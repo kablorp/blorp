@@ -9,14 +9,37 @@ import:
 		CoreEarlyInvariantViolation,
 		core_early_invariant_hint,
 		core_early_invariant_message,
-	ir: CoreProgram, core_program_max_declared_definition_id, core_program_to_json
+	io: print_error,
+	ir:
+		CoreDecl(FunctionDecl),
+		CoreExpr(
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			LambdaExpr,
+			LetExpr,
+			ResourceScopeExpr,
+			VarExpr,
+		),
+		CoreFunction,
+		CoreParam,
+		CoreProgram,
+		CoreVar,
+		core_program_max_declared_definition_id,
+		core_program_to_json,
 	mono_specialize: CoreMonoDiagnostic, core_mono_diagnostic_hint, core_mono_diagnostic_message
 	synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
-	system: now_microseconds
+	system: getenv, now_microseconds
 	trait_resolve:
 		CoreTraitResolveDiagnostic,
 		core_trait_resolve_diagnostic_hint,
 		core_trait_resolve_diagnostic_message,
+	traverse: immediate_core_expr_children,
 
 
 -- The runtime prints allocation and RSS counters for a named checkpoint when
@@ -129,6 +152,256 @@ private pure func core_pass_state_frontier_violation(
 		None
 
 
+-- Every binder `immediate_core_expr_children` won't surface on its own:
+-- the node kinds a source-name binder-mint (docs/CORE_ID_MIGRATION.md step
+-- 1) can produce. `immediate_core_expr_children` still gives the generic
+-- recursion into every child (a `LetExpr`'s rhs and body, a loop's iterable
+-- and body, ...); this only pulls out the *binder* a matching node itself
+-- introduces so it is not confused with an ordinary reference.
+private pure func core_expr_own_binders(expr: CoreExpr) -> List[CoreVar]:
+	match expr:
+		LetExpr(variable, _, _, _, _):
+			[variable]
+		LambdaExpr(params, _, _, _, _, _):
+			params.map(pure func(param): param.name)
+		ForRangeExpr(binder, _, _, _, _, _):
+			[binder.variable]
+		ForListExpr(loop, _, _):
+			[loop.binder.variable]
+		ForStringExpr(loop, _, _):
+			[loop.binder.variable]
+		ForDictExpr(loop, _, _):
+			[loop.binder.variable]
+		ForSetExpr(loop, _, _):
+			[loop.binder.variable]
+		ForStreamExpr(loop, _, _):
+			[loop.binder.variable]
+		ForResourceSourceExpr(loop, _, _):
+			[loop.binder.variable]
+		ForTensorExpr(loop, _, _):
+			[loop.binder.variable]
+		ResourceScopeExpr(scope, _, _):
+			[scope.variable]
+		_:
+			[]
+
+
+-- Every `VarExpr` a subtree contains, alongside every binder a node in that
+-- subtree introduces (see `core_expr_own_binders`). One pass over the tree
+-- serves both halves of the step-2 contract below.
+private record CoreBinderIdentityWalk {
+	binders: List[CoreVar],
+	uses: List[CoreVar]
+}
+
+private pure func core_binder_identity_walk(expr: CoreExpr) -> CoreBinderIdentityWalk:
+	own_binders: List[CoreVar] = core_expr_own_binders(expr)
+
+	own_use: List[CoreVar] = match expr:
+		VarExpr(variable, _, _):
+			[variable]
+		_:
+			[]
+
+	var binders: List[CoreVar] = own_binders
+	var uses: List[CoreVar] = own_use
+
+	for child in immediate_core_expr_children(expr):
+		child_walk: CoreBinderIdentityWalk = core_binder_identity_walk(child)
+		binders = binders.concat(child_walk.binders)
+		uses = uses.concat(child_walk.uses)
+
+	{ binders = binders, uses = uses }
+
+
+-- Core Identity Migration step 2 (docs/CORE_ID_MIGRATION.md): a debug-only
+-- contract, gated by `--check-invariants` like the frontier check above,
+-- run after every pass so the pass that mints an identity-breaking binder
+-- is named directly rather than surfacing later as a confusing Perceus (or
+-- other late-pipeline) failure.
+--
+-- Rule chosen: two binders in one function must not share a `(name, uniq)`
+-- pair when BOTH have `uniq > 0` (`uniq = 0` is still the sentinel for "no
+-- identity yet" -- globals, callables, constructors, and the ~30 other
+-- passes' private, name-only `core_var(name)` helpers that step 5 converts,
+-- plus match bindings and `?=`'s bound name, which step 1 deliberately left
+-- at `uniq = 0` -- see the docstring on `lower_raw_match_cases` in
+-- lower.brp). Scoping to "no compiler-generated prefix" instead was
+-- considered and rejected: it would require this module to duplicate every
+-- prefix convention scattered across those ~30 helpers, and would still
+-- need the `uniq = 0` carve-out for match/`?=` bindings, which do carry a
+-- real source name. The `uniq > 0` rule is the simpler rule that already
+-- captures exactly what step 1 changed.
+--
+-- A `VarExpr` is accepted when it names a binder with the same pair
+-- somewhere in the function, or when `def_id` is set (global, callable, or
+-- constructor), or when `uniq = 0` (not yet covered by step 1). This is
+-- weaker than true lexical scoping -- it does not check that the binder is
+-- still in scope at the use, only that a matching pair exists somewhere in
+-- the function -- because building a real scope stack over every `CoreExpr`
+-- kind here would duplicate lowering's own binder-site enumeration. It
+-- still catches the contract's central failure mode: a pass that mints a
+-- binder whose pair collides with another, or drops/renames a binder a use
+-- still points at.
+private pure func core_pass_state_binder_identity_violation(
+	pass_name: String,
+	function_info: CoreFunction,
+	walk: CoreBinderIdentityWalk,
+) -> Option[CorePassDiagnostic]:
+	duplicate: Option[CoreVar] = core_binder_identity_first_duplicate(walk.binders)
+
+	match duplicate:
+		Some(variable):
+			Some(
+				CorePassMessage(
+					"pass `${pass_name}` left function `${function_info.name}` with two binders sharing identity (${variable.name}, ${variable.uniq.to_string()})",
+				),
+			)
+		None:
+			unresolved: Option[CoreVar] = core_binder_identity_first_unresolved_use(
+				walk.binders,
+				walk.uses,
+			)
+
+			match unresolved:
+				Some(variable):
+					Some(
+						CorePassMessage(
+							"pass `${pass_name}` left function `${function_info.name}` with a use of `${variable.name}` (uniq ${variable.uniq.to_string()}) that names no binder in scope and no def_id",
+						),
+					)
+				None:
+					None
+
+
+private pure func core_binder_identity_first_duplicate(binders: List[CoreVar]) -> Option[CoreVar]:
+	var seen: List[CoreVar] = []
+	var duplicate: Option[CoreVar] = None
+	var index: Int = 0
+
+	while index < binders.length() and duplicate.is_none():
+		match binders.get(index):
+			Some(candidate):
+				if candidate.uniq > 0 and core_var_list_contains(seen, candidate):
+					duplicate = Some(candidate)
+				else:
+					seen = seen.append(candidate)
+			None:
+				void
+
+		index += 1
+
+	duplicate
+
+
+private pure func core_var_list_contains(vars: List[CoreVar], target: CoreVar) -> Bool:
+	var found: Bool = False
+
+	for candidate in vars:
+		if candidate.name == target.name and candidate.uniq == target.uniq:
+			found = True
+
+	found
+
+
+private pure func core_binder_identity_first_unresolved_use(
+	binders: List[CoreVar],
+	uses: List[CoreVar],
+) -> Option[CoreVar]:
+	var unresolved: Option[CoreVar] = None
+
+	for use in uses:
+		accepted: Bool = (
+			use.uniq == 0
+			or use.def_id.is_some()
+			or core_var_list_contains(binders, use)
+		)
+
+		if not accepted and unresolved.is_none():
+			unresolved = Some(use)
+
+	unresolved
+
+
+-- Every function's violation (see `core_pass_state_binder_identity_violation`
+-- above), in program order. Pure: no printing or env lookup here, so the
+-- strict/report-only split below stays the only place that decides what to
+-- do with what this finds.
+private pure func core_pass_state_binder_identity_violations(
+	pass_name: String,
+	program: CoreProgram,
+) -> List[CorePassDiagnostic]:
+	var violations: List[CorePassDiagnostic] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match function_info.body:
+					Some(body):
+						body_walk: CoreBinderIdentityWalk = core_binder_identity_walk(body)
+						-- The function's own parameters are binders too,
+						-- visible for the whole body; fold them in the
+						-- same way `push_function_scope` does at the
+						-- lowering side (lower.brp).
+						walk: CoreBinderIdentityWalk = {
+							binders = function_info.params
+								.map(pure func(param: CoreParam): param.name)
+								.concat(body_walk.binders),
+							uses = body_walk.uses
+						}
+
+						match core_pass_state_binder_identity_violation(
+							pass_name,
+							function_info,
+							walk,
+						):
+							Some(diagnostic):
+								violations = violations.append(diagnostic)
+							None:
+								void
+					None:
+						void
+			_:
+				void
+
+	violations
+
+
+-- Core Identity Migration step 2's contract is real today (steps 3-5 have
+-- not landed) but its target passes are not: Perceus's borrow handling and
+-- the `match` pass both clone an existing binder's exact `(name, uniq)`
+-- into a second binder site rather than minting a fresh one (see the step
+-- 2 commit message for the two concrete cases this was verified against on
+-- the self-compile). Until steps 3-5 convert those passes, the contract
+-- must not fail `--check-invariants` -- so by default this reports every
+-- violation as a `identity: ` line on stderr and lets the pass runner
+-- continue, rather than returning it as a `CorePassDiagnostic` that stops
+-- the pipeline. Setting `BLORP_IDENTITY_CONTRACT=strict` restores the
+-- fatal behavior (stopping at the first violation, exactly as before this
+-- change), for steps 3-5 to flip on once the passes above stop cloning
+-- identities.
+func core_pass_state_binder_identity_program_violation(
+	pass_name: String,
+	program: CoreProgram,
+) -> Option[CorePassDiagnostic]:
+	violations: List[CorePassDiagnostic] = core_pass_state_binder_identity_violations(
+		pass_name,
+		program,
+	)
+
+	if identity_contract_is_strict():
+		violations.get(0)
+	else:
+		for violation in violations:
+			print_error("identity: " + core_pass_diagnostic_message(violation))
+
+		None
+
+
+private func identity_contract_is_strict() -> Bool:
+	getenv("BLORP_IDENTITY_CONTRACT") == Some("strict")
+
+
 union CorePassRun:
 	CorePassesCompleted(CorePassState, List[CorePassObservation], List[CorePassTiming])
 	CorePassesStopped(String, String, List[CorePassObservation], List[CorePassTiming])
@@ -234,7 +507,14 @@ func run_core_passes(
 									Some(diagnostic):
 										Some(diagnostic)
 									None:
-										core_pass_state_frontier_violation(pass.name, current)
+										match core_pass_state_frontier_violation(pass.name, current):
+											Some(diagnostic):
+												Some(diagnostic)
+											None:
+												core_pass_state_binder_identity_program_violation(
+													pass.name,
+													current.program,
+												)
 							else:
 								None
 
