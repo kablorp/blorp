@@ -933,6 +933,7 @@ static bool __blorp_stats_enabled = false;
 // allocation-oracle counters that also gate on it.
 static bool __blorp_compiler_memory_profile_enabled = false;
 static bool __blorp_typecheck_body_metrics_enabled = false;
+static bool __blorp_core_lowering_type_metrics_enabled = false;
 static bool __blorp_trace_allocs = false;
 
 // Memory watch: periodic snapshots to stderr for leak detection in long-running programs.
@@ -1375,6 +1376,8 @@ static void __blorp_init_stats_flag(void) {
         getenv("BLORP_COMPILER_MEMORY_PROFILE") != NULL;
     __blorp_typecheck_body_metrics_enabled =
         getenv("BLORP_TYPECHECK_BODY_METRICS") != NULL;
+    __blorp_core_lowering_type_metrics_enabled =
+        getenv("BLORP_CORE_LOWERING_TYPE_METRICS") != NULL;
     __blorp_lightweight_stats_enabled =
         getenv("BLORP_ALLOCATOR_STATS") != NULL ||
         __blorp_compiler_memory_profile_enabled ||
@@ -2149,6 +2152,163 @@ void blorp_typecheck_body_metrics_report_c(void) {
         project_allocations + dependency_allocations
     );
     __blorp_typecheck_body_metrics_release();
+}
+
+// ============================================================================
+// Core lowering type-histogram counters (BLORP_CORE_LOWERING_TYPE_METRICS)
+// ============================================================================
+// Attribution instrumentation for Core lowering's type-lowering choke point
+// (core_lower_type_with_prefixes). Counts total calls and, keyed by the
+// lowered CoreType's `core_type_to_json` text, how many calls produced each
+// distinct shape -- the histogram used to decide whether cut 1's memo should
+// target arg-less scalar constants, a per-function identity memo, or both.
+// A no-op unless BLORP_CORE_LOWERING_TYPE_METRICS is set: production compiles
+// pay one branch per call and nothing else.
+typedef struct {
+    char* key;
+    long count;
+} __blorp_CoreLoweringTypeMetricEntry;
+
+static __blorp_CoreLoweringTypeMetricEntry* __blorp_core_lowering_type_table = NULL;
+static size_t __blorp_core_lowering_type_table_capacity = 0;
+static size_t __blorp_core_lowering_type_table_used = 0;
+static long __blorp_core_lowering_type_calls = 0;
+
+static unsigned long __blorp_core_lowering_type_hash(const char* text) {
+    unsigned long hash = 1469598103934665603UL;
+    for (const unsigned char* cursor = (const unsigned char*)text; *cursor; cursor++) {
+        hash ^= (unsigned long)*cursor;
+        hash *= 1099511628211UL;
+    }
+    return hash;
+}
+
+static void __blorp_core_lowering_type_table_insert(
+    __blorp_CoreLoweringTypeMetricEntry* table,
+    size_t capacity,
+    char* key,
+    long count
+) {
+    size_t mask = capacity - 1;
+    size_t index = __blorp_core_lowering_type_hash(key) & mask;
+    while (table[index].key != NULL) {
+        if (strcmp(table[index].key, key) == 0) {
+            table[index].count += count;
+            return;
+        }
+        index = (index + 1) & mask;
+    }
+    table[index].key = key;
+    table[index].count = count;
+}
+
+static void __blorp_core_lowering_type_table_grow(void) {
+    size_t grown = __blorp_core_lowering_type_table_capacity
+        ? __blorp_core_lowering_type_table_capacity * 2
+        : 256;
+    __blorp_CoreLoweringTypeMetricEntry* rows =
+        (__blorp_CoreLoweringTypeMetricEntry*)calloc(
+            grown,
+            sizeof(__blorp_CoreLoweringTypeMetricEntry)
+        );
+    if (!rows) return;
+    for (size_t index = 0; index < __blorp_core_lowering_type_table_capacity; index++) {
+        if (__blorp_core_lowering_type_table[index].key != NULL) {
+            __blorp_core_lowering_type_table_insert(
+                rows,
+                grown,
+                __blorp_core_lowering_type_table[index].key,
+                __blorp_core_lowering_type_table[index].count
+            );
+        }
+    }
+    free(__blorp_core_lowering_type_table);
+    __blorp_core_lowering_type_table = rows;
+    __blorp_core_lowering_type_table_capacity = grown;
+}
+
+long blorp_core_lowering_type_metrics_enabled_c(void) {
+    return __blorp_core_lowering_type_metrics_enabled ? 1 : 0;
+}
+
+void blorp_core_lowering_type_metric_record_c(const char* type_json) {
+    if (!__blorp_core_lowering_type_metrics_enabled) return;
+    __blorp_core_lowering_type_calls++;
+    if (__blorp_core_lowering_type_table_used * 2 >= __blorp_core_lowering_type_table_capacity) {
+        __blorp_core_lowering_type_table_grow();
+        if (!__blorp_core_lowering_type_table) return;
+    }
+    size_t mask = __blorp_core_lowering_type_table_capacity - 1;
+    size_t index = __blorp_core_lowering_type_hash(type_json) & mask;
+    while (__blorp_core_lowering_type_table[index].key != NULL) {
+        if (strcmp(__blorp_core_lowering_type_table[index].key, type_json) == 0) {
+            __blorp_core_lowering_type_table[index].count++;
+            return;
+        }
+        index = (index + 1) & mask;
+    }
+    __blorp_core_lowering_type_table[index].key =
+        __blorp_typecheck_body_metric_text(type_json);
+    __blorp_core_lowering_type_table[index].count = 1;
+    __blorp_core_lowering_type_table_used++;
+}
+
+static int __blorp_core_lowering_type_metric_compare(const void* left, const void* right) {
+    const __blorp_CoreLoweringTypeMetricEntry* first =
+        (const __blorp_CoreLoweringTypeMetricEntry*)left;
+    const __blorp_CoreLoweringTypeMetricEntry* second =
+        (const __blorp_CoreLoweringTypeMetricEntry*)right;
+    if (first->key == NULL && second->key == NULL) return 0;
+    if (first->key == NULL) return 1;
+    if (second->key == NULL) return -1;
+    if (first->count != second->count) {
+        return first->count < second->count ? 1 : -1;
+    }
+    return strcmp(first->key, second->key);
+}
+
+void blorp_core_lowering_type_metrics_report_c(void) {
+    if (!__blorp_core_lowering_type_metrics_enabled) return;
+    fprintf(
+        stderr,
+        "BLORP_CORE_LOWERING_TYPE_METRICS schema=1 calls=%ld distinct=%zu\n",
+        __blorp_core_lowering_type_calls,
+        __blorp_core_lowering_type_table_used
+    );
+    if (__blorp_core_lowering_type_table_used == 0) return;
+    // Sort a private copy so the live table (still being inserted into by any
+    // later calls in this process) is never reordered under a caller's feet.
+    __blorp_CoreLoweringTypeMetricEntry* sorted =
+        (__blorp_CoreLoweringTypeMetricEntry*)malloc(
+            __blorp_core_lowering_type_table_capacity
+                * sizeof(__blorp_CoreLoweringTypeMetricEntry)
+        );
+    if (!sorted) return;
+    memcpy(
+        sorted,
+        __blorp_core_lowering_type_table,
+        __blorp_core_lowering_type_table_capacity
+            * sizeof(__blorp_CoreLoweringTypeMetricEntry)
+    );
+    qsort(
+        sorted,
+        __blorp_core_lowering_type_table_capacity,
+        sizeof(__blorp_CoreLoweringTypeMetricEntry),
+        __blorp_core_lowering_type_metric_compare
+    );
+    size_t shown = __blorp_core_lowering_type_table_used < 30
+        ? __blorp_core_lowering_type_table_used
+        : 30;
+    for (size_t index = 0; index < shown; index++) {
+        fprintf(
+            stderr,
+            "BLORP_CORE_LOWERING_TYPE_TOP rank=%zu count=%ld type=%s\n",
+            index + 1,
+            sorted[index].count,
+            sorted[index].key ? sorted[index].key : ""
+        );
+    }
+    free(sorted);
 }
 
 #define BLORP_LIST_STORAGE_POINTER 0

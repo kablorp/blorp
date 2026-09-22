@@ -205,7 +205,12 @@ import:
 		),
 		TYPE_CHAR,
 		TYPE_INT,
+		TYPE_NAME_BOOL,
+		TYPE_NAME_CHAR,
+		TYPE_NAME_FLOAT,
+		TYPE_NAME_INT,
 		TYPE_NAME_MATRIX,
+		TYPE_NAME_STRING,
 		TYPE_NAME_TENSOR,
 		TYPE_NAME_VECTOR,
 		TYPE_NAME_VOID,
@@ -395,6 +400,7 @@ import:
 		CoreUnionVariant,
 		CoreValueRecordField,
 		CoreVar,
+		core_type_to_json,
 	../stage_09_core/type_policy as CoreTypePolicy
 	identity:
 		core_ufcs_function_name,
@@ -1031,11 +1037,46 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 	core_lower_type_with_prefixes({}, typ)
 
 
+-- Attribution instrumentation for the type-lowering choke point, opt-in
+-- through BLORP_CORE_LOWERING_TYPE_METRICS=1 (see runtime.c's matching
+-- BLORP_TYPECHECK_BODY_METRICS probes). With the variable unset this is one
+-- branch per call and no allocation; `core_type_to_json` only runs when the
+-- variable is set.
+foreign:
+	pure func core_lowering_type_metrics_enabled() -> Int = "blorp_core_lowering_type_metrics_enabled_c"
+	pure func core_lowering_type_metric_record(type_json: String) -> Void = "blorp_core_lowering_type_metric_record_c"
+	pure func core_lowering_type_metrics_report() -> Void = "blorp_core_lowering_type_metrics_report_c"
+
+
+-- Flushes the call/histogram counters collected under
+-- BLORP_CORE_LOWERING_TYPE_METRICS=1; a no-op when the variable is unset.
+pure func core_lowering_type_metrics_report_flush() -> Void:
+	core_lowering_type_metrics_report()
+
+
 -- `module_member_prefixes` is the lowering context's precomputed
 -- `core_module_member_prefix` table (see `core_module_member_prefix_table`),
 -- so nominal `module::Type` names flatten through one sanitized identity per
 -- module instead of re-sanitizing per type occurrence.
 private pure func core_lower_type_with_prefixes(
+	module_member_prefixes: Dict[String, String],
+	typ: SemanticType,
+) -> Result[CoreType, CoreLowerError]:
+	if core_lowering_type_metrics_enabled() == 0:
+		core_lower_type_with_prefixes_impl(module_member_prefixes, typ)
+	else:
+		result = core_lower_type_with_prefixes_impl(module_member_prefixes, typ)
+
+		match result:
+			Ok(lowered):
+				core_lowering_type_metric_record(core_type_to_json(lowered).to_string())
+			Err(_):
+				void
+
+		result
+
+
+private pure func core_lower_type_with_prefixes_impl(
 	module_member_prefixes: Dict[String, String],
 	typ: SemanticType,
 ) -> Result[CoreType, CoreLowerError]:
@@ -1056,6 +1097,16 @@ private pure func core_lower_type_with_prefixes(
 
 					if normalized == TYPE_NAME_VOID and args.length() == 0:
 						Ok(VoidType)
+					else if args.length() == 0 and normalized == TYPE_NAME_STRING:
+						Ok(CORE_STRING_TYPE)
+					else if args.length() == 0 and normalized == TYPE_NAME_BOOL:
+						Ok(CORE_BOOL_TYPE)
+					else if args.length() == 0 and normalized == TYPE_NAME_INT:
+						Ok(CORE_INT_TYPE)
+					else if args.length() == 0 and normalized == TYPE_NAME_CHAR:
+						Ok(CORE_CHAR_TYPE)
+					else if args.length() == 0 and normalized == TYPE_NAME_FLOAT:
+						Ok(CORE_FLOAT_TYPE)
 					else if (
 						name == PARALLEL_VECTOR_TYPE_NAME
 						or name == CANONICAL_PARALLEL_VECTOR_TYPE_NAME
@@ -1175,6 +1226,20 @@ private pure func core_lower_value_type(
 private CORE_INT_TYPE: CoreType = NamedType("Int", [])
 
 private CORE_BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+-- Shared constants for the built-in scalar named types, reused by
+-- `core_lower_type_with_prefixes_impl`'s arg-less-scalar fast path (see the
+-- 2026-09-22 core lowering allocation attribution: the frozen self-compile's
+-- most-repeated lowered types are overwhelmingly arg-less named types, and
+-- the built-in scalars alone -- String, Bool, Int -- account for roughly a
+-- quarter of all `core_lower_type` calls). Returning one of these instead of
+-- rebuilding `NamedType(name, [])` skips the list/record/Result allocations
+-- on every occurrence of these four names. `CORE_STRING_TYPE` already exists
+-- below (used by string-literal lowering); reused here rather than
+-- duplicated.
+private CORE_CHAR_TYPE: CoreType = NamedType("Char", [])
+
+private CORE_FLOAT_TYPE: CoreType = NamedType("Float", [])
 
 
 private pure func core_type_is_void(typ: CoreType) -> Bool:
@@ -5693,6 +5758,8 @@ pure func lower_typed_program_with_ctfe_replacements(
 						decls = decls.append(result.decl)
 					Err(error):
 						failure = Some(error)
+
+	core_lowering_type_metrics_report_flush()
 
 	match failure:
 		Some(error):

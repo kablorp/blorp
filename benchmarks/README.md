@@ -387,6 +387,24 @@ BLORP_DCE_FACTS_SKIP_BUILD=1 \
   benchmarks/compiler_dce_facts_builder_allocations
 ```
 
+`compiler_core_lowering_allocation_attribution` runs a synthetic 1202-node
+typed program (400 variable-declaration/initializer/reference triples, all
+carrying one shared `SemanticType` object, plus an enclosing block) through
+`lower_typed_program` and reports per-helper allocation costs for
+`core_lower_type`, `core_source_loc`, and the `CoreVar` record shape, plus a
+type-shape ablation (the same fixture lowered with a cheap `Void` type
+instead) that isolates how much of lowering's allocations come from
+rebuilding one repeated non-trivial type. It is an attribution tool, not a
+pass/fail gate — see
+`benchmarks/results/core_lowering_allocation_attribution_2026-09-22.md` for
+the measured numbers and the go/no-go decisions they produced:
+
+```bash
+benchmarks/compiler_core_lowering_allocation_attribution
+BLORP_CORE_LOWERING_ATTRIBUTION_SKIP_BUILD=1 \
+  benchmarks/compiler_core_lowering_allocation_attribution
+```
+
 ### Frontend and Typecheck Function Profile
 
 `compiler_typecheck_profile` runs a bounded synthetic graph through
@@ -1955,6 +1973,34 @@ Body rows follow, sorted by elapsed time, one per checked body, then three
 `scope` is the module's origin: a standard-library or package module is a
 `dependency`, a module of the program under compilation is `project`. Run it
 with `--time-phases` to relate the rows to the `typed_frontend` phase total.
+
+### Core Lowering Type Histogram
+
+`BLORP_CORE_LOWERING_TYPE_METRICS=1` makes any compile print, to stderr, how
+many times `core_lower_type_with_prefixes`
+(`blorp/src/compiler/stage_08_core_lower/lower.brp`) was called and a
+histogram of the top 30 lowered `CoreType` shapes by `core_type_to_json`
+text, keyed with the same C-side hash-table pattern
+`BLORP_TYPECHECK_BODY_METRICS` uses. With the variable unset it is one
+branch per call and no allocation; the generated C is unchanged either way.
+`lower_typed_program_with_ctfe_replacements` flushes the counters once per
+module, so they are cumulative -- the last line before a run ends is the
+whole compile's total:
+
+```bash
+BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_CORE_LOWERING_TYPE_METRICS=1 bin/blorp compile \
+  --stop-after=lower --no-format --std-dir <std> <entry>.brp >/dev/null 2>lower_histogram.log
+```
+
+```text
+BLORP_CORE_LOWERING_TYPE_METRICS schema=1 calls=1275348 distinct=22180
+BLORP_CORE_LOWERING_TYPE_TOP rank=1 count=167795 type={"kind":"named","name":"String","args":[]}
+```
+
+See `benchmarks/results/core_lowering_type_histogram_2026-09-22.md` for the
+full top-30 table from the frozen self-compile and the design decision it
+produced (module-level constants for arg-less scalar types, not a
+per-function memo).
 
 ## Timing Model
 

@@ -1,0 +1,361 @@
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	../../../blorp/src/lib/source:
+		SourceFile,
+		SourceTable,
+		SourceLocation,
+		Cursor,
+		source_file,
+		source_table_for_file,
+		source_cursor_at,
+		source_location_for_file,
+	../../../blorp/src/compiler/stage_03_parse/parsed_ast:
+		ParsedIdentifier,
+		ParsedExpr(ParsedIntLiteralExpr),
+		ParsedFunctionDecl,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder),
+		ParsedTypeExpr(ParsedNamedType),
+		parsed_identifier,
+	../../../blorp/src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticNamedType),
+	../../../blorp/src/compiler/stage_06_typecheck/type_system/refinement: UNREFINED_BINDING
+	../../../blorp/src/compiler/stage_06_typecheck/type_system/type_widening: ValueSlot(KeptValueSlot)
+	../../../blorp/src/compiler/stage_06_typecheck/infer:
+		TypedExpr(TypedBlockExpr, TypedListExpr, TypedNameExpr, TypedVarDeclExpr, TypedVoidExpr),
+		TypedExprInfo,
+		TypedVarDeclPayload,
+		ExprTypeOrigin(SynthesizedOrigin),
+	../../../blorp/src/compiler/stage_06_typecheck/decl:
+		TypedDecl(TypedFunctionDecl),
+		TypedFunctionInfo,
+		TypedProgram,
+	../../../blorp/src/compiler/stage_08_core_lower/lower:
+		CoreLowerContext,
+		core_lower_context,
+		core_lower_error_to_string,
+		core_lower_type,
+		core_source_loc,
+		lower_typed_program,
+	../../../blorp/src/compiler/stage_09_core/ir:
+		CoreType,
+		CoreVar,
+		core_type_to_json,
+
+
+-- Number of variable-carrying nodes (one declaration + one reference each)
+-- fed through `lower_typed_program`, all sharing ONE semantic type object
+-- (`shared_list_string_type`, built once). This is the shape the frozen
+-- self-compile exhibits at scale: the same nominal type (e.g. `List[String]`)
+-- annotates thousands of unrelated bindings.
+NODE_PAIR_COUNT: Int = 400
+
+-- Number of direct calls used to cost each helper in isolation.
+HELPER_CALL_COUNT: Int = 2000
+
+
+pure func fixture_source_file() -> SourceFile:
+	source_file("core_lowering_allocation_attribution.brp", "attribution_fixture", "func main() -> Int: 0")
+
+
+pure func fixture_source_table() -> SourceTable:
+	source_table_for_file(fixture_source_file())
+
+
+pure func fixture_source_span() -> SourceLocation:
+	src: SourceFile = fixture_source_file()
+	start: Cursor = source_cursor_at(src, 0)
+	finish: Cursor = source_cursor_at(src, 4)
+	source_location_for_file(src, start, finish)
+
+
+pure func ident(text: String) -> ParsedIdentifier:
+	parsed_identifier(text, fixture_source_span())
+
+
+pure func parsed_type_int() -> ParsedTypeExpr:
+	ParsedNamedType(ident("Int"), [], fixture_source_span())
+
+
+pure func parsed_function_decl() -> ParsedFunctionDecl:
+	{
+		name = ident("attribution_fixture"),
+		keyword_span = Some(fixture_source_span()),
+		type_params = [],
+		params = [],
+		return_type = Some(parsed_type_int()),
+		dim_constraints = [],
+		body = Some(ParsedIntLiteralExpr("0", fixture_source_span())),
+		is_pure = True,
+		annotations = [],
+		doc = None,
+		span = fixture_source_span()
+	}
+
+
+pure func expr_info(typ: SemanticType) -> TypedExprInfo:
+	{
+		source_type = None,
+		origin = SynthesizedOrigin("core lowering allocation attribution"),
+		value_slot = KeptValueSlot(typ),
+		proofs = UNREFINED_BINDING,
+		resolved_call = None,
+		resolved_definition_id = None,
+		resource_dependencies = []
+	}
+
+
+-- The one shared semantic type every synthetic binding carries. Built once
+-- so every occurrence is the SAME object, mirroring how a zonked semantic
+-- type tree is shared across occurrences in the real typed program (see the
+-- "Compiler types are immutable values" note on `SemanticType`).
+pure func shared_list_string_type() -> SemanticType:
+	SemanticNamedType("List", [SemanticNamedType("String", [])])
+
+
+-- The cheapest-to-lower named type (zero args, short-circuits to the bare
+-- `VoidType` constructor). Used as an ablation baseline: swap this in for
+-- `shared_list_string_type` everywhere in the synthetic program and the
+-- allocation delta between the two runs isolates the cost of lowering the
+-- non-trivial `List[String]` type shape repeatedly, holding node shape,
+-- node count, and source-location construction fixed.
+pure func shared_void_type() -> SemanticType:
+	SemanticNamedType("Void", [])
+
+
+-- A distinct type per index: same shape family as `shared_list_string_type`
+-- but never the same object twice, so a per-call attribution can compare a
+-- "one shared object, many occurrences" run against a "fresh object per
+-- occurrence" run without changing the type's structural complexity.
+pure func distinct_list_type(index: Int) -> SemanticType:
+	SemanticNamedType("List", [SemanticNamedType("String_${index}", [])])
+
+
+pure func synthetic_var_pair(index: Int, shared_type: SemanticType) -> List[TypedExpr]:
+	name: ParsedIdentifier = ident("attribution_var_${index}")
+	decl_payload: TypedVarDeclPayload = {
+		name = name,
+		annotation = Some(shared_type),
+		initializer = TypedListExpr([], fixture_source_span(), expr_info(shared_type)),
+		is_mutable = False,
+		span = fixture_source_span()
+	}
+
+	[
+		TypedVarDeclExpr(decl_payload, expr_info(shared_type)),
+		TypedNameExpr(name, expr_info(shared_type)),
+	]
+
+
+pure func synthetic_body(pair_count: Int, shared_type: SemanticType) -> TypedExpr:
+	var items: List[TypedExpr] = []
+
+	for index in 0..pair_count:
+		items = items.concat(synthetic_var_pair(index, shared_type))
+
+	items = items.concat([TypedVoidExpr(fixture_source_span(), expr_info(shared_type))])
+	TypedBlockExpr(items, fixture_source_span(), expr_info(shared_type))
+
+
+pure func synthetic_program(pair_count: Int, shared_type: SemanticType) -> TypedProgram:
+	function_info: TypedFunctionInfo = {
+		decl = parsed_function_decl(),
+		callable_id = None,
+		effective_type_params = [],
+		param_types = [],
+		source_return_type = None,
+		semantic_return_type = shared_type,
+		body = Some(synthetic_body(pair_count, shared_type))
+	}
+
+	{
+		source = fixture_source_file(),
+		decls = [TypedFunctionDecl(function_info)],
+		diagnostics = [],
+		type_definitions = [],
+		type_references = []
+	}
+
+
+record HelperCost {
+	label: String,
+	calls: Int,
+	allocations: Int
+}
+
+
+func print_helper_cost(cost: HelperCost) -> Void:
+	per_call: Float = to_float(cost.allocations) / to_float(cost.calls)
+	print(
+		"HELPER label=${cost.label} calls=${cost.calls} allocations=${cost.allocations} "
+		+ "allocations_per_call=${per_call}",
+	)
+
+
+-- core_lower_type cost when every call lowers the SAME shared SemanticType
+-- object: distinct results = 1, calls = HELPER_CALL_COUNT.
+func measure_core_lower_type_shared() -> HelperCost:
+	shared_type: SemanticType = shared_list_string_type()
+	reset_mem_stats()
+
+	for _ in 0..HELPER_CALL_COUNT:
+		match core_lower_type(shared_type):
+			Ok(_):
+				void
+			Err(_):
+				void
+
+	stats: MemStats = get_mem_stats()
+	{ label = "core_lower_type[shared_object]", calls = HELPER_CALL_COUNT, allocations = stats.total_allocations }
+
+
+-- core_lower_type cost when every call lowers a FRESH, distinct
+-- SemanticType object (same shape family, never shared): calls = distinct
+-- results = HELPER_CALL_COUNT.
+func measure_core_lower_type_distinct() -> HelperCost:
+	reset_mem_stats()
+
+	for index in 0..HELPER_CALL_COUNT:
+		match core_lower_type(distinct_list_type(index)):
+			Ok(_):
+				void
+			Err(_):
+				void
+
+	stats: MemStats = get_mem_stats()
+	{ label = "core_lower_type[distinct_object]", calls = HELPER_CALL_COUNT, allocations = stats.total_allocations }
+
+
+-- Confirms the "shared" run above really does collapse to one distinct
+-- result: build twice from the shared object and once from a fresh
+-- structurally-equal tree, and compare all three by `core_type_to_json`.
+func verify_distinct_type_count() -> Int:
+	shared_type: SemanticType = shared_list_string_type()
+
+	first: CoreType = match core_lower_type(shared_type):
+		Ok(typ):
+			typ
+		Err(_):
+			VoidType
+
+	second: CoreType = match core_lower_type(shared_type):
+		Ok(typ):
+			typ
+		Err(_):
+			VoidType
+
+	fresh_equal_type: SemanticType = SemanticNamedType("List", [SemanticNamedType("String", [])])
+
+	third: CoreType = match core_lower_type(fresh_equal_type):
+		Ok(typ):
+			typ
+		Err(_):
+			VoidType
+
+	first_json: String = core_type_to_json(first).to_string()
+	second_json: String = core_type_to_json(second).to_string()
+	third_json: String = core_type_to_json(third).to_string()
+
+	if first_json == second_json and second_json == third_json:
+		1
+	else:
+		3
+
+
+-- core_source_loc cost per call: one KnownSourceLoc (and its SourceSpan) per
+-- call, all against the same table/location.
+func measure_core_source_loc() -> HelperCost:
+	table: SourceTable = fixture_source_table()
+	location: SourceLocation = fixture_source_span()
+	reset_mem_stats()
+
+	for _ in 0..HELPER_CALL_COUNT:
+		loc = core_source_loc(table, location)
+		void
+
+	stats: MemStats = get_mem_stats()
+	{ label = "core_source_loc", calls = HELPER_CALL_COUNT, allocations = stats.total_allocations }
+
+
+-- `core_var` itself is private to lower.brp, but its body is exactly this
+-- record literal (name, uniq = 0, def_id); build the same shape directly to
+-- cost the one record allocation it performs per call.
+func measure_core_var_record() -> HelperCost:
+	reset_mem_stats()
+
+	for index in 0..HELPER_CALL_COUNT:
+		variable: CoreVar = { name = "attribution_var_${index}", uniq = 0, def_id = None }
+		void
+
+	stats: MemStats = get_mem_stats()
+	{ label = "core_var[record literal]", calls = HELPER_CALL_COUNT, allocations = stats.total_allocations }
+
+
+-- Whole-pipeline run: lower a representative synthetic program of
+-- 2 * NODE_PAIR_COUNT + 2 typed nodes (a var-decl and a name-ref per pair,
+-- plus the enclosing block and the trailing void expr), all sharing ONE
+-- SemanticType object, through the real `lower_typed_program` entry point.
+-- Node count is exact because we built the input, so the per-node ratio
+-- (allocations / node count) is exact too.
+func measure_whole_program_lowering() -> (Int, Int):
+	shared_type: SemanticType = shared_list_string_type()
+	program: TypedProgram = synthetic_program(NODE_PAIR_COUNT, shared_type)
+	context: CoreLowerContext = core_lower_context(0, Some("attribution_fixture"))
+	reset_mem_stats()
+
+	match lower_typed_program(context, program):
+		Ok(_):
+			void
+		Err(error):
+			print("WHOLE_PROGRAM_ERROR ${core_lower_error_to_string(error)}")
+
+	stats: MemStats = get_mem_stats()
+	node_count: Int = NODE_PAIR_COUNT * 3 + 2
+	(stats.total_allocations, node_count)
+
+
+func measure_whole_program_lowering_void() -> (Int, Int):
+	shared_type: SemanticType = shared_void_type()
+	program: TypedProgram = synthetic_program(NODE_PAIR_COUNT, shared_type)
+	context: CoreLowerContext = core_lower_context(0, Some("attribution_fixture"))
+	reset_mem_stats()
+
+	match lower_typed_program(context, program):
+		Ok(_):
+			void
+		Err(error):
+			print("WHOLE_PROGRAM_VOID_ERROR ${core_lower_error_to_string(error)}")
+
+	stats: MemStats = get_mem_stats()
+	node_count: Int = NODE_PAIR_COUNT * 3 + 2
+	(stats.total_allocations, node_count)
+
+
+func main(args: List[String]) -> Int:
+	shared_cost: HelperCost = measure_core_lower_type_shared()
+	distinct_cost: HelperCost = measure_core_lower_type_distinct()
+	distinct_result_count: Int = verify_distinct_type_count()
+	loc_cost: HelperCost = measure_core_source_loc()
+	var_cost: HelperCost = measure_core_var_record()
+	(whole_allocations, whole_node_count) = measure_whole_program_lowering()
+	(whole_void_allocations, whole_void_node_count) = measure_whole_program_lowering_void()
+
+	print_helper_cost(shared_cost)
+	print_helper_cost(distinct_cost)
+	print("VERIFY distinct_results_from_three_lowerings=${distinct_result_count} (1 == fully shared)")
+	print_helper_cost(loc_cost)
+	print_helper_cost(var_cost)
+	print(
+		"WHOLE_PROGRAM allocations=${whole_allocations} node_count=${whole_node_count} "
+		+ "allocations_per_node=${to_float(whole_allocations) / to_float(whole_node_count)}",
+	)
+	print(
+		"WHOLE_PROGRAM_VOID_TYPE allocations=${whole_void_allocations} node_count=${whole_void_node_count} "
+		+ "allocations_per_node=${to_float(whole_void_allocations) / to_float(whole_void_node_count)}",
+	)
+	type_shape_delta: Int = whole_allocations - whole_void_allocations
+	print(
+		"TYPE_SHAPE_DELTA (List[String] run minus Void run) = ${type_shape_delta} "
+		+ "share_of_string_run=${to_float(type_shape_delta) / to_float(whole_allocations)}",
+	)
+	0
