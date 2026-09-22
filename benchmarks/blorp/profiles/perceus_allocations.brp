@@ -1,0 +1,241 @@
+-- Per-helper allocation profile for Perceus (Core Identity Migration step 0).
+--
+-- Drives the exact production late-Core pass functions (pipeline.brp) over
+-- the frozen self-compile's Core, starting from the DCE dump
+-- (`--dump-core-after=dce --dump-core-file=<path>`) and advancing through
+-- consume_specialize, static string literals, record-update ownership, and
+-- dict-literal ownership to reach the exact point immediately before
+-- Perceus. `dict_literal_ownership` is not one of the CLI's exposed
+-- `--dump-core-after` stage names (see CORE_STAGE_NAMES in
+-- stage_manifest.brp), so this program drives the rest of the pipeline
+-- itself by calling the same public pass functions pipeline.brp calls,
+-- rather than trying a CLI flag that does not exist.
+--
+-- This committed program calls only the Perceus helpers that are public
+-- (`insert_drops_program`, `build_env`, `count_uses`), plus a static
+-- traversal of the decoded program for the region count (functions +
+-- lambdas + global initializers) that `build_borrowed_owner_catalog` runs
+-- once per, in production. The full per-helper breakdown for Perceus's
+-- private helpers (`infer_user_call_contracts`, `build_borrowed_owner_catalog`,
+-- the `summarize_linear_ownership_uses` family, `rewrite_mutable_assignments`,
+-- `protect_repeated_consumes`, `stabilize_nested_assignment_rhs`, the
+-- synthetic `CoreVar` constructors) was captured once with those
+-- declarations temporarily made non-private, then reverted before
+-- committing; no production behavior changed. See
+-- benchmarks/results/perceus_allocation_attribution_2026-09-22.md for the
+-- exact methodology, the one-line-per-declaration edit list, and the
+-- numbers that run produced.
+import:
+	system: read_file
+	json: parse_json
+	io: print_error
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	../../../blorp/src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreExpr(LambdaExpr),
+		CoreFunction,
+		CoreProgram,
+		core_program_max_declared_definition_id,
+		decode_core_program_json,
+	../../../blorp/src/compiler/stage_09_core/pass_runner: core_pass_state, CorePassState
+	../../../blorp/src/compiler/stage_09_core/pipeline:
+		run_consume_specialize_pass,
+		run_dict_literal_ownership_pass,
+		run_record_update_ownership_pass,
+		run_static_string_literals_pass,
+	../../../blorp/src/compiler/stage_09_core/perceus: PerceusEnv, build_env, count_uses, insert_drops_program
+	../../../blorp/src/compiler/stage_09_core/traverse: immediate_core_expr_children
+
+
+-- Representative-sampling harness, not a full pass trace: it calls the real
+-- helper on real arguments drawn from the real frozen self-compile program,
+-- capped here so the profile finishes in a reasonable time. It does not
+-- claim to reproduce every call Perceus itself makes in one production run.
+SAMPLE_FUNCTION_LIMIT: Int = 400
+
+
+func report_row(name: String, calls: Int, allocations: Int) -> Void:
+	var per_call: Int = 0
+
+	if calls > 0:
+		per_call = allocations / calls
+	else:
+		void
+
+	print("${name}\t${calls}\t${allocations}\t${per_call}")
+
+
+pure func decl_bodies(decl: CoreDecl) -> List[CoreFunction]:
+	match decl:
+		FunctionDecl(function_info):
+			[function_info]
+		ImplDecl(impl):
+			impl.methods
+		_:
+			[]
+
+
+pure func program_functions(program: CoreProgram) -> List[CoreFunction]:
+	var out: List[CoreFunction] = []
+
+	for decl in program.decls:
+		out = out.concat(decl_bodies(decl))
+
+	out
+
+
+pure func global_init_count(program: CoreProgram) -> Int:
+	var count: Int = 0
+
+	for decl in program.decls:
+		match decl:
+			GlobalDecl(_):
+				count += 1
+			_:
+				void
+
+	count
+
+
+pure func count_lambdas(expr: CoreExpr) -> Int:
+	var count: Int = 0
+
+	match expr:
+		LambdaExpr(_, _, _, _, _, _):
+			count = 1
+		_:
+			count = 0
+
+	for child in immediate_core_expr_children(expr):
+		count += count_lambdas(child)
+
+	count
+
+
+-- Builds the exact late Core state immediately before Perceus by chaining
+-- the same public pass functions `pipeline.brp` calls, starting from the
+-- post-DCE Core dumped for the frozen self-compile.
+func late_core_before_perceus(post_dce: CoreProgram) -> CoreProgram:
+	next_def_id: Int = core_program_max_declared_definition_id(post_dce) + 1
+	state: CorePassState = core_pass_state(post_dce, next_def_id)
+
+	match run_consume_specialize_pass(state):
+		Ok(after_consume_specialize):
+			after_static_strings: CoreProgram = run_static_string_literals_pass(
+				after_consume_specialize.program,
+			)
+			after_record_update: CoreProgram = run_record_update_ownership_pass(after_static_strings)
+			run_dict_literal_ownership_pass(after_record_update)
+		Err(_):
+			post_dce
+
+
+-- Reads and decodes the post-DCE Core dump, then advances it to the exact
+-- point immediately before Perceus.
+func decode_late_core(path: String) -> Option[CoreProgram]:
+	match read_file(path):
+		Err(_):
+			None
+		Ok(raw):
+			json_start: Int = raw.index_of("{").get_or(0)
+			trimmed: String = raw.substring(json_start, raw.length() - json_start)
+
+			match parse_json(trimmed):
+				Err(_):
+					None
+				Ok(json_value):
+					match decode_core_program_json(json_value):
+						Err(_):
+							None
+						Ok(post_dce_program):
+							Some(late_core_before_perceus(post_dce_program))
+
+
+-- Every measurement below shares one decoded `late_core` value. Each call is
+-- measured with a direct `reset_mem_stats()` / `get_mem_stats()` bracket
+-- around an ordinary (non-closure) call: wrapping a call in a `pure () -> T`
+-- closure passed to a generic higher-order helper defeats Perceus's own
+-- reuse/uniqueness analysis at that closure's call site (a captured
+-- argument is not eligible for the in-place, single-owner fast path a
+-- direct call gets), which turned a several-second `insert_drops_program`
+-- call into one that did not finish in 30 minutes on the real self-compile
+-- input during this measurement. `insert_drops_program` is called last, as
+-- the last statement using `late_core`, so it is also the last live
+-- reference and gets the same single-owner call shape production gives it.
+func run_profile(late_core: CoreProgram) -> Void:
+	functions: List[CoreFunction] = program_functions(late_core)
+
+	var lambda_count: Int = 0
+	for function_info in functions:
+		match function_info.body:
+			Some(body):
+				lambda_count += count_lambdas(body)
+			None:
+				void
+
+	region_count: Int = functions.length() + lambda_count + global_init_count(late_core)
+
+	print("helper\tcalls\tallocations\tallocations_per_call")
+
+	-- build_env: one call per program in production.
+	reset_mem_stats()
+	env: PerceusEnv = build_env(late_core)
+	env_stats: MemStats = get_mem_stats()
+	report_row("build_env", 1, env_stats.total_allocations)
+
+	print("-- region_count (functions + lambdas + global initializers): ${region_count}")
+	print("-- build_borrowed_owner_catalog and infer_user_call_contracts are private;")
+	print("-- see the results file for their numbers and methodology")
+
+	-- count_uses: sampled over up to SAMPLE_FUNCTION_LIMIT real function
+	-- bodies, once per parameter name, against that function's own body.
+	var count_uses_calls: Int = 0
+	var count_uses_allocations: Int = 0
+	var sampled_functions: Int = 0
+
+	for function_info in functions:
+		if sampled_functions < SAMPLE_FUNCTION_LIMIT:
+			match function_info.body:
+				Some(body):
+					sampled_functions += 1
+
+					for param in function_info.params:
+						name: String = param.name.name
+
+						reset_mem_stats()
+						uses: Int = count_uses(name, body)
+						cu_stats: MemStats = get_mem_stats()
+						count_uses_calls += 1
+						count_uses_allocations += cu_stats.total_allocations
+				None:
+					void
+		else:
+			void
+
+	report_row("count_uses", count_uses_calls, count_uses_allocations)
+
+	-- Whole pass, real frozen self-compile late Core, one call, called last
+	-- (see this function's docstring for why).
+	reset_mem_stats()
+	whole_result: CoreProgram = insert_drops_program(late_core)
+	whole_stats: MemStats = get_mem_stats()
+	print_error("run_profile: whole_result decls=${whole_result.decls.length()}")
+	report_row("insert_drops_program", 1, whole_stats.total_allocations)
+
+	void
+
+
+func main(args: List[String]) -> Int:
+	if args.length() < 2:
+		print("usage: perceus_allocations <post-dce-core-json-path>")
+		1
+	else:
+		path: String = args.get(1).get_or("")
+
+		match decode_late_core(path):
+			None:
+				print("decode failed")
+				1
+			Some(late_core):
+				run_profile(late_core)
+				0

@@ -387,6 +387,38 @@ BLORP_DCE_FACTS_SKIP_BUILD=1 \
   benchmarks/compiler_dce_facts_builder_allocations
 ```
 
+`compiler_perceus_allocations` follows the same model but drives the real
+frozen self-compile's Core instead of a synthetic fixture: it freezes an
+input revision, dumps Core just after DCE (`--dump-core-after=dce
+--dump-core-file=<path>`), and runs
+`benchmarks/blorp/profiles/perceus_allocations.brp` in-process, which
+advances the dumped Core through the remaining production pass functions
+(`run_consume_specialize_pass`, `run_static_string_literals_pass`,
+`run_record_update_ownership_pass`, `run_dict_literal_ownership_pass` --
+chained because `dict_literal_ownership` is not one of the CLI's exposed
+`--dump-core-after` stage names) to reach the exact Core state immediately
+before Perceus, then calls `insert_drops_program` and reports calls,
+allocations, and allocations per call:
+
+```bash
+benchmarks/compiler_perceus_allocations
+BLORP_PERCEUS_SKIP_BUILD=1 BLORP_PERCEUS_INPUT_REV=origin/main \
+  benchmarks/compiler_perceus_allocations
+```
+
+The committed profile only calls helpers that are public in
+`stage_09_core/perceus.brp` (`insert_drops_program`, `build_env`,
+`count_uses`) plus a static traversal of the decoded program (region count:
+functions, lambdas, global initializers). The full per-helper breakdown for
+Perceus's private helpers (`infer_user_call_contracts`,
+`build_borrowed_owner_catalog`, the `summarize_linear_ownership_uses`
+family, `rewrite_mutable_assignments`, `protect_repeated_consumes`,
+`stabilize_nested_assignment_rhs`, the synthetic `CoreVar` constructors) was
+captured once with those declarations temporarily made non-private, then
+reverted; see
+`benchmarks/results/perceus_allocation_attribution_2026-09-22.md` for the
+exact methodology, the one-line-per-declaration edit list, and the numbers.
+
 `compiler_core_lowering_allocation_attribution` runs a synthetic 1202-node
 typed program (400 variable-declaration/initializer/reference triples, all
 carrying one shared `SemanticType` object, plus an enclosing block) through
