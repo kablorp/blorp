@@ -2206,6 +2206,10 @@ static void __blorp_core_lowering_type_table_grow(void) {
     size_t grown = __blorp_core_lowering_type_table_capacity
         ? __blorp_core_lowering_type_table_capacity * 2
         : 256;
+    // Not an allocation the oracle observes, because this is compiler
+    // self-profiling instrumentation gated by BLORP_CORE_LOWERING_TYPE_METRICS
+    // (__blorp_core_lowering_type_metrics_enabled), independent of the subject
+    // program's execution.
     __blorp_CoreLoweringTypeMetricEntry* rows =
         (__blorp_CoreLoweringTypeMetricEntry*)calloc(
             grown,
@@ -2278,6 +2282,10 @@ void blorp_core_lowering_type_metrics_report_c(void) {
     if (__blorp_core_lowering_type_table_used == 0) return;
     // Sort a private copy so the live table (still being inserted into by any
     // later calls in this process) is never reordered under a caller's feet.
+    // Not an allocation the oracle observes, because this is compiler
+    // self-profiling instrumentation gated by BLORP_CORE_LOWERING_TYPE_METRICS
+    // (__blorp_core_lowering_type_metrics_enabled), independent of the subject
+    // program's execution.
     __blorp_CoreLoweringTypeMetricEntry* sorted =
         (__blorp_CoreLoweringTypeMetricEntry*)malloc(
             __blorp_core_lowering_type_table_capacity
