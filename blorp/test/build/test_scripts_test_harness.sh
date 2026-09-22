@@ -87,6 +87,16 @@ cp blorp/test/lib/run_blorp_check_fixtures.py \
 	"$TMP_HARNESS/blorp/test/lib/run_blorp_check_fixtures.py"
 cp blorp/test/lib/process_supervisor.py \
 	"$TMP_HARNESS/blorp/test/lib/process_supervisor.py"
+cp blorp/test/lib/run_python_unittest_gate.py \
+	"$TMP_HARNESS/blorp/test/lib/run_python_unittest_gate.py"
+# compiler-tools also counts the backend emitter guard unittest files; stub
+# each listed file with one passing test so the aggregated count is checked.
+mkdir -p "$TMP_HARNESS/blorp/test/compiler/stage_10_backend"
+for python_test in test_no_direct_emitter_allocation.py test_backend_helper_census.py; do
+	printf '%s\n' 'import unittest' '' '' 'class StubTests(unittest.TestCase):' \
+		'    def test_stub(self) -> None:' '        pass' \
+		> "$TMP_HARNESS/blorp/test/compiler/stage_10_backend/$python_test"
+done
 cat > "$TMP_HARNESS/blorp/test/tool/test_compiler_tool_fixtures.py" <<'PY'
 #!/usr/bin/env python3
 from pathlib import Path
@@ -934,7 +944,7 @@ compiler_tools_output="$TMP_HARNESS/compiler-tools-output.txt"
 compiler_tools_status=$?
 
 if [ "$compiler_tools_status" -ne 0 ] ||
-	! grep -Eq 'Compiler-Tools[[:space:]]+PASS[[:space:]]+3[[:space:]]+0[[:space:]]+3' \
+	! grep -Eq 'Compiler-Tools[[:space:]]+PASS[[:space:]]+5[[:space:]]+0[[:space:]]+5' \
 		"$compiler_tools_output"
 then
 	echo "FAIL: scripts/test compiler-tools should preserve public tool fixtures"

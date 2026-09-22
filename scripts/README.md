@@ -77,7 +77,7 @@ merging.
 ```bash
 scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
-scripts/test compiler-tools     # formatter, purify, and lint public CLI fixtures
+scripts/test compiler-tools     # formatter/purify/lint CLI fixtures + backend emitter guards
 scripts/test std-check          # broad standard-library source typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics

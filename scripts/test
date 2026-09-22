@@ -4,7 +4,7 @@
 # Usage:
 #   scripts/test                    # Run default test gates
 #   scripts/test compiler-blorp     # Compiler-owned Blorp TestSuites
-#   scripts/test compiler-tools     # Formatter, purify, and lint public CLI fixtures
+#   scripts/test compiler-tools     # Formatter/purify/lint CLI fixtures, backend emitter guards
 #   scripts/test compiler-core-sanitize  # Focused Core .brp tests under ASan + UBSan
 #   scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
 #   scripts/test std-check          # Broad standard-library source typecheck sweep
@@ -944,15 +944,23 @@ run_compiler_blorp_gate_commands() {
     return "$fixtures_exit"
 }
 
+# Python unittest files that guard the emitted backend C: the emitter must
+# not spell raw allocating runtime calls, and the small fixture's emitted
+# retain/release/allocation census must stay pinned. Both need bin/blorp.
+compiler_tools_python_tests=(
+    blorp/test/compiler/stage_10_backend/test_no_direct_emitter_allocation.py
+    blorp/test/compiler/stage_10_backend/test_backend_helper_census.py
+)
+
 run_compiler_tools_commands() {
     local output_file="$1"
     local live="${2:-false}"
-    local args
+    local args fixtures_exit python_exit output
 
     args=(
         --blorp-bin bin/blorp
         --timeout "$compiler_blorp_test_timeout"
-        --gate-name compiler_tools
+        --gate-name compiler_tools_component
     )
     if $verbose || [ -n "$log_dir" ]; then
         args+=(--verbose)
@@ -960,6 +968,30 @@ run_compiler_tools_commands() {
     capture_stream_append "$output_file" "$live" \
         env PYTHONDONTWRITEBYTECODE=1 \
         python3 blorp/test/tool/test_compiler_tool_fixtures.py "${args[@]}"
+    fixtures_exit=$?
+
+    {
+        echo ""
+        echo "═══ Backend Emitter Guards (Python unittest) ═══"
+        echo ""
+    } >> "$output_file"
+    capture_stream_append "$output_file" "$live" \
+        env PYTHONDONTWRITEBYTECODE=1 \
+        python3 blorp/test/lib/run_python_unittest_gate.py \
+            --timeout "$compiler_blorp_test_timeout" \
+            --gate-name compiler_tools_component \
+            "${compiler_tools_python_tests[@]}"
+    python_exit=$?
+
+    output=$(cat "$output_file")
+    emit_aggregated_blorp_result \
+        "$output" "compiler_tools_component" 2 \
+        "compiler_tools" >> "$output_file"
+
+    if [ "$fixtures_exit" -ne 0 ]; then
+        return "$fixtures_exit"
+    fi
+    return "$python_exit"
 }
 
 run_compiler_core_sanitize_commands() {
@@ -1098,7 +1130,7 @@ run_compiler_blorp() {
 }
 
 run_compiler_tools() {
-    echo "═══ Compiler Tool Fixtures (format/purify/lint) ═══"
+    echo "═══ Compiler Tool Fixtures (format/purify/lint) and Backend Emitter Guards ═══"
     echo ""
     local output exit_code output_file start_seconds
     start_seconds=$(now_seconds)
@@ -1372,7 +1404,7 @@ init_gate_output() {
             ;;
         compiler_tools)
             {
-                echo "═══ Compiler Tool Fixtures (format/purify/lint) ═══"
+                echo "═══ Compiler Tool Fixtures (format/purify/lint) and Backend Emitter Guards ═══"
                 echo ""
             } > "$outfile"
             ;;
