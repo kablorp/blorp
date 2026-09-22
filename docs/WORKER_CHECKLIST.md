@@ -84,6 +84,12 @@ benchmarks/self_compile_measure --label <task> --input-rev <rev> \
 
 ## Process Rules
 
+- Poll long builds and gates in the foreground with a BOUNDED loop
+  (`for i in $(seq 1 60); do grep -q '^BLORP_GATE_RESULT' log && break; sleep 30; done`),
+  never an unbounded `until ...; do sleep; done`; orphaned `until` loops from
+  finished workers have been found spinning for hours. Do not end a turn
+  while a build or gate runs.
+
 - Never spawn parallel compiled binaries on macOS.
 - Test codegen/RC changes in isolation before the full suite.
 - Do not parallelize Perceus or other late Core passes.
