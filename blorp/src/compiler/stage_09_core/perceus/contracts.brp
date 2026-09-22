@@ -160,6 +160,7 @@ import:
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreTailrecListSpreadRebind,
 		CoreTupleConstruct,
 		CoreTupleElement(
 			TupleFloat16Element,
@@ -324,9 +325,7 @@ private union ContractCollectionTaskStack:
 private record ContractCollectionState {
 	directly_consumed_parameters: Dict[Int, Bool],
 	user_call_flows: List[ParameterFlow],
-	seen_user_call_flows: Dict[Int, Dict[Int, Dict[Int, Bool]]],
-	contains_parameter_dup: Bool,
-	contains_parameter_shadow: Bool
+	seen_user_call_flows: Dict[Int, Dict[Int, Dict[Int, Bool]]]
 }
 
 
@@ -607,6 +606,648 @@ private pure func contract_expr_introduces_parameter_shadow(
 			contract_length_match_shadows_parameter(index, match_expr)
 		_:
 			False
+
+
+private pure func contract_expr_is_parameter_dup(
+	index: ContractParameterIndex,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		DupExpr(variable, _, _, _, _, _):
+			contract_parameter_index(index, variable) != None
+		_:
+			False
+
+
+private pure func contract_body_tuple_element_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	element: CoreTupleElement,
+) -> Bool:
+	match element:
+		TuplePrimElement(value):
+			contract_body_expr_matches(predicate, index, value)
+		TuplePointerElement(value):
+			contract_body_expr_matches(predicate, index, value)
+		TupleStructElement(value, _):
+			contract_body_expr_matches(predicate, index, value)
+		TupleStackResultElement(value):
+			contract_body_expr_matches(predicate, index, value)
+		TupleVoidElement:
+			False
+		TupleFloatElement(value):
+			contract_body_expr_matches(predicate, index, value)
+		TupleFloat32Element(value):
+			contract_body_expr_matches(predicate, index, value)
+		TupleFloat16Element(value):
+			contract_body_expr_matches(predicate, index, value)
+
+
+private pure func contract_body_optional_expr_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	value: Option[CoreExpr],
+) -> Bool:
+	match value:
+		Some(expr):
+			contract_body_expr_matches(predicate, index, expr)
+		None:
+			False
+
+
+private pure func contract_body_select_arm_kind_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	kind: CoreSelectArmKind,
+) -> Bool:
+	match kind:
+		SelectRecvArm(recv):
+			contract_body_expr_matches(predicate, index, recv.channel)
+		SelectSealedArm(channel):
+			contract_body_expr_matches(predicate, index, channel)
+		SelectAfterArm(timeout):
+			contract_body_expr_matches(predicate, index, timeout)
+
+
+private pure func contract_body_literal_match_fallback_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	fallback: CoreLiteralMatchFallback,
+) -> Bool:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			contract_body_expr_matches(predicate, index, body)
+		LiteralMatchFallbackBindings(_, body):
+			contract_body_expr_matches(predicate, index, body)
+		LiteralMatchFallbackFail:
+			False
+
+
+private pure func contract_body_constructor_match_body_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	body: CoreConstructorMatchBody,
+) -> Bool:
+	match body:
+		ConstructorMatchBodyExpr(expr):
+			contract_body_expr_matches(predicate, index, expr)
+		ConstructorMatchBodyLiteral(match_expr):
+			contract_body_constructor_literal_match_matches(predicate, index, match_expr)
+		ConstructorMatchBodyLength(match_expr):
+			contract_body_constructor_length_match_matches(predicate, index, match_expr)
+
+
+private pure func contract_body_constructor_length_branch_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	branch: CoreConstructorLengthMatchBranch,
+) -> Bool:
+	contract_body_constructor_match_body_matches(predicate, index, branch.body)
+
+
+private pure func contract_body_constructor_match_fallback_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	fallback: CoreConstructorMatchFallback,
+) -> Bool:
+	match fallback:
+		ConstructorMatchFallbackBody(body):
+			contract_body_expr_matches(predicate, index, body)
+		ConstructorMatchFallbackBindings(_, body):
+			contract_body_expr_matches(predicate, index, body)
+		ConstructorMatchFallbackFail:
+			False
+
+
+private pure func contract_body_record_cow_field_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	field: CoreRecordCowField,
+) -> Bool:
+	match field.replacement:
+		Some(replacement):
+			contract_body_expr_matches(predicate, index, replacement)
+		None:
+			False
+
+
+-- The following `contract_body_any_*_matches` helpers loop explicitly
+-- instead of using `List.any` with an inline lambda: a lambda that captures
+-- `predicate` and `index` is allocated at every call in this language, and
+-- these helpers are themselves called from inside a whole-body recursive
+-- walk (`contract_body_expr_matches`), so a captured closure per list would
+-- reintroduce the per-node allocation this query is meant to avoid.
+private pure func contract_body_any_expr_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	exprs: List[CoreExpr],
+) -> Bool:
+	var found: Bool = False
+
+	for item in exprs:
+		if contract_body_expr_matches(predicate, index, item):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_tuple_element_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	elements: List[CoreTupleElement],
+) -> Bool:
+	var found: Bool = False
+
+	for element in elements:
+		if contract_body_tuple_element_matches(predicate, index, element):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_boxed_storage_value_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	values: List[CoreBoxedStorageValue],
+) -> Bool:
+	var found: Bool = False
+
+	for value in values:
+		if contract_body_expr_matches(predicate, index, value.value):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_record_field_value_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	fields: List[CoreRecordFieldValue],
+) -> Bool:
+	var found: Bool = False
+
+	for field in fields:
+		if contract_body_expr_matches(predicate, index, field.value):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_record_cow_field_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	fields: List[CoreRecordCowField],
+) -> Bool:
+	var found: Bool = False
+
+	for field in fields:
+		if contract_body_record_cow_field_matches(predicate, index, field):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_dict_entry_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	entries: List[CoreDictEntry],
+) -> Bool:
+	var found: Bool = False
+
+	for entry in entries:
+		if contract_body_expr_matches(predicate, index, entry.key.value):
+			found = True
+			break
+		else:
+			if contract_body_expr_matches(predicate, index, entry.value.value):
+				found = True
+				break
+			else:
+				void
+
+	found
+
+
+private pure func contract_body_any_rebind_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	rebinds: List[CoreTailrecListSpreadRebind],
+) -> Bool:
+	var found: Bool = False
+
+	for rebind in rebinds:
+		if contract_body_expr_matches(predicate, index, rebind.value):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_concurrent_binding_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	bindings: List[CoreConcurrentBinding],
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if contract_body_expr_matches(predicate, index, binding.rhs):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_pre_closure_concurrent_binding_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	bindings: List[CorePreClosureConcurrentBinding],
+) -> Bool:
+	var found: Bool = False
+
+	for binding in bindings:
+		if contract_body_expr_matches(predicate, index, binding.rhs):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_select_arm_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	arms: List[CoreSelectArm],
+) -> Bool:
+	var found: Bool = False
+
+	for arm in arms:
+		if contract_body_select_arm_kind_matches(predicate, index, arm.kind):
+			found = True
+			break
+		else:
+			if contract_body_expr_matches(predicate, index, arm.body):
+				found = True
+				break
+			else:
+				void
+
+	found
+
+
+private pure func contract_body_any_literal_match_case_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	cases: List[CoreLiteralMatchCase],
+) -> Bool:
+	var found: Bool = False
+
+	for match_case in cases:
+		if contract_body_expr_matches(predicate, index, match_case.body):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_constructor_match_case_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	cases: List[CoreConstructorMatchCase],
+) -> Bool:
+	var found: Bool = False
+
+	for match_case in cases:
+		if contract_body_constructor_match_body_matches(predicate, index, match_case.body):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_any_constructor_length_match_case_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	cases: List[CoreConstructorLengthMatchCase],
+) -> Bool:
+	var found: Bool = False
+
+	for match_case in cases:
+		if contract_body_constructor_length_branch_matches(predicate, index, match_case.branch):
+			found = True
+			break
+
+	found
+
+
+private pure func contract_body_constructor_literal_match_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	match_expr: CoreConstructorLiteralMatch,
+) -> Bool:
+	(
+		contract_body_any_literal_match_case_matches(predicate, index, match_expr.cases)
+		or contract_body_literal_match_fallback_matches(predicate, index, match_expr.fallback)
+	)
+
+
+private pure func contract_body_constructor_length_match_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	match_expr: CoreConstructorLengthMatch,
+) -> Bool:
+	geq_matches: Bool = match match_expr.geq:
+		Some(geq):
+			contract_body_constructor_length_branch_matches(predicate, index, geq.branch)
+		None:
+			False
+
+	fallback_matches: Bool = match match_expr.fallback:
+		Some(branch):
+			contract_body_constructor_length_branch_matches(predicate, index, branch)
+		None:
+			False
+
+	(
+		contract_body_any_constructor_length_match_case_matches(predicate, index, match_expr.cases)
+		or geq_matches
+		or fallback_matches
+	)
+
+
+-- Early-exit query, run once before collection instead of on every task
+-- popped off `ContractCollectionTaskStack`, so a hit no longer rebuilds
+-- `ContractCollectionState` (both `contains_parameter_dup` and
+-- `contains_parameter_shadow` used to be set that way). `predicate` is a
+-- single-node test (`contract_expr_is_parameter_dup` or
+-- `contract_expr_introduces_parameter_shadow`); this function supplies the
+-- descent, matching each `CoreExpr` child directly instead of collecting
+-- them through `CoreTraverse.immediate_core_expr_children` -- that helper
+-- builds a fresh `List` per node, which measured as a real allocation rise
+-- on the self-compile when used for this whole-body query. Stops at a
+-- `LambdaExpr` without checking or descending into its body: that body is a
+-- future closure-body callable's region, visited later under
+-- `InspectNestedContractRegion` by the task-stack walk for accounting only,
+-- so neither predicate ever applied there even before this change. Only
+-- `CoreExpr` shapes reachable at this pipeline stage (the ones already
+-- matched elsewhere in this file) are covered directly; anything else falls
+-- back to the generic child mapper, which is exercised only if one of those
+-- shapes ever reaches contract collection.
+private pure func contract_body_expr_matches(
+	predicate: pure (ContractParameterIndex, CoreExpr) -> Bool,
+	index: ContractParameterIndex,
+	expr: CoreExpr,
+) -> Bool:
+	if predicate(index, expr):
+		True
+	else:
+		match expr:
+			LambdaExpr(_, _, _, _, _, _):
+				False
+			LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _) | BreakExpr(_, _) | ClosureCreateExpr(_, _, _) | DetachExpr(_, _, _):
+				False
+			DebugBlockExpr(body, _, _):
+				contract_body_expr_matches(predicate, index, body)
+			CallExpr(_, callee, args, _, _):
+				(
+					contract_body_expr_matches(predicate, index, callee)
+					or contract_body_any_expr_matches(predicate, index, args)
+				)
+			BinaryExpr(_, left, right, _, _) | LogicalExpr(_, left, right, _, _):
+				(
+					contract_body_expr_matches(predicate, index, left)
+					or contract_body_expr_matches(predicate, index, right)
+				)
+			UnaryExpr(_, value, _, _) | CastExpr(value, _, _) | UnboxExpr(_, value, _, _) | FieldExpr(value, _, _, _) | TupleFieldExpr(value, _, _, _):
+				contract_body_expr_matches(predicate, index, value)
+			AssignExpr(_, rhs, _, _):
+				contract_body_expr_matches(predicate, index, rhs)
+			BoxExpr(box, _, _):
+				contract_body_expr_matches(predicate, index, box.value)
+			TupleExpr(items, _, _) | VectorExpr(items, _, _):
+				contract_body_any_expr_matches(predicate, index, items)
+			TupleConstructExpr(construct, _, _):
+				contract_body_any_tuple_element_matches(predicate, index, construct.elements)
+			ListConstructExpr(construct, _, _) | TensorBoxedLiteralExpr(construct, _, _):
+				contract_body_any_boxed_storage_value_matches(predicate, index, construct.elements)
+			UnionConstructExpr(construct, _, _):
+				contract_body_any_boxed_storage_value_matches(predicate, index, construct.args)
+			ListAllocExpr(alloc, _, _):
+				contract_body_expr_matches(predicate, index, alloc.capacity)
+			ListGetExpr(get, _, _):
+				(
+					contract_body_expr_matches(predicate, index, get.list)
+					or contract_body_expr_matches(predicate, index, get.index)
+				)
+			ListHandoffExpr(handoff, _, _):
+				(
+					contract_body_expr_matches(predicate, index, handoff.source)
+					or contract_body_expr_matches(predicate, index, handoff.capacity)
+					or contract_body_expr_matches(predicate, index, handoff.body)
+				)
+			ListHandoffSetOwnedExpr(set, _, _):
+				(
+					contract_body_expr_matches(predicate, index, set.list)
+					or contract_body_expr_matches(predicate, index, set.index)
+					or contract_body_expr_matches(predicate, index, set.value.value)
+				)
+			ListHandoffSetSourceSlotExpr(slot, _, _):
+				(
+					contract_body_expr_matches(predicate, index, slot.result)
+					or contract_body_expr_matches(predicate, index, slot.out_index)
+					or contract_body_expr_matches(predicate, index, slot.source)
+					or contract_body_expr_matches(predicate, index, slot.source_index)
+				)
+			ListRetainExpr(retain, _, _):
+				(
+					contract_body_expr_matches(predicate, index, retain.list)
+					or contract_body_expr_matches(predicate, index, retain.value.value)
+				)
+			ListSetExpr(set, _, _):
+				(
+					contract_body_expr_matches(predicate, index, set.list)
+					or contract_body_expr_matches(predicate, index, set.index)
+					or contract_body_expr_matches(predicate, index, set.value.value)
+				)
+			ListSwapExpr(swap, _, _):
+				(
+					contract_body_expr_matches(predicate, index, swap.list)
+					or contract_body_expr_matches(predicate, index, swap.left_index)
+					or contract_body_expr_matches(predicate, index, swap.right_index)
+				)
+			StringByteReadExpr(read, _, _):
+				(
+					contract_body_expr_matches(predicate, index, read.source)
+					or contract_body_expr_matches(predicate, index, read.index)
+				)
+			StringByteWriteExpr(write, _, _):
+				(
+					contract_body_expr_matches(predicate, index, write.target)
+					or contract_body_expr_matches(predicate, index, write.index)
+					or contract_body_expr_matches(predicate, index, write.byte)
+				)
+			StringByteCopyExpr(copy, _, _):
+				(
+					contract_body_expr_matches(predicate, index, copy.dst)
+					or contract_body_expr_matches(predicate, index, copy.dst_pos)
+					or contract_body_expr_matches(predicate, index, copy.src)
+					or contract_body_expr_matches(predicate, index, copy.src_pos)
+					or contract_body_expr_matches(predicate, index, copy.len)
+				)
+			StringSetLenExpr(set_len, _, _):
+				(
+					contract_body_expr_matches(predicate, index, set_len.target)
+					or contract_body_expr_matches(predicate, index, set_len.len)
+				)
+			TensorRawFillExpr(fill, _, _):
+				(
+					contract_body_expr_matches(predicate, index, fill.value)
+					or contract_body_any_expr_matches(predicate, index, fill.dims)
+				)
+			TensorRawReadExpr(read, _, _):
+				contract_body_expr_matches(predicate, index, read.index)
+			TensorRawWriteExpr(write, _, _):
+				(
+					contract_body_expr_matches(predicate, index, write.index)
+					or contract_body_expr_matches(predicate, index, write.value)
+				)
+			TensorRawViewLetExpr(binding, body, _, _):
+				(
+					contract_body_expr_matches(predicate, index, binding.source)
+					or contract_body_expr_matches(predicate, index, body)
+				)
+			DictConstructExpr(construct, _, _):
+				contract_body_any_dict_entry_matches(predicate, index, construct.entries)
+			RecordExpr(fields, _, _) | RecordConstructExpr(_, fields, _, _):
+				contract_body_any_record_field_value_matches(predicate, index, fields)
+			RecordUpdateExpr(base, fields, _, _) | RecordReuseExpr(base, fields, _, _):
+				(
+					contract_body_expr_matches(predicate, index, base)
+					or contract_body_any_record_field_value_matches(predicate, index, fields)
+				)
+			RecordCowUpdateExpr(source, fields, _, _):
+				(
+					contract_body_expr_matches(predicate, index, source)
+					or contract_body_any_record_cow_field_matches(predicate, index, fields)
+				)
+			PreClosureDetachExpr(detached, _, _):
+				contract_body_expr_matches(predicate, index, detached)
+			DupExpr(_, _, _, body, _, _) | DropExpr(_, _, _, body, _, _):
+				contract_body_expr_matches(predicate, index, body)
+			LetExpr(_, _, _, rhs, body) | BorrowLetExpr(_, _, rhs, body):
+				(
+					contract_body_expr_matches(predicate, index, rhs)
+					or contract_body_expr_matches(predicate, index, body)
+				)
+			SeqExpr(first, second):
+				(
+					contract_body_expr_matches(predicate, index, first)
+					or contract_body_expr_matches(predicate, index, second)
+				)
+			WhileExpr(cond, body, _, _):
+				(
+					contract_body_expr_matches(predicate, index, cond)
+					or contract_body_expr_matches(predicate, index, body)
+				)
+			ResourceScopeExpr(scope, _, _):
+				(
+					contract_body_expr_matches(predicate, index, scope.acquire)
+					or contract_body_expr_matches(predicate, index, scope.body)
+					or contract_body_expr_matches(predicate, index, scope.cleanup)
+				)
+			ResourceCleanupExitExpr(cleanup_exit, _, _):
+				contract_body_any_expr_matches(predicate, index, cleanup_exit.cleanups)
+			TailrecLoopExpr(_, _, body, _):
+				contract_body_expr_matches(predicate, index, body)
+			TailrecRecurExpr(args, _, _):
+				contract_body_any_expr_matches(predicate, index, args)
+			TailrecListSpreadLoopExpr(loop, _):
+				contract_body_expr_matches(predicate, index, loop.body)
+			TailrecListSpreadRecurExpr(rebinds, _, _, _):
+				contract_body_any_rebind_matches(predicate, index, rebinds)
+			ForRangeExpr(_, start, end_value, body, _, _):
+				(
+					contract_body_expr_matches(predicate, index, start)
+					or contract_body_expr_matches(predicate, index, end_value)
+					or contract_body_expr_matches(predicate, index, body)
+				)
+			ForChannelExpr(loop, _, _) | ForListExpr(loop, _, _) | ForStringExpr(loop, _, _) | ForDictExpr(loop, _, _) | ForSetExpr(loop, _, _) | ForStreamExpr(loop, _, _) | ForResourceSourceExpr(loop, _, _) | ForTensorExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+				)
+			PreClosureConcurrentlyLoopExpr(loop, _, _) | ConcurrentlyLoopExpr(loop, _, _):
+				(
+					contract_body_expr_matches(predicate, index, loop.iterable)
+					or contract_body_expr_matches(predicate, index, loop.body)
+					or contract_body_optional_expr_matches(predicate, index, loop.timeout)
+					or contract_body_expr_matches(predicate, index, loop.limit)
+				)
+			PreClosureConcurrentExpr(block, _, _):
+				(
+					contract_body_any_pre_closure_concurrent_binding_matches(predicate, index, block.bindings)
+					or contract_body_expr_matches(predicate, index, block.body)
+					or contract_body_optional_expr_matches(predicate, index, block.timeout)
+				)
+			ConcurrentExpr(block, _, _):
+				(
+					contract_body_any_concurrent_binding_matches(predicate, index, block.bindings)
+					or contract_body_expr_matches(predicate, index, block.body)
+					or contract_body_optional_expr_matches(predicate, index, block.timeout)
+				)
+			SelectExpr(select_expr, _, _):
+				contract_body_any_select_arm_matches(predicate, index, select_expr)
+			IfExpr(cond, then_expr, else_expr, _, _):
+				(
+					contract_body_expr_matches(predicate, index, cond)
+					or contract_body_expr_matches(predicate, index, then_expr)
+					or contract_body_expr_matches(predicate, index, else_expr)
+				)
+			LiteralMatchExpr(scrutinee, cases, fallback, _, _):
+				(
+					contract_body_expr_matches(predicate, index, scrutinee)
+					or contract_body_any_literal_match_case_matches(predicate, index, cases)
+					or contract_body_literal_match_fallback_matches(predicate, index, fallback)
+				)
+			AccessorLiteralMatchExpr(scrutinee, _, match_expr, _, _):
+				(
+					contract_body_expr_matches(predicate, index, scrutinee)
+					or contract_body_constructor_literal_match_matches(predicate, index, match_expr)
+				)
+			LengthMatchExpr(scrutinee, _, match_expr, _, _):
+				(
+					contract_body_expr_matches(predicate, index, scrutinee)
+					or contract_body_constructor_length_match_matches(predicate, index, match_expr)
+				)
+			ConstructorMatchExpr(scrutinee, _, cases, fallback, _, _):
+				(
+					contract_body_expr_matches(predicate, index, scrutinee)
+					or contract_body_any_constructor_match_case_matches(predicate, index, cases)
+					or contract_body_constructor_match_fallback_matches(predicate, index, fallback)
+				)
+			_:
+				CoreTraverse.any_core_expr(
+					CoreTraverse.immediate_core_expr_children(expr),
+					func(child): contract_body_expr_matches(predicate, index, child),
+				)
+
+
+private pure func contract_body_contains_parameter_dup(
+	index: ContractParameterIndex,
+	expr: CoreExpr,
+) -> Bool:
+	contract_body_expr_matches(contract_expr_is_parameter_dup, index, expr)
+
+
+private pure func contract_body_contains_parameter_shadow(
+	index: ContractParameterIndex,
+	expr: CoreExpr,
+) -> Bool:
+	contract_body_expr_matches(contract_expr_introduces_parameter_shadow, index, expr)
 
 
 private pure func contract_direct_alias_parameter(
@@ -1108,15 +1749,8 @@ private pure func schedule_contract_linear(
 				)
 			}
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			parameter_dup: Bool = contract_parameter_index(index, variable) != None
-
-			next_state: ContractCollectionState = if parameter_dup:
-				{ state | contains_parameter_dup = True }
-			else:
-				state
-
 			{
-				state = next_state,
+				state = state,
 				pending = push_contract_task(pending, demand, body)
 			}
 		RecordExpr(fields, typ, loc) | RecordConstructExpr(_, fields, typ, loc):
@@ -1564,12 +2198,12 @@ private pure func collect_function_contract_equation(
 		perceus_work_contract_function_analyses()
 
 	parameter_index: ContractParameterIndex = build_contract_parameter_index(env, func_info.params)
+	contains_parameter_dup: Bool = contract_body_contains_parameter_dup(parameter_index, body)
+	contains_parameter_shadow: Bool = contract_body_contains_parameter_shadow(parameter_index, body)
 	var state: ContractCollectionState = {
 		directly_consumed_parameters = {},
 		user_call_flows = [],
-		seen_user_call_flows = {},
-		contains_parameter_dup = False,
-		contains_parameter_shadow = False
+		seen_user_call_flows = {}
 	}
 	var pending: ContractCollectionTaskStack = ContractCollectionMore(
 		ReturnContractResult(func_info.return_type),
@@ -1585,20 +2219,6 @@ private pure func collect_function_contract_equation(
 
 				debug:
 					perceus_work_contract_collection_expression_visits()
-
-				checks_enclosing_parameter_identity: Bool = match demand:
-					InspectNestedContractRegion:
-						False
-					_:
-						True
-
-				if (
-					checks_enclosing_parameter_identity
-					and contract_expr_introduces_parameter_shadow(parameter_index, expr)
-				):
-					state = { state | contains_parameter_shadow = True }
-				else:
-					void
 
 				step: ContractCollectionStep = match demand:
 					InspectNestedContractRegion:
@@ -1917,8 +2537,8 @@ private pure func collect_function_contract_equation(
 			directly_consumed_parameters = directly_consumed
 		},
 		user_call_flows = state.user_call_flows,
-		contains_parameter_dup = state.contains_parameter_dup,
-		contains_parameter_shadow = state.contains_parameter_shadow
+		contains_parameter_dup = contains_parameter_dup,
+		contains_parameter_shadow = contains_parameter_shadow
 	}
 
 
