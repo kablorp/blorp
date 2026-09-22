@@ -713,3 +713,214 @@ per the go/no-go result.
 One commit, instrumentation and this results section together (deliverable
 1 only -- deliverable 2's 20% gate was not met, so there is no second,
 behavior-changing commit for this issue).
+
+## P8 follow-up: what the walk's 5.77 allocations per node visit are made of
+## (2026-09-22, fourth pass)
+
+The prior section found 5.77 allocations per frame-stack node visit inside
+`summarize_linear_ownership_uses`, and ruled out re-summarizing the same
+`(name, expr)` pair as the cause (only 2.6% of the walk's allocations).
+This pass attributes those 5.77 allocations/visit to a source category,
+using the same allocation-free `BLORP_PERCEUS_ENGINE_METRICS` mechanism,
+to find out whether the walk's own per-node shape (not duplicate work) is
+concentrated in one avoidable place.
+
+### Instrumentation
+
+Two new plain occurrence counters (`perceus_engine_summary_record_construct`/
+`_frame_push`, `runtime.c`), each a single global increment gated on
+`perceus_engine_metrics_enabled()`, called once per `OwnershipUseSummary`
+record literal and once per `PerceusOwnershipSummaryFrameStack` frame
+construction in `perceus/uses.brp` (`ownership_uses_from_legacy_count`,
+`seq_ownership_uses`, `ownership_uses_with_returns_alias`,
+`sum_ownership_uses`, `branch_ownership_uses_pair`, `branch_ownership_uses`,
+and the frame-unwind `PerceusOwnershipSummaryDupBodyFrame` arm for (a); all
+nine push sites in the frame-stack loop for (b)). Both shapes are
+documented ("a push costs one allocation") to cost exactly one allocation
+per construction -- the same assumption `PerceusInsertBindingFrameStack`'s
+push count already relied on in the first section of this file -- so the
+counts double as the categories' allocation counts directly, with no
+per-construction bracket needed.
+
+For the call/match/repeated-body/borrow dispatch (categories c, e, f), six
+functions were split into a public wrapper plus a private `_impl` and
+bracketed with the existing `perceus_engine_node_enter`/`_node_exit`
+mechanism, the same pattern `rebuild_managed_let`'s own drill-down used:
+`summarize_linear_call` (`"summary:call"`), `summarize_call_args`
+(`"summary:call-args-list"`, nested inside the call bracket),
+`summarize_match_ownership_uses` (`"summary:match-combine"`),
+`summarize_constructor_literal_match_uses`/`summarize_constructor_length_match_uses`/
+`summarize_constructor_match_branch_uses` (all three share the label
+`"summary:match-branch-list"`, since they are the three list-building
+callers that assemble `branch_uses` before `summarize_match_ownership_uses`
+combines it with the scrutinee), `summarize_repeated_body_uses`
+(`"summary:repeated-body"`), and `summarize_linear_borrow`
+(`"summary:borrow"`). Two more call sites -- the `count_uses` legacy
+fallback in the `WhileExpr` arm and in the dispatch's final `_:` arm -- were
+bracketed individually (both labeled `"summary:legacy-count-fallback-site"`)
+since the fallback itself is a two-line expression, not a named helper.
+
+**Scope caveats**, matching the pattern the prior drill-down already
+established:
+
+- `summarize_match_ownership_uses` is also called from `contracts.brp`
+  (4 call sites, a file owned by another concurrent worker and not
+  touched here), so its row aggregates across the whole compile, not just
+  the summary walk.
+- `summarize_linear_borrow` is also called from `balance.brp` (3 sites) and
+  `contracts.brp` (4 sites), and is self-recursive (`FieldExpr`/
+  `TupleFieldExpr`/`CastExpr`/`BoxExpr`/`UnboxExpr` all recurse into it),
+  so both its aggregation and its self-recursion caveats from the prior
+  section's methodology apply; its **self** number is what is trustworthy.
+- `summarize_linear_call` has one external caller (`protect.brp`); not
+  separately checked for magnitude here, but it is a single call site
+  against `summarize_linear_call`'s 1.86M calls in this run, so its
+  contribution is expected to be negligible by the same reasoning the
+  prior section applied to `balance_let_body_legacy`'s one external caller.
+- **Dead-code note, found while locating the match-arm sites**:
+  `summarize_linear_ownership_uses_non_binding` has its own `LetExpr`/
+  `BorrowLetExpr`/`SeqExpr`/`AssignExpr`/`DupExpr`/`DropExpr`/
+  `DebugBlockExpr` arms (including a second `OwnershipUseSummary`
+  construction site for `DupExpr`, not instrumented here), but its single
+  caller is the frame-stack loop's own catch-all `_:` arm, which is only
+  reached for a `current_expr` that already failed to match exactly those
+  same seven kinds one level up. These arms therefore appear unreachable.
+  Flagged separately rather than fixed here (out of scope for an
+  attribution-only pass); see the spawned follow-up.
+
+### On/off honesty check
+
+Frozen input: `benchmarks/self_compile_measure freeze --rev origin/main`,
+commit `424d61c8946b43b5eae788a2185fd6e436d191ce` (`origin/main` after the
+prior census commit landed). Two direct compiles, `BLORP_CLI_C_OPTIMIZATION=-O2`,
+`BLORP_COMPILER_MEMORY_PROFILE=1`, identical otherwise except
+`BLORP_PERCEUS_ENGINE_METRICS`:
+
+| | `pass_dict_literal_ownership_complete` (cumulative) | `pass_perceus_complete` (cumulative) | Pass delta |
+| --- | ---: | ---: | ---: |
+| Metric unset | 148,803,855 | 211,530,490 | 62,726,635 |
+| `BLORP_PERCEUS_ENGINE_METRICS=1` | 148,803,855 | 211,530,490 | 62,726,635 |
+
+Identical; generated C is also byte-identical between the two runs and
+against the small smoke-test program used to check the instrumentation
+first.
+
+### The table
+
+Same frozen input, `BLORP_PERCEUS_ENGINE_METRICS=1` run. The pass delta
+above (62,726,635) is higher than the second section's 60,379,360 and the
+first section's 60,868,648 -- input drift between measurement runs on
+different commits of a self-compiling compiler (this frozen input now
+embeds every `uses.brp`/`results_and_loops.brp` line this issue has added
+so far), the same effect the prior two sections already documented and not
+a regression (confirmed by the on/off match immediately above, on this
+same commit).
+
+```
+BLORP_PERCEUS_ENGINE_LET_BINDINGS schema=1 total=73908 managed=57604
+BLORP_PERCEUS_ENGINE_SUMMARY schema=1 node_visits=9254533 external_calls=1137629 external_repeated_calls=160240 repeated_inclusive_allocations=1560675
+BLORP_PERCEUS_ENGINE_SUMMARY_SHAPES schema=1 record_constructions=11083210 frame_pushes=4339854
+BLORP_PERCEUS_ENGINE_NODE kind=helper:summarize_linear_ownership_uses calls=4801402 self_allocations=8189104 inclusive_allocations=59702445 self_per_call=1.706
+BLORP_PERCEUS_ENGINE_NODE kind=summary:call calls=1859998 self_allocations=9643638 inclusive_allocations=21856008 self_per_call=5.185
+BLORP_PERCEUS_ENGINE_NODE kind=summary:call-args-list calls=1859998 self_allocations=1907495 inclusive_allocations=12211390 self_per_call=1.026
+BLORP_PERCEUS_ENGINE_NODE kind=summary:match-branch-list calls=100169 self_allocations=220897 inclusive_allocations=11308029 self_per_call=2.205
+BLORP_PERCEUS_ENGINE_NODE kind=summary:match-combine calls=99802 self_allocations=113672 inclusive_allocations=113672 self_per_call=1.139
+BLORP_PERCEUS_ENGINE_NODE kind=summary:repeated-body calls=17381 self_allocations=34752 inclusive_allocations=1376111 self_per_call=1.999
+BLORP_PERCEUS_ENGINE_NODE kind=summary:legacy-count-fallback-site calls=23 self_allocations=23 inclusive_allocations=23 self_per_call=1.000
+BLORP_PERCEUS_ENGINE_NODE kind=summary:borrow calls=4312382 self_allocations=0 inclusive_allocations=3993817 self_per_call=0.000
+```
+
+`summarize_linear_ownership_uses`'s own inclusive allocations, 59,702,445,
+is used below as "the walk" -- 95.2% of this run's 62,726,635-allocation
+pass delta.
+
+| Category | Source | Count | Allocations | % of walk | % of pass |
+| --- | --- | ---: | ---: | ---: | ---: |
+| (a) `OwnershipUseSummary` record returned per node | `record_constructions` | 11,083,210 | 11,083,210 | **18.56%** | 17.67% |
+| (b) `PerceusOwnershipSummaryFrameStack` pushes | `frame_pushes` | 4,339,854 | 4,339,854 | 7.27% | 6.92% |
+| (c) List construction in aggregate/branch arms | `summary:call-args-list` self (1,907,495) + `summary:match-branch-list` self (220,897) | -- | 2,128,392 | 3.57% | 3.39% |
+| (d) `Option`/`Result`/tuple wrappers on return paths | none found on the walk's hot paths | -- | ~0 | ~0% | ~0% |
+| (e) `count_uses` fallbacks | `summary:repeated-body` self (34,752) + `summary:legacy-count-fallback-site` self (23) | -- | 34,775 | 0.06% | 0.06% |
+| (f) `summarize_linear_borrow` re-walks | `summary:borrow` self | -- | 0 | 0% | 0% |
+| (g) everything else (call/match dispatch glue, the frame loop's own unbracketed record/frame work) | `summary:call` self (9,643,638) + `summary:match-combine` self (113,672) + `helper:summarize_linear_ownership_uses` self (8,189,104) | -- | 17,946,414 | 30.06% | 28.61% |
+
+Rows do not sum to the walk's 59,702,445: (a) and (b) are cross-cutting
+shape counts (every construction anywhere in the walk, regardless of which
+named bracket, if any, is active when it happens), while (c)/(e)/(f)/(g)
+attribute cost by call path, and a construction inside e.g.
+`summary:call`'s own glue is counted once in (a)'s global tally and again
+inside (g)'s `summary:call` self number. This is the same overlapping-row
+shape the prior `rebuild_managed_let` drill-down already reported ("budget
+arithmetic does not sum exactly... the remainder is uninstrumented glue")
+and is disclosed rather than forced to add up.
+
+### (d): no wrapper found
+
+Unlike the lowering metric's Result-of-tuple box, no `Option`/`Result`/
+tuple construction was found on `summarize_linear_ownership_uses`'s
+dominant paths. `contract_for_call` returns `Option[OwnershipCallContract]`
+and is matched immediately in `summarize_linear_call_impl` without being
+stored or threaded further; `summarize_call_args` returns a plain `List`;
+`call_result_aliases_target` returns a `Bool`. Category (d) is negligible
+here because there is nothing to attribute.
+
+### (f): a pure delegator
+
+`summarize_linear_borrow`'s self allocations are exactly 0 across
+4,312,382 calls: its `VarExpr` arm returns one of the two pre-built shared
+constants (`BORROW_OWNERSHIP_USE`/`NO_OWNERSHIP_USES`, module-level values
+built once, not per call), and every other arm either recurses into itself
+or falls through to `summarize_linear_ownership_uses` -- both charged to
+the child, never to this function's own self. It is a router, not an
+allocation site; its cost surfaces entirely in category (a) (via whichever
+`seq_ownership_uses`/etc. its callees construct) or in the recursive
+`helper:summarize_linear_ownership_uses` bracket.
+
+### Go/no-go: does any category exceed 25% of the walk's allocations?
+
+**No single actionable category does.** (g), the residual "everything
+else" bucket, is the only row above 25% (30.06%), but it is not one
+mechanism -- it is `summary:call`'s own dispatch glue (contract lookup,
+`aggregate_ownership_uses_from`'s per-item combine, alias checks),
+`summary:match-combine`'s scrutinee/branch combine, and the frame loop's
+own record/frame construction that happens directly at the top level
+rather than inside a named bracket, three different things lumped together
+because none of them cleared 5% individually against the pass in the
+`rebuild_managed_let` drill-down's own methodology (a further split was
+not instrumented, since doing so risked re-litigating that prior issue's
+scope). It does not have "the exact shape" of a single cut.
+
+Of the concrete, single-mechanism categories, **(a) `OwnershipUseSummary`
+record construction is the largest at 18.56% of the walk** (17.67% of the
+pass) -- under the 25% bar. Per the brief, a category that clears 25% and
+requires changing `OwnershipUseSummary`'s own representation is not to be
+implemented in this pass regardless (the record's docstring already
+records a measured, rejected flattening); (a) does not clear the bar
+either way, so this is moot here. (b) frame pushes (7.27%), (c) list
+construction (3.57%), (e) legacy-count fallback (0.06%), and (f) borrow
+delegation (0%) are all well under 25% and are not list-construction- or
+wrapper-shaped cuts a loop could trivially avoid -- (c) is the one category
+matching that description in the brief, and at 3.57% of the walk it is an
+order of magnitude under the bar.
+
+**No cut is proposed or implemented.** This is a negative result:
+allocations per node visited are inherent to how many `OwnershipUseSummary`
+records and `PerceusOwnershipSummaryFrameStack` frames a walk of this shape
+builds, spread across the dispatch, not concentrated in one avoidable
+per-call wrapper or list. `pass_perceus_complete` is unchanged by this
+commit (instrumentation only, confirmed by the on/off check above).
+
+### Gates (`benchmarks/self_compile_measure lock --`, foreground)
+
+- `bin/blorp test --timeout 600 blorp/test/compiler/stage_09_core/test_core_perceus.brp` -- 364 passed.
+- `python3 -m unittest blorp.test.compiler.benchmark.test_perceus_memory` -- 80 passed.
+- `make hygiene-check` -- passed.
+- `scripts/compiler-check --changed` -- passed (1 source changed, 2,439 tests).
+- `scripts/test --serial compiler-blorp compiler-tools` -- 5,144 passed.
+- `scripts/test leak` -- 963 passed.
+- `scripts/test compiler-core-sanitize` -- 2,075 passed.
+
+### Commit
+
+One commit: the attribution instrumentation and this results section
+together. No behavior-changing cut follows, per the go/no-go result above.

@@ -2468,6 +2468,8 @@ void blorp_perceus_engine_summary_invocation_begin_c(void);
 void blorp_perceus_engine_summary_node_visit_c(void);
 void blorp_perceus_engine_summary_enter_c(const void* name_obj, const void* expr_obj);
 void blorp_perceus_engine_summary_exit_c(void);
+void blorp_perceus_engine_summary_record_construct_c(void);
+void blorp_perceus_engine_summary_frame_push_c(void);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);

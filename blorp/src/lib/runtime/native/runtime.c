@@ -2830,6 +2830,28 @@ void blorp_perceus_engine_summary_exit_c(void) {
     }
 }
 
+// ----------------------------------------------------------------------
+// P8 second pass: plain occurrence counters for the two structural
+// per-node shapes the summary walk builds -- an `OwnershipUseSummary`
+// record and a `PerceusOwnershipSummaryFrameStack` frame. Both are
+// documented ("a push costs one allocation") to cost exactly one
+// allocation per construction, the same assumption the existing
+// `PerceusInsertBindingFrameStack` push count above already relies on, so
+// these counts double as the categories' allocation counts.
+// ----------------------------------------------------------------------
+static long __blorp_perceus_summary_record_constructions = 0;
+static long __blorp_perceus_summary_frame_pushes = 0;
+
+void blorp_perceus_engine_summary_record_construct_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_summary_record_constructions++;
+}
+
+void blorp_perceus_engine_summary_frame_push_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_summary_frame_pushes++;
+}
+
 static int __blorp_perceus_engine_entry_compare(const void* left, const void* right) {
     const __blorp_PerceusEngineEntry* first = (const __blorp_PerceusEngineEntry*)left;
     const __blorp_PerceusEngineEntry* second = (const __blorp_PerceusEngineEntry*)right;
@@ -2878,6 +2900,12 @@ void blorp_perceus_engine_metrics_report_c(void) {
         __blorp_perceus_summary_external_calls,
         __blorp_perceus_summary_external_repeated_calls,
         __blorp_perceus_summary_repeated_inclusive_allocations
+    );
+    fprintf(
+        stderr,
+        "BLORP_PERCEUS_ENGINE_SUMMARY_SHAPES schema=1 record_constructions=%ld frame_pushes=%ld\n",
+        __blorp_perceus_summary_record_constructions,
+        __blorp_perceus_summary_frame_pushes
     );
     if (__blorp_perceus_engine_table_used == 0) return;
     // Not an allocation the oracle observes: BLORP_PERCEUS_ENGINE_METRICS

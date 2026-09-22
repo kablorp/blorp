@@ -252,6 +252,22 @@ foreign:
 	private pure func perceus_engine_summary_node_visit() -> Void = "blorp_perceus_engine_summary_node_visit_c"
 
 
+-- P8 second pass: allocation-site attribution inside the summary walk
+-- itself. `perceus_engine_summary_record_construct`/`_frame_push` are
+-- plain occurrence counters (never rendered/hashed), one call per
+-- `OwnershipUseSummary` record literal and per
+-- `PerceusOwnershipSummaryFrameStack` frame construction respectively --
+-- both cost exactly one allocation per construction (the frame stack's own
+-- docstring already states this invariant), so the counts double as the
+-- categories' allocation counts. The remaining functions reuse the
+-- existing `perceus_engine_node_enter`/`_node_exit` bracket to attribute
+-- the walk's other named steps (call/borrow/match/repeated-body dispatch)
+-- the same way `rebuild_managed_let`'s own drill-down did.
+foreign:
+	private pure func perceus_engine_summary_record_construct() -> Void = "blorp_perceus_engine_summary_record_construct_c"
+	private pure func perceus_engine_summary_frame_push() -> Void = "blorp_perceus_engine_summary_frame_push_c"
+
+
 --- The summary walk's explicit stack of what is left to do above the node it is
 --- visiting. Each frame carries the rest of the stack as its last field rather
 --- than sitting inside a separate cons cell, so a push costs one allocation.
@@ -309,36 +325,42 @@ private pure func ownership_uses_from_legacy_count(count: Int) -> OwnershipUseSu
 	if count <= 0:
 		NO_OWNERSHIP_USES
 	else:
-		{
+		result: OwnershipUseSummary = {
 			required_refs = count,
 			consumed_refs = count,
 			touched = True,
 			returns_alias = False
 		}
+		perceus_engine_summary_record_construct()
+		result
 
 
 pure func seq_ownership_uses(
 	first: OwnershipUseSummary,
 	second: OwnershipUseSummary,
 ) -> OwnershipUseSummary:
-	{
+	result: OwnershipUseSummary = {
 		required_refs = max_int(first.required_refs, first.consumed_refs + second.required_refs),
 		consumed_refs = first.consumed_refs + second.consumed_refs,
 		touched = first.touched or second.touched,
 		returns_alias = second.returns_alias
 	}
+	perceus_engine_summary_record_construct()
+	result
 
 
 private pure func ownership_uses_with_returns_alias(
 	uses: OwnershipUseSummary,
 	returns_alias: Bool,
 ) -> OwnershipUseSummary:
-	{
+	result: OwnershipUseSummary = {
 		required_refs = uses.required_refs,
 		consumed_refs = uses.consumed_refs,
 		touched = uses.touched,
 		returns_alias = returns_alias
 	}
+	perceus_engine_summary_record_construct()
+	result
 
 
 --- Evaluate `second` after `first` and report whether either result aliases
@@ -388,12 +410,14 @@ private pure func sum_ownership_uses(items: List[OwnershipUseSummary]) -> Owners
 		touched = touched or item.touched
 		returns_alias = returns_alias or item.returns_alias
 
-	{
+	result: OwnershipUseSummary = {
 		required_refs = required_refs,
 		consumed_refs = consumed_refs,
 		touched = touched,
 		returns_alias = returns_alias
 	}
+	perceus_engine_summary_record_construct()
+	result
 
 
 --- Take the worse of two mutually exclusive branches. Branch counts start at
@@ -403,12 +427,14 @@ pure func branch_ownership_uses_pair(
 	first: OwnershipUseSummary,
 	second: OwnershipUseSummary,
 ) -> OwnershipUseSummary:
-	{
+	result: OwnershipUseSummary = {
 		required_refs = max_int(first.required_refs, second.required_refs),
 		consumed_refs = max_int(first.consumed_refs, second.consumed_refs),
 		touched = first.touched or second.touched,
 		returns_alias = first.returns_alias or second.returns_alias
 	}
+	perceus_engine_summary_record_construct()
+	result
 
 
 pure func branch_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUseSummary:
@@ -423,12 +449,14 @@ pure func branch_ownership_uses(items: List[OwnershipUseSummary]) -> OwnershipUs
 		touched = touched or item.touched
 		returns_alias = returns_alias or item.returns_alias
 
-	{
+	result: OwnershipUseSummary = {
 		required_refs = required_refs,
 		consumed_refs = consumed_refs,
 		touched = touched,
 		returns_alias = returns_alias
 	}
+	perceus_engine_summary_record_construct()
+	result
 
 
 pure func direct_aliases_name(name: String, expr: CoreExpr) -> Bool:
@@ -797,6 +825,21 @@ private pure func summarize_call_args(
 	modes: List[OwnershipArgMode],
 	args: List[CoreExpr],
 ) -> List[OwnershipUseSummary]:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_call_args_impl(env, name, modes, args)
+	else:
+		perceus_engine_node_enter()
+		result: List[OwnershipUseSummary] = summarize_call_args_impl(env, name, modes, args)
+		perceus_engine_node_exit("summary:call-args-list")
+		result
+
+
+private pure func summarize_call_args_impl(
+	env: PerceusEnv,
+	name: String,
+	modes: List[OwnershipArgMode],
+	args: List[CoreExpr],
+) -> List[OwnershipUseSummary]:
 	-- One summary per argument that the contract describes a mode for, in
 	-- argument order. Peeling both lists one head at a time rebuilt a tail
 	-- pair and a result list at every position, so a call with n arguments
@@ -877,6 +920,30 @@ pure func summarize_linear_call(
 	callee: CoreExpr,
 	args: List[CoreExpr],
 ) -> OwnershipUseSummary:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_linear_call_impl(env, name, return_type, kind, callee, args)
+	else:
+		perceus_engine_node_enter()
+		result: OwnershipUseSummary = summarize_linear_call_impl(
+			env,
+			name,
+			return_type,
+			kind,
+			callee,
+			args,
+		)
+		perceus_engine_node_exit("summary:call")
+		result
+
+
+private pure func summarize_linear_call_impl(
+	env: PerceusEnv,
+	name: String,
+	return_type: CoreType,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+) -> OwnershipUseSummary:
 	match contract_for_call(env, kind, args.length(), return_type):
 		Some(contract):
 			arg_uses: List[OwnershipUseSummary] = summarize_call_args(
@@ -925,6 +992,20 @@ private pure func summarize_linear_call_arg(
 
 
 pure func summarize_linear_borrow(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+) -> OwnershipUseSummary:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_linear_borrow_impl(env, name, expr)
+	else:
+		perceus_engine_node_enter()
+		result: OwnershipUseSummary = summarize_linear_borrow_impl(env, name, expr)
+		perceus_engine_node_exit("summary:borrow")
+		result
+
+
+private pure func summarize_linear_borrow_impl(
 	env: PerceusEnv,
 	name: String,
 	expr: CoreExpr,
@@ -978,6 +1059,28 @@ pure func releasing_match_consumes_owner(
 
 
 pure func summarize_match_ownership_uses(
+	env: PerceusEnv,
+	name: String,
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	branch_uses: OwnershipUseSummary,
+) -> OwnershipUseSummary:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_match_ownership_uses_impl(env, name, scrutinee, release_policy, branch_uses)
+	else:
+		perceus_engine_node_enter()
+		result: OwnershipUseSummary = summarize_match_ownership_uses_impl(
+			env,
+			name,
+			scrutinee,
+			release_policy,
+			branch_uses,
+		)
+		perceus_engine_node_exit("summary:match-combine")
+		result
+
+
+private pure func summarize_match_ownership_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	scrutinee: CoreExpr,
@@ -2231,6 +2334,30 @@ private pure func summarize_repeated_body_uses(
 	body_shadowed: Bool,
 	whole_expr: CoreExpr,
 ) -> OwnershipUseSummary:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_repeated_body_uses_impl(env, name, prefix_uses, body, body_shadowed, whole_expr)
+	else:
+		perceus_engine_node_enter()
+		result: OwnershipUseSummary = summarize_repeated_body_uses_impl(
+			env,
+			name,
+			prefix_uses,
+			body,
+			body_shadowed,
+			whole_expr,
+		)
+		perceus_engine_node_exit("summary:repeated-body")
+		result
+
+
+private pure func summarize_repeated_body_uses_impl(
+	env: PerceusEnv,
+	name: String,
+	prefix_uses: OwnershipUseSummary,
+	body: CoreExpr,
+	body_shadowed: Bool,
+	whole_expr: CoreExpr,
+) -> OwnershipUseSummary:
 	body_uses: OwnershipUseSummary = if body_shadowed:
 		NO_OWNERSHIP_USES
 	else:
@@ -2246,6 +2373,24 @@ private pure func summarize_repeated_body_uses(
 
 
 private pure func summarize_constructor_literal_match_uses(
+	env: PerceusEnv,
+	name: String,
+	match_expr: CoreConstructorLiteralMatch,
+) -> OwnershipUseSummary:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_constructor_literal_match_uses_impl(env, name, match_expr)
+	else:
+		perceus_engine_node_enter()
+		result: OwnershipUseSummary = summarize_constructor_literal_match_uses_impl(
+			env,
+			name,
+			match_expr,
+		)
+		perceus_engine_node_exit("summary:match-branch-list")
+		result
+
+
+private pure func summarize_constructor_literal_match_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	match_expr: CoreConstructorLiteralMatch,
@@ -2304,6 +2449,24 @@ pure func summarize_constructor_length_branch_uses(
 
 
 private pure func summarize_constructor_length_match_uses(
+	env: PerceusEnv,
+	name: String,
+	match_expr: CoreConstructorLengthMatch,
+) -> OwnershipUseSummary:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_constructor_length_match_uses_impl(env, name, match_expr)
+	else:
+		perceus_engine_node_enter()
+		result: OwnershipUseSummary = summarize_constructor_length_match_uses_impl(
+			env,
+			name,
+			match_expr,
+		)
+		perceus_engine_node_exit("summary:match-branch-list")
+		result
+
+
+private pure func summarize_constructor_length_match_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	match_expr: CoreConstructorLengthMatch,
@@ -2379,6 +2542,28 @@ private pure func summarize_constructor_match_case_uses(
 
 
 private pure func summarize_constructor_match_branch_uses(
+	env: PerceusEnv,
+	name: String,
+	scrutinee_aliases_owner: Bool,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+) -> OwnershipUseSummary:
+	if perceus_engine_metrics_enabled() == 0:
+		summarize_constructor_match_branch_uses_impl(env, name, scrutinee_aliases_owner, cases, fallback)
+	else:
+		perceus_engine_node_enter()
+		result: OwnershipUseSummary = summarize_constructor_match_branch_uses_impl(
+			env,
+			name,
+			scrutinee_aliases_owner,
+			cases,
+			fallback,
+		)
+		perceus_engine_node_exit("summary:match-branch-list")
+		result
+
+
+private pure func summarize_constructor_match_branch_uses_impl(
 	env: PerceusEnv,
 	name: String,
 	scrutinee_aliases_owner: Bool,
@@ -2679,7 +2864,15 @@ private pure func summarize_linear_ownership_uses_non_binding(
 			body_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, body)
 
 			if cond_uses.consumed_refs > 0 or body_uses.consumed_refs > 0:
-				ownership_uses_from_legacy_count(count_uses(name, expr))
+				if perceus_engine_metrics_enabled() == 0:
+					ownership_uses_from_legacy_count(count_uses(name, expr))
+				else:
+					perceus_engine_node_enter()
+					fallback_result: OwnershipUseSummary = ownership_uses_from_legacy_count(
+						count_uses(name, expr),
+					)
+					perceus_engine_node_exit("summary:legacy-count-fallback-site")
+					fallback_result
 			else:
 				seq_ownership_uses(
 					cond_uses,
@@ -3023,7 +3216,15 @@ private pure func summarize_linear_ownership_uses_non_binding(
 				branch_ownership_uses(branch_summaries),
 			)
 		_:
-			ownership_uses_from_legacy_count(count_uses(name, expr))
+			if perceus_engine_metrics_enabled() == 0:
+				ownership_uses_from_legacy_count(count_uses(name, expr))
+			else:
+				perceus_engine_node_enter()
+				fallback_result: OwnershipUseSummary = ownership_uses_from_legacy_count(
+					count_uses(name, expr),
+				)
+				perceus_engine_node_exit("summary:legacy-count-fallback-site")
+				fallback_result
 
 
 pure func summarize_linear_ownership_uses(
@@ -3076,10 +3277,12 @@ private pure func summarize_linear_ownership_uses_impl(
 							visiting = False
 							pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
 						else:
+							perceus_engine_summary_frame_push()
 							frames = PerceusOwnershipSummaryCombineBodyFrame(rhs_uses, frames)
 							visiting = True
 							current_expr = body
 					else:
+						perceus_engine_summary_frame_push()
 						frames = PerceusOwnershipSummaryLetRhsFrame(variable, body, frames)
 						visiting = True
 						current_expr = rhs
@@ -3090,10 +3293,12 @@ private pure func summarize_linear_ownership_uses_impl(
 						visiting = False
 						pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
 					else:
+						perceus_engine_summary_frame_push()
 						frames = PerceusOwnershipSummaryCombineBodyFrame(rhs_uses, frames)
 						visiting = True
 						current_expr = body
 				SeqExpr(first, second):
+					perceus_engine_summary_frame_push()
 					frames = PerceusOwnershipSummarySequenceFirstFrame(second, frames)
 					visiting = True
 					current_expr = first
@@ -3110,14 +3315,17 @@ private pure func summarize_linear_ownership_uses_impl(
 						visiting = True
 						current_expr = rhs
 				DupExpr(variable, value_type, retain_policy, body, typ, loc):
+					perceus_engine_summary_frame_push()
 					frames = PerceusOwnershipSummaryDupBodyFrame(variable.name == name, frames)
 					visiting = True
 					current_expr = body
 				DropExpr(variable, value_type, release_policy, body, typ, loc):
+					perceus_engine_summary_frame_push()
 					frames = PerceusOwnershipSummaryDropBodyFrame(variable.name == name, frames)
 					visiting = True
 					current_expr = body
 				DebugBlockExpr(body, typ, loc):
+					perceus_engine_summary_frame_push()
 					frames = PerceusOwnershipSummaryPassBodyFrame(frames)
 					visiting = True
 					current_expr = body
@@ -3137,6 +3345,7 @@ private pure func summarize_linear_ownership_uses_impl(
 						visiting = False
 						pending = seq_ownership_uses(summary, NO_OWNERSHIP_USES)
 					else:
+						perceus_engine_summary_frame_push()
 						frames = PerceusOwnershipSummaryCombineBodyFrame(summary, remaining)
 						visiting = True
 						current_expr = body
@@ -3145,6 +3354,7 @@ private pure func summarize_linear_ownership_uses_impl(
 					visiting = False
 					pending = seq_ownership_uses(prefix_uses, summary)
 				PerceusOwnershipSummarySequenceFirstFrame(second, remaining):
+					perceus_engine_summary_frame_push()
 					frames = PerceusOwnershipSummarySequenceSecondFrame(summary, remaining)
 					visiting = True
 					current_expr = second
@@ -3154,12 +3364,14 @@ private pure func summarize_linear_ownership_uses_impl(
 					pending = seq_ownership_uses(first_uses, summary)
 				PerceusOwnershipSummaryDupBodyFrame(matches_target, remaining):
 					adjusted: OwnershipUseSummary = if matches_target:
-						{
+						built: OwnershipUseSummary = {
 							required_refs = max_int(1, summary.required_refs - 1),
 							consumed_refs = max_int(0, summary.consumed_refs - 1),
 							touched = True,
 							returns_alias = summary.returns_alias
 						}
+						perceus_engine_summary_record_construct()
+						built
 					else:
 						summary
 
