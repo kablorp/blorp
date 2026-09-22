@@ -93,6 +93,9 @@ class LspClient:
             mode="w+b", prefix="blorp-lsp-fixture-stderr.", delete=False
         )
         self.captured_stderr: str | None = None
+        # Last diagnostics observed per URI, so a close can tell a fresh
+        # publication from a duplicate of the edit it already reported.
+        self._last_diagnostics: dict[str, list[dict[str, Any]]] = {}
         try:
             self.proc = subprocess.Popen(
                 [blorp, "lsp"],
@@ -357,8 +360,20 @@ class LspClient:
         )
 
     def close_document(self, uri: str) -> list[dict[str, Any]]:
+        # A URI that is open while the workspace index is running gets one
+        # publication per analysis, so the edit's diagnostics can still be in
+        # flight behind this notification. Wait for a publication that differs
+        # from the one already observed for this URI rather than reporting a
+        # duplicate of the edit as the close result.
+        previous = self._last_diagnostics.get(uri)
         self.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
-        return self.wait_for_diagnostics(uri)
+        message = self.read_matching_until(
+            lambda value: value.get("method") == "textDocument/publishDiagnostics"
+            and value.get("params", {}).get("uri") == uri
+            and value.get("params", {}).get("diagnostics") != previous,
+            DIAGNOSTIC_TIMEOUT_SECONDS,
+        )
+        return self._record_diagnostics(uri, message)
 
     def wait_for_diagnostics_message(self, uri: str) -> dict[str, Any]:
         return self.read_matching_until(
@@ -369,7 +384,12 @@ class LspClient:
 
     def wait_for_diagnostics(self, uri: str) -> list[dict[str, Any]]:
         message = self.wait_for_diagnostics_message(uri)
-        return message.get("params", {}).get("diagnostics", [])
+        return self._record_diagnostics(uri, message)
+
+    def _record_diagnostics(self, uri: str, message: dict[str, Any]) -> list[dict[str, Any]]:
+        diagnostics = message.get("params", {}).get("diagnostics", [])
+        self._last_diagnostics[uri] = diagnostics
+        return diagnostics
 
     def wait_for_versioned_diagnostics(
         self,
