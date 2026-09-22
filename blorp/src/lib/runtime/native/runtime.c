@@ -5455,15 +5455,36 @@ void* blorp_union_destroy_stack_grow(void* old_stack, size_t new_size) {
 }
 
 // Single-threaded mode: use plain increment/decrement instead of atomics (14x cheaper)
+//
+// Multi-threaded ordering: a retain's increment only needs
+// memory_order_relaxed, because the thread performing the retain already
+// holds a reference to the object — the object cannot be concurrently freed
+// out from under it, so there is nothing for the increment to synchronize
+// with. A release's decrement uses memory_order_release, and the specific
+// decrement that observes the count drop to zero (the thread that is about
+// to run the destructor) follows up with a standalone
+// atomic_thread_fence(memory_order_acquire) before touching any field of the
+// object. That release-store/acquire-fence pairing is the standard way to
+// make every other thread's prior writes to the object visible to the
+// thread that destroys it, without paying for an acquire on every ordinary
+// (non-terminal) decrement. blorp_is_unique's relaxed load (below) is safe
+// under this scheme because uniqueness is only ever consulted by the thread
+// that holds the sole reference, so there is no cross-thread write to
+// synchronize with there either.
 #ifdef BLORP_SINGLE_THREADED
   #define BLORP_RC_LOAD(p)       (*(long*)(&(p)))
   #define BLORP_RC_INC(p)        (++(*(long*)(&(p))))
   #define BLORP_RC_DEC_PREV(p)   ((*(long*)(&(p)))--)
+  #define BLORP_RC_ACQUIRE_FENCE() ((void)0)
 
 #else
-  #define BLORP_RC_LOAD(p)       atomic_load(&(p))
-  #define BLORP_RC_INC(p)        atomic_fetch_add(&(p), 1)
-  #define BLORP_RC_DEC_PREV(p)   atomic_fetch_sub(&(p), 1)
+  #define BLORP_RC_LOAD(p)       atomic_load_explicit(&(p), memory_order_relaxed)
+  #define BLORP_RC_INC(p)        atomic_fetch_add_explicit(&(p), 1, memory_order_relaxed)
+  #define BLORP_RC_DEC_PREV(p)   atomic_fetch_sub_explicit(&(p), 1, memory_order_release)
+  // Paired with BLORP_RC_DEC_PREV's release: taken only on the decrement that
+  // observes the count reach zero, before any field of the object is read,
+  // so the destructor sees every other thread's writes to it.
+  #define BLORP_RC_ACQUIRE_FENCE() atomic_thread_fence(memory_order_acquire)
 #endif
 
 __attribute__((always_inline))
@@ -5482,6 +5503,7 @@ inline void blorp_release(void* obj) {
     if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return;
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
+        BLORP_RC_ACQUIRE_FENCE();
         blorp_release_slow(header, obj);
     }
 }
@@ -5493,6 +5515,7 @@ inline void blorp_release_arc_only(void* obj) {
     if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return;
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
+        BLORP_RC_ACQUIRE_FENCE();
         blorp_release_slow_finish(header, obj, NULL);
     }
 }
