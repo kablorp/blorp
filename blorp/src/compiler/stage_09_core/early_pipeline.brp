@@ -10,8 +10,7 @@ import:
 		check_desugar_invariants,
 		check_match_invariants,
 		check_mono_invariants,
-		check_resolve_invariants,
-		check_std_inline_invariants,
+		check_resolve_and_std_inline_invariants,
 		check_synth_invariants,
 	early_stages as CoreEarlyStages
 	ir: CoreProgram
@@ -239,17 +238,19 @@ private pure func match_invariant(program: CoreProgram) -> Option[CorePassDiagno
 	first_early_violation(check_match_invariants(program))
 
 
--- Resolution invariants run on every compile, so they stay in `invariant` and
--- leave `checked_invariant` empty rather than walking the program twice under
--- `--check-invariants`.
-private pure func resolve_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
-	first_early_violation(check_resolve_invariants(program))
-
-
-private pure func std_inline_invariant(program: CoreProgram) -> Option[CorePassDiagnostic]:
-	first_early_violation(
-		check_resolve_invariants(program).concat(check_std_inline_invariants(program)),
-	)
+-- The guarantee ("no `SelectedDirectCall`, no string-operator sugar, no
+-- inlineable std-wrapper call survives early Core") only needs to hold at the
+-- exit of the early pipeline, not after every pass that could in principle
+-- touch it. `resolve`, `std_inline`, and `tailrec` construct none of the
+-- three forbidden shapes (verified by grepping each pass's module for a
+-- constructed `SelectedDirectCall(` or a `BinaryExpr(AddOp, ...)` with a
+-- string-typed left operand -- see the commit message), so this single check
+-- runs on every compile but only at `tuple_sroa`, the last pass of the early
+-- segment, instead of after each of the four passes that used to carry it.
+private pure func resolve_and_std_inline_invariant(
+	program: CoreProgram,
+) -> Option[CorePassDiagnostic]:
+	first_early_violation(check_resolve_and_std_inline_invariants(program))
 
 
 private pure func checked_early_pass(
@@ -386,9 +387,9 @@ pure func early_core_resolution_passes(
 		resolve_core_program(program, import_bindings, module_imports)
 
 	[
-		required_early_pass(RESOLVE_PASS, resolve_imports, resolve_invariant),
-		required_early_pass(STD_INLINE_PASS, run_std_inline_pass, std_inline_invariant),
-		required_early_pass(TAILREC_PASS, run_tailrec_pass, std_inline_invariant),
+		core_program_pass(RESOLVE_PASS, resolve_imports),
+		core_program_pass(STD_INLINE_PASS, run_std_inline_pass),
+		core_program_pass(TAILREC_PASS, run_tailrec_pass),
 		core_program_pass(FUSE_STRING_PASS, run_fuse_string_pass),
 		core_program_pass(FUSE_COLLECTION_PASS, run_fuse_collection_pass),
 		core_program_pass(FUSE_PARALLEL_TENSOR_PASS, run_fuse_parallel_tensor_pass),
@@ -399,7 +400,7 @@ pure func early_core_resolution_passes(
 -- Tuple SROA runs after the caller projects generic templates out, so it is its
 -- own list segment rather than a tail of the one above.
 pure func early_core_projection_passes() -> List[CorePass]:
-	[required_early_pass(TUPLE_SROA_PASS, run_tuple_sroa_pass, std_inline_invariant)]
+	[required_early_pass(TUPLE_SROA_PASS, run_tuple_sroa_pass, resolve_and_std_inline_invariant)]
 
 
 private pure func early_pass_control(

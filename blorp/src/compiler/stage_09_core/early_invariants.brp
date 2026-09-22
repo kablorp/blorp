@@ -7,6 +7,7 @@ import:
 		CoreCallKind(SelectedDirectCall, UserCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreExpr(BinaryExpr, BoxExpr, CallExpr, DebugBlockExpr, LetExpr, RawMatchExpr, UnboxExpr),
+		CoreFunction,
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreType,
@@ -14,7 +15,13 @@ import:
 	ssa:
 		CoreAssignmentShape(ControlFlowAssignment, NoAssignment, StraightLineAssignment),
 		classify_assignment_shape,
-	std_inline: first_uninlined_std_wrapper_call
+	std_inline:
+		StdInlineTargets,
+		collect_targets,
+		find_target,
+		first_uninlined_std_wrapper_call,
+		owned_module,
+		target_is_function
 	traverse as CoreTraverse
 	type_policy as CoreTypePolicy
 
@@ -407,15 +414,21 @@ pure func check_match_invariants(program: CoreProgram) -> List[CoreEarlyInvarian
 	check_program_invariants(program, match_violations)
 
 
+-- `pending` is a stack (push children, pop the top) rather than an
+-- append-only queue, so live memory tracks the traversal frontier instead of
+-- growing to the size of the whole program before it is torn down.
 pure func check_resolve_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
 	var resolve: List[CoreEarlyInvariantViolation] = []
 	var string_add: List[CoreEarlyInvariantViolation] = []
 	var pending: List[CoreExpr] = program_expr_roots(program)
-	var index: Int = 0
 
-	while index < pending.length():
-		match pending.get(index):
+	while pending.length() > 0:
+		top: Int = pending.length() - 1
+
+		match pending.get(top):
 			Some(expr):
+				pending = pending.drop_last()
+
 				for violation in resolve_violations(expr):
 					resolve = resolve.append(violation)
 
@@ -427,8 +440,6 @@ pure func check_resolve_invariants(program: CoreProgram) -> List[CoreEarlyInvari
 			None:
 				break
 
-		index += 1
-
 	resolve.concat(string_add)
 
 
@@ -438,3 +449,145 @@ pure func check_std_inline_invariants(program: CoreProgram) -> List[CoreEarlyInv
 			[InlineableStdWrapperCallSurvived(name, loc)]
 		None:
 			[]
+
+
+private record CoreResolveInlineWalk {
+	resolve: List[CoreEarlyInvariantViolation],
+	string_add: List[CoreEarlyInvariantViolation],
+	wrapper: Option[CoreEarlyInvariantViolation]
+}
+
+-- One traversal of `root` that gathers both the resolve-family violations
+-- (`SelectedDirectCallSurvived`, `StringOperatorSugarSurvived`) and, when
+-- `check_wrapper` is set, the first surviving inlineable std-wrapper call.
+-- `check_wrapper` stops after the first wrapper hit (matching
+-- `first_target_call`'s short-circuit in std_inline.brp) but the resolve
+-- family keeps walking the whole subtree, since `check_resolve_invariants`
+-- never short-circuits.
+private pure func walk_resolve_and_wrapper(
+	root: CoreExpr,
+	targets: StdInlineTargets,
+	check_wrapper: Bool,
+) -> CoreResolveInlineWalk:
+	var resolve: List[CoreEarlyInvariantViolation] = []
+	var string_add: List[CoreEarlyInvariantViolation] = []
+	var wrapper: Option[CoreEarlyInvariantViolation] = None
+	var pending: List[CoreExpr] = [root]
+
+	while pending.length() > 0:
+		top: Int = pending.length() - 1
+
+		match pending.get(top):
+			Some(expr):
+				pending = pending.drop_last()
+
+				for violation in resolve_violations(expr):
+					resolve = resolve.append(violation)
+
+				for violation in string_add_operator_violations(expr):
+					string_add = string_add.append(violation)
+
+				if check_wrapper and wrapper.is_none():
+					match expr:
+						CallExpr(UserCall(name, Some(def_id), _), _, _, _, loc):
+							if find_target(targets, name, def_id).is_some():
+								wrapper = Some(InlineableStdWrapperCallSurvived(name, loc))
+							else:
+								void
+						_:
+							void
+				else:
+					void
+
+				for child in CoreTraverse.immediate_core_expr_children(expr):
+					pending = pending.append(child)
+			None:
+				break
+
+	{
+		resolve = resolve,
+		string_add = string_add,
+		wrapper = wrapper
+	}
+
+
+private pure func resolve_inline_eligible(
+	targets: StdInlineTargets,
+	function_info: CoreFunction,
+	wrapper_already_found: Bool,
+) -> Bool:
+	(
+		not wrapper_already_found
+		and not target_is_function(targets, function_info)
+		and not owned_module(function_info.source_module)
+	)
+
+
+-- Fuses `check_resolve_invariants` and `check_std_inline_invariants` into a
+-- single walk of the program so a production compile pays for one traversal
+-- (plus the O(decls) target-collection scan `collect_targets` already does)
+-- instead of the two-to-four separate walks the split predicates used to
+-- cost when they were each wired onto several early-Core passes. Returns the
+-- same violations, in the same resolve-then-string_add-then-wrapper family
+-- order, as `check_resolve_invariants(program).concat(check_std_inline_invariants(program))`.
+pure func check_resolve_and_std_inline_invariants(
+	program: CoreProgram,
+) -> List[CoreEarlyInvariantViolation]:
+	targets: StdInlineTargets = collect_targets(program)
+	var resolve: List[CoreEarlyInvariantViolation] = []
+	var string_add: List[CoreEarlyInvariantViolation] = []
+	var wrapper: Option[CoreEarlyInvariantViolation] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match function_info.body:
+					Some(body):
+						walk: CoreResolveInlineWalk = walk_resolve_and_wrapper(
+							body,
+							targets,
+							resolve_inline_eligible(targets, function_info, wrapper.is_some()),
+						)
+						resolve = resolve.concat(walk.resolve)
+						string_add = string_add.concat(walk.string_add)
+
+						if wrapper.is_none():
+							wrapper = walk.wrapper
+						else:
+							void
+					None:
+						void
+			GlobalDecl(global):
+				walk: CoreResolveInlineWalk = walk_resolve_and_wrapper(global.init, targets, False)
+				resolve = resolve.concat(walk.resolve)
+				string_add = string_add.concat(walk.string_add)
+			ImplDecl(impl):
+				for method in impl.methods:
+					match method.body:
+						Some(body):
+							walk: CoreResolveInlineWalk = walk_resolve_and_wrapper(
+								body,
+								targets,
+								resolve_inline_eligible(targets, method, wrapper.is_some()),
+							)
+							resolve = resolve.concat(walk.resolve)
+							string_add = string_add.concat(walk.string_add)
+
+							if wrapper.is_none():
+								wrapper = walk.wrapper
+							else:
+								void
+						None:
+							void
+			_:
+				void
+
+	wrapper_violations: List[CoreEarlyInvariantViolation] = match wrapper:
+		Some(violation):
+			[violation]
+		None:
+			[]
+
+	resolve
+		.concat(string_add)
+		.concat(wrapper_violations)
