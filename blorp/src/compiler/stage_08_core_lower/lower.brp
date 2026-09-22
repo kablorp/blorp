@@ -400,7 +400,6 @@ import:
 		CoreUnionVariant,
 		CoreValueRecordField,
 		CoreVar,
-		core_type_to_json,
 	../stage_09_core/type_policy as CoreTypePolicy
 	identity:
 		core_ufcs_function_name,
@@ -618,6 +617,19 @@ private pure func lowered_declared_abi_type(
 
 
 pure func core_source_loc(source_table: SourceTable, location: SourceLocation) -> CoreSourceLoc:
+	if core_lowering_type_metrics_enabled() == 0:
+		core_source_loc_impl(source_table, location)
+	else:
+		before = core_lowering_current_allocations()
+		result = core_source_loc_impl(source_table, location)
+		core_lowering_source_loc_record(core_lowering_current_allocations() - before)
+		result
+
+
+private pure func core_source_loc_impl(
+	source_table: SourceTable,
+	location: SourceLocation,
+) -> CoreSourceLoc:
 	span = source_location_span(source_table, location)
 	KnownSourceLoc(span.path, span.start_line, span.start_column, span.end_line, span.end_column)
 
@@ -634,6 +646,16 @@ private pure func core_source_loc_from_context(
 
 
 private pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
+	if core_lowering_type_metrics_enabled() == 0:
+		core_var_impl(name, def_id)
+	else:
+		before = core_lowering_current_allocations()
+		result = core_var_impl(name, def_id)
+		core_lowering_var_record(core_lowering_current_allocations() - before)
+		result
+
+
+private pure func core_var_impl(name: String, def_id: Option[Int]) -> CoreVar:
 	{
 		name = name,
 		uniq = 0,
@@ -1040,18 +1062,39 @@ pure func core_lower_type(typ: SemanticType) -> Result[CoreType, CoreLowerError]
 -- Attribution instrumentation for the type-lowering choke point, opt-in
 -- through BLORP_CORE_LOWERING_TYPE_METRICS=1 (see runtime.c's matching
 -- BLORP_TYPECHECK_BODY_METRICS probes). With the variable unset this is one
--- branch per call and no allocation; `core_type_to_json` only runs when the
--- variable is set.
+-- branch per call and no allocation.
+--
+-- `core_lowering_type_metric_record` keys its histogram by the lowered
+-- `CoreType` value's own allocation identity (the same notion
+-- `blorp_same_object` compares), never a structural/JSON key: an earlier
+-- version called `core_type_to_json(lowered).to_string()` per call, which
+-- allocates a JSON tree and a string on every one of the ~1.3M calls in a
+-- self-compile and was found to inflate `core_lowering_complete`'s
+-- allocation row roughly 4x while the instrumentation was active -- see
+-- `core_lowering_allocation_attribution_2026-09-22.md`'s "instrumentation
+-- correctness" section. Recording a pointer allocates nothing, so this is
+-- genuinely a no-op-when-off, allocation-neutral-when-on probe.
 foreign:
 	pure func core_lowering_type_metrics_enabled() -> Int = "blorp_core_lowering_type_metrics_enabled_c"
-	pure func core_lowering_type_metric_record(type_json: String) -> Void = "blorp_core_lowering_type_metric_record_c"
+	pure func core_lowering_type_metric_record(lowered_type: CoreType) -> Void = "blorp_core_lowering_type_metric_record_c"
 	pure func core_lowering_type_metrics_report() -> Void = "blorp_core_lowering_type_metrics_report_c"
+	pure func core_lowering_current_allocations() -> Int = "blorp_runtime_total_allocations_c"
+	pure func core_lowering_node_enter() -> Void = "blorp_core_lowering_node_enter_c"
+	pure func core_lowering_node_exit(kind: String) -> Void = "blorp_core_lowering_node_exit_c"
+	pure func core_lowering_source_loc_record(delta: Int) -> Void = "blorp_core_lowering_source_loc_record_c"
+	pure func core_lowering_var_record(delta: Int) -> Void = "blorp_core_lowering_var_record_c"
+	pure func core_lowering_node_kind_report() -> Void = "blorp_core_lowering_node_kind_report_c"
 
 
 -- Flushes the call/histogram counters collected under
 -- BLORP_CORE_LOWERING_TYPE_METRICS=1; a no-op when the variable is unset.
+-- Extended (2026-09-22 follow-up) to also flush the per-node-kind
+-- self/inclusive allocation table and the core_source_loc/core_var
+-- aggregate counters -- the same mechanism, closing the "where do the rest
+-- of lowering's allocations go" gap the type histogram alone left open.
 pure func core_lowering_type_metrics_report_flush() -> Void:
 	core_lowering_type_metrics_report()
+	core_lowering_node_kind_report()
 
 
 -- `module_member_prefixes` is the lowering context's precomputed
@@ -1069,7 +1112,7 @@ private pure func core_lower_type_with_prefixes(
 
 		match result:
 			Ok(lowered):
-				core_lowering_type_metric_record(core_type_to_json(lowered).to_string())
+				core_lowering_type_metric_record(lowered)
 			Err(_):
 				void
 
@@ -4701,7 +4744,125 @@ private pure func lower_typed_expr_with_context(
 	lower_typed_expr_as_type(context, expr, typ)
 
 
+-- Attribution instrumentation: a short static tag per `TypedExpr` variant,
+-- used only to key the BLORP_CORE_LOWERING_TYPE_METRICS node-kind table (see
+-- `lower_typed_expr_as_type`'s wrapper below). Never used for dispatch or
+-- lowering itself, so a mismatch here cannot change compiled output -- only
+-- which histogram bucket a count lands in.
+private pure func typed_expr_kind_name(expr: TypedExpr) -> String:
+	match expr:
+		TypedNameExpr(_, _):
+			"TypedNameExpr"
+		TypedIntLiteralExpr(_, _, _):
+			"TypedIntLiteralExpr"
+		TypedFloatLiteralExpr(_, _, _):
+			"TypedFloatLiteralExpr"
+		TypedStringLiteralExpr(_, _, _):
+			"TypedStringLiteralExpr"
+		TypedStringInterpolationExpr(_, _, _, _):
+			"TypedStringInterpolationExpr"
+		TypedStringInterpolationPartsExpr(_, _, _, _):
+			"TypedStringInterpolationPartsExpr"
+		TypedBoolLiteralExpr(_, _, _):
+			"TypedBoolLiteralExpr"
+		TypedCharLiteralExpr(_, _, _):
+			"TypedCharLiteralExpr"
+		TypedUnaryExpr(_, _, _, _):
+			"TypedUnaryExpr"
+		TypedBinaryExpr(_, _, _, _, _):
+			"TypedBinaryExpr"
+		TypedLogicalExpr(_, _, _, _, _):
+			"TypedLogicalExpr"
+		TypedCallExpr(_, _, _, _):
+			"TypedCallExpr"
+		TypedTupleExpr(_, _, _):
+			"TypedTupleExpr"
+		TypedTupleDestructExpr(_, _, _, _):
+			"TypedTupleDestructExpr"
+		TypedAssignExpr(_, _, _, _, _):
+			"TypedAssignExpr"
+		TypedSubscriptExpr(_, _, _, _):
+			"TypedSubscriptExpr"
+		TypedSubscriptAssignExpr(_, _, _, _, _, _):
+			"TypedSubscriptAssignExpr"
+		TypedListExpr(_, _, _):
+			"TypedListExpr"
+		TypedVectorExpr(_, _, _):
+			"TypedVectorExpr"
+		TypedDictExpr(_, _, _):
+			"TypedDictExpr"
+		TypedOpaqueIntoExpr(_, _, _, _):
+			"TypedOpaqueIntoExpr"
+		TypedOpaqueFromExpr(_, _, _, _):
+			"TypedOpaqueFromExpr"
+		TypedRecordExpr(_, _, _):
+			"TypedRecordExpr"
+		TypedRecordUpdateExpr(_, _, _, _, _):
+			"TypedRecordUpdateExpr"
+		TypedFieldAccessExpr(_, _, _, _, _):
+			"TypedFieldAccessExpr"
+		TypedLambdaExpr(_, _, _, _, _, _):
+			"TypedLambdaExpr"
+		TypedRangeExpr(_, _, _, _):
+			"TypedRangeExpr"
+		TypedIfExpr(_, _, _, _, _):
+			"TypedIfExpr"
+		TypedMatchExpr(_, _, _, _):
+			"TypedMatchExpr"
+		TypedSelectExpr(_, _, _):
+			"TypedSelectExpr"
+		TypedWhileExpr(_, _, _, _):
+			"TypedWhileExpr"
+		TypedForExpr(_, _, _, _, _, _):
+			"TypedForExpr"
+		TypedConcurrentBlockExpr(_, _, _, _):
+			"TypedConcurrentBlockExpr"
+		TypedConcurrentForExpr(_, _, _, _, _, _):
+			"TypedConcurrentForExpr"
+		TypedDetachExpr(_, _, _):
+			"TypedDetachExpr"
+		TypedAscriptionExpr(_, _, _, _):
+			"TypedAscriptionExpr"
+		TypedBlockExpr(_, _, _):
+			"TypedBlockExpr"
+		TypedWithExpr(_, _, _, _):
+			"TypedWithExpr"
+		TypedDebugBlockExpr(_, _, _):
+			"TypedDebugBlockExpr"
+		TypedVarDeclExpr(_, _):
+			"TypedVarDeclExpr"
+		TypedQuestionBindExpr(_, _, _, _, _):
+			"TypedQuestionBindExpr"
+		TypedBreakExpr(_, _):
+			"TypedBreakExpr"
+		TypedContinueExpr(_, _):
+			"TypedContinueExpr"
+		TypedVoidExpr(_, _):
+			"TypedVoidExpr"
+		TypedBuiltinExpr(_, _, _):
+			"TypedBuiltinExpr"
+		TypedMissingExpr(_, _):
+			"TypedMissingExpr"
+		TypedUnsupportedExpr(_, _, _):
+			"TypedUnsupportedExpr"
+
+
 private pure func lower_typed_expr_as_type(
+	context: CoreLowerContext,
+	expr: TypedExpr,
+	typ: CoreType,
+) -> Result[CoreExpr, CoreLowerError]:
+	if core_lowering_type_metrics_enabled() == 0:
+		lower_typed_expr_as_type_impl(context, expr, typ)
+	else:
+		kind: String = typed_expr_kind_name(expr)
+		core_lowering_node_enter()
+		result = lower_typed_expr_as_type_impl(context, expr, typ)
+		core_lowering_node_exit(kind)
+		result
+
+
+private pure func lower_typed_expr_as_type_impl(
 	context: CoreLowerContext,
 	expr: TypedExpr,
 	typ: CoreType,
@@ -4758,15 +4919,70 @@ private pure func lower_typed_expr_as_type(
 			lowered_right ?= lower_typed_expr_with_context(context, right)
 			Ok(LogicalExpr(core_logical_op(op), lowered_left, lowered_right, typ, loc))
 		TypedCallExpr(callee, args, _, info):
-			raw_callee ?= lower_typed_expr_with_context(context, callee)
-			lowered_callee ?= apply_resolved_callee_identity(
-				context,
-				info.resolved_call,
-				raw_callee,
-			)
-			lowered_args ?= lower_typed_exprs(context, args)
-			call_kind ?= lower_resolved_call_kind(context, info.resolved_call, lowered_callee)
-			Ok(CallExpr(call_kind, lowered_callee, lowered_args, typ, loc))
+			if core_lowering_type_metrics_enabled() == 0:
+				raw_callee ?= lower_typed_expr_with_context(context, callee)
+				lowered_callee ?= apply_resolved_callee_identity(
+					context,
+					info.resolved_call,
+					raw_callee,
+				)
+				lowered_args ?= lower_typed_exprs(context, args)
+				call_kind ?= lower_resolved_call_kind(context, info.resolved_call, lowered_callee)
+				Ok(CallExpr(call_kind, lowered_callee, lowered_args, typ, loc))
+			else:
+				-- Attribution instrumentation: drill one level into
+				-- `TypedCallExpr`'s own allocation budget (excluding the
+				-- callee's and each argument's own recursive lowering, which
+				-- are already charged to their own node kinds by the
+				-- enter/exit stack). Same mechanism as the per-node-kind
+				-- table, reusing its generic string-keyed self/inclusive
+				-- counters with call-specific labels instead of a
+				-- `TypedExpr` kind name.
+				--
+				-- `CallExpr.callee_type_lowering` isolates a subtlety in the
+				-- node-kind table above: `lower_typed_expr_with_context`
+				-- computes the callee's own semantic type via
+				-- `core_lower_value_type` BEFORE calling the wrapped
+				-- `lower_typed_expr_as_type` (which is what pushes the
+				-- callee's own frame). That type-lowering cost happens while
+				-- THIS frame is on top of the stack, so without wrapping the
+				-- whole call here it would be silently charged to whichever
+				-- node calls the callee (here, `TypedCallExpr`) instead of
+				-- to the callee's own kind.
+				core_lowering_node_enter()
+				raw_callee_result = lower_typed_expr_with_context(context, callee)
+				core_lowering_node_exit("CallExpr.callee_type_lowering")
+				raw_callee ?= raw_callee_result
+
+				core_lowering_node_enter()
+
+				callee_identity_result = apply_resolved_callee_identity(
+					context,
+					info.resolved_call,
+					raw_callee,
+				)
+
+				core_lowering_node_exit("CallExpr.callee_identity")
+				lowered_callee ?= callee_identity_result
+
+				core_lowering_node_enter()
+				args_result = lower_typed_exprs(context, args)
+				core_lowering_node_exit("CallExpr.args_list")
+				lowered_args ?= args_result
+
+				core_lowering_node_enter()
+				call_kind_result = lower_resolved_call_kind(
+					context,
+					info.resolved_call,
+					lowered_callee,
+				)
+				core_lowering_node_exit("CallExpr.call_kind")
+				call_kind ?= call_kind_result
+
+				core_lowering_node_enter()
+				call_node = CallExpr(call_kind, lowered_callee, lowered_args, typ, loc)
+				core_lowering_node_exit("CallExpr.node_construct")
+				Ok(call_node)
 		TypedTupleExpr(items, _, _):
 			lowered_items ?= lower_typed_exprs(context, items)
 			Ok(TupleExpr(lowered_items, typ, loc))

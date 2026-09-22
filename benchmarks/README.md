@@ -1978,14 +1978,23 @@ with `--time-phases` to relate the rows to the `typed_frontend` phase total.
 
 `BLORP_CORE_LOWERING_TYPE_METRICS=1` makes any compile print, to stderr, how
 many times `core_lower_type_with_prefixes`
-(`blorp/src/compiler/stage_08_core_lower/lower.brp`) was called and a
-histogram of the top 30 lowered `CoreType` shapes by `core_type_to_json`
-text, keyed with the same C-side hash-table pattern
-`BLORP_TYPECHECK_BODY_METRICS` uses. With the variable unset it is one
-branch per call and no allocation; the generated C is unchanged either way.
-`lower_typed_program_with_ctfe_replacements` flushes the counters once per
-module, so they are cumulative -- the last line before a run ends is the
-whole compile's total:
+(`blorp/src/compiler/stage_08_core_lower/lower.brp`) was called, a histogram
+of the top 30 lowered `CoreType` objects by allocation identity (the same
+notion `blorp_same_object` compares — never a structural key, so this
+counts pointer reuse, not shape repetition), aggregate `core_source_loc`/
+`core_var` call and allocation counters, and a per-`TypedExpr`-kind
+self/inclusive allocation table, all keyed with the same C-side hash-table
+pattern `BLORP_TYPECHECK_BODY_METRICS` uses. With the variable unset it is
+one branch per call and no allocation; with it set, recording a pointer (or
+an already-computed allocation-counter delta) still allocates nothing, so
+`core_lowering_complete`'s row is identical whether the variable is set or
+not — an earlier version keyed the type histogram by
+`core_type_to_json(...).to_string()`, which allocated on every call and
+inflated that row roughly 4x while the variable was on; see
+`core_lowering_allocation_attribution_2026-09-22.md`'s "Instrumentation
+correctness bug" section. `lower_typed_program_with_ctfe_replacements`
+flushes the counters once per module, so they are cumulative -- the last
+line before a run ends is the whole compile's total:
 
 ```bash
 BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_CORE_LOWERING_TYPE_METRICS=1 bin/blorp compile \
@@ -1993,13 +2002,18 @@ BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_CORE_LOWERING_TYPE_METRICS=1 bin/blorp com
 ```
 
 ```text
-BLORP_CORE_LOWERING_TYPE_METRICS schema=1 calls=1275348 distinct=22180
-BLORP_CORE_LOWERING_TYPE_TOP rank=1 count=167795 type={"kind":"named","name":"String","args":[]}
+BLORP_CORE_LOWERING_TYPE_METRICS schema=1 calls=1275600 distinct=876528
+BLORP_CORE_LOWERING_TYPE_TOP rank=1 count=167823 object=0xa2f044d80
+BLORP_CORE_LOWERING_SOURCE_LOC schema=1 calls=748990 allocations=1497980
+BLORP_CORE_LOWERING_VAR schema=1 calls=348992 allocations=348992
+BLORP_CORE_LOWERING_NODE_KIND kind=TypedNameExpr calls=271793 self_allocations=3802949 inclusive_allocations=3802949 self_per_call=13.992
 ```
 
-See `benchmarks/results/core_lowering_type_histogram_2026-09-22.md` for the
-full top-30 table from the frozen self-compile and the design decision it
-produced (module-level constants for arg-less scalar types, not a
+See `benchmarks/results/core_lowering_type_histogram_2026-09-22.md` (the
+original type-only histogram; see its errata note) and
+`benchmarks/results/core_lowering_allocation_attribution_2026-09-22.md`'s
+real-program section for the corrected full tables and the design decisions
+they produced (module-level constants for arg-less scalar types, not a
 per-function memo).
 
 ## Timing Model

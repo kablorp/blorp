@@ -4,6 +4,25 @@ Follow-up to `core_lowering_allocation_attribution_2026-09-22.md`, requested
 before implementing cut 1: real numbers from the frozen self-compile, not
 only the synthetic fixture.
 
+**Errata (later same day):** the JSON-text histogram mechanism described
+below was found to allocate on every call while `BLORP_CORE_LOWERING_TYPE_METRICS`
+is on (building a `core_type_to_json(...).to_string()` per call), inflating
+`core_lowering_complete`'s allocation total roughly 4x *while that
+diagnostic env var was active*. This does not affect cut 1's own acceptance
+numbers below (the 1.59% real saving, byte-identical C) -- those came from
+ordinary `self_compile_measure` runs with the env var unset, which were
+never subject to the bug -- nor the `calls`/`distinct`/top-30-by-count
+conclusion (arg-less scalars dominate), which only ever depended on string
+comparison for grouping, not on the allocation totals. It does mean any
+future run of this exact histogram command inflates its own numbers; the
+mechanism was fixed (pointer-identity keys, no allocation) in the same
+session that found it, in the 2026-09-22 real-program follow-up section of
+`core_lowering_allocation_attribution_2026-09-22.md`, which also has the
+before/after proof that the fixed version reproduces the harness's
+~18.3M-ish `core_lowering_complete` delta exactly with the variable set or
+unset. Use that mechanism for any further histogram work, not the one
+described in this file.
+
 ## Instrumentation
 
 New counters at the type-lowering choke point

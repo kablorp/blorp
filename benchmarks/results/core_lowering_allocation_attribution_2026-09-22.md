@@ -132,3 +132,233 @@ Flagging as a follow-up task rather than starting it half-finished.
   self-compile's actual typed program; the 26.5%/17.6% figures are the
   fixture's numbers, used only to clear or fail the stated go/no-go
   thresholds, not as literal self-compile percentages.
+
+
+## Real-program follow-up (2026-09-22, second pass)
+
+Cut 1 landed measuring 26.5%/17.6% type/location shares on the synthetic
+fixture above, but the real self-compile's scalar-constant cut only moved
+`core_lowering_complete` by 1.59% (see
+`core_lowering_type_histogram_2026-09-22.md`) -- types turned out to be a
+small share of the real program's allocations, and the fixture's numbers
+were an artifact of the specific type shape it chose to repeat, not
+representative of the real program. This section was first written with a
+bug in the instrumentation itself; the corrected version below replaces it
+entirely (see "Instrumentation correctness bug" for what was wrong and how
+it was found).
+
+### Extended instrumentation
+
+Extended `BLORP_CORE_LOWERING_TYPE_METRICS` (same opt-in env var, same
+C-side counter mechanism in `blorp/src/lib/runtime/native/runtime.c`) with:
+
+- **`core_source_loc`** and **`core_var`** wrapped the same way as
+  `core_lower_type_with_prefixes`: total calls and the allocation delta
+  measured immediately around each call, accumulated into one running
+  counter. Printed as `BLORP_CORE_LOWERING_SOURCE_LOC` / `BLORP_CORE_LOWERING_VAR`.
+- **Per-typed-node-kind self/inclusive allocations.** `lower_typed_expr_as_type`
+  (the function every `TypedExpr` node passes through exactly once) is
+  wrapped with an enter/exit pair around a call-stack of frames: entering
+  records the allocation counter; exiting computes this node's own
+  *inclusive* delta (allocations since entry, including everything its
+  children did) and *self* delta (inclusive delta minus the sum of its
+  direct children's inclusive deltas, the child sum tracked by charging each
+  child's inclusive delta to its parent's frame as it returns) -- the
+  standard stack-based self/inclusive split a sampling profiler uses. Each
+  node's kind (`TypedCallExpr`, `TypedBlockExpr`, ...) comes from a new
+  `typed_expr_kind_name` function added purely for this instrumentation (a
+  literal string per union variant; it cannot affect lowering's output).
+  Printed as `BLORP_CORE_LOWERING_NODE_KIND kind=... calls=... self_allocations=... inclusive_allocations=...`.
+  The same enter/exit primitives are reused inline inside the `TypedCallExpr`
+  arm with call-specific labels (`CallExpr.callee_type_lowering`,
+  `CallExpr.callee_identity`, `CallExpr.args_list`, `CallExpr.call_kind`,
+  `CallExpr.node_construct`) to drill one level into call lowering's own
+  budget -- see "Drilling into TypedCallExpr" below.
+
+### Instrumentation correctness bug (found, fixed)
+
+The first version of this section reported a lowering delta of 72,022,496
+allocations and concluded `TypedCallExpr` was 46.46% of it. Both numbers
+were wrong. The bug: `core_lower_type_with_prefixes`'s metric recorder
+called `core_lowering_type_metric_record(core_type_to_json(lowered).to_string())`
+on every one of the ~1.3M calls in a self-compile -- building a full JSON
+tree and then a string from it, on every call, purely so the histogram
+could bucket by structural shape. That allocates tens of millions of
+managed objects, and it allocates *while `BLORP_CORE_LOWERING_TYPE_METRICS`
+is on*, i.e. exactly while the measurement is running, silently inflating
+every downstream percentage. Confirmed directly: `core_lowering_complete`
+with the variable **unset**:
+
+```text
+BLORP_COMPILER_MEMORY_CHECKPOINT schema=1 phase=typed_frontend_complete total_allocations=47430609 ...
+BLORP_COMPILER_MEMORY_CHECKPOINT schema=1 phase=core_lowering_complete total_allocations=66459691 ...
+```
+
+delta = 19,029,082 -- within noise of the harness's ~18.3M reference row.
+With the variable **set** (before the fix): `core_lowering_complete`
+total_allocations = 119,453,105, delta = 72,022,496 -- 3.8x larger, entirely
+an artifact of the JSON-stringify probe itself.
+
+**Fix**: key the type histogram by the lowered `CoreType` value's own
+allocation identity (its pointer -- the same notion `blorp_same_object`
+compares) instead of a structural JSON string. Recording a pointer requires
+no Blorp-managed allocation at all. `core_lower_type_with_prefixes`'s
+foreign declaration changed from `core_lowering_type_metric_record(type_json: String)`
+to `core_lowering_type_metric_record(lowered_type: CoreType)`, and the C-side
+hash table's key changed from `char*` (strcmp-compared, heap-copied on
+insert) to `const void*` (pointer-compared, no copy). This also changes what
+"distinct" means in the histogram -- pointer identity rather than structural
+shape -- which is arguably the more useful number for cut-1-style questions
+(same object reused vs. rebuilt), at the cost of losing human-readable type
+text in the top-30 report (now `object=0x...` rather than `type={"kind":...}`).
+
+Verified fixed, same command, same input, both with the variable **set**:
+
+```text
+BLORP_COMPILER_MEMORY_CHECKPOINT schema=1 phase=typed_frontend_complete total_allocations=47430609 ...
+BLORP_COMPILER_MEMORY_CHECKPOINT schema=1 phase=core_lowering_complete total_allocations=66459691 ...
+```
+
+Identical to the metrics-unset run, to the allocation. Also verified with
+`benchmarks/self_compile_measure --require-identical` comparing this
+worktree (metrics instrumentation present but unset, the normal state) against
+the parent commit: byte-identical generated C, every phase's allocation row
+at exactly +0.00%, instructions retired +0.03% (noise). The instrumentation
+is a true no-op when off and allocation-neutral when on.
+
+**Both totals, as asked:**
+
+| run | `typed_frontend_complete` | `core_lowering_complete` | lowering delta |
+|---|---|---|---|
+| `BLORP_CORE_LOWERING_TYPE_METRICS` unset | 47,430,609 | 66,459,691 | **19,029,082** |
+| `BLORP_CORE_LOWERING_TYPE_METRICS=1` (fixed) | 47,430,609 | 66,459,691 | **19,029,082** (identical) |
+| `BLORP_CORE_LOWERING_TYPE_METRICS=1` (buggy, pre-fix) | 47,430,609 | 119,453,105 | 72,022,496 (4x inflated) |
+
+### Corrected result
+
+Top node kinds by **self** allocations (own construction cost, children's
+allocations excluded), all against the true 19,029,082 lowering delta:
+
+| kind | calls | self allocations | self % of lowering | self/call |
+|---|---|---|---|---|
+| `TypedNameExpr` | 271,793 | 3,802,949 | **19.98%** | 14.0 |
+| `TypedBlockExpr` | 68,829 | 1,143,015 | 6.01% | 16.6 |
+| `CallExpr.callee_type_lowering` | 86,648 | 852,492 | 4.48% | 9.8 |
+| `CallExpr.args_list` | 86,648 | 549,180 | 2.89% | 6.3 |
+| `CallExpr.call_kind` | 86,648 | 506,713 | 2.66% | 5.8 |
+| `CallExpr.callee_identity` | 86,648 | 390,076 | 2.05% | 4.5 |
+| `TypedMatchExpr` | 10,186 | 318,362 | 1.67% | 31.3 |
+| `TypedFieldAccessExpr` | 32,782 | 277,172 | 1.46% | 8.5 |
+| `TypedCallExpr` (own residual, mostly its `core_source_loc`) | 86,648 | 173,296 | 0.91% | 2.0 |
+| `TypedRecordUpdateExpr` | 1,735 | 118,727 | 0.62% | 68.4 |
+| `TypedStringLiteralExpr` | 23,755 | 95,020 | 0.50% | 4.0 |
+| `CallExpr.node_construct` | 86,648 | 86,648 | 0.46% | 1.0 |
+| remaining 24 kinds | 85,830 | 591,921 | 3.11% | -- |
+| **sum, all kinds/labels** | -- | **8,905,571** | **46.80%** | -- |
+| `core_source_loc` (all nodes) | 748,990 | 1,497,980 | 7.87% | 2.0 |
+| `core_var` (all nodes) | 348,992 | 348,992 | 1.83% | 1.0 |
+| not attributed to any expression node (decl/function/record/global lowering overhead outside `lower_typed_expr_as_type`) | -- | 10,123,511 | 53.20% | -- |
+
+Summing `TypedCallExpr`'s own residual with its four `CallExpr.*` sub-steps
+recovers exactly the same number the (buggy) first pass reported as
+`TypedCallExpr`'s self-allocations before this fix (2,558,405) -- the fix
+did not change the total, only the (much smaller, correct) denominator it is
+a percentage of, and split that total into finer sub-steps.
+
+**`TypedNameExpr` -- ordinary variable/function-name references, not calls
+-- is the single largest self-allocation contributor at 19.98%.** It is a
+leaf node (`Ok(VarExpr(core_var(clean_name, def_id), typ, loc))`): its per-call
+cost is `core_var` (1 allocation) plus whatever `core_source_loc_from_context`
+and the type it was handed cost, at massive volume (271,793 calls, the most
+frequent node kind after the arg/callee traffic already broken out above).
+This something-plus-volume shape, not one expensive helper, is why it is not
+already the subject of a cut; it would need its own drill-down before
+proposing one, and is flagged as the next attribution target below.
+
+### Drilling into TypedCallExpr
+
+Per the ask, drilled one level into `TypedCallExpr`'s own allocation budget
+(2,558,405, none of it double-counted with the callee's or an argument's own
+recursive lowering, which are separately charged to their own node kinds).
+Each of the arm's four steps -- `apply_resolved_callee_identity` (callable
+resolution / UFCS name split), `lower_typed_exprs` (the argument list
+build), `lower_resolved_call_kind` (`CoreCallKind` construction), and the
+final `CallExpr(...)` node -- was wrapped with the same enter/exit
+primitive, plus one more: the callee's own `lower_typed_expr_with_context`
+call, because that call computes the callee's *semantic type* via
+`core_lower_value_type` **before** calling the wrapped
+`lower_typed_expr_as_type` that pushes the callee's own frame -- so without
+wrapping the whole call, that type-lowering cost is silently charged to
+whichever node calls the callee (here, `TypedCallExpr`) instead of to the
+callee's own kind. This is a real, general subtlety of where the wrapper
+sits, not a further allocation bug (it does not affect the true lowering
+total, only which self-time bucket a cost lands in) -- worth noting for
+anyone extending this instrumentation further.
+
+| step | calls | self allocations | % of call lowering's own budget | self/call |
+|---|---|---|---|---|
+| `CallExpr.callee_type_lowering` (the callee's own semantic type, lowered fresh on every call site) | 86,648 | 852,492 | **33.32%** | 9.8 |
+| `CallExpr.args_list` (argument list construction, excluding each argument's own recursive lowering) | 86,648 | 549,180 | 21.47% | 6.3 |
+| `CallExpr.call_kind` (`CoreCallKind` construction: builtin/direct/trait/unknown dispatch) | 86,648 | 506,713 | 19.81% | 5.8 |
+| `CallExpr.callee_identity` (UFCS name split / resolved-call name substitution) | 86,648 | 390,076 | 15.25% | 4.5 |
+| `TypedCallExpr` own residual (mostly `core_source_loc` for the call node itself) | 86,648 | 173,296 | 6.77% | 2.0 |
+| `CallExpr.node_construct` (the final `CallExpr` node) | 86,648 | 86,648 | 3.39% | 1.0 |
+| **total (= call lowering's own budget)** | 86,648 | **2,558,405** | 100% | 29.5 |
+
+### Go/no-go: callee type lowering
+
+**GO** -- `CallExpr.callee_type_lowering` is 33.32% of call lowering's own
+budget, clearing the 25% threshold. Mechanism: the callee's semantic type
+(almost always a `SemanticFunctionType`, the referenced function's own
+signature) is lowered fresh via `core_lower_value_type` on *every call
+site* that references a given function, rather than once per function
+declaration. Unlike cut 1's built-in scalars, a function's `FunctionType`
+is not a small fixed set of shapes that can be replaced by a handful of
+module-level constants -- it is specific to each function's own param/return
+types.
+
+**Not implemented this session.** The safe version of this cut is a memo
+keyed by the callee's resolved definition id (available from
+`info.resolved_call` on a resolved `TypedCallExpr`) rather than by
+`SemanticType` identity, populated once when each function's own
+`TypedFunctionDecl`/`TypedForeignFunctionDecl` is lowered (a point that
+*does* correctly thread an updated `CoreLowerContext` forward across
+declarations, unlike expression-level lowering -- see the earlier
+context-threading finding above) and read (never written) from expression
+lowering, so no context-return-threading is needed at the read sites. That
+design avoids the blocking issue that ruled out cut 1's per-function memo.
+It was not implemented here because of a real, unverified risk in the time
+available: monomorphization. If the same function name resolves to
+*different* instantiated signatures at different call sites (a generic
+function called with different type arguments), a memo keyed only by
+definition id would hand a later call site the wrong, stale instantiation --
+a functional correctness bug in generated code, not just a missed
+optimization. Confirming whether `info.resolved_call`'s definition id is
+already instantiation-specific (safe to key on directly) or shared across
+instantiations (needs the type arguments folded into the key) requires
+reading the monomorphization/specialization passes this session did not
+have time to read carefully. Landing a memo without that check risked
+exactly the kind of unverified cut that got reverted before cut 0 existed.
+
+Recommending this as the next task, with the specific design and the
+monomorphization question spelled out above so it does not need
+re-deriving.
+
+## Caveats (real-program section)
+
+- The per-node self/inclusive split has a known attribution quirk: a node's
+  own outer type-lowering cost (computed by its *caller* via
+  `core_lower_value_type` before the node's own frame is pushed) is charged
+  to the caller, not the node itself, unless the caller explicitly wraps
+  that specific call (as done for `TypedCallExpr`'s callee above). Kinds
+  that were not drilled into this way may be under-counting their own true
+  cost and over-counting whichever kind most often calls them.
+- "Not attributed to any expression node" (53.20%) is declaration-level
+  lowering (function signatures, record/union/global declarations,
+  `CoreProgram`/`CoreDecl` list-building) that this instrumentation does not
+  wrap; a future pass could extend the same enter/exit mechanism to
+  `lower_typed_decl_with_visibility`'s dispatch to close this gap the same
+  way.
+- `core_source_loc` and `core_var`'s percentages are not additional to the
+  46.80% node-kind sum -- their allocations happen *inside* whichever node's
+  self-time window called them.

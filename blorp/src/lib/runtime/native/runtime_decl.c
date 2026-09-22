@@ -2447,8 +2447,13 @@ void blorp_typecheck_ctfe_metric_record_c(
 );
 void blorp_typecheck_body_metrics_report_c(void);
 long blorp_core_lowering_type_metrics_enabled_c(void);
-void blorp_core_lowering_type_metric_record_c(const char* type_json);
+void blorp_core_lowering_type_metric_record_c(const void* lowered_type);
 void blorp_core_lowering_type_metrics_report_c(void);
+void blorp_core_lowering_node_enter_c(void);
+void blorp_core_lowering_node_exit_c(const char* kind);
+void blorp_core_lowering_source_loc_record_c(long delta);
+void blorp_core_lowering_var_record_c(long delta);
+void blorp_core_lowering_node_kind_report_c(void);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);
 void blorp_reset_scheduler_stats(void);
