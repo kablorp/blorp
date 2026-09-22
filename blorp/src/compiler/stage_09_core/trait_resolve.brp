@@ -488,7 +488,7 @@ private pure func is_integer_type_name(name: String) -> Bool:
 
 
 private pure func has_native_structural_equality(
-	registry: CoreTraitResolveRegistry,
+	structural_type_names: Dict[String, Bool],
 	typ: CoreType,
 ) -> Bool:
 	match typ:
@@ -496,7 +496,7 @@ private pure func has_native_structural_equality(
 			True
 		NamedType(name, _):
 			(
-				registry.structural_type_names.get_or(name, False)
+				structural_type_names.get_or(name, False)
 				or CoreTypePolicy.core_named_type_has_structural_equality(name)
 			)
 		_:
@@ -508,7 +508,7 @@ private pure func native_structural_equality_target(
 	identity: CoreTraitMethodIdentity,
 	typ: CoreType,
 ) -> Option[CoreTraitImplTargetKind]:
-	if identity.trait_name != "Equatable" or not has_native_structural_equality(registry, typ):
+	if identity.trait_name != "Equatable" or not has_native_structural_equality(registry.structural_type_names, typ):
 		None
 	else:
 		match identity.method_name:
@@ -598,7 +598,7 @@ private pure func has_builtin_to_string_fallback(typ: CoreType) -> Bool:
 
 
 private pure func dispatch_type(
-	registry: CoreTraitResolveRegistry,
+	static_self_methods: Dict[String, Bool],
 	identity: CoreTraitMethodIdentity,
 	args: List[CoreExpr],
 	return_type: CoreType,
@@ -607,7 +607,7 @@ private pure func dispatch_type(
 		Some(receiver):
 			Some(core_expr_type(receiver))
 		None:
-			if registry.static_self_methods.get_or(
+			if static_self_methods.get_or(
 				method_key(identity.trait_name, identity.method_name),
 				False,
 			):
@@ -637,16 +637,16 @@ private pure func target_for_dispatch(
 
 
 private pure func registered_target_for_dispatch(
-	registry: CoreTraitResolveRegistry,
+	targets: Dict[String, CoreTraitImplTargetKind],
 	identity: CoreTraitMethodIdentity,
 	dispatch: CoreType,
 ) -> Option[CoreTraitImplTargetKind]:
 	type_name ?= core_trait_impl_type_key(dispatch)
-	registry.targets.get(target_key(identity.trait_name, identity.method_name, type_name))
+	targets.get(target_key(identity.trait_name, identity.method_name, type_name))
 
 
 private pure func unresolved_trait_call_kind(
-	registry: CoreTraitResolveRegistry,
+	generic_builtin_targets: List[CoreGenericBuiltinTarget],
 	original_kind: CoreCallKind,
 	callee: CoreExpr,
 ) -> CoreCallKind:
@@ -662,7 +662,7 @@ private pure func unresolved_trait_call_kind(
 					}
 
 					if (
-						has_generic_builtin_target(registry.generic_builtin_targets, target)
+						has_generic_builtin_target(generic_builtin_targets, target)
 						and variable.name == core_ufcs_function_name(module_name, method_name)
 					):
 						SelectedDirectCall(def_id)
@@ -788,13 +788,13 @@ private pure func rewrite_unresolved_trait_call(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	kind: CoreCallKind = unresolved_trait_call_kind(registry, original_kind, callee)
+	kind: CoreCallKind = unresolved_trait_call_kind(registry.generic_builtin_targets, original_kind, callee)
 
 	fallback_callee: CoreExpr = match kind:
 		DeferredTraitCall(_, _):
 			match trait_builtin_fallback_name(
 				identity,
-				dispatch_type(registry, identity, args, return_type),
+				dispatch_type(registry.static_self_methods, identity, args, return_type),
 			):
 				Some(name):
 					rewrite_callee(callee, name, loc)
@@ -824,11 +824,11 @@ private pure func rewrite_trait_call(
 	if shadowed:
 		CallExpr(UnknownCall, callee, args, return_type, loc)
 	else:
-		match dispatch_type(context.registry, identity, args, return_type):
+		match dispatch_type(context.registry.static_self_methods, identity, args, return_type):
 			Some(dispatch):
 				target: Option[CoreTraitImplTargetKind] = match original_kind:
 					SelectedTraitCall(_, _, _, _):
-						registered_target_for_dispatch(context.registry, identity, dispatch)
+						registered_target_for_dispatch(context.registry.targets, identity, dispatch)
 					_:
 						target_for_dispatch(context.registry, identity, dispatch)
 
@@ -880,7 +880,7 @@ private pure func rewrite_trait_call(
 
 
 private pure func rewrite_operator(
-	context: CoreTraitResolveContext,
+	registry: CoreTraitResolveRegistry,
 	identity: CoreTraitMethodIdentity,
 	operands: List[CoreExpr],
 	return_type: CoreType,
@@ -891,7 +891,7 @@ private pure func rewrite_operator(
 		Some(first):
 			dispatch: CoreType = core_expr_type(first)
 
-			match target_for_dispatch(context.registry, identity, dispatch):
+			match target_for_dispatch(registry, identity, dispatch):
 				Some(target):
 					match target:
 						NativeBinaryTraitTarget(op):
@@ -1003,7 +1003,7 @@ private pure func rewrite_expr(context: CoreTraitResolveContext, expr: CoreExpr)
 					children_rewritten
 		BinaryExpr(op, left, right, return_type, loc):
 			rewrite_operator(
-				context,
+				context.registry,
 				core_binary_trait_method(op),
 				[left, right],
 				return_type,
@@ -1014,7 +1014,7 @@ private pure func rewrite_expr(context: CoreTraitResolveContext, expr: CoreExpr)
 			match core_unary_trait_method(op):
 				Some(identity):
 					rewrite_operator(
-						context,
+						context.registry,
 						identity,
 						[operand],
 						return_type,
@@ -1050,12 +1050,12 @@ private pure func rewrite_function(
 
 
 private pure func finalize_native_impl_method(
-	registry: CoreTraitResolveRegistry,
+	targets: Dict[String, CoreTraitImplTargetKind],
 	trait_name: String,
 	type_name: String,
 	method: CoreFunction,
 ) -> CoreFunction:
-	match registry.targets.get(target_key(trait_name, method.name, type_name)):
+	match targets.get(target_key(trait_name, method.name, type_name)):
 		Some(NativeBinaryTraitTarget(_)) | Some(NativeUnaryTraitTarget(_)):
 			if method.function_kind == UnresolvedBuiltinFunction and method.body.is_some():
 				{ method | function_kind = UserFunction }
@@ -1079,7 +1079,7 @@ private pure func rewrite_impl(
 				for method in implementation.methods:
 					methods = methods.append(
 						finalize_native_impl_method(
-							registry,
+							registry.targets,
 							implementation.trait_name,
 							type_name,
 							rewrite_function(registry, method),
@@ -1128,7 +1128,7 @@ private pure func missing_impl_diagnostic(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Option[CoreTraitResolveDiagnostic]:
-	dispatch ?= dispatch_type(registry, identity, args, return_type)
+	dispatch ?= dispatch_type(registry.static_self_methods, identity, args, return_type)
 	type_name ?= core_trait_impl_type_key(dispatch)
 	candidates: List[String] = registry.types_by_method.get_or(
 		method_key(identity.trait_name, identity.method_name),
