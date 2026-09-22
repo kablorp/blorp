@@ -14,6 +14,14 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "bin" / "blorp")).resolve()
+# Initializing against ROOT makes the server recursively discover and read
+# every .brp file in the whole monorepo (thousands of files) before it can
+# answer `initialize`. Tests that don't need real cross-repo navigation use a
+# small fixture directory instead; the server's `cwd` stays ROOT (see
+# LspClient(str(BLORP), ROOT) below) so package-root discovery (searching
+# upward from the workspace root for a `pkg` directory) still finds the
+# repo's real `pkg/` directory.
+LIFECYCLE_ONLY_ROOT = ROOT / "blorp/test/lsp/fixtures/navigation"
 RUNNER_PATH = pathlib.Path(__file__).with_name("run_lsp_fixtures.py")
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_lsp_fixtures", RUNNER_PATH)
 if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
@@ -43,7 +51,7 @@ class NativeLspBaselineTests(unittest.TestCase):
                 "initialize",
                 {
                     "processId": None,
-                    "rootUri": ROOT.as_uri(),
+                    "rootUri": LIFECYCLE_ONLY_ROOT.as_uri(),
                     "capabilities": {},
                 },
                 timeout=RUNNER.INITIALIZE_TIMEOUT_SECONDS,
@@ -94,7 +102,7 @@ class NativeLspBaselineTests(unittest.TestCase):
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
             client.initialize(
-                ROOT.as_uri(),
+                source_path.parent.as_uri(),
                 expected_version,
                 capabilities={
                     "textDocument": {
@@ -716,7 +724,7 @@ class NativeLspBaselineTests(unittest.TestCase):
             )
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            client.initialize(source_path.parent.as_uri(), expected_version)
             diagnostics = client.open_document(source_path.as_uri(), source)
             import_diagnostics = [
                 diagnostic
@@ -757,7 +765,7 @@ class NativeLspBaselineTests(unittest.TestCase):
         try:
             expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            client.initialize(LIFECYCLE_ONLY_ROOT.as_uri(), expected_version)
 
             request_id = client.next_id
             client.next_id += 1
@@ -794,7 +802,12 @@ class NativeLspBaselineTests(unittest.TestCase):
             )
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            # Not source_path.parent: should_pass/ has its own nested "pkg"
+            # fixture directory (local_math.brp) that would shadow the repo's
+            # real pkg/ (crypto.brp) during upward package-root discovery.
+            # One level higher avoids that decoy while still being far
+            # smaller than the whole-repo root.
+            client.initialize(source_path.parent.parent.as_uri(), expected_version)
             diagnostics = client.open_document(
                 source_path.as_uri(), source_path.read_text(encoding="utf-8")
             )
@@ -817,7 +830,7 @@ class NativeLspBaselineTests(unittest.TestCase):
             source = 'TUPLES_EQUAL: Bool = (1, "value") == (1, "value")\n'
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            client.initialize(source_path.parent.as_uri(), expected_version)
             self.assertEqual(
                 client.open_document(source_path.as_uri(), source),
                 [],
@@ -841,7 +854,7 @@ class NativeLspBaselineTests(unittest.TestCase):
             invalid_source = source.replace("grown.length()", "missing_before_close")
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            client.initialize(source_path.parent.as_uri(), expected_version)
             self.assertEqual(client.open_document(source_path.as_uri(), source), [])
             diagnostics = client.change_document(
                 source_path.as_uri(),
@@ -874,7 +887,10 @@ class NativeLspBaselineTests(unittest.TestCase):
             uri = source_path.as_uri()
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            # See test_standard_library_and_package_imports_resolve: avoid
+            # should_pass/'s nested "pkg" fixture directory shadowing the
+            # repo's real pkg/.
+            client.initialize(source_path.parent.parent.as_uri(), expected_version)
             client.open_document_without_wait(uri, source)
             client.change_document_without_wait(uri, 2, old_source)
             client.change_document_without_wait(uri, 3, newest_source)
@@ -925,7 +941,7 @@ class NativeLspBaselineTests(unittest.TestCase):
             )
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            client.initialize(source_path.parent.as_uri(), expected_version)
             client.open_document_without_wait(source_path.as_uri(), large_source)
 
             self.assertIsNone(client.request("shutdown", None))
@@ -942,7 +958,7 @@ class NativeLspBaselineTests(unittest.TestCase):
         try:
             expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(ROOT.as_uri(), expected_version)
+            client.initialize(LIFECYCLE_ONLY_ROOT.as_uri(), expected_version)
 
             self.assertIsNotNone(client.proc.stdout)
             client.proc.stdout.close()
