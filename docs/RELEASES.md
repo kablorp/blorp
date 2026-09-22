@@ -152,7 +152,7 @@ bin/blorp run --timeout 5 --no-format "$smoke"
 bin/blorp test --warmup-only
 bin/blorp test --timeout 5 blorp/test/runtime/types/test_bool.brp
 bin/blorp test --leak-check --suite --timeout 5 \
-  blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
+  blorp/test/runtime/memory/leak_check_baselines/sleep_cancelled_string.brp
 bin/blorp test --sanitize --timeout 5 blorp/test/runtime/types/test_bool.brp
 bin/blorp lsp </dev/null >"$lsp_out"
 ```

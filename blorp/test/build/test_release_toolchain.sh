@@ -87,7 +87,7 @@ fi
 isolated_output="$tmp_dir/isolated-compile.c"
 "$release_binary" compile --no-format \
 	-o "$isolated_output" \
-	blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
+	blorp/test/runtime/memory/leak_check_baselines/sleep_cancelled_string.brp
 if [ ! -s "$isolated_output" ]; then
 	fail "the packaged compiler must compile in isolation"
 fi
@@ -266,7 +266,7 @@ fi
 bootstrap_smoke="$tmp_dir/bootstrap-smoke.c"
 "$bootstrap_path" compile --no-format \
 	-o "$bootstrap_smoke" \
-	blorp/test/runtime/memory/leak_check_baselines/empty_main.brp
+	blorp/test/runtime/memory/leak_check_baselines/sleep_cancelled_string.brp
 if [ ! -s "$bootstrap_smoke" ]; then
 	fail "the pinned compiler must compile through its ordinary command"
 fi

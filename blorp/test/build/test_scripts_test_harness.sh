@@ -225,6 +225,20 @@ if [ "\${1:-}" = "test" ]; then
 	exit "\${BLORP_TEST_COMMAND_EXIT:-1}"
 fi
 
+if [ "\${1:-}" = "__compiler-build-synthetic-executable" ]; then
+	echo "\$*" >> "$TMP_HARNESS/synthetic-executable-log.txt"
+	if [ "\${BLORP_LEAK_ISOLATED_BUILD_EXIT:-0}" != "0" ]; then
+		echo "fake isolated dispatch build failure" >&2
+		exit "\${BLORP_LEAK_ISOLATED_BUILD_EXIT}"
+	fi
+	cat > "\$4" <<'STUB'
+#!/usr/bin/env bash
+exit "${BLORP_LEAK_ISOLATED_CASE_EXIT:-0}"
+STUB
+	chmod +x "\$4"
+	exit 0
+fi
+
 echo "unexpected fake blorp command: \$*" >&2
 exit 2
 SH
@@ -548,6 +562,9 @@ fi
 
 echo "PASS: scripts/test compiles all selected runtime roots once"
 
+mkdir -p "$TMP_HARNESS/blorp/test/runtime/memory/leak_check_baselines"
+: > "$TMP_HARNESS/blorp/test/runtime/memory/leak_check_baselines/isolated_example.brp"
+
 leak_output_file="$TMP_HARNESS/leak-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
@@ -565,7 +582,7 @@ if [ "$leak_status" -ne 0 ]; then
 	exit 1
 fi
 
-if ! grep -Fq 'test --leak-check --suite --timeout 60 blorp/test/runtime/memory/' "$TMP_HARNESS/test-command-log.txt" \
+if ! grep -Fq 'test --leak-check --suite --timeout 60 blorp/test/runtime/memory/test_memory.brp' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'blorp/test/compiler/pipeline/test_type_header_graph.brp' "$TMP_HARNESS/test-command-log.txt" \
 	|| ! grep -Fq 'blorp/test/runtime/sys/test_file_resource.brp' "$TMP_HARNESS/test-command-log.txt"
 then
@@ -574,12 +591,40 @@ then
 	exit 1
 fi
 
+if grep -Fq 'leak_check_baselines' "$TMP_HARNESS/test-command-log.txt"; then
+	echo "FAIL: scripts/test leak should not hand isolated leak-baseline programs to the combined suite"
+	cat "$TMP_HARNESS/test-command-log.txt"
+	exit 1
+fi
+
 echo "PASS: scripts/test leak owns dedicated and curated ownership regressions"
 
+if ! grep -Fq '__compiler-build-synthetic-executable blorp/test/runtime/memory/leak_check_baselines/__isolated_dispatch__.brp' \
+	"$TMP_HARNESS/synthetic-executable-log.txt" 2>/dev/null
+then
+	echo "FAIL: scripts/test leak should link the isolated leak-baseline dispatch binary once"
+	cat "$TMP_HARNESS/synthetic-executable-log.txt" 2>/dev/null
+	exit 1
+fi
+
+if [ "$(wc -l < "$TMP_HARNESS/synthetic-executable-log.txt" | tr -d ' ')" -ne 1 ]; then
+	echo "FAIL: scripts/test leak should link the isolated dispatch binary exactly once per run"
+	cat "$TMP_HARNESS/synthetic-executable-log.txt"
+	exit 1
+fi
+
+echo "PASS: scripts/test leak links the isolated leak-baseline programs into one dispatch binary"
+
 if ! grep -Fxq 'Diagnostic results: 1 passed, 0 failed' "$leak_output_file" \
-	|| ! grep -Fxq 'Results: 2 passed, 0 failed (2 leak checks)' "$leak_output_file"
+	|| ! grep -Fxq 'Results: 20 passed, 0 failed (20 leak checks)' "$leak_output_file"
 then
 	echo "FAIL: scripts/test leak should distinguish its diagnostic subtotal from the combined result"
+	cat "$leak_output_file"
+	exit 1
+fi
+
+if ! grep -Fq -- '-- Leak-Check Isolated Programs (one link, 18 launches) --' "$leak_output_file"; then
+	echo "FAIL: scripts/test leak should report the isolated dispatch launch count"
 	cat "$leak_output_file"
 	exit 1
 fi
@@ -596,7 +641,7 @@ missing_diag_output="$TMP_HARNESS/missing-diag-output.txt"
 ) > "$missing_diag_output" 2>&1
 missing_diag_status=$?
 if [ "$missing_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+1[[:space:]]+1[[:space:]]+2' \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+19[[:space:]]+1[[:space:]]+20' \
 		"$missing_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject missing diagnostic verdicts"
@@ -617,7 +662,7 @@ malformed_diag_output="$TMP_HARNESS/malformed-diag-output.txt"
 ) > "$malformed_diag_output" 2>&1
 malformed_diag_status=$?
 if [ "$malformed_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+1[[:space:]]+1[[:space:]]+2' \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+19[[:space:]]+1[[:space:]]+20' \
 		"$malformed_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject malformed diagnostic verdicts"
@@ -635,7 +680,7 @@ duplicate_diag_output="$TMP_HARNESS/duplicate-diag-output.txt"
 ) > "$duplicate_diag_output" 2>&1
 duplicate_diag_status=$?
 if [ "$duplicate_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+1[[:space:]]+1[[:space:]]+2' \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+19[[:space:]]+1[[:space:]]+20' \
 		"$duplicate_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject duplicate diagnostic verdicts"

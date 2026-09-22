@@ -202,6 +202,65 @@ leak_roots=(
     blorp/test/runtime/sys/test_file_resource.brp
 )
 
+# Programs under leak_check_baselines/ that spawn/park fibers (cancellation
+# regressions: `test: cancel_after_parked_for_test`, `concurrent:` blocks,
+# `.concurrent(`/`concurrently(`) keep their own OS process per case, since a
+# process-global scheduler/reactor could carry state between them if they ran
+# back to back in one process. `run_leak_isolated_dispatch` below links them
+# into ONE dispatch binary (one clang run) and launches it once per case
+# (argv[1] selects which program's `main` runs), so leak accounting stays
+# exactly one process per program while paying only one link for all of them.
+# Every other file under leak_check_baselines/ is an ordinary single-threaded
+# program; those were converted to plain `tests: TestSuite` fixtures living
+# directly under blorp/test/runtime/memory/, so they join the combined suite
+# artifact below like any other leak-owned TestSuite source.
+leak_isolated_dispatch_root="blorp/test/runtime/memory/leak_check_baselines"
+leak_isolated_dispatch_source="${leak_isolated_dispatch_root}/__isolated_dispatch__.brp"
+leak_isolated_dispatch_cases=(
+    channel_cancelled_fanout_string
+    channel_cancelled_join_string
+    channel_cancelled_recv_string
+    channel_cancelled_select_string
+    channel_cancelled_send_string
+    concurrent_cancelled_fixed_join_string
+    list_concurrent_cancelled_join_string
+    list_concurrent_string_results
+    nested_worker_group_cancel_channel
+    select_cancelled_stack_result
+    sleep_cancelled_string
+    stream_cancelled_owned_callback_string
+    tcp_cancelled_accept_string
+    tcp_cancelled_read_string
+    tcp_concurrent_source_cancelled_stream
+    udp_cancelled_recv_string
+    udp_datagram_stream_cancelled_predicate
+    udp_datagram_stream_cancelled_recv
+)
+
+# `bin/blorp test`'s own source discovery still treats every `.brp` file under
+# leak_check_baselines/ (the isolated cases plus the dispatcher itself) as a
+# standalone `main` program and would link one artifact per file again if it
+# ever saw them. Give the `--suite` invocation an explicit file list that
+# expands the memory root but leaves that subdirectory out; `leak_roots`
+# itself keeps pointing at the plain directory so the ownership checks above
+# (is_leak_owned_source / the runtime gate's exclusion) are unaffected.
+leak_suite_test_roots=()
+for leak_root in "${leak_roots[@]}"; do
+    case "$leak_root" in
+        blorp/test/runtime/memory/)
+            if [ -d "$leak_root" ]; then
+                while IFS= read -r source_path; do
+                    leak_suite_test_roots+=("$source_path")
+                done < <(LC_ALL=C find "$leak_root" -type f -name '*.brp' \
+                    -not -path "${leak_isolated_dispatch_root}/*" -print | LC_ALL=C sort)
+            fi
+            ;;
+        *)
+            leak_suite_test_roots+=("$leak_root")
+            ;;
+    esac
+done
+
 is_leak_owned_source() {
     local source_path="$1"
     local leak_root
@@ -542,11 +601,103 @@ parse_blorp_output() {
     return 0
 }
 
+# Run one already-built binary with a bounded wall-clock budget, without
+# depending on a `timeout`/`gtimeout` binary being installed (scripts/test has
+# no such dependency anywhere else). Polls at one-second resolution and
+# escalates through the same TERM-then-KILL process-tree teardown the
+# parallel-gate interrupt handler uses.
+run_with_timeout_seconds() {
+    local timeout_seconds="$1"
+    local outfile="$2"
+    shift 2
+    local pid waited=0
+
+    ("$@" >"$outfile" 2>&1) &
+    pid=$!
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "$timeout_seconds" ]; then
+            terminate_process_tree "$pid" TERM
+            sleep 1
+            terminate_process_tree "$pid" KILL
+            wait "$pid" 2>/dev/null
+            printf '\nblorp: leak isolated case timed out after %ss\n' "$timeout_seconds" >> "$outfile"
+            return 124
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    wait "$pid"
+}
+
+# Link the isolated leak-baseline programs (fiber-parking/cancellation and
+# real-concurrency regressions) into one dispatch binary and launch it once
+# per case with argv[1] selecting the program, so leak accounting is still
+# exactly one OS process per program but the gate pays one clang link instead
+# of one per program. Sets leak_isolated_passed/_failed/_tests/_failures as a
+# side effect; callers fold those into emit_combined_leak_result.
+run_leak_isolated_dispatch() {
+    local timeout_seconds="$1"
+    local binary_path case_id case_source case_output case_outfile exit_code
+
+    leak_isolated_passed=0
+    leak_isolated_failed=0
+    leak_isolated_failures=""
+
+    binary_path=$(mktemp "${TMPDIR:-/tmp}/blorp_leak_isolated.XXXXXX") || return 1
+    rm -f "$binary_path"
+
+    echo "-- Leak-Check Isolated Programs (one link, ${#leak_isolated_dispatch_cases[@]} launches) --"
+    if ! bin/blorp __compiler-build-synthetic-executable \
+        "$leak_isolated_dispatch_source" "$leak_isolated_dispatch_source" \
+        "$binary_path" --debug; then
+        echo "FAIL: leak isolated dispatch binary failed to build"
+        leak_isolated_failed=1
+        leak_isolated_failures="leak isolated dispatch binary (build failed)"
+        leak_isolated_tests=1
+        return 1
+    fi
+
+    case_outfile=$(mktemp "${TMPDIR:-/tmp}/blorp_leak_isolated_case.XXXXXX") || {
+        rm -f "$binary_path"
+        return 1
+    }
+
+    for case_id in "${leak_isolated_dispatch_cases[@]}"; do
+        case_source="${leak_isolated_dispatch_root}/${case_id}.brp"
+        echo "BLORP_TEST_ARTIFACT_START kind=program sources=1 timeout_seconds=${timeout_seconds}"
+        echo "BLORP_TEST_ARTIFACT_SOURCE ${case_source}"
+        : > "$case_outfile"
+        run_with_timeout_seconds "$timeout_seconds" "$case_outfile" \
+            env BLORP_LEAK_CHECK=strict "$binary_path" "$case_id"
+        exit_code=$?
+        case_output=$(cat "$case_outfile")
+        printf '%s\n' "$case_output"
+        echo "BLORP_TEST_ARTIFACT_END kind=program sources=1"
+        if [ "$exit_code" -eq 0 ]; then
+            leak_isolated_passed=$((leak_isolated_passed + 1))
+        else
+            leak_isolated_failed=$((leak_isolated_failed + 1))
+            echo "FAIL: ${case_source} (exit code ${exit_code})"
+            leak_isolated_failures="${leak_isolated_failures}${leak_isolated_failures:+$'\n'}${case_source} (exit code ${exit_code})"
+        fi
+    done
+
+    rm -f "$binary_path" "$case_outfile"
+    leak_isolated_tests=$((leak_isolated_passed + leak_isolated_failed))
+    [ "$leak_isolated_failed" -eq 0 ]
+}
+
 emit_combined_leak_result() {
     local suite_output="$1"
     local diag_output="$2"
     local suite_exit="$3"
     local diag_exit="$4"
+    local isolated_passed="${5:-0}"
+    local isolated_failed="${6:-0}"
+    local isolated_tests="${7:-0}"
+    local isolated_failures="${8:-}"
     local suite_status suite_passed suite_failed suite_tests
     local diag_passed diag_failed diag_tests
     local passed failed tests status
@@ -575,9 +726,9 @@ emit_combined_leak_result() {
         diag_tests=$((diag_passed + diag_failed))
     fi
 
-    passed=$((suite_passed + diag_passed))
-    failed=$((suite_failed + diag_failed))
-    tests=$((suite_tests + diag_tests))
+    passed=$((suite_passed + diag_passed + isolated_passed))
+    failed=$((suite_failed + diag_failed + isolated_failed))
+    tests=$((suite_tests + diag_tests + isolated_tests))
     status="PASS"
     if [ "$suite_status" != "PASS" ] || [ "$failed" -ne 0 ]; then
         status="FAIL"
@@ -588,6 +739,9 @@ emit_combined_leak_result() {
     fi
     if [ -n "${leak_diagnostics_failures:-}" ]; then
         printf 'FAIL: %s\n' "$leak_diagnostics_failures"
+    fi
+    if [ -n "$isolated_failures" ]; then
+        printf 'FAIL: %s\n' "$isolated_failures"
     fi
     printf 'Results: %s passed, %s failed (%s leak checks)\n' "$passed" "$failed" "$tests"
     printf 'BLORP_GATE_RESULT gate=leak status=%s passed=%s failed=%s tests=%s\n' "$status" "$passed" "$failed" "$tests"
@@ -1233,41 +1387,58 @@ run_runtime() {
 run_leak() {
     echo "═══ Leak-Check Ownership Suites + Diagnostics ═══"
     echo ""
-    local output exit_code output_file diag_output_file start_seconds
-    local suite_exit diag_exit combined_exit suite_output diag_output
+    local output exit_code output_file diag_output_file isolated_output_file start_seconds
+    local suite_exit diag_exit isolated_exit combined_exit suite_output diag_output
     start_seconds=$(now_seconds)
     output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak.XXXXXX") || exit 1
     diag_output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak_diag.XXXXXX") || {
         rm -f "$output_file"
         exit 1
     }
+    isolated_output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_leak_isolated.XXXXXX") || {
+        rm -f "$output_file" "$diag_output_file"
+        exit 1
+    }
     if $verbose; then
-        env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" 2>&1 | tee "$output_file"
+        env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_suite_test_roots[@]}" 2>&1 | tee "$output_file"
         suite_exit=${PIPESTATUS[0]}
         suite_output=$(cat "$output_file")
+        # Not piped through `tee`: `run_leak_isolated_dispatch` sets
+        # leak_isolated_* globals as its side effect, and a pipeline would run
+        # it in a subshell where those assignments never reach this shell.
+        run_leak_isolated_dispatch "$leak_test_timeout" > "$isolated_output_file" 2>&1
+        isolated_exit=$?
+        cat "$isolated_output_file"
+        cat "$isolated_output_file" >> "$output_file"
         blorp/test/runtime/test_leak_report.sh 2>&1 | tee "$diag_output_file"
         diag_exit=${PIPESTATUS[0]}
         diag_output=$(cat "$diag_output_file")
         cat "$diag_output_file" >> "$output_file"
     else
-        env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_roots[@]}" > "$output_file" 2>&1
+        env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$leak_test_timeout" "${leak_suite_test_roots[@]}" > "$output_file" 2>&1
         suite_exit=$?
         suite_output=$(cat "$output_file")
+        run_leak_isolated_dispatch "$leak_test_timeout" > "$isolated_output_file" 2>&1
+        isolated_exit=$?
+        cat "$isolated_output_file" >> "$output_file"
         blorp/test/runtime/test_leak_report.sh > "$diag_output_file" 2>&1
         diag_exit=$?
         diag_output=$(cat "$diag_output_file")
         cat "$diag_output_file" >> "$output_file"
     fi
+    # run_leak_isolated_dispatch sets these as a side effect of the call above.
     if $verbose; then
         emit_combined_leak_result "$suite_output" "$diag_output" "$suite_exit" "$diag_exit" \
+            "$leak_isolated_passed" "$leak_isolated_failed" "$leak_isolated_tests" "$leak_isolated_failures" \
             | tee -a "$output_file"
         combined_exit=${PIPESTATUS[0]}
     else
         emit_combined_leak_result "$suite_output" "$diag_output" "$suite_exit" "$diag_exit" \
+            "$leak_isolated_passed" "$leak_isolated_failed" "$leak_isolated_tests" "$leak_isolated_failures" \
             >> "$output_file"
         combined_exit=$?
     fi
-    if [ "$suite_exit" -eq 0 ] && [ "$diag_exit" -eq 0 ] && [ "$combined_exit" -eq 0 ]; then
+    if [ "$suite_exit" -eq 0 ] && [ "$diag_exit" -eq 0 ] && [ "$isolated_exit" -eq 0 ] && [ "$combined_exit" -eq 0 ]; then
         exit_code=0
     else
         exit_code=1
@@ -1275,7 +1446,7 @@ run_leak() {
     output=$(cat "$output_file")
     record_gate_log "leak" "$output_file"
     maybe_print_failure_excerpt "leak" "$output_file" "$exit_code"
-    rm -f "$output_file" "$diag_output_file"
+    rm -f "$output_file" "$diag_output_file" "$isolated_output_file"
     leak_seconds=$(elapsed_since "$start_seconds")
     echo ""
     parse_blorp_output "$output" "leak"
@@ -1495,17 +1666,22 @@ run_gate_to_file() {
             run_runtime_gate_commands "$outfile" false
             ;;
         leak)
-            env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_roots[@]}" >> "$outfile" 2>&1
+            env BLORP_GATE_RESULT=leak_suite bin/blorp test $blorp_test_artifact_flags --leak-check --suite --timeout "$parallel_leak_timeout" "${leak_suite_test_roots[@]}" >> "$outfile" 2>&1
             leak_suite_exit=$?
             leak_suite_output=$(cat "$outfile")
+            leak_isolated_outfile="$gate_tmpdir/${gate}_isolated_output"
+            run_leak_isolated_dispatch "$parallel_leak_timeout" > "$leak_isolated_outfile" 2>&1
+            leak_isolated_exit=$?
+            cat "$leak_isolated_outfile" >> "$outfile"
             leak_diag_outfile="$gate_tmpdir/${gate}_diag_output"
             blorp/test/runtime/test_leak_report.sh > "$leak_diag_outfile" 2>&1
             leak_diag_exit=$?
             leak_diag_output=$(cat "$leak_diag_outfile")
             cat "$leak_diag_outfile" >> "$outfile"
-            emit_combined_leak_result "$leak_suite_output" "$leak_diag_output" "$leak_suite_exit" "$leak_diag_exit" >> "$outfile"
+            emit_combined_leak_result "$leak_suite_output" "$leak_diag_output" "$leak_suite_exit" "$leak_diag_exit" \
+                "$leak_isolated_passed" "$leak_isolated_failed" "$leak_isolated_tests" "$leak_isolated_failures" >> "$outfile"
             leak_combined_exit=$?
-            if [ "$leak_suite_exit" -ne 0 ] || [ "$leak_diag_exit" -ne 0 ] || [ "$leak_combined_exit" -ne 0 ]; then
+            if [ "$leak_suite_exit" -ne 0 ] || [ "$leak_isolated_exit" -ne 0 ] || [ "$leak_diag_exit" -ne 0 ] || [ "$leak_combined_exit" -ne 0 ]; then
                 false
             else
                 true
