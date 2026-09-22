@@ -924,3 +924,56 @@ commit (instrumentation only, confirmed by the on/off check above).
 
 One commit: the attribution instrumentation and this results section
 together. No behavior-changing cut follows, per the go/no-go result above.
+
+## Errata (2026-09-22, fifth pass): the (a)/(b) hooks were not free, removed
+
+The "On/off honesty check" above compared the metric's *reported totals*
+between `BLORP_PERCEUS_ENGINE_METRICS` on and off and found them identical.
+That check was insufficient: a bisect across this issue's commits (base
+`424d61c8`, this commit `7d269320`) found `pass_perceus_complete` up
+1,738,825 allocations (+3.7% of the pass) from this commit alone **with
+the metric off**, i.e. `BLORP_PERCEUS_ENGINE_METRICS` unset entirely. The
+on/off check only proves the two *runs* agree with each other; it cannot
+show that either run agrees with the pre-instrumentation baseline, which
+is the number that actually matters for a "free when unset" claim.
+
+The cause was not the hook calls themselves -- `blorp_perceus_engine_summary_record_construct_c`/
+`_frame_push_c` return immediately when the metric is unset, so calling
+them is not what allocated. The cause was *inserting the calls at all* in
+source: at every one of the (a)/(b) sites, the call sat immediately before
+a tail-position `OwnershipUseSummary` record literal or
+`PerceusOwnershipSummaryFrameStack` union construction that reuses an
+existing, uniquely-owned local's storage in place (`first`/`second` in
+`seq_ownership_uses` and friends, `frames` in the frame-stack push sites).
+That reuse decision is made statically, while compiling `uses.brp` itself,
+by shape -- it does not know or care what a runtime flag will evaluate to
+later. Inserting any statement, including a metric-gated `if
+env.engine_metrics_enabled: perceus_engine_summary_record_construct()`, in
+front of the construction broke the shape the reuse optimizer matches on,
+so the construction fell back to a fresh allocation on **every** call,
+metric on or off. Confirmed by direct measurement on the same frozen
+input (`0c2e104331a2`, `-O2`): pristine `pass_perceus_complete` (before
+this commit's (a)/(b) hooks existed) 48,962,950; with the hooks present
+but metric-gated at each call site, still 48,962,950 (no improvement);
+with the (a)/(b) hooks removed entirely and the bare constructions
+restored verbatim, 47,245,327 -- matching the pre-instrumentation figure
+within drift from unrelated commits since. The (c)/(e)/(f)/(g) categories'
+`summary:*`/`helper:*` wrapper functions do not have this problem: they
+wrap whole function *calls* (enter/call/exit around a call in the `else`
+branch, a plain tail call to `_impl` in the `if` branch), never insert a
+statement in front of an existing reused construction, and this file's
+own "On/off honesty check" plus a direct pristine-vs-instrumented
+allocation comparison confirm they cost nothing on the release path.
+
+**Fix**: removed the (a)/(b) hooks (`perceus_engine_summary_record_construct`/
+`_frame_push`, their foreign declarations, and their call sites in
+`ownership_uses_from_legacy_count`, `seq_ownership_uses`,
+`ownership_uses_with_returns_alias`, `sum_ownership_uses`,
+`branch_ownership_uses_pair`, `branch_ownership_uses`, the
+`PerceusOwnershipSummaryDupBodyFrame` unwind arm, and all nine frame-stack
+push sites) along with the matching C-side counters and the
+`BLORP_PERCEUS_ENGINE_SUMMARY_SHAPES` report line in `runtime.c`/
+`runtime_decl.c`. The (a)/(b) attribution numbers in the table above stand
+as a one-time historical measurement; the mechanism used to take them is
+gone. The (c)/(e)/(f)/(g) wrapper-call instrumentation is unaffected and
+remains free on the release path.
