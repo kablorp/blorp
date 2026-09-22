@@ -424,11 +424,17 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_insert_drops_tracks_reconstruction_without_a_second_result_wrapper(self) -> None:
         perceus_source = (
-            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+            ROOT
+            / "blorp"
+            / "src"
+            / "compiler"
+            / "stage_09_core"
+            / "perceus"
+            / "results_and_loops.brp"
         ).read_text(encoding="utf-8")
 
         inserted_expr_record = perceus_source.split(
-            "private record PerceusInsertedExpr {", 1
+            "record PerceusInsertedExpr {", 1
         )[1].split("}", 1)[0]
 
         self.assertIn("reuses_source: Bool", inserted_expr_record)
@@ -440,11 +446,17 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_managed_let_source_reuse_has_an_explicit_identity_proof(self) -> None:
         perceus_source = (
-            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+            ROOT
+            / "blorp"
+            / "src"
+            / "compiler"
+            / "stage_09_core"
+            / "perceus"
+            / "results_and_loops.brp"
         ).read_text(encoding="utf-8")
 
         managed_let_plan = perceus_source.split(
-            "private record PerceusManagedLetPlan {", 1
+            "record PerceusManagedLetPlan {", 1
         )[1].split("}", 1)[0]
 
         self.assertIn("source: CoreExpr", managed_let_plan)
@@ -465,7 +477,13 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_call_source_reuse_has_an_explicit_normalization_proof(self) -> None:
         perceus_source = (
-            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+            ROOT
+            / "blorp"
+            / "src"
+            / "compiler"
+            / "stage_09_core"
+            / "perceus"
+            / "results_and_loops.brp"
         ).read_text(encoding="utf-8")
 
         self.assertIn("call_ownership_normalization_reuses_source", perceus_source)
@@ -483,7 +501,13 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_aggregate_source_reuse_has_typed_change_results(self) -> None:
         perceus_source = (
-            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+            ROOT
+            / "blorp"
+            / "src"
+            / "compiler"
+            / "stage_09_core"
+            / "perceus"
+            / "results_and_loops.brp"
         ).read_text(encoding="utf-8")
 
         for result_type in (
@@ -493,7 +517,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             "PerceusAggregateBoxedValuesRewrite",
             "PerceusAggregateDictEntriesRewrite",
         ):
-            self.assertIn(f"private union {result_type}:", perceus_source)
+            self.assertIn(f"union {result_type}:", perceus_source)
 
         self.assertIn("insert_drops_change_aware_aggregate", perceus_source)
         self.assertIn("perceus_work_insert_aggregate_visits", perceus_source)
@@ -508,10 +532,16 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
 
     def test_fixed_ownership_source_reuse_has_typed_change_results(self) -> None:
         perceus_source = (
-            ROOT / "blorp" / "src" / "compiler" / "stage_09_core" / "perceus.brp"
+            ROOT
+            / "blorp"
+            / "src"
+            / "compiler"
+            / "stage_09_core"
+            / "perceus"
+            / "results_and_loops.brp"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("private union PerceusOwnershipNormalization", perceus_source)
+        self.assertIn("union PerceusOwnershipNormalization", perceus_source)
         self.assertIn("UnchangedPerceusOwnershipNormalization", perceus_source)
         self.assertIn(
             "ChangedPerceusOwnershipNormalization(CoreExpr)",

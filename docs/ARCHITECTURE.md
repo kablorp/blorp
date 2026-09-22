@@ -324,21 +324,34 @@ markers every other module calls into; no Perceus dependencies of its own),
 `perceus/env.brp` (`PerceusEnv`, `build_env`, the callable/user-call-contract
 tables, and the managed-type/contract queries such as `is_managed_type` and
 `contract_for_call`), `perceus/uses.brp` (`OwnershipUseSummary` and the
-summarize_*/count_uses family every later phase queries), and
+summarize_*/count_uses family every later phase queries),
 `perceus/contracts.brp` (the reverse-parameter-flow graph and its
 build/solve/annotate path: `build_ownership_contract_graph`,
 `solve_user_call_contracts`, `infer_user_call_contracts`,
-`annotate_user_call_contracts`). `perceus.brp` itself keeps the per-function
-rewrite pipeline (`rewrite_decl`, `rewrite_function`, `rewrite_global`), the
-top-level entry point `insert_drops_program`, and the phases not yet split into
-their own module (balance, mutable-assignment, repeated-context protection,
-borrowed-owner normalization, result-alias normalization, borrowed-loop
-marking, and the drop-insertion engine). A few names are still mutually
-imported between `perceus.brp` and a `perceus/` module during this migration
-(e.g. `assignment_rhs_returns_alias`) because they are shared by both an
-already-split phase and a phase that has not moved yet; Blorp's module
-resolution allows this since imports name symbols rather than establishing a
-compilation order.
+`annotate_user_call_contracts`), `perceus/balance.brp` (branch and
+compiled-match ownership balancing), `perceus/mutable.brp` (mutable-local
+reassignment rewriting), `perceus/protect.brp` (repeated-context protection),
+`perceus/borrowed.brp` (borrowed-owner catalog normalization for calls,
+aggregates, matches, lambdas, and referenced globals),
+`perceus/short_circuit.brp` (consumed-parameter balancing and `and`/`or`
+short-circuit protection), and `perceus/results_and_loops.brp` (owned-result
+alias normalization, borrowed-loop-iterable marking, and the drop-insertion
+engine itself). The last of these is one module rather than the three
+originally planned (results, loops, drops) because the drop-insertion engine's
+per-node dispatch helpers are mutually recursive with its own entry point
+through several shared result types (`PerceusInsertedExpr`,
+`PerceusOwnershipNormalization`, the `PerceusAggregate*Rewrite` unions,
+`PerceusInsertBindingFrameStack`); Blorp does not unify a type across a
+caller/callee pair that both cross a file boundary and call back into each
+other, so no split of that cluster compiles. `perceus.brp` itself is now just
+the top-level per-declaration pipeline: `rewrite_decl`, `rewrite_function`,
+`rewrite_global`, and the entry point `insert_drops_program`. A few names are
+still mutually imported between sibling `perceus/` modules (e.g.
+`assignment_rhs_returns_alias`, imported back from `perceus/uses.brp` and
+`perceus/contracts.brp` into `perceus/mutable.brp`) because they are shared
+across phase boundaries that do not reduce to a strict dependency order;
+Blorp's module resolution allows this since imports name symbols rather than
+establishing a compilation order.
 
 ### Early Core Responsibilities
 

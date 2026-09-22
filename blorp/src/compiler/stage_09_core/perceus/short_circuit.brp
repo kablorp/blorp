@@ -1,0 +1,707 @@
+-- Consumed-parameter balancing and logical-operand short-circuit protection:
+-- balance_consumed_param_bodies decides whether a function's consumed
+-- parameters can share the function's implicit final drop instead of a
+-- per-parameter drop (simple_consumed_parameter_catalog/prove_simple_
+-- consumed_parameter_balance walk the whole body once to prove it safe);
+-- balance_short_circuit_operands protects a short-circuited `and`/`or`
+-- operand's reads so a value the left operand consumed cannot be read again
+-- if the right operand is skipped.
+--
+-- rewrite_function calls both balance_consumed_param_bodies and
+-- balance_short_circuit_operands directly as part of its own per-function
+-- pipeline (see perceus.brp).
+import:
+	../ir:
+		CoreExpr(
+			AccessorLiteralMatchExpr,
+			AssignExpr,
+			BinaryExpr,
+			BorrowLetExpr,
+			BoxExpr,
+			BreakExpr,
+			CallExpr,
+			CastExpr,
+			ClosureCreateExpr,
+			ConcurrentExpr,
+			ConcurrentlyLoopExpr,
+			ConstructorMatchExpr,
+			DebugBlockExpr,
+			DetachExpr,
+			DictConstructExpr,
+			DropExpr,
+			DupExpr,
+			FieldExpr,
+			ForChannelExpr,
+			ForDictExpr,
+			ForListExpr,
+			ForRangeExpr,
+			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
+			ForTensorExpr,
+			IfExpr,
+			LambdaExpr,
+			LetExpr,
+			ListConstructExpr,
+			ListAllocExpr,
+			ListGetExpr,
+			ListHandoffExpr,
+			ListHandoffSetOwnedExpr,
+			ListHandoffSetSourceSlotExpr,
+			ListRetainExpr,
+			ListSetExpr,
+			ListSwapExpr,
+			LiteralExpr,
+			LogicalExpr,
+			PreClosureConcurrentExpr,
+			PreClosureConcurrentlyLoopExpr,
+			PreClosureDetachExpr,
+			RecordConstructExpr,
+			RecordExpr,
+			RecordCowUpdateExpr,
+			RecordReuseExpr,
+			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
+			ResourceScopeExpr,
+			SelectExpr,
+			SeqExpr,
+			StaticStringLiteralExpr,
+			StringByteCopyExpr,
+			StringByteReadExpr,
+			StringByteWriteExpr,
+			StringSetLenExpr,
+			TailrecListSpreadLoopExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecLoopExpr,
+			TailrecRecurExpr,
+			TensorBoxedLiteralExpr,
+			TensorRawFillExpr,
+			TensorRawReadExpr,
+			TensorRawViewLetExpr,
+			TensorRawWriteExpr,
+			TupleConstructExpr,
+			TupleExpr,
+			TupleFieldExpr,
+			UnaryExpr,
+			UnboxExpr,
+			UnionConstructExpr,
+			VarExpr,
+			VectorExpr,
+			VoidExpr,
+			WhileExpr,
+			LiteralMatchExpr,
+			LengthMatchExpr,
+		),
+		CoreFunction,
+		CoreLogicalOp,
+		CoreParam,
+		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
+		CoreType,
+		CoreVar,
+		core_expr_type,
+	../ownership:
+		arg_consumes_caller,
+	env:
+		PerceusBalanceStrategy(BranchAwareOwnershipBalance),
+		PerceusEnv,
+		contract_for_call,
+		is_managed_type,
+	uses:
+		OwnershipUseSummary,
+		max_int,
+		summarize_linear_ownership_uses,
+	balance:
+		balance_branch_body,
+		prepend_dups,
+	contracts:
+		int_list_contains,
+	protect:
+		protect_repeated_consumes,
+	../traverse as CoreTraverse
+
+
+private record SimpleConsumedParameterCatalog {
+	all_parameter_names: Dict[String, Bool],
+	consumed_indices_by_name: Dict[String, Int],
+	consumed_parameter_count: Int
+}
+
+
+private enum SimpleConsumedParameterBalance:
+	UnsupportedSimpleConsumedParameterBalance
+	UnchangedSimpleConsumedParameterBalance
+
+
+private union SimpleConsumedParameterScanStack:
+	SimpleConsumedParameterScanComplete
+	SimpleConsumedParameterScanMore(CoreExpr, SimpleConsumedParameterScanStack)
+
+
+private pure func balance_consumed_param_body(
+	env: PerceusEnv,
+	param: CoreParam,
+	body: CoreExpr,
+) -> CoreExpr:
+	variable: CoreVar = param.name
+	value_type: CoreType = param.typ
+	protected: CoreExpr = protect_repeated_consumes(env, variable, value_type, body, False)
+	balance_env: PerceusEnv = { env | balance_strategy = BranchAwareOwnershipBalance }
+	uses: OwnershipUseSummary = summarize_linear_ownership_uses(
+		balance_env,
+		variable.name,
+		protected,
+	)
+	owned_refs: Int = max_int(1, uses.required_refs)
+	balanced: CoreExpr = balance_branch_body(
+		balance_env,
+		variable,
+		value_type,
+		owned_refs,
+		uses,
+		protected,
+	)
+
+	prepend_dups(owned_refs - 1, variable, value_type, balanced)
+
+
+-- The catalog-and-proof setup only repays its fixed cost for broad generated
+-- signatures. Smaller functions retain the general balancing path.
+private SIMPLE_CONSUMED_PARAMETER_BALANCE_MINIMUM: Int = 16
+
+
+private pure func simple_consumed_parameter_catalog(
+	env: PerceusEnv,
+	params: List[CoreParam],
+	return_type: CoreType,
+	consumed_params: List[Int],
+) -> Option[SimpleConsumedParameterCatalog]:
+	if (
+		is_managed_type(env, return_type)
+		or consumed_params.length() < SIMPLE_CONSUMED_PARAMETER_BALANCE_MINIMUM
+	):
+		None
+	else:
+		var all_parameter_names: Dict[String, Bool] = {}
+		var consumed_indices_by_name: Dict[String, Int] = {}
+		var consumed_parameter_count: Int = 0
+		var eligible: Bool = True
+		var index: Int = 0
+
+		for param in params:
+			if all_parameter_names.contains(param.name.name):
+				eligible = False
+			else:
+				all_parameter_names = all_parameter_names.set(param.name.name, True)
+
+			if int_list_contains(consumed_params, index):
+				if is_managed_type(env, param.typ) and param.name.uniq == 0:
+					match param.name.def_id:
+						None:
+							consumed_indices_by_name = consumed_indices_by_name.set(
+								param.name.name,
+								index,
+							)
+							consumed_parameter_count += 1
+						Some(def_id):
+							eligible = False
+				else:
+					eligible = False
+			else:
+				void
+
+			index += 1
+
+		if eligible and consumed_parameter_count == consumed_params.length():
+			Some({
+				all_parameter_names = all_parameter_names,
+				consumed_indices_by_name = consumed_indices_by_name,
+				consumed_parameter_count = consumed_parameter_count,
+			})
+		else:
+			None
+
+
+-- This proof recognizes only a linear post-insertion body where balancing
+-- every consumed parameter is an identity operation. A call is supported only
+-- when its exact ownership contract directly consumes each referenced
+-- candidate once. Borrowed arguments, branches, aliases, repetition,
+-- shadowing, and ownership nodes for parameters all retain the established
+-- parameter-by-parameter logic.
+private pure func prove_simple_consumed_parameter_balance(
+	env: PerceusEnv,
+	catalog: SimpleConsumedParameterCatalog,
+	body: CoreExpr,
+) -> SimpleConsumedParameterBalance:
+	var pending: SimpleConsumedParameterScanStack = SimpleConsumedParameterScanMore(
+		body,
+		SimpleConsumedParameterScanComplete,
+	)
+	var observed_indices: Dict[Int, Bool] = {}
+	var observed_count: Int = 0
+	var supported: Bool = True
+	var complete: Bool = False
+
+	while not complete:
+		match pending:
+			SimpleConsumedParameterScanComplete:
+				complete = True
+			SimpleConsumedParameterScanMore(expr, remaining):
+				pending = remaining
+
+				if supported:
+					match expr:
+						LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
+							void
+						VarExpr(variable, _, _):
+							match catalog.consumed_indices_by_name.get(variable.name):
+								Some(index):
+									if (
+										variable.uniq == 0
+										and variable.def_id == None
+										and not observed_indices.contains(index)
+									):
+										observed_indices = observed_indices.set(index, True)
+										observed_count += 1
+									else:
+										supported = False
+								None:
+									supported = False
+						SeqExpr(first, second):
+							pending = SimpleConsumedParameterScanMore(
+								first,
+								SimpleConsumedParameterScanMore(second, pending),
+							)
+						LetExpr(variable, is_mutable, bind_type, rhs, let_body):
+							rhs_is_literal: Bool = match rhs:
+								LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _):
+									True
+								_:
+									False
+
+							if (
+								not is_mutable
+								and rhs_is_literal
+								and not catalog.all_parameter_names.contains(variable.name)
+							):
+								pending = SimpleConsumedParameterScanMore(let_body, pending)
+							else:
+								supported = False
+						CallExpr(kind, callee, args, typ, loc):
+							callee_is_unrelated_function: Bool = match callee:
+								VarExpr(variable, _, _):
+									not catalog.all_parameter_names.contains(variable.name)
+								_:
+									False
+
+							if not callee_is_unrelated_function:
+								supported = False
+							else:
+								match contract_for_call(env, kind, args.length(), typ):
+									Some(contract):
+										var arg_index: Int = 0
+
+										while supported and arg_index < args.length():
+											match args.get(arg_index):
+												Some(argument):
+													match contract.args.get(arg_index):
+														Some(mode):
+															match argument:
+																VarExpr(variable, _, _):
+																	variable_name: String = variable.name
+
+																	match catalog.consumed_indices_by_name.get(
+																		variable_name,
+																	):
+																		Some(index):
+																			if (
+																				arg_consumes_caller(
+																					mode,
+																				)
+																				and variable.uniq == 0
+																				and variable.def_id == None
+																				and not observed_indices.contains(
+																					index,
+																				)
+																			):
+																				observed_indices = observed_indices.set(
+																					index,
+																					True,
+																				)
+																				observed_count += 1
+																			else:
+																				supported = False
+																		None:
+																			supported = False
+																LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _):
+																	void
+																_:
+																	supported = False
+														None:
+															supported = False
+												None:
+													supported = False
+
+											arg_index += 1
+									None:
+										supported = False
+						CastExpr(inner, _, _):
+							if (
+								not is_managed_type(env, core_expr_type(inner))
+								and not is_managed_type(env, core_expr_type(expr))
+							):
+								pending = SimpleConsumedParameterScanMore(inner, pending)
+							else:
+								supported = False
+						DropExpr(variable, value_type, release_policy, drop_body, typ, loc):
+							if catalog.all_parameter_names.contains(variable.name):
+								supported = False
+							else:
+								pending = SimpleConsumedParameterScanMore(drop_body, pending)
+						_:
+							supported = False
+				else:
+					void
+
+	if supported and observed_count == catalog.consumed_parameter_count:
+		UnchangedSimpleConsumedParameterBalance
+	else:
+		UnsupportedSimpleConsumedParameterBalance
+
+
+-- Kept callable so regression tests can assert the production fast-path
+-- decision without relying on wall-clock timing.
+pure func consumed_parameter_balancing_is_identity(
+	env: PerceusEnv,
+	func_info: CoreFunction,
+	consumed_params: List[Int],
+	body: CoreExpr,
+) -> Bool:
+	match simple_consumed_parameter_catalog(
+		env,
+		func_info.params,
+		func_info.return_type,
+		consumed_params,
+	):
+		Some(catalog):
+			match prove_simple_consumed_parameter_balance(env, catalog, body):
+				UnchangedSimpleConsumedParameterBalance:
+					True
+				UnsupportedSimpleConsumedParameterBalance:
+					False
+		None:
+			False
+
+
+pure func balance_consumed_param_bodies(
+	env: PerceusEnv,
+	func_info: CoreFunction,
+	consumed_params: List[Int],
+	body: CoreExpr,
+) -> CoreExpr:
+	prebalanced: Bool = consumed_parameter_balancing_is_identity(
+		env,
+		func_info,
+		consumed_params,
+		body,
+	)
+
+	if prebalanced:
+		body
+	else:
+		var result: CoreExpr = body
+		var index: Int = func_info.params.length() - 1
+
+		while index >= 0:
+			match func_info.params.get(index):
+				Some(param):
+					if (
+						is_managed_type(env, param.typ)
+						and int_list_contains(consumed_params, index)
+					):
+						result = balance_consumed_param_body(env, param, result)
+					else:
+						void
+				None:
+					void
+
+			index -= 1
+
+		result
+
+
+--- A reused depth-first worklist. Growing a pending list by concatenation
+--- copies every entry already on it, which is quadratic in the node count, and
+--- the largest generated body in a self-compile holds more than two hundred
+--- thousand nodes. Overwrite the slot the pop just freed instead, exactly as
+--- the logical-tree mapper does, so one allocation serves the whole walk.
+private record ShortCircuitScanStack {
+	nodes: List[CoreExpr],
+	operand_flags: List[Bool],
+	count: Int
+}
+
+
+private pure func push_short_circuit_scan(
+	stack: ShortCircuitScanStack,
+	node: CoreExpr,
+	inside_operand: Bool,
+) -> ShortCircuitScanStack:
+	nodes: List[CoreExpr] = if stack.count < stack.nodes.length():
+		stack.nodes.set(stack.count, node)
+	else:
+		stack.nodes.append(node)
+	operand_flags: List[Bool] = if stack.count < stack.operand_flags.length():
+		stack.operand_flags.set(stack.count, inside_operand)
+	else:
+		stack.operand_flags.append(inside_operand)
+
+	{ stack |
+		nodes = nodes,
+		operand_flags = operand_flags,
+		count = stack.count + 1
+	}
+
+
+private pure func push_short_circuit_scan_children(
+	stack: ShortCircuitScanStack,
+	node: CoreExpr,
+	inside_operand: Bool,
+) -> ShortCircuitScanStack:
+	var result: ShortCircuitScanStack = stack
+
+	for child in CoreTraverse.immediate_core_expr_children(node):
+		result = push_short_circuit_scan(result, child, inside_operand)
+
+	result
+
+
+--- A logical operator only evaluates its right operand when the left operand
+--- does not already decide the result, so that operand is a branch with no
+--- expression to carry the other path. An ownership transfer inside it is
+--- therefore unbalanceable: the enclosing region would count the transfer on
+--- every path, and the short-circuited path would keep the reference alive
+--- forever. Look for the only shape that can transfer, a call under a right
+--- operand, before paying for the rewrite walk. Each pushed node carries
+--- whether it already sits under a right operand, so a nested operator
+--- inherits the answer instead of rescanning its subtree.
+private pure func has_short_circuit_operand_call(expr: CoreExpr) -> Bool:
+	var stack: ShortCircuitScanStack = push_short_circuit_scan(
+		{
+			nodes = [],
+			operand_flags = [],
+			count = 0
+		},
+		expr,
+		False,
+	)
+	var found: Bool = False
+
+	while not found and stack.count > 0:
+		index: Int = stack.count - 1
+		stack = { stack | count = index }
+
+		match (stack.nodes.get(index), stack.operand_flags.get(index)):
+			(Some(node), Some(inside_operand)):
+				match node:
+					LogicalExpr(op, left, right, typ, loc):
+						stack = push_short_circuit_scan(stack, left, inside_operand)
+						stack = push_short_circuit_scan(stack, right, True)
+					CallExpr(kind, callee, args, typ, loc):
+						if inside_operand:
+							found = True
+						else:
+							stack = push_short_circuit_scan_children(stack, node, inside_operand)
+					_:
+						stack = push_short_circuit_scan_children(stack, node, inside_operand)
+			_:
+				void
+
+	found
+
+
+--- Every name the expression reads, collected in one walk. The owner loop
+--- otherwise asks `count_uses` per owner, and owners accumulate with every
+--- enclosing immutable binding, so that walks the operand once per owner.
+private pure func short_circuit_operand_read_names(expr: CoreExpr) -> Dict[String, Bool]:
+	var stack: ShortCircuitScanStack = push_short_circuit_scan(
+		{
+			nodes = [],
+			operand_flags = [],
+			count = 0
+		},
+		expr,
+		False,
+	)
+	var names: Dict[String, Bool] = {}
+
+	while stack.count > 0:
+		index: Int = stack.count - 1
+		stack = { stack | count = index }
+
+		match stack.nodes.get(index):
+			Some(node):
+				match node:
+					VarExpr(variable, typ, loc):
+						names = names.set(variable.name, True)
+					_:
+						void
+
+				stack = push_short_circuit_scan_children(stack, node, False)
+			None:
+				void
+
+	names
+
+
+--- The owners a short-circuit operand may take a reference from: the enclosing
+--- function's managed parameters and the immutable managed bindings above the
+--- operator. Their ownership belongs to the linear region this pass balances.
+--- Match payloads, borrowed aliases, and referenced globals carry their own
+--- owner normalization and must not receive a second reference here.
+private record ShortCircuitContext {
+	env: PerceusEnv,
+	owners: List[CoreParam]
+}
+
+
+--- Give the operand its own reference for every transfer it performs, so the
+--- operand neither requires nor consumes ownership from the region around the
+--- logical operator. The skipped path then evaluates neither the dup nor the
+--- transfer, and the taken path balances itself.
+private pure func own_short_circuit_operand(
+	context: ShortCircuitContext,
+	operand: CoreExpr,
+) -> CoreExpr:
+	var result: CoreExpr = operand
+	read_names: Dict[String, Bool] = short_circuit_operand_read_names(operand)
+
+	for owner in context.owners:
+		-- A name the operand never reads cannot transfer it. The summary stays
+		-- the authority for the ones it does read.
+		if read_names.contains(owner.name.name):
+			consumed_refs: Int = summarize_linear_ownership_uses(
+				context.env,
+				owner.name.name,
+				operand,
+			).consumed_refs
+			result = prepend_dups(consumed_refs, owner.name, owner.typ, result)
+		else:
+			void
+
+	result
+
+
+private record ShortCircuitOperandFrame {
+	op: CoreLogicalOp,
+	right: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc
+}
+
+
+--- Long `and`/`or` chains nest to the left, so walk that spine with a frame
+--- list instead of one native stack frame per operator.
+private pure func normalize_logical_short_circuit(
+	context: ShortCircuitContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	var frames: List[ShortCircuitOperandFrame] = []
+	var current: CoreExpr = expr
+	var descending: Bool = True
+
+	while descending:
+		match current:
+			LogicalExpr(op, left, right, typ, loc):
+				frames = frames.append({
+					op = op,
+					right = right,
+					typ = typ,
+					loc = loc,
+				})
+				current = left
+			_:
+				descending = False
+
+	var result: CoreExpr = normalize_short_circuit_operands(context, current)
+	var index: Int = frames.length() - 1
+
+	while index >= 0:
+		match frames.get(index):
+			Some(frame):
+				result = LogicalExpr(
+					frame.op,
+					result,
+					own_short_circuit_operand(
+						context,
+						normalize_short_circuit_operands(context, frame.right),
+					),
+					frame.typ,
+					frame.loc,
+				)
+			None:
+				void
+
+		index -= 1
+
+	result
+
+
+private pure func normalize_short_circuit_operands(
+	context: ShortCircuitContext,
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		LogicalExpr(op, left, right, typ, loc):
+			normalize_logical_short_circuit(context, expr)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			-- An immutable managed binding owns its value for the rest of the
+			-- region, exactly like a consumed parameter, so a transfer out of a
+			-- short-circuit operand below it is unbalanceable in the same way.
+			-- A mutable binding can be reassigned between the dup and the
+			-- transfer, so it keeps the existing reassignment handling.
+			body_context: ShortCircuitContext = if (
+				is_mutable or not is_managed_type(context.env, typ)
+			):
+				context
+			else:
+				{ context |
+					owners = context.owners.append({
+						name = variable,
+						typ = typ,
+						loc = SyntheticSourceLoc,
+					})
+				}
+
+			LetExpr(
+				variable,
+				is_mutable,
+				typ,
+				normalize_short_circuit_operands(context, rhs),
+				normalize_short_circuit_operands(body_context, body),
+			)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				context,
+				normalize_short_circuit_operands,
+			)
+
+
+pure func balance_short_circuit_operands(
+	env: PerceusEnv,
+	params: List[CoreParam],
+	expr: CoreExpr,
+) -> CoreExpr:
+	var owners: List[CoreParam] = []
+
+	for param in params:
+		if is_managed_type(env, param.typ):
+			owners = owners.append(param)
+		else:
+			void
+
+	if has_short_circuit_operand_call(expr):
+		normalize_short_circuit_operands({ env = env, owners = owners }, expr)
+	else:
+		expr
