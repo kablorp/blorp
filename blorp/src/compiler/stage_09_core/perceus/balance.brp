@@ -192,6 +192,18 @@ foreign:
 	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
 
 
+-- Local rebinding of the BLORP_PERCEUS_ENGINE_METRICS hooks declared in
+-- perceus/results_and_loops.brp (see that file's own foreign block for the
+-- design note). There is no re-export in Blorp, so a module that wants to
+-- call these foreign functions binds its own name to the same C symbol
+-- rather than importing the name across the dependency direction (this
+-- module is imported BY results_and_loops.brp, not the other way around).
+foreign:
+	private pure func perceus_engine_metrics_enabled() -> Int = "blorp_perceus_engine_metrics_enabled_c"
+	private pure func perceus_engine_node_enter() -> Void = "blorp_perceus_engine_node_enter_c"
+	private pure func perceus_engine_node_exit(kind: String) -> Void = "blorp_perceus_engine_node_exit_c"
+
+
 record FreshenedConstructorMatchBindingBody {
 	bindings: List[CoreMatchBinding],
 	body: CoreConstructorMatchBody
@@ -666,6 +678,20 @@ private pure func literal_match_has_divergent_nested_branch_ownership(
 
 
 pure func balanced_path_has_divergent_constructor_match(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+) -> Bool:
+	if perceus_engine_metrics_enabled() == 0:
+		balanced_path_has_divergent_constructor_match_impl(env, name, expr)
+	else:
+		perceus_engine_node_enter()
+		result: Bool = balanced_path_has_divergent_constructor_match_impl(env, name, expr)
+		perceus_engine_node_exit("helper:balanced_path_has_divergent_constructor_match")
+		result
+
+
+private pure func balanced_path_has_divergent_constructor_match_impl(
 	env: PerceusEnv,
 	name: String,
 	expr: CoreExpr,
@@ -1462,6 +1488,34 @@ private pure func balance_nested_branch_body(
 
 
 pure func transform_let_if_body(
+	env: PerceusEnv,
+	variable: CoreVar,
+	value_type: CoreType,
+	cond: CoreExpr,
+	then_expr: CoreExpr,
+	else_expr: CoreExpr,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		transform_let_if_body_impl(env, variable, value_type, cond, then_expr, else_expr, typ, loc)
+	else:
+		perceus_engine_node_enter()
+		result: CoreExpr = transform_let_if_body_impl(
+			env,
+			variable,
+			value_type,
+			cond,
+			then_expr,
+			else_expr,
+			typ,
+			loc,
+		)
+		perceus_engine_node_exit("helper:transform_let_if_body")
+		result
+
+
+private pure func transform_let_if_body_impl(
 	env: PerceusEnv,
 	variable: CoreVar,
 	value_type: CoreType,
@@ -3427,6 +3481,46 @@ pure func transform_let_constructor_match_body(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Option[CoreExpr]:
+	if perceus_engine_metrics_enabled() == 0:
+		transform_let_constructor_match_body_impl(
+			env,
+			variable,
+			value_type,
+			scrutinee,
+			release_policy,
+			cases,
+			fallback,
+			typ,
+			loc,
+		)
+	else:
+		perceus_engine_node_enter()
+		result: Option[CoreExpr] = transform_let_constructor_match_body_impl(
+			env,
+			variable,
+			value_type,
+			scrutinee,
+			release_policy,
+			cases,
+			fallback,
+			typ,
+			loc,
+		)
+		perceus_engine_node_exit("helper:transform_let_constructor_match_body")
+		result
+
+
+private pure func transform_let_constructor_match_body_impl(
+	env: PerceusEnv,
+	variable: CoreVar,
+	value_type: CoreType,
+	scrutinee: CoreExpr,
+	release_policy: CoreReleasePolicy,
+	cases: List[CoreConstructorMatchCase],
+	fallback: CoreConstructorMatchFallback,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
 	freshened_cases: List[CoreConstructorMatchCase] = freshen_constructor_match_case_shadows(
 		variable,
 		cases,
@@ -3436,14 +3530,6 @@ pure func transform_let_constructor_match_body(
 		cases.length(),
 		fallback,
 	)
-	match_node: CoreExpr = ConstructorMatchExpr(
-		scrutinee,
-		release_policy,
-		freshened_cases,
-		freshened_fallback,
-		typ,
-		loc,
-	)
 	scrutinee_aliases_owner: Bool = borrow_expr_aliases_target(env, variable.name, scrutinee)
 
 	if scrutinee_aliases_owner and release_policy == NoReleasePolicy:
@@ -3451,6 +3537,21 @@ pure func transform_let_constructor_match_body(
 			constructor_match_cases_preserve_owner(env, variable.name, freshened_cases)
 			and constructor_match_fallback_preserves_owner(env, variable.name, freshened_fallback)
 		):
+			-- `match_node` is built here, on the one path that actually uses
+			-- it, rather than unconditionally at the top of this function:
+			-- every other path (this same `if`'s `else`, and the `else if`
+			-- below) returns `None` or builds an entirely different
+			-- `ConstructorMatchExpr` from `balance_constructor_match_cases`/
+			-- `balance_constructor_match_fallback`, so the eagerly-built node
+			-- was allocated and discarded unread on every one of those calls.
+			match_node: CoreExpr = ConstructorMatchExpr(
+				scrutinee,
+				release_policy,
+				freshened_cases,
+				freshened_fallback,
+				typ,
+				loc,
+			)
 			Some(drop_after_body(1, variable, value_type, match_node))
 		else:
 			None
@@ -3484,7 +3585,19 @@ pure func transform_let_constructor_match_body(
 		)
 
 		if total_needed == 0:
-			Some(prepend_drops(1, variable, value_type, match_node))
+			-- Same deferred construction as the other use of `match_node`
+			-- above: this is the only other path that reads the plain
+			-- (non-dup-balanced) match node, so it is built here rather than
+			-- unconditionally at the top of the function.
+			zero_needed_match_node: CoreExpr = ConstructorMatchExpr(
+				scrutinee,
+				release_policy,
+				freshened_cases,
+				freshened_fallback,
+				typ,
+				loc,
+			)
+			Some(prepend_drops(1, variable, value_type, zero_needed_match_node))
 		else:
 			dups_count: Int = max_int(0, total_needed - 1)
 			available_after_scrutinee: Int = 1 + dups_count - scrutinee_uses.consumed_refs
@@ -3513,6 +3626,21 @@ pure func transform_let_constructor_match_body(
 
 
 pure func balance_let_body_legacy(
+	env: PerceusEnv,
+	variable: CoreVar,
+	bind_type: CoreType,
+	body: CoreExpr,
+) -> CoreExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		balance_let_body_legacy_impl(env, variable, bind_type, body)
+	else:
+		perceus_engine_node_enter()
+		result: CoreExpr = balance_let_body_legacy_impl(env, variable, bind_type, body)
+		perceus_engine_node_exit("helper:balance_let_body_legacy")
+		result
+
+
+private pure func balance_let_body_legacy_impl(
 	env: PerceusEnv,
 	variable: CoreVar,
 	bind_type: CoreType,

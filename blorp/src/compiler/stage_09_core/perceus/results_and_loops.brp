@@ -284,6 +284,8 @@ foreign:
 	pure func perceus_engine_managed_let_plan_construct() -> Void = "blorp_perceus_engine_managed_let_plan_construct_c"
 	pure func perceus_engine_frame_construct() -> Void = "blorp_perceus_engine_frame_construct_c"
 	pure func perceus_engine_resolved_value_update() -> Void = "blorp_perceus_engine_resolved_value_update_c"
+	pure func perceus_engine_let_binding_visit() -> Void = "blorp_perceus_engine_let_binding_visit_c"
+	pure func perceus_engine_let_binding_managed() -> Void = "blorp_perceus_engine_let_binding_managed_c"
 	pure func perceus_engine_metrics_report() -> Void = "blorp_perceus_engine_metrics_report_c"
 
 
@@ -952,6 +954,20 @@ private pure func binding_alias_rhs_is_owned_temporary(
 	bind_type: CoreType,
 	rhs: CoreExpr,
 ) -> Bool:
+	if perceus_engine_metrics_enabled() == 0:
+		binding_alias_rhs_is_owned_temporary_impl(env, bind_type, rhs)
+	else:
+		perceus_engine_node_enter()
+		result: Bool = binding_alias_rhs_is_owned_temporary_impl(env, bind_type, rhs)
+		perceus_engine_node_exit("helper:binding_alias_rhs_is_owned_temporary")
+		result
+
+
+private pure func binding_alias_rhs_is_owned_temporary_impl(
+	env: PerceusEnv,
+	bind_type: CoreType,
+	rhs: CoreExpr,
+) -> Bool:
 	if not is_managed_type(env, bind_type):
 		False
 	else:
@@ -967,6 +983,26 @@ private pure func binding_alias_rhs_is_owned_temporary(
 
 
 private pure func normalize_binding_alias_rhs_with_owned_status(
+	env: PerceusEnv,
+	bind_type: CoreType,
+	rhs: CoreExpr,
+	rhs_is_owned_temporary: Bool,
+) -> CoreExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		normalize_binding_alias_rhs_with_owned_status_impl(env, bind_type, rhs, rhs_is_owned_temporary)
+	else:
+		perceus_engine_node_enter()
+		result: CoreExpr = normalize_binding_alias_rhs_with_owned_status_impl(
+			env,
+			bind_type,
+			rhs,
+			rhs_is_owned_temporary,
+		)
+		perceus_engine_node_exit("helper:normalize_binding_alias_rhs_with_owned_status")
+		result
+
+
+private pure func normalize_binding_alias_rhs_with_owned_status_impl(
 	env: PerceusEnv,
 	bind_type: CoreType,
 	rhs: CoreExpr,
@@ -1025,6 +1061,26 @@ private pure func normalize_binding_alias_rhs(
 -- make a managed Let claim source reuse. Cases outside the subset remain
 -- conservative even when their rebuilt output happens to serialize equally.
 private pure func normalize_binding_alias_rhs_reuses_source(
+	env: PerceusEnv,
+	bind_type: CoreType,
+	rhs: CoreExpr,
+	rhs_is_owned_temporary: Bool,
+) -> Bool:
+	if perceus_engine_metrics_enabled() == 0:
+		normalize_binding_alias_rhs_reuses_source_impl(env, bind_type, rhs, rhs_is_owned_temporary)
+	else:
+		perceus_engine_node_enter()
+		result: Bool = normalize_binding_alias_rhs_reuses_source_impl(
+			env,
+			bind_type,
+			rhs,
+			rhs_is_owned_temporary,
+		)
+		perceus_engine_node_exit("helper:normalize_binding_alias_rhs_reuses_source")
+		result
+
+
+private pure func normalize_binding_alias_rhs_reuses_source_impl(
 	env: PerceusEnv,
 	bind_type: CoreType,
 	rhs: CoreExpr,
@@ -1743,6 +1799,20 @@ private pure func retain_mutable_match_branch_results(
 	param: CoreParam,
 	expr: CoreExpr,
 ) -> CoreExpr:
+	if perceus_engine_metrics_enabled() == 0:
+		retain_mutable_match_branch_results_impl(env, param, expr)
+	else:
+		perceus_engine_node_enter()
+		result: CoreExpr = retain_mutable_match_branch_results_impl(env, param, expr)
+		perceus_engine_node_exit("helper:retain_mutable_match_branch_results")
+		result
+
+
+private pure func retain_mutable_match_branch_results_impl(
+	env: PerceusEnv,
+	param: CoreParam,
+	expr: CoreExpr,
+) -> CoreExpr:
 	match expr:
 		SeqExpr(first, second):
 			SeqExpr(
@@ -1940,35 +2010,87 @@ private pure func rebuild_managed_let_impl(
 		rewritten_body
 
 	if not managed_binding:
-		LetExpr(plan.variable, plan.is_mutable, plan.bind_type, rewritten_rhs, rewritten_body)
+		if perceus_engine_metrics_enabled() == 0:
+			LetExpr(plan.variable, plan.is_mutable, plan.bind_type, rewritten_rhs, rewritten_body)
+		else:
+			perceus_engine_node_enter()
+			unmanaged_result: CoreExpr = LetExpr(
+				plan.variable,
+				plan.is_mutable,
+				plan.bind_type,
+				rewritten_rhs,
+				rewritten_body,
+			)
+			perceus_engine_node_exit("let-reconstruct")
+			unmanaged_result
 	else if plan.is_mutable:
-		mutable_body: CoreExpr = rewrite_mutable_let_body(
-			env,
-			plan.variable,
-			plan.bind_type,
-			ownership_body,
-		)
-		LetExpr(
-			plan.variable,
-			True,
-			plan.bind_type,
-			rewritten_rhs,
-			retain_alias_source_in_body(
+		-- `rewrite_mutable_let_body` lives in perceus/mutable.brp, which another
+		-- worker is editing concurrently; this brackets the call site here
+		-- instead of wrapping the callee, attributing the same allocations to
+		-- this step without touching that file.
+		mutable_body: CoreExpr = if perceus_engine_metrics_enabled() == 0:
+			rewrite_mutable_let_body(env, plan.variable, plan.bind_type, ownership_body)
+		else:
+			perceus_engine_node_enter()
+			mutable_body_result: CoreExpr = rewrite_mutable_let_body(
 				env,
 				plan.variable,
 				plan.bind_type,
-				plan.source_rhs,
-				mutable_body,
-			),
-		)
+				ownership_body,
+			)
+			perceus_engine_node_exit("helper:rewrite_mutable_let_body")
+			mutable_body_result
+
+		if perceus_engine_metrics_enabled() == 0:
+			LetExpr(
+				plan.variable,
+				True,
+				plan.bind_type,
+				rewritten_rhs,
+				retain_alias_source_in_body(
+					env,
+					plan.variable,
+					plan.bind_type,
+					plan.source_rhs,
+					mutable_body,
+				),
+			)
+		else:
+			perceus_engine_node_enter()
+			mutable_let_result: CoreExpr = LetExpr(
+				plan.variable,
+				True,
+				plan.bind_type,
+				rewritten_rhs,
+				retain_alias_source_in_body(
+					env,
+					plan.variable,
+					plan.bind_type,
+					plan.source_rhs,
+					mutable_body,
+				),
+			)
+			perceus_engine_node_exit("let-reconstruct")
+			mutable_let_result
 	else:
-		protected_body: CoreExpr = protect_repeated_consumes(
-			env,
-			plan.variable,
-			plan.bind_type,
-			ownership_body,
-			False,
-		)
+		-- `protect_repeated_consumes` (protect.brp) has several other callers
+		-- (borrowed.brp, mutable.brp, short_circuit.brp), so its own wrapped
+		-- self/inclusive numbers aggregate across the whole compile, not just
+		-- this call site. Bracket the call here too so the managed-let-scoped
+		-- slice of its cost is isolable from the rest.
+		protected_body: CoreExpr = if perceus_engine_metrics_enabled() == 0:
+			protect_repeated_consumes(env, plan.variable, plan.bind_type, ownership_body, False)
+		else:
+			perceus_engine_node_enter()
+			protected_body_result: CoreExpr = protect_repeated_consumes(
+				env,
+				plan.variable,
+				plan.bind_type,
+				ownership_body,
+				False,
+			)
+			perceus_engine_node_exit("let-protect-repeated-consumes-site")
+			protected_body_result
 
 		balanced_body: CoreExpr = match protected_body:
 			IfExpr(cond, then_expr, else_expr, typ, loc):
@@ -2032,7 +2154,19 @@ private pure func rebuild_managed_let_impl(
 				balanced_body,
 			)
 
-		LetExpr(plan.variable, False, plan.bind_type, rewritten_rhs, alias_retained_body)
+		if perceus_engine_metrics_enabled() == 0:
+			LetExpr(plan.variable, False, plan.bind_type, rewritten_rhs, alias_retained_body)
+		else:
+			perceus_engine_node_enter()
+			immutable_let_result: CoreExpr = LetExpr(
+				plan.variable,
+				False,
+				plan.bind_type,
+				rewritten_rhs,
+				alias_retained_body,
+			)
+			perceus_engine_node_exit("let-reconstruct")
+			immutable_let_result
 
 
 private pure func rewrite_constructor_literal_match_cases(
@@ -3171,9 +3305,13 @@ private pure func insert_drops_expr_inner_result_impl(
 
 			match current:
 				LetExpr(variable, is_mutable, bind_type, rhs, body):
+					perceus_engine_let_binding_visit()
+
 					if is_managed_type(env, bind_type):
 						debug:
 							perceus_work_insert_managed_let_visits()
+
+						perceus_engine_let_binding_managed()
 
 						plan: PerceusManagedLetPlan = plan_managed_let(
 							env,

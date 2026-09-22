@@ -2577,6 +2577,8 @@ static long __blorp_perceus_inserted_expr_constructions = 0;
 static long __blorp_perceus_managed_let_plan_constructions = 0;
 static long __blorp_perceus_frame_constructions = 0;
 static long __blorp_perceus_resolved_value_index_updates = 0;
+static long __blorp_perceus_let_bindings_total = 0;
+static long __blorp_perceus_let_bindings_managed = 0;
 
 long blorp_perceus_engine_metrics_enabled_c(void) {
     if (__blorp_perceus_engine_metrics_enabled_flag < 0) {
@@ -2689,6 +2691,16 @@ void blorp_perceus_engine_resolved_value_update_c(void) {
     __blorp_perceus_resolved_value_index_updates++;
 }
 
+void blorp_perceus_engine_let_binding_visit_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_let_bindings_total++;
+}
+
+void blorp_perceus_engine_let_binding_managed_c(void) {
+    if (!blorp_perceus_engine_metrics_enabled_c()) return;
+    __blorp_perceus_let_bindings_managed++;
+}
+
 static int __blorp_perceus_engine_entry_compare(const void* left, const void* right) {
     const __blorp_PerceusEngineEntry* first = (const __blorp_PerceusEngineEntry*)left;
     const __blorp_PerceusEngineEntry* second = (const __blorp_PerceusEngineEntry*)right;
@@ -2722,6 +2734,12 @@ void blorp_perceus_engine_metrics_report_c(void) {
         stderr,
         "BLORP_PERCEUS_ENGINE_CONSTRUCT schema=1 kind=PerceusResolvedValueIndex count=%ld\n",
         __blorp_perceus_resolved_value_index_updates
+    );
+    fprintf(
+        stderr,
+        "BLORP_PERCEUS_ENGINE_LET_BINDINGS schema=1 total=%ld managed=%ld\n",
+        __blorp_perceus_let_bindings_total,
+        __blorp_perceus_let_bindings_managed
     );
     if (__blorp_perceus_engine_table_used == 0) return;
     // Not an allocation the oracle observes: BLORP_PERCEUS_ENGINE_METRICS

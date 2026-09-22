@@ -278,3 +278,281 @@ benchmarks/self_compile_measure lock -- scripts/test leak
   per-declaration setup) -- out of scope for this issue, which targets the
   drop-insertion engine specifically; the prior profile already measured
   `infer_user_call_contracts` directly at 5.36% of the pass.
+
+## Follow-up: drilling into `rebuild_managed_let` (2026-09-22, second pass)
+
+`rebuild_managed_let` alone was 25.66% of the pass above. This section
+drills one level into it (and `plan_managed_let`), attributing self
+allocations to each step it performs, using the same
+`BLORP_PERCEUS_ENGINE_METRICS` mechanism: `perceus_engine_node_enter`/
+`perceus_engine_node_exit` wraps around `summarize_linear_ownership_uses`
+(`perceus/uses.brp`), `balance_let_body_legacy` / `transform_let_if_body` /
+`transform_let_constructor_match_body` (`perceus/balance.brp`),
+`protect_repeated_consumes` (`perceus/protect.brp`), the four helpers
+`plan_managed_let` calls to compute `PerceusManagedLetPlan`'s fields
+(`binding_alias_rhs_is_owned_temporary`,
+`normalize_binding_alias_rhs_reuses_source`,
+`normalize_binding_alias_rhs_with_owned_status`,
+`retain_mutable_match_branch_results`, all in `results_and_loops.brp`), and
+`balanced_path_has_divergent_constructor_match` (`perceus/balance.brp`).
+Two additions: `BLORP_PERCEUS_ENGINE_LET_BINDINGS schema=1 total=... managed=...`
+counts how many `let` bindings the engine visits and how many are managed,
+and the final `LetExpr`/`BorrowLetExpr` reconstruction is bracketed under
+the label `let-reconstruct`.
+
+**Off-limits files.** Another worker is editing `perceus/borrowed.brp` and
+`perceus/mutable.brp` concurrently. `rewrite_mutable_let_body`
+(`perceus/mutable.brp`) is therefore not wrapped at its own definition;
+instead the *call site* inside `rebuild_managed_let_impl`
+(`results_and_loops.brp`) is bracketed with `perceus_engine_node_enter`/
+`perceus_engine_node_exit("helper:rewrite_mutable_let_body")`, which
+attributes the same allocations to this step without touching that file.
+`mutable.brp` was not edited. If a future cut needs to change
+`rewrite_mutable_let_body` itself, what it would need is exactly what this
+bracket already shows: an inclusive cost of 3,616,045 allocations across
+4,055 calls (only for mutable managed lets) -- the same shape as this
+issue's other findings, so the same kind of drill (an enter/exit bracket
+around its own internal steps) would apply there too, once that file is
+free to edit.
+
+**A second multi-caller correction.** `protect_repeated_consumes` also has
+several other callers (`borrowed.brp`, `mutable.brp` x3, `short_circuit.brp`),
+so wrapping its own definition (as done for the other helpers) aggregates
+across the whole compile, not just this call site -- the same caveat this
+report already noted for `summarize_linear_ownership_uses`. A second,
+call-site-only bracket, labeled `let-protect-repeated-consumes-site`, was
+added around the one call inside `rebuild_managed_let_impl` to isolate the
+managed-let-scoped share from the global aggregate.
+
+### Let bindings on the self-compile
+
+`BLORP_PERCEUS_ENGINE_LET_BINDINGS schema=1 total=73890 managed=57601` --
+73,890 `LetExpr` bindings visited by the frame-stack loop in
+`insert_drops_expr_inner_result_impl`, of which 57,601 (77.9%) are managed
+(bind a type `is_managed_type` reports true for) and go through
+`plan_managed_let`/the managed-let frame pair; the remaining 16,289 are
+unmanaged and rebuilt directly. Of the 57,601 managed lets, only 57,488
+(99.8%) actually reach `rebuild_managed_let` -- the other 113 are resolved
+by the cheaper `proven_unused`/`reuses_source`/`direct_consume` checks in
+`insert_drops_expr_inner_result_impl` before `rebuild_managed_let` is ever
+called, so there is very little "early-out before planning" headroom left
+in the current structure (see the go/no-go below).
+
+### `rebuild_managed_let`'s budget, broken down
+
+Frozen input: `origin/main` at `a109eca0cb29c816625185ccf3a2d7428f910028`.
+Reference row, same input: `pass_perceus_complete` = **60,868,648**
+allocations (delta of `pass_dict_literal_ownership_complete`'s
+148,498,896 and `pass_perceus_complete`'s 209,367,544 cumulative totals).
+`rebuild_managed_let`'s own row: calls=57,488, self=2,951,246,
+**inclusive=15,607,175 (25.64% of the pass)** -- consistent with the first
+pass's 25.66% (the 0.02-point difference is input drift between the two
+measurement runs, not the instrumentation).
+
+| Step | Scope | Calls | Self allocs | Self % of pass | % of rebuild's budget |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `balance_let_body_legacy` | Aggregate (see caveat) | 46,731 | 182,618 (self); **4,968,657 (inclusive)** | **8.16%** (inclusive) | **31.84%** |
+| `rebuild_managed_let` self (remaining glue: match dispatch, `is_immortal_value_expr`, `freshen_shadowed_match_bindings`, the immutable branch's `retain_alias_source_in_body`, `body_starts_with_dup`) | Exact | 57,488 | 2,951,246 | 4.85% | 18.91% |
+| `rewrite_mutable_let_body` (call-site bracket) | Exact (mutable lets only) | 4,055 | 1,310,133 (self); 3,616,045 (inclusive) | 5.94% (inclusive) | 23.17% |
+| `let-protect-repeated-consumes-site` (call-site bracket) | Exact | 53,342 | ~0 (self); 1,144,531 (inclusive) | 1.88% (inclusive) | 7.33% |
+| `transform_let_constructor_match_body` | Exact | 2,737 | 230,085 (self); 522,413 (inclusive) | 0.86% (inclusive) | 3.35% |
+| `transform_let_if_body` | Exact | 3,878 | 18,406 (self); 293,716 (inclusive) | 0.48% (inclusive) | 1.88% |
+| `plan_managed_let` self (remaining) | Exact | 57,601 | 61,656 | 0.10% | -- (separate budget) |
+| `binding_alias_rhs_is_owned_temporary` | Exact | 58,769 | 75,779 | 0.12% | -- (separate budget) |
+| `normalize_binding_alias_rhs_with_owned_status` | Exact | 14,010 | 58,119 | 0.10% | -- (separate budget) |
+| `retain_mutable_match_branch_results` | Exact | 19,630 | 54,429 | 0.09% | -- (separate budget) |
+| `normalize_binding_alias_rhs_reuses_source` | Exact | 57,601 | 20,223 | 0.03% | -- (separate budget) |
+| `let-reconstruct` (final `LetExpr` node) | Exact | 57,488 | 57,488 | 0.09% | 0.37% |
+| `balanced_path_has_divergent_constructor_match` | Exact, but recursive (see note) | 714,561 | 1,294 (self) | 0.002% | 0.01% |
+| `protect_repeated_consumes` (own definition, global) | **Aggregate, not scoped** | 3,226,532 | 2,086,226 (self); 29,235,161 (inclusive) | 3.43% (self, global) | n/a (see caveat) |
+| `summarize_linear_ownership_uses` (own definition, global) | **Aggregate, not scoped** | 4,799,071 | 17,381,954 (self); 53,411,618 (inclusive) | **28.56%** (self, global) | n/a (see caveat) |
+
+Notes:
+- **Scope column.** "Exact" means the row's number is scoped to calls
+  reachable only from `rebuild_managed_let`/`plan_managed_let` (either the
+  function has no other caller, or the wrap is a call-site bracket rather
+  than a definition wrap). "Aggregate" means the wrapped function has other
+  callers elsewhere in Perceus, so the self/inclusive numbers sum across the
+  whole compile, not just this call path; `balance_let_body_legacy`'s other
+  caller (`balance_concurrent_binding_body`) was checked and found
+  negligible on this program (`PreClosureConcurrentlyLoopExpr` appears once
+  in the whole self-compile), so its row is treated as ~100%
+  managed-let-scoped despite being an aggregate wrap.
+- **`balanced_path_has_divergent_constructor_match`'s inclusive number is
+  not reported** because it is self-recursive with a single external entry
+  point (only called from `rebuild_managed_let_impl`); the aggregate table
+  sums `inclusive_allocations` once per *call*, including every recursive
+  re-entry, so the reported total for a deeply recursive predicate
+  over-counts the same allocations many times over (the same effect this
+  report's first section already documented for `IfExpr`'s node-kind row).
+  Its `self` (1,294 across 714,561 calls) is the trustworthy number, and it
+  is negligible: the predicate does not allocate `CoreExpr` nodes, just
+  booleans and (rarely) small `Option`s.
+- **Budget arithmetic does not sum to exactly 15,607,175** (the rows above
+  add to roughly 13.5M): the remainder is the uninstrumented calls inside
+  `rebuild_managed_let_impl`'s own glue (`is_immortal_value_expr`,
+  `freshen_shadowed_match_bindings`, `releasing_match_consumes_owner`, the
+  immutable branch's `retain_alias_source_in_body` call before balancing,
+  `body_starts_with_dup`), which are folded into the "remaining glue" self
+  row above rather than drilled further, since none of them were named in
+  the issue's step list.
+
+### Go/no-go: does any step exceed 25% of `rebuild_managed_let`'s budget (~6.41% of the pass)?
+
+**Yes: `balance_let_body_legacy`, at 31.84% of the budget (8.16% of the
+pass).** This is the only step whose scoped-or-near-scoped share clears the
+line; `rewrite_mutable_let_body` (23.17% of budget, 5.94% of the pass) is
+close but under.
+
+### What was investigated for the cut, and why it lands where it does
+
+The hypothesized shapes were checked directly against `balance_let_body_legacy`
+and its callers, not assumed:
+
+- **"A summary computed more than once for the same body."** Traced every
+  path into `balance_let_body_legacy`: the `ConstructorMatchExpr` arm in
+  `rebuild_managed_let_impl` tries `releasing_match_consumes_owner` (cheap,
+  no summary) then `transform_let_constructor_match_body` before falling
+  back; but `transform_let_constructor_match_body`'s own `None` returns
+  either happen before any `summarize_linear_ownership_uses` call (the
+  shadow/shape check) or, when they do happen, are on `scrutinee`, a
+  different and much smaller expression than the `body` the fallback then
+  summarizes. The dominant caller by volume, the wildcard (`_`) arm for
+  "boring" bodies (46,731 of the 46,731 total `balance_let_body_legacy`
+  calls come through both the wildcard and the two `ConstructorMatchExpr`
+  fallback points combined; the wildcard arm alone accounts for the large
+  majority since `transform_let_if_body` and `transform_let_constructor_match_body`
+  together only see 6,615 calls), calls `balance_let_body_legacy` directly
+  with no prior summary of the same body at all. No duplicate call on the
+  same `(env, name, body)` triple was found.
+- **"A body rebuilt through two transformations when one would do."** Found
+  a real instance, but in `transform_let_constructor_match_body`, not
+  `balance_let_body_legacy`: `match_node` (a `ConstructorMatchExpr` wrapping
+  the freshened cases/fallback) was built unconditionally at the top of the
+  function, but is read on only one of its four return paths there and one
+  more further down; every other path (three of five) returned `None` or
+  built a *different* `ConstructorMatchExpr` from
+  `balance_constructor_match_cases`/`balance_constructor_match_fallback`,
+  discarding the eagerly-built node. This is the cut implemented below.
+- **"A plan record built for bindings that need no rebuild."** Checked:
+  `plan_managed_let` cannot know in advance whether a binding will be
+  `proven_unused` or `direct_consume`, because those checks depend on
+  `resolved_values`, an index populated by walking *forward* through the
+  binding's body in source order -- information that does not exist yet
+  when the `Let` is first visited pre-order. Confirmed by the let-binding
+  counts above: only 113 of 57,601 managed lets (0.2%) skip
+  `rebuild_managed_let` via these checks, so there is negligible early-out
+  headroom left to add without restructuring the two-pass architecture,
+  which is out of scope here.
+- **"The legacy balance path taken for a common shape the newer paths could
+  handle."** Would require broadening `transform_let_if_body`/
+  `transform_let_constructor_match_body` (or adding a new specialized path)
+  to cover more body shapes. This changes *which* balancing strategy a
+  program takes, which would change the emitted C for programs that shift
+  onto the new path -- incompatible with this issue's byte-identical-C
+  acceptance bar. Not attempted.
+- **`balance_let_body_legacy`'s own dominant cost** (self 182,618 vs.
+  inclusive 4,968,657 -- 96% of its budget) is the one
+  `summarize_linear_ownership_uses(env, variable.name, body)` call at its
+  top, over whatever `body` remains after `protect_repeated_consumes`. No
+  confirmed duplicate or avoidable-without-behavior-change instance of this
+  call was found for the dominant (wildcard-arm) case; a further cut here
+  would mean changing `summarize_linear_ownership_uses` itself (called
+  4,799,071 times project-wide, 28.56% of the pass on its own), which is a
+  shared-traversal change well beyond this issue's scope and risk budget.
+
+**Cut implemented:** the `transform_let_constructor_match_body` `match_node`
+deferral above. It does not target the 8.16%-of-pass mechanism directly
+(that mechanism's dominant cost was not found to be an avoidable
+duplicate), but it is a real, verified, safe reduction found while drilling
+the same call tree, and it changes nothing else in `rebuild_managed_let`'s
+own code.
+
+### On/off honesty check (drill-down instrumentation only, before the cut)
+
+Two direct compiles of the pinned self-compile input
+(`a109eca0cb29c816625185ccf3a2d7428f910028`), `BLORP_CLI_C_OPTIMIZATION=-O2`,
+`BLORP_COMPILER_MEMORY_PROFILE=1`, identical otherwise except
+`BLORP_PERCEUS_ENGINE_METRICS`:
+
+| | `pass_dict_literal_ownership_complete` (cumulative) | `pass_perceus_complete` (cumulative) | Pass delta |
+| --- | ---: | ---: | ---: |
+| Metric unset | 148,498,896 | 209,367,544 | 60,868,648 |
+| `BLORP_PERCEUS_ENGINE_METRICS=1` | 148,498,896 | 209,367,544 | 60,868,648 |
+
+Identical. Output C also byte-identical between the two runs.
+
+## The cut: deferring `match_node` in `transform_let_constructor_match_body`
+
+Landed on top of the drill-down instrumentation above, as its own commit.
+`transform_let_constructor_match_body_impl` (`perceus/balance.brp`) built
+`match_node: CoreExpr = ConstructorMatchExpr(scrutinee, release_policy,
+freshened_cases, freshened_fallback, typ, loc)` unconditionally at the top
+of the function, once per call. It is read on exactly two of the function's
+five return paths (the `scrutinee_aliases_owner`/`NoReleasePolicy`
+preserve-owner success, and the `total_needed == 0` success further down);
+every other path -- the two `None`s and the `dups_count > 0` success, which
+builds a *different* `ConstructorMatchExpr` via
+`balance_constructor_match_cases`/`balance_constructor_match_fallback` --
+discarded it unread. The fix moves the construction into the two arms that
+actually use it (each builds its own copy, since the two arms are mutually
+exclusive) instead of building it once, eagerly, for every call.
+
+### Before / after (pinned self-compile input `a109eca0cb29c816625185ccf3a2d7428f910028`)
+
+| | `helper:transform_let_constructor_match_body` self allocs | `pass_dict_literal_ownership_complete` (cumulative) | `pass_perceus_complete` (cumulative) | Pass delta |
+| --- | ---: | ---: | ---: | ---: |
+| Before | 230,085 | 148,498,896 | 209,367,544 | 60,868,648 |
+| After | 229,794 | 148,498,896 | 209,367,253 | **60,868,357** |
+| Δ | -291 | +0.00% | -291 | **-291 (-0.0005%)** |
+
+Output C is byte-identical to the pre-cut build on the same input (`diff`
+reports no difference). The reduction is small and real: `match_node` is
+read on 2,737 - (a small fraction) calls out of 2,737 total, so most calls
+to this function were paying for one wasted `ConstructorMatchExpr`
+allocation (plus the `List` references it holds) that this cut now skips.
+
+This does not target `balance_let_body_legacy`'s 8.16%-of-pass share
+directly -- see "What was investigated for the cut" above for why that
+mechanism's dominant cost (a necessary `summarize_linear_ownership_uses`
+call, not a confirmed duplicate) was not cut. It is a real, small,
+independently-verified reduction found in the same call tree while
+drilling `rebuild_managed_let`.
+
+### Small-program identity and instructions
+
+`benchmarks/self_compile_measure --program small --input-rev origin/main
+--samples 3 --baseline <parent at commit dae765e5d77d> --require-identical`:
+output C byte-identical (45,827 bytes both), every allocation row +0.00%,
+instructions retired **+0.02%** (well under the 0.3% floor). An earlier
+single-sample run under heavy concurrent load from other workers'
+gates briefly read instructions retired at +77%; re-measured in isolation
+(and again at 3 samples) it reads +0.02%-+0.04% consistently, confirming
+the first reading was scheduling noise from concurrent CPU contention, not
+a real regression -- `/usr/bin/time -l`'s instruction counter on this
+platform is not immune to that under enough concurrent load, so a surprising
+instructions delta should be re-checked in isolation before trusting it.
+
+### Gates (`benchmarks/self_compile_measure lock --`, foreground)
+
+All run against the final state (drill-down instrumentation + the cut):
+
+- `bin/blorp test --timeout 600 blorp/test/compiler/stage_09_core/test_core_perceus.brp` -- 364 passed.
+- `python3 -m unittest blorp.test.compiler.benchmark.test_perceus_memory` -- 80 passed.
+- `make hygiene-check` -- passed.
+- `scripts/compiler-check --changed` -- passed (1 source changed for this commit, 2,439 tests).
+- `scripts/test --serial compiler-blorp compiler-tools` -- 5,143 passed.
+- `scripts/test leak` -- 963 passed.
+- `compiler-core-sanitize` -- included in and passed as part of `scripts/compiler-check --changed`'s special checks.
+
+## Commits
+
+Two commits, per the coordinator's instruction to keep the measurement and
+the cut separate:
+
+1. `89a94912` "Drill Perceus's managed-let rebuild into per-step allocation
+   counters" -- instrumentation only (this file's "Follow-up" section
+   above), no cut, `pass_perceus_complete` unchanged.
+2. The `transform_let_constructor_match_body` `match_node` deferral above,
+   its own commit on top -- the only behavior-affecting (allocation-count)
+   change in this follow-up.

@@ -2461,6 +2461,8 @@ void blorp_perceus_engine_inserted_expr_construct_c(void);
 void blorp_perceus_engine_managed_let_plan_construct_c(void);
 void blorp_perceus_engine_frame_construct_c(void);
 void blorp_perceus_engine_resolved_value_update_c(void);
+void blorp_perceus_engine_let_binding_visit_c(void);
+void blorp_perceus_engine_let_binding_managed_c(void);
 void blorp_perceus_engine_metrics_report_c(void);
 void blorp_print_live_object_summary(void);
 blorp_SchedulerStats blorp_get_scheduler_stats(void);
