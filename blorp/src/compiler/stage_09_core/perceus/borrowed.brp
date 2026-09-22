@@ -290,20 +290,20 @@ private union BorrowedOwnerQueryKind:
 	BorrowedResultOwnerQuery
 
 
-private record BorrowedOwnerRewriteContext {
+-- `env` and `owners` are built once by the top-level call
+-- (`normalize_borrowed_owner_catalog`) and never written again; every
+-- `normalize_borrowed_*` and `*_borrowed_owner_*` function below borrows this
+-- instead of copying it into a record that gets rebuilt per node.
+--
+-- An owner query's `query_kind` and the current `shadowed_owner_ids` (and,
+-- for a result query, `result_satisfied_owner_ids`) ride alongside this as
+-- plain parameters rather than a second wrapper record: they are read-only
+-- for the duration of one query, and wrapping them would allocate a record
+-- on every query construction for no benefit (the query answer is a bare
+-- `Option[Int]`, never threaded onward).
+private record BorrowedFacts {
 	env: PerceusEnv,
-	owners: BorrowedOwnerCatalog,
-	shadowed_owner_ids: Dict[Int, Bool],
-	query_kind: BorrowedOwnerQueryKind
-}
-
-
--- Lexical shadowing and an existing Dup satisfy different obligations. Keep
--- them separate so a Dup for one result owner cannot hide another owner that
--- remains visible below the same result node.
-private record BorrowedResultRewriteContext {
-	base: BorrowedOwnerRewriteContext,
-	result_satisfied_owner_ids: Dict[Int, Bool]
+	owners: BorrowedOwnerCatalog
 }
 
 
@@ -336,9 +336,12 @@ private record BorrowedCallMaterialization {
 }
 
 
-private record BorrowedNormalizationContext {
-	env: PerceusEnv,
-	owners: BorrowedOwnerCatalog,
+-- The small state the boundary-normalization walk actually rewrites per
+-- node: which owners are shadowed, which result owners are already satisfied
+-- by a Dup, and which call materializations are pending on the current
+-- branch. `BorrowedFacts` (env, owners) never appears here; callers borrow
+-- it as a separate parameter.
+private record BorrowedNormalizationState {
 	shadowed_owner_ids: Dict[Int, Bool],
 	result_satisfied_owner_ids: Dict[Int, Bool],
 	pending_call_materializations: List[BorrowedCallMaterialization]
@@ -1273,18 +1276,19 @@ private pure func record_borrowed_region_rewrite(owners: BorrowedOwnerCatalog) -
 
 
 private pure func borrowed_owner_is_active(
-	context: BorrowedOwnerRewriteContext,
+	shadowed_owner_ids: Dict[Int, Bool],
 	owner_id: Int,
 ) -> Bool:
-	not context.shadowed_owner_ids.get_or(owner_id, False)
+	not shadowed_owner_ids.get_or(owner_id, False)
 
 
 private pure func borrowed_owner_param(
-	context: BorrowedOwnerRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
 	owner_id: Int,
 ) -> Option[CoreParam]:
-	if borrowed_owner_is_active(context, owner_id):
-		match context.owners.entries.get(owner_id):
+	if borrowed_owner_is_active(shadowed_owner_ids, owner_id):
+		match facts.owners.entries.get(owner_id):
 			Some(entry):
 				Some(entry.value)
 			None:
@@ -1294,13 +1298,14 @@ private pure func borrowed_owner_param(
 
 
 private pure func borrowed_context_shadowing_var(
-	context: BorrowedOwnerRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
 	variable: CoreVar,
-) -> BorrowedOwnerRewriteContext:
-	var shadowed: Dict[Int, Bool] = context.shadowed_owner_ids
+) -> Dict[Int, Bool]:
+	var shadowed: Dict[Int, Bool] = shadowed_owner_ids
 
-	for owner_id in context.owners.candidate_ids_by_name.get_or(variable.name, []):
-		match context.owners.entries.get(owner_id):
+	for owner_id in facts.owners.candidate_ids_by_name.get_or(variable.name, []):
+		match facts.owners.entries.get(owner_id):
 			Some(entry):
 				if core_var_matches_param(variable, entry.value):
 					shadowed = shadowed.set(owner_id, True)
@@ -1309,17 +1314,18 @@ private pure func borrowed_context_shadowing_var(
 			None:
 				void
 
-	{ context | shadowed_owner_ids = shadowed }
+	shadowed
 
 
 private pure func borrowed_context_shadowing_bindings(
-	context: BorrowedOwnerRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
 	bindings: List[CoreMatchBinding],
-) -> BorrowedOwnerRewriteContext:
-	var result: BorrowedOwnerRewriteContext = context
+) -> Dict[Int, Bool]:
+	var result: Dict[Int, Bool] = shadowed_owner_ids
 
 	for binding in bindings:
-		result = borrowed_context_shadowing_var(result, binding.variable)
+		result = borrowed_context_shadowing_var(facts, result, binding.variable)
 
 	result
 
@@ -1340,14 +1346,16 @@ private pure func earlier_borrowed_owner(left: Option[Int], right: Option[Int]) 
 
 
 private pure func direct_borrowed_owner_for_var(
-	context: BorrowedOwnerRewriteContext,
+	facts: BorrowedFacts,
+	query_kind: BorrowedOwnerQueryKind,
+	shadowed_owner_ids: Dict[Int, Bool],
 	variable: CoreVar,
 ) -> Option[Int]:
 	var found: Option[Int] = None
 
-	for owner_id in context.owners.candidate_ids_by_name.get_or(variable.name, []):
+	for owner_id in facts.owners.candidate_ids_by_name.get_or(variable.name, []):
 		debug:
-			match context.query_kind:
+			match query_kind:
 				BorrowedCallOwnerQuery:
 					perceus_work_borrowed_call_owner_candidate_visits()
 				BorrowedAggregateOwnerQuery:
@@ -1357,7 +1365,7 @@ private pure func direct_borrowed_owner_for_var(
 
 			perceus_work_borrowed_origin_member_visits()
 
-		match borrowed_owner_param(context, owner_id):
+		match borrowed_owner_param(facts, shadowed_owner_ids, owner_id):
 			Some(owner):
 				if core_var_matches_param(variable, owner):
 					found = Some(owner_id)
@@ -1371,13 +1379,15 @@ private pure func direct_borrowed_owner_for_var(
 
 
 private pure func first_borrowed_owner_legacy(
-	context: BorrowedOwnerRewriteContext,
+	facts: BorrowedFacts,
+	query_kind: BorrowedOwnerQueryKind,
+	shadowed_owner_ids: Dict[Int, Bool],
 	expr: CoreExpr,
 ) -> Option[Int]:
 	debug:
-		record_borrowed_region_alias_fallback(context.owners)
+		record_borrowed_region_alias_fallback(facts.owners)
 
-		match context.query_kind:
+		match query_kind:
 			BorrowedCallOwnerQuery:
 				perceus_work_borrowed_call_alias_fallback_requests()
 			BorrowedAggregateOwnerQuery:
@@ -1388,10 +1398,10 @@ private pure func first_borrowed_owner_legacy(
 	var found: Option[Int] = None
 	var owner_id: Int = 0
 
-	for entry in context.owners.entries:
-		if borrowed_owner_is_active(context, owner_id):
+	for entry in facts.owners.entries:
+		if borrowed_owner_is_active(shadowed_owner_ids, owner_id):
 			debug:
-				match context.query_kind:
+				match query_kind:
 					BorrowedCallOwnerQuery:
 						perceus_work_borrowed_call_owner_candidate_visits()
 					BorrowedAggregateOwnerQuery:
@@ -1401,7 +1411,7 @@ private pure func first_borrowed_owner_legacy(
 
 				perceus_work_borrowed_origin_member_visits()
 
-			if borrow_expr_aliases_param(context.env, entry.value, expr):
+			if borrow_expr_aliases_param(facts.env, entry.value, expr):
 				found = Some(owner_id)
 				break
 			else:
@@ -1419,30 +1429,32 @@ private pure func first_borrowed_owner_legacy(
 -- call contracts stay indexed; uncommon binding/match/ownership-node shapes
 -- use the exact scalar predicate as a compatibility fallback.
 private pure func first_resolved_borrowed_owner_aliasing_expr(
-	context: BorrowedOwnerRewriteContext,
+	facts: BorrowedFacts,
+	query_kind: BorrowedOwnerQueryKind,
+	shadowed_owner_ids: Dict[Int, Bool],
 	expr: CoreExpr,
 ) -> Option[Int]:
 	match expr:
 		VarExpr(variable, typ, loc):
-			direct_borrowed_owner_for_var(context, variable)
+			direct_borrowed_owner_for_var(facts, query_kind, shadowed_owner_ids, variable)
 		FieldExpr(owner, field, typ, loc):
-			first_borrowed_owner_aliasing_expr(context, owner)
+			first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, owner)
 		TupleFieldExpr(owner, field_index, typ, loc):
-			first_borrowed_owner_aliasing_expr(context, owner)
+			first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, owner)
 		ListGetExpr(get, typ, loc):
-			first_borrowed_owner_aliasing_expr(context, get.list)
+			first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, get.list)
 		CastExpr(inner, typ, loc):
-			first_borrowed_owner_aliasing_expr(context, inner)
+			first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, inner)
 		UnboxExpr(kind, inner, typ, loc):
-			first_borrowed_owner_aliasing_expr(context, inner)
+			first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, inner)
 		CallExpr(kind, callee, args, typ, loc):
-			match contract_for_call(context.env, kind, args.length(), typ):
+			match contract_for_call(facts.env, kind, args.length(), typ):
 				Some(contract):
 					match contract.result:
 						ReturnAliasOfArg(index):
 							match args.get(index):
 								Some(arg):
-									first_borrowed_owner_aliasing_expr(context, arg)
+									first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, arg)
 								None:
 									None
 						ReturnBorrowed:
@@ -1455,7 +1467,7 @@ private pure func first_resolved_borrowed_owner_aliasing_expr(
 										if arg_allows_borrowed_result_alias(mode):
 											found = earlier_borrowed_owner(
 												found,
-												first_borrowed_owner_aliasing_expr(context, arg),
+												first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, arg),
 											)
 										else:
 											void
@@ -1470,62 +1482,68 @@ private pure func first_resolved_borrowed_owner_aliasing_expr(
 				None:
 					None
 		SeqExpr(first, second):
-			first_borrowed_owner_aliasing_expr(context, second)
+			first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, second)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			earlier_borrowed_owner(
-				first_borrowed_owner_aliasing_expr(context, then_expr),
-				first_borrowed_owner_aliasing_expr(context, else_expr),
+				first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, then_expr),
+				first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, else_expr),
 			)
 		LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _) | ConstructorMatchExpr(_, _, _, _, _, _) | ResourceScopeExpr(_, _, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _):
-			first_borrowed_owner_legacy(context, expr)
+			first_borrowed_owner_legacy(facts, query_kind, shadowed_owner_ids, expr)
 		_:
 			None
 
 
 private pure func first_borrowed_owner_aliasing_expr(
-	context: BorrowedOwnerRewriteContext,
+	facts: BorrowedFacts,
+	query_kind: BorrowedOwnerQueryKind,
+	shadowed_owner_ids: Dict[Int, Bool],
 	expr: CoreExpr,
 ) -> Option[Int]:
-	if context.owners.has_unresolved_identity:
+	if facts.owners.has_unresolved_identity:
 		-- Name-mode has the same direct rules for variables and transparent
 		-- projections, but deliberately different summary semantics for
 		-- control flow and calls. Keep those complex forms on the exact
 		-- predicate while avoiding owner scans for definite leaves.
 		match expr:
 			VarExpr(variable, typ, loc):
-				direct_borrowed_owner_for_var(context, variable)
+				direct_borrowed_owner_for_var(facts, query_kind, shadowed_owner_ids, variable)
 			FieldExpr(owner, field, typ, loc):
-				first_borrowed_owner_aliasing_expr(context, owner)
+				first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, owner)
 			TupleFieldExpr(owner, field_index, typ, loc):
-				first_borrowed_owner_aliasing_expr(context, owner)
+				first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, owner)
 			CastExpr(inner, typ, loc):
-				first_borrowed_owner_aliasing_expr(context, inner)
+				first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, inner)
 			UnboxExpr(kind, inner, typ, loc):
-				first_borrowed_owner_aliasing_expr(context, inner)
+				first_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, inner)
 			LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
 				None
 			_:
-				first_borrowed_owner_legacy(context, expr)
+				first_borrowed_owner_legacy(facts, query_kind, shadowed_owner_ids, expr)
 	else:
-		first_resolved_borrowed_owner_aliasing_expr(context, expr)
+		first_resolved_borrowed_owner_aliasing_expr(facts, query_kind, shadowed_owner_ids, expr)
+
 
 
 private pure func borrowed_result_owner_is_active(
-	context: BorrowedResultRewriteContext,
+	shadowed_owner_ids: Dict[Int, Bool],
+	result_satisfied_owner_ids: Dict[Int, Bool],
 	owner_id: Int,
 ) -> Bool:
 	(
-		borrowed_owner_is_active(context.base, owner_id)
-		and not context.result_satisfied_owner_ids.get_or(owner_id, False)
+		not shadowed_owner_ids.get_or(owner_id, False)
+		and not result_satisfied_owner_ids.get_or(owner_id, False)
 	)
 
 
 private pure func borrowed_result_owner_param(
-	context: BorrowedResultRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
+	result_satisfied_owner_ids: Dict[Int, Bool],
 	owner_id: Int,
 ) -> Option[CoreParam]:
-	if borrowed_result_owner_is_active(context, owner_id):
-		match context.base.owners.entries.get(owner_id):
+	if borrowed_result_owner_is_active(shadowed_owner_ids, result_satisfied_owner_ids, owner_id):
+		match facts.owners.entries.get(owner_id):
 			Some(entry):
 				Some(entry.value)
 			None:
@@ -1535,37 +1553,37 @@ private pure func borrowed_result_owner_param(
 
 
 private pure func borrowed_result_context_shadowing_var(
-	context: BorrowedResultRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
 	variable: CoreVar,
-) -> BorrowedResultRewriteContext:
-	{ context | base = borrowed_context_shadowing_var(context.base, variable) }
+) -> Dict[Int, Bool]:
+	borrowed_context_shadowing_var(facts, shadowed_owner_ids, variable)
 
 
 private pure func borrowed_result_context_shadowing_bindings(
-	context: BorrowedResultRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
 	bindings: List[CoreMatchBinding],
-) -> BorrowedResultRewriteContext:
-	var result: BorrowedResultRewriteContext = context
-
-	for binding in bindings:
-		result = borrowed_result_context_shadowing_var(result, binding.variable)
-
-	result
+) -> Dict[Int, Bool]:
+	borrowed_context_shadowing_bindings(facts, shadowed_owner_ids, bindings)
 
 
+-- Only `result_satisfied_owner_ids` is read or written here: an existing Dup
+-- satisfies an owner independently of whether it is currently shadowed.
 private pure func borrowed_result_context_satisfying_var(
-	context: BorrowedResultRewriteContext,
+	facts: BorrowedFacts,
+	result_satisfied_owner_ids: Dict[Int, Bool],
 	variable: CoreVar,
-) -> BorrowedResultRewriteContext:
-	candidate_ids: List[Int] = context.base.owners.candidate_ids_by_name.get_or(variable.name, [])
+) -> Dict[Int, Bool]:
+	candidate_ids: List[Int] = facts.owners.candidate_ids_by_name.get_or(variable.name, [])
 
 	if candidate_ids.is_empty():
-		context
+		result_satisfied_owner_ids
 	else:
-		var satisfied: Dict[Int, Bool] = context.result_satisfied_owner_ids
+		var satisfied: Dict[Int, Bool] = result_satisfied_owner_ids
 
 		for owner_id in candidate_ids:
-			match context.base.owners.entries.get(owner_id):
+			match facts.owners.entries.get(owner_id):
 				Some(entry):
 					if core_var_matches_param(variable, entry.value):
 						satisfied = satisfied.set(owner_id, True)
@@ -1574,21 +1592,23 @@ private pure func borrowed_result_context_satisfying_var(
 				None:
 					void
 
-		{ context | result_satisfied_owner_ids = satisfied }
+		satisfied
 
 
 private pure func direct_borrowed_result_owner_for_var(
-	context: BorrowedResultRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
+	result_satisfied_owner_ids: Dict[Int, Bool],
 	variable: CoreVar,
 ) -> Option[Int]:
 	var found: Option[Int] = None
 
-	for owner_id in context.base.owners.candidate_ids_by_name.get_or(variable.name, []):
+	for owner_id in facts.owners.candidate_ids_by_name.get_or(variable.name, []):
 		debug:
 			perceus_work_borrowed_result_owner_candidate_visits()
 			perceus_work_borrowed_origin_member_visits()
 
-		match borrowed_result_owner_param(context, owner_id):
+		match borrowed_result_owner_param(facts, shadowed_owner_ids, result_satisfied_owner_ids, owner_id):
 			Some(owner):
 				if core_var_matches_param(variable, owner):
 					found = Some(owner_id)
@@ -1605,23 +1625,25 @@ private pure func direct_borrowed_result_owner_for_var(
 -- explicit compatibility boundary. Ownership-ready direct results and their
 -- transparent projections stay on the indexed path.
 private pure func first_borrowed_result_owner_legacy(
-	context: BorrowedResultRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
+	result_satisfied_owner_ids: Dict[Int, Bool],
 	expr: CoreExpr,
 ) -> Option[Int]:
 	debug:
 		perceus_work_borrowed_result_alias_fallback_requests()
-		record_borrowed_region_alias_fallback(context.base.owners)
+		record_borrowed_region_alias_fallback(facts.owners)
 
 	var found: Option[Int] = None
 	var owner_id: Int = 0
 
-	for entry in context.base.owners.entries:
-		if borrowed_result_owner_is_active(context, owner_id):
+	for entry in facts.owners.entries:
+		if borrowed_result_owner_is_active(shadowed_owner_ids, result_satisfied_owner_ids, owner_id):
 			debug:
 				perceus_work_borrowed_result_owner_candidate_visits()
 				perceus_work_borrowed_origin_member_visits()
 
-			if borrow_expr_aliases_param(context.base.env, entry.value, expr):
+			if borrow_expr_aliases_param(facts.env, entry.value, expr):
 				found = Some(owner_id)
 				break
 			else:
@@ -1635,22 +1657,24 @@ private pure func first_borrowed_result_owner_legacy(
 
 
 private pure func first_borrowed_result_owner_aliasing_expr(
-	context: BorrowedResultRewriteContext,
+	facts: BorrowedFacts,
+	shadowed_owner_ids: Dict[Int, Bool],
+	result_satisfied_owner_ids: Dict[Int, Bool],
 	expr: CoreExpr,
 ) -> Option[Int]:
 	match expr:
 		VarExpr(variable, typ, loc):
-			direct_borrowed_result_owner_for_var(context, variable)
+			direct_borrowed_result_owner_for_var(facts, shadowed_owner_ids, result_satisfied_owner_ids, variable)
 		FieldExpr(owner, field, typ, loc):
-			first_borrowed_result_owner_aliasing_expr(context, owner)
+			first_borrowed_result_owner_aliasing_expr(facts, shadowed_owner_ids, result_satisfied_owner_ids, owner)
 		TupleFieldExpr(owner, field_index, typ, loc):
-			first_borrowed_result_owner_aliasing_expr(context, owner)
+			first_borrowed_result_owner_aliasing_expr(facts, shadowed_owner_ids, result_satisfied_owner_ids, owner)
 		CastExpr(inner, typ, loc):
-			first_borrowed_result_owner_aliasing_expr(context, inner)
+			first_borrowed_result_owner_aliasing_expr(facts, shadowed_owner_ids, result_satisfied_owner_ids, inner)
 		UnboxExpr(kind, inner, typ, loc):
-			first_borrowed_result_owner_aliasing_expr(context, inner)
+			first_borrowed_result_owner_aliasing_expr(facts, shadowed_owner_ids, result_satisfied_owner_ids, inner)
 		_:
-			first_borrowed_result_owner_legacy(context, expr)
+			first_borrowed_result_owner_legacy(facts, shadowed_owner_ids, result_satisfied_owner_ids, expr)
 
 
 private pure func protect_borrowed_param_call_args(
@@ -2942,61 +2966,45 @@ private pure func borrowed_mode_is_empty(mode: BorrowedChildMode) -> Bool:
 							True
 
 
-private pure func borrowed_query_context(
-	context: BorrowedNormalizationContext,
-	query_kind: BorrowedOwnerQueryKind,
-) -> BorrowedOwnerRewriteContext:
-	{
-		env = context.env,
-		owners = context.owners,
-		shadowed_owner_ids = context.shadowed_owner_ids,
-		query_kind = query_kind
-	}
-
-
-private pure func borrowed_result_query_context(
-	context: BorrowedNormalizationContext,
-) -> BorrowedResultRewriteContext:
-	{
-		base = borrowed_query_context(context, BorrowedResultOwnerQuery),
-		result_satisfied_owner_ids = context.result_satisfied_owner_ids
-	}
-
-
 private pure func borrowed_normalization_shadowing_var(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	variable: CoreVar,
-) -> BorrowedNormalizationContext:
-	shadowed: BorrowedOwnerRewriteContext = borrowed_context_shadowing_var(
-		borrowed_query_context(context, BorrowedCallOwnerQuery),
+) -> BorrowedNormalizationState:
+	shadowed: Dict[Int, Bool] = borrowed_context_shadowing_var(
+		facts,
+		state.shadowed_owner_ids,
 		variable,
 	)
 
-	{ context | shadowed_owner_ids = shadowed.shadowed_owner_ids }
+	{ state | shadowed_owner_ids = shadowed }
 
 
 private pure func borrowed_normalization_shadowing_bindings(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	bindings: List[CoreMatchBinding],
-) -> BorrowedNormalizationContext:
-	var result: BorrowedNormalizationContext = context
+) -> BorrowedNormalizationState:
+	var result: BorrowedNormalizationState = state
 
 	for binding in bindings:
-		result = borrowed_normalization_shadowing_var(result, binding.variable)
+		result = borrowed_normalization_shadowing_var(facts, result, binding.variable)
 
 	result
 
 
 private pure func borrowed_normalization_satisfying_var(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	variable: CoreVar,
-) -> BorrowedNormalizationContext:
-	satisfied: BorrowedResultRewriteContext = borrowed_result_context_satisfying_var(
-		borrowed_result_query_context(context),
+) -> BorrowedNormalizationState:
+	satisfied: Dict[Int, Bool] = borrowed_result_context_satisfying_var(
+		facts,
+		state.result_satisfied_owner_ids,
 		variable,
 	)
 
-	{ context | result_satisfied_owner_ids = satisfied.result_satisfied_owner_ids }
+	{ state | result_satisfied_owner_ids = satisfied }
 
 
 -- The child has already been normalized under every enabled structural mode.
@@ -3051,17 +3059,17 @@ private pure func borrowed_call_materializes_aggregate(expr: CoreExpr) -> Bool:
 
 
 private pure func normalize_borrowed_call_args(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	parent_mode: BorrowedChildMode,
 	kind: CoreCallKind,
 	args: List[CoreExpr],
 	return_type: CoreType,
 	call_loc: CoreSourceLoc,
 ) -> List[CoreExpr]:
-	query: BorrowedOwnerRewriteContext = borrowed_query_context(context, BorrowedCallOwnerQuery)
 	ordinary_mode: BorrowedChildMode = borrowed_child_mode(parent_mode, True, True, False)
 	contract: Option[OwnershipCallContract] = contract_for_call(
-		context.env,
+		facts.env,
 		kind,
 		args.length(),
 		return_type,
@@ -3087,17 +3095,17 @@ private pure func normalize_borrowed_call_args(
 		aggregate_arg: Bool = borrowed_call_materializes_aggregate(arg)
 
 		pre_normalization_owner_id: Option[Int] = if consumes and aggregate_arg:
-			first_borrowed_owner_aliasing_expr(query, arg)
+			first_borrowed_owner_aliasing_expr(facts, BorrowedCallOwnerQuery, state.shadowed_owner_ids, arg)
 		else:
 			None
 
 		normalized_arg: CoreExpr = match pre_normalization_owner_id:
 			Some(active_owner_id):
-				match borrowed_owner_param(query, active_owner_id):
+				match borrowed_owner_param(facts, state.shadowed_owner_ids, active_owner_id):
 					Some(owner):
 						debug:
 							perceus_work_borrowed_call_rewrite_actions()
-							record_borrowed_region_rewrite(context.owners)
+							record_borrowed_region_rewrite(facts.owners)
 
 						storage_traversal: BorrowedStorageTraversal = match parent_mode.storage_traversal:
 							TraverseBorrowedStorage:
@@ -3105,14 +3113,15 @@ private pure func normalize_borrowed_call_args(
 							TraverseBorrowedCallMaterialization | SkipBorrowedStorage:
 								TraverseBorrowedCallMaterialization
 
-						call_context: BorrowedNormalizationContext = { context |
-							pending_call_materializations = context.pending_call_materializations.append({
+						call_state: BorrowedNormalizationState = { state |
+							pending_call_materializations = state.pending_call_materializations.append({
 								owner_id = active_owner_id,
 								owner = owner,
 							})
 						}
 						normalize_borrowed_child(
-							call_context,
+							facts,
+							call_state,
 							{
 								call_traversal = parent_mode.call_traversal,
 								storage_traversal = storage_traversal,
@@ -3121,22 +3130,22 @@ private pure func normalize_borrowed_call_args(
 							arg,
 						)
 					None:
-						normalize_borrowed_child(context, ordinary_mode, arg)
+						normalize_borrowed_child(facts, state, ordinary_mode, arg)
 			None:
-				child: CoreExpr = normalize_borrowed_child(context, ordinary_mode, arg)
+				child: CoreExpr = normalize_borrowed_child(facts, state, ordinary_mode, arg)
 
 				post_normalization_owner_id: Option[Int] = if consumes and not aggregate_arg:
-					first_borrowed_owner_aliasing_expr(query, child)
+					first_borrowed_owner_aliasing_expr(facts, BorrowedCallOwnerQuery, state.shadowed_owner_ids, child)
 				else:
 					None
 
 				match post_normalization_owner_id:
 					Some(active_owner_id):
-						match borrowed_owner_param(query, active_owner_id):
+						match borrowed_owner_param(facts, state.shadowed_owner_ids, active_owner_id):
 							Some(owner):
 								debug:
 									perceus_work_borrowed_call_rewrite_actions()
-									record_borrowed_region_rewrite(context.owners)
+									record_borrowed_region_rewrite(facts.owners)
 
 								temp: CoreVar = synthetic_binding_var(
 									"borrowed_result_${owner.name.name}_call_arg",
@@ -3144,7 +3153,7 @@ private pure func normalize_borrowed_call_args(
 									call_loc,
 								)
 								retain_known_borrowed_boundary_value(
-									context.env,
+									facts.env,
 									owner,
 									child,
 									Some(temp),
@@ -3162,20 +3171,19 @@ private pure func normalize_borrowed_call_args(
 
 
 private pure func protect_normalized_borrowed_equality_arg(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	arg: CoreExpr,
 	index: Int,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	query: BorrowedOwnerRewriteContext = borrowed_query_context(context, BorrowedCallOwnerQuery)
-
-	match first_borrowed_owner_aliasing_expr(query, arg):
+	match first_borrowed_owner_aliasing_expr(facts, BorrowedCallOwnerQuery, state.shadowed_owner_ids, arg):
 		Some(owner_id):
-			match borrowed_owner_param(query, owner_id):
+			match borrowed_owner_param(facts, state.shadowed_owner_ids, owner_id):
 				Some(owner):
 					debug:
 						perceus_work_borrowed_call_rewrite_actions()
-						record_borrowed_region_rewrite(context.owners)
+						record_borrowed_region_rewrite(facts.owners)
 
 					temp: CoreVar = synthetic_binding_var(
 						"borrowed_result_${owner.name.name}_equality_arg",
@@ -3183,7 +3191,7 @@ private pure func protect_normalized_borrowed_equality_arg(
 						loc,
 					)
 					retain_known_borrowed_boundary_value(
-						context.env,
+						facts.env,
 						owner,
 						arg,
 						Some(temp),
@@ -3196,27 +3204,23 @@ private pure func protect_normalized_borrowed_equality_arg(
 
 
 private pure func retain_normalized_borrowed_storage_value(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	value: CoreExpr,
 ) -> CoreExpr:
-	query: BorrowedOwnerRewriteContext = borrowed_query_context(
-		context,
-		BorrowedAggregateOwnerQuery,
-	)
-
-	if not is_managed_type(context.env, core_expr_type(value)):
+	if not is_managed_type(facts.env, core_expr_type(value)):
 		value
 	else:
-		match first_borrowed_owner_aliasing_expr(query, value):
+		match first_borrowed_owner_aliasing_expr(facts, BorrowedAggregateOwnerQuery, state.shadowed_owner_ids, value):
 			Some(owner_id):
-				match borrowed_owner_param(query, owner_id):
+				match borrowed_owner_param(facts, state.shadowed_owner_ids, owner_id):
 					Some(owner):
 						debug:
 							perceus_work_borrowed_aggregate_rewrite_actions()
-							record_borrowed_region_rewrite(context.owners)
+							record_borrowed_region_rewrite(facts.owners)
 
 						retain_known_borrowed_boundary_value(
-							context.env,
+							facts.env,
 							owner,
 							value,
 							None,
@@ -3229,20 +3233,20 @@ private pure func retain_normalized_borrowed_storage_value(
 
 
 private pure func retain_pending_borrowed_call_value(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	value: CoreExpr,
 ) -> Option[CoreExpr]:
-	query: BorrowedOwnerRewriteContext = borrowed_query_context(context, BorrowedCallOwnerQuery)
 	var retained: Option[CoreExpr] = None
 
-	for materialization in context.pending_call_materializations:
+	for materialization in state.pending_call_materializations:
 		if (
-			borrowed_owner_is_active(query, materialization.owner_id)
-			and borrow_expr_aliases_param(context.env, materialization.owner, value)
+			borrowed_owner_is_active(state.shadowed_owner_ids, materialization.owner_id)
+			and borrow_expr_aliases_param(facts.env, materialization.owner, value)
 		):
 			retained = Some(
 				retain_known_borrowed_boundary_value(
-					context.env,
+					facts.env,
 					materialization.owner,
 					value,
 					None,
@@ -3257,37 +3261,37 @@ private pure func retain_pending_borrowed_call_value(
 
 
 private pure func retain_normalized_borrowed_transfer_value(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	value: CoreExpr,
 ) -> CoreExpr:
-	match retain_pending_borrowed_call_value(context, value):
+	match retain_pending_borrowed_call_value(facts, state, value):
 		Some(retained):
 			retained
 		None:
 			match mode.storage_traversal:
 				TraverseBorrowedStorage:
-					retain_normalized_borrowed_storage_value(context, value)
+					retain_normalized_borrowed_storage_value(facts, state, value)
 				TraverseBorrowedCallMaterialization | SkipBorrowedStorage:
 					value
 
 
 private pure func retain_normalized_borrowed_result(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	expr: CoreExpr,
 ) -> CoreExpr:
-	result_context: BorrowedResultRewriteContext = borrowed_result_query_context(context)
-
-	if not is_managed_type(context.env, core_expr_type(expr)):
+	if not is_managed_type(facts.env, core_expr_type(expr)):
 		expr
 	else:
-		match first_borrowed_result_owner_aliasing_expr(result_context, expr):
+		match first_borrowed_result_owner_aliasing_expr(facts, state.shadowed_owner_ids, state.result_satisfied_owner_ids, expr):
 			Some(owner_id):
-				match borrowed_result_owner_param(result_context, owner_id):
+				match borrowed_result_owner_param(facts, state.shadowed_owner_ids, state.result_satisfied_owner_ids, owner_id):
 					Some(owner):
 						debug:
 							perceus_work_borrowed_result_rewrite_actions()
-							record_borrowed_region_rewrite(context.owners)
+							record_borrowed_region_rewrite(facts.owners)
 
 						retained: CoreExpr = match expr:
 							VarExpr(variable, typ, loc):
@@ -3303,41 +3307,44 @@ private pure func retain_normalized_borrowed_result(
 
 
 private pure func normalize_borrowed_child(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	if borrowed_mode_is_empty(mode):
 		expr
 	else:
-		normalize_borrowed_boundaries(context, mode, expr)
+		normalize_borrowed_boundaries(facts, state, mode, expr)
 
 
 private pure func normalize_borrowed_transfer_exprs(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	items: List[CoreExpr],
 ) -> List[CoreExpr]:
 	var normalized: List[CoreExpr] = []
 
 	for item in items:
-		child: CoreExpr = normalize_borrowed_child(context, mode, item)
-		transferred: CoreExpr = retain_normalized_borrowed_transfer_value(context, mode, child)
+		child: CoreExpr = normalize_borrowed_child(facts, state, mode, item)
+		transferred: CoreExpr = retain_normalized_borrowed_transfer_value(facts, state, mode, child)
 		normalized = normalized.append(transferred)
 
 	normalized
 
 
 private pure func normalize_borrowed_record_fields(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	fields: List[CoreRecordFieldValue],
 ) -> List[CoreRecordFieldValue]:
 	var normalized: List[CoreRecordFieldValue] = []
 
 	for field in fields:
-		child: CoreExpr = normalize_borrowed_child(context, mode, field.value)
-		value: CoreExpr = retain_normalized_borrowed_transfer_value(context, mode, child)
+		child: CoreExpr = normalize_borrowed_child(facts, state, mode, field.value)
+		value: CoreExpr = retain_normalized_borrowed_transfer_value(facts, state, mode, child)
 		normalized = normalized.append({
 			name = field.name,
 			value = value,
@@ -3347,7 +3354,8 @@ private pure func normalize_borrowed_record_fields(
 
 
 private pure func normalize_borrowed_cow_fields(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	fields: List[CoreRecordCowField],
 ) -> List[CoreRecordCowField]:
@@ -3356,8 +3364,8 @@ private pure func normalize_borrowed_cow_fields(
 	for field in fields:
 		replacement: Option[CoreExpr] = match field.replacement:
 			Some(value):
-				child: CoreExpr = normalize_borrowed_child(context, mode, value)
-				Some(retain_normalized_borrowed_transfer_value(context, mode, child))
+				child: CoreExpr = normalize_borrowed_child(facts, state, mode, value)
+				Some(retain_normalized_borrowed_transfer_value(facts, state, mode, child))
 			None:
 				None
 
@@ -3367,7 +3375,8 @@ private pure func normalize_borrowed_cow_fields(
 
 
 private pure func normalize_borrowed_boxed_value(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	value: CoreBoxedStorageValue,
 ) -> CoreBoxedStorageValue:
@@ -3376,10 +3385,10 @@ private pure func normalize_borrowed_boxed_value(
 	else:
 		borrowed_child_mode(mode, True, False, False)
 
-	child: CoreExpr = normalize_borrowed_child(context, child_mode, value.value)
+	child: CoreExpr = normalize_borrowed_child(facts, state, child_mode, value.value)
 
 	transferred: CoreExpr = if value.needs_release:
-		retain_normalized_borrowed_transfer_value(context, mode, child)
+		retain_normalized_borrowed_transfer_value(facts, state, mode, child)
 	else:
 		child
 
@@ -3387,20 +3396,22 @@ private pure func normalize_borrowed_boxed_value(
 
 
 private pure func normalize_borrowed_boxed_values(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	values: List[CoreBoxedStorageValue],
 ) -> List[CoreBoxedStorageValue]:
 	var normalized: List[CoreBoxedStorageValue] = []
 
 	for value in values:
-		normalized = normalized.append(normalize_borrowed_boxed_value(context, mode, value))
+		normalized = normalized.append(normalize_borrowed_boxed_value(facts, state, mode, value))
 
 	normalized
 
 
 private pure func normalize_borrowed_dict_entries(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	entries: List[CoreDictEntry],
 ) -> List[CoreDictEntry]:
@@ -3408,15 +3419,16 @@ private pure func normalize_borrowed_dict_entries(
 
 	for entry in entries:
 		normalized = normalized.append({
-			key = normalize_borrowed_boxed_value(context, mode, entry.key),
-			value = normalize_borrowed_boxed_value(context, mode, entry.value),
+			key = normalize_borrowed_boxed_value(facts, state, mode, entry.key),
+			value = normalize_borrowed_boxed_value(facts, state, mode, entry.value),
 		})
 
 	normalized
 
 
 private pure func normalize_borrowed_tuple_elements(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	parent_mode: BorrowedChildMode,
 	construct: CoreTupleConstruct,
 ) -> List[CoreTupleElement]:
@@ -3432,17 +3444,19 @@ private pure func normalize_borrowed_tuple_elements(
 				if retain_bits % 2 == 1:
 					TuplePointerElement(value)
 				else:
-					child: CoreExpr = normalize_borrowed_child(context, storage_only, value)
+					child: CoreExpr = normalize_borrowed_child(facts, state, storage_only, value)
 					transferred: CoreExpr = retain_normalized_borrowed_transfer_value(
-						context,
+						facts,
+						state,
 						storage_only,
 						child,
 					)
 					TuplePointerElement(transferred)
 			TupleStructElement(value, c_type):
-				child: CoreExpr = normalize_borrowed_child(context, storage_only, value)
+				child: CoreExpr = normalize_borrowed_child(facts, state, storage_only, value)
 				transferred: CoreExpr = retain_normalized_borrowed_transfer_value(
-					context,
+					facts,
+					state,
 					storage_only,
 					child,
 				)
@@ -3465,7 +3479,8 @@ private pure func normalize_borrowed_tuple_elements(
 
 
 private pure func normalize_borrowed_list_set(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	parent_mode: BorrowedChildMode,
 	set: CoreListSet,
 ) -> CoreListSet:
@@ -3477,58 +3492,62 @@ private pure func normalize_borrowed_list_set(
 	else:
 		call_only
 
-	child: CoreExpr = normalize_borrowed_child(context, value_mode, set.value.value)
+	child: CoreExpr = normalize_borrowed_child(facts, state, value_mode, set.value.value)
 
 	value: CoreExpr = if set.value.transfers_ownership:
-		retain_normalized_borrowed_transfer_value(context, value_mode, child)
+		retain_normalized_borrowed_transfer_value(facts, state, value_mode, child)
 	else:
 		child
 
 	{ set |
-		list = normalize_borrowed_child(context, call_only, set.list),
-		index = normalize_borrowed_child(context, call_only, set.index),
+		list = normalize_borrowed_child(facts, state, call_only, set.list),
+		index = normalize_borrowed_child(facts, state, call_only, set.index),
 		value = { set.value | value = value }
 	}
 
 
 private pure func normalize_borrowed_literal_case(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	match_case: CoreLiteralMatchCase,
 ) -> CoreLiteralMatchCase:
-	shadowed: BorrowedNormalizationContext = borrowed_normalization_shadowing_bindings(
-		context,
+	shadowed: BorrowedNormalizationState = borrowed_normalization_shadowing_bindings(
+		facts, state,
 		match_case.bindings,
 	)
-	{ match_case | body = normalize_borrowed_child(shadowed, mode, match_case.body) }
+	{ match_case | body = normalize_borrowed_child(facts, shadowed, mode, match_case.body) }
 
 
 private pure func normalize_borrowed_literal_cases(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	cases: List[CoreLiteralMatchCase],
 ) -> List[CoreLiteralMatchCase]:
 	var normalized: List[CoreLiteralMatchCase] = []
 
 	for match_case in cases:
-		normalized = normalized.append(normalize_borrowed_literal_case(context, mode, match_case))
+		normalized = normalized.append(normalize_borrowed_literal_case(facts, state, mode, match_case))
 
 	normalized
 
 
 private pure func normalize_borrowed_literal_fallback(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	fallback: CoreLiteralMatchFallback,
 ) -> CoreLiteralMatchFallback:
 	match fallback:
 		LiteralMatchFallbackBody(body):
-			LiteralMatchFallbackBody(normalize_borrowed_child(context, mode, body))
+			LiteralMatchFallbackBody(normalize_borrowed_child(facts, state, mode, body))
 		LiteralMatchFallbackBindings(bindings, body):
 			LiteralMatchFallbackBindings(
 				bindings,
 				normalize_borrowed_child(
-					borrowed_normalization_shadowing_bindings(context, bindings),
+					facts,
+					borrowed_normalization_shadowing_bindings(facts, state, bindings),
 					mode,
 					body,
 				),
@@ -3538,44 +3557,48 @@ private pure func normalize_borrowed_literal_fallback(
 
 
 private pure func normalize_borrowed_literal_match(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	match_expr: CoreConstructorLiteralMatch,
 ) -> CoreConstructorLiteralMatch:
 	{ match_expr |
-		cases = normalize_borrowed_literal_cases(context, mode, match_expr.cases),
-		fallback = normalize_borrowed_literal_fallback(context, mode, match_expr.fallback)
+		cases = normalize_borrowed_literal_cases(facts, state, mode, match_expr.cases),
+		fallback = normalize_borrowed_literal_fallback(facts, state, mode, match_expr.fallback)
 	}
 
 
 private pure func normalize_borrowed_constructor_body(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	body: CoreConstructorMatchBody,
 ) -> CoreConstructorMatchBody:
 	match body:
 		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(normalize_borrowed_child(context, mode, expr))
+			ConstructorMatchBodyExpr(normalize_borrowed_child(facts, state, mode, expr))
 		ConstructorMatchBodyLiteral(match_expr):
-			ConstructorMatchBodyLiteral(normalize_borrowed_literal_match(context, mode, match_expr))
+			ConstructorMatchBodyLiteral(normalize_borrowed_literal_match(facts, state, mode, match_expr))
 		ConstructorMatchBodyLength(match_expr):
-			ConstructorMatchBodyLength(normalize_borrowed_length_match(context, mode, match_expr))
+			ConstructorMatchBodyLength(normalize_borrowed_length_match(facts, state, mode, match_expr))
 
 
 private pure func normalize_borrowed_length_branch(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	branch: CoreConstructorLengthMatchBranch,
 ) -> CoreConstructorLengthMatchBranch:
-	shadowed: BorrowedNormalizationContext = borrowed_normalization_shadowing_bindings(
-		context,
+	shadowed: BorrowedNormalizationState = borrowed_normalization_shadowing_bindings(
+		facts, state,
 		branch.bindings,
 	)
-	{ branch | body = normalize_borrowed_constructor_body(shadowed, mode, branch.body) }
+	{ branch | body = normalize_borrowed_constructor_body(facts, shadowed, mode, branch.body) }
 
 
 private pure func normalize_borrowed_length_cases(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	cases: List[CoreConstructorLengthMatchCase],
 ) -> List[CoreConstructorLengthMatchCase]:
@@ -3584,7 +3607,7 @@ private pure func normalize_borrowed_length_cases(
 	for match_case in cases:
 		normalized = normalized.append(
 			{ match_case |
-				branch = normalize_borrowed_length_branch(context, mode, match_case.branch)
+				branch = normalize_borrowed_length_branch(facts, state, mode, match_case.branch)
 			},
 		)
 
@@ -3592,7 +3615,8 @@ private pure func normalize_borrowed_length_cases(
 
 
 private pure func normalize_borrowed_length_match(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	match_expr: CoreConstructorLengthMatch,
 ) -> CoreConstructorLengthMatch:
@@ -3600,7 +3624,7 @@ private pure func normalize_borrowed_length_match(
 		Some(branch):
 			Some(
 				{ branch |
-					branch = normalize_borrowed_length_branch(context, mode, branch.branch)
+					branch = normalize_borrowed_length_branch(facts, state, mode, branch.branch)
 				},
 			)
 		None:
@@ -3608,32 +3632,33 @@ private pure func normalize_borrowed_length_match(
 
 	fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
 		Some(branch):
-			Some(normalize_borrowed_length_branch(context, mode, branch))
+			Some(normalize_borrowed_length_branch(facts, state, mode, branch))
 		None:
 			None
 
 	{ match_expr |
-		cases = normalize_borrowed_length_cases(context, mode, match_expr.cases),
+		cases = normalize_borrowed_length_cases(facts, state, mode, match_expr.cases),
 		geq = geq,
 		fallback = fallback
 	}
 
 
 private pure func normalize_borrowed_constructor_cases(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	cases: List[CoreConstructorMatchCase],
 ) -> List[CoreConstructorMatchCase]:
 	var normalized: List[CoreConstructorMatchCase] = []
 
 	for match_case in cases:
-		shadowed: BorrowedNormalizationContext = borrowed_normalization_shadowing_bindings(
-			context,
+		shadowed: BorrowedNormalizationState = borrowed_normalization_shadowing_bindings(
+			facts, state,
 			match_case.bindings,
 		)
 		normalized = normalized.append(
 			{ match_case |
-				body = normalize_borrowed_constructor_body(shadowed, mode, match_case.body)
+				body = normalize_borrowed_constructor_body(facts, shadowed, mode, match_case.body)
 			},
 		)
 
@@ -3641,18 +3666,20 @@ private pure func normalize_borrowed_constructor_cases(
 
 
 private pure func normalize_borrowed_constructor_fallback(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	fallback: CoreConstructorMatchFallback,
 ) -> CoreConstructorMatchFallback:
 	match fallback:
 		ConstructorMatchFallbackBody(body):
-			ConstructorMatchFallbackBody(normalize_borrowed_child(context, mode, body))
+			ConstructorMatchFallbackBody(normalize_borrowed_child(facts, state, mode, body))
 		ConstructorMatchFallbackBindings(bindings, body):
 			ConstructorMatchFallbackBindings(
 				bindings,
 				normalize_borrowed_child(
-					borrowed_normalization_shadowing_bindings(context, bindings),
+					facts,
+					borrowed_normalization_shadowing_bindings(facts, state, bindings),
 					mode,
 					body,
 				),
@@ -3673,13 +3700,14 @@ private @debug_only pure func record_borrowed_fused_reconstructed_node(expr: Cor
 
 
 private pure func normalize_borrowed_boundaries(
-	context: BorrowedNormalizationContext,
+	facts: BorrowedFacts,
+	state: BorrowedNormalizationState,
 	mode: BorrowedChildMode,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	debug:
 		perceus_work_borrowed_fused_node_visits()
-		record_borrowed_region_normalization_visit(context.owners)
+		record_borrowed_region_normalization_visit(facts.owners)
 		record_borrowed_fused_reconstructed_node(expr)
 
 	call_mode: BorrowedChildMode = borrowed_child_mode(mode, True, False, False)
@@ -3688,17 +3716,17 @@ private pure func normalize_borrowed_boundaries(
 
 	normalized: CoreExpr = match expr:
 		CallExpr(kind, callee, args, typ, loc):
-			normalized_callee: CoreExpr = normalize_borrowed_child(context, call_mode, callee)
+			normalized_callee: CoreExpr = normalize_borrowed_child(facts, state, call_mode, callee)
 			CallExpr(
 				kind,
 				normalized_callee,
-				normalize_borrowed_call_args(context, mode, kind, args, typ, loc),
+				normalize_borrowed_call_args(facts, state, mode, kind, args, typ, loc),
 				typ,
 				loc,
 			)
 		BinaryExpr(op, left, right, typ, loc):
-			normalized_left: CoreExpr = normalize_borrowed_child(context, call_mode, left)
-			normalized_right: CoreExpr = normalize_borrowed_child(context, call_mode, right)
+			normalized_left: CoreExpr = normalize_borrowed_child(facts, state, call_mode, left)
+			normalized_right: CoreExpr = normalize_borrowed_child(facts, state, call_mode, right)
 
 			match mode.call_traversal:
 				TraverseBorrowedCalls:
@@ -3706,13 +3734,15 @@ private pure func normalize_borrowed_boundaries(
 						BinaryExpr(
 							op,
 							protect_normalized_borrowed_equality_arg(
-								context,
+								facts,
+								state,
 								normalized_left,
 								0,
 								loc,
 							),
 							protect_normalized_borrowed_equality_arg(
-								context,
+								facts,
+								state,
 								normalized_right,
 								1,
 								loc,
@@ -3727,75 +3757,75 @@ private pure func normalize_borrowed_boundaries(
 		UnaryExpr(op, value, typ, loc):
 			UnaryExpr(
 				op,
-				normalize_borrowed_child(context, call_mode, value),
+				normalize_borrowed_child(facts, state, call_mode, value),
 				typ,
 				loc,
 			)
 		LogicalExpr(op, left, right, typ, loc):
 			LogicalExpr(
 				op,
-				normalize_borrowed_child(context, call_mode, left),
-				normalize_borrowed_child(context, call_mode, right),
+				normalize_borrowed_child(facts, state, call_mode, left),
+				normalize_borrowed_child(facts, state, call_mode, right),
 				typ,
 				loc,
 			)
 		AssignExpr(variable, rhs, typ, loc):
 			AssignExpr(
 				variable,
-				normalize_borrowed_child(context, storage_mode, rhs),
+				normalize_borrowed_child(facts, state, storage_mode, rhs),
 				typ,
 				loc,
 			)
 		CastExpr(value, typ, loc):
 			CastExpr(
-				normalize_borrowed_child(context, call_mode, value),
+				normalize_borrowed_child(facts, state, call_mode, value),
 				typ,
 				loc,
 			)
 		BoxExpr(box, typ, loc):
 			BoxExpr(
-				{ box | value = normalize_borrowed_child(context, call_mode, box.value) },
+				{ box | value = normalize_borrowed_child(facts, state, call_mode, box.value) },
 				typ,
 				loc,
 			)
 		UnboxExpr(kind, value, typ, loc):
 			UnboxExpr(
 				kind,
-				normalize_borrowed_child(context, call_mode, value),
+				normalize_borrowed_child(facts, state, call_mode, value),
 				typ,
 				loc,
 			)
 		FieldExpr(owner, field_name, typ, loc):
 			FieldExpr(
-				normalize_borrowed_child(context, call_mode, owner),
+				normalize_borrowed_child(facts, state, call_mode, owner),
 				field_name,
 				typ,
 				loc,
 			)
 		TupleFieldExpr(owner, field_index, typ, loc):
 			TupleFieldExpr(
-				normalize_borrowed_child(context, call_mode, owner),
+				normalize_borrowed_child(facts, state, call_mode, owner),
 				field_index,
 				typ,
 				loc,
 			)
 		TupleExpr(items, typ, loc):
 			TupleExpr(
-				normalize_borrowed_transfer_exprs(context, storage_mode, items),
+				normalize_borrowed_transfer_exprs(facts, state, storage_mode, items),
 				typ,
 				loc,
 			)
 		TupleConstructExpr(construct, typ, loc):
 			TupleConstructExpr(
 				{ construct |
-					elements = normalize_borrowed_tuple_elements(context, mode, construct)
+					elements = normalize_borrowed_tuple_elements(facts, state, mode, construct)
 				},
 				typ,
 				loc,
 			)
 		VectorExpr(items, typ, loc):
 			VectorExpr(
-				normalize_borrowed_transfer_exprs(context, storage_mode, items),
+				normalize_borrowed_transfer_exprs(facts, state, storage_mode, items),
 				typ,
 				loc,
 			)
@@ -3803,7 +3833,8 @@ private pure func normalize_borrowed_boundaries(
 			ListConstructExpr(
 				{ construct |
 					elements = normalize_borrowed_boxed_values(
-						context,
+						facts,
+						state,
 						storage_mode,
 						construct.elements,
 					)
@@ -3815,7 +3846,8 @@ private pure func normalize_borrowed_boundaries(
 			TensorBoxedLiteralExpr(
 				{ literal |
 					elements = normalize_borrowed_boxed_values(
-						context,
+						facts,
+						state,
 						storage_mode,
 						literal.elements,
 					)
@@ -3827,7 +3859,8 @@ private pure func normalize_borrowed_boundaries(
 			DictConstructExpr(
 				{ construct |
 					entries = normalize_borrowed_dict_entries(
-						context,
+						facts,
+						state,
 						storage_mode,
 						construct.entries,
 					)
@@ -3837,55 +3870,55 @@ private pure func normalize_borrowed_boundaries(
 			)
 		RecordExpr(fields, typ, loc):
 			RecordExpr(
-				normalize_borrowed_record_fields(context, storage_mode, fields),
+				normalize_borrowed_record_fields(facts, state, storage_mode, fields),
 				typ,
 				loc,
 			)
 		RecordUpdateExpr(base, fields, typ, loc):
 			RecordUpdateExpr(
-				normalize_borrowed_child(context, storage_mode, base),
-				normalize_borrowed_record_fields(context, storage_mode, fields),
+				normalize_borrowed_child(facts, state, storage_mode, base),
+				normalize_borrowed_record_fields(facts, state, storage_mode, fields),
 				typ,
 				loc,
 			)
 		RecordReuseExpr(source, fields, typ, loc):
 			RecordReuseExpr(
-				normalize_borrowed_child(context, storage_mode, source),
-				normalize_borrowed_record_fields(context, storage_mode, fields),
+				normalize_borrowed_child(facts, state, storage_mode, source),
+				normalize_borrowed_record_fields(facts, state, storage_mode, fields),
 				typ,
 				loc,
 			)
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			RecordCowUpdateExpr(
-				normalize_borrowed_child(context, storage_mode, source),
-				normalize_borrowed_cow_fields(context, storage_mode, fields),
+				normalize_borrowed_child(facts, state, storage_mode, source),
+				normalize_borrowed_cow_fields(facts, state, storage_mode, fields),
 				typ,
 				loc,
 			)
 		RecordConstructExpr(type_name, fields, typ, loc):
 			RecordConstructExpr(
 				type_name,
-				normalize_borrowed_record_fields(context, storage_mode, fields),
+				normalize_borrowed_record_fields(facts, state, storage_mode, fields),
 				typ,
 				loc,
 			)
 		UnionConstructExpr(construct, typ, loc):
 			UnionConstructExpr(
 				{ construct |
-					args = normalize_borrowed_boxed_values(context, storage_mode, construct.args)
+					args = normalize_borrowed_boxed_values(facts, state, storage_mode, construct.args)
 				},
 				typ,
 				loc,
 			)
 		ListHandoffSetOwnedExpr(set, typ, loc):
 			ListHandoffSetOwnedExpr(
-				normalize_borrowed_list_set(context, mode, set),
+				normalize_borrowed_list_set(facts, state, mode, set),
 				typ,
 				loc,
 			)
 		ListSetExpr(set, typ, loc):
 			ListSetExpr(
-				normalize_borrowed_list_set(context, mode, set),
+				normalize_borrowed_list_set(facts, state, mode, set),
 				typ,
 				loc,
 			)
@@ -3894,9 +3927,10 @@ private pure func normalize_borrowed_boundaries(
 				variable,
 				is_mutable,
 				typ,
-				normalize_borrowed_child(context, storage_mode, rhs),
+				normalize_borrowed_child(facts, state, storage_mode, rhs),
 				normalize_borrowed_child(
-					borrowed_normalization_shadowing_var(context, variable),
+					facts,
+					borrowed_normalization_shadowing_var(facts, state, variable),
 					result_mode,
 					body,
 				),
@@ -3905,59 +3939,60 @@ private pure func normalize_borrowed_boundaries(
 			BorrowLetExpr(
 				variable,
 				typ,
-				normalize_borrowed_child(context, storage_mode, rhs),
+				normalize_borrowed_child(facts, state, storage_mode, rhs),
 				normalize_borrowed_child(
-					borrowed_normalization_shadowing_var(context, variable),
+					facts,
+					borrowed_normalization_shadowing_var(facts, state, variable),
 					result_mode,
 					body,
 				),
 			)
 		SeqExpr(first, second):
 			SeqExpr(
-				normalize_borrowed_child(context, storage_mode, first),
-				normalize_borrowed_child(context, result_mode, second),
+				normalize_borrowed_child(facts, state, storage_mode, first),
+				normalize_borrowed_child(facts, state, result_mode, second),
 			)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			IfExpr(
-				normalize_borrowed_child(context, storage_mode, cond),
-				normalize_borrowed_child(context, result_mode, then_expr),
-				normalize_borrowed_child(context, result_mode, else_expr),
+				normalize_borrowed_child(facts, state, storage_mode, cond),
+				normalize_borrowed_child(facts, state, result_mode, then_expr),
+				normalize_borrowed_child(facts, state, result_mode, else_expr),
 				typ,
 				loc,
 			)
 		WhileExpr(cond, body, typ, loc):
 			WhileExpr(
-				normalize_borrowed_child(context, storage_mode, cond),
-				normalize_borrowed_child(context, storage_mode, body),
+				normalize_borrowed_child(facts, state, storage_mode, cond),
+				normalize_borrowed_child(facts, state, storage_mode, body),
 				typ,
 				loc,
 			)
 		ResourceScopeExpr(scope, typ, loc):
-			shadowed: BorrowedNormalizationContext = borrowed_normalization_shadowing_var(
-				context,
+			shadowed: BorrowedNormalizationState = borrowed_normalization_shadowing_var(
+				facts, state,
 				scope.variable,
 			)
 			ResourceScopeExpr(
 				{ scope |
-					acquire = normalize_borrowed_child(context, storage_mode, scope.acquire),
-					body = normalize_borrowed_child(shadowed, result_mode, scope.body),
-					cleanup = normalize_borrowed_child(shadowed, storage_mode, scope.cleanup)
+					acquire = normalize_borrowed_child(facts, state, storage_mode, scope.acquire),
+					body = normalize_borrowed_child(facts, shadowed, result_mode, scope.body),
+					cleanup = normalize_borrowed_child(facts, shadowed, storage_mode, scope.cleanup)
 				},
 				typ,
 				loc,
 			)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			body_context: BorrowedNormalizationContext = match mode.result_position:
+			body_state: BorrowedNormalizationState = match mode.result_position:
 				BorrowedResultPosition:
-					borrowed_normalization_satisfying_var(context, variable)
+					borrowed_normalization_satisfying_var(facts, state, variable)
 				OrdinaryBorrowedPosition:
-					context
+					state
 
 			DupExpr(
 				variable,
 				value_type,
 				retain_policy,
-				normalize_borrowed_child(body_context, result_mode, body),
+				normalize_borrowed_child(facts, body_state, result_mode, body),
 				typ,
 				loc,
 			)
@@ -3966,17 +4001,18 @@ private pure func normalize_borrowed_boundaries(
 				variable,
 				value_type,
 				release_policy,
-				normalize_borrowed_child(context, result_mode, body),
+				normalize_borrowed_child(facts, state, result_mode, body),
 				typ,
 				loc,
 			)
 		ForRangeExpr(binder, start, end_value, body, typ, loc):
 			ForRangeExpr(
 				binder,
-				normalize_borrowed_child(context, call_mode, start),
-				normalize_borrowed_child(context, call_mode, end_value),
+				normalize_borrowed_child(facts, state, call_mode, start),
+				normalize_borrowed_child(facts, state, call_mode, end_value),
 				normalize_borrowed_child(
-					borrowed_normalization_shadowing_var(context, binder.variable),
+					facts,
+					borrowed_normalization_shadowing_var(facts, state, binder.variable),
 					call_mode,
 					body,
 				),
@@ -3986,9 +4022,10 @@ private pure func normalize_borrowed_boundaries(
 		ForChannelExpr(loop, typ, loc):
 			ForChannelExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -3999,9 +4036,10 @@ private pure func normalize_borrowed_boundaries(
 		ForListExpr(loop, typ, loc):
 			ForListExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -4012,9 +4050,10 @@ private pure func normalize_borrowed_boundaries(
 		ForStringExpr(loop, typ, loc):
 			ForStringExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -4025,9 +4064,10 @@ private pure func normalize_borrowed_boundaries(
 		ForDictExpr(loop, typ, loc):
 			ForDictExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -4038,9 +4078,10 @@ private pure func normalize_borrowed_boundaries(
 		ForSetExpr(loop, typ, loc):
 			ForSetExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -4051,9 +4092,10 @@ private pure func normalize_borrowed_boundaries(
 		ForStreamExpr(loop, typ, loc):
 			ForStreamExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -4064,9 +4106,10 @@ private pure func normalize_borrowed_boundaries(
 		ForResourceSourceExpr(loop, typ, loc):
 			ForResourceSourceExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -4077,9 +4120,10 @@ private pure func normalize_borrowed_boundaries(
 		ForTensorExpr(loop, typ, loc):
 			ForTensorExpr(
 				{ loop |
-					iterable = normalize_borrowed_child(context, call_mode, loop.iterable),
+					iterable = normalize_borrowed_child(facts, state, call_mode, loop.iterable),
 					body = normalize_borrowed_child(
-						borrowed_normalization_shadowing_var(context, loop.binder.variable),
+						facts,
+						borrowed_normalization_shadowing_var(facts, state, loop.binder.variable),
 						call_mode,
 						loop.body,
 					)
@@ -4089,34 +4133,34 @@ private pure func normalize_borrowed_boundaries(
 			)
 		LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
 			LiteralMatchExpr(
-				normalize_borrowed_child(context, storage_mode, scrutinee),
-				normalize_borrowed_literal_cases(context, result_mode, cases),
-				normalize_borrowed_literal_fallback(context, result_mode, fallback),
+				normalize_borrowed_child(facts, state, storage_mode, scrutinee),
+				normalize_borrowed_literal_cases(facts, state, result_mode, cases),
+				normalize_borrowed_literal_fallback(facts, state, result_mode, fallback),
 				typ,
 				loc,
 			)
 		AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			AccessorLiteralMatchExpr(
-				normalize_borrowed_child(context, storage_mode, scrutinee),
+				normalize_borrowed_child(facts, state, storage_mode, scrutinee),
 				release_policy,
-				normalize_borrowed_literal_match(context, result_mode, match_expr),
+				normalize_borrowed_literal_match(facts, state, result_mode, match_expr),
 				typ,
 				loc,
 			)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			LengthMatchExpr(
-				normalize_borrowed_child(context, storage_mode, scrutinee),
+				normalize_borrowed_child(facts, state, storage_mode, scrutinee),
 				release_policy,
-				normalize_borrowed_length_match(context, result_mode, match_expr),
+				normalize_borrowed_length_match(facts, state, result_mode, match_expr),
 				typ,
 				loc,
 			)
 		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
 			ConstructorMatchExpr(
-				normalize_borrowed_child(context, storage_mode, scrutinee),
+				normalize_borrowed_child(facts, state, storage_mode, scrutinee),
 				release_policy,
-				normalize_borrowed_constructor_cases(context, result_mode, cases),
-				normalize_borrowed_constructor_fallback(context, result_mode, fallback),
+				normalize_borrowed_constructor_cases(facts, state, result_mode, cases),
+				normalize_borrowed_constructor_fallback(facts, state, result_mode, fallback),
 				typ,
 				loc,
 			)
@@ -4127,7 +4171,7 @@ private pure func normalize_borrowed_boundaries(
 		BorrowedResultPosition:
 			match normalized:
 				VarExpr(_, _, _) | FieldExpr(_, _, _, _) | TupleFieldExpr(_, _, _, _) | CallExpr(_, _, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _):
-					retain_normalized_borrowed_result(context, normalized)
+					retain_normalized_borrowed_result(facts, state, normalized)
 				_:
 					normalized
 		OrdinaryBorrowedPosition:
@@ -4157,9 +4201,8 @@ private pure func normalize_borrowed_owner_catalog(
 		OrdinaryBorrowedPosition
 
 	normalize_borrowed_boundaries(
+		{ env = env, owners = owners },
 		{
-			env = env,
-			owners = owners,
 			shadowed_owner_ids = {},
 			result_satisfied_owner_ids = {},
 			pending_call_materializations = []
