@@ -70,6 +70,21 @@ def request_json(action: str = "typecheck_graph") -> dict[str, object]:
     }
 
 
+FAKE_RSS_BYTES = 4 * 1024 * 1024
+
+
+def fake_rss_probe_source(sample_log: Path) -> str:
+    """A replay RSS probe that reports a fixed RSS and logs every sample."""
+    return textwrap.dedent(
+        f"""\
+        #!/usr/bin/env python3
+        with open({str(sample_log)!r}, "a", encoding="utf-8") as log:
+            log.write("sample\\n")
+        print({FAKE_RSS_BYTES})
+        """
+    )
+
+
 def fake_bridge_source() -> str:
     return textwrap.dedent(
         """\
@@ -85,6 +100,28 @@ def fake_bridge_source() -> str:
         forced_exit = int(os.environ.get("BLORP_FAKE_TYPECHECK_EXIT", "0"))
         if forced_exit:
             os._exit(forced_exit)
+        sample_log = os.environ.get("BLORP_FAKE_RSS_SAMPLE_LOG")
+
+        def sample_count():
+            try:
+                with open(sample_log, encoding="utf-8") as log:
+                    return sum(1 for _line in log)
+            except FileNotFoundError:
+                return 0
+
+        def hold_window_until_sampled():
+            # The replay worker reads markers, then samples. The first sample
+            # counted after this marker may have read markers before it was
+            # written; the second belongs to a later poll that has seen it.
+            if not sample_log:
+                return
+            target = sample_count() + 2
+            deadline = time.monotonic() + 60
+            while sample_count() < target:
+                if time.monotonic() >= deadline:
+                    os._exit(98)
+                time.sleep(0.005)
+
         allocation_mb = int(os.environ.get("BLORP_FAKE_TYPECHECK_ALLOCATE_MB", "0"))
         if allocation_mb:
             allocation = bytearray(allocation_mb * 1024 * 1024)
@@ -126,6 +163,7 @@ def fake_bridge_source() -> str:
                 file=sys.stderr,
                 flush=True,
             )
+            hold_window_until_sampled()
             time.sleep(0.04)
             print(json.dumps({
                 "schema": 1,
@@ -152,6 +190,7 @@ def fake_bridge_source() -> str:
                 file=sys.stderr,
                 flush=True,
             )
+            hold_window_until_sampled()
             if inventory_enabled:
                 print(
                     f"[typecheck-inventory] kind=artifact module={item['module_path']} "
@@ -236,8 +275,22 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
             request_path.write_bytes(request_bytes)
             bridge_path.write_text(bridge_source, encoding="utf-8")
             bridge_path.chmod(0o755)
+            sample_log = temp_dir / "rss-samples"
+            probe_path = temp_dir / "rss-probe"
+            probe_path.write_text(
+                fake_rss_probe_source(sample_log),
+                encoding="utf-8",
+            )
+            probe_path.chmod(0o755)
+            environment = dict(os.environ)
+            environment["BLORP_TYPECHECK_REPLAY_RSS_PROBE"] = str(probe_path)
+            environment["BLORP_FAKE_RSS_SAMPLE_LOG"] = str(sample_log)
 
-            completed = self.run_replay(request_path, bridge_path)
+            completed = self.run_replay(
+                request_path,
+                bridge_path,
+                env=environment,
+            )
             result = json.loads(completed.stdout)
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -256,10 +309,14 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
         self.assertIn("typecheck_start", result["phase_sampled_peak_rss_bytes"])
         self.assertIn("dep", result["module_sampled_peak_rss_bytes"])
         self.assertIn("main", result["module_sampled_peak_rss_bytes"])
-        self.assertGreater(
-            result["module_phase_sampled_peak_rss_bytes"]["main"]["typecheck_start"],
-            0,
-        )
+        for module in ("dep", "main"):
+            self.assertEqual(
+                result["module_phase_sampled_peak_rss_bytes"][module],
+                {
+                    "typecheck_start": FAKE_RSS_BYTES,
+                    "typed_artifact_scope_complete": FAKE_RSS_BYTES,
+                },
+            )
         self.assertEqual(
             result["rss_phase_attribution"],
             "latest marker observed before each RSS sample",
