@@ -9,7 +9,7 @@ import:
 		CoreEarlyInvariantViolation,
 		core_early_invariant_hint,
 		core_early_invariant_message,
-	ir: CoreProgram, core_program_to_json
+	ir: CoreProgram, core_program_max_declared_definition_id, core_program_to_json
 	mono_specialize: CoreMonoDiagnostic, core_mono_diagnostic_hint, core_mono_diagnostic_message
 	synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
 	system: now_microseconds
@@ -106,6 +106,27 @@ record CorePassTiming {
 	name: String,
 	microseconds: Int
 }
+
+
+-- Debug-only frontier check: a pass that mints a declaration without
+-- advancing `next_def_id` (or advances it without actually using the id it
+-- reserved) leaves a definition whose id is not below the frontier the next
+-- pass believes it owns. Gated by `check_invariants` since it walks every
+-- declaration in the program once per pass.
+private pure func core_pass_state_frontier_violation(
+	pass_name: String,
+	state: CorePassState,
+) -> Option[CorePassDiagnostic]:
+	observed_max: Int = core_program_max_declared_definition_id(state.program)
+
+	if observed_max >= state.next_def_id:
+		Some(
+			CorePassMessage(
+				"pass `${pass_name}` left a declared definition id ${observed_max.to_string()} at or past its own next_def_id ${state.next_def_id.to_string()}",
+			),
+		)
+	else:
+		None
 
 
 union CorePassRun:
@@ -209,7 +230,11 @@ func run_core_passes(
 							Some(diagnostic)
 						None:
 							if control.check_invariants:
-								run_pass_invariant(pass.checked_invariant, current.program)
+								match run_pass_invariant(pass.checked_invariant, current.program):
+									Some(diagnostic):
+										Some(diagnostic)
+									None:
+										core_pass_state_frontier_violation(pass.name, current)
 							else:
 								None
 

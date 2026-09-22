@@ -21,6 +21,7 @@ import:
 		CorePassDiagnostic(CorePassMessage),
 		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
 		CorePassState,
+		core_pass,
 		core_pass_matches,
 		core_pass_state,
 		core_program_pass,
@@ -169,8 +170,26 @@ private pure func checked_late_core_pass(
 	{ core_program_pass(name, run) | checked_invariant = Some(walk) }
 
 
-pure func run_adapt_function_refs_pass(program: CoreProgram) -> CoreProgram:
-	CoreClosure.adapt_function_refs_program(program)
+-- Same as `checked_late_core_pass`, for a pass that mints declarations and so
+-- must read and advance `CorePassState.next_def_id` instead of only
+-- rewriting `state.program`.
+private pure func checked_stateful_late_core_pass(
+	name: String,
+	run: pure (CorePassState) -> Result[CorePassState, CorePassDiagnostic],
+	stage: CorePipelineStage,
+) -> CorePass:
+	walk: pure (CoreProgram) -> Option[CorePassDiagnostic] = func(program):
+		late_core_invariant(stage, program)
+
+	{ core_pass(name, run) | checked_invariant = Some(walk) }
+
+
+pure func run_adapt_function_refs_pass(state: CorePassState) -> Result[CorePassState, CorePassDiagnostic]:
+	adapted: CoreClosure.ClosurePassResult = CoreClosure.adapt_function_refs_program(
+		state.program,
+		state.next_def_id,
+	)
+	Ok(core_pass_state(adapted.program, adapted.next_def_id))
 
 
 pure func run_tensor_specialize_pass(program: CoreProgram) -> CoreProgram:
@@ -197,8 +216,14 @@ pure func run_dce_pass(program: CoreProgram) -> CoreProgram:
 	CoreDce.prune_program(program)
 
 
-pure func run_consume_specialize_pass(program: CoreProgram) -> CoreProgram:
-	CoreConsumeSpecialize.rewrite_program(program)
+pure func run_consume_specialize_pass(
+	state: CorePassState,
+) -> Result[CorePassState, CorePassDiagnostic]:
+	rewritten: CoreConsumeSpecialize.ConsumeSpecializeResult = CoreConsumeSpecialize.rewrite_program(
+		state.program,
+		state.next_def_id,
+	)
+	Ok(core_pass_state(rewritten.program, rewritten.next_def_id))
 
 
 pure func run_static_string_literals_pass(program: CoreProgram) -> CoreProgram:
@@ -221,8 +246,12 @@ pure func run_reuse_pass(program: CoreProgram) -> CoreProgram:
 	CoreReuse.rewrite_post_perceus_program(program)
 
 
-pure func run_closure_pass(program: CoreProgram) -> CoreProgram:
-	CoreClosure.convert_program(program)
+pure func run_closure_pass(state: CorePassState) -> Result[CorePassState, CorePassDiagnostic]:
+	converted: CoreClosure.ClosurePassResult = CoreClosure.convert_program(
+		state.program,
+		state.next_def_id,
+	)
+	Ok(core_pass_state(converted.program, converted.next_def_id))
 
 
 pure func run_resource_management_pass(program: CoreProgram) -> CoreProgram:
@@ -261,14 +290,14 @@ private pure func final_late_core_pass() -> CorePass:
 -- must not reintroduce unboxed erased-runtime arguments.
 pure func late_core_passes() -> List[CorePass]:
 	[
-		core_program_pass(ADAPT_FUNCTION_REFS_PASS, run_adapt_function_refs_pass),
+		core_pass(ADAPT_FUNCTION_REFS_PASS, run_adapt_function_refs_pass),
 		core_program_pass(TENSOR_SPECIALIZE_PASS, run_tensor_specialize_pass),
 		checked_late_core_pass(SPECIALIZE_PASS, run_specialize_pass, SpecializeStage),
 		core_program_pass(RESOLVE_CALLABLES_PASS, run_resolve_callables_pass),
 		core_program_pass(BACKEND_PROJECTION_PASS, run_backend_projection_pass),
 		core_program_pass(MATCH_PROJECTION_PASS, run_match_projection_pass),
 		checked_late_core_pass(DCE_PASS, run_dce_pass, DceStage),
-		checked_late_core_pass(
+		checked_stateful_late_core_pass(
 			CONSUME_SPECIALIZE_PASS,
 			run_consume_specialize_pass,
 			ConsumeSpecializeStage,
@@ -282,7 +311,7 @@ pure func late_core_passes() -> List[CorePass]:
 		core_program_pass(DICT_LITERAL_OWNERSHIP_PASS, run_dict_literal_ownership_pass),
 		checked_late_core_pass(PERCEUS_PASS, run_perceus_pass, PerceusStage),
 		checked_late_core_pass(REUSE_PASS, run_reuse_pass, ReuseStage),
-		checked_late_core_pass(CLOSURE_PASS, run_closure_pass, ClosureStage),
+		checked_stateful_late_core_pass(CLOSURE_PASS, run_closure_pass, ClosureStage),
 		core_program_pass(RESOURCE_MANAGEMENT_PASS, run_resource_management_pass),
 		core_program_pass(FAIRNESS_PASS, run_fairness_pass),
 		core_program_pass(PREPARE_PASS, run_prepare_pass),

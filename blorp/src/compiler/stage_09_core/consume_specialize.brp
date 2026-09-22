@@ -87,7 +87,6 @@ import:
 		CoreUnionVariant,
 		CoreVar,
 		core_expr_type,
-		core_program_max_declared_definition_id,
 		core_var_equal,
 	traverse as CoreTraverse
 
@@ -378,13 +377,16 @@ private pure func finish_function_clone_candidates(
 		}
 
 
-private pure func discover_clone_candidates(program: CoreProgram) -> CloneCandidateDiscoveryState:
+private pure func discover_clone_candidates(
+	program: CoreProgram,
+	next_def_id: Int,
+) -> CloneCandidateDiscoveryState:
 	unions: List[CoreUnionDecl] = collect_unions(program)
 	empty_candidates: CloneCandidateCatalog = empty_clone_candidate_catalog()
 	empty_used_keys: UsedCloneKeyIndex = empty_used_clone_key_index()
 	var discovery: CloneCandidateDiscoveryState = {
 		unions = unions,
-		next_def_id = core_program_max_declared_definition_id(program) + 1,
+		next_def_id = next_def_id,
 		candidates = empty_candidates,
 		analysis_state = {
 			unions = unions,
@@ -1847,11 +1849,21 @@ private pure func insert_clones_after_functions(
 	result
 
 
-pure func rewrite_program(program: CoreProgram) -> CoreProgram:
-	discovery: CloneCandidateDiscoveryState = discover_clone_candidates(program)
+-- Carries the advanced definition-id frontier back out: clone discovery
+-- mints one def_id per accepted candidate, so the pass runner's
+-- `CorePassState.next_def_id` must learn about them instead of the next
+-- pass rescanning the program to find them.
+record ConsumeSpecializeResult {
+	program: CoreProgram,
+	next_def_id: Int
+}
+
+
+pure func rewrite_program(program: CoreProgram, next_def_id: Int) -> ConsumeSpecializeResult:
+	discovery: CloneCandidateDiscoveryState = discover_clone_candidates(program, next_def_id)
 
 	if clone_candidate_catalog_is_empty(discovery.candidates):
-		program
+		{ program = program, next_def_id = discovery.next_def_id }
 	else:
 		var state: ConsumeSpecializeState = state_from_discovery(discovery)
 		var rewritten_decls: List[CoreDecl] = []
@@ -1862,6 +1874,9 @@ pure func rewrite_program(program: CoreProgram) -> CoreProgram:
 			rewritten_decls = rewritten_decls.append(rewritten_decl)
 
 		{
-			decls = insert_clones_after_functions(state, program.decls, rewritten_decls),
-			foreign_includes = program.foreign_includes
+			program = {
+				decls = insert_clones_after_functions(state, program.decls, rewritten_decls),
+				foreign_includes = program.foreign_includes
+			},
+			next_def_id = discovery.next_def_id
 		}
