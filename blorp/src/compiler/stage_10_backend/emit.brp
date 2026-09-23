@@ -48,6 +48,7 @@ import:
 		cancellation_let_protection,
 		cancellation_match_scrutinee_protection,
 		cancellation_plan_requires_local_owner_protection,
+		cancellation_variable_push_is_recorded,
 		cancellation_variable_requires_protection,
 	../stage_09_core/ir:
 		CoreAccessor(
@@ -1004,7 +1005,8 @@ private record FunctionEmissionContext {
 	cleanup_plan: CancellationProtectionPlan,
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
-	indent: String
+	indent: String,
+	parameter_variables: List[CoreVar]
 }
 
 
@@ -1138,16 +1140,22 @@ region-sensitive cancellation plan applied and build it at print time; that
 decision and the plan itself are now a fact recorded once before emission,
 so this reads a row instead.
 ---
+private pure func function_parameter_variables(func_info: CoreFunction) -> List[CoreVar]:
+	func_info.params.map(func(param: CoreParam) -> CoreVar: param.name)
+
+
 private pure func emission_context_from_plan(
 	plan: CancellationProtectionPlan,
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
+	parameter_variables: List[CoreVar],
 ) -> FunctionEmissionContext:
 	{
 		cleanup_plan = plan,
 		profile_function_id = profile_function_id,
 		symbol_authority = symbol_authority,
-		indent = BASE_INDENT
+		indent = BASE_INDENT,
+		parameter_variables = parameter_variables
 	}
 
 
@@ -1159,7 +1167,8 @@ private pure func diagnostic_emission_context(expr: CoreExpr) -> FunctionEmissio
 			}), expr),
 		profile_function_id = None,
 		symbol_authority = UnprojectedCEmissionSymbolsForTests,
-		indent = BASE_INDENT
+		indent = BASE_INDENT,
+		parameter_variables = []
 	}
 
 
@@ -12140,6 +12149,7 @@ private pure func emit_closure_body_function(
 				plan,
 				None,
 				symbol_authority,
+				function_parameter_variables(func_info),
 			)
 			param_decls ?= closure_param_decls(abi.params)
 			env_prelude ?= closure_env_prelude(abi, emission_context)
@@ -12774,14 +12784,39 @@ private pure func apply_let_cleanup_to_body(
 		}
 
 
+-- A function parameter is never wrapped in a `LetExpr` or match-arm binding
+-- of its own, so it never appears in the plan's identity-keyed protection
+-- indexes even when an earlier pass (outside this planner's view) already
+-- arranged for the parameter itself to be protected. Only the parameter case
+-- is excluded here: any other unmatched identity is either a `let`/match
+-- binding this same plan already walked (and would have indexed) or a
+-- temporary invented solely to hold this `DupExpr`'s own wrapped
+-- subexpression, used nowhere else in the function, which nothing could have
+-- pushed.
+private pure func variable_is_function_parameter(
+	emission_context: FunctionEmissionContext,
+	variable: CoreVar,
+) -> Bool:
+	emission_context.parameter_variables.any(func(param: CoreVar) -> Bool: core_var_equal(param, variable))
+
+
 private pure func emit_dup_statement(
 	variable: CoreVar,
 	retain_policy: CoreRetainPolicy,
 	emission_context: FunctionEmissionContext,
 ) -> String:
-	duplicate_cleanup: String = if cancellation_variable_requires_protection(
-		emission_context.cleanup_plan,
-		variable,
+	duplicate_cleanup: String = if (
+		cancellation_variable_requires_protection(
+			emission_context.cleanup_plan,
+			variable,
+		)
+		and (
+			cancellation_variable_push_is_recorded(
+				emission_context.cleanup_plan,
+				variable,
+			)
+			or variable_is_function_parameter(emission_context, variable)
+		)
 	):
 		"\n" + emission_context.indent + "blorp_task_cleanup_duplicate_slot_with_task(&" + c_var_name(
 			variable,
@@ -22103,6 +22138,7 @@ private pure func emit_supported_user_function(
 				plan,
 				profile_function_id,
 				symbol_authority,
+				function_parameter_variables(func_info),
 			)
 
 			if profile_function_id.is_some():
@@ -24334,6 +24370,7 @@ private pure func emit_global_runtime_init_body(
 		plan,
 		None,
 		symbol_authority,
+		[],
 	)
 	init_body ?= emit_function_body(global.init, next_temp, emission_context)
 

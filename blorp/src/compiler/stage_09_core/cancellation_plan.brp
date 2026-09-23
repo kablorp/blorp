@@ -1352,6 +1352,58 @@ pure func cancellation_variable_requires_protection(
 				True
 
 
+-- Whether the plan's own bookkeeping proves a push_with_task will be emitted
+-- somewhere in this function for this exact variable identity (id and
+-- def_id), via either the let-binding protection index or the
+-- match-scrutinee protection index -- the two places the planner records a
+-- push registration keyed by CoreVar identity. Unlike
+-- `cancellation_variable_requires_protection`, an unmatched identity returns
+-- False here, not the conservative True: a Core-level `DupExpr.dup_var` can
+-- only ever be (a) a variable some LetExpr or match arm in this same function
+-- binds, in which case one of these two indexes has it, or (b) a variable
+-- invented solely to hold this DupExpr's own wrapped subexpression, used
+-- nowhere else in the tree, which by construction nothing can have pushed.
+-- Backend-invented rendering temporaries (borrowed call arguments, `__cdrop_`
+-- results) are pushed and popped within one bracket keyed by a positional
+-- temporary index, never by a Core-level CoreVar the planner can see, so they
+-- cannot be the target of a genuine `DupExpr` and this check does not need to
+-- consult them.
+pure func cancellation_variable_push_is_recorded(
+	plan: CancellationProtectionPlan,
+	variable: CoreVar,
+) -> Bool:
+	if not cancellation_plan_requires_local_owner_protection(plan):
+		False
+	else:
+		let_tracked: Bool = match cancellation_let_protection(plan, variable):
+			Some(protection):
+				protection.tracks_cleanup
+			None:
+				False
+
+		if let_tracked:
+			True
+		else:
+			match plan.match_scrutinee_protections_by_id:
+				Some(index):
+					candidates: List[CancellationMatchScrutineeProtection] = index.get_or(
+						variable.id,
+						[],
+					)
+					var found: Bool = False
+
+					for candidate in candidates:
+						if (
+							core_var_equal(candidate.scrutinee, variable)
+							and candidate.protection.tracks_cleanup
+						):
+							found = True
+
+					found
+				None:
+					False
+
+
 pure func cancellation_match_scrutinee_protection(
 	plan: CancellationProtectionPlan,
 	scrutinee: CoreVar,
