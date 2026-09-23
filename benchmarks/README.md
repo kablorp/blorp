@@ -1276,7 +1276,13 @@ For compile-execution memory profiles, set
 `typed_frontend_complete`, `core_lowering_input_ready`,
 `core_lowering_complete`, `early_core_complete`,
 `runtime_projection_complete`, `late_core_complete`,
-`backend_emission_complete`, and `artifact_construction_complete`. If a
+`backend_emission_complete`, and `artifact_construction_complete`. Also emitted, between the last late-Core pass's own `pass_<name>_complete`
+row and `late_core_complete`: `cleanup_plan_complete` and
+`cancellation_plan_complete`, for the per-type cleanup plan and the
+per-function/global cancellation plan that
+`prepared_core_program_with_checkpoints` (`stage_09_core/pipeline.brp`) builds
+after the last late-Core pass, so their allocations attribute to a named row
+instead of the coarser `late_core_complete` phase total. If a
 compilation fails or stops, the final checkpoint uses the active phase label
 with `_failed` or `_stopped`, such as `typed_frontend_failed` or
 `late_core_stopped`. If final artifact publication fails after compiler
