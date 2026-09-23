@@ -149,7 +149,10 @@ record CoreResolveModuleImports {
 }
 
 
-private record CoreCallableIdentity {
+-- Exported (not `private`) so the resolve_callables/backend_projection/
+-- match_projection fused walk (`match_projection.project_fused_late_core`)
+-- can build one callables list once and thread it through the shared walk.
+record CoreCallableIdentity {
 	name: String,
 	def_id: Int,
 	constructor_type_name: Option[String]
@@ -1425,6 +1428,30 @@ private pure func resolved_user_callee(callee: CoreExpr, kind: CoreCallKind) -> 
 					)
 		_:
 			callee
+
+
+-- Fused-walk entry point: the per-node resolve step alone, on a node whose
+-- children the shared bottom-up walk has already fully processed (resolve,
+-- then backend projection, then match projection). `resolved_callable_kind`
+-- only reads `kind`/`callee`/`typ`, all already correct on this node by the
+-- time the walk reaches it, so applying just this step here reproduces what
+-- `resolve_callable_id_call_expr`'s own recursion would have done -- the
+-- fused walk supplies the recursion instead of this function recursing
+-- itself. `resolve_callable_id_calls` keeps its own full recursive walk
+-- unchanged below for `--dump-core-after=resolve_callables`.
+pure func resolve_current_expr(callables: List[CoreCallableIdentity], expr: CoreExpr) -> CoreExpr:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			resolved_kind: CoreCallKind = resolved_callable_kind(callables, kind, callee, typ)
+			CallExpr(
+				resolved_kind,
+				resolved_user_callee(callee, resolved_kind),
+				args,
+				typ,
+				loc,
+			)
+		_:
+			expr
 
 
 private pure func active_import(
@@ -3084,7 +3111,10 @@ private pure func resolve_callable_id_expr(
 		LogicalExpr(_, _, _, _, _):
 			resolve_callable_id_logical_expr(callables, expr)
 		_:
-			map_core_expr_children(expr, pure func(child): resolve_callable_id_expr(callables, child))
+			map_core_expr_children(
+				expr,
+				pure func(child): resolve_callable_id_expr(callables, child),
+			)
 
 
 private pure func resolve_callable_id_logical_expr(
@@ -3171,7 +3201,11 @@ private pure func resolve_callable_id_logical_expr(
 		expr
 
 
-private pure func program_callables(program: CoreProgram) -> List[CoreCallableIdentity]:
+-- Exported so the fused resolve/backend/match walk can build the callables
+-- list once from the pre-fusion program and thread it through the shared
+-- walk (`resolve_current_expr` below), instead of `resolve_callable_id_calls`
+-- rebuilding it inside its own separate whole-tree pass.
+pure func program_callables(program: CoreProgram) -> List[CoreCallableIdentity]:
 	var callables: List[CoreCallableIdentity] = []
 
 	for decl in program.decls:

@@ -1,4 +1,8 @@
 import:
+	../../../src/compiler/stage_09_core/backend_projection:
+		BackendProjectionContext,
+		build_backend_projection_context,
+		project_backend_calls,
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(
@@ -11,7 +15,7 @@ import:
 			TupleFieldAccessor,
 			VariantFieldAccessor,
 		),
-		CoreCallKind(BuiltinCall),
+		CoreCallKind(BuiltinCall, IntrinsicCall, UnknownCall),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr, ConstructorMatchBodyLiteral),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
 		CoreConstructorMatchTest(
@@ -34,6 +38,7 @@ import:
 			LiteralExpr,
 			LiteralMatchExpr,
 			SemanticMatchExpr,
+			SeqExpr,
 			VarExpr,
 			VoidExpr,
 		),
@@ -73,6 +78,11 @@ import:
 	../../../src/compiler/stage_09_core/match_projection:
 		project_backend_matches,
 		project_backend_matches_indexed,
+		project_fused_late_core,
+	../../../src/compiler/stage_09_core/resolve:
+		CoreCallableIdentity,
+		program_callables,
+		resolve_callable_id_calls,
 	test: TestSuite
 
 
@@ -1581,6 +1591,85 @@ private pure func test_projection_is_idempotent() -> Bool:
 	core_program_to_json(once).to_string() == core_program_to_json(twice).to_string()
 
 
+-- A program exercising all three fused-walk passes on one path: a call
+-- resolve_callables can promote to a `UserCall` (the match's own release
+-- check then depends on that promotion having already happened, via
+-- `contract_for_call`), an intrinsic call backend_projection rewrites into a
+-- `ListRetainExpr`, and a `ConstructorMatchExpr` matching the user call's
+-- result (exercising match's synthesized-temp release/materialize path,
+-- which is where a wrong walk order or a wrong nesting depth would first
+-- show up as a diff).
+private pure func fused_dependency_program() -> CoreProgram:
+	choice_type: CoreType = UnionType("Choice")
+	user_call: CoreExpr = CallExpr(
+		UnknownCall,
+		VarExpr(
+			core_var_with_def_id("helper", 900),
+			named_type("HelperFn"),
+			SyntheticSourceLoc,
+		),
+		[],
+		choice_type,
+		SyntheticSourceLoc,
+	)
+	list_type: CoreType = NamedType("List", [named_type("Ptr")])
+	intrinsic_stmt: CoreExpr = CallExpr(
+		IntrinsicCall("list_retain_for"),
+		VoidExpr(
+			VoidType,
+			SyntheticSourceLoc,
+		),
+		[variable("items", list_type), variable("value", named_type("Ptr"))],
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	match_on_call_result: CoreExpr = ConstructorMatchExpr(
+		user_call,
+		ArcReleasePolicy,
+		[],
+		ConstructorMatchFallbackFail,
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = SeqExpr(intrinsic_stmt, match_on_call_result)
+	helper_decl: CoreDecl = FunctionDecl({
+		name = "helper",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = choice_type,
+		body = Some(int_literal(0)),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 900,
+		loc = known_loc(),
+	})
+
+	program_with(
+		body,
+		[choice_decl(), helper_decl],
+	)
+
+
+-- The dependency this module's `project_fused_late_core` relies on: running
+-- resolve_callables, backend_projection, and match_projection as one fused
+-- walk over `fused_dependency_program()` must produce the same Core as
+-- running the three standalone passes in sequence (the `--dump-core-after`
+-- path `late_core_passes_for_control` falls back to).
+pure func test_fused_resolve_backend_match_matches_standalone_sequence() -> Bool:
+	source: CoreProgram = fused_dependency_program()
+
+	standalone: CoreProgram = project_backend_matches(
+		project_backend_calls(resolve_callable_id_calls(source)),
+	)
+
+	callables: List[CoreCallableIdentity] = program_callables(source)
+	backend: BackendProjectionContext = build_backend_projection_context(source)
+	fused: CoreProgram = project_fused_late_core(source, callables, backend)
+
+	core_program_to_json(standalone).to_string() == core_program_to_json(fused).to_string()
+
+
 tests: TestSuite = {
 	description = "Late backend semantic match projection",
 	tests = [
@@ -1677,6 +1766,10 @@ tests: TestSuite = {
 		(
 			"deep variant accessor projection is stack bounded",
 			test_deep_variant_accessor_projection_is_stack_bounded,
+		),
+		(
+			"fused resolve/backend/match walk matches standalone sequence",
+			test_fused_resolve_backend_match_matches_standalone_sequence,
 		),
 	]
 }

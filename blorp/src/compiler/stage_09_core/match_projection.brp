@@ -5,6 +5,7 @@
 -- accounting, resolve those facts into ordinary typed match nodes so every
 -- remaining Core pass sees the complete expression tree.
 import:
+	backend_projection as CoreBackendProjection
 	c_type_layout: c_type_name, stack_option_c_type, type_requires_release
 	ir:
 		CoreAccessor(
@@ -124,6 +125,7 @@ import:
 	mono: CoreMonoSubstitution, CoreMonoSubstitutionValue(TypeSubstitution), apply_type_substitution
 	ownership: OwnershipResultMode(ReturnOwned)
 	perceus/env: PerceusEnv, build_env, contract_for_call
+	resolve as CoreResolve
 	specialize_layout:
 		CoreOptionRuntimeLayout(NullableManagedOptionLayout),
 		CoreSpecializeLayout,
@@ -199,6 +201,16 @@ private record MatchProjectionLayout {
 	unions_by_name: Dict[String, MatchProjectionUnionLayout],
 	index_counters: MatchProjectionLayoutCounters,
 	valid: Bool
+}
+
+
+-- Carries the resolve_callables and backend_projection contexts through this
+-- module's own walk for `project_fused_late_core`. `None` everywhere below
+-- reproduces `project_backend_matches` exactly -- the standalone entry points
+-- pass `None` and never build one of these.
+private record LateProjectionFusion {
+	callables: List[CoreResolve.CoreCallableIdentity],
+	backend: CoreBackendProjection.BackendProjectionContext
 }
 
 
@@ -359,7 +371,10 @@ private pure func find_enum_variant(
 	result
 
 
-private pure func constructor_variable_matches(variable_def_id: Option[Int], def_id: Option[Int]) -> Bool:
+private pure func constructor_variable_matches(
+	variable_def_id: Option[Int],
+	def_id: Option[Int],
+) -> Bool:
 	match (variable_def_id, def_id):
 		(Some(variable_id), Some(constructor_id)):
 			variable_id == constructor_id
@@ -397,7 +412,10 @@ private pure func singleton_constructor_value(
 			match match_projection_variant(layout, type_name, variable.name, variable.def_id):
 				Some(variant):
 					fields_empty: Bool = variant.fields.is_empty()
-					exact_constructor: Bool = constructor_variable_matches(variable.def_id, variant.def_id)
+					exact_constructor: Bool = constructor_variable_matches(
+						variable.def_id,
+						variant.def_id,
+					)
 					fields_empty and exact_constructor
 				None:
 					False
@@ -1476,7 +1494,7 @@ private pure func reproject_typed_match_binding(
 							{ binding |
 								typ = typ,
 								accessor = accessor,
-								needs_release = type_requires_release(typ),
+								needs_release = type_requires_release(typ)
 							}
 						None:
 							binding
@@ -1562,6 +1580,7 @@ private pure func project_logical_expr(
 	ownership: PerceusEnv,
 	owner_def_id: Int,
 	nesting_depth: Int,
+	fusion: Option[LateProjectionFusion],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	var tasks: List[MatchProjectionLogicalTask] = [ProjectMatchLogicalNode(expr, nesting_depth)]
@@ -1622,6 +1641,7 @@ private pure func project_logical_expr(
 									ownership,
 									owner_def_id,
 									current_depth,
+									fusion,
 									current_expr,
 								)
 
@@ -1664,6 +1684,7 @@ private pure func project_expr(
 	ownership: PerceusEnv,
 	owner_def_id: Int,
 	nesting_depth: Int,
+	fusion: Option[LateProjectionFusion],
 	expr: CoreExpr,
 ) -> CoreExpr:
 	children_projected: CoreExpr = match expr:
@@ -1673,37 +1694,61 @@ private pure func project_expr(
 				preceding_items = spine.preceding_items.map(
 					func(
 						item,
-					): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, item),
+					): project_expr(
+						layout,
+						ownership,
+						owner_def_id,
+						nesting_depth + 1,
+						fusion,
+						item,
+					),
 				),
 				final_item = project_expr(
 					layout,
 					ownership,
 					owner_def_id,
 					nesting_depth + 1,
+					fusion,
 					spine.final_item,
 				),
 			})
 		LogicalExpr(_, _, _, _, _):
-			project_logical_expr(layout, ownership, owner_def_id, nesting_depth, expr)
+			project_logical_expr(layout, ownership, owner_def_id, nesting_depth, fusion, expr)
 		_:
 			CoreTraverse.map_core_expr_children(
 				expr,
 				func(
 					child,
-				): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, child),
+				): project_expr(layout, ownership, owner_def_id, nesting_depth + 1, fusion, child),
 			)
 
-	project_current_expr(layout, ownership, owner_def_id, nesting_depth, children_projected)
+	-- Applies resolve_callables' and backend_projection's per-node steps to
+	-- this node before match_projection's own, when fusing: match's own step
+	-- can depend on a call's kind already being resolved and backend-projected
+	-- (see `project_current_expr`'s scrutinee-release check), which is exactly
+	-- the order the standalone three-pass sequence already guarantees. `None`
+	-- keeps this an identity, so the standalone walk is untouched.
+	fused_children: CoreExpr = match fusion:
+		Some(context):
+			CoreBackendProjection.project_current_expr(
+				context.backend,
+				CoreResolve.resolve_current_expr(context.callables, children_projected),
+			)
+		None:
+			children_projected
+
+	project_current_expr(layout, ownership, owner_def_id, nesting_depth, fused_children)
 
 
 private pure func project_function(
 	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
+	fusion: Option[LateProjectionFusion],
 	function_info: CoreFunction,
 ) -> CoreFunction:
 	{ function_info |
 		body = function_info.body.map(
-			func(body): project_expr(layout, ownership, function_info.def_id, 0, body),
+			func(body): project_expr(layout, ownership, function_info.def_id, 0, fusion, body),
 		)
 	}
 
@@ -1711,13 +1756,18 @@ private pure func project_function(
 private pure func project_decl(
 	layout: MatchProjectionLayout,
 	ownership: PerceusEnv,
+	fusion: Option[LateProjectionFusion],
 	decl: CoreDecl,
 ) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(project_function(layout, ownership, function_info))
+			FunctionDecl(project_function(layout, ownership, fusion, function_info))
 		GlobalDecl(global):
-			GlobalDecl({ global | init = project_expr(layout, ownership, global.def_id, 0, global.init) })
+			GlobalDecl(
+				{ global |
+					init = project_expr(layout, ownership, global.def_id, 0, fusion, global.init)
+				},
+			)
 		_:
 			decl
 
@@ -1725,14 +1775,17 @@ private pure func project_decl(
 private pure func project_backend_matches_with_layout(
 	program: CoreProgram,
 	layout: MatchProjectionLayout,
+	fusion: Option[LateProjectionFusion],
 ) -> CoreProgram:
 	ownership: PerceusEnv = build_env(program)
-	{ program | decls = program.decls.map(func(decl): project_decl(layout, ownership, decl)) }
+	{ program |
+		decls = program.decls.map(func(decl): project_decl(layout, ownership, fusion, decl))
+	}
 
 
 pure func project_backend_matches_indexed(program: CoreProgram) -> MatchProjectionIndexedResult:
 	layout: MatchProjectionLayout = build_match_projection_layout(program)
-	projected: CoreProgram = project_backend_matches_with_layout(program, layout)
+	projected: CoreProgram = project_backend_matches_with_layout(program, layout, None)
 	{
 		program = projected,
 		declaration_index_entries = layout.index_counters.declaration_index_entries,
@@ -1744,4 +1797,25 @@ pure func project_backend_matches_indexed(program: CoreProgram) -> MatchProjecti
 
 pure func project_backend_matches(program: CoreProgram) -> CoreProgram:
 	layout: MatchProjectionLayout = build_match_projection_layout(program)
-	project_backend_matches_with_layout(program, layout)
+	project_backend_matches_with_layout(program, layout, None)
+
+
+---
+Fused resolve_callables -> backend_projection -> match_projection entry point
+for the normal compile path (`pipeline.late_core_passes_for_control` picks
+this over the three standalone passes). Builds match_projection's own layout
+and ownership context exactly as `project_backend_matches` does, and
+additionally threads the resolve callables list and the backend projection
+context through the same walk, so each node gets all three passes' per-node
+steps applied once instead of the program being rebuilt three times.
+---
+pure func project_fused_late_core(
+	program: CoreProgram,
+	callables: List[CoreResolve.CoreCallableIdentity],
+	backend: CoreBackendProjection.BackendProjectionContext,
+) -> CoreProgram:
+	layout: MatchProjectionLayout = build_match_projection_layout(program)
+	project_backend_matches_with_layout(program, layout, Some({
+			callables = callables,
+			backend = backend,
+		}))
