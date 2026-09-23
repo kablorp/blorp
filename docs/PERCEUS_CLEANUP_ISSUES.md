@@ -21,7 +21,7 @@ Anchors are against main after the second split commit; grep for names.
 - **Identity.** Byte-identical C on the self-compile and the small program
   unless an issue says otherwise. Core is compiled into `bin/blorp`, so the
   bootstrap-built harness observes every change directly.
-- **Gates**, each under `benchmarks/self_compile_measure lock --`:
+- **Gates**:
   `bin/blorp test --timeout 600 blorp/test/compiler/stage_09_core/test_core_perceus.brp`
   (364 tests), `python3 -m unittest blorp.test.compiler.benchmark.test_perceus_memory`
   (80 tests; it scans source text of `perceus/results_and_loops.brp` for

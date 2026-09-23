@@ -259,8 +259,10 @@ General setup/land rules are in
 own worktree and branch cut from `origin/main`
 (`git worktree add -b perf/<slug> ../blorp-rm-<slug> origin/main`); commit per
 cut with standalone titles, no task ids, no pasted tables; do not rebase,
-merge, or push, the coordinator merges; serialize gates, never run compiled
-binaries in parallel (macOS `syspolicyd` stalls under many fresh binaries).
+merge, or push, the coordinator merges; run gates directly, never run compiled
+binaries in parallel yourself (macOS `syspolicyd` stalls under many fresh
+binaries). Measurement noise from concurrent work is accepted; use the
+harness's min-of-runs, never wall time, as evidence.
 
 Task-specific:
 
@@ -275,9 +277,9 @@ Task-specific:
   noise on this machine; instructions retired and the pattern counts are the
   signal.
 - Gates per cut, one at a time: the owning suites, then
-  `benchmarks/self_compile_measure lock -- scripts/test compiler-core-sanitize leak`,
-  then `benchmarks/self_compile_measure lock -- scripts/compiler-check --changed --base main`.
-  Measurements take no lock; run them before waiting on any gate. The full
+  `scripts/test compiler-core-sanitize leak`,
+  then `scripts/compiler-check --changed --base main`.
+  Run measurements before waiting on any gate. The full
   default `scripts/test` runs once per merge for this roadmap (the
   coordinator runs it), because every task changes every function's C.
 - Do not change the order or placement of `DupExpr`/`DropExpr` unless the
@@ -690,7 +692,7 @@ Run the Perceus and reuse suites and the runtime memory tests with
 `--leak-check` after every cut; this change removes releases, so a wrong
 classification is a leak (too many releases) or a use-after-free (too few),
 and only the leak checker and the sanitizer see them. The sanitizer and
-leak gate (`benchmarks/self_compile_measure lock -- scripts/test compiler-core-sanitize leak`)
+leak gate (`scripts/test compiler-core-sanitize leak`)
 runs after every cut, not just at the end.
 
 **Measurement.** This changes generated C, so the stage-2 rule applies:
@@ -781,8 +783,8 @@ The coordinator merges. For each task:
    not increase them on the small program by more than 0.5%. Report
    `output_bytes` and the task's pattern counts.
 2. Gates: the owning suites, `compiler-check --changed --base main`,
-   `compiler-core-sanitize leak`, and the full default `scripts/test`, all
-   under `benchmarks/self_compile_measure lock --`.
+   `compiler-core-sanitize leak`, and the full default `scripts/test`, run
+   directly.
 3. Squash-merge the branch into one commit on main with a standalone title
    that describes the change; the measurement JSON under
    `benchmarks/results/` goes into that same commit. One task, one commit.

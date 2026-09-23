@@ -148,8 +148,8 @@ bin/blorp test --timeout 300 blorp/test/compiler/stage_06_typecheck/test_infer.b
   blorp/test/compiler/stage_06_typecheck/test_typecheck_decl.brp \
   blorp/test/compiler/stage_06_typecheck/type_system/test_env.brp
 scripts/compiler-check --changed --plan            # read-only: what will run
-benchmarks/self_compile_measure lock -- scripts/compiler-check --changed
-benchmarks/self_compile_measure lock -- scripts/test --serial compiler-blorp compiler-tools lsp
+scripts/compiler-check --changed
+scripts/test --serial compiler-blorp compiler-tools lsp
 ```
 
 The diagnostic fixtures (`fixtures/typecheck/should_fail`, 589 files, and

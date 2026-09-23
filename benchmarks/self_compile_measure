@@ -10,10 +10,8 @@ Subcommands:
 
   measure   Run the measurement (default when no subcommand is given).
   freeze    Create the frozen input snapshot for a revision and print its path.
-  lock      Run an arbitrary command under the global measurement lock.
-
-The global lock serializes measurements and multi-process gates across
-worktrees so they do not perturb each other or overwhelm macOS syspolicyd.
+  lock      Run a command directly (kept as a no-op passthrough for callers
+            still spelling gates this way; there is no lock anymore).
 
 Toolchain fingerprint: every measurement records `cc_version` (first line of
 `$BLORP_CC --version`, default "clang"), the full `<compiler> --version` output, and the
@@ -43,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import fcntl
 import hashlib
 import json
 import os
@@ -59,7 +56,6 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 TMP_BASE = Path(os.environ.get("TMPDIR", "/tmp"))
-LOCK_PATH = TMP_BASE / "blorp-perf-measure.lock"
 INPUT_BASE = TMP_BASE / "blorp-perf-input"
 CHECKPOINT_RE = re.compile(r"^BLORP_COMPILER_MEMORY_CHECKPOINT\s+(.*)$")
 PHASE_ROW_RE = re.compile(r"^([a-z_]+)\t([0-9.]+) ms$")
@@ -236,24 +232,6 @@ def freeze_input(rev: str) -> Path:
         )
     marker.write_text(full + "\n")
     return target
-
-
-class GlobalLock:
-    """Multi-process gates run through `lock --` take this exclusive lock so
-    they never overlap each other. Measurements do not take it."""
-
-    def __init__(self, exclusive: bool = False) -> None:
-        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = LOCK_PATH.open("a+")
-        self.mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-
-    def __enter__(self) -> "GlobalLock":
-        fcntl.flock(self.handle.fileno(), self.mode)
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        self.handle.close()
 
 
 def compiler_repo_root(compiler: Path) -> Path | None:
@@ -436,9 +414,6 @@ def measure(args: argparse.Namespace) -> dict:
         "samples": args.samples,
     }
 
-    # Measurements take no lock: they are single-process and their primary
-    # metrics tolerate concurrency. Only `lock --` gates serialize, so a queued
-    # gate is never starved behind a stream of shared measurements.
     with tempfile.TemporaryDirectory(prefix="blorp-measure.") as tmp:
         tmp_dir = Path(tmp)
         alloc_c = tmp_dir / "alloc.c"
@@ -626,8 +601,7 @@ def cmd_freeze(args: argparse.Namespace) -> int:
 def cmd_lock(args: argparse.Namespace) -> int:
     if not args.command:
         raise MeasureError("lock requires a command after --")
-    with GlobalLock(exclusive=True):
-        return subprocess.call(args.command)
+    return subprocess.call(args.command)
 
 
 def main(argv: list[str]) -> int:
@@ -669,7 +643,7 @@ def main(argv: list[str]) -> int:
     freeze_parser = sub.add_parser("freeze", help="materialize the frozen input for a revision")
     freeze_parser.add_argument("--rev", default="HEAD")
 
-    lock_parser = sub.add_parser("lock", help="run a command under the global measurement lock")
+    lock_parser = sub.add_parser("lock", help="run a command directly (no-op passthrough, kept for compatibility)")
     lock_parser.add_argument("command", nargs=argparse.REMAINDER)
 
     args = parser.parse_args(argv)

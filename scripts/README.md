@@ -437,8 +437,7 @@ with the given title and body. Titles starting with `Merge` or containing an
 `#<digits>` issue reference are refused so main's history stays standalone
 and readable. After `make`, it prints the `bin/blorp --version` build stamp,
 then runs `scripts/compiler-check --changed --base origin/main` and any
-`--gate` gates through `benchmarks/self_compile_measure lock --` so they don't
-collide with other worktrees' gates; every one must end in a `BLORP_GATE_RESULT
+`--gate` gates directly; every one must end in a `BLORP_GATE_RESULT
 ... status=PASS` line (a compiler-check run with no selected work counts).
 Only if all of that passes, and `origin/main` is still an ancestor of the new
 commit, does it push with fast-forward semantics; otherwise it reports that

@@ -177,8 +177,8 @@ bin/blorp test --timeout 180 \
   blorp/test/compiler/stage_03_parse/test_source_ast_finalize.brp
 
 scripts/compiler-check --changed --plan
-benchmarks/self_compile_measure lock -- scripts/compiler-check --changed
-benchmarks/self_compile_measure lock -- scripts/test --serial compiler-blorp compiler-tools lsp
+scripts/compiler-check --changed
+scripts/test --serial compiler-blorp compiler-tools lsp
 ```
 
 Task 6 also runs its Stage 04 suites and the package gate. Build once, confirm
@@ -829,8 +829,7 @@ bin/blorp test --timeout 180 \
   blorp/test/compiler/stage_04_modules/test_frontend_graph.brp \
   blorp/test/lsp/analysis/test_lsp_frontend_graph.brp
 
-benchmarks/self_compile_measure lock -- \
-  scripts/test --no-build --serial package lsp
+scripts/test --no-build --serial package lsp
 ```
 
 Add a provider-spy test that asserts exact lookup counts. It should include two

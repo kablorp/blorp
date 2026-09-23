@@ -63,10 +63,10 @@ benchmarks/self_compile_measure --label <task> --input-rev <rev> \
   (`benchmarks/build_stage2_compiler`, or `self_compile_measure --stage2`).
   A compiler fix on `main` does not reach a branch's binary until the
   bootstrap pin is rotated.
-- Serialize any command that spawns many compiled binaries — `scripts/test`,
-  `scripts/compiler-check` — with
-  `benchmarks/self_compile_measure lock -- <cmd>`, and never run compiled
-  test binaries in parallel yourself (macOS `syspolicyd` stalls).
+- Run gate commands directly (`scripts/test`, `scripts/compiler-check`, etc.);
+  do not spawn many compiled test binaries in parallel yourself (macOS
+  `syspolicyd` stalls). Measurement noise from concurrent work is accepted;
+  use the harness's min-of-runs, never wall time, as evidence.
 
 ## Land
 
@@ -78,7 +78,7 @@ benchmarks/self_compile_measure --label <task> --input-rev <rev> \
 - Gates that must pass before landing scale with the change; see the task
   boundary table in [`AGENTS.md`](../AGENTS.md#find-the-right-boundary-first)
   and, for perf work specifically, the owning suite plus
-  `self_compile_measure lock -- scripts/compiler-check --changed --base main`.
+  `scripts/compiler-check --changed --base main`.
 - Do not rebase, merge, or push a shared coordinator-owned branch; the
   coordinator integrates.
 

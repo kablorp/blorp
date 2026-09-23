@@ -138,7 +138,7 @@ a profile program that runs the production entry point on the frozen
 self-compile and reports calls, allocations and allocations per call per
 helper, using the runtime's allocation counter from `standard_library/src/memory.brp`.
 
-Gates for every code step, each under `benchmarks/self_compile_measure lock --`:
+Gates for every code step:
 the owning suites (`test_core_perceus.brp`, `test_core_closure.brp`,
 `test_core_dce.brp`, `test_core_lower.brp`, `test_core_json.brp`, plus the
 pass's own), `scripts/compiler-check --changed`, `scripts/test --serial

@@ -28,10 +28,10 @@ only. Iterate at `-O0`; the coordinator confirms at `-O2`.
 **Fast loop.** `make && scripts/compiler-build-status` (about 45s), the
 task's focused suite (seconds), then one harness run (about 40s at -O0).
 Never argue from a run made while another gate or build is active on the
-machine; the harness lock serializes only harness runs and locked gates.
+machine.
 
 **Gates before handoff.** Focused suites named in the task,
-`benchmarks/self_compile_measure lock -- scripts/compiler-check --changed --base main`,
+`scripts/compiler-check --changed --base main`,
 `bin/blorp format --check --diff <changed files>`, `git diff --check`. The
 coordinator runs the default `scripts/test` gate and the ownership gates
 (`compiler-core-sanitize`, `leak`) after merge. Never run multi-process gates

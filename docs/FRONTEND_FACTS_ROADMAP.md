@@ -163,8 +163,8 @@ the small program through the harness. The slow loop is the self-compile,
 three samples.
 
 Gates per cut, one at a time (never parallel background shells): the owning
-suites, then `benchmarks/self_compile_measure lock -- scripts/compiler-check --changed --base main`.
-Measurements take no lock; run them before waiting on a gate. Do not run the
+suites, then `scripts/compiler-check --changed --base main`.
+Run measurements before waiting on a gate. Do not run the
 full default `scripts/test`; the coordinator runs it once per merge.
 
 If the machine's `cc` reports an unaccepted Xcode license, prepend the

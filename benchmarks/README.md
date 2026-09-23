@@ -1844,8 +1844,8 @@ benchmarks/self_compile_measure --program small \
   --baseline benchmarks/results/self_compile_small_baseline_O0_2026-09-17_r7.json \
   --output /tmp/issue-147-step2-small.json --require-identical
 
-# Run a multi-process gate without overlapping another worker's measurement.
-benchmarks/self_compile_measure lock -- scripts/compiler-check --changed
+# Run a multi-process gate.
+scripts/compiler-check --changed
 ```
 
 Rules:
@@ -1861,11 +1861,11 @@ Rules:
    `BLORP_CLI_C_OPTIMIZATION=-O2` for `make`, `scripts/compiler-build-status`,
    and the harness alike, since the build identity includes that level. The
    JSON records the level as `c_optimization`. Report which one you used.
-4. Measurements take no lock (they are single-process and their primary metrics tolerate concurrency); `lock --` commands take an exclusive lock in `$TMPDIR/blorp-perf-measure.lock` so gates never overlap.
-   Wrap any command that spawns many compiled binaries
-   (`scripts/compiler-check`, `scripts/test`) in
-   `benchmarks/self_compile_measure lock -- <cmd>` so concurrent worktrees
-   neither perturb each other nor overwhelm macOS `syspolicyd`.
+4. Measurements are single-process and their primary metrics tolerate
+   concurrency; run commands directly. Do not spawn many compiled test
+   binaries in parallel yourself (`scripts/compiler-check`, `scripts/test`
+   can overwhelm macOS `syspolicyd`). Measurement noise from concurrent work
+   is accepted; use the harness's min-of-runs, never wall time, as evidence.
 5. Report the comparison table verbatim: allocations per phase, total
    allocations, minimum retired instructions, and the IDENTICAL/DIFFERENT
    output line. Wall time and per-phase `phases_ms` are host-clock noise, not
