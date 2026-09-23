@@ -27,7 +27,7 @@ import:
 		CoreProgram,
 		CoreSourceLoc(SyntheticSourceLoc),
 		CoreTensorDim(TensorRuntimeDim, TensorStaticDim),
-		CoreTensorRawScalarKind(TensorFloat64Elements),
+		CoreTensorRawScalarKind(TensorFloat64Elements, TensorInt64Elements),
 		CoreType(EnumType, NamedType, TensorType, VoidType),
 		CoreUnboxKind(PrimUnbox),
 		CoreVar,
@@ -982,6 +982,65 @@ pure func test_nonnegative_addition_start_proves_bounds() -> Bool:
 			False
 
 
+pure func checked_int_read(values: CoreExpr) -> CoreExpr:
+	builtin_call(
+		"blorp_checked_get",
+		[values, variable("i", INT_TYPE)],
+		INT_TYPE,
+	)
+
+
+-- Regression probe for the plain `for i in indices(v): total += v[i]` shape:
+-- a variable-indexed int read of a statically-dimensioned tensor, proven in
+-- bounds by the enclosing range loop, must still hoist a raw view the same
+-- way the float case does.
+pure func test_bounds_proven_int_read_hoists_raw_view() -> Bool:
+	values: CoreExpr = variable("values", tensor_with_dims(INT_TYPE, [TensorStaticDim(4)]))
+	loop: CoreExpr = range_loop(values, checked_int_read(values))
+
+	match specialized_body(loop):
+		Some(LetExpr(_, False, NamedType("Bool", []), _, IfExpr(_, fast_loop, _, VoidType, _))):
+			match fast_loop:
+				TensorRawViewLetExpr(binding, ForRangeExpr(_, _, LiteralExpr(IntLiteral(4), _, _), TensorRawReadExpr(read, _, _), _, _), _, _):
+					binding.kind == TensorInt64Elements and read.kind == TensorInt64Elements
+				_:
+					False
+		_:
+			False
+
+
+-- Same shape as the probe above, but with the read nested inside an
+-- accumulating assignment (`total = total + v[i]`) instead of being the bare
+-- loop body, matching what `for i in indices(v): total += v[i]` actually
+-- lowers to.
+pure func test_bounds_proven_int_read_hoists_raw_view_under_assign() -> Bool:
+	values: CoreExpr = variable("values", tensor_with_dims(INT_TYPE, [TensorStaticDim(4)]))
+	total_var: CoreVar = core_var("total")
+	accumulate: CoreExpr = AssignExpr(
+		total_var,
+		BinaryExpr(
+			AddOp,
+			VarExpr(total_var, INT_TYPE, SyntheticSourceLoc),
+			checked_int_read(values),
+			INT_TYPE,
+			SyntheticSourceLoc,
+		),
+		VoidType,
+		SyntheticSourceLoc,
+	)
+	loop: CoreExpr = range_loop(values, accumulate)
+
+	match specialized_body(loop):
+		Some(LetExpr(_, False, NamedType("Bool", []), _, IfExpr(_, fast_loop, _, VoidType, _))):
+			match fast_loop:
+				TensorRawViewLetExpr(binding, ForRangeExpr(_, _, LiteralExpr(IntLiteral(4), _, _), _, _, _), _, _):
+					binding.kind == TensorInt64Elements
+				_:
+					False
+		_:
+			False
+
+
 pure func test_nested_raw_view_region_is_not_rehoisted() -> Bool:
 	values: CoreExpr = variable("values", tensor_type(4))
 	inner_loop: CoreExpr = range_loop(values, checked_float_read(values))
@@ -1091,6 +1150,14 @@ tests: TestSuite = {
 			test_tensor_reductions_require_supported_element_type,
 		),
 		("bounds-proven read hoists raw view", test_bounds_proven_read_hoists_raw_view),
+		(
+			"bounds-proven int read hoists raw view",
+			test_bounds_proven_int_read_hoists_raw_view,
+		),
+		(
+			"bounds-proven int read under assign hoists raw view",
+			test_bounds_proven_int_read_hoists_raw_view_under_assign,
+		),
 		("temporary tensor source is not hoisted", test_temporary_tensor_source_is_not_hoisted),
 		("resource scope blocks raw-view hoisting", test_resource_scope_blocks_raw_view_hoisting),
 		("raw writes require unique storage", test_write_hoist_requires_unique_storage),
