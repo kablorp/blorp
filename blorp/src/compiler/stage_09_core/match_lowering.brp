@@ -90,8 +90,371 @@ import:
 		),
 		CoreVar,
 		core_expr_type,
+		core_var_equal,
 	set as Sets
 	traverse as CoreTraverse
+
+
+-- Core Identity Migration step 5 (docs/CORE_ID_MIGRATION.md). `expand_or_match_case`
+-- below splices one `A | B: body` arm's exact `body` expression into a
+-- separate `CoreRawMatchCase` per alternative pattern; when the alternatives
+-- land in different constructor groups (`compile_constructor_group_tree`),
+-- the literal same `LetExpr`/`BorrowLetExpr`/... binders from `body` end up
+-- at two places in the final decision tree, sharing one `(name, id)` pair --
+-- the exact case docs/CORE_ID_MIGRATION.md step 2's commit named as blocking
+-- strict mode. Every real, source-derived binder id (`core_binder_id`,
+-- `stage_08_core_lower/lower.brp`) is a source-span offset strictly below
+-- 2^31 (compiler source files are bounded under 2 GiB), so a synthetic id
+-- built from this seed can never collide with one.
+private CORE_SYNTHETIC_ID_SEED: Int = 2147483648
+
+
+-- `original` is matched with `core_var_equal` (name and id), so a use is
+-- only substituted once its own binder inside the same clone has already
+-- been renamed -- exactly `std_inline.brp`'s `renamed_var`/`rename_binder`
+-- pattern, scaled down to the binder shapes lowering itself can produce
+-- (a raw match arm body predates every later pass that mints the rest,
+-- e.g. `ListHandoffExpr`, so this does not need to cover them).
+private record CoreMatchCloneRename {
+	original: CoreVar,
+	replacement: CoreVar
+}
+
+
+private record CoreMatchCloneState {
+	next_id: Int,
+	renames: List[CoreMatchCloneRename]
+}
+
+
+private pure func match_clone_lookup(renames: List[CoreMatchCloneRename], variable: CoreVar) -> CoreVar:
+	var replacement: CoreVar = variable
+
+	for rename in renames:
+		if core_var_equal(rename.original, variable):
+			replacement = rename.replacement
+		else:
+			void
+
+	replacement
+
+
+private pure func match_clone_bind(
+	state: CoreMatchCloneState,
+	variable: CoreVar,
+) -> (CoreMatchCloneState, CoreVar):
+	next: Int = state.next_id + 1
+	fresh: CoreVar = { variable | id = next }
+	(
+		{
+			next_id = next,
+			renames = [{ original = variable, replacement = fresh }].concat(state.renames)
+		},
+		fresh,
+	)
+
+
+private pure func match_clone_expr(
+	state: CoreMatchCloneState,
+	expr: CoreExpr,
+) -> CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr]:
+	match expr:
+		VarExpr(variable, typ, loc):
+			{
+				state = state,
+				value = VarExpr(match_clone_lookup(state.renames, variable), typ, loc)
+			}
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			rhs_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				rhs,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(rhs_result.state, variable)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				body,
+			)
+			{
+				state = body_result.state,
+				value = LetExpr(bound[1], is_mutable, typ, rhs_result.value, body_result.value)
+			}
+		BorrowLetExpr(variable, typ, rhs, body):
+			rhs_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				rhs,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(rhs_result.state, variable)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				body,
+			)
+			{
+				state = body_result.state,
+				value = BorrowLetExpr(bound[1], typ, rhs_result.value, body_result.value)
+			}
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			var current_state: CoreMatchCloneState = state
+			var renamed_params: List[CoreParam] = []
+
+			for param in params:
+				bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(current_state, param.name)
+				current_state = bound[0]
+				renamed_params = renamed_params.append({ param | name = bound[1] })
+
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				current_state,
+				body,
+			)
+			{
+				state = body_result.state,
+				value = LambdaExpr(renamed_params, return_type, body_result.value, is_pure, typ, loc)
+			}
+		ForRangeExpr(binder, start, finish, body, typ, loc):
+			start_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				start,
+			)
+			finish_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				start_result.state,
+				finish,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				finish_result.state,
+				binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				body,
+			)
+			{
+				state = body_result.state,
+				value = ForRangeExpr(
+					{ binder | variable = bound[1] },
+					start_result.value,
+					finish_result.value,
+					body_result.value,
+					typ,
+					loc,
+				)
+			}
+		ForListExpr(loop, typ, loc):
+			iterable_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				loop.iterable,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				iterable_result.state,
+				loop.binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				loop.body,
+			)
+			{
+				state = body_result.state,
+				value = ForListExpr(
+					{ loop |
+						binder = { loop.binder | variable = bound[1] },
+						iterable = iterable_result.value,
+						body = body_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		ForStringExpr(loop, typ, loc):
+			iterable_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				loop.iterable,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				iterable_result.state,
+				loop.binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				loop.body,
+			)
+			{
+				state = body_result.state,
+				value = ForStringExpr(
+					{ loop |
+						binder = { loop.binder | variable = bound[1] },
+						iterable = iterable_result.value,
+						body = body_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		ForDictExpr(loop, typ, loc):
+			iterable_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				loop.iterable,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				iterable_result.state,
+				loop.binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				loop.body,
+			)
+			{
+				state = body_result.state,
+				value = ForDictExpr(
+					{ loop |
+						binder = { loop.binder | variable = bound[1] },
+						iterable = iterable_result.value,
+						body = body_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		ForSetExpr(loop, typ, loc):
+			iterable_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				loop.iterable,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				iterable_result.state,
+				loop.binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				loop.body,
+			)
+			{
+				state = body_result.state,
+				value = ForSetExpr(
+					{ loop |
+						binder = { loop.binder | variable = bound[1] },
+						iterable = iterable_result.value,
+						body = body_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		ForStreamExpr(loop, typ, loc):
+			iterable_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				loop.iterable,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				iterable_result.state,
+				loop.binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				loop.body,
+			)
+			{
+				state = body_result.state,
+				value = ForStreamExpr(
+					{ loop |
+						binder = { loop.binder | variable = bound[1] },
+						iterable = iterable_result.value,
+						body = body_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		ForResourceSourceExpr(loop, typ, loc):
+			iterable_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				loop.iterable,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				iterable_result.state,
+				loop.binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				loop.body,
+			)
+			{
+				state = body_result.state,
+				value = ForResourceSourceExpr(
+					{ loop |
+						binder = { loop.binder | variable = bound[1] },
+						iterable = iterable_result.value,
+						body = body_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		ForTensorExpr(loop, typ, loc):
+			iterable_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				loop.iterable,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				iterable_result.state,
+				loop.binder.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				loop.body,
+			)
+			{
+				state = body_result.state,
+				value = ForTensorExpr(
+					{ loop |
+						binder = { loop.binder | variable = bound[1] },
+						iterable = iterable_result.value,
+						body = body_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		ResourceScopeExpr(scope, typ, loc):
+			acquire_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				state,
+				scope.acquire,
+			)
+			bound: (CoreMatchCloneState, CoreVar) = match_clone_bind(
+				acquire_result.state,
+				scope.variable,
+			)
+			body_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				bound[0],
+				scope.body,
+			)
+			cleanup_result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+				body_result.state,
+				scope.cleanup,
+			)
+			{
+				state = cleanup_result.state,
+				value = ResourceScopeExpr(
+					{ scope |
+						variable = bound[1],
+						acquire = acquire_result.value,
+						body = body_result.value,
+						cleanup = cleanup_result.value,
+					},
+					typ,
+					loc,
+				)
+			}
+		_:
+			CoreTraverse.map_core_expr_children_with_state(state, match_clone_expr, expr)
+
+
+-- Clones `body`, minting a fresh id (from the shared `next_id` allocator,
+-- threaded from `compile_expr_at`) for every binder it introduces while
+-- keeping every name exactly as it was, so generated C stays byte-identical.
+private pure func clone_match_arm_body(next_id: Int, body: CoreExpr) -> (Int, CoreExpr):
+	result: CoreTraverse.CoreMapState[CoreMatchCloneState, CoreExpr] = match_clone_expr(
+		{ next_id = next_id, renames = [] },
+		body,
+	)
+	(result.state.next_id, result.value)
 
 
 private BUILTIN_CONSTRUCTOR_NAMES: List[String] = [
@@ -272,6 +635,50 @@ private pure func expand_or_match_case(match_case: CoreRawMatchCase) -> List[Cor
 
 private pure func expand_or_match_cases(cases: List[CoreRawMatchCase]) -> List[CoreRawMatchCase]:
 	cases.flat_map(expand_or_match_case)
+
+
+-- Same expansion as `expand_or_match_case`, except every alternative after
+-- the first gets its own clone of `body` with fresh binder ids (see
+-- `clone_match_arm_body`) instead of sharing the original's identity.
+private pure func expand_or_match_case_at(
+	next_id: Int,
+	match_case: CoreRawMatchCase,
+) -> (Int, List[CoreRawMatchCase]):
+	match match_case.pattern:
+		OrPattern(patterns):
+			var current_id: Int = next_id
+			var expanded: List[CoreRawMatchCase] = []
+			var index: Int = 0
+
+			for pattern in patterns:
+				body: CoreExpr = if index == 0:
+					match_case.body
+				else:
+					cloned: (Int, CoreExpr) = clone_match_arm_body(current_id, match_case.body)
+					current_id = cloned[0]
+					cloned[1]
+
+				expanded = expanded.append({ pattern = pattern, body = body })
+				index += 1
+
+			(current_id, expanded)
+		_:
+			(next_id, [match_case])
+
+
+private pure func expand_or_match_cases_at(
+	next_id: Int,
+	cases: List[CoreRawMatchCase],
+) -> (Int, List[CoreRawMatchCase]):
+	var current_id: Int = next_id
+	var expanded: List[CoreRawMatchCase] = []
+
+	for match_case in cases:
+		result: (Int, List[CoreRawMatchCase]) = expand_or_match_case_at(current_id, match_case)
+		current_id = result[0]
+		expanded = expanded.concat(result[1])
+
+	(current_id, expanded)
 
 
 private pure func constructor_name_of_callee(
@@ -2753,18 +3160,26 @@ private pure func compile_constructor_match_cases(
 		Some(SemanticConstructorMatch(RootSemanticMatchAccessor, constructor_cases, fallback))
 
 
-pure func compile_match_cases(
+-- `next_id` threads the shared allocator through the or-pattern clones
+-- `expand_or_match_cases_at` mints (see `clone_match_arm_body`); callers
+-- that do not need identity to stay consistent across sibling matches (the
+-- owning test suite exercises one match at a time) use `compile_match_cases`
+-- below, which reseeds it per call.
+pure func compile_match_cases_at(
+	next_id: Int,
 	constructors: Set[String],
 	cases: List[CoreRawMatchCase],
-) -> Option[CoreSemanticMatchTree]:
-	normalized_cases: List[CoreRawMatchCase] = expand_or_match_cases(
+) -> (Int, Option[CoreSemanticMatchTree]):
+	expanded: (Int, List[CoreRawMatchCase]) = expand_or_match_cases_at(
+		next_id,
 		normalize_match_cases(
 			constructors,
 			cases,
 		),
 	)
+	normalized_cases: List[CoreRawMatchCase] = expanded[1]
 
-	match match_case_shape(normalized_cases):
+	tree: Option[CoreSemanticMatchTree] = match match_case_shape(normalized_cases):
 		CatchallMatchCases:
 			match normalized_cases.get(0):
 				Some(match_case):
@@ -2782,12 +3197,32 @@ pure func compile_match_cases(
 		UnsupportedMatchCases:
 			None
 
+	(expanded[0], tree)
 
-private pure func compile_expr(constructors: Set[String], expr: CoreExpr) -> CoreExpr:
-	mapped_expr: CoreExpr = CoreTraverse.map_core_expr_children(
+
+pure func compile_match_cases(
+	constructors: Set[String],
+	cases: List[CoreRawMatchCase],
+) -> Option[CoreSemanticMatchTree]:
+	compile_match_cases_at(CORE_SYNTHETIC_ID_SEED, constructors, cases)[1]
+
+
+-- Threads a `next_id` allocator across the whole function body (seeded once
+-- per function by `compile_expr`, mirroring `std_inline.brp`'s
+-- `rewrite_function`) so two `A | B: body` matches in the same function
+-- never mint the same clone id -- see `compile_match_cases_at`.
+private pure func compile_expr_at(
+	constructors: Set[String],
+	next_id: Int,
+	expr: CoreExpr,
+) -> CoreTraverse.CoreMapState[Int, CoreExpr]:
+	mapped_children: CoreTraverse.CoreMapState[Int, CoreExpr] = CoreTraverse.map_core_expr_children_with_state(
+		next_id,
+		pure func(state: Int, child: CoreExpr): compile_expr_at(constructors, state, child),
 		expr,
-		func(child): compile_expr(constructors, child),
 	)
+	mapped_expr: CoreExpr = mapped_children.value
+	after_children: Int = mapped_children.state
 
 	match mapped_expr:
 		RawMatchExpr(scrutinee, cases, typ, loc):
@@ -2795,15 +3230,31 @@ private pure func compile_expr(constructors: Set[String], expr: CoreExpr) -> Cor
 
 			match try_fuse_direct_constructor_match(constructors, scrutinee, normalized_cases):
 				Some(fused):
-					fused
+					{ state = after_children, value = fused }
 				None:
-					match compile_match_cases(constructors, normalized_cases):
+					compiled: (Int, Option[CoreSemanticMatchTree]) = compile_match_cases_at(
+						after_children,
+						constructors,
+						normalized_cases,
+					)
+
+					match compiled[1]:
 						Some(tree):
-							SemanticMatchExpr(scrutinee, tree, typ, loc)
+							{
+								state = compiled[0],
+								value = SemanticMatchExpr(scrutinee, tree, typ, loc)
+							}
 						None:
-							RawMatchExpr(scrutinee, normalized_cases, typ, loc)
+							{
+								state = compiled[0],
+								value = RawMatchExpr(scrutinee, normalized_cases, typ, loc)
+							}
 		_:
-			mapped_expr
+			{ state = after_children, value = mapped_expr }
+
+
+private pure func compile_expr(constructors: Set[String], expr: CoreExpr) -> CoreExpr:
+	compile_expr_at(constructors, CORE_SYNTHETIC_ID_SEED, expr).value
 
 
 private pure func compile_function(

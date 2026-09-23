@@ -85,7 +85,11 @@ import:
 		CoreUnboxKind(Float16Unbox, Float32Unbox, FloatUnbox, PointerUnbox, PrimUnbox, StructUnbox),
 		CoreVar,
 		core_expr_type,
-	traverse: immediate_core_expr_children, map_core_expr_children
+	traverse:
+		CoreMapState,
+		immediate_core_expr_children,
+		map_core_expr_children,
+		map_core_expr_children_with_state
 
 
 private INT_TYPE: CoreType = NamedType("Int", [])
@@ -97,6 +101,30 @@ private POINTER_TYPE: CoreType = NamedType("Ptr", [])
 private VOID_TYPE: CoreType = VoidType
 
 private COMPILER_LOCAL_PREFIX: String = "$blorp$collection_pipeline$"
+
+-- Core Identity Migration step 5 (docs/CORE_ID_MIGRATION.md). Every real,
+-- source-derived binder id (`core_binder_id`, `stage_08_core_lower/lower.brp`)
+-- is a source-span offset strictly below 2^31 (compiler source files are
+-- bounded under 2 GiB), so a synthetic id built from this seed can never
+-- collide with one.
+private CORE_SYNTHETIC_ID_SEED: Int = 2147483648
+
+-- One fusion site's synthetic vars (`source`, `length`, `index`, ...) never
+-- number more than a handful; 64 leaves generous headroom so two sites'
+-- bands never overlap.
+private COLLECTION_PIPELINE_ID_BAND: Int = 64
+
+-- A per-fusion-site id band, independent of the *name* `fresh_var` mints
+-- (which keeps its exact old spelling so generated C stays byte-identical --
+-- see `fresh_var`'s docstring). Two pipeline fusions in the same function
+-- previously reused the same `(name, id)` pairs because `fresh_var` always
+-- started counting from 0; `site` is `fuse_collection_expr`'s own
+-- pre-order visit counter (see `fuse_collection_expr_at`), advanced once per
+-- node regardless of whether that node fuses, so two distinct fusion sites
+-- in one function never share a band even when they sit at the same source
+-- location (an inlined or duplicated subtree).
+private pure func collection_pipeline_id_band(site: Int) -> Int:
+	CORE_SYNTHETIC_ID_SEED + site * COLLECTION_PIPELINE_ID_BAND
 
 
 private record CoreCollectionFreshVar {
@@ -124,12 +152,16 @@ private pure func core_var(name: String, id: Int) -> CoreVar:
 	}
 
 
-private pure func fresh_var(label: String, next_fresh: Int) -> CoreCollectionFreshVar:
+-- `id_band` (see `collection_pipeline_id_band`) makes the `id` unique across
+-- fusion sites in the same function; `name` is built from `next` alone, the
+-- same formula this always used, so generated C stays byte-identical.
+private pure func fresh_var(label: String, next_fresh: Int, id_band: Int) -> CoreCollectionFreshVar:
 	next: Int = next_fresh + 1
 	{
-		variable = core_var(COMPILER_LOCAL_PREFIX + label
-				.length()
-				.to_string() + "$" + label + "$" + next.to_string(), next),
+		variable = core_var(
+			COMPILER_LOCAL_PREFIX + label.length().to_string() + "$" + label + "$" + next.to_string(),
+			id_band + next,
+		),
 		next_fresh = next
 	}
 
@@ -570,6 +602,7 @@ private pure func emit_collection_stages(
 	next_fresh: Int,
 	terminal: pure (CoreCollectionStreamCurrent, Int) -> CoreCollectionLowering,
 	loc: CoreSourceLoc,
+	id_band: Int,
 ) -> CoreCollectionLowering:
 	match stages:
 		[]:
@@ -583,6 +616,7 @@ private pure func emit_collection_stages(
 						next_fresh,
 						terminal,
 						loc,
+						id_band,
 					)
 					{
 						expr = IfExpr(
@@ -595,7 +629,7 @@ private pure func emit_collection_stages(
 						next_fresh = lowered.next_fresh
 					}
 				CollectionMapStage(callback, _, output_type):
-					mapped_fresh: CoreCollectionFreshVar = fresh_var("mapped", next_fresh)
+					mapped_fresh: CoreCollectionFreshVar = fresh_var("mapped", next_fresh, id_band)
 					mapped: CoreExpr = VarExpr(mapped_fresh.variable, output_type, loc)
 					lowered: CoreCollectionLowering = emit_collection_stages(
 						rest,
@@ -603,6 +637,7 @@ private pure func emit_collection_stages(
 						mapped_fresh.next_fresh,
 						terminal,
 						loc,
+						id_band,
 					)
 					{
 						expr = LetExpr(
@@ -620,10 +655,11 @@ private pure func emit_collection_stages(
 						next_fresh = lowered.next_fresh
 					}
 				CollectionFilterMapStage(callback, _, output_type, option_type):
-					option_fresh: CoreCollectionFreshVar = fresh_var("mapped_opt", next_fresh)
+					option_fresh: CoreCollectionFreshVar = fresh_var("mapped_opt", next_fresh, id_band)
 					value_fresh: CoreCollectionFreshVar = fresh_var(
 						"value",
 						option_fresh.next_fresh,
+						id_band,
 					)
 					option_value: CoreExpr = VarExpr(option_fresh.variable, option_type, loc)
 					value: CoreExpr = VarExpr(value_fresh.variable, output_type, loc)
@@ -633,6 +669,7 @@ private pure func emit_collection_stages(
 						value_fresh.next_fresh,
 						terminal,
 						loc,
+						id_band,
 					)
 					{
 						expr = LetExpr(
@@ -768,14 +805,16 @@ private pure func lower_stream_length(
 	element_type: CoreType,
 	source_access: CoreCollectionSourceAccess,
 	stages: List[CoreCollectionPipelineStage],
+	site: Int,
 ) -> CoreExpr:
 	loc: CoreSourceLoc = plan.loc
-	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0)
-	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh)
-	index_fresh: CoreCollectionFreshVar = fresh_var("index", length_fresh.next_fresh)
-	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh)
-	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh)
-	count_fresh: CoreCollectionFreshVar = fresh_var("count", element_fresh.next_fresh)
+	id_band: Int = collection_pipeline_id_band(site)
+	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0, id_band)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh, id_band)
+	index_fresh: CoreCollectionFreshVar = fresh_var("index", length_fresh.next_fresh, id_band)
+	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh, id_band)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh, id_band)
+	count_fresh: CoreCollectionFreshVar = fresh_var("count", element_fresh.next_fresh, id_band)
 	source_ref: CoreExpr = VarExpr(source_fresh.variable, core_expr_type(source), loc)
 	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
 	index_ref: CoreExpr = VarExpr(index_fresh.variable, INT_TYPE, loc)
@@ -807,7 +846,7 @@ private pure func lower_stream_length(
 	, element_fresh.variable
 	, element_type
 	, pure func(current, next):
-		emit_collection_stages(stages, current, next, increment, loc)
+		emit_collection_stages(stages, current, next, increment, loc, id_band)
 	, count_fresh.next_fresh
 	, loc)
 	loop_body: CoreExpr = LetExpr(
@@ -860,13 +899,19 @@ private pure func lower_stream_fold_at(
 	initial: CoreExpr,
 	reducer: CoreExpr,
 	accumulator_type: CoreType,
+	site: Int,
 ) -> CoreExpr:
-	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0)
-	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh)
-	index_fresh: CoreCollectionFreshVar = fresh_var("index", length_fresh.next_fresh)
-	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh)
-	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh)
-	accumulator_fresh: CoreCollectionFreshVar = fresh_var("accumulator", element_fresh.next_fresh)
+	id_band: Int = collection_pipeline_id_band(site)
+	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0, id_band)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh, id_band)
+	index_fresh: CoreCollectionFreshVar = fresh_var("index", length_fresh.next_fresh, id_band)
+	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh, id_band)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh, id_band)
+	accumulator_fresh: CoreCollectionFreshVar = fresh_var(
+		"accumulator",
+		element_fresh.next_fresh,
+		id_band,
+	)
 	source_ref: CoreExpr = VarExpr(source_fresh.variable, core_expr_type(source), loc)
 	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
 	index_ref: CoreExpr = VarExpr(index_fresh.variable, INT_TYPE, loc)
@@ -876,7 +921,7 @@ private pure func lower_stream_fold_at(
 		current: CoreCollectionStreamCurrent,
 		next_fresh: Int,
 	):
-		next_value_fresh: CoreCollectionFreshVar = fresh_var("next", next_fresh)
+		next_value_fresh: CoreCollectionFreshVar = fresh_var("next", next_fresh, id_band)
 		next_value: CoreExpr = VarExpr(next_value_fresh.variable, accumulator_type, loc)
 		{
 			expr = LetExpr(
@@ -908,7 +953,7 @@ private pure func lower_stream_fold_at(
 	, element_fresh.variable
 	, element_type
 	, pure func(current, next):
-		emit_collection_stages(stages, current, next, reduce, loc)
+		emit_collection_stages(stages, current, next, reduce, loc, id_band)
 	, accumulator_fresh.next_fresh
 	, loc)
 	loop_body: CoreExpr = LetExpr(
@@ -959,15 +1004,17 @@ private pure func lower_stream_collect(
 	source_access: CoreCollectionSourceAccess,
 	stages: List[CoreCollectionPipelineStage],
 	result_type: CoreType,
+	site: Int,
 ) -> CoreExpr:
 	loc: CoreSourceLoc = plan.loc
-	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0)
-	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh)
-	result_fresh: CoreCollectionFreshVar = fresh_var("result", length_fresh.next_fresh)
-	out_fresh: CoreCollectionFreshVar = fresh_var("out", result_fresh.next_fresh)
-	index_fresh: CoreCollectionFreshVar = fresh_var("index", out_fresh.next_fresh)
-	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh)
-	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh)
+	id_band: Int = collection_pipeline_id_band(site)
+	source_fresh: CoreCollectionFreshVar = fresh_var("source", 0, id_band)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", source_fresh.next_fresh, id_band)
+	result_fresh: CoreCollectionFreshVar = fresh_var("result", length_fresh.next_fresh, id_band)
+	out_fresh: CoreCollectionFreshVar = fresh_var("out", result_fresh.next_fresh, id_band)
+	index_fresh: CoreCollectionFreshVar = fresh_var("index", out_fresh.next_fresh, id_band)
+	raw_fresh: CoreCollectionFreshVar = fresh_var("raw", index_fresh.next_fresh, id_band)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", raw_fresh.next_fresh, id_band)
 	source_ref: CoreExpr = VarExpr(source_fresh.variable, core_expr_type(source), loc)
 	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
 	result_ref: CoreExpr = VarExpr(result_fresh.variable, result_type, loc)
@@ -1019,7 +1066,7 @@ private pure func lower_stream_collect(
 	, element_fresh.variable
 	, element_type
 	, pure func(current, next):
-		emit_collection_stages(stages, current, next, write, loc)
+		emit_collection_stages(stages, current, next, write, loc, id_band)
 	, element_fresh.next_fresh
 	, loc)
 	loop_body: CoreExpr = LetExpr(
@@ -1073,15 +1120,17 @@ private pure func lower_range_stream_collect(
 	stop: CoreExpr,
 	stages: List[CoreCollectionPipelineStage],
 	result_type: CoreType,
+	site: Int,
 ) -> CoreExpr:
 	loc: CoreSourceLoc = plan.loc
-	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0)
-	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh)
-	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh)
-	result_fresh: CoreCollectionFreshVar = fresh_var("result", length_fresh.next_fresh)
-	out_fresh: CoreCollectionFreshVar = fresh_var("out", result_fresh.next_fresh)
-	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", out_fresh.next_fresh)
-	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh)
+	id_band: Int = collection_pipeline_id_band(site)
+	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0, id_band)
+	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh, id_band)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh, id_band)
+	result_fresh: CoreCollectionFreshVar = fresh_var("result", length_fresh.next_fresh, id_band)
+	out_fresh: CoreCollectionFreshVar = fresh_var("out", result_fresh.next_fresh, id_band)
+	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", out_fresh.next_fresh, id_band)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh, id_band)
 	start_ref: CoreExpr = VarExpr(start_fresh.variable, INT_TYPE, loc)
 	stop_ref: CoreExpr = VarExpr(stop_fresh.variable, INT_TYPE, loc)
 	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
@@ -1121,6 +1170,7 @@ private pure func lower_range_stream_collect(
 		element_fresh.next_fresh,
 		write,
 		loc,
+		id_band,
 	)
 	loop_body: CoreExpr = LetExpr(
 		element_fresh.variable,
@@ -1199,14 +1249,16 @@ private pure func lower_range_stream_length(
 	start: CoreExpr,
 	stop: CoreExpr,
 	stages: List[CoreCollectionPipelineStage],
+	site: Int,
 ) -> CoreExpr:
 	loc: CoreSourceLoc = plan.loc
-	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0)
-	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh)
-	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh)
-	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", length_fresh.next_fresh)
-	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh)
-	count_fresh: CoreCollectionFreshVar = fresh_var("count", element_fresh.next_fresh)
+	id_band: Int = collection_pipeline_id_band(site)
+	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0, id_band)
+	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh, id_band)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh, id_band)
+	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", length_fresh.next_fresh, id_band)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh, id_band)
+	count_fresh: CoreCollectionFreshVar = fresh_var("count", element_fresh.next_fresh, id_band)
 	start_ref: CoreExpr = VarExpr(start_fresh.variable, INT_TYPE, loc)
 	stop_ref: CoreExpr = VarExpr(stop_fresh.variable, INT_TYPE, loc)
 	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
@@ -1237,6 +1289,7 @@ private pure func lower_range_stream_length(
 		count_fresh.next_fresh,
 		increment,
 		loc,
+		id_band,
 	)
 	loop_body: CoreExpr = LetExpr(
 		element_fresh.variable,
@@ -1289,14 +1342,20 @@ private pure func lower_range_stream_fold(
 	initial: CoreExpr,
 	reducer: CoreExpr,
 	accumulator_type: CoreType,
+	site: Int,
 ) -> CoreExpr:
 	loc: CoreSourceLoc = plan.loc
-	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0)
-	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh)
-	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh)
-	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", length_fresh.next_fresh)
-	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh)
-	accumulator_fresh: CoreCollectionFreshVar = fresh_var("accumulator", element_fresh.next_fresh)
+	id_band: Int = collection_pipeline_id_band(site)
+	start_fresh: CoreCollectionFreshVar = fresh_var("start", 0, id_band)
+	stop_fresh: CoreCollectionFreshVar = fresh_var("stop", start_fresh.next_fresh, id_band)
+	length_fresh: CoreCollectionFreshVar = fresh_var("length", stop_fresh.next_fresh, id_band)
+	offset_fresh: CoreCollectionFreshVar = fresh_var("offset", length_fresh.next_fresh, id_band)
+	element_fresh: CoreCollectionFreshVar = fresh_var("element", offset_fresh.next_fresh, id_band)
+	accumulator_fresh: CoreCollectionFreshVar = fresh_var(
+		"accumulator",
+		element_fresh.next_fresh,
+		id_band,
+	)
 	start_ref: CoreExpr = VarExpr(start_fresh.variable, INT_TYPE, loc)
 	stop_ref: CoreExpr = VarExpr(stop_fresh.variable, INT_TYPE, loc)
 	length_ref: CoreExpr = VarExpr(length_fresh.variable, INT_TYPE, loc)
@@ -1307,7 +1366,7 @@ private pure func lower_range_stream_fold(
 		current: CoreCollectionStreamCurrent,
 		next_fresh: Int,
 	):
-		next_value_fresh: CoreCollectionFreshVar = fresh_var("next", next_fresh)
+		next_value_fresh: CoreCollectionFreshVar = fresh_var("next", next_fresh, id_band)
 		next_value: CoreExpr = VarExpr(next_value_fresh.variable, accumulator_type, loc)
 		{
 			expr = LetExpr(
@@ -1337,6 +1396,7 @@ private pure func lower_range_stream_fold(
 		accumulator_fresh.next_fresh,
 		reduce,
 		loc,
+		id_band,
 	)
 	loop_body: CoreExpr = LetExpr(
 		element_fresh.variable,
@@ -1387,15 +1447,16 @@ private pure func lower_range_collection_plan(
 	start: CoreExpr,
 	stop: CoreExpr,
 	stages: List[CoreCollectionPipelineStage],
+	site: Int,
 ) -> Option[CoreExpr]:
 	if not plan_is_unboxed_scalar(model, plan):
 		None
 	else:
 		match plan.sink:
 			CollectionCollectSink(result_type):
-				Some(lower_range_stream_collect(plan, start, stop, stages, result_type))
+				Some(lower_range_stream_collect(plan, start, stop, stages, result_type, site))
 			CollectionLengthSink:
-				Some(lower_range_stream_length(plan, start, stop, stages))
+				Some(lower_range_stream_length(plan, start, stop, stages, site))
 			CollectionFoldSink(initial, reducer, accumulator_type):
 				Some(
 					lower_range_stream_fold(
@@ -1406,6 +1467,7 @@ private pure func lower_range_collection_plan(
 						initial,
 						reducer,
 						accumulator_type,
+						site,
 					),
 				)
 
@@ -1417,6 +1479,7 @@ private pure func lower_list_collect_plan(
 	element_type: CoreType,
 	stages: List[CoreCollectionPipelineStage],
 	result_type: CoreType,
+	site: Int,
 ) -> Option[CoreExpr]:
 	match source:
 		VarExpr(_, _, _):
@@ -1432,6 +1495,7 @@ private pure func lower_list_collect_plan(
 						policy.source_access,
 						stages,
 						result_type,
+						site,
 					),
 				)
 			else:
@@ -1446,10 +1510,11 @@ private pure func lower_list_collection_plan(
 	source: CoreExpr,
 	element_type: CoreType,
 	stages: List[CoreCollectionPipelineStage],
+	site: Int,
 ) -> Option[CoreExpr]:
 	match plan.sink:
 		CollectionCollectSink(result_type):
-			lower_list_collect_plan(model, plan, source, element_type, stages, result_type)
+			lower_list_collect_plan(model, plan, source, element_type, stages, result_type, site)
 		CollectionLengthSink:
 			policy ?= length_policy_for_plan(model, plan)
 			Some(
@@ -1460,6 +1525,7 @@ private pure func lower_list_collection_plan(
 					element_type,
 					policy.source_access,
 					stages,
+					site,
 				),
 			)
 		CollectionFoldSink(initial, reducer, accumulator_type):
@@ -1475,6 +1541,7 @@ private pure func lower_list_collection_plan(
 						initial,
 						reducer,
 						accumulator_type,
+						site,
 					),
 				)
 			else:
@@ -1484,6 +1551,7 @@ private pure func lower_list_collection_plan(
 private pure func lower_collection_plan(
 	model: CoreCollectionPipelineModel,
 	plan: CoreCollectionPipelinePlan,
+	site: Int,
 ) -> Option[CoreExpr]:
 	if not plan_callbacks_are_pure(plan):
 		None
@@ -1492,14 +1560,15 @@ private pure func lower_collection_plan(
 
 		match plan.source:
 			CollectionRangeSource(start, stop):
-				lower_range_collection_plan(model, plan, start, stop, stages)
+				lower_range_collection_plan(model, plan, start, stop, stages, site)
 			CollectionListSource(source, element_type):
-				lower_list_collection_plan(model, plan, source, element_type, stages)
+				lower_list_collection_plan(model, plan, source, element_type, stages, site)
 
 
 private pure func lower_bare_list_fold(
 	model: CoreCollectionPipelineModel,
 	expr: CoreExpr,
+	site: Int,
 ) -> Option[CoreExpr]:
 	match collection_pipeline_call_base_and_args(expr):
 		Some(call):
@@ -1531,6 +1600,7 @@ private pure func lower_bare_list_fold(
 							initial,
 							reducer,
 							core_expr_type(expr),
+							site,
 						),
 					)
 				else:
@@ -1541,26 +1611,48 @@ private pure func lower_bare_list_fold(
 			None
 
 
-pure func fuse_collection_expr(model: CoreCollectionPipelineModel, expr: CoreExpr) -> CoreExpr:
+-- Every node visited advances `site` by one, whether or not it fuses (see
+-- `fuse_collection_expr_at`), so two fusion sites in one function never
+-- share `collection_pipeline_id_band`'s band even if their calls sit at the
+-- same source location (an inlined or otherwise duplicated subtree).
+private pure func fuse_collection_expr_at(
+	model: CoreCollectionPipelineModel,
+	site: Int,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
 	match collection_pipeline_plan(expr):
 		Some(plan):
-			match lower_collection_plan(model, plan):
+			match lower_collection_plan(model, plan, site):
 				Some(lowered):
-					lowered
+					{ state = site + 1, value = lowered }
 				None:
-					map_core_expr_children(
-						expr,
-						pure func(child): fuse_collection_expr(model, child),
-					)
+					mapper: pure (Int, CoreExpr) -> CoreMapState[Int, CoreExpr] = pure func(
+						child_site: Int,
+						child: CoreExpr,
+					):
+						fuse_collection_expr_at(model, child_site, child)
+
+					map_core_expr_children_with_state(site, mapper, expr)
 		None:
-			match lower_bare_list_fold(model, expr):
+			match lower_bare_list_fold(model, expr, site):
 				Some(lowered):
-					lowered
+					{ state = site + 1, value = lowered }
 				None:
-					map_core_expr_children(
-						expr,
-						pure func(child): fuse_collection_expr(model, child),
-					)
+					mapper: pure (Int, CoreExpr) -> CoreMapState[Int, CoreExpr] = pure func(
+						child_site: Int,
+						child: CoreExpr,
+					):
+						fuse_collection_expr_at(model, child_site, child)
+
+					map_core_expr_children_with_state(site, mapper, expr)
+
+
+-- Public entry point kept single-expression (`fuse_collection_expr(model, expr)`)
+-- for its existing callers and tests: a lone expression's own fusion sites
+-- are still numbered from 0, which is exactly what a fresh `site` counter
+-- gives it, so this is a compatible wrapper around the stateful walk above.
+pure func fuse_collection_expr(model: CoreCollectionPipelineModel, expr: CoreExpr) -> CoreExpr:
+	fuse_collection_expr_at(model, 0, expr).value
 
 
 private pure func fuse_collection_function(
