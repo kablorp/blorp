@@ -281,7 +281,12 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 // themselves instrumented), or be listed in the allowlist comment block
 // next to it explaining why the oracle does not observe it. See
 // blorp/test/runtime/test_runtime_alloc_oracle_coverage.py.
-static bool __blorp_lightweight_stats_enabled = false;
+// Atomic: flipped at runtime by blorp_reset_mem_stats(), which any test
+// fiber/thread can call while a straggler from a prior concurrent test is
+// still reading it on another thread (the combined leak-suite artifact runs
+// many single- and multi-fiber test programs sequentially in one process, so
+// this is a real cross-thread access, not just a startup-time flag).
+static _Atomic bool __blorp_lightweight_stats_enabled = false;
 
 static struct {
     _Atomic long backing_pool_refill_events;
@@ -428,6 +433,25 @@ typedef struct blorp_Object_s {
 
 #define BLORP_ALLOC_CLASS_DIRECT UINT32_MAX
 typedef void (*blorp_destructor_fn)(void*);
+
+// Sentinel refcount for immortal singleton objects (nullary constructors like
+// None, static string/list/closure literals, Timeout/Cancelled). Retain and
+// release fold the immortality check into their one RMW instead of a
+// separate pre-check load+branch: the increment/decrement always happens,
+// and only the *result* of that RMW is tested. That only works because an
+// immortal object's count is a whole range, not one exact value -- retain
+// nudges it up by one, release nudges it down by one, and it must never be
+// mistaken for the ordinary 1 -> 0 transition or overflow LONG_MAX. Placing
+// it at LONG_MAX / 2 leaves ~LONG_MAX / 4 of headroom on each side: no real
+// object's refcount gets remotely close to that (it would need on the order
+// of 2^60 mismatched retains against one immortal object, which is not
+// reachable by any real program), and BLORP_IS_IMMORTAL_REFCOUNT's threshold
+// (LONG_MAX / 4) sits exactly halfway through that headroom in either
+// direction. Every reader that used to test `== BLORP_IMMORTAL_REFCOUNT`
+// (this file, runtime_decl.c, and the generated iterative union destructor
+// in stage_10_backend/emit.brp) now tests the range instead.
+#define BLORP_IMMORTAL_REFCOUNT (LONG_MAX / 2)
+#define BLORP_IS_IMMORTAL_REFCOUNT(rc) ((rc) >= (LONG_MAX / 4))
 
 // User-facing value snapshot for blorp_get_mem_stats.
 //
@@ -928,7 +952,12 @@ static inline void __blorp_scheduler_stat_lock(
 // Full stats/leak modes retain per-object metadata. Allocator and compiler
 // memory profiles use only atomic object counters plus allocator/RSS snapshots.
 // With neither mode enabled, alloc/release skip all stats traffic.
-static bool __blorp_stats_enabled = false;
+//
+// Atomic for the same reason as __blorp_lightweight_stats_enabled above:
+// blorp_reset_mem_stats()/blorp_get_mem_stats() can flip this from whatever
+// test fiber called them while blorp_alloc/blorp_release read it concurrently
+// on another thread.
+static _Atomic bool __blorp_stats_enabled = false;
 // __blorp_lightweight_stats_enabled is declared earlier, next to the
 // allocation-oracle counters that also gate on it.
 static bool __blorp_compiler_memory_profile_enabled = false;
@@ -1041,11 +1070,12 @@ static bool __leak_tracking_enabled = false;
 static pthread_mutex_t __alloc_meta_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static inline bool __alloc_meta_enabled(void) {
-    return __blorp_stats_enabled || __leak_tracking_enabled;
+    return atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed) ||
+           __leak_tracking_enabled;
 }
 
 static inline bool __blorp_allocator_stats_active(void) {
-    return __blorp_lightweight_stats_enabled;
+    return atomic_load_explicit(&__blorp_lightweight_stats_enabled, memory_order_relaxed);
 }
 
 static long __blorp_allocator_bytes_in_use(void) {
@@ -1378,14 +1408,17 @@ static void __blorp_init_stats_flag(void) {
         getenv("BLORP_TYPECHECK_BODY_METRICS") != NULL;
     __blorp_core_lowering_type_metrics_enabled =
         getenv("BLORP_CORE_LOWERING_TYPE_METRICS") != NULL;
-    __blorp_lightweight_stats_enabled =
+    atomic_store_explicit(&__blorp_lightweight_stats_enabled,
         getenv("BLORP_ALLOCATOR_STATS") != NULL ||
         __blorp_compiler_memory_profile_enabled ||
-        __blorp_typecheck_body_metrics_enabled;
-    __blorp_stats_enabled = (getenv("BLORP_LEAK_CHECK") != NULL) ||
-                            (getenv("BLORP_TRACK_STATS") != NULL) ||
-                            (getenv("BLORP_TRACE_ALLOCS") != NULL) ||
-                            (mem_watch_env != NULL);
+        __blorp_typecheck_body_metrics_enabled,
+        memory_order_relaxed);
+    atomic_store_explicit(&__blorp_stats_enabled,
+        (getenv("BLORP_LEAK_CHECK") != NULL) ||
+        (getenv("BLORP_TRACK_STATS") != NULL) ||
+        (getenv("BLORP_TRACE_ALLOCS") != NULL) ||
+        (mem_watch_env != NULL),
+        memory_order_relaxed);
     __blorp_trace_allocs = (getenv("BLORP_TRACE_ALLOCS") != NULL);
     __leak_tracking_enabled = (getenv("BLORP_LEAK_CHECK") != NULL);
     __alloc_live_sentinel.live_next = NULL;
@@ -1408,11 +1441,12 @@ static inline void blorp_init_object_header(blorp_Object* header,
     header->alloc_class = alloc_class;
     header->destructor_id = 0;
     __alloc_meta_insert(header, alloc_size, true);
-    if (__blorp_stats_enabled || __blorp_lightweight_stats_enabled) {
+    bool stats_on = atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed);
+    if (stats_on || atomic_load_explicit(&__blorp_lightweight_stats_enabled, memory_order_relaxed)) {
         global_mem_stats.total_allocations++;
         global_mem_stats.current_objects++;
     }
-    if (__blorp_stats_enabled) {
+    if (stats_on) {
         global_mem_stats.bytes_allocated += (long)alloc_size;
     }
 }
@@ -2975,7 +3009,7 @@ static long __blorp_collect_live_object_types(FILE* out,
     while (meta && counted < 10000) {
         blorp_Object* obj = meta->object;
         long rc = (long)atomic_load(&obj->refcount);
-        if (rc != LONG_MAX && meta->stats_tracked &&
+        if (!BLORP_IS_IMMORTAL_REFCOUNT(rc) && meta->stats_tracked &&
             meta->stats_epoch == current_epoch) {
             __leak_type_record(buckets, meta->type_tag, meta->alloc_size);
             if (verbose) {
@@ -3313,7 +3347,8 @@ void* blorp_alloc(size_t size) {
     void* alloc_site = NULL;
 
 #if defined(__GNUC__) || defined(__clang__)
-    if (__alloc_meta_enabled() || (__blorp_stats_enabled && __blorp_trace_allocs)) {
+    if (__alloc_meta_enabled() ||
+        (atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed) && __blorp_trace_allocs)) {
         alloc_site = __builtin_extract_return_addr(__builtin_return_address(0));
     }
 #endif
@@ -3385,7 +3420,7 @@ void* blorp_alloc(size_t size) {
             : 0;
         __alloc_meta_set_alloc_site(header, alloc_site_offset, 0);
     }
-    if (__blorp_stats_enabled && __blorp_trace_allocs) {
+    if (atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed) && __blorp_trace_allocs) {
         __blorp_trace_record(actual_size, alloc_site);
     }
     return obj;
@@ -5340,8 +5375,8 @@ static int blorp_io_reactor_take_ready(
     return ready;
 }
 
-// Sentinel refcount for immortal singleton objects (nullary constructors like None)
-#define BLORP_IMMORTAL_REFCOUNT LONG_MAX
+// BLORP_IMMORTAL_REFCOUNT and BLORP_IS_IMMORTAL_REFCOUNT are defined next to
+// blorp_Object above, before their first use in the leak checker.
 
 // Slow path for release — called when refcount reaches zero.
 // Separated so the fast path (decrement + check) can be inlined.
@@ -5395,11 +5430,13 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
     }
 #endif
 
-    if (__blorp_stats_enabled && counted_in_current_epoch) {
+    bool release_stats_on = atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed);
+    if (release_stats_on && counted_in_current_epoch) {
         global_mem_stats.total_releases++;
         global_mem_stats.current_objects--;
         global_mem_stats.bytes_allocated -= (long)freed_size;
-    } else if (!__blorp_stats_enabled && __blorp_lightweight_stats_enabled) {
+    } else if (!release_stats_on &&
+               atomic_load_explicit(&__blorp_lightweight_stats_enabled, memory_order_relaxed)) {
         atomic_fetch_add_explicit(
             &global_mem_stats.total_releases, 1, memory_order_relaxed);
         atomic_fetch_sub_explicit(
@@ -5470,11 +5507,21 @@ void* blorp_union_destroy_stack_grow(void* old_stack, size_t new_size) {
   #define BLORP_RC_ACQUIRE_FENCE() atomic_thread_fence(memory_order_acquire)
 #endif
 
+// Retain and release used to load the count and compare it against
+// BLORP_IMMORTAL_REFCOUNT before ever touching the RMW, so an immortal
+// object paid a load + branch on every retain and every release in addition
+// to the real work. Folding the check into the RMW's own result removes
+// that: an immortal object's count still moves by one on every retain and
+// release (that's what keeps a single unconditional increment correct for
+// both mortal and immortal objects), but nothing ever inspects the *count*
+// of an immortal object except to decide whether a release just took it to
+// exactly 1 -- and by construction (see BLORP_IMMORTAL_REFCOUNT above) it
+// never does, so an immortal object's release path degenerates to "do
+// nothing further", with no separate immortal check required.
 __attribute__((always_inline))
 inline void* blorp_retain(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return NULL;
     blorp_Object* header = (blorp_Object*)obj;
-    if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return obj;
     BLORP_RC_INC(header->refcount);
     return obj;
 }
@@ -5483,7 +5530,6 @@ __attribute__((always_inline))
 inline void blorp_release(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return;
     blorp_Object* header = (blorp_Object*)obj;
-    if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return;
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
         BLORP_RC_ACQUIRE_FENCE();
@@ -5495,7 +5541,6 @@ __attribute__((always_inline))
 inline void blorp_release_arc_only(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return;
     blorp_Object* header = (blorp_Object*)obj;
-    if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return;
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
         BLORP_RC_ACQUIRE_FENCE();
@@ -5529,7 +5574,12 @@ static inline bool blorp_same_object(const void* left, const void* right) {
 void blorp_move_ref(void* obj) {
     if (obj == NULL) return;
     blorp_Object* header = (blorp_Object*)obj;
-    if (BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT) return;
+    // This one keeps an explicit pre-check (unlike retain/release): it
+    // decrements unconditionally and never inspects the RMW's result, so
+    // there is no "do nothing" fallthrough for the immortal count to land
+    // in by construction -- it must be excluded up front, with a range
+    // test since drift can move it anywhere in the immortal range.
+    if (BLORP_IS_IMMORTAL_REFCOUNT(BLORP_RC_LOAD(header->refcount))) return;
     // Unconditional decrement — caller guarantees refcount > 1
     // (checked via blorp_is_unique before calling).
     // Note: the is_unique check + move_ref is a two-step non-atomic TOCTOU
@@ -38491,7 +38541,7 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value) {
 blorp_MemStats blorp_get_mem_stats(void) {
     bool allocator_stats = __blorp_allocator_stats_active();
     if (!allocator_stats) {
-        __blorp_stats_enabled = true;
+        atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
     }
     blorp_MemStats stats = {0};
     if (allocator_stats) {
@@ -38543,8 +38593,8 @@ void blorp_reset_mem_stats(void) {
     // (see memory.brp's assert_no_heap_activity) takes two get_mem_stats()
     // snapshots under BLORP_ALLOCATOR_STATS and diffs them, and does not use
     // this reset.
-    __blorp_lightweight_stats_enabled = false;
-    __blorp_stats_enabled = true;
+    atomic_store_explicit(&__blorp_lightweight_stats_enabled, false, memory_order_relaxed);
+    atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
     atomic_fetch_add(&global_mem_stats.epoch, 1);
     atomic_store(&global_mem_stats.total_allocations, 0);
     atomic_store(&global_mem_stats.total_releases, 0);
@@ -38553,7 +38603,7 @@ void blorp_reset_mem_stats(void) {
 }
 
 void blorp_print_live_object_summary(void) {
-    __blorp_stats_enabled = true;
+    atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
     long leaked = atomic_load(&global_mem_stats.current_objects);
     if (leaked <= 0) return;
     if (!__leak_tracking_enabled) {

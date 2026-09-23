@@ -847,7 +847,13 @@ typedef struct {
 // Key Macros (used by codegen)
 // ============================================================================
 
-#define BLORP_IMMORTAL_REFCOUNT LONG_MAX
+// See the matching definition and full rationale next to blorp_Object in
+// runtime.c: immortal objects carry a count far from both 0 and LONG_MAX so
+// retain/release can fold the immortality check into their one RMW instead
+// of a separate load+branch. Every reader that used to test
+// `== BLORP_IMMORTAL_REFCOUNT` now tests the range instead.
+#define BLORP_IMMORTAL_REFCOUNT (LONG_MAX / 2)
+#define BLORP_IS_IMMORTAL_REFCOUNT(rc) ((rc) >= (LONG_MAX / 4))
 #define BLORP_TAG_SOME 0
 #define BLORP_TAG_NONE 1
 
@@ -1063,11 +1069,22 @@ void blorp_cooperative_checkpoint_slow_extern(void);
   #define BLORP_RC_ACQUIRE_FENCE() atomic_thread_fence(memory_order_acquire)
 #endif
 
+// Retain and release used to load the count and compare it against
+// BLORP_IMMORTAL_REFCOUNT before ever touching the RMW, so an immortal
+// object paid a load + branch on every retain and every release in addition
+// to the real work. Folding the check into the RMW's own result removes
+// that: an immortal object's count still moves by one on every retain and
+// release (that's what keeps a single unconditional increment correct for
+// both mortal and immortal objects), but nothing ever inspects the *count*
+// of an immortal object except to decide whether a release just took it to
+// exactly 1 -- and by construction (see BLORP_IMMORTAL_REFCOUNT above) it
+// never does, so an immortal object's release path degenerates to "do
+// nothing further", with no separate immortal check required.
+//
 // Inline fast paths for ARC hot functions (avoids cross-TU call overhead)
 static inline void* blorp_retain(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return NULL;
     blorp_Object* header = (blorp_Object*)obj;
-    if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return obj;
     BLORP_RC_INC(header->refcount);
     return obj;
 }
@@ -1075,7 +1092,6 @@ static inline void* blorp_retain(void* obj) {
 static inline void blorp_release(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return;
     blorp_Object* header = (blorp_Object*)obj;
-    if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return;
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
         BLORP_RC_ACQUIRE_FENCE();
@@ -1086,7 +1102,6 @@ static inline void blorp_release(void* obj) {
 static inline void blorp_release_arc_only(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return;
     blorp_Object* header = (blorp_Object*)obj;
-    if (__builtin_expect(BLORP_RC_LOAD(header->refcount) == BLORP_IMMORTAL_REFCOUNT, 0)) return;
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
         BLORP_RC_ACQUIRE_FENCE();
