@@ -3572,13 +3572,6 @@ private pure func direct_runtime_list_layout_metadata(
 			[LIST_STORAGE_INLINE_C, "sizeof(${c_type})", LIST_CALLBACK_BOXED_STRUCT_C]
 
 
-private pure func with_list_parallel_layout_metadata(
-	layout: CoreDirectRuntimeListLayoutArgs,
-	args: List[String],
-) -> List[String]:
-	args.concat(direct_runtime_list_layout_metadata(layout.layout))
-
-
 private pure func is_unary_tensor_parallel_layout_builtin(name: String) -> Bool:
 	(
 		name == "blorp_matrix_map"
@@ -3691,7 +3684,7 @@ private pure func direct_runtime_args(
 			Some(args)
 		DirectRuntimeArgsAppendListParallelLayout(layout):
 			if args.length() == layout.semantic_arity:
-				Some(with_list_parallel_layout_metadata(layout, args))
+				Some(args.concat(direct_runtime_list_layout_metadata(layout.layout)))
 			else if args.length() == layout.semantic_arity + LIST_PARALLEL_METADATA_ARG_COUNT:
 				Some(args)
 			else:
@@ -5423,16 +5416,12 @@ private pure func call_kind_ownership_contract(
 			None
 
 
-private pure func call_kind_consumes_arg(kind: CoreCallKind, arg_count: Int, index: Int) -> Bool:
-	cancellation_call_consumed_arg_indices(kind, arg_count).contains(index)
-
-
 private pure func direct_runtime_call_arg_ownership(
 	call: CoreDirectRuntimeCall,
 	arg_count: Int,
 	index: Int,
 ) -> CallArgOwnership:
-	if call_kind_consumes_arg(DirectRuntimeCall(call), arg_count, index):
+	if cancellation_call_consumed_arg_indices(DirectRuntimeCall(call), arg_count).contains(index):
 		CallConsumesArg
 	else:
 		CallBorrowsArg
@@ -11964,10 +11953,6 @@ private pure func closure_slot_decl(typ: CoreType, name: String, source: String)
 			)
 
 
-private pure func closure_param_decl(param: CoreParam, index: Int) -> Option[String]:
-	closure_slot_decl(param.typ, param.name.name, "__arg" + index.to_string())
-
-
 private pure func closure_param_decls(params: List[CoreParam]) -> Option[String]:
 	var result: String = ""
 	var failed: Bool = False
@@ -11975,7 +11960,7 @@ private pure func closure_param_decls(params: List[CoreParam]) -> Option[String]
 
 	for param in params:
 		if not failed:
-			match closure_param_decl(param, index):
+			match closure_slot_decl(param.typ, param.name.name, "__arg" + index.to_string()):
 				Some(decl):
 					result += decl
 				None:
@@ -14339,22 +14324,6 @@ private pure func emit_tailrec_list_length_fallback(
 			Some(emit_literal_match_failure(emission_context.indent, next_temp))
 
 
-private pure func tailrec_list_length_case_test(
-	len_name: String,
-	cursor_name: String,
-	length: Int,
-) -> String:
-	len_name + " == " + tailrec_cursor_index_expr(cursor_name, length)
-
-
-private pure func tailrec_list_length_geq_test(
-	len_name: String,
-	cursor_name: String,
-	minimum_length: Int,
-) -> String:
-	len_name + " >= " + tailrec_cursor_index_expr(cursor_name, minimum_length)
-
-
 private pure func emit_tailrec_list_length_match(
 	loop: CoreTailrecListSpreadLoop,
 	match_expr: CoreConstructorLengthMatch,
@@ -14381,11 +14350,7 @@ private pure func emit_tailrec_list_length_match(
 						inner_context,
 					):
 						Some(case_c):
-							test: String = tailrec_list_length_case_test(
-								len_name,
-								cursor_name,
-								match_case.length,
-							)
+							test: String = len_name + " == " + tailrec_cursor_index_expr(cursor_name, match_case.length)
 
 							if has_case:
 								branch_statements += emission_context.indent + "} else if (" + test + ") {\n"
@@ -14409,11 +14374,7 @@ private pure func emit_tailrec_list_length_match(
 							inner_context,
 						):
 							Some(case_c):
-								test: String = tailrec_list_length_geq_test(
-									len_name,
-									cursor_name,
-									geq_case.minimum_length,
-								)
+								test: String = len_name + " >= " + tailrec_cursor_index_expr(cursor_name, geq_case.minimum_length)
 
 								if has_case:
 									branch_statements += emission_context.indent + "} else if (" + test + ") {\n"
@@ -22476,10 +22437,6 @@ private record CEnumDeclEmission {
 }
 
 
-private pure func render_enum_decl_emission(emission: CEnumDeclEmission) -> String:
-	emission.type_header + emission.functions.join("") + "\n"
-
-
 private pure func emit_enum_decl(
 	enum_decl: CoreEnumDecl,
 	authority: CEmissionSymbolAuthority,
@@ -23771,10 +23728,6 @@ private pure func static_stack_result_initializer(
 			None
 
 
-private pure func union_construct_tag_c_name(construct: CoreUnionConstruct) -> String:
-	"TAG_" + construct.type_name + "_" + c_identifier(construct.constructor_name)
-
-
 private pure func static_generic_union_arg_initializer(
 	parent_path: String,
 	constructor_name: String,
@@ -23861,9 +23814,7 @@ private pure func static_generic_union_initializer(
 				construct.args,
 			)
 			storage_name: String = static_union_storage_name(path_c)
-			definition: String = args.definitions + "static " + construct.type_name + " " + storage_name + " = {\n  .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  .tag = " + union_construct_tag_c_name(
-				construct,
-			) + ",\n  .data." + c_identifier(
+			definition: String = args.definitions + "static " + construct.type_name + " " + storage_name + " = {\n  .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  .tag = " + "TAG_" + construct.type_name + "_" + c_identifier(construct.constructor_name) + ",\n  .data." + c_identifier(
 				construct.constructor_name,
 			) + " = { " + args.value + " }\n};\n\n"
 
@@ -24014,14 +23965,10 @@ private record CCanonicalEmptyListSplitEmission {
 }
 
 
-private pure func canonical_empty_list_storage_type_name(item: CanonicalEmptyList) -> String:
-	item.symbol_name + "__storage"
-
-
 private pure func canonical_empty_list_split_emission(
 	item: CanonicalEmptyList,
 ) -> CCanonicalEmptyListSplitEmission:
-	storage_type: String = canonical_empty_list_storage_type_name(item)
+	storage_type: String = item.symbol_name + "__storage"
 	fields_prefix: String = (
 		"blorp_Object header; long len; long capacity; void (*elem_release)(void*); "
 		+ "int16_t elem_size; uint8_t storage_mode; char __pad["
@@ -24100,19 +24047,13 @@ private pure func emit_static_string_literal_definitions(
 			.join("\n") + "\n\n"
 
 
-private pure func emit_static_string_literal_extern_decl(
-	literal: BackendStaticStringLiteral,
-) -> String:
-	"extern blorp_String " + static_string_literal_symbol(literal.id) + ";\n"
-
-
 private pure func emit_static_string_literal_extern_decls(
 	literals: List[BackendStaticStringLiteral],
 ) -> String:
 	var c_code: String = make_string(0)
 
 	for literal in literals:
-		c_code = append_emitted_c(c_code, emit_static_string_literal_extern_decl(literal))
+		c_code = append_emitted_c(c_code, "extern blorp_String " + static_string_literal_symbol(literal.id) + ";\n")
 
 	c_code
 
@@ -24372,10 +24313,6 @@ current `CoreGlobal.typ` renders as a plain prefix type from
 `TypeLayout.c_type_name` (the same call `emit_global_decl` makes), so the
 declarator is always `<type> <name>` and trivially externable.
 ---
-private pure func emit_global_extern_decl(global: CoreGlobal) -> String:
-	"extern " + TypeLayout.c_type_name(global.typ) + " " + c_var_name(global.name) + ";\n"
-
-
 private pure func global_needs_runtime_init(global: CoreGlobal) -> Bool:
 	if global_has_static_managed_decl(global):
 		False
@@ -24448,10 +24385,6 @@ private record CValueRecordDeclEmission {
 	type_header: String,
 	inline_support: String
 }
-
-
-private pure func render_value_record_decl_emission(emission: CValueRecordDeclEmission) -> String:
-	emission.type_header + emission.inline_support
 
 
 private pure func emit_value_record_decl(
@@ -24676,10 +24609,6 @@ private record CHeapRecordDeclEmission {
 }
 
 
-private pure func render_heap_record_decl_emission(emission: CHeapRecordDeclEmission) -> String:
-	emission.type_header + emission.functions.join("") + emission.inline_support
-
-
 private pure func emit_heap_record_decl(
 	record_decl: CoreHeapRecordDecl,
 	type_plan: CleanupTypePlan,
@@ -24773,14 +24702,6 @@ private pure func union_field_storage_type(
 			"void*"
 
 
-private pure func c_union_variant_field_decl(
-	payload_storage: CoreUnionPayloadStorage,
-	field: CoreUnionField,
-	index: Int,
-) -> String:
-	union_field_storage_type(payload_storage, field) + " field" + index.to_string() + "; "
-
-
 private pure func emit_union_variant_storage(
 	payload_storage: CoreUnionPayloadStorage,
 	variant: CoreUnionVariant,
@@ -24792,7 +24713,7 @@ private pure func emit_union_variant_storage(
 		var index: Int = 0
 
 		for field in variant.fields:
-			fields_c += c_union_variant_field_decl(payload_storage, field, index)
+			fields_c += union_field_storage_type(payload_storage, field) + " field" + index.to_string() + "; "
 			index += 1
 
 		"    struct { " + fields_c + "} " + variant.name + ";\n"
@@ -25390,7 +25311,7 @@ private pure func emit_global_extern_decls(decls: List[CoreDecl]) -> String:
 	for decl in decls:
 		match decl:
 			GlobalDecl(global):
-				c_code = append_emitted_c(c_code, emit_global_extern_decl(global))
+				c_code = append_emitted_c(c_code, "extern " + TypeLayout.c_type_name(global.typ) + " " + c_var_name(global.name) + ";\n")
 			EnumDecl(enum_decl):
 				void
 			HeapRecordDecl(record_decl):
@@ -25988,7 +25909,7 @@ private pure func join_value_record_decl_emissions(
 	var c_code: String = make_string(0)
 
 	for emission in emissions:
-		c_code = append_emitted_c(c_code, render_value_record_decl_emission(emission))
+		c_code = append_emitted_c(c_code, emission.type_header + emission.inline_support)
 
 	c_code
 
@@ -25999,7 +25920,7 @@ private pure func join_heap_record_decl_emissions(
 	var c_code: String = make_string(0)
 
 	for emission in emissions:
-		c_code = append_emitted_c(c_code, render_heap_record_decl_emission(emission))
+		c_code = append_emitted_c(c_code, emission.type_header + emission.functions.join("") + emission.inline_support)
 
 	c_code
 
@@ -26017,7 +25938,7 @@ private pure func join_enum_decl_emissions(emissions: List[CEnumDeclEmission]) -
 	var c_code: String = make_string(0)
 
 	for emission in emissions:
-		c_code = append_emitted_c(c_code, render_enum_decl_emission(emission))
+		c_code = append_emitted_c(c_code, emission.type_header + emission.functions.join("") + "\n")
 
 	c_code
 
@@ -26299,10 +26220,6 @@ private pure func union_constructor_signature(
 	) + ")"
 
 
-private pure func enum_vector_to_string_signature(naming: BackendTypeNaming) -> String:
-	"blorp_String* " + naming.enum_vector_to_string_name + "(blorp_Vector* v)"
-
-
 private pure func entrypoint_forward_decl_for_split(
 	func_info: CoreFunction,
 	symbol_authority: CEmissionSymbolAuthority,
@@ -26475,7 +26392,7 @@ private pure func type_support_function_prototypes(
 			EnumDecl(enum_decl):
 				naming: BackendTypeNaming = selected_type_naming(authority, enum_decl.name)
 				c_code = append_emitted_c(c_code, enum_to_string_signature(naming) + ";\n")
-				c_code = append_emitted_c(c_code, enum_vector_to_string_signature(naming) + ";\n")
+				c_code = append_emitted_c(c_code, "blorp_String* " + naming.enum_vector_to_string_name + "(blorp_Vector* v);\n")
 			ValueRecordDecl(record_decl):
 				void
 			FunctionDecl(func_info):

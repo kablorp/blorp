@@ -706,13 +706,6 @@ private pure func dict_entries_touch_var(entries: List[CoreDictEntry], target: C
 	touched
 
 
-private pure func dict_literal_entries_touch_var(
-	entries: List[CoreDictLiteralEntry],
-	target: CoreVar,
-) -> Bool:
-	CoreTraverse.any_core_dict_literal_entry_exprs(entries, func(expr): owner_touched(target, expr))
-
-
 private pure func record_fields_touch_var(
 	fields: List[CoreRecordFieldValue],
 	target: CoreVar,
@@ -888,7 +881,7 @@ private pure func owner_touched(target: CoreVar, expr: CoreExpr) -> Bool:
 		TensorRawViewLetExpr(binding, body, typ, loc):
 			owner_touched(target, binding.source) or owner_touched(target, body)
 		DictExpr(entries, typ, loc):
-			dict_literal_entries_touch_var(entries, target)
+			CoreTraverse.any_core_dict_literal_entry_exprs(entries, func(expr): owner_touched(target, expr))
 		DictConstructExpr(construct, typ, loc):
 			dict_entries_touch_var(construct.entries, target)
 		SetAllocExpr(alloc, typ, loc):
@@ -3300,24 +3293,14 @@ pure func union_reuse_constructor_name(type_name: String, constructor_c_name: St
 	"__blorp_reuse_" + type_name + "_" + constructor_c_name
 
 
-private pure func record_last_prepared_reuse_union(
-	by_name: Dict[String, List[CoreUnionVariant]],
-	union_decl: CoreUnionDecl,
-) -> Dict[String, List[CoreUnionVariant]]:
-	-- Deliberately preserve the previous full scan's last-match behavior.
-	by_name.set(union_decl.name, union_decl.variants)
-
-
 private pure func build_prepared_reuse_layout(program: CoreProgram) -> PreparedReuseLayout:
 	var variants_by_union_name: Dict[String, List[CoreUnionVariant]] = {}
 
 	for decl in program.decls:
 		match decl:
 			UnionDecl(union_decl):
-				variants_by_union_name = record_last_prepared_reuse_union(
-					variants_by_union_name,
-					union_decl,
-				)
+				-- Preserve the previous full scan's last-match behavior.
+				variants_by_union_name = variants_by_union_name.set(union_decl.name, union_decl.variants)
 			FunctionDecl(func_info):
 				void
 			GlobalDecl(global):
@@ -5283,7 +5266,7 @@ private pure func rewrite_prepared_expr_with_layout(
 			ConstructorMatchExpr(
 				rewrite_prepared_expr_with_layout(layout, scrutinee),
 				scrutinee_release_policy,
-				rewrite_child_constructor_match_cases(layout, cases),
+				cases.map(func(match_case): { match_case | body = rewrite_child_constructor_match_body(layout, match_case.body) }),
 				rewrite_child_constructor_match_fallback(layout, fallback),
 				typ,
 				loc,
@@ -5474,20 +5457,6 @@ private pure func rewrite_child_constructor_match_body(
 				})
 
 
-private pure func rewrite_child_constructor_match_case(
-	layout: PreparedReuseLayout,
-	match_case: CoreConstructorMatchCase,
-) -> CoreConstructorMatchCase:
-	{ match_case | body = rewrite_child_constructor_match_body(layout, match_case.body) }
-
-
-private pure func rewrite_child_constructor_match_cases(
-	layout: PreparedReuseLayout,
-	cases: List[CoreConstructorMatchCase],
-) -> List[CoreConstructorMatchCase]:
-	cases.map(func(match_case): rewrite_child_constructor_match_case(layout, match_case))
-
-
 private pure func rewrite_child_constructor_match_fallback(
 	layout: PreparedReuseLayout,
 	fallback: CoreConstructorMatchFallback,
@@ -5582,19 +5551,12 @@ private pure func rewrite_prepared_function(
 			func_info
 
 
-private pure func rewrite_prepared_global(
-	layout: PreparedReuseLayout,
-	global: CoreGlobal,
-) -> CoreGlobal:
-	{ global | init = rewrite_prepared_expr_with_layout(layout, global.init) }
-
-
 private pure func rewrite_prepared_decl(layout: PreparedReuseLayout, decl: CoreDecl) -> CoreDecl:
 	match decl:
 		FunctionDecl(func_info):
 			FunctionDecl(rewrite_prepared_function(layout, func_info))
 		GlobalDecl(global):
-			GlobalDecl(rewrite_prepared_global(layout, global))
+			GlobalDecl({ global | init = rewrite_prepared_expr_with_layout(layout, global.init) })
 		UnionDecl(union_decl):
 			decl
 		EnumDecl(enum_decl):
