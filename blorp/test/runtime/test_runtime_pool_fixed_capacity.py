@@ -192,12 +192,12 @@ class RuntimePoolFixedCapacityTests(unittest.TestCase):
         completed = self._compile_and_run(source, {"BLORP_POOL_SLAB_LIMIT": "64"})
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_spike_then_release_settles_to_retain_target(self) -> None:
-        # Task-2 acceptance case: a burst that drives a class well past its
-        # retain target, followed by releasing everything, must bring the
-        # class's resident slab count back down to BLORP_POOL_RETAIN_SLABS
-        # (not leave it at the burst's high-water mark, and not overflow
-        # while at it — the burst stays comfortably under the slab limit).
+    def test_idle_slab_stays_resident_and_is_reused_without_a_fresh_malloc(self) -> None:
+        # The pool is now truly fixed: a slab that goes fully idle is never
+        # freed while its thread lives (that machinery — a retained warm-slab
+        # stack, a high-water release trigger — was removed). Confirm the
+        # slab count never drops after a burst drains back to idle, and that
+        # the next burst reuses the idle slab directly with no new malloc.
         source = textwrap.dedent(
             """\
             #define _GNU_SOURCE
@@ -213,9 +213,9 @@ class RuntimePoolFixedCapacityTests(unittest.TestCase):
                 for (int i = 0; i < KEEP; i++) {
                     keep[i] = blorp_alloc(32);
                 }
-                if (blorp_pool_tls.slab_count[0] <= blorp_pool_retain_slabs) {
-                    fprintf(stderr, "spike did not grow past the retain target: slab_count=%d retain=%d\\n",
-                            blorp_pool_tls.slab_count[0], blorp_pool_retain_slabs);
+                int high_water = blorp_pool_tls.slab_count[0];
+                if (high_water <= 1) {
+                    fprintf(stderr, "burst did not mint more than one slab: %d\\n", high_water);
                     return 2;
                 }
 
@@ -223,24 +223,14 @@ class RuntimePoolFixedCapacityTests(unittest.TestCase):
                     blorp_release(keep[i]);
                 }
 
-                if (blorp_pool_tls.slab_count[0] != blorp_pool_retain_slabs) {
-                    fprintf(stderr, "slab_count did not settle to the retain target: %d != %d\\n",
-                            blorp_pool_tls.slab_count[0], blorp_pool_retain_slabs);
+                if (blorp_pool_tls.slab_count[0] != high_water) {
+                    fprintf(stderr, "slab_count dropped after idling: %d != %d\\n",
+                            blorp_pool_tls.slab_count[0], high_water);
                     return 3;
                 }
-                if (blorp_pool_tls.retained_count[0] != blorp_pool_retain_slabs) {
-                    fprintf(stderr, "retained_count mismatch: %d != %d\\n",
-                            blorp_pool_tls.retained_count[0], blorp_pool_retain_slabs);
-                    return 4;
-                }
-                long releases = atomic_load_explicit(&__blorp_pool_slab_release_events, memory_order_relaxed);
-                if (releases <= 0) {
-                    fprintf(stderr, "expected at least one slab freed to libc via the retain limit\\n");
-                    return 5;
-                }
 
-                // Reuse after settling must not require fresh mallocs:
-                // the retained slabs serve the next burst directly.
+                // Reuse after idling must not require fresh mallocs: the
+                // slabs already minted serve the next burst directly.
                 long refills_before = atomic_load_explicit(
                     &__blorp_oracle_stats.backing_pool_refill_events, memory_order_relaxed);
                 void* reused[64];
@@ -248,8 +238,8 @@ class RuntimePoolFixedCapacityTests(unittest.TestCase):
                 long refills_after = atomic_load_explicit(
                     &__blorp_oracle_stats.backing_pool_refill_events, memory_order_relaxed);
                 if (refills_after != refills_before) {
-                    fprintf(stderr, "reuse after settling triggered a fresh slab malloc\\n");
-                    return 6;
+                    fprintf(stderr, "reuse after idling triggered a fresh slab malloc\\n");
+                    return 4;
                 }
                 for (int i = 0; i < 64; i++) blorp_release(reused[i]);
 
@@ -257,7 +247,7 @@ class RuntimePoolFixedCapacityTests(unittest.TestCase):
             }
             """
         )
-        completed = self._compile_and_run(source, {"BLORP_POOL_SLAB_LIMIT": "180000", "BLORP_POOL_RETAIN_SLABS": "8"})
+        completed = self._compile_and_run(source, {"BLORP_POOL_SLAB_LIMIT": "180000"})
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_cross_thread_handoff_does_not_alias_slab_ownership(self) -> None:

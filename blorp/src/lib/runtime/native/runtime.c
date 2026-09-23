@@ -3110,7 +3110,6 @@ __attribute__((constructor))
 static void __blorp_init_signal_handlers(void) {
     signal(SIGPIPE, SIG_IGN);
 }
-
 // ============================================================================
 // Small-Object Pool — free-list allocator for objects <= 256 bytes
 // Bypasses malloc/free for hot allocation paths (Options, small strings, records).
@@ -3138,89 +3137,85 @@ static void __blorp_init_signal_handlers(void) {
 // regression that caught a cap freeing an interior slab pointer directly
 // ("pointer being freed was not allocated" — DO NOT do that).
 //
-// What bounds memory: a fixed limit of BLORP_POOL_SLAB_LIMIT slabs per
-// class per thread. Once a class has minted that many slabs, every one of
-// its objects is already accounted for and permanently owned by the pool
-// (free or live) — the pool simply stops growing. A further miss on an
-// empty supply at the limit overflows to a direct libc malloc/free for
-// that one object instead of another slab; the object's header records
-// this (alloc_class = BLORP_ALLOC_CLASS_DIRECT, the same "never pooled"
-// marker oversized objects already use) so blorp_release frees it straight
-// to libc rather than pushing it onto a free list it was never carved out
-// of. No new header bit was needed: alloc_class already distinguishes
-// "pooled" (a class index) from "not pooled" (BLORP_ALLOC_CLASS_DIRECT).
+// What bounds memory: a fixed limit of BLORP_POOL_SLAB_LIMIT slabs per class
+// per thread. Once a class has minted that many slabs, every one of its
+// objects is already accounted for and permanently owned by the pool (free
+// or live) — the pool simply stops growing. A slab, once minted, is never
+// freed while its thread lives; a miss on an empty supply at the limit
+// overflows to a direct libc malloc/free for that one object instead of
+// another slab, and the object's header records this (alloc_class =
+// BLORP_ALLOC_CLASS_DIRECT, the same "never pooled" marker oversized objects
+// already use) so blorp_release frees it straight to libc rather than
+// pushing it onto a free list it was never carved out of. No new header bit
+// was needed: alloc_class already distinguishes "pooled" (a class index)
+// from "not pooled" (BLORP_ALLOC_CLASS_DIRECT). This is a strictly simpler
+// contract than an earlier version of this pool, which additionally tried to
+// shrink a class back down by freeing idle slabs once a burst subsided; that
+// added a second bounded state (a "retained" warm-slab stack), a slab
+// high-water-triggered release path, and a same-thread-vs-foreign-thread
+// ownership guard whose only job was to make that release path safe. None of
+// that machinery is needed to bound memory — the fixed slab-count limit
+// already does that on its own — so it was removed. A resident slab still
+// costs memory for the rest of the thread's life once minted (it holds
+// capacity libc's own allocator can no longer see or reuse for anything
+// else), which is the tradeoff a fixed pool accepts in exchange for never
+// re-mallocing a slab it already paid for.
 //
-// A cap alone still keeps every slab it ever minted resident for the
-// thread's whole life, which is the earlier version of this fix's own
-// bug: a burst that drives a class to its high-water mark never gives that
-// memory back, even if the class goes back to near-idle immediately after.
-// A depth cap on a single class-wide free list cannot fix this: an
-// interior slab pointer can never be passed to libc free() on its own
-// (freeing one "discards" nothing — the byte range is exactly as resident
-// either way — a first cut with a 16384-per-class free-list-depth cap
-// measured +39% peak RSS by pinning objects without letting the pool reuse
-// them; see blorp/test/runtime/types/test_pool_slab_release.brp for the
-// regression a naive interior-pointer free caused: "pointer being freed
-// was not allocated"). Reclaiming a whole slab is safe only once every one
-// of its objects is free and none of them are reachable through any other
-// slab's bookkeeping, which requires knowing, per object, which slab it
-// came from and how many of that slab's objects are still free — i.e. a
-// free list *per slab*, not one mixed list per class.
+// Finding an object's slab header from its address must be O(1) on the hot
+// release path — a search over up to BLORP_POOL_SLAB_LIMIT resident slab
+// base pointers is not acceptable there. Every slab, regardless of class, is
+// the same fixed power-of-two size, BLORP_POOL_SLAB_SIZE, and is allocated
+// with aligned_alloc(BLORP_POOL_SLAB_SIZE, BLORP_POOL_SLAB_SIZE); masking any
+// object's address with ~(BLORP_POOL_SLAB_SIZE-1) recovers the header's
+// address in one AND, independent of how many slabs exist and with no
+// per-class lookup table. A first cut instead sized each class's alignment
+// to the next power of two above that class's own header-plus-objects
+// footprint, which wasted close to half a slab for classes whose natural
+// size sits just past a power of two (32, 64, 128, 256 bytes here) —
+// measured +41% peak RSS on the self-compile, worse than the ceiling-only
+// commit this was meant to improve on. With one slab size shared by every
+// class, the object count per slab is instead derived per class —
+// (BLORP_POOL_SLAB_SIZE - header) / class_size (see blorp_pool_refill_count
+// below) — so the only waste is the remainder of that division, a few
+// percent at most (see the per-class table there). This overflow test
+// relies on the same header tag, not on the address mask: an overflowed
+// object is stamped BLORP_ALLOC_CLASS_DIRECT at alloc time, so
+// blorp_release never even reaches the masking code below for it — a
+// malloc'd object can never be mistaken for a slab member because the
+// branch on alloc_class routes it away before the mask is applied.
 //
-// So each slab now carries a small header (blorp_PoolSlabHeader) with its
-// own free list and free count, and slabs move between three thread-local
-// states per class: "partial" (0 < free_count < REFILL_COUNT, searched by
-// blorp_alloc, a doubly-linked list for O(1) removal from the middle),
-// "retained" (free_count == REFILL_COUNT, kept warm in a small LIFO stack
-// up to BLORP_POOL_RETAIN_SLABS deep for instant reuse without another
-// malloc), and "none" (not linked anywhere — either fully live, or a
-// retained/registry slot beyond the retain target that was freed to libc).
-// A release that drives a slab's free_count to REFILL_COUNT unlinks it
-// from "partial"; if the class already holds BLORP_POOL_RETAIN_SLABS
-// retained slabs it is freed to libc immediately instead of joining the
-// retained stack, so a spike's memory does not outlive the spike by more
-// than that small constant. BLORP_POOL_RETAIN_SLABS is configurable the
-// same way as BLORP_POOL_SLAB_LIMIT (env var, or link-time -D).
-//
-// Finding an object's slab header from its address must be O(1) on the
-// hot release path — a search over up to BLORP_POOL_SLAB_LIMIT resident
-// slab base pointers is not acceptable there. Every slab, regardless of
-// class, is the same fixed power-of-two size, BLORP_POOL_SLAB_SIZE, and
-// is allocated with aligned_alloc(BLORP_POOL_SLAB_SIZE, BLORP_POOL_SLAB_SIZE);
-// masking any object's address with ~(BLORP_POOL_SLAB_SIZE-1) recovers the
-// header's address in one AND, independent of how many slabs exist and
-// with no per-class lookup table. A first cut instead sized each class's
-// alignment to the next power of two above that class's own
-// header-plus-objects footprint, which wasted close to half a slab for
-// classes whose natural size sits just past a power of two (32, 64, 128,
-// 256 bytes here) — measured +41% peak RSS on the self-compile, worse
-// than the ceiling-only commit this was meant to improve on. With one
-// slab size shared by every class, the object count per slab is instead
-// derived per class — (BLORP_POOL_SLAB_SIZE - header) / class_size (see
-// blorp_pool_refill_count below) — so the only waste is the remainder of
-// that division, a few percent at most (see the per-class table there).
-//
-// The bounded registry array of resident slab base pointers
-// (blorp_PoolTLS.slabs) still exists, now doing double duty: it is both
-// the cap-enforcement count and the source blorp_pool_drain walks to free
-// everything at thread/process exit, and a slab freed early (via the
-// retain mechanism) is removed from it with an O(1) swap against the last
-// entry (order does not matter for this array), using a registry_index
-// field the header carries for exactly that removal.
+// Each slab carries a small header (blorp_PoolSlabHeader) with its own free
+// list and free count, so a slab can be identified as fully idle (every
+// object it ever handed out is back on its own list) without touching any
+// other slab's bookkeeping. This is what makes thread-exit teardown safe: a
+// thread can have live objects out in the program long after it exits (a
+// worker thread that built a List and handed it to a shared queue, for
+// example), so blorp_pool_drain must never free a slab some of whose
+// objects are still checked out — it frees only the slabs whose free_count
+// has reached their class's full object count, and deliberately leaks the
+// rest (safe: no use-after-free, bounded to whatever was mid-use at the
+// exact moment the thread exited). Per-slab tracking is also what lets
+// blorp_alloc find a slab with room in O(1): slabs move between two
+// thread-local states per class — "partial" (0 < free_count < refill count,
+// a doubly-linked list for O(1) removal from the middle, searched by
+// blorp_alloc) and "none" (not linked anywhere — either fully live, so
+// nothing to search, or fully idle and simply left linked in "partial" with
+// every object free, ready for instant reuse without another malloc). There
+// is no separate "retained" state or release trigger: once a slab is
+// resident it just stays wherever the partial/none transition puts it for
+// the rest of the thread's life.
 //
 // Every structure here is thread-local. An object allocated on one thread
 // and released on another is handled correctly but not optimally: the
 // releasing thread cannot safely touch another thread's _Thread_local
-// bookkeeping (its partial/retained lists, its registry array), so a
-// cross-thread release instead adopts the raw object onto the releasing
-// thread's own small per-class "foreign" list — available for that
-// thread's own future allocations, but that slab can never be recognized
-// as fully free and reclaimed once one of its objects takes this path.
-// This is the same bounded imperfection the design already accepted
-// before per-slab tracking existed ("that thread eventually reuses or
-// drains it; it does not migrate back"), just now also costing that one
-// slab its reclaim eligibility rather than only its "return to my own
-// pool" eligibility.
+// bookkeeping (its partial list, its registry array), so a cross-thread
+// release instead adopts the raw object onto the releasing thread's own
+// small per-class "foreign" list — available for that thread's own future
+// allocations, but that slab can never be recognized as fully idle through
+// this path (its free_count only advances via the owning thread noticing
+// the object back on its own list, which never happens once another thread
+// permanently annexed it). That thread eventually reuses or drains it; it
+// does not migrate back.
 // ============================================================================
 #define BLORP_POOL_MAX_SIZE 1024
 #define BLORP_POOL_CLASSES 9
@@ -3243,10 +3238,11 @@ static const size_t blorp_pool_sizes[BLORP_POOL_CLASSES] = {32, 64, 96, 128, 192
 // every miss.
 #define BLORP_POOL_SLAB_SIZE (16 * 1024)
 
-// Fixed number of slabs a class may hold resident per thread — the primary
-// bound: no more than this many slabs are ever minted concurrently, so the
-// class's resident footprint is bounded at
-// BLORP_POOL_SLAB_LIMIT * BLORP_POOL_SLAB_SIZE bytes.
+// Fixed number of slabs a class may hold resident per thread for the rest
+// of that thread's life — the whole bound: no more than this many slabs are
+// ever minted, so the class's resident footprint tops out at
+// BLORP_POOL_SLAB_LIMIT * BLORP_POOL_SLAB_SIZE bytes and never grows past
+// it and never shrinks before thread exit.
 // Overridable per process with the BLORP_POOL_SLAB_LIMIT environment
 // variable (read once at startup — see blorp_pool_init_slab_limit) and, at
 // link time, by defining BLORP_POOL_SLAB_LIMIT before this file is
@@ -3272,27 +3268,16 @@ static const size_t blorp_pool_sizes[BLORP_POOL_CLASSES] = {32, 64, 96, 128, 192
 // already generous, costs nothing extra for classes far below it (slabs
 // are only ever malloc'd on demand, never pre-allocated up to the limit),
 // and the only per-class cost of a larger limit is the bookkeeping array
-// of slab base pointers (limit * 8 bytes). This ceiling alone does not
-// shrink after a burst — see BLORP_POOL_RETAIN_SLABS below for the
-// mechanism that does.
+// of slab base pointers (limit * 8 bytes). A class that is still short of
+// its limit at the end of a workload paid nothing extra for the headroom;
+// a class that is not (see __blorp_pool_slab_highwater and the overflow
+// counter, both reported under BLORP_COMPILER_MEMORY_PROFILE) is the signal
+// to raise this default.
 #ifndef BLORP_POOL_SLAB_LIMIT
 #define BLORP_POOL_SLAB_LIMIT 180000
 #endif
 
 static int blorp_pool_slab_limit = BLORP_POOL_SLAB_LIMIT;
-
-// Number of fully-free ("retained") slabs per class a thread keeps warm
-// for instant reuse once a burst has drained back to idle. A slab that
-// goes fully free while the class already holds this many retained slabs
-// is freed to libc immediately instead of joining the retained stack, so
-// a spike's memory does not outlive the spike by more than this small,
-// constant amount. Overridable the same way as BLORP_POOL_SLAB_LIMIT (the
-// BLORP_POOL_RETAIN_SLABS environment variable, or a link-time -D).
-#ifndef BLORP_POOL_RETAIN_SLABS
-#define BLORP_POOL_RETAIN_SLABS 8
-#endif
-
-static int blorp_pool_retain_slabs = BLORP_POOL_RETAIN_SLABS;
 
 __attribute__((constructor))
 static void blorp_pool_init_slab_limit(void) {
@@ -3303,18 +3288,14 @@ static void blorp_pool_init_slab_limit(void) {
             blorp_pool_slab_limit = (int)parsed;
         }
     }
-    const char* retain_env = getenv("BLORP_POOL_RETAIN_SLABS");
-    if (retain_env) {
-        long long parsed = atoll(retain_env);
-        if (parsed >= 0) {
-            blorp_pool_retain_slabs = (int)parsed;
-        }
-    }
 }
 
 // Highest number of slabs any thread has driven a class to, tracked
-// unconditionally (the update is on the already-cold once-per-64-allocs
-// refill path) but only reported under BLORP_COMPILER_MEMORY_PROFILE.
+// unconditionally (the update is on the already-cold once-per-slab-mint
+// path) but only reported under BLORP_COMPILER_MEMORY_PROFILE. Useful for
+// tuning BLORP_POOL_SLAB_LIMIT: a class whose high-water mark sits well
+// under the limit has margin to spare; one that reaches it (see the
+// overflow counter) is a candidate for a higher default.
 static _Atomic int __blorp_pool_slab_highwater[BLORP_POOL_CLASSES];
 
 static inline void blorp_pool_highwater_note(int cls, int slab_count) {
@@ -3353,9 +3334,9 @@ static inline int blorp_pool_class(size_t size) {
 // Per-slab header, stored at the base of the slab's own
 // BLORP_POOL_SLAB_SIZE-aligned allocation. Each slab owns its own free
 // list — objects from different slabs are never linked together — so a
-// slab can be unlinked and freed to libc in O(1) the moment its
-// free_count reaches its class's refill count, without touching any
-// other slab's bookkeeping.
+// slab's idleness (every object it ever handed out is back on its own
+// list) can be checked at thread exit without touching any other slab's
+// bookkeeping (see blorp_pool_drain).
 //
 // `owner` identifies the minting thread for the cross-thread-release
 // guard. This must be pthread_self() (compared with pthread_equal), not
@@ -3380,10 +3361,9 @@ static inline int blorp_pool_class(size_t size) {
 typedef struct blorp_PoolSlabHeader_s {
     void* free_head;                      // this slab's own free list
     struct blorp_PoolSlabHeader_s* prev;  // "partial" list link (NULL when not linked)
-    struct blorp_PoolSlabHeader_s* next;  // "partial" list link, or the "retained" stack link
+    struct blorp_PoolSlabHeader_s* next;  // "partial" list link
     pthread_t owner;                      // minting thread's identity (cross-thread-release guard)
     int free_count;                       // objects free right now, 0..blorp_pool_refill_count[cls]
-    int registry_index;                   // this slab's slot in owner's tls->slabs[cls][], for O(1) removal
 } blorp_PoolSlabHeader;
 
 // Objects per slab, per class: (BLORP_POOL_SLAB_SIZE - header) /
@@ -3407,11 +3387,12 @@ typedef struct blorp_PoolSlabHeader_s {
 //
 // (Header size and the table above assume a 64-bit build, where
 // sizeof(blorp_PoolSlabHeader) is 40 bytes: three pointers, one
-// pthread_t, and two ints.) The 384/512/1024 classes trade proportionally
-// more waste per slab for the same fixed BLORP_POOL_SLAB_SIZE — accepted
-// per the same simplicity-over-a-per-class-slab-size call as the smaller
-// six; a class-specific slab size would need its own alignment/masking
-// scheme and reintroduce the per-class table this design removed.
+// pthread_t, and one int, rounded up to the platform's 8-byte alignment.)
+// The 384/512/1024 classes trade proportionally more waste per slab for
+// the same fixed BLORP_POOL_SLAB_SIZE — accepted per the same
+// simplicity-over-a-per-class-slab-size call as the smaller six; a
+// class-specific slab size would need its own alignment/masking scheme
+// and reintroduce the per-class table this design removed.
 static const int blorp_pool_refill_count[BLORP_POOL_CLASSES] = {
     (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 32),
     (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 64),
@@ -3425,12 +3406,11 @@ static const int blorp_pool_refill_count[BLORP_POOL_CLASSES] = {
 };
 
 // Per class: a doubly-linked "partial" list (slabs with free objects,
-// searched by blorp_alloc), a LIFO "retained" stack (fully-free slabs kept
-// warm, up to blorp_pool_retain_slabs deep), a small flat list of objects
-// adopted from a foreign thread's release (see the cross-thread note
-// above), the count of currently resident slabs, and the bounded registry
-// of their base pointers (for the slab-count cap and for blorp_pool_drain).
-// One thread-local object rather than parallel arrays: blorp_alloc and the
+// searched by blorp_alloc), a small flat list of objects adopted from a
+// foreign thread's release (see the cross-thread note above), the count of
+// currently resident slabs, and the bounded registry of their base
+// pointers (for the slab-count cap and for blorp_pool_drain). One
+// thread-local object rather than parallel arrays: blorp_alloc and the
 // release path each take its address once (one dyld `_tlv_get_addr` call)
 // and index through the resulting pointer for the rest of the call.
 //
@@ -3438,8 +3418,6 @@ static const int blorp_pool_refill_count[BLORP_POOL_CLASSES] = {
 // malloc'd as an array of exactly blorp_pool_slab_limit base pointers.
 typedef struct {
     blorp_PoolSlabHeader* partial_head[BLORP_POOL_CLASSES];
-    blorp_PoolSlabHeader* retained_head[BLORP_POOL_CLASSES];
-    int retained_count[BLORP_POOL_CLASSES];
     void* foreign_free[BLORP_POOL_CLASSES];
     int slab_count[BLORP_POOL_CLASSES];
     void** slabs[BLORP_POOL_CLASSES];
@@ -3454,20 +3432,11 @@ static _Thread_local blorp_PoolTLS blorp_pool_tls;
 // so tests can confirm the per-thread exit hook actually fired.
 static _Atomic long __blorp_pool_drain_calls = 0;
 
-// Counts slabs freed to libc because they went fully free while their
-// class already held blorp_pool_retain_slabs retained slabs — the
-// retain-then-release path, distinct from a slab minted and later
-// registered (backing_pool_refill_events) or an overflow object that was
-// never part of a slab at all (backing_pool_overflow_events). Internal
-// instrumentation for the harness test, not part of the allocation
-// oracle's gated counters, so it stays cheap enough to update
-// unconditionally.
-static _Atomic long __blorp_pool_slab_release_events = 0;
-
-// Drain every pool structure and free every FULLY FREE slab this thread
+// Drain every pool structure and free every FULLY IDLE slab this thread
 // currently holds resident. Called at process exit (atexit) and, per
 // thread, when that thread exits (see blorp_pool_register_exit_hook) so a
-// thread's high-water mark does not live for the rest of the process.
+// thread's slabs do not all sit resident for the rest of the process once
+// it is gone.
 //
 // A slab whose free_count is below its class's refill count still has
 // objects checked out — e.g. handed to another thread that has not
@@ -3484,16 +3453,14 @@ static _Atomic long __blorp_pool_slab_release_events = 0;
 //
 // Safe to call more than once: after the first call every slabs[c] is
 // NULL and slab_count[c] is 0, so later calls are no-ops. Walks the
-// bounded registry array (not the partial/retained lists) since every
-// resident slab appears there exactly once regardless of which list (if
-// any) it is currently linked into.
+// bounded registry array (not the partial list) since every resident slab
+// appears there exactly once regardless of whether it is currently linked
+// into "partial".
 static void blorp_pool_drain(void) {
     atomic_fetch_add_explicit(&__blorp_pool_drain_calls, 1, memory_order_relaxed);
     blorp_PoolTLS* tls = &blorp_pool_tls;
     for (int c = 0; c < BLORP_POOL_CLASSES; c++) {
         tls->partial_head[c] = NULL;
-        tls->retained_head[c] = NULL;
-        tls->retained_count[c] = 0;
         tls->foreign_free[c] = NULL;
         if (tls->slabs[c]) {
             for (int i = 0; i < tls->slab_count[c]; i++) {
@@ -3559,9 +3526,10 @@ static inline void blorp_pool_partial_unlink(blorp_PoolTLS* tls, int cls, blorp_
 
 // Mint a brand-new slab: one aligned_alloc of BLORP_POOL_SLAB_SIZE bytes
 // holding the header plus blorp_pool_refill_count[cls] objects, registered
-// in the thread's bounded slab array (never individually freed except via
-// the retain-limit release path below or blorp_pool_drain). Caller
-// guarantees tls->slab_count[cls] < blorp_pool_slab_limit.
+// in the thread's bounded slab array. Never freed individually while the
+// thread lives — only blorp_pool_drain (thread/process exit) ever calls
+// free() on it, and only once every object it handed out is back on its
+// own free list. Caller guarantees tls->slab_count[cls] < blorp_pool_slab_limit.
 static blorp_PoolSlabHeader* blorp_pool_mint_slab(blorp_PoolTLS* tls, int cls) {
     blorp_pool_register_exit_hook();
     if (!tls->slabs[cls]) {
@@ -3588,7 +3556,6 @@ static blorp_PoolSlabHeader* blorp_pool_mint_slab(blorp_PoolTLS* tls, int cls) {
     slab->owner = pthread_self();
     slab->prev = NULL;
     slab->next = NULL;
-    slab->registry_index = tls->slab_count[cls];
     tls->slabs[cls][tls->slab_count[cls]] = raw;
     tls->slab_count[cls]++;
     blorp_pool_highwater_note(cls, tls->slab_count[cls]);
@@ -3607,23 +3574,19 @@ static blorp_PoolSlabHeader* blorp_pool_mint_slab(blorp_PoolTLS* tls, int cls) {
     return slab;
 }
 
-// Slow path for a class whose partial list is empty: reuse a retained warm
-// slab if one exists, then an object adopted from a foreign thread's
-// release, then mint a new slab, then signal overflow (the caller is
-// already at blorp_pool_slab_limit) by returning NULL.
+// Slow path for a class whose partial list is empty: reuse an object
+// adopted from a foreign thread's release if one is on hand, then mint a
+// new slab if the class is under its fixed limit, then signal overflow (the
+// caller is already at blorp_pool_slab_limit) by returning NULL.
 static void* blorp_pool_slow_alloc(blorp_PoolTLS* tls, int cls, bool* overflowed) {
     *overflowed = false;
-    blorp_PoolSlabHeader* slab = tls->retained_head[cls];
-    if (slab) {
-        tls->retained_head[cls] = slab->next;
-        tls->retained_count[cls]--;
-        slab->next = NULL;
-        // free_count is already blorp_pool_refill_count[cls] from when it went idle.
-    } else if (tls->foreign_free[cls] != NULL) {
+    if (tls->foreign_free[cls] != NULL) {
         void* obj = tls->foreign_free[cls];
         tls->foreign_free[cls] = *(void**)obj;
         return obj;
-    } else if (tls->slab_count[cls] < blorp_pool_slab_limit) {
+    }
+    blorp_PoolSlabHeader* slab;
+    if (tls->slab_count[cls] < blorp_pool_slab_limit) {
         slab = blorp_pool_mint_slab(tls, cls);
     } else {
         *overflowed = true;
@@ -3706,10 +3669,8 @@ static void __blorp_alloc_hist_report(void) {
                 blorp_pool_sizes[c],
                 atomic_load_explicit(&__blorp_pool_slab_highwater[c], memory_order_relaxed));
     }
-    fprintf(stderr, " overflow=%ld slab_release=%ld retain_slabs=%d\n",
-            atomic_load_explicit(&__blorp_oracle_stats.backing_pool_overflow_events, memory_order_relaxed),
-            atomic_load_explicit(&__blorp_pool_slab_release_events, memory_order_relaxed),
-            blorp_pool_retain_slabs);
+    fprintf(stderr, " overflow=%ld\n",
+            atomic_load_explicit(&__blorp_oracle_stats.backing_pool_overflow_events, memory_order_relaxed));
 }
 
 static void __blorp_teardown_before_leak_report(void) {
@@ -3764,9 +3725,9 @@ void* blorp_alloc(size_t size) {
                 &__blorp_pool_hit_counts[cls], 1, memory_order_relaxed);
         }
     } else if (cls >= 0) {
-        // No slab with a free object on hand: try a retained warm slab,
-        // then an object adopted from another thread, then mint a new
-        // slab, in that order (see blorp_pool_slow_alloc).
+        // No slab with a free object on hand: try an object adopted from
+        // another thread, then mint a new slab if under the fixed limit,
+        // in that order (see blorp_pool_slow_alloc).
         if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
             atomic_fetch_add_explicit(
                 &__blorp_pool_miss_empty_counts[cls], 1, memory_order_relaxed);
@@ -5819,13 +5780,12 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
         if (!pthread_equal(slab->owner, pthread_self())) {
             // Cross-thread release: this thread cannot safely touch
             // another live thread's _Thread_local slab bookkeeping (its
-            // partial/retained lists, its registry array), so adopt the
-            // raw object into this thread's own small per-class list
-            // instead — usable by this thread's future allocations, but
-            // that slab can never be recognized as fully free and
-            // reclaimed once one of its objects takes this path (the same
-            // bounded imperfection already accepted before per-slab
-            // tracking existed).
+            // partial list, its registry array), so adopt the raw object
+            // into this thread's own small per-class list instead —
+            // usable by this thread's future allocations, but that slab
+            // can never be recognized as fully idle through this path
+            // (its free_count only advances via the owning thread's own
+            // release code, which this object never reaches once adopted).
             *(void**)obj = tls->foreign_free[cls];
             tls->foreign_free[cls] = obj;
         } else {
@@ -5837,35 +5797,13 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
                 // Slab was fully live (not linked anywhere) and now has
                 // one free object: it becomes searchable again.
                 blorp_pool_partial_push(tls, cls, slab);
-            } else if (slab->free_count == blorp_pool_refill_count[cls]) {
-                // Slab just became fully free: unlink from "partial" (O(1)
-                // thanks to the doubly-linked list) and either keep it
-                // warm for instant reuse or free it to libc if the class
-                // already holds enough retained slabs.
-                blorp_pool_partial_unlink(tls, cls, slab);
-                if (tls->retained_count[cls] < blorp_pool_retain_slabs) {
-                    slab->prev = NULL;
-                    slab->next = tls->retained_head[cls];
-                    tls->retained_head[cls] = slab;
-                    tls->retained_count[cls]++;
-                } else {
-                    // Swap-remove from the bounded registry array (order
-                    // does not matter there) and free the slab as a whole
-                    // — every object it ever handed out is accounted for
-                    // right here in its own free list, so no other
-                    // bookkeeping anywhere still points into it.
-                    int idx = slab->registry_index;
-                    int last = --tls->slab_count[cls];
-                    void* last_base = tls->slabs[cls][last];
-                    tls->slabs[cls][idx] = last_base;
-                    if (last_base != (void*)slab) {
-                        ((blorp_PoolSlabHeader*)last_base)->registry_index = idx;
-                    }
-                    atomic_fetch_add_explicit(
-                        &__blorp_pool_slab_release_events, 1, memory_order_relaxed);
-                    free(slab);
-                }
             }
+            // No special handling when free_count reaches the class's full
+            // object count: a fully idle slab simply stays linked in
+            // "partial" with every object free, ready for instant reuse.
+            // It is never freed while the thread lives — only
+            // blorp_pool_drain (thread/process exit) does that, and only
+            // for slabs it finds in this same fully idle state.
         }
         if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
             atomic_fetch_add_explicit(
