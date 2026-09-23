@@ -4,6 +4,7 @@
 -- fallback, generic data declarations, and generic trait implementations are
 -- separate concerns and remain outside this module.
 import:
+	instrumentation: black_box_int
 	../stage_08_core_lower/identity:
 		core_module_member_name_from_prefix,
 		core_module_member_prefix,
@@ -138,6 +139,12 @@ private record CoreMonoOptionFusionSite {
 	selected_def_id: Int,
 	loc: CoreSourceLoc,
 	fusion_id: Int
+}
+
+
+private record CoreMonoExprRequestScan {
+	requests: List[CoreMonoFunctionRequest],
+	option_fusion_sites: List[CoreMonoOptionFusionSite]
 }
 
 
@@ -777,6 +784,14 @@ private pure func request_for_call(
 			None
 
 
+private @debug_only pure func mono_request_scan_body_node_visit() -> Int:
+	black_box_int(0)
+
+
+private @debug_only pure func mono_request_scan_request_evaluation() -> Int:
+	black_box_int(0)
+
+
 private pure func request_is_generated(
 	requests: List[CoreMonoFunctionRequest],
 	mangled_name: String,
@@ -825,6 +840,35 @@ private pure func fusion_site_matches_expr(site: CoreMonoOptionFusionSite, expr:
 			False
 
 
+private pure func fusion_sites_share_identity(
+	left: CoreMonoOptionFusionSite,
+	right: CoreMonoOptionFusionSite,
+) -> Bool:
+	left.selected_def_id == right.selected_def_id and source_locs_equal(left.loc, right.loc)
+
+
+private pure func unique_fusion_site_id_for_site(
+	sites: List[CoreMonoOptionFusionSite],
+	target: CoreMonoOptionFusionSite,
+) -> Option[Int]:
+	var found: Option[Int] = None
+	var ambiguous: Bool = False
+
+	for site in sites:
+		if fusion_sites_share_identity(site, target):
+			match found:
+				Some(_):
+					ambiguous = True
+					break
+				None:
+					found = Some(site.fusion_id)
+
+	if ambiguous:
+		None
+	else:
+		found
+
+
 private pure func unique_fusion_site_id(
 	sites: List[CoreMonoOptionFusionSite],
 	expr: CoreExpr,
@@ -845,6 +889,52 @@ private pure func unique_fusion_site_id(
 		None
 	else:
 		found
+
+
+private pure func collect_expr_request_scan(
+	generic_functions: CoreGenericFunctionIndex,
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> CoreMonoExprRequestScan:
+	var requests: List[CoreMonoFunctionRequest] = []
+	var sites: List[CoreMonoOptionFusionSite] = []
+	var pending: List[CoreExpr] = [expr]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(node):
+				debug:
+					mono_request_scan_body_node_visit()
+					mono_request_scan_request_evaluation()
+				match request_for_call(generic_functions, unresolved_type_params, node):
+					Some(request):
+						requests = requests.append(request)
+
+						if request.option_fusion_target.is_some():
+							match node:
+								CallExpr(SelectedDirectCall(def_id), _, _, _, loc):
+									sites = sites.append({
+										selected_def_id = def_id,
+										loc = loc,
+										fusion_id = sites.length(),
+									})
+								_:
+									void
+					None:
+						void
+
+				for child in CoreTraverse.immediate_core_expr_children(node):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	{
+		requests = requests,
+		option_fusion_sites = sites
+	}
 
 
 private pure func collect_option_fusion_sites(
@@ -887,29 +977,33 @@ private pure func collect_option_fusion_sites(
 private pure func collect_expr_requests(
 	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
-	option_fusion_sites: List[CoreMonoOptionFusionSite],
 	requests: List[CoreMonoFunctionRequest],
 	expr: CoreExpr,
 ) -> List[CoreMonoFunctionRequest]:
+	scan: CoreMonoExprRequestScan = collect_expr_request_scan(
+		generic_functions,
+		unresolved_type_params,
+		expr,
+	)
 	var collected: List[CoreMonoFunctionRequest] = requests
-	var pending: List[CoreExpr] = [expr]
 	var index: Int = 0
+	var fusion_site_index: Int = 0
 
-	while index < pending.length():
-		match pending.get(index):
-			Some(node):
-				match request_for_call(generic_functions, unresolved_type_params, node):
-					Some(request):
-						if (
-							request.option_fusion_target.is_none()
-							or unique_fusion_site_id(option_fusion_sites, node).is_none()
-						):
+	while index < scan.requests.length():
+		match scan.requests.get(index):
+			Some(request):
+				if request.option_fusion_target.is_some():
+					match scan.option_fusion_sites.get(fusion_site_index):
+						Some(site):
+							if unique_fusion_site_id_for_site(scan.option_fusion_sites, site).is_none():
+								collected = append_request(collected, request)
+							else:
+								void
+						None:
 							collected = append_request(collected, request)
-					None:
-						void
-
-				for child in CoreTraverse.immediate_core_expr_children(node):
-					pending = pending.append(child)
+					fusion_site_index += 1
+				else:
+					collected = append_request(collected, request)
 			None:
 				break
 
@@ -929,7 +1023,6 @@ private pure func collect_optional_body_requests(
 			collect_expr_requests(
 				generic_functions,
 				unresolved_type_params,
-				collect_option_fusion_sites(generic_functions, unresolved_type_params, expr),
 				requests,
 				expr,
 			)
@@ -959,7 +1052,6 @@ private pure func collect_program_requests(
 				requests = collect_expr_requests(
 					generic_functions,
 					[],
-					collect_option_fusion_sites(generic_functions, [], global.init),
 					requests,
 					global.init,
 				)
