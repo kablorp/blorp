@@ -1243,6 +1243,18 @@ private union SimpleLogicalEmitTask:
 	RebuildSimpleLogicalNode(CoreLogicalOp)
 
 
+-- `emit_simple_expr`'s work stack for the linear-chain operators. A rebuild
+-- task carries whatever its `c_*_expr` combiner needs beyond the rendered
+-- child value(s): the original operand expressions (binary and unary
+-- combiners key C rendering off operand type/shape, not just the rendered
+-- string) or the cast's target type.
+private union SimpleExprChainTask:
+	EmitSimpleExprChainNode(CoreExpr)
+	RebuildSimpleBinaryChainNode(CoreBinaryOp, CoreExpr, CoreExpr)
+	RebuildSimpleUnaryChainNode(CoreUnaryOp, CoreExpr)
+	RebuildSimpleCastChainNode(CoreType)
+
+
 private enum LogicalEmitMode:
 	EmitLogicalBody
 	EmitLogicalCondition
@@ -1891,14 +1903,29 @@ private pure func call_result_transfers_ownership(kind: CoreCallKind, arg_count:
 			True
 
 
+---
+Unwraps nested `CastExpr` layers with a loop rather than recursion: a source
+cast cascade (`x as A as B as C ...`) lowers to exactly this right-nested
+shape, so recursing here would cost one native stack frame per cast in the
+chain.
+---
 private pure func expr_source_transfers_ownership(expr: CoreExpr) -> Bool:
-	match expr:
-		CallExpr(kind, callee, args, typ, loc):
-			call_result_transfers_ownership(kind, args.length())
-		CastExpr(expr_value, typ, loc):
-			expr_source_transfers_ownership(expr_value)
-		_:
-			expr_transfers_ownership(expr)
+	var current: CoreExpr = expr
+	var continue_walk: Bool = True
+	var result: Bool = False
+
+	while continue_walk:
+		match current:
+			CallExpr(kind, callee, args, typ, loc):
+				result = call_result_transfers_ownership(kind, args.length())
+				continue_walk = False
+			CastExpr(expr_value, typ, loc):
+				current = expr_value
+			_:
+				result = expr_transfers_ownership(current)
+				continue_walk = False
+
+	result
 
 
 private pure func expr_is_static_immortal(expr: CoreExpr) -> Bool:
@@ -12880,7 +12907,244 @@ private pure func emit_simple_logical_expr(
 		None
 
 
+-- Ordinary source nesting of `BinaryExpr`/`UnaryExpr`/`CastExpr` never comes
+-- close to this many native frames, so staying on the plain-recursion path
+-- until this depth keeps the overwhelmingly common shallow case exactly as
+-- cheap (no work-stack List allocation at all) as before this function grew
+-- an overflow-proof fallback. Only a synthetically deep chain -- the kind
+-- `emit_simple_expr_chain` exists for -- ever reaches the fallback.
+private SIMPLE_EXPR_CHAIN_NATIVE_DEPTH_LIMIT: Int = 64
+
+
+---
+Renders `expr` as a single C value expression with no supporting statements,
+or `None` when some part of it needs statement decomposition instead.
+---
 private pure func emit_simple_expr(
+	expr: CoreExpr,
+	emission_context: FunctionEmissionContext,
+) -> Option[String]:
+	emit_simple_expr_bounded(expr, emission_context, SIMPLE_EXPR_CHAIN_NATIVE_DEPTH_LIMIT)
+
+
+---
+Plain recursive-descent rendering of `BinaryExpr`/`UnaryExpr`/`CastExpr`,
+identical to how `emit_simple_expr` rendered them before it grew a
+stack-safe fallback, except that each descent into a child spends one unit
+of `remaining_native_depth`. Once that budget is exhausted, the current node
+switches to `emit_simple_expr_chain`, which unwinds the rest of the spine
+with an explicit work stack instead of native recursion: a desugared
+arithmetic or cast cascade lowers to a right-nested spine of exactly these
+three shapes, so unbounded recursion here would cost one native stack frame
+per source-level operator in the chain. Every other shape recurses through
+`emit_simple_expr_leaf`, including back into `emit_simple_expr` (so its own
+budget resets) for its own children, which is safe because none of them can
+form an unbounded linear chain of a single shape the way these three can.
+---
+private pure func emit_simple_expr_bounded(
+	expr: CoreExpr,
+	emission_context: FunctionEmissionContext,
+	remaining_native_depth: Int,
+) -> Option[String]:
+	if remaining_native_depth <= 0:
+		match expr:
+			BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | CastExpr(_, _, _):
+				emit_simple_expr_chain(expr, emission_context)
+			_:
+				emit_simple_expr_leaf(expr, emission_context)
+	else:
+		match expr:
+			BinaryExpr(op, left, right, typ, loc):
+				left_c ?= emit_simple_expr_bounded(
+					left,
+					emission_context,
+					remaining_native_depth - 1,
+				)
+				right_c ?= emit_simple_expr_bounded(
+					right,
+					emission_context,
+					remaining_native_depth - 1,
+				)
+				c_binary_expr(op, left, right, left_c, right_c)
+			UnaryExpr(op, expr_value, typ, loc):
+				expr_c ?= emit_simple_expr_bounded(
+					expr_value,
+					emission_context,
+					remaining_native_depth - 1,
+				)
+				Some(c_unary_expr(op, expr_value, expr_c))
+			CastExpr(expr_value, typ, loc):
+				if expr_transfers_ownership(expr):
+					None
+				else:
+					expr_c ?= emit_simple_expr_bounded(
+						expr_value,
+						emission_context,
+						remaining_native_depth - 1,
+					)
+					Some("((" + TypeLayout.c_type_name(typ) + ")" + expr_c + ")")
+			_:
+				emit_simple_expr_leaf(expr, emission_context)
+
+
+private pure func emit_simple_expr_chain(
+	expr: CoreExpr,
+	emission_context: FunctionEmissionContext,
+) -> Option[String]:
+	var tasks: List[SimpleExprChainTask] = [EmitSimpleExprChainNode(expr)]
+	var task_count: Int = 1
+	var values: List[String] = []
+	var value_count: Int = 0
+	var simple: Bool = True
+
+	while simple and task_count > 0:
+		task_count -= 1
+
+		match tasks.get(task_count):
+			Some(task):
+				match task:
+					EmitSimpleExprChainNode(current_expr):
+						match current_expr:
+							BinaryExpr(op, left, right, typ, loc):
+								rebuild_task: SimpleExprChainTask = RebuildSimpleBinaryChainNode(
+									op,
+									left,
+									right,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								right_task: SimpleExprChainTask = EmitSimpleExprChainNode(right)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, right_task)
+								else:
+									tasks.append(right_task)
+
+								task_count += 1
+
+								left_task: SimpleExprChainTask = EmitSimpleExprChainNode(left)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, left_task)
+								else:
+									tasks.append(left_task)
+
+								task_count += 1
+							UnaryExpr(op, expr_value, typ, loc):
+								rebuild_task: SimpleExprChainTask = RebuildSimpleUnaryChainNode(
+									op,
+									expr_value,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, rebuild_task)
+								else:
+									tasks.append(rebuild_task)
+
+								task_count += 1
+
+								child_task: SimpleExprChainTask = EmitSimpleExprChainNode(
+									expr_value,
+								)
+
+								tasks = if task_count < tasks.length():
+									tasks.set(task_count, child_task)
+								else:
+									tasks.append(child_task)
+
+								task_count += 1
+							CastExpr(expr_value, typ, loc):
+								if expr_transfers_ownership(current_expr):
+									simple = False
+								else:
+									rebuild_task: SimpleExprChainTask = RebuildSimpleCastChainNode(
+										typ,
+									)
+
+									tasks = if task_count < tasks.length():
+										tasks.set(task_count, rebuild_task)
+									else:
+										tasks.append(rebuild_task)
+
+									task_count += 1
+
+									child_task: SimpleExprChainTask = EmitSimpleExprChainNode(
+										expr_value,
+									)
+
+									tasks = if task_count < tasks.length():
+										tasks.set(task_count, child_task)
+									else:
+										tasks.append(child_task)
+
+									task_count += 1
+							_:
+								match emit_simple_expr_leaf(current_expr, emission_context):
+									Some(value):
+										values = if value_count < values.length():
+											values.set(value_count, value)
+										else:
+											values.append(value)
+
+										value_count += 1
+									None:
+										simple = False
+					RebuildSimpleBinaryChainNode(op, left, right):
+						match (values.get(value_count - 2), values.get(value_count - 1)):
+							(Some(left_c), Some(right_c)):
+								match c_binary_expr(op, left, right, left_c, right_c):
+									Some(value):
+										values = values.set(value_count - 2, value)
+										value_count -= 1
+									None:
+										simple = False
+							_:
+								simple = False
+					RebuildSimpleUnaryChainNode(op, expr_value):
+						match values.get(value_count - 1):
+							Some(value):
+								values = values.set(
+									value_count - 1,
+									c_unary_expr(op, expr_value, value),
+								)
+							None:
+								simple = False
+					RebuildSimpleCastChainNode(typ):
+						match values.get(value_count - 1):
+							Some(value):
+								values = values.set(
+									value_count - 1,
+									"((" + TypeLayout.c_type_name(typ) + ")" + value + ")",
+								)
+							None:
+								simple = False
+			None:
+				simple = False
+
+	if simple and value_count == 1:
+		values.get(0)
+	else:
+		None
+
+
+---
+Leaf-level dispatch for `emit_simple_expr`: every expression shape except the
+linear-chain operators (`BinaryExpr`, `UnaryExpr`, `CastExpr`) that
+`emit_simple_expr` itself unwinds with an explicit work stack. A right-nested
+spine of those three shapes is exactly the shape a desugared arithmetic or
+cast cascade produces, so it is the one place native recursion depth tracks
+the input program's nesting rather than its own branching factor; every
+other shape here still recurses through the public `emit_simple_expr` for
+its children (unchanged from before this split), which is safe because none
+of them can themselves form an unbounded linear chain of a single shape.
+---
+private pure func emit_simple_expr_leaf(
 	expr: CoreExpr,
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
