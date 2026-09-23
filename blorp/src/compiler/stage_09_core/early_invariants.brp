@@ -412,20 +412,30 @@ pure func check_match_invariants(program: CoreProgram) -> List[CoreEarlyInvarian
 	check_program_invariants(program, match_violations)
 
 
--- `pending` is a stack (push children, pop the top) rather than an
--- append-only queue, so live memory tracks the traversal frontier instead of
--- growing to the size of the whole program before it is torn down.
+---
+`pending` is a stack (push children, pop the top) rather than an
+append-only queue, so live memory tracks the traversal frontier instead of
+growing to the size of the whole program before it is torn down.
+
+`top` is the stack's logical length, separate from `pending.length()`.
+Popping only decrements `top`; it never calls `drop_last`, which is
+`self.take(self.length() - 1)` under the hood and copies the whole backing
+array on every pop instead of truncating in place. Pushing reuses a slot
+below `top` via `set` when one exists, or `append`s past it otherwise, so
+`pending` only grows to the maximum depth ever reached and both push and pop
+are O(1) on the list's own COW machinery (`pending` is a uniquely owned
+`var` local reassigned on every step).
+---
 pure func check_resolve_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
 	var resolve: List[CoreEarlyInvariantViolation] = []
 	var string_add: List[CoreEarlyInvariantViolation] = []
 	var pending: List[CoreExpr] = program_expr_roots(program)
+	var top: Int = pending.length()
 
-	while pending.length() > 0:
-		top: Int = pending.length() - 1
-
-		match pending.get(top):
+	while top > 0:
+		match pending.get(top - 1):
 			Some(expr):
-				pending = pending.drop_last()
+				top -= 1
 
 				for violation in resolve_violations(expr):
 					resolve = resolve.append(violation)
@@ -434,7 +444,12 @@ pure func check_resolve_invariants(program: CoreProgram) -> List[CoreEarlyInvari
 					string_add = string_add.append(violation)
 
 				for child in CoreTraverse.immediate_core_expr_children(expr):
-					pending = pending.append(child)
+					pending = if top < pending.length():
+						pending.set(top, child)
+					else:
+						pending.append(child)
+
+					top += 1
 			None:
 				break
 
@@ -455,13 +470,21 @@ private record CoreResolveInlineWalk {
 	wrapper: Option[CoreEarlyInvariantViolation]
 }
 
--- One traversal of `root` that gathers both the resolve-family violations
--- (`SelectedDirectCallSurvived`, `StringOperatorSugarSurvived`) and, when
--- `check_wrapper` is set, the first surviving inlineable std-wrapper call.
--- `check_wrapper` stops after the first wrapper hit (matching
--- `first_target_call`'s short-circuit in std_inline.brp) but the resolve
--- family keeps walking the whole subtree, since `check_resolve_invariants`
--- never short-circuits.
+---
+One traversal of `root` that gathers both the resolve-family violations
+(`SelectedDirectCallSurvived`, `StringOperatorSugarSurvived`) and, when
+`check_wrapper` is set, the first surviving inlineable std-wrapper call.
+`check_wrapper` stops after the first wrapper hit (matching
+`first_target_call`'s short-circuit in std_inline.brp) but the resolve
+family keeps walking the whole subtree, since `check_resolve_invariants`
+never short-circuits.
+
+Like `check_resolve_invariants`, `top` is the stack's logical length and
+popping only decrements it rather than calling `drop_last` (which copies
+the whole backing array via `take` on every pop). Pushing reuses a slot
+below `top` via `set` when one exists, or `append`s past it otherwise, so
+`pending` only grows to the maximum depth ever reached.
+---
 private pure func walk_resolve_and_wrapper(
 	root: CoreExpr,
 	targets: StdInlineTargets,
@@ -471,13 +494,12 @@ private pure func walk_resolve_and_wrapper(
 	var string_add: List[CoreEarlyInvariantViolation] = []
 	var wrapper: Option[CoreEarlyInvariantViolation] = None
 	var pending: List[CoreExpr] = [root]
+	var top: Int = pending.length()
 
-	while pending.length() > 0:
-		top: Int = pending.length() - 1
-
-		match pending.get(top):
+	while top > 0:
+		match pending.get(top - 1):
 			Some(expr):
-				pending = pending.drop_last()
+				top -= 1
 
 				for violation in resolve_violations(expr):
 					resolve = resolve.append(violation)
@@ -498,7 +520,12 @@ private pure func walk_resolve_and_wrapper(
 					void
 
 				for child in CoreTraverse.immediate_core_expr_children(expr):
-					pending = pending.append(child)
+					pending = if top < pending.length():
+						pending.set(top, child)
+					else:
+						pending.append(child)
+
+					top += 1
 			None:
 				break
 
