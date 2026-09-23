@@ -545,8 +545,51 @@ pure func test_change_queues_replacement() -> Bool:
 
 
 --- The background workspace scan merges through a configuration change, which
---- carries no document of its own. It must not drop the edit the open document
---- is still waiting on: the newest content has to stay scheduled.
+--- carries no document of its own. It must leave the open document's schedule
+--- alone: the running analysis keeps its token, so it answers exactly once
+--- instead of being cancelled and started again.
+private pure func background_sources_keep_interactive_analysis_case() -> Option[Bool]:
+	source = discovered_source()
+	workspace ?= workspace(configuration(), [source]).to_option()
+	state ?= running_server_state(workspace)
+	open_event ?= client_event(VALID_DID_OPEN_BODY)
+	open_requested ?= apply_server_event(state, open_event).to_option()
+	opened ?= resolve_requested_open(open_requested)
+	before ?= server_active_analysis_for(
+		opened.state,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	loaded ?= apply_server_event(
+		opened.state,
+		ServerWorkspaceRootSourcesLoaded([source], []),
+	).to_option()
+	after ?= server_active_analysis_for(
+		loaded.state,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+
+	Some(
+		(
+			cancellation_token_value(after.token) == cancellation_token_value(before.token)
+			and not has_cancellation_effect(
+				loaded,
+				InteractiveDocumentAnalysis(source.uri),
+				cancellation_token_value(before.token),
+			)
+			and server_pending_analysis_for(
+				loaded.state,
+				InteractiveDocumentAnalysis(source.uri),
+			).is_none()
+		),
+	)
+
+
+pure func test_background_sources_keep_interactive_analysis() -> Bool:
+	background_sources_keep_interactive_analysis_case().get_or(False)
+
+
+--- The same scan must not drop an edit the open document is still waiting on:
+--- a queued replacement stays queued rather than being discarded.
 private pure func background_sources_keep_interactive_replacement_case() -> Option[Bool]:
 	source = discovered_source()
 	workspace ?= workspace(configuration(), [source]).to_option()
@@ -562,16 +605,10 @@ private pure func background_sources_keep_interactive_replacement_case() -> Opti
 	).to_option()
 
 	Some(
-		(
-			server_active_analysis_for(
-				loaded.state,
-				InteractiveDocumentAnalysis(source.uri),
-			).is_some()
-			or server_pending_analysis_for(
-				loaded.state,
-				InteractiveDocumentAnalysis(source.uri),
-			).is_some()
-		),
+		server_pending_analysis_for(
+			loaded.state,
+			InteractiveDocumentAnalysis(source.uri),
+		).is_some(),
 	)
 
 
@@ -1946,6 +1983,10 @@ tests: TestSuite = {
 			test_current_analysis_failure_publishes_clear,
 		),
 		("change queues replacement", test_change_queues_replacement),
+		(
+			"background sources keep interactive analysis",
+			test_background_sources_keep_interactive_analysis,
+		),
 		(
 			"background sources keep interactive replacement",
 			test_background_sources_keep_interactive_replacement,

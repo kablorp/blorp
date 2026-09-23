@@ -431,6 +431,19 @@ private pure func interactive_schedule_uri(schedule: AnalysisSchedule) -> Option
 			None
 
 
+--- Whether the open document behind an in-flight or queued interactive
+--- analysis is still in the document store, and so still worth answering.
+private pure func interactive_schedule_survives(
+	workspace: Workspace,
+	schedule: AnalysisSchedule,
+) -> Bool:
+	match interactive_schedule_uri(schedule):
+		None:
+			False
+		Some(uri):
+			document_store_find(workspace_document_store(workspace), uri).is_some()
+
+
 private pure func interactive_uri_for_event(event: WorkspaceEvent) -> Option[DocumentUri]:
 	match event:
 		ResolvedDocumentOpened(opened):
@@ -495,24 +508,31 @@ private pure func apply_workspace_change(
 						next_workspace_token_value = background[1]
 					}
 
-					-- An event with no document of its own, such as the background
-					-- workspace scan merging through a configuration change, must not
-					-- discard the open document's newest analysis. Re-plan it against
-					-- the accepted revision instead of retiring it unanswered.
-					interactive_uri: Option[DocumentUri] = match interactive_uri_for_event(event):
-						Some(event_uri):
-							Some(event_uri)
+					match interactive_uri_for_event(event):
 						None:
-							interactive_schedule_uri(with_background.interactive_schedule)
-
-					match interactive_uri:
-						None:
-							retired = retire_analysis_schedule(with_background.interactive_schedule)
-							updated = { with_background | interactive_schedule = retired[0] }
-							Ok({
-								state = native_server_state(NativeReady(updated)),
-								effects = clears + retired[1] + background[2],
-							})
+							-- An event with no document of its own, such as the background
+							-- workspace scan merging through a configuration change, says
+							-- nothing about the open document. Leave its schedule running so
+							-- the in-flight analysis still answers and any queued replacement
+							-- still starts. Only a document that is no longer open is retired.
+							survives = interactive_schedule_survives(
+								workspace,
+								with_background.interactive_schedule,
+							)
+							if survives:
+								Ok({
+									state = native_server_state(NativeReady(with_background)),
+									effects = clears + background[2],
+								})
+							else:
+								retired = retire_analysis_schedule(
+									with_background.interactive_schedule,
+								)
+								updated = { with_background | interactive_schedule = retired[0] }
+								Ok({
+									state = native_server_state(NativeReady(updated)),
+									effects = clears + retired[1] + background[2],
+								})
 						Some(uri):
 							match plan_interactive_analysis(transition, uri):
 								Err(error):
