@@ -179,49 +179,63 @@ the only step that changes the emitter's structure and is deliberately last.
 **Context.** Two allocations per node for a value that is read only by
 diagnostics, `--dump-core-after`, and the backend's line directives.
 `SourceLocation` in the frontend already made this move: `blorp/src/lib/
-source.brp:48` is `opaque type SourceLocation = Int`, with the comment "keep
-it pointer-sized so those payloads remain inline: a struct here is boxed by
-the backend".
+source.brp:48` is `opaque type SourceLocation = Int`, packing start and end
+offsets into one integer, with the comment "keep it pointer-sized so those
+payloads remain inline: a struct here is boxed by the backend".
 
-**Change.** Add a location table to `CoreProgram` and make `CoreSourceLoc` an
-opaque `Int`:
+**Why not append rows during lowering.** Expression lowering is a stateless
+recursive descent whose functions return `Result[CoreExpr, CoreLowerError]`
+with no context in the result (binder ids are minted from source offsets for
+the same reason). Threading a row accumulator through it would change every
+lowering function's signature, and rewriting each finished declaration's
+locations in a second walk would reallocate the whole tree. Neither is
+acceptable, so the handle carries the location itself.
+
+**Change.** `CoreSourceLoc` becomes an opaque `Int` that packs the module
+index, start offset and span length; 0 is the synthetic location. Resolution
+to file, line and column happens lazily through one table published on the
+program:
 
 ```
---- Rows are appended by lowering and by passes that mint synthetic nodes;
---- a row is never mutated. Row 0 is the synthetic location.
-struct CoreSourceLocRow {
-	file: Int,          -- index into CoreProgram.source_files
-	start_line: Int,
-	start_column: Int,
-	end_line: Int,
-	end_column: Int
+--- Packed as (module_index, start_offset, length); 0 is synthetic. Limits
+--- are documented at the packing function and an out-of-range span falls
+--- back to synthetic with a counted diagnostic.
+opaque type CoreSourceLoc = Int
+
+record CoreSourceFile {
+	path: String,
+	module_name: String,
+	line_starts: List[Int]       -- inline storage; binary search gives line and column
 }
 
 record CoreProgram {
 	decls: List[CoreDecl],
 	foreign_includes: List[String],
-	source_files: List[String],
-	source_locs: List[CoreSourceLocRow]
+	source_files: List[CoreSourceFile]   -- one per module, built once in assemble_core_program
 }
 
-opaque type CoreSourceLoc = Int
+struct CoreSourceLocRow { file: Int, start_line: Int, start_column: Int, end_line: Int, end_column: Int }
 
-pure func core_source_loc_row(program: CoreProgram, loc: CoreSourceLoc) -> CoreSourceLocRow
 pure func core_source_loc_is_synthetic(loc: CoreSourceLoc) -> Bool = loc == 0
+pure func core_source_loc_row(program: CoreProgram, loc: CoreSourceLoc) -> CoreSourceLocRow
+pure func core_source_loc_path(program: CoreProgram, loc: CoreSourceLoc) -> String
 ```
 
-`List[CoreSourceLocRow]` is inline storage (`InlineStructListStorage`), so a
-row costs no allocation of its own. Lowering owns the append: a local `var`
-accumulator in the lowering context, published once on the program, exactly
-as `LexResult.texts` is built. Passes that construct a node today write
-`SyntheticSourceLoc` or copy the source node's `loc`; both keep working:
-synthetic is row 0, and copying an `Int` is free.
+`core_source_loc` in `lower.brp` (29 call sites through
+`core_source_loc_from_context`) becomes integer arithmetic on the module index
+from the lowering context and the span offsets from `context.source_table`.
+A loc carries its own module, so passes that copy nodes between declarations
+(`std_inline`, mono) stay correct with no remapping. `clone_core_source_loc`
+becomes the identity and goes away. Passes that construct synthetic nodes
+write 0; passes that copy a source node's `loc` copy an `Int`.
 
-The ten `KnownSourceLoc(` construction sites, the codec (`ir.brp:2977`
-region; encode the row's fields so the JSON is unchanged), the decoder (build
-the table while decoding), and the diagnostic renderers change in the same
-commit. `test_core_json.brp` round-trips must keep passing byte for byte on
-the encoded string, which they will if the encoder prints the resolved row.
+The JSON codec keeps its output byte for byte: the per-node encoders emit a
+small marker object for a loc, and `core_program_to_json` resolves every
+marker against `source_files` in one post-order pass over the finished
+`JsonValue`; the decoder folds the known/synthetic objects back into packed
+handles against the table it builds while decoding. Declaration-level `loc`
+fields (`CoreParam`, the type declarations, `CoreSelectArm`, the match
+records) simply change type.
 
 **Expected ROI.** `core_lowering_complete` -1.5M allocations (about -8% of
 the row). Every downstream node rebuild stops retaining and releasing a loc
@@ -229,26 +243,30 @@ object: a small instruction gain across all Core passes (estimate -0.5% to
 -1%). Peak RSS down by 748,990 five-field unions.
 
 **Risks.** Diagnostics that print a loc must resolve through the program;
-any helper that had only a `CoreSourceLoc` in hand now needs the table or
-the resolved row passed in. Grep every `core_source_loc_` consumer before
-starting and count them in the report. The backend receives the program, so
-line directives are unaffected.
+any helper that had only a `CoreSourceLoc` in hand now needs the program or
+the resolved row passed in. The packing limits (file size, span length,
+module count) must be checked and the fallback counted; the count on the
+self-compile must be zero. Line and column recomputed from `line_starts`
+must equal what the frontend span carried; the 860 typecheck diagnostic
+fixtures are the broad oracle.
 
-**Oracle.** Byte-identical C; the 860 typecheck diagnostic fixtures and the
-Core dump JSON unchanged; `test_core_json.brp` green.
+**Oracle.** Byte-identical C; the diagnostic fixtures and the Core dump JSON
+unchanged; `test_core_json.brp` green.
 
 ### N2: the handle is the node id
 
-**Context.** After N1 every lowered node carries a row index that is unique
-to it, because lowering appends one row per node. Passes that copy a loc from
-the node they rewrite produce two nodes with the same index, which is fine
-for locations but not for identity.
+**Context.** After N1 every lowered node carries a packed location that is
+unique to it in practice (two source nodes rarely share module, start and
+length). Passes that copy a loc from the node they rewrite produce two nodes
+with the same value, which is fine for locations but not for identity.
 
 **Change.** Rename the field's role without changing its type: a node's
-`loc` is its `node: CoreNodeId` (`opaque type CoreNodeId = Int`), and the
-location is one column of the node row. Add the allocator to the pass state
-so a pass that mints a node gets a fresh row that copies the source node's
-location:
+`loc` is its `node: CoreNodeId` (`opaque type CoreNodeId = Int`). A lowered
+node's id is its packed location; a node minted by a pass gets a fresh id
+from an allocator on the pass state that lives in a range disjoint from
+packed locations (for example the negative range, or above the module-index
+bits), with a side table from minted id to the origin's location so
+diagnostics still resolve:
 
 ```
 record CorePassState {
