@@ -23,6 +23,13 @@ BLORP = pathlib.Path(os.environ.get("BLORP_TEST_BINARY", ROOT / "bin" / "blorp")
 # upward from the workspace root for a `pkg` directory) still finds the
 # repo's real `pkg/` directory.
 LIFECYCLE_ONLY_ROOT = ROOT / "blorp/test/lsp/fixtures/navigation"
+# The typecheck fixtures directory (used as a workspace root by a couple
+# of tests to escape a decoy package directory, see
+# test_standard_library_and_package_imports_resolve) has grown to several
+# hundred files over time. Its background scan competes for the same
+# compiler workers as interactive analysis, so give diagnostics waits in
+# those tests real headroom instead of the small-fixture default.
+HEAVY_WORKSPACE_TIMEOUT_SECONDS = 90.0
 RUNNER_PATH = pathlib.Path(__file__).with_name("run_lsp_fixtures.py")
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_lsp_fixtures", RUNNER_PATH)
 if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
@@ -834,8 +841,14 @@ class NativeLspBaselineTests(unittest.TestCase):
             # One level higher avoids that decoy while still being far
             # smaller than the whole-repo root.
             client.initialize(source_path.parent.parent.as_uri(), expected_version)
+            # This workspace root has grown to several hundred fixture files
+            # over time, so its background scan can take a while on a slow
+            # or loaded machine; give the wait real headroom rather than the
+            # default budget meant for small, targeted fixtures.
             diagnostics = client.open_document(
-                source_path.as_uri(), source_path.read_text(encoding="utf-8")
+                source_path.as_uri(),
+                source_path.read_text(encoding="utf-8"),
+                timeout=HEAVY_WORKSPACE_TIMEOUT_SECONDS,
             )
             self.assertEqual(diagnostics, [])
 
@@ -923,7 +936,12 @@ class NativeLspBaselineTests(unittest.TestCase):
 
             observed: list[list[dict[str, object]]] = []
             for _ in range(3):
-                diagnostics = client.wait_for_diagnostics(uri)
+                # See test_standard_library_and_package_imports_resolve: this
+                # workspace root's background scan can be slow, so wait with
+                # real headroom rather than the default small-fixture budget.
+                diagnostics = client.wait_for_diagnostics(
+                    uri, timeout=HEAVY_WORKSPACE_TIMEOUT_SECONDS
+                )
                 observed.append(diagnostics)
                 if any(
                     "newest_missing_name" in str(diagnostic.get("message", ""))

@@ -329,9 +329,11 @@ class LspClient:
             )
         self.notify("initialized", {})
 
-    def open_document(self, uri: str, text: str) -> list[dict[str, Any]]:
+    def open_document(
+        self, uri: str, text: str, timeout: float = DIAGNOSTIC_TIMEOUT_SECONDS
+    ) -> list[dict[str, Any]]:
         self.open_document_without_wait(uri, text)
-        return self.wait_for_diagnostics(uri)
+        return self.wait_for_diagnostics(uri, timeout)
 
     def open_document_without_wait(self, uri: str, text: str) -> None:
         self.notify(
@@ -346,9 +348,15 @@ class LspClient:
             },
         )
 
-    def change_document(self, uri: str, version: int, text: str) -> list[dict[str, Any]]:
+    def change_document(
+        self,
+        uri: str,
+        version: int,
+        text: str,
+        timeout: float = DIAGNOSTIC_TIMEOUT_SECONDS,
+    ) -> list[dict[str, Any]]:
         self.change_document_without_wait(uri, version, text)
-        return self.wait_for_diagnostics(uri)
+        return self.wait_for_diagnostics(uri, timeout)
 
     def change_document_without_wait(self, uri: str, version: int, text: str) -> None:
         self.notify(
@@ -375,15 +383,19 @@ class LspClient:
         )
         return self._record_diagnostics(uri, message)
 
-    def wait_for_diagnostics_message(self, uri: str) -> dict[str, Any]:
+    def wait_for_diagnostics_message(
+        self, uri: str, timeout: float = DIAGNOSTIC_TIMEOUT_SECONDS
+    ) -> dict[str, Any]:
         return self.read_matching_until(
             lambda value: value.get("method") == "textDocument/publishDiagnostics"
             and value.get("params", {}).get("uri") == uri,
-            DIAGNOSTIC_TIMEOUT_SECONDS,
+            timeout,
         )
 
-    def wait_for_diagnostics(self, uri: str) -> list[dict[str, Any]]:
-        message = self.wait_for_diagnostics_message(uri)
+    def wait_for_diagnostics(
+        self, uri: str, timeout: float = DIAGNOSTIC_TIMEOUT_SECONDS
+    ) -> list[dict[str, Any]]:
+        message = self.wait_for_diagnostics_message(uri, timeout)
         return self._record_diagnostics(uri, message)
 
     def _record_diagnostics(self, uri: str, message: dict[str, Any]) -> list[dict[str, Any]]:
