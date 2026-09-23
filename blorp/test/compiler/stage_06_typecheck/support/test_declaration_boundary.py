@@ -1232,24 +1232,53 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertNotIn("owner_module_identity: ModuleIdentity", preparation.group(0))
         self.assertNotIn("bound_module_graph_find(bound_graph", preparation.group(0))
 
-    def test_accepted_table_fallbacks_require_prepared_scope(self) -> None:
-        for category, path in (
-            ("alias", ALIAS_GRAPH),
-            ("record", RECORD_GRAPH),
-            ("union", UNION_GRAPH),
+    def test_accepted_table_fallbacks_expose_only_canonically_visible_names(self) -> None:
+        """The canonical-name fallback (no local module bindings) must still
+        expose only public declarations. `accepted_*_table_canonical_authority`
+        takes no scope: it builds its authority from the table's own
+        `*_by_canonical_name` maps via an empty module view, and those maps
+        are populated only for entries whose source table marked
+        `canonical_visible = True` (see `accepted_*_table` in the matching
+        `type_system/accepted_*_authority.brp`). That gate — not a
+        `PreparedModuleScope` argument — is what keeps the fallback
+        public-only."""
+        for category, graph_path, authority_path in (
+            ("alias", ALIAS_GRAPH, ALIAS_AUTHORITY),
+            ("record", RECORD_GRAPH, RECORD_AUTHORITY),
+            ("union", UNION_GRAPH, UNION_AUTHORITY),
         ):
             with self.subTest(category=category):
-                source = path.read_text(encoding="utf-8")
+                graph_source = graph_path.read_text(encoding="utf-8")
                 fallback = re.search(
                     rf"pure func accepted_{category}_table_canonical_authority\(.*?"
                     rf"(?=\n\npure func|\Z)",
-                    source,
+                    graph_source,
                     re.DOTALL,
                 )
 
                 self.assertIsNotNone(fallback)
-                self.assertIn("owner_scope: PreparedModuleScope", fallback.group(0))
+                self.assertNotIn("owner_scope: PreparedModuleScope", fallback.group(0))
                 self.assertNotIn("owner: ModuleIdentity", fallback.group(0))
+                self.assertIn(f"accepted_{category}_empty_module_view()", fallback.group(0))
+
+                authority_source = authority_path.read_text(encoding="utf-8")
+                builder = re.search(
+                    rf"pure func accepted_{category}_table\(.*?"
+                    rf"(?=\n\npure func|\Z)",
+                    authority_source,
+                    re.DOTALL,
+                )
+
+                self.assertIsNotNone(builder)
+                gated_name_index = re.search(
+                    r"if [A-Za-z_.]*canonical_visible:\s*\n\s*[A-Za-z_]*(?:by_canonical_name|_by_name) = ",
+                    builder.group(0),
+                )
+                self.assertIsNotNone(
+                    gated_name_index,
+                    "canonical-name index must only be populated when "
+                    "canonical_visible is True",
+                )
 
     def test_global_header_owner_index_uses_compilation_module_ids(self) -> None:
         source = GLOBAL_HEADER_COMPLETION.read_text(encoding="utf-8")
