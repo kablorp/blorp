@@ -1443,6 +1443,17 @@ blorp_List* blorp_list_append(blorp_List* list, void* element);
 blorp_List* blorp_list_append_owned(blorp_List* list, void* element);
 blorp_List* blorp_list_cow(blorp_List* list);
 blorp_List* blorp_list_ensure_capacity(blorp_List* list, long min_cap);
+
+// Fast-path wrapper for the emitted "grow if needed before a push" check:
+// a unique list with enough capacity is returned unchanged, otherwise the
+// slow path (blorp_list_ensure_capacity) does the real work. Factored out
+// of emit.brp's per-call-site expansion so the ~4k push sites in a
+// self-compile share one function body instead of repeating this ternary.
+static inline blorp_List* blorp_list_ensure_capacity_checked(blorp_List* list, long min_cap) {
+    return __builtin_expect(list && blorp_is_unique(list) && list->capacity >= min_cap, 1)
+        ? list
+        : blorp_list_ensure_capacity(list, min_cap);
+}
 blorp_List* blorp_list_reuse_alloc(blorp_List* list, long min_cap);
 void blorp_list_copy_span_uninit(blorp_List* dst, long dst_start, blorp_List* src, long src_start, long count);
 blorp_List* blorp_list_reverse_owned(blorp_List* list);
