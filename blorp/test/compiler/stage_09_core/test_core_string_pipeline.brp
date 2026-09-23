@@ -1,7 +1,7 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(IntrinsicCall, UserCall),
-		CoreExpr(BorrowLetExpr, CallExpr, LetExpr, LiteralExpr, VarExpr),
+		CoreExpr(BorrowLetExpr, CallExpr, LetExpr, LiteralExpr, SeqExpr, VarExpr),
 		CoreLiteral(IntLiteral, StringLiteral),
 		CoreSourceLoc(KnownSourceLoc, SyntheticSourceLoc),
 		CoreType(FunctionType, NamedType),
@@ -130,6 +130,16 @@ private pure func count_intrinsic_call(name: String, expr: CoreExpr) -> Int:
 
 private pure func core_vars_equal(left: CoreVar, right: CoreVar) -> Bool:
 	left.name == right.name and left.id == right.id and left.def_id == right.def_id
+
+
+private pure func count_var_references(variable: CoreVar, expr: CoreExpr) -> Int:
+	count_expr(expr, pure func(candidate: CoreExpr):
+		match candidate:
+			VarExpr(actual, _, _):
+				core_vars_equal(variable, actual)
+			_:
+				False
+	)
 
 
 private pure func has_distinct_binding_for_rhs(expr: CoreExpr, target: CoreVar) -> Bool:
@@ -443,6 +453,39 @@ pure func test_generated_stage_binding_does_not_capture_user_binding() -> Bool:
 	has_distinct_binding_for_rhs(fused, user_count)
 
 
+pure func test_separated_materializations_have_distinct_bound_ids() -> Bool:
+	left_source: CoreVar = core_var("left_source")
+	right_source: CoreVar = core_var("right_source")
+	fused: CoreExpr = fuse_string_expr(
+		SeqExpr(
+			take_left_call(VarExpr(left_source, TY_STRING, SyntheticSourceLoc), int_literal(2)),
+			SeqExpr(
+				user_call("opaque_string", [variable("middle", TY_STRING)], TY_STRING),
+				take_left_call(VarExpr(right_source, TY_STRING, SyntheticSourceLoc), int_literal(3)),
+			),
+		),
+	)
+
+	match fused:
+		SeqExpr(
+			BorrowLetExpr(left_binding, _, VarExpr(left_rhs, _, _), left_body),
+			SeqExpr(
+				middle,
+				BorrowLetExpr(right_binding, _, VarExpr(right_rhs, _, _), right_body),
+			),
+		):
+			(
+				is_user_call_named("opaque_string", middle)
+				and core_vars_equal(left_rhs, left_source)
+				and core_vars_equal(right_rhs, right_source)
+				and left_binding.id != right_binding.id
+				and count_var_references(left_binding, left_body) > 0
+				and count_var_references(right_binding, right_body) > 0
+			)
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Blorp compiler string pipeline",
 	tests = [
@@ -476,6 +519,10 @@ tests: TestSuite = {
 		(
 			"generated stage binding is hygienic",
 			test_generated_stage_binding_does_not_capture_user_binding,
+		),
+		(
+			"separated materializations have distinct bound ids",
+			test_separated_materializations_have_distinct_bound_ids,
 		),
 	]
 }

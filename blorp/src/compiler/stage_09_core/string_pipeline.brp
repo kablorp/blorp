@@ -64,18 +64,17 @@ private COMPILER_LOCAL_PREFIX: String = "$blorp$string_pipeline$"
 -- being a multiple keeps `fresh_var`'s name-preserving modulo exact.
 private CORE_SYNTHETIC_ID_SEED: Int = 3000000000
 
--- One materialization chain's fresh vars stay well under this per-site
+-- One materialization chain's fresh vars stay well under this per-rewrite
 -- budget (see the call sites in this file), so two sites' bands never
 -- overlap.
 private STRING_PIPELINE_ID_BAND: Int = 1000000
 
--- A per-fusion-site id band, independent of the *name* `fresh_var` mints.
--- `site` is `fuse_string_expr`'s own pre-order visit counter (see
--- `fuse_string_expr_at`), advanced once per node regardless of whether that
--- node fuses, so two distinct materializations in one function never share
--- an id even when nothing about their own shape distinguishes them.
-private pure func string_pipeline_id_band(site: Int) -> Int:
-	CORE_SYNTHETIC_ID_SEED + site * STRING_PIPELINE_ID_BAND
+-- A per-successful-rewrite id band, independent of the *name* `fresh_var`
+-- mints. `fusion_index` is the ordinal of this successful rewrite in
+-- `fuse_string_expr_at`; failed attempts and non-fusing nodes do not advance
+-- it, so separate materializations in one expression receive separate bands.
+private pure func string_pipeline_id_band(fusion_index: Int) -> Int:
+	CORE_SYNTHETIC_ID_SEED + fusion_index * STRING_PIPELINE_ID_BAND
 
 
 private union StringPipelineStage:
@@ -143,13 +142,13 @@ private pure func core_var(name: String, id: Int) -> CoreVar:
 
 
 -- Core Identity Migration step 5 (docs/CORE_ID_MIGRATION.md). `next_fresh`
--- is seeded per fusion site at `string_pipeline_id_band(site)` (see
--- `lower_pipeline_with_source`) instead of always at 0, so its `id` is
--- unique across fusion sites in one function; the *name* keeps the exact
--- text it always had by taking `next` modulo the band, which is a no-op
--- when the band divides the seed evenly (it does -- see the constants
--- below) and `next`'s local count never reaches the band size, so
--- generated C stays byte-identical.
+-- is seeded per successful rewrite at
+-- `string_pipeline_id_band(fusion_index)` (see `lower_pipeline_with_source`)
+-- instead of always at 0, so its `id` is unique across materializations in
+-- one expression. The *name* keeps the exact text it always had by taking
+-- `next` modulo the band, which is a no-op when the band divides the seed
+-- evenly (it does -- see the constants below) and `next`'s local count never
+-- reaches the band size, so generated C stays byte-identical.
 private pure func fresh_var(prefix: String, next_fresh: Int) -> StringFreshVar:
 	next: Int = next_fresh + 1
 	local_index: Int = next % STRING_PIPELINE_ID_BAND
@@ -1617,9 +1616,9 @@ private pure func lower_materialized_window_stages(
 private pure func lower_pipeline_with_source(
 	pipeline: StringPipeline,
 	lowerer: pure (StringLengthState, List[StringPipelineStage], Int) -> Option[StringLowering],
-	site: Int,
+	fusion_index: Int,
 ) -> Option[CoreExpr]:
-	source_fresh: StringFreshVar = fresh_var("source", string_pipeline_id_band(site))
+	source_fresh: StringFreshVar = fresh_var("source", string_pipeline_id_band(fusion_index))
 	source: CoreExpr = variable(source_fresh.variable, STRING_TYPE)
 	lowered ?= lowerer(SourceWindowState({
 			source = source,
@@ -1629,34 +1628,43 @@ private pure func lower_pipeline_with_source(
 	Some(bind_source_alias(source_fresh.variable, pipeline.source, lowered.expr))
 
 
-private pure func lower_materialized_replace(pipeline: StringPipeline, site: Int) -> Option[CoreExpr]:
+private pure func lower_materialized_replace(
+	pipeline: StringPipeline,
+	fusion_index: Int,
+) -> Option[CoreExpr]:
 	lower_pipeline_with_source(pipeline, pure func(
 		state: StringLengthState,
 		stages: List[StringPipelineStage],
 		next_fresh: Int,
 	):
 		lower_materialized_replace_stages(False, state, stages, next_fresh)
-	, site)
+	, fusion_index)
 
 
-private pure func lower_materialized_reverse(pipeline: StringPipeline, site: Int) -> Option[CoreExpr]:
+private pure func lower_materialized_reverse(
+	pipeline: StringPipeline,
+	fusion_index: Int,
+) -> Option[CoreExpr]:
 	lower_pipeline_with_source(pipeline, pure func(
 		state: StringLengthState,
 		stages: List[StringPipelineStage],
 		next_fresh: Int,
 	):
 		lower_materialized_reverse_stages(False, state, stages, next_fresh)
-	, site)
+	, fusion_index)
 
 
-private pure func lower_materialized_window(pipeline: StringPipeline, site: Int) -> Option[CoreExpr]:
+private pure func lower_materialized_window(
+	pipeline: StringPipeline,
+	fusion_index: Int,
+) -> Option[CoreExpr]:
 	lower_pipeline_with_source(pipeline, pure func(
 		state: StringLengthState,
 		stages: List[StringPipelineStage],
 		next_fresh: Int,
 	):
 		lower_materialized_window_stages(False, state, stages, next_fresh)
-	, site)
+	, fusion_index)
 
 
 private pure func direct_string_length(source: CoreExpr, loc: CoreSourceLoc) -> CoreExpr:
@@ -1669,7 +1677,7 @@ private pure func direct_string_length(source: CoreExpr, loc: CoreSourceLoc) -> 
 	)
 
 
-private pure func try_fuse_length(expr: CoreExpr, site: Int) -> Option[CoreExpr]:
+private pure func try_fuse_length(expr: CoreExpr, fusion_index: Int) -> Option[CoreExpr]:
 	call ?= call_base_and_args(expr)
 
 	if call.name != "length":
@@ -1683,7 +1691,7 @@ private pure func try_fuse_length(expr: CoreExpr, site: Int) -> Option[CoreExpr]
 				):
 					match pipeline_of_expr(source):
 						Some(pipeline):
-							lower_pipeline_with_source(pipeline, lower_length_stages, site)
+							lower_pipeline_with_source(pipeline, lower_length_stages, fusion_index)
 						None:
 							loc: CoreSourceLoc = match expr:
 								CallExpr(_, _, _, _, call_loc):
@@ -1698,61 +1706,59 @@ private pure func try_fuse_length(expr: CoreExpr, site: Int) -> Option[CoreExpr]
 				None
 
 
-private pure func try_fuse_materialization(expr: CoreExpr, site: Int) -> Option[CoreExpr]:
+private pure func try_fuse_materialization(expr: CoreExpr, fusion_index: Int) -> Option[CoreExpr]:
 	if not is_string_type(core_expr_type(expr)):
 		None
 	else:
 		pipeline ?= pipeline_of_expr(expr)
 
-		match lower_materialized_replace(pipeline, site):
+		match lower_materialized_replace(pipeline, fusion_index):
 			Some(fused):
 				Some(fused)
 			None:
-				match lower_materialized_reverse(pipeline, site):
+				match lower_materialized_reverse(pipeline, fusion_index):
 					Some(fused):
 						Some(fused)
 					None:
-						lower_materialized_window(pipeline, site)
+						lower_materialized_window(pipeline, fusion_index)
 
 
--- Every node visited advances `site` by one, whether or not it fuses, so
--- two fusion sites in one function never share `string_pipeline_id_band`'s
--- band (see its docstring). `fuse_string_expr` tries fusing a node before
--- descending into its children and again after (a pipeline can only be
--- recognized once an inner call has itself been fused), so `site` also
--- advances across that second attempt.
-private pure func fuse_string_expr_at(site: Int, expr: CoreExpr) -> CoreMapState[Int, CoreExpr]:
-	match try_fuse_length(expr, site):
+-- Each successful rewrite advances `fusion_index` once, whether it occurs
+-- before or after child traversal. Failed attempts and non-fusing nodes leave
+-- it unchanged; stateful child mapping gives sibling rewrites distinct bands.
+private pure func fuse_string_expr_at(
+	fusion_index: Int,
+	expr: CoreExpr,
+) -> CoreMapState[Int, CoreExpr]:
+	match try_fuse_length(expr, fusion_index):
 		Some(fused):
-			{ state = site + 1, value = fused }
+			{ state = fusion_index + 1, value = fused }
 		None:
-			match try_fuse_materialization(expr, site):
+			match try_fuse_materialization(expr, fusion_index):
 				Some(fused):
-					{ state = site + 1, value = fused }
+					{ state = fusion_index + 1, value = fused }
 				None:
 					mapped_children: CoreMapState[Int, CoreExpr] = map_core_expr_children_with_state(
-						site,
+						fusion_index,
 						fuse_string_expr_at,
 						expr,
 					)
 					mapped: CoreExpr = mapped_children.value
-					next_site: Int = mapped_children.state
+					next_fusion_index: Int = mapped_children.state
 
-					match try_fuse_length(mapped, next_site):
+					match try_fuse_length(mapped, next_fusion_index):
 						Some(fused):
-							{ state = next_site + 1, value = fused }
+							{ state = next_fusion_index + 1, value = fused }
 						None:
-							match try_fuse_materialization(mapped, next_site):
+							match try_fuse_materialization(mapped, next_fusion_index):
 								Some(fused):
-									{ state = next_site + 1, value = fused }
+									{ state = next_fusion_index + 1, value = fused }
 								None:
-									{ state = next_site, value = mapped }
+									{ state = next_fusion_index, value = mapped }
 
 
--- Public entry point kept single-expression (`fuse_string_expr(expr)`) for
--- its existing callers and tests: a lone expression's own fusion sites are
--- still numbered from 0, which is exactly what a fresh `site` counter gives
--- it, so this is a compatible wrapper around the stateful walk above.
+-- Keep the public single-expression API for existing callers and tests.
+-- Each expression starts its successful-rewrite ordinal at zero.
 pure func fuse_string_expr(expr: CoreExpr) -> CoreExpr:
 	fuse_string_expr_at(0, expr).value
 
