@@ -495,8 +495,24 @@ record PerceusManagedLetPlan {
 -- The iterative insertion traversal maintains one exact occurrence index for
 -- all visited expressions. Keeping the index out of individual frame results
 -- avoids retaining and merging a persistent map at every Core binding.
+--
+-- Core Identity Migration step 3 (docs/CORE_ID_MIGRATION.md): every entry this
+-- index ever stores has `def_id = Some(...)` (see `resolved_value_occurrence_count`
+-- / `add_resolved_value_impl` / `without_bound_value_impl` below -- each one's
+-- match requires it, and reports a no-op otherwise). `name` is redundant once
+-- `uniq` and `def_id` are both known: `test_module_local_def_id_collision_preserves_outer_use`,
+-- `test_hygienic_local_collision_preserves_outer_use` and
+-- `test_definition_collision_in_same_hygienic_slot_preserves_distinct_use`
+-- (test_core_perceus.brp) each construct two distinct bindings that share one
+-- of `def_id` or `uniq` but not the other (a module-local or hygienic-slot
+-- collision), and require the index to keep them separate -- so `def_id`
+-- alone is not a safe key (tried first; both collision tests failed), and
+-- neither is `uniq` alone. The pair is: keyed by `uniq` then `def_id`,
+-- dropping only the outer `String` (`name`) level, which is not needed since
+-- no two occurrences with equal `uniq` and `def_id` are ever expected to
+-- carry different names in practice, and no test exercises that case.
 record PerceusResolvedValueIndex {
-	occurrences_by_def_id_by_uniq_by_name: Dict[String, Dict[Int, Dict[Int, Int]]]
+	occurrences_by_def_id_by_uniq: Dict[Int, Dict[Int, Int]]
 }
 
 
@@ -2937,14 +2953,10 @@ private pure func resolved_value_occurrence_count(
 	debug:
 		perceus_work_resolved_value_queries()
 
-	match (variable.def_id, index.occurrences_by_def_id_by_uniq_by_name.get(variable.name)):
-		(Some(def_id), Some(occurrences_by_uniq)):
-			match occurrences_by_uniq.get(variable.uniq):
-				Some(occurrences_by_def_id):
-					occurrences_by_def_id.get_or(def_id, 0)
-				None:
-					0
-		_:
+	match variable.def_id:
+		Some(def_id):
+			index.occurrences_by_def_id_by_uniq.get_or(variable.uniq, {}).get_or(def_id, 0)
+		None:
 			0
 
 
@@ -2968,22 +2980,15 @@ private pure func add_resolved_value_impl(
 ) -> PerceusResolvedValueIndex:
 	match variable.def_id:
 		Some(def_id):
-			occurrences_by_uniq: Dict[Int, Dict[Int, Int]] = index.occurrences_by_def_id_by_uniq_by_name.get_or(
-				variable.name,
-				{},
-			)
-			occurrences_by_def_id: Dict[Int, Int] = occurrences_by_uniq.get_or(variable.uniq, {})
+			occurrences_by_def_id: Dict[Int, Int] = index.occurrences_by_def_id_by_uniq.get_or(variable.uniq, {})
 			occurrences: Int = occurrences_by_def_id.get_or(def_id, 0)
 
 			perceus_engine_resolved_value_update()
 
 			{
-				occurrences_by_def_id_by_uniq_by_name = index.occurrences_by_def_id_by_uniq_by_name.set(
-					variable.name,
-					occurrences_by_uniq.set(
-						variable.uniq,
-						occurrences_by_def_id.set(def_id, occurrences + 1),
-					),
+				occurrences_by_def_id_by_uniq = index.occurrences_by_def_id_by_uniq.set(
+					variable.uniq,
+					occurrences_by_def_id.set(def_id, occurrences + 1),
 				),
 			}
 		None:
@@ -3021,33 +3026,21 @@ private pure func without_bound_value_impl(
 	index: PerceusResolvedValueIndex,
 	variable: CoreVar,
 ) -> PerceusResolvedValueIndex:
-	match (variable.def_id, index.occurrences_by_def_id_by_uniq_by_name.get(variable.name)):
-		(Some(def_id), Some(occurrences_by_uniq)):
-			match occurrences_by_uniq.get(variable.uniq):
-				Some(occurrences_by_def_id):
-					if not occurrences_by_def_id.contains(def_id):
-						index
-					else:
-						remaining_by_def_id: Dict[Int, Int] = occurrences_by_def_id.remove(def_id)
+	match (variable.def_id, index.occurrences_by_def_id_by_uniq.get(variable.uniq)):
+		(Some(def_id), Some(occurrences_by_def_id)):
+			if not occurrences_by_def_id.contains(def_id):
+				index
+			else:
+				remaining_by_def_id: Dict[Int, Int] = occurrences_by_def_id.remove(def_id)
 
-						remaining_by_uniq: Dict[Int, Dict[Int, Int]] = if remaining_by_def_id.is_empty():
-							occurrences_by_uniq.remove(variable.uniq)
-						else:
-							occurrences_by_uniq.set(variable.uniq, remaining_by_def_id)
+				remaining_by_uniq: Dict[Int, Dict[Int, Int]] = if remaining_by_def_id.is_empty():
+					index.occurrences_by_def_id_by_uniq.remove(variable.uniq)
+				else:
+					index.occurrences_by_def_id_by_uniq.set(variable.uniq, remaining_by_def_id)
 
-						remaining_by_name: Dict[String, Dict[Int, Dict[Int, Int]]] = if remaining_by_uniq.is_empty():
-							index.occurrences_by_def_id_by_uniq_by_name.remove(variable.name)
-						else:
-							index.occurrences_by_def_id_by_uniq_by_name.set(
-								variable.name,
-								remaining_by_uniq,
-							)
+				perceus_engine_resolved_value_update()
 
-						perceus_engine_resolved_value_update()
-
-						{occurrences_by_def_id_by_uniq_by_name = remaining_by_name}
-				None:
-					index
+				{occurrences_by_def_id_by_uniq = remaining_by_uniq}
 		_:
 			index
 
@@ -3300,7 +3293,7 @@ private pure func insert_drops_expr_inner_result_impl(
 	-- The loop can exit only from the rebuild branch. This seed keeps the
 	-- function total if that state-machine invariant ever changes.
 	var pending: PerceusInsertedExpr = inserted_expr(env, expr, True)
-	var resolved_values: PerceusResolvedValueIndex = {occurrences_by_def_id_by_uniq_by_name = {}}
+	var resolved_values: PerceusResolvedValueIndex = {occurrences_by_def_id_by_uniq = {}}
 	var managed_binding_frame_count: Int = 0
 	var complete: Bool = False
 
