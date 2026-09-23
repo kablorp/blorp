@@ -1006,6 +1006,11 @@ private record FunctionEmissionContext {
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
 	indent: String,
+	-- When true, `base_emission_context`/`nested_emission_context` keep
+	-- `indent` at `""` instead of growing a fresh indent string per nesting
+	-- level (see the pattern-census whitespace finding: 16.55 MB of the
+	-- self-compile artifact is leading indentation and newlines).
+	compact: Bool,
 	parameter_variables: List[CoreVar]
 }
 
@@ -1149,12 +1154,19 @@ private pure func emission_context_from_plan(
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
 	parameter_variables: List[CoreVar],
+	compact: Bool,
 ) -> FunctionEmissionContext:
+	initial_indent: String = if compact:
+		""
+	else:
+		BASE_INDENT
+
 	{
 		cleanup_plan = plan,
 		profile_function_id = profile_function_id,
 		symbol_authority = symbol_authority,
-		indent = BASE_INDENT,
+		indent = initial_indent,
+		compact = compact,
 		parameter_variables = parameter_variables
 	}
 
@@ -1168,6 +1180,7 @@ private pure func diagnostic_emission_context(expr: CoreExpr) -> FunctionEmissio
 		profile_function_id = None,
 		symbol_authority = UnprojectedCEmissionSymbolsForTests,
 		indent = BASE_INDENT,
+		compact = False,
 		parameter_variables = []
 	}
 
@@ -2569,14 +2582,19 @@ private GLOBAL_INIT_FUNCTION_NAME: String = "__blorp_init_globals"
 --- The generated initializer every program entrypoint calls before its own
 --- body. Split emission defines it in the first translation unit, so the
 --- shared header declares it for whichever unit holds the entrypoint.
-private pure func with_current_task_local(function_c: String) -> String:
+private pure func with_current_task_local(function_c: String, compact: Bool) -> String:
 	if function_c.contains(CURRENT_TASK_LOCAL):
 		match function_c.index_of(C_FUNCTION_BODY_OPEN):
 			Some(open_index):
 				body_start: Int = open_index + C_FUNCTION_BODY_OPEN.length()
+				indent: String = if compact:
+					""
+				else:
+					BASE_INDENT
+
 				function_c.take_left(
 					body_start,
-				) + BASE_INDENT + CURRENT_TASK_LOCAL_DECLARATION + function_c.drop_left(body_start)
+				) + indent + CURRENT_TASK_LOCAL_DECLARATION + function_c.drop_left(body_start)
 			None:
 				function_c
 	else:
@@ -12146,6 +12164,7 @@ private pure func emit_closure_body_function(
 	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
+	compact: Bool,
 ) -> Option[String]:
 	match func_info.body:
 		Some(body):
@@ -12160,7 +12179,12 @@ private pure func emit_closure_body_function(
 				None,
 				symbol_authority,
 				function_parameter_variables(func_info),
+				compact,
 			)
+			discard_indent: String = if compact:
+				""
+			else:
+				BASE_INDENT
 			param_decls ?= closure_param_decls(abi.params)
 			env_prelude ?= closure_env_prelude(abi, emission_context)
 			body_c ?= emit_function_body(body, 0, emission_context)
@@ -12175,12 +12199,12 @@ private pure func emit_closure_body_function(
 				if abi.task_abi:
 					Some(
 						prefix + discard_body(
-							BASE_INDENT,
+							discard_indent,
 							body_c,
 						) + "  return (void*)0;\n}\n" + suffix,
 					)
 				else:
-					Some(prefix + discard_body(BASE_INDENT, body_c) + "}\n" + suffix)
+					Some(prefix + discard_body(discard_indent, body_c) + "}\n" + suffix)
 			else if body_c.returns:
 				None
 			else:
@@ -20918,13 +20942,19 @@ statement that value lands in, so it is rendered at the base indent.
 private pure func base_emission_context(
 	emission_context: FunctionEmissionContext,
 ) -> FunctionEmissionContext:
-	{ emission_context | indent = BASE_INDENT }
+	if emission_context.compact:
+		emission_context
+	else:
+		{ emission_context | indent = BASE_INDENT }
 
 
 private pure func nested_emission_context(
 	emission_context: FunctionEmissionContext,
 ) -> FunctionEmissionContext:
-	{ emission_context | indent = emission_context.indent + "  " }
+	if emission_context.compact:
+		emission_context
+	else:
+		{ emission_context | indent = emission_context.indent + "  " }
 
 
 private pure func emit_while_body(
@@ -22163,6 +22193,7 @@ private pure func emit_supported_user_function(
 	profile_function_id: Option[ProfileFunctionId],
 	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
+	compact: Bool,
 ) -> Option[String]:
 	match func_info.body:
 		Some(_):
@@ -22171,6 +22202,7 @@ private pure func emit_supported_user_function(
 				profile_function_id,
 				symbol_authority,
 				function_parameter_variables(func_info),
+				compact,
 			)
 
 			if profile_function_id.is_some():
@@ -22295,6 +22327,7 @@ private pure func emit_function(
 	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
+	compact: Bool,
 ) -> String:
 	rendered: String = match func_info.function_kind:
 		UserFunction:
@@ -22307,6 +22340,7 @@ private pure func emit_function(
 						profile_function_id,
 						plan,
 						symbol_authority,
+						compact,
 					):
 						Some(c_code):
 							c_code
@@ -22324,6 +22358,7 @@ private pure func emit_function(
 						profile_function_id,
 						plan,
 						symbol_authority,
+						compact,
 					):
 						Some(c_code):
 							c_code
@@ -22344,13 +22379,14 @@ private pure func emit_function(
 				plan,
 				symbol_authority,
 				internal_type_linkage,
+				compact,
 			):
 				Some(c_code):
 					c_code
 				None:
 					emit_function_inventory(func_info, display_name)
 
-	with_task: String = with_current_task_local(rendered)
+	with_task: String = with_current_task_local(rendered, compact)
 
 	if (
 		internal_linkage
@@ -24397,23 +24433,29 @@ private pure func emit_global_runtime_init_body(
 	next_temp: Int,
 	plan: CancellationProtectionPlan,
 	symbol_authority: CEmissionSymbolAuthority,
+	compact: Bool,
 ) -> Option[FunctionBodyC]:
 	emission_context: FunctionEmissionContext = emission_context_from_plan(
 		plan,
 		None,
 		symbol_authority,
 		[],
+		compact,
 	)
 	init_body ?= emit_function_body(global.init, next_temp, emission_context)
+	wrapper_indent: String = if compact:
+		""
+	else:
+		"  "
 
 	if init_body.returns:
 		None
 	else:
 		init_value ?= required_body_value(init_body)
 		Some({
-			statements = "  {\n" + init_body.statements + "  " + c_var_name(
+			statements = wrapper_indent + "{\n" + init_body.statements + wrapper_indent + c_var_name(
 				global.name,
-			) + " = " + init_value + ";\n  }\n",
+			) + " = " + init_value + ";\n" + wrapper_indent + "}\n",
 			value = "",
 			next_temp = init_body.next_temp,
 			returns = False,
@@ -25454,6 +25496,7 @@ private pure func emit_global_init_function(
 	decls: List[CoreDecl],
 	cancellation_table: CancellationPlanTable,
 	symbol_authority: CEmissionSymbolAuthority,
+	compact: Bool,
 ) -> Result[String, CoreEmitError]:
 	var statements: String = make_string(0)
 	var error: Option[CoreEmitError] = None
@@ -25480,6 +25523,7 @@ private pure func emit_global_init_function(
 								temp_index,
 								plan,
 								symbol_authority,
+								compact,
 							):
 								Some(init_body):
 									statements = append_emitted_c(statements, init_body.statements)
@@ -25516,6 +25560,7 @@ private pure func emit_global_init_function(
 			else:
 				with_current_task_local(
 					"static void __blorp_drop_globals(void) {\n" + cleanup_statements + "}\n\n",
+					compact,
 				)
 
 			cleanup_registration: String = if cleanup_statements == "":
@@ -25526,6 +25571,7 @@ private pure func emit_global_init_function(
 			Ok(
 				cleanup_function + with_current_task_local(
 					"void " + GLOBAL_INIT_FUNCTION_NAME + "(void) {\n" + statements + cleanup_registration + "}\n\n",
+					compact,
 				),
 			)
 
@@ -25578,6 +25624,7 @@ private pure func emit_function_decls(
 	internal_linkage: Bool,
 	cancellation_table: CancellationPlanTable,
 	internal_type_linkage: Bool,
+	compact: Bool,
 ) -> List[CFunctionEmission]:
 	var functions: List[CFunctionEmission] = []
 	var next_profile_id: Int = 0
@@ -25616,6 +25663,7 @@ private pure func emit_function_decls(
 						plan,
 						symbol_authority,
 						internal_type_linkage,
+						compact,
 					),
 				})
 			EnumDecl(enum_decl):
@@ -26039,6 +26087,7 @@ private pure func emit_decls(
 	canonical_empty_lists: List[CanonicalEmptyList],
 	internal_linkage: Bool,
 	internal_type_linkage: Bool,
+	compact: Bool,
 ) -> Result[CEmissionSections, CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
 	layouts: CRecordLayoutRegistry = classify_c_record_layouts(program)
@@ -26047,7 +26096,7 @@ private pure func emit_decls(
 	).map_err(
 		func(error): InvalidStaticStringLiteralPool(error),
 	)
-	global_init ?= emit_global_init_function(decls, cancellation_table, symbol_authority)
+	global_init ?= emit_global_init_function(decls, cancellation_table, symbol_authority, compact)
 
 	profile_plan ?= profile_emission_plan(decls, symbol_authority, profile_configuration)
 
@@ -26104,6 +26153,7 @@ private pure func emit_decls(
 			internal_linkage,
 			cancellation_table,
 			internal_type_linkage,
+			compact,
 		),
 		value_record_emissions = value_record_emissions,
 		heap_record_emissions = heap_record_emissions,
@@ -26123,9 +26173,18 @@ private pure func error_artifact(error: CoreEmitError) -> CArtifact:
 	}
 
 
-pure func try_emit_prepared_core_program_c_artifact_with_profile(
+---
+The production single-unit emission path, parameterized on whether
+`nested_emission_context` grows an indent string per nesting level (see the
+pattern-census whitespace finding: 16.55 MB of the self-compile artifact is
+leading indentation and newlines).
+`try_emit_prepared_core_program_c_artifact_with_profile` below is the
+indented default every existing caller keeps getting.
+---
+pure func try_emit_prepared_core_program_c_artifact_with_profile_and_indentation(
 	prepared: PreparedCoreProgram,
 	profile_configuration: FunctionProfileConfiguration,
+	compact: Bool,
 ) -> Result[CArtifact, CoreEmitError]:
 	program: CoreProgram = prepared_core_program_value(prepared)
 	plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
@@ -26146,6 +26205,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 				c_emission_canonical_empty_lists(symbol_plan),
 				True,
 				True,
+				compact,
 			)
 			Ok({
 				c_code = render_single_translation_unit(
@@ -26156,6 +26216,17 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 				link_flags = [],
 				include_dirs = [],
 			})
+
+
+pure func try_emit_prepared_core_program_c_artifact_with_profile(
+	prepared: PreparedCoreProgram,
+	profile_configuration: FunctionProfileConfiguration,
+) -> Result[CArtifact, CoreEmitError]:
+	try_emit_prepared_core_program_c_artifact_with_profile_and_indentation(
+		prepared,
+		profile_configuration,
+		False,
+	)
 
 
 pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
@@ -26182,6 +26253,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		canonical_empty_lists,
 		False,
 		True,
+		False,
 	)
 	Ok({
 		c_code = render_single_translation_unit(
@@ -26857,16 +26929,18 @@ body with no header, so the split machinery above is never reached for the
 N=1 case: the single-file output stays byte-identical by construction, not
 by parallel maintenance.
 ---
-pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
+pure func try_emit_prepared_core_program_c_split_artifact_with_profile_and_indentation(
 	prepared: PreparedCoreProgram,
 	profile_configuration: FunctionProfileConfiguration,
 	unit_count: Int,
 	header_name: String,
+	compact: Bool,
 ) -> Result[CTranslationUnitSet, CoreEmitError]:
 	if unit_count <= 1:
-		single ?= try_emit_prepared_core_program_c_artifact_with_profile(
+		single ?= try_emit_prepared_core_program_c_artifact_with_profile_and_indentation(
 			prepared,
 			profile_configuration,
+			compact,
 		)
 		Ok({
 			shared_header = "",
@@ -26906,6 +26980,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 					canonical_empty_lists,
 					False,
 					False,
+					compact,
 				)
 
 				Ok(
@@ -26922,3 +26997,18 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
 						header_name,
 					),
 				)
+
+
+pure func try_emit_prepared_core_program_c_split_artifact_with_profile(
+	prepared: PreparedCoreProgram,
+	profile_configuration: FunctionProfileConfiguration,
+	unit_count: Int,
+	header_name: String,
+) -> Result[CTranslationUnitSet, CoreEmitError]:
+	try_emit_prepared_core_program_c_split_artifact_with_profile_and_indentation(
+		prepared,
+		profile_configuration,
+		unit_count,
+		header_name,
+		False,
+	)
