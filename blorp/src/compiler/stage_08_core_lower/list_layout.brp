@@ -186,18 +186,38 @@ private pure func substitute_alias_type(
 			typ
 
 
+-- Allocation identity for resolved Core types: a NamedType whose alias/arity
+-- lookups leave it unchanged hands back its own input rather than an
+-- allocated copy, following the same pattern as `same_core_expr` in
+-- traverse.brp. Bound straight to the runtime primitive for the same
+-- bootstrap reason as the matching block there and in flatten.brp; delete
+-- alongside those once the bootstrap pin moves past `blorp_same_object`.
+foreign:
+	private pure func same_core_type(left: CoreType, right: CoreType) -> Bool = "blorp_same_object"
+	private pure func same_core_types(left: List[CoreType], right: List[CoreType]) -> Bool = "blorp_same_object"
+
+
 private pure func canonical_declared_type(
 	index: CoreLayoutTypeIndex,
+	typ: CoreType,
 	name: String,
 	args: List[CoreType],
+	args_unchanged: Bool,
 ) -> CoreType:
 	if args.length() != 0:
-		NamedType(name, args)
+		if args_unchanged:
+			typ
+		else:
+			NamedType(name, args)
 	else:
-		index.declared_types.get_or(
-			name,
-			NamedType(name, args),
-		)
+		match index.declared_types.get(name):
+			Some(declared):
+				declared
+			None:
+				if args_unchanged:
+					typ
+				else:
+					NamedType(name, args)
 
 
 private pure func resolve_types(
@@ -206,11 +226,24 @@ private pure func resolve_types(
 	seen_aliases: List[String],
 ) -> List[CoreType]:
 	var result: List[CoreType] = []
+	var changed: Bool = False
+	var pos: Int = 0
 
 	for typ in types:
-		result = result.append(resolve_type(index, typ, seen_aliases))
+		resolved: CoreType = resolve_type(index, typ, seen_aliases)
 
-	result
+		if changed:
+			result = result.append(resolved)
+		else if not same_core_type(resolved, typ):
+			result = types.take(pos).append(resolved)
+			changed = True
+
+		pos += 1
+
+	if changed:
+		result
+	else:
+		types
 
 
 private pure func resolve_type(
@@ -221,9 +254,10 @@ private pure func resolve_type(
 	match typ:
 		NamedType(name, args):
 			resolved_args: List[CoreType] = resolve_types(index, args, seen_aliases)
+			args_unchanged: Bool = same_core_types(resolved_args, args)
 
 			if seen_aliases.contains(name):
-				canonical_declared_type(index, name, resolved_args)
+				canonical_declared_type(index, typ, name, resolved_args, args_unchanged)
 			else:
 				alias_expansion: Option[CoreType] = match index.aliases.get(name):
 					Some(alias_decl):
@@ -248,29 +282,45 @@ private pure func resolve_type(
 							seen_aliases.append(name),
 						)
 					None:
-						canonical_declared_type(index, name, resolved_args)
+						canonical_declared_type(index, typ, name, resolved_args, args_unchanged)
 		StackResultType(ok_type, err_type):
-			StackResultType(
-				resolve_type(index, ok_type, seen_aliases),
-				resolve_type(index, err_type, seen_aliases),
-			)
+			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases)
+			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases)
+
+			if same_core_type(resolved_ok, ok_type) and same_core_type(resolved_err, err_type):
+				typ
+			else:
+				StackResultType(resolved_ok, resolved_err)
 		BoxedResultType(ok_type, err_type):
-			BoxedResultType(
-				resolve_type(index, ok_type, seen_aliases),
-				resolve_type(index, err_type, seen_aliases),
-			)
+			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases)
+			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases)
+
+			if same_core_type(resolved_ok, ok_type) and same_core_type(resolved_err, err_type):
+				typ
+			else:
+				BoxedResultType(resolved_ok, resolved_err)
 		FunctionType(is_pure, params, return_type):
-			FunctionType(
-				is_pure,
-				resolve_types(index, params, seen_aliases),
-				resolve_type(index, return_type, seen_aliases),
-			)
+			resolved_params: List[CoreType] = resolve_types(index, params, seen_aliases)
+			resolved_return: CoreType = resolve_type(index, return_type, seen_aliases)
+
+			if same_core_types(resolved_params, params) and same_core_type(resolved_return, return_type):
+				typ
+			else:
+				FunctionType(is_pure, resolved_params, resolved_return)
 		TensorType(info):
-			TensorType(
-				{ info | element_type = resolve_type(index, info.element_type, seen_aliases) },
-			)
+			resolved_element: CoreType = resolve_type(index, info.element_type, seen_aliases)
+
+			if same_core_type(resolved_element, info.element_type):
+				typ
+			else:
+				TensorType({ info | element_type = resolved_element })
 		TupleType(items):
-			TupleType(resolve_types(index, items, seen_aliases))
+			resolved_items: List[CoreType] = resolve_types(index, items, seen_aliases)
+
+			if same_core_types(resolved_items, items):
+				typ
+			else:
+				TupleType(resolved_items)
 		_:
 			typ
 
