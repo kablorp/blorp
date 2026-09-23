@@ -250,15 +250,31 @@ pure func host_c_warning_arguments(sanitizer: BuildSanitizer) -> List[String]:
 			[]
 
 
+-- ASan/UBSan instrument every stack frame with redzones, which multiplies
+-- the frame size of ordinary recursive-descent C (e.g. the backend's
+-- expression-to-C renderer walking a synthetically deep CoreExpr tree in
+-- blorp/test/compiler/stage_10_backend/test_split_emit.brp). The renderer's
+-- recursion depth itself is legitimate and bounded by the input program, so
+-- give the sanitized host binary a much larger main-thread stack rather than
+-- rewriting the renderer to a work stack.
+private pure func platform_stack_size_argument(sanitizer: BuildSanitizer) -> String:
+	match sanitizer:
+		BuildNoSanitizer:
+			"0x1000000"
+		_:
+			"0x8000000"
+
+
 private pure func platform_arguments(
 	platform: BuildPlatform,
 	compiler: HostCCompilerFamily,
+	sanitizer: BuildSanitizer,
 ) -> List[String]:
 	match platform:
 		BuildMacos:
 			match compiler:
 				HostClang:
-					["-Wl,-stack_size,0x1000000"]
+					["-Wl,-stack_size,${platform_stack_size_argument(sanitizer)}"]
 				_:
 					[]
 		BuildLinux:
@@ -323,7 +339,13 @@ pure func prepare_host_c_compilation(
 			),
 		)
 		.concat(["-fwrapv", "-pipe"])
-		.concat(platform_arguments(configuration.platform, configuration.compiler.family))
+		.concat(
+			platform_arguments(
+				configuration.platform,
+				configuration.compiler.family,
+				artifact.compatibility.sanitizer,
+			),
+		)
 		.concat(host_c_warning_arguments(artifact.compatibility.sanitizer))
 		.concat(runtime_policy.runtime_feature_arguments)
 		.concat(invocation.include_arguments)
@@ -515,7 +537,7 @@ private pure func split_link_command(
 	sanitizer: BuildSanitizer = artifact.compatibility.sanitizer
 	arguments: List[String] = ["-pipe"]
 		.append(host_c_optimization_argument(artifact.compatibility.optimization, sanitizer))
-		.concat(platform_arguments(configuration.platform, configuration.compiler.family))
+		.concat(platform_arguments(configuration.platform, configuration.compiler.family, sanitizer))
 		.concat(object_paths)
 		.append(precompiled.object_path)
 		.concat(["-lm", "-lpthread"])
