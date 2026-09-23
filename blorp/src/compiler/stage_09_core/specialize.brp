@@ -62,6 +62,7 @@ import:
 	specialize_layout: CoreSpecializeLayout, build_specialize_layout, resolve_specialize_type
 	specialize_tensor_dispatch: specialize_tensor_dispatch_expr
 	specialize_value: specialize_value_expr
+	tensor_specialize as CoreTensorSpecialize
 	traverse as CoreTraverse
 	type_policy as CoreTypePolicy
 
@@ -461,13 +462,16 @@ private pure func specialize_current_expr(layout: CoreSpecializeLayout, expr: Co
 
 private pure func specialize_semantic_constructor_cases(
 	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
 	cases: List[CoreSemanticConstructorMatchCase],
 ) -> List[CoreSemanticConstructorMatchCase]:
 	var specialized: List[CoreSemanticConstructorMatchCase] = []
 
 	for match_case in cases:
 		specialized = specialized.append(
-			{ match_case | body = specialize_semantic_match_tree(layout, match_case.body) },
+			{ match_case |
+				body = specialize_semantic_match_tree(layout, fuse_tensor, match_case.body)
+			},
 		)
 
 	specialized
@@ -475,13 +479,16 @@ private pure func specialize_semantic_constructor_cases(
 
 private pure func specialize_semantic_literal_cases(
 	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
 	cases: List[CoreSemanticLiteralMatchCase],
 ) -> List[CoreSemanticLiteralMatchCase]:
 	var specialized: List[CoreSemanticLiteralMatchCase] = []
 
 	for match_case in cases:
 		specialized = specialized.append(
-			{ match_case | body = specialize_semantic_match_tree(layout, match_case.body) },
+			{ match_case |
+				body = specialize_semantic_match_tree(layout, fuse_tensor, match_case.body)
+			},
 		)
 
 	specialized
@@ -489,13 +496,16 @@ private pure func specialize_semantic_literal_cases(
 
 private pure func specialize_semantic_length_cases(
 	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
 	cases: List[CoreSemanticLengthMatchCase],
 ) -> List[CoreSemanticLengthMatchCase]:
 	var specialized: List[CoreSemanticLengthMatchCase] = []
 
 	for match_case in cases:
 		specialized = specialized.append(
-			{ match_case | body = specialize_semantic_match_tree(layout, match_case.body) },
+			{ match_case |
+				body = specialize_semantic_match_tree(layout, fuse_tensor, match_case.body)
+			},
 		)
 
 	specialized
@@ -503,22 +513,28 @@ private pure func specialize_semantic_length_cases(
 
 private pure func specialize_semantic_length_geq(
 	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
 	geq: Option[CoreSemanticLengthMatchGeq],
 ) -> Option[CoreSemanticLengthMatchGeq]:
 	match geq:
 		Some(match_case):
-			Some({ match_case | body = specialize_semantic_match_tree(layout, match_case.body) })
+			Some(
+				{ match_case |
+					body = specialize_semantic_match_tree(layout, fuse_tensor, match_case.body)
+				},
+			)
 		None:
 			None
 
 
 private pure func specialize_optional_semantic_match_tree(
 	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
 	tree: Option[CoreSemanticMatchTree],
 ) -> Option[CoreSemanticMatchTree]:
 	match tree:
 		Some(found):
-			Some(specialize_semantic_match_tree(layout, found))
+			Some(specialize_semantic_match_tree(layout, fuse_tensor, found))
 		None:
 			None
 
@@ -746,41 +762,46 @@ private pure func rewrite_tensor_get_or_match(
 
 private pure func specialize_semantic_match_tree(
 	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
 	tree: CoreSemanticMatchTree,
 ) -> CoreSemanticMatchTree:
 	match tree:
 		SemanticMatchLeaf(bindings, body):
 			SemanticMatchLeaf(
 				bindings,
-				specialize_expr(layout, body),
+				specialize_expr(layout, fuse_tensor, body),
 			)
 		SemanticMatchFail:
 			SemanticMatchFail
 		SemanticConstructorMatch(accessor, cases, fallback):
 			SemanticConstructorMatch(
 				accessor,
-				specialize_semantic_constructor_cases(layout, cases),
-				specialize_optional_semantic_match_tree(layout, fallback),
+				specialize_semantic_constructor_cases(layout, fuse_tensor, cases),
+				specialize_optional_semantic_match_tree(layout, fuse_tensor, fallback),
 			)
 		SemanticLiteralMatch(accessor, cases, fallback):
 			SemanticLiteralMatch(
 				accessor,
-				specialize_semantic_literal_cases(layout, cases),
-				specialize_semantic_match_tree(layout, fallback),
+				specialize_semantic_literal_cases(layout, fuse_tensor, cases),
+				specialize_semantic_match_tree(layout, fuse_tensor, fallback),
 			)
 		SemanticLengthMatch(accessor, cases, geq, fallback):
 			SemanticLengthMatch(
 				accessor,
-				specialize_semantic_length_cases(layout, cases),
-				specialize_semantic_length_geq(layout, geq),
-				specialize_optional_semantic_match_tree(layout, fallback),
+				specialize_semantic_length_cases(layout, fuse_tensor, cases),
+				specialize_semantic_length_geq(layout, fuse_tensor, geq),
+				specialize_optional_semantic_match_tree(layout, fuse_tensor, fallback),
 			)
 
 
 -- Logical chains can be much deeper than the surrounding expression tree.
 -- Keep their postorder traversal off the native stack while retaining the
 -- ordinary specialization entry point at every non-logical boundary.
-private pure func specialize_logical_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+private pure func specialize_logical_expr(
+	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
+	expr: CoreExpr,
+) -> CoreExpr:
 	var tasks: List[SpecializeLogicalTask] = [SpecializeLogicalNode(expr)]
 	var task_count: Int = 1
 	var specialized: List[CoreExpr] = []
@@ -827,7 +848,11 @@ private pure func specialize_logical_expr(layout: CoreSpecializeLayout, expr: Co
 
 								task_count += 1
 							_:
-								specialized_expr: CoreExpr = specialize_expr(layout, current_expr)
+								specialized_expr: CoreExpr = specialize_expr(
+									layout,
+									fuse_tensor,
+									current_expr,
+								)
 
 								specialized = if specialized_count < specialized.length():
 									specialized.set(specialized_count, specialized_expr)
@@ -860,16 +885,29 @@ private pure func specialize_logical_expr(layout: CoreSpecializeLayout, expr: Co
 		expr
 
 
-private pure func specialize_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+-- `fuse_tensor` is threaded (not carried in `layout`) because it changes the
+-- per-node rewrite itself -- whether `CoreTensorSpecialize.specialize_current_expr`
+-- runs before this pass's own `specialize_current_expr` on a node -- rather
+-- than data the layout builder would compute once. `False` everywhere below
+-- reproduces `specialize_program` exactly; only `specialize_program_fused`
+-- passes `True`.
+private pure func specialize_expr(
+	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
+	expr: CoreExpr,
+) -> CoreExpr:
 	match expr:
 		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(expr, func(item): specialize_expr(layout, item))
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				func(item): specialize_expr(layout, fuse_tensor, item),
+			)
 		LogicalExpr(_, _, _, _, _):
-			specialize_logical_expr(layout, expr)
+			specialize_logical_expr(layout, fuse_tensor, expr)
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			specialized_match: CoreExpr = SemanticMatchExpr(
-				specialize_expr(layout, scrutinee),
-				specialize_semantic_match_tree(layout, tree),
+				specialize_expr(layout, fuse_tensor, scrutinee),
+				specialize_semantic_match_tree(layout, fuse_tensor, tree),
 				typ,
 				loc,
 			)
@@ -877,30 +915,49 @@ private pure func specialize_expr(layout: CoreSpecializeLayout, expr: CoreExpr) 
 		_:
 			children_specialized: CoreExpr = CoreTraverse.map_core_expr_children(
 				expr,
-				func(child): specialize_expr(layout, child),
+				func(child): specialize_expr(layout, fuse_tensor, child),
 			)
 
-			specialize_current_expr(layout, children_specialized)
+			-- resolve_backend_match_fused's sibling: tensor_specialize's own
+			-- per-node step only ever rewrites `CallExpr`/`ForRangeExpr` shapes
+			-- (every other node kind passes through it unchanged), so applying
+			-- it here before this pass's own current-node step reproduces
+			-- running the two passes separately -- tensor_specialize would have
+			-- already fully rewritten this node and its children by the time
+			-- this pass's own (currently separate) walk reached it.
+			tensor_specialized: CoreExpr = if fuse_tensor:
+				CoreTensorSpecialize.specialize_current_expr(children_specialized)
+			else:
+				children_specialized
+
+			specialize_current_expr(layout, tensor_specialized)
 
 
 private pure func specialize_function(
 	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
 	function_info: CoreFunction,
 ) -> CoreFunction:
-	{ function_info | body = function_info.body.map(func(body): specialize_expr(layout, body)) }
+	{ function_info |
+		body = function_info.body.map(func(body): specialize_expr(layout, fuse_tensor, body))
+	}
 
 
-private pure func specialize_decl(layout: CoreSpecializeLayout, decl: CoreDecl) -> CoreDecl:
+private pure func specialize_decl(
+	layout: CoreSpecializeLayout,
+	fuse_tensor: Bool,
+	decl: CoreDecl,
+) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(specialize_function(layout, function_info))
+			FunctionDecl(specialize_function(layout, fuse_tensor, function_info))
 		GlobalDecl(global):
-			GlobalDecl({ global | init = specialize_expr(layout, global.init) })
+			GlobalDecl({ global | init = specialize_expr(layout, fuse_tensor, global.init) })
 		ImplDecl(impl_decl):
 			ImplDecl(
 				{ impl_decl |
 					methods = impl_decl.methods.map(
-						func(method): specialize_function(layout, method),
+						func(method): specialize_function(layout, fuse_tensor, method),
 					)
 				},
 			)
@@ -910,4 +967,19 @@ private pure func specialize_decl(layout: CoreSpecializeLayout, decl: CoreDecl) 
 
 pure func specialize_program(program: CoreProgram) -> CoreProgram:
 	layout: CoreSpecializeLayout = build_specialize_layout(program)
-	{ program | decls = program.decls.map(func(decl): specialize_decl(layout, decl)) }
+	{ program | decls = program.decls.map(func(decl): specialize_decl(layout, False, decl)) }
+
+
+---
+Fused tensor_specialize -> specialize entry point for the normal compile path
+(`pipeline.late_core_passes_for_control` picks this over the two standalone
+passes). Builds this pass's own layout exactly as `specialize_program` does,
+and additionally applies `CoreTensorSpecialize.specialize_current_expr` to
+each node before this pass's own per-node step, so both passes' rewrites
+happen in one walk instead of two. tensor_specialize needs no shared context
+of its own (its per-node step is a pure function of the node), so there is
+nothing else to build once here.
+---
+pure func specialize_program_fused(program: CoreProgram) -> CoreProgram:
+	layout: CoreSpecializeLayout = build_specialize_layout(program)
+	{ program | decls = program.decls.map(func(decl): specialize_decl(layout, True, decl)) }

@@ -44,7 +44,9 @@ import:
 		),
 		CoreVar,
 		core_expr_to_json,
-	../../../src/compiler/stage_09_core/specialize: specialize_program
+		core_program_to_json,
+	../../../src/compiler/stage_09_core/specialize: specialize_program, specialize_program_fused
+	../../../src/compiler/stage_09_core/tensor_specialize as CoreTensorSpecialize
 	test: TestSuite
 
 
@@ -531,6 +533,47 @@ pure func test_hash_preserves_unsupported_type_dispatch() -> Bool:
 			False
 
 
+-- A program exercising both fused-walk passes on the same node: a tensor
+-- length call inside a `SemanticMatchExpr` leaf. tensor_specialize turns the
+-- call into `IntrinsicCall("tensor_len")` from inside
+-- `specialize_semantic_match_tree`'s own (non-generic) recursion into the
+-- match tree, which is where a fusion that only threaded the flag through
+-- `specialize_expr`'s generic default arm -- and missed the semantic-match
+-- helpers -- would first show up as a diff.
+private pure func fused_dependency_program() -> CoreProgram:
+	tensor_type: CoreType = TensorType({
+		element_type = named_type("Int"),
+		dims = [TensorStaticDim(4)],
+	})
+	tensor_len_call: CoreExpr = builtin_call(
+		"blorp_vector_len",
+		variable("values", tensor_type),
+		named_type("Int"),
+	)
+	body: CoreExpr = SemanticMatchExpr(
+		LiteralExpr(BoolLiteral(True), named_type("Bool"), SyntheticSourceLoc),
+		SemanticMatchLeaf([], tensor_len_call),
+		named_type("Int"),
+		SyntheticSourceLoc,
+	)
+
+	program_with_body(body)
+
+
+-- The dependency `specialize_program_fused` relies on: running
+-- tensor_specialize then specialize as one fused walk over
+-- `fused_dependency_program()` must produce the same Core as running the two
+-- standalone passes in sequence (the `--dump-core-after` path
+-- `late_core_passes_for_control` falls back to).
+pure func test_fused_tensor_specialize_and_specialize_matches_standalone_sequence() -> Bool:
+	source: CoreProgram = fused_dependency_program()
+
+	standalone: CoreProgram = specialize_program(CoreTensorSpecialize.specialize_program(source))
+	fused: CoreProgram = specialize_program_fused(source)
+
+	core_program_to_json(standalone).to_string() == core_program_to_json(fused).to_string()
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core primitive specialization",
 	tests = [
@@ -567,9 +610,10 @@ tests: TestSuite = {
 			test_type_name_intrinsic_renders_post_mono_core_types,
 		),
 		("is_heap uses Core ownership layout", test_is_heap_intrinsic_uses_core_ownership_layout),
+		("hash preserves unsupported type dispatch", test_hash_preserves_unsupported_type_dispatch),
 		(
-			"hash preserves unsupported type dispatch",
-			test_hash_preserves_unsupported_type_dispatch,
+			"fused tensor_specialize/specialize walk matches standalone sequence",
+			test_fused_tensor_specialize_and_specialize_matches_standalone_sequence,
 		),
 	]
 }

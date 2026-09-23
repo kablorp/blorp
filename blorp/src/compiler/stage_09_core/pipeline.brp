@@ -149,6 +149,12 @@ TENSOR_SPECIALIZE_PASS: String = "tensor_specialize"
 
 SPECIALIZE_PASS: String = "specialize"
 
+-- The single walk `fused_late_core_passes` substitutes for the two passes
+-- above (see `run_fused_tensor_specialize_and_specialize_pass`). Never a
+-- target of `--dump-core-after`/`--stop-after`/`--observe`: those always
+-- resolve against `late_core_passes()`'s own two names.
+FUSED_TENSOR_SPECIALIZE_PASS: String = "tensor_specialize_specialize_fused"
+
 RESOLVE_CALLABLES_PASS: String = "resolve_callables"
 
 BACKEND_PROJECTION_PASS: String = "backend_projection"
@@ -253,6 +259,20 @@ pure func run_tensor_specialize_pass(program: CoreProgram) -> CoreProgram:
 
 pure func run_specialize_pass(program: CoreProgram) -> CoreProgram:
 	CoreSpecialize.specialize_program(program)
+
+
+-- The normal-path replacement for the two passes above: tensor_specialize
+-- adapts tensor dispatch before general ABI specialization runs, and neither
+-- pass needs the other's rewrite to build its own context (tensor_specialize
+-- has none; `CoreSpecialize.specialize_program_fused` builds its layout from
+-- `program.decls`, unaffected by either pass's expression-level rewrites), so
+-- one walk applying tensor_specialize's per-node step then specialize's own
+-- reproduces running them separately. See
+-- `CoreSpecialize.specialize_program_fused`'s docstring for the walk itself
+-- and `late_core_passes_for_control` for when this replaces
+-- `TENSOR_SPECIALIZE_PASS`/`SPECIALIZE_PASS`.
+pure func run_fused_tensor_specialize_and_specialize_pass(program: CoreProgram) -> CoreProgram:
+	CoreSpecialize.specialize_program_fused(program)
 
 
 pure func run_resolve_callables_pass(program: CoreProgram) -> CoreProgram:
@@ -424,18 +444,25 @@ pure func late_core_passes() -> List[CorePass]:
 	]
 
 
--- Same list as `late_core_passes()`, with resolve_callables, backend_projection,
--- and match_projection replaced by the one fused walk
--- (`run_fused_resolve_backend_match_pass`). A literal sibling list rather than
--- a splice of `late_core_passes()`, so the two are easy to diff against each
--- other when either changes. `late_core_passes_for_control` is the only
--- caller; every other consumer (`--dump-core-after`, `--stop-after`, the work
--- profiler, the backend bridge) keeps using `late_core_passes()` directly.
+-- Same list as `late_core_passes()`, with tensor_specialize+specialize
+-- replaced by their fused walk (`run_fused_tensor_specialize_and_specialize_pass`)
+-- and resolve_callables+backend_projection+match_projection replaced by their
+-- fused walk (`run_fused_resolve_backend_match_pass`). A literal sibling list
+-- rather than a splice of `late_core_passes()`, so the two are easy to diff
+-- against each other when either changes. `late_core_passes_for_control` is
+-- the only caller; every other consumer (`--dump-core-after`, `--stop-after`,
+-- the work profiler, the backend bridge) keeps using `late_core_passes()`
+-- directly. The fused tensor_specialize/specialize entry keeps `SpecializeStage`'s
+-- `checked_invariant`, so that invariant still runs exactly once, right after
+-- the fused walk, the same as it does after the standalone `specialize` pass.
 pure func fused_late_core_passes() -> List[CorePass]:
 	[
 		core_pass(ADAPT_FUNCTION_REFS_PASS, run_adapt_function_refs_pass),
-		core_program_pass(TENSOR_SPECIALIZE_PASS, run_tensor_specialize_pass),
-		checked_late_core_pass(SPECIALIZE_PASS, run_specialize_pass, SpecializeStage),
+		checked_late_core_pass(
+			FUSED_TENSOR_SPECIALIZE_PASS,
+			run_fused_tensor_specialize_and_specialize_pass,
+			SpecializeStage,
+		),
 		core_program_pass(FUSED_RESOLVE_BACKEND_MATCH_PASS, run_fused_resolve_backend_match_pass),
 		checked_late_core_pass(DCE_PASS, run_dce_pass, DceStage),
 		checked_stateful_late_core_pass(
@@ -461,9 +488,12 @@ pure func fused_late_core_passes() -> List[CorePass]:
 	]
 
 
--- Names inside the resolve_callables/backend_projection/match_projection span
--- the fused walk replaces.
-private LATE_FUSED_PROJECTION_SPAN: List[String] = [
+-- Names inside either span `fused_late_core_passes` replaces: the
+-- tensor_specialize/specialize pair and the
+-- resolve_callables/backend_projection/match_projection triple.
+private LATE_FUSED_PASS_SPAN: List[String] = [
+	TENSOR_SPECIALIZE_PASS,
+	SPECIALIZE_PASS,
 	RESOLVE_CALLABLES_PASS,
 	BACKEND_PROJECTION_PASS,
 	MATCH_PROJECTION_PASS,
@@ -471,32 +501,35 @@ private LATE_FUSED_PROJECTION_SPAN: List[String] = [
 
 
 ---
-True when `control` asks to observe, dump, or stop inside the
-resolve_callables/backend_projection/match_projection span, so
-`late_core_passes_for_control` must fall back to the three standalone passes
-to keep that snapshot byte-identical to today's output.
+True when `control` asks to observe, dump, or stop inside either fused span
+(tensor_specialize/specialize, or resolve_callables/backend_projection/
+match_projection), so `late_core_passes_for_control` must fall back to
+`late_core_passes()`'s standalone passes to keep that snapshot byte-identical
+to today's output. One request inside either span falls back for the whole
+list rather than fusing the other span only, keeping this one small check
+instead of a per-span mix-and-match selector.
 ---
-private pure func control_targets_fused_projection_span(control: CorePassControl) -> Bool:
+private pure func control_targets_fused_pass_span(control: CorePassControl) -> Bool:
 	stop_in_span: Bool = match control.stop_after:
 		Some(name):
-			LATE_FUSED_PROJECTION_SPAN.contains(name)
+			LATE_FUSED_PASS_SPAN.contains(name)
 		None:
 			False
 
-	control.observe.any(func(name): LATE_FUSED_PROJECTION_SPAN.contains(name)) or stop_in_span
+	control.observe.any(func(name): LATE_FUSED_PASS_SPAN.contains(name)) or stop_in_span
 
 
 ---
 The one place production compiles, `--dump-core-after`, `--stop-after`, and
 `--observe` all choose between the two pass lists above. Everything except a
-request that names a pass inside the fused span gets `fused_late_core_passes()`
-(one walk instead of three, same output); a request naming one of those three
+request that names a pass inside a fused span gets `fused_late_core_passes()`
+(two walks instead of five, same output); a request naming one of those five
 passes gets `late_core_passes()` unchanged, so that snapshot still matches
-running the three passes separately. The work profiler, `run_late_core_span`,
+running the five passes separately. The work profiler, `run_late_core_span`,
 and tests call `late_core_passes()` directly and are unaffected.
 ---
 pure func late_core_passes_for_control(control: CorePassControl) -> List[CorePass]:
-	if control_targets_fused_projection_span(control):
+	if control_targets_fused_pass_span(control):
 		late_core_passes()
 	else:
 		fused_late_core_passes()
