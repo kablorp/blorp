@@ -505,28 +505,32 @@ record CoreLowerContext {
 }
 
 
--- One (name, id) binding on the lowering scope stack. Tried as a `struct`
--- (so `List[struct]`'s inline storage, `InlineStructListStorage` in
--- stage_09_core/ir.brp, would skip a record box per push) and rejected by
--- the compiler: "struct fields must be scalar values ... use a record for
--- strings." A `String` field forces `record`. The remaining, still-real
--- saving is in how entries are pushed: batched and appended rather than
--- boxed one at a time and prepended (see `push_local_scope`/
--- `push_local_scopes` below). A per-function name-id table (storing an
--- interned int here instead of `name: String`, letting this become a
--- struct) would remove the record box too, but that table is itself a
--- second growing structure needing its own lookup/allocation on the same
--- hot path, and no name id reaches lowering today (see
--- `core_local_var_use`'s docstring) -- not attempted given the size of the
--- remaining delta after the batching fix (see the step 1 commit message).
+---
+One (name, id) binding on the lowering scope stack. Tried as a `struct`
+(so `List[struct]`'s inline storage, `InlineStructListStorage` in
+stage_09_core/ir.brp, would skip a record box per push) and rejected by
+the compiler: "struct fields must be scalar values ... use a record for
+strings." A `String` field forces `record`. The remaining, still-real
+saving is in how entries are pushed: batched and appended rather than
+boxed one at a time and prepended (see `push_local_scope`/
+`push_local_scopes` below). A per-function name-id table (storing an
+interned int here instead of `name: String`, letting this become a
+struct) would remove the record box too, but that table is itself a
+second growing structure needing its own lookup/allocation on the same
+hot path, and no name id reaches lowering today (see
+`core_local_var_use`'s docstring) -- not attempted given the size of the
+remaining delta after the batching fix (see the step 1 commit message).
+---
 record CoreLowerScopeEntry {
 	name: String,
 	id: Int
 }
 
 
--- The graph preparation boundary owns these names because it is the first
--- phase that has both a resolved target module and its stable callable id.
+---
+The graph preparation boundary owns these names because it is the first
+phase that has both a resolved target module and its stable callable id.
+---
 union CoreLowerCallableNameRegistry:
 	CoreLowerDefaultCallableNames
 	CoreLowerPreparedCallableNames(ModuleTable, List[Dict[Int, CoreLowerCallableName]])
@@ -634,9 +638,11 @@ pure func core_lower_context_with_callable_names(
 	}
 
 
--- Attach the program-wide `core_module_member_prefix` table (one entry per
--- module being lowered) so type lowering spells nominal `module::Type` names
--- through one sanitized identity per module.
+---
+Attach the program-wide `core_module_member_prefix` table (one entry per
+module being lowered) so type lowering spells nominal `module::Type` names
+through one sanitized identity per module.
+---
 pure func core_lower_context_with_module_member_prefixes(
 	context: CoreLowerContext,
 	module_member_prefixes: Dict[String, String],
@@ -716,45 +722,51 @@ private pure func core_var_impl(name: String, def_id: Option[Int]) -> CoreVar:
 private CORE_LOWER_ID_SEED_BOUND: Int = 2147483648
 
 
--- Core Identity Migration step 1 (docs/CORE_ID_MIGRATION.md). Mint a
--- binder's `id` from its own source span rather than from a counter
--- threaded through lowering. Two distinct source tokens never share a start
--- offset within one file -- the invariant `SourceLocation` itself already
--- relies on -- so this is a pure, stateless allocator: it needs no state
--- threaded across sibling subexpressions to stay collision-free (two
--- independent closures that each bind a parameter of the same name do not
--- race for one shared counter value, because each mints from its own,
--- textually distinct, parameter span). `+ 1` keeps every minted id
--- strictly positive so it stays distinguishable from the `id = 0`
--- sentinel that still means "no local identity" for globals, callables,
--- constructors, and the synthetic binders the ~30 other private
--- `core_var(name)` helpers mint (unaffected by this step; see step 5 of the
--- roadmap).
+---
+Core Identity Migration step 1 (docs/CORE_ID_MIGRATION.md). Mint a
+binder's `id` from its own source span rather than from a counter
+threaded through lowering. Two distinct source tokens never share a start
+offset within one file -- the invariant `SourceLocation` itself already
+relies on -- so this is a pure, stateless allocator: it needs no state
+threaded across sibling subexpressions to stay collision-free (two
+independent closures that each bind a parameter of the same name do not
+race for one shared counter value, because each mints from its own,
+textually distinct, parameter span). `+ 1` keeps every minted id
+strictly positive so it stays distinguishable from the `id = 0`
+sentinel that still means "no local identity" for globals, callables,
+constructors, and the synthetic binders the ~30 other private
+`core_var(name)` helpers mint (unaffected by this step; see step 5 of the
+roadmap).
+---
 private pure func core_binder_id(span: SourceLocation) -> Int:
 	source_location_start_offset(span) + 1
 
 
--- A binder introduced from a real source identifier: name plus a id
--- derived from that identifier's own span.
+---
+A binder introduced from a real source identifier: name plus a id
+derived from that identifier's own span.
+---
 private pure func core_local_var(identifier: ParsedIdentifier) -> CoreVar:
 	{ core_var(identifier.text, None) | id = core_binder_id(identifier.span) }
 
 
--- A binder lowering itself invents with no `ParsedIdentifier` of its own
--- (for example the record-update temp): keyed off the span of the
--- construct that needs it instead.
--- Push one binder onto the lowering scope stack, valid only for the span of
--- code where it is visible. Appended, not prepended: `.append` grows a
--- `List`'s backing store in place (amortized, no separate list built to
--- concatenate), where `[entry].concat(context.scope)` would both box a
--- one-element list just to discard it and copy the whole existing scope on
--- every push. `resolve_local_id` below scans back-to-front to still
--- prefer the innermost (most recently appended) binder. Callers must pass
--- the resulting context solely into the specific sub-lowering call that is
--- that binder's continuation (the `let` body, the match arm body, the loop
--- body, ...): `CoreLowerContext` stays a Reader everywhere else in
--- expression lowering, so a scope extension must never leak into an
--- unrelated sibling call still holding the original context.
+---
+A binder lowering itself invents with no `ParsedIdentifier` of its own
+(for example the record-update temp): keyed off the span of the
+construct that needs it instead.
+Push one binder onto the lowering scope stack, valid only for the span of
+code where it is visible. Appended, not prepended: `.append` grows a
+`List`'s backing store in place (amortized, no separate list built to
+concatenate), where `[entry].concat(context.scope)` would both box a
+one-element list just to discard it and copy the whole existing scope on
+every push. `resolve_local_id` below scans back-to-front to still
+prefer the innermost (most recently appended) binder. Callers must pass
+the resulting context solely into the specific sub-lowering call that is
+that binder's continuation (the `let` body, the match arm body, the loop
+body, ...): `CoreLowerContext` stays a Reader everywhere else in
+expression lowering, so a scope extension must never leak into an
+unrelated sibling call still holding the original context.
+---
 private pure func push_local_scope(
 	context: CoreLowerContext,
 	name: String,
@@ -763,10 +775,12 @@ private pure func push_local_scope(
 	{ context | scope = context.scope.append({ name = name, id = id }) }
 
 
--- Push several binders at once (in list order, so later entries shadow
--- earlier ones at the same scope depth, matching how `push_local_scope`
--- would be called one at a time). One `.concat` for the whole batch, not
--- one context copy and one list write per name.
+---
+Push several binders at once (in list order, so later entries shadow
+earlier ones at the same scope depth, matching how `push_local_scope`
+would be called one at a time). One `.concat` for the whole batch, not
+one context copy and one list write per name.
+---
 private pure func push_local_scopes(
 	context: CoreLowerContext,
 	names: List[String],
@@ -794,11 +808,13 @@ private pure func local_scope_entries(
 	entries
 
 
--- Push a lowered parameter list's binders onto the scope stack in one
--- batch, in order, so a later parameter that repeats an earlier name
--- shadows it the same way a nested `let` would (matches source semantics:
--- `func(x, x)` would already be rejected earlier; this only matters for two
--- parameter lists being combined, e.g. lambda-params-in-a-lambda-in-a-lambda).
+---
+Push a lowered parameter list's binders onto the scope stack in one
+batch, in order, so a later parameter that repeats an earlier name
+shadows it the same way a nested `let` would (matches source semantics:
+`func(x, x)` would already be rejected earlier; this only matters for two
+parameter lists being combined, e.g. lambda-params-in-a-lambda-in-a-lambda).
+---
 private pure func push_params_scope(context: CoreLowerContext, params: List[CoreParam]) -> CoreLowerContext:
 	entries: List[CoreLowerScopeEntry] = params.map(
 		pure func(param: CoreParam): { name = param.name.name, id = param.name.id },
@@ -806,14 +822,16 @@ private pure func push_params_scope(context: CoreLowerContext, params: List[Core
 	{ context | scope = context.scope.concat(entries) }
 
 
--- Push a function's own parameter scope: the ordinary (already-minted)
--- parameter binders, plus every name a tuple parameter destructures into
--- (minted here, from its own identifier span, matching what
--- `lower_tuple_destruct_bindings` mints for the same name when it later
--- builds that destructure's `LetExpr`). Both the plain parameters and the
--- destructured names are visible for the whole function body, so this is
--- pushed once, before lowering it -- unlike a `let`'s scope, which is
--- local to one continuation.
+---
+Push a function's own parameter scope: the ordinary (already-minted)
+parameter binders, plus every name a tuple parameter destructures into
+(minted here, from its own identifier span, matching what
+`lower_tuple_destruct_bindings` mints for the same name when it later
+builds that destructure's `LetExpr`). Both the plain parameters and the
+destructured names are visible for the whole function body, so this is
+pushed once, before lowering it -- unlike a `let`'s scope, which is
+local to one continuation.
+---
 private pure func push_function_scope(context: CoreLowerContext, params: CoreLowerParams) -> CoreLowerContext:
 	-- A function body starts a fresh scope: no binder from a sibling
 	-- declaration (or, for a lambda literal's own nested call into this
@@ -831,11 +849,13 @@ private pure func push_function_scope(context: CoreLowerContext, params: CoreLow
 	)
 
 
--- Resolve a name use to its innermost binder's `id`, or `None` if the
--- name is not a local in scope (a global, callable, or constructor, which
--- keep `id = 0` and carry `def_id` instead). Scans back-to-front since
--- `push_local_scope`/`push_local_scopes` append: the innermost binder is
--- always the last one whose name matches.
+---
+Resolve a name use to its innermost binder's `id`, or `None` if the
+name is not a local in scope (a global, callable, or constructor, which
+keep `id = 0` and carry `def_id` instead). Scans back-to-front since
+`push_local_scope`/`push_local_scopes` append: the innermost binder is
+always the last one whose name matches.
+---
 private pure func resolve_local_id(context: CoreLowerContext, name: String) -> Option[Int]:
 	var result: Option[Int] = None
 
@@ -846,11 +866,13 @@ private pure func resolve_local_id(context: CoreLowerContext, name: String) -> O
 	result
 
 
--- A name-use site's `CoreVar`: a resolved global/callable/constructor
--- (`def_id` present) keeps `id = 0`; a local (`def_id = None`) resolves
--- through the scope stack to the binder it refers to. A name absent from
--- scope (not yet covered by step 1's binder sites, or a forward reference)
--- falls back to today's `id = 0`, unchanged from before this step.
+---
+A name-use site's `CoreVar`: a resolved global/callable/constructor
+(`def_id` present) keeps `id = 0`; a local (`def_id = None`) resolves
+through the scope stack to the binder it refers to. A name absent from
+scope (not yet covered by step 1's binder sites, or a forward reference)
+falls back to today's `id = 0`, unchanged from before this step.
+---
 private pure func core_local_var_use(
 	context: CoreLowerContext,
 	name: String,
@@ -1081,20 +1103,22 @@ private pure func resolved_core_decl_callable_id(
 			Ok(None)
 
 
--- Reconciles the two sources a name reference's callable id can come from
--- (a `#<id>` suffix already encoded on the name, and a resolved-call
--- definition id) into the one id the lowered `CoreVar` carries.
---
--- Split out of what used to be `lower_name_expr_identity` (2026-09-22
--- attribution: that single function returning `Result[(String, Option[Int]),
--- CoreLowerError]` boxed a tuple purely to carry `clean_name` back out
--- alongside a value this reconciliation never touches, measured at 5
--- allocations/call -- 35.7% of a plain name reference's whole lowering
--- budget, clearing the 25% cut threshold; see
--- `core_lowering_allocation_attribution_2026-09-22.md`). `clean_name` needs
--- no `Result` at all (`split_var_callable_id` cannot fail), so it is now
--- read directly at the one call site instead of round-tripping through a
--- boxed tuple that only existed to carry it past this reconciliation.
+---
+Reconciles the two sources a name reference's callable id can come from
+(a `#<id>` suffix already encoded on the name, and a resolved-call
+definition id) into the one id the lowered `CoreVar` carries.
+
+Split out of what used to be `lower_name_expr_identity` (2026-09-22
+attribution: that single function returning `Result[(String, Option[Int]),
+CoreLowerError]` boxed a tuple purely to carry `clean_name` back out
+alongside a value this reconciliation never touches, measured at 5
+allocations/call -- 35.7% of a plain name reference's whole lowering
+budget, clearing the 25% cut threshold; see
+`core_lowering_allocation_attribution_2026-09-22.md`). `clean_name` needs
+no `Result` at all (`split_var_callable_id` cannot fail), so it is now
+read directly at the one call site instead of round-tripping through a
+boxed tuple that only existed to carry it past this reconciliation.
+---
 private pure func resolve_name_expr_def_id(
 	name: ParsedIdentifier,
 	encoded_id: Option[Int],
@@ -1306,21 +1330,25 @@ foreign:
 	pure func core_lowering_node_kind_report() -> Void = "blorp_core_lowering_node_kind_report_c"
 
 
--- Flushes the call/histogram counters collected under
--- BLORP_CORE_LOWERING_TYPE_METRICS=1; a no-op when the variable is unset.
--- Extended (2026-09-22 follow-up) to also flush the per-node-kind
--- self/inclusive allocation table and the core_source_loc/core_var
--- aggregate counters -- the same mechanism, closing the "where do the rest
--- of lowering's allocations go" gap the type histogram alone left open.
+---
+Flushes the call/histogram counters collected under
+BLORP_CORE_LOWERING_TYPE_METRICS=1; a no-op when the variable is unset.
+Extended (2026-09-22 follow-up) to also flush the per-node-kind
+self/inclusive allocation table and the core_source_loc/core_var
+aggregate counters -- the same mechanism, closing the "where do the rest
+of lowering's allocations go" gap the type histogram alone left open.
+---
 pure func core_lowering_type_metrics_report_flush() -> Void:
 	core_lowering_type_metrics_report()
 	core_lowering_node_kind_report()
 
 
--- `module_member_prefixes` is the lowering context's precomputed
--- `core_module_member_prefix` table (see `core_module_member_prefix_table`),
--- so nominal `module::Type` names flatten through one sanitized identity per
--- module instead of re-sanitizing per type occurrence.
+---
+`module_member_prefixes` is the lowering context's precomputed
+`core_module_member_prefix` table (see `core_module_member_prefix_table`),
+so nominal `module::Type` names flatten through one sanitized identity per
+module instead of re-sanitizing per type occurrence.
+---
 private pure func core_lower_type_with_prefixes(
 	module_member_prefixes: Dict[String, String],
 	typ: SemanticType,
@@ -2530,23 +2558,25 @@ private pure func lower_typed_field_access(
 			Ok(FieldExpr(lowered_receiver, field.text, typ, loc))
 
 
--- Match bindings are deliberately NOT given scope-resolved identity in step
--- 1, unlike every other binder kind. `CorePattern.NamePattern` carries only
--- a `String` (see `stage_09_core/ir.brp`; giving it a `id` is an IR
--- change well outside lower.brp, and outside step 1's file list in
--- docs/CORE_ID_MIGRATION.md). Worse: `stage_09_core/match_lowering.brp`'s
--- direct-constructor fast path (`bind_constructor_payloads`) rebuilds its
--- own `LetExpr` binder for a matched name via its own private `core_var`
--- (`id = 0`) around the arm body Core lowering already produced. Giving
--- the arm body's own uses of that name a nonzero, scope-resolved `id`
--- here would desync them from that later-rebuilt `id = 0` binder --
--- `core_var_equal` would call them different variables, `bind_constructor_
--- payloads`'s consumer can conclude the original binding is unused, and
--- the reference in `body` no longer names a declared C local. This was
--- confirmed by a real `scripts/test leak` failure ("use of undeclared
--- identifier") when this was pushed onto scope; reverted. A match
--- binding's uses keep resolving through today's fallback (`id = 0`)
--- until that consumer is also converted (see step 3/5 of the roadmap).
+---
+Match bindings are deliberately NOT given scope-resolved identity in step
+1, unlike every other binder kind. `CorePattern.NamePattern` carries only
+a `String` (see `stage_09_core/ir.brp`; giving it a `id` is an IR
+change well outside lower.brp, and outside step 1's file list in
+docs/CORE_ID_MIGRATION.md). Worse: `stage_09_core/match_lowering.brp`'s
+direct-constructor fast path (`bind_constructor_payloads`) rebuilds its
+own `LetExpr` binder for a matched name via its own private `core_var`
+(`id = 0`) around the arm body Core lowering already produced. Giving
+the arm body's own uses of that name a nonzero, scope-resolved `id`
+here would desync them from that later-rebuilt `id = 0` binder --
+`core_var_equal` would call them different variables, `bind_constructor_
+payloads`'s consumer can conclude the original binding is unused, and
+the reference in `body` no longer names a declared C local. This was
+confirmed by a real `scripts/test leak` failure ("use of undeclared
+identifier") when this was pushed onto scope; reverted. A match
+binding's uses keep resolving through today's fallback (`id = 0`)
+until that consumer is also converted (see step 3/5 of the roadmap).
+---
 private pure func lower_raw_match_cases(
 	context: CoreLowerContext,
 	cases: List[TypedMatchCase],
@@ -4648,10 +4678,12 @@ private pure func with_resource_name(binding: TypedWithBinding) -> String:
 		binding.name.text
 
 
--- The `with`-bound resource's own binder. A real name mints from its own
--- identifier span like any other binder; `_` has no identifier to mint
--- from and is never looked up by name, so it keeps the synthetic,
--- self-contained treatment it already had.
+---
+The `with`-bound resource's own binder. A real name mints from its own
+identifier span like any other binder; `_` has no identifier to mint
+from and is never looked up by name, so it keeps the synthetic,
+self-contained treatment it already had.
+---
 private pure func with_resource_var(binding: TypedWithBinding) -> CoreVar:
 	if binding.name.text == "_":
 		core_var(with_resource_name(binding), None)
@@ -5041,11 +5073,13 @@ private pure func lower_typed_expr_with_context(
 	lower_typed_expr_as_type(context, expr, typ)
 
 
--- Attribution instrumentation: a short static tag per `TypedExpr` variant,
--- used only to key the BLORP_CORE_LOWERING_TYPE_METRICS node-kind table (see
--- `lower_typed_expr_as_type`'s wrapper below). Never used for dispatch or
--- lowering itself, so a mismatch here cannot change compiled output -- only
--- which histogram bucket a count lands in.
+---
+Attribution instrumentation: a short static tag per `TypedExpr` variant,
+used only to key the BLORP_CORE_LOWERING_TYPE_METRICS node-kind table (see
+`lower_typed_expr_as_type`'s wrapper below). Never used for dispatch or
+lowering itself, so a mismatch here cannot change compiled output -- only
+which histogram bucket a count lands in.
+---
 private pure func typed_expr_kind_name(expr: TypedExpr) -> String:
 	match expr:
 		TypedNameExpr(_, _):
@@ -6260,10 +6294,12 @@ pure func lower_typed_decl(
 	)
 
 
--- Imports have already become explicit graph/import-table metadata, while
--- builtin type declarations define stable ABI types rather than emitted Core
--- declarations. These are the only typed-program declarations intentionally
--- consumed without producing a Core declaration.
+---
+Imports have already become explicit graph/import-table metadata, while
+builtin type declarations define stable ABI types rather than emitted Core
+declarations. These are the only typed-program declarations intentionally
+consumed without producing a Core declaration.
+---
 private pure func typed_decl_is_compile_time_only(decl: TypedDecl) -> Bool:
 	match decl:
 		TypedParsedDecl(parsed):
