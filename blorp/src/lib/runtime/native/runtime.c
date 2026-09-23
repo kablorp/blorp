@@ -3107,11 +3107,17 @@ static void __blorp_init_signal_handlers(void) {
 // the *releasing* thread's free list, never back to the allocating one.
 // That thread eventually reuses or drains it; it does not migrate back.
 // ============================================================================
-#define BLORP_POOL_MAX_SIZE 256
-#define BLORP_POOL_CLASSES 6
+#define BLORP_POOL_MAX_SIZE 1024
+#define BLORP_POOL_CLASSES 9
 
-// Size classes: 32, 64, 96, 128, 192, 256.
-static const size_t blorp_pool_sizes[BLORP_POOL_CLASSES] = {32, 64, 96, 128, 192, 256};
+// Size classes: 32, 64, 96, 128, 192, 256, 384, 512, 1024. The last three
+// were added after the ceiling profile in
+// benchmarks/results/core_teardown_profile_2026-09-22.md found the
+// oversized-miss traffic split across four buckets above 256 bytes (le_384,
+// le_512, le_1024, gt_1024); the first three are fixed, bounded sizes worth
+// a class, the unbounded gt_1024 tail (variable-size List/Dict/String/tensor
+// storage) is not and is left on the libc malloc/free path unchanged.
+static const size_t blorp_pool_sizes[BLORP_POOL_CLASSES] = {32, 64, 96, 128, 192, 256, 384, 512, 1024};
 
 // Slab refill: a miss on an empty free list mallocs one slab of
 // BLORP_POOL_REFILL_COUNT objects instead of one object, threads all but one
@@ -3126,13 +3132,18 @@ static const size_t blorp_pool_sizes[BLORP_POOL_CLASSES] = {32, 64, 96, 128, 192
 // during ordinary operation.
 #define BLORP_POOL_REFILL_COUNT 64
 
-// Every allocation size this runtime can produce fits in one of 8 buckets of
-// 32 bytes each (1..256); map each bucket straight to its class with a shift
-// and a table lookup instead of a branch per class, so the lookup cost does
-// not grow with the number of classes.
-#define BLORP_POOL_CLASS_BUCKETS 8
+// Every allocation size this runtime can produce fits in one of 32 buckets of
+// 32 bytes each (1..1024); map each bucket straight to its class with a
+// shift and a table lookup instead of a branch per class, so the lookup cost
+// does not grow with the number of classes. Buckets 8..11 round up to the
+// 384-byte class, 12..15 to 512, and 16..31 (a 513..1024 byte allocation) all
+// round up to the single 1024-byte class.
+#define BLORP_POOL_CLASS_BUCKETS 32
 static const int8_t blorp_pool_class_table[BLORP_POOL_CLASS_BUCKETS] = {
-    0, 1, 2, 3, 4, 4, 5, 5
+    0, 1, 2, 3, 4, 4, 5, 5,
+    6, 6, 6, 6, 7, 7, 7, 7,
+    8, 8, 8, 8, 8, 8, 8, 8,
+    8, 8, 8, 8, 8, 8, 8, 8
 };
 
 // Map allocation size to pool class index. Returns -1 if too large or zero.
