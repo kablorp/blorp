@@ -589,6 +589,7 @@ import:
 		AcceptedTraitImplementationAuthorityMetrics,
 		AcceptedTraitImplementationTable,
 		AcceptedTraitImplementationTableInput,
+		AcceptedTraitOnlyProjection,
 		AcceptedTraitTableRecord,
 		AcceptedTraitVisibility,
 		accepted_has_direct_trait_evidence,
@@ -598,12 +599,15 @@ import:
 		accepted_trait_find,
 		accepted_trait_ids_for_owner,
 		accepted_trait_implementation_authority,
+		accepted_trait_implementation_authority_from_projection,
 		accepted_trait_implementation_authority_from_visibility,
 		accepted_trait_implementation_authority_metrics,
 		accepted_trait_implementation_authority_preparation_errors,
 		accepted_trait_implementation_table,
 		accepted_trait_implementation_table_validation_errors,
 		accepted_trait_methods_with_declaring_trait,
+		accepted_trait_only_projection_find,
+		accepted_trait_only_projection_from_visibility,
 		accepted_visible_trait_bindings,
 	type_system/accepted_union_authority:
 		AcceptedUnionAuthority,
@@ -3759,18 +3763,24 @@ private pure func typecheck_resolve_trait_obligation(
 			env_resolve_trait_obligation(state.env, obligation)
 
 
-private pure func impl_orphan_error_message(
-	state: TypecheckState,
-	module_path: String,
-	impl_decl: ParsedImplDecl,
-	for_type: SemanticType,
-) -> Option[String]:
-	trait_home: Option[String] = match typecheck_find_trait(state, impl_decl.trait_name.text):
+-- Trait-name resolution for orphan checks outside header conversion, where
+-- the module's accepted authority (or its absence) is already reflected in
+-- `state.module_view`.
+private pure func impl_orphan_trait_home(state: TypecheckState, trait_name: String) -> Option[String]:
+	match typecheck_find_trait(state, trait_name):
 		Some(trait_def):
 			trait_def.module_path
 		None:
 			None
 
+
+private pure func impl_orphan_error_message(
+	state: TypecheckState,
+	module_path: String,
+	trait_home: Option[String],
+	impl_decl: ParsedImplDecl,
+	for_type: SemanticType,
+) -> Option[String]:
 	type_home: Option[String] = match impl_type_head_name(for_type):
 		Some(type_name):
 			typecheck_state_find_type_home(state, type_name)
@@ -4319,6 +4329,9 @@ private union AcceptedImplementationRecordClaim:
 
 -- Convert and claim an accepted implementation without installing it in Env.
 -- Coherence is checked after the graph table can project the exact visible IDs.
+-- `trait_projection` is the module's trait-only projection (no implementation
+-- half exists yet at this point in preparation); orphan checks resolve trait
+-- names from it directly instead of through a preliminary full authority.
 private pure func prepare_accepted_implementation_header(
 	state: TypecheckState,
 	type_headers: TypeHeaderGraph,
@@ -4326,6 +4339,7 @@ private pure func prepare_accepted_implementation_header(
 	header: ImplementationHeader,
 	module_path: String,
 	local_type_names: List[String],
+	trait_projection: Option[AcceptedTraitOnlyProjection],
 ) -> AcceptedImplementationRecordClaim:
 	id = implementation_header_id(header)
 	trait_id = implementation_header_trait_id(header)
@@ -4362,9 +4376,23 @@ private pure func prepare_accepted_implementation_header(
 				ImplMethodInfosClaimed(with_methods, method_infos):
 					source = implementation_header_source(header)
 
+					trait_home: Option[String] = match trait_projection:
+						Some(projection):
+							match accepted_trait_only_projection_find(
+								projection,
+								source.trait_name.text,
+							):
+								Some(trait_def):
+									trait_def.module_path
+								None:
+									impl_orphan_trait_home(with_methods, source.trait_name.text)
+						None:
+							impl_orphan_trait_home(with_methods, source.trait_name.text)
+
 					with_orphan = match impl_orphan_error_message(
 						with_methods,
 						module_path,
+						trait_home,
 						source,
 						for_type,
 					):
@@ -4454,7 +4482,9 @@ private pure func register_impl_decl_with_info(
 	method_infos: List[ImplMethodInfo],
 	is_private: Bool,
 ) -> TypecheckState:
-	var next = match impl_orphan_error_message(state, module_path, impl_decl, for_type):
+	trait_home = impl_orphan_trait_home(state, impl_decl.trait_name.text)
+
+	var next = match impl_orphan_error_message(state, module_path, trait_home, impl_decl, for_type):
 		Some(message):
 			typecheck_state_add_error(state, message)
 		None:
@@ -7257,7 +7287,13 @@ private record PreparedModuleCallableBase {
 	callable_error_start: Int,
 	state: TypecheckState,
 	callables: List[AcceptedCallableTableRecord],
-	callable_errors: List[String]
+	callable_errors: List[String],
+	-- The module's trait-only projection, built once from the preliminary
+	-- (implementation-free) trait table and consumed by implementation
+	-- header conversion below and by final authority assembly. It never
+	-- lives in `state.module_view`, so it does not linger as a second
+	-- reference to shared trait tables once the full authority is built.
+	trait_projection: Option[AcceptedTraitOnlyProjection]
 }
 
 
@@ -7367,6 +7403,34 @@ private pure func accepted_trait_implementation_authority_for_module(
 	)
 
 	accepted_trait_implementation_authority_from_visibility(
+		table,
+		bound_module_canonical_path(bound_module),
+		visibility,
+		bound_module_direct_import_modules(bound_module).map(importable_module_path),
+	)
+
+
+-- The trait-only half of the module's authority: names, visible traits, and
+-- visible trait methods, with no implementation records. Callable and
+-- implementation header conversion resolve trait names and orphan checks
+-- from this before the module's implementations are known, so preparation
+-- never has to build a full authority with an empty implementation half.
+private pure func accepted_trait_only_projection_for_module(
+	table: AcceptedTraitImplementationTable,
+	bound_module: BoundModule,
+) -> AcceptedTraitOnlyProjection:
+	view = bound_module_view(bound_module)
+	issuing_definition_table = definition_index_definition_table(
+		prepared_module_scope_definition_index(bound_module_scope(bound_module)),
+	)
+	visibility: Option[AcceptedTraitVisibility] = accepted_visible_trait_bindings(
+		table,
+		issuing_definition_table,
+		prepared_module_scope_source_name_table(bound_module_scope(bound_module)),
+		module_view_import_bindings(view),
+	)
+
+	accepted_trait_only_projection_from_visibility(
 		table,
 		bound_module_canonical_path(bound_module),
 		visibility,
@@ -7607,6 +7671,7 @@ private pure func prepared_module_environments(
 			state = base_state,
 			callables = [],
 			callable_errors = [],
+			trait_projection = None,
 		})
 
 	for header in trait_topology_graph_headers(
@@ -7661,9 +7726,13 @@ private pure func prepared_module_environments(
 			None:
 				trait_implementation_owner_missing = True
 
-	-- Callable and implementation annotation conversion can consult local and
-	-- imported traits through a trait-only projection. Accepted traits never
-	-- need a provisional Env publication.
+	-- Callable and implementation header conversion can consult local and
+	-- imported traits through a trait-only projection, built once per module
+	-- here. Accepted traits never need a provisional Env publication, and
+	-- header conversion never needs a full authority: implementations are
+	-- not known yet, so a full authority built now would carry an empty
+	-- implementation half for nothing. The projection is reused, not
+	-- recomputed, when the full authority is assembled below.
 	preliminary_trait_table = if trait_implementation_owner_missing:
 		None
 	else:
@@ -7681,33 +7750,31 @@ private pure func prepared_module_environments(
 	while preliminary_base_index < bases.length():
 		match bases.get(preliminary_base_index):
 			Some(base):
-				var with_authority = base.state
-
 				match preliminary_trait_table:
 					Some(table):
-						authority = accepted_trait_implementation_authority_for_module(
-							table,
-							base.bound_module,
+						bases = bases.set(
+							preliminary_base_index,
+							{ base |
+								trait_projection = Some(
+									accepted_trait_only_projection_for_module(
+										table,
+										base.bound_module,
+									),
+								)
+							},
 						)
-						with_authority = { with_authority |
-							module_view = module_view_with_accepted_trait_implementation_authority(
-								with_authority.module_view,
-								authority,
-							)
-						}
 					None:
-						with_authority = typecheck_state_add_error(
-							with_authority,
+						with_error = typecheck_state_add_error(
+							base.state,
 							"internal typecheck error: accepted trait table rejected prepared entries",
 						)
-
-				bases = bases.set(
-					preliminary_base_index,
-					{ base |
-						state = with_authority,
-						callable_error_start = with_authority.errors.length()
-					},
-				)
+						bases = bases.set(
+							preliminary_base_index,
+							{ base |
+								state = with_error,
+								callable_error_start = with_error.errors.length()
+							},
+						)
 			None:
 				trait_implementation_owner_missing = True
 
@@ -7783,6 +7850,7 @@ private pure func prepared_module_environments(
 							header,
 							base.module_path,
 							base.local_type_names,
+							base.trait_projection,
 						):
 							AcceptedImplementationRecordClaimed(with_impl, item):
 								bases = bases.set(index, { base | state = with_impl })
@@ -7833,10 +7901,14 @@ private pure func prepared_module_environments(
 
 		match trait_implementation_table:
 			Some(table):
-				authority = accepted_trait_implementation_authority_for_module(
-					table,
-					base.bound_module,
-				)
+				-- Reuse the trait-only projection built during header
+				-- conversion instead of recomputing the trait half a second
+				-- time; only the implementation half is new here.
+				authority = match base.trait_projection:
+					Some(projection):
+						accepted_trait_implementation_authority_from_projection(table, projection)
+					None:
+						accepted_trait_implementation_authority_for_module(table, base.bound_module)
 
 				for message in accepted_trait_implementation_authority_preparation_errors(
 					authority,

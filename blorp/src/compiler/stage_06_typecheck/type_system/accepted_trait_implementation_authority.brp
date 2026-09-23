@@ -193,6 +193,27 @@ private record AcceptedTraitImplementationAuthorityRep {
 opaque type AcceptedTraitImplementationAuthority = AcceptedTraitImplementationAuthorityRep
 
 
+-- The trait half of an authority: names, visible traits, and visible trait
+-- methods, with no implementation-side fields. Callable and implementation
+-- header conversion resolve trait names and orphan checks from this alone,
+-- so header conversion never needs to materialize a full authority (with an
+-- empty implementation half) before implementations are known.
+private record AcceptedTraitProjectionFields {
+	table: AcceptedTraitImplementationTable,
+	owner_module_path: String,
+	source_name_table: SourceNameTable,
+	direct_module_paths: List[String],
+	visible_trait_indices: List[Int],
+	trait_indices_by_semantic_name: Dict[String, Int],
+	visible_traits: List[AcceptedVisibleTraitRow],
+	visible_trait_methods: List[AcceptedVisibleTraitMethodRow],
+	preparation_errors: List[String]
+}
+
+
+opaque type AcceptedTraitOnlyProjection = AcceptedTraitProjectionFields
+
+
 struct AcceptedTraitImplementationAuthorityMetrics {
 	accepted_trait_table_entries: Int,
 	accepted_implementation_table_entries: Int,
@@ -207,6 +228,12 @@ private pure func table_rep(
 	table: AcceptedTraitImplementationTable,
 ) -> AcceptedTraitImplementationTableRep:
 	from_opaque AcceptedTraitImplementationTable(table)
+
+
+private pure func projection_fields(
+	projection: AcceptedTraitOnlyProjection,
+) -> AcceptedTraitProjectionFields:
+	from_opaque AcceptedTraitOnlyProjection(projection)
 
 
 pure func accepted_trait_implementation_table_definition_table(
@@ -1444,12 +1471,18 @@ private pure func visible_trait_method_for_source_name(
 		None
 
 
-pure func accepted_trait_implementation_authority(
+-- The trait half of an accepted authority: visibility, name resolution, and
+-- trait methods. Identical whether computed against a table with or without
+-- implementations, since none of it reads implementation-side table fields.
+-- Callers that need a full authority pass the result to
+-- `accepted_trait_implementation_authority_from_fields`; callers that only
+-- need trait names (header conversion) keep this value instead.
+private pure func accepted_trait_projection_fields(
 	table: AcceptedTraitImplementationTable,
 	owner_module_path: String,
 	visibility: AcceptedTraitVisibility,
 	direct_module_paths: List[String],
-) -> AcceptedTraitImplementationAuthority:
+) -> AcceptedTraitProjectionFields:
 	representation = table_rep(table)
 	visibility_representation = accepted_trait_visibility_rep(visibility)
 	source_names = visibility_representation.source_name_table
@@ -1466,15 +1499,6 @@ pure func accepted_trait_implementation_authority(
 	var visible_trait_candidates: List[AcceptedVisibleTraitRow] = []
 	var visible_trait_indices: List[Int] = []
 	var unqualified_trait_indices: List[Int] = []
-	var visible_implementations: List[Int] = []
-	var implementation_indices_by_satisfied_trait_index: Dict[Int, List[Int]] = {}
-	var implementation_indices_by_trait_name: Dict[String, List[Int]] = {}
-	var compiler_implementations_by_trait_identity: Dict[Int, AcceptedCompilerImplementationBucket] = {
-
-	}
-	var qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]] = {
-
-	}
 	var visible_trait_method_candidates: List[AcceptedVisibleTraitMethodRow] = []
 
 	var preparation_errors: List[String] = if visibility_is_valid:
@@ -1493,11 +1517,6 @@ pure func accepted_trait_implementation_authority(
 
 	for index in trait_indices_for_module_path(representation, owner_module_path):
 		visible_trait_indices = append_unique_index(visible_trait_indices, index)
-
-	var visible_trait_index_set: Dict[Int, Bool] = {}
-
-	for index in visible_trait_indices:
-		visible_trait_index_set = visible_trait_index_set.set(index, True)
 
 	for index in trait_indices_for_module_path(representation, owner_module_path):
 		match representation.traits.get(index):
@@ -1631,10 +1650,46 @@ pure func accepted_trait_implementation_authority(
 		visible_trait_method_candidates,
 		preparation_errors,
 	)
-	visible_trait_methods = normalized_trait_methods[0]
-	preparation_errors = normalized_trait_methods[1]
 
-	for module_path in direct_module_paths:
+	{
+		table = table,
+		owner_module_path = owner_module_path,
+		source_name_table = source_names,
+		direct_module_paths = direct_module_paths,
+		visible_trait_indices = visible_trait_indices,
+		trait_indices_by_semantic_name = semantic_traits,
+		visible_traits = visible_traits,
+		visible_trait_methods = normalized_trait_methods[0],
+		preparation_errors = normalized_trait_methods[1]
+	}
+
+
+-- Build a full authority from trait-projection fields (already resolved, and
+-- possibly shared with an earlier header-conversion projection) and a table
+-- that carries the real implementation records. Never called with a table
+-- whose implementation half does not yet exist; use
+-- `accepted_trait_projection_fields` alone for that.
+private pure func accepted_trait_implementation_authority_from_fields(
+	table: AcceptedTraitImplementationTable,
+	fields: AcceptedTraitProjectionFields,
+) -> AcceptedTraitImplementationAuthority:
+	representation = table_rep(table)
+	var visible_implementations: List[Int] = []
+	var implementation_indices_by_satisfied_trait_index: Dict[Int, List[Int]] = {}
+	var implementation_indices_by_trait_name: Dict[String, List[Int]] = {}
+	var compiler_implementations_by_trait_identity: Dict[Int, AcceptedCompilerImplementationBucket] = {
+
+	}
+	var qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]] = {
+
+	}
+	var preparation_errors: List[String] = fields.preparation_errors
+	var visible_trait_index_set: Dict[Int, Bool] = {}
+
+	for index in fields.visible_trait_indices:
+		visible_trait_index_set = visible_trait_index_set.set(index, True)
+
+	for module_path in fields.direct_module_paths:
 		for index in implementation_indices_for_module_path(representation, module_path):
 			match representation.implementations.get(index):
 				Some(item):
@@ -1646,7 +1701,7 @@ pure func accepted_trait_implementation_authority(
 				None:
 					void
 
-	for index in implementation_indices_for_module_path(representation, owner_module_path):
+	for index in implementation_indices_for_module_path(representation, fields.owner_module_path):
 		visible_implementations = append_unique_index(visible_implementations, index)
 
 	var prior_visible_implementation_indices: Dict[Int, Bool] = {}
@@ -1670,7 +1725,7 @@ pure func accepted_trait_implementation_authority(
 						"conflicting implementation of trait '" + item.instance.trait_name + "' for type '" + implementation_type_label(
 							representation.definition_table,
 							representation.module_table,
-							owner_module_path,
+							fields.owner_module_path,
 							item,
 						) + "'",
 					)
@@ -1796,19 +1851,42 @@ pure func accepted_trait_implementation_authority(
 
 	into_opaque AcceptedTraitImplementationAuthority({
 			table = table,
-			owner_module_path = owner_module_path,
-			source_name_table = source_names,
-			visible_trait_indices = visible_trait_indices,
-			trait_indices_by_semantic_name = semantic_traits,
-			visible_traits = visible_traits,
+			owner_module_path = fields.owner_module_path,
+			source_name_table = fields.source_name_table,
+			visible_trait_indices = fields.visible_trait_indices,
+			trait_indices_by_semantic_name = fields.trait_indices_by_semantic_name,
+			visible_traits = fields.visible_traits,
 			visible_implementation_indices = visible_implementations,
 			implementation_indices_by_satisfied_trait_index = implementation_indices_by_satisfied_trait_index,
 			implementation_indices_by_trait_name = implementation_indices_by_trait_name,
 			compiler_implementations_by_trait_identity = compiler_implementations_by_trait_identity,
 			qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method,
-			visible_trait_methods = visible_trait_methods,
+			visible_trait_methods = fields.visible_trait_methods,
 			preparation_errors = preparation_errors
 		})
+
+
+pure func accepted_trait_implementation_authority(
+	table: AcceptedTraitImplementationTable,
+	owner_module_path: String,
+	visibility: AcceptedTraitVisibility,
+	direct_module_paths: List[String],
+) -> AcceptedTraitImplementationAuthority:
+	accepted_trait_implementation_authority_from_fields(
+		table,
+		accepted_trait_projection_fields(table, owner_module_path, visibility, direct_module_paths),
+	)
+
+
+-- Build a full authority from a trait-only projection computed earlier
+-- (typically during header conversion) instead of recomputing the trait
+-- half. `table` must be the table whose implementation records are now
+-- known; the projection's own table is not read here.
+pure func accepted_trait_implementation_authority_from_projection(
+	table: AcceptedTraitImplementationTable,
+	projection: AcceptedTraitOnlyProjection,
+) -> AcceptedTraitImplementationAuthority:
+	accepted_trait_implementation_authority_from_fields(table, projection_fields(projection))
 
 
 pure func accepted_trait_implementation_authority_without_visible_names(
@@ -1863,6 +1941,41 @@ pure func accepted_trait_implementation_authority_from_visibility(
 			)
 
 
+-- Same visibility-projection fallback as
+-- `accepted_trait_implementation_authority_from_visibility`, but for the
+-- trait-only projection header conversion uses. Never materializes the
+-- implementation half.
+pure func accepted_trait_only_projection_from_visibility(
+	table: AcceptedTraitImplementationTable,
+	owner_module_path: String,
+	visibility: Option[AcceptedTraitVisibility],
+	direct_module_paths: List[String],
+) -> AcceptedTraitOnlyProjection:
+	match visibility:
+		Some(accepted_visibility):
+			fields = accepted_trait_projection_fields(
+				table,
+				owner_module_path,
+				accepted_visibility,
+				direct_module_paths,
+			)
+			into_opaque AcceptedTraitOnlyProjection(fields)
+		None:
+			fields = accepted_trait_projection_fields(
+				table,
+				owner_module_path,
+				accepted_trait_empty_visibility(table),
+				direct_module_paths,
+			)
+			into_opaque AcceptedTraitOnlyProjection(
+				{ fields |
+					preparation_errors = fields.preparation_errors.append(
+						"accepted trait visibility rejected its graph definition table",
+					)
+				}
+			)
+
+
 private pure func localized_trait_method(
 	module_path: String,
 	method: TraitMethodSig,
@@ -1873,25 +1986,33 @@ private pure func localized_trait_method(
 	}
 
 
-private pure func trait_for_authority(
-	authority: AcceptedTraitImplementationAuthorityRep,
+private pure func trait_for_owner(
+	table: AcceptedTraitImplementationTable,
+	owner_module_path: String,
 	item: AcceptedTraitTableRecord,
 ) -> TraitDef:
-	table = table_rep(authority.table)
-	owner_module_path = trait_owner_module_path(
-		table.definition_table,
-		table.module_table,
+	table_representation = table_rep(table)
+	resolved_owner_module_path = trait_owner_module_path(
+		table_representation.definition_table,
+		table_representation.module_table,
 		item,
-	).get_or(authority.owner_module_path)
+	).get_or(owner_module_path)
 
-	if owner_module_path == authority.owner_module_path:
+	if resolved_owner_module_path == owner_module_path:
 		{ item.definition |
 			methods = item.definition.methods.map(
-				func(method): localized_trait_method(owner_module_path, method),
+				func(method): localized_trait_method(resolved_owner_module_path, method),
 			)
 		}
 	else:
 		item.definition
+
+
+private pure func trait_for_authority(
+	authority: AcceptedTraitImplementationAuthorityRep,
+	item: AcceptedTraitTableRecord,
+) -> TraitDef:
+	trait_for_owner(authority.table, authority.owner_module_path, item)
 
 
 private pure func visible_trait_index_for_name(
@@ -1912,6 +2033,23 @@ pure func accepted_trait_find(
 	table_rep(representation.table).traits
 		.get(index)
 		.map(func(item): trait_for_authority(representation, item))
+
+
+-- Trait-name resolution for header conversion, from the trait-only
+-- projection instead of a full authority. Orphan checks during callable and
+-- implementation header conversion need exactly this: no implementation
+-- data exists yet at that point in module preparation.
+pure func accepted_trait_only_projection_find(
+	projection: AcceptedTraitOnlyProjection,
+	name: String,
+) -> Option[TraitDef]:
+	fields = projection_fields(projection)
+	source_name_id ?= source_name_table_find_id(fields.source_name_table, name)
+	row ?= visible_trait_for_source_name(fields.visible_traits, source_name_id)
+	index ?= table_find_trait_index(table_rep(fields.table), row.trait_id)
+	table_rep(fields.table).traits
+		.get(index)
+		.map(func(item): trait_for_owner(fields.table, fields.owner_module_path, item))
 
 
 pure func accepted_trait_contains(
