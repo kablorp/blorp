@@ -20,7 +20,11 @@ import:
 		WorkspaceTransition,
 		cancellation_token,
 		cancellation_token_value,
-	../analysis/diagnostic_model: DiagnosticPublication
+	../analysis/diagnostic_model:
+		DiagnosticPublication,
+		PublishedDiagnostics,
+		published_diagnostics_equal,
+		published_diagnostics_of,
 	../capabilities/definition: encode_lsp_definition_response
 	../capabilities/definition_query: definition_query_snapshot
 	../capabilities/document_highlight: encode_lsp_document_highlight_response
@@ -96,6 +100,7 @@ import:
 		UriStore,
 		uri_store,
 		uri_store_contains,
+		uri_store_get,
 		uri_store_remove,
 		uri_store_set,
 	../workspace/source_loader:
@@ -185,7 +190,8 @@ private record ReadyServerState {
 	workspace_schedule: AnalysisSchedule,
 	interactive_schedule: AnalysisSchedule,
 	next_workspace_token_value: Int,
-	next_interactive_token_value: Int
+	next_interactive_token_value: Int,
+	published_diagnostics: UriStore[PublishedDiagnostics]
 }
 
 
@@ -413,6 +419,77 @@ private pure func diagnostic_effects(
 	diagnostics.map(func(diagnostic): PublishDiagnostics(diagnostic))
 
 
+private record CompletionOutcome {
+	workspace: Workspace,
+	schedule: AnalysisSchedule,
+	next_token_value: Int,
+	published_diagnostics: UriStore[PublishedDiagnostics],
+	effects: List[ServerEffect]
+}
+
+
+private pure func completion_outcome(
+	workspace: Workspace,
+	schedule: AnalysisSchedule,
+	next_token_value: Int,
+	published_diagnostics: UriStore[PublishedDiagnostics],
+	effects: List[ServerEffect],
+) -> CompletionOutcome:
+	{
+		workspace = workspace,
+		schedule = schedule,
+		next_token_value = next_token_value,
+		published_diagnostics = published_diagnostics,
+		effects = effects
+	}
+
+
+--- Drop publications the client has already been sent. Both analysis lanes
+--- publish for a URI that is open, and a wave republishes cached diagnostics
+--- for targets it did not re-analyze, so the same message is produced more
+--- than once. Sending it twice makes a client that waits for the answer to
+--- its newest edit read a duplicate of an older one instead.
+private pure func unpublished_diagnostics(
+	ledger: UriStore[PublishedDiagnostics],
+	publications: List[DiagnosticPublication],
+) -> (UriStore[PublishedDiagnostics], List[DiagnosticPublication]):
+	var remaining: UriStore[PublishedDiagnostics] = ledger
+	var fresh: List[DiagnosticPublication] = []
+
+	for publication in publications:
+		published = published_diagnostics_of(publication)
+
+		already: Bool = match uri_store_get(remaining, publication.identity.uri):
+			None:
+				False
+			Some(previous):
+				published_diagnostics_equal(previous, published)
+
+		if not already:
+			remaining = uri_store_set(remaining, publication.identity.uri, published)
+			fresh = fresh.append(publication)
+
+	(remaining, fresh)
+
+
+--- A cleared URI has nothing published against it any more, so the next
+--- publication must go out even when it repeats what was sent before.
+private pure func forget_published_diagnostics(
+	ledger: UriStore[PublishedDiagnostics],
+	clears: List[ServerEffect],
+) -> UriStore[PublishedDiagnostics]:
+	var remaining: UriStore[PublishedDiagnostics] = ledger
+
+	for clear in clears:
+		match clear:
+			ClearDiagnostics(identity):
+				remaining = uri_store_remove(remaining, identity.uri)
+			_:
+				remaining = remaining
+
+	remaining
+
+
 private pure func interactive_schedule_uri(schedule: AnalysisSchedule) -> Option[DocumentUri]:
 	purpose: Option[AnalysisPurpose] = match pending_analysis(schedule):
 		Some(pending):
@@ -467,11 +544,14 @@ private pure func apply_workspace_change(
 	workspace = applied[0]
 	transition = applied[1]
 	clears = transition.diagnostics_to_clear.map(func(identity): ClearDiagnostics(identity))
+	cleared: ReadyServerState = { ready |
+		published_diagnostics = forget_published_diagnostics(ready.published_diagnostics, clears)
+	}
 
 	match transition.analysis_planning:
 		NoAnalysisPlanRequired:
 			Ok({
-				state = native_server_state(NativeReady({ ready | workspace = workspace })),
+				state = native_server_state(NativeReady({ cleared | workspace = workspace })),
 				effects = clears,
 			})
 		AnalysisPlanRequired:
@@ -479,30 +559,33 @@ private pure func apply_workspace_change(
 				Err(error):
 					-- The accepted workspace event remains authoritative even when
 					-- an internal planning invariant prevents this analysis wave.
-					workspace_retired = retire_analysis_schedule(ready.workspace_schedule)
-					interactive_retired = retire_analysis_schedule(ready.interactive_schedule)
-					updated = { ready |
+					workspace_retired = retire_analysis_schedule(cleared.workspace_schedule)
+					interactive_retired = retire_analysis_schedule(cleared.interactive_schedule)
+					emptied = unpublished_diagnostics(
+						cleared.published_diagnostics,
+						empty_diagnostic_publications_for_selected_sources(workspace),
+					)
+					updated = { cleared |
 						workspace = workspace,
 						workspace_schedule = workspace_retired[0],
-						interactive_schedule = interactive_retired[0]
+						interactive_schedule = interactive_retired[0],
+						published_diagnostics = emptied[0]
 					}
 					Ok({
 						state = native_server_state(NativeReady(updated)),
 						effects = clears + diagnostic_effects(
-							empty_diagnostic_publications_for_selected_sources(
-								workspace,
-							),
+							emptied[1],
 						) + workspace_retired[1] + interactive_retired[1] + [
 							AnalysisPlanningFailed(error),
 						],
 					})
 				Ok(plan):
 					background = schedule_analysis(
-						ready.workspace_schedule,
-						ready.next_workspace_token_value,
+						cleared.workspace_schedule,
+						cleared.next_workspace_token_value,
 						plan,
 					)
-					with_background = { ready |
+					with_background = { cleared |
 						workspace = workspace,
 						workspace_schedule = background[0],
 						next_workspace_token_value = background[1]
@@ -519,6 +602,7 @@ private pure func apply_workspace_change(
 								workspace,
 								with_background.interactive_schedule,
 							)
+
 							if survives:
 								Ok({
 									state = native_server_state(NativeReady(with_background)),
@@ -610,33 +694,39 @@ private pure func apply_completion_to_schedule(
 	workspace: Workspace,
 	schedule: AnalysisSchedule,
 	next_token_value: Int,
+	ledger: UriStore[PublishedDiagnostics],
 	completion: AnalysisCompletion,
-) -> Result[(Workspace, AnalysisSchedule, Int, List[ServerEffect]), ServerActorError]:
+) -> Result[CompletionOutcome, ServerActorError]:
 	active = active_analysis(schedule)
 	pending = pending_analysis(schedule)
 
 	match active:
 		None:
-			Ok((workspace, schedule, next_token_value, []))
+			Ok(completion_outcome(workspace, schedule, next_token_value, ledger, []))
 		Some(scheduled):
 			if not active_matches_completion(scheduled, completion):
-				Ok((workspace, schedule, next_token_value, []))
+				Ok(completion_outcome(workspace, schedule, next_token_value, ledger, []))
 			else:
 				authenticated: AnalysisCompletion = { completion | scheduled = scheduled }
 
 				match apply_analysis_completion(workspace, authenticated):
 					Err(error):
 						next = start_replacement_after_completion(next_token_value, pending)
+						rejected = unpublished_diagnostics(
+							ledger,
+							diagnostic_publications_for_rejected_analysis_plan(
+								workspace,
+								scheduled.plan,
+							),
+						)
 						Ok(
-							(
+							completion_outcome(
 								workspace,
 								next[0],
 								next[1],
+								rejected[0],
 								diagnostic_effects(
-									diagnostic_publications_for_rejected_analysis_plan(
-										workspace,
-										scheduled.plan,
-									),
+									rejected[1],
 								) + [AnalysisCompletionRejected(error)] + next[2],
 							),
 						)
@@ -650,12 +740,14 @@ private pure func apply_completion_to_schedule(
 								[]
 
 						next = start_replacement_after_completion(next_token_value, pending)
+						sendable = unpublished_diagnostics(ledger, diagnostics)
 						Ok(
-							(
+							completion_outcome(
 								committed[0],
 								next[0],
 								next[1],
-								diagnostic_effects(diagnostics) + next[2],
+								sendable[0],
+								diagnostic_effects(sendable[1]) + next[2],
 							),
 						)
 
@@ -670,27 +762,31 @@ private pure func apply_completion_to_actor(
 				ready.workspace,
 				ready.workspace_schedule,
 				ready.next_workspace_token_value,
+				ready.published_diagnostics,
 				completion,
 			)
 			updated = { ready |
-				workspace = applied[0],
-				workspace_schedule = applied[1],
-				next_workspace_token_value = applied[2]
+				workspace = applied.workspace,
+				workspace_schedule = applied.schedule,
+				next_workspace_token_value = applied.next_token_value,
+				published_diagnostics = applied.published_diagnostics
 			}
-			actor_transition(native_server_state(NativeReady(updated)), applied[3])
+			actor_transition(native_server_state(NativeReady(updated)), applied.effects)
 		InteractiveDocumentAnalysis(_):
 			applied ?= apply_completion_to_schedule(
 				ready.workspace,
 				ready.interactive_schedule,
 				ready.next_interactive_token_value,
+				ready.published_diagnostics,
 				completion,
 			)
 			updated = { ready |
-				workspace = applied[0],
-				interactive_schedule = applied[1],
-				next_interactive_token_value = applied[2]
+				workspace = applied.workspace,
+				interactive_schedule = applied.schedule,
+				next_interactive_token_value = applied.next_token_value,
+				published_diagnostics = applied.published_diagnostics
 			}
-			actor_transition(native_server_state(NativeReady(updated)), applied[3])
+			actor_transition(native_server_state(NativeReady(updated)), applied.effects)
 
 
 private pure func actor_transition(
@@ -844,7 +940,8 @@ private pure func apply_source_load_success(
 				workspace_schedule = AnalysisIdle,
 				interactive_schedule = AnalysisIdle,
 				next_workspace_token_value = INITIAL_CANCELLATION_TOKEN_VALUE,
-				next_interactive_token_value = INITIAL_CANCELLATION_TOKEN_VALUE
+				next_interactive_token_value = INITIAL_CANCELLATION_TOKEN_VALUE,
+				published_diagnostics = uri_store()
 			}
 			snapshot = workspace_snapshot(workspace)
 			transition: WorkspaceTransition = {
@@ -863,24 +960,28 @@ private pure func apply_source_load_success(
 			-- disk change, so features that need the whole tree (workspace-wide
 			-- diagnostics) still get it without `initialize` paying for it.
 			background_load_request = { source_load_request(
-					loading.source_load_environment,
-					loading.initialization.parameters,
-				) |
+				loading.source_load_environment,
+				loading.initialization.parameters,
+			) |
 				defer_workspace_root_sources = False
 			}
-			prefix = [SendMessage(response)] + issue_effects + [
-				LoadWorkspaceRootSources(background_load_request),
-			]
+			prefix = [
+				SendMessage(
+					response,
+				),
+			] + issue_effects + [LoadWorkspaceRootSources(background_load_request)]
 
 			match plan_analysis(transition):
 				Err(error):
+					emptied = unpublished_diagnostics(
+						ready.published_diagnostics,
+						empty_diagnostic_publications_for_selected_sources(workspace),
+					)
 					actor_transition(
-						native_server_state(NativeReady(ready)),
-						prefix + diagnostic_effects(
-							empty_diagnostic_publications_for_selected_sources(
-								workspace,
-							),
-						) + [AnalysisPlanningFailed(error)],
+						native_server_state(
+							NativeReady({ ready | published_diagnostics = emptied[0] }),
+						),
+						prefix + diagnostic_effects(emptied[1]) + [AnalysisPlanningFailed(error)],
 					)
 				Ok(plan):
 					scheduled = schedule_analysis(
@@ -1283,7 +1384,10 @@ pure func apply_server_event(
 									sources = sources
 								}
 
-								match apply_workspace_change(ready, WorkspaceConfigurationChanged(update)):
+								match apply_workspace_change(
+									ready,
+									WorkspaceConfigurationChanged(update),
+								):
 									Err(error):
 										Err(error)
 									Ok(transition):
@@ -1292,6 +1396,10 @@ pure func apply_server_event(
 										else:
 											[ReportSourceLoadIssues(issues)]
 
-										Ok({ transition | effects = issue_effects + transition.effects })
+										Ok(
+											{ transition |
+												effects = issue_effects + transition.effects
+											},
+										)
 		NativeExited(_):
 			actor_transition(state, [])
