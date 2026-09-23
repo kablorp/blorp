@@ -24,14 +24,27 @@ import:
 			LambdaExpr,
 			LetExpr,
 			ResourceScopeExpr,
+			SemanticMatchExpr,
 			VarExpr,
 		),
 		CoreFunction,
 		CoreParam,
 		CoreProgram,
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
 		CoreVar,
 		core_program_max_declared_definition_id,
 		core_program_to_json,
+	memory: same_object
 	mono_specialize: CoreMonoDiagnostic, core_mono_diagnostic_hint, core_mono_diagnostic_message
 	ownership_contracts: OwnershipContractFacts, empty_ownership_contract_facts
 	synth_error: CoreSynthError, core_synth_error_hint, core_synth_error_message
@@ -226,23 +239,208 @@ private record CoreBinderIdentityWalk {
 }
 
 private pure func core_binder_identity_walk(expr: CoreExpr) -> CoreBinderIdentityWalk:
-	own_binders: List[CoreVar] = core_expr_own_binders(expr)
-
-	own_use: List[CoreVar] = match expr:
-		VarExpr(variable, _, _):
-			[variable]
+	match expr:
+		-- `tree` can be a DAG, not a tree: match_lowering.brp legitimately
+		-- reaches one compiled subtree (a shared fallback) from more than one
+		-- constructor branch or matrix column by reference -- the binders
+		-- inside are the same binders read from two call sites, not two
+		-- passes disagreeing about identity. `immediate_core_expr_children`
+		-- (via `semantic_match_tree_items`) flattens the whole tree into a
+		-- list of leaf bodies with no memory of which of those came from the
+		-- same subtree object, so the generic walk below would re-count that
+		-- subtree's binders once per physical reference and misreport a
+		-- shared fallback as "two binders sharing identity". Walking `tree`
+		-- directly here, with a small per-match "already visited" list
+		-- checked by `same_object` (the same tool `traverse.brp` uses to
+		-- recognize an unchanged subtree), counts each physical node once
+		-- regardless of how many parents reach it. The list is scoped to
+		-- this one `SemanticMatchExpr`'s own tree, not threaded across the
+		-- function, so a match with no sharing (the overwhelming majority)
+		-- allocates a list of exactly the nodes it already had to visit
+		-- anyway -- no cost added for the non-sharing case, and no global
+		-- per-node bookkeeping for the rest of this walk.
+		SemanticMatchExpr(scrutinee, tree, _, _):
+			scrutinee_walk: CoreBinderIdentityWalk = core_binder_identity_walk(scrutinee)
+			tree_walk: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_match_tree_identity_walk(
+				[],
+				tree,
+			)
+			{
+				binders = scrutinee_walk.binders.concat(tree_walk[0].binders),
+				uses = scrutinee_walk.uses.concat(tree_walk[0].uses),
+			}
 		_:
-			[]
+			own_binders: List[CoreVar] = core_expr_own_binders(expr)
 
-	var binders: List[CoreVar] = own_binders
-	var uses: List[CoreVar] = own_use
+			own_use: List[CoreVar] = match expr:
+				VarExpr(variable, _, _):
+					[variable]
+				_:
+					[]
 
-	for child in immediate_core_expr_children(expr):
-		child_walk: CoreBinderIdentityWalk = core_binder_identity_walk(child)
-		binders = binders.concat(child_walk.binders)
-		uses = uses.concat(child_walk.uses)
+			var binders: List[CoreVar] = own_binders
+			var uses: List[CoreVar] = own_use
 
-	{ binders = binders, uses = uses }
+			for child in immediate_core_expr_children(expr):
+				child_walk: CoreBinderIdentityWalk = core_binder_identity_walk(child)
+				binders = binders.concat(child_walk.binders)
+				uses = uses.concat(child_walk.uses)
+
+			{ binders = binders, uses = uses }
+
+
+private pure func core_semantic_match_tree_seen(
+	visited: List[CoreSemanticMatchTree],
+	tree: CoreSemanticMatchTree,
+) -> Bool:
+	var found: Bool = False
+
+	for candidate in visited:
+		if same_object(candidate, tree):
+			found = True
+		else:
+			void
+
+	found
+
+
+private CORE_EMPTY_BINDER_IDENTITY_WALK: CoreBinderIdentityWalk = {
+	binders = [],
+	uses = []
+}
+
+
+private pure func core_binder_identity_walk_merge(
+	left: CoreBinderIdentityWalk,
+	right: CoreBinderIdentityWalk,
+) -> CoreBinderIdentityWalk:
+	{
+		binders = left.binders.concat(right.binders),
+		uses = left.uses.concat(right.uses)
+	}
+
+
+-- Walks a `CoreSemanticMatchTree`, visiting each physical node once: a node
+-- already in `visited` (by `same_object`, i.e. the same shared fallback
+-- reached again from a second branch) contributes no further binders or
+-- uses the second time, since they were already counted on the first visit.
+private pure func core_semantic_match_tree_identity_walk(
+	visited: List[CoreSemanticMatchTree],
+	tree: CoreSemanticMatchTree,
+) -> (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]):
+	if core_semantic_match_tree_seen(visited, tree):
+		(CORE_EMPTY_BINDER_IDENTITY_WALK, visited)
+	else:
+		marked: List[CoreSemanticMatchTree] = [tree].concat(visited)
+
+		match tree:
+			SemanticMatchLeaf(_, body):
+				(core_binder_identity_walk(body), marked)
+			SemanticMatchFail:
+				(CORE_EMPTY_BINDER_IDENTITY_WALK, marked)
+			SemanticConstructorMatch(_, cases, fallback):
+				cases_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_constructor_match_cases_identity_walk(
+					marked,
+					cases,
+				)
+				fallback_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = match fallback:
+					Some(found):
+						core_semantic_match_tree_identity_walk(cases_result[1], found)
+					None:
+						(CORE_EMPTY_BINDER_IDENTITY_WALK, cases_result[1])
+				(
+					core_binder_identity_walk_merge(cases_result[0], fallback_result[0]),
+					fallback_result[1],
+				)
+			SemanticLiteralMatch(_, cases, fallback):
+				cases_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_literal_match_cases_identity_walk(
+					marked,
+					cases,
+				)
+				fallback_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_match_tree_identity_walk(
+					cases_result[1],
+					fallback,
+				)
+				(
+					core_binder_identity_walk_merge(cases_result[0], fallback_result[0]),
+					fallback_result[1],
+				)
+			SemanticLengthMatch(_, cases, geq, fallback):
+				cases_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_length_match_cases_identity_walk(
+					marked,
+					cases,
+				)
+				geq_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = match geq:
+					Some(found):
+						core_semantic_match_tree_identity_walk(cases_result[1], found.body)
+					None:
+						(CORE_EMPTY_BINDER_IDENTITY_WALK, cases_result[1])
+				fallback_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = match fallback:
+					Some(found):
+						core_semantic_match_tree_identity_walk(geq_result[1], found)
+					None:
+						(CORE_EMPTY_BINDER_IDENTITY_WALK, geq_result[1])
+				(
+					core_binder_identity_walk_merge(
+						core_binder_identity_walk_merge(cases_result[0], geq_result[0]),
+						fallback_result[0],
+					),
+					fallback_result[1],
+				)
+
+
+private pure func core_semantic_constructor_match_cases_identity_walk(
+	visited: List[CoreSemanticMatchTree],
+	cases: List[CoreSemanticConstructorMatchCase],
+) -> (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]):
+	var current_visited: List[CoreSemanticMatchTree] = visited
+	var result: CoreBinderIdentityWalk = CORE_EMPTY_BINDER_IDENTITY_WALK
+
+	for match_case in cases:
+		case_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_match_tree_identity_walk(
+			current_visited,
+			match_case.body,
+		)
+		current_visited = case_result[1]
+		result = core_binder_identity_walk_merge(result, case_result[0])
+
+	(result, current_visited)
+
+
+private pure func core_semantic_literal_match_cases_identity_walk(
+	visited: List[CoreSemanticMatchTree],
+	cases: List[CoreSemanticLiteralMatchCase],
+) -> (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]):
+	var current_visited: List[CoreSemanticMatchTree] = visited
+	var result: CoreBinderIdentityWalk = CORE_EMPTY_BINDER_IDENTITY_WALK
+
+	for match_case in cases:
+		case_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_match_tree_identity_walk(
+			current_visited,
+			match_case.body,
+		)
+		current_visited = case_result[1]
+		result = core_binder_identity_walk_merge(result, case_result[0])
+
+	(result, current_visited)
+
+
+private pure func core_semantic_length_match_cases_identity_walk(
+	visited: List[CoreSemanticMatchTree],
+	cases: List[CoreSemanticLengthMatchCase],
+) -> (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]):
+	var current_visited: List[CoreSemanticMatchTree] = visited
+	var result: CoreBinderIdentityWalk = CORE_EMPTY_BINDER_IDENTITY_WALK
+
+	for match_case in cases:
+		case_result: (CoreBinderIdentityWalk, List[CoreSemanticMatchTree]) = core_semantic_match_tree_identity_walk(
+			current_visited,
+			match_case.body,
+		)
+		current_visited = case_result[1]
+		result = core_binder_identity_walk_merge(result, case_result[0])
+
+	(result, current_visited)
 
 
 ---
