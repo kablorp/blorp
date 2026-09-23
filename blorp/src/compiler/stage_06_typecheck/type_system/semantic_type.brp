@@ -1,4 +1,5 @@
 import:
+	memory: same_object
 	meta_identity: MetaSessionId, meta_session_ids_equal
 
 
@@ -538,38 +539,94 @@ private pure func owner_local_type_name(module_path: String, name: String) -> St
 			name
 
 
+-- `None` means every child came back as the same allocation, so a caller can
+-- keep its own input instead of rebuilding a list. Same idiom as
+-- `type_instantiate_type_param_list_if_changed` above: `List.set` clones
+-- shared storage on the first changed element, then updates the unique clone
+-- in place, so a fully unchanged list allocates nothing.
+private pure func localize_module_types_list(
+	module_path: String,
+	items: List[SemanticType],
+) -> Option[List[SemanticType]]:
+	var mapped: List[SemanticType] = items
+	var changed: Bool = False
+	var index: Int = 0
+
+	for item in items:
+		mapped_item: SemanticType = localize_module_types(module_path, item)
+
+		if not same_object(mapped_item, item):
+			mapped = mapped.set(index, mapped_item)
+			changed = True
+
+		index += 1
+
+	if changed:
+		Some(mapped)
+	else:
+		None
+
+
 -- Accepted aliases retain canonical targets. Their defining module needs the
 -- owner-local spelling until the remaining type categories are canonicalized.
+-- Every arm returns `typ` unchanged when localization touched nothing, so a
+-- module with no locally-owned qualified names pays no allocation here.
 pure func localize_module_types(module_path: String, typ: SemanticType) -> SemanticType:
 	match typ:
 		SemanticNamedType(name, args):
-			SemanticNamedType(
-				owner_local_type_name(module_path, name),
-				args.map(func(arg): localize_module_types(module_path, arg)),
-			)
+			next_name = owner_local_type_name(module_path, name)
+
+			match localize_module_types_list(module_path, args):
+				Some(next_args):
+					SemanticNamedType(next_name, next_args)
+				None:
+					if same_object(next_name, name):
+						typ
+					else:
+						SemanticNamedType(next_name, args)
 		SemanticArrayType(element, dims):
-			SemanticArrayType(
-				localize_module_types(module_path, element),
-				dims.map(func(dim): localize_module_types(module_path, dim)),
-			)
+			next_element = localize_module_types(module_path, element)
+
+			match localize_module_types_list(module_path, dims):
+				Some(next_dims):
+					SemanticArrayType(next_element, next_dims)
+				None:
+					if same_object(next_element, element):
+						typ
+					else:
+						SemanticArrayType(next_element, dims)
 		SemanticFunctionType(is_pure, params, return_type):
-			SemanticFunctionType(
-				is_pure,
-				params.map(func(param): localize_module_types(module_path, param)),
-				localize_module_types(module_path, return_type),
-			)
+			next_return_type = localize_module_types(module_path, return_type)
+
+			match localize_module_types_list(module_path, params):
+				Some(next_params):
+					SemanticFunctionType(is_pure, next_params, next_return_type)
+				None:
+					if same_object(next_return_type, return_type):
+						typ
+					else:
+						SemanticFunctionType(is_pure, params, next_return_type)
 		SemanticTupleType(elements):
-			SemanticTupleType(elements.map(
-				func(element): localize_module_types(module_path, element),
-			))
+			match localize_module_types_list(module_path, elements):
+				Some(next_elements):
+					SemanticTupleType(next_elements)
+				None:
+					typ
 		SemanticRangeType(inner):
-			SemanticRangeType(localize_module_types(module_path, inner))
+			next_inner = localize_module_types(module_path, inner)
+
+			if same_object(next_inner, inner):
+				typ
+			else:
+				SemanticRangeType(next_inner)
 		SemanticDimOpType(op, left, right):
-			SemanticDimOpType(
-				op,
-				localize_module_types(module_path, left),
-				localize_module_types(module_path, right),
-			)
+			next_left = localize_module_types(module_path, left)
+			next_right = localize_module_types(module_path, right)
+
+			if same_object(next_left, left) and same_object(next_right, right):
+				typ
+			else:
+				SemanticDimOpType(op, next_left, next_right)
 		_:
 			typ
 

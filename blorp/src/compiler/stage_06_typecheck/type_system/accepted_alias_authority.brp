@@ -12,6 +12,7 @@ import:
 		definition_table_module_table,
 		definition_table_type_row,
 	../graph/type_identity: TypeId, type_id_definition_id, type_id_module_id, type_ids_equal
+	memory: same_object
 	semantic_type:
 		SemanticType(
 			SemanticArrayType,
@@ -730,19 +731,50 @@ private pure func alias_substitution(
 	substitutions
 
 
+-- `None` means every element resolved to the same allocation, so a caller can
+-- keep its own input instead of rebuilding a list. Same idiom as
+-- `localize_module_types_list` in semantic_type.brp: `List.set` clones shared
+-- storage on the first changed element, then updates the unique clone in
+-- place, so a fully unchanged list allocates nothing.
 private pure func resolve_alias_list(
 	authority: AcceptedAliasAuthority,
 	seen: List[String],
 	types: List[SemanticType],
-) -> List[SemanticType]:
-	var resolved: List[SemanticType] = []
+) -> Option[List[SemanticType]]:
+	var resolved: List[SemanticType] = types
+	var changed: Bool = False
+	var index: Int = 0
 
 	for typ in types:
-		resolved = resolved.append(resolve_alias_seen(authority, seen, typ))
+		resolved_typ = resolve_alias_seen(authority, seen, typ)
 
-	resolved
+		if not same_object(resolved_typ, typ):
+			resolved = resolved.set(index, resolved_typ)
+			changed = True
+
+		index += 1
+
+	if changed:
+		Some(resolved)
+	else:
+		None
 
 
+private pure func resolve_alias_list_or_same(
+	authority: AcceptedAliasAuthority,
+	seen: List[String],
+	types: List[SemanticType],
+) -> List[SemanticType]:
+	match resolve_alias_list(authority, seen, types):
+		Some(resolved):
+			resolved
+		None:
+			types
+
+
+-- A no-op resolution (no alias found, nothing to substitute, not a recursive
+-- name already in `seen`) returns `typ` unchanged, so a type tree with no
+-- transparent aliases in it costs no allocation here.
 private pure func resolve_alias_seen(
 	authority: AcceptedAliasAuthority,
 	seen: List[String],
@@ -753,10 +785,10 @@ private pure func resolve_alias_seen(
 			if seen.contains(name):
 				typ
 			else:
-				resolved_args = resolve_alias_list(authority, seen, args)
-
 				match accepted_alias_find_transparent(authority, name):
 					Some(alias_entry):
+						resolved_args = resolve_alias_list_or_same(authority, seen, args)
+
 						if alias_entry.type_params.length() == resolved_args.length():
 							resolve_alias_seen(
 								authority,
@@ -766,31 +798,59 @@ private pure func resolve_alias_seen(
 									alias_entry.target,
 								),
 							)
+						else if same_object(resolved_args, args):
+							typ
 						else:
 							SemanticNamedType(name, resolved_args)
 					None:
-						SemanticNamedType(name, resolved_args)
+						match resolve_alias_list(authority, seen, args):
+							Some(resolved_args):
+								SemanticNamedType(name, resolved_args)
+							None:
+								typ
 		SemanticArrayType(element, dims):
-			SemanticArrayType(
-				resolve_alias_seen(authority, seen, element),
-				resolve_alias_list(authority, seen, dims),
-			)
+			resolved_element = resolve_alias_seen(authority, seen, element)
+
+			match resolve_alias_list(authority, seen, dims):
+				Some(resolved_dims):
+					SemanticArrayType(resolved_element, resolved_dims)
+				None:
+					if same_object(resolved_element, element):
+						typ
+					else:
+						SemanticArrayType(resolved_element, dims)
 		SemanticFunctionType(is_pure, params, return_type):
-			SemanticFunctionType(
-				is_pure,
-				resolve_alias_list(authority, seen, params),
-				resolve_alias_seen(authority, seen, return_type),
-			)
+			resolved_return_type = resolve_alias_seen(authority, seen, return_type)
+
+			match resolve_alias_list(authority, seen, params):
+				Some(resolved_params):
+					SemanticFunctionType(is_pure, resolved_params, resolved_return_type)
+				None:
+					if same_object(resolved_return_type, return_type):
+						typ
+					else:
+						SemanticFunctionType(is_pure, params, resolved_return_type)
 		SemanticTupleType(elements):
-			SemanticTupleType(resolve_alias_list(authority, seen, elements))
+			match resolve_alias_list(authority, seen, elements):
+				Some(resolved_elements):
+					SemanticTupleType(resolved_elements)
+				None:
+					typ
 		SemanticRangeType(inner):
-			SemanticRangeType(resolve_alias_seen(authority, seen, inner))
+			resolved_inner = resolve_alias_seen(authority, seen, inner)
+
+			if same_object(resolved_inner, inner):
+				typ
+			else:
+				SemanticRangeType(resolved_inner)
 		SemanticDimOpType(op, left, right):
-			SemanticDimOpType(
-				op,
-				resolve_alias_seen(authority, seen, left),
-				resolve_alias_seen(authority, seen, right),
-			)
+			resolved_left = resolve_alias_seen(authority, seen, left)
+			resolved_right = resolve_alias_seen(authority, seen, right)
+
+			if same_object(resolved_left, left) and same_object(resolved_right, right):
+				typ
+			else:
+				SemanticDimOpType(op, resolved_left, resolved_right)
 		_:
 			typ
 
