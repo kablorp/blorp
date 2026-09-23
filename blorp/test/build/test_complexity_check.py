@@ -26,8 +26,8 @@ def location(line: int) -> dict[str, object]:
 	}
 
 
-def variable(name: str, line: int = 1, uniq: int = 0) -> dict[str, object]:
-	return {"kind": "var", "var": {"name": name, "uniq": uniq}, "loc": location(line)}
+def variable(name: str, line: int = 1, id: int = 0) -> dict[str, object]:
+	return {"kind": "var", "var": {"name": name, "id": id}, "loc": location(line)}
 
 
 def void(line: int = 1) -> dict[str, object]:
@@ -60,7 +60,7 @@ def core_function(
 		"name": name,
 		"module": "example",
 		"params": [
-			{"name": {"name": param, "uniq": 0}, "type": {"kind": "named", "name": "Any"}}
+			{"name": {"name": param, "id": 0}, "type": {"kind": "named", "name": "Any"}}
 			for param in params or []
 		],
 		"body": body,
@@ -70,8 +70,8 @@ def core_function(
 
 
 def append_assignment(name: str, line: int) -> dict[str, object]:
-	length = variable("append_length", uniq=1)
-	grown = variable("append_result", uniq=1)
+	length = variable("append_length", id=1)
+	grown = variable("append_result", id=1)
 	new_length = {
 		"kind": "binary",
 		"op": "add",
@@ -80,14 +80,14 @@ def append_assignment(name: str, line: int) -> dict[str, object]:
 	}
 	return {
 		"kind": "assign",
-		"var": {"name": name, "uniq": 0},
+		"var": {"name": name, "id": 0},
 		"rhs": {
 			"kind": "let",
-			"name": {"name": "append_length", "uniq": 1},
+			"name": {"name": "append_length", "id": 1},
 			"rhs": call("list_len", [variable(name)], line),
 			"body": {
 				"kind": "let",
-				"name": {"name": "append_result", "uniq": 1},
+				"name": {"name": "append_result", "id": 1},
 				"rhs": call("list_ensure_capacity", [variable(name), new_length], line),
 				"body": {
 					"kind": "seq",
@@ -109,7 +109,7 @@ def for_list(
 	return {
 		"kind": "for_list",
 		"for_list": {
-			"binder": {"var": {"name": binder, "uniq": 0}},
+			"binder": {"var": {"name": binder, "id": 0}},
 			"iterable": iterable,
 			"body": body,
 		},
@@ -126,7 +126,7 @@ def for_range(
 	return {
 		"kind": "for_range",
 		"binder": {
-			"var": {"name": "index", "uniq": 0},
+			"var": {"name": "index", "id": 0},
 			"range_direction": "forward_only",
 		},
 		"start": start,
@@ -224,8 +224,8 @@ class ComplexityCheckTests(unittest.TestCase):
 
 	def test_uses_core_variable_identity_for_shadowed_names(self) -> None:
 		body = for_list(
-			variable("items", uniq=1),
-			for_list(variable("items", uniq=2), void(), line=27),
+			variable("items", id=1),
+			for_list(variable("items", id=2), void(), line=27),
 			line=26,
 		)
 
@@ -618,7 +618,7 @@ class ComplexityCheckTests(unittest.TestCase):
 	def test_discarded_append_result_does_not_prove_accumulator_growth(self) -> None:
 		discarded_append = {
 			"kind": "assign",
-			"var": {"name": "result", "uniq": 0},
+			"var": {"name": "result", "id": 0},
 			"rhs": {
 				"kind": "seq",
 				"first": call(
@@ -653,7 +653,7 @@ class ComplexityCheckTests(unittest.TestCase):
 	def test_capacity_reservation_alone_is_not_accumulator_growth(self) -> None:
 		reserve = {
 			"kind": "assign",
-			"var": {"name": "result", "uniq": 0},
+			"var": {"name": "result", "id": 0},
 			"rhs": call("list_ensure_capacity", [variable("result"), integer(8)], 57),
 			"loc": location(57),
 		}
@@ -975,7 +975,7 @@ class ComplexityCheckTests(unittest.TestCase):
 		concurrent = {
 			"kind": "pre_closure_concurrently_loop",
 			"pre_closure_concurrently_loop": {
-				"var": {"name": "task_item", "uniq": 0},
+				"var": {"name": "task_item", "id": 0},
 				"iterable": variable("tasks"),
 				"body": for_list(variable("items"), void(), line=62),
 				"timeout": None,

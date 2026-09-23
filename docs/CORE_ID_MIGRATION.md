@@ -16,12 +16,12 @@ anchors below give the current file and symbol name instead of a
 
 ## What is true today
 
-`CoreVar` (`stage_09_core/ir.brp:668`) is `{ name: String, uniq: Int,
+`CoreVar` (`stage_09_core/ir.brp:668`) is `{ name: String, id: Int,
 def_id: Option[Int] }`. Lowering mints every local and parameter through one
-helper, `core_var` at `stage_08_core_lower/lower.brp:630`, with `uniq = 0`
+helper, `core_var` at `stage_08_core_lower/lower.brp:630`, with `id = 0`
 and `def_id = None` (73 call sites); `def_id` is set only for globals,
-callables and constructors. The SSA desugar pass later uses `uniq` as an
-assignment version, so after it identity is the pair name plus `uniq` for
+callables and constructors. The SSA desugar pass later uses `id` as an
+assignment version, so after it identity is the pair name plus `id` for
 reassigned locals and the bare name for everything else. Because that pair
 is not unique per binder, every pass that mints a synthetic variable bakes a
 counter or a source offset into the name string to keep it distinct (about
@@ -50,11 +50,11 @@ Consequences that this migration removes:
   `free_vars_expr` checks a `List[String]` of bound names; the name-only
   comparison `same_var_name` (`closure.brp:2069`) is required there because
   callers run shadow checks before descending.
-- DCE's value index (`dce.brp:237-244`) is keyed by `(def_id, uniq)`, so a
+- DCE's value index (`dce.brp:237-244`) is keyed by `(def_id, id)`, so a
   local with `def_id = None` is never deduplicated.
 
 Already landed (2026-09-21): one public equality `core_var_equal`
-(`ir.brp:685`, name plus `uniq`; `def_id` never overrules it) replacing eight
+(`ir.brp:685`, name plus `id`; `def_id` never overrules it) replacing eight
 private copies; one definition-id allocator on `CorePassState.next_def_id`
 replacing two whole-program rescans, which also fixed a real bug: the late
 pipeline seeded the frontier at zero and reseeded from surviving
@@ -77,8 +77,8 @@ metrics off.
   profile program in
   `benchmarks/results/perceus_allocation_attribution_2026-09-22.md`; sizes
   steps 3 and 5.
-- **Step 1 — lowering mints a unique `uniq` per binder**: `54a4e6ef`.
-  Byte-identical C; every binder has a distinct `(name, uniq)` pair inside
+- **Step 1 — lowering mints a unique `id` per binder**: `54a4e6ef`.
+  Byte-identical C; every binder has a distinct `(name, id)` pair inside
   its function.
 - **Step 2 — binder-identity check before Perceus**: `908d8458`. This
   landed in **report-only mode**: `--check-invariants` prints an
@@ -89,7 +89,7 @@ metrics off.
   the first violation and exits 1. The commit message is explicit that
   strict mode cannot pass cleanly on the real self-compile until steps 3-5
   land: match's arm desugaring and Perceus's borrow-argument handling each
-  duplicate an existing binder's exact `(name, uniq)` into a second binder
+  duplicate an existing binder's exact `(name, id)` into a second binder
   site instead of minting a fresh one. Do not read step 2 as an enforced
   invariant — it is a diagnostic until a later step flips
   `BLORP_IDENTITY_CONTRACT=strict` on by default.
@@ -168,7 +168,7 @@ Only the helpers step 0 named. Candidates: `count_uses` and the
 (`perceus/mutable.brp`) and `protect_repeated_consumes`
 (`perceus/protect.brp`) stop dropping to `target.name`;
 `BorrowedOwnerCatalog.candidate_ids_by_name` (`perceus/borrowed.brp`)
-becomes a list indexed by `uniq` within the region (or a
+becomes a list indexed by `id` within the region (or a
 `Dict[Int, List[Int]]` if the range is sparse; measure);
 `has_unresolved_identity` (`perceus/borrowed.brp`) and the alias fallback
 that exists only for it are deleted, and the fallbacks for unsupported
@@ -199,12 +199,12 @@ conversion; allocation flat.
 
 ### Step 5: synthetic binders from the shared allocator
 
-Every pass with a private `core_var(name)` helper mints `uniq` from the
-allocator on `CorePassState` (extend it with `next_uniq` next to
+Every pass with a private `core_var(name)` helper mints `id` from the
+allocator on `CorePassState` (extend it with `next_id` next to
 `next_def_id`, threaded the same way; passes that mint take and return it)
 and stops baking counters and source offsets into the name. Names become
 plain prefixes (`__assign`, `__elem`, `__view`). Until step 6, the C
-identifier still comes from the name, so the emitter must append `uniq`
+identifier still comes from the name, so the emitter must append `id`
 when a name is not unique within a function; do that in `c_var_name` as a
 transitional rule and remove it in step 6.
 
@@ -215,7 +215,7 @@ synthetic binder).
 
 ### Step 6: C identifiers from identity; spellings in one table
 
-`c_var_name` derives the C identifier from `uniq` (with the source name kept
+`c_var_name` derives the C identifier from `id` (with the source name kept
 as a suffix for readability of the emitted C, from the table); diagnostics,
 `--dump-core-after` and the Core JSON read the spelling through one accessor
 on a per-program name table (id to `String`), the only place a variable's

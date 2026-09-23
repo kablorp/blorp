@@ -18,7 +18,7 @@ Measurement only; no production code path changed (confirmed below with
   of the pass's 60,823,087 allocations. `PerceusResolvedValueIndex` is
   rebuilt (not just queried) 137,953 times. This does not clear P3's
   allocation-share gate on its own; P3's other starting condition (step 1 of
-  `CORE_ID_MIGRATION.md` landing, which would make `uniq` unique per binder)
+  `CORE_ID_MIGRATION.md` landing, which would make `id` unique per binder)
   is independent of this measurement and not evaluated here.
 - **P4 (frame constructions above 5%?).** No. `PerceusInsertBindingFrameStack`
   is pushed **269,077** times across the walk. Its own docstring's

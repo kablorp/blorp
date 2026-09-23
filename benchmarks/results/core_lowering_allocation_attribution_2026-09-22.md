@@ -18,7 +18,7 @@ lands as a measurement-only commit with no production change: they are
 exercised indirectly — `core_lower_type` calls `core_lower_type_with_prefixes`
 with an empty prefix map on every call, so timing the public wrapper times
 the private helper too, and `core_var`'s entire body is one record literal
-(`{ name, uniq = 0, def_id }`), so building that literal directly costs the
+(`{ name, id = 0, def_id }`), so building that literal directly costs the
 same allocation the private function performs.
 
 **Representative subset, not the frozen self-compile input.** Loading the

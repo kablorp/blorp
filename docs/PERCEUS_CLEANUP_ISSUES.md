@@ -116,7 +116,7 @@ the simplification for clarity only and say so.
 **Observation.** `PerceusResolvedValueIndex` (`perceus/results_and_loops.brp`,
 used by `resolved_value_occurrence_count`, `add_resolved_value`,
 `add_resolved_value_occurrences`, `without_bound_value`) is a
-`Dict[String, Dict[Int, Dict[Int, Int]]]` keyed name, then `uniq`, then
+`Dict[String, Dict[Int, Dict[Int, Int]]]` keyed name, then `id`, then
 `def_id`, threaded through every recursive call of `insert_drops_expr_inner`
 and rebuilt with `.set` at every binding that consumes an occurrence. It is
 real state, but its shape is the name-keyed shape the identity roadmap
@@ -124,12 +124,12 @@ retires, and the triple nesting allocates on every update.
 
 **Gate to start.** P0 shows the index's updates above 5% of the pass, or
 step 1 of [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) has landed (then
-`uniq` is unique per binder and the name key is redundant).
+`id` is unique per binder and the name key is redundant).
 
 **Change.** Key by the variable's identity: after roadmap step 1, a flat
-`Dict[Int, Int]` from `uniq` to count (or a list indexed by `uniq` within the
+`Dict[Int, Int]` from `id` to count (or a list indexed by `id` within the
 function when the range is dense); before it, the same with the pair
-encoded as one Int and the name dropped only where `uniq` is already
+encoded as one Int and the name dropped only where `id` is already
 unique (SSA versions). Delete the String level.
 
 **Acceptance.** Identical C; the row falls by what P0 predicted; the
@@ -171,7 +171,7 @@ which matter:
   further, compute the fields as locals and publish once at the return.
 - `exact_owned_vars_add/remove/contains` (`CoreVar` set over a list) and
   `int_list_contains` (`contracts.brp`) are the same membership shape; after
-  roadmap step 1 the `CoreVar` version can key on `uniq`.
+  roadmap step 1 the `CoreVar` version can key on `id`.
 - `same_core_expr` / `same_core_expr_list` are redeclared in four `perceus/`
   files (eleven files repo-wide) behind a comment that says to delete them
   once the bootstrap pin passes the commit that introduced

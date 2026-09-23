@@ -285,7 +285,7 @@ every file byte for byte (`bin/blorp format --check blorp/src standard_library/s
 **Pitfalls.** Names are per compilation, not per module, so the table must
 be shared across all files in one compile and stable across the LSP's
 incremental reparse of one file (append-only). Hygiene: the typechecker
-distinguishes same-named locals by a uniq counter; do not collapse those.
+distinguishes same-named locals by a id counter; do not collapse those.
 Interpolated strings and docstrings are not names.
 
 **Acceptance.** Identical C; `source_discovery_complete` allocations not
@@ -807,7 +807,7 @@ change shared with header completion); (4) the scope insert, only alongside
 | --- | --- | --- | --- | --- |
 | T1 module lookups by `ModuleId` | landed | `842912c16` | self-compile rows identical | the path-keyed source was only the fallback used by lint, check, purify, and the LSP; the self-compile driver already used ids |
 | T2 callable name facts once per module | landed | `46930b911` | `core_lowering_complete` -0.13% | builder runs 359 times instead of 718; identical lowered Core; `CallableNameFacts` stays name-keyed by design (it aggregates overloads sharing a name) |
-| F7 DCE reference indexes by `(def_id, uniq)` | landed | `441f568a9` | instructions -0.32%; `pass_perceus_complete` -0.5% | the consumer of those indexes is Perceus, not DCE's own pass; string-equality samples -56% |
+| F7 DCE reference indexes by `(def_id, id)` | landed | `441f568a9` | instructions -0.32%; `pass_perceus_complete` -0.5% | the consumer of those indexes is Perceus, not DCE's own pass; string-equality samples -56% |
 | T7 parser: token kind without owning the token; infix classification as a stack struct | landed | `7619c0035` | instructions -1.3%; `source_discovery_complete` -0.4% | `advance_parser` still rebuilds a `ParserState` record per token: the T7b builder conversion below |
 | T4 broad typecheck facts split | closed; replaced by T4a/T4b gates | | | `InferModuleFacts`/`InferSession` and the header-install builder already exist; do not add another managed facts carrier. Probe a function-parameter facts boundary first, and independently move graph import admission to a local owner with one module-view publication |
 | F3 backend type naming facts and reserved-identifier index | landed | `aff15726a` | instructions -1.52% | the cost was a 54-entry `List[String].contains` per emitted local reference, not concatenation; naming facts flat but single-sourced |
