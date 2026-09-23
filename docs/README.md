@@ -52,12 +52,15 @@ module inventory lives in
   allocation explanations and a compile-time `no_alloc` block, including
   runtime/cleanup coverage, Core analysis, and tooling enforcement.
 - [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
+  plan for publishing each stage's facts as id-keyed tables (module,
+  name, definition tables) and removing threaded state from typecheck.
+- [`CORE_NODE_TABLE_ROADMAP.md`](CORE_NODE_TABLE_ROADMAP.md) — Core expressions get node ids and facts move into published id-keyed tables; steps N1-N6 (compact locations first), each with ROI, risks, oracle.
+- [`TYPE_INTERNING_ROADMAP.md`](TYPE_INTERNING_ROADMAP.md) — one type table per compilation, identity equality, mono and trait keys by type id, names last; steps I1-I7; extends Frontend Facts T3/T5/T6.
+- [`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) — struct values inline in union payloads and closures (typed payload storage for source unions), then hot records become structs; steps S0-S5.
 - [`SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md`](SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md) — lexer/parser/discovery cuts (Task 4 landed; rest deferred), with its profile in `benchmarks/results/`.
 - [`TYPECHECK_OPTIMIZATION_ISSUES.md`](TYPECHECK_OPTIMIZATION_ISSUES.md) — five worker-ready typecheck issues (T-A..T-E) with anchors, fast loop, acceptance numbers.
 - [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) — Core variable identity by integer, steps 0-6 with start gates, oracles and expected effects; lessons from the reverted cuts.
 - [`PERCEUS_CLEANUP_ISSUES.md`](PERCEUS_CLEANUP_ISSUES.md) — worker-ready Perceus cleanup issues P0-P6 from the split observations; allocation floor rules.
-  plan for publishing each stage's facts as id-keyed tables (module,
-  name, definition tables) and removing threaded state from typecheck.
 - [Compact Parser Migration](COMPACT_PARSER_MIGRATION.md) defines the staged
   schema, ownership, compatibility, and measurement contract for replacing
   per-expression parser trees without creating a second permanent parser.
