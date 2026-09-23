@@ -92,10 +92,12 @@ class RuntimeAllocOracleTests(unittest.TestCase):
                 CHECK_MOVED(after_managed_alloc, after_managed_release, total_releases, 3);
 
                 // 2. Pool slab refill: exhaust the free list for the 32-byte
-                // class (BLORP_POOL_REFILL_COUNT=64 objects per slab) so a
-                // second refill is forced.
+                // class (blorp_pool_refill_count[0] objects per slab, derived
+                // from the fixed BLORP_POOL_SLAB_SIZE) so a second refill is
+                // forced.
                 blorp_MemStats before_pool = blorp_get_mem_stats();
-                for (int i = 0; i < 200; i++) {
+                int class0_alloc_count = blorp_pool_refill_count[0] * 2 + 8;
+                for (int i = 0; i < class0_alloc_count; i++) {
                     blorp_alloc(32);
                 }
                 blorp_MemStats after_pool = blorp_get_mem_stats();

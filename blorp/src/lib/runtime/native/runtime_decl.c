@@ -202,6 +202,7 @@ typedef struct {
     long bytes_allocated;
     long backing_pool_refill_events;
     long backing_libc_malloc_events;
+    long backing_pool_overflow_events;
     long raw_buffer_malloc_events;
     long raw_buffer_calloc_events;
     long raw_buffer_realloc_events;
