@@ -15,10 +15,21 @@ import:
 		ProjectSourcePackage,
 		ProjectStdProvider(ProjectEmbeddedStd, ProjectFilesystemStd),
 		project_source_catalog,
+	../../compiler/stage_04_modules/frontend_graph:
+		FrontendImportEdge,
+		FrontendImportResolution(FrontendUnresolvedImport),
+		frontend_graph_import_edges,
+	../../compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(UserModule),
+		ResolvedModuleIdentity,
+		resolved_module_identities_equal,
+		resolved_module_identity_from_resolver,
+		resolved_module_origin,
 	../../compiler/stage_04_modules/source_package_layout: SourcePackageLayout
 	../../lib/path_identity: canonical_existing_path, existing_path_identity, path_is_absolute
 	../../lib/source: SourceFile, source_file
 	../analysis/architecture: WorkspaceError
+	../analysis/frontend_graph: frontend_graph_for_roots
 	../protocol/file_uri: FileUriError, embedded_std_uri, file_uri_from_path, file_uri_to_path
 	../protocol/identity: DocumentUri, document_uri_value
 	../protocol/initialize_model: InitializeParameters, initialize_workspace_roots
@@ -30,7 +41,7 @@ import:
 		open_read,
 		read_directory,
 		read_text,
-	path: join, normalize
+	path: dirname, join, normalize
 	system: file_exists, getcwd, getenv, is_directory, temp_dir
 	workspace: Workspace, workspace
 	workspace_model:
@@ -45,7 +56,11 @@ import:
 		SavedSourceRefresh(SavedSourceRemoved, SavedSourceUpdated),
 		WorkspaceConfiguration,
 		WorkspaceRoot,
-	workspace_source: discovered_source_layer
+		source_snapshot_for_layers,
+		source_snapshot_origin,
+		source_snapshot_source,
+	workspace_source: discovered_source_layer, set_discovered_source
+	workspace_store: SourceStore, source_store_contains, source_store_values
 
 
 record SourceDiscoveryPolicy {
@@ -58,11 +73,21 @@ DEFAULT_SOURCE_DISCOVERY_POLICY: SourceDiscoveryPolicy = {
 }
 
 
+-- `defer_workspace_root_sources` skips the eager recursive read of every
+-- workspace-root .brp file at load time. The standard library and package
+-- roots (always small and required for import resolution) still load eagerly.
+-- Deferred workspace-root text is filled in on demand, per file, when a
+-- document is opened or when an interactive analysis wave finds an
+-- unresolved import that resolves to a workspace-root path (see
+-- `fill_missing_workspace_sources`). The native LSP server sets this so
+-- `initialize` never pays for a whole-repository scan; tests that construct
+-- a `SourceLoadRequest` directly keep the original eager behavior.
 record SourceLoadEnvironment {
 	working_directory: String,
 	std_override: Option[String],
 	package_cache_root: String,
-	policy: SourceDiscoveryPolicy
+	policy: SourceDiscoveryPolicy,
+	defer_workspace_root_sources: Bool
 }
 
 
@@ -115,7 +140,8 @@ func process_source_load_environment() -> SourceLoadEnvironment:
 		package_cache_root = nonempty_environment_path(
 			BLORP_PACKAGE_CACHE_ENVIRONMENT_VARIABLE,
 		).get_or(default_package_cache_root()),
-		policy = DEFAULT_SOURCE_DISCOVERY_POLICY
+		policy = DEFAULT_SOURCE_DISCOVERY_POLICY,
+		defer_workspace_root_sources = True
 	}
 
 
@@ -161,7 +187,8 @@ record SourceLoadRequest {
 	initialization: InitializeParameters,
 	std_override: Option[String],
 	package_cache_root: String,
-	policy: SourceDiscoveryPolicy
+	policy: SourceDiscoveryPolicy,
+	defer_workspace_root_sources: Bool
 }
 
 
@@ -174,7 +201,8 @@ pure func source_load_request(
 		initialization = initialization,
 		std_override = environment.std_override,
 		package_cache_root = environment.package_cache_root,
-		policy = environment.policy
+		policy = environment.policy,
+		defer_workspace_root_sources = environment.defer_workspace_root_sources
 	}
 
 
@@ -818,18 +846,19 @@ func load_sources(request: SourceLoadRequest) -> Result[SourceLoadResult, FatalS
 			seen_paths = appended[1]
 			issues = issues.concat(appended[2])
 
-	for root in roots:
-		loaded = load_filesystem_tree(
-			root.canonical_path,
-			root.client_path,
-			"",
-			FixedFilesystemSourceProvenance(DiskSource),
-			request.policy,
-		)
-		appended = append_unique_loaded_sources(sources, seen_paths, loaded)
-		sources = appended[0]
-		seen_paths = appended[1]
-		issues = issues.concat(appended[2])
+	if not request.defer_workspace_root_sources:
+		for root in roots:
+			loaded = load_filesystem_tree(
+				root.canonical_path,
+				root.client_path,
+				"",
+				FixedFilesystemSourceProvenance(DiskSource),
+				request.policy,
+			)
+			appended = append_unique_loaded_sources(sources, seen_paths, loaded)
+			sources = appended[0]
+			seen_paths = appended[1]
+			issues = issues.concat(appended[2])
 
 	Ok({
 		configuration = {
@@ -855,3 +884,163 @@ func load_workspace(request: SourceLoadRequest) -> Result[LoadedWorkspace, Fatal
 		workspace = workspace,
 		issues = loaded.issues,
 	})
+
+
+-- On-demand fill for workspace-root sources deferred at load time. Frontend
+-- import resolution never reads disk (see analysis/frontend_graph.brp); this
+-- effect boundary keeps that true by reading the handful of files an
+-- analysis wave's roots actually need *before* resolution runs, rather than
+-- letting resolution itself touch the filesystem.
+private LAZY_FILL_MAX_ROUNDS: Int = 64
+
+
+private pure func lazy_import_source_filename(requested_path: String) -> String:
+	if requested_path.ends_with(BLORP_SOURCE_EXTENSION):
+		requested_path
+	else:
+		requested_path + BLORP_SOURCE_EXTENSION
+
+
+-- Mirrors the compiler's own relative/bare import path rule (see
+-- `source_path_for_import` in stage_04_modules/frontend_import_plan.brp):
+-- a non-package import is looked up relative to the importer's own file,
+-- not to some separate module root.
+private pure func lazy_import_candidate_path(importer_path: String, requested_path: String) -> String:
+	normalize(join(dirname(importer_path), lazy_import_source_filename(requested_path)))
+
+
+private pure func importer_source_path(
+	sources: SourceStore,
+	identity: ResolvedModuleIdentity,
+) -> Option[String]:
+	matches = source_store_values(sources).filter_map(func(layers):
+		match source_snapshot_for_layers(layers):
+			Some(snapshot):
+				source = source_snapshot_source(snapshot)
+				candidate_identity = resolved_module_identity_from_resolver(
+					source.module_name,
+					source_snapshot_origin(snapshot),
+				)
+
+				if resolved_module_identities_equal(candidate_identity, identity):
+					Some(source.path)
+				else:
+					None
+			None:
+				None
+	)
+	matches.get(0)
+
+
+private pure func edge_importer_is_user_module(edge: FrontendImportEdge) -> Bool:
+	match resolved_module_origin(edge.importer):
+		UserModule:
+			True
+		_:
+			False
+
+
+private func load_candidate_for_edge(
+	configuration: WorkspaceConfiguration,
+	sources: SourceStore,
+	edge: FrontendImportEdge,
+) -> Option[DiscoveredSourceSnapshot]:
+	if not edge_importer_is_user_module(edge) or edge.requested_path.starts_with("pkg/"):
+		None
+	else:
+		match importer_source_path(sources, edge.importer):
+			None:
+				None
+			Some(importer_path):
+				candidate_path: String = lazy_import_candidate_path(importer_path, edge.requested_path)
+
+				if not file_exists(candidate_path):
+					None
+				else:
+					match canonical_existing_path(candidate_path):
+						Err(_):
+							None
+						Ok(canonical_path):
+							root_match = configuration.workspace_roots.find(func(root):
+								path_is_under(root.canonical_path, canonical_path)
+							)
+
+							match root_match:
+								None:
+									None
+								Some(root):
+									match relative_path_from(root.canonical_path, canonical_path):
+										None:
+											None
+										Some(relative_path):
+											module_name: String = module_name_from_relative_path(
+												relative_path,
+											)
+											uri_path: String = normalize(join(root.client_path, relative_path))
+
+											match file_uri_from_path(uri_path):
+												Err(_):
+													None
+												Ok(uri):
+													if source_store_contains(sources, uri):
+														None
+													else:
+														match read_source_text(canonical_path):
+															Err(_):
+																None
+															Ok(text):
+																Some({
+																	uri = uri,
+																	layer = discovered_source_layer(
+																		source_file(
+																			canonical_path,
+																			module_name,
+																			text,
+																		),
+																		DiskSource,
+																	)
+																})
+
+
+-- Repeatedly discovers the frontend import graph for `roots` against the
+-- current sources, and for each unresolved import that resolves to a real
+-- workspace-root path, reads that one file and adds it. Stops when a round
+-- adds nothing new (including genuinely missing modules, left unresolved for
+-- normal diagnostics), so the cost is proportional to the roots' transitive
+-- import closure rather than the whole workspace.
+func fill_missing_workspace_sources(
+	configuration: WorkspaceConfiguration,
+	sources: SourceStore,
+	roots: List[ResolvedModuleIdentity],
+) -> SourceStore:
+	var current: SourceStore = sources
+	var round: Int = 0
+	var continue_filling: Bool = True
+
+	while continue_filling and round < LAZY_FILL_MAX_ROUNDS:
+		match frontend_graph_for_roots(current, roots):
+			Err(_):
+				continue_filling = False
+			Ok(snapshot):
+				unresolved_edges = frontend_graph_import_edges(snapshot.graph).filter(func(edge):
+					match edge.resolution:
+						FrontendUnresolvedImport:
+							True
+						_:
+							False
+				)
+				var added: Bool = False
+
+				for edge in unresolved_edges:
+					match load_candidate_for_edge(configuration, current, edge):
+						Some(discovered):
+							current = set_discovered_source(current, discovered)
+							added = True
+						None:
+							void
+
+				continue_filling = added
+
+		round += 1
+
+	current

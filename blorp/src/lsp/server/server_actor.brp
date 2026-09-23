@@ -115,10 +115,12 @@ import:
 		workspace_snapshot,
 	../workspace/workspace_model:
 		WorkspaceConfiguration,
+		WorkspaceConfigurationUpdate,
 		WorkspaceEvent(
 			DiskSourceRemoved,
 			DiskSourceUpdated,
 			ResolvedDocumentOpened,
+			WorkspaceConfigurationChanged,
 			WorkspaceDocumentChanged,
 			WorkspaceDocumentClosed,
 			WorkspaceDocumentSaved,
@@ -136,6 +138,7 @@ import:
 			ClearDiagnostics,
 			ExitServer,
 			LoadWorkspace,
+			LoadWorkspaceRootSources,
 			OperationalEnvelopeReady,
 			PublishDiagnostics,
 			RefreshSavedSource,
@@ -155,6 +158,7 @@ import:
 			ServerSavedSourceUpdated,
 			ServerSourceLoadFailed,
 			ServerSourceLoadSucceeded,
+			ServerWorkspaceRootSourcesLoaded,
 		),
 		SourceLoadToken,
 		source_load_token,
@@ -804,7 +808,21 @@ private pure func apply_source_load_success(
 				analysis_planning = AnalysisPlanRequired,
 				diagnostics_to_clear = []
 			}
-			prefix = [SendMessage(response)] + issue_effects
+			-- `initialize` only indexed paths (std/packages loaded, workspace-root
+			-- disk sources deferred). Kick off the full workspace-root scan now,
+			-- off the response path: it lands later as
+			-- ServerWorkspaceRootSourcesLoaded and is merged in like any other
+			-- disk change, so features that need the whole tree (workspace-wide
+			-- diagnostics) still get it without `initialize` paying for it.
+			background_load_request = { source_load_request(
+					loading.source_load_environment,
+					loading.initialization.parameters,
+				) |
+				defer_workspace_root_sources = False
+			}
+			prefix = [SendMessage(response)] + issue_effects + [
+				LoadWorkspaceRootSources(background_load_request),
+			]
 
 			match plan_analysis(transition):
 				Err(error):
@@ -1204,5 +1222,28 @@ pure func apply_server_event(
 						apply_completion_to_actor(ready, completion)
 					else:
 						actor_transition(state, [])
+				ServerWorkspaceRootSourcesLoaded(sources, issues):
+					if lifecycle_running_initialization(ready.lifecycle).is_none():
+						actor_transition(state, [])
+					else:
+						match server_workspace_configuration(state):
+							None:
+								actor_transition(state, [])
+							Some(configuration):
+								update: WorkspaceConfigurationUpdate = {
+									configuration = configuration,
+									sources = sources
+								}
+
+								match apply_workspace_change(ready, WorkspaceConfigurationChanged(update)):
+									Err(error):
+										Err(error)
+									Ok(transition):
+										issue_effects: List[ServerEffect] = if issues.is_empty():
+											[]
+										else:
+											[ReportSourceLoadIssues(issues)]
+
+										Ok({ transition | effects = issue_effects + transition.effects })
 		NativeExited(_):
 			actor_transition(state, [])

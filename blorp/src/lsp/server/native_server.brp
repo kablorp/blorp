@@ -49,12 +49,17 @@ import:
 		),
 	../workspace/document_model: OpenedDocument
 	../workspace/source_loader:
+		SourceLoadIssue,
 		SourceLoadRequest,
+		fill_missing_workspace_sources,
+		load_sources,
 		load_workspace,
 		process_source_load_environment,
 		refresh_saved_source,
 		resolve_open_document,
-	../workspace/workspace_model: SavedSourceRefresh(SavedSourceRemoved, SavedSourceUpdated)
+	../workspace/workspace_model:
+		DiscoveredSourceSnapshot,
+		SavedSourceRefresh(SavedSourceRemoved, SavedSourceUpdated)
 	channel: Channel, channel, recv, recv_timeout, seal, send, send_timeout
 	io: print_error
 	json: JsonValue
@@ -75,6 +80,7 @@ import:
 			ClearDiagnostics,
 			ExitServer,
 			LoadWorkspace,
+			LoadWorkspaceRootSources,
 			OperationalEnvelopeReady,
 			PublishDiagnostics,
 			RefreshSavedSource,
@@ -94,6 +100,7 @@ import:
 			ServerSavedSourceUpdated,
 			ServerSourceLoadFailed,
 			ServerSourceLoadSucceeded,
+			ServerWorkspaceRootSourcesLoaded,
 		),
 		SourceLoadToken,
 
@@ -122,6 +129,7 @@ private CLEAN_EXIT_STATUS: Int = 0
 foreign(include: "native_runtime.h"):
 	func require_lsp_compiler_worker_stack() -> Bool = "blorp_compiler_require_fiber_stack_size"
 	func exit_lsp_process(status: Int) -> Void = "blorp_compiler_lsp_exit_now"
+	func lower_background_thread_priority() -> Void = "blorp_compiler_lower_background_thread_priority"
 
 
 private union NativeProcessEvent:
@@ -129,6 +137,7 @@ private union NativeProcessEvent:
 	NativeInputClosed
 	NativeInputFailed(String)
 	NativeAnalysisCompleted(AnalysisCompletion)
+	NativeWorkspaceRootSourcesLoaded(List[DiscoveredSourceSnapshot], List[SourceLoadIssue])
 
 
 private union NativeWriterOutcome:
@@ -152,6 +161,7 @@ private record NativeRuntimeChannels {
 	events: Channel[NativeProcessEvent],
 	workspace_analysis_requests: Channel[AnalysisRequest],
 	interactive_analysis_requests: Channel[AnalysisRequest],
+	workspace_source_load_requests: Channel[SourceLoadRequest],
 	outbound_bodies: Channel[String],
 	writer_done: Channel[NativeWriterOutcome]
 }
@@ -233,6 +243,21 @@ private func native_reader(events: Channel[NativeProcessEvent]) -> Void:
 				reading = False
 
 
+-- Deferred workspace-root sources are filled lazily, per analysis wave, right
+-- before the request reaches the analysis worker fiber: the worker itself
+-- only performs pure resolution over an already-materialized SourceStore
+-- (see workspace/source_loader.brp's fill_missing_workspace_sources).
+private func filled_analysis_request(request: AnalysisRequest) -> AnalysisRequest:
+	filled_sources = fill_missing_workspace_sources(
+		request.plan.workspace.configuration,
+		request.plan.workspace.sources,
+		request.plan.roots,
+	)
+	updated_workspace = { request.plan.workspace | sources = filled_sources }
+	updated_plan = { request.plan | workspace = updated_workspace }
+	{ request | plan = updated_plan }
+
+
 private func analysis_worker(
 	requests: Channel[AnalysisRequest],
 	events: Channel[NativeProcessEvent],
@@ -244,15 +269,46 @@ private func analysis_worker(
 			None:
 				working = False
 			Some(request):
+				-- Reported identity (token/plan) stays the original schedule;
+				-- only the compiled request's sources gain whatever this wave's
+				-- roots need, filled in here on the worker fiber so the
+				-- (potentially expensive) extra graph pass never blocks the
+				-- main actor loop.
 				scheduled: ScheduledAnalysis = {
 					token = request.cancellation_token,
 					plan = request.plan
 				}
 				completion: AnalysisCompletion = {
 					scheduled = scheduled,
-					result = run_compiler_analysis(request)
+					result = run_compiler_analysis(filled_analysis_request(request))
 				}
 				working = send_process_event(events, NativeAnalysisCompleted(completion))
+
+
+-- Runs the full (non-deferred) source load off the main actor loop: the
+-- whole-repository scan still happens, just not on `initialize`'s response
+-- path. Its result rejoins the actor as an ordinary workspace event (see
+-- ServerWorkspaceRootSourcesLoaded). Lowered QoS keeps this CPU-heavy scan
+-- from starving the reader/writer/analysis threads under contention.
+private func workspace_source_load_worker(
+	requests: Channel[SourceLoadRequest],
+	events: Channel[NativeProcessEvent],
+) -> Void:
+	lower_background_thread_priority()
+	var working: Bool = True
+
+	while working:
+		match recv(requests):
+			None:
+				working = False
+			Some(request):
+				event: NativeProcessEvent = match load_sources(request):
+					Ok(loaded):
+						NativeWorkspaceRootSourcesLoaded(loaded.sources, loaded.issues)
+					Err(_):
+						NativeWorkspaceRootSourcesLoaded([], [])
+
+				working = send_process_event(events, event)
 
 
 private func write_lsp_body(body: String) -> Result[Void, String]:
@@ -415,6 +471,11 @@ private func interpret_native_effect(
 	match effect:
 		LoadWorkspace(token, request):
 			apply_source_load_effect(state, token, request, runtime)
+		LoadWorkspaceRootSources(request):
+			if send(runtime.workspace_source_load_requests, request):
+				continue_step(state)
+			else:
+				failed_step(state, "native LSP workspace source loader stopped unexpectedly")
 		ResolveOpenDocument(document):
 			apply_open_resolution_effect(state, document, runtime)
 		RefreshSavedSource(uri):
@@ -530,6 +591,12 @@ private func native_actor(runtime: NativeRuntimeChannels) -> Int:
 							ServerAnalysisCompleted(completion),
 							runtime,
 						)
+					NativeWorkspaceRootSourcesLoaded(sources, issues):
+						apply_native_actor_event(
+							state,
+							ServerWorkspaceRootSourcesLoaded(sources, issues),
+							runtime,
+						)
 					NativeInputClosed:
 						match server_lifecycle(state):
 							Some(lifecycle):
@@ -559,6 +626,7 @@ private func native_actor(runtime: NativeRuntimeChannels) -> Int:
 
 	seal(runtime.workspace_analysis_requests)
 	seal(runtime.interactive_analysis_requests)
+	seal(runtime.workspace_source_load_requests)
 	status
 
 
@@ -587,6 +655,7 @@ func run_native_lsp_server() -> Int:
 			events = channel(EVENT_BUFFER_CAPACITY),
 			workspace_analysis_requests = channel(ANALYSIS_REQUEST_BUFFER_CAPACITY),
 			interactive_analysis_requests = channel(ANALYSIS_REQUEST_BUFFER_CAPACITY),
+			workspace_source_load_requests = channel(ANALYSIS_REQUEST_BUFFER_CAPACITY),
 			outbound_bodies = channel(OUTBOUND_BODY_BUFFER_CAPACITY),
 			writer_done = channel(WRITER_COMPLETION_BUFFER_CAPACITY)
 		}
@@ -594,5 +663,6 @@ func run_native_lsp_server() -> Int:
 		detach native_reader(runtime.events)
 		detach analysis_worker(runtime.workspace_analysis_requests, runtime.events)
 		detach analysis_worker(runtime.interactive_analysis_requests, runtime.events)
+		detach workspace_source_load_worker(runtime.workspace_source_load_requests, runtime.events)
 		detach native_writer(runtime)
 		finish_native_process(runtime, native_actor(runtime))
