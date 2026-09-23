@@ -9,7 +9,10 @@ oracle. Read [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md) first; its rules
 commit per task) apply throughout.
 
 Anchors are against main at `f7fb1cd6` (2026-09-22). Line numbers drift;
-grep for the name.
+grep for the name. Perceus was split into per-phase modules under
+`stage_09_core/perceus/` after that anchor (`53fd0c60`, `7dde2e17`), so
+anchors below give the current file and symbol name instead of a
+`perceus.brp` line number.
 
 ## What is true today
 
@@ -22,8 +25,9 @@ assignment version, so after it identity is the pair name plus `uniq` for
 reassigned locals and the bare name for everything else. Because that pair
 is not unique per binder, every pass that mints a synthetic variable bakes a
 counter or a source offset into the name string to keep it distinct (about
-thirty passes with a private `core_var(name)` helper: `perceus.brp:14216
-synthetic_binding_var`, `8706 mutable_assignment_temp_var`, `tuple_sroa.brp:227`,
+thirty passes with a private `core_var(name)` helper:
+`synthetic_binding_var` (`perceus/results_and_loops.brp`),
+`mutable_assignment_temp_var` (`perceus/mutable.brp`), `tuple_sroa.brp:227`,
 `tailrec.brp:829`, `ssa.brp:1215`, `std_inline.brp:471`, `match_projection.brp:1226`,
 `record_update.brp:519`, the `synth_*` files), and the C identifier is
 derived from the name alone (`stage_10_backend/emit.brp` `c_var_name`, via
@@ -31,18 +35,20 @@ derived from the name alone (`stage_10_backend/emit.brp` `c_var_name`, via
 
 Consequences that this migration removes:
 
-- Perceus resolves ownership by name. `count_uses` (`perceus.brp:5032`),
-  `summarize_linear_ownership_uses` and its non-binding variant
-  (`4887`, `4286`), `rewrite_mutable_assignments` (`11337`) and
-  `protect_repeated_consumes` (`13467`) match `variable.name == name`.
-  `BorrowedOwnerCatalog` (`811-816`) keys candidates by name and sets
+- Perceus resolves ownership by name. `count_uses`
+  (`stage_09_core/perceus/uses.brp`), `summarize_linear_ownership_uses` and
+  its non-binding variant (`perceus/uses.brp`),
+  `rewrite_mutable_assignments` (`perceus/mutable.brp`) and
+  `protect_repeated_consumes` (`perceus/protect.brp`) match
+  `variable.name == name`. `BorrowedOwnerCatalog` (`perceus/borrowed.brp`,
+  `build_borrowed_owner_catalog`) keys candidates by name and sets
   `has_unresolved_identity` whenever any parameter has `def_id = None`,
   which is every ordinary parameter, so `borrow_expr_aliases_param`
-  (`4025`) takes the name-only scan on nearly every region.
+  (`perceus/borrowed.brp`) takes the name-only scan on nearly every region.
 - Closure capture is by name. `FreeVar` (`closure.brp:242`) and
   `CoreClosureCapture` (`ir.brp:1145`) carry `{ name, typ }`;
-  `free_vars_expr` (`1797`) checks a `List[String]` of bound names; the
-  name-only comparison `same_var_name` (`2710`) is required there because
+  `free_vars_expr` checks a `List[String]` of bound names; the name-only
+  comparison `same_var_name` (`closure.brp:2069`) is required there because
   callers run shadow checks before descending.
 - DCE's value index (`dce.brp:237-244`) is keyed by `(def_id, uniq)`, so a
   local with `def_id = None` is never deduplicated.
@@ -56,6 +62,37 @@ declarations after DCE, recycling ids of deleted declarations. That change
 altered closure symbol names in the emitted C; identity was proven with
 `benchmarks/normalize_generated_c_symbols`, which is the oracle for any step
 that changes id allocation.
+
+Also landed since, and referenced by steps 3 and 5 below: `bde1af38` moved
+the ownership-contract solve (`build_env`, `infer_user_call_contracts`) out
+of Perceus into its own pass, `stage_09_core/ownership_contracts.brp`,
+which publishes `OwnershipContractFacts` on `CorePassState` for Perceus to
+read; `31e61487` removed the engine-metrics hooks that allocated a record
+per visit in the ownership-use summary, on the release path, even with
+metrics off.
+
+## Landed (steps 0-2)
+
+- **Step 0 — Perceus per-helper allocation profile**: `370f0abb`. Table and
+  profile program in
+  `benchmarks/results/perceus_allocation_attribution_2026-09-22.md`; sizes
+  steps 3 and 5.
+- **Step 1 — lowering mints a unique `uniq` per binder**: `54a4e6ef`.
+  Byte-identical C; every binder has a distinct `(name, uniq)` pair inside
+  its function.
+- **Step 2 — binder-identity check before Perceus**: `908d8458`. This
+  landed in **report-only mode**: `--check-invariants` prints an
+  `identity: ...` line per violation (pass, function, binder kind) to
+  stderr and the pipeline continues; it exits 0 even when violations are
+  found (68,947 of them on the frozen self-compile today). Set
+  `BLORP_IDENTITY_CONTRACT=strict` to make the contract fatal — it stops at
+  the first violation and exits 1. The commit message is explicit that
+  strict mode cannot pass cleanly on the real self-compile until steps 3-5
+  land: match's arm desugaring and Perceus's borrow-argument handling each
+  duplicate an existing binder's exact `(name, uniq)` into a second binder
+  site instead of minting a fresh one. Do not read step 2 as an enforced
+  invariant — it is a diagnostic until a later step flips
+  `BLORP_IDENTITY_CONTRACT=strict` on by default.
 
 ## Lessons that shape every step
 
@@ -110,106 +147,35 @@ compiler-core-sanitize`. The `BLORP_GATE_RESULT` line is the verdict.
 
 ## Steps
 
+Steps 0-2 have landed; see "Landed (steps 0-2)" above. Steps 3-6 remain.
+
 | # | Step | Gate to start | Oracle | Expected effect |
 | --- | --- | --- | --- | --- |
-| 0 | Perceus per-helper allocation profile | none | n/a | the table that sizes 3 and 5 |
-| 1 | Lowering mints a unique `uniq` per binder | `perf/lowering-type-sharing` landed | identical C | complete identity at Core entry; instructions flat |
-| 2 | Contract before Perceus | 1 landed | identical C | any pass that mints without identity fails loudly |
 | 3 | Perceus keys by identity | 0 and 2 landed; 0 names the helpers | identical C | whatever 0 measured; correctness under shadowing |
 | 4 | Closure captures carry identity | 2 landed | identical C | string compares gone; latent shadowing bugs closed |
 | 5 | Synthetic binders from the shared allocator, no name baking | 2 landed; 0 counts the strings | identical C until 6 | the synthetic-name strings 0 counted |
 | 6 | C identifiers from identity; spellings in one table | 5 landed | normalized C plus runtime, leak, sanitizer gates | strings out of Core |
 
-Steps 3 and 4 can run in parallel after 2. Step 5 can run alongside 3 if it
-avoids `perceus.brp`.
-
-### Step 0: Perceus per-helper allocation profile
-
-Build `benchmarks/compiler_perceus_allocations` and
-`benchmarks/profiles/perceus_allocations.brp` on the DCE model. Run
-`insert_drops_program` (`perceus.brp:26165`) on the frozen self-compile's
-late Core (dump it with `--dump-core-after=dict_literal_ownership`, the pass
-before Perceus, and load it through the Core JSON decoder in `ir.brp`, or
-drive the pipeline to that point in the profile program; say which). Report
-calls, allocations and allocations per call for at least: `build_env`
-(`1479`) and `infer_user_call_contracts` (`21236`); `build_borrowed_owner_catalog`
-(`22156`) and the number of regions it is built for; `count_uses` and its
-`count_uses_in_*` helpers (`2308-2495`); the two `summarize_linear_ownership_uses`
-variants and `summarize_linear_call` (`2730`) with the frame stack they push;
-`rewrite_mutable_assignments` and `mutable_assignment_temp_var`; `protect_repeated_consumes`;
-`stabilize_nested_assignment_rhs` (`10239`); `schedule_contract_linear` (`19506`);
-`normalize_borrowed_boundaries` (`24625`); `synthetic_binding_var` and every
-other `CoreVar` constructor in the file (`5435`, `8703`, `14216`, `14929`,
-`14937`); and the `OwnershipUseSummary` records built per node (`2000-2005`).
-Also count the fallbacks the existing `perceus_work_*` counters expose
-(`250-300`, consumed by `work_profile.brp`), split by cause: missing
-identity, unsupported shape, missing ownership summary.
-
-Deliverable: `benchmarks/results/perceus_allocation_attribution_<date>.md`
-with the table and the exact commands, plus the profile program, as one
-commit with no production change. Then write, at the top of that file, the
-go/no-go for step 3 and step 5: which helpers exceed 5% of the Perceus row
-and whether identity or name strings are among them.
-
-### Step 1: lowering mints a unique `uniq` per binder
-
-Where: `core_var` (`lower.brp:630`) and the 73 sites that call it;
-`core_lower_params` / `core_lower_param` (`4806-4829`) for parameters;
-the binder sites for `let`, match bindings, loop binders, lambda parameters
-and the record-update temp at `2017-2021` (which sets `uniq` to a source
-offset today). `CoreLowerContext` (`473`) gains a `next_uniq: Int` counter,
-minted per binder from 1 upward, and a scope stack keyed by the source name
-id (the typed AST's `ParsedIdentifier` carries only text; resolve the id at
-the lowering boundary through the same source-name table typecheck uses, or
-a per-function `Dict[String, List[Int]]` if that table is not reachable; say
-which and why) so a use resolves to the innermost binder's `uniq`. Shadowing
-therefore yields different pairs. The SSA desugar (`ssa.brp:1215
-fresh_version`) keeps minting fresh versions, seeded above the lowering
-counter, so a version never collides with a binder id. Globals and callables
-keep `uniq = 0` and their `def_id`.
-
-Oracle: byte-identical C on both programs. Every pass compares by
-`core_var_equal` (name plus `uniq`) today, and today every local has
-`uniq = 0` except SSA versions, so this is the one step where a mistake
-shows as a diff immediately: a use bound to the wrong binder changes the
-pair and downstream passes change their answer. Tests: extend
-`test_core_lower.brp` with shadowing in nested scopes, a match binding
-shadowing a parameter, a lambda parameter shadowing a `let`, and a loop
-binder reused after the loop, asserting the `uniq` values on binders and
-uses. `test_core_json.brp` must still round-trip.
-
-Expected effect: none on allocations (an Int field per var already exists).
-Instructions flat. The value is the invariant step 2 asserts.
-
-### Step 2: contract before Perceus
-
-A debug-only check in `pass_runner.brp`, gated by `--check-invariants`
-(the existing `control.check_invariants`), run before the Perceus pass:
-every binder in a function has a distinct pair, every `VarExpr` names a
-binder in scope or a global or callable with a `def_id`, and no two binders
-in a function share a `uniq` unless one is an SSA version of the other. It
-fails with the function name, the binder kind and the location. The
-`--check-invariants` self-compile is the acceptance run (the string-operator
-desugar failure that blocked that run was fixed in `30998844`). Also add the
-same check after each pass that mints binders, so the pass that forgets the
-allocator is named, not Perceus.
-
-Oracle: identical C (no production change). Expected effect: none;
-correctness.
+Their gates on step 0 and step 2 are already satisfied. Next unblocked:
+3 and 4 in parallel (gated on 2, which has landed), 5 alongside if it
+avoids `perceus/*.brp`, 6 after 5.
 
 ### Step 3: Perceus keys by identity
 
 Only the helpers step 0 named. Candidates: `count_uses` and the
-`summarize_linear_ownership_uses` family take a `CoreVar` and compare with
-`core_var_equal`; `rewrite_mutable_assignments` and
-`protect_repeated_consumes` stop dropping to `target.name`;
-`BorrowedOwnerCatalog.candidate_ids_by_name` becomes a list indexed by
-`uniq` within the region (or a `Dict[Int, List[Int]]` if the range is
-sparse; measure); `has_unresolved_identity` and the alias fallback that
-exists only for it are deleted, and the fallbacks for unsupported shapes
-stay, now counted separately by the `perceus_work_*` counters. Do not
-convert `PerceusEnv`'s global and constructor lookups here; they are keyed
-by declaration names, not variables, and they are built once.
+`summarize_linear_ownership_uses` family (`perceus/uses.brp`) take a
+`CoreVar` and compare with `core_var_equal`; `rewrite_mutable_assignments`
+(`perceus/mutable.brp`) and `protect_repeated_consumes`
+(`perceus/protect.brp`) stop dropping to `target.name`;
+`BorrowedOwnerCatalog.candidate_ids_by_name` (`perceus/borrowed.brp`)
+becomes a list indexed by `uniq` within the region (or a
+`Dict[Int, List[Int]]` if the range is sparse; measure);
+`has_unresolved_identity` (`perceus/borrowed.brp`) and the alias fallback
+that exists only for it are deleted, and the fallbacks for unsupported
+shapes stay, now counted separately by the `perceus_work_*` counters
+(`perceus/work_counters.brp`). Do not convert `PerceusEnv`'s global and
+constructor lookups here; they are keyed by declaration names, not
+variables, and they are built once.
 
 Oracle: byte-identical C on both programs. If a helper's rewrite changes
 the C, the old name-based answer and the new identity-based answer differ on
@@ -259,8 +225,8 @@ with their own `match expr:` will find the rest.
 
 Oracle: normalized C plus the full gates; the diagnostic fixtures under
 `blorp/test/compiler` must print the same text. Expected effect: strings out
-of Core; the remaining `Dict[String` in `perceus.brp`, `closure.brp` and
-`dce.brp` that key on variables are gone.
+of Core; the remaining `Dict[String` in `stage_09_core/perceus/*.brp`,
+`closure.brp` and `dce.brp` that key on variables are gone.
 
 ## What this roadmap does not include
 

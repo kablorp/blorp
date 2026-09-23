@@ -794,10 +794,12 @@ completion), scope-chain lookups by name (`scope_lookup` 4.4M,
 (`scope_add_symbol` 200k calls, real but small).
 
 Tasks, ranked: (1) zonk reuses unchanged nodes and skips bodies with no
-metas (task `perf/zonk-reuse`, in flight); (2) resolve each identifier
-occurrence once by definition id instead of re-walking the scope chain by
-name; (3) key the id-indirection chain directly (a facts change shared
-with header completion); (4) the scope insert, only alongside (2).
+metas (task `perf/zonk-reuse`: the skip-when-no-metas cut landed, `a92f30bda`;
+the per-node reuse cut is parked on that branch — see Results); (2) resolve
+each identifier occurrence once by definition id instead of re-walking the
+scope chain by name; (3) key the id-indirection chain directly (a facts
+change shared with header completion); (4) the scope insert, only alongside
+(2).
 
 ## Results
 
