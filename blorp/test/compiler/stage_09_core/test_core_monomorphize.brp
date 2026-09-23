@@ -1,7 +1,7 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(SelectedDirectCall),
-		CoreDecl(FunctionDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreExpr(CallExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
@@ -195,6 +195,147 @@ func test_reports_unresolved_call_in_monomorphic_body() -> Bool:
 			False
 
 
+func test_conflict_precedes_earlier_unresolved_call_with_exact_message() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	string_type: CoreType = named_type("String")
+	option_t: CoreType = option_type(t)
+	make: CoreFunction = function(
+		"make",
+		10,
+		["T"],
+		[],
+		option_t,
+		variable("None", option_t),
+	)
+	same: CoreFunction = function(
+		"same",
+		11,
+		["T"],
+		[param("left", t), param("right", t)],
+		t,
+		variable("left", t),
+	)
+	unresolved_loc: CoreSourceLoc = source_loc(17)
+	main: CoreFunction = function(
+		"main",
+		20,
+		[],
+		[],
+		option_t,
+		selected_call("make", 10, [], [], option_t, unresolved_loc),
+	)
+	conflict_loc: CoreSourceLoc = source_loc(23)
+	later: CoreFunction = function(
+		"later",
+		30,
+		["U"],
+		[],
+		int_type,
+		selected_call(
+			"same",
+			11,
+			[int_type, string_type],
+			[variable("left", int_type), variable("right", string_type)],
+			int_type,
+			conflict_loc,
+		),
+	)
+
+	match monomorphize_program(
+		program([
+			FunctionDecl(make),
+			FunctionDecl(same),
+			FunctionDecl(main),
+			FunctionDecl(later),
+		]),
+		100,
+	):
+		Err(CoreMonoConflictingTypeArguments(name, loc)):
+			(
+				name == "same"
+					and loc == conflict_loc
+					and core_mono_diagnostic_message(
+						CoreMonoConflictingTypeArguments(name, loc),
+					) == "Conflicting type arguments for generic function 'same'"
+			)
+		_:
+			False
+
+
+func test_generic_impl_conflict_precedes_global_unresolved_call() -> Bool:
+	t: CoreType = type_parameter("T")
+	int_type: CoreType = named_type("Int")
+	string_type: CoreType = named_type("String")
+	option_t: CoreType = option_type(t)
+	make: CoreFunction = function(
+		"make",
+		10,
+		["T"],
+		[],
+		option_t,
+		variable("None", option_t),
+	)
+	same: CoreFunction = function(
+		"same",
+		11,
+		["T"],
+		[param("left", t), param("right", t)],
+		t,
+		variable("left", t),
+	)
+	unresolved_loc: CoreSourceLoc = source_loc(27)
+	conflict_loc: CoreSourceLoc = source_loc(31)
+	global: CoreDecl = GlobalDecl({
+		name = named_var("value", Some(40)),
+		source_module = None,
+		typ = option_t,
+		init = selected_call("make", 10, [], [], option_t, unresolved_loc),
+		is_mutable = False,
+		is_const = True,
+		is_private = False,
+		def_id = 40,
+		loc = unresolved_loc
+	})
+	method: CoreFunction = function(
+		"later",
+		30,
+		["U"],
+		[],
+		int_type,
+		selected_call(
+			"same",
+			11,
+			[int_type, string_type],
+			[variable("left", int_type), variable("right", string_type)],
+			int_type,
+			conflict_loc,
+		),
+	)
+	impl: CoreDecl = ImplDecl({
+		trait_name = "Marker",
+		for_type = int_type,
+		type_params = [],
+		methods = [method],
+		loc = SyntheticSourceLoc
+	})
+
+	match monomorphize_program(
+		program([FunctionDecl(make), FunctionDecl(same), global, impl]),
+		100,
+	):
+		Err(CoreMonoConflictingTypeArguments(name, loc)):
+			(
+				name == "same"
+					and loc == conflict_loc
+					and core_mono_diagnostic_message(
+						CoreMonoConflictingTypeArguments(name, loc),
+					) == "Conflicting type arguments for generic function 'same'"
+			)
+		_:
+			False
+
+
 func test_duplicate_exact_identity_still_reports_unresolved_call() -> Bool:
 	t: CoreType = type_parameter("T")
 	option_t: CoreType = option_type(t)
@@ -249,7 +390,7 @@ func test_allows_unresolved_call_in_generic_body() -> Bool:
 	monomorphize_program(program([FunctionDecl(make), FunctionDecl(use)]), 100).is_ok()
 
 
-func test_accepts_concrete_return_type_evidence() -> Bool:
+func test_ordinary_success_survives_combined_diagnostic_scan() -> Bool:
 	t: CoreType = type_parameter("T")
 	int_type: CoreType = named_type("Int")
 	option_t: CoreType = option_type(t)
@@ -283,10 +424,21 @@ tests: TestSuite = {
 			test_reports_unresolved_call_in_monomorphic_body,
 		),
 		(
+			"conflict precedes earlier unresolved call with exact message",
+			test_conflict_precedes_earlier_unresolved_call_with_exact_message,
+		),
+		(
+			"generic impl conflict precedes global unresolved call",
+			test_generic_impl_conflict_precedes_global_unresolved_call,
+		),
+		(
 			"duplicate exact identity still reports unresolved call",
 			test_duplicate_exact_identity_still_reports_unresolved_call,
 		),
 		("allows unresolved call in generic body", test_allows_unresolved_call_in_generic_body),
-		("accepts concrete return type evidence", test_accepts_concrete_return_type_evidence),
+		(
+			"ordinary success survives combined diagnostic scan",
+			test_ordinary_success_survives_combined_diagnostic_scan,
+		),
 	]
 }

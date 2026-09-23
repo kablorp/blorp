@@ -977,6 +977,12 @@ private enum CoreMonoDiagnosticScan:
 	UnresolvedCallScan
 
 
+private record CoreMonoDiagnosticCandidates {
+	conflict: Option[CoreMonoDiagnostic],
+	unresolved: Option[CoreMonoDiagnostic]
+}
+
+
 private pure func indexed_function_matches_call(
 	generic_functions: CoreGenericFunctionIndex,
 	function_index: Int,
@@ -1077,28 +1083,36 @@ private pure func diagnostic_for_selected_call(
 			None
 
 
-private pure func find_expr_diagnostic(
-	scan: CoreMonoDiagnosticScan,
+private pure func find_expr_diagnostics(
 	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
 	expr: CoreExpr,
-) -> Option[CoreMonoDiagnostic]:
-	var found: Option[CoreMonoDiagnostic] = None
+) -> CoreMonoDiagnosticCandidates:
+	var conflict: Option[CoreMonoDiagnostic] = None
+	var unresolved: Option[CoreMonoDiagnostic] = None
 	var pending: List[CoreExpr] = [expr]
 	var index: Int = 0
 
 	while index < pending.length():
 		match pending.get(index):
 			Some(node):
-				found = diagnostic_for_selected_call(
-					scan,
+				conflict = diagnostic_for_selected_call(
+					ConflictingEvidenceScan,
 					generic_functions,
 					unresolved_type_params,
 					node,
 				)
 
-				if found.is_some():
+				if conflict.is_some():
 					break
+
+				if unresolved_type_params.is_empty() and unresolved.is_none():
+					unresolved = diagnostic_for_selected_call(
+						UnresolvedCallScan,
+						generic_functions,
+						unresolved_type_params,
+						node,
+					)
 
 				for child in CoreTraverse.immediate_core_expr_children(node):
 					pending = pending.append(child)
@@ -1107,72 +1121,91 @@ private pure func find_expr_diagnostic(
 
 		index += 1
 
-	found
+	{conflict = conflict, unresolved = unresolved}
 
 
-private pure func find_function_diagnostic(
-	scan: CoreMonoDiagnosticScan,
+private pure func find_function_diagnostics(
 	generic_functions: CoreGenericFunctionIndex,
 	inherited_type_params: List[String],
 	function: CoreFunction,
-) -> Option[CoreMonoDiagnostic]:
+) -> CoreMonoDiagnosticCandidates:
 	unresolved_type_params: List[String] = inherited_type_params.concat(function.type_params)
 
-	if scan == UnresolvedCallScan and not unresolved_type_params.is_empty():
-		None
-	else:
-		match function.body:
-			Some(body):
-				find_expr_diagnostic(scan, generic_functions, unresolved_type_params, body)
-			None:
-				None
+	match function.body:
+		Some(body):
+			find_expr_diagnostics(generic_functions, unresolved_type_params, body)
+		None:
+			{conflict = None, unresolved = None}
 
 
-private pure func find_program_diagnostic(
-	scan: CoreMonoDiagnosticScan,
+private pure func find_program_diagnostics(
 	generic_functions: CoreGenericFunctionIndex,
 	program: CoreProgram,
-) -> Option[CoreMonoDiagnostic]:
-	var found: Option[CoreMonoDiagnostic] = None
+) -> CoreMonoDiagnosticCandidates:
+	var conflict: Option[CoreMonoDiagnostic] = None
+	var unresolved: Option[CoreMonoDiagnostic] = None
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function):
-				found = find_function_diagnostic(scan, generic_functions, [], function)
+				found: CoreMonoDiagnosticCandidates = find_function_diagnostics(
+					generic_functions,
+					[],
+					function,
+				)
+				if conflict.is_none():
+					conflict = found.conflict
+				if unresolved.is_none():
+					unresolved = found.unresolved
 			GlobalDecl(global):
-				found = find_expr_diagnostic(scan, generic_functions, [], global.init)
+				found: CoreMonoDiagnosticCandidates = find_expr_diagnostics(
+					generic_functions,
+					[],
+					global.init,
+				)
+				if conflict.is_none():
+					conflict = found.conflict
+				if unresolved.is_none():
+					unresolved = found.unresolved
 			ImplDecl(impl):
 				inherited_type_params: List[String] = impl.type_params.map(
 					pure func(param): param.name,
 				)
 
 				for method in impl.methods:
-					found = find_function_diagnostic(
-						scan,
+					found: CoreMonoDiagnosticCandidates = find_function_diagnostics(
 						generic_functions,
 						inherited_type_params,
 						method,
 					)
+					if conflict.is_none():
+						conflict = found.conflict
+					if unresolved.is_none():
+						unresolved = found.unresolved
 
-					if found.is_some():
+					if conflict.is_some():
 						break
 			_:
 				void
 
-		if found.is_some():
+		if conflict.is_some():
 			break
 
-	found
+	{conflict = conflict, unresolved = unresolved}
 
 
 pure func validate_selected_generic_calls(program: CoreProgram) -> Option[CoreMonoDiagnostic]:
 	generic_functions: CoreGenericFunctionIndex = collect_generic_functions(program)
+	candidates: CoreMonoDiagnosticCandidates = find_program_diagnostics(
+		generic_functions,
+		program,
+	)
 
-	match find_program_diagnostic(ConflictingEvidenceScan, generic_functions, program):
+	match candidates.conflict:
 		Some(diagnostic):
 			Some(diagnostic)
 		None:
-			find_program_diagnostic(UnresolvedCallScan, generic_functions, program)
+			candidates.unresolved
 
 
 private pure func rewrite_sequence_self_references(
