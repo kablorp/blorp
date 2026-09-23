@@ -1123,6 +1123,109 @@ pure func test_conversion_rebuilds_only_the_spine_to_a_hoisted_lambda() -> Bool:
 			False
 
 
+-- Two sibling lambdas both close over a variable spelled "base", but the
+-- second lambda is nested inside a `let` that shadows "base" with a fresh
+-- binder (a different `uniq`, same name). Capture identity (step 4 of the
+-- Core id migration) means each hoisted closure's capture carries the
+-- `uniq` of the binder it actually references, not just the shared name.
+pure func shadowed_capture_program() -> CoreProgram:
+	outer_base: CoreVar = { name = "base", uniq = 7, def_id = None }
+	inner_base: CoreVar = { name = "base", uniq = 9, def_id = None }
+	outer_lambda: CoreExpr = LambdaExpr(
+		[local_param("x", int_type())],
+		int_type(),
+		BinaryExpr(
+			AddOp,
+			VarExpr(outer_base, int_type(), SyntheticSourceLoc),
+			VarExpr(local_var("x"), int_type(), SyntheticSourceLoc),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+	inner_lambda: CoreExpr = LambdaExpr(
+		[local_param("y", int_type())],
+		int_type(),
+		BinaryExpr(
+			AddOp,
+			VarExpr(inner_base, int_type(), SyntheticSourceLoc),
+			VarExpr(local_var("y"), int_type(), SyntheticSourceLoc),
+			int_type(),
+			SyntheticSourceLoc,
+		),
+		True,
+		closure_type(),
+		SyntheticSourceLoc,
+	)
+	body: CoreExpr = LetExpr(
+		local_var("first"),
+		False,
+		closure_type(),
+		outer_lambda,
+		LetExpr(
+			inner_base,
+			False,
+			int_type(),
+			LiteralExpr(IntLiteral(1), int_type(), SyntheticSourceLoc),
+			inner_lambda,
+		),
+	)
+	make_lambdas: CoreFunction = {
+		name = "make_lambdas",
+		source_module = None,
+		type_params = [],
+		params = [{ name = outer_base, typ = int_type(), loc = SyntheticSourceLoc }],
+		return_type = closure_type(),
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 30,
+		loc = SyntheticSourceLoc
+	}
+
+	{
+		decls = [FunctionDecl(make_lambdas)],
+		foreign_includes = []
+	}
+
+
+pure func closure_body_capture_matches(function_kind: CoreFunctionKind, expected_uniq: Int) -> Bool:
+	match function_kind:
+		ClosureBodyFunction(abi):
+			(
+				abi.captures.length() == 1
+				and abi.captures
+					.get(0)
+					.map(func(c): c.name == "base" and c.uniq == expected_uniq)
+					.get_or(False)
+			)
+		ProgramEntrypointFunction:
+			False
+		UserFunction:
+			False
+		BuiltinFunction(c_name):
+			False
+		UnresolvedBuiltinFunction:
+			False
+		ForeignFunction(_):
+			False
+
+
+pure func test_closure_capture_carries_identity_under_shadowing() -> Bool:
+	converted: CoreProgram = convert_program_for_test(shadowed_capture_program())
+
+	match converted.decls:
+		[FunctionDecl(_), FunctionDecl(outer_hoisted), FunctionDecl(inner_hoisted)]:
+			(
+				closure_body_capture_matches(outer_hoisted.function_kind, 7)
+				and closure_body_capture_matches(inner_hoisted.function_kind, 9)
+			)
+		_:
+			False
+
+
 pure func two_lambdas_and_a_task(base_def_id: Int, name_suffix: String) -> CoreFunction:
 	lambda_one: CoreExpr = LambdaExpr(
 		[local_param("x", int_type())],
@@ -1207,6 +1310,10 @@ tests: TestSuite = {
 			test_numbering_is_stable_across_two_functions_with_lambdas_and_a_task,
 		),
 		("hoists lambda to closure body", test_lambda_is_hoisted_to_closure_body),
+		(
+			"closure capture carries identity under shadowing",
+			test_closure_capture_carries_identity_under_shadowing,
+		),
 		(
 			"hoists lambda nested in semantic match",
 			test_semantic_match_lambda_is_hoisted_to_closure_body,

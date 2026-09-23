@@ -241,6 +241,7 @@ foreign:
 
 record FreeVar {
 	name: String,
+	uniq: Int,
 	typ: CoreType
 }
 
@@ -625,9 +626,13 @@ private pure func task_capture_moves_env_slot(capture: CoreTaskCapture) -> Bool:
 			False
 
 
+-- CoreTaskCapture has no identity yet (out of this step's scope: task
+-- captures are keyed by name only, see `same_var_name`/`expr_consumes_var`
+-- below); `uniq = 0` is a placeholder, not a real binder identity.
 private pure func closure_capture_from_task_capture(capture: CoreTaskCapture) -> CoreClosureCapture:
 	{
 		name = capture.name,
+		uniq = 0,
 		typ = capture.typ
 	}
 
@@ -696,11 +701,17 @@ private pure func add_bound_match_bindings(
 	result
 
 
-private pure func add_free_var(vars: List[FreeVar], name: String, typ: CoreType) -> List[FreeVar]:
+-- Identity dedup: name plus `uniq`, matching `core_var_equal`. Every `uniq`
+-- is distinct per binder within a function (step 1), so two free
+-- occurrences with equal name and `uniq` are always the same originating
+-- variable; this can only be stricter than the old name-only dedup, never
+-- looser, so it cannot introduce a new capture the old code would have
+-- merged away.
+private pure func add_free_var(vars: List[FreeVar], name: String, uniq: Int, typ: CoreType) -> List[FreeVar]:
 	var exists: Bool = False
 
 	for existing in vars:
-		if existing.name == name:
+		if existing.name == name and existing.uniq == uniq:
 			exists = True
 			break
 		else:
@@ -711,6 +722,7 @@ private pure func add_free_var(vars: List[FreeVar], name: String, typ: CoreType)
 	else:
 		free_var: FreeVar = {
 			name = name,
+			uniq = uniq,
 			typ = typ
 		}
 		vars.append(free_var)
@@ -720,7 +732,7 @@ private pure func merge_free_vars(left: List[FreeVar], right: List[FreeVar]) -> 
 	var result: List[FreeVar] = left
 
 	for item in right:
-		result = add_free_var(result, item.name, item.typ)
+		result = add_free_var(result, item.name, item.uniq, item.typ)
 
 	result
 
@@ -1159,6 +1171,7 @@ private pure func free_vars_expr(
 			else:
 				free_var: FreeVar = {
 					name = variable.name,
+					uniq = variable.uniq,
 					typ = typ
 				}
 				[free_var]
@@ -1225,7 +1238,7 @@ private pure func free_vars_expr(
 				if bound.contains(capture.name):
 					void
 				else:
-					result = add_free_var(result, capture.name, capture.typ)
+					result = add_free_var(result, capture.name, capture.uniq, capture.typ)
 
 			result
 		ListConstructExpr(construct, typ, loc):
@@ -1406,11 +1419,14 @@ private pure func free_vars_expr(
 		DetachExpr(detached, typ, loc):
 			var result: List[FreeVar] = []
 
+			-- `detached.captures` is `List[CoreTaskCapture]`, which has no
+			-- identity yet (out of this step's scope); 0 is a placeholder,
+			-- matching `closure_capture_from_task_capture`.
 			for capture in detached.captures:
 				if bound.contains(capture.name):
 					void
 				else:
-					result = add_free_var(result, capture.name, capture.typ)
+					result = add_free_var(result, capture.name, 0, capture.typ)
 
 			result
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
@@ -1777,7 +1793,7 @@ private pure func captures_from_body(
 	var result: List[FreeVar] = []
 
 	for free_var in free_vars_expr(facts, local_bound, body):
-		result = add_free_var(result, free_var.name, free_var.typ)
+		result = add_free_var(result, free_var.name, free_var.uniq, free_var.typ)
 
 	result
 
@@ -2013,6 +2029,7 @@ private pure func core_expr_type(expr: CoreExpr) -> CoreType:
 private pure func closure_capture_from_free_var(free_var: FreeVar) -> CoreClosureCapture:
 	{
 		name = free_var.name,
+		uniq = free_var.uniq,
 		typ = free_var.typ
 	}
 
