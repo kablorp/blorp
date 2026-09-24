@@ -15,14 +15,45 @@ the oracle is behavioural (runtime, leak, sanitizer, codegen-audit,
 compiler suites) plus the measured effect, never byte identity, except where
 a step says otherwise.
 
-Anchors are against main at `dab2f490` (2026-09-23).
+Historical source anchors are against main at `dab2f490` (2026-09-23). The
+original hypotheses and estimates below are preserved for context; for S1-S3
+they are superseded by the measured status and decisions that follow. S4 and
+S5 remain proposals requiring their stated dependencies and fresh evidence.
 
 Companions: [`CORE_NODE_TABLE_ROADMAP.md`](CORE_NODE_TABLE_ROADMAP.md) (N1
 owns the `CoreSourceLoc` conversion; S4 here does not repeat it) and
 [`TYPE_INTERNING_ROADMAP.md`](TYPE_INTERNING_ROADMAP.md) (I6 provides the
 name id that lets `CoreVar` become a struct in S4).
 
-## What is true today
+## Current status and decisions (2026-09-23)
+
+These decisions reflect the reviewed outcomes on their recorded bases. None of
+the S2 or S3 measurements below should be read as a comparison against
+current `main` unless explicitly stated; each future performance acceptance
+must use the then-current integrated base.
+
+| Step | Current status / decision |
+| --- | --- |
+| S1 | `main` has its own struct/enum typed-storage change at `5cf87a20`. This is distinct from the experimental S1a candidate at `4fb…`; do not describe that candidate as landed. |
+| S2a | The isolated S2a report is correctness evidence plus a small older-base measurement, not accepted/current-main performance evidence. Keep it experimental. See [`S2a outcome`](STRUCT_PAYLOAD_S2A_OUTCOME.md). |
+| S2b / S2 | S2b broadened typed accessor reach, but its three-pair stage-2 comparison on base `a1fb8e6a` improved median retired instructions by only 0.1052%, below the predeclared ≥2% bar. Park S2; S2a/S2b remain experimental and neither report is a measurement against current `main`. See the [S2b negative experiment](../benchmarks/results/struct_payload_managed_union_s2b_probe_2026-09-23.md). |
+| S3 | The selective ordinary-closure candidate is accepted on its focused review/evidence, with integration still pending. Its fixture demonstrated 2,048→1,024 allocations with checksum/live-object parity; the old-base stage-2 median retired-instruction change was -0.66%. Integrated remeasurement remains required; do not apply that result to current `main`. See the [S3 outcome](../benchmarks/results/struct_payload_closure_env_2026-09-23.md). |
+| S4 | Wait for I6 before the name-id-dependent `CoreVar` conversion. N1's `CoreSourceLoc` work is already on `main`; do not repeat it in S4. |
+| S5 | Dictionary storage is parked: the inspected experimental C had 0 static dictionary boxing sites. Tuple storage remains only a future probe: 123 static sites in experimental C, not dynamic allocation/execution counts and not a post-S4 census. Recount after S4 before proposing implementation. |
+
+S2a's report compares its candidate with an older `2bb45f3f` base and measured
+median retired instructions +0.23%; S2b compares on the later `a1fb8e6a` base.
+These are separate experiments, not a single cumulative or current-main
+comparison. S3 used the older frozen input/base identified in its report; its
+otherwise positive result also needs integrated remeasurement.
+
+## Historical baseline architecture snapshot (main at `dab2f490`)
+
+The architecture, source anchors, and emitted-C counts in this section describe
+the baseline named above, not present-day `main`; they are retained to explain
+the original proposals. In particular, later main changes make some statements
+below stale. For the present step status and decisions, use the table in
+[Current status and decisions](#current-status-and-decisions-2026-09-23).
 
 **Struct semantics.** `struct` fields must be scalars, fieldless enums or
 other structs (`type_header_graph.brp:2536`, error
@@ -101,14 +132,16 @@ backend") and `Token` (`token.brp:154`).
 cut discovery -5.5% but raised typed frontend +2.0%: 662 of 903 box sites in
 the candidate's C were spans entering union payloads, each a fresh copy of a
 value that had been shared by pointer. The rule it left: count where the
-value lives before converting. This roadmap removes the reason for that
-rule.
+value lives before converting. The original roadmap expected later payload
+steps to reduce that pressure; the measured scope and current decision are in
+the status table above.
 
-**Current boxing load in emitted C** (a stale artifact; recount on the
-current build in S0): 137 `blorp_box_struct` calls, dominated by
-`blorp_StackOption_Int` (82), then frames and scanner structs. Small today
-because the compiler avoids struct payloads; the win is what the removal
-unlocks.
+**Pre-census stale-C sample.** The original plan recorded 137
+`blorp_box_struct` calls in a stale emitted-C artifact, dominated by
+`blorp_StackOption_Int` (82), then frames and scanner structs. This is not a
+current count. The later S0 census reports 247 static sites for its own
+frozen-input artifact ([census report](../benchmarks/results/struct_payload_census_2026-09-23.md));
+the two counts use different artifacts and are not directly comparable.
 
 ## Measurement
 
