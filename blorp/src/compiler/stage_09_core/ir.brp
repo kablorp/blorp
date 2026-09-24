@@ -660,9 +660,173 @@ private RANGE_MAY_RUN_BACKWARD_TAG: String = "may_run_backward"
 private RANGE_FORWARD_ONLY_TAG: String = "forward_only"
 
 
-union CoreSourceLoc:
-	KnownSourceLoc(String, Int, Int, Int, Int)
-	SyntheticSourceLoc
+---
+A handle into `CoreProgram.source_files` for one Core node's source extent.
+Previously a two-allocation union (`KnownSourceLoc`'s tag plus its five-field
+payload) rebuilt on every node copy; now a single packed, self-describing
+Int (docs/CORE_NODE_TABLE_ROADMAP.md step N1). The location's own module
+index is packed alongside it, so a node carries everything needed to
+resolve itself and copying one between declarations (mono, std_inline) or
+between modules needs no remap.
+
+Layout (62 of the 63 non-negative bits of Int; 0 is synthetic):
+
+	module_index : 10 bits (< 1,024 modules)
+	start_line   : 19 bits (< 524,288 lines)
+	start_column : 10 bits (< 1,024 columns)
+	line_delta   : 13 bits (< 8,192 lines; end_line - start_line)
+	end_column   : 10 bits (< 1,024 columns)
+
+packed = ((((module_index * START_LINE_BASE + start_line) * START_COLUMN_BASE
+	+ start_column) * LINE_DELTA_BASE + line_delta) * END_COLUMN_BASE
+	+ end_column) + 1
+
+The `+ 1` keeps every known location strictly positive so 0 stays free for
+`SyntheticSourceLoc`. A location whose fields do not fit this layout (an
+oversized module index, an implausibly long line, or a span crossing more
+lines or columns than the budget) packs as 0 (synthetic) instead of
+silently wrapping; there is no live counter for this today because adding
+one needs a new runtime builtin, which the pinned bootstrap cannot see
+(see `new_builtin_needs_bootstrap_rotation` in project memory) -- verify
+narrowly instead (see the N1 measurement notes). Columns and the line delta
+got the wider share of the budget over the module index and start line,
+since a handful of declarations in this codebase span thousands of lines
+(late-Core match dispatchers) while file and module counts stay in the
+low hundreds.
+---
+opaque type CoreSourceLoc = Int
+
+private CORE_SOURCE_LOC_MODULE_BASE: Int = 1024
+
+private CORE_SOURCE_LOC_START_LINE_BASE: Int = 524288
+
+private CORE_SOURCE_LOC_START_COLUMN_BASE: Int = 1024
+
+private CORE_SOURCE_LOC_LINE_DELTA_BASE: Int = 8192
+
+private CORE_SOURCE_LOC_END_COLUMN_BASE: Int = 1024
+
+
+pure func synthetic_core_source_loc() -> CoreSourceLoc:
+	into_opaque CoreSourceLoc(0)
+
+
+pure func core_source_loc_is_synthetic(loc: CoreSourceLoc) -> Bool:
+	from_opaque CoreSourceLoc(loc) == 0
+
+
+implements Equatable for CoreSourceLoc:
+	pure func equals(left: CoreSourceLoc, right: CoreSourceLoc) -> Bool:
+		from_opaque CoreSourceLoc(left) == from_opaque CoreSourceLoc(right)
+
+
+--- Pack one resolved Core source extent into a handle. `module_index` is
+--- this location's position in `CoreProgram.source_files` (lowering reads
+--- it off its own module; see `core_lower_context`'s `module_id`).
+pure func pack_core_source_loc(
+	module_index: Int,
+	start_line: Int,
+	start_column: Int,
+	end_line: Int,
+	end_column: Int,
+) -> CoreSourceLoc:
+	line_delta: Int = end_line - start_line
+
+	if (
+		module_index < 0
+		or module_index >= CORE_SOURCE_LOC_MODULE_BASE
+		or start_line < 0
+		or start_line >= CORE_SOURCE_LOC_START_LINE_BASE
+		or start_column < 0
+		or start_column >= CORE_SOURCE_LOC_START_COLUMN_BASE
+		or line_delta < 0
+		or line_delta >= CORE_SOURCE_LOC_LINE_DELTA_BASE
+		or end_column < 0
+		or end_column >= CORE_SOURCE_LOC_END_COLUMN_BASE
+	):
+		synthetic_core_source_loc()
+	else:
+		packed: Int = (
+			(
+				(
+					(module_index * CORE_SOURCE_LOC_START_LINE_BASE + start_line)
+						* CORE_SOURCE_LOC_START_COLUMN_BASE
+					+ start_column
+				)
+					* CORE_SOURCE_LOC_LINE_DELTA_BASE
+				+ line_delta
+			)
+				* CORE_SOURCE_LOC_END_COLUMN_BASE
+			+ end_column
+		)
+		into_opaque CoreSourceLoc(packed + 1)
+
+
+--- Unpack a handle to its row without resolving `file` to a path -- the
+--- module index alone (packed alongside the span) is enough for callers
+--- that only need line/column, such as a synthetic binder name derived
+--- from a node's location. Row 0 (synthetic) decodes as a placeholder at
+--- file -1, line/column 0: callers that care check
+--- `core_source_loc_is_synthetic` first, as every renderer here does.
+pure func core_source_loc_row_unresolved(loc: CoreSourceLoc) -> CoreSourceLocRow:
+	encoded: Int = from_opaque CoreSourceLoc(loc)
+
+	if encoded == 0:
+		{ file = -1, start_line = 0, start_column = 0, end_line = 0, end_column = 0 }
+	else:
+		remaining0: Int = encoded - 1
+		end_column: Int = remaining0 % CORE_SOURCE_LOC_END_COLUMN_BASE
+		remaining1: Int = remaining0 / CORE_SOURCE_LOC_END_COLUMN_BASE
+		line_delta: Int = remaining1 % CORE_SOURCE_LOC_LINE_DELTA_BASE
+		remaining2: Int = remaining1 / CORE_SOURCE_LOC_LINE_DELTA_BASE
+		start_column: Int = remaining2 % CORE_SOURCE_LOC_START_COLUMN_BASE
+		remaining3: Int = remaining2 / CORE_SOURCE_LOC_START_COLUMN_BASE
+		start_line: Int = remaining3 % CORE_SOURCE_LOC_START_LINE_BASE
+		module_index: Int = remaining3 / CORE_SOURCE_LOC_START_LINE_BASE
+		{
+			file = module_index,
+			start_line = start_line,
+			start_column = start_column,
+			end_line = start_line + line_delta,
+			end_column = end_column
+		}
+
+
+--- Resolve a handle back to its row, with `file` naming an index into
+--- `program.source_files` (see `core_source_loc_path`).
+pure func core_source_loc_row(program: CoreProgram, loc: CoreSourceLoc) -> CoreSourceLocRow:
+	core_source_loc_row_unresolved(loc)
+
+
+pure func core_source_loc_path(program: CoreProgram, loc: CoreSourceLoc) -> String:
+	if core_source_loc_is_synthetic(loc):
+		""
+	else:
+		row: CoreSourceLocRow = core_source_loc_row(program, loc)
+		program.source_files.get_or(row.file, SYNTHETIC_CORE_SOURCE_FILE).path
+
+
+struct CoreSourceLocRow {
+	file: Int,
+	start_line: Int,
+	start_column: Int,
+	end_line: Int,
+	end_column: Int
+}
+
+
+--- One module's identity for `core_source_loc_path`/diagnostics. Built once
+--- in `assemble_core_program` (stage_08_core_lower/graph_prepare.brp) from
+--- the module table that already indexes every module in the graph, so a
+--- location's `module_index` (see `pack_core_source_loc`) is stable and
+--- needs no remap when a node moves between declarations or modules.
+record CoreSourceFile {
+	path: String,
+	module_name: String
+}
+
+
+private SYNTHETIC_CORE_SOURCE_FILE: CoreSourceFile = { path = "", module_name = "" }
 
 
 --- `id` is the binder identity within a function (0 means "not minted":
@@ -2455,7 +2619,8 @@ union CoreDecl:
 
 record CoreProgram {
 	decls: List[CoreDecl],
-	foreign_includes: List[String]
+	foreign_includes: List[String],
+	source_files: List[CoreSourceFile]
 }
 
 
@@ -2955,36 +3120,240 @@ private pure func decode_int_list(
 			Ok(result)
 
 
+private CORE_SOURCE_LOC_REF_FIELD: String = "__core_source_loc_ref__"
+
+
 pure func source_loc_to_json(loc: CoreSourceLoc) -> JsonValue:
-	match loc:
-		SyntheticSourceLoc:
-			JsonObject([(KIND_FIELD, JsonString(SYNTHETIC_LOC_TAG))])
-		KnownSourceLoc(file, line, column, end_line, end_column):
-			JsonObject([
-				(KIND_FIELD, JsonString(KNOWN_LOC_TAG)),
-				("file", JsonString(file)),
-				("line", json_int(line)),
-				("column", json_int(column)),
-				("end_line", json_int(end_line)),
-				("end_column", json_int(end_column)),
-			])
+	JsonObject([(CORE_SOURCE_LOC_REF_FIELD, json_int(from_opaque CoreSourceLoc(loc)))])
+
+
+private pure func core_source_loc_ref_encoded(fields: List[(String, JsonValue)]) -> Option[Int]:
+	var result: Option[Int] = None
+
+	for (name, value) in fields:
+		if name == CORE_SOURCE_LOC_REF_FIELD:
+			match as_number(value):
+				Some(number):
+					result = Some(to_int(number))
+				None:
+					void
+
+	result
+
+
+private pure func resolved_source_loc_json(program: CoreProgram, encoded: Int) -> JsonValue:
+	loc: CoreSourceLoc = into_opaque CoreSourceLoc(encoded)
+
+	if core_source_loc_is_synthetic(loc):
+		JsonObject([(KIND_FIELD, JsonString(SYNTHETIC_LOC_TAG))])
+	else:
+		row: CoreSourceLocRow = core_source_loc_row(program, loc)
+		file: String = program.source_files.get_or(row.file, SYNTHETIC_CORE_SOURCE_FILE).path
+		JsonObject([
+			(KIND_FIELD, JsonString(KNOWN_LOC_TAG)),
+			("file", JsonString(file)),
+			("line", json_int(row.start_line)),
+			("column", json_int(row.start_column)),
+			("end_line", json_int(row.end_line)),
+			("end_column", json_int(row.end_column)),
+		])
+
+
+private pure func resolve_core_source_loc_object_fields(
+	program: CoreProgram,
+	fields: List[(String, JsonValue)],
+) -> List[(String, JsonValue)]:
+	var rewritten: List[(String, JsonValue)] = []
+
+	for (name, value) in fields:
+		rewritten = rewritten.append((name, resolve_core_source_loc_refs(program, value)))
+
+	rewritten
+
+
+pure func resolve_core_source_loc_refs(program: CoreProgram, value: JsonValue) -> JsonValue:
+	match value:
+		JsonObject(fields):
+			match core_source_loc_ref_encoded(fields):
+				Some(encoded):
+					resolved_source_loc_json(program, encoded)
+				None:
+					JsonObject(resolve_core_source_loc_object_fields(program, fields))
+		JsonVector(items):
+			var rewritten: List[JsonValue] = []
+
+			for item in items:
+				rewritten = rewritten.append(resolve_core_source_loc_refs(program, item))
+
+			JsonVector(rewritten)
+		_:
+			value
+
+
+private record CoreSourceLocDecodeState {
+	files: List[String]
+}
+
+
+private pure func core_source_loc_decode_seed() -> CoreSourceLocDecodeState:
+	{ files = [] }
+
+
+private pure func intern_source_loc_file(
+	state: CoreSourceLocDecodeState,
+	file: String,
+) -> (CoreSourceLocDecodeState, Int):
+	match state.files.index_of(file):
+		Some(index):
+			(state, index)
+		None:
+			updated: List[String] = state.files.append(file)
+			({ state | files = updated }, updated.length() - 1)
+
+
+private record CoreSourceLocRewriteResult {
+	state: CoreSourceLocDecodeState,
+	value: JsonValue
+}
+
+
+private pure func rewrite_source_loc_object_fields(
+	state: CoreSourceLocDecodeState,
+	fields: List[(String, JsonValue)],
+) -> CoreSourceLocRewriteResult:
+	var current: CoreSourceLocDecodeState = state
+	var rewritten: List[(String, JsonValue)] = []
+
+	for (name, value) in fields:
+		child: CoreSourceLocRewriteResult = rewrite_source_loc_refs(current, value)
+		current = child.state
+		rewritten = rewritten.append((name, child.value))
+
+	{ state = current, value = JsonObject(rewritten) }
+
+
+private pure func rewrite_source_loc_list(
+	state: CoreSourceLocDecodeState,
+	items: List[JsonValue],
+) -> CoreSourceLocRewriteResult:
+	var current: CoreSourceLocDecodeState = state
+	var rewritten: List[JsonValue] = []
+
+	for item in items:
+		child: CoreSourceLocRewriteResult = rewrite_source_loc_refs(current, item)
+		current = child.state
+		rewritten = rewritten.append(child.value)
+
+	{ state = current, value = JsonVector(rewritten) }
+
+
+private pure func rewrite_known_source_loc_fields(
+	state: CoreSourceLocDecodeState,
+	value: JsonValue,
+	fields: List[(String, JsonValue)],
+) -> CoreSourceLocRewriteResult:
+	match string_field(value, "", "file"):
+		Err(_):
+			rewrite_source_loc_object_fields(state, fields)
+		Ok(file):
+			match int_field(value, "", "line"):
+				Err(_):
+					rewrite_source_loc_object_fields(state, fields)
+				Ok(line):
+					match int_field(value, "", "column"):
+						Err(_):
+							rewrite_source_loc_object_fields(state, fields)
+						Ok(column):
+							match int_field(value, "", "end_line"):
+								Err(_):
+									rewrite_source_loc_object_fields(state, fields)
+								Ok(end_line):
+									match int_field(value, "", "end_column"):
+										Err(_):
+											rewrite_source_loc_object_fields(state, fields)
+										Ok(end_column):
+											(with_file, module_index) = intern_source_loc_file(
+												state,
+												file,
+											)
+											packed: CoreSourceLoc = pack_core_source_loc(
+												module_index,
+												line,
+												column,
+												end_line,
+												end_column,
+											)
+											{
+												state = with_file,
+												value = json_int(from_opaque CoreSourceLoc(packed)),
+											}
+
+
+private pure func rewrite_source_loc_refs(
+	state: CoreSourceLocDecodeState,
+	value: JsonValue,
+) -> CoreSourceLocRewriteResult:
+	match value:
+		JsonObject(fields):
+			match optional_json_object_kind(fields):
+				Some(kind):
+					if kind == SYNTHETIC_LOC_TAG:
+						{ state = state, value = json_int(0) }
+					else if kind == KNOWN_LOC_TAG:
+						rewrite_known_source_loc_fields(state, value, fields)
+					else:
+						rewrite_source_loc_object_fields(state, fields)
+				None:
+					rewrite_source_loc_object_fields(state, fields)
+		JsonVector(items):
+			rewrite_source_loc_list(state, items)
+		_:
+			{ state = state, value = value }
 
 
 pure func decode_source_loc_json(
 	value: JsonValue,
 	path: String,
 ) -> Result[CoreSourceLoc, CoreJsonError]:
+	match as_number(value):
+		Some(number):
+			Ok(into_opaque CoreSourceLoc(to_int(number)))
+		None:
+			-- `core_expr_to_json`/`decode_core_expr_json` are also used
+			-- standalone, outside `core_program_to_json`'s marker-resolve
+			-- pass, so `value` here may still be an unresolved
+			-- `__core_source_loc_ref__` marker; unwrap it directly, since it
+			-- already carries the same packed Int either way. Otherwise fall
+			-- back to the original `{"kind": ...}` object shape (a
+			-- hand-written fixture, say) so decode errors stay identical,
+			-- packing against module 0 since no table is available here.
+			marker_encoded: Option[Int] = match value:
+				JsonObject(fields):
+					core_source_loc_ref_encoded(fields)
+				_:
+					None
+
+			match marker_encoded:
+				Some(encoded):
+					Ok(into_opaque CoreSourceLoc(encoded))
+				None:
+					decode_resolved_source_loc_json(value, path)
+
+
+private pure func decode_resolved_source_loc_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreSourceLoc, CoreJsonError]:
 	tag ?= kind_field(value, path)
 
 	if tag == SYNTHETIC_LOC_TAG:
-		Ok(SyntheticSourceLoc)
+		Ok(synthetic_core_source_loc())
 	else if tag == KNOWN_LOC_TAG:
-		file ?= string_field(value, path, "file")
 		line ?= int_field(value, path, "line")
 		column ?= int_field(value, path, "column")
 		end_line ?= int_field(value, path, "end_line")
 		end_column ?= int_field(value, path, "end_column")
-		Ok(KnownSourceLoc(file, line, column, end_line, end_column))
+		Ok(pack_core_source_loc(0, line, column, end_line, end_column))
 	else:
 		Err(CoreUnsupportedTag(path, tag))
 
@@ -7327,7 +7696,7 @@ private pure func decode_core_select_arm_json(
 		body_json,
 		path_field(path, "body"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -8273,7 +8642,7 @@ pure func decode_core_constructor_literal_match_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -8441,7 +8810,7 @@ pure func decode_core_constructor_length_match_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10536,7 +10905,7 @@ private pure func decode_core_expr_literal_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10555,7 +10924,7 @@ private pure func decode_core_expr_static_string_literal_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10577,7 +10946,7 @@ private pure func decode_core_expr_var_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10594,7 +10963,7 @@ private pure func decode_core_expr_void_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10616,7 +10985,7 @@ private pure func decode_core_expr_debug_block_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10633,7 +11002,7 @@ private pure func decode_core_expr_cooperative_checkpoint_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10661,7 +11030,7 @@ private pure func decode_core_expr_call_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10693,7 +11062,7 @@ private pure func decode_core_expr_binary_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10720,7 +11089,7 @@ private pure func decode_core_expr_unary_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10752,7 +11121,7 @@ private pure func decode_core_expr_logical_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10779,7 +11148,7 @@ private pure func decode_core_expr_assign_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10801,7 +11170,7 @@ private pure func decode_core_expr_cast_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10823,7 +11192,7 @@ private pure func decode_core_expr_box_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10850,7 +11219,7 @@ private pure func decode_core_expr_unbox_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10873,7 +11242,7 @@ private pure func decode_core_expr_field_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10896,7 +11265,7 @@ private pure func decode_core_expr_tuple_field_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10914,7 +11283,7 @@ private pure func decode_core_expr_tuple_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10936,7 +11305,7 @@ private pure func decode_core_expr_tuple_construct_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10954,7 +11323,7 @@ private pure func decode_core_expr_vector_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -10983,7 +11352,7 @@ private pure func decode_core_expr_lambda_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11005,7 +11374,7 @@ private pure func decode_core_expr_closure_create_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11027,7 +11396,7 @@ private pure func decode_core_expr_list_construct_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11049,7 +11418,7 @@ private pure func decode_core_expr_list_alloc_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11071,7 +11440,7 @@ private pure func decode_core_expr_list_get_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11093,7 +11462,7 @@ private pure func decode_core_expr_list_handoff_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11115,7 +11484,7 @@ private pure func decode_core_expr_list_handoff_set_owned_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11137,7 +11506,7 @@ private pure func decode_core_expr_list_handoff_set_source_slot_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11159,7 +11528,7 @@ private pure func decode_core_expr_string_byte_read_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11181,7 +11550,7 @@ private pure func decode_core_expr_string_byte_write_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11203,7 +11572,7 @@ private pure func decode_core_expr_string_byte_copy_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11225,7 +11594,7 @@ private pure func decode_core_expr_string_set_len_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11247,7 +11616,7 @@ private pure func decode_core_expr_tensor_literal_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11269,7 +11638,7 @@ private pure func decode_core_expr_tensor_boxed_literal_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11291,7 +11660,7 @@ private pure func decode_core_expr_tensor_packed_literal_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11313,7 +11682,7 @@ private pure func decode_core_expr_tensor_raw_fill_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11335,7 +11704,7 @@ private pure func decode_core_expr_tensor_raw_read_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11357,7 +11726,7 @@ private pure func decode_core_expr_tensor_raw_write_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11384,7 +11753,7 @@ private pure func decode_core_expr_tensor_raw_view_let_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11458,7 +11827,7 @@ private pure func decode_core_expr_dict_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11480,7 +11849,7 @@ private pure func decode_core_expr_dict_construct_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11502,7 +11871,7 @@ private pure func decode_core_expr_set_alloc_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11524,7 +11893,7 @@ private pure func decode_core_expr_list_retain_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11546,7 +11915,7 @@ private pure func decode_core_expr_list_set_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11568,7 +11937,7 @@ private pure func decode_core_expr_list_swap_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11586,7 +11955,7 @@ private pure func decode_core_expr_record_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11609,7 +11978,7 @@ private pure func decode_core_expr_record_update_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11690,7 +12059,7 @@ private pure func decode_core_expr_record_reuse_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11750,7 +12119,7 @@ private pure func decode_core_expr_record_cow_update_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11794,7 +12163,7 @@ private pure func decode_core_expr_record_construct_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11816,7 +12185,7 @@ private pure func decode_core_expr_union_construct_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11838,7 +12207,7 @@ private pure func decode_core_expr_union_reuse_construct_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11860,7 +12229,7 @@ private pure func decode_core_expr_detach_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11893,7 +12262,7 @@ private pure func decode_core_expr_dup_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -11930,7 +12299,7 @@ private pure func decode_core_expr_drop_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12029,7 +12398,7 @@ private pure func decode_core_expr_while_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12046,7 +12415,7 @@ private pure func decode_core_expr_break_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12063,7 +12432,7 @@ private pure func decode_core_expr_continue_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12085,7 +12454,7 @@ private pure func decode_core_expr_resource_scope_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12107,7 +12476,7 @@ private pure func decode_core_expr_resource_cleanup_exit_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12130,7 +12499,7 @@ private pure func decode_core_expr_tailrec_loop_from_json(
 		body_json,
 		path_field(path, "body"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12148,7 +12517,7 @@ private pure func decode_core_expr_tailrec_recur_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12165,7 +12534,7 @@ private pure func decode_core_expr_tailrec_list_spread_loop_from_json(
 		loop_json,
 		path_field(path, "loop"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12184,7 +12553,7 @@ private pure func decode_core_expr_tailrec_list_spread_recur_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12221,7 +12590,7 @@ private pure func decode_core_expr_for_range_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12243,7 +12612,7 @@ private pure func decode_core_expr_for_channel_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12265,7 +12634,7 @@ private pure func decode_core_expr_for_list_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12287,7 +12656,7 @@ private pure func decode_core_expr_for_string_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12309,7 +12678,7 @@ private pure func decode_core_expr_for_dict_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12331,7 +12700,7 @@ private pure func decode_core_expr_for_set_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12353,7 +12722,7 @@ private pure func decode_core_expr_for_stream_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12375,7 +12744,7 @@ private pure func decode_core_expr_for_resource_source_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12397,7 +12766,7 @@ private pure func decode_core_expr_for_tensor_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12419,7 +12788,7 @@ private pure func decode_core_expr_concurrently_loop_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12441,7 +12810,7 @@ private pure func decode_core_expr_pre_closure_concurrently_loop_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12463,7 +12832,7 @@ private pure func decode_core_expr_concurrent_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12485,7 +12854,7 @@ private pure func decode_core_expr_pre_closure_concurrent_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12507,7 +12876,7 @@ private pure func decode_core_expr_pre_closure_detach_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12529,7 +12898,7 @@ private pure func decode_core_expr_select_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12556,7 +12925,7 @@ private pure func decode_core_expr_range_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12963,7 +13332,7 @@ private pure func decode_core_expr_raw_match_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -12991,7 +13360,7 @@ private pure func decode_core_expr_semantic_match_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13019,7 +13388,7 @@ private pure func decode_core_expr_literal_match_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13051,7 +13420,7 @@ private pure func decode_core_expr_accessor_literal_match_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13083,7 +13452,7 @@ private pure func decode_core_expr_length_match_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13116,7 +13485,7 @@ private pure func decode_core_expr_constructor_match_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13148,7 +13517,7 @@ private pure func decode_core_expr_if_from_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13363,7 +13732,7 @@ pure func decode_core_param_json(
 		type_json,
 		path_field(path, "type"),
 	)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13786,7 +14155,7 @@ pure func decode_core_function_json(
 			path_field(path, "function_kind"),
 		)
 		def_id ?= int_field(value, path, "def_id")
-		loc_json ?= object_field(value, path, "loc")
+		loc_json ?= required_field(value, path, "loc")
 		loc ?= decode_source_loc_json(
 			loc_json,
 			path_field(path, "loc"),
@@ -13878,7 +14247,7 @@ pure func decode_core_global_json(
 	is_const ?= bool_field(value, path, "const")
 	is_private ?= bool_field(value, path, "private")
 	def_id ?= int_field(value, path, "def_id")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -13978,7 +14347,7 @@ pure func decode_core_enum_decl_json(
 	name ?= string_field(value, path, "name")
 	type_params ?= decode_string_list(value, path, "type_params")
 	variants ?= decode_core_enum_variants(value, path, "variants")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14150,7 +14519,7 @@ pure func decode_core_union_decl_json(
 		path_field(path, "payload_storage"),
 	)
 	variants ?= decode_core_union_variants(value, path, "variants")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14312,7 +14681,7 @@ pure func decode_core_value_record_decl_json(
 	name ?= string_field(value, path, "name")
 	type_params ?= decode_string_list(value, path, "type_params")
 	fields ?= decode_core_value_record_fields(value, path, "fields")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14346,7 +14715,7 @@ pure func decode_core_heap_record_decl_json(
 	name ?= string_field(value, path, "name")
 	type_params ?= decode_string_list(value, path, "type_params")
 	fields ?= decode_core_heap_record_fields(value, path, "fields")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14386,7 +14755,7 @@ pure func decode_core_type_alias_decl_json(
 		path_field(path, "target"),
 	)
 	is_opaque ?= bool_field(value, path, "opaque")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14424,7 +14793,7 @@ private pure func decode_core_trait_method_json(
 		path_field(path, "return_type"),
 	)
 	is_pure ?= bool_field(value, path, "pure")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14490,7 +14859,7 @@ pure func decode_core_trait_decl_json(
 	type_params ?= decode_string_list(value, path, "type_params")
 	supertraits ?= decode_string_list(value, path, "supertraits")
 	methods ?= decode_core_trait_methods(value, path)
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14583,7 +14952,7 @@ pure func decode_core_impl_decl_json(
 	)
 	type_params ?= decode_core_type_params(value, path)
 	methods ?= decode_core_functions(value, path, "methods")
-	loc_json ?= object_field(value, path, "loc")
+	loc_json ?= required_field(value, path, "loc")
 	loc ?= decode_source_loc_json(
 		loc_json,
 		path_field(path, "loc"),
@@ -14691,11 +15060,13 @@ private pure func decode_core_decls(
 
 
 pure func core_program_to_json(program: CoreProgram) -> JsonValue:
-	JsonObject([
+	unresolved: JsonValue = JsonObject([
 		(KIND_FIELD, JsonString(PROGRAM_TAG)),
 		("decls", JsonVector(program.decls.map(core_decl_to_json))),
 		("foreign_includes", strings_to_json(program.foreign_includes)),
 	])
+
+	resolve_core_source_loc_refs(program, unresolved)
 
 
 private union CoreJsonRecordStorage:
@@ -15098,8 +15469,13 @@ private pure func validate_record_update_json_tree(
 			Ok(void)
 
 
-pure func decode_core_program_json(value: JsonValue) -> Result[CoreProgram, CoreJsonError]:
+pure func decode_core_program_json(raw_value: JsonValue) -> Result[CoreProgram, CoreJsonError]:
 	path: String = "program"
+	folded: CoreSourceLocRewriteResult = rewrite_source_loc_refs(
+		core_source_loc_decode_seed(),
+		raw_value,
+	)
+	value: JsonValue = folded.value
 	tag ?= kind_field(value, path)
 
 	if tag != PROGRAM_TAG:
@@ -15115,6 +15491,7 @@ pure func decode_core_program_json(value: JsonValue) -> Result[CoreProgram, Core
 		Ok({
 			decls = decls,
 			foreign_includes = foreign_includes,
+			source_files = folded.state.files.map(func(p): { path = p, module_name = p }),
 		})
 
 

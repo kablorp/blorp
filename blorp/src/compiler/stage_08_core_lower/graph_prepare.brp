@@ -11,6 +11,7 @@ import:
 		module_id_table_index,
 		module_table_canonical_path,
 		module_table_count,
+		module_table_id_at,
 	../stage_06_typecheck/decl:
 		TypedDecl(TypedFunctionDecl, TypedImplDecl, TypedPrivateDecl),
 		TypedFunctionInfo,
@@ -23,7 +24,7 @@ import:
 		CtfeGlobalReplacements,
 		ctfe_global_replacements_are_compatible,
 		ctfe_global_replacements_empty,
-	../stage_09_core/ir: CoreProgram
+	../stage_09_core/ir: CoreProgram, CoreSourceFile
 	dict: entries as dict_entries, from_list as dict_from_list
 	entrypoint: synthesize_program_entrypoint
 	ffi_boundary: CoreFfiBoundaryError, annotate_ffi_boundaries, core_ffi_boundary_error_to_string
@@ -307,9 +308,31 @@ private pure func lower_core_modules(
 			})
 
 
+--- One `CoreSourceFile` per entry in `module_table`, indexed exactly as
+--- `module_id_table_index` numbers modules -- the same index every location
+--- packed during lowering (`core_source_loc_from_context`,
+--- stage_08_core_lower/lower.brp) already carries, so no remap is needed
+--- when a module's declarations are concatenated into the assembled
+--- program below.
+private pure func core_source_files_from_module_table(module_table: ModuleTable) -> List[CoreSourceFile]:
+	var files: List[CoreSourceFile] = []
+
+	for index in 0..module_table_count(module_table):
+		path: String = match module_table_id_at(module_table, index):
+			Some(id):
+				module_table_canonical_path(module_table, id).get_or("")
+			None:
+				""
+
+		files = files.append({ path = path, module_name = path })
+
+	files
+
+
 private pure func assemble_core_program(
 	modules: List[CoreProgram],
 	target: CoreProgram,
+	module_table: ModuleTable,
 ) -> CoreProgram:
 	module_decls = modules.flat_map(func(program): program.decls)
 	module_includes = modules.flat_map(func(program): program.foreign_includes)
@@ -318,7 +341,8 @@ private pure func assemble_core_program(
 		decls = module_decls.concat(target.decls),
 		foreign_includes = module_includes
 			.concat(target.foreign_includes)
-			.unique()
+			.unique(),
+		source_files = core_source_files_from_module_table(module_table)
 	}
 
 
@@ -408,7 +432,11 @@ pure func prepare_core_graph_with_ctfe_replacements(
 		Err(error):
 			Err(CoreGraphLowerError("target", error))
 
-	assembled = assemble_core_program(lowered_modules.programs, lowered_target_result.program)
+	assembled = assemble_core_program(
+		lowered_modules.programs,
+		lowered_target_result.program,
+		module_table,
+	)
 	aliased = rewrite_program_callable_aliases(assembled, lowered_modules.callable_aliases)
 
 	entrypoint_result ?= match synthesize_program_entrypoint(

@@ -9,7 +9,7 @@ import:
 		SourceLocation,
 		SourceTable,
 		source_location_end_offset,
-		source_location_span,
+		source_location_line_column_span,
 		source_location_start_offset,
 		source_table_for_file,
 	../stage_03_parse/parsed_ast:
@@ -373,7 +373,7 @@ import:
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSelectRecvArm,
-		CoreSourceLoc(KnownSourceLoc),
+		CoreSourceLoc,
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
 		CoreTensorForElementStorage(TensorForRowSliceElement),
 		CoreTraitMethod,
@@ -400,6 +400,8 @@ import:
 		CoreUnionVariant,
 		CoreValueRecordField,
 		CoreVar,
+		pack_core_source_loc,
+		synthetic_core_source_loc,
 	../stage_09_core/type_policy as CoreTypePolicy
 	identity:
 		core_ufcs_function_name,
@@ -665,33 +667,58 @@ private pure func lowered_declared_abi_type(
 			None
 
 
-pure func core_source_loc(source_table: SourceTable, location: SourceLocation) -> CoreSourceLoc:
+pure func core_source_loc(
+	module_index: Int,
+	source_table: SourceTable,
+	location: SourceLocation,
+) -> CoreSourceLoc:
 	if core_lowering_type_metrics_enabled() == 0:
-		core_source_loc_impl(source_table, location)
+		core_source_loc_impl(module_index, source_table, location)
 	else:
 		before = core_lowering_current_allocations()
-		result = core_source_loc_impl(source_table, location)
+		result = core_source_loc_impl(module_index, source_table, location)
 		core_lowering_source_loc_record(core_lowering_current_allocations() - before)
 		result
 
 
+--- Pure arithmetic: pack the already-computed (tab-aware) span directly
+--- into the handle (docs/CORE_NODE_TABLE_ROADMAP.md step N1). No
+--- allocation, no accumulator -- a location carries its own module index,
+--- so copying a node between declarations or modules (mono, std_inline)
+--- needs no remap.
 private pure func core_source_loc_impl(
+	module_index: Int,
 	source_table: SourceTable,
 	location: SourceLocation,
 ) -> CoreSourceLoc:
-	span = source_location_span(source_table, location)
-	KnownSourceLoc(span.path, span.start_line, span.start_column, span.end_line, span.end_column)
+	(start_line, start_column, end_line, end_column) = source_location_line_column_span(
+		source_table,
+		location,
+	)
+	pack_core_source_loc(module_index, start_line, start_column, end_line, end_column)
 
 
+--- `context.module_id` is `None` for lowering entry points used outside the
+--- module graph (`lower_typed_expr`/`lower_typed_program` below seed a
+--- context with `None`, e.g. from isolated tests); there is no module table
+--- to index into at that call site, so those locations pack against module
+--- 0, mirroring the frontend's own `source_file_id(0)` convention for
+--- single-file lowering (blorp/src/lib/source.brp). Graph-driven lowering
+--- (stage_08_core_lower/graph_prepare.brp) always sets a real module id.
 private pure func core_source_loc_from_context(
 	context: CoreLowerContext,
 	location: SourceLocation,
 ) -> CoreSourceLoc:
 	match context.source_table:
 		Some(source_table):
-			core_source_loc(source_table, location)
+			module_index: Int = match context.module_id:
+				Some(id):
+					module_id_table_index(id)
+				None:
+					0
+			core_source_loc(module_index, source_table, location)
 		None:
-			SyntheticSourceLoc
+			synthetic_core_source_loc()
 
 
 private pure func core_var(name: String, def_id: Option[Int]) -> CoreVar:
@@ -6360,7 +6387,8 @@ pure func lower_typed_program_with_ctfe_replacements(
 				context = current,
 				program = {
 					decls = decls,
-					foreign_includes = foreign_includes
+					foreign_includes = foreign_includes,
+					source_files = []
 				},
 			})
 
