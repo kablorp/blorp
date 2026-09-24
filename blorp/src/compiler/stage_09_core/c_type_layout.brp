@@ -37,10 +37,8 @@ pure func runtime_backed_value_record_c_type(abi_type: DeclaredAbiType) -> Optio
 			None
 
 
----
-Flattening reserves these unqualified names for their declared ABI
-identities; same-named user structs retain module-qualified Core names.
----
+-- Flattening reserves these unqualified names for their declared ABI
+-- identities; same-named user structs retain module-qualified Core names.
 private pure func canonical_runtime_value_record_c_type(name: String) -> Option[String]:
 	if name == "MemStats":
 		Some("blorp_MemStats")
@@ -57,7 +55,99 @@ pure func generated_stack_option_c_type_name(payload_name: String) -> String:
 		"blorp_StackOption_" + payload_name
 
 
-pure func stack_option_c_type(payload: CoreType) -> Option[String]:
+---
+`CoreStackOptionRepresentation.option_type` (and every other Core-IR field
+that stores a stack-Option C type spelling) is baked in at Core-lowering
+time, before backend symbol projection has a plan to offer -- so it always
+carries an *unprojected* payload name. Most payloads reach this through
+`generated_stack_option_c_type_name`'s plain `"blorp_StackOption_" +
+payload_name` branch, but `stack_option_c_type`'s `RangeType` arm bakes the
+fixed literal `"blorp_StackOption_Range"` directly, bypassing
+`generated_stack_option_c_type_name` entirely (whose own `Range` special
+case produces the differently-spelled `"blorp_StackOption_RangeValue"`, an
+unrelated generated-typedef name) -- so naively stripping the prefix and
+re-running every payload name back through `generated_stack_option_c_type_name`
+would mangle `Range` into the wrong spelling. Only a payload name that is
+actually a key in `type_symbol_lookup` was ever a projection candidate
+(`Range`, like every other builtin, never is), so this only reconstructs
+the spelling when the lookup hits; every other name -- builtin or
+absent-from-the-plan -- passes through completely unchanged.
+---
+pure func resolved_stack_option_type_name(
+	option_type: String,
+	type_symbol_lookup: Dict[String, String],
+) -> String:
+	prefix: String = "blorp_StackOption_"
+
+	if type_symbol_lookup.is_empty() or not option_type.starts_with(prefix):
+		option_type
+	else:
+		payload_name: String = option_type.substring(prefix.length(), option_type.length() - prefix.length())
+
+		match type_symbol_lookup.get(payload_name):
+			Some(projected):
+				generated_stack_option_c_type_name(projected)
+			None:
+				option_type
+
+
+---
+Core lowering bakes an inline-struct list/tensor element's C type as the
+value record's bare declared name (see `list_layout_for_element_type` and
+`tensor_for_element_storage_for_canonical_type` in `list_layout.brp`, both
+calling `c_type_name`/`stack_option_c_type` with `{}`), except for the
+`Option` payload case, which bakes a full `blorp_StackOption_<payload>`
+spelling. Re-resolving needs to tell those two shapes apart: a
+`blorp_StackOption_` name defers to `resolved_stack_option_type_name`
+(which recovers the projected payload), anything else is looked up as a
+bare declared name directly.
+---
+pure func resolved_inline_struct_c_type(
+	c_type: String,
+	type_symbol_lookup: Dict[String, String],
+) -> String:
+	if c_type.starts_with("blorp_StackOption_"):
+		resolved_stack_option_type_name(c_type, type_symbol_lookup)
+	else:
+		type_symbol_lookup.get(c_type).get_or(c_type)
+
+
+---
+Core lowering also bakes a "boxed tensor element" C type as
+`c_type_name(element_type, {})` for heap records and unions (see
+`tensor_for_element_storage_for_canonical_type`'s catch-all arm), which
+comes out as the declared name plus a trailing `*` -- unlike the bare-name
+shapes `resolved_inline_struct_c_type` handles. Every other spelling that
+arm can produce (`blorp_Vector*`, `blorp_Tuple*`, `blorp_StackResult`,
+`blorp_Result*`, `blorp_Closure*`, `void*`, `void`, or a boxed generic's
+`void*`) is a fixed runtime name that is never a key in
+`type_symbol_lookup`, so stripping and re-appending the trailing `*` for
+those is a no-op and safe to apply unconditionally.
+---
+pure func resolved_boxed_element_c_type(
+	c_type: String,
+	type_symbol_lookup: Dict[String, String],
+) -> String:
+	if type_symbol_lookup.is_empty() or not c_type.ends_with("*"):
+		c_type
+	else:
+		bare_name: String = c_type.substring(0, c_type.length() - 1)
+		type_symbol_lookup.get(bare_name).get_or(bare_name) + "*"
+
+
+---
+`type_symbol_lookup` maps an artifact-local heap/value/union/enum type's
+declared name to its projected short C symbol (see
+`c_symbol_projection.c_emission_type_symbol_lookup`). It is empty for every
+caller that runs before final backend emission has a symbol plan to offer
+(Core lowering and Core transformation passes still address types by their
+declared name); an empty dict makes every lookup a no-op, so those callers
+keep emitting today's unprojected spelling.
+---
+pure func stack_option_c_type(
+	payload: CoreType,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
 	match payload:
 		VoidType:
 			Some("blorp_StackOption_Void")
@@ -102,9 +192,9 @@ pure func stack_option_c_type(payload: CoreType) -> Option[String]:
 		TypeParameterType(_) | SelfType:
 			None
 		EnumType(name):
-			Some(generated_stack_option_c_type_name(name))
+			Some(generated_stack_option_c_type_name(type_symbol_lookup.get(name).get_or(name)))
 		ValueRecordType(name):
-			Some(generated_stack_option_c_type_name(name))
+			Some(generated_stack_option_c_type_name(type_symbol_lookup.get(name).get_or(name)))
 		HeapRecordType(name):
 			None
 		UnionType(name):
@@ -129,7 +219,7 @@ pure func nullable_managed_option_payload_type(option_type: CoreType) -> Option[
 			if name == "Option":
 				match args:
 					[payload]:
-						if stack_option_c_type(payload).is_some():
+						if stack_option_c_type(payload, {}).is_some():
 							None
 						else if nullable_managed_option_payload_release_policy(payload).is_some():
 							Some(payload)
@@ -179,7 +269,12 @@ pure func is_closure_abi_prim_name(name: String) -> Bool:
 	)
 
 
-pure func c_type_name(typ: CoreType) -> String:
+---
+`type_symbol_lookup` is the same artifact-local declared-name -> projected-
+symbol lookup documented on `stack_option_c_type`; pass `{}` before final
+backend emission has a plan to offer.
+---
+pure func c_type_name(typ: CoreType, type_symbol_lookup: Dict[String, String]) -> String:
 	match typ:
 		VoidType:
 			"void"
@@ -187,7 +282,7 @@ pure func c_type_name(typ: CoreType) -> String:
 			if name == "Option":
 				match args:
 					[payload]:
-						match stack_option_c_type(payload):
+						match stack_option_c_type(payload, type_symbol_lookup):
 							Some(c_type):
 								c_type
 							None:
@@ -328,11 +423,11 @@ pure func c_type_name(typ: CoreType) -> String:
 				Some(c_type):
 					c_type
 				None:
-					name
+					type_symbol_lookup.get(name).get_or(name)
 		HeapRecordType(name):
-			name + "*"
+			type_symbol_lookup.get(name).get_or(name) + "*"
 		UnionType(name):
-			name + "*"
+			type_symbol_lookup.get(name).get_or(name) + "*"
 		RangeType:
 			"long"
 		TensorType(info):

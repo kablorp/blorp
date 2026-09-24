@@ -61,3 +61,109 @@ sys.exit(1 if violations else 0)
 PY
 
 echo "C symbol projection boundary: ok"
+
+# Artifact-level check for the whole "Core bakes a declared name, the
+# backend re-resolves it" family (see c_type_layout.brp's
+# `resolved_stack_option_type_name` / `resolved_inline_struct_c_type` /
+# `resolved_boxed_element_c_type`): compile the compiler's own source with
+# the just-built `bin/blorp` (a stage-2 self-compile, not the
+# bootstrap-frozen `blorp_cli_main.c` -- see the Stage-2 measurement rule --
+# so this actually exercises the source under test) and assert that no
+# artifact-local heap/value/union/enum type's projected symbol was missed.
+#
+# A missed projection always shows up as one of these four shapes in the
+# emitted C:
+#   - `<qualified_name>_make(` / `_destroy(` / `_destroy_fields(` /
+#     `_destroy_stack_push(` / `_destroy_release_child(` -- a type-support
+#     function called or defined under its pre-projection name.
+#   - `typedef struct <qualified_name>` -- a type's own definition left
+#     unprojected.
+#   - `(<qualified_name>*)` -- a pointer cast to the unprojected spelling.
+#   - `blorp_StackOption_<qualified_name>` -- a stack-Option payload built
+#     from the unprojected payload name.
+#
+# Each pattern requires an identifier boundary immediately before
+# `blorp_src_` (a negative lookbehind for `[A-Za-z0-9_]`) so a benign
+# canonical-empty-list singleton name like
+# `__blorp_canonical_empty_list_struct_blorp_StackOption_blorp_src_...`
+# (the unprojected name appears only as a *suffix* of a longer,
+# already-unique identifier, never in type position) does not false-positive.
+#
+# Explicitly NOT flagged, by design, not oversight:
+#   - Union/enum variant constructor and tag spellings (`TAG_<name>_<Variant>`,
+#     a variant's own `c_name`, and the `__def_<id>_<Variant>` combination) --
+#     these intentionally keep the type's original qualified name baked in
+#     from Core lowering; `c_symbol_projection.program_symbol_inventory` never
+#     re-derives them from the projected type symbol, and the definition side
+#     (`union_init_name`/`union_reuse_name` in c_naming.brp) matches them
+#     consistently, so there is nothing to resolve.
+#   - Any `blorp_src_...` text inside a string literal (`BLORP_TAG(...)`, a
+#     profile/side-table module-path string, an error message) -- those are
+#     data, not C identifiers, and are stripped before matching.
+python3 <<'PY'
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+bin_blorp = Path("bin/blorp")
+if not bin_blorp.is_file():
+    print(
+        "bin/blorp is not built; run `make` before the self-compile symbol-leak check",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+with tempfile.TemporaryDirectory() as tmp_dir:
+    stage2_c = Path(tmp_dir) / "stage2.c"
+    result = subprocess.run(
+        [
+            str(bin_blorp),
+            "compile",
+            "--std-dir",
+            "standard_library/src",
+            "--no-format",
+            "--no-embed-runtime",
+            "-o",
+            str(stage2_c),
+            "blorp/src/main.brp",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        print("stage-2 self-compile failed", file=sys.stderr)
+        sys.exit(1)
+
+    text = stage2_c.read_text()
+
+boundary = r"(?<![A-Za-z0-9_])"
+leak_pattern = re.compile(
+    boundary
+    + r"blorp_src_[A-Za-z0-9_]*(_make|_destroy|_destroy_fields|_destroy_stack_push|_destroy_release_child)\s*\("
+    + r"|typedef struct " + boundary + r"blorp_src_[A-Za-z0-9_]*"
+    + r"|\(" + boundary + r"blorp_src_[A-Za-z0-9_]*\s*\*\)"
+    + r"|" + boundary + r"blorp_StackOption_blorp_src_[A-Za-z0-9_]*"
+)
+string_literal = re.compile(r'"(\\.|[^"\\])*"')
+
+leaks: dict[str, int] = {}
+for line in text.split("\n"):
+    stripped = string_literal.sub('""', line)
+    for match in leak_pattern.finditer(stripped):
+        leaks[match.group(0)] = leaks.get(match.group(0), 0) + 1
+
+if leaks:
+    print(
+        "Unprojected artifact-local type spelling(s) survived the stage-2 self-compile:",
+        file=sys.stderr,
+    )
+    for name, count in sorted(leaks.items()):
+        print(f"  {name}  ({count} occurrence(s))", file=sys.stderr)
+    sys.exit(1)
+
+print("C symbol projection self-compile leak check: ok")
+PY

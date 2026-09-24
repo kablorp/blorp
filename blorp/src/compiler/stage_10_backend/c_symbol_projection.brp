@@ -127,7 +127,8 @@ record CCallableSymbolPlan {
 private record CProgramSymbolInventory {
 	candidates: List[CCallableSymbolCandidate],
 	preserved_names: List[String],
-	type_naming: Dict[String, BackendTypeNaming]
+	type_naming: Dict[String, BackendTypeNaming],
+	type_symbol_lookup: Dict[String, String]
 }
 
 
@@ -151,7 +152,8 @@ private record CEmissionSymbolPlanRep {
 	callables: CCallableSymbolPlan,
 	canonical_empty_lists: List[CanonicalEmptyList],
 	preserved_symbol_count: Int,
-	type_naming: Dict[String, BackendTypeNaming]
+	type_naming: Dict[String, BackendTypeNaming],
+	type_symbol_lookup: Dict[String, String]
 }
 
 
@@ -171,6 +173,15 @@ private BASE62_RADIX: Int = 62
 -- from spelling ordinary declarations from system headers (one undelimited
 -- definition ID encoded to `brk`) without paying for the full `blorp_` prefix.
 private PROJECTED_CALLABLE_PREFIX: String = "brp_"
+
+-- Distinct from `PROJECTED_CALLABLE_PREFIX`: an artifact-local type has no
+-- definition ID to encode, so its base symbol is minted from a local
+-- declaration-order index instead. The extra underscore is deliberate: a
+-- callable spelling is always `brp_` followed directly by a base-62 digit
+-- (never an underscore), so a type base symbol and every name derived from
+-- it (`_destroy`, `_make`, ...) can never collide with a callable spelling
+-- by construction, independent of the def-id-keyed collision table.
+private PROJECTED_TYPE_PREFIX: String = "brp_ty"
 
 -- Validation makes this branch unreachable. Keeping an unmistakably invalid
 -- internal symbol here ensures future validator/projector drift cannot emit a
@@ -195,6 +206,25 @@ private pure func encode_callable_id(def_id: Int) -> String:
 
 pure func projected_callable_base_symbol(def_id: Int) -> String:
 	PROJECTED_CALLABLE_PREFIX + encode_callable_id(def_id)
+
+
+pure func projected_type_base_symbol(index: Int) -> String:
+	PROJECTED_TYPE_PREFIX + encode_callable_id(index)
+
+
+---
+Mint a short symbol for the type at `index` in declaration order, avoiding
+every name already claimed (by an earlier program-wide reservation or an
+earlier-minted type in the same declaration-order walk). Mirrors
+`available_projected_callable_name`'s suffix-on-conflict fallback.
+---
+private pure func available_projected_type_name(index: Int, taken: Dict[String, Bool]) -> String:
+	var name: String = projected_type_base_symbol(index)
+
+	while taken.contains(name):
+		name += "_"
+
+	name
 
 
 private pure func preserved_symbol_index(names: List[String]) -> Dict[String, Bool]:
@@ -429,6 +459,17 @@ pure func c_emission_type_naming(plan: CEmissionSymbolPlan, type_name: String) -
 			backend_type_naming(type_name)
 
 
+---
+The declared-name -> projected-symbol lookup for every artifact-local
+heap/value/union/enum type (empty entries fall back to the declared name
+itself, matching `c_type_name`'s and `c_emission_type_naming`'s defensive
+behavior on a stale or absent plan).
+---
+pure func c_emission_type_symbol_lookup(plan: CEmissionSymbolPlan) -> Dict[String, String]:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.type_symbol_lookup
+
+
 private pure func projected_callable_name_after_validation(
 	plan: CCallableSymbolPlan,
 	qualified_name: String,
@@ -558,15 +599,55 @@ private pure func static_storage_names(path: String, expr: CoreExpr) -> List[Str
 	names
 
 
+---
+An artifact-local type's projected base symbol, or its own name when it has
+none (an ABI-classified type, or a name absent from `lookup` because a caller
+holds a stale plan). Mirrors `c_emission_type_naming`'s defensive fallback.
+---
+private pure func resolved_type_name(lookup: Dict[String, String], name: String) -> String:
+	lookup.get(name).get_or(name)
+
+
+---
+Mint a short symbol for every artifact-local type name in `candidates`
+(declaration order), avoiding every name in `taken` and every symbol minted
+earlier in this same walk. Returns the name -> symbol lookup plus the flat
+list of minted symbols so callers can extend their own preserved-name set.
+---
+private pure func mint_type_symbols(
+	candidates: List[String],
+	taken: Dict[String, Bool],
+) -> (Dict[String, String], List[String]):
+	var lookup: Dict[String, String] = {}
+	var minted: List[String] = []
+	var occupied: Dict[String, Bool] = taken
+	var index: Int = 0
+
+	for name in candidates:
+		projected: String = available_projected_type_name(index, occupied)
+		lookup = lookup.set(name, projected)
+		minted = minted.append(projected)
+		occupied = occupied.set(projected, True)
+		index += 1
+
+	(lookup, minted)
+
+
 private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymbolInventory:
 	var candidates: List[CCallableSymbolCandidate] = []
 	var names: List[String] = ["main", "__blorp_init_globals", "__blorp_drop_globals"]
-	var type_naming: Dict[String, BackendTypeNaming] = {}
+	var type_candidates: List[String] = []
 
 	names = names.append(BUILTIN_STACK_OPTION_INT128_OPTION_C_TYPE)
 	names = names.append(BUILTIN_STACK_OPTION_UINT128_OPTION_C_TYPE)
 	names = names.append(BUILTIN_STACK_OPTION_RANGE_OPTION_C_TYPE)
 
+	-- First walk: every program-wide reserved name that does not depend on a
+	-- type's own projected spelling, plus the ordered list of artifact-local
+	-- type names (`abi_type.is_none()`) that still need one minted below. An
+	-- ABI-classified type keeps today's behavior exactly: its declared
+	-- spelling is already the runtime-mandated short name, so it is never a
+	-- projection candidate.
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
@@ -588,29 +669,36 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 				names = names.append(global_name)
 				names = names.concat(static_storage_names(global_name, global.init))
 			EnumDecl(enum_decl):
-				facts: BackendTypeNaming = backend_type_naming(enum_decl.name)
-				type_naming = type_naming.set(enum_decl.name, facts)
-				names = names.append(facts.c_name)
-				names = names.append(facts.enum_to_string_name)
-				names = names.append(facts.enum_vector_to_string_name)
-
-				if not TypeLayout.runtime_owned_stack_option_payload_name(enum_decl.name):
-					names = names.append(
-						TypeLayout.generated_stack_option_c_type_name(enum_decl.name),
-					)
+				if enum_decl.abi_type.is_none():
+					type_candidates = type_candidates.append(enum_decl.name)
 				else:
-					void
+					facts: BackendTypeNaming = backend_type_naming(enum_decl.name)
+					names = names.append(facts.c_name)
+					names = names.append(facts.enum_to_string_name)
+					names = names.append(facts.enum_vector_to_string_name)
 
+					if not TypeLayout.runtime_owned_stack_option_payload_name(enum_decl.name):
+						names = names.append(
+							TypeLayout.generated_stack_option_c_type_name(enum_decl.name),
+						)
+					else:
+						void
+
+				-- Variant constructor spellings still carry the type's
+				-- original qualified name baked in from Core lowering; they
+				-- are not re-derived from the projected type symbol here.
 				for variant in enum_decl.variants:
 					names = names.append(c_identifier(variant.c_name))
 			UnionDecl(union_decl):
-				facts: BackendTypeNaming = backend_type_naming(union_decl.name)
-				type_naming = type_naming.set(union_decl.name, facts)
-				names = names.append(facts.c_name)
-				names = names.append(facts.destroy_name)
-				names = names.append(facts.union_destroy_stack_push_name)
-				names = names.append(facts.union_destroy_release_child_name)
-				names = names.append(facts.union_destroy_fields_name)
+				if union_decl.abi_type.is_none():
+					type_candidates = type_candidates.append(union_decl.name)
+				else:
+					facts: BackendTypeNaming = backend_type_naming(union_decl.name)
+					names = names.append(facts.c_name)
+					names = names.append(facts.destroy_name)
+					names = names.append(facts.union_destroy_stack_push_name)
+					names = names.append(facts.union_destroy_release_child_name)
+					names = names.append(facts.union_destroy_fields_name)
 
 				for variant in union_decl.variants:
 					names = names.append(c_identifier(variant.c_name))
@@ -619,24 +707,28 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 					names = names.append(union_init_name(variant.c_name))
 					names = names.append(union_reuse_name(union_decl.name, variant.c_name))
 			ValueRecordDecl(record_decl):
-				facts: BackendTypeNaming = backend_type_naming(record_decl.name)
-				type_naming = type_naming.set(record_decl.name, facts)
-				names = names.append(facts.c_name)
-				names = names.append(facts.make_name)
-
-				if not TypeLayout.runtime_owned_stack_option_payload_name(record_decl.name):
-					names = names.append(
-						TypeLayout.generated_stack_option_c_type_name(record_decl.name),
-					)
+				if record_decl.abi_type.is_none():
+					type_candidates = type_candidates.append(record_decl.name)
 				else:
-					void
+					facts: BackendTypeNaming = backend_type_naming(record_decl.name)
+					names = names.append(facts.c_name)
+					names = names.append(facts.make_name)
+
+					if not TypeLayout.runtime_owned_stack_option_payload_name(record_decl.name):
+						names = names.append(
+							TypeLayout.generated_stack_option_c_type_name(record_decl.name),
+						)
+					else:
+						void
 			HeapRecordDecl(record_decl):
-				facts: BackendTypeNaming = backend_type_naming(record_decl.name)
-				type_naming = type_naming.set(record_decl.name, facts)
-				names = names.append(facts.c_name)
-				names = names.append(facts.make_name)
-				names = names.append(facts.destroy_name)
-				names = names.append(facts.reuse_name)
+				if record_decl.abi_type.is_none():
+					type_candidates = type_candidates.append(record_decl.name)
+				else:
+					facts: BackendTypeNaming = backend_type_naming(record_decl.name)
+					names = names.append(facts.c_name)
+					names = names.append(facts.make_name)
+					names = names.append(facts.destroy_name)
+					names = names.append(facts.reuse_name)
 			TypeAliasDecl(alias_decl):
 				names = names.append(c_identifier(alias_decl.name))
 			TraitDecl(trait_decl):
@@ -644,10 +736,83 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 			ImplDecl(impl_decl):
 				void
 
+	-- Mint short symbols for every artifact-local type, in declaration
+	-- order, only once every other program-wide reservation is known.
+	-- Appending the minted symbols to `names` before any callable is minted
+	-- means a callable's own collision-avoidance (`available_projected_
+	-- callable_name`) automatically steers clear of them; the reverse
+	-- direction can never happen because a callable spelling is `brp_`
+	-- followed directly by a base-62 digit while every type spelling is
+	-- `brp_ty` (or a derived form containing `_destroy`/`_make`, ...), so the
+	-- two families cannot collide by construction.
+	taken: Dict[String, Bool] = preserved_symbol_index(names)
+	(type_symbol_lookup, minted_type_names) = mint_type_symbols(type_candidates, taken)
+	names = names.concat(minted_type_names)
+
+	-- Second walk: now that every artifact-local type has a final spelling,
+	-- build its derived C names from that spelling (unchanged for an
+	-- ABI-classified type, which was never in `type_symbol_lookup`) and
+	-- extend `names` with the ones this walk could not have produced above.
+	var type_naming: Dict[String, BackendTypeNaming] = {}
+
+	for decl in program.decls:
+		match decl:
+			EnumDecl(enum_decl):
+				if enum_decl.abi_type.is_none():
+					resolved: String = resolved_type_name(type_symbol_lookup, enum_decl.name)
+					facts: BackendTypeNaming = backend_type_naming(resolved)
+					type_naming = type_naming.set(enum_decl.name, facts)
+					names = names.append(facts.enum_to_string_name)
+					names = names.append(facts.enum_vector_to_string_name)
+
+					if not TypeLayout.runtime_owned_stack_option_payload_name(enum_decl.name):
+						names = names.append(TypeLayout.generated_stack_option_c_type_name(resolved))
+					else:
+						void
+				else:
+					type_naming = type_naming.set(enum_decl.name, backend_type_naming(enum_decl.name))
+			UnionDecl(union_decl):
+				if union_decl.abi_type.is_none():
+					resolved: String = resolved_type_name(type_symbol_lookup, union_decl.name)
+					facts: BackendTypeNaming = backend_type_naming(resolved)
+					type_naming = type_naming.set(union_decl.name, facts)
+					names = names.append(facts.destroy_name)
+					names = names.append(facts.union_destroy_stack_push_name)
+					names = names.append(facts.union_destroy_release_child_name)
+					names = names.append(facts.union_destroy_fields_name)
+				else:
+					type_naming = type_naming.set(union_decl.name, backend_type_naming(union_decl.name))
+			ValueRecordDecl(record_decl):
+				if record_decl.abi_type.is_none():
+					resolved: String = resolved_type_name(type_symbol_lookup, record_decl.name)
+					facts: BackendTypeNaming = backend_type_naming(resolved)
+					type_naming = type_naming.set(record_decl.name, facts)
+					names = names.append(facts.make_name)
+
+					if not TypeLayout.runtime_owned_stack_option_payload_name(record_decl.name):
+						names = names.append(TypeLayout.generated_stack_option_c_type_name(resolved))
+					else:
+						void
+				else:
+					type_naming = type_naming.set(record_decl.name, backend_type_naming(record_decl.name))
+			HeapRecordDecl(record_decl):
+				if record_decl.abi_type.is_none():
+					resolved: String = resolved_type_name(type_symbol_lookup, record_decl.name)
+					facts: BackendTypeNaming = backend_type_naming(resolved)
+					type_naming = type_naming.set(record_decl.name, facts)
+					names = names.append(facts.make_name)
+					names = names.append(facts.destroy_name)
+					names = names.append(facts.reuse_name)
+				else:
+					type_naming = type_naming.set(record_decl.name, backend_type_naming(record_decl.name))
+			_:
+				void
+
 	{
 		candidates = candidates,
 		preserved_names = names,
-		type_naming = type_naming
+		type_naming = type_naming,
+		type_symbol_lookup = type_symbol_lookup
 	}
 
 
@@ -985,7 +1150,8 @@ pure func prepare_c_emission_symbols(
 														callables = plan,
 														canonical_empty_lists = validation.canonical_empty_lists,
 														preserved_symbol_count = preserved_names.length(),
-														type_naming = inventory.type_naming
+														type_naming = inventory.type_naming,
+														type_symbol_lookup = inventory.type_symbol_lookup
 													}))
 
 
