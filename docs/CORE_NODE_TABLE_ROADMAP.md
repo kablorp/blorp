@@ -167,7 +167,7 @@ Rules learned this month that bind every step:
 | N1 | `CoreSourceLoc` becomes an `Int` handle into a per-program location table | lowering -1.5M allocations (-8%); every later rebuild copies one Int instead of a five-field union | byte-identical C; diagnostics fixtures unchanged | everything; owns `CoreSourceLoc` |
 | N2 | the handle becomes a node id: passes mint fresh rows for synthetic nodes | 0 allocations; enables N3 and N4 | byte-identical C; new invariant under `--check-invariants` | everything |
 | N3 | Perceus ownership summaries memoized in a table keyed by node id | Perceus -6M to -11M (-15% to -25% of the row); instructions -3% to -5% | byte-identical C; leak gate | N1/N2 done; not with Perceus liveness work |
-| N4 | program facts built once after lowering and published on `CorePassState`: callable table, free-variable table, use counts; per-pass builders deleted | instructions -2% to -4%; allocations -3M to -5M across dce, closure, resolve, Perceus env | byte-identical C | N3 |
+| N4 | **parked 2026-09-23** (see below): program facts published once on `CorePassState` | measured: total allocations +0.02%, instructions +0.05% to +0.27%; only the id-only consumer gained | byte-identical C | — |
 | N5 | expression types become type ids from the interning table | node size -1 pointer; mono substitution becomes a table remap; mono -5M to -8M | byte-identical C | after `TYPE_INTERNING_ROADMAP` I3 |
 | N6 | let chains as blocks: `BlockExpr(List[CoreStmt], CoreExpr)` | Perceus `LetExpr` row (8.8%) and every let-heavy rebuild shrink; emitter simpler | normalized C, runtime and leak gates | last; owns emit's statement path |
 
@@ -339,6 +339,34 @@ or prove they are constant within a body. The leak gate is the safety net.
 **Oracle.** Byte-identical C; `scripts/test leak`; `test_core_perceus.brp`.
 
 ### N4: program facts published once
+
+**Parked 2026-09-23 with numbers** (branch `core/n4-program-facts`, commit
+`1a490776`, two slices, all gates green, byte-identical C, zero invariant
+violations). A `CoreProgramFacts.callables` table of id rows (`def_id`,
+`name`, `constructor_type_name`, `decl_index`, `arity`, `member_index`) was
+built once at the head of late Core and rebuilt by `adapt_function_refs` and
+`consume_specialize`; a checked invariant caught a real staleness bug in dce.
+Results on the frozen self-compile:
+
+| consumer converted | its row | total allocations | instructions |
+| --- | --- | --- | --- |
+| resolve (id-only reads) | -0.66%, then -1.11% | +0.01% | +0.08% (small program) |
+| plus Perceus env and closure index (need bodies) | ownership_contracts +0.21%, Perceus flat, closure flat | +0.02% | +0.05% to +0.27% |
+
+Root cause: a consumer that needs the function body pays an indexed
+`program.decls.get(decl_index)` per row, which costs more than the fused
+`for decl in program.decls` scan it replaced, and the table's own build and
+rebuilds are a fixed cost that one id-only consumer does not repay. This is
+the third measurement to the same conclusion (`core/program-facts`,
+`perf/definition-table`). Rule sharpened: a published declaration table is
+worth building only for consumers that never read bodies, and there are not
+enough of those in late Core to pay for it. Do not reopen without a consumer
+whose scan is itself measurable (over 1% of its row) and body-free. The
+node-keyed tables in N3 are a different case: they are keyed by expression
+node, built inside one pass, and replace repeated walks rather than a scan.
+
+The original text follows for the record.
+
 
 **Context.** Four late passes rebuild a callable index from `decls`;
 `closure.brp` recomputes free variables with 25 helpers; `dce.brp` collects
