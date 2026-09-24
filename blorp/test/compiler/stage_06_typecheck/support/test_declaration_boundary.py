@@ -652,14 +652,19 @@ class DeclarationBoundaryTests(unittest.TestCase):
         # function's `for facts in section.aliases:` loop.
         source = TYPE_HEADER_INSTALL.read_text(encoding="utf-8")
         function = re.search(
-            r"for facts in section\.aliases:.*?"
-            r"(?=\n\n\t-- Publish the fact tables)",
+            r"pure func typecheck_install_module_header_section\(.*?"
+            r"(?=\n\nprivate pure func single_category_section\()",
             source,
             re.DOTALL,
         )
 
         self.assertIsNotNone(function)
-        body = function.group(0)
+        section_body = function.group(0)
+        alias_loop_start = section_body.index("\n\tfor facts in section.aliases:")
+        alias_loop_end = section_body.index(
+            "\n\ttype_homes = type_home_index_record_names(", alias_loop_start
+        )
+        body = section_body[alias_loop_start:alias_loop_end]
         authority_branch = body.index("match alias_authority:")
         provisional_conversion = body.index("semantic_type_from_resolved_shape(")
         self.assertLess(authority_branch, provisional_conversion)
