@@ -34,7 +34,7 @@ must use the then-current integrated base.
 
 | Step | Current status / decision |
 | --- | --- |
-| S0 | The ownership fix was reviewed and validated on the frozen 8f integration; landing the S0-only change on latest `main` is pending final gates. |
+| S0 | The S0-only ownership fix passed focused, generated-C, broad, leak, and sanitizer gates on base `2afce9bd` and was accepted for integration. |
 | S1 | `main` has its own struct/enum typed-storage change at `5cf87a20`. This is distinct from the experimental S1a candidate at `4fb…`; do not describe that candidate as landed. |
 | S2a | The isolated S2a report is correctness evidence plus a small older-base measurement, not accepted/current-main performance evidence. Keep it experimental. See [`S2a outcome`](STRUCT_PAYLOAD_S2A_OUTCOME.md). |
 | S2b / S2 | S2b broadened typed accessor reach, but its three-pair stage-2 comparison on base `a1fb8e6a` improved median retired instructions by only 0.1052%, below the predeclared ≥2% bar. Park S2; S2a/S2b remain experimental and neither report is a measurement against current `main`. See the [S2b negative experiment](../benchmarks/results/struct_payload_managed_union_s2b_probe_2026-09-23.md). |
