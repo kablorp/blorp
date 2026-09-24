@@ -109,7 +109,7 @@ allocation-neutral with the flag off. Rows to watch: `typed_frontend_complete`
 | --- | --- | --- | --- |
 | I1 | identity-preserving substitution and qualification (`apply_subst*`, `qualify_module_local_types`, mono `apply_type_substitution*`, `split_canonical_module_type_name` without the tuple) | typed frontend -1.5M to -2.5M; mono -1M to -2M | everything |
 | I2 | mono request dedup by dictionary; callee function type memoized by definition id | lowering -0.8M; mono instructions -1% to -2% | everything |
-| I3 | **parked 2026-09-24 as construction-time interning** (see below); the equality short-circuits are being measured alone as I3a | measured: lowering +41.6%, mono +12.1%, instructions +3.3% | — |
+| I3 | **parked 2026-09-24** as construction-time interning (lowering +41.6%, instructions +3.3%); I3a, the equality short-circuits alone, also parked (instructions +0.00%). Re-scoped: intern inside mono's substitution only, whose loop already threads state (about a quarter of constructions) | see below | after I1 |
 | I4 | `SemanticType` interned at its hot producers (`localize`, `qualify`, `apply_subst`, unify's rebuilds) | typed frontend -2M to -4M | I3 |
 | I5 | trait dispatch keyed by type id; `Dict[String, BackendTypeNaming]` and `CoreLayoutTypeIndex` keyed by type id | trait resolve instructions -10% to -20% of its row; allocations flat | after I3 |
 | I6 | name ids: `ParsedIdentifier` carries the lexer's id; `SourceNameTable` becomes a view of the lexer table; `CoreVar.name` becomes a name id with the spelling in one table | allocations flat (per T-A); `blorp_string_eq` samples down; unlocks `CoreVar` as a struct (S4) | after CORE_ID_MIGRATION step 6 |
@@ -198,6 +198,21 @@ re-scoping to test: intern only inside mono's substitution, which runs
 under a pass with threaded state, if a count shows a meaningful share of
 the 1.27M constructions originate there. N5 of the node roadmap (type ids
 on expressions) waits on whichever form of I3 lands.
+
+**I3a (2026-09-24, branch `core/i3a-type-equality-identity`, commit
+`0825d2db`, gates green, byte-identical C).** The `same_object`
+short-circuit in both Core equalities plus one shared `normalize_dim`,
+measured on stage-2 compilers: every allocation row +0.00%, instructions
++0.00%. Without interning upstream, structurally equal types are almost never
+the same allocation, so the check skips no work. Parked; details in
+`benchmarks/results/type_interning_i3_equality_identity_2026-09-23.md`. That
+note also sizes the two routes: expression lowering has 60 to 80 helpers
+rooted at `lower_typed_expr_with_context` with no threaded context, while
+mono's specialization loop already threads state across its 20
+`apply_type_substitution` sites and accounts for roughly a quarter of the
+1.27M constructions. The next I3 attempt is mono-scoped: a table on the
+specialization state, interning substitution results only, with the
+short-circuits re-enabled once rows are shared.
 
 The original text follows for the record.
 
