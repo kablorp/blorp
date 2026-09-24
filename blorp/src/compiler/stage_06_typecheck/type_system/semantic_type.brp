@@ -341,18 +341,30 @@ pure func lookup_subst(name: String, subst: List[SemanticTypeSubstEntry]) -> Opt
 				None
 
 
-private pure func split_canonical_module_type_name(name: String) -> Option[(String, String)]:
+-- Scalar split offsets for a canonical `module_path::type_name` name.
+-- Neither caller below needs a tuple: `owner_local_type_name` substrings the
+-- owner path to compare it but only needs the type-name substring on the
+-- match branch, and `display_type_name` needs both, but as two independent
+-- substrings rather than an allocated pair. Returning offsets instead of an
+-- `Option[(String, String)]` removes the tuple-and-pair-of-substrings
+-- allocation from every call and lets `owner_local_type_name` skip the
+-- type-name substring entirely on its non-matching branch.
+private struct CanonicalModuleTypeNameSplit {
+	module_path_end: Int,
+	type_name_start: Int
+}
+
+
+private pure func split_canonical_module_type_name(name: String) -> Option[CanonicalModuleTypeNameSplit]:
 	index: Int = name.raw_index_of(CANONICAL_MODULE_TYPE_SEPARATOR)
 
 	if index < 0:
 		None
 	else:
-		module_path: String = name.substring(0, index)
-		type_name: String = name.substring(
-			index + CANONICAL_MODULE_TYPE_SEPARATOR.length(),
-			name.length() - index - CANONICAL_MODULE_TYPE_SEPARATOR.length(),
-		)
-		Some((module_path, type_name))
+		Some({
+			module_path_end = index,
+			type_name_start = index + CANONICAL_MODULE_TYPE_SEPARATOR.length(),
+		})
 
 
 pure func canonical_module_type_name(module_path: String, type_name: String) -> String:
@@ -487,6 +499,38 @@ private pure func should_qualify_module_local_type(
 	)
 
 
+-- Copies the untouched prefix only once a child changes (same idiom as
+-- `localize_module_types_list` below), and hands back `items` itself when
+-- every child qualifies to its own allocation, so a module with no
+-- locally-owned type arguments costs no allocation here.
+private pure func qualify_module_local_types_list(
+	module_path: String,
+	local_type_names: List[String],
+	items: List[SemanticType],
+) -> List[SemanticType]:
+	var result: List[SemanticType] = items
+	var changed: Bool = False
+	var index: Int = 0
+
+	for item in items:
+		qualified: SemanticType = qualify_module_local_types(module_path, local_type_names, item)
+
+		if changed:
+			result = result.append(qualified)
+		else if not same_object(qualified, item):
+			result = items.take(index).append(qualified)
+			changed = True
+
+		index += 1
+
+	if changed:
+		result
+	else:
+		items
+
+
+-- Every arm returns `typ` unchanged when qualification touched nothing, so a
+-- type with no locally-owned names anywhere in it costs no allocation here.
 pure func qualify_module_local_types(
 	module_path: String,
 	local_type_names: List[String],
@@ -494,49 +538,86 @@ pure func qualify_module_local_types(
 ) -> SemanticType:
 	match typ:
 		SemanticNamedType(name, args):
-			next_name = if should_qualify_module_local_type(module_path, local_type_names, name):
+			next_name: String = if should_qualify_module_local_type(module_path, local_type_names, name):
 				canonical_module_type_name(module_path, name)
 			else:
 				name
 
-			SemanticNamedType(
-				next_name,
-				args.map(func(arg): qualify_module_local_types(module_path, local_type_names, arg)),
+			next_args: List[SemanticType] = qualify_module_local_types_list(
+				module_path,
+				local_type_names,
+				args,
 			)
+
+			if same_object(next_name, name) and same_object(next_args, args):
+				typ
+			else:
+				SemanticNamedType(next_name, next_args)
 		SemanticArrayType(element, dims):
-			SemanticArrayType(
-				qualify_module_local_types(module_path, local_type_names, element),
-				dims.map(func(dim): qualify_module_local_types(module_path, local_type_names, dim)),
+			next_element: SemanticType = qualify_module_local_types(module_path, local_type_names, element)
+			next_dims: List[SemanticType] = qualify_module_local_types_list(
+				module_path,
+				local_type_names,
+				dims,
 			)
+
+			if same_object(next_element, element) and same_object(next_dims, dims):
+				typ
+			else:
+				SemanticArrayType(next_element, next_dims)
 		SemanticFunctionType(is_pure, params, return_type):
-			SemanticFunctionType(
-				is_pure,
-				params.map(
-					func(param): qualify_module_local_types(module_path, local_type_names, param),
-				),
-				qualify_module_local_types(module_path, local_type_names, return_type),
+			next_params: List[SemanticType] = qualify_module_local_types_list(
+				module_path,
+				local_type_names,
+				params,
 			)
+			next_return_type: SemanticType = qualify_module_local_types(
+				module_path,
+				local_type_names,
+				return_type,
+			)
+
+			if same_object(next_params, params) and same_object(next_return_type, return_type):
+				typ
+			else:
+				SemanticFunctionType(is_pure, next_params, next_return_type)
 		SemanticTupleType(elements):
-			SemanticTupleType(elements.map(
-				func(element): qualify_module_local_types(module_path, local_type_names, element),
-			))
-		SemanticRangeType(inner):
-			SemanticRangeType(qualify_module_local_types(module_path, local_type_names, inner))
-		SemanticDimOpType(op, left, right):
-			SemanticDimOpType(
-				op,
-				qualify_module_local_types(module_path, local_type_names, left),
-				qualify_module_local_types(module_path, local_type_names, right),
+			next_elements: List[SemanticType] = qualify_module_local_types_list(
+				module_path,
+				local_type_names,
+				elements,
 			)
+
+			if same_object(next_elements, elements):
+				typ
+			else:
+				SemanticTupleType(next_elements)
+		SemanticRangeType(inner):
+			next_inner: SemanticType = qualify_module_local_types(module_path, local_type_names, inner)
+
+			if same_object(next_inner, inner):
+				typ
+			else:
+				SemanticRangeType(next_inner)
+		SemanticDimOpType(op, left, right):
+			next_left: SemanticType = qualify_module_local_types(module_path, local_type_names, left)
+			next_right: SemanticType = qualify_module_local_types(module_path, local_type_names, right)
+
+			if same_object(next_left, left) and same_object(next_right, right):
+				typ
+			else:
+				SemanticDimOpType(op, next_left, next_right)
 		_:
 			typ
 
 
 private pure func owner_local_type_name(module_path: String, name: String) -> String:
 	match split_canonical_module_type_name(name):
-		Some((owner_path, type_name)):
+		Some(split):
+			owner_path: String = name.substring(0, split.module_path_end)
+
 			if owner_path == module_path:
-				type_name
+				name.substring(split.type_name_start, name.length() - split.type_name_start)
 			else:
 				name
 		None:
@@ -641,7 +722,10 @@ pure func localize_module_types(module_path: String, typ: SemanticType) -> Seman
 
 pure func display_type_name(name: String) -> String:
 	match split_canonical_module_type_name(name):
-		Some((module_path, type_name)):
+		Some(split):
+			module_path: String = name.substring(0, split.module_path_end)
+			type_name: String = name.substring(split.type_name_start, name.length() - split.type_name_start)
+
 			module_path + "." + type_name
 		None:
 			name
@@ -1279,19 +1363,42 @@ private pure func try_apply_subst_name(
 				original
 
 
-private pure func apply_subst_list(
+-- Copies the untouched prefix only once a child changes (same idiom as
+-- `resolve_types` in list_layout.brp), and hands back `types` itself when
+-- every element substitutes to its own allocation, so a fully ground type's
+-- argument list costs no allocation here.
+private pure func apply_subst_list_or_same(
 	subst: List[SemanticTypeSubstEntry],
 	visited: List[String],
 	types: List[SemanticType],
 ) -> List[SemanticType]:
-	var result: List[SemanticType] = []
+	var result: List[SemanticType] = types
+	var changed: Bool = False
+	var index: Int = 0
 
 	for typ in types:
-		result = result.append(apply_subst_with_visited(subst, visited, typ))
+		substituted: SemanticType = apply_subst_with_visited(subst, visited, typ)
 
-	result
+		if changed:
+			result = result.append(substituted)
+		else if not same_object(substituted, typ):
+			result = types.take(index).append(substituted)
+			changed = True
+
+		index += 1
+
+	if changed:
+		result
+	else:
+		types
 
 
+-- Every arm returns `typ` unchanged when substitution touched nothing, so a
+-- type with no substitutable names or dim operations in it costs no
+-- allocation here. The `SemanticDimOpType` arm still normalizes the
+-- (possibly identical) node unconditionally: `apply_subst`'s outer guard is
+-- what skips this function entirely when there is nothing to substitute or
+-- normalize.
 private pure func apply_subst_with_visited(
 	subst: List[SemanticTypeSubstEntry],
 	visited: List[String],
@@ -1304,35 +1411,52 @@ private pure func apply_subst_with_visited(
 			if args.length() == 0:
 				try_apply_subst_name(subst, visited, name, typ)
 			else:
-				SemanticNamedType(
-					name,
-					apply_subst_list(subst, visited, args),
-				)
+				next_args: List[SemanticType] = apply_subst_list_or_same(subst, visited, args)
+
+				if same_object(next_args, args):
+					typ
+				else:
+					SemanticNamedType(name, next_args)
 		SemanticArrayType(element, dims):
-			SemanticArrayType(
-				apply_subst_with_visited(subst, visited, element),
-				apply_subst_list(subst, visited, dims),
-			)
+			next_element: SemanticType = apply_subst_with_visited(subst, visited, element)
+			next_dims: List[SemanticType] = apply_subst_list_or_same(subst, visited, dims)
+
+			if same_object(next_element, element) and same_object(next_dims, dims):
+				typ
+			else:
+				SemanticArrayType(next_element, next_dims)
 		SemanticFunctionType(is_pure, params, return_type):
-			SemanticFunctionType(
-				is_pure,
-				apply_subst_list(subst, visited, params),
-				apply_subst_with_visited(subst, visited, return_type),
-			)
+			next_params: List[SemanticType] = apply_subst_list_or_same(subst, visited, params)
+			next_return_type: SemanticType = apply_subst_with_visited(subst, visited, return_type)
+
+			if same_object(next_params, params) and same_object(next_return_type, return_type):
+				typ
+			else:
+				SemanticFunctionType(is_pure, next_params, next_return_type)
 		SemanticTupleType(elements):
-			SemanticTupleType(apply_subst_list(subst, visited, elements))
+			next_elements: List[SemanticType] = apply_subst_list_or_same(subst, visited, elements)
+
+			if same_object(next_elements, elements):
+				typ
+			else:
+				SemanticTupleType(next_elements)
 		SemanticSelfType:
 			try_apply_subst_name(subst, visited, "Self", typ)
 		SemanticRangeType(inner):
-			SemanticRangeType(apply_subst_with_visited(subst, visited, inner))
+			next_inner: SemanticType = apply_subst_with_visited(subst, visited, inner)
+
+			if same_object(next_inner, inner):
+				typ
+			else:
+				SemanticRangeType(next_inner)
 		SemanticDimOpType(op, left, right):
-			normalize_dim(
-				SemanticDimOpType(
-					op,
-					apply_subst_with_visited(subst, visited, left),
-					apply_subst_with_visited(subst, visited, right),
-				),
-			)
+			next_left: SemanticType = apply_subst_with_visited(subst, visited, left)
+			next_right: SemanticType = apply_subst_with_visited(subst, visited, right)
+
+			if same_object(next_left, left) and same_object(next_right, right):
+				normalize_dim(typ)
+			else:
+				normalize_dim(SemanticDimOpType(op, next_left, next_right))
 		_:
 			typ
 

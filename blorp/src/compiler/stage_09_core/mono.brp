@@ -26,6 +26,7 @@ import:
 			VoidType,
 		),
 	list: join
+	memory: same_object
 	string: append_int, string
 
 
@@ -819,30 +820,73 @@ private pure func apply_dim_substitution_with_active_packs(
 			[dim]
 
 
+-- `apply_dim_substitution_with_active_packs` always wraps its result in a
+-- fresh singleton list, even when the dimension itself is unchanged, and a
+-- variadic pack can expand one dimension into several. So identity here is
+-- tracked per dimension (same allocation, still a singleton) rather than by
+-- comparing whole sublists; once a dimension changes shape or value, the
+-- untouched prefix is copied once and the rest is concatenated as before.
 private pure func apply_dims_substitution(
 	substitution: CoreMonoSubstitution,
 	dims: List[CoreTensorDim],
 ) -> List[CoreTensorDim]:
-	var applied: List[CoreTensorDim] = []
+	var applied: List[CoreTensorDim] = dims
+	var changed: Bool = False
+	var index: Int = 0
 
 	for dim in dims:
-		applied = applied.concat(apply_dim_substitution_with_active_packs(substitution, [], dim))
+		substituted: List[CoreTensorDim] = apply_dim_substitution_with_active_packs(substitution, [], dim)
+		unchanged: Bool = substituted.length() == 1 and same_object(substituted.get(0).get_or(dim), dim)
 
-	applied
+		if changed:
+			applied = applied.concat(substituted)
+		else if not unchanged:
+			applied = dims.take(index).concat(substituted)
+			changed = True
+
+		index += 1
+
+	if changed:
+		applied
+	else:
+		dims
 
 
+-- Copies the untouched prefix only once a child changes (same idiom as
+-- `apply_dims_substitution` above), and hands back `types` itself when every
+-- element substitutes to its own allocation, so a fully ground type list
+-- costs no allocation here.
 private pure func apply_type_list_substitution(
 	substitution: CoreMonoSubstitution,
 	types: List[CoreType],
 ) -> List[CoreType]:
-	var applied: List[CoreType] = []
+	var applied: List[CoreType] = types
+	var changed: Bool = False
+	var index: Int = 0
 
 	for typ in types:
-		applied = applied.append(apply_type_substitution(substitution, typ))
+		substituted: CoreType = apply_type_substitution(substitution, typ)
 
-	applied
+		if changed:
+			applied = applied.append(substituted)
+		else if not same_object(substituted, typ):
+			applied = types.take(index).append(substituted)
+			changed = True
+
+		index += 1
+
+	if changed:
+		applied
+	else:
+		types
 
 
+-- Every non-leaf arm returns `typ` unchanged when substitution touched
+-- nothing, so instantiating a generic function whose body mentions a subtree
+-- with no free type parameters costs no allocation for that subtree.
+-- `clone_core_type` stays for an actually-substituted parameter: that
+-- allocation is the point, since the replacement is now owned by a new
+-- position in the tree.
 pure func apply_type_substitution(substitution: CoreMonoSubstitution, typ: CoreType) -> CoreType:
 	match typ:
 		TypeParameterType(name):
@@ -863,33 +907,51 @@ pure func apply_type_substitution(substitution: CoreMonoSubstitution, typ: CoreT
 				_:
 					typ
 		NamedType(name, args):
-			NamedType(
-				name,
-				apply_type_list_substitution(substitution, args),
-			)
+			next_args: List[CoreType] = apply_type_list_substitution(substitution, args)
+
+			if same_object(next_args, args):
+				typ
+			else:
+				NamedType(name, next_args)
 		FunctionType(is_pure, params, return_type):
-			FunctionType(
-				is_pure,
-				apply_type_list_substitution(substitution, params),
-				apply_type_substitution(substitution, return_type),
-			)
+			next_params: List[CoreType] = apply_type_list_substitution(substitution, params)
+			next_return_type: CoreType = apply_type_substitution(substitution, return_type)
+
+			if same_object(next_params, params) and same_object(next_return_type, return_type):
+				typ
+			else:
+				FunctionType(is_pure, next_params, next_return_type)
 		StackResultType(value_type, error_type):
-			StackResultType(
-				apply_type_substitution(substitution, value_type),
-				apply_type_substitution(substitution, error_type),
-			)
+			next_value_type: CoreType = apply_type_substitution(substitution, value_type)
+			next_error_type: CoreType = apply_type_substitution(substitution, error_type)
+
+			if same_object(next_value_type, value_type) and same_object(next_error_type, error_type):
+				typ
+			else:
+				StackResultType(next_value_type, next_error_type)
 		BoxedResultType(value_type, error_type):
-			BoxedResultType(
-				apply_type_substitution(substitution, value_type),
-				apply_type_substitution(substitution, error_type),
-			)
+			next_value_type: CoreType = apply_type_substitution(substitution, value_type)
+			next_error_type: CoreType = apply_type_substitution(substitution, error_type)
+
+			if same_object(next_value_type, value_type) and same_object(next_error_type, error_type):
+				typ
+			else:
+				BoxedResultType(next_value_type, next_error_type)
 		TensorType(info):
-			TensorType({
-				element_type = apply_type_substitution(substitution, info.element_type),
-				dims = apply_dims_substitution(substitution, info.dims),
-			})
+			next_element_type: CoreType = apply_type_substitution(substitution, info.element_type)
+			next_dims: List[CoreTensorDim] = apply_dims_substitution(substitution, info.dims)
+
+			if same_object(next_element_type, info.element_type) and same_object(next_dims, info.dims):
+				typ
+			else:
+				TensorType({ element_type = next_element_type, dims = next_dims })
 		TupleType(items):
-			TupleType(apply_type_list_substitution(substitution, items))
+			next_items: List[CoreType] = apply_type_list_substitution(substitution, items)
+
+			if same_object(next_items, items):
+				typ
+			else:
+				TupleType(next_items)
 		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
 			typ
 
