@@ -1,0 +1,209 @@
+-- Shared synthetic Core node builders for the post-monomorphization body
+-- synthesizers (synth_list, synth_string, synth_tensor, synth_slice,
+-- synth_hash_collections, synth_bytes, string_pipeline). Each of those files
+-- used to redeclare its own private copy of these builders; this module
+-- consolidates the ones that were byte-for-byte identical (or identical
+-- except for a cosmetic parameter name) so there is exactly one
+-- implementation. See docs/CORE_NODE_TABLE_ROADMAP.md step N2.
+--
+-- Every builder still stamps `synthetic_core_source_loc()` on the node it
+-- creates, matching prior per-file behavior exactly. A later minting slice
+-- of N2 (out of scope here; no minting lands in this change) will give
+-- these an explicit `loc: CoreSourceLoc` parameter so callers can pass a
+-- fresh node id instead; the callers of this module already exist as
+-- individual call sites, so that follow-up can be scoped and measured on
+-- its own.
+import:
+	ir:
+		CoreBinaryOp,
+		CoreCallKind(BuiltinCall, ClosureCall, IntrinsicCall),
+		CoreExpr(
+			AssignExpr,
+			BinaryExpr,
+			BreakExpr,
+			CallExpr,
+			ForRangeExpr,
+			IfExpr,
+			LetExpr,
+			LiteralExpr,
+			LogicalExpr,
+			VarExpr,
+			VoidExpr,
+			WhileExpr,
+		),
+		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLogicalOp(AndOp, OrOp),
+		CoreLoopBinder,
+		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreParam,
+		CoreSourceLoc,
+		synthetic_core_source_loc,
+		CoreType(NamedType, VoidType),
+		CoreVar,
+
+
+--- Shared singleton type values, matching every prior per-file `INT_TYPE`/
+--- `BOOL_TYPE` constant: built once and reference-counted on reuse instead
+--- of reallocating `NamedType(...)` at every call site.
+INT_TYPE: CoreType = NamedType("Int", [])
+
+BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+
+--- A fresh, unresolved local variable reference by name. `id` and `def_id`
+--- are filled in by later passes (name resolution has already run for
+--- synthesized bodies, so these are placeholders, matching every prior
+--- per-file copy of this helper).
+pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		id = 0,
+		def_id = None
+	}
+
+
+--- A read of a local variable `name` with static type `typ`.
+pure func variable(name: String, typ: CoreType) -> CoreExpr:
+	VarExpr(core_var(name), typ, synthetic_core_source_loc())
+
+
+--- A read of an existing function parameter.
+pure func parameter_value(param: CoreParam) -> CoreExpr:
+	VarExpr(param.name, param.typ, synthetic_core_source_loc())
+
+
+--- An `Int` literal.
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, synthetic_core_source_loc())
+
+
+--- A `Bool` literal.
+pure func bool_literal(value: Bool) -> CoreExpr:
+	LiteralExpr(BoolLiteral(value), BOOL_TYPE, synthetic_core_source_loc())
+
+
+--- The shared `Void` value. Reused by value across every synthesized body
+--- (rather than rebuilt per call) exactly as each per-file copy did.
+VOID_EXPR: CoreExpr = VoidExpr(VoidType, synthetic_core_source_loc())
+
+
+--- A call to a compiler intrinsic.
+pure func intrinsic_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), VOID_EXPR, args, return_type, synthetic_core_source_loc())
+
+
+--- A call to a compiler intrinsic at an explicit, already-known location.
+--- Consolidates four identical private copies (parallel_tensor_pipeline,
+--- specialize_tensor_dispatch, collection_pipeline, tensor_specialize) whose
+--- passes copy a node's own location instead of stamping a synthetic one.
+pure func intrinsic_call_at(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	CallExpr(IntrinsicCall(name), VoidExpr(VoidType, loc), args, return_type, loc)
+
+
+--- A call to a standard-library builtin.
+pure func builtin_call(
+	name: String,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(BuiltinCall(name), VOID_EXPR, args, return_type, synthetic_core_source_loc())
+
+
+--- A direct call through a closure value.
+pure func closure_call(
+	callee: CoreExpr,
+	args: List[CoreExpr],
+	return_type: CoreType,
+) -> CoreExpr:
+	CallExpr(ClosureCall, callee, args, return_type, synthetic_core_source_loc())
+
+
+--- A binary operator application.
+pure func binary(
+	op: CoreBinaryOp,
+	left: CoreExpr,
+	right: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	BinaryExpr(op, left, right, return_type, synthetic_core_source_loc())
+
+
+--- A short-circuiting logical operator application; always `Bool`-typed.
+pure func logical(op: CoreLogicalOp, left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	LogicalExpr(op, left, right, BOOL_TYPE, synthetic_core_source_loc())
+
+
+--- Short-circuiting `and`.
+pure func logical_and(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	logical(AndOp, left, right)
+
+
+--- Short-circuiting `or`.
+pure func logical_or(left: CoreExpr, right: CoreExpr) -> CoreExpr:
+	logical(OrOp, left, right)
+
+
+--- A `let` (or `var`, when `is_mutable`) binding. `LetExpr` carries no
+--- source location of its own.
+pure func let_expr(
+	name: String,
+	is_mutable: Bool,
+	typ: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	LetExpr(core_var(name), is_mutable, typ, rhs, body)
+
+
+--- An `if`/`else` expression.
+pure func if_expr(
+	condition: CoreExpr,
+	then_expr: CoreExpr,
+	else_expr: CoreExpr,
+	return_type: CoreType,
+) -> CoreExpr:
+	IfExpr(condition, then_expr, else_expr, return_type, synthetic_core_source_loc())
+
+
+--- An assignment to an existing local `var`.
+pure func assignment(name: String, value: CoreExpr) -> CoreExpr:
+	AssignExpr(core_var(name), value, VoidType, synthetic_core_source_loc())
+
+
+--- The loop binder for a `for name in start..end_value` loop, forward-only
+--- and `Int`-typed (the only shape synthesized bodies need).
+pure func loop_binder(name: String) -> CoreLoopBinder:
+	{
+		variable = core_var(name),
+		typ = INT_TYPE,
+		range_direction = RangeForwardOnly
+	}
+
+
+--- A forward `for name in start..end_value: body` loop.
+pure func for_range(
+	name: String,
+	start: CoreExpr,
+	end_value: CoreExpr,
+	body: CoreExpr,
+) -> CoreExpr:
+	ForRangeExpr(loop_binder(name), start, end_value, body, VoidType, synthetic_core_source_loc())
+
+
+--- A `while condition: body` loop.
+pure func while_expr(condition: CoreExpr, body: CoreExpr) -> CoreExpr:
+	WhileExpr(condition, body, VoidType, synthetic_core_source_loc())
+
+
+--- The shared `break` node. Reused by value across every synthesized body
+--- exactly as each per-file copy did.
+BREAK_EXPR: CoreExpr = BreakExpr(VoidType, synthetic_core_source_loc())
