@@ -544,11 +544,9 @@ pure func test_change_queues_replacement() -> Bool:
 	change_queues_replacement_case().get_or(False)
 
 
---- The background workspace scan merges through a configuration change, which
---- carries no document of its own. It must leave the open document's schedule
---- alone: the running analysis keeps its token, so it answers exactly once
---- instead of being cancelled and started again.
-private pure func background_sources_keep_interactive_analysis_case() -> Option[Bool]:
+--- A background merge changes the workspace revision. The active document
+--- analysis will be stale on completion, so it needs a replacement plan.
+private pure func background_sources_replan_interactive_analysis_case() -> Option[Bool]:
 	source = discovered_source()
 	workspace ?= workspace(configuration(), [source]).to_option()
 	state ?= running_server_state(workspace)
@@ -563,57 +561,103 @@ private pure func background_sources_keep_interactive_analysis_case() -> Option[
 		opened.state,
 		ServerWorkspaceRootSourcesLoaded([source], []),
 	).to_option()
-	after ?= server_active_analysis_for(
+	pending ?= server_pending_analysis_for(
 		loaded.state,
 		InteractiveDocumentAnalysis(source.uri),
 	)
+	stale ?= apply_server_event(loaded.state, ServerAnalysisCompleted({
+		scheduled = before,
+		result = Err(AnalysisWorkerFailed("superseded by background merge")),
+	})).to_option()
+	replacement ?= analysis_request_for_purpose(
+		stale,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	published ?= apply_server_event(stale.state, ServerAnalysisCompleted({
+		scheduled = {
+			token = replacement.cancellation_token,
+			plan = replacement.plan,
+		},
+		result = Err(AnalysisWorkerFailed("current document failure")),
+	})).to_option()
 
 	Some(
 		(
-			cancellation_token_value(after.token) == cancellation_token_value(before.token)
-			and not has_cancellation_effect(
+			has_cancellation_effect(
 				loaded,
 				InteractiveDocumentAnalysis(source.uri),
 				cancellation_token_value(before.token),
 			)
-			and server_pending_analysis_for(
-				loaded.state,
-				InteractiveDocumentAnalysis(source.uri),
-			).is_none()
+			and workspace_revision_value(pending.workspace_revision)
+				== workspace_revision_value(before.plan.workspace_revision) + 1
+			and workspace_revision_value(replacement.plan.workspace_revision)
+				== workspace_revision_value(pending.workspace_revision)
+			and has_diagnostic_publication(published)
 		),
 	)
 
 
-pure func test_background_sources_keep_interactive_analysis() -> Bool:
-	background_sources_keep_interactive_analysis_case().get_or(False)
+pure func test_background_sources_replan_interactive_analysis() -> Bool:
+	background_sources_replan_interactive_analysis_case().get_or(False)
 
 
---- The same scan must not drop an edit the open document is still waiting on:
---- a queued replacement stays queued rather than being discarded.
-private pure func background_sources_keep_interactive_replacement_case() -> Option[Bool]:
+--- If an edit is already queued, the background merge must refresh that
+--- replacement to the newest workspace revision while retaining the edit.
+private pure func background_sources_refresh_interactive_replacement_case() -> Option[Bool]:
 	source = discovered_source()
 	workspace ?= workspace(configuration(), [source]).to_option()
 	state ?= running_server_state(workspace)
 	open_event ?= client_event(VALID_DID_OPEN_BODY)
 	open_requested ?= apply_server_event(state, open_event).to_option()
 	opened ?= resolve_requested_open(open_requested)
+	before ?= server_active_analysis_for(
+		opened.state,
+		InteractiveDocumentAnalysis(source.uri),
+	)
 	change_event ?= client_event(DID_CHANGE_VERSION_TWO_BODY)
 	changed ?= apply_server_event(opened.state, change_event).to_option()
+	before_pending ?= server_pending_analysis_for(
+		changed.state,
+		InteractiveDocumentAnalysis(source.uri),
+	)
 	loaded ?= apply_server_event(
 		changed.state,
 		ServerWorkspaceRootSourcesLoaded([source], []),
 	).to_option()
+	pending ?= server_pending_analysis_for(
+		loaded.state,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	target ?= pending.targets.get(0)
+	version ?= target.identity.document_version
+	stale ?= apply_server_event(loaded.state, ServerAnalysisCompleted({
+		scheduled = before,
+		result = Err(AnalysisWorkerFailed("superseded by background merge")),
+	})).to_option()
+	replacement ?= analysis_request_for_purpose(
+		stale,
+		InteractiveDocumentAnalysis(source.uri),
+	)
+	published ?= apply_server_event(stale.state, ServerAnalysisCompleted({
+		scheduled = {
+			token = replacement.cancellation_token,
+			plan = replacement.plan,
+		},
+		result = Err(AnalysisWorkerFailed("current edited document failure")),
+	})).to_option()
 
 	Some(
-		server_pending_analysis_for(
-			loaded.state,
-			InteractiveDocumentAnalysis(source.uri),
-		).is_some(),
+		workspace_revision_value(pending.workspace_revision)
+			== workspace_revision_value(before_pending.workspace_revision) + 1
+		and workspace_revision_value(replacement.plan.workspace_revision)
+			== workspace_revision_value(pending.workspace_revision)
+		and document_version_value(version) == 2
+		and has_empty_diagnostic_publication(published, target.identity),
 	)
 
 
-pure func test_background_sources_keep_interactive_replacement() -> Bool:
-	background_sources_keep_interactive_replacement_case().get_or(False)
+pure func test_background_sources_refresh_interactive_replacement() -> Bool:
+	background_sources_refresh_interactive_replacement_case().get_or(False)
 
 
 private pure func close_retires_interactive_replacement_case() -> Option[Bool]:
@@ -1984,12 +2028,12 @@ tests: TestSuite = {
 		),
 		("change queues replacement", test_change_queues_replacement),
 		(
-			"background sources keep interactive analysis",
-			test_background_sources_keep_interactive_analysis,
+			"background sources replan interactive analysis",
+			test_background_sources_replan_interactive_analysis,
 		),
 		(
-			"background sources keep interactive replacement",
-			test_background_sources_keep_interactive_replacement,
+			"background sources refresh interactive replacement",
+			test_background_sources_refresh_interactive_replacement,
 		),
 		(
 			"close retires obsolete interactive replacement",
