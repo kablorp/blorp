@@ -25,28 +25,29 @@ owns the `CoreSourceLoc` conversion; S4 here does not repeat it) and
 [`TYPE_INTERNING_ROADMAP.md`](TYPE_INTERNING_ROADMAP.md) (I6 provides the
 name id that lets `CoreVar` become a struct in S4).
 
-## Current status and decisions (2026-09-23)
+## Current status and decisions (2026-09-24)
 
-These decisions reflect the reviewed outcomes on their recorded bases. None of
-the S2 or S3 measurements below should be read as a comparison against
-current `main` unless explicitly stated; each future performance acceptance
-must use the then-current integrated base.
+These decisions reflect the reviewed outcomes on their recorded bases. The S3
+result is an explicit current-base comparison against `b72b0c7c`; S2's results
+remain older-base experiments. Each future performance acceptance must use
+the then-current integrated base.
 
 | Step | Current status / decision |
 | --- | --- |
-| S0 | The S0-only ownership fix passed focused, generated-C, broad, leak, and sanitizer gates on base `2afce9bd` and was accepted for integration. |
+| S0 | Landed on `main` at `e4c1b505`; the ownership fix passed focused, generated-C, broad, leak, and sanitizer gates. |
 | S1 | `main` has its own struct/enum typed-storage change at `5cf87a20`. This is distinct from the experimental S1a candidate at `4fb…`; do not describe that candidate as landed. |
 | S2a | The isolated S2a report is correctness evidence plus a small older-base measurement, not accepted/current-main performance evidence. Keep it experimental. See [`S2a outcome`](STRUCT_PAYLOAD_S2A_OUTCOME.md). |
 | S2b / S2 | S2b broadened typed accessor reach, but its three-pair stage-2 comparison on base `a1fb8e6a` improved median retired instructions by only 0.1052%, below the predeclared ≥2% bar. Park S2; S2a/S2b remain experimental and neither report is a measurement against current `main`. See the [S2b negative experiment](../benchmarks/results/struct_payload_managed_union_s2b_probe_2026-09-23.md). |
-| S3 | The selective ordinary-closure candidate remains unlanded. Its fixture demonstrated 2,048→1,024 allocations with checksum/live-object parity, and the old-base stage-2 median retired-instruction change was -0.66%; the required current-base uncontended benchmark could not be completed under sustained host contention. Integrated acceptance remains pending; do not apply the old-base result to current `main`. See the [S3 outcome](../benchmarks/results/struct_payload_closure_env_2026-09-23.md). |
+| S3 | Accepted at `41592efd` following current-base evidence. The focused fixture reduced allocations 2,048→1,024 with checksum/live-object parity. Self-compile allocations fell 89,125 (-0.0388%); median retired instructions were effectively flat (+21,524), so there is no speed or latency claim. See the [current-base S3 outcome](../benchmarks/results/struct_payload_closure_env_current_base_2026-09-24.md). |
 | S4 | Wait for I6 before the name-id-dependent `CoreVar` conversion. N1's `CoreSourceLoc` work is already on `main`; do not repeat it in S4. |
 | S5 | Dictionary storage is parked: the inspected experimental C had 0 static dictionary boxing sites. Tuple storage remains only a future probe: 123 static sites in experimental C, not dynamic allocation/execution counts and not a post-S4 census. Recount after S4 before proposing implementation. |
 
 S2a's report compares its candidate with an older `2bb45f3f` base and measured
 median retired instructions +0.23%; S2b compares on the later `a1fb8e6a` base.
 These are separate experiments, not a single cumulative or current-main
-comparison. S3 used the older frozen input/base identified in its report; its
-otherwise positive result also needs integrated remeasurement.
+comparison. S3's 2026-09-24 measurement compares exact base `b72b0c7c` with its
+candidate on the same frozen `d5fe8d9d` input; see the current-base outcome for
+the full provenance and limitations.
 
 ## Historical baseline architecture snapshot (main at `dab2f490`)
 
@@ -54,7 +55,7 @@ The architecture, source anchors, and emitted-C counts in this section describe
 the baseline named above, not present-day `main`; they are retained to explain
 the original proposals. In particular, later main changes make some statements
 below stale. For the present step status and decisions, use the table in
-[Current status and decisions](#current-status-and-decisions-2026-09-23).
+[Current status and decisions](#current-status-and-decisions-2026-09-24).
 
 **Struct semantics.** `struct` fields must be scalars, fieldless enums or
 other structs (`type_header_graph.brp:2536`, error
