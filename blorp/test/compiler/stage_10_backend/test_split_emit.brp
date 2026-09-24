@@ -1,15 +1,18 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(AddOp),
+		CoreClosureAbi,
+		CoreClosureCapture,
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
 		CoreEnumDecl,
-		CoreExpr(BinaryExpr, LiteralExpr, ListConstructExpr),
+		CoreExpr(BinaryExpr, ClosureCreateExpr, LiteralExpr, ListConstructExpr, VarExpr),
 		CoreFunction,
-		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
+		CoreFunctionKind(ClosureBodyFunction, ProgramEntrypointFunction, UserFunction),
 		CoreGlobal,
 		CoreHeapRecordDecl,
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreLiteral(IntLiteral, StringLiteral),
+		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreSourceLoc,
@@ -42,6 +45,10 @@ pure func string_type() -> CoreType:
 
 pure func list_int_type() -> CoreType:
 	NamedType("List", [int_type()])
+
+
+pure func closure_type() -> CoreType:
+	NamedType("Closure", [])
 
 
 ---
@@ -283,6 +290,74 @@ pure func split_test_program() -> CoreProgram:
 		],
 		foreign_includes = [],
 		source_files = []
+	}
+
+
+---
+A captured closure and its creator are separate function emissions. The
+typed-env prototype stays in the shared header, while its one destructor
+definition must travel with the closure-body function through the existing
+function binning path.
+---
+pure func captured_closure_split_program() -> CoreProgram:
+	capture: CoreClosureCapture = {
+		name = "base",
+		id = 0,
+		typ = NamedType("Option", [int_type()]),
+	}
+	closure_abi: CoreClosureAbi = {
+		c_name = "__def_980__blorp_eta_split",
+		params = [],
+		captures = [capture],
+		moved_captures = [],
+		task_abi = False,
+	}
+	closure_body: CoreFunction = {
+		name = "_blorp_eta_split",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = NamedType("Option", [int_type()]),
+		body = Some(
+			VarExpr(
+				{ name = "base", id = 0, def_id = None },
+				NamedType("Option", [int_type()]),
+				SyntheticSourceLoc,
+			),
+		),
+		is_pure = True,
+		function_kind = ClosureBodyFunction(closure_abi),
+		def_id = 980,
+		loc = SyntheticSourceLoc,
+	}
+	creator_param: CoreParam = {
+		name = { name = "base", id = 0, def_id = None },
+		typ = NamedType("Option", [int_type()]),
+		loc = SyntheticSourceLoc,
+	}
+	creator: CoreFunction = {
+		name = "make_split_capture",
+		source_module = None,
+		type_params = [],
+		params = [creator_param],
+		return_type = closure_type(),
+		body = Some(
+			ClosureCreateExpr({
+				function_name = "_blorp_eta_split",
+				def_id = 980,
+				c_name = "__def_980__blorp_eta_split",
+				static_name = "__sc___def_980__blorp_eta_split",
+				captures = [capture],
+			}, closure_type(), SyntheticSourceLoc),
+		),
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 981,
+		loc = SyntheticSourceLoc,
+	}
+	{
+		decls = [FunctionDecl(creator), FunctionDecl(closure_body)],
+		foreign_includes = [],
 	}
 
 
@@ -1058,6 +1133,51 @@ pure func test_type_support_heavy_program_balances_across_units() -> Bool:
 			False
 
 
+---
+A closure's environment destructor is part of its owning closure-body
+function emission. The shared header declares the typed env and destructor;
+exactly one definition must occur in the same TU as that closure body.
+---
+pure func test_closure_environment_destructor_follows_closure_body() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(captured_closure_split_program()),
+		FunctionProfileOff,
+		2,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			closure_symbol: String = projected_callable_base_symbol(980)
+			creator_symbol: String = projected_callable_base_symbol(981)
+			env_name: String = "__blorp_closure_env_" + closure_symbol
+			destructor_name: String = "__blorp_closure_env_destroy_" + closure_symbol
+			destructor_prototype: String = "void " + destructor_name + "(void* obj);"
+			destructor_definition: String = "void " + destructor_name + "(void* obj) {"
+			closure_body: String = "void* " + closure_symbol + "(void* __env) {"
+			creator: String = "blorp_Closure* " + creator_symbol + "(blorp_StackOption_Int base) {"
+			env_typedef: String = "typedef struct { blorp_StackOption_Int capture_0; } " + env_name + ";"
+			var owner_tu_contains_destructor: Bool = False
+			var creator_tu_uses_shared_declaration: Bool = False
+
+			for body in result.bodies:
+				if body.contains(closure_body) and body.contains(destructor_definition):
+					owner_tu_contains_destructor = True
+
+				if body.contains(creator) and not body.contains(closure_body) and body.contains(
+					"BLORP_SET_DESTRUCTOR(__cl_new, " + destructor_name + ")"
+				):
+					creator_tu_uses_shared_declaration = True
+
+			(
+				result.bodies.length() == 2
+				and result.shared_header.contains(env_typedef)
+				and result.shared_header.contains(destructor_prototype)
+				and not result.shared_header.contains(destructor_definition)
+				and count_occurrences_across(result.bodies, destructor_definition) == 1
+				and owner_tu_contains_destructor
+				and creator_tu_uses_shared_declaration
+			)
+		Err(_):
+			False
 tests: TestSuite = {
 	description = "Split, multi-translation-unit C emission",
 	tests = [
@@ -1100,6 +1220,10 @@ tests: TestSuite = {
 		(
 			"type-support-heavy program balances across units",
 			test_type_support_heavy_program_balances_across_units,
+		),
+		(
+			"closure environment destructor follows closure body",
+			test_closure_environment_destructor_follows_closure_body,
 		),
 	]
 }

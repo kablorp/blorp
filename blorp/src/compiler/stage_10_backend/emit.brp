@@ -1391,6 +1391,11 @@ private union ClosureAbiValue:
 	ClosureAbiStruct(String)
 
 
+private union ClosureEnvStorageKind:
+	LegacyVoidPointerSlots
+	TypedInlineTail
+
+
 private record ClosureArgBinding {
 	name: String,
 	statement: String,
@@ -12168,7 +12173,22 @@ private pure func emit_closure_call_body(
 	)
 
 
-private pure func closure_capture_box_expr(capture: CoreClosureCapture, type_symbol_lookup: Dict[String, String]) -> Option[String]:
+private pure func closure_env_type_name(c_name: String) -> String:
+	"__blorp_closure_env_" + c_identifier(c_name)
+
+
+private pure func closure_env_destructor_name(c_name: String) -> String:
+	"__blorp_closure_env_destroy_" + c_identifier(c_name)
+
+
+private pure func closure_env_field_name(index: Int) -> String:
+	"capture_" + index.to_string()
+
+
+private pure func closure_capture_box_expr(
+	capture: CoreClosureCapture,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
 	abi_value ?= closure_abi_value_for_type(capture.typ, type_symbol_lookup)
 	capture_c: String = c_local_name(capture.name)
 
@@ -12190,9 +12210,7 @@ private pure func closure_capture_box_expr(capture: CoreClosureCapture, type_sym
 			Some("blorp_box_float32(" + capture_c + ")")
 		ClosureAbiFloat16:
 			Some("blorp_box_float16(" + capture_c + ")")
-		ClosureAbiInt128:
-			None
-		ClosureAbiUInt128:
+		ClosureAbiInt128 | ClosureAbiUInt128:
 			None
 		ClosureAbiStruct(c_type):
 			Some(
@@ -12213,23 +12231,18 @@ private pure func closure_capture_needs_release(capture: CoreClosureCapture, typ
 				Some(False)
 			else:
 				None
-		ClosureAbiPrim:
+		ClosureAbiPrim | ClosureAbiFloat | ClosureAbiFloat32 | ClosureAbiFloat16:
 			Some(False)
-		ClosureAbiFloat:
-			Some(False)
-		ClosureAbiFloat32:
-			Some(False)
-		ClosureAbiFloat16:
-			Some(False)
-		ClosureAbiInt128:
+		ClosureAbiInt128 | ClosureAbiUInt128:
 			None
-		ClosureAbiUInt128:
-			None
-		ClosureAbiStruct(c_type):
+		ClosureAbiStruct(_):
 			Some(True)
 
 
-private pure func closure_capture_assignments(captures: List[CoreClosureCapture], type_symbol_lookup: Dict[String, String]) -> Option[String]:
+private pure func closure_capture_assignments(
+	captures: List[CoreClosureCapture],
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
 	var result: String = ""
 	var failed: Bool = False
 	var index: Int = 0
@@ -12274,20 +12287,352 @@ private pure func closure_capture_release_mask(captures: List[CoreClosureCapture
 		Some(mask)
 
 
-private pure func emit_closure_create(closure: CoreClosureCreate, type_symbol_lookup: Dict[String, String]) -> Option[String]:
+private pure func closure_env_capture_c_type(
+	typ: CoreType,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
+	if typ == VoidType:
+		None
+	else:
+		abi_value ?= closure_abi_value_for_type(typ, type_symbol_lookup)
+
+		match abi_value:
+			ClosureAbiVoid:
+				None
+			ClosureAbiPointer | ClosureAbiPrim | ClosureAbiFloat | ClosureAbiFloat32 | ClosureAbiFloat16 | ClosureAbiInt128 | ClosureAbiUInt128 | ClosureAbiStruct(_):
+				Some(TypeLayout.c_type_name(typ, type_symbol_lookup))
+
+
+private pure func closure_env_storage_kind(
+	captures: List[CoreClosureCapture],
+	task_abi: Bool,
+	type_symbol_lookup: Dict[String, String],
+) -> ClosureEnvStorageKind:
+	var has_struct_capture: Bool = False
+	var all_captures_supported: Bool = True
+
+	for capture in captures:
+		match closure_abi_value_for_type(capture.typ, type_symbol_lookup):
+			Some(ClosureAbiVoid) | Some(ClosureAbiInt128) | Some(ClosureAbiUInt128) | None:
+				all_captures_supported = False
+			Some(ClosureAbiPointer):
+				if not (
+					is_managed_pointer_capture_type(capture.typ)
+					or is_unmanaged_pointer_capture_type(capture.typ)
+				):
+					all_captures_supported = False
+			Some(ClosureAbiPrim) | Some(ClosureAbiFloat) | Some(ClosureAbiFloat32) | Some(ClosureAbiFloat16):
+				void
+			Some(ClosureAbiStruct(_)):
+				has_struct_capture = True
+
+	if not task_abi and has_struct_capture and all_captures_supported:
+		TypedInlineTail
+	else:
+		LegacyVoidPointerSlots
+
+
+private pure func closure_env_capture_value(
+	capture: CoreClosureCapture,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
+	match closure_env_capture_c_type(capture.typ, type_symbol_lookup):
+		Some(_):
+			closure_env_capture_value_for_supported_type(capture, type_symbol_lookup)
+		None:
+			None
+
+
+private pure func closure_env_capture_value_for_supported_type(
+	capture: CoreClosureCapture,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
+	abi_value ?= closure_abi_value_for_type(capture.typ, type_symbol_lookup)
+	capture_c: String = c_local_name(capture.name)
+	capture_type: String = TypeLayout.c_type_name(capture.typ, type_symbol_lookup)
+
+	match abi_value:
+		ClosureAbiVoid:
+			Some("(void*)0")
+		ClosureAbiPointer:
+			if is_managed_pointer_capture_type(capture.typ):
+				Some("(" + capture_type + ")blorp_retain((blorp_Object*)" + capture_c + ")")
+			else if is_unmanaged_pointer_capture_type(capture.typ):
+				Some("(" + capture_type + ")" + capture_c)
+			else:
+				None
+		ClosureAbiStruct(_):
+			if CoreTypePolicy.cleanup_release_policy_for_type(capture.typ) == StackResultReleasePolicy:
+				Some("blorp_stack_result_retain_value(" + capture_c + ")")
+			else:
+				Some(capture_c)
+		ClosureAbiPrim | ClosureAbiFloat | ClosureAbiFloat32 | ClosureAbiFloat16 | ClosureAbiInt128 | ClosureAbiUInt128:
+			Some(capture_c)
+
+
+private pure func closure_env_capture_clear_statement(
+	capture: CoreClosureCapture,
+	field: String,
+) -> String:
+	match CoreTypePolicy.cleanup_release_policy_for_type(capture.typ):
+		ArcReleasePolicy | ArcReleaseOnlyPolicy:
+			"  " + field + " = NULL;\n"
+		StackResultReleasePolicy:
+			"  " + field + ".release_mask = 0UL;\n"
+		NoReleasePolicy:
+			""
+
+
+private pure func closure_env_capture_field_declarations(
+	captures: List[CoreClosureCapture],
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
+	var fields: List[String] = []
+	var failed: Bool = False
+	var index: Int = 0
+
+	for capture in captures:
+		if not failed:
+			match closure_env_capture_c_type(capture.typ, type_symbol_lookup):
+				Some(c_type):
+					fields = fields.append(c_type + " " + closure_env_field_name(index) + ";")
+				None:
+					failed = True
+					break
+
+		index += 1
+
+	if failed:
+		None
+	else:
+		Some("typedef struct { " + fields.join(" ") + " } ")
+
+
+private pure func closure_env_capture_assignments(
+	captures: List[CoreClosureCapture],
+	env_local_name: String,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
+	var result: String = ""
+	var failed: Bool = False
+	var index: Int = 0
+
+	for capture in captures:
+		if not failed:
+			match closure_env_capture_value(capture, type_symbol_lookup):
+				Some(value):
+					result += " " + env_local_name + "->" + closure_env_field_name(index) + " = " + value + ";"
+				None:
+					failed = True
+					break
+
+		index += 1
+
+	if failed:
+		None
+	else:
+		Some(result)
+
+
+private pure func closure_env_capture_declarations(
+	captures: List[CoreClosureCapture],
+	env_local_name: String,
+	moved_captures: List[String],
+	emission_context: FunctionEmissionContext,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
+	var result: String = ""
+	var failed: Bool = False
+	var index: Int = 0
+
+	for capture in captures:
+		if not failed:
+			match closure_env_capture_c_type(capture.typ, type_symbol_lookup):
+				Some(c_type):
+					field: String = env_local_name + "->" + closure_env_field_name(index)
+					result += "  " + c_type + " " + c_local_name(capture.name) + " = " + field + ";\n"
+					if moved_captures.contains(capture.name):
+						capture_var: CoreVar = {
+							name = capture.name,
+							id = 0,
+							def_id = None
+						}
+						result += closure_env_capture_clear_statement(capture, field)
+						result += planned_variable_cleanup_push_statement(
+							emission_context,
+							index,
+							ClosureMoveTemporary(index),
+							capture_var,
+							CoreTypePolicy.cleanup_release_policy_for_type(capture.typ),
+						)
+				None:
+					failed = True
+					break
+
+		index += 1
+
+	if failed:
+		None
+	else:
+		Some(result)
+
+
+private pure func closure_env_capture_destroy_statement(
+	capture: CoreClosureCapture,
+	env_name: String,
+	index: Int,
+) -> String:
+	field_value: String = env_name + "->" + closure_env_field_name(index)
+
+	match CoreTypePolicy.cleanup_release_policy_for_type(capture.typ):
+		NoReleasePolicy:
+			""
+		ArcReleasePolicy:
+			"  if (" + field_value + ") blorp_release((void*)" + field_value + ");\n"
+		ArcReleaseOnlyPolicy:
+			"  if (" + field_value + ") blorp_release_arc_only((void*)" + field_value + ");\n"
+		StackResultReleasePolicy:
+			"  blorp_stack_result_release(" + field_value + ");\n"
+
+
+private pure func closure_env_destructor_body(
+	captures: List[CoreClosureCapture],
+	c_name: String,
+	internal_type_linkage: Bool,
+) -> String:
+	env_type: String = closure_env_type_name(c_name)
+	destructor_name: String = closure_env_destructor_name(c_name)
+	storage_class: String = if internal_type_linkage:
+		"static "
+	else:
+		""
+	var release_statements: String = ""
+	var index: Int = 0
+
+	for capture in captures:
+		release_statements += closure_env_capture_destroy_statement(capture, "__e", index)
+		index += 1
+
+	storage_class + "void " + destructor_name + "(void* obj) {\n" + "  blorp_Closure* __cl = (blorp_Closure*)obj;\n" + "  " + env_type + "* __e = (" + env_type + "*)__cl->env;\n" + release_statements + "}\n\n"
+
+
+private pure func closure_env_emission(
+	captures: List[CoreClosureCapture],
+	c_name: String,
+	internal_type_linkage: Bool,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[CClosureEnvEmission]:
+	type_fields ?= closure_env_capture_field_declarations(captures, type_symbol_lookup)
+	env_type: String = closure_env_type_name(c_name)
+	destructor_name: String = closure_env_destructor_name(c_name)
+	storage_class: String = if internal_type_linkage:
+		"static "
+	else:
+		""
+
+	Some({
+		type_declaration = type_fields + env_type + ";\n",
+		destructor_prototype = storage_class + "void " + destructor_name + "(void* obj);\n",
+	})
+
+
+private pure func collect_closure_env_emissions(
+	decls: List[CoreDecl],
+	authority: CEmissionSymbolAuthority,
+	internal_type_linkage: Bool,
+	type_symbol_lookup: Dict[String, String],
+) -> List[CClosureEnvEmission]:
+	var result: List[CClosureEnvEmission] = []
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(func_info):
+				match func_info.function_kind:
+					ClosureBodyFunction(abi):
+						match closure_env_storage_kind(abi.captures, abi.task_abi, type_symbol_lookup):
+							LegacyVoidPointerSlots:
+								void
+							TypedInlineTail:
+								emitted_name: String = selected_callable_c_spelling(
+									authority,
+									func_info.name,
+									func_info.def_id,
+									abi.c_name,
+								)
+								match closure_env_emission(
+									abi.captures,
+									emitted_name,
+									internal_type_linkage,
+									type_symbol_lookup,
+								):
+									Some(emission):
+										result = result.append(emission)
+									None:
+										void
+					_:
+						void
+			HeapRecordDecl(_) | ValueRecordDecl(_) | UnionDecl(_) | EnumDecl(_) | GlobalDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
+				void
+
+	result
+
+
+private pure func closure_env_emission_type_declarations(
+	emissions: List[CClosureEnvEmission],
+) -> String:
+	var result: String = ""
+
+	for emission in emissions:
+		result += emission.type_declaration + "\n"
+
+	result
+
+
+private pure func closure_env_emission_destructor_prototypes(
+	emissions: List[CClosureEnvEmission],
+) -> String:
+	var result: String = ""
+
+	for emission in emissions:
+		result += emission.destructor_prototype
+
+	result
+
+
+private pure func emit_closure_create(
+	closure: CoreClosureCreate,
+	storage_kind: ClosureEnvStorageKind,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
 	if closure.captures.length() == 0:
 		Some("((void*)&" + c_identifier(closure.static_name) + ")")
 	else:
-		assignments ?= closure_capture_assignments(closure.captures, type_symbol_lookup)
-		release_mask ?= closure_capture_release_mask(closure.captures, type_symbol_lookup)
-
-		Some(
-			"({ blorp_Closure* __cl_new = blorp_closure_new_inline((void*)" + c_identifier(
-				closure.c_name,
-			) + ", " + closure.captures
-				.length()
-				.to_string() + ");" + assignments + " __cl_new->env_release_mask = " + release_mask.to_string() + "UL; (void*)__cl_new; })",
-		)
+		match storage_kind:
+			LegacyVoidPointerSlots:
+				assignments ?= closure_capture_assignments(closure.captures, type_symbol_lookup)
+				release_mask ?= closure_capture_release_mask(closure.captures, type_symbol_lookup)
+				Some(
+					"({ blorp_Closure* __cl_new = blorp_closure_new_inline((void*)" + c_identifier(
+						closure.c_name,
+					) + ", " + closure.captures.length().to_string() + ");" + assignments + " __cl_new->env_release_mask = " + release_mask.to_string() + "UL; (void*)__cl_new; })",
+				)
+			TypedInlineTail:
+				match closure_env_storage_kind(closure.captures, False, type_symbol_lookup):
+					LegacyVoidPointerSlots:
+						None
+					TypedInlineTail:
+						assignments ?= closure_env_capture_assignments(
+							closure.captures,
+							"__cl_env",
+							type_symbol_lookup,
+						)
+						env_type: String = closure_env_type_name(closure.c_name)
+						destructor_name: String = closure_env_destructor_name(closure.c_name)
+						Some(
+							"({ blorp_Closure* __cl_new = blorp_closure_new_typed_inline((void*)" + c_identifier(
+								closure.c_name,
+							) + ", sizeof(" + env_type + "), _Alignof(" + env_type + ")); BLORP_SET_DESTRUCTOR(__cl_new, " + destructor_name + "); " + env_type + "* __cl_env = (" + env_type + "*)__cl_new->env;" + assignments + " (void*)__cl_new; })",
+						)
 
 
 private pure func closure_slot_decl(typ: CoreType, name: String, source: String, type_symbol_lookup: Dict[String, String]) -> Option[String]:
@@ -12354,7 +12699,7 @@ private pure func closure_capture_decl(
 		capture_var: CoreVar = {
 			name = capture.name,
 			id = 0,
-			def_id = None
+			def_id = None,
 		}
 		Some(
 			decl + "  __e[" + index.to_string() + "] = NULL;\n" + planned_variable_cleanup_push_statement(
@@ -12397,13 +12742,36 @@ private pure func closure_capture_decls(
 
 private pure func closure_env_prelude(
 	abi: CoreClosureAbi,
+	emitted_name: String,
+	storage_kind: ClosureEnvStorageKind,
 	emission_context: FunctionEmissionContext,
+	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	if abi.captures.length() == 0:
 		Some("  (void)__env;\n")
 	else:
-		capture_decls ?= closure_capture_decls(abi.captures, abi.moved_captures, emission_context)
-		Some("  void** __e = (void**)__env;\n" + capture_decls)
+		match storage_kind:
+			LegacyVoidPointerSlots:
+				capture_decls ?= closure_capture_decls(
+					abi.captures,
+					abi.moved_captures,
+					emission_context,
+				)
+				Some("  void** __e = (void**)__env;\n" + capture_decls)
+			TypedInlineTail:
+				match closure_env_storage_kind(abi.captures, abi.task_abi, type_symbol_lookup):
+					LegacyVoidPointerSlots:
+						None
+					TypedInlineTail:
+						capture_decls ?= closure_env_capture_declarations(
+							abi.captures,
+							"__e",
+							abi.moved_captures,
+							emission_context,
+							type_symbol_lookup,
+						)
+						env_type: String = closure_env_type_name(emitted_name)
+						Some("  " + env_type + "* __e = (" + env_type + "*)__env;\n" + capture_decls)
 
 
 private pure func closure_body_suffix(
@@ -12517,8 +12885,20 @@ private pure func emit_closure_body_function(
 				""
 			else:
 				BASE_INDENT
-			param_decls ?= closure_param_decls(abi.params, selected_type_symbol_lookup(symbol_authority))
-			env_prelude ?= closure_env_prelude(abi, emission_context)
+			type_symbol_lookup: Dict[String, String] = selected_type_symbol_lookup(symbol_authority)
+			param_decls ?= closure_param_decls(abi.params, type_symbol_lookup)
+			storage_kind: ClosureEnvStorageKind = closure_env_storage_kind(
+				abi.captures,
+				abi.task_abi,
+				type_symbol_lookup,
+			)
+			env_prelude ?= closure_env_prelude(
+				abi,
+				emitted_name,
+				storage_kind,
+				emission_context,
+				type_symbol_lookup,
+			)
 			body_c ?= emit_function_body(body, 0, emission_context)
 			prefix: String = closure_body_signature(
 				func_info.return_type,
@@ -13729,7 +14109,18 @@ private pure func emit_simple_expr_leaf(
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
 			None
 		ClosureCreateExpr(closure, typ, loc):
-			emit_closure_create(selected_closure_create(emission_context.symbol_authority, closure), selected_type_symbol_lookup(emission_context.symbol_authority))
+			type_symbol_lookup: Dict[String, String] = selected_type_symbol_lookup(
+				emission_context.symbol_authority,
+			)
+			selected_closure: CoreClosureCreate = selected_closure_create(
+				emission_context.symbol_authority,
+				closure,
+			)
+			emit_closure_create(
+				selected_closure,
+				closure_env_storage_kind(selected_closure.captures, False, type_symbol_lookup),
+				type_symbol_lookup,
+			)
 		ListConstructExpr(construct, typ, loc):
 			emit_list_construct(construct, emission_context)
 		ListAllocExpr(alloc, typ, loc):
@@ -15710,12 +16101,19 @@ private pure func emit_copy_concurrent_task_closure(
 ) -> Option[String]:
 	fn_name: String = concurrent_task_function_name(base_temp, binding_index)
 	closure ?= task_as_copy_closure_create(selected_task_closure(symbol_authority, task))
-	closure_value ?= emit_closure_create(closure, selected_type_symbol_lookup(symbol_authority))
+	closure_value ?= emit_closure_create(
+		closure,
+		LegacyVoidPointerSlots,
+		selected_type_symbol_lookup(symbol_authority),
+	)
 
 	Some(indent + "blorp_Closure* " + fn_name + " = (blorp_Closure*)" + closure_value + ";\n")
 
 
-private pure func task_capture_box_expr(capture: CoreTaskCapture, type_symbol_lookup: Dict[String, String]) -> Option[String]:
+private pure func task_capture_box_expr(
+	capture: CoreTaskCapture,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
 	kind: CoreTaskCaptureKind = capture.kind
 
 	match kind:
@@ -15731,7 +16129,10 @@ private pure func task_capture_box_expr(capture: CoreTaskCapture, type_symbol_lo
 			None
 
 
-private pure func task_capture_needs_release(capture: CoreTaskCapture, type_symbol_lookup: Dict[String, String]) -> Option[Bool]:
+private pure func task_capture_needs_release(
+	capture: CoreTaskCapture,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[Bool]:
 	kind: CoreTaskCaptureKind = capture.kind
 
 	match kind:
@@ -15792,7 +16193,10 @@ private pure func task_capture_release_mask(captures: List[CoreTaskCapture], typ
 		Some(mask)
 
 
-private pure func emit_task_closure_create(task: CoreTaskClosure, type_symbol_lookup: Dict[String, String]) -> Option[String]:
+private pure func emit_task_closure_create(
+	task: CoreTaskClosure,
+	type_symbol_lookup: Dict[String, String],
+) -> Option[String]:
 	if task.captures.length() == 0:
 		Some("((void*)&" + c_identifier(task.static_name) + ")")
 	else:
@@ -15802,9 +16206,7 @@ private pure func emit_task_closure_create(task: CoreTaskClosure, type_symbol_lo
 		Some(
 			"({ blorp_Closure* __cl_new = blorp_closure_new_inline((void*)" + c_identifier(
 				task.c_name,
-			) + ", " + task.captures
-				.length()
-				.to_string() + ");" + assignments + " __cl_new->env_release_mask = " + release_mask.to_string() + "UL; __cl_new; })",
+			) + ", " + task.captures.length().to_string() + ");" + assignments + " __cl_new->env_release_mask = " + release_mask.to_string() + "UL; __cl_new; })",
 		)
 
 
@@ -15815,7 +16217,10 @@ private pure func emit_resource_concurrent_task_closure(
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	fn_name: String = concurrent_task_function_name(base_temp, 0)
-	closure_value ?= emit_task_closure_create(selected_task_closure(symbol_authority, task), selected_type_symbol_lookup(symbol_authority))
+	closure_value ?= emit_task_closure_create(
+		selected_task_closure(symbol_authority, task),
+		selected_type_symbol_lookup(symbol_authority),
+	)
 
 	Some(indent + "blorp_Closure* " + fn_name + " = (blorp_Closure*)" + closure_value + ";\n")
 
@@ -22918,18 +23323,46 @@ private pure func emit_function(
 					emit_function_inventory(func_info, display_name)
 
 	with_task: String = with_current_task_local(rendered, compact)
-
-	if (
+	closure_env_destructor: String = match func_info.function_kind:
+		ClosureBodyFunction(abi):
+			if abi.captures.length() == 0:
+				""
+			else:
+				emitted_name: String = selected_callable_c_spelling(
+					symbol_authority,
+					func_info.name,
+					func_info.def_id,
+					abi.c_name,
+				)
+				type_symbol_lookup: Dict[String, String] = selected_type_symbol_lookup(symbol_authority)
+				match closure_env_storage_kind(abi.captures, abi.task_abi, type_symbol_lookup):
+					LegacyVoidPointerSlots:
+						""
+					TypedInlineTail:
+						match closure_env_capture_field_declarations(abi.captures, type_symbol_lookup):
+							Some(_):
+								closure_env_destructor_body(
+									abi.captures,
+									emitted_name,
+									internal_type_linkage,
+								)
+							None:
+								""
+		_:
+			""
+	emitted_function: String = if (
 		internal_linkage
 		and func_info.body.is_some()
-		and ((
+		and (
 			func_info.function_kind == UserFunction
 			or function_kind_is_closure_body(func_info.function_kind)
-		))
+		)
 	):
 		"static " + with_task
 	else:
 		with_task
+
+	emitted_function + closure_env_destructor
 
 
 private pure func function_kind_is_closure_body(kind: CoreFunctionKind) -> Bool:
@@ -26409,6 +26842,12 @@ that needs the structured form — today, `render_split_translation_units` —
 never has to re-derive them by calling `emit_value_record_decl` /
 `emit_heap_record_decl` / `emit_enum_decl` / `emit_union_decl` a second time.
 ---
+private record CClosureEnvEmission {
+	type_declaration: String,
+	destructor_prototype: String
+}
+
+
 private record CEmissionSections {
 	heap_record_and_union_forward_decls: String,
 	value_record_decls: String,
@@ -26416,10 +26855,12 @@ private record CEmissionSections {
 	generated_stack_option_typedefs: String,
 	union_decls: String,
 	heap_record_decls: String,
+	closure_env_type_decls: String,
 	canonical_empty_lists: String,
 	static_string_literals: String,
 	static_closure_forward_decls: String,
 	function_forward_decls: String,
+	closure_env_destructor_prototypes: String,
 	global_decls: String,
 	global_init: String,
 	profile_metadata: String,
@@ -26445,9 +26886,11 @@ private pure func render_single_translation_unit(sections: CEmissionSections, he
 	c_code = append_emitted_c(c_code, sections.generated_stack_option_typedefs)
 	c_code = append_emitted_c(c_code, sections.union_decls)
 	c_code = append_emitted_c(c_code, sections.heap_record_decls)
+	c_code = append_emitted_c(c_code, sections.closure_env_type_decls)
 	c_code = append_emitted_c(c_code, sections.canonical_empty_lists)
 	c_code = append_emitted_c(c_code, sections.static_string_literals)
 	c_code = append_emitted_c(c_code, sections.static_closure_forward_decls)
+	c_code = append_emitted_c(c_code, sections.closure_env_destructor_prototypes)
 	c_code = append_emitted_c(c_code, sections.function_forward_decls)
 	c_code = append_emitted_c(c_code, sections.global_decls)
 	c_code = append_emitted_c(c_code, sections.global_init)
@@ -26754,6 +27197,12 @@ private pure func emit_decls(
 		symbol_authority,
 		internal_type_linkage,
 	)
+	closure_env_emissions: List[CClosureEnvEmission] = collect_closure_env_emissions(
+		decls,
+		symbol_authority,
+		internal_type_linkage,
+		selected_type_symbol_lookup(symbol_authority),
+	)
 
 	Ok({
 		heap_record_and_union_forward_decls = emit_heap_record_and_union_forward_decls(decls, selected_type_symbol_lookup(symbol_authority)),
@@ -26762,6 +27211,7 @@ private pure func emit_decls(
 		generated_stack_option_typedefs = emit_generated_stack_option_typedefs(decls, selected_type_symbol_lookup(symbol_authority)),
 		union_decls = join_union_decl_emissions(union_emissions),
 		heap_record_decls = join_heap_record_decl_emissions(heap_record_emissions),
+		closure_env_type_decls = closure_env_emission_type_declarations(closure_env_emissions),
 		canonical_empty_lists = emit_canonical_empty_list_definitions(canonical_empty_lists, selected_type_symbol_lookup(symbol_authority)),
 		static_string_literals = emit_static_string_literal_definitions(static_string_literals),
 		static_closure_forward_decls = emit_static_closure_forward_decls(
@@ -26773,6 +27223,9 @@ private pure func emit_decls(
 			decls,
 			internal_linkage,
 			symbol_authority,
+		),
+		closure_env_destructor_prototypes = closure_env_emission_destructor_prototypes(
+			closure_env_emissions,
 		),
 		global_decls = emit_global_decls(decls, internal_type_linkage, selected_type_symbol_lookup(symbol_authority)),
 		global_init = global_init,
@@ -27522,7 +27975,7 @@ private pure func render_split_translation_units(
 		decls,
 		plan,
 		authority,
-	) + sections.function_forward_decls + emit_entrypoint_forward_decls(
+	) + sections.closure_env_type_decls + sections.closure_env_destructor_prototypes + sections.function_forward_decls + emit_entrypoint_forward_decls(
 		decls,
 		authority,
 	) + header_inline_support(

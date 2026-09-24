@@ -22661,6 +22661,9 @@ typedef struct blorp_Closure_s {
     unsigned long env_release_mask;
 } blorp_Closure;
 
+/* Negative env_count tags an aligned typed tail; legacy inline slot counts stay nonnegative. */
+#define BLORP_CLOSURE_TYPED_INLINE_ENV_COUNT (-1L)
+
 blorp_Closure* blorp_closure_new(void* func, void* env);
 
 // Helper: call a closure with one argument
@@ -35955,12 +35958,13 @@ bool blorp_stream_next_raw(blorp_Stream* stream, void** out) {
 // Note: blorp_closure_env_is_inline is also defined in runtime_decl.c for generated code
 
 static inline int blorp_closure_env_is_inline(blorp_Closure* c) {
-    return c->env == (void*)((char*)c + sizeof(blorp_Closure));
+    return c->env_count == BLORP_CLOSURE_TYPED_INLINE_ENV_COUNT ||
+        c->env == (void*)((char*)c + sizeof(blorp_Closure));
 }
 
 static void blorp_closure_destroy(void* obj) {
     blorp_Closure* c = (blorp_Closure*)obj;
-    if (c->env && c->env_release_mask) {
+    if (c->env && c->env_count >= 0 && c->env_release_mask) {
         void** slots = (void**)c->env;
         for (long i = 0; i < c->env_count; i++) {
             if (((c->env_release_mask >> i) & 1UL) && slots[i]) {
@@ -35988,6 +35992,25 @@ blorp_Closure* blorp_closure_new_inline(void* func, int n) {
     c->func = func;
     c->env = (void*)((char*)c + sizeof(blorp_Closure));
     c->env_count = n;
+    c->env_release_mask = 0;
+    BLORP_SET_DESTRUCTOR(c, blorp_closure_destroy);
+    return c;
+}
+
+blorp_Closure* blorp_closure_new_typed_inline(void* func, size_t env_size, size_t env_alignment) {
+    if (env_alignment == 0) env_alignment = 1;
+    size_t allocation_size = blorp_checked_add(
+        blorp_checked_add(sizeof(blorp_Closure), env_size),
+        env_alignment - 1
+    );
+    blorp_Closure* c = (blorp_Closure*)blorp_alloc(allocation_size);
+    BLORP_TAG(c, "Closure");
+    c->func = func;
+    uintptr_t env_address = (uintptr_t)((char*)c + sizeof(blorp_Closure));
+    size_t remainder = env_address % env_alignment;
+    size_t env_padding = remainder == 0 ? 0 : env_alignment - remainder;
+    c->env = (void*)(env_address + env_padding);
+    c->env_count = BLORP_CLOSURE_TYPED_INLINE_ENV_COUNT;
     c->env_release_mask = 0;
     BLORP_SET_DESTRUCTOR(c, blorp_closure_destroy);
     return c;

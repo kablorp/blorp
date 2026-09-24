@@ -748,6 +748,9 @@ typedef struct blorp_Closure_s {
     unsigned long env_release_mask;
 } blorp_Closure;
 
+/* Negative env_count tags an aligned typed tail; legacy inline slot counts stay nonnegative. */
+#define BLORP_CLOSURE_TYPED_INLINE_ENV_COUNT (-1L)
+
 typedef struct blorp_WorkItem_s {
     struct blorp_WorkItem_s* next;
     void (*func)(void* arg);
@@ -2336,8 +2339,10 @@ blorp_StackOption_Int blorp_time_parse_rfc3339(const blorp_String* s);
 blorp_Tuple* blorp_tuple_new(long arity, ...);
 blorp_Closure* blorp_closure_new(void* func, void* env);
 blorp_Closure* blorp_closure_new_inline(void* func, int n);
+blorp_Closure* blorp_closure_new_typed_inline(void* func, size_t env_size, size_t env_alignment);
 static inline int blorp_closure_env_is_inline(blorp_Closure* c) {
-    return c->env == (void*)((char*)c + sizeof(blorp_Closure));
+    return c->env_count == BLORP_CLOSURE_TYPED_INLINE_ENV_COUNT ||
+        c->env == (void*)((char*)c + sizeof(blorp_Closure));
 }
 
 // Fixed-Point
