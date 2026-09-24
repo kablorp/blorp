@@ -806,46 +806,6 @@ private pure func summarize_dict_entries(
 	aggregate_ownership_uses(summaries)
 
 
-private pure func summarize_call_args(
-	env: PerceusEnv,
-	name: String,
-	modes: List[OwnershipArgMode],
-	args: List[CoreExpr],
-) -> List[OwnershipUseSummary]:
-	if not env.engine_metrics_enabled:
-		summarize_call_args_impl(env, name, modes, args)
-	else:
-		perceus_engine_node_enter()
-		result: List[OwnershipUseSummary] = summarize_call_args_impl(env, name, modes, args)
-		perceus_engine_node_exit("summary:call-args-list")
-		result
-
-
-private pure func summarize_call_args_impl(
-	env: PerceusEnv,
-	name: String,
-	modes: List[OwnershipArgMode],
-	args: List[CoreExpr],
-) -> List[OwnershipUseSummary]:
-	-- One summary per argument that the contract describes a mode for, in
-	-- argument order. Peeling both lists one head at a time rebuilt a tail
-	-- pair and a result list at every position, so a call with n arguments
-	-- allocated O(n^2) lists to produce n summaries.
-	var summaries: List[OwnershipUseSummary] = []
-	var index: Int = 0
-
-	for arg in args:
-		match modes.get(index):
-			Some(mode):
-				summaries = summaries.append(summarize_linear_call_arg(env, name, mode, arg))
-			None:
-				void
-
-		index += 1
-
-	summaries
-
-
 private pure func call_result_aliases_from_borrowed_args(
 	env: PerceusEnv,
 	name: String,
@@ -876,19 +836,19 @@ private pure func call_result_aliases_target(
 	name: String,
 	contract: OwnershipCallContract,
 	args: List[CoreExpr],
-	arg_uses: List[OwnershipUseSummary],
+	target_arg_summary_present: Bool,
+	target_arg_returns_alias: Bool,
 ) -> Bool:
 	match contract.result:
 		ReturnAliasOfArg(index):
-			match args.get(index):
-				Some(arg):
-					match arg_uses.get(index):
-						Some(uses):
-							uses.returns_alias or borrow_expr_aliases_target(env, name, arg)
-						None:
-							False
-				None:
-					False
+			if not target_arg_summary_present:
+				False
+			else:
+				match args.get(index):
+					Some(arg):
+						target_arg_returns_alias or borrow_expr_aliases_target(env, name, arg)
+					None:
+						False
 		ReturnBorrowed:
 			call_result_aliases_from_borrowed_args(env, name, contract.args, args)
 		ReturnVoid:
@@ -933,37 +893,102 @@ private pure func summarize_linear_call_impl(
 ) -> OwnershipUseSummary:
 	match contract_for_call(env, kind, args.length(), return_type):
 		Some(contract):
-			arg_uses: List[OwnershipUseSummary] = summarize_call_args(
-				env,
-				name,
-				contract.args,
-				args,
-			)
+			-- The call's result mode replaces the aggregate alias flag. Only
+			-- ReturnAliasOfArg needs one argument's alias bit, so retain that
+			-- scalar while folding instead of allocating a list of summaries.
+			var arg_required_refs: Int = 0
+			var arg_consumed_refs: Int = 0
+			var arg_touched: Bool = False
+			var target_arg_summary_present: Bool = False
+			var target_arg_returns_alias: Bool = False
+			var index: Int = 0
 
-			-- A closure call evaluates the borrowed callee before its arguments.
-			-- Every other call kind reaches its callee through the contract, so
-			-- the argument summaries are the whole story.
-			uses: OwnershipUseSummary = match kind:
-				ClosureCall:
-					aggregate_ownership_uses_from(
-						summarize_linear_borrow(env, name, callee),
-						arg_uses,
-					)
-				_:
-					aggregate_ownership_uses(arg_uses)
-
-			ownership_uses_with_returns_alias(
-				uses,
-				call_result_aliases_target(env, name, contract, args, arg_uses),
-			)
-		None:
-			callee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, callee)
-			var summaries: List[OwnershipUseSummary] = []
+			if env.engine_metrics_enabled:
+				perceus_engine_node_enter()
+			else:
+				void
 
 			for arg in args:
-				summaries = summaries.append(summarize_linear_ownership_uses(env, name, arg))
+				match contract.args.get(index):
+					Some(mode):
+						arg_uses: OwnershipUseSummary = summarize_linear_call_arg(
+							env,
+							name,
+							mode,
+							arg,
+						)
+						arg_required_refs = max_int(
+							arg_required_refs,
+							arg_consumed_refs + arg_uses.required_refs,
+						)
+						arg_consumed_refs += arg_uses.consumed_refs
+						arg_touched = arg_touched or arg_uses.touched
 
-			aggregate_ownership_uses_from(callee_uses, summaries)
+						match contract.result:
+							ReturnAliasOfArg(target_index):
+								if target_index == index:
+									target_arg_summary_present = True
+									target_arg_returns_alias = arg_uses.returns_alias
+								else:
+									void
+							_:
+								void
+					None:
+						void
+
+				index += 1
+
+			if env.engine_metrics_enabled:
+				-- Preserve the historical counter key for profile comparisons.
+				perceus_engine_node_exit("summary:call-args-list")
+			else:
+				void
+
+			-- A closure call evaluates the borrowed callee before its arguments.
+			-- Other call kinds reach their callee through the contract. Summarize
+			-- the callee after the argument walk, as before, then prefix its uses.
+			callee_uses: OwnershipUseSummary = match kind:
+				ClosureCall:
+					summarize_linear_borrow(env, name, callee)
+				_:
+					NO_OWNERSHIP_USES
+
+			{
+				required_refs = max_int(
+					callee_uses.required_refs,
+					callee_uses.consumed_refs + arg_required_refs,
+				),
+				consumed_refs = callee_uses.consumed_refs + arg_consumed_refs,
+				touched = callee_uses.touched or arg_touched,
+				returns_alias = call_result_aliases_target(
+					env,
+					name,
+					contract,
+					args,
+					target_arg_summary_present,
+					target_arg_returns_alias,
+				),
+			}
+		None:
+			callee_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, callee)
+			var required_refs: Int = callee_uses.required_refs
+			var consumed_refs: Int = callee_uses.consumed_refs
+			var touched: Bool = callee_uses.touched
+			var returns_alias: Bool = callee_uses.returns_alias
+
+			for arg in args:
+				arg_uses: OwnershipUseSummary = summarize_linear_ownership_uses(env, name, arg)
+				required_refs = max_int(required_refs, consumed_refs + arg_uses.required_refs)
+				consumed_refs += arg_uses.consumed_refs
+				touched = touched or arg_uses.touched
+				returns_alias = returns_alias or arg_uses.returns_alias
+
+			{
+				required_refs = required_refs,
+				consumed_refs = consumed_refs,
+				touched = touched,
+				returns_alias = returns_alias,
+			}
 
 
 private pure func summarize_linear_call_arg(

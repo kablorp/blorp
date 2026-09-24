@@ -14,7 +14,7 @@ import:
 		CoreBinaryOp(AddOp, EqualOp, LessOp),
 		CoreBoxKind(PointerBox),
 		CoreBoxedStorageValue,
-		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UserCall),
+		CoreCallKind(BuiltinCall, ClosureCall, ForeignCall, IntrinsicCall, UnknownCall, UserCall),
 		CoreClosureCapture,
 		CoreConstructorLengthMatch,
 		CoreConstructorLengthMatchBranch,
@@ -160,6 +160,7 @@ import:
 	../../../src/compiler/stage_09_core/perceus/uses:
 		borrowed_result_aliases_param,
 		count_uses,
+		summarize_linear_call,
 	../../../src/compiler/stage_09_core/perceus/env:
 		PerceusEnv,
 		PerceusGlobalLookup(CollidingPerceusGlobals),
@@ -6153,6 +6154,111 @@ pure func test_foreign_and_closure_calls_borrow_arguments() -> Bool:
 		[BorrowArg],
 		ReturnPrimitive,
 	) and contract_is(Some(borrow_contract_for_signature(env, 0, void_type())), [], ReturnVoid)
+
+
+pure func test_call_summary_aliases_contract_result_argument() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	uses = summarize_linear_call(
+		env,
+		"items",
+		list_int_type(),
+		IntrinsicCall("list_get"),
+		int_expr(0),
+		[var_expr("items", list_int_type()), int_expr(0)],
+	)
+
+	(
+		uses.required_refs == 1
+		and uses.consumed_refs == 0
+		and uses.touched
+		and uses.returns_alias
+	)
+
+
+pure func test_call_summary_borrowed_result_finds_matching_argument() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	uses = summarize_linear_call(
+		env,
+		"items",
+		int_type(),
+		BuiltinCall("blorp_vector_get_or"),
+		int_expr(0),
+		[var_expr("other", list_int_type()), int_expr(0), var_expr("items", list_int_type())],
+	)
+
+	(
+		uses.required_refs == 1
+		and uses.consumed_refs == 0
+		and uses.touched
+		and uses.returns_alias
+	)
+
+
+pure func test_call_summary_accumulates_multiple_consuming_arguments() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	uses = summarize_linear_call(
+		env,
+		"text",
+		string_type(),
+		BuiltinCall("blorp_string_concat_consume"),
+		int_expr(0),
+		[var_expr("text", string_type()), var_expr("text", string_type())],
+	)
+
+	(
+		uses.required_refs == 2
+		and uses.consumed_refs == 2
+		and uses.touched
+		and not uses.returns_alias
+	)
+
+
+pure func test_call_summary_evaluates_closure_callee_before_arguments() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	callee: CoreExpr = SeqExpr(
+		var_expr("owner", list_int_type()),
+		var_expr("callback", closure_type()),
+	)
+	uses = summarize_linear_call(
+		env,
+		"owner",
+		int_type(),
+		ClosureCall,
+		callee,
+		[var_expr("owner", list_int_type())],
+	)
+
+	(
+		uses.required_refs == 2
+		and uses.consumed_refs == 1
+		and uses.touched
+		and not uses.returns_alias
+	)
+
+
+pure func test_call_summary_without_contract_preserves_argument_aliases() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	field: CoreExpr = FieldExpr(
+		var_expr("owner", HeapRecordType("Node")),
+		"items",
+		list_int_type(),
+		synthetic_core_source_loc(),
+	)
+	uses = summarize_linear_call(
+		env,
+		"owner",
+		list_int_type(),
+		UnknownCall,
+		int_expr(0),
+		[field, var_expr("owner", HeapRecordType("Node"))],
+	)
+
+	(
+		uses.required_refs == 1
+		and uses.consumed_refs == 1
+		and uses.touched
+		and uses.returns_alias
+	)
 
 
 pure func test_count_uses_counts_linear_occurrences() -> Bool:
@@ -17664,6 +17770,23 @@ tests: TestSuite = {
 		(
 			"foreign and closure calls borrow arguments",
 			test_foreign_and_closure_calls_borrow_arguments,
+		),
+		("call summary aliases contract result argument", test_call_summary_aliases_contract_result_argument),
+		(
+			"call summary borrowed result finds matching argument",
+			test_call_summary_borrowed_result_finds_matching_argument,
+		),
+		(
+			"call summary accumulates multiple consuming arguments",
+			test_call_summary_accumulates_multiple_consuming_arguments,
+		),
+		(
+			"call summary evaluates closure callee before arguments",
+			test_call_summary_evaluates_closure_callee_before_arguments,
+		),
+		(
+			"call summary without contract preserves argument aliases",
+			test_call_summary_without_contract_preserves_argument_aliases,
 		),
 		("count uses counts linear occurrences", test_count_uses_counts_linear_occurrences),
 		("count uses respects shadowing", test_count_uses_respects_shadowing),
