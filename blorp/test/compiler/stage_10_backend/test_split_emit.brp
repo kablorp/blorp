@@ -16,7 +16,7 @@ import:
 		synthetic_core_source_loc,
 		CoreType(NamedType),
 		CoreUnionDecl,
-		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
+		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreVar,
 	../../../src/compiler/stage_09_core/pipeline: run_pre_dce_tail
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
@@ -141,6 +141,16 @@ pure func doc_union_decl() -> CoreUnionDecl:
 			},
 		],
 		loc = synthetic_core_source_loc()
+	}
+
+
+pure func erased_doc_split_program() -> CoreProgram:
+	{
+		decls = [
+			UnionDecl({ doc_union_decl() | payload_storage = ErasedUnionPayloadStorage }),
+		],
+		foreign_includes = [],
+		source_files = []
 	}
 
 
@@ -401,6 +411,34 @@ pure func test_header_body_partition_at_three_units() -> Bool:
 				and destroys_ok
 				and no_body_defines_prototype_text
 				and no_typedef_in_bodies
+			)
+		Err(_):
+			False
+
+
+---
+Projected split output must use one artifact-local C type symbol consistently
+for the erased union typedef, its constructor prototype, and its definition;
+the field and cleanup mask must also agree across the prototype/definition
+boundary.
+---
+pure func test_projected_erased_union_constructor_abi_matches() -> Bool:
+	match try_emit_prepared_core_program_c_split_artifact_with_profile(
+		run_pre_dce_tail(erased_doc_split_program()),
+		FunctionProfileOff,
+		3,
+		"blorp_shared.h",
+	):
+		Ok(result):
+			type_symbol: String = projected_type_base_symbol(0)
+			constructor_signature: String = (
+				type_symbol + "* __def_701_Text(void* field0, unsigned long release_mask)"
+			)
+			(
+				result.shared_header.contains("typedef struct " + type_symbol + " {")
+					and result.shared_header.contains("struct { void* field0; } Text;")
+					and result.shared_header.contains(constructor_signature + ";")
+					and count_occurrences_across(result.bodies, constructor_signature + " {") == 1
 			)
 		Err(_):
 			False
@@ -1025,6 +1063,10 @@ tests: TestSuite = {
 	tests = [
 		("unit count one matches single-file path", test_unit_count_one_matches_single_file_path),
 		("header/body partition at three units", test_header_body_partition_at_three_units),
+		(
+			"projected erased union constructor ABI matches",
+			test_projected_erased_union_constructor_abi_matches,
+		),
 		(
 			"string literal defined once and declared once",
 			test_string_literal_defined_once_and_declared_once,
