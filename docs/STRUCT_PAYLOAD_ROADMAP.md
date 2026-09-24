@@ -158,6 +158,24 @@ count by boxed type. Committed under `benchmarks/results/`.
 measuring: nearly every compiler union is erased, so S2's reach is most of
 the IR.
 
+### S0 result (2026-09-23)
+
+`benchmarks/results/struct_payload_census_2026-09-23.md`. Of 532 source
+unions, S1 as written unlocks 8; S2 as written unlocks 352 (71% of the 495
+non-generic erased unions), including `CoreExpr`, `SemanticType`,
+`ParsedExpr` and `TypedExpr`. The remaining 143 are blocked, all but three of
+them, by an **opaque type** field (`opaque type X = Rep`): the predicate
+matches the field's own type name and never unwraps to the representation,
+so a union carrying an `AnalysisPurpose`- or `DocumentUri`-shaped id stays
+erased although the payload is an `Int` or a `String`. S2 must resolve
+opaque types to their representation before classifying the field (25 of the
+182 opaque field instances resolve to `Int`, 15 to `String`; the rest to
+records and unions that S2 accepts anyway). The runtime audit found no
+helper that walks a union payload as `void*`; the S2 risk surface is the
+emitter's release-policy derivation and destructor emission, not
+`runtime.c`. No dynamic counter attributes allocations to `blorp_box_struct`;
+the census counts are static.
+
 ### S1: typed payloads for struct and enum fields
 
 **Context.** `source_union_typed_payload_field_supported` accepts scalars
