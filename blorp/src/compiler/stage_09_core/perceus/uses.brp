@@ -187,7 +187,9 @@ import:
 		),
 		CoreUnboxKind(PointerUnbox),
 		CoreVar,
+		core_expr_own_node_id,
 		core_expr_type,
+		core_node_id_raw,
 		core_var_equal,
 		core_vars_have_same_definition,
 	../ownership:
@@ -249,8 +251,18 @@ foreign:
 -- argument -- the identity check is a raw pointer compare, the same
 -- primitive `same_core_expr`/`blorp_same_object` already use elsewhere in
 -- this pass family. A no-op unless `BLORP_PERCEUS_ENGINE_METRICS` is set.
+--
+-- N3 second-attempt measurement (docs/CORE_NODE_TABLE_ROADMAP.md N3): the
+-- `node_id` argument is `core_node_id_raw(core_expr_own_node_id(expr))`, or
+-- 0 when `expr` has no node id of its own (the `LetExpr`/`BorrowLetExpr`/
+-- `SeqExpr` wrappers) -- 0 is never treated as a hit. It feeds a second,
+-- wider-scoped table (reset per function body, not per managed-let
+-- invocation) that answers a different question than the census above:
+-- how often the *same node* is re-summarized for the *same variable name*
+-- anywhere within one function, which is the scope the N3 memo design
+-- would actually key on.
 foreign:
-	private pure func perceus_engine_summary_enter(name: String, expr: CoreExpr) -> Void = "blorp_perceus_engine_summary_enter_c"
+	private pure func perceus_engine_summary_enter(name: String, expr: CoreExpr, node_id: Int) -> Void = "blorp_perceus_engine_summary_enter_c"
 	private pure func perceus_engine_summary_exit() -> Void = "blorp_perceus_engine_summary_exit_c"
 	private pure func perceus_engine_summary_node_visit() -> Void = "blorp_perceus_engine_summary_node_visit_c"
 
@@ -3145,16 +3157,59 @@ private pure func summarize_linear_ownership_uses_non_binding(
 				fallback_result
 
 
+--- The node id `summarize_linear_ownership_uses` keys its memo (and its
+--- diagnostic census) on: `core_node_id_raw(core_expr_own_node_id(expr))`,
+--- or 0 for the three loc-less wrapper kinds and for a synthetic location.
+--- 0 is never a hit -- see `docs/CORE_NODE_TABLE_ROADMAP.md` N2's packing
+--- note (0 is reserved) and N3's "never memoizable" rule.
+private pure func memoizable_node_id(expr: CoreExpr) -> Int:
+	match core_expr_own_node_id(expr):
+		Some(loc):
+			core_node_id_raw(loc)
+		None:
+			0
+
+
+-- N3 second attempt (worktree core/n3b-summary-entry-memo), parked with
+-- numbers: a live entry memo keyed by `(node id, name)` was built and
+-- gated (`PerceusEnv.memo_enabled`) to the one call tree analysis said was
+-- env-invariant, with proper `blorp_retain`/`blorp_release` on the cached
+-- name. It still produced non-identical C on the frozen self-compile
+-- input (hundreds of thousands of diff lines against the unmemoized
+-- baseline) and an ASan heap-use-after-free when running the compiler's
+-- own test suite -- i.e. a real correctness bug survives both the env-
+-- invariance fix and the retain/release fix, most likely a node id that
+-- is not as unique as N1/N2 assumes somewhere in `rebuild_managed_let`'s
+-- shadowed-match-binding freshening (a subtree can be duplicated across
+-- match arms; whether every such duplication mints a fresh id was not
+-- fully verified). Per this issue's go/no-go rule ("do not land a net
+-- loss"), the memo itself was not landed; see
+-- `docs/CORE_NODE_TABLE_ROADMAP.md` N3 and the worktree's own report for
+-- the measurement this parks (a genuine ~7M-allocation opportunity, well
+-- past the 5M go/no-go floor, that a correct, narrower-scoped memo could
+-- still capture).
 pure func summarize_linear_ownership_uses(
 	env: PerceusEnv,
 	name: String,
 	expr: CoreExpr,
 ) -> OwnershipUseSummary:
+	summarize_linear_ownership_uses_measured(env, name, expr, memoizable_node_id(expr))
+
+
+-- The `BLORP_PERCEUS_ENGINE_METRICS` census wrapper around the actual
+-- walk (see `summarize_linear_ownership_uses`'s doc comment for the memo
+-- this was going to feed, parked with numbers rather than landed).
+private pure func summarize_linear_ownership_uses_measured(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+	node_id: Int,
+) -> OwnershipUseSummary:
 	if not env.engine_metrics_enabled:
 		summarize_linear_ownership_uses_impl(env, name, expr)
 	else:
 		perceus_engine_node_enter()
-		perceus_engine_summary_enter(name, expr)
+		perceus_engine_summary_enter(name, expr, node_id)
 		result: OwnershipUseSummary = summarize_linear_ownership_uses_impl(env, name, expr)
 		perceus_engine_summary_exit()
 		perceus_engine_node_exit("helper:summarize_linear_ownership_uses")
