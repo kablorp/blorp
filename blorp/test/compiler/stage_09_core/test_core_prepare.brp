@@ -82,6 +82,7 @@ import:
 		CoreUnionDecl,
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
+		CoreUnionVariant,
 		CoreUnionRepresentation(
 			BoxedOptionRepresentation,
 			GenericUnionRepresentation,
@@ -105,8 +106,11 @@ import:
 		cleanup_plan_row,
 		heap_record_cleanup_field_plan,
 		is_primitive_tuple_slot_type,
+		prepare_dict_literals_for_ownership,
 		prepare_program,
-		union_cleanup_field_plan
+		union_cleanup_field_plan,
+		union_variant_requires_release_mask
+	../../../src/compiler/stage_09_core/specialize_layout: build_specialize_layout
 	memory: same_object
 	test: TestSuite
 
@@ -2120,6 +2124,12 @@ pure func test_prepare_converts_union_constructor_call() -> Bool:
 	programs_equal(actual, expected)
 
 
+pure func test_dict_ownership_prepass_preserves_union_constructor_call() -> Bool:
+	program: CoreProgram = program_with_choice_body(choice_constructor_call())
+
+	programs_equal(prepare_dict_literals_for_ownership(program), program)
+
+
 pure func shadowed_choice_union_decl() -> CoreUnionDecl:
 	{
 		abi_type = None,
@@ -2639,6 +2649,69 @@ pure func cleanup_plan_test_iterative_union_decl() -> CoreUnionDecl:
 	}
 
 
+pure func test_erased_struct_union_storage_cleanup_policy() -> Bool:
+	point_field: CoreUnionField = no_release_union_field(ValueRecordType("CleanupPlanPoint"))
+	variant: CoreUnionVariant = {
+		name = "Point",
+		c_name = "CleanupPlanErasedPoint_Point",
+		tag_c_name = "TAG_CleanupPlanErasedPoint_Point",
+		tag = 0,
+		fields = [point_field],
+		def_id = None
+	}
+	erased_decl: CoreUnionDecl = {
+		abi_type = None,
+		name = "CleanupPlanErasedPoint",
+		type_params = [],
+		payload_storage = ErasedUnionPayloadStorage,
+		variants = [variant],
+		loc = SyntheticSourceLoc
+	}
+	typed_decl: CoreUnionDecl = {
+		erased_decl |
+			name = "CleanupPlanTypedPoint",
+			payload_storage = TypedUnionPayloadStorage
+	}
+	program: CoreProgram = {
+		decls = [UnionDecl(erased_decl), UnionDecl(typed_decl)],
+		foreign_includes = []
+	}
+	layout = build_specialize_layout(program)
+	plan: CleanupPlan = build_cleanup_plan(program)
+	erased_row: CleanupTypePlan = cleanup_plan_row(plan, 0)
+	typed_row: CleanupTypePlan = cleanup_plan_row(plan, 1)
+
+	erased_strategy_ok: Bool = match erased_row:
+		UnionTypeCleanup(union_plan):
+			union_plan.strategy == DirectCleanup
+		HeapRecordTypeCleanup(_) | NotACleanupType:
+			False
+	erased_field_ok: Bool = match union_cleanup_field_plan(erased_row, 0, 0):
+		Some(field_plan):
+			field_plan.needs_release
+		None:
+			False
+	typed_strategy_ok: Bool = match typed_row:
+		UnionTypeCleanup(union_plan):
+			union_plan.strategy == NoCleanup
+		HeapRecordTypeCleanup(_) | NotACleanupType:
+			False
+	typed_field_ok: Bool = match union_cleanup_field_plan(typed_row, 0, 0):
+		Some(field_plan):
+			not field_plan.needs_release
+		None:
+			False
+
+	(
+		erased_strategy_ok
+		and erased_field_ok
+		and typed_strategy_ok
+		and typed_field_ok
+		and union_variant_requires_release_mask(layout, ErasedUnionPayloadStorage, [point_field])
+		and not union_variant_requires_release_mask(layout, TypedUnionPayloadStorage, [point_field])
+	)
+
+
 ---
 Builds the cleanup plan for a program with a non-recursive union (direct
 cleanup), a self-recursive union (iterative cleanup, and the only case that
@@ -2845,6 +2918,10 @@ tests: TestSuite = {
 		("prepare recurses into call arguments", test_prepare_recurses_into_call_arguments),
 		("prepare converts union constructor call", test_prepare_converts_union_constructor_call),
 		(
+			"dictionary ownership prepass preserves union constructor calls",
+			test_dict_ownership_prepass_preserves_union_constructor_call,
+		),
+		(
 			"prepare uses first declared union of a name",
 			test_prepare_uses_first_declared_union_of_a_name,
 		),
@@ -2936,6 +3013,10 @@ tests: TestSuite = {
 		),
 		("prepare reuses already prepared output", test_prepare_reuses_already_prepared_output),
 		("build cleanup plan rows", test_build_cleanup_plan_rows),
+		(
+			"erased value-record union storage has owned cleanup",
+			test_erased_struct_union_storage_cleanup_policy,
+		),
 		("build cancellation plan table rows", test_build_cancellation_plan_table_rows),
 	]
 }

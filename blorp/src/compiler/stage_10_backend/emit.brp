@@ -21,8 +21,11 @@ import:
 		function_profile_mode,
 		function_profile_selectors,
 	../stage_08_core_lower/identity: core_module_member_name
-	../stage_09_core/allocation_contracts: union_variant_has_cleanup
 	../stage_09_core/c_type_layout as TypeLayout
+	../stage_09_core/specialize_layout:
+		CoreSpecializeLayout,
+		boxed_storage_slot_needs_release,
+		build_specialize_layout
 	../stage_09_core/cancellation_plan:
 		BackendCleanupTemporaryRole(
 			CallArgumentTemporary,
@@ -495,6 +498,7 @@ import:
 		heap_record_cleanup_field_plan,
 		union_cleanup_field_plan,
 		union_cleanup_variant_plan,
+		union_variant_requires_release_mask,
 	../stage_09_core/traverse as CoreTraverse
 	../stage_09_core/type_policy as CoreTypePolicy
 	c_naming:
@@ -1004,6 +1008,9 @@ private union CEmissionSymbolAuthority:
 
 private record FunctionEmissionContext {
 	cleanup_plan: CancellationProtectionPlan,
+	-- Expression-only diagnostic callers have no program-wide type index;
+	-- production contexts carry the once-built emission layout.
+	specialize_layout: Option[CoreSpecializeLayout],
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
 	indent: String,
@@ -1205,6 +1212,7 @@ private pure func function_parameter_variables(func_info: CoreFunction) -> List[
 
 private pure func emission_context_from_plan(
 	plan: CancellationProtectionPlan,
+	specialize_layout: CoreSpecializeLayout,
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
 	parameter_variables: List[CoreVar],
@@ -1217,6 +1225,7 @@ private pure func emission_context_from_plan(
 
 	{
 		cleanup_plan = plan,
+		specialize_layout = Some(specialize_layout),
 		profile_function_id = profile_function_id,
 		symbol_authority = symbol_authority,
 		indent = initial_indent,
@@ -1228,9 +1237,10 @@ private pure func emission_context_from_plan(
 private pure func diagnostic_emission_context(expr: CoreExpr) -> FunctionEmissionContext:
 	{
 		cleanup_plan = build_current_behavior_cancellation_plan(FunctionCancellationActivation({
-				name = "__backend_diagnostic",
-				def_id = -1,
-			}), expr),
+			name = "__backend_diagnostic",
+			def_id = -1,
+		}), expr),
+		specialize_layout = None,
 		profile_function_id = None,
 		symbol_authority = UnprojectedCEmissionSymbolsForTests,
 		indent = BASE_INDENT,
@@ -6686,11 +6696,13 @@ private pure func emit_prepared_channel_builtin_call(
 	name: String,
 	args: List[String],
 	typ: CoreType,
+	specialize_layout: Option[CoreSpecializeLayout],
 ) -> Option[String]:
 	if name == "blorp_channel_new":
 		elem_type ?= TypeLayout.channel_element_type(typ)
+		layout ?= specialize_layout
 
-		if TypeLayout.boxed_value_needs_release_type(elem_type):
+		if boxed_storage_slot_needs_release(layout, elem_type):
 			match args:
 				[capacity]:
 					render_args: ChannelWithElemReleaseArgs = {
@@ -6929,8 +6941,9 @@ private pure func emit_call_value_from_args(
 	kind: CoreCallKind,
 	args: List[String],
 	typ: CoreType,
-	type_symbol_lookup: Dict[String, String],
+	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
+	type_symbol_lookup: Dict[String, String] = selected_type_symbol_lookup(emission_context.symbol_authority)
 	args_c: String = args.join(", ")
 
 	match kind:
@@ -6986,6 +6999,7 @@ private pure func emit_call_value_from_args(
 												name,
 												args,
 												typ,
+												emission_context.specialize_layout,
 											):
 												Some(rendered):
 													Some(rendered)
@@ -7017,7 +7031,7 @@ private pure func emit_call_body(
 			emit_foreign_call_body(name, arg_passing, args, typ, next_temp, emission_context)
 		UserCall(name, def_id, consumed_args):
 			args_body ?= emit_call_args_body(args, next_temp, emission_context)
-			value ?= emit_call_value_from_args(kind, args_body.args, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+			value ?= emit_call_value_from_args(kind, args_body.args, typ, emission_context)
 			transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(
 				kind,
 				args,
@@ -7078,7 +7092,7 @@ private pure func emit_call_body(
 								DirectRuntimeCall(call),
 								args_body.args,
 								typ,
-								selected_type_symbol_lookup(emission_context.symbol_authority),
+								emission_context,
 							)
 							Some(
 								call_body_from_value(
@@ -7169,7 +7183,7 @@ private pure func emit_call_body(
 													kind,
 													args_body.args,
 													typ,
-													selected_type_symbol_lookup(emission_context.symbol_authority),
+													emission_context,
 												)
 												Some(
 													call_body_from_value(
@@ -7183,18 +7197,18 @@ private pure func emit_call_body(
 												)
 		TensorParallelCall(name, layout):
 			args_body ?= emit_call_args_body(args, next_temp, emission_context)
-			value ?= emit_call_value_from_args(kind, args_body.args, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+			value ?= emit_call_value_from_args(kind, args_body.args, typ, emission_context)
 			Some(call_body_from_value(emission_context.indent, args_body, "", value, typ, selected_type_symbol_lookup(emission_context.symbol_authority)))
 		DictWithCapacityCall(constructor):
 			args_body ?= emit_call_args_body(args, next_temp, emission_context)
-			value ?= emit_call_value_from_args(kind, args_body.args, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+			value ?= emit_call_value_from_args(kind, args_body.args, typ, emission_context)
 			Some(call_body_from_value(emission_context.indent, args_body, "", value, typ, selected_type_symbol_lookup(emission_context.symbol_authority)))
 		IntrinsicCall(name):
 			if name == "list_retain_for":
 				emit_list_retain_intrinsic_body(args, next_temp, emission_context)
 			else:
 				args_body ?= emit_call_args_body(args, next_temp, emission_context)
-				value ?= emit_call_value_from_args(kind, args_body.args, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+				value ?= emit_call_value_from_args(kind, args_body.args, typ, emission_context)
 				transfer_cleanup_pop: String = call_transfer_cleanup_pop_statements(
 					kind,
 					args,
@@ -7216,7 +7230,7 @@ private pure func emit_call_body(
 			None
 		ListToStringCall(callback_name):
 			args_body ?= emit_call_args_body(args, next_temp, emission_context)
-			value ?= emit_call_value_from_args(kind, args_body.args, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+			value ?= emit_call_value_from_args(kind, args_body.args, typ, emission_context)
 			Some(call_body_from_value(emission_context.indent, args_body, "", value, typ, selected_type_symbol_lookup(emission_context.symbol_authority)))
 		ClosureCall:
 			None
@@ -12478,6 +12492,7 @@ private pure func emit_closure_body_function(
 	func_info: CoreFunction,
 	abi: CoreClosureAbi,
 	plan: CancellationProtectionPlan,
+	specialize_layout: CoreSpecializeLayout,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 	compact: Bool,
@@ -12492,6 +12507,7 @@ private pure func emit_closure_body_function(
 			)
 			emission_context: FunctionEmissionContext = emission_context_from_plan(
 				plan,
+				specialize_layout,
 				None,
 				symbol_authority,
 				function_parameter_variables(func_info),
@@ -13591,7 +13607,7 @@ private pure func emit_simple_expr_leaf(
 						None
 					ListToStringCall(callback_name):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(emitted_kind, arg_values, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+						emit_call_value_from_args(emitted_kind, arg_values, typ, emission_context)
 					BuiltinCall(name):
 						match emit_typed_builtin_tensor_call(name, args, typ, emission_context):
 							Some(rendered):
@@ -13641,7 +13657,7 @@ private pure func emit_simple_expr_leaf(
 																emitted_kind,
 																arg_values,
 																typ,
-																selected_type_symbol_lookup(emission_context.symbol_authority),
+																emission_context,
 															)
 					DirectRuntimeCall(call):
 						match emit_typed_direct_tensor_call(call, args, typ, emission_context):
@@ -13659,20 +13675,20 @@ private pure func emit_simple_expr_leaf(
 									Some(rendered):
 										Some(rendered)
 									None:
-										emit_call_value_from_args(emitted_kind, arg_values, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+										emit_call_value_from_args(emitted_kind, arg_values, typ, emission_context)
 					TensorParallelCall(name, layout):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(emitted_kind, arg_values, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+						emit_call_value_from_args(emitted_kind, arg_values, typ, emission_context)
 					DictWithCapacityCall(constructor):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(emitted_kind, arg_values, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+						emit_call_value_from_args(emitted_kind, arg_values, typ, emission_context)
 					OperationResultCall(bridge):
 						None
 					FallibleStreamTerminalCall(bridge):
 						None
 					ListToStringCall(callback_name):
 						arg_values ?= emit_simple_expr_arg_values(args, emission_context)
-						emit_call_value_from_args(emitted_kind, arg_values, typ, selected_type_symbol_lookup(emission_context.symbol_authority))
+						emit_call_value_from_args(emitted_kind, arg_values, typ, emission_context)
 					ClosureCall:
 						emit_closure_call(callee, args, typ, emission_context)
 					UnknownCall | DeferredTraitCall(_, _) | SelectedTraitCall(_, _, _, _):
@@ -22093,6 +22109,7 @@ private pure func union_variant_c_name(
 
 private pure func channel_attempt_constructors(
 	union_decl: CoreUnionDecl,
+	layout: CoreSpecializeLayout,
 ) -> ChannelAttemptConstructors:
 	recv_value_variant: Option[CoreUnionVariant] = find_union_variant(
 		union_decl.variants,
@@ -22101,7 +22118,11 @@ private pure func channel_attempt_constructors(
 
 	recv_value_uses_release_mask: Bool = match recv_value_variant:
 		Some(variant):
-			union_variant_uses_release_mask(union_decl.payload_storage, variant)
+			union_variant_requires_release_mask(
+				layout,
+				union_decl.payload_storage,
+				variant.fields,
+			)
 		None:
 			False
 
@@ -22336,21 +22357,17 @@ private pure func emit_channel_recv_timeout_attempt_for_values(
 	func_info: CoreFunction,
 	constructors: ChannelAttemptConstructors,
 	temp_seed: String,
-	channel_expr: CoreExpr,
 	arg_values: List[String],
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match arg_values:
 		[channel, timeout]:
-			elem_type ?= TypeLayout.channel_element_type(core_expr_type(channel_expr))
 			recv_constructors ?= channel_recv_attempt_constructors(
 				constructors,
 				constructors.recv_timed_out,
 			)
 
-			release_policy: ChannelRecvReleasePolicy = if TypeLayout.boxed_value_needs_release_type(
-				elem_type,
-			):
+			release_policy: ChannelRecvReleasePolicy = if constructors.recv_value_uses_release_mask:
 				ReleaseChannelRecvValue
 			else:
 				KeepChannelRecvValue
@@ -22377,21 +22394,17 @@ private pure func emit_channel_try_recv_attempt_for_values(
 	func_info: CoreFunction,
 	constructors: ChannelAttemptConstructors,
 	temp_seed: String,
-	channel_expr: CoreExpr,
 	arg_values: List[String],
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match arg_values:
 		[channel]:
-			elem_type ?= TypeLayout.channel_element_type(core_expr_type(channel_expr))
 			recv_constructors ?= channel_recv_attempt_constructors(
 				constructors,
 				constructors.recv_would_block,
 			)
 
-			release_policy: ChannelRecvReleasePolicy = if TypeLayout.boxed_value_needs_release_type(
-				elem_type,
-			):
+			release_policy: ChannelRecvReleasePolicy = if constructors.recv_value_uses_release_mask:
 				ReleaseChannelRecvValue
 			else:
 				KeepChannelRecvValue
@@ -22434,7 +22447,8 @@ private pure func emit_channel_attempt_user_function(
 
 	type_name ?= union_type_name(func_info.return_type)
 	union_decl ?= find_union_decl(decls, type_name)
-	constructors: ChannelAttemptConstructors = channel_attempt_constructors(union_decl)
+	layout ?= emission_context.specialize_layout
+	constructors: ChannelAttemptConstructors = channel_attempt_constructors(union_decl, layout)
 	temp_seed: String = func_info.def_id.to_string()
 
 	match body:
@@ -22483,12 +22497,11 @@ private pure func emit_channel_attempt_user_function(
 						None
 			else if channel_attempt_name == "blorp_channel_recv_timeout_attempt":
 				match args:
-					[channel_expr, timeout_expr]:
+					[_, timeout_expr]:
 						emit_channel_recv_timeout_attempt_for_values(
 							func_info,
 							constructors,
 							temp_seed,
-							channel_expr,
 							arg_values,
 							emission_context.symbol_authority,
 						)
@@ -22500,12 +22513,11 @@ private pure func emit_channel_attempt_user_function(
 						None
 			else if channel_attempt_name == "blorp_channel_try_recv_attempt":
 				match args:
-					[channel_expr]:
+					[_]:
 						emit_channel_try_recv_attempt_for_values(
 							func_info,
 							constructors,
 							temp_seed,
-							channel_expr,
 							arg_values,
 							emission_context.symbol_authority,
 						)
@@ -22697,6 +22709,7 @@ private pure func emit_supported_user_function(
 	profile_plan: Option[ProfileEmissionPlan],
 	profile_function_id: Option[ProfileFunctionId],
 	plan: CancellationProtectionPlan,
+	specialize_layout: CoreSpecializeLayout,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Option[String]:
@@ -22704,6 +22717,7 @@ private pure func emit_supported_user_function(
 		Some(_):
 			emission_context: FunctionEmissionContext = emission_context_from_plan(
 				plan,
+				specialize_layout,
 				profile_function_id,
 				symbol_authority,
 				function_parameter_variables(func_info),
@@ -22838,6 +22852,7 @@ private pure func emit_function(
 	display_name: String,
 	internal_linkage: Bool,
 	plan: CancellationProtectionPlan,
+	specialize_layout: CoreSpecializeLayout,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 	compact: Bool,
@@ -22852,6 +22867,7 @@ private pure func emit_function(
 						profile_plan,
 						profile_function_id,
 						plan,
+						specialize_layout,
 						symbol_authority,
 						compact,
 					):
@@ -22870,6 +22886,7 @@ private pure func emit_function(
 						profile_plan,
 						profile_function_id,
 						plan,
+						specialize_layout,
 						symbol_authority,
 						compact,
 					):
@@ -22890,6 +22907,7 @@ private pure func emit_function(
 				func_info,
 				abi,
 				plan,
+				specialize_layout,
 				symbol_authority,
 				internal_type_linkage,
 				compact,
@@ -24983,11 +25001,13 @@ private pure func emit_global_runtime_init_body(
 	global: CoreGlobal,
 	next_temp: Int,
 	plan: CancellationProtectionPlan,
+	specialize_layout: CoreSpecializeLayout,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Option[FunctionBodyC]:
 	emission_context: FunctionEmissionContext = emission_context_from_plan(
 		plan,
+		specialize_layout,
 		None,
 		symbol_authority,
 		[],
@@ -25399,20 +25419,32 @@ private pure func emit_union_constructor_param(
 
 private pure func union_variant_uses_release_mask(
 	payload_storage: CoreUnionPayloadStorage,
-	variant: CoreUnionVariant,
+	type_plan: CleanupTypePlan,
+	variant_index: Int,
 ) -> Bool:
 	match payload_storage:
 		TypedUnionPayloadStorage:
 			False
 		ErasedUnionPayloadStorage:
-			union_variant_has_cleanup(variant)
+			match union_cleanup_variant_plan(type_plan, variant_index):
+				Some(variant_plan):
+					variant_plan.has_cleanup
+				None:
+					False
 
 
-private pure func union_decl_has_release_mask(union_decl: CoreUnionDecl) -> Bool:
+private pure func union_decl_has_release_mask(
+	union_decl: CoreUnionDecl,
+	type_plan: CleanupTypePlan,
+) -> Bool:
 	var has_release_mask: Bool = False
 
-	for variant in union_decl.variants:
-		if union_variant_uses_release_mask(union_decl.payload_storage, variant):
+	for entry in union_decl.variants.enumerate():
+		if union_variant_uses_release_mask(
+			union_decl.payload_storage,
+			type_plan,
+			entry[0],
+		):
 			has_release_mask = True
 			break
 
@@ -25584,6 +25616,7 @@ private pure func emit_union_destructor(
 private pure func emit_union_constructor(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	variant_index: Int,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	type_symbol_lookup: Dict[String, String],
@@ -25599,9 +25632,10 @@ private pure func emit_union_constructor(
 		var index: Int = 0
 		uses_release_mask: Bool = union_variant_uses_release_mask(
 			union_decl.payload_storage,
-			variant,
+			type_plan,
+			variant_index,
 		)
-		has_release_mask: Bool = union_decl_has_release_mask(union_decl)
+		has_release_mask: Bool = union_decl_has_release_mask(union_decl, type_plan)
 
 		for field in variant.fields:
 			params = params.append(
@@ -25640,6 +25674,7 @@ private pure func emit_union_constructor(
 private pure func emit_union_reuse_constructor(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	variant_index: Int,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	type_symbol_lookup: Dict[String, String],
@@ -25653,9 +25688,10 @@ private pure func emit_union_reuse_constructor(
 		var index: Int = 0
 		uses_release_mask: Bool = union_variant_uses_release_mask(
 			union_decl.payload_storage,
-			variant,
+			type_plan,
+			variant_index,
 		)
-		has_release_mask: Bool = union_decl_has_release_mask(union_decl)
+		has_release_mask: Bool = union_decl_has_release_mask(union_decl, type_plan)
 		reuse_name: String = union_reuse_name(union_decl.name, variant.c_name)
 
 		for field in variant.fields:
@@ -25754,12 +25790,14 @@ private pure func emit_union_decl(
 	var reuse_constructors_c: String = make_string(0)
 	naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
 
-	release_mask_field: String = if union_decl_has_release_mask(union_decl):
+	release_mask_field: String = if union_decl_has_release_mask(union_decl, type_plan):
 		"  unsigned long release_mask;\n"
 	else:
 		""
 
-	for variant in union_decl.variants:
+	for entry in union_decl.variants.enumerate():
+		variant_index: Int = entry[0]
+		variant: CoreUnionVariant = entry[1]
 		storage_c = append_emitted_c(
 			storage_c,
 			emit_union_variant_storage(union_decl.payload_storage, variant, selected_type_symbol_lookup(authority)),
@@ -25770,11 +25808,25 @@ private pure func emit_union_decl(
 		)
 		constructor_pieces = constructor_pieces.append({
 			is_owner_data = variant.fields.length() == 0,
-			text = emit_union_constructor(union_decl, variant, type_plan, naming, selected_type_symbol_lookup(authority)),
+			text = emit_union_constructor(
+				union_decl,
+				variant,
+				variant_index,
+				type_plan,
+				naming,
+				selected_type_symbol_lookup(authority),
+			),
 		})
 		reuse_constructors_c = append_emitted_c(
 			reuse_constructors_c,
-			emit_union_reuse_constructor(union_decl, variant, type_plan, naming, selected_type_symbol_lookup(authority)),
+			emit_union_reuse_constructor(
+				union_decl,
+				variant,
+				variant_index,
+				type_plan,
+				naming,
+				selected_type_symbol_lookup(authority),
+			),
 		)
 
 	header: String = "typedef struct " + naming.c_name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + naming.c_name + ";\n\n" + tags_c + "\n"
@@ -26058,6 +26110,7 @@ private pure func global_cancellation_plan_or_default(
 private pure func emit_global_init_function(
 	decls: List[CoreDecl],
 	cancellation_table: CancellationPlanTable,
+	specialize_layout: CoreSpecializeLayout,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Result[String, CoreEmitError]:
@@ -26085,6 +26138,7 @@ private pure func emit_global_init_function(
 								global,
 								temp_index,
 								plan,
+								specialize_layout,
 								symbol_authority,
 								compact,
 							):
@@ -26186,6 +26240,7 @@ private pure func emit_function_decls(
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_linkage: Bool,
 	cancellation_table: CancellationPlanTable,
+	specialize_layout: CoreSpecializeLayout,
 	internal_type_linkage: Bool,
 	compact: Bool,
 ) -> List[CFunctionEmission]:
@@ -26224,6 +26279,7 @@ private pure func emit_function_decls(
 						func_info.name,
 						internal_linkage,
 						plan,
+						specialize_layout,
 						symbol_authority,
 						internal_type_linkage,
 						compact,
@@ -26658,13 +26714,20 @@ private pure func emit_decls(
 	compact: Bool,
 ) -> Result[CEmissionSections, CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
+	specialize_layout: CoreSpecializeLayout = build_specialize_layout(program)
 	layouts: CRecordLayoutRegistry = classify_c_record_layouts(program)
 	static_string_literals ?= collect_backend_static_string_literals(
 		program,
 	).map_err(
 		func(error): InvalidStaticStringLiteralPool(error),
 	)
-	global_init ?= emit_global_init_function(decls, cancellation_table, symbol_authority, compact)
+	global_init ?= emit_global_init_function(
+		decls,
+		cancellation_table,
+		specialize_layout,
+		symbol_authority,
+		compact,
+	)
 
 	profile_plan ?= profile_emission_plan(decls, symbol_authority, profile_configuration)
 
@@ -26720,6 +26783,7 @@ private pure func emit_decls(
 			symbol_authority,
 			internal_linkage,
 			cancellation_table,
+			specialize_layout,
 			internal_type_linkage,
 			compact,
 		),
@@ -26910,6 +26974,8 @@ private pure func heap_record_make_signature(
 private pure func union_constructor_param_list(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	variant_index: Int,
+	type_plan: CleanupTypePlan,
 	type_symbol_lookup: Dict[String, String],
 ) -> String:
 	var params: List[String] = []
@@ -26926,7 +26992,11 @@ private pure func union_constructor_param_list(
 		)
 		index += 1
 
-	if union_variant_uses_release_mask(union_decl.payload_storage, variant):
+	if union_variant_uses_release_mask(
+		union_decl.payload_storage,
+		type_plan,
+		variant_index,
+	):
 		params = params.append("unsigned long release_mask")
 
 	params.join(", ")
@@ -26935,11 +27005,15 @@ private pure func union_constructor_param_list(
 private pure func union_constructor_signature(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
+	variant_index: Int,
+	type_plan: CleanupTypePlan,
 	type_symbol_lookup: Dict[String, String],
 ) -> String:
 	type_symbol_lookup.get(union_decl.name).get_or(union_decl.name) + "* " + variant.c_name + "(" + union_constructor_param_list(
 		union_decl,
 		variant,
+		variant_index,
+		type_plan,
 		type_symbol_lookup,
 	) + ")"
 
@@ -27103,18 +27177,27 @@ private pure func type_support_function_prototypes(
 				)
 			UnionDecl(union_decl):
 				naming: BackendTypeNaming = selected_type_naming(authority, union_decl.name)
+				type_plan: CleanupTypePlan = cleanup_plan_row(plan, decl_index)
 
-				if cleanup_type_plan_has_destructor(cleanup_plan_row(plan, decl_index)):
+				if cleanup_type_plan_has_destructor(type_plan):
 					c_code = append_emitted_c(
 						c_code,
 						destroy_function_signature(naming.destroy_name) + ";\n",
 					)
 
-				for variant in union_decl.variants:
+				for variant_entry in union_decl.variants.enumerate():
+					variant_index: Int = variant_entry[0]
+					variant: CoreUnionVariant = variant_entry[1]
 					if variant.fields.length() > 0:
 						c_code = append_emitted_c(
 							c_code,
-							union_constructor_signature(union_decl, variant, selected_type_symbol_lookup(authority)) + ";\n",
+							union_constructor_signature(
+								union_decl,
+								variant,
+								variant_index,
+								type_plan,
+								selected_type_symbol_lookup(authority),
+							) + ";\n",
 						)
 			EnumDecl(enum_decl):
 				naming: BackendTypeNaming = selected_type_naming(authority, enum_decl.name)

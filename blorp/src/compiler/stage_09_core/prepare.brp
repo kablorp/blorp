@@ -298,7 +298,12 @@ import:
 		clone_tensor_for_element_storage,
 		core_var_equal,
 	mono: core_mono_type_equal
-	specialize_layout: generic_hash_container_type_name
+	specialize_layout:
+		CoreSpecializeLayout,
+		boxed_storage_slot_needs_release,
+		boxed_storage_value,
+		build_specialize_layout,
+		generic_hash_container_type_name
 	traverse as CoreTraverse
 	type_policy: is_stack_result_type
 
@@ -437,7 +442,11 @@ is a lookup accelerator, never a second authority on declaration order.
 ---
 private record PrepareDecls {
 	decls: List[CoreDecl],
-	unions_by_name: Dict[String, CoreUnionDecl]
+	unions_by_name: Dict[String, CoreUnionDecl],
+	-- Present only for the later construction-preparation pass. The earlier
+	-- dictionary-ownership traversal has its own mapper and never calls
+	-- prepare_union_construct, so it intentionally has no layout index.
+	specialize_layout: Option[CoreSpecializeLayout]
 }
 
 
@@ -446,7 +455,10 @@ First declaration of a name wins, matching the first-match scan this index
 replaces. Value-record, heap-record, enum, and union namespaces stay
 distinct because only union declarations enter this dictionary.
 ---
-private pure func prepare_decls(decls: List[CoreDecl]) -> PrepareDecls:
+private pure func prepare_decls(
+	decls: List[CoreDecl],
+	specialize_layout: Option[CoreSpecializeLayout],
+) -> PrepareDecls:
 	var unions_by_name: Dict[String, CoreUnionDecl] = {}
 
 	for decl in decls:
@@ -461,7 +473,8 @@ private pure func prepare_decls(decls: List[CoreDecl]) -> PrepareDecls:
 
 	{
 		decls = decls,
-		unions_by_name = unions_by_name
+		unions_by_name = unions_by_name,
+		specialize_layout = specialize_layout
 	}
 
 
@@ -1089,6 +1102,18 @@ private pure func boxed_storage_values_for_exprs(
 	exprs: List[CoreExpr],
 ) -> List[CoreBoxedStorageValue]:
 	exprs.map(boxed_storage_value_for_expr)
+
+
+private pure func boxed_storage_values_for_union_payload(
+	layout: CoreSpecializeLayout,
+	payload_storage: CoreUnionPayloadStorage,
+	exprs: List[CoreExpr],
+) -> List[CoreBoxedStorageValue]:
+	match payload_storage:
+		TypedUnionPayloadStorage:
+			boxed_storage_values_for_exprs(exprs)
+		ErasedUnionPayloadStorage:
+			exprs.map(func(expr): boxed_storage_value(layout, expr, False))
 
 
 private pure func prepare_tuple_element(
@@ -2018,7 +2043,42 @@ private pure func release_policy_requires_release(policy: CoreReleasePolicy) -> 
 			True
 
 
-private pure func union_variant_uses_release_mask(
+--- Whether a union field's stored representation owns something its
+--- destructor must release. Source cleanup policy covers ownership carried by
+--- the source value; erased storage can add a separately owned box around an
+--- otherwise unmanaged value (for example, a value-record struct). The shared
+--- specialization layout classifier is authoritative for that storage box.
+pure func union_field_needs_release_in_storage(
+	layout: CoreSpecializeLayout,
+	payload_storage: CoreUnionPayloadStorage,
+	field: CoreUnionField,
+) -> Bool:
+	source_value_needs_release: Bool = release_policy_requires_release(field.release_policy)
+
+	match payload_storage:
+		TypedUnionPayloadStorage:
+			source_value_needs_release
+		ErasedUnionPayloadStorage:
+			source_value_needs_release or boxed_storage_slot_needs_release(layout, field.typ)
+
+
+pure func union_variant_has_effective_cleanup(
+	layout: CoreSpecializeLayout,
+	payload_storage: CoreUnionPayloadStorage,
+	fields: List[CoreUnionField],
+) -> Bool:
+	var needs_release: Bool = False
+
+	for field in fields:
+		if union_field_needs_release_in_storage(layout, payload_storage, field):
+			needs_release = True
+			break
+
+	needs_release
+
+
+pure func union_variant_requires_release_mask(
+	layout: CoreSpecializeLayout,
 	payload_storage: CoreUnionPayloadStorage,
 	fields: List[CoreUnionField],
 ) -> Bool:
@@ -2026,14 +2086,7 @@ private pure func union_variant_uses_release_mask(
 		TypedUnionPayloadStorage:
 			False
 		ErasedUnionPayloadStorage:
-			var needs_release: Bool = False
-
-			for field in fields:
-				if release_policy_requires_release(field.release_policy):
-					needs_release = True
-					break
-
-			needs_release
+			union_variant_has_effective_cleanup(layout, payload_storage, fields)
 
 
 private pure func release_mask_for_boxed_args(args: List[CoreBoxedStorageValue]) -> Int:
@@ -3972,6 +4025,8 @@ private pure func prepare_union_construct(
 	args: List[CoreExpr],
 	typ: CoreType,
 ) -> Option[CoreUnionConstruct]:
+	layout ?= decls.specialize_layout
+
 	match typ:
 		UnionType(type_name):
 			match kind:
@@ -3985,10 +4040,13 @@ private pure func prepare_union_construct(
 							):
 								Some(variant):
 									if variant.fields.length() == args.length():
-										boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
+										boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_union_payload(
+											layout,
+											union_decl.payload_storage,
 											args,
 										)
-										uses_release_mask: Bool = union_variant_uses_release_mask(
+										uses_release_mask: Bool = union_variant_requires_release_mask(
+											layout,
 											union_decl.payload_storage,
 											variant.fields,
 										)
@@ -5488,7 +5546,7 @@ private pure func prepare_dict_literals_for_ownership_decl(
 
 
 pure func prepare_dict_literals_for_ownership(program: CoreProgram) -> CoreProgram:
-	indexed: PrepareDecls = prepare_decls(program.decls)
+	indexed: PrepareDecls = prepare_decls(program.decls, None)
 
 	{ program |
 		decls = program.decls.map(
@@ -5552,7 +5610,8 @@ private pure func prepare_decl(decls: PrepareDecls, decl: CoreDecl) -> CoreDecl:
 
 
 pure func prepare_program(program: CoreProgram) -> CoreProgram:
-	indexed: PrepareDecls = prepare_decls(program.decls)
+	layout: CoreSpecializeLayout = build_specialize_layout(program)
+	indexed: PrepareDecls = prepare_decls(program.decls, Some(layout))
 	var decls: List[CoreDecl] = []
 
 	for decl in program.decls:
@@ -5583,11 +5642,13 @@ its declaration's dense identity -- the only identity types have today; there
 is no narrower type id than the position of the declaration in `decls`. Rows
 for anything that is not a heap record or a union are `NotACleanupType`.
 
-The plan is built once (see `build_cleanup_plan`) by calling the shared
-`allocation_contracts` predicates that already encode this policy; it does not
-reimplement them. The emitter should read a row instead of calling
-`union_cleanup_kind` / `union_field_uses_iterative_cleanup` /
-`release_policy_requires_cleanup` itself.
+The plan is built once (see `build_cleanup_plan`) from the shared
+`allocation_contracts` predicates for source-owned release and recursive
+cleanup. CorePrepare adds one representation-specific fact for erased union
+fields: boxing an otherwise unmanaged source value can create an owned storage
+object. That fact uses the shared `specialize_layout` box-kind and slot-release
+classifier. The emitter reads the prepared row instead of deriving either
+source or erased-storage cleanup policy while printing.
 ---
 enum CleanupStrategy:
 	NoCleanup
@@ -5708,36 +5769,84 @@ private pure func cleanup_strategy_for_union(kind: UnionCleanupKind) -> CleanupS
 
 
 private pure func cleanup_field_plan_for_union_field(
+	layout: CoreSpecializeLayout,
 	union_decl: CoreUnionDecl,
 	field: CoreUnionField,
 ) -> CleanupFieldPlan:
 	{
-		needs_release = release_policy_requires_cleanup(field.release_policy),
+		needs_release = union_field_needs_release_in_storage(
+			layout,
+			union_decl.payload_storage,
+			field,
+		),
 		uses_iterative_cleanup = union_field_uses_iterative_cleanup(union_decl, field)
 	}
 
 
 private pure func cleanup_variant_plan(
+	layout: CoreSpecializeLayout,
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
 ) -> CleanupVariantPlan:
 	var fields: List[CleanupFieldPlan] = []
 
 	for field in variant.fields:
-		fields = fields.append(cleanup_field_plan_for_union_field(union_decl, field))
+		fields = fields.append(cleanup_field_plan_for_union_field(layout, union_decl, field))
 
 	{
-		has_cleanup = union_variant_has_cleanup(variant),
+		has_cleanup = union_variant_has_effective_cleanup(
+			layout,
+			union_decl.payload_storage,
+			variant.fields,
+		),
 		fields = fields
 	}
 
 
-private pure func union_cleanup_type_plan(union_decl: CoreUnionDecl) -> CleanupTypePlan:
-	strategy: CleanupStrategy = cleanup_strategy_for_union(union_cleanup_kind(union_decl))
+private pure func union_decl_requires_field_cleanup(
+	layout: CoreSpecializeLayout,
+	union_decl: CoreUnionDecl,
+) -> Bool:
+	var requires_cleanup: Bool = False
+
+	for variant in union_decl.variants:
+		if union_variant_has_effective_cleanup(
+			layout,
+			union_decl.payload_storage,
+			variant.fields,
+		):
+			requires_cleanup = True
+			break
+
+	requires_cleanup
+
+
+private pure func union_cleanup_strategy(
+	layout: CoreSpecializeLayout,
+	union_decl: CoreUnionDecl,
+) -> CleanupStrategy:
+	source_strategy: CleanupStrategy = cleanup_strategy_for_union(
+		union_cleanup_kind(union_decl),
+	)
+
+	if source_strategy == IterativeCleanup:
+		-- Keep the existing iterative path for recursive source-owned fields.
+		IterativeCleanup
+	else if union_decl_requires_field_cleanup(layout, union_decl):
+		DirectCleanup
+	else:
+		NoCleanup
+
+
+private pure func union_cleanup_type_plan(
+	layout: CoreSpecializeLayout,
+	union_decl: CoreUnionDecl,
+) -> CleanupTypePlan:
+	strategy: CleanupStrategy = union_cleanup_strategy(layout, union_decl)
 	var variants: List[CleanupVariantPlan] = []
 
 	for variant in union_decl.variants:
-		variants = variants.append(cleanup_variant_plan(union_decl, variant))
+		variants = variants.append(cleanup_variant_plan(layout, union_decl, variant))
 
 	UnionTypeCleanup({
 		strategy = strategy,
@@ -5774,10 +5883,13 @@ private pure func heap_record_cleanup_type_plan(record_decl: CoreHeapRecordDecl)
 	})
 
 
-private pure func cleanup_type_plan_for_decl(decl: CoreDecl) -> CleanupTypePlan:
+private pure func cleanup_type_plan_for_decl(
+	layout: CoreSpecializeLayout,
+	decl: CoreDecl,
+) -> CleanupTypePlan:
 	match decl:
 		UnionDecl(union_decl):
-			union_cleanup_type_plan(union_decl)
+			union_cleanup_type_plan(layout, union_decl)
 		HeapRecordDecl(record_decl):
 			heap_record_cleanup_type_plan(record_decl)
 		FunctionDecl(_) | GlobalDecl(_) | EnumDecl(_) | ValueRecordDecl(_) | TypeAliasDecl(_) | TraitDecl(_) | ImplDecl(_):
@@ -5785,18 +5897,20 @@ private pure func cleanup_type_plan_for_decl(decl: CoreDecl) -> CleanupTypePlan:
 
 
 ---
-Builds the program's cleanup plan once. Every heap record and union
-declaration gets a row computed from the shared `allocation_contracts`
-predicates; every other declaration gets `NotACleanupType`. Called once, from
-the single place a `CoreProgram` becomes a `PreparedCoreProgram`
+Builds the program's cleanup plan once. Heap record rows use shared
+`allocation_contracts` policy; union rows combine that source-owned policy
+with the erased-storage box ownership classifier. Every other declaration
+gets `NotACleanupType`. Called once, from the single place a `CoreProgram`
+becomes a `PreparedCoreProgram`
 (`stage_09_core/pipeline.brp`), so the emitter never has to call the
 policy predicates itself.
 ---
 pure func build_cleanup_plan(program: CoreProgram) -> CleanupPlan:
+	layout: CoreSpecializeLayout = build_specialize_layout(program)
 	var rows: List[CleanupTypePlan] = []
 
 	for decl in program.decls:
-		rows = rows.append(cleanup_type_plan_for_decl(decl))
+		rows = rows.append(cleanup_type_plan_for_decl(layout, decl))
 
 	{ rows = rows }
 
