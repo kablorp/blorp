@@ -109,7 +109,7 @@ allocation-neutral with the flag off. Rows to watch: `typed_frontend_complete`
 | --- | --- | --- | --- |
 | I1 | identity-preserving substitution and qualification (`apply_subst*`, `qualify_module_local_types`, mono `apply_type_substitution*`, `split_canonical_module_type_name` without the tuple) | typed frontend -1.5M to -2.5M; mono -1M to -2M | everything |
 | I2 | mono request dedup by dictionary; callee function type memoized by definition id | lowering -0.8M; mono instructions -1% to -2% | everything |
-| I3 | `CoreTypeTable`: hash-consed `CoreType` rows built by lowering and extended by mono; `core_type_equal` and `core_mono_type_equal` short-circuit on identity | lowering -1.2M (1.27M constructions become 22k); mono substitution shares rows; instructions -1% to -2% | N1 to N4 of the node roadmap |
+| I3 | **parked 2026-09-24 as construction-time interning** (see below); the equality short-circuits are being measured alone as I3a | measured: lowering +41.6%, mono +12.1%, instructions +3.3% | — |
 | I4 | `SemanticType` interned at its hot producers (`localize`, `qualify`, `apply_subst`, unify's rebuilds) | typed frontend -2M to -4M | I3 |
 | I5 | trait dispatch keyed by type id; `Dict[String, BackendTypeNaming]` and `CoreLayoutTypeIndex` keyed by type id | trait resolve instructions -10% to -20% of its row; allocations flat | after I3 |
 | I6 | name ids: `ParsedIdentifier` carries the lexer's id; `SourceNameTable` becomes a view of the lexer table; `CoreVar.name` becomes a name id with the spelling in one table | allocations flat (per T-A); `blorp_string_eq` samples down; unlocks `CoreVar` as a struct (S4) | after CORE_ID_MIGRATION step 6 |
@@ -176,6 +176,31 @@ report must include the test.
 **Oracle.** Byte-identical C.
 
 ### I3: the Core type table
+
+**Parked 2026-09-24 with numbers** (branch `core/i3-type-table`, commit
+`8cc4cbf1`, all gates green, byte-identical C). A `CoreTypeTable { rows,
+buckets: Dict[Int, List[Int]] }` keyed by a structural hash over children's
+hashes was threaded through the type-lowering subsystem and mono's
+substitution. Result on the frozen self-compile: `core_lowering_complete`
++41.6% allocations, `pass_mono_complete` +12.1%, total +5.0%, instructions
++3.3%. Root cause is the same fact N1 hit: expression lowering is a
+stateless descent whose helpers do not return the lowering context, so the
+forty-odd call sites outside the closed type-lowering subsystem went through
+a wrapper that read the table for hits but could not publish rows; sharing
+happened only within one type's own recursive construction, and the table
+paid its hash and bucket cost on nearly every call. Construction-time
+interning needs the context threaded through most of `lower.brp`'s
+expression helpers, which is a larger task than I3 and must be measured
+against that cost. Two salvage candidates are being measured separately as
+I3a: the `same_object` short-circuit in `core_type_equal` and
+`core_mono_type_equal`, and one shared `normalize_dim` definition. A second
+re-scoping to test: intern only inside mono's substitution, which runs
+under a pass with threaded state, if a count shows a meaningful share of
+the 1.27M constructions originate there. N5 of the node roadmap (type ids
+on expressions) waits on whichever form of I3 lands.
+
+The original text follows for the record.
+
 
 **Context.** 1.27M `CoreType` constructions for 22k shapes; two structural
 equalities with 176 call sites; mono substitution rebuilding type trees per

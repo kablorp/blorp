@@ -414,7 +414,9 @@ rebuilds those trees per instantiation; `core_type_equal` (37 sites) and
 short-circuit.
 
 **Change.** Depends on `TYPE_INTERNING_ROADMAP.md` I3 (a `CoreTypeTable`
-with hash-consed rows). The `CoreType` field on each expression becomes a
+with hash-consed rows). I3 as construction-time interning was parked on
+2026-09-24 (lowering +41.6% allocations: the stateless lowering descent
+cannot publish rows); N5 waits for its re-scoped form. The `CoreType` field on each expression becomes a
 `CoreTypeId`; type substitution in mono becomes a remap over the table; the
 two equality functions become integer compares. The codec renders the
 resolved type so the dump JSON is unchanged.
