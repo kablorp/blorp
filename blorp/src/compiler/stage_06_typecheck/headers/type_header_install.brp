@@ -17,9 +17,9 @@ import:
 		TypecheckState,
 		known_type_index_empty,
 		known_type_index_record_resource,
-		known_type_index_record_type,
+		known_type_index_record_types,
 		type_home_index_empty,
-		type_home_index_record,
+		type_home_index_record_names,
 		typecheck_state_add_error,
 		typecheck_state_allows_builtin,
 	../type_system/accepted_alias_authority: accepted_alias_contains
@@ -974,9 +974,8 @@ pure func imported_union_header_variants(
 The header installer: one builder over a published section, with the
 session state as a single `var` accumulator that every write updates in
 place. Helpers above compute values; none of them takes or returns the
-session, which is what keeps the type-home and known-type dictionaries and
-the environment uniquely owned across the whole section instead of copying
-once per inserted name.
+session. The environment stays on that accumulator, while home and ordinary
+known type names are buffered and applied to their indexes once per section.
 ---
 pure func typecheck_install_module_header_section(
 	state: TypecheckState,
@@ -993,15 +992,14 @@ pure func typecheck_install_module_header_section(
 	binds_imported_aliases = imported and not has_alias_authority
 	allows_builtin = typecheck_state_allows_builtin(state)
 	var acc = state
-	-- The two fact tables this builder writes are hoisted into their own
-	-- local owners and folded back once at the end, the pattern
-	-- `docs/MEMORY_MODEL.md` prescribes for a collection field updated in a
-	-- loop. Left on the session they are reachable from two places at every
-	-- insert, and the opaque unwrap inside the index helper retains its
-	-- borrowed argument, so `Dict.set` copied the whole table on every
-	-- installed name.
+	-- Keep fact tables outside the session while installing this section.
+	-- Buffer only the names, then apply each index in one local dictionary
+	-- loop. Per-name index helper calls retained the dictionary argument and
+	-- copied its backing array on each update.
 	var type_homes: TypeHomeIndex = acc.type_homes
 	var known_types: KnownTypeIndex = acc.known_type_index
+	var type_home_names: List[String] = []
+	var known_type_names: List[String] = []
 	acc = { acc |
 		type_homes = type_home_index_empty(),
 		known_type_index = known_type_index_empty()
@@ -1023,7 +1021,7 @@ pure func typecheck_install_module_header_section(
 			known_types = known_type_index_record_resource(known_types, facts.type_name)
 		else:
 			if not imported:
-				known_types = known_type_index_record_type(known_types, facts.type_name)
+				known_type_names = known_type_names.append(facts.type_name)
 
 		acc = { acc |
 			env = env_add_accepted_type(
@@ -1050,7 +1048,7 @@ pure func typecheck_install_module_header_section(
 			None:
 				void
 
-		type_homes = type_home_index_record(type_homes, facts.type_name, module_path, imported)
+		type_home_names = type_home_names.append(facts.type_name)
 
 		if binds_imported_aliases:
 			acc = add_imported_accepted_type_aliases(
@@ -1065,12 +1063,7 @@ pure func typecheck_install_module_header_section(
 		match record_authority:
 			Some(authority):
 				if accepted_record_contains(authority, facts.type_name):
-					type_homes = type_home_index_record(
-						type_homes,
-						facts.type_name,
-						module_path,
-						imported,
-					)
+					type_home_names = type_home_names.append(facts.type_name)
 
 					if binds_imported_aliases:
 						acc = add_imported_accepted_type_aliases(
@@ -1112,12 +1105,7 @@ pure func typecheck_install_module_header_section(
 								),
 							)
 						}
-						type_homes = type_home_index_record(
-							type_homes,
-							facts.type_name,
-							module_path,
-							imported,
-						)
+						type_home_names = type_home_names.append(facts.type_name)
 
 						if binds_imported_aliases:
 							acc = add_imported_accepted_type_aliases(
@@ -1134,12 +1122,7 @@ pure func typecheck_install_module_header_section(
 				-- Graph completion constructed this authority from these exact headers.
 				-- Accepted installation retains only spelling provenance; union payload,
 				-- constructors, and containment remain authority-owned.
-				type_homes = type_home_index_record(
-					type_homes,
-					facts.type_name,
-					module_path,
-					imported,
-				)
+				type_home_names = type_home_names.append(facts.type_name)
 			None:
 				match installed_union_variants(graph, facts.accepted_header, installation):
 					None:
@@ -1167,12 +1150,7 @@ pure func typecheck_install_module_header_section(
 									union_type_header_containment_facts(facts.accepted_header),
 								),
 							) }
-						type_homes = type_home_index_record(
-							type_homes,
-							facts.type_name,
-							module_path,
-							imported,
-						)
+						type_home_names = type_home_names.append(facts.type_name)
 
 						if binds_imported_aliases:
 							acc = add_imported_accepted_type_aliases(
@@ -1187,18 +1165,13 @@ pure func typecheck_install_module_header_section(
 		match alias_authority:
 			Some(authority):
 				if accepted_alias_contains(authority, facts.type_name):
-					known_types = known_type_index_record_type(known_types, facts.type_name)
+					known_type_names = known_type_names.append(facts.type_name)
 
 					match facts.layout:
 						TransparentAlias:
 							void
 						OpaqueAlias:
-							type_homes = type_home_index_record(
-								type_homes,
-								facts.type_name,
-								module_path,
-								imported,
-							)
+							type_home_names = type_home_names.append(facts.type_name)
 				else:
 					acc = typecheck_state_add_error(
 						acc,
@@ -1244,18 +1217,13 @@ pure func typecheck_install_module_header_section(
 								)
 
 						acc = { acc | env = next_env }
-						known_types = known_type_index_record_type(known_types, facts.type_name)
+						known_type_names = known_type_names.append(facts.type_name)
 
 						match facts.layout:
 							TransparentAlias:
 								void
 							OpaqueAlias:
-								type_homes = type_home_index_record(
-									type_homes,
-									facts.type_name,
-									module_path,
-									imported,
-								)
+								type_home_names = type_home_names.append(facts.type_name)
 
 						if imported:
 							acc = add_imported_accepted_type_aliases(
@@ -1266,7 +1234,8 @@ pure func typecheck_install_module_header_section(
 								facts.type_parameters,
 							)
 
-	-- Publish the fact tables this builder wrote, once, as the result. The
+	-- Apply the names in declaration encounter order, then publish the fact
+	-- tables once as the result. The
 	-- update is also what makes `acc` the builder's own owner of the session:
 	-- `stage_09_core/consume_specialize.brp`'s `result_aliases_var` reports a
 	-- bare `acc` return (bound from `state`) as aliasing argument 0 and
@@ -1275,6 +1244,8 @@ pure func typecheck_install_module_header_section(
 	-- first insert. A record update result is reported as non-aliasing, the
 	-- clone is generated, and `acc` stays uniquely owned across the whole
 	-- section.
+	type_homes = type_home_index_record_names(type_homes, type_home_names, module_path, imported)
+	known_types = known_type_index_record_types(known_types, known_type_names)
 	{ acc |
 		known_type_index = known_types,
 		type_homes = type_homes

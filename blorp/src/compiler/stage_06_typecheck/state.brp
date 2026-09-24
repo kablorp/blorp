@@ -301,19 +301,11 @@ pure func type_home_index_is_empty(index: TypeHomeIndex) -> Bool:
 ---
 Records `type_name`'s home, keeping the first-recorded entry when an
 import tries to overwrite one that already exists (an import never
-overrides an existing entry; a local declaration always wins). This is
-the single place that unwraps and rewraps the dict, and it always calls
-`entries.set` -- even to re-affirm an unchanged entry -- so no arm
-returns `index` unchanged. A bare `index` return here (as the previous
-shape had, matching only `Some(_) and imported`) makes
-`consume_specialize.brp`'s `function_is_cloneable` refuse a consuming
-clone of this function: measured with `--dump-core-after=reuse`, that
-shape left every call site's `consumed_args` covering only the `String`
-arguments, never `index` (argument 0), so `entries.set` always ran on a
-retained (non-unique) dict and copied it. Always constructing, with only
-the value passed to `set` varying, keeps this function reachable through
-the header-install loops' consuming calling convention so `entries.set`
-can mutate in place when the dict is uniquely owned.
+overrides an existing entry; a local declaration always wins). It always
+calls `entries.set`, including duplicate imports, so no arm returns `index`
+unchanged and disqualifies a consuming clone. Header installation uses the
+section batch below: per-name calls here retained the dictionary argument
+and copied its backing array on each update.
 ---
 pure func type_home_index_record(
 	index: TypeHomeIndex,
@@ -342,9 +334,39 @@ pure func type_home_index_record(
 
 
 ---
-Same shape as `type_home_index_record` above: always calls `entries.set`,
-keeping whichever `KnownTypeKind` was already recorded rather than
-returning `index` unchanged, so this stays consume-specializable.
+Apply one module header section's home registrations while the unwrapped
+dictionary stays in a local owner. The section has one path and import status;
+only names need buffering at its installation boundary.
+---
+pure func type_home_index_record_names(
+	index: TypeHomeIndex,
+	type_names: List[String],
+	module_path: String,
+	imported: Bool,
+) -> TypeHomeIndex:
+	var entries = from_opaque TypeHomeIndex(index)
+	for type_name in type_names:
+		next_entry = match entries.get(type_name):
+			Some(existing):
+				if imported:
+					existing
+				else:
+					{
+						module_path = module_path,
+						imported = False
+					}
+			None:
+				{
+					module_path = module_path,
+					imported = imported
+				}
+		entries = entries.set(type_name, next_entry)
+	into_opaque TypeHomeIndex(entries)
+
+
+---
+Keep an existing resource kind when an ordinary type name is registered.
+Always call `entries.set` so no branch returns `index` unchanged.
 ---
 pure func known_type_index_record_type(index: KnownTypeIndex, name: String) -> KnownTypeIndex:
 	entries = from_opaque KnownTypeIndex(index)
@@ -356,6 +378,25 @@ pure func known_type_index_record_type(index: KnownTypeIndex, name: String) -> K
 			KnownOrdinaryType
 
 	into_opaque KnownTypeIndex(entries.set(name, next_kind))
+
+
+---
+Apply ordinary type names in one locally owned dictionary. Resource entries
+already present in the index keep their stronger kind.
+---
+pure func known_type_index_record_types(
+	index: KnownTypeIndex,
+	names: List[String],
+) -> KnownTypeIndex:
+	var entries = from_opaque KnownTypeIndex(index)
+	for name in names:
+		next_kind = match entries.get(name):
+			Some(existing):
+				existing
+			None:
+				KnownOrdinaryType
+		entries = entries.set(name, next_kind)
+	into_opaque KnownTypeIndex(entries)
 
 
 pure func known_type_index_record_resource(index: KnownTypeIndex, name: String) -> KnownTypeIndex:
@@ -1640,43 +1681,12 @@ pure func typecheck_state_type_home_matches(
 
 
 ---
-The "imported name that already has a home is a no-op" precedence rule
-lives inside `type_home_index_record`, not here, and it never returns
-`state.type_homes` (or `state`) unchanged from a bare-identifier arm --
-it always finishes with `entries.set`. That matters for two independent
-reasons documented at length here because both were tried and measured
-with `--dump-core-after=reuse` before this shape:
-
-1. `consume_specialize.brp`'s `function_is_cloneable` refuses a consuming
-   clone of any function with a path that returns its own parameter
-   unchanged (a bare `index` or bare `state` return). The original
-   `type_home_index_record` had exactly that shape (`Some(_): if
-   imported: index`), so it never got a `__consume_arg0` clone, and
-   every call site's `consumed_args` covered only the `String`
-   arguments, never `index`. A first attempt at this fix moved the same
-   bare-return shape into `typecheck_state_record_type_home` itself
-   (`if imported and has_entry: state else: {...}`); that reproduced the
-   identical measurement (no clone, `state` never in `consumed_args`)
-   because the bare return simply disqualified this function instead.
-2. Even with no bare-parameter return, hoisting the choice into a local
-   before the update (`next = if ...: state.type_homes else: ...; {
-   state | type_homes = next }`) reads `state.type_homes` twice --
-   once in the `if`'s condition/branches, once implicitly by referring
-   back to it -- which `docs/MEMORY_MODEL.md`'s COW section calls out
-   directly: the record-update fast path is proved only when "the
-   field's replacement is the one place the update reads that field";
-   every other shape, including one "that reads the field twice",
-   still copies.
-
-Folding the precedence check into `type_home_index_record` satisfies
-both: this function reads `state.type_homes` exactly once, in the
-update's own field-replacement expression, and reaches an insert
-helper that always constructs. After this change `state` (argument 0)
-appears in `consumed_args` at this function's call sites in the
-header-install loops (`typecheck_install_imported_union_headers` and
-siblings in `headers/type_header_install.brp`, each of which threads
-`state` through a `var next = state; for ...: next = install_*(next,
-...)` loop where `next` is genuinely last-used per call).
+The scalar state update keeps the field's replacement as its only read of
+`state.type_homes`, preserving the record-update ownership fast path. The
+precedence rule lives in `type_home_index_record`, which always calls `set`:
+a bare unchanged-parameter return would prevent consuming specialization.
+Header installation now collects names and calls `type_home_index_record_names`
+once per section, avoiding this per-name helper's shared dictionary copy.
 ---
 pure func typecheck_state_record_type_home(
 	state: TypecheckState,
