@@ -81,16 +81,17 @@ private pure func increment_entry_occurrences(
 
 
 ---
-The `ids_by_value` half of `catalog_add_literal`, split out so the record
-update below reads `catalog.ids_by_value` exactly once. `catalog.entries` is
-never read here; the next id comes from `ids_by_value.length()` instead of
-`entries.length()`, since the two collections always grow together.
+The `ids_by_value` half of `catalog_add_literal`, split out so the replacement
+passes `catalog.ids_by_value` to its helper exactly once. `catalog.entries`
+is never read here; the next id comes from `ids_by_value.length()` instead
+of `entries.length()`, since the two collections always grow together.
 ---
 private pure func next_ids_by_value(
 	ids_by_value: Dict[String, Int],
 	value: String,
+	existing_id: Option[Int],
 ) -> Dict[String, Int]:
-	match ids_by_value.get(value):
+	match existing_id:
 		Some(_):
 			ids_by_value
 		None:
@@ -100,15 +101,16 @@ private pure func next_ids_by_value(
 ---
 The `entries` half of `catalog_add_literal`, split out so the record update
 below reads `catalog.entries` exactly once. Reading `catalog.ids_by_value`
-here is fine: it is a plain lookup (never the field being replaced), so it
-does not defeat the reuse below.
+here is fine: only its length is needed for a new entry, so it is never the
+field being replaced and does not defeat the reuse below.
 ---
 private pure func next_entries(
 	ids_by_value: Dict[String, Int],
 	entries: List[StaticStringLiteralEntry],
 	value: String,
+	existing_id: Option[Int],
 ) -> List[StaticStringLiteralEntry]:
-	match ids_by_value.get(value):
+	match existing_id:
 		Some(existing_id):
 			increment_entry_occurrences(entries, existing_id)
 		None:
@@ -120,20 +122,22 @@ private pure func next_entries(
 
 
 ---
-A bare, unconditional record update: both field values come from helpers
-that read `catalog`'s two fields exactly once between them, so the
-post-Perceus reuse rewrite can move `entries` out of a unique `catalog`
-instead of retaining it before every insert. Branching here (a `match` on
-`catalog.ids_by_value.get(value)` around the whole record) would hide the
-update from that rewrite, which does not look inside match arms.
+A bare, unconditional record update: each replaced field is passed once to
+the helper that may update it, so the post-Perceus reuse rewrite can move
+`entries` out of a unique `catalog` instead of retaining it before every
+insert. `next_entries` separately borrows `catalog.ids_by_value` for a new
+entry's id. Branching here (a `match` around the whole record) would hide the
+update from that rewrite, which does not look inside match arms. The lookup
+stays before the update; only its scalar result crosses into both helpers.
 ---
 private pure func catalog_add_literal(
 	catalog: StaticStringLiteralCatalog,
 	value: String,
 ) -> StaticStringLiteralCatalog:
+	existing_id: Option[Int] = catalog.ids_by_value.get(value)
 	{ catalog |
-		ids_by_value = next_ids_by_value(catalog.ids_by_value, value),
-		entries = next_entries(catalog.ids_by_value, catalog.entries, value)
+		ids_by_value = next_ids_by_value(catalog.ids_by_value, value, existing_id),
+		entries = next_entries(catalog.ids_by_value, catalog.entries, value, existing_id)
 	}
 
 
