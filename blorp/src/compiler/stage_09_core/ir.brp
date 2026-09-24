@@ -693,6 +693,28 @@ got the wider share of the budget over the module index and start line,
 since a handful of declarations in this codebase span thousands of lines
 (late-Core match dispatchers) while file and module counts stay in the
 low hundreds.
+
+docs/CORE_NODE_TABLE_ROADMAP.md step N2: this Int also carries a node's
+*identity*, not only its source extent. A lowered node's id is its packed
+location (unique in practice: two source nodes rarely share module, start
+and length). A node minted by a pass -- one with no source extent of its
+own -- gets a fresh id from `core_mint_node_id` on `CorePassState`
+(pass_runner.brp), drawn from the negative integers, a range disjoint from
+every packed location and from 0 (synthetic). A second `opaque type
+CoreNodeId = Int` over the same underlying Int was considered and rejected:
+every one of the ~2,500 Core node constructors already takes this field
+typed as `CoreSourceLoc`, and a distinct opaque type would need an explicit
+conversion at each one for a field that is, physically, the same Int either
+way. So the two roles share one type and this doc comment; read `loc` as
+"the location if this node came from source, or the id either way."
+`core_node_id_is_minted` tells the two apart; `core_mint_node_id` also
+records the origin location a minted id stands in for (see
+`CorePassState.minted_origins`), so a minted node still resolves to a
+source location for diagnostics via `core_source_loc_row_with_origins` /
+`core_source_loc_path_with_origins`. `core_source_loc_row` and
+`core_source_loc_path`, which do not have the origins table in hand, treat
+an unresolved minted id the same as synthetic (empty path, placeholder
+row) rather than misreading its negative encoding as a packed location.
 ---
 opaque type CoreSourceLoc = Int
 
@@ -713,6 +735,27 @@ pure func synthetic_core_source_loc() -> CoreSourceLoc:
 
 pure func core_source_loc_is_synthetic(loc: CoreSourceLoc) -> Bool:
 	from_opaque CoreSourceLoc(loc) == 0
+
+
+--- True for a node id minted by a pass (docs/CORE_NODE_TABLE_ROADMAP.md
+--- step N2) rather than carried straight from a lowered node's own source
+--- extent. Minted ids are the negative integers; 0 (synthetic) and every
+--- packed location (`pack_core_source_loc`) are non-negative.
+pure func core_node_id_is_minted(id: CoreSourceLoc) -> Bool:
+	from_opaque CoreSourceLoc(id) < 0
+
+
+--- Wrap a raw Int as a handle without `pack_core_source_loc`'s field
+--- validation -- for `core_mint_node_id` (pass_runner.brp), which mints
+--- the negative range directly rather than packing a resolved extent.
+--- `into_opaque`/`from_opaque` only work inside this module, so this and
+--- `core_node_id_raw` are the pair a caller outside it uses instead.
+pure func core_source_loc_from_raw(raw: Int) -> CoreSourceLoc:
+	into_opaque CoreSourceLoc(raw)
+
+
+pure func core_node_id_raw(id: CoreSourceLoc) -> Int:
+	from_opaque CoreSourceLoc(id)
 
 
 implements Equatable for CoreSourceLoc:
@@ -767,11 +810,15 @@ pure func pack_core_source_loc(
 --- that only need line/column, such as a synthetic binder name derived
 --- from a node's location. Row 0 (synthetic) decodes as a placeholder at
 --- file -1, line/column 0: callers that care check
---- `core_source_loc_is_synthetic` first, as every renderer here does.
+--- `core_source_loc_is_synthetic` first, as every renderer here does. A
+--- minted id (`core_node_id_is_minted`, negative) has no packed fields of
+--- its own -- without the pass's `minted_origins` table in hand (see
+--- `core_source_loc_row_with_origins`) it decodes the same placeholder as
+--- synthetic rather than misreading its negative encoding as a span.
 pure func core_source_loc_row_unresolved(loc: CoreSourceLoc) -> CoreSourceLocRow:
 	encoded: Int = from_opaque CoreSourceLoc(loc)
 
-	if encoded == 0:
+	if encoded <= 0:
 		{ file = -1, start_line = 0, start_column = 0, end_line = 0, end_column = 0 }
 	else:
 		remaining0: Int = encoded - 1
@@ -804,6 +851,46 @@ pure func core_source_loc_path(program: CoreProgram, loc: CoreSourceLoc) -> Stri
 	else:
 		row: CoreSourceLocRow = core_source_loc_row(program, loc)
 		program.source_files.get_or(row.file, SYNTHETIC_CORE_SOURCE_FILE).path
+
+
+--- Resolve a node id to the row it stands for, given the minting pass's
+--- side table (`CorePassState.minted_origins`, indexed by `-id - 1`; see
+--- `core_mint_node_id`). A non-minted id (a real packed location, or 0)
+--- resolves exactly as `core_source_loc_row`; a minted id whose origin
+--- table entry is missing (index out of range) falls back to the same
+--- placeholder `core_source_loc_row_unresolved` gives synthetic.
+pure func core_source_loc_row_with_origins(
+	program: CoreProgram,
+	loc: CoreSourceLoc,
+	minted_origins: List[CoreSourceLoc],
+) -> CoreSourceLocRow:
+	core_source_loc_row(program, core_node_id_resolve_origin(loc, minted_origins))
+
+
+--- Same resolution as `core_source_loc_row_with_origins`, for the path.
+pure func core_source_loc_path_with_origins(
+	program: CoreProgram,
+	loc: CoreSourceLoc,
+	minted_origins: List[CoreSourceLoc],
+) -> String:
+	core_source_loc_path(program, core_node_id_resolve_origin(loc, minted_origins))
+
+
+--- A minted id's origin location, or `loc` unchanged when it is not
+--- minted or its origin entry is missing.
+pure func core_node_id_resolve_origin(
+	loc: CoreSourceLoc,
+	minted_origins: List[CoreSourceLoc],
+) -> CoreSourceLoc:
+	if core_node_id_is_minted(loc):
+		index: Int = 0 - from_opaque CoreSourceLoc(loc) - 1
+		match minted_origins.get(index):
+			Some(origin):
+				origin
+			None:
+				loc
+	else:
+		loc
 
 
 struct CoreSourceLocRow {
@@ -1725,6 +1812,20 @@ pure func core_expr_source_loc(expr: CoreExpr) -> CoreSourceLoc:
 			core_expr_source_loc(body)
 		SeqExpr(_, second):
 			core_expr_source_loc(second)
+
+
+--- The node id (docs/CORE_NODE_TABLE_ROADMAP.md step N2) this node itself
+--- carries, or `None` for the three loc-less wrapper kinds (`LetExpr`,
+--- `BorrowLetExpr`, `SeqExpr`) that delegate their location to their tail
+--- (see `core_expr_source_loc`) and so have no id of their own -- a node
+--- identity walk that visits every child skips these rather than counting
+--- their tail's id a second time as if it were a second physical node.
+pure func core_expr_own_node_id(expr: CoreExpr) -> Option[CoreSourceLoc]:
+	match expr:
+		LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _):
+			None
+		_:
+			Some(core_expr_source_loc(expr))
 
 
 union CoreTupleElement:

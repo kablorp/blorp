@@ -41,7 +41,11 @@ import:
 			SemanticMatchFail,
 			SemanticMatchLeaf,
 		),
+		CoreSourceLoc,
 		CoreVar,
+		core_expr_own_node_id,
+		core_node_id_raw,
+		core_source_loc_from_raw,
 		core_program_max_declared_definition_id,
 		core_program_to_json,
 	memory: same_object
@@ -72,10 +76,26 @@ table (see `ownership_contracts.OwnershipContractFacts`); it defaults to
 `empty_ownership_contract_facts()` and stays that way until that pass runs,
 which every early-Core `CorePassState` and any late-Core span starting
 before it never reads.
+
+`next_node_id` and `minted_origins` are docs/CORE_NODE_TABLE_ROADMAP.md step
+N2's node id allocator: a pass that constructs a genuinely new node (one
+with no source extent of its own) calls `core_mint_node_id` instead of
+writing `synthetic_core_source_loc()`, which both hands back a fresh
+negative id and records the location it stands in for. Reset to `-1` / `[]`
+by plain `core_pass_state` at the start of a fresh thread (a pipeline's
+first state, or the early-to-late Core handoff, which already resets
+`ownership_contract_facts` the same way and, as of this step, mints nothing
+on the early side yet); a pass whose `run` reconstructs a state after a
+helper that only returns `(program, next_def_id)` (mono, consume-specialize,
+closure conversion) must use `core_pass_state_carry_ids` instead, so a node
+id minted earlier in the same list is never handed out again by a later
+pass in that list.
 ---
 record CorePassState {
 	program: CoreProgram,
 	next_def_id: Int,
+	next_node_id: Int,
+	minted_origins: List[CoreSourceLoc],
 	ownership_contract_facts: OwnershipContractFacts
 }
 
@@ -637,6 +657,243 @@ private func identity_contract_is_strict() -> Bool:
 	getenv("BLORP_IDENTITY_CONTRACT") == Some("strict")
 
 
+---
+docs/CORE_NODE_TABLE_ROADMAP.md step N2's own contract, the same shape as
+the binder identity contract above: within one function body, two
+expression nodes must not share a node id (`loc`, read through
+`core_expr_own_node_id`, which is `None` for the loc-less wrapper kinds
+`LetExpr`/`BorrowLetExpr`/`SeqExpr` -- they delegate their location to
+their tail and are not a second physical node sharing its id). Report-only
+by default (an `identity: ` line per violation on stderr, same as the
+binder contract), since most passes still write `synthetic_core_source_loc()`
+for a newly constructed node instead of minting through
+`core_mint_node_id` -- every one of those synthetic nodes shares id 0,
+so the count is expected to be large until they convert. Setting
+`BLORP_NODE_IDENTITY=strict` makes the first violation fatal, for a later
+step to flip on once enough passes mint.
+---
+private pure func core_node_identity_walk(expr: CoreExpr) -> List[CoreSourceLoc]:
+	match expr:
+		SemanticMatchExpr(scrutinee, tree, _, _):
+			tree_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_match_tree_node_ids(
+				[],
+				tree,
+			)
+			core_expr_own_node_id_list(expr).concat(core_node_identity_walk(scrutinee)).concat(tree_result[0])
+		_:
+			var ids: List[CoreSourceLoc] = core_expr_own_node_id_list(expr)
+
+			for child in immediate_core_expr_children(expr):
+				ids = ids.concat(core_node_identity_walk(child))
+
+			ids
+
+
+private pure func core_expr_own_node_id_list(expr: CoreExpr) -> List[CoreSourceLoc]:
+	match core_expr_own_node_id(expr):
+		Some(id):
+			[id]
+		None:
+			[]
+
+
+-- Mirrors `core_semantic_match_tree_identity_walk`'s DAG-sharing dedup
+-- (visiting a shared fallback subtree, reached from more than one branch,
+-- only the first time by `same_object`) so a legitimately shared subtree is
+-- not misreported as two nodes sharing an id.
+private pure func core_semantic_match_tree_node_ids(
+	visited: List[CoreSemanticMatchTree],
+	tree: CoreSemanticMatchTree,
+) -> (List[CoreSourceLoc], List[CoreSemanticMatchTree]):
+	if core_semantic_match_tree_seen(visited, tree):
+		([], visited)
+	else:
+		marked: List[CoreSemanticMatchTree] = [tree].concat(visited)
+
+		match tree:
+			SemanticMatchLeaf(_, body):
+				(core_node_identity_walk(body), marked)
+			SemanticMatchFail:
+				([], marked)
+			SemanticConstructorMatch(_, cases, fallback):
+				cases_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_constructor_match_cases_node_ids(
+					marked,
+					cases,
+				)
+				fallback_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = match fallback:
+					Some(found):
+						core_semantic_match_tree_node_ids(cases_result[1], found)
+					None:
+						([], cases_result[1])
+				(cases_result[0].concat(fallback_result[0]), fallback_result[1])
+			SemanticLiteralMatch(_, cases, fallback):
+				cases_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_literal_match_cases_node_ids(
+					marked,
+					cases,
+				)
+				fallback_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_match_tree_node_ids(
+					cases_result[1],
+					fallback,
+				)
+				(cases_result[0].concat(fallback_result[0]), fallback_result[1])
+			SemanticLengthMatch(_, cases, geq, fallback):
+				cases_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_length_match_cases_node_ids(
+					marked,
+					cases,
+				)
+				geq_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = match geq:
+					Some(found):
+						core_semantic_match_tree_node_ids(cases_result[1], found.body)
+					None:
+						([], cases_result[1])
+				fallback_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = match fallback:
+					Some(found):
+						core_semantic_match_tree_node_ids(geq_result[1], found)
+					None:
+						([], geq_result[1])
+				(
+					cases_result[0].concat(geq_result[0]).concat(fallback_result[0]),
+					fallback_result[1],
+				)
+
+
+private pure func core_semantic_constructor_match_cases_node_ids(
+	visited: List[CoreSemanticMatchTree],
+	cases: List[CoreSemanticConstructorMatchCase],
+) -> (List[CoreSourceLoc], List[CoreSemanticMatchTree]):
+	var current_visited: List[CoreSemanticMatchTree] = visited
+	var result: List[CoreSourceLoc] = []
+
+	for match_case in cases:
+		case_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_match_tree_node_ids(
+			current_visited,
+			match_case.body,
+		)
+		current_visited = case_result[1]
+		result = result.concat(case_result[0])
+
+	(result, current_visited)
+
+
+private pure func core_semantic_literal_match_cases_node_ids(
+	visited: List[CoreSemanticMatchTree],
+	cases: List[CoreSemanticLiteralMatchCase],
+) -> (List[CoreSourceLoc], List[CoreSemanticMatchTree]):
+	var current_visited: List[CoreSemanticMatchTree] = visited
+	var result: List[CoreSourceLoc] = []
+
+	for match_case in cases:
+		case_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_match_tree_node_ids(
+			current_visited,
+			match_case.body,
+		)
+		current_visited = case_result[1]
+		result = result.concat(case_result[0])
+
+	(result, current_visited)
+
+
+private pure func core_semantic_length_match_cases_node_ids(
+	visited: List[CoreSemanticMatchTree],
+	cases: List[CoreSemanticLengthMatchCase],
+) -> (List[CoreSourceLoc], List[CoreSemanticMatchTree]):
+	var current_visited: List[CoreSemanticMatchTree] = visited
+	var result: List[CoreSourceLoc] = []
+
+	for match_case in cases:
+		case_result: (List[CoreSourceLoc], List[CoreSemanticMatchTree]) = core_semantic_match_tree_node_ids(
+			current_visited,
+			match_case.body,
+		)
+		current_visited = case_result[1]
+		result = result.concat(case_result[0])
+
+	(result, current_visited)
+
+
+private pure func core_node_identity_first_duplicate(ids: List[CoreSourceLoc]) -> Option[CoreSourceLoc]:
+	var seen: List[CoreSourceLoc] = []
+	var duplicate: Option[CoreSourceLoc] = None
+	var index: Int = 0
+
+	while index < ids.length() and duplicate.is_none():
+		match ids.get(index):
+			Some(candidate):
+				if seen.contains(candidate):
+					duplicate = Some(candidate)
+				else:
+					seen = seen.append(candidate)
+			None:
+				void
+
+		index += 1
+
+	duplicate
+
+
+private pure func core_pass_state_node_identity_violation(
+	pass_name: String,
+	function_info: CoreFunction,
+) -> Option[CorePassDiagnostic]:
+	match function_info.body:
+		Some(body):
+			ids: List[CoreSourceLoc] = core_node_identity_walk(body)
+
+			match core_node_identity_first_duplicate(ids):
+				Some(duplicate):
+					Some(
+						CorePassMessage(
+							"pass `${pass_name}` left function `${function_info.name}` with two nodes sharing node id ${core_node_id_raw(duplicate).to_string()}",
+						),
+					)
+				None:
+					None
+		None:
+			None
+
+
+private pure func core_pass_state_node_identity_violations(
+	pass_name: String,
+	program: CoreProgram,
+) -> List[CorePassDiagnostic]:
+	var violations: List[CorePassDiagnostic] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match core_pass_state_node_identity_violation(pass_name, function_info):
+					Some(diagnostic):
+						violations = violations.append(diagnostic)
+					None:
+						void
+			_:
+				void
+
+	violations
+
+
+func core_pass_state_node_identity_program_violation(
+	pass_name: String,
+	program: CoreProgram,
+) -> Option[CorePassDiagnostic]:
+	violations: List[CorePassDiagnostic] = core_pass_state_node_identity_violations(
+		pass_name,
+		program,
+	)
+
+	if node_identity_contract_is_strict():
+		violations.get(0)
+	else:
+		for violation in violations:
+			print_error("identity: " + core_pass_diagnostic_message(violation))
+
+		None
+
+
+private func node_identity_contract_is_strict() -> Bool:
+	getenv("BLORP_NODE_IDENTITY") == Some("strict")
+
+
 union CorePassRun:
 	CorePassesCompleted(CorePassState, List[CorePassObservation], List[CorePassTiming])
 	CorePassesStopped(String, String, List[CorePassObservation], List[CorePassTiming])
@@ -647,8 +904,49 @@ pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassSta
 	{
 		program = program,
 		next_def_id = next_def_id,
+		next_node_id = -1,
+		minted_origins = [],
 		ownership_contract_facts = empty_ownership_contract_facts()
 	}
+
+
+--- Same as `core_pass_state`, but carries the node id allocator forward
+--- from `base` instead of resetting it (docs/CORE_NODE_TABLE_ROADMAP.md
+--- step N2): for a pass whose `run` reconstructs a state from a helper
+--- that only returns `(program, next_def_id)` (mono, consume-specialize,
+--- closure conversion), so a node id minted earlier in the same
+--- `run_core_passes` list is never handed out again by a later pass in
+--- that list.
+pure func core_pass_state_carry_ids(
+	base: CorePassState,
+	program: CoreProgram,
+	next_def_id: Int,
+) -> CorePassState:
+	{ core_pass_state(program, next_def_id) |
+		next_node_id = base.next_node_id,
+		minted_origins = base.minted_origins
+	}
+
+
+--- Mint a node id whose location is that of `origin` (docs/CORE_NODE_TABLE_ROADMAP.md
+--- step N2): a pass constructing a genuinely new node -- one with no
+--- source extent of its own -- calls this instead of writing
+--- `synthetic_core_source_loc()`, so the new node still has an id distinct
+--- from every other node in the program and a location diagnostics can
+--- resolve back to (`core_source_loc_row_with_origins`,
+--- `core_source_loc_path_with_origins`). Minted ids are the negative
+--- integers, counting down from -1; `origin` is appended to
+--- `minted_origins`, so a minted id's own index (`-id - 1`) is always its
+--- position in that list.
+pure func core_mint_node_id(state: CorePassState, origin: CoreSourceLoc) -> (CorePassState, CoreSourceLoc):
+	id: CoreSourceLoc = core_source_loc_from_raw(state.next_node_id)
+	(
+		{ state |
+			next_node_id = state.next_node_id - 1,
+			minted_origins = state.minted_origins.append(origin)
+		},
+		id
+	)
 
 
 pure func core_pass(
@@ -751,10 +1049,17 @@ func run_core_passes(
 											Some(diagnostic):
 												Some(diagnostic)
 											None:
-												core_pass_state_binder_identity_program_violation(
+												match core_pass_state_binder_identity_program_violation(
 													pass.name,
 													current.program,
-												)
+												):
+													Some(diagnostic):
+														Some(diagnostic)
+													None:
+														core_pass_state_node_identity_program_violation(
+															pass.name,
+															current.program,
+														)
 							else:
 								None
 
