@@ -10396,6 +10396,14 @@ blorp_List* blorp_list_ensure_capacity(blorp_List* list, long min_cap) {
     return copy;
 }
 
+// Keep the emitted push fast path available in both runtime modes: the
+// precompiled declarations define the same inline helper in runtime_decl.c.
+static inline blorp_List* blorp_list_ensure_capacity_checked(blorp_List* list, long min_cap) {
+    return __builtin_expect(list && blorp_is_unique(list) && list->capacity >= min_cap, 1)
+        ? list
+        : blorp_list_ensure_capacity(list, min_cap);
+}
+
 // IR intrinsic: consume a dead list owner and return an empty list allocation.
 // Reuses storage only when the owner is unique; otherwise it releases the caller's
 // reference and allocates fresh empty storage.

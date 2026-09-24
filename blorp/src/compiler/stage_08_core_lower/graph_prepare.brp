@@ -308,13 +308,16 @@ private pure func lower_core_modules(
 			})
 
 
---- One `CoreSourceFile` per entry in `module_table`, indexed exactly as
---- `module_id_table_index` numbers modules -- the same index every location
---- packed during lowering (`core_source_loc_from_context`,
---- stage_08_core_lower/lower.brp) already carries, so no remap is needed
---- when a module's declarations are concatenated into the assembled
---- program below.
-private pure func core_source_files_from_module_table(module_table: ModuleTable) -> List[CoreSourceFile]:
+--- One `CoreSourceFile` per module-table index, matching the index packed
+--- during lowering. Module identities are not source paths (a direct target
+--- may have the identity `main` but live at `/tmp/main.brp`), so use each
+--- typed program's source for every module that was actually lowered.
+private pure func core_source_files_from_graph(
+	module_table: ModuleTable,
+	modules: List[CoreGraphUnit],
+	target_module_id: ModuleId,
+	target: TypedProgram,
+) -> List[CoreSourceFile]:
 	var files: List[CoreSourceFile] = []
 
 	for index in 0..module_table_count(module_table):
@@ -326,13 +329,22 @@ private pure func core_source_files_from_module_table(module_table: ModuleTable)
 
 		files = files.append({ path = path, module_name = path })
 
-	files
+	for unit in modules:
+		files = files.set(module_id_table_index(unit.module_id), {
+			path = unit.typed_program.source.path,
+			module_name = unit.typed_program.source.module_name
+		})
+
+	files.set(module_id_table_index(target_module_id), {
+		path = target.source.path,
+		module_name = target.source.module_name
+	})
 
 
 private pure func assemble_core_program(
 	modules: List[CoreProgram],
 	target: CoreProgram,
-	module_table: ModuleTable,
+	source_files: List[CoreSourceFile],
 ) -> CoreProgram:
 	module_decls = modules.flat_map(func(program): program.decls)
 	module_includes = modules.flat_map(func(program): program.foreign_includes)
@@ -342,7 +354,7 @@ private pure func assemble_core_program(
 		foreign_includes = module_includes
 			.concat(target.foreign_includes)
 			.unique(),
-		source_files = core_source_files_from_module_table(module_table)
+		source_files = source_files
 	}
 
 
@@ -435,7 +447,7 @@ pure func prepare_core_graph_with_ctfe_replacements(
 	assembled = assemble_core_program(
 		lowered_modules.programs,
 		lowered_target_result.program,
-		module_table,
+		core_source_files_from_graph(module_table, codegen_units, target_module_id, target),
 	)
 	aliased = rewrite_program_callable_aliases(assembled, lowered_modules.callable_aliases)
 

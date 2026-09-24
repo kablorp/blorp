@@ -45,7 +45,12 @@ import:
 		AllocationRiskReason,
 		allocation_reason_code,
 	backend_helper_catalog: BACKEND_HELPER_CATALOG_REVISION, BACKEND_HELPER_KIND_COUNT
-	ir: CoreSourceLoc, CoreSourceLocRow, core_source_loc_is_synthetic, core_source_loc_row_unresolved
+	ir:
+		CoreSourceFile,
+		CoreSourceLoc,
+		CoreSourceLocRow,
+		core_source_loc_is_synthetic,
+		core_source_loc_row_unresolved,
 	json: JsonValue(JsonBool, JsonNumber, JsonObject, JsonString, JsonVector)
 
 
@@ -224,25 +229,32 @@ private pure func int_vector(values: List[Int]) -> JsonValue:
 	))
 
 
--- `CoreSourceLoc` no longer carries a path string directly (it packs a
--- module index; see docs/CORE_NODE_TABLE_ROADMAP.md step N1), and this
--- report has no `CoreProgram` in hand to resolve one against, so it reports
--- the module index in the path's place. Threading the program through
--- `CoreAllocationAnalysis` to recover the real path is follow-up work, not
--- required by any fixture today.
-private pure func source_json(loc: CoreSourceLoc) -> JsonValue:
+-- A packed location's module index is meaningful only with the source table
+-- retained by the analysis. Preserve the report's path-bearing JSON contract.
+private pure func source_json(loc: CoreSourceLoc, source_files: List[CoreSourceFile]) -> JsonValue:
 	if core_source_loc_is_synthetic(loc):
 		JsonObject([("status", JsonString("compiler_generated"))])
 	else:
 		row: CoreSourceLocRow = core_source_loc_row_unresolved(loc)
-		JsonObject([
-			("status", JsonString("known")),
-			("module_index", JsonNumber(to_float(row.file))),
-			("line", JsonNumber(to_float(row.start_line))),
-			("column", JsonNumber(to_float(row.start_column))),
-			("end_line", JsonNumber(to_float(row.end_line))),
-			("end_column", JsonNumber(to_float(row.end_column))),
-		])
+		match source_files.get(row.file):
+			Some(file):
+				JsonObject([
+					("status", JsonString("known")),
+					("path", JsonString(file.path)),
+					("line", JsonNumber(to_float(row.start_line))),
+					("column", JsonNumber(to_float(row.start_column))),
+					("end_line", JsonNumber(to_float(row.end_line))),
+					("end_column", JsonNumber(to_float(row.end_column))),
+				])
+			None:
+				JsonObject([
+					("status", JsonString("unresolved")),
+					("module_index", JsonNumber(to_float(row.file))),
+					("line", JsonNumber(to_float(row.start_line))),
+					("column", JsonNumber(to_float(row.start_column))),
+					("end_line", JsonNumber(to_float(row.end_line))),
+					("end_column", JsonNumber(to_float(row.end_column))),
+				])
 
 
 ---
@@ -314,12 +326,12 @@ private pure func owner_json(
 	])
 
 
-private pure func site_json(site: AllocationSite) -> JsonValue:
+private pure func site_json(site: AllocationSite, source_files: List[CoreSourceFile]) -> JsonValue:
 	JsonObject([
 		("site_id", JsonNumber(to_float(site.site_id))),
 		("owner_index", JsonNumber(to_float(site.owner_index))),
 		("category", JsonString(operation_category_code(site.category))),
-		("source", source_json(site.loc)),
+		("source", source_json(site.loc, source_files)),
 		("may_reasons", reason_vector(site.facts.may_allocate)),
 		("unknown_reasons", reason_vector(site.facts.unknown)),
 		("coverage_complete", JsonBool(site.coverage_complete)),
@@ -364,7 +376,9 @@ pure func render_allocation_report_json(
 		("owners", JsonVector(analysis.owners.map(
 				func(owner): owner_json(analysis, index, owner),
 			))),
-		("sites", JsonVector(analysis.sites.map(site_json))),
+		("sites", JsonVector(analysis.sites.map(
+			func(site): site_json(site, analysis.source_files),
+		))),
 		("work", work_json(analysis)),
 	]).to_string()
 
@@ -387,12 +401,15 @@ private pure func reasons_text(reasons: List[AllocationRiskReason]) -> String:
 			.join(", ")
 
 
-private pure func source_text(loc: CoreSourceLoc) -> String:
+private pure func source_text(loc: CoreSourceLoc, source_files: List[CoreSourceFile]) -> String:
 	if core_source_loc_is_synthetic(loc):
 		"compiler-generated"
 	else:
 		row: CoreSourceLocRow = core_source_loc_row_unresolved(loc)
-		"module#" + row.file.to_string() + ":" + row.start_line.to_string() + ":" + row.start_column.to_string()
+		path: String = match source_files.get(row.file):
+			Some(file): file.path
+			None: "module#" + row.file.to_string()
+		path + ":" + row.start_line.to_string() + ":" + row.start_column.to_string()
 
 
 private pure func owner_human(
@@ -463,7 +480,7 @@ private pure func owner_human(
 	lines.join("\n")
 
 
-private pure func site_human(site: AllocationSite) -> String:
+private pure func site_human(site: AllocationSite, source_files: List[CoreSourceFile]) -> String:
 	coverage: String = if site.coverage_complete:
 		"complete"
 	else:
@@ -477,7 +494,7 @@ private pure func site_human(site: AllocationSite) -> String:
 	[
 		"site " + site.site_id.to_string() + " [" + operation_category_code(
 			site.category,
-		) + "] " + source_text(site.loc),
+		) + "] " + source_text(site.loc, source_files),
 		"  may reasons: " + reasons_text(site.facts.may_allocate),
 		"  unknown reasons: " + reasons_text(site.facts.unknown),
 		"  coverage: " + coverage,
@@ -506,7 +523,7 @@ pure func render_allocation_report_human(
 		.map(func(owner): owner_human(analysis, index, owner))
 		.join("\n")
 	sites: String = analysis.sites
-		.map(site_human)
+		.map(func(site): site_human(site, analysis.source_files))
 		.join("\n")
 	var sections: List[String] = [header]
 
