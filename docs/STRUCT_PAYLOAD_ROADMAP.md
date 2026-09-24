@@ -34,10 +34,11 @@ must use the then-current integrated base.
 
 | Step | Current status / decision |
 | --- | --- |
+| S0 | The ownership fix was reviewed and validated on the frozen 8f integration; landing the S0-only change on latest `main` is pending final gates. |
 | S1 | `main` has its own struct/enum typed-storage change at `5cf87a20`. This is distinct from the experimental S1a candidate at `4fb…`; do not describe that candidate as landed. |
 | S2a | The isolated S2a report is correctness evidence plus a small older-base measurement, not accepted/current-main performance evidence. Keep it experimental. See [`S2a outcome`](STRUCT_PAYLOAD_S2A_OUTCOME.md). |
 | S2b / S2 | S2b broadened typed accessor reach, but its three-pair stage-2 comparison on base `a1fb8e6a` improved median retired instructions by only 0.1052%, below the predeclared ≥2% bar. Park S2; S2a/S2b remain experimental and neither report is a measurement against current `main`. See the [S2b negative experiment](../benchmarks/results/struct_payload_managed_union_s2b_probe_2026-09-23.md). |
-| S3 | The selective ordinary-closure candidate is accepted on its focused review/evidence, with integration still pending. Its fixture demonstrated 2,048→1,024 allocations with checksum/live-object parity; the old-base stage-2 median retired-instruction change was -0.66%. Integrated remeasurement remains required; do not apply that result to current `main`. See the [S3 outcome](../benchmarks/results/struct_payload_closure_env_2026-09-23.md). |
+| S3 | The selective ordinary-closure candidate remains unlanded. Its fixture demonstrated 2,048→1,024 allocations with checksum/live-object parity, and the old-base stage-2 median retired-instruction change was -0.66%; the required current-base uncontended benchmark could not be completed under sustained host contention. Integrated acceptance remains pending; do not apply the old-base result to current `main`. See the [S3 outcome](../benchmarks/results/struct_payload_closure_env_2026-09-23.md). |
 | S4 | Wait for I6 before the name-id-dependent `CoreVar` conversion. N1's `CoreSourceLoc` work is already on `main`; do not repeat it in S4. |
 | S5 | Dictionary storage is parked: the inspected experimental C had 0 static dictionary boxing sites. Tuple storage remains only a future probe: 123 static sites in experimental C, not dynamic allocation/execution counts and not a post-S4 census. Recount after S4 before proposing implementation. |
 
@@ -354,9 +355,11 @@ what `env` points at.
 
 ### S4: hot records become structs
 
-**Context.** With S1 and S2 landed, the SourceSpan rule no longer applies:
-a struct in a union payload is inline. Candidates from the lowering type
-histogram and the allocation census:
+**Context.** Original premise, conditional on the required S1 and S2 union-
+layout changes being landed: the SourceSpan rule no longer applies to a struct
+in a union payload. S2 is currently parked, so that premise does not hold;
+S4 remains gated on I6 and a fresh decision about its S2 dependency. Candidates
+from the lowering type histogram and the allocation census:
 
 | type | today | as a struct | needs |
 | --- | --- | --- | --- |
