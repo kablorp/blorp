@@ -140,7 +140,7 @@ new layout. Rotation is only needed for the new layout to speed up
 | --- | --- | --- | --- |
 | S0 | census of erased unions and box sites on the current build; a `BLORP_EMIT_PAYLOAD_CENSUS` report | numbers for S1 and S2 | none (report) |
 | S1 | source unions with struct or enum payload fields get typed storage | struct payloads inline; `blorp_box_struct` count down; unlocks S4 | behavioural + codegen-audit updates |
-| S2 | source unions with managed pointer fields get typed storage with static release (as mono already does) | every `CoreExpr`, `SemanticType`, `ParsedExpr` read loses a cast; `release_mask` gone from those unions; instructions -3% to -6% | behavioural; stage-2 instructions |
+| S2 | **parked 2026-09-24** (see below): typed storage for managed fields, built and gated green | measured on stage 2: instructions -0.04%, allocations +0.33%, emitted C -2.1%, RSS -0.8% | behavioural; stage-2 instructions |
 | S3 | closure environments as a typed struct per closure instead of `void*` slots | struct captures inline; capture reads lose the unbox | behavioural |
 | S4 | convert hot records to structs: `CoreVar`, `SourceSpan`, `CoreParam` shape, small type nodes | lowering -0.35M (`CoreVar`) and downstream; discovery -5%; typed frontend no longer +2% | behavioural + allocation rows |
 | S5 | tuple elements and dictionary slots typed by monomorphized layout | remaining box sites gone | behavioural |
@@ -220,6 +220,35 @@ Unions containing themselves recursively through a struct cannot occur
 `test_core_emit.brp` union fixtures updated where they pin the erased form.
 
 ### S2: typed payloads for managed fields
+
+**Parked 2026-09-24 with numbers** (branch `backend/s2-typed-managed-payloads`,
+all gates green, codegen-audit 220/220). The predicate was extended to every
+field type the mono path accepts, with the type-kind table gaining record and
+union names; release policies needed no change because
+`cleanup_release_policy_for_type` already derived them per field regardless
+of storage. Two hand-written runtime-bridge emitters that hardcoded the erased
+two-argument convention for native error unions were found and fixed. Stage-2
+measurement on the frozen self-compile:
+
+| metric | parent | candidate | delta |
+| --- | --- | --- | --- |
+| instructions retired (min of 3) | 284,992,725,939 | 284,871,812,592 | -0.04% (noise band) |
+| total allocations | 181,837,033 | 182,433,234 | +0.33% (typed frontend +2.39%, mono +1.77%) |
+| emitted C | 112,309,349 | 109,945,309 | -2.10% |
+| peak RSS | 2,073,034,752 | 2,056,339,456 | -0.81% |
+
+The instruction estimate in this roadmap was wrong: an erased scalar payload
+is one cast and a release is one mask test, and neither is measurable
+against the rest of a node visit. What S2 buys is smaller C and lower RSS,
+and the allocation rise (the widened predicate's per-field lookups and the
+canonical-field work for 352 newly typed unions) would have to be removed
+before even that is a clean win. Do not reopen for instructions. Reopen only
+if emitted C size becomes the target metric, and then fix the allocation
+regression first (cache the kind lookups per union, and check why
+`typed_frontend_complete` moved at all for a lowering-side change).
+
+The original text follows for the record.
+
 
 **Context.** The mono path already emits typed storage for pointer fields
 with static release policies and no `release_mask`. Source unions are held
