@@ -204,13 +204,25 @@ retain policy with `CowFieldTakeRetainPolicy(source, field)` when the update's
 source is a bare consumed variable, the field is stored as one heap pointer
 under `ArcReleasePolicy` (heap records and the pointer collections; never an
 inline managed value such as a stack result), and that alias is the only read
-of the source that could observe the field slot across every replacement (a
-direct read of a different field does not count; a lambda, closure, or
-assignment of the source disqualifies). The policy emits a runtime test on the source: a
-unique source gives up its slot (left null) so the alias is the sole owner; a
-shared source retains as before. The emptied slot is never observable because
-the source is read only after every replacement, the unique path overwrites
-the slot, and field release is null-safe on every path including cancellation
+of the source that could observe the field slot across every replacement. A
+direct read of a different field does not count; a lambda, closure, assignment,
+or ownership event on the source disqualifies.
+
+The owned alias may appear directly inside the replacement or in one preceding
+immutable binding whose value transfers exactly once as the matching field's
+bare replacement. The latter proof follows only explicit `LetExpr`,
+`BorrowLetExpr`, and `SeqExpr` fall-through frames. It does not cross a call,
+cooperative checkpoint, conditional, loop, logical short-circuit, lambda, or
+nested field path, and it rejects any same-slot or whole-source observation
+before writeback.
+
+The policy emits a runtime test on the source: a unique source gives up its
+slot (left null) so the alias is the sole owner; a shared source retains as
+before. The emptied slot is never observable: the replacement-local form
+evaluates every replacement before consuming the source, while the hoisted
+form proves that its linear window reaches the matching update without an
+intervening observation or cancellation point. The unique path overwrites the
+slot, and field release is null-safe on every path including cancellation
 cleanup. The rewrite must stay after Perceus and must not descend into any
 position that can evaluate more than once or conditionally.
 

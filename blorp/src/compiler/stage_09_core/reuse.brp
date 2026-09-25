@@ -232,6 +232,12 @@ private record PreparedReuseLayout {
 }
 
 
+private record HoistedFieldAlias {
+	source_var: CoreVar,
+	field_name: String
+}
+
+
 pure func core_expr_is_var(expr: CoreExpr, expected: CoreVar) -> Bool:
 	match expr:
 		VarExpr(variable, typ, loc):
@@ -2000,11 +2006,17 @@ private pure func var_touch_count(target: CoreVar, field_name: String, expr: Cor
 				2
 			else:
 				var_touch_count(target, field_name, rhs)
+		DupExpr(variable, _, _, body, _, _) | DropExpr(variable, _, _, body, _, _):
+			if core_var_equal(variable, target):
+				2
+			else:
+				var_touch_count(target, field_name, body)
 		_:
 			var total: Int = 0
 
 			for child in CoreTraverse.immediate_core_expr_children(expr):
-				total += var_touch_count(target, field_name, child)
+				if total < 2:
+					total += var_touch_count(target, field_name, child)
 
 			total
 
@@ -2163,6 +2175,255 @@ private pure func take_field_alias(
 			)
 		_:
 			None
+
+
+---
+Identify the exact Perceus owned-field-alias shape before scanning a later
+linear suffix. This is intentionally the same guaranteed-once expression
+spine as `take_field_alias`; it never searches branches, loops, or lambdas.
+---
+private pure func find_hoisted_field_alias(expr: CoreExpr) -> Option[HoistedFieldAlias]:
+	match expr:
+		BorrowLetExpr(temp, temp_type, FieldExpr(VarExpr(owner, _, _), field_name, _, _), DupExpr(dup_var, dup_type, ArcRetainPolicy, VarExpr(body_var, _, _), _, _)):
+			if (
+				core_var_equal(dup_var, temp)
+				and core_var_equal(body_var, temp)
+				and field_take_type_allowed(temp_type)
+				and field_take_type_allowed(dup_type)
+			):
+				Some({ source_var = owner, field_name = field_name })
+			else:
+				None
+		BorrowLetExpr(_, _, rhs, body):
+			match find_hoisted_field_alias(rhs):
+				Some(field_alias):
+					Some(field_alias)
+				None:
+					find_hoisted_field_alias(body)
+		LetExpr(_, _, _, rhs, body):
+			match find_hoisted_field_alias(rhs):
+				Some(field_alias):
+					Some(field_alias)
+				None:
+					find_hoisted_field_alias(body)
+		SeqExpr(first, second):
+			match find_hoisted_field_alias(first):
+				Some(field_alias):
+					Some(field_alias)
+				None:
+					find_hoisted_field_alias(second)
+		CallExpr(_, _, args, _, _):
+			var found: Option[HoistedFieldAlias] = None
+
+			for arg in args:
+				match found:
+					Some(_):
+						void
+					None:
+						found = find_hoisted_field_alias(arg)
+
+			found
+		DupExpr(_, _, _, body, _, _) | DropExpr(_, _, _, body, _, _):
+			find_hoisted_field_alias(body)
+		CastExpr(inner, _, _) | UnboxExpr(_, inner, _, _):
+			find_hoisted_field_alias(inner)
+		_:
+			None
+
+
+private pure func linear_prefix_exprs_complete_normally(exprs: List[CoreExpr]) -> Bool:
+	exprs.all(linear_prefix_completes_normally)
+
+
+---
+Whether an expression used before the terminal update must fall through to
+the next expression. The allow-list is explicit so a new Core form fails
+closed until its control-flow behavior is classified.
+---
+private pure func linear_prefix_completes_normally(expr: CoreExpr) -> Bool:
+	match expr:
+		LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VarExpr(_, _, _) | VoidExpr(_, _):
+			True
+		DebugBlockExpr(body, _, _):
+			linear_prefix_completes_normally(body)
+		BinaryExpr(_, left, right, _, _):
+			(
+				linear_prefix_completes_normally(left)
+				and linear_prefix_completes_normally(right)
+			)
+		UnaryExpr(_, inner, _, _) | CastExpr(inner, _, _) | UnboxExpr(_, inner, _, _) | FieldExpr(inner, _, _, _) | TupleFieldExpr(inner, _, _, _):
+			linear_prefix_completes_normally(inner)
+		AssignExpr(_, rhs, _, _):
+			linear_prefix_completes_normally(rhs)
+		TupleExpr(items, _, _) | VectorExpr(items, _, _):
+			linear_prefix_exprs_complete_normally(items)
+		LetExpr(_, _, _, rhs, body) | BorrowLetExpr(_, _, rhs, body):
+			(
+				linear_prefix_completes_normally(rhs)
+				and linear_prefix_completes_normally(body)
+			)
+		SeqExpr(first, second):
+			(
+				linear_prefix_completes_normally(first)
+				and linear_prefix_completes_normally(second)
+			)
+		DupExpr(_, _, _, body, _, _) | DropExpr(_, _, _, body, _, _):
+			linear_prefix_completes_normally(body)
+		_:
+			False
+
+
+private pure func record_reuse_transfers_hoisted_alias(
+	binding: CoreVar,
+	field_alias: HoistedFieldAlias,
+	fields: List[CoreRecordFieldValue],
+) -> Bool:
+	var transfers: Int = 0
+	var valid: Bool = True
+
+	for field in fields:
+		if field.name == field_alias.field_name and core_expr_is_var(field.value, binding):
+			transfers += 1
+		else if owner_touched(binding, field.value):
+			valid = False
+
+		if var_touch_count(field_alias.source_var, field_alias.field_name, field.value) > 0:
+			valid = False
+
+	valid and transfers == 1
+
+
+private pure func record_cow_transfers_hoisted_alias(
+	binding: CoreVar,
+	field_alias: HoistedFieldAlias,
+	fields: List[CoreRecordCowField],
+) -> Bool:
+	var transfers: Int = 0
+	var valid: Bool = True
+
+	for field in fields:
+		match field.replacement:
+			Some(replacement):
+				if (
+					field.field.name == field_alias.field_name
+					and is_arc_release_policy(field.field.release_policy)
+					and core_expr_is_var(replacement, binding)
+				):
+					transfers += 1
+				else if owner_touched(binding, replacement):
+					valid = False
+
+				if var_touch_count(field_alias.source_var, field_alias.field_name, replacement) > 0:
+					valid = False
+			None:
+				void
+
+	valid and transfers == 1
+
+
+private pure func terminal_update_transfers_hoisted_alias(
+	binding: CoreVar,
+	field_alias: HoistedFieldAlias,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		RecordReuseExpr(VarExpr(source_var, _, _), fields, _, _):
+			(
+				core_var_equal(source_var, field_alias.source_var)
+				and record_reuse_transfers_hoisted_alias(binding, field_alias, fields)
+			)
+		RecordCowUpdateExpr(VarExpr(source_var, _, _), fields, _, _):
+			(
+				core_var_equal(source_var, field_alias.source_var)
+				and record_cow_transfers_hoisted_alias(binding, field_alias, fields)
+			)
+		_:
+			False
+
+
+private pure func terminal_assignment_transfers_hoisted_alias(
+	binding: CoreVar,
+	field_alias: HoistedFieldAlias,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		AssignExpr(assigned_var, rhs, _, _):
+			(
+				core_var_equal(assigned_var, field_alias.source_var)
+				and terminal_update_transfers_hoisted_alias(binding, field_alias, rhs)
+			)
+		_:
+			False
+
+
+---
+Prove that `binding` is transferred exactly once into the matching field of a
+bare-source update, after only guaranteed-once frames. Prefix expressions may
+read other fields, but cannot touch the source slot, use the binding, rebind
+either owner, or exit before writeback.
+---
+private pure func linear_body_transfers_hoisted_alias(
+	binding: CoreVar,
+	field_alias: HoistedFieldAlias,
+	expr: CoreExpr,
+) -> Bool:
+	match expr:
+		LetExpr(variable, _, _, rhs, body):
+			(
+				not core_var_equal(variable, binding)
+				and not core_var_equal(variable, field_alias.source_var)
+				and linear_prefix_completes_normally(rhs)
+				and not owner_touched(binding, rhs)
+				and var_touch_count(field_alias.source_var, field_alias.field_name, rhs) == 0
+				and linear_body_transfers_hoisted_alias(binding, field_alias, body)
+			)
+		BorrowLetExpr(variable, _, rhs, body):
+			(
+				not core_var_equal(variable, binding)
+				and not core_var_equal(variable, field_alias.source_var)
+				and linear_prefix_completes_normally(rhs)
+				and not owner_touched(binding, rhs)
+				and var_touch_count(field_alias.source_var, field_alias.field_name, rhs) == 0
+				and linear_body_transfers_hoisted_alias(binding, field_alias, body)
+			)
+		SeqExpr(first, second):
+			if terminal_assignment_transfers_hoisted_alias(binding, field_alias, first):
+				not owner_touched(binding, second)
+			else:
+				(
+					linear_prefix_completes_normally(first)
+					and not owner_touched(binding, first)
+					and var_touch_count(field_alias.source_var, field_alias.field_name, first) == 0
+					and linear_body_transfers_hoisted_alias(binding, field_alias, second)
+				)
+		AssignExpr(_, _, _, _):
+			terminal_assignment_transfers_hoisted_alias(binding, field_alias, expr)
+		_:
+			terminal_update_transfers_hoisted_alias(binding, field_alias, expr)
+
+
+private pure func take_hoisted_field_alias(
+	binding: CoreVar,
+	is_mutable: Bool,
+	binding_type: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> Option[CoreExpr]:
+	if is_mutable or not field_take_type_allowed(binding_type):
+		None
+	else:
+		match find_hoisted_field_alias(rhs):
+			Some(field_alias):
+				if (
+					not core_var_equal(binding, field_alias.source_var)
+					and var_touch_count(field_alias.source_var, field_alias.field_name, rhs) == 1
+					and linear_body_transfers_hoisted_alias(binding, field_alias, body)
+				):
+					take_field_alias(field_alias.source_var, field_alias.field_name, rhs)
+				else:
+					None
+			None:
+				None
 
 
 ---
@@ -2707,6 +2968,20 @@ private pure func consume_handoff_in_linear_expr(
 
 
 pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
+	match expr:
+		LetExpr(variable, is_mutable, value_type, rhs, body):
+			match take_hoisted_field_alias(variable, is_mutable, value_type, rhs, body):
+				Some(taken_rhs):
+					rewrite_post_perceus_non_let(
+						LetExpr(variable, is_mutable, value_type, taken_rhs, body),
+					)
+				None:
+					rewrite_post_perceus_non_let(expr)
+		_:
+			rewrite_post_perceus_non_let(expr)
+
+
+private pure func rewrite_post_perceus_non_let(expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LetExpr(variable, is_mutable, value_type, rhs, body):
 			match body:

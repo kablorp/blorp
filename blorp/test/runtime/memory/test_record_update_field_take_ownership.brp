@@ -6,12 +6,10 @@
 -- unique list and grows it in place: allocations are the amortized vector
 -- growth steps, independent of the loop trip count.
 --
--- Hoisting the same append into a preceding binding loses that: the field read
--- is outside the record update, so it is retained with a plain `blorp_retain`,
--- the list has two owners across `append`, and every iteration copies. The
--- `hoisted_*` expectations below record today's behavior, not desired
--- behavior; a fix that extends the field take to a hoisted read is expected to
--- fail them and should replace them with the fused expectations.
+-- A hoisted append followed by a record update uses the same take when the
+-- intervening Core path is linear and the owned alias transfers exactly once
+-- into the matching field. A fresh record rebuild remains outside that proof
+-- and still allocates a record and copies the list on every iteration.
 import:
 	memory: MemStats, get_mem_stats, reset_mem_stats
 	test: TestSuite
@@ -108,23 +106,22 @@ func test_hoisted_append_then_rebuild_copies_every_iteration() -> Bool:
 	)
 
 
-func test_hoisted_append_then_update_reuses_the_record_but_copies_the_list() -> Bool:
+func test_hoisted_append_then_update_grows_the_field_in_place() -> Bool:
 	reset_mem_stats()
 	state: State = hoisted_then_update(ROUNDS)
 	stats: MemStats = get_mem_stats()
 
-	-- The record is reused in place, so only the list copy remains.
 	(
 		state.count == ROUNDS
 		and state.items.length() == ROUNDS
-		and stats.total_allocations >= ROUNDS
-		and stats.total_allocations < 2 * ROUNDS
+		and stats.total_allocations <= GROWTH_ALLOCATION_CEILING
 	)
 
 
 -- The record crosses a function boundary. `state = step_*(state, i)` leaves the
 -- caller's binding dead at the call, so the consumed-parameter specialization
--- hands the callee a unique record; only the fused body exploits it.
+-- hands the callee a unique record. Both fused and proven-linear hoisted bodies
+-- can move the field out before append.
 pure func step_fused(state: State, i: Int) -> State:
 	{ state |
 		items = state.items.append(i),
@@ -180,12 +177,36 @@ func test_consumed_parameter_with_fused_update_grows_in_place() -> Bool:
 	)
 
 
-func test_consumed_parameter_with_hoisted_append_copies_every_iteration() -> Bool:
+func test_consumed_parameter_with_hoisted_append_grows_in_place() -> Bool:
 	reset_mem_stats()
 	state: State = fill_param_hoisted(ROUNDS)
 	stats: MemStats = get_mem_stats()
 
-	state.count == ROUNDS and state.items.length() == ROUNDS and stats.total_allocations >= ROUNDS
+	(
+		state.count == ROUNDS
+		and state.items.length() == ROUNDS
+		and stats.total_allocations <= GROWTH_ALLOCATION_CEILING
+	)
+
+
+func test_hoisted_append_preserves_a_shared_parent() -> Bool:
+	state: State = {
+		items = [1],
+		count = 1
+	}
+	shared: State = state
+	items: List[Int] = state.items.append(2)
+	updated: State = { state |
+		items = items,
+		count = 2
+	}
+
+	(
+		shared.count == 1
+		and shared.items == [1]
+		and updated.count == 2
+		and updated.items == [1, 2]
+	)
 
 
 tests: TestSuite = {
@@ -200,16 +221,20 @@ tests: TestSuite = {
 			test_hoisted_append_then_rebuild_copies_every_iteration,
 		),
 		(
-			"hoisted append then update reuses the record but copies the list",
-			test_hoisted_append_then_update_reuses_the_record_but_copies_the_list,
+			"hoisted append then update grows the field in place",
+			test_hoisted_append_then_update_grows_the_field_in_place,
 		),
 		(
 			"consumed parameter with fused update grows in place",
 			test_consumed_parameter_with_fused_update_grows_in_place,
 		),
 		(
-			"consumed parameter with hoisted append copies every iteration",
-			test_consumed_parameter_with_hoisted_append_copies_every_iteration,
+			"consumed parameter with hoisted append grows in place",
+			test_consumed_parameter_with_hoisted_append_grows_in_place,
+		),
+		(
+			"hoisted append preserves a shared parent",
+			test_hoisted_append_preserves_a_shared_parent,
 		),
 	]
 }
