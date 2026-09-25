@@ -589,8 +589,20 @@ class NativeLspBaselineTests(unittest.TestCase):
             uri = source_path.as_uri()
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(source_path.parent.as_uri(), expected_version)
-            self.assertEqual(client.open_document(uri, source.text), [])
+            client.initialize(
+                source_path.parent.as_uri(),
+                expected_version,
+                capabilities={
+                    "textDocument": {
+                        "publishDiagnostics": {"versionSupport": True}
+                    }
+                },
+            )
+            client.open_document_without_wait(uri, source.text)
+            # didOpen can first clear old diagnostics with an unversioned empty
+            # publication. Wait for analysis of version 1 before querying its
+            # semantic index; a failed analysis still fails the assertion below.
+            self.assertEqual(client.wait_for_versioned_diagnostics(uri, 1), [])
 
             highlights = client.request(
                 "textDocument/documentHighlight",
