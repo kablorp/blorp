@@ -124,6 +124,12 @@ record CCallableSymbolPlan {
 }
 
 
+private record CEmissionCallablePlan {
+	by_definition_id: Dict[Int, String],
+	by_original_c_spelling: Dict[String, String]
+}
+
+
 private record CProgramSymbolInventory {
 	candidates: List[CCallableSymbolCandidate],
 	preserved_names: List[String],
@@ -149,7 +155,7 @@ union CSymbolProjectionError:
 
 
 private record CEmissionSymbolPlanRep {
-	callables: CCallableSymbolPlan,
+	callables: CEmissionCallablePlan,
 	canonical_empty_lists: List[CanonicalEmptyList],
 	preserved_symbol_count: Int,
 	type_naming: Dict[String, BackendTypeNaming],
@@ -365,6 +371,34 @@ pure func build_callable_symbol_plan(
 			})
 
 
+---
+Publish only the callable facts needed while printing C. Semantic names and
+the original callable records remain in the validation plan above, whose
+lifetime ends at the projection boundary.
+---
+private pure func build_emission_callable_plan(
+	candidates: List[CCallableSymbolCandidate],
+	preserved_names: List[String],
+) -> CEmissionCallablePlan:
+	var by_definition_id: Dict[Int, String] = {}
+	var by_original: Dict[String, String] = {}
+	preserved: Dict[String, Bool] = preserved_symbol_index(preserved_names)
+
+	for candidate in candidates:
+		projected_name: String = available_projected_callable_name(
+			candidate.def_id,
+			candidate.kind,
+			preserved,
+		)
+		by_definition_id = by_definition_id.set(candidate.def_id, projected_name)
+		by_original = by_original.set(c_identifier(candidate.original_c_spelling), projected_name)
+
+	{
+		by_definition_id = by_definition_id,
+		by_original_c_spelling = by_original,
+	}
+
+
 pure func projected_callable_name(
 	plan: CCallableSymbolPlan,
 	qualified_name: String,
@@ -397,36 +431,36 @@ private pure func projected_callback_name(
 		.map(func(symbol): symbol.projected_name)
 
 
-private pure func c_emission_callable_plan(plan: CEmissionSymbolPlan) -> CCallableSymbolPlan:
+private pure func c_emission_callable_plan(plan: CEmissionSymbolPlan) -> CEmissionCallablePlan:
 	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
 	representation.callables
 
 
 pure func planned_emitted_callable_name(
 	plan: CEmissionSymbolPlan,
-	qualified_name: String,
 	def_id: Int,
 ) -> Option[String]:
-	projected_callable_name(c_emission_callable_plan(plan), qualified_name, def_id)
+	c_emission_callable_plan(plan).by_definition_id.get(def_id)
 
 
 pure func planned_emitted_callback_name(
 	plan: CEmissionSymbolPlan,
 	original_name: String,
 ) -> Option[String]:
-	projected_callback_name(c_emission_callable_plan(plan).by_original_c_spelling, original_name)
+	c_emission_callable_plan(plan)
+		.by_original_c_spelling
+		.get(c_identifier(original_name))
 
 
 pure func emitted_callable_name(
 	plan: CEmissionSymbolPlan,
-	qualified_name: String,
 	def_id: Int,
 ) -> String:
-	projected_callable_name_after_validation(c_emission_callable_plan(plan), qualified_name, def_id)
+	planned_emitted_callable_name(plan, def_id).get_or(INVALID_PROJECTED_CALLABLE_NAME)
 
 
 pure func emitted_callback_name(plan: CEmissionSymbolPlan, original_name: String) -> String:
-	projected_callback_name_after_validation(c_emission_callable_plan(plan), original_name)
+	planned_emitted_callback_name(plan, original_name).get_or(INVALID_PROJECTED_CALLABLE_NAME)
 
 
 pure func c_emission_canonical_empty_lists(plan: CEmissionSymbolPlan) -> List[CanonicalEmptyList]:
@@ -468,29 +502,6 @@ behavior on a stale or absent plan).
 pure func c_emission_type_symbol_lookup(plan: CEmissionSymbolPlan) -> Dict[String, String]:
 	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
 	representation.type_symbol_lookup
-
-
-private pure func projected_callable_name_after_validation(
-	plan: CCallableSymbolPlan,
-	qualified_name: String,
-	def_id: Int,
-) -> String:
-	match projected_callable_name(plan, qualified_name, def_id):
-		Some(name):
-			name
-		None:
-			INVALID_PROJECTED_CALLABLE_NAME
-
-
-private pure func projected_callback_name_after_validation(
-	plan: CCallableSymbolPlan,
-	original_name: String,
-) -> String:
-	match projected_callback_name(plan.by_original_c_spelling, original_name):
-		Some(name):
-			name
-		None:
-			INVALID_PROJECTED_CALLABLE_NAME
 
 
 private pure func callable_candidate(
@@ -1139,20 +1150,16 @@ pure func prepare_c_emission_symbols(
 										),
 									)
 
-									match build_callable_symbol_plan(
-										inventory.candidates,
-										preserved_names,
-									):
-										Err(error):
-											Err(error)
-										Ok(plan):
-											Ok(into_opaque CEmissionSymbolPlan({
-														callables = plan,
-														canonical_empty_lists = validation.canonical_empty_lists,
-														preserved_symbol_count = preserved_names.length(),
-														type_naming = inventory.type_naming,
-														type_symbol_lookup = inventory.type_symbol_lookup
-													}))
+									Ok(into_opaque CEmissionSymbolPlan({
+										callables = build_emission_callable_plan(
+											inventory.candidates,
+											preserved_names,
+										),
+										canonical_empty_lists = validation.canonical_empty_lists,
+										preserved_symbol_count = preserved_names.length(),
+										type_naming = inventory.type_naming,
+										type_symbol_lookup = inventory.type_symbol_lookup
+									}))
 
 
 pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
