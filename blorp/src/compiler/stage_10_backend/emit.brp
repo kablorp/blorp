@@ -26817,30 +26817,10 @@ private pure func emit_static_closure_forward_decls(
 
 
 ---
-The emitted C for one translation unit's worth of declarations, held as the
-named sections `emit_decls` builds them in rather than one concatenated
-string. Field order matches today's fixed emission order exactly, and
-`render_single_translation_unit` joins them in that order, so this step
-changes only where the pieces are held: it does not move, add, or remove a
-single byte of the rendered output.
-
-Splitting further than this — e.g. pulling every type's typedef into one
-program-wide field, ahead of every type's supporting functions — is left to
-a later step, because doing so here would interleave text across
-declarations in a different order than today (a union's destroy function,
-for instance, sits between its typedef and its constructors today; nothing
-here moves it). What this step does add is finer-grained data one level
-down: `emit_value_record_decl`, `emit_heap_record_decl`, `emit_enum_decl`,
-and `emit_union_decl` now each return a small record separating their
-typedef from their supporting functions (see `CValueRecordDeclEmission`,
-`CHeapRecordDeclEmission`, `CEnumDeclEmission`, `CUnionDeclEmission`), and
-`function_definitions` below is kept as a `List[CFunctionEmission]` rather
-than one string. `emit_decls` keeps the per-declaration emission lists that
-back the four `*_decls` strings above (`value_record_emissions`,
-`heap_record_emissions`, `enum_emissions`, `union_emissions`) so a consumer
-that needs the structured form — today, `render_split_translation_units` —
-never has to re-derive them by calling `emit_value_record_decl` /
-`emit_heap_record_decl` / `emit_enum_decl` / `emit_union_decl` a second time.
+The common sections shared by single and split C rendering. The four type
+declaration sections have separate flat and structured representations below:
+single rendering owns the joined strings, while split rendering owns the
+per-declaration emissions. Both come from one collection pass in `emit_decls`.
 ---
 private record CClosureEnvEmission {
 	type_declaration: String,
@@ -26848,13 +26828,25 @@ private record CClosureEnvEmission {
 }
 
 
-private record CEmissionSections {
-	heap_record_and_union_forward_decls: String,
+private record CFlatTypeDeclSections {
 	value_record_decls: String,
 	enum_decls: String,
-	generated_stack_option_typedefs: String,
 	union_decls: String,
-	heap_record_decls: String,
+	heap_record_decls: String
+}
+
+
+private record CTypeDeclEmissions {
+	value_records: List[CValueRecordDeclEmission],
+	enums: List[CEnumDeclEmission],
+	unions: List[CUnionDeclEmission],
+	heap_records: List[CHeapRecordDeclEmission]
+}
+
+
+private record CEmissionSections {
+	heap_record_and_union_forward_decls: String,
+	generated_stack_option_typedefs: String,
 	closure_env_type_decls: String,
 	canonical_empty_lists: String,
 	static_string_literals: String,
@@ -26864,11 +26856,7 @@ private record CEmissionSections {
 	global_decls: String,
 	global_init: String,
 	profile_metadata: String,
-	function_definitions: List[CFunctionEmission],
-	value_record_emissions: List[CValueRecordDeclEmission],
-	heap_record_emissions: List[CHeapRecordDeclEmission],
-	enum_emissions: List[CEnumDeclEmission],
-	union_emissions: List[CUnionDeclEmission]
+	function_definitions: List[CFunctionEmission]
 }
 
 
@@ -26878,14 +26866,18 @@ translation unit by appending into the same buffer this function already
 grows in place, instead of the caller building a full-size artifact copy
 with a top-level `+` afterward.
 ---
-private pure func render_single_translation_unit(sections: CEmissionSections, header: String) -> String:
+private pure func render_single_translation_unit(
+	sections: CEmissionSections,
+	type_decls: CFlatTypeDeclSections,
+	header: String,
+) -> String:
 	var c_code: String = header
 	c_code = append_emitted_c(c_code, sections.heap_record_and_union_forward_decls)
-	c_code = append_emitted_c(c_code, sections.value_record_decls)
-	c_code = append_emitted_c(c_code, sections.enum_decls)
+	c_code = append_emitted_c(c_code, type_decls.value_record_decls)
+	c_code = append_emitted_c(c_code, type_decls.enum_decls)
 	c_code = append_emitted_c(c_code, sections.generated_stack_option_typedefs)
-	c_code = append_emitted_c(c_code, sections.union_decls)
-	c_code = append_emitted_c(c_code, sections.heap_record_decls)
+	c_code = append_emitted_c(c_code, type_decls.union_decls)
+	c_code = append_emitted_c(c_code, type_decls.heap_record_decls)
 	c_code = append_emitted_c(c_code, sections.closure_env_type_decls)
 	c_code = append_emitted_c(c_code, sections.canonical_empty_lists)
 	c_code = append_emitted_c(c_code, sections.static_string_literals)
@@ -26942,18 +26934,11 @@ private pure func emit_heap_record_and_union_forward_decls(
 
 
 ---
-Builds each declaration kind's `C*DeclEmission` records exactly once, by
-calling `emit_value_record_decl` / `emit_heap_record_decl` /
-`emit_union_decl` / `emit_enum_decl` per declaration. `emit_decls` keeps
-these lists on `CEmissionSections` (see `value_record_emissions` et al.) and
-also folds them into the flat section strings the single-file path renders,
-via `join_*_decl_emissions` below -- so a consumer that needs the structured
-form, like `render_split_translation_units`, and a consumer that needs the
-flat joined string, like `render_single_translation_unit`, both read from
-the same computed data instead of one re-deriving what the other already
-built. `internal_type_linkage` threads through the same way it does for the
-flat emitters (`emit_value_record_decl` never took a linkage parameter, so
-`collect_value_record_decl_emissions` has none either).
+Builds each declaration kind's `C*DeclEmission` records exactly once. The
+single path joins these records after collection; the split renderer keeps
+them structured. `internal_type_linkage` threads through the same way
+it does for the flat emitters (`emit_value_record_decl` never took a linkage
+parameter, so `collect_value_record_decl_emissions` has none either).
 ---
 private pure func collect_value_record_decl_emissions(
 	decls: List[CoreDecl],
@@ -27136,6 +27121,15 @@ private pure func join_enum_decl_emissions(emissions: List[CEnumDeclEmission]) -
 	c_code
 
 
+private pure func flatten_type_decl_emissions(emissions: CTypeDeclEmissions) -> CFlatTypeDeclSections:
+	{
+		value_record_decls = join_value_record_decl_emissions(emissions.value_records),
+		enum_decls = join_enum_decl_emissions(emissions.enums),
+		union_decls = join_union_decl_emissions(emissions.unions),
+		heap_record_decls = join_heap_record_decl_emissions(emissions.heap_records),
+	}
+
+
 ---
 `internal_type_linkage` governs the storage class of the pieces this module
 has always hard-coded as `static` regardless of `internal_linkage` — record/
@@ -27156,7 +27150,7 @@ private pure func emit_decls(
 	internal_linkage: Bool,
 	internal_type_linkage: Bool,
 	compact: Bool,
-) -> Result[CEmissionSections, CoreEmitError]:
+) -> Result[(CEmissionSections, CTypeDeclEmissions), CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
 	specialize_layout: CoreSpecializeLayout = build_specialize_layout(program)
 	layouts: CRecordLayoutRegistry = classify_c_record_layouts(program)
@@ -27205,13 +27199,9 @@ private pure func emit_decls(
 		selected_type_symbol_lookup(symbol_authority),
 	)
 
-	Ok({
+	sections: CEmissionSections = {
 		heap_record_and_union_forward_decls = emit_heap_record_and_union_forward_decls(decls, selected_type_symbol_lookup(symbol_authority)),
-		value_record_decls = join_value_record_decl_emissions(value_record_emissions),
-		enum_decls = join_enum_decl_emissions(enum_emissions),
 		generated_stack_option_typedefs = emit_generated_stack_option_typedefs(decls, selected_type_symbol_lookup(symbol_authority)),
-		union_decls = join_union_decl_emissions(union_emissions),
-		heap_record_decls = join_heap_record_decl_emissions(heap_record_emissions),
 		closure_env_type_decls = closure_env_emission_type_declarations(closure_env_emissions),
 		canonical_empty_lists = emit_canonical_empty_list_definitions(canonical_empty_lists, selected_type_symbol_lookup(symbol_authority)),
 		static_string_literals = emit_static_string_literal_definitions(static_string_literals),
@@ -27241,11 +27231,43 @@ private pure func emit_decls(
 			internal_type_linkage,
 			compact,
 		),
-		value_record_emissions = value_record_emissions,
-		heap_record_emissions = heap_record_emissions,
-		enum_emissions = enum_emissions,
-		union_emissions = union_emissions,
-	})
+	}
+	type_emissions: CTypeDeclEmissions = {
+		value_records = value_record_emissions,
+		enums = enum_emissions,
+		unions = union_emissions,
+		heap_records = heap_record_emissions,
+	}
+	Ok((sections, type_emissions))
+
+
+---
+End the structured emission lifetime before assembling the single, large C
+translation unit. The split caller keeps the original per-declaration lists.
+---
+private pure func emit_single_decls(
+	program: CoreProgram,
+	plan: CleanupPlan,
+	cancellation_table: CancellationPlanTable,
+	profile_configuration: FunctionProfileConfiguration,
+	symbol_authority: CEmissionSymbolAuthority,
+	canonical_empty_lists: List[CanonicalEmptyList],
+	internal_linkage: Bool,
+	internal_type_linkage: Bool,
+	compact: Bool,
+) -> Result[(CEmissionSections, CFlatTypeDeclSections), CoreEmitError]:
+	emitted ?= emit_decls(
+		program,
+		plan,
+		cancellation_table,
+		profile_configuration,
+		symbol_authority,
+		canonical_empty_lists,
+		internal_linkage,
+		internal_type_linkage,
+		compact,
+	)
+	Ok((emitted[0], flatten_type_decl_emissions(emitted[1])))
 
 
 private pure func error_artifact(error: CoreEmitError) -> CArtifact:
@@ -27282,7 +27304,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile_and_indentation
 		Err(error):
 			Err(CallableSymbolProjectionFailed(error))
 		Ok(symbol_plan):
-			sections ?= emit_decls(
+			emitted ?= emit_single_decls(
 				program,
 				plan,
 				cancellation_table,
@@ -27293,9 +27315,12 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile_and_indentation
 				True,
 				compact,
 			)
+			sections: CEmissionSections = emitted[0]
+			type_decls: CFlatTypeDeclSections = emitted[1]
 			Ok({
 				c_code = render_single_translation_unit(
 					sections,
+					type_decls,
 					C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes),
 				),
 				extra_units = [],
@@ -27330,7 +27355,7 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		func(error): CallableSymbolProjectionFailed(error),
 	)
 
-	sections ?= emit_decls(
+	emitted ?= emit_single_decls(
 		program,
 		plan,
 		cancellation_table,
@@ -27341,9 +27366,12 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 		True,
 		False,
 	)
+	sections: CEmissionSections = emitted[0]
+	type_decls: CFlatTypeDeclSections = emitted[1]
 	Ok({
 		c_code = render_single_translation_unit(
 			sections,
+			type_decls,
 			C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes),
 		),
 		extra_units = [],
@@ -27879,28 +27907,15 @@ private pure func bin_function_definitions(
 
 
 ---
-The split renderer: given the `CEmissionSections` `emit_decls` already
-built (called with `internal_linkage = False, internal_type_linkage =
-False` by the caller below, so its function bodies, global definitions,
-profile metadata, and static-closure forward decls are already in their
-split-ready non-static/extern forms, and its `value_record_emissions` /
-`heap_record_emissions` / `enum_emissions` / `union_emissions` are the same
-per-declaration records `emit_decls` folded into the flat section strings)
-plus the raw per-declaration material that isn't derivable from `sections`
-alone (the `decls` list itself, and the raw canonical-empty-list / static-
-string-literal pools), produce a shared header and `unit_count` translation
-unit bodies.
-
-Reuses `sections`'s emission lists rather than re-deriving them: separating
-a type's typedef from its supporting functions (needed to place them in
-different places) requires the per-declaration `C*DeclEmission` records,
-and `emit_decls` already built and kept exactly those records, so this
-function reads them off `sections` instead of calling
-`emit_value_record_decl` / `emit_heap_record_decl` / `emit_enum_decl` /
-`emit_union_decl` a second time.
+The split renderer receives `CEmissionSections` built with external type and
+function linkage, and the structured type declarations collected in the same
+`emit_decls` call. It uses those declarations directly, without building the
+single-file path's flat type-section strings. Raw declarations and literal
+pools supply additional material for the shared header and translation units.
 ---
 private pure func render_split_translation_units(
 	sections: CEmissionSections,
+	type_emissions: CTypeDeclEmissions,
 	decls: List[CoreDecl],
 	plan: CleanupPlan,
 	authority: CEmissionSymbolAuthority,
@@ -27911,10 +27926,10 @@ private pure func render_split_translation_units(
 	unit_count: Int,
 	header_name: String,
 ) -> CTranslationUnitSet:
-	value_record_emissions: List[CValueRecordDeclEmission] = sections.value_record_emissions
-	enum_emissions: List[CEnumDeclEmission] = sections.enum_emissions
-	union_emissions: List[CUnionDeclEmission] = sections.union_emissions
-	heap_record_emissions: List[CHeapRecordDeclEmission] = sections.heap_record_emissions
+	value_record_emissions: List[CValueRecordDeclEmission] = type_emissions.value_records
+	enum_emissions: List[CEnumDeclEmission] = type_emissions.enums
+	union_emissions: List[CUnionDeclEmission] = type_emissions.unions
+	heap_record_emissions: List[CHeapRecordDeclEmission] = type_emissions.heap_records
 	owner_data_emissions: List[CUnionOwnerDataSplitEmission] = collect_union_owner_data_split_emissions(
 		decls,
 		selected_type_symbol_lookup(authority),
@@ -28088,7 +28103,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile_and_inden
 					authority,
 					profile_configuration,
 				)
-				sections ?= emit_decls(
+				emitted ?= emit_decls(
 					program,
 					plan,
 					cancellation_table,
@@ -28102,7 +28117,8 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile_and_inden
 
 				Ok(
 					render_split_translation_units(
-						sections,
+						emitted[0],
+						emitted[1],
 						program.decls,
 						plan,
 						authority,
