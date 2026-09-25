@@ -203,19 +203,6 @@ record CancellationCleanupCandidate {
 }
 
 
-union CancellationProtectionEvent:
-	TrackCancellationOwner(CancellationSlotId, CancellationOwnerId, CancellationCleanupAction)
-	DuplicateCancellationOwner(CancellationSlotId)
-	UntrackCancellationOwner(CancellationSlotId)
-
-
-record CancellationProtectionSite {
-	site_id: CancellationSiteId,
-	before: List[CancellationProtectionEvent],
-	after: List[CancellationProtectionEvent]
-}
-
-
 record CancellationLetProtection {
 	variable: CoreVar,
 	owner_id: CancellationOwnerId,
@@ -241,7 +228,6 @@ record CancellationProtectionPlan {
 	activation: CancellationActivationIdentity,
 	effect: CoreCancellationEffect,
 	max_live_slots: Int,
-	sites: List[CancellationProtectionSite],
 	let_protections: List[CancellationLetProtection],
 	let_protections_by_name: Dict[String, List[CancellationLetProtection]],
 	match_scrutinee_protections: List[CancellationMatchScrutineeProtection],
@@ -309,7 +295,6 @@ private record CancellationOwnershipFacts {
 
 private record CancellationPlanAnalysis {
 	facts: CancellationOwnershipFacts,
-	sites: List[CancellationProtectionSite],
 	let_protections: List[CancellationLetProtection],
 	match_scrutinee_protections: List[CancellationMatchScrutineeProtection],
 	max_live_slots: Int,
@@ -924,7 +909,6 @@ private pure func analyze_current_behavior_expr(
 		next_owner
 
 	var children: List[CancellationOwnershipFacts] = []
-	var sites: List[CancellationProtectionSite] = []
 	var protections: List[CancellationLetProtection] = []
 	var match_protections: List[CancellationMatchScrutineeProtection] = []
 	var max_live_slots: Int = 0
@@ -943,7 +927,6 @@ private pure func analyze_current_behavior_expr(
 			forced_match_scrutinees,
 		)
 		children = children.append(child_analysis.facts)
-		sites = append_child_results(sites, child_analysis.sites)
 		protections = append_child_results(protections, child_analysis.let_protections)
 
 		-- Most subtrees contain no managed match scrutinee. Avoid allocating an
@@ -1007,27 +990,6 @@ private pure func analyze_current_behavior_expr(
 			owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
 			slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
 
-			before: List[CancellationProtectionEvent] = match action:
-				Some(cleanup_action):
-					if tracks_cleanup:
-						[TrackCancellationOwner(slot_id, owner_id, cleanup_action)]
-					else:
-						[]
-				None:
-					[]
-
-			after: List[CancellationProtectionEvent] = if untracks_after_body:
-				[UntrackCancellationOwner(slot_id)]
-			else:
-				[]
-
-			sites = [
-				{
-					site_id = current_site,
-					before = before,
-					after = after
-				},
-			].concat(sites)
 			protections = [
 				{
 					variable = variable,
@@ -1060,16 +1022,6 @@ private pure func analyze_current_behavior_expr(
 					owner_id: CancellationOwnerId = cancellation_owner_id(current_owner)
 					slot_id: CancellationSlotId = cancellation_slot_id(current_owner)
 
-					before: List[CancellationProtectionEvent] = if tracks_cleanup:
-						[TrackCancellationOwner(slot_id, owner_id, action)]
-					else:
-						[]
-
-					after: List[CancellationProtectionEvent] = if tracks_cleanup:
-						[UntrackCancellationOwner(slot_id)]
-					else:
-						[]
-
 					candidate: CancellationCleanupCandidate = {
 						activation = activation,
 						id = owner_id,
@@ -1081,13 +1033,6 @@ private pure func analyze_current_behavior_expr(
 						action = action
 					}
 
-					sites = [
-						{
-							site_id = current_site,
-							before = before,
-							after = after
-						},
-					].concat(sites)
 					match_protections = [
 						{
 							scrutinee = variable,
@@ -1117,7 +1062,6 @@ private pure func analyze_current_behavior_expr(
 			non_suspending_transfer = analyzed_non_suspending_transfer(expr, children),
 			may_cancel = expression_node_may_cancel(expr, mode) or child_may_cancel(children)
 		},
-		sites = sites,
 		let_protections = protections,
 		match_scrutinee_protections = match_protections,
 		max_live_slots = max_live_slots,
@@ -1171,7 +1115,6 @@ private pure func protection_plan_from_analysis(
 		activation = activation,
 		effect = effect,
 		max_live_slots = analysis.max_live_slots,
-		sites = analysis.sites,
 		let_protections = analysis.let_protections,
 		let_protections_by_name = protections_by_name,
 		match_scrutinee_protections = analysis.match_scrutinee_protections,
@@ -1271,8 +1214,8 @@ pure func build_region_sensitive_cancellation_plan(
 
 	-- Emission has the semantic Core variable but not the planner's traversal
 	-- cursor. Duplicate exact variables therefore fail closed. Reanalyzing only
-	-- those uncommon activations preserves exact nested slot capacity and event
-	-- ordering without charging the ordinary single-pass path.
+	-- those uncommon activations preserves exact nested slot capacity and
+	-- protection ordering without charging the ordinary single-pass path.
 	if not forced_match_scrutinees.is_empty():
 		analysis = analyze_current_behavior_expr(
 			body,
@@ -1419,7 +1362,7 @@ pure func cancellation_match_scrutinee_protection(
 
 	-- Emission does not share the planner's expression cursor, so the original
 	-- Core variable is the stable semantic anchor. Repeated exact uses were
-	-- normalized to protected events above and deliberately return None here so
+	-- normalized to protected decisions above and deliberately return None here so
 	-- emission keeps the same cleanup behavior.
 	protections: List[CancellationMatchScrutineeProtection] = match plan.match_scrutinee_protections_by_id:
 		Some(index):

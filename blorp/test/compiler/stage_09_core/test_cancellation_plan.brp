@@ -70,7 +70,6 @@ import:
 		),
 		CancellationOwnerIdentity(BackendTemporaryCancellationOwner),
 		CancellationProgramSummary,
-		CancellationProtectionEvent(TrackCancellationOwner, UntrackCancellationOwner),
 		CancellationProtectionPlan,
 		CancellationReason(
 			BuiltinCancellationPoint,
@@ -318,18 +317,16 @@ pure func current_behavior_plan_tracks_live_let_in_lexical_order() -> Bool:
 			def_id = 10,
 		}), body)
 
-	match (cancellation_let_protection(plan, variable), plan.sites):
-		(Some(decision), [site]):
-			match (site.before, site.after):
-				([TrackCancellationOwner(_, owner_id, ReleaseArcCancellationOwner)], [UntrackCancellationOwner(_)]):
-					(
-						decision.tracks_cleanup
-						and decision.untracks_after_body
-						and cancellation_owner_id_value(owner_id) == 0
-					)
-				_:
-					False
-		_:
+	match cancellation_let_protection(plan, variable):
+		Some(decision):
+			(
+				decision.tracks_cleanup
+				and decision.untracks_after_body
+				and cancellation_owner_id_value(decision.owner_id) == 0
+				and plan.let_protections.length() == 1
+				and plan.max_live_slots == 1
+			)
+		None:
 			False
 
 
@@ -445,18 +442,17 @@ pure func noncancelling_activation_suppresses_local_cleanup_candidates() -> Bool
 		False,
 	)
 
-	match (cancellation_let_protection(plan, variable), plan.sites):
-		(Some(decision), [site]):
+	match cancellation_let_protection(plan, variable):
+		Some(decision):
 			(
 				plan.effect == CannotCancelCurrentTask
 				and decision.tracks_cleanup
 				and decision.untracks_after_body
-				and site.before.length() == 1
-				and site.after.length() == 1
+				and plan.let_protections.length() == 1
 				and candidate.is_some()
 				and not cancellation_plan_requires_local_owner_protection(plan)
 			)
-		_:
+		None:
 			False
 
 
@@ -653,15 +649,14 @@ pure func repeated_match_scrutinee_lookup_fails_closed() -> Bool:
 	)
 	plan = region_plan(body)
 
-	match plan.sites:
-		[first_site, second_site]:
+	match plan.match_scrutinee_protections:
+		[first_protection, second_protection]:
 			(
-				first_site.before.length() == 1
-				and first_site.after.length() == 1
-				and second_site.before.length() == 1
-				and second_site.after.length() == 1
+				first_protection.protection.tracks_cleanup
+				and second_protection.protection.tracks_cleanup
+				and cancellation_owner_id_value(first_protection.protection.candidate.id) == 0
+				and cancellation_owner_id_value(second_protection.protection.candidate.id) == 1
 				and plan.max_live_slots == 1
-				and plan.match_scrutinee_protections.length() == 2
 				and plan.planned_owner_count == 2
 				and cancellation_match_scrutinee_protection(
 					plan,
@@ -677,13 +672,18 @@ pure func nested_repeated_match_scrutinees_preserve_live_slot_capacity() -> Bool
 	scrutinee: CoreVar = local_var("scrutinee", 66)
 	plan = region_plan(releasing_match(scrutinee, releasing_match(scrutinee, VOID_EXPR)))
 
-	(
-		plan.sites.all(func(site): site.before.length() == 1 and site.after.length() == 1)
-		and plan.sites.length() == 2
-		and plan.max_live_slots == 2
-		and plan.expression_visits == 10
-		and cancellation_match_scrutinee_protection(plan, scrutinee, ArcReleasePolicy).is_none()
-	)
+	match plan.match_scrutinee_protections:
+		[outer_protection, inner_protection]:
+			(
+				outer_protection.protection.tracks_cleanup
+				and inner_protection.protection.tracks_cleanup
+				and outer_protection.protection.candidate.slot != inner_protection.protection.candidate.slot
+				and plan.max_live_slots == 2
+				and plan.expression_visits == 10
+				and cancellation_match_scrutinee_protection(plan, scrutinee, ArcReleasePolicy).is_none()
+			)
+		_:
+			False
 
 
 pure func match_scrutinee_action_mismatch_fails_closed() -> Bool:
@@ -981,7 +981,7 @@ pure func region_plan_does_not_treat_one_branch_consumption_as_a_handoff() -> Bo
 		.get_or(False)
 
 
-pure func overlapping_region_events_preserve_lexical_order() -> Bool:
+pure func overlapping_region_protections_preserve_lexical_order() -> Bool:
 	outer: CoreVar = local_var("outer", 9)
 	inner: CoreVar = local_var("inner", 10)
 	plan = region_plan(
@@ -1000,17 +1000,20 @@ pure func overlapping_region_events_preserve_lexical_order() -> Bool:
 		),
 	)
 
-	match plan.sites:
-		[outer_site, inner_site]:
-			match (outer_site.before, outer_site.after, inner_site.before, inner_site.after):
-				([TrackCancellationOwner(_, outer_id, _)], [UntrackCancellationOwner(_)], [TrackCancellationOwner(_, inner_id, _)], [UntrackCancellationOwner(_)]):
-					(
-						cancellation_owner_id_value(outer_id) == 0
-						and cancellation_owner_id_value(inner_id) == 1
-						and plan.max_live_slots == 2
-					)
-				_:
-					False
+	match plan.let_protections:
+		[outer_decision, inner_decision]:
+			(
+				outer_decision.variable.id == outer.id
+				and inner_decision.variable.id == inner.id
+				and outer_decision.tracks_cleanup
+				and inner_decision.tracks_cleanup
+				and outer_decision.untracks_after_body
+				and inner_decision.untracks_after_body
+				and cancellation_owner_id_value(outer_decision.owner_id) == 0
+				and cancellation_owner_id_value(inner_decision.owner_id) == 1
+				and outer_decision.slot_id != inner_decision.slot_id
+				and plan.max_live_slots == 2
+			)
 		_:
 			False
 
@@ -1532,8 +1535,8 @@ tests: TestSuite = {
 			region_plan_does_not_treat_one_branch_consumption_as_a_handoff,
 		),
 		(
-			"overlapping region events preserve lexical order",
-			overlapping_region_events_preserve_lexical_order,
+			"overlapping region protections preserve lexical order",
+			overlapping_region_protections_preserve_lexical_order,
 		),
 		(
 			"earlier consumed arguments span later argument evaluation",
