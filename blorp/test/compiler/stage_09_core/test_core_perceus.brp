@@ -162,6 +162,7 @@ import:
 		borrowed_result_aliases_param,
 		count_uses,
 		summarize_linear_call,
+		summarize_linear_ownership_uses,
 	../../../src/compiler/stage_09_core/perceus/env:
 		PerceusEnv,
 		PerceusGlobalLookup(CollidingPerceusGlobals),
@@ -17194,6 +17195,87 @@ func test_assignment_to_other_slot_preserves_owner_events_in_mutable_region() ->
 	ownership_event_signature_matches(rewritten, OTHER_SLOT_ASSIGNMENT_OWNERSHIP_EVENT_SIGNATURE)
 
 
+-- Sequence order, frame-carried summaries, and a shadowed binding each change
+-- a different field of the four-scalar ownership result.
+pure func test_linear_summary_frames_preserve_sequence_alias_and_shadowing() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	owner: CoreExpr = var_expr("xs", list_int_type())
+	borrowed_field: CoreExpr = FieldExpr(
+		owner,
+		"items",
+		list_int_type(),
+		synthetic_core_source_loc(),
+	)
+	consumed_then_alias: CoreExpr = SeqExpr(owner, borrowed_field)
+	combined = summarize_linear_ownership_uses(env, "xs", consumed_then_alias)
+	alias_then_unused = summarize_linear_ownership_uses(
+		env,
+		"xs",
+		SeqExpr(borrowed_field, int_expr(0)),
+	)
+	shadowed = summarize_linear_ownership_uses(
+		env,
+		"xs",
+		LetExpr(named_var("xs"), False, list_int_type(), owner, borrowed_field),
+	)
+	duplicated: CoreExpr = DupExpr(
+		named_var("xs"),
+		list_int_type(),
+		ArcRetainPolicy,
+		borrowed_field,
+		list_int_type(),
+		synthetic_core_source_loc(),
+	)
+	dropped: CoreExpr = DropExpr(
+		named_var("xs"),
+		list_int_type(),
+		ArcReleasePolicy,
+		borrowed_field,
+		list_int_type(),
+		synthetic_core_source_loc(),
+	)
+	dup_uses = summarize_linear_ownership_uses(env, "xs", duplicated)
+	drop_uses = summarize_linear_ownership_uses(env, "xs", dropped)
+	nested_uses = summarize_linear_ownership_uses(
+		env,
+		"xs",
+		LetExpr(
+			named_var("other"),
+			False,
+			list_int_type(),
+			owner,
+			SeqExpr(duplicated, dropped),
+		),
+	)
+
+	(
+		combined.required_refs == 2
+		and combined.consumed_refs == 1
+		and combined.touched
+		and combined.returns_alias
+		and alias_then_unused.required_refs == 1
+		and alias_then_unused.consumed_refs == 0
+		and alias_then_unused.touched
+		and not alias_then_unused.returns_alias
+		and shadowed.required_refs == 1
+		and shadowed.consumed_refs == 0
+		and shadowed.touched
+		and not shadowed.returns_alias
+		and dup_uses.required_refs == 1
+		and dup_uses.consumed_refs == 0
+		and dup_uses.touched
+		and dup_uses.returns_alias
+		and drop_uses.required_refs == 2
+		and drop_uses.consumed_refs == 1
+		and drop_uses.touched
+		and drop_uses.returns_alias
+		and nested_uses.required_refs == 2
+		and nested_uses.consumed_refs == 1
+		and nested_uses.touched
+		and nested_uses.returns_alias
+	)
+
+
 -- Every ownership decision in this pass is carried by an `OwnershipUseSummary`
 -- value that the summary walk combines with sequence, branch, and aggregate
 -- rules. These characterization tests pin the exact ordered ownership events
@@ -18939,6 +19021,10 @@ tests: TestSuite = {
 		(
 			"assignment to other slot preserves owner events in mutable region",
 			test_assignment_to_other_slot_preserves_owner_events_in_mutable_region,
+		),
+		(
+			"linear summary frames preserve sequence alias and shadowing",
+			test_linear_summary_frames_preserve_sequence_alias_and_shadowing,
 		),
 		(
 			"mixed consume and borrow branches preserve owner events",

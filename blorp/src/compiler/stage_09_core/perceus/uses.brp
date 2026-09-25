@@ -273,9 +273,9 @@ foreign:
 private union PerceusOwnershipSummaryFrameStack:
 	PerceusOwnershipSummaryNoFrame
 	PerceusOwnershipSummaryLetRhsFrame(CoreVar, CoreExpr, PerceusOwnershipSummaryFrameStack)
-	PerceusOwnershipSummaryCombineBodyFrame(OwnershipUseSummary, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummaryCombineBodyFrame(Int, Int, Bool, PerceusOwnershipSummaryFrameStack)
 	PerceusOwnershipSummarySequenceFirstFrame(CoreExpr, PerceusOwnershipSummaryFrameStack)
-	PerceusOwnershipSummarySequenceSecondFrame(OwnershipUseSummary, PerceusOwnershipSummaryFrameStack)
+	PerceusOwnershipSummarySequenceSecondFrame(Int, Int, Bool, PerceusOwnershipSummaryFrameStack)
 	PerceusOwnershipSummaryDupBodyFrame(Bool, PerceusOwnershipSummaryFrameStack)
 	PerceusOwnershipSummaryDropBodyFrame(Bool, PerceusOwnershipSummaryFrameStack)
 	PerceusOwnershipSummaryPassBodyFrame(PerceusOwnershipSummaryFrameStack)
@@ -285,10 +285,10 @@ private union PerceusOwnershipSummaryFrameStack:
 
 --- How one name is used by one expression: the peak simultaneous references it
 --- needs, how many of them it consumes, whether it appears at all, and whether
---- the expression's result aliases it. This stays a `record` even though every
---- field is scalar: the summary walk's frame stack and its per-argument lists
---- hold summaries as union and collection payloads, which box a `struct` at
---- every push, and a measured conversion cost 2% more allocations than it saved.
+--- the expression's result aliases it. This stays a `record` at public and
+--- collection boundaries: per-argument lists box a `struct` payload, and a
+--- measured whole-type conversion cost 2% more allocations than it saved.
+--- The linear walk instead threads scalars through its private frame stack.
 
 record OwnershipUseSummary {
 	required_refs: Int,
@@ -3142,11 +3142,41 @@ private pure func summarize_linear_ownership_uses_impl(
 	debug:
 		perceus_work_linear_summary_requests()
 
+	match expr:
+		LetExpr(_, _, _, _, _):
+			summarize_linear_ownership_uses_binding_impl(env, name, expr)
+		BorrowLetExpr(_, _, _, _):
+			summarize_linear_ownership_uses_binding_impl(env, name, expr)
+		SeqExpr(_, _):
+			summarize_linear_ownership_uses_binding_impl(env, name, expr)
+		AssignExpr(_, _, _, _):
+			summarize_linear_ownership_uses_binding_impl(env, name, expr)
+		DupExpr(_, _, _, _, _, _):
+			summarize_linear_ownership_uses_binding_impl(env, name, expr)
+		DropExpr(_, _, _, _, _, _):
+			summarize_linear_ownership_uses_binding_impl(env, name, expr)
+		DebugBlockExpr(_, _, _):
+			summarize_linear_ownership_uses_binding_impl(env, name, expr)
+		_:
+			debug:
+				perceus_work_linear_summary_node_visits()
+			if env.engine_metrics_enabled:
+				perceus_engine_summary_node_visit()
+			summarize_linear_ownership_uses_non_binding(env, name, expr)
+
+
+private pure func summarize_linear_ownership_uses_binding_impl(
+	env: PerceusEnv,
+	name: String,
+	expr: CoreExpr,
+) -> OwnershipUseSummary:
 	var frames: PerceusOwnershipSummaryFrameStack = PerceusOwnershipSummaryNoFrame
 	var visiting: Bool = True
 	var current_expr: CoreExpr = expr
-	var pending: OwnershipUseSummary = NO_OWNERSHIP_USES
-	var result: OwnershipUseSummary = NO_OWNERSHIP_USES
+	var pending_required_refs: Int = 0
+	var pending_consumed_refs: Int = 0
+	var pending_touched: Bool = False
+	var pending_returns_alias: Bool = False
 	var complete: Bool = False
 
 	while not complete:
@@ -3166,9 +3196,17 @@ private pure func summarize_linear_ownership_uses_impl(
 
 						if variable.name == name:
 							visiting = False
-							pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
+							pending_required_refs = rhs_uses.required_refs
+							pending_consumed_refs = rhs_uses.consumed_refs
+							pending_touched = rhs_uses.touched
+							pending_returns_alias = False
 						else:
-							frames = PerceusOwnershipSummaryCombineBodyFrame(rhs_uses, frames)
+							frames = PerceusOwnershipSummaryCombineBodyFrame(
+								rhs_uses.required_refs,
+								rhs_uses.consumed_refs,
+								rhs_uses.touched,
+								frames,
+							)
 							visiting = True
 							current_expr = body
 					else:
@@ -3180,9 +3218,17 @@ private pure func summarize_linear_ownership_uses_impl(
 
 					if variable.name == name:
 						visiting = False
-						pending = seq_ownership_uses(rhs_uses, NO_OWNERSHIP_USES)
+						pending_required_refs = rhs_uses.required_refs
+						pending_consumed_refs = rhs_uses.consumed_refs
+						pending_touched = rhs_uses.touched
+						pending_returns_alias = False
 					else:
-						frames = PerceusOwnershipSummaryCombineBodyFrame(rhs_uses, frames)
+						frames = PerceusOwnershipSummaryCombineBodyFrame(
+							rhs_uses.required_refs,
+							rhs_uses.consumed_refs,
+							rhs_uses.touched,
+							frames,
+						)
 						visiting = True
 						current_expr = body
 				SeqExpr(first, second):
@@ -3192,12 +3238,19 @@ private pure func summarize_linear_ownership_uses_impl(
 				AssignExpr(variable, rhs, typ, loc):
 					if variable.name == name:
 						visiting = False
-						pending = NO_OWNERSHIP_USES
+						pending_required_refs = 0
+						pending_consumed_refs = 0
+						pending_touched = False
+						pending_returns_alias = False
 					else if assignment_rhs_returns_alias(env, rhs):
 						-- Mutable assignment retains managed aliases before replacing
 						-- the target, so the source remains owned by its scope.
 						visiting = False
-						pending = summarize_linear_borrow(env, name, rhs)
+						borrowed_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, rhs)
+						pending_required_refs = borrowed_uses.required_refs
+						pending_consumed_refs = borrowed_uses.consumed_refs
+						pending_touched = borrowed_uses.touched
+						pending_returns_alias = borrowed_uses.returns_alias
 					else:
 						visiting = True
 						current_expr = rhs
@@ -3215,64 +3268,96 @@ private pure func summarize_linear_ownership_uses_impl(
 					current_expr = body
 				_:
 					visiting = False
-					pending = summarize_linear_ownership_uses_non_binding(env, name, current)
+					leaf_uses: OwnershipUseSummary = summarize_linear_ownership_uses_non_binding(
+						env,
+						name,
+						current,
+					)
+					pending_required_refs = leaf_uses.required_refs
+					pending_consumed_refs = leaf_uses.consumed_refs
+					pending_touched = leaf_uses.touched
+					pending_returns_alias = leaf_uses.returns_alias
 		else:
-			summary: OwnershipUseSummary = pending
-
 			match frames:
 				PerceusOwnershipSummaryNoFrame:
-					result = summary
 					complete = True
 				PerceusOwnershipSummaryLetRhsFrame(variable, body, remaining):
 					if variable.name == name:
 						frames = remaining
 						visiting = False
-						pending = seq_ownership_uses(summary, NO_OWNERSHIP_USES)
+						pending_returns_alias = False
 					else:
-						frames = PerceusOwnershipSummaryCombineBodyFrame(summary, remaining)
+						frames = PerceusOwnershipSummaryCombineBodyFrame(
+							pending_required_refs,
+							pending_consumed_refs,
+							pending_touched,
+							remaining,
+						)
 						visiting = True
 						current_expr = body
-				PerceusOwnershipSummaryCombineBodyFrame(prefix_uses, remaining):
+				PerceusOwnershipSummaryCombineBodyFrame(
+					prefix_required_refs,
+					prefix_consumed_refs,
+					prefix_touched,
+					remaining,
+				):
 					frames = remaining
 					visiting = False
-					pending = seq_ownership_uses(prefix_uses, summary)
+					pending_required_refs = max_int(
+						prefix_required_refs,
+						prefix_consumed_refs + pending_required_refs,
+					)
+					pending_consumed_refs = prefix_consumed_refs + pending_consumed_refs
+					pending_touched = prefix_touched or pending_touched
+					-- Sequencing reports only the body's result alias.
 				PerceusOwnershipSummarySequenceFirstFrame(second, remaining):
-					frames = PerceusOwnershipSummarySequenceSecondFrame(summary, remaining)
+					frames = PerceusOwnershipSummarySequenceSecondFrame(
+						pending_required_refs,
+						pending_consumed_refs,
+						pending_touched,
+						remaining,
+					)
 					visiting = True
 					current_expr = second
-				PerceusOwnershipSummarySequenceSecondFrame(first_uses, remaining):
+				PerceusOwnershipSummarySequenceSecondFrame(
+					first_required_refs,
+					first_consumed_refs,
+					first_touched,
+					remaining,
+				):
 					frames = remaining
 					visiting = False
-					pending = seq_ownership_uses(first_uses, summary)
+					pending_required_refs = max_int(
+						first_required_refs,
+						first_consumed_refs + pending_required_refs,
+					)
+					pending_consumed_refs = first_consumed_refs + pending_consumed_refs
+					pending_touched = first_touched or pending_touched
+					-- The first expression's alias does not survive sequence.
 				PerceusOwnershipSummaryDupBodyFrame(matches_target, remaining):
-					adjusted: OwnershipUseSummary = if matches_target:
-						{
-							required_refs = max_int(1, summary.required_refs - 1),
-							consumed_refs = max_int(0, summary.consumed_refs - 1),
-							touched = True,
-							returns_alias = summary.returns_alias
-						}
-					else:
-						summary
-
+					if matches_target:
+						pending_required_refs = max_int(1, pending_required_refs - 1)
+						pending_consumed_refs = max_int(0, pending_consumed_refs - 1)
+						pending_touched = True
 					frames = remaining
 					visiting = False
-					pending = adjusted
 				PerceusOwnershipSummaryDropBodyFrame(matches_target, remaining):
-					adjusted: OwnershipUseSummary = if matches_target:
-						seq_ownership_uses(CONSUME_OWNERSHIP_USE, summary)
-					else:
-						summary
-
+					if matches_target:
+						pending_required_refs = max_int(1, 1 + pending_required_refs)
+						pending_consumed_refs = 1 + pending_consumed_refs
+						pending_touched = True
 					frames = remaining
 					visiting = False
-					pending = adjusted
 				PerceusOwnershipSummaryPassBodyFrame(remaining):
 					frames = remaining
 					visiting = False
-					pending = summary
 
-	result
+	{
+		required_refs = pending_required_refs,
+		consumed_refs = pending_consumed_refs,
+		touched = pending_touched,
+		returns_alias = pending_returns_alias
+	}
 
 
 private pure func count_core_var_use(name: String, variable: CoreVar) -> Int:
