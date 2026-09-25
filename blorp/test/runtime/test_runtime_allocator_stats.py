@@ -16,6 +16,99 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class RuntimeAllocatorStatsTests(unittest.TestCase):
+    def test_first_append_to_shared_empty_list_starts_with_four_slots(self) -> None:
+        source = textwrap.dedent(
+            """\
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            static struct {
+                blorp_Object header;
+                long len;
+                long capacity;
+                void (*elem_release)(void*);
+                int16_t elem_size;
+                uint8_t storage_mode;
+                char pad[5];
+                void* data[1];
+            } canonical_empty = {
+                { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },
+                0, 1, NULL, sizeof(void*), BLORP_LIST_STORAGE_POINTER, { 0 }, { NULL }
+            };
+
+            int main(void) {
+                blorp_List* empty = (blorp_List*)&canonical_empty;
+                blorp_List* values = blorp_list_append(empty, (void*)1);
+                if (values == empty || values->len != 1 || values->capacity != 4) return 1;
+                if (empty->len != 0 || empty->capacity != 1) return 2;
+                for (long item = 2; item <= 4; item++) {
+                    blorp_List* previous = values;
+                    values = blorp_list_append(values, (void*)item);
+                    if (values != previous || values->capacity != 4) return 3;
+                }
+                blorp_release(values);
+                blorp_release(empty);
+
+                blorp_List* empty_inline = blorp_list_new_inline(1, sizeof(long));
+                blorp_retain(empty_inline);
+                blorp_List* inline_values = blorp_list_append_owned(empty_inline, (void*)1);
+                if (inline_values == empty_inline || inline_values->len != 1 ||
+                    inline_values->capacity != 4 ||
+                    inline_values->storage_mode != BLORP_LIST_STORAGE_INLINE) return 4;
+                if (empty_inline->len != 0) return 5;
+                blorp_release(inline_values);
+                blorp_release(empty_inline);
+
+                blorp_List* empty_managed = blorp_list_new(1);
+                blorp_list_init_elem_release(empty_managed, blorp_elem_release_fn);
+                blorp_retain(empty_managed);
+                blorp_Object* owned_element = blorp_alloc(sizeof(blorp_Object));
+                blorp_List* managed_values = blorp_list_append_owned(empty_managed, owned_element);
+                if (managed_values->capacity != 4 ||
+                    managed_values->elem_release != blorp_elem_release_fn ||
+                    managed_values->data[0] != owned_element ||
+                    empty_managed->len != 0) return 6;
+                blorp_release(managed_values);
+                blorp_release(empty_managed);
+                return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            executable = Path(temp_name) / "first-list-append"
+            compiled = subprocess.run(
+                [
+                    os.environ.get("CC", "cc"),
+                    "-O2",
+                    "-w",
+                    f"-I{ROOT / 'blorp' / 'src' / 'lib' / 'runtime' / 'native'}",
+                    "-x",
+                    "c",
+                    "-",
+                    "-lm",
+                    "-lpthread",
+                    "-o",
+                    str(executable),
+                ],
+                cwd=ROOT,
+                input=source,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            completed = subprocess.run(
+                [str(executable)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_optimized_allocation_does_not_require_frame_pointers(self) -> None:
         source = textwrap.dedent(
             """\

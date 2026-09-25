@@ -9395,6 +9395,8 @@ unsigned __int128 blorp_to_uint128(long x) { return (unsigned __int128)x; }
 // List Operations
 // ============================================================================
 
+enum { BLORP_LIST_DEFAULT_CAPACITY = 4 };
+
 static int blorp_list_valid_inline_size(int16_t elem_size) {
     return elem_size > 0;
 }
@@ -10318,7 +10320,7 @@ blorp_StackOption_Float blorp_parse_float(blorp_String* s) {
 
 // Helper to copy list (for COW semantics)
 static blorp_List* blorp_list_copy(blorp_List* src) {
-    if (!src) return blorp_list_new(4);
+    if (!src) return blorp_list_new(BLORP_LIST_DEFAULT_CAPACITY);
     size_t stride = blorp_list_stride(src);
     blorp_List* list = (blorp_List*)blorp_alloc(blorp_checked_add(sizeof(blorp_List), blorp_checked_mul(src->capacity, stride)));
     list->len = src->len;
@@ -10345,6 +10347,14 @@ static blorp_List* blorp_list_copy(blorp_List* src) {
 // Helper to copy list with extra capacity (for COW + growth)
 static blorp_List* blorp_list_copy_with_capacity(blorp_List* src, long new_capacity) {
     if (!src) return blorp_list_new(new_capacity);
+    // An empty shared list has no elements to copy or retain. In particular,
+    // the canonical empty literal is immortal; give its first owner fresh
+    // storage without recording a zero-byte COW copy.
+    if (src->len == 0) {
+        blorp_List* fresh = blorp_list_new_layout(new_capacity, src->storage_mode, src->elem_size);
+        fresh->elem_release = src->elem_release;
+        return fresh;
+    }
     size_t stride = blorp_list_stride(src);
     blorp_List* list = (blorp_List*)blorp_alloc(blorp_checked_add(sizeof(blorp_List), blorp_checked_mul(new_capacity, stride)));
     list->len = src->len;
@@ -10510,7 +10520,7 @@ blorp_List* blorp_list_reverse_owned(blorp_List* list) {
 // IR intrinsic: COW check — if shared, return a copy; if unique, return as-is.
 // The caller is responsible for releasing the original if it was copied.
 blorp_List* blorp_list_cow(blorp_List* list) {
-    if (!list) return blorp_list_new(4);
+    if (!list) return blorp_list_new(BLORP_LIST_DEFAULT_CAPACITY);
     if (blorp_is_unique(list)) return list;
     blorp_List* copy = blorp_list_copy(list);
     blorp_release(list);
@@ -10523,7 +10533,7 @@ blorp_List* blorp_list_ensure_capacity(blorp_List* list, long min_cap) {
     if (!list) return blorp_list_new(min_cap);
     if (blorp_is_unique(list) && list->capacity >= min_cap) return list;
     long new_cap = list->capacity;
-    if (new_cap < 4) new_cap = 4;
+    if (new_cap < BLORP_LIST_DEFAULT_CAPACITY) new_cap = BLORP_LIST_DEFAULT_CAPACITY;
     while (new_cap < min_cap) new_cap *= 2;
     blorp_List* copy = blorp_list_copy_with_capacity(list, new_cap);
     blorp_release(list);
@@ -10680,12 +10690,13 @@ void blorp_list_handoff_finish(blorp_List* result, long out_len, long old_len, b
 }
 
 blorp_List* blorp_list_append(blorp_List* list, void* element) {
-    if (!list) list = blorp_list_new(4);
+    if (!list) list = blorp_list_new(BLORP_LIST_DEFAULT_CAPACITY);
 
     // COW: if shared, copy the list first
     if (!blorp_is_unique(list)) {
         // Need capacity for at least one more element
         long new_cap = list->len >= list->capacity ? list->capacity * 2 : list->capacity;
+        if (list->len == 0 && new_cap < BLORP_LIST_DEFAULT_CAPACITY) new_cap = BLORP_LIST_DEFAULT_CAPACITY;
         blorp_List* copy = blorp_list_copy_with_capacity(list, new_cap);
         blorp_release(list);
         list = copy;
@@ -10716,11 +10727,12 @@ blorp_List* blorp_list_append(blorp_List* list, void* element) {
 // Used by codegen when the element is a fresh allocation (refcount already 1).
 // Sets elem_release if not already set so destructor properly cleans up.
 blorp_List* blorp_list_append_owned(blorp_List* list, void* element) {
-    if (!list) list = blorp_list_new(4);
+    if (!list) list = blorp_list_new(BLORP_LIST_DEFAULT_CAPACITY);
 
     // COW: if shared, copy the list first
     if (!blorp_is_unique(list)) {
         long new_cap = list->len >= list->capacity ? list->capacity * 2 : list->capacity;
+        if (list->len == 0 && new_cap < BLORP_LIST_DEFAULT_CAPACITY) new_cap = BLORP_LIST_DEFAULT_CAPACITY;
         blorp_List* copy = blorp_list_copy_with_capacity(list, new_cap);
         blorp_release(list);
         list = copy;
