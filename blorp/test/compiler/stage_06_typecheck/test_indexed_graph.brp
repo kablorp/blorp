@@ -326,6 +326,81 @@ pure func test_indexed_graph_scopes_selective_export_names_by_module_id() -> Boo
 			False
 
 
+private pure func selective_export_fixture_names(start: Int, end: Int) -> String:
+	var names: String = ""
+
+	for index in start..end:
+		if index > start:
+			names += ", "
+
+		names += "name_" + index.to_string()
+
+	names
+
+
+private pure func selective_export_fixture_definitions(count: Int) -> String:
+	var definitions: String = ""
+
+	for index in 0..count:
+		definitions += "pure func name_" + index.to_string() + "() -> Int:\n\t" + index.to_string() + "\n\n"
+
+	definitions
+
+
+-- The owned-column scatter shape allocates 2,655 managed objects for this
+-- deterministic 64-name fixture. The former record-threading shape allocates
+-- 2,787 because both list fields remain shared across every update.
+private SELECTIVE_EXPORT_LARGE_BUCKET_ALLOCATION_LIMIT: Int = 2655
+
+
+func test_indexed_graph_scatter_keeps_large_selective_export_buckets_owned() -> Bool:
+	target = fixture_module_load_candidate(
+		"src/main.brp",
+		"app/main",
+		"import:\n\tpkg/large: " + selective_export_fixture_names(0, 32)
+			+ "\n\nimport:\n\tpkg/large: " + selective_export_fixture_names(32, 64)
+			+ "\n\nimport:\n\tunresolved/source: Missing\n\nfunc main(args: List[String]) -> Int:\n\t0",
+	)
+	dependency = fixture_module_load_candidate(
+		"src/large.brp",
+		"pkg/large",
+		selective_export_fixture_definitions(64),
+	)
+
+	reset_mem_stats()
+
+	match indexed_graph_build(target, [dependency]):
+		Err(_):
+			False
+		Ok(graph):
+			stats = get_mem_stats()
+			owns_expected_names = match indexed_graph_find_dependency_scope(graph, "pkg/large"):
+				Some(dependency_scope):
+					(
+						prepared_module_scope_selective_export_names(
+							dependency_scope,
+						).exported_definition_name_demand_contains("name_0")
+						and prepared_module_scope_selective_export_names(
+							dependency_scope,
+						).exported_definition_name_demand_contains("name_63")
+						and prepared_module_scope_conservative_selective_export_names(
+							dependency_scope,
+						).exported_definition_name_demand_contains("Missing")
+					)
+				None:
+					False
+
+			if stats.total_allocations > SELECTIVE_EXPORT_LARGE_BUCKET_ALLOCATION_LIMIT:
+				print(
+					"large selective-export scatter allocations: " + stats.total_allocations.to_string(),
+				)
+
+			(
+				owns_expected_names
+				and stats.total_allocations <= SELECTIVE_EXPORT_LARGE_BUCKET_ALLOCATION_LIMIT
+			)
+
+
 pure func test_source_name_table_issues_stable_dense_ids() -> Bool:
 	table = source_name_table(["map", "List", "map"])
 	first_map = source_name_table_find_id(table, "map")
@@ -1327,6 +1402,10 @@ tests: TestSuite = {
 		(
 			"scopes selective export names by module id",
 			test_indexed_graph_scopes_selective_export_names_by_module_id,
+		),
+		(
+			"scatter keeps large selective-export buckets owned",
+			test_indexed_graph_scatter_keeps_large_selective_export_buckets_owned,
 		),
 		(
 			"module meta sessions require the issuing definition table",

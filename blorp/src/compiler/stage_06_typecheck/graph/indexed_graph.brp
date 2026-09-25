@@ -266,61 +266,6 @@ private pure func selective_export_request_counts_for_decl(
 			request_count_by_module
 
 
-private pure func selective_export_scatter_import(
-	scatter: GraphSelectiveExportScatter,
-	module_table: ModuleTable,
-	conservative_module_index: Int,
-	import_decl: ParsedImportDecl,
-) -> GraphSelectiveExportScatter:
-	match import_decl.symbols:
-		None:
-			scatter
-		Some(symbols):
-			module_index = selective_export_request_module_index(
-				module_table,
-				conservative_module_index,
-				import_decl,
-			)
-			var next = scatter
-
-			for symbol in symbols:
-				write_index = next.next_write_by_module.get_or(module_index, 0)
-				next = { next |
-					next_write_by_module = next.next_write_by_module.set(
-						module_index,
-						write_index + 1,
-					),
-					ordered_names = next.ordered_names.set(write_index, symbol.name.text)
-				}
-
-			next
-
-
-private pure func selective_export_scatter_decl(
-	scatter: GraphSelectiveExportScatter,
-	module_table: ModuleTable,
-	conservative_module_index: Int,
-	decl: ParsedDecl,
-) -> GraphSelectiveExportScatter:
-	match decl:
-		ImportBlockParsedDecl(imports, _):
-			var next = scatter
-
-			for import_decl in imports:
-				next = selective_export_scatter_import(
-					next,
-					module_table,
-					conservative_module_index,
-					import_decl,
-				)
-
-			next
-		PrivateParsedDecl(inner, _):
-			selective_export_scatter_decl(scatter, module_table, conservative_module_index, inner)
-		_:
-			scatter
-
-
 private pure func selective_export_name_demand(
 	module_table: ModuleTable,
 	modules: List[PreparedModule],
@@ -339,25 +284,64 @@ private pure func selective_export_name_demand(
 			)
 
 	var bucket_start_by_module: List[Int] = []
+	var next_write_by_module: List[Int] = []
 	var next_bucket_start: Int = 0
 
 	for request_count in request_count_by_module:
 		bucket_start_by_module = bucket_start_by_module.append(next_bucket_start)
+		next_write_by_module = next_write_by_module.append(next_bucket_start)
 		next_bucket_start += request_count
 
-	var scatter: GraphSelectiveExportScatter = {
-		next_write_by_module = bucket_start_by_module,
-		ordered_names = repeat(UNFILLED_SELECTIVE_EXPORT_NAME, next_bucket_start)
-	}
+	var ordered_names = repeat(UNFILLED_SELECTIVE_EXPORT_NAME, next_bucket_start)
 
+	-- Keep both scatter columns as local owners while they are updated. A
+	-- GraphSelectiveExportScatter retained through this loop would keep the
+	-- lists shared and turn every set into a full COW copy.
 	for module in modules:
 		for decl in prepared_module_program(module).decls:
-			scatter = selective_export_scatter_decl(
-				scatter,
-				module_table,
-				conservative_module_index,
-				decl,
-			)
+			var scatter_decl = decl
+			var scatter_decl_complete = False
+
+			-- PrivateParsedDecl is a transparent wrapper here. Iteration keeps the
+			-- owned scatter columns in this function instead of borrowing them
+			-- through a recursive helper boundary.
+			while not scatter_decl_complete:
+				match scatter_decl:
+					ImportBlockParsedDecl(imports, _):
+						for import_decl in imports:
+							match import_decl.symbols:
+								None:
+									void
+								Some(symbols):
+									module_index = selective_export_request_module_index(
+										module_table,
+										conservative_module_index,
+										import_decl,
+									)
+
+									for symbol in symbols:
+										write_index = next_write_by_module.get_or(module_index, 0)
+										next_write_by_module = next_write_by_module.set(
+											module_index,
+											write_index + 1,
+										)
+										ordered_names = ordered_names.set(
+											write_index,
+											symbol.name.text,
+										)
+
+						scatter_decl_complete = True
+					PrivateParsedDecl(inner, _):
+						scatter_decl = inner
+					_:
+						scatter_decl_complete = True
+
+	-- Publish the completed columns only after no later scatter update can
+	-- observe the record as an alias.
+	scatter: GraphSelectiveExportScatter = {
+		next_write_by_module = next_write_by_module,
+		ordered_names = ordered_names
+	}
 
 	var names_by_module: List[ExportedDefinitionNameDemand] = []
 	var conservative_names = exported_definition_name_demand_empty()
