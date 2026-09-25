@@ -435,50 +435,29 @@ pure func balance_consumed_param_bodies(
 		result
 
 
---- A reused depth-first worklist. Growing a pending list by concatenation
---- copies every entry already on it, which is quadratic in the node count, and
---- the largest generated body in a self-compile holds more than two hundred
---- thousand nodes. Overwrite the slot the pop just freed instead, exactly as
---- the logical-tree mapper does, so one allocation serves the whole walk.
-private record ShortCircuitScanStack {
+--- The scan walks a reused depth-first worklist. Growing it by concatenation
+--- copies pending entries quadratically on wide bodies. Keep each list in one
+--- local owner while overwriting popped slots, so `.set` can reuse its buffer.
+private pure func push_short_circuit_scan_node(
 	nodes: List[CoreExpr],
+	count: Int,
+	node: CoreExpr,
+) -> List[CoreExpr]:
+	if count < nodes.length():
+		nodes.set(count, node)
+	else:
+		nodes.append(node)
+
+
+private pure func push_short_circuit_scan_flag(
 	operand_flags: List[Bool],
-	count: Int
-}
-
-
-private pure func push_short_circuit_scan(
-	stack: ShortCircuitScanStack,
-	node: CoreExpr,
+	count: Int,
 	inside_operand: Bool,
-) -> ShortCircuitScanStack:
-	nodes: List[CoreExpr] = if stack.count < stack.nodes.length():
-		stack.nodes.set(stack.count, node)
+) -> List[Bool]:
+	if count < operand_flags.length():
+		operand_flags.set(count, inside_operand)
 	else:
-		stack.nodes.append(node)
-	operand_flags: List[Bool] = if stack.count < stack.operand_flags.length():
-		stack.operand_flags.set(stack.count, inside_operand)
-	else:
-		stack.operand_flags.append(inside_operand)
-
-	{ stack |
-		nodes = nodes,
-		operand_flags = operand_flags,
-		count = stack.count + 1
-	}
-
-
-private pure func push_short_circuit_scan_children(
-	stack: ShortCircuitScanStack,
-	node: CoreExpr,
-	inside_operand: Bool,
-) -> ShortCircuitScanStack:
-	var result: ShortCircuitScanStack = stack
-
-	for child in CoreTraverse.immediate_core_expr_children(node):
-		result = push_short_circuit_scan(result, child, inside_operand)
-
-	result
+		operand_flags.append(inside_operand)
 
 
 --- A logical operator only evaluates its right operand when the left operand
@@ -491,34 +470,51 @@ private pure func push_short_circuit_scan_children(
 --- whether it already sits under a right operand, so a nested operator
 --- inherits the answer instead of rescanning its subtree.
 private pure func has_short_circuit_operand_call(expr: CoreExpr) -> Bool:
-	var stack: ShortCircuitScanStack = push_short_circuit_scan(
-		{
-			nodes = [],
-			operand_flags = [],
-			count = 0
-		},
-		expr,
-		False,
-	)
+	var nodes: List[CoreExpr] = [expr]
+	var operand_flags: List[Bool] = [False]
+	var count: Int = 1
 	var found: Bool = False
 
-	while not found and stack.count > 0:
-		index: Int = stack.count - 1
-		stack = { stack | count = index }
+	while not found and count > 0:
+		index: Int = count - 1
+		count = index
 
-		match (stack.nodes.get(index), stack.operand_flags.get(index)):
+		match (nodes.get(index), operand_flags.get(index)):
 			(Some(node), Some(inside_operand)):
+				var push_children: Bool = True
 				match node:
 					LogicalExpr(op, left, right, typ, loc):
-						stack = push_short_circuit_scan(stack, left, inside_operand)
-						stack = push_short_circuit_scan(stack, right, True)
+						push_children = False
+						nodes = push_short_circuit_scan_node(nodes, count, left)
+						operand_flags = push_short_circuit_scan_flag(
+							operand_flags,
+							count,
+							inside_operand,
+						)
+						count += 1
+						nodes = push_short_circuit_scan_node(nodes, count, right)
+						operand_flags = push_short_circuit_scan_flag(operand_flags, count, True)
+						count += 1
 					CallExpr(kind, callee, args, typ, loc):
 						if inside_operand:
 							found = True
+							push_children = False
 						else:
-							stack = push_short_circuit_scan_children(stack, node, inside_operand)
+							void
 					_:
-						stack = push_short_circuit_scan_children(stack, node, inside_operand)
+						void
+
+				if push_children:
+					for child in CoreTraverse.immediate_core_expr_children(node):
+						nodes = push_short_circuit_scan_node(nodes, count, child)
+						operand_flags = push_short_circuit_scan_flag(
+							operand_flags,
+							count,
+							inside_operand,
+						)
+						count += 1
+				else:
+					void
 			_:
 				void
 
@@ -529,22 +525,15 @@ private pure func has_short_circuit_operand_call(expr: CoreExpr) -> Bool:
 --- otherwise asks `count_uses` per owner, and owners accumulate with every
 --- enclosing immutable binding, so that walks the operand once per owner.
 private pure func short_circuit_operand_read_names(expr: CoreExpr) -> Dict[String, Bool]:
-	var stack: ShortCircuitScanStack = push_short_circuit_scan(
-		{
-			nodes = [],
-			operand_flags = [],
-			count = 0
-		},
-		expr,
-		False,
-	)
+	var nodes: List[CoreExpr] = [expr]
+	var count: Int = 1
 	var names: Dict[String, Bool] = {}
 
-	while stack.count > 0:
-		index: Int = stack.count - 1
-		stack = { stack | count = index }
+	while count > 0:
+		index: Int = count - 1
+		count = index
 
-		match stack.nodes.get(index):
+		match nodes.get(index):
 			Some(node):
 				match node:
 					VarExpr(variable, typ, loc):
@@ -552,7 +541,9 @@ private pure func short_circuit_operand_read_names(expr: CoreExpr) -> Dict[Strin
 					_:
 						void
 
-				stack = push_short_circuit_scan_children(stack, node, False)
+				for child in CoreTraverse.immediate_core_expr_children(node):
+					nodes = push_short_circuit_scan_node(nodes, count, child)
+					count += 1
 			None:
 				void
 

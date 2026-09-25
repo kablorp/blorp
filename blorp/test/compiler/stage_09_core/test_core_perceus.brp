@@ -156,6 +156,7 @@ import:
 		insert_drops_expr,
 		insert_drops_program,
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
+		balance_short_circuit_operands,
 		consumed_parameter_balancing_is_identity,
 	../../../src/compiler/stage_09_core/perceus/uses:
 		borrowed_result_aliases_param,
@@ -7308,6 +7309,90 @@ func test_deep_logical_chain_rewrites_without_stack_growth() -> Bool:
 		void
 
 	passed
+
+
+func test_short_circuit_scan_reuses_slots_before_nested_operand_call() -> Bool:
+	owner: CoreParam = core_param("owner", string_type())
+	inner_loc: CoreSourceLoc = pack_core_source_loc(0, 31, 1, 31, 9)
+	outer_loc: CoreSourceLoc = pack_core_source_loc(0, 32, 1, 32, 9)
+	call: CoreExpr = call_expr(
+		"blorp_string_concat_consume",
+		[
+			var_expr("owner", string_type()),
+			LiteralExpr(StringLiteral("x"), string_type(), synthetic_core_source_loc()),
+		],
+		string_type(),
+	)
+	logical: CoreExpr = LogicalExpr(
+		OrOp,
+		LogicalExpr(
+			AndOp,
+			bool_expr(True),
+			SeqExpr(call, bool_expr(True)),
+			bool_type(),
+			inner_loc,
+		),
+		bool_expr(False),
+		bool_type(),
+		outer_loc,
+	)
+	var items: List[CoreExpr] = [logical]
+	var item_types: List[CoreType] = [bool_type()]
+	for index in 0..16:
+		items = items.append(bool_expr(index % 2 == 0))
+		item_types = item_types.append(bool_type())
+
+	rewritten: CoreExpr = balance_short_circuit_operands(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		[owner],
+		TupleExpr(items, TupleType(item_types), synthetic_core_source_loc()),
+	)
+	var valid: Bool = False
+
+	match rewritten:
+		TupleExpr(rewritten_items, _, _):
+			match rewritten_items.get(0):
+				Some(LogicalExpr(
+					OrOp,
+					LogicalExpr(
+						AndOp,
+						LiteralExpr(BoolLiteral(True), _, _),
+						DupExpr(dup_var, _, ArcRetainPolicy, SeqExpr(
+							CallExpr(BuiltinCall(name), _, args, _, _),
+							LiteralExpr(BoolLiteral(True), _, _),
+						), _, _),
+						_,
+						rewritten_inner_loc,
+					),
+					LiteralExpr(BoolLiteral(False), _, _),
+					_,
+					rewritten_outer_loc,
+				)):
+					valid = (
+						exact_core_var_equal(dup_var, owner.name)
+							and name == "blorp_string_concat_consume"
+							and core_source_loc_equal(rewritten_inner_loc, inner_loc)
+							and core_source_loc_equal(rewritten_outer_loc, outer_loc)
+						)
+					match args:
+						[VarExpr(argument_var, _, _), LiteralExpr(StringLiteral("x"), _, _)]:
+							valid = valid and exact_core_var_equal(argument_var, owner.name)
+						_:
+							valid = False
+				_:
+					valid = False
+
+			valid = valid and rewritten_items.length() == 17
+			for index in 0..16:
+				match rewritten_items.get(index + 1):
+					Some(LiteralExpr(BoolLiteral(value), _, _)):
+						valid = valid and value == (index % 2 == 0)
+					_:
+						valid = False
+		_:
+			valid = False
+
+	valid
 
 
 func test_logical_operands_rewrite_ownership_independently() -> Bool:
@@ -17896,6 +17981,10 @@ tests: TestSuite = {
 		(
 			"deep logical chain rewrites without stack growth",
 			test_deep_logical_chain_rewrites_without_stack_growth,
+		),
+		(
+			"short circuit scan reuses slots before nested operand call",
+			test_short_circuit_scan_reuses_slots_before_nested_operand_call,
 		),
 		(
 			"logical operands rewrite ownership independently",
