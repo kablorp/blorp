@@ -28,13 +28,23 @@ import:
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreLogicalOp(AndOp),
 		CoreLoopRangeDirection(RangeForwardOnly),
+		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSemanticLengthMatchCase,
 		CoreSemanticLengthMatchGeq,
-		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
-		CoreSemanticMatchTree(SemanticLengthMatch, SemanticLiteralMatch, SemanticMatchLeaf),
+		CoreSemanticMatchAccessor(
+			RootSemanticMatchAccessor,
+			TupleFieldSemanticMatchAccessor,
+			VariantFieldSemanticMatchAccessor,
+		),
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch,
+			SemanticLengthMatch,
+			SemanticLiteralMatch,
+			SemanticMatchLeaf,
+		),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreTensorRawScalarKind(TensorInt64Elements),
@@ -60,6 +70,10 @@ TY_PAIR: CoreType = TupleType([TY_INT, TY_INT])
 TY_STRING_PAIR: CoreType = TupleType([TY_STRING, TY_INT])
 
 TY_BOX: CoreType = HeapRecordType("Box")
+
+TY_OPTION_INT: CoreType = NamedType("Option", [TY_INT])
+
+TY_TWO_OPTIONS: CoreType = TupleType([TY_OPTION_INT, TY_OPTION_INT])
 
 DEEP_LOGICAL_LENGTH: Int = 512
 
@@ -752,6 +766,95 @@ func test_tuple_match_with_non_tuple_leaf_is_unchanged() -> Bool:
 	contains_tuple(rewritten) and contains_field_of(rewritten, pair)
 
 
+func test_nested_option_match_subject_is_scalar_replaced() -> Bool:
+	first_accessor = TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, 0)
+	second_accessor = TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, 1)
+	first: CoreVar = core_var_with_id("first", 1)
+	second: CoreVar = core_var_with_id("second", 2)
+	match_expr: CoreExpr = SemanticMatchExpr(
+		TupleExpr(
+			[variable("left", TY_OPTION_INT), variable("right", TY_OPTION_INT)],
+			TY_TWO_OPTIONS,
+			synthetic_core_source_loc(),
+		),
+		SemanticConstructorMatch(
+			first_accessor,
+			[{
+				constructor = "Some",
+				body = SemanticConstructorMatch(
+					second_accessor,
+					[{
+						constructor = "Some",
+						body = SemanticMatchLeaf(
+							[
+								{
+									variable = first,
+									accessor = VariantFieldSemanticMatchAccessor(first_accessor, "Some", 0),
+									mode = MatchBorrowBindingMode
+								},
+								{
+									variable = second,
+									accessor = VariantFieldSemanticMatchAccessor(second_accessor, "Some", 0),
+									mode = MatchBorrowBindingMode
+								},
+							],
+							BinaryExpr(
+								AddOp,
+								variable_with_identity(first, TY_INT),
+								variable_with_identity(second, TY_INT),
+								TY_INT,
+								synthetic_core_source_loc(),
+							),
+						)
+					}],
+					Some(SemanticMatchLeaf([], int_literal(0))),
+				)
+			}],
+			Some(SemanticMatchLeaf([], int_literal(0))),
+		),
+		TY_INT,
+		synthetic_core_source_loc(),
+	)
+
+	rewritten: CoreExpr = rewrite_tuple_sroa_expr(match_expr)
+	(
+		not contains_tuple(rewritten)
+		and generated_binding_names(rewritten) == [
+			"$blorp$tuple_sroa$element$0",
+			"$blorp$tuple_sroa$element$1",
+		]
+	)
+
+
+func test_constructor_match_whole_tuple_fallback_is_unchanged() -> Bool:
+	whole_tuple: CoreVar = core_var_with_id("whole_tuple", 3)
+	match_expr: CoreExpr = SemanticMatchExpr(
+		TupleExpr(
+			[variable("left", TY_OPTION_INT), variable("right", TY_OPTION_INT)],
+			TY_TWO_OPTIONS,
+			synthetic_core_source_loc(),
+		),
+		SemanticConstructorMatch(
+			TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, 0),
+			[{ constructor = "Some", body = SemanticMatchLeaf([], int_literal(1)) }],
+			Some(
+				SemanticMatchLeaf(
+					[{
+						variable = whole_tuple,
+						accessor = RootSemanticMatchAccessor,
+						mode = MatchBorrowBindingMode
+					}],
+					int_literal(0),
+				),
+			),
+		),
+		TY_INT,
+		synthetic_core_source_loc(),
+	)
+
+	contains_tuple(rewrite_tuple_sroa_expr(match_expr))
+
+
 func test_tuple_match_leaf_collection_preserves_case_order() -> Bool:
 	pair: CoreVar = core_var_with_id("pair", 1)
 	match_rhs: CoreExpr = SemanticMatchExpr(
@@ -1334,6 +1437,14 @@ tests: TestSuite = {
 		(
 			"tuple match with non-tuple leaf is unchanged",
 			test_tuple_match_with_non_tuple_leaf_is_unchanged,
+		),
+		(
+			"nested Option match subject is scalar replaced",
+			test_nested_option_match_subject_is_scalar_replaced,
+		),
+		(
+			"whole-tuple fallback keeps constructor match tuple",
+			test_constructor_match_whole_tuple_fallback_is_unchanged,
 		),
 		(
 			"tuple match leaf collection preserves case order",

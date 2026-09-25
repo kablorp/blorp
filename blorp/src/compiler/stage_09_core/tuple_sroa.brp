@@ -139,7 +139,11 @@ import:
 		CoreSemanticLengthMatchCase,
 		CoreSemanticLengthMatchGeq,
 		CoreSemanticLiteralMatchCase,
-		CoreSemanticMatchAccessor(RootSemanticMatchAccessor, TupleFieldSemanticMatchAccessor),
+		CoreSemanticMatchAccessor(
+			RootSemanticMatchAccessor,
+			TupleFieldSemanticMatchAccessor,
+			VariantFieldSemanticMatchAccessor,
+		),
 		CoreSemanticMatchBinding,
 		CoreSemanticMatchTree(
 			SemanticConstructorMatch,
@@ -210,6 +214,19 @@ private record TuplePlanBinding {
 private record TuplePlanLiteralCase {
 	literal: CoreLiteral,
 	body: TupleSemanticPlan
+}
+
+
+private record TupleMatchPayloadBinding {
+	index: Int,
+	constructor: String,
+	binding: CoreSemanticMatchBinding
+}
+
+
+private record TupleConstructorChain {
+	expr: CoreExpr,
+	pending_bindings: List[TupleMatchPayloadBinding]
 }
 
 
@@ -982,6 +999,156 @@ private pure func lower_tuple_plan(
 				)
 			else:
 				None
+
+
+-- A constructor chain may bind payloads from several tuple fields at its
+-- final leaf. Keep those bindings pending until the constructor case that
+-- proves each payload is reached; attaching them to a detached leaf match
+-- loses that proof and gives ownership preparation a different scope.
+private pure func tuple_match_payload_bindings(
+	bindings: List[CoreSemanticMatchBinding],
+	used_indices: List[Int],
+) -> Option[List[TupleMatchPayloadBinding]]:
+	var pending: List[TupleMatchPayloadBinding] = []
+	var supported: Bool = True
+
+	for binding in bindings:
+		if binding.mode != MatchBorrowBindingMode:
+			supported = False
+			break
+		else:
+			match binding.accessor:
+				VariantFieldSemanticMatchAccessor(
+					TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, index),
+					constructor,
+					field_index,
+				):
+					if not used_indices.any(pure func(used: Int): used == index):
+						supported = False
+						break
+					pending = pending.append({
+						index = index,
+						constructor = constructor,
+						binding = { binding |
+							accessor = VariantFieldSemanticMatchAccessor(
+								RootSemanticMatchAccessor,
+								constructor,
+								field_index,
+							)
+						}
+					})
+				_:
+					supported = False
+					break
+
+	if supported:
+		Some(pending)
+	else:
+		None
+
+
+private pure func lower_tuple_constructor_chain(
+	element_vars: List[CoreVar],
+	elements: List[CoreExpr],
+	tree: CoreSemanticMatchTree,
+	used_indices: List[Int],
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[TupleConstructorChain]:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			pending ?= tuple_match_payload_bindings(bindings, used_indices)
+			Some({ expr = body, pending_bindings = pending })
+		SemanticConstructorMatch(accessor, [match_case], fallback):
+			index ?= direct_tuple_field_index(elements.length(), accessor)
+			if used_indices.any(pure func(used: Int): used == index):
+				None
+			else:
+				fallback_supported: Bool = match fallback:
+					None | Some(SemanticMatchFail) | Some(SemanticMatchLeaf([], _)):
+						True
+					_:
+						False
+
+				if not fallback_supported:
+					None
+				else:
+					child ?= lower_tuple_constructor_chain(
+						element_vars,
+						elements,
+						match_case.body,
+						used_indices.append(index),
+						result_type,
+						loc,
+					)
+					var case_bindings: List[CoreSemanticMatchBinding] = []
+					var remaining: List[TupleMatchPayloadBinding] = []
+					var bindings_supported: Bool = True
+
+					for pending in child.pending_bindings:
+						if pending.index == index:
+							if pending.constructor != match_case.constructor:
+								bindings_supported = False
+								break
+							case_bindings = case_bindings.append(pending.binding)
+						else:
+							remaining = remaining.append(pending)
+
+					if not bindings_supported:
+						None
+					else:
+						scrutinee ?= tuple_element_ref(element_vars, elements, index, loc)
+						Some({
+							expr = SemanticMatchExpr(
+								scrutinee,
+								SemanticConstructorMatch(
+									RootSemanticMatchAccessor,
+									[{
+										constructor = match_case.constructor,
+										body = SemanticMatchLeaf(case_bindings, child.expr)
+									}],
+									fallback,
+								),
+								result_type,
+								loc,
+							),
+							pending_bindings = remaining
+						})
+		_:
+			None
+
+
+private pure func scalar_replace_constructor_match_subject(
+	elements: List[CoreExpr],
+	tree: CoreSemanticMatchTree,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+	next_fresh: Int,
+) -> Option[TupleSroaRewrite]:
+	match tree:
+		SemanticConstructorMatch(_, _, _):
+			allocated: (List[CoreVar], Int) = allocate_vars(
+				"element",
+				elements.length(),
+				next_fresh,
+			)
+			chain ?= lower_tuple_constructor_chain(
+				allocated[0],
+				elements,
+				tree,
+				[],
+				result_type,
+				loc,
+			)
+			if chain.pending_bindings.is_empty():
+				Some({
+					expr = bind_tuple_elements(allocated[0], elements, chain.expr),
+					next_fresh = allocated[1]
+				})
+			else:
+				None
+		_:
+			None
 
 
 private pure func replace_field_uses(
@@ -2440,10 +2607,20 @@ private pure func scalar_replace_tuple_node(
 								next_fresh = next_fresh
 							}
 				None:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
+					match scalar_replace_constructor_match_subject(
+						elements,
+						tree,
+						typ,
+						loc,
+						next_fresh,
+					):
+						Some(result):
+							result
+						None:
+							{
+								expr = expr,
+								next_fresh = next_fresh
+							}
 		SemanticMatchExpr(CallExpr(call_kind, _, args, _, _), tree, typ, loc):
 			match lower_tuple_return_call_match(
 				context.summaries,
