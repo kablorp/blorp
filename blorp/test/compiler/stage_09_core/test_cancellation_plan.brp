@@ -18,7 +18,7 @@ import:
 			UserCall,
 		),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
-		CoreDecl(FunctionDecl, GlobalDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreDirectRuntimeArgs(DirectRuntimeArgsAsWritten),
 		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
 		CoreExpr(
@@ -36,6 +36,7 @@ import:
 		),
 		CoreFallibleStreamTerminalPayload(FallibleStreamPayloadInt),
 		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreHashContainerConstructor(GenericHashContainerConstructor),
 		CoreLiteral(BoolLiteral, StringLiteral),
@@ -116,8 +117,8 @@ pure func call_expr(kind: CoreCallKind) -> CoreExpr:
 	CallExpr(kind, VOID_EXPR, [], VoidType, synthetic_core_source_loc())
 
 
-pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
-	FunctionDecl({
+pure func test_function(name: String, def_id: Int, body: CoreExpr) -> CoreFunction:
+	{
 		name = name,
 		source_module = None,
 		type_params = [],
@@ -128,7 +129,11 @@ pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
 		function_kind = UserFunction,
 		def_id = def_id,
 		loc = synthetic_core_source_loc(),
-	})
+	}
+
+
+pure func function_decl(name: String, def_id: Int, body: CoreExpr) -> CoreDecl:
+	FunctionDecl(test_function(name, def_id, body))
 
 
 pure func global_decl(name: String, def_id: Int, init: CoreExpr) -> CoreDecl:
@@ -1268,6 +1273,59 @@ pure func cancellation_propagation_preserves_graph_order_and_fixed_points() -> B
 	)
 
 
+pure func cancellation_summaries_preserve_function_and_impl_method_order() -> Bool:
+	program: CoreProgram = program_with([
+		function_decl("before", 101, VOID_EXPR),
+		ImplDecl({
+			trait_name = "FirstTrait",
+			for_type = VoidType,
+			type_params = [],
+			methods = [
+				test_function("first_method", 102, VOID_EXPR),
+				test_function(
+					"checkpoint_method",
+					103,
+					CooperativeCheckpointExpr(VoidType, synthetic_core_source_loc()),
+				),
+			],
+			loc = synthetic_core_source_loc(),
+		}),
+		function_decl("between", 104, VOID_EXPR),
+		ImplDecl({
+			trait_name = "SecondTrait",
+			for_type = VoidType,
+			type_params = [],
+			methods = [test_function("last_method", 105, VOID_EXPR)],
+			loc = synthetic_core_source_loc(),
+		}),
+	])
+	summaries: CancellationProgramSummary = analyze_program_cancellation(program)
+
+	(
+		summaries.functions.length() == 5
+		and ordered_summary_matches(summaries, 0, "before", 101, [])
+		and ordered_summary_matches(summaries, 1, "first_method", 102, [])
+		and ordered_summary_matches(
+			summaries,
+			2,
+			"checkpoint_method",
+			103,
+			[ExplicitCancellationCheckpoint],
+		)
+		and ordered_summary_matches(summaries, 3, "between", 104, [])
+		and ordered_summary_matches(summaries, 4, "last_method", 105, [])
+		and cancellation_function_summary(
+			summaries,
+			{
+				name = "checkpoint_method",
+				def_id = 103
+			},
+		)
+			.map(cancellation_effect_may_cancel)
+			.get_or(False)
+	)
+
+
 pure func unresolved_calls_fail_closed() -> Bool:
 	summary: CancellationSummary = summary_for(
 		program_with([function_decl("unknown", 1, call_expr(UnknownCall))]),
@@ -1555,6 +1613,10 @@ tests: TestSuite = {
 		(
 			"cancellation propagation preserves graph order and fixed points",
 			cancellation_propagation_preserves_graph_order_and_fixed_points,
+		),
+		(
+			"cancellation summaries preserve function and impl method order",
+			cancellation_summaries_preserve_function_and_impl_method_order,
 		),
 		("unresolved calls fail closed", unresolved_calls_fail_closed),
 		("dynamic global initializers are summarized", dynamic_global_initializers_are_summarized),
