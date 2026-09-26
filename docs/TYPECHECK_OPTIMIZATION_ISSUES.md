@@ -294,6 +294,18 @@ month.
 
 ## Issue T-D cut 2: Build module environment preparation once
 
+**Status (2026-09-25).** Three bounded preparation cuts have landed or reached
+acceptance evidence: sharing the immutable builtin environment, owning callable
+rows locally during header preparation, and precomputing stable
+trait-implementation lookup facts. The latest cut removes 385,935 allocations
+from `global_header_completion` (-7.39%) and the typed frontend (-1.24%) on the
+current frozen self-compile, with an unchanged `module_bodies` row and
+byte-identical C. See
+[`typecheck_precomputed_trait_implementation_facts_2026-09-25.md`](../benchmarks/results/typecheck_precomputed_trait_implementation_facts_2026-09-25.md).
+This is meaningful progress, but it does not satisfy the original 40% goal;
+the remaining base and final-environment construction still need independent
+attribution and cuts rather than a single broad rewrite.
+
 **Goal.** `global_prepare` is 5,201,772 allocations, 78.3% of
 `global_header_completion`, and all of it is `prepared_module_environments`
 (`stage_06_typecheck/decl.brp:7551`), called once per compile from
