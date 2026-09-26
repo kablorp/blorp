@@ -43,7 +43,12 @@ import:
 		run_dict_literal_ownership_pass,
 		run_record_update_ownership_pass,
 		run_static_string_literals_pass,
-	../../../blorp/src/compiler/stage_09_core/perceus: PerceusEnv, build_env, count_uses, insert_drops_program
+	../../../blorp/src/compiler/stage_09_core/perceus: insert_drops_program
+	../../../blorp/src/compiler/stage_09_core/perceus/env: PerceusEnv, build_env
+	../../../blorp/src/compiler/stage_09_core/perceus/index:
+		index_ownership_function,
+		ownership_index_node_count,
+	../../../blorp/src/compiler/stage_09_core/perceus/uses: count_uses
 	../../../blorp/src/compiler/stage_09_core/traverse: immediate_core_expr_children
 
 
@@ -225,9 +230,54 @@ func run_profile(late_core: CoreProgram) -> Void:
 	void
 
 
+---
+Measure the construction floor for one dense occurrence index per function.
+The indexes are intentionally not retained after each body: the production
+design consumes one function at a time, and retaining every compatibility
+CoreExpr payload would measure an architecture we do not intend to use.
+---
+func run_index_profile(late_core: CoreProgram) -> Bool:
+	functions: List[CoreFunction] = program_functions(late_core)
+	var indexed_functions: Int = 0
+	var indexed_nodes: Int = 0
+	var failed_indexes: Int = 0
+
+	reset_mem_stats()
+
+	for function_info in functions:
+		match function_info.body:
+			Some(body):
+				match index_ownership_function(body):
+					Some(index):
+						indexed_functions += 1
+						indexed_nodes += ownership_index_node_count(index)
+					None:
+						failed_indexes += 1
+			None:
+				void
+
+	if failed_indexes == 0:
+		stats: MemStats = get_mem_stats()
+		print_error(
+			"run_index_profile: functions=${indexed_functions} nodes=${indexed_nodes} failures=0",
+		)
+		report_row("index_ownership_function", indexed_functions, stats.total_allocations)
+		print(
+			"index_memory\t${stats.total_allocations}\t${stats.total_releases}"
+			+ "\t${stats.current_objects}\t${stats.bytes_allocated}",
+		)
+		True
+	else:
+		print_error(
+			"run_index_profile failed: functions=${indexed_functions}"
+			+ " nodes=${indexed_nodes} failures=${failed_indexes}",
+		)
+		False
+
+
 func main(args: List[String]) -> Int:
 	if args.length() < 2:
-		print("usage: perceus_allocations <post-dce-core-json-path>")
+		print("usage: perceus_allocations <post-dce-core-json-path> [perceus|index]")
 		1
 	else:
 		path: String = args.get(1).get_or("")
@@ -237,5 +287,17 @@ func main(args: List[String]) -> Int:
 				print("decode failed")
 				1
 			Some(late_core):
-				run_profile(late_core)
-				0
+				mode: String = args.get_or(2, "perceus")
+
+				match mode:
+					"index":
+						if run_index_profile(late_core):
+							0
+						else:
+							1
+					"perceus":
+						run_profile(late_core)
+						0
+					_:
+						print("unknown profile mode: ${mode}")
+						1
