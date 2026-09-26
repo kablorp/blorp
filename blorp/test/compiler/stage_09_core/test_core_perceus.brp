@@ -173,6 +173,16 @@ import:
 		lookup_constructor_call_contract,
 		perceus_env_for_managed_types,
 		result_mode_for_type,
+	../../../src/compiler/stage_09_core/perceus/index:
+		index_ownership_function,
+		ownership_index_child,
+		ownership_index_child_count,
+		ownership_index_is_valid,
+		ownership_index_node,
+		ownership_index_node_count,
+		ownership_index_root,
+		ownership_index_root_expr,
+		ownership_occurrence_id_value,
 	../../../src/compiler/stage_09_core/type_policy: CORE_MANAGED_TYPE_NAMES
 	../test_support_core_ownership_events:
 		OwnershipEvent,
@@ -181,6 +191,7 @@ import:
 		ownership_events_from_json,
 	io: print_error
 	json: JsonValue(JsonObject, JsonString)
+	memory: same_object
 	test: TestSuite
 
 
@@ -17276,6 +17287,101 @@ pure func test_linear_summary_frames_preserve_sequence_alias_and_shadowing() -> 
 	)
 
 
+-- Source locations are diagnostic metadata, not ownership-analysis identity.
+-- Both branches below deliberately use the same synthetic location. The
+-- occurrence index must still give them distinct dense ids and preserve the
+-- different consume/alias summaries read through its compatibility payload.
+func test_ownership_index_distinguishes_duplicate_synthetic_nodes() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	consumed: CoreExpr = var_expr("xs", list_int_type())
+	shadowed: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		int_expr(0),
+		var_expr("xs", list_int_type()),
+	)
+	root: CoreExpr = IfExpr(
+		bool_expr(True),
+		consumed,
+		shadowed,
+		list_int_type(),
+		synthetic_core_source_loc(),
+	)
+	var result: Bool = False
+
+	match index_ownership_function(root):
+		Some(index):
+			root_id = ownership_index_root(index)
+
+			match (
+				ownership_index_child(index, root_id, 0),
+				ownership_index_child(index, root_id, 1),
+				ownership_index_child(index, root_id, 2),
+				ownership_index_root_expr(index),
+			):
+				(Some(cond_id), Some(consumed_id), Some(shadowed_id), Some(indexed_root)):
+					match (ownership_index_node(index, consumed_id), ownership_index_node(index, shadowed_id)):
+						(Some(consumed_row), Some(shadowed_row)):
+							consumed_uses = summarize_linear_ownership_uses(env, "xs", consumed_row.expr)
+							shadowed_uses = summarize_linear_ownership_uses(env, "xs", shadowed_row.expr)
+							result = (
+								ownership_index_is_valid(index)
+								and ownership_index_node_count(index) == 6
+								and ownership_occurrence_id_value(root_id) == 5
+								and ownership_index_child_count(index, root_id) == 3
+								and ownership_occurrence_id_value(cond_id) == 0
+								and ownership_occurrence_id_value(consumed_id) == 1
+								and ownership_occurrence_id_value(shadowed_id) == 4
+								and consumed_uses.consumed_refs == 1
+								and consumed_uses.touched
+								and shadowed_uses.consumed_refs == 0
+								and not shadowed_uses.touched
+								and same_object(indexed_root, root)
+							)
+						_:
+							void
+				_:
+					void
+		None:
+			void
+
+	if not result:
+		print_error("ownership index did not preserve the validated postorder shape")
+	else:
+		void
+
+	result
+
+
+pure func test_ownership_index_handles_deep_sequence_without_stack_growth() -> Bool:
+	var root: CoreExpr = int_expr(DEEP_MANAGED_BINDING_COUNT)
+
+	for index in 0..DEEP_MANAGED_BINDING_COUNT:
+		root = SeqExpr(
+			var_expr("indexed_${index}", int_type()),
+			root,
+		)
+
+	match index_ownership_function(root):
+		Some(index):
+			root_id = ownership_index_root(index)
+
+			match ownership_index_root_expr(index):
+				Some(indexed_root):
+					(
+						ownership_index_is_valid(index)
+						and ownership_index_node_count(index) == DEEP_MANAGED_BINDING_COUNT * 2 + 1
+						and ownership_occurrence_id_value(root_id) == DEEP_MANAGED_BINDING_COUNT * 2
+						and ownership_index_child_count(index, root_id) == 2
+						and same_object(indexed_root, root)
+					)
+				None:
+					False
+		None:
+			False
+
+
 -- Every ownership decision in this pass is carried by an `OwnershipUseSummary`
 -- value that the summary walk combines with sequence, branch, and aggregate
 -- rules. These characterization tests pin the exact ordered ownership events
@@ -19025,6 +19131,14 @@ tests: TestSuite = {
 		(
 			"linear summary frames preserve sequence alias and shadowing",
 			test_linear_summary_frames_preserve_sequence_alias_and_shadowing,
+		),
+		(
+			"ownership index distinguishes duplicate synthetic nodes",
+			test_ownership_index_distinguishes_duplicate_synthetic_nodes,
+		),
+		(
+			"ownership index handles deep sequence without stack growth",
+			test_ownership_index_handles_deep_sequence_without_stack_growth,
 		),
 		(
 			"mixed consume and borrow branches preserve owner events",

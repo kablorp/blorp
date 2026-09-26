@@ -1,0 +1,270 @@
+---
+A lossless, function-local occurrence index for ownership analysis.
+
+CoreSourceLoc is useful diagnostic metadata, but it is not a unique node key:
+synthetic nodes share zero and some rewrites deliberately preserve an origin.
+This index therefore assigns a fresh dense id to every occurrence it visits.
+Children precede their parent, so later bottom-up fact builders can fill a
+parallel column with a single forward scan.
+
+The first representation keeps the original CoreExpr as a compatibility
+payload. That makes adopting the index incremental: analyses can move facts
+to id-keyed columns before Core payloads themselves are scalarized. Direct
+children live in one flat column rather than allocating a list per row.
+---
+import:
+	../ir: CoreExpr
+	../traverse as CoreTraverse
+	memory: same_object
+
+
+opaque type OwnershipOccurrenceId = Int
+
+
+record OwnershipNodeRow {
+	expr: CoreExpr,
+	child_start: Int,
+	child_count: Int
+}
+
+
+private record OwnershipFunctionIndexRep {
+	nodes: List[OwnershipNodeRow],
+	child_ids: List[OwnershipOccurrenceId],
+	root: OwnershipOccurrenceId
+}
+
+
+opaque type OwnershipFunctionIndex = OwnershipFunctionIndexRep
+
+
+private union OwnershipIndexFrameStack:
+	NoOwnershipIndexFrame
+	OwnershipIndexFrame(
+		CoreExpr,
+		List[CoreExpr],
+		Int,
+		Int,
+		OwnershipIndexFrameStack,
+	)
+
+
+pure func ownership_occurrence_id_value(id: OwnershipOccurrenceId) -> Int:
+	from_opaque OwnershipOccurrenceId(id)
+
+
+private pure func ownership_occurrence_id(value: Int) -> OwnershipOccurrenceId:
+	into_opaque OwnershipOccurrenceId(value)
+
+
+private pure func publish_ownership_index(
+	nodes: List[OwnershipNodeRow],
+	child_slots: List[Option[OwnershipOccurrenceId]],
+	root: OwnershipOccurrenceId,
+) -> Option[OwnershipFunctionIndex]:
+	var child_ids: List[OwnershipOccurrenceId] = []
+	var valid: Bool = True
+
+	for slot in child_slots:
+		match slot:
+			Some(child):
+				child_ids = child_ids.append(child)
+			None:
+				valid = False
+
+	if valid:
+		Some(into_opaque OwnershipFunctionIndex({
+			nodes = nodes,
+			child_ids = child_ids,
+			root = root
+		}))
+	else:
+		None
+
+
+private pure func ownership_index_rep(index: OwnershipFunctionIndex) -> OwnershipFunctionIndexRep:
+	from_opaque OwnershipFunctionIndex(index)
+
+
+---
+Build an occurrence index without recursive Blorp calls. Core commonly has
+long LetExpr and SeqExpr spines, so the traversal keeps its own explicit
+frame stack. A frame retains the canonical direct-child list and its reserved
+edge range; it does not allocate a second list of child ids. The published
+index stores all child ids in one flat list.
+---
+pure func index_ownership_function(root: CoreExpr) -> Option[OwnershipFunctionIndex]:
+	var nodes: List[OwnershipNodeRow] = []
+	var child_slots: List[Option[OwnershipOccurrenceId]] = []
+	var frames: OwnershipIndexFrameStack = NoOwnershipIndexFrame
+	var current: CoreExpr = root
+	var visiting: Bool = True
+	var produced: OwnershipOccurrenceId = ownership_occurrence_id(0)
+	var complete: Bool = False
+	var valid: Bool = True
+
+	while valid and not complete:
+		if visiting:
+			children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(current)
+
+			if children.is_empty():
+				produced = ownership_occurrence_id(nodes.length())
+				nodes = nodes.append({
+					expr = current,
+					child_start = child_slots.length(),
+					child_count = 0
+				})
+				visiting = False
+			else:
+				child_start: Int = child_slots.length()
+				var offset: Int = 0
+
+				while offset < children.length():
+					child_slots = child_slots.append(None)
+					offset += 1
+
+				frames = OwnershipIndexFrame(current, children, 1, child_start, frames)
+
+				match children.get(0):
+					Some(first_child):
+						current = first_child
+						visiting = True
+					None:
+						valid = False
+		else:
+			match frames:
+				NoOwnershipIndexFrame:
+					complete = True
+				OwnershipIndexFrame(parent, children, next_child, child_start, remaining):
+					child_slot: Int = child_start + next_child - 1
+
+					if child_slot >= 0 and child_slot < child_slots.length():
+						child_slots = child_slots.set(child_slot, Some(produced))
+					else:
+						valid = False
+
+					if valid and next_child < children.length():
+						frames = OwnershipIndexFrame(
+							parent,
+							children,
+							next_child + 1,
+							child_start,
+							remaining,
+						)
+
+						match children.get(next_child):
+							Some(next_expr):
+								current = next_expr
+								visiting = True
+							None:
+								valid = False
+					else if valid:
+						produced = ownership_occurrence_id(nodes.length())
+						nodes = nodes.append({
+							expr = parent,
+							child_start = child_start,
+							child_count = children.length()
+						})
+						frames = remaining
+						visiting = False
+					else:
+						void
+
+	if valid:
+		publish_ownership_index(nodes, child_slots, produced)
+	else:
+		None
+
+
+pure func ownership_index_root(index: OwnershipFunctionIndex) -> OwnershipOccurrenceId:
+	ownership_index_rep(index).root
+
+
+pure func ownership_index_node_count(index: OwnershipFunctionIndex) -> Int:
+	ownership_index_rep(index).nodes.length()
+
+
+pure func ownership_index_node(
+	index: OwnershipFunctionIndex,
+	id: OwnershipOccurrenceId,
+) -> Option[OwnershipNodeRow]:
+	ownership_index_rep(index).nodes.get(ownership_occurrence_id_value(id))
+
+
+pure func ownership_index_root_expr(index: OwnershipFunctionIndex) -> Option[CoreExpr]:
+	ownership_index_node(index, ownership_index_root(index)).map(func(row): row.expr)
+
+
+pure func ownership_index_child_count(
+	index: OwnershipFunctionIndex,
+	id: OwnershipOccurrenceId,
+) -> Int:
+	match ownership_index_node(index, id):
+		Some(row):
+			row.child_count
+		None:
+			0
+
+
+--- Read one direct child without allocating a compatibility list. ---
+pure func ownership_index_child(
+	index: OwnershipFunctionIndex,
+	id: OwnershipOccurrenceId,
+	offset: Int,
+) -> Option[OwnershipOccurrenceId]:
+	row ?= ownership_index_node(index, id)
+
+	if offset < 0 or offset >= row.child_count:
+		None
+	else:
+		ownership_index_rep(index).child_ids.get(row.child_start + offset)
+
+
+---
+Validate the dense postorder contract and the exact child payload/order. This
+is intentionally public for invariant tests and diagnostic prototypes; hot
+analysis reads the already-validated opaque index through scalar accessors.
+---
+pure func ownership_index_is_valid(index: OwnershipFunctionIndex) -> Bool:
+	rep: OwnershipFunctionIndexRep = ownership_index_rep(index)
+	node_count: Int = rep.nodes.length()
+	var valid: Bool = (
+		node_count > 0
+		and ownership_occurrence_id_value(rep.root) == node_count - 1
+	)
+	var parent_index: Int = 0
+
+	while valid and parent_index < node_count:
+		match rep.nodes.get(parent_index):
+			Some(row):
+				expected_children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(row.expr)
+				valid = (
+					row.child_start >= 0
+					and row.child_count == expected_children.length()
+					and row.child_start + row.child_count <= rep.child_ids.length()
+				)
+				var offset: Int = 0
+
+				while valid and offset < row.child_count:
+					match rep.child_ids.get(row.child_start + offset):
+						Some(child_id):
+							child_index: Int = ownership_occurrence_id_value(child_id)
+
+							match (rep.nodes.get(child_index), expected_children.get(offset)):
+								(Some(child_row), Some(expected_child)):
+									valid = (
+										child_index >= 0
+										and child_index < parent_index
+										and same_object(child_row.expr, expected_child)
+									)
+								_:
+									valid = False
+						None:
+							valid = False
+					offset += 1
+			None:
+				valid = False
+
+		parent_index += 1
+
+	valid

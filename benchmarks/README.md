@@ -413,12 +413,16 @@ allocations, and allocations per call:
 benchmarks/compiler_perceus_allocations
 BLORP_PERCEUS_SKIP_BUILD=1 BLORP_PERCEUS_INPUT_REV=origin/main \
   benchmarks/compiler_perceus_allocations
+
+# Measure the one-index-per-function construction floor on the same Core.
+BLORP_PERCEUS_PROFILE_MODE=index \
+  benchmarks/compiler_perceus_allocations
 ```
 
-The committed profile only calls helpers that are public in
-`stage_09_core/perceus.brp` (`insert_drops_program`, `build_env`,
-`count_uses`) plus a static traversal of the decoded program (region count:
-functions, lambdas, global initializers). The full per-helper breakdown for
+The committed profile calls the public Perceus entry point plus focused
+helpers from `perceus/env.brp`, `perceus/uses.brp`, and, in `index` mode,
+`perceus/index.brp`. It also uses a static traversal of the decoded program
+for the region count (functions, lambdas, and global initializers). The full per-helper breakdown for
 Perceus's private helpers (`infer_user_call_contracts`,
 `build_borrowed_owner_catalog`, the `summarize_linear_ownership_uses`
 family, `rewrite_mutable_assignments`, `protect_repeated_consumes`,
