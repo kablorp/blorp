@@ -162,6 +162,7 @@ import:
 		insert_drops_program_with_facts,
 	../../../src/compiler/stage_09_core/perceus/balance: freshen_shadowed_match_bindings
 	../../../src/compiler/stage_09_core/perceus/borrowed: normalize_lambda_result_aliases
+	../../../src/compiler/stage_09_core/perceus/protect: protect_repeated_consumes
 	../../../src/compiler/stage_09_core/resolve: resolve_global_value_refs
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
 		balance_short_circuit_operands,
@@ -8336,6 +8337,194 @@ pure func test_mutable_consuming_call_preserves_slot_owner() -> Bool:
 	)
 
 	dup_count_for("slot", rewritten) == 1 and drop_count_for("slot", rewritten) == 1
+
+
+pure func protect_call_args_for_test(args: List[CoreExpr]) -> CoreExpr:
+	protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		call_expr("arg_identity_probe", args, int_type()),
+		False,
+	)
+
+
+pure func test_protect_call_preserves_unchanged_arg_list_identity() -> Bool:
+	empty_call: CoreExpr = call_expr("arg_identity_probe", [], int_type())
+	empty_protected: CoreExpr = protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		empty_call,
+		False,
+	)
+	empty_valid: Bool = match empty_protected:
+		CallExpr(_, _, protected_args, _, _):
+			protected_args.length() == 0
+		_:
+			False
+	one_arg: CoreExpr = int_expr(1)
+	one_args: List[CoreExpr] = [one_arg]
+	one_call: CoreExpr = call_expr("arg_identity_probe", one_args, int_type())
+	one_protected: CoreExpr = protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		one_call,
+		False,
+	)
+	many_args: List[CoreExpr] = [int_expr(1), int_expr(2), int_expr(3)]
+	many_call: CoreExpr = call_expr("arg_identity_probe", many_args, int_type())
+	many_protected: CoreExpr = protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		many_call,
+		False,
+	)
+
+	(
+		empty_valid
+		and same_object(one_protected, one_call)
+		and same_object(many_protected, many_call)
+	)
+
+
+pure func protect_call_changes_only_selected_arg(changed_index: Int) -> Bool:
+	changed_rhs: CoreExpr = int_expr(9)
+	changed_arg: CoreExpr = AssignExpr(
+		named_var("other"),
+		changed_rhs,
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	first: CoreExpr = if changed_index == 0:
+		changed_arg
+	else:
+		int_expr(1)
+	middle: CoreExpr = if changed_index == 1:
+		changed_arg
+	else:
+		int_expr(2)
+	last: CoreExpr = if changed_index == 2:
+		changed_arg
+	else:
+		int_expr(3)
+	args: List[CoreExpr] = [first, middle, last]
+	protected: CoreExpr = protect_call_args_for_test(args)
+
+	match protected:
+		CallExpr(_, _, protected_args, _, _):
+			changed_shape: Bool = match protected_args.get(changed_index):
+				Some(AssignExpr(variable, rhs, _, _)):
+					variable.name == "other" and same_object(rhs, changed_rhs)
+				_:
+					False
+			match (protected_args.get(0), protected_args.get(1), protected_args.get(2)):
+				(Some(protected_first), Some(protected_middle), Some(protected_last)):
+					(
+						protected_args.length() == 3
+						and not same_object(protected_args, args)
+						and changed_shape
+						and (same_object(protected_first, first) == (changed_index != 0))
+						and (same_object(protected_middle, middle) == (changed_index != 1))
+						and (same_object(protected_last, last) == (changed_index != 2))
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_protect_call_rewrites_single_argument() -> Bool:
+	rhs: CoreExpr = int_expr(9)
+	arg: CoreExpr = AssignExpr(
+		named_var("other"),
+		rhs,
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	args: List[CoreExpr] = [arg]
+	protected: CoreExpr = protect_call_args_for_test(args)
+
+	match protected:
+		CallExpr(_, _, protected_args, _, _):
+			match protected_args.get(0):
+				Some(AssignExpr(variable, protected_rhs, _, _)):
+					(
+						protected_args.length() == 1
+						and not same_object(protected_args, args)
+						and variable.name == "other"
+						and same_object(protected_rhs, rhs)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_protect_call_rewrites_first_middle_last_arg_in_order() -> Bool:
+	(
+		protect_call_changes_only_selected_arg(0)
+		and protect_call_changes_only_selected_arg(1)
+		and protect_call_changes_only_selected_arg(2)
+	)
+
+
+pure func test_protect_call_keeps_two_rewrites_in_repeated_context() -> Bool:
+	first_rhs: CoreExpr = int_expr(11)
+	last_rhs: CoreExpr = int_expr(33)
+	first: CoreExpr = AssignExpr(
+		named_var("first_other"),
+		first_rhs,
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	middle: CoreExpr = int_expr(22)
+	last: CoreExpr = AssignExpr(
+		named_var("last_other"),
+		last_rhs,
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	args: List[CoreExpr] = [first, middle, last]
+	call: CoreExpr = call_expr("arg_identity_probe", args, int_type())
+	protected: CoreExpr = protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		call,
+		True,
+	)
+
+	match protected:
+		CallExpr(_, _, protected_args, _, _):
+			match (protected_args.get(0), protected_args.get(1), protected_args.get(2)):
+				(Some(protected_first), Some(protected_middle), Some(protected_last)):
+					first_shape: Bool = match protected_first:
+						AssignExpr(first_var, protected_first_rhs, _, _):
+							first_var.name == "first_other" and same_object(protected_first_rhs, first_rhs)
+						_:
+							False
+					last_shape: Bool = match protected_last:
+						AssignExpr(last_var, protected_last_rhs, _, _):
+							last_var.name == "last_other" and same_object(protected_last_rhs, last_rhs)
+						_:
+							False
+					(
+						protected_args.length() == 3
+						and not same_object(protected, call)
+						and not same_object(protected_args, args)
+						and not same_object(protected_first, first)
+						and first_shape
+						and same_object(protected_middle, middle)
+						and not same_object(protected_last, last)
+						and last_shape
+					)
+				_:
+					False
+		_:
+			False
 
 
 pure func test_mutable_collection_equality_preserves_slot_owner() -> Bool:
@@ -18863,6 +19052,22 @@ tests: TestSuite = {
 		(
 			"mutable consuming call preserves slot owner",
 			test_mutable_consuming_call_preserves_slot_owner,
+		),
+		(
+			"protect call preserves unchanged argument list identity",
+			test_protect_call_preserves_unchanged_arg_list_identity,
+		),
+		(
+			"protect call rewrites one argument",
+			test_protect_call_rewrites_single_argument,
+		),
+		(
+			"protect call rewrites first middle last argument in order",
+			test_protect_call_rewrites_first_middle_last_arg_in_order,
+		),
+		(
+			"protect call keeps two rewrites in repeated context",
+			test_protect_call_keeps_two_rewrites_in_repeated_context,
 		),
 		(
 			"mutable collection equality preserves slot owner",
