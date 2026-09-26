@@ -19,12 +19,14 @@ import:
 			AssignExpr,
 			CallExpr,
 			ClosureCreateExpr,
+			ConcurrentExpr,
 			DetachExpr,
 			DropExpr,
 			DupExpr,
 			IfExpr,
 			LetExpr,
 			LiteralExpr,
+			LiteralMatchExpr,
 			SetAllocExpr,
 			SeqExpr,
 			TensorRawReadExpr,
@@ -36,6 +38,7 @@ import:
 		CoreFunctionKind(ProgramEntrypointFunction, UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
 		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy),
@@ -513,6 +516,236 @@ func test_value_references_preserve_resolved_occurrences() -> Bool:
 	references.resolved_reads == [value] and references.resolved_occurrences == [value, value]
 
 
+func test_value_references_preserve_first_occurrence_and_effect_order() -> Bool:
+	first: CoreVar = named_var("first", Some(70))
+	second: CoreVar = named_var("second", Some(71))
+	unresolved: CoreVar = named_var("unresolved", None)
+	loc = synthetic_core_source_loc()
+	expr: CoreExpr = SeqExpr(
+		AssignExpr(first, VarExpr(second, int_type(), loc), VoidType, loc),
+		SeqExpr(
+			VarExpr(unresolved, int_type(), loc),
+			SeqExpr(
+				VarExpr(first, int_type(), loc),
+				SeqExpr(
+					VarExpr(second, int_type(), loc),
+					AssignExpr(first, VarExpr(first, int_type(), loc), VoidType, loc),
+				),
+			),
+		),
+	)
+	references = value_references(expr)
+
+	(
+		references.names == ["first", "second", "unresolved"]
+		and references.resolved_reads == [second, first]
+		and references.resolved_invalidations == [first]
+		and references.resolved_occurrences == [first, second, first, second, first, first]
+		and resolved_value_occurrences(expr) == references.resolved_occurrences
+	)
+
+
+-- IfExpr uses the canonical multi-child fallback rather than the binding
+-- fast path. Its three siblings must keep condition, then, else order.
+func test_value_references_preserve_generic_sibling_order() -> Bool:
+	condition: CoreVar = named_var("condition", Some(72))
+	then_value: CoreVar = named_var("then_value", Some(73))
+	else_value: CoreVar = named_var("else_value", Some(74))
+	loc = synthetic_core_source_loc()
+	expr: CoreExpr = IfExpr(
+		VarExpr(condition, int_type(), loc),
+		SeqExpr(
+			VarExpr(then_value, int_type(), loc),
+			VarExpr(condition, int_type(), loc),
+		),
+		VarExpr(else_value, int_type(), loc),
+		int_type(),
+		loc,
+	)
+	references = value_references(expr)
+	no_invalidations: List[CoreVar] = []
+
+	(
+		references.names == ["condition", "then_value", "else_value"]
+		and references.resolved_reads == [condition, then_value, else_value]
+		and references.resolved_invalidations == no_invalidations
+		and references.resolved_occurrences == [
+			condition,
+			then_value,
+			condition,
+			else_value,
+		]
+	)
+
+
+-- Pruning retains both task and expression dependencies; value references
+-- separately assert the exact RHS, body, then timeout traversal order.
+func test_concurrent_tasks_are_retained_and_values_keep_order() -> Bool:
+	first_rhs: CoreVar = named_var("first_rhs", Some(75))
+	second_rhs: CoreVar = named_var("second_rhs", Some(76))
+	body_value: CoreVar = named_var("body_value", Some(77))
+	timeout_value: CoreVar = named_var("timeout_value", Some(78))
+	loc = synthetic_core_source_loc()
+	first_task: CoreTaskClosure = {
+		function_name = "first_task",
+		def_id = 2,
+		c_name = "first_task__def_2",
+		static_name = "first_task__task_2",
+		captures = [],
+		return_type = int_type()
+	}
+	second_task: CoreTaskClosure = {
+		function_name = "second_task",
+		def_id = 4,
+		c_name = "second_task__def_4",
+		static_name = "second_task__task_4",
+		captures = [],
+		return_type = int_type()
+	}
+	expr: CoreExpr = ConcurrentExpr(
+		{
+			bindings = [
+				{
+					variable = named_var("first_result", Some(79)),
+					typ = int_type(),
+					rhs = SeqExpr(VarExpr(first_rhs, int_type(), loc), user_call("first_rhs_helper", Some(3))),
+					task = first_task
+				},
+				{
+					variable = named_var("second_result", Some(80)),
+					typ = int_type(),
+					rhs = SeqExpr(VarExpr(second_rhs, int_type(), loc), user_call("second_rhs_helper", Some(5))),
+					task = second_task
+				},
+			],
+			body = SeqExpr(VarExpr(body_value, int_type(), loc), user_call("body_helper", Some(6))),
+			timeout = Some(SeqExpr(
+				VarExpr(timeout_value, int_type(), loc),
+				user_call("timeout_helper", Some(7)),
+			)),
+			max_threads = None
+		},
+		int_type(),
+		loc,
+	)
+	references = value_references(expr)
+	no_invalidations: List[CoreVar] = []
+	pruned = prune_program(program([
+		function_decl("main", 1, expr),
+		function_decl("first_task", 2, int_literal(2)),
+		function_decl("first_rhs_helper", 3, int_literal(3)),
+		function_decl("second_task", 4, int_literal(4)),
+		function_decl("second_rhs_helper", 5, int_literal(5)),
+		function_decl("body_helper", 6, int_literal(6)),
+		function_decl("timeout_helper", 7, int_literal(7)),
+		function_decl("dead", 8, int_literal(8)),
+	]))
+
+	(
+		function_names(pruned) == [
+			"main",
+			"first_task",
+			"first_rhs_helper",
+			"second_task",
+			"second_rhs_helper",
+			"body_helper",
+			"timeout_helper",
+		]
+		and references.names == ["first_rhs", "second_rhs", "body_value", "timeout_value"]
+		and references.resolved_reads == [first_rhs, second_rhs, body_value, timeout_value]
+		and references.resolved_invalidations == no_invalidations
+		and references.resolved_occurrences == [
+			first_rhs,
+			second_rhs,
+			body_value,
+			timeout_value,
+		]
+	)
+
+
+func test_nested_match_cases_and_fallbacks_keep_dependency_order() -> Bool:
+	outer_subject: CoreVar = named_var("outer_subject", Some(81))
+	inner_subject: CoreVar = named_var("inner_subject", Some(82))
+	inner_case: CoreVar = named_var("inner_case", Some(83))
+	inner_fallback: CoreVar = named_var("inner_fallback", Some(84))
+	outer_second: CoreVar = named_var("outer_second", Some(85))
+	outer_fallback: CoreVar = named_var("outer_fallback", Some(86))
+	loc = synthetic_core_source_loc()
+	inner: CoreExpr = LiteralMatchExpr(
+		VarExpr(inner_subject, int_type(), loc),
+		[{
+			literal = IntLiteral(1),
+			bindings = [],
+			body = SeqExpr(VarExpr(inner_case, int_type(), loc), user_call("inner_case_helper", Some(2)))
+		}],
+		LiteralMatchFallbackBody(SeqExpr(
+			VarExpr(inner_fallback, int_type(), loc),
+			user_call("inner_fallback_helper", Some(3)),
+		)),
+		int_type(),
+		loc,
+	)
+	expr: CoreExpr = LiteralMatchExpr(
+		VarExpr(outer_subject, int_type(), loc),
+		[
+			{ literal = IntLiteral(1), bindings = [], body = inner },
+			{
+				literal = IntLiteral(2),
+				bindings = [],
+				body = SeqExpr(
+					VarExpr(outer_second, int_type(), loc),
+					user_call("outer_second_helper", Some(4)),
+				)
+			},
+		],
+		LiteralMatchFallbackBody(SeqExpr(
+			VarExpr(outer_fallback, int_type(), loc),
+			user_call("outer_fallback_helper", Some(5)),
+		)),
+		int_type(),
+		loc,
+	)
+	references = value_references(expr)
+	no_invalidations: List[CoreVar] = []
+	pruned = prune_program(program([
+		function_decl("main", 1, expr),
+		function_decl("inner_case_helper", 2, int_literal(2)),
+		function_decl("inner_fallback_helper", 3, int_literal(3)),
+		function_decl("outer_second_helper", 4, int_literal(4)),
+		function_decl("outer_fallback_helper", 5, int_literal(5)),
+		function_decl("dead", 6, int_literal(6)),
+	]))
+	expected_reads: List[CoreVar] = [
+		outer_subject,
+		inner_subject,
+		inner_case,
+		inner_fallback,
+		outer_second,
+		outer_fallback,
+	]
+
+	(
+		function_names(pruned) == [
+			"main",
+			"inner_case_helper",
+			"inner_fallback_helper",
+			"outer_second_helper",
+			"outer_fallback_helper",
+		]
+		and references.names == [
+			"outer_subject",
+			"inner_subject",
+			"inner_case",
+			"inner_fallback",
+			"outer_second",
+			"outer_fallback",
+		]
+		and references.resolved_reads == expected_reads
+		and references.resolved_invalidations == no_invalidations
+		and references.resolved_occurrences == expected_reads
+	)
+
+
 func test_value_reference_occurrences_include_effect_nodes() -> Bool:
 	retained: CoreVar = named_var("retained_occurrence", Some(46))
 	assigned: CoreVar = named_var("assigned_occurrence", Some(47))
@@ -737,6 +970,23 @@ func test_duplicate_function_ids_are_kept_conservatively() -> Bool:
 	])
 
 	function_names(prune_program(input_program)) == ["main", "duplicate"]
+
+
+func test_duplicate_function_ids_collect_every_body_dependency() -> Bool:
+	input_program = program([
+		function_decl("main", 1, user_call("first_helper", Some(2))),
+		function_decl("duplicate", 1, user_call("second_helper", Some(3))),
+		function_decl("first_helper", 2, int_literal(2)),
+		function_decl("second_helper", 3, int_literal(3)),
+		function_decl("dead", 4, int_literal(4)),
+	])
+
+	function_names(prune_program(input_program)) == [
+		"main",
+		"duplicate",
+		"first_helper",
+		"second_helper",
+	]
 
 
 func test_prunes_types_and_retains_field_dependencies() -> Bool:
@@ -1060,6 +1310,22 @@ tests: TestSuite = {
 			test_value_references_preserve_resolved_occurrences,
 		),
 		(
+			"value references preserve first occurrence and effect order",
+			test_value_references_preserve_first_occurrence_and_effect_order,
+		),
+		(
+			"value references preserve generic sibling order",
+			test_value_references_preserve_generic_sibling_order,
+		),
+		(
+			"concurrent tasks retained and values keep order",
+			test_concurrent_tasks_are_retained_and_values_keep_order,
+		),
+		(
+			"nested match cases and fallbacks keep dependency order",
+			test_nested_match_cases_and_fallbacks_keep_dependency_order,
+		),
+		(
 			"value reference occurrences include effect nodes",
 			test_value_reference_occurrences_include_effect_nodes,
 		),
@@ -1087,6 +1353,10 @@ tests: TestSuite = {
 		(
 			"duplicate function ids are kept conservatively",
 			test_duplicate_function_ids_are_kept_conservatively,
+		),
+		(
+			"duplicate function ids collect every body dependency",
+			test_duplicate_function_ids_collect_every_body_dependency,
 		),
 		(
 			"prunes types and retains field dependencies",
