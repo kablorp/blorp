@@ -77,7 +77,12 @@ import:
 		module_view_accepted_alias_authority,
 		module_view_accepted_record_authority,
 		module_view_accepted_union_authority,
-	../../../src/compiler/stage_06_typecheck/state: typecheck_state_for_prepared_module_scope
+	../../../src/compiler/stage_06_typecheck/state:
+		typecheck_state_add_error,
+		typecheck_state_for_prepared_module_scope,
+		typecheck_state_for_prepared_module_scope_with_builtin_env,
+		typecheck_state_is_reserved_for_exact_scope,
+	../../../src/compiler/stage_06_typecheck/type_system/builtins: env_with_builtins
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_alias_authority:
 		accepted_alias_find_transparent,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority:
@@ -86,10 +91,14 @@ import:
 		accepted_union_find,
 		accepted_union_find_constructor,
 	../../../src/compiler/stage_06_typecheck/type_system/env:
+		ENV_EMPTY,
+		env_add_var,
 		env_get_alias,
 		env_get_constructor,
+		env_get_func_info,
 		env_get_record,
 		env_get_type_decl,
+		env_lookup,
 	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: TYPE_INT, types_equal
 	../../../src/lib/source: source_location_start_offset
 	../typecheck_test_support as TypecheckTestSupport
@@ -123,6 +132,82 @@ private pure func accept_empty_view(scope: PreparedModuleScope) -> BoundModuleVi
 		COMPILER_BOUND_MODULE_VISIBILITY_EMPTY,
 		[],
 	)
+
+
+private pure func shared_builtin_env_keeps_prepared_module_states_independent() -> Option[Bool]:
+	target_program = TypecheckTestSupport.finalized_typecheck_program_fixture(
+		"main.brp",
+		"main",
+		"value = 1",
+	)
+	dependency_program = TypecheckTestSupport.finalized_typecheck_program_fixture(
+		"dep.brp",
+		"dep",
+		"value = 2",
+	)
+	indexed ?= indexed_graph_build(
+		module_load_candidate(
+			resolved_module_identity_from_resolver("main", UserModule),
+			target_program,
+		),
+		[module_load_candidate(
+			resolved_module_identity_from_resolver("dep", UserModule),
+			dependency_program,
+		)],
+	).to_option()
+	target_scope = indexed_graph_target_scope(indexed)
+	dependency_scope ?= indexed_graph_find_dependency_scope(indexed, "dep")
+	builtin_env = env_with_builtins(ENV_EMPTY)
+	target_state = typecheck_state_for_prepared_module_scope_with_builtin_env(
+		target_scope,
+		False,
+		builtin_env,
+	)
+	dependency_state = typecheck_state_for_prepared_module_scope_with_builtin_env(
+		dependency_scope,
+		True,
+		builtin_env,
+	)
+	changed_target = typecheck_state_add_error(
+		{ target_state | env = env_add_var(target_state.env, "local_value", TYPE_INT) },
+		"local marker",
+	)
+	legacy_target = typecheck_state_for_prepared_module_scope(target_scope, False)
+	option_matches_legacy = match (
+		env_get_type_decl(target_state.env, "Option"),
+		env_get_type_decl(legacy_target.env, "Option"),
+	):
+		(Some((params, variants)), Some((legacy_params, legacy_variants))):
+			params == legacy_params and variants.length() == legacy_variants.length()
+		_:
+			False
+	print_matches_legacy = match (
+		env_get_func_info(target_state.env, "print"),
+		env_get_func_info(legacy_target.env, "print"),
+	):
+		(Some((print_type, _, print_purity)), Some((legacy_type, _, legacy_purity))):
+			types_equal(print_type, legacy_type) and print_purity == legacy_purity
+		_:
+			False
+
+	Some((
+		target_state.env.next_def_id == legacy_target.env.next_def_id
+		and option_matches_legacy
+		and print_matches_legacy
+		and typecheck_state_is_reserved_for_exact_scope(target_state, target_scope)
+		and typecheck_state_is_reserved_for_exact_scope(dependency_state, dependency_scope)
+		and not target_state.allow_debug_only_calls
+		and dependency_state.allow_debug_only_calls
+		and env_lookup(changed_target.env, "local_value").is_some()
+		and env_lookup(dependency_state.env, "local_value").is_none()
+		and env_lookup(builtin_env, "local_value").is_none()
+		and changed_target.errors.length() == 1
+		and dependency_state.errors.is_empty()
+	))
+
+
+pure func test_shared_builtin_env_keeps_prepared_module_states_independent() -> Bool:
+	shared_builtin_env_keeps_prepared_module_states_independent().get_or(False)
 
 
 private pure func callable_graph(source: String) -> Option[CallableHeaderGraph]:
@@ -1074,6 +1159,10 @@ pure func test_blocked_duplicate_sharing_cycle_name_keeps_baseline_classificatio
 tests: TestSuite = {
 	description = "Compiler global header completion",
 	tests = [
+		(
+			"shared builtin env keeps prepared module states independent",
+			test_shared_builtin_env_keeps_prepared_module_states_independent,
+		),
 		("orders forward dependencies", test_dependencies_order_forward_references),
 		(
 			"resolves selective import dependencies exactly",
