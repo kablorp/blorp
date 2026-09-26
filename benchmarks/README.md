@@ -2016,7 +2016,10 @@ Phase rows come first, in the order the frontend runs them: `indexed_graph`,
 `ctfe_dependencies`, `ctfe_globals`, `module_bodies`. Two of them are parents of
 rows printed before them: `graph_completion` contains `accepted_aliases`,
 `accepted_records`, `accepted_unions`, `accepted_globals`,
-`global_header_completion` and `accepted_graph`; `module_bodies` contains every
+`global_header_completion` and `accepted_graph`. `global_header_completion` in
+turn contains `prepare_products`, `prepare_bases`, `prepare_traits`,
+`prepare_trait_authority`, `prepare_callables`, `prepare_impls`, and
+`prepare_environments`, in that execution order. `module_bodies` contains every
 `BLORP_TYPECHECK_BODY` row. Do not add a parent and its children together.
 
 Body rows follow, sorted by elapsed time, one per checked body, then three

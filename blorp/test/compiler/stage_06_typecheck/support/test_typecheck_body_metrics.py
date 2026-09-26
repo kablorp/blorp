@@ -138,10 +138,31 @@ class TypecheckBodyMetricsTests(unittest.TestCase):
                 "type_headers",
                 "callable_headers",
                 "implementation_headers",
+                "prepare_products",
+                "prepare_bases",
+                "prepare_traits",
+                "prepare_trait_authority",
+                "prepare_callables",
+                "prepare_impls",
+                "prepare_environments",
                 "global_header_completion",
                 "module_bodies",
             ):
                 self.assertIn(expected, phases, "expected a row for every phase")
+            preparation_phases = [
+                "prepare_products",
+                "prepare_bases",
+                "prepare_traits",
+                "prepare_trait_authority",
+                "prepare_callables",
+                "prepare_impls",
+                "prepare_environments",
+            ]
+            self.assertEqual(
+                sorted(preparation_phases, key=phases.index),
+                preparation_phases,
+                "module preparation rows must preserve execution order",
+            )
             self.assertLess(
                 phases.index("bound_modules"),
                 phases.index("module_bodies"),

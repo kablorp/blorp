@@ -1520,6 +1520,25 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIn("base_positions_by_module_id", graph_preparation.group(0))
         self.assertNotIn("base_indices_by_module", graph_preparation.group(0))
 
+    def test_imported_header_sections_do_not_transition_the_session_scope(self) -> None:
+        decl_source = DECL.read_text(encoding="utf-8")
+        registration = re.search(
+            r"private pure func typecheck_register_import_modules_from\(.*?"
+            r"(?=\n\nprivate pure func)",
+            decl_source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(registration)
+        body = registration.group(0)
+
+        self.assertEqual(
+            body.count("typecheck_state_scope_to_imported_module("),
+            1,
+            "only the incompatible-scope diagnostic path should select an imported scope",
+        )
+        self.assertNotIn("typecheck_state_restore_module_scope(", body)
+        self.assertIn("typecheck_install_module_header_section(next, type_headers, section)", body)
+
     def test_direct_accepted_callable_resolution_preserves_exact_identity(self) -> None:
         authority_source = CALLABLE_AUTHORITY.read_text(encoding="utf-8")
         infer_source = INFER.read_text(encoding="utf-8")

@@ -503,7 +503,6 @@ import:
 		typecheck_state_module_path_matches,
 		typecheck_state_remember_top_level_name,
 		typecheck_state_reset_type_shape_memo,
-		typecheck_state_restore_module_scope,
 		typecheck_state_scope_to_imported_module,
 		typecheck_state_scope_to_program,
 		typecheck_state_type_home_matches,
@@ -4691,12 +4690,10 @@ private pure func typecheck_register_import_modules_from(
 	-- introduce a bare source name; aliases are created only for actual import
 	-- selective bindings in the module view. This lets a direct dependency expose a
 	-- record/union from one of its dependencies without leaking unrelated values.
-	-- The importer-dependent half of an import edge, inline: select the
-	-- imported module's definition scope, install its published header
-	-- section, and restore this module's scope. It stays inline so `next` is
-	-- handed to the installer at an assignment site and stays uniquely owned
-	-- across every edge; a helper here would borrow the session once per edge
-	-- and copy its dictionaries.
+	-- The section owns the imported module scope used to resolve its header
+	-- shapes. Keep the session in the importing module's scope: the installer
+	-- reads the section's scope directly, and changing the session twice per
+	-- edge only constructs and discards equivalent scope wrappers.
 	for module in compatible_modules:
 		section = module_header_product_table_section(
 			header_products,
@@ -4705,16 +4702,7 @@ private pure func typecheck_register_import_modules_from(
 			importable_module_path(module),
 			True,
 		)
-		target_scope = next.module_scope
-		error_count = next.errors.length()
-		next = typecheck_state_scope_to_imported_module(
-			next,
-			importable_module_prepared_scope(module),
-		)
-
-		if next.errors.length() == error_count:
-			next = typecheck_install_module_header_section(next, type_headers, section)
-			next = typecheck_state_restore_module_scope(next, target_scope)
+		next = typecheck_install_module_header_section(next, type_headers, section)
 
 	next
 
@@ -7616,6 +7604,7 @@ private pure func prepared_module_environments(
 	var implementation_records: List[AcceptedImplementationTableRecord] = []
 	var trait_implementation_owner_missing: Bool = False
 
+	products_mark = typecheck_phase_mark()
 	var header_products = module_header_product_table_empty(
 		indexed_graph_module_count(bound_module_graph_indexed_graph(bound_graph)),
 	)
@@ -7641,6 +7630,8 @@ private pure func prepared_module_environments(
 				True,
 			)
 
+	record_typecheck_phase("prepare_products", products_mark)
+	bases_mark = typecheck_phase_mark()
 	builtin_env = env_with_builtins(ENV_EMPTY)
 	for bound_module in modules:
 		base_state = prepared_module_environment_base_state(
@@ -7670,6 +7661,8 @@ private pure func prepared_module_environments(
 			trait_projection = None,
 		})
 
+	record_typecheck_phase("prepare_bases", bases_mark)
+	traits_mark = typecheck_phase_mark()
 	for header in trait_topology_graph_headers(
 		callable_header_graph_trait_topology(callable_headers),
 	):
@@ -7722,6 +7715,8 @@ private pure func prepared_module_environments(
 			None:
 				trait_implementation_owner_missing = True
 
+	record_typecheck_phase("prepare_traits", traits_mark)
+	trait_authority_mark = typecheck_phase_mark()
 	-- Callable and implementation header conversion can consult local and
 	-- imported traits through a trait-only projection, built once per module
 	-- here. Accepted traits never need a provisional Env publication, and
@@ -7776,6 +7771,8 @@ private pure func prepared_module_environments(
 
 		preliminary_base_index += 1
 
+	record_typecheck_phase("prepare_trait_authority", trait_authority_mark)
+	callables_mark = typecheck_phase_mark()
 	var active_module_index: Option[Int] = None
 	var active_rows: List[AcceptedCallableTableRecord] = []
 	for header in callable_header_graph_callables(callable_headers):
@@ -7871,6 +7868,8 @@ private pure func prepared_module_environments(
 			callables = callable_records,
 		})
 
+	record_typecheck_phase("prepare_callables", callables_mark)
+	impls_mark = typecheck_phase_mark()
 	for header in implementation_header_graph_headers(implementation_headers):
 		base_positions = base_positions_by_module_id
 
@@ -7917,6 +7916,8 @@ private pure func prepared_module_environments(
 	else:
 		accepted_trait_implementation_table(trait_implementation_input)
 
+	record_typecheck_phase("prepare_impls", impls_mark)
+	environments_mark = typecheck_phase_mark()
 	for base in bases:
 		var prepared_state = base.state
 
@@ -7998,6 +7999,7 @@ private pure func prepared_module_environments(
 				callable_errors = base.callable_errors,
 			})
 
+	record_typecheck_phase("prepare_environments", environments_mark)
 	{
 		environments = prepared,
 		environment_positions_by_module_id = prepared_environment_positions_by_module_id(
