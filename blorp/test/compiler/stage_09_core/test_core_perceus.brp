@@ -160,6 +160,8 @@ import:
 		insert_drops_expr,
 		insert_drops_program,
 		insert_drops_program_with_facts,
+	../../../src/compiler/stage_09_core/perceus/balance: freshen_shadowed_match_bindings
+	../../../src/compiler/stage_09_core/perceus/borrowed: normalize_lambda_result_aliases
 	../../../src/compiler/stage_09_core/resolve: resolve_global_value_refs
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
 		balance_short_circuit_operands,
@@ -170,6 +172,7 @@ import:
 		summarize_linear_call,
 		summarize_linear_ownership_uses,
 	../../../src/compiler/stage_09_core/perceus/env:
+		MatchShadowCatalog,
 		PerceusEnv,
 		PerceusGlobalLookup(CollidingPerceusGlobals),
 		borrow_contract_for_signature,
@@ -180,6 +183,10 @@ import:
 		lookup_direct_user_call_contract,
 		perceus_env_for_managed_types,
 		result_mode_for_type,
+	../../../src/compiler/stage_09_core/perceus/shadow_catalog:
+		build_match_shadow_catalog,
+		freshen_shadowed_match_bindings_if_catalog_admits,
+		match_shadow_catalog_admits,
 	../../../src/compiler/stage_09_core/perceus/index:
 		index_ownership_function,
 		ownership_index_child,
@@ -9717,6 +9724,398 @@ pure func test_mutable_constructor_match_result_retains_direct_return_branch() -
 	dup_count_for("xs", rewritten) == 1 and drop_count_for("xs", rewritten) == 1
 
 
+pure func constructor_case_binding_and_body_have_name(
+	expr: CoreExpr,
+	expected: String,
+) -> Bool:
+	match expr:
+		ConstructorMatchExpr(_, _, cases, _, _, _):
+			match cases.get(0):
+				Some(match_case):
+					match (match_case.bindings.get(0), match_case.body):
+						(Some(binding), ConstructorMatchBodyExpr(VarExpr(variable, _, _))):
+							binding.variable.name == expected and variable.name == expected
+						_:
+							False
+				None:
+					False
+		_:
+			False
+
+
+pure func constructor_fallback_binding_and_body_have_name(
+	expr: CoreExpr,
+	expected: String,
+) -> Bool:
+	match expr:
+		ConstructorMatchExpr(_, _, _, fallback, _, _):
+			match fallback:
+				ConstructorMatchFallbackBindings(bindings, VarExpr(variable, _, _)):
+					match bindings.get(0):
+						Some(binding):
+							binding.variable.name == expected and variable.name == expected
+						None:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_match_shadow_catalog_negative_gate_preserves_identity() -> Bool:
+	body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Other",
+				[match_binding("other", string_type())],
+				var_expr("other", string_type()),
+			)],
+		var_expr("fallback", string_type()),
+		string_type(),
+	)
+	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	rewritten: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
+		catalog,
+		named_var("value"),
+		body,
+	)
+
+	not match_shadow_catalog_admits(catalog, "value") and same_object(rewritten, body)
+
+
+pure func test_match_shadow_catalog_direct_case_admits_and_freshens() -> Bool:
+	body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Shadow",
+				[match_binding("value", string_type())],
+				var_expr("value", string_type()),
+			)],
+		var_expr("fallback", string_type()),
+		string_type(),
+	)
+	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	rewritten: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
+		catalog,
+		named_var("value"),
+		body,
+	)
+
+	(
+		match_shadow_catalog_admits(catalog, "value")
+		and constructor_case_binding_and_body_have_name(
+			rewritten,
+			"__perceus_shadow_value_0_0_0",
+		)
+	)
+
+
+pure func test_match_shadow_catalog_fallback_admits_and_freshens() -> Bool:
+	body: CoreExpr = constructor_match_expr_with_fallback(
+		[],
+		ConstructorMatchFallbackBindings(
+			[match_binding("value", string_type())],
+			var_expr("value", string_type()),
+		),
+		string_type(),
+	)
+	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	rewritten: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
+		catalog,
+		named_var("value"),
+		body,
+	)
+
+	(
+		match_shadow_catalog_admits(catalog, "value")
+		and constructor_fallback_binding_and_body_have_name(
+			rewritten,
+			"__perceus_shadow_value_0_0_0",
+		)
+	)
+
+
+pure func test_match_shadow_catalog_finds_nested_constructor_match() -> Bool:
+	nested: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Shadow",
+				[match_binding("nested", string_type())],
+				var_expr("nested", string_type()),
+			)],
+		var_expr("fallback", string_type()),
+		string_type(),
+	)
+	body: CoreExpr = IfExpr(
+		bool_expr(True),
+		nested,
+		var_expr("fallback", string_type()),
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+
+	match_shadow_catalog_admits(catalog, "nested")
+
+
+--- Constructor literal/length bodies are uncommon child containers. The
+--- catalog deliberately walks through them even though the authoritative
+--- freshener treats their contents as an opaque compatibility shape today.
+--- Admission is therefore conservative and cannot create a false negative if
+--- that compatibility boundary is removed later.
+pure func test_match_shadow_catalog_finds_nested_match_in_literal_body() -> Bool:
+	nested: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Nested",
+				[match_binding("literal_nested", string_type())],
+				var_expr("literal_nested", string_type()),
+			)],
+		var_expr("nested_fallback", string_type()),
+		string_type(),
+	)
+	literal_body: CoreConstructorMatchBody = constructor_literal_body(
+		[literal_case(IntLiteral(0), [], nested)],
+		LiteralMatchFallbackBody(var_expr("literal_fallback", string_type())),
+		string_type(),
+	)
+	body: CoreExpr = constructor_match_expr(
+		[constructor_case_body("Outer", [], literal_body)],
+		var_expr("outer_fallback", string_type()),
+		string_type(),
+	)
+	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+
+	match_shadow_catalog_admits(catalog, "literal_nested")
+
+
+pure func shadow_catalog_oracle_program(expr: CoreExpr) -> CoreProgram:
+	{
+		decls = [function_decl(
+			"shadow_catalog_oracle",
+			9899,
+			[],
+			list_int_type(),
+			expr,
+		)],
+		foreign_includes = [],
+		source_files = [],
+	}
+
+
+--- Test-only subset oracle for the safety-critical catalog invariant. Every
+--- constructor-match binding name visible after insertion must already have
+--- been admitted by the catalog built from the normalized pre-insertion tree.
+pure func match_shadow_catalog_covers(
+	pre_insertion: MatchShadowCatalog,
+	post_insertion: MatchShadowCatalog,
+) -> Bool:
+	var covers: Bool = True
+
+	for name in post_insertion.names.keys():
+		if not match_shadow_catalog_admits(pre_insertion, name):
+			covers = False
+			break
+		else:
+			void
+
+	covers
+
+
+pure func test_match_shadow_catalog_coverage_rejects_new_post_name() -> Bool:
+	pre_insertion: MatchShadowCatalog = build_match_shadow_catalog(
+		constructor_match_expr(
+			[constructor_case(
+					"Before",
+					[match_binding("known", string_type())],
+					var_expr("known", string_type()),
+				)],
+			var_expr("fallback", string_type()),
+			string_type(),
+		),
+	)
+	post_insertion: MatchShadowCatalog = build_match_shadow_catalog(
+		constructor_match_expr(
+			[constructor_case(
+					"After",
+					[match_binding("introduced", string_type())],
+					var_expr("introduced", string_type()),
+				)],
+			var_expr("fallback", string_type()),
+			string_type(),
+		),
+	)
+
+	not match_shadow_catalog_covers(pre_insertion, post_insertion)
+
+
+--- Differential integration oracle for the production sequencing:
+---
+--- 1. normalize the exact outer managed-let shape;
+--- 2. build the catalog before insertion, as `insert_drops_expr` does;
+--- 3. obtain a rewritten body from the real insertion entry point; and
+--- 4. prove its post-insertion binding-name catalog is a subset of the
+---    pre-insertion catalog; and
+--- 5. require catalog-gated freshening to serialize exactly like the old,
+---    authoritative freshener on that same transformed body.
+---
+--- The inner managed let is used twice so insertion must add ownership work;
+--- the final identity checks prove both fresheners took the admitted rewrite
+--- path rather than making structural equality vacuous.
+func test_match_shadow_catalog_gate_matches_freshener_after_real_insertion() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	target: CoreVar = {
+		name = "value",
+		id = 0,
+		def_id = Some(9890)
+	}
+	inner: CoreVar = {
+		name = "inner",
+		id = 0,
+		def_id = Some(9891)
+	}
+	shadow_match: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Shadow",
+				[match_binding("value", list_int_type())],
+				SeqExpr(
+					var_expr("value", list_int_type()),
+					var_expr_with_id("inner", 9891, list_int_type()),
+				),
+			)],
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		list_int_type(),
+	)
+	original_body: CoreExpr = LetExpr(
+		inner,
+		False,
+		list_int_type(),
+		var_expr("inner_source", list_int_type()),
+		SeqExpr(
+			user_call_expr(
+				"consume_inner",
+				Some(9892),
+				[0],
+				[var_expr_with_id("inner", 9891, list_int_type())],
+				list_int_type(),
+			),
+			shadow_match,
+		),
+	)
+	outer: CoreExpr = LetExpr(
+		target,
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		original_body,
+	)
+	normalized: CoreExpr = normalize_lambda_result_aliases(env, outer)
+
+	match normalized:
+		LetExpr(normalized_target, _, _, _, normalized_body):
+			catalog: MatchShadowCatalog = build_match_shadow_catalog(normalized)
+			rewritten_body: CoreExpr = insert_drops_expr(env, normalized_body)
+			post_insertion_catalog: MatchShadowCatalog = build_match_shadow_catalog(
+				rewritten_body,
+			)
+			gated: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
+				catalog,
+				normalized_target,
+				rewritten_body,
+			)
+			authoritative: CoreExpr = freshen_shadowed_match_bindings(
+				normalized_target,
+				rewritten_body,
+			)
+			gated_json: String = core_program_to_json(
+				shadow_catalog_oracle_program(gated),
+			).to_string()
+			authoritative_json: String = core_program_to_json(
+				shadow_catalog_oracle_program(authoritative),
+			).to_string()
+			admitted: Bool = match_shadow_catalog_admits(catalog, "value")
+			pre_covers_post: Bool = match_shadow_catalog_covers(
+				catalog,
+				post_insertion_catalog,
+			)
+			inner_dups: Int = dup_count_for("inner", rewritten_body)
+			inner_drops: Int = drop_count_for("inner", rewritten_body)
+			gated_changed: Bool = not same_object(gated, rewritten_body)
+			authoritative_changed: Bool = not same_object(authoritative, rewritten_body)
+			serializations_match: Bool = gated_json == authoritative_json
+			valid: Bool = (
+				admitted
+				and pre_covers_post
+				and inner_dups > 0
+				and inner_drops > 0
+				and gated_changed
+				and authoritative_changed
+				and serializations_match
+			)
+
+			if not valid:
+				print_error(
+					"shadow catalog integration: admitted=${admitted} "
+					+ "pre_covers_post=${pre_covers_post} inner_dups=${inner_dups} "
+					+ "inner_drops=${inner_drops} gated_changed=${gated_changed} "
+					+ "authoritative_changed=${authoritative_changed} "
+					+ "serializations_match=${serializations_match}",
+				)
+			else:
+				void
+
+			valid
+		_:
+			False
+
+
+pure func test_match_shadow_catalogs_do_not_leak_across_bodies() -> Bool:
+	first_body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"First",
+				[match_binding("value", string_type())],
+				var_expr("value", string_type()),
+			)],
+		var_expr("fallback", string_type()),
+		string_type(),
+	)
+	second_body: CoreExpr = LetExpr(
+		named_var("value"),
+		False,
+		string_type(),
+		var_expr("source", string_type()),
+		constructor_match_expr(
+			[constructor_case(
+					"Second",
+					[match_binding("other", string_type())],
+					var_expr("other", string_type()),
+				)],
+			var_expr("value", string_type()),
+			string_type(),
+		),
+	)
+	first_catalog: MatchShadowCatalog = build_match_shadow_catalog(first_body)
+	second_catalog: MatchShadowCatalog = build_match_shadow_catalog(second_body)
+
+	(
+		match_shadow_catalog_admits(first_catalog, "value")
+		and not match_shadow_catalog_admits(first_catalog, "other")
+		and not match_shadow_catalog_admits(second_catalog, "value")
+		and match_shadow_catalog_admits(second_catalog, "other")
+	)
+
+
+--- Ordinary lexical binders are intentionally absent: only constructor-match
+--- case/fallback bindings are candidates for the specialized freshener.
+pure func test_match_shadow_catalog_ignores_non_match_lexical_binders() -> Bool:
+	body: CoreExpr = LetExpr(
+		named_var("lexical"),
+		False,
+		string_type(),
+		var_expr("source", string_type()),
+		var_expr("lexical", string_type()),
+	)
+	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+
+	not match_shadow_catalog_admits(catalog, "lexical")
+
+
 pure func test_shadowed_match_binding_freshens_before_outer_owner_balance() -> Bool:
 	outer_variable: CoreVar = {
 		name = "value",
@@ -18580,6 +18979,42 @@ tests: TestSuite = {
 		(
 			"mutable constructor match result retains direct return branch",
 			test_mutable_constructor_match_result_retains_direct_return_branch,
+		),
+		(
+			"match shadow catalog negative gate preserves identity",
+			test_match_shadow_catalog_negative_gate_preserves_identity,
+		),
+		(
+			"match shadow catalog direct case admits and freshens",
+			test_match_shadow_catalog_direct_case_admits_and_freshens,
+		),
+		(
+			"match shadow catalog fallback admits and freshens",
+			test_match_shadow_catalog_fallback_admits_and_freshens,
+		),
+		(
+			"match shadow catalog finds nested constructor match",
+			test_match_shadow_catalog_finds_nested_constructor_match,
+		),
+		(
+			"match shadow catalog finds nested match in literal body",
+			test_match_shadow_catalog_finds_nested_match_in_literal_body,
+		),
+		(
+			"match shadow catalog coverage rejects a new post-insertion name",
+			test_match_shadow_catalog_coverage_rejects_new_post_name,
+		),
+		(
+			"match shadow catalog gate matches freshener after real insertion",
+			test_match_shadow_catalog_gate_matches_freshener_after_real_insertion,
+		),
+		(
+			"match shadow catalogs do not leak across bodies",
+			test_match_shadow_catalogs_do_not_leak_across_bodies,
+		),
+		(
+			"match shadow catalog ignores non-match lexical binders",
+			test_match_shadow_catalog_ignores_non_match_lexical_binders,
 		),
 		(
 			"shadowed match binding freshens before outer owner balance",

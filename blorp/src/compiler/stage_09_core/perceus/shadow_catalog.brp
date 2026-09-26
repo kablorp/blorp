@@ -1,0 +1,126 @@
+-- A function/global-scoped negative index for constructor-match shadow names.
+--
+-- `freshen_shadowed_match_bindings` must recursively inspect a managed let's
+-- whole body when a constructor-match payload might reuse the let variable's
+-- source name. Most names are absent. Build that fact once at the exact body
+-- boundary entering drop insertion, then use a missing catalog entry to skip
+-- the identity-only traversal. Presence is deliberately conservative: lexical
+-- scope is not encoded here, so false positives still take the old path.
+import:
+	../ir:
+		CoreConstructorMatchFallback(
+			ConstructorMatchFallbackBindings,
+			ConstructorMatchFallbackBody,
+			ConstructorMatchFallbackFail,
+		),
+		CoreExpr(ConstructorMatchExpr),
+		CoreVar,
+	env: MatchShadowCatalog
+	balance: freshen_shadowed_match_bindings
+	work_counters:
+		perceus_work_match_shadow_catalogs_built,
+		perceus_work_match_shadow_empty_catalogs,
+		perceus_work_match_shadow_freshener_admissions,
+		perceus_work_match_shadow_freshener_skips,
+		perceus_work_match_shadow_managed_let_lookups,
+		perceus_work_match_shadow_unique_names,
+	../traverse as CoreTraverse
+
+
+---
+Collect only the binding family that the freshener can rename: direct case
+bindings and direct fallback bindings of `ConstructorMatchExpr`. The generic
+child traversal still finds nested constructor matches, including matches
+inside constructor-body literal/length result expressions.
+
+The dictionary and worklist have one local owner for the whole build. Nothing
+threads a growing builder record through recursion, and the immutable catalog
+is published only after the walk is complete.
+---
+pure func build_match_shadow_catalog(body: CoreExpr) -> MatchShadowCatalog:
+	debug:
+		perceus_work_match_shadow_catalogs_built()
+
+	var names: Dict[String, Bool] = {}
+	var pending: List[CoreExpr] = [body]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(current):
+				match current:
+					ConstructorMatchExpr(_, _, cases, fallback, _, _):
+						for match_case in cases:
+							for binding in match_case.bindings:
+								name: String = binding.variable.name
+
+								if not names.contains(name):
+									names = names.set(name, True)
+
+									debug:
+										perceus_work_match_shadow_unique_names()
+								else:
+									void
+
+						match fallback:
+							ConstructorMatchFallbackBindings(bindings, _):
+								for binding in bindings:
+									name: String = binding.variable.name
+
+									if not names.contains(name):
+										names = names.set(name, True)
+
+										debug:
+											perceus_work_match_shadow_unique_names()
+									else:
+										void
+							ConstructorMatchFallbackBody(_):
+								void
+							ConstructorMatchFallbackFail:
+								void
+					_:
+						void
+
+				for child in CoreTraverse.immediate_core_expr_children(current):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	if names.length() == 0:
+		debug:
+			perceus_work_match_shadow_empty_catalogs()
+	else:
+		void
+
+	{ names = names }
+
+
+pure func match_shadow_catalog_admits(catalog: MatchShadowCatalog, name: String) -> Bool:
+	catalog.names.contains(name)
+
+
+---
+A negative lookup is an exact identity proof. A positive lookup delegates to
+the unchanged freshener, which remains the authority for lexical scoping and
+the deterministic `__perceus_shadow_*` identities it creates.
+---
+pure func freshen_shadowed_match_bindings_if_catalog_admits(
+	catalog: MatchShadowCatalog,
+	target: CoreVar,
+	body: CoreExpr,
+) -> CoreExpr:
+	debug:
+		perceus_work_match_shadow_managed_let_lookups()
+
+	if match_shadow_catalog_admits(catalog, target.name):
+		debug:
+			perceus_work_match_shadow_freshener_admissions()
+
+		freshen_shadowed_match_bindings(target, body)
+	else:
+		debug:
+			perceus_work_match_shadow_freshener_skips()
+
+		body
