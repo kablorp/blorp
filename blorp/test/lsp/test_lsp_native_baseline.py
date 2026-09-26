@@ -539,19 +539,38 @@ class NativeLspBaselineTests(unittest.TestCase):
             uri = source_path.as_uri()
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(source_path.parent.as_uri(), expected_version)
-            self.assertEqual(client.open_document(uri, source.text), [])
-
-            hover = client.request(
-                "textDocument/hover",
-                {
-                    "textDocument": {"uri": uri},
-                    "position": {
-                        "line": source.markers["add_use"].line,
-                        "character": source.markers["add_use"].character,
-                    },
+            client.initialize(
+                source_path.parent.as_uri(),
+                expected_version,
+                capabilities={
+                    "textDocument": {
+                        "publishDiagnostics": {"versionSupport": True}
+                    }
                 },
             )
+            client.open_document_without_wait(uri, source.text)
+            # An unversioned empty publication can clear prior diagnostics
+            # before the version-1 analysis has populated the semantic index.
+            self.assertEqual(client.wait_for_versioned_diagnostics(uri, 1), [])
+
+            hover_params = {
+                "textDocument": {"uri": uri},
+                "position": {
+                    "line": source.markers["add_use"].line,
+                    "character": source.markers["add_use"].character,
+                },
+            }
+            # A failed analysis can also publish empty version-1 diagnostics.
+            # Verify semantic readiness directly, with a bounded wait.
+            deadline = time.monotonic() + RUNNER.DIAGNOSTIC_TIMEOUT_SECONDS
+            retry_interval_seconds = 0.05
+            hover = None
+            while hover is None and time.monotonic() < deadline:
+                hover = client.request("textDocument/hover", hover_params)
+                if hover is None:
+                    time.sleep(retry_interval_seconds)
+
+            self.assertIsNotNone(hover, "hover remained unavailable after analysis")
 
             self.assertEqual(
                 hover.get("contents"),
