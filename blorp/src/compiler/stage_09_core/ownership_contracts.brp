@@ -3,9 +3,10 @@
 -- fixpoint (solve_user_call_contracts), and annotates each call site with its
 -- resolved contract (infer_user_call_contracts, annotate_ownership_contracts_program).
 --
--- Runs once per program, immediately before `perceus` in the late-Core pass
--- list (see `pipeline.run_ownership_contracts_pass`), and publishes
--- `OwnershipContractFacts` on `CorePassState` for `perceus` to consume. This
+-- In the standalone control pass list this runs immediately before `perceus`
+-- (see `pipeline.run_ownership_contracts_pass`), and publishes
+-- `OwnershipContractFacts` on `CorePassState` for `perceus` to consume. The
+-- normal production pass fuses the call-site annotation into Perceus. This
 -- module owns the whole-program orchestration that used to live at the top of
 -- `insert_drops_program`: resolving global value refs, building the base
 -- `PerceusEnv`, solving the contract graph, and annotating every `UserCall`
@@ -367,6 +368,20 @@ private pure func merge_consumed_args(left: List[Int], right: List[Int]) -> List
 			void
 
 	merged
+
+
+private pure func same_consumed_arg_indices(left: List[Int], right: List[Int]) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var index: Int = 0
+		var same: Bool = True
+
+		while same and index < left.length():
+			same = left.get(index) == right.get(index)
+			index += 1
+
+		same
 
 
 private pure func contract_parameter_index(
@@ -3348,6 +3363,35 @@ private pure func inferred_user_call_consumed_args(
 					fallback
 
 
+---
+Resolve the serialized call kind from the already-solved ownership facts.
+Perceus uses this at its call rewrite boundary in the fused production pass;
+the standalone ownership pass uses the same function through its tree walk.
+---
+pure func resolved_user_call_kind(
+	env: PerceusEnv,
+	kind: CoreCallKind,
+	arg_count: Int,
+	return_type: CoreType,
+) -> CoreCallKind:
+	match kind:
+		UserCall(name, def_id, consumed_args):
+			resolved: List[Int] = inferred_user_call_consumed_args(
+				env,
+				name,
+				def_id,
+				arg_count,
+				return_type,
+				consumed_args,
+			)
+			if same_consumed_arg_indices(consumed_args, resolved):
+				kind
+			else:
+				UserCall(name, def_id, resolved)
+		_:
+			kind
+
+
 pure func annotate_user_call_contracts(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	rewritten: CoreExpr = match expr:
 		LogicalExpr(_, _, _, _, _):
@@ -3362,18 +3406,7 @@ pure func annotate_user_call_contracts(env: PerceusEnv, expr: CoreExpr) -> CoreE
 	match rewritten:
 		CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
 			CallExpr(
-				UserCall(
-					name,
-					def_id,
-					inferred_user_call_consumed_args(
-						env,
-						name,
-						def_id,
-						args.length(),
-						typ,
-						consumed_args,
-					),
-				),
+				resolved_user_call_kind(env, UserCall(name, def_id, consumed_args), args.length(), typ),
 				callee,
 				args,
 				typ,
@@ -3444,13 +3477,9 @@ private pure func annotate_ownership_contracts_decl(env: PerceusEnv, decl: CoreD
 
 ---
 Rewrites every `UserCall` site in `program` to carry its resolved
-consumed-argument list, using `facts.env`. Runs once per program immediately
-after `infer_ownership_contracts` (see `pipeline.run_ownership_contracts_pass`);
-`perceus`'s own per-declaration rewrite reads the already-annotated call sites
-instead of annotating them itself, since annotation only consults
-`facts.env` (the callable index, the solved contract table, and the
-constructor-contract tables `build_env` already filled in) rather than any
-Perceus-internal walking state.
+consumed-argument list, using `facts.env`. The standalone control path uses
+this full-tree rewrite before Perceus; the fused production path calls
+`resolved_user_call_kind` at each Perceus call rewrite instead.
 ---
 pure func annotate_ownership_contracts_program(
 	facts: OwnershipContractFacts,

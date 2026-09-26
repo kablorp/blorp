@@ -1597,7 +1597,7 @@ expect_output_contains "compile time phases reports the tuple SROA pass row" 0 \
 	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
 		-o "$timed_phase_c" "$valid_prog"
 expect_output_contains "compile time phases reports one row per late Core pass" 0 \
-	$'  perceus\t' \
+	$'  ownership_perceus_fused\t' \
 	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
 		-o "$timed_phase_c" "$valid_prog"
 expect_output_contains "compile time phases reports the first late Core pass row" 0 \
@@ -1638,9 +1638,28 @@ expect_output_contains "compiler memory checkpoints name every early Core pass" 
 	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
 		--no-embed-runtime -o "$timed_memory_c" "$valid_prog"
 expect_output_contains "compiler memory checkpoints name every late Core pass" 0 \
-	"phase=pass_perceus_complete" \
+	"phase=pass_ownership_perceus_fused_complete" \
 	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
 		--no-embed-runtime -o "$timed_memory_c" "$valid_prog"
+perceus_control_dump="$TMPDIR_CLI/perceus-control.dump"
+TOTAL=$((TOTAL + 1))
+run_capture "" env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile \
+	--no-format --no-embed-runtime --time-phases \
+	--dump-core-after=perceus --dump-core-file="$perceus_control_dump" \
+	--stop-after=perceus "$valid_prog"
+if [ "$RUN_CODE" -eq 0 ] \
+	&& grep -qF $'  perceus\t' <<<"$RUN_OUTPUT" \
+	&& grep -qF "phase=pass_perceus_complete" <<<"$RUN_OUTPUT" \
+	&& ! grep -qF "phase=pass_ownership_perceus_fused_complete" <<<"$RUN_OUTPUT" \
+	&& [ -f "$perceus_control_dump" ] \
+	&& grep -qF "===== after perceus =====" "$perceus_control_dump" \
+	&& grep -qF '"kind":"program"' "$perceus_control_dump"; then
+	record_pass "Perceus checkpoint retains standalone timing, memory, and Core dump"
+else
+	record_fail "Perceus checkpoint retains standalone timing, memory, and Core dump" \
+		"missing standalone Perceus evidence or invalid $perceus_control_dump
+$RUN_OUTPUT"
+fi
 expect_memory_checkpoint_labels "compiler memory checkpoints report typed frontend failure" \
 	1 \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_failed" \

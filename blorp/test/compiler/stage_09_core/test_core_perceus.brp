@@ -136,6 +136,7 @@ import:
 		CoreUnionVariant,
 		CoreVar,
 		core_node_id_raw,
+		core_program_to_json,
 		core_program_max_declared_definition_id,
 		core_source_loc_is_synthetic,
 		core_source_loc_row_unresolved,
@@ -152,9 +153,14 @@ import:
 			ReturnPrimitive,
 			ReturnVoid,
 		),
+	../../../src/compiler/stage_09_core/ownership_contracts:
+		annotate_ownership_contracts_program,
+		infer_ownership_contracts,
 	../../../src/compiler/stage_09_core/perceus:
 		insert_drops_expr,
 		insert_drops_program,
+		insert_drops_program_with_facts,
+	../../../src/compiler/stage_09_core/resolve: resolve_global_value_refs
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
 		balance_short_circuit_operands,
 		consumed_parameter_balancing_is_identity,
@@ -171,6 +177,7 @@ import:
 		contract_for_call,
 		is_managed_type,
 		lookup_constructor_call_contract,
+		lookup_direct_user_call_contract,
 		perceus_env_for_managed_types,
 		result_mode_for_type,
 	../../../src/compiler/stage_09_core/perceus/index:
@@ -15855,6 +15862,124 @@ pure func test_bodyless_user_call_preserves_explicit_consumption() -> Bool:
 			False
 
 
+pure func test_preannotated_and_deferred_contracts_have_identical_perceus_core() -> Bool:
+	value_type: CoreType = string_type()
+	owned_type: CoreType = list_int_type()
+	constructor_program: CoreProgram = decl_env_program()
+	inferred: CoreDecl = function_decl(
+		"fusion_inferred",
+		8040,
+		[core_param("left", owned_type), core_param("right", owned_type)],
+		owned_type,
+		intrinsic_expr("list_ensure_unique", [var_expr("right", owned_type)], owned_type),
+	)
+	direct_wrapper: CoreDecl = FunctionDecl({
+		name = "fusion_direct_wrapper",
+		source_module = None,
+		type_params = [],
+		params = [core_param("left", value_type), core_param("right", value_type)],
+		return_type = value_type,
+		body = Some(call_expr(
+			"blorp_string_concat_consume",
+			[var_expr("left", value_type), var_expr("right", value_type)],
+			value_type,
+		)),
+		is_pure = True,
+		function_kind = ClosureBodyFunction({
+			c_name = "fusion_direct_wrapper_c",
+			params = [],
+			captures = [],
+			moved_captures = [],
+			task_abi = False,
+		}),
+		def_id = 8041,
+		loc = synthetic_core_source_loc(),
+	})
+	fixed_only: CoreDecl = FunctionDecl({
+		name = "fusion_fixed_borrow",
+		source_module = None,
+		type_params = [],
+		params = [core_param("item", owned_type)],
+		return_type = owned_type,
+		body = Some(var_expr("item", owned_type)),
+		is_pure = True,
+		function_kind = ClosureBodyFunction({
+			c_name = "fusion_fixed_borrow_c",
+			params = [],
+			captures = [],
+			moved_captures = [],
+			task_abi = False,
+		}),
+		def_id = 8044,
+		loc = synthetic_core_source_loc(),
+	})
+	explicit: CoreDecl = FunctionDecl({
+		name = "fusion_explicit",
+		source_module = None,
+		type_params = [],
+		params = [core_param("item", owned_type)],
+		return_type = owned_type,
+		body = None,
+		is_pure = True,
+		function_kind = UserFunction,
+		def_id = 8042,
+		loc = synthetic_core_source_loc(),
+	})
+	caller: CoreDecl = function_decl(
+		"fusion_caller",
+		8043,
+		[
+			core_param("left", owned_type),
+			core_param("right", owned_type),
+			core_param("a", value_type),
+			core_param("b", value_type),
+		],
+		owned_type,
+		SeqExpr(
+			user_call_expr("Node", Some(42), [], [var_expr("a", value_type), var_expr("b", value_type)], UnionType("Tree")),
+			SeqExpr(
+				user_call_expr("fusion_direct_wrapper", Some(8041), [], [var_expr("a", value_type), var_expr("b", value_type)], value_type),
+				SeqExpr(
+					user_call_expr("fusion_fixed_borrow", Some(8044), [], [var_expr("left", owned_type)], owned_type),
+					SeqExpr(
+						user_call_expr("fusion_explicit", Some(8042), [0], [var_expr("left", owned_type)], owned_type),
+						SeqExpr(
+							user_call_expr("missing_fusion_identity", None, [0], [var_expr("left", owned_type)], owned_type),
+							user_call_expr("fusion_inferred", Some(8040), [0], [var_expr("left", owned_type), var_expr("right", owned_type)], owned_type),
+						),
+					),
+				),
+			),
+		),
+	)
+	program: CoreProgram = {
+		decls = constructor_program.decls.concat([inferred, direct_wrapper, fixed_only, explicit, caller]),
+		foreign_includes = [],
+		source_files = [],
+	}
+	resolved: CoreProgram = resolve_global_value_refs(program)
+	facts = infer_ownership_contracts(resolved)
+	annotated: CoreProgram = annotate_ownership_contracts_program(facts, resolved)
+	control: CoreProgram = insert_drops_program_with_facts(annotated, facts)
+	deferred: CoreProgram = insert_drops_program_with_facts(resolved, facts)
+	fixed_contract_is_borrowed: Bool = contract_is_none(
+		lookup_direct_user_call_contract(facts.env, "fusion_fixed_borrow", Some(8044), 1, owned_type),
+	) and contract_is(
+		contract_for_call(facts.env, UserCall("fusion_fixed_borrow", Some(8044), []), 1, owned_type),
+		[BorrowArg],
+		ReturnOwned,
+	)
+	call_arguments_rewritten: Bool = match function_body(control, "fusion_caller"):
+		Some(body):
+			dup_count_for("left", body) > 0 or dup_count_for("right", body) > 0
+		None:
+			False
+
+	fixed_contract_is_borrowed and call_arguments_rewritten and core_program_to_json(control).to_string() == core_program_to_json(
+		annotate_ownership_contracts_program(facts, deferred),
+	).to_string() and core_program_to_json(control).to_string() == core_program_to_json(deferred).to_string()
+
+
 pure func test_inferred_user_call_contract_is_used_for_union_return() -> Bool:
 	consume: CoreDecl = function_decl(
 		"consume_with_union_result",
@@ -19031,6 +19156,10 @@ tests: TestSuite = {
 		(
 			"bodyless user call preserves explicit consumption",
 			test_bodyless_user_call_preserves_explicit_consumption,
+		),
+		(
+			"preannotated and deferred contracts have identical Perceus Core",
+			test_preannotated_and_deferred_contracts_have_identical_perceus_core,
 		),
 		(
 			"inferred user-call contract is used for union return",

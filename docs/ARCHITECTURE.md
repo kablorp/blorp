@@ -293,8 +293,7 @@ lower + ffi_boundary + list_layout
   -> consume_specialize
   -> static_string_literals
   -> record-update ownership lowering + dictionary ownership preparation
-  -> ownership_contracts
-  -> perceus
+  -> ownership contracts + perceus (fused production pass)
   -> reuse
   -> closure
   -> resource
@@ -318,20 +317,24 @@ dictionary literals so every transferred entry is explicit. These operations
 are not emitter cleanup and must not be reordered or omitted from ownership
 analysis.
 
-Contract inference is its own Core pass, `ownership_contracts`
-(`stage_09_core/ownership_contracts.brp`), that runs immediately before
-Perceus: it resolves global value refs, builds the base `PerceusEnv`, builds
-and solves the reverse-parameter-flow graph over user calls
+The production `ownership_perceus_fused` Core pass resolves global value refs,
+builds the base `PerceusEnv`, and builds and solves the reverse-parameter-flow
+graph over user calls
 (`build_ownership_contract_graph`, `solve_user_call_contracts`,
-`infer_user_call_contracts`), and annotates every `UserCall` site with its
-resolved consumed-argument list (`annotate_ownership_contracts_program`). It
-publishes the result as `OwnershipContractFacts` on `CorePassState`.
+`infer_user_call_contracts`). Perceus then annotates each `UserCall` with its
+resolved consumed-argument list as it rewrites that call, using the solved
+`OwnershipContractFacts` on `CorePassState`. The standalone
+`ownership_contracts` and `perceus` passes remain the internal observer and
+differential-control path; the CLI `perceus` checkpoint selects that path.
+`ownership_contracts` is not a public CLI stage.
 
 Perceus (`stage_09_core/perceus.brp` and `stage_09_core/perceus/`) is split by
 responsibility, following the `stage_06_typecheck` subdirectory convention.
 `insert_drops_program_with_facts` reads `OwnershipContractFacts.env` from
 `CorePassState` rather than building the environment or solving the contract
-graph itself, so both run exactly once per program; `insert_drops_program`
+graph itself. The production fused pass builds and solves those facts once,
+while the standalone ownership pass also annotates the full call tree before
+Perceus for its observable pre-Perceus snapshot. `insert_drops_program`
 stays as a self-contained entry point (it runs `ownership_contracts`'s own
 steps first) for tests, the work profiler, and the benchmark backend bridge,
 none of which go through `CorePassState`. In pipeline order:
