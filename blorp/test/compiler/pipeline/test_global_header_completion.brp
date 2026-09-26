@@ -18,6 +18,7 @@ import:
 		completed_global_header_canonical_binding_type,
 		completed_global_header_global_dependencies,
 		completed_global_header_id,
+		completed_global_dependencies_in_completion_order,
 		recoverable_ctfe_artifact_typecheck_module,
 		recoverable_graph_typecheck_module,
 		recoverable_typecheck_graph_diagnostics,
@@ -43,6 +44,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		GlobalId,
 		declaration_skeleton_graph_build,
+		global_id_definition_id,
 		global_id_module_id,
 		global_id_name,
 		global_id_source_span,
@@ -536,6 +538,81 @@ private func acyclic_permutations_complete_identically() -> Option[Bool]:
 
 func test_acyclic_permutations_complete_identically() -> Bool:
 	acyclic_permutations_complete_identically().get_or(False)
+
+
+private func indexed_completed_dependencies_keep_completion_order() -> Option[Bool]:
+	graph ?= accepted_graph(
+		"first = 1\nunrelated = 0\nsecond = 2\ntarget = second + first",
+	)
+	definition_table = accepted_typecheck_graph_definition_table(graph)
+	completed = accepted_typecheck_graph_completed_globals(graph)
+	target ?= completed.find(func(header):
+		global_name(definition_table, completed_global_header_id(header)) == "target"
+	)
+	planned = completed_global_header_global_dependencies(target)
+	var index_by_definition_id: Dict[Int, Int] = {}
+	var position: Int = 0
+
+	for header in completed:
+		index_by_definition_id = index_by_definition_id.set(
+			global_id_definition_id(completed_global_header_id(header)),
+			position,
+		)
+		position += 1
+
+	ordered ?= completed_global_dependencies_in_completion_order(
+		planned,
+		completed,
+		index_by_definition_id,
+	)
+	with_repeats ?= completed_global_dependencies_in_completion_order(
+		planned.concat(planned),
+		completed,
+		index_by_definition_id,
+	)
+	-- This valid forward annotated reference has no completed row yet.
+	forward_graph ?= accepted_graph("early: Int = later + 1\nlater: Int = 41")
+	forward_definition_table = accepted_typecheck_graph_definition_table(forward_graph)
+	forward_headers = accepted_typecheck_graph_completed_globals(forward_graph)
+	early ?= forward_headers.find(func(header):
+		global_name(forward_definition_table, completed_global_header_id(header)) == "early"
+	)
+	forward_planned = completed_global_header_global_dependencies(early)
+	empty_completed: List[CompletedGlobalHeader] = []
+	empty_index: Dict[Int, Int] = {}
+	forward_dependency_skipped = completed_global_dependencies_in_completion_order(
+		forward_planned,
+		empty_completed,
+		empty_index,
+	).map(func(items): items.is_empty()).get_or(False)
+	-- A stale position for an indexed dependency must fail closed.
+	var stale_index: Dict[Int, Int] = {}
+	stale_index = stale_index.set(
+		global_id_definition_id(planned.get_or(0, completed_global_header_id(target))),
+		1,
+	)
+	stale_index_rejected = completed_global_dependencies_in_completion_order(
+		planned,
+		completed,
+		stale_index,
+	).is_none()
+
+	Some(
+		planned.map(func(id): global_name(definition_table, id)) == ["second", "first"]
+		and ordered.map(func(header):
+			global_name(definition_table, completed_global_header_id(header))
+		) == ["first", "second"]
+		and with_repeats.map(func(header):
+			global_name(definition_table, completed_global_header_id(header))
+		) == ["first", "second"]
+		and forward_planned.map(func(id): global_name(forward_definition_table, id)) == ["later"]
+		and forward_dependency_skipped
+		and stale_index_rejected,
+	)
+
+
+func test_indexed_completed_dependencies_keep_completion_order() -> Bool:
+	indexed_completed_dependencies_keep_completion_order().get_or(False)
 
 
 private pure func lambda_body_type_dependencies_order_headers() -> Option[Bool]:
@@ -1217,6 +1294,10 @@ tests: TestSuite = {
 		(
 			"checks each initializer once across body consumers",
 			test_accepted_graph_checks_each_initializer_once,
+		),
+		(
+			"indexed dependencies retain completion order and reject stale entries",
+			test_indexed_completed_dependencies_keep_completion_order,
 		),
 		(
 			"preserves annotated and inferred origins",

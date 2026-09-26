@@ -8138,6 +8138,59 @@ private pure func initializer_callable_dependencies_from_expr(
 			result
 
 
+-- The previous full completed-list filter returned dependencies in completion
+-- order, regardless of their first-reference order in the plan. An absent ID
+-- is a forward annotated dependency whose declared type is already available.
+-- Callers must pass the completed list and index from the same append-only
+-- builder: a missing key means not-yet-completed, while a present stale
+-- position violates that paired-builder invariant.
+pure func completed_global_dependencies_in_completion_order(
+	planned_dependencies: List[GlobalId],
+	completed: List[CompletedGlobalHeader],
+	completed_index_by_global_definition_id: Dict[Int, Int],
+) -> Option[List[CompletedGlobalHeader]]:
+	var positions: List[Int] = []
+	var valid: Bool = True
+
+	for dependency in planned_dependencies:
+		match completed_index_by_global_definition_id.get(global_id_definition_id(dependency)):
+			Some(position):
+				match completed.get(position):
+					Some(candidate):
+						if global_ids_equal(completed_global_header_id(candidate), dependency):
+							if not positions.contains(position):
+								positions = positions.append(position)
+						else:
+							valid = False
+					None:
+						valid = False
+			None:
+				void
+
+	if not valid:
+		None
+	else:
+		var ordered: List[CompletedGlobalHeader] = []
+		-- Most initializers have no completed global dependencies. Sorting
+		-- only matters when two or more positions must be reordered.
+		ordered_positions = if positions.length() > 1:
+			positions.sort()
+		else:
+			positions
+
+		for position in ordered_positions:
+			match completed.get(position):
+				Some(candidate):
+					ordered = ordered.append(candidate)
+				None:
+					valid = False
+
+		if valid:
+			Some(ordered)
+		else:
+			None
+
+
 private pure func complete_one_global_header(
 	implementation_headers: ImplementationHeaderGraph,
 	bound_graph: BoundModuleGraph,
@@ -8145,6 +8198,7 @@ private pure func complete_one_global_header(
 	prepared_environment_positions_by_module_id: List[Int],
 	planned_dependencies: List[GlobalId],
 	completed: List[CompletedGlobalHeader],
+	completed_index_by_global_definition_id: Dict[Int, Int],
 	header: GlobalHeader,
 	meta_session: MetaSessionId,
 ) -> Result[CompletedGlobalHeader, List[TypecheckDiagnostic]]:
@@ -8189,11 +8243,14 @@ private pure func complete_one_global_header(
 			)
 		Some(module_environment):
 			bound_module = module_environment.bound_module
-			completed_dependencies = completed.filter(func(candidate):
-				planned_dependencies.any(func(dependency):
-					global_ids_equal(dependency, completed_global_header_id(candidate))
-				)
-			)
+			completed_dependencies ?= completed_global_dependencies_in_completion_order(
+				planned_dependencies,
+				completed,
+				completed_index_by_global_definition_id,
+			).to_result([typecheck_diagnostic(
+				"internal typecheck error: completed global dependency index is inconsistent",
+				global_id_source_span(definition_table, id),
+			)])
 			state = initializer_check_state({
 				module_environment = module_environment,
 				definition_table = definition_table,
@@ -8460,6 +8517,7 @@ private pure func complete_planned_global_headers(
 					prepared_environment_positions_by_module_id,
 					planned_dependencies_by_header.get_or(header_index, []),
 					completed,
+					completed_index_by_global_definition_id,
 					header,
 					session,
 				)
