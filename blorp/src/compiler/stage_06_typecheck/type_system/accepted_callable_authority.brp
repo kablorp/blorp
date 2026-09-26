@@ -110,6 +110,7 @@ private record AcceptedCallableTableRep {
 	definition_table: DefinitionTable,
 	source_name_table: SourceNameTable,
 	slots: List[AcceptedCallableSlot],
+	owner_entries: List[OverloadEntry],
 	indices_by_definition_id: Dict[Int, List[Int]],
 	slot_range_by_module: List[AcceptedCallableModuleRange]
 }
@@ -234,6 +235,7 @@ pure func accepted_callable_table(
 	)
 	source_name_table = prepared_module_scope_source_name_table(input.scope)
 	var slots: List[AcceptedCallableSlot] = []
+	var owner_entries: List[OverloadEntry] = []
 	var indices_by_definition_id: Dict[Int, List[Int]] = {}
 	empty_range: AcceptedCallableModuleRange = {
 		start = 0,
@@ -309,32 +311,39 @@ pure func accepted_callable_table(
 			match (module_index, module_range):
 				(Some(owner_index), Some(range)):
 					index = slots.length()
+					slot: AcceptedCallableSlot = {
+						id = item.id,
+						source_name_id = item.source_name_id,
+						visibility = item.visibility,
+						entry = item.entry,
+					}
 
 					range_start = if range.count == 0:
 						index
 					else:
 						range.start
 
-					slots = slots.append({
-						id = item.id,
-						source_name_id = item.source_name_id,
-						visibility = item.visibility,
-						entry = item.entry,
-					})
-					indices_by_definition_id = indices_by_definition_id.set(
-						definition_id,
-						definition_indices.append(index),
-					)
-					slot_range_by_module = slot_range_by_module.set(
-						owner_index,
-						{
-							start = range_start,
-							count = range.count + 1
-						},
-					)
+					match owner_entry(module_table, definition_table, slot):
+						Some(local_entry):
+							-- Both payload columns append together after validation.
+							slots = slots.append(slot)
+							owner_entries = owner_entries.append(local_entry)
+							indices_by_definition_id = indices_by_definition_id.set(
+								definition_id,
+								definition_indices.append(index),
+							)
+							slot_range_by_module = slot_range_by_module.set(
+								owner_index,
+								{
+									start = range_start,
+									count = range.count + 1
+								},
+							)
 
-					previous_module_index = Some(owner_index)
-					previous_source_name_index = Some(source_name_index)
+							previous_module_index = Some(owner_index)
+							previous_source_name_index = Some(source_name_index)
+						None:
+							valid = False
 				_:
 					valid = False
 
@@ -344,6 +353,7 @@ pure func accepted_callable_table(
 					definition_table = definition_table,
 					source_name_table = source_name_table,
 					slots = slots,
+					owner_entries = owner_entries,
 					indices_by_definition_id = indices_by_definition_id,
 					slot_range_by_module = slot_range_by_module
 				}))
@@ -704,11 +714,12 @@ pure func accepted_callable_authority_without_visible_names(
 
 
 private pure func owner_entry(
-	table: AcceptedCallableTableRep,
+	module_table: ModuleTable,
+	definition_table: DefinitionTable,
 	slot: AcceptedCallableSlot,
 ) -> Option[OverloadEntry]:
-	owner_module_id ?= callable_id_module_id(table.definition_table, slot.id)
-	owner_module_path ?= module_table_canonical_path(table.module_table, owner_module_id)
+	owner_module_id ?= callable_id_module_id(definition_table, slot.id)
+	owner_module_path ?= module_table_canonical_path(module_table, owner_module_id)
 
 	Some({ slot.entry |
 			func_type = localize_module_types(owner_module_path, slot.entry.func_type),
@@ -739,7 +750,7 @@ private pure func entry_at(
 			False
 
 	if is_owner:
-		owner_entry(table, slot)
+		table.owner_entries.get(index)
 	else:
 		Some(slot.entry)
 
@@ -892,9 +903,7 @@ pure func accepted_callable_find_owner_definition_id(
 				None:
 					False
 		)
-	slot ?= table.slots.get(index)
-
-	owner_entry(table, slot)
+	table.owner_entries.get(index)
 
 
 pure func accepted_callable_find_qualified(
