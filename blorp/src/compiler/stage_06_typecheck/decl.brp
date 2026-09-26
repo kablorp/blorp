@@ -7316,7 +7316,6 @@ private record PreparedModuleCallableBase {
 	local_type_names: List[String],
 	callable_error_start: Int,
 	state: TypecheckState,
-	callables: List[AcceptedCallableTableRecord],
 	callable_errors: List[String],
 	-- The module's trait-only projection, built once from the preliminary
 	-- (implementation-free) trait table and consumed by implementation
@@ -7325,52 +7324,6 @@ private record PreparedModuleCallableBase {
 	-- reference to shared trait tables once the full authority is built.
 	trait_projection: Option[AcceptedTraitOnlyProjection]
 }
-
-
-private pure func prepare_accepted_module_callable(
-	base: PreparedModuleCallableBase,
-	type_headers: TypeHeaderGraph,
-	header: CallableHeader,
-) -> PreparedModuleCallableBase:
-	id = callable_header_id(header)
-	source_name = callable_header_name(header)
-	owner_scope = bound_module_scope(base.bound_module)
-	prepared = prepare_accepted_callable_header(
-		base.state,
-		type_headers,
-		owner_scope,
-		header,
-		LocalCallableHeaderRegistration(base.module_path),
-	)
-	source_name_id = source_name_table_find_id(
-		prepared_module_scope_source_name_table(owner_scope),
-		source_name,
-	)
-
-	match (prepared.entry, source_name_id):
-		(Some(entry), Some(name_id)):
-			{ base |
-				state = prepared.state,
-				callables = base.callables.append({
-					id = id,
-					source_name_id = name_id,
-					visibility = callable_header_visibility(header),
-					entry = canonical_callable_entry(
-						entry,
-						base.module_path,
-						base.local_type_names,
-					),
-				})
-			}
-		(Some(_), None):
-			{ base |
-				state = typecheck_state_add_error(
-					prepared.state,
-					"internal typecheck error: accepted callable source name '" + source_name + "' is absent from the graph name table",
-				)
-			}
-		_:
-			{ base | state = prepared.state }
 
 
 private pure func accepted_callable_authority_for_module(
@@ -7707,7 +7660,6 @@ private pure func prepared_module_environments(
 			),
 			callable_error_start = base_state.errors.length(),
 			state = base_state,
-			callables = [],
 			callable_errors = [],
 			trait_projection = None,
 		})
@@ -7818,6 +7770,8 @@ private pure func prepared_module_environments(
 
 		preliminary_base_index += 1
 
+	var active_module_index: Option[Int] = None
+	var active_rows: List[AcceptedCallableTableRecord] = []
 	for header in callable_header_graph_callables(callable_headers):
 		owner_index = match callable_id_module_id(definition_table, callable_header_id(header)):
 			Some(module_id):
@@ -7827,16 +7781,65 @@ private pure func prepared_module_environments(
 
 		match owner_index:
 			Some(index):
+				if active_module_index != Some(index):
+					-- The accepted header graph visits callables one module at a time.
+					-- Sort only the completed module so equal-name overloads
+					-- retain their header order in the accepted table.
+					for row in active_rows.sort_by(
+						func(item): source_name_id_table_index(item.source_name_id),
+					):
+						callable_records = callable_records.append(row)
+					active_rows = []
+					active_module_index = Some(index)
+
 				match bases.get(index):
 					Some(base):
-						bases = bases.set(
-							index,
-							prepare_accepted_module_callable(base, type_headers, header),
+						id = callable_header_id(header)
+						source_name = callable_header_name(header)
+						owner_scope = bound_module_scope(base.bound_module)
+						prepared_header = prepare_accepted_callable_header(
+							base.state,
+							type_headers,
+							owner_scope,
+							header,
+							LocalCallableHeaderRegistration(base.module_path),
 						)
+						source_name_id = source_name_table_find_id(
+							prepared_module_scope_source_name_table(owner_scope),
+							source_name,
+						)
+						var next_state = prepared_header.state
+
+						match (prepared_header.entry, source_name_id):
+							(Some(entry), Some(name_id)):
+								active_rows = active_rows.append({
+									id = id,
+									source_name_id = name_id,
+									visibility = callable_header_visibility(header),
+									entry = canonical_callable_entry(
+										entry,
+										base.module_path,
+										base.local_type_names,
+									),
+								})
+							(Some(_), None):
+								next_state = typecheck_state_add_error(
+									next_state,
+									"internal typecheck error: accepted callable source name '" + source_name + "' is absent from the graph name table",
+								)
+							_:
+								void
+
+						bases = bases.set(index, { base | state = next_state })
 					None:
 						callable_owner_missing = True
 			None:
 				callable_owner_missing = True
+
+	for row in active_rows.sort_by(
+		func(item): source_name_id_table_index(item.source_name_id),
+	):
+		callable_records = callable_records.append(row)
 
 	var base_index: Int = 0
 
@@ -7849,11 +7852,6 @@ private pure func prepared_module_environments(
 					)
 				}
 				bases = bases.set(base_index, base)
-				-- Stable name grouping lets the accepted table encode module
-				-- membership as searchable ranges without changing overload order.
-				callable_records = callable_records.concat(base.callables.sort_by(
-					func(item): source_name_id_table_index(item.source_name_id),
-				))
 			None:
 				callable_owner_missing = True
 
