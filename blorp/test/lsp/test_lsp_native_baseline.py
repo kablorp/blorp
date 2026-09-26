@@ -303,7 +303,15 @@ class NativeLspBaselineTests(unittest.TestCase):
             uri = source_path.as_uri()
 
             client = RUNNER.LspClient(str(BLORP), ROOT)
-            client.initialize(source_path.parent.as_uri(), expected_version)
+            client.initialize(
+                source_path.parent.as_uri(),
+                expected_version,
+                capabilities={
+                    "textDocument": {
+                        "publishDiagnostics": {"versionSupport": True}
+                    }
+                },
+            )
             definition_params = {
                 "textDocument": {"uri": uri},
                 "position": {
@@ -312,10 +320,10 @@ class NativeLspBaselineTests(unittest.TestCase):
                 },
             }
 
-            self.assertIsNone(
-                client.request("textDocument/definition", definition_params)
-            )
-            self.assertEqual(client.open_document(uri, source.text), [])
+            client.open_document_without_wait(uri, source.text)
+            # A background workspace publication need not be for the opened
+            # version, so it cannot establish readiness for definition queries.
+            self.assertEqual(client.wait_for_versioned_diagnostics(uri, 1), [])
 
             client.notify("textDocument/definition", definition_params)
 
@@ -334,11 +342,22 @@ class NativeLspBaselineTests(unittest.TestCase):
                 )
             )
 
-            locations = client.request(
-                "textDocument/definition",
-                definition_params,
-            )
+            # A failed analysis can publish empty versioned diagnostics without
+            # an index. Wait for the semantic result, with a bounded deadline.
+            deadline = time.monotonic() + RUNNER.DIAGNOSTIC_TIMEOUT_SECONDS
+            retry_interval_seconds = 0.05
+            locations = None
+            while locations is None and time.monotonic() < deadline:
+                locations = client.request(
+                    "textDocument/definition",
+                    definition_params,
+                )
+                if locations is None:
+                    time.sleep(retry_interval_seconds)
 
+            self.assertIsNotNone(
+                locations, "definition remained unavailable after analysis"
+            )
             self.assertEqual(len(locations), 1)
             self.assertEqual(locations[0].get("uri"), uri)
             definition_range = locations[0].get("range", {})
