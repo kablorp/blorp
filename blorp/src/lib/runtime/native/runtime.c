@@ -3245,7 +3245,7 @@ static void __blorp_init_signal_handlers(void) {
     signal(SIGPIPE, SIG_IGN);
 }
 // ============================================================================
-// Small-Object Pool — free-list allocator for objects <= 256 bytes
+// Small-Object Pool — fixed-capacity per-thread slabs for objects <= 1024 bytes
 // Bypasses malloc/free for hot allocation paths (Options, small strings, records).
 // Thread-local free lists, no locking. Overflow falls through to system allocator.
 //

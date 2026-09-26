@@ -439,39 +439,38 @@ change its meaning.
 compiler's C; DCE pass instructions (the R2 probe's victim) down; identical
 behavior on the record update and copy-on-write suites; leak gate green.
 
-## N4. Allocator pool coverage
+## N4. Allocator pool coverage (landed)
 
-**Context.** `blorp_alloc` (runtime.c, grep `void* blorp_alloc(size_t size)`)
-pops from a thread-local free list for four size classes (32, 64, 96, 128
-bytes) and otherwise calls `malloc`. In the Perceus sample, `blorp_alloc`
-plus libc allocation and free were 12% of the pass, and libc alone was
-larger than `blorp_alloc`'s own time, which says many objects miss the pool
-or the pool refills one object at a time.
+**Current contract.** `blorp_alloc` uses nine per-thread size classes: 32,
+64, 96, 128, 192, 256, 384, 512, and 1024 bytes. Each class mints 16 KiB
+slabs on demand, up to `BLORP_POOL_SLAB_LIMIT` slabs per class per thread
+(default 180,000, also configurable through the environment). Freed slots
+remain reusable in their slabs for the thread's lifetime; the class does
+not grow past the limit. A request above 1024 bytes, or one that reaches a
+full class at its slab limit, uses direct `malloc`/`free`. ASan builds bypass
+the pool. This is a **fixed-capacity pool**, not a depth-capped free list:
+`BLORP_POOL_MAX_DEPTH` was removed, and an idle slab is not returned to libc
+until thread/process teardown. See `runtime.c` at `BLORP_POOL_MAX_SIZE`,
+`BLORP_POOL_SLAB_SIZE`, `BLORP_POOL_SLAB_LIMIT`, and `blorp_alloc`.
 
-**Change.** Measure first: add a temporary histogram of requested sizes
-(and of pool hit versus miss) under `BLORP_COMPILER_MEMORY_PROFILE`, run the
-self-compile, and report it. Then extend coverage where the histogram says:
-more classes up to the size that covers 95% of requests, batch refills
-(allocate a slab of N objects per miss instead of one `malloc`), and a
-cheaper `blorp_pool_class` (a shift-and-table lookup rather than a loop, if
-it is a loop). Keep the ASan exclusion (`BLORP_ASAN` disables the pool).
+**History.** The original N4 proposal predated slab refills and the
+later fixed-capacity design. Six classes and slab refills landed in
+`f9f8ef8a2`; 384-, 512-, and 1024-byte classes landed in `1350f963`.
+`f79f8b5a` introduced a slab cap with idle-slab release; `dab2f490`
+removed that release path, keeping capacity fixed and resident while the
+thread lives. The first-round measurement table below records the original
+N4 result, not a benchmark of these later revisions.
 
-**Where to look.** `runtime.c` around lines 2203 to 2260 (`BLORP_POOL_*`,
-`blorp_pool_free`, `blorp_pool_count`, `blorp_free`), `BLORP_POOL_MAX_DEPTH`
-(the per-class cap, which decides how much memory the pool retains), and the
-memory statistics block that `BLORP_COMPILER_MEMORY_PROFILE=1` prints (the
-harness reads it, so keep its format).
-
-**Pitfalls.** The pool is thread-local; objects freed on a different thread
-than they were allocated on go to that thread's list, which is fine for
-correctness but means slabs must not assume same-thread free. Peak RSS is a
-tracked metric: a slab allocator that retains memory must not push peak RSS
-up by more than a few percent (report it). The leak checker counts live
-objects, not pool residency; verify the leak gate still reports zero.
-
-**Acceptance.** Histogram reported; pool hit rate above 95% on the
-self-compile; instructions down on both programs; peak RSS within +3%; leak
-and sanitizer gates green; the runtime unit tests green.
+**Further tuning.** Use `BLORP_COMPILER_MEMORY_PROFILE=1` to inspect the
+size histogram, per-class hits/misses, slab high-water marks, and overflow
+count before adding a class or raising the limit. Raising the limit cannot
+help a workload with zero overflow; it also enlarges each used class's
+per-thread slab-pointer registry. Larger classes can reduce backing
+`malloc`/`free` traffic but do not reduce the number of Blorp objects
+allocated. Compare retired instructions and peak RSS on the same frozen
+self-compile input, using a stage-2 compiler for runtime changes. Preserve
+cross-thread release behavior and verify the fixed-capacity, leak, and
+sanitizer tests.
 
 ## N5. Inline the cooperative checkpoint fast path
 
