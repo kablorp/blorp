@@ -29,7 +29,7 @@ union StaticStringLiteralPoolError:
 	UnpooledValueStringLiteral(String)
 
 
-private record StaticStringLiteralPoolState {
+record BackendStaticStringLiteralPool {
 	values_by_id: Dict[Int, String],
 	ids_by_value: Dict[String, Int],
 	max_id: Int,
@@ -37,7 +37,7 @@ private record StaticStringLiteralPoolState {
 }
 
 
-private EMPTY_STATIC_STRING_LITERAL_POOL_STATE: StaticStringLiteralPoolState = {
+private EMPTY_STATIC_STRING_LITERAL_POOL: BackendStaticStringLiteralPool = {
 	values_by_id = {},
 	ids_by_value = {},
 	max_id = -1,
@@ -175,33 +175,47 @@ than copying it. Branching around the record update, or returning `state`
 itself from any path, would hide the update from that rewrite and make every
 insert copy the whole pool.
 ---
-private pure func add_static_string_literal(
-	state: StaticStringLiteralPoolState,
+pure func backend_static_string_literal_pool_add(
+	pool: BackendStaticStringLiteralPool,
 	id: StaticStringLiteralId,
 	value: String,
-) -> StaticStringLiteralPoolState:
+) -> BackendStaticStringLiteralPool:
 	id_value: Int = static_string_literal_id_value(id)
 	step: StaticStringLiteralPoolStep = classify_static_string_literal(
-		state.values_by_id,
-		state.ids_by_value,
-		state.error,
+		pool.values_by_id,
+		pool.ids_by_value,
+		pool.error,
 		id_value,
 		value,
 	)
 
-	{ state |
-		values_by_id = next_values_by_id(state.values_by_id, step, id_value, value),
-		ids_by_value = next_ids_by_value(state.ids_by_value, step, id_value, value),
-		max_id = next_max_id(state.max_id, step, id_value),
-		error = next_pool_error(state.error, step)
+	{ pool |
+		values_by_id = next_values_by_id(pool.values_by_id, step, id_value, value),
+		ids_by_value = next_ids_by_value(pool.ids_by_value, step, id_value, value),
+		max_id = next_max_id(pool.max_id, step, id_value),
+		error = next_pool_error(pool.error, step)
 	}
 
 
+pure func empty_backend_static_string_literal_pool() -> BackendStaticStringLiteralPool:
+	EMPTY_STATIC_STRING_LITERAL_POOL
+
+
+pure func backend_static_string_literal_pool_reject_unpooled(
+	pool: BackendStaticStringLiteralPool,
+	value: String,
+) -> BackendStaticStringLiteralPool:
+	if pool.error.is_some():
+		pool
+	else:
+		{ pool | error = Some(UnpooledValueStringLiteral(value)) }
+
+
 private pure func collect_expr_static_string_literals(
-	state: StaticStringLiteralPoolState,
+	state: BackendStaticStringLiteralPool,
 	root: CoreExpr,
-) -> StaticStringLiteralPoolState:
-	var result: StaticStringLiteralPoolState = state
+) -> BackendStaticStringLiteralPool:
+	var result: BackendStaticStringLiteralPool = state
 	var pending: List[CoreExpr] = [root]
 	var cursor: Int = 0
 
@@ -210,7 +224,7 @@ private pure func collect_expr_static_string_literals(
 
 		match current:
 			StaticStringLiteralExpr(id, value, typ, loc):
-				result = add_static_string_literal(result, id, value)
+				result = backend_static_string_literal_pool_add(result, id, value)
 			LiteralExpr(StringLiteral(value), typ, loc):
 				result = { result | error = Some(UnpooledValueStringLiteral(value)) }
 			_:
@@ -225,9 +239,9 @@ private pure func collect_expr_static_string_literals(
 
 
 private pure func collect_function_static_string_literals(
-	state: StaticStringLiteralPoolState,
+	state: BackendStaticStringLiteralPool,
 	function_info: CoreFunction,
-) -> StaticStringLiteralPoolState:
+) -> BackendStaticStringLiteralPool:
 	match function_info.body:
 		Some(body):
 			collect_expr_static_string_literals(state, body)
@@ -236,16 +250,16 @@ private pure func collect_function_static_string_literals(
 
 
 private pure func collect_decl_static_string_literals(
-	state: StaticStringLiteralPoolState,
+	state: BackendStaticStringLiteralPool,
 	decl: CoreDecl,
-) -> StaticStringLiteralPoolState:
+) -> BackendStaticStringLiteralPool:
 	match decl:
 		FunctionDecl(function_info):
 			collect_function_static_string_literals(state, function_info)
 		GlobalDecl(global):
 			collect_expr_static_string_literals(state, global.init)
 		ImplDecl(impl):
-			var result: StaticStringLiteralPoolState = state
+			var result: BackendStaticStringLiteralPool = state
 
 			for method in impl.methods:
 				result = collect_function_static_string_literals(result, method)
@@ -256,7 +270,7 @@ private pure func collect_decl_static_string_literals(
 
 
 private pure func ordered_static_string_literals(
-	state: StaticStringLiteralPoolState,
+	state: BackendStaticStringLiteralPool,
 ) -> List[BackendStaticStringLiteral]:
 	var result: List[BackendStaticStringLiteral] = []
 	var id_value: Int = 0
@@ -276,10 +290,20 @@ private pure func ordered_static_string_literals(
 	result
 
 
+pure func finish_backend_static_string_literal_pool(
+	pool: BackendStaticStringLiteralPool,
+) -> Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError]:
+	match pool.error:
+		Some(error):
+			Err(error)
+		None:
+			Ok(ordered_static_string_literals(pool))
+
+
 pure func collect_backend_static_string_literals(
 	program: CoreProgram,
 ) -> Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError]:
-	var state: StaticStringLiteralPoolState = EMPTY_STATIC_STRING_LITERAL_POOL_STATE
+	var state: BackendStaticStringLiteralPool = EMPTY_STATIC_STRING_LITERAL_POOL
 
 	for decl in program.decls:
 		if state.error.is_none():

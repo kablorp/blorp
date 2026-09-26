@@ -10,6 +10,7 @@ import:
 			ClosureCall,
 			DeferredTraitCall,
 			DictWithCapacityCall,
+			ForeignCall,
 			ListToStringCall,
 			SelectedDirectCall,
 			SelectedTraitCall,
@@ -35,9 +36,11 @@ import:
 			DetachExpr,
 			DictConstructExpr,
 			ListConstructExpr,
+			LiteralExpr,
 			RecordConstructExpr,
 			SeqExpr,
 			SetAllocExpr,
+			StaticStringLiteralExpr,
 			TupleConstructExpr,
 			UnionConstructExpr,
 			VarExpr,
@@ -52,6 +55,7 @@ import:
 			UserFunction,
 		),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
+		CoreLiteral(StringLiteral),
 		CoreProgram,
 		CoreTaskClosure,
 		CoreTupleElement(
@@ -65,6 +69,7 @@ import:
 			TupleVoidElement,
 		),
 		CoreType(FunctionType),
+		core_expr_type,
 	../stage_09_core/late_invariants: check_definition_id_uniqueness, core_late_invariant_message
 	../stage_09_core/traverse as CoreTraverse
 	c_naming:
@@ -94,6 +99,14 @@ import:
 		canonical_empty_list_symbol_names,
 		canonical_empty_lists_add,
 		canonical_empty_lists_sorted,
+	static_string_literal_pool:
+		BackendStaticStringLiteral,
+		BackendStaticStringLiteralPool,
+		StaticStringLiteralPoolError,
+		backend_static_string_literal_pool_add,
+		backend_static_string_literal_pool_reject_unpooled,
+		empty_backend_static_string_literal_pool,
+		finish_backend_static_string_literal_pool,
 
 
 enum CProjectedCallableKind:
@@ -157,6 +170,8 @@ union CSymbolProjectionError:
 private record CEmissionSymbolPlanRep {
 	callables: CEmissionCallablePlan,
 	canonical_empty_lists: List[CanonicalEmptyList],
+	foreign_boundary_types: List[CoreType],
+	static_string_literals: Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError],
 	preserved_symbol_count: Int,
 	type_naming: Dict[String, BackendTypeNaming],
 	type_symbol_lookup: Dict[String, String]
@@ -165,7 +180,9 @@ private record CEmissionSymbolPlanRep {
 
 private record CProjectionValidation {
 	error: Option[CSymbolProjectionError],
-	canonical_empty_lists: List[CanonicalEmptyList]
+	canonical_empty_lists: List[CanonicalEmptyList],
+	foreign_boundary_types: List[CoreType],
+	static_string_literal_pool: BackendStaticStringLiteralPool
 }
 
 
@@ -466,6 +483,18 @@ pure func emitted_callback_name(plan: CEmissionSymbolPlan, original_name: String
 pure func c_emission_canonical_empty_lists(plan: CEmissionSymbolPlan) -> List[CanonicalEmptyList]:
 	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
 	representation.canonical_empty_lists
+
+
+pure func c_emission_foreign_boundary_types(plan: CEmissionSymbolPlan) -> List[CoreType]:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.foreign_boundary_types
+
+
+pure func c_emission_static_string_literals(
+	plan: CEmissionSymbolPlan,
+) -> Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError]:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.static_string_literals
 
 
 pure func c_emission_symbol_plan_entry_count(plan: CEmissionSymbolPlan) -> Int:
@@ -969,41 +998,59 @@ private pure func expr_projection_error(
 			None
 
 
-private pure func projection_validation_children(expr: CoreExpr) -> List[CoreExpr]:
-	match expr:
-		CallExpr(ClosureCall, callee, args, _, _):
-			[callee].concat(args)
-		CallExpr(_, _, args, _, _):
-			args
-		_:
-			CoreTraverse.immediate_core_expr_children(expr)
-
-
 private pure func validate_expr_projection(
 	plan: Option[CCallableSymbolPlan],
+	initial_static_string_literal_pool: BackendStaticStringLiteralPool,
 	root: CoreExpr,
 ) -> CProjectionValidation:
 	-- Keep only the current and next breadth-first layers so completed layers
-	-- are released without changing deterministic first-error selection.
+	-- are released without changing deterministic first-error selection. The
+	-- parallel flags keep direct-call callees in the emission-fact census while
+	-- excluding them from callable projection validation.
 	var current_frontier: List[CoreExpr] = [root]
+	var current_validation: List[Bool] = [True]
 	var next_frontier: List[CoreExpr] = []
+	var next_validation: List[Bool] = []
 	var current_index: Int = 0
 	var error: Option[CSymbolProjectionError] = None
 	var canonical_empty_lists: List[CanonicalEmptyList] = []
+	var foreign_boundary_types: List[CoreType] = []
+	var static_string_literal_pool: BackendStaticStringLiteralPool = initial_static_string_literal_pool
 
 	while current_frontier.length() > 0 and error.is_none():
 		while current_index < current_frontier.length() and error.is_none():
-			match current_frontier.get(current_index):
-				Some(expr):
-					error = match plan:
-						Some(selected_plan):
-							expr_projection_error(selected_plan, expr)
-						None:
-							None
+			match (current_frontier.get(current_index), current_validation.get(current_index)):
+				(Some(expr), Some(should_validate)):
+					if should_validate:
+						error = match plan:
+							Some(selected_plan):
+								expr_projection_error(selected_plan, expr)
+							None:
+								None
+					else:
+						void
 
 					match expr:
+						StaticStringLiteralExpr(id, value, _, _):
+							static_string_literal_pool = backend_static_string_literal_pool_add(
+								static_string_literal_pool,
+								id,
+								value,
+							)
+						LiteralExpr(StringLiteral(value), _, _):
+							static_string_literal_pool = backend_static_string_literal_pool_reject_unpooled(
+								static_string_literal_pool,
+								value,
+							)
+						CallExpr(ForeignCall(_, _), _, args, return_type, _):
+							for arg in args:
+								foreign_boundary_types = foreign_boundary_types.append(
+									core_expr_type(arg),
+								)
+
+							foreign_boundary_types = foreign_boundary_types.append(return_type)
 						ListConstructExpr(construct, _, _):
-							if (
+							if should_validate and (
 								construct.elements.length() == 0
 								and not canonical_empty_list_layout_is_valid(construct)
 							):
@@ -1012,7 +1059,7 @@ private pure func validate_expr_projection(
 										"inline empty lists cannot own releasable elements",
 									),
 								)
-							else:
+							else if should_validate:
 								match canonical_empty_list_for_construct(construct):
 									Some(item):
 										canonical_empty_lists = canonical_empty_lists_add(
@@ -1021,25 +1068,48 @@ private pure func validate_expr_projection(
 										)
 									None:
 										void
+							else:
+								void
 						_:
 							void
 
 					if error.is_none():
-						for child in projection_validation_children(expr):
-							next_frontier = next_frontier.append(child)
-				None:
+						match expr:
+							CallExpr(ClosureCall, callee, args, _, _):
+								next_frontier = next_frontier.append(callee)
+								next_validation = next_validation.append(should_validate)
+
+								for arg in args:
+									next_frontier = next_frontier.append(arg)
+									next_validation = next_validation.append(should_validate)
+							CallExpr(_, callee, args, _, _):
+								next_frontier = next_frontier.append(callee)
+								next_validation = next_validation.append(False)
+
+								for arg in args:
+									next_frontier = next_frontier.append(arg)
+									next_validation = next_validation.append(should_validate)
+							_:
+								for child in CoreTraverse.immediate_core_expr_children(expr):
+									next_frontier = next_frontier.append(child)
+									next_validation = next_validation.append(should_validate)
+				_:
 					void
 
 			current_index += 1
 
 		if error.is_none():
 			current_frontier = next_frontier
+			current_validation = next_validation
 			next_frontier = []
+			next_validation = []
 			current_index = 0
 
 	{
 		error = error,
-		canonical_empty_lists = canonical_empty_lists
+		canonical_empty_lists = canonical_empty_lists,
+		foreign_boundary_types = foreign_boundary_types,
+		static_string_literal_pool = static_string_literal_pool
 	}
 
 
@@ -1049,32 +1119,89 @@ private pure func validate_program_projection(
 ) -> CProjectionValidation:
 	var error: Option[CSymbolProjectionError] = None
 	var canonical_empty_lists: List[CanonicalEmptyList] = []
+	var foreign_boundary_types: List[CoreType] = []
+	var static_string_literal_pool: BackendStaticStringLiteralPool = empty_backend_static_string_literal_pool()
 
 	for decl in program.decls:
 		if error.is_none():
 			match decl:
 				FunctionDecl(function_info):
+					match function_info.function_kind:
+						ForeignFunction(_):
+							for param in function_info.params:
+								foreign_boundary_types = foreign_boundary_types.append(param.typ)
+
+							foreign_boundary_types = foreign_boundary_types.append(
+								function_info.return_type,
+							)
+						_:
+							void
+
 					match function_info.body:
 						Some(body):
-							validation: CProjectionValidation = validate_expr_projection(plan, body)
+							validation: CProjectionValidation = validate_expr_projection(
+								plan,
+								static_string_literal_pool,
+								body,
+							)
 							error = validation.error
+							static_string_literal_pool = validation.static_string_literal_pool
 
 							for item in validation.canonical_empty_lists:
 								canonical_empty_lists = canonical_empty_lists_add(
 									canonical_empty_lists,
 									item,
 								)
+
+							for typ in validation.foreign_boundary_types:
+								foreign_boundary_types = foreign_boundary_types.append(typ)
 						None:
 							void
 				GlobalDecl(global):
-					validation: CProjectionValidation = validate_expr_projection(plan, global.init)
+					validation: CProjectionValidation = validate_expr_projection(
+						plan,
+						static_string_literal_pool,
+						global.init,
+					)
 					error = validation.error
+					static_string_literal_pool = validation.static_string_literal_pool
 
 					for item in validation.canonical_empty_lists:
 						canonical_empty_lists = canonical_empty_lists_add(
 							canonical_empty_lists,
 							item,
 						)
+
+					for typ in validation.foreign_boundary_types:
+						foreign_boundary_types = foreign_boundary_types.append(typ)
+				ImplDecl(impl):
+					for method in impl.methods:
+						match method.function_kind:
+							ForeignFunction(_):
+								for param in method.params:
+									foreign_boundary_types = foreign_boundary_types.append(param.typ)
+
+								foreign_boundary_types = foreign_boundary_types.append(
+									method.return_type,
+								)
+							_:
+								void
+
+						match method.body:
+							Some(body):
+								-- Impl bodies no longer participate in projection validation,
+								-- but their foreign calls still constrain ABI layout.
+								validation: CProjectionValidation = validate_expr_projection(
+									None,
+									static_string_literal_pool,
+									body,
+								)
+								static_string_literal_pool = validation.static_string_literal_pool
+
+								for typ in validation.foreign_boundary_types:
+									foreign_boundary_types = foreign_boundary_types.append(typ)
+							None:
+								void
 				_:
 					void
 		else:
@@ -1082,7 +1209,9 @@ private pure func validate_program_projection(
 
 	{
 		error = error,
-		canonical_empty_lists = canonical_empty_lists_sorted(canonical_empty_lists)
+		canonical_empty_lists = canonical_empty_lists_sorted(canonical_empty_lists),
+		foreign_boundary_types = foreign_boundary_types,
+		static_string_literal_pool = static_string_literal_pool
 	}
 
 
@@ -1156,6 +1285,10 @@ pure func prepare_c_emission_symbols(
 											preserved_names,
 										),
 										canonical_empty_lists = validation.canonical_empty_lists,
+										foreign_boundary_types = validation.foreign_boundary_types,
+										static_string_literals = finish_backend_static_string_literal_pool(
+											validation.static_string_literal_pool,
+										),
 										preserved_symbol_count = preserved_names.length(),
 										type_naming = inventory.type_naming,
 										type_symbol_lookup = inventory.type_symbol_lookup

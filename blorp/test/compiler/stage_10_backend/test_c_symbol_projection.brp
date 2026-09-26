@@ -1,6 +1,6 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
-		CoreCallKind(ClosureCall, DictWithCapacityCall, ListToStringCall, UnknownCall, UserCall),
+		CoreCallKind(ClosureCall, DictWithCapacityCall, ForeignCall, ListToStringCall, UnknownCall, UserCall),
 		CoreClosureAbi,
 		CoreClosureCreate,
 		CoreConcurrentBinding,
@@ -21,10 +21,12 @@ import:
 			ResourceScopeExpr,
 			SetAllocExpr,
 			SeqExpr,
+			StaticStringLiteralExpr,
 			VarExpr,
 			VoidExpr,
 		),
 		CoreFunction,
+		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunctionKind(ClosureBodyFunction, UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
 		CoreListStorageLayout(PointerListStorage),
@@ -35,6 +37,7 @@ import:
 		CoreTaskClosure,
 		CoreType(FunctionType, NamedType, VoidType),
 		CoreVar,
+		static_string_literal_id,
 	../../../src/compiler/stage_09_core/pipeline: prepared_core_program
 	../../../src/compiler/stage_10_backend/c_naming: static_closure_name
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
@@ -52,6 +55,8 @@ import:
 			UnprojectedCallableValue,
 		),
 		build_callable_symbol_plan,
+		c_emission_foreign_boundary_types,
+		c_emission_static_string_literals,
 		planned_emitted_callable_name,
 		planned_emitted_callback_name,
 		prepare_c_emission_symbols,
@@ -60,6 +65,8 @@ import:
 	../../../src/compiler/stage_10_backend/emit:
 		core_emit_error_message,
 		try_emit_prepared_core_program_c_artifact_with_profile,
+	../../../src/compiler/stage_10_backend/static_string_literal_pool:
+		StaticStringLiteralPoolError(StaticStringLiteralIdConflict),
 	../../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileOff)
 	test: TestSuite
 
@@ -83,6 +90,10 @@ private pure func int_type() -> CoreType:
 
 private pure func function_type() -> CoreType:
 	FunctionType(True, [], int_type())
+
+
+private pure func string_type() -> CoreType:
+	NamedType("String", [])
 
 
 private pure func user_function(name: String, def_id: Int, body: CoreExpr) -> CoreFunction:
@@ -835,6 +846,183 @@ pure func test_published_emission_plan_resolves_callables_by_definition_id() -> 
 			False
 
 
+pure func test_published_emission_plan_carries_foreign_boundary_types() -> Bool:
+	foreign_call: CoreExpr = CallExpr(
+		ForeignCall("fixture_foreign", ForeignBorrowArgs),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+		[VoidExpr(int_type(), synthetic_core_source_loc())],
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+	program: CoreProgram = {
+		decls = [FunctionDecl(user_function("fixture_foreign_caller", 43, foreign_call))],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Ok(plan):
+			foreign_types: List[CoreType] = c_emission_foreign_boundary_types(plan)
+			match (foreign_types.get(0), foreign_types.get(1)):
+				(Some(NamedType(first_name, first_args)), Some(NamedType(second_name, second_args))):
+					(
+						foreign_types.length() == 2
+						and first_name == "Int"
+						and first_args.length() == 0
+						and second_name == "Int"
+						and second_args.length() == 0
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_published_emission_plan_carries_static_string_literals() -> Bool:
+	value: String = "projected literal"
+	program: CoreProgram = {
+		decls = [
+			GlobalDecl({
+				name = {
+					name = "fixture_static_string",
+					id = 0,
+					def_id = Some(44)
+				},
+				source_module = None,
+				typ = string_type(),
+				init = StaticStringLiteralExpr(
+					static_string_literal_id(7),
+					value,
+					string_type(),
+					synthetic_core_source_loc(),
+				),
+				is_mutable = False,
+				is_const = True,
+				is_private = False,
+				def_id = 44,
+				loc = synthetic_core_source_loc(),
+			}),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Ok(plan):
+			match c_emission_static_string_literals(plan):
+				Ok([literal]):
+					literal.value == value
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_published_emission_plan_carries_static_literal_from_non_closure_callee() -> Bool:
+	value: String = "callee literal"
+	callee: CoreExpr = SeqExpr(
+		StaticStringLiteralExpr(
+			static_string_literal_id(8),
+			value,
+			string_type(),
+			synthetic_core_source_loc(),
+		),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+	)
+	outer_call: CoreExpr = CallExpr(
+		ForeignCall("fixture_outer_foreign", ForeignBorrowArgs),
+		callee,
+		[],
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	program: CoreProgram = {
+		decls = [FunctionDecl(user_function("fixture_callee_facts", 45, outer_call))],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Ok(plan):
+			match c_emission_static_string_literals(plan):
+				Ok([literal]):
+					literal.value == value
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_published_emission_plan_carries_foreign_types_from_non_closure_callee() -> Bool:
+	callee: CoreExpr = CallExpr(
+		ForeignCall("fixture_nested_foreign", ForeignBorrowArgs),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+		[VoidExpr(int_type(), synthetic_core_source_loc())],
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+	outer_call: CoreExpr = CallExpr(
+		ForeignCall("fixture_outer_foreign", ForeignBorrowArgs),
+		callee,
+		[],
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	program: CoreProgram = {
+		decls = [FunctionDecl(user_function("fixture_callee_foreign_types", 46, outer_call))],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Ok(plan):
+			foreign_types: List[CoreType] = c_emission_foreign_boundary_types(plan)
+			foreign_types.length() == 3
+		Err(_):
+			False
+
+
+pure func test_published_emission_plan_preserves_callee_fact_error_order() -> Bool:
+	call: CoreExpr = CallExpr(
+		ForeignCall("fixture_fact_order", ForeignBorrowArgs),
+		StaticStringLiteralExpr(
+			static_string_literal_id(9),
+			"callee first",
+			string_type(),
+			synthetic_core_source_loc(),
+		),
+		[
+			StaticStringLiteralExpr(
+				static_string_literal_id(9),
+				"argument second",
+				string_type(),
+				synthetic_core_source_loc(),
+			),
+		],
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	program: CoreProgram = {
+		decls = [FunctionDecl(user_function("fixture_callee_fact_order", 47, call))],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Ok(plan):
+			match c_emission_static_string_literals(plan):
+				Err(StaticStringLiteralIdConflict(id, existing, incoming)):
+					(
+						id == 9
+						and existing == "callee first"
+						and incoming == "argument second"
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
 pure func test_rejects_user_call_without_exact_definition_identity() -> Bool:
 	match prepare_c_emission_symbols(direct_call_program(Some(99))):
 		Err(MissingProjectedCallable(name, def_id)):
@@ -1301,6 +1489,26 @@ tests: TestSuite = {
 		(
 			"published emission plan resolves callables by definition ID",
 			test_published_emission_plan_resolves_callables_by_definition_id,
+		),
+		(
+			"published emission plan carries foreign boundary types",
+			test_published_emission_plan_carries_foreign_boundary_types,
+		),
+		(
+			"published emission plan carries static string literals",
+			test_published_emission_plan_carries_static_string_literals,
+		),
+		(
+			"published emission plan carries static literal from non-closure callee",
+			test_published_emission_plan_carries_static_literal_from_non_closure_callee,
+		),
+		(
+			"published emission plan carries foreign types from non-closure callee",
+			test_published_emission_plan_carries_foreign_types_from_non_closure_callee,
+		),
+		(
+			"published emission plan preserves callee fact error order",
+			test_published_emission_plan_preserves_callee_fact_error_order,
 		),
 		(
 			"rejects user call without exact definition identity",
