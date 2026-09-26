@@ -179,6 +179,7 @@ import:
 		DeclarationVisibility(PublicDeclaration),
 		builtin_trait_id,
 		callable_id_definition_id,
+		callable_id_from_definition_table,
 		callable_id_from_reserved_graph_definition,
 		callable_id_module_id,
 		callable_ids_equal,
@@ -345,6 +346,7 @@ import:
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog:
 		accepted_semantic_catalog_alias_table,
 		accepted_semantic_catalog_callable_table,
+		accepted_semantic_catalog_trait_implementation_table,
 		accepted_semantic_catalog_union_table,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
 		AcceptedImplementationTableRecord,
@@ -352,6 +354,7 @@ import:
 		accepted_find_qualified_trait_method_info,
 		accepted_has_direct_trait_evidence,
 		accepted_implementation_candidate_count,
+		accepted_qualified_trait_implementation_method,
 		accepted_qualified_trait_method_signature,
 		accepted_resolve_trait_id_obligation,
 		accepted_resolve_trait_obligation,
@@ -4065,6 +4068,102 @@ func test_accepted_trait_table_precomputes_implementation_lookup_facts() -> Bool
 			)
 		Err(_):
 			False
+
+
+private func accepted_qualified_lookup_respects_direct_import_order() -> Option[Bool]:
+	pick_params = [named_param("value", int_type())]
+	pick_signature = trait_method_decl("pick", pick_params, Some(int_type()), False, False)
+	base_method = method_body_decl_at(
+		"pick",
+		pick_params,
+		Some(int_type()),
+		Some(decl_name_expr("value")),
+		2,
+	)
+	child_method = method_body_decl_at(
+		"pick",
+		pick_params,
+		Some(int_type()),
+		Some(decl_name_expr("value")),
+		3,
+	)
+	modules = importable_modules(
+		"base",
+		[
+			trait_decl_with_methods("Base", [], [], [pick_signature]),
+			impl_decl_with_methods_at("Base", int_type(), [base_method], 4),
+		],
+	).concat(
+		importable_modules(
+			"child",
+			[
+				import_block_decl(
+					[import_decl("base", None, Some([import_symbol("Base", None, [])]))],
+				),
+				trait_decl_with_methods("Child", [], ["Base"], []),
+				impl_decl_with_methods_at("Child", int_type(), [child_method], 5),
+			],
+		),
+	)
+	target = program([import_block_decl([
+			import_decl("base", Some("BaseModule"), None),
+			import_decl("child", Some("ChildModule"), None),
+		])])
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	graph: AcceptedTypecheckGraph ?= typecheck_test_accepted_graph(
+		state,
+		target,
+		modules,
+	).to_option()
+	definition_table = accepted_typecheck_graph_definition_table(graph)
+	table = accepted_semantic_catalog_trait_implementation_table(
+		accepted_typecheck_graph_semantic_catalog(graph),
+	)
+	child_first = accepted_trait_implementation_authority(
+		table,
+		"decl",
+		accepted_trait_empty_visibility(table),
+		["child", "base"],
+	)
+	base_first = accepted_trait_implementation_authority(
+		table,
+		"decl",
+		accepted_trait_empty_visibility(table),
+		["base", "child"],
+	)
+	child_info ?= accepted_find_qualified_trait_method_info(
+		child_first,
+		state.env,
+		"base",
+		"pick",
+		TYPE_INT,
+	)
+	base_info ?= accepted_find_qualified_trait_method_info(
+		base_first,
+		state.env,
+		"base",
+		"pick",
+		TYPE_INT,
+	)
+	child_target ?= accepted_qualified_trait_implementation_method(child_info).target
+	base_target ?= accepted_qualified_trait_implementation_method(base_info).target
+	child_callable ?= callable_id_from_definition_table(definition_table, child_target.callable_id)
+	base_callable ?= callable_id_from_definition_table(definition_table, base_target.callable_id)
+	child_owner ?= callable_id_module_id(definition_table, child_callable)
+	base_owner ?= callable_id_module_id(definition_table, base_callable)
+	module_table = definition_table_module_table(definition_table)
+
+	Some(
+		(
+			module_table_canonical_path(module_table, child_owner) == Some("child")
+			and module_table_canonical_path(module_table, base_owner) == Some("base")
+			and child_target.callable_id != base_target.callable_id
+		),
+	)
+
+
+func test_accepted_qualified_lookup_respects_direct_import_order() -> Bool:
+	accepted_qualified_lookup_respects_direct_import_order().get_or(False)
 
 
 func test_impl_registration_rejects_mismatched_module_path() -> Bool:
@@ -9510,6 +9609,10 @@ tests: TestSuite = {
 		(
 			"accepted trait table precomputes implementation lookup facts",
 			test_accepted_trait_table_precomputes_implementation_lookup_facts,
+		),
+		(
+			"accepted qualified lookup respects direct import order",
+			test_accepted_qualified_lookup_respects_direct_import_order,
 		),
 		(
 			"accepted trait method lookup sorts exact visibility rows",

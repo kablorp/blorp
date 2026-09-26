@@ -294,7 +294,7 @@ month.
 
 ## Issue T-D cut 2: Build module environment preparation once
 
-**Status (2026-09-25).** Five bounded preparation cuts have landed or reached
+**Status (2026-09-26).** Six bounded preparation cuts have landed or reached
 acceptance evidence: sharing the immutable builtin environment, owning callable
 rows locally during header preparation, precomputing stable
 trait-implementation lookup facts, and batching graph-selective type facts while
@@ -304,9 +304,14 @@ typed-frontend allocations (-0.35%) on the current frozen self-compile, with
 flat retired instructions, an unchanged `module_bodies` row, and byte-identical
 C. See
 [`typecheck_import_scope_transitions_2026-09-25.md`](../benchmarks/results/typecheck_import_scope_transitions_2026-09-25.md).
-This is meaningful progress, but it does not satisfy the original 40% goal;
-the remaining base and final-environment construction still need independent
-attribution and cuts rather than a single broad rewrite.
+The sixth cut publishes qualified implementation candidates once in the
+accepted table and leaves only exact visibility rank in each prepared module.
+It removes another 297,390 typed-frontend allocations (-0.97%), reduces retired
+instructions by 0.58%, leaves `module_bodies` unchanged, and preserves
+byte-identical C. See
+[`typecheck_qualified_implementation_projection_2026-09-26.md`](../benchmarks/results/typecheck_qualified_implementation_projection_2026-09-26.md).
+The original 40% preparation goal is not yet met; base construction and the
+remaining final-authority indexes still need independent attribution and cuts.
 
 **Goal.** `global_prepare` is 5,201,772 allocations, 78.3% of
 `global_header_completion`, and all of it is `prepared_module_environments`

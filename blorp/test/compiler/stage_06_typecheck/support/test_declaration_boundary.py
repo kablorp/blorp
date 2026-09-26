@@ -121,6 +121,41 @@ def unchecked_meta_session_sources(source_root: Path, allowed_owners: set[Path])
 
 class DeclarationBoundaryTests(unittest.TestCase):
 
+    def test_qualified_implementation_candidates_are_table_owned(self) -> None:
+        """Module views publish visibility ranks, not rebuilt string indexes."""
+        source = TRAIT_IMPLEMENTATION_AUTHORITY.read_text(encoding="utf-8")
+        table_rep = source.split(
+            "private record AcceptedTraitImplementationTableRep {", 1
+        )[1].split("\n}\n", 1)[0]
+        authority_rep = source.split(
+            "private record AcceptedTraitImplementationAuthorityRep {", 1
+        )[1].split("\n}\n", 1)[0]
+        projection = source.split(
+            "private pure func accepted_trait_implementation_authority_from_fields(", 1
+        )[1].split(
+            "\n\n\npure func accepted_trait_implementation_authority(", 1
+        )[0]
+        lookup = source.split(
+            "pure func accepted_find_qualified_trait_method_info(", 1
+        )[1].split(
+            "\n\n\npure func accepted_trait_implementation_authority_metrics(", 1
+        )[0]
+
+        self.assertIn(
+            "qualified_implementation_indices_by_module_and_method:", table_rep
+        )
+        self.assertIn("visible_implementation_rank_by_index:", authority_rep)
+        self.assertNotIn(
+            "qualified_implementation_indices_by_module_and_method:", authority_rep
+        )
+        self.assertNotIn(
+            "qualified_implementation_indices_by_module_and_method.set(", projection
+        )
+        self.assertIn(
+            "table.qualified_implementation_indices_by_module_and_method", lookup
+        )
+        self.assertIn("visible_implementation_rank_by_index", lookup)
+
     def test_meta_identity_does_not_depend_on_semantic_graph_index(self) -> None:
         source = META_IDENTITY.read_text(encoding="utf-8")
         imports = source.split("private record", 1)[0]

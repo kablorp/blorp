@@ -126,24 +126,14 @@ private union AcceptedVisibleTraitBinding:
 	AcceptedVisibleTraitMethodBinding(SourceNameId, TraitMethodId)
 
 
----
-Stable qualified lookup contribution for one implementation method. The
-accepted table derives these rows once; per-module authorities only filter
-and index rows belonging to implementations visible in that module.
----
-private record QualifiedImplMethodRow {
-	module_path: String,
-	method_name: String
-}
-
-
 private record AcceptedTraitImplementationTableRep {
 	module_table: ModuleTable,
 	definition_table: DefinitionTable,
 	traits: List[AcceptedTraitTableRecord],
 	implementations: List[AcceptedImplementationTableRecord],
 	implementation_trait_method_ids: List[List[Option[TraitMethodId]]],
-	qualified_method_rows_by_implementation: List[List[QualifiedImplMethodRow]],
+	qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]],
+	qualified_implementation_method_row_count: Int,
 	compiler_trait_id_by_implementation: List[Option[TraitId]],
 	satisfied_trait_indices_by_implementation: List[List[Int]],
 	conflicting_implementation_indices_by_implementation: List[List[Int]],
@@ -197,7 +187,7 @@ private record AcceptedTraitImplementationAuthorityRep {
 	implementation_indices_by_satisfied_trait_index: Dict[Int, List[Int]],
 	implementation_indices_by_trait_name: Dict[String, List[Int]],
 	compiler_implementations_by_trait_identity: Dict[Int, AcceptedCompilerImplementationBucket],
-	qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]],
+	visible_implementation_rank_by_index: List[Int],
 	visible_trait_methods: List[AcceptedVisibleTraitMethodRow],
 	preparation_errors: List[String]
 }
@@ -915,7 +905,10 @@ pure func accepted_trait_implementation_table(
 		module_table_count(input.module_table),
 	)
 	var implementation_trait_method_ids: List[List[Option[TraitMethodId]]] = []
-	var qualified_method_rows_by_implementation: List[List[QualifiedImplMethodRow]] = []
+	var qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]] = {
+
+	}
+	var qualified_implementation_method_row_count: Int = 0
 	var compiler_trait_id_by_implementation: List[Option[TraitId]] = []
 	var satisfied_trait_indices_by_implementation: List[List[Int]] = []
 	var conflicting_implementation_indices_by_implementation: List[List[Int]] = []
@@ -969,6 +962,8 @@ pure func accepted_trait_implementation_table(
 
 	var implementation_index: Int = 0
 
+	var qualified_implementation_index: Int = 0
+
 	for item in input.implementations:
 		module_key = impl_id_module_id(input.definition_table, item.id).map(module_id_table_index)
 		definition_id = impl_id_definition_id(item.id)
@@ -1019,7 +1014,6 @@ pure func accepted_trait_implementation_table(
 			),
 		)
 		var method_traits: List[Option[TraitMethodId]] = []
-		var qualified_method_rows: List[QualifiedImplMethodRow] = []
 
 		for method_id in item.method_ids:
 			trait_method_id = trait_method_id_for_name_seen(
@@ -1076,17 +1070,23 @@ pure func accepted_trait_implementation_table(
 							void
 
 					for module_path in owner_paths:
-						qualified_method_rows = qualified_method_rows.append({
-							module_path = module_path,
-							method_name = method_name,
-						})
+						methods = qualified_implementation_indices_by_module_and_method.get_or(
+							module_path,
+							{},
+						)
+						indices = methods.get_or(method_name, [])
+						qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method.set(
+							module_path,
+							methods.set(
+								method_name,
+								append_unique_index(indices, qualified_implementation_index),
+							),
+						)
+						qualified_implementation_method_row_count += 1
 				None:
 					void
 
 		implementation_trait_method_ids = implementation_trait_method_ids.append(method_traits)
-		qualified_method_rows_by_implementation = qualified_method_rows_by_implementation.append(
-			qualified_method_rows,
-		)
 		compiler_trait_id_by_implementation = compiler_trait_id_by_implementation.append(
 			trait_compiler_link_from_indices(
 				input.traits,
@@ -1094,6 +1094,7 @@ pure func accepted_trait_implementation_table(
 				item.trait_id,
 			),
 		)
+		qualified_implementation_index += 1
 
 	-- Coherence relationships depend only on canonical table entries. Compute
 	-- them once within exact/compiler-linked trait buckets so unrelated traits
@@ -1169,7 +1170,8 @@ pure func accepted_trait_implementation_table(
 					traits = input.traits,
 					implementations = input.implementations,
 					implementation_trait_method_ids = implementation_trait_method_ids,
-					qualified_method_rows_by_implementation = qualified_method_rows_by_implementation,
+					qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method,
+					qualified_implementation_method_row_count = qualified_implementation_method_row_count,
 					compiler_trait_id_by_implementation = compiler_trait_id_by_implementation,
 					satisfied_trait_indices_by_implementation = satisfied_trait_indices_by_implementation,
 					conflicting_implementation_indices_by_implementation = conflicting_implementation_indices_by_implementation,
@@ -1777,9 +1779,6 @@ private pure func accepted_trait_implementation_authority_from_fields(
 	var compiler_implementations_by_trait_identity: Dict[Int, AcceptedCompilerImplementationBucket] = {
 
 	}
-	var qualified_implementation_indices_by_module_and_method: Dict[String, Dict[String, List[Int]]] = {
-
-	}
 	var preparation_errors: List[String] = fields.preparation_errors
 	var visible_trait_index_set: Dict[Int, Bool] = {}
 
@@ -1838,6 +1837,13 @@ private pure func accepted_trait_implementation_authority_from_fields(
 				void
 
 	visible_implementations = accepted_visible_implementation_indices
+	var visible_implementation_rank_by_index = 0.repeat(representation.implementations.length())
+
+	for ranked in visible_implementations.enumerate():
+		visible_implementation_rank_by_index = visible_implementation_rank_by_index.set(
+			ranked[1],
+			ranked[0] + 1,
+		)
 
 	for index in visible_implementations:
 		match representation.implementations.get(index):
@@ -1848,20 +1854,6 @@ private pure func accepted_trait_implementation_authority_from_fields(
 						.get_or(item.instance.trait_name, [])
 						.append(index),
 				)
-
-				for row in representation.qualified_method_rows_by_implementation.get_or(index, []):
-					methods = qualified_implementation_indices_by_module_and_method.get_or(
-						row.module_path,
-						{},
-					)
-					indices = methods.get_or(row.method_name, [])
-					qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method.set(
-						row.module_path,
-						methods.set(
-							row.method_name,
-							append_unique_index(indices, index),
-						),
-					)
 
 				for trait_index in representation.satisfied_trait_indices_by_implementation.get_or(
 					index,
@@ -1907,7 +1899,7 @@ private pure func accepted_trait_implementation_authority_from_fields(
 			implementation_indices_by_satisfied_trait_index = implementation_indices_by_satisfied_trait_index,
 			implementation_indices_by_trait_name = implementation_indices_by_trait_name,
 			compiler_implementations_by_trait_identity = compiler_implementations_by_trait_identity,
-			qualified_implementation_indices_by_module_and_method = qualified_implementation_indices_by_module_and_method,
+			visible_implementation_rank_by_index = visible_implementation_rank_by_index,
 			visible_trait_methods = fields.visible_trait_methods,
 			preparation_errors = preparation_errors
 		})
@@ -3192,6 +3184,109 @@ pure func accepted_trait_find_ufcs_method(
 				AcceptedTraitUfcsMethodNotFound
 
 
+private pure func accepted_qualified_trait_method_info_for_implementation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	module_path: String,
+	method_name: String,
+	receiver_type: SemanticType,
+	implementation_index: Int,
+) -> Option[AcceptedQualifiedTraitMethodInfo]:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	var result: Option[AcceptedQualifiedTraitMethodInfo] = None
+
+	match table.implementations.get(implementation_index):
+		Some(item):
+			owner_module_path = implementation_owner_module_path(
+				table.definition_table,
+				table.module_table,
+				item,
+			).get_or(representation.owner_module_path)
+
+			match table_find_trait_index(table, item.trait_id):
+				Some(trait_index):
+					match table_find_trait_method_seen(
+						representation,
+						[],
+						trait_index,
+						method_name,
+					):
+						Some(requested):
+							requested_owner_path = trait_id_module_id(
+								table.definition_table,
+								trait_method_id_owner(requested.id),
+							).and_then(func(module_id):
+								module_table_canonical_path(table.module_table, module_id)
+							)
+							qualified_owner = (
+								impl_id_module_id(
+									table.definition_table,
+									item.id,
+								).and_then(
+									func(
+										module_id,
+									): module_table_canonical_path(
+										table.module_table,
+										module_id,
+									),
+								) == Some(module_path)
+								or requested_owner_path == Some(module_path)
+							)
+
+							if (
+								qualified_owner
+								and accepted_implementation_matches_type(
+									authority,
+									env,
+									item,
+									receiver_type,
+								)
+							):
+								method_trait_ids = table.implementation_trait_method_ids.get_or(
+									implementation_index,
+									[],
+								)
+
+								for indexed in item.instance.methods.enumerate():
+									implements_requested_slot = match method_trait_ids.get(
+										indexed[0],
+									):
+										Some(Some(id)):
+											trait_method_ids_equal(id, requested.id)
+										_:
+											False
+
+									if implements_requested_slot:
+										implementation_method = if owner_module_path == representation.owner_module_path:
+											localized_implementation_method(
+												owner_module_path,
+												indexed[1],
+											)
+										else:
+											indexed[1]
+
+										result = Some(into_opaque AcceptedQualifiedTraitMethodInfo({
+													trait_id = trait_method_id_owner(requested.id),
+													trait_name = requested.declaring_trait_name,
+													trait_identity = bound_trait_identity_from_id(
+														table.definition_table,
+														trait_method_id_owner(requested.id),
+													),
+													method = requested.signature,
+													implementation_method = implementation_method
+												}))
+										break
+						None:
+							void
+				None:
+					void
+		None:
+			void
+
+	result
+
+
 pure func accepted_find_qualified_trait_method_info(
 	authority: AcceptedTraitImplementationAuthority,
 	env: Env,
@@ -3201,106 +3296,32 @@ pure func accepted_find_qualified_trait_method_info(
 ) -> Option[AcceptedQualifiedTraitMethodInfo]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	var result: Option[AcceptedQualifiedTraitMethodInfo] = None
-	implementation_indices = representation.qualified_implementation_indices_by_module_and_method
+	implementation_indices = table.qualified_implementation_indices_by_module_and_method
 		.get_or(module_path, {})
 		.get_or(method_name, [])
+	var best_visible_rank = representation.visible_implementation_indices.length() + 1
+	var result: Option[AcceptedQualifiedTraitMethodInfo] = None
 
 	for implementation_index in implementation_indices:
-		match table.implementations.get(implementation_index):
-			Some(item):
-				owner_module_path = implementation_owner_module_path(
-					table.definition_table,
-					table.module_table,
-					item,
-				).get_or(representation.owner_module_path)
+		visible_rank = representation.visible_implementation_rank_by_index.get_or(
+			implementation_index,
+			0,
+		)
 
-				match table_find_trait_index(table, item.trait_id):
-					Some(trait_index):
-						match table_find_trait_method_seen(
-							representation,
-							[],
-							trait_index,
-							method_name,
-						):
-							Some(requested):
-								requested_owner_path = trait_id_module_id(
-									table.definition_table,
-									trait_method_id_owner(requested.id),
-								).and_then(func(module_id):
-									module_table_canonical_path(table.module_table, module_id)
-								)
-								qualified_owner = (
-									impl_id_module_id(
-										table.definition_table,
-										item.id,
-									).and_then(
-										func(
-											module_id,
-										): module_table_canonical_path(
-											table.module_table,
-											module_id,
-										),
-									) == Some(module_path)
-									or requested_owner_path == Some(module_path)
-								)
-
-								if (
-									qualified_owner
-									and accepted_implementation_matches_type(
-										authority,
-										env,
-										item,
-										receiver_type,
-									)
-								):
-									method_trait_ids = table.implementation_trait_method_ids.get_or(
-										implementation_index,
-										[],
-									)
-
-									for indexed in item.instance.methods.enumerate():
-										implements_requested_slot = match method_trait_ids.get(
-											indexed[0],
-										):
-											Some(Some(id)):
-												trait_method_ids_equal(id, requested.id)
-											_:
-												False
-
-										if implements_requested_slot:
-											implementation_method = if owner_module_path == representation.owner_module_path:
-												localized_implementation_method(
-													owner_module_path,
-													indexed[1],
-												)
-											else:
-												indexed[1]
-
-											result = Some(
-												into_opaque AcceptedQualifiedTraitMethodInfo({
-														trait_id = trait_method_id_owner(
-															requested.id,
-														),
-														trait_name = requested.declaring_trait_name,
-														trait_identity = bound_trait_identity_from_id(
-															table.definition_table,
-															trait_method_id_owner(requested.id),
-														),
-														method = requested.signature,
-														implementation_method = implementation_method
-													}),
-											)
-											break
-							None:
-								void
-					None:
-						void
-			None:
-				void
-
-		if result.is_some():
-			break
+		if visible_rank > 0 and visible_rank < best_visible_rank:
+			match accepted_qualified_trait_method_info_for_implementation(
+				authority,
+				env,
+				module_path,
+				method_name,
+				receiver_type,
+				implementation_index,
+			):
+				Some(info):
+					best_visible_rank = visible_rank
+					result = Some(info)
+				None:
+					void
 
 	result
 
@@ -3374,11 +3395,7 @@ pure func accepted_trait_implementation_authority_metrics(
 	representation = table_rep(table)
 	var trait_indices: Int = 0
 	var implementation_indices: Int = 0
-	var qualified_method_rows: Int = 0
 	var compiler_implementation_links: Int = 0
-
-	for rows in representation.qualified_method_rows_by_implementation:
-		qualified_method_rows += rows.length()
 
 	for compiler_trait_id in representation.compiler_trait_id_by_implementation:
 		if compiler_trait_id.is_some():
@@ -3394,7 +3411,7 @@ pure func accepted_trait_implementation_authority_metrics(
 		accepted_implementation_table_entries = representation.implementations.length(),
 		accepted_trait_semantic_conversions = representation.traits.length(),
 		accepted_implementation_semantic_conversions = representation.implementations.length(),
-		accepted_qualified_implementation_method_rows = qualified_method_rows,
+		accepted_qualified_implementation_method_rows = representation.qualified_implementation_method_row_count,
 		accepted_compiler_implementation_links = compiler_implementation_links,
 		module_view_trait_indices = trait_indices,
 		module_view_implementation_indices = implementation_indices
