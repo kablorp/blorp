@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read exact identity marker calls from the existing benchmark profile worker."""
+"""Read exact identity hot-path calls from the existing function profiler."""
 
 from __future__ import annotations
 
@@ -13,13 +13,12 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKER = ROOT / "benchmarks/compiler_identity_work_profile"
-PREFIX = "blorp_src_compiler_identity_work_counters__"
-MARKERS = (
-    "identity_work_core_var_equal",
-    "identity_work_local_scope_lookup",
-    "identity_work_observed_core_var_constructor_helper_calls",
-    "identity_work_observed_display_lookup",
-)
+FUNCTIONS = {
+    "blorp_src_compiler_stage_09_core_ir__core_var_equal": "core_var_equal",
+    "blorp_src_compiler_stage_06_typecheck_type_system_env__scope_lookup": "scope_lookup",
+    "blorp_src_compiler_stage_08_core_lower_lower__core_var_impl": "core_var_impl",
+}
+TOY_FUNCTIONS = {"core_var_equal", "scope_lookup"}
 LOSS_DIAGNOSTICS = (
     "invalid_start_ids",
     "invalid_end_ids",
@@ -46,16 +45,16 @@ def check_profile_diagnostics(output: str, expected_mode: str) -> dict[str, str]
         if name not in fields or int(fields[name]) != 0:
             raise ValueError(f"profiler loss or corruption: {name}={fields.get(name)}")
     if expected_mode == "calls":
-        schema_functions = len(MARKERS) + 1
+        schema_functions = len(FUNCTIONS)
         for name in ("functions_selected", "functions_observed"):
             if int(fields.get(name, "-1")) != schema_functions:
-                raise ValueError(f"calls-mode identity schema requires {schema_functions} {name}")
+                raise ValueError(f"calls-mode identity selectors require {schema_functions} {name}")
         for name in ("abandoned_frames", "window_abandoned_frames", "stack_growths"):
             if int(fields.get(name, "-1")) != 0:
                 raise ValueError(f"unexpected calls-mode profiler stack state: {name}")
         if int(fields.get("calls_completed", "-1")) != 0:
             raise ValueError("calls-mode profiler unexpectedly recorded timed completions")
-    elif int(fields.get("functions_observed", "0")) < len(MARKERS) + 1:
+    elif int(fields.get("functions_observed", "0")) < len(TOY_FUNCTIONS):
         raise ValueError("profiler observed too few functions for identity schema")
     return fields
 
@@ -66,20 +65,21 @@ def parse_profile(output: str, expected_mode: str = "exact") -> dict[str, int]:
     for line in output.splitlines():
         columns = line.split()
         expected_columns = 3 if expected_mode == "calls" else 7
-        if len(columns) == expected_columns and columns[0].startswith(PREFIX):
-            name = columns[0][len(PREFIX) :]
+        if len(columns) == expected_columns and columns[0] in FUNCTIONS:
+            name = FUNCTIONS[columns[0]]
+            if name in rows:
+                raise ValueError(f"duplicate identity function row: {name}")
             rows[name] = int(columns[2] if expected_mode == "calls" else columns[5])
-    if rows.get("register_identity_work_counters") != 1:
-        raise ValueError("identity marker registration must occur exactly once")
-    if set(rows) != set(MARKERS) | {"register_identity_work_counters"}:
-        raise ValueError(f"incomplete identity marker schema: {sorted(rows)}")
+    required = set(FUNCTIONS.values()) if expected_mode == "calls" else TOY_FUNCTIONS
+    if not required.issubset(rows) or (expected_mode == "calls" and set(rows) != required):
+        raise ValueError(f"incomplete identity function profile: {sorted(rows)}")
     observed_calls = int(diagnostics.get("calls_observed", "0"))
     completed_calls = int(diagnostics.get("calls_completed", "0"))
     if expected_mode == "calls" and observed_calls != sum(rows.values()):
         raise ValueError("calls-mode profiler total disagrees with identity rows")
-    if expected_mode == "exact" and completed_calls < sum(rows.values()):
+    if expected_mode == "exact" and completed_calls < sum(rows[name] for name in required):
         raise ValueError("exact profiler completed fewer calls than identity rows")
-    return {name: rows[name] - 1 for name in MARKERS}
+    return {name: rows[name] for name in sorted(required)}
 
 
 def run_once() -> tuple[dict[str, int], int]:
@@ -108,6 +108,17 @@ def git_output(repo: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
+def replay_resources(profile: str) -> dict[str, float | int]:
+    elapsed = re.search(r"\s+(\d+\.\d+) real\s", profile)
+    peak = re.search(r"\s+(\d+)\s+maximum resident set size", profile)
+    if elapsed is None or peak is None:
+        raise ValueError("timed production replay resource row missing")
+    return {
+        "elapsed_seconds": float(elapsed.group(1)),
+        "max_rss_bytes": int(peak.group(1)),
+    }
+
+
 def extract_replay(arguments: list[str]) -> int:
     if len(arguments) != 7:
         raise ValueError(
@@ -132,25 +143,28 @@ def extract_replay(arguments: list[str]) -> int:
     hashes = [file_sha256(core) for core in (core1, core2)]
     if hashes[0] != hashes[1]:
         raise ValueError(f"replay Core output changed: {hashes}")
-    if counts[0]["identity_work_core_var_equal"] <= 0:
+    if counts[0]["core_var_equal"] <= 0:
         raise ValueError("production replay did not exercise Core equality")
-    if counts[0]["identity_work_local_scope_lookup"] <= 0:
+    if counts[0]["scope_lookup"] <= 0:
         raise ValueError("production replay did not exercise central scope lookup")
+    if counts[0]["core_var_impl"] <= 0:
+        raise ValueError("production replay did not exercise observed constructor helper")
     result = {
         "input_revision": git_output(input_repo, "rev-parse", "HEAD"),
         "input_tree_hash": git_output(input_repo, "rev-parse", "HEAD^{tree}"),
         "input_main_blob_hash": git_output(input_repo, "hash-object", "blorp/src/main.brp"),
         "candidate_compiler_sha256": file_sha256(ROOT / "bin/blorp"),
         "worker_sha256": file_sha256(worker),
-        "mode": f"debug, selected function call counts, stop-after={stage}",
+        "mode": f"debug, three selected function call counts, stop-after={stage}",
         "counts": counts[0],
         "core_output_sha256": hashes[0],
         "raw_logs": [str(log1), str(log2)],
         "core_outputs": [str(core1), str(core2)],
+        "resources": [replay_resources(profile) for profile in profiles],
         "covered_helper_sites": ["stage_08_core_lower/lower.brp:core_var_impl"],
         "total_static_constructor_sites": 47,
         "constructor_site_scope": "lexically adjacent name/id/def_id fields in stage 8/9 complete-field literals; source-shape conditional, not total constructions",
-        "display_lookup_status": "unsupported_current_authority",
+        "display_lookup": {"status": "unsupported_current_authority", "profiled_calls": 0},
         "string_hash_status": "scope-lookup and CoreVar-equality proxies; separate hash calls require library/runtime intrusion",
     }
     output_json.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
@@ -166,21 +180,17 @@ def main() -> int:
     if first != second:
         raise ValueError(f"identity counts changed between runs: {first} != {second}")
     counts, allocations = first
-    if counts["identity_work_core_var_equal"] != 2:
+    if counts["core_var_equal"] != 2:
         raise ValueError("fixture expected two CoreVar equality calls")
-    if counts["identity_work_local_scope_lookup"] != 2:
+    if counts["scope_lookup"] != 2:
         raise ValueError("fixture expected two central scope lookups")
-    if counts["identity_work_observed_core_var_constructor_helper_calls"] != 0:
-        raise ValueError("fixture does not exercise the observed constructor helper")
-    if counts["identity_work_observed_display_lookup"] != 0:
-        raise ValueError("display lookup is unsupported at this checkpoint")
     result = {
         "counts": counts,
         "fixture_allocations": allocations,
         "covered_helper_sites": ["stage_08_core_lower/lower.brp:core_var_impl"],
         "total_static_constructor_sites": 47,
         "constructor_site_scope": "complete-field CoreVar literals in stage 8/9; record updates excluded",
-        "display_lookup_status": "unsupported_current_authority",
+        "display_lookup": {"status": "unsupported_current_authority", "profiled_calls": 0},
         "string_hash_status": "scope-lookup and CoreVar-equality proxy; separate hash calls require library/runtime intrusion",
     }
     print(json.dumps(result, indent=2, sort_keys=True))

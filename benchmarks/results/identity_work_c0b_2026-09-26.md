@@ -1,98 +1,123 @@
-# Identity work counter checkpoint
+# Identity hot-path call profiling checkpoint
 
-## Retained production replay
+## Accepted candidate: direct function selectors
 
-The frozen compiler input is parent revision
+The normal-build allocation contract rejected the first C0b marker module.
+On frozen input revision `c4f7c16352e664714da74ba26e8f99f14ef52240`,
+the parent and marker candidate emitted byte-identical program C, but the
+candidate had 25,004 additional `source_discovery_complete` allocations
+(8,484,401 to 8,509,405). Other allocation rows were identical. The added
+module and its three production imports changed the compiler's own source
+graph. Normal compiler C contained no marker symbols, yet generated compiler
+C differed beyond definition-ID renaming. The marker candidate is rejected.
+Matched measurement artifacts are `/tmp/blorp-id-d0-measure.LoXsWT/{parent,candidate}.json`
+and the adjacent generated C.
+
+The revised candidate makes **no production source changes**. A benchmark-only
+worker profiles the existing functions directly, with exactly these three
+`--profile-function` selectors in `--profile-mode calls`:
+
+| Selector | Meaning |
+| --- | --- |
+| `stage_09_core/ir::core_var_equal` | CoreVar equality calls |
+| `stage_06_typecheck/type_system/env::scope_lookup` | Central local-scope lookup calls |
+| `stage_08_core_lower/lower::core_var_impl` | Calls to the one observed CoreVar constructor helper |
+
+The full selector spelling is pinned in the focused test. The parser requires
+exactly three selected and observed functions, the exact three result rows,
+call-total agreement, and zero profiler loss/corruption diagnostics. An
+unsupported display lookup is reported as metadata with `profiled_calls=0`,
+not as a synthetic profiler row or a claim about runtime demand. There is no
+registration function, runtime global counter, atomics, or production
+instrumentation.
+
+The frozen production replay input is parent revision
 `bbea8789383f51f471358569acb4c0ae1091b2c8`, tree
 `f1d74095c39d9a47abf10774029e2248168a5427`, with
 `blorp/src/main.brp` blob `e4edf283c6bb7f761c4e42d07885e57f63561f72`.
-The candidate `bin/blorp` SHA-256 is
-`7f06499cd86f3910236211ed8fdaff9289936ab2663a95d3eb92e10c0f1e0229`;
-the benchmark worker SHA-256 is
-`bdc611b5e3c464021291769f494b01d49312fd233fde89b2a6e3b173233c37dc`.
-`benchmarks/compiler_identity_work_replay` builds that worker through the
-existing benchmark helper, with the CLI main and required LSP native hooks.
-The worker self-compiles the frozen main through `--stop-after=specialize`,
-selecting only the four marker functions and registration function in
-`--profile-mode calls`. This is the earliest measured late-Core boundary that
-exercises both central scope lookup and CoreVar equality.
+The revised `-O2` compiler SHA-256 is
+`a376b4d921948ec2fe55b274bee63719e5ea591049a9f33457068453292159ff`;
+the disposable worker SHA-256 is
+`95dafc3c4c6dce952a5e9fb60687436e3f2ce6fc353bf400414dfa27cc12b4c8`.
+The benchmark worker self-compiles the frozen main through
+`--stop-after=specialize` with an explicit Core dump file, selecting only the
+three functions above. The two runs were serialized:
 
-Two serialized runs exited successfully with identical counts, after
-subtracting the one schema-registration call from every marker:
+| Existing function | Calls, run 1 | Calls, run 2 |
+| --- | ---: | ---: |
+| `core_var_equal` | 111,577 | 111,577 |
+| `scope_lookup` | 4,731,560 | 4,731,560 |
+| `core_var_impl` | 358,423 | 358,423 |
 
-| Marker | Calls in each run | Coverage |
-| --- | ---: | --- |
-| `identity_work_core_var_equal` | 111,577 | Central `core_var_equal` calls |
-| `identity_work_local_scope_lookup` | 4,731,560 | Central stage-6 `scope_lookup` calls |
-| `identity_work_observed_core_var_constructor_helper_calls` | 358,423 | `stage_08_core_lower/lower.brp:core_var_impl` calls only |
-| `identity_work_observed_display_lookup` | 0 | `unsupported_current_authority`; not a runtime-demand estimate |
-
-Both calls-mode diagnostics say `functions_selected=5`,
-`functions_observed=5`, `calls_observed=5,201,565`, and
-`calls_completed=0`; all reported loss/corruption and abandoned-frame fields
-are zero. The extractor rejects missing/nonzero diagnostics, incomplete marker
-rows, unequal call totals, mismatched counts, mismatched Core hashes, and
-unsuccessful runs. The two ~389 MiB serialized Core outputs share SHA-256
+Both runs exited with status 0. Diagnostics report `profile_mode=calls`,
+`functions_selected=functions_observed=3`, `calls_observed=5,201,560`,
+`calls_completed=0`, and zero loss/corruption and abandoned-frame fields.
+Both ~389 MiB Core outputs have SHA-256
 `24dea825ed4482742dcf50f90570c5b86aab00ff44eb2c3ae5ba325b5d7e365d`.
-The unfiltered and five-selector exact-mode specialize pairs produced these
-same counts and Core hash.
+The checked extraction is `/tmp/blorp-id-c0b-direct-o2-counts.json`; raw
+profiles/stderr and Core outputs are
+`/tmp/blorp-id-c0b-direct-o2-{1,2}.log/.core`. Build evidence is
+`/tmp/blorp-id-c0b-direct-o2-build.log`; the worker is at
+`/tmp/blorp-id-c0b-direct-o2-worker/compiler_identity_work_replay`.
+Elapsed time was 43.86/39.43 seconds and peak RSS was
+8,398,766,080/8,399,011,840 bytes. This is a reproducible observability
+checkpoint, not a low-resource routine benchmark.
 
-Retained artifacts outside the repository:
+Normal disabled-build evidence against the pre-C0b `bbea8789` compiler:
+the generated compiler C is byte-identical (SHA-256
+`24a5a7c15933a6d9ea3fd7587d6c8d5845107b4dc0e4752b86ef3c7acf0176d3`).
+The compared files are
+`/tmp/blorp-id-c0b-parent.tXYzFE/blorp/blorp/build/_build/blorp-cli/blorp_cli_main.c`
+and `blorp/build/_build/blorp-cli/blorp_cli_main.c` in this worktree.
+The normal toy fixture generated C is also byte-identical (SHA-256
+`c329e7088086850dd6296265676c41cc2ae38f45ae13ee0664479152489ef70d`),
+and both normal runs report `allocations=0` after allocator reset. Artifacts:
+`/tmp/blorp-id-c0b-direct-normal-{parent,candidate}.c/.log`.
+Two `-O2` toy exact-profile runs additionally reported exactly two equality
+and two scope-lookup calls, with zero measured allocations
+(`/tmp/blorp-id-c0b-direct-o2-toy-{1,2}.log`). The current-main matched
+D0 self-compile allocation check remains an integration gate, owned by D0.
 
-- `/tmp/blorp-id-c0b-calls-counts.json` — checked extraction and provenance.
-- `/tmp/blorp-id-c0b-calls-{1,2}.log` — raw profiles, diagnostics, stderr,
-  success status, and resource rows.
-- `/tmp/blorp-id-c0b-calls-{1,2}.core` — serialized output identity oracle.
-- `/tmp/blorp-id-c0b-calls-worker/compiler_identity_work_replay` and
-  `/tmp/blorp-id-c0b-calls-build.log` — worker and build evidence.
+## Historical evidence, not current acceptance
 
-This is an observability checkpoint, not a fast routine benchmark: runs took
-41.39/39.27 seconds and peaked at 8,394,670,080/8,394,145,792 bytes RSS.
-The named Core-stage stop serializes ~389 MiB. A no-dump probe was rejected:
-the stop emitted the same Core JSON to stdout, making a ~389 MiB log, with
-42.28 seconds and 8,397,635,584 bytes RSS. Its diagnostic is
-`/tmp/blorp-id-c0b-no-dump-1.log`; it is not acceptance evidence. Earlier
-lower stopped before Core equality (zero calls); a Perceus probe exceeded the
-fast-feedback resource boundary. Neither is the retained production result.
+The earlier unfiltered exact-mode specialize replay of the marker candidate
+already included profiler rows for the original functions, independently of
+their markers:
 
-## Coverage and normal-build contract
+| Existing function | Direct calls | Former marker count after registration subtraction |
+| --- | ---: | ---: |
+| `core_var_equal` | 111,577 | 111,577 |
+| `scope_lookup` | 4,731,560 | 4,731,560 |
+| `core_var_impl` | 358,423 | 358,423 |
+
+The raw row evidence is `/tmp/blorp-id-c0b-specialize-1.log`. It supports the
+call-boundary substitution but is not a replay of the revised worker. The
+old paired five-marker calls-mode artifacts
+(`/tmp/blorp-id-c0b-calls-{1,2}.log` and `.core`,
+`/tmp/blorp-id-c0b-calls-counts.json`) are retained only as rejected-candidate
+diagnostics. They must not be used as revised-candidate acceptance evidence.
+The old calls-mode pair took 41.39/39.27 seconds, peaked at
+8,394,670,080/8,394,145,792 bytes RSS, and serialized ~389 MiB Core output
+each run. A no-dump probe streamed that Core output to stdout instead and did
+not improve resources (`/tmp/blorp-id-c0b-no-dump-1.log`).
+
+## Coverage limits
 
 `covered_helper_sites = [stage_08_core_lower/lower.brp:core_var_impl]` and
 `total_static_constructor_sites = 47`. The denominator is a pinned,
 source-shape-conditional census of lexically adjacent `name`, `id`, `def_id`
 fields in complete-field CoreVar literals under stage 8/9. It excludes record
-updates and is **not** a semantic total-construction count. The focused test
-fails if the per-file census or sole covered helper changes. C3a owns moving
-the remaining raw sites to a central constructor; C0b does not rewrite them.
+updates and is **not** a semantic total-construction count. The test fails if
+the per-file census or observed helper changes. C3a owns moving remaining
+raw sites to a central constructor; this checkpoint does not rewrite them.
 
 No current central ID-to-display/name accessor serves Core and backend.
-C1/C3 must move the registered-but-uncalled display marker to that accessor
-when the display authority exists. Separate string-hash calls cannot be
-observed without library/runtime intrusion; scope-lookup and CoreVar-equality
-counts are explicit proxies, not exact hash/string-equality counts.
+C1/C3 must add the display selector at that authority when it exists. Separate
+string-hash calls cannot be observed without library/runtime intrusion;
+scope-lookup and CoreVar-equality call counts are explicit proxies, not exact
+hash/string-equality operation counts.
 
-The debug-only markers use `black_box_int(0)` and no mutable runtime counter.
-Parent and candidate normal `examples/hello.brp` generated C were
-byte-identical, SHA-256
-`e26bd0ce67ff86cbaf838aa47d6b123a0c4d44ab6b0770bcf1619f9928615025`.
-The candidate's normal compiler-importing fixture C had no marker or
-registration symbols/calls; parent and candidate fixture binaries both
-reported `allocations=0` after allocator reset around measured calls. That
-compiler-importing fixture C was **not** byte-identical: importing the
-debug-only module shifts generated definition IDs. It is the allocation
-oracle, not the byte-identity oracle. Artifacts are
-`/tmp/blorp-id-c0b-hello-{parent,candidate}.c`,
-`/tmp/blorp-id-c0b-{parent,normal}.c`, and
-`/tmp/blorp-id-c0b-counts.json` for the two-run toy exact-profile fixture
-(2 equality, 2 scope, 0 allocations).
-
-## Validation and friction
-
-`scripts/compiler-check --changed` passed 2,473/2,473 selected cases,
-five suites and two checks; `scripts/compiler-check --validate-manifest`
-passed 348 modules/253 suites/10 checks. A first production-worker build
-exposed missing local include paths; an initial link exposed LSP native hooks
-pulled in by CLI main. These were resolved only in the benchmark worker's
-include/link inputs, with backwards-compatible helper options and focused
-command-construction tests. The failed diagnostics remain under
-`/tmp/blorp-id-c0b-replay-build.log` and related build logs.
+The compiler-sized replay uses explicit Core dump files and `/dev/null`
+output. Its benchmark-only LSP native hook link input remains necessary
+because it imports CLI main. The 47-site census and unsupported display
+status are coverage labels, not additional profiler rows.
