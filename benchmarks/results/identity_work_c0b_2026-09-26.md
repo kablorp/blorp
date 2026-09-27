@@ -2,16 +2,15 @@
 
 ## Accepted candidate: direct function selectors
 
-The normal-build allocation contract rejected the first C0b marker module.
-On frozen input revision `c4f7c16352e664714da74ba26e8f99f14ef52240`,
-the parent and marker candidate emitted byte-identical program C, but the
-candidate had 25,004 additional `source_discovery_complete` allocations
-(8,484,401 to 8,509,405). Other allocation rows were identical. The added
-module and its three production imports changed the compiler's own source
-graph. Normal compiler C contained no marker symbols, yet generated compiler
-C differed beyond definition-ID renaming. The marker candidate is rejected.
-Matched measurement artifacts are `/tmp/blorp-id-d0-measure.LoXsWT/{parent,candidate}.json`
-and the adjacent generated C.
+The first C0b marker module is rejected because it changed the compiler's
+source graph and the normal compiler C differed beyond definition-ID
+renaming, even though marker calls themselves erased and compiled programs
+remained byte-identical. Its apparent 25,004-allocation discovery regression
+was measured from different worktree directories and is confounded by path
+construction; the parent reproduces the higher count when run from the
+candidate directory. Those cross-directory records are retained only as
+rejected measurement evidence at
+`/tmp/blorp-id-d0-measure.LoXsWT/{parent,candidate}.json` and adjacent C.
 
 The revised candidate makes **no production source changes**. A benchmark-only
 worker profiles the existing functions directly, with exactly these three
@@ -75,8 +74,28 @@ and both normal runs report `allocations=0` after allocator reset. Artifacts:
 `/tmp/blorp-id-c0b-direct-normal-{parent,candidate}.c/.log`.
 Two `-O2` toy exact-profile runs additionally reported exactly two equality
 and two scope-lookup calls, with zero measured allocations
-(`/tmp/blorp-id-c0b-direct-o2-toy-{1,2}.log`). The current-main matched
-D0 self-compile allocation check remains an integration gate, owned by D0.
+(`/tmp/blorp-id-c0b-direct-o2-toy-{1,2}.log`).
+
+The integrated D0 gate compares current-main parent
+`c4f7c16352e664714da74ba26e8f99f14ef52240` with direct-selector candidate
+`db9146e95323`, compiling the same frozen current-main input from the same
+working directory with fresh `-O2` compilers and two instruction samples.
+Generated program C is byte-identical (78,677,202 bytes, SHA-256
+`d968bfd95186825d9e33c80815140f76b7729fc5c66f421c20bcd87521e2b643`).
+Every allocation checkpoint is identical, including discovery at 8,509,405
+and the 195,308,238 total. Minimum retired instructions are
+151,476,328,277 parent and 151,474,784,130 candidate (-0.001%). The retained
+records and generated C are
+`/tmp/blorp-id-d0-measure.LoXsWT/{parent,candidate}-same-cwd.json/.c`.
+
+An earlier cross-worktree comparison is rejected measurement evidence. It
+ran each compiler from its own differently sized checkout path and reported
+25,004 extra transient discovery allocations even after compiler C became
+byte-identical; rerunning the parent from the candidate working directory
+reproduced the candidate count exactly. Self-compile comparisons must hold
+the working directory fixed because discovery constructs path strings and
+its allocation count is path-sensitive. The rejected records are the other
+`parent*.json` and `candidate*.json` files in that artifact directory.
 
 ## Historical evidence, not current acceptance
 
