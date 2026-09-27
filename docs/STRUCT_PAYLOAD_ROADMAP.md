@@ -22,8 +22,8 @@ S5 remain proposals requiring their stated dependencies and fresh evidence.
 
 Companions: [`CORE_NODE_TABLE_ROADMAP.md`](CORE_NODE_TABLE_ROADMAP.md) (N1
 owns the `CoreSourceLoc` conversion; S4 here does not repeat it) and
-[`TYPE_INTERNING_ROADMAP.md`](TYPE_INTERNING_ROADMAP.md) (I6 provides the
-name id that lets `CoreVar` become a struct in S4).
+[`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) (A8 exclusively owns the
+spelling-free `CoreVar`/`ResolvedValueId` conversion; S4 does not repeat it).
 
 ## Current status and decisions (2026-09-24)
 
@@ -39,7 +39,7 @@ the then-current integrated base.
 | S2a | The isolated S2a report is correctness evidence plus a small older-base measurement, not accepted/current-main performance evidence. Keep it experimental. See [`S2a outcome`](STRUCT_PAYLOAD_S2A_OUTCOME.md). |
 | S2b / S2 | S2b broadened typed accessor reach, but its three-pair stage-2 comparison on base `a1fb8e6a` improved median retired instructions by only 0.1052%, below the predeclared ≥2% bar. Park S2; S2a/S2b remain experimental and neither report is a measurement against current `main`. See the [S2b negative experiment](../benchmarks/results/struct_payload_managed_union_s2b_probe_2026-09-23.md). |
 | S3 | Accepted at `41592efd` following current-base evidence. The focused fixture reduced allocations 2,048→1,024 with checksum/live-object parity. Self-compile allocations fell 89,125 (-0.0388%); median retired instructions were effectively flat (+21,524), so there is no speed or latency claim. See the [current-base S3 outcome](../benchmarks/results/struct_payload_closure_env_current_base_2026-09-24.md). |
-| S4 | Wait for I6 before the name-id-dependent `CoreVar` conversion. N1's `CoreSourceLoc` work is already on `main`; do not repeat it in S4. |
+| S4 | Re-census the remaining hot records after the ID migration. `CoreVar` is removed from S4 and owned by `CORE_ID_MIGRATION.md` A8; N1's `CoreSourceLoc` work is already on `main`. |
 | S5 | Dictionary storage is parked: the inspected experimental C had 0 static dictionary boxing sites. Tuple storage remains only a future probe: 123 static sites in experimental C, not dynamic allocation/execution counts and not a post-S4 census. Recount after S4 before proposing implementation. |
 
 S2a's report compares its candidate with an older `2bb45f3f` base and measured
@@ -177,7 +177,7 @@ new layout. Rotation is only needed for the new layout to speed up
 | S1 | source unions with struct or enum payload fields get typed storage | struct payloads inline; `blorp_box_struct` count down; unlocks S4 | behavioural + codegen-audit updates |
 | S2 | **parked 2026-09-24** (see below): typed storage for managed fields, built and gated green | measured on stage 2: instructions -0.04%, allocations +0.33%, emitted C -2.1%, RSS -0.8% | behavioural; stage-2 instructions |
 | S3 | closure environments as a typed struct per closure instead of `void*` slots | struct captures inline; capture reads lose the unbox | behavioural |
-| S4 | convert hot records to structs: `CoreVar`, `SourceSpan`, `CoreParam` shape, small type nodes | lowering -0.35M (`CoreVar`) and downstream; discovery -5%; typed frontend no longer +2% | behavioural + allocation rows |
+| S4 | re-census and convert remaining hot, fixed-layout records one at a time; excludes `CoreVar` and `CoreSourceLoc` | determined by a fresh post-ID-migration census | behavioural + allocation rows |
 | S5 | tuple elements and dictionary slots typed by monomorphized layout | remaining box sites gone | behavioural |
 
 ### S0: census
@@ -358,39 +358,37 @@ what `env` points at.
 
 **Context.** Original premise, conditional on the required S1 and S2 union-
 layout changes being landed: the SourceSpan rule no longer applies to a struct
-in a union payload. S2 is currently parked, so that premise does not hold;
-S4 remains gated on I6 and a fresh decision about its S2 dependency. Candidates
-from the lowering type histogram and the allocation census:
+in a union payload. S2 is currently parked, so that premise does not hold.
+The old `CoreVar` target is also superseded: the value-ID migration removes its
+spelling and optional definition field rather than compacting that obsolete
+shape. Re-census the remaining candidates after A8/A11 and make a fresh
+decision about the S2 dependency.
 
 | type | today | as a struct | needs |
 | --- | --- | --- | --- |
-| `CoreVar { name: String, id: Int, def_id: Option[Int] }` | record, 349k allocations in lowering, rebuilt by every pass | `struct { name: NameId, id: Int, def_id: Int }` with `-1` for none | `TYPE_INTERNING_ROADMAP` I6 (name id) |
-| `SourceSpan { path: String, module_name: String, 6 x Int }` | record | `struct { path: NameId, module: NameId, 6 x Int }` | I6 |
+| `CoreVar { name: String, id: Int, def_id: Option[Int] }` | obsolete transitional record | spelling-free `ResolvedValueId { owner_definition_id, local_ordinal }` | exclusively `CORE_ID_MIGRATION.md` A8; not S4 |
+| `SourceSpan { path: String, module_name: String, 6 x Int }` | record materialized at display boundaries | only pursue a fixed layout if the post-A11 census still shows material cost | A11 source display catalog plus fresh evidence |
 | `CoreParam { name: CoreVar, typ: CoreType, loc }` | record | stays a record (holds a `CoreType` pointer) unless N5 gives it a type id | N5 |
-| `CoreLowerScopeEntry { name: String, id: Int }` | record; struct explicitly rejected at `lower.brp:508` | struct with a name id | I6 |
+| `CoreLowerScopeEntry { name: String, id: Int }` | transitional lowering record | deleted when resolved IDs reach lowering | `CORE_ID_MIGRATION.md` A3; not S4 |
 | `CoreSourceLoc` | union with a `String` | owned by `CORE_NODE_TABLE_ROADMAP` N1 | N1 |
 
 **Change.** One type per commit, each with the SourceSpan probe's method:
-count where the value lives, convert, measure every phase row. The
-`CoreVar` conversion also lets `core_var_equal` become two integer compares
-and removes one allocation from every binder in every rebuild.
+count where the value lives, convert, and measure every phase row. Do not add
+an S4 compatibility struct for a type another roadmap deletes.
 
-**Expected ROI.** `CoreVar`: -0.35M in lowering and a comparable amount in
-each pass that rebuilds binders (estimate -1M to -2M total). `SourceSpan`:
-discovery -5% as measured, without the +2% typed-frontend penalty.
-`CoreLowerScopeEntry`: the record box per scope entry gone. Across the
-pipeline, estimate -2% to -4% of total allocations, plus the instruction
-savings of value copies over retain and release pairs.
+**Expected ROI.** No retained estimate until the fresh census. The historical
+`CoreVar` estimate now belongs to A8 and must be remeasured there; the old
+`SourceSpan` and `CoreLowerScopeEntry` estimates cannot justify S4 work after
+their representation boundaries have moved.
 
-**Risks.** Each conversion changes many call sites mechanically; the
-formatter and compiler suites catch shape errors, the leak gate catches
-ownership ones. `Option[Int]` to a sentinel is a semantic choice; document
-`-1` in the struct's docstring.
+**Risks.** Each conversion changes many call sites mechanically; the formatter
+and compiler suites catch shape errors, and the leak gate catches ownership
+ones. Do not introduce sentinel encodings when a typed ID or precise variant
+already represents the state.
 
-**Oracle.** Byte-identical C is expected for `CoreVar` and
-`CoreLowerScopeEntry` (they are compiler-internal); `SourceSpan` changes
-diagnostics only if a caller drops the path, so the 860 fixtures are the
-oracle there.
+**Oracle.** Byte-identical C for compiler-internal representation cuts unless
+the owning issue explicitly names a layout change; exact diagnostic fixtures
+for any display-span carrier.
 
 ### S5: tuples and dictionaries
 
@@ -413,8 +411,8 @@ S0 and S1 start now. S2 follows S1 in the same files (`lower.brp`
 `match_projection.brp`, `specialize_layout.brp`, codegen fixtures) and should
 be the same worker or a sequential handoff. S3 is independent of S2 and can
 run alongside it (`closure.brp` and the closure emission in `emit.brp`). S4
-waits for S1, and for I6 for the types that need a name id; the `CoreVar`
-row is the first S4 task once I6 lands. None of S0 to S3 touch the files the
+waits for S1, A8/A11, and a fresh census of types not owned by those steps.
+None of S0 to S3 touch the files the
 node or interning roadmaps own; merge main before every gate run because all
 three roadmaps land into `emit.brp` and `lower.brp` in different functions.
 

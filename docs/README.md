@@ -59,7 +59,7 @@ module inventory lives in
 - [`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) — struct values inline in union payloads and closures (typed payload storage for source unions), then hot records become structs; steps S0-S5.
 - [`SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md`](SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md) — lexer/parser/discovery cuts (Task 4 landed; rest deferred), with its profile in `benchmarks/results/`.
 - [`TYPECHECK_OPTIMIZATION_ISSUES.md`](TYPECHECK_OPTIMIZATION_ISSUES.md) — five worker-ready typecheck issues (T-A..T-E) with anchors, fast loop, acceptance numbers.
-- [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) — Core variable identity by integer, steps 0-6 with start gates, oracles and expected effects; lessons from the reverted cuts.
+- [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) — compiler-wide ID-first migration from discovery through typecheck, Core, and emission; normalized logical tables, literate worker handoffs, A-stage/D-delivery/C-cut sequencing, typed identity domains, oracles, and stop rules.
 - [`PERCEUS_CLEANUP_ISSUES.md`](PERCEUS_CLEANUP_ISSUES.md) — worker-ready Perceus cleanup issues P0-P6 from the split observations; allocation floor rules.
 - [Compact Parser Migration](COMPACT_PARSER_MIGRATION.md) defines the staged
   schema, ownership, compatibility, and measurement contract for replacing

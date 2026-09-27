@@ -16,8 +16,8 @@ Anchors are against main at `dab2f490` (2026-09-23).
 
 Companions: [`CORE_NODE_TABLE_ROADMAP.md`](CORE_NODE_TABLE_ROADMAP.md) (its
 step N5 consumes this roadmap's I3) and
-[`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) (its step S4 consumes
-this roadmap's I6 name ids).
+[`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) (its A11 is the sole owner of
+source-name ID consolidation; the former I6 work is delegated there).
 
 ## What is true today
 
@@ -112,8 +112,8 @@ allocation-neutral with the flag off. Rows to watch: `typed_frontend_complete`
 | I3 | **parked 2026-09-24** as construction-time interning (lowering +41.6%, instructions +3.3%); I3a, the equality short-circuits alone, also parked (instructions +0.00%). Re-scoped: intern inside mono's substitution only, whose loop already threads state (about a quarter of constructions) | see below | after I1 |
 | I4 | `SemanticType` interned at its hot producers (`localize`, `qualify`, `apply_subst`, unify's rebuilds) | typed frontend -2M to -4M | I3 |
 | I5 | trait dispatch keyed by type id; `Dict[String, BackendTypeNaming]` and `CoreLayoutTypeIndex` keyed by type id | trait resolve instructions -10% to -20% of its row; allocations flat | after I3 |
-| I6 | name ids: `ParsedIdentifier` carries the lexer's id; `SourceNameTable` becomes a view of the lexer table; `CoreVar.name` becomes a name id with the spelling in one table | allocations flat (per T-A); `blorp_string_eq` samples down; unlocks `CoreVar` as a struct (S4) | after CORE_ID_MIGRATION step 6 |
-| I7 | definition table built once after lowering (T5 as re-specified), consumers converted one at a time | instructions -1% to -3%; the parked +11% must not recur | after I3 |
+| I6 | **delegated to `CORE_ID_MIGRATION.md` A11**: parser/source-name ID consolidation after the value-ID frontier is complete | no independent implementation here | after A10, as part of A11 |
+| I7 | **superseded by `CORE_ID_MIGRATION.md` A1/A3/A7**: reuse the frozen frontend definition table plus generated overlay; consumer-specific current-program indexes are views, not an identity authority | no independent table build here | delegated |
 
 ### I1: substitution that returns its input
 
@@ -299,44 +299,35 @@ and the backend naming lookups; allocations flat. Report samples of
 
 ### I6: names as ids
 
-**Context.** Interning exists at the lexer and again in the typechecker;
-`ParsedIdentifier` and `CoreVar.name` are strings between and after. The
-measured allocation effect of name-id keys is zero; the reasons to do it are
-instruction count, cleanliness, and enabling `CoreVar` to become a struct
-(`STRUCT_PAYLOAD_ROADMAP.md` S4), which needs `{ name_id: Int, id: Int,
-def_id: Int }`.
+This item is no longer an implementation step in the type-interning series.
+The current `ParsedIdentifier` still carries `text: String`; T3 did not change
+that representation. [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) A11 owns
+the future lexer/parser/source-table projection after A8-A10 have removed
+spelling from resolved values, named types, constructors, fields, and traits.
+Its formatter, diagnostic, LSP, and generated-C oracles apply. Do not start a
+second `NameId` migration from this roadmap.
 
-**Change.** T3 completed: `ParsedIdentifier { name: NameId, span }` with the
-text reachable through the compilation's name table; `SourceNameTable`
-becomes a pass-through view; `CoreVar.name` becomes `NameId` and the C
-emitter reads the spelling from the table (this is `CORE_ID_MIGRATION.md`
-step 6's "spellings in one table", so do it as that step or right after it).
-The formatter is the strongest oracle for the parser half.
-
-**Expected ROI.** Allocations flat; `blorp_string_eq` samples down; the
-enabling effect is S4's.
-
-**Risks.** Hygiene (same-named locals differ by `id`, not by name);
-diagnostics render through the table; the name table must be per
-compilation and append-only for the LSP's incremental reparse.
-
-**Oracle.** Byte-identical C; `bin/blorp format --check` clean on the whole
-tree; diagnostic fixtures.
-
-### I7: the definition table, built once
+### I7: definition lookup views
 
 **Context.** T5 parked at +11% because the table was built in the per-module
 loop and made `decls` non-unique. `441f568a` showed the consumer side pays
 (DCE indexes by definition id: instructions -0.32%).
 
-**Change.** Build `DefinitionTable` once after lowering from the final
-`decls` (ids only, per the node roadmap's rule), publish it on
-`CorePassState` next to `CoreProgramFacts` (N4 of the node roadmap shares the
-record), and convert consumers one per commit: mono's
-`collect_generic_functions`, DCE roots, Perceus `build_env`'s callable index.
+**Status.** Superseded as an identity-table proposal. Do not build a second
+`DefinitionTable` after lowering. [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md)
+A1/A3 owns the frozen frontend definition authority and append-only generated
+overlay; A7 converts mono, DCE, and Perceus consumers to those IDs.
 
-**Expected ROI.** Instructions -1% to -3%. Go/no-go: each consumer's pass
-row must not rise.
+If one of those consumers still needs a current-program declaration lookup,
+publish a clearly named view such as `CoreDeclarationRowIndex` containing only
+definition ID to current row index/scalar facts. It must not duplicate display
+rows, own the definition frontier, retain declaration bodies, or compete with
+`CompilerIdentityFacts`. Build and measure each view with its first active
+consumer, then delete that consumer's private scan/index in the same cut.
+
+**Expected ROI.** No retained aggregate estimate. The prior DCE result is a
+reason to measure a view, not permission to publish another authority. Each
+consumer's pass row must fall or the view is removed.
 
 **Oracle.** Byte-identical C.
 
@@ -345,8 +336,8 @@ row must not rise.
 I1, I2 and I3 touch different files from each other (`semantic_type.brp`;
 `mono_specialize.brp` and `lower.brp`'s call lowering; `lower.brp`'s type
 lowering, `ir.brp` equality, `mono.brp` substitution) and can run as three
-workers at once. I4 follows I1 in the same files. I5 and I7 follow I3. I6
-waits for `CORE_ID_MIGRATION.md` step 6. None of these touch union layout or
+workers at once. I4 follows I1 in the same files. I5 follows I3. I6 and I7 are
+delegated to `CORE_ID_MIGRATION.md` and have no workers here. None of these touch union layout or
 `CoreSourceLoc`, so the two companion roadmaps run alongside. The one shared
 seam is `ir.brp`: this roadmap edits `core_type_equal` and later adds the
 type table field; the node roadmap edits `CoreSourceLoc` and `CoreProgram`.

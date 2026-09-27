@@ -463,11 +463,13 @@ stopped moving.
 | --- | --- | --- |
 | this one | `ir.brp` (`CoreSourceLoc`, `CoreProgram`, node ids), `traverse.brp`, `pass_runner.brp`, `perceus/uses.brp` (N3), `closure.brp`/`resolve.brp`/`dce.brp` builders (N4), emit's statement path (N6) | `lower.brp` (loc minting only) |
 | `TYPE_INTERNING_ROADMAP` | `semantic_type.brp`, `context.brp`, type lowering in `lower.brp`, `mono*.brp`, `trait_resolve.brp` keys, `list_layout.brp` | `ir.brp` (`CoreType` equality, then the type table field) |
-| `STRUCT_PAYLOAD_ROADMAP` | `lower_union_payload_storage` in `lower.brp`, union emission in `emit.brp`, `match_projection.brp` accessors, `specialize_layout.brp`, codegen fixtures | `ir.brp` (only after N1: `CoreVar` as a struct needs a name id from interning) |
+| `STRUCT_PAYLOAD_ROADMAP` | `lower_union_payload_storage` in `lower.brp`, union emission in `emit.brp`, `match_projection.brp` accessors, `specialize_layout.brp`, codegen fixtures | `ir.brp` for remaining measured record candidates; `CoreVar` is owned exclusively by `CORE_ID_MIGRATION.md` A8 |
 
 Meeting points: N1 gives `STRUCT_PAYLOAD_ROADMAP` its example of a
 record-to-handle conversion and owns `CoreSourceLoc`, so that roadmap does
-not convert it. N5 waits for I3. Nothing in N1 to N4 conflicts with either
+not convert it. `CORE_ID_MIGRATION.md` A8 owns the spelling-free value-ID
+replacement for `CoreVar`; neither companion should introduce a name-ID
+struct first. N5 waits for I3. Nothing in N1 to N4 conflicts with either
 companion; run them concurrently, each in its own worktree, and merge main
 before every gate run.
 

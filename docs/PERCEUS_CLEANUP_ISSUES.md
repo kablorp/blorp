@@ -113,27 +113,25 @@ the simplification for clarity only and say so.
 
 ## P3. The resolved-value index as an id-keyed table
 
-**Observation.** `PerceusResolvedValueIndex` (`perceus/results_and_loops.brp`,
-used by `resolved_value_occurrence_count`, `add_resolved_value`,
-`add_resolved_value_occurrences`, `without_bound_value`) is a
-`Dict[String, Dict[Int, Dict[Int, Int]]]` keyed name, then `id`, then
-`def_id`, threaded through every recursive call of `insert_drops_expr_inner`
-and rebuilt with `.set` at every binding that consumes an occurrence. It is
-real state, but its shape is the name-keyed shape the identity roadmap
-retires, and the triple nesting allocates on every update.
+**Status.** The original outer `String` level has landed. The current
+`PerceusResolvedValueIndex` is `Dict[Int, Dict[Int, Int]]`, keyed by the
+transitional `(CoreVar.id, def_id)` pair, and its collision fixtures prove
+that neither component is sufficient alone. Do not flatten it to raw `id` or
+invent an integer pair encoding while match/synthetic identities remain
+incomplete.
 
-**Gate to start.** P0 shows the index's updates above 5% of the pass, or
-step 1 of [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) has landed (then
-`id` is unique per binder and the name key is redundant).
+**Remaining change.** This item is delegated to
+[`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) A4/A7. After strict
+`ResolvedValueId` is green, key the index by that exact typed identity. C1b's
+representation probe decides whether the physical table is a dictionary,
+nested owner/ordinal rows, or a dense per-owner list; source spelling never
+returns to the key.
 
-**Change.** Key by the variable's identity: after roadmap step 1, a flat
-`Dict[Int, Int]` from `id` to count (or a list indexed by `id` within the
-function when the range is dense); before it, the same with the pair
-encoded as one Int and the name dropped only where `id` is already
-unique (SSA versions). Delete the String level.
-
-**Acceptance.** Identical C; the row falls by what P0 predicted; the
-occurrence-count tests in `test_core_perceus.brp`.
+**Gate and acceptance.** C4c's zero-pending strict identity gate must be green.
+P0 must show enough index work to support a performance claim; otherwise C7c may land only
+as measured semantic cleanup with no speed claim. Require identical C, the
+three collision/occurrence-count fixture families in `test_core_perceus.brp`,
+and no increase in the Perceus row.
 
 ## P4. One frame-stack helper instead of three
 
@@ -171,7 +169,8 @@ which matter:
   further, compute the fields as locals and publish once at the return.
 - `exact_owned_vars_add/remove/contains` (`CoreVar` set over a list) and
   `int_list_contains` (`contracts.brp`) are the same membership shape; after
-  roadmap step 1 the `CoreVar` version can key on `id`.
+  `CORE_ID_MIGRATION.md` A4/A7 the `CoreVar` version can key on exact
+  `ResolvedValueId`, never raw `id`.
 - `same_core_expr` / `same_core_expr_list` are redeclared in four `perceus/`
   files (eleven files repo-wide) behind a comment that says to delete them
   once the bootstrap pin passes the commit that introduced
@@ -198,5 +197,6 @@ done by the same worker after it.
 ## Order
 
 P0 first and alone. P1 and P2 are independent of P0 and of each other; P6
-follows P1. P3, P4 and P5 wait for P0's table, and P3 prefers roadmap step 1.
+follows P1. P4 and P5 wait for P0's table. P3's remaining exact-ID conversion
+waits for `CORE_ID_MIGRATION.md` A4/A7.
 Each issue is one squash commit with its measurement in the commit body.
