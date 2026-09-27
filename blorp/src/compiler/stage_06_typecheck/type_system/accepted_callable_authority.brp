@@ -110,7 +110,8 @@ private record AcceptedCallableTableRep {
 	definition_table: DefinitionTable,
 	source_name_table: SourceNameTable,
 	slots: List[AcceptedCallableSlot],
-	owner_entries: List[OverloadEntry],
+	canonical_bindings: List[AcceptedCallableBinding],
+	owner_bindings: List[AcceptedCallableBinding],
 	indices_by_definition_id: Dict[Int, List[Int]],
 	slot_range_by_module: List[AcceptedCallableModuleRange]
 }
@@ -235,7 +236,8 @@ pure func accepted_callable_table(
 	)
 	source_name_table = prepared_module_scope_source_name_table(input.scope)
 	var slots: List[AcceptedCallableSlot] = []
-	var owner_entries: List[OverloadEntry] = []
+	var canonical_bindings: List[AcceptedCallableBinding] = []
+	var owner_bindings: List[AcceptedCallableBinding] = []
 	var indices_by_definition_id: Dict[Int, List[Int]] = {}
 	empty_range: AcceptedCallableModuleRange = {
 		start = 0,
@@ -323,11 +325,24 @@ pure func accepted_callable_table(
 					else:
 						range.start
 
-					match owner_entry(module_table, definition_table, slot):
-						Some(local_entry):
-							-- Both payload columns append together after validation.
+					match (
+						owner_entry(module_table, definition_table, slot),
+						definition_table_callable_row(definition_table, definition_id),
+					):
+						(Some(local_entry), Some(row)):
+							-- Both binding views use the defining row's spelling, even
+							-- when a selective import later exposes a different name.
 							slots = slots.append(slot)
-							owner_entries = owner_entries.append(local_entry)
+							canonical_bindings = canonical_bindings.append({
+								id = slot.id,
+								source_name = row.name,
+								entry = slot.entry,
+							})
+							owner_bindings = owner_bindings.append({
+								id = slot.id,
+								source_name = row.name,
+								entry = local_entry,
+							})
 							indices_by_definition_id = indices_by_definition_id.set(
 								definition_id,
 								definition_indices.append(index),
@@ -342,7 +357,7 @@ pure func accepted_callable_table(
 
 							previous_module_index = Some(owner_index)
 							previous_source_name_index = Some(source_name_index)
-						None:
+						_:
 							valid = False
 				_:
 					valid = False
@@ -353,7 +368,8 @@ pure func accepted_callable_table(
 					definition_table = definition_table,
 					source_name_table = source_name_table,
 					slots = slots,
-					owner_entries = owner_entries,
+					canonical_bindings = canonical_bindings,
+					owner_bindings = owner_bindings,
 					indices_by_definition_id = indices_by_definition_id,
 					slot_range_by_module = slot_range_by_module
 				}))
@@ -739,6 +755,13 @@ private pure func entry_at(
 	authority: AcceptedCallableAuthorityRep,
 	index: Int,
 ) -> Option[OverloadEntry]:
+	binding_at(authority, index).map(func(binding): binding.entry)
+
+
+private pure func binding_at(
+	authority: AcceptedCallableAuthorityRep,
+	index: Int,
+) -> Option[AcceptedCallableBinding]:
 	table = table_rep(authority.table)
 	slot ?= table.slots.get(index)
 	owner_module_id ?= callable_id_module_id(table.definition_table, slot.id)
@@ -750,32 +773,9 @@ private pure func entry_at(
 			False
 
 	if is_owner:
-		table.owner_entries.get(index)
+		table.owner_bindings.get(index)
 	else:
-		Some(slot.entry)
-
-
-private pure func binding_from_slot(
-	table: AcceptedCallableTableRep,
-	slot: AcceptedCallableSlot,
-	entry: OverloadEntry,
-) -> Option[AcceptedCallableBinding]:
-	row ?= definition_table_callable_row(table.definition_table, callable_id_definition_id(slot.id))
-	Some({
-		id = slot.id,
-		source_name = row.name,
-		entry = entry,
-	})
-
-
-private pure func binding_at(
-	authority: AcceptedCallableAuthorityRep,
-	index: Int,
-) -> Option[AcceptedCallableBinding]:
-	table = table_rep(authority.table)
-	slot ?= table.slots.get(index)
-	entry ?= entry_at(authority, index)
-	binding_from_slot(table, slot, entry)
+		table.canonical_bindings.get(index)
 
 
 private pure func append_module_ufcs_matches(
@@ -808,7 +808,7 @@ private pure func append_module_ufcs_matches(
 							match entry_at(authority, range.start + offset):
 								Some(entry):
 									if overload_entry_first_param_matches(entry, first_arg_type):
-										match binding_from_slot(table, slot, entry):
+										match binding_at(authority, range.start + offset):
 											Some(binding):
 												matches = matches.append(binding)
 											None:
@@ -903,7 +903,7 @@ pure func accepted_callable_find_owner_definition_id(
 				None:
 					False
 		)
-	table.owner_entries.get(index)
+	table.owner_bindings.get(index).map(func(binding): binding.entry)
 
 
 pure func accepted_callable_find_qualified(
@@ -925,7 +925,7 @@ pure func accepted_callable_find_qualified(
 		match table.slots.get(name_range.start + offset):
 			Some(slot):
 				if slot.visibility == PublicDeclaration:
-					result = binding_from_slot(table, slot, slot.entry)
+					result = table.canonical_bindings.get(name_range.start + offset)
 			None:
 				void
 
@@ -1082,7 +1082,7 @@ pure func accepted_callable_lookup_qualified_ufcs(
 												first_arg_type,
 											)
 										):
-											match binding_from_slot(table, slot, slot.entry):
+											match table.canonical_bindings.get(name_range.start + offset):
 												Some(binding):
 													result = result.append(binding)
 												None:

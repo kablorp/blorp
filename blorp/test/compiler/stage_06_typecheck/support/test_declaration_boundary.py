@@ -1639,7 +1639,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(lookup)
         self.assertIn("List[AcceptedCallableBinding]", lookup.group(0))
-        self.assertIn("binding_from_slot", lookup.group(0))
+        self.assertIn("canonical_bindings.get", lookup.group(0))
 
         selection = re.search(
             r"pure func accepted_callable_select_ufcs_method\(.*?"
