@@ -1,29 +1,54 @@
 #!/usr/bin/env python3
-"""Canonicalize generated symbol names in compiler C output and hash the result.
+"""Compare generated C exactly, or with explicitly mapped generated symbols.
 
-Four things in the output carry the definition ID the Core pipeline assigned:
-anonymous functions and static closures (`brp_<suffix>`, `__sc_brp_<suffix>`),
-the singleton of a nullary union variant (`__def_<id>_<Name>`, which also
-appears embedded in longer mangled names), generated local variable suffixes
-(`__v<n>`), and the `def_id=<n>` echoed in generated comments. A change that
-legitimately prunes or reorders declarations before monomorphization shifts
-those IDs, so all four shift even though the emitted program is the same, and
-the file size can move by a few bytes when an id changes digit count.
-`--require-identical` compares raw bytes and reports that as DIFFERENT.
-
-This script renumbers each family by first occurrence in the file, keeping
-everything else -- including the variant name in `__def_$<n>_<Name>` -- and
-prints a SHA-256 of the rewritten text.
-Two files with the same normalized hash differ only in the spelling of those
-generated symbols: the renaming is one-to-one and occurrence order is preserved,
-so any difference in structure, ordering, or in any other identifier survives
-normalization and changes the hash.
+Raw C cannot prove whether a generated-looking token is compiler-owned or
+source-authored. Without sidecars this tool hashes/compares raw C exactly.
+With one hash-bound sidecar per C file, only listed identifier/comment spans
+are normalized. Repeated uses share a logical key; collisions, splits, missing
+uses, literal changes and structural differences remain visible.
 
 Usage:
 
     benchmarks/normalize_generated_c_symbols a.c            # print hash
     benchmarks/normalize_generated_c_symbols a.c b.c        # compare, exit 1 if different
     benchmarks/normalize_generated_c_symbols --emit a.c     # print normalized text
+    benchmarks/normalize_generated_c_symbols --sidecar a.json a.c
+    benchmarks/normalize_generated_c_symbols --sidecar a.json --sidecar b.json a.c b.c
+
+Sidecar v1 is JSON with `version: 1`, `c_sha256` for exact UTF-8 C bytes, and
+`locals`, a list of `{owner_definition_id, local_ordinal, scope_span,
+emitted_identifier, declaration_span, reference_spans}` records. It may also
+contain `generated`, a list of `{kind, identity, spelling, spans}` records,
+where kind is callable, static_closure, definition, variable_suffix, or
+definition_comment. Spans are zero-based `[start, end]` character offsets into
+the C text. Local spans cover full identifier tokens; generated spans cover
+the exact spelling supplied. Every occurrence of a mapped spelling must be
+listed. V1 local rows cover simple block-local declarations with primitive/
+specifier sequences or explicit `struct|union|enum Tag` types.
+Optional qualifiers and pointer stars may precede the local identifier, which
+must be followed by `=`, `;`, `,`, or `[`. The scope is the innermost balanced
+brace pair containing its declaration, and that brace pair must be a recognized
+compound opening: a primitive/tagged-return function body, control body ending
+`)`, naked nested block, `else`/`do`/label body, or assignment/return
+statement expression ending `= (` / `return (`.
+Unknown openings, type definitions, and initializer braces reject. Typedef-typed locals,
+unknown included-header types, parameters, function pointers, and complex
+declarators fail closed and remain raw-different. C5c must emit only supported
+rows, or deliberately version and extend the oracle or emit an independently
+validated compiler-owned binding marker before relying on those forms.
+Every mapped identifier token is listed exactly once; a reference belongs to
+the innermost containing declaration that precedes it. Logical and scoped
+local keys occur in exactly one row. Directive tokens, member names, labels,
+goto targets, tag names, and typedef names are excluded from local spans.
+Directive detection follows C line splicing and treats leading block comments
+as whitespace. V1 sidecars reject C whose post-splice text contains `%:` or
+`??=` anywhere, since
+those alternate preprocessor-marker spellings need preprocessing before local
+identifier roles can be trusted. Raw comparison remains available.
+Numeric IDs may drift: normalization numbers locals by structural scope and
+declaration order, and other generated symbols by their first occurrence
+within each family. Linked callable/closure and definition/comment rows must
+agree on the raw identity payload within each file.
 
 Exit status is 0 when the hashes agree, 1 when they do not, and 2 on a usage or
 I/O error.
@@ -32,50 +57,452 @@ I/O error.
 from __future__ import annotations
 
 import argparse
+import bisect
 import hashlib
+import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-# `brp_<suffix>` and `__sc_brp_<suffix>` name anonymous functions and static
-# closures; the longer alternative comes first so the static-closure prefix is
-# not split by the shorter match. `__def_<id>_<Name>` names the singleton of a
-# nullary union variant, where only the numeric id is definition-derived and the
-# trailing name is meaningful, so the id alone is renumbered.
-# Four families carry a definition ID. `__def_` is matched without a word
-# boundary because it also appears embedded in longer mangled names, preceded by
-# an underscore; the prefix is distinctive enough to be unambiguous on its own.
-GENERATED_SYMBOL_RE = re.compile(
-    r"\b(__sc_brp_|brp_)([A-Za-z0-9]+)\b"  # anonymous functions, static closures
-    r"|__def_(\d+)_"  # nullary union variant singletons
-    r"|(__v)(\d+)\b"  # generated local variable suffixes
-    r"|(def_id=)(\d+)\b"  # the id echoed in generated comments
+TOKEN_RE = re.compile(
+    r"(?P<comment>/\*[\s\S]*?\*/|//[^\n]*)"
+    r"|(?P<literal>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+    r"|(?P<identifier>[A-Za-z_][A-Za-z_0-9]*)"
+    r"|(?P<number>[0-9]+)"
+    r"|(?P<brace>[{}])"
+    r"|(?P<punct>[#;=,*()\[\]+\-/&|<>?:.])"
 )
+GENERATED_GRAMMARS = {
+    "callable": re.compile(r"brp_[A-Za-z0-9]+"),
+    "static_closure": re.compile(r"__sc_brp_[A-Za-z0-9]+"),
+    "definition": re.compile(r"__def_[0-9]+_"),
+    "variable_suffix": re.compile(r"[A-Za-z_][A-Za-z_0-9]*__v[0-9]+"),
+    "definition_comment": re.compile(r"def_id=[0-9]+"),
+}
 
 
-def normalize(text: str) -> str:
-    """Rewrite generated symbol names to their first-occurrence index."""
-    numbering: dict[str, int] = {}
+@dataclass(frozen=True)
+class Lexeme:
+    match: re.Match[str]
+    source_start: int
+    source_end: int
+    logical_start: int
+    logical_end: int
 
-    def index_of(symbol: str) -> int:
-        if symbol not in numbering:
-            numbering[symbol] = len(numbering)
-        return numbering[symbol]
+    def group(self, name: str | int) -> str | None:
+        return self.match.group(name)
 
-    def replace(match: re.Match[str]) -> str:
-        if match.group(3) is not None:
-            return f"__def_${index_of(match.group(0))}_"
-        if match.group(4) is not None:
-            return f"__v${index_of(match.group(0))}"
-        if match.group(6) is not None:
-            return f"def_id=${index_of(match.group(0))}"
-        return f"{match.group(1)}${index_of(match.group(0))}"
+    def start(self) -> int:
+        return self.source_start
 
-    return GENERATED_SYMBOL_RE.sub(replace, text)
+    def end(self) -> int:
+        return self.source_end
+
+    def span(self) -> tuple[int, int]:
+        return self.source_start, self.source_end
 
 
-def normalized_hash(path: Path) -> str:
-    return hashlib.sha256(normalize(path.read_text()).encode("utf-8")).hexdigest()
+def c_lexemes(text: str) -> tuple[list[Lexeme], str]:
+    """Apply C line splicing before lexing, retaining original offsets."""
+    chunks: list[str] = []
+    event_positions: list[int] = []
+    cumulative_removed: list[int] = []
+    previous = 0
+    removed = 0
+    for splice in re.finditer(r"\\\r?\n", text):
+        chunks.append(text[previous:splice.start()])
+        event_positions.append(splice.start() - removed)
+        removed += splice.end() - splice.start()
+        cumulative_removed.append(removed)
+        previous = splice.end()
+    chunks.append(text[previous:])
+    logical = "".join(chunks)
+
+    def start_offset(position: int) -> int:
+        index = bisect.bisect_right(event_positions, position) - 1
+        return position + (cumulative_removed[index] if index >= 0 else 0)
+
+    def end_offset(position: int) -> int:
+        index = bisect.bisect_left(event_positions, position) - 1
+        return position + (cumulative_removed[index] if index >= 0 else 0)
+
+    return ([Lexeme(match, start_offset(match.start()), end_offset(match.end()),
+                    match.start(), match.end())
+             for match in TOKEN_RE.finditer(logical)], logical)
+
+
+def directive_spans(lexemes: list[Lexeme], logical: str) -> list[tuple[int, int]]:
+    """Find logical-line directives after whitespace and block comments."""
+    spans: list[tuple[int, int]] = []
+    directive_start: int | None = None
+    directive_end = 0
+    leading_only = True
+    previous_end = 0
+    for lexeme in lexemes:
+        gap = logical[previous_end:lexeme.logical_start]
+        if "\n" in gap:
+            if directive_start is not None:
+                spans.append((directive_start, directive_end))
+                directive_start = None
+            leading_only = True
+            gap = gap.rsplit("\n", 1)[-1]
+        if gap.strip():
+            leading_only = False
+        if directive_start is not None:
+            directive_end = lexeme.end()
+        elif lexeme.group("comment") is not None:
+            pass  # Phase-3 block comments act as whitespace, even across lines.
+        elif lexeme.group(0) == "#" and leading_only:
+            directive_start = lexeme.start()
+            directive_end = lexeme.end()
+        else:
+            leading_only = False
+        previous_end = lexeme.logical_end
+    if directive_start is not None:
+        spans.append((directive_start, directive_end))
+    return spans
+
+
+def apply_sidecar(text: str, sidecar: dict) -> str:
+    """Replace only exact, declared local-token spans from a versioned map."""
+    if not isinstance(sidecar, dict) or set(sidecar) - {"version", "c_sha256", "locals", "generated"}:
+        raise ValueError("sidecar must be an object with known fields")
+    if type(sidecar.get("version")) is not int or sidecar["version"] != 1:
+        raise ValueError("sidecar version must be 1")
+    digest = sidecar.get("c_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("sidecar c_sha256 must be a lowercase SHA-256 hex digest")
+    if digest != hashlib.sha256(text.encode("utf-8")).hexdigest():
+        raise ValueError("sidecar C hash does not match input")
+    lexemes, logical = c_lexemes(text)
+    if "%:" in logical or "??=" in logical:
+        raise ValueError("sidecar v1 does not support alternate preprocessor markers %: or ??=")
+    rows = sidecar.get("locals")
+    if not isinstance(rows, list):
+        raise ValueError("sidecar locals must be a list")
+    starts = [match.start() for match in lexemes]
+    tokens = {match.span(): text[match.start():match.end()] for match in lexemes
+              if match.group("identifier") is not None}
+    directives = directive_spans(lexemes, logical)
+    directive_starts = [start for start, _ in directives]
+
+    def in_directive(position: int) -> bool:
+        index = bisect.bisect_right(directive_starts, position) - 1
+        return index >= 0 and position < directives[index][1]
+    qualifiers = {"const", "volatile", "static", "register", "restrict", "extern", "_Atomic"}
+    primitives = {"void", "char", "short", "int", "long", "float", "double",
+                  "signed", "unsigned", "_Bool", "_Complex", "_Imaginary"}
+
+    def valid_type_prefix(prefix: list[str]) -> bool:
+        if not prefix or any(token != "*" and not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", token)
+                             for token in prefix):
+            return False
+        words = [token for token in prefix if token != "*" and token not in qualifiers]
+        if not words:
+            return False
+        if all(word in primitives for word in words):
+            return True
+        if len(words) == 2 and words[0] in ("struct", "union", "enum"):
+            return True
+        return False
+
+    brace_stack: list[int] = []
+    scope_pairs: dict[tuple[int, int], int] = {}
+    compound_openings: set[int] = set()
+    for index, lexeme in enumerate(lexemes):
+        if in_directive(lexeme.start()):
+            continue
+        if lexeme.group("brace") == "{":
+            previous = index - 1
+            while previous >= 0 and lexemes[previous].group(0) not in (";", "{", "}"):
+                previous -= 1
+            prefix = [token.group(0) for token in lexemes[previous + 1:index]
+                      if token.group("comment") is None and not in_directive(token.start())]
+            is_naked_block = bool(brace_stack) and not prefix
+            is_else_or_do = prefix in (["else"], ["do"])
+            is_label = (len(prefix) == 2 and prefix[1] == ":"
+                        and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", prefix[0]))
+            is_case = (len(prefix) >= 3 and prefix[0] == "case" and prefix[-1] == ":")
+            is_control = (prefix[-1:] == [")"] and prefix[:1] in
+                          (["if"], ["for"], ["while"], ["switch"])
+                          or prefix[:2] == ["else", "if"] and prefix[-1:] == [")"])
+            is_statement_expression = bool(brace_stack) and prefix[-2:] in (["=", "("], ["return", "("])
+            is_function = False
+            if not brace_stack and prefix[-1:] == [")"] and "(" in prefix:
+                opening_paren = prefix.index("(")
+                is_function = (opening_paren >= 2
+                               and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", prefix[opening_paren - 1])
+                               and valid_type_prefix(prefix[:opening_paren - 1]))
+            if (is_naked_block or is_else_or_do or is_label or is_case or is_control
+                    or is_statement_expression or is_function):
+                compound_openings.add(lexeme.start())
+            brace_stack.append(lexeme.start())
+        elif lexeme.group("brace") == "}":
+            if not brace_stack:
+                raise ValueError("unbalanced C braces")
+            opening = brace_stack.pop()
+            scope_pairs[(opening, lexeme.end())] = 0
+    if brace_stack:
+        raise ValueError("unbalanced C braces")
+    scope_pairs = {span: index for index, span in enumerate(sorted(scope_pairs))}
+
+    def containing_lexeme(start: int, end: int) -> re.Match[str] | None:
+        index = bisect.bisect_right(starts, start) - 1
+        if index >= 0 and end <= lexemes[index].end():
+            return lexemes[index]
+        return None
+    keys: set[tuple[int, int]] = set()
+    scoped_names: set[tuple[tuple[int, int], str]] = set()
+    mapped_names: set[str] = set()
+    replacements: dict[tuple[int, int], str] = {}
+    local_rows: list[tuple[tuple[int, int], tuple[int, int], str, list[tuple[int, int]]]] = []
+    token_indices = {lexeme.span(): index for index, lexeme in enumerate(lexemes)
+                     if lexeme.group("identifier") is not None}
+
+    def adjacent_index(index: int, direction: int) -> int | None:
+        index += direction
+        while 0 <= index < len(lexemes) and lexemes[index].group("comment") is not None:
+            index += direction
+        return index if 0 <= index < len(lexemes) else None
+
+    def require_value_identifier_role(span: tuple[int, int]) -> None:
+        """Exclude C namespaces and syntax sites that cannot name a local value."""
+        if in_directive(span[0]):
+            raise ValueError("local span is inside a preprocessor directive")
+        index = token_indices.get(span)
+        if index is None:
+            return
+        previous_index = adjacent_index(index, -1)
+        before_previous_index = adjacent_index(previous_index, -1) if previous_index is not None else None
+        following_index = adjacent_index(index, 1)
+        previous = lexemes[previous_index].group(0) if previous_index is not None else None
+        before_previous = (lexemes[before_previous_index].group(0)
+                           if before_previous_index is not None else None)
+        following = lexemes[following_index].group(0) if following_index is not None else None
+        if (previous in (".", "goto", "struct", "union", "enum")
+                or previous == ">" and before_previous == "-"
+                or following == ":"):
+            raise ValueError("local span is in a non-value C identifier role")
+        statement_start = index - 1
+        while statement_start >= 0 and lexemes[statement_start].group(0) not in (";", "{", "}"):
+            statement_start -= 1
+        if any(lexemes[position].group(0) == "typedef"
+               for position in range(statement_start + 1, index)):
+            raise ValueError("local span is in a typedef declaration")
+        containing_scopes = [candidate for candidate in scope_pairs
+                             if candidate[0] < span[0] and span[1] < candidate[1]]
+        if containing_scopes:
+            innermost = min(containing_scopes, key=lambda candidate: candidate[1] - candidate[0])
+            if innermost[0] not in compound_openings:
+                raise ValueError("local span is inside a non-compound C scope")
+
+    def is_simple_declaration(span: tuple[int, int]) -> bool:
+        """Recognize only generated C's simple local type/name declarators."""
+        index = token_indices.get(span)
+        if index is None:
+            return False
+        previous = index - 1
+        while previous >= 0 and lexemes[previous].group(0) not in (";", "{", "}"):
+            previous -= 1
+        prefix = [token.group(0) for token in lexemes[previous + 1:index]
+                  if token.group("comment") is None]
+        next_index = index + 1
+        while next_index < len(lexemes) and lexemes[next_index].group("comment") is not None:
+            next_index += 1
+        next_token = lexemes[next_index].group(0) if next_index < len(lexemes) else None
+        if next_token not in ("=", ";", ",", "["):
+            return False
+        return valid_type_prefix(prefix)
+
+    def checked_span(value: object, label: str) -> tuple[int, int]:
+        if (not isinstance(value, list) or len(value) != 2
+                or any(type(offset) is not int for offset in value)):
+            raise ValueError(f"malformed {label} span")
+        start, end = value
+        if start < 0 or end > len(text) or start >= end:
+            raise ValueError(f"out-of-bounds {label} span")
+        return start, end
+
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != {
+                "owner_definition_id", "local_ordinal", "scope_span",
+                "emitted_identifier", "declaration_span", "reference_spans"}):
+            raise ValueError("local row must be an object")
+        owner = row.get("owner_definition_id")
+        local = row.get("local_ordinal")
+        scope = checked_span(row.get("scope_span"), "scope")
+        symbol = row.get("emitted_identifier")
+        declaration = row.get("declaration_span")
+        references = row.get("reference_spans")
+        if (type(owner) is not int or owner < 0 or type(local) is not int or local < 0
+                or not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", symbol)
+                or not isinstance(references, list)):
+            raise ValueError("malformed local row")
+        if scope not in scope_pairs:
+            raise ValueError("scope span must be a balanced C brace pair")
+        if scope[0] not in compound_openings:
+            raise ValueError("local scope is not a compound statement")
+        key = (owner, local)
+        scoped_name = (scope, symbol)
+        if key in keys or scoped_name in scoped_names:
+            raise ValueError("split or merged local mapping")
+        keys.add(key)
+        scoped_names.add(scoped_name)
+        mapped_names.add(symbol)
+        all_spans = [checked_span(span, "local") for span in [declaration, *references]]
+        for span in all_spans:
+            require_value_identifier_role(span)
+        containing_scopes = [candidate for candidate in scope_pairs
+                             if candidate[0] < all_spans[0][0]
+                             and all_spans[0][1] < candidate[1]]
+        if not containing_scopes or scope != min(containing_scopes,
+                                                  key=lambda candidate: candidate[1] - candidate[0]):
+            raise ValueError("local declaration must use its innermost brace scope")
+        if any(not (scope[0] < start and end < scope[1]) for start, end in all_spans):
+            raise ValueError("local span lies outside scope")
+        if tokens.get(all_spans[0]) != symbol or not is_simple_declaration(all_spans[0]):
+            raise ValueError("local declaration is not a recognized C declarator")
+        if any(is_simple_declaration(span) for span in all_spans[1:]):
+            raise ValueError("local reference cannot be a declaration")
+        if any(start <= all_spans[0][0] for start, _ in all_spans[1:]):
+            raise ValueError("local reference precedes its declaration")
+        local_rows.append((scope, all_spans[0], symbol, all_spans))
+        for bounds in all_spans:
+            if tokens.get(bounds) != symbol or bounds in replacements:
+                raise ValueError("local span is not a unique exact identifier token")
+            replacements[bounds] = ""
+    declarations_by_scope: dict[tuple[int, int], list[int]] = {}
+    for scope, declaration, _, _ in local_rows:
+        declarations_by_scope.setdefault(scope, []).append(declaration[0])
+    for scope, declaration, _, spans in local_rows:
+        rank = sorted(declarations_by_scope[scope]).index(declaration[0])
+        marker = f"@@local:{scope_pairs[scope]}:{rank}@@"
+        for span in spans:
+            replacements[span] = marker
+    uncovered = [span for span, token in tokens.items()
+                 if token in mapped_names and span not in replacements]
+    if uncovered:
+        raise ValueError(f"unlisted local identifier occurrence at {uncovered[0][0]}")
+    for row_scope, declaration, symbol, spans in local_rows:
+        for reference in spans[1:]:
+            candidates = [(scope, declared_at) for scope, declared_at, name, _ in local_rows
+                          if name == symbol and scope[0] < reference[0]
+                          and reference[1] < scope[1] and declared_at[0] < reference[0]]
+            if not candidates:
+                raise ValueError("local reference has no preceding declaration")
+            innermost_scope, owning_declaration = min(candidates,
+                                                        key=lambda candidate: candidate[0][1] - candidate[0][0])
+            if (innermost_scope, owning_declaration) != (row_scope, declaration):
+                raise ValueError("local reference belongs to another scoped declaration")
+    generated = sidecar.get("generated", [])
+    if not isinstance(generated, list):
+        raise ValueError("sidecar generated must be a list")
+    seen_generated: set[tuple[str, str]] = set()
+    generated_ids: set[tuple[str, str]] = set()
+    linked_payloads: dict[tuple[str, str], str] = {}
+    generated_rows: list[tuple[str, str, list[tuple[int, int]]]] = []
+    for row in generated:
+        if not isinstance(row, dict) or set(row) != {"kind", "identity", "spelling", "spans"}:
+            raise ValueError("generated row must be an object")
+        kind = row.get("kind")
+        identity = row.get("identity")
+        spelling = row.get("spelling")
+        spans = row.get("spans")
+        if (not isinstance(kind, str) or kind not in GENERATED_GRAMMARS
+                or not isinstance(identity, str)
+                or not re.fullmatch(r"[A-Za-z0-9_]+", identity)
+                or not isinstance(spelling, str) or not isinstance(spans, list)
+                or not spans or (kind, spelling) in seen_generated
+                or (kind, identity) in generated_ids):
+            raise ValueError("malformed or duplicate generated row")
+        seen_generated.add((kind, spelling))
+        generated_ids.add((kind, identity))
+        if not GENERATED_GRAMMARS[kind].fullmatch(spelling):
+            raise ValueError("generated spelling does not match kind")
+        if kind in ("callable", "static_closure"):
+            linked_key = ("callable", identity)
+            payload = spelling.removeprefix("__sc_brp_").removeprefix("brp_")
+        elif kind in ("definition", "definition_comment"):
+            linked_key = ("definition", identity)
+            payload = spelling.removeprefix("__def_").removesuffix("_").removeprefix("def_id=")
+        else:
+            linked_key = None
+            payload = None
+        if linked_key is not None:
+            if linked_key in linked_payloads and linked_payloads[linked_key] != payload:
+                raise ValueError("linked generated spellings disagree on raw identity")
+            linked_payloads[linked_key] = payload
+        validated_spans: list[tuple[int, int]] = []
+        for span in spans:
+            start, end = checked_span(span, "generated")
+            if text[start:end] != spelling or (start, end) in replacements:
+                raise ValueError("generated span does not match exact spelling")
+            containing = containing_lexeme(start, end)
+            if containing is None or (kind == "definition_comment") != (containing.group("comment") is not None):
+                raise ValueError("generated span has wrong lexical context")
+            if kind != "definition_comment" and containing.group("identifier") is None:
+                raise ValueError("generated span must be inside an identifier")
+            if kind in ("callable", "static_closure", "variable_suffix") and (start, end) not in tokens:
+                raise ValueError("generated span must cover full identifier")
+            replacements[(start, end)] = ""
+            validated_spans.append((start, end))
+        generated_rows.append((kind, identity, validated_spans))
+    family = {"callable": "callable", "static_closure": "callable",
+              "definition": "definition", "definition_comment": "definition",
+              "variable_suffix": "variable_suffix"}
+    first_by_family: dict[tuple[str, str], int] = {}
+    for kind, identity, spans in generated_rows:
+        key = (family[kind], identity)
+        first_by_family[key] = min(first_by_family.get(key, len(text)), min(start for start, _ in spans))
+    ordinals: dict[tuple[str, str], int] = {}
+    for key in sorted(first_by_family, key=lambda item: (item[0], first_by_family[item])):
+        ordinals[key] = sum(1 for other in ordinals if other[0] == key[0])
+    for kind, identity, spans in generated_rows:
+        marker = f"@@{kind}:{ordinals[(family[kind], identity)]}@@"
+        for span in spans:
+            replacements[span] = marker
+    for lexeme in lexemes:
+        if lexeme.group("identifier") is not None:
+            whole = lexeme.group(0)
+            kinds = ["callable", "static_closure", "variable_suffix"]
+            candidates = [(kind, whole, lexeme.span()) for kind in kinds]
+            candidates.extend(("definition", match.group(0),
+                               (lexeme.start() + match.start(), lexeme.start() + match.end()))
+                              for match in re.finditer(r"__def_[0-9]+_", whole))
+        elif lexeme.group("comment") is not None:
+            candidates = [("definition_comment", match.group(0),
+                           (lexeme.start() + match.start(), lexeme.start() + match.end()))
+                          for match in re.finditer(r"def_id=[0-9]+", lexeme.group(0))]
+        else:
+            continue
+        for kind, spelling, span in candidates:
+            if (kind, spelling) in seen_generated and span not in replacements:
+                raise ValueError(f"unlisted generated occurrence at {span[0]}")
+    result = []
+    cursor = 0
+    for (start, end), replacement in sorted(replacements.items()):
+        if start < cursor:
+            raise ValueError("overlapping local spans")
+        result.extend((text[cursor:start], replacement))
+        cursor = end
+    result.append(text[cursor:])
+    return "".join(result)
+
+
+def normalize(text: str, sidecar: dict | None = None) -> str:
+    """Return exact C unless a validated sidecar authorizes specific rewrites."""
+    return apply_sidecar(text, sidecar) if sidecar is not None else text
+
+
+def read_c(path: Path) -> str:
+    """Decode without newline translation so sidecar hashes exact file bytes."""
+    return path.read_bytes().decode("utf-8")
+
+
+def normalized_hash(path: Path, sidecar_path: Path | None = None) -> str:
+    sidecar = json.loads(sidecar_path.read_text()) if sidecar_path else None
+    return hashlib.sha256(normalize(read_c(path), sidecar).encode("utf-8")).hexdigest()
 
 
 def main(argv: list[str]) -> int:
@@ -86,10 +513,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--emit", action="store_true", help="print the normalized text instead of a hash"
     )
+    parser.add_argument("--sidecar", action="append", type=Path,
+                        help="versioned local-identity JSON sidecar, once per C file")
     args = parser.parse_args(argv)
 
     if len(args.files) > 2:
         print("normalize_generated_c_symbols: pass one or two files", file=sys.stderr)
+        return 2
+    if args.sidecar and len(args.sidecar) != len(args.files):
+        print("normalize_generated_c_symbols: provide one sidecar per C file", file=sys.stderr)
         return 2
 
     try:
@@ -97,20 +529,23 @@ def main(argv: list[str]) -> int:
             if len(args.files) != 1:
                 print("normalize_generated_c_symbols: --emit takes one file", file=sys.stderr)
                 return 2
-            sys.stdout.write(normalize(args.files[0].read_text()))
+            sidecar = json.loads(args.sidecar[0].read_text()) if args.sidecar else None
+            sys.stdout.write(normalize(read_c(args.files[0]), sidecar))
             return 0
 
-        hashes = [(path, normalized_hash(path)) for path in args.files]
-    except OSError as error:
+        hashes = [(path, normalized_hash(path, args.sidecar[index] if args.sidecar else None))
+                  for index, path in enumerate(args.files)]
+    except (OSError, ValueError, UnicodeError, TypeError, AttributeError) as error:
         print(f"normalize_generated_c_symbols: {error}", file=sys.stderr)
         return 2
 
+    mode = "normalized C with sidecar" if args.sidecar else "raw C"
     for path, digest in hashes:
-        print(f"{digest}  {path}")
+        print(f"{mode} SHA-256: {digest}  {path}")
 
     if len(hashes) == 2:
         identical = hashes[0][1] == hashes[1][1]
-        print("normalized C: IDENTICAL" if identical else "normalized C: DIFFERENT")
+        print(f"{mode}: IDENTICAL" if identical else f"{mode}: DIFFERENT")
         return 0 if identical else 1
 
     return 0

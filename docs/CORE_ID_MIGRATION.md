@@ -2162,8 +2162,19 @@ compare the retained artifacts before runtime/codegen gates:
 
 ```bash
 benchmarks/normalize_generated_c_symbols \
+  --sidecar "$series_root/parent-symbols.json" \
+  --sidecar "$series_root/candidate-symbols.json" \
   "$series_root/parent.c" "$series_root/candidate.c"
 ```
+
+The normalizer compares raw C exactly without sidecars. Each sidecar is bound
+to its C file's SHA-256 and lists the generated symbol and local-binding spans
+that may change spelling. C5c owns production emission of these sidecars; a
+normalized comparison is unavailable until both are retained with the C files.
+The v1 sidecar recognizes only simple block locals with primitive or explicit
+tagged C types; typedef-typed locals and parameters remain raw-different. C5c
+must version/extend the oracle or emit an independently validated compiler-owned
+binding marker before relying on those unsupported forms.
 
 Do not report wall time as the primary evidence.
 
