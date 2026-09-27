@@ -76,7 +76,7 @@ Two `-O2` toy exact-profile runs additionally reported exactly two equality
 and two scope-lookup calls, with zero measured allocations
 (`/tmp/blorp-id-c0b-direct-o2-toy-{1,2}.log`).
 
-The integrated D0 gate compares current-main parent
+An earlier integrated checkpoint compared then-current main parent
 `c4f7c16352e664714da74ba26e8f99f14ef52240` with direct-selector candidate
 `db9146e95323`, compiling the same frozen current-main input from the same
 working directory with fresh `-O2` compilers and two instruction samples.
@@ -96,6 +96,20 @@ reproduced the candidate count exactly. Self-compile comparisons must hold
 the working directory fixed because discovery constructs path strings and
 its allocation count is path-sensitive. The rejected records are the other
 `parent*.json` and `candidate*.json` files in that artifact directory.
+
+The frozen D0 acceptance gate compares main parent
+`6aca194442ca6a93bb7591f3b4b761e4ce7777cb` with candidate `343988417ffa`,
+again from one working directory with fresh `-O2` compilers and the same
+frozen parent input. Parent and candidate compiler C are byte-identical
+(SHA-256
+`8262df3d3810240c2d68c8402df4327bffcd6a3354e1e450b8b700012acc7238`).
+Generated program C is byte-identical (78,677,216 bytes, SHA-256
+`46f211fa769c8485855e1f999d8c25466ddd50c6d4c75126020735098e7e175a`).
+All allocation checkpoints match exactly, including discovery at 8,509,621
+and the 193,962,091 total. Minimum retired instructions are 150,953,540,858
+parent and 151,054,807,919 candidate (+0.067%, within sampling noise). Raw
+records and generated C are retained at
+`/tmp/blorp-id-d0-final.9vuWsA/{parent,candidate}.json/.c`.
 
 ## Historical evidence, not current acceptance
 
