@@ -8329,60 +8329,79 @@ private pure func resolve_var_dims_type_list(
 	subst: List[VarDimsSubstEntry],
 	types: List[SemanticType],
 ) -> List[SemanticType]:
-	var result: List[SemanticType] = []
+	-- An empty substitution cannot expand dimensions, but DimOp nodes still normalize.
+	if subst.length() == 0 and not types.any(type_contains_dim_op):
+		types
+	else:
+		var result: List[SemanticType] = []
 
-	for typ in types:
-		match typ:
-			SemanticVarDimsType(name):
-				match find_var_dims_subst(subst, name):
-					Some(concrete_dims):
-						for concrete_dim in concrete_dims:
-							result = result.append(concrete_dim)
-					None:
-						result = result.append(typ)
-			_:
-				result = result.append(resolve_var_dims_type(subst, typ))
+		for typ in types:
+			match typ:
+				SemanticVarDimsType(name):
+					match find_var_dims_subst(subst, name):
+						Some(concrete_dims):
+							for concrete_dim in concrete_dims:
+								result = result.append(concrete_dim)
+						None:
+							result = result.append(typ)
+				_:
+					result = result.append(resolve_var_dims_type(subst, typ))
 
-	result
+		result
+
+
+private pure func resolve_var_dims_param_types(
+	subst: List[VarDimsSubstEntry],
+	params: List[SemanticType],
+) -> List[SemanticType]:
+	-- Parameter positions resolve individually; unlike dimension lists, a
+	-- top-level variadic dimension is not expanded into multiple parameters.
+	if subst.length() == 0 and not params.any(type_contains_dim_op):
+		params
+	else:
+		params.map(func(param): resolve_var_dims_type(subst, param))
 
 
 private pure func resolve_var_dims_type(
 	subst: List[VarDimsSubstEntry],
 	typ: SemanticType,
 ) -> SemanticType:
-	match typ:
-		SemanticNamedType(name, args):
-			SemanticNamedType(
-				name,
-				resolve_var_dims_type_list(subst, args),
-			)
-		SemanticArrayType(element, dims):
-			SemanticArrayType(
-				resolve_var_dims_type(subst, element),
-				resolve_var_dims_type_list(subst, dims),
-			)
-		SemanticFunctionType(is_pure, params, return_type):
-			SemanticFunctionType(
-				is_pure,
-				params.map(func(param): resolve_var_dims_type(subst, param)),
-				resolve_var_dims_type(subst, return_type),
-			)
-		SemanticTupleType(elements):
-			SemanticTupleType(elements.map(
-				func(element): resolve_var_dims_type(subst, element),
-			))
-		SemanticRangeType(inner):
-			SemanticRangeType(resolve_var_dims_type(subst, inner))
-		SemanticDimOpType(op, left, right):
-			normalize_dim(
-				SemanticDimOpType(
-					op,
-					resolve_var_dims_type(subst, left),
-					resolve_var_dims_type(subst, right),
-				),
-			)
-		_:
-			typ
+	if subst.length() == 0 and not type_contains_dim_op(typ):
+		typ
+	else:
+		match typ:
+			SemanticNamedType(name, args):
+				SemanticNamedType(
+					name,
+					resolve_var_dims_type_list(subst, args),
+				)
+			SemanticArrayType(element, dims):
+				SemanticArrayType(
+					resolve_var_dims_type(subst, element),
+					resolve_var_dims_type_list(subst, dims),
+				)
+			SemanticFunctionType(is_pure, params, return_type):
+				SemanticFunctionType(
+					is_pure,
+					params.map(func(param): resolve_var_dims_type(subst, param)),
+					resolve_var_dims_type(subst, return_type),
+				)
+			SemanticTupleType(elements):
+				SemanticTupleType(elements.map(
+					func(element): resolve_var_dims_type(subst, element),
+				))
+			SemanticRangeType(inner):
+				SemanticRangeType(resolve_var_dims_type(subst, inner))
+			SemanticDimOpType(op, left, right):
+				normalize_dim(
+					SemanticDimOpType(
+						op,
+						resolve_var_dims_type(subst, left),
+						resolve_var_dims_type(subst, right),
+					),
+				)
+			_:
+				typ
 
 
 private pure func bind_type_subst_result(
@@ -10375,8 +10394,9 @@ private pure func infer_call_with_callee_result(
 					substituted_param_types,
 					arg_result.args,
 				)
-				resolved_param_types = substituted_param_types.map(
-					func(param): resolve_var_dims_type(var_dims_bind.subst, param),
+				resolved_param_types = resolve_var_dims_param_types(
+					var_dims_bind.subst,
+					substituted_param_types,
 				)
 				substituted_return_type = if can_skip_call_subst:
 					call_return_type
@@ -10619,8 +10639,9 @@ private pure func infer_ufcs_call_with_resolved_call(
 							substituted_param_types,
 							call_args,
 						)
-						resolved_param_types = substituted_param_types.map(
-							func(param): resolve_var_dims_type(var_dims_bind.subst, param),
+						resolved_param_types = resolve_var_dims_param_types(
+							var_dims_bind.subst,
+							substituted_param_types,
 						)
 						resolved_return_base = resolve_var_dims_type(
 							var_dims_bind.subst,
