@@ -1252,18 +1252,22 @@ compatibility ID. Initially both numbers are equal, and the cut deletes direct
 output interpretation of semantic `def_id` at each migrated site. Do not add
 the carrier to `CoreVar`, `CoreExpr`, or recursive lowering/pass contexts.
 There is no public raw-`Int` constructor: existing declarations project from a
-checked `DefinitionId`, and C1p2's private emission-frontier mint is the only
-other issuer. Do not add the field to globals or other declarations without a
-named output consumer. Internal profile selection remains semantic-ID keyed;
-only serialized/emitted numeric correlation uses the compatibility ID.
+checked `DefinitionId`. For generated declarations, C1p1 refactors each
+existing legacy-frontier mint so one owned frontier step atomically returns a
+checked semantic/emission identity pair with the same ordinal. It must not
+advance twice or expose a generally importable raw-scalar constructor. Do not
+add the field to globals or other declarations without a named output
+consumer. Internal profile selection remains semantic-ID keyed; only
+serialized/emitted numeric correlation uses the compatibility ID.
 
 C1p2 replaces the single generated-definition frontier with
 `next_semantic_definition_id` and `next_emission_compatibility_id`. Every
-Stage 8/9 mint consumes both exactly once; initially they advance in lockstep.
-The cuts land before the C1b authority switch and require byte-identical C,
-symbol maps, comments, split ordering, and profile metadata. Stop if
-compatibility IDs enter semantic equality, lookup, dispatch, or diagnostics,
-or if any generated producer can advance only one frontier.
+Stage 8/9 mint consumes both exactly once through the C1p1 pair-mint API;
+initially they advance in lockstep. The cuts land before the C1b authority
+switch and require byte-identical C, symbol maps, comments, split ordering,
+and profile metadata. Stop if compatibility IDs enter semantic equality,
+lookup, dispatch, or diagnostics, or if any generated producer can advance
+only one frontier.
 
 ```blorp
 -- Semantic lookup remains keyed by DefinitionId.
