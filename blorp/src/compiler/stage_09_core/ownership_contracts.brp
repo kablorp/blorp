@@ -2235,271 +2235,125 @@ private pure func collect_function_contract_equation(
 				debug:
 					perceus_work_contract_collection_expression_visits()
 
-				step: ContractCollectionStep = match demand:
-					InspectNestedContractRegion:
-						{
-							state = state,
-							pending = push_contract_exprs(
-								pending,
-								InspectNestedContractRegion,
-								CoreTraverse.immediate_core_expr_children(expr),
-							)
-						}
-					BorrowContractResult:
-						match expr:
-							VarExpr(variable, typ, loc):
-								{
-									state = state,
-									pending = pending
-								}
-							FieldExpr(owner, field, typ, loc):
-								{
-									state = state,
-									pending = push_contract_task(
-										pending,
-										BorrowContractResult,
-										owner,
-									)
-								}
-							TupleFieldExpr(owner, field_index, typ, loc):
-								{
-									state = state,
-									pending = push_contract_task(
-										pending,
-										BorrowContractResult,
-										owner,
-									)
-								}
-							CastExpr(inner, typ, loc):
-								{
-									state = state,
-									pending = push_contract_task(
-										pending,
-										BorrowContractResult,
-										inner,
-									)
-								}
-							UnboxExpr(kind, inner, typ, loc):
-								{
-									state = state,
-									pending = push_contract_task(
-										pending,
-										BorrowContractResult,
-										inner,
-									)
-								}
-							BoxExpr(box_op, typ, loc):
-								{
-									state = state,
-									pending = push_contract_task(
-										pending,
-										BorrowContractResult,
-										box_op.value,
-									)
-								}
-							_:
-								schedule_contract_linear(
-									env,
-									parameter_index,
-									callable_id,
-									ConsumeContractResult,
-									expr,
-									state,
-									pending,
-								)
-					DeferredContractResult(callee, argument_index):
-						match expr:
-							VarExpr(variable, typ, loc):
-								{
-									state = record_contract_parameter_use(
-										parameter_index,
-										callable_id,
-										demand,
-										variable,
-										state,
-									),
-									pending = pending
-								}
-							BoxExpr(box_op, typ, loc):
-								match box_op.kind:
-									PointerBox:
-										{
-											state = state,
-											pending = push_contract_task(
-												pending,
-												demand,
-												box_op.value,
-											)
-										}
-									_:
-										{
-											state = state,
-											pending = push_contract_task(
-												pending,
-												BorrowContractResult,
-												box_op.value,
-											)
-										}
-							_:
-								-- A deferred outer call borrows a composite argument until
-								-- its callee contract is known. Evaluate the argument using
-								-- normal borrow semantics; only direct Vars and pointer boxes
-								-- above become parameter-flow edges.
-								schedule_contract_linear(
-									env,
-									parameter_index,
-									callable_id,
-									BorrowContractResult,
-									expr,
-									state,
-									pending,
-								)
-					ReturnContractResult(return_type):
-						match expr:
-							IfExpr(cond, then_expr, else_expr, typ, loc):
-								{
-									state = state,
-									pending = push_contract_task(
-										push_contract_task(
-											push_contract_task(
-												pending,
-												ConsumeContractResult,
-												cond,
-											),
-											ReturnContractResult(return_type),
-											then_expr,
-										),
-										ReturnContractResult(return_type),
-										else_expr,
-									)
-								}
-							ConstructorMatchExpr(_, _, _, _, _, _):
-								schedule_contract_linear(
-									env,
+				-- Common leaves and calls need no boxed ContractCollectionStep.
+				-- Keep their possible state or stack update in this loop, where
+				-- the accumulators are already locally owned.
+				var handled: Bool = False
+				match expr:
+					VarExpr(variable, _, _):
+						match demand:
+							ConsumeContractResult | DeferredContractResult(_, _):
+								state = record_contract_parameter_use(
 									parameter_index,
 									callable_id,
 									demand,
-									expr,
+									variable,
 									state,
-									pending,
 								)
-							LiteralMatchExpr(_, _, _, _, _):
-								schedule_contract_linear(
-									env,
-									parameter_index,
-									callable_id,
-									demand,
-									expr,
-									state,
-									pending,
-								)
-							AccessorLiteralMatchExpr(_, _, _, _, _):
-								schedule_contract_linear(
-									env,
-									parameter_index,
-									callable_id,
-									demand,
-									expr,
-									state,
-									pending,
-								)
-							LengthMatchExpr(_, _, _, _, _):
-								schedule_contract_linear(
-									env,
-									parameter_index,
-									callable_id,
-									demand,
-									expr,
-									state,
-									pending,
-								)
-							LetExpr(variable, is_mutable, bind_type, rhs, body):
-								rhs_demand: ContractConsumptionDemand = if (
-									is_managed_type(env, bind_type)
-									and contract_direct_alias_parameter(
-										parameter_index,
-										rhs,
-									) != None
-								):
-									BorrowContractResult
-								else:
-									ConsumeContractResult
-
-								{
-									state = state,
-									pending = push_contract_task(
-										push_contract_task(pending, rhs_demand, rhs),
-										ReturnContractResult(return_type),
-										body,
-									)
-								}
-							BorrowLetExpr(variable, bind_type, rhs, body):
-								{
-									state = state,
-									pending = push_contract_task(
-										push_contract_task(pending, BorrowContractResult, rhs),
-										ReturnContractResult(return_type),
-										body,
-									)
-								}
-							SeqExpr(first, second):
-								{
-									state = state,
-									pending = push_contract_task(
-										push_contract_task(pending, ConsumeContractResult, first),
-										ReturnContractResult(return_type),
-										second,
-									)
-								}
-							DropExpr(variable, value_type, release_policy, body, typ, loc):
-								{
+							ReturnContractResult(return_type):
+								if not is_managed_type(env, return_type):
 									state = record_contract_parameter_use(
 										parameter_index,
 										callable_id,
 										ConsumeContractResult,
 										variable,
 										state,
-									),
-									pending = push_contract_task(
-										pending,
-										ReturnContractResult(return_type),
-										body,
 									)
-								}
-							ResourceScopeExpr(scope, typ, loc):
-								{
-									state = state,
-									pending = push_contract_task(
-										push_contract_task(
-											pending,
-											ConsumeContractResult,
-											scope.acquire,
-										),
-										ReturnContractResult(return_type),
-										scope.body,
-									)
-								}
-							VarExpr(_, _, _) | FieldExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _):
-								if is_managed_type(env, return_type):
-									match expr:
-										VarExpr(variable, typ, loc):
-											{
-												state = state,
-												pending = pending
-											}
-										_:
-											match schedule_contract_linear(
-												env,
-												parameter_index,
-												callable_id,
-												BorrowContractResult,
-												expr,
-												state,
-												pending,
-											):
-												step:
-													step
 								else:
+									void
+							_:
+								void
+
+						handled = True
+					LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _) | BreakExpr(_, _):
+						handled = True
+					CallExpr(kind, callee, args, typ, _):
+						match demand:
+							InspectNestedContractRegion:
+								pending = push_contract_exprs(
+									pending,
+									InspectNestedContractRegion,
+									CoreTraverse.immediate_core_expr_children(expr),
+								)
+							_:
+								next_pending: ContractCollectionTaskStack = schedule_contract_call(
+									env,
+									pending,
+									kind,
+									callee,
+									args,
+									typ,
+								)
+								pending = next_pending
+
+						handled = True
+					_:
+						void
+
+				if not handled:
+					step: ContractCollectionStep = match demand:
+						InspectNestedContractRegion:
+							{
+								state = state,
+								pending = push_contract_exprs(
+									pending,
+									InspectNestedContractRegion,
+									CoreTraverse.immediate_core_expr_children(expr),
+								)
+							}
+						BorrowContractResult:
+							match expr:
+								VarExpr(variable, typ, loc):
+									{
+										state = state,
+										pending = pending
+									}
+								FieldExpr(owner, field, typ, loc):
+									{
+										state = state,
+										pending = push_contract_task(
+											pending,
+											BorrowContractResult,
+											owner,
+										)
+									}
+								TupleFieldExpr(owner, field_index, typ, loc):
+									{
+										state = state,
+										pending = push_contract_task(
+											pending,
+											BorrowContractResult,
+											owner,
+										)
+									}
+								CastExpr(inner, typ, loc):
+									{
+										state = state,
+										pending = push_contract_task(
+											pending,
+											BorrowContractResult,
+											inner,
+										)
+									}
+								UnboxExpr(kind, inner, typ, loc):
+									{
+										state = state,
+										pending = push_contract_task(
+											pending,
+											BorrowContractResult,
+											inner,
+										)
+									}
+								BoxExpr(box_op, typ, loc):
+									{
+										state = state,
+										pending = push_contract_task(
+											pending,
+											BorrowContractResult,
+											box_op.value,
+										)
+									}
+								_:
 									schedule_contract_linear(
 										env,
 										parameter_index,
@@ -2509,29 +2363,231 @@ private pure func collect_function_contract_equation(
 										state,
 										pending,
 									)
-							_:
-								schedule_contract_linear(
-									env,
-									parameter_index,
-									callable_id,
-									ConsumeContractResult,
-									expr,
-									state,
-									pending,
-								)
-					ConsumeContractResult:
-						schedule_contract_linear(
-							env,
-							parameter_index,
-							callable_id,
-							demand,
-							expr,
-							state,
-							pending,
-						)
+						DeferredContractResult(callee, argument_index):
+							match expr:
+								VarExpr(variable, typ, loc):
+									{
+										state = record_contract_parameter_use(
+											parameter_index,
+											callable_id,
+											demand,
+											variable,
+											state,
+										),
+										pending = pending
+									}
+								BoxExpr(box_op, typ, loc):
+									match box_op.kind:
+										PointerBox:
+											{
+												state = state,
+												pending = push_contract_task(
+													pending,
+													demand,
+													box_op.value,
+												)
+											}
+										_:
+											{
+												state = state,
+												pending = push_contract_task(
+													pending,
+													BorrowContractResult,
+													box_op.value,
+												)
+											}
+								_:
+									-- A deferred outer call borrows a composite argument until
+									-- its callee contract is known. Evaluate the argument using
+									-- normal borrow semantics; only direct Vars and pointer boxes
+									-- above become parameter-flow edges.
+									schedule_contract_linear(
+										env,
+										parameter_index,
+										callable_id,
+										BorrowContractResult,
+										expr,
+										state,
+										pending,
+									)
+						ReturnContractResult(return_type):
+							match expr:
+								IfExpr(cond, then_expr, else_expr, typ, loc):
+									{
+										state = state,
+										pending = push_contract_task(
+											push_contract_task(
+												push_contract_task(
+													pending,
+													ConsumeContractResult,
+													cond,
+												),
+												ReturnContractResult(return_type),
+												then_expr,
+											),
+											ReturnContractResult(return_type),
+											else_expr,
+										)
+									}
+								ConstructorMatchExpr(_, _, _, _, _, _):
+									schedule_contract_linear(
+										env,
+										parameter_index,
+										callable_id,
+										demand,
+										expr,
+										state,
+										pending,
+									)
+								LiteralMatchExpr(_, _, _, _, _):
+									schedule_contract_linear(
+										env,
+										parameter_index,
+										callable_id,
+										demand,
+										expr,
+										state,
+										pending,
+									)
+								AccessorLiteralMatchExpr(_, _, _, _, _):
+									schedule_contract_linear(
+										env,
+										parameter_index,
+										callable_id,
+										demand,
+										expr,
+										state,
+										pending,
+									)
+								LengthMatchExpr(_, _, _, _, _):
+									schedule_contract_linear(
+										env,
+										parameter_index,
+										callable_id,
+										demand,
+										expr,
+										state,
+										pending,
+									)
+								LetExpr(variable, is_mutable, bind_type, rhs, body):
+									rhs_demand: ContractConsumptionDemand = if (
+										is_managed_type(env, bind_type)
+										and contract_direct_alias_parameter(
+											parameter_index,
+											rhs,
+										) != None
+									):
+										BorrowContractResult
+									else:
+										ConsumeContractResult
 
-				state = step.state
-				pending = step.pending
+									{
+										state = state,
+										pending = push_contract_task(
+											push_contract_task(pending, rhs_demand, rhs),
+											ReturnContractResult(return_type),
+											body,
+										)
+									}
+								BorrowLetExpr(variable, bind_type, rhs, body):
+									{
+										state = state,
+										pending = push_contract_task(
+											push_contract_task(pending, BorrowContractResult, rhs),
+											ReturnContractResult(return_type),
+											body,
+										)
+									}
+								SeqExpr(first, second):
+									{
+										state = state,
+										pending = push_contract_task(
+											push_contract_task(pending, ConsumeContractResult, first),
+											ReturnContractResult(return_type),
+											second,
+										)
+									}
+								DropExpr(variable, value_type, release_policy, body, typ, loc):
+									{
+										state = record_contract_parameter_use(
+											parameter_index,
+											callable_id,
+											ConsumeContractResult,
+											variable,
+											state,
+										),
+										pending = push_contract_task(
+											pending,
+											ReturnContractResult(return_type),
+											body,
+										)
+									}
+								ResourceScopeExpr(scope, typ, loc):
+									{
+										state = state,
+										pending = push_contract_task(
+											push_contract_task(
+												pending,
+												ConsumeContractResult,
+												scope.acquire,
+											),
+											ReturnContractResult(return_type),
+											scope.body,
+										)
+									}
+								VarExpr(_, _, _) | FieldExpr(_, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _):
+									if is_managed_type(env, return_type):
+										match expr:
+											VarExpr(variable, typ, loc):
+												{
+													state = state,
+													pending = pending
+												}
+											_:
+												match schedule_contract_linear(
+													env,
+													parameter_index,
+													callable_id,
+													BorrowContractResult,
+													expr,
+													state,
+													pending,
+												):
+													step:
+														step
+									else:
+										schedule_contract_linear(
+											env,
+											parameter_index,
+											callable_id,
+											ConsumeContractResult,
+											expr,
+											state,
+											pending,
+										)
+								_:
+									schedule_contract_linear(
+										env,
+										parameter_index,
+										callable_id,
+										ConsumeContractResult,
+										expr,
+										state,
+										pending,
+									)
+						ConsumeContractResult:
+							schedule_contract_linear(
+								env,
+								parameter_index,
+								callable_id,
+								demand,
+								expr,
+								state,
+								pending,
+							)
+
+					state = step.state
+					pending = step.pending
 			ContractCollectionComplete:
 				collection_complete = True
 

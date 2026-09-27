@@ -180,10 +180,12 @@ import:
 		PerceusGlobalLookup(CollidingPerceusGlobals),
 		borrow_contract_for_signature,
 		build_env,
+		callable_consumed_args,
 		contract_for_call,
 		is_managed_type,
 		lookup_constructor_call_contract,
 		lookup_direct_user_call_contract,
+		lookup_ownership_callable_id,
 		perceus_env_for_managed_types,
 		result_mode_for_type,
 	../../../src/compiler/stage_09_core/perceus/shadow_catalog:
@@ -16367,6 +16369,90 @@ pure func test_nested_concurrent_borrowed_match_does_not_retain() -> Bool:
 	dup_count_for("answer", rewritten) == 0
 
 
+pure func inferred_contract_has_consumed_indices(
+	env: PerceusEnv,
+	name: String,
+	def_id: Int,
+	expected: List[Int],
+) -> Bool:
+	match lookup_ownership_callable_id(env.callables, name, Some(def_id)):
+		Some(callable_id):
+			match callable_consumed_args(env, callable_id):
+				Some(indices):
+					int_lists_equal(indices, expected)
+				None:
+					False
+		None:
+			False
+
+
+pure func test_contract_collection_fast_paths_preserve_nested_and_deferred_calls() -> Bool:
+	items_type: CoreType = list_int_type()
+	consume: CoreDecl = function_decl(
+		"fastpath_consume",
+		92001,
+		[core_param("items", items_type)],
+		items_type,
+		intrinsic_expr("list_ensure_unique", [var_expr("items", items_type)], items_type),
+	)
+	forward: CoreDecl = function_decl(
+		"fastpath_forward",
+		92002,
+		[core_param("items", items_type)],
+		items_type,
+		user_call_expr(
+			"fastpath_consume",
+			Some(92001),
+			[],
+			[var_expr("items", items_type)],
+			items_type,
+		),
+	)
+	borrow: CoreDecl = function_decl(
+		"fastpath_borrow",
+		92003,
+		[core_param("items", items_type)],
+		items_type,
+		var_expr("items", items_type),
+	)
+	nested: CoreDecl = function_decl(
+		"fastpath_nested",
+		92004,
+		[core_param("items", items_type)],
+		items_type,
+		SeqExpr(
+			LambdaExpr(
+				[],
+				items_type,
+				user_call_expr(
+					"fastpath_consume",
+					Some(92001),
+					[],
+					[var_expr("items", items_type)],
+					items_type,
+				),
+				True,
+				closure_type(),
+				synthetic_core_source_loc(),
+			),
+			var_expr("items", items_type),
+		),
+	)
+	program: CoreProgram = resolve_global_value_refs({
+		decls = [consume, forward, borrow, nested],
+		foreign_includes = [],
+		source_files = [],
+	})
+	facts = infer_ownership_contracts(program)
+
+	(
+		inferred_contract_has_consumed_indices(facts.env, "fastpath_consume", 92001, [0])
+		and inferred_contract_has_consumed_indices(facts.env, "fastpath_forward", 92002, [0])
+		and inferred_contract_has_consumed_indices(facts.env, "fastpath_borrow", 92003, [])
+		and inferred_contract_has_consumed_indices(facts.env, "fastpath_nested", 92004, [])
+	)
+
+
 pure func test_inferred_user_call_contract_is_written_to_calls() -> Bool:
 	consume: CoreDecl = function_decl(
 		"consume",
@@ -19840,6 +19926,10 @@ tests: TestSuite = {
 		(
 			"nested concurrent borrowed match does not retain",
 			test_nested_concurrent_borrowed_match_does_not_retain,
+		),
+		(
+			"contract collection fast paths preserve nested and deferred calls",
+			test_contract_collection_fast_paths_preserve_nested_and_deferred_calls,
 		),
 		(
 			"inferred user-call contract is written to calls",
