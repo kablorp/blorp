@@ -47,15 +47,16 @@ import:
 		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
 
 
-private pure func fold_expr_list[T](
+private pure func fold_expr_list[T, Context](
 	items: List[ParsedExpr],
 	initial: T,
-	folder: pure (T, ParsedExpr) -> T,
+	context: Context,
+	folder: pure (T, ParsedExpr, Context) -> T,
 ) -> T:
 	var result = initial
 
 	for item in items:
-		result = folder(result, item)
+		result = folder(result, item, context)
 
 	result
 
@@ -64,10 +65,11 @@ private pure func fold_expr_list[T](
 Read-only one-level traversal for analyses. It preserves source child order
 and never materializes a temporary child list.
 ---
-pure func fold_parsed_expr_children[T](
+pure func fold_parsed_expr_children[T, Context](
 	expr: ParsedExpr,
 	initial: T,
-	folder: pure (T, ParsedExpr) -> T,
+	context: Context,
+	folder: pure (T, ParsedExpr, Context) -> T,
 ) -> T:
 	match expr:
 		ParsedStringInterpolationPartsExpr(parts, _, _):
@@ -76,60 +78,65 @@ pure func fold_parsed_expr_children[T](
 			for part in parts:
 				match part:
 					ParsedInterpolationExpr(child):
-						result = folder(result, child)
+						result = folder(result, child, context)
 					ParsedInterpolationLiteral(_):
 						void
 
 			result
 		ParsedUnaryExpr(_, value, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedBinaryExpr(_, left, right, _):
 			folder(
-				folder(initial, left),
+				folder(initial, left, context),
 				right,
+				context,
 			)
 		ParsedLogicalExpr(_, left, right, _):
 			folder(
-				folder(initial, left),
+				folder(initial, left, context),
 				right,
+				context,
 			)
 		ParsedAscriptionExpr(value, _, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedRangeExpr(start, finish, _):
 			folder(
-				folder(initial, start),
+				folder(initial, start, context),
 				finish,
+				context,
 			)
 		ParsedCallExpr(callee, args, _):
 			fold_expr_list(
 				args,
-				folder(initial, callee),
+				folder(initial, callee, context),
+				context,
 				folder,
 			)
 		ParsedFieldAccessExpr(target, _, _):
-			folder(initial, target)
+			folder(initial, target, context)
 		ParsedSubscriptExpr(target, indices, _):
 			fold_expr_list(
 				indices,
-				folder(initial, target),
+				folder(initial, target, context),
+				context,
 				folder,
 			)
 		ParsedListExpr(items, _):
-			fold_expr_list(items, initial, folder)
+			fold_expr_list(items, initial, context, folder)
 		ParsedTupleExpr(items, _):
-			fold_expr_list(items, initial, folder)
+			fold_expr_list(items, initial, context, folder)
 		ParsedRecordExpr(fields, _):
 			var result = initial
 
 			for field in fields:
-				result = folder(result, field.value)
+				result = folder(result, field.value, context)
 
 			result
 		ParsedRecordUpdateExpr(base, fields, _):
-			var result = folder(initial, base)
+			var result = folder(initial, base, context)
 
 			for field in fields:
-				result = folder(result, field.value)
+				result = folder(result, field.value, context)
 
 			result
 		ParsedDictExpr(entries, _):
@@ -137,35 +144,37 @@ pure func fold_parsed_expr_children[T](
 
 			for entry in entries:
 				result = folder(
-					folder(result, entry.key),
+					folder(result, entry.key, context),
 					entry.value,
+					context,
 				)
 
 			result
 		ParsedVectorExpr(items, _):
-			fold_expr_list(items, initial, folder)
+			fold_expr_list(items, initial, context, folder)
 		ParsedOpaqueIntoExpr(_, value, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedOpaqueFromExpr(_, value, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedBlockExpr(items, _):
-			fold_expr_list(items, initial, folder)
+			fold_expr_list(items, initial, context, folder)
 		ParsedIfExpr(condition, then_expr, else_expr, _):
 			with_then = folder(
-				folder(initial, condition),
+				folder(initial, condition, context),
 				then_expr,
+				context,
 			)
 
 			match else_expr:
 				Some(found):
-					folder(with_then, found)
+					folder(with_then, found, context)
 				None:
 					with_then
 		ParsedMatchExpr(value, cases, _):
-			var result = folder(initial, value)
+			var result = folder(initial, value, context)
 
 			for case in cases:
-				result = folder(result, case.body)
+				result = folder(result, case.body, context)
 
 			result
 		ParsedSelectExpr(arms, _):
@@ -181,76 +190,81 @@ pure func fold_parsed_expr_children[T](
 						timeout
 
 				result = folder(
-					folder(result, channel_or_timeout),
+					folder(result, channel_or_timeout, context),
 					arm.body,
+					context,
 				)
 
 			result
 		ParsedWithExpr(binding, body, _):
-			with_value = folder(initial, binding.value)
+			with_value = folder(initial, binding.value, context)
 
 			with_error = match binding.error_map:
 				Some(error_map):
-					folder(with_value, error_map.value)
+					folder(with_value, error_map.value, context)
 				None:
 					with_value
 
-			folder(with_error, body)
+			folder(with_error, body, context)
 		ParsedDebugBlockExpr(body, _):
-			folder(initial, body)
+			folder(initial, body, context)
 		ParsedLambdaExpr(_, _, _, body, _):
-			folder(initial, body)
+			folder(initial, body, context)
 		ParsedFunctionDeclExpr(function_decl):
 			match function_decl.body:
 				Some(body):
-					folder(initial, body)
+					folder(initial, body, context)
 				None:
 					initial
 		ParsedWhileExpr(condition, body, _):
 			folder(
-				folder(initial, condition),
+				folder(initial, condition, context),
 				body,
+				context,
 			)
 		ParsedForExpr(_, iterable, body, _):
 			folder(
-				folder(initial, iterable),
+				folder(initial, iterable, context),
 				body,
+				context,
 			)
 		ParsedConcurrentBlockExpr(params, body, _):
 			var result = initial
 
 			for param in params:
-				result = folder(result, param.value)
+				result = folder(result, param.value, context)
 
-			folder(result, body)
+			folder(result, body, context)
 		ParsedConcurrentForExpr(_, iterable, params, body, _):
-			var result = folder(initial, iterable)
+			var result = folder(initial, iterable, context)
 
 			for param in params:
-				result = folder(result, param.value)
+				result = folder(result, param.value, context)
 
-			folder(result, body)
+			folder(result, body, context)
 		ParsedDetachExpr(body, _):
-			folder(initial, body)
+			folder(initial, body, context)
 		ParsedVarDeclExpr(_, _, value, _, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedAssignExpr(_, value, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedCompoundAssignExpr(_, _, value, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedSubscriptAssignExpr(target, indices, value, _):
 			folder(
 				fold_expr_list(
 					indices,
-					folder(initial, target),
+					folder(initial, target, context),
+					context,
 					folder,
 				),
 				value,
+				context,
 			)
 		ParsedTupleDestructExpr(_, value, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		ParsedQuestionBindExpr(_, _, value, _):
-			folder(initial, value)
+			folder(initial, value, context)
 		_:
 			initial
 
