@@ -1269,6 +1269,15 @@ and profile metadata. Stop if compatibility IDs enter semantic equality,
 lookup, dispatch, or diagnostics, or if any generated producer can advance
 only one frontier.
 
+Some test, benchmark, and direct-emitter APIs currently receive a bare
+`CoreProgram` rather than the frontier that produced it. During C1p1, exactly
+one grep-able reconstruction seam may derive the single issuer from the
+program's validated maximum declared definition ID; the constructor validates
+`max >= -1`, mints no ID, and is not a general compatibility-ID constructor.
+C1p2 must either derive separate semantic/emission maxima there or serialize
+the frontier with the Core artifact before the two sequences diverge. No
+individual pass or fixture may invent its own starting frontier.
+
 ```blorp
 -- Semantic lookup remains keyed by DefinitionId.
 candidate ?= callable_candidate_by_definition_id(plan, semantic_id)
