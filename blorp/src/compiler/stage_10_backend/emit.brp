@@ -26858,6 +26858,12 @@ private record CFunctionEmission {
 }
 
 
+private record CFunctionEmissionContext {
+	profile_plan: Option[ProfileEmissionPlan],
+	specialize_layout: CoreSpecializeLayout
+}
+
+
 private pure func render_function_definitions(functions: List[CFunctionEmission]) -> String:
 	var c_code: String = make_string(0)
 
@@ -27091,6 +27097,13 @@ private pure func render_single_translation_unit(
 	sections: CEmissionSections,
 	type_decls: CFlatTypeDeclSections,
 	header: String,
+	decls: List[CoreDecl],
+	context: CFunctionEmissionContext,
+	symbol_authority: CEmissionSymbolAuthority,
+	internal_linkage: Bool,
+	cancellation_table: CancellationPlanTable,
+	internal_type_linkage: Bool,
+	compact: Bool,
 ) -> String:
 	var c_code: String = header
 	c_code = append_emitted_c(c_code, sections.heap_record_and_union_forward_decls)
@@ -27108,8 +27121,58 @@ private pure func render_single_translation_unit(
 	c_code = append_emitted_c(c_code, sections.global_decls)
 	c_code = append_emitted_c(c_code, sections.global_init)
 	c_code = append_emitted_c(c_code, sections.profile_metadata)
-	for function in sections.function_definitions:
-		c_code = append_emitted_c(c_code, function.text)
+	var next_profile_id: Int = 0
+
+	for entry in decls.enumerate():
+		decl_index: Int = entry[0]
+
+		match entry[1]:
+			FunctionDecl(func_info):
+				profile_function_id: Option[ProfileFunctionId] = profile_function_id_at_cursor(
+					context.profile_plan,
+					next_profile_id,
+					func_info,
+				)
+
+				if profile_function_id.is_some():
+					next_profile_id += 1
+
+				plan: CancellationProtectionPlan = function_cancellation_plan_or_default(
+					cancellation_table,
+					decl_index,
+					func_info,
+				)
+
+				c_code = append_emitted_c(c_code, emit_function(
+					decls,
+					func_info,
+					context.profile_plan,
+					profile_function_id,
+					func_info.name,
+					internal_linkage,
+					plan,
+					context.specialize_layout,
+					symbol_authority,
+					internal_type_linkage,
+					compact,
+				))
+			EnumDecl(enum_decl):
+				void
+			HeapRecordDecl(record_decl):
+				void
+			ValueRecordDecl(record_decl):
+				void
+			UnionDecl(union_decl):
+				void
+			GlobalDecl(global):
+				void
+			TypeAliasDecl(alias_decl):
+				void
+			TraitDecl(trait_decl):
+				void
+			ImplDecl(impl_decl):
+				void
+
 	c_code
 
 
@@ -27371,7 +27434,8 @@ private pure func emit_decls(
 	internal_linkage: Bool,
 	internal_type_linkage: Bool,
 	compact: Bool,
-) -> Result[(CEmissionSections, CTypeDeclEmissions), CoreEmitError]:
+	collect_function_definitions: Bool,
+) -> Result[(CEmissionSections, CTypeDeclEmissions, CFunctionEmissionContext), CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
 	specialize_layout: CoreSpecializeLayout = build_specialize_layout(program)
 	layouts: CRecordLayoutRegistry = classify_c_record_layouts(
@@ -27423,6 +27487,19 @@ private pure func emit_decls(
 		internal_type_linkage,
 		selected_type_symbol_lookup(symbol_authority),
 	)
+	function_definitions: List[CFunctionEmission] = if collect_function_definitions:
+		emit_function_decls(
+			decls,
+			profile_plan,
+			symbol_authority,
+			internal_linkage,
+			cancellation_table,
+			specialize_layout,
+			internal_type_linkage,
+			compact,
+		)
+	else:
+		[]
 
 	sections: CEmissionSections = {
 		heap_record_and_union_forward_decls = emit_heap_record_and_union_forward_decls(decls, selected_type_symbol_lookup(symbol_authority)),
@@ -27446,16 +27523,7 @@ private pure func emit_decls(
 		global_decls = emit_global_decls(decls, internal_type_linkage, selected_type_symbol_lookup(symbol_authority)),
 		global_init = global_init,
 		profile_metadata = emit_profile_metadata(profile_plan, internal_type_linkage),
-		function_definitions = emit_function_decls(
-			decls,
-			profile_plan,
-			symbol_authority,
-			internal_linkage,
-			cancellation_table,
-			specialize_layout,
-			internal_type_linkage,
-			compact,
-		),
+		function_definitions = function_definitions,
 	}
 	type_emissions: CTypeDeclEmissions = {
 		value_records = value_record_emissions,
@@ -27463,7 +27531,10 @@ private pure func emit_decls(
 		unions = union_emissions,
 		heap_records = heap_record_emissions,
 	}
-	Ok((sections, type_emissions))
+	Ok((sections, type_emissions, {
+		profile_plan = profile_plan,
+		specialize_layout = specialize_layout
+	}))
 
 
 ---
@@ -27480,7 +27551,7 @@ private pure func emit_single_decls(
 	internal_linkage: Bool,
 	internal_type_linkage: Bool,
 	compact: Bool,
-) -> Result[(CEmissionSections, CFlatTypeDeclSections), CoreEmitError]:
+) -> Result[(CEmissionSections, CFlatTypeDeclSections, CFunctionEmissionContext), CoreEmitError]:
 	emitted ?= emit_decls(
 		program,
 		plan,
@@ -27491,8 +27562,9 @@ private pure func emit_single_decls(
 		internal_linkage,
 		internal_type_linkage,
 		compact,
+		False,
 	)
-	Ok((emitted[0], flatten_type_decl_emissions(emitted[1])))
+	Ok((emitted[0], flatten_type_decl_emissions(emitted[1]), emitted[2]))
 
 
 private pure func error_artifact(error: CoreEmitError) -> CArtifact:
@@ -27547,6 +27619,13 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile_and_indentation
 					sections,
 					type_decls,
 					C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes),
+					program.decls,
+					emitted[2],
+					ValidatedCEmissionSymbols(symbol_plan),
+					True,
+					cancellation_table,
+					True,
+					compact,
 				),
 				extra_units = [],
 				link_flags = [],
@@ -27598,6 +27677,13 @@ pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
 			sections,
 			type_decls,
 			C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes),
+			program.decls,
+			emitted[2],
+			UnprojectedCEmissionSymbolsForTests,
+			False,
+			cancellation_table,
+			True,
+			False,
 		),
 		extra_units = [],
 		link_flags = [],
@@ -28338,6 +28424,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile_and_inden
 					False,
 					False,
 					compact,
+					True,
 				)
 
 				Ok(
