@@ -1204,21 +1204,6 @@ private pure func selected_call_kind(
 			kind
 
 
-private pure func selected_closure_create(
-	authority: CEmissionSymbolAuthority,
-	closure: CoreClosureCreate,
-) -> CoreClosureCreate:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			name: String = emitted_callable_name(plan, closure.def_id)
-			{ closure |
-				c_name = name,
-				static_name = static_closure_name(name)
-			}
-		UnprojectedCEmissionSymbolsForTests:
-			closure
-
-
 private pure func selected_task_closure(
 	authority: CEmissionSymbolAuthority,
 	task: CoreTaskClosure,
@@ -12844,11 +12829,13 @@ private pure func closure_env_emission_destructor_prototypes(
 
 private pure func emit_closure_create(
 	closure: CoreClosureCreate,
+	c_name: String,
+	static_name: String,
 	storage_kind: ClosureEnvStorageKind,
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	if closure.captures.length() == 0:
-		Some("((void*)&" + c_identifier(closure.static_name) + ")")
+		Some("((void*)&" + c_identifier(static_name) + ")")
 	else:
 		match storage_kind:
 			LegacyVoidPointerSlots:
@@ -12856,7 +12843,7 @@ private pure func emit_closure_create(
 				release_mask ?= closure_capture_release_mask(closure.captures, type_symbol_lookup)
 				Some(
 					"({ blorp_Closure* __cl_new = blorp_closure_new_inline((void*)" + c_identifier(
-						closure.c_name,
+						c_name,
 					) + ", " + closure.captures.length().to_string() + ");" + assignments + " __cl_new->env_release_mask = " + release_mask.to_string() + "UL; (void*)__cl_new; })",
 				)
 			TypedInlineTail:
@@ -12869,11 +12856,11 @@ private pure func emit_closure_create(
 							"__cl_env",
 							type_symbol_lookup,
 						)
-						env_type: String = closure_env_type_name(closure.c_name)
-						destructor_name: String = closure_env_destructor_name(closure.c_name)
+						env_type: String = closure_env_type_name(c_name)
+						destructor_name: String = closure_env_destructor_name(c_name)
 						Some(
 							"({ blorp_Closure* __cl_new = blorp_closure_new_typed_inline((void*)" + c_identifier(
-								closure.c_name,
+								c_name,
 							) + ", sizeof(" + env_type + "), _Alignof(" + env_type + ")); BLORP_SET_DESTRUCTOR(__cl_new, " + destructor_name + "); " + env_type + "* __cl_env = (" + env_type + "*)__cl_new->env;" + assignments + " (void*)__cl_new; })",
 						)
 
@@ -14322,13 +14309,24 @@ private pure func emit_simple_expr_leaf(
 			type_symbol_lookup: Dict[String, String] = selected_type_symbol_lookup(
 				emission_context.symbol_authority,
 			)
-			selected_closure: CoreClosureCreate = selected_closure_create(
+			c_name: String = selected_callable_c_spelling(
 				emission_context.symbol_authority,
-				closure,
+				closure.def_id,
+				closure.c_name,
 			)
+			static_name: String = if closure.captures.length() == 0:
+				match emission_context.symbol_authority:
+					ValidatedCEmissionSymbols(_):
+						static_closure_name(c_name)
+					UnprojectedCEmissionSymbolsForTests:
+						closure.static_name
+			else:
+				closure.static_name
 			emit_closure_create(
-				selected_closure,
-				closure_env_storage_kind(selected_closure.captures, False, type_symbol_lookup),
+				closure,
+				c_name,
+				static_name,
+				closure_env_storage_kind(closure.captures, False, type_symbol_lookup),
 				type_symbol_lookup,
 			)
 		ListConstructExpr(construct, typ, loc):
@@ -16321,6 +16319,8 @@ private pure func emit_copy_concurrent_task_closure(
 	closure ?= task_as_copy_closure_create(selected_task_closure(symbol_authority, task))
 	closure_value ?= emit_closure_create(
 		closure,
+		closure.c_name,
+		closure.static_name,
 		LegacyVoidPointerSlots,
 		selected_type_symbol_lookup(symbol_authority),
 	)
