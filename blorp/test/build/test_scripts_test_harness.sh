@@ -82,6 +82,8 @@ mkdir -p \
 : > "$TMP_HARNESS/blorp/test/runtime/memory/test_memory.brp"
 : > "$TMP_HARNESS/blorp/test/runtime/types/test_type.brp"
 cp scripts/test "$TMP_HARNESS/scripts/test"
+cp scripts/compiler-tools-python-tests.txt \
+	"$TMP_HARNESS/scripts/compiler-tools-python-tests.txt"
 cp scripts/compiler-core-sanitize-roots.txt "$TMP_HARNESS/scripts/compiler-core-sanitize-roots.txt"
 cp blorp/test/lib/run_blorp_check_fixtures.py \
 	"$TMP_HARNESS/blorp/test/lib/run_blorp_check_fixtures.py"
@@ -89,14 +91,25 @@ cp blorp/test/lib/process_supervisor.py \
 	"$TMP_HARNESS/blorp/test/lib/process_supervisor.py"
 cp blorp/test/lib/run_python_unittest_gate.py \
 	"$TMP_HARNESS/blorp/test/lib/run_python_unittest_gate.py"
-# compiler-tools also counts the backend emitter guard unittest files; stub
-# each listed file with one passing test so the aggregated count is checked.
-mkdir -p "$TMP_HARNESS/blorp/test/compiler/stage_10_backend"
-for python_test in test_no_direct_emitter_allocation.py test_backend_helper_census.py; do
+# Stub every compiler-tools unittest with one passing test. Both the real gate
+# and this sandbox read the same manifest, so additions cannot drift apart.
+compiler_tools_stub_count=0
+while IFS= read -r python_test; do
+	[ -n "$python_test" ] || continue
+	if [ ! -f "$python_test" ]; then
+		echo "FAIL: compiler-tools unittest does not exist: $python_test"
+		exit 1
+	fi
+	mkdir -p "$TMP_HARNESS/$(dirname "$python_test")"
 	printf '%s\n' 'import unittest' '' '' 'class StubTests(unittest.TestCase):' \
 		'    def test_stub(self) -> None:' '        pass' \
-		> "$TMP_HARNESS/blorp/test/compiler/stage_10_backend/$python_test"
-done
+		> "$TMP_HARNESS/$python_test"
+	compiler_tools_stub_count=$((compiler_tools_stub_count + 1))
+done < scripts/compiler-tools-python-tests.txt
+if [ "$compiler_tools_stub_count" -eq 0 ]; then
+	echo "FAIL: compiler-tools unittest manifest is empty"
+	exit 1
+fi
 cat > "$TMP_HARNESS/blorp/test/tool/test_compiler_tool_fixtures.py" <<'PY'
 #!/usr/bin/env python3
 from pathlib import Path
@@ -981,6 +994,7 @@ fi
 echo "PASS: scripts/test rejects stale compiler suite inventory"
 
 compiler_tools_output="$TMP_HARNESS/compiler-tools-output.txt"
+expected_compiler_tools_passed=$((3 + compiler_tools_stub_count))
 (
 	cd "$TMP_HARNESS" || exit 1
 	BLORP_TEST_LOCK_HELD=1 \
@@ -989,7 +1003,7 @@ compiler_tools_output="$TMP_HARNESS/compiler-tools-output.txt"
 compiler_tools_status=$?
 
 if [ "$compiler_tools_status" -ne 0 ] ||
-	! grep -Eq 'Compiler-Tools[[:space:]]+PASS[[:space:]]+5[[:space:]]+0[[:space:]]+5' \
+	! grep -Eq "Compiler-Tools[[:space:]]+PASS[[:space:]]+${expected_compiler_tools_passed}[[:space:]]+0[[:space:]]+${expected_compiler_tools_passed}[[:space:]]" \
 		"$compiler_tools_output"
 then
 	echo "FAIL: scripts/test compiler-tools should preserve public tool fixtures"
