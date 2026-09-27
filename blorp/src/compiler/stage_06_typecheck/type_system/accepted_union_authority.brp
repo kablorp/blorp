@@ -1,6 +1,8 @@
 -- Category-specific accepted union storage and compact constructor visibility.
--- Union and variant payloads live once in the graph-owned table. Module views
--- retain only scalar table locators for visible source spellings.
+-- Union and variant payloads live once in the graph-owned table. Constructor
+-- symbols are projected there for canonical lookups and in each module view
+-- for owner-local source spellings and localized field types. Visible-name
+-- lookup still uses scalar locators, preserving its precedence order.
 import:
 	../../stage_04_modules/module_table:
 		ModuleId,
@@ -87,6 +89,7 @@ private record AcceptedUnionTableRep {
 	unions: List[AcceptedUnionEntry],
 	graph_type_ids_by_union_index: Dict[Int, TypeId],
 	canonical_names: List[String],
+	canonical_constructor_symbols: List[List[Symbol]],
 	canonical_visibility: List[Bool],
 	graph_union_indices_by_definition_id: Dict[Int, Int],
 	canonical_graph_union_indices_by_name: Dict[String, Int],
@@ -120,7 +123,7 @@ private record AcceptedUnionModuleViewRep {
 	visible_unions_by_source_name: Dict[String, AcceptedUnionLocator],
 	visible_constructors_by_source_name: Dict[String, List[AcceptedUnionConstructorLocator]],
 	constructor_parent_aliases: Dict[String, String],
-	local_parent_source_names_by_union_index: Dict[Int, String]
+	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]]
 }
 
 
@@ -133,7 +136,7 @@ private record AcceptedUnionAuthorityRep {
 	visible_unions_by_source_name: Dict[String, AcceptedUnionLocator],
 	visible_constructors_by_source_name: Dict[String, List[AcceptedUnionConstructorLocator]],
 	constructor_parent_aliases: Dict[String, String],
-	local_parent_source_names_by_union_index: Dict[Int, String]
+	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]]
 }
 
 
@@ -356,6 +359,34 @@ private pure func append_module_constructor_locators(
 	)
 
 
+private pure func constructor_symbols_for_union(
+	entry: AcceptedUnionEntry,
+	parent_type: String,
+	identity_domain: ConstructorIdentityDomain,
+	owner_module_path: Option[String],
+) -> List[Symbol]:
+	entry.variants.map(func(variant):
+		fields = match owner_module_path:
+			Some(path):
+				variant.fields.map(func(field): localize_module_types(path, field))
+			None:
+				variant.fields
+
+		symbol: Symbol = {
+			name = variant.name,
+			kind = ConstructorSymbolKind({
+				parent_type = parent_type,
+				constructor_id = variant.constructor_id,
+				identity_domain = identity_domain,
+				type_params = entry.type_params,
+				field_types = fields,
+				tag = variant.tag,
+			})
+		}
+		symbol
+	)
+
+
 pure func accepted_union_table(
 	input: AcceptedUnionTableInput,
 	type_identities: AcceptedAliasTable,
@@ -481,11 +512,38 @@ pure func accepted_union_table(
 						)
 
 	if errors.is_empty():
+		var canonical_constructor_symbols: List[List[Symbol]] = []
+		var union_index: Int = 0
+
+		for entry in unions:
+			match canonical_names.get(union_index):
+				Some(parent_type):
+					identity_domain: ConstructorIdentityDomain = if graph_type_ids_by_union_index.contains(
+						union_index,
+					):
+						GraphConstructorIdentity
+					else:
+						UnindexedConstructorIdentity
+
+					canonical_constructor_symbols = canonical_constructor_symbols.append(
+						constructor_symbols_for_union(
+							entry,
+							parent_type,
+							identity_domain,
+							None,
+						),
+					)
+				None:
+					canonical_constructor_symbols = canonical_constructor_symbols.append([])
+
+			union_index += 1
+
 		Ok(into_opaque AcceptedUnionTable({
 					definition_table = definition_table,
 					unions = unions,
 					graph_type_ids_by_union_index = graph_type_ids_by_union_index,
 					canonical_names = canonical_names,
+					canonical_constructor_symbols = canonical_constructor_symbols,
 					canonical_visibility = canonical_visibility,
 					graph_union_indices_by_definition_id = graph_union_indices_by_definition_id,
 					canonical_graph_union_indices_by_name = canonical_graph_union_indices_by_name,
@@ -583,7 +641,7 @@ pure func accepted_union_module_view(
 	var visible_unions: Dict[String, AcceptedUnionLocator] = {}
 	var visible_constructors: Dict[String, List[AcceptedUnionConstructorLocator]] = {}
 	var parent_aliases: Dict[String, String] = {}
-	var local_parent_source_names_by_union_index: Dict[Int, String] = {}
+	var local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]] = {}
 	var valid: Bool = True
 
 	for binding in union_bindings:
@@ -616,12 +674,6 @@ pure func accepted_union_module_view(
 							owner_local = binding.owner_local
 						},
 					)
-
-					if binding.owner_local:
-						local_parent_source_names_by_union_index = local_parent_source_names_by_union_index.set(
-							found_index,
-							binding.source_name,
-						)
 			None:
 				valid = False
 
@@ -708,15 +760,44 @@ pure func accepted_union_module_view(
 					valid = False
 
 	if valid:
+		owner_module_path = module_table_canonical_path(
+			definition_table_module_table(representation.definition_table),
+			owner,
+		)
+
+		for binding in union_bindings:
+			if binding.owner_local:
+				match (union_index_for_id(representation, binding.id), owner_module_path):
+					(Some(union_index), Some(path)):
+						match representation.unions.get(union_index):
+							Some(entry):
+								identity_domain: ConstructorIdentityDomain = if representation.graph_type_ids_by_union_index.contains(
+									union_index,
+								):
+									GraphConstructorIdentity
+								else:
+									UnindexedConstructorIdentity
+
+								local_constructor_symbols_by_union_index = local_constructor_symbols_by_union_index.set(
+									union_index,
+									constructor_symbols_for_union(
+										entry,
+										binding.source_name,
+										identity_domain,
+										Some(path),
+									),
+								)
+							None:
+								void
+					_:
+						void
+
 		Some(into_opaque AcceptedUnionModuleView({
-					owner_module_path = module_table_canonical_path(
-						definition_table_module_table(representation.definition_table),
-						owner,
-					),
+					owner_module_path = owner_module_path,
 					visible_unions_by_source_name = visible_unions,
 					visible_constructors_by_source_name = visible_constructors,
 					constructor_parent_aliases = parent_aliases,
-					local_parent_source_names_by_union_index = local_parent_source_names_by_union_index
+					local_constructor_symbols_by_union_index = local_constructor_symbols_by_union_index
 				}))
 	else:
 		None
@@ -728,7 +809,7 @@ pure func accepted_union_empty_module_view() -> AcceptedUnionModuleView:
 			visible_unions_by_source_name = {},
 			visible_constructors_by_source_name = {},
 			constructor_parent_aliases = {},
-			local_parent_source_names_by_union_index = {}
+			local_constructor_symbols_by_union_index = {}
 		})
 
 
@@ -743,7 +824,7 @@ pure func accepted_union_authority(
 			visible_unions_by_source_name = representation.visible_unions_by_source_name,
 			visible_constructors_by_source_name = representation.visible_constructors_by_source_name,
 			constructor_parent_aliases = representation.constructor_parent_aliases,
-			local_parent_source_names_by_union_index = representation.local_parent_source_names_by_union_index
+			local_constructor_symbols_by_union_index = representation.local_constructor_symbols_by_union_index
 		})
 
 
@@ -816,18 +897,6 @@ private pure func accepted_union_entry_raw(
 	table.unions.get(locator.union_index)
 
 
-private pure func localized_variant(
-	variant: AcceptedUnionVariantEntry,
-	owner_module_path: Option[String],
-) -> Option[AcceptedUnionVariantEntry]:
-	owner_path ?= owner_module_path
-	Some(
-		{ variant |
-			fields = variant.fields.map(func(field): localize_module_types(owner_path, field))
-		},
-	)
-
-
 pure func accepted_union_find(
 	authority: AcceptedUnionAuthority,
 	name: String,
@@ -850,58 +919,26 @@ pure func accepted_union_contains(authority: AcceptedUnionAuthority, name: Strin
 private pure func constructor_symbol_from_locator(
 	table: AcceptedUnionTableRep,
 	locator: AcceptedUnionConstructorLocator,
-	owner_module_path: Option[String],
-	local_parent_source_names_by_union_index: Dict[Int, String],
+	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]],
 ) -> Option[Symbol]:
-	union_entry ?= table.unions.get(locator.union_index)
-	canonical_variant ?= union_entry.variants.get(locator.variant_index)
-
-	variant ?= match locator.owner_local:
+	match locator.owner_local:
 		True:
-			localized_variant(canonical_variant, owner_module_path)
+			local_constructor_symbols_by_union_index
+				.get(locator.union_index)
+				.and_then(func(symbols): symbols.get(locator.variant_index))
 		False:
-			Some(canonical_variant)
-
-	parent_type ?= match locator.owner_local:
-		True:
-			local_parent_source_names_by_union_index.get(locator.union_index)
-		False:
-			table.canonical_names.get(locator.union_index)
-
-	identity_domain: ConstructorIdentityDomain = if union_id_at(
-		table.graph_type_ids_by_union_index,
-		locator.union_index,
-	).is_some():
-		GraphConstructorIdentity
-	else:
-		UnindexedConstructorIdentity
-
-	Some({
-		name = variant.name,
-		kind = ConstructorSymbolKind({
-			parent_type = parent_type,
-			constructor_id = variant.constructor_id,
-			identity_domain = identity_domain,
-			type_params = union_entry.type_params,
-			field_types = variant.fields,
-			tag = variant.tag,
-		}),
-	})
+			table.canonical_constructor_symbols
+				.get(locator.union_index)
+				.and_then(func(symbols): symbols.get(locator.variant_index))
 
 
 private pure func first_constructor_symbol(
 	table: AcceptedUnionTableRep,
 	locators: Option[List[AcceptedUnionConstructorLocator]],
-	owner_module_path: Option[String],
-	local_parent_source_names_by_union_index: Dict[Int, String],
+	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]],
 ) -> Option[Symbol]:
 	locator ?= locators.and_then(func(entries): entries.get(0))
-	constructor_symbol_from_locator(
-		table,
-		locator,
-		owner_module_path,
-		local_parent_source_names_by_union_index,
-	)
+	constructor_symbol_from_locator(table, locator, local_constructor_symbols_by_union_index)
 
 
 pure func accepted_union_find_constructor_symbol(
@@ -914,8 +951,7 @@ pure func accepted_union_find_constructor_symbol(
 	match first_constructor_symbol(
 		table,
 		representation.visible_constructors_by_source_name.get(name),
-		representation.owner_module_path,
-		representation.local_parent_source_names_by_union_index,
+		representation.local_constructor_symbols_by_union_index,
 	):
 		Some(symbol):
 			Some(symbol)
@@ -923,7 +959,6 @@ pure func accepted_union_find_constructor_symbol(
 			first_constructor_symbol(
 				table,
 				table.builtin_constructors_by_name.get(name),
-				None,
 				{},
 			)
 
@@ -932,8 +967,7 @@ private pure func constructor_symbol_for_parent(
 	table: AcceptedUnionTableRep,
 	locators: Option[List[AcceptedUnionConstructorLocator]],
 	parent_type: String,
-	owner_module_path: Option[String],
-	local_parent_source_names_by_union_index: Dict[Int, String],
+	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]],
 ) -> Option[Symbol]:
 	var result: Option[Symbol] = None
 
@@ -944,8 +978,7 @@ private pure func constructor_symbol_for_parent(
 					match constructor_symbol_from_locator(
 						table,
 						locator,
-						owner_module_path,
-						local_parent_source_names_by_union_index,
+						local_constructor_symbols_by_union_index,
 					):
 						Some(symbol):
 							match symbol.kind:
@@ -975,8 +1008,7 @@ pure func accepted_union_find_constructor_symbol_for_parent(
 		table,
 		representation.visible_constructors_by_source_name.get(name),
 		resolved_parent,
-		representation.owner_module_path,
-		representation.local_parent_source_names_by_union_index,
+		representation.local_constructor_symbols_by_union_index,
 	):
 		Some(symbol):
 			Some(symbol)
@@ -985,7 +1017,6 @@ pure func accepted_union_find_constructor_symbol_for_parent(
 				table,
 				table.builtin_constructors_by_name.get(name),
 				resolved_parent,
-				None,
 				{},
 			)
 
@@ -1041,7 +1072,6 @@ private pure func accepted_union_find_module_constructor_symbol(
 	first_constructor_symbol(
 		table,
 		module_constructor_locators(table, module_path, name),
-		None,
 		{},
 	)
 
