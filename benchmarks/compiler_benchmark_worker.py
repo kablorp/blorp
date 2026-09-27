@@ -8,6 +8,7 @@ import platform
 import shlex
 import subprocess
 from pathlib import Path
+from typing import Literal
 
 
 WORKER_STACK_SIZE_BYTES = 256 * 1024 * 1024
@@ -87,6 +88,57 @@ def _explicit_worker(env_name: str, explicit: str | None) -> Path | None:
     return path
 
 
+def _link_command(
+    cc: list[str],
+    root: Path,
+    object_path: Path,
+    wrapper_path: Path,
+    worker_path: Path,
+    link_sources: tuple[Path, ...] = (),
+) -> list[str]:
+    stack_link_args = (
+        ["-Wl,-stack_size,0x4000000"] if platform.system() == "Darwin" else []
+    )
+    return [
+        *cc,
+        *COMMON_CC_FLAGS,
+        str(object_path),
+        str(wrapper_path),
+        *(str((root / path).resolve()) for path in link_sources),
+        *stack_link_args,
+        "-lm",
+        "-lpthread",
+        "-o",
+        str(worker_path),
+    ]
+
+
+def _compiler_command(
+    compiler: Path,
+    c_path: Path,
+    source: Path,
+    *,
+    debug_profile: bool = False,
+    profile_functions: tuple[str, ...] = (),
+    profile_mode: Literal["exact", "calls"] = "exact",
+) -> list[str]:
+    if profile_mode not in ("exact", "calls"):
+        raise ValueError("profile_mode must be exact or calls")
+    if not debug_profile and (profile_functions or profile_mode != "exact"):
+        raise ValueError("profile selection and mode require debug_profile")
+    command = [str(compiler), "compile", "--no-format"]
+    if debug_profile:
+        command.append("--debug")
+        if profile_mode == "exact":
+            command.append("--profile")
+        else:
+            command.extend(("--profile-mode", "calls"))
+        for selector in profile_functions:
+            command.extend(("--profile-function", selector))
+    command.extend(("-o", str(c_path), str(source)))
+    return command
+
+
 def prepare_benchmark_worker(
     root: Path,
     out_dir: Path,
@@ -97,7 +149,10 @@ def prepare_benchmark_worker(
     worker_name: str,
     main_symbol: str,
     include_dirs: tuple[Path, ...] = (),
+    link_sources: tuple[Path, ...] = (),
     debug_profile: bool = False,
+    profile_functions: tuple[str, ...] = (),
+    profile_mode: Literal["exact", "calls"] = "exact",
 ) -> Path:
     """Resolve an override or build one disposable benchmark worker."""
     selected = _explicit_worker(env_name, explicit)
@@ -117,10 +172,14 @@ def prepare_benchmark_worker(
     wrapper_path = out_dir / f"{worker_name}_main.c"
     worker_path = out_dir / worker_name
 
-    compiler_arguments = [str(compiler), "compile", "--no-format"]
-    if debug_profile:
-        compiler_arguments.extend(("--debug", "--profile"))
-    compiler_arguments.extend(("-o", str(c_path), str(source)))
+    compiler_arguments = _compiler_command(
+        compiler,
+        c_path,
+        source,
+        debug_profile=debug_profile,
+        profile_functions=profile_functions,
+        profile_mode=profile_mode,
+    )
     _run(
         compiler_arguments,
         root,
@@ -152,21 +211,8 @@ def prepare_benchmark_worker(
         root,
         f"compiling the {worker_name} object",
     )
-    stack_link_args = (
-        ["-Wl,-stack_size,0x4000000"] if platform.system() == "Darwin" else []
-    )
     _run(
-        [
-            *cc,
-            *COMMON_CC_FLAGS,
-            str(object_path),
-            str(wrapper_path),
-            *stack_link_args,
-            "-lm",
-            "-lpthread",
-            "-o",
-            str(worker_path),
-        ],
+        _link_command(cc, root, object_path, wrapper_path, worker_path, link_sources),
         root,
         f"linking the {worker_name}",
     )

@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Read exact identity marker calls from the existing benchmark profile worker."""
+
+from __future__ import annotations
+
+import json
+import hashlib
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKER = ROOT / "benchmarks/compiler_identity_work_profile"
+PREFIX = "blorp_src_compiler_identity_work_counters__"
+MARKERS = (
+    "identity_work_core_var_equal",
+    "identity_work_local_scope_lookup",
+    "identity_work_observed_core_var_constructor_helper_calls",
+    "identity_work_observed_display_lookup",
+)
+LOSS_DIAGNOSTICS = (
+    "invalid_start_ids",
+    "invalid_end_ids",
+    "unmatched_ends",
+    "out_of_order_ends",
+    "metadata_initialization_failures",
+    "stack_growth_failures",
+    "cancellation_abandoned_frames",
+    "dead_or_shutdown_abandoned_frames",
+    "signal_abandoned_frames",
+    "nonlocal_abandoned_frames",
+    "recovered_nonlocal_exits",
+)
+
+
+def check_profile_diagnostics(output: str, expected_mode: str) -> dict[str, str]:
+    lines = [line for line in output.splitlines() if line.startswith("PROFILE_DIAGNOSTICS ")]
+    if len(lines) != 1:
+        raise ValueError("expected exactly one profiler diagnostics row")
+    fields = dict(part.split("=", 1) for part in lines[0].split()[1:])
+    if fields.get("profile_mode") != expected_mode:
+        raise ValueError(f"identity counts require {expected_mode} profile mode")
+    for name in LOSS_DIAGNOSTICS:
+        if name not in fields or int(fields[name]) != 0:
+            raise ValueError(f"profiler loss or corruption: {name}={fields.get(name)}")
+    if expected_mode == "calls":
+        schema_functions = len(MARKERS) + 1
+        for name in ("functions_selected", "functions_observed"):
+            if int(fields.get(name, "-1")) != schema_functions:
+                raise ValueError(f"calls-mode identity schema requires {schema_functions} {name}")
+        for name in ("abandoned_frames", "window_abandoned_frames", "stack_growths"):
+            if int(fields.get(name, "-1")) != 0:
+                raise ValueError(f"unexpected calls-mode profiler stack state: {name}")
+        if int(fields.get("calls_completed", "-1")) != 0:
+            raise ValueError("calls-mode profiler unexpectedly recorded timed completions")
+    elif int(fields.get("functions_observed", "0")) < len(MARKERS) + 1:
+        raise ValueError("profiler observed too few functions for identity schema")
+    return fields
+
+
+def parse_profile(output: str, expected_mode: str = "exact") -> dict[str, int]:
+    diagnostics = check_profile_diagnostics(output, expected_mode)
+    rows: dict[str, int] = {}
+    for line in output.splitlines():
+        columns = line.split()
+        expected_columns = 3 if expected_mode == "calls" else 7
+        if len(columns) == expected_columns and columns[0].startswith(PREFIX):
+            name = columns[0][len(PREFIX) :]
+            rows[name] = int(columns[2] if expected_mode == "calls" else columns[5])
+    if rows.get("register_identity_work_counters") != 1:
+        raise ValueError("identity marker registration must occur exactly once")
+    if set(rows) != set(MARKERS) | {"register_identity_work_counters"}:
+        raise ValueError(f"incomplete identity marker schema: {sorted(rows)}")
+    observed_calls = int(diagnostics.get("calls_observed", "0"))
+    completed_calls = int(diagnostics.get("calls_completed", "0"))
+    if expected_mode == "calls" and observed_calls != sum(rows.values()):
+        raise ValueError("calls-mode profiler total disagrees with identity rows")
+    if expected_mode == "exact" and completed_calls < sum(rows.values()):
+        raise ValueError("exact profiler completed fewer calls than identity rows")
+    return {name: rows[name] - 1 for name in MARKERS}
+
+
+def run_once() -> tuple[dict[str, int], int]:
+    completed = subprocess.run(
+        [str(WORKER)], cwd=ROOT, text=True, capture_output=True, check=True
+    )
+    output = completed.stdout + completed.stderr
+    match = re.search(
+        r"IDENTITY_WORK_PROFILE equality_calls=2 scope_lookup_calls=2 allocations=(\d+)",
+        output,
+    )
+    if match is None:
+        raise ValueError("identity fixture result missing or incorrect")
+    return parse_profile(output), int(match.group(1))
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_output(repo: Path, *args: str) -> str:
+    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+
+def extract_replay(arguments: list[str]) -> int:
+    if len(arguments) != 7:
+        raise ValueError(
+            "usage: compiler_identity_work_counters --extract-replay "
+            "LOG1 LOG2 CORE1 CORE2 INPUT_REPO WORKER_BINARY OUTPUT_JSON"
+        )
+    log1, log2, core1, core2, input_repo, worker, output_json = map(Path, arguments)
+    profiles = [log1.read_text(), log2.read_text()]
+    stage_rows = [
+        re.findall(r"IDENTITY_WORK_REPLAY stage=(\w+) status=0", profile)
+        for profile in profiles
+    ]
+    if any(len(rows) != 1 for rows in stage_rows) or stage_rows[0] != stage_rows[1]:
+        raise ValueError("production replays did not complete at one matching stage")
+    stage = stage_rows[0][0]
+    for profile in profiles:
+        if "PROFILE_DIAGNOSTICS " not in profile:
+            raise ValueError("production replay did not finish successfully")
+    counts = [parse_profile(profile, expected_mode="calls") for profile in profiles]
+    if counts[0] != counts[1]:
+        raise ValueError(f"replay identity counts changed: {counts}")
+    hashes = [file_sha256(core) for core in (core1, core2)]
+    if hashes[0] != hashes[1]:
+        raise ValueError(f"replay Core output changed: {hashes}")
+    if counts[0]["identity_work_core_var_equal"] <= 0:
+        raise ValueError("production replay did not exercise Core equality")
+    if counts[0]["identity_work_local_scope_lookup"] <= 0:
+        raise ValueError("production replay did not exercise central scope lookup")
+    result = {
+        "input_revision": git_output(input_repo, "rev-parse", "HEAD"),
+        "input_tree_hash": git_output(input_repo, "rev-parse", "HEAD^{tree}"),
+        "input_main_blob_hash": git_output(input_repo, "hash-object", "blorp/src/main.brp"),
+        "candidate_compiler_sha256": file_sha256(ROOT / "bin/blorp"),
+        "worker_sha256": file_sha256(worker),
+        "mode": f"debug, selected function call counts, stop-after={stage}",
+        "counts": counts[0],
+        "core_output_sha256": hashes[0],
+        "raw_logs": [str(log1), str(log2)],
+        "core_outputs": [str(core1), str(core2)],
+        "covered_helper_sites": ["stage_08_core_lower/lower.brp:core_var_impl"],
+        "total_static_constructor_sites": 47,
+        "constructor_site_scope": "lexically adjacent name/id/def_id fields in stage 8/9 complete-field literals; source-shape conditional, not total constructions",
+        "display_lookup_status": "unsupported_current_authority",
+        "string_hash_status": "scope-lookup and CoreVar-equality proxies; separate hash calls require library/runtime intrusion",
+    }
+    output_json.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--extract-replay":
+        return extract_replay(sys.argv[2:])
+    first = run_once()
+    second = run_once()
+    if first != second:
+        raise ValueError(f"identity counts changed between runs: {first} != {second}")
+    counts, allocations = first
+    if counts["identity_work_core_var_equal"] != 2:
+        raise ValueError("fixture expected two CoreVar equality calls")
+    if counts["identity_work_local_scope_lookup"] != 2:
+        raise ValueError("fixture expected two central scope lookups")
+    if counts["identity_work_observed_core_var_constructor_helper_calls"] != 0:
+        raise ValueError("fixture does not exercise the observed constructor helper")
+    if counts["identity_work_observed_display_lookup"] != 0:
+        raise ValueError("display lookup is unsupported at this checkpoint")
+    result = {
+        "counts": counts,
+        "fixture_allocations": allocations,
+        "covered_helper_sites": ["stage_08_core_lower/lower.brp:core_var_impl"],
+        "total_static_constructor_sites": 47,
+        "constructor_site_scope": "complete-field CoreVar literals in stage 8/9; record updates excluded",
+        "display_lookup_status": "unsupported_current_authority",
+        "string_hash_status": "scope-lookup and CoreVar-equality proxy; separate hash calls require library/runtime intrusion",
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if len(sys.argv) == 3 and sys.argv[1] == "--output":
+        Path(sys.argv[2]).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    elif len(sys.argv) != 1:
+        raise ValueError("usage: compiler_identity_work_counters [--output PATH]")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
