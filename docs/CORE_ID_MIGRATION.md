@@ -1320,6 +1320,13 @@ record ModuleSourceDefinitionColumns {
 
 All columns have one checked equal-length invariant. Optional owner/child
 relationships use named absent-index constants, not scattered magic integers.
+The existing surface traversal owns the growable column lists directly and
+wraps them once when the module surface is frozen. Do not thread an opaque
+eight-list builder through each row: under Blorp value semantics that shape can
+allocate a builder record and retain every column on every append. Validate
+the frozen columns once when the graph-level catalog is published; publication
+already has an explicit failure result, so an invalid module must not silently
+fall back to an empty catalog.
 The catalog may project one boxed `DiscoveredDefinition` or locator for cold
 diagnostics and tests, but it must not expose an API that reconstructs the
 whole catalog as a list of row records. C1b consumes borrowed columns and
