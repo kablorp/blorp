@@ -433,6 +433,7 @@ import:
 		type_contains_meta,
 		type_instantiate_type_params,
 		type_list,
+		type_contains_dim_op,
 		type_subst_entry,
 		type_to_string,
 		types_compatible_with_params,
@@ -7988,25 +7989,34 @@ private pure func call_signature(
 	params: List[SemanticType],
 	return_type: SemanticType,
 ) -> CallSignature:
-	outer_names = env_get_type_params(context.state.env)
-	var used_names: List[String] = []
-	var scoped_params: List[BoundTypeParam] = []
-	var renames: List[SemanticTypeSubstEntry] = []
+	-- Empty substitution normally returns each original type, but it also
+	-- normalizes dimension expressions. Preserve that work when present.
+	if (
+		bound_params.length() == 0
+		and not params.any(type_contains_dim_op)
+		and not type_contains_dim_op(return_type)
+	):
+		{ bound_params = bound_params, params = params, return_type = return_type }
+	else:
+		outer_names = env_get_type_params(context.state.env)
+		var used_names: List[String] = []
+		var scoped_params: List[BoundTypeParam] = []
+		var renames: List[SemanticTypeSubstEntry] = []
 
-	for param in bound_params:
-		scoped_name = fresh_callee_type_param_name(outer_names, used_names, param.name)
-		scoped_params = scoped_params.append({ param | name = scoped_name })
-		used_names = used_names.append(scoped_name)
+		for param in bound_params:
+			scoped_name = fresh_callee_type_param_name(outer_names, used_names, param.name)
+			scoped_params = scoped_params.append({ param | name = scoped_name })
+			used_names = used_names.append(scoped_name)
 
-		if scoped_name != param.name:
-			renames = renames.append(type_subst_entry(param.name, SemanticTypeVar(scoped_name)))
+			if scoped_name != param.name:
+				renames = renames.append(type_subst_entry(param.name, SemanticTypeVar(scoped_name)))
 
-	final_renames = renames
-	{
-		bound_params = scoped_params,
-		params = params.map(func(param): apply_subst(final_renames, param)),
-		return_type = apply_subst(final_renames, return_type)
-	}
+		final_renames = renames
+		{
+			bound_params = scoped_params,
+			params = params.map(func(param): apply_subst(final_renames, param)),
+			return_type = apply_subst(final_renames, return_type)
+		}
 
 
 private pure func type_contains_named_type_param(
@@ -8849,6 +8859,64 @@ private pure func infer_call_args_with_subst(
 		context = infer_without_expected(next_context),
 		args = typed_args,
 		subst = subst
+	}
+
+
+-- A signature without bound or free type variables still needs argument
+-- inference and assignability, but cannot acquire a type substitution.
+private pure func infer_call_args_without_subst(
+	context: InferContext,
+	callee: TypedExpr,
+	args: List[ParsedExpr],
+	params: List[SemanticType],
+) -> InferCallArgsResult:
+	var next_context: InferContext = context
+	var typed_args: List[TypedExpr] = []
+	var index: Int = 0
+
+	while index < args.length():
+		match (args.get(index), params.get(index)):
+			(Some(arg), Some(param_type)):
+				arg_context = infer_with_canonical_expected_value_slot(
+					next_context,
+					param_type,
+					ExpectedArgumentSlot,
+				)
+				arg_result = infer_expr(arg_context, arg)
+				arg_bind_type = generic_argument_bind_type(
+					param_type,
+					arg_result.expr,
+					typed_expr_value_type(arg_result.expr),
+				)
+
+				next_context = match call_argument_assignable_context(
+					arg_result.context,
+					callee,
+					param_type,
+					arg_bind_type,
+				):
+					Some(assignable_context):
+						assignable_context
+					None:
+						argument_mismatch_error(
+							arg_result.context,
+							callee,
+							index,
+							param_type,
+							arg_bind_type,
+							parsed_expr_location(arg),
+						)
+
+				typed_args = typed_args.append(arg_result.expr)
+			_:
+				void
+
+		index += 1
+
+	{
+		context = infer_without_expected(next_context),
+		args = typed_args,
+		subst = []
 	}
 
 
@@ -10220,6 +10288,11 @@ private pure func infer_call_with_callee_result(
 			call_params = signature.params
 			call_return_type = signature.return_type
 			type_param_names: List[String] = signature.bound_params.map(func(param): param.name)
+			can_skip_call_subst = (
+				signature.bound_params.length() == 0
+				and not call_params.any(type_contains_type_var)
+				and not type_contains_type_var(call_return_type)
+			)
 
 			if call_params.length() != args.length():
 				next = call_arity_error(
@@ -10236,32 +10309,43 @@ private pure func infer_call_with_callee_result(
 				)
 				infer_result(next, typed)
 			else:
-				initial_return_bind = bind_expected_return_subst(
-					self_resolution.context,
-					type_param_names,
-					call_return_type,
-					[],
-				)
-				arg_result = infer_call_args_with_subst(
-					initial_return_bind.context,
-					callee_expr,
-					args,
-					call_params,
-					type_param_names,
-					initial_return_bind.subst,
-				)
+				arg_result = if can_skip_call_subst:
+					infer_call_args_without_subst(
+						self_resolution.context,
+						callee_expr,
+						args,
+						call_params,
+					)
+				else:
+					initial_return_bind = bind_expected_return_subst(
+						self_resolution.context,
+						type_param_names,
+						call_return_type,
+						[],
+					)
+					infer_call_args_with_subst(
+						initial_return_bind.context,
+						callee_expr,
+						args,
+						call_params,
+						type_param_names,
+						initial_return_bind.subst,
+					)
 				result_context = infer_context_with_state(context, arg_result.context.state)
-				return_bind = bind_expected_return_subst(
-					result_context,
-					type_param_names,
-					call_return_type,
-					arg_result.subst,
-				)
-				complete_subst = complete_call_type_subst(
-					return_bind.context,
-					signature.bound_params,
-					return_bind.subst,
-				)
+				complete_subst = if can_skip_call_subst:
+					bind_type_subst_result(result_context, [])
+				else:
+					return_bind = bind_expected_return_subst(
+						result_context,
+						type_param_names,
+						call_return_type,
+						arg_result.subst,
+					)
+					complete_call_type_subst(
+						return_bind.context,
+						signature.bound_params,
+						return_bind.subst,
+					)
 				checked_context = check_call_trait_bounds_for_params(
 					complete_subst.context,
 					callee_expr,
@@ -10282,9 +10366,10 @@ private pure func infer_call_with_callee_result(
 					self_resolved_call,
 					arg_result.args,
 				)
-				substituted_param_types = call_params.map(
-					func(param): apply_subst(complete_subst.subst, param),
-				)
+				substituted_param_types = if can_skip_call_subst:
+					call_params
+				else:
+					call_params.map(func(param): apply_subst(complete_subst.subst, param))
 				var_dims_bind = bind_call_var_dims(
 					resource_checked_context,
 					substituted_param_types,
@@ -10293,9 +10378,13 @@ private pure func infer_call_with_callee_result(
 				resolved_param_types = substituted_param_types.map(
 					func(param): resolve_var_dims_type(var_dims_bind.subst, param),
 				)
+				substituted_return_type = if can_skip_call_subst:
+					call_return_type
+				else:
+					apply_subst(complete_subst.subst, call_return_type)
 				resolved_return_base = resolve_var_dims_type(
 					var_dims_bind.subst,
-					apply_subst(complete_subst.subst, call_return_type),
+					substituted_return_type,
 				)
 				resolved_return_type = refined_builtin_return_type(
 					var_dims_bind.context.state.facts,
