@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Count generated C bytes by lexical class and conservative spelling family.
+
+This is a size probe, not a Core identity map. In particular, ordinary source
+locals and globals have arbitrary C spellings and remain in ``unknown``.
+Known families are exact spelling contracts in c_symbol_projection.brp and
+c_naming.brp; the report does not infer declaration ownership from a prefix.
+
+Use --measurement with a self_compile_measure JSON record and its --keep-output
+C file to bind the report to an input revision and compiler binary. This mode
+requires a frozen Git input and a repository compiler: harness runs recording
+``unknown`` for either revision are intentionally rejected. The C hash must
+match that measurement. Only a bounded unknown-identifier list is printed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import mmap
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+
+# Order matters: literals/comments/numbers must consume their embedded names.
+# C pp-numbers are counted as structural bytes; the generated C uses C numeric
+# syntax, including hexadecimal digits and signed exponent tails.
+TOKEN = re.compile(
+    rb'(?P<include>^[ \t]*\#[ \t]*include[ \t]*(?:<[^>\r\n]+>|"(?:\\[\s\S]|[^"\\])*"))'
+    rb'|(?P<comment>/\*[\s\S]*?\*/|//(?:\\\r?\n|[^\r\n])*)'
+    rb'|(?P<literal>(?:u8|u|U|L)?"(?:\\[\s\S]|[^"\\])*"|(?:u8|u|U|L)?\'(?:\\[\s\S]|[^\'\\])*\')'
+    rb'|(?P<number>(?:[0-9]|\.[0-9])(?:[eEpP][+-]|[A-Za-z_0-9.])*)'
+    rb'|(?P<identifier>[A-Za-z_][A-Za-z_0-9]*)',
+    re.MULTILINE,
+)
+INCLUDE_HEADER = re.compile(rb'(?:<[^>\r\n]+>|"(?:\\[\s\S]|[^"\\])*")$')
+PROJECTED_TYPE = re.compile(rb'brp_ty[0-9A-Za-z]+\Z')
+PROJECTED_CALLABLE = re.compile(rb'brp_[0-9A-Za-z]+\Z')
+COMPACT_TEMP = re.compile(rb'__t[0-9A-Za-z]+_[0-9]+\Z')
+INTERNAL_BINDING = re.compile(rb'__blorp_internal_[A-Za-z_0-9]+\Z')
+ESCAPED_SOURCE_BINDING = re.compile(rb'__blorp_source_[0-9]+_[A-Za-z_0-9]+\Z')
+
+C_KEYWORDS = frozenset(
+    b"auto break case char const continue default do double else enum extern float "
+    b"for goto if inline int long register restrict return short signed sizeof "
+    b"static struct switch typedef union unsigned void volatile while _Alignas "
+    b"_Alignof _Atomic _Bool _Complex _Generic _Imaginary _Noreturn "
+    b"_Static_assert _Thread_local".split()
+)
+FAMILIES = (
+    "projected_callable_spelling",
+    "projected_type_spelling",
+    "compact_temp_spelling",
+    "compiler_internal_binding_spelling",
+    "escaped_source_binding_spelling",
+    "unknown",
+)
+MEASUREMENT_SCHEMA = 1  # benchmarks/self_compile_measure SCHEMA_VERSION
+HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+HEX_REVISION = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def load_measurement(path: Path) -> dict:
+    record = json.loads(path.read_text())
+    if not isinstance(record, dict):
+        raise ValueError("measurement must be a self_compile_measure JSON object")
+    if record.get("schema") != MEASUREMENT_SCHEMA:
+        raise ValueError(f"measurement schema must be {MEASUREMENT_SCHEMA}")
+    for key in ("output_sha256", "compiler_sha256"):
+        value = record.get(key)
+        if not isinstance(value, str) or HEX_SHA256.fullmatch(value) is None:
+            raise ValueError(f"measurement {key} must be a SHA-256 hex digest")
+    for key in ("input_rev", "compiler_rev"):
+        value = record.get(key)
+        if not isinstance(value, str) or HEX_REVISION.fullmatch(value) is None:
+            raise ValueError(f"measurement {key} must be a 40-digit Git revision")
+    for key in ("compiler_path", "c_optimization", "compiler_build_status"):
+        value = record.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"measurement {key} must be a nonempty string")
+    if record.get("program") not in ("self", "small"):
+        raise ValueError("measurement program must be self or small")
+    if record.get("compiler_stage") not in (1, 2):
+        raise ValueError("measurement compiler_stage must be 1 or 2")
+    output_bytes = record.get("output_bytes")
+    if isinstance(output_bytes, bool) or not isinstance(output_bytes, int) or output_bytes <= 0:
+        raise ValueError("measurement output_bytes must be a positive integer")
+    toolchain = record.get("toolchain")
+    if not isinstance(toolchain, dict) or not isinstance(toolchain.get("cc_version"), str):
+        raise ValueError("measurement toolchain.cc_version is required")
+    return record
+
+
+def family(name: bytes) -> str:
+    if PROJECTED_TYPE.fullmatch(name):
+        return "projected_type_spelling"
+    if PROJECTED_CALLABLE.fullmatch(name):
+        return "projected_callable_spelling"
+    if COMPACT_TEMP.fullmatch(name):
+        return "compact_temp_spelling"
+    if INTERNAL_BINDING.fullmatch(name):
+        return "compiler_internal_binding_spelling"
+    if ESCAPED_SOURCE_BINDING.fullmatch(name):
+        return "escaped_source_binding_spelling"
+    return "unknown"
+
+
+def count(data: mmap.mmap, top: int) -> dict:
+    size = len(data)
+    bytes_by_class = {"total": size, "comments": 0, "literals": 0,
+                      "identifiers": 0, "structure": 0}
+    family_counts = {name: {"occurrences": 0, "bytes": 0} for name in FAMILIES}
+    unknown: Counter[bytes] = Counter()
+    previous_end = 0
+
+    for match in TOKEN.finditer(data):
+        token_size = match.end() - match.start()
+        bytes_by_class["structure"] += match.start() - previous_end
+        previous_end = match.end()
+        kind = match.lastgroup
+        if kind == "include":
+            header = INCLUDE_HEADER.search(match.group())
+            assert header is not None
+            bytes_by_class["literals"] += header.end() - header.start()
+            bytes_by_class["structure"] += token_size - (header.end() - header.start())
+        elif kind == "comment":
+            bytes_by_class["comments"] += token_size
+        elif kind == "literal":
+            bytes_by_class["literals"] += token_size
+        elif kind == "identifier":
+            identifier = match.group()
+            if identifier in C_KEYWORDS:
+                bytes_by_class["structure"] += token_size
+            else:
+                name_family = family(identifier)
+                family_counts[name_family]["occurrences"] += 1
+                family_counts[name_family]["bytes"] += token_size
+                bytes_by_class["identifiers"] += token_size
+                if name_family == "unknown":
+                    unknown[identifier] += 1
+        else:
+            bytes_by_class["structure"] += token_size
+
+    bytes_by_class["structure"] += size - previous_end
+    assert sum(bytes_by_class[key] for key in ("comments", "literals", "identifiers", "structure")) == size
+    top_unknown = sorted(unknown.items(), key=lambda pair: (-len(pair[0]) * pair[1], pair[0]))[:top]
+    return {
+        "bytes": bytes_by_class,
+        "identifier_families": family_counts,
+        "top_unknown": [
+            {"identifier": name.decode("ascii"), "occurrences": occurrences,
+             "bytes": len(name) * occurrences, "average_length": len(name)}
+            for name, occurrences in top_unknown
+        ],
+    }
+
+
+def run() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("c_file", type=Path, help="complete generated C artifact")
+    parser.add_argument("--measurement", type=Path,
+                        help="matching self_compile_measure JSON with Git input and repository compiler")
+    parser.add_argument("--top", type=int, default=20,
+                        help="maximum unknown identifier rows (default: 20)")
+    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    args = parser.parse_args()
+    if args.top < 0:
+        parser.error("--top must be nonnegative")
+    measurement = load_measurement(args.measurement) if args.measurement else None
+    with args.c_file.open("rb") as source:
+        if source.seek(0, 2) == 0:
+            parser.error("C artifact is empty")
+        source.seek(0)
+        with mmap.mmap(source.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            digest = hashlib.sha256(data).hexdigest()
+            if measurement is not None:
+                if digest != measurement["output_sha256"]:
+                    parser.error("generated C hash does not match measurement output_sha256")
+                if len(data) != measurement["output_bytes"]:
+                    parser.error("generated C size does not match measurement output_bytes")
+            report = count(data, args.top)
+
+    provenance = {"c_path": str(args.c_file.resolve()), "c_sha256": digest}
+    if measurement is not None:
+        provenance.update({key: measurement.get(key) for key in (
+            "program", "input_rev", "compiler_path", "compiler_sha256",
+            "compiler_rev", "compiler_stage", "c_optimization", "toolchain",
+        )})
+        provenance["measurement_path"] = str(args.measurement.resolve())
+    report["provenance"] = provenance
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"C artifact: {provenance['c_path']}")
+        print(f"SHA-256: {digest}  bytes: {report['bytes']['total']:,}")
+        if measurement is not None:
+            print(f"program={provenance['program']} input_rev={provenance['input_rev']} "
+                  f"compiler_sha256={provenance['compiler_sha256']}")
+        for name in ("comments", "literals", "identifiers", "structure"):
+            value = report["bytes"][name]
+            print(f"{name:12} {value:12,}  {100 * value / report['bytes']['total']:6.2f}%")
+        print("Identifier spellings (family names describe shape, not Core ownership):")
+        for name, item in report["identifier_families"].items():
+            print(f"  {name:38} {item['bytes']:12,} bytes  {item['occurrences']:10,} uses")
+        print("Top unknown identifiers by emitted bytes:")
+        for row in report["top_unknown"]:
+            print(f"  {row['bytes']:12,} bytes  {row['occurrences']:10,} uses  "
+                  f"avg {row['average_length']:4}  {row['identifier']}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(run())
+    except (OSError, ValueError, KeyError) as error:
+        print(f"c_emission_bytes: {error}", file=sys.stderr)
+        sys.exit(2)

@@ -1860,6 +1860,26 @@ actually removed.
 **Purpose.** Establish the backend beachhead from which strings can be removed
 right-to-left.
 
+**Feasibility checkpoint (2026-09-27).** Do not add a global or authored-local
+ID-to-C-name table merely as a preparatory backend cut. Callable projection is
+already ID-keyed. For ordinary globals and locals, `c_local_name` normally
+returns the existing string without allocation, whereas a new table adds
+storage and lookups. Global declarations have artifact-wide definition IDs,
+but the shared `c_var_name` path also serves locals and ownership/cleanup
+helpers; global references need validation that a present ID agrees with the
+declared name and that no unresolved reference is mistaken for a local.
+Likewise, final Core currently defines local occurrence identity as
+`(name, id)`, not `id` alone: a positive ID is not an exclusive authored-local
+key, and synthetic binders share `LetExpr`. These are upstream identity and
+coverage prerequisites, not renderer fallbacks to guess around. Before each
+table cut, prove complete declaration/reference coverage for one family and
+measure an actual repeated construction or lookup that the table removes.
+If the ordinary-name fast path remains zero-allocation, retain direct
+rendering and proceed with upstream identity work instead. The
+[`2026-09-27 C-byte census`](../benchmarks/results/c_emission_bytes_2026-09-27.md)
+is a repeatable size probe, not a substitute for that identity or a
+stage-2 cost measurement.
+
 Before touching emission, extend
 `benchmarks/normalize_generated_c_symbols` to canonicalize the complete old
 and proposed local-identifier families, including authored
@@ -1869,8 +1889,8 @@ where a collision, missing occurrence, declaration/reference mismatch, or
 structural C change does not. The tool must prove a one-to-one renaming; a
 broad regex that hides arbitrary identifiers is not an oracle.
 
-Callable projection already uses definition IDs. Extend the same rule to
-globals and locals:
+Callable projection already uses definition IDs. Once the prerequisites above
+hold, extend the same rule to globals and locals:
 
 ```text
 callable definition          brp_f<definition-id>
