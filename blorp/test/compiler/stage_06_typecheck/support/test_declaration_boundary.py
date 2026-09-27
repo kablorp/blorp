@@ -359,7 +359,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIn("graph_alias_view_matches_owner", resolution_source)
         self.assertIn(
-            "BoundAliasAndSelectiveName(BoundCandidateRowId, ModuleId, BoundCandidateRowId, ModuleId, Int)",
+            "BoundAliasAndSelectiveName(BoundCandidateRowId, ModuleId, BoundCandidateRowId, ModuleId, Int, ImportedNameBinding)",
             view_source,
         )
         self.assertNotIn(
