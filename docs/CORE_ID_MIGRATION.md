@@ -1256,8 +1256,14 @@ checked `DefinitionId`. For generated declarations, C1p1 refactors each
 existing legacy-frontier mint so one owned frontier step atomically returns a
 checked semantic/emission identity pair with the same ordinal. It must not
 advance twice or expose a generally importable raw-scalar constructor. Do not
-add the field to globals or other declarations without a named output
-consumer. Internal profile selection remains semantic-ID keyed; only
+represent that mint as a heap record or return tuple: use one private,
+scalar-only fixed-layout mint result with accessors for the semantic ID,
+emission ID, and next issuer, and inspect generated C to prove that a mint has
+no managed allocation. Do not add the field to declarations without a named
+output consumer. `CoreGlobal` does have such a consumer: match-projection and
+option-fusion temporary names currently include its semantic `def_id`, so the
+global must retain its emission compatibility ID and those local-name builders
+must read it. Internal profile selection remains semantic-ID keyed; only
 serialized/emitted numeric correlation uses the compatibility ID.
 
 C1p2 replaces the single generated-definition frontier with
@@ -1269,33 +1275,55 @@ and profile metadata. Stop if compatibility IDs enter semantic equality,
 lookup, dispatch, or diagnostics, or if any generated producer can advance
 only one frontier.
 
-Some test, benchmark, and direct-emitter APIs currently receive a bare
-`CoreProgram` rather than the frontier that produced it. During C1p1, exactly
-one grep-able reconstruction seam may derive the single issuer from the
-program's validated maximum declared definition ID; the constructor validates
-`max >= -1`, mints no ID, and is not a general compatibility-ID constructor.
-C1p2 must either derive separate semantic/emission maxima there or serialize
-the frontier with the Core artifact before the two sequences diverge. No
-individual pass or fixture may invent its own starting frontier.
+The semantic allocation frontier cannot be reconstructed from the final row in
+`DefinitionTable`: body-local and generated IDs legitimately advance `Env`
+beyond the source-row table. It also cannot be reconstructed from the largest
+declaration in a bare `CoreProgram`, because reserved IDs need not materialize
+as Core declarations. C1p1 therefore introduces a checked scalar
+`DefinitionAllocationFrontier` at the Stage 6 authority. `DefinitionIndex` and
+the final aligned `Env` publish it; `TypecheckedGraph` carries it; and Stage 8
+converts it once into the generated-definition issuer. Production code must
+not prove a frontier by looking up `next_def_id - 1`, scanning Core, or
+fabricating a predecessor row.
+
+Tests and direct helpers that can mint generated definitions must receive a
+real checked frontier or issuer from their fixture builder. A standalone
+lowering helper that can mint does the same. Do not provide a zero/empty issuer
+that is described as no-mint but remains capable of minting, and do not silently
+return the untransformed program when frontier construction fails. Direct
+emitter APIs that cannot mint need no issuer. C1p2 extends the carried artifact
+with an independent emission frontier before the two sequences diverge. No
+individual pass or fixture may invent its own production starting frontier.
 
 ```blorp
 -- Semantic lookup remains keyed by DefinitionId.
 candidate ?= callable_candidate_by_definition_id(plan, semantic_id)
 
+-- Stage 6 publishes authority, not evidence inferred from materialized rows.
+semantic_frontier = definition_index_allocation_frontier(aligned_index, final_env)
+typed_graph = { typed_graph | definition_frontier = semantic_frontier }
+
 -- Only rendering/ordering observes the compatibility number.
 symbol = projected_callable_base_symbol(candidate.emission_compatibility_id)
 
--- A generated declaration consumes both authorities atomically.
-(identity, emission, next_identity_state) ?= mint_generated_definition(
-	identity_state,
-)
+-- A generated declaration consumes both authorities atomically. The opaque
+-- fixed-layout result keeps the three scalars together without a tuple box.
+mint ?= mint_generated_definition(identity_state)
+identity = generated_definition_mint_semantic_id(mint)
+emission = generated_definition_mint_emission_id(mint)
+identity_state = generated_definition_mint_next_issuer(mint)
 ```
 
-`CoreFunction` and only declarations with a named output-number consumer carry
-the compatibility value. Do not add it to `CoreGlobal`, `CoreVar`, or another
-hot value merely for symmetry. A stored constructor `c_name` should be reused
+`CoreFunction`, `CoreGlobal`, and only other declarations with a named
+output-number consumer carry the compatibility value. Functions use it for
+symbols, ordering, comments, and owner-derived temporary names; globals use it
+for owner-derived match-projection and option-fusion temporary names. Add
+divergent semantic/emission fixtures for both paths so raw C proves which
+identity was observed. Do not add it to `CoreVar` or another recursive hot
+value merely for symmetry. A stored constructor `c_name` should be reused
 instead of reconstructed from either ID when it is already the output
-authority.
+authority. Symbol projection must reject duplicate compatibility IDs or
+duplicate projected symbols even when the semantic IDs differ.
 
 **C1a — discovery issuance.** Move the final-form `DefinitionId` primitive to
 a phase-neutral module that Stage 4 may own and Stage 6 may import. Do not
@@ -2485,7 +2513,7 @@ ratchet only at the C1b and C3c endpoints of their atomic trains.
 | --- | --- | --- |
 | C0a | new `scripts/compiler-identity-census`, Core/backend allowlist | stable text/JSON census and baseline ratchet budgets with zero production behavior change |
 | C0b | debug counters near `core_var_equal`, scope lookup, construction, display reads | disabled build is byte/allocation-identical; retained baseline artifacts |
-| C1p1 | Stage 8 declaration handoff, Stage 9 declaration/program representation, Stage 10 symbol projection/emission/order/metadata | checked output-only compatibility ID initially equals semantic ID; all output ordinal reads switch; semantic maps remain semantic-ID keyed; raw C and metadata identical |
+| C1p1 | Stage 6 checked allocation-frontier handoff, Stage 8 declaration handoff, Stage 9 declaration/program representation, Stage 10 symbol projection/emission/order/metadata | checked semantic frontier is carried from its authority rather than inferred from rows/Core; output-only compatibility ID initially equals semantic ID; fixed-layout pair mint allocates no managed object; function/global output consumers use the compatibility ID; duplicate output identities/symbols and invalid frontiers fail closed; semantic maps remain semantic-ID keyed; raw C and metadata identical |
 | C1p2 | Stage 8/9 identity state and every generated-definition mint site | independent semantic/emission frontiers advance exactly once per generated definition; initially lockstep; raw C identical; no recursive carrier traffic |
 | C1a | phase-neutral identity primitive, full ordered source-definition skeletons in `stage_04_modules/module_surface.brp`, `frontend_graph.brp`, and focused discovery tests | discovery-issued normalized catalog for the complete source-definition family; deterministic global IDs; generated/default/local/synthetic census explicit; no body/typed/Core work |
 | C1b | Stage 6 definition index, indexed graph, prepared module scopes, and header builders | every source-declared definition adopts its discovery ID; graph-time re-mint/enumeration is deleted; reserved/generated/standalone authorities remain explicit; C1a/C1b lands atomically |
