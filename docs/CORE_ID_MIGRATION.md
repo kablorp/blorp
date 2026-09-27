@@ -1295,6 +1295,34 @@ DiscoveredDefinition(definition_id PK, module_id FK, kind,
                      owner_definition_id nullable, source_locator, spelling)
 ```
 
+That notation describes the logical relation, not a required row-object
+representation. The production representation should be normalized parallel
+columns, partitioned by module so discovery can append locally and publish one
+immutable graph-level catalog without allocating a record and locator union per
+definition:
+
+```blorp
+record ModuleSourceDefinitionColumns {
+	kinds: List[SourceDefinitionKind]
+	visibilities: List[Visibility]
+	owner_definition_indexes: List[Int]
+	locator_kinds: List[SourceDefinitionLocatorKind]
+	declaration_indexes: List[Int]
+	child_indexes: List[Int]
+	spans: List[SourceSpan]
+	display_names: List[String]
+}
+```
+
+All columns have one checked equal-length invariant. Optional owner/child
+relationships use named absent-index constants, not scattered magic integers.
+The catalog may project one boxed `DiscoveredDefinition` or locator for cold
+diagnostics and tests, but it must not expose an API that reconstructs the
+whole catalog as a list of row records. C1b consumes borrowed columns and
+module ranges directly. Store each display string once; do not duplicate it in
+both a locator and a row view. Generated-C inspection must confirm that catalog
+construction does not box a record or union for every source definition.
+
 The minimum closed source family is every public/private function and foreign
 function, union plus constructor, record plus field, builtin/type alias, trait
 plus trait method, implementation owner plus explicit method, and global.
