@@ -14,7 +14,6 @@ import:
 			TypedFrontendPhase,
 		),
 		CompilerPhaseTerminalState(CompilerPhaseFailed, CompilerPhaseStopped),
-		CoreCompilation,
 		LateCoreExecution(LateCoreCompleted, LateCoreFailed, LateCoreStopped),
 		LateCoreStageAction(ObserveLateCoreStage, StopLateCoreStage),
 		LateCoreStageRequest,
@@ -53,12 +52,12 @@ import:
 	../../../src/lib/compilation:
 		CompileExecution(CompileBuildArtifactFailed, CompileEmitFailed),
 		LateCoreCompileExecution,
-		PreparedCompileExecution,
 	../../../src/lib/compilation_timing: CompileTiming
 	../../../src/lib/compile_plan_execute: execute_backend_artifact_compile_tail_timed
 	../../../src/lib/function_profile:
 		FunctionProfileConfiguration(FunctionProfileOff),
 		FunctionProfileMode(FunctionProfileOffMode),
+	system: now_microseconds
 	test: TestSuite
 
 
@@ -207,30 +206,11 @@ pure func invalid_foreign_link_program() -> CoreProgram:
 	}
 
 
-pure func prepared_compile_execution(program: CoreProgram) -> PreparedCompileExecution:
-	compilation: CoreCompilation = {
-		target_path = "/tmp/main.brp",
-		target_module_name = "main",
-		program = program,
-		next_def_id = core_program_max_declared_definition_id(program) + 1,
-		check_invariants = False
-	}
-
-	{
-		compilation = compilation,
-		configuration = artifact_configuration(),
-		late_stages = [],
-		typed_program_summary = None,
-		early_observations = [],
-		allocation_report = None
-	}
-
-
 pure func late_core_compile_execution(program: CoreProgram) -> LateCoreCompileExecution:
-	prepared: PreparedCompileExecution = prepared_compile_execution(program)
-
 	{
-		prepared = prepared,
+		configuration = artifact_configuration(),
+		typed_program_summary = None,
+		allocation_report = None,
 		prepared_core = prepared_core_program(program),
 		observations = []
 	}
@@ -267,32 +247,54 @@ pure func test_artifact_construction_failure_happens_after_backend_emission() ->
 
 
 func test_timed_backend_emission_failure_reports_backend_only() -> Bool:
+	prior_timings: List[CompileTiming] = [{
+		phase = LateCorePhase,
+		pass_name = None,
+		microseconds = 7
+	}]
+	outer_started: Int = now_microseconds() - 1000
 	timed = execute_backend_artifact_compile_tail_timed(
 		late_core_compile_execution(duplicate_definition_program()),
 		True,
+		prior_timings,
+		outer_started,
 	)
 
 	match timed.execution:
 		CompileEmitFailed(message):
 			(
 				message.contains("definition ID")
-				and timing_labels(timed.timings) == ["backend_emission"]
+				and timing_labels(timed.timings) == ["late_core", "backend_emission"]
+				and timed.timings.get(0).map(func(timing): timing.microseconds).get_or(0) == 7
+				and timed.outer_microseconds >= 1000
 			)
 		_:
 			False
 
 
 func test_timed_artifact_construction_failure_reports_backend_and_artifact() -> Bool:
+	prior_timings: List[CompileTiming] = [{
+		phase = LateCorePhase,
+		pass_name = None,
+		microseconds = 7
+	}]
+	outer_started: Int = now_microseconds() - 1000
 	timed = execute_backend_artifact_compile_tail_timed(
 		late_core_compile_execution(invalid_foreign_link_program()),
 		True,
+		prior_timings,
+		outer_started,
 	)
 
 	match timed.execution:
 		CompileBuildArtifactFailed(message):
 			(
 				message.contains("invalid foreign link arguments")
-				and timing_labels(timed.timings) == ["backend_emission", "artifact_construction"]
+				and timing_labels(timed.timings) == [
+					"late_core", "backend_emission", "artifact_construction",
+				]
+				and timed.timings.get(0).map(func(timing): timing.microseconds).get_or(0) == 7
+				and timed.outer_microseconds >= 1000
 			)
 		_:
 			False

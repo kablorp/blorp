@@ -78,16 +78,9 @@ union TimedCompilePlanPreparation:
 	TimedCompilePlanPreparationReady(PreparedCoreCompilePreparation, List[CompileTiming], Bool, Int)
 
 
-record TimedBackendArtifactCompileTail {
-	execution: CompileExecution,
-	timings: List[CompileTiming]
-}
-
-
-private record TimedPreparedCompileTail {
-	execution: CompileExecution,
-	timings: List[CompileTiming]
-}
+private union LateCompilePlanExecution:
+	LateCompilePlanFinished(TimedCompileExecution)
+	LateCompilePlanReady(LateCoreCompileExecution, List[CompileTiming], Bool, Int)
 
 
 foreign:
@@ -212,8 +205,10 @@ private func finalize_timed_compile_execution(
 func execute_backend_artifact_compile_tail_timed(
 	late: LateCoreCompileExecution,
 	record_timings: Bool,
-) -> TimedBackendArtifactCompileTail:
-	var timings: List[CompileTiming] = []
+	prior_timings: List[CompileTiming],
+	outer_started: Int,
+) -> TimedCompileExecution:
+	var timings: List[CompileTiming] = prior_timings
 	backend_started: Int = current_time_when(record_timings)
 
 	match emit_backend_compile_execution(late):
@@ -228,10 +223,12 @@ func execute_backend_artifact_compile_tail_timed(
 				backend_finished,
 			)
 
-			{
-				execution = CompileEmitFailed(message),
-				timings = timings
-			}
+			finalize_timed_compile_execution(
+				CompileEmitFailed(message),
+				timings,
+				record_timings,
+				outer_started,
+			)
 		BackendEmissionCompilePhaseReady(emitted):
 			record_phase_complete_checkpoint(BackendEmissionPhase)
 			backend_finished: Int = current_time_when(record_timings)
@@ -265,17 +262,21 @@ func execute_backend_artifact_compile_tail_timed(
 				artifact_finished,
 			)
 
-			{
-				execution = execution,
-				timings = timings
-			}
+			finalize_timed_compile_execution(
+				execution,
+				timings,
+				record_timings,
+				outer_started,
+			)
 
 
 private func execute_prepared_compile_execution_timed(
 	prepared: PreparedCompileExecution,
 	record_timings: Bool,
-) -> TimedPreparedCompileTail:
-	var timings: List[CompileTiming] = []
+	prior_timings: List[CompileTiming],
+	outer_started: Int,
+) -> LateCompilePlanExecution:
+	var timings: List[CompileTiming] = prior_timings
 	late_started: Int = current_time_when(record_timings)
 
 	match run_late_core_compile_execution(prepared, record_timings):
@@ -291,15 +292,17 @@ private func execute_prepared_compile_execution_timed(
 			)
 			timings = append_pass_timings(timings, record_timings, LateCorePhase, pass_timings)
 
-			{
-				execution = CompileStopped(
+			LateCompilePlanFinished(finalize_timed_compile_execution(
+				CompileStopped(
 					prepared.compilation.target_path,
 					stage_name,
 					rendered,
 					compile_observations(stopped_observations),
 				),
-				timings = timings
-			}
+				timings,
+				record_timings,
+				outer_started,
+			))
 		LateCoreCompilePhaseInvariantFailed(stage_name, detail, pass_timings):
 			record_phase_terminal_checkpoint(LateCorePhase, CompilerPhaseFailed)
 			late_finished: Int = current_time_when(record_timings)
@@ -312,10 +315,12 @@ private func execute_prepared_compile_execution_timed(
 			)
 			timings = append_pass_timings(timings, record_timings, LateCorePhase, pass_timings)
 
-			{
-				execution = CompileCoreInvariantFailed("${stage_name}: ${detail}"),
-				timings = timings
-			}
+			LateCompilePlanFinished(finalize_timed_compile_execution(
+				CompileCoreInvariantFailed("${stage_name}: ${detail}"),
+				timings,
+				record_timings,
+				outer_started,
+			))
 		LateCoreCompilePhaseReady(late, pass_timings):
 			record_phase_complete_checkpoint(LateCorePhase)
 			late_finished: Int = current_time_when(record_timings)
@@ -328,25 +333,23 @@ private func execute_prepared_compile_execution_timed(
 			)
 			timings = append_pass_timings(timings, record_timings, LateCorePhase, pass_timings)
 
-			match late.prepared.allocation_report:
+			match late.allocation_report:
 				Some(_):
-					{
-						execution = CompileAllocationReport(
-							late.prepared.compilation.target_path,
+					LateCompilePlanFinished(finalize_timed_compile_execution(
+						CompileAllocationReport(
+							late.configuration.source.path,
 							analyze_core_allocations(
 								prepared_core_program_value(late.prepared_core),
 							),
 							compile_observations(late.observations),
-							late.prepared.typed_program_summary,
+							late.typed_program_summary,
 						),
-						timings = timings
-					}
+						timings,
+						record_timings,
+						outer_started,
+					))
 				None:
-					tail = execute_backend_artifact_compile_tail_timed(late, record_timings)
-					{
-						execution = tail.execution,
-						timings = timings.concat(tail.timings)
-					}
+					LateCompilePlanReady(late, timings, record_timings, outer_started)
 
 
 func prepare_compile_plan_timed(
@@ -405,12 +408,15 @@ func prepare_compile_plan_timed(
 			TimedCompilePlanPreparationReady(prepared_core, timings, record_timings, outer_elapsed)
 
 
-func execute_prepared_compile_plan_timed(
+-- Close every preparation owner before backend emission starts. In particular,
+-- the pre-late Core program must not remain reachable through `prepared` or
+-- `projected` while the backend builds its own representation.
+private func execute_compile_plan_through_late_core(
 	preparation: TimedCompilePlanPreparation,
-) -> TimedCompileExecution:
+) -> LateCompilePlanExecution:
 	match preparation:
 		TimedCompilePlanPreparationFailed(timed):
-			timed
+			LateCompilePlanFinished(timed)
 		TimedCompilePlanPreparationReady(prepared_core, prepared_timings, record_timings, prepared_outer_elapsed):
 			execution_started: Int = current_time_when(record_timings)
 			-- The caller may materialize runtime sources between preparation and
@@ -432,12 +438,12 @@ func execute_prepared_compile_plan_timed(
 						lowering_finished,
 					)
 
-					finalize_timed_compile_execution(
+					LateCompilePlanFinished(finalize_timed_compile_execution(
 						CompileFrontendFailed(errors),
 						timings,
 						record_timings,
 						outer_started,
-					)
+					))
 				Ok(lowered):
 					record_phase_complete_checkpoint(CoreLoweringPhase)
 					lowering_finished: Int = current_time_when(record_timings)
@@ -462,12 +468,12 @@ func execute_prepared_compile_plan_timed(
 								early_finished,
 							)
 
-							finalize_timed_compile_execution(
+							LateCompilePlanFinished(finalize_timed_compile_execution(
 								CompileFrontendFailed(errors),
 								timings,
 								record_timings,
 								outer_started,
-							)
+							))
 						EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, pass_timings):
 							record_phase_terminal_checkpoint(EarlyCorePhase, CompilerPhaseStopped)
 							early_finished: Int = current_time_when(record_timings)
@@ -485,7 +491,7 @@ func execute_prepared_compile_plan_timed(
 								pass_timings,
 							)
 
-							finalize_timed_compile_execution(
+							LateCompilePlanFinished(finalize_timed_compile_execution(
 								CompileStopped(
 									target_path,
 									stage_name,
@@ -495,7 +501,7 @@ func execute_prepared_compile_plan_timed(
 								timings,
 								record_timings,
 								outer_started,
-							)
+							))
 						EarlyCorePhaseReady(early, pass_timings):
 							record_phase_complete_checkpoint(EarlyCorePhase)
 							early_finished: Int = current_time_when(record_timings)
@@ -533,12 +539,12 @@ func execute_prepared_compile_plan_timed(
 										runtime_finished,
 									)
 
-									finalize_timed_compile_execution(
+									LateCompilePlanFinished(finalize_timed_compile_execution(
 										CompileFrontendFailed(errors),
 										timings,
 										record_timings,
 										outer_started,
-									)
+									))
 								RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, pass_timings):
 									record_phase_terminal_checkpoint(
 										RuntimeProjectionPhase,
@@ -559,7 +565,7 @@ func execute_prepared_compile_plan_timed(
 										pass_timings,
 									)
 
-									finalize_timed_compile_execution(
+									LateCompilePlanFinished(finalize_timed_compile_execution(
 										CompileStopped(
 											target_path,
 											stage_name,
@@ -569,7 +575,7 @@ func execute_prepared_compile_plan_timed(
 										timings,
 										record_timings,
 										outer_started,
-									)
+									))
 								RuntimeProjectionPhaseReady(projected, pass_timings):
 									record_phase_complete_checkpoint(RuntimeProjectionPhase)
 									runtime_finished: Int = current_time_when(record_timings)
@@ -592,16 +598,27 @@ func execute_prepared_compile_plan_timed(
 											projected,
 										),
 									)
-									tail = execute_prepared_compile_execution_timed(
+									execute_prepared_compile_execution_timed(
 										prepared,
 										record_timings,
-									)
-									finalize_timed_compile_execution(
-										tail.execution,
-										timings.concat(tail.timings),
-										record_timings,
+										timings,
 										outer_started,
 									)
+
+
+func execute_prepared_compile_plan_timed(
+	preparation: TimedCompilePlanPreparation,
+) -> TimedCompileExecution:
+	match execute_compile_plan_through_late_core(preparation):
+		LateCompilePlanFinished(timed):
+			timed
+		LateCompilePlanReady(late, timings, record_timings, outer_started):
+			execute_backend_artifact_compile_tail_timed(
+				late,
+				record_timings,
+				timings,
+				outer_started,
+			)
 
 
 func execute_run_artifact_plan(plan: CliRunSourcePlan) -> RunArtifactExecution:
