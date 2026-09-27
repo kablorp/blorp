@@ -16,6 +16,7 @@ import:
 		unindexed_source_table_for_file,
 	../stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_error
 	language_parser: parse_compiler_source, parse_compiler_source_rebased
+	memory: same_object
 	parsed_ast:
 		ParsedBinaryOp,
 		ParsedConcurrentParam,
@@ -1723,13 +1724,109 @@ private pure func rewrite_subscript_read_optional_expr(
 ) -> Option[ParsedExpr]:
 	match value:
 		Some(expr):
-			Some(rewrite_subscript_read_expr(expr))
+			rewritten = rewrite_subscript_read_expr(expr)
+			if same_object(rewritten, expr):
+				value
+			else:
+				Some(rewritten)
 		None:
-			None
+			value
+
+
+private pure func optional_subscript_read_expr_changed(
+	original: Option[ParsedExpr],
+	rewritten: Option[ParsedExpr],
+) -> Bool:
+	match (original, rewritten):
+		(Some(before), Some(after)):
+			not same_object(before, after)
+		(None, None):
+			False
+		_:
+			True
 
 
 private pure func rewrite_subscript_read_exprs(items: List[ParsedExpr]) -> List[ParsedExpr]:
-	items.map(func(item): rewrite_subscript_read_expr(item))
+	-- Keep the original list until a child changes; the first set makes the
+	-- changed path's private COW copy, and unchanged paths retain identity.
+	var rewritten: List[ParsedExpr] = items
+	var index: Int = 0
+	for item in items:
+		mapped = rewrite_subscript_read_expr(item)
+		if not same_object(mapped, item):
+			rewritten = rewritten.set(index, mapped)
+		index += 1
+	rewritten
+
+
+private pure func rewrite_subscript_read_interpolation_parts(
+	parts: List[ParsedStringInterpolationPart],
+) -> List[ParsedStringInterpolationPart]:
+	var rewritten: List[ParsedStringInterpolationPart] = parts
+	var index: Int = 0
+	for part in parts:
+		match part:
+			ParsedInterpolationExpr(expr):
+				mapped = rewrite_subscript_read_expr(expr)
+				if not same_object(mapped, expr):
+					rewritten = rewritten.set(index, ParsedInterpolationExpr(mapped))
+			ParsedInterpolationLiteral(_):
+				void
+		index += 1
+	rewritten
+
+
+private pure func rewrite_subscript_read_record_fields(
+	fields: List[ParsedRecordExprField],
+) -> List[ParsedRecordExprField]:
+	var rewritten: List[ParsedRecordExprField] = fields
+	var index: Int = 0
+	for field in fields:
+		mapped = rewrite_subscript_read_expr(field.value)
+		if not same_object(mapped, field.value):
+			rewritten = rewritten.set(index, { field | value = mapped })
+		index += 1
+	rewritten
+
+
+private pure func rewrite_subscript_read_dict_entries(
+	entries: List[ParsedDictEntry],
+) -> List[ParsedDictEntry]:
+	var rewritten: List[ParsedDictEntry] = entries
+	var index: Int = 0
+	for entry in entries:
+		key = rewrite_subscript_read_expr(entry.key)
+		value = rewrite_subscript_read_expr(entry.value)
+		if not same_object(key, entry.key) or not same_object(value, entry.value):
+			rewritten = rewritten.set(index, { entry | key = key, value = value })
+		index += 1
+	rewritten
+
+
+private pure func rewrite_subscript_read_match_cases(
+	cases: List[ParsedMatchCase],
+) -> List[ParsedMatchCase]:
+	var rewritten: List[ParsedMatchCase] = cases
+	var index: Int = 0
+	for item in cases:
+		body = rewrite_subscript_read_expr(item.body)
+		if not same_object(body, item.body):
+			rewritten = rewritten.set(index, { item | body = body })
+		index += 1
+	rewritten
+
+
+private pure func rewrite_subscript_read_concurrent_params(
+	params: List[ParsedConcurrentParam],
+) -> List[ParsedConcurrentParam]:
+	var rewritten: List[ParsedConcurrentParam] = params
+	var index: Int = 0
+	for param in params:
+		value = rewrite_subscript_read_expr(param.value)
+		if not same_object(value, param.value):
+			rewritten = rewritten.set(index, { param | value = value })
+		index += 1
+	rewritten
 
 
 private pure func rewrite_subscript_read_select_arm_kind(
@@ -1737,11 +1834,37 @@ private pure func rewrite_subscript_read_select_arm_kind(
 ) -> ParsedSelectArmKind:
 	match kind:
 		ParsedSelectReceiveArm(name, channel):
-			ParsedSelectReceiveArm(name, rewrite_subscript_read_expr(channel))
+			rewritten = rewrite_subscript_read_expr(channel)
+			if same_object(rewritten, channel):
+				kind
+			else:
+				ParsedSelectReceiveArm(name, rewritten)
 		ParsedSelectSealedArm(channel):
-			ParsedSelectSealedArm(rewrite_subscript_read_expr(channel))
+			rewritten = rewrite_subscript_read_expr(channel)
+			if same_object(rewritten, channel):
+				kind
+			else:
+				ParsedSelectSealedArm(rewritten)
 		ParsedSelectAfterArm(timeout):
-			ParsedSelectAfterArm(rewrite_subscript_read_expr(timeout))
+			rewritten = rewrite_subscript_read_expr(timeout)
+			if same_object(rewritten, timeout):
+				kind
+			else:
+				ParsedSelectAfterArm(rewritten)
+
+
+private pure func rewrite_subscript_read_select_arms(
+	arms: List[ParsedSelectArm],
+) -> List[ParsedSelectArm]:
+	var rewritten: List[ParsedSelectArm] = arms
+	var index: Int = 0
+	for arm in arms:
+		kind = rewrite_subscript_read_select_arm_kind(arm.kind)
+		body = rewrite_subscript_read_expr(arm.body)
+		if not same_object(kind, arm.kind) or not same_object(body, arm.body):
+			rewritten = rewritten.set(index, { arm | kind = kind, body = body })
+		index += 1
+	rewritten
 
 
 private pure func rewrite_subscript_read_with_error_map(
@@ -1749,72 +1872,132 @@ private pure func rewrite_subscript_read_with_error_map(
 ) -> Option[ParsedWithErrorMap]:
 	match value:
 		Some(error_map):
-			Some({ error_map | value = rewrite_subscript_read_expr(error_map.value) })
+			rewritten = rewrite_subscript_read_expr(error_map.value)
+			if same_object(rewritten, error_map.value):
+				value
+			else:
+				Some({ error_map | value = rewritten })
 		None:
-			None
+			value
+
+
+private pure func optional_subscript_read_error_map_changed(
+	original: Option[ParsedWithErrorMap],
+	rewritten: Option[ParsedWithErrorMap],
+) -> Bool:
+	match (original, rewritten):
+		(Some(before), Some(after)):
+			not same_object(before.value, after.value)
+		(None, None):
+			False
+		_:
+			True
 
 
 private pure func rewrite_subscript_read_with_binding(
 	binding: ParsedWithBinding,
 ) -> ParsedWithBinding:
-	{ binding |
-		value = rewrite_subscript_read_expr(binding.value),
-		error_map = rewrite_subscript_read_with_error_map(binding.error_map)
-	}
+	value = rewrite_subscript_read_expr(binding.value)
+	error_map = rewrite_subscript_read_with_error_map(binding.error_map)
+	if (
+		same_object(value, binding.value)
+		and not optional_subscript_read_error_map_changed(binding.error_map, error_map)
+	):
+		binding
+	else:
+		{ binding | value = value, error_map = error_map }
 
 
 private pure func rewrite_subscript_read_function_decl(
 	decl: ParsedFunctionDecl,
 ) -> ParsedFunctionDecl:
-	{ decl | body = rewrite_subscript_read_optional_expr(decl.body) }
+	body = rewrite_subscript_read_optional_expr(decl.body)
+	if optional_subscript_read_expr_changed(decl.body, body):
+		{ decl | body = body }
+	else:
+		decl
+
+
+private pure func rewrite_subscript_read_trait_methods(
+	methods: List[ParsedTraitMethodDecl],
+) -> List[ParsedTraitMethodDecl]:
+	var rewritten: List[ParsedTraitMethodDecl] = methods
+	var index: Int = 0
+	for method in methods:
+		body = rewrite_subscript_read_optional_expr(method.body)
+		if optional_subscript_read_expr_changed(method.body, body):
+			rewritten = rewritten.set(index, { method | body = body })
+		index += 1
+	rewritten
+
+
+private pure func rewrite_subscript_read_impl_methods(
+	methods: List[ParsedFunctionDecl],
+) -> List[ParsedFunctionDecl]:
+	var rewritten: List[ParsedFunctionDecl] = methods
+	var index: Int = 0
+	for method in methods:
+		mapped = rewrite_subscript_read_function_decl(method)
+		if not same_object(mapped, method):
+			rewritten = rewritten.set(index, mapped)
+		index += 1
+	rewritten
 
 
 private pure func rewrite_subscript_read_expr(expr: ParsedExpr) -> ParsedExpr:
 	match expr:
 		ParsedStringInterpolationPartsExpr(parts, is_multiline, span):
-			ParsedStringInterpolationPartsExpr(
-				parts.map(func(part):
-					match part:
-						ParsedInterpolationExpr(interpolation_expr):
-							ParsedInterpolationExpr(rewrite_subscript_read_expr(interpolation_expr))
-						ParsedInterpolationLiteral(_):
-							part
-				),
-				is_multiline,
-				span,
-			)
+			rewritten = rewrite_subscript_read_interpolation_parts(parts)
+			if same_object(rewritten, parts):
+				expr
+			else:
+				ParsedStringInterpolationPartsExpr(rewritten, is_multiline, span)
 		ParsedUnaryExpr(op, value, span):
-			ParsedUnaryExpr(op, rewrite_subscript_read_expr(value), span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedUnaryExpr(op, rewritten, span)
 		ParsedBinaryExpr(op, left, right, span):
-			ParsedBinaryExpr(
-				op,
-				rewrite_subscript_read_expr(left),
-				rewrite_subscript_read_expr(right),
-				span,
-			)
+			rewritten_left = rewrite_subscript_read_expr(left)
+			rewritten_right = rewrite_subscript_read_expr(right)
+			if same_object(rewritten_left, left) and same_object(rewritten_right, right):
+				expr
+			else:
+				ParsedBinaryExpr(op, rewritten_left, rewritten_right, span)
 		ParsedLogicalExpr(op, left, right, span):
-			ParsedLogicalExpr(
-				op,
-				rewrite_subscript_read_expr(left),
-				rewrite_subscript_read_expr(right),
-				span,
-			)
+			rewritten_left = rewrite_subscript_read_expr(left)
+			rewritten_right = rewrite_subscript_read_expr(right)
+			if same_object(rewritten_left, left) and same_object(rewritten_right, right):
+				expr
+			else:
+				ParsedLogicalExpr(op, rewritten_left, rewritten_right, span)
 		ParsedAscriptionExpr(value, type_expr, span):
-			ParsedAscriptionExpr(rewrite_subscript_read_expr(value), type_expr, span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedAscriptionExpr(rewritten, type_expr, span)
 		ParsedRangeExpr(start, finish, span):
-			ParsedRangeExpr(
-				rewrite_subscript_read_expr(start),
-				rewrite_subscript_read_expr(finish),
-				span,
-			)
+			rewritten_start = rewrite_subscript_read_expr(start)
+			rewritten_finish = rewrite_subscript_read_expr(finish)
+			if same_object(rewritten_start, start) and same_object(rewritten_finish, finish):
+				expr
+			else:
+				ParsedRangeExpr(rewritten_start, rewritten_finish, span)
 		ParsedCallExpr(callee, args, span):
-			ParsedCallExpr(
-				rewrite_subscript_read_expr(callee),
-				rewrite_subscript_read_exprs(args),
-				span,
-			)
+			rewritten_callee = rewrite_subscript_read_expr(callee)
+			rewritten_args = rewrite_subscript_read_exprs(args)
+			if same_object(rewritten_callee, callee) and same_object(rewritten_args, args):
+				expr
+			else:
+				ParsedCallExpr(rewritten_callee, rewritten_args, span)
 		ParsedFieldAccessExpr(target, field, span):
-			ParsedFieldAccessExpr(rewrite_subscript_read_expr(target), field, span)
+			rewritten = rewrite_subscript_read_expr(target)
+			if same_object(rewritten, target):
+				expr
+			else:
+				ParsedFieldAccessExpr(rewritten, field, span)
 		ParsedSubscriptExpr(target, indices, span):
 			rewrite_subscript_read_node(
 				rewrite_subscript_read_expr(target),
@@ -1822,127 +2005,202 @@ private pure func rewrite_subscript_read_expr(expr: ParsedExpr) -> ParsedExpr:
 				span,
 			)
 		ParsedListExpr(items, span):
-			ParsedListExpr(rewrite_subscript_read_exprs(items), span)
+			rewritten = rewrite_subscript_read_exprs(items)
+			if same_object(rewritten, items):
+				expr
+			else:
+				ParsedListExpr(rewritten, span)
 		ParsedTupleExpr(items, span):
-			ParsedTupleExpr(rewrite_subscript_read_exprs(items), span)
+			rewritten = rewrite_subscript_read_exprs(items)
+			if same_object(rewritten, items):
+				expr
+			else:
+				ParsedTupleExpr(rewritten, span)
 		ParsedRecordExpr(fields, span):
-			ParsedRecordExpr(
-				fields.map(
-					func(field): { field | value = rewrite_subscript_read_expr(field.value) },
-				),
-				span,
-			)
+			rewritten = rewrite_subscript_read_record_fields(fields)
+			if same_object(rewritten, fields):
+				expr
+			else:
+				ParsedRecordExpr(rewritten, span)
 		ParsedRecordUpdateExpr(base, fields, span):
-			ParsedRecordUpdateExpr(
-				rewrite_subscript_read_expr(base),
-				fields.map(
-					func(field): { field | value = rewrite_subscript_read_expr(field.value) },
-				),
-				span,
-			)
+			rewritten_base = rewrite_subscript_read_expr(base)
+			rewritten_fields = rewrite_subscript_read_record_fields(fields)
+			if same_object(rewritten_base, base) and same_object(rewritten_fields, fields):
+				expr
+			else:
+				ParsedRecordUpdateExpr(rewritten_base, rewritten_fields, span)
 		ParsedDictExpr(entries, span):
-			ParsedDictExpr(
-				entries.map(func(entry):
-					{ entry |
-						key = rewrite_subscript_read_expr(entry.key),
-						value = rewrite_subscript_read_expr(entry.value)
-					}
-				),
-				span,
-			)
+			rewritten = rewrite_subscript_read_dict_entries(entries)
+			if same_object(rewritten, entries):
+				expr
+			else:
+				ParsedDictExpr(rewritten, span)
 		ParsedVectorExpr(items, span):
-			ParsedVectorExpr(rewrite_subscript_read_exprs(items), span)
+			rewritten = rewrite_subscript_read_exprs(items)
+			if same_object(rewritten, items):
+				expr
+			else:
+				ParsedVectorExpr(rewritten, span)
 		ParsedOpaqueIntoExpr(type_expr, value, span):
-			ParsedOpaqueIntoExpr(type_expr, rewrite_subscript_read_expr(value), span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedOpaqueIntoExpr(type_expr, rewritten, span)
 		ParsedOpaqueFromExpr(type_expr, value, span):
-			ParsedOpaqueFromExpr(type_expr, rewrite_subscript_read_expr(value), span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedOpaqueFromExpr(type_expr, rewritten, span)
 		ParsedBlockExpr(items, span):
-			ParsedBlockExpr(rewrite_subscript_read_exprs(items), span)
+			rewritten = rewrite_subscript_read_exprs(items)
+			if same_object(rewritten, items):
+				expr
+			else:
+				ParsedBlockExpr(rewritten, span)
 		ParsedIfExpr(cond, then_expr, else_expr, span):
-			ParsedIfExpr(
-				rewrite_subscript_read_expr(cond),
-				rewrite_subscript_read_expr(then_expr),
-				rewrite_subscript_read_optional_expr(else_expr),
-				span,
-			)
+			rewritten_cond = rewrite_subscript_read_expr(cond)
+			rewritten_then = rewrite_subscript_read_expr(then_expr)
+			rewritten_else = rewrite_subscript_read_optional_expr(else_expr)
+			if (
+				same_object(rewritten_cond, cond)
+				and same_object(rewritten_then, then_expr)
+				and not optional_subscript_read_expr_changed(else_expr, rewritten_else)
+			):
+				expr
+			else:
+				ParsedIfExpr(rewritten_cond, rewritten_then, rewritten_else, span)
 		ParsedMatchExpr(value, cases, span):
-			ParsedMatchExpr(
-				rewrite_subscript_read_expr(value),
-				cases.map(func(item): { item | body = rewrite_subscript_read_expr(item.body) }),
-				span,
-			)
+			rewritten_value = rewrite_subscript_read_expr(value)
+			rewritten_cases = rewrite_subscript_read_match_cases(cases)
+			if same_object(rewritten_value, value) and same_object(rewritten_cases, cases):
+				expr
+			else:
+				ParsedMatchExpr(rewritten_value, rewritten_cases, span)
 		ParsedSelectExpr(arms, span):
-			ParsedSelectExpr(
-				arms.map(func(arm):
-					{ arm |
-						kind = rewrite_subscript_read_select_arm_kind(arm.kind),
-						body = rewrite_subscript_read_expr(arm.body)
-					}
-				),
-				span,
-			)
+			rewritten = rewrite_subscript_read_select_arms(arms)
+			if same_object(rewritten, arms):
+				expr
+			else:
+				ParsedSelectExpr(rewritten, span)
 		ParsedWithExpr(binding, body, span):
-			ParsedWithExpr(
-				rewrite_subscript_read_with_binding(binding),
-				rewrite_subscript_read_expr(body),
-				span,
-			)
+			rewritten_binding = rewrite_subscript_read_with_binding(binding)
+			rewritten_body = rewrite_subscript_read_expr(body)
+			if same_object(rewritten_binding, binding) and same_object(rewritten_body, body):
+				expr
+			else:
+				ParsedWithExpr(rewritten_binding, rewritten_body, span)
 		ParsedDebugBlockExpr(body, span):
-			ParsedDebugBlockExpr(rewrite_subscript_read_expr(body), span)
+			rewritten = rewrite_subscript_read_expr(body)
+			if same_object(rewritten, body):
+				expr
+			else:
+				ParsedDebugBlockExpr(rewritten, span)
 		ParsedLambdaExpr(is_pure, params, return_type, body, span):
-			ParsedLambdaExpr(is_pure, params, return_type, rewrite_subscript_read_expr(body), span)
+			rewritten = rewrite_subscript_read_expr(body)
+			if same_object(rewritten, body):
+				expr
+			else:
+				ParsedLambdaExpr(is_pure, params, return_type, rewritten, span)
 		ParsedFunctionDeclExpr(decl):
-			ParsedFunctionDeclExpr(rewrite_subscript_read_function_decl(decl))
+			rewritten = rewrite_subscript_read_function_decl(decl)
+			if same_object(rewritten, decl):
+				expr
+			else:
+				ParsedFunctionDeclExpr(rewritten)
 		ParsedWhileExpr(cond, body, span):
-			ParsedWhileExpr(
-				rewrite_subscript_read_expr(cond),
-				rewrite_subscript_read_expr(body),
-				span,
-			)
+			rewritten_cond = rewrite_subscript_read_expr(cond)
+			rewritten_body = rewrite_subscript_read_expr(body)
+			if same_object(rewritten_cond, cond) and same_object(rewritten_body, body):
+				expr
+			else:
+				ParsedWhileExpr(rewritten_cond, rewritten_body, span)
 		ParsedForExpr(binder, iterable, body, span):
-			ParsedForExpr(
-				binder,
-				rewrite_subscript_read_expr(iterable),
-				rewrite_subscript_read_expr(body),
-				span,
-			)
+			rewritten_iterable = rewrite_subscript_read_expr(iterable)
+			rewritten_body = rewrite_subscript_read_expr(body)
+			if same_object(rewritten_iterable, iterable) and same_object(rewritten_body, body):
+				expr
+			else:
+				ParsedForExpr(binder, rewritten_iterable, rewritten_body, span)
 		ParsedConcurrentBlockExpr(params, body, span):
-			ParsedConcurrentBlockExpr(
-				params.map(
-					func(param): { param | value = rewrite_subscript_read_expr(param.value) },
-				),
-				rewrite_subscript_read_expr(body),
-				span,
-			)
+			rewritten_params = rewrite_subscript_read_concurrent_params(params)
+			rewritten_body = rewrite_subscript_read_expr(body)
+			if same_object(rewritten_params, params) and same_object(rewritten_body, body):
+				expr
+			else:
+				ParsedConcurrentBlockExpr(rewritten_params, rewritten_body, span)
 		ParsedConcurrentForExpr(name, iterable, params, body, span):
-			ParsedConcurrentForExpr(
-				name,
-				rewrite_subscript_read_expr(iterable),
-				params.map(
-					func(param): { param | value = rewrite_subscript_read_expr(param.value) },
-				),
-				rewrite_subscript_read_expr(body),
-				span,
-			)
+			rewritten_iterable = rewrite_subscript_read_expr(iterable)
+			rewritten_params = rewrite_subscript_read_concurrent_params(params)
+			rewritten_body = rewrite_subscript_read_expr(body)
+			if (
+				same_object(rewritten_iterable, iterable)
+				and same_object(rewritten_params, params)
+				and same_object(rewritten_body, body)
+			):
+				expr
+			else:
+				ParsedConcurrentForExpr(
+					name,
+					rewritten_iterable,
+					rewritten_params,
+					rewritten_body,
+					span,
+				)
 		ParsedDetachExpr(body, span):
-			ParsedDetachExpr(rewrite_subscript_read_expr(body), span)
+			rewritten = rewrite_subscript_read_expr(body)
+			if same_object(rewritten, body):
+				expr
+			else:
+				ParsedDetachExpr(rewritten, span)
 		ParsedVarDeclExpr(name, type_expr, value, is_mutable, span):
-			ParsedVarDeclExpr(name, type_expr, rewrite_subscript_read_expr(value), is_mutable, span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedVarDeclExpr(name, type_expr, rewritten, is_mutable, span)
 		ParsedAssignExpr(name, value, span):
-			ParsedAssignExpr(name, rewrite_subscript_read_expr(value), span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedAssignExpr(name, rewritten, span)
 		ParsedCompoundAssignExpr(name, op, value, span):
-			ParsedCompoundAssignExpr(name, op, rewrite_subscript_read_expr(value), span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedCompoundAssignExpr(name, op, rewritten, span)
 		ParsedSubscriptAssignExpr(target, indices, value, span):
-			ParsedSubscriptAssignExpr(
-				rewrite_subscript_read_expr(target),
-				rewrite_subscript_read_exprs(indices),
-				rewrite_subscript_read_expr(value),
-				span,
-			)
+			rewritten_target = rewrite_subscript_read_expr(target)
+			rewritten_indices = rewrite_subscript_read_exprs(indices)
+			rewritten_value = rewrite_subscript_read_expr(value)
+			if (
+				same_object(rewritten_target, target)
+				and same_object(rewritten_indices, indices)
+				and same_object(rewritten_value, value)
+			):
+				expr
+			else:
+				ParsedSubscriptAssignExpr(
+					rewritten_target,
+					rewritten_indices,
+					rewritten_value,
+					span,
+				)
 		ParsedTupleDestructExpr(names, value, span):
-			ParsedTupleDestructExpr(names, rewrite_subscript_read_expr(value), span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedTupleDestructExpr(names, rewritten, span)
 		ParsedQuestionBindExpr(name, type_expr, value, span):
-			ParsedQuestionBindExpr(name, type_expr, rewrite_subscript_read_expr(value), span)
+			rewritten = rewrite_subscript_read_expr(value)
+			if same_object(rewritten, value):
+				expr
+			else:
+				ParsedQuestionBindExpr(name, type_expr, rewritten, span)
 		_:
 			expr
 
@@ -1950,31 +2208,48 @@ private pure func rewrite_subscript_read_expr(expr: ParsedExpr) -> ParsedExpr:
 private pure func rewrite_subscript_read_decl(decl: ParsedDecl) -> ParsedDecl:
 	match decl:
 		FunctionParsedDecl(function_decl):
-			FunctionParsedDecl(rewrite_subscript_read_function_decl(function_decl))
+			rewritten = rewrite_subscript_read_function_decl(function_decl)
+			if same_object(rewritten, function_decl):
+				decl
+			else:
+				FunctionParsedDecl(rewritten)
 		VarParsedDecl(var_decl):
-			VarParsedDecl({ var_decl | value = rewrite_subscript_read_expr(var_decl.value) })
+			rewritten = rewrite_subscript_read_expr(var_decl.value)
+			if same_object(rewritten, var_decl.value):
+				decl
+			else:
+				VarParsedDecl({ var_decl | value = rewritten })
 		TraitParsedDecl(trait_decl):
-			TraitParsedDecl(
-				{ trait_decl |
-					methods = trait_decl.methods.map(
-						func(
-							item,
-						): { item | body = rewrite_subscript_read_optional_expr(item.body) },
-					)
-				},
-			)
+			methods = rewrite_subscript_read_trait_methods(trait_decl.methods)
+			if same_object(methods, trait_decl.methods):
+				decl
+			else:
+				TraitParsedDecl({ trait_decl | methods = methods })
 		ImplParsedDecl(impl_decl):
-			ImplParsedDecl(
-				{ impl_decl |
-					methods = impl_decl.methods.map(
-						func(item): rewrite_subscript_read_function_decl(item),
-					)
-				},
-			)
+			methods = rewrite_subscript_read_impl_methods(impl_decl.methods)
+			if same_object(methods, impl_decl.methods):
+				decl
+			else:
+				ImplParsedDecl({ impl_decl | methods = methods })
 		PrivateParsedDecl(inner, span):
-			PrivateParsedDecl(rewrite_subscript_read_decl(inner), span)
+			rewritten = rewrite_subscript_read_decl(inner)
+			if same_object(rewritten, inner):
+				decl
+			else:
+				PrivateParsedDecl(rewritten, span)
 		_:
 			decl
+
+
+private pure func rewrite_subscript_read_decls(decls: List[ParsedDecl]) -> List[ParsedDecl]:
+	var rewritten: List[ParsedDecl] = decls
+	var index: Int = 0
+	for decl in decls:
+		mapped = rewrite_subscript_read_decl(decl)
+		if not same_object(mapped, decl):
+			rewritten = rewritten.set(index, mapped)
+		index += 1
+	rewritten
 
 
 private pure func parse_interpolation_expr(
@@ -2813,7 +3088,7 @@ pure func finalize_typecheck_source_program(program: ParsedProgram) -> ParsedPro
 	table: SourceTable = unindexed_source_table_for_file(program.source)
 	interpolated = finalize_interpolation_program_with_table(program, table)
 	nested = finalize_nested_functions_program_with_table(interpolated, table)
-	{ nested | decls = nested.decls.map(func(decl): rewrite_subscript_read_decl(decl)) }
+	{ nested | decls = rewrite_subscript_read_decls(nested.decls) }
 
 
 pure func finalized_typecheck_program(program: ParsedProgram) -> FinalizedTypecheckProgram:
