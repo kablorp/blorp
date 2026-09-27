@@ -328,7 +328,6 @@ pure func current_behavior_plan_tracks_live_let_in_lexical_order() -> Bool:
 				decision.tracks_cleanup
 				and decision.untracks_after_body
 				and cancellation_owner_id_value(decision.owner_id) == 0
-				and plan.let_protections.length() == 1
 				and plan.max_live_slots == 1
 			)
 		None:
@@ -453,7 +452,6 @@ pure func noncancelling_activation_suppresses_local_cleanup_candidates() -> Bool
 				plan.effect == CannotCancelCurrentTask
 				and decision.tracks_cleanup
 				and decision.untracks_after_body
-				and plan.let_protections.length() == 1
 				and candidate.is_some()
 				and not cancellation_plan_requires_local_owner_protection(plan)
 			)
@@ -922,6 +920,51 @@ pure func region_plan_separates_shared_id_distinct_def_ids() -> Bool:
 			False
 
 
+private MANY_SAME_NAME_LETS: Int = 16
+
+
+pure func region_plan_indexes_many_same_name_lets() -> Bool:
+	var body: CoreExpr = CooperativeCheckpointExpr(VoidType, synthetic_core_source_loc())
+
+	for id in 0..MANY_SAME_NAME_LETS:
+		body = LetExpr(
+			local_var("repeated", id),
+			False,
+			STRING_TYPE,
+			owned_string(),
+			body,
+		)
+
+	plan = region_plan(body)
+	var all_protected: Bool = True
+
+	for id in 0..MANY_SAME_NAME_LETS:
+		match cancellation_let_protection(
+			plan,
+			local_var("repeated", id),
+		):
+			Some(protection):
+				if not protection.tracks_cleanup:
+					all_protected = False
+			None:
+				all_protected = False
+
+	empty_plan = region_plan(VOID_EXPR)
+	missing_identity_is_absent: Bool = cancellation_let_protection(
+		plan,
+		local_var("repeated", MANY_SAME_NAME_LETS),
+	).is_none()
+	empty_lookup_is_absent: Bool = cancellation_let_protection(
+		empty_plan,
+		local_var("repeated", 0),
+	).is_none()
+	correct_capacity: Bool = (
+		plan.max_live_slots == MANY_SAME_NAME_LETS
+		and empty_plan.max_live_slots == 0
+	)
+	all_protected and missing_identity_is_absent and empty_lookup_is_absent and correct_capacity
+
+
 pure func region_plan_protects_branch_and_loop_lifetimes() -> Bool:
 	branch_owner: CoreVar = local_var("branch_owner", 7)
 	loop_owner: CoreVar = local_var("loop_owner", 8)
@@ -1005,8 +1048,8 @@ pure func overlapping_region_protections_preserve_lexical_order() -> Bool:
 		),
 	)
 
-	match plan.let_protections:
-		[outer_decision, inner_decision]:
+	match (cancellation_let_protection(plan, outer), cancellation_let_protection(plan, inner)):
+		(Some(outer_decision), Some(inner_decision)):
 			(
 				outer_decision.variable.id == outer.id
 				and inner_decision.variable.id == inner.id
@@ -1584,6 +1627,7 @@ tests: TestSuite = {
 			"region plans separate shared id with distinct def ids",
 			region_plan_separates_shared_id_distinct_def_ids,
 		),
+		("region plans index many same-name lets", region_plan_indexes_many_same_name_lets),
 		(
 			"region plans protect branch and loop lifetimes",
 			region_plan_protects_branch_and_loop_lifetimes,
