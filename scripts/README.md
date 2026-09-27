@@ -580,6 +580,32 @@ not fail the quality gate merely because cleanup remains queued. Track accepted
 cleanup work in GitHub issues rather than copying point-in-time counts into a
 maintained document.
 
+### Compiler identity migration census
+
+`scripts/compiler-identity-census` emits a deterministic identity migration
+inventory from compiler stages 6, 8, 9, and 10:
+
+```bash
+scripts/compiler-identity-census --json > /tmp/identity-census.json
+scripts/compiler-identity-census --check
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp.test.build.test_compiler_identity_census
+```
+
+The checked-in JSON baseline caps each category, family, and directory. The
+`--check` command rejects an increase and a new unlisted C naming boundary at
+its source location. `--write-baseline PATH` writes an explicit candidate for a
+reviewed migration cut; new boundaries carry `REVIEW_REQUIRED` metadata and
+cannot pass `--check` until their rationale, owner, and oracle are filled in.
+JSON and text use the same sorted
+rows. Exact source shapes are separate from heuristic candidates: member reads,
+sparse `Option` fields, and index builders are triage inventory, not confirmed
+semantic uses. `unsupported_static` rows name the dynamic or typed oracle needed
+for classes that this source scan cannot prove.
+Pending-constructor keys include the containing brace expression and its ordinal
+among balanced brace expressions in the same scope. Blank lines, comments, and
+unrelated statements without braces leave these keys stable; inserting a brace
+expression before a site may require an explicit baseline review.
+
 ### Compiler anti-pattern census
 
 `scripts/audit-compiler-antipatterns` inventories a small set of recurring

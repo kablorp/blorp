@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""Deterministic source-shape inventory and non-increase identity ratchet.
+
+This is lexical evidence, not a typechecked use graph.  Exact syntax and
+heuristic candidates are distinguished in every row.  The baseline records
+reviewed budgets and the small set of approved spelling boundaries.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+DEFAULT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BASELINE = Path(__file__).with_name("compiler-identity-census-baseline.json")
+REVIEW_REQUIRED = "REVIEW_REQUIRED"
+PHASE_DIRECTORIES = {
+    "stage_06_typecheck": "typecheck",
+    "stage_08_core_lower": "lowering",
+    "stage_09_core": "core",
+    "stage_10_backend": "backend",
+}
+FIELD_OWNER = re.compile(r"^\s*(?:private\s+)?(?:record|struct)\s+(\w+)\s*\{")
+FUNCTION_OWNER = re.compile(r"^\s*(?:private\s+)?(?:(?:pure|impure|foreign|builtin)\s+)*"
+                            r"func\s+(\w+)(?:\s*\[[^]]+\])?\s*\(")
+IMPLEMENTATION_OWNER = re.compile(r"^implements\s+(.+?)\s+for\s+(.+?)\s*:\s*$")
+FIELD = re.compile(r"^\s*(\w+)\s*:\s*(String|Int|Option\[Int\]|Option\[[^]]+\])\s*[,}]?")
+COLLECTION = re.compile(r"\b(Dict|Set)\s*\[\s*String\s*[,\]]")
+PENDING = re.compile(r"\b(id\s*=\s*0|def_id\s*=\s*None)\b")
+PREDICATE = re.compile(r"\b(?P<left>[\w.]+\.name)\s*(?P<operator>==|!=)\s*"
+                       r"(?P<right>\"[^\"]*\"|[\w.]+\.name)")
+PROJECTION = re.compile(r"\b(c_local_name|c_identifier)\s*\(")
+INDEX = re.compile(r"\b(?:pure\s+)?func\s+(build_\w+_index)\s*\(")
+MEMBER = re.compile(r"\b\w+\.(name|id|def_id)\b")
+IDENTITY_OWNERS = re.compile(
+    r"(?:CoreVar|ParsedIdentifier|Typed\w*(?:Var|Name|Call|Capture|Target|Ref)|"
+    r"Core\w*(?:Capture|CallTarget|TypeRef|MemberRef))$"
+)
+CAPABILITIES = (
+    ("definition_frontier", "C3c/C4a", "persistent identity frontier fixture",
+     "A static source scan cannot prove graph-to-Core definition ID continuity."),
+    ("duplicate_authored_span", "C2a", "authored span uniqueness fixture",
+     "Duplicate ParsedIdentifier spans require a parsed body, not source text."),
+    ("receiver_type_resolution", "C11b", "typed identity hygiene gate",
+     "Lexical member reads cannot prove the receiver is a CoreVar."),
+    ("repeated_record_authority", "C1b", "frontend carrier probe",
+     "A source scan cannot establish whether repeated records share authority."),
+    ("identity_conversion", "C2a", "resolved-use fixture",
+     "Name-to-ID and ID-to-name conversion needs typed call graph evidence."),
+    ("phase_identity_fields", "C9", "resolved typed frontend view fixture",
+     "Identity-bearing string fields beyond exact owner types need typed dataflow review."),
+    ("string_collection_purpose", "C7a-C7d", "consumer-by-consumer table migration",
+     "Dict[String] and Set[String] syntax does not establish key purpose or semantic use."),
+    ("source_spelling_predicate_forms", "C6x/C7d", "spelling predicate fixture corpus",
+     "Only direct .name equality is recognized; helper predicates need typed review."),
+    ("symbol_concatenation", "C5a", "generated symbol oracle",
+     "Arbitrary String concatenation cannot be distinguished from C symbol assembly lexically."),
+    ("display_diagnostic_formatter_reflection_foreign_export", "C11b",
+     "output and ABI fixture corpus",
+     "These boundaries require output provenance and ABI checks, not path-name guesses."),
+)
+
+
+def site(category, family, phase, path, line, classification, detail,
+         recognition="exact", column=0):
+    key = f"{path}:{category}:{family}:{detail}"
+    return dict(key=key, category=category, family=family, phase=phase,
+                path=path, line=line, column=column, classification=classification,
+                detail=detail, recognition=recognition)
+
+
+def lexical_code(raw):
+    """Keep token offsets while hiding comments and literal interiors."""
+    output = []
+    quote = None
+    escaped = False
+    for index, char in enumerate(raw):
+        if quote:
+            if escaped:
+                escaped = False
+                output.append(" ")
+            elif char == "\\":
+                escaped = True
+                output.append(" ")
+            elif char == quote:
+                quote = None
+                output.append(char)
+            else:
+                output.append(" ")
+        elif char in {'"', "'"}:
+            quote = char
+            output.append(char)
+        elif char == "-" and raw[index:index + 2] == "--":
+            output.extend(" " * (len(raw) - index))
+            break
+        else:
+            output.append(char)
+    return "".join(output)
+
+
+def comment_aware_code(raw):
+    """Remove comments while retaining quoted values for record fingerprints."""
+    quote = None
+    escaped = False
+    for index, char in enumerate(raw):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+        elif raw[index:index + 2] == "--":
+            return raw[:index]
+    return raw
+
+
+def normalized_structural_code(source):
+    """Collapse code whitespace, retaining and canonically escaping literals."""
+    parts = []
+    quote = None
+    escaped = False
+    for char in source:
+        if quote:
+            parts.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in {'"', "'"}:
+            quote = char
+            parts.append(char)
+        elif char.isspace():
+            if parts and parts[-1] != " ":
+                parts.append(" ")
+        else:
+            parts.append(char)
+    return json.dumps("".join(parts).strip(), ensure_ascii=True)
+
+
+def pending_record_contexts(logical_lines, pending_rows):
+    """Find the innermost balanced brace expression at each pending site."""
+    pending_at = {(row["line"], row["column"] - 1): row for row in pending_rows}
+    stack = []
+    containing = {}
+    closing = {}
+    for number, scope, code, _ in logical_lines:
+        for index, char in enumerate(code):
+            row = pending_at.get((number, index))
+            if row is not None:
+                containing[id(row)] = stack[-1] if stack else None
+            if char == "{":
+                stack.append((number, index, scope))
+            elif char == "}" and stack:
+                closing[stack.pop()] = (number, index)
+    # Count every balanced brace expression in a scope, including expressions
+    # without pending fields, so equal record bodies keep distinct sites.
+    ordinal_by_opening = {}
+    counts_by_scope = Counter()
+    for opening in sorted(closing):
+        counts_by_scope[opening[2]] += 1
+        ordinal_by_opening[opening] = counts_by_scope[opening[2]]
+    line_index = {number: index for index, (number, _, _, _) in enumerate(logical_lines)}
+    contexts = {}
+    for row in pending_rows:
+        opening = containing.get(id(row))
+        if opening is None or opening not in closing:
+            continue
+        end = closing[opening]
+        pieces = []
+        for _, _, _, rich in logical_lines[line_index[opening[0]]:line_index[end[0]] + 1]:
+            pieces.append(rich)
+        if opening[0] == end[0]:
+            pieces[0] = pieces[0][:end[1] + 1]
+        else:
+            pieces[-1] = pieces[-1][:end[1] + 1]
+        basis = normalized_structural_code("\n".join(pieces))
+        structural_site = json.dumps([ordinal_by_opening[opening], basis], separators=(",", ":"))
+        contexts[id(row)] = hashlib.sha256(structural_site.encode("utf-8")).hexdigest()[:16]
+    return contexts
+
+
+def scan_repository(root):
+    rows = []
+    source_root = root / "blorp/src/compiler"
+    if not source_root.is_dir():
+        raise ValueError(f"compiler source root missing: {source_root}")
+    for phase_dir, phase in PHASE_DIRECTORIES.items():
+        phase_root = source_root / phase_dir
+        if not phase_root.is_dir():
+            raise ValueError(f"required compiler phase missing: {phase_root}")
+        sources = sorted(phase_root.rglob("*.brp"))
+        if not sources:
+            raise ValueError(f"required compiler phase has no .brp files: {phase_root}")
+        for source in sources:
+            relative = source.relative_to(root).as_posix()
+            owner = None
+            implementation = None
+            scope = "<module>"
+            in_doc_comment = False
+            logical_lines = []
+            source_first_row = len(rows)
+            for number, raw in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+                if raw.strip() == "---":
+                    in_doc_comment = not in_doc_comment
+                    continue
+                if in_doc_comment:
+                    continue
+                code = lexical_code(raw)
+                if not code.strip():
+                    continue
+                first_row = len(rows)
+                if code[0] not in " \t":
+                    implementation_header = IMPLEMENTATION_OWNER.match(code)
+                    if implementation_header:
+                        implementation = ":".join(implementation_header.groups())
+                        scope = f"implements:{implementation}"
+                    elif not code.startswith(")"):
+                        implementation = None
+                        if owner is None:
+                            scope = "<module>"
+                declaration = FIELD_OWNER.match(code)
+                if declaration:
+                    owner = declaration.group(1)
+                    scope = f"type:{owner}"
+                function = FUNCTION_OWNER.match(code)
+                if function:
+                    owner = None
+                    scope = (f"implements:{implementation}/" if implementation else "") + f"func:{function.group(1)}"
+                elif owner and "}" in code:
+                    owner = None
+                    scope = "<module>"
+                logical_lines.append((number, scope, code, comment_aware_code(raw)))
+                field = FIELD.match(code) if owner else None
+                if field:
+                    field_name, field_type = field.groups()
+                    if field_name in {"name", "id", "def_id"} and IDENTITY_OWNERS.search(owner):
+                        rows.append(site("identity_field", owner, phase, relative, number,
+                                         "legacy_semantic", f"{field_name}:{field_type}"))
+                    elif field_type.startswith("Option[") and phase in {"core", "lowering"}:
+                        rows.append(site("sparse_option_field", owner, phase, relative, number,
+                                         "heuristic_candidate", f"{field_name}:{field_type}", "heuristic"))
+                for match in COLLECTION.finditer(code):
+                    rows.append(site("string_collection", match.group(1), phase, relative,
+                                     number, "legacy_source_shape", match.group(1) + "[String",
+                                     column=match.start() + 1))
+                for match in PENDING.finditer(code):
+                    rows.append(site("pending_constructor", match.group(1).split("=", 1)[0].strip(),
+                                     phase, relative, number, "legacy_source_shape", match.group(1).replace(" ", ""),
+                                     column=match.start() + 1))
+                for match in PREDICATE.finditer(code):
+                    right = match.group("right")
+                    if right.startswith('"'):
+                        digest = hashlib.sha256(raw[match.start():match.end()].encode("utf-8")).hexdigest()[:16]
+                        detail = f'{match.group("left")}{match.group("operator")}literal:{digest}'
+                    else:
+                        detail = match.group(0)
+                    rows.append(site("source_spelling_predicate", "name", phase, relative,
+                                     number, "legacy_semantic", detail, column=match.start() + 1))
+                for match in PROJECTION.finditer(code):
+                    if re.search(r"\bfunc\s+" + match.group(1) + r"\s*\(", code):
+                        continue
+                    boundary = source.name == "c_naming.brp"
+                    rows.append(site("symbol_projection", match.group(1), phase, relative,
+                                     number, "allowed_boundary" if boundary else "legacy_semantic",
+                                     match.group(1), column=match.start() + 1))
+                for match in INDEX.finditer(code):
+                    rows.append(site("per_consumer_index", match.group(1), phase, relative,
+                                     number, "heuristic_candidate", match.group(1), "heuristic",
+                                     column=match.start() + 1))
+                # A lexical candidate is useful for human review, but never
+                # silently becomes a semantic budget without receiver typing.
+                if not FIELD.match(code):
+                    for match in MEMBER.finditer(code):
+                        rows.append(site("member_read_candidate", match.group(1), phase,
+                                         relative, number, "heuristic_candidate", match.group(0),
+                                         "heuristic", column=match.start() + 1))
+                for row in rows[first_row:]:
+                    row["scope"] = scope
+            by_line = {number: rich for number, _, _, rich in logical_lines}
+            pending_rows = [row for row in rows[source_first_row:]
+                            if row["category"] == "pending_constructor"]
+            record_contexts = pending_record_contexts(logical_lines, pending_rows)
+            for row in rows[source_first_row:]:
+                if row["classification"] in {"legacy_semantic", "legacy_source_shape", "allowed_boundary"}:
+                    if row["category"] == "pending_constructor":
+                        context = record_contexts.get(id(row))
+                        if context is None:
+                            row["classification"] = "needs_review"
+                            row["recognition"] = "unsupported_static"
+                            continue
+                    else:
+                        basis = normalized_structural_code(by_line[row["line"]])
+                        context = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+                    row["context"] = context
+    for family, owner, oracle, rationale in CAPABILITIES:
+        row = site("unsupported_static", family, "cross_phase", "<capability>", 0,
+                   "unsupported_static", family)
+        row.update(owner=owner, oracle=oracle, rationale=rationale)
+        row["scope"] = "<capability>"
+        rows.append(row)
+    occurrences = Counter()
+    for row in rows:
+        context = f':{row["context"]}' if "context" in row else ""
+        row["key"] = f'{row["path"]}:{row["scope"]}:{row["category"]}:{row["family"]}:{row["detail"]}{context}'
+        occurrences[row["key"]] += 1
+        row["key"] += f'#{occurrences[row["key"]]}'
+    return sorted(rows, key=lambda row: row["key"])
+
+
+def budgets(rows):
+    counts = Counter()
+    for row in rows:
+        if row["classification"] in {"legacy_semantic", "legacy_source_shape", "heuristic_candidate"}:
+            counts[(row["classification"], row["category"], row["family"],
+                    str(Path(row["path"]).parent))] += 1
+    return [dict(classification=classification, category=category, family=family, directory=directory,
+                 max_count=count)
+            for (classification, category, family, directory), count in sorted(counts.items())]
+
+
+def report(root):
+    rows = scan_repository(root)
+    source_root = root / "blorp/src/compiler"
+    paths = sorted(source.relative_to(root).as_posix()
+                   for phase_dir in PHASE_DIRECTORIES
+                   for source in (source_root / phase_dir).rglob("*.brp"))
+    counts_by_phase = {phase: sum(path.startswith(f"blorp/src/compiler/{phase_dir}/")
+                                        for path in paths)
+                       for phase_dir, phase in PHASE_DIRECTORIES.items()}
+    semantic = sum(row["classification"] == "legacy_semantic" for row in rows)
+    source_shapes = sum(row["classification"] == "legacy_source_shape" for row in rows)
+    heuristic = sum(row["classification"] == "heuristic_candidate" for row in rows)
+    return dict(schema_version=1, rows=rows, budgets=budgets(rows),
+                coverage=dict(paths=paths, counts_by_phase=counts_by_phase),
+                summary=dict(legacy_semantic_sites=semantic,
+                             legacy_source_shapes=source_shapes,
+                             heuristic_candidates=heuristic,
+                             member_reads_requiring_receiver_resolution=sum(
+                                 row["category"] == "member_read_candidate" for row in rows),
+                             note="Heuristic candidates are triage only and excluded from semantic totals."))
+
+
+def validate_baseline(baseline):
+    if not isinstance(baseline, dict) or baseline.get("schema_version") != 1:
+        raise ValueError("schema_version must be 1")
+    for name in ("budgets", "exact_site_keys", "allowed_boundaries", "capabilities"):
+        if not isinstance(baseline.get(name), list):
+            raise ValueError(f"{name} must be a list")
+    if not all(isinstance(key, str) and key for key in baseline["exact_site_keys"]):
+        raise ValueError("exact_site_keys must contain nonempty strings")
+    for item in baseline["budgets"]:
+        if not isinstance(item, dict) or not all(
+            isinstance(item.get(field), str) and item[field]
+            for field in ("classification", "category", "family", "directory")
+        ) or type(item.get("max_count")) is not int or item["max_count"] < 0:
+            raise ValueError("each budget needs classification, category, family, directory, and nonnegative max_count")
+    for name, fields in (
+        ("allowed_boundaries", ("key", "rationale", "owner", "oracle")),
+        ("capabilities", ("key", "family", "rationale", "owner", "oracle")),
+    ):
+        for item in baseline[name]:
+            if not isinstance(item, dict) or not all(
+                isinstance(item.get(field), str) and item[field] for field in fields
+            ):
+                raise ValueError(f"each {name} item needs nonempty {', '.join(fields)}")
+            if name == "allowed_boundaries" and any(
+                item[field] == REVIEW_REQUIRED for field in ("rationale", "owner", "oracle")
+            ):
+                raise ValueError(f"unreviewed allowed boundary: {item['key']}")
+    coverage = baseline.get("coverage")
+    if not isinstance(coverage, dict):
+        raise ValueError("coverage must be an object")
+    paths = coverage.get("paths")
+    counts = coverage.get("counts_by_phase")
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise ValueError("coverage.paths must be a list of nonempty paths")
+    if not isinstance(counts, dict) or set(counts) != set(PHASE_DIRECTORIES.values()) or not all(
+        type(value) is int and value > 0 for value in counts.values()
+    ):
+        raise ValueError("coverage.counts_by_phase must contain positive counts for every required phase")
+
+
+def preserved_boundaries_for_write(baseline):
+    """Validate the part of an existing candidate whose review text is carried forward."""
+    if not isinstance(baseline, dict):
+        raise ValueError("top level must be an object")
+    boundaries = baseline.get("allowed_boundaries")
+    if not isinstance(boundaries, list):
+        raise ValueError("allowed_boundaries must be a list")
+    for item in boundaries:
+        if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not item["key"] or any(
+            not isinstance(item.get(field), str) for field in ("rationale", "owner", "oracle")
+        ):
+            raise ValueError("each allowed_boundaries row needs a nonempty string key and string metadata")
+    return {item["key"]: item for item in boundaries}
+
+
+def check(current, baseline):
+    errors = []
+    missing_paths = sorted(set(baseline["coverage"]["paths"]) - set(current["coverage"]["paths"]))
+    for path in missing_paths:
+        errors.append(f"previously covered compiler file missing: {path}")
+    for phase, count in baseline["coverage"]["counts_by_phase"].items():
+        if current["coverage"]["counts_by_phase"].get(phase, 0) < count:
+            errors.append(f"compiler phase {phase} coverage decreased from {count} to "
+                          f'{current["coverage"]["counts_by_phase"].get(phase, 0)}')
+    maxima = {(item["classification"], item["category"], item["family"],
+               item["directory"]): item["max_count"]
+              for item in baseline["budgets"]}
+    allowed = {item["key"] for item in baseline["allowed_boundaries"]}
+    exact_sites = set(baseline["exact_site_keys"])
+    capabilities = {row["key"]: row for row in baseline["capabilities"]}
+    for row in current["rows"]:
+        if row["classification"] != "unsupported_static":
+            continue
+        prior = capabilities.get(row["key"])
+        if prior is None or any(prior.get(field) != row[field]
+                                for field in ("owner", "oracle", "rationale")):
+            errors.append(f'unsupported_static capability needs review: {row["family"]}')
+    for item in baseline["allowed_boundaries"]:
+        if not all(item.get(field) for field in ("rationale", "owner", "oracle")):
+            errors.append(f"boundary {item.get('key', '<missing>')} lacks rationale, owner, or oracle")
+    for row in current["rows"]:
+        location = f'{row["path"]}:{row["line"]}'
+        if row["classification"] == "allowed_boundary" and row["key"] not in allowed:
+            errors.append(f"{location}: unclassified boundary {row['key']}")
+        if row["classification"] in {"legacy_semantic", "legacy_source_shape"} and row["key"] not in exact_sites:
+            errors.append(f"{location}: new exact identity site {row['key']}")
+        if row["classification"] == "needs_review":
+            errors.append(f"{location}: unclassified semantic site {row['key']}")
+    for item in current["budgets"]:
+        key = (item["classification"], item["category"], item["family"], item["directory"])
+        maximum = maxima.get(key, 0)
+        if item["max_count"] > maximum:
+            additions = [row for row in current["rows"]
+                         if row["classification"] == key[0] and row["category"] == key[1]
+                         and row["family"] == key[2]
+                         and str(Path(row["path"]).parent) == key[3]]
+            location = additions[-1]
+            errors.append(f'{location["path"]}:{location["line"]}: '
+                          f'budget {key} increased {maximum} -> {item["max_count"]}')
+    return errors
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--write-baseline", type=Path, metavar="PATH")
+    args = parser.parse_args()
+    if args.check and args.write_baseline is not None:
+        parser.error("--check and --write-baseline are mutually exclusive")
+    try:
+        current = report(args.root)
+    except (OSError, ValueError) as error:
+        print(f"identity census: {error}", file=sys.stderr)
+        return 2
+    if args.write_baseline is not None:
+        revision = subprocess.run(["git", "-C", str(args.root), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=False)
+        source_revision = revision.stdout.strip() if revision.returncode == 0 else "unversioned-fixture"
+        previous = {}
+        if args.write_baseline.exists():
+            try:
+                old = json.loads(args.write_baseline.read_text(encoding="utf-8"))
+                previous = preserved_boundaries_for_write(old)
+            except (OSError, ValueError, TypeError):
+                print("invalid existing baseline; refusing to overwrite", file=sys.stderr)
+                return 2
+        boundaries = []
+        for row in current["rows"]:
+            if row["classification"] != "allowed_boundary":
+                continue
+            old_boundary = previous.get(row["key"], {})
+            metadata = {field: old_boundary.get(field, REVIEW_REQUIRED)
+                        for field in ("rationale", "owner", "oracle")}
+            boundaries.append(dict(key=row["key"], **metadata))
+        baseline = dict(schema_version=1, source_revision=source_revision,
+                        budgets=current["budgets"],
+                        coverage=current["coverage"],
+                        exact_site_keys=[row["key"] for row in current["rows"]
+                                         if row["classification"] in {"legacy_semantic", "legacy_source_shape"}],
+                        allowed_boundaries=boundaries,
+                        capabilities=[row for row in current["rows"]
+                                      if row["classification"] == "unsupported_static"])
+        args.write_baseline.write_text(json.dumps(baseline, indent=2, sort_keys=True) + "\n",
+                                      encoding="utf-8")
+    if args.json:
+        print(json.dumps(current, indent=2, sort_keys=True))
+    elif not args.check and not args.write_baseline:
+        for row in current["rows"]:
+            print(f'{row["key"]}\t{row["classification"]}\t{row["recognition"]}')
+        print(json.dumps(current["summary"], sort_keys=True))
+    if args.check:
+        try:
+            baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            print(f"invalid baseline: {error}", file=sys.stderr)
+            return 2
+        try:
+            validate_baseline(baseline)
+        except ValueError as error:
+            print(f"invalid baseline: {error}", file=sys.stderr)
+            return 2
+        errors = check(current, baseline)
+        for error in errors:
+            print(error, file=sys.stderr)
+        if errors:
+            return 1
+        if not args.json:
+            print(f'identity census: {len(current["rows"])} rows; budgets within baseline')
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
