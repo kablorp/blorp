@@ -500,6 +500,27 @@ func test_drains_transitive_worklist() -> Bool:
 	)
 
 
+func test_initial_request_keeps_order_when_transitive_body_rediscovers_it() -> Bool:
+	int_type: CoreType = named_type("Int")
+	var source: CoreProgram = transitive_source_program("Int")
+	var expected: CoreProgram = transitive_expected_program("Int", 100, 101)
+	source_body: CoreExpr = SeqExpr(
+		identity_call("outer", int_type, SelectedDirectCall(12), Some(12)),
+		identity_call("inner", int_type, SelectedDirectCall(11), Some(11)),
+	)
+	expected_body: CoreExpr = SeqExpr(
+		identity_call("outer__mono_Int", int_type, UnknownCall, None),
+		identity_call("inner__mono_Int", int_type, UnknownCall, None),
+	)
+	source = { source | decls = source.decls.set(2, FunctionDecl(main_function(source_body))) }
+	expected = {
+		expected | decls = expected.decls.set(2, FunctionDecl(main_function(expected_body)))
+	}
+	actual: CoreMonoProgramSpecialization = specialize_selected_generic_calls(source, 100)
+
+	actual.next_def_id == 102 and programs_equal(actual.program, expected)
+
+
 pure func recursive_source_program(target_type: String) -> CoreProgram:
 	{
 		decls = [
@@ -592,6 +613,149 @@ func test_recursive_specialization_is_deduplicated() -> Bool:
 	actual.next_def_id == 101 and programs_equal(
 		actual.program,
 		recursive_expected_program("Int", 100),
+	)
+
+
+func test_duplicate_heavy_requests_keep_first_seen_order() -> Bool:
+	int_type: CoreType = named_type("Int")
+	bool_type: CoreType = named_type("Bool")
+	var body: CoreExpr = identity_call("recur", int_type, SelectedDirectCall(13), Some(13))
+	var duplicate_count: Int = 0
+
+	while duplicate_count < 64:
+		body = SeqExpr(
+			identity_call("recur", bool_type, SelectedDirectCall(13), Some(13)),
+			body,
+		)
+		duplicate_count += 1
+
+	source: CoreProgram = {
+		decls = [
+			FunctionDecl(
+				generic_function(
+					"recur",
+					13,
+					["T"],
+					type_parameter("T"),
+					call_with_argument(
+						"recur",
+						type_parameter("T"),
+						"value",
+						SelectedDirectCall(13),
+						Some(13),
+					),
+				),
+			),
+			FunctionDecl(main_function(body)),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+	actual: CoreMonoProgramSpecialization = specialize_selected_generic_calls(source, 100)
+
+	match (actual.program.decls.get(2), actual.program.decls.get(3)):
+		(Some(FunctionDecl(first)), Some(FunctionDecl(second))):
+			(
+				actual.next_def_id == 102
+				and actual.program.decls.length() == 4
+				and first.name == "recur__mono_Bool"
+				and first.def_id == 100
+				and second.name == "recur__mono_Int"
+				and second.def_id == 101
+			)
+		_:
+			False
+
+
+func test_request_order_crosses_index_promotion_with_transitive_duplicate() -> Bool:
+	promotion_limit: Int = 256
+	unique_request_count: Int = promotion_limit + 1
+	source_def_id_start: Int = 1000
+	generated_def_id_start: Int = 2000
+	int_type: CoreType = named_type("Int")
+	var decls: List[CoreDecl] = []
+	var source_index: Int = 0
+
+	while source_index < unique_request_count:
+		name: String = "identity_${source_index}"
+		def_id: Int = source_def_id_start + source_index
+		function: CoreFunction = if source_index == promotion_limit:
+			generic_function(
+				name,
+				def_id,
+				["T"],
+				type_parameter("T"),
+				call_with_argument(
+					"identity_0",
+					type_parameter("T"),
+					"value",
+					SelectedDirectCall(source_def_id_start),
+					Some(source_def_id_start),
+				),
+			)
+		else:
+			identity_function(name, def_id, ["T"], type_parameter("T"))
+		decls = decls.append(FunctionDecl(function))
+		source_index += 1
+
+	var call_index: Int = unique_request_count - 1
+	var body: CoreExpr = identity_call(
+		"identity_${call_index}",
+		int_type,
+		SelectedDirectCall(source_def_id_start + call_index),
+		Some(source_def_id_start + call_index),
+	)
+	call_index -= 1
+	while call_index >= 0:
+		body = SeqExpr(
+			identity_call(
+				"identity_${call_index}",
+				int_type,
+				SelectedDirectCall(source_def_id_start + call_index),
+				Some(source_def_id_start + call_index),
+			),
+			body,
+		)
+		call_index -= 1
+
+	decls = decls.append(FunctionDecl(main_function(body)))
+	program: CoreProgram = { decls = decls, foreign_includes = [], source_files = [] }
+	actual: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		program,
+		generated_def_id_start,
+	)
+	generated_start: Int = unique_request_count + 1
+	var ordered: Bool = True
+	var generated_index: Int = 0
+	while generated_index < unique_request_count:
+		match actual.program.decls.get(generated_start + generated_index):
+			Some(FunctionDecl(function)):
+				if (
+					function.name != "identity_${generated_index}__mono_Int"
+					or function.def_id != generated_def_id_start + generated_index
+				):
+					ordered = False
+					break
+			_:
+				ordered = False
+				break
+		generated_index += 1
+
+	last_rewrites_first: Bool = match actual.program.decls.get(generated_start + promotion_limit):
+		Some(FunctionDecl(function)):
+			match function.body:
+				Some(CallExpr(UnknownCall, VarExpr(variable, _, _), _, _, _)):
+					variable.name == "identity_0__mono_Int"
+				_:
+					False
+		_:
+			False
+
+	(
+		actual.next_def_id == generated_def_id_start + unique_request_count
+		and actual.program.decls.length() == generated_start + unique_request_count
+		and ordered
+		and last_rewrites_first
 	)
 
 
@@ -1413,7 +1577,19 @@ tests: TestSuite = {
 			test_full_mono_accepts_generic_function_used_as_returned_callee,
 		),
 		("drains transitive worklist", test_drains_transitive_worklist),
+		(
+			"initial request keeps order when transitive body rediscovers it",
+			test_initial_request_keeps_order_when_transitive_body_rediscovers_it,
+		),
 		("recursive specialization is deduplicated", test_recursive_specialization_is_deduplicated),
+		(
+			"duplicate-heavy requests keep first-seen order",
+			test_duplicate_heavy_requests_keep_first_seen_order,
+		),
+		(
+			"request order crosses index promotion with transitive duplicate",
+			test_request_order_crosses_index_promotion_with_transitive_duplicate,
+		),
 		(
 			"conflicting selected call is left unchanged",
 			test_conflicting_selected_call_is_left_unchanged,

@@ -792,30 +792,6 @@ private @debug_only pure func mono_request_scan_request_evaluation() -> Int:
 	black_box_int(0)
 
 
-private pure func request_is_generated(
-	requests: List[CoreMonoFunctionRequest],
-	mangled_name: String,
-) -> Bool:
-	var generated: Bool = False
-
-	for request in requests:
-		if request.mangled_name == mangled_name:
-			generated = True
-			break
-
-	generated
-
-
-private pure func append_request(
-	requests: List[CoreMonoFunctionRequest],
-	request: CoreMonoFunctionRequest,
-) -> List[CoreMonoFunctionRequest]:
-	if request_is_generated(requests, request.mangled_name):
-		requests
-	else:
-		requests.append(request)
-
-
 -- `CoreSourceLoc` is now an opaque Int (docs/CORE_NODE_TABLE_ROADMAP.md step
 -- N1): two locations are equal exactly when they are the same packed value.
 private pure func source_locs_equal(left: CoreSourceLoc, right: CoreSourceLoc) -> Bool:
@@ -967,7 +943,6 @@ private pure func collect_option_fusion_sites(
 private pure func collect_expr_requests(
 	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
-	requests: List[CoreMonoFunctionRequest],
 	expr: CoreExpr,
 ) -> List[CoreMonoFunctionRequest]:
 	scan: CoreMonoExprRequestScan = collect_expr_request_scan(
@@ -975,7 +950,7 @@ private pure func collect_expr_requests(
 		unresolved_type_params,
 		expr,
 	)
-	var collected: List[CoreMonoFunctionRequest] = requests
+	var collected: List[CoreMonoFunctionRequest] = []
 	var index: Int = 0
 	var fusion_site_index: Int = 0
 
@@ -986,14 +961,14 @@ private pure func collect_expr_requests(
 					match scan.option_fusion_sites.get(fusion_site_index):
 						Some(site):
 							if unique_fusion_site_id_for_site(scan.option_fusion_sites, site).is_none():
-								collected = append_request(collected, request)
+								collected = collected.append(request)
 							else:
 								void
 						None:
-							collected = append_request(collected, request)
+							collected = collected.append(request)
 					fusion_site_index += 1
 				else:
-					collected = append_request(collected, request)
+					collected = collected.append(request)
 			None:
 				break
 
@@ -1005,7 +980,6 @@ private pure func collect_expr_requests(
 private pure func collect_optional_body_requests(
 	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
-	requests: List[CoreMonoFunctionRequest],
 	body: Option[CoreExpr],
 ) -> List[CoreMonoFunctionRequest]:
 	match body:
@@ -1013,19 +987,17 @@ private pure func collect_optional_body_requests(
 			collect_expr_requests(
 				generic_functions,
 				unresolved_type_params,
-				requests,
 				expr,
 			)
 		None:
-			requests
+			[]
 
 
 private pure func collect_function_requests(
 	generic_functions: CoreGenericFunctionIndex,
-	requests: List[CoreMonoFunctionRequest],
 	function: CoreFunction,
 ) -> List[CoreMonoFunctionRequest]:
-	collect_optional_body_requests(generic_functions, function.type_params, requests, function.body)
+	collect_optional_body_requests(generic_functions, function.type_params, function.body)
 
 
 private pure func collect_program_requests(
@@ -1037,17 +1009,19 @@ private pure func collect_program_requests(
 	for decl in decls:
 		match decl:
 			FunctionDecl(function):
-				requests = collect_function_requests(generic_functions, requests, function)
+				for discovered in collect_function_requests(generic_functions, function):
+					requests = requests.append(discovered)
 			GlobalDecl(global):
-				requests = collect_expr_requests(
+				for discovered in collect_expr_requests(
 					generic_functions,
 					[],
-					requests,
 					global.init,
-				)
+				):
+					requests = requests.append(discovered)
 			ImplDecl(impl):
 				for method in impl.methods:
-					requests = collect_function_requests(generic_functions, requests, method)
+					for discovered in collect_function_requests(generic_functions, method):
+						requests = requests.append(discovered)
 			_:
 				void
 
@@ -1656,10 +1630,34 @@ pure func specialize_selected_generic_calls_from(
 		}
 	else:
 		unprocessed_decls: List[CoreDecl] = program.decls.drop(rewritten_decl_count)
-		var requests: List[CoreMonoFunctionRequest] = collect_program_requests(
+		initial_requests: List[CoreMonoFunctionRequest] = collect_program_requests(
 			generic_functions,
 			unprocessed_decls,
 		)
+		var requests: List[CoreMonoFunctionRequest] = []
+		-- Below this size the ordered queue is cheaper than a populated index.
+		-- Its length is the mode: the index is built when the 256th unique
+		-- request enters, then owns membership for the rest of this worklist call.
+		linear_request_limit: Int = 256
+		var seen_requests: Dict[String, Bool] = {}
+
+		for request in initial_requests:
+			if requests.length() < linear_request_limit:
+				var already_queued: Bool = False
+				for queued in requests:
+					if queued.mangled_name == request.mangled_name:
+						already_queued = True
+						break
+				if not already_queued:
+					requests = requests.append(request)
+					if requests.length() == linear_request_limit:
+						for queued in requests:
+							seen_requests = seen_requests.set(queued.mangled_name, True)
+			else:
+				if not seen_requests.contains(request.mangled_name):
+					seen_requests = seen_requests.set(request.mangled_name, True)
+					requests = requests.append(request)
+
 		var specialized_decls: List[CoreDecl] = []
 		var request_index: Int = 0
 		var current_def_id: Int = next_def_id
@@ -1678,11 +1676,22 @@ pure func specialize_selected_generic_calls_from(
 								request,
 								current_def_id,
 							)
-							requests = collect_function_requests(
-								generic_functions,
-								requests,
-								specialized,
-							)
+							for discovered in collect_function_requests(generic_functions, specialized):
+								if requests.length() < linear_request_limit:
+									var already_queued: Bool = False
+									for queued in requests:
+										if queued.mangled_name == discovered.mangled_name:
+											already_queued = True
+											break
+									if not already_queued:
+										requests = requests.append(discovered)
+										if requests.length() == linear_request_limit:
+											for queued in requests:
+												seen_requests = seen_requests.set(queued.mangled_name, True)
+								else:
+									if not seen_requests.contains(discovered.mangled_name):
+										seen_requests = seen_requests.set(discovered.mangled_name, True)
+										requests = requests.append(discovered)
 							specialized_decls = specialized_decls.append(FunctionDecl(specialized))
 							current_def_id += 1
 						None:
