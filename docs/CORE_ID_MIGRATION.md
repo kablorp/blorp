@@ -1,10 +1,83 @@
 # ID-First Compiler Migration
 
 Goal: after the compiler has resolved a source name, later phases operate on a
-typed integer identity. Source spellings live once in immutable display tables
+typed artifact-wide identity. Source spellings live once in immutable display tables
 and are consulted only for diagnostics, dumps, reflection, foreign/exported
 ABI, and optional readability of generated artifacts. No later phase should
 reconstruct semantic identity from a `String`.
+
+## First North Star: one globally unique entity identity
+
+Before removing strings, the compiler must be able to name every semantic
+entity uniquely across one compilation artifact. A local ordinal, dense table
+row, source-name ID, or Core-only counter is not an entity identity by itself.
+Domain-specific wrappers may make invalid comparisons unrepresentable, but
+they project to the same artifact-wide identity relation.
+
+Treat that relation as the normalized logical table below, even when the
+physical compiler representation uses smaller family-specific structs:
+
+```text
+Entity(entity_id PK, domain, owner_entity_id nullable, domain_key)
+```
+
+`(domain, owner_entity_id, domain_key)` must be injective within one compiler
+artifact. Every public domain ID (`ModuleId`, `DefinitionId`,
+`ResolvedValueId`, `FieldId`, name-site IDs, and `NodeId`) must have exactly
+one checked projection into this relation. A family may use a more compact
+physical representation when its domain or owner is implicit in the type,
+but two different semantic entities must never project to the same entity ID.
+Conversely, reordering, compacting, or rebuilding a storage table must never
+change the projected entity ID.
+
+This is the first migration completion target. Removing strings is the payoff
+and the enforcement mechanism, but it is downstream of complete identity:
+
+1. define the artifact-wide entity relation and the issuing authority for
+   every entity family;
+2. make every producer issue or preserve an ID in that relation;
+3. propagate IDs across phase boundaries and make consumers authoritative on
+   them;
+4. only then delete redundant names and name-keyed semantic indexes.
+
+The deliveries may implement one family at a time, but no delivery may mint a
+temporary ID that cannot be projected losslessly into the final entity
+relation.
+
+For values, the fixed-layout identity is:
+
+```blorp
+struct ResolvedValueId {
+	owner_definition_id: DefinitionValueId
+	domain: ResolvedValueDomain
+	key: Int
+}
+```
+
+The owner is a checked graph definition. The domain distinguishes the
+definition value, an authored local, and a synthetic local. The key is
+domain-specific: zero for the definition value, the binder's authored source
+site key for an authored local, and a deterministic owner-scoped minted key
+for a synthetic local. Equality always compares the complete fixed-layout
+identity. A source spelling, a use-site location, and a dense storage row are
+never substitutes for it.
+
+This distinction is architectural, not cosmetic:
+
+- every use of one binder carries the binder's ID, not an ID derived from the
+  use token;
+- two bodies may use the same authored site key because their checked owners
+  differ;
+- authored and synthetic entities cannot collide even when a synthetic node
+  inherits an authored source span;
+- a cloned definition receives a new owner and therefore a new namespace;
+- copying a binder inside one owner must mint a new key in the same domain;
+- dense `EntityRowId`/table indexes are physical storage only and may be
+  rebuilt or compacted without changing semantic identity.
+
+The migration must first extend this global identity relation to each entity
+family, then make consumers ID-only. It must not introduce a cheaper temporary
+function-local identity that would later need another semantic migration.
 
 This is a migration plan, not permission for a big-bang rewrite. It uses a
 thin ID spine followed by a moving deletion frontier:
@@ -102,18 +175,20 @@ The intended steady-state boundary is precise:
    declaration into the canonical definition table;
 2. immediately after discovery/surface installation, every declaration has a
    typed definition/member ID before any body is inferred;
-3. immediately before a body is inferred, its lexical resolver issues local
-   value IDs and resolves authored use sites once;
+3. while a body is inferred, each existing binder-admission site mints its
+   globally unique local value ID from the checked body owner and binder site;
+   the existing lexical lookup copies the selected binder's ID to each use;
 4. inference and every later phase consume those IDs. A spelling may still be
    carried temporarily during migration, but it is display/assertion data and
    never the authority;
 5. unresolved name lookup, diagnostics/formatting, reflection, and explicit
    ABI projection are the only string/name-ID boundaries that remain.
 
-“After discovery” therefore does not mean assigning locals before their body
-is walked. It means definitions are ID-only at the graph boundary, and each
-body crosses one explicit lexical-resolution boundary before semantic work.
-No later pass repeats discovery or lexical resolution.
+“After discovery” therefore means all possible owners are ID-only at the graph
+boundary. A local becomes an entity at the exact inference point that proves a
+source site is a binder; no separate full-body prewalk is required. Existing
+lexical inference is the one resolution boundary. No later pass repeats
+discovery or lexical resolution.
 
 ## Identity vocabulary
 
@@ -124,11 +199,11 @@ and meaning of each identity must remain visible in the type.
 | --- | --- | --- | --- |
 | `ModuleId` | module discovery | one validated module in a graph | frontend snapshot |
 | `SourceNameId` | source-name catalog | one spelling, not one entity | frontend snapshot |
-| `DefinitionId` | definition index | callable, type, constructor, field, global, trait, or implementation | compilation artifact |
+| `DefinitionId` | discovery source catalog or checked post-discovery generator | callable, type, constructor, field, global, trait, implementation, or generated definition | compilation artifact |
 | `DefinitionValueId` | checked definition-table projection | a definition that denotes a runtime value or owns an executable body | compilation artifact |
 | `BuiltinValueId` | builtin enum/catalog | a builtin value below the graph definition range; never a local owner | compiler ABI |
-| `ResolvedValueId` | body resolver or Core minting API | one definition value or authored/synthetic local binder | typed frontend through backend |
-| `ResolvedNameSiteId` | body resolver | one authored identifier occurrence within a body snapshot | resolved frontend artifact |
+| `ResolvedValueId` | checked definition projection, binder admission, or Core minting API | one globally unique definition value or authored/synthetic local binder | typed frontend through backend |
+| `ResolvedNameSiteId` | source/body occurrence catalog | one globally unique authored identifier occurrence; never a binder target by itself | resolved frontend artifact |
 | `ResolvedTypeNameSiteId` | module resolver | one type-name occurrence within a module snapshot | resolved frontend artifact |
 | `ResolvedMemberNameSiteId` | module resolver | one member-name occurrence within a module snapshot | resolved frontend artifact |
 | `NodeId` | Core construction | one Core expression occurrence | Core artifact |
@@ -139,36 +214,39 @@ overloads may share one spelling while naming different entities.
 
 ### Core value identity
 
-The recommended Core representation is a fixed-layout pair:
+The recommended Core representation is a fixed-layout identity with an
+explicit domain:
 
 ```blorp
 struct ResolvedValueId {
 	owner_definition_id: DefinitionValueId,
-	local_ordinal: Int
+	domain: ResolvedValueDomain,
+	key: Int
 }
 ```
 
 The constructors and projections belong in one identity module:
 
 ```blorp
-private DEFINITION_VALUE_ORDINAL: Int = 0
-
 pure func resolved_definition_value_id(definition_id: DefinitionValueId) -> ResolvedValueId:
 	{
 		owner_definition_id = definition_id,
-		local_ordinal = DEFINITION_VALUE_ORDINAL
+		domain = DefinitionValueDomain,
+		key = 0
 	}
 
 pure func resolved_local_value_id(
 	owner_definition_id: DefinitionValueId,
-	ordinal: Int,
-) -> ResolvedValueId:
-	-- Construction rejects/reserves zero; callers cannot fabricate the
-	-- definition-value representation for a local.
-	{
+	binder_site: SourceLocation,
+) -> Option[ResolvedValueId]:
+	-- The smart constructor validates an authored location and derives the
+	-- binder-site key. Callers cannot fabricate another domain.
+	key ?= authored_source_site_key(binder_site)
+	Some({
 		owner_definition_id = owner_definition_id,
-		local_ordinal = ordinal
-	}
+		domain = AuthoredLocalValueDomain,
+		key = key
+	})
 ```
 
 `DefinitionValueId` is created only by a checked projection over a
@@ -182,34 +260,35 @@ The definition-index seed reserves IDs below
 does not contain rows for them. C0a classifies which of those values survive
 into typed/Core value references. A surviving builtin gets a checked
 `BuiltinValueId` from the builtin enum/catalog and an explicit intrinsic or
-runtime symbol policy; it cannot own local ordinals. A builtin already lowered
+runtime symbol policy; it cannot own authored or synthetic local keys. A builtin already lowered
 to a dedicated operation has no `ResolvedValueId`. Do not pad the graph/local
 frontier down to zero or fabricate frontend table rows for builtin types and
 traits.
 
-Slot zero denotes the definition value itself. Positive slots denote local
-binders owned by an executable value definition. The pair is artifact-wide identity without a global
-mutable binding counter:
+The complete value is artifact-wide identity without a global mutable binding
+counter or a second syntax walk:
 
-- an authored body resolver assigns ordinals deterministically in source walk
-  order;
-- nested lambdas share their containing definition's ordinal namespace until
+- an authored binder is minted at its existing inference admission site from
+  the checked body owner and the binder's source site;
+- lexical lookup stores and returns that exact ID, so shadowing and
+  constructor-versus-binder decisions remain owned by inference;
+- nested lambdas share their containing definition's owner until
   closure conversion creates a new function;
 - a cloned function receives a new definition ID and therefore a new identity
-  namespace even if its local ordinals are preserved;
-- a pass that adds a binder inside an existing function mints the next ordinal
-  for that owner;
-- a pass that copies a binding inside the same function must mint a new ordinal;
-- globals, callables, and constructors use ordinal zero with their checked
-  `DefinitionValueId` projection.
+  namespace even if its internal authored/synthetic keys are preserved;
+- a pass that adds or copies a binder uses the synthetic domain and the
+  owner's deterministic synthetic-key allocator;
+- globals, callables, and constructors use the definition domain with their
+  checked `DefinitionValueId` projection.
 
 The type belongs in a phase-neutral stage-6 identity/storage module so the
 typed frontend does not import a Core-owned type. Core uses the same
 `ResolvedValueId`; it does not define an isomorphic wrapper or conversion.
 The exact source type may be opaque over this struct. What matters is that it
-remains fixed-layout, has smart constructors, and has no public sentinel
-manipulation. Do not encode the pair into bit ranges, signs, source offsets,
-hashes, or string prefixes.
+remains fixed-layout, has smart constructors, and has no public sentinel or
+domain manipulation. The authored-site projection may use compact source
+location identity internally, but callers may not encode or decode bit ranges,
+signs, hashes, or string prefixes themselves.
 
 ### Display facts
 
@@ -281,7 +360,7 @@ checks the frontend table's contiguous range, then the generated overlay's
 contiguous range. A missing row produces an internal diagnostic containing the
 numeric ID and provenance; it never falls back to a guessed or source-spelling
 lookup. Minting a post-frontend definition must atomically consume
-`next_def_id`, append this display row, and append its local-ordinal frontier.
+`next_def_id`, append this display row, and append its synthetic-key frontier.
 No pass may increment `next_def_id` directly after A4.
 
 The authored and Core display catalogs above are logical interfaces. The
@@ -377,8 +456,8 @@ the joined data back onto every node.
 carriers whose public APIs accept the corresponding typed IDs. C1a guarantees
 checked construction and equality only; it
 does not silently require generic `Hashable` for the fixed-layout struct. The
-representation probe compares a nested owner-raw/local-ordinal index, owner
-ranges, and a dense row map. Likewise, location ingress uses an explicitly
+representation probe compares a nested owner/domain/key index, owner ranges,
+and a dense row map. Likewise, location ingress uses an explicitly
 named scalar projection from `source.brp` and a private `Dict[Int, Int]`, not a
 `Dict[SourceLocation, ...]` that the current opaque type cannot instantiate.
 Adding `Hashable` later is a separate API decision with equality/hash tests and
@@ -406,16 +485,19 @@ indexes are required and which joins must remain cold.
 
 The following invariants become strict before strings leave Core:
 
-1. Every definition has exactly one `DefinitionId` issued by the canonical
-   graph definition table or by the shared post-frontend definition allocator.
-2. Every authored local binder has one positive local ordinal within its
-   owning definition.
+1. Every source definition has exactly one `DefinitionId` issued by discovery;
+   post-frontend generated definitions use the shared later allocator in the
+   same artifact-wide relation. Stage 6 never re-mints a source definition.
+2. Every authored local binder has one authored-domain key within its owning
+   definition, derived only by the identity authority from that binder's
+   source site.
 3. Every local use carries the exact `ResolvedValueId` chosen by lexical resolution;
    it never repeats a scope-chain lookup after that point.
 4. Every synthetic binding has an ID minted by the owning Core pass.
 5. Cloning into a new definition remaps the owner component. Cloning within
-   the same definition freshens the local ordinal.
-6. Definition references carry ordinal zero and a validated definition ID.
+   the same definition uses the synthetic domain and freshens its key.
+6. Definition references carry the definition domain and a validated
+   definition ID.
 7. No semantic comparison combines a spelling with an ID. Equality is the ID.
 8. A lookup from ID to spelling is legal only at a named display, diagnostic,
    serialization, reflection, or ABI boundary.
@@ -482,14 +564,123 @@ change. Prefer a short literate sequence over a large final-state type dump:
 3. show one hot consumer reading a narrow table by ID;
 4. show the old lookup/field/helper being deleted.
 
-#### Worked design example: C2a parameters and straight lets
+#### Active design example: C2a one-binder-family pilot
 
-This section demonstrates the required authority, schema, ownership, and
-consumer/deletion sequence. It is deliberately not a dispatchable handoff:
-the orchestrator must add the current green revision/worktree, exact owned and
-out-of-scope file list, a named failing fixture and assertion, and the literal
-smallest command from that revision. Never send a worker this section alone or
-label placeholders such as “the focused fixture” complete.
+The first value-identity slice selects either named parameters or straight
+bindings after the carrier probe; the snippets below use a straight binding
+as the concrete example. It must reuse the lexical walk inference already
+performs. It must not add a syntax census, resolver walk, work tape, binding
+catalog, or freeze pass. Those structures were measured and rejected below.
+
+**Authority before.** `Env` selects a local by spelling, and lowering later
+selects the same binding again by spelling. The binding has no artifact-wide
+identity that can cross the typed boundary.
+
+**Authority after.** The checked graph definition table first projects the
+callable/global body owner. That fixed owner is installed in `InferSession`.
+Each existing binder-admission site derives one authored-domain value ID and
+stores it on the admitted `VarSymbol`:
+
+```blorp
+owner ?= definition_value_owner(definition_table, body_definition_id)
+issuer = checked_value_identity_issuer(owner)
+
+private pure func admit_straight_binding(
+	context: InferContext,
+	name: ParsedIdentifier,
+	value_type: SemanticType,
+) -> InferContext:
+	value_id = issued_authored_local_value_identity(
+		context.state.value_identity_issuer,
+		name.span,
+	)
+	env = env_add_var_with_details_and_identity(
+		context.state.env,
+		name.text,       -- transitional lexical ingress only
+		value_type,
+		value_id,
+	)
+	infer_context_with_env(context, env)
+```
+
+The complete semantic identity is `(owner, AuthoredLocalValueDomain,
+binder_site_key)`. The site key alone is only a component. The smart
+constructor is the sole place that derives it from source location. Offset
+zero remains distinct from the definition-value key because equality includes
+the explicit domain.
+
+The existing name lookup continues to choose the binding in this slice. Once
+chosen, it copies the exact ID from `VarSymbol` into the typed name or
+assignment payload. Refinement/shadow-resource helpers must preserve that ID
+when they replace the symbol's type or proofs:
+
+```blorp
+match env_lookup(context.state.env, name.text):
+	Some(VarSymbolKind(symbol)):
+		TypedNameExpr(name, symbol.resolved_value_id, info)
+	_:
+		infer_non_local_or_error(context, name)
+
+-- A refinement changes facts about the same entity, never its identity.
+env_add_var_with_details_and_identity(
+	env,
+	name,
+	refined_type,
+	symbol.resolved_value_id,
+)
+```
+
+Stage 8 consumes the typed ID directly. For the first compatibility slice it
+projects the authored key to the existing positive `CoreVar.id`, which must be
+byte-for-byte the same value lowering previously derived from the binder span.
+Unmigrated binder families take an explicit legacy arm and retain the current
+scope lookup. A missing or wrong-domain ID never falls back silently:
+
+```blorp
+match typed_expr:
+	TypedNameExpr(name, value_id, info) if value_id.is_issued():
+		core_id ?= authored_core_id(value_id)
+		lower_exact_local(name, core_id, info)
+	TypedNameExpr(name, _, info):
+		lower_legacy_local_or_non_local(name, info)
+```
+
+This delivery intentionally does not publish a normalized binding/use table.
+The ID is already complete and global; table rows are a later storage product
+for consumers that can pay for them. Nor does this delivery yet put the full
+three-component ID on every `CoreVar`: direct projection proves the spine and
+removes the duplicate lowering lookup while preserving emitted C. D2 carries
+the full ID into Core after all authored binder families can supply it.
+
+**First tests.** Cover a binder at source offset zero, two same-spelled
+bindings with distinct owners, parameter shadowing, a straight mutable
+binding plus assignment, refinement of an existing binding, a function-valued
+local call, and one unmigrated match/destructuring binder exercising only the
+legacy arm. Tests must prove that every use of one binding carries the exact
+same complete ID and shadowed binders differ.
+
+**Fast loop and acceptance.** Run the identity unit test, the focused Stage 6
+fixtures, and the focused Stage 8 lowering tests before a self-compile. Count
+direct-ID and legacy lowering paths in a test-only oracle. Generated C and
+diagnostics must be identical. Whole-compile allocations and retired
+instructions must each remain within 0.5%, and the active path must not add a
+full-body traversal or growing collection to `InferSession`. Parallel typed
+variants are prohibited; store the fixed-layout identity on the existing
+narrow payload or stop if no inline carrier passes the probe.
+
+#### Rejected design example: C2a pre-inference body resolver
+
+The remainder of this worked example records the earlier table-first design
+so its failure mode is not rediscovered. It is not an implementation contract:
+the full-body resolver, draft tables, outcome retention, and freeze pass below
+were rejected after adding 3.7 million typed-frontend allocations and 3.334
+billion retired instructions on a self-compile. The active C2a contract is the
+inference-site design above. Normalized publication may return only with a
+named paying consumer and new evidence.
+
+This historical section documents the rejected authority, schema, ownership,
+and consumer/deletion sequence. Never send it to a worker as a handoff or
+reintroduce its body-wide prepass without a new measured design review.
 
 **Merge value.** Resolve parameter and straight-let uses once per body and
 delete their repeated local scope-chain lookup during inference.
@@ -851,15 +1042,22 @@ one of these forms of value:
 
 An API, field, or table with no active consumer is not a delivery. A bounded
 preparatory refactor may be reviewed independently, but production scaffolding
-lands only in the same short integration train as its first consumer. In
-particular:
+lands only in the same short integration train as its first consumer. The
+foundation is therefore split into three bounded checkpoints:
 
-- C1a is reviewable on its own, but C1a/C2a is one atomic landing unit: merge
-  or squash the train only when C2a's first consumer is ready. The C1b
-  frontend carrier/COW probe is a hard prerequisite to C2a production edits;
-  its selected frontend catalog lands in that train. C1b's Core catalog lands
-  with C3c, not earlier merely because its separate representation probe
-  succeeded;
+- C1p1 first separates output compatibility numbering from semantic
+  definition identity; C1p2 then gives generated definitions independent
+  semantic and output frontiers. Both initially preserve the same numbers and
+  must produce raw-identical C;
+- C1a makes discovery the issuing authority for source-declared definition
+  identity. It may be developed and reviewed independently, but it lands on
+  main atomically with C1b so an unused catalog is never published;
+- C1b makes Stage 6 adopt those exact IDs and deletes the competing graph-time
+  mint/enumeration path. C1a plus C1b is the first production delivery;
+- C2a is a later one-binder-family local-ID pilot. It mints at the existing
+  inference binder-admission site and consumes the ID in lowering. It must not
+  add a per-body resolver, table, freeze pass, or parallel `TypedExpr`
+  variants;
 - C3a/C3b/C3c are independently compiling and reviewable commits but one
   atomic landing unit. Merge or squash only the C3c endpoint; do not expose an
   intermediate main revision in which every Core variable carries unused
@@ -890,28 +1088,70 @@ durable improvement even before the old fields can be physically removed.
 
 ### Independently releasable deliveries
 
-Use the following deliveries. Work inside a delivery may be developed in parallel
-from its named green checkpoint. Ordinary slices merge one at a time with their
-own tests and evidence. The named C1a/C2a and C3a/C3b/C3c trains instead land
-atomically at their final endpoint, with ratchet and performance acceptance
-applied to that endpoint. After each landing, remaining workers rebase onto the
-new checkpoint before final measurement.
+Use the following deliveries. Work inside a delivery may be developed in
+parallel from its named green checkpoint. C1a is a reviewable branch checkpoint,
+not a main landing; C1a/C1b and C3a/C3b/C3c land atomically at their final
+endpoints. Other slices merge one at a time with their own tests and evidence.
+After each landing, remaining workers rebase onto the new checkpoint before
+final measurement.
 
 | Delivery | Sequential spine | Safe parallel lanes | Value delivered at the checkpoint |
 | --- | --- | --- | --- |
 | D0 — observability | Land C0a census/ratchet, C0b counters, and C5a symbol-normalizer tests from one frozen input/schema | The three cuts own disjoint tooling/test files and may develop in parallel before serialized validation | Reproducible identity inventory, stronger correctness corpus, and a trustworthy generated-symbol oracle with no compiler behavior change |
-| D1 — first resolved body slice | Review C1a, complete and select C1b's frontend carrier/COW probe, then merge the short C1a → C2a train so the checked vocabulary and chosen carrier land with parameters/straight lets | Resolver census/fixture work and the read-only synthetic-constructor inventory may run while C1b is measured; carrier-dependent Env/catalog production edits may not | Every authored lexical binder/use has an ID and explicit migration state; parameters/straight lets consume IDs; their inference lookup path is deleted; same-spelling IDs are checked |
-| D2 — authored IDs reach Core | Extend the resolver through C2b/C2c, then merge the short C3a → C3b → C3c train | C3a's mechanical Core constructor work may be prepared while the frontend worker finishes C2b/C2c; backend symbol-plan fixtures may proceed in separate files | Every authored binding/use reaches Core by ID, lowering's local scope walk disappears, and only enumerated synthetic sites remain pending |
+| D1p — decouple output numbering | Land C1p1's output-only `EmissionCompatibilityId`, then C1p2's independent semantic/emission generated-definition frontiers | D1a discovery catalog development may proceed in its own files, but Stage 6 adoption waits | Semantic IDs can change without perturbing C symbols, output ordering, comments, symbol maps, temporary seeds, or later generated IDs; both cuts are initially raw-C-identical |
+| D1a — discovery identity authority | C1a moves final-form source-definition identity and normalized catalog construction into an extended existing discovery/surface walk | Stage 6 adoption and local-carrier workers are read-only auditors until the authority API freezes | Discovery deterministically issues artifact-wide IDs for the full source-definition skeleton family; row order is storage only; no body or typed/Core work is added |
+| D1b — Stage 6 adoption | Rebase C1b onto reviewed C1a, consume discovery IDs in the definition index/header graph, and delete graph-time re-minting; squash C1a/C1b as one main landing | Standalone/test authority fixtures and generated-C identity fixtures may proceed in disjoint files | Discovery is the sole source-declared definition-ID authority; Stage 6 attaches facts to those IDs; the old allocator/enumeration path is gone; C and diagnostics are identical |
+| D1c — first local-ID pilot | C2a selects one complete binder family, mints owner/domain/site IDs at existing binder admission, stores the exact ID on Env and the existing narrow typed payload, and consumes it directly in lowering | A carrier representation probe and fixtures may precede production edits; no parallel typed variants or retained body catalog | One binder family has artifact-wide IDs end to end and one lowering lookup is deleted; all other families have an explicit compatibility boundary; C and diagnostics are identical |
+| D2 — authored IDs reach Core | Extend inference-site minting through C2b/C2c, then merge the short C3a → C3b → C3c train | C3a's mechanical Core constructor work may be prepared while the frontend worker finishes C2b/C2c; backend symbol-plan fixtures may proceed in separate files | Every authored binding/use reaches Core by globally unique ID, lowering's local scope walk disappears, and only enumerated synthetic sites remain pending |
 | D3 — strict synthetic identity | Land C4a's persistent allocator/state API, then integrate match/simple synthetics as the first producer pilot | After C4a freezes the mint/remap API, the producer families may be developed in parallel: match/simple synthetics; inlining/SSA/tail; mono/specialization/synthesis; closure/Perceus. Rebase, measure, and merge one family at a time | Each merge expands strict invariant coverage; final D3 has zero pending identities and a mandatory `ResolvedValueId` |
 | D4 — ID-only Core consumers | Establish C5b's raw-identical symbol-plan seam first. Land C7a's shared final-preparation/cancellation/projection seam before branching the other C7 consumers | From C5b, backend C5c/C6x is one lane. After C7a, closure C7b, Perceus/reuse/DCE C7c, and match/tail/specialization/mono C7d may use separate workers with explicit file ownership. Serialize merges where backend files overlap | Every merge removes a name-keyed hot path or renderer policy. Final D4 has zero semantic reads of legacy `CoreVar` fields |
 | D5 — representation payoff | C8 alone owns the Core variable representation flag day | Workers may prepare C9 diagnostic/formatter fixtures and disjoint C10x family censuses, but do not edit `CoreVar` concurrently | `CoreVar` and its managed string disappear; the expected Core allocation/ARC reduction becomes measurable |
 | D6 — move the frontier backward | Land C9's resolved typed-frontend view, freeze the common C10x schema, then integrate one family per merge | Named types, fields/constructors, traits, and imports may be developed in parallel only with disjoint source ownership; each rebases and measures before its serialized merge | Each family removes per-occurrence strings and string-keyed semantic indexes from an earlier phase |
 | D7 — one spelling authority | Land C11a source-name consolidation, then C11b makes the ratchet strict | Formatter/LSP validation and hygiene-fixture work may be prepared in parallel; the source-name authority itself has one owner | One documented spelling projection, zero migrated semantic-string violations, exact formatter/diagnostic/LSP behavior |
 
-D1 should be the first production delivery, not merely “types exist.” D2 is
-the first end-to-end spine delivery. D3 and D4 are where multiple agents can
-produce independent, measurable wins continuously instead of waiting for one
-large Core rewrite.
+D1p lands before the definition authority switch. D1a is not merged alone;
+D1b establishes the North Star authority: discovery defines source entities
+and later phases add facts. D1c is the first local end-to-end proof. D2
+completes authored-local coverage. D3 and D4 are where multiple agents can produce independent,
+measurable wins continuously instead of waiting for one large Core rewrite.
+
+#### Rejected D1 pre-resolver implementation
+
+The first D1 implementation (`8a83107dd`, measured after rebasing its full
+train onto `99d074858`) built `ResolvedBodyNames` before inference for every
+function/global body. Generated C and correctness gates were identical, but
+versus current main it added 4,031,967 typed-frontend allocations (+18.55%),
+4,056,971 total allocations (+2.10%), and 2.59% retired instructions. A commit
+bisect isolated 3,704,510 of those typed-frontend allocations to activating
+the resolver in `8a83107dd`; later graph retention added none.
+
+The mechanism was transient work, not retained facts or COW bytes: each body
+paid a syntax census, a semantic work-tape traversal, and a freeze before the
+normal inference traversal. The resolver-only 0/1/40-binder fixture measured
+27/56/182 allocations. This implementation is rejected, not waiting for a
+looser threshold. Do not split out its unused tables: the roadmap's active
+consumer rule forbids that. C2 now mints the same global identity at the
+existing inference binding/lookup boundary, and normalized publication is a
+separate graph-wide/batch decision made only when a paying consumer exists.
+
+#### Rejected D1 parallel-typed-variant implementation
+
+The replacement avoided the prewalk and minted complete owner/domain/site IDs
+at binder admission, but represented migrated names, assignments, and
+declarations as three new `TypedExpr` variants beside the legacy variants.
+Even before broad validation, the narrow parameter/straight-binding slice had
+grown to 1,035 insertions and 75 deletions across 13 production/test files.
+Every typed traversal, CTFE adapter, JSON renderer, inventory, semantic-site
+collector, and lowering match needed duplicate arms. The candidate compiler
+then failed a basic test with an unsupported Core-lowering shape despite all
+edited modules source-checking.
+
+That branch is rejected. Do not repair it into production. C2a must first
+probe representations that extend the existing narrow payload or replace its
+positional fields with one small record. The representation is accepted only
+if it preserves the complete ID, avoids per-node boxing, and does not create a
+second semantic arm in every traversal. If no carrier meets the performance
+and edit-surface limits, stop after D1b rather than forcing local propagation.
 
 ### Parallel execution rules
 
@@ -995,14 +1235,136 @@ do not become strict zero requirements until C11b.
 
 ### A1. Define the identity types and catalog ownership
 
-**Purpose.** Establish one vocabulary before adding more integer fields.
+**Purpose.** Establish discovery as the identity authority before adding more
+integer fields or migrating local uses.
 
-**Change.** Introduce `DefinitionValueId`/`ResolvedValueId` constructors and
-equality in a phase-neutral identity module. Reuse the existing `ModuleTable`,
-`SourceNameTable`, and `DefinitionTable`; do not build replacement copies.
-Define the generated-definition overlay and binding-display catalog, but
-publish authored rows only once per body batch and generated rows only through
-the shared minting API.
+**C1p1/C1p2 — preserve output while identity changes.** The current
+`def_id` is both semantic identity and an observable output ordinal. Stage 10
+uses it for symbols, ordering/binning, comments, symbol maps, and profile
+correlation; Stage 8/9 advance the same `next_def_id` for generated
+definitions. Discovery source order cannot replace that number without
+changing raw C and every later generated ID.
+
+C1p1 introduces a checked scalar `EmissionCompatibilityId` at Core
+declaration/program and backend candidate boundaries. Semantic maps remain
+keyed by semantic ID; only output spelling/order/correlation reads the
+compatibility ID. Initially both numbers are equal, and the cut deletes direct
+output interpretation of semantic `def_id` at each migrated site. Do not add
+the carrier to `CoreVar`, `CoreExpr`, or recursive lowering/pass contexts.
+There is no public raw-`Int` constructor: existing declarations project from a
+checked `DefinitionId`, and C1p2's private emission-frontier mint is the only
+other issuer. Do not add the field to globals or other declarations without a
+named output consumer. Internal profile selection remains semantic-ID keyed;
+only serialized/emitted numeric correlation uses the compatibility ID.
+
+C1p2 replaces the single generated-definition frontier with
+`next_semantic_definition_id` and `next_emission_compatibility_id`. Every
+Stage 8/9 mint consumes both exactly once; initially they advance in lockstep.
+The cuts land before the C1b authority switch and require byte-identical C,
+symbol maps, comments, split ordering, and profile metadata. Stop if
+compatibility IDs enter semantic equality, lookup, dispatch, or diagnostics,
+or if any generated producer can advance only one frontier.
+
+```blorp
+-- Semantic lookup remains keyed by DefinitionId.
+candidate ?= callable_candidate_by_definition_id(plan, semantic_id)
+
+-- Only rendering/ordering observes the compatibility number.
+symbol = projected_callable_base_symbol(candidate.emission_compatibility_id)
+
+-- A generated declaration consumes both authorities atomically.
+(identity, emission, next_identity_state) ?= mint_generated_definition(
+	identity_state,
+)
+```
+
+`CoreFunction` and only declarations with a named output-number consumer carry
+the compatibility value. Do not add it to `CoreGlobal`, `CoreVar`, or another
+hot value merely for symmetry. A stored constructor `c_name` should be reused
+instead of reconstructed from either ID when it is already the output
+authority.
+
+**C1a — discovery issuance.** Move the final-form `DefinitionId` primitive to
+a phase-neutral module that Stage 4 may own and Stage 6 may import. Do not
+invent a transitional `DiscoveredDefinitionId` that later needs translation.
+Extend the existing finalized-program/module-surface walk to publish an ordered
+source-definition skeleton stream, then build one normalized discovery catalog:
+
+```text
+DiscoveredDefinition(definition_id PK, module_id FK, kind,
+                     owner_definition_id nullable, source_locator, spelling)
+```
+
+The minimum closed source family is every public/private function and foreign
+function, union plus constructor, record plus field, builtin/type alias, trait
+plus trait method, implementation owner plus explicit method, and global.
+Inherited default-method projections are semantic/generated entities and are
+deferred to the post-discovery allocator; local binders, name sites, and Core
+synthetics are likewise deferred. Do not add a second parsed-AST walk merely
+to fill the catalog. Catalog order is deterministic canonical-module/source
+order;
+`definition_id` is semantic identity and never a row index contract. Import
+edge duplication or traversal scheduling cannot change it. This cut adds no
+body walk and makes no typed/Core change.
+
+**C1b — Stage 6 adoption.** Stage 6 consumes the discovery-issued catalog and
+attaches type, callable, trait, implementation, and completion facts to those
+exact IDs. Delete the graph-time source-definition mint/enumeration path in
+the same train. Reserved builtins and post-frontend generated definitions keep
+explicit disjoint authorities; standalone compilation must retain its own
+artifact-local discovery catalog rather than fabricate a raw integer.
+
+The current graph-assigned numeric `def_id` may remain temporarily only as an
+explicitly named compatibility number for byte-identical emitted C. It is not
+a second semantic identity and no new consumer may branch, hash, or resolve by
+it. C1b must either rename/isolate that seam or stop; an undocumented mapping
+between two apparent `DefinitionId` authorities is not acceptable. Later
+symbol projection removes the compatibility number.
+
+Implement C1b as three reviewable steps and one authority-switch landing:
+
+1. **Catalog adoption.** `indexed_graph_from_loaded_modules` receives the
+   discovery catalog and builds derived name/span indexes over its IDs. Delete
+   source-row allocation from `definition_index_for_loaded_modules`,
+   `definition_rows_for_decl`, and the reserved-graph mutation path.
+2. **Direct header adoption.** Declaration skeletons and type/callable/trait/
+   implementation header builders consume catalog locators, owner/child
+   relationships, and IDs. Delete re-finds that reconstruct constructor,
+   field, method, or implementation ownership by name/span.
+3. **Authority API split.** Reserved graph scopes can only adopt/validate a
+   catalog ID. Standalone compilation owns a small artifact-local catalog
+   builder; callers cannot provide a raw integer. Inherited default-method
+   projections use the checked post-discovery generator.
+
+```blorp
+-- Before: Stage 6 walks declarations and allocates source identity again.
+index = definition_index_for_loaded_modules(seed, module_table, programs)
+
+-- After: discovery identity is borrowed; Stage 6 builds only derived facts.
+index ?= definition_index_from_source_catalog(
+	frontend_graph_definition_catalog(graph),
+	frontend_graph_module_table(graph),
+)
+```
+
+Do not retain the old enumerator as a permanent shadow verifier. Transition
+tests may compare the legacy emission-number projection, then the duplicate
+source authority is deleted before landing.
+
+C1a is reviewable alone but C1a/C1b lands atomically. Its acceptance oracle is
+not merely that both tables agree: after C1b there is one source-definition
+authority. Existing `ModuleTable` and spelling storage are borrowed or moved,
+not copied into a parallel catalog. Generated C, diagnostics, definition-ID
+ordering, and import behavior remain exact; discovery plus typed-frontend
+allocations/instructions are flat or better within the series budget.
+
+Only after C1b freezes owner identity does C2 introduce checked
+`DefinitionValueId`/`ResolvedValueId` constructors. The generated-definition
+overlay and binding-display catalog remain later products and are created only
+with paying consumers.
+
+After authored and synthetic values begin crossing into Core, the logical
+Core identity state is:
 
 The logical Core identity state is explicit from the start:
 
@@ -1012,7 +1374,7 @@ record CoreIdentityState {
 	authored: AuthoredIdentityFacts,
 	first_managed_definition_id: Int,
 	next_definition_id: Int,
-	next_local_ordinal_by_definition: List[Int],
+	next_synthetic_key_by_definition: List[Int],
 	generated_definition_displays: List[GeneratedDefinitionDisplayFacts],
 	synthetic_binding_displays: CoreBindingDisplayCatalog
 }
@@ -1030,13 +1392,14 @@ The graph allocator is monotonic, so a row index is
 `definition_id - first_managed_definition_id`. C0a adds an invariant that all
 graph and later Core definition IDs form this contiguous range. A row for a
 non-body definition stores zero and rejects local minting; an executable body
-stores one past its highest local ordinal. If the invariant exposes a genuinely
+stores its next synthetic-domain key. Authored keys do not advance this
+frontier because their domain is disjoint. If the invariant exposes a genuinely
 sparse producer, stop and use an explicit dense definition-ID-to-row map; never
 allocate a list up to a sparse maximum.
 
 A1 defines the state and lookup rules, but does not yet put the managed value
-on every recursive helper. A3 initializes the ordinal column from
-`TypecheckedGraph.authored_identity_facts`. A4 makes `CorePassState.identity`
+on every recursive helper. A3 initializes the synthetic-key column for each
+executable owner. A4 makes `CorePassState.identity`
 the sole owner, replaces
 `next_def_id`, and updates every state-reconstruction adapter and early/late
 handoff to carry the complete identity state.
@@ -1079,69 +1442,78 @@ allocations by more than 0.5%.
 
 **Purpose.** Stop asking later consumers to reproduce lexical resolution.
 
-**Boundary.** Run a pure body resolver after graph definition IDs exist and
-immediately before inference consumes a body. It assigns local ordinals in a
-deterministic walk and publishes a use-site resolution table. The same landed
-cut makes inference consume that table for the supported binder family and
-deletes the corresponding name-based local lookup. Never land a complete,
-unused second resolver.
+**Boundary.** Reuse the existing inference walk. Graph body planning supplies
+the checked owning `DefinitionValueId` by borrow. Each binder-admission helper
+mints `ResolvedValueId(owner, AuthoredLocalValueDomain, binder_site_key)` and
+stores it beside the `VarSymbol`. Existing lexical lookup remains the one
+authority for shadowing and semantic binder decisions; when it selects a
+variable, inference copies that binder's complete ID to the typed name or
+assignment target. It must never derive a target from the use token.
 
-The required product is the normalized `ResolvedBodyNames` schema in the C2a
-handoff above: binding, use-site, and local-target tables are separate; hot
-accessors use their derived indexes; and `InferBodyFacts` supplies the source
-table/definition authority by borrow. Do not replace it with a dictionary from
-location directly to a materialized symbol or display row.
+This is deliberately not a pre-inference resolver. Do not add a syntax census,
+work tape, per-body `current_by_name`, or freeze step. Those duplicate the
+normal inference traversal and were measured as an unacceptable regression.
+Do not put growing identity columns into threaded `InferContext` either: under
+Blorp's value semantics that turns the fix into repeated COW. The hot path
+carries only fixed-layout scalar identity on the relevant symbol/node.
 
-The resolver assigns a dense body-local `ResolvedNameSiteId` in deterministic
-source-walk order. `ParsedIdentifier.span` is the exact authored token extent
-and becomes a column of the site table, not the semantic key. A derived
-`site_by_location_raw` index is valid only because C0a asserts authored identifier
-locations are unique within the body and excludes compiler-prelude/recovery
-identifiers from publication. If a legal authored construct violates that
-invariant, change the derived ingress index explicitly; do not disambiguate by
-spelling, pointer identity, or an undocumented “first match.” The site ID
-remains body-local, so any retained reference is paired with its body artifact
-and cannot collide with an equal singleton-file `SourceLocation` elsewhere.
+The authored binder-site constructor is private to the identity authority. It
+validates a real authored `SourceLocation`, obtains its scalar identity key,
+and combines that key with the checked body owner and authored domain. A
+recovery/compiler-prelude binder that cannot prove those inputs stays on the
+explicit legacy path; it never fabricates an ID. Refinement of an existing
+binding preserves its ID. Shadowing mints the new binder's ID.
 
-The resolver owns one unshared builder with `current_by_name` and an undo log:
+Normalized tables remain the target representation when publication has a
+paying consumer:
 
 ```text
-enter binder: save the previous value for its spelling, then set the new ID
-resolve use:  one current_by_name lookup
-exit scope:   replay the scope's undo entries in reverse
+NameUseSite(name_site_id PK, location)
+ResolvedValueUse(name_site_id PK/FK, value_id FK)
+AuthoredBindingDisplay(value_id PK/FK, source_name_id FK, location)
 ```
 
-Until A11, `current_by_name` is the final string-keyed lexical boundary. Local
-mutation keeps the dictionary unique; snapshots are forbidden. This gives one
-expected-constant-time lookup and one push/pop per local occurrence, rather
-than a scope-chain walk. Counters report lookups, updates, undo entries, and
-unexpected COW copies. A non-local use continues to existing
-definition/import resolution, which writes a definition-valued
-`ResolvedValueId` after canonical selection.
+Build these as graph-wide or batch parallel columns after typed bodies exist,
+so list/dictionary capacity is amortized across bodies. `EntityRowId` is the
+dense row key. It is never the `ResolvedValueId`, and table construction may
+not be required merely to carry identity into Core. A first publication cut
+must name its consumer and measure the extra traversal/construction cost.
 
-**Scope limit.** C2a's resolver walk enumerates every lexical binder and assigns
-every authored binder/use its final ID. Parameters and straight bindings switch
-their inference reads in the same commit. Uses belonging to later binder
-families are explicitly `LegacyConsumerLocalBodyNameUse`, with an exact local
-target, until their consumer changes land. C2b switches lambda, block, and loop
-consumers. C2c switches ordinary match patterns, question-bind, select,
-concurrent, and with/resource consumers, then deletes the transitional variant
-and legacy-local path. Each cut reduces the ratchet for its family and deletes
-its old lexical lookup. Do not rewrite unrelated inference state.
+**Scope limit.** C2a migrates exactly one complete binder family, selected by
+the carrier probe: either named function parameters or ordinary straight
+let/var bindings. It includes every use/assignment shape needed to remove one
+Stage 8 lookup for that family. Do not combine both merely to amortize gate
+time. The next small cut migrates the other family only after C2a is accepted.
+C2b then switches lambda parameters, tuple destructures, blocks, and loop
+binders. C2c switches ordinary match patterns,
+question-bind, select, concurrent, and with/resource binders. Each cut mints
+the binder and switches its uses atomically, reduces the legacy lowering
+fallback ratchet, and preserves the exact existing lexical semantics. After
+C2c, delete the lowering scope/name walk. Do not build display catalogs or
+rewrite unrelated inference state in these cuts.
+
+Before C2a production edits, compare extending the existing narrow typed
+payload with a fixed-layout explicit legacy/issued identity against replacing
+its positional fields with one narrow record. Reject `Option` or union payload
+boxing in generated C. A side table is eligible only if it is populated during
+the existing inference traversal without a growing COW accumulator. Parallel
+legacy/resolved `TypedExpr` variants are prohibited by the rejected D1 result.
 
 **Tests.** One fixture per binder form; shadowing across every scope boundary;
 same name in sibling arms; use-before-binding behavior; exact existing error
 messages for unknown names; deterministic IDs on two identical runs.
 
-**Fast loop.** A resolver-only fixture or body-check worker, then
+**Fast loop.** Run focused Env/inference/lowering fixtures, then
 `scripts/compiler-check --stage typecheck`. Use `--stop-after=lower` for the
-first self-compile comparison.
+first self-compile comparison. Count direct-ID lowering sites and legacy local
+fallback scans; the direct count must increase and the fallback count must
+fall for the migrated family.
 
-**Oracle.** Typed output and lowered Core are byte-identical. Resolver work is
-linear in parsed nodes in expected hash-table cost; the measured counters are
-bounded by a constant multiple of identifier sites. The new table is built
-once per body, inference is its active consumer, and no body node stores a new
-`String`.
+**Oracle.** Generated C, diagnostics, and formatter output are byte-identical.
+No migrated use performs a second spelling lookup in lowering. The cut adds no
+per-use `Option`, tuple, record, or collection allocation; total allocations
+and retired instructions remain within 0.5%, with a preferred measurable
+reduction in `core_lowering_complete` work.
 
 ### A3. Propagate the thin ID spine through typed AST and lowering
 
@@ -1182,7 +1554,8 @@ enum TransitionalValueIdentityState:
 struct TransitionalValueIdentity {
 	state: TransitionalValueIdentityState,
 	owner_definition_id_raw: Int,
-	local_ordinal: Int
+	domain_raw: Int,
+	key: Int
 }
 
 record CoreVar {
@@ -1194,8 +1567,8 @@ record CoreVar {
 ```
 
 Private smart constructors are the only way to create this struct. A resolved
-constructor requires `DefinitionValueId` plus a valid ordinal and stores their
-raw fixed-layout fields. A pending constructor initializes named private
+constructor requires a checked `ResolvedValueId` and stores its three raw
+fixed-layout fields. A pending constructor initializes named private
 placeholder constants. C3a updates every existing constructor to pending;
 C3c switches authored/definition-valued sites, after which only legacy
 synthetic constructors on the C4 producer census may call it. Consumers must match `state` before reading the scalar fields;
@@ -1212,8 +1585,8 @@ until A8; no semantic code added after C3c may consult them.
 Before the first module is lowered, graph preparation initializes a uniquely
 owned `CoreIdentityBuildState` from the frozen `DefinitionTable` and
 `TypecheckedGraph.authored_identity_facts`: record the table's first ID/range,
-borrow the already-published authored binding display catalog, and fill each
-local-ordinal frontier from its canonical rows. Do not retain or rescan
+borrow the already-published authored binding display catalog, and initialize
+each owner's synthetic-key frontier from its canonical rows. Do not retain or rescan
 body-local `ResolvedBodyNames`. Keep that builder at the
 module/declaration orchestration loop; do **not** put the full managed state in
 `CoreLowerContext`, which is passed through recursive expression lowering.
@@ -1277,7 +1650,7 @@ names.
 
 **Important.** This cut should remove lowering's repeated local scope walk. It
 must not add a second name-to-ID dictionary in lowering. The resolver table is
-the authority.
+not the authority: the `ResolvedValueId` already carried by the typed node is.
 
 **Tests.** Lowering tests cover every typed binder shape, unresolved/recovery
 nodes, graph-backed and standalone lowering, and conflicting definition IDs.
@@ -1294,7 +1667,7 @@ match the parent dump, and separately validates every candidate identity tag,
 pair, pending/resolved census, and candidate JSON round trip. It must reject a
 missing/duplicated variable, changed legacy field, malformed identity, or any
 non-identity structural change. Resolved
-variables include `owner_definition_id` and `local_ordinal`; pending synthetic
+variables include `owner_definition_id`, `domain`, and `key`; pending synthetic
 variables include only the pending tag and retain the existing legacy fields.
 The decoder reconstructs the same tagged state, so round trips do not silently
 lose identity. C4c moves to the final required-identity schema once the pending
@@ -1317,11 +1690,11 @@ reduction in lowering work.
 IDs exclusively.
 
 **Change.** Make `CorePassState.identity: CoreIdentityState` the persistent
-authority. A3 initializes `next_local_ordinal_by_definition` once from the
-resolved authored bodies: each executable definition row contains one past its
-greatest authored ordinal, non-body rows contain zero, and generated rows are
-initialized from `GeneratedDefinitionKind`: an executable owner starts at one,
-while a non-body runtime value starts at zero and rejects `mint_local_value`.
+authority. A3 initializes `next_synthetic_key_by_definition`: each executable
+definition starts its disjoint synthetic domain at one, non-body rows contain
+zero, and generated rows are initialized from `GeneratedDefinitionKind`.
+Authored source-site keys never affect this frontier. A non-body runtime value
+rejects `mint_local_value`.
 The state owns `next_definition_id`; remove the parallel
 `CorePassState.next_def_id` field.
 
@@ -1338,8 +1711,8 @@ state_with_program(state, program) -> state
 ```
 
 The first operation consumes the definition frontier and appends the generated
-display and local-frontier rows atomically. The second validates an executable
-owner, consumes that owner's ordinal, and appends the binding display row
+display and synthetic-frontier rows atomically. The second validates an executable
+owner, consumes that owner's synthetic-domain key, and appends the binding display row
 atomically. Helpers may own and update the state locally while rewriting a
 body, but must return the full state; a pass-local counter is never an
 independent authority.
@@ -1348,8 +1721,8 @@ Classify constructors into three operations:
 
 ```text
 preserve(var)                 same semantic binding, same ID
-freshen_within(owner, var)    copied/new binding in same function, new ordinal
-rehome(new_owner, var)        cloned/extracted function, new owner and ordinal map
+freshen_within(owner, var)    copied/new binding in same function, new synthetic key
+rehome(new_owner, var)        cloned/extracted function, new owner and key map
 ```
 
 Cloning is driven by binder introduction, not by rewriting every matching
@@ -1384,7 +1757,7 @@ the appropriate preserve/remap operation. When the pending census reaches
 zero, replace `TransitionalValueIdentity` with required `ResolvedValueId` on
 `CoreVar`; keep `name`/`id`/`def_id` only for the A7 compatibility consumers.
 At that same zero-pending gate, version Core JSON from the transitional tagged
-form to the final required numeric pair. No later stage may construct or decode
+form to the final required fixed-layout identity. No later stage may construct or decode
 a pending identity.
 
 Upgrade the current report-only identity check to validate exact
@@ -1393,11 +1766,11 @@ owning tests first, then make strict validation the default once the frozen
 self-compile reports zero violations after every pass.
 
 **Tests.** Per-pass clone/freshen cases, two clones of one function, repeated
-synthetic construction in one owner, closure extraction, same local ordinal
+synthetic construction in one owner, closure extraction, same authored key
 under two different owners, free-variable preservation, capture-slot
 distinction, recursive clone retargeting, and missing display row. Add one
 pipeline test in which two separate passes mint binders in the same original
-function; the second pass must receive a higher ordinal without a rescan. Add a
+function; the second pass must receive a higher synthetic key without a rescan. Add a
 second test where the first pass creates a definition and the later pass adds a
 binder to it, proving that both overlay rows survived the handoff.
 
@@ -1413,7 +1786,8 @@ right-to-left.
 
 Before touching emission, extend
 `benchmarks/normalize_generated_c_symbols` to canonicalize the complete old
-and proposed local-identifier families, including `brp_v<owner>_<ordinal>`.
+and proposed local-identifier families, including authored
+`brp_v<owner>_a<key>` and synthetic `brp_v<owner>_s<key>` forms.
 Retain paired fixtures where old and new spellings normalize identically and
 where a collision, missing occurrence, declaration/reference mismatch, or
 structural C change does not. The tool must prove a one-to-one renaming; a
@@ -1425,7 +1799,8 @@ globals and locals:
 ```text
 callable definition          brp_f<definition-id>
 global value                 brp_g<definition-id>
-local binding                brp_v<owner-definition-id>_<local-ordinal>
+authored local binding       brp_v<owner-definition-id>_a<authored-site-key>
+synthetic local binding      brp_v<owner-definition-id>_s<synthetic-key>
 ```
 
 Named C types, fields, and layout members remain A10 work even when their IDs
@@ -1630,8 +2005,8 @@ Dictionary-to-dense-list conversion is a separate measured choice. Integer
 keys remove hashing/string equality, but dictionary probes do not allocate.
 Use a dense list only when IDs are compact in that consumer and the required
 capacity does not dominate. Otherwise use the exact typed-ID key if the
-standard dictionary supports it, or a two-level owner-ID/local-ordinal table;
-do not flatten the pair into a magic integer.
+standard dictionary supports it, or a nested owner/domain/key index;
+do not flatten owner/domain/key into a magic integer.
 
 **Oracle.** Byte-identical C. A changed answer should be retained only when a
 test proves the old name-based result was incorrect. Report phase rows and
@@ -1990,8 +2365,12 @@ the practical branch and merge schedule.
 ```text
 tooling: C0a/C0b/C5a --------------------------------------------+
                                                                   |
-C1a -> C1b frontend probe -> C2a -> C2b -> C2c                    |
-                                  -> [C3a -> C3b -> C3c] -> C4a   |
+C1p1 output carrier -> C1p2 dual generated frontiers -------------+
+                                                                  |
+C1a discovery issuer ---------------------------------------------+
+                 -> C1b Stage-6 adoption -> C2a carrier pilot     |
+                                                -> C2b -> C2c     |
+                                                -> [C3a -> C3b -> C3c] -> C4a
                                                       |           |
                           +---------------------------+-----------+
                           v
@@ -2011,11 +2390,16 @@ C1a -> C1b frontend probe -> C2a -> C2b -> C2c                    |
 ```
 
 - C0a, C0b, and C5a are independent tooling/test cuts and should land early.
-- C1a freezes the checked identity vocabulary before consumer workers branch,
-  but merges only as part of the C1a/C2a train. C1b is a hard probe gate, not a
-  standalone production landing: select its frontend carrier before C2a edits
-  Env/catalog storage, land that carrier with C2a, and land its separately
-  measured Core half with C3c.
+- C1p1 and C1p2 are sequential prerequisites for C1b. They may develop while
+  C1a is in progress because they own Stage 8-10 rather than discovery, but
+  all compiled gates and measurements remain serialized.
+- C1a owns discovery issuance and the common source-definition catalog. C1b
+  may audit in parallel but cannot implement against an unfrozen API. C1a is a
+  review checkpoint; C1a/C1b merges as one production delivery after the old
+  graph-time authority is deleted.
+- C2a begins only from the green C1a/C1b checkpoint. Its carrier probe may run
+  earlier, but no production typed representation is chosen until the body
+  owner ID and provenance contract are final.
 - C2a/C2b/C2c may be investigated in parallel by binder family, but they share
   the frontend resolver/environment authority and normally integrate in order.
 - C3a/C3b/C3c are one short train. Do not interleave unrelated compiler
@@ -2047,17 +2431,19 @@ architecture; the D0-D7 table defines practical merge order. A row may be
 split further after its census, but adjacent rows should not be combined
 merely to save gate time. C1a and C3a/C3b are the exceptions to independent
 landing: retain them as reviewable commits, but apply the landing criteria and
-ratchet only at the C2a and C3c endpoints of their atomic trains.
+ratchet only at the C1b and C3c endpoints of their atomic trains.
 
 | Cut | Primary source boundary | Required result before landing |
 | --- | --- | --- |
 | C0a | new `scripts/compiler-identity-census`, Core/backend allowlist | stable text/JSON census and baseline ratchet budgets with zero production behavior change |
 | C0b | debug counters near `core_var_equal`, scope lookup, construction, display reads | disabled build is byte/allocation-identical; retained baseline artifacts |
-| C1a | `stage_06_typecheck/graph/definition_index.brp` plus new `stage_06_typecheck/graph/resolved_value_identity.brp` | phase-neutral checked `DefinitionValueId`/`ResolvedValueId`; illegal row-kind tests |
-| C1b | representation probes for stage-6 authored facts/Env projection and stage-9 identity catalogs | frontend carrier selected before C2a production edits; no upstream Core import; physical layouts backed by generated C, fresh/seeded allocation counts, and surprising-COW stop rule; production frontend/Core halves land with C2a and C3c respectively |
-| C2a | body resolver, `source.brp` scalar location-key projection, `decl.brp` accepted/recovered function artifacts plus completed-global artifacts/reuse, and `type_system/env.brp`/`infer.brp` parameter and straight-let paths | inference actively consumes IDs; fresh/seeded function and global paths publish identical canonical body facts in definition order; exact bind/refine/pop undo tests pass; no struct-key hashing is introduced; replaced name lookup deleted |
-| C2b | lambda, block, and loop binder environment/inference consumers | their preassigned IDs become active; mixed shadowing is exact; each family's `legacy_local_name_use_sites` row reaches zero; resolver cardinality/order is unchanged |
-| C2c | match, question-bind, select, concurrent, and resource binder consumers | all remaining preassigned IDs become active; the legacy-local ratchet reaches zero; the transitional variant/path is deleted; existing diagnostics remain exact |
+| C1p1 | Stage 8 declaration handoff, Stage 9 declaration/program representation, Stage 10 symbol projection/emission/order/metadata | checked output-only compatibility ID initially equals semantic ID; all output ordinal reads switch; semantic maps remain semantic-ID keyed; raw C and metadata identical |
+| C1p2 | Stage 8/9 identity state and every generated-definition mint site | independent semantic/emission frontiers advance exactly once per generated definition; initially lockstep; raw C identical; no recursive carrier traffic |
+| C1a | phase-neutral identity primitive, full ordered source-definition skeletons in `stage_04_modules/module_surface.brp`, `frontend_graph.brp`, and focused discovery tests | discovery-issued normalized catalog for the complete source-definition family; deterministic global IDs; generated/default/local/synthetic census explicit; no body/typed/Core work |
+| C1b | Stage 6 definition index, indexed graph, prepared module scopes, and header builders | every source-declared definition adopts its discovery ID; graph-time re-mint/enumeration is deleted; reserved/generated/standalone authorities remain explicit; C1a/C1b lands atomically |
+| C2a | carrier representation probe, `type_system/env.brp`, one complete inference binder family, its existing typed payloads, and Stage 8 lowering | complete owner/domain/site identity reaches lowering without parallel typed variants, boxing, prewalk, or growing threaded state; one lowering lookup is deleted; other families remain explicit compatibility cases |
+| C2b | remaining straight/parameter family, then lambda, block, and loop binder environment/inference consumers | each binder mints at admission and its selected uses carry the same ID; mixed shadowing is exact; each family's legacy lowering row reaches zero |
+| C2c | match, question-bind, select, concurrent, and resource binder consumers | all remaining authored binders mint/carry IDs; the legacy-local lowering ratchet reaches zero; the transitional path is deleted; existing diagnostics remain exact |
 | C3a | `stage_09_core/ir.brp`, every current `CoreVar` constructor from the C0a census, Core JSON tests, and `benchmarks/compare_core_identity_transition` | tagged inline transition compiles; all constructors pending; tested parent/candidate projection and transitional JSON round-trip pass; no consumer switch |
 | C3b | typed binder/use records in `stage_06_typecheck/` | every successful local inference result exposes `ResolvedValueId` |
 | C3c | `stage_08_core_lower/lower.brp` and `graph_prepare.brp` | orchestration-owned builder; authored/definition sites resolved; recursive context remains a reader; lowering scope lookup deleted; only enumerated C4 producer sites pending |
