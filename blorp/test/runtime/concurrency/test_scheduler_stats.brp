@@ -148,6 +148,99 @@ func stats_wait_for_no_tracked_active_tasks() -> Bool:
 	done
 
 
+--- Outcome of one nested-timeout run. A `concurrent(timeout: ...)` deadline
+--- starts when the block is entered, so a loaded scheduler can cancel the
+--- parent before its children run. That run cannot show that blocked children
+--- were cancelled, so it is inconclusive rather than a pass or a failure.
+--- Passed: the timeout cancelled every child while blocked and no tasks remain.
+--- Failed: the parent did not time out or tracked tasks outlived the timeout.
+--- ChildrenStartedLate: some child was not scheduled before the deadline.
+union NestedTimeoutAttempt:
+	NestedTimeoutPassed
+	NestedTimeoutFailed
+	NestedTimeoutChildrenStartedLate
+
+
+--- Counts start signals after the timed block has joined. Started children
+--- have already sent, so the wait only bounds the poll for children that the
+--- timeout cancelled before they ran.
+func stats_count_started_children(started: Channel[Int], child_count: Int) -> Int:
+	unstarted_child_poll_ms: Int = 20
+	var received: Int = 0
+	var polls: Int = 0
+
+	while polls < child_count:
+		if recv_timeout(started, unstarted_child_poll_ms) == Some(1):
+			received += 1
+
+		polls += 1
+
+	received
+
+
+--- Runs `parent` under one timeout. Timeout and cleanup failures are final;
+--- only a late child start is inconclusive.
+func stats_nested_timeout_attempt(
+	parent: (Channel[Int], Channel[Int]) -> Int,
+	child_count: Int,
+	timeout_ms: Int,
+) -> NestedTimeoutAttempt:
+	reset_scheduler_stats()
+	started: Channel[Int] = channel(child_count)
+	release: Channel[Int] = channel(1)
+
+	concurrent(timeout: timeout_ms):
+		outcome = parent(started, release)
+
+	timed_out: Bool = match outcome:
+		Err(_):
+			True
+		_:
+			False
+
+	started_children: Int = stats_count_started_children(started, child_count)
+	no_live_children: Bool = stats_wait_for_no_tracked_active_tasks()
+	seal(release)
+
+	if not timed_out or not no_live_children:
+		NestedTimeoutFailed
+	else if started_children == child_count:
+		NestedTimeoutPassed
+	else:
+		NestedTimeoutChildrenStartedLate
+
+
+--- Checks that a timeout on `parent` cancels the `child_count` children it
+--- spawns while they are blocked, and leaves no tracked active tasks. The first
+--- deadline is short to keep unloaded runs fast; it doubles after each run in
+--- which the children were not all scheduled before it fired.
+func stats_nested_timeout_cleans_children(
+	parent: (Channel[Int], Channel[Int]) -> Int,
+	child_count: Int,
+) -> Bool:
+	initial_timeout_ms: Int = 10
+	-- Eight attempts from 10 ms end at a 1280 ms deadline.
+	max_attempts: Int = 8
+	var timeout_ms: Int = initial_timeout_ms
+	var attempts: Int = 0
+	var decided: Bool = False
+	var passed: Bool = False
+
+	while attempts < max_attempts and not decided:
+		match stats_nested_timeout_attempt(parent, child_count, timeout_ms):
+			NestedTimeoutPassed:
+				decided = True
+				passed = True
+			NestedTimeoutFailed:
+				decided = True
+			NestedTimeoutChildrenStartedLate:
+				timeout_ms *= 2
+
+		attempts += 1
+
+	passed
+
+
 func result_value_or_zero(result: Result[Int, ConcurrencyError]) -> Int:
 	match result:
 		Ok(value):
@@ -412,44 +505,11 @@ func test_scheduler_stats_reset_preserves_gauges() -> Bool:
 
 
 func test_scheduler_stats_nested_timeout_cleans_child_tasks() -> Bool:
-	reset_scheduler_stats()
-	started: Channel[Int] = channel(1)
-	release: Channel[Int] = channel(1)
-
-	concurrent(timeout: 10):
-		parent = stats_nested_parent(started, release)
-
-	timed_out: Bool = match parent:
-		Err(_):
-			True
-		_:
-			False
-
-	child_started: Bool = recv_timeout(started, 20) == Some(1)
-	no_live_children: Bool = stats_wait_for_no_tracked_active_tasks()
-	seal(release)
-	timed_out and child_started and no_live_children
+	stats_nested_timeout_cleans_children(stats_nested_parent, 1)
 
 
 func test_scheduler_stats_nested_timeout_cleans_loop_tasks() -> Bool:
-	reset_scheduler_stats()
-	started: Channel[Int] = channel(2)
-	release: Channel[Int] = channel(1)
-
-	concurrent(timeout: 10):
-		parent = stats_nested_loop_parent(started, release)
-
-	timed_out: Bool = match parent:
-		Err(_):
-			True
-		_:
-			False
-
-	first_started: Bool = recv_timeout(started, 20) == Some(1)
-	second_started: Bool = recv_timeout(started, 20) == Some(1)
-	no_live_children: Bool = stats_wait_for_no_tracked_active_tasks()
-	seal(release)
-	timed_out and first_started and second_started and no_live_children
+	stats_nested_timeout_cleans_children(stats_nested_loop_parent, 2)
 
 
 func test_scheduler_stats_reset() -> Bool:
