@@ -9788,6 +9788,33 @@ static blorp_List* blorp_list_copy_with_capacity(blorp_List* src, long new_capac
     return list;
 }
 
+// Grow a uniquely owned list by moving its elements into a fresh allocation
+// with `new_capacity` slots, then free the old allocation.
+//
+// Why not copy_with_capacity + release: that pair retains every pointer
+// element for the copy and then releases every element again when the old
+// list's destructor runs, costing 2n atomic RC updates and n indirect release
+// calls per growth step for no change in ownership. Here the elements change
+// allocation but not owner, so nulling the old list's elem_release makes its
+// destructor skip them.
+//
+// The caller must hold the only reference to `list` (blorp_is_unique) and
+// `new_capacity` must be at least `list->len`.
+static blorp_List* blorp_list_move_to_capacity(blorp_List* list, long new_capacity) {
+    size_t stride = blorp_list_stride(list);
+    blorp_List* grown = (blorp_List*)blorp_alloc(blorp_checked_add(sizeof(blorp_List), blorp_checked_mul(new_capacity, stride)));
+    grown->len = list->len;
+    grown->capacity = new_capacity;
+    grown->elem_release = list->elem_release;
+    grown->elem_size = list->elem_size;
+    grown->storage_mode = list->storage_mode;
+    BLORP_SET_DESTRUCTOR(grown, blorp_list_destroy);
+    memcpy(grown->data, list->data, list->len * stride);
+    list->elem_release = NULL;
+    blorp_release(list);
+    return grown;
+}
+
 // Copy a borrowed source span into destination slots that have not been
 // initialized yet. Pointer-backed owning lists retain the copied elements;
 // inline storage can be copied as raw bytes because inline list elements are
@@ -9941,10 +9968,12 @@ blorp_List* blorp_list_cow(blorp_List* list) {
 // Returns a unique list with at least min_cap slots.
 blorp_List* blorp_list_ensure_capacity(blorp_List* list, long min_cap) {
     if (!list) return blorp_list_new(min_cap);
-    if (blorp_is_unique(list) && list->capacity >= min_cap) return list;
+    bool unique = blorp_is_unique(list);
+    if (unique && list->capacity >= min_cap) return list;
     long new_cap = list->capacity;
     if (new_cap < BLORP_LIST_DEFAULT_CAPACITY) new_cap = BLORP_LIST_DEFAULT_CAPACITY;
     while (new_cap < min_cap) new_cap *= 2;
+    if (unique) return blorp_list_move_to_capacity(list, new_cap);
     blorp_List* copy = blorp_list_copy_with_capacity(list, new_cap);
     blorp_release(list);
     return copy;
@@ -10111,21 +10140,7 @@ blorp_List* blorp_list_append(blorp_List* list, void* element) {
         blorp_release(list);
         list = copy;
     } else if (list->len >= list->capacity) {
-        // Unique but need more capacity - reallocate (transfer ownership, no element retain)
-        long new_cap = list->capacity * 2;
-        size_t stride = blorp_list_stride(list);
-        blorp_List* new_list = (blorp_List*)blorp_alloc(blorp_checked_add(sizeof(blorp_List), blorp_checked_mul(new_cap, stride)));
-        new_list->len = list->len;
-        new_list->capacity = new_cap;
-        new_list->elem_release = list->elem_release;
-        new_list->elem_size = list->elem_size;
-        new_list->storage_mode = list->storage_mode;
-        BLORP_SET_DESTRUCTOR(new_list, blorp_list_destroy);
-        memcpy(new_list->data, list->data, list->len * stride);
-        // Transfer ownership: suppress element release in old list's destructor
-        list->elem_release = NULL;
-        blorp_release(list);
-        list = new_list;
+        list = blorp_list_move_to_capacity(list, list->capacity * 2);
     }
     // Now list is unique and has capacity - safe to mutate in place
     if (list->storage_mode == BLORP_LIST_STORAGE_POINTER && list->elem_release && element) blorp_retain(element);
@@ -10147,19 +10162,7 @@ blorp_List* blorp_list_append_owned(blorp_List* list, void* element) {
         blorp_release(list);
         list = copy;
     } else if (list->len >= list->capacity) {
-        long new_cap = list->capacity * 2;
-        size_t stride = blorp_list_stride(list);
-        blorp_List* new_list = (blorp_List*)blorp_alloc(blorp_checked_add(sizeof(blorp_List), blorp_checked_mul(new_cap, stride)));
-        new_list->len = list->len;
-        new_list->capacity = new_cap;
-        new_list->elem_release = list->elem_release;
-        new_list->elem_size = list->elem_size;
-        new_list->storage_mode = list->storage_mode;
-        BLORP_SET_DESTRUCTOR(new_list, blorp_list_destroy);
-        memcpy(new_list->data, list->data, list->len * stride);
-        list->elem_release = NULL;
-        blorp_release(list);
-        list = new_list;
+        list = blorp_list_move_to_capacity(list, list->capacity * 2);
     }
     // No retain — ownership transferred from caller
     blorp_list_store_raw(list, list->len++, element);

@@ -1,0 +1,130 @@
+-- Growing a list past its capacity must keep each element owned exactly once
+-- per list that holds it.
+--
+-- A uniquely owned list moves its elements into the larger allocation, so the
+-- elements keep a single owner. A list shared with another binding is copied
+-- on write: the grown copy and the untouched original each own every shared
+-- element. Both shapes run under leak instrumentation (this file is owned by
+-- the leak gate), so an unbalanced move or copy shows up as a leak or a
+-- double release.
+import:
+	memory: is_unique, refcount
+	test: TestSuite
+
+
+record Label {
+	text: String,
+	index: Int
+}
+
+
+-- Enough elements to cross several capacity doublings from the default.
+private GROWN_LENGTH: Int = 100
+
+-- Elements appended before a snapshot shares the list.
+private SHARED_PREFIX_LENGTH: Int = 37
+
+
+private pure func grow_strings(start: Int, count: Int, values: List[String]) -> List[String]:
+	var grown: List[String] = values
+	var index: Int = start
+
+	while index < start + count:
+		grown = grown.append(to_string(index * 7))
+		index += 1
+
+	grown
+
+
+private pure func grow_labels(count: Int) -> List[Label]:
+	var grown: List[Label] = []
+	var index: Int = 0
+
+	while index < count:
+		grown = grown.append({
+			text = to_string(index),
+			index = index
+		})
+		index += 1
+
+	grown
+
+
+private pure func strings_match_from(values: List[String], start: Int, count: Int) -> Bool:
+	var matches: Bool = values.length() == start + count
+	var index: Int = 0
+
+	while index < start + count:
+		matches = matches and values.get_or(index, "") == to_string(index * 7)
+		index += 1
+
+	matches
+
+
+private pure func every_string_refcount(values: List[String], count: Int, expected: Int) -> Bool:
+	var matches: Bool = True
+	var index: Int = 0
+
+	for value in values:
+		if index < count:
+			matches = matches and refcount(value) == expected
+		index += 1
+
+	matches
+
+
+func test_unique_string_list_growth_keeps_single_owners() -> Bool:
+	values: List[String] = grow_strings(0, GROWN_LENGTH, [])
+
+	(
+		is_unique(values)
+		and strings_match_from(values, 0, GROWN_LENGTH)
+		and every_string_refcount(values, GROWN_LENGTH, 1)
+	)
+
+
+func test_unique_record_list_growth_keeps_contents() -> Bool:
+	labels: List[Label] = grow_labels(GROWN_LENGTH)
+	var matches: Bool = labels.length() == GROWN_LENGTH
+	var index: Int = 0
+
+	for label in labels:
+		matches = matches and label.index == index and label.text == to_string(index)
+		index += 1
+
+	is_unique(labels) and matches
+
+
+func test_shared_string_list_growth_copies_and_retains() -> Bool:
+	original: List[String] = grow_strings(0, SHARED_PREFIX_LENGTH, [])
+	grown: List[String] = grow_strings(
+		SHARED_PREFIX_LENGTH,
+		GROWN_LENGTH - SHARED_PREFIX_LENGTH,
+		original,
+	)
+
+	(
+		strings_match_from(original, 0, SHARED_PREFIX_LENGTH)
+		and strings_match_from(grown, 0, GROWN_LENGTH)
+		and every_string_refcount(original, SHARED_PREFIX_LENGTH, 2)
+		and every_string_refcount(grown, SHARED_PREFIX_LENGTH, 2)
+	)
+
+
+tests: TestSuite = {
+	description = "List growth element ownership",
+	tests = [
+		(
+			"unique string list growth keeps single owners",
+			test_unique_string_list_growth_keeps_single_owners,
+		),
+		(
+			"unique record list growth keeps contents",
+			test_unique_record_list_growth_keeps_contents,
+		),
+		(
+			"shared string list growth copies and retains",
+			test_shared_string_list_growth_copies_and_retains,
+		),
+	]
+}

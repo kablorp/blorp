@@ -110,6 +110,145 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_unique_list_growth_moves_elements_and_shared_growth_retains(self) -> None:
+        # Growing a uniquely owned list must move element ownership into the
+        # larger allocation: no element retain on copy and no element release
+        # when the old allocation dies. Growing a shared list is a real COW
+        # copy: every element gains an owner and the original keeps its own.
+        # The counting release hook observes the element releases that the old
+        # copy-then-release growth path performed.
+        source = textwrap.dedent(
+            """\
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            enum { ELEMENT_COUNT = 40 };
+            static long element_release_calls;
+
+            static void counting_element_release(void* element) {
+                element_release_calls++;
+                blorp_release(element);
+            }
+
+            static long element_refcount(void* element) {
+                return atomic_load(&((blorp_Object*)element)->refcount);
+            }
+
+            typedef blorp_List* (*grow_one)(blorp_List*, blorp_Object*);
+
+            static blorp_List* grow_by_ensure_capacity(blorp_List* list, blorp_Object* element) {
+                list = blorp_list_ensure_capacity(list, list->len + 1);
+                blorp_list_store_raw(list, list->len++, element);
+                return list;
+            }
+
+            static blorp_List* grow_by_append(blorp_List* list, blorp_Object* element) {
+                list = blorp_list_append(list, element);
+                blorp_release(element);
+                return list;
+            }
+
+            static blorp_List* grow_by_append_owned(blorp_List* list, blorp_Object* element) {
+                return blorp_list_append_owned(list, element);
+            }
+
+            static int check_unique_growth(grow_one grow, int failure_base) {
+                blorp_Object* elements[ELEMENT_COUNT];
+                blorp_List* values = blorp_list_new(1);
+                blorp_list_init_elem_release(values, counting_element_release);
+                element_release_calls = 0;
+                for (long index = 0; index < ELEMENT_COUNT; index++) {
+                    elements[index] = blorp_alloc(sizeof(blorp_Object));
+                    values = grow(values, elements[index]);
+                }
+                if (values->len != ELEMENT_COUNT || values->capacity < ELEMENT_COUNT) return failure_base + 1;
+                if (values->elem_release != counting_element_release) return failure_base + 2;
+                if (element_release_calls != 0) return failure_base + 3;
+                for (long index = 0; index < ELEMENT_COUNT; index++) {
+                    if (values->data[index] != elements[index]) return failure_base + 4;
+                    if (element_refcount(elements[index]) != 1) return failure_base + 5;
+                }
+                blorp_release(values);
+                if (element_release_calls != ELEMENT_COUNT) return failure_base + 6;
+                return 0;
+            }
+
+            static int check_shared_growth(void) {
+                blorp_Object* elements[ELEMENT_COUNT];
+                blorp_List* original = blorp_list_new(ELEMENT_COUNT);
+                blorp_list_init_elem_release(original, counting_element_release);
+                for (long index = 0; index < ELEMENT_COUNT; index++) {
+                    elements[index] = blorp_alloc(sizeof(blorp_Object));
+                    blorp_list_store_raw(original, original->len++, elements[index]);
+                }
+                element_release_calls = 0;
+                blorp_retain(original);
+                blorp_List* grown = blorp_list_ensure_capacity(original, ELEMENT_COUNT + 1);
+                if (grown == original || !blorp_is_unique(original)) return 101;
+                if (grown->len != ELEMENT_COUNT || grown->capacity <= ELEMENT_COUNT) return 102;
+                if (element_release_calls != 0) return 103;
+                for (long index = 0; index < ELEMENT_COUNT; index++) {
+                    if (grown->data[index] != elements[index]) return 104;
+                    if (original->data[index] != elements[index]) return 105;
+                    if (element_refcount(elements[index]) != 2) return 106;
+                }
+                blorp_release(grown);
+                if (element_release_calls != ELEMENT_COUNT) return 107;
+                for (long index = 0; index < ELEMENT_COUNT; index++) {
+                    if (element_refcount(elements[index]) != 1) return 108;
+                }
+                blorp_release(original);
+                if (element_release_calls != 2 * ELEMENT_COUNT) return 109;
+                return 0;
+            }
+
+            int main(void) {
+                int failure = check_unique_growth(grow_by_ensure_capacity, 10);
+                if (failure) return failure;
+                failure = check_unique_growth(grow_by_append, 20);
+                if (failure) return failure;
+                failure = check_unique_growth(grow_by_append_owned, 30);
+                if (failure) return failure;
+                return check_shared_growth();
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            executable = Path(temp_name) / "list-growth-ownership"
+            compiled = subprocess.run(
+                [
+                    os.environ.get("CC", "cc"),
+                    "-O2",
+                    "-w",
+                    "-DBLORP_MEMORY_DIAGNOSTICS=1",
+                    f"-I{ROOT / 'blorp' / 'src' / 'lib' / 'runtime' / 'native'}",
+                    "-x",
+                    "c",
+                    "-",
+                    "-lm",
+                    "-lpthread",
+                    "-o",
+                    str(executable),
+                ],
+                cwd=ROOT,
+                input=source,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            completed = subprocess.run(
+                [str(executable)],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_optimized_allocation_does_not_require_frame_pointers(self) -> None:
         source = textwrap.dedent(
             """\
