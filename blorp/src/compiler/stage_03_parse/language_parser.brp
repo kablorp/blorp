@@ -14,7 +14,16 @@ import:
 		source_locations_equal,
 		source_span,
 	../stage_02_lex/lexer: lex
-	../stage_02_lex/name_table: NameTable, name_table_empty
+	../stage_02_lex/name_table:
+		EMPTY_NAME_TABLE,
+		NameId,
+		NameTable,
+		SYNTHESIZED_NAME_TABLE,
+		name_id_from_interned_index,
+		name_id_pending_dynamic_intern,
+		name_ids_equal,
+		name_table_dict,
+		name_table_find_id,
 	../stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_error_expected
 	../stage_02_lex/token:
 		Keyword(
@@ -336,6 +345,20 @@ private pure func parsed_string_literal_form(kind: StringLiteralKind) -> ParsedS
 
 
 ---
+Where a `ParsedIdentifier`'s `NameId` comes from. A normal parse lexes against
+the compilation table, so an identifier token's payload already is its id.
+An interpolation hole is lexed against a private empty table (its
+identifiers sit inside a string token the compilation lexer never saw, and
+appending to the compilation table here would copy it), so its payloads mean
+nothing globally: `ResolveSpelling` looks each spelling up read-only in the
+compilation table and yields the pending id on a miss.
+---
+private union NameIdSource:
+	TokenPayloadIds
+	ResolveSpelling(NameTable)
+
+
+---
 Token storage as columns (struct of arrays) instead of a `List[Token]`
 (array of structs): reading one field of one token -- the common case,
 several times per parse decision -- is one scalar list index instead
@@ -354,7 +377,9 @@ private record ParserInput {
 	end_offsets: List[Int],
 	end_lines: List[Int],
 	end_columns: List[Int],
-	texts: List[String]
+	texts: List[String],
+	names: NameTable,
+	id_source: NameIdSource
 }
 
 
@@ -828,9 +853,11 @@ private pure func initial_state(
 	source: SourceFile,
 	tokens: List[Token],
 	texts: List[String],
+	names: NameTable,
 	path: String,
 	module_name: String,
 	location_offset_delta: Int,
+	id_source: NameIdSource,
 ) -> ParserInput:
 	capacity: Int = tokens.length()
 	var tags: List[TokenTag] = list(capacity)
@@ -864,7 +891,9 @@ private pure func initial_state(
 		end_offsets = end_offsets,
 		end_lines = end_lines,
 		end_columns = end_columns,
-		texts = texts
+		texts = texts,
+		names = names,
+		id_source = id_source
 	}
 
 
@@ -1030,6 +1059,87 @@ private pure func current_text(state: ParserInput, index: Int) -> String:
 		state.texts,
 		current_payload(state, index),
 	)
+
+
+private pure func spelling_lookup_table(state: ParserInput) -> NameTable:
+	match state.id_source:
+		TokenPayloadIds:
+			state.names
+		ResolveSpelling(compilation_names):
+			compilation_names
+
+
+private pure func resolve_spelling_id(state: ParserInput, spelling: String) -> NameId:
+	match name_table_dict(spelling_lookup_table(state)).get(spelling):
+		Some(index):
+			name_id_from_interned_index(index)
+		None:
+			name_id_pending_dynamic_intern()
+
+
+---
+Builds a `ParsedIdentifier` for the token at `index`, an `IdentifierTag`
+token whose payload the lexer already assigned from this same compilation's
+name table (`name_table_intern`, during lexing) -- so the payload already
+*is* the spelling's `NameId` index and no table lookup is needed here (an
+interpolation hole resolves by spelling instead; see `NameIdSource`).
+---
+private pure func identifier_at_token(
+	state: ParserInput,
+	index: Int,
+	span: SourceLocation,
+) -> ParsedIdentifier:
+	spelling: String = current_text(state, index)
+
+	match state.id_source:
+		TokenPayloadIds:
+			parsed_identifier(
+				name_id_from_interned_index(current_payload(state, index)),
+				spelling,
+				span,
+			)
+		ResolveSpelling(_):
+			parsed_identifier(
+				resolve_spelling_id(state, spelling),
+				spelling,
+				span,
+			)
+
+
+---
+Builds a `ParsedIdentifier` for a spelling the parser synthesizes itself
+(a reserved keyword echoed back as a name, a soft-keyword identifier, `_`,
+`""` for error recovery, ...) rather than reading one from a token.
+`spelling` must be one of `name_table_synthesized_spellings()`; `state.names`
+was seeded with exactly that closed vocabulary before this file was lexed
+(see `SYNTHESIZED_NAME_TABLE`), so this is always a read-only
+lookup, never an append.
+---
+private pure func synthesized_identifier(
+	state: ParserInput,
+	spelling: String,
+	span: SourceLocation,
+) -> ParsedIdentifier:
+	parsed_identifier(
+		resolve_spelling_id(state, spelling),
+		spelling,
+		span,
+	)
+
+
+---
+Whether `identifier` spells `_`, compared by `NameId` (a dense-index
+equality check, not a string compare) rather than by `.text`.
+---
+private pure func identifier_is_underscore(
+	state: ParserInput,
+	identifier: ParsedIdentifier,
+) -> Bool:
+	match name_table_find_id(spelling_lookup_table(state), "_"):
+		Some(underscore_id):
+			name_ids_equal(identifier.name, underscore_id)
+		None:
+			False
 
 
 private pure func current_keyword(state: ParserInput, index: Int) -> Keyword:
@@ -1483,7 +1593,7 @@ private pure func parse_reserved_keyword_as_name(
 	{
 		index = advance_parser(state, next_state),
 		diagnostics = next_state_diag,
-		value = parsed_identifier(keyword_text(keyword), span)
+		value = synthesized_identifier(state, keyword_text(keyword), span)
 	}
 
 
@@ -1500,10 +1610,7 @@ private pure func parse_identifier_expected(
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = parsed_identifier(
-					current_text(state, index),
-					span,
-				)
+				value = identifier_at_token(state, index, span)
 			}
 		KeywordTag:
 			keyword: Keyword = current_keyword(state, index)
@@ -1513,7 +1620,7 @@ private pure func parse_identifier_expected(
 					{
 						index = advance_parser(state, index),
 						diagnostics = diagnostics,
-						value = parsed_identifier(text, span)
+						value = synthesized_identifier(state, text, span)
 					}
 				None:
 					next_state: Int = index
@@ -1534,7 +1641,7 @@ private pure func parse_identifier_expected(
 					{
 						index = recovery_state,
 						diagnostics = next_state_diag,
-						value = parsed_identifier("", span)
+						value = synthesized_identifier(state, "", span)
 					}
 		_:
 			next_state: Int = index
@@ -1555,7 +1662,7 @@ private pure func parse_identifier_expected(
 			{
 				index = recovery_state,
 				diagnostics = next_state_diag,
-				value = parsed_identifier("", span)
+				value = synthesized_identifier(state, "", span)
 			}
 
 
@@ -1607,7 +1714,8 @@ private pure func parse_type_identifier_expected(
 					{
 						index = advance_parser(state, index),
 						diagnostics = diagnostics,
-						value = parsed_identifier(
+						value = synthesized_identifier(
+							state,
 							text,
 							current_location(state, index),
 						)
@@ -1727,6 +1835,7 @@ private pure func parse_hash_identifier_expected(
 				index = advance_parser(state, st),
 				diagnostics = st_diag,
 				value = parsed_identifier(
+					name_id_pending_dynamic_intern(),
 					"#" + current_text(state, st),
 					location_cover(
 						start_span,
@@ -1739,7 +1848,8 @@ private pure func parse_hash_identifier_expected(
 				{
 					index = advance_parser(state, st),
 					diagnostics = st_diag,
-					value = parsed_identifier(
+					value = synthesized_identifier(
+						state,
 						"#_",
 						location_cover(
 							start_span,
@@ -1761,7 +1871,7 @@ private pure func parse_hash_identifier_expected(
 				{
 					index = next_state,
 					diagnostics = next_state_diag,
-					value = parsed_identifier("#", start_span)
+					value = synthesized_identifier(state, "#", start_span)
 				}
 		_:
 			next_state: Int = st
@@ -1777,7 +1887,7 @@ private pure func parse_hash_identifier_expected(
 			{
 				index = next_state,
 				diagnostics = next_state_diag,
-				value = parsed_identifier("#", start_span)
+				value = synthesized_identifier(state, "#", start_span)
 			}
 
 
@@ -1791,6 +1901,7 @@ private pure func parse_dim_hash_suffix(
 		IdentifierTag:
 			var st: Int = st_in
 			name: ParsedIdentifier = parsed_identifier(
+				name_id_pending_dynamic_intern(),
 				"#" + current_text(state, st),
 				location_cover(
 					start_span,
@@ -1830,7 +1941,8 @@ private pure func parse_dim_hash_suffix(
 		SymbolTag:
 			if current_symbol(state, st_in) == UnderscoreSymbol:
 				var st: Int = st_in
-				name: ParsedIdentifier = parsed_identifier(
+				name: ParsedIdentifier = synthesized_identifier(
+					state,
 					"#_",
 					location_cover(
 						start_span,
@@ -2301,7 +2413,8 @@ private pure func parse_parenthesized_type_expr(
 		st = right_step.index
 		st_diag = right_step_diagnostics
 		void_type: ParsedTypeExpr = ParsedNamedType(
-			parsed_identifier(
+			synthesized_identifier(
+				state,
 				"Void",
 				location_cover(
 					start_span,
@@ -2654,7 +2767,7 @@ private pure func parse_named_or_wildcard_param(
 
 	if is_underscore:
 		span: SourceLocation = current_location(state, index)
-		underscore: ParsedIdentifier = parsed_identifier("_", span)
+		underscore: ParsedIdentifier = synthesized_identifier(state, "_", span)
 		type_step: ParseOptionalTypeStep = parse_optional_type_annotation(
 			state,
 			advance_parser(state, index),
@@ -3068,17 +3181,14 @@ private pure func parse_binder_identifier_expected(
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = parsed_identifier(
-					current_text(state, index),
-					span,
-				)
+				value = identifier_at_token(state, index, span)
 			}
 		SymbolTag:
 			if current_symbol(state, index) == UnderscoreSymbol:
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = parsed_identifier("_", span)
+					value = synthesized_identifier(state, "_", span)
 				}
 			else:
 				parse_declared_name_expected(state, index, diagnostics, expected)
@@ -3099,17 +3209,14 @@ private pure func parse_select_receive_identifier_expected(
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
-				value = parsed_identifier(
-					current_text(state, index),
-					span,
-				)
+				value = identifier_at_token(state, index, span)
 			}
 		SymbolTag:
 			if current_symbol(state, index) == UnderscoreSymbol:
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = parsed_identifier("_", span)
+					value = synthesized_identifier(state, "_", span)
 				}
 			else:
 				parse_declared_name_expected(state, index, diagnostics, expected)
@@ -3120,13 +3227,13 @@ private pure func parse_select_receive_identifier_expected(
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = parsed_identifier("after", span)
+					value = synthesized_identifier(state, "after", span)
 				}
 			else if keyword == FromKeyword:
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = parsed_identifier("from", span)
+					value = synthesized_identifier(state, "from", span)
 				}
 			else:
 				parse_declared_name_expected(state, index, diagnostics, expected)
@@ -3810,10 +3917,7 @@ private pure func parse_list_pattern_spread_after_dotdotdot(
 
 	match current_tag(state, index):
 		IdentifierTag:
-			name: ParsedIdentifier = parsed_identifier(
-				current_text(state, index),
-				span,
-			)
+			name: ParsedIdentifier = identifier_at_token(state, index, span)
 			{
 				index = advance_parser(state, index),
 				diagnostics = diagnostics,
@@ -3922,10 +4026,7 @@ private pure func parse_simple_pattern(
 
 	match current_tag(state, index):
 		IdentifierTag:
-			name: ParsedIdentifier = parsed_identifier(
-				current_text(state, index),
-				span,
-			)
+			name: ParsedIdentifier = identifier_at_token(state, index, span)
 			var st: Int = advance_parser(state, index)
 			var st_diag: List[ParseDiagnostic] = diagnostics
 
@@ -4044,7 +4145,7 @@ private pure func parse_simple_pattern(
 						{
 							index = advance_parser(state, index),
 							diagnostics = diagnostics,
-							value = ParsedNamePattern(parsed_identifier(text, span))
+							value = ParsedNamePattern(synthesized_identifier(state, text, span))
 						}
 					None:
 						name_step: ParseIdentifierStep = parse_reserved_keyword_as_name(
@@ -5601,7 +5702,7 @@ private pure func parse_for_expr_with_header_span(
 					state,
 					error_state,
 					error_state_diag,
-					parsed_identifier("_", start_span),
+					synthesized_identifier(state, "_", start_span),
 					iter_step.value,
 					start_span,
 					header_span,
@@ -5728,7 +5829,7 @@ private pure func parse_named_assignment_tail(
 			name.span,
 		)
 
-		if name.text == "_":
+		if identifier_is_underscore(state, name):
 			next_state: Int = value_step.index
 			next_state_diag: List[ParseDiagnostic] = add_expected_error(
 				state,
@@ -6976,7 +7077,7 @@ private pure func parse_primary_expr(
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = ParsedNameExpr(parsed_identifier(text, span))
+					value = ParsedNameExpr(identifier_at_token(state, index, span))
 				}
 		IntLiteralTag:
 			{
@@ -7040,13 +7141,13 @@ private pure func parse_primary_expr(
 					{
 						index = advance_parser(state, index),
 						diagnostics = diagnostics,
-						value = ParsedNameExpr(parsed_identifier("after", span))
+						value = ParsedNameExpr(synthesized_identifier(state, "after", span))
 					}
 				SealedKeyword:
 					{
 						index = advance_parser(state, index),
 						diagnostics = diagnostics,
-						value = ParsedNameExpr(parsed_identifier("sealed", span))
+						value = ParsedNameExpr(synthesized_identifier(state, "sealed", span))
 					}
 				BreakKeyword:
 					{
@@ -7077,7 +7178,7 @@ private pure func parse_primary_expr(
 						{
 							index = advance_parser(state, index),
 							diagnostics = diagnostics,
-							value = ParsedNameExpr(parsed_identifier("from", span))
+							value = ParsedNameExpr(synthesized_identifier(state, "from", span))
 						}
 				FromOpaqueKeyword:
 					parse_opaque_conversion_expr(state, index, diagnostics, False)
@@ -7096,7 +7197,7 @@ private pure func parse_primary_expr(
 						{
 							index = advance_parser(state, index),
 							diagnostics = diagnostics,
-							value = ParsedNameExpr(parsed_identifier("debug", span))
+							value = ParsedNameExpr(synthesized_identifier(state, "debug", span))
 						}
 					else:
 						parse_debug_block_expr(state, index, diagnostics)
@@ -7541,14 +7642,16 @@ pure func raw_expression_parser_checkpoint(
 	min_precedence: Int,
 	header_span: SourceLocation,
 ) -> RawExpressionParserCheckpoint:
-	lex_result = lex(source, name_table_empty())
+	lex_result = lex(source, SYNTHESIZED_NAME_TABLE)
 	state = initial_state(
 		source,
 		lex_result.tokens,
 		lex_result.texts,
+		lex_result.names,
 		lex_result.path,
 		lex_result.module_name,
 		0,
+		TokenPayloadIds,
 	)
 	step = parse_expression_with_header_span(
 		state,
@@ -7569,14 +7672,16 @@ pure func raw_expression_parser_batch_checkpoint(
 	source: SourceFile,
 	requests: List[RawExpressionParserRootRequest],
 ) -> RawExpressionParserBatchCheckpoint:
-	lex_result = lex(source, name_table_empty())
+	lex_result = lex(source, SYNTHESIZED_NAME_TABLE)
 	state = initial_state(
 		source,
 		lex_result.tokens,
 		lex_result.texts,
+		lex_result.names,
 		lex_result.path,
 		lex_result.module_name,
 		0,
+		TokenPayloadIds,
 	)
 	var indices: List[Int] = []
 	var diagnostics = lex_result.diagnostics
@@ -8835,13 +8940,13 @@ private pure func parse_variant_identifier_expected(
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = parsed_identifier("True", span)
+					value = synthesized_identifier(state, "True", span)
 				}
 			else if keyword == FalseKeyword:
 				{
 					index = advance_parser(state, index),
 					diagnostics = diagnostics,
-					value = parsed_identifier("False", span)
+					value = synthesized_identifier(state, "False", span)
 				}
 			else:
 				parse_declared_name_expected(state, index, diagnostics, "variant name")
@@ -9897,19 +10002,22 @@ extended with any spelling this file adds, so a caller that threads one
 table across every file in a compilation (source discovery) gets ids
 shared across files with no remap step.
 ---
-pure func parse_compiler_source_rebased_with_names(
+private pure func parse_program_with_id_source(
 	source: SourceFile,
 	location_offset_delta: Int,
 	names: NameTable,
+	id_source: NameIdSource,
 ) -> (ParsedProgram, NameTable):
 	lex_result = lex(source, names)
 	state: ParserInput = initial_state(
 		source,
 		lex_result.tokens,
 		lex_result.texts,
+		lex_result.names,
 		lex_result.path,
 		lex_result.module_name,
 		location_offset_delta,
+		id_source,
 	)
 	var index: Int = skip_newlines(state, 0)
 	var diagnostics: List[ParseDiagnostic] = lex_result.diagnostics
@@ -9932,6 +10040,14 @@ pure func parse_compiler_source_rebased_with_names(
 		}, lex_result.names)
 
 
+pure func parse_compiler_source_rebased_with_names(
+	source: SourceFile,
+	location_offset_delta: Int,
+	names: NameTable,
+) -> (ParsedProgram, NameTable):
+	parse_program_with_id_source(source, location_offset_delta, names, TokenPayloadIds)
+
+
 pure func parse_compiler_source_rebased(
 	source: SourceFile,
 	location_offset_delta: Int,
@@ -9939,7 +10055,28 @@ pure func parse_compiler_source_rebased(
 	(program, _) = parse_compiler_source_rebased_with_names(
 		source,
 		location_offset_delta,
-		name_table_empty(),
+		SYNTHESIZED_NAME_TABLE,
+	)
+	program
+
+
+---
+Parses one interpolation hole's wrapper source. The hole is lexed against a
+private empty table (see `NameIdSource`), so nothing is appended to and
+nothing is copied from `compilation_names`; each hole identifier resolves by
+spelling through a read-only `name_table_find_id`-style lookup and is the
+pending id on a miss. `.text` stays authoritative for those.
+---
+pure func parse_interpolation_hole_source(
+	source: SourceFile,
+	location_offset_delta: Int,
+	compilation_names: NameTable,
+) -> ParsedProgram:
+	(program, _) = parse_program_with_id_source(
+		source,
+		location_offset_delta,
+		EMPTY_NAME_TABLE,
+		ResolveSpelling(compilation_names),
 	)
 	program
 

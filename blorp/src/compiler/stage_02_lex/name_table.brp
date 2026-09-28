@@ -6,17 +6,13 @@
 -- id, and ids are assigned densely in encounter order (file order, then
 -- first occurrence within a file). A single-file caller (the formatter,
 -- LSP incremental reparse, standalone tools, tests) starts from
--- `name_table_empty()` and gets a table scoped to that one lex; discovery
+-- `EMPTY_NAME_TABLE` and gets a table scoped to that one lex; discovery
 -- threads one table through every file so ids are shared compilation-wide.
 --
 -- `NameId` is a spelling identity, not a semantic entity identity: two
 -- different bindings that happen to share a spelling share a `NameId`.
 -- Hygiene (distinguishing same-named locals) and semantic identity remain
 -- the responsibility of later phases (see docs/CORE_ID_MIGRATION.md).
-import:
-	dict: dict
-
-
 opaque type NameId = Int
 
 
@@ -28,12 +24,15 @@ private record NameTableRep {
 
 opaque type NameTable = NameTableRep
 
-
-pure func name_table_empty() -> NameTable:
-	into_opaque NameTable({
-			spellings = [],
-			id_by_spelling = dict()
-		})
+---
+The table with no spellings: what a single-file lex (formatter, tools, tests)
+starts from. A shared immutable constant, not a function, so no caller
+rebuilds it.
+---
+EMPTY_NAME_TABLE: NameTable = into_opaque NameTable({
+		spellings = [],
+		id_by_spelling = {}
+	})
 
 
 pure func name_table_spellings(table: NameTable) -> List[String]:
@@ -110,3 +109,161 @@ pure func name_table_id_at(table: NameTable, index: Int) -> Option[NameId]:
 
 pure func name_spelling(table: NameTable, id: NameId) -> Option[String]:
 	name_table_spellings(table).get(name_id_index(id))
+
+
+---
+Wraps an index that is already known to be a valid dense position in some
+name table as a `NameId`, without needing the table itself in hand.
+
+The one legitimate caller is the identifier-token path: the lexer assigns
+an `IdentifierTag` token's payload from this same table (`name_table_intern`
+during lexing), so that payload already *is* the spelling's `NameId` index.
+Do not call this on an index that has not gone through interning -- callers
+elsewhere should go through `name_table_find_id` or `name_table_id_at`.
+---
+pure func name_id_from_interned_index(index: Int) -> NameId:
+	name_id(index)
+
+
+---
+The closed vocabulary of spellings the parser synthesizes itself rather than
+reading from a token: every keyword spelling (a reserved keyword written
+where a name belongs is echoed back as that name, and several keywords have
+a soft-identifier use such as `after`/`debug`/`sealed`/`from`), the small set
+of literal names desugaring and parser self-tests fabricate (`_`, `#`,
+`resource`, `Type`, ...), and `""` for error recovery. Keeping the set here,
+named, is what lets the parser only ever do read-only lookups
+(`name_table_find_id`) against a pre-seeded table instead of appending new
+spellings while it parses.
+
+`""` is listed first so it gets a low, stable id across every table this
+function seeds; nothing depends on the exact value, only on it existing.
+---
+pure func name_table_synthesized_spellings() -> List[String]:
+	[
+		"",
+		"func",
+		"pure",
+		"var",
+		"union",
+		"record",
+		"void",
+		"while",
+		"for",
+		"in",
+		"if",
+		"else",
+		"and",
+		"or",
+		"not",
+		"on",
+		"match",
+		"True",
+		"False",
+		"break",
+		"continue",
+		"debug",
+		"struct",
+		"enum",
+		"with",
+		"resource",
+		"foreign",
+		"private",
+		"builtin",
+		"concurrent",
+		"concurrently",
+		"detach",
+		"select",
+		"into_opaque",
+		"from",
+		"from_opaque",
+		"after",
+		"sealed",
+		"opaque",
+		"try",
+		"import",
+		"as",
+		"trait",
+		"implements",
+		"Self",
+		"type",
+		"alias",
+		"where",
+		"_",
+		"#",
+		"#_",
+		"a",
+		"b",
+		"first",
+		"second",
+		"Type",
+		"bound",
+		"tuple",
+		"left",
+		"right",
+		"Some",
+		"received",
+		"error",
+		"first_function",
+		"T",
+		"Eq",
+		"value",
+		"second_function",
+		"limit",
+		"timeout",
+		"item",
+		"other",
+		"Void",
+	]
+
+
+---
+The table pre-seeded with `name_table_synthesized_spellings()`, as a shared
+immutable constant (CTFE accepts the initializer): discovery, hole parses and
+single-file parses (formatter, LSP, tools, tests) share one copy instead of
+rebuilding the 73 entries, and ids for these spellings agree everywhere.
+---
+SYNTHESIZED_NAME_TABLE: NameTable = build_synthesized_name_table()
+
+
+private pure func build_synthesized_name_table() -> NameTable:
+	var table: NameTable = EMPTY_NAME_TABLE
+
+	for spelling in name_table_synthesized_spellings():
+		(next_table, _) = name_table_intern(table, spelling)
+		table = next_table
+
+	table
+
+
+---
+Looks up a synthesized spelling's id without a table in hand, for the rare
+caller (parser self-test/oracle helpers) that builds sample
+`ParsedIdentifier`s outside any real parse. Rebuilds the small seeded table
+per call, so this is for test and diagnostic scaffolding only -- real
+parsing threads a table through `ParserInput` instead.
+---
+pure func synthesized_name_id(spelling: String) -> NameId:
+	match name_table_find_id(SYNTHESIZED_NAME_TABLE, spelling):
+		Some(id):
+			id
+		None:
+			name_id(0)
+
+
+---
+A placeholder for a spelling the parser builds dynamically from source text
+(for example `"#" + current_text(...)` for a dim-hash suffix like `#N`) and
+therefore cannot resolve with a read-only lookup against the pre-seeded
+closed vocabulary -- it was never interned. `.text` stays authoritative for
+these identifiers until a caller interns the real spelling; the negative
+index can never equal a real `NameId` (every real one is a non-negative
+dense index), so no reader can mistake this for a resolved identity.
+
+TODO(name-id-migration): these sites are the "genuinely dynamic" spellings
+called out in the parsed-identifier-name-id slice; intern them for real at
+the discovery join (or thread a mutable table through this one call path)
+instead of using this placeholder.
+---
+pure func name_id_pending_dynamic_intern() -> NameId:
+	name_id(-1)
