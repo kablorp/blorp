@@ -276,17 +276,32 @@ pure func normalize_type_name(name: String) -> String:
 		name
 
 
+---
+Type-variable names spell their kind: a dimension variable keeps the source
+`#` sigil (`#N`). The parser records the kind on the declaration
+(`ParsedTypeParamDecl.kind`), and header code carries it from there; semantic
+types have no kind field, so a `SemanticTypeVar` name is the only carrier and
+this constant is the one place that spelling is defined. A later change that
+gives semantic type variables an explicit kind deletes these three helpers.
+---
+private DIM_VAR_SIGIL: Char = '#'
+
+DIM_VAR_SIGIL_LENGTH: Int = 1
+
+
 pure func is_dim_var_name(name: String) -> Bool:
-	name.length() > 0 and name.get_or(0, ' ') == '#'
+	name.length() > 0 and name.get_or(0, ' ') == DIM_VAR_SIGIL
 
 
-pure func strip_type_param_bounds(name: String) -> String:
-	bounds_index: Int = name.raw_index_of(":")
-
-	if bounds_index < 0:
-		name
+---
+The variable's name without the dimension sigil; type-variable names are
+returned unchanged. Used to build derived names that must re-add the sigil.
+---
+pure func dim_var_name_without_sigil(name: String) -> String:
+	if is_dim_var_name(name):
+		name.substring(DIM_VAR_SIGIL_LENGTH, name.length())
 	else:
-		name.substring(0, bounds_index)
+		name
 
 
 pure func is_legacy_single_letter_type_param(name: String) -> Bool:
@@ -298,7 +313,7 @@ pure func is_legacy_single_letter_type_param(name: String) -> Bool:
 
 
 pure func is_type_param_name(name: String) -> Bool:
-	name.raw_index_of(":") >= 0 or is_legacy_single_letter_type_param(strip_type_param_bounds(name))
+	is_legacy_single_letter_type_param(name)
 
 
 pure func type_subst_entry(var_name: String, concrete_type: SemanticType) -> SemanticTypeSubstEntry:
@@ -329,26 +344,36 @@ private pure func lookup_subst_key(
 
 
 pure func lookup_subst(name: String, subst: List[SemanticTypeSubstEntry]) -> Option[SemanticType]:
-	match lookup_subst_key(name, subst):
-		Some(replacement):
-			Some(replacement)
-		None:
-			stripped: String = strip_type_param_bounds(name)
-
-			if stripped != name:
-				lookup_subst_key(stripped, subst)
-			else:
-				None
+	lookup_subst_key(name, subst)
 
 
--- Scalar split offsets for a canonical `module_path::type_name` name.
--- Neither caller below needs a tuple: `owner_local_type_name` substrings the
--- owner path to compare it but only needs the type-name substring on the
--- match branch, and `display_type_name` needs both, but as two independent
--- substrings rather than an allocated pair. Returning offsets instead of an
--- `Option[(String, String)]` removes the tuple-and-pair-of-substrings
--- allocation from every call and lets `owner_local_type_name` skip the
--- type-name substring entirely on its non-matching branch.
+---
+The canonical spelling of a module-owned type: `module_path::type_name`, or
+the bare `type_name` for a global ABI type. `SemanticNamedType` carries only
+this string, so the owner path and local name are recoverable only by
+`split_canonical_module_type_name` below. That parser and this constructor
+are the only code that knows the separator. A later change that gives
+`SemanticNamedType` the type's definition identity (owner module plus local
+name as separate values) deletes the parser; `owner_local_type_name` and
+`display_type_name` would then read those values instead.
+---
+pure func canonical_module_type_name(module_path: String, type_name: String) -> String:
+	if is_std_module_name(module_path) and is_global_abi_type_name(type_name):
+		type_name
+	else:
+		module_path + CANONICAL_MODULE_TYPE_SEPARATOR + type_name
+
+
+---
+Scalar split offsets for a canonical `module_path::type_name` name.
+Neither caller needs a tuple: `owner_local_type_name` substrings the owner
+path to compare it but only needs the type-name substring on the match
+branch, and `display_type_name` needs both, but as two independent substrings
+rather than an allocated pair. Returning offsets instead of an
+`Option[(String, String)]` removes the tuple-and-pair-of-substrings
+allocation from every call and lets `owner_local_type_name` skip the
+type-name substring entirely on its non-matching branch.
+---
 private struct CanonicalModuleTypeNameSplit {
 	module_path_end: Int,
 	type_name_start: Int
@@ -367,11 +392,42 @@ private pure func split_canonical_module_type_name(name: String) -> Option[Canon
 		})
 
 
-pure func canonical_module_type_name(module_path: String, type_name: String) -> String:
-	if is_std_module_name(module_path) and is_global_abi_type_name(type_name):
-		type_name
+---
+Type expressions written `alias.Type` reach the semantic layer as one
+`SemanticNamedType` name, so the alias and local name are recovered by
+`split_qualified_type_name`. Like the canonical form above, this constructor
+and parser are the only code that knows the separator, and both are deleted
+by giving semantic types a qualified-name variant that keeps the parsed
+qualifier and name apart (`ParsedQualifiedNamedType` already does).
+---
+QUALIFIED_TYPE_NAME_SEPARATOR: String = "."
+
+
+pure func qualified_type_name(alias_name: String, local_name: String) -> String:
+	alias_name + QUALIFIED_TYPE_NAME_SEPARATOR + local_name
+
+
+---
+Offsets of the alias and local-name parts of an `alias.Type` name, or `None`
+for an unqualified name. Offsets rather than substrings so the caller only
+allocates the parts it needs.
+---
+struct QualifiedTypeNameSplit {
+	alias_end: Int,
+	local_name_start: Int
+}
+
+
+pure func split_qualified_type_name(name: String) -> Option[QualifiedTypeNameSplit]:
+	index: Int = name.raw_index_of(QUALIFIED_TYPE_NAME_SEPARATOR)
+
+	if index < 0:
+		None
 	else:
-		module_path + CANONICAL_MODULE_TYPE_SEPARATOR + type_name
+		Some({
+			alias_end = index,
+			local_name_start = index + QUALIFIED_TYPE_NAME_SEPARATOR.length(),
+		})
 
 
 private STD_MODULE_NAMES: List[String] = [
@@ -726,7 +782,7 @@ pure func display_type_name(name: String) -> String:
 			module_path: String = name.substring(0, split.module_path_end)
 			type_name: String = name.substring(split.type_name_start, name.length() - split.type_name_start)
 
-			module_path + "." + type_name
+			qualified_type_name(module_path, type_name)
 		None:
 			name
 
@@ -984,14 +1040,13 @@ pure func types_equal(left: SemanticType, right: SemanticType) -> Bool:
 
 
 private pure func type_param_names_include(type_params: List[String], name: String) -> Bool:
-	stripped_name: String = strip_type_param_bounds(name)
 	var index: Int = 0
 	var found: Bool = False
 
 	while index < type_params.length() and not found:
 		match type_params.get(index):
 			Some(param):
-				found = strip_type_param_bounds(param) == stripped_name
+				found = param == name
 			None:
 				void
 
@@ -1184,14 +1239,12 @@ private pure func type_list_occurs_in(var_name: String, types: List[SemanticType
 
 
 pure func occurs_in(var_name: String, typ: SemanticType) -> Bool:
-	stripped_var: String = strip_type_param_bounds(var_name)
-
 	match typ:
 		SemanticTypeVar(name):
-			name == var_name or strip_type_param_bounds(name) == stripped_var
+			name == var_name
 		SemanticNamedType(name, args):
 			if args.length() == 0:
-				name == var_name or strip_type_param_bounds(name) == stripped_var
+				name == var_name
 			else:
 				type_list_occurs_in(var_name, args)
 		SemanticArrayType(element, dims):
@@ -1324,18 +1377,11 @@ pure func find_non_positive_dim(typ: SemanticType) -> Option[Int]:
 
 
 private pure func visit_subst_name(visited: List[String], name: String) -> List[String]:
-	stripped: String = strip_type_param_bounds(name)
-	with_name: List[String] = visited.append(name)
-
-	if stripped != name:
-		with_name.append(stripped)
-	else:
-		with_name
+	visited.append(name)
 
 
 private pure func subst_visited_contains(visited: List[String], name: String) -> Bool:
-	stripped: String = strip_type_param_bounds(name)
-	visited.contains(name) or visited.contains(stripped)
+	visited.contains(name)
 
 
 private pure func try_apply_subst_name(
@@ -1349,9 +1395,7 @@ private pure func try_apply_subst_name(
 	else:
 		match lookup_subst(name, subst):
 			Some(replacement):
-				stripped: String = strip_type_param_bounds(name)
-
-				if occurs_in(name, replacement) or occurs_in(stripped, replacement):
+				if occurs_in(name, replacement):
 					replacement
 				else:
 					apply_subst_with_visited(
@@ -1566,8 +1610,7 @@ private pure func type_params_include_dim_name(type_params: List[String], name: 
 	while index < type_params.length() and not found:
 		match type_params.get(index):
 			Some(param):
-				stripped: String = strip_type_param_bounds(param)
-				found = stripped == name and is_dim_var_name(stripped)
+				found = param == name and is_dim_var_name(param)
 			None:
 				void
 
