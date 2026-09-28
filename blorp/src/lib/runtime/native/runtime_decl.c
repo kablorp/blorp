@@ -1837,6 +1837,12 @@ blorp_String* blorp_vector_to_string_float16(blorp_Vector* v);
 blorp_String* blorp_vector_to_string_int(blorp_Vector* v);
 blorp_String* blorp_vector_to_string_float(blorp_Vector* v);
 blorp_String* blorp_list_to_string_int(blorp_List* list);
+blorp_String* blorp_list_to_string_int8(blorp_List* list);
+blorp_String* blorp_list_to_string_int16(blorp_List* list);
+blorp_String* blorp_list_to_string_int32(blorp_List* list);
+blorp_String* blorp_list_to_string_uint8(blorp_List* list);
+blorp_String* blorp_list_to_string_uint16(blorp_List* list);
+blorp_String* blorp_list_to_string_uint32(blorp_List* list);
 blorp_String* blorp_list_to_string_float(blorp_List* list);
 blorp_String* blorp_list_to_string_float32(blorp_List* list);
 #ifdef __FLT16_MAX__

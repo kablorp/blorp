@@ -12906,8 +12906,43 @@ blorp_String* blorp_vector_to_string_float(blorp_Vector* v) {
     return result;
 }
 
+// C element type of an integer list. The generic accessor returns an inline
+// element's bits zero-extended, so a formatter must convert through the exact
+// element type to recover signed values; the compiler names that type by
+// choosing the matching blorp_list_to_string_<type> entry point.
+typedef enum {
+    BLORP_LIST_INT_ELEMENT_LONG,
+    BLORP_LIST_INT_ELEMENT_INT8,
+    BLORP_LIST_INT_ELEMENT_INT16,
+    BLORP_LIST_INT_ELEMENT_INT32,
+    BLORP_LIST_INT_ELEMENT_UINT8,
+    BLORP_LIST_INT_ELEMENT_UINT16,
+    BLORP_LIST_INT_ELEMENT_UINT32,
+} blorp_ListIntElement;
+
+static inline long blorp_list_int_element_at(
+    blorp_List* list,
+    long index,
+    blorp_ListIntElement element
+) {
+    uintptr_t bits = (uintptr_t)blorp_list_get(list, index);
+    switch (element) {
+        case BLORP_LIST_INT_ELEMENT_INT8: return (long)(int8_t)bits;
+        case BLORP_LIST_INT_ELEMENT_INT16: return (long)(int16_t)bits;
+        case BLORP_LIST_INT_ELEMENT_INT32: return (long)(int32_t)bits;
+        case BLORP_LIST_INT_ELEMENT_UINT8: return (long)(uint8_t)bits;
+        case BLORP_LIST_INT_ELEMENT_UINT16: return (long)(uint16_t)bits;
+        case BLORP_LIST_INT_ELEMENT_UINT32: return (long)(uint32_t)bits;
+        case BLORP_LIST_INT_ELEMENT_LONG: break;
+    }
+    return (long)bits;
+}
+
 // List to_string: format as [1, 2, 3]
-blorp_String* blorp_list_to_string_int(blorp_List* list) {
+static blorp_String* blorp_list_to_string_integers(
+    blorp_List* list,
+    blorp_ListIntElement element
+) {
     if (!list || list->len == 0) {
         return blorp_string_create_len("[]", 2);
     }
@@ -12917,7 +12952,7 @@ blorp_String* blorp_list_to_string_int(blorp_List* list) {
         if (i > 0) output_size = blorp_checked_add(output_size, 2);
         output_size = blorp_checked_add(
             output_size,
-            blorp_long_decimal_width((long)blorp_list_get(list, i))
+            blorp_long_decimal_width(blorp_list_int_element_at(list, i, element))
         );
     }
     if (output_size > (size_t)LONG_MAX) {
@@ -12933,7 +12968,7 @@ blorp_String* blorp_list_to_string_int(blorp_List* list) {
             result->data[pos++] = ',';
             result->data[pos++] = ' ';
         }
-        long value = (long)blorp_list_get(list, i);
+        long value = blorp_list_int_element_at(list, i, element);
         size_t width = blorp_long_decimal_width(value);
         blorp_format_long_decimal(result->data + pos, width, value);
         pos += width;
@@ -12941,6 +12976,34 @@ blorp_String* blorp_list_to_string_int(blorp_List* list) {
     result->data[pos++] = ']';
     result->data[pos] = '\0';
     return result;
+}
+
+blorp_String* blorp_list_to_string_int(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_LONG);
+}
+
+blorp_String* blorp_list_to_string_int8(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_INT8);
+}
+
+blorp_String* blorp_list_to_string_int16(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_INT16);
+}
+
+blorp_String* blorp_list_to_string_int32(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_INT32);
+}
+
+blorp_String* blorp_list_to_string_uint8(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_UINT8);
+}
+
+blorp_String* blorp_list_to_string_uint16(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_UINT16);
+}
+
+blorp_String* blorp_list_to_string_uint32(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_UINT32);
 }
 
 blorp_String* blorp_list_to_string_float(blorp_List* list) {
