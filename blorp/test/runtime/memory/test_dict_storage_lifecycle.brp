@@ -1,0 +1,137 @@
+-- Dict storage lifecycle: empty tables, growth across capacities, tombstones,
+-- insertion order after rehash, copy-on-write splits, and release of heap
+-- keys and values. Runs under the leak gate so every path must free exactly
+-- what it allocated.
+import:
+	dict as D
+	test: TestSuite
+
+
+foreign(include: "dict_native_storage_header.h"):
+	func dict_native_empty_dict() -> Int
+	func dict_native_growth_preserves_entries_and_order() -> Int
+	func dict_native_tombstones_then_growth() -> Int
+	func dict_native_shared_copy_then_mutate_both() -> Int
+	func dict_native_shared_copy_with_full_order() -> Int
+	func dict_native_resize_below_live_count_keeps_entries() -> Int
+	func dict_native_heap_entries_release_cleanly() -> Int
+
+
+func test_native_empty_dict() -> Bool:
+	dict_native_empty_dict() == 1
+
+
+func test_native_growth_preserves_entries_and_order() -> Bool:
+	dict_native_growth_preserves_entries_and_order() == 1
+
+
+func test_native_tombstones_then_growth() -> Bool:
+	dict_native_tombstones_then_growth() == 1
+
+
+func test_native_shared_copy_then_mutate_both() -> Bool:
+	dict_native_shared_copy_then_mutate_both() == 1
+
+
+func test_native_shared_copy_with_full_order() -> Bool:
+	dict_native_shared_copy_with_full_order() == 1
+
+
+func test_native_resize_below_live_count_keeps_entries() -> Bool:
+	dict_native_resize_below_live_count_keeps_entries() == 1
+
+
+func test_native_heap_entries_release_cleanly() -> Bool:
+	dict_native_heap_entries_release_cleanly() == 1
+
+
+func test_empty_dict_reads() -> Bool:
+	empty: Dict[String, String] = D.dict()
+	keys: List[String] = D.keys(empty)
+	empty.length() == 0 and D.get_or(empty, "missing", "none") == "none" and keys.length() == 0
+
+
+func test_string_growth_keeps_insertion_order() -> Bool:
+	var d: Dict[String, String] = D.dict()
+	var expected: List[String] = []
+
+	for i in 0..600:
+		key: String = "k" + (i * 7919 % 100003).to_string()
+		d = D.set(d, key, "v" + i.to_string())
+		expected = expected.append(key)
+
+	last_key: String = "k" + (599 * 7919 % 100003).to_string()
+	D.keys(d) == expected and D.get_or(d, last_key, "") == "v599"
+
+
+func test_removal_reinsertion_then_growth() -> Bool:
+	var d: Dict[String, Int] = D.dict()
+
+	for i in 0..10:
+		d = D.set(d, "k" + i.to_string(), i)
+
+	for i in 0..10:
+		if i % 2 == 0:
+			d = D.remove(d, "k" + i.to_string())
+
+	d = D.set(d, "k4", 44)
+	d = D.set(d, "k0", 1)
+
+	for i in 100..200:
+		d = D.set(d, "k" + i.to_string(), i)
+
+	var expected: List[String] = ["k1", "k3", "k5", "k7", "k9", "k4", "k0"]
+
+	for i in 100..200:
+		expected = expected.append("k" + i.to_string())
+
+	D.keys(d) == expected and D.get_or(d, "k2", -1) == -1 and D.get_or(d, "k4", -1) == 44
+
+
+func test_shared_copy_then_mutate_both() -> Bool:
+	var original: Dict[String, String] = D.dict()
+	var shared_keys: List[String] = []
+
+	-- Eleven entries put the next insert at the capacity-16 growth threshold.
+	for i in 0..11:
+		original = D.set(original, "k" + i.to_string(), "v" + i.to_string())
+		shared_keys = shared_keys.append("k" + i.to_string())
+
+	var copy: Dict[String, String] = original
+	copy = D.set(copy, "copy-only", "c")
+	original = D.set(original, "original-only", "o")
+	copy = D.set(copy, "k0", "changed")
+	(
+		D.get_or(original, "k0", "") == "v0"
+		and D.get_or(copy, "k0", "") == "changed"
+		and D.get_or(original, "copy-only", "missing") == "missing"
+		and D.get_or(copy, "original-only", "missing") == "missing"
+		and original.length() == 12
+		and copy.length() == 12
+		and D.keys(copy) == shared_keys.append("copy-only")
+		and D.keys(original) == shared_keys.append("original-only")
+	)
+
+
+tests: TestSuite = {
+	description = "Dict storage lifecycle",
+	tests = [
+		("native empty dict", test_native_empty_dict),
+		(
+			"native growth preserves entries and order",
+			test_native_growth_preserves_entries_and_order,
+		),
+		("native tombstones then growth", test_native_tombstones_then_growth),
+		("native shared copy then mutate both", test_native_shared_copy_then_mutate_both),
+		("native shared copy with full order", test_native_shared_copy_with_full_order),
+		(
+			"native resize below live count keeps entries",
+			test_native_resize_below_live_count_keeps_entries,
+		),
+		("native heap entries release cleanly", test_native_heap_entries_release_cleanly),
+		("empty dict reads", test_empty_dict_reads),
+		("string growth keeps insertion order", test_string_growth_keeps_insertion_order),
+		("removal, reinsertion, then growth", test_removal_reinsertion_then_growth),
+		("shared copy then mutate both", test_shared_copy_then_mutate_both),
+	]
+}

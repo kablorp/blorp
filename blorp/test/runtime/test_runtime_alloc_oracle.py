@@ -157,6 +157,91 @@ class RuntimeAllocOracleTests(unittest.TestCase):
         completed = self._compile_and_run(source)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_dict_table_takes_one_raw_buffer_per_capacity(self) -> None:
+        # A Dict's per-slot arrays share one backing buffer, and a shared
+        # dict that an insert grows is copied straight into the grown table
+        # instead of being copied and then rehashed.
+        source = textwrap.dedent(
+            """\
+            #define _GNU_SOURCE
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            static long raw_events(blorp_MemStats stats) {
+                return stats.raw_buffer_malloc_events + stats.raw_buffer_calloc_events
+                    + stats.raw_buffer_realloc_events + stats.raw_buffer_aligned_events;
+            }
+
+            #define EXPECT_RAW(before, after, expected, code) \\
+                do { \\
+                    long delta = raw_events(after) - raw_events(before); \\
+                    if (delta != (expected)) { \\
+                        fprintf(stderr, "check %d: expected %d raw buffers, got %ld\\n", \\
+                                (code), (expected), delta); \\
+                        return (code); \\
+                    } \\
+                } while (0)
+
+            #define KEY(v) ((void*)(intptr_t)(v))
+
+            int main(void) {
+                if (!getenv("BLORP_ALLOCATOR_STATS")) return 90;
+
+                blorp_MemStats before_new = blorp_get_mem_stats();
+                blorp_Dict* dict = blorp_dict_new();
+                blorp_MemStats after_new = blorp_get_mem_stats();
+                EXPECT_RAW(before_new, after_new, 1, 2);
+
+                // Fill to one below the growth threshold: no new buffers.
+                long threshold = dict->grow_at;
+                for (long key = 0; key < threshold - 1; key++) {
+                    dict = blorp_dict_insert(dict, KEY(key), KEY(key));
+                }
+                blorp_MemStats after_fill = blorp_get_mem_stats();
+                EXPECT_RAW(after_new, after_fill, 0, 3);
+
+                // A shared dict grown by an insert takes exactly one buffer.
+                blorp_Dict* shared = dict;
+                blorp_retain(shared);
+                long old_capacity = dict->capacity;
+                dict = blorp_dict_insert(dict, KEY(1000), KEY(1000));
+                blorp_MemStats after_shared_grow = blorp_get_mem_stats();
+                EXPECT_RAW(after_fill, after_shared_grow, 1, 4);
+                if (dict->capacity != old_capacity * 2) return 5;
+                if (shared->capacity != old_capacity) return 6;
+
+                // A unique dict grows with one buffer.
+                shared = blorp_dict_insert(shared, KEY(2000), KEY(2000));
+                blorp_MemStats after_unique_grow = blorp_get_mem_stats();
+                EXPECT_RAW(after_shared_grow, after_unique_grow, 1, 7);
+                if (shared->capacity != old_capacity * 2) return 8;
+
+                // Copy of a shared dict on remove: one buffer.
+                blorp_Dict* other = shared;
+                blorp_retain(other);
+                shared = blorp_dict_remove(shared, KEY(0));
+                blorp_MemStats after_copy = blorp_get_mem_stats();
+                EXPECT_RAW(after_unique_grow, after_copy, 1, 9);
+
+                // Resize and reuse at a smaller capacity.
+                blorp_dict_resize_to(shared, shared->capacity * 2);
+                blorp_MemStats after_resize = blorp_get_mem_stats();
+                EXPECT_RAW(after_copy, after_resize, 1, 10);
+                shared = blorp_dict_reuse_alloc(shared, 16);
+                blorp_MemStats after_reuse = blorp_get_mem_stats();
+                EXPECT_RAW(after_resize, after_reuse, 0, 11);
+
+                blorp_release(dict);
+                blorp_release(shared);
+                blorp_release(other);
+                return 0;
+            }
+            """
+        )
+        completed = self._compile_and_run(source)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_idle_process_reports_zero_oracle_counters(self) -> None:
         source = textwrap.dedent(
             """\
