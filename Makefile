@@ -532,6 +532,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_float_to_string.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_memory_diagnostics.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_unicode_case_map.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle_coverage.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_fatal_messages.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_cooperative_checkpoint_contract.py

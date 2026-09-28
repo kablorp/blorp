@@ -8364,22 +8364,49 @@ static bool blorp_is_case_ignorable_codepoint(int32_t cp) {
     return blorp_codepoint_in_ranges(cp, blorp_case_ignorable_ranges, sizeof(blorp_case_ignorable_ranges) / sizeof(blorp_case_ignorable_ranges[0]));
 }
 
-static bool blorp_is_final_sigma_context(const blorp_utf8_span* spans, long count, long index) {
-    bool has_cased_before = false;
-    for (long i = index - 1; i >= 0; i--) {
-        if (!spans[i].valid) break;
-        int32_t cp = spans[i].codepoint;
-        if (blorp_is_case_ignorable_codepoint(cp)) continue;
-        has_cased_before = blorp_is_cased_codepoint(cp);
-        break;
-    }
-    if (!has_cased_before) return false;
+enum {
+    BLORP_GREEK_CAPITAL_SIGMA = 0x03A3,
+    BLORP_GREEK_FINAL_SIGMA = 0x03C2
+};
 
-    for (long i = index + 1; i < count; i++) {
-        if (!spans[i].valid) break;
-        int32_t cp = spans[i].codepoint;
-        if (blorp_is_case_ignorable_codepoint(cp)) continue;
-        return !blorp_is_cased_codepoint(cp);
+/* Look-behind half of the Final_Sigma condition, folded forward lazily so
+   strings without a capital sigma never classify their code points.
+   cased_before describes the spans that end at scanned_to: the nearest one
+   that is not case-ignorable is cased, and no invalid span follows it. */
+typedef struct {
+    long scanned_to;
+    bool cased_before;
+} blorp_final_sigma_scan;
+
+static bool blorp_final_sigma_has_cased_before(
+    const blorp_String* s,
+    blorp_final_sigma_scan* scan,
+    long sigma_pos
+) {
+    while (scan->scanned_to < sigma_pos) {
+        blorp_utf8_span span;
+        blorp_utf8_decode_span(s, scan->scanned_to, &span);
+        if (!span.valid) {
+            scan->cased_before = false;
+        } else if (!blorp_is_case_ignorable_codepoint(span.codepoint)) {
+            scan->cased_before = blorp_is_cased_codepoint(span.codepoint);
+        }
+        scan->scanned_to += span.length;
+    }
+    return scan->cased_before;
+}
+
+/* Look-ahead half: the nearest following span that is not case-ignorable
+   must not be cased; the end of the text or an invalid span also ends it. */
+static bool blorp_final_sigma_has_no_cased_after(const blorp_String* s, long pos) {
+    while (pos < s->len) {
+        blorp_utf8_span span;
+        blorp_utf8_decode_span(s, pos, &span);
+        if (!span.valid) return true;
+        if (!blorp_is_case_ignorable_codepoint(span.codepoint)) {
+            return !blorp_is_cased_codepoint(span.codepoint);
+        }
+        pos += span.length;
     }
     return true;
 }
@@ -8405,20 +8432,7 @@ static blorp_String* blorp_ascii_case_map(const blorp_String* s, bool upper) {
     return result;
 }
 
-static blorp_unicode_case_mapping blorp_case_mapping_for_span(
-    const blorp_utf8_span* spans,
-    long count,
-    long index,
-    bool upper
-) {
-    int32_t cp = spans[index].codepoint;
-    if (!upper && cp == 0x03A3 && blorp_is_final_sigma_context(spans, count, index)) {
-        return (blorp_unicode_case_mapping){
-            .length = 1,
-            .codepoints = {0x03C2, 0, 0}
-        };
-    }
-
+static blorp_unicode_case_mapping blorp_unicode_case_lookup_for(int32_t cp, bool upper) {
     if (upper) {
         return blorp_unicode_case_lookup(
             cp,
@@ -8435,57 +8449,107 @@ static blorp_unicode_case_mapping blorp_case_mapping_for_span(
         sizeof(blorp_lower_specials) / sizeof(blorp_lower_specials[0]));
 }
 
+enum {
+    /* Mapped bytes kept on the stack before the mapper moves to the heap;
+       covers typical words and short lines without a temporary allocation. */
+    BLORP_CASE_MAP_INLINE_BYTES = 256,
+    /* Largest UTF-8 encoding of one code point. */
+    BLORP_UTF8_MAX_CODEPOINT_BYTES = 4
+};
+
+/* Mapped bytes collected before the exact-size result is allocated. It lives
+   on the caller's stack: about 280 bytes including the inline buffer, which
+   is small enough for fiber stacks. */
+typedef struct {
+    char* data;
+    size_t len;
+    size_t capacity;
+    char inline_bytes[BLORP_CASE_MAP_INLINE_BYTES];
+} blorp_case_map_output;
+
+static void blorp_case_map_output_reserve(blorp_case_map_output* out, size_t extra) {
+    size_t needed = blorp_checked_add(out->len, extra);
+    if (needed <= out->capacity) return;
+    size_t capacity = blorp_checked_add(out->capacity, out->capacity);
+    if (capacity < needed) capacity = needed;
+    if (out->data == out->inline_bytes) {
+        char* heap = (char*)blorp_malloc_checked(capacity);
+        memcpy(heap, out->data, out->len);
+        out->data = heap;
+    } else {
+        out->data = (char*)blorp_realloc_checked(out->data, capacity);
+    }
+    out->capacity = capacity;
+}
+
 static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
     if (!s || s->len == 0) return blorp_static_empty_string();
     if (blorp_string_is_ascii(s)) return blorp_ascii_case_map(s, upper);
 
-    blorp_utf8_span* spans = (blorp_utf8_span*)blorp_malloc_checked(sizeof(blorp_utf8_span) * (size_t)s->len);
-    long count = 0;
+    /* Each code point is decoded and mapped once, straight into the output
+       bytes; the result is then allocated at its exact length. Most
+       mappings keep the byte length, so input length plus a quarter is a
+       good first heap size when the text does not fit on the stack. */
+    blorp_case_map_output out;
+    out.data = out.inline_bytes;
+    out.len = 0;
+    out.capacity = sizeof(out.inline_bytes);
+    if ((size_t)s->len > out.capacity) {
+        blorp_case_map_output_reserve(&out, blorp_checked_add((size_t)s->len, (size_t)s->len / 4));
+    }
+
+    blorp_final_sigma_scan sigma_scan = { 0, false };
     for (long pos = 0; pos < s->len; ) {
+        unsigned char byte = (unsigned char)s->data[pos];
+        if (byte < 0x80) {
+            /* Same mapping as the ASCII fast path and the Unicode tables. */
+            blorp_case_map_output_reserve(&out, 1);
+            if (upper) {
+                out.data[out.len++] = (char)((byte >= 'a' && byte <= 'z') ? byte - 32 : byte);
+            } else {
+                out.data[out.len++] = (char)((byte >= 'A' && byte <= 'Z') ? byte + 32 : byte);
+            }
+            pos++;
+            continue;
+        }
+
         blorp_utf8_span span;
         blorp_utf8_decode_span(s, pos, &span);
-        spans[count++] = span;
+        if (!span.valid) {
+            /* Invalid bytes are copied through one at a time. */
+            blorp_case_map_output_reserve(&out, (size_t)span.length);
+            memcpy(out.data + out.len, s->data + pos, (size_t)span.length);
+            out.len += (size_t)span.length;
+            pos += span.length;
+            continue;
+        }
+
+        blorp_unicode_case_mapping mapped;
+        if (!upper && span.codepoint == BLORP_GREEK_CAPITAL_SIGMA &&
+            blorp_final_sigma_has_cased_before(s, &sigma_scan, pos) &&
+            blorp_final_sigma_has_no_cased_after(s, pos + span.length)) {
+            mapped = (blorp_unicode_case_mapping){
+                .length = 1,
+                .codepoints = {BLORP_GREEK_FINAL_SIGMA, 0, 0}
+            };
+        } else {
+            mapped = blorp_unicode_case_lookup_for(span.codepoint, upper);
+        }
+        blorp_case_map_output_reserve(&out, (size_t)mapped.length * BLORP_UTF8_MAX_CODEPOINT_BYTES);
+        for (uint8_t j = 0; j < mapped.length; j++) {
+            out.len += (size_t)blorp_utf8_encode(
+                mapped.codepoints[j], (unsigned char*)out.data + out.len);
+        }
         pos += span.length;
     }
 
-    size_t out_len = 0;
-    for (long i = 0; i < count; i++) {
-        if (!spans[i].valid) {
-            out_len = blorp_checked_add(out_len, (size_t)spans[i].length);
-            continue;
-        }
-        blorp_unicode_case_mapping mapped =
-            blorp_case_mapping_for_span(spans, count, i, upper);
-        for (uint8_t j = 0; j < mapped.length; j++) {
-            out_len = blorp_checked_add(
-                out_len,
-                (size_t)blorp_utf8_encoded_len(mapped.codepoints[j]));
-        }
-    }
-
-    if (out_len > (size_t)LONG_MAX) {
+    if (out.len > (size_t)LONG_MAX) {
         blorp_fatal_invalid_runtime_length("String", LONG_MAX, LONG_MAX);
     }
-
-    blorp_String* result = blorp_string_alloc_uninit((long)out_len, (long)out_len);
-    size_t write = 0;
-    for (long i = 0; i < count; i++) {
-        if (!spans[i].valid) {
-            memcpy(result->data + write, s->data + spans[i].start, (size_t)spans[i].length);
-            write += (size_t)spans[i].length;
-            continue;
-        }
-        blorp_unicode_case_mapping mapped =
-            blorp_case_mapping_for_span(spans, count, i, upper);
-        for (uint8_t j = 0; j < mapped.length; j++) {
-            unsigned char encoded[4];
-            int len = blorp_utf8_encode(mapped.codepoints[j], encoded);
-            memcpy(result->data + write, encoded, (size_t)len);
-            write += (size_t)len;
-        }
-    }
-    result->data[out_len] = '\0';
-    free(spans);
+    blorp_String* result = blorp_string_alloc_uninit((long)out.len, (long)out.len);
+    memcpy(result->data, out.data, out.len);
+    result->data[out.len] = '\0';
+    if (out.data != out.inline_bytes) free(out.data);
     return result;
 }
 

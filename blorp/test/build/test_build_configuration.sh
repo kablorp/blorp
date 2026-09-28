@@ -505,6 +505,10 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle.
 	echo "FAIL: hygiene-check must include the allocation oracle counter contract" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_unicode_case_map.py' Makefile; then
+	echo "FAIL: hygiene-check must include the Unicode case-map differential" >&2
+	exit 1
+fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle_coverage.py' Makefile; then
 	echo "FAIL: hygiene-check must include the allocation oracle raw-call coverage gate" >&2
 	exit 1
