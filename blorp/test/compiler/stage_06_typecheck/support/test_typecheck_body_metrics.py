@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -19,6 +20,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[5]
 COMPILER = ROOT / "bin/blorp"
+
+# `BLORP_TYPECHECK_BODY_METRICS=1` requires a runtime built with
+# `BLORP_MEMORY_DIAGNOSTICS=1`; obtain that sibling compiler through the same
+# shared helper the CLI memory suite uses (prebuilt pair in CI, built on
+# demand locally).
+sys.path.insert(0, str(ROOT / "blorp" / "test" / "cli"))
+from prepare_memory_compiler import SetupError, prepare  # noqa: E402
 
 PROGRAM = textwrap.dedent(
     """\
@@ -50,14 +58,14 @@ TOTAL = re.compile(
 
 
 class TypecheckBodyMetricsTests(unittest.TestCase):
-    def compile_program(self, source_path: Path, output_path: Path, metrics: bool):
+    def compile_program(self, compiler: Path, source_path: Path, output_path: Path, metrics: bool):
         environment = dict(os.environ)
         environment.pop("BLORP_TYPECHECK_BODY_METRICS", None)
         if metrics:
             environment["BLORP_TYPECHECK_BODY_METRICS"] = "1"
         completed = subprocess.run(
             [
-                str(COMPILER),
+                str(compiler),
                 "compile",
                 "--no-format",
                 "-o",
@@ -76,6 +84,11 @@ class TypecheckBodyMetricsTests(unittest.TestCase):
 
     def test_metrics_are_opt_in_and_do_not_change_the_generated_c(self) -> None:
         self.assertTrue(COMPILER.exists(), f"missing {COMPILER}; run make first")
+        try:
+            diagnostic_compiler = prepare(COMPILER, os.environ.get("BLORP_DIAGNOSTIC_BIN"))
+        except SetupError as error:
+            self.skipTest(f"Compiler memory test setup failed: {error}")
+
         with tempfile.TemporaryDirectory() as temp_name:
             temp = Path(temp_name)
             source = temp / "body_metrics_probe.brp"
@@ -83,10 +96,10 @@ class TypecheckBodyMetricsTests(unittest.TestCase):
             quiet_output = temp / "quiet.c"
             metrics_output = temp / "metrics.c"
 
-            quiet = self.compile_program(source, quiet_output, metrics=False)
+            quiet = self.compile_program(COMPILER, source, quiet_output, metrics=False)
             self.assertNotIn("BLORP_TYPECHECK", quiet.stderr)
 
-            loud = self.compile_program(source, metrics_output, metrics=True)
+            loud = self.compile_program(diagnostic_compiler, source, metrics_output, metrics=True)
             self.assertEqual(
                 quiet_output.read_bytes(),
                 metrics_output.read_bytes(),
