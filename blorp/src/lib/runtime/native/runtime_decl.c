@@ -1336,15 +1336,44 @@ static inline bool blorp_same_object(const void* left, const void* right) {
 }
 
 
+// Inline list elements no wider than a pointer travel as the first elem_size
+// bytes of a uintptr_t. A memcpy whose size is a run-time value is a libc call
+// per element, so the common widths get fixed-size copies, which compile to a
+// single load or store; memcpy (not a pointer cast) keeps them free of
+// alignment and aliasing assumptions. Other widths keep the general copy.
+// runtime.c (the embedded runtime) and runtime_decl.c (the declarations a
+// split-TU or --no-embed-runtime program includes) each define these helpers
+// because neither includes the other; keep the two copies identical.
+static inline uintptr_t blorp_list_load_inline_bits(const void* slot, int16_t elem_size) {
+    uintptr_t bits = 0;
+    switch (elem_size) {
+        case 1: memcpy(&bits, slot, 1); break;
+        case 2: memcpy(&bits, slot, 2); break;
+        case 4: memcpy(&bits, slot, 4); break;
+        case 8: memcpy(&bits, slot, 8); break;
+        default: memcpy(&bits, slot, (size_t)elem_size); break;
+    }
+    return bits;
+}
+
+static inline void blorp_list_store_inline_bits(void* slot, uintptr_t bits, int16_t elem_size) {
+    switch (elem_size) {
+        case 1: memcpy(slot, &bits, 1); break;
+        case 2: memcpy(slot, &bits, 2); break;
+        case 4: memcpy(slot, &bits, 4); break;
+        case 8: memcpy(slot, &bits, 8); break;
+        default: memcpy(slot, &bits, (size_t)elem_size); break;
+    }
+}
+
 static inline void* blorp_list_get_inline(blorp_List* list, long index) {
     if (__builtin_expect(!list || index < 0 || index >= list->len, 0)) return NULL;
     if (list->storage_mode == BLORP_LIST_STORAGE_INLINE) {
         if (list->elem_size > (int16_t)sizeof(uintptr_t)) {
             return (void*)((char*)list->data + index * list->elem_size);
         }
-        uintptr_t bits = 0;
-        memcpy(&bits, (char*)list->data + index * list->elem_size, list->elem_size);
-        return (void*)bits;
+        return (void*)blorp_list_load_inline_bits(
+            (char*)list->data + index * list->elem_size, list->elem_size);
     }
     return list->data[index];
 }
@@ -1355,8 +1384,7 @@ static inline void blorp_list_set_raw_inline(blorp_List* list, long index, void*
     if (list->storage_mode == BLORP_LIST_STORAGE_INLINE) {
         void* slot = (char*)list->data + index * list->elem_size;
         if (list->elem_size <= (int16_t)sizeof(uintptr_t)) {
-            uintptr_t bits = (uintptr_t)value;
-            memcpy(slot, &bits, list->elem_size);
+            blorp_list_store_inline_bits(slot, (uintptr_t)value, list->elem_size);
         } else if (value) {
             memcpy(slot, value, list->elem_size);
         } else {
