@@ -1481,7 +1481,7 @@ union CoreExpr:
 	CastExpr(CoreExpr, CoreType, CoreSourceLoc)
 	BoxExpr(CoreBoxOp, CoreType, CoreSourceLoc)
 	UnboxExpr(CoreUnboxKind, CoreExpr, CoreType, CoreSourceLoc)
-	FieldExpr(CoreExpr, String, CoreType, CoreSourceLoc)
+	FieldExpr(CoreExpr, String, CoreFieldRef, CoreType, CoreSourceLoc)
 	TupleFieldExpr(CoreExpr, Int, CoreType, CoreSourceLoc)
 	TupleExpr(List[CoreExpr], CoreType, CoreSourceLoc)
 	TupleConstructExpr(CoreTupleConstruct, CoreType, CoreSourceLoc)
@@ -1641,7 +1641,7 @@ pure func core_expr_type(expr: CoreExpr) -> CoreType:
 			typ
 		UnboxExpr(kind, value, typ, loc):
 			typ
-		FieldExpr(value, field_name, typ, loc):
+		FieldExpr(value, field_name, field_ref, typ, loc):
 			typ
 		TupleFieldExpr(value, field_index, typ, loc):
 			typ
@@ -1804,7 +1804,9 @@ pure func core_expr_source_loc(expr: CoreExpr) -> CoreSourceLoc:
 			loc
 		StaticStringLiteralExpr(_, _, _, loc) | CallExpr(_, _, _, _, loc) | BinaryExpr(_, _, _, _, loc) | LogicalExpr(_, _, _, _, loc) | RecordUpdateExpr(_, _, _, loc) | RecordReuseExpr(_, _, _, loc) | RecordCowUpdateExpr(_, _, _, loc) | UnionReuseConstructExpr(_, _, loc) | WhileExpr(_, _, _, loc) | RangeExpr(_, _, _, loc) | LiteralMatchExpr(_, _, _, _, loc) | IfExpr(_, _, _, _, loc):
 			loc
-		UnaryExpr(_, _, _, loc) | AssignExpr(_, _, _, loc) | FieldExpr(_, _, _, loc) | TupleFieldExpr(_, _, _, loc) | TensorRawViewLetExpr(_, _, _, loc) | TailrecLoopExpr(_, _, _, loc) | TailrecListSpreadRecurExpr(_, _, _, loc) | ForRangeExpr(_, _, _, _, _, loc) | AccessorLiteralMatchExpr(_, _, _, _, loc) | LengthMatchExpr(_, _, _, _, loc):
+		UnaryExpr(_, _, _, loc) | AssignExpr(_, _, _, loc) | TupleFieldExpr(_, _, _, loc) | TensorRawViewLetExpr(_, _, _, loc) | TailrecLoopExpr(_, _, _, loc) | TailrecListSpreadRecurExpr(_, _, _, loc) | ForRangeExpr(_, _, _, _, _, loc) | AccessorLiteralMatchExpr(_, _, _, _, loc) | LengthMatchExpr(_, _, _, _, loc):
+			loc
+		FieldExpr(_, _, _, _, loc):
 			loc
 		LambdaExpr(_, _, _, _, _, loc) | DupExpr(_, _, _, _, _, loc) | DropExpr(_, _, _, _, _, loc) | ConstructorMatchExpr(_, _, _, _, _, loc):
 			loc
@@ -2290,6 +2292,7 @@ record CoreForTensor {
 
 record CoreRecordFieldValue {
 	name: String,
+	ref: CoreFieldRef,
 	value: CoreExpr
 }
 
@@ -2632,8 +2635,60 @@ record CoreUnionDecl {
 }
 
 
+--- Resolved field identity threaded through Core, carried alongside the field
+--- spelling (part (a) of the field name-table slice; emitting members by
+--- ordinal is part (b), which can compute the ordinal from the declaration
+--- through this id).
+--
+--- `field_id` is the field's own `FieldId` (a `DefinitionId`) from typecheck
+--- (`ResolvedFieldIdentity`, `graph/definition_index.brp`). Distinct field
+--- declarations, even same-named ones on different records, have distinct
+--- ids. `CORE_FIELD_REF_UNRESOLVED` marks the synthetic sites that have no
+--- typecheck identity (the runtime tag member, `Range` start/end, tuple-as-
+--- record fields); an unresolved ref is never equal to anything, so callers
+--- that must match those sites compare the spelling explicitly.
+--
+--- The ref is an opaque `Int`, not a one-field `struct` or a `record`: a
+--- struct payload inside a union variant (`FieldExpr`) is boxed, which cost
+--- one allocation per field-access node in every pass that rebuilds it, and
+--- a wrapper record cost one per node minted during lowering. An opaque Int
+--- stays unboxed, the same reason `ResolvedFieldIdentity` is one.
+opaque type CoreFieldRef = Int
+
+CORE_FIELD_REF_UNRESOLVED: Int = -1
+
+pure func core_field_ref(field_id: Int) -> CoreFieldRef:
+	into_opaque CoreFieldRef(field_id)
+
+pure func core_field_ref_id(ref: CoreFieldRef) -> Int:
+	from_opaque CoreFieldRef(ref)
+
+pure func core_field_ref_is_resolved(ref: CoreFieldRef) -> Bool:
+	core_field_ref_id(ref) != CORE_FIELD_REF_UNRESOLVED
+
+--- One rule: equal ids, and an unresolved ref equals nothing.
+pure func core_field_refs_equal(left: CoreFieldRef, right: CoreFieldRef) -> Bool:
+	core_field_ref_is_resolved(left) and core_field_ref_id(left) == core_field_ref_id(right)
+
+--- True only when both refs are resolved and name different fields. Use this
+--- (not `not core_field_refs_equal`) where a conservative answer for an
+--- unresolved ref is "may be the same field".
+pure func core_field_refs_distinct(left: CoreFieldRef, right: CoreFieldRef) -> Bool:
+	(
+		core_field_ref_is_resolved(left)
+		and core_field_ref_is_resolved(right)
+		and core_field_ref_id(left) != core_field_ref_id(right)
+	)
+
+--- The backend's raw runtime union tag member (`tag` in the emitted C struct)
+--- is not a declared Blorp field; it is a fixed runtime ABI member that keeps
+--- its spelling forever.
+CORE_FIELD_REF_RUNTIME_TAG: CoreFieldRef = into_opaque CoreFieldRef(CORE_FIELD_REF_UNRESOLVED)
+
+
 record CoreValueRecordField {
 	name: String,
+	ref: CoreFieldRef,
 	typ: CoreType
 }
 
@@ -2649,6 +2704,7 @@ record CoreValueRecordDecl {
 
 record CoreHeapRecordField {
 	name: String,
+	ref: CoreFieldRef,
 	typ: CoreType,
 	release_policy: CoreReleasePolicy
 }
@@ -6251,9 +6307,25 @@ pure func decode_core_list_retain_json(
 	})
 
 
+pure func core_field_ref_to_json(ref: CoreFieldRef) -> JsonValue:
+	JsonObject([
+		("field_id", json_int(core_field_ref_id(ref))),
+	])
+
+
+pure func decode_core_field_ref_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreFieldRef, CoreJsonError]:
+	field_id ?= int_field(value, path, "field_id")
+
+	Ok(core_field_ref(field_id))
+
+
 pure func core_record_field_value_to_json(field: CoreRecordFieldValue) -> JsonValue:
 	JsonObject([
 		("name", JsonString(field.name)),
+		("field_ref", core_field_ref_to_json(field.ref)),
 		("value", core_expr_to_json(field.value)),
 	])
 
@@ -6263,6 +6335,7 @@ pure func decode_core_record_field_value_json(
 	path: String,
 ) -> Result[CoreRecordFieldValue, CoreJsonError]:
 	name ?= string_field(value, path, "name")
+	ref ?= decode_optional_field_ref_json(value, path, "field_ref")
 	value_json ?= object_field(value, path, "value")
 	expr_value ?= decode_core_expr_json(
 		value_json,
@@ -6271,8 +6344,28 @@ pure func decode_core_record_field_value_json(
 
 	Ok({
 		name = name,
+		ref = ref,
 		value = expr_value,
 	})
+
+
+---
+Old artifacts encoded before this field carried an identity ref may omit
+"field_ref"; missing it decodes to the unresolved sentinel rather
+than failing the whole artifact, since the ref is round-trip metadata for
+identity comparisons and not required for structural correctness of a
+decoded field value on its own.
+---
+private pure func decode_optional_field_ref_json(
+	value: JsonValue,
+	path: String,
+	key: String,
+) -> Result[CoreFieldRef, CoreJsonError]:
+	match object_field(value, path, key):
+		Ok(ref_json):
+			decode_core_field_ref_json(ref_json, path_field(path, key))
+		Err(_):
+			Ok(core_field_ref(CORE_FIELD_REF_UNRESOLVED))
 
 
 private pure func core_record_fields_to_json(fields: List[CoreRecordFieldValue]) -> JsonValue:
@@ -9502,6 +9595,7 @@ private pure func core_expr_unbox_to_json(
 private pure func core_expr_field_to_json(
 	expr_value: CoreExpr,
 	field_name: String,
+	field_ref: CoreFieldRef,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> JsonValue:
@@ -9509,6 +9603,7 @@ private pure func core_expr_field_to_json(
 		(KIND_FIELD, JsonString(FIELD_EXPR_TAG)),
 		("expr", core_expr_to_json(expr_value)),
 		("field", JsonString(field_name)),
+		("field_ref", core_field_ref_to_json(field_ref)),
 		("type", core_type_to_json(typ)),
 		("loc", source_loc_to_json(loc)),
 	])
@@ -10781,8 +10876,8 @@ pure func core_expr_to_json(expr: CoreExpr) -> JsonValue:
 			core_expr_box_to_json(box, typ, loc)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
 			core_expr_unbox_to_json(unbox_kind, expr_value, typ, loc)
-		FieldExpr(expr_value, field_name, typ, loc):
-			core_expr_field_to_json(expr_value, field_name, typ, loc)
+		FieldExpr(expr_value, field_name, field_ref, typ, loc):
+			core_expr_field_to_json(expr_value, field_name, field_ref, typ, loc)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
 			core_expr_tuple_field_to_json(expr_value, field_index, typ, loc)
 		TupleExpr(items, typ, loc):
@@ -11338,6 +11433,7 @@ private pure func decode_core_expr_field_from_json(
 		path_field(path, "expr"),
 	)
 	field_name ?= string_field(value, path, "field")
+	field_ref ?= decode_optional_field_ref_json(value, path, "field_ref")
 	type_json ?= object_field(value, path, "type")
 	typ ?= decode_core_type_json(
 		type_json,
@@ -11348,7 +11444,7 @@ private pure func decode_core_expr_field_from_json(
 		loc_json,
 		path_field(path, "loc"),
 	)
-	Ok(FieldExpr(expr_value, field_name, typ, loc))
+	Ok(FieldExpr(expr_value, field_name, field_ref, typ, loc))
 
 
 private pure func decode_core_expr_tuple_field_from_json(
@@ -14639,6 +14735,7 @@ pure func decode_core_union_decl_json(
 pure func core_value_record_field_to_json(field: CoreValueRecordField) -> JsonValue:
 	JsonObject([
 		("name", JsonString(field.name)),
+		("field_ref", core_field_ref_to_json(field.ref)),
 		("type", core_type_to_json(field.typ)),
 	])
 
@@ -14648,6 +14745,7 @@ pure func decode_core_value_record_field_json(
 	path: String,
 ) -> Result[CoreValueRecordField, CoreJsonError]:
 	name ?= string_field(value, path, "name")
+	ref ?= decode_optional_field_ref_json(value, path, "field_ref")
 	type_json ?= object_field(value, path, "type")
 	typ ?= decode_core_type_json(
 		type_json,
@@ -14656,6 +14754,7 @@ pure func decode_core_value_record_field_json(
 
 	Ok({
 		name = name,
+		ref = ref,
 		typ = typ,
 	})
 
@@ -14699,6 +14798,7 @@ private pure func decode_core_value_record_fields(
 pure func core_heap_record_field_to_json(field: CoreHeapRecordField) -> JsonValue:
 	JsonObject([
 		("name", JsonString(field.name)),
+		("field_ref", core_field_ref_to_json(field.ref)),
 		("type", core_type_to_json(field.typ)),
 		("release_policy", JsonString(core_release_policy_to_string(field.release_policy))),
 	])
@@ -14709,6 +14809,7 @@ pure func decode_core_heap_record_field_json(
 	path: String,
 ) -> Result[CoreHeapRecordField, CoreJsonError]:
 	name ?= string_field(value, path, "name")
+	ref ?= decode_optional_field_ref_json(value, path, "field_ref")
 	type_json ?= object_field(value, path, "type")
 	typ ?= decode_core_type_json(
 		type_json,
@@ -14722,6 +14823,7 @@ pure func decode_core_heap_record_field_json(
 
 	Ok({
 		name = name,
+		ref = ref,
 		typ = typ,
 		release_policy = release_policy,
 	})

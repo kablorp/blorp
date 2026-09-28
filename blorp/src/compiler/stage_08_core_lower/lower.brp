@@ -77,7 +77,11 @@ import:
 		TypedUnionInfo,
 		TypedUnionVariantInfo,
 		typed_foreign_arg_passing_borrows,
-	../stage_06_typecheck/graph/definition_index: DefinitionTable, definition_table_module_table
+	../stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		ResolvedFieldIdentity,
+		definition_table_module_table,
+		resolved_field_identity_runtime_value,
 	../stage_06_typecheck/headers/declaration_skeleton:
 		callable_id_definition_id,
 		callable_id_module_id,
@@ -323,6 +327,8 @@ import:
 			WhileExpr,
 			VoidExpr,
 		),
+		CORE_FIELD_REF_UNRESOLVED,
+		CoreFieldRef,
 		CoreForChannel,
 		CoreForDict,
 		CoreForList,
@@ -402,6 +408,7 @@ import:
 		CoreUnionVariant,
 		CoreValueRecordField,
 		CoreVar,
+		core_field_ref,
 		pack_core_source_loc,
 		synthetic_core_source_loc,
 	../stage_09_core/type_policy as CoreTypePolicy
@@ -1244,7 +1251,7 @@ private pure func apply_resolved_callee_identity(
 					match callee:
 						VarExpr(variable, typ, loc):
 							Ok(VarExpr({ variable | name = name }, typ, loc))
-						FieldExpr(_, _, typ, loc):
+						FieldExpr(_, _, _, typ, loc):
 							Ok(VarExpr(core_var(name, None), typ, loc))
 						_:
 							Ok(callee)
@@ -2388,6 +2395,7 @@ private pure func lower_typed_record_fields(
 				Ok(value):
 					lowered = lowered.append({
 						name = field.name.text,
+						ref = core_field_ref_from_resolved(field.field_id),
 						value = value,
 					})
 				Err(error):
@@ -2400,6 +2408,14 @@ private pure func lower_typed_record_fields(
 			Ok(lowered)
 
 
+--- Typecheck already resolved every field access, literal field, update field
+--- and declaration field to a `ResolvedFieldIdentity`; this carries that
+--- field id into Core. A missing identity (recovery only) becomes
+--- `CORE_FIELD_REF_UNRESOLVED`, which is the same -1 value.
+private pure func core_field_ref_from_resolved(identity: ResolvedFieldIdentity) -> CoreFieldRef:
+	core_field_ref(resolved_field_identity_runtime_value(identity))
+
+
 private pure func lower_record_update_field(
 	context: CoreLowerContext,
 	field: ResolvedRecordField,
@@ -2408,6 +2424,7 @@ private pure func lower_record_update_field(
 	loc: CoreSourceLoc,
 ) -> Result[CoreRecordFieldValue, CoreLowerError]:
 	field_type ?= core_lower_type_with_prefixes(context.module_member_prefixes, field.field_type)
+	field_ref: CoreFieldRef = core_field_ref_from_resolved(field.field_id)
 
 	match updates.find(func(update): update.name == field.name):
 		Some(update):
@@ -2415,7 +2432,8 @@ private pure func lower_record_update_field(
 		None:
 			Ok({
 				name = field.name,
-				value = FieldExpr(base_ref, field.name, field_type, loc),
+				ref = field_ref,
+				value = FieldExpr(base_ref, field.name, field_ref, field_type, loc),
 			})
 
 
@@ -2590,6 +2608,7 @@ private pure func lower_typed_field_access(
 	context: CoreLowerContext,
 	receiver: TypedExpr,
 	field: ParsedIdentifier,
+	field_identity: ResolvedFieldIdentity,
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreExpr, CoreLowerError]:
@@ -2598,6 +2617,7 @@ private pure func lower_typed_field_access(
 		context.module_member_prefixes,
 		typed_expr_value_type(receiver),
 	)
+	field_ref: CoreFieldRef = core_field_ref_from_resolved(field_identity)
 
 	match receiver_type:
 		TupleType(items):
@@ -2632,9 +2652,9 @@ private pure func lower_typed_field_access(
 					None:
 						Err(CoreLowerInvalidType("tuple field access requires numeric field name"))
 			else:
-				Ok(FieldExpr(lowered_receiver, field.text, typ, loc))
+				Ok(FieldExpr(lowered_receiver, field.text, field_ref, typ, loc))
 		_:
-			Ok(FieldExpr(lowered_receiver, field.text, typ, loc))
+			Ok(FieldExpr(lowered_receiver, field.text, field_ref, typ, loc))
 
 
 ---
@@ -3206,10 +3226,17 @@ private pure func lower_typed_range_value_for(
 		clone_core_type(range_type),
 		clone_core_source_loc(loc),
 	)
-	start_expr = FieldExpr(range_ref, "start", CORE_INT_TYPE, clone_core_source_loc(loc))
+	start_expr = FieldExpr(
+		range_ref,
+		"start",
+		core_field_ref(CORE_FIELD_REF_UNRESOLVED),
+		CORE_INT_TYPE,
+		clone_core_source_loc(loc),
+	)
 	end_expr = FieldExpr(
 		VarExpr(clone_core_var(range_var), clone_core_type(range_type), clone_core_source_loc(loc)),
 		"end",
+		core_field_ref(CORE_FIELD_REF_UNRESOLVED),
 		CORE_INT_TYPE,
 		clone_core_source_loc(loc),
 	)
@@ -5449,8 +5476,8 @@ private pure func lower_typed_expr_as_type_impl(
 		TypedDictExpr(entries, _, _):
 			lowered_entries ?= lower_typed_dict_entries(context, entries)
 			Ok(DictExpr(lowered_entries, typ, loc))
-		TypedFieldAccessExpr(receiver, field, _, _, _):
-			lower_typed_field_access(context, receiver, field, typ, loc)
+		TypedFieldAccessExpr(receiver, field, field_identity, _, _):
+			lower_typed_field_access(context, receiver, field, field_identity, typ, loc)
 		TypedRangeExpr(start_expr, end_expr, _, _):
 			lowered_start ?= lower_typed_expr_with_context(context, start_expr)
 			lowered_end ?= lower_typed_expr_with_context(context, end_expr)
@@ -5918,6 +5945,7 @@ private pure func lower_value_record_field(
 	typ ?= core_lower_type_with_prefixes(module_member_prefixes, field.semantic_type)
 	Ok({
 		name = field.name,
+		ref = core_field_ref_from_resolved(field.field_id),
 		typ = typ,
 	})
 
@@ -5951,6 +5979,7 @@ private pure func lower_heap_record_field(
 	typ ?= core_lower_type_with_prefixes(module_member_prefixes, field.semantic_type)
 	Ok({
 		name = field.name,
+		ref = core_field_ref_from_resolved(field.field_id),
 		typ = typ,
 		release_policy = CoreTypePolicy.cleanup_release_policy_for_type(typ),
 	})
