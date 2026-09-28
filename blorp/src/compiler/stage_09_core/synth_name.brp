@@ -4,14 +4,28 @@
 -- and source names may contain that sequence. Decode relative to the explicit
 -- source module carried by the function, then remove only compiler-owned
 -- suffixes.
+--
+-- This module also owns the two markers `mono.brp` embeds when it
+-- synthesizes a specialized function or data-type name
+-- (`mangle_specialization_name`/`mangle_generic_data_name`) and the single
+-- accessor set that recovers a name's parts from them. No other module may
+-- parse a mono-mangled or pure-overload name directly; call these accessors
+-- instead.
 import:
 	../stage_08_core_lower/identity: core_module_member_prefix
 	ir: CoreFunction, CoreFunctionKind(UnresolvedBuiltinFunction)
 
 
-private MONO_NAME_MARKER: String = "__mono_"
+-- `mono.brp` embeds this marker right after a specialized function or
+-- data-type's source name, followed by an encoded substitution or argument
+-- list. This module owns the marker and the accessors below; no other
+-- module may embed or parse it directly.
+MONO_NAME_MARKER: String = "__mono_"
 
-private PURE_NAME_SUFFIX: String = "__pure"
+-- `stage_08_core_lower/identity.brp`'s pure-overload naming appends this
+-- suffix to a function's mangled name. This module owns the accessor
+-- that recovers a name's parts; no other module may parse it directly.
+PURE_NAME_SUFFIX: String = "__pure"
 
 
 private pure func last_index_of(value: String, needle: String) -> Int:
@@ -31,17 +45,43 @@ private pure func last_index_of(value: String, needle: String) -> Int:
 	last_index
 
 
-private pure func strip_mono_suffix(name: String) -> String:
-	marker_index: Int = last_index_of(name, MONO_NAME_MARKER)
+---
+The base name before the last `MONO_NAME_MARKER`, or `name` unchanged when
+it carries no marker. A name can carry the marker more than once: mono can
+specialize an already-specialized name (for example a pure-overload variant
+of a prior specialization), so an earlier round's marker survives inside
+the base name and only the last marker delimits the outermost
+specialization's encoded suffix.
+---
+pure func mono_name_base(name: String) -> String:
+	index: Int = last_index_of(name, MONO_NAME_MARKER)
 
-	if marker_index < 0:
+	if index < 0:
 		name
 	else:
-		name.substring(0, marker_index)
+		name.substring(0, index)
 
 
-private pure func strip_pure_suffix(name: String) -> String:
-	if name.ends_with(PURE_NAME_SUFFIX):
+---
+True when `name` carries a mono-specialization marker.
+---
+pure func is_mono_specialization_name(name: String) -> Bool:
+	last_index_of(name, MONO_NAME_MARKER) >= 0
+
+
+---
+True when `name` ends with the pure-overload suffix.
+---
+pure func is_pure_variant_name(name: String) -> Bool:
+	name.ends_with(PURE_NAME_SUFFIX)
+
+
+---
+`name` with a trailing pure-overload suffix removed, or `name` unchanged
+when it carries none.
+---
+pure func strip_pure_suffix(name: String) -> String:
+	if is_pure_variant_name(name):
 		name.substring(0, name.length() - PURE_NAME_SUFFIX.length())
 	else:
 		name
@@ -63,7 +103,7 @@ pure func synthesis_source_name_with_prefix(
 			module_prefix.length(),
 			function_name.length() - module_prefix.length(),
 		)
-		Some(strip_pure_suffix(strip_mono_suffix(qualified_name)))
+		Some(strip_pure_suffix(mono_name_base(qualified_name)))
 
 
 pure func synthesis_source_name(function_info: CoreFunction) -> Option[String]:
