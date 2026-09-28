@@ -501,6 +501,10 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_memory_diagno
 	echo "FAIL: hygiene-check must include the split-link memory diagnostics contract" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_release_path.py' Makefile; then
+	echo "FAIL: hygiene-check must include the final-release path contract" >&2
+	exit 1
+fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle.py' Makefile; then
 	echo "FAIL: hygiene-check must include the allocation oracle counter contract" >&2
 	exit 1

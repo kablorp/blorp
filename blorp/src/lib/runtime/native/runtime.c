@@ -1403,13 +1403,31 @@ uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn
     return cached;
 }
 
-void blorp_set_destructor_id(void* obj, uint32_t id) {
-    if (obj) ((blorp_Object*)obj)->destructor_id = id;
-}
-
+// A plain table load, with no acquire of the slot count and no bounds check.
+// Every nonzero id in a header came from blorp_get_destructor_id, which writes
+// the slot before it release-stores the count and then the site cache, all
+// under the registry mutex; so the id is always below the count and within
+// BLORP_DESTRUCTOR_SLOTS, and slot 0 stays NULL. The thread that stored the id
+// into the header obtained it with an acquire of the site cache (or under the
+// mutex), so the slot write happens-before that header store. The releasing
+// thread reads destructor_id with a plain load, which is only race-free if the
+// header store happens-before it (through the object's hand-off and the
+// release/acquire-fence pair on the final decrement). By transitivity the slot
+// write happens-before this load, so the old acquire of the count added no
+// ordering. Slots are written once and never change. A diagnostic runtime
+// still checks the id against the registered count so a corrupted header is
+// reported instead of calling through an arbitrary slot.
 static inline blorp_destructor_fn blorp_destructor_for_id(uint32_t id) {
+#if BLORP_MEMORY_DIAGNOSTICS
     uint32_t count = atomic_load_explicit(&__blorp_destructor_count, memory_order_acquire);
-    return id < count ? __blorp_destructors[id] : NULL;
+    if (__builtin_expect(id >= count, 0)) {
+        fprintf(stderr,
+            "blorp: object header names destructor id %u, but only %u are registered\n",
+            id, count);
+        abort();
+    }
+#endif
+    return __blorp_destructors[id];
 }
 
 // Installs `fn` as obj's destructor through a per-site id cache. Every
@@ -5365,11 +5383,16 @@ static int blorp_io_reactor_take_ready(
 // BLORP_IMMORTAL_REFCOUNT and BLORP_IS_IMMORTAL_REFCOUNT are defined next to
 // blorp_Object above, before their first use in the leak checker.
 
-// Slow path for release — called when refcount reaches zero.
-// Separated so the fast path (decrement + check) can be inlined.
-__attribute__((noinline))
-static void blorp_release_slow_finish(blorp_Object* header, void* obj,
-                                      blorp_destructor_fn destructor) {
+// Final release: run the destructor, return the block, and settle the
+// diagnostic bookkeeping. Always inlined into the two extern entry points
+// below, so a final release is one out-of-line call from the inline fast path
+// (in this file and in runtime_decl.c alike) instead of extern -> slow ->
+// noinline finish. Keeping the entry points out of line keeps the inline
+// fast paths small and keeps a nested destructor chain (a list of lists) at
+// one entry-point frame plus the destructor's frame per level.
+__attribute__((always_inline))
+static inline void blorp_release_final(blorp_Object* header, void* obj,
+                                       blorp_destructor_fn destructor) {
 #if BLORP_MEMORY_DIAGNOSTICS
     blorp_AllocMeta* meta = __alloc_meta_take(header);
     bool stats_tracked = meta && meta->stats_tracked;
@@ -5402,21 +5425,18 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
 #endif
 }
 
-static void blorp_release_slow(blorp_Object* header, void* obj) {
-    blorp_release_slow_finish(header, obj,
-        blorp_destructor_for_id(header->destructor_id));
-}
-
-// Extern entry point for precompiled runtime (runtime_decl.c inline fast path calls this)
+// Slow path for release — called when refcount reaches zero. Extern because
+// the runtime_decl.c inline fast path calls it from generated code.
+__attribute__((noinline))
 void blorp_release_slow_extern(void* obj) {
     blorp_Object* header = (blorp_Object*)obj;
-    blorp_release_slow(header, obj);
+    blorp_release_final(header, obj, blorp_destructor_for_id(header->destructor_id));
 }
 
 // Extern entry point for ARC-only values whose layouts cannot have nested destructors.
+__attribute__((noinline))
 void blorp_release_arc_only_slow_extern(void* obj) {
-    blorp_Object* header = (blorp_Object*)obj;
-    blorp_release_slow_finish(header, obj, NULL);
+    blorp_release_final((blorp_Object*)obj, obj, NULL);
 }
 
 // Counted growth for the generated iterative union destructor's work stack
@@ -5490,7 +5510,7 @@ inline void blorp_release(void* obj) {
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
         BLORP_RC_ACQUIRE_FENCE();
-        blorp_release_slow(header, obj);
+        blorp_release_slow_extern(obj);
     }
 }
 
@@ -5501,7 +5521,7 @@ inline void blorp_release_arc_only(void* obj) {
     long prev = BLORP_RC_DEC_PREV(header->refcount);
     if (__builtin_expect(prev == 1, 0)) {
         BLORP_RC_ACQUIRE_FENCE();
-        blorp_release_slow_finish(header, obj, NULL);
+        blorp_release_arc_only_slow_extern(obj);
     }
 }
 
@@ -5551,13 +5571,24 @@ void blorp_elem_release_fn(void* p) {
     if (p) blorp_release(p);
 }
 
+// Releases one non-NULL element through a collection's release function.
+// Nearly every collection of heap values uses blorp_elem_release_fn, whose
+// body is exactly blorp_release, so destroy loops release those elements
+// inline instead of through an indirect call; any other release function is
+// still called as before.
+static inline void blorp_release_element_with(void (*release_fn)(void*), void* value) {
+    if (__builtin_expect(release_fn == blorp_elem_release_fn, 1)) blorp_release(value);
+    else release_fn(value);
+}
+
 // List destructor — releases elements if elem_release is set, then no-op
 // (flexible array member is freed with the struct by blorp_release)
 static void blorp_list_destroy(void* obj) {
     blorp_List* list = (blorp_List*)obj;
-    if (list->storage_mode == BLORP_LIST_STORAGE_POINTER && list->elem_release) {
+    void (*elem_release)(void*) = list->elem_release;
+    if (list->storage_mode == BLORP_LIST_STORAGE_POINTER && elem_release) {
         for (long i = 0; i < list->len; i++) {
-            if (list->data[i]) list->elem_release(list->data[i]);
+            if (list->data[i]) blorp_release_element_with(elem_release, list->data[i]);
         }
     }
 }
@@ -5576,8 +5607,9 @@ static void blorp_vector_destroy(void* obj) {
     blorp_Vector* v = (blorp_Vector*)obj;
     if (v->elem_release) {
         // Use capacity to cover all elements in 2D matrices (len=rows, capacity=rows*cols)
+        void (*elem_release)(void*) = v->elem_release;
         for (long i = 0; i < v->capacity; i++) {
-            if (v->data[i]) v->elem_release(v->data[i]);
+            if (v->data[i]) blorp_release_element_with(elem_release, v->data[i]);
         }
     }
 }
@@ -9303,6 +9335,9 @@ static inline void blorp_stack_result_release(blorp_StackResult res) {
     if (payload) blorp_release(payload);
 }
 
+// Must release only the payload that release_mask bit 0 owns:
+// blorp_stack_result_from_boxed frees a unique box without running this
+// destructor and moves that payload reference to the stack value instead.
 static void blorp_stack_result_box_destroy(void* obj) {
     blorp_StackResult* res = (blorp_StackResult*)((char*)obj + sizeof(blorp_Object));
     blorp_stack_result_release(*res);
@@ -9497,6 +9532,9 @@ typedef struct {
 #define BLORP_TAG_OK 0
 #define BLORP_TAG_ERR 1
 
+// Must release only the payload that release_mask bit 0 owns:
+// blorp_stack_result_from_boxed frees a unique box without running this
+// destructor and moves that payload reference to the stack value instead.
 static void blorp_result_destroy(void* obj) {
     blorp_Result* res = (blorp_Result*)obj;
     if (res->tag == BLORP_TAG_OK) {
@@ -9515,12 +9553,23 @@ static inline blorp_StackResult blorp_stack_result_from_boxed(blorp_Result* res)
     out.release_mask = res->release_mask & 1UL;
     if (res->tag == BLORP_TAG_OK) {
         out.data.Ok.field0 = res->data.Ok.field0;
-        if (out.release_mask && out.data.Ok.field0) blorp_retain(out.data.Ok.field0);
     } else {
         out.data.Err.field0 = res->data.Err.field0;
-        if (out.release_mask && out.data.Err.field0) blorp_retain(out.data.Err.field0);
     }
-    blorp_release(res);
+    // A unique box hands its payload reference to the stack value: every
+    // boxed Result's destructor only releases the payload its release bit
+    // owns, so freeing the box without its destructor replaces a retain, a
+    // destructor call, and the matching release. blorp_release_arc_only's
+    // final decrement still takes the acquire fence before the free. A
+    // shared box keeps its reference, so the stack value takes a new one.
+    // Kept identical to the runtime_decl.c copy.
+    if (blorp_is_unique(res)) {
+        blorp_release_arc_only(res);
+    } else {
+        void* payload = res->tag == BLORP_TAG_OK ? out.data.Ok.field0 : out.data.Err.field0;
+        if (out.release_mask && payload) blorp_retain(payload);
+        blorp_release(res);
+    }
     return out;
 }
 
@@ -21430,8 +21479,10 @@ static void blorp_dict_destroy(void* obj) {
     for (long i = 0; i < dict->order_len; i++) {
         long slot = dict->order[i];
         if (slot < 0) continue;
-        if (dict->key_release && dict->keys[slot]) dict->key_release(dict->keys[slot]);
-        if (dict->value_release && dict->values[slot]) dict->value_release(dict->values[slot]);
+        if (dict->key_release && dict->keys[slot])
+            blorp_release_element_with(dict->key_release, dict->keys[slot]);
+        if (dict->value_release && dict->values[slot])
+            blorp_release_element_with(dict->value_release, dict->values[slot]);
     }
     blorp_dict_free_storage(dict->keys);
 }
@@ -21858,7 +21909,8 @@ static void blorp_set_destroy(void* obj) {
     blorp_SetEntry* entry = set->first;
     while (entry) {
         blorp_SetEntry* next = entry->next_order;
-        if (set->key_release && entry->key) set->key_release(entry->key);
+        if (set->key_release && entry->key)
+            blorp_release_element_with(set->key_release, entry->key);
         free(entry);
         entry = next;
     }

@@ -948,7 +948,6 @@ static inline _Float16 blorp_unbox_float16(void* p) {
 
 void* blorp_alloc(size_t size);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
-void blorp_set_destructor_id(void* obj, uint32_t id);
 
 // Installs `fn` as obj's destructor through a per-site id cache. Every
 // generated allocation site runs this, so the cached path (one acquire load
@@ -1041,7 +1040,6 @@ void* blorp_alloc(size_t size);
 void blorp_move_ref(void* obj);
 void blorp_set_type_tag(void* obj, const char* tag);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
-void blorp_set_destructor_id(void* obj, uint32_t id);
 
 // Whether the linked runtime object records allocation metadata. It is a
 // runtime symbol, not a macro, because one generated body object is linked
@@ -1142,6 +1140,16 @@ static inline void blorp_release_arc_only(void* obj) {
         BLORP_RC_ACQUIRE_FENCE();
         blorp_release_arc_only_slow_extern(obj);
     }
+}
+
+static inline bool blorp_is_unique(void* obj) {
+    if (__builtin_expect(obj == NULL, 0)) return false;
+    blorp_Object* header = (blorp_Object*)obj;
+#ifdef BLORP_SINGLE_THREADED
+    return header->refcount == 1;
+#else
+    return atomic_load_explicit(&header->refcount, memory_order_relaxed) == 1;
+#endif
 }
 
 void blorp_cleanup_release_arc_value(void* value);
@@ -1273,6 +1281,9 @@ static inline void blorp_stack_result_release(blorp_StackResult res) {
     if (payload) blorp_release(payload);
 }
 
+// Must release only the payload that release_mask bit 0 owns:
+// blorp_stack_result_from_boxed frees a unique box without running this
+// destructor and moves that payload reference to the stack value instead.
 static void blorp_stack_result_box_destroy(void* obj) {
     blorp_StackResult* res = (blorp_StackResult*)((char*)obj + sizeof(blorp_Object));
     blorp_stack_result_release(*res);
@@ -1294,12 +1305,23 @@ static inline blorp_StackResult blorp_stack_result_from_boxed(blorp_Result* res)
     out.release_mask = res->release_mask & 1UL;
     if (res->tag == BLORP_TAG_OK) {
         out.data.Ok.field0 = res->data.Ok.field0;
-        if (out.release_mask && out.data.Ok.field0) blorp_retain(out.data.Ok.field0);
     } else {
         out.data.Err.field0 = res->data.Err.field0;
-        if (out.release_mask && out.data.Err.field0) blorp_retain(out.data.Err.field0);
     }
-    blorp_release(res);
+    // A unique box hands its payload reference to the stack value: every
+    // boxed Result's destructor only releases the payload its release bit
+    // owns, so freeing the box without its destructor replaces a retain, a
+    // destructor call, and the matching release. blorp_release_arc_only's
+    // final decrement still takes the acquire fence before the free. A
+    // shared box keeps its reference, so the stack value takes a new one.
+    // Kept identical to the runtime.c copy.
+    if (blorp_is_unique(res)) {
+        blorp_release_arc_only(res);
+    } else {
+        void* payload = res->tag == BLORP_TAG_OK ? out.data.Ok.field0 : out.data.Err.field0;
+        if (out.release_mask && payload) blorp_retain(payload);
+        blorp_release(res);
+    }
     return out;
 }
 
@@ -1316,16 +1338,6 @@ static inline blorp_StackResult blorp_stack_result_borrow_from_boxed(const blorp
         out.data.Err.field0 = res->data.Err.field0;
     }
     return out;
-}
-
-static inline bool blorp_is_unique(void* obj) {
-    if (__builtin_expect(obj == NULL, 0)) return false;
-    blorp_Object* header = (blorp_Object*)obj;
-#ifdef BLORP_SINGLE_THREADED
-    return header->refcount == 1;
-#else
-    return atomic_load_explicit(&header->refcount, memory_order_relaxed) == 1;
-#endif
 }
 
 // Allocation identity, not value equality: true only when both operands name
