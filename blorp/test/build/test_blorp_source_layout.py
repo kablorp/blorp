@@ -15,6 +15,10 @@ CHECKER = ROOT / "scripts" / "check-blorp-layout"
 
 
 class BlorpSourceLayoutTests(unittest.TestCase):
+	def test_repository_satisfies_source_and_test_layout(self) -> None:
+		result = self.run_checker(ROOT)
+		self.assertEqual(result.returncode, 0, result.stderr)
+
 	def test_repository_separates_standard_library_sources_and_tests(self) -> None:
 		source_root = ROOT / "standard_library/src"
 		test_root = ROOT / "standard_library/test"
