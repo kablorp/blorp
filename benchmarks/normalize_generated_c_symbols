@@ -17,10 +17,12 @@ Usage:
 
 Sidecar v1 is JSON with `version: 1`, `c_sha256` for exact UTF-8 C bytes, and
 `locals`, a list of `{owner_definition_id, local_ordinal, scope_span,
-emitted_identifier, declaration_span, reference_spans}` records. It may also
+emitted_identifier, declaration_span, reference_spans}` records, plus an
+optional `declared_type` field (see below). It may also
 contain `generated`, a list of `{kind, identity, spelling, spans}` records,
-where kind is callable, static_closure, definition, variable_suffix, or
-definition_comment. Spans are zero-based `[start, end]` character offsets into
+where kind is callable, static_closure, definition, variable_suffix,
+definition_comment, type, temp, local_argument, local_source_binder, global,
+or field. Spans are zero-based `[start, end]` character offsets into
 the C text. Local spans cover full identifier tokens; generated spans cover
 the exact spelling supplied. Every occurrence of a mapped spelling must be
 listed. V1 local rows cover simple block-local declarations with primitive/
@@ -31,11 +33,22 @@ brace pair containing its declaration, and that brace pair must be a recognized
 compound opening: a primitive/tagged-return function body, control body ending
 `)`, naked nested block, `else`/`do`/label body, or assignment/return
 statement expression ending `= (` / `return (`.
-Unknown openings, type definitions, and initializer braces reject. Typedef-typed locals,
-unknown included-header types, parameters, function pointers, and complex
-declarators fail closed and remain raw-different. C5c must emit only supported
-rows, or deliberately version and extend the oracle or emit an independently
-validated compiler-owned binding marker before relying on those forms.
+Unknown openings, type definitions, and initializer braces reject. Function
+pointers and other complex declarators fail closed and remain raw-different.
+A local row may instead carry a `declared_type` string naming a typedef the
+declarator uses -- a `brp_ty...` projected type or a `blorp_...` runtime
+typedef (`blorp_StackOption_*`, `blorp_List*`, and similarly spelled types) --
+so the declaration/parameter can be recognized without the tool parsing C
+declarators itself; the recorded type still must appear as the exact prefix
+token, and function pointers/complex declarators remain rejected regardless.
+The same declarator grammar, plus `declared_type`, also recognizes function
+parameters: a local row whose declaration span falls inside a recognized
+function's parameter list is accepted when the parameter's type prefix is a
+primitive/tagged sequence or matches `declared_type`, followed directly by
+`,` or `)`; its reference spans still must lie inside the function body scope.
+C5c must emit only supported rows, or deliberately version and extend the
+oracle or emit an independently validated compiler-owned binding marker
+before relying on unsupported forms.
 Every mapped identifier token is listed exactly once; a reference belongs to
 the innermost containing declaration that precedes it. Logical and scoped
 local keys occur in exactly one row. Directive tokens, member names, labels,
@@ -48,7 +61,32 @@ identifier roles can be trusted. Raw comparison remains available.
 Numeric IDs may drift: normalization numbers locals by structural scope and
 declaration order, and other generated symbols by their first occurrence
 within each family. Linked callable/closure and definition/comment rows must
-agree on the raw identity payload within each file.
+agree on the raw identity payload within each file. The `field` kind covers
+projected struct/union member spellings (`f0`, `f1`, ... and the existing
+union payload slots `field0`, `field1`, ...) under one family, so an ordinal
+rename of record members normalizes against a parent that still spells them
+out. Members that keep fixed spellings across the projection -- `header`,
+`tag`, `release_mask`, `data`, the `Ok`/`Err`/`Some` payload members, and the
+runtime stats struct fields -- are simply never given `field` rows, since
+their names do not match the family's grammar.
+
+`--project-locals` is a second, sidecar-free mode for the transition period:
+with no `--sidecar` given, it normalizes any identifier matching the local
+(`brp_v<owner>_a<key>` or `brp_v<owner>_s<key>`, combined into one family since
+this mode cannot distinguish the two), temp (`__t...`), type (`brp_ty...`),
+global (`brp_g...`), or field (`f<N>`/`field<N>`) grammars, by first occurrence
+per family. Local/temp/type/global ordinals reset at each top-level
+brace-enclosed body (approximating per-function scope); field ordinals are
+file-wide, since record members are referenced across many function bodies.
+This is weaker than a sidecar: it has no owner/scope information, so it
+cannot tell two different bindings that happen to alternate spellings apart,
+and it matches identifiers by spelling alone regardless of C role (a field
+access, a declarator, and an unrelated local sharing a matched spelling are
+all rewritten the same way). It also cannot know which records are
+foreign-ABI-constrained and must keep their spellings; without a sidecar,
+foreign-ABI record fields are compared raw like any other unmapped spelling.
+Use `--project-locals` only to check a projection landing against its parent
+before the compiler emits sidecars.
 
 Exit status is 0 when the hashes agree, 1 when they do not, and 2 on a usage or
 I/O error.
@@ -79,7 +117,34 @@ GENERATED_GRAMMARS = {
     "definition": re.compile(r"__def_[0-9]+_"),
     "variable_suffix": re.compile(r"[A-Za-z_][A-Za-z_0-9]*__v[0-9]+"),
     "definition_comment": re.compile(r"def_id=[0-9]+"),
+    "type": re.compile(r"brp_ty[A-Za-z0-9]+"),
+    "temp": re.compile(r"__t[A-Za-z0-9]+"),
+    "local_argument": re.compile(r"brp_v[A-Za-z0-9]+_a[A-Za-z0-9]+"),
+    "local_source_binder": re.compile(r"brp_v[A-Za-z0-9]+_s[A-Za-z0-9]+"),
+    "global": re.compile(r"brp_g[A-Za-z0-9]+"),
+    "field": re.compile(r"f[0-9]+|field[0-9]+"),
 }
+
+# Whole-identifier "generated" kinds: the entire identifier token is the
+# mapped spelling, so a listed row must be checked against every occurrence
+# of that exact token in the file (see the "unlisted generated occurrence"
+# scan below), and its span must exactly cover a token boundary.
+WHOLE_IDENTIFIER_GENERATED_KINDS = (
+    "callable", "static_closure", "variable_suffix",
+    "type", "temp", "local_argument", "local_source_binder", "global", "field",
+)
+
+# Type names a `declared_type` field on a local row may name: projected
+# `brp_ty...` types, and `blorp_...`-spelled runtime typedefs such as
+# `blorp_StackOption_Int` or `blorp_List`. The recorded name is only the base
+# type identifier; pointer stars remain separate declarator tokens.
+TYPEDEF_NAME_RE = re.compile(r"brp_ty[A-Za-z0-9]+|blorp_[A-Za-z_][A-Za-z_0-9]*")
+
+REQUIRED_LOCAL_FIELDS = frozenset({
+    "owner_definition_id", "local_ordinal", "scope_span",
+    "emitted_identifier", "declaration_span", "reference_spans",
+})
+OPTIONAL_LOCAL_FIELDS = frozenset({"declared_type"})
 
 
 @dataclass(frozen=True)
@@ -194,13 +259,15 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
     primitives = {"void", "char", "short", "int", "long", "float", "double",
                   "signed", "unsigned", "_Bool", "_Complex", "_Imaginary"}
 
-    def valid_type_prefix(prefix: list[str]) -> bool:
+    def valid_type_prefix(prefix: list[str], expected_typedef: str | None = None) -> bool:
         if not prefix or any(token != "*" and not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", token)
                              for token in prefix):
             return False
         words = [token for token in prefix if token != "*" and token not in qualifiers]
         if not words:
             return False
+        if expected_typedef is not None:
+            return words == [expected_typedef]
         if all(word in primitives for word in words):
             return True
         if len(words) == 2 and words[0] in ("struct", "union", "enum"):
@@ -210,6 +277,11 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
     brace_stack: list[int] = []
     scope_pairs: dict[tuple[int, int], int] = {}
     compound_openings: set[int] = set()
+    # Char-offset parameter-list span (start of "(", end of matching ")") for
+    # each recognized function body, keyed by that body's opening "{" offset.
+    # Lets a `locals` row express a parameter -- a declarator that lies before
+    # the function's own brace scope -- without re-parsing the signature.
+    function_body_opens: dict[int, tuple[int, int]] = {}
     for index, lexeme in enumerate(lexemes):
         if in_directive(lexeme.start()):
             continue
@@ -229,14 +301,23 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
                           or prefix[:2] == ["else", "if"] and prefix[-1:] == [")"])
             is_statement_expression = bool(brace_stack) and prefix[-2:] in (["=", "("], ["return", "("])
             is_function = False
+            function_param_range: tuple[int, int] | None = None
             if not brace_stack and prefix[-1:] == [")"] and "(" in prefix:
                 opening_paren = prefix.index("(")
                 is_function = (opening_paren >= 2
                                and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", prefix[opening_paren - 1])
                                and valid_type_prefix(prefix[:opening_paren - 1]))
+                if is_function:
+                    prefix_lexemes = [token for token in lexemes[previous + 1:index]
+                                      if token.group("comment") is None
+                                      and not in_directive(token.start())]
+                    function_param_range = (prefix_lexemes[opening_paren].start(),
+                                            prefix_lexemes[-1].end())
             if (is_naked_block or is_else_or_do or is_label or is_case or is_control
                     or is_statement_expression or is_function):
                 compound_openings.add(lexeme.start())
+            if is_function and function_param_range is not None:
+                function_body_opens[lexeme.start()] = function_param_range
             brace_stack.append(lexeme.start())
         elif lexeme.group("brace") == "}":
             if not brace_stack:
@@ -297,7 +378,7 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
             if innermost[0] not in compound_openings:
                 raise ValueError("local span is inside a non-compound C scope")
 
-    def is_simple_declaration(span: tuple[int, int]) -> bool:
+    def is_simple_declaration(span: tuple[int, int], declared_type: str | None = None) -> bool:
         """Recognize only generated C's simple local type/name declarators."""
         index = token_indices.get(span)
         if index is None:
@@ -313,7 +394,29 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
         next_token = lexemes[next_index].group(0) if next_index < len(lexemes) else None
         if next_token not in ("=", ";", ",", "["):
             return False
-        return valid_type_prefix(prefix)
+        return valid_type_prefix(prefix, declared_type)
+
+    def is_simple_parameter_declaration(span: tuple[int, int], param_range: tuple[int, int],
+                                        declared_type: str | None = None) -> bool:
+        """Recognize a simple parameter declarator inside a function's own parameter list."""
+        index = token_indices.get(span)
+        if index is None:
+            return False
+        start, end = param_range
+        if not (start <= span[0] and span[1] <= end):
+            return False
+        previous = index - 1
+        while previous >= 0 and lexemes[previous].group(0) not in (",", "("):
+            previous -= 1
+        prefix = [token.group(0) for token in lexemes[previous + 1:index]
+                  if token.group("comment") is None]
+        next_index = index + 1
+        while next_index < len(lexemes) and lexemes[next_index].group("comment") is not None:
+            next_index += 1
+        next_token = lexemes[next_index].group(0) if next_index < len(lexemes) else None
+        if next_token not in (",", ")"):
+            return False
+        return valid_type_prefix(prefix, declared_type)
 
     def checked_span(value: object, label: str) -> tuple[int, int]:
         if (not isinstance(value, list) or len(value) != 2
@@ -325,9 +428,8 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
         return start, end
 
     for row in rows:
-        if (not isinstance(row, dict) or set(row) != {
-                "owner_definition_id", "local_ordinal", "scope_span",
-                "emitted_identifier", "declaration_span", "reference_spans"}):
+        if (not isinstance(row, dict)
+                or not REQUIRED_LOCAL_FIELDS <= set(row) <= REQUIRED_LOCAL_FIELDS | OPTIONAL_LOCAL_FIELDS):
             raise ValueError("local row must be an object")
         owner = row.get("owner_definition_id")
         local = row.get("local_ordinal")
@@ -335,6 +437,10 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
         symbol = row.get("emitted_identifier")
         declaration = row.get("declaration_span")
         references = row.get("reference_spans")
+        declared_type = row.get("declared_type") if "declared_type" in row else None
+        if declared_type is not None and (not isinstance(declared_type, str)
+                                          or not TYPEDEF_NAME_RE.fullmatch(declared_type)):
+            raise ValueError("local declared_type must be a recognized typedef name")
         if (type(owner) is not int or owner < 0 or type(local) is not int or local < 0
                 or not isinstance(symbol, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", symbol)
                 or not isinstance(references, list)):
@@ -353,21 +459,35 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
         all_spans = [checked_span(span, "local") for span in [declaration, *references]]
         for span in all_spans:
             require_value_identifier_role(span)
-        containing_scopes = [candidate for candidate in scope_pairs
-                             if candidate[0] < all_spans[0][0]
-                             and all_spans[0][1] < candidate[1]]
-        if not containing_scopes or scope != min(containing_scopes,
-                                                  key=lambda candidate: candidate[1] - candidate[0]):
-            raise ValueError("local declaration must use its innermost brace scope")
-        if any(not (scope[0] < start and end < scope[1]) for start, end in all_spans):
+        declaration_span = all_spans[0]
+        reference_spans = all_spans[1:]
+        param_range = function_body_opens.get(scope[0])
+        is_parameter = (param_range is not None
+                        and param_range[0] <= declaration_span[0]
+                        and declaration_span[1] <= param_range[1])
+        if is_parameter:
+            if (tokens.get(declaration_span) != symbol
+                    or not is_simple_parameter_declaration(declaration_span, param_range, declared_type)):
+                raise ValueError("local declaration is not a recognized C declarator")
+        else:
+            containing_scopes = [candidate for candidate in scope_pairs
+                                 if candidate[0] < declaration_span[0]
+                                 and declaration_span[1] < candidate[1]]
+            if not containing_scopes or scope != min(containing_scopes,
+                                                      key=lambda candidate: candidate[1] - candidate[0]):
+                raise ValueError("local declaration must use its innermost brace scope")
+            if not (scope[0] < declaration_span[0] and declaration_span[1] < scope[1]):
+                raise ValueError("local span lies outside scope")
+            if (tokens.get(declaration_span) != symbol
+                    or not is_simple_declaration(declaration_span, declared_type)):
+                raise ValueError("local declaration is not a recognized C declarator")
+        if any(not (scope[0] < start and end < scope[1]) for start, end in reference_spans):
             raise ValueError("local span lies outside scope")
-        if tokens.get(all_spans[0]) != symbol or not is_simple_declaration(all_spans[0]):
-            raise ValueError("local declaration is not a recognized C declarator")
-        if any(is_simple_declaration(span) for span in all_spans[1:]):
+        if any(is_simple_declaration(span, declared_type) for span in reference_spans):
             raise ValueError("local reference cannot be a declaration")
-        if any(start <= all_spans[0][0] for start, _ in all_spans[1:]):
+        if any(start <= declaration_span[0] for start, _ in reference_spans):
             raise ValueError("local reference precedes its declaration")
-        local_rows.append((scope, all_spans[0], symbol, all_spans))
+        local_rows.append((scope, declaration_span, symbol, all_spans))
         for bounds in all_spans:
             if tokens.get(bounds) != symbol or bounds in replacements:
                 raise ValueError("local span is not a unique exact identifier token")
@@ -443,14 +563,16 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
                 raise ValueError("generated span has wrong lexical context")
             if kind != "definition_comment" and containing.group("identifier") is None:
                 raise ValueError("generated span must be inside an identifier")
-            if kind in ("callable", "static_closure", "variable_suffix") and (start, end) not in tokens:
+            if kind in WHOLE_IDENTIFIER_GENERATED_KINDS and (start, end) not in tokens:
                 raise ValueError("generated span must cover full identifier")
             replacements[(start, end)] = ""
             validated_spans.append((start, end))
         generated_rows.append((kind, identity, validated_spans))
     family = {"callable": "callable", "static_closure": "callable",
               "definition": "definition", "definition_comment": "definition",
-              "variable_suffix": "variable_suffix"}
+              "variable_suffix": "variable_suffix", "type": "type", "temp": "temp",
+              "local_argument": "local_argument", "local_source_binder": "local_source_binder",
+              "global": "global", "field": "field"}
     first_by_family: dict[tuple[str, str], int] = {}
     for kind, identity, spans in generated_rows:
         key = (family[kind], identity)
@@ -465,8 +587,7 @@ def apply_sidecar(text: str, sidecar: dict) -> str:
     for lexeme in lexemes:
         if lexeme.group("identifier") is not None:
             whole = lexeme.group(0)
-            kinds = ["callable", "static_closure", "variable_suffix"]
-            candidates = [(kind, whole, lexeme.span()) for kind in kinds]
+            candidates = [(kind, whole, lexeme.span()) for kind in WHOLE_IDENTIFIER_GENERATED_KINDS]
             candidates.extend(("definition", match.group(0),
                                (lexeme.start() + match.start(), lexeme.start() + match.end()))
                               for match in re.finditer(r"__def_[0-9]+_", whole))
@@ -495,6 +616,85 @@ def normalize(text: str, sidecar: dict | None = None) -> str:
     return apply_sidecar(text, sidecar) if sidecar is not None else text
 
 
+# Grammars used by --project-locals. "local" folds the argument and source-
+# binder families together, since this sidecar-free mode has no owner/scope
+# information to tell them apart -- see the module docstring.
+PROJECT_LOCALS_PER_BODY_GRAMMARS = {
+    "local": re.compile(r"brp_v[A-Za-z0-9]+_[as][A-Za-z0-9]+"),
+    "temp": GENERATED_GRAMMARS["temp"],
+    "type": GENERATED_GRAMMARS["type"],
+    "global": GENERATED_GRAMMARS["global"],
+}
+PROJECT_LOCALS_FILE_WIDE_GRAMMARS = {
+    "field": GENERATED_GRAMMARS["field"],
+}
+
+
+def project_locals(text: str) -> str:
+    """Heuristically canonicalize local/temp/type/global/field-looking identifiers.
+
+    Used only when no sidecar is available, to check a projection landing
+    against its parent before the compiler emits sidecars. Local, temp, type,
+    and global occurrences are renumbered by first occurrence per family,
+    reset at each top-level brace-enclosed body (approximating a function);
+    field occurrences are renumbered file-wide, since record members are
+    referenced across many function bodies. This is weaker than a sidecar: it
+    has no owner/scope information, so a spelling match alone decides family
+    membership regardless of C role (declarator, reference, or member
+    access), and two distinct bindings that happen to alternate spellings
+    normalize the same way. Foreign-ABI record fields, which must keep fixed
+    spellings, are indistinguishable from any other field here and are
+    compared raw like any other unmapped spelling.
+    """
+    lexemes, _ = c_lexemes(text)
+    depth = 0
+    body_id = -1
+    next_body_id = 0
+    occurrences: list[tuple[int, str, str, tuple[int, int]]] = []
+    for lexeme in lexemes:
+        if lexeme.group("brace") == "{":
+            if depth == 0:
+                body_id = next_body_id
+                next_body_id += 1
+            depth += 1
+        elif lexeme.group("brace") == "}":
+            depth -= 1
+            if depth == 0:
+                body_id = -1
+        elif lexeme.group("identifier") is not None:
+            whole = lexeme.group(0)
+            for family, grammar in PROJECT_LOCALS_PER_BODY_GRAMMARS.items():
+                if grammar.fullmatch(whole):
+                    occurrences.append((body_id, family, whole, lexeme.span()))
+                    break
+            else:
+                for family, grammar in PROJECT_LOCALS_FILE_WIDE_GRAMMARS.items():
+                    if grammar.fullmatch(whole):
+                        occurrences.append((-1, family, whole, lexeme.span()))
+                        break
+    first_seen: dict[tuple[int, str, str], int] = {}
+    for scope, family, whole, span in occurrences:
+        key = (scope, family, whole)
+        first_seen[key] = min(first_seen.get(key, span[0]), span[0])
+    grouped: dict[tuple[int, str], list[str]] = {}
+    for scope, family, whole in first_seen:
+        grouped.setdefault((scope, family), []).append(whole)
+    ordinals: dict[tuple[int, str, str], int] = {}
+    for (scope, family), names in grouped.items():
+        for rank, whole in enumerate(sorted(names, key=lambda name: first_seen[(scope, family, name)])):
+            ordinals[(scope, family, whole)] = rank
+    replacements: dict[tuple[int, int], str] = {}
+    for scope, family, whole, span in occurrences:
+        replacements[span] = f"@@project:{family}:{scope}:{ordinals[(scope, family, whole)]}@@"
+    result = []
+    cursor = 0
+    for (start, end), replacement in sorted(replacements.items()):
+        result.extend((text[cursor:start], replacement))
+        cursor = end
+    result.append(text[cursor:])
+    return "".join(result)
+
+
 def read_c(path: Path) -> str:
     """Decode without newline translation so sidecar hashes exact file bytes."""
     return path.read_bytes().decode("utf-8")
@@ -515,6 +715,10 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--sidecar", action="append", type=Path,
                         help="versioned local-identity JSON sidecar, once per C file")
+    parser.add_argument("--project-locals", action="store_true",
+                        help="transition-only heuristic: normalize local/temp/type/global/"
+                             "field-looking identifiers by first occurrence when no sidecar "
+                             "is available (weaker than a sidecar; see the module docstring)")
     args = parser.parse_args(argv)
 
     if len(args.files) > 2:
@@ -523,23 +727,35 @@ def main(argv: list[str]) -> int:
     if args.sidecar and len(args.sidecar) != len(args.files):
         print("normalize_generated_c_symbols: provide one sidecar per C file", file=sys.stderr)
         return 2
+    if args.project_locals and args.sidecar:
+        print("normalize_generated_c_symbols: --project-locals cannot be combined with --sidecar",
+              file=sys.stderr)
+        return 2
 
     try:
         if args.emit:
             if len(args.files) != 1:
                 print("normalize_generated_c_symbols: --emit takes one file", file=sys.stderr)
                 return 2
-            sidecar = json.loads(args.sidecar[0].read_text()) if args.sidecar else None
-            sys.stdout.write(normalize(read_c(args.files[0]), sidecar))
+            if args.project_locals:
+                sys.stdout.write(project_locals(read_c(args.files[0])))
+            else:
+                sidecar = json.loads(args.sidecar[0].read_text()) if args.sidecar else None
+                sys.stdout.write(normalize(read_c(args.files[0]), sidecar))
             return 0
 
-        hashes = [(path, normalized_hash(path, args.sidecar[index] if args.sidecar else None))
-                  for index, path in enumerate(args.files)]
+        if args.project_locals:
+            hashes = [(path, hashlib.sha256(project_locals(read_c(path)).encode("utf-8")).hexdigest())
+                      for path in args.files]
+        else:
+            hashes = [(path, normalized_hash(path, args.sidecar[index] if args.sidecar else None))
+                      for index, path in enumerate(args.files)]
     except (OSError, ValueError, UnicodeError, TypeError, AttributeError) as error:
         print(f"normalize_generated_c_symbols: {error}", file=sys.stderr)
         return 2
 
-    mode = "normalized C with sidecar" if args.sidecar else "raw C"
+    mode = ("normalized C with --project-locals" if args.project_locals else
+            "normalized C with sidecar" if args.sidecar else "raw C")
     for path, digest in hashes:
         print(f"{mode} SHA-256: {digest}  {path}")
 

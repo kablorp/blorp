@@ -2653,10 +2653,33 @@ The normalizer compares raw C exactly without sidecars. Each sidecar is bound
 to its C file's SHA-256 and lists the generated symbol and local-binding spans
 that may change spelling. C5c owns production emission of these sidecars; a
 normalized comparison is unavailable until both are retained with the C files.
-The v1 sidecar recognizes only simple block locals with primitive or explicit
-tagged C types; typedef-typed locals and parameters remain raw-different. C5c
-must version/extend the oracle or emit an independently validated compiler-owned
-binding marker before relying on those unsupported forms.
+The v1 sidecar recognizes simple block locals with primitive or explicit
+tagged C types, and, via an optional `declared_type` row field naming the
+typedef, also typedef-typed locals and function parameters (a `brp_ty...`
+projected type or a `blorp_...`-spelled runtime typedef); function pointers
+and other complex declarators still fail closed and remain raw-different.
+The `generated` kind grammar also covers the planned `type` (`brp_ty...`),
+`temp` (`__t...`), `local_argument`/`local_source_binder`
+(`brp_v<owner>_a<key>` / `brp_v<owner>_s<key>`), `global` (`brp_g<id>`), and
+`field` (`f<N>`/`field<N>`, covering both a projected ordinal-numbered
+member and the existing union payload slot spelling under one family)
+kinds, each numbered by first occurrence within its own family like
+`callable`. C5c must emit only supported rows, or deliberately version and
+extend the oracle or emit an independently validated compiler-owned binding
+marker before relying on unsupported forms.
+
+For the transition period before the compiler emits sidecars,
+`--project-locals` normalizes local/temp/type/global/field-looking
+identifiers directly from their grammar, with no sidecar: local, temp, type,
+and global occurrences are renumbered by first occurrence per family, reset
+at each top-level brace body (approximating a function); field occurrences
+are renumbered file-wide, since record members are read from many functions.
+This is a strictly weaker oracle than a sidecar -- it has no owner/scope
+information, cannot tell two different bindings that happen to alternate
+spellings apart, and cannot distinguish a foreign-ABI record (whose field
+spellings must not change) from any other record, so foreign-ABI record
+fields are simply compared raw in this mode. Use it only to check a
+projection landing against its parent before sidecars exist.
 
 Do not report wall time as the primary evidence.
 

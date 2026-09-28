@@ -388,6 +388,213 @@ class GeneratedCSymbolTests(unittest.TestCase):
         self.different(old, 'int brp_v1_1; /* keep=3 */ puts("brp_v1_1"); source_x;')
         self.different(old, 'int brp_v1_1; /* keep=3 */ puts("__blorp_internal_a"); source_y;')
 
+    def mapped_generated(self, text, rows):
+        def row(kind, identity, spelling):
+            spans = [[match.start(), match.end()]
+                     for match in re.finditer(r"(?<![A-Za-z0-9_])" + re.escape(spelling)
+                                              + r"(?![A-Za-z0-9_])", text)]
+            return {"kind": kind, "identity": identity, "spelling": spelling, "spans": spans}
+
+        return {"version": 1, "c_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "locals": [], "generated": [row(*fields) for fields in rows]}
+
+    def test_new_generated_kinds_normalize_by_first_occurrence(self):
+        cases = {
+            "type": ("brp_ty3", "brp_tyAbc"),
+            "temp": ("__t7", "__tQ9"),
+            "local_argument": ("brp_v12_a3", "brp_v99_a1"),
+            "local_source_binder": ("brp_v12_s3", "brp_v99_s1"),
+            "global": ("brp_g4", "brp_g900"),
+            "field": ("f0", "field3"),
+        }
+        for kind, (old_spelling, new_spelling) in cases.items():
+            old = f"void f(void) {{ {old_spelling} x; use({old_spelling}); }}"
+            new = old.replace(old_spelling, new_spelling)
+            self.different(old, new)
+            old_mapped = self.mapped_generated(old, [(kind, "one", old_spelling)])
+            new_mapped = self.mapped_generated(new, [(kind, "one", new_spelling)])
+            self.assertEqual(normalizer.normalize(old, old_mapped),
+                             normalizer.normalize(new, new_mapped), kind)
+
+    def test_new_generated_kinds_reject_mismatched_spelling(self):
+        cases = {
+            "type": "brp_notype3",
+            "temp": "not_temp",
+            "local_argument": "brp_v12_3",
+            "local_source_binder": "brp_v12_a3",
+            "global": "brp_v12_a3",
+            "field": "header",
+        }
+        for kind, spelling in cases.items():
+            code = f"void f(void) {{ int {spelling}; }}"
+            mapped = self.mapped_generated(code, [(kind, "one", spelling)])
+            with self.assertRaisesRegex(ValueError, "does not match kind", msg=kind):
+                normalizer.normalize(code, mapped)
+
+    def test_field_family_shares_ordinal_family_and_kept_spellings_are_untouched(self):
+        old = "struct S { int field0; int field1; }; void f(struct S s) { use(s.field0, s.field1); }"
+        new = "struct S { int f0; int f1; }; void f(struct S s) { use(s.f0, s.f1); }"
+        self.different(old, new)
+
+        def mapped(text, spellings):
+            return self.mapped_generated(text, [("field", f"member_{index}", spelling)
+                                                 for index, spelling in enumerate(spellings)])
+
+        self.assertEqual(normalizer.normalize(old, mapped(old, ["field0", "field1"])),
+                         normalizer.normalize(new, mapped(new, ["f0", "f1"])))
+        kept = "struct S { int header; int tag; }; void f(struct S s) { use(s.header, s.tag); }"
+        self.assertEqual(normalizer.normalize(kept), kept)
+
+    def test_typedef_declared_type_authorizes_local_declaration(self):
+        code = self.body("blorp_List x; use(x);")
+        sidecar = self.sidecar(code, "x")
+        with self.assertRaisesRegex(ValueError, "recognized C declarator"):
+            normalizer.normalize(code, sidecar)
+        sidecar["locals"][0]["declared_type"] = "blorp_List"
+        self.assertIn("@@local:0:0@@", normalizer.normalize(code, sidecar))
+        # The local identifier may still drift; the type token is unaffected
+        # since declared_type only authorizes recognizing the declarator.
+        new = self.body("blorp_List brp_v99_8; use(brp_v99_8);")
+        new_sidecar = self.sidecar(new, "brp_v99_8")
+        new_sidecar["locals"][0]["declared_type"] = "blorp_List"
+        self.assertEqual(normalizer.normalize(code, sidecar), normalizer.normalize(new, new_sidecar))
+
+    def test_declared_type_must_be_a_recognized_typedef_name(self):
+        code = self.body("Widget x; use(x);")
+        sidecar = self.sidecar(code, "x")
+        sidecar["locals"][0]["declared_type"] = "Widget"
+        with self.assertRaisesRegex(ValueError, "recognized typedef name"):
+            normalizer.normalize(code, sidecar)
+
+    def test_declared_type_still_rejects_function_pointers_and_complex_declarators(self):
+        code = self.body("blorp_List (*x)(int); use(x);")
+        sidecar = self.sidecar(code, "x")
+        sidecar["locals"][0]["declared_type"] = "blorp_List"
+        with self.assertRaisesRegex(ValueError, "recognized C declarator"):
+            normalizer.normalize(code, sidecar)
+
+    def test_v1_local_rows_remain_valid_without_declared_type(self):
+        code = self.body("int local; use(local);")
+        sidecar = self.sidecar(code, "local")
+        self.assertNotIn("declared_type", sidecar["locals"][0])
+        self.assertIn("@@local:0:0@@", normalizer.normalize(code, sidecar))
+
+    def test_typedef_typed_parameter_is_expressible(self):
+        code = "void f(blorp_List items) { use(items); }"
+        occurrences = [[match.start(), match.end()]
+                       for match in re.finditer(r"\bitems\b", code)]
+        sidecar = {"version": 1, "c_sha256": hashlib.sha256(code.encode()).hexdigest(),
+                   "locals": [{"owner_definition_id": 1, "local_ordinal": 0,
+                               "scope_span": [code.index("{"), code.rindex("}") + 1],
+                               "emitted_identifier": "items",
+                               "declared_type": "blorp_List",
+                               "declaration_span": occurrences[0],
+                               "reference_spans": occurrences[1:]}]}
+        normalized = normalizer.normalize(code, sidecar)
+        self.assertIn("@@local:0:0@@", normalized)
+        # The parameter identifier may drift; declared_type stays the anchor
+        # that authorizes recognizing the (still typedef-typed) parameter.
+        new = "void f(blorp_List renamed) { use(renamed); }"
+        new_occurrences = [[match.start(), match.end()]
+                           for match in re.finditer(r"\brenamed\b", new)]
+        new_sidecar = {"version": 1, "c_sha256": hashlib.sha256(new.encode()).hexdigest(),
+                       "locals": [{"owner_definition_id": 1, "local_ordinal": 0,
+                                   "scope_span": [new.index("{"), new.rindex("}") + 1],
+                                   "emitted_identifier": "renamed",
+                                   "declared_type": "blorp_List",
+                                   "declaration_span": new_occurrences[0],
+                                   "reference_spans": new_occurrences[1:]}]}
+        self.assertEqual(normalized, normalizer.normalize(new, new_sidecar))
+
+    def test_primitive_parameter_is_expressible_without_declared_type(self):
+        code = "void f(int count) { use(count); }"
+        occurrences = [[match.start(), match.end()]
+                       for match in re.finditer(r"\bcount\b", code)]
+        sidecar = {"version": 1, "c_sha256": hashlib.sha256(code.encode()).hexdigest(),
+                   "locals": [{"owner_definition_id": 1, "local_ordinal": 0,
+                               "scope_span": [code.index("{"), code.rindex("}") + 1],
+                               "emitted_identifier": "count",
+                               "declaration_span": occurrences[0],
+                               "reference_spans": occurrences[1:]}]}
+        self.assertIn("@@local:0:0@@", normalizer.normalize(code, sidecar))
+
+    def test_parameter_row_still_rejects_function_pointer_parameters(self):
+        code = "void f(void (*cb)(int)) { use(cb); }"
+        occurrences = [[match.start(), match.end()]
+                       for match in re.finditer(r"\bcb\b", code)]
+        sidecar = {"version": 1, "c_sha256": hashlib.sha256(code.encode()).hexdigest(),
+                   "locals": [{"owner_definition_id": 1, "local_ordinal": 0,
+                               "scope_span": [code.index("{"), code.rindex("}") + 1],
+                               "emitted_identifier": "cb",
+                               "declaration_span": occurrences[0],
+                               "reference_spans": occurrences[1:]}]}
+        with self.assertRaisesRegex(ValueError, "recognized C declarator"):
+            normalizer.normalize(code, sidecar)
+
+    def test_project_locals_normalizes_new_families_by_first_occurrence(self):
+        code = ("brp_ty3 brp_g4;\n"
+                "void f(void) { brp_v1_a2 x; __t9 tmp; use(x, tmp, brp_g4); }\n"
+                "void g(void) { brp_v9_s3 y; __t1 tmp2; use(y, tmp2); }\n")
+        normalized_once = normalizer.project_locals(code)
+        normalized_twice = normalizer.project_locals(code)
+        self.assertEqual(normalized_once, normalized_twice)
+        self.assertNotIn("brp_v1_a2", normalized_once)
+        self.assertNotIn("__t9", normalized_once)
+        self.assertNotIn("brp_ty3", normalized_once)
+        self.assertNotIn("brp_g4", normalized_once)
+        # brp_ty3/brp_g4 are outside any function body (the top-level scope).
+        self.assertIn("@@project:type:-1:0@@", normalized_once)
+        self.assertIn("@@project:global:-1:0@@", normalized_once)
+        # f is the first top-level body (id 0), g is the second (id 1); each
+        # function's local and temp are that function's own first occurrence
+        # of its family, so both get ordinal 0 but under distinct body ids.
+        self.assertIn("@@project:local:0:0@@", normalized_once)
+        self.assertIn("@@project:local:1:0@@", normalized_once)
+        self.assertIn("@@project:temp:0:0@@", normalized_once)
+        self.assertIn("@@project:temp:1:0@@", normalized_once)
+
+    def test_project_locals_field_family_is_file_wide_not_per_body(self):
+        code = "void f(void) { use(f0); }\nvoid g(void) { use(f0); }\n"
+        normalized = normalizer.project_locals(code)
+        markers = re.findall(r"@@project:field:[^@]+@@", normalized)
+        self.assertEqual(len(markers), 2)
+        self.assertEqual(markers[0], markers[1])
+
+    def test_project_locals_is_weaker_than_sidecar_on_unrelated_local(self):
+        # A source-authored local that happens to alternate with the same
+        # spelling as a projected temp is folded together: documented
+        # limitation of the sidecar-free heuristic mode.
+        code = "void f(void) { int __t1; use(__t1); }"
+        normalized = normalizer.project_locals(code)
+        self.assertIn("@@project:temp:0:0@@", normalized)
+
+    def test_project_locals_cannot_combine_with_sidecar_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.c"
+            path.write_text("void f(void) { int x; use(x); }\n")
+            sidecar_path = Path(directory) / "a.json"
+            sidecar_path.write_text(json.dumps(self.sidecar(path.read_text(), "x")))
+            command = [sys.executable, str(TOOL), "--project-locals",
+                      "--sidecar", str(sidecar_path), str(path)]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--project-locals cannot be combined with --sidecar", result.stderr)
+
+    def test_project_locals_cli_emit_and_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "a.c"
+            path.write_text("void f(void) { brp_v1_a2 x; use(x); }\n")
+            command = [sys.executable, str(TOOL), "--project-locals", "--emit", str(path)]
+            emitted = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(emitted.returncode, 0)
+            self.assertEqual(emitted.stdout, normalizer.project_locals(path.read_text()))
+            hash_command = [sys.executable, str(TOOL), "--project-locals", str(path)]
+            first = subprocess.run(hash_command, capture_output=True, text=True)
+            second = subprocess.run(hash_command, capture_output=True, text=True)
+            self.assertEqual(first.returncode, 0)
+            self.assertEqual(first.stdout, second.stdout)
+            self.assertIn("normalized C with --project-locals", first.stdout)
+
     def test_cli(self):
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "old.c"
