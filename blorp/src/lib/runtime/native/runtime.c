@@ -1411,10 +1411,27 @@ static inline blorp_destructor_fn blorp_destructor_for_id(uint32_t id) {
     return id < count ? __blorp_destructors[id] : NULL;
 }
 
+// Installs `fn` as obj's destructor through a per-site id cache. Every
+// generated allocation site runs this, so the cached path (one acquire load
+// and one header store) is inline; only a site's first allocation calls the
+// runtime's registry to assign the id. The acquire pairs with the registry's
+// release store of the cache, which follows its release of the slot count, so
+// a thread that sees the id also sees the registry slot it names.
+// Kept byte-identical to the runtime_decl.c copy.
+static inline void blorp_install_destructor(
+    void* obj,
+    _Atomic uint32_t* cache,
+    blorp_destructor_fn fn
+) {
+    uint32_t id = atomic_load_explicit(cache, memory_order_acquire);
+    if (__builtin_expect(id == 0, 0)) id = blorp_get_destructor_id(cache, fn);
+    if (obj) ((blorp_Object*)obj)->destructor_id = id;
+}
+
 #define BLORP_SET_DESTRUCTOR(ptr, fn) do { \
     static _Atomic uint32_t __blorp_destructor_id = 0; \
-    blorp_set_destructor_id((void*)(ptr), \
-        blorp_get_destructor_id(&__blorp_destructor_id, (blorp_destructor_fn)(fn))); \
+    blorp_install_destructor((void*)(ptr), &__blorp_destructor_id, \
+        (blorp_destructor_fn)(fn)); \
 } while (0)
 
 __attribute__((constructor))
@@ -3337,6 +3354,11 @@ static void __blorp_teardown_before_leak_report(void) {
 int blorp_memory_diagnostics_mode(void) {
     return BLORP_MEMORY_DIAGNOSTICS;
 }
+
+// The same fact as a data symbol, read by runtime_decl.c's inline BLORP_TAG
+// so a generated allocation site skips the tag call on an ordinary runtime
+// without a function call to find that out.
+const bool blorp_runtime_memory_diagnostics = BLORP_MEMORY_DIAGNOSTICS;
 
 void* blorp_alloc(size_t size) {
 #if BLORP_MEMORY_DIAGNOSTICS
@@ -35437,7 +35459,10 @@ blorp_Closure* blorp_closure_new_typed_inline(void* func, size_t env_size, size_
     c->env = (void*)(env_address + env_padding);
     c->env_count = BLORP_CLOSURE_TYPED_INLINE_ENV_COUNT;
     c->env_release_mask = 0;
-    BLORP_SET_DESTRUCTOR(c, blorp_closure_destroy);
+    // No destructor here: every caller (the backend's typed closure literal)
+    // installs its own environment destructor next, and blorp_closure_destroy
+    // would do nothing for a typed inline environment anyway (negative
+    // env_count, inline storage). blorp_alloc leaves the id 0 until then.
     return c;
 }
 

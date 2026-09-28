@@ -949,10 +949,28 @@ static inline _Float16 blorp_unbox_float16(void* p) {
 void* blorp_alloc(size_t size);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
 void blorp_set_destructor_id(void* obj, uint32_t id);
+
+// Installs `fn` as obj's destructor through a per-site id cache. Every
+// generated allocation site runs this, so the cached path (one acquire load
+// and one header store) is inline; only a site's first allocation calls the
+// runtime's registry to assign the id. The acquire pairs with the registry's
+// release store of the cache, which follows its release of the slot count, so
+// a thread that sees the id also sees the registry slot it names.
+// Kept byte-identical to the runtime.c copy.
+static inline void blorp_install_destructor(
+    void* obj,
+    _Atomic uint32_t* cache,
+    blorp_destructor_fn fn
+) {
+    uint32_t id = atomic_load_explicit(cache, memory_order_acquire);
+    if (__builtin_expect(id == 0, 0)) id = blorp_get_destructor_id(cache, fn);
+    if (obj) ((blorp_Object*)obj)->destructor_id = id;
+}
+
 #define BLORP_SET_DESTRUCTOR(ptr, fn) do { \
     static _Atomic uint32_t __blorp_destructor_id = 0; \
-    blorp_set_destructor_id((void*)(ptr), \
-        blorp_get_destructor_id(&__blorp_destructor_id, (blorp_destructor_fn)(fn))); \
+    blorp_install_destructor((void*)(ptr), &__blorp_destructor_id, \
+        (blorp_destructor_fn)(fn)); \
 } while (0)
 
 static inline void* blorp_box_int128(__int128 v) {
@@ -1024,7 +1042,21 @@ void blorp_move_ref(void* obj);
 void blorp_set_type_tag(void* obj, const char* tag);
 uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
 void blorp_set_destructor_id(void* obj, uint32_t id);
-#define BLORP_TAG(ptr, tag) blorp_set_type_tag((void*)(ptr), (tag))
+
+// Whether the linked runtime object records allocation metadata. It is a
+// runtime symbol, not a macro, because one generated body object is linked
+// against both runtime modes (benchmarks/build_stage2_compiler
+// --diagnostic-output), so the body cannot know the mode when it is compiled.
+// An ordinary runtime pays one load and a not-taken branch per allocation
+// site; a diagnostic runtime still receives every tag for its leak reports.
+extern const bool blorp_runtime_memory_diagnostics;
+
+static inline void blorp_tag_allocation(void* obj, const char* tag) {
+    if (__builtin_expect(blorp_runtime_memory_diagnostics, 0))
+        blorp_set_type_tag(obj, tag);
+}
+
+#define BLORP_TAG(ptr, tag) blorp_tag_allocation((void*)(ptr), (tag))
 
 // Release slow path (destructor + free + stats) — defined in runtime.o
 void blorp_release_slow_extern(void* obj);

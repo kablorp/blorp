@@ -64,6 +64,45 @@ SOURCE = textwrap.dedent(
 )
 
 
+# A generated-code body compiled once through runtime_decl.c, with no
+# BLORP_MEMORY_DIAGNOSTICS define, then linked against each runtime mode.
+# This is the shape of a stage-2 compiler built with --diagnostic-output, so
+# the allocation-site macros must discover the mode from the linked runtime.
+SPLIT_LINK_BODY = textwrap.dedent(
+    """\
+    int blorp_memory_diagnostics_mode(void);
+
+    static int probe_destructor_calls;
+    static void probe_destroy(void* object) {
+        (void)object;
+        probe_destructor_calls++;
+    }
+
+    static void* probe_new(void) {
+        void* object = blorp_alloc(32);
+        BLORP_TAG(object, "InlineHeaderProbe");
+        BLORP_SET_DESTRUCTOR(object, probe_destroy);
+        return object;
+    }
+
+    int main(void) {
+        if ((int)blorp_runtime_memory_diagnostics != blorp_memory_diagnostics_mode())
+            return 1;
+        // The first allocation registers the site's destructor id; the second
+        // takes the inline cached path.
+        void* first = probe_new();
+        void* second = probe_new();
+        blorp_release(first);
+        blorp_release(second);
+        if (probe_destructor_calls != 2) return 2;
+        // Deliberately leaked so a diagnostic runtime reports its tag.
+        (void)probe_new();
+        return 0;
+    }
+    """
+)
+
+
 class RuntimeMemoryDiagnosticsTests(unittest.TestCase):
     def _compile(self, mode: int, output: Path) -> None:
         result = subprocess.run(
@@ -121,6 +160,65 @@ class RuntimeMemoryDiagnosticsTests(unittest.TestCase):
             environment["BLORP_ALLOCATOR_STATS"] = "1"
             measured = subprocess.run([str(binary)], env=environment, capture_output=True, text=True)
             self.assertEqual(measured.returncode, 0, measured.stderr)
+
+
+    def _compile_split_link(self, directory: Path) -> dict[int, Path]:
+        compiler = os.environ.get("CC", "cc")
+        body_object = directory / "body.o"
+        body = subprocess.run(
+            [
+                compiler, "-O2", "-w", "-include", str(RUNTIME / "runtime_decl.c"),
+                "-x", "c", "-", "-c", "-o", str(body_object),
+            ],
+            cwd=ROOT, input=SPLIT_LINK_BODY, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(body.returncode, 0, body.stderr)
+        binaries: dict[int, Path] = {}
+        for mode in (0, 1):
+            runtime_object = directory / f"runtime-{mode}.o"
+            runtime = subprocess.run(
+                [
+                    compiler, "-O2", "-w", "-fwrapv", "-D_GNU_SOURCE", "-DMINICORO_IMPL",
+                    f"-DBLORP_MEMORY_DIAGNOSTICS={mode}",
+                    "-include", str(RUNTIME / "minicoro.h"),
+                    "-c", str(RUNTIME / "runtime.c"), "-o", str(runtime_object),
+                ],
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(runtime.returncode, 0, runtime.stderr)
+            binary = directory / f"split-link-{mode}"
+            link = subprocess.run(
+                [
+                    compiler, str(body_object), str(runtime_object),
+                    "-lm", "-lpthread", "-o", str(binary),
+                ],
+                cwd=ROOT, text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(link.returncode, 0, link.stderr)
+            binaries[mode] = binary
+        return binaries
+
+    def test_split_link_body_tags_and_destroys_under_both_runtime_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binaries = self._compile_split_link(Path(directory))
+            environment = dict(os.environ)
+            for name in ("BLORP_ALLOCATOR_STATS", "BLORP_COMPILER_MEMORY_PROFILE"):
+                environment.pop(name, None)
+
+            environment.pop("BLORP_LEAK_CHECK", None)
+            normal = subprocess.run(
+                [str(binaries[0])], env=environment, capture_output=True, text=True
+            )
+            self.assertEqual(normal.returncode, 0, normal.stderr)
+            self.assertNotIn("InlineHeaderProbe", normal.stderr)
+
+            environment["BLORP_LEAK_CHECK"] = "1"
+            diagnostic = subprocess.run(
+                [str(binaries[1])], env=environment, capture_output=True, text=True
+            )
+            self.assertEqual(diagnostic.returncode, 0, diagnostic.stderr)
+            self.assertIn("Leaked by type:", diagnostic.stderr)
+            self.assertRegex(diagnostic.stderr, r"InlineHeaderProbe\s+1\s")
 
 
 if __name__ == "__main__":
