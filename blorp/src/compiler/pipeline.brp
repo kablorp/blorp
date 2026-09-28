@@ -15,8 +15,9 @@ import:
 	frontend_output: typed_program_summary
 	frontend_request: FrontendCompilationGraph
 	path: dirname
+	stage_02_lex/name_table: NameTable, name_table_empty
 	stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
-	stage_03_parse/language_parser: parse_compiler_source
+	stage_03_parse/language_parser: parse_compiler_source, parse_compiler_source_with_names
 	stage_03_parse/parsed_ast: ParsedProgram
 	stage_03_parse/source_ast_finalize: finalized_typecheck_program, finalized_typecheck_program_ast
 	stage_04_modules/frontend_graph:
@@ -140,23 +141,33 @@ private record DiscoveredFrontendSource {
 }
 
 
+---
+Parses (or accepts an already-finalized) source and folds any new spelling
+it adds into `names`, the compilation name table so far, so every file
+discovery walks contributes to the same running table.
+---
 private pure func discover_frontend_source(
 	candidate: FrontendSourceCandidate,
-) -> DiscoveredFrontendSource:
-	program = match candidate.input:
+	names: NameTable,
+) -> (DiscoveredFrontendSource, NameTable):
+	(program, next_names) = match candidate.input:
 		RawFrontendSource(source):
-			finalized_typecheck_program(parse_compiler_source(source))
+			(parsed, updated_names) = parse_compiler_source_with_names(source, names)
+			(finalized_typecheck_program(parsed), updated_names)
 		FinalizedFrontendSource(program):
-			program
+			(program, names)
 
-	{
-		candidate = candidate,
-		module = {
-			identity = candidate.identity,
-			program = program,
-			surface = module_surface_for_program(finalized_typecheck_program_ast(program))
-		}
-	}
+	(
+		{
+			candidate = candidate,
+			module = {
+				identity = candidate.identity,
+				program = program,
+				surface = module_surface_for_program(finalized_typecheck_program_ast(program))
+			}
+		},
+		next_names,
+	)
 
 
 --- Two locations that share a module identity conflict unless they also
@@ -202,9 +213,14 @@ func frontend_graph_discover(
 	resolve: (FrontendSourceCandidate, String) -> Result[FrontendSourceResolution, String],
 	load: (FrontendSourceLocation) -> Result[SourceFile, String],
 ) -> Result[FrontendGraph, FrontendDiscoveryError]:
-	var discovered = roots
-		.concat(seed_modules)
-		.map(discover_frontend_source)
+	var discovered: List[DiscoveredFrontendSource] = []
+	var names: NameTable = name_table_empty()
+
+	for candidate in roots.concat(seed_modules):
+		(discovered_source, next_names) = discover_frontend_source(candidate, names)
+		discovered = discovered.append(discovered_source)
+		names = next_names
+
 	var discovered_by_identity = discovered_source_index(discovered)
 	var next_module: Int = 0
 	var edges: List[FrontendImportEdge] = []
@@ -256,10 +272,14 @@ func frontend_graph_discover(
 													),
 												)
 											Ok(target_source):
-												discovered_target = discover_frontend_source({
-													identity = target_location.identity,
-													input = RawFrontendSource(target_source),
-												})
+												(discovered_target, target_next_names) = discover_frontend_source(
+													{
+														identity = target_location.identity,
+														input = RawFrontendSource(target_source)
+													},
+													names,
+												)
+												names = target_next_names
 												discovered = discovered.append(discovered_target)
 												discovered_by_identity = discovered_by_identity.set(
 													target_key,
@@ -286,7 +306,7 @@ func frontend_graph_discover(
 			modules = discovered.map(func(source): source.module)
 			root_identities = roots.map(func(root): root.identity)
 
-			match validated_frontend_graph_for_modules(modules, root_identities, edges):
+			match validated_frontend_graph_for_modules(modules, root_identities, edges, names):
 				Ok(graph):
 					Ok(graph)
 				Err(errors):

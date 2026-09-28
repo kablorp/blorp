@@ -1,0 +1,112 @@
+-- One compilation-wide spelling catalog.
+--
+-- `NameTable` replaces the lexer's former per-file `texts`/`by_text` locals
+-- with an accumulator that can be threaded across every file in one
+-- compilation: the same spelling anywhere in the compilation gets the same
+-- id, and ids are assigned densely in encounter order (file order, then
+-- first occurrence within a file). A single-file caller (the formatter,
+-- LSP incremental reparse, standalone tools, tests) starts from
+-- `name_table_empty()` and gets a table scoped to that one lex; discovery
+-- threads one table through every file so ids are shared compilation-wide.
+--
+-- `NameId` is a spelling identity, not a semantic entity identity: two
+-- different bindings that happen to share a spelling share a `NameId`.
+-- Hygiene (distinguishing same-named locals) and semantic identity remain
+-- the responsibility of later phases (see docs/CORE_ID_MIGRATION.md).
+import:
+	dict: dict
+
+
+opaque type NameId = Int
+
+
+private record NameTableRep {
+	spellings: List[String],
+	id_by_spelling: Dict[String, Int]
+}
+
+
+opaque type NameTable = NameTableRep
+
+
+pure func name_table_empty() -> NameTable:
+	into_opaque NameTable({
+			spellings = [],
+			id_by_spelling = dict()
+		})
+
+
+pure func name_table_spellings(table: NameTable) -> List[String]:
+	from_opaque NameTable(table).spellings
+
+
+pure func name_table_dict(table: NameTable) -> Dict[String, Int]:
+	from_opaque NameTable(table).id_by_spelling
+
+
+pure func name_table_from_parts(
+	spellings: List[String],
+	id_by_spelling: Dict[String, Int],
+) -> NameTable:
+	into_opaque NameTable({
+			spellings = spellings,
+			id_by_spelling = id_by_spelling
+		})
+
+
+pure func name_table_count(table: NameTable) -> Int:
+	name_table_spellings(table).length()
+
+
+private pure func name_id(index: Int) -> NameId:
+	into_opaque NameId(index)
+
+
+pure func name_id_index(id: NameId) -> Int:
+	from_opaque NameId(id)
+
+
+pure func name_ids_equal(left: NameId, right: NameId) -> Bool:
+	name_id_index(left) == name_id_index(right)
+
+
+implements Equatable for NameId:
+	pure func equals(left: NameId, right: NameId) -> Bool:
+		name_ids_equal(left, right)
+
+
+---
+Looks up the id already assigned to `spelling`, or mints the next dense id
+and appends it when this is the first time this table has seen it.
+---
+pure func name_table_intern(table: NameTable, spelling: String) -> (NameTable, Int):
+	id_by_spelling = name_table_dict(table)
+
+	match id_by_spelling.get(spelling):
+		Some(existing_id):
+			(table, existing_id)
+		None:
+			spellings = name_table_spellings(table)
+			new_id = spellings.length()
+			(name_table_from_parts(
+					spellings.append(spelling),
+					id_by_spelling.set(spelling, new_id),
+				), new_id)
+
+
+pure func name_table_find_id(table: NameTable, spelling: String) -> Option[NameId]:
+	name_table_dict(table)
+		.get(spelling)
+		.map(name_id)
+
+
+pure func name_table_id_at(table: NameTable, index: Int) -> Option[NameId]:
+	match name_table_spellings(table).get(index):
+		Some(_):
+			Some(name_id(index))
+		None:
+			None
+
+
+pure func name_spelling(table: NameTable, id: NameId) -> Option[String]:
+	name_table_spellings(table).get(name_id_index(id))
