@@ -1,9 +1,18 @@
--- Compilation-local source spelling identities.
+-- Graph-issued name-table capabilities.
 --
--- SourceNameId is deliberately not semantic identity: it only replaces
--- repeated String keys while a compilation graph is active. Resolved products
+-- Typechecking shares the compilation `NameTable` (stage_02_lex/name_table):
+-- a `NameId` is a spelling identity that replaces repeated String keys while
+-- a compilation graph is active, not semantic identity. Resolved products
 -- must carry DefinitionId, ModuleId, or another semantic entity ID instead.
+-- The graph pairs that table with its `ModuleTable` so one compilation's
+-- names cannot be combined with another compilation's modules.
 import:
+	../../stage_02_lex/name_table:
+		EMPTY_NAME_TABLE,
+		NameTable,
+		name_table_dict,
+		name_table_from_parts,
+		name_table_spellings,
 	../../stage_03_parse/parsed_ast:
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
@@ -30,22 +39,13 @@ import:
 	instrumentation: black_box_int
 
 
-opaque type SourceNameId = Int
-
-
-private record SourceNameTableRep {
-	spellings: List[String],
-	id_by_spelling: Dict[String, Int]
-}
-
-
-opaque type SourceNameTable = SourceNameTableRep
-
 ---
-Dict iteration preserves insertion order, so one dictionary is sufficient
-construction state. Finalization materializes the ordered key list once;
-retaining a list beside the dictionary while building would either allocate
-an aggregate wrapper or repeatedly trigger COW through borrowed fields.
+Standalone catalog construction state, used only when no compilation-wide
+table exists (see `graph_source_name_table_for_programs`). Dict iteration
+preserves insertion order, so one dictionary is sufficient construction
+state. Finalization materializes the ordered key list once; retaining a list
+beside the dictionary while building would either allocate an aggregate
+wrapper or repeatedly trigger COW through borrowed fields.
 ---
 private type alias SourceNameTableBuilder = Dict[String, Int]
 
@@ -96,8 +96,8 @@ private pure func source_name_table_builder_insert(
 
 foreign(include: "source_name_table_ffi.h"):
 	private pure func source_name_tables_are_same_allocation(
-		left: SourceNameTable,
-		right: SourceNameTable,
+		left: NameTable,
+		right: NameTable,
 	) -> Bool = "blorp_compiler_source_name_tables_are_same_allocation"
 
 
@@ -106,7 +106,7 @@ Created as one graph-issued pair so graph visibility cannot combine a
 spelling table from one compilation with a module table from another.
 ---
 private record GraphSourceNameTableRep {
-	source_names: SourceNameTable,
+	source_names: NameTable,
 	module_table: ModuleTable
 }
 
@@ -116,7 +116,7 @@ opaque type GraphSourceNameTable = GraphSourceNameTableRep
 
 private pure func graph_source_name_table_from_source_names(
 	module_table: ModuleTable,
-	source_names: SourceNameTable,
+	source_names: NameTable,
 ) -> GraphSourceNameTable:
 	into_opaque GraphSourceNameTable({
 			source_names = source_names,
@@ -126,12 +126,12 @@ private pure func graph_source_name_table_from_source_names(
 
 pure func graph_source_name_table(
 	module_table: ModuleTable,
-	candidates: List[String],
+	source_names: NameTable,
 ) -> GraphSourceNameTable:
-	graph_source_name_table_from_source_names(module_table, source_name_table(candidates))
+	graph_source_name_table_from_source_names(module_table, source_names)
 
 
-pure func graph_source_name_table_source_names(table: GraphSourceNameTable) -> SourceNameTable:
+pure func graph_source_name_table_source_names(table: GraphSourceNameTable) -> NameTable:
 	from_opaque GraphSourceNameTable(table).source_names
 
 
@@ -196,32 +196,6 @@ pure func graph_module_name_scope_matches_catalog(
 	)
 
 
-private pure func source_name_id(index: Int) -> SourceNameId:
-	into_opaque SourceNameId(index)
-
-
-pure func source_name_id_table_index(id: SourceNameId) -> Int:
-	from_opaque SourceNameId(id)
-
-
----
-Reconstitute an ID only after proving that its raw table index belongs to
-this source-name domain.
----
-pure func source_name_table_id_at(table: SourceNameTable, index: Int) -> Option[SourceNameId]:
-	representation: SourceNameTableRep = from_opaque SourceNameTable(table)
-
-	match representation.spellings.get(index):
-		Some(_):
-			Some(source_name_id(index))
-		None:
-			None
-
-
-pure func source_name_ids_equal(left: SourceNameId, right: SourceNameId) -> Bool:
-	source_name_id_table_index(left) == source_name_id_table_index(right)
-
-
 ---
 A qualified import without an explicit alias is visible through the final
 path component, without the source extension. Keeping that spelling rule
@@ -229,10 +203,13 @@ beside the compilation source-name table prevents graph admission and
 import binding from independently deriving different keys.
 ---
 pure func source_name_default_module_alias(module_path: String) -> String:
-	parts = module_path.split("/")
-	raw_name = parts
-		.last()
-		.get_or(module_path)
+	-- Slice after the last separator instead of splitting the whole path:
+	-- alias derivation runs once per resolved import path.
+	raw_name = match module_path.last_index_of("/"):
+		Some(separator_index):
+			module_path.substring(separator_index + 1, module_path.length() - separator_index - 1)
+		None:
+			module_path
 
 	if raw_name.ends_with(".brp"):
 		raw_name.substring(0, raw_name.length() - 4)
@@ -401,19 +378,19 @@ private pure func source_name_table_builder_add_decl(
 			builder
 
 
-private pure func source_name_table_from_builder(
-	builder: SourceNameTableBuilder,
-) -> SourceNameTable:
+private pure func source_name_table_from_builder(builder: SourceNameTableBuilder) -> NameTable:
 	debug:
 		source_name_catalog_work_finalizations()
 
-	into_opaque SourceNameTable({
-			spellings = builder.keys(),
-			id_by_spelling = builder
-		})
+	name_table_from_parts(builder.keys(), builder)
 
 
-pure func source_name_table(candidates: List[String]) -> SourceNameTable:
+---
+Catalog a list of spellings directly. For callers that hold candidate
+spellings rather than parsed programs: benchmark fixtures, tests, and the
+trait authority's rejected-visibility fallback.
+---
+pure func name_table_for_spellings(candidates: List[String]) -> NameTable:
 	var builder: SourceNameTableBuilder = {}
 
 	for candidate in candidates:
@@ -423,41 +400,109 @@ pure func source_name_table(candidates: List[String]) -> SourceNameTable:
 
 
 ---
-Indexed graph construction owns the program order. Cataloging directly from
-that ordered input avoids retaining every candidate spelling and traversing
-it a second time before the graph can be published.
+Extend `names` with every source-visible declared spelling of `programs` that
+it does not already hold, keeping every existing id. The typechecker resolves
+declared names through the compilation `NameTable` by spelling, so whoever
+publishes a table for a graph must make it complete over the declared names
+of every program in that graph. Raw discovery already is (it lexes each file
+through the table); this closes the gap for programs whose identifiers were
+minted under a private table: sources parsed before discovery, the generated
+test-harness root, and standalone construction (request-driven bridge, LSP,
+tests), where `names` starts empty. Returns `names` itself, allocation-free,
+when nothing is missing.
 ---
-pure func graph_source_name_table_for_programs(
-	module_table: ModuleTable,
+pure func name_table_with_declared_names(
+	names: NameTable,
 	programs: List[ParsedProgram],
-) -> GraphSourceNameTable:
-	var builder: SourceNameTableBuilder = {}
+) -> NameTable:
+	var builder: SourceNameTableBuilder = name_table_dict(names)
+	starting_count = builder.length()
 
 	for program in programs:
 		for decl in program.decls:
 			builder = source_name_table_builder_add_decl(builder, decl)
 
-	graph_source_name_table_from_source_names(module_table, source_name_table_from_builder(builder))
+	if builder.length() == starting_count:
+		names
+	else:
+		source_name_table_from_builder(builder)
 
 
-pure func source_name_table_count(table: SourceNameTable) -> Int:
-	from_opaque SourceNameTable(table).spellings.length()
+private pure func source_name_table_builder_add_default_alias_decl(
+	builder: SourceNameTableBuilder,
+	decl: ParsedDecl,
+) -> SourceNameTableBuilder:
+	match decl:
+		ImportBlockParsedDecl(imports, _):
+			var result = builder
+
+			for import_decl in imports:
+				match (import_decl.module_alias, import_decl.symbols):
+					(None, None):
+						result = source_name_table_builder_add(
+							result,
+							source_name_default_module_alias(import_decl.module_path),
+						)
+					_:
+						void
+
+			result
+		PrivateParsedDecl(inner, _):
+			source_name_table_builder_add_default_alias_decl(builder, inner)
+		_:
+			builder
 
 
-pure func source_name_tables_are_compatible(left: SourceNameTable, right: SourceNameTable) -> Bool:
-	left_representation: SourceNameTableRep = from_opaque SourceNameTable(left)
-	right_representation: SourceNameTableRep = from_opaque SourceNameTable(right)
-	left_representation.spellings == right_representation.spellings
+---
+Import-path finalization rewrites an import's module path to the resolved
+module's canonical path, and an import with no explicit alias and no symbol
+list is visible under the last component of that path, so a rewrite can
+introduce an alias spelling no token ever wrote. Extend `names` with the
+default alias of every such import in the finalized `programs`; every other
+declared spelling is unaffected by the rewrite. Returns `names` itself when
+nothing is missing.
+---
+pure func name_table_with_default_import_aliases(
+	names: NameTable,
+	programs: List[ParsedProgram],
+) -> NameTable:
+	var builder: SourceNameTableBuilder = name_table_dict(names)
+	starting_count = builder.length()
+
+	for program in programs:
+		for decl in program.decls:
+			builder = source_name_table_builder_add_default_alias_decl(builder, decl)
+
+	if builder.length() == starting_count:
+		names
+	else:
+		source_name_table_from_builder(builder)
 
 
-pure func source_name_table_find_id(
-	table: SourceNameTable,
-	spelling: String,
-) -> Option[SourceNameId]:
-	from_opaque SourceNameTable(table).id_by_spelling
-		.get(spelling)
-		.map(source_name_id)
+---
+Standalone graph construction has no compilation-wide table, and each
+program's `ParsedIdentifier.name` ids come from a private table, so declared
+spellings are cataloged from scratch. Discovery-driven compilation never
+calls this: it hands the graph the discovery table.
+---
+pure func graph_source_name_table_for_programs(
+	module_table: ModuleTable,
+	programs: List[ParsedProgram],
+) -> GraphSourceNameTable:
+	graph_source_name_table_from_source_names(
+		module_table,
+		name_table_with_declared_names(EMPTY_NAME_TABLE, programs),
+	)
 
 
-pure func source_name_table_spelling(table: SourceNameTable, id: SourceNameId) -> Option[String]:
-	from_opaque SourceNameTable(table).spellings.get(source_name_id_table_index(id))
+---
+Two tables describe the same spellings in the same order, so ids minted
+under one are valid under the other. A graph's tables are one allocation in
+practice; the identity check keeps that common case from comparing every
+spelling of a compilation-wide table.
+---
+pure func name_tables_are_compatible(left: NameTable, right: NameTable) -> Bool:
+	(
+		source_name_tables_are_same_allocation(left, right)
+		or name_table_spellings(left) == name_table_spellings(right)
+	)

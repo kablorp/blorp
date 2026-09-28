@@ -127,9 +127,10 @@ one. The index remains cold data; hot identity tests compare only scalars.
 The compiler already contains much of the foundation:
 
 - Stage 4 owns `ModuleId` and a validated `ModuleTable`.
-- Stage 6 builds a compilation-local `SourceNameTable` and exposes
-  `SourceNameId`. Its own comment correctly says that a spelling ID is not a
-  semantic identity.
+- Stage 6 shares the compilation-wide `NameTable` (`stage_02_lex/name_table`)
+  and its `NameId` through the indexed graph; the former declaration-only
+  `SourceNameTable`/`SourceNameId` second table is gone. A spelling ID is not
+  a semantic identity.
 - Stage 6's graph `DefinitionIndex` assigns `DefinitionId`, `FieldId`, and the
   typed callable/type/constructor/trait ID wrappers. Its `DefinitionTable`
   already maps a definition ID to module, kind, source name, owner name, and
@@ -142,7 +143,8 @@ The compiler already contains much of the foundation:
 
 The important gaps are:
 
-- `SourceNameTable` catalogs module-visible declaration spellings, not local
+- The compilation `NameTable` catalogs every token spelling, but typecheck's
+  graph-visible relations cover module-visible declaration spellings, not local
   parameters, local bindings, record fields, or every identifier occurrence.
 - lexical scopes and typed local uses are still resolved and represented by
   `String`; `VarSymbol` has no local binding identity;

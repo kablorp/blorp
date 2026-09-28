@@ -339,7 +339,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
 
         self.assertIn("opaque type GraphSourceNameTable", name_source)
         self.assertIn(
-            "graph_source_name_table_from_source_names(module_table, source_name_table(candidates))",
+            "graph_source_name_table_from_source_names(module_table, source_names)",
             name_source,
         )
         self.assertIn("opaque type GraphModuleNameScope", name_source)
@@ -857,9 +857,9 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIn("scope: PreparedModuleScope", table_input.group(0))
         self.assertNotIn("module_table: ModuleTable", table_input.group(0))
         self.assertNotIn("definition_table: DefinitionTable", table_input.group(0))
-        self.assertNotIn("source_name_table: SourceNameTable", table_input.group(0))
-        self.assertIn("source_name_table: SourceNameTable", table.group(0))
-        self.assertIn("source_name_id: SourceNameId", binding.group(0))
+        self.assertNotIn("source_name_table: NameTable", table_input.group(0))
+        self.assertIn("source_name_table: NameTable", table.group(0))
+        self.assertIn("source_name_id: NameId", binding.group(0))
         self.assertNotIn("source_name: String", binding.group(0))
 
     def test_callable_module_membership_uses_compact_ranges(self) -> None:
@@ -883,9 +883,9 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(slot)
         self.assertIsNotNone(table)
         self.assertIsNotNone(record)
-        self.assertIn("source_name_id: SourceNameId", record.group(0))
+        self.assertIn("source_name_id: NameId", record.group(0))
         self.assertNotIn("source_name: String", record.group(0))
-        self.assertIn("source_name_id: SourceNameId", slot.group(0))
+        self.assertIn("source_name_id: NameId", slot.group(0))
         self.assertNotIn("source_name: String", slot.group(0))
         self.assertIn(
             "slot_range_by_module: List[AcceptedCallableModuleRange]",
@@ -1764,7 +1764,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(visibility_row)
-        self.assertIn("source_name_id: SourceNameId", visibility_row.group(0))
+        self.assertIn("source_name_id: NameId", visibility_row.group(0))
         self.assertIn("method_id: TraitMethodId", visibility_row.group(0))
         self.assertNotIn("String", visibility_row.group(0))
 
@@ -1776,7 +1776,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(visibility_binding)
         self.assertIn(
-            "AcceptedVisibleTraitMethodBinding(SourceNameId, TraitMethodId)",
+            "AcceptedVisibleTraitMethodBinding(NameId, TraitMethodId)",
             visibility_binding.group(0),
         )
         self.assertNotIn(
@@ -1792,7 +1792,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(lookup)
         self.assertIn("Option[AcceptedTraitMethodBinding]", lookup.group(0))
-        self.assertIn("source_name_table_find_id", lookup.group(0))
+        self.assertIn("name_table_find_id", lookup.group(0))
         self.assertIn("visible_trait_method_for_source_name", lookup.group(0))
         self.assertIn("table_find_trait_method_by_id", lookup.group(0))
         self.assertIn("into_opaque AcceptedTraitMethodBinding", lookup.group(0))
@@ -1837,7 +1837,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(visibility_row)
-        self.assertIn("source_name_id: SourceNameId", visibility_row.group(0))
+        self.assertIn("source_name_id: NameId", visibility_row.group(0))
         self.assertIn("trait_id: TraitId", visibility_row.group(0))
         self.assertNotIn("String", visibility_row.group(0))
 
@@ -1849,7 +1849,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
         )
         self.assertIsNotNone(visibility_binding)
         self.assertIn(
-            "AcceptedVisibleTraitDefinitionBinding(SourceNameId, TraitId)",
+            "AcceptedVisibleTraitDefinitionBinding(NameId, TraitId)",
             visibility_binding.group(0),
         )
         self.assertNotIn(
@@ -1864,7 +1864,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
             re.DOTALL,
         )
         self.assertIsNotNone(lookup)
-        self.assertIn("source_name_table_find_id", lookup.group(0))
+        self.assertIn("name_table_find_id", lookup.group(0))
         self.assertIn("visible_trait_for_source_name", lookup.group(0))
         self.assertIn("table_find_trait_index", lookup.group(0))
 

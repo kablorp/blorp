@@ -1,4 +1,11 @@
 import:
+	../../../src/compiler/stage_02_lex/name_table:
+		NameTable,
+		name_id_index,
+		name_ids_equal,
+		name_spelling,
+		name_table_count,
+		name_table_find_id,
 	../../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedImportPathRewrite,
 		FinalizedTypecheckProgram,
@@ -10,6 +17,7 @@ import:
 		module_identity_display_name,
 		module_load_candidate,
 		module_load_candidate_canonical_path,
+		module_load_candidate_program,
 		module_load_candidate_resolved_identity,
 		module_load_candidate_with_surface,
 		resolved_module_identity_from_resolver,
@@ -30,6 +38,7 @@ import:
 		definition_index_seed_next_def_id,
 		exported_definition_name_demand_contains,
 	../../../src/compiler/stage_06_typecheck/graph/indexed_graph:
+		GraphNameSource(CompilationGraphNames, StandaloneGraphNames),
 		IndexedGraph,
 		IndexedGraphError,
 		indexed_graph_build,
@@ -56,14 +65,10 @@ import:
 		prepared_module_scope_selective_export_names,
 		prepared_module_scopes_are_compatible,
 	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
-		SourceNameTable,
+		name_table_for_spellings,
+		name_table_with_declared_names,
+		name_table_with_default_import_aliases,
 		source_name_default_module_alias,
-		source_name_id_table_index,
-		source_name_ids_equal,
-		source_name_table,
-		source_name_table_count,
-		source_name_table_find_id,
-		source_name_table_spelling,
 	../../../src/compiler/stage_06_typecheck/type_system/env: ENV_EMPTY
 	../../../src/compiler/stage_06_typecheck/type_system/meta_identity: meta_session_ids_equal
 	../typecheck_test_support as TypecheckTestSupport
@@ -145,10 +150,10 @@ private pure func first_error_message(errors: List[IndexedGraphError]) -> Option
 
 
 private pure func source_name_table_matches_order(
-	table: SourceNameTable,
+	table: NameTable,
 	expected_spellings: List[String],
 ) -> Bool:
-	if source_name_table_count(table) != expected_spellings.length():
+	if name_table_count(table) != expected_spellings.length():
 		False
 	else:
 		var index: Int = 0
@@ -157,11 +162,11 @@ private pure func source_name_table_matches_order(
 		while matches and index < expected_spellings.length():
 			match expected_spellings.get(index):
 				Some(spelling):
-					match source_name_table_find_id(table, spelling):
+					match name_table_find_id(table, spelling):
 						Some(id):
 							matches = (
-								source_name_id_table_index(id) == index
-								and source_name_table_spelling(table, id) == Some(spelling)
+								name_id_index(id) == index
+								and name_spelling(table, id) == Some(spelling)
 							)
 						None:
 							matches = False
@@ -455,22 +460,109 @@ func test_indexed_graph_scatter_keeps_large_selective_export_buckets_owned() -> 
 
 
 pure func test_source_name_table_issues_stable_dense_ids() -> Bool:
-	table = source_name_table(["map", "List", "map"])
-	first_map = source_name_table_find_id(table, "map")
-	second_map = source_name_table_find_id(table, "map")
+	table = name_table_for_spellings(["map", "List", "map"])
+	first_map = name_table_find_id(table, "map")
+	second_map = name_table_find_id(table, "map")
 
-	match (first_map, second_map, source_name_table_find_id(table, "List")):
+	match (first_map, second_map, name_table_find_id(table, "List")):
 		(Some(first), Some(second), Some(list_name)):
 			(
-				source_name_table_count(table) == 2
-				and source_name_ids_equal(first, second)
-				and not source_name_ids_equal(first, list_name)
-				and source_name_table_spelling(table, first) == Some("map")
-				and source_name_table_spelling(table, list_name) == Some("List")
-				and source_name_table_find_id(table, "missing").is_none()
+				name_table_count(table) == 2
+				and name_ids_equal(first, second)
+				and not name_ids_equal(first, list_name)
+				and name_spelling(table, first) == Some("map")
+				and name_spelling(table, list_name) == Some("List")
+				and name_table_find_id(table, "missing").is_none()
 			)
 		_:
 			False
+
+
+pure func test_compilation_graph_names_are_adopted_without_recataloging() -> Bool:
+	-- "unrelated" comes first in the compilation table, so "main" is not the
+	-- first id: a graph that re-cataloged declared names would number it 0.
+	compilation_names = name_table_for_spellings(["unrelated", "helper", "main"])
+	target = fixture_module_load_candidate("main.brp", "app", "func main() -> Int:\n\t0")
+
+	match module_table([module_load_candidate_resolved_identity(target)]):
+		Err(_):
+			False
+		Ok(table):
+			match indexed_graph_build_for_module_table(
+				table,
+				CompilationGraphNames(compilation_names),
+				[target],
+				target,
+			):
+				Err(_):
+					False
+				Ok(graph):
+					graph_names = indexed_graph_source_name_table(graph)
+
+					match (
+						name_table_find_id(graph_names, "main"),
+						name_table_find_id(compilation_names, "main"),
+					):
+						(Some(graph_id), Some(compilation_id)):
+							(
+								name_ids_equal(graph_id, compilation_id)
+								and name_id_index(graph_id) == 2
+								and name_table_count(graph_names) == 3
+								and name_table_find_id(graph_names, "unrelated").is_some()
+							)
+						_:
+							False
+
+
+pure func test_declared_name_completion_keeps_ids_and_adds_only_missing() -> Bool:
+	target = fixture_module_load_candidate(
+		"main.brp",
+		"app",
+		"record Box {value: Int}\n\nfunc main() -> Int:\n\t0",
+	)
+	program = module_load_candidate_program(target)
+	seeded = name_table_for_spellings(["unrelated", "main"])
+	complete = name_table_with_declared_names(seeded, [program])
+	unchanged = name_table_with_declared_names(complete, [program])
+
+	match (
+		name_table_find_id(seeded, "main"),
+		name_table_find_id(complete, "main"),
+		name_table_find_id(complete, "Box"),
+	):
+		(Some(before), Some(after), Some(box_id)):
+			(
+				name_ids_equal(before, after)
+				and name_id_index(box_id) == 2
+				and name_table_count(complete) == 3
+				and name_table_count(unchanged) == 3
+			)
+		_:
+			False
+
+
+pure func test_default_import_alias_completion_only_covers_aliasless_imports() -> Bool:
+	source: String =
+		|import:
+		|	pkg/plain
+		|	pkg/aliased as Renamed
+		|	pkg/selective: helper
+	program = module_load_candidate_program(
+		fixture_module_load_candidate(
+			"main.brp",
+			"app",
+			source,
+		),
+	)
+	completed = name_table_with_default_import_aliases(name_table_for_spellings([]), [program])
+
+	(
+		name_table_find_id(completed, "plain").is_some()
+		and name_table_find_id(completed, "Renamed").is_none()
+		and name_table_find_id(completed, "selective").is_none()
+		and name_table_find_id(completed, "helper").is_none()
+		and name_table_count(completed) == 1
+	)
 
 
 pure func test_source_name_default_module_alias_strips_source_extension() -> Bool:
@@ -614,8 +706,8 @@ pure func test_indexed_graph_catalogs_trait_method_source_names() -> Bool:
 			table = indexed_graph_source_name_table(graph)
 
 			(
-				source_name_table_find_id(table, "Renderable").is_some()
-				and source_name_table_find_id(table, "render").is_some()
+				name_table_find_id(table, "Renderable").is_some()
+				and name_table_find_id(table, "render").is_some()
 			)
 		Err(_):
 			False
@@ -646,24 +738,24 @@ pure func test_indexed_graph_catalogs_qualified_aliases_and_local_declarations()
 	):
 		Ok(graph):
 			table = indexed_graph_source_name_table(graph)
-			alias_name = source_name_table_find_id(table, "Math")
-			default_alias_name = source_name_table_find_id(table, "text")
-			main_name = source_name_table_find_id(table, "main")
-			answer_name = source_name_table_find_id(table, "answer")
-			compute_name = source_name_table_find_id(table, "compute")
-			empty_name = source_name_table_find_id(table, "empty")
+			alias_name = name_table_find_id(table, "Math")
+			default_alias_name = name_table_find_id(table, "text")
+			main_name = name_table_find_id(table, "main")
+			answer_name = name_table_find_id(table, "answer")
+			compute_name = name_table_find_id(table, "compute")
+			empty_name = name_table_find_id(table, "empty")
 
 			match (alias_name, default_alias_name):
 				(Some(alias_id), Some(default_alias_id)):
 					(
-						source_name_table_count(table) == 6
-						and source_name_table_spelling(table, alias_id) == Some("Math")
-						and source_name_table_spelling(table, default_alias_id) == Some("text")
+						name_table_count(table) == 6
+						and name_spelling(table, alias_id) == Some("Math")
+						and name_spelling(table, default_alias_id) == Some("text")
 						and main_name.is_some()
 						and answer_name.is_some()
 						and compute_name.is_some()
 						and empty_name.is_some()
-						and source_name_table_find_id(table, "missing").is_none()
+						and name_table_find_id(table, "missing").is_none()
 					)
 				_:
 					False
@@ -697,9 +789,9 @@ pure func test_indexed_graph_catalogs_every_module_local_name_kind() -> Bool:
 			]
 
 			(
-				source_name_table_count(table) == expected_names.length()
-				and expected_names.all(func(name): source_name_table_find_id(table, name).is_some())
-				and source_name_table_find_id(table, "value").is_none()
+				name_table_count(table) == expected_names.length()
+				and expected_names.all(func(name): name_table_find_id(table, name).is_some())
+				and name_table_find_id(table, "value").is_none()
 			)
 		Err(_):
 			False
@@ -1151,6 +1243,7 @@ pure func test_indexed_graph_preserves_issuing_module_table_ids() -> Bool:
 		Ok(table):
 			indexed_graph_build_for_module_table(
 				table,
+				StandaloneGraphNames,
 				[first, target, second],
 				target,
 			)
@@ -1281,6 +1374,7 @@ pure func test_indexed_graph_retains_exact_compilation_module_table() -> Bool:
 			match (
 				indexed_graph_build_for_module_table(
 					table,
+					StandaloneGraphNames,
 					[first, target, second],
 					target,
 				)
@@ -1310,8 +1404,18 @@ pure func test_indexed_graph_rejects_misaligned_module_table_payloads() -> Bool:
 	match (module_table([target_identity]), module_table([other_identity])):
 		(Ok(target_table), Ok(other_table)):
 			match (
-				indexed_graph_build_for_module_table(target_table, [], target),
-				indexed_graph_build_for_module_table(other_table, [target], other),
+				indexed_graph_build_for_module_table(
+					target_table,
+					StandaloneGraphNames,
+					[],
+					target,
+				),
+				indexed_graph_build_for_module_table(
+					other_table,
+					StandaloneGraphNames,
+					[target],
+					other,
+				),
 			):
 				(Err([CompilerModuleTableLengthMismatch(1, 0)]), Err([CompilerModuleTableIdentityMismatch(0, "other", "app")])):
 					True
@@ -1335,6 +1439,7 @@ pure func test_indexed_graph_rejects_dependency_ids_from_another_table() -> Bool
 				(
 					indexed_graph_build_for_module_table(
 						table,
+						StandaloneGraphNames,
 						[target, dependency],
 						target,
 					),
@@ -1415,6 +1520,18 @@ tests: TestSuite = {
 		(
 			"source-name table issues stable dense IDs",
 			test_source_name_table_issues_stable_dense_ids,
+		),
+		(
+			"compilation graph names are adopted without re-cataloging",
+			test_compilation_graph_names_are_adopted_without_recataloging,
+		),
+		(
+			"declared-name completion keeps ids and adds only missing spellings",
+			test_declared_name_completion_keeps_ids_and_adds_only_missing,
+		),
+		(
+			"default import alias completion only covers alias-less imports",
+			test_default_import_alias_completion_only_covers_aliasless_imports,
 		),
 		(
 			"source-name default alias strips source extension",

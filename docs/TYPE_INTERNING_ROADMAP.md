@@ -71,8 +71,8 @@ The identity-preserving variants that did land this week measured -1.28%,
 of 1,746,333 tokens, `2c171a5d`), and because `interned_text` returns the
 table element, same-spelled identifiers in one file already share a `String`
 allocation. Interning stops at `ParsedIdentifier { text: String, span }`.
-The typechecker interns again into `SourceNameId` (5 files, 31 uses, never
-leaves stage 06). `DefinitionId` reaches 23 files and `CoreVar.def_id` is
+The typechecker used to intern again into `SourceNameId` (5 files, 31 uses,
+never left stage 06); it now reads the compilation `NameTable` directly. `DefinitionId` reaches 23 files and `CoreVar.def_id` is
 read at 362 sites, so definition identity does flow; the published
 definition *table* (T5) is parked at +11% instructions because it was built
 inside the per-module lowering loop.
