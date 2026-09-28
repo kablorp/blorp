@@ -21829,19 +21829,27 @@ static void blorp_dict_rehash(blorp_Dict* dict, long new_capacity) {
     blorp_dict_free_storage(old_keys);
 }
 
+// Ownership: consumes `dict` and returns the owned result; borrows `key`
+// and `value` (the table retains whatever it stores).
 blorp_Dict* blorp_dict_insert(blorp_Dict* dict, void* key, void* value) {
     if (!dict) dict = blorp_dict_new();
     unsigned long hash = dict->hash_fn(key);
     blorp_Dict* result = dict;
     if (__builtin_expect(!blorp_is_unique(dict), 0)) {
+        // Setting an existing key to the value it already holds changes
+        // nothing, so a shared dict is returned as is: the caller's
+        // reference passes straight through as the result. Values compare
+        // by stored pointer (identity for heap values, bits for unboxed
+        // scalars); user equality is never called here.
+        long existing = blorp_dict_find_slot(dict, key, hash, NULL);
+        if (existing >= 0 && dict->values[existing] == value) return dict;
         // A new key that reaches the growth threshold, or that finds order[]
         // full, would rehash the fresh copy immediately; build the copy at
         // its final capacity instead. The lookup that decides whether the
         // key is new only runs when one of those rebuilds is possible.
         bool would_grow = dict->size + 1 >= dict->grow_at;
         bool would_compact = dict->order_len >= dict->capacity;
-        bool adds_key = (would_grow || would_compact)
-            && blorp_dict_find_slot(dict, key, hash, NULL) < 0;
+        bool adds_key = (would_grow || would_compact) && existing < 0;
         if (adds_key && would_grow) {
             result = blorp_dict_copy_rehashed(dict, dict->capacity * 2);
         } else if (adds_key) {
@@ -21891,15 +21899,21 @@ blorp_Dict* blorp_dict_insert(blorp_Dict* dict, void* key, void* value) {
     return result;
 }
 
+// Ownership: consumes `dict` and returns the owned result; borrows `key`.
 blorp_Dict* blorp_dict_remove(blorp_Dict* dict, void* key) {
     if (!dict) return blorp_dict_new();
 
-    bool was_shared = !blorp_is_unique(dict);
-    blorp_Dict* result = was_shared ? blorp_dict_copy(dict) : dict;
-    if (was_shared) blorp_release(dict);
-
-    unsigned long hash = result->hash_fn(key);
-    long slot = blorp_dict_find_slot(result, key, hash, NULL);
+    unsigned long hash = dict->hash_fn(key);
+    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    blorp_Dict* result = dict;
+    if (__builtin_expect(!blorp_is_unique(dict), 0)) {
+        // Removing a missing key changes nothing, so a shared dict is
+        // returned as is: the caller's reference passes straight through.
+        if (slot < 0) return dict;
+        // The same-capacity copy keeps every entry in the same slot.
+        result = blorp_dict_copy(dict);
+        blorp_release(dict);
+    }
 
     if (slot >= 0) {
         // Release key and value

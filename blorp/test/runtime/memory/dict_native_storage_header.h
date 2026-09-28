@@ -25,6 +25,14 @@ static inline long dict_storage_order_matches(blorp_Dict* dict, const long* expe
     return seen == count && dict->size == count;
 }
 
+static inline long dict_storage_refcount(void* obj) {
+#ifdef BLORP_SINGLE_THREADED
+    return (long)((blorp_Object*)obj)->refcount;
+#else
+    return (long)atomic_load_explicit(&((blorp_Object*)obj)->refcount, memory_order_relaxed);
+#endif
+}
+
 static inline long dict_storage_has_int(blorp_Dict* dict, long key, long value) {
     void* out = NULL;
     return blorp_dict_get_raw(dict, DICT_STORAGE_INT(key), &out) && out == DICT_STORAGE_INT(value);
@@ -40,12 +48,13 @@ static inline long dict_native_empty_dict(void) {
     for (long slot = 0; slot < dict->capacity; slot++) {
         if (dict->meta[slot] != DICT_META_EMPTY) passed = 0;
     }
-    // Removing from an empty dict and copying an empty shared dict stay empty.
+    // Removing from an empty dict stays empty; removing a missing key from an
+    // empty shared dict changes nothing, so it returns the shared dict itself.
     dict = blorp_dict_remove(dict, DICT_STORAGE_INT(7));
     blorp_Dict* shared = dict;
     blorp_retain(shared);
     dict = blorp_dict_remove(dict, DICT_STORAGE_INT(7));
-    if (dict == shared || dict->size != 0 || shared->size != 0) passed = 0;
+    if (dict != shared || dict->size != 0 || dict_storage_refcount(shared) != 2) passed = 0;
     blorp_List* entries = blorp_dict_entries(dict);
     if (entries->len != 0) passed = 0;
     blorp_release(entries);
@@ -312,6 +321,79 @@ static inline long dict_native_heap_entries_release_cleanly(void) {
     if (!blorp_dict_get_raw(dict, key, &out) || out != (void*)key) passed = -8;
     blorp_release(key);
     blorp_release(dict);
+    return passed;
+}
+
+// A mutation of a shared dict that changes nothing returns the shared dict
+// itself, with no copy and no reference-count change: removing a missing key,
+// and setting an existing key to the pointer-identical value. Value equality
+// is never consulted, so an equal but distinct value still copies. Real
+// mutations still copy and leave the other holder untouched.
+static inline long dict_native_shared_noop_mutations_keep_object(void) {
+    blorp_Dict* dict = blorp_dict_new_string();
+    blorp_dict_set_value_release(dict, blorp_elem_release_fn);
+    blorp_String* key = blorp_string_create("present");
+    blorp_String* value = blorp_string_create("value");
+    dict = blorp_dict_insert(dict, key, value);
+    long passed = 1;
+
+    blorp_Dict* holder = dict;
+    blorp_retain(holder);
+    blorp_String* missing = blorp_string_create("missing");
+    dict = blorp_dict_remove(dict, missing);
+    if (dict != holder || dict_storage_refcount(holder) != 2 || dict->size != 1) passed = -1;
+
+    // Same key object and a distinct but equal key both find the entry.
+    dict = blorp_dict_insert(dict, key, value);
+    if (passed == 1 && (dict != holder || dict_storage_refcount(holder) != 2)) passed = -2;
+    blorp_String* equal_key = blorp_string_create("present");
+    dict = blorp_dict_insert(dict, equal_key, value);
+    if (passed == 1 && (dict != holder || dict_storage_refcount(holder) != 2)) passed = -3;
+    if (passed == 1 && dict_storage_refcount(value) != 2) passed = -4;
+
+    // An equal but distinct value is a real update: it copies.
+    blorp_String* equal_value = blorp_string_create("value");
+    dict = blorp_dict_insert(dict, key, equal_value);
+    void* out = NULL;
+    if (passed == 1 && (dict == holder || dict_storage_refcount(holder) != 1)) passed = -5;
+    if (passed == 1 && (!blorp_dict_get_raw(dict, key, &out) || out != (void*)equal_value)) passed = -6;
+    if (passed == 1 && (!blorp_dict_get_raw(holder, key, &out) || out != (void*)value)) passed = -7;
+    blorp_release(dict);
+
+    // Removing a present key from the shared dict copies too.
+    blorp_retain(holder);
+    dict = blorp_dict_remove(holder, key);
+    if (passed == 1 && (dict == holder || dict->size != 0 || holder->size != 1)) passed = -8;
+    blorp_release(dict);
+
+    // Unboxed scalars compare by their stored bits.
+    blorp_Dict* ints = blorp_dict_new();
+    ints = blorp_dict_insert(ints, DICT_STORAGE_INT(3), DICT_STORAGE_INT(30));
+    blorp_Dict* int_holder = ints;
+    blorp_retain(int_holder);
+    ints = blorp_dict_insert(ints, DICT_STORAGE_INT(3), DICT_STORAGE_INT(30));
+    ints = blorp_dict_remove(ints, DICT_STORAGE_INT(4));
+    if (passed == 1 && (ints != int_holder || dict_storage_refcount(int_holder) != 2)) passed = -9;
+    ints = blorp_dict_insert(ints, DICT_STORAGE_INT(3), DICT_STORAGE_INT(31));
+    if (passed == 1 && (ints == int_holder || !dict_storage_has_int(ints, 3, 31)
+        || !dict_storage_has_int(int_holder, 3, 30))) passed = -10;
+
+    // A NULL dict is an empty dict on the probe-first paths too.
+    blorp_Dict* from_null = blorp_dict_insert(NULL, DICT_STORAGE_INT(5), DICT_STORAGE_INT(50));
+    if (passed == 1 && (!from_null || from_null->size != 1 || !dict_storage_has_int(from_null, 5, 50))) passed = -11;
+    blorp_Dict* removed_from_null = blorp_dict_remove(NULL, DICT_STORAGE_INT(5));
+    if (passed == 1 && (!removed_from_null || removed_from_null->size != 0)) passed = -12;
+
+    blorp_release(removed_from_null);
+    blorp_release(from_null);
+    blorp_release(ints);
+    blorp_release(int_holder);
+    blorp_release(equal_value);
+    blorp_release(equal_key);
+    blorp_release(missing);
+    blorp_release(key);
+    blorp_release(value);
+    blorp_release(holder);
     return passed;
 }
 
