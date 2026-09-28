@@ -311,6 +311,20 @@ invalid.
 
 ## Reproducing CI
 
+CI builds normal and diagnostic compilers together and bundles both in its
+toolchain artifact. The CLI memory tests use the supplied diagnostic compiler,
+not the build machine's cache, bootstrap, or object files:
+
+```bash
+BLORP_DIAGNOSTIC_BIN=blorp/build/_build/blorp-cli/blorp-diagnostic \
+scripts/test --no-build --serial cli
+```
+
+The pair must report matching version/build metadata and runtime modes 0 and 1.
+An invalid supplied pair fails the gate; it does not trigger a rebuild. Without
+`BLORP_DIAGNOSTIC_BIN`, local CLI tests require a fresh checkout compiler and
+build its diagnostic sibling automatically.
+
 Reproduce the compiler test shard locally with the same environment shape:
 
 ```bash

@@ -1628,35 +1628,13 @@ expect_timing_labels "compile late stop times reached phases" 0 \
 	"$BLORP_BIN" compile --no-format --time-phases \
 		--dump-core-after=dce --stop-after=dce \
 		-o "$timed_late_stopped_c" "$resolved_identity_prog"
-BLORP_DIAGNOSTIC_BIN="blorp/build/_build/blorp-cli/blorp-diagnostic"
-if ! cmp -s "$BLORP_BIN_ABS" bin/blorp \
-	|| ! scripts/compiler-build-status --quiet; then
-	echo "Compiler memory tests require the fresh checkout bin/blorp; run make first" >&2
-	exit 1
-fi
-normal_version=$("$BLORP_BIN_ABS" --version)
-normal_cli_opt=$(printf '%s\n' "$normal_version" | sed -n 's/^optimization: cli=\([^ ]*\) runtime=.*/\1/p')
-normal_runtime_opt=$(printf '%s\n' "$normal_version" | sed -n 's/^optimization: cli=[^ ]* runtime=\([^ ]*\).*/\1/p')
-normal_split=$(printf '%s\n' "$normal_version" | sed -n 's/^split: //p')
-normal_mode=$(printf '%s\n' "$normal_version" | sed -n 's/^memory_diagnostics: //p')
-if [ -z "$normal_cli_opt" ] || [ -z "$normal_runtime_opt" ] \
-	|| [ -z "$normal_split" ] || [ "$normal_mode" != "0" ]; then
-	echo "Cannot read a normal compiler configuration from bin/blorp --version" >&2
-	exit 1
-fi
-if ! BLORP_CLI_C_OPTIMIZATION="$normal_cli_opt" \
-	BLORP_CLI_RUNTIME_C_OPTIMIZATION="$normal_runtime_opt" \
-	BLORP_CLI_C_SPLIT="$normal_split" \
-	make --no-print-directory build-blorp-cli-diagnostic >"$TMPDIR_CLI/diagnostic-build.log" 2>&1; then
-	echo "Failed to build diagnostic compiler for memory checkpoint tests" >&2
-	cat "$TMPDIR_CLI/diagnostic-build.log" >&2
-	exit 1
-fi
-diagnostic_version=$("$BLORP_DIAGNOSTIC_BIN" --version)
-if [ "$(printf '%s\n' "$diagnostic_version" | sed -n 's/^memory_diagnostics: //p')" != "1" ] \
-	|| [ "$(printf '%s\n' "$normal_version" | sed '/^memory_diagnostics: /d')" \
-		!= "$(printf '%s\n' "$diagnostic_version" | sed '/^memory_diagnostics: /d')" ]; then
-	echo "Diagnostic compiler version differs from normal compiler beyond memory_diagnostics" >&2
+TOTAL=$((TOTAL + 1))
+if BLORP_DIAGNOSTIC_BIN=$(python3 blorp/test/cli/prepare_memory_compiler.py \
+	"$BLORP_BIN_ABS" 2>"$TMPDIR_CLI/diagnostic-setup.log"); then
+	record_pass "compiler memory test toolchain"
+else
+	record_fail "compiler memory test toolchain" "$(cat "$TMPDIR_CLI/diagnostic-setup.log")"
+	finish
 	exit 1
 fi
 expect_memory_checkpoint_labels "compiler memory checkpoints use phase labels" \

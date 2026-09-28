@@ -537,6 +537,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_build_status.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_memory_diagnostics_harness.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/cli/test_memory_compiler_setup.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_complexity_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_record_validation.py
 	@blorp/test/compiler/benchmark/test_record_layout.sh
