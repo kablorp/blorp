@@ -153,6 +153,26 @@ func variable_examples() -> Int:
     0
 ```
 
+A tuple destructuring is always a declaration, never an assignment. Writing it
+with a name that already belongs to a `var` in an enclosing scope, such as
+`(total, _) = step(total)` inside a loop over `var total`, is a compile error
+instead of a silent new binding that hides the accumulator. Destructure into a
+new name and assign it:
+
+```blorp
+func step(total: Int, x: Int) -> (Int, Int):
+    (total + x, x)
+
+func sum_with_destructuring() -> Int:
+    var total: Int = 0
+
+    for x in [1, 2, 3]:
+        (next_total, _) = step(total, x)
+        total = next_total
+
+    total
+```
+
 Immutable top-level bindings are constants. Their initializers may use literal
 data, records, structs, tuples, collections, arithmetic, union constructors, and
 pure computations that the compile-time evaluator supports. When an immutable

@@ -215,6 +215,10 @@ var_initializer = "=" expr
 ```
 
 **Semantic constraints:**
+- A tuple destructuring `(a, b) = expr` always declares its names. A name that
+  is already a mutable variable in an enclosing scope, or a mutable module
+  global, is rejected rather than shadowed; a name already declared in the
+  current scope is rejected as a redeclaration.
 - Immutable top-level bindings are constants. Function, method, and closure
   calls in immutable global initializers must be pure and evaluatable by the
   compile-time evaluator. Union constructors are data construction and are
