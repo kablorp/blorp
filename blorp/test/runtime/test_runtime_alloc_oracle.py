@@ -29,6 +29,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
                     os.environ.get("CC", "cc"),
                     "-O0",
                     "-w",
+                    "-DBLORP_MEMORY_DIAGNOSTICS=1",
                     f"-I{ROOT / 'blorp' / 'src' / 'lib' / 'runtime' / 'native'}",
                     "-x",
                     "c",
@@ -91,24 +92,20 @@ class RuntimeAllocOracleTests(unittest.TestCase):
                 blorp_MemStats after_managed_release = blorp_get_mem_stats();
                 CHECK_MOVED(after_managed_alloc, after_managed_release, total_releases, 3);
 
-                // 2. Pool slab refill: exhaust the free list for the 32-byte
-                // class (blorp_pool_refill_count[0] objects per slab, derived
-                // from the fixed BLORP_POOL_SLAB_SIZE) so a second refill is
-                // forced.
-                blorp_MemStats before_pool = blorp_get_mem_stats();
-                int class0_alloc_count = blorp_pool_refill_count[0] * 2 + 8;
-                for (int i = 0; i < class0_alloc_count; i++) {
-                    blorp_alloc(32);
-                }
-                blorp_MemStats after_pool = blorp_get_mem_stats();
-                CHECK_MOVED(before_pool, after_pool, backing_pool_refill_events, 4);
+                // 2. Every managed object requests backing directly from libc.
+                blorp_MemStats before_managed_backing = blorp_get_mem_stats();
+                void* small = blorp_alloc(32);
+                blorp_MemStats after_managed_backing = blorp_get_mem_stats();
+                CHECK_MOVED(before_managed_backing, after_managed_backing,
+                            backing_libc_malloc_events, 4);
+                blorp_release(small);
 
-                // 3. Backing libc malloc: a request larger than every pool
-                // class (max class is 256 bytes) falls back to a direct malloc.
+                // 3. Oversized managed objects use the same direct path.
                 blorp_MemStats before_libc = blorp_get_mem_stats();
-                blorp_alloc(100000);
+                void* large = blorp_alloc(100000);
                 blorp_MemStats after_libc = blorp_get_mem_stats();
                 CHECK_MOVED(before_libc, after_libc, backing_libc_malloc_events, 5);
+                blorp_release(large);
 
                 // 4. Raw buffer malloc/calloc/realloc via the checked wrappers
                 // every list/dict/set/I/O raw buffer in the runtime uses.
@@ -174,7 +171,6 @@ class RuntimeAllocOracleTests(unittest.TestCase):
                 if (before.oracle_stats_active != 1) return 2;
                 if (after.oracle_stats_active != 1) return 3;
                 if (after.total_allocations != before.total_allocations) return 4;
-                if (after.backing_pool_refill_events != before.backing_pool_refill_events) return 5;
                 if (after.backing_libc_malloc_events != before.backing_libc_malloc_events) return 6;
                 if (after.raw_buffer_malloc_events != before.raw_buffer_malloc_events) return 7;
                 if (after.raw_buffer_calloc_events != before.raw_buffer_calloc_events) return 8;
@@ -213,6 +209,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
                     os.environ.get("CC", "cc"),
                     "-O0",
                     "-w",
+                    "-DBLORP_MEMORY_DIAGNOSTICS=1",
                     f"-I{ROOT / 'blorp' / 'src' / 'lib' / 'runtime' / 'native'}",
                     "-x",
                     "c",

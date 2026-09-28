@@ -34,4 +34,8 @@ def prepare_typecheck_worker(
         worker_name=WORKER_NAME,
         main_symbol=WORKER_MAIN_SYMBOL,
         include_dirs=WORKER_INCLUDE_DIRS,
+        # The replay can request get_mem_stats or allocator bytes at runtime.
+        # Keep its disposable worker capable of both without changing the
+        # normal user-program compiler default.
+        memory_diagnostics=True,
     )

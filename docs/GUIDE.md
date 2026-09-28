@@ -2823,6 +2823,16 @@ physical allocation. See [MEMORY_MODEL.md](MEMORY_MODEL.md) for user-facing
 patterns and [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the compiler/runtime
 ownership ABI.
 
+Managed-allocation counters are a build-time diagnostic. Use
+`bin/blorp run --memory-diagnostics program.brp` to compile a program with
+those counters and print its allocation summary. `bin/blorp test` builds
+diagnostic-capable test artifacts; `--leak-check` enables leak reporting.
+Programs built without diagnostics still expose the `memory` module's stats
+API, but its snapshots have `memory_stats_active == 0` and contain no managed
+counts. Helpers that assert allocation behavior fail when counters are
+inactive. For a standalone C build of generated code, compile the runtime
+with `-DBLORP_MEMORY_DIAGNOSTICS=1` to enable the counters.
+
 ## 12. Standard Library
 
 Prelude types, constructors, core traits, common collection methods, and basic

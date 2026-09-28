@@ -83,10 +83,11 @@ included in `bench.sh all`.
 ## Runtime Managed-Buffer Copy Diagnostic
 
 `runtime_managed_buffer_copy_profile` compares collection serialization in the
-working tree with a Git control. It compiles both native runtimes at `-O2`,
+working tree with a Git control. It compiles both native runtimes at `-O2` with
+`BLORP_MEMORY_DIAGNOSTICS=1` so its allocation counters are available,
 alternates their execution order, verifies byte-identical output, and reports
 managed capacity and retained-memory facts alongside median wall time. Timing
-runs use the ordinary uninstrumented allocator path; allocation facts come
+runs leave the counters disabled; allocation facts come
 from separate lightweight-stat processes. It is deliberately excluded from
 `bench.sh all`.
 
@@ -1002,6 +1003,9 @@ needed; plain mode remains the fast comparison loop.
 
 The compiler benchmark wrappers use `compiler_blorp_benchmark_runner` for
 compiler selection, content-addressed artifacts, and native C flags.
+The runner enables memory diagnostics in benchmark executables so fixtures
+that report allocation counts receive active counters. Its script hash is
+part of the cache key, so this flag change rebuilds cached executables.
 `BLORP_COMPILER_BENCHMARK_COMPILER` and
 `BLORP_COMPILER_BENCHMARK_SKIP_BUILD=1` are the generic controls; the older
 `BLORP_TYPECHECK_PROFILE_*` names remain supported for the existing profile.
@@ -1198,7 +1202,9 @@ benchmarks/compiler_type_instantiation \
 request against an isolated benchmark worker. Capture exactly one CLI check
 root with the explicit diagnostic flag; this constructs the normal source graph
 and stops before typechecking. Keep captures local because they contain source
-text and local paths. First typecheck only the target while retaining its full
+text and local paths. The disposable typecheck worker is compiled with memory diagnostics;
+`--memstats` and `--allocator-stats` reject an external worker whose counters
+report inactive. First typecheck only the target while retaining its full
 prepared graph context, then typecheck the complete selected module graph:
 
 ```bash
@@ -1818,8 +1824,10 @@ compiler-performance work. Every worker, baseline, and acceptance decision
 uses it so numbers are comparable across branches, worktrees, and people.
 
 It compiles a **frozen input snapshot** (the compiler's own `blorp/src` and
-`standard_library/src` at one recorded revision) to C with one compiler
-executable and reports:
+`standard_library/src` at one recorded revision) with paired compiler
+executables. The diagnostic binary supplies allocation checkpoints; the
+normal binary supplies instructions, time, and RSS. Their generated C must
+match byte for byte. The harness reports:
 
 - allocations per compiler phase, from the runtime's memory checkpoints
   (deterministic; the primary signal while iterating);
@@ -1834,19 +1842,23 @@ executable and reports:
 make
 scripts/compiler-build-status
 
-# Candidate measurement against the shared baseline (self-compile).
-benchmarks/self_compile_measure \
-  --label issue-147-step2 \
-  --input-rev <input_rev from the baseline JSON> \
-  --baseline benchmarks/results/self_compile_baseline_O0_2026-09-17_r7.json \
-  --output /tmp/issue-147-step2.json --require-identical
+# Establish a paired baseline, then compare the candidate on the same input.
+benchmarks/self_compile_measure --stage2 \
+  --label baseline --input-rev <frozen_input_rev> \
+  --output /tmp/paired-baseline.json
+benchmarks/self_compile_measure --stage2 \
+  --label candidate --input-rev <frozen_input_rev> \
+  --baseline /tmp/paired-baseline.json \
+  --output /tmp/candidate.json --require-identical
 
 # Small-program guard (must not regress materially).
-benchmarks/self_compile_measure --program small \
-  --label issue-147-step2-small \
-  --input-rev <input_rev> \
-  --baseline benchmarks/results/self_compile_small_baseline_O0_2026-09-17_r7.json \
-  --output /tmp/issue-147-step2-small.json --require-identical
+benchmarks/self_compile_measure --stage2 --program small \
+  --label baseline-small --input-rev <frozen_input_rev> \
+  --output /tmp/paired-small-baseline.json
+benchmarks/self_compile_measure --stage2 --program small \
+  --label candidate-small --input-rev <frozen_input_rev> \
+  --baseline /tmp/paired-small-baseline.json \
+  --output /tmp/candidate-small.json --require-identical
 
 # Run a multi-process gate.
 scripts/compiler-check --changed
@@ -1892,7 +1904,12 @@ Rules:
 
 Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when
-the input revision or host changes. Baselines recorded before the toolchain
+the input revision or host changes. Legacy records used one diagnostics-capable
+binary with runtime profiling disabled for instruction samples. Comparing a
+schema-1 baseline with a schema-2 candidate is supported for the accounting
+mode experiment; the harness prints a mode warning so the instruction delta
+is interpreted as part of that experiment. Baselines
+recorded before the toolchain
 fingerprint was added have no `toolchain` key at all; comparing against one
 of them prints a warning ("baseline predates fingerprint recording") instead
 of a hard refusal, and instruction-count deltas against them should be read
@@ -1910,19 +1927,22 @@ and linked with the Makefile's own "Compiling Blorp CLI" recipe, so it
 carries this checkout's codegen and runtime.
 
 ```bash
-# Build bin/blorp-stage2 directly (prints the generated C's byte count and sha256).
-benchmarks/build_stage2_compiler bin/blorp-stage2
+# Build both modes directly from one generated C and body object.
+benchmarks/build_stage2_compiler --diagnostic-output bin/blorp-stage2-diagnostic \
+  bin/blorp-stage2
 
 # Or let the harness build and measure it in one step.
 benchmarks/self_compile_measure --stage2 \
   --label candidate --input-rev <input_rev> \
-  --baseline benchmarks/results/self_compile_stage2_baseline_O2_2026-09-17_s3.json \
+  --baseline /tmp/paired-stage2-baseline.json \
   --output /tmp/candidate.json --require-identical
 ```
 
-`--stage2` builds `bin/blorp-stage2` via `benchmarks/build_stage2_compiler`
-and measures it exactly as `--compiler bin/blorp-stage2 --skip-build-check`
-would, and records which `bin/blorp` (by sha256) built it. The comparison
+`--stage2` builds both `bin/blorp-stage2` and
+`bin/blorp-stage2-diagnostic` via `benchmarks/build_stage2_compiler`, records
+their hashes and the `bin/blorp` hash that generated their shared C, and
+measures them as a pair. External binaries require both `--compiler` and
+`--diagnostic-compiler`. The comparison
 table prints `output bytes` next to the instructions-retired row, since the
 compiler's own generated-C size is a tracked metric for codegen work. Both
 scripts respect `BLORP_CLI_C_OPTIMIZATION` the same way `make` does; export it

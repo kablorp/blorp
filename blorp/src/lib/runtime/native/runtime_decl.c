@@ -200,9 +200,7 @@ typedef struct {
     long total_releases;
     long current_objects;
     long bytes_allocated;
-    long backing_pool_refill_events;
     long backing_libc_malloc_events;
-    long backing_pool_overflow_events;
     long raw_buffer_malloc_events;
     long raw_buffer_calloc_events;
     long raw_buffer_realloc_events;
@@ -210,6 +208,7 @@ typedef struct {
     long cleanup_scratch_events;
     long fiber_mmap_events;
     long oracle_stats_active;
+    long memory_stats_active;
 } blorp_MemStats;
 
 typedef struct {

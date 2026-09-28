@@ -51,6 +51,7 @@ class LspStdioTransportTests(unittest.TestCase):
             "-fwrapv",
             "-pipe",
             "-w",
+            "-DBLORP_MEMORY_DIAGNOSTICS=1",
         ]
         if SANITIZE:
             compiler_flags.extend(

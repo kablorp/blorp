@@ -27,6 +27,7 @@ BUILD_METADATA_ENV_VARS = (
 BUILD_OPTIMIZATION_ENV_VARS = (
 	"BLORP_CLI_C_OPTIMIZATION",
 	"BLORP_CLI_RUNTIME_C_OPTIMIZATION",
+	"BLORP_MEMORY_DIAGNOSTICS",
 )
 
 
@@ -74,6 +75,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 			(self.root / directory).mkdir(parents=True, exist_ok=True)
 
 		self.fake_cc = self.root / "fake-bin/cc"
+		self.fake_cc_version = "fake cc 1.0"
 		make_executable(
 			self.fake_cc,
 			b"#!/bin/sh\nprintf 'fake cc 1.0\\n'\n",
@@ -146,6 +148,8 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		runtime_opt: str = "-O2",
 		split_n: str = "8",
 		compiled_by: str = "dev-aaaaaaaaaaaa",
+		memory_diagnostics: str = "0",
+		commit: str = "deadbeef0000",
 	) -> None:
 		# `scripts/compiler-build-status` now derives cli/runtime optimization
 		# and split count by running the built binary's own `--version`
@@ -159,12 +163,13 @@ class CompilerBuildStatusTests(unittest.TestCase):
 				'if [ "$1" = "--version" ]; then',
 				"cat <<'BLORP_VERSION_EOF'",
 				"blorp 0.0.1",
-				"commit: deadbeef0000",
+				f"commit: {commit}",
 				"target: aarch64-apple-darwin",
 				f"compiled_by: {compiled_by}",
 				f"optimization: cli={cli_opt} runtime={runtime_opt}",
 				f"split: {split_n}",
 				"cc: fake cc 1.0",
+				f"memory_diagnostics: {memory_diagnostics}",
 				"BLORP_VERSION_EOF",
 				"fi",
 				"",
@@ -198,15 +203,15 @@ class CompilerBuildStatusTests(unittest.TestCase):
 				break
 		return sha256_bytes("".join(selected).encode("utf-8"))
 
-	def runtime_config_hash(self, runtime_opt: str = "-O2") -> str:
+	def runtime_config_hash(self, runtime_opt: str = "-O2", memory_diagnostics: str = "0") -> str:
 		records = [
 			f"{runtime_opt}\n",
-			"-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1\n",
+			f"-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1 -DBLORP_MEMORY_DIAGNOSTICS={memory_diagnostics}\n",
 			f"{sha256_file(self.root / 'blorp/src/lib/runtime/native/minicoro.h')}  blorp/src/lib/runtime/native/minicoro.h\n",
 			f"{sha256_file(self.root / 'blorp/src/lib/runtime/native/runtime.c')}  blorp/src/lib/runtime/native/runtime.c\n",
 			f"{sha256_file(self.root / 'blorp/src/lib/runtime/native/runtime_decl.c')}  blorp/src/lib/runtime/native/runtime_decl.c\n",
 			f"{self.fake_cc}\n",
-			"fake cc 1.0\n",
+			f"{self.fake_cc_version}\n",
 		]
 		return sha256_bytes("".join(records).encode("utf-8"))
 
@@ -238,6 +243,8 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		cli_opt: str = "-O0",
 		runtime_opt: str = "-O2",
 		split_n: str = "8",
+		memory_diagnostics: str = "0",
+		commit: str = "deadbeef0000",
 	) -> None:
 		c_manifest = input_manifest(self.root, self.generated_c_input_paths())
 		(self.build / "generated-c-build-inputs.sha256").write_bytes(c_manifest)
@@ -267,11 +274,18 @@ class CompilerBuildStatusTests(unittest.TestCase):
 				"# Preserve the safe all-in-one build path",
 			),
 			cli_opt,
-			self.runtime_config_hash(runtime_opt),
 			sha256_file(self.root / "scripts/split-generated-c"),
 			split_n,
+			str(self.fake_cc),
+			self.fake_cc_version,
 		)
 		(self.build / "inputs.sha256").write_text(f"{binary_input_hash}\n", encoding="utf-8")
+		link_hash = hash_lines(
+			binary_input_hash,
+			self.runtime_config_hash(runtime_opt, memory_diagnostics),
+			commit,
+		)
+		(self.build / "link-inputs.sha256").write_text(f"{link_hash}\n", encoding="utf-8")
 		(self.build / "blorp.sha256").write_text(
 			f"{sha256_file(self.build / 'blorp')}\n",
 			encoding="utf-8",
@@ -460,6 +474,34 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		self.assert_status(result, 1, "STALE")
 		self.assertIn("split: 1", result.stdout)
 
+	def test_linked_diagnostic_mode_controls_runtime_identity(self) -> None:
+		body_hash = (self.build / "inputs.sha256").read_text()
+		self.write_fake_binary_version(memory_diagnostics="1")
+		stale = self.run_status()
+		self.assert_status(stale, 1, "STALE")
+		self.assertIn("memory_diagnostics: 1", stale.stdout)
+		self.write_fresh_manifests(memory_diagnostics="1")
+		self.assertEqual((self.build / "inputs.sha256").read_text(), body_hash)
+		self.assert_status(self.run_status(), 0, "FRESH")
+		self.assert_status(self.run_status(extra_env={"BLORP_MEMORY_DIAGNOSTICS": "0"}), 0, "FRESH")
+
+	def test_c_compiler_version_change_invalidates_body_identity(self) -> None:
+		self.fake_cc_version = "fake cc 2.0"
+		make_executable(self.fake_cc, b"#!/bin/sh\nprintf 'fake cc 2.0\\n'\n")
+		result = self.run_status()
+		self.assert_status(result, 1, "STALE")
+		self.assertIn("native compiler build identity changed", result.stdout)
+
+	def test_missing_diagnostic_mode_is_unverifiable(self) -> None:
+		self.write_fake_binary_version(memory_diagnostics="unknown")
+		self.assert_status(self.run_status(), 2, "UNKNOWN")
+
+	def test_dirty_commit_controls_link_identity(self) -> None:
+		self.write_fake_binary_version(commit="deadbeef0000-dirty")
+		self.assert_status(self.run_status(), 1, "STALE")
+		self.write_fresh_manifests(commit="deadbeef0000-dirty")
+		self.assert_status(self.run_status(), 0, "FRESH")
+
 	def test_splitter_script_edit_reports_stale(self) -> None:
 		self.write("scripts/split-generated-c", "changed splitter\n")
 
@@ -487,6 +529,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		for path in (
 			"bin/blorp",
 			"blorp/build/_build/blorp-cli/inputs.sha256",
+			"blorp/build/_build/blorp-cli/link-inputs.sha256",
 			"blorp/build/_build/blorp-cli/embedded-inputs.sha256",
 		):
 			with self.subTest(path=path):

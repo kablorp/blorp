@@ -16,5 +16,7 @@ blorp_String *blorp_build_stamp_cli_optimization(void);
 blorp_String *blorp_build_stamp_runtime_optimization(void);
 blorp_String *blorp_build_stamp_split(void);
 blorp_String *blorp_build_stamp_cc(void);
+/* Reads the linked runtime object's compile-time capability. */
+int blorp_memory_diagnostics_mode(void);
 
 #endif

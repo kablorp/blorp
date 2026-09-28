@@ -439,38 +439,28 @@ change its meaning.
 compiler's C; DCE pass instructions (the R2 probe's victim) down; identical
 behavior on the record update and copy-on-write suites; leak gate green.
 
-## N4. Allocator pool coverage (landed)
+## N4. Allocator pool coverage (historical)
 
-**Current contract.** `blorp_alloc` uses nine per-thread size classes: 32,
-64, 96, 128, 192, 256, 384, 512, and 1024 bytes. Each class mints 16 KiB
-slabs on demand, up to `BLORP_POOL_SLAB_LIMIT` slabs per class per thread
-(default 180,000, also configurable through the environment). Freed slots
-remain reusable in their slabs for the thread's lifetime; the class does
-not grow past the limit. A request above 1024 bytes, or one that reaches a
-full class at its slab limit, uses direct `malloc`/`free`. ASan builds bypass
-the pool. This is a **fixed-capacity pool**, not a depth-capped free list:
-`BLORP_POOL_MAX_DEPTH` was removed, and an idle slab is not returned to libc
-until thread/process teardown. See `runtime.c` at `BLORP_POOL_MAX_SIZE`,
-`BLORP_POOL_SLAB_SIZE`, `BLORP_POOL_SLAB_LIMIT`, and `blorp_alloc`.
+**Current contract.** Managed objects are individually `malloc`-owned.
+`blorp_alloc` obtains each block directly from libc; final release runs its
+destructor and frees that same block. There are no allocator slabs, per-thread
+free lists, size classes, or allocator tuning controls. A live object remains
+valid after its allocating thread exits and may be released by another thread.
 
 **History.** The original N4 proposal predated slab refills and the
 later fixed-capacity design. Six classes and slab refills landed in
 `f9f8ef8a2`; 384-, 512-, and 1024-byte classes landed in `1350f963`.
 `f79f8b5a` introduced a slab cap with idle-slab release; `dab2f490`
 removed that release path, keeping capacity fixed and resident while the
-thread lives. The first-round measurement table below records the original
-N4 result, not a benchmark of these later revisions.
+thread lived. The direct allocator later removed slab retention and cached
+blocks. The first-round measurement table below records the original N4
+result, not a benchmark of the current allocator.
 
-**Further tuning.** Use `BLORP_COMPILER_MEMORY_PROFILE=1` to inspect the
-size histogram, per-class hits/misses, slab high-water marks, and overflow
-count before adding a class or raising the limit. Raising the limit cannot
-help a workload with zero overflow; it also enlarges each used class's
-per-thread slab-pointer registry. Larger classes can reduce backing
-`malloc`/`free` traffic but do not reduce the number of Blorp objects
-allocated. Compare retired instructions and peak RSS on the same frozen
-self-compile input, using a stage-2 compiler for runtime changes. Preserve
-cross-thread release behavior and verify the fixed-capacity, leak, and
-sanitizer tests.
+**Validation.** Compare retired instructions and peak RSS on the same frozen
+self-compile input, using a stage-2 compiler for runtime changes. Verify
+cross-thread final release, allocation accounting, leak checks, and sanitizer
+tests. The historical N4 measurements below do not establish the current
+runtime's cost.
 
 ## N5. Inline the cooperative checkpoint fast path
 

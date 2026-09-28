@@ -1628,22 +1628,53 @@ expect_timing_labels "compile late stop times reached phases" 0 \
 	"$BLORP_BIN" compile --no-format --time-phases \
 		--dump-core-after=dce --stop-after=dce \
 		-o "$timed_late_stopped_c" "$resolved_identity_prog"
+BLORP_DIAGNOSTIC_BIN="blorp/build/_build/blorp-cli/blorp-diagnostic"
+if ! cmp -s "$BLORP_BIN_ABS" bin/blorp \
+	|| ! scripts/compiler-build-status --quiet; then
+	echo "Compiler memory tests require the fresh checkout bin/blorp; run make first" >&2
+	exit 1
+fi
+normal_version=$("$BLORP_BIN_ABS" --version)
+normal_cli_opt=$(printf '%s\n' "$normal_version" | sed -n 's/^optimization: cli=\([^ ]*\) runtime=.*/\1/p')
+normal_runtime_opt=$(printf '%s\n' "$normal_version" | sed -n 's/^optimization: cli=[^ ]* runtime=\([^ ]*\).*/\1/p')
+normal_split=$(printf '%s\n' "$normal_version" | sed -n 's/^split: //p')
+normal_mode=$(printf '%s\n' "$normal_version" | sed -n 's/^memory_diagnostics: //p')
+if [ -z "$normal_cli_opt" ] || [ -z "$normal_runtime_opt" ] \
+	|| [ -z "$normal_split" ] || [ "$normal_mode" != "0" ]; then
+	echo "Cannot read a normal compiler configuration from bin/blorp --version" >&2
+	exit 1
+fi
+if ! BLORP_CLI_C_OPTIMIZATION="$normal_cli_opt" \
+	BLORP_CLI_RUNTIME_C_OPTIMIZATION="$normal_runtime_opt" \
+	BLORP_CLI_C_SPLIT="$normal_split" \
+	make --no-print-directory build-blorp-cli-diagnostic >"$TMPDIR_CLI/diagnostic-build.log" 2>&1; then
+	echo "Failed to build diagnostic compiler for memory checkpoint tests" >&2
+	cat "$TMPDIR_CLI/diagnostic-build.log" >&2
+	exit 1
+fi
+diagnostic_version=$("$BLORP_DIAGNOSTIC_BIN" --version)
+if [ "$(printf '%s\n' "$diagnostic_version" | sed -n 's/^memory_diagnostics: //p')" != "1" ] \
+	|| [ "$(printf '%s\n' "$normal_version" | sed '/^memory_diagnostics: /d')" \
+		!= "$(printf '%s\n' "$diagnostic_version" | sed '/^memory_diagnostics: /d')" ]; then
+	echo "Diagnostic compiler version differs from normal compiler beyond memory_diagnostics" >&2
+	exit 1
+fi
 expect_memory_checkpoint_labels "compiler memory checkpoints use phase labels" \
 	0 \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_complete,core_lowering_input_ready,core_lowering_complete,early_core_complete,runtime_projection_complete,cleanup_plan_complete,cancellation_plan_complete,late_core_complete,backend_emission_complete,artifact_construction_complete" \
-	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile --no-format \
 		--no-embed-runtime --time-phases -o "$timed_memory_c" "$valid_prog"
 expect_output_contains "compiler memory checkpoints name every early Core pass" 0 \
 	"phase=pass_mono_complete" \
-	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile --no-format \
 		--no-embed-runtime -o "$timed_memory_c" "$valid_prog"
 expect_output_contains "compiler memory checkpoints name every late Core pass" 0 \
 	"phase=pass_ownership_perceus_fused_complete" \
-	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile --no-format \
 		--no-embed-runtime -o "$timed_memory_c" "$valid_prog"
 perceus_control_dump="$TMPDIR_CLI/perceus-control.dump"
 TOTAL=$((TOTAL + 1))
-run_capture "" env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile \
+run_capture "" env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile \
 	--no-format --no-embed-runtime --time-phases \
 	--dump-core-after=perceus --dump-core-file="$perceus_control_dump" \
 	--stop-after=perceus "$valid_prog"
@@ -1663,24 +1694,24 @@ fi
 expect_memory_checkpoint_labels "compiler memory checkpoints report typed frontend failure" \
 	1 \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_failed" \
-	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile --no-format \
 		--time-phases -o "$timed_invalid_c" "$invalid_prog"
 expect_memory_checkpoint_labels "compiler memory checkpoints report early Core stop" \
 	0 \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_complete,core_lowering_input_ready,core_lowering_complete,early_core_stopped" \
-	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile --no-format \
 		--time-phases --dump-core-after=desugar --stop-after=desugar \
 		-o "$timed_early_stopped_c" "$valid_prog"
 expect_memory_checkpoint_labels "compiler memory checkpoints report late Core stop" \
 	0 \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_complete,core_lowering_input_ready,core_lowering_complete,early_core_complete,runtime_projection_complete,late_core_stopped" \
-	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile --no-format \
 		--time-phases --dump-core-after=dce --stop-after=dce \
 		-o "$timed_late_stopped_c" "$resolved_identity_prog"
 expect_memory_checkpoint_labels "compiler memory checkpoints report artifact publication failure" \
 	1 \
 	"source_discovery_start,source_discovery_complete,typed_frontend_start,typed_frontend_complete,core_lowering_input_ready,core_lowering_complete,early_core_complete,runtime_projection_complete,cleanup_plan_complete,cancellation_plan_complete,late_core_complete,backend_emission_complete,artifact_construction_complete,artifact_publication_failed" \
-	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_BIN" compile --no-format \
+	env BLORP_COMPILER_MEMORY_PROFILE=1 "$BLORP_DIAGNOSTIC_BIN" compile --no-format \
 		--time-phases -o "$TMPDIR_CLI" "$valid_prog"
 expect_output_contains "compile AST remains in Blorp frontend" 0 "Func main" \
 	"$BLORP_BIN" compile --no-format --ast "$valid_prog"

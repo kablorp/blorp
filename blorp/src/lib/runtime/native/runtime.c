@@ -4,6 +4,13 @@
 
 #define _GNU_SOURCE  // Required for memmem() on Linux/glibc
 
+#ifndef BLORP_MEMORY_DIAGNOSTICS
+#define BLORP_MEMORY_DIAGNOSTICS 0
+#endif
+#if BLORP_MEMORY_DIAGNOSTICS != 0 && BLORP_MEMORY_DIAGNOSTICS != 1
+#error "BLORP_MEMORY_DIAGNOSTICS must be 0 or 1"
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,7 +273,7 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Allocation oracle: raw allocation-path counters (allocation-contract
 // roadmap milestone 6). MemStats/blorp_alloc only ever counted managed
 // object requests; every OTHER libc/OS allocation call this runtime makes
-// (pool slab refills, malloc/calloc/realloc-backed raw buffers, aligned
+// (managed-object mallocs, malloc/calloc/realloc-backed raw buffers, aligned
 // SIMD buffers, generated cleanup scratch growth, fiber stack mmaps) was
 // invisible to a Blorp test doing a before/after MemStats snapshot. These
 // counters close that gap. They are atomics with no formatting/logging on
@@ -277,7 +284,7 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Every malloc/calloc/realloc/aligned_alloc/mmap call site in this file must
 // either go through one of the BLORP_ORACLE_* wrappers below (directly, or
 // transitively through blorp_malloc_checked/blorp_realloc_checked/
-// blorp_calloc_checked/blorp_pool_refill/blorp_simd_alloc, which are
+// blorp_calloc_checked/blorp_simd_alloc, which are
 // themselves instrumented), or be listed in the allowlist comment block
 // next to it explaining why the oracle does not observe it. See
 // blorp/test/runtime/test_runtime_alloc_oracle_coverage.py.
@@ -289,28 +296,25 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic bool __blorp_lightweight_stats_enabled = false;
 
 static struct {
-    _Atomic long backing_pool_refill_events;
     _Atomic long backing_libc_malloc_events;
-    // A poolable-size request that could not be served from a class's free
-    // list because the class was already at its fixed slab-count limit
-    // (BLORP_POOL_SLAB_LIMIT). Every overflow event also bumps
-    // backing_libc_malloc_events, since it is in fact a libc malloc; this
-    // counter isolates the subset caused by the limit specifically.
-    _Atomic long backing_pool_overflow_events;
     _Atomic long raw_buffer_malloc_events;
     _Atomic long raw_buffer_calloc_events;
     _Atomic long raw_buffer_realloc_events;
     _Atomic long raw_buffer_aligned_events;
     _Atomic long cleanup_scratch_events;
     _Atomic long fiber_mmap_events;
-} __blorp_oracle_stats = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+} __blorp_oracle_stats = {0};
 
 static inline bool __blorp_allocator_stats_active(void);
 
 static inline void __blorp_oracle_count(_Atomic long* counter) {
+#if BLORP_MEMORY_DIAGNOSTICS
     if (__blorp_allocator_stats_active()) {
         atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
     }
+#else
+    (void)counter;
+#endif
 }
 
 // Thin counted wrappers around the libc allocation calls used for raw
@@ -318,12 +322,18 @@ static inline void __blorp_oracle_count(_Atomic long* counter) {
 // stream combinator state, I/O ring buffers, and similar. Semantically
 // identical to calling libc directly; the only difference is the oracle
 // counter bump when stats are active.
+#if BLORP_MEMORY_DIAGNOSTICS
 #define BLORP_ORACLE_MALLOC(sz) \
     (__blorp_oracle_count(&__blorp_oracle_stats.raw_buffer_malloc_events), malloc(sz))
 #define BLORP_ORACLE_CALLOC(n, sz) \
     (__blorp_oracle_count(&__blorp_oracle_stats.raw_buffer_calloc_events), calloc((n), (sz)))
 #define BLORP_ORACLE_REALLOC(p, sz) \
     (__blorp_oracle_count(&__blorp_oracle_stats.raw_buffer_realloc_events), realloc((p), (sz)))
+#else
+#define BLORP_ORACLE_MALLOC(sz) malloc(sz)
+#define BLORP_ORACLE_CALLOC(n, sz) calloc((n), (sz))
+#define BLORP_ORACLE_REALLOC(p, sz) realloc((p), (sz))
+#endif
 
 // ============================================================================
 // Checked Arithmetic for Allocation Sizes
@@ -476,15 +486,9 @@ typedef struct {
     long current_objects;
     long bytes_allocated;
     // Backing allocator events distinct from the logical managed-object
-    // requests above: a pool slab refill or an oversized/ASan-mode libc
-    // malloc supplies storage for one or many blorp_alloc() calls, so these
-    // must not be summed with total_allocations to avoid double counting.
-    long backing_pool_refill_events;
+    // requests above: each blorp_alloc() requests backing from libc. These
+    // are not additional managed objects and must not be summed with them.
     long backing_libc_malloc_events;
-    // Subset of backing_libc_malloc_events caused specifically by a pool
-    // class sitting at its fixed slab-count limit (BLORP_POOL_SLAB_LIMIT)
-    // with an empty free list.
-    long backing_pool_overflow_events;
     // Raw (non-managed) buffer requests: list/string/dict/set capacity
     // storage, stream combinator state, I/O buffers, and similar, routed
     // through blorp_malloc_checked/blorp_realloc_checked/blorp_calloc_checked.
@@ -505,6 +509,9 @@ typedef struct {
     // A caller must fail rather than treat an all-zero oracle snapshot as
     // proof of no allocation when this is 0.
     long oracle_stats_active;
+    // 1 when managed allocation/release counters are available. This is
+    // independent of the allocation-oracle gate above.
+    long memory_stats_active;
 } blorp_MemStats;
 
 // User-facing value snapshot for scheduler instrumentation.
@@ -1055,8 +1062,9 @@ static void* __mem_watch_thread(void* arg) {
 // Cold allocation metadata (stats and leak reports)
 // ============================================================================
 // Allocation metadata is kept out of the hot object header. It is only created
-// while memory stats or leak tracking are active; normal execution only stores a
-// small pool class in the header so release can recycle small objects.
+// while memory stats or leak tracking are active. The existing alloc_class
+// header field remains for generated-C ABI compatibility and is always DIRECT
+// for blorp_alloc-owned objects.
 typedef struct blorp_AllocMeta_s {
     blorp_Object* object;
     size_t alloc_size;
@@ -1411,6 +1419,34 @@ static inline blorp_destructor_fn blorp_destructor_for_id(uint32_t id) {
 
 __attribute__((constructor))
 static void __blorp_init_stats_flag(void) {
+#if !BLORP_MEMORY_DIAGNOSTICS
+    // Reject explicit requests before running a program whose linked runtime
+    // cannot collect the requested evidence. The ordinary stats API itself
+    // remains infallible and returns an inactive snapshot in this mode.
+    static const char* requests[] = {
+        "BLORP_ALLOCATOR_STATS",
+        "BLORP_COMPILER_MEMORY_PROFILE",
+        "BLORP_TYPECHECK_BODY_METRICS",
+        "BLORP_CORE_LOWERING_TYPE_METRICS",
+#ifndef BLORP_COMPILER_RUNTIME_SOURCES
+        // The compiler owns this setting for its run/test child artifacts.
+        // Its own stripped runtime must allow the CLI to select a diagnostic
+        // child; an ordinary stripped program still rejects the request.
+        "BLORP_LEAK_CHECK",
+#endif
+        "BLORP_TRACK_STATS",
+        "BLORP_TRACE_ALLOCS",
+        "BLORP_MEM_WATCH",
+    };
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        if (getenv(requests[i]) != NULL) {
+            fprintf(stderr,
+                "blorp: %s requires a runtime built with BLORP_MEMORY_DIAGNOSTICS=1\n",
+                requests[i]);
+            exit(2);
+        }
+    }
+#else
     const char* mem_watch_env = getenv("BLORP_MEM_WATCH");
     __blorp_compiler_memory_profile_enabled =
         getenv("BLORP_COMPILER_MEMORY_PROFILE") != NULL;
@@ -1442,6 +1478,7 @@ static void __blorp_init_stats_flag(void) {
         pthread_create(&tid, NULL, __mem_watch_thread, NULL);
         pthread_detach(tid);
     }
+#endif
 }
 
 static inline void blorp_init_object_header(blorp_Object* header,
@@ -1450,6 +1487,7 @@ static inline void blorp_init_object_header(blorp_Object* header,
     atomic_store_explicit(&header->refcount, 1, memory_order_relaxed);
     header->alloc_class = alloc_class;
     header->destructor_id = 0;
+#if BLORP_MEMORY_DIAGNOSTICS
     __alloc_meta_insert(header, alloc_size, true);
     bool stats_on = atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed);
     if (stats_on || atomic_load_explicit(&__blorp_lightweight_stats_enabled, memory_order_relaxed)) {
@@ -1459,6 +1497,9 @@ static inline void blorp_init_object_header(blorp_Object* header,
     if (stats_on) {
         global_mem_stats.bytes_allocated += (long)alloc_size;
     }
+#else
+    (void)alloc_size;
+#endif
 }
 
 // ============================================================================
@@ -3245,515 +3286,12 @@ static void __blorp_init_signal_handlers(void) {
     signal(SIGPIPE, SIG_IGN);
 }
 // ============================================================================
-// Small-Object Pool — fixed-capacity per-thread slabs for objects <= 1024 bytes
-// Bypasses malloc/free for hot allocation paths (Options, small strings, records).
-// Thread-local free lists, no locking. Overflow falls through to system allocator.
-//
-// A self-compile histogram (N4, 2026-09) covering 214.7M allocations found the
-// 50/90/95/99th percentile sizes at roughly 54/93/127/562 bytes, and that
-// misses were dominated (77.5% of all misses) not by sizes outside the pool's
-// classes but by an empty free list inside a covered class, caused by the old
-// BLORP_POOL_MAX_DEPTH=512 discarding freed objects during a free-heavy burst
-// just before an alloc-heavy burst drained the (now-shorter) list. The
-// 96-byte class in particular oscillated between a 60.7% hit rate and a
-// 34.7% free-time discard rate. Classes 192 and 256 were added to cover the
-// next-largest slice of previously-oversized traffic.
-//
-// A pure depth cap on the free list does not work under slab refill: an
-// interior slab pointer can never be passed to libc free(), so "discarding"
-// a freed object only unlinks it — the memory stays exactly as resident
-// either way. Capping the free list therefore does not bound RSS; it only
-// converts reusable memory into permanently wasted memory, which then
-// forces more slabs to be malloc'd for the same churn. A first cut with a
-// 16384-per-class free-list-depth cap measured +39% peak RSS on the
-// self-compile, because objects kept the memory pinned but stopped being
-// reused. See blorp/test/runtime/types/test_pool_slab_release.brp for the
-// regression that caught a cap freeing an interior slab pointer directly
-// ("pointer being freed was not allocated" — DO NOT do that).
-//
-// What bounds memory: a fixed limit of BLORP_POOL_SLAB_LIMIT slabs per class
-// per thread. Once a class has minted that many slabs, every one of its
-// objects is already accounted for and permanently owned by the pool (free
-// or live) — the pool simply stops growing. A slab, once minted, is never
-// freed while its thread lives; a miss on an empty supply at the limit
-// overflows to a direct libc malloc/free for that one object instead of
-// another slab, and the object's header records this (alloc_class =
-// BLORP_ALLOC_CLASS_DIRECT, the same "never pooled" marker oversized objects
-// already use) so blorp_release frees it straight to libc rather than
-// pushing it onto a free list it was never carved out of. No new header bit
-// was needed: alloc_class already distinguishes "pooled" (a class index)
-// from "not pooled" (BLORP_ALLOC_CLASS_DIRECT). This is a strictly simpler
-// contract than an earlier version of this pool, which additionally tried to
-// shrink a class back down by freeing idle slabs once a burst subsided; that
-// added a second bounded state (a "retained" warm-slab stack), a slab
-// high-water-triggered release path, and a same-thread-vs-foreign-thread
-// ownership guard whose only job was to make that release path safe. None of
-// that machinery is needed to bound memory — the fixed slab-count limit
-// already does that on its own — so it was removed. A resident slab still
-// costs memory for the rest of the thread's life once minted (it holds
-// capacity libc's own allocator can no longer see or reuse for anything
-// else), which is the tradeoff a fixed pool accepts in exchange for never
-// re-mallocing a slab it already paid for.
-//
-// Finding an object's slab header from its address must be O(1) on the hot
-// release path — a search over up to BLORP_POOL_SLAB_LIMIT resident slab
-// base pointers is not acceptable there. Every slab, regardless of class, is
-// the same fixed power-of-two size, BLORP_POOL_SLAB_SIZE, and is allocated
-// with aligned_alloc(BLORP_POOL_SLAB_SIZE, BLORP_POOL_SLAB_SIZE); masking any
-// object's address with ~(BLORP_POOL_SLAB_SIZE-1) recovers the header's
-// address in one AND, independent of how many slabs exist and with no
-// per-class lookup table. A first cut instead sized each class's alignment
-// to the next power of two above that class's own header-plus-objects
-// footprint, which wasted close to half a slab for classes whose natural
-// size sits just past a power of two (32, 64, 128, 256 bytes here) —
-// measured +41% peak RSS on the self-compile, worse than the ceiling-only
-// commit this was meant to improve on. With one slab size shared by every
-// class, the object count per slab is instead derived per class —
-// (BLORP_POOL_SLAB_SIZE - header) / class_size (see blorp_pool_refill_count
-// below) — so the only waste is the remainder of that division, a few
-// percent at most (see the per-class table there). This overflow test
-// relies on the same header tag, not on the address mask: an overflowed
-// object is stamped BLORP_ALLOC_CLASS_DIRECT at alloc time, so
-// blorp_release never even reaches the masking code below for it — a
-// malloc'd object can never be mistaken for a slab member because the
-// branch on alloc_class routes it away before the mask is applied.
-//
-// Each slab carries a small header (blorp_PoolSlabHeader) with its own free
-// list and free count, so a slab can be identified as fully idle (every
-// object it ever handed out is back on its own list) without touching any
-// other slab's bookkeeping. This is what makes thread-exit teardown safe: a
-// thread can have live objects out in the program long after it exits (a
-// worker thread that built a List and handed it to a shared queue, for
-// example), so blorp_pool_drain must never free a slab some of whose
-// objects are still checked out — it frees only the slabs whose free_count
-// has reached their class's full object count, and deliberately leaks the
-// rest (safe: no use-after-free, bounded to whatever was mid-use at the
-// exact moment the thread exited). Per-slab tracking is also what lets
-// blorp_alloc find a slab with room in O(1): slabs move between two
-// thread-local states per class — "partial" (0 < free_count < refill count,
-// a doubly-linked list for O(1) removal from the middle, searched by
-// blorp_alloc) and "none" (not linked anywhere — either fully live, so
-// nothing to search, or fully idle and simply left linked in "partial" with
-// every object free, ready for instant reuse without another malloc). There
-// is no separate "retained" state or release trigger: once a slab is
-// resident it just stays wherever the partial/none transition puts it for
-// the rest of the thread's life.
-//
-// Every structure here is thread-local. An object allocated on one thread
-// and released on another is handled correctly but not optimally: the
-// releasing thread cannot safely touch another thread's _Thread_local
-// bookkeeping (its partial list, its registry array), so a cross-thread
-// release instead adopts the raw object onto the releasing thread's own
-// small per-class "foreign" list — available for that thread's own future
-// allocations, but that slab can never be recognized as fully idle through
-// this path (its free_count only advances via the owning thread noticing
-// the object back on its own list, which never happens once another thread
-// permanently annexed it). That thread eventually reuses or drains it; it
-// does not migrate back.
-// ============================================================================
-#define BLORP_POOL_MAX_SIZE 1024
-#define BLORP_POOL_CLASSES 9
-
-// Size classes: 32, 64, 96, 128, 192, 256, 384, 512, 1024. The last three
-// were added after the ceiling profile in
-// benchmarks/results/core_teardown_profile_2026-09-22.md found the
-// oversized-miss traffic split across four buckets above 256 bytes (le_384,
-// le_512, le_1024, gt_1024); the first three are fixed, bounded sizes worth
-// a class, the unbounded gt_1024 tail (variable-size List/Dict/String/tensor
-// storage) is not and is left on the libc malloc/free path unchanged.
-static const size_t blorp_pool_sizes[BLORP_POOL_CLASSES] = {32, 64, 96, 128, 192, 256, 384, 512, 1024};
-
-// Every slab, of every class, is this many bytes: one page-multiple,
-// chosen once, shared by all nine classes so masking an address needs no
-// per-class table (see the big comment above). A slab refill mallocs one
-// of these instead of one object at a time, amortizing libc's per-call
-// bookkeeping (which the Perceus sample showed costing more than
-// blorp_alloc's own logic) across many objects instead of paying it on
-// every miss.
-#define BLORP_POOL_SLAB_SIZE (16 * 1024)
-
-// Fixed number of slabs a class may hold resident per thread for the rest
-// of that thread's life — the whole bound: no more than this many slabs are
-// ever minted, so the class's resident footprint tops out at
-// BLORP_POOL_SLAB_LIMIT * BLORP_POOL_SLAB_SIZE bytes and never grows past
-// it and never shrinks before thread exit.
-// Overridable per process with the BLORP_POOL_SLAB_LIMIT environment
-// variable (read once at startup — see blorp_pool_init_slab_limit) and, at
-// link time, by defining BLORP_POOL_SLAB_LIMIT before this file is
-// compiled.
-//
-// The default below is a single scalar shared by every class (simplicity
-// over a per-class table). Kept at the same value chosen for the previous
-// (per-class-aligned) slab layout; re-measuring the self-compile's
-// per-class slab high-water mark under this fixed-BLORP_POOL_SLAB_SIZE
-// layout (BLORP_COMPILER_MEMORY_PROFILE=1, BLORP_POOL_SLAB_LIMIT=100000000
-// so nothing overflowed) found every class's need dropped, since a slab
-// now holds several times more objects for the smaller classes:
-//
-//   class (bytes)   slab high-water   default / high-water margin
-//   32                      2,553            70.5x
-//   64                     35,622             5.1x
-//   96                     51,066             3.5x  (the binding class)
-//   128                     2,252            79.9x
-//   192                     2,166            83.1x
-//   256                     2,708            66.5x
-//
-// The default is left unchanged rather than tightened further: it is
-// already generous, costs nothing extra for classes far below it (slabs
-// are only ever malloc'd on demand, never pre-allocated up to the limit),
-// and the only per-class cost of a larger limit is the bookkeeping array
-// of slab base pointers (limit * 8 bytes). A class that is still short of
-// its limit at the end of a workload paid nothing extra for the headroom;
-// a class that is not (see __blorp_pool_slab_highwater and the overflow
-// counter, both reported under BLORP_COMPILER_MEMORY_PROFILE) is the signal
-// to raise this default.
-#ifndef BLORP_POOL_SLAB_LIMIT
-#define BLORP_POOL_SLAB_LIMIT 180000
-#endif
-
-static int blorp_pool_slab_limit = BLORP_POOL_SLAB_LIMIT;
-
-__attribute__((constructor))
-static void blorp_pool_init_slab_limit(void) {
-    const char* env = getenv("BLORP_POOL_SLAB_LIMIT");
-    if (env) {
-        long long parsed = atoll(env);
-        if (parsed > 0) {
-            blorp_pool_slab_limit = (int)parsed;
-        }
-    }
-}
-
-// Highest number of slabs any thread has driven a class to, tracked
-// unconditionally (the update is on the already-cold once-per-slab-mint
-// path) but only reported under BLORP_COMPILER_MEMORY_PROFILE. Useful for
-// tuning BLORP_POOL_SLAB_LIMIT: a class whose high-water mark sits well
-// under the limit has margin to spare; one that reaches it (see the
-// overflow counter) is a candidate for a higher default.
-static _Atomic int __blorp_pool_slab_highwater[BLORP_POOL_CLASSES];
-
-static inline void blorp_pool_highwater_note(int cls, int slab_count) {
-    int prev = atomic_load_explicit(&__blorp_pool_slab_highwater[cls], memory_order_relaxed);
-    while (slab_count > prev &&
-           !atomic_compare_exchange_weak_explicit(
-               &__blorp_pool_slab_highwater[cls], &prev, slab_count,
-               memory_order_relaxed, memory_order_relaxed)) {
-        // prev is updated by the failed CAS; retry until we win or fall behind.
-    }
-}
-
-// Every allocation size this runtime can produce fits in one of 32 buckets of
-// 32 bytes each (1..1024); map each bucket straight to its class with a
-// shift and a table lookup instead of a branch per class, so the lookup cost
-// does not grow with the number of classes. Buckets 8..11 round up to the
-// 384-byte class, 12..15 to 512, and 16..31 (a 513..1024 byte allocation) all
-// round up to the single 1024-byte class.
-#define BLORP_POOL_CLASS_BUCKETS 32
-static const int8_t blorp_pool_class_table[BLORP_POOL_CLASS_BUCKETS] = {
-    0, 1, 2, 3, 4, 4, 5, 5,
-    6, 6, 6, 6, 7, 7, 7, 7,
-    8, 8, 8, 8, 8, 8, 8, 8,
-    8, 8, 8, 8, 8, 8, 8, 8
-};
-
-// Map allocation size to pool class index. Returns -1 if too large or zero.
-static inline int blorp_pool_class(size_t size) {
-    if (size == 0 || size > BLORP_POOL_MAX_SIZE) {
-        return -1;  // SIMD objects have alloc_size=0 — must not pool
-    }
-    size_t bucket = (size - 1) >> 5;
-    return blorp_pool_class_table[bucket];
-}
-
-// Per-slab header, stored at the base of the slab's own
-// BLORP_POOL_SLAB_SIZE-aligned allocation. Each slab owns its own free
-// list — objects from different slabs are never linked together — so a
-// slab's idleness (every object it ever handed out is back on its own
-// list) can be checked at thread exit without touching any other slab's
-// bookkeeping (see blorp_pool_drain).
-//
-// `owner` identifies the minting thread for the cross-thread-release
-// guard. This must be pthread_self() (compared with pthread_equal), not
-// the address of that thread's _Thread_local blorp_pool_tls block: a
-// dynamic TLS implementation can lazily allocate a thread's first-ever
-// _Thread_local storage on its first access, and a short-lived thread
-// that mints a slab, hands its objects to another thread, and exits
-// before that other thread's own first touch of blorp_pool_tls creates a
-// real, non-hypothetical window where the allocator reuses the exited
-// thread's just-freed TLS address for the still-live thread's block —
-// making a stale `owner` pointer compare equal to a live thread's
-// `&blorp_pool_tls` despite being different threads. Reproduced directly:
-// a producer thread minted slabs, handed 1000 objects to a consumer
-// thread, and exited; the consumer's lazily-allocated blorp_pool_tls
-// landed at the exact address the producer's had just vacated, so the
-// release path wrongly took the same-thread branch and eventually
-// corrupted the pool. pthread_self() has no such lazy-allocation aliasing
-// window: it identifies the calling thread for that thread's entire
-// lifetime, and POSIX guarantees no two concurrently live threads share
-// one. See blorp/test/runtime/test_runtime_pool_fixed_capacity.py's
-// cross-thread handoff test for the regression.
-typedef struct blorp_PoolSlabHeader_s {
-    void* free_head;                      // this slab's own free list
-    struct blorp_PoolSlabHeader_s* prev;  // "partial" list link (NULL when not linked)
-    struct blorp_PoolSlabHeader_s* next;  // "partial" list link
-    pthread_t owner;                      // minting thread's identity (cross-thread-release guard)
-    int free_count;                       // objects free right now, 0..blorp_pool_refill_count[cls]
-} blorp_PoolSlabHeader;
-
-// Objects per slab, per class: (BLORP_POOL_SLAB_SIZE - header) /
-// class_size, so every slab is the same fixed size (masking an object's
-// address with ~(BLORP_POOL_SLAB_SIZE-1) recovers its header, no
-// per-class table needed for that) and the only waste per slab is the
-// division's remainder rather than padding out to a per-class power of
-// two. sizeof(blorp_PoolSlabHeader) is a compile-time constant, so this
-// table is computed once here, not per allocation.
-//
-//   class (bytes)   objects/slab   header bytes   waste bytes/slab
-//   32                  510             40               24
-//   64                  255             40               24
-//   96                  170             40               24
-//   128                 127             40               88
-//   192                  85             40               24
-//   256                  63             40              216
-//   384                  42             40              216
-//   512                  31             40              472
-//   1024                 15             40              984
-//
-// (Header size and the table above assume a 64-bit build, where
-// sizeof(blorp_PoolSlabHeader) is 40 bytes: three pointers, one
-// pthread_t, and one int, rounded up to the platform's 8-byte alignment.)
-// The 384/512/1024 classes trade proportionally more waste per slab for
-// the same fixed BLORP_POOL_SLAB_SIZE — accepted per the same
-// simplicity-over-a-per-class-slab-size call as the smaller six; a
-// class-specific slab size would need its own alignment/masking scheme
-// and reintroduce the per-class table this design removed.
-static const int blorp_pool_refill_count[BLORP_POOL_CLASSES] = {
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 32),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 64),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 96),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 128),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 192),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 256),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 384),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 512),
-    (int)((BLORP_POOL_SLAB_SIZE - sizeof(blorp_PoolSlabHeader)) / 1024),
-};
-
-// Per class: a doubly-linked "partial" list (slabs with free objects,
-// searched by blorp_alloc), a small flat list of objects adopted from a
-// foreign thread's release (see the cross-thread note above), the count of
-// currently resident slabs, and the bounded registry of their base
-// pointers (for the slab-count cap and for blorp_pool_drain). One
-// thread-local object rather than parallel arrays: blorp_alloc and the
-// release path each take its address once (one dyld `_tlv_get_addr` call)
-// and index through the resulting pointer for the rest of the call.
-//
-// slabs[cls] is NULL until that class's first mint, at which point it is
-// malloc'd as an array of exactly blorp_pool_slab_limit base pointers.
-typedef struct {
-    blorp_PoolSlabHeader* partial_head[BLORP_POOL_CLASSES];
-    void* foreign_free[BLORP_POOL_CLASSES];
-    int slab_count[BLORP_POOL_CLASSES];
-    void** slabs[BLORP_POOL_CLASSES];
-} blorp_PoolTLS;
-
-static _Thread_local blorp_PoolTLS blorp_pool_tls;
-
-// Counts every blorp_pool_drain() call (process exit plus one per thread
-// that ever touched the pool). Not part of the allocation oracle — it
-// counts drains, not allocations — but cheap enough (one atomic add on an
-// already-rare, once-per-thread-lifetime path) to keep on unconditionally
-// so tests can confirm the per-thread exit hook actually fired.
-static _Atomic long __blorp_pool_drain_calls = 0;
-
-// Drain every pool structure and free every FULLY IDLE slab this thread
-// currently holds resident. Called at process exit (atexit) and, per
-// thread, when that thread exits (see blorp_pool_register_exit_hook) so a
-// thread's slabs do not all sit resident for the rest of the process once
-// it is gone.
-//
-// A slab whose free_count is below its class's refill count still has
-// objects checked out — e.g. handed to another thread that has not
-// released them yet, exactly the scenario the cross-thread release path
-// exists for. Freeing such a slab here would free memory another thread
-// still holds a live pointer into. Instead it is deliberately leaked: its
-// base pointer is simply not passed to free(), which is safe (no
-// use-after-free, no corruption) and bounded (at most however many slabs
-// were mid-use at the exact moment this thread exited). A later release
-// of one of its objects still finds the slab correctly by address masking
-// and takes the safe cross-thread "adopt" path, since the releasing
-// thread's own &blorp_pool_tls can never equal this exited thread's
-// (dead) owner pointer value for a live comparison.
-//
-// Safe to call more than once: after the first call every slabs[c] is
-// NULL and slab_count[c] is 0, so later calls are no-ops. Walks the
-// bounded registry array (not the partial list) since every resident slab
-// appears there exactly once regardless of whether it is currently linked
-// into "partial".
-static void blorp_pool_drain(void) {
-    atomic_fetch_add_explicit(&__blorp_pool_drain_calls, 1, memory_order_relaxed);
-    blorp_PoolTLS* tls = &blorp_pool_tls;
-    for (int c = 0; c < BLORP_POOL_CLASSES; c++) {
-        tls->partial_head[c] = NULL;
-        tls->foreign_free[c] = NULL;
-        if (tls->slabs[c]) {
-            for (int i = 0; i < tls->slab_count[c]; i++) {
-                blorp_PoolSlabHeader* slab = (blorp_PoolSlabHeader*)tls->slabs[c][i];
-                if (slab->free_count == blorp_pool_refill_count[c]) {
-                    free(slab);
-                }
-            }
-            free(tls->slabs[c]);
-            tls->slabs[c] = NULL;
-        }
-        tls->slab_count[c] = 0;
-    }
-}
-
-// One pthread key whose only purpose is to run a destructor (blorp_pool_
-// drain) when a thread that ever touched the pool exits, so its slabs are
-// freed at that point rather than only at process exit. The main thread
-// does not exit via a path that runs pthread key destructors, so the
-// existing atexit(blorp_pool_drain) still owns that case; blorp_pool_drain
-// tolerates being called twice.
-static pthread_key_t blorp_pool_exit_key;
-static pthread_once_t blorp_pool_exit_key_once = PTHREAD_ONCE_INIT;
-static _Thread_local bool blorp_pool_exit_hook_registered = false;
-
-static void blorp_pool_exit_hook(void* arg) {
-    (void)arg;
-    blorp_pool_drain();
-}
-
-static void blorp_pool_exit_key_init(void) {
-    pthread_key_create(&blorp_pool_exit_key, blorp_pool_exit_hook);
-}
-
-static inline void blorp_pool_register_exit_hook(void) {
-    if (!blorp_pool_exit_hook_registered) {
-        pthread_once(&blorp_pool_exit_key_once, blorp_pool_exit_key_init);
-        // Any non-NULL value triggers the destructor at thread exit; the
-        // value itself is never read back.
-        pthread_setspecific(blorp_pool_exit_key, (void*)1);
-        blorp_pool_exit_hook_registered = true;
-    }
-}
-
-// Push a slab onto the head of the class's "partial" list (a slab with at
-// least one free object, searched by blorp_alloc). O(1).
-static inline void blorp_pool_partial_push(blorp_PoolTLS* tls, int cls, blorp_PoolSlabHeader* slab) {
-    slab->prev = NULL;
-    slab->next = tls->partial_head[cls];
-    if (slab->next) slab->next->prev = slab;
-    tls->partial_head[cls] = slab;
-}
-
-// Remove a slab from wherever it sits in the class's "partial" list. O(1):
-// this is exactly why the list is doubly linked instead of a single mixed
-// free chain across every slab of the class.
-static inline void blorp_pool_partial_unlink(blorp_PoolTLS* tls, int cls, blorp_PoolSlabHeader* slab) {
-    if (slab->prev) slab->prev->next = slab->next; else tls->partial_head[cls] = slab->next;
-    if (slab->next) slab->next->prev = slab->prev;
-    slab->prev = NULL;
-    slab->next = NULL;
-}
-
-// Mint a brand-new slab: one aligned_alloc of BLORP_POOL_SLAB_SIZE bytes
-// holding the header plus blorp_pool_refill_count[cls] objects, registered
-// in the thread's bounded slab array. Never freed individually while the
-// thread lives — only blorp_pool_drain (thread/process exit) ever calls
-// free() on it, and only once every object it handed out is back on its
-// own free list. Caller guarantees tls->slab_count[cls] < blorp_pool_slab_limit.
-static blorp_PoolSlabHeader* blorp_pool_mint_slab(blorp_PoolTLS* tls, int cls) {
-    blorp_pool_register_exit_hook();
-    if (!tls->slabs[cls]) {
-        // Not an allocation the oracle observes, because this is internal
-        // pool bookkeeping (the fixed-size registry of a class's own slab
-        // base pointers), not backing storage for a blorp_alloc() request;
-        // it happens at most once per class per thread for the process's
-        // whole life, unlike backing_pool_refill_events below which fires
-        // on every slab.
-        tls->slabs[cls] = (void**)malloc(sizeof(void*) * (size_t)blorp_pool_slab_limit);
-        if (!tls->slabs[cls]) {
-            fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n",
-                    sizeof(void*) * (size_t)blorp_pool_slab_limit);
-            exit(1);
-        }
-    }
-    __blorp_oracle_count(&__blorp_oracle_stats.backing_pool_refill_events);
-    void* raw = aligned_alloc(BLORP_POOL_SLAB_SIZE, BLORP_POOL_SLAB_SIZE);
-    if (!raw) {
-        fprintf(stderr, "blorp: out of memory (requested %d bytes)\n", BLORP_POOL_SLAB_SIZE);
-        exit(1);
-    }
-    blorp_PoolSlabHeader* slab = (blorp_PoolSlabHeader*)raw;
-    slab->owner = pthread_self();
-    slab->prev = NULL;
-    slab->next = NULL;
-    tls->slabs[cls][tls->slab_count[cls]] = raw;
-    tls->slab_count[cls]++;
-    blorp_pool_highwater_note(cls, tls->slab_count[cls]);
-
-    size_t obj_size = blorp_pool_sizes[cls];
-    int count = blorp_pool_refill_count[cls];
-    char* objects = (char*)raw + sizeof(blorp_PoolSlabHeader);
-    void* head = NULL;
-    for (int i = 0; i < count; i++) {
-        void* obj = objects + (size_t)i * obj_size;
-        *(void**)obj = head;
-        head = obj;
-    }
-    slab->free_head = head;
-    slab->free_count = count;
-    return slab;
-}
-
-// Slow path for a class whose partial list is empty: reuse an object
-// adopted from a foreign thread's release if one is on hand, then mint a
-// new slab if the class is under its fixed limit, then signal overflow (the
-// caller is already at blorp_pool_slab_limit) by returning NULL.
-static void* blorp_pool_slow_alloc(blorp_PoolTLS* tls, int cls, bool* overflowed) {
-    *overflowed = false;
-    if (tls->foreign_free[cls] != NULL) {
-        void* obj = tls->foreign_free[cls];
-        tls->foreign_free[cls] = *(void**)obj;
-        return obj;
-    }
-    blorp_PoolSlabHeader* slab;
-    if (tls->slab_count[cls] < blorp_pool_slab_limit) {
-        slab = blorp_pool_mint_slab(tls, cls);
-    } else {
-        *overflowed = true;
-        return NULL;
-    }
-    blorp_pool_partial_push(tls, cls, slab);
-    void* obj = slab->free_head;
-    slab->free_head = *(void**)obj;
-    slab->free_count--;
-    if (slab->free_count == 0) blorp_pool_partial_unlink(tls, cls, slab);
-    return obj;
-}
-
-// ----------------------------------------------------------------------------
-// Allocation size histogram and pool hit/miss counters (N4, allocator pool
-// coverage). Active only under BLORP_COMPILER_MEMORY_PROFILE=1; on the hot
-// path this is exactly one predicted, statically-unlikely branch
-// (__blorp_compiler_memory_profile_enabled) per call, so it stays compiled
-// in rather than behind a build flag.
-// ----------------------------------------------------------------------------
+// Allocation-size histogram for opt-in compiler memory diagnostics.
 #define BLORP_ALLOC_HIST_BUCKETS 12
 static const size_t __blorp_alloc_hist_bounds[BLORP_ALLOC_HIST_BUCKETS] = {
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, SIZE_MAX
 };
 static _Atomic long __blorp_alloc_hist_counts[BLORP_ALLOC_HIST_BUCKETS];
-static _Atomic long __blorp_pool_hit_counts[BLORP_POOL_CLASSES];
-static _Atomic long __blorp_pool_miss_empty_counts[BLORP_POOL_CLASSES];
-static _Atomic long __blorp_pool_miss_oversized_count;
-// Free-path counters: did a released object return to its class's pool, or
-// get freed to libc because it was never poolable (there is no depth cap —
-// see the pool-return path)?
-static _Atomic long __blorp_pool_return_pushed_counts[BLORP_POOL_CLASSES];
-static _Atomic long __blorp_pool_return_discard_oversized_count;
 
 static inline void __blorp_alloc_hist_record(size_t size) {
     int bucket = 0;
@@ -3779,32 +3317,7 @@ static void __blorp_alloc_hist_report(void) {
             fprintf(stderr, " bucket_le_%zu=%ld", bound, count);
         }
     }
-    for (int c = 0; c < BLORP_POOL_CLASSES; c++) {
-        fprintf(stderr, " pool_hit_%zu=%ld pool_miss_empty_%zu=%ld",
-                blorp_pool_sizes[c],
-                atomic_load_explicit(&__blorp_pool_hit_counts[c], memory_order_relaxed),
-                blorp_pool_sizes[c],
-                atomic_load_explicit(&__blorp_pool_miss_empty_counts[c], memory_order_relaxed));
-    }
-    fprintf(stderr, " pool_miss_oversized=%ld\n",
-            atomic_load_explicit(&__blorp_pool_miss_oversized_count, memory_order_relaxed));
-    fprintf(stderr, "BLORP_COMPILER_MEMORY_HISTOGRAM_FREE schema=1");
-    for (int c = 0; c < BLORP_POOL_CLASSES; c++) {
-        fprintf(stderr, " pool_pushed_%zu=%ld",
-                blorp_pool_sizes[c],
-                atomic_load_explicit(&__blorp_pool_return_pushed_counts[c], memory_order_relaxed));
-    }
-    fprintf(stderr, " pool_discard_oversized=%ld\n",
-            atomic_load_explicit(&__blorp_pool_return_discard_oversized_count, memory_order_relaxed));
-    fprintf(stderr, "BLORP_COMPILER_MEMORY_HISTOGRAM_POOL_SLABS schema=1 slab_limit=%d",
-            blorp_pool_slab_limit);
-    for (int c = 0; c < BLORP_POOL_CLASSES; c++) {
-        fprintf(stderr, " highwater_%zu=%d",
-                blorp_pool_sizes[c],
-                atomic_load_explicit(&__blorp_pool_slab_highwater[c], memory_order_relaxed));
-    }
-    fprintf(stderr, " overflow=%ld\n",
-            atomic_load_explicit(&__blorp_oracle_stats.backing_pool_overflow_events, memory_order_relaxed));
+    fprintf(stderr, "\n");
 }
 
 static void __blorp_teardown_before_leak_report(void) {
@@ -3817,13 +3330,16 @@ static void __blorp_teardown_before_leak_report(void) {
         cleanup();
     }
     __blorp_alloc_hist_report();
-    blorp_pool_drain();
+}
+
+// Query the linked runtime object, not a build-stamp or generated-body macro.
+// Stage-2 binaries can share generated C while linking different runtime modes.
+int blorp_memory_diagnostics_mode(void) {
+    return BLORP_MEMORY_DIAGNOSTICS;
 }
 
 void* blorp_alloc(size_t size) {
-    void* obj;
-    size_t actual_size = size;
-    int cls = blorp_pool_class(size);
+#if BLORP_MEMORY_DIAGNOSTICS
     void* alloc_site = NULL;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -3836,85 +3352,21 @@ void* blorp_alloc(size_t size) {
     if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
         __blorp_alloc_hist_record(size);
     }
-
-    // Try pool for small objects.
-    // Pool is disabled under ASan — ASan tracks malloc/free precisely and the pool's
-    // memory reuse bypasses that tracking, causing false heap-buffer-overflow reports.
-// Pool disabled under ASan
-#if !defined(BLORP_ASAN)
-    // One TLS lookup for the whole call — see blorp_PoolTLS above.
-    blorp_PoolTLS* tls = &blorp_pool_tls;
-    blorp_PoolSlabHeader* partial = cls >= 0 ? tls->partial_head[cls] : NULL;
-    if (partial != NULL) {
-        // Pop from the head partial slab's own free list — reuse first 8
-        // bytes as next pointer. If this empties the slab, unlink it (the
-        // most common transition on the hot path is staying partial).
-        obj = partial->free_head;
-        partial->free_head = *(void**)obj;
-        partial->free_count--;
-        if (partial->free_count == 0) blorp_pool_partial_unlink(tls, cls, partial);
-        actual_size = blorp_pool_sizes[cls];
-        if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
-            atomic_fetch_add_explicit(
-                &__blorp_pool_hit_counts[cls], 1, memory_order_relaxed);
-        }
-    } else if (cls >= 0) {
-        // No slab with a free object on hand: try an object adopted from
-        // another thread, then mint a new slab if under the fixed limit,
-        // in that order (see blorp_pool_slow_alloc).
-        if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
-            atomic_fetch_add_explicit(
-                &__blorp_pool_miss_empty_counts[cls], 1, memory_order_relaxed);
-        }
-        bool overflowed = false;
-        obj = blorp_pool_slow_alloc(tls, cls, &overflowed);
-        actual_size = blorp_pool_sizes[cls];
-        if (overflowed) {
-            // The class is already at its fixed slab-count limit: overflow
-            // this one object to libc instead of growing the pool further.
-            // cls is reset to -1 so the header below is stamped
-            // BLORP_ALLOC_CLASS_DIRECT (the same "not pooled" marker
-            // oversized objects use), which sends this object straight
-            // back to libc free() on release instead of into any slab.
-            __blorp_oracle_count(&__blorp_oracle_stats.backing_pool_overflow_events);
-            __blorp_oracle_count(&__blorp_oracle_stats.backing_libc_malloc_events);
-            obj = malloc(actual_size);
-            if (!obj) {
-                fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n", actual_size);
-                exit(1);
-            }
-            cls = -1;
-        }
-    } else
 #endif
-    {
-        // ASan builds always land here; non-ASan builds land here only for
-        // sizes outside every class.
-        if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
-            if (cls >= 0) {
-                atomic_fetch_add_explicit(
-                    &__blorp_pool_miss_empty_counts[cls], 1, memory_order_relaxed);
-            } else {
-                atomic_fetch_add_explicit(
-                    &__blorp_pool_miss_oversized_count, 1, memory_order_relaxed);
-            }
-        }
-        // Round up to class size for poolable objects (so free can recycle)
-        if (cls >= 0) actual_size = blorp_pool_sizes[cls];
-        __blorp_oracle_count(&__blorp_oracle_stats.backing_libc_malloc_events);
-        obj = malloc(actual_size);
-        if (!obj) {
-            fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n", size);
-            exit(1);
-        }
-    }
 
+    // Even a zero-sized request must leave room for the managed header.
+    size_t actual_size = size < sizeof(blorp_Object) ? sizeof(blorp_Object) : size;
+#if BLORP_MEMORY_DIAGNOSTICS
+    __blorp_oracle_count(&__blorp_oracle_stats.backing_libc_malloc_events);
+#endif
+    void* obj = malloc(actual_size);
+    if (!obj) {
+        fprintf(stderr, "blorp: out of memory (requested %zu bytes)\n", actual_size);
+        exit(1);
+    }
     blorp_Object* header = (blorp_Object*)obj;
-    blorp_init_object_header(
-        header,
-        cls >= 0 ? (uint32_t)cls : BLORP_ALLOC_CLASS_DIRECT,
-        actual_size
-    );
+    blorp_init_object_header(header, BLORP_ALLOC_CLASS_DIRECT, actual_size);
+#if BLORP_MEMORY_DIAGNOSTICS
     if (__alloc_meta_enabled()) {
         long alloc_site_offset = alloc_site
             ? (long)((intptr_t)(uintptr_t)alloc_site -
@@ -3925,18 +3377,28 @@ void* blorp_alloc(size_t size) {
     if (atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed) && __blorp_trace_allocs) {
         __blorp_trace_record(actual_size, alloc_site);
     }
+#endif
     return obj;
 }
 
 // Tagged allocation: sets type_tag for leak reporting.
 // type_tag is a string literal pointer — no allocation or copy needed.
 void blorp_set_type_tag(void* obj, const char* tag) {
+#if BLORP_MEMORY_DIAGNOSTICS
     if (obj) __alloc_meta_set_type_tag((blorp_Object*)obj, tag);
+#else
+    (void)obj;
+    (void)tag;
+#endif
 }
 
 // Macro for tagging after allocation — less invasive than changing every call site.
 // Usage: BLORP_TAG(ptr, "String")
+#if BLORP_MEMORY_DIAGNOSTICS
 #define BLORP_TAG(ptr, tag) blorp_set_type_tag((void*)(ptr), (tag))
+#else
+#define BLORP_TAG(ptr, tag) ((void)0)
+#endif
 
 static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters);
 static blorp_IoWaitOwner blorp_io_wait_owner_none(void);
@@ -5885,75 +5347,22 @@ static int blorp_io_reactor_take_ready(
 __attribute__((noinline))
 static void blorp_release_slow_finish(blorp_Object* header, void* obj,
                                       blorp_destructor_fn destructor) {
+#if BLORP_MEMORY_DIAGNOSTICS
     blorp_AllocMeta* meta = __alloc_meta_take(header);
     bool stats_tracked = meta && meta->stats_tracked;
     bool counted_in_current_epoch =
         stats_tracked && meta->stats_epoch == atomic_load(&global_mem_stats.epoch);
     size_t freed_size = meta ? meta->alloc_size : 0;
+#else
+    (void)header;
+#endif
     if (destructor) destructor(obj);
 
-    // Try to return to pool instead of freeing. The hot header stores only the
-    // pool class; exact byte size is cold metadata for stats/leak modes.
-    // Disable pool when AddressSanitizer is active — ASan tracks malloc/free precisely
-    // and the pool's memory reuse bypasses that tracking, causing false positives.
-#if defined(BLORP_ASAN)
+    // blorp_alloc returns the malloc base directly, so the final ARC
+    // release returns that same pointer after its destructor has run.
     free(obj);
-#else
-    int cls = header->alloc_class < BLORP_POOL_CLASSES
-        ? (int)header->alloc_class
-        : -1;
-    // One TLS lookup for the whole call — see blorp_PoolTLS above.
-    blorp_PoolTLS* tls = &blorp_pool_tls;
-    if (cls >= 0) {
-        // Find this object's slab header by masking its address — every
-        // slab is the same fixed BLORP_POOL_SLAB_SIZE regardless of class
-        // (see the big comment above). `obj` and `header` are the same
-        // address (blorp_Object sits at a slab object's front).
-        blorp_PoolSlabHeader* slab = (blorp_PoolSlabHeader*)(
-            (uintptr_t)obj & ~((uintptr_t)BLORP_POOL_SLAB_SIZE - 1));
-        if (!pthread_equal(slab->owner, pthread_self())) {
-            // Cross-thread release: this thread cannot safely touch
-            // another live thread's _Thread_local slab bookkeeping (its
-            // partial list, its registry array), so adopt the raw object
-            // into this thread's own small per-class list instead —
-            // usable by this thread's future allocations, but that slab
-            // can never be recognized as fully idle through this path
-            // (its free_count only advances via the owning thread's own
-            // release code, which this object never reaches once adopted).
-            *(void**)obj = tls->foreign_free[cls];
-            tls->foreign_free[cls] = obj;
-        } else {
-            int prev_count = slab->free_count;
-            *(void**)obj = slab->free_head;
-            slab->free_head = obj;
-            slab->free_count = prev_count + 1;
-            if (prev_count == 0) {
-                // Slab was fully live (not linked anywhere) and now has
-                // one free object: it becomes searchable again.
-                blorp_pool_partial_push(tls, cls, slab);
-            }
-            // No special handling when free_count reaches the class's full
-            // object count: a fully idle slab simply stays linked in
-            // "partial" with every object free, ready for instant reuse.
-            // It is never freed while the thread lives — only
-            // blorp_pool_drain (thread/process exit) does that, and only
-            // for slabs it finds in this same fully idle state.
-        }
-        if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
-            atomic_fetch_add_explicit(
-                &__blorp_pool_return_pushed_counts[cls], 1, memory_order_relaxed);
-        }
-    } else {
-        // Never poolable (oversized or zero-size): always a standalone
-        // malloc(), so a plain free() is correct here.
-        if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
-            atomic_fetch_add_explicit(
-                &__blorp_pool_return_discard_oversized_count, 1, memory_order_relaxed);
-        }
-        free(obj);
-    }
-#endif
 
+#if BLORP_MEMORY_DIAGNOSTICS
     bool release_stats_on = atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed);
     if (release_stats_on && counted_in_current_epoch) {
         global_mem_stats.total_releases++;
@@ -5967,6 +5376,7 @@ static void blorp_release_slow_finish(blorp_Object* header, void* obj,
             &global_mem_stats.current_objects, 1, memory_order_relaxed);
     }
     free(meta);
+#endif
 }
 
 static void blorp_release_slow(blorp_Object* header, void* obj) {
@@ -39106,6 +38516,7 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value) {
 // ============================================================================
 
 blorp_MemStats blorp_get_mem_stats(void) {
+#if BLORP_MEMORY_DIAGNOSTICS
     bool allocator_stats = __blorp_allocator_stats_active();
     if (!allocator_stats) {
         atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
@@ -39119,12 +38530,8 @@ blorp_MemStats blorp_get_mem_stats(void) {
         stats.current_objects = atomic_load_explicit(
             &global_mem_stats.current_objects, memory_order_relaxed);
         stats.bytes_allocated = __blorp_allocator_bytes_in_use();
-        stats.backing_pool_refill_events = atomic_load_explicit(
-            &__blorp_oracle_stats.backing_pool_refill_events, memory_order_relaxed);
         stats.backing_libc_malloc_events = atomic_load_explicit(
             &__blorp_oracle_stats.backing_libc_malloc_events, memory_order_relaxed);
-        stats.backing_pool_overflow_events = atomic_load_explicit(
-            &__blorp_oracle_stats.backing_pool_overflow_events, memory_order_relaxed);
         stats.raw_buffer_malloc_events = atomic_load_explicit(
             &__blorp_oracle_stats.raw_buffer_malloc_events, memory_order_relaxed);
         stats.raw_buffer_calloc_events = atomic_load_explicit(
@@ -39148,10 +38555,15 @@ blorp_MemStats blorp_get_mem_stats(void) {
         // oracle counters were not being maintained and must not be read as
         // "zero events observed".
     }
+    stats.memory_stats_active = 1;
     return stats;
+#else
+    return (blorp_MemStats){0};
+#endif
 }
 
 void blorp_reset_mem_stats(void) {
+#if BLORP_MEMORY_DIAGNOSTICS
     // Lightweight process-wide counters deliberately omit per-object metadata.
     // A reset starts an exact measurement epoch, so objects allocated before
     // this boundary must not affect the new epoch when they are later released.
@@ -39169,9 +38581,11 @@ void blorp_reset_mem_stats(void) {
     atomic_store(&global_mem_stats.total_releases, 0);
     atomic_store(&global_mem_stats.current_objects, 0);
     atomic_store(&global_mem_stats.bytes_allocated, 0);
+#endif
 }
 
 void blorp_print_live_object_summary(void) {
+#if BLORP_MEMORY_DIAGNOSTICS
     atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
     long leaked = atomic_load(&global_mem_stats.current_objects);
     if (leaked <= 0) return;
@@ -39184,6 +38598,9 @@ void blorp_print_live_object_summary(void) {
     unsigned long current_epoch = atomic_load(&global_mem_stats.epoch);
     __blorp_print_live_object_type_summary(stdout, current_epoch, 0);
     fflush(stdout);
+#else
+    puts("Memory diagnostics unavailable; rebuild with BLORP_MEMORY_DIAGNOSTICS=1");
+#endif
 }
 
 blorp_SchedulerStats blorp_get_scheduler_stats(void) {

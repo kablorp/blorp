@@ -46,7 +46,7 @@ MEMSTAT_FIELDS = (
     "current_objects",
     "bytes_allocated",
 )
-TRACE_NUMERIC_FIELDS = ("timestamp_microseconds", *MEMSTAT_FIELDS)
+TRACE_NUMERIC_FIELDS = ("timestamp_microseconds", *MEMSTAT_FIELDS, "memory_stats_active")
 COMPILER_CLI_RETENTION_SLICE = (
     "string",
     "parser",
@@ -569,10 +569,23 @@ def measurement_worker(argv: list[str]) -> int:
         for _phase, _module, fields in final_markers
         if "bytes_allocated" in fields
     ]
+    stat_markers = [
+        fields for _phase, _module, fields in final_markers
+        if "total_allocations" in fields
+    ]
+    memory_stats_available = (
+        not args.memstats_enabled
+        or (bool(stat_markers) and all(
+            fields.get("memory_stats_active") == 1
+            for fields in stat_markers
+        ))
+    )
     allocator_stats_available = (
         not args.allocator_stats_enabled
         or (
             bool(allocator_samples)
+            and all(fields.get("memory_stats_active") == 1
+                    for fields in stat_markers)
             and all(
                 sample["bytes_allocated"] >= 0
                 and sample.get("total_allocations", -1) >= 0
@@ -598,6 +611,7 @@ def measurement_worker(argv: list[str]) -> int:
         "memory_limit_kind": limit_kind,
         "memory_limit_failure_possible": memory_limit_failure_possible,
         "memstats_enabled": bool(args.memstats_enabled),
+        "memory_stats_available": memory_stats_available,
         "allocator_stats_enabled": bool(args.allocator_stats_enabled),
         "allocator_stats_available": allocator_stats_available,
         "inventory_enabled": bool(args.inventory_enabled),
@@ -926,6 +940,12 @@ def run_benchmark(args: argparse.Namespace) -> int:
                 errors.append(detail)
             if errors:
                 metrics["error"] = "\n".join(errors)
+            print_metrics(metrics, args.json)
+            return 1
+
+        if not metrics["memory_stats_available"]:
+            metrics["verified"] = False
+            metrics["error"] = "memory statistics are unavailable; rebuild the helper with BLORP_MEMORY_DIAGNOSTICS=1"
             print_metrics(metrics, args.json)
             return 1
 

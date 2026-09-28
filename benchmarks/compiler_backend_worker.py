@@ -46,5 +46,6 @@ def prepare_backend_worker(
         out_dir,
         explicit,
         include_dirs=WORKER_INCLUDE_DIRS,
+        memory_diagnostics=True,
         **worker_options,
     )

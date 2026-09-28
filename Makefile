@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-tools-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -9,6 +9,7 @@ BLORP_CLI_SOURCE := blorp/src/main.brp
 BLORP_CLI_BUILD_DIR := blorp/build/_build/blorp-cli
 BLORP_CLI_C := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c
 BLORP_CLI_BIN := $(BLORP_CLI_BUILD_DIR)/blorp
+BLORP_CLI_DIAGNOSTIC_BIN := $(BLORP_CLI_BUILD_DIR)/blorp-diagnostic
 BLORP_INSTALLED_BIN := bin/blorp
 BLORP_CLI_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/inputs.sha256
 BLORP_CLI_C_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/generated-c-inputs.sha256
@@ -16,6 +17,12 @@ BLORP_CLI_C_HASH := $(BLORP_CLI_BUILD_DIR)/blorp_cli_main.c.sha256
 BLORP_CLI_C_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/generated-c-build-inputs.sha256
 BLORP_CLI_C_OPTIMIZATION ?= -O0
 BLORP_CLI_RUNTIME_C_OPTIMIZATION ?= -O2
+BLORP_MEMORY_DIAGNOSTICS ?= 0
+ifneq ($(BLORP_MEMORY_DIAGNOSTICS),0)
+ifneq ($(BLORP_MEMORY_DIAGNOSTICS),1)
+$(error BLORP_MEMORY_DIAGNOSTICS must be 0 or 1)
+endif
+endif
 # Host C compiler. Clang and GCC are both supported and both exercised in CI;
 # Clang is the default. `BLORP_CC=gcc make` selects GCC. `blorp --version`'s
 # `cc:` line and the harness toolchain fingerprint record whatever this was
@@ -33,10 +40,11 @@ BLORP_CLI_SPLIT_DIR := $(BLORP_CLI_BUILD_DIR)/split-c
 # runtime config identity below and for the `cc:` line in `blorp --version`,
 # so the binary is the single source of truth for which C compiler built it.
 BLORP_CLI_CC_VERSION := $(shell $(BLORP_CC) --version 2>/dev/null | head -n 1)
-BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v $(BLORP_CC); printf '%s\n' '$(BLORP_CLI_CC_VERSION)'; } | shasum -a 256 | awk '{print $$1}')
+BLORP_CLI_RUNTIME_CONFIG_HASH := $(shell { printf '%s\n' '$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)' '-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1 -DBLORP_MEMORY_DIAGNOSTICS=$(BLORP_MEMORY_DIAGNOSTICS)'; shasum -a 256 blorp/src/lib/runtime/native/minicoro.h blorp/src/lib/runtime/native/runtime.c blorp/src/lib/runtime/native/runtime_decl.c; command -v $(BLORP_CC); printf '%s\n' '$(BLORP_CLI_CC_VERSION)'; } | shasum -a 256 | awk '{print $$1}')
 BLORP_CLI_BUILD_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/build-inputs.sha256
 BLORP_CLI_INSTALL_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/install-inputs.sha256
 BLORP_CLI_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp.sha256
+BLORP_CLI_DIAGNOSTIC_BIN_HASH := $(BLORP_CLI_BUILD_DIR)/blorp-diagnostic.sha256
 BLORP_CLI_EMBEDDED_INPUT_MANIFEST := $(BLORP_CLI_BUILD_DIR)/embedded-inputs.sha256
 BLORP_CLI_MANIFEST_TOOL := scripts/blorp-cli-embedded-manifest
 BLORP_CLI_RUNTIME_SOURCES_C := $(BLORP_CLI_BUILD_DIR)/runtime_sources.c
@@ -51,6 +59,7 @@ BLORP_CLI_BUILD_STAMP_SOURCE := blorp/src/lib/runtime/native/build_stamp.c
 BLORP_CLI_BUILD_STAMP_HEADER := blorp/src/lib/runtime/native/build_stamp.h
 BLORP_CLI_BUILD_STAMP_OBJECT := $(BLORP_CLI_BUILD_DIR)/build_stamp.o
 BLORP_CLI_LINK_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/link-inputs.sha256
+BLORP_CLI_DIAGNOSTIC_LINK_INPUT_HASH := $(BLORP_CLI_BUILD_DIR)/diagnostic-link-inputs.sha256
 BLORP_LSP_NATIVE_RUNTIME_C := blorp/src/lsp/server/native_runtime.c
 BLORP_EMBEDDED_STD_SOURCE := blorp/src/compiler/stage_01_generated_inputs/embedded_std.brp
 BLORP_BUILD_INFO_SOURCE := blorp/src/compiler/stage_01_generated_inputs/compiler_build_info.brp
@@ -190,7 +199,7 @@ $(BLORP_CLI_RUNTIME_OBJECT):
 	tmp="$@.tmp"; \
 	trap 'rm -f "$$tmp"' EXIT; \
 	$(BLORP_CC) "$(BLORP_CLI_RUNTIME_C_OPTIMIZATION)" -fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL \
-		-DBLORP_COMPILER_RUNTIME_SOURCES=1 \
+		-DBLORP_COMPILER_RUNTIME_SOURCES=1 -DBLORP_MEMORY_DIAGNOSTICS=$(BLORP_MEMORY_DIAGNOSTICS) \
 		-include blorp/src/lib/runtime/native/minicoro.h -c blorp/src/lib/runtime/native/runtime.c -o "$$tmp"; \
 	mv "$$tmp" "$@"; \
 	trap - EXIT
@@ -363,7 +372,8 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_
 	generated_c_hash=$$(shasum -a 256 "$(BLORP_CLI_C)" | awk '{print $$1}'); \
 	splitter_hash=$$(shasum -a 256 "$(BLORP_CLI_SPLITTER)" | awk '{print $$1}'); \
 	recipe_hash=$$(sed -n '/^# Compile prepared C inputs/,/^# Preserve the safe all-in-one build path/p' Makefile | shasum -a 256 | awk '{print $$1}'); \
-	new_hash=$$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$$source_hash" "$$generated_c_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" "$(BLORP_CLI_RUNTIME_CONFIG_HASH)" "$$splitter_hash" "$(BLORP_CLI_C_SPLIT)" | shasum -a 256 | awk '{print $$1}'); \
+	cc_path=$$(command -v $(BLORP_CC)); \
+	new_hash=$$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$$source_hash" "$$generated_c_hash" "$$recipe_hash" "$(BLORP_CLI_C_OPTIMIZATION)" "$$splitter_hash" "$(BLORP_CLI_C_SPLIT)" "$$cc_path" "$(BLORP_CLI_CC_VERSION)" | shasum -a 256 | awk '{print $$1}'); \
 	old_hash=$$(cat "$(BLORP_CLI_INPUT_HASH)" 2>/dev/null || true); \
 	split_dir="$(BLORP_CLI_SPLIT_DIR)/n$(BLORP_CLI_C_SPLIT)"; \
 	obj_dir="$$split_dir/obj"; \
@@ -433,7 +443,7 @@ compile-prepared-blorp-cli: $(BLORP_CLI_RUNTIME_OBJECT) $(BLORP_CLI_BUILD_STAMP_
 			commit="$$commit-dirty"; \
 		fi; \
 	fi; \
-	link_hash=$$(printf '%s\n%s\n' "$$new_hash" "$$commit" | shasum -a 256 | awk '{print $$1}'); \
+	link_hash=$$(printf '%s\n%s\n%s\n' "$$new_hash" "$(BLORP_CLI_RUNTIME_CONFIG_HASH)" "$$commit" | shasum -a 256 | awk '{print $$1}'); \
 	old_link_hash=$$(cat "$(BLORP_CLI_LINK_INPUT_HASH)" 2>/dev/null || true); \
 	recorded_bin_hash=$$(cat "$(BLORP_CLI_BIN_HASH)" 2>/dev/null || true); \
 	actual_bin_hash=$$(shasum -a 256 "$(BLORP_CLI_BIN)" 2>/dev/null | awk '{print $$1}'); \
@@ -465,6 +475,16 @@ compile-blorp-cli: prepare-blorp-cli-c prepare-blorp-cli-runtime
 	@$(MAKE) --no-print-directory compile-prepared-blorp-cli
 
 build-blorp-cli: compile-blorp-cli
+
+# Reuse the generated C and body objects, linking only a second runtime object
+# and binary. Separate link identities prevent a diagnostic build from
+# replacing or marking the ordinary CLI build as fresh.
+build-blorp-cli-diagnostic: prepare-blorp-cli-c
+	@$(MAKE) --no-print-directory BLORP_MEMORY_DIAGNOSTICS=1 \
+		BLORP_CLI_BIN="$(BLORP_CLI_DIAGNOSTIC_BIN)" \
+		BLORP_CLI_BIN_HASH="$(BLORP_CLI_DIAGNOSTIC_BIN_HASH)" \
+		BLORP_CLI_LINK_INPUT_HASH="$(BLORP_CLI_DIAGNOSTIC_LINK_INPUT_HASH)" \
+		compile-prepared-blorp-cli
 
 # Run the top-level local test gate
 test:
@@ -516,6 +536,7 @@ hygiene-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_cli_embedded_manifest.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_build_status.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_memory_diagnostics_harness.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_complexity_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_record_validation.py
 	@blorp/test/compiler/benchmark/test_record_layout.sh

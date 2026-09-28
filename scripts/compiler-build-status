@@ -39,6 +39,7 @@ GENERATED_C_INPUT_HASH = BUILD_DIR / "generated-c-inputs.sha256"
 GENERATED_C_HASH = BUILD_DIR / "blorp_cli_main.c.sha256"
 BUILD_INPUT_MANIFEST = BUILD_DIR / "build-inputs.sha256"
 BUILD_INPUT_HASH = BUILD_DIR / "inputs.sha256"
+LINK_INPUT_HASH = BUILD_DIR / "link-inputs.sha256"
 BUILD_BIN_HASH = BUILD_DIR / "blorp.sha256"
 INSTALL_INPUT_MANIFEST = BUILD_DIR / "install-inputs.sha256"
 INSTALLED_INPUT_MANIFEST = BUILD_DIR / "embedded-inputs.sha256"
@@ -470,7 +471,7 @@ def read_binary_version(binary: Path) -> dict[str, str]:
 		name, separator, value = line.partition(": ")
 		if separator:
 			fields[name] = value
-	if "optimization" not in fields or "split" not in fields:
+	if "optimization" not in fields or "split" not in fields or fields.get("memory_diagnostics") not in ("0", "1"):
 		raise StatusError(f"could not parse `--version` output from {binary}")
 	match = re.match(r"^cli=(\S+) runtime=(\S+)$", fields["optimization"])
 	if not match:
@@ -480,11 +481,11 @@ def read_binary_version(binary: Path) -> dict[str, str]:
 	return fields
 
 
-def runtime_config_hash(root: Path, runtime_optimization: str) -> str:
+def runtime_config_hash(root: Path, runtime_optimization: str, diagnostics: str) -> str:
 	cc_path, cc_version = cc_identity(root)
 	records = [
 		f"{runtime_optimization}\n",
-		"-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1\n",
+		f"-fwrapv -pipe -w -D_GNU_SOURCE -DMINICORO_IMPL -DBLORP_COMPILER_RUNTIME_SOURCES=1 -DBLORP_MEMORY_DIAGNOSTICS={diagnostics}\n",
 		f"{sha256_file(root / MINICORO_H)}  {MINICORO_H}\n",
 		f"{sha256_file(root / RUNTIME_C)}  {RUNTIME_C}\n",
 		f"{sha256_file(root / RUNTIME_DECL_C)}  {RUNTIME_DECL_C}\n",
@@ -600,6 +601,7 @@ def status(root: Path) -> StatusResult:
 		binary_version = read_binary_version(root / BUILD_BIN)
 		cli_optimization = binary_version["cli_optimization"]
 		runtime_optimization = binary_version["runtime_optimization"]
+		memory_diagnostics = binary_version["memory_diagnostics"]
 		split_n = binary_version["split"]
 		bootstrap_config = read_bootstrap_configuration(root)
 		compiled_by = binary_version.get("compiled_by", "")
@@ -610,7 +612,8 @@ def status(root: Path) -> StatusResult:
 				f"blorp/build/bootstrap.env pins {bootstrap_config['BLORP_BOOTSTRAP_TAG']}; "
 				f"bin/blorp reports compiled_by={compiled_by}",
 			)
-		runtime_hash = runtime_config_hash(root, runtime_optimization)
+		runtime_hash = runtime_config_hash(root, runtime_optimization, memory_diagnostics)
+		cc_path, cc_version = cc_identity(root)
 		splitter_hash = sha256_file(root / SPLITTER_SCRIPT)
 		binary_input_hash = hash_lines(
 			sha256_bytes(build_manifest),
@@ -621,9 +624,10 @@ def status(root: Path) -> StatusResult:
 				"# Preserve the safe all-in-one build path",
 			),
 			cli_optimization,
-			runtime_hash,
 			splitter_hash,
 			split_n,
+			cc_path,
+			cc_version,
 		)
 		if one_line_digest(root / BUILD_INPUT_HASH) != binary_input_hash:
 			return StatusResult(
@@ -631,6 +635,12 @@ def status(root: Path) -> StatusResult:
 				"native compiler build identity changed",
 				f"bin/blorp reports optimization: cli={cli_optimization} "
 				f"runtime={runtime_optimization}; split: {split_n}",
+			)
+		link_hash = hash_lines(binary_input_hash, runtime_hash, binary_version.get("commit", ""))
+		if one_line_digest(root / LINK_INPUT_HASH) != link_hash:
+			return StatusResult(
+				"STALE", "native compiler link identity changed",
+				f"bin/blorp reports memory_diagnostics: {memory_diagnostics}",
 			)
 		verify_hash_file(
 			root / BUILD_BIN_HASH,

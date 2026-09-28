@@ -96,6 +96,7 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
                 f"-Dmain={self.worker.WORKER_MAIN_SYMBOL}",
                 object_command,
             )
+            self.assertIn("-DBLORP_MEMORY_DIAGNOSTICS=1", object_command)
             self.assertIn(
                 f"-I{(root / MODULE_TABLE_INCLUDE_DIR).resolve()}",
                 object_command,
@@ -137,6 +138,7 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
             source_path=self.backend.WORKER_SOURCE,
             worker_name=self.backend.WORKER_NAME,
             main_symbol=self.backend.WORKER_MAIN_SYMBOL,
+            memory_diagnostics=True,
         )
 
     def test_backend_adapter_requests_debug_profile_worker_explicitly(self) -> None:
@@ -155,6 +157,7 @@ class CompilerTypecheckWorkerTests(unittest.TestCase):
 
         self.assertEqual(actual, expected)
         self.assertTrue(prepare.call_args.kwargs["debug_profile"])
+        self.assertTrue(prepare.call_args.kwargs["memory_diagnostics"])
         self.assertEqual(
             prepare.call_args.kwargs["env_name"],
             self.backend.BACKEND_COUNTER_WORKER_ENV,

@@ -12,7 +12,7 @@
 -- The first four fields count managed (blorp_alloc-backed) object
 -- requests, as before. The remaining fields are the allocation oracle's
 -- counters (allocation-contract roadmap milestone 6): every OTHER
--- heap/OS allocation path the runtime has (pool slab refills, raw
+-- heap/OS allocation path the runtime has (managed-object malloc, raw
 -- malloc/calloc/realloc/aligned buffers, generated cleanup scratch growth,
 -- fiber stack mmaps), populated only while `BLORP_ALLOCATOR_STATS`-style
 -- tracking is active. `oracle_stats_active` is 0 when that gate was off at
@@ -23,23 +23,25 @@ struct MemStats {
 	total_releases: Int,
 	current_objects: Int,
 	bytes_allocated: Int,
-	backing_pool_refill_events: Int,
 	backing_libc_malloc_events: Int,
-	backing_pool_overflow_events: Int,
 	raw_buffer_malloc_events: Int,
 	raw_buffer_calloc_events: Int,
 	raw_buffer_realloc_events: Int,
 	raw_buffer_aligned_events: Int,
 	cleanup_scratch_events: Int,
 	fiber_mmap_events: Int,
-	oracle_stats_active: Int
+	oracle_stats_active: Int,
+	-- Managed counters are valid only when this is 1. This is independent
+	-- of whether the allocation oracle was activated for this snapshot.
+	memory_stats_active: Int
 }
 
 
 -- Get current memory statistics.
--- The returned MemStats value requires no allocation, so a reset
--- followed by get_mem_stats() reports zero live objects unless user code
--- has allocated something.
+-- The returned MemStats value requires no allocation. In a diagnostic
+-- runtime, a reset followed by get_mem_stats() reports zero live objects
+-- unless user code has allocated something. Check memory_stats_active before
+-- interpreting any managed count.
 pure func get_mem_stats() -> MemStats:
 	builtin("blorp_get_mem_stats")
 
@@ -119,24 +121,30 @@ pure func format_bytes(bytes: Int) -> String:
 
 -- Format memory stats as a readable string
 pure func format_stats(stats: MemStats) -> String:
-	"allocations: " + to_string(
-		stats.total_allocations,
-	) + ", releases: " + to_string(
-		stats.total_releases,
-	) + ", current: " + to_string(
-		stats.current_objects,
-	) + ", bytes: " + format_bytes(stats.bytes_allocated)
+	if stats.memory_stats_active == 0:
+		"memory stats unavailable: rebuild with BLORP_MEMORY_DIAGNOSTICS=1"
+	else:
+		"allocations: " + to_string(
+			stats.total_allocations,
+		) + ", releases: " + to_string(
+			stats.total_releases,
+		) + ", current: " + to_string(
+			stats.current_objects,
+		) + ", bytes: " + format_bytes(stats.bytes_allocated)
 
 
 -- Print current memory statistics
 func print_mem_stats() -> Void:
 	stats: MemStats = get_mem_stats()
-	print("=== Memory Stats ===")
-	print("  Total allocations: " + stats.total_allocations.to_string())
-	print("  Total releases:    " + stats.total_releases.to_string())
-	print("  Current objects:   " + stats.current_objects.to_string())
-	print("  Bytes allocated:   " + format_bytes(stats.bytes_allocated))
-	print("====================")
+	if stats.memory_stats_active == 0:
+		print("Memory stats unavailable; rebuild with BLORP_MEMORY_DIAGNOSTICS=1")
+	else:
+		print("=== Memory Stats ===")
+		print("  Total allocations: " + stats.total_allocations.to_string())
+		print("  Total releases:    " + stats.total_releases.to_string())
+		print("  Current objects:   " + stats.current_objects.to_string())
+		print("  Bytes allocated:   " + format_bytes(stats.bytes_allocated))
+		print("====================")
 
 
 -- Measure memory usage of a function
@@ -152,8 +160,14 @@ pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
 	-- Both endpoints must have been taken with the oracle gate active for a
 	-- delta to mean anything; see assert_no_heap_activity.
 	both_active: Bool = before.oracle_stats_active > 0 and after.oracle_stats_active > 0
+	both_memory_active: Bool = before.memory_stats_active > 0 and after.memory_stats_active > 0
 
 	active_flag: Int = match both_active:
+		True:
+			1
+		False:
+			0
+	memory_active_flag: Int = match both_memory_active:
 		True:
 			1
 		False:
@@ -164,29 +178,23 @@ pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
 		total_releases = after.total_releases - before.total_releases,
 		current_objects = after.current_objects - before.current_objects,
 		bytes_allocated = after.bytes_allocated - before.bytes_allocated,
-		backing_pool_refill_events = after.backing_pool_refill_events - before.backing_pool_refill_events,
 		backing_libc_malloc_events = after.backing_libc_malloc_events - before.backing_libc_malloc_events,
-		backing_pool_overflow_events = after.backing_pool_overflow_events - before.backing_pool_overflow_events,
 		raw_buffer_malloc_events = after.raw_buffer_malloc_events - before.raw_buffer_malloc_events,
 		raw_buffer_calloc_events = after.raw_buffer_calloc_events - before.raw_buffer_calloc_events,
 		raw_buffer_realloc_events = after.raw_buffer_realloc_events - before.raw_buffer_realloc_events,
 		raw_buffer_aligned_events = after.raw_buffer_aligned_events - before.raw_buffer_aligned_events,
 		cleanup_scratch_events = after.cleanup_scratch_events - before.cleanup_scratch_events,
 		fiber_mmap_events = after.fiber_mmap_events - before.fiber_mmap_events,
-		oracle_stats_active = active_flag
+		oracle_stats_active = active_flag,
+		memory_stats_active = memory_active_flag
 	}
-
-
--- Check for memory leaks: returns true if objects are still live
-pure func has_leaks(stats: MemStats) -> Bool:
-	stats.current_objects > 0
 
 
 -- Allocation oracle assertion (allocation-contract roadmap milestone 6).
 --
 -- Given a `before`/`after` MemStats pair bracketing a piece of test code,
 -- confirm that NO heap activity happened on any counted path: managed
--- object requests, pool slab refills, raw buffer malloc/calloc/realloc,
+-- object requests, backing libc malloc, raw buffer malloc/calloc/realloc,
 -- SIMD-aligned buffers, generated cleanup scratch growth, and fiber stack
 -- mmaps. On success returns `Ok(void)`. On failure, names the first
 -- counter that moved (or explains that the oracle gate was not active) so
@@ -198,7 +206,9 @@ pure func has_leaks(stats: MemStats) -> Bool:
 -- that needs either must snapshot around each fiber's own single-threaded
 -- region instead of sharing one before/after pair.
 pure func assert_no_heap_activity(before: MemStats, after: MemStats) -> Result[Void, String]:
-	if before.oracle_stats_active == 0 or after.oracle_stats_active == 0:
+	if before.memory_stats_active == 0 or after.memory_stats_active == 0:
+		Err("memory stats unavailable: rebuild with BLORP_MEMORY_DIAGNOSTICS=1")
+	else if before.oracle_stats_active == 0 or after.oracle_stats_active == 0:
 		Err((
 				"allocation oracle inactive: run with BLORP_ALLOCATOR_STATS=1 (a disabled gate "
 				+ "must fail, not read as zero)"
@@ -212,67 +222,59 @@ pure func assert_no_heap_activity(before: MemStats, after: MemStats) -> Result[V
 			if delta.total_releases != 0:
 				Err("managed release requests moved by " + delta.total_releases.to_string())
 			else:
-				if delta.backing_pool_refill_events != 0:
+				if delta.backing_libc_malloc_events != 0:
 					Err(
-						"pool slab refill events moved by " + delta.backing_pool_refill_events.to_string(),
+						"backing libc malloc events moved by " + delta.backing_libc_malloc_events.to_string(),
 					)
 				else:
-					if delta.backing_libc_malloc_events != 0:
+					if delta.raw_buffer_malloc_events != 0:
 						Err(
-							"backing libc malloc events moved by " + delta.backing_libc_malloc_events.to_string(),
+							"raw buffer malloc events moved by " + delta.raw_buffer_malloc_events.to_string(),
 						)
 					else:
-						if delta.backing_pool_overflow_events != 0:
+						if delta.raw_buffer_calloc_events != 0:
 							Err(
-								"pool overflow events moved by " + delta.backing_pool_overflow_events.to_string(),
+								"raw buffer calloc events moved by " + delta.raw_buffer_calloc_events.to_string(),
 							)
 						else:
-							if delta.raw_buffer_malloc_events != 0:
+							if delta.raw_buffer_realloc_events != 0:
 								Err(
-									"raw buffer malloc events moved by " + delta.raw_buffer_malloc_events.to_string(),
+									"raw buffer realloc events moved by " + delta.raw_buffer_realloc_events.to_string(),
 								)
 							else:
-								if delta.raw_buffer_calloc_events != 0:
+								if delta.raw_buffer_aligned_events != 0:
 									Err(
-										"raw buffer calloc events moved by " + delta.raw_buffer_calloc_events.to_string(),
+										"raw aligned-buffer events moved by " + delta.raw_buffer_aligned_events.to_string(),
 									)
 								else:
-									if delta.raw_buffer_realloc_events != 0:
+									if delta.cleanup_scratch_events != 0:
 										Err(
-											"raw buffer realloc events moved by " + delta.raw_buffer_realloc_events.to_string(),
+											"cleanup scratch events moved by " + delta.cleanup_scratch_events.to_string(),
 										)
 									else:
-										if delta.raw_buffer_aligned_events != 0:
+										if delta.fiber_mmap_events != 0:
 											Err(
-												"raw aligned-buffer events moved by " + delta.raw_buffer_aligned_events.to_string(),
+												"fiber stack mmap events moved by " + delta.fiber_mmap_events.to_string(),
 											)
 										else:
-											if delta.cleanup_scratch_events != 0:
-												Err(
-													"cleanup scratch events moved by " + delta.cleanup_scratch_events.to_string(),
-												)
-											else:
-												if delta.fiber_mmap_events != 0:
-													Err(
-														"fiber stack mmap events moved by " + delta.fiber_mmap_events.to_string(),
-													)
-												else:
-													Ok(void)
+											Ok(void)
 
 
 -- Print memory report comparing before/after stats
 func print_mem_report(label: String, before: MemStats, after: MemStats) -> Void:
 	delta: MemStats = mem_delta(before, after)
-	print("=== Memory Report: " + label + " ===")
-	print("  New allocations: " + delta.total_allocations.to_string())
-	print("  New releases:    " + delta.total_releases.to_string())
-	print("  Net objects:     " + delta.current_objects.to_string())
-	print("  Net bytes:       " + format_bytes(delta.bytes_allocated))
+	if delta.memory_stats_active == 0:
+		print("Memory report unavailable: rebuild with BLORP_MEMORY_DIAGNOSTICS=1")
+	else:
+		print("=== Memory Report: " + label + " ===")
+		print("  New allocations: " + delta.total_allocations.to_string())
+		print("  New releases:    " + delta.total_releases.to_string())
+		print("  Net objects:     " + delta.current_objects.to_string())
+		print("  Net bytes:       " + format_bytes(delta.bytes_allocated))
 
-	match has_leaks(delta):
-		True:
+		if delta.current_objects > 0:
 			print("  WARNING: Potential memory leak detected!")
-		False:
+		else:
 			print("  OK: All allocations released")
 
-	print("================================")
+		print("================================")

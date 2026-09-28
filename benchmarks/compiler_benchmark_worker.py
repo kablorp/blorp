@@ -153,6 +153,7 @@ def prepare_benchmark_worker(
     debug_profile: bool = False,
     profile_functions: tuple[str, ...] = (),
     profile_mode: Literal["exact", "calls"] = "exact",
+    memory_diagnostics: bool = False,
 ) -> Path:
     """Resolve an override or build one disposable benchmark worker."""
     selected = _explicit_worker(env_name, explicit)
@@ -201,6 +202,7 @@ def prepare_benchmark_worker(
         [
             *cc,
             *COMMON_CC_FLAGS,
+            f"-DBLORP_MEMORY_DIAGNOSTICS={int(memory_diagnostics)}",
             *include_arguments,
             f"-Dmain={main_symbol}",
             "-c",

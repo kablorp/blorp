@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Standard self-compile measurement for compiler performance work.
 
-Measures one compiler executable compiling a frozen input snapshot to C and
-reports, per compiler phase, allocation counts (deterministic) and, per run,
-retired instructions, wall time, and peak RSS. Every worker and every
-baseline/candidate comparison uses this script so numbers are comparable.
+Measures paired normal and diagnostic compiler executables compiling a frozen
+input snapshot to C. The diagnostic binary supplies deterministic per-phase
+allocation counts; the normal binary supplies retired instructions, wall time,
+and peak RSS. Generated C must match between them.
 
 Subcommands:
 
@@ -18,7 +18,7 @@ Toolchain fingerprint: every measurement records `cc_version` (first line of
 `compiled_by` / `optimization` / `commit` fields parsed out of it (each
 "unknown" when the binary's --version output does not carry that key --
 older binaries print only "commit: unknown" / "target: unknown"; a warning
-is printed in that case, not a failure). `compare()` treats a difference in
+is printed in that case, and paired measurements fail). `compare()` treats a difference in
 `cc_version`, `compiled_by`, or `optimization` as a hard mismatch (exit
 nonzero unless --allow-toolchain-mismatch); a `commit` difference is
 expected (that is what is usually being measured) and is informational
@@ -65,7 +65,8 @@ REAL_RE = re.compile(r"^\s*([0-9.]+)\s+real\s+([0-9.]+)\s+user\s+([0-9.]+)\s+sys
 SMALL_PROGRAM = SCRIPT_DIR / "self_compile" / "small.brp"
 STAGE2_BUILD_SCRIPT = SCRIPT_DIR / "build_stage2_compiler"
 STAGE2_DEFAULT_BIN = REPO_ROOT / "bin" / "blorp-stage2"
-SCHEMA_VERSION = 1
+STAGE2_DIAGNOSTIC_BIN = REPO_ROOT / "bin" / "blorp-stage2-diagnostic"
+SCHEMA_VERSION = 2
 
 
 class MeasureError(Exception):
@@ -113,10 +114,11 @@ def parse_compiler_version(compiler: Path) -> dict:
         compiled_by: dev-<sha>        (bootstrap-built)  or  self-<sha>  (stage-2)
         optimization: cli=-O2 runtime=-O2
         split: 8
+        cc: clang
+        memory_diagnostics: 0 (or 1 for the diagnostic runtime)
 
-    Parsing is lenient: any missing key becomes "unknown" so this never
-    fails on an older binary that only prints "commit: unknown" /
-    "target: unknown".
+    Parsing is lenient for older binary inspection; measurement requires
+    complete, matching provenance and the correct linked runtime modes.
     """
     try:
         result = subprocess.run(
@@ -125,7 +127,11 @@ def parse_compiler_version(compiler: Path) -> dict:
         lines = result.stdout.splitlines()
     except OSError:
         lines = []
-    fields = {"commit": "unknown", "compiled_by": "unknown", "optimization": "unknown"}
+    fields = {
+        "commit": "unknown", "compiled_by": "unknown", "optimization": "unknown",
+        "target": "unknown", "split": "unknown", "cc": "unknown",
+        "memory_diagnostics": "unknown",
+    }
     for line in lines:
         for key in fields:
             prefix = f"{key}: "
@@ -144,6 +150,10 @@ def toolchain_fingerprint(compiler: Path) -> dict:
         "compiled_by": parsed["fields"]["compiled_by"],
         "optimization": parsed["fields"]["optimization"],
         "commit": parsed["fields"]["commit"],
+        "target": parsed["fields"]["target"],
+        "split": parsed["fields"]["split"],
+        "cc": parsed["fields"]["cc"],
+        "memory_diagnostics": parsed["fields"]["memory_diagnostics"],
     }
     if cc_version == "unknown" or not parsed["complete"]:
         print(
@@ -317,26 +327,47 @@ def run_compile(
         if real:
             parsed["wall_seconds"] = float(real.group(1))
             parsed["user_seconds"] = float(real.group(2))
+    if with_time:
+        missing = [field for field in ("instructions_retired", "peak_rss_bytes", "wall_seconds")
+                   if field not in parsed]
+        if missing:
+            raise MeasureError(f"timed compile lacks {', '.join(missing)} evidence")
     return sha256_file(output_c), parsed
 
 
 def checkpoint_deltas(checkpoints: list[dict]) -> list[dict]:
+    if not checkpoints:
+        raise MeasureError(
+            "diagnostic compiler emitted no allocation checkpoints; rebuild it "
+            "with BLORP_MEMORY_DIAGNOSTICS=1"
+        )
     rows = []
     previous_total = 0
     previous_bytes = 0
     for fields in checkpoints:
-        name = fields.get("phase", "?")
-        total = int(fields.get("total_allocations", 0))
-        allocator_bytes = int(fields.get("allocator_bytes", 0))
+        required = ("phase", "total_allocations", "current_objects", "allocator_bytes", "rss_bytes")
+        missing = [name for name in required if name not in fields]
+        if missing:
+            raise MeasureError(f"incomplete allocation checkpoint, missing {', '.join(missing)}")
+        name = fields["phase"]
+        try:
+            total = int(fields["total_allocations"])
+            allocator_bytes = int(fields["allocator_bytes"])
+            current_objects = int(fields["current_objects"])
+            rss_bytes = int(fields["rss_bytes"])
+        except ValueError as error:
+            raise MeasureError(f"invalid numeric allocation checkpoint: {fields}") from error
+        if total < previous_total:
+            raise MeasureError(f"allocation counter went backwards at {name}")
         rows.append(
             {
                 "name": name,
                 "total_allocations": total,
                 "delta_allocations": total - previous_total,
-                "current_objects": int(fields.get("current_objects", 0)),
+                "current_objects": current_objects,
                 "allocator_bytes": allocator_bytes,
                 "delta_allocator_bytes": allocator_bytes - previous_bytes,
-                "rss_bytes": int(fields.get("rss_bytes", 0)),
+                "rss_bytes": rss_bytes,
             }
         )
         previous_total = total
@@ -344,7 +375,7 @@ def checkpoint_deltas(checkpoints: list[dict]) -> list[dict]:
     return rows
 
 
-def build_stage2_compiler() -> tuple[Path, str]:
+def build_stage2_compiler() -> tuple[Path, Path, str]:
     """Build bin/blorp-stage2 via benchmarks/build_stage2_compiler and return
     its path along with the sha256 of the bin/blorp that built it (the
     stage-2 rule: bin/blorp-stage2 is blorp/src/main.brp compiled by
@@ -354,25 +385,59 @@ def build_stage2_compiler() -> tuple[Path, str]:
         raise MeasureError("bin/blorp is missing; run `make` first (needed to build the stage-2 compiler)")
     stage1_sha256 = sha256_file(stage1)
     result = subprocess.run(
-        [str(STAGE2_BUILD_SCRIPT), str(STAGE2_DEFAULT_BIN)],
+        [str(STAGE2_BUILD_SCRIPT), "--diagnostic-output", str(STAGE2_DIAGNOSTIC_BIN),
+         str(STAGE2_DEFAULT_BIN)],
         cwd=REPO_ROOT, capture_output=True, text=True,
     )
     if result.returncode != 0:
         raise MeasureError(
             f"benchmarks/build_stage2_compiler failed:\n{result.stdout}{result.stderr}"
         )
-    return STAGE2_DEFAULT_BIN, stage1_sha256
+    return STAGE2_DEFAULT_BIN, STAGE2_DIAGNOSTIC_BIN, stage1_sha256
+
+
+def validate_compiler_pair(normal: dict, diagnostic: dict) -> None:
+    for name, fingerprint, expected in (
+        ("normal", normal, "0"),
+        ("diagnostic", diagnostic, "1"),
+    ):
+        if fingerprint["memory_diagnostics"] != expected:
+            raise MeasureError(
+                f"{name} compiler reports memory_diagnostics: "
+                f"{fingerprint['memory_diagnostics']}; expected {expected} from the linked runtime"
+            )
+    for field in ("commit", "compiled_by", "optimization", "target", "split", "cc"):
+        if normal[field] == "unknown" or diagnostic[field] == "unknown":
+            raise MeasureError(f"normal/diagnostic compiler {field} provenance is missing")
+        if normal[field] != diagnostic[field]:
+            raise MeasureError(
+                f"normal and diagnostic compiler {field} differs: "
+                f"{normal[field]!r} vs {diagnostic[field]!r}"
+            )
 
 
 def measure(args: argparse.Namespace) -> dict:
+    if args.samples < 1:
+        raise MeasureError("--samples must be at least 1 to verify generated C identity")
     stage2_built_by_sha256 = None
     if args.stage2:
-        stage2_bin, stage2_built_by_sha256 = build_stage2_compiler()
+        stage2_bin, diagnostic_bin, stage2_built_by_sha256 = build_stage2_compiler()
         args.compiler = str(stage2_bin)
+        args.diagnostic_compiler = str(diagnostic_bin)
         args.skip_build_check = True
     compiler = Path(args.compiler).resolve()
     if not compiler.exists():
         raise MeasureError(f"compiler not found: {compiler}")
+    if not args.diagnostic_compiler:
+        raise MeasureError(
+            "--diagnostic-compiler is required with --compiler; build the same "
+            "compiler with BLORP_MEMORY_DIAGNOSTICS=1, or use --stage2"
+        )
+    diagnostic_compiler = Path(args.diagnostic_compiler).resolve()
+    if not diagnostic_compiler.is_file():
+        raise MeasureError(f"diagnostic compiler not found: {diagnostic_compiler}")
+    if diagnostic_compiler == compiler:
+        raise MeasureError("normal and diagnostic compilers must be separate binaries")
     freshness = "skipped" if args.skip_build_check else check_build_fresh(compiler)
     if args.input_dir:
         input_dir = Path(args.input_dir).resolve()
@@ -391,6 +456,8 @@ def measure(args: argparse.Namespace) -> dict:
     compiler_rev = git(["rev-parse", "HEAD"], root) if root else "unknown"
     compiler_dirty = bool(git(["status", "--porcelain", "--untracked-files=no"], root)) if root else None
     toolchain = toolchain_fingerprint(compiler)
+    diagnostic_toolchain = toolchain_fingerprint(diagnostic_compiler)
+    validate_compiler_pair(toolchain, diagnostic_toolchain)
     warn_if_stage2_needed(root, toolchain)
 
     record: dict = {
@@ -401,10 +468,13 @@ def measure(args: argparse.Namespace) -> dict:
         "machine": platform.machine(),
         "compiler_path": str(compiler),
         "compiler_sha256": sha256_file(compiler),
+        "diagnostic_compiler_path": str(diagnostic_compiler),
+        "diagnostic_compiler_sha256": sha256_file(diagnostic_compiler),
         "compiler_rev": compiler_rev,
         "compiler_dirty": compiler_dirty,
         "compiler_build_status": freshness,
         "toolchain": toolchain,
+        "diagnostic_toolchain": diagnostic_toolchain,
         "compiler_stage": 2 if args.stage2 else 1,
         "stage2_built_by_bin_blorp_sha256": stage2_built_by_sha256,
         "c_optimization": os.environ.get("BLORP_CLI_C_OPTIMIZATION", "-O0 (default)"),
@@ -418,15 +488,16 @@ def measure(args: argparse.Namespace) -> dict:
         tmp_dir = Path(tmp)
         alloc_c = tmp_dir / "alloc.c"
         output_sha, alloc_run = run_compile(
-            compiler, input_dir, program, alloc_c,
-            {"BLORP_COMPILER_MEMORY_PROFILE": "1"}, with_time=False,
+            diagnostic_compiler, input_dir, program, alloc_c,
+            {"BLORP_MEMORY_DIAGNOSTICS": "1", "BLORP_COMPILER_MEMORY_PROFILE": "1"},
+            with_time=False,
         )
         record["output_sha256"] = output_sha
         record["output_bytes"] = alloc_c.stat().st_size
         record["checkpoints"] = checkpoint_deltas(alloc_run["checkpoints"])
-        record["total_allocations"] = (
-            record["checkpoints"][-1]["total_allocations"] if record["checkpoints"] else None
-        )
+        record["total_allocations"] = record["checkpoints"][-1]["total_allocations"]
+        if record["total_allocations"] <= 0:
+            raise MeasureError("diagnostic compiler reported no allocations")
         if args.keep_output:
             shutil.copyfile(alloc_c, Path(args.keep_output))
 
@@ -437,14 +508,15 @@ def measure(args: argparse.Namespace) -> dict:
         for index in range(args.samples):
             sample_c = tmp_dir / f"sample{index}.c"
             sample_sha, run = run_compile(
-                compiler, input_dir, program, sample_c, {}, with_time=True
+                compiler, input_dir, program, sample_c,
+                {"BLORP_MEMORY_DIAGNOSTICS": "0"}, with_time=True
             )
             if sample_sha != output_sha:
-                raise MeasureError("generated C differed between runs of the same compiler")
+                raise MeasureError("generated C differs between normal and diagnostic compilers")
             sample_c.unlink()
-            instructions.append(run.get("instructions_retired", 0))
-            walls.append(run.get("wall_seconds", 0.0))
-            rss.append(run.get("peak_rss_bytes", 0))
+            instructions.append(run["instructions_retired"])
+            walls.append(run["wall_seconds"])
+            rss.append(run["peak_rss_bytes"])
             for name, ms in run["phases_ms"].items():
                 phase_samples.setdefault(name, []).append(ms)
 
@@ -522,9 +594,36 @@ def compare_toolchain(baseline: dict, candidate: dict) -> tuple[list[str], list[
     return lines, hard
 
 
+def validate_record_evidence(record: dict, label: str) -> None:
+    if not isinstance(record, dict) or record.get("schema") not in (1, 2):
+        raise MeasureError(f"{label} has unsupported measurement schema")
+    instructions = record.get("instructions_retired")
+    values = {
+        "total_allocations": record.get("total_allocations"),
+        "instructions_retired.min": instructions.get("min") if isinstance(instructions, dict) else None,
+        "peak_rss_bytes": record.get("peak_rss_bytes"),
+        "output_bytes": record.get("output_bytes"),
+    }
+    for field, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise MeasureError(f"{label} lacks positive numeric {field} evidence")
+
+
 def compare(baseline: dict, candidate: dict, show_wall: bool = False) -> dict:
     identical = baseline.get("output_sha256") == candidate.get("output_sha256")
     toolchain_lines, hard_mismatch_fields = compare_toolchain(baseline, candidate)
+    base_schema = baseline.get("schema")
+    candidate_schema = candidate.get("schema")
+    if base_schema == 1 and candidate_schema == 2:
+        toolchain_lines.insert(
+            0, "measurement mode differs: schema-1 baseline used a diagnostics-capable "
+               "binary with runtime profiling off; schema-2 candidate uses separate "
+               "normal/diagnostic binaries. Interpret the instruction delta as the "
+               "accounting-mode experiment."
+        )
+    elif base_schema not in (1, 2) or candidate_schema != 2:
+        toolchain_lines.insert(0, f"measurement schema unsupported: {base_schema} vs {candidate_schema}")
+        hard_mismatch_fields.append("schema")
     print()
     print(f"baseline : {baseline.get('label')} @ {baseline.get('compiler_rev', '?')[:12]}")
     print(f"candidate: {candidate.get('label')} @ {candidate.get('compiler_rev', '?')[:12]}")
@@ -564,20 +663,29 @@ def compare(baseline: dict, candidate: dict, show_wall: bool = False) -> dict:
         b = baseline.get("wall_seconds", {}).get("min"); c = candidate.get("wall_seconds", {}).get("min")
         print(f"{'wall seconds (min)':<44} {fmt(b):>16} {fmt(c):>16} {pct(b, c):>9}")
     print()
-    return {"identical": identical, "hard_mismatch_fields": hard_mismatch_fields}
+    return {
+        "identical": identical,
+        "hard_mismatch_fields": hard_mismatch_fields,
+        "schema_mismatch": "schema" in hard_mismatch_fields,
+    }
 
 
 def cmd_measure(args: argparse.Namespace) -> int:
     record = measure(args)
+    validate_record_evidence(record, "candidate")
     if args.output:
         Path(args.output).write_text(json.dumps(record, indent=2) + "\n")
         print(f"wrote {args.output}")
     if args.baseline:
         baseline = json.loads(Path(args.baseline).read_text())
+        validate_record_evidence(baseline, "baseline")
         result = compare(baseline, record, show_wall=args.show_wall)
         if args.require_identical and not result["identical"]:
             print("generated C differs from baseline", file=sys.stderr)
             return 3
+        if result["schema_mismatch"]:
+            print("self_compile_measure: unsupported measurement schema", file=sys.stderr)
+            return 4
         if result["hard_mismatch_fields"] and not args.allow_toolchain_mismatch:
             print(
                 "self_compile_measure: toolchain mismatch in "
@@ -611,6 +719,7 @@ def main(argv: list[str]) -> int:
     measure_parser = sub.add_parser("measure", help="measure a compiler (default)")
     for p in (parser, measure_parser):
         p.add_argument("--compiler", default=str(REPO_ROOT / "bin" / "blorp"))
+        p.add_argument("--diagnostic-compiler", help="matching compiler linked with memory diagnostics enabled")
         p.add_argument("--input-rev", default="HEAD", help="revision to freeze as the input snapshot")
         p.add_argument("--input-dir", help="use an existing frozen input directory")
         p.add_argument("--program", choices=["self", "small"], default="self")
@@ -635,9 +744,8 @@ def main(argv: list[str]) -> int:
         )
         p.add_argument(
             "--stage2", action="store_true",
-            help="build bin/blorp-stage2 via benchmarks/build_stage2_compiler and measure it "
-                 "(equivalent to --compiler bin/blorp-stage2 --skip-build-check); "
-                 "overrides --compiler and --skip-build-check",
+            help="build paired normal/diagnostic stage-2 compilers and measure them; "
+                 "overrides --compiler, --diagnostic-compiler, and --skip-build-check",
         )
 
     freeze_parser = sub.add_parser("freeze", help="materialize the frozen input for a revision")

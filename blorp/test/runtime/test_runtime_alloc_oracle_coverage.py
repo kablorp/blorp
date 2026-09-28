@@ -5,7 +5,7 @@ roadmap milestone 6).
 A newly introduced raw allocation call in runtime.c must either be routed
 through one of the oracle's counted wrappers (BLORP_ORACLE_MALLOC/CALLOC/
 REALLOC, blorp_malloc_checked/blorp_realloc_checked/blorp_calloc_checked,
-blorp_pool_refill, blorp_simd_alloc, or the blorp_alloc/mmap call sites the
+blorp_simd_alloc, or the blorp_alloc/mmap call sites the
 oracle counts directly) or be given an explicit "Not an allocation the
 oracle observes, because ..." comment immediately above it. This test greps
 every malloc/calloc/realloc/posix_memalign/aligned_alloc/mmap call site and

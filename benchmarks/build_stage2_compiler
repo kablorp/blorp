@@ -12,10 +12,13 @@ This script never touches the Makefile's own hash files or `bin/blorp`; it
 reads the Makefile's `generate-blorp-cli-c` and "Compiling Blorp CLI" recipes
 through `make -n` so the exact compile and link commands (the `-I` list
 included) stay in sync with the Makefile without being copied by hand.
+With --diagnostic-output it generates and compiles the compiler body once,
+then links it against the two mode-specific native runtime objects.
 
 Usage:
 
     benchmarks/build_stage2_compiler <output-binary>
+    benchmarks/build_stage2_compiler --diagnostic-output <diagnostic-binary> <output-binary>
 """
 
 from __future__ import annotations
@@ -105,9 +108,10 @@ def make_var(name: str) -> str:
     return match.group(1).strip()
 
 
-def make_recipe(target: str) -> str:
+def make_recipe(target: str, diagnostics: int = 0) -> str:
     result = subprocess.run(
-        ["make", "-n", "BLORP_CLI_C_SPLIT=1", f"BLORP_CC={BLORP_CC}", target],
+        ["make", "-n", "BLORP_CLI_C_SPLIT=1", f"BLORP_CC={BLORP_CC}",
+         f"BLORP_MEMORY_DIAGNOSTICS={diagnostics}", target],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -200,6 +204,14 @@ def extract_link_command(recipe_text: str, input_obj: Path, output_bin: Path) ->
     ]
 
 
+def runtime_object_from_recipe(recipe_text: str) -> Path:
+    tail = recipe_text[recipe_text.index(LINK_MARKER) + len(LINK_MARKER):]
+    match = LINK_RE.search(tail)
+    if not match:
+        raise BuildError("could not identify runtime object in stage-2 link recipe")
+    return REPO_ROOT / match.group("runtime_obj")
+
+
 def check_bin_blorp_fresh() -> None:
     if not INSTALLED_BIN.is_file():
         raise BuildError(f"{INSTALLED_BIN} does not exist; run `make` first")
@@ -225,9 +237,36 @@ def run(cmd: list[str], what: str) -> None:
         )
 
 
-def build(output: Path) -> int:
+def prepare_runtime(diagnostics: int) -> None:
+    result = subprocess.run(
+        ["make", f"BLORP_CC={BLORP_CC}",
+         f"BLORP_MEMORY_DIAGNOSTICS={diagnostics}", "prepare-blorp-cli-runtime"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise BuildError(
+            f"make prepare-blorp-cli-runtime (diagnostics={diagnostics}) failed "
+            f"(exit {result.returncode}):\n{result.stderr[-4000:]}"
+        )
+
+
+def verify_binary_mode(binary: Path, expected: int) -> None:
+    result = subprocess.run([str(binary), "--version"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise BuildError(f"{binary} --version failed (exit {result.returncode})")
+    found = re.search(r"^memory_diagnostics: ([01])$", result.stdout, re.MULTILINE)
+    if not found or int(found.group(1)) != expected:
+        raise BuildError(
+            f"{binary} did not report memory_diagnostics: {expected} from its linked runtime"
+        )
+
+
+def build(output: Path, diagnostic_output: Path | None = None) -> int:
     if output.resolve() == INSTALLED_BIN.resolve():
         raise BuildError("refusing to overwrite bin/blorp; choose a different output path")
+    if diagnostic_output is not None:
+        if diagnostic_output.resolve() in (output.resolve(), INSTALLED_BIN.resolve()):
+            raise BuildError("diagnostic output must differ from normal output and bin/blorp")
 
     check_bin_blorp_fresh()
 
@@ -268,28 +307,52 @@ def build(output: Path) -> int:
             f"{stamp_result.stderr[-4000:]}"
         )
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    tmp_bin = output.with_name(output.name + ".tmp")
-    link_cmd = extract_link_command(compile_prepared_recipe, stage2_obj, tmp_bin)
-    run(link_cmd, "cc (stage-2 link)")
-    tmp_bin.chmod(0o755)
-    tmp_bin.replace(output)
-
+    runtime_objects: dict[int, Path] = {}
+    for diagnostics, destination in (
+        [(0, output), (1, diagnostic_output)] if diagnostic_output is not None
+        else [(0, output)]
+    ):
+        # The compiler body object above is shared. Only the native runtime
+        # object changes mode; each link uses the corresponding Make recipe.
+        prepare_runtime(diagnostics)
+        recipe = make_recipe("compile-prepared-blorp-cli", diagnostics)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp_bin = destination.with_name(destination.name + ".tmp")
+        link_cmd = extract_link_command(recipe, stage2_obj, tmp_bin)
+        runtime_objects[diagnostics] = runtime_object_from_recipe(recipe)
+        if diagnostics == 1 and runtime_objects[0] == runtime_objects[1]:
+            raise BuildError("diagnostic and normal links use the same runtime object")
+        run(link_cmd, f"cc (stage-2 link, diagnostics={diagnostics})")
+        verify_binary_mode(tmp_bin, diagnostics)
+        tmp_bin.chmod(0o755)
+        tmp_bin.replace(destination)
     size = stage2_c.stat().st_size
     digest = sha256_file(stage2_c)
     print(f"stage2 generated C  : {stage2_c}")
     print(f"stage2 generated C bytes : {size}")
     print(f"stage2 generated C sha256: {digest}")
     print(f"stage2 binary        : {output}")
+    print(f"stage2 binary sha256 : {sha256_file(output)}")
+    print(f"stage2 body sha256   : {sha256_file(stage2_obj)}")
+    for diagnostics, runtime_object in runtime_objects.items():
+        print(f"stage2 runtime object diagnostics={diagnostics}: {runtime_object}")
+        print(f"stage2 runtime sha256 diagnostics={diagnostics}: {sha256_file(runtime_object)}")
+    if diagnostic_output is not None:
+        print(f"stage2 diagnostic binary: {diagnostic_output}")
+        print(f"stage2 diagnostic sha256: {sha256_file(diagnostic_output)}")
     return 0
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("output", help="path to write the stage-2 compiler binary to")
+    parser.add_argument("--diagnostic-output", help="also link a compiler with memory diagnostics enabled")
     args = parser.parse_args(argv)
     try:
-        return build(Path(args.output).resolve())
+        return build(
+            Path(args.output).resolve(),
+            Path(args.diagnostic_output).resolve() if args.diagnostic_output else None,
+        )
     except BuildError as error:
         print(f"build_stage2_compiler: {error}", file=sys.stderr)
         return 1

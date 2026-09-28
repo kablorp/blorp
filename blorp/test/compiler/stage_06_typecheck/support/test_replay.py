@@ -151,6 +151,7 @@ def fake_bridge_source() -> str:
         )
         start_bytes = -1 if allocator_stats_unavailable else 4096
         complete_bytes = -1 if allocator_stats_unavailable else 8192
+        stats_active = 0 if "BLORP_FAKE_MEMORY_STATS_UNAVAILABLE" in os.environ else 1
         start_stats = "total_allocations=10 total_releases=3 current_objects=7 "
         complete_stats = "total_allocations=20 total_releases=15 current_objects=5 "
 
@@ -159,7 +160,7 @@ def fake_bridge_source() -> str:
             typed_expr_nodes = 2 if reused else 0
             print(
                 f"[typecheck-phase] phase=typecheck_start module={item['module_path']} "
-                f"{start_stats}bytes_allocated={start_bytes}",
+                f"{start_stats}bytes_allocated={start_bytes} memory_stats_active={stats_active}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -186,7 +187,7 @@ def fake_bridge_source() -> str:
             }), flush=True)
             print(
                 f"[typecheck-phase] phase=typed_artifact_scope_complete module={item['module_path']} "
-                f"{complete_stats}bytes_allocated={complete_bytes}",
+                f"{complete_stats}bytes_allocated={complete_bytes} memory_stats_active={stats_active}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -630,6 +631,26 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
             result["module_memstats_max"]["main"]["bytes_allocated"],
             8192,
         )
+
+    def test_replay_rejects_inactive_memory_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            temp_dir = Path(temp_name)
+            request_path = temp_dir / "request.json"
+            bridge_path = temp_dir / "typecheck-bridge"
+            request_path.write_text(json.dumps(request_json()), encoding="utf-8")
+            bridge_path.write_text(fake_bridge_source(), encoding="utf-8")
+            bridge_path.chmod(0o755)
+            environment = dict(os.environ)
+            environment["BLORP_FAKE_MEMORY_STATS_UNAVAILABLE"] = "1"
+            completed = self.run_replay(
+                request_path, bridge_path, "--memstats", env=environment,
+            )
+            result = json.loads(completed.stdout)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(result["verified"])
+        self.assertFalse(result["memory_stats_available"])
+        self.assertIn("BLORP_MEMORY_DIAGNOSTICS=1", result["error"])
 
     def test_replay_rejects_bridge_without_allocator_stats_support(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:

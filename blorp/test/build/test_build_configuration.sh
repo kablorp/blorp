@@ -611,10 +611,29 @@ if grep -Fq "printf '%s\\n' Makefile " <<<"$cli_build_plan"; then
 	exit 1
 fi
 if ! grep -Fq \
-	'new_hash=$(printf '\''%s\n%s\n%s\n%s\n%s\n%s\n%s\n'\'' "$source_hash" "$generated_c_hash" "$recipe_hash" "-O0"' \
+	'new_hash=$(printf '\''%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n'\'' "$source_hash" "$generated_c_hash" "$recipe_hash" "-O0"' \
 	<<<"$cli_build_plan"
 then
-	echo "FAIL: source, generated C, recipe, optimization, and compiler config must determine the Blorp CLI cache key" >&2
+	echo "FAIL: source, generated C, recipe, and optimization must determine the Blorp CLI body cache key" >&2
+	exit 1
+fi
+if ! grep -Fq 'cc_path=$(command -v clang)' <<<"$cli_build_plan" ||
+	! grep -Fq '"$splitter_hash" "8" "$cc_path" "' <<<"$cli_build_plan"
+then
+	echo "FAIL: C compiler path and version must determine the Blorp CLI body cache key" >&2
+	exit 1
+fi
+diagnostic_build_plan=$(
+	unset BLORP_CLI_C_OPTIMIZATION BLORP_CC MAKEFLAGS MFLAGS
+	make -n BLORP_MEMORY_DIAGNOSTICS=1 compile-prepared-blorp-cli
+)
+normal_body_hash_recipe=$(grep -F 'new_hash=$(' <<<"$cli_build_plan")
+diagnostic_body_hash_recipe=$(grep -F 'new_hash=$(' <<<"$diagnostic_build_plan")
+normal_link_hash_recipe=$(grep -F 'link_hash=$(' <<<"$cli_build_plan")
+diagnostic_link_hash_recipe=$(grep -F 'link_hash=$(' <<<"$diagnostic_build_plan")
+if [ "$normal_body_hash_recipe" != "$diagnostic_body_hash_recipe" ] ||
+	[ "$normal_link_hash_recipe" = "$diagnostic_link_hash_recipe" ]; then
+	echo "FAIL: diagnostic mode must share Blorp CLI body objects and change the link cache key" >&2
 	exit 1
 fi
 if ! grep -Fq '"$splitter_hash" "8"' <<<"$cli_build_plan"; then

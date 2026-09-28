@@ -299,6 +299,10 @@ compile_blorp() {
     local timer_c="$TEMP_DIR/${name}_blorp_timer.c"
     local timer_o="$TEMP_DIR/${name}_blorp_timer.o"
     local helper_src="$SCRIPT_DIR/blorp/support"
+    local memory_diagnostics=0
+    if [ "$BENCH_ALLOC_STATS" = "1" ]; then
+        memory_diagnostics=1
+    fi
 
     cp "$src" "$bench_src"
     if [ -d "$helper_src" ]; then
@@ -311,7 +315,8 @@ compile_blorp() {
     [ -f "$bench_c" ] || return 1
 
     write_c_timer "$timer_c" "$name" "blorp" 1
-    $CC -fwrapv -O3 -march=native -flto -pthread -Dmain=bench_main -c "$bench_c" -o "$obj"
+    $CC -fwrapv -O3 -march=native -flto -pthread -Dmain=bench_main \
+        "-DBLORP_MEMORY_DIAGNOSTICS=$memory_diagnostics" -c "$bench_c" -o "$obj"
     $CC -fwrapv -O3 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
     $CC -fwrapv -O3 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm -lpthread
 }
