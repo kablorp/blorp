@@ -342,11 +342,11 @@ static inline void __blorp_oracle_count(_Atomic long* counter) {
 
 static size_t blorp_checked_mul(long a, long b) {
     if (a < 0 || b < 0) {
-        fprintf(stderr, "blorp: negative allocation size (%ld * %ld)\\n", a, b);
+        fprintf(stderr, "blorp: negative allocation size (%ld * %ld)\n", a, b);
         exit(1);
     }
     if (a > 0 && b > 0 && (size_t)a > SIZE_MAX / (size_t)b) {
-        fprintf(stderr, "blorp: allocation size overflow (%ld * %ld)\\n", a, b);
+        fprintf(stderr, "blorp: allocation size overflow (%ld * %ld)\n", a, b);
         exit(1);
     }
     return (size_t)a * (size_t)b;
@@ -354,7 +354,7 @@ static size_t blorp_checked_mul(long a, long b) {
 
 static size_t blorp_checked_add(size_t a, size_t b) {
     if (a > SIZE_MAX - b) {
-        fprintf(stderr, "blorp: allocation size overflow (%zu + %zu)\\n", a, b);
+        fprintf(stderr, "blorp: allocation size overflow (%zu + %zu)\n", a, b);
         exit(1);
     }
     return a + b;
@@ -363,7 +363,7 @@ static size_t blorp_checked_add(size_t a, size_t b) {
 void* blorp_malloc_checked(size_t size) {
     void* ptr = BLORP_ORACLE_MALLOC(size);
     if (!ptr) {
-        fprintf(stderr, "blorp: out of memory (malloc %zu bytes)\\n", size);
+        fprintf(stderr, "blorp: out of memory (malloc %zu bytes)\n", size);
         exit(1);
     }
     return ptr;
@@ -372,7 +372,7 @@ void* blorp_malloc_checked(size_t size) {
 static void* blorp_realloc_checked(void* old_ptr, size_t size) {
     void* ptr = BLORP_ORACLE_REALLOC(old_ptr, size);
     if (!ptr) {
-        fprintf(stderr, "blorp: out of memory (realloc %zu bytes)\\n", size);
+        fprintf(stderr, "blorp: out of memory (realloc %zu bytes)\n", size);
         exit(1);
     }
     return ptr;
@@ -381,7 +381,7 @@ static void* blorp_realloc_checked(void* old_ptr, size_t size) {
 static void* blorp_calloc_checked(size_t count, size_t size) {
     void* ptr = BLORP_ORACLE_CALLOC(count, size);
     if (!ptr) {
-        fprintf(stderr, "blorp: out of memory (calloc %zu * %zu bytes)\\n", count, size);
+        fprintf(stderr, "blorp: out of memory (calloc %zu * %zu bytes)\n", count, size);
         exit(1);
     }
     return ptr;

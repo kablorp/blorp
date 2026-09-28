@@ -505,6 +505,10 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle_
 	echo "FAIL: hygiene-check must include the allocation oracle raw-call coverage gate" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_fatal_messages.py' Makefile; then
+	echo "FAIL: hygiene-check must include the runtime fatal message newline contract" >&2
+	exit 1
+fi
 if ! grep -Fq 'python3 -m unittest blorp/test/build/test_record_validation.py' Makefile; then
 	echo "FAIL: hygiene-check must include the validation evidence recorder contract" >&2
 	exit 1
