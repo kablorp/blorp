@@ -8835,41 +8835,115 @@ static blorp_String* blorp_nonfinite_float_to_string(double f) {
     return blorp_string_from_buf("inf", 3);
 }
 
+enum {
+    /* Size of the text buffers used by Float to_string; %.17g needs at most 24. */
+    BLORP_FLOAT_TEXT_CAPACITY = 64,
+    /* The C default %g precision, whose short form is kept whenever it is exact. */
+    BLORP_FLOAT_DEFAULT_PRECISION = 6,
+    /* First precision tried after the default six-digit %g form fails. */
+    BLORP_FLOAT_MIN_SEARCH_PRECISION = 7,
+    /* Probe that splits the search: most computed doubles need 16 or 17 digits. */
+    BLORP_FLOAT_COMMON_PROBE_PRECISION = 15
+};
+
+/* Formats f with `precision` significant digits into buf and reports whether
+   the text parses back to exactly the same IEEE double. */
+static bool blorp_float_text_round_trips(double f, int precision, char* buf, int* len_out) {
+    int len = snprintf(buf, BLORP_FLOAT_TEXT_CAPACITY, "%.*g", precision, f);
+    *len_out = len;
+    if (len <= 0 || len >= BLORP_FLOAT_TEXT_CAPACITY) return false;
+
+    char* end = NULL;
+    double parsed = strtod(buf, &end);
+    uint64_t original_bits = 0;
+    uint64_t parsed_bits = 0;
+    memcpy(&original_bits, &f, sizeof(original_bits));
+    memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
+    return end == buf + len && original_bits == parsed_bits;
+}
+
+/* True when "round-trips with p digits" implies "round-trips with p + 1
+   digits" for every p, which lets the fewest-digits search skip precisions.
+
+   printf rounds correctly, so the p + 1 digit text is never farther from f
+   than the p digit text (every p digit decimal is also a p + 1 digit decimal).
+   strtod returns f exactly for decimals strictly inside f's rounding interval,
+   so the implication holds whenever that interval is symmetric and no decimal
+   of at most 17 digits lies exactly on its edge. Both conditions fail only for
+   exact powers of two (the gap below is half the gap above) and for
+   |f| >= 2^52 (ulp >= 1, so interval edges are short decimals such as n + 0.5
+   or 2n + 1). Below 2^52, writing f's ulp as 2^e (so e <= -1), an edge is
+   f +/- 2^(e-1), an odd multiple of 2^(e-1), and needs at least 18
+   significant digits. Those inputs keep the linear
+   search, so the result is always the fewest round-tripping digits. */
+static bool blorp_float_round_trip_is_monotonic(double f) {
+    static const uint64_t fraction_mask = (UINT64_C(1) << 52) - 1;
+    uint64_t bits = 0;
+    memcpy(&bits, &f, sizeof(bits));
+    return fabs(f) < 0x1p52 && (bits & fraction_mask) != 0;
+}
+
+/* Writes into buf the %.*g text of f with the fewest significant digits in
+   [7, DBL_DECIMAL_DIG] that round-trips, or the DBL_DECIMAL_DIG form when
+   none does, and returns its length. */
+static int blorp_float_fewest_round_trip_digits(double f, char* buf) {
+    int len = 0;
+    if (!blorp_float_round_trip_is_monotonic(f)) {
+        for (int precision = BLORP_FLOAT_MIN_SEARCH_PRECISION; precision <= DBL_DECIMAL_DIG; precision++) {
+            if (blorp_float_text_round_trips(f, precision, buf, &len)) break;
+        }
+        return len;
+    }
+
+    if (blorp_float_text_round_trips(f, BLORP_FLOAT_MIN_SEARCH_PRECISION, buf, &len)) return len;
+
+    int first_known = DBL_DECIMAL_DIG;
+    int lowest_unknown = BLORP_FLOAT_MIN_SEARCH_PRECISION + 1;
+    char candidate[BLORP_FLOAT_TEXT_CAPACITY];
+    int candidate_len = 0;
+    if (blorp_float_text_round_trips(f, BLORP_FLOAT_COMMON_PROBE_PRECISION, candidate, &candidate_len)) {
+        first_known = BLORP_FLOAT_COMMON_PROBE_PRECISION;
+        memcpy(buf, candidate, (size_t)candidate_len);
+        len = candidate_len;
+    } else {
+        lowest_unknown = BLORP_FLOAT_COMMON_PROBE_PRECISION + 1;
+    }
+
+    /* Invariant: every precision below lowest_unknown fails and buf holds the
+       text for first_known, or DBL_DECIMAL_DIG has not been formatted yet. */
+    while (lowest_unknown < first_known) {
+        int middle = lowest_unknown + (first_known - lowest_unknown) / 2;
+        if (blorp_float_text_round_trips(f, middle, candidate, &candidate_len)) {
+            first_known = middle;
+            memcpy(buf, candidate, (size_t)candidate_len);
+            len = candidate_len;
+        } else {
+            lowest_unknown = middle + 1;
+        }
+    }
+    if (first_known == DBL_DECIMAL_DIG) {
+        /* The linear search also returns this text when nothing shorter
+           round-trips, whether or not it round-trips itself. */
+        len = snprintf(buf, BLORP_FLOAT_TEXT_CAPACITY, "%.*g", DBL_DECIMAL_DIG, f);
+    }
+    return len;
+}
+
+/* The skip-ahead proof above assumes correctly rounded printf and strtod;
+   blorp/test/runtime/test_runtime_float_to_string.py checks each platform's
+   libc against the one-precision-at-a-time search. */
 blorp_String* blorp_float_to_string(double f) {
     if (!isfinite(f)) {
         return blorp_nonfinite_float_to_string(f);
     }
 
-    char buf[64];
-    int len = snprintf(buf, sizeof(buf), "%g", f);
-
-    uint64_t original_bits = 0;
-    memcpy(&original_bits, &f, sizeof(original_bits));
-    bool exact = false;
-
-    if (len > 0 && len < (int)sizeof(buf)) {
-        char* end = NULL;
-        double parsed = strtod(buf, &end);
-        uint64_t parsed_bits = 0;
-        memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
-        exact = end == buf + len && original_bits == parsed_bits;
-    }
-
     /* Preserve the established, human-readable %g form whenever it is
-       already exact. Otherwise increase significant digits until the
-       decimal text round-trips to the same IEEE double. */
-    if (!exact) {
-        for (int precision = 7; precision <= DBL_DECIMAL_DIG; precision++) {
-            len = snprintf(buf, sizeof(buf), "%.*g", precision, f);
-            if (len <= 0 || len >= (int)sizeof(buf)) continue;
-
-            char* end = NULL;
-            double parsed = strtod(buf, &end);
-            uint64_t parsed_bits = 0;
-            memcpy(&parsed_bits, &parsed, sizeof(parsed_bits));
-
-            if (end == buf + len && original_bits == parsed_bits) break;
-        }
+       already exact. Otherwise use the fewest significant digits that make
+       the decimal text round-trip to the same IEEE double. */
+    char buf[BLORP_FLOAT_TEXT_CAPACITY];
+    int len = 0;
+    if (!blorp_float_text_round_trips(f, BLORP_FLOAT_DEFAULT_PRECISION, buf, &len)) {
+        len = blorp_float_fewest_round_trip_digits(f, buf);
     }
 
     if (len < 0) len = 0;

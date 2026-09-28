@@ -493,6 +493,10 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_allocator_sta
 	echo "FAIL: hygiene-check must include the optimized runtime allocator regression" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_float_to_string.py' Makefile; then
+	echo "FAIL: hygiene-check must include the Float to_string precision-search differential" >&2
+	exit 1
+fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_memory_diagnostics.py' Makefile; then
 	echo "FAIL: hygiene-check must include the split-link memory diagnostics contract" >&2
 	exit 1
