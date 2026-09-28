@@ -242,6 +242,87 @@ class RuntimeAllocOracleTests(unittest.TestCase):
         completed = self._compile_and_run(source)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_set_noop_update_on_shared_set_allocates_nothing(self) -> None:
+        # Adding a present key to, or removing a missing key from, a shared
+        # set returns the original object without copying it: no managed
+        # object, no raw buffer, and every holder keeps its reference count.
+        # A real change to a shared set still copies.
+        source = textwrap.dedent(
+            """\
+            #define _GNU_SOURCE
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            static long raw_events(blorp_MemStats stats) {
+                return stats.raw_buffer_malloc_events + stats.raw_buffer_calloc_events
+                    + stats.raw_buffer_realloc_events + stats.raw_buffer_aligned_events;
+            }
+
+            #define EXPECT_NO_ALLOCATION(before, after, code) \\
+                do { \\
+                    long raw = raw_events(after) - raw_events(before); \\
+                    long managed = (after).total_allocations - (before).total_allocations; \\
+                    if (raw != 0 || managed != 0) { \\
+                        fprintf(stderr, "check %d: %ld raw buffers, %ld managed objects\\n", \\
+                                (code), raw, managed); \\
+                        return (code); \\
+                    } \\
+                } while (0)
+
+            #define KEY(v) ((void*)(intptr_t)(v))
+
+            static long refcount_of(void* obj) {
+                return (long)atomic_load(&((blorp_Object*)obj)->refcount);
+            }
+
+            int main(void) {
+                if (!getenv("BLORP_ALLOCATOR_STATS")) return 90;
+
+                blorp_Set* set = blorp_set_new();
+                for (long key = 0; key < 20; key++) set = blorp_set_add(set, KEY(key));
+                blorp_Set* other = set;
+                blorp_retain(other);
+                long shared_refcount = refcount_of(set);
+
+                blorp_MemStats before_add = blorp_get_mem_stats();
+                blorp_Set* added = blorp_set_add(set, KEY(7));
+                blorp_MemStats after_add = blorp_get_mem_stats();
+                EXPECT_NO_ALLOCATION(before_add, after_add, 2);
+                if (added != other) return 3;
+                if (refcount_of(other) != shared_refcount) return 4;
+                if (added->size != 20) return 5;
+
+                blorp_Set* removed = blorp_set_remove(added, KEY(1000));
+                blorp_MemStats after_remove = blorp_get_mem_stats();
+                EXPECT_NO_ALLOCATION(after_add, after_remove, 6);
+                if (removed != other) return 7;
+                if (refcount_of(other) != shared_refcount) return 8;
+                if (removed->size != 20) return 9;
+
+                // A real insert into the shared set still copies it and
+                // leaves the other holder untouched.
+                blorp_Set* grown = blorp_set_add(removed, KEY(1000));
+                if (grown == other) return 10;
+                if (grown->size != 21 || other->size != 20) return 11;
+                if (refcount_of(other) != shared_refcount - 1) return 12;
+
+                blorp_release(grown);
+                blorp_release(other);
+
+                // A NULL set is an empty set, as blorp_set_remove and
+                // blorp_set_cow treat it: adding to it yields a one-element set.
+                blorp_Set* from_null = blorp_set_add(NULL, KEY(5));
+                if (!from_null || from_null->size != 1) return 13;
+                if (!set_contains_internal(from_null, KEY(5))) return 14;
+                blorp_release(from_null);
+                return 0;
+            }
+            """
+        )
+        completed = self._compile_and_run(source)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_idle_process_reports_zero_oracle_counters(self) -> None:
         source = textwrap.dedent(
             """\

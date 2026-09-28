@@ -1,0 +1,188 @@
+-- Set updates that change nothing must not copy a shared set.
+--
+-- Adding an element that is already present, or removing one that is absent,
+-- leaves the set's contents unchanged. When the set is shared, copying it
+-- first would allocate a whole table only to hand back an equal value, so the
+-- update returns the original object instead. The update still consumes the
+-- caller's reference and returns an owned one; both are the same object, so
+-- each holder keeps exactly the reference it had. Runs under the leak gate.
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats, same_object
+	set as S
+	test: TestSuite
+
+
+private func int_set(count: Int) -> Set[Int]:
+	var values: Set[Int] = S.set()
+
+	for i in 0..count:
+		values = S.add(values, i * 3)
+
+	values
+
+
+private func string_set(count: Int) -> Set[String]:
+	var values: Set[String] = S.set()
+
+	for i in 0..count:
+		values = S.add(values, "k" + i.to_string())
+
+	values
+
+
+private func no_allocations_since_reset() -> Bool:
+	stats: MemStats = get_mem_stats()
+	stats.memory_stats_active == 1 and stats.total_allocations == 0
+
+
+func test_add_present_int_on_shared_set_returns_original() -> Bool:
+	original: Set[Int] = int_set(20)
+	var holder: Set[Int] = original
+	reset_mem_stats()
+	holder = S.add(holder, 9)
+	allocated_nothing: Bool = no_allocations_since_reset()
+	(
+		allocated_nothing
+		and same_object(holder, original)
+		and holder.length() == 20
+		and original.length() == 20
+		and S.contains(original, 9)
+	)
+
+
+func test_add_present_string_on_shared_set_returns_original() -> Bool:
+	original: Set[String] = string_set(20)
+	present: String = "k" + 7.to_string()
+	var holder: Set[String] = original
+	reset_mem_stats()
+	holder = S.add(holder, present)
+	allocated_nothing: Bool = no_allocations_since_reset()
+	(
+		allocated_nothing
+		and same_object(holder, original)
+		and holder.length() == 20
+		and original.length() == 20
+		and S.to_list(holder) == S.to_list(original)
+	)
+
+
+func test_remove_missing_int_on_shared_set_returns_original() -> Bool:
+	original: Set[Int] = int_set(20)
+	var holder: Set[Int] = original
+	reset_mem_stats()
+	holder = S.remove(holder, 1)
+	allocated_nothing: Bool = no_allocations_since_reset()
+	(
+		allocated_nothing
+		and same_object(holder, original)
+		and holder.length() == 20
+		and original.length() == 20
+	)
+
+
+func test_remove_missing_string_on_shared_set_returns_original() -> Bool:
+	original: Set[String] = string_set(20)
+	missing: String = "absent" + 1.to_string()
+	var holder: Set[String] = original
+	reset_mem_stats()
+	holder = S.remove(holder, missing)
+	allocated_nothing: Bool = no_allocations_since_reset()
+	(
+		allocated_nothing
+		and same_object(holder, original)
+		and holder.length() == 20
+		and original.length() == 20
+	)
+
+
+func test_add_new_on_shared_set_still_copies() -> Bool:
+	original: Set[Int] = int_set(20)
+	var holder: Set[Int] = original
+	holder = S.add(holder, 1)
+	(
+		not same_object(holder, original)
+		and holder.length() == 21
+		and original.length() == 20
+		and S.contains(holder, 1)
+		and not S.contains(original, 1)
+	)
+
+
+func test_remove_present_on_shared_set_still_copies() -> Bool:
+	original: Set[String] = string_set(20)
+	present: String = "k" + 3.to_string()
+	var holder: Set[String] = original
+	holder = S.remove(holder, present)
+	(
+		not same_object(holder, original)
+		and holder.length() == 19
+		and original.length() == 20
+		and not S.contains(holder, present)
+		and S.contains(original, present)
+	)
+
+
+-- A no-op update followed by real updates on each holder: both holders must
+-- still split correctly afterwards and every object must be released.
+private func noop_then_diverge() -> Bool:
+	original: Set[String] = string_set(12)
+	present: String = "k" + 5.to_string()
+	var first: Set[String] = original
+	var second: Set[String] = original
+	first = S.add(first, present)
+	second = S.remove(second, "missing")
+	first = S.add(first, "first-only")
+	second = S.remove(second, present)
+	(
+		first.length() == 13
+		and second.length() == 11
+		and original.length() == 12
+		and S.contains(first, present)
+		and not S.contains(second, present)
+		and not S.contains(original, "first-only")
+	)
+
+
+func test_noop_updates_then_divergence_release_everything() -> Bool:
+	reset_mem_stats()
+	ok: Bool = noop_then_diverge()
+	stats: MemStats = get_mem_stats()
+	(
+		ok
+		and stats.memory_stats_active == 1
+		and stats.total_allocations > 0
+		and stats.total_allocations == stats.total_releases
+		and stats.current_objects == 0
+	)
+
+
+tests: TestSuite = {
+	description = "Set no-op updates on shared sets",
+	tests = [
+		(
+			"add present Int on shared set returns original",
+			test_add_present_int_on_shared_set_returns_original,
+		),
+		(
+			"add present String on shared set returns original",
+			test_add_present_string_on_shared_set_returns_original,
+		),
+		(
+			"remove missing Int on shared set returns original",
+			test_remove_missing_int_on_shared_set_returns_original,
+		),
+		(
+			"remove missing String on shared set returns original",
+			test_remove_missing_string_on_shared_set_returns_original,
+		),
+		("add new on shared set still copies", test_add_new_on_shared_set_still_copies),
+		(
+			"remove present on shared set still copies",
+			test_remove_present_on_shared_set_still_copies,
+		),
+		(
+			"no-op updates then divergence release everything",
+			test_noop_updates_then_divergence_release_everything,
+		),
+	]
+}

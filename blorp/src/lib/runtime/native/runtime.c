@@ -22079,96 +22079,116 @@ static blorp_Set* blorp_set_copy(blorp_Set* src) {
     return set;
 }
 
-blorp_Set* blorp_set_add(blorp_Set* set, void* key) {
-    bool was_shared = !blorp_is_unique(set);
-    blorp_Set* result = was_shared ? blorp_set_copy(set) : set;
-    if (was_shared) blorp_release(set);
-    unsigned long hash = result->hash_fn(key);
-    long bucket = hash & result->mask;
-    blorp_SetEntry* entry = result->buckets[bucket];
+// Find the entry holding `key` in its bucket chain, or NULL. `hash` must be
+// set->hash_fn(key); a copy made by blorp_set_copy keeps the capacity and
+// hash function, so the same hash stays valid for it.
+static blorp_SetEntry* blorp_set_find_entry(blorp_Set* set, void* key, unsigned long hash) {
+    blorp_SetEntry* entry = set->buckets[hash & set->mask];
     while (entry) {
-        if (result->eq_fn(entry->key, key)) return result;
+        if (set->eq_fn(entry->key, key)) return entry;
         entry = entry->next;
     }
+    return NULL;
+}
+
+// Ownership: consumes the caller's reference to `set` and returns an owned
+// reference; `key` is borrowed and retained only if it is inserted.
+//
+// Adding a key that is already present changes nothing, so a shared set is
+// probed before it is copied: when the key is there, the original is returned
+// as the result (the consumed reference becomes the returned one, so every
+// holder keeps its count) instead of copying the table to return an equal
+// value. Only an insert that really changes the set pays for the copy.
+blorp_Set* blorp_set_add(blorp_Set* set, void* key) {
+    // A NULL set is an empty Int set, as in blorp_set_remove and blorp_set_cow.
+    if (!set) set = blorp_set_new();
+    unsigned long hash = set->hash_fn(key);
+    if (blorp_set_find_entry(set, key, hash)) return set;
+    if (!blorp_is_unique(set)) {
+        blorp_Set* copy = blorp_set_copy(set);
+        blorp_release(set);
+        set = copy;
+    }
+    long bucket = hash & set->mask;
     blorp_SetEntry* new_entry = (blorp_SetEntry*)blorp_malloc_checked(sizeof(blorp_SetEntry));
     new_entry->key = key;
     // Retain key for set ownership
-    if (result->key_release && key) blorp_retain(key);
-    new_entry->next = result->buckets[bucket];
-    result->buckets[bucket] = new_entry;
+    if (set->key_release && key) blorp_retain(key);
+    new_entry->next = set->buckets[bucket];
+    set->buckets[bucket] = new_entry;
 
     // Append to insertion order list
-    new_entry->prev_order = result->last;
+    new_entry->prev_order = set->last;
     new_entry->next_order = NULL;
-    if (result->last) result->last->next_order = new_entry;
-    else result->first = new_entry;
-    result->last = new_entry;
+    if (set->last) set->last->next_order = new_entry;
+    else set->first = new_entry;
+    set->last = new_entry;
 
-    result->size++;
+    set->size++;
 
     // Resize if load factor exceeds 0.75
-    if (result->size > result->capacity * 3 / 4) {
-        long new_capacity = result->capacity * 2;
+    if (set->size > set->capacity * 3 / 4) {
+        long new_capacity = set->capacity * 2;
         long new_mask = new_capacity - 1;
         blorp_SetEntry** new_buckets = (blorp_SetEntry**)blorp_calloc_checked(new_capacity, sizeof(blorp_SetEntry*));
         // Rehash all entries via insertion-order traversal
-        blorp_SetEntry* e = result->first;
+        blorp_SetEntry* e = set->first;
         while (e) {
-            unsigned long h = result->hash_fn(e->key);
+            unsigned long h = set->hash_fn(e->key);
             long b = h & new_mask;
             e->next = new_buckets[b];
             new_buckets[b] = e;
             e = e->next_order;
         }
-        free(result->buckets);
-        result->buckets = new_buckets;
-        result->capacity = new_capacity;
-        result->mask = new_mask;
+        free(set->buckets);
+        set->buckets = new_buckets;
+        set->capacity = new_capacity;
+        set->mask = new_mask;
     }
 
-    return result;
+    return set;
 }
 
+// Ownership matches blorp_set_add: consumes `set`, returns an owned
+// reference, borrows `key`.
+//
+// Removing a missing key changes nothing, so a shared set is probed before it
+// is copied and returned unchanged when the key is absent.
 blorp_Set* blorp_set_remove(blorp_Set* set, void* key) {
     if (!set) return blorp_set_new();
-    bool was_shared = !blorp_is_unique(set);
-    blorp_Set* result = was_shared ? blorp_set_copy(set) : set;
-    if (was_shared) blorp_release(set);
-    unsigned long hash = result->hash_fn(key);
-    long bucket = hash & result->mask;
-    blorp_SetEntry** ptr = &result->buckets[bucket];
+    unsigned long hash = set->hash_fn(key);
+    if (!blorp_is_unique(set)) {
+        if (!blorp_set_find_entry(set, key, hash)) return set;
+        blorp_Set* copy = blorp_set_copy(set);
+        blorp_release(set);
+        set = copy;
+    }
+    blorp_SetEntry** ptr = &set->buckets[hash & set->mask];
     while (*ptr) {
-        if (result->eq_fn((*ptr)->key, key)) {
+        if (set->eq_fn((*ptr)->key, key)) {
             blorp_SetEntry* to_free = *ptr;
             *ptr = (*ptr)->next;
 
             // Unlink from insertion order list
             if (to_free->prev_order) to_free->prev_order->next_order = to_free->next_order;
-            else result->first = to_free->next_order;
+            else set->first = to_free->next_order;
             if (to_free->next_order) to_free->next_order->prev_order = to_free->prev_order;
-            else result->last = to_free->prev_order;
+            else set->last = to_free->prev_order;
 
             // Release key before freeing the entry
-            if (result->key_release && to_free->key) result->key_release(to_free->key);
+            if (set->key_release && to_free->key) set->key_release(to_free->key);
             free(to_free);
-            result->size--;
-            return result;
+            set->size--;
+            return set;
         }
         ptr = &(*ptr)->next;
     }
-    return result;
+    return set;
 }
 
 static bool set_contains_internal(blorp_Set* set, void* key) {
     if (!set) return false;
-    unsigned long hash = set->hash_fn(key);
-    long bucket = hash & set->mask;
-    blorp_SetEntry* entry = set->buckets[bucket];
-    while (entry) {
-        if (set->eq_fn(entry->key, key)) return true;
-        entry = entry->next;
-    }
-    return false;
+    return blorp_set_find_entry(set, key, set->hash_fn(key)) != NULL;
 }
 
 // Set to_list and length are now IR intrinsics.
