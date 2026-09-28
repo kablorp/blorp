@@ -347,33 +347,64 @@ private pure func selective_export_fixture_definitions(count: Int) -> String:
 	definitions
 
 
--- The owned-column scatter shape allocates 2,655 managed objects for this
--- deterministic 64-name fixture. The former record-threading shape allocates
--- 2,787 because both list fields remain shared across every update.
-private SELECTIVE_EXPORT_LARGE_BUCKET_ALLOCATION_LIMIT: Int = 2655
+---
+Regression protected: the selective-export name buckets are built by an
+owned-column scatter, so each additional imported name costs a fixed number
+of managed allocations. The former record-threading shape kept both list
+fields shared across every update, so each update copy-on-write cloned them
+and cost about two more allocations per name.
+
+The assertion is on the marginal cost per name (the slope between two
+fixture sizes), not on an absolute total. The total also contains the fixed
+cost of building the graph, which legitimately shifts whenever unrelated
+graph code gains a function; the slope does not.
+---
+private SELECTIVE_EXPORT_SMALL_FIXTURE_NAME_COUNT: Int = 64
+
+---
+Second fixture size; the slope is measured between the two counts.
+---
+private SELECTIVE_EXPORT_LARGE_FIXTURE_NAME_COUNT: Int = 128
+
+---
+Allocation limit per added name across the whole graph build, which
+includes the scatter and the per-declaration work for each added
+definition. The owned scatter measures 4.03 per added name (258 allocations
+for the 64 added names); the shared-field shape measures about 6.1 (7.0
+when re-created by injecting a per-update alias). The limit of 5 leaves one
+allocation of headroom per name and stays below that gap, so the
+regression cannot hide inside the margin.
+---
+private SELECTIVE_EXPORT_OWNED_ALLOCATIONS_PER_NAME_LIMIT: Int = 5
 
 
-func test_indexed_graph_scatter_keeps_large_selective_export_buckets_owned() -> Bool:
+private func selective_export_fixture_allocations(name_count: Int) -> Option[Int]:
+	half = name_count / 2
 	target = fixture_module_load_candidate(
 		"src/main.brp",
 		"app/main",
-		"import:\n\tpkg/large: " + selective_export_fixture_names(0, 32)
-			+ "\n\nimport:\n\tpkg/large: " + selective_export_fixture_names(32, 64)
-			+ "\n\nimport:\n\tunresolved/source: Missing\n\nfunc main(args: List[String]) -> Int:\n\t0",
+		"import:\n\tpkg/large: " + selective_export_fixture_names(
+			0,
+			half,
+		) + "\n\nimport:\n\tpkg/large: " + selective_export_fixture_names(
+			half,
+			name_count,
+		) + "\n\nimport:\n\tunresolved/source: Missing\n\nfunc main(args: List[String]) -> Int:\n\t0",
 	)
 	dependency = fixture_module_load_candidate(
 		"src/large.brp",
 		"pkg/large",
-		selective_export_fixture_definitions(64),
+		selective_export_fixture_definitions(name_count),
 	)
 
 	reset_mem_stats()
 
 	match indexed_graph_build(target, [dependency]):
 		Err(_):
-			False
+			None
 		Ok(graph):
 			stats = get_mem_stats()
+
 			owns_expected_names = match indexed_graph_find_dependency_scope(graph, "pkg/large"):
 				Some(dependency_scope):
 					(
@@ -382,7 +413,9 @@ func test_indexed_graph_scatter_keeps_large_selective_export_buckets_owned() -> 
 						).exported_definition_name_demand_contains("name_0")
 						and prepared_module_scope_selective_export_names(
 							dependency_scope,
-						).exported_definition_name_demand_contains("name_63")
+						).exported_definition_name_demand_contains(
+							"name_" + (name_count - 1).to_string(),
+						)
 						and prepared_module_scope_conservative_selective_export_names(
 							dependency_scope,
 						).exported_definition_name_demand_contains("Missing")
@@ -390,15 +423,35 @@ func test_indexed_graph_scatter_keeps_large_selective_export_buckets_owned() -> 
 				None:
 					False
 
-			if stats.total_allocations > SELECTIVE_EXPORT_LARGE_BUCKET_ALLOCATION_LIMIT:
+			if owns_expected_names:
+				Some(stats.total_allocations)
+			else:
+				None
+
+
+func test_indexed_graph_scatter_keeps_large_selective_export_buckets_owned() -> Bool:
+	-- Warm-up build, discarded: one-time lazy initialization would otherwise
+	-- inflate whichever fixture runs first and understate the slope.
+	warm_up = selective_export_fixture_allocations(SELECTIVE_EXPORT_SMALL_FIXTURE_NAME_COUNT)
+
+	match (
+		selective_export_fixture_allocations(SELECTIVE_EXPORT_SMALL_FIXTURE_NAME_COUNT),
+		selective_export_fixture_allocations(SELECTIVE_EXPORT_LARGE_FIXTURE_NAME_COUNT),
+	):
+		(Some(small_allocations), Some(large_allocations)):
+			added_names = SELECTIVE_EXPORT_LARGE_FIXTURE_NAME_COUNT - SELECTIVE_EXPORT_SMALL_FIXTURE_NAME_COUNT
+			added_allocations = large_allocations - small_allocations
+			allocation_limit = added_names * SELECTIVE_EXPORT_OWNED_ALLOCATIONS_PER_NAME_LIMIT
+
+			if added_allocations > allocation_limit:
 				print(
-					"large selective-export scatter allocations: " + stats.total_allocations.to_string(),
+					"selective-export scatter allocations: small=" + small_allocations.to_string() + " large=" + large_allocations.to_string() + " added=" + added_allocations.to_string() + " limit=" + allocation_limit.to_string(),
 				)
 
-			(
-				owns_expected_names
-				and stats.total_allocations <= SELECTIVE_EXPORT_LARGE_BUCKET_ALLOCATION_LIMIT
-			)
+			added_allocations <= allocation_limit
+		_:
+			print("selective-export fixture failed to build or lost expected exported names")
+			False
 
 
 pure func test_source_name_table_issues_stable_dense_ids() -> Bool:
