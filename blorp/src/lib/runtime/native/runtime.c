@@ -8683,7 +8683,8 @@ static int blorp_format_long_decimal(char* buf, size_t buf_len, long value) {
 }
 
 // IR intrinsic: allocate an empty mutable string with given byte capacity.
-// len is set to 0; data is zeroed. Caller fills bytes via string_set_byte.
+// len is set to 0 and only data[0] is written (the terminator); the other
+// bytes are uninitialized. Caller fills bytes via string_set_byte.
 blorp_String* blorp_string_alloc(long capacity) {
     if (capacity < 1) capacity = 1;
     blorp_String* str = blorp_string_alloc_empty(capacity);
