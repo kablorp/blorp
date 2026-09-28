@@ -9,7 +9,6 @@
 -- divergent-ownership-use predicates that decide when a branch needs
 -- distinct per-arm balancing instead of one shared drop above it).
 import:
-	memory: same_object
 	../ir:
 		CoreBinaryOp(EqualOp, NotEqualOp),
 		CoreBoxKind(PointerBox),
@@ -142,7 +141,6 @@ import:
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc,
-		synthetic_core_source_loc,
 		CoreType(
 			BoxedResultType,
 			EnumType,
@@ -161,27 +159,30 @@ import:
 		),
 		CoreVar,
 		core_expr_type,
+		synthetic_core_source_loc,
+	../traverse as CoreTraverse
 	env:
 		PerceusEnv,
 		is_managed_type,
 		release_policy_for_type,
 		retain_policy_for_type,
 		uses_branch_aware_balance,
+	memory: same_object
 	uses:
 		NO_OWNERSHIP_USES,
 		OwnershipUseSummary,
 		borrow_expr_aliases_target,
+		core_params_shadow,
 		count_uses,
 		count_uses_in_constructor_match_body,
-		core_params_shadow,
 		direct_aliases_name,
 		match_bindings_shadow,
 		max_int,
-		summarize_linear_borrow,
 		summarize_constructor_length_branch_uses,
+		summarize_linear_borrow,
 		summarize_linear_ownership_uses,
 		summarize_match_ownership_uses,
-	../traverse as CoreTraverse
+
 
 -- Local rebinding of the BLORP_PERCEUS_ENGINE_METRICS hooks declared in
 -- perceus/results_and_loops.brp (see that file's own foreign block for the
@@ -194,7 +195,9 @@ import:
 -- only needs the enter/exit hooks.
 foreign:
 	private pure func perceus_engine_node_enter() -> Void = "blorp_perceus_engine_node_enter_c"
-	private pure func perceus_engine_node_exit(kind: String) -> Void = "blorp_perceus_engine_node_exit_c"
+	private pure func perceus_engine_node_exit(
+		kind: String,
+	) -> Void = "blorp_perceus_engine_node_exit_c"
 
 
 record FreshenedConstructorMatchBindingBody {
@@ -869,6 +872,183 @@ private pure func balance_managed_borrowed_match_branch_body(
 	result
 
 
+-- Nested discriminators still borrow the matched owner. Delay balancing until
+-- their leaves, carrying payload bindings from every enclosing pattern so a
+-- leaf can retain them before releasing or transferring the owner.
+private pure func nested_match_borrowed_bindings(
+	outer: List[CoreMatchBinding],
+	inner: List[CoreMatchBinding],
+) -> List[CoreMatchBinding]:
+	var bindings: List[CoreMatchBinding] = []
+
+	for binding in outer:
+		if not match_bindings_shadow(binding.variable.name, inner):
+			bindings = bindings.append(binding)
+		else:
+			void
+
+	for binding in inner:
+		bindings = bindings.append(binding)
+
+	bindings
+
+
+private pure func balance_borrowed_literal_fallback(
+	env: PerceusEnv,
+	variable: CoreVar,
+	value_type: CoreType,
+	available_refs: Int,
+	bindings: List[CoreMatchBinding],
+	fallback: CoreLiteralMatchFallback,
+) -> CoreLiteralMatchFallback:
+	match fallback:
+		LiteralMatchFallbackBody(body):
+			LiteralMatchFallbackBody(
+				balance_managed_borrowed_match_branch_body(
+					env,
+					variable,
+					value_type,
+					available_refs,
+					bindings,
+					body,
+				),
+			)
+		LiteralMatchFallbackBindings(local_bindings, body):
+			LiteralMatchFallbackBindings(
+				local_bindings,
+				balance_managed_borrowed_match_branch_body(
+					env,
+					variable,
+					value_type,
+					available_refs,
+					nested_match_borrowed_bindings(bindings, local_bindings),
+					body,
+				),
+			)
+		LiteralMatchFallbackFail:
+			LiteralMatchFallbackFail
+
+
+private pure func balance_borrowed_constructor_length_branch(
+	env: PerceusEnv,
+	variable: CoreVar,
+	value_type: CoreType,
+	available_refs: Int,
+	bindings: List[CoreMatchBinding],
+	branch: CoreConstructorLengthMatchBranch,
+) -> CoreConstructorLengthMatchBranch:
+	{ branch | body = balance_borrowed_constructor_match_body(
+			env,
+			variable,
+			value_type,
+			available_refs,
+			nested_match_borrowed_bindings(bindings, branch.bindings),
+			branch.body,
+		) }
+
+
+private pure func balance_borrowed_constructor_match_body(
+	env: PerceusEnv,
+	variable: CoreVar,
+	value_type: CoreType,
+	available_refs: Int,
+	bindings: List[CoreMatchBinding],
+	body: CoreConstructorMatchBody,
+) -> CoreConstructorMatchBody:
+	match body:
+		ConstructorMatchBodyExpr(leaf):
+			ConstructorMatchBodyExpr(
+				balance_managed_borrowed_match_branch_body(
+					env,
+					variable,
+					value_type,
+					available_refs,
+					bindings,
+					leaf,
+				),
+			)
+		ConstructorMatchBodyLiteral(match_expr):
+			var cases: List[CoreLiteralMatchCase] = []
+
+			for match_case in match_expr.cases:
+				cases = cases.append(
+					{ match_case | body = balance_managed_borrowed_match_branch_body(
+							env,
+							variable,
+							value_type,
+							available_refs,
+							nested_match_borrowed_bindings(bindings, match_case.bindings),
+							match_case.body,
+						) },
+				)
+
+			ConstructorMatchBodyLiteral({ match_expr |
+					cases = cases,
+					fallback = balance_borrowed_literal_fallback(
+						env,
+						variable,
+						value_type,
+						available_refs,
+						bindings,
+						match_expr.fallback,
+					)
+				})
+		ConstructorMatchBodyLength(match_expr):
+			var cases: List[CoreConstructorLengthMatchCase] = []
+
+			for match_case in match_expr.cases:
+				cases = cases.append(
+					{ match_case |
+						branch = balance_borrowed_constructor_length_branch(
+							env,
+							variable,
+							value_type,
+							available_refs,
+							bindings,
+							match_case.branch,
+						)
+					},
+				)
+
+			geq: Option[CoreConstructorLengthMatchGeq] = match match_expr.geq:
+				Some(match_case):
+					Some(
+						{ match_case |
+							branch = balance_borrowed_constructor_length_branch(
+								env,
+								variable,
+								value_type,
+								available_refs,
+								bindings,
+								match_case.branch,
+							)
+						},
+					)
+				None:
+					None
+
+			fallback: Option[CoreConstructorLengthMatchBranch] = match match_expr.fallback:
+				Some(branch):
+					Some(
+						balance_borrowed_constructor_length_branch(
+							env,
+							variable,
+							value_type,
+							available_refs,
+							bindings,
+							branch,
+						),
+					)
+				None:
+					None
+
+			ConstructorMatchBodyLength({ match_expr |
+					cases = cases,
+					geq = geq,
+					fallback = fallback
+				})
+
+
 private pure func balance_terminal_constructor_match(
 	env: PerceusEnv,
 	variable: CoreVar,
@@ -889,21 +1069,9 @@ private pure func balance_terminal_constructor_match(
 			can_balance = False
 			break
 		else:
-			body_is_expr: Bool = match match_case.body:
-				ConstructorMatchBodyExpr(leaf):
-					True
-				_:
-					False
-
-			if scrutinee_is_direct_alias and not body_is_expr:
-				can_balance = False
-				break
-			else if not constructor_match_body_can_balance(
-				env,
-				variable.name,
-				scrutinee_is_direct_alias,
-				match_case.body,
-			):
+			-- Direct-owner branches use the nested borrowed-binding walker,
+			-- so only shadowing prevents balancing, not managed payload uses.
+			if not constructor_match_body_can_balance(env, variable.name, False, match_case.body):
 				can_balance = False
 				break
 			else:
@@ -953,18 +1121,26 @@ private pure func balance_terminal_constructor_match(
 						},
 					)
 				_:
-					balanced_cases = balanced_cases.append(
-						{ match_case |
-							body = balance_constructor_match_body(
-								env,
-								variable,
-								value_type,
-								available_after_scrutinee,
-								scrutinee_is_direct_alias,
-								match_case.body,
-							)
-						},
-					)
+					balanced_body: CoreConstructorMatchBody = if scrutinee_is_direct_alias:
+						balance_borrowed_constructor_match_body(
+							env,
+							variable,
+							value_type,
+							available_after_scrutinee,
+							match_case.bindings,
+							match_case.body,
+						)
+					else:
+						balance_constructor_match_body(
+							env,
+							variable,
+							value_type,
+							available_after_scrutinee,
+							scrutinee_is_direct_alias,
+							match_case.body,
+						)
+
+					balanced_cases = balanced_cases.append({ match_case | body = balanced_body })
 
 		balanced_fallback: CoreConstructorMatchFallback = match fallback:
 			ConstructorMatchFallbackBody(leaf):
@@ -3571,7 +3747,11 @@ private pure func transform_let_constructor_match_body_impl(
 		)
 		max_branch_required: Int = max_int(
 			constructor_match_cases_max_required(env, variable.name, freshened_cases),
-			summarize_constructor_match_fallback(env, variable.name, freshened_fallback).required_refs,
+			summarize_constructor_match_fallback(
+				env,
+				variable.name,
+				freshened_fallback,
+			).required_refs,
 		)
 		total_needed: Int = max_int(
 			scrutinee_uses.required_refs,

@@ -160,7 +160,9 @@ import:
 		insert_drops_expr,
 		insert_drops_program,
 		insert_drops_program_with_facts,
-	../../../src/compiler/stage_09_core/perceus/balance: freshen_shadowed_match_bindings
+	../../../src/compiler/stage_09_core/perceus/balance:
+		balance_branch_body,
+		freshen_shadowed_match_bindings,
 	../../../src/compiler/stage_09_core/perceus/borrowed: normalize_lambda_result_aliases
 	../../../src/compiler/stage_09_core/perceus/protect: protect_repeated_consumes
 	../../../src/compiler/stage_09_core/resolve: resolve_global_value_refs
@@ -177,6 +179,7 @@ import:
 	../../../src/compiler/stage_09_core/perceus/env:
 		MatchShadowCatalog,
 		PerceusEnv,
+		PerceusBalanceStrategy(BranchAwareOwnershipBalance),
 		PerceusGlobalLookup(CollidingPerceusGlobals),
 		borrow_contract_for_signature,
 		build_env,
@@ -17723,6 +17726,76 @@ pure func test_consumed_parameter_owner_outlives_borrowed_match_payload_retain()
 			False
 
 
+pure func nested_consumed_owner_match_is_balanced(with_length: Bool) -> Bool:
+	tag_type: CoreType = UnionType("Tag")
+	payload_type: CoreType = list_int_type()
+	env: PerceusEnv = { perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES) |
+		balance_strategy = BranchAwareOwnershipBalance
+	}
+	payload_binding: CoreMatchBinding = {
+		variable = named_var("payload"),
+		typ = payload_type,
+		accessor = VariantFieldAccessor(RootAccessor, "Tag", "Some", 0),
+		mode = MatchBorrowBindingMode,
+		needs_release = type_requires_release(payload_type)
+	}
+	borrow: CoreExpr = intrinsic_expr("list_len", [var_expr("payload", payload_type)], int_type())
+	literal_body: CoreConstructorMatchBody = constructor_literal_body(
+		[literal_case(IntLiteral(1), [], borrow)],
+		LiteralMatchFallbackBody(borrow),
+		int_type(),
+	)
+	nested_body: CoreConstructorMatchBody = if with_length:
+		constructor_length_body(
+			[{ length = 1, branch = constructor_length_branch([], literal_body) }],
+			None,
+			Some(constructor_length_branch([], ConstructorMatchBodyExpr(int_expr(0)))),
+			int_type(),
+		)
+	else:
+		literal_body
+
+	body: CoreExpr = constructor_match_expr(
+		[
+			constructor_case_body("Some", [payload_binding], nested_body),
+			constructor_case(
+				"Taken",
+				[],
+				user_call_expr("take_tag", None, [0], [var_expr("tag", tag_type)], int_type()),
+			),
+		],
+		int_expr(0),
+		int_type(),
+	)
+	balanced: CoreExpr = balance_branch_body(
+		env,
+		named_var("tag"),
+		tag_type,
+		1,
+		summarize_linear_ownership_uses(env, "tag", body),
+		body,
+	)
+	expected_drops: Int = if with_length:
+		4
+	else:
+		3
+
+	(
+		drop_count_for("tag", balanced) == expected_drops
+		and dup_count_for("tag", balanced) == 0
+		and dup_count_for("payload", balanced) == 2
+		and drop_count_for("payload", balanced) == 2
+	)
+
+
+pure func test_nested_literal_consumed_owner_balances_payload_leaves() -> Bool:
+	nested_consumed_owner_match_is_balanced(False)
+
+
+pure func test_nested_length_consumed_owner_balances_payload_leaves() -> Bool:
+	nested_consumed_owner_match_is_balanced(True)
+
+
 pure func test_nested_aggregate_call_retains_borrowed_match_binding() -> Bool:
 	payload_type: CoreType = list_int_type()
 	span_type: CoreType = HeapRecordType("Span")
@@ -20051,6 +20124,14 @@ tests: TestSuite = {
 		(
 			"consumed parameter owner outlives borrowed match payload retain",
 			test_consumed_parameter_owner_outlives_borrowed_match_payload_retain,
+		),
+		(
+			"nested literal consumed owner balances payload leaves",
+			test_nested_literal_consumed_owner_balances_payload_leaves,
+		),
+		(
+			"nested length consumed owner balances payload leaves",
+			test_nested_length_consumed_owner_balances_payload_leaves,
 		),
 		(
 			"nested aggregate call retains borrowed match binding",

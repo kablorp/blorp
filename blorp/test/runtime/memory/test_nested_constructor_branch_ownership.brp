@@ -1,0 +1,134 @@
+import:
+	memory: get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+union BranchNode:
+	Tagged(Bool, List[Int])
+	Taken(List[Int])
+	Plain(List[Int])
+
+
+record StoredNode {
+	node: BranchNode
+}
+
+
+private pure func borrow_node(node: BranchNode) -> Int:
+	match node:
+		Tagged(_, payload):
+			payload.length()
+		Taken(payload):
+			payload.length()
+		Plain(payload):
+			payload.length()
+
+
+private pure func store_node(node: BranchNode) -> StoredNode:
+	{node = node}
+
+
+private pure func consume_node(node: BranchNode) -> Int:
+	borrow_node(store_node(node).node)
+
+
+--- The nested Bool test must balance the outer owner even though another
+--- constructor branch transfers that owner to store_node.
+private pure func inspect_node(node: BranchNode) -> Int:
+	match node:
+		Tagged(False, payload):
+			payload.length() + 10
+		Taken(_):
+			consume_node(node) + 20
+		_:
+			borrow_node(node) + 30
+
+
+private pure func consume_then_read_payload(node: BranchNode) -> Int:
+	match node:
+		Tagged(False, payload):
+			value = consume_node(node)
+			value + payload.length()
+		Taken(_):
+			consume_node(node)
+		_:
+			borrow_node(node)
+
+
+private pure func run_consume_then_read() -> Int:
+	consume_then_read_payload(
+		Tagged(
+			False,
+			[1, 2, 3],
+		),
+	)
+
+
+private pure func run_branch(branch: Int) -> Int:
+	payload: List[Int] = [1, 2, 3]
+
+	node: BranchNode = match branch:
+		0:
+			Tagged(False, payload)
+		1:
+			Tagged(True, payload)
+		2:
+			Taken(payload)
+		_:
+			Plain(payload)
+
+	inspect_node(node)
+
+
+private func branch_releases_owners(branch: Int, expected: Int) -> Bool:
+	reset_mem_stats()
+	value = run_branch(branch)
+	stats = get_mem_stats()
+	(
+		value == expected
+		and stats.memory_stats_active == 1
+		and stats.total_allocations > 0
+		and stats.total_allocations == stats.total_releases
+		and stats.current_objects == 0
+	)
+
+
+func test_nested_false_branch() -> Bool:
+	branch_releases_owners(0, 13)
+
+
+func test_nested_true_fallback() -> Bool:
+	branch_releases_owners(1, 33)
+
+
+func test_consuming_branch() -> Bool:
+	branch_releases_owners(2, 23)
+
+
+func test_borrowing_fallback() -> Bool:
+	branch_releases_owners(3, 33)
+
+
+func test_payload_survives_consuming_owner() -> Bool:
+	reset_mem_stats()
+	value = run_consume_then_read()
+	stats = get_mem_stats()
+	(
+		value == 6
+		and stats.memory_stats_active == 1
+		and stats.total_allocations > 0
+		and stats.total_allocations == stats.total_releases
+		and stats.current_objects == 0
+	)
+
+
+tests: TestSuite = {
+	description = "Nested constructor branch ownership",
+	tests = [
+		("nested false branch releases outer owner", test_nested_false_branch),
+		("nested true fallback releases outer owner", test_nested_true_fallback),
+		("consuming branch releases outer owner", test_consuming_branch),
+		("borrowing fallback releases outer owner", test_borrowing_fallback),
+		("payload survives consuming outer owner", test_payload_survives_consuming_owner),
+	]
+}
