@@ -2658,9 +2658,6 @@ long blorp_option_eq_string(void* a, void* b);
 long blorp_option_eq_float(void* a, void* b);
 
 // Collection equality — consuming (releases both args after comparison)
-long blorp_list_eq(void* a, void* b);
-long blorp_list_eq_string(void* a, void* b);
-long blorp_list_eq_float(void* a, void* b);
 long blorp_dict_eq(void* a, void* b);
 long blorp_dict_eq_string_value(void* a, void* b);
 long blorp_dict_eq_float_value(void* a, void* b);

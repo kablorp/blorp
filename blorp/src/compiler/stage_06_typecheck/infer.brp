@@ -1273,6 +1273,14 @@ private pure func infer_has_compiler_structural_equality(
 	)
 
 
+private pure func list_element_type_of(typ: SemanticType) -> Option[SemanticType]:
+	match typ:
+		SemanticNamedType("List", [element]):
+			Some(element)
+		_:
+			None
+
+
 private pure func infer_resolve_trait_obligation(
 	session: InferSession,
 	obligation: TraitObligation,
@@ -1280,11 +1288,24 @@ private pure func infer_resolve_trait_obligation(
 	if infer_has_compiler_structural_equality(session, obligation):
 		TraitObligationSatisfied
 	else:
-		match module_view_accepted_trait_implementation_authority(session.facts.module_view):
-			Some(authority):
-				accepted_resolve_trait_obligation(authority, session.env, obligation)
+		-- List equality is element-wise, so a List is Equatable exactly when
+		-- its element is. Resolving the element here, rather than through the
+		-- stdlib impl's bound, keeps enums (which only the module view can
+		-- identify) admissible as elements.
+		equatable_list_element = if obligation.trait_name == "Equatable":
+			list_element_type_of(obligation.obligation_type)
+		else:
+			None
+
+		match equatable_list_element:
+			Some(element):
+				infer_resolve_trait_obligation(session, trait_obligation(element, "Equatable"))
 			None:
-				env_resolve_trait_obligation(session.env, obligation)
+				match module_view_accepted_trait_implementation_authority(session.facts.module_view):
+					Some(authority):
+						accepted_resolve_trait_obligation(authority, session.env, obligation)
+					None:
+						env_resolve_trait_obligation(session.env, obligation)
 
 
 private pure func infer_find_unsatisfied_trait_obligation(
@@ -6431,10 +6452,28 @@ private pure func check_comparison_binary_op(
 				checked_type(next, TYPE_VOID)
 
 
+---
+Help text for a List whose equality fails because its element type is not
+Equatable; List equality compares elements with the element type's own ==.
+---
+private pure func equality_element_help(context: InferContext, typ: SemanticType) -> String:
+	match list_element_type_of(typ):
+		Some(element):
+			if type_satisfies_trait(context, element, "Equatable"):
+				""
+			else:
+				" (List equality compares elements with ==; add 'implements Equatable for " + type_to_string(
+					element,
+				) + "')"
+		_:
+			""
+
+
 private pure func check_equality_binary_op(
 	context: InferContext,
 	left_type: SemanticType,
 	right_type: SemanticType,
+	span: SourceLocation,
 ) -> CheckedType:
 	resolved_left = infer_resolve_alias(context, left_type)
 	resolved_right = infer_resolve_alias(context, right_type)
@@ -6472,11 +6511,12 @@ private pure func check_equality_binary_op(
 					if type_satisfies_trait(next_context, zonked_left, "Equatable"):
 						checked_type(next_context, TYPE_BOOL)
 					else:
-						next = infer_error(
+						next = infer_error_at(
 							next_context,
 							"Equality requires an implementation of Equatable for " + type_to_string(
 								zonked_left,
-							),
+							) + equality_element_help(next_context, zonked_left),
+							span,
 						)
 						checked_type(next, TYPE_VOID)
 		None:
@@ -6494,6 +6534,7 @@ private pure func check_binary_op(
 	op: ParsedBinaryOp,
 	left_type: SemanticType,
 	right_type: SemanticType,
+	span: SourceLocation,
 ) -> CheckedType:
 	if is_arithmetic_binary_op(op):
 		check_arithmetic_binary_op(context, op, left_type, right_type)
@@ -6508,9 +6549,9 @@ private pure func check_binary_op(
 			ParsedGreaterEqualOp:
 				check_comparison_binary_op(context, left_type, right_type)
 			ParsedEqualOp:
-				check_equality_binary_op(context, left_type, right_type)
+				check_equality_binary_op(context, left_type, right_type, span)
 			ParsedNotEqualOp:
-				check_equality_binary_op(context, left_type, right_type)
+				check_equality_binary_op(context, left_type, right_type, span)
 			_:
 				next = infer_error(context, "Unsupported binary operator")
 				checked_type(next, TYPE_VOID)
@@ -7841,7 +7882,7 @@ private pure func infer_binary_expr(
 	right_slot = numeric_operand_slot(op, right_semantic_type)
 	left_value_type = widening_value_type(left_slot)
 	right_value_type = widening_value_type(right_slot)
-	checked = check_binary_op(right_result.context, op, left_value_type, right_value_type)
+	checked = check_binary_op(right_result.context, op, left_value_type, right_value_type, span)
 	result_type = mod_result_type(op, left_semantic_type, right_semantic_type, checked.typ)
 	typed_left = typed_expr_with_slot(left_result.expr, left_slot)
 	typed_right = typed_expr_with_slot(right_result.expr, right_slot)

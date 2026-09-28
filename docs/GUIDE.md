@@ -2175,6 +2175,11 @@ implements Equatable for Vec2:
         a.x == b.x and a.y == b.y
 ```
 
+`List[T]` is `Equatable` exactly when `T` is: `==` compares lengths, then elements
+with the element type's own `==`, so lists of lists, options, and records with an
+`Equatable` implementation compare by value. Comparing `List[Point]` when `Point`
+has no `Equatable` implementation is a compile error.
+
 The standard library uses this extensively — `Vec2`, `Vec3`, `Radians`, `Degrees`, `Hz`, `Db`, and all sized numeric types define operators through traits. Builtin scalar implementations, including numeric arithmetic, `String` concatenation, and `Fixed` arithmetic, are ordinary trait implementations whose `builtin` bodies lower directly to native Core operations without a runtime trait call. See `standard_library/src/geometry.brp` and `standard_library/src/units.brp` for source-defined examples.
 
 ### Using Trait Bounds
