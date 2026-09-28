@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdarg.h>
@@ -5720,6 +5721,102 @@ static void blorp_fatal_invalid_runtime_length(const char* label, long len, long
     exit(1);
 }
 
+// Runtime-owned immortal strings for results that are fixed by the operation:
+// the empty string, "True"/"False", and every one-byte (ASCII) character.
+// Returning one shared static instead of allocating per call is safe for the
+// same reasons the compiler's BLORP_STATIC_STRING literal pool is (see
+// stage_10_backend/emit.brp):
+//   - an immortal refcount is never 1, so blorp_is_unique() is false and
+//     every in-place path (append, append_char/set_byte via
+//     blorp_string_ensure_capacity, blorp_string_cow, concat_consume's
+//     reuse) copies before writing;
+//   - retain/release only nudge the count inside the immortal range and
+//     never reach the free path, so returning a static as an owned result
+//     needs no retain (generated code returns pooled literals the same way).
+// Every object here has a compile-time static initializer: there is no lazy
+// initialization, so concurrent first use cannot race.
+//
+// Each storage type has blorp_String's exact prefix with a fixed-size data
+// array in place of the flexible one, and is read through blorp_String*,
+// again like the literal pool; the asserts below pin that layout.
+#define BLORP_STATIC_STRING_HEADER \
+    { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 }
+
+// Longest fixed word result stored below ("False").
+#define BLORP_STATIC_WORD_STRING_MAX_LEN 5
+
+typedef struct {
+    blorp_Object header;
+    long len;
+    long capacity;
+    char data[BLORP_STATIC_WORD_STRING_MAX_LEN + 1];
+} blorp_StaticWordString;
+
+typedef struct {
+    blorp_Object header;
+    long len;
+    long capacity;
+    char data[2];
+} blorp_StaticCharString;
+
+_Static_assert(offsetof(blorp_StaticWordString, len) == offsetof(blorp_String, len),
+               "static word string layout must match blorp_String");
+_Static_assert(offsetof(blorp_StaticWordString, capacity) == offsetof(blorp_String, capacity),
+               "static word string layout must match blorp_String");
+_Static_assert(offsetof(blorp_StaticWordString, data) == offsetof(blorp_String, data),
+               "static word string layout must match blorp_String");
+_Static_assert(offsetof(blorp_StaticCharString, len) == offsetof(blorp_String, len),
+               "static char string layout must match blorp_String");
+_Static_assert(offsetof(blorp_StaticCharString, capacity) == offsetof(blorp_String, capacity),
+               "static char string layout must match blorp_String");
+_Static_assert(offsetof(blorp_StaticCharString, data) == offsetof(blorp_String, data),
+               "static char string layout must match blorp_String");
+
+static blorp_StaticWordString blorp_static_empty_string_storage =
+    { BLORP_STATIC_STRING_HEADER, 0L, 0L, "" };
+static blorp_StaticWordString blorp_static_true_string_storage =
+    { BLORP_STATIC_STRING_HEADER, 4L, 4L, "True" };
+static blorp_StaticWordString blorp_static_false_string_storage =
+    { BLORP_STATIC_STRING_HEADER, 5L, 5L, "False" };
+
+// Code points below this are encoded as the single byte of the same value.
+#define BLORP_ASCII_CHAR_COUNT 128
+
+#define BLORP_STATIC_ASCII_CHAR(code) \
+    { BLORP_STATIC_STRING_HEADER, 1L, 1L, { (char)(code), '\0' } }
+#define BLORP_STATIC_ASCII_CHAR_ROW(base) \
+    BLORP_STATIC_ASCII_CHAR((base) + 0), BLORP_STATIC_ASCII_CHAR((base) + 1), \
+    BLORP_STATIC_ASCII_CHAR((base) + 2), BLORP_STATIC_ASCII_CHAR((base) + 3), \
+    BLORP_STATIC_ASCII_CHAR((base) + 4), BLORP_STATIC_ASCII_CHAR((base) + 5), \
+    BLORP_STATIC_ASCII_CHAR((base) + 6), BLORP_STATIC_ASCII_CHAR((base) + 7)
+
+// Indexed by code point: entry c holds the one-byte string for c.
+static blorp_StaticCharString blorp_static_ascii_char_strings[] = {
+    BLORP_STATIC_ASCII_CHAR_ROW(0),   BLORP_STATIC_ASCII_CHAR_ROW(8),
+    BLORP_STATIC_ASCII_CHAR_ROW(16),  BLORP_STATIC_ASCII_CHAR_ROW(24),
+    BLORP_STATIC_ASCII_CHAR_ROW(32),  BLORP_STATIC_ASCII_CHAR_ROW(40),
+    BLORP_STATIC_ASCII_CHAR_ROW(48),  BLORP_STATIC_ASCII_CHAR_ROW(56),
+    BLORP_STATIC_ASCII_CHAR_ROW(64),  BLORP_STATIC_ASCII_CHAR_ROW(72),
+    BLORP_STATIC_ASCII_CHAR_ROW(80),  BLORP_STATIC_ASCII_CHAR_ROW(88),
+    BLORP_STATIC_ASCII_CHAR_ROW(96),  BLORP_STATIC_ASCII_CHAR_ROW(104),
+    BLORP_STATIC_ASCII_CHAR_ROW(112), BLORP_STATIC_ASCII_CHAR_ROW(120),
+};
+_Static_assert(sizeof(blorp_static_ascii_char_strings) / sizeof(blorp_static_ascii_char_strings[0])
+                   == BLORP_ASCII_CHAR_COUNT,
+               "one static string per ASCII code point");
+
+#undef BLORP_STATIC_ASCII_CHAR_ROW
+#undef BLORP_STATIC_ASCII_CHAR
+
+static inline blorp_String* blorp_static_empty_string(void) {
+    return (blorp_String*)&blorp_static_empty_string_storage;
+}
+
+static inline blorp_String* blorp_static_bool_string(bool value) {
+    return value ? (blorp_String*)&blorp_static_true_string_storage
+                 : (blorp_String*)&blorp_static_false_string_storage;
+}
+
 static blorp_String* blorp_string_alloc_uninit(long len, long capacity) {
     if (len < 0 || capacity < len) {
         blorp_fatal_invalid_runtime_length("String", len, capacity);
@@ -5773,9 +5870,12 @@ blorp_String* blorp_string_create(const char* cstr) {
 }
 
 blorp_String* blorp_string_concat(const blorp_String* a, const blorp_String* b) {
-    if (!a && !b) return blorp_string_create("");
-    if (!a) return (blorp_String*)blorp_retain((void*)b);
-    if (!b) return (blorp_String*)blorp_retain((void*)a);
+    if (!a && !b) return blorp_static_empty_string();
+    // Joining with an empty operand is the other operand's value; share it.
+    if (!a || a->len == 0) {
+        return b ? (blorp_String*)blorp_retain((void*)b) : blorp_static_empty_string();
+    }
+    if (!b || b->len == 0) return (blorp_String*)blorp_retain((void*)a);
     long new_len = (long)blorp_checked_add((size_t)a->len, (size_t)b->len);
     blorp_String* result = blorp_string_alloc_uninit(new_len, new_len);
     memcpy(result->data, a->data, a->len);
@@ -5784,12 +5884,26 @@ blorp_String* blorp_string_concat(const blorp_String* a, const blorp_String* b) 
     return result;
 }
 
-// Consuming string concat: creates result, then releases both inputs.
+// Consuming string concat: takes ownership of both inputs and returns an
+// owned result (a fresh or reused buffer, or the non-empty input itself).
 // Used for string interpolation where all parts are temporaries.
 blorp_String* blorp_string_concat_consume(blorp_String* a, blorp_String* b) {
-    if (!a && !b) return blorp_string_create("");
+    if (!a && !b) return blorp_static_empty_string();
     if (!a) return b;  // Transfer b's ownership
     if (!b) return a;  // Transfer a's ownership
+    // An empty operand contributes nothing: move the other one's ownership
+    // out instead of copying it (a shared `a` would otherwise be copied).
+    if (b->len == 0) {
+        blorp_release(b);
+        return a;
+    }
+    // A unique empty `a` with room for `b` is a reserved buffer
+    // (`string(n) + ...`); keep filling it in place below so the reserved
+    // capacity carries into later concatenations.
+    if (a->len == 0 && !(blorp_is_unique(a) && a->capacity >= b->len)) {
+        blorp_release(a);
+        return b;
+    }
     long new_len = (long)blorp_checked_add((size_t)a->len, (size_t)b->len);
     // Optimization: reuse a in-place if uniquely owned and has capacity
     if (blorp_is_unique(a) && a->capacity >= new_len) {
@@ -5820,20 +5934,27 @@ blorp_String* blorp_string_concat_many(long count, ...) {
     // First pass: compute total length
     va_start(args, count);
     size_t total = 0;
+    long non_empty_parts = 0;
+    blorp_String* only_non_empty = NULL;
     for (long i = 0; i < count; i++) {
         blorp_String* s = va_arg(args, blorp_String*);
-        if (s) total = blorp_checked_add(total, (size_t)s->len);
+        if (s && s->len > 0) {
+            total = blorp_checked_add(total, (size_t)s->len);
+            non_empty_parts++;
+            only_non_empty = s;
+        }
     }
     va_end(args);
-    if (total == 0) {
-        // Release all inputs
+    if (non_empty_parts <= 1) {
+        // The result is "" or exactly one part's text: release every other
+        // input and move that part's ownership out instead of copying it.
         va_start(args, count);
         for (long i = 0; i < count; i++) {
             blorp_String* s = va_arg(args, blorp_String*);
-            if (s) blorp_release(s);
+            if (s && s != only_non_empty) blorp_release(s);
         }
         va_end(args);
-        return blorp_string_create("");
+        return only_non_empty ? only_non_empty : blorp_static_empty_string();
     }
     // Allocate result
     if (total > (size_t)LONG_MAX) {
@@ -8315,7 +8436,7 @@ static blorp_unicode_case_mapping blorp_case_mapping_for_span(
 }
 
 static blorp_String* blorp_unicode_case_map(const blorp_String* s, bool upper) {
-    if (!s || s->len == 0) return blorp_string_create("");
+    if (!s || s->len == 0) return blorp_static_empty_string();
     if (blorp_string_is_ascii(s)) return blorp_ascii_case_map(s, upper);
 
     blorp_utf8_span* spans = (blorp_utf8_span*)blorp_malloc_checked(sizeof(blorp_utf8_span) * (size_t)s->len);
@@ -8378,6 +8499,10 @@ blorp_String* blorp_lower(const blorp_String* s) {
 
 
 blorp_String* blorp_from_char(int32_t c) {
+    // A one-byte character's string is fixed: share its immortal static.
+    if (c >= 0 && c < BLORP_ASCII_CHAR_COUNT) {
+        return (blorp_String*)&blorp_static_ascii_char_strings[c];
+    }
     unsigned char buf[4];
     int len = blorp_utf8_encode(c, buf);
     blorp_String* str = blorp_string_alloc_uninit(len, len);
@@ -8387,11 +8512,7 @@ blorp_String* blorp_from_char(int32_t c) {
 }
 
 blorp_String* blorp_from_chars(blorp_List* chars) {
-    if (!chars || chars->len == 0) {
-        blorp_String* empty = blorp_string_alloc_uninit(0, 0);
-        empty->data[0] = '\0';
-        return empty;
-    }
+    if (!chars || chars->len == 0) return blorp_static_empty_string();
     // Two-pass: compute total UTF-8 byte length, then encode
     size_t total_len = 0;
     for (long i = 0; i < chars->len; i++) {
@@ -8425,7 +8546,7 @@ static blorp_String* blorp_string_with_capacity(long cap) {
 }
 
 blorp_String* blorp_string_append(blorp_String* s, const blorp_String* other) {
-    if (!other || other->len == 0) return s ? s : blorp_string_create("");
+    if (!other || other->len == 0) return s ? s : blorp_static_empty_string();
     if (!s) s = blorp_string_with_capacity(other->len);
     bool append_self = s == other;
     long old_len = s->len;
@@ -8647,7 +8768,7 @@ blorp_String* blorp_read_line(void) {
 blorp_String* blorp_read_line_or_empty(void) {
     blorp_String* line = blorp_read_line_nullable();
     if (line) return line;
-    return blorp_string_alloc_uninit(0, 0);
+    return blorp_static_empty_string();
 }
 
 blorp_String* blorp_input(blorp_String* prompt) {
@@ -8794,12 +8915,12 @@ blorp_String* blorp_float16_to_string(_Float16 f) {
 #endif // __FLT16_MAX__
 
 blorp_String* blorp_bool_to_string(bool b) {
-    return blorp_string_create(b ? "True" : "False");
+    return blorp_static_bool_string(b);
 }
 
 // Long-taking wrapper for packed enum tensor to_string callback
 blorp_String* blorp_bool_to_string_long(long b) {
-    return blorp_string_create(b ? "True" : "False");
+    return blorp_static_bool_string(b != 0);
 }
 
 long blorp_to_int(blorp_String* s) {

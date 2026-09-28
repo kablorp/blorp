@@ -1,0 +1,259 @@
+-- Runtime string operations whose result is fixed ("", "True"/"False", a
+-- single ASCII character) return immortal static strings, and concatenation
+-- with an empty operand returns the other operand instead of copying it.
+-- These tests pin the values, the identity/immortality of those results, and
+-- that mutating a returned static never changes the shared static itself.
+import:
+	memory: MemStats, get_mem_stats, refcount, reset_mem_stats, same_object
+	string: append_char, append_int, codepoints, from_char, from_chars, lower, string, upper
+	test: TestSuite
+
+
+-- Every immortal object's count sits far above any real ARC count (the
+-- runtime keeps it at LONG_MAX / 2 and treats >= LONG_MAX / 4 as immortal).
+-- Anything at or above this floor cannot be an ordinary heap refcount.
+private IMMORTAL_REFCOUNT_FLOOR: Int = 1000000000000
+
+-- Calls per loop in the allocation checks; large enough that one allocation
+-- per call would be unmistakable next to the loop's fixed overhead.
+private ALLOCATION_LOOP_CALLS: Int = 1000
+
+-- Fixed allocation budget for a loop whose conversions no longer allocate.
+private ALLOCATION_LOOP_BUDGET: Int = 16
+
+
+pure func is_immortal(text: String) -> Bool:
+	refcount(text) >= IMMORTAL_REFCOUNT_FLOOR
+
+
+-- Deliberately impure so the compiler cannot fold the conversions below into
+-- compile-time literals; the values must reach the runtime functions.
+func runtime_flag(value: Int) -> Bool:
+	value > 0
+
+
+func runtime_char(text: String, index: Int) -> Char:
+	text
+		.codepoints()
+		.get_or(index, 63)
+		.to_char()
+
+
+func runtime_empty_text(seed: Int) -> String:
+	var chars: List[Char] = []
+
+	if seed < 0:
+		chars = chars.append('x')
+
+	from_chars(chars)
+
+
+func runtime_heap_text(seed: Int) -> String:
+	var text: String = string(8)
+	text += "heap"
+	text = text.append_int(seed)
+	text
+
+
+func test_bool_to_string_returns_shared_statics() -> Bool:
+	yes: String = runtime_flag(1).to_string()
+	yes_again: String = runtime_flag(2).to_string()
+	no: String = runtime_flag(0).to_string()
+	no_again: String = runtime_flag(-1).to_string()
+
+	(
+		yes == "True"
+		and no == "False"
+		and is_immortal(yes)
+		and is_immortal(no)
+		and same_object(yes, yes_again)
+		and same_object(no, no_again)
+	)
+
+
+func test_ascii_from_char_returns_shared_statics() -> Bool:
+	letter: String = from_char(runtime_char("abc", 0))
+	letter_again: String = runtime_char("xa", 1).to_string()
+	nul: String = from_char((runtime_char("a", 0).to_int() - 97).to_char())
+	delete: String = from_char((runtime_char("a", 0).to_int() + 30).to_char())
+
+	(
+		letter == "a"
+		and letter.length() == 1
+		and is_immortal(letter)
+		and same_object(letter, letter_again)
+		and nul.length() == 1
+		and is_immortal(nul)
+		and delete.length() == 1
+		and is_immortal(delete)
+		and delete.codepoints() == [127]
+	)
+
+
+func test_non_ascii_from_char_stays_heap_and_correct() -> Bool:
+	e_acute: String = from_char(runtime_char("é", 0))
+	cjk: String = from_char(runtime_char("世", 0))
+	emoji: String = from_char(runtime_char("😀", 0))
+	first_non_ascii: String = from_char((runtime_char("a", 0).to_int() + 31).to_char())
+
+	(
+		e_acute == "é"
+		and e_acute.length() == 2
+		and not is_immortal(e_acute)
+		and cjk == "世"
+		and cjk.length() == 3
+		and emoji == "😀"
+		and emoji.length() == 4
+		and first_non_ascii.length() == 2
+		and not is_immortal(first_non_ascii)
+	)
+
+
+func test_empty_results_are_static() -> Bool:
+	empty_chars: String = runtime_empty_text(1)
+	empty_upper: String = upper(runtime_empty_text(2))
+	empty_lower: String = lower(runtime_empty_text(3))
+
+	(
+		empty_chars == ""
+		and empty_upper == ""
+		and empty_lower == ""
+		and is_immortal(empty_chars)
+		and is_immortal(empty_upper)
+		and is_immortal(empty_lower)
+	)
+
+
+func test_concat_with_empty_operand_returns_other_operand() -> Bool:
+	text: String = runtime_heap_text(7)
+	empty: String = runtime_empty_text(4)
+	right_empty: String = text + empty
+	left_empty: String = empty + text
+	both_empty: String = empty + runtime_empty_text(5)
+	interpolated: String = "${empty}${text}${empty}"
+
+	(
+		right_empty == "heap7"
+		and left_empty == "heap7"
+		and interpolated == "heap7"
+		and both_empty == ""
+		and same_object(right_empty, text)
+		and same_object(left_empty, text)
+		and same_object(interpolated, text)
+	)
+
+
+-- Two-part interpolation lowers to the consuming concat.
+func test_consuming_concat_with_empty_operand() -> Bool:
+	text: String = runtime_heap_text(3)
+	empty: String = runtime_empty_text(6)
+	empty_first: String = "${empty}${text}"
+	empty_second: String = "${text}${empty}"
+	both_empty: String = "${empty}${runtime_empty_text(7)}"
+
+	-- A reserved empty buffer is filled in place rather than replaced.
+	reserved_first: String = "${string(32)}${text}"
+
+	var accumulated: String = runtime_empty_text(8)
+	accumulated += runtime_heap_text(1)
+	accumulated += runtime_empty_text(9)
+	accumulated += runtime_heap_text(2)
+
+	(
+		empty_first == "heap3"
+		and empty_second == "heap3"
+		and both_empty == ""
+		and reserved_first == "heap3"
+		and same_object(empty_first, text)
+		and same_object(empty_second, text)
+		and not same_object(reserved_first, text)
+		and accumulated == "heap1heap2"
+	)
+
+
+-- Appending to a returned static must copy first and leave the static intact.
+func test_mutating_returned_statics_leaves_statics_unchanged() -> Bool:
+	var from_empty: String = runtime_empty_text(8)
+	from_empty = from_empty.append_char('z')
+	from_empty += "!"
+
+	var from_letter: String = from_char(runtime_char("q", 0))
+	from_letter = from_letter.append_char('r')
+	from_letter = from_letter.append_int(5)
+	from_letter += "s"
+
+	var from_bool: String = runtime_flag(1).to_string()
+	from_bool += "ish"
+	from_bool = from_bool.append_char('?')
+
+	var reserved: String = from_char(runtime_char("w", 0)).reserve(64)
+	reserved = reserved.append_char('x')
+
+	fresh_empty: String = runtime_empty_text(9)
+	fresh_letter: String = from_char(runtime_char("q", 0))
+	fresh_bool: String = runtime_flag(1).to_string()
+	fresh_w: String = from_char(runtime_char("w", 0))
+
+	(
+		from_empty == "z!"
+		and from_letter == "qr5s"
+		and from_bool == "Trueish?"
+		and reserved == "wx"
+		and fresh_empty == ""
+		and fresh_empty.length() == 0
+		and fresh_letter == "q"
+		and fresh_letter.length() == 1
+		and fresh_bool == "True"
+		and fresh_w == "w"
+		and is_immortal(fresh_empty)
+		and is_immortal(fresh_letter)
+		and is_immortal(fresh_bool)
+	)
+
+
+func test_bool_and_char_conversions_do_not_allocate() -> Bool:
+	reset_mem_stats()
+	var total_length: Int = 0
+	var i: Int = 0
+
+	while i < ALLOCATION_LOOP_CALLS:
+		flag_text: String = runtime_flag(i % 2).to_string()
+		char_text: String = from_char((65 + i % 26).to_char())
+		total_length += flag_text.length() + char_text.length()
+		i += 1
+
+	stats: MemStats = get_mem_stats()
+	expected_length: Int = ALLOCATION_LOOP_CALLS / 2 * (4 + 5) + ALLOCATION_LOOP_CALLS
+
+	(
+		total_length == expected_length
+		and stats.memory_stats_active == 1
+		and stats.total_allocations < ALLOCATION_LOOP_BUDGET
+	)
+
+
+tests: TestSuite = {
+	description = "String Static Results",
+	tests = [
+		("bool to_string returns shared statics", test_bool_to_string_returns_shared_statics),
+		("ascii from_char returns shared statics", test_ascii_from_char_returns_shared_statics),
+		(
+			"non-ascii from_char stays heap and correct",
+			test_non_ascii_from_char_stays_heap_and_correct,
+		),
+		("empty results are static", test_empty_results_are_static),
+		(
+			"concat with empty operand returns other operand",
+			test_concat_with_empty_operand_returns_other_operand,
+		),
+		("consuming concat with empty operand", test_consuming_concat_with_empty_operand),
+		(
+			"mutating returned statics leaves statics unchanged",
+			test_mutating_returned_statics_leaves_statics_unchanged,
+		),
+		(
+			"bool and char conversions do not allocate",
+			test_bool_and_char_conversions_do_not_allocate,
+		),
+	]
+}
