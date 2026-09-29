@@ -54,6 +54,7 @@ module inventory lives in
 - [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
   plan for publishing each stage's facts as id-keyed tables (module,
   name, definition tables) and removing threaded state from typecheck.
+- [`NAME_ID_ROADMAP.md`](NAME_ID_ROADMAP.md) — names become ids: Lane A (identifier text to `NameId` then `Int`, identical C) and Lane B (emission spelled from definition and binder ids, smaller C); the one tracked plan for the name-to-id work, superseding the catalog's task order.
 - [`CORE_NODE_TABLE_ROADMAP.md`](CORE_NODE_TABLE_ROADMAP.md) — Core expressions get node ids and facts move into published id-keyed tables; steps N1-N6 (compact locations first), each with ROI, risks, oracle.
 - [`TYPE_INTERNING_ROADMAP.md`](TYPE_INTERNING_ROADMAP.md) — one type table per compilation, identity equality, mono and trait keys by type id, names last; steps I1-I7; extends Frontend Facts T3/T5/T6.
 - [`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) — struct values inline in union payloads and closures (typed payload storage for source unions), then hot records become structs; steps S0-S5.
