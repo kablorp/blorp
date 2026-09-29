@@ -30,6 +30,7 @@ import:
 			UserCall,
 		),
 		CoreConcurrentBinding,
+		CoreDeclaredOrigin(MonoInstance),
 		CoreDecl(
 			EnumDecl,
 			FunctionDecl,
@@ -106,6 +107,7 @@ import:
 		CoreType(EnumType, FunctionType, NamedType, TensorType, UnionType),
 		CoreVar,
 		core_expr_type,
+		core_function_declared_origin,
 	mono: core_mono_type_equal
 	set as Sets
 	synth_name: mono_name_base, strip_pure_suffix
@@ -174,14 +176,39 @@ private union ResolveGlobalLogicalTask:
 	RebuildResolvedGlobalLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
 
 
+---
+Where a callable target came from, as far as call resolution cares.
+
+`CoreMonoInstanceCallableTarget` is a function whose declared origin is
+`MonoInstance`. Mono created it from one call site's argument types and then
+pointed that call at it by id, so a call that selects its id already agrees
+with its signature by construction; resolution does not re-check it. Every
+other target is `CoreSourceCallableTarget` and keeps the signature check,
+because its id may have been selected by the frontend against a different
+overload.
+---
+private enum CoreCallableTargetProvenance:
+	CoreSourceCallableTarget
+	CoreMonoInstanceCallableTarget
+
+
 private record CoreCallableTarget {
 	name: String,
 	def_id: Int,
 	is_pure: Bool,
 	params: List[CoreType],
 	return_type: CoreType,
-	resolution: CoreCallableTargetResolution
+	resolution: CoreCallableTargetResolution,
+	provenance: CoreCallableTargetProvenance
 }
+
+
+private pure func callable_target_provenance(function_info: CoreFunction) -> CoreCallableTargetProvenance:
+	match core_function_declared_origin(function_info.origin):
+		MonoInstance(_, _):
+			CoreMonoInstanceCallableTarget
+		_:
+			CoreSourceCallableTarget
 
 
 private union CoreCallableTargetResolution:
@@ -401,7 +428,8 @@ private pure func callable_target(
 		is_pure = function_info.is_pure,
 		params = function_info.params.map(func(param): param.typ),
 		return_type = function_info.return_type,
-		resolution = resolution
+		resolution = resolution,
+		provenance = callable_target_provenance(function_info)
 	}
 
 
@@ -757,7 +785,8 @@ private pure func collect_call_resolve_env(
 									is_pure = method.is_pure,
 									params = method.params.map(func(param): param.typ),
 									return_type = method.return_type,
-									resolution = CoreUserCallableTarget
+									resolution = CoreUserCallableTarget,
+									provenance = callable_target_provenance(method)
 								}
 								user_functions = user_functions.set(target.name, target)
 
@@ -1277,12 +1306,29 @@ private pure func callable_call_by_id(
 	else:
 		match env.callable_targets_by_id.get(id):
 			Some(target):
-				if selected_signature_matches(target, callee, args):
+				if callable_target_accepts_call(target, callee, args):
 					Some(callable_target_call_kind(target))
 				else:
 					None
 			None:
 				None
+
+
+---
+Whether the target selected by id accepts this call. A mono instance is
+trusted (see `CoreCallableTargetProvenance`); any other target must match the
+call's argument and return types.
+---
+private pure func callable_target_accepts_call(
+	target: CoreCallableTarget,
+	callee: CoreExpr,
+	args: List[CoreExpr],
+) -> Bool:
+	match target.provenance:
+		CoreMonoInstanceCallableTarget:
+			True
+		CoreSourceCallableTarget:
+			selected_signature_matches(target, callee, args)
 
 
 private pure func exact_import_call(
