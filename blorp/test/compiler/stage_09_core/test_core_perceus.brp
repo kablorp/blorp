@@ -135,6 +135,21 @@ import:
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
 		CoreUnionRepresentation(GenericUnionRepresentation),
 		CoreUnionVariant,
+		CoreBinderOrigin(AuthoredBinder, DerivedFrom, PerceusBorrowedResultTemporary, PerceusTemporary),
+		DerivedTempKind(AssignTemp, ClosureDropTemp, DropTemp),
+		PerceusBorrowedResultKind(BorrowedResultAlias, BorrowedResultCallArg, BorrowedResultEqualityArg),
+		PerceusTempKind(
+			PerceusBorrowArg,
+			PerceusBorrowCallee,
+			PerceusBorrowCastSource,
+			PerceusCowArg,
+			PerceusEqualityArg,
+			PerceusOwnedCastSource,
+			PerceusOwnedFieldOwner,
+			PerceusOwnedListGetSource,
+			PerceusOwnedResult,
+		),
+		perceus_temporary_binder_id,
 		CoreVar,
 		core_field_ref,
 		core_node_id_raw,
@@ -263,11 +278,35 @@ DEEP_CONSUMING_CALL_DEF_ID: Int = 70000
 DEEP_LOGICAL_EXPR_COUNT: Int = 2048
 
 
+-- The owners the borrowed-result fixtures name, in the order they are numbered:
+-- an owner's fixture id is its 1-based position, so ids are small, stable and
+-- collision-free without hashing the name. A name outside the list has id 0.
+private BORROWED_OWNER_FIXTURE_NAMES: List[String] = [
+	"left",
+	"right",
+	"owner",
+	"items",
+	"pair",
+	"value",
+	"unrelated",
+	"item",
+]
+
+
+pure func borrowed_owner_fixture_id(name: String) -> Int:
+	match BORROWED_OWNER_FIXTURE_NAMES.index_of(name):
+		Some(position):
+			position + 1
+		None:
+			0
+
+
 pure func named_var(name: String) -> CoreVar:
 	{
 		name = name,
 		id = 0,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 
 
@@ -356,12 +395,14 @@ func test_ownership_events_preserve_branch_path_identity_type_and_policy() -> Bo
 	retained: CoreVar = {
 		name = "owner",
 		id = 7,
-		def_id = Some(41)
+		def_id = Some(41),
+		origin = AuthoredBinder
 	}
 	released: CoreVar = {
 		name = "owner",
 		id = 8,
-		def_id = Some(42)
+		def_id = Some(42),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = IfExpr(
 		bool_expr(True),
@@ -416,7 +457,8 @@ func test_perceus_preserves_incoming_ownership_nodes() -> Bool:
 	owner: CoreVar = {
 		name = "incoming_owner",
 		id = 3,
-		def_id = Some(73)
+		def_id = Some(73),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = DupExpr(
 		owner,
@@ -471,7 +513,8 @@ func test_ownership_event_projection_covers_every_policy() -> Bool:
 	owner: CoreVar = {
 		name = "policy_owner",
 		id = 9,
-		def_id = Some(91)
+		def_id = Some(91),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = DupExpr(
 		owner,
@@ -544,7 +587,8 @@ pure func deep_managed_binding_var(index: Int) -> CoreVar:
 	{
 		name = "deep_${index}",
 		id = index + 1,
-		def_id = Some(DEEP_MANAGED_BINDING_DEF_ID_BASE + index)
+		def_id = Some(DEEP_MANAGED_BINDING_DEF_ID_BASE + index),
+		origin = AuthoredBinder
 	}
 
 
@@ -556,12 +600,21 @@ pure func core_param(name: String, typ: CoreType) -> CoreParam:
 	}
 
 
+-- A borrowed-owner parameter with a registry id (`borrowed_owner_fixture_id`): Perceus keys a borrowed
+-- result temporary on its owner's id, so two owners in one fixture need
+-- distinct ids where `core_param_with_id` leaves them all at 0.
+pure func core_owner_param_with_id(name: String, def_id: Int, typ: CoreType) -> CoreParam:
+	param: CoreParam = core_param_with_id(name, def_id, typ)
+	{ param | name = { param.name | id = borrowed_owner_fixture_id(name) } }
+
+
 pure func core_param_with_id(name: String, def_id: Int, typ: CoreType) -> CoreParam:
 	{
 		name = {
 			name = name,
 			id = 0,
-			def_id = Some(def_id)
+			def_id = Some(def_id),
+			origin = AuthoredBinder
 		},
 		typ = typ,
 		loc = synthetic_core_source_loc()
@@ -601,7 +654,8 @@ pure func global_decl(
 		name = {
 			name = name,
 			id = 0,
-			def_id = Some(def_id)
+			def_id = Some(def_id),
+			origin = AuthoredBinder
 		},
 		source_module = None,
 		typ = typ,
@@ -624,7 +678,8 @@ pure func mutable_global_decl(
 		name = {
 			name = name,
 			id = 0,
-			def_id = Some(def_id)
+			def_id = Some(def_id),
+			origin = AuthoredBinder
 		},
 		source_module = None,
 		typ = typ,
@@ -777,7 +832,8 @@ pure func var_expr_with_id(name: String, def_id: Int, typ: CoreType) -> CoreExpr
 		{
 			name = name,
 			id = 0,
-			def_id = Some(def_id)
+			def_id = Some(def_id),
+			origin = AuthoredBinder
 		},
 		typ,
 		synthetic_core_source_loc(),
@@ -1258,12 +1314,106 @@ pure func contract_is_none(contract: Option[OwnershipCallContract]) -> Bool:
 			True
 
 
+---
+Fixtures name a Perceus-created variable by the label its pre-projection spelling
+had (`__borrow_arg_0_1`, `$blorp$perceus$owned_result`, `__cdrop_xs`, ...). A
+temporary's name is now its projected C spelling, so the label is matched against
+the temporary's origin (kind, ordinal, owner id, anchor) instead. A label whose
+node part is not `0` names one node's temporary and is also matched against the
+temporary's id.
+---
+pure func temp_label_matches(variable: CoreVar, label: String) -> Bool:
+	if variable.name == label:
+		True
+	else:
+		match variable.origin:
+			PerceusTemporary(kind, ordinal):
+				perceus_label_matches(variable.id, kind, ordinal, label)
+			PerceusBorrowedResultTemporary(kind, _, owner_id):
+				borrowed_result_label_matches(kind, owner_id, label)
+			DerivedFrom(anchor_key, DropTemp, _):
+				label == "__cdrop_" + fixture_anchor_name(anchor_key)
+			DerivedFrom(anchor_key, ClosureDropTemp, _):
+				label == "__cdrop_" + fixture_anchor_name(anchor_key)
+			DerivedFrom(anchor_key, AssignTemp, ordinal):
+				label == "__assign_" + fixture_anchor_name(anchor_key) + "_0_" + ordinal.to_string()
+			_:
+				False
+
+
+-- A fixture anchor is a plain `named_var` (id 0), whose key is `z<name>`.
+pure func fixture_anchor_name(anchor_key: String) -> String:
+	anchor_key.drop_left(1)
+
+
+pure func perceus_label_matches(id: Int, kind: PerceusTempKind, ordinal: Int, label: String) -> Bool:
+	if label == "$blorp$perceus$owned_result":
+		kind == PerceusOwnedResult
+	else:
+		parts: List[String] = label.split("_")
+		count: Int = parts.length()
+		node: String = parts.get(count - 2).get_or("")
+		index: String = parts.get(count - 1).get_or("")
+		stem: String = label.substring(0, label.length() - node.length() - index.length() - 2)
+		node_matches: Bool = node == "0" or node == id.to_string()
+
+		node_matches and index == ordinal.to_string() and perceus_stem_kind(stem) == Some(kind)
+
+
+pure func perceus_stem_kind(stem: String) -> Option[PerceusTempKind]:
+	if stem == "__borrow_arg":
+		Some(PerceusBorrowArg)
+	else if stem == "__borrow_callee":
+		Some(PerceusBorrowCallee)
+	else if stem == "__borrow_cast_source":
+		Some(PerceusBorrowCastSource)
+	else if stem == "__owned_cast_source":
+		Some(PerceusOwnedCastSource)
+	else if stem == "__owned_field_owner":
+		Some(PerceusOwnedFieldOwner)
+	else if stem == "__owned_list_get_source":
+		Some(PerceusOwnedListGetSource)
+	else if stem == "__cow_arg":
+		Some(PerceusCowArg)
+	else if stem == "__equality_arg":
+		Some(PerceusEqualityArg)
+	else:
+		None
+
+
+-- `__borrowed_result_<owner>[_call_arg|_equality_arg]_<node>_<index>` (the
+-- alias form carries only one trailing number). The owner is identified by its
+-- fixture id: `core_owner_param_with_id` numbers it from the registry
+-- (`borrowed_owner_fixture_id`); a plain `named_var` owner has id 0.
+pure func borrowed_result_label_matches(kind: PerceusBorrowedResultKind, owner_id: Int, label: String) -> Bool:
+	if not label.starts_with("__borrowed_result_"):
+		False
+	else:
+		var stem: String = label.drop_left(18)
+		var expected_kind: PerceusBorrowedResultKind = BorrowedResultAlias
+
+		if stem.contains("_call_arg_"):
+			expected_kind = BorrowedResultCallArg
+			stem = stem.split("_call_arg_").get(0).get_or("")
+		else if stem.contains("_equality_arg_"):
+			expected_kind = BorrowedResultEqualityArg
+			stem = stem.split("_equality_arg_").get(0).get_or("")
+		else:
+			parts: List[String] = stem.split("_")
+			stem = parts.take(parts.length() - 1).join("_")
+
+			if parts.length() >= 3 and parts.get(parts.length() - 2).get_or("x") == "0":
+				stem = parts.take(parts.length() - 2).join("_")
+
+		kind == expected_kind and (owner_id == 0 or owner_id == borrowed_owner_fixture_id(stem))
+
+
 pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 	match expr:
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			nested: Int = drop_count_for(name, body)
 
-			if variable.name == name:
+			if temp_label_matches(variable, name):
 				nested + 1
 			else:
 				nested
@@ -1489,7 +1639,7 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			nested: Int = dup_count_for(name, body)
 
-			if variable.name == name:
+			if temp_label_matches(variable, name):
 				nested + 1
 			else:
 				nested
@@ -6561,7 +6711,8 @@ pure func test_count_uses_flattened_detach_payloads() -> Bool:
 					name = "x",
 					id = 0,
 					typ = string_type(),
-					kind = TaskCopyCapture
+					kind = TaskCopyCapture,
+					origin = AuthoredBinder
 				},
 			],
 			return_type = void_type()
@@ -6685,12 +6836,14 @@ pure func test_prepared_list_retain_does_not_own_shadowed_assignment_result() ->
 	retained_elem: CoreVar = {
 		name = "elem",
 		id = 1,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 	shadowed_elem: CoreVar = {
 		name = "elem",
 		id = 2,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 	retained: CoreExpr = ListRetainExpr(
 		{
@@ -7114,7 +7267,8 @@ pure func test_deep_used_managed_let_chain_transfers_without_stack_growth() -> B
 		variable: CoreVar = {
 			name = "deep_used_${index}",
 			id = index + 1,
-			def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + index)
+			def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + index),
+			origin = AuthoredBinder
 		}
 		expr = LetExpr(
 			variable,
@@ -7143,7 +7297,8 @@ pure func test_deep_used_managed_let_chain_transfers_without_stack_growth() -> B
 				expected_variable: CoreVar = {
 					name = "deep_used_${expected_index}",
 					id = expected_index + 1,
-					def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + expected_index)
+					def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + expected_index),
+					origin = AuthoredBinder
 				}
 
 				match body:
@@ -7173,7 +7328,8 @@ pure func test_deep_call_consumed_managed_let_chain_transfers_without_stack_grow
 		variable: CoreVar = {
 			name = "deep_call_consumed_${index}",
 			id = index + 1,
-			def_id = Some(DEEP_CALL_CONSUMED_BINDING_DEF_ID_BASE + index)
+			def_id = Some(DEEP_CALL_CONSUMED_BINDING_DEF_ID_BASE + index),
+			origin = AuthoredBinder
 		}
 		expr = LetExpr(
 			variable,
@@ -7208,7 +7364,8 @@ pure func test_deep_call_consumed_managed_let_chain_transfers_without_stack_grow
 				expected_variable: CoreVar = {
 					name = "deep_call_consumed_${expected_index}",
 					id = expected_index + 1,
-					def_id = Some(DEEP_CALL_CONSUMED_BINDING_DEF_ID_BASE + expected_index)
+					def_id = Some(DEEP_CALL_CONSUMED_BINDING_DEF_ID_BASE + expected_index),
+					origin = AuthoredBinder
 				}
 
 				match body:
@@ -7240,7 +7397,8 @@ pure func test_deep_sequence_collects_distinct_resolved_values_without_quadratic
 		variable: CoreVar = {
 			name = "deep_sequence_${index}",
 			id = index + 1,
-			def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + index)
+			def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + index),
+			origin = AuthoredBinder
 		}
 		expr = SeqExpr(
 			VarExpr(variable, int_type(), synthetic_core_source_loc()),
@@ -7263,7 +7421,8 @@ pure func test_deep_sequence_collects_distinct_resolved_values_without_quadratic
 				expected_variable: CoreVar = {
 					name = "deep_sequence_${expected_index}",
 					id = expected_index + 1,
-					def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + expected_index)
+					def_id = Some(DEEP_USED_MANAGED_BINDING_DEF_ID_BASE + expected_index),
+					origin = AuthoredBinder
 				}
 				valid = exact_core_var_equal(variable, expected_variable)
 				sequence_count += 1
@@ -7452,12 +7611,14 @@ func test_logical_operands_rewrite_ownership_independently() -> Bool:
 	left: CoreVar = {
 		name = "logical_left",
 		id = 1,
-		def_id = Some(72001)
+		def_id = Some(72001),
+		origin = AuthoredBinder
 	}
 	right: CoreVar = {
 		name = "logical_right",
 		id = 2,
-		def_id = Some(72002)
+		def_id = Some(72002),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LogicalExpr(
 		AndOp,
@@ -7501,7 +7662,8 @@ pure func test_direct_consume_shortcut_rejects_additional_alias_argument() -> Bo
 	value: CoreVar = {
 		name = "aliased_consume",
 		id = 1,
-		def_id = Some(71001)
+		def_id = Some(71001),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		value,
@@ -7535,7 +7697,8 @@ pure func test_direct_consume_shortcut_rejects_multiple_consumes() -> Bool:
 	value: CoreVar = {
 		name = "twice_consumed",
 		id = 1,
-		def_id = Some(71003)
+		def_id = Some(71003),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		value,
@@ -7569,12 +7732,14 @@ pure func test_direct_consume_shortcut_counts_binding_rhs_consume() -> Bool:
 	value: CoreVar = {
 		name = "rhs_consumed",
 		id = 1,
-		def_id = Some(71005)
+		def_id = Some(71005),
+		origin = AuthoredBinder
 	}
 	result: CoreVar = {
 		name = "rhs_result",
 		id = 2,
-		def_id = Some(71006)
+		def_id = Some(71006),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		value,
@@ -7613,7 +7778,8 @@ pure func test_consuming_call_with_owned_result_preserves_result() -> Bool:
 	value: CoreVar = {
 		name = "owned_result_source",
 		id = 1,
-		def_id = Some(71008)
+		def_id = Some(71008),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		value,
@@ -7650,7 +7816,8 @@ pure func test_resolved_used_managed_let_transfers_without_drop() -> Bool:
 	resolved: CoreVar = {
 		name = "resolved_value",
 		id = 1,
-		def_id = Some(resolved_def_id)
+		def_id = Some(resolved_def_id),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		resolved,
@@ -7677,12 +7844,14 @@ pure func test_resolved_shadow_drops_only_outer_managed_let() -> Bool:
 	outer: CoreVar = {
 		name = "shadowed",
 		id = 1,
-		def_id = Some(outer_def_id)
+		def_id = Some(outer_def_id),
+		origin = AuthoredBinder
 	}
 	inner: CoreVar = {
 		name = "shadowed",
 		id = 2,
-		def_id = Some(inner_def_id)
+		def_id = Some(inner_def_id),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		outer,
@@ -7723,12 +7892,14 @@ pure func test_module_local_def_id_collision_preserves_outer_use() -> Bool:
 	outer: CoreVar = {
 		name = "module_a.outer",
 		id = 1,
-		def_id = Some(shared_module_local_def_id)
+		def_id = Some(shared_module_local_def_id),
+		origin = AuthoredBinder
 	}
 	inner: CoreVar = {
 		name = "module_b.inner",
 		id = 2,
-		def_id = Some(shared_module_local_def_id)
+		def_id = Some(shared_module_local_def_id),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		outer,
@@ -7769,12 +7940,14 @@ pure func test_hygienic_local_collision_preserves_outer_use() -> Bool:
 	outer: CoreVar = {
 		name = "value",
 		id = 1,
-		def_id = Some(shared_def_id)
+		def_id = Some(shared_def_id),
+		origin = AuthoredBinder
 	}
 	inner: CoreVar = {
 		name = "value",
 		id = 2,
-		def_id = Some(shared_def_id)
+		def_id = Some(shared_def_id),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		outer,
@@ -7814,12 +7987,14 @@ pure func test_definition_collision_in_same_hygienic_slot_preserves_distinct_use
 	binding: CoreVar = {
 		name = "value",
 		id = 1,
-		def_id = Some(30006)
+		def_id = Some(30006),
+		origin = AuthoredBinder
 	}
 	distinct_value: CoreVar = {
 		name = "value",
 		id = 1,
-		def_id = Some(30007)
+		def_id = Some(30007),
+		origin = AuthoredBinder
 	}
 	expr: CoreExpr = LetExpr(
 		binding,
@@ -7993,7 +8168,7 @@ pure func test_lambda_managed_parameter_field_return_is_retained() -> Bool:
 			match body:
 				BorrowLetExpr(temp, temp_type, rhs, retained):
 					(
-						temp.name == "__borrowed_result_item_0_0"
+						temp_label_matches(temp, "__borrowed_result_item_0_0")
 						and dup_count_for(temp.name, retained) == 1
 					)
 				_:
@@ -8024,7 +8199,8 @@ pure func test_lambda_catalog_retains_parameter_capture_and_exact_global() -> Bo
 	global_value: CoreVar = {
 		name = "GLOBAL_TEXT",
 		id = 0,
-		def_id = Some(global_def_id)
+		def_id = Some(global_def_id),
+		origin = AuthoredBinder
 	}
 	result_type: CoreType = TupleType([string_type(), string_type(), string_type()])
 	program: CoreProgram = {
@@ -8085,7 +8261,8 @@ pure func test_lambda_name_mode_capture_and_exact_global_retain_each_site_once()
 	exact_global: CoreVar = {
 		name = "shared",
 		id = 0,
-		def_id = Some(global_def_id)
+		def_id = Some(global_def_id),
+		origin = AuthoredBinder
 	}
 	result_type: CoreType = TupleType([string_type(), string_type()])
 	body: CoreExpr = TupleExpr(
@@ -8768,7 +8945,8 @@ pure func test_nullary_constructor_binding_is_not_retained() -> Bool:
 		{
 			name = "Leaf",
 			id = 0,
-			def_id = Some(41)
+			def_id = Some(41),
+			origin = AuthoredBinder
 		},
 		tree_type,
 		synthetic_core_source_loc(),
@@ -8801,7 +8979,8 @@ pure func test_projected_nullary_constructor_binding_is_not_retained() -> Bool:
 		{
 			name = projected_constructor_name,
 			id = 0,
-			def_id = Some(41)
+			def_id = Some(41),
+			origin = AuthoredBinder
 		},
 		tree_type,
 		synthetic_core_source_loc(),
@@ -8843,7 +9022,8 @@ pure func test_resolved_nonconstructor_with_constructor_name_is_retained() -> Bo
 		{
 			name = "Leaf",
 			id = 0,
-			def_id = Some(999)
+			def_id = Some(999),
+			origin = AuthoredBinder
 		},
 		tree_type,
 		synthetic_core_source_loc(),
@@ -8883,7 +9063,8 @@ pure func test_resolved_nonconstructor_with_constructor_id_is_retained() -> Bool
 		{
 			name = "branch",
 			id = 0,
-			def_id = Some(41)
+			def_id = Some(41),
+			origin = AuthoredBinder
 		},
 		tree_type,
 		synthetic_core_source_loc(),
@@ -10181,12 +10362,14 @@ func test_match_shadow_catalog_gate_matches_freshener_after_real_insertion() -> 
 	target: CoreVar = {
 		name = "value",
 		id = 0,
-		def_id = Some(9890)
+		def_id = Some(9890),
+		origin = AuthoredBinder
 	}
 	inner: CoreVar = {
 		name = "inner",
 		id = 0,
-		def_id = Some(9891)
+		def_id = Some(9891),
+		origin = AuthoredBinder
 	}
 	shadow_match: CoreExpr = constructor_match_expr(
 		[constructor_case(
@@ -10338,12 +10521,14 @@ pure func test_shadowed_match_binding_freshens_before_outer_owner_balance() -> B
 	outer_variable: CoreVar = {
 		name = "value",
 		id = 0,
-		def_id = Some(1398)
+		def_id = Some(1398),
+		origin = AuthoredBinder
 	}
 	match_variable: CoreVar = {
 		name = "value",
 		id = 0,
-		def_id = Some(1399)
+		def_id = Some(1399),
+		origin = AuthoredBinder
 	}
 	match_value: CoreMatchBinding = {
 		variable = match_variable,
@@ -12751,11 +12936,11 @@ pure func test_consuming_field_argument_gets_owned_alias() -> Bool:
 	match rewritten:
 		LetExpr(variable, False, typ, rhs, body):
 			(
-				variable.name == "__cow_arg_0_0"
+				temp_label_matches(variable, "__cow_arg_0_0")
 				and dup_count_for("$blorp$perceus$owned_result", rhs) == 1
 				and match body:
 					CallExpr(kind, callee, [VarExpr(arg, arg_type, arg_loc)], result_type, call_loc):
-						arg.name == "__cow_arg_0_0"
+						temp_label_matches(arg, "__cow_arg_0_0")
 					_:
 						False
 			)
@@ -12836,11 +13021,11 @@ pure func test_consuming_collection_equality_field_gets_owned_alias() -> Bool:
 	match rewritten:
 		LetExpr(variable, False, typ, rhs, body):
 			(
-				variable.name == "__equality_arg_0_0"
+				temp_label_matches(variable, "__equality_arg_0_0")
 				and dup_count_for("$blorp$perceus$owned_result", rhs) == 1
 				and match body:
 					BinaryExpr(EqualOp, VarExpr(arg, arg_type, arg_loc), right, typ, binary_loc):
-						arg.name == "__equality_arg_0_0"
+						temp_label_matches(arg, "__equality_arg_0_0")
 					_:
 						False
 			)
@@ -12851,8 +13036,8 @@ pure func test_consuming_collection_equality_field_gets_owned_alias() -> Bool:
 pure func test_multi_owner_conditional_call_argument_is_retained_once() -> Bool:
 	record_type: CoreType = HeapRecordType("Pair")
 	value_type: CoreType = list_int_type()
-	left: CoreParam = core_param_with_id("left", 2201, record_type)
-	right: CoreParam = core_param_with_id("right", 2202, record_type)
+	left: CoreParam = core_owner_param_with_id("left", 2201, record_type)
+	right: CoreParam = core_owner_param_with_id("right", 2202, record_type)
 	argument: CoreExpr = IfExpr(
 		bool_expr(True),
 		FieldExpr(
@@ -12903,8 +13088,8 @@ pure func test_multi_owner_conditional_call_argument_is_retained_once() -> Bool:
 pure func test_multi_owner_record_fields_are_retained_once_each() -> Bool:
 	owner_type: CoreType = HeapRecordType("BorrowOwner")
 	result_type: CoreType = HeapRecordType("BorrowPair")
-	left: CoreParam = core_param_with_id("left", 2210, owner_type)
-	right: CoreParam = core_param_with_id("right", 2211, owner_type)
+	left: CoreParam = core_owner_param_with_id("left", 2210, owner_type)
+	right: CoreParam = core_owner_param_with_id("right", 2211, owner_type)
 	body: CoreExpr = RecordConstructExpr(
 		"BorrowPair",
 		[
@@ -13204,10 +13389,10 @@ pure func test_computed_borrowed_result_terminals_find_second_owner_alias() -> B
 	value_type: CoreType = list_int_type()
 	list_value_type: CoreType = NamedType("List", [value_type])
 	tuple_type: CoreType = TupleType([value_type])
-	unrelated: CoreParam = core_param_with_id("unrelated", 2234, value_type)
-	pair: CoreParam = core_param_with_id("pair", 2222, tuple_type)
-	value: CoreParam = core_param_with_id("value", 2223, value_type)
-	items: CoreParam = core_param_with_id("items", 2224, list_value_type)
+	unrelated: CoreParam = core_owner_param_with_id("unrelated", 2234, value_type)
+	pair: CoreParam = core_owner_param_with_id("pair", 2222, tuple_type)
+	value: CoreParam = core_owner_param_with_id("value", 2223, value_type)
+	items: CoreParam = core_owner_param_with_id("items", 2224, list_value_type)
 	tuple_result: CoreExpr = TupleFieldExpr(
 		VarExpr(pair.name, tuple_type, synthetic_core_source_loc()),
 		0,
@@ -13317,7 +13502,8 @@ pure func test_result_binder_shadowing_uses_exact_definition_identity() -> Bool:
 	inner: CoreVar = {
 		name = "value",
 		id = 0,
-		def_id = Some(2230)
+		def_id = Some(2230),
+		origin = AuthoredBinder
 	}
 	body: CoreExpr = BorrowLetExpr(
 		inner,
@@ -13448,7 +13634,7 @@ pure func test_assignment_alias_rhs_becomes_owned() -> Bool:
 		AssignExpr(target, BorrowLetExpr(temp, typ, rhs, body), assign_type, loc):
 			(
 				target.name == "target"
-				and temp.name == "$blorp$perceus$owned_result"
+				and temp_label_matches(temp, "$blorp$perceus$owned_result")
 				and dup_count_for("$blorp$perceus$owned_result", body) == 1
 				and drop_count_for("$blorp$perceus$owned_result", body) == 0
 			)
@@ -14592,7 +14778,8 @@ pure func test_same_named_definition_is_not_retained_as_global() -> Bool:
 	local_reference: CoreVar = {
 		name = "GLOBAL_NAME",
 		id = 0,
-		def_id = Some(local_def_id)
+		def_id = Some(local_def_id),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [global_decl(
@@ -14624,12 +14811,14 @@ pure func test_global_retention_uses_definition_identity() -> Bool:
 	global_reference: CoreVar = {
 		name = "GLOBAL_NAME",
 		id = 0,
-		def_id = Some(global_def_id)
+		def_id = Some(global_def_id),
+		origin = AuthoredBinder
 	}
 	local_reference: CoreVar = {
 		name = "GLOBAL_NAME",
 		id = 0,
-		def_id = Some(local_def_id)
+		def_id = Some(local_def_id),
+		origin = AuthoredBinder
 	}
 	result_type: CoreType = TupleType([string_type(), string_type()])
 	program: CoreProgram = insert_drops_program({
@@ -14680,7 +14869,8 @@ pure func test_global_reference_identity_includes_qualified_name() -> Bool:
 	first_reference: CoreVar = {
 		name = first_name,
 		id = 0,
-		def_id = Some(shared_def_id)
+		def_id = Some(shared_def_id),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [global_decl(
@@ -14717,7 +14907,8 @@ pure func test_exact_global_reference_survives_same_name_ambiguity() -> Bool:
 	reference: CoreVar = {
 		name = global_name,
 		id = 0,
-		def_id = Some(referenced_id)
+		def_id = Some(referenced_id),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [global_decl(
@@ -14755,7 +14946,8 @@ pure func test_duplicate_exact_global_identity_is_retained_once() -> Bool:
 	reference: CoreVar = {
 		name = global_name,
 		id = 0,
-		def_id = Some(global_def_id)
+		def_id = Some(global_def_id),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [
@@ -14785,7 +14977,8 @@ pure func test_resolved_global_is_retained_under_same_named_parameter() -> Bool:
 	global_reference: CoreVar = {
 		name = "GLOBAL_NAME",
 		id = 0,
-		def_id = Some(global_def_id)
+		def_id = Some(global_def_id),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [global_decl(
@@ -14817,7 +15010,8 @@ pure func test_unmanaged_exact_parameter_collision_excludes_global_owner() -> Bo
 	shared_reference: CoreVar = {
 		name = shared_name,
 		id = 0,
-		def_id = Some(shared_def_id)
+		def_id = Some(shared_def_id),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [global_decl(
@@ -14849,7 +15043,8 @@ pure func test_consumed_exact_parameter_collision_excludes_global_owner() -> Boo
 	shared_reference: CoreVar = {
 		name = shared_name,
 		id = 0,
-		def_id = Some(shared_def_id)
+		def_id = Some(shared_def_id),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [global_decl(
@@ -14885,7 +15080,8 @@ pure func test_repeated_global_references_retain_each_transfer_site_once() -> Bo
 	global_reference: CoreVar = {
 		name = global_name,
 		id = 0,
-		def_id = Some(global_def_id)
+		def_id = Some(global_def_id),
+		origin = AuthoredBinder
 	}
 	result_type: CoreType = TupleType([string_type(), string_type()])
 	program: CoreProgram = insert_drops_program({
@@ -14931,7 +15127,8 @@ pure func test_global_initializer_excludes_self_and_retains_dependency() -> Bool
 		{
 			name = dependency_name,
 			id = 0,
-			def_id = Some(dependency_def_id)
+			def_id = Some(dependency_def_id),
+			origin = AuthoredBinder
 		},
 		string_type(),
 		synthetic_core_source_loc(),
@@ -14940,7 +15137,8 @@ pure func test_global_initializer_excludes_self_and_retains_dependency() -> Bool
 		{
 			name = initialized_name,
 			id = 0,
-			def_id = Some(initialized_def_id)
+			def_id = Some(initialized_def_id),
+			origin = AuthoredBinder
 		},
 		string_type(),
 		synthetic_core_source_loc(),
@@ -15005,7 +15203,8 @@ pure func test_global_initializer_retains_two_exact_dependencies() -> Bool:
 							{
 								name = first_name,
 								id = 0,
-								def_id = Some(first_def_id)
+								def_id = Some(first_def_id),
+								origin = AuthoredBinder
 							},
 							string_type(),
 							synthetic_core_source_loc(),
@@ -15014,7 +15213,8 @@ pure func test_global_initializer_retains_two_exact_dependencies() -> Bool:
 							{
 								name = second_name,
 								id = 0,
-								def_id = Some(second_def_id)
+								def_id = Some(second_def_id),
+								origin = AuthoredBinder
 							},
 							string_type(),
 							synthetic_core_source_loc(),
@@ -15074,7 +15274,8 @@ func test_parameter_phase_precedes_dense_exact_global_catalog() -> Bool:
 							{
 								name = shared_global_name,
 								id = 0,
-								def_id = Some(first_global_def_id)
+								def_id = Some(first_global_def_id),
+								origin = AuthoredBinder
 							},
 							string_type(),
 							synthetic_core_source_loc(),
@@ -15083,7 +15284,8 @@ func test_parameter_phase_precedes_dense_exact_global_catalog() -> Bool:
 							{
 								name = shared_global_name,
 								id = 0,
-								def_id = Some(second_global_def_id)
+								def_id = Some(second_global_def_id),
+								origin = AuthoredBinder
 							},
 							string_type(),
 							synthetic_core_source_loc(),
@@ -15154,7 +15356,8 @@ pure func test_alias_contract_correlates_exact_argument_identity() -> Bool:
 	same_named_other_owner: CoreVar = {
 		name = "value",
 		id = 0,
-		def_id = Some(1430)
+		def_id = Some(1430),
+		origin = AuthoredBinder
 	}
 	exact_reference: CoreExpr = VarExpr(param.name, list_string_type(), synthetic_core_source_loc())
 	call: CoreExpr = intrinsic_expr(
@@ -15178,7 +15381,8 @@ pure func test_exact_alias_contract_accepts_sequence_result() -> Bool:
 	other: CoreVar = {
 		name = "value",
 		id = 0,
-		def_id = Some(1440)
+		def_id = Some(1440),
+		origin = AuthoredBinder
 	}
 	argument: CoreExpr = SeqExpr(
 		VarExpr(other, list_string_type(), synthetic_core_source_loc()),
@@ -15202,7 +15406,8 @@ pure func test_exact_alias_contract_follows_let_alias() -> Bool:
 	local: CoreVar = {
 		name = "local_value",
 		id = 0,
-		def_id = Some(1442)
+		def_id = Some(1442),
+		origin = AuthoredBinder
 	}
 	argument: CoreExpr = LetExpr(
 		local,
@@ -15229,7 +15434,8 @@ pure func test_exact_alias_contract_follows_branch_result() -> Bool:
 	other: CoreVar = {
 		name = "other",
 		id = 0,
-		def_id = Some(1444)
+		def_id = Some(1444),
+		origin = AuthoredBinder
 	}
 	argument: CoreExpr = IfExpr(
 		LiteralExpr(BoolLiteral(True), bool_type(), synthetic_core_source_loc()),
@@ -15357,7 +15563,8 @@ pure func test_exact_alias_contract_follows_borrowed_match_binding() -> Bool:
 		variable = {
 			name = "payload",
 			id = 0,
-			def_id = Some(1450)
+			def_id = Some(1450),
+			origin = AuthoredBinder
 		},
 		typ = string_type(),
 		accessor = RootAccessor,
@@ -15399,7 +15606,8 @@ pure func test_exact_alias_contract_follows_resource_scope_result() -> Bool:
 			variable = {
 				name = "resource",
 				id = 0,
-				def_id = Some(1452)
+				def_id = Some(1452),
+				origin = AuthoredBinder
 			},
 			typ = string_type(),
 			acquire = LiteralExpr(StringLiteral("resource"), string_type(), synthetic_core_source_loc()),
@@ -15422,7 +15630,8 @@ pure func test_exact_alias_contract_recognizes_retained_wrapped_result() -> Bool
 	local: CoreVar = {
 		name = "local",
 		id = 0,
-		def_id = Some(1454)
+		def_id = Some(1454),
+		origin = AuthoredBinder
 	}
 	retained_sequence: CoreExpr = DupExpr(
 		param.name,
@@ -15490,7 +15699,8 @@ pure func test_exact_alias_contract_recognizes_retained_wrapped_result() -> Bool
 				variable = {
 					name = "resource",
 					id = 0,
-					def_id = Some(1455)
+					def_id = Some(1455),
+					origin = AuthoredBinder
 				},
 				typ = int_type(),
 				acquire = int_expr(0),
@@ -15669,7 +15879,8 @@ pure func test_managed_global_is_retained_when_stored_in_record() -> Bool:
 	global_name: CoreVar = {
 		name = "GLOBAL_NAME",
 		id = 0,
-		def_id = Some(214)
+		def_id = Some(214),
+		origin = AuthoredBinder
 	}
 	box_type: CoreType = HeapRecordType("NameBox")
 	program: CoreProgram = insert_drops_program({
@@ -15720,7 +15931,8 @@ pure func test_managed_global_is_retained_in_releasing_union_slot() -> Bool:
 	global_name: CoreVar = {
 		name = "GLOBAL_NAME",
 		id = 0,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 	box_type: CoreType = UnionType("NameBox")
 	program: CoreProgram = insert_drops_program({
@@ -15783,7 +15995,8 @@ pure func test_managed_global_is_retained_in_nested_record_union_payload() -> Bo
 	global_seed: CoreVar = {
 		name = "GLOBAL_SEED",
 		id = 0,
-		def_id = Some(219)
+		def_id = Some(219),
+		origin = AuthoredBinder
 	}
 	args_type: CoreType = HeapRecordType("RenderArgs")
 	op_type: CoreType = UnionType("RenderOp")
@@ -15865,7 +16078,8 @@ pure func test_managed_global_is_retained_in_record_passed_to_union_constructor(
 	global_seed: CoreVar = {
 		name = "GLOBAL_SEED",
 		id = 0,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 	args_type: CoreType = HeapRecordType("RenderArgs")
 	op_type: CoreType = UnionType("RenderOp")
@@ -15927,7 +16141,8 @@ pure func test_managed_global_in_length_match_branch_is_retained() -> Bool:
 	global_seed: CoreVar = {
 		name = "GLOBAL_SEED",
 		id = 0,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 	args_type: CoreType = HeapRecordType("RenderArgs")
 	op_type: CoreType = UnionType("RenderOp")
@@ -16012,7 +16227,8 @@ pure func test_mutable_managed_global_assignment_releases_previous_owner() -> Bo
 	global_state: CoreVar = {
 		name = "GLOBAL_STATE",
 		id = 0,
-		def_id = Some(216)
+		def_id = Some(216),
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [mutable_global_decl(
@@ -16070,7 +16286,8 @@ pure func test_mutable_global_lookup_uses_exact_colliding_identity() -> Bool:
 					{
 						name = shared_name,
 						id = 0,
-						def_id = Some(mutable_id)
+						def_id = Some(mutable_id),
+						origin = AuthoredBinder
 					},
 					LiteralExpr(
 						StringLiteral("next"),
@@ -16112,7 +16329,8 @@ pure func test_unresolved_assignment_resolves_unique_managed_global() -> Bool:
 	unresolved_state: CoreVar = {
 		name = "GLOBAL_STATE",
 		id = 0,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [mutable_global_decl(
@@ -16178,7 +16396,8 @@ pure func test_parameter_shadow_prevents_global_assignment_resolution() -> Bool:
 	unresolved_state: CoreVar = {
 		name = "GLOBAL_STATE",
 		id = 0,
-		def_id = None
+		def_id = None,
+		origin = AuthoredBinder
 	}
 	program: CoreProgram = insert_drops_program({
 		decls = [mutable_global_decl(
@@ -18775,8 +18994,8 @@ pure func test_synthetic_binding_names_differ_by_call_site_node_id() -> Bool:
 	match function_body(program, "call_read_twice"):
 		Some(body):
 			(
-				drop_count_for("__borrow_arg_${core_node_id_raw(first_loc)}_0", body) == 1
-				and drop_count_for("__borrow_arg_${core_node_id_raw(second_loc)}_0", body) == 1
+				drop_count_for("__borrow_arg_${perceus_temporary_binder_id(first_loc)}_0", body) == 1
+				and drop_count_for("__borrow_arg_${perceus_temporary_binder_id(second_loc)}_0", body) == 1
 			)
 		None:
 			False

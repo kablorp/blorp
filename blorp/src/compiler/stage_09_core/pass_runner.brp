@@ -5,6 +5,7 @@
 -- lists live with the stages they sequence (`early_pipeline`, `pipeline`), and
 -- this module only walks a list it is handed.
 import:
+	../stage_10_backend/c_naming: projected_temporary_spelling
 	../stage_02_lex/name_table: EMPTY_NAME_TABLE, NameTable, name_spelling_of_text
 	early_invariants:
 		CoreEarlyInvariantViolation,
@@ -45,6 +46,16 @@ import:
 			SemanticMatchLeaf,
 		),
 		CoreSourceLoc,
+		CoreBinderOrigin(
+			AuthoredBinder,
+			DerivedFrom,
+			LoweringTemporary,
+			PassTemporary,
+			PerceusBorrowedResultTemporary,
+			PerceusTemporary,
+		),
+		CORE_AUTHORED_BINDER_ID_CEILING,
+		MINTED_BINDER_ID_FLOOR,
 		CoreVar,
 		core_expr_own_node_id,
 		core_node_id_raw,
@@ -482,24 +493,44 @@ private pure func core_semantic_length_match_cases_identity_walk(
 
 
 ---
+Why a binder fails the identity contract, one case per rule so the message names
+the actual cause.
+---
+private union BinderIdentityFault:
+	-- An authored binder with no id: only a compiler temporary (or the discard
+	-- `_`) may have none, and it says so through its origin.
+	AuthoredBinderWithoutId(CoreVar)
+	-- A Perceus or derived temporary whose stored name is not the spelling its
+	-- (id, origin) recomputes to, so emission would print something else.
+	TemporaryNameOffItsOrigin(CoreVar, String)
+	-- A binder whose id lies outside the range its origin implies (see the id
+	-- ranges on `FIRST_MINTED_BINDER_ID` in ir.brp).
+	BinderIdOutsideOriginRange(CoreVar)
+
+
+private pure func binder_identity_fault_message(fault: BinderIdentityFault) -> String:
+	match fault:
+		AuthoredBinderWithoutId(variable):
+			"binder `${variable.name}` is authored but has no id"
+		TemporaryNameOffItsOrigin(variable, expected):
+			"temporary `${variable.name}` (id ${variable.id.to_string()}) is not the spelling its id and origin give, `${expected}`"
+		BinderIdOutsideOriginRange(variable):
+			"binder `${variable.name}` has id ${variable.id.to_string()}, outside the range its origin implies"
+
+
+---
 Core Identity Migration step 2 (docs/CORE_ID_MIGRATION.md): a debug-only
 contract, gated by `--check-invariants` like the frontier check above,
 run after every pass so the pass that mints an identity-breaking binder
 is named directly rather than surfacing later as a confusing Perceus (or
 other late-pipeline) failure.
 
-Rule chosen: two binders in one function must not share a `(name, id)`
-pair when BOTH have `id > 0` (`id = 0` is still the sentinel for "no
-identity yet" -- globals, callables, constructors, and the ~30 other
-passes' private, name-only `core_var(name)` helpers that step 5 converts,
-plus match bindings and `?=`'s bound name, which step 1 deliberately left
-at `id = 0` -- see the docstring on `lower_raw_match_cases` in
-lower.brp). Scoping to "no compiler-generated prefix" instead was
-considered and rejected: it would require this module to duplicate every
-prefix convention scattered across those ~30 helpers, and would still
-need the `id = 0` carve-out for match/`?=` bindings, which do carry a
-real source name. The `id > 0` rule is the simpler rule that already
-captures exactly what step 1 changed.
+Rule chosen: two binders in one function must not share a `(name, id)` pair
+when `id != 0`; minted binders (negative ids) are checked exactly like authored
+ones (positive ids), so a pass that reuses a minted id is named at once. `id = 0`
+remains the "no identity yet" sentinel for globals, callables, constructors and
+the passes' private name-only `core_var(name)` helpers, which later steps
+convert.
 
 A `VarExpr` is accepted when it names a binder with the same pair
 somewhere in the function, or when `def_id` is set (global, callable, or
@@ -513,6 +544,25 @@ binder whose pair collides with another, or drops/renames a binder a use
 still points at.
 ---
 private pure func core_pass_state_binder_identity_violation(
+	names: NameTable,
+	pass_name: String,
+	function_info: CoreFunction,
+	walk: CoreBinderIdentityWalk,
+) -> Option[CorePassDiagnostic]:
+	fault: Option[BinderIdentityFault] = core_binder_identity_first_fault(walk.binders)
+
+	match fault:
+		Some(found):
+			Some(
+				CorePassMessage(
+					"pass `${pass_name}` left function `${name_spelling_of_text(names, function_info.name)}` with a binder that breaks the identity contract: ${binder_identity_fault_message(found)}",
+				),
+			)
+		None:
+			core_pass_state_duplicate_or_unresolved_violation(names, pass_name, function_info, walk)
+
+
+private pure func core_pass_state_duplicate_or_unresolved_violation(
 	names: NameTable,
 	pass_name: String,
 	function_info: CoreFunction,
@@ -542,6 +592,78 @@ private pure func core_pass_state_binder_identity_violation(
 					)
 				None:
 					None
+
+
+---
+The first binder that breaks a per-binder rule of the identity contract: an
+authored binder must leave lowering with an id, a Perceus or derived temporary's
+name must equal the spelling its (id, origin) recomputes to, and an id must lie
+in the range its origin implies. This is what keeps a fallback spelling from
+hiding an authored binder again and a stored name from drifting from its origin.
+---
+private pure func core_binder_identity_first_fault(binders: List[CoreVar]) -> Option[BinderIdentityFault]:
+	var found: Option[BinderIdentityFault] = None
+
+	for candidate in binders:
+		if found.is_none():
+			found = binder_identity_fault(candidate)
+
+	found
+
+
+private pure func binder_identity_fault(variable: CoreVar) -> Option[BinderIdentityFault]:
+	match projected_temporary_spelling(variable):
+		Some(expected):
+			if variable.name != expected:
+				Some(TemporaryNameOffItsOrigin(variable, expected))
+			else if binder_id_in_origin_range(variable):
+				None
+			else:
+				Some(BinderIdOutsideOriginRange(variable))
+		None:
+			if binder_lacks_identity(variable):
+				Some(AuthoredBinderWithoutId(variable))
+			else if binder_id_in_origin_range(variable):
+				None
+			else:
+				Some(BinderIdOutsideOriginRange(variable))
+
+
+private pure func binder_lacks_identity(variable: CoreVar) -> Bool:
+	if variable.id != 0 or variable.def_id.is_some() or variable.name == "_":
+		False
+	else:
+		match variable.origin:
+			AuthoredBinder:
+				True
+			_:
+				False
+
+
+private pure func is_counter_minted_binder_id(id: Int) -> Bool:
+	id < 0 and id > MINTED_BINDER_ID_FLOOR
+
+
+---
+Whether `variable.id` is in the range its origin implies. An authored or lowering
+binder has a span-derived positive id (or a counter-minted one after a pass
+cloned it); a pass temporary has none yet (0), a counter-minted one, or one of
+the seeds above the authored range; a Perceus temporary's id is a negated node
+handle, below the counter's floor. A derived temporary reuses its anchor's id or
+a minted one, so it has no range of its own.
+---
+private pure func binder_id_in_origin_range(variable: CoreVar) -> Bool:
+	id: Int = variable.id
+
+	match variable.origin:
+		AuthoredBinder | LoweringTemporary(_):
+			id >= 0 or is_counter_minted_binder_id(id)
+		PassTemporary(_, _):
+			id == 0 or is_counter_minted_binder_id(id) or id >= CORE_AUTHORED_BINDER_ID_CEILING
+		PerceusTemporary(_, _) | PerceusBorrowedResultTemporary(_, _, _):
+			id <= MINTED_BINDER_ID_FLOOR
+		DerivedFrom(_, _, _):
+			True
 
 
 private pure func core_binder_identity_first_duplicate(binders: List[CoreVar]) -> Option[CoreVar]:
@@ -599,7 +721,7 @@ above), in program order. Pure: no printing or env lookup here, so the
 strict/report-only split below stays the only place that decides what to
 do with what this finds.
 ---
-private pure func core_pass_state_binder_identity_violations(
+pure func core_pass_state_binder_identity_violations(
 	names: NameTable,
 	pass_name: String,
 	program: CoreProgram,
@@ -625,7 +747,7 @@ private pure func core_pass_state_binder_identity_violations(
 							ClosureBodyFunction(abi):
 								abi.params
 									.map(pure func(param: CoreParam): param.name)
-									.concat(abi.captures.map(pure func(capture): { name = capture.name, id = capture.id, def_id = None }))
+									.concat(abi.captures.map(pure func(capture): { name = capture.name, id = capture.id, def_id = None, origin = capture.origin }))
 							_:
 								[]
 

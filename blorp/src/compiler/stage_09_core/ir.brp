@@ -768,6 +768,13 @@ private CORE_SOURCE_LOC_LINE_DELTA_BASE: Int = 8192
 private CORE_SOURCE_LOC_END_COLUMN_BASE: Int = 1024
 
 
+---
+Every packed handle is below this bound: it is the product of the field bases,
+which `pack_core_source_loc` enforces field by field.
+---
+CORE_SOURCE_LOC_HANDLE_BOUND: Int = CORE_SOURCE_LOC_MODULE_BASE * CORE_SOURCE_LOC_START_LINE_BASE * CORE_SOURCE_LOC_START_COLUMN_BASE * CORE_SOURCE_LOC_LINE_DELTA_BASE * CORE_SOURCE_LOC_END_COLUMN_BASE
+
+
 pure func synthetic_core_source_loc() -> CoreSourceLoc:
 	into_opaque CoreSourceLoc(0)
 
@@ -956,6 +963,143 @@ private SYNTHETIC_CORE_SOURCE_FILE: CoreSourceFile = { path = "", module_name = 
 
 
 ---
+Which pass or construct invented a Perceus temporary. The kind, with the
+ordinal and the owner the site supplies, is what tells two temporaries at one
+source node apart (see `CoreBinderOrigin`).
+---
+enum PerceusTempKind:
+	PerceusAggregateField
+	PerceusBorrowArg
+	PerceusBorrowCallee
+	PerceusBorrowCastSource
+	PerceusCowArg
+	PerceusEqualityArg
+	PerceusOwnedCastSource
+	PerceusOwnedFieldOwner
+	PerceusOwnedListGetSource
+	PerceusOwnedResult
+
+
+---
+The temporaries that protect a value a borrowed owner parameter can alias. They
+are a separate origin (`PerceusBorrowedResultTemporary`) because they alone carry
+the owner: two owners protected at one call argument share node, kind and
+ordinal, and the owner is what tells them apart.
+---
+enum PerceusBorrowedResultKind:
+	BorrowedResultAlias
+	BorrowedResultCallArg
+	BorrowedResultEqualityArg
+
+
+---
+What a pass derives from a variable it protects.
+---
+enum DerivedTempKind:
+	DropTemp
+	BorrowedView
+	AssignTemp
+	ClosureDropTemp
+
+
+---
+The passes whose synthesized binders are minted at creation.
+---
+enum PassTempKind:
+	SynthBodyTemp
+	EtaArgument
+	TupleSroaTemp
+	OptionFusionTemp
+	RecordUpdateTemp
+	SsaVersion
+	PipelineTemp
+	InlinedCalleeTemp
+	TensorViewTemp
+	ConsumeSpecializeTemp
+	MatchScrutineeTemp
+	TailrecTemp
+
+
+---
+Lowering's own temporaries, keyed off the construct's source span.
+---
+enum LoweringTempKind:
+	QuestionBindTemp
+	WithTemp
+	LoopTemp
+	TupleDestructTemp
+	RecordUpdateSpanTemp
+
+
+---
+Where a local's identity comes from. `id` alone identifies authored and
+counter-minted binders. A Perceus temporary shares its `id` with every other
+temporary at the same node (`perceus_temporary_binder_id`), so its identity is
+`(id, origin)`; a derived temporary reuses the id of the variable it protects
+(or a counter-minted one) and is told apart by its origin.
+
+INTERIM (docs/NAME_ID_ROADMAP.md, Interim states): for `PerceusTemporary`,
+`PerceusBorrowedResultTemporary` and `DerivedFrom` the `CoreVar.name` IS the
+projected C spelling, built once at creation by the two `c_naming` producers
+and passed through by emission; the identity contract requires it to equal the
+spelling recomputed from `(id, origin)`. It is deleted when Perceus carries
+threaded state and can mint dense binder ids, or when names become display-only
+(roadmap Phase 4).
+
+`DerivedFrom` holds the anchor's identity key (`derived_anchor_key`), not the
+anchor variable, so a derived temporary does not retain the anchor's record.
+---
+union CoreBinderOrigin:
+	AuthoredBinder
+	LoweringTemporary(LoweringTempKind)
+	PassTemporary(PassTempKind, Int)
+	PerceusTemporary(PerceusTempKind, Int)
+	PerceusBorrowedResultTemporary(PerceusBorrowedResultKind, Int, Int)
+	DerivedFrom(String, DerivedTempKind, Int)
+
+
+---
+One shared value per pass-temporary origin with ordinal 0: a union payload is
+boxed, so building `PassTemporary(kind, 0)` per binder allocates, while a
+constant is only retained.
+---
+SYNTH_BODY_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(SynthBodyTemp, 0)
+
+
+INLINED_CALLEE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(InlinedCalleeTemp, 0)
+
+
+CONSUME_SPECIALIZE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(ConsumeSpecializeTemp, 0)
+
+
+MATCH_SCRUTINEE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(MatchScrutineeTemp, 0)
+
+
+OPTION_FUSION_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(OptionFusionTemp, 0)
+
+
+RECORD_UPDATE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(RecordUpdateTemp, 0)
+
+
+SSA_VERSION_ORIGIN: CoreBinderOrigin = PassTemporary(SsaVersion, 0)
+
+
+TAILREC_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(TailrecTemp, 0)
+
+
+TENSOR_VIEW_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(TensorViewTemp, 0)
+
+
+ETA_ARGUMENT_ORIGIN: CoreBinderOrigin = PassTemporary(EtaArgument, 0)
+
+
+QUESTION_BIND_TEMP_ORIGIN: CoreBinderOrigin = LoweringTemporary(QuestionBindTemp)
+
+
+TUPLE_DESTRUCT_TEMP_ORIGIN: CoreBinderOrigin = LoweringTemporary(TupleDestructTemp)
+
+
+---
 The first id a pass mints for a binder it invents. Minted binder ids are the
 negative integers counting down from here; authored binders keep the
 positive id lowering gave them and `0` still means "no identity". A pass
@@ -963,8 +1107,41 @@ that needs `count` fresh binders reads `state.next_binder_id` as its base,
 gives its k-th binder the id `base - k`, and afterwards returns the state
 through `core_reserve_binder_ids` (pass_runner.brp), so no later pass hands the same id to a
 different binder in the same function.
+
+Id ranges (all disjoint):
+- authored binders: 1 up to `CORE_AUTHORED_BINDER_ID_CEILING` (a source-span
+  offset plus one), then lowering's SSA seed and per-construct bands above it;
+- counter-minted binders: `FIRST_MINTED_BINDER_ID` down to
+  `MINTED_BINDER_ID_FLOOR`, which the counter never reaches;
+- Perceus temporaries: `perceus_temporary_binder_id`, the negated packed node
+  handle for an authored node (strictly below `CORE_SOURCE_LOC_HANDLE_BOUND`,
+  so above `PERCEUS_MINTED_NODE_ID_BASE`), the base itself for the synthetic
+  location, and below it for a node a pass minted.
 ---
 FIRST_MINTED_BINDER_ID: Int = -1
+
+CORE_AUTHORED_BINDER_ID_CEILING: Int = 2147483648
+
+MINTED_BINDER_ID_FLOOR: Int = -4294967296
+
+PERCEUS_MINTED_NODE_ID_BASE: Int = 0 - CORE_SOURCE_LOC_HANDLE_BOUND
+
+
+---
+The id shared by every Perceus temporary created for the node at `loc`. An
+authored node's packed handle is at least 2^33 (module 0, line 1), strictly
+below `CORE_SOURCE_LOC_HANDLE_BOUND` and far above the counter's floor, so its negation cannot meet
+a counter-minted id; a minted node id `-k` lands `k` below
+`PERCEUS_MINTED_NODE_ID_BASE`; the shared synthetic location (handle 0) takes
+the base itself. Temporaries at one node differ by `CoreBinderOrigin`.
+---
+pure func perceus_temporary_binder_id(loc: CoreSourceLoc) -> Int:
+	raw: Int = core_node_id_raw(loc)
+
+	if raw > 0:
+		0 - raw
+	else:
+		PERCEUS_MINTED_NODE_ID_BASE + raw
 
 
 --- `id` is the binder identity within a function: positive for an authored
@@ -979,11 +1156,13 @@ FIRST_MINTED_BINDER_ID: Int = -1
 --- monomorphic instance call, `None`: the call kind is the single authority
 --- for the target, and an id on the variable too would keep the function
 --- alive when the call resolves to a runtime builtin. The early invariant
---- `SelectedCallDisagreesWithCalleeId` rejects `Some(other)`.
+--- `SelectedCallDisagreesWithCalleeId` rejects `Some(other)`. `origin` says
+--- how the binder came to exist (see `CoreBinderOrigin`).
 record CoreVar {
 	name: String,
 	id: Int,
-	def_id: Option[Int]
+	def_id: Option[Int],
+	origin: CoreBinderOrigin
 }
 
 
@@ -1516,7 +1695,8 @@ are not being converted to identity here.
 record CoreClosureCapture {
 	name: String,
 	id: Int,
-	typ: CoreType
+	typ: CoreType,
+	origin: CoreBinderOrigin
 }
 
 
@@ -2251,7 +2431,8 @@ record CoreTaskCapture {
 	name: String,
 	id: Int,
 	typ: CoreType,
-	kind: CoreTaskCaptureKind
+	kind: CoreTaskCaptureKind,
+	origin: CoreBinderOrigin
 }
 
 
@@ -3830,11 +4011,38 @@ private pure func decode_resolved_source_loc_json(
 
 
 pure func core_var_to_json(variable: CoreVar) -> JsonValue:
-	JsonObject([
-		("name", JsonString(variable.name)),
-		("id", json_int(variable.id)),
-		("def_id", option_int_to_json(variable.def_id)),
-	])
+	match variable.origin:
+		AuthoredBinder:
+			JsonObject([
+				("name", JsonString(variable.name)),
+				("id", json_int(variable.id)),
+				("def_id", option_int_to_json(variable.def_id)),
+			])
+		_:
+			JsonObject([
+				("name", JsonString(variable.name)),
+				("id", json_int(variable.id)),
+				("def_id", option_int_to_json(variable.def_id)),
+				("origin", JsonString(core_binder_origin_label(variable.origin))),
+			])
+
+
+--- A dump label for an origin. It is written for readers and is not decoded
+--- back: a decoded temporary keeps its name and id and is read as authored.
+private pure func core_binder_origin_label(origin: CoreBinderOrigin) -> String:
+	match origin:
+		AuthoredBinder:
+			"authored"
+		LoweringTemporary(_):
+			"lowering_temporary"
+		PassTemporary(_, ordinal):
+			"pass_temporary:" + ordinal.to_string()
+		PerceusTemporary(_, ordinal):
+			"perceus_temporary:" + ordinal.to_string()
+		PerceusBorrowedResultTemporary(_, ordinal, owner):
+			"perceus_borrowed_result_temporary:" + ordinal.to_string() + ":" + owner.to_string()
+		DerivedFrom(anchor_key, _, ordinal):
+			"derived_from:" + anchor_key + ":" + ordinal.to_string()
 
 
 pure func decode_core_var_json(value: JsonValue, path: String) -> Result[CoreVar, CoreJsonError]:
@@ -3846,6 +4054,7 @@ pure func decode_core_var_json(value: JsonValue, path: String) -> Result[CoreVar
 		name = name,
 		id = id,
 		def_id = def_id,
+		origin = AuthoredBinder
 	})
 
 
@@ -7584,6 +7793,7 @@ pure func decode_core_task_capture_json(
 		id = id,
 		typ = typ,
 		kind = kind,
+		origin = AuthoredBinder
 	})
 
 
@@ -14327,6 +14537,7 @@ pure func decode_core_closure_capture_json(
 		name = name,
 		id = id,
 		typ = typ,
+		origin = AuthoredBinder
 	})
 
 

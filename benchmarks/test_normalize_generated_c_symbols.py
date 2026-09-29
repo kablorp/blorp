@@ -569,6 +569,18 @@ class GeneratedCSymbolTests(unittest.TestCase):
         # A callable whose base-62 id starts with `v` is not a local.
         self.assertIn("brp_v3K", normalizer.project_locals("void brp_v3K(void);"))
 
+    def test_project_locals_accepts_perceus_temporary_and_derived_locals(self):
+        code = ("void f(void) { long brp_vt_5uFzovh2zo4_b0 = 1; "
+                "long brp_vd_vt_5uFzovh2zo4_b0_v0 = brp_vt_5uFzovh2zo4_b0; "
+                "long brp_vd_v_2X_d0 = 2; use(brp_vt_5uFzovh2zo4_b0, "
+                "brp_vd_vt_5uFzovh2zo4_b0_v0, brp_vd_v_2X_d0); }\n")
+        normalized = normalizer.project_locals(code)
+        for spelling in ("brp_vt_5uFzovh2zo4_b0", "brp_vd_vt_5uFzovh2zo4_b0_v0",
+                         "brp_vd_v_2X_d0"):
+            self.assertNotIn(spelling, normalized)
+        for ordinal in (0, 1, 2):
+            self.assertIn("@@project:local:0:%d@@" % ordinal, normalized)
+
     def test_project_locals_maps_old_and_new_variant_spellings_to_one_family(self):
         parent = (
             "#define TAG_Shape_Circle 0\n#define TAG_Shape_Sq 1\n"

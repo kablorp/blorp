@@ -5,6 +5,7 @@
 -- separately at the post-reuse/pre-closure boundary.
 import:
 	../stage_08_core_lower/identity: mangled_definition_name
+	../stage_10_backend/c_naming: derived_anchor_key, derived_temporary_spelling
 	ir:
 		FIRST_MINTED_BINDER_ID,
 		CoreBoxedStorageValue,
@@ -212,6 +213,8 @@ import:
 		),
 		CoreType,
 		CoreUnionDecl,
+		CoreBinderOrigin(AuthoredBinder, DerivedFrom),
+		DerivedTempKind(ClosureDropTemp),
 		CoreVar,
 	synth_nodes: core_var
 	traverse: core_pattern_binds_name, core_pattern_bound_names, immediate_core_expr_children
@@ -246,7 +249,8 @@ foreign:
 record FreeVar {
 	name: String,
 	id: Int,
-	typ: CoreType
+	typ: CoreType,
+	origin: CoreBinderOrigin
 }
 
 
@@ -662,7 +666,8 @@ private pure func closure_capture_from_task_capture(capture: CoreTaskCapture) ->
 	{
 		name = capture.name,
 		id = capture.id,
-		typ = capture.typ
+		typ = capture.typ,
+		origin = capture.origin
 	}
 
 
@@ -738,7 +743,13 @@ variable; this can only be stricter than the old name-only dedup, never
 looser, so it cannot introduce a new capture the old code would have
 merged away.
 ---
-private pure func add_free_var(vars: List[FreeVar], name: String, id: Int, typ: CoreType) -> List[FreeVar]:
+private pure func add_free_var(
+	vars: List[FreeVar],
+	name: String,
+	id: Int,
+	origin: CoreBinderOrigin,
+	typ: CoreType,
+) -> List[FreeVar]:
 	var exists: Bool = False
 
 	for existing in vars:
@@ -754,7 +765,8 @@ private pure func add_free_var(vars: List[FreeVar], name: String, id: Int, typ: 
 		free_var: FreeVar = {
 			name = name,
 			id = id,
-			typ = typ
+			typ = typ,
+			origin = origin
 		}
 		vars.append(free_var)
 
@@ -763,7 +775,7 @@ private pure func merge_free_vars(left: List[FreeVar], right: List[FreeVar]) -> 
 	var result: List[FreeVar] = left
 
 	for item in right:
-		result = add_free_var(result, item.name, item.id, item.typ)
+		result = add_free_var(result, item.name, item.id, item.origin, item.typ)
 
 	result
 
@@ -1203,7 +1215,8 @@ private pure func free_vars_expr(
 				free_var: FreeVar = {
 					name = variable.name,
 					id = variable.id,
-					typ = typ
+					typ = typ,
+					origin = variable.origin
 				}
 				[free_var]
 		LiteralExpr(literal, typ, loc):
@@ -1269,7 +1282,7 @@ private pure func free_vars_expr(
 				if bound.contains(capture.name):
 					void
 				else:
-					result = add_free_var(result, capture.name, capture.id, capture.typ)
+					result = add_free_var(result, capture.name, capture.id, capture.origin, capture.typ)
 
 			result
 		ListConstructExpr(construct, typ, loc):
@@ -1454,7 +1467,7 @@ private pure func free_vars_expr(
 				if bound.contains(capture.name):
 					void
 				else:
-					result = add_free_var(result, capture.name, capture.id, capture.typ)
+					result = add_free_var(result, capture.name, capture.id, capture.origin, capture.typ)
 
 			result
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
@@ -1827,7 +1840,7 @@ private pure func captures_from_body(
 	var result: List[FreeVar] = []
 
 	for free_var in free_vars_expr(facts, local_bound, body):
-		result = add_free_var(result, free_var.name, free_var.id, free_var.typ)
+		result = add_free_var(result, free_var.name, free_var.id, free_var.origin, free_var.typ)
 
 	result
 
@@ -2061,7 +2074,8 @@ private pure func closure_capture_from_free_var(free_var: FreeVar) -> CoreClosur
 	{
 		name = free_var.name,
 		id = free_var.id,
-		typ = free_var.typ
+		typ = free_var.typ,
+		origin = free_var.origin
 	}
 
 
@@ -2079,7 +2093,8 @@ private pure func task_capture_from_free_var(
 		name = free_var.name,
 		id = free_var.id,
 		typ = free_var.typ,
-		kind = kind
+		kind = kind,
+		origin = free_var.origin
 	}
 
 
@@ -3241,7 +3256,9 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 `body` followed by a drop of `variable`. A body that yields a value is bound
 to a temporary so the drop can run between computing it and returning it; the
 temporary takes `next_binder_id - 1` (`CorePassState.next_binder_id`, see
-`FIRST_MINTED_BINDER_ID` in ir.brp), and `ids_used` is 1 exactly then.
+`FIRST_MINTED_BINDER_ID` in ir.brp), and `ids_used` is 1 exactly then. It is
+derived from `variable`; the minted id, negated, is its ordinal, so two drops of
+one variable never share a spelling.
 ---
 private record DroppedBody {
 	expr: CoreExpr,
@@ -3274,7 +3291,14 @@ private pure func drop_after_body(
 			ids_used = 0
 		}
 	else:
-		result_var: CoreVar = { core_var("__cdrop_" + variable.name) | id = next_binder_id - 1 }
+		drop_id: Int = next_binder_id - 1
+		anchor_key: String = derived_anchor_key(variable)
+		result_var: CoreVar = {
+			name = derived_temporary_spelling(anchor_key, ClosureDropTemp, 0 - drop_id),
+			id = drop_id,
+			def_id = None,
+			origin = DerivedFrom(anchor_key, ClosureDropTemp, 0 - drop_id)
+		}
 		result_type: CoreType = core_expr_type(body)
 		{
 			expr = LetExpr(
@@ -3303,7 +3327,7 @@ private pure func balance_task_copy_capture(
 ) -> DroppedBody:
 	match capture.kind:
 		TaskCopyCapture:
-			variable: CoreVar = { name = capture.name, id = capture.id, def_id = None }
+			variable: CoreVar = { name = capture.name, id = capture.id, def_id = None, origin = capture.origin }
 
 			if expr_consumes_var(body, variable):
 				{
@@ -3471,7 +3495,8 @@ private pure func adapt_var_expr(
 							{
 								name = target.name,
 								id = variable.id,
-								def_id = Some(target.def_id)
+								def_id = Some(target.def_id),
+								origin = AuthoredBinder
 							},
 							typ,
 							loc,

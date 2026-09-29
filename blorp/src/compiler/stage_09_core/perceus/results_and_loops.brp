@@ -11,6 +11,11 @@
 -- comment on insert_drops_program). A later pass can split this file further
 -- once the drops engine moves and the remaining coupling is easier to see.
 import:
+	../../stage_10_backend/c_naming:
+		derived_anchor_key,
+		derived_temporary_spelling,
+		perceus_borrowed_result_spelling,
+		perceus_temporary_spelling
 	memory: same_object
 	../closure as CoreClosure
 	../dce as CoreDce
@@ -181,6 +186,11 @@ import:
 			ValueRecordType,
 			VoidType,
 		),
+		CoreBinderOrigin(DerivedFrom, PerceusBorrowedResultTemporary, PerceusTemporary),
+		PerceusBorrowedResultKind,
+		PerceusTempKind(PerceusAggregateField, PerceusBorrowArg, PerceusBorrowCallee, PerceusBorrowCastSource, PerceusCowArg, PerceusEqualityArg, PerceusOwnedCastSource, PerceusOwnedFieldOwner, PerceusOwnedListGetSource, PerceusOwnedResult),
+		DerivedTempKind(BorrowedView),
+		perceus_temporary_binder_id,
 		CoreVar,
 		core_expr_type,
 		core_node_id_raw,
@@ -1184,7 +1194,7 @@ The caller proves the direct-alias condition once before entering here.
 private pure func retain_proven_direct_field_alias_value(value: CoreExpr) -> CoreExpr:
 	match value:
 		FieldExpr(_, _, _, typ, loc) | TupleFieldExpr(_, _, typ, loc):
-			temp: CoreVar = synthetic_binding_var("aggregate_field", 0, loc)
+			temp: CoreVar = synthetic_binding_var(PerceusAggregateField, 0, loc)
 			BorrowLetExpr(
 				temp,
 				typ,
@@ -1669,7 +1679,7 @@ pure func materialize_owned_temporary_field_projection(
 	match expr:
 		FieldExpr(owner, field, field_ref, typ, loc):
 			owner_type: CoreType = core_expr_type(owner)
-			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", depth, loc)
+			owner_var: CoreVar = synthetic_binding_var(PerceusOwnedFieldOwner, depth, loc)
 			projection: CoreExpr = FieldExpr(
 				VarExpr(owner_var, owner_type, loc),
 				field,
@@ -1686,7 +1696,7 @@ pure func materialize_owned_temporary_field_projection(
 			LetExpr(owner_var, False, owner_type, owner, owned_projection)
 		TupleFieldExpr(owner, field_index, typ, loc):
 			owner_type: CoreType = core_expr_type(owner)
-			owner_var: CoreVar = synthetic_binding_var("owned_field_owner", depth, loc)
+			owner_var: CoreVar = synthetic_binding_var(PerceusOwnedFieldOwner, depth, loc)
 			projection: CoreExpr = TupleFieldExpr(
 				VarExpr(owner_var, owner_type, loc),
 				field_index,
@@ -3561,11 +3571,6 @@ union TemporaryBindingContractPlan:
 	ExplicitDropTemporaryBindingContract(OwnershipCallContract)
 
 
-private PERCEUS_LOCAL_PREFIX: String = "$blorp$perceus$"
-
-private OWNED_RESULT_TEMP_NAME: String = PERCEUS_LOCAL_PREFIX + "owned_result"
-
-
 private record SyntheticOwnershipBinding {
 	variable: CoreVar,
 	typ: CoreType,
@@ -3606,38 +3611,43 @@ pure func direct_field_alias(expr: CoreExpr) -> Bool:
 
 
 ---
-A minted node id (docs/CORE_NODE_TABLE_ROADMAP.md step N2) is negative, and
-`-` is not a legal character inside a C identifier, so the sign is spelled
-out as an `n` prefix on the magnitude instead of embedding the raw digits.
+A synthetic Perceus temporary for the node at `loc`: its id is the negated
+packed node handle (`perceus_temporary_binder_id`, shared by every temporary at
+that node), its origin carries the kind and call-site `index`, and its name is
+the projected spelling `perceus_temporary_spelling` builds once here. The
+handle is unique across every non-synthetic node (docs/CORE_NODE_TABLE_ROADMAP.md
+step N2: `loc` doubles as a node's identity); the shared synthetic `loc` is the
+one case it does not disambiguate on its own, which the identity contract's
+duplicate check reports.
 ---
-private pure func node_id_name_fragment(loc: CoreSourceLoc) -> String:
-	raw: Int = core_node_id_raw(loc)
-
-	if raw < 0:
-		"n${0 - raw}"
-	else:
-		"${raw}"
-
-
----
-Names a synthetic Perceus temporary from its prefix, call-site index, and
-the node id of the protected node's own `loc`
-(docs/CORE_NODE_TABLE_ROADMAP.md step N2: `loc` doubles as a node's identity,
-unique in practice across every non-synthetic node). Two distinct call sites
-almost always carry two distinct node ids, so folding the raw id in keeps
-every generated C identifier unique per call site without any per-function
-disambiguator. A synthetic `loc` (id 0, shared by every not-yet-minted
-node) is the one case this does not disambiguate on its own; no caller
-mints a fresh id here today, so two synthetic-loc protections at the same
-`index` can still collide (see the "smallest change" note in
-perceus/borrowed.brp's `retain_borrowed_alias_result` callers for where
-this was last observed).
----
-pure func synthetic_binding_var(prefix: String, index: Int, loc: CoreSourceLoc) -> CoreVar:
+pure func synthetic_binding_var(kind: PerceusTempKind, index: Int, loc: CoreSourceLoc) -> CoreVar:
+	id: Int = perceus_temporary_binder_id(loc)
 	{
-		name = "__${prefix}_${node_id_name_fragment(loc)}_${index}",
-		id = 0,
-		def_id = None
+		name = perceus_temporary_spelling(kind, id, index),
+		id = id,
+		def_id = None,
+		origin = PerceusTemporary(kind, index)
+	}
+
+
+---
+A temporary that protects a value a borrowed `owner` parameter can alias. The
+owner's id is part of the spelling and the origin, so two owners protected at
+one call argument stay two temporaries.
+---
+pure func synthetic_borrowed_result_var(
+	kind: PerceusBorrowedResultKind,
+	owner: CoreVar,
+	index: Int,
+	loc: CoreSourceLoc,
+) -> CoreVar:
+	id: Int = perceus_temporary_binder_id(loc)
+
+	{
+		name = perceus_borrowed_result_spelling(kind, id, index, owner.id),
+		id = id,
+		def_id = None,
+		origin = PerceusBorrowedResultTemporary(kind, index, owner.id)
 	}
 
 
@@ -3670,11 +3680,7 @@ private pure func wrap_borrowed_owned_temporary_bindings(
 	while index >= 0:
 		match bindings.get(index):
 			Some(binding):
-				borrowed_view: CoreVar = {
-					name = "${binding.variable.name}_view",
-					id = 0,
-					def_id = None
-				}
+				borrowed_view: CoreVar = borrowed_temporary_view_var(binding.variable)
 				dropped_result: CoreExpr = drop_after_body(1, binding.variable, binding.typ, result)
 				borrowed_scope: CoreExpr = BorrowLetExpr(
 					borrowed_view,
@@ -3742,7 +3748,7 @@ pure func protect_consuming_call_field_aliases(env: PerceusEnv, expr: CoreExpr) 
 									and is_managed_type(env, arg_type)
 									and direct_field_alias(arg)
 								):
-									temp: CoreVar = synthetic_binding_var("cow_arg", index, loc)
+									temp: CoreVar = synthetic_binding_var(PerceusCowArg, index, loc)
 									bindings = bindings.append({
 										variable = temp,
 										typ = arg_type,
@@ -4049,7 +4055,7 @@ private pure func materialize_borrowed_temporary_with_names(
 
 			if inner_result.is_owned and is_managed_type(env, typ):
 				source_type: CoreType = core_expr_type(inner_result.expr)
-				source: CoreVar = synthetic_binding_var("owned_cast_source", depth, loc)
+				source: CoreVar = synthetic_binding_var(PerceusOwnedCastSource, depth, loc)
 				cast_result: CoreExpr = CastExpr(
 					VarExpr(source, source_type, loc),
 					typ,
@@ -4180,7 +4186,7 @@ private pure func materialize_borrowed_temporary_with_names(
 
 			if list_result.is_owned:
 				source_type: CoreType = core_expr_type(list_result.expr)
-				source: CoreVar = synthetic_binding_var("owned_list_get_source", depth, loc)
+				source: CoreVar = synthetic_binding_var(PerceusOwnedListGetSource, depth, loc)
 				projected: CoreExpr = ListGetExpr(
 					{ get | list = VarExpr(source, source_type, loc) },
 					typ,
@@ -4343,10 +4349,13 @@ private pure func temporary_binding_plan_uses_explicit_drop(
 
 
 private pure func borrowed_temporary_view_var(variable: CoreVar) -> CoreVar:
+	anchor_key: String = derived_anchor_key(variable)
+
 	{
-		name = "${variable.name}_view",
-		id = 0,
-		def_id = None
+		name = derived_temporary_spelling(anchor_key, BorrowedView, 0),
+		id = variable.id,
+		def_id = None,
+		origin = DerivedFrom(anchor_key, BorrowedView, 0)
 	}
 
 
@@ -4365,7 +4374,7 @@ private pure func prepare_materialized_borrowed_argument(
 	materialized: MaterializedBorrowedTemporary,
 ) -> PreparedBorrowedArgument:
 	if materialized.is_owned:
-		temp: CoreVar = synthetic_binding_var("borrow_arg", index, loc)
+		temp: CoreVar = synthetic_binding_var(PerceusBorrowArg, index, loc)
 		arg_type: CoreType = core_expr_type(arg)
 		{
 			bindings = [
@@ -4406,7 +4415,7 @@ private pure func prepare_borrowed_argument(
 				-- outside the call so the view cannot outlive its owner during
 				-- argument evaluation.
 				source_type: CoreType = core_expr_type(inner_result.expr)
-				source: CoreVar = synthetic_binding_var("borrow_cast_source", index, loc)
+				source: CoreVar = synthetic_binding_var(PerceusBorrowCastSource, index, loc)
 				{
 					bindings = [
 						{
@@ -4524,7 +4533,7 @@ private pure func normalize_binary_ownership_change_aware(
 					var protected_right: CoreExpr = right
 
 					if left_needs_protection:
-						left_temp: CoreVar = synthetic_binding_var("equality_arg", 0, loc)
+						left_temp: CoreVar = synthetic_binding_var(PerceusEqualityArg, 0, loc)
 						bindings = bindings.append({
 							variable = left_temp,
 							typ = left_type,
@@ -4535,7 +4544,7 @@ private pure func normalize_binary_ownership_change_aware(
 						void
 
 					if right_needs_protection:
-						right_temp: CoreVar = synthetic_binding_var("equality_arg", 1, loc)
+						right_temp: CoreVar = synthetic_binding_var(PerceusEqualityArg, 1, loc)
 						bindings = bindings.append({
 							variable = right_temp,
 							typ = right_type,
@@ -4582,7 +4591,7 @@ private pure func prepare_borrowed_owned_temporary_call(
 	var index: Int = 0
 
 	rewritten_callee: CoreExpr = if is_closure_call(kind) and is_owned_temporary_expr(env, callee):
-		temp: CoreVar = synthetic_binding_var("borrow_callee", 0, loc)
+		temp: CoreVar = synthetic_binding_var(PerceusBorrowCallee, 0, loc)
 		callee_type: CoreType = core_expr_type(callee)
 		bindings = bindings.append({
 			variable = temp,
@@ -4745,11 +4754,6 @@ private pure func normalize_unbox_ownership_change_aware(
 
 pure func retain_alias_as_owned(expr: CoreExpr) -> CoreExpr:
 	typ: CoreType = core_expr_type(expr)
-	temp: CoreVar = {
-		name = OWNED_RESULT_TEMP_NAME,
-		id = 0,
-		def_id = None
-	}
 
 	loc: CoreSourceLoc = match expr:
 		VarExpr(variable, value_type, value_loc):
@@ -4768,6 +4772,8 @@ pure func retain_alias_as_owned(expr: CoreExpr) -> CoreExpr:
 			value_loc
 		_:
 			synthetic_core_source_loc()
+
+	temp: CoreVar = synthetic_binding_var(PerceusOwnedResult, 0, loc)
 
 	BorrowLetExpr(
 		temp,

@@ -5,6 +5,34 @@
 -- This includes language keywords and compiler-provided object-like macros.
 -- GCC defines `linux` in non-strict C modes before processing our artifact.
 import:
+	../stage_09_core/ir:
+		CoreBinderOrigin(
+			AuthoredBinder,
+			DerivedFrom,
+			LoweringTemporary,
+			PassTemporary,
+			PerceusBorrowedResultTemporary,
+			PerceusTemporary,
+		),
+		CoreVar,
+		DerivedTempKind(AssignTemp, BorrowedView, ClosureDropTemp, DropTemp),
+		PerceusBorrowedResultKind(
+			BorrowedResultAlias,
+			BorrowedResultCallArg,
+			BorrowedResultEqualityArg,
+		),
+		PerceusTempKind(
+			PerceusAggregateField,
+			PerceusBorrowArg,
+			PerceusBorrowCallee,
+			PerceusBorrowCastSource,
+			PerceusCowArg,
+			PerceusEqualityArg,
+			PerceusOwnedCastSource,
+			PerceusOwnedFieldOwner,
+			PerceusOwnedListGetSource,
+			PerceusOwnedResult,
+		),
 	string: string as make_string
 
 
@@ -249,6 +277,27 @@ private pure func base62_spelling(prefix: String, value: Int) -> String:
 	spelling
 
 
+private pure func base62_spelling_with_suffix(prefix: String, value: Int, suffix: String) -> String:
+	var digit_count: Int = 1
+	var scale: Int = 1
+
+	while value / scale >= BASE62_RADIX:
+		scale *= BASE62_RADIX
+		digit_count += 1
+
+	var spelling: String = make_string(prefix.length() + digit_count + suffix.length())
+	spelling += prefix
+	var remaining: Int = value
+
+	while scale > 0:
+		spelling += BASE62_DIGIT_STRINGS.get_or(remaining / scale, "")
+		remaining = remaining % scale
+		scale /= BASE62_RADIX
+
+	spelling += suffix
+	spelling
+
+
 pure func encode_base62(value: Int) -> String:
 	base62_spelling("", value)
 
@@ -265,6 +314,209 @@ pure func c_binder_name(name: String, id: Int) -> String:
 		base62_spelling(PROJECTED_LOCAL_PREFIX, id)
 	else:
 		base62_spelling(PROJECTED_MINTED_LOCAL_PREFIX, 0 - id)
+
+
+-- Spellings of the Perceus temporaries. A Perceus temporary shares its id (the
+-- negated packed node handle) with every temporary at the same node, so its
+-- spelling adds a kind letter and an ordinal: `brp_vt_<b62 |id|>_<kind><n>`,
+-- with `_<owner>` appended for the borrowed-result kinds, where the borrowed
+-- owner parameter is what tells two temporaries at one call argument apart. A
+-- temporary derived from a protected variable is
+-- `brp_vd_<anchor key>_<kind><n>`; the key is built from the anchor's id and
+-- origin (an anchor that is itself a temporary contributes its own kind and
+-- ordinal, since its id alone does not identify it; an anchor with no id
+-- contributes its escaped name). Each is built once, where the temporary is
+-- created, by exactly these two functions, and stored as the variable's `name`:
+-- for these two origins the name IS the projected C spelling, so emission
+-- passes it through and a `String` shared by reference costs nothing per
+-- occurrence. This is interim, until Perceus carries threaded state and can
+-- mint dense binder ids. Both families are disjoint from `brp_v_`, `brp_vn_`,
+-- callables (`brp_` then a base-62 digit), `brp_c_`, `brp_t_`, `brp_ty`, `brp_g`.
+private PROJECTED_PERCEUS_TEMPORARY_PREFIX: String = "brp_vt_"
+
+private PROJECTED_DERIVED_LOCAL_PREFIX: String = "brp_vd_"
+
+private pure func perceus_temp_kind_letter(kind: PerceusTempKind) -> String:
+	match kind:
+		PerceusAggregateField:
+			"a"
+		PerceusBorrowArg:
+			"b"
+		PerceusBorrowCallee:
+			"c"
+		PerceusBorrowCastSource:
+			"d"
+		PerceusCowArg:
+			"e"
+		PerceusEqualityArg:
+			"f"
+		PerceusOwnedCastSource:
+			"g"
+		PerceusOwnedFieldOwner:
+			"h"
+		PerceusOwnedListGetSource:
+			"i"
+		PerceusOwnedResult:
+			"j"
+
+
+private pure func borrowed_result_kind_letter(kind: PerceusBorrowedResultKind) -> String:
+	match kind:
+		BorrowedResultAlias:
+			"k"
+		BorrowedResultCallArg:
+			"l"
+		BorrowedResultEqualityArg:
+			"m"
+
+
+private pure func derived_temp_kind_letter(kind: DerivedTempKind) -> String:
+	match kind:
+		DropTemp:
+			"d"
+		BorrowedView:
+			"v"
+		AssignTemp:
+			"a"
+		ClosureDropTemp:
+			"c"
+
+
+private pure func borrowed_owner_key(owner_id: Int) -> String:
+	if owner_id >= 0:
+		encode_base62(owner_id)
+	else:
+		"n" + encode_base62(0 - owner_id)
+
+
+private pure func perceus_temporary_suffix(kind: PerceusTempKind, ordinal: Int) -> String:
+	perceus_temp_kind_letter(kind) + ordinal.to_string()
+
+
+private pure func borrowed_result_suffix(kind: PerceusBorrowedResultKind, ordinal: Int, owner_id: Int) -> String:
+	borrowed_result_kind_letter(kind) + ordinal.to_string() + "_" + borrowed_owner_key(owner_id)
+
+
+---
+`brp_vt_<b62 |id|>_<kind letter><ordinal>`, built in one buffer.
+---
+pure func perceus_temporary_spelling(kind: PerceusTempKind, id: Int, ordinal: Int) -> String:
+	base62_spelling_with_suffix(
+		PROJECTED_PERCEUS_TEMPORARY_PREFIX,
+		0 - id,
+		"_" + perceus_temporary_suffix(kind, ordinal),
+	)
+
+
+---
+`brp_vt_<b62 |id|>_<kind letter><ordinal>_<owner>`: the borrowed owner parameter
+is what tells two temporaries at one call argument apart, since they share node,
+kind and ordinal.
+---
+pure func perceus_borrowed_result_spelling(
+	kind: PerceusBorrowedResultKind,
+	id: Int,
+	ordinal: Int,
+	owner_id: Int,
+) -> String:
+	base62_spelling_with_suffix(
+		PROJECTED_PERCEUS_TEMPORARY_PREFIX,
+		0 - id,
+		"_" + borrowed_result_suffix(kind, ordinal, owner_id),
+	)
+
+
+---
+The identity of a variable a temporary is derived from, spelled once when the
+derived temporary is created and stored in its `DerivedFrom` origin. It reads the
+anchor's id and origin, never a spelling of its name (an anchor with neither an
+id nor a temporary origin contributes its escaped name); an anchor that is itself
+a temporary contributes its own kind and ordinal, since its id alone does not
+identify it.
+---
+pure func derived_anchor_key(anchor: CoreVar) -> String:
+	match anchor.origin:
+		PerceusTemporary(kind, ordinal):
+			"t" + encode_base62(0 - anchor.id) + "_" + perceus_temporary_suffix(kind, ordinal)
+		PerceusBorrowedResultTemporary(kind, ordinal, owner_id):
+			"t" + encode_base62(0 - anchor.id) + "_" + borrowed_result_suffix(kind, ordinal, owner_id)
+		DerivedFrom(anchor_key, kind, ordinal):
+			"d" + anchor_key + "_" + derived_temp_kind_letter(kind) + ordinal.to_string()
+		_:
+			if anchor.id > 0:
+				"p" + encode_base62(anchor.id)
+			else if anchor.id < 0:
+				"n" + encode_base62(0 - anchor.id)
+			else:
+				"z" + c_local_name(anchor.name)
+
+
+---
+`brp_vd_<anchor key>_<kind letter><ordinal>` for a temporary derived from the
+variable whose `derived_anchor_key` is `anchor_key`.
+---
+pure func derived_temporary_spelling(anchor_key: String, kind: DerivedTempKind, ordinal: Int) -> String:
+	PROJECTED_DERIVED_LOCAL_PREFIX + anchor_key + "_" + derived_temp_kind_letter(kind) + ordinal.to_string()
+
+
+---
+The spelling `variable`'s `(id, origin)` promises for a Perceus or derived
+temporary, recomputed from those two alone; `None` for every other origin, whose
+spelling is `c_binder_name`. The identity contract requires a temporary's stored
+`name` to equal it.
+---
+pure func projected_temporary_spelling(variable: CoreVar) -> Option[String]:
+	match variable.origin:
+		PerceusTemporary(kind, ordinal):
+			Some(perceus_temporary_spelling(kind, variable.id, ordinal))
+		PerceusBorrowedResultTemporary(kind, ordinal, owner_id):
+			Some(perceus_borrowed_result_spelling(kind, variable.id, ordinal, owner_id))
+		DerivedFrom(anchor_key, kind, ordinal):
+			Some(derived_temporary_spelling(anchor_key, kind, ordinal))
+		_:
+			None
+
+
+--- Whether `variable`'s name has the family shape its origin promises. This is
+--- the cheap emission guard; the identity contract compares against the full
+--- `projected_temporary_spelling`. Any origin other than a Perceus or derived
+--- temporary has no such promise.
+pure func temporary_name_is_projected(variable: CoreVar) -> Bool:
+	match variable.origin:
+		PerceusTemporary(_, _) | PerceusBorrowedResultTemporary(_, _, _):
+			variable.name.starts_with(PROJECTED_PERCEUS_TEMPORARY_PREFIX)
+		DerivedFrom(_, _, _):
+			variable.name.starts_with(PROJECTED_DERIVED_LOCAL_PREFIX)
+		_:
+			True
+
+
+private INVALID_PROJECTED_TEMPORARY_NAME: String = "__blorp_invalid_projected_temporary"
+
+---
+The C spelling of a local variable occurrence, a pure function of its id and
+origin. A Perceus or derived temporary's `name` already is its projected
+spelling (see above); a name outside the family fails closed to a spelling the C
+compiler rejects. Every other local is spelled from its id by `c_binder_name`.
+---
+pure func c_local_spelling(name: String, id: Int, origin: CoreBinderOrigin) -> String:
+	c_variable_spelling({
+		name = name,
+		id = id,
+		def_id = None,
+		origin = origin
+	})
+
+
+pure func c_variable_spelling(variable: CoreVar) -> String:
+	if temporary_name_is_projected(variable):
+		match variable.origin:
+			PerceusTemporary(_, _) | PerceusBorrowedResultTemporary(_, _, _) | DerivedFrom(_, _, _):
+				variable.name
+			_:
+				c_binder_name(variable.name, variable.id)
+	else:
+		INVALID_PROJECTED_TEMPORARY_NAME
 
 
 -- Spellings of a union or enum variant by definition identity. Every variant

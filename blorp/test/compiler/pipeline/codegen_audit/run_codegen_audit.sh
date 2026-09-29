@@ -15,6 +15,10 @@ FAIL=0
 DIR="$(dirname "$0")"
 REPO_ROOT="$(cd "$DIR/../../../../.." && pwd -P)"
 RUNTIME_DECL="$REPO_ROOT/blorp/src/lib/runtime/native/runtime_decl.c"
+# A case that imports a compiler module (for a constant it inspects) carries the
+# foreign includes of everything that module imports; the module table's native
+# header is the one such header the compiler modules declare.
+COMPILER_NATIVE_INCLUDE="$REPO_ROOT/blorp/src/compiler/stage_04_modules"
 TEST_TIMEOUT="${BLORP_COMPILER_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-30}}"
 DEFAULT_JOB_CAP=2
 
@@ -239,7 +243,7 @@ run_case() {
     fi
 
     set +e
-    cc_output=$(run_with_timeout "${BLORP_CC:-clang}" "${CC_WARNING_FLAGS[@]}" -I "$test_dir" -include "$RUNTIME_DECL" "$c_file")
+    cc_output=$(run_with_timeout "${BLORP_CC:-clang}" "${CC_WARNING_FLAGS[@]}" -I "$test_dir" -I "$COMPILER_NATIVE_INCLUDE" -include "$RUNTIME_DECL" "$c_file")
     cc_exit=$?
     set -e
     if [ "$cc_exit" -eq 124 ]; then
