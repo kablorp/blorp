@@ -37,7 +37,6 @@ import:
 		frontend_graph_module_ids,
 		frontend_graph_module_table,
 		frontend_graph_modules,
-		frontend_graph_name_table,
 		frontend_graph_root_ids,
 		frontend_graph_root_modules,
 	stage_04_modules/frontend_graph_service:
@@ -64,6 +63,7 @@ import:
 		TypecheckedModule,
 		typecheck_frontend_graph_ids,
 		typecheck_graph,
+		typechecked_graph_name_table,
 		typechecked_module_name,
 		typechecked_module_path,
 		typechecked_module_program_with_ctfe_replacements,
@@ -377,6 +377,7 @@ record CoreCompilation {
 	program: CoreProgram,
 	next_def_id: Int,
 	next_binder_id: Int,
+	names: NameTable,
 	check_invariants: Bool
 }
 
@@ -513,6 +514,7 @@ private record RuntimeProjectedCompilationRep {
 	program: CoreProgram,
 	next_def_id: Int,
 	next_binder_id: Int,
+	names: NameTable,
 	observations: List[CoreObservation]
 }
 
@@ -608,7 +610,8 @@ private record CoreLoweringInput {
 	module_imports: List[CoreResolveModuleImports],
 	include_dirs: List[String],
 	typed_summary: Option[String],
-	next_def_id: Int
+	next_def_id: Int,
+	names: NameTable
 }
 
 
@@ -901,16 +904,13 @@ run only when `BLORP_NAME_IDENTITY` is `report` (counts on stderr) or `strict`
 (counts, and any unresolved or mismatched identifier fails the compilation).
 Off by default: it walks every typed expression.
 ---
-private func check_typed_name_identity(
-	graph: FrontendGraph,
-	typechecked: TypecheckedGraph,
-) -> List[String]:
+private func check_typed_name_identity(typechecked: TypecheckedGraph) -> List[String]:
 	mode = name_identity_mode()
 
 	if mode != Some("report") and mode != Some("strict"):
 		[]
 	else:
-		names = frontend_graph_name_table(graph)
+		names = typechecked_graph_name_table(typechecked)
 		var census: NameIdentityCensus = NAME_IDENTITY_CENSUS_EMPTY
 
 		for module in typechecked.modules.append(typechecked.target):
@@ -980,7 +980,7 @@ func run_typed_frontend_compilation(
 						Err(errors)
 					else:
 						validation_errors: List[String] = validate(typechecked).concat(
-							check_typed_name_identity(graph.graph, typechecked),
+							check_typed_name_identity(typechecked),
 						)
 
 						if validation_errors.length() != 0:
@@ -1112,6 +1112,7 @@ private pure func core_lowering_input(
 		include_dirs = typechecked_graph_source_include_dirs(typechecked),
 		typed_summary = typed_summary,
 		next_def_id = typechecked.next_def_id,
+		names = typechecked_graph_name_table(typechecked),
 	})
 
 
@@ -1163,7 +1164,8 @@ pure func lower_prepared_core_request(
 	early_input: CoreEarlyPipelineInput = {
 		program = prepared_graph.program,
 		next_def_id = prepared_graph.next_def_id,
-		next_binder_id = FIRST_MINTED_BINDER_ID
+		next_binder_id = FIRST_MINTED_BINDER_ID,
+		names = input.names
 	}
 
 	Ok(into_opaque LoweredCoreCompilation({
@@ -1263,6 +1265,7 @@ func project_runtime_compilation(
 									program = completed.program,
 									next_def_id = completed.next_def_id,
 									next_binder_id = completed.next_binder_id,
+									names = completed.names,
 									observations = completed.observations.map(early_observation)
 								}),
 							completed.pass_timings,
@@ -1281,6 +1284,7 @@ pure func runtime_projected_core_compilation(
 		program = representation.program,
 		next_def_id = representation.next_def_id,
 		next_binder_id = representation.next_binder_id,
+		names = representation.names,
 		check_invariants = representation.check_invariants
 	}
 
@@ -1417,6 +1421,7 @@ func execute_late_core_stages(
 	pre_dce_core: CoreProgram,
 	next_def_id: Int,
 	next_binder_id: Int,
+	names: NameTable,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
@@ -1431,12 +1436,15 @@ func execute_late_core_stages(
 
 	match run_core_passes(
 		late_core_passes_for_control(control),
-		{ core_pass_state(pre_dce_core, next_def_id) | next_binder_id = next_binder_id },
+		{ core_pass_state(pre_dce_core, next_def_id) |
+			next_binder_id = next_binder_id,
+			names = names
+		},
 		control,
 	):
 		CorePassesCompleted(completed, pass_observations, timings):
 			LateCoreCompleted(
-				prepared_core_program_with_checkpoints(completed.program),
+				prepared_core_program_with_checkpoints(completed.program, names),
 				late_core_observations(observations, pass_observations),
 				timings,
 			)
@@ -1473,6 +1481,7 @@ func run_late_core_compilation(
 		representation.program,
 		representation.next_def_id,
 		representation.next_binder_id,
+		representation.names,
 		representation.observations,
 		stages,
 		representation.check_invariants,
@@ -1562,6 +1571,7 @@ func finish_compiler_pipeline(
 	pre_dce_core: CoreProgram,
 	next_def_id: Int,
 	next_binder_id: Int,
+	names: NameTable,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
@@ -1571,6 +1581,7 @@ func finish_compiler_pipeline(
 		pre_dce_core,
 		next_def_id,
 		next_binder_id,
+		names,
 		observations,
 		stages,
 		check_invariants,

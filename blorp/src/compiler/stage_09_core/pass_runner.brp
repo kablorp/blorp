@@ -5,6 +5,7 @@
 -- lists live with the stages they sequence (`early_pipeline`, `pipeline`), and
 -- this module only walks a list it is handed.
 import:
+	../stage_02_lex/name_table: EMPTY_NAME_TABLE, NameTable, name_spelling_of_text
 	early_invariants:
 		CoreEarlyInvariantViolation,
 		core_early_invariant_hint,
@@ -92,6 +93,12 @@ helper that only returns `(program, next_def_id)` (mono, consume-specialize,
 closure conversion) must use `core_pass_state_carry_ids` instead, so a node
 id minted earlier in the same list is never handed out again by a later
 pass in that list.
+
+`names` is the compilation's name table, read-only here: Core does not yet
+carry `NameId`s, but a pass or invariant that renders an identifier at a
+boundary reaches its spelling through it (`name_spelling_or_text`). Plain
+`core_pass_state` starts from `EMPTY_NAME_TABLE`, and
+`core_pass_state_carry_ids` carries `base.names` forward.
 ---
 record CorePassState {
 	program: CoreProgram,
@@ -99,7 +106,8 @@ record CorePassState {
 	next_node_id: Int,
 	minted_origins: List[CoreSourceLoc],
 	ownership_contract_facts: OwnershipContractFacts,
-	next_binder_id: Int
+	next_binder_id: Int,
+	names: NameTable
 }
 
 
@@ -498,6 +506,7 @@ binder whose pair collides with another, or drops/renames a binder a use
 still points at.
 ---
 private pure func core_pass_state_binder_identity_violation(
+	names: NameTable,
 	pass_name: String,
 	function_info: CoreFunction,
 	walk: CoreBinderIdentityWalk,
@@ -508,7 +517,7 @@ private pure func core_pass_state_binder_identity_violation(
 		Some(variable):
 			Some(
 				CorePassMessage(
-					"pass `${pass_name}` left function `${function_info.name}` with two binders sharing identity (${variable.name}, ${variable.id.to_string()})",
+					"pass `${pass_name}` left function `${name_spelling_of_text(names, function_info.name)}` with two binders sharing identity (${variable.name}, ${variable.id.to_string()})",
 				),
 			)
 		None:
@@ -521,7 +530,7 @@ private pure func core_pass_state_binder_identity_violation(
 				Some(variable):
 					Some(
 						CorePassMessage(
-							"pass `${pass_name}` left function `${function_info.name}` with a use of `${variable.name}` (id ${variable.id.to_string()}) that names no binder in scope and no def_id",
+							"pass `${pass_name}` left function `${name_spelling_of_text(names, function_info.name)}` with a use of `${variable.name}` (id ${variable.id.to_string()}) that names no binder in scope and no def_id",
 						),
 					)
 				None:
@@ -584,6 +593,7 @@ strict/report-only split below stays the only place that decides what to
 do with what this finds.
 ---
 private pure func core_pass_state_binder_identity_violations(
+	names: NameTable,
 	pass_name: String,
 	program: CoreProgram,
 ) -> List[CorePassDiagnostic]:
@@ -621,6 +631,7 @@ private pure func core_pass_state_binder_identity_violations(
 						}
 
 						match core_pass_state_binder_identity_violation(
+							names,
 							pass_name,
 							function_info,
 							walk,
@@ -653,10 +664,12 @@ change), for steps 3-5 to flip on once the passes above stop cloning
 identities.
 ---
 func core_pass_state_binder_identity_program_violation(
+	names: NameTable,
 	pass_name: String,
 	program: CoreProgram,
 ) -> Option[CorePassDiagnostic]:
 	violations: List[CorePassDiagnostic] = core_pass_state_binder_identity_violations(
+		names,
 		pass_name,
 		program,
 	)
@@ -928,7 +941,8 @@ pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassSta
 		next_node_id = -1,
 		minted_origins = [],
 		ownership_contract_facts = empty_ownership_contract_facts(),
-		next_binder_id = FIRST_MINTED_BINDER_ID
+		next_binder_id = FIRST_MINTED_BINDER_ID,
+		names = EMPTY_NAME_TABLE
 	}
 
 
@@ -947,7 +961,8 @@ pure func core_pass_state_carry_ids(
 	{ core_pass_state(program, next_def_id) |
 		next_node_id = base.next_node_id,
 		minted_origins = base.minted_origins,
-		next_binder_id = base.next_binder_id
+		next_binder_id = base.next_binder_id,
+		names = base.names
 	}
 
 
@@ -1073,6 +1088,7 @@ func run_core_passes(
 												Some(diagnostic)
 											None:
 												match core_pass_state_binder_identity_program_violation(
+													current.names,
 													pass.name,
 													current.program,
 												):
