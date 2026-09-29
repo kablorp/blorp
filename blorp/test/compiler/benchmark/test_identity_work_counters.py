@@ -15,7 +15,7 @@ WORKER_HELPER = runpy.run_path(str(ROOT / "benchmarks/compiler_benchmark_worker.
 FUNCTIONS = PARSER["FUNCTIONS"]
 EXPECTED_FULL_FIELD_SITES = {
     "stage_08_core_lower/entrypoint.brp": 2,
-    "stage_08_core_lower/lower.brp": 1,
+    "stage_08_core_lower/lower.brp": 2,
     "stage_09_core/clone.brp": 1,
     "stage_09_core/closure.brp": 1,
     "stage_09_core/consume_specialize.brp": 2,
@@ -151,7 +151,7 @@ class IdentityWorkCounterTests(unittest.TestCase):
                 if count:
                     sites[str(path.relative_to(source_root))] = count
         self.assertEqual(sites, EXPECTED_FULL_FIELD_SITES)
-        self.assertEqual(sum(sites.values()), 40)
+        self.assertEqual(sum(sites.values()), 41)
         lower = (source_root / "stage_08_core_lower/lower.brp").read_text()
         self.assertIn("private pure func core_var_impl(", lower)
         self.assertIn("name = name,\n\t\tid = 0,\n\t\tdef_id = def_id", lower)

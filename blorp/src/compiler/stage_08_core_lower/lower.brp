@@ -801,7 +801,8 @@ strictly positive so it stays distinguishable from the `id = 0`
 sentinel that still means "no local identity" for globals, callables,
 constructors, and the synthetic binders the ~30 other private
 `core_var(name)` helpers mint (unaffected by this step; see step 5 of the
-roadmap).
+roadmap). Interim: span-derived ids stand in until roadmap A1b, where the
+frontend mints binder ids and lowering only reads them.
 ---
 private pure func core_binder_id(span: SourceLocation) -> Int:
 	source_location_start_offset(span) + 1
@@ -1563,6 +1564,39 @@ private pure func question_bind_name(label: String, span: SourceLocation) -> Str
 	).to_string() + "_" + source_location_end_offset(span).to_string()
 
 
+---
+Lowering mints an authored binder's id from its own identifier span
+(`core_binder_id`, below 2^31). A binder lowering invents for a construct has no
+identifier of its own, and several may hang off one span (`?=` makes a value
+temporary, a failure binder and the payload binder), so each kind takes its own
+band of 2^32 ids above the authored range and the seed band the SSA pass counts
+from, keyed by the construct's start offset (below 2^31, so `band * 2^32 +
+start` never reaches the next band). The band index makes ids of two kinds at
+one span differ. Interim, with `core_binder_id`, until roadmap A1b gives the
+frontend real binder ids.
+---
+QUESTION_BIND_ID_BAND: Int = 4294967296
+
+QUESTION_BIND_FAILURE_BAND: Int = 1
+
+QUESTION_BIND_VALUE_BAND: Int = 2
+
+QUESTION_BIND_RESOURCE_BAND: Int = 3
+
+QUESTION_BIND_WITH_FAILURE_BAND: Int = 4
+
+QUESTION_BIND_WITH_PAYLOAD_BAND: Int = 5
+
+QUESTION_BIND_WITH_VALUE_BAND: Int = 6
+
+pure func core_question_bind_var(label: String, band: Int, span: SourceLocation) -> CoreVar:
+	{
+		name = question_bind_name(label, span),
+		id = band * QUESTION_BIND_ID_BAND + source_location_start_offset(span),
+		def_id = None
+	}
+
+
 private pure func tuple_destruct_name(span: SourceLocation) -> String:
 	"__td_" + source_location_start_offset(
 		span,
@@ -1938,7 +1972,7 @@ private pure func lower_core_pattern(pattern: TypedPattern) -> Result[CorePatter
 		TypedWildcardPattern(_):
 			Ok(WildcardPattern)
 		TypedNamePattern(name, _):
-			Ok(NamePattern(name.text))
+			Ok(NamePattern(core_local_var(name)))
 		TypedBoolPattern(value, _):
 			Ok(LiteralPattern(BoolLiteral(value)))
 		TypedIntPattern(value, _):
@@ -1963,7 +1997,7 @@ private pure func lower_core_pattern(pattern: TypedPattern) -> Result[CorePatter
 
 			lowered_spread = match spread:
 				Some(ParsedListSpreadName(name)):
-					Some(NamePattern(name.text))
+					Some(NamePattern(core_local_var(name)))
 				Some(ParsedListSpreadWildcard(_)):
 					Some(WildcardPattern)
 				None:
@@ -1972,7 +2006,7 @@ private pure func lower_core_pattern(pattern: TypedPattern) -> Result[CorePatter
 			Ok(ListPattern(lowered_items, lowered_spread))
 		TypedOrPattern(items, _):
 			lowered_items ?= lower_core_patterns(items)
-			Ok(OrPattern(lowered_items))
+			Ok(OrPattern(unify_or_pattern_binders(lowered_items)))
 		TypedUnsupportedPattern(label, _):
 			Err(CoreLowerUnsupported("match pattern: " + label))
 
@@ -2588,85 +2622,108 @@ The names a lowered pattern binds, in source order (spread and nested
 patterns included), appended to `names`. Accumulating into one list keeps a
 pattern that binds nothing (most of them) allocation-free.
 ---
-private pure func core_pattern_binder_names(pattern: CorePattern, names: List[String]) -> List[String]:
+private pure func core_pattern_binder_vars(pattern: CorePattern, vars: List[CoreVar]) -> List[CoreVar]:
 	match pattern:
-		NamePattern(name):
-			names.append(name)
+		NamePattern(variable):
+			vars.append(variable)
 		ConstructorPattern(_, args):
-			core_patterns_binder_names(args, names)
+			core_patterns_binder_vars(args, vars)
 		QualifiedConstructorPattern(_, _, args):
-			core_patterns_binder_names(args, names)
+			core_patterns_binder_vars(args, vars)
 		TuplePattern(items):
-			core_patterns_binder_names(items, names)
+			core_patterns_binder_vars(items, vars)
 		ListPattern(items, spread):
-			item_names: List[String] = core_patterns_binder_names(items, names)
+			item_vars: List[CoreVar] = core_patterns_binder_vars(items, vars)
 
 			match spread:
 				Some(spread_pattern):
-					core_pattern_binder_names(spread_pattern, item_names)
+					core_pattern_binder_vars(spread_pattern, item_vars)
 				None:
-					item_names
+					item_vars
 		OrPattern(items):
-			core_patterns_binder_names(items, names)
+			core_patterns_binder_vars(items, vars)
 		_:
-			names
+			vars
 
 
-private pure func core_patterns_binder_names(patterns: List[CorePattern], names: List[String]) -> List[String]:
-	var collected: List[String] = names
+private pure func core_patterns_binder_vars(patterns: List[CorePattern], vars: List[CoreVar]) -> List[CoreVar]:
+	var collected: List[CoreVar] = vars
 
 	for pattern in patterns:
-		collected = core_pattern_binder_names(pattern, collected)
+		collected = core_pattern_binder_vars(pattern, collected)
 
 	collected
 
 
 ---
-Binders whose Core identity is not migrated yet (a match arm's pattern
-names, see `lower_raw_match_cases`) still have to shadow: a use of such a
-name must not resolve to an outer local that happens to share it, or it
-would take that local's id and be spelled as the wrong variable. Pushed
-with id 0, their uses resolve to id 0, exactly as an absent name did.
+Every alternative of an or-pattern binds the same names, and the arm body sees
+one variable per name, so each alternative must carry the first alternative's
+variable (its id) for that name.
 ---
-private pure func push_unmigrated_binders(
+private pure func unify_or_pattern_binders(alternatives: List[CorePattern]) -> List[CorePattern]:
+	match alternatives.get(0):
+		Some(first):
+			canonical: List[CoreVar] = core_pattern_binder_vars(first, [])
+			alternatives.map(pure func(alternative): rebind_pattern_variables(alternative, canonical))
+		None:
+			alternatives
+
+
+private pure func rebind_pattern_variables(pattern: CorePattern, canonical: List[CoreVar]) -> CorePattern:
+	match pattern:
+		NamePattern(variable):
+			var rebound: CoreVar = variable
+
+			for candidate in canonical:
+				if candidate.name == variable.name:
+					rebound = candidate
+					break
+
+			NamePattern(rebound)
+		ConstructorPattern(name, args):
+			ConstructorPattern(name, args.map(pure func(arg): rebind_pattern_variables(arg, canonical)))
+		QualifiedConstructorPattern(module_name, name, args):
+			QualifiedConstructorPattern(
+				module_name,
+				name,
+				args.map(pure func(arg): rebind_pattern_variables(arg, canonical)),
+			)
+		TuplePattern(items):
+			TuplePattern(items.map(pure func(item): rebind_pattern_variables(item, canonical)))
+		ListPattern(items, spread):
+			ListPattern(
+				items.map(pure func(item): rebind_pattern_variables(item, canonical)),
+				spread.map(pure func(item): rebind_pattern_variables(item, canonical)),
+			)
+		OrPattern(items):
+			OrPattern(items.map(pure func(item): rebind_pattern_variables(item, canonical)))
+		_:
+			pattern
+
+
+---
+The scope entries a pattern's binders introduce for the arm body.
+---
+private pure func push_pattern_binders(
 	context: CoreLowerContext,
-	names: List[String],
+	pattern: CorePattern,
 ) -> CoreLowerContext:
-	if names.is_empty():
+	vars: List[CoreVar] = core_pattern_binder_vars(pattern, [])
+
+	if vars.is_empty():
 		context
 	else:
-		var entries: List[CoreLowerScopeEntry] = []
-
-		for name in names:
-			-- A name with no outer local to shadow already resolves to id 0,
-			-- so only a name that hides an in-scope binder needs an entry.
-			if resolve_local_id(context, name).is_some():
-				entries = entries.append({ name = name, id = 0 })
-
-		if entries.is_empty():
-			context
-		else:
-			{ context | scope = context.scope.concat(entries) }
+		push_local_scopes(
+			context,
+			vars.map(pure func(variable: CoreVar): variable.name),
+			vars.map(pure func(variable: CoreVar): variable.id),
+		)
 
 
 ---
-Match bindings are deliberately NOT given scope-resolved identity in step
-1, unlike every other binder kind. `CorePattern.NamePattern` carries only
-a `String` (see `stage_09_core/ir.brp`; giving it a `id` is an IR
-change well outside lower.brp, and outside step 1's file list in
-docs/CORE_ID_MIGRATION.md). Worse: `stage_09_core/match_lowering.brp`'s
-direct-constructor fast path (`bind_constructor_payloads`) rebuilds its
-own `LetExpr` binder for a matched name via its own private `core_var`
-(`id = 0`) around the arm body Core lowering already produced. Giving
-the arm body's own uses of that name a nonzero, scope-resolved `id`
-here would desync them from that later-rebuilt `id = 0` binder --
-`core_var_equal` would call them different variables, `bind_constructor_
-payloads`'s consumer can conclude the original binding is unused, and
-the reference in `body` no longer names a declared C local. This was
-confirmed by a real `scripts/test leak` failure ("use of undeclared
-identifier") when this was pushed onto scope; reverted. A match
-binding's uses keep resolving through today's fallback (`id = 0`)
-until that consumer is also converted (see step 3/5 of the roadmap).
+A match arm's pattern binders carry the id of their own source span
+(`lower_core_pattern`), the arm body's uses resolve to it through the scope, and
+`match_lowering` builds the arm's binding from the pattern's own variable.
 ---
 private pure func lower_raw_match_cases(
 	context: CoreLowerContext,
@@ -2682,7 +2739,7 @@ private pure func lower_raw_match_cases(
 					failure = Some(error)
 				Ok(pattern):
 					match lower_typed_expr_with_context(
-						push_unmigrated_binders(context, core_pattern_binder_names(pattern, [])),
+						push_pattern_binders(context, pattern),
 						match_case.body,
 					):
 						Err(error):
@@ -2711,7 +2768,7 @@ private pure func lower_typed_concurrent_binding(
 	rhs ?= lower_typed_expr_with_context(context, binding.value)
 
 	Ok({
-		variable = core_var(binding.name.text, None),
+		variable = core_local_var(binding.name),
 		typ = typ,
 		rhs = rhs,
 	})
@@ -4432,11 +4489,14 @@ private pure func lower_typed_concurrent_for(
 	iterable_type = typed_expr_value_type(iterable)
 	item ?= concurrent_for_item(context.module_member_prefixes, iterable_type)
 	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
-	lowered_body ?= lower_typed_expr_with_context(push_unmigrated_binders(context, [name.text]), body)
+	lowered_body ?= lower_typed_expr_with_context(
+		push_local_scope(context, name.text, core_binder_id(name.span)),
+		body,
+	)
 	body_type ?= core_lower_value_type(context.module_member_prefixes, typed_expr_value_type(body))
 	lowered_params ?= lower_typed_concurrent_for_params(context, params, loc)
 	loop: CorePreClosureConcurrentlyLoop = {
-		variable = core_var(name.text, None),
+		variable = core_local_var(name),
 		item_type = item.item_type,
 		item_mode = item.item_mode,
 		iterable = lowered_iterable,
@@ -4639,7 +4699,7 @@ private pure func lower_resolved_call_kind(
 
 
 private pure func lower_question_bind_success_case(
-	name: ParsedIdentifier,
+	variable: CoreVar,
 	kind: CoreLowerCarrierKind,
 	success_body: CoreExpr,
 ) -> CoreRawMatchCase:
@@ -4650,7 +4710,7 @@ private pure func lower_question_bind_success_case(
 			"Ok"
 
 	{
-		pattern = ConstructorPattern(constructor, [NamePattern(name.text)]),
+		pattern = ConstructorPattern(constructor, [NamePattern(variable)]),
 		body = success_body
 	}
 
@@ -4668,10 +4728,7 @@ private pure func lower_question_bind_failure_case(
 		CoreLowerResultCarrier:
 			"Err"
 
-	failure_var = core_var(
-		question_bind_name("failure", span),
-		None,
-	)
+	failure_var = core_question_bind_var("failure", QUESTION_BIND_FAILURE_BAND, span)
 
 	failure_type ?= match kind:
 		CoreLowerOptionCarrier:
@@ -4687,7 +4744,7 @@ private pure func lower_question_bind_failure_case(
 		CoreLowerOptionCarrier:
 			ConstructorPattern(constructor, [])
 		CoreLowerResultCarrier:
-			ConstructorPattern(constructor, [NamePattern(failure_var.name)])
+			ConstructorPattern(constructor, [NamePattern(failure_var)])
 
 	Ok({
 		pattern = failure_pattern,
@@ -4724,21 +4781,17 @@ private pure func lower_typed_question_bind(
 		if block_kind != rhs_kind:
 			Err(CoreLowerInvalidType("?= carrier kind changed between inference and lowering"))
 		else:
-			-- NOT scope-resolved, matching `lower_raw_match_cases`'s
-			-- match-binding limitation above: `?=` desugars to exactly the
-			-- same `NamePattern`-bound `RawMatchExpr` shape (the `Some`/`Ok`
-			-- arm below), so it hits the identical `match_lowering.brp`
-			-- direct-constructor-fast-path desync. Confirmed by the same
-			-- kind of `scripts/test leak` "undeclared identifier" failure
-			-- this produced before being reverted. The name is still pushed
-			-- (id 0) so it shadows an outer local of the same name.
+			-- The bound name is a match binding of the `Some`/`Ok` arm below: its
+			-- id is the one `core_local_var(name)` gives that arm's pattern, so
+			-- the continuation's uses resolve to the binding that arm declares
+			-- and shadow an outer local of the same name.
 			success_body ?= lower_typed_block_expr(
-				push_unmigrated_binders(context, [name.text]),
+				push_local_scope(context, name.text, core_binder_id(name.span)),
 				rest,
 				clone_core_type(block_type),
 				clone_core_source_loc(loc),
 			)
-			success_case = lower_question_bind_success_case(name, rhs_kind, success_body)
+			success_case = lower_question_bind_success_case(core_local_var(name), rhs_kind, success_body)
 			failure_case ?= lower_question_bind_failure_case(
 				rhs_kind,
 				clone_core_type(rhs_type),
@@ -4746,10 +4799,7 @@ private pure func lower_typed_question_bind(
 				span,
 				clone_core_source_loc(loc),
 			)
-			tmp_var = core_var(
-				question_bind_name("value", span),
-				None,
-			)
+			tmp_var = core_question_bind_var("value", QUESTION_BIND_VALUE_BAND, span)
 			tmp_ref = VarExpr(
 				clone_core_var(tmp_var),
 				clone_core_type(rhs_type),
@@ -4773,13 +4823,6 @@ private pure func lower_typed_question_bind(
 			)
 
 
-private pure func with_resource_name(binding: TypedWithBinding) -> String:
-	if name_ids_equal(binding.name.name, NAME_ID_WILDCARD):
-		question_bind_name("resource", binding.span)
-	else:
-		binding.name.text
-
-
 ---
 The `with`-bound resource's own binder. A real name mints from its own
 identifier span like any other binder; `_` has no identifier to mint
@@ -4788,7 +4831,7 @@ self-contained treatment it already had.
 ---
 private pure func with_resource_var(binding: TypedWithBinding) -> CoreVar:
 	if name_ids_equal(binding.name.name, NAME_ID_WILDCARD):
-		core_var(with_resource_name(binding), None)
+		core_question_bind_var("resource", QUESTION_BIND_RESOURCE_BAND, binding.span)
 	else:
 		core_local_var(binding.name)
 
@@ -4871,18 +4914,18 @@ private pure func lower_with_mapped_failure_case(
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Result[CoreRawMatchCase, CoreLowerError]:
-	mapped_error ?= lower_typed_expr_with_context(context, mapper.value)
+	mapped_error ?= lower_typed_expr_with_context(
+		push_local_scope(context, mapper.name.text, core_binder_id(mapper.name.span)),
+		mapper.value,
+	)
 
 	failure_var = if name_ids_equal(mapper.name.name, NAME_ID_WILDCARD):
-		core_var(
-			question_bind_name("with_failure", mapper.span),
-			None,
-		)
+		core_question_bind_var("with_failure", QUESTION_BIND_WITH_FAILURE_BAND, mapper.span)
 	else:
-		core_var(mapper.name.text, None)
+		core_local_var(mapper.name)
 
 	Ok({
-		pattern = ConstructorPattern("Err", [NamePattern(failure_var.name)]),
+		pattern = ConstructorPattern("Err", [NamePattern(failure_var)]),
 		body = builtin_core_call("blorp_result_err", [mapped_error], result_type, loc),
 	})
 
@@ -4941,12 +4984,7 @@ private pure func lower_typed_with(
 			Err(CoreLowerInvalidType("with ?= carrier kind changed between inference and lowering"))
 		else:
 			-- Pending: a per-site synthesized binder; lowering has no name table.
-			payload_name: ParsedIdentifier = {
-				name = name_id_pending_dynamic_intern(),
-				text = question_bind_name("with_payload", binding.span),
-				span = binding.span
-			}
-			payload_var = core_var(payload_name.text, None)
+			payload_var = core_question_bind_var("with_payload", QUESTION_BIND_WITH_PAYLOAD_BAND, binding.span)
 			payload_ref = VarExpr(
 				clone_core_var(payload_var),
 				clone_core_type(resource_type),
@@ -4961,7 +4999,7 @@ private pure func lower_typed_with(
 				clone_core_source_loc(loc),
 			)
 			success_case = lower_question_bind_success_case(
-				payload_name,
+				payload_var,
 				acquisition_kind,
 				success_scope,
 			)
@@ -4973,10 +5011,7 @@ private pure func lower_typed_with(
 				clone_core_type(result_type),
 				clone_core_source_loc(loc),
 			)
-			temp_var = core_var(
-				question_bind_name("with_value", binding.span),
-				None,
-			)
+			temp_var = core_question_bind_var("with_value", QUESTION_BIND_WITH_VALUE_BAND, binding.span)
 			temp_ref = VarExpr(
 				clone_core_var(temp_var),
 				clone_core_type(acquisition_type),
@@ -5146,9 +5181,12 @@ private pure func lower_typed_block_expr(
 						Ok(VoidExpr(typ, loc))
 					else:
 						lower_typed_block_expr(
-							push_unmigrated_binders(
+							push_local_scopes(
 								context,
 								bindings.map(pure func(binding: TypedConcurrentBinding): binding.name.text),
+								bindings.map(
+									pure func(binding: TypedConcurrentBinding): core_binder_id(binding.name.span),
+								),
 							),
 							rest,
 							typ,

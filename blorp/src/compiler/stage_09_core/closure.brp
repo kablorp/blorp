@@ -6,6 +6,7 @@
 import:
 	../stage_08_core_lower/identity: mangled_definition_name
 	ir:
+		FIRST_MINTED_BINDER_ID,
 		CoreBoxedStorageValue,
 		CoreCallKind(
 			BuiltinCall,
@@ -330,6 +331,7 @@ record ClosureState {
 	next_lambda_index: Int,
 	next_task_index: Int,
 	next_def_id: Int,
+	next_binder_id: Int,
 	hoisted: List[CoreDecl]
 }
 
@@ -3221,82 +3223,123 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			expr_consumes_var(start, variable) or expr_consumes_var(end_value, variable)
 
 
+---
+`body` followed by a drop of `variable`. A body that yields a value is bound
+to a temporary so the drop can run between computing it and returning it; the
+temporary takes `next_binder_id - 1` (`CorePassState.next_binder_id`, see
+`FIRST_MINTED_BINDER_ID` in ir.brp), and `ids_used` is 1 exactly then.
+---
+private record DroppedBody {
+	expr: CoreExpr,
+	ids_used: Int
+}
+
+
 private pure func drop_after_body(
+	next_binder_id: Int,
 	variable: CoreVar,
 	value_type: CoreType,
 	body: CoreExpr,
 	loc: CoreSourceLoc,
-) -> CoreExpr:
+) -> DroppedBody:
 	release_policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(value_type)
 
 	if core_type_is_void(core_expr_type(body)):
-		SeqExpr(
-			body,
-			DropExpr(
-				variable,
-				value_type,
-				release_policy,
-				VoidExpr(VoidType, loc),
-				VoidType,
-				loc,
+		{
+			expr = SeqExpr(
+				body,
+				DropExpr(
+					variable,
+					value_type,
+					release_policy,
+					VoidExpr(VoidType, loc),
+					VoidType,
+					loc,
+				),
 			),
-		)
+			ids_used = 0
+		}
 	else:
-		result_var: CoreVar = core_var("__cdrop_" + variable.name)
+		result_var: CoreVar = { core_var("__cdrop_" + variable.name) | id = next_binder_id - 1 }
 		result_type: CoreType = core_expr_type(body)
-		LetExpr(
-			result_var,
-			False,
-			result_type,
-			body,
-			DropExpr(
-				variable,
-				value_type,
-				release_policy,
-				VarExpr(result_var, result_type, loc),
+		{
+			expr = LetExpr(
+				result_var,
+				False,
 				result_type,
-				loc,
+				body,
+				DropExpr(
+					variable,
+					value_type,
+					release_policy,
+					VarExpr(result_var, result_type, loc),
+					result_type,
+					loc,
+				),
 			),
-		)
+			ids_used = 1
+		}
 
 
 private pure func balance_task_copy_capture(
+	next_binder_id: Int,
 	body: CoreExpr,
 	capture: CoreTaskCapture,
 	loc: CoreSourceLoc,
-) -> CoreExpr:
+) -> DroppedBody:
 	match capture.kind:
 		TaskCopyCapture:
 			variable: CoreVar = { name = capture.name, id = capture.id, def_id = None }
 
 			if expr_consumes_var(body, variable):
-				body
+				{
+					expr = body,
+					ids_used = 0
+				}
 			else:
-				drop_after_body(variable, capture.typ, body, loc)
+				drop_after_body(next_binder_id, variable, capture.typ, body, loc)
 		TaskMoveResourceItem:
-			body
+			{
+				expr = body,
+				ids_used = 0
+			}
 		TaskStructuredTaskBorrow:
-			body
+			{
+				expr = body,
+				ids_used = 0
+			}
 
 
 private pure func balance_task_copy_captures(
+	next_binder_id: Int,
 	captures: List[CoreTaskCapture],
 	body: CoreExpr,
 	loc: CoreSourceLoc,
-) -> CoreExpr:
+) -> DroppedBody:
 	var balanced: CoreExpr = body
+	var ids_used: Int = 0
 	var index: Int = captures.length() - 1
 
 	while index >= 0:
 		match captures.get(index):
 			Some(capture):
-				balanced = balance_task_copy_capture(balanced, capture, loc)
+				dropped: DroppedBody = balance_task_copy_capture(
+					next_binder_id - ids_used,
+					balanced,
+					capture,
+					loc,
+				)
+				balanced = dropped.expr
+				ids_used += dropped.ids_used
 			None:
 				void
 
 		index -= 1
 
-	balanced
+	{
+		expr = balanced,
+		ids_used = ids_used
+	}
 
 
 private pure func add_hoisted_function(
@@ -3528,8 +3571,14 @@ private pure func hoist_task(
 	loc: CoreSourceLoc,
 ) -> HoistedTaskClosure:
 	closure_captures: List[CoreClosureCapture] = captures.map(closure_capture_from_task_capture)
-	balanced_body: CoreExpr = balance_task_copy_captures(captures, body, loc)
-	fresh: FreshHoistedName = next_task_name(state)
+	balanced: DroppedBody = balance_task_copy_captures(
+		state.next_binder_id,
+		captures,
+		body,
+		loc,
+	)
+	balanced_body: CoreExpr = balanced.expr
+	fresh: FreshHoistedName = next_task_name({ state | next_binder_id = state.next_binder_id - balanced.ids_used })
 	moved_captures: List[String] = captures.filter_map(func(capture):
 		if task_capture_moves_env_slot(capture):
 			Some(capture.name)
@@ -7462,12 +7511,13 @@ The mutable counters and hoisted-function accumulator, seeded once per
 program from the pass-state definition-id frontier. `hoisted` only ever
 grows as the walk hoists lambdas/etas/tasks.
 ---
-private pure func initial_counters(next_def_id: Int) -> ClosureState:
+private pure func initial_counters(next_def_id: Int, next_binder_id: Int) -> ClosureState:
 	{
 		next_eta_index = 0,
 		next_lambda_index = 0,
 		next_task_index = 0,
 		next_def_id = next_def_id,
+		next_binder_id = next_binder_id,
 		hoisted = []
 	}
 
@@ -7627,7 +7677,8 @@ rescanning the program.
 ---
 record ClosurePassResult {
 	program: CoreProgram,
-	next_def_id: Int
+	next_def_id: Int,
+	next_binder_id: Int
 }
 
 
@@ -7635,10 +7686,11 @@ private pure func run_closure_pass(
 	program: CoreProgram,
 	mode: ClosurePassMode,
 	next_def_id: Int,
+	next_binder_id: Int,
 ) -> ClosurePassResult:
 	converted: ConvertedDecls = convert_decls(
 		closure_facts(program, mode),
-		initial_counters(next_def_id),
+		initial_counters(next_def_id, next_binder_id),
 		program.decls,
 	)
 	{
@@ -7647,7 +7699,8 @@ private pure func run_closure_pass(
 			foreign_includes = program.foreign_includes,
 			source_files = program.source_files
 		},
-		next_def_id = converted.state.next_def_id
+		next_def_id = converted.state.next_def_id,
+		next_binder_id = converted.state.next_binder_id
 	}
 
 
@@ -7661,8 +7714,24 @@ pure func adapt_function_refs_program(
 	program: CoreProgram,
 	next_def_id: Int,
 ) -> ClosurePassResult:
-	run_closure_pass(program, AdaptFunctionRefs, next_def_id)
+	-- Adapting function references mints no binder ids (its eta parameters are
+	-- minted by the walk after Perceus), so the counter it starts from is never
+	-- read.
+	run_closure_pass(program, AdaptFunctionRefs, next_def_id, FIRST_MINTED_BINDER_ID)
+
+
+---
+Convert closures with binder ids for the temporaries the pass invents counting
+down from `next_binder_id` (the caller's `CorePassState.next_binder_id`);
+`ClosurePassResult.next_binder_id` is the counter afterwards.
+---
+pure func convert_program_minting(
+	program: CoreProgram,
+	next_def_id: Int,
+	next_binder_id: Int,
+) -> ClosurePassResult:
+	run_closure_pass(program, ConvertClosures, next_def_id, next_binder_id)
 
 
 pure func convert_program(program: CoreProgram, next_def_id: Int) -> ClosurePassResult:
-	run_closure_pass(program, ConvertClosures, next_def_id)
+	convert_program_minting(program, next_def_id, FIRST_MINTED_BINDER_ID)

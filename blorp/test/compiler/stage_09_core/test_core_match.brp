@@ -409,14 +409,14 @@ pure func test_normalizes_nested_builtin_constructors() -> Bool:
 	normalized: CorePattern = normalize_match_pattern(
 		collect_match_constructor_names(empty_program()),
 		ListPattern(
-			[NamePattern("Some"), NamePattern("value")],
-			Some(NamePattern("None")),
+			[NamePattern({ name = "Some", id = 0, def_id = None }), NamePattern({ name = "value", id = 0, def_id = None })],
+			Some(NamePattern({ name = "None", id = 0, def_id = None })),
 		),
 	)
 
 	match normalized:
-		ListPattern([ConstructorPattern("Some", []), NamePattern("value")], Some(ConstructorPattern("None", []))):
-			True
+		ListPattern([ConstructorPattern("Some", []), NamePattern(variable)], Some(ConstructorPattern("None", []))):
+			variable.name == "value"
 		_:
 			False
 
@@ -431,7 +431,7 @@ pure func test_fuses_direct_constructor_binding() -> Bool:
 			[arg],
 		),
 		[raw_match_case(
-				ConstructorPattern("Some", [NamePattern("value")]),
+				ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 				body,
 			), raw_match_case(WildcardPattern, int_expr(0))],
 	)
@@ -489,7 +489,7 @@ pure func test_expands_or_pattern_before_direct_fusion() -> Bool:
 		constructor_call("Some", [int_expr(42)]),
 		[raw_match_case(OrPattern([
 					ConstructorPattern("None", []),
-					ConstructorPattern("Some", [NamePattern("value")]),
+					ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 				]), int_expr(7))],
 	)
 
@@ -505,7 +505,7 @@ pure func test_does_not_fuse_non_constructor_call() -> Bool:
 		collect_match_constructor_names(empty_program()),
 		constructor_call("make_value", [int_expr(42)]),
 		[raw_match_case(
-				ConstructorPattern("Some", [NamePattern("value")]),
+				ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 				int_expr(7),
 			)],
 	)
@@ -520,7 +520,7 @@ pure func test_does_not_fuse_non_constructor_call() -> Bool:
 pure func test_compiles_catchall_binding_leaf() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
-		[raw_match_case(NamePattern("value"), int_expr(7))],
+		[raw_match_case(NamePattern({ name = "value", id = 0, def_id = None }), int_expr(7))],
 	)
 
 	match result:
@@ -575,7 +575,7 @@ pure func test_compiles_flat_constructor_switch() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(
-				ConstructorPattern("Some", [NamePattern("value")]),
+				ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 				int_expr(1),
 			), raw_match_case(
 				ConstructorPattern("None", []),
@@ -618,7 +618,7 @@ pure func test_constructor_grouping_preserves_first_occurrence_order() -> Bool:
 				ConstructorPattern("None", []),
 				int_expr(3),
 			), raw_match_case(
-				ConstructorPattern("Some", [NamePattern("value")]),
+				ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 				int_expr(4),
 			)],
 	)
@@ -645,7 +645,7 @@ pure func test_compiles_constructor_literal_payload() -> Bool:
 				ConstructorPattern("Some", [LiteralPattern(IntLiteral(1))]),
 				int_expr(10),
 			), raw_match_case(
-				ConstructorPattern("Some", [NamePattern("value")]),
+				ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 				int_expr(20),
 			), raw_match_case(
 				ConstructorPattern("None", []),
@@ -672,7 +672,7 @@ pure func test_compiles_nested_constructor_payload() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(
-				ConstructorPattern("Some", [ConstructorPattern("Some", [NamePattern("value")])]),
+				ConstructorPattern("Some", [ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })])]),
 				int_expr(10),
 			), raw_match_case(
 				ConstructorPattern("Some", [ConstructorPattern("None", [])]),
@@ -708,11 +708,66 @@ pure func test_compiles_nested_constructor_payload() -> Bool:
 			False
 
 
+private pure func leaf_binding_id(tree: CoreSemanticMatchTree, name: String) -> Option[Int]:
+	match tree:
+		SemanticMatchLeaf(bindings, _):
+			var found: Option[Int] = None
+
+			for binding in bindings:
+				if binding.variable.name == name:
+					found = Some(binding.variable.id)
+
+			found
+		_:
+			None
+
+
+-- Two arms of one constructor group (`Call`) bind the same spelling for a
+-- position the group does not test (`args`), each under its own variable. Each
+-- arm's leaf must declare its own variable; hoisting the first arm's binding
+-- over the group left the second arm's use undeclared. Confirmed by running
+-- this suite against `match_lowering.brp` from before the fix (`git show
+-- cbcb8ba16^:...`): this test alone fails there, the None leaf reporting no
+-- `args` binding.
+pure func test_constructor_group_arms_bind_their_own_outer_variables() -> Bool:
+	result = compile_match_cases(
+		collect_match_constructor_names(empty_program()),
+		[raw_match_case(
+				ConstructorPattern("Call", [ConstructorPattern("User", [WildcardPattern, ConstructorPattern("Some", [NamePattern({ name = "def_id", id = 5, def_id = None })])]), NamePattern({ name = "args", id = 1, def_id = None })]),
+				int_expr(10),
+			), raw_match_case(
+				ConstructorPattern("Call", [ConstructorPattern("User", [NamePattern({ name = "name", id = 6, def_id = None }), ConstructorPattern("None", [])]), NamePattern({ name = "args", id = 2, def_id = None })]),
+				int_expr(20),
+			)],
+	)
+
+	match result:
+		Some(SemanticConstructorMatch(_, [call_case], _)):
+			match call_case.body:
+				SemanticConstructorMatch(_, [user_case], _):
+					match user_case.body:
+						SemanticConstructorMatch(_, inner_cases, _):
+							match inner_cases:
+								[some_case, none_case]:
+									(
+										leaf_binding_id(some_case.body, "args") == Some(1)
+										and leaf_binding_id(none_case.body, "args") == Some(2)
+									)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
 pure func test_constructor_payload_catchall_shadows_later_cases() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(
-				ConstructorPattern("Some", [NamePattern("value")]),
+				ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 				int_expr(10),
 			), raw_match_case(
 				ConstructorPattern("Some", [ConstructorPattern("None", [])]),
@@ -744,11 +799,11 @@ pure func test_compiles_constructor_tuple_payload() -> Bool:
 		[raw_match_case(
 				ConstructorPattern(
 					"Ok",
-					[TuplePattern([NamePattern("value"), NamePattern("rest")])],
+					[TuplePattern([NamePattern({ name = "value", id = 0, def_id = None }), NamePattern({ name = "rest", id = 0, def_id = None })])],
 				),
 				int_expr(10),
 			), raw_match_case(
-				ConstructorPattern("Err", [NamePattern("error")]),
+				ConstructorPattern("Err", [NamePattern({ name = "error", id = 0, def_id = None })]),
 				int_expr(20),
 			)],
 	)
@@ -782,7 +837,7 @@ pure func test_compiles_constructor_tuple_payload() -> Bool:
 pure func test_compiles_simple_tuple_bindings() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
-		[raw_match_case(TuplePattern([NamePattern("left"), NamePattern("right")]), int_expr(1))],
+		[raw_match_case(TuplePattern([NamePattern({ name = "left", id = 0, def_id = None }), NamePattern({ name = "right", id = 0, def_id = None })]), int_expr(1))],
 	)
 
 	match result:
@@ -820,14 +875,14 @@ pure func test_preserves_all_pattern_binding_order_and_modes() -> Bool:
 				ConstructorPattern(
 					"Outer",
 					[
-						NamePattern("first"),
-						QualifiedConstructorPattern("profile", "Inner", [NamePattern("second")]),
+						NamePattern({ name = "first", id = 0, def_id = None }),
+						QualifiedConstructorPattern("profile", "Inner", [NamePattern({ name = "second", id = 0, def_id = None })]),
 						TuplePattern([
-							NamePattern("third"),
+							NamePattern({ name = "third", id = 0, def_id = None }),
 							WildcardPattern,
 							LiteralPattern(IntLiteral(3)),
 						]),
-						ListPattern([NamePattern("fourth")], Some(NamePattern("rest"))),
+						ListPattern([NamePattern({ name = "fourth", id = 0, def_id = None })], Some(NamePattern({ name = "rest", id = 0, def_id = None }))),
 					],
 				),
 				variable_expr(
@@ -883,7 +938,7 @@ pure func test_compiles_tuple_constructor_columns() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(TuplePattern([
-					ConstructorPattern("Some", [NamePattern("value")]),
+					ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })]),
 					ConstructorPattern("None", []),
 				]), int_expr(10)), raw_match_case(WildcardPattern, int_expr(20))],
 	)
@@ -905,7 +960,7 @@ pure func test_compiles_tuple_constructor_and_list_columns() -> Bool:
 		[raw_match_case(
 				TuplePattern([
 					ConstructorPattern("Some", []),
-					ListPattern([NamePattern("value")], None),
+					ListPattern([NamePattern({ name = "value", id = 0, def_id = None })], None),
 				]),
 				variable_expr("value", int_type()),
 			), raw_match_case(WildcardPattern, int_expr(20))],
@@ -931,8 +986,8 @@ pure func test_compiles_tuple_with_two_list_columns() -> Bool:
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(
 				TuplePattern([
-					ListPattern([NamePattern("left")], None),
-					ListPattern([NamePattern("right")], None),
+					ListPattern([NamePattern({ name = "left", id = 0, def_id = None })], None),
+					ListPattern([NamePattern({ name = "right", id = 0, def_id = None })], None),
 				]),
 				variable_expr("right", int_type()),
 			), raw_match_case(WildcardPattern, int_expr(20))],
@@ -957,10 +1012,10 @@ pure func test_preserves_list_spread_source_order() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(
-				ListPattern([NamePattern("head")], Some(NamePattern("rest"))),
+				ListPattern([NamePattern({ name = "head", id = 0, def_id = None })], Some(NamePattern({ name = "rest", id = 0, def_id = None }))),
 				int_expr(10),
 			), raw_match_case(
-				ListPattern([NamePattern("only")], None),
+				ListPattern([NamePattern({ name = "only", id = 0, def_id = None })], None),
 				int_expr(20),
 			), raw_match_case(WildcardPattern, int_expr(30))],
 	)
@@ -1007,7 +1062,7 @@ pure func test_compiles_list_constructor_elements() -> Bool:
 	result = compile_match_cases(
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(
-				ListPattern([ConstructorPattern("Some", [NamePattern("value")])], None),
+				ListPattern([ConstructorPattern("Some", [NamePattern({ name = "value", id = 0, def_id = None })])], None),
 				int_expr(10),
 			), raw_match_case(WildcardPattern, int_expr(20))],
 	)
@@ -1032,8 +1087,8 @@ pure func test_compiles_list_tuple_elements() -> Bool:
 		collect_match_constructor_names(empty_program()),
 		[raw_match_case(
 				ListPattern(
-					[TuplePattern([NamePattern("key"), NamePattern("value")])],
-					Some(NamePattern("rest")),
+					[TuplePattern([NamePattern({ name = "key", id = 0, def_id = None }), NamePattern({ name = "value", id = 0, def_id = None })])],
+					Some(NamePattern({ name = "rest", id = 0, def_id = None })),
 				),
 				variable_expr("value", int_type()),
 			), raw_match_case(WildcardPattern, int_expr(20))],
@@ -1071,7 +1126,7 @@ pure func test_ordered_list_match_current_fallback_duplication_count() -> Bool:
 
 pure func test_omits_unused_list_spread_binding() -> Bool:
 	result = compile_match_cases(collect_match_constructor_names(empty_program()), [raw_match_case(
-				ListPattern([NamePattern("head")], Some(NamePattern("rest"))),
+				ListPattern([NamePattern({ name = "head", id = 0, def_id = None })], Some(NamePattern({ name = "rest", id = 0, def_id = None }))),
 				int_expr(10),
 			)])
 
@@ -1084,7 +1139,7 @@ pure func test_omits_unused_list_spread_binding() -> Bool:
 
 pure func test_preserves_used_list_spread_binding() -> Bool:
 	result = compile_match_cases(collect_match_constructor_names(empty_program()), [raw_match_case(
-				ListPattern([NamePattern("head")], Some(NamePattern("rest"))),
+				ListPattern([NamePattern({ name = "head", id = 0, def_id = None })], Some(NamePattern({ name = "rest", id = 0, def_id = None }))),
 				variable_expr("rest", list_int_type()),
 			)])
 
@@ -1104,7 +1159,7 @@ pure func test_omits_list_spread_shadowed_by_let_body() -> Bool:
 		variable_expr("rest", list_int_type()),
 	)
 	result = compile_match_cases(collect_match_constructor_names(empty_program()), [raw_match_case(
-				ListPattern([NamePattern("head")], Some(NamePattern("rest"))),
+				ListPattern([NamePattern({ name = "head", id = 0, def_id = None })], Some(NamePattern({ name = "rest", id = 0, def_id = None }))),
 				shadowed_body,
 			)])
 
@@ -1124,7 +1179,7 @@ pure func test_preserves_list_spread_used_by_let_rhs() -> Bool:
 		int_expr(10),
 	)
 	result = compile_match_cases(collect_match_constructor_names(empty_program()), [raw_match_case(
-				ListPattern([NamePattern("head")], Some(NamePattern("rest"))),
+				ListPattern([NamePattern({ name = "head", id = 0, def_id = None })], Some(NamePattern({ name = "rest", id = 0, def_id = None }))),
 				outer_use,
 			)])
 
@@ -1141,7 +1196,7 @@ pure func test_compiles_constructor_wrapped_list_pattern() -> Bool:
 		[raw_match_case(
 				ConstructorPattern(
 					"Some",
-					[ListPattern([NamePattern("head")], Some(NamePattern("rest")))],
+					[ListPattern([NamePattern({ name = "head", id = 0, def_id = None })], Some(NamePattern({ name = "rest", id = 0, def_id = None })))],
 				),
 				variable_expr("head", int_type()),
 			), raw_match_case(
@@ -1217,7 +1272,7 @@ pure func test_program_normalizes_before_direct_constructor_fusion() -> Bool:
 			[],
 		),
 		[
-			raw_match_case(NamePattern("None"), int_expr(7)),
+			raw_match_case(NamePattern({ name = "None", id = 0, def_id = None }), int_expr(7)),
 			raw_match_case(WildcardPattern, int_expr(9)),
 		],
 		int_type(),
@@ -1255,6 +1310,10 @@ tests: TestSuite = {
 		),
 		("compiles constructor literal payload", test_compiles_constructor_literal_payload),
 		("compiles nested constructor payload", test_compiles_nested_constructor_payload),
+		(
+			"constructor group arms bind their own outer variables",
+			test_constructor_group_arms_bind_their_own_outer_variables,
+		),
 		(
 			"constructor payload catchall shadows later cases",
 			test_constructor_payload_catchall_shadows_later_cases,

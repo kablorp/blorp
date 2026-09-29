@@ -493,7 +493,7 @@ private BUILTIN_CONSTRUCTOR_NAMES: List[String] = [
 
 private union DirectConstructorPayload:
 	DiscardDirectConstructorPayload
-	BindDirectConstructorPayload(String)
+	BindDirectConstructorPayload(CoreVar)
 
 
 private enum MatchCaseShape:
@@ -511,6 +511,7 @@ private enum PatternMatrixAccessorKind:
 
 
 private record ConstructorCaseArm {
+	outer_bindings: List[CoreSemanticMatchBinding],
 	patterns: List[CorePattern],
 	body: CoreExpr
 }
@@ -528,16 +529,9 @@ private record ConstructorCaseGroups {
 }
 
 
-private record NestedConstructorCaseArm {
-	patterns: List[CorePattern],
-	outer_bindings: List[CoreSemanticMatchBinding],
-	body: CoreExpr
-}
-
-
 private record NestedConstructorCaseGroup {
 	constructor: String,
-	arms: List[NestedConstructorCaseArm]
+	arms: List[ConstructorCaseArm]
 }
 
 
@@ -591,9 +585,9 @@ pure func collect_match_constructor_names(program: CoreProgram) -> Set[String]:
 
 pure func normalize_match_pattern(constructors: Set[String], pattern: CorePattern) -> CorePattern:
 	match pattern:
-		NamePattern(name):
-			if Sets.contains(constructors, name):
-				ConstructorPattern(name, [])
+		NamePattern(variable):
+			if Sets.contains(constructors, variable.name):
+				ConstructorPattern(variable.name, [])
 			else:
 				pattern
 		ConstructorPattern(name, args):
@@ -731,10 +725,13 @@ private pure func direct_constructor_payload(
 	pattern: CorePattern,
 ) -> Option[DirectConstructorPayload]:
 	match pattern:
-		NamePattern("_") | WildcardPattern:
+		WildcardPattern:
 			Some(DiscardDirectConstructorPayload)
-		NamePattern(name):
-			Some(BindDirectConstructorPayload(name))
+		NamePattern(variable):
+			if variable.name == "_":
+				Some(DiscardDirectConstructorPayload)
+			else:
+				Some(BindDirectConstructorPayload(variable))
 		_:
 			None
 
@@ -819,9 +816,9 @@ private pure func bind_constructor_payloads(
 					match payload:
 						DiscardDirectConstructorPayload:
 							result = SeqExpr(arg, result)
-						BindDirectConstructorPayload(name):
+						BindDirectConstructorPayload(variable):
 							result = LetExpr(
-								core_var(name),
+								variable,
 								False,
 								core_expr_type(arg),
 								arg,
@@ -892,10 +889,10 @@ private pure func catchall_binding(
 	accessor: CoreSemanticMatchAccessor,
 ) -> List[CoreSemanticMatchBinding]:
 	match pattern:
-		NamePattern(name):
+		NamePattern(variable):
 			[
 				{
-					variable = core_var(name),
+					variable = variable,
 					accessor = accessor,
 					mode = MatchBorrowBindingMode
 				},
@@ -912,7 +909,7 @@ private pure func catchall_leaf(pattern: CorePattern, body: CoreExpr) -> CoreSem
 
 
 private pure func semantic_binding(
-	name: String,
+	variable: CoreVar,
 	accessor: CoreSemanticMatchAccessor,
 ) -> CoreSemanticMatchBinding:
 	mode: CoreMatchBindingMode = match accessor:
@@ -922,7 +919,7 @@ private pure func semantic_binding(
 			MatchBorrowBindingMode
 
 	{
-		variable = core_var(name),
+		variable = variable,
 		accessor = accessor,
 		mode = mode
 	}
@@ -939,9 +936,9 @@ private pure func prepend_pattern_bindings(
 	pattern: CorePattern,
 ) -> PatternBindingSequence:
 	match pattern:
-		NamePattern(name):
+		NamePattern(variable):
 			PatternBindingThen(
-				semantic_binding(name, accessor),
+				semantic_binding(variable, accessor),
 				bindings,
 			)
 		ConstructorPattern(constructor, patterns) | QualifiedConstructorPattern(_, constructor, patterns):
@@ -982,10 +979,10 @@ private pure func prepend_pattern_bindings(
 			result
 		ListPattern(patterns, spread):
 			var result: PatternBindingSequence = match spread:
-				Some(NamePattern(name)):
+				Some(NamePattern(variable)):
 					PatternBindingThen(
 						semantic_binding(
-							name,
+							variable,
 							ListSpreadSemanticMatchAccessor(accessor, patterns.length()),
 						),
 						bindings,
@@ -1036,6 +1033,19 @@ private pure func collect_pattern_bindings(
 	pattern: CorePattern,
 ) -> List[CoreSemanticMatchBinding]:
 	pattern_binding_sequence_to_list(prepend_pattern_bindings(NoPatternBindings, accessor, pattern))
+
+
+---
+A constructor group's arm binds its own variables, including those of enclosing
+patterns above the group (`outer_bindings`): each arm's leaf declares its own,
+because two arms that bind one spelling still name different variables.
+---
+private pure func constructor_arm_bindings(
+	base: CoreSemanticMatchAccessor,
+	constructor: String,
+	arm: ConstructorCaseArm,
+) -> List[CoreSemanticMatchBinding]:
+	arm.outer_bindings.concat(constructor_pattern_bindings(base, constructor, arm.patterns))
 
 
 private pure func prepend_constructor_pattern_bindings(
@@ -1365,7 +1375,7 @@ private pure func literal_subpattern_tree(
 				literal_cases = literal_cases.append({
 					literal = literal,
 					body = SemanticMatchLeaf(
-						constructor_pattern_bindings(base, constructor, arm.patterns),
+						constructor_arm_bindings(base, constructor, arm),
 						arm.body,
 					),
 				})
@@ -1374,7 +1384,7 @@ private pure func literal_subpattern_tree(
 					if default.is_none():
 						default = Some(
 							SemanticMatchLeaf(
-								constructor_pattern_bindings(base, constructor, arm.patterns),
+								constructor_arm_bindings(base, constructor, arm),
 								arm.body,
 							),
 						)
@@ -1517,6 +1527,7 @@ private pure func group_constructor_cases(
 			Some(parts):
 				constructor: String = parts[0]
 				arm: ConstructorCaseArm = {
+					outer_bindings = [],
 					patterns = parts[1],
 					body = match_case.body
 				}
@@ -1581,16 +1592,12 @@ private pure func nested_constructor_subpattern_tree(
 				match constructor_pattern_parts(pattern):
 					Some(parts):
 						nested_constructor: String = parts[0]
-						outer_bindings: List[CoreSemanticMatchBinding] = constructor_pattern_bindings(
-							base,
-							constructor,
-							arm.patterns,
-						).filter(
+						outer_bindings: List[CoreSemanticMatchBinding] = constructor_arm_bindings(base, constructor, arm).filter(
 							func(
 								binding,
 							): not semantic_accessor_starts_with(accessor, binding.accessor),
 						)
-						nested_arm: NestedConstructorCaseArm = {
+						nested_arm: ConstructorCaseArm = {
 							patterns = parts[1],
 							outer_bindings = outer_bindings,
 							body = arm.body
@@ -1626,11 +1633,7 @@ private pure func nested_constructor_subpattern_tree(
 							if default.is_none():
 								default = Some(
 									SemanticMatchLeaf(
-										constructor_pattern_bindings(
-											base,
-											constructor,
-											arm.patterns,
-										),
+										constructor_arm_bindings(base, constructor, arm),
 										arm.body,
 									),
 								)
@@ -1649,10 +1652,7 @@ private pure func nested_constructor_subpattern_tree(
 		for group in groups.ordered:
 			match group.arms.get(0):
 				Some(first_arm):
-					core_arms: List[ConstructorCaseArm] = group.arms.map(func(arm): {
-							patterns = arm.patterns,
-							body = arm.body
-						})
+					core_arms: List[ConstructorCaseArm] = group.arms
 
 					match compile_constructor_group_tree(
 						accessor,
@@ -1663,7 +1663,7 @@ private pure func nested_constructor_subpattern_tree(
 						Some(body):
 							cases = cases.append({
 								constructor = group.constructor,
-								body = prepend_semantic_bindings(body, first_arm.outer_bindings),
+								body = body,
 							})
 						None:
 							failed = True
@@ -1741,11 +1741,7 @@ private pure func tuple_subpattern_tree(
 			Some(TuplePattern(patterns)):
 				matrix_arms = matrix_arms.append({
 					patterns = patterns,
-					bindings = constructor_pattern_bindings(
-						base,
-						constructor,
-						arm.patterns,
-					).filter(
+					bindings = constructor_arm_bindings(base, constructor, arm).filter(
 						func(
 							binding,
 						): not semantic_accessor_starts_with(accessor, binding.accessor),
@@ -1756,7 +1752,7 @@ private pure func tuple_subpattern_tree(
 				if is_catchall_pattern(pattern):
 					matrix_arms = matrix_arms.append({
 						patterns = wildcard_patterns(width),
-						bindings = constructor_pattern_bindings(base, constructor, arm.patterns),
+						bindings = constructor_arm_bindings(base, constructor, arm),
 						body = SemanticMatchLeaf([], arm.body),
 					})
 				else:
@@ -1790,11 +1786,7 @@ private pure func list_subpattern_tree(
 	for arm in arms:
 		match arm.patterns.get(position):
 			Some(ListPattern(patterns, spread)):
-				outer_bindings: List[CoreSemanticMatchBinding] = constructor_pattern_bindings(
-					base,
-					constructor,
-					arm.patterns,
-				).filter(
+				outer_bindings: List[CoreSemanticMatchBinding] = constructor_arm_bindings(base, constructor, arm).filter(
 					func(binding): not semantic_accessor_starts_with(accessor, binding.accessor),
 				)
 				matrix_arm: PatternMatrixArm = {
@@ -1818,7 +1810,7 @@ private pure func list_subpattern_tree(
 				if is_catchall_pattern(pattern):
 					sequence = sequence.append(
 						CatchallListPatternArm(
-							constructor_pattern_bindings(base, constructor, arm.patterns),
+							constructor_arm_bindings(base, constructor, arm),
 							SemanticMatchLeaf([], arm.body),
 						),
 					)
@@ -1846,7 +1838,7 @@ private pure func compile_constructor_group_tree(
 			if arm.patterns.all(is_catchall_pattern):
 				Some(
 					SemanticMatchLeaf(
-						constructor_pattern_bindings(base, constructor, arm.patterns),
+						constructor_arm_bindings(base, constructor, arm),
 						arm.body,
 					),
 				)
@@ -1893,7 +1885,7 @@ private pure func compile_constructor_group_tree(
 					None:
 						Some(
 							SemanticMatchLeaf(
-								constructor_pattern_bindings(base, constructor, arm.patterns),
+								constructor_arm_bindings(base, constructor, arm),
 								arm.body,
 							),
 						)
@@ -2400,10 +2392,10 @@ private pure func list_spread_tree_binding(
 	body: CoreSemanticMatchTree,
 ) -> List[CoreSemanticMatchBinding]:
 	match spread:
-		Some(NamePattern(name)):
-			if semantic_match_tree_name_may_occur_free(body, name):
+		Some(NamePattern(variable)):
+			if semantic_match_tree_name_may_occur_free(body, variable.name):
 				[semantic_binding(
-						name,
+						variable,
 						ListSpreadSemanticMatchAccessor(base, fixed_length),
 					)]
 			else:
@@ -3006,10 +2998,10 @@ private pure func list_spread_binding(
 	body: CoreExpr,
 ) -> List[CoreSemanticMatchBinding]:
 	match spread:
-		Some(NamePattern(name)):
-			if core_name_may_occur_free(name, body):
+		Some(NamePattern(variable)):
+			if core_name_may_occur_free(variable.name, body):
 				[semantic_binding(
-						name,
+						variable,
 						ListSpreadSemanticMatchAccessor(base, fixed_length),
 					)]
 			else:

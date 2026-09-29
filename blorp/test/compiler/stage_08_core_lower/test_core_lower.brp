@@ -165,6 +165,7 @@ import:
 			TypedConstructorPattern,
 			TypedIntPattern,
 			TypedNamePattern,
+			TypedOrPattern,
 			TypedWildcardPattern,
 		),
 		TypedRecordField,
@@ -242,6 +243,14 @@ import:
 		core_lower_context,
 		core_lower_context_with_callable_names,
 		core_lower_type,
+		QUESTION_BIND_FAILURE_BAND,
+		QUESTION_BIND_ID_BAND,
+		QUESTION_BIND_VALUE_BAND,
+		QUESTION_BIND_RESOURCE_BAND,
+		QUESTION_BIND_WITH_FAILURE_BAND,
+		QUESTION_BIND_WITH_PAYLOAD_BAND,
+		QUESTION_BIND_WITH_VALUE_BAND,
+		core_question_bind_var,
 		core_source_loc,
 		lower_typed_decl,
 		lower_typed_expr,
@@ -329,7 +338,7 @@ import:
 			WideIntLiteral,
 		),
 		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
-		CorePattern(ConstructorPattern, LiteralPattern, NamePattern, WildcardPattern),
+		CorePattern(ConstructorPattern, LiteralPattern, NamePattern, OrPattern, WildcardPattern),
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreTensorForElementStorage(TensorForRowSliceElement, TensorForRuntimeReadElement),
 		CoreTensorRuntimeReadHelper(TensorRuntimeReadI64),
@@ -4311,15 +4320,10 @@ func test_lambda_parameter_shadows_enclosing_let() -> Bool:
 			False
 
 
--- Match bindings are deliberately NOT scope-resolved in step 1 (see the
--- docstring on `lower_raw_match_cases` in lower.brp): giving them real
--- identity desyncs from `match_lowering.brp`'s direct-constructor fast
--- path, which rebuilds its own `id = 0` binder around the already-lowered
--- arm body. This pins that intentional limitation: a plain match binding's
--- arm-body reference still lowers at `id = 0` (today's fallback for a
--- name absent from scope), exactly like every other reference this step
--- does not cover.
-func test_match_binding_does_not_mint_identity_yet() -> Bool:
+-- A match binding's arm-body reference lowers to the binding's own id (its
+-- span start plus one), the id `lower_core_pattern` gives the pattern's
+-- variable, so match lowering can declare exactly that variable.
+func test_match_binding_mints_identity_from_its_own_span() -> Bool:
 	span = fixture_source_span_at(26, 27)
 	binding_case: TypedMatchCase = {
 		pattern = TypedNamePattern(ident_at("v", 26, 27), int_type()),
@@ -4340,7 +4344,7 @@ func test_match_binding_does_not_mint_identity_yet() -> Bool:
 					core_exprs_equal(
 						lowered_case.body,
 						VarExpr(
-							{ name = "v", id = 0, def_id = None },
+							{ name = "v", id = 27, def_id = None },
 							core_int_type(),
 							core_source_loc(0, fixture_source_table(), span),
 						),
@@ -4351,10 +4355,87 @@ func test_match_binding_does_not_mint_identity_yet() -> Bool:
 			False
 
 
+-- Every alternative of an or-pattern binds the same variable, so each lowers to
+-- the first alternative's variable and id; otherwise the arm body would refer
+-- to a binder only one alternative declares.
+func test_or_pattern_alternatives_share_the_first_alternatives_binder() -> Bool:
+	or_case: TypedMatchCase = {
+		pattern = TypedOrPattern(
+			[
+				TypedConstructorPattern(
+					ident("A"),
+					[TypedNamePattern(ident_at("x", 10, 11), int_type())],
+					fixture_source_span_at(8, 12),
+					"Choice",
+					101,
+				),
+				TypedConstructorPattern(
+					ident("B"),
+					[TypedNamePattern(ident_at("x", 30, 31), int_type())],
+					fixture_source_span_at(28, 32),
+					"Choice",
+					102,
+				),
+			],
+			fixture_source_span_at(8, 32),
+		),
+		body = int_expr("1"),
+		span = fixture_source_span_at(8, 40)
+	}
+	expr = TypedMatchExpr(
+		TypedNameExpr(ident("scrutinee"), expr_info(int_type())),
+		[or_case],
+		fixture_source_span_at(0, 40),
+		expr_info(int_type()),
+	)
+
+	match lower_typed_expr(fixture_source_table(), expr):
+		Ok(RawMatchExpr(_, cases, _, _)):
+			match cases.get(0):
+				Some(lowered_case):
+					match lowered_case.pattern:
+						OrPattern(alternatives):
+							ids = alternatives.map(
+								func(alternative: CorePattern) -> Int:
+									match alternative:
+										ConstructorPattern(_, [NamePattern(bound)]):
+											bound.id
+										_:
+											0
+							)
+							ids == [11, 11]
+						_:
+							False
+				None:
+					False
+		_:
+			False
+
+
+-- The six `?=`/`with` binder kinds at one span must not collide with each other
+-- or with the authored (below 2^31) and SSA-seed (from 2^31) id ranges.
+func test_question_bind_kinds_at_one_span_get_distinct_ids() -> Bool:
+	span = fixture_source_span_at(26, 27)
+	bands = [
+		QUESTION_BIND_FAILURE_BAND,
+		QUESTION_BIND_VALUE_BAND,
+		QUESTION_BIND_RESOURCE_BAND,
+		QUESTION_BIND_WITH_FAILURE_BAND,
+		QUESTION_BIND_WITH_PAYLOAD_BAND,
+		QUESTION_BIND_WITH_VALUE_BAND,
+	]
+	ids = bands.map(func(band: Int) -> Int: core_question_bind_var("k", band, span).id)
+	distinct = ids.filter(
+		func(id: Int) -> Bool: ids.filter(func(other: Int) -> Bool: other == id).length() == 1
+	)
+	above_ssa_seed = ids.filter(func(id: Int) -> Bool: id >= QUESTION_BIND_ID_BAND)
+	distinct.length() == bands.length() and above_ssa_seed.length() == bands.length()
+
+
 -- A match binding that reuses the name of an in-scope local shadows it: its
--- arm-body reference must lower at `id = 0` (the binding's own identity), not
--- at the outer local's id, or the emitter would spell the use as the outer
--- variable while the binding is declared under its source name.
+-- arm-body reference must lower at the binding's own id (its span start plus
+-- one), not at the outer local's id, or the emitter would spell the use as the
+-- outer variable.
 func test_match_binding_shadows_an_outer_local_of_the_same_name() -> Bool:
 	outer_span = fixture_source_span_at(10, 11)
 	match_span = fixture_source_span_at(26, 27)
@@ -4388,7 +4469,7 @@ func test_match_binding_shadows_an_outer_local_of_the_same_name() -> Bool:
 					core_exprs_equal(
 						lowered_case.body,
 						VarExpr(
-							{ name = "x", id = 0, def_id = None },
+							{ name = "x", id = 27, def_id = None },
 							core_int_type(),
 							core_source_loc(0, fixture_source_table(), match_span),
 						),
@@ -4503,6 +4584,7 @@ func test_lowers_block_head_concurrent_block_with_tail_scope() -> Bool:
 					(
 						block.bindings.length() == 1
 						and binding.variable.name == "task"
+						and binding.variable.id != 0
 						and core_type_to_json(
 							binding.typ,
 						).to_string() == core_type_to_json(core_task_result_int_type()).to_string()
@@ -4517,11 +4599,7 @@ func test_lowers_block_head_concurrent_block_with_tail_scope() -> Bool:
 						and core_exprs_equal(
 							block.body,
 							VarExpr(
-								{
-									name = "task",
-									id = 0,
-									def_id = None
-								},
+								binding.variable,
 								core_task_result_int_type(),
 								core_source_loc(
 									0,
@@ -7241,8 +7319,16 @@ tests: TestSuite = {
 			test_lambda_parameter_shadows_enclosing_let,
 		),
 		(
-			"match binding does not mint identity yet",
-			test_match_binding_does_not_mint_identity_yet,
+			"match binding mints identity from its own span",
+			test_match_binding_mints_identity_from_its_own_span,
+		),
+		(
+			"or-pattern alternatives share the first alternative's binder",
+			test_or_pattern_alternatives_share_the_first_alternatives_binder,
+		),
+		(
+			"question-bind kinds at one span get distinct ids",
+			test_question_bind_kinds_at_one_span_get_distinct_ids,
 		),
 		(
 			"match binding shadows an outer local of the same name",

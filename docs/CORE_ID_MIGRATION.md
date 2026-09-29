@@ -152,11 +152,18 @@ The important gaps are:
   `{ name: String, id: Int, def_id: Option[Int] }`;
 - the current Core `id` is only function-local and is not sufficient by itself
   outside its owning function;
-- match bindings and many synthetic Core passes still use `id = 0` or bake
-  uniqueness into generated strings;
+- lowering gives every authored binder an id from its own source span,
+  match-arm and `?=` pattern binders included (`CorePattern.NamePattern`
+  carries its `CoreVar`, and an or-pattern's alternatives share one variable
+  per name); the binders lowering invents for `?=`/`with` take ids from
+  per-kind bands above the authored range. Synthetic Core passes still create
+  binders with `id = 0`, dominated by Perceus temporaries
+  (`__borrow_arg`, `__cdrop_`, `__aggregate_field`, `owned_result`, ...),
+  match-projection scrutinee temporaries and the `synth_*` bodies; the closure
+  pass mints its drop temporaries from `CorePassState.next_binder_id`;
 - `CoreProgram` drops the frontend `DefinitionTable` at graph preparation, so
   later stages cannot use the existing canonical ID-to-name table;
-- local C names still come from `c_local_name(variable.name)`;
+- local C names still come from `c_local_name(variable.name)` when `id = 0` (binder id otherwise);
 - Core and backend still contain semantic decisions made from source spelling,
   including intrinsic/runtime recognition and several name-keyed ownership
   catalogs.
@@ -191,6 +198,16 @@ boundary. A local becomes an entity at the exact inference point that proves a
 source site is a binder; no separate full-body prewalk is required. Existing
 lexical inference is the one resolution boundary. No later pass repeats
 discovery or lexical resolution.
+
+### Interim states introduced by synthetic-binder minting
+
+Each entry names the shortcut and the step that deletes it.
+
+| Interim state | Where | Deleted by |
+| --- | --- | --- |
+| Authored and `?=`/`with` binder ids derive from the construct's span start (`core_binder_id`, `core_question_bind_var`; start offsets must stay below 2^31) | `stage_08_core_lower/lower.brp` | A1b: the frontend mints binder ids and lowering only reads them |
+| `synth_list` builds its `Some(__value)` pattern binder at id 0; `run_synth_pass` does not thread `next_binder_id` | `stage_09_core/synth_list.brp` | The smaller-passes step: mint from `CorePassState.next_binder_id` once the synth pass threads state |
+| `direct_constructor_payload` recognises a discarded payload by the name `_` on a `NamePattern` | `stage_09_core/match_lowering.brp` | Lowering emits `WildcardPattern` for `_` name patterns, then the name test is removed |
 
 ## Identity vocabulary
 
