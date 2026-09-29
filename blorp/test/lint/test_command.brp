@@ -1,7 +1,6 @@
 import:
 	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/compiler/pipeline: typecheck_frontend_root_only
-	../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE
 	../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
 	../../src/compiler/stage_04_modules/frontend_graph: FrontendModule
 	../../src/compiler/stage_04_modules/frontend_graph_service: validated_frontend_graph_for_modules
@@ -29,9 +28,16 @@ import:
 		),
 		LintSeverity(LintAdvice),
 		lint_rule_id_name,
+	../../src/compiler/stage_02_lex/name_table:
+		EMPTY_NAME_TABLE,
+		IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable),
+		name_id_index,
+		name_table_from_parts,
+	../../src/compiler/stage_06_typecheck/decl: TypedDecl(TypedRecordDecl)
 	../../src/lint/command: execute_lint_plan, lint_context, lint_module
 	../../src/main: run_cli
 	../compiler/typecheck_test_support as TypecheckTestSupport
+	list: repeat
 	json: JsonValue(JsonNumber), as_array, get_field, parse_json
 	system: mkdir, remove_dir, remove_file, temp_dir, write_file
 	test: TestSuite
@@ -176,6 +182,39 @@ func test_single_field_record_finding_has_stable_contract() -> Bool:
 				and finding.span.end_column == 15
 				and finding.message == "Record 'Wrapper' has one field; consider using the field type directly."
 			)
+		_:
+			False
+
+
+-- The finding's spelling comes from the context's `identifier_spellings`:
+-- a table that spells the record's id differently wins, and the text source
+-- gives what was written.
+func test_lint_message_reads_the_identifier_spelling_from_the_context() -> Bool:
+	root = lint_graph_source("record Wrapper {value: Int}")
+	typechecked = typecheck_frontend_root_only(lint_graph(root), root, False)
+
+	match typechecked.target.typed_program.decls:
+		[TypedRecordDecl(info)]:
+			index = name_id_index(info.decl.name.name)
+			respelled = name_table_from_parts(repeat("filler", index).append("Respelled"), {})
+			base = lint_context(typechecked)
+			from_table = lint_module(
+				typechecked.target,
+				{ base | identifier_spellings = SpellingsFromNameTable(respelled) },
+			)
+			from_text = lint_module(
+				typechecked.target,
+				{ base | identifier_spellings = SpellingsFromIdentifierText },
+			)
+
+			match (from_table, from_text):
+				([table_finding], [text_finding]):
+					(
+						table_finding.message == "Record 'Respelled' has one field; consider using the field type directly."
+						and text_finding.message == "Record 'Wrapper' has one field; consider using the field type directly."
+					)
+				_:
+					False
 		_:
 			False
 
@@ -941,6 +980,10 @@ func test_forwarded_boolean_constant_reaches_fixed_point_with_provenance() -> Bo
 tests: TestSuite = {
 	description = "Blorp lint",
 	tests = [
+		(
+			"lint message reads the identifier spelling from the context",
+			test_lint_message_reads_the_identifier_spelling_from_the_context,
+		),
 		("lint CLI parses human defaults", test_lint_cli_parses_human_defaults),
 		("lint CLI parses JSON and failure mode", test_lint_cli_parses_json_and_failure_mode),
 		("lint CLI rejects unknown format", test_lint_cli_rejects_unknown_format),

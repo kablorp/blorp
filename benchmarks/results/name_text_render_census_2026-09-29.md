@@ -39,6 +39,17 @@ misstate by a few lines either way.
 | (e) `type_name` reflection | 0 | see below |
 | (g) unclassified | ~612 | `infer.brp` 122, `decl.brp` 73, `lower.brp` 50, `declaration_skeleton.brp` 38, `implementation_headers.brp` 38 |
 
+## Class (c) correction
+
+The ~17 LSP `.text` lines counted above are source-file content (`source.text`
+fingerprints, comparisons and byte conversion in `workspace_source.brp`,
+`position.brp`, `analysis_model.brp`, `frontend_graph.brp`), not identifier
+spellings, so there is nothing to convert in the LSP. Its one identifier use is
+the `name_spelling_of_text` caller in `semantic_index.brp` (see below). In
+`lint/command.brp`, 6 of the 37 lines render a message and were converted in
+A4b; about 20 are `name.text == expected` comparisons and about 6 build
+`name:`/`index-name:` keys (class f, counted for A5).
+
 ## Class (e)
 
 The compile-time `type_name(x)` string is built in `infer.brp` (~10339) by
