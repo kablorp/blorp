@@ -5,6 +5,8 @@
 -- once at the transfer boundary into Core-specific variants, so emission code
 -- can make illegal states unrepresentable as the port expands.
 import:
+	../stage_04_modules/loaded_module: ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule)
+	../stage_04_modules/module_table: ModuleId, module_id_from_serialized_index, module_id_table_index
 	../stage_02_lex/name_table: NameId, name_id_from_interned_index, name_id_index
 	../stage_06_typecheck/type_system/language_surface_manifest:
 		DeclaredAbiType(
@@ -29,6 +31,18 @@ import:
 private KIND_FIELD: String = "kind"
 
 private SOURCE_FUNCTION_ORIGIN_TAG: String = "source_function"
+
+private SOURCE_MODULE_TAG: String = "source_module"
+
+private NO_SOURCE_MODULE_TAG: String = "no_source_module"
+
+private USER_MODULE_ORIGIN_TAG: String = "user"
+
+private STDLIB_MODULE_ORIGIN_TAG: String = "stdlib"
+
+private NATIVE_PACKAGE_MODULE_ORIGIN_TAG: String = "native_package"
+
+private SOURCE_PACKAGE_MODULE_ORIGIN_TAG: String = "source_package"
 
 private IMPL_METHOD_ORIGIN_TAG: String = "impl_method"
 
@@ -2773,9 +2787,10 @@ onto an existing function, and `__sc_...` spells a static closure C symbol on
 union CoreDeclaredOrigin:
 	-- SourceFunction(name): declared in source under `name` (a spelling
 	-- identity, not a semantic one). Replaces the `<module>__name` spelling
-	-- (F2) as the fact "this is source member `name`". INTERIM: the owning
-	-- module is not carried here; it stays in the function's `source_module`
-	-- (a path String) until M2.5 gives Core a `ModuleId`.
+	-- (F2) as the fact "this is source member `name`"; the module is the
+	-- function's own `module` field, not repeated here.
+	-- (Comments in this union avoid naming the function record: the borrowed-boundary
+	-- inventory counts any mention as expression-bearing; tooling bug filed 2026-09-29.)
 	SourceFunction(NameId)
 	-- ImplMethod(trait, method): a method of `impl trait for ...`, both the
 	-- spellings written in source. The function's own `def_id` identifies the
@@ -2838,9 +2853,34 @@ pure func core_function_declared_origin(origin: CoreFunctionOrigin) -> CoreDecla
 			declared_as
 
 
+---
+The module a Core function came from, by id and origin, so readers ask the fact
+("is this a package function?") instead of parsing a path String.
+
+The origin sits beside the id on purpose. Passes hold no module table, so the id
+alone cannot answer "which kind of module?", and that origin is the one fact
+readers ask (`owned_module`). M2.5b decides whether it becomes a lookup through
+the id once a table handle reaches those readers.
+
+`NoSourceModule` is written only where a function has no module of its own: the
+program entrypoint wrapper and functions hoisted out of a global initializer
+(globals do not carry a module yet). Lowering without a module table also gives
+it, but only tests do that with a function; the one production caller without a
+table lowers an expression, not a function.
+
+INTERIM (M2.5a): `CoreFunction.source_module`, the module's path String, still
+sits beside this and feeds the readers that spell flattened names; M2.5b
+deletes it and renders paths from the module table.
+---
+union CoreModuleOrigin:
+	SourceModule(ModuleId, ModuleOrigin)
+	NoSourceModule
+
+
 record CoreFunction {
 	name: String,
 	source_module: Option[String],
+	module: CoreModuleOrigin,
 	type_params: List[String],
 	params: List[CoreParam],
 	return_type: CoreType,
@@ -14678,6 +14718,86 @@ pure func core_function_origin_to_json(origin: CoreFunctionOrigin) -> JsonValue:
 			])
 
 
+private pure func module_origin_to_json(origin: ModuleOrigin) -> JsonValue:
+	match origin:
+		UserModule:
+			JsonObject([(KIND_FIELD, JsonString(USER_MODULE_ORIGIN_TAG))])
+		StdlibModule:
+			JsonObject([(KIND_FIELD, JsonString(STDLIB_MODULE_ORIGIN_TAG))])
+		NativePackageModule(package_id):
+			JsonObject([
+				(KIND_FIELD, JsonString(NATIVE_PACKAGE_MODULE_ORIGIN_TAG)),
+				("package", JsonString(package_id)),
+			])
+		SourcePackageModule(package_alias):
+			JsonObject([
+				(KIND_FIELD, JsonString(SOURCE_PACKAGE_MODULE_ORIGIN_TAG)),
+				("package", JsonString(package_alias)),
+			])
+
+
+---
+The JSON for a function's module: the table index and origin of a source
+module, or the `no_source_module` marker.
+---
+pure func core_module_origin_to_json(module: CoreModuleOrigin) -> JsonValue:
+	match module:
+		SourceModule(module_id, origin):
+			JsonObject([
+				(KIND_FIELD, JsonString(SOURCE_MODULE_TAG)),
+				("id", json_int(module_id_table_index(module_id))),
+				("origin", module_origin_to_json(origin)),
+			])
+		NoSourceModule:
+			JsonObject([(KIND_FIELD, JsonString(NO_SOURCE_MODULE_TAG))])
+
+
+private pure func decode_module_origin_json(
+	value: JsonValue,
+	path: String,
+) -> Result[ModuleOrigin, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == USER_MODULE_ORIGIN_TAG:
+		Ok(UserModule)
+	else if tag == STDLIB_MODULE_ORIGIN_TAG:
+		Ok(StdlibModule)
+	else if tag == NATIVE_PACKAGE_MODULE_ORIGIN_TAG:
+		package_id ?= string_field(value, path, "package")
+		Ok(NativePackageModule(package_id))
+	else if tag == SOURCE_PACKAGE_MODULE_ORIGIN_TAG:
+		package_alias ?= string_field(value, path, "package")
+		Ok(SourcePackageModule(package_alias))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+---
+Decode the JSON of `core_module_origin_to_json`. The module id is a table
+index the decoder cannot check (no table here), so it trusts the producer and
+only rejects a negative index.
+---
+pure func decode_core_module_origin_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreModuleOrigin, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == SOURCE_MODULE_TAG:
+		index ?= int_field(value, path, "id")
+		origin_json ?= object_field(value, path, "origin")
+		origin ?= decode_module_origin_json(origin_json, path_field(path, "origin"))
+
+		if index < 0:
+			Err(CoreExpectedIntField(path, "id"))
+		else:
+			Ok(SourceModule(module_id_from_serialized_index(index), origin))
+	else if tag == NO_SOURCE_MODULE_TAG:
+		Ok(NoSourceModule)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 ---
 The JSON object for how a function was declared; `kind` names the case.
 ---
@@ -14913,6 +15033,7 @@ pure func core_function_to_json(core_func: CoreFunction) -> JsonValue:
 		(KIND_FIELD, JsonString(FUNCTION_TAG)),
 		("name", JsonString(core_func.name)),
 		("module", option_string_to_json(core_func.source_module)),
+		("module_origin", core_module_origin_to_json(core_func.module)),
 		("type_params", strings_to_json(core_func.type_params)),
 		("params", core_params_to_json(core_func.params)),
 		("return_type", core_type_to_json(core_func.return_type)),
@@ -14936,6 +15057,8 @@ pure func decode_core_function_json(
 	else:
 		name ?= string_field(value, path, "name")
 		source_module ?= decode_optional_string(value, path, "module")
+		module_json ?= object_field(value, path, "module_origin")
+		module ?= decode_core_module_origin_json(module_json, path_field(path, "module_origin"))
 		type_params ?= decode_string_list(value, path, "type_params")
 		params ?= decode_core_params(value, path, "params")
 		return_type_json ?= object_field(value, path, "return_type")
@@ -14965,6 +15088,7 @@ pure func decode_core_function_json(
 		Ok({
 			name = name,
 			source_module = source_module,
+			module = module,
 			type_params = type_params,
 			params = params,
 			return_type = return_type,

@@ -37,7 +37,9 @@ import:
 	../../../src/compiler/stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
+		module_id_from_serialized_index,
 		module_id_table_index,
+		module_ids_equal,
 		module_table,
 		module_table_count,
 		module_table_find_id_by_canonical_path,
@@ -329,6 +331,7 @@ import:
 		),
 		CoreDeclaredOrigin(Entrypoint, ImplMethod, SourceFunction),
 		CoreFunctionOrigin(Declared),
+		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreListStorageLayout(InlineListStorage),
 		CoreLiteral(
 			BoolLiteral,
@@ -5316,6 +5319,22 @@ func test_lowers_function_decl_preserving_callable_id() -> Bool:
 			False
 
 
+private pure func is_source_module_of(module: CoreModuleOrigin, expected: ModuleId) -> Bool:
+	match module:
+		SourceModule(module_id, _):
+			module_ids_equal(module_id, expected)
+		NoSourceModule:
+			False
+
+
+private pure func is_no_source_module(module: CoreModuleOrigin) -> Bool:
+	match module:
+		NoSourceModule:
+			True
+		SourceModule(_, _):
+			False
+
+
 private pure func origin_is_entrypoint(
 	origin: CoreFunctionOrigin,
 	expected: CoreEntrypointKind,
@@ -5369,6 +5388,57 @@ func test_lowered_function_records_its_source_name_as_origin() -> Bool:
 				_:
 					False
 		Err(_):
+			False
+
+
+func test_lowering_without_a_module_table_gives_no_source_module() -> Bool:
+	info: TypedFunctionInfo = {
+		decl = parsed_function_decl(),
+		callable_id = Some(42),
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(int_expr("1"))
+	}
+
+	match lower_typed_decl(core_lower_context(100, Some("m")), fixture_source_table(), TypedFunctionDecl(info)):
+		Ok(result):
+			match result.decl:
+				FunctionDecl(function_info):
+					is_no_source_module(function_info.module)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowering_a_function_whose_module_is_missing_from_the_table_fails() -> Bool:
+	match core_resolved_call_fixture():
+		Some(fixture):
+			context = core_lower_context_with_callable_names(
+				0,
+				None,
+				empty_core_definition_table(fixture.module_table),
+				module_id_from_serialized_index(module_table_count(fixture.module_table) + 5),
+				core_test_callable_names(fixture.module_table, []),
+			)
+			info: TypedFunctionInfo = {
+				decl = parsed_function_decl(),
+				callable_id = Some(42),
+				effective_type_params = [],
+				param_types = [int_type()],
+				source_return_type = Some(int_type()),
+				semantic_return_type = int_type(),
+				body = Some(int_expr("1"))
+			}
+
+			match lower_typed_decl(context, fixture_source_table(), TypedFunctionDecl(info)):
+				Err(CoreLowerInvalidCall(message)):
+					message.contains("is missing from the module table")
+				_:
+					False
+		None:
 			False
 
 
@@ -6919,6 +6989,8 @@ private func synthesizes_explicit_program_entrypoint(
 							and user_main.def_id == main_raw
 							and is_user_function_kind(user_main.function_kind)
 							and origin_is_entrypoint(user_main.origin, UserMainEntrypoint)
+							and is_source_module_of(user_main.module, target_module_id)
+							and is_no_source_module(entrypoint.module)
 							and entrypoint.name == "$blorp$program"
 							and entrypoint.def_id == core_frontier
 							and is_program_entrypoint_function_kind(entrypoint.function_kind)
@@ -7400,6 +7472,14 @@ tests: TestSuite = {
 		(
 			"lowered function records its source name as origin",
 			test_lowered_function_records_its_source_name_as_origin,
+		),
+		(
+			"lowering without a module table gives no source module",
+			test_lowering_without_a_module_table_gives_no_source_module,
+		),
+		(
+			"lowering a function whose module is missing from the table fails",
+			test_lowering_a_function_whose_module_is_missing_from_the_table_fails,
 		),
 		(
 			"lowered foreign function records its source name as origin",

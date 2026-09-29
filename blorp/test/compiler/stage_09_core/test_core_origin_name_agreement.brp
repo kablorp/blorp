@@ -1,5 +1,10 @@
 import:
 	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(StdlibModule, UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table: ModuleTable, singleton_module_table
+	../../../src/compiler/stage_09_core/function_origin_fixture: fixture_source_module
 	../../../src/compiler/stage_09_core/ir:
 		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
@@ -7,12 +12,14 @@ import:
 		CoreFunctionKind(UserFunction),
 		CoreDeclaredOrigin(Entrypoint, EtaExpansion, HoistedLambda, HoistedTask, ImplMethod, MonoInstance, PureVariant, SourceFunction),
 		CoreFunctionOrigin(Declared, Synthesized),
+		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreMonoSubstitutionValue(TypeSubstitution),
 		CoreProgram,
 		CoreSynthesisKind(TensorSynthesis),
 		CoreType(NamedType),
 		synthetic_core_source_loc,
 	../../../src/compiler/stage_09_core/origin_name_agreement:
+		ModuleCheckScope(CheckAgainstModuleTable, CheckWithoutModuleTable),
 		OriginNameAgreement,
 		origin_name_agreement,
 		origin_name_agreement_summary,
@@ -24,6 +31,18 @@ SOURCE_ORIGIN: CoreDeclaredOrigin = SourceFunction(synthesized_name_id("_"))
 INT_TYPE: CoreType = NamedType("Int", [])
 
 
+pure func module_for(source_module: Option[String]) -> CoreModuleOrigin:
+	match source_module:
+		Some(path):
+			fixture_source_module(path, UserModule)
+		None:
+			NoSourceModule
+
+
+pure func source_origin_in(source_module: Option[String]) -> CoreFunctionOrigin:
+	Declared(SourceFunction(synthesized_name_id("_")))
+
+
 pure func function_in_module(
 	name: String,
 	source_module: Option[String],
@@ -32,6 +51,7 @@ pure func function_in_module(
 	{
 		name = name,
 		source_module = source_module,
+		module = module_for(source_module),
 		type_params = [],
 		params = [],
 		return_type = INT_TYPE,
@@ -61,7 +81,7 @@ pure func program_of(decls: List[CoreDecl]) -> CoreProgram:
 
 
 pure func agreement_for(functions: List[CoreFunction]) -> OriginNameAgreement:
-	origin_name_agreement(program_of(functions.map(pure func(function: CoreFunction) -> CoreDecl: FunctionDecl(function))))
+	origin_name_agreement(fn_program(functions), CheckWithoutModuleTable)
 
 
 pure func string_contains_all(text: String, needles: List[String]) -> Bool:
@@ -165,7 +185,7 @@ pure func test_member_named_mono_something_is_not_a_mono_instance() -> Bool:
 		function_in_module(
 			"src_compiler_synth_name__mono_name_base",
 			Some("src/compiler/synth_name"),
-			Declared(SOURCE_ORIGIN),
+			source_origin_in(Some("src/compiler/synth_name")),
 		),
 		function_in_module(
 			"src_compiler_synth_name__mono_name_base__mono_Int",
@@ -192,13 +212,15 @@ pure func impl_program(method_origin: CoreFunctionOrigin) -> CoreProgram:
 pure func test_impl_methods_must_carry_an_impl_method_origin() -> Bool:
 	good = origin_name_agreement(
 		impl_program(Declared(ImplMethod(synthesized_name_id("_"), synthesized_name_id("_")))),
+		CheckWithoutModuleTable,
 	)
 	wrapped = origin_name_agreement(
 		impl_program(
 			Synthesized(TensorSynthesis, ImplMethod(synthesized_name_id("_"), synthesized_name_id("_"))),
 		),
+		CheckWithoutModuleTable,
 	)
-	bad = origin_name_agreement(impl_program(Declared(SOURCE_ORIGIN)))
+	bad = origin_name_agreement(impl_program(Declared(SOURCE_ORIGIN)), CheckWithoutModuleTable)
 
 	good.violations.is_empty() and wrapped.violations.is_empty() and bad.violations.length() == 1
 
@@ -219,9 +241,94 @@ pure func test_trait_named_functions_are_projected_impl_methods() -> Bool:
 	)
 	misattributed: CoreDecl = FunctionDecl(function_with("Display_show_Bool", SOURCE_ORIGIN))
 
-	origin_name_agreement(program_of([trait_decl, projected])).violations.is_empty() and origin_name_agreement(
-		program_of([trait_decl, misattributed]),
+	projected_agreement = origin_name_agreement(program_of([trait_decl, projected]), CheckWithoutModuleTable)
+	misattributed_agreement = origin_name_agreement(program_of([trait_decl, misattributed]), CheckWithoutModuleTable)
+
+	projected_agreement.violations.is_empty() and misattributed_agreement.violations.length() == 1
+
+
+pure func test_source_module_without_a_path_is_the_target_module() -> Bool:
+	target_module: CoreFunction = function_in_module(
+		"main",
+		None,
+		Declared(SourceFunction(synthesized_name_id("_"))),
+	)
+	target_module_function: CoreFunction = { target_module | module = fixture_source_module("main", UserModule) }
+
+	agreement_for([target_module_function]).violations.is_empty()
+
+
+pure func test_path_without_a_source_module_is_reported() -> Bool:
+	function_info: CoreFunction = { function_in_module("list__map", Some("list"), Declared(SourceFunction(synthesized_name_id("_")))) |
+		module = NoSourceModule
+	}
+
+	match agreement_for([function_info]).violations:
+		[message]:
+			message.contains("module origin NoSourceModule")
+		_:
+			False
+
+
+pure func module_table_of(path: String, origin: ModuleOrigin) -> ModuleTable:
+	(table, _) = singleton_module_table(resolved_module_identity_from_resolver(path, origin))
+	table
+
+
+pure func list_function_in(path: String, module: CoreModuleOrigin) -> CoreFunction:
+	{ function_in_module("list__map", Some(path), Declared(SOURCE_ORIGIN)) | module = module }
+
+
+pure func test_module_table_accepts_a_function_whose_path_and_origin_match() -> Bool:
+	table: ModuleTable = module_table_of("list", StdlibModule)
+	matching: CoreFunction = list_function_in("list", fixture_source_module("list", StdlibModule))
+
+	origin_name_agreement(fn_program([matching]), CheckAgainstModuleTable(table)).violations.is_empty()
+
+
+pure func test_module_table_reports_a_path_the_module_id_does_not_name() -> Bool:
+	table: ModuleTable = module_table_of("list", StdlibModule)
+	wrong_path: CoreFunction = list_function_in("elsewhere", fixture_source_module("list", StdlibModule))
+
+	match origin_name_agreement(fn_program([wrong_path]), CheckAgainstModuleTable(table)).violations:
+		[message]:
+			message.contains("another path in the table")
+		_:
+			False
+
+
+pure func test_module_table_reports_an_origin_the_table_does_not_give() -> Bool:
+	table: ModuleTable = module_table_of("list", StdlibModule)
+	wrong_origin: CoreFunction = list_function_in("list", fixture_source_module("list", UserModule))
+
+	match origin_name_agreement(fn_program([wrong_origin]), CheckAgainstModuleTable(table)).violations:
+		[message]:
+			message.contains("origin the table does not give")
+		_:
+			False
+
+
+pure func test_late_passes_without_a_table_still_apply_the_path_rule_but_skip_table_rules() -> Bool:
+	no_module_with_path: CoreFunction = list_function_in("list", NoSourceModule)
+	path_the_id_does_not_name: CoreFunction = list_function_in(
+		"elsewhere",
+		fixture_source_module("list", StdlibModule),
+	)
+
+	path_rule_fires: Bool = origin_name_agreement(
+		fn_program([no_module_with_path]),
+		CheckWithoutModuleTable,
 	).violations.length() == 1
+	table_rule_skipped: Bool = origin_name_agreement(
+		fn_program([path_the_id_does_not_name]),
+		CheckWithoutModuleTable,
+	).violations.is_empty()
+
+	path_rule_fires and table_rule_skipped
+
+
+pure func fn_program(functions: List[CoreFunction]) -> CoreProgram:
+	program_of(functions.map(pure func(function: CoreFunction) -> CoreDecl: FunctionDecl(function)))
 
 
 pure func test_summary_reports_totals_and_counts_per_origin_case() -> Bool:
@@ -280,6 +387,27 @@ tests: TestSuite = {
 		(
 			"trait named functions are projected impl methods",
 			test_trait_named_functions_are_projected_impl_methods,
+		),
+		(
+			"source module without a path is the target module",
+			test_source_module_without_a_path_is_the_target_module,
+		),
+		("path without a source module is reported", test_path_without_a_source_module_is_reported),
+		(
+			"module table accepts a function whose path and origin match",
+			test_module_table_accepts_a_function_whose_path_and_origin_match,
+		),
+		(
+			"module table reports a path the module id does not name",
+			test_module_table_reports_a_path_the_module_id_does_not_name,
+		),
+		(
+			"module table reports an origin the table does not give",
+			test_module_table_reports_an_origin_the_table_does_not_give,
+		),
+		(
+			"late passes without a table still apply the path rule but skip table rules",
+			test_late_passes_without_a_table_still_apply_the_path_rule_but_skip_table_rules,
 		),
 		(
 			"summary reports totals and counts per origin case",

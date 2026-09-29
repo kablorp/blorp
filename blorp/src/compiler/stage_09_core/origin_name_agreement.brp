@@ -12,6 +12,8 @@
 import:
 	../stage_08_core_lower/entrypoint: ENTRYPOINT_NAME, USER_MAIN_NAME_PREFIX
 	../stage_08_core_lower/identity: core_module_member_prefix, is_core_ufcs_function_name
+	../stage_04_modules/loaded_module: ModuleOrigin, module_origins_equal
+	../stage_04_modules/module_table: ModuleId, ModuleTable, module_ids_equal, module_table_canonical_path, module_table_origin
 	closure: ETA_NAME_PREFIX, LAMBDA_NAME_PREFIX, TASK_NAME_PREFIX
 	ir:
 		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
@@ -28,6 +30,7 @@ import:
 			SourceFunction,
 		),
 		CoreFunctionOrigin(Declared, Synthesized),
+		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreProgram,
 		core_function_declared_origin,
 	synth_name: mono_name_base, strip_pure_suffix
@@ -49,6 +52,16 @@ private union NameShape:
 	UfcsName
 	TraitMethodName
 	PlainName
+
+
+---
+Whether the module table is reachable for a check. Only the early passes hold
+it (the caller has the lowering input); the late passes run with
+`CheckWithoutModuleTable` and apply the table-free rules alone.
+---
+union ModuleCheckScope:
+	CheckAgainstModuleTable(ModuleTable)
+	CheckWithoutModuleTable
 
 
 ---
@@ -253,7 +266,67 @@ private pure func shape_label(shape: NameShape) -> String:
 			"a plain source or impl function"
 
 
+---
+How a function's module facts disagree with each other, or with the module
+table when one is reachable.
+
+Table-free rules: a function with a path String must have a `SourceModule`
+(the reverse does not hold: the target module's own functions have no path
+String, which is how the entrypoint pass finds `main`).
+
+Table rules, only under `CheckAgainstModuleTable`: the id's canonical path
+equals the String when there is one, and the id's origin equals the recorded
+origin.
+---
+private pure func module_disagreement(
+	function_info: CoreFunction,
+	modules: ModuleCheckScope,
+) -> Option[String]:
+	label: String = "function `${function_info.name}` (def ${function_info.def_id.to_string()})"
+
+	match (function_info.module, function_info.source_module):
+		(NoSourceModule, None):
+			None
+		(NoSourceModule, Some(path)):
+			Some("${label} has source module `${path}` but module origin NoSourceModule")
+		(SourceModule(module_id, origin), path):
+			table_module_disagreement(modules, module_id, origin, path, label)
+
+
+private pure func table_module_disagreement(
+	modules: ModuleCheckScope,
+	module_id: ModuleId,
+	origin: ModuleOrigin,
+	path: Option[String],
+	label: String,
+) -> Option[String]:
+	match modules:
+		CheckWithoutModuleTable:
+			None
+		CheckAgainstModuleTable(table):
+			if path.is_some() and module_table_canonical_path(table, module_id) != path:
+				Some("${label} has source module `${path.get_or("")}` but its module id names another path in the table")
+			else if not module_table_origin(table, module_id)
+				.map(pure func(table_origin: ModuleOrigin) -> Bool: module_origins_equal(table_origin, origin))
+				.get_or(False):
+				Some("${label} records a module origin the table does not give its module id")
+			else:
+				None
+
+
 private pure func function_disagreement(
+	function_info: CoreFunction,
+	trait_names: Dict[String, Bool],
+	modules: ModuleCheckScope,
+) -> Option[String]:
+	match module_disagreement(function_info, modules):
+		Some(message):
+			Some(message)
+		None:
+			name_disagreement(function_info, trait_names)
+
+
+private pure func name_disagreement(
 	function_info: CoreFunction,
 	trait_names: Dict[String, Bool],
 ) -> Option[String]:
@@ -303,7 +376,10 @@ Every function the program declares, top level or as an impl method, checked
 against its name. An impl method must also carry an impl-method origin: it is
 declared inside an `impl`, whatever its name looks like.
 ---
-pure func origin_name_agreement(program: CoreProgram) -> OriginNameAgreement:
+pure func origin_name_agreement(
+	program: CoreProgram,
+	modules: ModuleCheckScope,
+) -> OriginNameAgreement:
 	trait_names: Dict[String, Bool] = program_trait_names(program)
 	var checked: Int = 0
 	var counts: Dict[String, Int] = {}
@@ -315,7 +391,7 @@ pure func origin_name_agreement(program: CoreProgram) -> OriginNameAgreement:
 				checked += 1
 				counts = count_origin_case(counts, function_info)
 
-				match function_disagreement(function_info, trait_names):
+				match function_disagreement(function_info, trait_names, modules):
 					Some(message):
 						violations = violations.append(message)
 					None:
@@ -324,6 +400,12 @@ pure func origin_name_agreement(program: CoreProgram) -> OriginNameAgreement:
 				for method in impl_decl.methods:
 					checked += 1
 					counts = count_origin_case(counts, method)
+
+					match module_disagreement(method, modules):
+						Some(message):
+							violations = violations.append(message)
+						None:
+							void
 
 					match core_function_declared_origin(method.origin):
 						ImplMethod(_, _):

@@ -53,6 +53,7 @@ import:
 		module_id_table_index,
 		module_ids_equal,
 		module_table_canonical_path,
+		module_table_origin,
 	../stage_06_typecheck/decl:
 		TypedDecl(
 			TypedFunctionDecl,
@@ -348,6 +349,7 @@ import:
 		CoreFunctionKind(ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
 		CoreDeclaredOrigin(ImplMethod, SourceFunction),
 		CoreFunctionOrigin(Declared),
+		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreHeapRecordField,
 		CoreListConstruct,
 		CoreListStorageLayout(PointerListStorage),
@@ -5826,10 +5828,36 @@ private pure func lower_typed_function_body(
 							)
 
 
+---
+The module every function lowered under `context` belongs to. A context built
+from the compilation graph knows its module id and definition table, and the
+origin is read from that table; a module id the table does not hold is a
+malformed graph and fails lowering. A bare context (no module id or table)
+gives `NoSourceModule`: only tests lower a function that way.
+---
+private pure func lowered_module_origin(
+	context: CoreLowerContext,
+) -> Result[CoreModuleOrigin, CoreLowerError]:
+	match (context.module_id, context.definition_table):
+		(Some(module_id), Some(definitions)):
+			match module_table_origin(definition_table_module_table(definitions), module_id):
+				Some(origin):
+					Ok(SourceModule(module_id, origin))
+				None:
+					Err(
+						CoreLowerInvalidCall(
+							"function module ${module_id_table_index(module_id)} is missing from the module table",
+						),
+					)
+		_:
+			Ok(NoSourceModule)
+
+
 private pure func lower_typed_function_info(
 	context: CoreLowerContext,
 	info: TypedFunctionInfo,
 ) -> Result[CoreLowerFunctionResult, CoreLowerError]:
+	module ?= lowered_module_origin(context)
 	params ?= core_lower_params(context, info.decl.params, info.param_types)
 	return_type ?= core_lower_value_type(context.module_member_prefixes, info.semantic_return_type)
 	lowered_function_body ?= lower_typed_function_body(
@@ -5860,6 +5888,7 @@ private pure func lower_typed_function_info(
 		function_info = {
 			name = info.decl.name.text,
 			source_module = context.source_module,
+			module = module,
 			type_params = info.effective_type_params.map(pure func(param): param.name),
 			params = params.params,
 			return_type = return_type,
@@ -5898,6 +5927,7 @@ private pure func lower_typed_foreign_function(
 	context: CoreLowerContext,
 	info: TypedForeignFunctionInfo,
 ) -> Result[CoreLowerDeclResult, CoreLowerError]:
+	module ?= lowered_module_origin(context)
 	params ?= core_lower_params(context, info.decl.params, info.param_types)
 	return_type ?= core_lower_value_type(context.module_member_prefixes, info.semantic_return_type)
 
@@ -5924,6 +5954,7 @@ private pure func lower_typed_foreign_function(
 		decl = FunctionDecl({
 			name = info.decl.name.text,
 			source_module = context.source_module,
+			module = module,
 			type_params = [],
 			params = params.params,
 			return_type = return_type,

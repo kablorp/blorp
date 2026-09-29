@@ -93,7 +93,8 @@ becomes permanent by being forgotten.
 | `SOURCE_VARIANT_TAG_PREFIX` fallback for a variant without a `def_id` | B2 | B5 |
 | `MANGLED_DEF_ID_PREFIX` / `mangled_definition_name` in identity.brp for hoisted-closure names | T5 (f21b59a9d) | M3.1 |
 | `c_local_name` escape branches for locals with id 0 | B0 (32307f0d) | B1b (dense or origin-derived spelling for compiler temporaries) |
-| `ImplMethod(trait NameId, method NameId)` without impl/trait def ids and type key; `SourceFunction(NameId)` without a module id; program-wide hoist ordinals | M1.1 | M2.3, M2.5 |
+| `ImplMethod(trait NameId, method NameId)` without impl/trait def ids and type key; program-wide hoist ordinals | M1.1 | M2.3 |
+| `CoreFunction.source_module` path String beside `CoreFunction.module`, and `ModuleOrigin` beside the `ModuleId` in `SourceModule` (passes hold no module table); readers that compute flattened names from the path | M2.5a | after M2.4 (M2.5b deletes the String, renders paths from the module table, and decides whether the origin becomes a lookup once a table handle exists) |
 | `CoreMonoInstanceIndex` buckets instances by a structural hash in a `Dict[Int, ...]` instead of keying a `Dict` by `CoreMonoInstanceKey`, because a `Dict` with custom `Hashable` keys bound to variables misses equal keys (filed as "Fix Dict lookup miss for custom Hashable keys bound to variables"; reproduction `/private/tmp/claude-501/scratch/dict_key_repro`) | M1.2 | Key the `Dict` by `CoreMonoInstanceKey` once that bug is fixed |
 | Span-derived positive binder ids for authored binders | B0/B1a | A1b (parser-minted ids) |
 | One sigil read left in `type_parameter_name_kind` (`List[String]` type parameters) | D7 (230835a0b) | type interning, when type-parameter lists carry kinds |
