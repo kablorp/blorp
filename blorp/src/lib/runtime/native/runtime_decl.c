@@ -2461,6 +2461,7 @@ blorp_StackOption_Int blorp_time_parse_rfc3339(const blorp_String* s);
 blorp_Tuple* blorp_tuple_new(long arity, ...);
 blorp_Closure* blorp_closure_new(void* func, void* env);
 blorp_Closure* blorp_closure_new_inline(void* func, int n);
+blorp_Closure* blorp_closure_new_inline_wide_mask(void* func, int n, int extra_mask_words);
 blorp_Closure* blorp_closure_new_typed_inline(void* func, size_t env_size, size_t env_alignment);
 static inline int blorp_closure_env_is_inline(blorp_Closure* c) {
     return c->env_count == BLORP_CLOSURE_TYPED_INLINE_ENV_COUNT ||

@@ -1,0 +1,106 @@
+-- Ownership bitmasks for aggregates whose slots are released dynamically.
+--
+-- Tuples, union variant payloads, and closure or task environments record
+-- which slots own a reference-counted value in an `unsigned long` word of the
+-- emitted C. This module is the only place that decides how slot indices map
+-- to bits, so producers and decoders cannot drift.
+--
+-- Words are Blorp `Int` values holding the C bit pattern: bit 63 is the sign
+-- bit, and `Int` arithmetic wraps, so the emitted literal
+-- (`word.to_string() + "UL"`) has the same 64 bits.
+--
+-- Width policy:
+--   * Closure and task environments have no small bound, so they use as many
+--     words as they need (`release_mask_words`).
+--   * Tuples and union variant payloads live in a fixed one-word C header
+--     field. Tuple syntax limits arity to 4, and the parser rejects a union
+--     variant with more than `RELEASE_MASK_WORD_BITS` fields
+--     (`MAX_UNION_VARIANT_FIELDS` in `parsed_ast.brp`), so their slot indices
+--     are always below `RELEASE_MASK_WORD_BITS`; they use `release_mask_first_word`.
+
+
+--- Number of slots one mask word describes: the width of C `unsigned long`
+--- on every supported target.
+RELEASE_MASK_WORD_BITS: Int = 64
+
+private SIGN_BIT_INDEX: Int = 63
+
+private HALF_SIGN_BIT_VALUE: Int = 4611686018427387904
+
+
+--- The value of bit `bit_index` (0 to 63) as an `Int` bit pattern. Bit 63 is
+--- the wrapped value with only the sign bit set.
+pure func release_mask_bit(bit_index: Int) -> Int:
+	var result: Int = 1
+	var index: Int = 0
+
+	while index < bit_index:
+		result *= 2
+		index += 1
+
+	result
+
+
+--- The number of mask words needed to describe `slot_count` slots.
+pure func release_mask_word_count(slot_count: Int) -> Int:
+	(slot_count + RELEASE_MASK_WORD_BITS - 1) / RELEASE_MASK_WORD_BITS
+
+
+--- Whether bit `bit_index` (0 to 63) of a single mask word is set.
+pure func release_mask_word_has_bit(word: Int, bit_index: Int) -> Bool:
+	if bit_index == SIGN_BIT_INDEX:
+		word < 0
+	else:
+		-- Clear the sign bit (adding 2^63 wraps) so the division sees a
+		-- non-negative value.
+		low_bits: Int = if word < 0:
+			word + HALF_SIGN_BIT_VALUE + HALF_SIGN_BIT_VALUE
+		else:
+			word
+
+		low_bits / release_mask_bit(bit_index) % 2 == 1
+
+
+--- One mask word per 64 slots: bit `i % 64` of word `i / 64` is set exactly
+--- when `owns_reference[i]` is True. An empty list has no words.
+pure func release_mask_words(owns_reference: List[Bool]) -> List[Int]:
+	var words: List[Int] = []
+	var word: Int = 0
+	var index: Int = 0
+
+	for owns in owns_reference:
+		bit_index: Int = index % RELEASE_MASK_WORD_BITS
+
+		if owns:
+			word += release_mask_bit(bit_index)
+
+		index += 1
+
+		if bit_index == RELEASE_MASK_WORD_BITS - 1:
+			words = words.append(word)
+			word = 0
+
+	if index % RELEASE_MASK_WORD_BITS != 0:
+		words = words.append(word)
+
+	words
+
+
+--- The only word of a one-word aggregate. Callers guarantee at most
+--- `RELEASE_MASK_WORD_BITS` slots (see the module comment); an empty list is 0.
+pure func release_mask_first_word(owns_reference: List[Bool]) -> Int:
+	match release_mask_words(owns_reference).get(0):
+		Some(word):
+			word
+		None:
+			0
+
+
+--- Word `word_index` of a multi-word mask; 0 past the last word, because an
+--- absent word describes slots that own nothing.
+pure func release_mask_word_at(words: List[Int], word_index: Int) -> Int:
+	match words.get(word_index):
+		Some(word):
+			word
+		None:
+			0

@@ -242,6 +242,7 @@ enum_decl = "enum" IDENT ":" NEWLINE INDENT variant_list DEDENT ;
 variant_list = variant { NEWLINE variant } ;
 variant      = variant_name [ "(" type_expr { "," type_expr } [ "," ] ")" ] ;
 variant_name = IDENT | "True" | "False" ;
+(* A variant declares at most 64 payload fields; the parser rejects more. *)
 
 record_decl = "record" IDENT [ type_params ] "{" field_list "}"
             | "record" IDENT [ type_params ] "{" "builtin" "}" ;

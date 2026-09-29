@@ -36136,12 +36136,28 @@ static inline int blorp_closure_env_is_inline(blorp_Closure* c) {
         c->env == (void*)((char*)c + sizeof(blorp_Closure));
 }
 
+/* Slots 0..63 are described by env_release_mask. A legacy environment with
+ * more slots keeps the mask words for slots 64.. (word k covers slots
+ * 64k..64k+63) in the slots that follow the captures, so no capture index is
+ * ever shifted by 64 or more. */
+#define BLORP_CLOSURE_MASK_WORD_BITS 64L
+
+static inline int blorp_closure_slot_owns_reference(blorp_Closure* c, long slot) {
+    if (slot < BLORP_CLOSURE_MASK_WORD_BITS) {
+        return (int)((c->env_release_mask >> slot) & 1UL);
+    }
+    void** slots = (void**)c->env;
+    long word_index = slot / BLORP_CLOSURE_MASK_WORD_BITS;
+    unsigned long word = (unsigned long)slots[c->env_count + word_index - 1];
+    return (int)((word >> (slot % BLORP_CLOSURE_MASK_WORD_BITS)) & 1UL);
+}
+
 static void blorp_closure_destroy(void* obj) {
     blorp_Closure* c = (blorp_Closure*)obj;
-    if (c->env && c->env_count >= 0 && c->env_release_mask) {
+    if (c->env && c->env_count >= 0 && (c->env_release_mask || c->env_count > BLORP_CLOSURE_MASK_WORD_BITS)) {
         void** slots = (void**)c->env;
         for (long i = 0; i < c->env_count; i++) {
-            if (((c->env_release_mask >> i) & 1UL) && slots[i]) {
+            if (blorp_closure_slot_owns_reference(c, i) && slots[i]) {
                 blorp_release(slots[i]);
             }
         }
@@ -36161,6 +36177,19 @@ blorp_Closure* blorp_closure_new(void* func, void* env) {
 
 blorp_Closure* blorp_closure_new_inline(void* func, int n) {
     blorp_Closure* c = (blorp_Closure*)blorp_alloc(sizeof(blorp_Closure) + n * sizeof(void*));
+    c->func = func;
+    c->env = (void*)((char*)c + sizeof(blorp_Closure));
+    c->env_count = n;
+    c->env_release_mask = 0;
+    BLORP_INSTALL_TYPE(c, blorp_closure_destroy, "Closure");
+    return c;
+}
+
+/* Environment of n captures followed by extra_mask_words words of release mask
+ * for slots 64.. (see blorp_closure_slot_owns_reference). The caller fills the
+ * extra words; env_count stays n so they are never mistaken for captures. */
+blorp_Closure* blorp_closure_new_inline_wide_mask(void* func, int n, int extra_mask_words) {
+    blorp_Closure* c = (blorp_Closure*)blorp_alloc(sizeof(blorp_Closure) + ((size_t)n + (size_t)extra_mask_words) * sizeof(void*));
     c->func = func;
     c->env = (void*)((char*)c + sizeof(blorp_Closure));
     c->env_count = n;

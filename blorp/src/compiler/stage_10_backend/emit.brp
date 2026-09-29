@@ -502,6 +502,13 @@ import:
 		union_cleanup_field_plan,
 		union_cleanup_variant_plan,
 		union_variant_requires_release_mask,
+	../stage_09_core/release_mask:
+		release_mask_bit,
+		release_mask_first_word,
+		release_mask_word_at,
+		release_mask_word_count,
+		release_mask_words,
+		release_mask_word_has_bit,
 	../stage_09_core/traverse as CoreTraverse
 	../stage_09_core/type_policy as CoreTypePolicy
 	c_naming:
@@ -4102,22 +4109,18 @@ private pure func payload_named_type_name(typ: CoreType) -> Option[String]:
 			None
 
 
+private pure func runtime_union_arg_owns_reference(arg: CoreRuntimeUnionArg) -> Bool:
+	match arg:
+		RuntimeOwnedField(field):
+			True
+		RuntimeIntField(field):
+			False
+		RuntimeTypedIntField(field):
+			False
+
+
 private pure func runtime_union_release_mask(args: List[CoreRuntimeUnionArg]) -> Int:
-	var mask: Int = 0
-	var bit: Int = 1
-
-	for arg in args:
-		match arg:
-			RuntimeOwnedField(field):
-				mask += bit
-			RuntimeIntField(field):
-				void
-			RuntimeTypedIntField(field):
-				void
-
-		bit *= 2
-
-	mask
+	release_mask_first_word(args.map(func(arg): runtime_union_arg_owns_reference(arg)))
 
 
 private pure func runtime_union_uses_erased_payload(args: List[CoreRuntimeUnionArg]) -> Bool:
@@ -7493,22 +7496,6 @@ private pure func tuple_element_box_args(
 		Some(tuple_call_args_suffix(values))
 
 
-private pure func int_power_of_two(exponent: Int) -> Int:
-	var result: Int = 1
-	var index: Int = 0
-
-	while index < exponent:
-		result *= 2
-		index += 1
-
-	result
-
-
-private pure func mask_contains_bit(mask: Int, index: Int) -> Bool:
-	bit: Int = int_power_of_two(index)
-	mask / bit % 2 == 1
-
-
 private pure func tuple_retain_statements(
 	tuple_construct: CoreTupleConstruct,
 	tuple_name: String,
@@ -7517,7 +7504,7 @@ private pure func tuple_retain_statements(
 	var index: Int = 0
 
 	for element in tuple_construct.elements:
-		if mask_contains_bit(tuple_construct.retain_mask, index):
+		if release_mask_word_has_bit(tuple_construct.retain_mask, index):
 			args: TupleRetainElemArgs = {
 				tuple = tuple_name,
 				index = index.to_string()
@@ -12460,27 +12447,51 @@ private pure func closure_capture_assignments(
 		Some(result)
 
 
-private pure func closure_capture_release_mask(captures: List[CoreClosureCapture], type_symbol_lookup: Dict[String, String]) -> Option[Int]:
-	var mask: Int = 0
+private pure func closure_capture_release_words(captures: List[CoreClosureCapture], type_symbol_lookup: Dict[String, String]) -> Option[List[Int]]:
+	var owns_reference: List[Bool] = []
 	var failed: Bool = False
-	var index: Int = 0
 
 	for capture in captures:
 		if not failed:
 			match closure_capture_needs_release(capture, type_symbol_lookup):
 				Some(needs_release):
-					if needs_release:
-						mask += int_power_of_two(index)
+					owns_reference = owns_reference.append(needs_release)
 				None:
 					failed = True
 					break
 
-		index += 1
-
 	if failed:
 		None
 	else:
-		Some(mask)
+		Some(release_mask_words(owns_reference))
+
+
+--- The C expression prefix that allocates a legacy closure or task environment
+--- of `capture_count` slots. Slots 0..63 are described by the closure's own
+--- `env_release_mask`; a wider environment reserves one extra trailing slot per
+--- further 64 captures for the remaining mask words (see
+--- `blorp_closure_new_inline_wide_mask` in the runtime).
+private pure func closure_new_inline_call(c_name: String, capture_count: Int, mask_words: List[Int]) -> String:
+	extra_word_count: Int = release_mask_word_count(capture_count) - 1
+
+	if extra_word_count <= 0:
+		"blorp_closure_new_inline((void*)" + c_identifier(c_name) + ", " + capture_count.to_string() + ")"
+	else:
+		"blorp_closure_new_inline_wide_mask((void*)" + c_identifier(c_name) + ", " + capture_count.to_string() + ", " + extra_word_count.to_string() + ")"
+
+
+--- Statements that record ownership in a closure allocated by
+--- `closure_new_inline_call`: word 0 in `env_release_mask`, later words in the
+--- slots that follow the captures.
+private pure func closure_release_mask_statements(capture_count: Int, mask_words: List[Int]) -> String:
+	var statements: String = " __cl_new->env_release_mask = " + release_mask_word_at(mask_words, 0).to_string() + "UL;"
+	var word_index: Int = 1
+
+	while word_index < mask_words.length():
+		statements += " ((void**)__cl_new->env)[" + (capture_count + word_index - 1).to_string() + "] = (void*)(unsigned long)" + release_mask_word_at(mask_words, word_index).to_string() + "UL;"
+		word_index += 1
+
+	statements
 
 
 private pure func closure_env_capture_c_type(
@@ -12808,11 +12819,14 @@ private pure func emit_closure_create(
 		match storage_kind:
 			LegacyVoidPointerSlots:
 				assignments ?= closure_capture_assignments(closure.captures, type_symbol_lookup)
-				release_mask ?= closure_capture_release_mask(closure.captures, type_symbol_lookup)
+				mask_words ?= closure_capture_release_words(closure.captures, type_symbol_lookup)
+				capture_count: Int = closure.captures.length()
 				Some(
-					"({ blorp_Closure* __cl_new = blorp_closure_new_inline((void*)" + c_identifier(
+					"({ blorp_Closure* __cl_new = " + closure_new_inline_call(
 						c_name,
-					) + ", " + closure.captures.length().to_string() + ");" + assignments + " __cl_new->env_release_mask = " + release_mask.to_string() + "UL; (void*)__cl_new; })",
+						capture_count,
+						mask_words,
+					) + ";" + assignments + closure_release_mask_statements(capture_count, mask_words) + " (void*)__cl_new; })",
 				)
 			TypedInlineTail:
 				match closure_env_storage_kind(closure.captures, False, type_symbol_lookup):
@@ -16359,27 +16373,23 @@ private pure func task_capture_assignments(captures: List[CoreTaskCapture], type
 		Some(result)
 
 
-private pure func task_capture_release_mask(captures: List[CoreTaskCapture], type_symbol_lookup: Dict[String, String]) -> Option[Int]:
-	var mask: Int = 0
+private pure func task_capture_release_words(captures: List[CoreTaskCapture], type_symbol_lookup: Dict[String, String]) -> Option[List[Int]]:
+	var owns_reference: List[Bool] = []
 	var failed: Bool = False
-	var index: Int = 0
 
 	for capture in captures:
 		if not failed:
 			match task_capture_needs_release(capture, type_symbol_lookup):
 				Some(needs_release):
-					if needs_release:
-						mask += int_power_of_two(index)
+					owns_reference = owns_reference.append(needs_release)
 				None:
 					failed = True
 					break
 
-		index += 1
-
 	if failed:
 		None
 	else:
-		Some(mask)
+		Some(release_mask_words(owns_reference))
 
 
 private pure func emit_task_closure_create(
@@ -16390,12 +16400,15 @@ private pure func emit_task_closure_create(
 		Some("((void*)&" + c_identifier(task.static_name) + ")")
 	else:
 		assignments ?= task_capture_assignments(task.captures, type_symbol_lookup)
-		release_mask ?= task_capture_release_mask(task.captures, type_symbol_lookup)
+		mask_words ?= task_capture_release_words(task.captures, type_symbol_lookup)
+		capture_count: Int = task.captures.length()
 
 		Some(
-			"({ blorp_Closure* __cl_new = blorp_closure_new_inline((void*)" + c_identifier(
+			"({ blorp_Closure* __cl_new = " + closure_new_inline_call(
 				task.c_name,
-			) + ", " + task.captures.length().to_string() + ");" + assignments + " __cl_new->env_release_mask = " + release_mask.to_string() + "UL; __cl_new; })",
+				capture_count,
+				mask_words,
+			) + ";" + assignments + closure_release_mask_statements(capture_count, mask_words) + " __cl_new; })",
 		)
 
 
@@ -23875,6 +23888,20 @@ private pure func normalize_positive_binary_float(value: Float) -> Option[Positi
 			})
 
 
+--- 2 raised to `bit_count`, the number of distinct values of an IEEE binary
+--- field that is `bit_count` bits wide. Unrelated to ownership masks; see
+--- `release_mask_bit` for those.
+private pure func binary_field_scale(bit_count: Int) -> Int:
+	var result: Int = 1
+	var index: Int = 0
+
+	while index < bit_count:
+		result *= 2
+		index += 1
+
+	result
+
+
 private pure func positive_normal_float_bits(
 	value: Float,
 	exponent_bias: Int,
@@ -23887,7 +23914,7 @@ private pure func positive_normal_float_bits(
 	if biased_exponent <= 0 or biased_exponent > max_biased_exponent:
 		None
 	else:
-		fraction_scale: Int = int_power_of_two(fraction_bits)
+		fraction_scale: Int = binary_field_scale(fraction_bits)
 		fraction_float: Float = (normalized.significand - 1.0) * to_float(fraction_scale)
 		var fraction: Int = round_positive_float_ties_to_even(fraction_float)
 		var adjusted_exponent: Int = biased_exponent
@@ -23919,7 +23946,7 @@ private pure func float32_bits(value: Float) -> Option[Int]:
 			FLOAT32_MAX_BIASED_EXPONENT,
 			FLOAT32_FRACTION_BITS,
 		)
-		Some(int_power_of_two(31) + magnitude_bits)
+		Some(binary_field_scale(31) + magnitude_bits)
 	else:
 		positive_normal_float_bits(
 			value,
@@ -23937,7 +23964,7 @@ private pure func float16_bits(value: Float) -> Option[Int]:
 			FLOAT16_MAX_BIASED_EXPONENT,
 			FLOAT16_FRACTION_BITS,
 		)
-		Some(int_power_of_two(15) + magnitude_bits)
+		Some(binary_field_scale(15) + magnitude_bits)
 	else:
 		positive_normal_float_bits(
 			value,
@@ -24885,7 +24912,7 @@ private pure func static_tuple_slots(
 private pure func static_tuple_element_release_bit(index: Int, element: CoreTupleElement) -> Int:
 	match element:
 		TuplePointerElement(value):
-			int_power_of_two(index)
+			release_mask_bit(index)
 		TuplePrimElement(value):
 			0
 		TupleVoidElement:
@@ -24893,7 +24920,7 @@ private pure func static_tuple_element_release_bit(index: Int, element: CoreTupl
 		TupleStructElement(value, c_type):
 			0
 		TupleStackResultElement(value):
-			int_power_of_two(index)
+			release_mask_bit(index)
 		TupleFloatElement(value):
 			0
 		TupleFloat32Element(value):
@@ -26094,7 +26121,7 @@ private pure func typed_union_field_release_statement(
 
 
 private pure func erased_union_field_release_statement(index: Int, field_c: String) -> String:
-	bit: String = int_power_of_two(index).to_string()
+	bit: String = release_mask_bit(index).to_string()
 	"        if ((self->release_mask & " + bit + "UL) && " + field_c + ") blorp_release(" + field_c + ");\n"
 
 
@@ -26110,7 +26137,7 @@ private pure func iterative_union_field_release_statement(
 		TypedUnionPayloadStorage:
 			"        if (" + field_c + ") " + release_call
 		ErasedUnionPayloadStorage:
-			bit: String = int_power_of_two(index).to_string()
+			bit: String = release_mask_bit(index).to_string()
 			"        if ((self->release_mask & " + bit + "UL) && " + field_c + ") " + release_call
 
 

@@ -1135,6 +1135,9 @@ result: Result[Int, String] = Ok(100)
 err: Result[Int, String] = Err("failed")
 ```
 
+A variant may declare at most 64 fields. Group related fields into a record and
+use the record as one field when a payload grows that large.
+
 ### Enum Types
 
 Enums are lightweight union types with no associated data — variants are simple named constants backed by integers:
