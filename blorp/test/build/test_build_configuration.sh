@@ -501,6 +501,10 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_memory_diagno
 	echo "FAIL: hygiene-check must include the split-link memory diagnostics contract" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_type_registry.py' Makefile; then
+	echo "FAIL: hygiene-check must include the type registry and bootstrap-macro compatibility contract" >&2
+	exit 1
+fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_release_path.py' Makefile; then
 	echo "FAIL: hygiene-check must include the final-release path contract" >&2
 	exit 1

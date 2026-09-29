@@ -949,30 +949,35 @@ static inline _Float16 blorp_unbox_float16(void* p) {
 #endif // __FLT16_MAX__
 
 void* blorp_alloc(size_t size);
-uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
+uint32_t blorp_register_type(_Atomic uint32_t* cache, blorp_destructor_fn fn, const char* tag);
 
-// Installs `fn` as obj's destructor through a per-site id cache. Every
-// generated allocation site runs this, so the cached path (one acquire load
-// and one header store) is inline; only a site's first allocation calls the
-// runtime's registry to assign the id. The acquire pairs with the registry's
-// release store of the cache, which follows its release of the slot count, so
-// a thread that sees the id also sees the registry slot it names.
+// Installs the (fn, tag) type as obj's header id through a per-site id cache.
+// Every generated allocation site runs this, so the cached path (one acquire
+// load and one header store) is inline; only a site's first allocation calls
+// the runtime's registry to assign the id. The acquire pairs with the
+// registry's release store of the cache, which follows its release of the
+// entry count, so a thread that sees the id also sees the entry it names.
 // Kept byte-identical to the runtime.c copy.
-static inline void blorp_install_destructor(
+static inline void blorp_install_type(
     void* obj,
     _Atomic uint32_t* cache,
-    blorp_destructor_fn fn
+    blorp_destructor_fn fn,
+    const char* tag
 ) {
     uint32_t id = atomic_load_explicit(cache, memory_order_acquire);
-    if (__builtin_expect(id == 0, 0)) id = blorp_get_destructor_id(cache, fn);
+    if (__builtin_expect(id == 0, 0)) id = blorp_register_type(cache, fn, tag);
     if (obj) ((blorp_Object*)obj)->destructor_id = id;
 }
 
-#define BLORP_SET_DESTRUCTOR(ptr, fn) do { \
-    static _Atomic uint32_t __blorp_destructor_id = 0; \
-    blorp_install_destructor((void*)(ptr), &__blorp_destructor_id, \
-        (blorp_destructor_fn)(fn)); \
+// One allocation site's type: `fn` and `tag` are constants of the site. Either
+// may be NULL; a site with both NULL leaves the header id 0.
+#define BLORP_INSTALL_TYPE(ptr, fn, tag) do { \
+    static _Atomic uint32_t __blorp_type_id = 0; \
+    blorp_install_type((void*)(ptr), &__blorp_type_id, \
+        (blorp_destructor_fn)(fn), (tag)); \
 } while (0)
+#define BLORP_INSTALL_TAG(ptr, tag) BLORP_INSTALL_TYPE(ptr, NULL, tag)
+#define BLORP_INSTALL_DESTRUCTOR(ptr, fn) BLORP_INSTALL_TYPE(ptr, fn, NULL)
 
 static inline void* blorp_box_int128(__int128 v) {
     void* p = blorp_alloc(sizeof(blorp_Object) + sizeof(__int128));
@@ -998,7 +1003,7 @@ static inline void blorp_tuple_set_rc(blorp_Tuple* t, long mask) {
     t->release_mask = mask;
     // blorp_tuple_destructor is defined in runtime.c — installed via compact id
     extern void blorp_tuple_destructor(void*);
-    BLORP_SET_DESTRUCTOR(t, blorp_tuple_destructor);
+    BLORP_INSTALL_TYPE(t, blorp_tuple_destructor, "Tuple");
 }
 
 static inline void* blorp_call1(blorp_Closure* closure, void* arg) {
@@ -1040,23 +1045,59 @@ extern _Thread_local long __blorp_cooperative_checkpoint_budget;
 // ARC / Memory Management
 void* blorp_alloc(size_t size);
 void blorp_move_ref(void* obj);
-void blorp_set_type_tag(void* obj, const char* tag);
-uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn);
-
 // Whether the linked runtime object records allocation metadata. It is a
 // runtime symbol, not a macro, because one generated body object is linked
 // against both runtime modes (benchmarks/build_stage2_compiler
 // --diagnostic-output), so the body cannot know the mode when it is compiled.
-// An ordinary runtime pays one load and a not-taken branch per allocation
-// site; a diagnostic runtime still receives every tag for its leak reports.
+// Only the legacy macros below read it.
 extern const bool blorp_runtime_memory_diagnostics;
+
+// ---------------------------------------------------------------------------
+// Legacy allocation-site macros. C emitted by the pinned bootstrap compiler
+// still writes `BLORP_TAG(obj, tag)` and then `BLORP_SET_DESTRUCTOR(obj, fn)`
+// as two steps, and is linked against this header and runtime. They exist only
+// for that bootstrap-generated C and are removed after the next bootstrap
+// rotation; the emitter now writes BLORP_INSTALL_TYPE / BLORP_INSTALL_TAG /
+// BLORP_INSTALL_DESTRUCTOR. Behavior is preserved: destructors always run, and
+// on a diagnostic runtime the tag survives into the leak report because each
+// step folds into the object's registry entry (see runtime.c).
+// Cost: on a diagnostic runtime each legacy tag or destructor-upgrade step takes
+// the registry mutex and hashes the tag text (a slow path per tagged
+// allocation); an ordinary runtime pays one load and a not-taken branch. That
+// cost disappears when these macros are removed after the next pin rotation.
+// ---------------------------------------------------------------------------
+void blorp_legacy_tag_allocation(void* obj, const char* tag);
+void blorp_legacy_upgrade_destructor(void* obj, blorp_destructor_fn fn);
 
 static inline void blorp_tag_allocation(void* obj, const char* tag) {
     if (__builtin_expect(blorp_runtime_memory_diagnostics, 0))
-        blorp_set_type_tag(obj, tag);
+        blorp_legacy_tag_allocation(obj, tag);
 }
 
 #define BLORP_TAG(ptr, tag) blorp_tag_allocation((void*)(ptr), (tag))
+
+// The first allocation of a site registers its destructor with no tag. On a
+// diagnostic runtime an object that already carries a tag id (from BLORP_TAG,
+// which the bootstrap emitter writes first) takes the slow path so the tag is
+// kept.
+static inline void blorp_legacy_install_destructor(
+    void* obj,
+    _Atomic uint32_t* cache,
+    blorp_destructor_fn fn
+) {
+    if (__builtin_expect(blorp_runtime_memory_diagnostics && obj &&
+                         ((blorp_Object*)obj)->destructor_id != 0, 0)) {
+        blorp_legacy_upgrade_destructor(obj, fn);
+        return;
+    }
+    blorp_install_type(obj, cache, fn, NULL);
+}
+
+#define BLORP_SET_DESTRUCTOR(ptr, fn) do { \
+    static _Atomic uint32_t __blorp_destructor_id = 0; \
+    blorp_legacy_install_destructor((void*)(ptr), &__blorp_destructor_id, \
+        (blorp_destructor_fn)(fn)); \
+} while (0)
 
 // Release slow path (destructor + free + stats) — defined in runtime.o
 void blorp_release_slow_extern(void* obj);
@@ -1293,7 +1334,7 @@ static void blorp_stack_result_box_destroy(void* obj) {
 
 static inline void* blorp_box_stack_result(blorp_StackResult value) {
     void* boxed = blorp_alloc(sizeof(blorp_Object) + sizeof(blorp_StackResult));
-    BLORP_SET_DESTRUCTOR(boxed, blorp_stack_result_box_destroy);
+    BLORP_INSTALL_DESTRUCTOR(boxed, blorp_stack_result_box_destroy);
     memcpy((char*)boxed + sizeof(blorp_Object), &value, sizeof(blorp_StackResult));
     return boxed;
 }

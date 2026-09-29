@@ -39,7 +39,7 @@ SOURCE = textwrap.dedent(
         blorp_MemStats before = blorp_get_mem_stats();
         void* object = blorp_alloc(64);
         tracked_object = object;
-        BLORP_SET_DESTRUCTOR(object, test_destructor);
+        BLORP_INSTALL_DESTRUCTOR(object, test_destructor);
         blorp_MemStats after = blorp_get_mem_stats();
         blorp_retain(object);
         blorp_release(object);

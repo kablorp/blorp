@@ -1078,7 +1078,6 @@ typedef struct blorp_AllocMeta_s {
     unsigned long stats_epoch;
     bool stats_tracked;
     bool live_linked;
-    const char* type_tag;
     struct blorp_AllocMeta_s* live_next;
     struct blorp_AllocMeta_s* live_prev;
     struct blorp_AllocMeta_s* hash_next;
@@ -1304,7 +1303,6 @@ static void __alloc_meta_insert(blorp_Object* obj, size_t alloc_size, bool stats
     meta->stats_epoch = atomic_load(&global_mem_stats.epoch);
     meta->stats_tracked = stats_tracked;
     meta->live_linked = __leak_tracking_enabled;
-    meta->type_tag = NULL;
     pthread_mutex_lock(&__alloc_meta_mutex);
     size_t slot = __alloc_meta_slot(obj);
     meta->hash_next = __alloc_meta_table[slot];
@@ -1342,14 +1340,6 @@ static blorp_AllocMeta* __alloc_meta_take(blorp_Object* obj) {
     return meta;
 }
 
-static void __alloc_meta_set_type_tag(blorp_Object* obj, const char* tag) {
-    if (!__alloc_meta_enabled()) return;
-    pthread_mutex_lock(&__alloc_meta_mutex);
-    blorp_AllocMeta* meta = __alloc_meta_find_locked(obj);
-    if (meta) meta->type_tag = tag;
-    pthread_mutex_unlock(&__alloc_meta_mutex);
-}
-
 static void __alloc_meta_set_alloc_site(
     blorp_Object* obj,
     long site_offset,
@@ -1366,96 +1356,210 @@ static void __alloc_meta_set_alloc_site(
 }
 
 // ============================================================================
-// Destructor registry
+// Type registry (destructor and leak-report tag per allocation site)
 // ============================================================================
-// Most heap objects do not need a destructor. For the ones that do, store a
-// compact id in the hot header and keep the function pointer once per type/call
-// site in this process-wide registry.
-#define BLORP_DESTRUCTOR_SLOTS 4096
-static blorp_destructor_fn __blorp_destructors[BLORP_DESTRUCTOR_SLOTS];
-static _Atomic uint32_t __blorp_destructor_count = 1;  // id 0 means no destructor
-static pthread_mutex_t __blorp_destructor_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Most heap objects need neither a destructor nor a name, but every generated
+// allocation site has a type. The hot header stores one compact id; this
+// process-wide registry maps the id to the object's destructor and its
+// leak-report type tag. A site registers its (destructor, tag) pair once, so
+// the tag costs one registry entry per distinct pair instead of a metadata
+// record per object. Id 0 means "no destructor, no tag".
+typedef struct {
+    blorp_destructor_fn destructor;
+    const char* tag;
+} blorp_TypeRegistryEntry;
 
-uint32_t blorp_get_destructor_id(_Atomic uint32_t* cache, blorp_destructor_fn fn) {
-    if (!fn) return 0;
+// Capacity is one entry per distinct (destructor, tag) pair, not per site: the
+// compiler's own generated C registers a few hundred. The index table below
+// must stay a power of two and at least twice the entry capacity so its probe
+// sequences stay short.
+#ifndef BLORP_TYPE_REGISTRY_SLOTS
+#define BLORP_TYPE_REGISTRY_SLOTS 16384
+#endif
+#define BLORP_TYPE_REGISTRY_INDEX_SLOTS (BLORP_TYPE_REGISTRY_SLOTS * 2)
+// The probe masks with INDEX_SLOTS - 1, so INDEX_SLOTS must be a power of two;
+// twice the entry capacity also guarantees an empty bucket ends every probe.
+_Static_assert((BLORP_TYPE_REGISTRY_SLOTS & (BLORP_TYPE_REGISTRY_SLOTS - 1)) == 0,
+    "BLORP_TYPE_REGISTRY_SLOTS must be a power of two");
+_Static_assert(BLORP_TYPE_REGISTRY_INDEX_SLOTS > BLORP_TYPE_REGISTRY_SLOTS,
+    "the type registry index must be larger than the entry table");
+static blorp_TypeRegistryEntry __blorp_type_registry[BLORP_TYPE_REGISTRY_SLOTS];
+// Open-addressed lookup from a (destructor, tag) pair to its registry id, used
+// only under the mutex to deduplicate registrations. 0 marks an empty bucket.
+static uint32_t __blorp_type_registry_index[BLORP_TYPE_REGISTRY_INDEX_SLOTS];
+static _Atomic uint32_t __blorp_type_registry_count = 1;  // id 0 is "no type"
+static pthread_mutex_t __blorp_type_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t __blorp_type_registry_hash(blorp_destructor_fn fn, const char* tag) {
+    // FNV-1a over the tag text (so equal tag strings from different
+    // translation units collapse to one entry), seeded with the destructor.
+    uint64_t hash = 14695981039346656037ULL ^ ((uint64_t)(uintptr_t)fn * 0x9E3779B97F4A7C15ULL);
+    for (const char* cursor = tag; cursor && *cursor; cursor++) {
+        hash = (hash ^ (uint8_t)*cursor) * 1099511628211ULL;
+    }
+    return hash;
+}
+
+static bool __blorp_type_registry_entry_matches(
+    const blorp_TypeRegistryEntry* entry,
+    blorp_destructor_fn fn,
+    const char* tag
+) {
+    if (entry->destructor != fn) return false;
+    if (entry->tag == tag) return true;
+    return entry->tag && tag && strcmp(entry->tag, tag) == 0;
+}
+
+// Finds or creates the id for (fn, tag). Caller holds the registry mutex.
+// A new entry is written and then release-stored into the count, so any thread
+// that observes the count (or an id derived from it) observes the entry.
+static uint32_t __blorp_type_registry_intern_locked(blorp_destructor_fn fn, const char* tag) {
+    if (!fn && !tag) return 0;
+    size_t mask = BLORP_TYPE_REGISTRY_INDEX_SLOTS - 1;
+    size_t bucket = (size_t)__blorp_type_registry_hash(fn, tag) & mask;
+    while (__blorp_type_registry_index[bucket] != 0) {
+        uint32_t id = __blorp_type_registry_index[bucket];
+        if (__blorp_type_registry_entry_matches(&__blorp_type_registry[id], fn, tag)) return id;
+        bucket = (bucket + 1) & mask;
+    }
+    uint32_t count = atomic_load_explicit(&__blorp_type_registry_count, memory_order_relaxed);
+    if (count >= BLORP_TYPE_REGISTRY_SLOTS) {
+        fprintf(stderr,
+            "blorp: type registry full: %u distinct (destructor, type tag) pairs are "
+            "registered and BLORP_TYPE_REGISTRY_SLOTS = %u leaves no room "
+            "(entry 0 is reserved); raise it in runtime.c (failed on type tag \"%s\")\n",
+            (unsigned)(count - 1), (unsigned)BLORP_TYPE_REGISTRY_SLOTS,
+            tag ? tag : "(none)");
+        exit(1);
+    }
+    __blorp_type_registry[count].destructor = fn;
+    __blorp_type_registry[count].tag = tag;
+    __blorp_type_registry_index[bucket] = count;
+    atomic_store_explicit(&__blorp_type_registry_count, count + 1, memory_order_release);
+    return count;
+}
+
+// Registers a site's (fn, tag) pair and publishes the id in the site's cache.
+// A site with neither a destructor nor a tag has no type and keeps id 0.
+uint32_t blorp_register_type(_Atomic uint32_t* cache, blorp_destructor_fn fn, const char* tag) {
+    if (!fn && !tag) return 0;
 
     uint32_t cached = atomic_load_explicit(cache, memory_order_acquire);
     if (cached != 0) return cached;
 
-    pthread_mutex_lock(&__blorp_destructor_mutex);
+    pthread_mutex_lock(&__blorp_type_registry_mutex);
     cached = atomic_load_explicit(cache, memory_order_relaxed);
     if (cached == 0) {
-        uint32_t count = atomic_load_explicit(&__blorp_destructor_count, memory_order_relaxed);
-        for (uint32_t i = 1; i < count; i++) {
-            if (__blorp_destructors[i] == fn) {
-                cached = i;
-                break;
-            }
-        }
-        if (cached == 0) {
-            if (count >= BLORP_DESTRUCTOR_SLOTS) {
-                fprintf(stderr, "blorp: too many destructor functions\n");
-                exit(1);
-            }
-            cached = count;
-            __blorp_destructors[cached] = fn;
-            atomic_store_explicit(&__blorp_destructor_count, count + 1, memory_order_release);
-        }
+        cached = __blorp_type_registry_intern_locked(fn, tag);
         atomic_store_explicit(cache, cached, memory_order_release);
     }
-    pthread_mutex_unlock(&__blorp_destructor_mutex);
+    pthread_mutex_unlock(&__blorp_type_registry_mutex);
     return cached;
 }
 
-// A plain table load, with no acquire of the slot count and no bounds check.
-// Every nonzero id in a header came from blorp_get_destructor_id, which writes
-// the slot before it release-stores the count and then the site cache, all
-// under the registry mutex; so the id is always below the count and within
-// BLORP_DESTRUCTOR_SLOTS, and slot 0 stays NULL. The thread that stored the id
-// into the header obtained it with an acquire of the site cache (or under the
-// mutex), so the slot write happens-before that header store. The releasing
-// thread reads destructor_id with a plain load, which is only race-free if the
-// header store happens-before it (through the object's hand-off and the
-// release/acquire-fence pair on the final decrement). By transitivity the slot
-// write happens-before this load, so the old acquire of the count added no
-// ordering. Slots are written once and never change. A diagnostic runtime
+// A plain table load, with no acquire of the entry count and no bounds check.
+// Every nonzero id in a header came from blorp_register_type (or the legacy
+// entry points below), which writes the entry before it release-stores the
+// count and then the site cache, all under the registry mutex; so the id is
+// always below the count and within BLORP_TYPE_REGISTRY_SLOTS, and entry 0
+// stays empty. The thread that stored the id into the header obtained it with
+// an acquire of the site cache (or under the mutex), so the entry write
+// happens-before that header store. The releasing thread reads destructor_id
+// with a plain load, which is only race-free if the header store
+// happens-before it (through the object's hand-off and the
+// release/acquire-fence pair on the final decrement). By transitivity the
+// entry write happens-before this load, so an acquire of the count would add
+// no ordering. Entries are written once and never change. A diagnostic runtime
 // still checks the id against the registered count so a corrupted header is
-// reported instead of calling through an arbitrary slot.
+// reported instead of calling through an arbitrary entry.
 static inline blorp_destructor_fn blorp_destructor_for_id(uint32_t id) {
 #if BLORP_MEMORY_DIAGNOSTICS
-    uint32_t count = atomic_load_explicit(&__blorp_destructor_count, memory_order_acquire);
+    uint32_t count = atomic_load_explicit(&__blorp_type_registry_count, memory_order_acquire);
     if (__builtin_expect(id >= count, 0)) {
         fprintf(stderr,
-            "blorp: object header names destructor id %u, but only %u are registered\n",
+            "blorp: object header names type id %u, but only %u are registered\n",
             id, count);
         abort();
     }
 #endif
-    return __blorp_destructors[id];
+    return __blorp_type_registry[id].destructor;
 }
 
-// Installs `fn` as obj's destructor through a per-site id cache. Every
-// generated allocation site runs this, so the cached path (one acquire load
-// and one header store) is inline; only a site's first allocation calls the
-// runtime's registry to assign the id. The acquire pairs with the registry's
-// release store of the cache, which follows its release of the slot count, so
-// a thread that sees the id also sees the registry slot it names.
+// Leak-report lookup. Unlike the release path this reads the headers of live
+// objects that may have been leaked mid-initialisation, so it validates the id.
+static const char* __blorp_type_tag_for_id(uint32_t id) {
+    uint32_t count = atomic_load_explicit(&__blorp_type_registry_count, memory_order_acquire);
+    if (id == 0 || id >= count) return NULL;
+    return __blorp_type_registry[id].tag;
+}
+
+// Installs the (fn, tag) type as obj's header id through a per-site cache.
+// Every generated allocation site runs this, so the cached path (one acquire
+// load and one header store) is inline; only a site's first allocation calls
+// the runtime's registry to assign the id. The acquire pairs with the
+// registry's release store of the cache, which follows its release of the
+// entry count, so a thread that sees the id also sees the entry it names.
 // Kept byte-identical to the runtime_decl.c copy.
-static inline void blorp_install_destructor(
+static inline void blorp_install_type(
     void* obj,
     _Atomic uint32_t* cache,
-    blorp_destructor_fn fn
+    blorp_destructor_fn fn,
+    const char* tag
 ) {
     uint32_t id = atomic_load_explicit(cache, memory_order_acquire);
-    if (__builtin_expect(id == 0, 0)) id = blorp_get_destructor_id(cache, fn);
+    if (__builtin_expect(id == 0, 0)) id = blorp_register_type(cache, fn, tag);
     if (obj) ((blorp_Object*)obj)->destructor_id = id;
 }
 
-#define BLORP_SET_DESTRUCTOR(ptr, fn) do { \
-    static _Atomic uint32_t __blorp_destructor_id = 0; \
-    blorp_install_destructor((void*)(ptr), &__blorp_destructor_id, \
-        (blorp_destructor_fn)(fn)); \
+// One allocation site's type: `fn` and `tag` are constants of the site. Either
+// may be NULL; a site with both NULL leaves the header id 0.
+#define BLORP_INSTALL_TYPE(ptr, fn, tag) do { \
+    static _Atomic uint32_t __blorp_type_id = 0; \
+    blorp_install_type((void*)(ptr), &__blorp_type_id, \
+        (blorp_destructor_fn)(fn), (tag)); \
 } while (0)
+#define BLORP_INSTALL_TAG(ptr, tag) BLORP_INSTALL_TYPE(ptr, NULL, tag)
+#define BLORP_INSTALL_DESTRUCTOR(ptr, fn) BLORP_INSTALL_TYPE(ptr, fn, NULL)
+
+// Entry points for C emitted by the pinned bootstrap compiler, which still
+// writes `BLORP_TAG(obj, tag); ... BLORP_SET_DESTRUCTOR(obj, fn);` as two
+// steps and links against this runtime through runtime_decl.c. They fold the
+// two steps into one registry entry: the tag step records (existing fn, tag)
+// and the destructor step records (fn, existing tag). They exist only for
+// bootstrap-generated C and are removed with the legacy macros after the
+// next bootstrap rotation.
+// The legacy tag step keeps the object's current destructor and sets the tag;
+// the legacy destructor step keeps the current tag and sets the destructor.
+static uint32_t __blorp_legacy_reintern(blorp_Object* obj, blorp_destructor_fn fn, const char* tag) {
+    uint32_t id;
+    pthread_mutex_lock(&__blorp_type_registry_mutex);
+    id = __blorp_type_registry_intern_locked(fn, tag);
+    pthread_mutex_unlock(&__blorp_type_registry_mutex);
+    obj->destructor_id = id;
+    return id;
+}
+
+// Caller holds no lock; entries are immutable once published, so reading the
+// current entry only needs the count's acquire.
+static blorp_TypeRegistryEntry __blorp_legacy_current_entry(const blorp_Object* obj) {
+    uint32_t count = atomic_load_explicit(&__blorp_type_registry_count, memory_order_acquire);
+    blorp_TypeRegistryEntry none = {NULL, NULL};
+    return obj->destructor_id != 0 && obj->destructor_id < count
+        ? __blorp_type_registry[obj->destructor_id]
+        : none;
+}
+
+void blorp_legacy_tag_allocation(void* obj, const char* tag) {
+    if (!obj) return;
+    blorp_TypeRegistryEntry current = __blorp_legacy_current_entry((blorp_Object*)obj);
+    __blorp_legacy_reintern((blorp_Object*)obj, current.destructor, tag);
+}
+
+void blorp_legacy_upgrade_destructor(void* obj, blorp_destructor_fn fn) {
+    if (!obj) return;
+    blorp_TypeRegistryEntry current = __blorp_legacy_current_entry((blorp_Object*)obj);
+    __blorp_legacy_reintern((blorp_Object*)obj, fn, current.tag);
+}
 
 __attribute__((constructor))
 static void __blorp_init_stats_flag(void) {
@@ -3288,13 +3392,14 @@ static long __blorp_collect_live_object_types(FILE* out,
         long rc = (long)atomic_load(&obj->refcount);
         if (!BLORP_IS_IMMORTAL_REFCOUNT(rc) && meta->stats_tracked &&
             meta->stats_epoch == current_epoch) {
-            __leak_type_record(buckets, meta->type_tag, meta->alloc_size);
+            const char* type_tag = __blorp_type_tag_for_id(obj->destructor_id);
+            __leak_type_record(buckets, type_tag, meta->alloc_size);
             if (verbose) {
                 fprintf(out,
                         "  #%ld  %s  %zu bytes  rc=%ld  alloc_site=%+ld"
                         "  alloc_caller=%+ld\n",
                         counted + 1,
-                        meta->type_tag ? meta->type_tag : "(unknown)",
+                        type_tag ? type_tag : "(unknown)",
                         meta->alloc_size, rc, meta->alloc_site_offset,
                         meta->alloc_caller_offset);
             }
@@ -3430,9 +3535,9 @@ int blorp_memory_diagnostics_mode(void) {
     return BLORP_MEMORY_DIAGNOSTICS;
 }
 
-// The same fact as a data symbol, read by runtime_decl.c's inline BLORP_TAG
-// so a generated allocation site skips the tag call on an ordinary runtime
-// without a function call to find that out.
+// The same fact as a data symbol, read by runtime_decl.c's legacy
+// BLORP_TAG / BLORP_SET_DESTRUCTOR macros (bootstrap-generated C only), so an
+// ordinary runtime skips their slow path without a function call.
 const bool blorp_runtime_memory_diagnostics = BLORP_MEMORY_DIAGNOSTICS;
 
 void* blorp_alloc(size_t size) {
@@ -3477,25 +3582,6 @@ void* blorp_alloc(size_t size) {
 #endif
     return obj;
 }
-
-// Tagged allocation: sets type_tag for leak reporting.
-// type_tag is a string literal pointer — no allocation or copy needed.
-void blorp_set_type_tag(void* obj, const char* tag) {
-#if BLORP_MEMORY_DIAGNOSTICS
-    if (obj) __alloc_meta_set_type_tag((blorp_Object*)obj, tag);
-#else
-    (void)obj;
-    (void)tag;
-#endif
-}
-
-// Macro for tagging after allocation — less invasive than changing every call site.
-// Usage: BLORP_TAG(ptr, "String")
-#if BLORP_MEMORY_DIAGNOSTICS
-#define BLORP_TAG(ptr, tag) blorp_set_type_tag((void*)(ptr), (tag))
-#else
-#define BLORP_TAG(ptr, tag) ((void)0)
-#endif
 
 static void blorp_io_waiter_wake_all(blorp_IoWaiterList* waiters);
 static blorp_IoWaitOwner blorp_io_wait_owner_none(void);
@@ -4507,8 +4593,7 @@ static blorp_TcpListener* blorp_tcp_listener_from_open_fd(int raw_fd) {
         blorp_tcp_inner_new(BLORP_TCP_HANDLE_LISTENER, raw_fd);
     blorp_TcpListener* listener =
         (blorp_TcpListener*)blorp_alloc(sizeof(blorp_TcpListener));
-    BLORP_TAG(listener, "TcpListener");
-    BLORP_SET_DESTRUCTOR(listener, blorp_tcp_listener_destructor);
+    BLORP_INSTALL_TYPE(listener, blorp_tcp_listener_destructor, "TcpListener");
     listener->inner = inner;
     return listener;
 }
@@ -4518,8 +4603,7 @@ static blorp_TcpStream* blorp_tcp_stream_from_open_fd(int raw_fd) {
     blorp_TcpInner* inner =
         blorp_tcp_inner_new(BLORP_TCP_HANDLE_STREAM, raw_fd);
     blorp_TcpStream* stream = (blorp_TcpStream*)blorp_alloc(sizeof(blorp_TcpStream));
-    BLORP_TAG(stream, "TcpStream");
-    BLORP_SET_DESTRUCTOR(stream, blorp_tcp_stream_destructor);
+    BLORP_INSTALL_TYPE(stream, blorp_tcp_stream_destructor, "TcpStream");
     stream->inner = inner;
     return stream;
 }
@@ -5675,7 +5759,7 @@ static void blorp_vector_destroy(void* obj) {
 void blorp_vector_set_elem_release(blorp_Vector* v, void (*release_fn)(void*)) {
     if (!v || v->elem_release) return;
     v->elem_release = release_fn;
-    BLORP_SET_DESTRUCTOR(v, blorp_vector_destroy);
+    BLORP_INSTALL_TYPE(v, blorp_vector_destroy, "Vector");
     for (long i = 0; i < v->capacity; i++) {
         if (v->data[i]) blorp_retain(v->data[i]);
     }
@@ -5686,7 +5770,7 @@ void blorp_vector_set_elem_release(blorp_Vector* v, void (*release_fn)(void*)) {
 void blorp_vector_init_elem_release(blorp_Vector* v, void (*release_fn)(void*)) {
     if (!v || v->elem_release) return;
     v->elem_release = release_fn;
-    BLORP_SET_DESTRUCTOR(v, blorp_vector_destroy);
+    BLORP_INSTALL_TYPE(v, blorp_vector_destroy, "Vector");
 }
 
 // ============================================================================
@@ -5947,7 +6031,7 @@ static bool blorp_string_contains_nul(const blorp_String* s);
 blorp_String* blorp_string_create_len(const char* bytes, long len) {
     if (len < 0) len = 0;
     blorp_String* str = blorp_string_alloc_uninit(len, len);
-    BLORP_TAG(str, "String");
+    BLORP_INSTALL_TAG(str, "String");
     memcpy(str->data, bytes, len);
     str->data[len] = '\0';
     return str;
@@ -9219,13 +9303,12 @@ static blorp_List* blorp_list_new_layout(long initial_capacity, uint8_t storage_
     }
     size_t stride = storage_mode == BLORP_LIST_STORAGE_INLINE ? (size_t)elem_size : sizeof(void*);
     blorp_List* list = (blorp_List*)blorp_alloc(blorp_checked_add(sizeof(blorp_List), blorp_checked_mul(initial_capacity, stride)));
-    BLORP_TAG(list, "List");
     list->len = 0;
     list->capacity = initial_capacity;
     list->elem_release = NULL;
     list->elem_size = elem_size;
     list->storage_mode = storage_mode;
-    BLORP_SET_DESTRUCTOR(list, blorp_list_destroy);
+    BLORP_INSTALL_TYPE(list, blorp_list_destroy, "List");
     return list;
 }
 
@@ -9425,7 +9508,7 @@ static void blorp_stack_result_box_destroy(void* obj) {
 
 static inline void* blorp_box_stack_result(blorp_StackResult value) {
     void* boxed = blorp_alloc(sizeof(blorp_Object) + sizeof(blorp_StackResult));
-    BLORP_SET_DESTRUCTOR(boxed, blorp_stack_result_box_destroy);
+    BLORP_INSTALL_DESTRUCTOR(boxed, blorp_stack_result_box_destroy);
     memcpy((char*)boxed + sizeof(blorp_Object), &value, sizeof(blorp_StackResult));
     return boxed;
 }
@@ -9508,8 +9591,7 @@ static void blorp_option_destroy(void* obj) {
 
 blorp_Option* blorp_option_some(void* value) {
     blorp_Option* opt = (blorp_Option*)blorp_alloc(sizeof(blorp_Option));
-    BLORP_TAG(opt, "Option");
-    BLORP_SET_DESTRUCTOR(opt, blorp_option_destroy);
+    BLORP_INSTALL_TYPE(opt, blorp_option_destroy, "Option");
     opt->release_mask = 0;
     opt->tag = BLORP_TAG_SOME;
     opt->data.Some.field0 = value;
@@ -9670,8 +9752,7 @@ static inline blorp_StackResult blorp_stack_result_borrow_from_boxed(const blorp
 
 blorp_Result* blorp_result_ok(void* value) {
     blorp_Result* res = (blorp_Result*)blorp_alloc(sizeof(blorp_Result));
-    BLORP_TAG(res, "Result");
-    BLORP_SET_DESTRUCTOR(res, blorp_result_destroy);
+    BLORP_INSTALL_TYPE(res, blorp_result_destroy, "Result");
     res->release_mask = 0;
     res->tag = BLORP_TAG_OK;
     res->data.Ok.field0 = value;
@@ -9686,8 +9767,7 @@ static blorp_Result* blorp_result_ok_with_release_mask(void* value, bool value_i
 
 blorp_Result* blorp_result_err(void* value) {
     blorp_Result* res = (blorp_Result*)blorp_alloc(sizeof(blorp_Result));
-    BLORP_TAG(res, "Result");
-    BLORP_SET_DESTRUCTOR(res, blorp_result_destroy);
+    BLORP_INSTALL_TYPE(res, blorp_result_destroy, "Result");
     res->release_mask = 0;
     res->tag = BLORP_TAG_ERR;
     res->data.Err.field0 = value;
@@ -10133,7 +10213,7 @@ static blorp_ConcurrencyError __blorp_Cancelled_instance;
 
 blorp_ConcurrencyError* blorp_TaskFailed(void* msg) {
     blorp_ConcurrencyError* v = (blorp_ConcurrencyError*)blorp_alloc(sizeof(blorp_ConcurrencyError));
-    BLORP_SET_DESTRUCTOR(v, blorp_concurrency_error_destroy);
+    BLORP_INSTALL_DESTRUCTOR(v, blorp_concurrency_error_destroy);
     v->tag = TAG_TaskFailed;
     v->release_mask = 1UL;
     v->data.TaskFailed.field0 = msg;
@@ -10177,7 +10257,7 @@ static blorp_List* blorp_list_copy(blorp_List* src) {
     list->elem_release = src->elem_release;
     list->elem_size = src->elem_size;
     list->storage_mode = src->storage_mode;
-    BLORP_SET_DESTRUCTOR(list, blorp_list_destroy);
+    BLORP_INSTALL_DESTRUCTOR(list, blorp_list_destroy);
     memcpy(list->data, src->data, src->len * stride);
     // Retain all elements — the copy shares ownership with the original
     if (list->storage_mode == BLORP_LIST_STORAGE_POINTER && list->elem_release) {
@@ -10211,7 +10291,7 @@ static blorp_List* blorp_list_copy_with_capacity(blorp_List* src, long new_capac
     list->elem_release = src->elem_release;
     list->elem_size = src->elem_size;
     list->storage_mode = src->storage_mode;
-    BLORP_SET_DESTRUCTOR(list, blorp_list_destroy);
+    BLORP_INSTALL_DESTRUCTOR(list, blorp_list_destroy);
     memcpy(list->data, src->data, src->len * stride);
     // Retain all elements — the copy shares ownership with the original
     if (list->storage_mode == BLORP_LIST_STORAGE_POINTER && list->elem_release) {
@@ -10247,7 +10327,7 @@ static blorp_List* blorp_list_move_to_capacity(blorp_List* list, long new_capaci
     grown->elem_release = list->elem_release;
     grown->elem_size = list->elem_size;
     grown->storage_mode = list->storage_mode;
-    BLORP_SET_DESTRUCTOR(grown, blorp_list_destroy);
+    BLORP_INSTALL_DESTRUCTOR(grown, blorp_list_destroy);
     memcpy(grown->data, list->data, list->len * stride);
     list->elem_release = NULL;
     blorp_release(list);
@@ -10617,7 +10697,7 @@ blorp_List* blorp_list_append_owned(blorp_List* list, void* element) {
 // new(value, size) — create a 1D vector filled with a value
 blorp_Vector* blorp_vector_new_fill(void* value, long size) {
     blorp_Vector* arr = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(size, sizeof(void*))));
-    BLORP_TAG(arr, "Vector");
+    BLORP_INSTALL_TAG(arr, "Vector");
     arr->len = size;
     arr->capacity = size;
     arr->elem_release = NULL;
@@ -10633,7 +10713,7 @@ blorp_Vector* blorp_matrix_new_fill(void* value, long rows, long cols) {
     if (cols < 0) cols = 0;
     long total = (long)blorp_checked_mul(rows, cols);
     blorp_Vector* arr = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(void*))));
-    BLORP_TAG(arr, "Vector");
+    BLORP_INSTALL_TAG(arr, "Vector");
     arr->len = rows;
     arr->capacity = total;
     arr->elem_release = NULL;
@@ -10649,7 +10729,7 @@ blorp_Vector* blorp_tensor3_new(void* value, long d1, long d2, long d3) {
     if (d1 < 0) d1 = 0; if (d2 < 0) d2 = 0; if (d3 < 0) d3 = 0;
     long total = (long)blorp_checked_mul(d1, blorp_checked_mul(d2, d3));
     blorp_Vector* arr = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(void*))));
-    BLORP_TAG(arr, "Vector");
+    BLORP_INSTALL_TAG(arr, "Vector");
     arr->len = d1;
     arr->capacity = total;
     arr->elem_release = NULL;
@@ -10663,7 +10743,7 @@ blorp_Vector* blorp_tensor4_new(void* value, long d1, long d2, long d3, long d4)
     if (d1 < 0) d1 = 0; if (d2 < 0) d2 = 0; if (d3 < 0) d3 = 0; if (d4 < 0) d4 = 0;
     long total = (long)blorp_checked_mul(blorp_checked_mul(d1, d2), blorp_checked_mul(d3, d4));
     blorp_Vector* arr = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(void*))));
-    BLORP_TAG(arr, "Vector");
+    BLORP_INSTALL_TAG(arr, "Vector");
     arr->len = d1;
     arr->capacity = total;
     arr->elem_release = NULL;
@@ -10677,7 +10757,7 @@ blorp_Vector* blorp_tensor5_new(void* value, long d1, long d2, long d3, long d4,
     if (d1 < 0) d1 = 0; if (d2 < 0) d2 = 0; if (d3 < 0) d3 = 0; if (d4 < 0) d4 = 0; if (d5 < 0) d5 = 0;
     long total = (long)blorp_checked_mul(blorp_checked_mul(d1, blorp_checked_mul(d2, d3)), blorp_checked_mul(d4, d5));
     blorp_Vector* arr = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(total, sizeof(void*))));
-    BLORP_TAG(arr, "Vector");
+    BLORP_INSTALL_TAG(arr, "Vector");
     arr->len = d1;
     arr->capacity = total;
     arr->elem_release = NULL;
@@ -10689,7 +10769,7 @@ blorp_Vector* blorp_tensor5_new(void* value, long d1, long d2, long d3, long d4,
 
 blorp_Vector* blorp_vector_new(long size) {
     blorp_Vector* arr = (blorp_Vector*)blorp_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(size, sizeof(void*))));
-    BLORP_TAG(arr, "Vector");
+    BLORP_INSTALL_TAG(arr, "Vector");
     arr->len = size;
     arr->capacity = size;  /* Fixed size for arrays */
     arr->elem_release = NULL;
@@ -11240,7 +11320,7 @@ blorp_Vector* blorp_checked_slice(blorp_Vector* arr, long start, long end_idx) {
             empty->elem_release = arr->elem_release;
             empty->elem_size = arr->elem_size;
             empty->storage_mode = arr->storage_mode;
-            if (arr->elem_release) BLORP_SET_DESTRUCTOR(empty, blorp_vector_destroy);
+            if (arr->elem_release) BLORP_INSTALL_TYPE(empty, blorp_vector_destroy, "Vector");
         }
         empty->len = 0;
         return empty;
@@ -11260,7 +11340,7 @@ blorp_Vector* blorp_checked_slice(blorp_Vector* arr, long start, long end_idx) {
     out->elem_release = arr->elem_release;
     out->elem_size = arr->elem_size;
     out->storage_mode = arr->storage_mode;
-    if (out->elem_release) BLORP_SET_DESTRUCTOR(out, blorp_vector_destroy);
+    if (out->elem_release) BLORP_INSTALL_TYPE(out, blorp_vector_destroy, "Vector");
     // Packed byte copy handles both pointer-sized and sub-byte elements.
     long src_offset_bytes = blorp_packed_byte_count(s, arr->elem_size);
     memcpy(out->data, (char*)arr->data + src_offset_bytes, byte_size);
@@ -11624,7 +11704,7 @@ static blorp_Vector* blorp_vector_copy(blorp_Vector* src) {
     arr->elem_size = src->elem_size;
     arr->storage_mode = src->storage_mode;
     if (arr->elem_release) {
-        BLORP_SET_DESTRUCTOR(arr, blorp_vector_destroy);
+        BLORP_INSTALL_TYPE(arr, blorp_vector_destroy, "Vector");
     }
     memcpy(arr->data, src->data, byte_size);
     if (arr->elem_release) {
@@ -13324,7 +13404,7 @@ blorp_Vector* blorp_tensor_slice_row(blorp_Vector* tensor, long row_index, long 
     result->elem_size = es;
     result->storage_mode = tensor->storage_mode;
     if (result->elem_release) {
-        BLORP_SET_DESTRUCTOR(result, blorp_vector_destroy);
+        BLORP_INSTALL_TYPE(result, blorp_vector_destroy, "Vector");
     }
     memcpy(result->data, (char*)tensor->data + offset * byte_es, row_size * byte_es);
     if (result->elem_release) {
@@ -15323,7 +15403,7 @@ static blorp_ResourceSource* blorp_tcp_connection_source_new(
 ) {
     blorp_ResourceSource* source =
         (blorp_ResourceSource*)blorp_alloc(sizeof(blorp_ResourceSource));
-    BLORP_TAG(source, "ResourceSource");
+    BLORP_INSTALL_TAG(source, "ResourceSource");
     source->kind = BLORP_RESOURCE_SOURCE_TCP_CONNECTIONS;
     source->error_policy = error_policy;
     source->owner.tcp_listener = listener;
@@ -16613,8 +16693,7 @@ static blorp_TlsSession* blorp_tls_session_new(
 ) {
     blorp_TlsSession* session =
         (blorp_TlsSession*)blorp_alloc(sizeof(blorp_TlsSession));
-    BLORP_TAG(session, "net_tls__TlsSession");
-    BLORP_SET_DESTRUCTOR(session, blorp_tls_session_destroy);
+    BLORP_INSTALL_TYPE(session, blorp_tls_session_destroy, "net_tls__TlsSession");
     session->stream = stream ? blorp_retain(stream) : NULL;
     session->backend = backend ? backend : blorp_tls_active_backend();
     session->state = state;
@@ -18757,8 +18836,7 @@ static blorp_WebSocketSession* blorp_websocket_session_new(
 ) {
     blorp_WebSocketSession* session =
         (blorp_WebSocketSession*)blorp_alloc(sizeof(blorp_WebSocketSession));
-    BLORP_TAG(session, "net_websocket__WebSocketSession");
-    BLORP_SET_DESTRUCTOR(session, blorp_websocket_session_destroy);
+    BLORP_INSTALL_TYPE(session, blorp_websocket_session_destroy, "net_websocket__WebSocketSession");
     session->backend = backend ? backend : blorp_websocket_active_backend();
     session->state = state;
     session->read_operation_state = BLORP_WEBSOCKET_OPERATION_NONE;
@@ -21327,7 +21405,7 @@ void blorp_tuple_destructor(void* obj) {
 // Set release mask on tuple and install destructor
 static inline void blorp_tuple_set_rc(blorp_Tuple* t, long mask) {
     t->release_mask = mask;
-    BLORP_SET_DESTRUCTOR(t, blorp_tuple_destructor);
+    BLORP_INSTALL_TYPE(t, blorp_tuple_destructor, "Tuple");
 }
 
 // Dict: Swiss table — open addressing with group-of-16 probing
@@ -21788,7 +21866,7 @@ blorp_Dict* blorp_dict_new(void) {
     dict->eq_fn = blorp_dict_key_eq_int;
     dict->key_release = NULL;
     dict->value_release = NULL;
-    BLORP_SET_DESTRUCTOR(dict, blorp_dict_destroy);
+    BLORP_INSTALL_DESTRUCTOR(dict, blorp_dict_destroy);
     return dict;
 }
 
@@ -21999,7 +22077,7 @@ static blorp_Dict* blorp_dict_new_like(const blorp_Dict* src) {
     dict->eq_fn = src->eq_fn;
     dict->key_release = src->key_release;
     dict->value_release = src->value_release;
-    BLORP_SET_DESTRUCTOR(dict, blorp_dict_destroy);
+    BLORP_INSTALL_DESTRUCTOR(dict, blorp_dict_destroy);
     return dict;
 }
 
@@ -22227,7 +22305,7 @@ blorp_Set* blorp_set_new(void) {
     set->hash_fn = blorp_dict_hash_int;
     set->eq_fn = blorp_dict_key_eq_int;
     set->key_release = NULL;
-    BLORP_SET_DESTRUCTOR(set, blorp_set_destroy);
+    BLORP_INSTALL_DESTRUCTOR(set, blorp_set_destroy);
     return set;
 }
 
@@ -22272,7 +22350,7 @@ static blorp_Set* blorp_set_copy(blorp_Set* src) {
     set->hash_fn = src->hash_fn;
     set->eq_fn = src->eq_fn;
     set->key_release = src->key_release;
-    BLORP_SET_DESTRUCTOR(set, blorp_set_destroy);
+    BLORP_INSTALL_DESTRUCTOR(set, blorp_set_destroy);
 
     // Iterate in insertion order to preserve it in the copy
     blorp_SetEntry* src_entry = src->first;
@@ -22447,7 +22525,7 @@ blorp_Set* blorp_set_alloc(long capacity) {
     set->hash_fn = blorp_dict_hash_int;
     set->eq_fn = blorp_dict_key_eq_int;
     set->key_release = NULL;
-    BLORP_SET_DESTRUCTOR(set, blorp_set_destroy);
+    BLORP_INSTALL_DESTRUCTOR(set, blorp_set_destroy);
     return set;
 }
 
@@ -22557,7 +22635,7 @@ blorp_Dict* blorp_dict_alloc(long capacity) {
     dict->eq_fn = blorp_dict_key_eq_int;
     dict->key_release = NULL;
     dict->value_release = NULL;
-    BLORP_SET_DESTRUCTOR(dict, blorp_dict_destroy);
+    BLORP_INSTALL_DESTRUCTOR(dict, blorp_dict_destroy);
     return dict;
 }
 
@@ -26650,8 +26728,7 @@ static blorp_Task* __blorp_task_alloc(
 ) {
     bool stats_active = __blorp_scheduler_stats_active();
     blorp_Task* task = (blorp_Task*)blorp_alloc(sizeof(blorp_Task));
-    BLORP_TAG(task, "Task");
-    BLORP_SET_DESTRUCTOR(task, blorp_task_destructor);
+    BLORP_INSTALL_TYPE(task, blorp_task_destructor, "Task");
     task->stats_active_counted = stats_active;
     if (stats_active) {
         atomic_fetch_add_explicit(
@@ -27697,8 +27774,7 @@ static void blorp_channel_destructor(void* obj) {
 void* blorp_channel_new(long capacity) {
     if (capacity < 1) capacity = 1;
     blorp_Channel* ch = (blorp_Channel*)blorp_alloc(sizeof(blorp_Channel));
-    BLORP_TAG(ch, "Channel");
-    BLORP_SET_DESTRUCTOR(ch, blorp_channel_destructor);
+    BLORP_INSTALL_TYPE(ch, blorp_channel_destructor, "Channel");
     pthread_mutex_init(&ch->mutex, NULL);
     pthread_cond_init(&ch->not_empty, NULL);
     pthread_cond_init(&ch->not_full, NULL);
@@ -31680,7 +31756,7 @@ blorp_StackOption_Int blorp_time_parse_rfc3339(const blorp_String* s) {
 
 blorp_Tuple* blorp_tuple_new(long arity, ...) {
     blorp_Tuple* t = (blorp_Tuple*)blorp_alloc(blorp_checked_add(sizeof(blorp_Tuple), blorp_checked_mul(arity, sizeof(void*))));
-    BLORP_TAG(t, "Tuple");
+    BLORP_INSTALL_TAG(t, "Tuple");
     t->arity = arity;
     t->release_mask = 0;  // No element ownership by default
     va_list args;
@@ -31876,7 +31952,7 @@ typedef struct {
 // --- Helper: allocate a stream ---
 static blorp_Stream* blorp_stream_new(void) {
     blorp_Stream* s = (blorp_Stream*)blorp_alloc(sizeof(blorp_Stream));
-    BLORP_SET_DESTRUCTOR(s, blorp_stream_destroy);
+    BLORP_INSTALL_DESTRUCTOR(s, blorp_stream_destroy);
     s->state = NULL;
     s->state_cleanup = NULL;
     s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE;
@@ -31886,7 +31962,7 @@ static blorp_Stream* blorp_stream_new(void) {
 static blorp_FallibleStream* blorp_fallible_stream_new(void) {
     blorp_FallibleStream* s =
         (blorp_FallibleStream*)blorp_alloc(sizeof(blorp_FallibleStream));
-    BLORP_SET_DESTRUCTOR(s, blorp_fallible_stream_destroy);
+    BLORP_INSTALL_DESTRUCTOR(s, blorp_fallible_stream_destroy);
     s->state = NULL;
     s->state_cleanup = NULL;
     s->elem_layout = BLORP_STREAM_ELEM_IMMEDIATE;
@@ -33515,8 +33591,7 @@ static blorp_UdpDatagramRecord* blorp_udp_datagram_record_make(
 ) {
     blorp_UdpDatagramRecord* datagram =
         (blorp_UdpDatagramRecord*)blorp_alloc(sizeof(blorp_UdpDatagramRecord));
-    BLORP_TAG(datagram, "net_udp__Datagram");
-    BLORP_SET_DESTRUCTOR(datagram, blorp_udp_datagram_record_destroy);
+    BLORP_INSTALL_TYPE(datagram, blorp_udp_datagram_record_destroy, "net_udp__Datagram");
     datagram->data = data;
     datagram->host = host;
     datagram->port = port;
@@ -36076,23 +36151,21 @@ static void blorp_closure_destroy(void* obj) {
 
 blorp_Closure* blorp_closure_new(void* func, void* env) {
     blorp_Closure* c = (blorp_Closure*)blorp_alloc(sizeof(blorp_Closure));
-    BLORP_TAG(c, "Closure");
     c->func = func;
     c->env = env;
     c->env_count = 0;
     c->env_release_mask = 0;
-    BLORP_SET_DESTRUCTOR(c, blorp_closure_destroy);
+    BLORP_INSTALL_TYPE(c, blorp_closure_destroy, "Closure");
     return c;
 }
 
 blorp_Closure* blorp_closure_new_inline(void* func, int n) {
     blorp_Closure* c = (blorp_Closure*)blorp_alloc(sizeof(blorp_Closure) + n * sizeof(void*));
-    BLORP_TAG(c, "Closure");
     c->func = func;
     c->env = (void*)((char*)c + sizeof(blorp_Closure));
     c->env_count = n;
     c->env_release_mask = 0;
-    BLORP_SET_DESTRUCTOR(c, blorp_closure_destroy);
+    BLORP_INSTALL_TYPE(c, blorp_closure_destroy, "Closure");
     return c;
 }
 
@@ -36103,7 +36176,7 @@ blorp_Closure* blorp_closure_new_typed_inline(void* func, size_t env_size, size_
         env_alignment - 1
     );
     blorp_Closure* c = (blorp_Closure*)blorp_alloc(allocation_size);
-    BLORP_TAG(c, "Closure");
+    BLORP_INSTALL_TAG(c, "Closure");
     c->func = func;
     uintptr_t env_address = (uintptr_t)((char*)c + sizeof(blorp_Closure));
     size_t remainder = env_address % env_alignment;
@@ -36839,7 +36912,7 @@ static void blorp_slice_destructor(void* obj) {
 // Allocate a slice with given source, start, len (retains source, sets destructor)
 blorp_StringSlice* blorp_slice_alloc(blorp_String* source, long start, long len) {
     blorp_StringSlice* slice = (blorp_StringSlice*)blorp_alloc(sizeof(blorp_StringSlice));
-    BLORP_SET_DESTRUCTOR(slice, blorp_slice_destructor);
+    BLORP_INSTALL_DESTRUCTOR(slice, blorp_slice_destructor);
     slice->source = (blorp_String*)blorp_retain(source);
     slice->start = start;
     slice->len = len;
@@ -38262,8 +38335,7 @@ static blorp_DirectoryEntry* blorp_directory_entry_make(
 ) {
     blorp_DirectoryEntry* entry =
         (blorp_DirectoryEntry*)blorp_alloc(sizeof(blorp_DirectoryEntry));
-    BLORP_TAG(entry, "DirectoryEntry");
-    BLORP_SET_DESTRUCTOR(entry, blorp_directory_entry_destroy);
+    BLORP_INSTALL_TYPE(entry, blorp_directory_entry_destroy, "DirectoryEntry");
     entry->name = blorp_string_from_buf_size(name, name_len);
     entry->kind = kind;
     return entry;

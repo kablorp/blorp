@@ -6,6 +6,7 @@
 BLORP=bin/blorp
 FIXTURE=blorp/test/runtime/fixture/leak_string_deliberate.brp
 SUITE_FIXTURE=blorp/test/runtime/fixture/leak_suite_deliberate.brp
+TYPED_FIXTURE=blorp/test/runtime/fixture/leak_typed_deliberate.brp
 PASS=0
 FAIL=0
 
@@ -68,6 +69,23 @@ if grep -qE "\\[LEAK: [0-9]+ objects\\]" <<< "$suite_output" \
 else
     echo "FAIL (no suite type bucket)"
     echo "  Got: $(grep -iE 'LEAK|Leaked by type|String|List|Channel|Closure|unknown' <<< "$suite_output")"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 6: leaked objects are named by their allocation site's registered type,
+# including a record with no destructor (LeakPoint, a tag-only site), a record
+# with one (LeakLabeled), and a union.
+echo -n "Test 6: leak report names generated record and union types... "
+typed_output=$(BLORP_LEAK_CHECK=1 $BLORP run "$TYPED_FIXTURE" 2>&1 || true)
+if grep -qE "LeakPoint +1 " <<< "$typed_output" \
+    && grep -qE "LeakLabeled +1 " <<< "$typed_output" \
+    && grep -qE "LeakChoice +1 " <<< "$typed_output" \
+    && ! grep -q "(unknown)" <<< "$typed_output"; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (missing per-type names)"
+    echo "  Got: $typed_output"
     FAIL=$((FAIL + 1))
 fi
 

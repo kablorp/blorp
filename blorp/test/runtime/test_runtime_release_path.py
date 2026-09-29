@@ -37,7 +37,7 @@ PRELUDE = textwrap.dedent(
     }
     static void* new_counted_element(void) {
         void* obj = blorp_alloc(sizeof(blorp_Object) + sizeof(long));
-        BLORP_SET_DESTRUCTOR(obj, counted_element_destroy);
+        BLORP_INSTALL_DESTRUCTOR(obj, counted_element_destroy);
         return obj;
     }
     static long refcount_of(void* obj) {
