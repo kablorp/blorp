@@ -280,20 +280,6 @@ private pure func tuple_index_in_bounds(arity: Int, index: Int) -> Option[Int]:
 		None
 
 
----
-Synthetic multi-return-call "tuple as record" fields still carry their
-positional index as a decimal spelling (`"0"`, `"1"`, ...) in the field
-access's name; their `CoreFieldRef` is unresolved (no typecheck identity), so
-the spelling is the only discriminator and is compared explicitly here.
----
-private pure func field_index_in_bounds(arity: Int, name: String) -> Option[Int]:
-	match name.parse_int():
-		Some(index):
-			tuple_index_in_bounds(arity, index)
-		None:
-			None
-
-
 private pure func direct_tuple_field_index(
 	arity: Int,
 	accessor: CoreSemanticMatchAccessor,
@@ -619,11 +605,8 @@ private pure func tuple_uses_supported(arity: Int, aliases: List[CoreVar], expr:
 	match expr:
 		VarExpr(variable_name, _, _):
 			not aliases_include(aliases, variable_name)
-		FieldExpr(VarExpr(variable_name, _, _), field_name, _, _, _):
-			(
-				not aliases_include(aliases, variable_name)
-				or field_index_in_bounds(arity, field_name).is_some()
-			)
+		FieldExpr(VarExpr(variable_name, _, _), _, _, _, _):
+			not aliases_include(aliases, variable_name)
 		TupleFieldExpr(VarExpr(variable_name, _, _), index, _, _):
 			(
 				not aliases_include(aliases, variable_name)
@@ -1165,15 +1148,6 @@ private pure func replace_field_uses(
 	expr: CoreExpr,
 ) -> CoreExpr:
 	match expr:
-		FieldExpr(VarExpr(variable_name, _, _), field_name, _, typ, loc):
-			if aliases_include(aliases, variable_name):
-				match field_index_in_bounds(element_vars.length(), field_name):
-					Some(index):
-						tuple_element_ref(element_vars, elements, index, loc).get_or(expr)
-					None:
-						expr
-			else:
-				expr
 		TupleFieldExpr(VarExpr(variable_name, _, _), index, _, loc):
 			if aliases_include(aliases, variable_name):
 				match tuple_index_in_bounds(element_vars.length(), index):
@@ -2473,14 +2447,14 @@ private pure func lower_tuple_return_call_field(
 	summaries: Dict[Int, TupleReturnSummary],
 	call_kind: CoreCallKind,
 	args: List[CoreExpr],
-	field_name: String,
+	index: Int,
 	loc: CoreSourceLoc,
 	next_fresh: Int,
 ) -> Option[TupleSroaRewrite]:
 	summary ?= tuple_return_summary_for_call(summaries, call_kind)
-	index ?= field_index_in_bounds(summary.elements.length(), field_name)
+	valid_index ?= tuple_index_in_bounds(summary.elements.length(), index)
 	expansion ?= tuple_return_call_expansion(summary, args, next_fresh)
-	selected ?= tuple_element_ref(expansion.element_vars, expansion.elements, index, loc)
+	selected ?= tuple_element_ref(expansion.element_vars, expansion.elements, valid_index, loc)
 	Some({
 		expr = bind_tuple_return_expansion(expansion, args, selected),
 		next_fresh = expansion.next_fresh,
@@ -2512,31 +2486,6 @@ private pure func scalar_replace_tuple_node(
 	next_fresh: Int,
 ) -> TupleSroaRewrite:
 	match expr:
-		FieldExpr(TupleExpr(elements, _, _), field_name, _, _, loc):
-			match field_index_in_bounds(elements.length(), field_name):
-				Some(index):
-					allocated: (List[CoreVar], Int) = allocate_vars(
-						"element",
-						elements.length(),
-						next_fresh,
-					)
-
-					match tuple_element_ref(allocated[0], elements, index, loc):
-						Some(selected):
-							{
-								expr = bind_tuple_elements(allocated[0], elements, selected),
-								next_fresh = allocated[1]
-							}
-						None:
-							{
-								expr = expr,
-								next_fresh = next_fresh
-							}
-				None:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
 		TupleFieldExpr(TupleExpr(elements, _, _), index, _, loc):
 			if index >= 0 and index < elements.length():
 				allocated: (List[CoreVar], Int) = allocate_vars(
@@ -2561,28 +2510,12 @@ private pure func scalar_replace_tuple_node(
 					expr = expr,
 					next_fresh = next_fresh
 				}
-		FieldExpr(CallExpr(call_kind, _, args, _, _), field_name, _, _, loc):
-			match lower_tuple_return_call_field(
-				context.summaries,
-				call_kind,
-				args,
-				field_name,
-				loc,
-				next_fresh,
-			):
-				Some(result):
-					result
-				None:
-					{
-						expr = expr,
-						next_fresh = next_fresh
-					}
 		TupleFieldExpr(CallExpr(call_kind, _, args, _, _), index, _, loc):
 			match lower_tuple_return_call_field(
 				context.summaries,
 				call_kind,
 				args,
-				index.to_string(),
+				index,
 				loc,
 				next_fresh,
 			):
@@ -2777,7 +2710,7 @@ with its own iterative walker for deep `and`/`or` chains, and this pass
 never special-cased `BinaryExpr`'s spine the way SSA versioning and
 std-wrapper inlining do, so every node kind maps its children the same
 way here: rewrite children first, then let `scalar_replace_tuple_node`
-look for the tuple-shaped patterns (`FieldExpr(TupleExpr(...))`,
+look for the tuple-shaped patterns (`TupleFieldExpr(TupleExpr(...))`,
 `LetExpr` binding a tuple-producing rhs, a tuple-shaped semantic match,
 and so on) that only appear once children are in their final form.
 ---
