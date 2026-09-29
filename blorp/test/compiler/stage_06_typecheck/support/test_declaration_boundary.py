@@ -339,7 +339,7 @@ class DeclarationBoundaryTests(unittest.TestCase):
 
         self.assertIn("opaque type GraphSourceNameTable", name_source)
         self.assertIn(
-            "graph_source_name_table_from_source_names(module_table, source_names)",
+            "graph_source_name_table_from_source_names(\n\t\tmodule_table,\n\t\tsource_names,\n\t\tSpellingsFromNameTable(source_names),\n\t)",
             name_source,
         )
         self.assertIn("opaque type GraphModuleNameScope", name_source)

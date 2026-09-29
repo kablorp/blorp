@@ -1,8 +1,20 @@
 import:
-	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
+	../../../src/compiler/stage_02_lex/name_table:
+		IdentifierSpellings(SpellingsFromNameTable),
+		identifier_spelling,
+		EMPTY_NAME_TABLE,
+		NameTable,
+		name_id_from_interned_index,
+		name_table_intern,
+	../../../src/compiler/stage_03_parse/parsed_ast: ParsedIdentifier, ParsedProgram, parsed_identifier
 	../../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedTypecheckProgram,
 		finalized_typecheck_program_ast,
+	../../../src/compiler/stage_04_modules/module_table: ModuleTable, singleton_module_table
+	../../../src/compiler/stage_06_typecheck/graph/source_name_table:
+		graph_source_name_table,
+		graph_source_name_table_for_programs,
+		graph_source_name_table_identifier_spellings,
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(SourcePackageModule, UserModule),
 		module_identities_equal,
@@ -80,6 +92,7 @@ import:
 		typecheck_state_find_type_home,
 		typecheck_state_finish_graph_import_admission,
 		typecheck_state_for_origin,
+		typecheck_state_identifier_text,
 		typecheck_state_from_infer_session,
 		typecheck_state_func_callable_bindings,
 		typecheck_state_has_known_resource_type_name,
@@ -1055,9 +1068,74 @@ pure func test_infer_session_round_trip_preserves_module_facts() -> Bool:
 	)
 
 
+pure func test_state_renders_identifiers_from_its_name_table() -> Bool:
+	(table, index) = name_table_intern(EMPTY_NAME_TABLE, "spelled")
+	identifier: ParsedIdentifier = parsed_identifier(
+		name_id_from_interned_index(index),
+		"stale_text",
+		callable_span(1, 1),
+	)
+	with_table: TypecheckState = { typecheck_state_for_origin(TYPECHECK_USER_ORIGIN) | identifier_spellings = SpellingsFromNameTable(table) }
+	without_table: TypecheckState = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+
+	(
+		typecheck_state_identifier_text(with_table, identifier) == "spelled"
+		and typecheck_state_identifier_text(without_table, identifier) == "stale_text"
+	)
+
+
+-- The `z` -> `ease_out_quart` shape: the identifier's id names a different
+-- spelling in the graph's table than the identifier's own text. A discovery
+-- graph's ids index that table, so the table wins; a standalone graph's ids come
+-- from private tables, so the table must not be consulted at all.
+pure func mismatched_id_identifier() -> ParsedIdentifier:
+	parsed_identifier(name_id_from_interned_index(0), "z", callable_span(1, 1))
+
+
+pure func graph_names_table_with_other_spelling() -> NameTable:
+	(table, _) = name_table_intern(EMPTY_NAME_TABLE, "ease_out_quart")
+	table
+
+
+pure func single_module_table() -> ModuleTable:
+	(module_table, _) = singleton_module_table(
+		resolved_module_identity_from_resolver("app", UserModule),
+	)
+	module_table
+
+
+pure func test_discovery_graph_renders_identifiers_from_its_table() -> Bool:
+	graph_names = graph_source_name_table(
+		single_module_table(),
+		graph_names_table_with_other_spelling(),
+	)
+	spellings = graph_source_name_table_identifier_spellings(graph_names)
+
+	identifier_spelling(spellings, mismatched_id_identifier().name, "z") == "ease_out_quart"
+
+
+pure func test_standalone_graph_renders_identifiers_from_their_text() -> Bool:
+	graph_names = graph_source_name_table_for_programs(single_module_table(), [])
+	spellings = graph_source_name_table_identifier_spellings(graph_names)
+
+	identifier_spelling(spellings, mismatched_id_identifier().name, "z") == "z"
+
+
 tests: TestSuite = {
 	description = "Compiler typecheck state substrate",
 	tests = [
+		(
+			"discovery graph renders identifiers from its table",
+			test_discovery_graph_renders_identifiers_from_its_table,
+		),
+		(
+			"standalone graph renders identifiers from their text",
+			test_standalone_graph_renders_identifiers_from_their_text,
+		),
+		(
+			"state renders identifiers from its name table",
+			test_state_renders_identifiers_from_its_name_table,
+		),
 		("state initialization and origin policy", test_state_initialization_and_origin_policy),
 		("import bindings are deduped", test_import_bindings_are_deduped),
 		("import binding kind is explicit", test_import_binding_kind_is_explicit),
