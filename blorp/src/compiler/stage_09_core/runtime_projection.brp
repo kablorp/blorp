@@ -7,6 +7,7 @@ import:
 	../stage_06_typecheck/type_system/language_surface_manifest:
 		DeclaredAbiType(DeclaredAbiOption, DeclaredAbiResult),
 	ir:
+		CoreDeclaredOrigin(ImplMethod, ProjectedImplMethod),
 		CoreDecl(
 			EnumDecl,
 			FunctionDecl,
@@ -20,6 +21,7 @@ import:
 		),
 		CoreExpr(SeqExpr),
 		CoreFunction,
+		CoreFunctionOrigin(Declared, Synthesized),
 		CoreGlobal,
 		CoreHeapRecordField,
 		CoreImplDecl,
@@ -163,17 +165,50 @@ private pure func project_runtime_abi_union(union_decl: CoreUnionDecl) -> CoreDe
 	)
 
 
-private pure func project_impl_method(impl_decl: CoreImplDecl, method: CoreFunction) -> CoreDecl:
-	method_name: String = if method.name.starts_with(impl_decl.trait_name + "_"):
-		method.name
-	else:
-		match core_trait_impl_type_key(impl_decl.for_type):
-			Some(type_key):
-				"${impl_decl.trait_name}_${method.name}_${type_key}"
-			None:
-				method.name
+---
+The declared origin of a method whose impl is being projected: an impl method
+keeps its trait, method and role and gains the impl's target type, which is
+about to leave with the `ImplDecl`.
+---
+private pure func projected_declared_origin(
+	declared: CoreDeclaredOrigin,
+	for_type: CoreType,
+) -> CoreDeclaredOrigin:
+	match declared:
+		ImplMethod(trait_name, method_name, role):
+			ProjectedImplMethod(trait_name, method_name, for_type, role)
+		_:
+			declared
 
-	FunctionDecl({ method | name = method_name })
+
+private pure func projected_origin(origin: CoreFunctionOrigin, for_type: CoreType) -> CoreFunctionOrigin:
+	match origin:
+		Declared(declared):
+			Declared(projected_declared_origin(declared, for_type))
+		Synthesized(kind, declared_as):
+			Synthesized(kind, projected_declared_origin(declared_as, for_type))
+
+
+---
+Turns one impl method into the top-level function the backend calls. This is
+the only place an impl becomes functions (`project_runtime_decl` maps each
+`ImplDecl` to `FunctionDecl`s and no `ImplDecl` survives), so it never sees an
+already-projected method and needs no check for one. The `<Trait>_<method>_<TypeKey>`
+spelling is still produced here for the dispatch readers that have not moved
+to origins yet (M3.1 deletes it); the callback readers ask the origin, which
+this also rewrites to carry the impl's target type.
+---
+private pure func project_impl_method(impl_decl: CoreImplDecl, method: CoreFunction) -> CoreDecl:
+	method_name: String = match core_trait_impl_type_key(impl_decl.for_type):
+		Some(type_key):
+			"${impl_decl.trait_name}_${method.name}_${type_key}"
+		None:
+			method.name
+
+	FunctionDecl({ method |
+		name = method_name,
+		origin = projected_origin(method.origin, impl_decl.for_type)
+	})
 
 
 private pure func project_runtime_decl(

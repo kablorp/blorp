@@ -1,11 +1,17 @@
 import:
+	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(IntrinsicCall, SelectedDirectCall, UserCall),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackFail),
+		CoreDeclaredOrigin(ProjectedImplMethod),
 		CoreDecl(FunctionDecl, ImplDecl),
+		CoreFunction,
+		CoreFunctionOrigin(Declared),
+		CoreImplMethodRole(RuntimeCallbackMethod),
+		CoreRuntimeCallbackRole(HashableHashCallback),
 		CoreExpr(
 			BreakExpr,
 			CallExpr,
@@ -59,6 +65,7 @@ import:
 			DebugBlockSurvived,
 			DictLiteralSurvived,
 			DuplicateDefinitionId,
+			DuplicateRuntimeCallback,
 			InvalidDefinitionId,
 			LayoutlessListAllocationSurvived,
 			LambdaSurvived,
@@ -80,6 +87,7 @@ import:
 			UnresolvedCallSurvived,
 			VectorLiteralSurvived,
 		),
+		check_definition_id_uniqueness,
 		check_late_core_invariants,
 	../../../src/compiler/stage_09_core/pipeline_stage:
 		CorePipelineStage(ClosureStage, DceStage, FinalStage, PerceusStage, PostDceTailStage),
@@ -888,6 +896,66 @@ pure func test_final_boundary_rejects_definition_id_owned_by_two_functions() -> 
 			False
 
 
+pure func hash_callback_function(name: String, def_id: Int, for_type: CoreType) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(literal(1)),
+		is_pure = True,
+		origin = Declared(
+			ProjectedImplMethod(
+				synthesized_name_id("_"),
+				synthesized_name_id("_"),
+				for_type,
+				RuntimeCallbackMethod(HashableHashCallback),
+			),
+		),
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = synthetic_core_source_loc(),
+	}
+
+
+pure func test_final_boundary_rejects_two_functions_implementing_one_callback_on_one_type() -> Bool:
+	key_type: CoreType = NamedType("Key", [])
+	program: CoreProgram = {
+		decls = [
+			FunctionDecl(hash_callback_function("Hashable_hash_Key", 2, key_type)),
+			FunctionDecl(hash_callback_function("other_hash_of_Key", 3, key_type)),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match check_definition_id_uniqueness(program):
+		[DuplicateRuntimeCallback(role, type_key, first, second)]:
+			(
+				role == "Hashable.hash"
+				and type_key == "Key"
+				and first == "Hashable_hash_Key"
+				and second == "other_hash_of_Key"
+			)
+		_:
+			False
+
+
+pure func test_final_boundary_accepts_one_callback_per_type() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			FunctionDecl(hash_callback_function("Hashable_hash_Key", 2, NamedType("Key", []))),
+			FunctionDecl(hash_callback_function("Hashable_hash_Other", 3, NamedType("Other", []))),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	check_definition_id_uniqueness(program).is_empty()
+
+
 pure func test_final_boundary_rejects_negative_definition_id() -> Bool:
 	match program_with_body(literal(1)).decls:
 		[FunctionDecl(function_info)]:
@@ -1057,6 +1125,11 @@ tests: TestSuite = {
 			"final boundary rejects definition ID owned by two functions",
 			test_final_boundary_rejects_definition_id_owned_by_two_functions,
 		),
+		(
+			"final boundary rejects two functions implementing one callback on one type",
+			test_final_boundary_rejects_two_functions_implementing_one_callback_on_one_type,
+		),
+		("final boundary accepts one callback per type", test_final_boundary_accepts_one_callback_per_type),
 		(
 			"final boundary rejects negative definition ID",
 			test_final_boundary_rejects_negative_definition_id,

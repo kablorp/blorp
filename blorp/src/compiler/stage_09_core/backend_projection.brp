@@ -57,6 +57,11 @@ import:
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
 		CoreLogicalOp,
 		CoreProgram,
+		CoreRuntimeCallbackRole(
+			EquatableEqualsCallback,
+			HashableHashCallback,
+			StringableToStringCallback,
+		),
 		CoreSourceLoc,
 		CoreTensorParallelLayout(
 			TensorParallelInlineStructLayout,
@@ -85,6 +90,10 @@ import:
 		builtin_contract,
 		runtime_builtin_has_erased_arguments,
 		runtime_builtin_uses_erased_argument,
+	runtime_callbacks:
+		CoreRuntimeCallbackTable,
+		build_runtime_callback_table,
+		find_runtime_callback,
 	specialize_layout:
 		CoreOptionRuntimeLayout(BoxedOptionLayout),
 		CoreSpecializeLayout,
@@ -101,7 +110,6 @@ import:
 		specialize_list_element_needs_release,
 		specialize_list_layout,
 		specialize_type_is_pointer,
-	trait_resolve: core_trait_impl_type_key
 	traverse as CoreTraverse
 
 
@@ -135,25 +143,13 @@ can build one context once and thread it through the shared walk.
 record BackendProjectionContext {
 	layout: CoreSpecializeLayout,
 	constructors: NullaryConstructorIndex,
-	function_names: List[String]
+	callbacks: CoreRuntimeCallbackTable
 }
 
 
 private union BackendProjectionLogicalTask:
 	ProjectBackendLogicalNode(CoreExpr)
 	RebuildProjectedBackendLogicalNode(CoreLogicalOp, CoreType, CoreSourceLoc)
-
-
-private pure func find_function_name(names: List[String], expected: String) -> Option[String]:
-	var result: Option[String] = None
-	suffix: String = "_" + expected
-
-	for name in names:
-		if name == expected or name.ends_with(suffix):
-			result = Some(name)
-			break
-
-	result
 
 
 private pure func result_is_option(layout: CoreSpecializeLayout, typ: CoreType) -> Bool:
@@ -367,7 +363,7 @@ private pure func project_ranked_tensor_fill(
 
 private pure func list_callback_call_kind(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	args: List[CoreExpr],
 ) -> Option[CoreCallKind]:
 	if args.length() != 1:
@@ -384,20 +380,18 @@ private pure func list_callback_call_kind(
 			_:
 				None
 
-		element_key ?= core_trait_impl_type_key(element_type)
-		callback ?= find_function_name(names, "Stringable_to_string_" + element_key)
+		callback ?= find_runtime_callback(callbacks, StringableToStringCallback, element_type)
 		Some(ListToStringCall(callback))
 
 
 private pure func custom_hash_container_constructor(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	key_type: CoreType,
 ) -> Option[CoreHashContainerConstructor]:
 	key: CoreType = resolve_specialize_type(layout, key_type)
-	key_name ?= core_trait_impl_type_key(key)
-	hash_fn ?= find_function_name(names, "Hashable_hash_" + key_name)
-	equals_fn ?= find_function_name(names, "Equatable_equals_" + key_name)
+	hash_fn ?= find_runtime_callback(callbacks, HashableHashCallback, key)
+	equals_fn ?= find_runtime_callback(callbacks, EquatableEqualsCallback, key)
 
 	Some(
 		CustomHashContainerConstructor(
@@ -410,7 +404,7 @@ private pure func custom_hash_container_constructor(
 
 private pure func custom_dict_constructor(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	result_type: CoreType,
 ) -> Option[CoreHashContainerConstructor]:
 	dict_types ?= named_type_arguments(layout, result_type, "Dict")
@@ -420,12 +414,12 @@ private pure func custom_dict_constructor(
 	else:
 		None
 
-	custom_hash_container_constructor(layout, names, key_type)
+	custom_hash_container_constructor(layout, callbacks, key_type)
 
 
 private pure func custom_set_constructor(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	result_type: CoreType,
 ) -> Option[CoreHashContainerConstructor]:
 	set_types ?= named_type_arguments(layout, result_type, "Set")
@@ -435,12 +429,12 @@ private pure func custom_set_constructor(
 	else:
 		None
 
-	custom_hash_container_constructor(layout, names, element_type)
+	custom_hash_container_constructor(layout, callbacks, element_type)
 
 
 private pure func hash_container_constructor(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	key_type: CoreType,
 ) -> Option[CoreHashContainerConstructor]:
 	key: CoreType = resolve_specialize_type(layout, key_type)
@@ -454,16 +448,16 @@ private pure func hash_container_constructor(
 			else if generic_hash_container_type_name(name):
 				Some(GenericHashContainerConstructor)
 			else:
-				custom_hash_container_constructor(layout, names, key)
+				custom_hash_container_constructor(layout, callbacks, key)
 		EnumType(_):
 			Some(GenericHashContainerConstructor)
 		_:
-			custom_hash_container_constructor(layout, names, key)
+			custom_hash_container_constructor(layout, callbacks, key)
 
 
 private pure func set_constructor(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	result_type: CoreType,
 ) -> Option[CoreHashContainerConstructor]:
 	set_types ?= named_type_arguments(layout, result_type, "Set")
@@ -473,21 +467,21 @@ private pure func set_constructor(
 	else:
 		None
 
-	hash_container_constructor(layout, names, element_type)
+	hash_container_constructor(layout, callbacks, element_type)
 
 
 private pure func custom_dict_call_kind(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	result_type: CoreType,
 ) -> Option[CoreCallKind]:
-	constructor ?= custom_dict_constructor(layout, names, result_type)
+	constructor ?= custom_dict_constructor(layout, callbacks, result_type)
 	Some(DictWithCapacityCall(constructor))
 
 
 private pure func project_empty_custom_dict(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Option[CoreExpr]:
@@ -498,7 +492,7 @@ private pure func project_empty_custom_dict(
 	else:
 		None
 
-	constructor ?= custom_dict_constructor(layout, names, result_type)
+	constructor ?= custom_dict_constructor(layout, callbacks, result_type)
 
 	Some(
 		DictConstructExpr(
@@ -518,27 +512,27 @@ private pure func project_empty_custom_dict(
 
 private pure func project_empty_custom_set(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Option[CoreExpr]:
-	constructor ?= custom_set_constructor(layout, names, result_type)
+	constructor ?= custom_set_constructor(layout, callbacks, result_type)
 	Some(SetAllocExpr(constructor, result_type, loc))
 
 
 private pure func project_empty_set(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	result_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> Option[CoreExpr]:
-	constructor ?= set_constructor(layout, names, result_type)
+	constructor ?= set_constructor(layout, callbacks, result_type)
 	Some(SetAllocExpr(constructor, result_type, loc))
 
 
 private pure func project_call_kind(
 	layout: CoreSpecializeLayout,
-	names: List[String],
+	callbacks: CoreRuntimeCallbackTable,
 	name: String,
 	args: List[CoreExpr],
 	result_type: CoreType,
@@ -578,9 +572,9 @@ private pure func project_call_kind(
 	else if fallible_stream_terminal_builtin(name):
 		fallible_stream_terminal_call_kind(layout, name, result_type).get_or(BuiltinCall(name))
 	else if name == "blorp_list_to_string_cb":
-		list_callback_call_kind(layout, names, args).get_or(BuiltinCall(name))
+		list_callback_call_kind(layout, callbacks, args).get_or(BuiltinCall(name))
 	else if name == "blorp_dict_with_capacity_custom":
-		custom_dict_call_kind(layout, names, result_type).get_or(BuiltinCall(name))
+		custom_dict_call_kind(layout, callbacks, result_type).get_or(BuiltinCall(name))
 	else if tensor_parallel_builtin(name):
 		TensorParallelCall(
 			name,
@@ -1099,14 +1093,14 @@ pure func project_current_expr(
 					else if name == "blorp_dict_new_custom" and args.is_empty():
 						project_empty_custom_dict(
 							context.layout,
-							context.function_names,
+							context.callbacks,
 							result_type,
 							loc,
 						).get_or(children_projected)
 					else if name == "blorp_set_new_custom" and args.is_empty():
 						project_empty_custom_set(
 							context.layout,
-							context.function_names,
+							context.callbacks,
 							result_type,
 							loc,
 						).get_or(children_projected)
@@ -1114,7 +1108,7 @@ pure func project_current_expr(
 						CallExpr(
 							project_call_kind(
 								context.layout,
-								context.function_names,
+								context.callbacks,
 								name,
 								projected_args,
 								result_type,
@@ -1128,7 +1122,7 @@ pure func project_current_expr(
 			if entries.is_empty():
 				project_empty_set(
 					context.layout,
-					context.function_names,
+					context.callbacks,
 					typ,
 					loc,
 				).get_or(children_projected)
@@ -1264,17 +1258,10 @@ resolve's or match's own node rewrites) and reuse it across the whole walk,
 the same context `project_backend_calls` builds for its own standalone run.
 ---
 pure func build_backend_projection_context(program: CoreProgram) -> BackendProjectionContext:
-	names: List[String] = program.decls.filter_map(func(decl):
-		match decl:
-			FunctionDecl(function_info):
-				Some(function_info.name)
-			_:
-				None
-	)
-	{
+		{
 		layout = build_specialize_layout(program),
 		constructors = build_nullary_constructor_index(program),
-		function_names = names
+		callbacks = build_runtime_callback_table(program)
 	}
 
 

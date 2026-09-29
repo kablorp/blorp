@@ -219,6 +219,7 @@ import:
 		),
 		CoreLogicalOp,
 		CoreProgram,
+		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreRawMatchCase,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
@@ -301,6 +302,10 @@ import:
 		core_field_refs_equal,
 		core_var_equal,
 	mono: core_mono_type_equal
+	runtime_callbacks:
+		CoreRuntimeCallbackTable,
+		build_runtime_callback_table,
+		find_runtime_callback,
 	specialize_layout:
 		CoreSpecializeLayout,
 		boxed_storage_slot_needs_release,
@@ -449,7 +454,10 @@ private record PrepareDecls {
 	-- Present only for the later construction-preparation pass. The earlier
 	-- dictionary-ownership traversal has its own mapper and never calls
 	-- prepare_union_construct, so it intentionally has no layout index.
-	specialize_layout: Option[CoreSpecializeLayout]
+	specialize_layout: Option[CoreSpecializeLayout],
+	-- Built with the union index: the functions a custom-key Dict literal
+	-- calls back for `Hashable.hash` and `Equatable.equals`.
+	callbacks: CoreRuntimeCallbackTable
 }
 
 
@@ -461,6 +469,7 @@ distinct because only union declarations enter this dictionary.
 private pure func prepare_decls(
 	decls: List[CoreDecl],
 	specialize_layout: Option[CoreSpecializeLayout],
+	callbacks: CoreRuntimeCallbackTable,
 ) -> PrepareDecls:
 	var unions_by_name: Dict[String, CoreUnionDecl] = {}
 
@@ -477,7 +486,8 @@ private pure func prepare_decls(
 	{
 		decls = decls,
 		unions_by_name = unions_by_name,
-		specialize_layout = specialize_layout
+		specialize_layout = specialize_layout,
+		callbacks = callbacks
 	}
 
 
@@ -3173,6 +3183,12 @@ private pure func has_enum_decl(decls: PrepareDecls, name: String) -> Bool:
 	result
 
 
+---
+The container constructor for a Dict literal keyed by `key_type`. A key type
+with its own `Hashable.hash` and `Equatable.equals` uses those functions,
+found through the callback table; a key without one (or one the table does
+not know) hashes generically.
+---
 private pure func hash_container_constructor_for_key_type(
 	decls: PrepareDecls,
 	key_type: CoreType,
@@ -3189,19 +3205,30 @@ private pure func hash_container_constructor_for_key_type(
 			else if has_enum_decl(decls, name) or generic_hash_container_type_name(name):
 				GenericHashContainerConstructor
 			else:
-				CustomHashContainerConstructor(
-					"Hashable_hash_" + name,
-					"Equatable_equals_" + name,
+				custom_hash_container_constructor_or_generic(
+					decls,
+					key_type,
 					pointer_box_storage_needs_release_type(key_type),
 				)
 		EnumType(name):
 			GenericHashContainerConstructor
 		ValueRecordType(name):
-			CustomHashContainerConstructor(
-				"Hashable_hash_" + name,
-				"Equatable_equals_" + name,
-				False,
-			)
+			custom_hash_container_constructor_or_generic(decls, key_type, False)
+		_:
+			GenericHashContainerConstructor
+
+
+private pure func custom_hash_container_constructor_or_generic(
+	decls: PrepareDecls,
+	key_type: CoreType,
+	needs_release: Bool,
+) -> CoreHashContainerConstructor:
+	match (
+		find_runtime_callback(decls.callbacks, HashableHashCallback, key_type),
+		find_runtime_callback(decls.callbacks, EquatableEqualsCallback, key_type),
+	):
+		(Some(hash_fn), Some(equals_fn)):
+			CustomHashContainerConstructor(hash_fn, equals_fn, needs_release)
 		_:
 			GenericHashContainerConstructor
 
@@ -5551,7 +5578,7 @@ private pure func prepare_dict_literals_for_ownership_decl(
 
 
 pure func prepare_dict_literals_for_ownership(program: CoreProgram) -> CoreProgram:
-	indexed: PrepareDecls = prepare_decls(program.decls, None)
+	indexed: PrepareDecls = prepare_decls(program.decls, None, build_runtime_callback_table(program))
 
 	{ program |
 		decls = program.decls.map(
@@ -5616,7 +5643,7 @@ private pure func prepare_decl(decls: PrepareDecls, decl: CoreDecl) -> CoreDecl:
 
 pure func prepare_program(program: CoreProgram) -> CoreProgram:
 	layout: CoreSpecializeLayout = build_specialize_layout(program)
-	indexed: PrepareDecls = prepare_decls(program.decls, Some(layout))
+	indexed: PrepareDecls = prepare_decls(program.decls, Some(layout), build_runtime_callback_table(program))
 	var decls: List[CoreDecl] = []
 
 	for decl in program.decls:

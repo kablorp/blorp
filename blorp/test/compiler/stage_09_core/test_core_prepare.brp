@@ -1,11 +1,16 @@
 import:
+	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(AddOp),
 		CoreBoxKind(PointerBox, PrimBox, StructBox),
 		CoreBoxedStorageValue,
 		CoreCallKind(BuiltinCall, IntrinsicCall, UserCall),
+		CoreDeclaredOrigin(ProjectedImplMethod),
 		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
+		CoreFunctionOrigin(Declared),
+		CoreImplMethodRole(RuntimeCallbackMethod),
+		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreExpr(
 			BinaryExpr,
 			BoxExpr,
@@ -34,7 +39,7 @@ import:
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreGlobal,
-		CoreHashContainerConstructor(StringHashContainerConstructor),
+		CoreHashContainerConstructor(CustomHashContainerConstructor, GenericHashContainerConstructor, StringHashContainerConstructor),
 		CoreHeapRecordDecl,
 		CoreListStorageLayout(InlineStructListStorage, PointerListStorage),
 		CoreLiteral(FloatLiteral, IntLiteral, StringLiteral),
@@ -2158,6 +2163,86 @@ pure func test_prepare_converts_union_constructor_call() -> Bool:
 	programs_equal(actual, expected)
 
 
+pure func point_keyed_dict_literal() -> CoreExpr:
+	dict_type: CoreType = NamedType("Dict", [point_type(), int_type()])
+
+	DictExpr(
+		[
+			{
+				key = VarExpr(
+					{
+						name = "point",
+						id = 0,
+						def_id = None,
+						origin = AuthoredBinder
+					},
+					point_type(),
+					synthetic_core_source_loc(),
+				),
+				value = int_literal(1)
+			},
+		],
+		dict_type,
+		synthetic_core_source_loc(),
+	)
+
+
+pure func point_callback_function(name: String, def_id: Int, role: CoreRuntimeCallbackRole) -> CoreDecl:
+	FunctionDecl({ identity_function(int_literal(0), int_type()) |
+		name = name,
+		def_id = def_id,
+		origin = Declared(
+			ProjectedImplMethod(
+				synthesized_name_id("_"),
+				synthesized_name_id("_"),
+				point_type(),
+				RuntimeCallbackMethod(role),
+			),
+		)
+	})
+
+
+pure func dict_literal_constructor_after_prepass(extra_decls: List[CoreDecl]) -> Option[CoreHashContainerConstructor]:
+	dict_type: CoreType = NamedType("Dict", [point_type(), int_type()])
+	program: CoreProgram = {
+		decls = [FunctionDecl(identity_function(point_keyed_dict_literal(), dict_type))].concat(extra_decls),
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_dict_literals_for_ownership(program).decls:
+		[FunctionDecl(function), ..._]:
+			match function.body:
+				Some(DictConstructExpr(construct, _, _)):
+					Some(construct.constructor)
+				_:
+					None
+		_:
+			None
+
+
+pure func test_dict_literal_uses_the_key_types_callbacks_found_by_origin() -> Bool:
+	-- Named for neither trait: only the origins say these are Point's hash and equals.
+	constructor = dict_literal_constructor_after_prepass([
+		point_callback_function("point_hasher", 2, HashableHashCallback),
+		point_callback_function("point_equality", 3, EquatableEqualsCallback),
+	])
+
+	match constructor:
+		Some(CustomHashContainerConstructor(hash_fn, equals_fn, _)):
+			hash_fn == "point_hasher" and equals_fn == "point_equality"
+		_:
+			False
+
+
+pure func test_dict_literal_without_key_callbacks_hashes_generically() -> Bool:
+	match dict_literal_constructor_after_prepass([]):
+		Some(GenericHashContainerConstructor):
+			True
+		_:
+			False
+
+
 pure func test_dict_ownership_prepass_preserves_union_constructor_call() -> Bool:
 	program: CoreProgram = program_with_choice_body(choice_constructor_call())
 
@@ -2957,6 +3042,14 @@ tests: TestSuite = {
 		),
 		("prepare recurses into call arguments", test_prepare_recurses_into_call_arguments),
 		("prepare converts union constructor call", test_prepare_converts_union_constructor_call),
+		(
+			"dict literal uses the key type's callbacks found by origin",
+			test_dict_literal_uses_the_key_types_callbacks_found_by_origin,
+		),
+		(
+			"dict literal without key callbacks hashes generically",
+			test_dict_literal_without_key_callbacks_hashes_generically,
+		),
 		(
 			"dictionary ownership prepass preserves union constructor calls",
 			test_dict_ownership_prepass_preserves_union_constructor_call,

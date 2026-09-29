@@ -1,4 +1,5 @@
 import:
+	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
 	../../../src/compiler/stage_09_core/backend_projection: project_backend_calls
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
@@ -12,12 +13,16 @@ import:
 			ListToStringCall,
 			OperationResultCall,
 		),
+		CoreDeclaredOrigin(ProjectedImplMethod),
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl),
 		CoreDirectRuntimeArgs(
 			DirectRuntimeArgsAppendListParallelLayout,
 			DirectRuntimeArgsAsWritten,
 		),
 		CoreDirectRuntimeResult(DirectRuntimeResultAsWritten),
+		CoreFunctionOrigin(Declared),
+		CoreImplMethodRole(RuntimeCallbackMethod),
+		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback, StringableToStringCallback),
 		CoreExpr(
 			BoxExpr,
 			CallExpr,
@@ -131,6 +136,34 @@ pure func function_decl(name: String, def_id: Int, body: Option[CoreExpr]) -> Co
 		def_id = def_id,
 		loc = synthetic_core_source_loc(),
 	})
+
+
+---
+A top-level function the way runtime projection leaves an impl method: named
+by the (still produced) `Trait_method_TypeKey` spelling, and recording in its
+origin which trait method on which type it implements and the role the backend
+calls it back under.
+---
+pure func callback_decl(
+	name: String,
+	def_id: Int,
+	for_type: CoreType,
+	role: CoreRuntimeCallbackRole,
+) -> CoreDecl:
+	match function_decl(name, def_id, None):
+		FunctionDecl(function):
+			FunctionDecl({ function |
+				origin = Declared(
+					ProjectedImplMethod(
+						synthesized_name_id("_"),
+						synthesized_name_id("_"),
+						for_type,
+						RuntimeCallbackMethod(role),
+					),
+				)
+			})
+		other:
+			other
 
 
 pure func union_variant(name: String, tag: Int) -> CoreUnionVariant:
@@ -444,7 +477,12 @@ pure func test_projects_list_string_callback() -> Bool:
 	program: CoreProgram = {
 		decls = [
 			function_decl("main", 1, Some(call)),
-			function_decl("string__Stringable_to_string_String", 2, None),
+			callback_decl(
+				"string__Stringable_to_string_String",
+				2,
+				named_type("String"),
+				StringableToStringCallback,
+			),
 		],
 		foreign_includes = [],
 		source_files = []
@@ -471,8 +509,8 @@ pure func test_projects_custom_dict_constructor() -> Bool:
 	program: CoreProgram = {
 		decls = [
 			function_decl("main", 1, Some(call)),
-			function_decl("pkg__Hashable_hash_Key", 2, None),
-			function_decl("pkg__Equatable_equals_Key", 3, None),
+			callback_decl("pkg__Hashable_hash_Key", 2, UnionType("Key"), HashableHashCallback),
+			callback_decl("pkg__Equatable_equals_Key", 3, UnionType("Key"), EquatableEqualsCallback),
 		],
 		foreign_includes = [],
 		source_files = []
@@ -489,6 +527,54 @@ pure func test_projects_custom_dict_constructor() -> Bool:
 			False
 
 
+pure func test_callback_lookup_reads_origin_not_spelling() -> Bool:
+	-- The functions are spelled nothing like `Hashable_hash_Key`; only their
+	-- origins say they are Key's hash and equals.
+	key_type: CoreType = UnionType("Key")
+	dict_type: CoreType = NamedType("Dict", [key_type, named_type("Int")])
+	call: CoreExpr = builtin_call("blorp_dict_new_custom", [], dict_type)
+	program: CoreProgram = {
+		decls = [
+			function_decl("main", 1, Some(call)),
+			callback_decl("key_hasher", 2, key_type, HashableHashCallback),
+			callback_decl("key_equality", 3, key_type, EquatableEqualsCallback),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match projected_body(program):
+		Some(DictConstructExpr(construct, _, _)):
+			match construct.constructor:
+				CustomHashContainerConstructor(hash_fn, equals_fn, _):
+					hash_fn == "key_hasher" and equals_fn == "key_equality"
+				_:
+					False
+		_:
+			False
+
+
+pure func test_functions_spelled_like_callbacks_without_the_origin_are_not_callbacks() -> Bool:
+	key_type: CoreType = UnionType("Key")
+	dict_type: CoreType = NamedType("Dict", [key_type, named_type("Int")])
+	call: CoreExpr = builtin_call("blorp_dict_new_custom", [], dict_type)
+	program: CoreProgram = {
+		decls = [
+			function_decl("main", 1, Some(call)),
+			function_decl("pkg__Hashable_hash_Key", 2, None),
+			function_decl("pkg__Equatable_equals_Key", 3, None),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(BuiltinCall(_), _, _, _, _)):
+			True
+		_:
+			False
+
+
 pure func test_projects_empty_custom_dict_constructor() -> Bool:
 	key_type: CoreType = UnionType("Key")
 	dict_type: CoreType = NamedType(
@@ -499,8 +585,8 @@ pure func test_projects_empty_custom_dict_constructor() -> Bool:
 	program: CoreProgram = {
 		decls = [
 			function_decl("main", 1, Some(call)),
-			function_decl("pkg__Hashable_hash_Key", 2, None),
-			function_decl("pkg__Equatable_equals_Key", 3, None),
+			callback_decl("pkg__Hashable_hash_Key", 2, UnionType("Key"), HashableHashCallback),
+			callback_decl("pkg__Equatable_equals_Key", 3, UnionType("Key"), EquatableEqualsCallback),
 		],
 		foreign_includes = [],
 		source_files = []
@@ -530,8 +616,8 @@ pure func test_projects_empty_custom_set_constructor() -> Bool:
 	program: CoreProgram = {
 		decls = [
 			function_decl("main", 1, Some(call)),
-			function_decl("pkg__Hashable_hash_Key", 2, None),
-			function_decl("pkg__Equatable_equals_Key", 3, None),
+			callback_decl("pkg__Hashable_hash_Key", 2, UnionType("Key"), HashableHashCallback),
+			callback_decl("pkg__Equatable_equals_Key", 3, UnionType("Key"), EquatableEqualsCallback),
 		],
 		foreign_includes = [],
 		source_files = []
@@ -1836,6 +1922,11 @@ tests: TestSuite = {
 		("preserves semantic and unknown calls", test_preserves_semantic_and_unknown_calls),
 		("projects list string callback", test_projects_list_string_callback),
 		("projects custom dict constructor", test_projects_custom_dict_constructor),
+		("callback lookup reads origin not spelling", test_callback_lookup_reads_origin_not_spelling),
+		(
+			"functions spelled like callbacks without the origin are not callbacks",
+			test_functions_spelled_like_callbacks_without_the_origin_are_not_callbacks,
+		),
 		("projects empty custom dict constructor", test_projects_empty_custom_dict_constructor),
 		("projects empty custom set constructor", test_projects_empty_custom_set_constructor),
 		("projects singleton constructor value", test_projects_singleton_constructor_value),

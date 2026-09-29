@@ -45,6 +45,11 @@ private NATIVE_PACKAGE_MODULE_ORIGIN_TAG: String = "native_package"
 private SOURCE_PACKAGE_MODULE_ORIGIN_TAG: String = "source_package"
 
 private IMPL_METHOD_ORIGIN_TAG: String = "impl_method"
+private PROJECTED_IMPL_METHOD_ORIGIN_TAG: String = "projected_impl_method"
+private STRINGABLE_TO_STRING_ROLE_TAG: String = "stringable_to_string"
+private HASHABLE_HASH_ROLE_TAG: String = "hashable_hash"
+private EQUATABLE_EQUALS_ROLE_TAG: String = "equatable_equals"
+private ORDINARY_ROLE_TAG: String = "ordinary"
 
 private PURE_VARIANT_ORIGIN_TAG: String = "pure_variant"
 
@@ -2950,6 +2955,29 @@ enum CoreEntrypointKind:
 
 
 ---
+Whether the backend calls an impl method back by role, and which role. The
+closed vocabulary is the three traits whose methods the runtime containers and
+list printing invoke by function: `Stringable.to_string` (list printing),
+`Hashable.hash` and `Equatable.equals` (custom-key Dict and Set). Decided once
+where the impl method is lowered, so no later reader compares trait or method
+spellings.
+---
+enum CoreRuntimeCallbackRole:
+	StringableToStringCallback
+	HashableHashCallback
+	EquatableEqualsCallback
+
+
+---
+`RuntimeCallbackMethod(role)` for a method the backend calls back by role,
+`OrdinaryImplMethod` for every other impl method.
+---
+union CoreImplMethodRole:
+	RuntimeCallbackMethod(CoreRuntimeCallbackRole)
+	OrdinaryImplMethod
+
+
+---
 How a Core function was declared, recorded where the function is created instead
 of encoded in its mangled name. Payloads are ids and types only, never
 spellings; a `def_id` is the `CoreFunction.def_id` of the function named.
@@ -2958,6 +2986,15 @@ This is the structured form of the markers `CoreFunction.name` still carries
 (docs/NAME_MANGLING_REMOVAL_ROADMAP.md): once every reader asks `origin`,
 the marked spellings become display text. Until then the pass-runner
 `origin_name_agreement` check keeps the two in step.
+
+Hazard for any payload that holds a `CoreType`: flatten renames the types
+inside declarations (`ImplDecl.for_type`, records, unions) but never touches
+an origin's payload, so a type stored in an origin goes stale unless it is
+written after flatten or is an id. `ProjectedImplMethod` is written by runtime
+projection for that reason, and `MonoInstance` arguments are written by mono,
+which runs after flatten; nothing reads them after that except the JSON and
+`--dump-core` renderers. A new type-bearing payload must be written after
+flatten, or carry ids.
 
 `UfcsWrapper` (`__ufcs_...`, family F3) and a static-callback case
 (`__sc_...`, F5) are deliberately absent: no `CoreFunction` is ever created
@@ -2973,13 +3010,27 @@ union CoreDeclaredOrigin:
 	-- (Comments in this union avoid naming the function record: the borrowed-boundary
 	-- inventory counts any mention as expression-bearing; tooling bug filed 2026-09-29.)
 	SourceFunction(NameId)
-	-- ImplMethod(trait, method): a method of `impl trait for ...`, both the
-	-- spellings written in source. The function's own `def_id` identifies the
-	-- method. Replaces the `<Trait>_<method>_<TypeKey>` spelling (F4).
-	-- INTERIM: still missing the impl definition id, the trait definition id
-	-- (typed impls do not carry them yet) and the receiver type key; M2.3
-	-- adds them when it moves the F4 readers.
-	ImplMethod(NameId, NameId)
+	-- ImplMethod(trait, method, role): a method of `impl trait for ...`,
+	-- `trait` and `method` being the spellings written in source and `role`
+	-- whether the backend calls this method back by role. The function's own
+	-- `def_id` identifies the method; the impl's target type is the enclosing
+	-- impl's `for_type`. Replaces the `<Trait>_<method>_<TypeKey>` spelling
+	-- (F4) as the way to ask "the method of trait T".
+	-- INTERIM: the impl definition id and the trait definition id are still
+	-- missing (typed impls do not carry them yet); the role stands in for the
+	-- trait identity for the three traits the runtime calls back. Once typed
+	-- impls carry trait ids the payload becomes `(trait DefinitionId, method
+	-- NameId)`, and `CoreImplMethodRole`, `CoreRuntimeCallbackRole` and
+	-- `impl_method_role` in `lower.brp` are deleted with the pinned
+	-- `NAME_ID_*` callback constants.
+	ImplMethod(NameId, NameId, CoreImplMethodRole)
+	-- ProjectedImplMethod(trait, method, for_type, role): the same method once
+	-- runtime projection has turned its impl into top-level functions. The
+	-- impl (and with it `for_type`) is gone, so the target type, as the impl
+	-- spelled it at that moment, moves onto the function. Written only by
+	-- runtime projection, which is what keeps the type in step with the
+	-- passes that rename or specialize types inside impls.
+	ProjectedImplMethod(NameId, NameId, CoreType, CoreImplMethodRole)
 	-- PureVariant(base_def): the pure overload of the function whose `def_id`
 	-- is `base_def` (the impure or builtin sibling that shares its source
 	-- name). Replaces the `__pure` suffix (F1).
@@ -15166,6 +15217,34 @@ pure func decode_core_module_origin_json(
 		Err(CoreUnsupportedTag(path, tag))
 
 
+private pure func core_impl_method_role_to_json(role: CoreImplMethodRole) -> JsonValue:
+	match role:
+		RuntimeCallbackMethod(StringableToStringCallback):
+			JsonString(STRINGABLE_TO_STRING_ROLE_TAG)
+		RuntimeCallbackMethod(HashableHashCallback):
+			JsonString(HASHABLE_HASH_ROLE_TAG)
+		RuntimeCallbackMethod(EquatableEqualsCallback):
+			JsonString(EQUATABLE_EQUALS_ROLE_TAG)
+		OrdinaryImplMethod:
+			JsonString(ORDINARY_ROLE_TAG)
+
+
+private pure func parse_core_impl_method_role(
+	name: String,
+	path: String,
+) -> Result[CoreImplMethodRole, CoreJsonError]:
+	if name == STRINGABLE_TO_STRING_ROLE_TAG:
+		Ok(RuntimeCallbackMethod(StringableToStringCallback))
+	else if name == HASHABLE_HASH_ROLE_TAG:
+		Ok(RuntimeCallbackMethod(HashableHashCallback))
+	else if name == EQUATABLE_EQUALS_ROLE_TAG:
+		Ok(RuntimeCallbackMethod(EquatableEqualsCallback))
+	else if name == ORDINARY_ROLE_TAG:
+		Ok(OrdinaryImplMethod)
+	else:
+		Err(CoreUnsupportedTag(path, name))
+
+
 ---
 The JSON object for how a function was declared; `kind` names the case.
 ---
@@ -15176,11 +15255,20 @@ pure func core_declared_origin_to_json(origin: CoreDeclaredOrigin) -> JsonValue:
 				(KIND_FIELD, JsonString(SOURCE_FUNCTION_ORIGIN_TAG)),
 				("name", json_int(name_id_index(name))),
 			])
-		ImplMethod(trait_name, method):
+		ImplMethod(trait_name, method, role):
 			JsonObject([
 				(KIND_FIELD, JsonString(IMPL_METHOD_ORIGIN_TAG)),
 				("trait", json_int(name_id_index(trait_name))),
 				("method", json_int(name_id_index(method))),
+				("role", core_impl_method_role_to_json(role)),
+			])
+		ProjectedImplMethod(trait_name, method, for_type, role):
+			JsonObject([
+				(KIND_FIELD, JsonString(PROJECTED_IMPL_METHOD_ORIGIN_TAG)),
+				("trait", json_int(name_id_index(trait_name))),
+				("method", json_int(name_id_index(method))),
+				("for_type", core_type_to_json(for_type)),
+				("role", core_impl_method_role_to_json(role)),
 			])
 		PureVariant(base_def):
 			JsonObject([
@@ -15335,7 +15423,17 @@ pure func decode_core_declared_origin_json(
 	else if tag == IMPL_METHOD_ORIGIN_TAG:
 		trait_name ?= decode_name_id_field(value, path, "trait")
 		method ?= decode_name_id_field(value, path, "method")
-		Ok(ImplMethod(trait_name, method))
+		role_name ?= string_field(value, path, "role")
+		role ?= parse_core_impl_method_role(role_name, path_field(path, "role"))
+		Ok(ImplMethod(trait_name, method, role))
+	else if tag == PROJECTED_IMPL_METHOD_ORIGIN_TAG:
+		trait_name ?= decode_name_id_field(value, path, "trait")
+		method ?= decode_name_id_field(value, path, "method")
+		for_type_json ?= object_field(value, path, "for_type")
+		for_type ?= decode_core_type_json(for_type_json, path_field(path, "for_type"))
+		role_name ?= string_field(value, path, "role")
+		role ?= parse_core_impl_method_role(role_name, path_field(path, "role"))
+		Ok(ProjectedImplMethod(trait_name, method, for_type, role))
 	else if tag == PURE_VARIANT_ORIGIN_TAG:
 		base_def ?= int_field(value, path, "base_def")
 		Ok(PureVariant(base_def))

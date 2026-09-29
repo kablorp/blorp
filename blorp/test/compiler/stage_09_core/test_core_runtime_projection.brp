@@ -1,8 +1,10 @@
 import:
 	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest:
 		DeclaredAbiType(DeclaredAbiOption, DeclaredAbiResult),
+	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
+		CoreDeclaredOrigin(ImplMethod, ProjectedImplMethod),
 		CoreDecl(
 			FunctionDecl,
 			GlobalDecl,
@@ -16,8 +18,11 @@ import:
 		CoreExpr(RecordExpr, VarExpr, VoidExpr),
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
+		CoreFunctionOrigin(Declared),
+		CoreImplMethodRole(RuntimeCallbackMethod),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreRuntimeCallbackRole(HashableHashCallback),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(
@@ -251,6 +256,60 @@ pure func test_projects_only_runtime_declarations() -> Bool:
 				]
 				and projected.foreign_includes == ["runtime.h"]
 			)
+		Err(_):
+			False
+
+
+pure func hashable_program() -> CoreProgram:
+	hash_method: CoreFunction = { boundary_function("hash", [], True) |
+		origin = Declared(
+			ImplMethod(
+				synthesized_name_id("_"),
+				synthesized_name_id("_"),
+				RuntimeCallbackMethod(HashableHashCallback),
+			),
+		)
+	}
+
+	{
+		decls = [
+			ImplDecl({
+				trait_name = "Hashable",
+				for_type = NamedType("Int", []),
+				type_params = [],
+				methods = [hash_method],
+				loc = synthetic_core_source_loc(),
+			}),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func test_projection_moves_the_impl_target_type_onto_the_method_origin() -> Bool:
+	match project_runtime_program(hashable_program()):
+		Ok(projected):
+			match projected.decls:
+				[FunctionDecl(function)]:
+					match function.origin:
+						Declared(ProjectedImplMethod(_, _, for_type, RuntimeCallbackMethod(HashableHashCallback))):
+							function.name == "Hashable_hash_Int" and for_type == NamedType("Int", [])
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_projecting_an_already_projected_program_keeps_its_names() -> Bool:
+	match project_runtime_program(hashable_program()):
+		Ok(once):
+			match project_runtime_program(once):
+				Ok(twice):
+					twice.decls.map(boundary_decl_name) == once.decls.map(boundary_decl_name)
+				Err(_):
+					False
 		Err(_):
 			False
 
@@ -601,6 +660,14 @@ tests: TestSuite = {
 	description = "Blorp Core runtime projection",
 	tests = [
 		("projects only runtime declarations", test_projects_only_runtime_declarations),
+		(
+			"projection moves the impl target type onto the method origin",
+			test_projection_moves_the_impl_target_type_onto_the_method_origin,
+		),
+		(
+			"projecting an already projected program keeps its names",
+			test_projecting_an_already_projected_program_keeps_its_names,
+		),
 		("rejects malformed runtime ABI templates", test_rejects_malformed_runtime_abi_templates),
 		(
 			"runtime ABI payloads use dynamic release masks",
