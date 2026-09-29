@@ -6,6 +6,7 @@ import:
 	../../../src/compiler/stage_04_modules/module_table: ModuleTable, singleton_module_table
 	../../../src/compiler/stage_09_core/function_origin_fixture: fixture_source_module
 	../../../src/compiler/stage_09_core/ir:
+		CoreCopyDeclarationNames,
 		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunction,
@@ -25,6 +26,9 @@ import:
 		origin_name_agreement_summary,
 	test: TestSuite
 
+
+-- What `CorePassState.copy_declaration_names` holds before mono records it.
+NO_RECORDED_COPY_NAMES: CoreCopyDeclarationNames = {}
 
 SOURCE_ORIGIN: CoreDeclaredOrigin = SourceFunction(synthesized_name_id("_"))
 
@@ -81,7 +85,7 @@ pure func program_of(decls: List[CoreDecl]) -> CoreProgram:
 
 
 pure func agreement_for(functions: List[CoreFunction]) -> OriginNameAgreement:
-	origin_name_agreement(fn_program(functions), CheckWithoutModuleTable)
+	origin_name_agreement(NO_RECORDED_COPY_NAMES, fn_program(functions), CheckWithoutModuleTable)
 
 
 pure func string_contains_all(text: String, needles: List[String]) -> Bool:
@@ -200,17 +204,17 @@ pure func impl_program(method_origin: CoreFunctionOrigin) -> CoreProgram:
 
 
 pure func test_impl_methods_must_carry_an_impl_method_origin() -> Bool:
-	good = origin_name_agreement(
+	good = origin_name_agreement(NO_RECORDED_COPY_NAMES, 
 		impl_program(Declared(ImplMethod(synthesized_name_id("_"), synthesized_name_id("_")))),
 		CheckWithoutModuleTable,
 	)
-	wrapped = origin_name_agreement(
+	wrapped = origin_name_agreement(NO_RECORDED_COPY_NAMES, 
 		impl_program(
 			Synthesized(TensorSynthesis, ImplMethod(synthesized_name_id("_"), synthesized_name_id("_"))),
 		),
 		CheckWithoutModuleTable,
 	)
-	bad = origin_name_agreement(impl_program(Declared(SOURCE_ORIGIN)), CheckWithoutModuleTable)
+	bad = origin_name_agreement(NO_RECORDED_COPY_NAMES, impl_program(Declared(SOURCE_ORIGIN)), CheckWithoutModuleTable)
 
 	good.violations.is_empty() and wrapped.violations.is_empty() and bad.violations.length() == 1
 
@@ -231,8 +235,8 @@ pure func test_trait_named_functions_are_projected_impl_methods() -> Bool:
 	)
 	misattributed: CoreDecl = FunctionDecl(function_with("Display_show_Bool", SOURCE_ORIGIN))
 
-	projected_agreement = origin_name_agreement(program_of([trait_decl, projected]), CheckWithoutModuleTable)
-	misattributed_agreement = origin_name_agreement(program_of([trait_decl, misattributed]), CheckWithoutModuleTable)
+	projected_agreement = origin_name_agreement(NO_RECORDED_COPY_NAMES, program_of([trait_decl, projected]), CheckWithoutModuleTable)
+	misattributed_agreement = origin_name_agreement(NO_RECORDED_COPY_NAMES, program_of([trait_decl, misattributed]), CheckWithoutModuleTable)
 
 	projected_agreement.violations.is_empty() and misattributed_agreement.violations.length() == 1
 
@@ -273,14 +277,14 @@ pure func test_module_table_accepts_a_function_whose_path_and_origin_match() -> 
 	table: ModuleTable = module_table_of("list", StdlibModule)
 	matching: CoreFunction = list_function_in("list", fixture_source_module("list", StdlibModule))
 
-	origin_name_agreement(fn_program([matching]), CheckAgainstModuleTable(table)).violations.is_empty()
+	origin_name_agreement(NO_RECORDED_COPY_NAMES, fn_program([matching]), CheckAgainstModuleTable(table)).violations.is_empty()
 
 
 pure func test_module_table_reports_a_path_the_module_id_does_not_name() -> Bool:
 	table: ModuleTable = module_table_of("list", StdlibModule)
 	wrong_path: CoreFunction = list_function_in("elsewhere", fixture_source_module("list", StdlibModule))
 
-	match origin_name_agreement(fn_program([wrong_path]), CheckAgainstModuleTable(table)).violations:
+	match origin_name_agreement(NO_RECORDED_COPY_NAMES, fn_program([wrong_path]), CheckAgainstModuleTable(table)).violations:
 		[message]:
 			message.contains("another path in the table")
 		_:
@@ -291,7 +295,7 @@ pure func test_module_table_reports_an_origin_the_table_does_not_give() -> Bool:
 	table: ModuleTable = module_table_of("list", StdlibModule)
 	wrong_origin: CoreFunction = list_function_in("list", fixture_source_module("list", UserModule))
 
-	match origin_name_agreement(fn_program([wrong_origin]), CheckAgainstModuleTable(table)).violations:
+	match origin_name_agreement(NO_RECORDED_COPY_NAMES, fn_program([wrong_origin]), CheckAgainstModuleTable(table)).violations:
 		[message]:
 			message.contains("origin the table does not give")
 		_:
@@ -305,11 +309,11 @@ pure func test_late_passes_without_a_table_still_apply_the_path_rule_but_skip_ta
 		fixture_source_module("list", StdlibModule),
 	)
 
-	path_rule_fires: Bool = origin_name_agreement(
+	path_rule_fires: Bool = origin_name_agreement(NO_RECORDED_COPY_NAMES, 
 		fn_program([no_module_with_path]),
 		CheckWithoutModuleTable,
 	).violations.length() == 1
-	table_rule_skipped: Bool = origin_name_agreement(
+	table_rule_skipped: Bool = origin_name_agreement(NO_RECORDED_COPY_NAMES, 
 		fn_program([path_the_id_does_not_name]),
 		CheckWithoutModuleTable,
 	).violations.is_empty()
@@ -334,9 +338,36 @@ pure func test_summary_reports_totals_and_counts_per_origin_case() -> Bool:
 	)
 
 
+-- Once mono has recorded the declaration names, a copy the table does not list
+-- would be read by its mangled name everywhere; the invariant says so.
+pure func test_copy_missing_from_recorded_names_is_reported() -> Bool:
+	copy: CoreFunction = function_with("list__map__mono_Int", mono_origin())
+	recorded_other: CoreCopyDeclarationNames = NO_RECORDED_COPY_NAMES.set(copy.def_id + 1, "list__map")
+	recorded_copy: CoreCopyDeclarationNames = NO_RECORDED_COPY_NAMES.set(copy.def_id, "list__map")
+	program: CoreProgram = fn_program([copy])
+
+	missing = origin_name_agreement(recorded_other, program, CheckWithoutModuleTable)
+	listed = origin_name_agreement(recorded_copy, program, CheckWithoutModuleTable)
+	before_mono = origin_name_agreement(NO_RECORDED_COPY_NAMES, program, CheckWithoutModuleTable)
+
+	(
+		missing.violations.length() == 1
+		and string_contains_all(
+			missing.violations.get(0).get_or(""),
+			["list__map__mono_Int", "no entry in the recorded declaration names"],
+		)
+		and listed.violations.is_empty()
+		and before_mono.violations.is_empty()
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler Core origin and name agreement",
 	tests = [
+		(
+			"copy missing from the recorded names is reported",
+			test_copy_missing_from_recorded_names_is_reported,
+		),
 		(
 			"functions whose names and origins agree report nothing",
 			test_functions_whose_names_and_origins_agree_report_nothing,

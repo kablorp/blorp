@@ -1,6 +1,7 @@
 import:
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
+		core_copy_declaration_names,
 		is_unresolved_builtin_function_kind,
 		CoreBinaryOp(
 			AddOp,
@@ -31,7 +32,7 @@ import:
 		CoreUnaryOp(NegateOp),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
-	../../../src/compiler/stage_09_core/synth: synthesize_program
+	../../../src/compiler/stage_09_core/synth: synthesize_program as synthesize_program_with_names
 	../../../src/compiler/stage_09_core/synth_error:
 		CoreSynthError(UnsupportedTensorReductionElement),
 	../../../src/compiler/stage_09_core/synth_scalar_operator: synthesize_scalar_operator_impl_body
@@ -62,6 +63,12 @@ private DICT_INT_TYPE: CoreType = NamedType(
 )
 
 
+-- The pipeline records the names after mono, while every declaration is still in
+-- the program; a fixture's program is that program.
+pure func synthesize_program(program: CoreProgram) -> Result[CoreProgram, CoreSynthError]:
+	synthesize_program_with_names(core_copy_declaration_names(program), program)
+
+
 pure func core_var(name: String) -> CoreVar:
 	{
 		name = name,
@@ -86,7 +93,7 @@ pure func builtin_function(
 	return_type: CoreType,
 ) -> CoreFunction:
 	{
-		name = module_name.replace("/", "_") + "__" + source_name + "__mono_fixture",
+		name = module_name.replace("/", "_") + "__" + source_name,
 		source_module = Some(module_name),
 		type_params = [],
 		params = params,
@@ -346,22 +353,62 @@ pure func test_synthesizing_a_mono_instance_keeps_its_mono_origin() -> Bool:
 		element_type = INT_TYPE,
 		dims = [TensorStaticDim(4)],
 	})
-	declared: CoreFunction = { builtin_function(
+	template: CoreFunction = builtin_function(
 		"vector",
 		"max",
 		[param("values", tensor_type)],
 		INT_TYPE,
-	) | origin = Declared(MonoInstance(5, [])) }
+	)
+	base: CoreFunction = { template | def_id = 5 }
+	instance: CoreFunction = { template |
+		name = template.name + "__mono_fixture",
+		def_id = 6,
+		origin = Declared(MonoInstance(5, []))
+	}
 
-	match synthesize_program(program_with(declared)):
+	match synthesize_program({
+		decls = [FunctionDecl(base), FunctionDecl(instance)],
+		foreign_includes = [],
+		source_files = []
+	}):
 		Ok(program):
 			match program.decls:
-				[FunctionDecl(synthesized)]:
+				[_, FunctionDecl(synthesized)]:
 					match synthesized.origin:
 						Synthesized(TensorSynthesis, MonoInstance(base_def, _)):
-							base_def == 5
+							base_def == 5 and synthesized.name == "vector__max__mono_fixture"
 						_:
 							False
+				_:
+					False
+		Err(_):
+			False
+
+
+-- The instance's body is chosen by the declaration it is an instance of: with
+-- no such declaration in the program there is nothing to read a source name
+-- from, so nothing is synthesized.
+pure func test_mono_instance_without_its_declaration_is_not_synthesized() -> Bool:
+	tensor_type: CoreType = TensorType({
+		element_type = INT_TYPE,
+		dims = [TensorStaticDim(4)],
+	})
+	template: CoreFunction = builtin_function(
+		"vector",
+		"max",
+		[param("values", tensor_type)],
+		INT_TYPE,
+	)
+	orphan: CoreFunction = { template |
+		name = template.name + "__mono_fixture",
+		origin = Declared(MonoInstance(5, []))
+	}
+
+	match synthesize_program(program_with(orphan)):
+		Ok(program):
+			match program.decls:
+				[FunctionDecl(unchanged)]:
+					unchanged.body.is_none()
 				_:
 					False
 		Err(_):
@@ -820,6 +867,10 @@ tests: TestSuite = {
 		(
 			"synthesizing a mono instance keeps its mono origin",
 			test_synthesizing_a_mono_instance_keeps_its_mono_origin,
+		),
+		(
+			"mono instance without its declaration is not synthesized",
+			test_mono_instance_without_its_declaration_is_not_synthesized,
 		),
 		(
 			"unsynthesized builtin keeps its declared origin",

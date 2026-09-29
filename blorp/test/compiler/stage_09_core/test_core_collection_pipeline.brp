@@ -6,7 +6,7 @@ import:
 		CoreCollectionPipelineSink(CollectionFoldSink),
 		CoreCollectionPipelineSource(CollectionListSource),
 		CoreCollectionPipelineStage(CollectionFilterStage, CollectionMapStage),
-		collection_pipeline_base_name,
+		collection_pipeline_call_base_and_args,
 		collection_pipeline_plan,
 		collection_pipeline_stages,
 		fold_collection_pipeline_stages,
@@ -18,12 +18,16 @@ import:
 		),
 		CoreCollectionIneligibleReason(CollectionTypesDiffer, CollectionUnknownLayout),
 		CoreCollectionSourceAccess(CollectionBindUnboxedValue, CollectionBorrowManagedAlias),
+		CoreCollectionPipelineModel,
 		collection_canonical_type,
-		collection_pipeline_model,
+		collection_pipeline_model as collection_pipeline_model_with_names,
 		collection_same_type_source_access_policy,
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(ClosureCall, IntrinsicCall, UserCall),
-		CoreDecl(HeapRecordDecl, TypeAliasDecl),
+		CoreCopyDeclarationNames,
+		CoreDecl(FunctionDecl, HeapRecordDecl, TypeAliasDecl),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
 		CoreExpr(
 			BorrowLetExpr,
 			CallExpr,
@@ -42,11 +46,17 @@ import:
 		CoreProgram,
 		CoreSourceLoc,
 		synthetic_core_source_loc,
-		CoreType(FunctionType, NamedType),
+		CoreType(FunctionType, NamedType, VoidType),
 		CoreTypeAliasDecl,
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
+		core_copy_declaration_names,
 		core_expr_type,
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		fixture_mono_instance_of,
+		fixture_pure_variant_of,
 	../../../src/compiler/stage_09_core/mono: core_mono_type_equal
 	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
 	test: TestSuite
@@ -73,6 +83,106 @@ LIST_INT128: CoreType = NamedType("List", [TY_INT128])
 LIST_OPTION_INT: CoreType = NamedType("List", [NamedType("Option", [TY_INT])])
 
 LIST_WIDGET: CoreType = NamedType("List", [TY_WIDGET])
+
+-- The `list` declarations the fixture calls reach, by declared name, each with
+-- the mono instance the call site names. A call's declared name is read through
+-- the instance's origin, so the instance's own spelling can be anything.
+private LIST_FIXTURE_DECLARATIONS: List[(String, String)] = [
+	("list__filter", "list__filter__mono_Value"),
+	("list__map", "list__map__mono_Value_Value"),
+	("list__filter_map", "list__filter_map__mono_Value_Value"),
+	("list__fold_left", "list__fold_left__mono_Value_Value"),
+	("list__length", "list__length__mono_Value"),
+]
+
+private FIXTURE_DECLARATION_ID_BASE: Int = 100
+
+private FIXTURE_INSTANCE_ID_BASE: Int = 200
+
+-- The pure overload of `list__filter` and its `Int` instance: an instance of a
+-- pure variant reaches the declaration through both origins.
+private FIXTURE_PURE_FILTER_VARIANT_ID: Int = 300
+
+private FIXTURE_PURE_FILTER_INSTANCE_ID: Int = 301
+
+private FIXTURE_PURE_FILTER_INSTANCE_NAME: String = "list__filter__pure__mono_Int"
+
+
+private pure func fixture_list_function(name: String, def_id: Int) -> CoreFunction:
+	{
+		name = name,
+		source_module = Some("list"),
+		module = FIXTURE_NO_SOURCE_MODULE,
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = None,
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = def_id,
+		loc = synthetic_core_source_loc()
+	}
+
+
+private pure func fixture_list_program() -> CoreProgram:
+	var decls: List[CoreDecl] = []
+	var index: Int = 0
+
+	for entry in LIST_FIXTURE_DECLARATIONS:
+		declaration: CoreFunction = fixture_list_function(entry[0], FIXTURE_DECLARATION_ID_BASE + index)
+		instance_id: Int = FIXTURE_INSTANCE_ID_BASE + index
+
+		decls = decls
+			.append(FunctionDecl(declaration))
+			.append(FunctionDecl(fixture_mono_instance_of(declaration, entry[1], instance_id)))
+		index += 1
+
+	filter_declaration: CoreFunction = fixture_list_function("list__filter", FIXTURE_DECLARATION_ID_BASE)
+	pure_filter: CoreFunction = fixture_pure_variant_of(
+		filter_declaration,
+		"list__filter__pure",
+		FIXTURE_PURE_FILTER_VARIANT_ID,
+	)
+
+	{
+		decls = decls
+			.append(FunctionDecl(pure_filter))
+			.append(
+				FunctionDecl(
+					fixture_mono_instance_of(
+						pure_filter,
+						FIXTURE_PURE_FILTER_INSTANCE_NAME,
+						FIXTURE_PURE_FILTER_INSTANCE_ID,
+					),
+				),
+			),
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+-- The fixture program's mono instances and pure variants, by def id.
+pure func collection_pipeline_model(program: CoreProgram) -> CoreCollectionPipelineModel:
+	collection_pipeline_model_with_names(core_copy_declaration_names(program), program)
+
+
+private pure func fixture_copy_names() -> CoreCopyDeclarationNames:
+	core_copy_declaration_names(fixture_list_program())
+
+
+private pure func fixture_callee_def_id(name: String) -> Int:
+	var index: Int = 0
+	var found: Int = 1
+
+	for entry in LIST_FIXTURE_DECLARATIONS:
+		if entry[1] == name:
+			found = FIXTURE_INSTANCE_ID_BASE + index
+
+		index += 1
+
+	found
+
 
 EMPTY_PROGRAM: CoreProgram = {
 	decls = [],
@@ -118,7 +228,7 @@ private pure func impure_callback(
 
 private pure func user_call(name: String, args: List[CoreExpr], return_type: CoreType) -> CoreExpr:
 	CallExpr(
-		UserCall(name, Some(1), []),
+		UserCall(name, Some(fixture_callee_def_id(name)), []),
 		variable(
 			name,
 			FunctionType(
@@ -229,10 +339,10 @@ private pure func count_expr(
 
 private pure func count_list_call(name: String, expr: CoreExpr) -> Int:
 	count_expr(expr, pure func(candidate):
-		match candidate:
-			CallExpr(UserCall(actual, _, _), _, _, _, _):
-				collection_pipeline_base_name(actual) == Some(name)
-			_:
+		match collection_pipeline_call_base_and_args(fixture_copy_names(), candidate):
+			Some(call):
+				call.base == name
+			None:
 				False
 	)
 
@@ -298,15 +408,15 @@ private pure func count_unbox_let_bindings(expr: CoreExpr, element_type: CoreTyp
 
 
 private pure func fuse(expr: CoreExpr) -> CoreExpr:
-	fuse_collection_expr(collection_pipeline_model(EMPTY_PROGRAM), expr)
+	fuse_collection_expr(collection_pipeline_model(fixture_list_program()), expr)
 
 
 pure func test_rejects_bare_list_source() -> Bool:
-	collection_pipeline_plan(variable("xs", LIST_INT)).is_none()
+	collection_pipeline_plan(fixture_copy_names(), variable("xs", LIST_INT)).is_none()
 
 
 pure func test_exposes_nonempty_pipeline_stages() -> Bool:
-	match collection_pipeline_plan(filter_map_fold_expr()):
+	match collection_pipeline_plan(fixture_copy_names(), filter_map_fold_expr()):
 		Some(plan):
 			match (plan.source, collection_pipeline_stages(plan), plan.sink):
 				(CollectionListSource(_, _), [CollectionFilterStage(_, _), CollectionMapStage(_, _, _)], CollectionFoldSink(_, _, _)):
@@ -318,7 +428,7 @@ pure func test_exposes_nonempty_pipeline_stages() -> Bool:
 
 
 pure func test_folds_nonempty_pipeline_stages_in_order() -> Bool:
-	match collection_pipeline_plan(filter_map_fold_expr()):
+	match collection_pipeline_plan(fixture_copy_names(), filter_map_fold_expr()):
 		Some(plan):
 			fold_collection_pipeline_stages(plan, "", pure func(acc, stage):
 				match stage:
@@ -333,8 +443,36 @@ pure func test_folds_nonempty_pipeline_stages_in_order() -> Bool:
 			False
 
 
-pure func test_recognizes_compiler_owned_pure_suffix() -> Bool:
-	collection_pipeline_base_name("list__filter__pure__mono_Int") == Some("filter")
+-- A call to a mono instance of a pure variant is read through both origins to the
+-- declaration, whatever the instance is called.
+pure func test_reads_a_pure_mono_instance_through_its_declaration() -> Bool:
+	call: CoreExpr = CallExpr(
+		UserCall(FIXTURE_PURE_FILTER_INSTANCE_NAME, Some(FIXTURE_PURE_FILTER_INSTANCE_ID), []),
+		variable(FIXTURE_PURE_FILTER_INSTANCE_NAME, FunctionType(True, [LIST_INT, TY_BOOL], LIST_INT)),
+		[variable("xs", LIST_INT), variable("predicate", TY_BOOL)],
+		LIST_INT,
+		synthetic_core_source_loc(),
+	)
+
+	match collection_pipeline_call_base_and_args(fixture_copy_names(), call):
+		Some(recognized):
+			recognized.base == "filter"
+		None:
+			False
+
+
+-- The marker in a name is no longer evidence: a call the origin table does not
+-- list as a copy is read by its own name, which here names no list function.
+pure func test_does_not_read_a_mono_marker_from_a_name() -> Bool:
+	call: CoreExpr = CallExpr(
+		UserCall("list__filter__mono_Int", Some(1), []),
+		variable("list__filter__mono_Int", FunctionType(True, [LIST_INT, TY_BOOL], LIST_INT)),
+		[variable("xs", LIST_INT), variable("predicate", TY_BOOL)],
+		LIST_INT,
+		synthetic_core_source_loc(),
+	)
+
+	collection_pipeline_call_base_and_args(fixture_copy_names(), call).is_none()
 
 
 pure func test_lowers_filter_map_fold_without_intermediate_lists() -> Bool:
@@ -504,10 +642,10 @@ pure func test_filter_map_policy_tracks_borrowed_payload() -> Bool:
 		NamedType("Option", [TY_STRING]),
 	)
 
-	match collection_pipeline_plan(filter_map_call(source, mapper, LIST_STRING)):
+	match collection_pipeline_plan(fixture_copy_names(), filter_map_call(source, mapper, LIST_STRING)):
 		Some(plan):
 			match collection_collect_policy_for_plan(
-				collection_pipeline_model(EMPTY_PROGRAM),
+				collection_pipeline_model(fixture_list_program()),
 				plan,
 			):
 				Some(policy):
@@ -546,7 +684,7 @@ pure func test_managed_filter_map_plan_is_recognized() -> Bool:
 		NamedType("Option", [TY_STRING]),
 	)
 
-	collection_pipeline_plan(filter_map_call(source, mapper, LIST_STRING)).is_some()
+	collection_pipeline_plan(fixture_copy_names(), filter_map_call(source, mapper, LIST_STRING)).is_some()
 
 
 pure func test_managed_filter_map_policy_is_available() -> Bool:
@@ -557,10 +695,10 @@ pure func test_managed_filter_map_policy_is_available() -> Bool:
 		NamedType("Option", [TY_STRING]),
 	)
 
-	match collection_pipeline_plan(filter_map_call(source, mapper, LIST_STRING)):
+	match collection_pipeline_plan(fixture_copy_names(), filter_map_call(source, mapper, LIST_STRING)):
 		Some(plan):
 			collection_collect_policy_for_plan(
-				collection_pipeline_model(EMPTY_PROGRAM),
+				collection_pipeline_model(fixture_list_program()),
 				plan,
 			).is_some()
 		None:
@@ -569,7 +707,7 @@ pure func test_managed_filter_map_policy_is_available() -> Bool:
 
 pure func test_managed_string_source_access_is_borrowed() -> Bool:
 	match collection_same_type_source_access_policy(
-		collection_pipeline_model(EMPTY_PROGRAM),
+		collection_pipeline_model(fixture_list_program()),
 		TY_STRING,
 		[TY_STRING],
 	):
@@ -581,7 +719,7 @@ pure func test_managed_string_source_access_is_borrowed() -> Bool:
 
 pure func test_managed_string_is_not_unknown_layout() -> Bool:
 	match collection_same_type_source_access_policy(
-		collection_pipeline_model(EMPTY_PROGRAM),
+		collection_pipeline_model(fixture_list_program()),
 		TY_STRING,
 		[TY_STRING],
 	):
@@ -631,10 +769,10 @@ pure func test_stack_option_collect_policy_is_available() -> Bool:
 	source: CoreExpr = variable("items", LIST_OPTION_INT)
 	predicate: CoreExpr = callback("predicate", [option_int], TY_BOOL)
 
-	match collection_pipeline_plan(filter_call(source, predicate, LIST_OPTION_INT)):
+	match collection_pipeline_plan(fixture_copy_names(), filter_call(source, predicate, LIST_OPTION_INT)):
 		Some(plan):
 			collection_collect_policy_for_plan(
-				collection_pipeline_model(EMPTY_PROGRAM),
+				collection_pipeline_model(fixture_list_program()),
 				plan,
 			).is_some()
 		None:
@@ -645,7 +783,7 @@ pure func test_stack_option_source_access_is_unboxed() -> Bool:
 	option_int: CoreType = NamedType("Option", [TY_INT])
 
 	match collection_same_type_source_access_policy(
-		collection_pipeline_model(EMPTY_PROGRAM),
+		collection_pipeline_model(fixture_list_program()),
 		option_int,
 		[option_int],
 	):
@@ -659,7 +797,7 @@ pure func test_stack_option_types_compare_equal() -> Bool:
 	option_int: CoreType = NamedType("Option", [TY_INT])
 
 	match collection_same_type_source_access_policy(
-		collection_pipeline_model(EMPTY_PROGRAM),
+		collection_pipeline_model(fixture_list_program()),
 		option_int,
 		[option_int],
 	):
@@ -688,10 +826,10 @@ pure func test_unknown_layout_has_no_collect_policy() -> Bool:
 	source: CoreExpr = variable("items", LIST_WIDGET)
 	predicate: CoreExpr = callback("predicate", [TY_WIDGET], TY_BOOL)
 
-	match collection_pipeline_plan(filter_call(source, predicate, LIST_WIDGET)):
+	match collection_pipeline_plan(fixture_copy_names(), filter_call(source, predicate, LIST_WIDGET)):
 		Some(plan):
 			collection_collect_policy_for_plan(
-				collection_pipeline_model(EMPTY_PROGRAM),
+				collection_pipeline_model(fixture_list_program()),
 				plan,
 			).is_none()
 		None:
@@ -714,7 +852,7 @@ pure func test_registered_heap_record_uses_borrow_policy() -> Bool:
 	source: CoreExpr = variable("items", LIST_WIDGET)
 	predicate: CoreExpr = callback("predicate", [TY_WIDGET], TY_BOOL)
 
-	match collection_pipeline_plan(filter_call(source, predicate, LIST_WIDGET)):
+	match collection_pipeline_plan(fixture_copy_names(), filter_call(source, predicate, LIST_WIDGET)):
 		Some(plan):
 			match collection_collect_policy_for_plan(collection_pipeline_model(program), plan):
 				Some(policy):
@@ -728,7 +866,7 @@ pure func test_registered_heap_record_uses_borrow_policy() -> Bool:
 pure func test_heap_record_alias_handoff_preserves_release_metadata() -> Bool:
 	alias_type: CoreType = NamedType("WidgetAlias", [])
 	program: CoreProgram = {
-		decls = [TypeAliasDecl({
+		decls = fixture_list_program().decls.concat([TypeAliasDecl({
 				abi_type = None,
 				name = "WidgetAlias",
 				type_params = [],
@@ -741,7 +879,7 @@ pure func test_heap_record_alias_handoff_preserves_release_metadata() -> Bool:
 				type_params = [],
 				fields = [],
 				loc = synthetic_core_source_loc(),
-			})],
+			})]),
 		foreign_includes = [],
 		source_files = []
 	}
@@ -786,7 +924,7 @@ pure func test_alias_policy_uses_canonical_type() -> Bool:
 	)
 	mapper: CoreExpr = callback("mapper", [TY_COUNT], TY_INT)
 
-	match collection_pipeline_plan(map_call(source, mapper, LIST_INT)):
+	match collection_pipeline_plan(fixture_copy_names(), map_call(source, mapper, LIST_INT)):
 		Some(plan):
 			match collection_collect_policy_for_plan(collection_pipeline_model(program), plan):
 				Some(policy):
@@ -808,7 +946,7 @@ pure func test_alias_pipeline_plan_is_recognized() -> Bool:
 	)
 	mapper: CoreExpr = callback("mapper", [TY_COUNT], TY_INT)
 
-	collection_pipeline_plan(map_call(source, mapper, LIST_INT)).is_some()
+	collection_pipeline_plan(fixture_copy_names(), map_call(source, mapper, LIST_INT)).is_some()
 
 
 pure func test_alias_type_is_canonicalized() -> Bool:
@@ -872,7 +1010,11 @@ tests: TestSuite = {
 		("bare source is not a pipeline", test_rejects_bare_list_source),
 		("pipeline stages are nonempty", test_exposes_nonempty_pipeline_stages),
 		("pipeline stages fold in order", test_folds_nonempty_pipeline_stages_in_order),
-		("compiler pure suffix is recognized", test_recognizes_compiler_owned_pure_suffix),
+		(
+			"pure mono instance is read through its declaration",
+			test_reads_a_pure_mono_instance_through_its_declaration,
+		),
+		("mono marker in a name is not read", test_does_not_read_a_mono_marker_from_a_name),
 		("filter map fold fuses", test_lowers_filter_map_fold_without_intermediate_lists),
 		("bare fold fuses", test_lowers_bare_fold),
 		("filter length avoids allocation", test_lowers_filter_length_without_result_allocation),

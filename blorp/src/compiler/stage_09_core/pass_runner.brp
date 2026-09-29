@@ -45,6 +45,7 @@ import:
 			SemanticMatchFail,
 			SemanticMatchLeaf,
 		),
+		CoreCopyDeclarationNames,
 		CoreSourceLoc,
 		CoreBinderOrigin(
 			AuthoredBinder,
@@ -114,6 +115,18 @@ carry `NameId`s, but a pass or invariant that renders an identifier at a
 boundary reaches its spelling through it (`name_spelling_or_text`). Plain
 `core_pass_state` starts from `EMPTY_NAME_TABLE`, and
 `core_pass_state_carry_ids` carries `base.names` forward.
+
+`copy_declaration_names` is `core_copy_declaration_names` of the program right
+after mono, computed once and read-only after that: mono instances and pure variants are the only
+copies, and by the time the passes that ask which declaration a copy is of have
+run (resolve, std inlining, the fusion passes) the declaration itself has been
+pruned. Empty until mono records it, so a read before mono is a bug (the origin agreement
+invariant reports a copy missing from the table once it is recorded).
+`core_pass_state_carry_ids` carries it. No pass after mono creates a copy: mono
+creates every `MonoInstance`, and flatten's `PureVariant`s are minted during
+lowering, before `prune_early` and mono. `prune_early` runs before this table is
+built, so a declaration it dropped would leave its variant unlisted; the origin
+agreement invariant reports such a copy (the strict self-compile is clean).
 ---
 record CorePassState {
 	program: CoreProgram,
@@ -122,7 +135,8 @@ record CorePassState {
 	minted_origins: List[CoreSourceLoc],
 	ownership_contract_facts: OwnershipContractFacts,
 	next_binder_id: Int,
-	names: NameTable
+	names: NameTable,
+	copy_declaration_names: CoreCopyDeclarationNames
 }
 
 
@@ -178,8 +192,8 @@ invariant costs no call at all rather than a call that returns `None`.
 record CorePass {
 	name: String,
 	run: pure (CorePassState) -> Result[CorePassState, CorePassDiagnostic],
-	invariant: Option[pure (CoreProgram) -> Option[CorePassDiagnostic]],
-	checked_invariant: Option[pure (CoreProgram) -> Option[CorePassDiagnostic]]
+	invariant: Option[pure (CorePassState) -> Option[CorePassDiagnostic]],
+	checked_invariant: Option[pure (CorePassState) -> Option[CorePassDiagnostic]]
 }
 
 
@@ -1069,11 +1083,12 @@ violations that predate `origin`, which would hide this check's result.
 Temporary: deleted in step M3.1 with the name markers it reads.
 ---
 func core_pass_state_origin_name_program_violation(
+	names: CoreCopyDeclarationNames,
 	pass_name: String,
 	program: CoreProgram,
 	modules: ModuleCheckScope,
 ) -> Option[CorePassDiagnostic]:
-	agreement = origin_name_agreement(program, modules)
+	agreement = origin_name_agreement(names, program, modules)
 	violations: List[CorePassDiagnostic] = agreement.violations.map(
 		pure func(message: String) -> CorePassDiagnostic: CorePassMessage(
 			"pass `${pass_name}` left ${message}",
@@ -1109,7 +1124,8 @@ pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassSta
 		minted_origins = [],
 		ownership_contract_facts = empty_ownership_contract_facts(),
 		next_binder_id = FIRST_MINTED_BINDER_ID,
-		names = EMPTY_NAME_TABLE
+		names = EMPTY_NAME_TABLE,
+		copy_declaration_names = {}
 	}
 
 
@@ -1129,7 +1145,8 @@ pure func core_pass_state_carry_ids(
 		next_node_id = base.next_node_id,
 		minted_origins = base.minted_origins,
 		next_binder_id = base.next_binder_id,
-		names = base.names
+		names = base.names,
+		copy_declaration_names = base.copy_declaration_names
 	}
 
 
@@ -1180,13 +1197,24 @@ pure func core_program_pass(
 	core_pass(name, run)
 
 
+---
+An invariant that reads only the program, as most do, as the state invariant a
+`CorePass` carries. An invariant that also needs the state (the std-inline
+check reads `copy_declaration_names`) takes the state directly.
+---
+pure func core_program_invariant(
+	check: pure (CoreProgram) -> Option[CorePassDiagnostic],
+) -> pure (CorePassState) -> Option[CorePassDiagnostic]:
+	func(state): check(state.program)
+
+
 private pure func run_pass_invariant(
-	invariant: Option[pure (CoreProgram) -> Option[CorePassDiagnostic]],
-	program: CoreProgram,
+	invariant: Option[pure (CorePassState) -> Option[CorePassDiagnostic]],
+	state: CorePassState,
 ) -> Option[CorePassDiagnostic]:
 	match invariant:
 		Some(check):
-			check(program)
+			check(state)
 		None:
 			None
 
@@ -1240,13 +1268,13 @@ func run_core_passes(
 
 					violation: Option[CorePassDiagnostic] = match run_pass_invariant(
 						pass.invariant,
-						current.program,
+						current,
 					):
 						Some(diagnostic):
 							Some(diagnostic)
 						None:
 							if control.check_invariants:
-								match run_pass_invariant(pass.checked_invariant, current.program):
+								match run_pass_invariant(pass.checked_invariant, current):
 									Some(diagnostic):
 										Some(diagnostic)
 									None:
@@ -1263,6 +1291,7 @@ func run_core_passes(
 														Some(diagnostic)
 													None:
 														match core_pass_state_origin_name_program_violation(
+															current.copy_declaration_names,
 															pass.name,
 															current.program,
 															control.modules,

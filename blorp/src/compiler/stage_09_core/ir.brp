@@ -3035,6 +3035,153 @@ pure func core_function_declared_origin(origin: CoreFunctionOrigin) -> CoreDecla
 
 
 ---
+The declarations other functions are instances or variants of, by `def_id`: every
+function that is the `base_def` of some `MonoInstance` or `PureVariant` origin in
+the program it was built from. Only `core_copy_declaration_names` builds and reads
+it.
+---
+type alias CoreBaseDeclarations = Dict[Int, CoreFunction]
+
+
+private pure func origin_base_def(origin: CoreDeclaredOrigin) -> Option[Int]:
+	match origin:
+		MonoInstance(base_def, _):
+			Some(base_def)
+		PureVariant(base_def):
+			Some(base_def)
+		_:
+			None
+
+
+---
+The `CoreBaseDeclarations` of `program`: its top-level functions and impl methods
+whose `def_id` some other function's origin names as its base. Two scans, the
+second keeping only the named declarations, so the index holds the few generic
+templates and impure siblings rather than every function.
+---
+private pure func core_base_declarations(program: CoreProgram) -> CoreBaseDeclarations:
+	var base_defs: Dict[Int, Bool] = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match origin_base_def(core_function_declared_origin(function_info.origin)):
+					Some(base_def):
+						base_defs = base_defs.set(base_def, True)
+					None:
+						void
+			ImplDecl(impl_decl):
+				for method in impl_decl.methods:
+					match origin_base_def(core_function_declared_origin(method.origin)):
+						Some(base_def):
+							base_defs = base_defs.set(base_def, True)
+						None:
+							void
+			_:
+				void
+
+	var bases: CoreBaseDeclarations = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				if base_defs.contains(function_info.def_id):
+					bases = bases.set(function_info.def_id, function_info)
+			ImplDecl(impl_decl):
+				for method in impl_decl.methods:
+					if base_defs.contains(method.def_id):
+						bases = bases.set(method.def_id, method)
+			_:
+				void
+
+	bases
+
+
+---
+The declaration `function_info` is, or is an instance or pure variant of: itself
+for a function declared in source (or by any other creation site), otherwise the
+declaration its `MonoInstance` or `PureVariant` origin names, followed through
+instances of variants to the root. This is how a reader that wants "the source
+function this is a copy of" asks, instead of parsing the copy's mangled name.
+`None` when the origin names a declaration that is not in `bases`.
+---
+private pure func core_function_base_declaration(
+	bases: CoreBaseDeclarations,
+	function_info: CoreFunction,
+) -> Option[CoreFunction]:
+	match origin_base_def(core_function_declared_origin(function_info.origin)):
+		Some(base_def):
+			if base_def == function_info.def_id:
+				None
+			else:
+				match bases.get(base_def):
+					Some(base):
+						core_function_base_declaration(bases, base)
+					None:
+						None
+		None:
+			Some(function_info)
+
+
+---
+The name of the declaration each mono instance or pure variant is a copy of, by
+the copy's `def_id`. A pass that sees a call to a copy and wants to know which
+source function it calls reads this with the call's `def_id`
+(`core_callee_declaration_name`) instead of parsing the callee's mangled name.
+
+The declaration is usually pruned before the readers run (nothing live reaches
+a generic template), so this is computed once, right after mono while every
+declaration is still there, and carried on `CorePassState.copy_declaration_names`
+for the passes after it.
+---
+type alias CoreCopyDeclarationNames = Dict[Int, String]
+
+
+---
+The `CoreCopyDeclarationNames` of `program`. A copy whose declaration is not in
+the program has no entry.
+---
+pure func core_copy_declaration_names(program: CoreProgram) -> CoreCopyDeclarationNames:
+	bases: CoreBaseDeclarations = core_base_declarations(program)
+	var names: CoreCopyDeclarationNames = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match origin_base_def(core_function_declared_origin(function_info.origin)):
+					Some(_):
+						match core_function_base_declaration(bases, function_info):
+							Some(declaration):
+								names = names.set(function_info.def_id, declaration.name)
+							None:
+								void
+					None:
+						void
+			_:
+				void
+
+	names
+
+
+---
+The declared name a call to `callee_name` (with `callee_def_id`, when the call
+carries one) reaches: the declaration's name when the callee is a mono instance
+or pure variant listed in `names`, otherwise `callee_name` itself, which then
+names a declaration and carries no compiler-owned marker.
+---
+pure func core_callee_declaration_name(
+	names: CoreCopyDeclarationNames,
+	callee_def_id: Option[Int],
+	callee_name: String,
+) -> String:
+	match callee_def_id:
+		Some(def_id):
+			names.get_or(def_id, callee_name)
+		None:
+			callee_name
+
+
+---
 The module a Core function came from, by id and origin, so readers ask the fact
 ("is this a package function?") instead of parsing a path String.
 
@@ -3056,6 +3203,16 @@ deletes it and renders paths from the module table.
 union CoreModuleOrigin:
 	SourceModule(ModuleId, ModuleOrigin)
 	NoSourceModule
+
+
+---
+The name of the declaration `function_info` is, or is a mono instance or pure
+variant of: its own name for a declaration, the recorded declaration name for a
+copy in `names`. A copy `names` does not list keeps its own name, which then
+names no declaration.
+---
+pure func core_declaration_name(names: CoreCopyDeclarationNames, function_info: CoreFunction) -> String:
+	names.get_or(function_info.def_id, function_info.name)
 
 
 record CoreFunction {

@@ -6,12 +6,13 @@
 import:
 	ir:
 		CoreCallKind(UnknownCall, UserCall),
+		CoreCopyDeclarationNames,
 		CoreExpr(CallExpr, VarExpr),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(NamedType),
+		core_callee_declaration_name,
 		core_expr_type,
-	synth_name: mono_name_base, strip_pure_suffix
 
 
 private INT_TYPE: CoreType = NamedType("Int", [])
@@ -115,16 +116,19 @@ private pure func supported_list_base_name(name: String) -> Option[String]:
 			None
 
 
-pure func collection_pipeline_base_name(name: String) -> Option[String]:
-	without_mono: String = mono_name_base(name)
-
-	without_module: String = match strip_prefix(without_mono, "list__"):
+---
+The list pipeline function a call reaches, by its supported base name (`map`,
+`filter`, ...). `declared_name` is the callee's declared name
+(`core_callee_declaration_name`): a mono instance or pure variant is read through
+the declaration its origin names, so only a `list__` module prefix (or the UFCS
+wrapper's `__ufcs_list__` prefix) is left to strip here.
+---
+pure func collection_pipeline_base_name(declared_name: String) -> Option[String]:
+	base: String = match strip_prefix(declared_name, "list__"):
 		Some(rest):
 			rest
 		None:
-			strip_prefix(without_mono, "__ufcs_list__").get_or(without_mono)
-
-	base: String = strip_pure_suffix(without_module)
+			strip_prefix(declared_name, "__ufcs_list__").get_or(declared_name)
 
 	match supported_list_base_name(base):
 		Some(supported):
@@ -137,17 +141,18 @@ pure func collection_pipeline_base_name(name: String) -> Option[String]:
 
 
 pure func collection_pipeline_call_base_and_args(
+	names: CoreCopyDeclarationNames,
 	expr: CoreExpr,
 ) -> Option[CoreCollectionPipelineCall]:
 	match expr:
 		CallExpr(call_kind, callee, args, _, _):
 			name: Option[String] = match call_kind:
-				UserCall(user_name, _, _):
-					Some(user_name)
+				UserCall(user_name, user_def_id, _):
+					Some(core_callee_declaration_name(names, user_def_id, user_name))
 				UnknownCall:
 					match callee:
 						VarExpr(variable, _, _):
-							Some(variable.name)
+							Some(core_callee_declaration_name(names, variable.def_id, variable.name))
 						_:
 							None
 				_:
@@ -206,11 +211,12 @@ private pure func append_collection_stage(
 
 
 private pure func collect_collection_pipeline(
+	names: CoreCopyDeclarationNames,
 	expr: CoreExpr,
 ) -> Option[CollectedCollectionPipeline]:
-	match collection_pipeline_call_base_and_args(expr):
+	match collection_pipeline_call_base_and_args(names, expr):
 		Some(call):
-			collect_collection_call(expr, call)
+			collect_collection_call(names, expr, call)
 		None:
 			element_type ?= collection_list_element_type(core_expr_type(expr))
 			Some({
@@ -222,6 +228,7 @@ private pure func collect_collection_pipeline(
 
 
 private pure func collect_collection_call(
+	names: CoreCopyDeclarationNames,
 	expr: CoreExpr,
 	call: CoreCollectionPipelineCall,
 ) -> Option[CollectedCollectionPipeline]:
@@ -237,13 +244,13 @@ private pure func collect_collection_call(
 	else if call.base == "filter" and call.args.length() == 2:
 		source ?= call.args.get(0)
 		callback ?= call.args.get(1)
-		collected ?= collect_collection_pipeline(source)
+		collected ?= collect_collection_pipeline(names, source)
 		stage: CoreCollectionPipelineStage = CollectionFilterStage(callback, collected.element_type)
 		Some(append_collection_stage(collected, stage, collected.element_type))
 	else if call.base == "filter_map" and call.args.length() == 2:
 		source ?= call.args.get(0)
 		callback ?= call.args.get(1)
-		collected ?= collect_collection_pipeline(source)
+		collected ?= collect_collection_pipeline(names, source)
 		output_type ?= collection_list_element_type(core_expr_type(expr))
 		option_type: CoreType = NamedType("Option", [output_type])
 		stage: CoreCollectionPipelineStage = CollectionFilterMapStage(
@@ -256,7 +263,7 @@ private pure func collect_collection_call(
 	else if call.base == "map" and call.args.length() == 2:
 		source ?= call.args.get(0)
 		callback ?= call.args.get(1)
-		collected ?= collect_collection_pipeline(source)
+		collected ?= collect_collection_pipeline(names, source)
 		output_type ?= collection_list_element_type(core_expr_type(expr))
 		stage: CoreCollectionPipelineStage = CollectionMapStage(
 			callback,
@@ -306,14 +313,17 @@ private pure func make_collection_pipeline_plan(
 	})
 
 
-pure func collection_pipeline_plan(expr: CoreExpr) -> Option[CoreCollectionPipelinePlan]:
-	match collection_pipeline_call_base_and_args(expr):
+pure func collection_pipeline_plan(
+	names: CoreCopyDeclarationNames,
+	expr: CoreExpr,
+) -> Option[CoreCollectionPipelinePlan]:
+	match collection_pipeline_call_base_and_args(names, expr):
 		Some(call):
 			if call.base == "fold_left" and call.args.length() == 3:
 				source ?= call.args.get(0)
 				initial ?= call.args.get(1)
 				reducer ?= call.args.get(2)
-				collected ?= collect_collection_pipeline(source)
+				collected ?= collect_collection_pipeline(names, source)
 				make_collection_pipeline_plan(
 					collected.source,
 					collected.stages,
@@ -324,7 +334,7 @@ pure func collection_pipeline_plan(expr: CoreExpr) -> Option[CoreCollectionPipel
 				)
 			else if call.base == "length" and call.args.length() == 1:
 				source ?= call.args.get(0)
-				collected ?= collect_collection_pipeline(source)
+				collected ?= collect_collection_pipeline(names, source)
 				make_collection_pipeline_plan(
 					collected.source,
 					collected.stages,
@@ -334,13 +344,16 @@ pure func collection_pipeline_plan(expr: CoreExpr) -> Option[CoreCollectionPipel
 					collection_expr_loc(expr),
 				)
 			else:
-				collection_collect_plan(expr)
+				collection_collect_plan(names, expr)
 		None:
-			collection_collect_plan(expr)
+			collection_collect_plan(names, expr)
 
 
-private pure func collection_collect_plan(expr: CoreExpr) -> Option[CoreCollectionPipelinePlan]:
-	collected ?= collect_collection_pipeline(expr)
+private pure func collection_collect_plan(
+	names: CoreCopyDeclarationNames,
+	expr: CoreExpr,
+) -> Option[CoreCollectionPipelinePlan]:
+	collected ?= collect_collection_pipeline(names, expr)
 	make_collection_pipeline_plan(
 		collected.source,
 		collected.stages,

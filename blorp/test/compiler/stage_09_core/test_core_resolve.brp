@@ -13,8 +13,6 @@ import:
 			UnknownCall,
 			UserCall,
 		),
-		CoreDeclaredOrigin(MonoInstance),
-		CoreFunctionOrigin(Declared),
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
 		CoreConstructorLengthMatch,
@@ -68,7 +66,10 @@ import:
 			VarExpr,
 		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreDeclaredOrigin(MonoInstance),
+		core_copy_declaration_names,
 		CoreFunctionKind(BuiltinFunction, ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
+		CoreFunctionOrigin(Declared),
 		CoreListHandoffMode(BorrowFreshHandoff),
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
 		CoreListStorageLayout(PointerListStorage),
@@ -110,7 +111,7 @@ import:
 		),
 		CoreResolveModuleImports,
 		resolve_callable_id_calls,
-		resolve_core_program,
+		resolve_core_program as resolve_core_program_with_names,
 		resolve_global_value_refs,
 	../../../src/compiler/stage_09_core/trait_resolve: resolve_core_traits
 	../../../src/compiler/stage_09_core/traverse:
@@ -119,6 +120,21 @@ import:
 		map_core_match_results,
 		map_core_match_results_with_context,
 	test: TestSuite
+
+
+-- The pipeline records the names after mono, while every declaration is still in
+-- the program; a fixture's program is that program.
+pure func resolve_core_program(
+	program: CoreProgram,
+	import_bindings: List[CoreResolveImportBinding],
+	module_imports: List[CoreResolveModuleImports],
+) -> CoreProgram:
+	resolve_core_program_with_names(
+		core_copy_declaration_names(program),
+		program,
+		import_bindings,
+		module_imports,
+	)
 
 
 pure func int_type() -> CoreType:
@@ -247,6 +263,39 @@ pure func function_decl_in_module(
 		def_id = def_id,
 		loc = synthetic_core_source_loc(),
 	})
+
+
+-- The generic declaration `module__source_name` that mono instances are copies
+-- of: bodyless, as a std declaration is before mono fills its instances.
+pure func generic_declaration_in_module(
+	module_name: String,
+	source_name: String,
+	def_id: Int,
+) -> CoreDecl:
+	FunctionDecl({
+		name = module_name.replace("/", "_") + "__" + source_name,
+		source_module = Some(module_name),
+		module = FIXTURE_NO_SOURCE_MODULE,
+		type_params = ["T"],
+		params = [core_param("value")],
+		return_type = int_type(),
+		body = None,
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = def_id,
+		loc = synthetic_core_source_loc(),
+	})
+
+
+-- `decl` as a mono instance of the declaration with `base_def`, which the
+-- resolver finds through the origin and not through the name.
+pure func mono_instance_of(base_def: Int, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl({ function_info | origin = Declared(MonoInstance(base_def, [])) })
+		_:
+			decl
 
 
 pure func function_decl_with_params(
@@ -2606,6 +2655,36 @@ pure func test_materialized_known_builtin_body_stays_builtin() -> Bool:
 	call: CoreExpr = call_expr(name, int_function_type(1), [int_literal(1)])
 	resolved: CoreProgram = resolve_without_imports(program([
 		function_decl("main", 1, call),
+		generic_declaration_in_module("stream", "repeat", 3),
+		mono_instance_of(
+			3,
+			function_decl_in_module(
+				"stream",
+				"repeat__mono_Int",
+				2,
+				CallExpr(
+					BuiltinCall(runtime_name),
+					VoidExpr(VoidType, synthetic_core_source_loc()),
+					[int_literal(2)],
+					int_type(),
+					synthetic_core_source_loc(),
+				),
+			),
+		),
+	]))
+
+	resolved_builtin_call_is(resolved, runtime_name)
+
+
+-- The declaration is pruned before resolve runs (nothing live reaches a generic
+-- template), so the instance's declaration name comes from the names recorded
+-- after mono and carried on the pass state, not from the program in hand.
+pure func test_pruned_declaration_still_registers_its_instance_as_builtin() -> Bool:
+	name: String = "stream__repeat__mono_Int"
+	runtime_name: String = "blorp_stream_repeat"
+	call: CoreExpr = call_expr(name, int_function_type(1), [int_literal(1)])
+	instance: CoreDecl = mono_instance_of(
+		3,
 		function_decl_in_module(
 			"stream",
 			"repeat__mono_Int",
@@ -2618,7 +2697,19 @@ pure func test_materialized_known_builtin_body_stays_builtin() -> Bool:
 				synthetic_core_source_loc(),
 			),
 		),
-	]))
+	)
+	after_mono: CoreProgram = program([
+		function_decl("main", 1, call),
+		generic_declaration_in_module("stream", "repeat", 3),
+		instance,
+	])
+	after_prune: CoreProgram = program([function_decl("main", 1, call), instance])
+	resolved: CoreProgram = resolve_core_program_with_names(
+		core_copy_declaration_names(after_mono),
+		after_prune,
+		[],
+		[],
+	)
 
 	resolved_builtin_call_is(resolved, runtime_name)
 
@@ -2657,12 +2748,39 @@ pure func test_selected_materialized_runtime_builtin_stays_builtin() -> Bool:
 	resolved_builtin_call_is(resolved, runtime_name)
 
 
+-- A source function whose name happens to contain a mono instance's marker is a
+-- declaration: without a `MonoInstance` origin it is not registered under the
+-- source name before the marker, so the builtin `repeat` does not claim it.
+pure func test_marker_in_a_source_function_name_is_not_a_mono_instance() -> Bool:
+	name: String = "stream__repeat__mono_Int"
+	runtime_name: String = "blorp_stream_repeat"
+	call: CoreExpr = call_expr(name, int_function_type(1), [int_literal(1)])
+	resolved: CoreProgram = resolve_without_imports(program([
+		function_decl("main", 1, call),
+		function_decl_in_module(
+			"stream",
+			"repeat__mono_Int",
+			2,
+			CallExpr(
+				BuiltinCall(runtime_name),
+				VoidExpr(VoidType, synthetic_core_source_loc()),
+				[int_literal(2)],
+				int_type(),
+				synthetic_core_source_loc(),
+			),
+		),
+	]))
+
+	resolved_user_call_is(resolved, name, Some(2))
+
+
 pure func test_registry_name_does_not_replace_user_body() -> Bool:
 	name: String = "stream__repeat__mono_Int"
 	call: CoreExpr = call_expr(name, int_function_type(1), [int_literal(1)])
 	resolved: CoreProgram = resolve_without_imports(program([
 		function_decl("main", 1, call),
-		function_decl_in_module("stream", "repeat__mono_Int", 2, int_literal(2)),
+		generic_declaration_in_module("stream", "repeat", 3),
+		mono_instance_of(3, function_decl_in_module("stream", "repeat__mono_Int", 2, int_literal(2))),
 	]))
 
 	resolved_user_call_is(resolved, name, Some(2))
@@ -3859,8 +3977,16 @@ tests: TestSuite = {
 			test_materialized_known_builtin_body_stays_builtin,
 		),
 		(
+			"pruned declaration still registers its instance as builtin",
+			test_pruned_declaration_still_registers_its_instance_as_builtin,
+		),
+		(
 			"selected materialized runtime builtin stays builtin",
 			test_selected_materialized_runtime_builtin_stays_builtin,
+		),
+		(
+			"marker in a source function name is not a mono instance",
+			test_marker_in_a_source_function_name_is_not_a_mono_instance,
 		),
 		("registry name does not replace user body", test_registry_name_does_not_replace_user_body),
 		(

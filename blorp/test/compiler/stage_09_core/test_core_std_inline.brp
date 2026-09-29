@@ -2,6 +2,9 @@ import:
 	../../../src/compiler/stage_09_core/function_origin_fixture: fixture_source_module, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_04_modules/loaded_module: ModuleOrigin(StdlibModule)
 	../../../src/compiler/stage_09_core/ir:
+		CoreDeclaredOrigin(MonoInstance),
+		core_copy_declaration_names,
+		CoreFunctionOrigin(Declared),
 		CoreModuleOrigin(NoSourceModule),
 		CoreAccessor(RootAccessor),
 		CoreBinaryOp(AddOp),
@@ -38,7 +41,7 @@ import:
 			VoidExpr,
 		),
 		CoreFunction,
-		CoreFunctionKind(UserFunction),
+		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(IntLiteral),
 		CoreLogicalOp(AndOp),
@@ -60,13 +63,29 @@ import:
 		CoreVar,
 		core_field_ref,
 	../../../src/compiler/stage_09_core/std_inline:
-		first_uninlined_std_wrapper_call,
+		first_uninlined_std_wrapper_call as first_uninlined_std_wrapper_call_with_names,
 		StdInlineResult,
-		inline_std_wrappers,
-		inline_std_wrappers_minting,
+		inline_std_wrappers as inline_std_wrappers_with_names,
+		inline_std_wrappers_minting as inline_std_wrappers_minting_with_names,
 	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
 	memory: same_object
 	test: TestSuite
+
+
+-- The pipeline records the names after mono, while every declaration is still in
+-- the program; a fixture's program is that program.
+private pure func inline_std_wrappers(program: CoreProgram) -> CoreProgram:
+	inline_std_wrappers_with_names(core_copy_declaration_names(program), program)
+
+
+private pure func inline_std_wrappers_minting(program: CoreProgram, id_base: Int) -> StdInlineResult:
+	inline_std_wrappers_minting_with_names(core_copy_declaration_names(program), program, id_base)
+
+
+private pure func first_uninlined_std_wrapper_call(
+	program: CoreProgram,
+) -> Option[(String, CoreSourceLoc)]:
+	first_uninlined_std_wrapper_call_with_names(core_copy_declaration_names(program), program)
 
 
 DEEP_LOGICAL_COUNT: Int = 4096
@@ -194,41 +213,98 @@ private pure func function_decl(
 	})
 
 
+-- The generic `list` declarations the `Int` instances below are copies of. Every
+-- `program(...)` carries them, since a reader finds which declaration an instance
+-- copies through its origin, not its name.
+private pure func list_declaration(
+	name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = Some("list"),
+		module = NoSourceModule,
+		type_params = ["T"],
+		params = params,
+		return_type = return_type,
+		body = None,
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = def_id,
+		loc = synthetic_core_source_loc(),
+	}
+
+
+private pure func list_declarations() -> List[CoreDecl]:
+	[
+		FunctionDecl(list_declaration("list__get_or", GET_OR_DECLARATION_ID, [], int_type())),
+		FunctionDecl(list_declaration("list__get", GET_DECLARATION_ID, [], option_int_type())),
+		FunctionDecl(list_declaration("list__append", APPEND_DECLARATION_ID, [], list_type())),
+	]
+
+
+private GET_OR_DECLARATION_ID: Int = 1010
+
+private GET_DECLARATION_ID: Int = 1014
+
+private APPEND_DECLARATION_ID: Int = 1012
+
+
+private pure func instance_of(base_def: Int, decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl({ function_info | origin = Declared(MonoInstance(base_def, [])) })
+		_:
+			decl
+
+
 private pure func target_get_or(body: CoreExpr) -> CoreDecl:
-	function_decl(
-		"list__get_or__mono_Int",
-		Some("list"),
-		10,
-		[param("self", list_type()), param("index", int_type()), param("default", int_type())],
-		int_type(),
-		body,
+	instance_of(
+		GET_OR_DECLARATION_ID,
+		function_decl(
+			"list__get_or__mono_Int",
+			Some("list"),
+			10,
+			[param("self", list_type()), param("index", int_type()), param("default", int_type())],
+			int_type(),
+			body,
+		),
 	)
 
 
 private pure func target_get() -> CoreDecl:
-	function_decl(
-		"list__get__mono_Int",
-		Some("list"),
-		14,
-		[param("self", list_type()), param("index", int_type())],
-		option_int_type(),
-		variable(
-			"None",
+	instance_of(
+		GET_DECLARATION_ID,
+		function_decl(
+			"list__get__mono_Int",
+			Some("list"),
+			14,
+			[param("self", list_type()), param("index", int_type())],
 			option_int_type(),
+			variable(
+				"None",
+				option_int_type(),
+			),
 		),
 	)
 
 
 private pure func target_append() -> CoreDecl:
-	function_decl(
-		"list__append__mono_Int",
-		Some("list"),
-		12,
-		[param("self", list_type()), param("item", int_type())],
-		list_type(),
-		variable(
-			"self",
+	instance_of(
+		APPEND_DECLARATION_ID,
+		function_decl(
+			"list__append__mono_Int",
+			Some("list"),
+			12,
+			[param("self", list_type()), param("item", int_type())],
 			list_type(),
+			variable(
+				"self",
+				list_type(),
+			),
 		),
 	)
 
@@ -244,7 +320,7 @@ private pure func caller(
 
 private pure func program(decls: List[CoreDecl]) -> CoreProgram:
 	{
-		decls = decls,
+		decls = list_declarations().concat(decls),
 		foreign_includes = [],
 		source_files = []
 	}

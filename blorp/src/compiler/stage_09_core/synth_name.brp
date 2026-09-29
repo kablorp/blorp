@@ -2,81 +2,26 @@
 --
 -- A flattened Core name cannot be split safely on `__`: both module segments
 -- and source names may contain that sequence. Decode relative to the explicit
--- source module carried by the function, then remove only compiler-owned
--- suffixes.
---
--- This module also owns the two markers `mono.brp` embeds when it
--- synthesizes a specialized function or data-type name
--- (`mangle_specialization_name`/`mangle_generic_data_name`) and the single
--- accessor set that recovers a name's parts from them. No other module may
--- parse a mono-mangled or pure-overload name directly; call these accessors
--- instead.
+-- source module carried by the function. The function a synthesis pass is
+-- given is a source declaration (or a copy carrying its name, see
+-- `synth.brp`'s `synthesis_declaration_view`), so its name carries no
+-- compiler-owned suffix to remove: which declaration an instance or pure
+-- variant is a copy of is `CoreFunction.origin`'s to say.
 import:
-	../stage_08_core_lower/identity: CORE_PURE_OVERLOAD_SUFFIX, core_module_member_prefix
-	ir: CoreFunction, CoreFunctionKind(UnresolvedBuiltinFunction)
+	../stage_08_core_lower/identity: core_module_member_prefix
+	ir:
+		CoreCopyDeclarationNames,
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction),
+		core_declaration_name,
 
 
 -- `mono.brp` embeds this marker right after a specialized function or
 -- data-type's source name, followed by an encoded substitution or argument
--- list. This module owns the marker and the accessors below; no other
--- module may embed or parse it directly.
+-- list. This module owns the marker; no reader parses it (a function's
+-- `origin` says what it is an instance of), and the producer goes with the
+-- marked names in docs/NAME_MANGLING_REMOVAL_ROADMAP.md step M3.1.
 MONO_NAME_MARKER: String = "__mono_"
-
--- `stage_08_core_lower/identity.brp` defines `CORE_PURE_OVERLOAD_SUFFIX` and
--- appends it to a function's mangled name. This module owns the accessor
--- that recovers a name's parts; no other module may parse it directly.
-
-
-private pure func last_index_of(value: String, needle: String) -> Int:
-	var last_index: Int = -1
-	var search_start: Int = 0
-
-	while search_start < value.length():
-		remaining: String = value.substring(search_start, value.length() - search_start)
-		relative_index: Int = remaining.raw_index_of(needle)
-
-		if relative_index < 0:
-			break
-		else:
-			last_index = search_start + relative_index
-			search_start = last_index + needle.length()
-
-	last_index
-
-
----
-The base name before the last `MONO_NAME_MARKER`, or `name` unchanged when
-it carries no marker. A name can carry the marker more than once: mono can
-specialize an already-specialized name (for example a pure-overload variant
-of a prior specialization), so an earlier round's marker survives inside
-the base name and only the last marker delimits the outermost
-specialization's encoded suffix.
----
-pure func mono_name_base(name: String) -> String:
-	index: Int = last_index_of(name, MONO_NAME_MARKER)
-
-	if index < 0:
-		name
-	else:
-		name.substring(0, index)
-
-
----
-True when `name` ends with the pure-overload suffix.
----
-private pure func is_pure_variant_name(name: String) -> Bool:
-	name.ends_with(CORE_PURE_OVERLOAD_SUFFIX)
-
-
----
-`name` with a trailing pure-overload suffix removed, or `name` unchanged
-when it carries none.
----
-pure func strip_pure_suffix(name: String) -> String:
-	if is_pure_variant_name(name):
-		name.substring(0, name.length() - CORE_PURE_OVERLOAD_SUFFIX.length())
-	else:
-		name
 
 
 ---
@@ -95,7 +40,7 @@ pure func synthesis_source_name_with_prefix(
 			module_prefix.length(),
 			function_name.length() - module_prefix.length(),
 		)
-		Some(strip_pure_suffix(mono_name_base(qualified_name)))
+		Some(qualified_name)
 
 
 pure func synthesis_source_name(function_info: CoreFunction) -> Option[String]:
@@ -116,3 +61,33 @@ pure func is_synthesis_candidate(function_info: CoreFunction) -> Bool:
 						True
 					_:
 						False
+
+
+---
+`function_info` as the synthesis passes read it: for a candidate that is a mono
+instance or pure variant, a copy carrying the name of the declaration it is a
+copy of (`names`, from `CorePassState.copy_declaration_names`), so a pass that
+asks for the function's source member name gets the source declaration's without
+parsing a marker out of the copy's mangled name. Every other function is returned
+as it is. `synthesize_function` puts the real name back on the result, so the
+synthesized copy keeps its own name.
+
+INTERIM: this is a name round-trip (rename to the declaration, synthesize, restore).
+It goes when the synthesis passes match on the declaration's origin or ids instead
+of a source-name String (docs/NAME_ID_ROADMAP.md, Interim states). A copy `names`
+does not list keeps its own name, which no pass matches, so nothing is synthesized
+for it; the origin agreement invariant reports such a copy loudly.
+---
+pure func synthesis_declaration_view(
+	names: CoreCopyDeclarationNames,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	if not is_synthesis_candidate(function_info):
+		function_info
+	else:
+		declaration_name: String = core_declaration_name(names, function_info)
+
+		if declaration_name == function_info.name:
+			function_info
+		else:
+			{ function_info | name = declaration_name }

@@ -11,11 +11,12 @@
 -- agree.
 import:
 	../stage_08_core_lower/entrypoint: ENTRYPOINT_NAME, USER_MAIN_NAME_PREFIX
-	../stage_08_core_lower/identity: core_module_member_prefix
+	../stage_08_core_lower/identity: CORE_PURE_OVERLOAD_SUFFIX, core_module_member_prefix
 	../stage_04_modules/loaded_module: ModuleOrigin, module_origins_equal
 	../stage_04_modules/module_table: ModuleId, ModuleTable, module_ids_equal, module_table_canonical_path, module_table_origin
 	closure: ETA_NAME_PREFIX, LAMBDA_NAME_PREFIX, TASK_NAME_PREFIX
 	ir:
+		CoreCopyDeclarationNames,
 		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunction,
@@ -33,7 +34,50 @@ import:
 		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreProgram,
 		core_function_declared_origin,
-	synth_name: mono_name_base, strip_pure_suffix
+	synth_name: MONO_NAME_MARKER
+
+
+---
+The parsers the name-reading proof needs, kept private here now that no pass
+reads a name for these facts: the invariant is the one reader allowed to. They
+are removed with this invariant and the markers in step M3.1 (docs/NAME_MANGLING_REMOVAL_ROADMAP.md).
+---
+private pure func last_index_of(value: String, needle: String) -> Int:
+	var last_index: Int = -1
+	var search_start: Int = 0
+
+	while search_start < value.length():
+		remaining: String = value.substring(search_start, value.length() - search_start)
+		relative_index: Int = remaining.raw_index_of(needle)
+
+		if relative_index < 0:
+			break
+		else:
+			last_index = search_start + relative_index
+			search_start = last_index + needle.length()
+
+	last_index
+
+
+---
+The name before the last `MONO_NAME_MARKER`, or `name` unchanged when it carries
+none. A name can carry the marker more than once (a mono of a mono), and only the
+last marker delimits the outermost specialization's encoded suffix.
+---
+private pure func mono_name_base(name: String) -> String:
+	index: Int = last_index_of(name, MONO_NAME_MARKER)
+
+	if index < 0:
+		name
+	else:
+		name.substring(0, index)
+
+
+private pure func strip_pure_suffix(name: String) -> String:
+	if name.ends_with(CORE_PURE_OVERLOAD_SUFFIX):
+		name.substring(0, name.length() - CORE_PURE_OVERLOAD_SUFFIX.length())
+	else:
+		name
 
 
 ---
@@ -365,11 +409,35 @@ private pure func case_counts_in_order(counts: Dict[String, Int]) -> List[(Strin
 
 
 ---
+A mono instance or pure variant must have an entry in the recorded declaration
+names once mono has recorded them (`names` is empty until then, and before mono
+there is nothing to check). A missing entry means the declaration was pruned
+before mono recorded the table, and every reader of the copy's declaration would
+then read its mangled name instead, silently.
+---
+private pure func unrecorded_copy_disagreement(
+	names: CoreCopyDeclarationNames,
+	function_info: CoreFunction,
+) -> Option[String]:
+	if names.is_empty() or names.contains(function_info.def_id):
+		None
+	else:
+		match core_function_declared_origin(function_info.origin):
+			MonoInstance(_, _) | PureVariant(_):
+				Some(
+					"function `${function_info.name}` (def ${function_info.def_id.to_string()}) is a copy with no entry in the recorded declaration names",
+				)
+			_:
+				None
+
+
+---
 Every function the program declares, top level or as an impl method, checked
 against its name. An impl method must also carry an impl-method origin: it is
 declared inside an `impl`, whatever its name looks like.
 ---
 pure func origin_name_agreement(
+	names: CoreCopyDeclarationNames,
 	program: CoreProgram,
 	modules: ModuleCheckScope,
 ) -> OriginNameAgreement:
@@ -385,6 +453,12 @@ pure func origin_name_agreement(
 				counts = count_origin_case(counts, function_info)
 
 				match function_disagreement(function_info, trait_names, modules):
+					Some(message):
+						violations = violations.append(message)
+					None:
+						void
+
+				match unrecorded_copy_disagreement(names, function_info):
 					Some(message):
 						violations = violations.append(message)
 					None:
