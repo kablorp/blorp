@@ -17,11 +17,9 @@ EXPECTED_FULL_FIELD_SITES = {
     "stage_08_core_lower/entrypoint.brp": 2,
     "stage_08_core_lower/lower.brp": 1,
     "stage_09_core/clone.brp": 1,
-    "stage_09_core/closure.brp": 2,
-    "stage_09_core/collection_pipeline.brp": 1,
+    "stage_09_core/closure.brp": 1,
     "stage_09_core/consume_specialize.brp": 2,
     "stage_09_core/ir.brp": 1,
-    "stage_09_core/match_lowering.brp": 1,
     "stage_09_core/match_projection.brp": 2,
     "stage_09_core/mono_option.brp": 1,
     "stage_09_core/parallel_tensor_pipeline.brp": 1,
@@ -31,12 +29,8 @@ EXPECTED_FULL_FIELD_SITES = {
     "stage_09_core/perceus/results_and_loops.brp": 4,
     "stage_09_core/record_update.brp": 1,
     "stage_09_core/resolve.brp": 10,
-    "stage_09_core/specialize.brp": 1,
-    "stage_09_core/specialize_collection.brp": 1,
     "stage_09_core/ssa.brp": 1,
     "stage_09_core/std_inline.brp": 1,
-    "stage_09_core/string_pipeline.brp": 1,
-    "stage_09_core/synth_fixed.brp": 1,
     "stage_09_core/synth_nodes.brp": 1,
     "stage_09_core/tailrec.brp": 1,
     "stage_09_core/tensor_specialize.brp": 2,
@@ -157,7 +151,7 @@ class IdentityWorkCounterTests(unittest.TestCase):
                 if count:
                     sites[str(path.relative_to(source_root))] = count
         self.assertEqual(sites, EXPECTED_FULL_FIELD_SITES)
-        self.assertEqual(sum(sites.values()), 47)
+        self.assertEqual(sum(sites.values()), 40)
         lower = (source_root / "stage_08_core_lower/lower.brp").read_text()
         self.assertIn("private pure func core_var_impl(", lower)
         self.assertIn("name = name,\n\t\tid = 0,\n\t\tdef_id = def_id", lower)
