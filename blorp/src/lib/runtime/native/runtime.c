@@ -979,8 +979,10 @@ static _Atomic bool __blorp_stats_enabled = false;
 // __blorp_lightweight_stats_enabled is declared earlier, next to the
 // allocation-oracle counters that also gate on it.
 static bool __blorp_compiler_memory_profile_enabled = false;
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
 static bool __blorp_typecheck_body_metrics_enabled = false;
 static bool __blorp_core_lowering_type_metrics_enabled = false;
+#endif
 static bool __blorp_trace_allocs = false;
 
 // Memory watch: periodic snapshots to stderr for leak detection in long-running programs.
@@ -1195,6 +1197,7 @@ static void __blorp_compiler_memory_checkpoint(
     );
 }
 
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
 // Per-body typecheck attribution (BLORP_TYPECHECK_BODY_METRICS=1). The typed
 // frontend records one row per checked body; the report prints once per flush
 // and the buffer is released with it, so nothing outlives the compile.
@@ -1269,6 +1272,7 @@ static void __blorp_typecheck_body_metrics_release(void) {
     __blorp_typecheck_body_metric_count = 0;
     __blorp_typecheck_body_metric_capacity = 0;
 }
+#endif // BLORP_COMPILER_RUNTIME_SOURCES
 
 static inline size_t __alloc_meta_slot(const blorp_Object* obj) {
     return (((uintptr_t)obj) >> 4) & (BLORP_ALLOC_META_SLOTS - 1);
@@ -1462,8 +1466,11 @@ static void __blorp_init_stats_flag(void) {
     static const char* requests[] = {
         "BLORP_ALLOCATOR_STATS",
         "BLORP_COMPILER_MEMORY_PROFILE",
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
+        // Compiler self-profiling exists only in the compiler runtime.
         "BLORP_TYPECHECK_BODY_METRICS",
         "BLORP_CORE_LOWERING_TYPE_METRICS",
+#endif
 #ifndef BLORP_COMPILER_RUNTIME_SOURCES
         // The compiler owns this setting for its run/test child artifacts.
         // Its own stripped runtime must allow the CLI to select a diagnostic
@@ -1486,14 +1493,19 @@ static void __blorp_init_stats_flag(void) {
     const char* mem_watch_env = getenv("BLORP_MEM_WATCH");
     __blorp_compiler_memory_profile_enabled =
         getenv("BLORP_COMPILER_MEMORY_PROFILE") != NULL;
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
     __blorp_typecheck_body_metrics_enabled =
         getenv("BLORP_TYPECHECK_BODY_METRICS") != NULL;
     __blorp_core_lowering_type_metrics_enabled =
         getenv("BLORP_CORE_LOWERING_TYPE_METRICS") != NULL;
+#endif
     atomic_store_explicit(&__blorp_lightweight_stats_enabled,
         getenv("BLORP_ALLOCATOR_STATS") != NULL ||
-        __blorp_compiler_memory_profile_enabled ||
-        __blorp_typecheck_body_metrics_enabled,
+        __blorp_compiler_memory_profile_enabled
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
+        || __blorp_typecheck_body_metrics_enabled
+#endif
+        ,
         memory_order_relaxed);
     atomic_store_explicit(&__blorp_stats_enabled,
         (getenv("BLORP_LEAK_CHECK") != NULL) ||
@@ -2040,6 +2052,7 @@ long blorp_runtime_monotonic_microseconds_c(void) {
     return timestamp.tv_sec * 1000000L + timestamp.tv_nsec / 1000L;
 }
 
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
 long blorp_typecheck_body_metrics_enabled_c(void) {
     return __blorp_typecheck_body_metrics_enabled ? 1 : 0;
 }
@@ -3169,6 +3182,49 @@ void blorp_perceus_engine_metrics_report_c(void) {
     }
     free(sorted);
 }
+
+#else
+// User programs, standard-library and package tests, and test binaries that
+// import compiler modules link this runtime without the compiler
+// self-profiling code. Compiler sources declare these entry points as
+// `foreign func`s, so a program that reaches them must still link; the
+// metrics are permanently off there, which the compiler's call sites already
+// treat as the "no env var set" path.
+long blorp_typecheck_body_metrics_enabled_c(void) { return 0; }
+void blorp_typecheck_body_metric_record_c(
+    const char* module_path, const char* callable, long microseconds,
+    long allocations, long source_lines, long is_dependency) {}
+void blorp_typecheck_phase_metric_record_c(
+    const char* phase, long microseconds, long allocations) {}
+void blorp_typecheck_ctfe_metric_record_c(
+    const char* fallback, const char* fallback_callable, long fallback_definition_id,
+    long dependency_modules, long selective_modules, long eager_modules,
+    long worklist_checked_bodies, long bodies_outside_plan) {}
+void blorp_typecheck_body_metrics_report_c(void) {}
+long blorp_core_lowering_type_metrics_enabled_c(void) { return 0; }
+void blorp_core_lowering_type_metric_record_c(const void* lowered_type) {}
+void blorp_core_lowering_type_metrics_report_c(void) {}
+void blorp_core_lowering_node_enter_c(void) {}
+void blorp_core_lowering_node_exit_c(const char* kind) {}
+void blorp_core_lowering_source_loc_record_c(long delta) {}
+void blorp_core_lowering_var_record_c(long delta) {}
+void blorp_core_lowering_node_kind_report_c(void) {}
+long blorp_perceus_engine_metrics_enabled_c(void) { return 0; }
+void blorp_perceus_engine_node_enter_c(void) {}
+void blorp_perceus_engine_node_exit_c(const char* kind) {}
+void blorp_perceus_engine_inserted_expr_construct_c(void) {}
+void blorp_perceus_engine_managed_let_plan_construct_c(void) {}
+void blorp_perceus_engine_frame_construct_c(void) {}
+void blorp_perceus_engine_resolved_value_update_c(void) {}
+void blorp_perceus_engine_let_binding_visit_c(void) {}
+void blorp_perceus_engine_let_binding_managed_c(void) {}
+void blorp_perceus_engine_metrics_report_c(void) {}
+void blorp_perceus_engine_summary_invocation_begin_c(void) {}
+void blorp_perceus_engine_summary_function_begin_c(void) {}
+void blorp_perceus_engine_summary_node_visit_c(void) {}
+void blorp_perceus_engine_summary_enter_c(const void* name_obj, const void* expr_obj, long node_id) {}
+void blorp_perceus_engine_summary_exit_c(void) {}
+#endif // BLORP_COMPILER_RUNTIME_SOURCES
 
 #define BLORP_LIST_STORAGE_POINTER 0
 #define BLORP_LIST_STORAGE_INLINE 1

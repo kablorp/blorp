@@ -521,6 +521,10 @@ if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_fatal_message
 	echo "FAIL: hygiene-check must include the runtime fatal message newline contract" >&2
 	exit 1
 fi
+if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_compiler_only_metrics.py' Makefile; then
+	echo "FAIL: hygiene-check must include the compiler-only metrics runtime split" >&2
+	exit 1
+fi
 if ! grep -Fq 'python3 -m unittest blorp/test/build/test_record_validation.py' Makefile; then
 	echo "FAIL: hygiene-check must include the validation evidence recorder contract" >&2
 	exit 1
