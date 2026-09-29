@@ -161,7 +161,8 @@ import:
 			UnresolvedBuiltinFunction,
 			UserFunction,
 		),
-		CoreFunctionOrigin(EtaExpansion, HoistedLambda, HoistedTask),
+		CoreDeclaredOrigin(EtaExpansion, HoistedLambda, HoistedTask),
+		CoreFunctionOrigin(Declared),
 		CoreGlobal,
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
@@ -223,8 +224,6 @@ TASK_NAME_PREFIX: String = "_blorp_task_"
 ETA_NAME_PREFIX: String = "_blorp_eta_"
 
 STATIC_CLOSURE_PREFIX: String = "__sc_"
-
-NO_ENCLOSING_DEFINITION: Int = -1
 
 CLOSURE_TYPE_NAME: String = "Closure"
 
@@ -304,19 +303,36 @@ mutation, then borrowed through the walk -- it never changes during a
 single function body's conversion, so it never needs to be copied into the
 per-node results below.
 ---
-record ClosureFacts {
+record ClosureDefinitionFacts {
+	function_definitions: List[CoreDefinitionIdentity],
+	constructor_definitions: List[CoreDefinitionIdentity]
+}
+
+
+---
+The program-wide, read-only half of `ClosureFacts`: the pass mode and the
+lookup tables. It exists before any definition is being converted, so it
+carries no enclosing definition.
+---
+record ClosureProgramFacts {
 	mode: ClosurePassMode,
-	current_module: Option[String],
-	-- The definition whose body is being converted: the `enclosing_def` of every
-	-- function hoisted while it is (`CoreFunctionOrigin`). Set per function or
-	-- global initializer before any hoisting; `NO_ENCLOSING_DEFINITION` only
-	-- before the first one, where nothing can hoist.
-	enclosing_def_id: Int,
 	functions_by_id: Dict[Int, CoreFunction],
 	function_collisions_by_id: Dict[Int, List[CoreFunction]],
 	functions_by_name: Dict[String, List[CoreFunction]],
-	function_definitions: List[CoreDefinitionIdentity],
-	constructor_definitions: List[CoreDefinitionIdentity]
+	definitions: ClosureDefinitionFacts
+}
+
+
+---
+Facts for converting one function body or global initializer: the program
+facts plus the module and the definition being converted. A hoist records
+`enclosing_def_id` in its origin, so it is required; only `convert_function`
+and `convert_global` build this record.
+---
+record ClosureFacts {
+	program: ClosureProgramFacts,
+	current_module: Option[String],
+	enclosing_def_id: Int
 }
 
 
@@ -751,7 +767,7 @@ private pure func merge_free_vars(left: List[FreeVar], right: List[FreeVar]) -> 
 
 
 private pure func free_vars_exprs(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	exprs: List[CoreExpr],
 ) -> List[FreeVar]:
@@ -767,7 +783,7 @@ private pure func free_vars_exprs(
 
 
 private pure func free_vars_boxed_storage_value(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	value: CoreBoxedStorageValue,
 ) -> List[FreeVar]:
@@ -775,7 +791,7 @@ private pure func free_vars_boxed_storage_value(
 
 
 private pure func free_vars_boxed_storage_values(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	values: List[CoreBoxedStorageValue],
 ) -> List[FreeVar]:
@@ -791,7 +807,7 @@ private pure func free_vars_boxed_storage_values(
 
 
 private pure func free_vars_tuple_element(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	element: CoreTupleElement,
 ) -> List[FreeVar]:
@@ -815,7 +831,7 @@ private pure func free_vars_tuple_element(
 
 
 private pure func free_vars_tuple_elements(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	elements: List[CoreTupleElement],
 ) -> List[FreeVar]:
@@ -831,7 +847,7 @@ private pure func free_vars_tuple_elements(
 
 
 private pure func free_vars_record_fields(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	fields: List[CoreRecordFieldValue],
 ) -> List[FreeVar]:
@@ -847,7 +863,7 @@ private pure func free_vars_record_fields(
 
 
 private pure func free_vars_record_cow_fields(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	fields: List[CoreRecordCowField],
 ) -> List[FreeVar]:
@@ -867,7 +883,7 @@ private pure func free_vars_record_cow_fields(
 
 
 private pure func free_vars_dict_entries(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	entries: List[CoreDictEntry],
 ) -> List[FreeVar]:
@@ -887,7 +903,7 @@ private pure func free_vars_dict_entries(
 
 
 private pure func free_vars_dict_literal_entries(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	entries: List[CoreDictLiteralEntry],
 ) -> List[FreeVar]:
@@ -907,7 +923,7 @@ private pure func free_vars_dict_literal_entries(
 
 
 private pure func free_vars_tensor_payload(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	payload: CoreTensorLiteralPayload,
 ) -> List[FreeVar]:
@@ -919,7 +935,7 @@ private pure func free_vars_tensor_payload(
 
 
 private pure func free_vars_optional_expr(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	expr: Option[CoreExpr],
 ) -> List[FreeVar]:
@@ -931,7 +947,7 @@ private pure func free_vars_optional_expr(
 
 
 private pure func free_vars_literal_match_cases(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	cases: List[CoreLiteralMatchCase],
 ) -> List[FreeVar]:
@@ -948,7 +964,7 @@ private pure func free_vars_literal_match_cases(
 
 
 private pure func free_vars_literal_match_fallback(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	fallback: CoreLiteralMatchFallback,
 ) -> List[FreeVar]:
@@ -966,7 +982,7 @@ private pure func free_vars_literal_match_fallback(
 
 
 private pure func free_vars_constructor_match_body(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	body: CoreConstructorMatchBody,
 ) -> List[FreeVar]:
@@ -980,7 +996,7 @@ private pure func free_vars_constructor_match_body(
 
 
 private pure func free_vars_constructor_match_cases(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	cases: List[CoreConstructorMatchCase],
 ) -> List[FreeVar]:
@@ -997,7 +1013,7 @@ private pure func free_vars_constructor_match_cases(
 
 
 private pure func free_vars_constructor_match_fallback(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	fallback: CoreConstructorMatchFallback,
 ) -> List[FreeVar]:
@@ -1015,7 +1031,7 @@ private pure func free_vars_constructor_match_fallback(
 
 
 private pure func free_vars_constructor_literal_match(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	match_expr: CoreConstructorLiteralMatch,
 ) -> List[FreeVar]:
@@ -1027,7 +1043,7 @@ private pure func free_vars_constructor_literal_match(
 
 
 private pure func free_vars_constructor_length_branch(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	branch: CoreConstructorLengthMatchBranch,
 ) -> List[FreeVar]:
@@ -1039,7 +1055,7 @@ private pure func free_vars_constructor_length_branch(
 
 
 private pure func free_vars_constructor_length_cases(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	cases: List[CoreConstructorLengthMatchCase],
 ) -> List[FreeVar]:
@@ -1055,7 +1071,7 @@ private pure func free_vars_constructor_length_cases(
 
 
 private pure func free_vars_constructor_length_geq(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	geq: Option[CoreConstructorLengthMatchGeq],
 ) -> List[FreeVar]:
@@ -1067,7 +1083,7 @@ private pure func free_vars_constructor_length_geq(
 
 
 private pure func free_vars_constructor_length_fallback(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	fallback: Option[CoreConstructorLengthMatchBranch],
 ) -> List[FreeVar]:
@@ -1079,7 +1095,7 @@ private pure func free_vars_constructor_length_fallback(
 
 
 private pure func free_vars_constructor_length_match(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	match_expr: CoreConstructorLengthMatch,
 ) -> List[FreeVar]:
@@ -1095,7 +1111,7 @@ private pure func free_vars_constructor_length_match(
 
 
 private pure func free_vars_select_arm_kind(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	kind: CoreSelectArmKind,
 ) -> List[FreeVar]:
@@ -1109,7 +1125,7 @@ private pure func free_vars_select_arm_kind(
 
 
 private pure func free_vars_select_arm(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	arm: CoreSelectArm,
 ) -> List[FreeVar]:
@@ -1128,7 +1144,7 @@ private pure func free_vars_select_arm(
 
 
 private pure func free_vars_select_arms(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	arms: List[CoreSelectArm],
 ) -> List[FreeVar]:
@@ -1144,7 +1160,7 @@ private pure func free_vars_select_arms(
 
 
 private pure func free_vars_sequence(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> List[FreeVar]:
@@ -1169,7 +1185,7 @@ private pure func free_vars_sequence(
 
 
 private pure func free_vars_expr(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	bound: List[String],
 	expr: CoreExpr,
 ) -> List[FreeVar]:
@@ -1802,7 +1818,7 @@ private pure func next_task_name(state: ClosureState) -> FreshHoistedName:
 
 
 private pure func captures_from_body(
-	facts: ClosureFacts,
+	facts: ClosureDefinitionFacts,
 	local_bound: List[String],
 	body: CoreExpr,
 ) -> List[FreeVar]:
@@ -1820,18 +1836,14 @@ pure func lambda_runtime_captures(
 	params: List[CoreParam],
 	body: CoreExpr,
 ) -> List[CoreClosureCapture]:
-	facts: ClosureFacts = {
-		mode = ConvertClosures,
-		current_module = None,
-		enclosing_def_id = NO_ENCLOSING_DEFINITION,
-		functions_by_id = {},
-		function_collisions_by_id = {},
-		functions_by_name = {},
+	definitions: ClosureDefinitionFacts = {
 		function_definitions = function_definitions,
 		constructor_definitions = constructor_definitions
 	}
 
-	closure_captures_from_free_vars(captures_from_body(facts, add_bound_params([], params), body))
+	closure_captures_from_free_vars(
+		captures_from_body(definitions, add_bound_params([], params), body),
+	)
 
 
 pure func lambda_has_runtime_captures(
@@ -3353,7 +3365,7 @@ private pure func function_target_for_var(
 	facts: ClosureFacts,
 	variable: CoreVar,
 ) -> Option[CoreFunction]:
-	by_name: Option[CoreFunction] = match facts.functions_by_name.get_or(variable.name, []):
+	by_name: Option[CoreFunction] = match facts.program.functions_by_name.get_or(variable.name, []):
 		[only]:
 			Some(only)
 		_:
@@ -3361,7 +3373,7 @@ private pure func function_target_for_var(
 
 	match variable.def_id:
 		Some(def_id):
-			match facts.function_collisions_by_id.get(def_id):
+			match facts.program.function_collisions_by_id.get(def_id):
 				Some(candidates):
 					var exact: Option[CoreFunction] = None
 
@@ -3377,7 +3389,7 @@ private pure func function_target_for_var(
 						None:
 							by_name
 				None:
-					match facts.functions_by_id.get(def_id):
+					match facts.program.functions_by_id.get(def_id):
 						Some(target):
 							Some(target)
 						None:
@@ -3414,10 +3426,10 @@ private pure func adapt_var_expr(
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
 	if (
-		facts.mode == ConvertClosures
+		facts.program.mode == ConvertClosures
 		or not is_closure_value_type(typ)
 		or bound.contains(variable.name)
-		or variable_references_definition(variable, facts.constructor_definitions)
+		or variable_references_definition(variable, facts.program.definitions.constructor_definitions)
 	):
 		{
 			state = state,
@@ -3479,7 +3491,7 @@ private pure func adapt_var_expr(
 							),
 							is_pure = signature.is_pure,
 							function_kind = ClosureBodyFunction(abi),
-							origin = EtaExpansion(target.def_id),
+							origin = Declared(EtaExpansion(target.def_id)),
 							def_id = fresh.def_id,
 							loc = loc
 						}
@@ -3521,7 +3533,7 @@ private pure func hoist_lambda(
 	loc: CoreSourceLoc,
 ) -> HoistedClosureCreate:
 	free_vars: List[FreeVar] = captures_from_body(
-		facts,
+		facts.program.definitions,
 		add_bound_params([], params),
 		body,
 	)
@@ -3543,7 +3555,7 @@ private pure func hoist_lambda(
 		body = Some(body),
 		is_pure = is_pure,
 		function_kind = ClosureBodyFunction(abi),
-		origin = HoistedLambda(facts.enclosing_def_id, fresh.ordinal),
+		origin = Declared(HoistedLambda(facts.enclosing_def_id, fresh.ordinal)),
 		def_id = fresh.def_id,
 		loc = loc
 	}
@@ -3601,7 +3613,7 @@ private pure func hoist_task(
 		body = Some(balanced_body),
 		is_pure = False,
 		function_kind = ClosureBodyFunction(abi),
-		origin = HoistedTask(facts.enclosing_def_id, fresh.ordinal),
+		origin = Declared(HoistedTask(facts.enclosing_def_id, fresh.ordinal)),
 		def_id = fresh.def_id,
 		loc = loc
 	}
@@ -3628,7 +3640,7 @@ private pure func hoist_copy_task(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> HoistedTaskClosure:
-	free_vars: List[FreeVar] = captures_from_body(facts, local_bound, body)
+	free_vars: List[FreeVar] = captures_from_body(facts.program.definitions, local_bound, body)
 	captures: List[CoreTaskCapture] = free_vars.map(
 		func(free_var): task_capture_from_free_var(free_var, TaskCopyCapture),
 	)
@@ -3646,7 +3658,7 @@ private pure func hoist_loop_task(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> HoistedTaskClosure:
-	free_vars: List[FreeVar] = captures_from_body(facts, local_bound, body)
+	free_vars: List[FreeVar] = captures_from_body(facts.program.definitions, local_bound, body)
 	captures: List[CoreTaskCapture] = task_captures_for_loop(free_vars, loop_variable, item_mode)
 	hoist_task(facts, state, capturable, local_bound, body, return_type, captures, loc)
 
@@ -4705,7 +4717,7 @@ private pure func convert_call_expr(
 	loc: CoreSourceLoc,
 ) -> ConvertedExpr:
 	callee_converted: ConvertedExpr = if (
-		facts.mode == AdaptFunctionRefs
+		facts.program.mode == AdaptFunctionRefs
 		and not call_kind_uses_runtime_callee(kind)
 	):
 		{
@@ -5703,7 +5715,7 @@ private pure func convert_operator_expr(
 		PreClosureDetachExpr(detached, typ, loc):
 			body: ConvertedExpr = convert_expr(facts, state, bound, detached)
 
-			if facts.mode == AdaptFunctionRefs:
+			if facts.program.mode == AdaptFunctionRefs:
 				converted_with_child(
 					body,
 					detached,
@@ -6524,7 +6536,7 @@ private pure func convert_loop_expr(
 			body_bound: List[String] = add_bound_params(bound, params)
 			body_converted: ConvertedExpr = convert_expr(facts, state, body_bound, body)
 
-			if facts.mode == AdaptFunctionRefs:
+			if facts.program.mode == AdaptFunctionRefs:
 				converted_with_child(
 					body_converted,
 					body,
@@ -6915,7 +6927,7 @@ private pure func convert_concurrency_expr(
 			)
 			limit: ConvertedExpr = convert_expr(facts, timeout.state, bound, loop.limit)
 
-			if facts.mode == AdaptFunctionRefs:
+			if facts.program.mode == AdaptFunctionRefs:
 				if (
 					same_core_expr(iterable.expr, loop.iterable)
 					and same_core_expr(body.expr, loop.body)
@@ -7007,7 +7019,7 @@ private pure func convert_concurrency_expr(
 					)
 				}
 		PreClosureConcurrentExpr(block, typ, loc):
-			if facts.mode == AdaptFunctionRefs:
+			if facts.program.mode == AdaptFunctionRefs:
 				var current: ClosureState = state
 				var bindings: List[CorePreClosureConcurrentBinding] = block.bindings
 				var bindings_changed: Bool = False
@@ -7492,17 +7504,17 @@ Builds the read-only facts about `program` once: the pass mode and the
 lookup tables used throughout the walk. Delegates to `index_functions`,
 which already follows the local-mutation-then-publish builder shape.
 ---
-private pure func closure_facts(program: CoreProgram, mode: ClosurePassMode) -> ClosureFacts:
+private pure func closure_facts(program: CoreProgram, mode: ClosurePassMode) -> ClosureProgramFacts:
 	indexes: FunctionIndexes = index_functions(program)
 	{
 		mode = mode,
-		current_module = None,
-		enclosing_def_id = NO_ENCLOSING_DEFINITION,
 		functions_by_id = indexes.by_id,
 		function_collisions_by_id = indexes.collisions_by_id,
 		functions_by_name = indexes.by_name,
-		function_definitions = capture_function_definitions(program),
-		constructor_definitions = capture_constructor_definitions(program)
+		definitions = {
+			function_definitions = capture_function_definitions(program),
+			constructor_definitions = capture_constructor_definitions(program)
+		}
 	}
 
 
@@ -7523,19 +7535,20 @@ private pure func initial_counters(next_def_id: Int, next_binder_id: Int) -> Clo
 
 
 private pure func convert_function(
-	facts: ClosureFacts,
+	program_facts: ClosureProgramFacts,
 	state: ClosureState,
 	decl: CoreDecl,
 	func_info: CoreFunction,
 ) -> ConvertedDecl:
 	match func_info.body:
 		Some(body):
-			facts_with_module: ClosureFacts = { facts |
+			facts: ClosureFacts = {
+				program = program_facts,
 				current_module = func_info.source_module,
 				enclosing_def_id = func_info.def_id
 			}
 			body_bound: List[String] = add_bound_params([], func_info.params)
-			converted: ConvertedExpr = convert_expr(facts_with_module, state, body_bound, body)
+			converted: ConvertedExpr = convert_expr(facts, state, body_bound, body)
 
 			if same_core_expr(converted.expr, body):
 				{
@@ -7555,13 +7568,17 @@ private pure func convert_function(
 
 
 private pure func convert_global(
-	facts: ClosureFacts,
+	program_facts: ClosureProgramFacts,
 	state: ClosureState,
 	decl: CoreDecl,
 	global: CoreGlobal,
 ) -> ConvertedDecl:
 	converted: ConvertedExpr = convert_expr(
-		{ facts | enclosing_def_id = global.def_id },
+		{
+			program = program_facts,
+			current_module = None,
+			enclosing_def_id = global.def_id
+		},
 		state,
 		[],
 		global.init,
@@ -7580,7 +7597,7 @@ private pure func convert_global(
 
 
 private pure func convert_decl(
-	facts: ClosureFacts,
+	facts: ClosureProgramFacts,
 	state: ClosureState,
 	decl: CoreDecl,
 ) -> ConvertedOptionalDecl:
@@ -7646,7 +7663,7 @@ private pure func convert_decl(
 
 
 private pure func convert_decls(
-	facts: ClosureFacts,
+	facts: ClosureProgramFacts,
 	state: ClosureState,
 	decls: List[CoreDecl],
 ) -> ConvertedDecls:

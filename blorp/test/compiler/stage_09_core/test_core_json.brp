@@ -140,17 +140,8 @@ import:
 		CoreFunction,
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunctionKind(ClosureBodyFunction, ForeignFunction, UserFunction),
-		CoreFunctionOrigin(
-			Entrypoint,
-			EtaExpansion,
-			HoistedLambda,
-			HoistedTask,
-			ImplMethod,
-			MonoInstance,
-			PureVariant,
-			SourceFunction,
-			Synthesized,
-		),
+		CoreDeclaredOrigin(Entrypoint, EtaExpansion, HoistedLambda, HoistedTask, ImplMethod, MonoInstance, PureVariant, SourceFunction),
+		CoreFunctionOrigin(Declared, Synthesized),
 		CoreMonoSubstitutionValue(DimPackSubstitution, DimSubstitution, TypeSubstitution),
 		CoreSynthesisKind(
 			BytesSynthesis,
@@ -4602,36 +4593,38 @@ pure func test_core_json_round_trips_source_function_origin_name_id() -> Bool:
 	name: NameId = name_id_from_interned_index(1234)
 
 	match decode_core_function_origin_json(
-		core_function_origin_to_json(SourceFunction(name)),
+		core_function_origin_to_json(Declared(SourceFunction(name))),
 		"origin",
 	):
-		Ok(SourceFunction(decoded)):
-			name_ids_equal(decoded, name) and origin_round_trips(SourceFunction(name))
+		Ok(Declared(SourceFunction(decoded))):
+			name_ids_equal(decoded, name) and origin_round_trips(Declared(SourceFunction(name)))
 		_:
 			False
 
 
 pure func test_core_json_round_trips_impl_method_origin() -> Bool:
 	origin_round_trips(
-		ImplMethod(name_id_from_interned_index(3), name_id_from_interned_index(4)),
+		Declared(ImplMethod(name_id_from_interned_index(3), name_id_from_interned_index(4))),
 	)
 
 
 pure func test_core_json_round_trips_pure_variant_origin() -> Bool:
-	origin_round_trips(PureVariant(17))
+	origin_round_trips(Declared(PureVariant(17)))
+
+
+pure func mono_instance_with_every_argument_kind() -> CoreDeclaredOrigin:
+	MonoInstance(
+		21,
+		[
+			("T", TypeSubstitution(list_int_type())),
+			("N", DimSubstitution(TensorStaticDim(4))),
+			("Ds", DimPackSubstitution([TensorStaticDim(2), TensorRuntimeDim("M")])),
+		],
+	)
 
 
 pure func test_core_json_round_trips_mono_instance_origin_with_every_argument_kind() -> Bool:
-	origin_round_trips(
-		MonoInstance(
-			21,
-			[
-				("T", TypeSubstitution(list_int_type())),
-				("N", DimSubstitution(TensorStaticDim(4))),
-				("Ds", DimPackSubstitution([TensorStaticDim(2), TensorRuntimeDim("M")])),
-			],
-		),
-	)
+	origin_round_trips(Declared(mono_instance_with_every_argument_kind()))
 
 
 pure func test_core_json_round_trips_synthesized_origin_keeping_declared_origin() -> Bool:
@@ -4671,16 +4664,19 @@ pure func test_core_json_round_trips_every_synthesis_kind() -> Bool:
 
 
 pure func test_core_json_round_trips_hoisted_origins() -> Bool:
-	origin_round_trips(HoistedLambda(30, 2)) and origin_round_trips(HoistedTask(31, 0))
+	(
+		origin_round_trips(Declared(HoistedLambda(30, 2)))
+		and origin_round_trips(Declared(HoistedTask(31, 0)))
+	)
 
 
 pure func test_core_json_round_trips_eta_expansion_origin() -> Bool:
-	origin_round_trips(EtaExpansion(44))
+	origin_round_trips(Declared(EtaExpansion(44)))
 
 
 pure func test_core_json_round_trips_entrypoint_origins() -> Bool:
-	origin_round_trips(Entrypoint(ProgramWrapperEntrypoint)) and origin_round_trips(
-		Entrypoint(UserMainEntrypoint),
+	origin_round_trips(Declared(Entrypoint(ProgramWrapperEntrypoint))) and origin_round_trips(
+		Declared(Entrypoint(UserMainEntrypoint)),
 	)
 
 
@@ -4691,6 +4687,87 @@ pure func test_core_json_rejects_unknown_origin_tag() -> Bool:
 	):
 		Err(CoreUnsupportedTag(_, tag)):
 			tag == "ufcs_wrapper"
+		_:
+			False
+
+
+pure func origin_object(fields: List[(String, JsonValue)]) -> JsonValue:
+	JsonObject(fields)
+
+
+pure func origin_decode_fails_with_tag(value: JsonValue, expected_tag: String) -> Bool:
+	match decode_core_function_origin_json(value, "origin"):
+		Err(CoreUnsupportedTag(_, tag)):
+			tag == expected_tag
+		_:
+			False
+
+
+pure func test_core_json_rejects_unknown_synthesis_kind() -> Bool:
+	origin_decode_fails_with_tag(
+		origin_object([
+			("kind", JsonString("synthesized")),
+			("synthesis", JsonString("quantum")),
+			("declared_as", core_function_origin_to_json(Declared(PureVariant(1)))),
+		]),
+		"quantum",
+	)
+
+
+pure func test_core_json_rejects_unknown_entrypoint_kind() -> Bool:
+	origin_decode_fails_with_tag(
+		origin_object([("kind", JsonString("entrypoint")), ("entrypoint", JsonString("second_main"))]),
+		"second_main",
+	)
+
+
+pure func test_core_json_rejects_malformed_substitution_kind() -> Bool:
+	origin_decode_fails_with_tag(
+		origin_object([
+			("kind", JsonString("mono_instance")),
+			("base_def", JsonNumber(1.0)),
+			(
+				"arguments",
+				JsonVector([
+					origin_object([
+						("parameter", JsonString("T")),
+						("value", origin_object([("kind", JsonString("lifetime"))])),
+					]),
+				]),
+			),
+		]),
+		"lifetime",
+	)
+
+
+pure func test_core_json_rejects_malformed_declared_as() -> Bool:
+	unknown_tag: Bool = origin_decode_fails_with_tag(
+		origin_object([
+			("kind", JsonString("synthesized")),
+			("synthesis", JsonString("tensor")),
+			("declared_as", origin_object([("kind", JsonString("synthesized"))])),
+		]),
+		"synthesized",
+	)
+	missing: Bool = match decode_core_function_origin_json(
+		origin_object([("kind", JsonString("synthesized")), ("synthesis", JsonString("tensor"))]),
+		"origin",
+	):
+		Err(CoreMissingField(_, field_name)):
+			field_name == "declared_as"
+		_:
+			False
+
+	unknown_tag and missing
+
+
+pure func test_core_json_rejects_negative_name_id() -> Bool:
+	match decode_core_function_origin_json(
+		origin_object([("kind", JsonString("source_function")), ("name", JsonNumber(-1.0))]),
+		"origin",
+	):
+		Err(CoreExpectedIntField(_, field_name)):
+			field_name == "name"
 		_:
 			False
 
@@ -6525,5 +6602,13 @@ tests: TestSuite = {
 		("Core JSON round trips entrypoint origins", test_core_json_round_trips_entrypoint_origins),
 		("Core JSON rejects unknown origin tag", test_core_json_rejects_unknown_origin_tag),
 		("Core JSON rejects function without origin", test_core_json_rejects_function_without_origin),
+		("Core JSON rejects unknown synthesis kind", test_core_json_rejects_unknown_synthesis_kind),
+		("Core JSON rejects unknown entrypoint kind", test_core_json_rejects_unknown_entrypoint_kind),
+		(
+			"Core JSON rejects malformed substitution kind",
+			test_core_json_rejects_malformed_substitution_kind,
+		),
+		("Core JSON rejects malformed declared origin", test_core_json_rejects_malformed_declared_as),
+		("Core JSON rejects negative name id", test_core_json_rejects_negative_name_id),
 	]
 }
