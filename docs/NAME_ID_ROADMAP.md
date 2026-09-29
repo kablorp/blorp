@@ -103,6 +103,7 @@ becomes permanent by being forgotten.
 | Span-derived positive binder ids for authored binders | B0/B1a | A1b (parser-minted ids) |
 | One sigil read left in `type_parameter_name_kind` (`List[String]` type parameters) | D7 (230835a0b) | type interning, when type-parameter lists carry kinds |
 | `--dump-core` JSON carries both name Strings and ids | A0 | A5 |
+| `.text` reads left after A4c: 13 name-data copies in `stage_07_ctfe/ir.brp` (CTFE IR bindings and assignment targets) and 2 key comparisons in `typed_ast_json.brp` | A4c | A5 (when CTFE IR and those keys carry ids) |
 | Standalone graphs (`graph_source_name_table_for_programs`) give identifiers ids from private per-program tables; rendering there is `.text`-only (`SpellingsFromIdentifierText`) | A4a | before A5: standalone graphs share the discovery table |
 | `.text` lookups in type header resolution (`declared_unqualified_type`, `type_header_graph_has_unqualified_type_name`, `resolve_named_type`) kept beside `identifier.name` for import, alias and parameter lookups keyed by String | A2 | A4/A5 |
 
