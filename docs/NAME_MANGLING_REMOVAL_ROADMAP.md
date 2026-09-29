@@ -87,7 +87,7 @@ is reduced to the display renderer.
 | --- | --- | --- | --- |
 | M5.1 | Payload `CoreType` in `CoreStackOptionRepresentation`, `StructBox`, the inline-struct and boxed-element storage variants; the emitter renders the C type; delete `resolved_stack_option_type_name`, `resolved_inline_struct_c_type`, `resolved_boxed_element_c_type` and the nine copies of the `blorp_StackOption_` spelling (census in the T6 report, `benchmarks/results/`; `blorp_StackResult` is an ABI constant and stays). The `StackOption*ConstructorTest(String)` variants in `match_projection.brp` carry the type | `c_type_layout.brp`, `list_layout.brp`, `prepare.brp`, `collection_pipeline.brp`, `specialize_collection.brp`, `specialize_layout.brp`, `synth_list.brp`, `match_projection.brp`, `emit.brp` | F11 (10 readers, 15 producers) |
 | M5.2 | Packed-enum `to_string` becomes a `CoreCallKind` case carrying the enum type; the `_f64`/`_f32` width becomes a field of the checked-get call | `specialize_value.brp`, `specialize_tensor_dispatch.brp`, `emit.brp`, `ownership.brp` | F11 remainder |
-| M5.3 | Qualified type names: type references carry the type's `DefinitionId` (or `ModuleId` plus `NameId`); the 98 literal triples (`Stream` / `stream::Stream` / `stream__Stream`) in `operation_metadata.brp`, `c_type_layout.brp`, `unmanaged_type.brp`, `type_policy.brp`, `type_name_metadata.brp`, `prepare.brp` become comparisons with pinned type ids; `split_canonical_module_type_name` and `identity.brp`'s second `::` parser delete | shared with the type-interning roadmap (D9); the pinned-id literal conversion can go first as its own step | F12 (101) |
+| M5.3 | Qualified type names; sliced Q0 to Q5 in "M5.3 slices" below | see below | F12 (95 literal lines, about 24 predicate callers, 4 parsers) |
 | M5.4 | Dimension sigil: route `mono.brp:367` through the kind, then delete `type_parameter_name_kind`'s sigil read once `List[String]` type-parameter lists carry kinds | `mono.brp`, `semantic_type.brp` | F13 (32) |
 | M5.5 | Tuple field access parsed as `NamedField(NameId) \| TupleIndex(Int)` by the parser; the five decimal readers go | `parsed_ast.brp`, `language_parser.brp`, `infer.brp`, CTFE `ir.brp`, `lower.brp`, formatter | F14 (5) |
 
@@ -96,6 +96,67 @@ is reduced to the display renderer.
 | Step | What | Files | Allowlist |
 | --- | --- | --- | --- |
 | M6.1 | The 169 `__x_<seed>` emitter temporaries use the existing compact temp scheme driven by an `EmitterTempKind` enum; `is_generated_temp_value` becomes an explicit field set where the temp is created | `emit.brp`, `prepared_*_renderer.brp` | F18 (169 producers, 1 reader) |
+
+
+## M5.3 slices: qualified type names
+
+Census: `benchmarks/results/qualified_type_name_census_2026-09-29.md`.
+Every slice is byte-identical C, deletes Strings or comparisons in its own
+commit, and is gated by the family rule above plus the slice-specific
+gate named here.
+
+Why the current shape exists: a stdlib type is bare inside its own module
+and for names on `is_global_abi_type_name`, `module::T` in an importer
+(typecheck), and `module__T` after `lower.brp:1429` flattens it (Core).
+Readers were written to accept all three; most of the `::` arms in Core
+readers and `__` arms in typecheck readers are expected to be dead, and
+`type_name_metadata.brp` lists all three only because pre-flatten and
+post-flatten readers share it.
+
+Identity today: `TypeId` (a `DefinitionId`) plus `owner_module_id` exist
+in header resolution and are dropped when
+`type_header_install.brp` builds the `SemanticNamedType` String.
+`SemanticNamedType` (255 source, 457 test uses) and `NamedType` (465
+source, 1000 test uses) carry only a String, so no reader can compare
+identities until a field is added; that field is the named-types family
+of `CORE_ID_MIGRATION.md` A10 and the key of `TYPE_INTERNING_ROADMAP.md`
+I5. The pin is `(std module origin, NameId)` resolved to a
+`KnownStdlibType` once per declaration, not a literal `DefinitionId`.
+
+| Slice | What | Sites | Deletes | Extra gate |
+| --- | --- | --- | --- | --- |
+| Q0 | Dead-arm probe. On a scratch branch (not committed), count which spelling each reader arm matches over the self-compile, `scripts/test compiler-blorp`, and the runtime and package corpora. Record the table in the census. Add fixtures first for the two unsound cases: a user type named `Stream` or `Channel`, and an imported std type not on the ABI list | 95 arms | nothing (evidence) | table shows zero hits for each arm Q1 deletes |
+| Q1 | Delete the dead arms. Split `type_name_metadata.brp` into a typecheck-form and a Core-form module (or two predicate families) so each phase lists only its own spellings; drop `::` arms from Core readers and `__` arms from typecheck readers. Flat-only `net_*__` arms stay | about 40 to 50 literals, 7 files | those literals | Q0 table; identical C |
+| Q2a | `KnownStdlibType` enum and one `known_stdlib_type_of_semantic_name` / `known_stdlib_type_of_core_name` pair in one new module (the only file with type-name literals). Move the typecheck-side readers: the 4 `type_name_metadata` predicates, 15 `infer.brp` uses, `decl.brp` 2, `env.brp` 1, `lower.brp` 4, the two `Duration` readers, `CANONICAL_PARALLEL_*` | about 25 call sites, 12 literals | 12 literals and the private predicates | `scripts/compiler-check --stage typecheck`; identical C |
+| Q2b | Move the Core readers to the enum: `type_policy` (11), `c_type_layout` (13), `unmanaged_type` (13), `prepare` (6), `desugar` (2), `late_invariants` (1), `specialize_collection` (1) | 47 literals, 7 files | those literals | `scripts/test compiler-core-sanitize leak`; codegen audit; identical C |
+| Q2c | `operation_metadata.brp`: `accepted_type_names: List[String]` and the `ExactSuccessType([...])` / `resource_success([...])` lists become `List[KnownStdlibType]`; the two compiler-private LSP types become a `ModulePathType(canonical path, name)` case, not a stdlib pin | 38 literals, 1 file, 24 lists | those literals | operation-metadata suites; identical C |
+| Q3 | Identity beside the String. `SemanticNamedType` and `NamedType` gain a nominal-identity field (`NoNominalIdentity`, `DeclaredNominal(TypeId)`, `IntrinsicNominal(IntrinsicType)`), written by header install (`type_header_install.brp:195-201, :353`, the four accepted graphs) and by lowering copying it from the semantic type. Mechanical arity change done with a script and a smart constructor; equality stays String-only in this slice. Belongs to A10 item 1; the typechecker producers without an id (`types.brp:92`, `qualify_module_local_types`, `type_resolution.brp:123`) get it from one env lookup | 720 source and 1457 test occurrences (patterns), about 14 producers | none (adds a field) | compiler-check all stages; typed-AST JSON tests; identical C; allocation counts (a wider variant is a measured cost, see I3) |
+| Q4 | `known_stdlib_type_of_*` reads the identity (per-declaration classification stored on `TypeHeader`) instead of the String; the two string-to-enum constructors and the `is_global_abi_type_name` list, `normalize_type_name`'s `Vector`/`Matrix` fold and the 60-name list's readers go. `net_*` package types classify by module origin through the same path | about 30 literals, 60-name list | the constructor tables | same-named-type-in-two-modules fixtures (Q0); identical C |
+| Q5 | Delete the parsers. `SemanticQualifiedNamedType(alias, name)` replaces `alias.Name` (`types.brp:92`, `type_resolution.brp:112`); `display_type_name` renders from identity plus the module table; `split_canonical_module_type_name`, `split_qualified_type_name`, `owner_local_type_name` and the `::` parse in `identity.brp:160` go with M3.1 (Core stops flattening by String) | 4 parsers, 3 helpers | the parsers | 860 diagnostic fixtures; `type_name` intrinsic tests; identical C |
+
+Sequencing. Q0, Q1, Q2a to Q2c need no representation change and can run
+now, one landing at a time; Q2 is on the path (not a bounded detour)
+because it converts each reader exactly once, to an enum whose constructor
+Q4 later swaps, so no reader is edited twice. Q3 must land as its own
+change, with no simultaneous change to type equality or emitted C naming
+(A10 rule), and before `TYPE_INTERNING_ROADMAP.md` I4 and I5 (I5 keys
+dispatch and layout by this same identity). Q3 and Q4 are the A10
+named-types cut; do not run a second migration. Q5 needs M3.1 (Core
+function and type names stop being built by String) and I1's landed
+offset-returning split.
+
+Risks and how the gates catch them.
+
+| Risk | Slice | Catch |
+| --- | --- | --- |
+| A dead-looking arm is live (a Core name built without flattening, or a pass that renames) | Q1 | Q0 hit table; an arm with any hit stays and is listed |
+| Bare spelling collides with a user type of the same name | Q2, Q4 | Q0 fixture (user `Stream` in a user module); Q4 must classify by module origin and make it pass |
+| Mono-specialized data types (`mangle_generic_data_name`) | Q2b, Q4 | readers test unspecialized names of fixed arity; add a fixture with a generic user record whose name spells a stdlib type; the emitted-C identity gate |
+| Flat names for builtins, tensors and tuples (no declaration, no `TypeId`) | Q3, Q4 | `IntrinsicNominal` and `NoNominalIdentity` are explicit cases; tensors and tuples keep their own variants; a reader receiving `NoNominalIdentity` for a pinned type fails a Core invariant, not a fallback to the String |
+| `net_*` and other `pkg/` types in a stdlib vocabulary | Q2b, Q4 | classify by module origin, not by a stdlib enum; package tests (`scripts/test package`) |
+| Compiler-private LSP types named by source path | Q2c | `ModulePathType` case; `scripts/test lsp` |
+| Display text changes (`stream.Stream`, `Tuple` compare in `core_type_to_string`) | Q5 | 860 diagnostic fixtures and `type_name` tests; move the `"Tuple"` comparison to a variant match first |
+| Wider `NamedType` costs allocations | Q3 | `benchmarks/self_compile_measure --stage2` allocation rows; stop and reassess if `core_lowering_complete` moves as in the parked I3 |
 
 ## Order and parallelism
 
