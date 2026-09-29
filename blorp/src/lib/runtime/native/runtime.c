@@ -8681,9 +8681,8 @@ static unsigned long blorp_long_magnitude(long value) {
         : (unsigned long)value;
 }
 
-static size_t blorp_long_decimal_width(long value) {
-    size_t width = value < 0 ? 1 : 0;
-    unsigned long magnitude = blorp_long_magnitude(value);
+static size_t blorp_unsigned_decimal_width(unsigned long magnitude) {
+    size_t width = 0;
     do {
         width++;
         magnitude /= 10UL;
@@ -8691,13 +8690,23 @@ static size_t blorp_long_decimal_width(long value) {
     return width;
 }
 
-static int blorp_format_long_decimal(char* buf, size_t buf_len, long value) {
+static size_t blorp_long_decimal_width(long value) {
+    return (value < 0 ? 1 : 0) + blorp_unsigned_decimal_width(blorp_long_magnitude(value));
+}
+
+// Writes an optional '-' and the decimal digits of magnitude into buf,
+// right-aligned then shifted to the front; returns the length, or 0 when
+// buf is too small. Signed and unsigned formatters share this so UInt64
+// values above Int's range print their full unsigned magnitude.
+static int blorp_format_decimal_magnitude(
+    char* buf,
+    size_t buf_len,
+    bool negative,
+    unsigned long magnitude
+) {
     if (buf_len == 0) return 0;
 
     size_t pos = buf_len;
-    bool negative = value < 0;
-    unsigned long magnitude = blorp_long_magnitude(value);
-
     do {
         if (pos == 0) return 0;
         buf[--pos] = (char)('0' + (magnitude % 10UL));
@@ -8712,6 +8721,15 @@ static int blorp_format_long_decimal(char* buf, size_t buf_len, long value) {
     int len = (int)(buf_len - pos);
     if (pos != 0) memmove(buf, buf + pos, (size_t)len);
     return len;
+}
+
+static int blorp_format_long_decimal(char* buf, size_t buf_len, long value) {
+    return blorp_format_decimal_magnitude(
+        buf, buf_len, value < 0, blorp_long_magnitude(value));
+}
+
+static int blorp_format_unsigned_decimal(char* buf, size_t buf_len, unsigned long value) {
+    return blorp_format_decimal_magnitude(buf, buf_len, false, value);
 }
 
 // IR intrinsic: allocate an empty mutable string with given byte capacity.
@@ -8889,6 +8907,12 @@ blorp_String* blorp_to_string(long i) {
     char buf[32];
     int len = blorp_format_long_decimal(buf, sizeof(buf), i);
     if (len < 0) len = 0;
+    return blorp_string_from_buf(buf, len);
+}
+
+blorp_String* blorp_uint64_to_string(uint64_t value) {
+    char buf[32];
+    int len = blorp_format_unsigned_decimal(buf, sizeof(buf), (unsigned long)value);
     return blorp_string_from_buf(buf, len);
 }
 
@@ -12918,24 +12942,42 @@ typedef enum {
     BLORP_LIST_INT_ELEMENT_UINT8,
     BLORP_LIST_INT_ELEMENT_UINT16,
     BLORP_LIST_INT_ELEMENT_UINT32,
+    BLORP_LIST_INT_ELEMENT_UINT64,
 } blorp_ListIntElement;
 
-static inline long blorp_list_int_element_at(
+// Sign and magnitude of one list element, so UInt64 elements above Int's
+// range keep their unsigned value instead of passing through a signed long.
+typedef struct {
+    bool negative;
+    unsigned long magnitude;
+} blorp_ListIntDecimal;
+
+static inline blorp_ListIntDecimal blorp_list_int_decimal_from_long(long value) {
+    return (blorp_ListIntDecimal){ value < 0, blorp_long_magnitude(value) };
+}
+
+static inline blorp_ListIntDecimal blorp_list_int_element_at(
     blorp_List* list,
     long index,
     blorp_ListIntElement element
 ) {
     uintptr_t bits = (uintptr_t)blorp_list_get(list, index);
     switch (element) {
-        case BLORP_LIST_INT_ELEMENT_INT8: return (long)(int8_t)bits;
-        case BLORP_LIST_INT_ELEMENT_INT16: return (long)(int16_t)bits;
-        case BLORP_LIST_INT_ELEMENT_INT32: return (long)(int32_t)bits;
-        case BLORP_LIST_INT_ELEMENT_UINT8: return (long)(uint8_t)bits;
-        case BLORP_LIST_INT_ELEMENT_UINT16: return (long)(uint16_t)bits;
-        case BLORP_LIST_INT_ELEMENT_UINT32: return (long)(uint32_t)bits;
+        case BLORP_LIST_INT_ELEMENT_INT8: return blorp_list_int_decimal_from_long((int8_t)bits);
+        case BLORP_LIST_INT_ELEMENT_INT16: return blorp_list_int_decimal_from_long((int16_t)bits);
+        case BLORP_LIST_INT_ELEMENT_INT32: return blorp_list_int_decimal_from_long((int32_t)bits);
+        case BLORP_LIST_INT_ELEMENT_UINT8: return blorp_list_int_decimal_from_long((uint8_t)bits);
+        case BLORP_LIST_INT_ELEMENT_UINT16: return blorp_list_int_decimal_from_long((uint16_t)bits);
+        case BLORP_LIST_INT_ELEMENT_UINT32: return blorp_list_int_decimal_from_long((uint32_t)bits);
+        case BLORP_LIST_INT_ELEMENT_UINT64:
+            return (blorp_ListIntDecimal){ false, (unsigned long)(uint64_t)bits };
         case BLORP_LIST_INT_ELEMENT_LONG: break;
     }
-    return (long)bits;
+    return blorp_list_int_decimal_from_long((long)bits);
+}
+
+static inline size_t blorp_list_int_decimal_width(blorp_ListIntDecimal value) {
+    return (value.negative ? 1 : 0) + blorp_unsigned_decimal_width(value.magnitude);
 }
 
 // List to_string: format as [1, 2, 3]
@@ -12952,7 +12994,7 @@ static blorp_String* blorp_list_to_string_integers(
         if (i > 0) output_size = blorp_checked_add(output_size, 2);
         output_size = blorp_checked_add(
             output_size,
-            blorp_long_decimal_width(blorp_list_int_element_at(list, i, element))
+            blorp_list_int_decimal_width(blorp_list_int_element_at(list, i, element))
         );
     }
     if (output_size > (size_t)LONG_MAX) {
@@ -12968,9 +13010,10 @@ static blorp_String* blorp_list_to_string_integers(
             result->data[pos++] = ',';
             result->data[pos++] = ' ';
         }
-        long value = blorp_list_int_element_at(list, i, element);
-        size_t width = blorp_long_decimal_width(value);
-        blorp_format_long_decimal(result->data + pos, width, value);
+        blorp_ListIntDecimal value = blorp_list_int_element_at(list, i, element);
+        size_t width = blorp_list_int_decimal_width(value);
+        blorp_format_decimal_magnitude(
+            result->data + pos, width, value.negative, value.magnitude);
         pos += width;
     }
     result->data[pos++] = ']';
@@ -13004,6 +13047,10 @@ blorp_String* blorp_list_to_string_uint16(blorp_List* list) {
 
 blorp_String* blorp_list_to_string_uint32(blorp_List* list) {
     return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_UINT32);
+}
+
+blorp_String* blorp_list_to_string_uint64(blorp_List* list) {
+    return blorp_list_to_string_integers(list, BLORP_LIST_INT_ELEMENT_UINT64);
 }
 
 blorp_String* blorp_list_to_string_float(blorp_List* list) {

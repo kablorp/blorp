@@ -5,7 +5,9 @@ import:
 			ParsedAddOp,
 			ParsedDivideOp,
 			ParsedEqualOp,
+			ParsedGreaterEqualOp,
 			ParsedGreaterOp,
+			ParsedLessOp,
 			ParsedModuloOp,
 			ParsedNotEqualOp,
 		),
@@ -35,6 +37,9 @@ import:
 		ctfe_eval_unary,
 		ctfe_float,
 		ctfe_int,
+		ctfe_int_literal,
+		ctfe_int_literal_bits,
+		ctfe_int_value_text,
 		ctfe_string,
 		ctfe_value,
 		ctfe_values_equal,
@@ -286,10 +291,80 @@ func test_error_messages_are_user_facing() -> Bool:
 	ctfe_error_message(err) == "compile-time constant evaluation expected Int, found String"
 
 
+---
+UInt64 literals above Int's range keep their 64-bit pattern instead of
+saturating, and render unsigned so compile-time text matches the runtime.
+---
+pure func test_uint64_literal_bits_render_unsigned() -> Bool:
+	uint64 = SemanticNamedType("UInt64", [])
+	max_bits = ctfe_int_literal_bits("18446744073709551615")
+	half_bits = ctfe_int_literal_bits("9223372036854775808")
+	(
+		max_bits == -1
+		and ctfe_int_literal_bits("42") == 42
+		and ctfe_int_literal_bits("-42") == -42
+		and ctfe_int_literal_bits("-9223372036854775808") == -9223372036854775807 - 1
+		and ctfe_int_literal_bits("9223372036854775807") == 9223372036854775807
+		and ctfe_int_value_text(uint64, max_bits) == "18446744073709551615"
+		and ctfe_int_value_text(uint64, half_bits) == "9223372036854775808"
+		and ctfe_int_value_text(uint64, ctfe_int_literal_bits("18446744073709551610")) == "18446744073709551610"
+		and ctfe_int_value_text(uint64, 7) == "7"
+		and ctfe_int_value_text(TYPE_INT, max_bits) == "-1"
+	)
+
+
+pure func uint64_value(text: String) -> CtfeValue:
+	ctfe_int_literal(SemanticNamedType("UInt64", []), fixture_source_span(), text)
+
+
+---
+UInt64 division, modulo, and ordering read the 64-bit bits as unsigned, like
+the runtime's C uint64_t arithmetic, including divisors of at least 2^63.
+---
+pure func test_uint64_binary_ops_are_unsigned() -> Bool:
+	max = uint64_value("18446744073709551615")
+	half = uint64_value("9223372036854775808")
+	above_half = uint64_value("9223372036854775809")
+	near_max = uint64_value("18446744073709551610")
+	two = uint64_value("2")
+	(
+		result_value_equal(
+			ctfe_eval_binary(ParsedDivideOp, max, two),
+			uint64_value("9223372036854775807"),
+		)
+		and result_value_equal(
+			ctfe_eval_binary(ParsedDivideOp, max, uint64_value("10")),
+			uint64_value("1844674407370955161"),
+		)
+		and result_value_equal(
+			ctfe_eval_binary(ParsedModuloOp, max, uint64_value("10")),
+			uint64_value("5"),
+		)
+		and result_value_equal(
+			ctfe_eval_binary(ParsedDivideOp, max, uint64_value("3")),
+			uint64_value("6148914691236517205"),
+		)
+		and result_value_equal(ctfe_eval_binary(ParsedDivideOp, near_max, above_half), uint64_value("1"))
+		and result_value_equal(
+			ctfe_eval_binary(ParsedModuloOp, near_max, above_half),
+			uint64_value("9223372036854775801"),
+		)
+		and result_value_equal(ctfe_eval_binary(ParsedDivideOp, half, above_half), uint64_value("0"))
+		and result_value_equal(ctfe_eval_binary(ParsedDivideOp, max, uint64_value("0")), uint64_value("0"))
+		and result_value_equal(ctfe_eval_binary(ParsedGreaterOp, max, two), bool_value(True))
+		and result_value_equal(ctfe_eval_binary(ParsedLessOp, two, half), bool_value(True))
+		and result_value_equal(ctfe_eval_binary(ParsedGreaterEqualOp, half, max), bool_value(False))
+		and result_value_equal(ctfe_eval_binary(ParsedDivideOp, int_value(-7), int_value(2)), int_value(-3))
+		and result_value_equal(ctfe_eval_binary(ParsedLessOp, int_value(-1), int_value(2)), bool_value(True))
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler CTFE value",
 	tests = [
 		("value equality is structural", test_value_equality_is_structural),
+		("UInt64 literal bits render unsigned", test_uint64_literal_bits_render_unsigned),
+		("UInt64 binary ops are unsigned", test_uint64_binary_ops_are_unsigned),
 		(
 			"constructor and dict equality are structural",
 			test_constructor_and_dict_equality_are_structural,

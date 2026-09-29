@@ -250,6 +250,103 @@ pure func ctfe_int(span: SourceLocation, value: Int) -> CtfeValue:
 	ctfe_value(TYPE_INT, CtfeIntValue(value), span)
 
 
+---
+Compile-time value of an integer literal of type `typ`. CTFE holds integers
+as 64-bit Int bits. A UInt64 literal is folded to its exact two's-complement
+bits and keeps its type, so formatting and unsigned operations read values
+above Int's range correctly. Other literals keep the `parse_int` reading and
+the Int type: Int128/UInt128 cannot be represented in 64 bits, and CTFE has no
+narrow-width semantics yet, so tagging them would only imply support.
+---
+pure func ctfe_int_literal(typ: SemanticType, span: SourceLocation, text: String) -> CtfeValue:
+	if ctfe_type_is_uint64(typ):
+		ctfe_value(typ, CtfeIntValue(ctfe_int_literal_bits(text)), span)
+	else:
+		ctfe_int(span, ctfe_int_literal_value(typ, text))
+
+
+---
+Int bits a literal pattern or literal of type `typ` denotes; see
+`ctfe_int_literal`.
+---
+pure func ctfe_int_literal_value(typ: SemanticType, text: String) -> Int:
+	if ctfe_type_is_uint64(typ):
+		ctfe_int_literal_bits(text)
+	else:
+		text
+			.parse_int()
+			.get_or(0)
+
+
+---
+Two's-complement bits of a decimal integer literal. Source literals are digit
+runs (negation is a separate unary operator); materialized CTFE values may add
+a leading '-'. The digit fold wraps like runtime Int arithmetic, so a UInt64
+literal above Int's range keeps its exact bits instead of saturating the way
+`parse_int` does. Text of any other shape keeps the old `parse_int` reading.
+---
+pure func ctfe_int_literal_bits(text: String) -> Int:
+	negative: Bool = text.starts_with("-")
+	digits: String = if negative:
+		text.substring(1, text.length() - 1)
+	else:
+		text
+	var magnitude: Int = 0
+	var well_formed: Bool = digits.length() > 0
+
+	for ch in digits:
+		if ch >= '0' and ch <= '9':
+			magnitude = magnitude * DECIMAL_RADIX + (to_int(ch) - to_int('0'))
+		else:
+			well_formed = False
+
+	if not well_formed:
+		text
+			.parse_int()
+			.get_or(0)
+	else if negative:
+		0 - magnitude
+	else:
+		magnitude
+
+
+private DECIMAL_RADIX: Int = 10
+
+-- 2^63 = UINT64_HALF_RANGE_TENS * 10 + UINT64_HALF_RANGE_ONES. Splitting the
+-- offset keeps the unsigned decimal conversion inside Int's range.
+private UINT64_HALF_RANGE_TENS: Int = 922337203685477580
+
+private UINT64_HALF_RANGE_ONES: Int = 8
+
+private INT_MIN_BITS: Int = -9223372036854775807 - 1
+
+
+pure func ctfe_type_is_uint64(typ: SemanticType) -> Bool:
+	match typ:
+		SemanticNamedType(name, args):
+			name == "UInt64" and args.length() == 0
+		_:
+			False
+
+
+---
+Decimal text of a compile-time integer, matching the runtime formatter for
+its type. CTFE stores every integer as 64-bit two's-complement bits in an
+Int; `UInt64` reads those bits as unsigned like `blorp_uint64_to_string`, so a
+value above Int's range prints as 18446744073709551615 rather than -1.
+---
+pure func ctfe_int_value_text(typ: SemanticType, raw: Int) -> String:
+	if raw >= 0 or not ctfe_type_is_uint64(typ):
+		raw.to_string()
+	else:
+		-- raw's unsigned value is below_half + 2^63, with below_half in
+		-- [0, 2^63). Divide each part by ten separately so no step overflows.
+		below_half: Int = raw - INT_MIN_BITS
+		ones_sum: Int = below_half % DECIMAL_RADIX + UINT64_HALF_RANGE_ONES
+		tens: Int = UINT64_HALF_RANGE_TENS + below_half / DECIMAL_RADIX + ones_sum / DECIMAL_RADIX
+		tens.to_string() + (ones_sum % DECIMAL_RADIX).to_string()
+
+
 pure func ctfe_float(span: SourceLocation, value: Float) -> CtfeValue:
 	ctfe_value(TYPE_FLOAT, CtfeFloatValue(value), span)
 
@@ -594,11 +691,90 @@ private pure func ctfe_compare_float(op: ParsedBinaryOp, left: Float, right: Flo
 			False
 
 
+---
+How CTFE reads an integer's 64-bit bits in division, modulo, and ordering.
+Addition, subtraction, multiplication, and equality agree for both readings.
+---
+enum CtfeIntSignedness:
+	CtfeSignedInt
+	CtfeUnsignedInt64
+
+
+private UINT64_QUARTER_RANGE: Int = 4611686018427387904
+
+
+---
+Order-preserving signed key for UInt64 bits: flipping the sign bit maps
+unsigned order onto signed order.
+---
+private pure func ctfe_uint64_order_key(bits: Int) -> Int:
+	bits - INT_MIN_BITS
+
+
+---
+Unsigned quotient of UInt64 bits, following the runtime's C `uint64_t`
+division. `divisor` must be nonzero.
+---
+private pure func ctfe_uint64_divide(dividend: Int, divisor: Int) -> Int:
+	if divisor < 0:
+		-- A divisor of at least 2^63 goes into any UInt64 at most once.
+		if ctfe_uint64_order_key(dividend) >= ctfe_uint64_order_key(divisor):
+			1
+		else:
+			0
+	else if dividend >= 0:
+		dividend / divisor
+	else:
+		-- Halve the dividend unsigned (its value is below_half + 2^63), divide,
+		-- then correct the doubled quotient by at most one.
+		half: Int = (dividend - INT_MIN_BITS) / 2 + UINT64_QUARTER_RANGE
+		quotient: Int = half / divisor * 2
+		remainder: Int = dividend - quotient * divisor
+		if ctfe_uint64_order_key(remainder) >= ctfe_uint64_order_key(divisor):
+			quotient + 1
+		else:
+			quotient
+
+
+private pure func ctfe_divide_int(signedness: CtfeIntSignedness, left: Int, right: Int) -> Int:
+	if right == 0:
+		0
+	else:
+		match signedness:
+			CtfeSignedInt:
+				left / right
+			CtfeUnsignedInt64:
+				ctfe_uint64_divide(left, right)
+
+
+private pure func ctfe_modulo_int(signedness: CtfeIntSignedness, left: Int, right: Int) -> Int:
+	if right == 0:
+		0
+	else:
+		match signedness:
+			CtfeSignedInt:
+				left % right
+			CtfeUnsignedInt64:
+				left - ctfe_uint64_divide(left, right) * right
+
+
+private pure func ctfe_int_order_key(signedness: CtfeIntSignedness, bits: Int) -> Int:
+	match signedness:
+		CtfeSignedInt:
+			bits
+		CtfeUnsignedInt64:
+			ctfe_uint64_order_key(bits)
+
+
 private pure func ctfe_eval_int_binary_values(
 	op: ParsedBinaryOp,
+	signedness: CtfeIntSignedness,
 	left_value: Int,
 	right_value: Int,
 ) -> Result[CtfeValueDesc, CtfeError]:
+	left_key: Int = ctfe_int_order_key(signedness, left_value)
+	right_key: Int = ctfe_int_order_key(signedness, right_value)
+
 	match op:
 		ParsedAddOp:
 			Ok(CtfeIntValue(left_value + right_value))
@@ -607,23 +783,17 @@ private pure func ctfe_eval_int_binary_values(
 		ParsedMultiplyOp:
 			Ok(CtfeIntValue(left_value * right_value))
 		ParsedDivideOp:
-			if right_value == 0:
-				Ok(CtfeIntValue(0))
-			else:
-				Ok(CtfeIntValue(left_value / right_value))
+			Ok(CtfeIntValue(ctfe_divide_int(signedness, left_value, right_value)))
 		ParsedModuloOp:
-			if right_value == 0:
-				Ok(CtfeIntValue(0))
-			else:
-				Ok(CtfeIntValue(left_value % right_value))
+			Ok(CtfeIntValue(ctfe_modulo_int(signedness, left_value, right_value)))
 		ParsedLessOp:
-			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_key, right_key)))
 		ParsedGreaterOp:
-			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_key, right_key)))
 		ParsedLessEqualOp:
-			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_key, right_key)))
 		ParsedGreaterEqualOp:
-			Ok(CtfeBoolValue(ctfe_compare_int(op, left_value, right_value)))
+			Ok(CtfeBoolValue(ctfe_compare_int(op, left_key, right_key)))
 		ParsedEqualOp:
 			Ok(CtfeBoolValue(left_value == right_value))
 		ParsedNotEqualOp:
@@ -641,7 +811,16 @@ private pure func ctfe_eval_int_binary_desc(
 		Ok(left_value):
 			match ctfe_expect_int(right):
 				Ok(right_value):
-					ctfe_eval_int_binary_values(op, left_value, right_value)
+					-- Typecheck gives both operands the same integer type; either
+					-- tag suffices when one side came from an untyped path.
+					signedness: CtfeIntSignedness = if (
+						ctfe_type_is_uint64(left.typ)
+						or ctfe_type_is_uint64(right.typ)
+					):
+						CtfeUnsignedInt64
+					else:
+						CtfeSignedInt
+					ctfe_eval_int_binary_values(op, signedness, left_value, right_value)
 				Err(error):
 					Err(error)
 

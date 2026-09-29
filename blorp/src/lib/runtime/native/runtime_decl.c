@@ -1470,6 +1470,7 @@ blorp_String* blorp_input_or_empty(blorp_String* prompt);
 blorp_String* blorp_to_string(long i);
 blorp_String* blorp_int128_to_string(__int128 v);
 blorp_String* blorp_uint128_to_string(unsigned __int128 v);
+blorp_String* blorp_uint64_to_string(uint64_t value);
 blorp_String* blorp_float_to_string(double f);
 blorp_String* blorp_format_float(double f, long decimals);
 blorp_String* blorp_float32_to_string(float f);
@@ -1845,6 +1846,7 @@ blorp_String* blorp_list_to_string_int32(blorp_List* list);
 blorp_String* blorp_list_to_string_uint8(blorp_List* list);
 blorp_String* blorp_list_to_string_uint16(blorp_List* list);
 blorp_String* blorp_list_to_string_uint32(blorp_List* list);
+blorp_String* blorp_list_to_string_uint64(blorp_List* list);
 blorp_String* blorp_list_to_string_float(blorp_List* list);
 blorp_String* blorp_list_to_string_float32(blorp_List* list);
 #ifdef __FLT16_MAX__
