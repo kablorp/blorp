@@ -29,6 +29,7 @@ import:
 
 union CoreEarlyInvariantViolation:
 	DebugBlockSurvived(CoreSourceLoc)
+	DuplicateFunctionDefinitionId(Int, String, CoreSourceLoc)
 	StringOperatorSugarSurvived(String, CoreSourceLoc)
 	MutableLocalWithoutAssignmentSurvived(CoreSourceLoc)
 	StraightLineMutableAssignmentSurvived(CoreSourceLoc)
@@ -57,6 +58,8 @@ pure func core_early_invariant_message(violation: CoreEarlyInvariantViolation) -
 	match violation:
 		DebugBlockSurvived(_):
 			"debug block survived Core debug lowering"
+		DuplicateFunctionDefinitionId(def_id, name, _):
+			"function `${name}` reuses definition id ${def_id.to_string()} of another function"
 		StringOperatorSugarSurvived(op, _):
 			"string operator `${op}` survived Core desugaring"
 		MutableLocalWithoutAssignmentSurvived(_):
@@ -85,6 +88,10 @@ pure func core_early_invariant_hint(violation: CoreEarlyInvariantViolation) -> O
 	match violation:
 		DebugBlockSurvived(_):
 			Some("Core debug lowering must erase or unwrap every debug block before later passes")
+		DuplicateFunctionDefinitionId(_, _, _):
+			Some(
+				"every function and impl method needs its own definition id; passes select callees by id alone and never by name",
+			)
 		StringOperatorSugarSurvived(_, _):
 			Some("Core desugaring must replace string operators with their explicit builtin calls")
 		MutableLocalWithoutAssignmentSurvived(_):
@@ -366,8 +373,46 @@ private pure func check_program_invariants(
 	check_expr_roots(program_expr_roots(program), check)
 
 
+---
+Definition ids are function identity: mono, flatten and resolve select a callee
+by its id alone and keep no per-id list or name tie-breaker. Two functions (or
+impl methods) sharing an id are therefore malformed input, reported here at
+the first pass that sees the whole lowered program. Generic data variants are
+not checked: specialized copies of one data declaration legitimately repeat
+their template's variant ids.
+---
+private pure func duplicate_function_id_violations(
+	program: CoreProgram,
+) -> List[CoreEarlyInvariantViolation]:
+	var seen: Dict[Int, Bool] = {}
+	var violations: List[CoreEarlyInvariantViolation] = []
+
+	for decl in program.decls:
+		var functions: List[CoreFunction] = []
+
+		match decl:
+			FunctionDecl(function):
+				functions = [function]
+			ImplDecl(impl):
+				functions = impl.methods
+			_:
+				void
+
+		for function in functions:
+			if seen.contains(function.def_id):
+				violations = violations.append(
+					DuplicateFunctionDefinitionId(function.def_id, function.name, function.loc),
+				)
+			else:
+				seen = seen.set(function.def_id, True)
+
+	violations
+
+
 pure func check_debug_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:
-	check_program_invariants(program, debug_violations)
+	duplicate_function_id_violations(program).concat(
+		check_program_invariants(program, debug_violations),
+	)
 
 
 pure func check_desugar_invariants(program: CoreProgram) -> List[CoreEarlyInvariantViolation]:

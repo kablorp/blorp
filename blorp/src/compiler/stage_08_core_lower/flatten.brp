@@ -159,7 +159,6 @@ import:
 		core_pure_overload_function_name_from_prefix,
 		core_ufcs_module_prefix,
 		core_ufcs_name_from_prefix,
-		is_core_ufcs_function_name,
 
 
 ---
@@ -178,14 +177,13 @@ private record CallableRewrite {
 
 
 ---
-`CallableRewrite`s grouped by the source `def_id` they answer for. The list
-is kept per id, in insertion order, because definition ids can collide across
-same-module functions: the lookup still requires the source name to match and
-returns the first such rewrite, exactly as the former linear scan did, but
-without scanning every rewrite for every reference.
+`CallableRewrite`s by the source `def_id` they answer for. Definition ids are
+unique (`DuplicateFunctionDefinitionId` in `early_invariants.brp` rejects
+input that reuses one), so a reference's id, or a declaration's own id,
+selects its rewrite exactly and no spelling takes part.
 ---
 private record CallableRewriteIndex {
-	by_def_id: Dict[Int, List[CallableRewrite]]
+	by_def_id: Dict[Int, CallableRewrite]
 }
 
 
@@ -419,7 +417,7 @@ private union FlattenRewriteLogicalAction:
 private pure func is_module_user_callable(function_info: CoreFunction) -> Bool:
 	match function_info.function_kind:
 		UserFunction:
-			not is_core_ufcs_function_name(function_info.name)
+			True
 		UnresolvedBuiltinFunction:
 			True
 		BuiltinFunction(c_name):
@@ -809,32 +807,19 @@ private pure func collect_global_rewrites(
 
 
 private pure func callable_rewrite_index(rewrites: List[CallableRewrite]) -> CallableRewriteIndex:
-	var by_def_id: Dict[Int, List[CallableRewrite]] = {}
+	var by_def_id: Dict[Int, CallableRewrite] = {}
 
 	for rewrite in rewrites:
-		by_def_id = by_def_id.set(
-			rewrite.def_id,
-			by_def_id
-				.get_or(rewrite.def_id, [])
-				.append(rewrite),
-		)
+		by_def_id = by_def_id.set(rewrite.def_id, rewrite)
 
 	{by_def_id = by_def_id}
 
 
 private pure func find_callable_rewrite(
 	rewrites: CallableRewriteIndex,
-	source_name: String,
 	def_id: Int,
 ) -> Option[CallableRewrite]:
-	var target: Option[CallableRewrite] = None
-
-	for rewrite in rewrites.by_def_id.get_or(def_id, []):
-		if rewrite.source_name == source_name:
-			target = Some(rewrite)
-			break
-
-	target
+	rewrites.by_def_id.get(def_id)
 
 
 private pure func rewritten_global_name(
@@ -893,7 +878,7 @@ private pure func rewrite_var_with_id(
 	variable: CoreVar,
 	def_id: Int,
 ) -> Option[CoreVar]:
-	find_callable_rewrite(rewrites, variable.name, def_id).map(func(rewrite): { variable |
+	find_callable_rewrite(rewrites, def_id).map(func(rewrite): { variable |
 			name = rewrite.target_name,
 			def_id = Some(rewrite.target_def_id)
 		})
@@ -906,7 +891,7 @@ private pure func rewrite_call_kind(
 ) -> CoreCallKind:
 	match (kind, callee):
 		(SelectedDirectCall(def_id), VarExpr(variable, _, _)):
-			match find_callable_rewrite(rewrites, variable.name, def_id):
+			match find_callable_rewrite(rewrites, def_id):
 				Some(rewrite):
 					SelectedDirectCall(rewrite.target_def_id)
 				None:
@@ -922,7 +907,7 @@ private pure func rewrite_closure_reference(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	match find_callable_rewrite(rewrites, closure.function_name, closure.def_id):
+	match find_callable_rewrite(rewrites, closure.def_id):
 		Some(rewrite):
 			ClosureCreateExpr(
 				{ closure |
@@ -2252,7 +2237,7 @@ private pure func rewrite_top_level_function(
 		function_info,
 	)
 
-	match find_callable_rewrite(callable_rewrites, function_info.name, function_info.def_id):
+	match find_callable_rewrite(callable_rewrites, function_info.def_id):
 		Some(rewrite):
 			match rewrite.pure_variant_base:
 				Some(base_def_id):
