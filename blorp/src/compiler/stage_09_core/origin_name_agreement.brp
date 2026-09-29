@@ -1,0 +1,359 @@
+-- Temporary proof that `CoreFunction.origin` is right.
+--
+-- `origin` (docs/NAME_MANGLING_REMOVAL_ROADMAP.md step M1.1) is written at
+-- every place a Core function is created, beside the mangled name that still
+-- encodes the same fact. Before any reader moves from the name to `origin`
+-- (Phase 2), this check derives the classification from the name with the
+-- existing decoders and reports every function whose `origin` disagrees. It is
+-- deleted in step M3.1, together with the markers it reads: it is the one
+-- reader allowed to parse a name shape after M1.1, and only because it is the
+-- proof that the parsers being retired and the field they are replaced by
+-- agree.
+import:
+	../stage_08_core_lower/entrypoint: ENTRYPOINT_NAME, USER_MAIN_NAME_PREFIX
+	../stage_08_core_lower/identity: core_module_member_prefix, is_core_ufcs_function_name
+	closure: ETA_NAME_PREFIX, LAMBDA_NAME_PREFIX, TASK_NAME_PREFIX
+	ir:
+		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
+		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
+		CoreFunction,
+		CoreFunctionOrigin(
+			Entrypoint,
+			EtaExpansion,
+			HoistedLambda,
+			HoistedTask,
+			ImplMethod,
+			MonoInstance,
+			PureVariant,
+			SourceFunction,
+			Synthesized,
+		),
+		CoreProgram,
+	synth_name: mono_name_base, strip_pure_suffix
+
+
+---
+What a function's mangled name says it is. `Plain` is a name none of the
+markers touch: a source function, an impl method not yet projected, or a
+synthesized one of those.
+---
+private union NameShape:
+	ProgramEntrypointName
+	UserMainName
+	LambdaName(Option[Int])
+	TaskName(Option[Int])
+	EtaName
+	MonoName
+	PureName
+	UfcsName
+	TraitMethodName
+	PlainName
+
+
+---
+How many functions were checked, how many of them each origin case
+accounts for (for the report line), and the disagreements found.
+---
+record OriginNameAgreement {
+	checked: Int,
+	case_counts: List[(String, Int)],
+	violations: List[String]
+}
+
+
+private TRAIT_METHOD_SEPARATOR: String = "_"
+
+private ORIGIN_CASE_NAMES: List[String] = [
+	"SourceFunction",
+	"ImplMethod",
+	"PureVariant",
+	"MonoInstance",
+	"Synthesized",
+	"HoistedLambda",
+	"HoistedTask",
+	"EtaExpansion",
+	"Entrypoint",
+]
+
+
+private pure func origin_case_name(origin: CoreFunctionOrigin) -> String:
+	match origin:
+		SourceFunction(_):
+			"SourceFunction"
+		ImplMethod(_, _):
+			"ImplMethod"
+		PureVariant(_):
+			"PureVariant"
+		MonoInstance(_, _):
+			"MonoInstance"
+		Synthesized(_, _):
+			"Synthesized"
+		HoistedLambda(_, _):
+			"HoistedLambda"
+		HoistedTask(_, _):
+			"HoistedTask"
+		EtaExpansion(_):
+			"EtaExpansion"
+		Entrypoint(_):
+			"Entrypoint"
+
+
+---
+The origin a function was declared with: synthesis wraps the origin it
+replaced, and the name is still the declaration's.
+---
+private pure func declared_origin(origin: CoreFunctionOrigin) -> CoreFunctionOrigin:
+	match origin:
+		Synthesized(_, declared_as):
+			declared_origin(declared_as)
+		_:
+			origin
+
+
+private pure func ordinal_after_prefix(name: String, prefix: String) -> Option[Int]:
+	name.drop_left(prefix.length()).parse_int()
+
+
+---
+The mono marker `__mono_` also occurs, without meaning it, where a flattened
+module prefix (`..._synth_name__`) meets a source member that starts with
+`mono_`. A real mono marker sits after the whole `<module>__<member>` name, so
+a marker inside the module prefix is not one. This is the ambiguity that
+makes reading the marker from the name unsound and `origin` necessary.
+---
+private pure func has_mono_marker_after_module_prefix(
+	function_info: CoreFunction,
+	name: String,
+) -> Bool:
+	base: String = mono_name_base(name)
+
+	if base == name:
+		False
+	else:
+		match function_info.source_module:
+			Some(module_name):
+				base.length() >= core_module_member_prefix(module_name).length()
+			None:
+				True
+
+
+private pure func name_shape(
+	function_info: CoreFunction,
+	trait_names: Dict[String, Bool],
+) -> NameShape:
+	name: String = function_info.name
+
+	if name == ENTRYPOINT_NAME:
+		ProgramEntrypointName
+	else if name.starts_with(USER_MAIN_NAME_PREFIX):
+		UserMainName
+	else if name.starts_with(LAMBDA_NAME_PREFIX):
+		LambdaName(ordinal_after_prefix(name, LAMBDA_NAME_PREFIX))
+	else if name.starts_with(TASK_NAME_PREFIX):
+		TaskName(ordinal_after_prefix(name, TASK_NAME_PREFIX))
+	else if name.starts_with(ETA_NAME_PREFIX):
+		EtaName
+	else if has_mono_marker_after_module_prefix(function_info, name):
+		MonoName
+	else if strip_pure_suffix(name) != name:
+		PureName
+	else if is_core_ufcs_function_name(name):
+		UfcsName
+	else if is_trait_method_name(name, trait_names):
+		TraitMethodName
+	else:
+		PlainName
+
+
+private pure func is_trait_method_name(name: String, trait_names: Dict[String, Bool]) -> Bool:
+	separator_index: Int = name.raw_index_of(TRAIT_METHOD_SEPARATOR)
+
+	if separator_index <= 0:
+		False
+	else:
+		trait_names.contains(name.substring(0, separator_index))
+
+
+private pure func shape_and_origin_agree(shape: NameShape, origin: CoreFunctionOrigin) -> Bool:
+	match shape:
+		ProgramEntrypointName:
+			match origin:
+				Entrypoint(ProgramWrapperEntrypoint):
+					True
+				_:
+					False
+		UserMainName:
+			match origin:
+				Entrypoint(UserMainEntrypoint):
+					True
+				_:
+					False
+		LambdaName(named_ordinal):
+			match origin:
+				HoistedLambda(_, ordinal):
+					named_ordinal == Some(ordinal)
+				_:
+					False
+		TaskName(named_ordinal):
+			match origin:
+				HoistedTask(_, ordinal):
+					named_ordinal == Some(ordinal)
+				_:
+					False
+		EtaName:
+			match origin:
+				EtaExpansion(_):
+					True
+				_:
+					False
+		MonoName:
+			match origin:
+				MonoInstance(_, _):
+					True
+				_:
+					False
+		PureName:
+			match origin:
+				PureVariant(_):
+					True
+				_:
+					False
+		UfcsName:
+			False
+		TraitMethodName:
+			match origin:
+				ImplMethod(_, _):
+					True
+				_:
+					False
+		PlainName:
+			match origin:
+				SourceFunction(_) | ImplMethod(_, _):
+					True
+				_:
+					False
+
+
+private pure func shape_label(shape: NameShape) -> String:
+	match shape:
+		ProgramEntrypointName:
+			"the program entrypoint"
+		UserMainName:
+			"the user main"
+		LambdaName(_):
+			"a hoisted lambda"
+		TaskName(_):
+			"a hoisted task"
+		EtaName:
+			"an eta expansion"
+		MonoName:
+			"a mono instance"
+		PureName:
+			"a pure variant"
+		UfcsName:
+			"a UFCS wrapper (no origin case exists for one)"
+		TraitMethodName:
+			"a trait method"
+		PlainName:
+			"a plain source or impl function"
+
+
+private pure func function_disagreement(
+	function_info: CoreFunction,
+	trait_names: Dict[String, Bool],
+) -> Option[String]:
+	declared: CoreFunctionOrigin = declared_origin(function_info.origin)
+	shape: NameShape = name_shape(function_info, trait_names)
+
+	if shape_and_origin_agree(shape, declared):
+		None
+	else:
+		Some(
+			"function `${function_info.name}` (def ${function_info.def_id.to_string()}) is named as ${shape_label(shape)} but its origin is ${origin_case_name(declared)}",
+		)
+
+
+private pure func program_trait_names(program: CoreProgram) -> Dict[String, Bool]:
+	var names: Dict[String, Bool] = {}
+
+	for decl in program.decls:
+		match decl:
+			TraitDecl(trait_decl):
+				names = names.set(trait_decl.name, True)
+			ImplDecl(impl_decl):
+				names = names.set(impl_decl.trait_name, True)
+			_:
+				void
+
+	names
+
+
+private pure func count_origin_case(
+	counts: Dict[String, Int],
+	function_info: CoreFunction,
+) -> Dict[String, Int]:
+	case_name: String = origin_case_name(function_info.origin)
+	counts.set(case_name, counts.get_or(case_name, 0) + 1)
+
+
+private pure func case_counts_in_order(counts: Dict[String, Int]) -> List[(String, Int)]:
+	ORIGIN_CASE_NAMES.map(pure func(case_name: String) -> (String, Int): (
+			case_name,
+			counts.get_or(case_name, 0),
+		))
+
+
+---
+Every function the program declares, top level or as an impl method, checked
+against its name. An impl method must also carry an impl-method origin: it is
+declared inside an `impl`, whatever its name looks like.
+---
+pure func origin_name_agreement(program: CoreProgram) -> OriginNameAgreement:
+	trait_names: Dict[String, Bool] = program_trait_names(program)
+	var checked: Int = 0
+	var counts: Dict[String, Int] = {}
+	var violations: List[String] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				checked += 1
+				counts = count_origin_case(counts, function_info)
+
+				match function_disagreement(function_info, trait_names):
+					Some(message):
+						violations = violations.append(message)
+					None:
+						void
+			ImplDecl(impl_decl):
+				for method in impl_decl.methods:
+					checked += 1
+					counts = count_origin_case(counts, method)
+
+					match declared_origin(method.origin):
+						ImplMethod(_, _):
+							void
+						other:
+							violations = violations.append(
+								"impl method `${method.name}` (def ${method.def_id.to_string()}) has origin ${origin_case_name(other)}, not ImplMethod",
+							)
+			_:
+				void
+
+	{
+		checked = checked,
+		case_counts = case_counts_in_order(counts),
+		violations = violations
+	}
+
+
+---
+The report-mode summary line: how many functions were checked, the count per
+origin case, and how many disagree.
+---
+pure func origin_name_agreement_summary(agreement: OriginNameAgreement) -> String:
+	counts: String = agreement.case_counts
+		.map(pure func(entry: (String, Int)) -> String: "${entry[0]}=${entry[1].to_string()}")
+		.join(" ")
+
+	"${agreement.checked.to_string()} functions, ${agreement.violations.length().to_string()} disagree; ${counts}"

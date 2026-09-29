@@ -1,5 +1,10 @@
 import:
-	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
+	../../../src/compiler/stage_02_lex/name_table:
+		NameId,
+		name_id_from_interned_index,
+		name_id_pending_dynamic_intern,
+		name_ids_equal,
+		synthesized_name_id,
 	../../../src/compiler/stage_03_parse/parsed_ast:
 		ParsedBinaryOp(ParsedAddOp),
 		ParsedBuiltinTypeDecl,
@@ -306,12 +311,14 @@ import:
 		),
 		CoreForeignArgPassing(ForeignDefaultArgs),
 		CoreForeignLinkPlatform(CoreForeignLinux, CoreForeignMacos),
+		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunctionKind(
 			ForeignFunction,
 			ProgramEntrypointFunction,
 			UnresolvedBuiltinFunction,
 			UserFunction,
 		),
+		CoreFunctionOrigin(Entrypoint, ImplMethod, SourceFunction),
 		CoreListStorageLayout(InlineListStorage),
 		CoreLiteral(
 			BoolLiteral,
@@ -5230,6 +5237,127 @@ func test_lowers_function_decl_preserving_callable_id() -> Bool:
 			False
 
 
+private pure func origin_is_entrypoint(
+	origin: CoreFunctionOrigin,
+	expected: CoreEntrypointKind,
+) -> Bool:
+	match (origin, expected):
+		(Entrypoint(ProgramWrapperEntrypoint), ProgramWrapperEntrypoint):
+			True
+		(Entrypoint(UserMainEntrypoint), UserMainEntrypoint):
+			True
+		_:
+			False
+
+
+private pure func origin_is_source_function(origin: CoreFunctionOrigin, name: NameId) -> Bool:
+	match origin:
+		SourceFunction(actual):
+			name_ids_equal(actual, name)
+		_:
+			False
+
+
+private pure func origin_is_impl_method(
+	origin: CoreFunctionOrigin,
+	trait_name: NameId,
+	method: NameId,
+) -> Bool:
+	match origin:
+		ImplMethod(actual_trait, actual_method):
+			name_ids_equal(actual_trait, trait_name) and name_ids_equal(actual_method, method)
+		_:
+			False
+
+
+func test_lowered_function_records_its_source_name_as_origin() -> Bool:
+	answer_name: NameId = name_id_from_interned_index(7)
+	info: TypedFunctionInfo = {
+		decl = { parsed_function_decl() | name = parsed_identifier(answer_name, "answer", fixture_source_span()) },
+		callable_id = Some(42),
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(int_expr("1"))
+	}
+
+	match lower_typed_decl(core_lower_context(100, None), fixture_source_table(), TypedFunctionDecl(info)):
+		Ok(result):
+			match result.decl:
+				FunctionDecl(function_info):
+					origin_is_source_function(function_info.origin, answer_name)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowered_foreign_function_records_its_source_name_as_origin() -> Bool:
+	native_name: NameId = name_id_from_interned_index(11)
+	info: TypedForeignFunctionInfo = {
+		decl = { parsed_foreign_function_decl() |
+			name = parsed_identifier(native_name, "native_answer", fixture_source_span())
+		},
+		callable_id = Some(44),
+		param_types = [int_type()],
+		semantic_return_type = int_type(),
+		c_name = "c_native_answer",
+		includes = [],
+		link_flags = [],
+		arg_passing = TypedForeignDefaultArgs,
+		block_span = fixture_source_span()
+	}
+
+	match lower_typed_decl(
+		core_lower_context(100, None),
+		fixture_source_table(),
+		TypedForeignFunctionDecl(info),
+	):
+		Ok(result):
+			match result.decl:
+				FunctionDecl(function_info):
+					origin_is_source_function(function_info.origin, native_name)
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_lowered_impl_method_records_trait_and_method_as_origin() -> Bool:
+	trait_name: NameId = name_id_from_interned_index(8)
+	method_name: NameId = name_id_from_interned_index(9)
+	method: TypedFunctionInfo = {
+		decl = { parsed_function_decl() | name = parsed_identifier(method_name, "answer", fixture_source_span()) },
+		callable_id = None,
+		effective_type_params = [],
+		param_types = [int_type()],
+		source_return_type = Some(int_type()),
+		semantic_return_type = int_type(),
+		body = Some(int_expr("1"))
+	}
+	info: TypedImplInfo = {
+		decl = { parsed_impl_decl() | trait_name = parsed_identifier(trait_name, "Display", fixture_source_span()) },
+		for_type = int_type(),
+		type_params = [],
+		methods = [method]
+	}
+
+	match lower_typed_decl(core_lower_context(10, None), fixture_source_table(), TypedImplDecl(info)):
+		Ok(result):
+			match result.decl:
+				ImplDecl(impl_info):
+					match impl_info.methods:
+						[lowered_method]:
+							origin_is_impl_method(lowered_method.origin, trait_name, method_name)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
 func test_lowers_tuple_pattern_parameter_bindings() -> Bool:
 	info: TypedFunctionInfo = {
 		decl = { parsed_function_decl() |
@@ -6711,9 +6839,11 @@ private func synthesizes_explicit_program_entrypoint(
 							and user_main.name == "$blorp$user_main_" + main_raw.to_string()
 							and user_main.def_id == main_raw
 							and is_user_function_kind(user_main.function_kind)
+							and origin_is_entrypoint(user_main.origin, UserMainEntrypoint)
 							and entrypoint.name == "$blorp$program"
 							and entrypoint.def_id == core_frontier
 							and is_program_entrypoint_function_kind(entrypoint.function_kind)
+							and origin_is_entrypoint(entrypoint.origin, ProgramWrapperEntrypoint)
 							and user_main_calls_renamed_main
 						)
 					_:
@@ -7179,6 +7309,18 @@ tests: TestSuite = {
 		(
 			"lowers function decl preserving callable id",
 			test_lowers_function_decl_preserving_callable_id,
+		),
+		(
+			"lowered function records its source name as origin",
+			test_lowered_function_records_its_source_name_as_origin,
+		),
+		(
+			"lowered foreign function records its source name as origin",
+			test_lowered_foreign_function_records_its_source_name_as_origin,
+		),
+		(
+			"lowered impl method records trait and method as origin",
+			test_lowered_impl_method_records_trait_and_method_as_origin,
 		),
 		("lowers tuple pattern parameter bindings", test_lowers_tuple_pattern_parameter_bindings),
 		("lowers forward function decl", test_lowers_forward_function_decl),

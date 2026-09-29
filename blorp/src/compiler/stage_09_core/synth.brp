@@ -12,8 +12,22 @@ import:
 		CoreExpr,
 		CoreFunction,
 		CoreFunctionKind(BuiltinFunction, ProgramEntrypointFunction, UserFunction),
+		CoreFunctionOrigin(Synthesized),
 		CoreImplDecl,
 		CoreProgram,
+		CoreSynthesisKind(
+			BytesSynthesis,
+			FixedSynthesis,
+			FloatSynthesis,
+			ForwardSynthesis,
+			HashCollectionSynthesis,
+			ListSynthesis,
+			ParallelTensorSynthesis,
+			ScalarOperatorSynthesis,
+			SliceSynthesis,
+			StringSynthesis,
+			TensorSynthesis,
+		),
 	list: list as allocate_list
 	synth_bytes: synthesize_bytes_body
 	synth_context: CoreSynthContext, core_synth_context
@@ -31,29 +45,58 @@ import:
 	synth_tensor: synthesize_tensor_body
 
 
-private pure func synthesize_infallible_body(function_info: CoreFunction) -> Option[CoreExpr]:
-	var body: Option[CoreExpr] = synthesize_bytes_body(function_info)
+---
+A synthesized body together with the pass that supplied it, so the function
+records `Synthesized(kind, ...)` as its origin.
+---
+private record SynthesizedBody {
+	kind: CoreSynthesisKind,
+	body: CoreExpr
+}
+
+
+private pure func attributed_to(
+	kind: CoreSynthesisKind,
+	body: Option[CoreExpr],
+) -> Option[SynthesizedBody]:
+	-- A `match`, not `body.map(...)`: the closure `map` takes would be allocated
+	-- on every attempt, and nearly every attempt over every function is a miss.
+	match body:
+		Some(supplied):
+			Some({
+				kind = kind,
+				body = supplied
+			})
+		None:
+			None
+
+
+private pure func synthesize_infallible_body(function_info: CoreFunction) -> Option[SynthesizedBody]:
+	var body: Option[SynthesizedBody] = attributed_to(
+		BytesSynthesis,
+		synthesize_bytes_body(function_info),
+	)
 
 	if body.is_none():
-		body = synthesize_fixed_body(function_info)
+		body = attributed_to(FixedSynthesis, synthesize_fixed_body(function_info))
 
 	if body.is_none():
-		body = synthesize_float_body(function_info)
+		body = attributed_to(FloatSynthesis, synthesize_float_body(function_info))
 
 	if body.is_none():
-		body = synthesize_forward_body(function_info)
+		body = attributed_to(ForwardSynthesis, synthesize_forward_body(function_info))
 
 	if body.is_none():
-		body = synthesize_slice_body(function_info)
+		body = attributed_to(SliceSynthesis, synthesize_slice_body(function_info))
 
 	if body.is_none():
-		body = synthesize_string_body(function_info)
+		body = attributed_to(StringSynthesis, synthesize_string_body(function_info))
 
 	if body.is_none():
-		body = synthesize_list_body(function_info)
+		body = attributed_to(ListSynthesis, synthesize_list_body(function_info))
 
 	if body.is_none():
-		body = synthesize_parallel_tensor_body(function_info)
+		body = attributed_to(ParallelTensorSynthesis, synthesize_parallel_tensor_body(function_info))
 
 	body
 
@@ -79,22 +122,34 @@ private pure func synthesize_function(
 ) -> Result[CoreFunction, CoreSynthError]:
 	hash_collection_body ?= synthesize_hash_collection_body(context, function_info)
 	tensor_body ?= synthesize_tensor_body(function_info)
-	var body: Option[CoreExpr] = hash_collection_body
+	var body: Option[SynthesizedBody] = attributed_to(HashCollectionSynthesis, hash_collection_body)
 
 	if body.is_none():
-		body = tensor_body
+		body = attributed_to(TensorSynthesis, tensor_body)
 
 	if body.is_none():
 		body = synthesize_infallible_body(function_info)
 
 	match body:
 		Some(synthesized):
-			Ok({ function_info |
-					body = Some(synthesized),
-					function_kind = synthesized_function_kind(function_info)
-				})
+			Ok(synthesized_function(function_info, synthesized))
 		None:
 			Ok(function_info)
+
+
+---
+`function_info` with the body a synthesis pass supplied. The origin records
+the pass and keeps the origin the function was declared with.
+---
+private pure func synthesized_function(
+	function_info: CoreFunction,
+	synthesized: SynthesizedBody,
+) -> CoreFunction:
+	{ function_info |
+		body = Some(synthesized.body),
+		function_kind = synthesized_function_kind(function_info),
+		origin = Synthesized(synthesized.kind, function_info.origin)
+	}
 
 
 private pure func qualify_impl_method_for_synthesis(function_info: CoreFunction) -> CoreFunction:
@@ -127,7 +182,8 @@ private pure func synthesize_impl_method(
 		Some(body):
 			Ok({ candidate |
 					name = function_info.name,
-					body = Some(body)
+					body = Some(body),
+					origin = Synthesized(ScalarOperatorSynthesis, candidate.origin)
 				})
 		None:
 			synthesized ?= synthesize_function(context, candidate)

@@ -86,6 +86,12 @@ Replace with: `CoreFunction.origin` cases `MonoInstance(base_def_id, type_args)`
 `PureVariant(base_def_id)`, plus an instantiation-specific `def_id`. Readers
 ask `origin`, not the name. Two markers with one encoded suffix also lose the
 "a name can carry the marker twice" rule in `synth_name.brp:46`. Owner: A3.1.
+
+Temporary readers (M1.1): `origin_name_agreement.brp` calls `mono_name_base`,
+`strip_pure_suffix` and `is_core_ufcs_function_name`, and tests the closure and
+entrypoint prefixes, to prove `CoreFunction.origin` agrees with the name on the
+frozen self-compile. Its 11 allowlist lines and the `USER_MAIN_NAME_PREFIX`
+export die in M3.1 with the markers.
 Delete both duplicated suffix constants in the last A3.1 commit.
 
 ### F2 module-member prefix and flattened names

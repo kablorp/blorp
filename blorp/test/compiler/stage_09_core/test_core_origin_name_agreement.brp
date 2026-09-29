@@ -1,0 +1,294 @@
+import:
+	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
+	../../../src/compiler/stage_09_core/ir:
+		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
+		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreFunctionOrigin(
+			Entrypoint,
+			EtaExpansion,
+			HoistedLambda,
+			HoistedTask,
+			ImplMethod,
+			MonoInstance,
+			PureVariant,
+			SourceFunction,
+			Synthesized,
+		),
+		CoreMonoSubstitutionValue(TypeSubstitution),
+		CoreProgram,
+		CoreSynthesisKind(TensorSynthesis),
+		CoreType(NamedType),
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/origin_name_agreement:
+		OriginNameAgreement,
+		origin_name_agreement,
+		origin_name_agreement_summary,
+	test: TestSuite
+
+
+SOURCE_ORIGIN: CoreFunctionOrigin = SourceFunction(synthesized_name_id("_"))
+
+INT_TYPE: CoreType = NamedType("Int", [])
+
+
+pure func function_in_module(
+	name: String,
+	source_module: Option[String],
+	origin: CoreFunctionOrigin,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = source_module,
+		type_params = [],
+		params = [],
+		return_type = INT_TYPE,
+		body = None,
+		is_pure = False,
+		function_kind = UserFunction,
+		origin = origin,
+		def_id = 1,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func function_with(name: String, origin: CoreFunctionOrigin) -> CoreFunction:
+	function_in_module(name, None, origin)
+
+
+pure func program_of(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func agreement_for(functions: List[CoreFunction]) -> OriginNameAgreement:
+	origin_name_agreement(program_of(functions.map(pure func(function: CoreFunction) -> CoreDecl: FunctionDecl(function))))
+
+
+pure func string_contains_all(text: String, needles: List[String]) -> Bool:
+	needles.all(pure func(needle: String) -> Bool: text.contains(needle))
+
+
+pure func mono_origin() -> CoreFunctionOrigin:
+	MonoInstance(5, [("T", TypeSubstitution(INT_TYPE))])
+
+
+pure func test_functions_whose_names_and_origins_agree_report_nothing() -> Bool:
+	agreement = agreement_for([
+		function_with("list__map", SOURCE_ORIGIN),
+		function_with("list__map__mono_Int", mono_origin()),
+		function_with("list__map__pure", PureVariant(5)),
+		function_with("_blorp_clambda_3", HoistedLambda(9, 3)),
+		function_with("_blorp_task_0", HoistedTask(9, 0)),
+		function_with("_blorp_eta_2", EtaExpansion(5)),
+		function_with("$blorp$program", Entrypoint(ProgramWrapperEntrypoint)),
+		function_with("$blorp$user_main_12", Entrypoint(UserMainEntrypoint)),
+	])
+
+	agreement.checked == 8 and agreement.violations.is_empty()
+
+
+pure func test_mono_named_function_with_source_origin_is_reported() -> Bool:
+	agreement = agreement_for([function_with("list__map__mono_Int", SOURCE_ORIGIN)])
+
+	match agreement.violations:
+		[message]:
+			string_contains_all(
+				message,
+				["list__map__mono_Int", "a mono instance", "origin is SourceFunction"],
+			)
+		_:
+			False
+
+
+pure func test_plain_named_function_with_mono_origin_is_reported() -> Bool:
+	agreement = agreement_for([function_with("list__map", mono_origin())])
+
+	match agreement.violations:
+		[message]:
+			string_contains_all(message, ["a plain source or impl function", "MonoInstance"])
+		_:
+			False
+
+
+pure func test_pure_suffix_without_pure_variant_origin_is_reported() -> Bool:
+	agreement = agreement_for([function_with("list__map__pure", SOURCE_ORIGIN)])
+
+	agreement.violations.length() == 1
+
+
+pure func test_hoisted_lambda_ordinal_must_match_the_name() -> Bool:
+	agreement = agreement_for([
+		function_with("_blorp_clambda_4", HoistedLambda(9, 3)),
+		function_with("_blorp_task_1", HoistedTask(9, 1)),
+	])
+
+	match agreement.violations:
+		[message]:
+			string_contains_all(message, ["_blorp_clambda_4", "a hoisted lambda"])
+		_:
+			False
+
+
+pure func test_entrypoint_names_require_matching_entrypoint_kind() -> Bool:
+	agreement = agreement_for([
+		function_with("$blorp$program", Entrypoint(UserMainEntrypoint)),
+		function_with("$blorp$user_main_3", Entrypoint(ProgramWrapperEntrypoint)),
+	])
+
+	agreement.violations.length() == 2
+
+
+pure func test_ufcs_named_function_is_always_reported() -> Bool:
+	agreement = agreement_for([function_with("__ufcs_list__map", SOURCE_ORIGIN)])
+
+	match agreement.violations:
+		[message]:
+			message.contains("a UFCS wrapper")
+		_:
+			False
+
+
+pure func test_synthesized_function_is_judged_by_its_declared_origin() -> Bool:
+	agreement = agreement_for([
+		function_with("list__map__mono_Int", Synthesized(TensorSynthesis, mono_origin())),
+		function_with("list__length", Synthesized(TensorSynthesis, SOURCE_ORIGIN)),
+		function_with("list__map", Synthesized(TensorSynthesis, mono_origin())),
+	])
+
+	agreement.violations.length() == 1 and agreement.checked == 3
+
+
+pure func test_member_named_mono_something_is_not_a_mono_instance() -> Bool:
+	-- `src_compiler_synth_name__mono_name_base` is member `mono_name_base` of
+	-- module `src/compiler/synth_name`: the marker sits inside the module prefix.
+	agreement = agreement_for([
+		function_in_module(
+			"src_compiler_synth_name__mono_name_base",
+			Some("src/compiler/synth_name"),
+			SOURCE_ORIGIN,
+		),
+		function_in_module(
+			"src_compiler_synth_name__mono_name_base__mono_Int",
+			Some("src/compiler/synth_name"),
+			mono_origin(),
+		),
+	])
+
+	agreement.violations.is_empty()
+
+
+pure func impl_program(method_origin: CoreFunctionOrigin) -> CoreProgram:
+	program_of([
+		ImplDecl({
+			trait_name = "Display",
+			for_type = INT_TYPE,
+			type_params = [],
+			methods = [function_with("show", method_origin)],
+			loc = synthetic_core_source_loc()
+		}),
+	])
+
+
+pure func test_impl_methods_must_carry_an_impl_method_origin() -> Bool:
+	good = origin_name_agreement(
+		impl_program(ImplMethod(synthesized_name_id("_"), synthesized_name_id("_"))),
+	)
+	wrapped = origin_name_agreement(
+		impl_program(
+			Synthesized(TensorSynthesis, ImplMethod(synthesized_name_id("_"), synthesized_name_id("_"))),
+		),
+	)
+	bad = origin_name_agreement(impl_program(SOURCE_ORIGIN))
+
+	good.violations.is_empty() and wrapped.violations.is_empty() and bad.violations.length() == 1
+
+
+pure func test_trait_named_functions_are_projected_impl_methods() -> Bool:
+	trait_decl: CoreDecl = TraitDecl({
+		name = "Display",
+		type_params = [],
+		supertraits = [],
+		methods = [],
+		loc = synthetic_core_source_loc()
+	})
+	projected: CoreDecl = FunctionDecl(
+		function_with(
+			"Display_show_Int",
+			ImplMethod(synthesized_name_id("_"), synthesized_name_id("_")),
+		),
+	)
+	misattributed: CoreDecl = FunctionDecl(function_with("Display_show_Bool", SOURCE_ORIGIN))
+
+	origin_name_agreement(program_of([trait_decl, projected])).violations.is_empty() and origin_name_agreement(
+		program_of([trait_decl, misattributed]),
+	).violations.length() == 1
+
+
+pure func test_summary_reports_totals_and_counts_per_origin_case() -> Bool:
+	agreement = agreement_for([
+		function_with("list__map", SOURCE_ORIGIN),
+		function_with("list__filter", SOURCE_ORIGIN),
+		function_with("list__map__mono_Int", mono_origin()),
+		function_with("list__bad__mono_Int", SOURCE_ORIGIN),
+	])
+
+	origin_name_agreement_summary(agreement).starts_with(
+		"4 functions, 1 disagree; SourceFunction=3 ImplMethod=0 PureVariant=0 MonoInstance=1",
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler Core origin and name agreement",
+	tests = [
+		(
+			"functions whose names and origins agree report nothing",
+			test_functions_whose_names_and_origins_agree_report_nothing,
+		),
+		(
+			"mono named function with source origin is reported",
+			test_mono_named_function_with_source_origin_is_reported,
+		),
+		(
+			"plain named function with mono origin is reported",
+			test_plain_named_function_with_mono_origin_is_reported,
+		),
+		(
+			"pure suffix without pure variant origin is reported",
+			test_pure_suffix_without_pure_variant_origin_is_reported,
+		),
+		(
+			"hoisted lambda ordinal must match the name",
+			test_hoisted_lambda_ordinal_must_match_the_name,
+		),
+		(
+			"entrypoint names require matching entrypoint kind",
+			test_entrypoint_names_require_matching_entrypoint_kind,
+		),
+		("ufcs named function is always reported", test_ufcs_named_function_is_always_reported),
+		(
+			"synthesized function is judged by its declared origin",
+			test_synthesized_function_is_judged_by_its_declared_origin,
+		),
+		(
+			"member named mono something is not a mono instance",
+			test_member_named_mono_something_is_not_a_mono_instance,
+		),
+		(
+			"impl methods must carry an impl method origin",
+			test_impl_methods_must_carry_an_impl_method_origin,
+		),
+		(
+			"trait named functions are projected impl methods",
+			test_trait_named_functions_are_projected_impl_methods,
+		),
+		(
+			"summary reports totals and counts per origin case",
+			test_summary_reports_totals_and_counts_per_origin_case,
+		),
+	]
+}

@@ -5,6 +5,7 @@
 -- once at the transfer boundary into Core-specific variants, so emission code
 -- can make illegal states unrepresentable as the port expands.
 import:
+	../stage_02_lex/name_table: NameId, name_id_from_interned_index, name_id_index
 	../stage_06_typecheck/type_system/language_surface_manifest:
 		DeclaredAbiType(
 			DeclaredAbiBool,
@@ -26,6 +27,30 @@ import:
 
 
 private KIND_FIELD: String = "kind"
+
+private SOURCE_FUNCTION_ORIGIN_TAG: String = "source_function"
+
+private IMPL_METHOD_ORIGIN_TAG: String = "impl_method"
+
+private PURE_VARIANT_ORIGIN_TAG: String = "pure_variant"
+
+private MONO_INSTANCE_ORIGIN_TAG: String = "mono_instance"
+
+private SYNTHESIZED_ORIGIN_TAG: String = "synthesized"
+
+private HOISTED_LAMBDA_ORIGIN_TAG: String = "hoisted_lambda"
+
+private HOISTED_TASK_ORIGIN_TAG: String = "hoisted_task"
+
+private ETA_EXPANSION_ORIGIN_TAG: String = "eta_expansion"
+
+private ENTRYPOINT_ORIGIN_TAG: String = "entrypoint"
+
+private TYPE_SUBSTITUTION_TAG: String = "type"
+
+private DIM_SUBSTITUTION_TAG: String = "dim"
+
+private DIM_PACK_SUBSTITUTION_TAG: String = "dim_pack"
 
 private PROGRAM_TAG: String = "program"
 
@@ -2674,6 +2699,108 @@ pure func is_unresolved_builtin_function_kind(kind: CoreFunctionKind) -> Bool:
 			False
 
 
+---
+One argument of a monomorphic instance: a type for an ordinary type
+parameter, a dimension for a dimension parameter, or a dimension list for a
+variadic dimension parameter. The three domains stay distinct so a nominal
+type can never stand where a dimension belongs.
+---
+union CoreMonoSubstitutionValue:
+	TypeSubstitution(CoreType)
+	DimSubstitution(CoreTensorDim)
+	DimPackSubstitution(List[CoreTensorDim])
+
+
+---
+The arguments a monomorphic instance was specialized with, keyed by type
+parameter name (the substitution a call site's inference produced).
+---
+type alias CoreMonoSubstitution = List[(String, CoreMonoSubstitutionValue)]
+
+
+---
+Which synthesis pass supplied a function's body. One case per pass module
+under `stage_09_core/synth_*.brp`.
+---
+enum CoreSynthesisKind:
+	ScalarOperatorSynthesis
+	HashCollectionSynthesis
+	ListSynthesis
+	ParallelTensorSynthesis
+	FixedSynthesis
+	ForwardSynthesis
+	FloatSynthesis
+	BytesSynthesis
+	StringSynthesis
+	TensorSynthesis
+	SliceSynthesis
+
+
+---
+Which of the two functions the entrypoint pass owns: the exported program
+wrapper, or the user's `main` after it is renamed out of the wrapper's way.
+---
+enum CoreEntrypointKind:
+	ProgramWrapperEntrypoint
+	UserMainEntrypoint
+
+
+---
+Why a Core function exists, recorded where the function is created instead
+of encoded in its mangled name. Payloads are ids and types only, never
+spellings; a `def_id` is the `CoreFunction.def_id` of the function named.
+
+This is the structured form of the markers `CoreFunction.name` still carries
+(docs/NAME_MANGLING_REMOVAL_ROADMAP.md): once every reader asks `origin`,
+the marked spellings become display text. Until then the pass-runner
+`origin_name_agreement` check keeps the two in step.
+
+`UfcsWrapper` (`__ufcs_...`, family F3) and a static-callback case
+(`__sc_...`, F5) are deliberately absent: no `CoreFunction` is ever created
+for either. A UFCS name is only a call-target alias that flattening rewrites
+onto an existing function, and `__sc_...` spells a static closure C symbol on
+`CoreClosureCreate`, so a case would have no producer.
+---
+union CoreFunctionOrigin:
+	-- SourceFunction(name): declared in source under `name` (a spelling
+	-- identity, not a semantic one). Replaces the `<module>__name` spelling
+	-- (F2) as the fact "this is source member `name`"; the owning module stays
+	-- in the function's `source_module` until that field carries a `ModuleId`.
+	SourceFunction(NameId)
+	-- ImplMethod(trait, method): a method of `impl trait for ...`, both the
+	-- spellings written in source. The function's own `def_id` identifies the
+	-- method. Replaces the `<Trait>_<method>_<TypeKey>` spelling (F4).
+	ImplMethod(NameId, NameId)
+	-- PureVariant(base_def): the pure overload of the function whose `def_id`
+	-- is `base_def` (the impure or builtin sibling that shares its source
+	-- name). Replaces the `__pure` suffix (F1).
+	PureVariant(Int)
+	-- MonoInstance(base_def, arguments): a monomorphic instance of the generic
+	-- function `base_def`, specialized with `arguments`. Replaces the
+	-- `__mono_...` marker and its encoded suffix (F1).
+	MonoInstance(Int, CoreMonoSubstitution)
+	-- Synthesized(kind, declared_as): a body supplied by a synthesis pass for a
+	-- function that was created as `declared_as`. Synthesis runs after mono
+	-- and fills the body of a bodyless source, pure or mono function, so the
+	-- origin it replaces is kept inside rather than dropped: readers that
+	-- want the source name follow `declared_as`. The name never carried the
+	-- synthesis fact; readers recovered it by re-parsing the module-member
+	-- name (F2 readers in the `synth_*` passes).
+	Synthesized(CoreSynthesisKind, CoreFunctionOrigin)
+	-- HoistedLambda(enclosing_def, ordinal): the `ordinal`-th lambda hoisted
+	-- out of `enclosing_def` (a function or a global initializer). Replaces
+	-- `_blorp_clambda_<n>` (F5).
+	HoistedLambda(Int, Int)
+	-- HoistedTask(enclosing_def, ordinal): the `ordinal`-th task body hoisted
+	-- out of `enclosing_def`. Replaces `_blorp_task_<n>` (F5).
+	HoistedTask(Int, Int)
+	-- EtaExpansion(target_def): the adapter that lets the function
+	-- `target_def` be used as a closure value. Replaces `_blorp_eta_<n>` (F5).
+	EtaExpansion(Int)
+	-- Entrypoint(kind): one of the two exported entrypoint functions (F6).
+	Entrypoint(CoreEntrypointKind)
+
+
 record CoreFunction {
 	name: String,
 	source_module: Option[String],
@@ -2683,6 +2810,7 @@ record CoreFunction {
 	body: Option[CoreExpr],
 	is_pure: Bool,
 	function_kind: CoreFunctionKind,
+	origin: CoreFunctionOrigin,
 	def_id: Int,
 	loc: CoreSourceLoc
 }
@@ -14391,6 +14519,283 @@ pure func decode_core_function_kind_json(
 		Err(CoreUnsupportedTag(path, tag))
 
 
+private pure func core_synthesis_kind_name(kind: CoreSynthesisKind) -> String:
+	match kind:
+		ScalarOperatorSynthesis:
+			"scalar_operator"
+		HashCollectionSynthesis:
+			"hash_collection"
+		ListSynthesis:
+			"list"
+		ParallelTensorSynthesis:
+			"parallel_tensor"
+		FixedSynthesis:
+			"fixed"
+		ForwardSynthesis:
+			"forward"
+		FloatSynthesis:
+			"float"
+		BytesSynthesis:
+			"bytes"
+		StringSynthesis:
+			"string"
+		TensorSynthesis:
+			"tensor"
+		SliceSynthesis:
+			"slice"
+
+
+private pure func parse_core_synthesis_kind(
+	name: String,
+	path: String,
+) -> Result[CoreSynthesisKind, CoreJsonError]:
+	match name:
+		"scalar_operator":
+			Ok(ScalarOperatorSynthesis)
+		"hash_collection":
+			Ok(HashCollectionSynthesis)
+		"list":
+			Ok(ListSynthesis)
+		"parallel_tensor":
+			Ok(ParallelTensorSynthesis)
+		"fixed":
+			Ok(FixedSynthesis)
+		"forward":
+			Ok(ForwardSynthesis)
+		"float":
+			Ok(FloatSynthesis)
+		"bytes":
+			Ok(BytesSynthesis)
+		"string":
+			Ok(StringSynthesis)
+		"tensor":
+			Ok(TensorSynthesis)
+		"slice":
+			Ok(SliceSynthesis)
+		_:
+			Err(CoreUnsupportedTag(path, name))
+
+
+private pure func core_entrypoint_kind_name(kind: CoreEntrypointKind) -> String:
+	match kind:
+		ProgramWrapperEntrypoint:
+			"program_wrapper"
+		UserMainEntrypoint:
+			"user_main"
+
+
+private pure func parse_core_entrypoint_kind(
+	name: String,
+	path: String,
+) -> Result[CoreEntrypointKind, CoreJsonError]:
+	match name:
+		"program_wrapper":
+			Ok(ProgramWrapperEntrypoint)
+		"user_main":
+			Ok(UserMainEntrypoint)
+		_:
+			Err(CoreUnsupportedTag(path, name))
+
+
+private pure func mono_substitution_value_to_json(value: CoreMonoSubstitutionValue) -> JsonValue:
+	match value:
+		TypeSubstitution(typ):
+			JsonObject([
+				(KIND_FIELD, JsonString(TYPE_SUBSTITUTION_TAG)),
+				("type", core_type_to_json(typ)),
+			])
+		DimSubstitution(dim):
+			JsonObject([
+				(KIND_FIELD, JsonString(DIM_SUBSTITUTION_TAG)),
+				("dim", core_tensor_dim_to_json(dim)),
+			])
+		DimPackSubstitution(dims):
+			JsonObject([
+				(KIND_FIELD, JsonString(DIM_PACK_SUBSTITUTION_TAG)),
+				("dims", JsonVector(dims.map(core_tensor_dim_to_json))),
+			])
+
+
+private pure func mono_substitution_to_json(substitution: CoreMonoSubstitution) -> JsonValue:
+	JsonVector(
+		substitution.map(pure func(binding: (String, CoreMonoSubstitutionValue)) -> JsonValue: JsonObject([
+				("parameter", JsonString(binding[0])),
+				("value", mono_substitution_value_to_json(binding[1])),
+			])),
+	)
+
+
+pure func core_function_origin_to_json(origin: CoreFunctionOrigin) -> JsonValue:
+	match origin:
+		SourceFunction(name):
+			JsonObject([
+				(KIND_FIELD, JsonString(SOURCE_FUNCTION_ORIGIN_TAG)),
+				("name", json_int(name_id_index(name))),
+			])
+		ImplMethod(trait_name, method):
+			JsonObject([
+				(KIND_FIELD, JsonString(IMPL_METHOD_ORIGIN_TAG)),
+				("trait", json_int(name_id_index(trait_name))),
+				("method", json_int(name_id_index(method))),
+			])
+		PureVariant(base_def):
+			JsonObject([
+				(KIND_FIELD, JsonString(PURE_VARIANT_ORIGIN_TAG)),
+				("base_def", json_int(base_def)),
+			])
+		MonoInstance(base_def, arguments):
+			JsonObject([
+				(KIND_FIELD, JsonString(MONO_INSTANCE_ORIGIN_TAG)),
+				("base_def", json_int(base_def)),
+				("arguments", mono_substitution_to_json(arguments)),
+			])
+		Synthesized(kind, declared_as):
+			JsonObject([
+				(KIND_FIELD, JsonString(SYNTHESIZED_ORIGIN_TAG)),
+				("synthesis", JsonString(core_synthesis_kind_name(kind))),
+				("declared_as", core_function_origin_to_json(declared_as)),
+			])
+		HoistedLambda(enclosing_def, ordinal):
+			JsonObject([
+				(KIND_FIELD, JsonString(HOISTED_LAMBDA_ORIGIN_TAG)),
+				("enclosing_def", json_int(enclosing_def)),
+				("ordinal", json_int(ordinal)),
+			])
+		HoistedTask(enclosing_def, ordinal):
+			JsonObject([
+				(KIND_FIELD, JsonString(HOISTED_TASK_ORIGIN_TAG)),
+				("enclosing_def", json_int(enclosing_def)),
+				("ordinal", json_int(ordinal)),
+			])
+		EtaExpansion(target_def):
+			JsonObject([
+				(KIND_FIELD, JsonString(ETA_EXPANSION_ORIGIN_TAG)),
+				("target_def", json_int(target_def)),
+			])
+		Entrypoint(kind):
+			JsonObject([
+				(KIND_FIELD, JsonString(ENTRYPOINT_ORIGIN_TAG)),
+				("entrypoint", JsonString(core_entrypoint_kind_name(kind))),
+			])
+
+
+private pure func decode_mono_substitution_value_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreMonoSubstitutionValue, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == TYPE_SUBSTITUTION_TAG:
+		type_json ?= object_field(value, path, "type")
+		typ ?= decode_core_type_json(type_json, path_field(path, "type"))
+		Ok(TypeSubstitution(typ))
+	else if tag == DIM_SUBSTITUTION_TAG:
+		dim_json ?= object_field(value, path, "dim")
+		dim ?= decode_core_tensor_dim_json(dim_json, path_field(path, "dim"))
+		Ok(DimSubstitution(dim))
+	else if tag == DIM_PACK_SUBSTITUTION_TAG:
+		dims ?= decode_core_tensor_dims_json(value, path, "dims")
+		Ok(DimPackSubstitution(dims))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+private pure func decode_mono_substitution_json(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[CoreMonoSubstitution, CoreJsonError]:
+	items ?= array_field(value, path, field_name)
+	var result: CoreMonoSubstitution = []
+	var error: Option[CoreJsonError] = None
+	var index: Int = 0
+
+	for item in items:
+		if error.is_none():
+			item_path: String = path_index(path_field(path, field_name), index)
+
+			match decode_mono_binding_json(item, item_path):
+				Ok(binding):
+					result = result.append(binding)
+				Err(binding_error):
+					error = Some(binding_error)
+
+		index += 1
+
+	match error:
+		Some(existing_error):
+			Err(existing_error)
+		None:
+			Ok(result)
+
+
+private pure func decode_mono_binding_json(
+	item: JsonValue,
+	path: String,
+) -> Result[(String, CoreMonoSubstitutionValue), CoreJsonError]:
+	parameter ?= string_field(item, path, "parameter")
+	value_json ?= object_field(item, path, "value")
+	value ?= decode_mono_substitution_value_json(value_json, path_field(path, "value"))
+	Ok((parameter, value))
+
+
+private pure func decode_name_id_field(
+	value: JsonValue,
+	path: String,
+	field_name: String,
+) -> Result[NameId, CoreJsonError]:
+	index ?= int_field(value, path, field_name)
+	Ok(name_id_from_interned_index(index))
+
+
+pure func decode_core_function_origin_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreFunctionOrigin, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == SOURCE_FUNCTION_ORIGIN_TAG:
+		name ?= decode_name_id_field(value, path, "name")
+		Ok(SourceFunction(name))
+	else if tag == IMPL_METHOD_ORIGIN_TAG:
+		trait_name ?= decode_name_id_field(value, path, "trait")
+		method ?= decode_name_id_field(value, path, "method")
+		Ok(ImplMethod(trait_name, method))
+	else if tag == PURE_VARIANT_ORIGIN_TAG:
+		base_def ?= int_field(value, path, "base_def")
+		Ok(PureVariant(base_def))
+	else if tag == MONO_INSTANCE_ORIGIN_TAG:
+		base_def ?= int_field(value, path, "base_def")
+		arguments ?= decode_mono_substitution_json(value, path, "arguments")
+		Ok(MonoInstance(base_def, arguments))
+	else if tag == SYNTHESIZED_ORIGIN_TAG:
+		synthesis_name ?= string_field(value, path, "synthesis")
+		kind ?= parse_core_synthesis_kind(synthesis_name, path_field(path, "synthesis"))
+		declared_as_json ?= object_field(value, path, "declared_as")
+		declared_as ?= decode_core_function_origin_json(
+			declared_as_json,
+			path_field(path, "declared_as"),
+		)
+		Ok(Synthesized(kind, declared_as))
+	else if tag == HOISTED_LAMBDA_ORIGIN_TAG:
+		enclosing_def ?= int_field(value, path, "enclosing_def")
+		ordinal ?= int_field(value, path, "ordinal")
+		Ok(HoistedLambda(enclosing_def, ordinal))
+	else if tag == HOISTED_TASK_ORIGIN_TAG:
+		enclosing_def ?= int_field(value, path, "enclosing_def")
+		ordinal ?= int_field(value, path, "ordinal")
+		Ok(HoistedTask(enclosing_def, ordinal))
+	else if tag == ETA_EXPANSION_ORIGIN_TAG:
+		target_def ?= int_field(value, path, "target_def")
+		Ok(EtaExpansion(target_def))
+	else if tag == ENTRYPOINT_ORIGIN_TAG:
+		entrypoint_name ?= string_field(value, path, "entrypoint")
+		kind ?= parse_core_entrypoint_kind(entrypoint_name, path_field(path, "entrypoint"))
+		Ok(Entrypoint(kind))
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 private pure func option_expr_to_json(body: Option[CoreExpr]) -> JsonValue:
 	match body:
 		Some(expr):
@@ -14436,6 +14841,7 @@ pure func core_function_to_json(core_func: CoreFunction) -> JsonValue:
 		("body", option_expr_to_json(core_func.body)),
 		("pure", JsonBool(core_func.is_pure)),
 		("function_kind", core_function_kind_to_json(core_func.function_kind)),
+		("origin", core_function_origin_to_json(core_func.origin)),
 		("def_id", json_int(core_func.def_id)),
 		("loc", source_loc_to_json(core_func.loc)),
 	])
@@ -14466,6 +14872,11 @@ pure func decode_core_function_json(
 			function_kind_json,
 			path_field(path, "function_kind"),
 		)
+		origin_json ?= object_field(value, path, "origin")
+		origin ?= decode_core_function_origin_json(
+			origin_json,
+			path_field(path, "origin"),
+		)
 		def_id ?= int_field(value, path, "def_id")
 		loc_json ?= required_field(value, path, "loc")
 		loc ?= decode_source_loc_json(
@@ -14482,6 +14893,7 @@ pure func decode_core_function_json(
 			body = body,
 			is_pure = is_pure,
 			function_kind = function_kind,
+			origin = origin,
 			def_id = def_id,
 			loc = loc,
 		})

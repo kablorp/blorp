@@ -160,6 +160,7 @@ import:
 			UnresolvedBuiltinFunction,
 			UserFunction,
 		),
+		CoreFunctionOrigin(EtaExpansion, HoistedLambda, HoistedTask),
 		CoreGlobal,
 		CoreLiteralMatchCase,
 		CoreLiteralMatchFallback(
@@ -221,6 +222,8 @@ TASK_NAME_PREFIX: String = "_blorp_task_"
 ETA_NAME_PREFIX: String = "_blorp_eta_"
 
 STATIC_CLOSURE_PREFIX: String = "__sc_"
+
+NO_ENCLOSING_DEFINITION: Int = -1
 
 CLOSURE_TYPE_NAME: String = "Closure"
 
@@ -303,6 +306,11 @@ per-node results below.
 record ClosureFacts {
 	mode: ClosurePassMode,
 	current_module: Option[String],
+	-- The definition whose body is being converted: the `enclosing_def` of every
+	-- function hoisted while it is (`CoreFunctionOrigin`). Set per function or
+	-- global initializer before any hoisting; `NO_ENCLOSING_DEFINITION` only
+	-- before the first one, where nothing can hoist.
+	enclosing_def_id: Int,
 	functions_by_id: Dict[Int, CoreFunction],
 	function_collisions_by_id: Dict[Int, List[CoreFunction]],
 	functions_by_name: Dict[String, List[CoreFunction]],
@@ -544,6 +552,8 @@ record ConvertedDecls {
 record FreshHoistedName {
 	state: ClosureState,
 	name: String,
+	-- The `<n>` in `name`: the counter value this hoist consumed.
+	ordinal: Int,
 	def_id: Int,
 	c_name: String,
 	static_name: String
@@ -1733,6 +1743,7 @@ private pure func free_vars_expr(
 
 
 private pure func next_eta_name(state: ClosureState) -> FreshHoistedName:
+	ordinal: Int = state.next_eta_index
 	name: String = ETA_NAME_PREFIX + state.next_eta_index.to_string()
 	def_id: Int = state.next_def_id
 	c_name: String = mangled_definition_name(def_id, name)
@@ -1743,6 +1754,7 @@ private pure func next_eta_name(state: ClosureState) -> FreshHoistedName:
 	{
 		state = new_state,
 		name = name,
+		ordinal = ordinal,
 		def_id = def_id,
 		c_name = c_name,
 		static_name = static_closure_name(c_name)
@@ -1750,6 +1762,7 @@ private pure func next_eta_name(state: ClosureState) -> FreshHoistedName:
 
 
 private pure func next_lambda_name(state: ClosureState) -> FreshHoistedName:
+	ordinal: Int = state.next_lambda_index
 	name: String = LAMBDA_NAME_PREFIX + state.next_lambda_index.to_string()
 	def_id: Int = state.next_def_id
 	c_name: String = mangled_definition_name(def_id, name)
@@ -1760,6 +1773,7 @@ private pure func next_lambda_name(state: ClosureState) -> FreshHoistedName:
 	{
 		state = new_state,
 		name = name,
+		ordinal = ordinal,
 		def_id = def_id,
 		c_name = c_name,
 		static_name = static_closure_name(c_name)
@@ -1767,6 +1781,7 @@ private pure func next_lambda_name(state: ClosureState) -> FreshHoistedName:
 
 
 private pure func next_task_name(state: ClosureState) -> FreshHoistedName:
+	ordinal: Int = state.next_task_index
 	name: String = TASK_NAME_PREFIX + state.next_task_index.to_string()
 	def_id: Int = state.next_def_id
 	c_name: String = mangled_definition_name(def_id, name)
@@ -1777,6 +1792,7 @@ private pure func next_task_name(state: ClosureState) -> FreshHoistedName:
 	{
 		state = new_state,
 		name = name,
+		ordinal = ordinal,
 		def_id = def_id,
 		c_name = c_name,
 		static_name = static_closure_name(c_name)
@@ -1805,6 +1821,7 @@ pure func lambda_runtime_captures(
 	facts: ClosureFacts = {
 		mode = ConvertClosures,
 		current_module = None,
+		enclosing_def_id = NO_ENCLOSING_DEFINITION,
 		functions_by_id = {},
 		function_collisions_by_id = {},
 		functions_by_name = {},
@@ -3419,6 +3436,7 @@ private pure func adapt_var_expr(
 							),
 							is_pure = signature.is_pure,
 							function_kind = ClosureBodyFunction(abi),
+							origin = EtaExpansion(target.def_id),
 							def_id = fresh.def_id,
 							loc = loc
 						}
@@ -3482,6 +3500,7 @@ private pure func hoist_lambda(
 		body = Some(body),
 		is_pure = is_pure,
 		function_kind = ClosureBodyFunction(abi),
+		origin = HoistedLambda(facts.enclosing_def_id, fresh.ordinal),
 		def_id = fresh.def_id,
 		loc = loc
 	}
@@ -3533,6 +3552,7 @@ private pure func hoist_task(
 		body = Some(balanced_body),
 		is_pure = False,
 		function_kind = ClosureBodyFunction(abi),
+		origin = HoistedTask(facts.enclosing_def_id, fresh.ordinal),
 		def_id = fresh.def_id,
 		loc = loc
 	}
@@ -7428,6 +7448,7 @@ private pure func closure_facts(program: CoreProgram, mode: ClosurePassMode) -> 
 	{
 		mode = mode,
 		current_module = None,
+		enclosing_def_id = NO_ENCLOSING_DEFINITION,
 		functions_by_id = indexes.by_id,
 		function_collisions_by_id = indexes.collisions_by_id,
 		functions_by_name = indexes.by_name,
@@ -7459,7 +7480,10 @@ private pure func convert_function(
 ) -> ConvertedDecl:
 	match func_info.body:
 		Some(body):
-			facts_with_module: ClosureFacts = { facts | current_module = func_info.source_module }
+			facts_with_module: ClosureFacts = { facts |
+				current_module = func_info.source_module,
+				enclosing_def_id = func_info.def_id
+			}
 			body_bound: List[String] = add_bound_params([], func_info.params)
 			converted: ConvertedExpr = convert_expr(facts_with_module, state, body_bound, body)
 
@@ -7486,7 +7510,12 @@ private pure func convert_global(
 	decl: CoreDecl,
 	global: CoreGlobal,
 ) -> ConvertedDecl:
-	converted: ConvertedExpr = convert_expr(facts, state, [], global.init)
+	converted: ConvertedExpr = convert_expr(
+		{ facts | enclosing_def_id = global.def_id },
+		state,
+		[],
+		global.init,
+	)
 
 	if same_core_expr(converted.expr, global.init):
 		{
