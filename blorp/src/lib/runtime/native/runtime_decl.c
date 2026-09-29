@@ -701,7 +701,7 @@ typedef struct { blorp_Object header; long arity; long release_mask; void* elem[
 #define DICT_META_DELETED 0x80
 #define DICT_GROUP_SIZE   16
 
-typedef struct {
+typedef struct blorp_HashTable {
     blorp_Object header;
     long size;
     long order_len;
@@ -718,6 +718,8 @@ typedef struct {
     void (*key_release)(void*);
     void (*value_release)(void*);
 } blorp_Dict;
+
+typedef struct blorp_HashTable blorp_HashTable;
 
 typedef struct blorp_SetEntry {
     void* key;

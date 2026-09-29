@@ -21232,21 +21232,26 @@ static inline void blorp_tuple_set_rc(blorp_Tuple* t, long mask) {
 // Occupied slots have high bit 0; empty/deleted have high bit 1.
 // Probing is currently scalar; the encoding would let SIMD compare 16 meta
 // bytes at once to find h2 matches or empty slots.
+// The DICT_META_* names predate the shared table: they serve every
+// blorp_HashTable, not only Dict.
 #define DICT_META_EMPTY   0xFF
 #define DICT_META_DELETED 0x80
 #define DICT_GROUP_SIZE   16
 
-typedef struct {
+// One hash table layout shared by every hashed collection: the table state
+// below plus a single storage buffer whose per-slot arrays are chosen by a
+// blorp_HashSlotLayout. blorp_Dict is this struct with keys and values.
+typedef struct blorp_HashTable {
     blorp_Object header;
     long size;           // Number of live entries
     long order_len;      // Length of order[] including holes (-1 entries from removal)
     long capacity;       // Power of 2 (hash table capacity)
     long mask;           // capacity - 1 (for & instead of %)
     long grow_at;        // Rehash threshold (capacity * 7 / 10)
-    // The five per-slot arrays live in one backing buffer per capacity (see
-    // blorp_dict_alloc_storage); keys is its base and the pointer that owns it.
+    // The per-slot arrays live in one backing buffer per capacity (see
+    // blorp_hash_table_alloc_storage); keys is its base and the pointer that owns it.
     void** keys;         // Flat array [capacity]
-    void** values;       // Flat array [capacity]
+    void** values;       // Flat array [capacity]; NULL for a keys-only layout
     uint8_t* meta;       // [capacity]: metadata bytes
     long* order;         // Slot indices [capacity], with -1 holes, preserves insertion order
     long* order_index;   // Reverse map: slot -> position in order[] (valid for occupied slots)
@@ -21255,6 +21260,8 @@ typedef struct {
     void (*key_release)(void*);    // ARC release for refcounted keys (NULL for primitives)
     void (*value_release)(void*);  // ARC release for refcounted values (NULL for primitives)
 } blorp_Dict;
+
+typedef struct blorp_HashTable blorp_HashTable;
 
 // Type-specific hash functions
 // Random seed for hash functions — prevents hash collision DoS
@@ -21395,7 +21402,7 @@ long blorp_hash_combine(long seed, long value) {
 }
 
 // Compute h2 fingerprint: low 7 bits from top of hash (0x00-0x7F, high bit always 0)
-static inline uint8_t blorp_dict_h2(unsigned long hash) {
+static inline uint8_t blorp_hash_h2(unsigned long hash) {
     return (uint8_t)(hash >> 57) & 0x7F;
 }
 
@@ -21403,14 +21410,19 @@ static inline uint8_t blorp_dict_h2(unsigned long hash) {
 // Meta encoding: 0xFF=empty, 0x80=deleted, 0x00-0x7F=h2 (occupied).
 // Returns slot index if found, -1 if not found.
 // If out_insert_slot is non-NULL and key not found, writes the first available slot.
-static long blorp_dict_find_slot(blorp_Dict* dict, void* key, unsigned long hash, long* out_insert_slot) {
-    uint8_t h2 = blorp_dict_h2(hash);
-    long i = (long)(hash & (unsigned long)dict->mask);
+static long blorp_hash_table_find_slot(
+    blorp_HashTable* table,
+    void* key,
+    unsigned long hash,
+    long* out_insert_slot
+) {
+    uint8_t h2 = blorp_hash_h2(hash);
+    long i = (long)(hash & (unsigned long)table->mask);
     long first_available = -1;
     long probes = 0;
-    while (probes <= dict->capacity) {
-        uint8_t m = dict->meta[i];
-        if (m == h2 && dict->eq_fn(dict->keys[i], key)) {
+    while (probes <= table->capacity) {
+        uint8_t m = table->meta[i];
+        if (m == h2 && table->eq_fn(table->keys[i], key)) {
             return i;  // Found
         }
         if (m == DICT_META_EMPTY) {
@@ -21423,7 +21435,7 @@ static long blorp_dict_find_slot(blorp_Dict* dict, void* key, unsigned long hash
         if (m == DICT_META_DELETED && first_available == -1) {
             first_available = i;
         }
-        i = (i + 1) & dict->mask;
+        i = (i + 1) & table->mask;
         probes++;
     }
     if (out_insert_slot && first_available >= 0) {
@@ -21432,92 +21444,212 @@ static long blorp_dict_find_slot(blorp_Dict* dict, void* key, unsigned long hash
     return -1;
 }
 
-// Dict table storage.
+// Hash table storage.
 //
-// All five per-slot arrays of one capacity share a single raw buffer laid out
-// keys | values | order | order_index | meta, so a dict is two allocations
-// (header + table) instead of six, and a rehash or copy frees and allocates
-// one buffer. The struct keeps a separate pointer per array because emitted
-// C and synthesized Core address each array through its own field
-// (stage_10_backend/intrinsic_renderer.brp dict_* intrinsics). `keys` is the
-// buffer base and the only pointer passed to free(). The 8-byte arrays come
-// first so each stays naturally aligned; nothing scans meta with SIMD loads,
-// so it needs no extra alignment.
+// All per-slot arrays of one capacity share a single raw buffer, so a table
+// is two allocations (header + storage) and a rehash or copy frees and
+// allocates one buffer. A blorp_HashSlotLayout names which arrays the buffer
+// holds: a Dict table is keys | values | order | order_index | meta, and a
+// keys-only table drops the values array and keeps `values` NULL. The struct
+// keeps a separate pointer per array because emitted C and synthesized Core
+// address each array through its own field (stage_10_backend/
+// intrinsic_renderer.brp dict_* intrinsics). `keys` is the buffer base and
+// the only pointer passed to free(). The 8-byte arrays come first so each
+// stays naturally aligned; nothing scans meta with SIMD loads, so it needs no
+// extra alignment.
 //
 // Only meta is initialized. Every other array is read solely at slots whose
-// meta byte is occupied (probes compare meta first: blorp_dict_find_slot here
-// and the synthesized dict_find_slot/insert probes in
+// meta byte is occupied (probes compare meta first: blorp_hash_table_find_slot
+// here and the synthesized dict_find_slot/insert probes in
 // stage_09_core/synth_hash_collections.brp), or through order[] entries below
 // order_len, and each of those positions is written when its entry is
 // inserted. Zeroing keys/values/order_index would be pure overhead.
-#define DICT_SLOT_STORAGE_BYTES \
-    (sizeof(void*) + sizeof(void*) + sizeof(long) + sizeof(long) + sizeof(uint8_t))
+//
+// Every caller passes a constant layout, and the helpers are inline, so the
+// layout branches fold away at each call site.
+typedef enum {
+    BLORP_HASH_SLOTS_KEYS,
+    BLORP_HASH_SLOTS_KEYS_AND_VALUES,
+} blorp_HashSlotLayout;
 
-static void blorp_dict_alloc_storage(blorp_Dict* dict, long capacity) {
-    char* storage = (char*)blorp_malloc_checked(
-        blorp_checked_mul(capacity, (long)DICT_SLOT_STORAGE_BYTES));
-    dict->capacity = capacity;
-    dict->mask = capacity - 1;
-    dict->grow_at = capacity * 7 / 10;
-    dict->keys = (void**)storage;
-    dict->values = dict->keys + capacity;
-    dict->order = (long*)(dict->values + capacity);
-    dict->order_index = dict->order + capacity;
-    dict->meta = (uint8_t*)(dict->order_index + capacity);
-    memset(dict->meta, DICT_META_EMPTY, (size_t)capacity);
+#define BLORP_DICT_SLOTS BLORP_HASH_SLOTS_KEYS_AND_VALUES
+
+static inline bool blorp_hash_slots_have_values(blorp_HashSlotLayout layout) {
+    return layout == BLORP_HASH_SLOTS_KEYS_AND_VALUES;
 }
 
-static inline void blorp_dict_free_storage(void** storage_base) {
+static inline size_t blorp_hash_slot_bytes(blorp_HashSlotLayout layout) {
+    return sizeof(void*)                                               // keys
+        + (blorp_hash_slots_have_values(layout) ? sizeof(void*) : 0)   // values
+        + sizeof(long) + sizeof(long)                                  // order, order_index
+        + sizeof(uint8_t);                                             // meta
+}
+
+static inline void blorp_hash_table_alloc_storage(
+    blorp_HashTable* table,
+    long capacity,
+    blorp_HashSlotLayout layout
+) {
+    char* storage = (char*)blorp_malloc_checked(
+        blorp_checked_mul(capacity, (long)blorp_hash_slot_bytes(layout)));
+    table->capacity = capacity;
+    table->mask = capacity - 1;
+    table->grow_at = capacity * 7 / 10;
+    table->keys = (void**)storage;
+    void** after_keys = table->keys + capacity;
+    if (blorp_hash_slots_have_values(layout)) {
+        table->values = after_keys;
+        after_keys = table->values + capacity;
+    } else {
+        table->values = NULL;
+    }
+    table->order = (long*)after_keys;
+    table->order_index = table->order + capacity;
+    table->meta = (uint8_t*)(table->order_index + capacity);
+    memset(table->meta, DICT_META_EMPTY, (size_t)capacity);
+}
+
+static inline void blorp_hash_table_free_storage(void** storage_base) {
     free(storage_base);
 }
 
 // Place an entry into a table that has no tombstones and does not already
 // contain the key: take the first empty slot on the probe path, with no key
 // comparisons. Used to rebuild a table from another table's live entries.
-static inline void blorp_dict_place_distinct(
-    blorp_Dict* dict,
+// `value` is ignored for a keys-only layout.
+static inline void blorp_hash_table_place_distinct(
+    blorp_HashTable* table,
     void* key,
     void* value,
-    unsigned long hash
+    unsigned long hash,
+    blorp_HashSlotLayout layout
 ) {
-    long slot = (long)(hash & (unsigned long)dict->mask);
-    while (dict->meta[slot] != DICT_META_EMPTY) {
-        slot = (slot + 1) & dict->mask;
+    long slot = (long)(hash & (unsigned long)table->mask);
+    while (table->meta[slot] != DICT_META_EMPTY) {
+        slot = (slot + 1) & table->mask;
     }
-    dict->meta[slot] = blorp_dict_h2(hash);
-    dict->keys[slot] = key;
-    dict->values[slot] = value;
-    dict->order_index[slot] = dict->order_len;
-    dict->order[dict->order_len++] = slot;
-    dict->size++;
+    table->meta[slot] = blorp_hash_h2(hash);
+    table->keys[slot] = key;
+    if (blorp_hash_slots_have_values(layout)) table->values[slot] = value;
+    table->order_index[slot] = table->order_len;
+    table->order[table->order_len++] = slot;
+    table->size++;
 }
 
-// Fill the freshly allocated (all-empty) table of `dict` with the live
-// entries of a source table in insertion order. Holes and tombstones are
-// dropped. The caller guarantees dict->capacity exceeds the live entry
-// count, so the probe loop always finds an empty slot.
-static void blorp_dict_place_entries_from(
-    blorp_Dict* dict,
+// First slot on `hash`'s probe path that holds no live entry. Only valid for
+// a key known to be absent: that is exactly the slot blorp_hash_table_find_slot
+// reports as the insert position (the first tombstone before the first empty
+// slot, else that empty slot). Empty (0xFF) and deleted (0x80) meta bytes
+// both have the high bit set and live h2 fingerprints never do, so one bit
+// test tells a free slot from a live one.
+static inline long blorp_hash_table_free_slot_for(const blorp_HashTable* table, unsigned long hash) {
+    long slot = (long)(hash & (unsigned long)table->mask);
+    while (!(table->meta[slot] & DICT_META_DELETED)) {
+        slot = (slot + 1) & table->mask;
+    }
+    return slot;
+}
+
+// Fill the freshly allocated (all-empty) table with the live entries of a
+// source table in insertion order. Holes and tombstones are dropped. The
+// caller guarantees table->capacity exceeds the live entry count, so the
+// probe loop always finds an empty slot. `source_values` is only read for a
+// layout with values.
+static inline void blorp_hash_table_place_entries_from(
+    blorp_HashTable* table,
     void* const* source_keys,
     void* const* source_values,
     const long* source_order,
-    long source_order_len
+    long source_order_len,
+    blorp_HashSlotLayout layout
 ) {
-    dict->size = 0;
-    dict->order_len = 0;
+    table->size = 0;
+    table->order_len = 0;
     for (long i = 0; i < source_order_len; i++) {
         long source_slot = source_order[i];
         if (source_slot < 0) continue;
         void* key = source_keys[source_slot];
-        blorp_dict_place_distinct(dict, key, source_values[source_slot], dict->hash_fn(key));
+        void* value = blorp_hash_slots_have_values(layout) ? source_values[source_slot] : NULL;
+        blorp_hash_table_place_distinct(table, key, value, table->hash_fn(key), layout);
     }
 }
 
+// Same-capacity copy of a source table's storage: one buffer copy of the
+// whole table. Slots that meta marks unoccupied carry whatever bytes the
+// source had, which is fine because nothing reads them (see above). The
+// caller retains the copied entries.
+static inline void blorp_hash_table_copy_storage(
+    blorp_HashTable* table,
+    const blorp_HashTable* source,
+    blorp_HashSlotLayout layout
+) {
+    blorp_hash_table_alloc_storage(table, source->capacity, layout);
+    memcpy(table->keys, source->keys, (size_t)source->capacity * blorp_hash_slot_bytes(layout));
+    table->size = source->size;
+    table->order_len = source->order_len;
+}
+
+// Rehash into a table of new_capacity (no tombstones or order holes in the
+// result). Keys are already distinct, so entries are placed without key
+// comparisons.
+static inline void blorp_hash_table_rehash(
+    blorp_HashTable* table,
+    long new_capacity,
+    blorp_HashSlotLayout layout
+) {
+    void** old_keys = table->keys;
+    void** old_values = table->values;
+    long* old_order = table->order;
+    long old_order_len = table->order_len;
+    blorp_hash_table_alloc_storage(table, new_capacity, layout);
+    blorp_hash_table_place_entries_from(
+        table, old_keys, old_values, old_order, old_order_len, layout);
+    blorp_hash_table_free_storage(old_keys);
+}
+
+// Retain the live keys and values a table releases, after its entries were
+// copied from a table that still owns them.
+static inline void blorp_hash_table_retain_entries(
+    blorp_HashTable* table,
+    blorp_HashSlotLayout layout
+) {
+    bool has_values = blorp_hash_slots_have_values(layout);
+    if (!table->key_release && !(has_values && table->value_release)) return;
+    for (long i = 0; i < table->order_len; i++) {
+        long slot = table->order[i];
+        if (slot < 0) continue;
+        if (table->key_release && table->keys[slot]) blorp_retain(table->keys[slot]);
+        if (has_values && table->value_release && table->values[slot]) {
+            blorp_retain(table->values[slot]);
+        }
+    }
+}
+
+// Release the live keys and values a table owns (destroy and reuse).
+static inline void blorp_hash_table_release_entries(
+    blorp_HashTable* table,
+    blorp_HashSlotLayout layout
+) {
+    bool has_values = blorp_hash_slots_have_values(layout);
+    for (long i = 0; i < table->order_len; i++) {
+        long slot = table->order[i];
+        if (slot < 0) continue;
+        if (table->key_release && table->keys[slot])
+            blorp_release_element_with(table->key_release, table->keys[slot]);
+        if (has_values && table->value_release && table->values[slot])
+            blorp_release_element_with(table->value_release, table->values[slot]);
+    }
+}
+
+// Smallest capacity of any hash table: new tables start here, and requested
+// capacities are rounded up to at least this power of two.
+#define BLORP_HASH_TABLE_MIN_CAPACITY 16
+
 static long blorp_hash_capacity_at_least(long min_cap) {
-    if (min_cap <= 16) return 16;
+    if (min_cap <= BLORP_HASH_TABLE_MIN_CAPACITY) return BLORP_HASH_TABLE_MIN_CAPACITY;
     const unsigned long max_cap = ((unsigned long)LONG_MAX >> 1) + 1UL;
     unsigned long target = (unsigned long)min_cap;
-    unsigned long cap = 16;
+    unsigned long cap = BLORP_HASH_TABLE_MIN_CAPACITY;
     while (cap < target) {
         if (cap >= max_cap) return (long)max_cap;
         cap <<= 1;
@@ -21526,7 +21658,7 @@ static long blorp_hash_capacity_at_least(long min_cap) {
 }
 
 static long blorp_dict_capacity_for_len(long len) {
-    if (len <= 0) return 16;
+    if (len <= 0) return BLORP_HASH_TABLE_MIN_CAPACITY;
     const unsigned long max_long = (unsigned long)LONG_MAX;
     unsigned long target_len = (unsigned long)len;
     if (target_len > max_long / 10UL) {
@@ -21539,23 +21671,16 @@ static long blorp_dict_capacity_for_len(long len) {
 
 static void blorp_dict_destroy(void* obj) {
     blorp_Dict* dict = (blorp_Dict*)obj;
-    for (long i = 0; i < dict->order_len; i++) {
-        long slot = dict->order[i];
-        if (slot < 0) continue;
-        if (dict->key_release && dict->keys[slot])
-            blorp_release_element_with(dict->key_release, dict->keys[slot]);
-        if (dict->value_release && dict->values[slot])
-            blorp_release_element_with(dict->value_release, dict->values[slot]);
-    }
-    blorp_dict_free_storage(dict->keys);
+    blorp_hash_table_release_entries(dict, BLORP_DICT_SLOTS);
+    blorp_hash_table_free_storage(dict->keys);
 }
 
 blorp_Dict* blorp_dict_new(void) {
-    long initial_capacity = 16;
+    long initial_capacity = BLORP_HASH_TABLE_MIN_CAPACITY;
     blorp_Dict* dict = (blorp_Dict*)blorp_alloc(sizeof(blorp_Dict));
     dict->size = 0;
     dict->order_len = 0;
-    blorp_dict_alloc_storage(dict, initial_capacity);
+    blorp_hash_table_alloc_storage(dict, initial_capacity, BLORP_DICT_SLOTS);
     dict->hash_fn = blorp_dict_hash_int;
     dict->eq_fn = blorp_dict_key_eq_int;
     dict->key_release = NULL;
@@ -21634,7 +21759,7 @@ void blorp_dict_set_value_release(blorp_Dict* dict, void (*release_fn)(void*)) {
 blorp_Option* blorp_dict_get(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return blorp_option_none();
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         void* val = dict->values[slot];
         if (dict->value_release && val) blorp_retain(val);
@@ -21648,7 +21773,7 @@ blorp_Option* blorp_dict_get(blorp_Dict* dict, void* key) {
 bool blorp_dict_get_raw(blorp_Dict* dict, void* key, void** out_value) {
     if (__builtin_expect(!dict, 0)) return false;
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         if (out_value) *out_value = dict->values[slot];
         return true;
@@ -21659,7 +21784,7 @@ bool blorp_dict_get_raw(blorp_Dict* dict, void* key, void** out_value) {
 void* blorp_dict_get_nullable(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return NULL;
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         void* val = dict->values[slot];
         if (dict->value_release && val) blorp_retain(val);
@@ -21671,7 +21796,7 @@ void* blorp_dict_get_nullable(blorp_Dict* dict, void* key) {
 blorp_StackOption_Int blorp_dict_get_int(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_int_none();
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         return blorp_stack_option_int_some((long)dict->values[slot]);
     }
@@ -21682,7 +21807,7 @@ blorp_StackOption_Int blorp_dict_get_int(blorp_Dict* dict, void* key) {
 blorp_StackOption_##NAME blorp_dict_get_##SUFFIX(blorp_Dict* dict, void* key) { \
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_##SUFFIX##_none(); \
     unsigned long hash = dict->hash_fn(key); \
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL); \
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL); \
     if (slot >= 0) { \
         return blorp_stack_option_##SUFFIX##_some((CTYPE)(intptr_t)dict->values[slot]); \
     } \
@@ -21693,7 +21818,7 @@ blorp_StackOption_##NAME blorp_dict_get_##SUFFIX(blorp_Dict* dict, void* key) { 
 blorp_StackOption_##NAME blorp_dict_get_##SUFFIX(blorp_Dict* dict, void* key) { \
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_##SUFFIX##_none(); \
     unsigned long hash = dict->hash_fn(key); \
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL); \
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL); \
     if (slot >= 0) { \
         return blorp_stack_option_##SUFFIX##_some((CTYPE)(uintptr_t)dict->values[slot]); \
     } \
@@ -21715,7 +21840,7 @@ BLORP_DEFINE_DICT_GET_UNSIGNED(uint64, UInt64, uint64_t)
 blorp_StackOption_Float blorp_dict_get_float(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_float_none();
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         return blorp_stack_option_float_some(blorp_unbox_float(dict->values[slot]));
     }
@@ -21725,7 +21850,7 @@ blorp_StackOption_Float blorp_dict_get_float(blorp_Dict* dict, void* key) {
 blorp_StackOption_Bool blorp_dict_get_bool(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_bool_none();
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         return blorp_stack_option_bool_some((long)dict->values[slot]);
     }
@@ -21735,7 +21860,7 @@ blorp_StackOption_Bool blorp_dict_get_bool(blorp_Dict* dict, void* key) {
 blorp_StackOption_Char blorp_dict_get_char(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_char_none();
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         return blorp_stack_option_char_some((int32_t)(long)dict->values[slot]);
     }
@@ -21745,7 +21870,7 @@ blorp_StackOption_Char blorp_dict_get_char(blorp_Dict* dict, void* key) {
 blorp_StackOption_Float32 blorp_dict_get_f32(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_float32_none();
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         return blorp_stack_option_float32_some(blorp_unbox_float32(dict->values[slot]));
     }
@@ -21756,7 +21881,7 @@ blorp_StackOption_Float32 blorp_dict_get_f32(blorp_Dict* dict, void* key) {
 blorp_StackOption_Float16 blorp_dict_get_f16(blorp_Dict* dict, void* key) {
     if (__builtin_expect(!dict, 0)) return blorp_stack_option_float16_none();
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     if (slot >= 0) {
         return blorp_stack_option_float16_some(blorp_unbox_float16(dict->values[slot]));
     }
@@ -21775,27 +21900,18 @@ static blorp_Dict* blorp_dict_new_like(const blorp_Dict* src) {
     return dict;
 }
 
-static void blorp_dict_retain_entries(blorp_Dict* dict) {
-    if (!dict->key_release && !dict->value_release) return;
-    for (long i = 0; i < dict->order_len; i++) {
-        long slot = dict->order[i];
-        if (slot < 0) continue;
-        if (dict->key_release && dict->keys[slot]) blorp_retain(dict->keys[slot]);
-        if (dict->value_release && dict->values[slot]) blorp_retain(dict->values[slot]);
-    }
+// Out of line: rehashing is rare, and keeping it a call keeps the insert path
+// small.
+static void blorp_dict_rehash(blorp_Dict* dict, long new_capacity) {
+    blorp_hash_table_rehash(dict, new_capacity, BLORP_DICT_SLOTS);
 }
 
-// Same-capacity copy: one buffer copy of the whole table. Slots that meta
-// marks unoccupied carry whatever bytes the source had, which is fine
-// because nothing reads them (see the storage comment above).
+// Same-capacity copy: one buffer copy of the whole table.
 static blorp_Dict* blorp_dict_copy(blorp_Dict* src) {
     if (!src) return blorp_dict_new();
     blorp_Dict* dict = blorp_dict_new_like(src);
-    blorp_dict_alloc_storage(dict, src->capacity);
-    memcpy(dict->keys, src->keys, (size_t)src->capacity * DICT_SLOT_STORAGE_BYTES);
-    dict->size = src->size;
-    dict->order_len = src->order_len;
-    blorp_dict_retain_entries(dict);
+    blorp_hash_table_copy_storage(dict, src, BLORP_DICT_SLOTS);
+    blorp_hash_table_retain_entries(dict, BLORP_DICT_SLOTS);
 #if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
     blorp_profile_record_dict_copy(src->capacity, src->order_len);
 #endif
@@ -21807,26 +21923,14 @@ static blorp_Dict* blorp_dict_copy(blorp_Dict* src) {
 // fresh copy straight away.
 static blorp_Dict* blorp_dict_copy_rehashed(blorp_Dict* src, long capacity) {
     blorp_Dict* dict = blorp_dict_new_like(src);
-    blorp_dict_alloc_storage(dict, capacity);
-    blorp_dict_place_entries_from(dict, src->keys, src->values, src->order, src->order_len);
-    blorp_dict_retain_entries(dict);
+    blorp_hash_table_alloc_storage(dict, capacity, BLORP_DICT_SLOTS);
+    blorp_hash_table_place_entries_from(
+        dict, src->keys, src->values, src->order, src->order_len, BLORP_DICT_SLOTS);
+    blorp_hash_table_retain_entries(dict, BLORP_DICT_SLOTS);
 #if BLORP_PROFILE_COLLECTION_COPY_COUNTERS
     blorp_profile_record_dict_copy(src->capacity, src->order_len);
 #endif
     return dict;
-}
-
-// Rehash into a table of new_capacity (no tombstones or order holes in the
-// result). Keys are already distinct, so entries are placed without key
-// comparisons.
-static void blorp_dict_rehash(blorp_Dict* dict, long new_capacity) {
-    void** old_keys = dict->keys;
-    void** old_values = dict->values;
-    long* old_order = dict->order;
-    long old_order_len = dict->order_len;
-    blorp_dict_alloc_storage(dict, new_capacity);
-    blorp_dict_place_entries_from(dict, old_keys, old_values, old_order, old_order_len);
-    blorp_dict_free_storage(old_keys);
 }
 
 // Ownership: consumes `dict` and returns the owned result; borrows `key`
@@ -21841,7 +21945,7 @@ blorp_Dict* blorp_dict_insert(blorp_Dict* dict, void* key, void* value) {
         // reference passes straight through as the result. Values compare
         // by stored pointer (identity for heap values, bits for unboxed
         // scalars); user equality is never called here.
-        long existing = blorp_dict_find_slot(dict, key, hash, NULL);
+        long existing = blorp_hash_table_find_slot(dict, key, hash, NULL);
         if (existing >= 0 && dict->values[existing] == value) return dict;
         // A new key that reaches the growth threshold, or that finds order[]
         // full, would rehash the fresh copy immediately; build the copy at
@@ -21868,7 +21972,7 @@ blorp_Dict* blorp_dict_insert(blorp_Dict* dict, void* key, void* value) {
     }
 
     long insert_slot = -1;
-    long found = blorp_dict_find_slot(result, key, hash, &insert_slot);
+    long found = blorp_hash_table_find_slot(result, key, hash, &insert_slot);
 
     if (found >= 0) {
         // Key exists — update value
@@ -21882,7 +21986,7 @@ blorp_Dict* blorp_dict_insert(blorp_Dict* dict, void* key, void* value) {
     }
 
     // Insert new entry
-    result->meta[insert_slot] = blorp_dict_h2(hash);
+    result->meta[insert_slot] = blorp_hash_h2(hash);
     result->keys[insert_slot] = key;
     result->values[insert_slot] = value;
     if (result->key_release && key) blorp_retain(key);
@@ -21904,7 +22008,7 @@ blorp_Dict* blorp_dict_remove(blorp_Dict* dict, void* key) {
     if (!dict) return blorp_dict_new();
 
     unsigned long hash = dict->hash_fn(key);
-    long slot = blorp_dict_find_slot(dict, key, hash, NULL);
+    long slot = blorp_hash_table_find_slot(dict, key, hash, NULL);
     blorp_Dict* result = dict;
     if (__builtin_expect(!blorp_is_unique(dict), 0)) {
         // Removing a missing key changes nothing, so a shared dict is
@@ -22339,13 +22443,13 @@ void blorp_set_reserve_for_len(blorp_Set* set, long len) {
 }
 
 // Allocate a dict with given capacity (power of 2).
-// Delegates to blorp_dict_alloc_storage for the table buffer.
+// Delegates to blorp_hash_table_alloc_storage for the table buffer.
 blorp_Dict* blorp_dict_alloc(long capacity) {
     capacity = blorp_hash_capacity_at_least(capacity);
     blorp_Dict* dict = (blorp_Dict*)blorp_alloc(sizeof(blorp_Dict));
     dict->size = 0;
     dict->order_len = 0;
-    blorp_dict_alloc_storage(dict, capacity);
+    blorp_hash_table_alloc_storage(dict, capacity, BLORP_DICT_SLOTS);
     dict->hash_fn = blorp_dict_hash_int;
     dict->eq_fn = blorp_dict_key_eq_int;
     dict->key_release = NULL;
@@ -22385,7 +22489,7 @@ blorp_Dict* blorp_dict_with_capacity_custom(
 
 // COW: return unique copy (deep copy if shared, identity if unique)
 blorp_Dict* blorp_dict_cow(blorp_Dict* dict) {
-    if (!dict) return blorp_dict_alloc(16);
+    if (!dict) return blorp_dict_alloc(BLORP_HASH_TABLE_MIN_CAPACITY);
     if (blorp_is_unique(dict)) return dict;
     blorp_Dict* copy = blorp_dict_copy(dict);
     blorp_release(dict);
@@ -22411,18 +22515,13 @@ blorp_Dict* blorp_dict_reuse_alloc(blorp_Dict* dict, long min_cap) {
         return fresh;
     }
 
-    for (long i = 0; i < dict->order_len; i++) {
-        long slot = dict->order[i];
-        if (slot < 0) continue;
-        if (key_release && dict->keys[slot]) key_release(dict->keys[slot]);
-        if (value_release && dict->values[slot]) value_release(dict->values[slot]);
-    }
+    blorp_hash_table_release_entries(dict, BLORP_DICT_SLOTS);
 
     if (new_cap > dict->capacity) {
-        blorp_dict_free_storage(dict->keys);
-        blorp_dict_alloc_storage(dict, new_cap);
+        blorp_hash_table_free_storage(dict->keys);
+        blorp_hash_table_alloc_storage(dict, new_cap, BLORP_DICT_SLOTS);
     } else {
-        // Only meta governs occupancy (see blorp_dict_alloc_storage).
+        // Only meta governs occupancy (see blorp_hash_table_alloc_storage).
         memset(dict->meta, DICT_META_EMPTY, (size_t)dict->capacity);
     }
 
@@ -22459,7 +22558,7 @@ static long blorp_dict_eq_impl(void* a, void* b) {
         if (slot_a < 0) continue;
         void* key = da->keys[slot_a];
         unsigned long hash = db->hash_fn(key);
-        long slot_b = blorp_dict_find_slot(db, key, hash, NULL);
+        long slot_b = blorp_hash_table_find_slot(db, key, hash, NULL);
         if (slot_b < 0) return 0;
         if (db->values[slot_b] != da->values[slot_a]) return 0;
     }
@@ -22477,7 +22576,7 @@ static long blorp_dict_eq_string_value_impl(void* a, void* b) {
         if (slot_a < 0) continue;
         void* key = da->keys[slot_a];
         unsigned long hash = db->hash_fn(key);
-        long slot_b = blorp_dict_find_slot(db, key, hash, NULL);
+        long slot_b = blorp_hash_table_find_slot(db, key, hash, NULL);
         if (slot_b < 0) return 0;
         if (!blorp_string_eq((blorp_String*)db->values[slot_b], (blorp_String*)da->values[slot_a])) return 0;
     }
@@ -22495,7 +22594,7 @@ static long blorp_dict_eq_float_value_impl(void* a, void* b) {
         if (slot_a < 0) continue;
         void* key = da->keys[slot_a];
         unsigned long hash = db->hash_fn(key);
-        long slot_b = blorp_dict_find_slot(db, key, hash, NULL);
+        long slot_b = blorp_hash_table_find_slot(db, key, hash, NULL);
         if (slot_b < 0) return 0;
         double da_val, db_val;
         memcpy(&da_val, &da->values[slot_a], sizeof(double));
