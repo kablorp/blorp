@@ -94,6 +94,7 @@ becomes permanent by being forgotten.
 | `MANGLED_DEF_ID_PREFIX` / `mangled_definition_name` in identity.brp for hoisted-closure names | T5 (f21b59a9d) | M3.1 |
 | `c_local_name` escape branches for locals with id 0 | B0 (32307f0d) | B1b (dense or origin-derived spelling for compiler temporaries) |
 | `ImplMethod(trait NameId, method NameId)` without impl/trait def ids and type key; `SourceFunction(NameId)` without a module id; program-wide hoist ordinals | M1.1 | M2.3, M2.5 |
+| `CoreMonoInstanceIndex` buckets instances by a structural hash in a `Dict[Int, ...]` instead of keying a `Dict` by `CoreMonoInstanceKey`, because a `Dict` with custom `Hashable` keys bound to variables misses equal keys (filed as "Fix Dict lookup miss for custom Hashable keys bound to variables"; reproduction `/private/tmp/claude-501/scratch/dict_key_repro`) | M1.2 | Key the `Dict` by `CoreMonoInstanceKey` once that bug is fixed |
 | Span-derived positive binder ids for authored binders | B0/B1a | A1b (parser-minted ids) |
 | One sigil read left in `type_parameter_name_kind` (`List[String]` type parameters) | D7 (230835a0b) | type interning, when type-parameter lists carry kinds |
 | `--dump-core` JSON carries both name Strings and ids | A0 | A5 |

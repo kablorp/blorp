@@ -44,11 +44,19 @@ import:
 		core_expr_type,
 	mono:
 		apply_type_substitution,
+		closed_substitution_arguments,
 		collect_dimension_literal_substitution,
 		collect_type_substitution,
 		is_concrete_substitution,
 		mangle_specialization_name,
-		substitution_closes_parameters,
+	mono_instance:
+		CoreMonoInstance,
+		CoreMonoInstanceIndex,
+		CoreMonoInstanceKey,
+		add_core_mono_instance,
+		core_mono_instance_key,
+		empty_core_mono_instance_index,
+		find_core_mono_instance,
 	mono_option:
 		CoreMonoOptionFusionTarget,
 		core_option_fusion_supported,
@@ -67,12 +75,15 @@ record CoreMonoProgramSpecialization {
 ---
 Result of `specialize_selected_generic_calls_from`. `rewritten_decl_count`
 is how many leading decls of `program.decls` have had calls scanned and
-rewritten; pass it back in on the next call to skip them.
+rewritten; pass it back in on the next call to skip them. `instances` holds
+every instance minted so far and is passed back in too, so a later call that
+requests an existing specialization reuses its id instead of minting another.
 ---
 record CoreMonoFunctionSpecializationStep {
 	program: CoreProgram,
 	next_def_id: Int,
-	rewritten_decl_count: Int
+	rewritten_decl_count: Int,
+	instances: CoreMonoInstanceIndex
 }
 
 
@@ -110,11 +121,17 @@ pure func core_mono_diagnostic_loc(diagnostic: CoreMonoDiagnostic) -> CoreSource
 			loc
 
 
+---
+`key` is the instance's identity (`source_def_id` plus the arguments by
+parameter position); the request set deduplicates on it. The instance's
+spelling is not part of a request: it is produced once, when a new instance is
+minted (`enqueue_instance_request`), not for every call site.
+---
 private record CoreMonoFunctionRequest {
 	source_name: String,
 	source_def_id: Int,
 	substitution: CoreMonoSubstitution,
-	mangled_name: String,
+	key: CoreMonoInstanceKey,
 	option_fusion_target: Option[CoreMonoOptionFusionTarget]
 }
 
@@ -154,6 +171,7 @@ private record CoreMonoExprRequestScan {
 private record CoreMonoCallRewriteContext {
 	generic_functions: CoreGenericFunctionIndex,
 	unresolved_type_params: List[String],
+	instances: CoreMonoInstanceIndex,
 	owner_def_id: Int,
 	option_fusion_sites: List[CoreMonoOptionFusionSite]
 }
@@ -162,6 +180,7 @@ private record CoreMonoCallRewriteContext {
 private record CoreMonoSelfReferenceContext {
 	source_name: String,
 	source_def_id: Int,
+	instance_def_id: Int,
 	mangled_name: String
 }
 
@@ -714,24 +733,34 @@ private pure func collect_call_substitution(
 				None
 
 
+---
+A call's substitution together with the identity of the instance it names.
+Only built for a substitution that is concrete and closes every parameter of
+the callee, so the key needs no failure case.
+---
+private record CoreMonoConcreteCall {
+	substitution: CoreMonoSubstitution,
+	key: CoreMonoInstanceKey
+}
+
+
 private pure func concrete_call_substitution(
 	function: CoreFunction,
 	unresolved_type_params: List[String],
 	args: List[CoreExpr],
 	result_type: CoreType,
-) -> Option[CoreMonoSubstitution]:
-	match collect_call_substitution(function, unresolved_type_params, args, result_type):
-		Some(substitution):
-			if (
-				not substitution.is_empty()
-				and is_concrete_substitution(unresolved_type_params, substitution)
-				and substitution_closes_parameters(substitution, function.type_params)
-			):
-				Some(substitution)
-			else:
-				None
-		None:
-			None
+) -> Option[CoreMonoConcreteCall]:
+	substitution ?= collect_call_substitution(function, unresolved_type_params, args, result_type)
+
+	if substitution.is_empty() or not is_concrete_substitution(unresolved_type_params, substitution):
+		None
+	else:
+		arguments ?= closed_substitution_arguments(substitution, function.type_params)
+
+		Some({
+			substitution = substitution,
+			key = core_mono_instance_key(function.def_id, arguments)
+		})
 
 
 private pure func request_for_call(
@@ -755,30 +784,26 @@ private pure func request_for_call(
 						args,
 						result_type,
 					):
-						Some(substitution):
-							match mangle_specialization_name(function.name, substitution):
-								Some(mangled_name):
-									option_target: Option[CoreMonoOptionFusionTarget] = match core_option_fusion_target(
-										generic_functions.module_member_prefixes,
-										function,
-									):
-										Some(target):
-											if core_option_fusion_supported(target, args):
-												Some(target)
-											else:
-												None
-										None:
-											None
-
-									Some({
-										source_name = function.name,
-										source_def_id = function.def_id,
-										substitution = substitution,
-										mangled_name = mangled_name,
-										option_fusion_target = option_target,
-									})
+						Some(concrete):
+							option_target: Option[CoreMonoOptionFusionTarget] = match core_option_fusion_target(
+								generic_functions.module_member_prefixes,
+								function,
+							):
+								Some(target):
+									if core_option_fusion_supported(target, args):
+										Some(target)
+									else:
+										None
 								None:
 									None
+
+							Some({
+								source_name = function.name,
+								source_def_id = function.def_id,
+								substitution = concrete.substitution,
+								key = concrete.key,
+								option_fusion_target = option_target,
+							})
 						None:
 							None
 				None:
@@ -1317,7 +1342,7 @@ private pure func rewrite_non_sequence_self_references(
 						VarExpr(
 							{ variable |
 								name = context.mangled_name,
-								def_id = None
+								def_id = Some(context.instance_def_id)
 							},
 							typ,
 							loc,
@@ -1332,7 +1357,7 @@ private pure func rewrite_non_sequence_self_references(
 					VarExpr(variable, callee_type, callee_loc):
 						if self_reference_name_matches(context, variable.name):
 							CallExpr(
-								UnknownCall,
+								SelectedDirectCall(context.instance_def_id),
 								VarExpr(
 									{ variable |
 										name = context.mangled_name,
@@ -1355,10 +1380,70 @@ private pure func rewrite_non_sequence_self_references(
 			children_rewritten
 
 
+---
+Instances requested during one worklist call, in request order. Each gets its
+`def_id` from `next_def_id` the first time its key is requested, so the id is
+known to every reference before the instance's body is built. `def_id`s need
+be unique, not dense: an id minted for a request whose generic function is then
+not found (`find_requested_generic_function`, malformed input only) is never
+used and leaves a gap.
+---
+private record CoreMonoQueuedInstance {
+	request: CoreMonoFunctionRequest,
+	instance: CoreMonoInstance
+}
+
+
+---
+The worklist state of one `specialize_selected_generic_calls_from` call:
+instances still to build (`queued`, in request order), every instance minted
+so far including earlier calls' (`instances`), and the next unused `def_id`.
+---
+private record CoreMonoInstanceQueue {
+	queued: List[CoreMonoQueuedInstance],
+	instances: CoreMonoInstanceIndex,
+	next_def_id: Int
+}
+
+
+---
+Queue `request` unless an instance with the same key already exists, in this
+call or an earlier one. A new instance takes the next fresh `def_id`, the
+existing allocator's next value, and its spelling. A substitution that cannot
+be spelled (the mangler declines it) cannot be named and is not queued, so its
+calls stay unspecialized, exactly as before.
+---
+private pure func enqueue_instance_request(
+	queue: CoreMonoInstanceQueue,
+	request: CoreMonoFunctionRequest,
+) -> CoreMonoInstanceQueue:
+	match find_core_mono_instance(queue.instances, request.key):
+		Some(_):
+			queue
+		None:
+			match mangle_specialization_name(request.source_name, request.substitution):
+				Some(name):
+					instance: CoreMonoInstance = {
+						def_id = queue.next_def_id,
+						name = name
+					}
+
+					{ queue |
+						queued = queue.queued.append({
+							request = request,
+							instance = instance
+						}),
+						instances = add_core_mono_instance(queue.instances, request.key, instance),
+						next_def_id = queue.next_def_id + 1
+					}
+				None:
+					queue
+
+
 private pure func specialize_function(
 	function: CoreFunction,
 	request: CoreMonoFunctionRequest,
-	def_id: Int,
+	instance: CoreMonoInstance,
 ) -> CoreFunction:
 	substituted_decl: CoreDecl = substitute_core_decl_types(
 		request.substitution,
@@ -1374,7 +1459,8 @@ private pure func specialize_function(
 							{
 								source_name = request.source_name,
 								source_def_id = request.source_def_id,
-								mangled_name = request.mangled_name
+								instance_def_id = instance.def_id,
+								mangled_name = instance.name
 							},
 							expr,
 						),
@@ -1383,11 +1469,11 @@ private pure func specialize_function(
 					None
 
 			{ substituted |
-				name = request.mangled_name,
+				name = instance.name,
 				type_params = [],
 				body = body,
 				origin = Declared(MonoInstance(request.source_def_id, request.substitution)),
-				def_id = def_id
+				def_id = instance.def_id
 			}
 		_:
 			function
@@ -1450,57 +1536,96 @@ private pure func rewrite_non_sequence_selected_calls(
 		children_rewritten,
 	):
 		Some(request):
-			match children_rewritten:
-				CallExpr(_, VarExpr(variable, callee_type, callee_loc), args, result_type, loc):
-					fused: Option[CoreExpr] = match (
-						request.option_fusion_target,
-						unique_fusion_site_id(context.option_fusion_sites, children_rewritten),
-					):
-						(Some(target), Some(fusion_id)):
-							fuse_core_option_call(
-								target,
-								request.substitution,
-								args,
-								result_type,
-								loc,
-								"${context.owner_def_id}_${fusion_id}",
-							)
-						_:
-							None
-
-					fused.get_or(
-						CallExpr(
-							UnknownCall,
-							VarExpr(
-								{ variable |
-									name = request.mangled_name,
-									def_id = None
-								},
-								apply_type_substitution(
-									request.substitution,
-									callee_type,
-								),
-								callee_loc,
-							),
-							concretize_call_args(
-								request.substitution,
-								args,
-							),
-							apply_type_substitution(
-								request.substitution,
-								result_type,
-							),
-							loc,
-						),
-					)
-				_:
-					children_rewritten
+			rewrite_call_for_request(context, request, children_rewritten)
 		None:
 			children_rewritten
 
 
+---
+Rewrites one call that has a specialization request. An Option helper the
+fusion pass accepted becomes its inline match and never has an instance;
+every other call is pointed at its instance by id.
+---
+private pure func rewrite_call_for_request(
+	context: CoreMonoCallRewriteContext,
+	request: CoreMonoFunctionRequest,
+	call: CoreExpr,
+) -> CoreExpr:
+	fused: Option[CoreExpr] = match (
+		call,
+		request.option_fusion_target,
+		unique_fusion_site_id(context.option_fusion_sites, call),
+	):
+		(CallExpr(_, VarExpr(_, _, _), args, result_type, loc), Some(target), Some(fusion_id)):
+			fuse_core_option_call(
+				target,
+				request.substitution,
+				args,
+				result_type,
+				loc,
+				"${context.owner_def_id}_${fusion_id}",
+			)
+		_:
+			None
+
+	match fused:
+		Some(fused_call):
+			fused_call
+		None:
+			match find_core_mono_instance(context.instances, request.key):
+				Some(instance):
+					rewrite_call_to_instance(request, instance, call)
+				None:
+					call
+
+
+---
+Points one call at `instance`, by id: the call kind carries the instance's
+own definition id, so a later pass resolves the callee without consulting its
+spelling. The callee variable deliberately carries no id. The call kind is the
+single authority for the target: an id on the variable as well would keep a
+function alive (dead-code reachability roots callee variables) even when
+resolution turns the call into a runtime builtin that never enters the
+function. The instance's name is still written into the callee variable until
+names are display-only.
+---
+private pure func rewrite_call_to_instance(
+	request: CoreMonoFunctionRequest,
+	instance: CoreMonoInstance,
+	call: CoreExpr,
+) -> CoreExpr:
+	match call:
+		CallExpr(_, VarExpr(variable, callee_type, callee_loc), args, result_type, loc):
+			CallExpr(
+				SelectedDirectCall(instance.def_id),
+				VarExpr(
+					{ variable |
+						name = instance.name,
+						def_id = None
+					},
+					apply_type_substitution(
+						request.substitution,
+						callee_type,
+					),
+					callee_loc,
+				),
+				concretize_call_args(
+					request.substitution,
+					args,
+				),
+				apply_type_substitution(
+					request.substitution,
+					result_type,
+				),
+				loc,
+			)
+		_:
+			call
+
+
 private pure func rewrite_optional_body(
 	generic_functions: CoreGenericFunctionIndex,
+	instances: CoreMonoInstanceIndex,
 	unresolved_type_params: List[String],
 	owner_def_id: Int,
 	body: Option[CoreExpr],
@@ -1517,6 +1642,7 @@ private pure func rewrite_optional_body(
 					{
 						generic_functions = generic_functions,
 						unresolved_type_params = unresolved_type_params,
+						instances = instances,
 						owner_def_id = owner_def_id,
 						option_fusion_sites = option_fusion_sites
 					},
@@ -1529,11 +1655,13 @@ private pure func rewrite_optional_body(
 
 private pure func rewrite_function_calls(
 	generic_functions: CoreGenericFunctionIndex,
+	instances: CoreMonoInstanceIndex,
 	function: CoreFunction,
 ) -> CoreFunction:
 	{ function |
 		body = rewrite_optional_body(
 			generic_functions,
+			instances,
 			function.type_params,
 			function.def_id,
 			function.body,
@@ -1543,11 +1671,12 @@ private pure func rewrite_function_calls(
 
 private pure func rewrite_decl_calls(
 	generic_functions: CoreGenericFunctionIndex,
+	instances: CoreMonoInstanceIndex,
 	decl: CoreDecl,
 ) -> CoreDecl:
 	match decl:
 		FunctionDecl(function):
-			FunctionDecl(rewrite_function_calls(generic_functions, function))
+			FunctionDecl(rewrite_function_calls(generic_functions, instances, function))
 		GlobalDecl(global):
 			option_fusion_sites: List[CoreMonoOptionFusionSite] = collect_option_fusion_sites(
 				generic_functions,
@@ -1559,6 +1688,7 @@ private pure func rewrite_decl_calls(
 						{
 							generic_functions = generic_functions,
 							unresolved_type_params = [],
+							instances = instances,
 							owner_def_id = global.def_id,
 							option_fusion_sites = option_fusion_sites
 						},
@@ -1569,7 +1699,7 @@ private pure func rewrite_decl_calls(
 			var methods: List[CoreFunction] = []
 
 			for method in impl.methods:
-				methods = methods.append(rewrite_function_calls(generic_functions, method))
+				methods = methods.append(rewrite_function_calls(generic_functions, instances, method))
 
 			ImplDecl({ impl | methods = methods })
 		_:
@@ -1578,12 +1708,13 @@ private pure func rewrite_decl_calls(
 
 private pure func rewrite_decl_list_calls(
 	generic_functions: CoreGenericFunctionIndex,
+	instances: CoreMonoInstanceIndex,
 	decls: List[CoreDecl],
 ) -> List[CoreDecl]:
 	var rewritten: List[CoreDecl] = []
 
 	for decl in decls:
-		rewritten = rewritten.append(rewrite_decl_calls(generic_functions, decl))
+		rewritten = rewritten.append(rewrite_decl_calls(generic_functions, instances, decl))
 
 	rewritten
 
@@ -1603,6 +1734,7 @@ pure func specialize_selected_generic_calls(
 		next_def_id,
 		collect_generic_functions(program),
 		0,
+		empty_core_mono_instance_index(),
 	)
 
 	{
@@ -1624,89 +1756,57 @@ pure func specialize_selected_generic_calls_from(
 	next_def_id: Int,
 	generic_functions: CoreGenericFunctionIndex,
 	rewritten_decl_count: Int,
+	instances: CoreMonoInstanceIndex,
 ) -> CoreMonoFunctionSpecializationStep:
 	if generic_functions.functions.is_empty():
 		{
 			program = program,
 			next_def_id = next_def_id,
-			rewritten_decl_count = program.decls.length()
+			rewritten_decl_count = program.decls.length(),
+			instances = instances
 		}
 	else:
 		unprocessed_decls: List[CoreDecl] = program.decls.drop(rewritten_decl_count)
-		initial_requests: List[CoreMonoFunctionRequest] = collect_program_requests(
-			generic_functions,
-			unprocessed_decls,
-		)
-		var requests: List[CoreMonoFunctionRequest] = []
-		-- Below this size the ordered queue is cheaper than a populated index.
-		-- Its length is the mode: the index is built when the 256th unique
-		-- request enters, then owns membership for the rest of this worklist call.
-		linear_request_limit: Int = 256
-		var seen_requests: Dict[String, Bool] = {}
+		var queue: CoreMonoInstanceQueue = {
+			queued = [],
+			instances = instances,
+			next_def_id = next_def_id
+		}
 
-		for request in initial_requests:
-			if requests.length() < linear_request_limit:
-				var already_queued: Bool = False
-				for queued in requests:
-					if queued.mangled_name == request.mangled_name:
-						already_queued = True
-						break
-				if not already_queued:
-					requests = requests.append(request)
-					if requests.length() == linear_request_limit:
-						for queued in requests:
-							seen_requests = seen_requests.set(queued.mangled_name, True)
-			else:
-				if not seen_requests.contains(request.mangled_name):
-					seen_requests = seen_requests.set(request.mangled_name, True)
-					requests = requests.append(request)
+		for request in collect_program_requests(generic_functions, unprocessed_decls):
+			queue = enqueue_instance_request(queue, request)
 
 		var specialized_decls: List[CoreDecl] = []
-		var request_index: Int = 0
-		var current_def_id: Int = next_def_id
+		var queue_index: Int = 0
 
-		while request_index < requests.length():
-			match requests.get(request_index):
-				Some(request):
+		while queue_index < queue.queued.length():
+			match queue.queued.get(queue_index):
+				Some(queued):
 					match find_requested_generic_function(
 						generic_functions,
-						request.source_def_id,
-						request.source_name,
+						queued.request.source_def_id,
+						queued.request.source_name,
 					):
 						Some(function):
 							specialized: CoreFunction = specialize_function(
 								function,
-								request,
-								current_def_id,
+								queued.request,
+								queued.instance,
 							)
 							for discovered in collect_function_requests(generic_functions, specialized):
-								if requests.length() < linear_request_limit:
-									var already_queued: Bool = False
-									for queued in requests:
-										if queued.mangled_name == discovered.mangled_name:
-											already_queued = True
-											break
-									if not already_queued:
-										requests = requests.append(discovered)
-										if requests.length() == linear_request_limit:
-											for queued in requests:
-												seen_requests = seen_requests.set(queued.mangled_name, True)
-								else:
-									if not seen_requests.contains(discovered.mangled_name):
-										seen_requests = seen_requests.set(discovered.mangled_name, True)
-										requests = requests.append(discovered)
+								queue = enqueue_instance_request(queue, discovered)
 							specialized_decls = specialized_decls.append(FunctionDecl(specialized))
-							current_def_id += 1
 						None:
 							void
 				None:
 					break
 
-			request_index += 1
+			queue_index += 1
 
 		combined_decls: List[CoreDecl] = program.decls.concat(specialized_decls)
 		rewritten_tail: List[CoreDecl] = rewrite_decl_list_calls(
 			generic_functions,
+			queue.instances,
 			combined_decls.drop(rewritten_decl_count),
 		)
 		final_decls: List[CoreDecl] = combined_decls
@@ -1715,6 +1815,7 @@ pure func specialize_selected_generic_calls_from(
 
 		{
 			program = { program | decls = final_decls },
-			next_def_id = current_def_id,
-			rewritten_decl_count = final_decls.length()
+			next_def_id = queue.next_def_id,
+			rewritten_decl_count = final_decls.length(),
+			instances = queue.instances
 		}

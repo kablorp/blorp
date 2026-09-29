@@ -10,7 +10,8 @@ import:
 		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreDeclaredOrigin(MonoInstance),
 		CoreFunctionOrigin(Declared),
-		CoreMonoSubstitutionValue(TypeSubstitution),
+		CoreMonoSubstitution,
+		CoreMonoSubstitutionValue(DimSubstitution, TypeSubstitution),
 		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreLogicalOp(AndOp),
 		CoreParam,
@@ -20,10 +21,20 @@ import:
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
 		CoreType(FunctionType, NamedType, RangeType, TensorType, TypeParameterType, VoidType),
 		CoreVar,
+		core_function_declared_origin,
 		core_program_to_json,
 	../../../src/compiler/stage_09_core/mono_specialize:
 		CoreMonoProgramSpecialization,
 		specialize_selected_generic_calls,
+	../../../src/compiler/stage_09_core/mono: closed_substitution_arguments
+	../../../src/compiler/stage_09_core/mono_instance:
+		CoreMonoInstance,
+		CoreMonoInstanceIndex,
+		CoreMonoInstanceKey,
+		add_core_mono_instance,
+		core_mono_instance_key,
+		empty_core_mono_instance_index,
+		find_core_mono_instance,
 	../../../src/compiler/stage_09_core/monomorphize: monomorphize_program
 	test: TestSuite
 
@@ -267,7 +278,7 @@ pure func expected_program(target_type: String, specialized_def_id: Int) -> Core
 					identity_call(
 						"identity__mono_${target_type}",
 						named_type(target_type),
-						UnknownCall,
+						SelectedDirectCall(specialized_def_id),
 						None,
 					),
 				),
@@ -484,7 +495,7 @@ pure func transitive_expected_program(
 					identity_call(
 						"outer__mono_${target_type}",
 						named_type(target_type),
-						UnknownCall,
+						SelectedDirectCall(outer_def_id),
 						None,
 					),
 				),
@@ -500,7 +511,7 @@ pure func transitive_expected_program(
 							"inner__mono_${target_type}",
 							named_type(target_type),
 							"value",
-							UnknownCall,
+							SelectedDirectCall(inner_def_id),
 							None,
 						),
 					),
@@ -549,8 +560,8 @@ func test_initial_request_keeps_order_when_transitive_body_rediscovers_it() -> B
 		identity_call("inner", int_type, SelectedDirectCall(11), Some(11)),
 	)
 	expected_body: CoreExpr = SeqExpr(
-		identity_call("outer__mono_Int", int_type, UnknownCall, None),
-		identity_call("inner__mono_Int", int_type, UnknownCall, None),
+		identity_call("outer__mono_Int", int_type, SelectedDirectCall(100), None),
+		identity_call("inner__mono_Int", int_type, SelectedDirectCall(101), None),
 	)
 	source = { source | decls = source.decls.set(2, FunctionDecl(main_function(source_body))) }
 	expected = {
@@ -618,7 +629,7 @@ pure func recursive_expected_program(target_type: String, specialized_def_id: In
 					identity_call(
 						"recur__mono_${target_type}",
 						named_type(target_type),
-						UnknownCall,
+						SelectedDirectCall(specialized_def_id),
 						None,
 					),
 				),
@@ -634,7 +645,7 @@ pure func recursive_expected_program(target_type: String, specialized_def_id: In
 							"recur__mono_${target_type}",
 							named_type(target_type),
 							"value",
-							UnknownCall,
+							SelectedDirectCall(specialized_def_id),
 							None,
 						),
 					),
@@ -712,9 +723,9 @@ func test_duplicate_heavy_requests_keep_first_seen_order() -> Bool:
 			False
 
 
-func test_request_order_crosses_index_promotion_with_transitive_duplicate() -> Bool:
-	promotion_limit: Int = 256
-	unique_request_count: Int = promotion_limit + 1
+func test_request_order_survives_many_unique_requests_with_transitive_duplicate() -> Bool:
+	last_request_index: Int = 256
+	unique_request_count: Int = last_request_index + 1
 	source_def_id_start: Int = 1000
 	generated_def_id_start: Int = 2000
 	int_type: CoreType = named_type("Int")
@@ -724,7 +735,7 @@ func test_request_order_crosses_index_promotion_with_transitive_duplicate() -> B
 	while source_index < unique_request_count:
 		name: String = "identity_${source_index}"
 		def_id: Int = source_def_id_start + source_index
-		function: CoreFunction = if source_index == promotion_limit:
+		function: CoreFunction = if source_index == last_request_index:
 			generic_function(
 				name,
 				def_id,
@@ -786,11 +797,15 @@ func test_request_order_crosses_index_promotion_with_transitive_duplicate() -> B
 				break
 		generated_index += 1
 
-	last_rewrites_first: Bool = match actual.program.decls.get(generated_start + promotion_limit):
+	last_rewrites_first: Bool = match actual.program.decls.get(generated_start + last_request_index):
 		Some(FunctionDecl(function)):
 			match function.body:
-				Some(CallExpr(UnknownCall, VarExpr(variable, _, _), _, _, _)):
-					variable.name == "identity_0__mono_Int"
+				Some(CallExpr(SelectedDirectCall(target_def_id), VarExpr(variable, _, _), _, _, _)):
+					(
+						variable.name == "identity_0__mono_Int"
+						and variable.def_id.is_none()
+						and target_def_id == generated_def_id_start
+					)
 				_:
 					False
 		_:
@@ -829,6 +844,214 @@ pure func conflicting_source_program(argument_type: String, result_type: String)
 		foreign_includes = [],
 		source_files = []
 	}
+
+
+---
+Two calls at different types plus a repeat of the first: one generic function
+yields two instances, each with its own fresh id and the shared base in its
+origin, and the repeat resolves to the first instance's id.
+---
+pure func repeated_request_source_program() -> CoreProgram:
+	int_type: CoreType = named_type("Int")
+	bool_type: CoreType = named_type("Bool")
+	body: CoreExpr = SeqExpr(
+		identity_call("identity", int_type, SelectedDirectCall(10), Some(10)),
+		SeqExpr(
+			identity_call("identity", bool_type, SelectedDirectCall(10), Some(10)),
+			identity_call("identity", int_type, SelectedDirectCall(10), Some(10)),
+		),
+	)
+
+	{
+		decls = [
+			FunctionDecl(identity_function("identity", 10, ["T"], type_parameter("T"))),
+			FunctionDecl(main_function(body)),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func instance_base_def_id(function: CoreFunction) -> Option[Int]:
+	match core_function_declared_origin(function.origin):
+		MonoInstance(base_def_id, _):
+			Some(base_def_id)
+		_:
+			None
+
+
+pure func main_call_target_ids(program: CoreProgram) -> List[Int]:
+	var ids: List[Int] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				if function.name == "main":
+					match function.body:
+						Some(SeqExpr(first, SeqExpr(second, third))):
+							for call in [first, second, third]:
+								match call:
+									CallExpr(SelectedDirectCall(target_def_id), VarExpr(variable, _, _), _, _, _):
+										if variable.def_id.is_none():
+											ids = ids.append(target_def_id)
+									_:
+										void
+						_:
+							void
+			_:
+				void
+
+	ids
+
+
+func test_instances_of_one_generic_have_distinct_ids_and_the_same_base() -> Bool:
+	actual: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		repeated_request_source_program(),
+		100,
+	)
+
+	match (actual.program.decls.get(2), actual.program.decls.get(3)):
+		(Some(FunctionDecl(first)), Some(FunctionDecl(second))):
+			(
+				actual.program.decls.length() == 4
+				and first.def_id == 100
+				and second.def_id == 101
+				and instance_base_def_id(first) == Some(10)
+				and instance_base_def_id(second) == Some(10)
+				and actual.next_def_id == 102
+			)
+		_:
+			False
+
+
+func test_repeated_request_reuses_the_first_instance_id() -> Bool:
+	actual: CoreMonoProgramSpecialization = specialize_selected_generic_calls(
+		repeated_request_source_program(),
+		100,
+	)
+
+	main_call_target_ids(actual.program) == [100, 101, 100]
+
+
+pure func int_binding(parameter: String) -> (String, CoreMonoSubstitutionValue):
+	(parameter, TypeSubstitution(named_type("Int")))
+
+
+pure func bool_binding(parameter: String) -> (String, CoreMonoSubstitutionValue):
+	(parameter, TypeSubstitution(named_type("Bool")))
+
+
+pure func key_base_function(def_id: Int, type_params: List[String]) -> CoreFunction:
+	identity_function("keyed", def_id, type_params, type_parameter("A"))
+
+
+pure func key_for(base: CoreFunction, substitution: CoreMonoSubstitution) -> Option[CoreMonoInstanceKey]:
+	arguments ?= closed_substitution_arguments(substitution, base.type_params)
+	Some(core_mono_instance_key(base.def_id, arguments))
+
+
+pure func with_instance(
+	index: CoreMonoInstanceIndex,
+	base: CoreFunction,
+	substitution: CoreMonoSubstitution,
+	def_id: Int,
+) -> CoreMonoInstanceIndex:
+	match key_for(base, substitution):
+		Some(key):
+			add_core_mono_instance(index, key, { def_id = def_id, name = "keyed__mono" })
+		None:
+			index
+
+
+pure func instance_id_for(
+	index: CoreMonoInstanceIndex,
+	base: CoreFunction,
+	substitution: CoreMonoSubstitution,
+) -> Option[Int]:
+	key ?= key_for(base, substitution)
+	find_core_mono_instance(index, key).map(pure func(instance: CoreMonoInstance) -> Int: instance.def_id)
+
+
+func test_instance_key_ignores_binding_order() -> Bool:
+	base: CoreFunction = key_base_function(7, ["A", "B"])
+	index = with_instance(
+		empty_core_mono_instance_index(),
+		base,
+		[int_binding("A"), bool_binding("B")],
+		55,
+	)
+
+	instance_id_for(index, base, [bool_binding("B"), int_binding("A")]) == Some(55)
+
+
+func test_instance_key_is_positional_in_the_base_parameters() -> Bool:
+	base: CoreFunction = key_base_function(7, ["A", "B"])
+	index = with_instance(
+		empty_core_mono_instance_index(),
+		base,
+		[int_binding("A"), bool_binding("B")],
+		55,
+	)
+
+	instance_id_for(index, base, [bool_binding("A"), int_binding("B")]).is_none()
+
+
+func test_instance_key_distinguishes_arguments_and_base() -> Bool:
+	base: CoreFunction = key_base_function(7, ["T"])
+	index = with_instance(empty_core_mono_instance_index(), base, [int_binding("T")], 55)
+
+	(
+		instance_id_for(index, base, [bool_binding("T")]).is_none()
+		and instance_id_for(index, key_base_function(8, ["T"]), [int_binding("T")]).is_none()
+		and instance_id_for(index, base, [int_binding("T")]) == Some(55)
+	)
+
+
+func test_instance_key_requires_every_parameter_bound() -> Bool:
+	base: CoreFunction = key_base_function(7, ["A", "B"])
+
+	closed_substitution_arguments([int_binding("A")], base.type_params).is_none()
+
+
+func test_equal_hashes_with_different_arguments_do_not_merge() -> Bool:
+	int_key: CoreMonoInstanceKey = {
+		base_def_id = 7,
+		arguments = [TypeSubstitution(named_type("Int"))],
+		structural_hash = 42
+	}
+	bool_key: CoreMonoInstanceKey = {
+		base_def_id = 7,
+		arguments = [TypeSubstitution(named_type("Bool"))],
+		structural_hash = 42
+	}
+	index = add_core_mono_instance(
+		add_core_mono_instance(
+			empty_core_mono_instance_index(),
+			int_key,
+			{ def_id = 1, name = "one" },
+		),
+		bool_key,
+		{ def_id = 2, name = "two" },
+	)
+
+	(
+		find_core_mono_instance(index, int_key).map(pure func(i: CoreMonoInstance) -> Int: i.def_id) == Some(1)
+		and find_core_mono_instance(index, bool_key).map(pure func(i: CoreMonoInstance) -> Int: i.def_id) == Some(2)
+	)
+
+
+func test_instance_key_normalizes_equal_dimensions() -> Bool:
+	base: CoreFunction = key_base_function(7, ["N"])
+	product_dim: CoreTensorDim = TensorDimOperation(
+		DimMultiply,
+		TensorStaticDim(2),
+		TensorStaticDim(3),
+	)
+	folded: CoreMonoSubstitutionValue = DimSubstitution(TensorStaticDim(6))
+	unfolded: CoreMonoSubstitutionValue = DimSubstitution(product_dim)
+	index = with_instance(empty_core_mono_instance_index(), base, [("N", folded)], 55)
+
+	instance_id_for(index, base, [("N", unfolded)]) == Some(55)
 
 
 func test_conflicting_selected_call_is_left_unchanged() -> Bool:
@@ -948,7 +1171,7 @@ func test_specializes_bodyless_generic_builtin() -> Bool:
 	(
 		actual.next_def_id == 101
 		and program_has_function(actual.program, "identity__mono_Int")
-		and program_main_calls_unknown(actual.program, "identity__mono_Int")
+		and program_main_calls_instance(actual.program, "identity__mono_Int")
 	)
 
 
@@ -958,8 +1181,8 @@ pure func argument_concretization_program(
 	specialized_def_id: Option[Int],
 ) -> CoreProgram:
 	call_kind: CoreCallKind = match specialized_def_id:
-		Some(_):
-			UnknownCall
+		Some(def_id):
+			SelectedDirectCall(def_id)
 		None:
 			SelectedDirectCall(10)
 
@@ -1211,7 +1434,7 @@ func test_accepts_existential_return_dimension() -> Bool:
 			(
 				actual.next_def_id == 101
 				and program_has_function(actual.program, "erase_dims__mono_5")
-				and program_main_calls_unknown(actual.program, "erase_dims__mono_5")
+				and program_main_calls_instance(actual.program, "erase_dims__mono_5")
 			)
 		Err(_):
 			False
@@ -1483,7 +1706,25 @@ pure func imported_collision_program(callee_name: String) -> CoreProgram:
 	}
 
 
-pure func program_main_calls_unknown(program: CoreProgram, callee_name: String) -> Bool:
+pure func program_function_def_id(program: CoreProgram, name: String) -> Option[Int]:
+	var found: Option[Int] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				if function.name == name:
+					found = Some(function.def_id)
+			_:
+				void
+
+	found
+
+
+---
+`main` calls the function `callee_name` by that function's own `def_id`,
+by that function's id in the call kind, and the callee variable carries no id.
+---
+pure func program_main_calls_instance(program: CoreProgram, callee_name: String) -> Bool:
 	var found: Bool = False
 
 	for decl in program.decls:
@@ -1491,8 +1732,12 @@ pure func program_main_calls_unknown(program: CoreProgram, callee_name: String) 
 			FunctionDecl(function):
 				if function.name == "main":
 					match function.body:
-						Some(CallExpr(UnknownCall, VarExpr(variable, _, _), _, _, _)):
-							found = variable.name == callee_name
+						Some(CallExpr(SelectedDirectCall(target_def_id), VarExpr(variable, _, _), _, _, _)):
+							found = (
+								variable.name == callee_name
+								and variable.def_id.is_none()
+								and program_function_def_id(program, callee_name) == Some(target_def_id)
+							)
 						_:
 							void
 			_:
@@ -1515,7 +1760,7 @@ func test_specializes_explicit_imported_identity() -> Bool:
 	(
 		actual.next_def_id == 101
 		and program_has_function(actual.program, "list__identity__mono_Int")
-		and program_main_calls_unknown(actual.program, "list__identity__mono_Int")
+		and program_main_calls_instance(actual.program, "list__identity__mono_Int")
 	)
 
 
@@ -1533,7 +1778,7 @@ func test_specializes_explicit_imported_pure_overload_identity() -> Bool:
 	(
 		actual.next_def_id == 101
 		and program_has_function(actual.program, "list__identity__pure__mono_Int")
-		and program_main_calls_unknown(actual.program, "list__identity__pure__mono_Int")
+		and program_main_calls_instance(actual.program, "list__identity__pure__mono_Int")
 	)
 
 
@@ -1559,7 +1804,7 @@ func test_imported_identity_disambiguates_selected_id_collision() -> Bool:
 		actual.next_def_id == 101
 		and program_has_function(actual.program, "list__identity__mono_Int")
 		and not program_has_function(actual.program, "option__identity__mono_Int")
-		and program_main_calls_unknown(actual.program, "list__identity__mono_Int")
+		and program_main_calls_instance(actual.program, "list__identity__mono_Int")
 	)
 
 
@@ -1638,9 +1883,32 @@ tests: TestSuite = {
 			test_duplicate_heavy_requests_keep_first_seen_order,
 		),
 		(
-			"request order crosses index promotion with transitive duplicate",
-			test_request_order_crosses_index_promotion_with_transitive_duplicate,
+			"request order survives many unique requests with transitive duplicate",
+			test_request_order_survives_many_unique_requests_with_transitive_duplicate,
 		),
+		(
+			"instances of one generic have distinct ids and the same base",
+			test_instances_of_one_generic_have_distinct_ids_and_the_same_base,
+		),
+		("repeated request reuses the first instance id", test_repeated_request_reuses_the_first_instance_id),
+		("instance key ignores binding order", test_instance_key_ignores_binding_order),
+		(
+			"instance key is positional in the base parameters",
+			test_instance_key_is_positional_in_the_base_parameters,
+		),
+		(
+			"equal hashes with different arguments do not merge",
+			test_equal_hashes_with_different_arguments_do_not_merge,
+		),
+		(
+			"instance key requires every parameter bound",
+			test_instance_key_requires_every_parameter_bound,
+		),
+		(
+			"instance key distinguishes arguments and base",
+			test_instance_key_distinguishes_arguments_and_base,
+		),
+		("instance key normalizes equal dimensions", test_instance_key_normalizes_equal_dimensions),
 		(
 			"conflicting selected call is left unchanged",
 			test_conflicting_selected_call_is_left_unchanged,

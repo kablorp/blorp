@@ -1,0 +1,343 @@
+-- Identity of monomorphic function instances.
+--
+-- An instance is the generic function `base_def_id` specialized with one
+-- substitution. Mono requests are deduplicated on that pair, compared
+-- structurally, so no spelling of the instance (its `__mono_...` name) takes
+-- part in deciding whether two requests are the same instance.
+import:
+	ir:
+		CoreMonoSubstitutionValue(DimPackSubstitution, DimSubstitution, TypeSubstitution),
+		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
+		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim, TensorVariadicDim),
+		CoreType(
+			BoxedResultType,
+			EnumType,
+			FunctionType,
+			HeapRecordType,
+			NamedType,
+			RangeType,
+			SelfType,
+			StackResultType,
+			TensorType,
+			TupleType,
+			TypeParameterType,
+			UnionType,
+			ValueRecordType,
+			VoidType,
+		),
+	mono:
+		core_mono_substitution_value_equal,
+		normalize_dim,
+		normalize_substitution_value,
+
+
+-- One distinct seed per union case, so that structurally different values
+-- (`Int` as a nominal record versus `Int` as an enum) hash apart. The values
+-- are arbitrary distinct constants; only their distinctness matters.
+private HASH_TAG_VOID_TYPE: Int = 101
+private HASH_TAG_NAMED_TYPE: Int = 103
+private HASH_TAG_TYPE_PARAMETER: Int = 107
+private HASH_TAG_SELF_TYPE: Int = 109
+private HASH_TAG_FUNCTION_TYPE: Int = 113
+private HASH_TAG_STACK_RESULT: Int = 127
+private HASH_TAG_BOXED_RESULT: Int = 131
+private HASH_TAG_ENUM_TYPE: Int = 137
+private HASH_TAG_VALUE_RECORD_TYPE: Int = 139
+private HASH_TAG_HEAP_RECORD_TYPE: Int = 149
+private HASH_TAG_UNION_TYPE: Int = 151
+private HASH_TAG_RANGE_TYPE: Int = 157
+private HASH_TAG_TENSOR_TYPE: Int = 163
+private HASH_TAG_TUPLE_TYPE: Int = 167
+private HASH_TAG_STATIC_DIM: Int = 173
+private HASH_TAG_RUNTIME_DIM: Int = 179
+private HASH_TAG_VARIADIC_DIM: Int = 181
+private HASH_TAG_DIM_OPERATION: Int = 191
+private HASH_TAG_TYPE_SUBSTITUTION: Int = 193
+private HASH_TAG_DIM_SUBSTITUTION: Int = 197
+private HASH_TAG_DIM_PACK_SUBSTITUTION: Int = 199
+private HASH_TAG_PURE_FUNCTION: Int = 211
+private HASH_TAG_IMPURE_FUNCTION: Int = 223
+
+
+private pure func hash_dim_operator(op: CoreDimOp) -> Int:
+	match op:
+		DimAdd:
+			1
+		DimSubtract:
+			2
+		DimMultiply:
+			3
+		DimDivide:
+			4
+
+
+private pure func hash_normalized_dim(dim: CoreTensorDim) -> Int:
+	match dim:
+		TensorStaticDim(value):
+			hash_combine(HASH_TAG_STATIC_DIM, value)
+		TensorRuntimeDim(name):
+			hash_combine(HASH_TAG_RUNTIME_DIM, name.hash())
+		TensorVariadicDim(name):
+			hash_combine(HASH_TAG_VARIADIC_DIM, name.hash())
+		TensorDimOperation(op, left, right):
+			hash_combine(
+				hash_combine(
+					hash_combine(HASH_TAG_DIM_OPERATION, hash_dim_operator(op)),
+					hash_normalized_dim(left),
+				),
+				hash_normalized_dim(right),
+			)
+
+
+private pure func hash_dims(seed: Int, dims: List[CoreTensorDim]) -> Int:
+	var combined: Int = seed
+
+	for dim in dims:
+		combined = hash_combine(combined, hash_normalized_dim(normalize_dim(dim)))
+
+	combined
+
+
+private pure func hash_types(seed: Int, types: List[CoreType]) -> Int:
+	var combined: Int = seed
+
+	for typ in types:
+		combined = hash_combine(combined, hash_type(typ))
+
+	combined
+
+
+---
+Structural hash of a type that agrees with `core_mono_type_equal`: equal
+types (including tensor dimensions that normalize alike) hash alike.
+---
+private pure func hash_type(typ: CoreType) -> Int:
+	match typ:
+		VoidType:
+			HASH_TAG_VOID_TYPE
+		NamedType(name, args):
+			hash_types(hash_combine(HASH_TAG_NAMED_TYPE, name.hash()), args)
+		TypeParameterType(name):
+			hash_combine(HASH_TAG_TYPE_PARAMETER, name.hash())
+		SelfType:
+			HASH_TAG_SELF_TYPE
+		FunctionType(is_pure, params, return_type):
+			purity_tag: Int = if is_pure:
+				HASH_TAG_PURE_FUNCTION
+			else:
+				HASH_TAG_IMPURE_FUNCTION
+
+			hash_combine(
+				hash_types(hash_combine(HASH_TAG_FUNCTION_TYPE, purity_tag), params),
+				hash_type(return_type),
+			)
+		StackResultType(value, error):
+			hash_combine(
+				hash_combine(HASH_TAG_STACK_RESULT, hash_type(value)),
+				hash_type(error),
+			)
+		BoxedResultType(value, error):
+			hash_combine(
+				hash_combine(HASH_TAG_BOXED_RESULT, hash_type(value)),
+				hash_type(error),
+			)
+		EnumType(name):
+			hash_combine(HASH_TAG_ENUM_TYPE, name.hash())
+		ValueRecordType(name):
+			hash_combine(HASH_TAG_VALUE_RECORD_TYPE, name.hash())
+		HeapRecordType(name):
+			hash_combine(HASH_TAG_HEAP_RECORD_TYPE, name.hash())
+		UnionType(name):
+			hash_combine(HASH_TAG_UNION_TYPE, name.hash())
+		RangeType:
+			HASH_TAG_RANGE_TYPE
+		TensorType(info):
+			hash_dims(
+				hash_combine(HASH_TAG_TENSOR_TYPE, hash_type(info.element_type)),
+				info.dims,
+			)
+		TupleType(items):
+			hash_types(HASH_TAG_TUPLE_TYPE, items)
+
+
+private pure func hash_substitution_value(value: CoreMonoSubstitutionValue) -> Int:
+	match value:
+		TypeSubstitution(typ):
+			hash_combine(HASH_TAG_TYPE_SUBSTITUTION, hash_type(typ))
+		DimSubstitution(dim):
+			hash_combine(HASH_TAG_DIM_SUBSTITUTION, hash_normalized_dim(dim))
+		DimPackSubstitution(dims):
+			hash_dims(HASH_TAG_DIM_PACK_SUBSTITUTION, dims)
+
+
+---
+The identity of one monomorphic instance: the generic function it
+specializes and one argument per type parameter of that function.
+
+Canonical form: `arguments[i]` is the (dimension-normalized) argument for the
+`i`-th entry of the base function's `type_params`. The association list a
+call site produces has no meaningful order and names its parameters with
+Strings; position in the base function's own parameter list replaces both, so
+two keys for one `base_def_id` compare argument by argument with no parameter
+name involved. `structural_hash` is computed once from the same fields.
+
+Build it only with `core_mono_instance_key`.
+---
+record CoreMonoInstanceKey {
+	base_def_id: Int,
+	arguments: List[CoreMonoSubstitutionValue],
+	structural_hash: Int
+}
+
+
+---
+The key of the instance of `base_def_id` specialized with `arguments`, which
+must be the closed arguments in the base's `type_params` order (what
+`closed_substitution_arguments` returns), so there is exactly one per
+parameter. Dimensions are normalized here.
+---
+pure func core_mono_instance_key(
+	base_def_id: Int,
+	arguments: List[CoreMonoSubstitutionValue],
+) -> CoreMonoInstanceKey:
+	var normalized: List[CoreMonoSubstitutionValue] = []
+	var structural_hash: Int = hash_combine(0, base_def_id)
+
+	for argument in arguments:
+		value: CoreMonoSubstitutionValue = normalize_substitution_value(argument)
+		normalized = normalized.append(value)
+		structural_hash = hash_combine(structural_hash, hash_substitution_value(value))
+
+	{
+		base_def_id = base_def_id,
+		arguments = normalized,
+		structural_hash = structural_hash
+	}
+
+
+private pure func arguments_equal(
+	left: List[CoreMonoSubstitutionValue],
+	right: List[CoreMonoSubstitutionValue],
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+
+		while index < left.length():
+			match (left.get(index), right.get(index)):
+				(Some(left_value), Some(right_value)):
+					if not core_mono_substitution_value_equal(left_value, right_value):
+						equal = False
+						break
+				_:
+					equal = False
+					break
+
+			index += 1
+
+		equal
+
+
+---
+Structural equality of two keys: same generic function and the same
+arguments, position for position. The cached hashes are compared first so unequal
+keys almost never reach the argument comparison.
+---
+pure func core_mono_instance_keys_equal(
+	left: CoreMonoInstanceKey,
+	right: CoreMonoInstanceKey,
+) -> Bool:
+	(
+		left.structural_hash == right.structural_hash
+		and left.base_def_id == right.base_def_id
+		and arguments_equal(left.arguments, right.arguments)
+	)
+
+
+---
+One minted instance: its own `def_id` and the spelling it is emitted under.
+The spelling is kept only until names are display-only; reading it back from
+here is what lets a call site be rewritten without re-mangling.
+---
+record CoreMonoInstance {
+	def_id: Int,
+	name: String
+}
+
+
+---
+One row of the instance index: a key and the instance minted for it.
+---
+private record CoreMonoInstanceEntry {
+	key: CoreMonoInstanceKey,
+	instance: CoreMonoInstance
+}
+
+
+---
+Every instance requested so far. It is the single membership test for "has
+this specialization been requested already"; a hit reuses the earlier
+instance.
+
+Entries are grouped by the key's `structural_hash` in a `Dict[Int, ...]` and
+confirmed with `core_mono_instance_keys_equal`, so a hash collision costs one
+extra comparison and never merges two instances.
+
+Interim state (docs/NAME_ID_ROADMAP.md, Interim states): this bucket layer
+exists only because a `Dict` keyed directly by `CoreMonoInstanceKey` through
+custom `Hashable`/`Equatable` impls misses structurally equal keys that were
+bound to variables. Filed as "Fix Dict lookup miss for custom Hashable keys
+bound to variables" (reproduction: /private/tmp/claude-501/scratch/dict_key_repro).
+Deletion step: key the `Dict` by `CoreMonoInstanceKey` once that bug is fixed.
+---
+record CoreMonoInstanceIndex {
+	entries_by_hash: Dict[Int, List[CoreMonoInstanceEntry]]
+}
+
+
+---
+An index with no instances.
+---
+pure func empty_core_mono_instance_index() -> CoreMonoInstanceIndex:
+	{entries_by_hash = {}}
+
+
+---
+The instance with this identity, if one was minted.
+---
+pure func find_core_mono_instance(
+	index: CoreMonoInstanceIndex,
+	key: CoreMonoInstanceKey,
+) -> Option[CoreMonoInstance]:
+	var found: Option[CoreMonoInstance] = None
+
+	for entry in index.entries_by_hash.get_or(key.structural_hash, []):
+		if core_mono_instance_keys_equal(entry.key, key):
+			found = Some(entry.instance)
+			break
+
+	found
+
+
+---
+Records that the instance `key` is `instance`. Callers check
+`find_core_mono_instance` first; adding a key twice would shadow the first.
+---
+pure func add_core_mono_instance(
+	index: CoreMonoInstanceIndex,
+	key: CoreMonoInstanceKey,
+	instance: CoreMonoInstance,
+) -> CoreMonoInstanceIndex:
+	{ index |
+		entries_by_hash = index.entries_by_hash.set(
+			key.structural_hash,
+			index.entries_by_hash
+				.get_or(key.structural_hash, [])
+				.append({
+					key = key,
+					instance = instance
+				}),
+		)
+	}
