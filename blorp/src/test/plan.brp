@@ -123,6 +123,37 @@ private pure func run_options_for_harness(options: CliRunArgs, harness_path: Str
 	{ options | files = [harness_path] }
 
 
+--- Execution budget granted to each test source in a leak-checked suite batch.
+--- Leak instrumentation adds teardown work, and a heavily loaded host can push a
+--- large batch past a fixed budget even though every test is healthy.
+private LEAK_CHECKED_SOURCE_TIMEOUT_SECONDS: Int = 5
+
+
+--- A leak-checked batch runs many sources in one artifact, so its timeout is the
+--- larger of the requested timeout (the floor) and a per-source budget times the
+--- batch size. The budget stays finite, so a hung test still fails in bounded time.
+private pure func suite_batch_run_options(
+	options: CliRunArgs,
+	harness_path: String,
+	source_count: Int,
+) -> CliRunArgs:
+	harness_options: CliRunArgs = run_options_for_harness(options, harness_path)
+
+	if not options.leak_check:
+		harness_options
+	else:
+		scaled: Int = LEAK_CHECKED_SOURCE_TIMEOUT_SECONDS * source_count
+
+		match options.timeout:
+			Some(floor):
+				if scaled > floor:
+					{ harness_options | timeout = Some(scaled) }
+				else:
+					harness_options
+			None:
+				harness_options
+
+
 private pure func source_is_requested_for_sequential_route(
 	mode: CliTestMode,
 	source: CliDiscoveredTestSource,
@@ -397,7 +428,11 @@ func materialize_blorp_test_suites(
 		Ok({
 			run_plan = {
 				args = plan.command_args,
-				options = run_options_for_harness(plan.run_options, generated.source.path),
+				options = suite_batch_run_options(
+					plan.run_options,
+					generated.source.path,
+					targets.length(),
+				),
 				graph = graph
 			},
 			target = {
