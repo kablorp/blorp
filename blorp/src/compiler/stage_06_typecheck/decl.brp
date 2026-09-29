@@ -234,7 +234,6 @@ import:
 		DeclarationVisibility(PrivateDeclaration, PublicDeclaration),
 		GlobalId,
 		ImplId,
-		TraitId,
 		builtin_trait_id,
 		callable_id_definition_id,
 		callable_id_module_id,
@@ -251,10 +250,13 @@ import:
 		impl_id_name,
 		impl_id_source_span,
 		trait_id_definition_id,
-		trait_id_is_compiler_builtin,
 		trait_id_module_id,
 		trait_id_name,
 		trait_id_source_span,
+	type_system/trait_identity:
+		TraitId,
+		graph_trait_id,
+		trait_id_is_compiler_builtin,
 	headers/global_header_completion:
 		GlobalHeaderCompletionPlan,
 		GlobalHeaderCompletionPlanBuild(
@@ -3568,15 +3570,39 @@ private pure func register_trait_decl(
 			with_error
 
 
+---
+Register a trait from its parsed declaration alone. Test-only: production
+registers traits from the accepted headers (`AcceptedTraitTableRecord`), which
+carry the header's `TraitId`; nothing outside tests calls this. Here the trait is
+a graph trait whose `TraitId` is the definition id just claimed for it.
+---
 private pure func register_trait_with_id(
 	state: TypecheckState,
 	module_path: String,
 	trait_decl: ParsedTraitDecl,
 	def_id: Int,
 ) -> TypecheckState:
+	match graph_trait_id(def_id):
+		Some(trait_id):
+			register_trait_with_identity(state, module_path, trait_decl, def_id, trait_id)
+		None:
+			typecheck_state_add_error(
+				state,
+				"internal typecheck error: trait '" + trait_decl.name.text + "' was claimed a negative definition id",
+			)
+
+
+private pure func register_trait_with_identity(
+	state: TypecheckState,
+	module_path: String,
+	trait_decl: ParsedTraitDecl,
+	def_id: Int,
+	trait_id: TraitId,
+) -> TypecheckState:
 	type_params = type_param_names(trait_decl.type_params)
 	trait_def = trait_def_with_details(
 		def_id,
+		trait_id,
 		trait_decl.name.text,
 		type_params,
 		trait_decl.supertraits.map(func(name): name.text),
@@ -3715,6 +3741,7 @@ private pure func prepare_accepted_trait_header(
 							).map(trait_method_slot_id),
 							definition = trait_def_with_details(
 								definition_id,
+								id,
 								trait_id_name(definition_table, id),
 								trait_topology_header_parameters(
 									header,
@@ -4491,6 +4518,7 @@ private pure func prepare_accepted_implementation_header(
 											.map(implementation_method_header_id),
 										instance = impl_instance_with_methods(
 											definition_id,
+											trait_id,
 											trait_id_name(definition_table, trait_id),
 											canonical_for_type,
 											implementation_bound_type_params(
@@ -4533,6 +4561,14 @@ private pure func register_impl_decl_with_info(
 			with_error
 
 
+---
+Register an impl from its parsed declaration alone. Test-only: production
+registers impls from the accepted headers, which carry the header's trait id;
+nothing outside tests calls this. The trait's identity is looked up in the
+environment by name. An impl of a trait the environment does not know cannot
+carry a `TraitId`, so it is reported as an internal error instead of being
+registered.
+---
 private pure func register_impl_with_id(
 	state: TypecheckState,
 	impl_decl: ParsedImplDecl,
@@ -4541,19 +4577,31 @@ private pure func register_impl_with_id(
 	is_private: Bool,
 	def_id: Int,
 ) -> TypecheckState:
-	instance = impl_instance_with_methods(
-		def_id,
-		impl_decl.trait_name.text,
-		for_type,
-		impl_bounds_for_decl_type(state, impl_decl.for_type, for_type),
-		method_infos,
-		False,
-	)
+	match env_get_trait(state.env, impl_decl.trait_name.text):
+		Some(trait_definition):
+			instance = impl_instance_with_methods(
+				def_id,
+				trait_definition.trait_id,
+				impl_decl.trait_name.text,
+				for_type,
+				impl_bounds_for_decl_type(state, impl_decl.for_type, for_type),
+				method_infos,
+				False,
+			)
 
-	if is_private:
-		add_private_impl_checked(state, instance)
-	else:
-		add_source_impl_checked(state, instance)
+			if is_private:
+				add_private_impl_checked(state, instance)
+			else:
+				add_source_impl_checked(state, instance)
+		None:
+			typecheck_state_add_error(
+				state,
+				(
+					"internal typecheck error: implementation of unknown trait '"
+					+ impl_decl.trait_name.text
+					+ "' reached test-only registration"
+				),
+			)
 
 
 private pure func register_impl_decl(

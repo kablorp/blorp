@@ -81,13 +81,19 @@ not declaration); `TraitId` is right.
 
 | Slice | What | Gate |
 | --- | --- | --- |
-| A2b.1 | pinned builtin `TraitId`s; `TraitId` beside the name on `TraitDef`, `ImplInstance`, `TraitObligation`; id/name agreement test | typecheck stage; identical C |
+| A2b.1 | leaf `type_system/trait_identity.brp` (opaque `TraitId`, 29 pinned builtin constants tested against `builtin_trait_registry_id`); mandatory `TraitDef.trait_id` and `ImplInstance.trait_id` written by the builtin registry and the accepted-header path; agreement test over `env.traits` and `env.impls` (including builtin `def_id` 100+ versus registry id) | typecheck stage; identical C |
+| A2b.4 | identities for every bound (`BoundTypeParam.bounds` derived from `bound_identities`; inline bounds through a module-view lookup where headers do not supply an identity); delete `TraitRef`. Needed before A2b.2 because `TraitObligation.trait_name` is built from bounds | typecheck stage; formatter idempotence |
 | A2b.2 | obligation readers compare pinned ids; delete `TraitObligation.trait_name` (the Equatable/HasLength/Stringable arms and 23 `infer.brp` literal compares go) | 860 `should_fail` messages unchanged |
 | A2b.3 | impl and supertrait walks by `TraitId`; delete `ImplInstance.trait_name`, `TraitDef.supertraits` Strings; authority dict keys by id | typecheck stage, sanitize |
-| A2b.4 | `BoundTypeParam.bounds` derived from `bound_identities`; delete `TraitRef` | typecheck stage; formatter idempotence |
 | A2b.5 | resolved call targets, `TraitMethodCallee`, `trait_functions` by `TraitId` | typecheck stage |
 | A2b.6 | typed trait and impl info carry `TraitId` for lowering | Core suites |
 | A2b.7 | Core: impl and trait decls, trait calls, DCE keys, `synth_scalar_operator` and `trait_dispatch` literals by id; trait catalog for display; retire M2.3's `CoreImplMethodRole` (callback roles become pinned `(TraitId, NameId)` pairs) | `compiler-core-sanitize`, backend identity |
+
+Order: A2b.1, A2b.4, A2b.2, A2b.3, A2b.5, A2b.6, A2b.7. The registration path
+used only by tests (`register_trait_decl`, `register_impl_decl`,
+`register_impl_with_id`; no production callers) resolves its `TraitId` by name
+from the environment. Retiring it (about 75 test call sites) is a separate
+cleanup, not part of these slices.
 
 ## Lane B: emission by id
 
@@ -132,6 +138,7 @@ becomes permanent by being forgotten.
 | `.text` reads left after A4c: 13 name-data copies in `stage_07_ctfe/ir.brp` (CTFE IR bindings and assignment targets) and 2 key comparisons in `typed_ast_json.brp` | A4c | A5 (when CTFE IR and those keys carry ids) |
 | Standalone graphs (`graph_source_name_table_for_programs`) give identifiers ids from private per-program tables; rendering there is `.text`-only (`SpellingsFromIdentifierText`) | A4a | before A5: standalone graphs share the discovery table |
 | `.text` lookups in type header resolution (`declared_unqualified_type`, `type_header_graph_has_unqualified_type_name`, `resolve_named_type`) kept beside `identifier.name` for import, alias and parameter lookups keyed by String | A2 | A4/A5 |
+| trait name Strings beside `TraitId` in `TraitDef`, `ImplInstance` (`TraitObligation.trait_name` unchanged; it waits for bound identities, A2b.4) | A2b.1 | A2b.2-A2b.3 |
 
 ## Finished branches waiting to land
 

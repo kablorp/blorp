@@ -75,6 +75,9 @@ CALLABLE_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_callable_authority.brp"
 )
+TRAIT_IDENTITY = (
+    ROOT / "blorp/src/compiler/stage_06_typecheck/type_system/trait_identity.brp"
+)
 TRAIT_IMPLEMENTATION_AUTHORITY = (
     ROOT
     / "blorp/src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority.brp"
@@ -535,7 +538,11 @@ class DeclarationBoundaryTests(unittest.TestCase):
         source = DECLARATION_SKELETON.read_text(encoding="utf-8")
 
         self.assertIn("opaque type ImplId = DefinitionId", source)
-        self.assertIn("opaque type TraitId = Int", source)
+        self.assertNotIn("opaque type TraitId", source)
+        self.assertIn(
+            "opaque type TraitId = Int",
+            TRAIT_IDENTITY.read_text(encoding="utf-8"),
+        )
         self.assertNotIn("StructuralDeclarationIdRep", source)
         self.assertNotIn("RuntimeDeclarationIdRep", source)
 
