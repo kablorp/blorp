@@ -97,6 +97,7 @@ becomes permanent by being forgotten.
 | Span-derived positive binder ids for authored binders | B0/B1a | A1b (parser-minted ids) |
 | One sigil read left in `type_parameter_name_kind` (`List[String]` type parameters) | D7 (230835a0b) | type interning, when type-parameter lists carry kinds |
 | `--dump-core` JSON carries both name Strings and ids | A0 | A5 |
+| `.text` lookups in type header resolution (`declared_unqualified_type`, `type_header_graph_has_unqualified_type_name`, `resolve_named_type`) kept beside `identifier.name` for import, alias and parameter lookups keyed by String | A2 | A4/A5 |
 
 ## Finished branches waiting to land
 
