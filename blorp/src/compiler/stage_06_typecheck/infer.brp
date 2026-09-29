@@ -344,6 +344,7 @@ import:
 		env_get_var_refinement,
 		env_get_var_type,
 		env_has_compiler_structural_equality,
+		equality_component_types,
 		env_is_scoped_resource_derived_var,
 		env_is_scoped_resource_related_var,
 		env_is_scoped_resource_var,
@@ -1256,7 +1257,7 @@ private pure func infer_type_has_compiler_structural_equality(
 			SemanticNamedType(name, _):
 				match module_view_accepted_union_authority(session.facts.module_view):
 					Some(authority):
-						accepted_union_is_enum(authority, name).is_some()
+						accepted_union_is_enum(authority, name) == Some(True)
 					None:
 						False
 			_:
@@ -1273,14 +1274,6 @@ private pure func infer_has_compiler_structural_equality(
 	)
 
 
-private pure func list_element_type_of(typ: SemanticType) -> Option[SemanticType]:
-	match typ:
-		SemanticNamedType("List", [element]):
-			Some(element)
-		_:
-			None
-
-
 private pure func infer_resolve_trait_obligation(
 	session: InferSession,
 	obligation: TraitObligation,
@@ -1288,24 +1281,48 @@ private pure func infer_resolve_trait_obligation(
 	if infer_has_compiler_structural_equality(session, obligation):
 		TraitObligationSatisfied
 	else:
-		-- List equality is element-wise, so a List is Equatable exactly when
-		-- its element is. Resolving the element here, rather than through the
-		-- stdlib impl's bound, keeps enums (which only the module view can
-		-- identify) admissible as elements.
-		equatable_list_element = if obligation.trait_name == "Equatable":
-			list_element_type_of(obligation.obligation_type)
+		-- Component-wise containers (List, Option, Result, tuples) are Equatable
+		-- exactly when their components are. Resolving the components here,
+		-- rather than through the stdlib impl's bounds, keeps enums (which only
+		-- the module view can identify) admissible as components.
+		components = if obligation.trait_name == "Equatable":
+			equality_component_types(obligation.obligation_type)
 		else:
 			None
 
-		match equatable_list_element:
-			Some(element):
-				infer_resolve_trait_obligation(session, trait_obligation(element, "Equatable"))
+		match components:
+			Some(types):
+				infer_resolve_all_equatable(session, types)
 			None:
 				match module_view_accepted_trait_implementation_authority(session.facts.module_view):
 					Some(authority):
 						accepted_resolve_trait_obligation(authority, session.env, obligation)
 					None:
 						env_resolve_trait_obligation(session.env, obligation)
+
+
+private pure func infer_resolve_all_equatable(
+	session: InferSession,
+	types: List[SemanticType],
+) -> TraitObligationResolution:
+	var result: TraitObligationResolution = TraitObligationSatisfied
+
+	for typ in types:
+		-- An integer literal's component type is its literal value type; equality
+		-- is decided by the scalar Int it defaults to.
+		match infer_resolve_trait_obligation(
+			session,
+			trait_obligation(scalar_int_value_type(typ), "Equatable"),
+		):
+			TraitObligationSatisfied:
+				void
+			TraitObligationDeferred:
+				result = TraitObligationDeferred
+			TraitObligationUnsatisfied:
+				result = TraitObligationUnsatisfied
+				break
+
+	result
 
 
 private pure func infer_find_unsatisfied_trait_obligation(
@@ -6456,8 +6473,16 @@ private pure func check_comparison_binary_op(
 Help text for a List whose equality fails because its element type is not
 Equatable; List equality compares elements with the element type's own ==.
 ---
+private pure func list_element_type(typ: SemanticType) -> Option[SemanticType]:
+	match typ:
+		SemanticNamedType("List", [element]):
+			Some(element)
+		_:
+			None
+
+
 private pure func equality_element_help(context: InferContext, typ: SemanticType) -> String:
-	match list_element_type_of(typ):
+	match list_element_type(typ):
 		Some(element):
 			if type_satisfies_trait(context, element, "Equatable"):
 				""

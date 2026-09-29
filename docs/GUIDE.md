@@ -2175,6 +2175,8 @@ implements Equatable for Vec2:
         a.x == b.x and a.y == b.y
 ```
 
+Every type that has data needs an explicit `Equatable` implementation to use `==`: records, structs, and unions with payloads. There is no identity fallback. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, and `List`. `Option[T]`, `Result[T, E]`, tuples, and `List[T]` are `Equatable` exactly when their components are, so `Option[Point]` is rejected unless `Point` implements `Equatable`.
+
 `List[T]` is `Equatable` exactly when `T` is: `==` compares lengths, then elements
 with the element type's own `==`, so lists of lists, options, and records with an
 `Equatable` implementation compare by value. Comparing `List[Point]` when `Point`
