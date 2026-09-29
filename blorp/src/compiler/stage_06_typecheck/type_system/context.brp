@@ -28,8 +28,11 @@ import:
 			SemanticVarDimsType,
 		),
 		SemanticTypeSubstEntry,
+		SemanticTypeVarKind(SemanticTypeParameter),
 		array_type_parts,
-		is_dim_var_name,
+		is_dimension_parameter_kind,
+		is_dimension_parameter_name,
+		type_parameter_name_kind,
 		normalize_dim,
 		normalize_type_name,
 		occurs_in,
@@ -52,8 +55,17 @@ record ResourceCleanupEntry {
 }
 
 
+---
+`origins[slot]` names the generic variable an unbound meta becomes when its
+body is finalized and `origin_kinds[slot]` is that variable's kind. The kind is
+recorded once, when the meta is issued, so generalization does not re-read a
+sigil. The two lists are appended together in `fresh_meta_with_origin` only. A
+parallel list of a fieldless enum keeps issuing a meta allocation-free, which a
+per-meta record would not.
+---
 private record MetaSolverStateRep {
 	origins: List[String],
+	origin_kinds: List[SemanticTypeVarKind],
 	bindings: List[Option[SemanticType]]
 }
 
@@ -62,6 +74,7 @@ opaque type MetaSolverState = MetaSolverStateRep
 
 private META_SOLVER_EMPTY: MetaSolverState = into_opaque MetaSolverState({
 		origins = [],
+		origin_kinds = [],
 		bindings = []
 	})
 
@@ -312,6 +325,19 @@ pure func meta_origin_name(context: Context, session: MetaSessionId, slot: Int) 
 				"?m" + slot.to_string()
 
 
+pure func meta_origin_kind(
+	context: Context,
+	session: MetaSessionId,
+	slot: Int,
+) -> SemanticTypeVarKind:
+	solver = from_opaque MetaSolverState(context.solver)
+
+	if not meta_session_belongs_to_context(context, session):
+		SemanticTypeParameter
+	else:
+		solver.origin_kinds.get_or(slot, SemanticTypeParameter)
+
+
 pure func lookup_meta(context: Context, session: MetaSessionId, slot: Int) -> Option[SemanticType]:
 	solver = from_opaque MetaSolverState(context.solver)
 
@@ -356,6 +382,7 @@ pure func meta_solver_states_equal(left: Context, right: Context) -> Bool:
 	(
 		sessions_equal
 		and left_solver.origins == right_solver.origins
+		and left_solver.origin_kinds == right_solver.origin_kinds
 		and meta_bindings_equal(left_solver.bindings, right_solver.bindings)
 	)
 
@@ -623,7 +650,8 @@ private pure func unbound_meta_type_if_changed(
 
 		match origin:
 			Some(origin):
-				Some(SemanticTypeVar(origin))
+				origin_kind = solver.origin_kinds.get_or(slot, SemanticTypeParameter)
+				Some(SemanticTypeVar(origin, origin_kind))
 			None:
 				None
 	else:
@@ -1174,9 +1202,9 @@ private pure func unify_right_or_structural(
 	match right:
 		SemanticMetaType(meta_session, meta_slot):
 			unify_bind_meta(step, meta_session, meta_slot, left)
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, kind):
 			if unify_name_is_rigid(options, name):
-				if is_dim_var_name(name) and unify_is_int_type(left):
+				if is_dimension_parameter_kind(kind) and unify_is_int_type(left):
 					Some(step)
 				else:
 					None
@@ -1240,9 +1268,9 @@ private pure func unify_go(
 		match left:
 			SemanticMetaType(meta_session, meta_slot):
 				unify_bind_meta(step, meta_session, meta_slot, right)
-			SemanticTypeVar(name):
+			SemanticTypeVar(name, kind):
 				if unify_name_is_rigid(options, name):
-					if is_dim_var_name(name) and unify_is_int_type(right):
+					if is_dimension_parameter_kind(kind) and unify_is_int_type(right):
 						Some(step)
 					else:
 						None
@@ -1254,10 +1282,10 @@ private pure func unify_go(
 
 private pure func unify_is_dim_var_type(typ: SemanticType) -> Bool:
 	match typ:
-		SemanticTypeVar(name):
-			is_dim_var_name(name)
+		SemanticTypeVar(_, kind):
+			is_dimension_parameter_kind(kind)
 		SemanticNamedType(name, args):
-			args.length() == 0 and is_dim_var_name(name)
+			args.length() == 0 and is_dimension_parameter_name(name)
 		_:
 			False
 
@@ -1407,6 +1435,7 @@ pure func fresh_meta_with_origin(context: Context, origin: String) -> Option[Fre
 		Some({
 			context = { context | solver = into_opaque MetaSolverState({ solver |
 						origins = solver.origins.append(meta_origin),
+						origin_kinds = solver.origin_kinds.append(type_parameter_name_kind(meta_origin)),
 						bindings = solver.bindings.append(None)
 					}) },
 			meta_type = SemanticMetaType(session, slot),

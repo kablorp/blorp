@@ -415,6 +415,7 @@ import:
 			SemanticVarDimsType,
 		),
 		SemanticTypeSubstEntry,
+		SemanticTypeVarKind(SemanticDimensionParameter, SemanticTypeParameter),
 		TYPE_BOOL,
 		TYPE_CHAR,
 		TYPE_FLOAT,
@@ -425,21 +426,24 @@ import:
 		array_type,
 		array_type_parts,
 		canonical_module_type_name,
-		dim_var_name_without_sigil,
 		is_any_float_type,
 		is_any_integer_type,
 		is_dim_type,
-		is_dim_var_name,
+		is_dimension_parameter_kind,
+		is_dimension_parameter_name,
 		is_legacy_single_letter_type_param,
 		is_signed_integer_type,
 		is_unsigned_integer_type,
 		normalize_dim,
 		normalize_type_name,
 		occurs_in,
+		semantic_type_variable_named,
 		type_contains_meta,
 		type_instantiate_type_params,
 		type_list,
 		type_contains_dim_op,
+		type_parameter_name_kind,
+		type_parameter_name_without_sigil,
 		type_subst_entry,
 		type_to_string,
 		types_compatible_with_params,
@@ -6248,7 +6252,7 @@ private pure func type_param_name(context: InferContext, typ: SemanticType) -> O
 	type_params = env_get_type_params(context.state.env)
 
 	match typ:
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, _):
 			if type_params.contains(name):
 				Some(name)
 			else:
@@ -6851,7 +6855,7 @@ private pure func constructor_return_type(
 
 			for param in type_params:
 				if field_types.any(func(field_type): occurs_in(param, field_type)):
-					args = args.append(SemanticTypeVar(param))
+					args = args.append(semantic_type_variable_named(param))
 				else:
 					match fresh_meta_with_origin(type_context, param):
 						Some(step):
@@ -6862,7 +6866,7 @@ private pure func constructor_return_type(
 								next_context,
 								"internal typecheck error: inference meta requested outside an issued session",
 							)
-							args = args.append(SemanticTypeVar(param))
+							args = args.append(semantic_type_variable_named(param))
 
 			next_state = { next_context.state | context = type_context }
 			checked_type(
@@ -7450,7 +7454,7 @@ private pure func builtin_symbol_prefers_trait_dispatch(name: String) -> Bool:
 
 private pure func to_string_prefers_trait_dispatch(receiver_type: SemanticType) -> Bool:
 	match receiver_type:
-		SemanticTypeVar(_):
+		SemanticTypeVar(_, _):
 			True
 		_:
 			False
@@ -8005,7 +8009,7 @@ private pure func argument_mismatch_error(
 
 private pure func type_contains_type_var(typ: SemanticType) -> Bool:
 	match typ:
-		SemanticTypeVar(_):
+		SemanticTypeVar(_, _):
 			True
 		SemanticNamedType(name, args):
 			if args.length() == 0:
@@ -8054,9 +8058,9 @@ private pure func fresh_callee_type_param_name(
 	if not outer_names.contains(name) and not used_names.contains(name):
 		name
 	else:
-		is_dim = is_dim_var_name(name)
+		is_dim = is_dimension_parameter_name(name)
 
-		base_name = dim_var_name_without_sigil(name)
+		base_name = type_parameter_name_without_sigil(name)
 
 		prefix = if is_dim:
 			"#__callee_"
@@ -8099,7 +8103,9 @@ private pure func call_signature(
 			used_names = used_names.append(scoped_name)
 
 			if scoped_name != param.name:
-				renames = renames.append(type_subst_entry(param.name, SemanticTypeVar(scoped_name)))
+				renames = renames.append(
+					type_subst_entry(param.name, semantic_type_variable_named(scoped_name)),
+				)
 
 		final_renames = renames
 		{
@@ -8114,7 +8120,7 @@ private pure func type_contains_named_type_param(
 	typ: SemanticType,
 ) -> Bool:
 	match typ:
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, _):
 			type_param_names.contains(name)
 		SemanticNamedType(name, args):
 			(
@@ -8521,16 +8527,17 @@ private pure func generic_conflict_error(
 private pure func bind_type_var_subst(
 	context: InferContext,
 	name: String,
+	kind: SemanticTypeVarKind,
 	actual_type: SemanticType,
 	subst: List[SemanticTypeSubstEntry],
 ) -> BindTypeSubstResult:
-	bound_type: SemanticType = if is_dim_var_name(name):
+	bound_type: SemanticType = if is_dimension_parameter_kind(kind):
 		actual_type
 	else:
 		default_collection_element_type(actual_type)
 
 	is_identity = match bound_type:
-		SemanticTypeVar(actual_name):
+		SemanticTypeVar(actual_name, _):
 			actual_name == name
 		SemanticNamedType(actual_name, args):
 			args.length() == 0 and actual_name == name
@@ -8632,14 +8639,20 @@ private pure func bind_type_subst_with_type_params(
 	subst: List[SemanticTypeSubstEntry],
 ) -> BindTypeSubstResult:
 	match param_type:
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, kind):
 			if type_param_names.length() == 0 or type_param_names.contains(name):
-				bind_type_var_subst(context, name, actual_type, subst)
+				bind_type_var_subst(context, name, kind, actual_type, subst)
 			else:
 				bind_type_subst_result(context, subst)
 		SemanticNamedType(param_name, param_args):
 			if param_args.length() == 0 and type_param_names.contains(param_name):
-				bind_type_var_subst(context, param_name, actual_type, subst)
+				bind_type_var_subst(
+					context,
+					param_name,
+					type_parameter_name_kind(param_name),
+					actual_type,
+					subst,
+				)
 			else:
 				match actual_type:
 					SemanticNamedType(actual_name, actual_args):
@@ -9517,7 +9530,7 @@ private pure func call_trait_bound_error(
 	trait_name: String,
 ) -> InferContext:
 	match concrete_type:
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, _):
 			infer_error(
 				context,
 				"Type parameter " + name + " does not have bound " + trait_name + " (required by " + callee_name + ")",
@@ -10061,9 +10074,9 @@ private pure func refined_length_return_type(
 			match dims.get(0):
 				Some(SemanticConstIntType(size)):
 					SemanticConstIntType(size)
-				Some(SemanticTypeVar(name)):
-					if is_dim_var_name(name):
-						SemanticTypeVar(name)
+				Some(SemanticTypeVar(name, kind)):
+					if is_dimension_parameter_kind(kind):
+						SemanticTypeVar(name, kind)
 					else:
 						fallback
 				Some(SemanticDimOpType(op, left, right)):
@@ -10078,14 +10091,14 @@ private pure func static_dim_from_type(typ: SemanticType) -> Option[SemanticType
 	match typ:
 		SemanticConstIntType(_):
 			Some(typ)
-		SemanticTypeVar(name):
-			if is_dim_var_name(name):
+		SemanticTypeVar(_, kind):
+			if is_dimension_parameter_kind(kind):
 				Some(typ)
 			else:
 				None
 		SemanticNamedType(name, args):
-			if args.length() == 0 and is_dim_var_name(name):
-				Some(SemanticTypeVar(name))
+			if args.length() == 0 and is_dimension_parameter_name(name):
+				Some(SemanticTypeVar(name, SemanticDimensionParameter))
 			else:
 				None
 		SemanticDimOpType(_, _, _):
@@ -15917,13 +15930,13 @@ private pure func dim_minimum_size(dim: SemanticType) -> Option[Int]:
 	match normalize_dim(dim):
 		SemanticConstIntType(value):
 			Some(value)
-		SemanticTypeVar(name):
-			if is_dim_var_name(name):
+		SemanticTypeVar(_, kind):
+			if is_dimension_parameter_kind(kind):
 				Some(1)
 			else:
 				None
 		SemanticNamedType(name, args):
-			if args.length() == 0 and is_dim_var_name(name):
+			if args.length() == 0 and is_dimension_parameter_name(name):
 				Some(1)
 			else:
 				None
@@ -15949,8 +15962,12 @@ private pure func range_bound_fits_dim(bound: SemanticType, dim: SemanticType) -
 	match (bound, dim):
 		(SemanticConstIntType(bound_size), SemanticConstIntType(dim_size)):
 			bound_size <= dim_size
-		(SemanticTypeVar(bound_name), SemanticTypeVar(dim_name)):
-			is_dim_var_name(bound_name) and is_dim_var_name(dim_name) and bound_name == dim_name
+		(SemanticTypeVar(bound_name, bound_kind), SemanticTypeVar(dim_name, dim_kind)):
+			(
+				is_dimension_parameter_kind(bound_kind)
+				and is_dimension_parameter_kind(dim_kind)
+				and bound_name == dim_name
+			)
 		_:
 			types_equal(bound, dim)
 
@@ -16685,7 +16702,7 @@ private pure func assert_shape_dims_refinable(dims: List[SemanticType]) -> Bool:
 	match dims:
 		[SemanticVarDimsType(_)]:
 			True
-		[SemanticTypeVar(_)]:
+		[SemanticTypeVar(_, _)]:
 			True
 		_:
 			False
@@ -17806,7 +17823,7 @@ private pure func list_pattern_element_type(scrutinee_type: SemanticType) -> Opt
 					Some(element):
 						Some(element)
 					None:
-						Some(SemanticTypeVar("_list_elem"))
+						Some(SemanticTypeVar("_list_elem", SemanticTypeParameter))
 			else:
 				None
 		_:
@@ -19208,9 +19225,9 @@ private pure func loop_index_type(dim: SemanticType) -> SemanticType:
 				SemanticRangeType(SemanticConstIntType(bound))
 			else:
 				TYPE_INT
-		SemanticTypeVar(name):
-			if is_dim_var_name(name):
-				SemanticRangeType(SemanticTypeVar(name))
+		SemanticTypeVar(name, kind):
+			if is_dimension_parameter_kind(kind):
+				SemanticRangeType(SemanticTypeVar(name, kind))
 			else:
 				TYPE_INT
 		SemanticVarDimsType(name):

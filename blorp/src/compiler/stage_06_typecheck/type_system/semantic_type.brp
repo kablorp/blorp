@@ -11,6 +11,17 @@ enum SemanticDimOp:
 
 
 ---
+Whether a type variable stands for a type or for a dimension. A variable
+carries its kind so consumers test the kind instead of reading a `#` sigil off
+its spelling; the spelling keeps the sigil only for display and for the
+string-keyed parameter lists that have not yet been given kinds.
+---
+enum SemanticTypeVarKind:
+	SemanticTypeParameter
+	SemanticDimensionParameter
+
+
+---
 Compiler types are immutable values. Phase boundaries share these trees and
 rely on ARC to retain them; only a transformation that changes a node should
 rebuild that node.
@@ -19,7 +30,7 @@ union SemanticType:
 	SemanticNamedType(String, List[SemanticType])
 	SemanticArrayType(SemanticType, List[SemanticType])
 	SemanticFunctionType(Bool, List[SemanticType], SemanticType)
-	SemanticTypeVar(String)
+	SemanticTypeVar(String, SemanticTypeVarKind)
 	SemanticConstIntType(Int)
 	SemanticTupleType(List[SemanticType])
 	SemanticSelfType
@@ -130,7 +141,7 @@ private pure func type_instantiate_type_params_if_changed(
 	match typ:
 		SemanticNamedType(name, args):
 			if args.is_empty() and type_params.contains(name):
-				Some(SemanticTypeVar(name))
+				Some(semantic_type_variable_named(name))
 			else:
 				match type_instantiate_type_param_list_if_changed(type_params, args):
 					Some(instantiated_args):
@@ -177,7 +188,7 @@ private pure func type_instantiate_type_params_if_changed(
 							Some(SemanticFunctionType(is_pure, params, instantiated_return))
 						None:
 							None
-		SemanticTypeVar(_):
+		SemanticTypeVar(_, _):
 			None
 		SemanticConstIntType(_):
 			None
@@ -251,7 +262,7 @@ pure func type_contains_meta(typ: SemanticType) -> Bool:
 			type_contains_meta(element) or types_contain_meta(dims)
 		SemanticFunctionType(_, params, return_type):
 			types_contain_meta(params) or type_contains_meta(return_type)
-		SemanticTypeVar(_):
+		SemanticTypeVar(_, _):
 			False
 		SemanticConstIntType(_):
 			False
@@ -277,28 +288,47 @@ pure func normalize_type_name(name: String) -> String:
 
 
 ---
-Type-variable names spell their kind: a dimension variable keeps the source
-`#` sigil (`#N`). The parser records the kind on the declaration
-(`ParsedTypeParamDecl.kind`), and header code carries it from there; semantic
-types have no kind field, so a `SemanticTypeVar` name is the only carrier and
-this constant is the one place that spelling is defined. A later change that
-gives semantic type variables an explicit kind deletes these three helpers.
+The dimension sigil in a dimension parameter's spelling (`#N`). A
+`SemanticTypeVar` carries its kind explicitly, so this is read in exactly one
+place: `type_parameter_name_kind`, the boundary where a bare parameter name
+from a `List[String]` parameter list (environment, data declarations,
+`BoundTypeParam`) becomes a kinded variable. Deleting it requires giving those
+lists kinds, which is a separate change.
 ---
 private DIM_VAR_SIGIL: Char = '#'
 
 DIM_VAR_SIGIL_LENGTH: Int = 1
 
 
-pure func is_dim_var_name(name: String) -> Bool:
-	name.length() > 0 and name.get_or(0, ' ') == DIM_VAR_SIGIL
+pure func type_parameter_name_kind(name: String) -> SemanticTypeVarKind:
+	if name.length() > 0 and name.get_or(0, ' ') == DIM_VAR_SIGIL:
+		SemanticDimensionParameter
+	else:
+		SemanticTypeParameter
+
+
+pure func semantic_type_variable_named(name: String) -> SemanticType:
+	SemanticTypeVar(name, type_parameter_name_kind(name))
+
+
+pure func is_dimension_parameter_kind(kind: SemanticTypeVarKind) -> Bool:
+	match kind:
+		SemanticDimensionParameter:
+			True
+		SemanticTypeParameter:
+			False
+
+
+pure func is_dimension_parameter_name(name: String) -> Bool:
+	is_dimension_parameter_kind(type_parameter_name_kind(name))
 
 
 ---
-The variable's name without the dimension sigil; type-variable names are
+The parameter's name without the dimension sigil; type-parameter names are
 returned unchanged. Used to build derived names that must re-add the sigil.
 ---
-pure func dim_var_name_without_sigil(name: String) -> String:
-	if is_dim_var_name(name):
+pure func type_parameter_name_without_sigil(name: String) -> String:
+	if is_dimension_parameter_name(name):
 		name.substring(DIM_VAR_SIGIL_LENGTH, name.length())
 	else:
 		name
@@ -832,7 +862,7 @@ pure func type_to_string(typ: SemanticType) -> String:
 			return_text: String = type_to_string(return_type)
 
 			prefix + "(" + params_text + ") -> " + return_text
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, _):
 			name
 		SemanticConstIntType(value):
 			"#" + value.to_string()
@@ -973,9 +1003,9 @@ pure func types_equal(left: SemanticType, right: SemanticType) -> Bool:
 										)
 									_:
 										False
-							SemanticTypeVar(left_name):
+							SemanticTypeVar(left_name, _):
 								match right:
-									SemanticTypeVar(right_name):
+									SemanticTypeVar(right_name, _):
 										left_name == right_name
 									_:
 										False
@@ -1113,7 +1143,7 @@ pure func types_compatible_with_params(
 		True
 	else:
 		match expected:
-			SemanticTypeVar(name):
+			SemanticTypeVar(name, _):
 				name == "#_" or type_param_names_include(type_params, name)
 			SemanticNamedType(expected_name, expected_args):
 				if (
@@ -1128,11 +1158,11 @@ pure func types_compatible_with_params(
 					match actual:
 						SemanticConstIntType(_):
 							expected_name == TYPE_NAME_INT and expected_args.length() == 0
-						SemanticTypeVar(actual_name):
+						SemanticTypeVar(_, actual_kind):
 							(
 								expected_name == TYPE_NAME_INT
 								and expected_args.length() == 0
-								and is_dim_var_name(actual_name)
+								and is_dimension_parameter_kind(actual_kind)
 							)
 						SemanticRangeType(_):
 							expected_name == TYPE_NAME_INT and expected_args.length() == 0
@@ -1248,7 +1278,7 @@ private pure func type_list_occurs_in(var_name: String, types: List[SemanticType
 
 pure func occurs_in(var_name: String, typ: SemanticType) -> Bool:
 	match typ:
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, _):
 			name == var_name
 		SemanticNamedType(name, args):
 			if args.length() == 0:
@@ -1457,7 +1487,7 @@ private pure func apply_subst_with_visited(
 	typ: SemanticType,
 ) -> SemanticType:
 	match typ:
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, _):
 			try_apply_subst_name(subst, visited, name, typ)
 		SemanticNamedType(name, args):
 			if args.length() == 0:
@@ -1618,7 +1648,7 @@ private pure func type_params_include_dim_name(type_params: List[String], name: 
 	while index < type_params.length() and not found:
 		match type_params.get(index):
 			Some(param):
-				found = param == name and is_dim_var_name(param)
+				found = param == name and is_dimension_parameter_name(param)
 			None:
 				void
 
@@ -1631,12 +1661,12 @@ pure func is_dim_type_with_params(type_params: List[String], typ: SemanticType) 
 	match typ:
 		SemanticConstIntType(_):
 			True
-		SemanticTypeVar(name):
-			is_dim_var_name(name) or type_params_include_dim_name(type_params, name)
+		SemanticTypeVar(name, kind):
+			is_dimension_parameter_kind(kind) or type_params_include_dim_name(type_params, name)
 		SemanticNamedType(name, args):
 			(
 				args.length() == 0
-				and (is_dim_var_name(name) or type_params_include_dim_name(type_params, name))
+				and (is_dimension_parameter_name(name) or type_params_include_dim_name(type_params, name))
 			)
 		SemanticVarDimsType(_):
 			True
@@ -1661,7 +1691,7 @@ private pure func collect_type_vars_from_list(types: List[SemanticType]) -> List
 
 pure func collect_type_vars(typ: SemanticType) -> List[String]:
 	match typ:
-		SemanticTypeVar(name):
+		SemanticTypeVar(name, _):
 			[name]
 		SemanticVarDimsType(name):
 			[name]
@@ -1692,10 +1722,10 @@ pure func is_scalar_int_value_type(typ: SemanticType) -> Bool:
 			True
 		SemanticDimOpType(_, _, _):
 			True
-		SemanticTypeVar(name):
-			is_dim_var_name(name)
+		SemanticTypeVar(_, kind):
+			is_dimension_parameter_kind(kind)
 		SemanticNamedType(name, args):
-			args.length() == 0 and is_dim_var_name(name)
+			args.length() == 0 and is_dimension_parameter_name(name)
 		_:
 			False
 
