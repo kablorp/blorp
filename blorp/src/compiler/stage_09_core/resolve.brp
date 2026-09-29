@@ -1312,6 +1312,24 @@ private pure func callable_call_by_id(
 
 
 ---
+The target of a `SelectedDirectCall(id)`. The frontend selected this
+definition for the call and ids are unique, so the id is the answer and the
+call's argument types are not re-checked against the target's parameters:
+they legitimately differ when typecheck lifts a scalar function over a tensor
+(`sqrt(matrix)` selects the scalar `sqrt`, whose signature the arguments do not
+match). Only an id shared across categories (`colliding_definition_ids`)
+declines.
+---
+private pure func selected_call_by_id(env: CoreCallResolveEnv, id: Int) -> Option[CoreCallKind]:
+	if Sets.contains(env.colliding_definition_ids, id):
+		None
+	else:
+		env.callable_targets_by_id
+			.get(id)
+			.map(callable_target_call_kind)
+
+
+---
 Whether the target selected by id accepts this call. A mono instance is
 trusted (see `CoreCallableTargetProvenance`); any other target must match the
 call's argument and return types.
@@ -1892,6 +1910,19 @@ private pure func unknown_field_call_kind(
 				UnknownCall
 
 
+---
+Resolves one call kind to the callee it names.
+
+`SelectedDirectCall(id)` is the frontend's own selection, and definition ids
+are unique (`DuplicateFunctionDefinitionId`, `DuplicateDefinitionId`), so the
+id is the answer. Its arguments are deliberately not re-checked against the
+target's parameters: typecheck may select a scalar function for an
+elementwise tensor call (`sqrt(matrix)` selects the scalar `sqrt`), which is
+legal at this stage and is specialized later by `tensor_specialize` and the
+parallel-tensor passes. A signature check here rejected that lift and the call
+ended up as a `ClosureCall`. `UnknownCall` carries only a hint, so its id must
+still match the call's signature.
+---
 private pure func resolve_call_kind(
 	env: CoreCallResolveEnv,
 	module_path: String,
@@ -1903,7 +1934,7 @@ private pure func resolve_call_kind(
 ) -> CoreCallKind:
 	match kind:
 		SelectedDirectCall(selected_id):
-			match callable_call_by_id(env, Some(selected_id), callee, args):
+			match selected_call_by_id(env, selected_id):
 				Some(resolved):
 					resolved
 				None:
@@ -1921,15 +1952,13 @@ private pure func resolve_call_kind(
 								Some(resolved):
 									resolved
 								None:
-									resolve_call_kind(
-										env,
-										module_path,
-										scope,
-										UnknownCall,
-										callee,
-										args,
-										return_type,
-									)
+									-- Never fall back to an `UnknownCall` hint here: for a
+									-- function-typed callee that resolves to `ClosureCall`, which
+									-- silently calls a definition through a closure slot. The
+									-- unresolved selection survives instead, and both the early
+									-- `SelectedDirectCallSurvived` and the late `UnresolvedCallSurvived`
+									-- invariants reject it.
+									kind
 		UnknownCall:
 			match callee:
 				VarExpr(variable, _, _):
