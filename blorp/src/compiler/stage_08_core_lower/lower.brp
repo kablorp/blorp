@@ -2578,6 +2578,72 @@ private pure func lower_typed_field_access(
 
 
 ---
+The names a lowered pattern binds, in source order (spread and nested
+patterns included), appended to `names`. Accumulating into one list keeps a
+pattern that binds nothing (most of them) allocation-free.
+---
+private pure func core_pattern_binder_names(pattern: CorePattern, names: List[String]) -> List[String]:
+	match pattern:
+		NamePattern(name):
+			names.append(name)
+		ConstructorPattern(_, args):
+			core_patterns_binder_names(args, names)
+		QualifiedConstructorPattern(_, _, args):
+			core_patterns_binder_names(args, names)
+		TuplePattern(items):
+			core_patterns_binder_names(items, names)
+		ListPattern(items, spread):
+			item_names: List[String] = core_patterns_binder_names(items, names)
+
+			match spread:
+				Some(spread_pattern):
+					core_pattern_binder_names(spread_pattern, item_names)
+				None:
+					item_names
+		OrPattern(items):
+			core_patterns_binder_names(items, names)
+		_:
+			names
+
+
+private pure func core_patterns_binder_names(patterns: List[CorePattern], names: List[String]) -> List[String]:
+	var collected: List[String] = names
+
+	for pattern in patterns:
+		collected = core_pattern_binder_names(pattern, collected)
+
+	collected
+
+
+---
+Binders whose Core identity is not migrated yet (a match arm's pattern
+names, see `lower_raw_match_cases`) still have to shadow: a use of such a
+name must not resolve to an outer local that happens to share it, or it
+would take that local's id and be spelled as the wrong variable. Pushed
+with id 0, their uses resolve to id 0, exactly as an absent name did.
+---
+private pure func push_unmigrated_binders(
+	context: CoreLowerContext,
+	names: List[String],
+) -> CoreLowerContext:
+	if names.is_empty():
+		context
+	else:
+		var entries: List[CoreLowerScopeEntry] = []
+
+		for name in names:
+			-- A name with no outer local to shadow already resolves to id 0,
+			-- so only a name that hides an in-scope binder needs an entry.
+			if resolve_local_id(context, name).is_some():
+				entries = entries.append({ name = name, id = 0 })
+
+		if entries.is_empty():
+			context
+		else:
+			{ context | scope = context.scope.concat(entries) }
+
+
+---
 Match bindings are deliberately NOT given scope-resolved identity in step
 1, unlike every other binder kind. `CorePattern.NamePattern` carries only
 a `String` (see `stage_09_core/ir.brp`; giving it a `id` is an IR
@@ -2609,7 +2675,10 @@ private pure func lower_raw_match_cases(
 				Err(error):
 					failure = Some(error)
 				Ok(pattern):
-					match lower_typed_expr_with_context(context, match_case.body):
+					match lower_typed_expr_with_context(
+						push_unmigrated_binders(context, core_pattern_binder_names(pattern, [])),
+						match_case.body,
+					):
 						Err(error):
 							failure = Some(error)
 						Ok(body):
@@ -4357,7 +4426,7 @@ private pure func lower_typed_concurrent_for(
 	iterable_type = typed_expr_value_type(iterable)
 	item ?= concurrent_for_item(context.module_member_prefixes, iterable_type)
 	lowered_iterable ?= lower_typed_expr_with_context(context, iterable)
-	lowered_body ?= lower_typed_expr_with_context(context, body)
+	lowered_body ?= lower_typed_expr_with_context(push_unmigrated_binders(context, [name.text]), body)
 	body_type ?= core_lower_value_type(context.module_member_prefixes, typed_expr_value_type(body))
 	lowered_params ?= lower_typed_concurrent_for_params(context, params, loc)
 	loop: CorePreClosureConcurrentlyLoop = {
@@ -4655,9 +4724,10 @@ private pure func lower_typed_question_bind(
 			-- arm below), so it hits the identical `match_lowering.brp`
 			-- direct-constructor-fast-path desync. Confirmed by the same
 			-- kind of `scripts/test leak` "undeclared identifier" failure
-			-- this produced before being reverted.
+			-- this produced before being reverted. The name is still pushed
+			-- (id 0) so it shadows an outer local of the same name.
 			success_body ?= lower_typed_block_expr(
-				context,
+				push_unmigrated_binders(context, [name.text]),
 				rest,
 				clone_core_type(block_type),
 				clone_core_source_loc(loc),
@@ -5068,7 +5138,15 @@ private pure func lower_typed_block_expr(
 					body ?= if rest.length() == 0:
 						Ok(VoidExpr(typ, loc))
 					else:
-						lower_typed_block_expr(context, rest, typ, first_loc)
+						lower_typed_block_expr(
+							push_unmigrated_binders(
+								context,
+								bindings.map(pure func(binding: TypedConcurrentBinding): binding.name.text),
+							),
+							rest,
+							typ,
+							first_loc,
+						)
 
 					lower_typed_concurrent_block(context, params, bindings, body, typ, first_loc)
 				_:

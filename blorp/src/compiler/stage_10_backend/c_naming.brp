@@ -4,6 +4,10 @@
 -- callable.
 -- This includes language keywords and compiler-provided object-like macros.
 -- GCC defines `linux` in non-strict C modes before processing our artifact.
+import:
+	string: string as make_string
+
+
 private C_RESERVED_IDENTIFIERS: List[String] = [
 	"auto",
 	"break",
@@ -189,6 +193,78 @@ pure func c_field_name(name: String) -> String:
 		RESERVED_STRUCT_MEMBER_C_PREFIX + name
 	else:
 		c_identifier(name)
+
+
+private BASE62_ALPHABET: String = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+private BASE62_RADIX: Int = 62
+
+-- Spellings of a local by binder identity. A positive `CoreVar.id` is an
+-- authored (lowering) or seeded-band binder, a negative one a binder a pass
+-- minted from `CorePassState.next_binder_id`; each is unique within a
+-- function, so the spelling is a pure function of the `CoreVar` and needs no
+-- rename pass or scope table. The underscore after `brp_v` is deliberate: a
+-- callable spelling is `brp_` followed directly by a base-62 digit, which can
+-- itself be `v` (or `vn`), so without it a callable could equal a local; no
+-- callable has `_` there. `n` marks the minted (negative) domain so `+id`
+-- and `-id` never spell alike.
+private PROJECTED_LOCAL_PREFIX: String = "brp_v_"
+
+private PROJECTED_MINTED_LOCAL_PREFIX: String = "brp_vn_"
+
+private pure func base62_digit_strings() -> List[String]:
+	var digits: List[String] = []
+
+	for digit in 0..BASE62_RADIX:
+		digits = digits.append(BASE62_ALPHABET.substring(digit, 1))
+
+	digits
+
+
+private BASE62_DIGIT_STRINGS: List[String] = base62_digit_strings()
+
+---
+`prefix` followed by `value` in base 62 (`"0"` for zero), built in one
+buffer allocated up front. `c_binder_name` runs once per emitted occurrence
+of a local, so encoding by prepending a digit at a time (an allocation per
+digit) was several times the cost of the one allocation this needs.
+---
+private pure func base62_spelling(prefix: String, value: Int) -> String:
+	var digit_count: Int = 1
+	var scale: Int = 1
+
+	while value / scale >= BASE62_RADIX:
+		scale *= BASE62_RADIX
+		digit_count += 1
+
+	var spelling: String = make_string(prefix.length() + digit_count)
+	spelling += prefix
+	var remaining: Int = value
+
+	while scale > 0:
+		spelling += BASE62_DIGIT_STRINGS.get_or(remaining / scale, "")
+		remaining = remaining % scale
+		scale /= BASE62_RADIX
+
+	spelling
+
+
+pure func encode_base62(value: Int) -> String:
+	base62_spelling("", value)
+
+
+---
+The C spelling of a local variable occurrence. Id 0 ("not minted", the
+binders docs/CORE_ID_MIGRATION.md still has to convert) and the discard
+binder keep the escaped source spelling of `c_local_name`.
+---
+pure func c_binder_name(name: String, id: Int) -> String:
+	if name == "_" or id == 0:
+		c_local_name(name)
+	else if id > 0:
+		base62_spelling(PROJECTED_LOCAL_PREFIX, id)
+	else:
+		base62_spelling(PROJECTED_MINTED_LOCAL_PREFIX, 0 - id)
 
 
 pure func c_local_name(name: String) -> String:

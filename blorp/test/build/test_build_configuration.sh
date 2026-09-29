@@ -120,8 +120,8 @@ then
 fi
 if ! grep -Fq 'blorp_src_lsp_lsp_stdio_transport__CompilerStdioError' \
 	"$relocation_probe" ||
-	! grep -Fq 'blorp_compiler_stdin_read_raw(max_bytes)' "$relocation_probe" ||
-	! grep -Fq 'blorp_compiler_stdout_write_all_raw(data)' "$relocation_probe"
+	! grep -Eq 'blorp_compiler_stdin_read_raw\(brp_vn?_[A-Za-z0-9]+\)' "$relocation_probe" ||
+	! grep -Eq 'blorp_compiler_stdout_write_all_raw\(brp_vn?_[A-Za-z0-9]+\)' "$relocation_probe"
 then
 	echo "FAIL: relocated LSP native operations did not reach C emission" >&2
 	exit 1

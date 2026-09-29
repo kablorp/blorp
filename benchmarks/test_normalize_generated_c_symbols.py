@@ -553,6 +553,34 @@ class GeneratedCSymbolTests(unittest.TestCase):
         self.assertIn("@@project:temp:0:0@@", normalized_once)
         self.assertIn("@@project:temp:1:0@@", normalized_once)
 
+    def test_project_locals_accepts_owner_less_binder_id_locals(self):
+        code = ("void f(void) { long brp_v_2X = 1; long brp_vn_3 = brp_v_2X; "
+                "use(brp_v_2X, brp_vn_3); }\n"
+                "void g(void) { long brp_v_9 = 2; use(brp_v_9, brp_v1_a2); }\n")
+        normalized = normalizer.project_locals(code)
+        for spelling in ("brp_v_2X", "brp_vn_3", "brp_v_9", "brp_v1_a2"):
+            self.assertNotIn(spelling, normalized)
+        # first occurrence per function: brp_v_2X is 0, brp_vn_3 is 1; the
+        # second function restarts at 0 under its own body id.
+        self.assertIn("@@project:local:0:0@@", normalized)
+        self.assertIn("@@project:local:0:1@@", normalized)
+        self.assertIn("@@project:local:1:0@@", normalized)
+        self.assertIn("@@project:local:1:1@@", normalized)
+        # A callable whose base-62 id starts with `v` is not a local.
+        self.assertIn("brp_v3K", normalizer.project_locals("void brp_v3K(void);"))
+
+    def test_local_families_accept_binder_id_spellings_and_keep_owner_forms(self):
+        for kind in ("local_argument", "local_source_binder"):
+            grammar = normalizer.GENERATED_GRAMMARS[kind]
+            for spelling in ("brp_v_2X", "brp_vn_3"):
+                self.assertIsNotNone(grammar.fullmatch(spelling), (kind, spelling))
+            # A callable whose base-62 id starts with `v` is never a local.
+            self.assertIsNone(grammar.fullmatch("brp_v3K"))
+        arguments = normalizer.GENERATED_GRAMMARS["local_argument"]
+        binders = normalizer.GENERATED_GRAMMARS["local_source_binder"]
+        self.assertIsNotNone(arguments.fullmatch("brp_v1_a2"))
+        self.assertIsNotNone(binders.fullmatch("brp_v1_s2"))
+
     def test_project_locals_field_family_is_file_wide_not_per_body(self):
         code = "void f(void) { use(f0); }\nvoid g(void) { use(f0); }\n"
         normalized = normalizer.project_locals(code)

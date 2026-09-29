@@ -9,6 +9,7 @@ import:
 	../stage_08_core_lower/identity: core_module_member_prefix
 	ir:
 		CoreBoxedStorageValue,
+		FIRST_MINTED_BINDER_ID,
 		CoreCallKind(UserCall),
 		CoreConstructorLengthMatch,
 		CoreConstructorLengthMatchBranch,
@@ -414,7 +415,11 @@ private pure func renamed_var(renames: List[StdInlineRename], variable: CoreVar)
 
 
 private pure func fresh_var(next_id: Int, variable: CoreVar) -> (Int, CoreVar):
-	fresh_id: Int = next_id + 1
+	-- Minted binder ids count down from the pass's base (see
+	-- `CorePassState.next_binder_id`): `next_id` is the last id handed out
+	-- (one above the base before the first), and every inlined callee binder
+	-- gets a new one rather than the callee's own.
+	fresh_id: Int = next_id - 1
 	(fresh_id, {
 			name = "__std_inline_" + variable.name,
 			id = fresh_id,
@@ -1629,18 +1634,29 @@ private pure func rewrite_expr(
 
 
 
+private record StdInlineFunctionResult {
+	function_info: CoreFunction,
+	ids_used: Int
+}
+
+
 private pure func rewrite_function(
 	targets: StdInlineTargets,
 	function_info: CoreFunction,
-) -> CoreFunction:
+	id_base: Int,
+) -> StdInlineFunctionResult:
 	if target_is_function(targets, function_info) or owned_module(function_info.source_module):
-		function_info
+		{ function_info = function_info, ids_used = 0 }
 	else:
 		match function_info.body:
 			Some(body):
-				{ function_info | body = Some(rewrite_expr(targets, 0, body).expr) }
+				rewritten: StdInlineExprResult = rewrite_expr(targets, id_base + 1, body)
+				{
+					function_info = { function_info | body = Some(rewritten.expr) },
+					ids_used = id_base + 1 - rewritten.next_id
+				}
 			None:
-				function_info
+				{ function_info = function_info, ids_used = 0 }
 
 
 private pure func first_target_call(
@@ -1715,28 +1731,54 @@ pure func first_uninlined_std_wrapper_call(program: CoreProgram) -> Option[(Stri
 	found
 
 
-pure func inline_std_wrappers(program: CoreProgram) -> CoreProgram:
+---
+`program` with its standard-library wrappers inlined, plus how many binder
+ids the rewrite minted counting down from `id_base` (the caller's
+`CorePassState.next_binder_id`). Ids restart from `id_base` in every
+function, since only uniqueness within one function matters, so
+`ids_used` is the largest count any single function needed.
+---
+record StdInlineResult {
+	program: CoreProgram,
+	ids_used: Int
+}
+
+
+pure func inline_std_wrappers_minting(program: CoreProgram, id_base: Int) -> StdInlineResult:
 	targets: StdInlineTargets = collect_targets(program)
 
 	if targets.by_name.is_empty():
-		program
+		{ program = program, ids_used = 0 }
 	else:
-		rewritten_decls: List[CoreDecl] = program.decls.map(pure func(decl):
+		var ids_used: Int = 0
+		var rewritten_decls: List[CoreDecl] = []
+
+		for decl in program.decls:
 			match decl:
 				FunctionDecl(function_info):
-					FunctionDecl(rewrite_function(targets, function_info))
+					rewritten: StdInlineFunctionResult = rewrite_function(targets, function_info, id_base)
+					ids_used = if rewritten.ids_used > ids_used:
+						rewritten.ids_used
+					else:
+						ids_used
+					rewritten_decls = rewritten_decls.append(FunctionDecl(rewritten.function_info))
 				ImplDecl(impl):
-					ImplDecl(
-						{ impl |
-							methods = impl.methods.map(
-								pure func(method): rewrite_function(targets, method),
-							)
-						},
-					)
-				GlobalDecl(_):
-					decl
-				_:
-					decl
-		)
+					var methods: List[CoreFunction] = []
 
-		{ program | decls = rewritten_decls }
+					for method in impl.methods:
+						rewritten: StdInlineFunctionResult = rewrite_function(targets, method, id_base)
+						ids_used = if rewritten.ids_used > ids_used:
+							rewritten.ids_used
+						else:
+							ids_used
+						methods = methods.append(rewritten.function_info)
+
+					rewritten_decls = rewritten_decls.append(ImplDecl({ impl | methods = methods }))
+				_:
+					rewritten_decls = rewritten_decls.append(decl)
+
+		{ program = { program | decls = rewritten_decls }, ids_used = ids_used }
+
+
+pure func inline_std_wrappers(program: CoreProgram) -> CoreProgram:
+	inline_std_wrappers_minting(program, FIRST_MINTED_BINDER_ID).program

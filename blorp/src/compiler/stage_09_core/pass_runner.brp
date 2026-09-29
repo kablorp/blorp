@@ -12,6 +12,7 @@ import:
 	io: print_error,
 	ir:
 		CoreDecl(FunctionDecl),
+		FIRST_MINTED_BINDER_ID,
 		CoreExpr(
 			ForDictExpr,
 			ForListExpr,
@@ -28,6 +29,7 @@ import:
 			VarExpr,
 		),
 		CoreFunction,
+		CoreFunctionKind(ClosureBodyFunction),
 		CoreParam,
 		CoreProgram,
 		CoreSemanticConstructorMatchCase,
@@ -96,7 +98,8 @@ record CorePassState {
 	next_def_id: Int,
 	next_node_id: Int,
 	minted_origins: List[CoreSourceLoc],
-	ownership_contract_facts: OwnershipContractFacts
+	ownership_contract_facts: OwnershipContractFacts,
+	next_binder_id: Int
 }
 
 
@@ -596,9 +599,23 @@ private pure func core_pass_state_binder_identity_violations(
 						-- visible for the whole body; fold them in the
 						-- same way `push_function_scope` does at the
 						-- lowering side (lower.brp).
+						-- A closure or task body receives its captures from the
+						-- creating function's environment, and a lambda body
+						-- may carry its parameters only in its ABI: both are
+						-- binders of the body, under the identity the creation
+						-- site gave them.
+						captured: List[CoreVar] = match function_info.function_kind:
+							ClosureBodyFunction(abi):
+								abi.params
+									.map(pure func(param: CoreParam): param.name)
+									.concat(abi.captures.map(pure func(capture): { name = capture.name, id = capture.id, def_id = None }))
+							_:
+								[]
+
 						walk: CoreBinderIdentityWalk = {
 							binders = function_info.params
 								.map(pure func(param: CoreParam): param.name)
+								.concat(captured)
 								.concat(body_walk.binders),
 							uses = body_walk.uses
 						}
@@ -900,13 +917,18 @@ union CorePassRun:
 	CorePassesFailed(String, CorePassDiagnostic, List[CorePassTiming])
 
 
+pure func core_reserve_binder_ids(state: CorePassState, count: Int) -> CorePassState:
+	{ state | next_binder_id = state.next_binder_id - count }
+
+
 pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassState:
 	{
 		program = program,
 		next_def_id = next_def_id,
 		next_node_id = -1,
 		minted_origins = [],
-		ownership_contract_facts = empty_ownership_contract_facts()
+		ownership_contract_facts = empty_ownership_contract_facts(),
+		next_binder_id = FIRST_MINTED_BINDER_ID
 	}
 
 
@@ -924,7 +946,8 @@ pure func core_pass_state_carry_ids(
 ) -> CorePassState:
 	{ core_pass_state(program, next_def_id) |
 		next_node_id = base.next_node_id,
-		minted_origins = base.minted_origins
+		minted_origins = base.minted_origins,
+		next_binder_id = base.next_binder_id
 	}
 
 

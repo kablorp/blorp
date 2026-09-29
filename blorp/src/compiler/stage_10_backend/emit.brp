@@ -509,6 +509,7 @@ import:
 		backend_type_naming,
 		c_field_name,
 		c_identifier,
+		c_binder_name,
 		c_local_name,
 		static_child_path,
 		static_closure_name,
@@ -1752,7 +1753,12 @@ private pure func c_function_signature(
 
 
 private pure func c_var_name(variable: CoreVar) -> String:
-	c_local_name(variable.name)
+	-- A `def_id` marks a global or callable reference, already spelled by
+	-- symbol projection; only true locals take the binder-id spelling.
+	if variable.def_id.is_some():
+		c_local_name(variable.name)
+	else:
+		c_binder_name(variable.name, variable.id)
 
 
 private pure func entrypoint_has_source_args(func_info: CoreFunction) -> Bool:
@@ -9169,7 +9175,7 @@ private pure func tensor_raw_view_decl(
 	source_c ?= emit_simple_expr(binding.source, emission_context)
 	args: RawViewDeclArgs = {
 		pointer_c_type = tensor_raw_pointer_c_type(binding.kind),
-		view = binding.variable.name,
+		view = c_var_name(binding.variable),
 		source = source_c
 	}
 
@@ -9183,7 +9189,7 @@ private pure func emit_tensor_raw_read(
 	index_c ?= emit_simple_expr(read.index, emission_context)
 
 	if tensor_raw_scalar_supported(read.kind):
-		Some(render_prepared_tensor_op(RawRead(read.view.name, index_c)))
+		Some(render_prepared_tensor_op(RawRead(c_var_name(read.view), index_c)))
 	else:
 		None
 
@@ -9195,7 +9201,7 @@ private pure func emit_tensor_raw_write(
 	index_c ?= emit_simple_expr(write.index, emission_context)
 	value_c ?= emit_simple_expr(write.value, emission_context)
 	args: RawWriteArgs = {
-		view = write.view.name,
+		view = c_var_name(write.view),
 		index = index_c,
 		value = value_c
 	}
@@ -9234,7 +9240,7 @@ private pure func emit_tensor_raw_write_body(
 			emission_context.compact,
 		)
 		args: RawWriteArgs = {
-			view = write.view.name,
+			view = c_var_name(write.view),
 			index = prepared_index.value,
 			value = prepared_value.value
 		}
@@ -12377,7 +12383,7 @@ private pure func closure_capture_box_expr(
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	abi_value ?= closure_abi_value_for_type(capture.typ, type_symbol_lookup)
-	capture_c: String = c_local_name(capture.name)
+	capture_c: String = c_binder_name(capture.name, capture.id)
 
 	match abi_value:
 		ClosureAbiVoid:
@@ -12535,7 +12541,7 @@ private pure func closure_env_capture_value_for_supported_type(
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	abi_value ?= closure_abi_value_for_type(capture.typ, type_symbol_lookup)
-	capture_c: String = c_local_name(capture.name)
+	capture_c: String = c_binder_name(capture.name, capture.id)
 	capture_type: String = TypeLayout.c_type_name(capture.typ, type_symbol_lookup)
 
 	match abi_value:
@@ -12637,11 +12643,11 @@ private pure func closure_env_capture_declarations(
 			match closure_env_capture_c_type(capture.typ, type_symbol_lookup):
 				Some(c_type):
 					field: String = env_local_name + "->" + closure_env_field_name(index)
-					result += "  " + c_type + " " + c_local_name(capture.name) + " = " + field + ";\n"
+					result += "  " + c_type + " " + c_binder_name(capture.name, capture.id) + " = " + field + ";\n"
 					if moved_captures.contains(capture.name):
 						capture_var: CoreVar = {
 							name = capture.name,
-							id = 0,
+							id = capture.id,
 							def_id = None
 						}
 						result += closure_env_capture_clear_statement(capture, field)
@@ -12823,10 +12829,9 @@ private pure func emit_closure_create(
 						)
 
 
-private pure func closure_slot_decl(typ: CoreType, name: String, source: String, type_symbol_lookup: Dict[String, String]) -> Option[String]:
+private pure func closure_slot_decl(typ: CoreType, param_name: String, source: String, type_symbol_lookup: Dict[String, String]) -> Option[String]:
 	abi_value ?= closure_abi_value_for_type(typ, type_symbol_lookup)
 	param_type: String = TypeLayout.c_type_name(typ, type_symbol_lookup)
-	param_name: String = c_local_name(name)
 
 	match abi_value:
 		ClosureAbiVoid:
@@ -12860,7 +12865,7 @@ private pure func closure_param_decls(params: List[CoreParam], type_symbol_looku
 
 	for param in params:
 		if not failed:
-			match closure_slot_decl(param.typ, param.name.name, "__arg" + index.to_string(), type_symbol_lookup):
+			match closure_slot_decl(param.typ, c_var_name(param.name), "__arg" + index.to_string(), type_symbol_lookup):
 				Some(decl):
 					result += decl
 				None:
@@ -12881,12 +12886,12 @@ private pure func closure_capture_decl(
 	moved_captures: List[String],
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
-	decl ?= closure_slot_decl(capture.typ, capture.name, "__e[" + index.to_string() + "]", selected_type_symbol_lookup(emission_context.symbol_authority))
+	decl ?= closure_slot_decl(capture.typ, c_binder_name(capture.name, capture.id), "__e[" + index.to_string() + "]", selected_type_symbol_lookup(emission_context.symbol_authority))
 
 	if moved_captures.contains(capture.name):
 		capture_var: CoreVar = {
 			name = capture.name,
-			id = 0,
+			id = capture.id,
 			def_id = None,
 		}
 		Some(
@@ -16224,7 +16229,7 @@ private pure func task_copy_capture_to_closure_capture(
 		TaskCopyCapture:
 			Some({
 				name = capture.name,
-				id = 0,
+				id = capture.id,
 				typ = capture.typ,
 			})
 		TaskMoveResourceItem:
@@ -16296,11 +16301,11 @@ private pure func task_capture_box_expr(
 		TaskCopyCapture:
 			closure_capture_box_expr({
 				name = capture.name,
-				id = 0,
+				id = capture.id,
 				typ = capture.typ,
 			}, type_symbol_lookup)
 		TaskMoveResourceItem:
-			Some("(void*)" + c_local_name(capture.name))
+			Some("(void*)" + c_binder_name(capture.name, capture.id))
 		TaskStructuredTaskBorrow:
 			None
 
@@ -16315,7 +16320,7 @@ private pure func task_capture_needs_release(
 		TaskCopyCapture:
 			closure_capture_needs_release({
 				name = capture.name,
-				id = 0,
+				id = capture.id,
 				typ = capture.typ,
 			}, type_symbol_lookup)
 		TaskMoveResourceItem:
