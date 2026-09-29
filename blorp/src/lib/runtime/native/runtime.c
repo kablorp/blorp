@@ -278,9 +278,9 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 // SIMD buffers, generated cleanup scratch growth, fiber stack mmaps) was
 // invisible to a Blorp test doing a before/after MemStats snapshot. These
 // counters close that gap. They are atomics with no formatting/logging on
-// the hot path and are only touched when __blorp_allocator_stats_active()
-// is true (the same BLORP_ALLOCATOR_STATS-style gate blorp_alloc already
-// uses), so the production path keeps its single predicted branch.
+// the hot path and are only touched when __blorp_counters_active() is true
+// (the same counters gate blorp_alloc already uses), so the production path
+// keeps its single predicted branch.
 //
 // Every malloc/calloc/realloc/aligned_alloc/mmap call site in this file must
 // either go through one of the BLORP_ORACLE_* wrappers below (directly, or
@@ -289,12 +289,34 @@ static pthread_mutex_t __process_spawn_mutex = PTHREAD_MUTEX_INITIALIZER;
 // themselves instrumented), or be listed in the allowlist comment block
 // next to it explaining why the oracle does not observe it. See
 // blorp/test/runtime/test_runtime_alloc_oracle_coverage.py.
-// Atomic: flipped at runtime by blorp_reset_mem_stats(), which any test
-// fiber/thread can call while a straggler from a prior concurrent test is
-// still reading it on another thread (the combined leak-suite artifact runs
-// many single- and multi-fiber test programs sequentially in one process, so
-// this is a real cross-thread access, not just a startup-time flag).
-static _Atomic bool __blorp_lightweight_stats_enabled = false;
+// The two memory gates, kept in ONE atomic word so an allocation or release
+// reads a consistent pair with a single relaxed load. Both bits are monotonic
+// (once on, they stay on).
+//
+//   counters:  managed allocation/release/current/byte counters plus the
+//              allocation-oracle counters below. No per-object state.
+//   leak:      per-object metadata (managed bytes, type tag, alloc site,
+//              live list, stats epoch) and the exit leak report. Implies
+//              counters: the two bits are always set together.
+//
+// Startup sets them from the environment (BLORP_MEMORY_STATS,
+// BLORP_LEAK_CHECK, and the compiler self-profiling variables, which need
+// allocation counts). After startup only blorp_reset_mem_stats() changes
+// them, and only from off; blorp_get_mem_stats() never does.
+//
+// Counting protocol. An allocation reads the gates once. A tracked object
+// (leak bit set) is counted and given metadata together under
+// __alloc_meta_mutex; a release reads the gates once before running the
+// destructor, and under the same mutex counts the release only if it finds
+// the object's metadata from the current epoch. blorp_reset_mem_stats()
+// starts the epoch under that mutex, so an object allocated before the reset
+// (which has no metadata, or an older epoch) is never subtracted from the new
+// epoch's counters, however the release interleaves with the reset.
+enum {
+    BLORP_GATE_COUNTERS = 1u,
+    BLORP_GATE_LEAK_TRACKING = 2u,
+};
+static _Atomic unsigned __blorp_memory_gates = 0;
 
 static struct {
     _Atomic long backing_libc_malloc_events;
@@ -306,11 +328,11 @@ static struct {
     _Atomic long fiber_mmap_events;
 } __blorp_oracle_stats = {0};
 
-static inline bool __blorp_allocator_stats_active(void);
+static inline bool __blorp_counters_active(void);
 
 static inline void __blorp_oracle_count(_Atomic long* counter) {
 #if BLORP_MEMORY_DIAGNOSTICS
-    if (__blorp_allocator_stats_active()) {
+    if (__blorp_counters_active()) {
         atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
     }
 #else
@@ -472,20 +494,32 @@ typedef void (*blorp_destructor_fn)(void*);
 
 // User-facing value snapshot for blorp_get_mem_stats.
 //
-// The first four fields count managed (blorp_alloc-backed) object requests,
-// as before. The remaining fields are the allocation oracle's counters
+// The first four fields count managed (blorp_alloc-backed) objects:
+// bytes_allocated is the sum of the requested sizes of the live managed
+// objects. Only leak tracking records a per-object size, so
+// bytes_available is 0 (and bytes_allocated 0) while only the counters gate is
+// on. allocator_bytes_in_use is a different quantity: the
+// whole process's allocator-reported bytes (-1 where the platform has no
+// query), which includes raw buffers and everything else the program
+// allocated. The remaining fields are the allocation oracle's counters
 // (allocation-contract roadmap milestone 6): every OTHER heap/OS allocation
 // path this runtime has, so a zero-delta MemStats snapshot pair is actual
 // evidence of "no heap activity" rather than just "no managed objects".
-// They are populated only while the lightweight allocator-stats gate is
-// active (see oracle_stats_active); reading them while that gate is off
-// always reports oracle_stats_active == 0, which callers must treat as an
-// incomplete/failed measurement, never as a zero-allocation result.
+// They are populated only while the counters gate has been on since before
+// the snapshot (see oracle_stats_active); a snapshot taken while the gate
+// was off always reports oracle_stats_active == 0, which callers must treat
+// as an incomplete/failed measurement, never as a zero-allocation result.
 typedef struct {
     long total_allocations;
     long total_releases;
     long current_objects;
     long bytes_allocated;
+    // 1 when bytes_allocated is a measurement, 0 when it is unavailable.
+    long bytes_available;
+    long allocator_bytes_in_use;
+    // 1 when allocator_bytes_in_use is a measurement, 0 when the platform has
+    // no query for it.
+    long allocator_bytes_available;
     // Backing allocator events distinct from the logical managed-object
     // requests above: each blorp_alloc() requests backing from libc. These
     // are not additional managed objects and must not be summed with them.
@@ -505,8 +539,8 @@ typedef struct {
     // Fiber stack mmap requests that were not satisfied by the fiber stack
     // reuse pool.
     long fiber_mmap_events;
-    // 1 when the oracle counters above were actually being tracked at
-    // snapshot time (BLORP_ALLOCATOR_STATS-style gate active), 0 otherwise.
+    // 1 when the oracle counters above were already being tracked before
+    // this snapshot (counters gate on), 0 otherwise.
     // A caller must fail rather than treat an all-zero oracle snapshot as
     // proof of no allocation when this is 0.
     long oracle_stats_active;
@@ -967,18 +1001,15 @@ static inline void __blorp_scheduler_stat_lock(
     pthread_mutex_lock(lock);
 }
 
-// Full stats/leak modes retain per-object metadata. Allocator and compiler
-// memory profiles use only atomic object counters plus allocator/RSS snapshots.
-// With neither mode enabled, alloc/release skip all stats traffic.
+// Leak tracking retains per-object metadata; counters alone use only atomic
+// object counters plus allocator/RSS snapshots. With neither gate on,
+// alloc/release skip all stats traffic. See __blorp_memory_gates above.
 //
-// Atomic for the same reason as __blorp_lightweight_stats_enabled above:
-// blorp_reset_mem_stats()/blorp_get_mem_stats() can flip this from whatever
-// test fiber called them while blorp_alloc/blorp_release read it concurrently
-// on another thread.
-static _Atomic bool __blorp_stats_enabled = false;
-// __blorp_lightweight_stats_enabled is declared earlier, next to the
-// allocation-oracle counters that also gate on it.
-static bool __blorp_compiler_memory_profile_enabled = false;
+// Compiler checkpoint lines (BLORP_COMPILER_MEMORY_CHECKPOINT) print only
+// when BLORP_MEMORY_STATS was set in the environment, not merely because the
+// counters are on: BLORP_LEAK_CHECK and the metrics variables also turn the
+// counters on and must not add stderr lines to every compile.
+static bool __blorp_memory_checkpoints_enabled = false;
 #ifdef BLORP_COMPILER_RUNTIME_SOURCES
 static bool __blorp_typecheck_body_metrics_enabled = false;
 static bool __blorp_core_lowering_type_metrics_enabled = false;
@@ -988,19 +1019,19 @@ static bool __blorp_core_lowering_type_metrics_enabled = false;
 // Cold allocation metadata (stats and leak reports)
 // ============================================================================
 // Allocation metadata is kept out of the hot object header. It is only created
-// while memory stats or leak tracking are active. The existing alloc_class
+// while leak tracking is active. The existing alloc_class
 // header field remains for generated-C ABI compatibility and is always DIRECT
 // for blorp_alloc-owned objects.
 typedef struct blorp_AllocMeta_s {
     blorp_Object* object;
-    size_t alloc_size;
+    // Bytes counted for this object in bytes_allocated: the size requested
+    // from the allocator (header included).
+    long managed_bytes;
     long alloc_site_offset;
     // Reserved for a future platform unwinder. Nonzero
     // __builtin_return_address levels are unsafe in optimized builds.
     long alloc_caller_offset;
     unsigned long stats_epoch;
-    bool stats_tracked;
-    bool live_linked;
     struct blorp_AllocMeta_s* live_next;
     struct blorp_AllocMeta_s* live_prev;
     struct blorp_AllocMeta_s* hash_next;
@@ -1009,16 +1040,18 @@ typedef struct blorp_AllocMeta_s {
 #define BLORP_ALLOC_META_SLOTS 16384
 static blorp_AllocMeta* __alloc_meta_table[BLORP_ALLOC_META_SLOTS];
 static blorp_AllocMeta __alloc_live_sentinel = {0};
-static bool __leak_tracking_enabled = false;
 static pthread_mutex_t __alloc_meta_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static inline bool __alloc_meta_enabled(void) {
-    return atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed) ||
-           __leak_tracking_enabled;
+static inline unsigned __blorp_gates(void) {
+    return atomic_load_explicit(&__blorp_memory_gates, memory_order_relaxed);
 }
 
-static inline bool __blorp_allocator_stats_active(void) {
-    return atomic_load_explicit(&__blorp_lightweight_stats_enabled, memory_order_relaxed);
+static inline bool __alloc_meta_enabled(void) {
+    return (__blorp_gates() & BLORP_GATE_LEAK_TRACKING) != 0;
+}
+
+static inline bool __blorp_counters_active(void) {
+    return (__blorp_gates() & BLORP_GATE_COUNTERS) != 0;
 }
 
 static long __blorp_allocator_bytes_in_use(void) {
@@ -1096,7 +1129,7 @@ static void __blorp_compiler_memory_checkpoint(
     const char* phase,
     size_t phase_length
 ) {
-    if (!__blorp_compiler_memory_profile_enabled) return;
+    if (!__blorp_memory_checkpoints_enabled) return;
     struct timespec timestamp = {0};
     clock_gettime(CLOCK_MONOTONIC, &timestamp);
     long timestamp_microseconds = timestamp.tv_sec > LONG_MAX / 1000000L
@@ -1209,42 +1242,40 @@ static blorp_AllocMeta* __alloc_meta_find_locked(const blorp_Object* obj) {
 }
 
 // Not an allocation the oracle observes, because this is cold leak/full-stats
-// metadata bookkeeping (only reachable when __alloc_meta_enabled(), i.e.
-// BLORP_LEAK_CHECK/BLORP_TRACK_STATS), never active in the
-// lightweight BLORP_ALLOCATOR_STATS oracle mode this test harness uses.
-static void __alloc_meta_insert(blorp_Object* obj, size_t alloc_size, bool stats_tracked) {
-    if (!__alloc_meta_enabled()) return;
+// metadata bookkeeping (only reached with leak tracking on), never active in
+// the counters-only oracle mode this test harness uses. Counts the allocation
+// and records its metadata as one step under the mutex; see the counting
+// protocol at __blorp_memory_gates.
+static void __alloc_meta_insert_and_count(blorp_Object* obj, size_t requested_bytes) {
     blorp_AllocMeta* meta = (blorp_AllocMeta*)malloc(sizeof(blorp_AllocMeta));
     if (!meta) {
         fprintf(stderr, "blorp: out of memory (allocation metadata)\n");
         exit(1);
     }
     meta->object = obj;
-    meta->alloc_size = alloc_size;
+    meta->managed_bytes = (long)requested_bytes;
     meta->alloc_site_offset = 0;
     meta->alloc_caller_offset = 0;
-    meta->stats_epoch = atomic_load(&global_mem_stats.epoch);
-    meta->stats_tracked = stats_tracked;
-    meta->live_linked = __leak_tracking_enabled;
     pthread_mutex_lock(&__alloc_meta_mutex);
+    meta->stats_epoch = atomic_load(&global_mem_stats.epoch);
     size_t slot = __alloc_meta_slot(obj);
     meta->hash_next = __alloc_meta_table[slot];
     __alloc_meta_table[slot] = meta;
-    if (meta->live_linked) {
-        meta->live_next = __alloc_live_sentinel.live_next;
-        meta->live_prev = &__alloc_live_sentinel;
-        if (__alloc_live_sentinel.live_next)
-            __alloc_live_sentinel.live_next->live_prev = meta;
-        __alloc_live_sentinel.live_next = meta;
-    } else {
-        meta->live_next = NULL;
-        meta->live_prev = NULL;
-    }
+    meta->live_next = __alloc_live_sentinel.live_next;
+    meta->live_prev = &__alloc_live_sentinel;
+    if (__alloc_live_sentinel.live_next)
+        __alloc_live_sentinel.live_next->live_prev = meta;
+    __alloc_live_sentinel.live_next = meta;
+    atomic_fetch_add_explicit(&global_mem_stats.total_allocations, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&global_mem_stats.current_objects, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&global_mem_stats.bytes_allocated, meta->managed_bytes, memory_order_relaxed);
     pthread_mutex_unlock(&__alloc_meta_mutex);
 }
 
-static blorp_AllocMeta* __alloc_meta_take(blorp_Object* obj) {
-    if (!__alloc_meta_enabled()) return NULL;
+// Unlinks the object's metadata and, when it belongs to the current epoch,
+// counts the release in the same critical section. Returns the metadata for
+// the caller to free (NULL when the object was allocated before tracking).
+static blorp_AllocMeta* __alloc_meta_take_and_count(blorp_Object* obj) {
     pthread_mutex_lock(&__alloc_meta_mutex);
     size_t slot = __alloc_meta_slot(obj);
     blorp_AllocMeta** link = &__alloc_meta_table[slot];
@@ -1254,10 +1285,15 @@ static blorp_AllocMeta* __alloc_meta_take(blorp_Object* obj) {
     blorp_AllocMeta* meta = *link;
     if (meta) {
         *link = meta->hash_next;
-        if (meta->live_linked && meta->live_prev)
+        if (meta->live_prev)
             meta->live_prev->live_next = meta->live_next;
-        if (meta->live_linked && meta->live_next)
+        if (meta->live_next)
             meta->live_next->live_prev = meta->live_prev;
+        if (meta->stats_epoch == atomic_load(&global_mem_stats.epoch)) {
+            atomic_fetch_add_explicit(&global_mem_stats.total_releases, 1, memory_order_relaxed);
+            atomic_fetch_sub_explicit(&global_mem_stats.current_objects, 1, memory_order_relaxed);
+            atomic_fetch_sub_explicit(&global_mem_stats.bytes_allocated, meta->managed_bytes, memory_order_relaxed);
+        }
     }
     pthread_mutex_unlock(&__alloc_meta_mutex);
     return meta;
@@ -1484,6 +1520,10 @@ void blorp_legacy_upgrade_destructor(void* obj, blorp_destructor_fn fn) {
     __blorp_legacy_reintern((blorp_Object*)obj, fn, current.tag);
 }
 
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
+long blorp_perceus_engine_metrics_enabled_c(void);
+#endif
+
 __attribute__((constructor))
 static void __blorp_init_stats_flag(void) {
 #if !BLORP_MEMORY_DIAGNOSTICS
@@ -1491,8 +1531,7 @@ static void __blorp_init_stats_flag(void) {
     // cannot collect the requested evidence. The ordinary stats API itself
     // remains infallible and returns an inactive snapshot in this mode.
     static const char* requests[] = {
-        "BLORP_ALLOCATOR_STATS",
-        "BLORP_COMPILER_MEMORY_PROFILE",
+        "BLORP_MEMORY_STATS",
 #ifdef BLORP_COMPILER_RUNTIME_SOURCES
         // Compiler self-profiling exists only in the compiler runtime.
         "BLORP_TYPECHECK_BODY_METRICS",
@@ -1504,7 +1543,6 @@ static void __blorp_init_stats_flag(void) {
         // child; an ordinary stripped program still rejects the request.
         "BLORP_LEAK_CHECK",
 #endif
-        "BLORP_TRACK_STATS",
     };
     for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
         if (getenv(requests[i]) != NULL) {
@@ -1514,28 +1552,39 @@ static void __blorp_init_stats_flag(void) {
             exit(2);
         }
     }
+    // The Perceus metrics variable has its own value grammar (empty and "0"
+    // mean off), so it is checked through the same predicate the metric uses.
+#ifdef BLORP_COMPILER_RUNTIME_SOURCES
+    if (blorp_perceus_engine_metrics_enabled_c()) {
+        fprintf(stderr,
+            "blorp: BLORP_PERCEUS_ENGINE_METRICS requires a runtime built with BLORP_MEMORY_DIAGNOSTICS=1\n");
+        exit(2);
+    }
+#endif
 #else
-    __blorp_compiler_memory_profile_enabled =
-        getenv("BLORP_COMPILER_MEMORY_PROFILE") != NULL;
+    bool memory_stats = getenv("BLORP_MEMORY_STATS") != NULL;
+    __blorp_memory_checkpoints_enabled = memory_stats;
 #ifdef BLORP_COMPILER_RUNTIME_SOURCES
     __blorp_typecheck_body_metrics_enabled =
         getenv("BLORP_TYPECHECK_BODY_METRICS") != NULL;
     __blorp_core_lowering_type_metrics_enabled =
         getenv("BLORP_CORE_LOWERING_TYPE_METRICS") != NULL;
 #endif
-    atomic_store_explicit(&__blorp_lightweight_stats_enabled,
-        getenv("BLORP_ALLOCATOR_STATS") != NULL ||
-        __blorp_compiler_memory_profile_enabled
+    bool leak_tracking = getenv("BLORP_LEAK_CHECK") != NULL;
+    // The typecheck body metrics attribute allocation counts to phases, so
+    // they need the counters; leak tracking implies them. The Core-lowering
+    // and Perceus metrics only read the counters, so (as before) they are
+    // combined with BLORP_MEMORY_STATS rather than switching it on.
+    unsigned gates = 0;
+    if (memory_stats || leak_tracking
 #ifdef BLORP_COMPILER_RUNTIME_SOURCES
         || __blorp_typecheck_body_metrics_enabled
 #endif
-        ,
-        memory_order_relaxed);
-    atomic_store_explicit(&__blorp_stats_enabled,
-        (getenv("BLORP_LEAK_CHECK") != NULL) ||
-        (getenv("BLORP_TRACK_STATS") != NULL),
-        memory_order_relaxed);
-    __leak_tracking_enabled = (getenv("BLORP_LEAK_CHECK") != NULL);
+        ) {
+        gates |= BLORP_GATE_COUNTERS;
+    }
+    if (leak_tracking) gates |= BLORP_GATE_COUNTERS | BLORP_GATE_LEAK_TRACKING;
+    atomic_store_explicit(&__blorp_memory_gates, gates, memory_order_relaxed);
     __alloc_live_sentinel.live_next = NULL;
     __alloc_live_sentinel.live_prev = NULL;
 #endif
@@ -1548,14 +1597,14 @@ static inline void blorp_init_object_header(blorp_Object* header,
     header->alloc_class = alloc_class;
     header->destructor_id = 0;
 #if BLORP_MEMORY_DIAGNOSTICS
-    __alloc_meta_insert(header, alloc_size, true);
-    bool stats_on = atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed);
-    if (stats_on || atomic_load_explicit(&__blorp_lightweight_stats_enabled, memory_order_relaxed)) {
-        global_mem_stats.total_allocations++;
-        global_mem_stats.current_objects++;
-    }
-    if (stats_on) {
-        global_mem_stats.bytes_allocated += (long)alloc_size;
+    unsigned gates = __blorp_gates();
+    if (gates & BLORP_GATE_LEAK_TRACKING) {
+        __alloc_meta_insert_and_count(header, alloc_size);
+    } else if (gates & BLORP_GATE_COUNTERS) {
+        atomic_fetch_add_explicit(
+            &global_mem_stats.total_allocations, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &global_mem_stats.current_objects, 1, memory_order_relaxed);
     }
 #else
     (void)alloc_size;
@@ -1605,9 +1654,10 @@ typedef struct { blorp_Object header; long len; long capacity; void (*elem_relea
 blorp_Vector* blorp_simd_vector_add_f32(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -1650,9 +1700,10 @@ blorp_Vector* blorp_simd_vector_add_f32(const blorp_Vector* a, const blorp_Vecto
 blorp_Vector* blorp_simd_vector_sub_f32(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -1694,9 +1745,10 @@ blorp_Vector* blorp_simd_vector_sub_f32(const blorp_Vector* a, const blorp_Vecto
 blorp_Vector* blorp_simd_vector_mul_f32(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -1738,9 +1790,10 @@ blorp_Vector* blorp_simd_vector_mul_f32(const blorp_Vector* a, const blorp_Vecto
 blorp_Vector* blorp_simd_vector_div_f32(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(float)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -1789,9 +1842,10 @@ blorp_Vector* blorp_simd_vector_div_f32(const blorp_Vector* a, const blorp_Vecto
 blorp_Vector* blorp_simd_vector_add_f64(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -1833,9 +1887,10 @@ blorp_Vector* blorp_simd_vector_add_f64(const blorp_Vector* a, const blorp_Vecto
 blorp_Vector* blorp_simd_vector_sub_f64(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -1877,9 +1932,10 @@ blorp_Vector* blorp_simd_vector_sub_f64(const blorp_Vector* a, const blorp_Vecto
 blorp_Vector* blorp_simd_vector_mul_f64(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -1921,9 +1977,10 @@ blorp_Vector* blorp_simd_vector_mul_f64(const blorp_Vector* a, const blorp_Vecto
 blorp_Vector* blorp_simd_vector_div_f64(const blorp_Vector* a, const blorp_Vector* b) {
     if (!a || !b) return NULL;
     long len = a->capacity < b->capacity ? a->capacity : b->capacity;
-    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double))));
+    size_t vector_bytes = blorp_checked_add(sizeof(blorp_Vector), blorp_checked_mul(len, sizeof(double)));
+    blorp_Vector* result = (blorp_Vector*)blorp_simd_alloc(vector_bytes);
     if (!result) return NULL;
-    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, 0);
+    blorp_init_object_header(&result->header, BLORP_ALLOC_CLASS_DIRECT, vector_bytes);
     result->len = a->len <= len ? a->len : len;  // clamp: len <= capacity
     result->capacity = len;
     result->elem_release = NULL;
@@ -3298,17 +3355,17 @@ static long __blorp_collect_live_object_types(FILE* out,
     while (meta && counted < 10000) {
         blorp_Object* obj = meta->object;
         long rc = (long)atomic_load(&obj->refcount);
-        if (!BLORP_IS_IMMORTAL_REFCOUNT(rc) && meta->stats_tracked &&
+        if (!BLORP_IS_IMMORTAL_REFCOUNT(rc) &&
             meta->stats_epoch == current_epoch) {
             const char* type_tag = __blorp_type_tag_for_id(obj->destructor_id);
-            __leak_type_record(buckets, type_tag, meta->alloc_size);
+            __leak_type_record(buckets, type_tag, (size_t)meta->managed_bytes);
             if (verbose) {
                 fprintf(out,
                         "  #%ld  %s  %zu bytes  rc=%ld  alloc_site=%+ld"
                         "  alloc_caller=%+ld\n",
                         counted + 1,
                         type_tag ? type_tag : "(unknown)",
-                        meta->alloc_size, rc, meta->alloc_site_offset,
+                        (size_t)meta->managed_bytes, rc, meta->alloc_site_offset,
                         meta->alloc_caller_offset);
             }
             counted++;
@@ -3353,7 +3410,7 @@ static void __blorp_leak_report(void) {
             leaked, bytes);
 
     // Walk live-object list for per-type breakdown
-    if (leaked > 0 && __leak_tracking_enabled) {
+    if (leaked > 0 && __alloc_meta_enabled()) {
         int verbose = (strcmp(mode, "verbose") == 0);
         __blorp_print_live_object_type_summary(stderr, current_epoch, verbose);
     }
@@ -3388,41 +3445,6 @@ __attribute__((constructor))
 static void __blorp_init_signal_handlers(void) {
     signal(SIGPIPE, SIG_IGN);
 }
-// ============================================================================
-// Allocation-size histogram for opt-in compiler memory diagnostics.
-#define BLORP_ALLOC_HIST_BUCKETS 12
-static const size_t __blorp_alloc_hist_bounds[BLORP_ALLOC_HIST_BUCKETS] = {
-    16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024, SIZE_MAX
-};
-static _Atomic long __blorp_alloc_hist_counts[BLORP_ALLOC_HIST_BUCKETS];
-
-static inline void __blorp_alloc_hist_record(size_t size) {
-    int bucket = 0;
-    while (bucket < BLORP_ALLOC_HIST_BUCKETS - 1 &&
-           size > __blorp_alloc_hist_bounds[bucket]) {
-        bucket++;
-    }
-    atomic_fetch_add_explicit(
-        &__blorp_alloc_hist_counts[bucket], 1, memory_order_relaxed);
-}
-
-static void __blorp_alloc_hist_report(void) {
-    if (!__blorp_compiler_memory_profile_enabled) return;
-    fprintf(stderr, "BLORP_COMPILER_MEMORY_HISTOGRAM schema=1");
-    for (int b = 0; b < BLORP_ALLOC_HIST_BUCKETS; b++) {
-        size_t bound = __blorp_alloc_hist_bounds[b];
-        long count = atomic_load_explicit(
-            &__blorp_alloc_hist_counts[b], memory_order_relaxed);
-        if (bound == SIZE_MAX) {
-            fprintf(stderr, " bucket_gt_%zu=%ld",
-                    __blorp_alloc_hist_bounds[b - 1], count);
-        } else {
-            fprintf(stderr, " bucket_le_%zu=%ld", bound, count);
-        }
-    }
-    fprintf(stderr, "\n");
-}
-
 static void __blorp_teardown_before_leak_report(void) {
     blorp_thread_pool_shutdown();
     blorp_profile_report();
@@ -3432,7 +3454,6 @@ static void __blorp_teardown_before_leak_report(void) {
         __blorp_global_cleanup = NULL;
         cleanup();
     }
-    __blorp_alloc_hist_report();
 }
 
 // Query the linked runtime object, not a build-stamp or generated-body macro.
@@ -3456,9 +3477,6 @@ void* blorp_alloc(size_t size) {
     }
 #endif
 
-    if (__builtin_expect(__blorp_compiler_memory_profile_enabled, 0)) {
-        __blorp_alloc_hist_record(size);
-    }
 #endif
 
     // Even a zero-sized request must leave room for the managed header.
@@ -5436,11 +5454,22 @@ __attribute__((always_inline))
 static inline void blorp_release_final(blorp_Object* header, void* obj,
                                        blorp_destructor_fn destructor) {
 #if BLORP_MEMORY_DIAGNOSTICS
-    blorp_AllocMeta* meta = __alloc_meta_take(header);
-    bool stats_tracked = meta && meta->stats_tracked;
-    bool counted_in_current_epoch =
-        stats_tracked && meta->stats_epoch == atomic_load(&global_mem_stats.epoch);
-    size_t freed_size = meta ? meta->alloc_size : 0;
+    // Read the gates once, before the destructor runs, and decide the count
+    // here (see the counting protocol at __blorp_memory_gates). With leak
+    // tracking the release is counted only if the object's metadata is from
+    // the current epoch; an object allocated before tracking began or before
+    // a reset has none. Without it (counters only, from startup) every object
+    // was counted when allocated, so every release counts.
+    unsigned gates = __blorp_gates();
+    blorp_AllocMeta* meta = NULL;
+    if (gates & BLORP_GATE_LEAK_TRACKING) {
+        meta = __alloc_meta_take_and_count(header);
+    } else if (gates & BLORP_GATE_COUNTERS) {
+        atomic_fetch_add_explicit(
+            &global_mem_stats.total_releases, 1, memory_order_relaxed);
+        atomic_fetch_sub_explicit(
+            &global_mem_stats.current_objects, 1, memory_order_relaxed);
+    }
 #else
     (void)header;
 #endif
@@ -5451,18 +5480,6 @@ static inline void blorp_release_final(blorp_Object* header, void* obj,
     free(obj);
 
 #if BLORP_MEMORY_DIAGNOSTICS
-    bool release_stats_on = atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed);
-    if (release_stats_on && counted_in_current_epoch) {
-        global_mem_stats.total_releases++;
-        global_mem_stats.current_objects--;
-        global_mem_stats.bytes_allocated -= (long)freed_size;
-    } else if (!release_stats_on &&
-               atomic_load_explicit(&__blorp_lightweight_stats_enabled, memory_order_relaxed)) {
-        atomic_fetch_add_explicit(
-            &global_mem_stats.total_releases, 1, memory_order_relaxed);
-        atomic_fetch_sub_explicit(
-            &global_mem_stats.current_objects, 1, memory_order_relaxed);
-    }
     free(meta);
 #endif
 }
@@ -39186,44 +39203,54 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value) {
 
 blorp_MemStats blorp_get_mem_stats(void) {
 #if BLORP_MEMORY_DIAGNOSTICS
-    bool allocator_stats = __blorp_allocator_stats_active();
-    if (!allocator_stats) {
-        atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
-    }
+    // Reading never changes the gates, so a snapshot cannot race an
+    // escalation and a caller that never asked for counting gets an explicit
+    // inactive snapshot (memory_stats_active == oracle_stats_active == 0)
+    // instead of numbers that begin at an arbitrary call. Counting starts at
+    // process start (BLORP_MEMORY_STATS, BLORP_LEAK_CHECK) or at
+    // blorp_reset_mem_stats().
+    unsigned gates = __blorp_gates();
     blorp_MemStats stats = {0};
-    if (allocator_stats) {
-        stats.total_allocations = atomic_load_explicit(
-            &global_mem_stats.total_allocations, memory_order_relaxed);
-        stats.total_releases = atomic_load_explicit(
-            &global_mem_stats.total_releases, memory_order_relaxed);
-        stats.current_objects = atomic_load_explicit(
-            &global_mem_stats.current_objects, memory_order_relaxed);
-        stats.bytes_allocated = __blorp_allocator_bytes_in_use();
-        stats.backing_libc_malloc_events = atomic_load_explicit(
-            &__blorp_oracle_stats.backing_libc_malloc_events, memory_order_relaxed);
-        stats.raw_buffer_malloc_events = atomic_load_explicit(
-            &__blorp_oracle_stats.raw_buffer_malloc_events, memory_order_relaxed);
-        stats.raw_buffer_calloc_events = atomic_load_explicit(
-            &__blorp_oracle_stats.raw_buffer_calloc_events, memory_order_relaxed);
-        stats.raw_buffer_realloc_events = atomic_load_explicit(
-            &__blorp_oracle_stats.raw_buffer_realloc_events, memory_order_relaxed);
-        stats.raw_buffer_aligned_events = atomic_load_explicit(
-            &__blorp_oracle_stats.raw_buffer_aligned_events, memory_order_relaxed);
-        stats.cleanup_scratch_events = atomic_load_explicit(
-            &__blorp_oracle_stats.cleanup_scratch_events, memory_order_relaxed);
-        stats.fiber_mmap_events = atomic_load_explicit(
-            &__blorp_oracle_stats.fiber_mmap_events, memory_order_relaxed);
-        stats.oracle_stats_active = 1;
-    } else {
-        stats.total_allocations = atomic_load(&global_mem_stats.total_allocations);
-        stats.total_releases = atomic_load(&global_mem_stats.total_releases);
-        stats.current_objects = atomic_load(&global_mem_stats.current_objects);
-        stats.bytes_allocated = atomic_load(&global_mem_stats.bytes_allocated);
-        // Oracle fields and oracle_stats_active stay 0: this snapshot was
-        // taken without the lightweight allocator-stats gate active, so the
-        // oracle counters were not being maintained and must not be read as
-        // "zero events observed".
+    if (!(gates & BLORP_GATE_COUNTERS)) return stats;
+    // With leak tracking on, the counters change under the metadata mutex, so
+    // hold it to read them as one consistent snapshot.
+    bool locked = (gates & BLORP_GATE_LEAK_TRACKING) != 0;
+    if (locked) pthread_mutex_lock(&__alloc_meta_mutex);
+    stats.total_allocations = atomic_load_explicit(
+        &global_mem_stats.total_allocations, memory_order_relaxed);
+    stats.total_releases = atomic_load_explicit(
+        &global_mem_stats.total_releases, memory_order_relaxed);
+    stats.current_objects = atomic_load_explicit(
+        &global_mem_stats.current_objects, memory_order_relaxed);
+    // Managed bytes need a per-object size, which only leak tracking records
+    // (counters alone keep no per-object state and pay no size lookup on the
+    // allocation and release hot paths), so they are unavailable without it.
+    if (gates & BLORP_GATE_LEAK_TRACKING) {
+        stats.bytes_allocated = atomic_load_explicit(
+            &global_mem_stats.bytes_allocated, memory_order_relaxed);
+        stats.bytes_available = 1;
     }
+    if (locked) pthread_mutex_unlock(&__alloc_meta_mutex);
+    long allocator_bytes = __blorp_allocator_bytes_in_use();
+    if (allocator_bytes >= 0) {
+        stats.allocator_bytes_in_use = allocator_bytes;
+        stats.allocator_bytes_available = 1;
+    }
+    stats.backing_libc_malloc_events = atomic_load_explicit(
+        &__blorp_oracle_stats.backing_libc_malloc_events, memory_order_relaxed);
+    stats.raw_buffer_malloc_events = atomic_load_explicit(
+        &__blorp_oracle_stats.raw_buffer_malloc_events, memory_order_relaxed);
+    stats.raw_buffer_calloc_events = atomic_load_explicit(
+        &__blorp_oracle_stats.raw_buffer_calloc_events, memory_order_relaxed);
+    stats.raw_buffer_realloc_events = atomic_load_explicit(
+        &__blorp_oracle_stats.raw_buffer_realloc_events, memory_order_relaxed);
+    stats.raw_buffer_aligned_events = atomic_load_explicit(
+        &__blorp_oracle_stats.raw_buffer_aligned_events, memory_order_relaxed);
+    stats.cleanup_scratch_events = atomic_load_explicit(
+        &__blorp_oracle_stats.cleanup_scratch_events, memory_order_relaxed);
+    stats.fiber_mmap_events = atomic_load_explicit(
+        &__blorp_oracle_stats.fiber_mmap_events, memory_order_relaxed);
+    stats.oracle_stats_active = 1;
     stats.memory_stats_active = 1;
     return stats;
 #else
@@ -39233,32 +39260,38 @@ blorp_MemStats blorp_get_mem_stats(void) {
 
 void blorp_reset_mem_stats(void) {
 #if BLORP_MEMORY_DIAGNOSTICS
-    // Lightweight process-wide counters deliberately omit per-object metadata.
-    // A reset starts an exact measurement epoch, so objects allocated before
-    // this boundary must not affect the new epoch when they are later released.
-    //
-    // This switches to the full/precise metadata mode and away from the
-    // lightweight allocator-stats gate, so it deliberately leaves the
-    // allocation-oracle counters alone: the oracle's before/after workflow
-    // (see memory.brp's assert_no_heap_activity) takes two get_mem_stats()
-    // snapshots under BLORP_ALLOCATOR_STATS and diffs them, and does not use
-    // this reset.
-    atomic_store_explicit(&__blorp_lightweight_stats_enabled, false, memory_order_relaxed);
-    atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
+    // The one explicit call that starts an exact measurement epoch: objects
+    // allocated before this boundary must not affect the new epoch when they
+    // are later released. Only per-object metadata can tell them apart, so a
+    // reset turns leak tracking (and with it the counters) on for the rest of
+    // the process. That costs a metadata record and a mutex acquisition per
+    // managed allocation and release. The epoch, the counters and the gates
+    // change under the metadata mutex, so tracked allocations and releases on
+    // other threads see either the old state or the finished new one. Called
+    // from off, a reset is safe against concurrent allocation and release.
+    // Called when BLORP_MEMORY_STATS already counted without metadata, it
+    // cannot tell in-flight untracked operations apart; call it while other
+    // threads are quiescent. The allocation-oracle counters are deliberately
+    // not cleared: the oracle's before/after workflow (see memory.brp's
+    // assert_no_heap_activity) diffs two get_mem_stats() snapshots and does
+    // not use this reset.
+    pthread_mutex_lock(&__alloc_meta_mutex);
     atomic_fetch_add(&global_mem_stats.epoch, 1);
     atomic_store(&global_mem_stats.total_allocations, 0);
     atomic_store(&global_mem_stats.total_releases, 0);
     atomic_store(&global_mem_stats.current_objects, 0);
     atomic_store(&global_mem_stats.bytes_allocated, 0);
+    atomic_fetch_or(&__blorp_memory_gates,
+        BLORP_GATE_COUNTERS | BLORP_GATE_LEAK_TRACKING);
+    pthread_mutex_unlock(&__alloc_meta_mutex);
 #endif
 }
 
 void blorp_print_live_object_summary(void) {
 #if BLORP_MEMORY_DIAGNOSTICS
-    atomic_store_explicit(&__blorp_stats_enabled, true, memory_order_relaxed);
     long leaked = atomic_load(&global_mem_stats.current_objects);
     if (leaked <= 0) return;
-    if (!__leak_tracking_enabled) {
+    if (!__alloc_meta_enabled()) {
         printf("\nLeaked by type:\n");
         printf("  (unavailable; run with --leak-check)\n");
         fflush(stdout);

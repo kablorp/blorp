@@ -2853,15 +2853,35 @@ physical allocation. See [MEMORY_MODEL.md](MEMORY_MODEL.md) for user-facing
 patterns and [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md) for the compiler/runtime
 ownership ABI.
 
-Managed-allocation counters are a build-time diagnostic. Use
-`bin/blorp run --memory-diagnostics program.brp` to compile a program with
-those counters and print its allocation summary. `bin/blorp test` builds
-diagnostic-capable test artifacts; `--leak-check` enables leak reporting.
+Managed-allocation counters are a build-time diagnostic. `bin/blorp test`
+builds diagnostic-capable test artifacts. `bin/blorp run --memory-stats
+program.brp` compiles a program with the counters and turns them on for that
+run; the program reads them through the `memory` module (`get_mem_stats`,
+`mem_delta`, `format_stats`) and nothing is printed automatically.
+`--leak-check` also turns the counters on and reports leaked objects by type on
+exit. Reading `get_mem_stats()` never turns counting on: without one of those
+switches it returns an inactive snapshot (`memory_stats_active == 0`). A
+program can start an exact measurement itself with `reset_mem_stats()`, which
+zeroes the counters, counts only objects allocated afterwards, and turns on
+per-object leak tracking for the rest of the process; that costs a metadata
+record and a mutex acquisition on every managed allocation and release, so
+use it in tests and diagnostics, not in timed code. If `--memory-stats` was
+already counting, call it while other threads are not allocating, since
+in-flight untracked operations cannot be told apart from new ones.
+`MemStats.bytes_allocated`
+is the requested bytes of live managed objects (the leak report uses the same
+figure in its total and per type); under plain `--memory-stats`, which keeps
+no per-object state, `bytes_available` is 0 and the figure is 0, while
+`reset_mem_stats()` or `--leak-check` make it available. `allocator_bytes_in_use`
+is the whole process's allocator usage, with `allocator_bytes_available` 0
+where the platform cannot report it. `mem_delta` carries the flags, and
+`format_stats` prints "unavailable" only when a flag is 0.
 Programs built without diagnostics still expose the `memory` module's stats
 API, but its snapshots have `memory_stats_active == 0` and contain no managed
 counts. Helpers that assert allocation behavior fail when counters are
 inactive. For a standalone C build of generated code, compile the runtime
-with `-DBLORP_MEMORY_DIAGNOSTICS=1` to enable the counters.
+with `-DBLORP_MEMORY_DIAGNOSTICS=1` to enable the counters, then set
+`BLORP_MEMORY_STATS=1` or `BLORP_LEAK_CHECK=1` when running it.
 
 ## 12. Standard Library
 
@@ -3034,6 +3054,8 @@ Additional runtime and native-build controls are:
 
 | Variable | Purpose |
 | --- | --- |
+| `BLORP_MEMORY_STATS` | Turn on managed-allocation counters (diagnostic runtime only; `run --memory-stats` sets it) |
+| `BLORP_LEAK_CHECK` | Report leaked objects on exit: `1`, `verbose` (per object), or `strict` (exit 99 on a leak; diagnostic runtime only) |
 | `BLORP_FIBER_STACK_SIZE` | Fiber stack size in bytes |
 | `BLORP_FIBER_STACK_CACHE_BYTES` | Maximum cached bytes for dead fiber stacks; `0` disables |
 | `BLORP_FIBER_OBJECT_CACHE_COUNT` | Maximum cached dead fiber handles; `0` disables |

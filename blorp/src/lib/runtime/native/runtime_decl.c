@@ -200,6 +200,9 @@ typedef struct {
     long total_releases;
     long current_objects;
     long bytes_allocated;
+    long bytes_available;
+    long allocator_bytes_in_use;
+    long allocator_bytes_available;
     long backing_libc_malloc_events;
     long raw_buffer_malloc_events;
     long raw_buffer_calloc_events;

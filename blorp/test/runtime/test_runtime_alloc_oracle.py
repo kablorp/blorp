@@ -3,7 +3,7 @@
 roadmap milestone 6): every backing allocator path the oracle claims to
 count actually moves its counter when exercised, and every counter stays
 at zero when its path is never touched. Follows
-test_runtime_allocator_stats.py's small-C-harness-under-BLORP_ALLOCATOR_STATS
+test_runtime_allocator_stats.py's small-C-harness-under-BLORP_MEMORY_STATS
 model.
 """
 
@@ -49,7 +49,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
             environment = dict(os.environ)
-            environment["BLORP_ALLOCATOR_STATS"] = "1"
+            environment["BLORP_MEMORY_STATS"] = "1"
             return subprocess.run(
                 [str(executable)],
                 cwd=ROOT,
@@ -78,7 +78,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
                 } while (0)
 
             int main(void) {
-                if (!getenv("BLORP_ALLOCATOR_STATS")) return 90;
+                if (!getenv("BLORP_MEMORY_STATS")) return 90;
 
                 blorp_MemStats baseline = blorp_get_mem_stats();
                 if (baseline.oracle_stats_active != 1) return 91;
@@ -186,7 +186,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
             #define KEY(v) ((void*)(intptr_t)(v))
 
             int main(void) {
-                if (!getenv("BLORP_ALLOCATOR_STATS")) return 90;
+                if (!getenv("BLORP_MEMORY_STATS")) return 90;
 
                 blorp_MemStats before_new = blorp_get_mem_stats();
                 blorp_Dict* dict = blorp_dict_new();
@@ -277,7 +277,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
             }
 
             int main(void) {
-                if (!getenv("BLORP_ALLOCATOR_STATS")) return 90;
+                if (!getenv("BLORP_MEMORY_STATS")) return 90;
 
                 blorp_Set* set = blorp_set_new();
                 for (long key = 0; key < 20; key++) set = blorp_set_add(set, KEY(key));
@@ -361,7 +361,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
 
             int main(void) {
                 blorp_MemStats stats = blorp_get_mem_stats();
-                // Without BLORP_ALLOCATOR_STATS, oracle_stats_active must be
+                // Without BLORP_MEMORY_STATS, oracle_stats_active must be
                 // 0 (a disabled gate), never silently read as "0 events".
                 if (stats.oracle_stats_active != 0) return 2;
                 return 0;
@@ -395,7 +395,7 @@ class RuntimeAllocOracleTests(unittest.TestCase):
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
             environment = dict(os.environ)
-            environment.pop("BLORP_ALLOCATOR_STATS", None)
+            environment.pop("BLORP_MEMORY_STATS", None)
             completed = subprocess.run(
                 [str(executable)],
                 cwd=ROOT,

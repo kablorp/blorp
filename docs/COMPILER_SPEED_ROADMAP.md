@@ -586,7 +586,7 @@ func fill(n: Int) -> State:
 	state
 ```
 
-Measure allocations with `BLORP_ALLOCATOR_STATS=1` for n = 1k, 10k, 100k; a
+Measure allocations with `BLORP_MEMORY_STATS=1` for n = 1k, 10k, 100k; a
 quadratic curve confirms the copy. Then read the generated C for `fill` and
 the post-Perceus Core (`--dump-core-after=perceus`) to see where `state`'s
 old value is released.

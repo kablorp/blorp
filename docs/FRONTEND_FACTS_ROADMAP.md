@@ -144,7 +144,7 @@ lowering, so a self-compile iteration takes about 5 s instead of 17 s and
 the lowered-Core dump proves identity of every frontend product:
 
 ```bash
-BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_TYPECHECK_BODY_METRICS=1 \
+BLORP_MEMORY_STATS=1 BLORP_TYPECHECK_BODY_METRICS=1 \
 bin/blorp compile --stop-after=lower --dump-core-after=lower --dump-core-file=/tmp/cand.core \
   --time-phases --no-format --std-dir $input/standard_library/src -o /dev/null $input/blorp/src/main.brp \
   2>/tmp/cand.txt

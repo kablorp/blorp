@@ -96,7 +96,7 @@ base=$(git rev-parse origin/main)
 input=$(benchmarks/self_compile_measure freeze --rev "$base")
 BLORP_CLI_C_OPTIMIZATION=-O2 make && scripts/compiler-build-status   # must say FRESH
 
-BLORP_TYPECHECK_BODY_METRICS=1 BLORP_COMPILER_MEMORY_PROFILE=1 \
+BLORP_TYPECHECK_BODY_METRICS=1 BLORP_MEMORY_STATS=1 \
   bin/blorp compile --stop-after=lower --no-format \
   --std-dir "$input/standard_library/src" "$input/blorp/src/main.brp" \
   2>&1 >/dev/null | grep -E '^BLORP_(TYPECHECK_PHASE|TYPECHECK_BODY_TOTAL|COMPILER_MEMORY_CHECKPOINT)'
@@ -203,7 +203,7 @@ calls `reset_mem_stats()`, runs the function under study once, reads
 `get_mem_stats()` (`standard_library/src/memory.brp:21-48`, a `MemStats`
 struct whose read allocates nothing), checks output identity, and prints one
 value per line; and a bash wrapper under `benchmarks/` that builds at
-`-O2` unless `*_SKIP_BUILD=1`, runs the program with `BLORP_TRACK_STATS=1`,
+`-O2` unless `*_SKIP_BUILD=1`, runs the program with `BLORP_MEMORY_STATS=1`,
 validates every line as an integer, fails on any identity change, caps
 `allocations` at an expected value (`*_MEASURE_ONLY=1` to report without the
 cap), and prints one `..._ALLOCATIONS schema=1 ... allocations=... ` summary

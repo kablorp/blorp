@@ -319,7 +319,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
                     allocations, releases = leak_summary.groups()
                     self.assertEqual(allocations, releases)
 
-    def test_allocator_stats_do_not_enable_object_metadata(self) -> None:
+    def test_memory_stats_counters_do_not_enable_object_metadata(self) -> None:
         source = textwrap.dedent(
             """\
             #define MINICORO_IMPL
@@ -331,46 +331,52 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
                 if (before.total_allocations != 0) return 2;
                 if (before.total_releases != 0) return 3;
                 if (before.current_objects != 0) return 4;
-                // A zero baseline is valid now that the stats snapshot itself
-                // is returned by value and performs no allocation.
-                if (before.bytes_allocated < 0) return 5;
-                long before_bytes = before.bytes_allocated;
+                // -1 on a platform whose allocator cannot report block sizes.
+                int bytes_supported = before.bytes_available;
+                if (bytes_supported && before.bytes_allocated != 0) return 5;
+                if (before.oracle_stats_active != 1) return 16;
 
                 blorp_Object* object = blorp_alloc(sizeof(blorp_Object));
                 blorp_MemStats after_object_alloc = blorp_get_mem_stats();
                 if (after_object_alloc.total_allocations != 1) return 6;
                 if (after_object_alloc.total_releases != 0) return 7;
                 if (after_object_alloc.current_objects != 1) return 8;
+                if (bytes_supported &&
+                    after_object_alloc.bytes_allocated < (long)sizeof(blorp_Object)) return 17;
                 blorp_release(object);
 
                 blorp_MemStats after_object_release = blorp_get_mem_stats();
                 if (after_object_release.total_allocations != 1) return 9;
                 if (after_object_release.total_releases != 1) return 10;
                 if (after_object_release.current_objects != 0) return 11;
+                if (bytes_supported && after_object_release.bytes_allocated != 0) return 18;
 
                 for (size_t slot = 0; slot < BLORP_ALLOC_META_SLOTS; slot++) {
                     if (__alloc_meta_table[slot] != NULL) return 12;
                 }
 
+                // Raw process memory moves allocator_bytes_in_use but never
+                // the managed byte count.
                 const size_t allocation_size = 64 * 1024 * 1024;
                 void* allocation = malloc(allocation_size);
                 if (!allocation) return 13;
                 memset(allocation, 0x5a, allocation_size);
 
                 blorp_MemStats during = blorp_get_mem_stats();
-                long during_bytes = during.bytes_allocated;
-                if (during_bytes - before_bytes < (long)(allocation_size / 2)) return 14;
+                if (bytes_supported && during.bytes_allocated != 0) return 19;
+                if (during.allocator_bytes_in_use - before.allocator_bytes_in_use <
+                    (long)(allocation_size / 2)) return 14;
 
                 free(allocation);
                 blorp_MemStats after = blorp_get_mem_stats();
-                long after_bytes = after.bytes_allocated;
-                if (during_bytes - after_bytes < (long)(allocation_size / 2)) return 15;
+                if (during.allocator_bytes_in_use - after.allocator_bytes_in_use <
+                    (long)(allocation_size / 2)) return 15;
                 return 0;
             }
             """
         )
         with tempfile.TemporaryDirectory() as temp_name:
-            executable = Path(temp_name) / "allocator-stats"
+            executable = Path(temp_name) / "memory-stats-counters"
             compiled = subprocess.run(
                 [
                     os.environ.get("CC", "cc"),
@@ -396,7 +402,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
             environment = dict(os.environ)
-            environment["BLORP_ALLOCATOR_STATS"] = "1"
+            environment["BLORP_MEMORY_STATS"] = "1"
             completed = subprocess.run(
                 [str(executable)],
                 cwd=ROOT,
@@ -479,7 +485,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
             environment = dict(os.environ)
-            environment["BLORP_ALLOCATOR_STATS"] = "1"
+            environment["BLORP_MEMORY_STATS"] = "1"
             completed = subprocess.run(
                 [str(executable)],
                 cwd=ROOT,
@@ -536,7 +542,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
             environment = dict(os.environ)
-            environment["BLORP_COMPILER_MEMORY_PROFILE"] = "1"
+            environment["BLORP_MEMORY_STATS"] = "1"
             completed = subprocess.run(
                 [str(executable)],
                 cwd=ROOT,
@@ -584,6 +590,247 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             int(parsed[1]["total_allocations"]), starting_allocations + 1
         )
         self.assertEqual(int(parsed[2]["total_releases"]), starting_releases + 1)
+
+    def _compile_harness(self, source: str, directory: str, name: str) -> Path:
+        executable = Path(directory) / name
+        compiled = subprocess.run(
+            [
+                os.environ.get("CC", "cc"),
+                "-O0",
+                "-w",
+                "-DBLORP_MEMORY_DIAGNOSTICS=1",
+                f"-I{ROOT / 'blorp' / 'src' / 'lib' / 'runtime' / 'native'}",
+                "-x",
+                "c",
+                "-",
+                "-lm",
+                "-lpthread",
+                "-o",
+                str(executable),
+            ],
+            cwd=ROOT,
+            input=source,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        return executable
+
+    def test_bytes_allocated_is_managed_bytes_in_every_gate_state(self) -> None:
+        # The same program under each way of turning counting on: the
+        # environment counters gate (which keeps no per-object size, so bytes
+        # are explicitly unavailable), leak tracking, and an explicit reset.
+        # Where available, bytes_allocated is exactly the requested managed
+        # bytes and returns to its baseline once they are released; raw
+        # process memory belongs to allocator_bytes_in_use only.
+        source = textwrap.dedent(
+            """\
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            #define OBJECT_COUNT 100
+            #define OBJECT_SIZE 200
+
+            int main(void) {
+                if (getenv("START_WITH_RESET")) blorp_reset_mem_stats();
+                blorp_MemStats base = blorp_get_mem_stats();
+                if (!base.memory_stats_active || !base.oracle_stats_active) return 20;
+                // Bytes need a per-object size, which only leak tracking
+                // records: counters alone report bytes_available == 0.
+                int bytes_supported = base.bytes_available;
+                if (getenv("EXPECT_BYTES") && !bytes_supported) return 21;
+                if (getenv("EXPECT_NO_BYTES") && bytes_supported) return 22;
+                void* objects[OBJECT_COUNT];
+                for (int index = 0; index < OBJECT_COUNT; index++) {
+                    objects[index] = blorp_alloc(OBJECT_SIZE);
+                }
+                blorp_MemStats live = blorp_get_mem_stats();
+                if (live.current_objects - base.current_objects != OBJECT_COUNT) return 4;
+                if (bytes_supported) {
+                    long managed = live.bytes_allocated - base.bytes_allocated;
+                    if (managed != OBJECT_COUNT * OBJECT_SIZE) return 2;
+                }
+
+                const size_t raw_size = 8 * 1024 * 1024;
+                char* raw = malloc(raw_size);
+                if (!raw) return 5;
+                memset(raw, 1, raw_size);
+                blorp_MemStats with_raw = blorp_get_mem_stats();
+                if (with_raw.bytes_allocated != live.bytes_allocated) return 6;
+                if (with_raw.allocator_bytes_in_use >= 0 &&
+                    with_raw.allocator_bytes_in_use - live.allocator_bytes_in_use <
+                        (long)(raw_size / 2)) return 7;
+                free(raw);
+
+                for (int index = 0; index < OBJECT_COUNT; index++) blorp_release(objects[index]);
+                blorp_MemStats done = blorp_get_mem_stats();
+                if (done.bytes_allocated != base.bytes_allocated) return 8;
+                if (done.current_objects != base.current_objects) return 9;
+                return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            executable = self._compile_harness(source, temp_name, "bytes-per-gate")
+            gates = (
+                ("counters", {"BLORP_MEMORY_STATS": "1", "EXPECT_NO_BYTES": "1"}),
+                ("leak tracking", {"BLORP_LEAK_CHECK": "1", "EXPECT_BYTES": "1"}),
+                ("explicit reset", {"START_WITH_RESET": "1", "EXPECT_BYTES": "1"}),
+            )
+            for label, gate_environment in gates:
+                environment = dict(os.environ)
+                for name in (
+                    "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK", "START_WITH_RESET",
+                    "EXPECT_BYTES", "EXPECT_NO_BYTES",
+                ):
+                    environment.pop(name, None)
+                environment.update(gate_environment)
+                completed = subprocess.run(
+                    [str(executable)],
+                    cwd=ROOT,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, f"{label}: {completed.stderr}")
+
+    def test_reading_stats_never_starts_counting(self) -> None:
+        source = textwrap.dedent(
+            """\
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            int main(void) {
+                blorp_MemStats first = blorp_get_mem_stats();
+                if (first.memory_stats_active || first.oracle_stats_active) return 2;
+                void* object = blorp_alloc(64);
+                blorp_MemStats second = blorp_get_mem_stats();
+                if (second.memory_stats_active || second.oracle_stats_active) return 3;
+                if (second.total_allocations != 0 || second.current_objects != 0) return 4;
+                if (__blorp_gates() != 0) return 5;
+                blorp_release(object);
+                blorp_reset_mem_stats();
+                blorp_MemStats reset = blorp_get_mem_stats();
+                if (!reset.memory_stats_active || !reset.oracle_stats_active) return 6;
+                if (reset.current_objects != 0) return 7;
+                return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            executable = self._compile_harness(source, temp_name, "read-only-stats")
+            environment = dict(os.environ)
+            for name in ("BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK"):
+                environment.pop(name, None)
+            completed = subprocess.run(
+                [str(executable)], cwd=ROOT, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_reset_racing_concurrent_alloc_and_release_stays_balanced(self) -> None:
+        # Worker threads allocate and release their own objects continuously
+        # while the main thread escalates from "off" with a reset. Objects
+        # allocated before the reset are released after it, so a release must
+        # not be subtracted from an epoch that never counted its allocation.
+        source = textwrap.dedent(
+            """\
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            #define WORKER_COUNT 4
+            #define BATCH 64
+            #define SAMPLE_COUNT 3000
+            static _Atomic int stop_workers;
+
+            static void* worker(void* unused) {
+                (void)unused;
+                void* objects[BATCH];
+                while (!atomic_load(&stop_workers)) {
+                    for (int i = 0; i < BATCH; i++) objects[i] = blorp_alloc(48 + (i % 5) * 16);
+                    for (int i = 0; i < BATCH; i++) blorp_release(objects[i]);
+                }
+                return NULL;
+            }
+
+            int main(void) {
+                pthread_t threads[WORKER_COUNT];
+                for (int i = 0; i < WORKER_COUNT; i++) pthread_create(&threads[i], NULL, worker, NULL);
+                usleep(20000);
+                blorp_reset_mem_stats();
+                for (int sample = 0; sample < SAMPLE_COUNT; sample++) {
+                    blorp_MemStats live = blorp_get_mem_stats();
+                    if (live.current_objects < 0) return 2;
+                    if (live.bytes_allocated < 0) return 3;
+                    if (!live.bytes_available) return 4;
+                    usleep(50);
+                }
+                atomic_store(&stop_workers, 1);
+                for (int i = 0; i < WORKER_COUNT; i++) pthread_join(threads[i], NULL);
+                blorp_MemStats done = blorp_get_mem_stats();
+                if (done.total_allocations <= 0) return 5;
+                if (done.total_allocations != done.total_releases) return 6;
+                if (done.current_objects != 0) return 7;
+                if (done.bytes_allocated != 0) return 8;
+                return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            executable = self._compile_harness(source, temp_name, "reset-race")
+            environment = dict(os.environ)
+            for name in ("BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK"):
+                environment.pop(name, None)
+            for attempt in range(3):
+                completed = subprocess.run(
+                    [str(executable)], cwd=ROOT, env=environment,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+                )
+                self.assertEqual(completed.returncode, 0, f"attempt {attempt}: {completed.stderr}")
+
+    def test_strict_leak_check_reports_types_and_exits_99(self) -> None:
+        source = textwrap.dedent(
+            """\
+            #define MINICORO_IMPL
+            #include "minicoro.h"
+            #include "runtime.c"
+
+            int main(void) {
+                void* leaked = blorp_alloc(64);
+                BLORP_INSTALL_TAG(leaked, "LeakProbe");
+                void* freed = blorp_alloc(64);
+                blorp_release(freed);
+                return 0;
+            }
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_name:
+            executable = self._compile_harness(source, temp_name, "strict-leak")
+            results = {}
+            for mode in ("1", "strict"):
+                environment = dict(os.environ)
+                environment["BLORP_LEAK_CHECK"] = mode
+                results[mode] = subprocess.run(
+                    [str(executable)],
+                    cwd=ROOT,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+        for mode, completed in results.items():
+            self.assertIn("2 allocs, 1 releases, 1 leaked", completed.stderr, mode)
+            self.assertRegex(completed.stderr, r"LeakProbe\s+1\s", mode)
+        self.assertEqual(results["1"].returncode, 0, results["1"].stderr)
+        self.assertEqual(results["strict"].returncode, 99, results["strict"].stderr)
 
 
 if __name__ == "__main__":

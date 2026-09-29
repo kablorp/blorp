@@ -78,7 +78,7 @@ class RuntimeReleasePathTests(unittest.TestCase):
             )
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
             environment = dict(os.environ)
-            environment["BLORP_ALLOCATOR_STATS"] = "1"
+            environment["BLORP_MEMORY_STATS"] = "1"
             return subprocess.run(
                 [str(executable)],
                 cwd=ROOT,

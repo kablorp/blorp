@@ -131,7 +131,7 @@ For the fastest discovery-only loop, do not compile emitted C and do not enter
 typechecking:
 
 ```bash
-BLORP_COMPILER_MEMORY_PROFILE=1 /usr/bin/time -l \
+BLORP_MEMORY_STATS=1 /usr/bin/time -l \
   bin/blorp compile --ast --no-format \
   --std-dir "$input/standard_library/src" \
   "$input/blorp/src/main.brp" \

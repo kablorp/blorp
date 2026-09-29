@@ -1271,15 +1271,16 @@ limit is reported as indeterminate and should be rerun without the limit.
 `--memstats` resets before measured work and adds exact, metadata-tracked epoch
 counters to phase markers. It is intentionally perturbative. `--allocator-stats`
 instead keeps cumulative lightweight managed counters without constructing the
-per-object metadata table; `bytes_allocated` is the platform allocator's
-process-wide in-use estimate. It still adds atomic traffic to every managed
+per-object metadata table; the phase markers carry `bytes_allocated` (managed
+bytes) and `allocator_bytes_in_use` (the platform allocator's process-wide
+in-use estimate, which is what this mode reports as available). It still adds atomic traffic to every managed
 allocation, so use either mode for attribution rather than headline timing
 comparisons. Cumulative allocator-stat counts include worker startup; compare
 checkpoints or module/phase deltas rather than interpreting them as an isolated
 epoch.
 
 For compile-execution memory profiles, set
-`BLORP_COMPILER_MEMORY_PROFILE=1`. The compiler writes schema-1
+`BLORP_MEMORY_STATS=1`. The compiler writes schema-1
 `BLORP_COMPILER_MEMORY_CHECKPOINT` rows to stderr at
 `source_discovery_start`, then at the completed compiler phase checkpoints:
 `source_discovery_complete`, `typed_frontend_start`,
@@ -2071,7 +2072,7 @@ flushes the counters once per module, so they are cumulative -- the last
 line before a run ends is the whole compile's total:
 
 ```bash
-BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_CORE_LOWERING_TYPE_METRICS=1 bin/blorp compile \
+BLORP_MEMORY_STATS=1 BLORP_CORE_LOWERING_TYPE_METRICS=1 bin/blorp compile \
   --stop-after=lower --no-format --std-dir <std> <entry>.brp >/dev/null 2>lower_histogram.log
 ```
 
@@ -2110,7 +2111,7 @@ is set or not. `insert_drops_program` flushes the counters once per
 compile, right before returning:
 
 ```bash
-BLORP_COMPILER_MEMORY_PROFILE=1 BLORP_PERCEUS_ENGINE_METRICS=1 bin/blorp compile \
+BLORP_MEMORY_STATS=1 BLORP_PERCEUS_ENGINE_METRICS=1 bin/blorp compile \
   --no-format --no-embed-runtime --std-dir <std> -o /tmp/out.c <entry>.brp 2>perceus_engine.log
 ```
 

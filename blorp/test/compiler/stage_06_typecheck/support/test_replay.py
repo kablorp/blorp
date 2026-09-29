@@ -139,7 +139,7 @@ def fake_bridge_source() -> str:
         selected = [modules[name] for name in payload["module_targets"]]
         selected.append(payload["target"])
         inventory_enabled = "BLORP_COMPILER_TYPECHECK_INVENTORY" in os.environ
-        allocator_stats_enabled = "BLORP_ALLOCATOR_STATS" in os.environ
+        allocator_stats_enabled = "BLORP_MEMORY_STATS" in os.environ
         if (
             allocator_stats_enabled
             and "BLORP_COMPILER_TYPECHECK_MEMSTATS" in os.environ
@@ -149,8 +149,8 @@ def fake_bridge_source() -> str:
         allocator_stats_unavailable = (
             "BLORP_FAKE_ALLOCATOR_STATS_UNAVAILABLE" in os.environ
         )
-        start_bytes = -1 if allocator_stats_unavailable else 4096
-        complete_bytes = -1 if allocator_stats_unavailable else 8192
+        start_bytes = 0 if allocator_stats_unavailable else 4096
+        complete_bytes = 0 if allocator_stats_unavailable else 8192
         stats_active = 0 if "BLORP_FAKE_MEMORY_STATS_UNAVAILABLE" in os.environ else 1
         start_stats = "total_allocations=10 total_releases=3 current_objects=7 "
         complete_stats = "total_allocations=20 total_releases=15 current_objects=5 "
@@ -160,7 +160,7 @@ def fake_bridge_source() -> str:
             typed_expr_nodes = 2 if reused else 0
             print(
                 f"[typecheck-phase] phase=typecheck_start module={item['module_path']} "
-                f"{start_stats}bytes_allocated={start_bytes} memory_stats_active={stats_active}",
+                f"{start_stats}bytes_allocated=4096 allocator_bytes_in_use={start_bytes} allocator_bytes_available={0 if allocator_stats_unavailable else 1} memory_stats_active={stats_active}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -187,7 +187,7 @@ def fake_bridge_source() -> str:
             }), flush=True)
             print(
                 f"[typecheck-phase] phase=typed_artifact_scope_complete module={item['module_path']} "
-                f"{complete_stats}bytes_allocated={complete_bytes} memory_stats_active={stats_active}",
+                f"{complete_stats}bytes_allocated=8192 allocator_bytes_in_use={complete_bytes} allocator_bytes_available={0 if allocator_stats_unavailable else 1} memory_stats_active={stats_active}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -628,7 +628,7 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
         self.assertTrue(result["allocator_stats_available"])
         self.assertFalse(result["memstats_enabled"])
         self.assertEqual(
-            result["module_memstats_max"]["main"]["bytes_allocated"],
+            result["module_memstats_max"]["main"]["allocator_bytes_in_use"],
             8192,
         )
 
@@ -660,7 +660,7 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
             request_path.write_text(json.dumps(request_json()), encoding="utf-8")
             bridge_path.write_text(
                 fake_bridge_source().replace(
-                    "BLORP_ALLOCATOR_STATS",
+                    "BLORP_MEMORY_STATS",
                     "BLORP_UNSUPPORTED_ALLOCATOR_STATS",
                 ),
                 encoding="utf-8",

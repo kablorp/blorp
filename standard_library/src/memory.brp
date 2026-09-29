@@ -2,27 +2,42 @@
 --
 -- Provides utilities for tracking and reporting memory usage.
 --
--- Use `print_mem_stats`, `measure_memory`, and `format_bytes` while
--- debugging allocation behavior.
+-- Use `get_mem_stats`, `mem_delta`, `format_stats`, and `format_bytes` while
+-- debugging allocation behavior. Counting needs a diagnostic runtime and must be
+-- switched on: run with `blorp run --memory-stats` (or `BLORP_MEMORY_STATS=1`
+-- on a diagnostic build), run with `--leak-check`, or call `reset_mem_stats()`.
+-- `get_mem_stats()` alone never starts counting.
 -- ============================================================================
 -- Core Types and Builtins
 -- ============================================================================
 -- Memory statistics value tracks allocation patterns.
 --
--- The first four fields count managed (blorp_alloc-backed) object
--- requests, as before. The remaining fields are the allocation oracle's
--- counters (allocation-contract roadmap milestone 6): every OTHER
--- heap/OS allocation path the runtime has (managed-object malloc, raw
--- malloc/calloc/realloc/aligned buffers, generated cleanup scratch growth,
--- fiber stack mmaps), populated only while `BLORP_ALLOCATOR_STATS`-style
--- tracking is active. `oracle_stats_active` is 0 when that gate was off at
--- snapshot time; a caller must treat that as an incomplete measurement,
--- never as "zero events". See `assert_no_heap_activity`.
+-- The first three fields count managed (blorp_alloc-backed) objects.
+-- `bytes_allocated` is the sum of the requested sizes (headers included) of
+-- the live managed objects. Only leak tracking records a per-object size, so
+-- when just the counters are on (`--memory-stats` before any
+-- `reset_mem_stats()`) `bytes_available` is 0 and `bytes_allocated` is 0;
+-- `--leak-check` and `reset_mem_stats()` make it available.
+-- `allocator_bytes_in_use` is a different quantity: the bytes the whole
+-- process currently has from the system allocator (raw buffers included);
+-- `allocator_bytes_available` is 0 where the platform cannot report it. A
+-- figure is meaningful only when its availability field is 1.
+--
+-- The remaining fields are the allocation oracle's counters
+-- (allocation-contract roadmap milestone 6): every OTHER heap/OS allocation
+-- path the runtime has (managed-object malloc, raw malloc/calloc/realloc/
+-- aligned buffers, generated cleanup scratch growth, fiber stack mmaps).
+-- `oracle_stats_active` and `memory_stats_active` are 1 only when counting
+-- was on when the snapshot was taken; a caller must treat 0 as an incomplete
+-- measurement, never as "zero events". See `assert_no_heap_activity`.
 struct MemStats {
 	total_allocations: Int,
 	total_releases: Int,
 	current_objects: Int,
 	bytes_allocated: Int,
+	bytes_available: Int,
+	allocator_bytes_in_use: Int,
+	allocator_bytes_available: Int,
 	backing_libc_malloc_events: Int,
 	raw_buffer_malloc_events: Int,
 	raw_buffer_calloc_events: Int,
@@ -38,15 +53,21 @@ struct MemStats {
 
 
 -- Get current memory statistics.
--- The returned MemStats value requires no allocation. In a diagnostic
--- runtime, a reset followed by get_mem_stats() reports zero live objects
--- unless user code has allocated something. Check memory_stats_active before
--- interpreting any managed count.
+-- The returned MemStats value requires no allocation, and reading never turns
+-- counting on: when nothing has (see the header), the snapshot is all zeros
+-- with memory_stats_active == 0. After `reset_mem_stats()` it reports zero
+-- live objects unless user code has allocated something. Check
+-- memory_stats_active before interpreting any managed count.
 pure func get_mem_stats() -> MemStats:
 	builtin("blorp_get_mem_stats")
 
 
--- Reset memory statistics counters
+-- Start an exact measurement epoch: zero the managed counters and count only
+-- objects allocated from now on. This also turns on per-object leak tracking
+-- for the rest of the process, which costs a metadata record and a mutex
+-- acquisition per managed allocation and release, so use it in tests and
+-- diagnostics, not in timed code. Call it while other threads are not
+-- allocating if `--memory-stats` was already counting.
 func reset_mem_stats() -> Void:
 	builtin("blorp_reset_mem_stats")
 
@@ -119,10 +140,19 @@ pure func format_bytes(bytes: Int) -> String:
 							round_to(gb, 100.0).to_string() + " GB"
 
 
+-- A byte figure for display, or "unavailable" when its availability field is
+-- 0. A negative figure with the field set is a real (negative delta) number.
+private pure func format_byte_count(bytes: Int, available: Int) -> String:
+	if available == 0:
+		"unavailable"
+	else:
+		format_bytes(bytes)
+
+
 -- Format memory stats as a readable string
 pure func format_stats(stats: MemStats) -> String:
 	if stats.memory_stats_active == 0:
-		"memory stats unavailable: rebuild with BLORP_MEMORY_DIAGNOSTICS=1"
+		"memory stats inactive: run with --memory-stats or call reset_mem_stats() (needs a runtime built with BLORP_MEMORY_DIAGNOSTICS=1)"
 	else:
 		"allocations: " + to_string(
 			stats.total_allocations,
@@ -130,32 +160,29 @@ pure func format_stats(stats: MemStats) -> String:
 			stats.total_releases,
 		) + ", current: " + to_string(
 			stats.current_objects,
-		) + ", bytes: " + format_bytes(stats.bytes_allocated)
+		) + ", managed bytes: " + format_byte_count(stats.bytes_allocated, stats.bytes_available)
 
 
--- Print current memory statistics
-func print_mem_stats() -> Void:
-	stats: MemStats = get_mem_stats()
-	if stats.memory_stats_active == 0:
-		print("Memory stats unavailable; rebuild with BLORP_MEMORY_DIAGNOSTICS=1")
+-- Difference of two byte figures, or 0 when either endpoint could not report
+-- one; the availability field of the delta says which it is.
+private pure func byte_delta(before: Int, before_available: Int, after: Int, after_available: Int) -> Int:
+	if before_available == 0 or after_available == 0:
+		0
 	else:
-		print("=== Memory Stats ===")
-		print("  Total allocations: " + stats.total_allocations.to_string())
-		print("  Total releases:    " + stats.total_releases.to_string())
-		print("  Current objects:   " + stats.current_objects.to_string())
-		print("  Bytes allocated:   " + format_bytes(stats.bytes_allocated))
-		print("====================")
+		after - before
 
 
--- Measure memory usage of a function
--- Resets stats before, runs the function, returns final stats
-func measure_memory(f: () -> Void) -> MemStats:
-	reset_mem_stats()
-	f()
-	get_mem_stats()
+private pure func both_available(before: Int, after: Int) -> Int:
+	if before == 0 or after == 0:
+		0
+	else:
+		1
 
 
--- Get the delta in memory stats between two points
+-- Get the delta in memory stats between two snapshots (the value to print or
+-- assert on; use `format_stats` to render it). A byte delta is 0 with its
+-- availability field 0 when either snapshot could not report that figure; a
+-- negative delta with the field 1 is a real decrease.
 pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
 	-- Both endpoints must have been taken with the oracle gate active for a
 	-- delta to mean anything; see assert_no_heap_activity.
@@ -177,7 +204,23 @@ pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
 		total_allocations = after.total_allocations - before.total_allocations,
 		total_releases = after.total_releases - before.total_releases,
 		current_objects = after.current_objects - before.current_objects,
-		bytes_allocated = after.bytes_allocated - before.bytes_allocated,
+		bytes_allocated = byte_delta(
+			before.bytes_allocated,
+			before.bytes_available,
+			after.bytes_allocated,
+			after.bytes_available,
+		),
+		bytes_available = both_available(before.bytes_available, after.bytes_available),
+		allocator_bytes_in_use = byte_delta(
+			before.allocator_bytes_in_use,
+			before.allocator_bytes_available,
+			after.allocator_bytes_in_use,
+			after.allocator_bytes_available,
+		),
+		allocator_bytes_available = both_available(
+			before.allocator_bytes_available,
+			after.allocator_bytes_available,
+		),
 		backing_libc_malloc_events = after.backing_libc_malloc_events - before.backing_libc_malloc_events,
 		raw_buffer_malloc_events = after.raw_buffer_malloc_events - before.raw_buffer_malloc_events,
 		raw_buffer_calloc_events = after.raw_buffer_calloc_events - before.raw_buffer_calloc_events,
@@ -201,16 +244,17 @@ pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
 -- a caller does not have to re-derive which path allocated.
 --
 -- This is test-only: it is for single-fiber test code measured under
--- `BLORP_ALLOCATOR_STATS=1`, since the underlying counters are process-
--- global. It does not support nested scopes or concurrent fibers; a test
--- that needs either must snapshot around each fiber's own single-threaded
--- region instead of sharing one before/after pair.
+-- `BLORP_MEMORY_STATS=1` (`blorp run --memory-stats`), since the underlying
+-- counters are process-global. It does not support nested scopes or
+-- concurrent fibers; a test that needs either must snapshot around each
+-- fiber's own single-threaded region instead of sharing one before/after
+-- pair.
 pure func assert_no_heap_activity(before: MemStats, after: MemStats) -> Result[Void, String]:
 	if before.memory_stats_active == 0 or after.memory_stats_active == 0:
-		Err("memory stats unavailable: rebuild with BLORP_MEMORY_DIAGNOSTICS=1")
+		Err("memory stats inactive: run with --memory-stats or call reset_mem_stats() (needs a runtime built with BLORP_MEMORY_DIAGNOSTICS=1)")
 	else if before.oracle_stats_active == 0 or after.oracle_stats_active == 0:
 		Err((
-				"allocation oracle inactive: run with BLORP_ALLOCATOR_STATS=1 (a disabled gate "
+				"allocation oracle inactive: run with BLORP_MEMORY_STATS=1 (a disabled gate "
 				+ "must fail, not read as zero)"
 			))
 	else:
@@ -258,23 +302,3 @@ pure func assert_no_heap_activity(before: MemStats, after: MemStats) -> Result[V
 											)
 										else:
 											Ok(void)
-
-
--- Print memory report comparing before/after stats
-func print_mem_report(label: String, before: MemStats, after: MemStats) -> Void:
-	delta: MemStats = mem_delta(before, after)
-	if delta.memory_stats_active == 0:
-		print("Memory report unavailable: rebuild with BLORP_MEMORY_DIAGNOSTICS=1")
-	else:
-		print("=== Memory Report: " + label + " ===")
-		print("  New allocations: " + delta.total_allocations.to_string())
-		print("  New releases:    " + delta.total_releases.to_string())
-		print("  Net objects:     " + delta.current_objects.to_string())
-		print("  Net bytes:       " + format_bytes(delta.bytes_allocated))
-
-		if delta.current_objects > 0:
-			print("  WARNING: Potential memory leak detected!")
-		else:
-			print("  OK: All allocations released")
-
-		print("================================")

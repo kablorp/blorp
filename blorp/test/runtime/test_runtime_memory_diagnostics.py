@@ -132,14 +132,13 @@ class RuntimeMemoryDiagnosticsTests(unittest.TestCase):
             self._compile(0, binary)
             environment = dict(os.environ)
             for name in (
-                "BLORP_ALLOCATOR_STATS",
-                "BLORP_COMPILER_MEMORY_PROFILE",
+                "BLORP_MEMORY_STATS",
                 "BLORP_LEAK_CHECK",
             ):
                 environment.pop(name, None)
             normal = subprocess.run([str(binary)], env=environment, capture_output=True, text=True)
             self.assertEqual(normal.returncode, 0, normal.stderr)
-            for request in ("BLORP_ALLOCATOR_STATS", "BLORP_LEAK_CHECK"):
+            for request in ("BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK"):
                 environment[request] = "1"
                 rejected = subprocess.run([str(binary)], env=environment, capture_output=True, text=True)
                 self.assertEqual(rejected.returncode, 2)
@@ -155,7 +154,7 @@ class RuntimeMemoryDiagnosticsTests(unittest.TestCase):
             self._compile(1, binary)
             environment = dict(os.environ)
             environment.pop("BLORP_LEAK_CHECK", None)
-            environment["BLORP_ALLOCATOR_STATS"] = "1"
+            environment["BLORP_MEMORY_STATS"] = "1"
             measured = subprocess.run([str(binary)], env=environment, capture_output=True, text=True)
             self.assertEqual(measured.returncode, 0, measured.stderr)
 
@@ -200,7 +199,7 @@ class RuntimeMemoryDiagnosticsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             binaries = self._compile_split_link(Path(directory))
             environment = dict(os.environ)
-            for name in ("BLORP_ALLOCATOR_STATS", "BLORP_COMPILER_MEMORY_PROFILE"):
+            for name in ("BLORP_MEMORY_STATS",):
                 environment.pop(name, None)
 
             environment.pop("BLORP_LEAK_CHECK", None)
