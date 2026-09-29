@@ -983,83 +983,6 @@ static bool __blorp_compiler_memory_profile_enabled = false;
 static bool __blorp_typecheck_body_metrics_enabled = false;
 static bool __blorp_core_lowering_type_metrics_enabled = false;
 #endif
-static bool __blorp_trace_allocs = false;
-
-// Memory watch: periodic snapshots to stderr for leak detection in long-running programs.
-// Enabled by BLORP_MEM_WATCH=N (interval in seconds).
-static volatile int __mem_watch_active = 0;
-static int __mem_watch_interval = 0;
-
-// Allocation tracing: count allocations per call site (return address)
-#define BLORP_TRACE_SLOTS 4096
-static struct { void* addr; long count; size_t bytes; } __blorp_trace_table[BLORP_TRACE_SLOTS];
-static long __blorp_trace_total = 0;
-
-static void __blorp_trace_record(size_t size, void* caller) {
-    unsigned long hash = ((unsigned long)caller >> 4) % BLORP_TRACE_SLOTS;
-    for (int probe = 0; probe < 16; probe++) {
-        unsigned long idx = (hash + probe) % BLORP_TRACE_SLOTS;
-        if (__blorp_trace_table[idx].addr == caller || __blorp_trace_table[idx].addr == NULL) {
-            __blorp_trace_table[idx].addr = caller;
-            __blorp_trace_table[idx].count++;
-            __blorp_trace_table[idx].bytes += size;
-            break;
-        }
-    }
-    __blorp_trace_total++;
-}
-
-static int __blorp_trace_cmp(const void* a, const void* b) {
-    long ca = ((const struct { void* addr; long count; size_t bytes; }*)a)->count;
-    long cb = ((const struct { void* addr; long count; size_t bytes; }*)b)->count;
-    return (cb > ca) - (cb < ca);
-}
-
-__attribute__((destructor))
-static void __blorp_trace_dump(void) {
-    if (!__blorp_trace_allocs) return;
-    qsort(__blorp_trace_table, BLORP_TRACE_SLOTS, sizeof(__blorp_trace_table[0]), __blorp_trace_cmp);
-    fprintf(stderr, "\n=== BLORP ALLOCATION TRACE (%ld total) ===\n", __blorp_trace_total);
-    fprintf(stderr, "%12s %12s  %s\n", "COUNT", "BYTES", "CALL SITE");
-    for (int i = 0; i < 20 && __blorp_trace_table[i].count > 0; i++) {
-        fprintf(stderr, "%12ld %12zu  %p\n",
-            __blorp_trace_table[i].count,
-            __blorp_trace_table[i].bytes,
-            __blorp_trace_table[i].addr);
-    }
-    fprintf(stderr, "===\nTip: Use `atos -o <binary> <addr>` or `addr2line` to resolve addresses.\n");
-}
-
-// ============================================================================
-// Memory Watch Thread — periodic snapshots for leak detection
-// ============================================================================
-// Activated by BLORP_MEM_WATCH=N environment variable (N = seconds between snapshots).
-// Prints one line to stderr each interval showing current object/byte counts and deltas.
-
-static void* __mem_watch_thread(void* arg) {
-    (void)arg;
-    long prev_objects = 0;
-    long prev_bytes = 0;
-    struct timespec start_ts;
-    clock_gettime(CLOCK_MONOTONIC, &start_ts);
-    while (__mem_watch_active) {
-        sleep((unsigned)__mem_watch_interval);
-        if (!__mem_watch_active) break;
-        long objects = atomic_load(&global_mem_stats.current_objects);
-        long bytes = atomic_load(&global_mem_stats.bytes_allocated);
-        struct timespec now_ts;
-        clock_gettime(CLOCK_MONOTONIC, &now_ts);
-        double elapsed = (double)(now_ts.tv_sec - start_ts.tv_sec)
-                       + (double)(now_ts.tv_nsec - start_ts.tv_nsec) / 1e9;
-        long d_obj = objects - prev_objects;
-        long d_bytes = bytes - prev_bytes;
-        fprintf(stderr, "[mem @%.0fs] objects: %ld (%+ld)  bytes: %ld (%+ld)\n",
-                elapsed, objects, d_obj, bytes, d_bytes);
-        prev_objects = objects;
-        prev_bytes = bytes;
-    }
-    return NULL;
-}
 
 // ============================================================================
 // Cold allocation metadata (stats and leak reports)
@@ -1287,7 +1210,7 @@ static blorp_AllocMeta* __alloc_meta_find_locked(const blorp_Object* obj) {
 
 // Not an allocation the oracle observes, because this is cold leak/full-stats
 // metadata bookkeeping (only reachable when __alloc_meta_enabled(), i.e.
-// BLORP_LEAK_CHECK/BLORP_TRACK_STATS/BLORP_TRACE_ALLOCS), never active in the
+// BLORP_LEAK_CHECK/BLORP_TRACK_STATS), never active in the
 // lightweight BLORP_ALLOCATOR_STATS oracle mode this test harness uses.
 static void __alloc_meta_insert(blorp_Object* obj, size_t alloc_size, bool stats_tracked) {
     if (!__alloc_meta_enabled()) return;
@@ -1582,8 +1505,6 @@ static void __blorp_init_stats_flag(void) {
         "BLORP_LEAK_CHECK",
 #endif
         "BLORP_TRACK_STATS",
-        "BLORP_TRACE_ALLOCS",
-        "BLORP_MEM_WATCH",
     };
     for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
         if (getenv(requests[i]) != NULL) {
@@ -1594,7 +1515,6 @@ static void __blorp_init_stats_flag(void) {
         }
     }
 #else
-    const char* mem_watch_env = getenv("BLORP_MEM_WATCH");
     __blorp_compiler_memory_profile_enabled =
         getenv("BLORP_COMPILER_MEMORY_PROFILE") != NULL;
 #ifdef BLORP_COMPILER_RUNTIME_SOURCES
@@ -1613,23 +1533,11 @@ static void __blorp_init_stats_flag(void) {
         memory_order_relaxed);
     atomic_store_explicit(&__blorp_stats_enabled,
         (getenv("BLORP_LEAK_CHECK") != NULL) ||
-        (getenv("BLORP_TRACK_STATS") != NULL) ||
-        (getenv("BLORP_TRACE_ALLOCS") != NULL) ||
-        (mem_watch_env != NULL),
+        (getenv("BLORP_TRACK_STATS") != NULL),
         memory_order_relaxed);
-    __blorp_trace_allocs = (getenv("BLORP_TRACE_ALLOCS") != NULL);
     __leak_tracking_enabled = (getenv("BLORP_LEAK_CHECK") != NULL);
     __alloc_live_sentinel.live_next = NULL;
     __alloc_live_sentinel.live_prev = NULL;
-    // Start memory watch thread if BLORP_MEM_WATCH=N is set
-    if (mem_watch_env) {
-        __mem_watch_interval = atoi(mem_watch_env);
-        if (__mem_watch_interval < 1) __mem_watch_interval = 1;
-        __mem_watch_active = 1;
-        pthread_t tid;
-        pthread_create(&tid, NULL, __mem_watch_thread, NULL);
-        pthread_detach(tid);
-    }
 #endif
 }
 
@@ -3432,8 +3340,6 @@ static void __blorp_print_live_object_type_summary(FILE* out,
 }
 
 static void __blorp_leak_report(void) {
-    // Stop memory watch thread before reporting
-    __mem_watch_active = 0;
     const char* mode = getenv("BLORP_LEAK_CHECK");
     if (!mode) return;
     long leaked = atomic_load(&global_mem_stats.current_objects);
@@ -3545,8 +3451,7 @@ void* blorp_alloc(size_t size) {
     void* alloc_site = NULL;
 
 #if defined(__GNUC__) || defined(__clang__)
-    if (__alloc_meta_enabled() ||
-        (atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed) && __blorp_trace_allocs)) {
+    if (__alloc_meta_enabled()) {
         alloc_site = __builtin_extract_return_addr(__builtin_return_address(0));
     }
 #endif
@@ -3575,9 +3480,6 @@ void* blorp_alloc(size_t size) {
                      (intptr_t)(uintptr_t)(void*)&blorp_alloc)
             : 0;
         __alloc_meta_set_alloc_site(header, alloc_site_offset, 0);
-    }
-    if (atomic_load_explicit(&__blorp_stats_enabled, memory_order_relaxed) && __blorp_trace_allocs) {
-        __blorp_trace_record(actual_size, alloc_site);
     }
 #endif
     return obj;
@@ -5591,9 +5493,7 @@ void* blorp_union_destroy_stack_grow(void* old_stack, size_t new_size) {
     return realloc(old_stack, new_size);
 }
 
-// Single-threaded mode: use plain increment/decrement instead of atomics (14x cheaper)
-//
-// Multi-threaded ordering: a retain's increment only needs
+// Reference-count ordering: a retain's increment only needs
 // memory_order_relaxed, because the thread performing the retain already
 // holds a reference to the object — the object cannot be concurrently freed
 // out from under it, so there is nothing for the increment to synchronize
@@ -5608,21 +5508,13 @@ void* blorp_union_destroy_stack_grow(void* old_stack, size_t new_size) {
 // under this scheme because uniqueness is only ever consulted by the thread
 // that holds the sole reference, so there is no cross-thread write to
 // synchronize with there either.
-#ifdef BLORP_SINGLE_THREADED
-  #define BLORP_RC_LOAD(p)       (*(long*)(&(p)))
-  #define BLORP_RC_INC(p)        (++(*(long*)(&(p))))
-  #define BLORP_RC_DEC_PREV(p)   ((*(long*)(&(p)))--)
-  #define BLORP_RC_ACQUIRE_FENCE() ((void)0)
-
-#else
-  #define BLORP_RC_LOAD(p)       atomic_load_explicit(&(p), memory_order_relaxed)
-  #define BLORP_RC_INC(p)        atomic_fetch_add_explicit(&(p), 1, memory_order_relaxed)
-  #define BLORP_RC_DEC_PREV(p)   atomic_fetch_sub_explicit(&(p), 1, memory_order_release)
-  // Paired with BLORP_RC_DEC_PREV's release: taken only on the decrement that
-  // observes the count reach zero, before any field of the object is read,
-  // so the destructor sees every other thread's writes to it.
-  #define BLORP_RC_ACQUIRE_FENCE() atomic_thread_fence(memory_order_acquire)
-#endif
+#define BLORP_RC_LOAD(p)       atomic_load_explicit(&(p), memory_order_relaxed)
+#define BLORP_RC_INC(p)        atomic_fetch_add_explicit(&(p), 1, memory_order_relaxed)
+#define BLORP_RC_DEC_PREV(p)   atomic_fetch_sub_explicit(&(p), 1, memory_order_release)
+// Paired with BLORP_RC_DEC_PREV's release: taken only on the decrement that
+// observes the count reach zero, before any field of the object is read,
+// so the destructor sees every other thread's writes to it.
+#define BLORP_RC_ACQUIRE_FENCE() atomic_thread_fence(memory_order_acquire)
 
 // Retain and release used to load the count and compare it against
 // BLORP_IMMORTAL_REFCOUNT before ever touching the RMW, so an immortal
@@ -5669,11 +5561,7 @@ __attribute__((always_inline))
 inline bool blorp_is_unique(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return false;
     blorp_Object* header = (blorp_Object*)obj;
-#ifdef BLORP_SINGLE_THREADED
-    return header->refcount == 1;
-#else
     return atomic_load_explicit(&header->refcount, memory_order_relaxed) == 1;
-#endif
 }
 
 // Allocation identity, not value equality: true only when both operands name

@@ -1129,21 +1129,13 @@ void blorp_cooperative_checkpoint_slow_extern(void);
 // under this scheme because uniqueness is only ever consulted by the thread
 // that holds the sole reference, so there is no cross-thread write to
 // synchronize with there either.
-#ifdef BLORP_SINGLE_THREADED
-  #define BLORP_RC_LOAD(p)       (*(long*)(&(p)))
-  #define BLORP_RC_INC(p)        (++(*(long*)(&(p))))
-  #define BLORP_RC_DEC_PREV(p)   ((*(long*)(&(p)))--)
-  #define BLORP_RC_ACQUIRE_FENCE() ((void)0)
-
-#else
-  #define BLORP_RC_LOAD(p)       atomic_load_explicit(&(p), memory_order_relaxed)
-  #define BLORP_RC_INC(p)        atomic_fetch_add_explicit(&(p), 1, memory_order_relaxed)
-  #define BLORP_RC_DEC_PREV(p)   atomic_fetch_sub_explicit(&(p), 1, memory_order_release)
-  // Paired with BLORP_RC_DEC_PREV's release: taken only on the decrement that
-  // observes the count reach zero, before any field of the object is read,
-  // so the destructor sees every other thread's writes to it.
-  #define BLORP_RC_ACQUIRE_FENCE() atomic_thread_fence(memory_order_acquire)
-#endif
+#define BLORP_RC_LOAD(p)       atomic_load_explicit(&(p), memory_order_relaxed)
+#define BLORP_RC_INC(p)        atomic_fetch_add_explicit(&(p), 1, memory_order_relaxed)
+#define BLORP_RC_DEC_PREV(p)   atomic_fetch_sub_explicit(&(p), 1, memory_order_release)
+// Paired with BLORP_RC_DEC_PREV's release: taken only on the decrement that
+// observes the count reach zero, before any field of the object is read,
+// so the destructor sees every other thread's writes to it.
+#define BLORP_RC_ACQUIRE_FENCE() atomic_thread_fence(memory_order_acquire)
 
 // Retain and release used to load the count and compare it against
 // BLORP_IMMORTAL_REFCOUNT before ever touching the RMW, so an immortal
@@ -1188,11 +1180,7 @@ static inline void blorp_release_arc_only(void* obj) {
 static inline bool blorp_is_unique(void* obj) {
     if (__builtin_expect(obj == NULL, 0)) return false;
     blorp_Object* header = (blorp_Object*)obj;
-#ifdef BLORP_SINGLE_THREADED
-    return header->refcount == 1;
-#else
     return atomic_load_explicit(&header->refcount, memory_order_relaxed) == 1;
-#endif
 }
 
 void blorp_cleanup_release_arc_value(void* value);

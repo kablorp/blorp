@@ -26,11 +26,7 @@ static inline long dict_storage_order_matches(blorp_Dict* dict, const long* expe
 }
 
 static inline long dict_storage_refcount(void* obj) {
-#ifdef BLORP_SINGLE_THREADED
-    return (long)((blorp_Object*)obj)->refcount;
-#else
     return (long)atomic_load_explicit(&((blorp_Object*)obj)->refcount, memory_order_relaxed);
-#endif
 }
 
 static inline long dict_storage_has_int(blorp_Dict* dict, long key, long value) {

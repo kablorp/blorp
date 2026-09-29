@@ -733,12 +733,13 @@ managed values before and after the interval; leak gate green.
 ## N9. Non-atomic reference counts while single-threaded
 
 **Context.** `blorp_retain` and `blorp_release` use atomic operations
-(`BLORP_RC_DEC_PREV`); a `BLORP_SINGLE_THREADED` build flag exists. The
+(`BLORP_RC_DEC_PREV`); an old `BLORP_SINGLE_THREADED` build flag was removed
+because no build ever defined it. The
 compiler runs its passes on one thread; only discovery and parsing use tasks.
 
-**Change.** Measure first: build the stage-2 compiler with
-`-DBLORP_SINGLE_THREADED` (if it links and the self-compile still runs
-single-threaded) and report the instruction delta; that is the ceiling. If
+**Change.** Measure first: build the stage-2 compiler with the
+`BLORP_RC_*` macros temporarily patched to plain increments (if it links and
+the self-compile still runs single-threaded) and report the instruction delta; that is the ceiling. If
 it is above 3%, design a dynamic version: a process-wide flag set when the
 first worker thread starts, tested with a predictable branch in the inline
 fast paths, with the non-atomic path taken while it is clear. Any value

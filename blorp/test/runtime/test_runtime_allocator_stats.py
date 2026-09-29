@@ -290,7 +290,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             )
             self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
-            for setting in (None, "BLORP_TRACE_ALLOCS", "BLORP_LEAK_CHECK"):
+            for setting in (None, "BLORP_LEAK_CHECK"):
                 environment = dict(os.environ)
                 if setting is not None:
                     environment[setting] = "1"
@@ -308,12 +308,7 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
                     0,
                     f"{setting or 'default'}: {completed.stderr}",
                 )
-                if setting == "BLORP_TRACE_ALLOCS":
-                    self.assertRegex(
-                        completed.stderr,
-                        r"=== BLORP ALLOCATION TRACE \([1-9][0-9]* total\) ===",
-                    )
-                elif setting == "BLORP_LEAK_CHECK":
+                if setting == "BLORP_LEAK_CHECK":
                     leak_summary = re.search(
                         r"blorp: leak check: ([0-9]+) allocs, "
                         r"([0-9]+) releases, 0 leaked, 0 bytes",
