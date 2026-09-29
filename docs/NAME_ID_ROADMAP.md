@@ -68,6 +68,27 @@ Measured facts that fix the order (all 2026-09-28):
 | A4d | Formatter (~486) | `format/engine/*.brp`, `format/projection.brp` | formatter idempotence; own branch, after the formatter has a settled table parameter | after A4a |
 | A5 | Flip `ParsedIdentifier.text` to the stringified id and delete `.text` readers; then String to `Int` one record family per commit (`CoreVar.name`, function names, field and variant spellings, type names) | frontend and Core records | identical C | after A2, A3, A4 and the standalone-graph precondition (standalone graphs share the discovery table) |
 
+## A2b: trait identity
+
+Census: [`benchmarks/results/trait_identity_census_2026-09-29.md`](../benchmarks/results/trait_identity_census_2026-09-29.md).
+A trait's identity is the opaque `TraitId` (graph traits are their
+`DefinitionId`; builtins are `-(registry_id + 1)`). The header graph already
+holds it; the legacy `Env` layer and Core hold the trait's name as a String
+(about 450 lines in typecheck and Core, 68 literal compares against builtin
+spellings), which cannot tell two same-named traits from different modules apart
+and cannot be compared by pinned id. `NameId` is the wrong identity (spelling,
+not declaration); `TraitId` is right.
+
+| Slice | What | Gate |
+| --- | --- | --- |
+| A2b.1 | pinned builtin `TraitId`s; `TraitId` beside the name on `TraitDef`, `ImplInstance`, `TraitObligation`; id/name agreement test | typecheck stage; identical C |
+| A2b.2 | obligation readers compare pinned ids; delete `TraitObligation.trait_name` (the Equatable/HasLength/Stringable arms and 23 `infer.brp` literal compares go) | 860 `should_fail` messages unchanged |
+| A2b.3 | impl and supertrait walks by `TraitId`; delete `ImplInstance.trait_name`, `TraitDef.supertraits` Strings; authority dict keys by id | typecheck stage, sanitize |
+| A2b.4 | `BoundTypeParam.bounds` derived from `bound_identities`; delete `TraitRef` | typecheck stage; formatter idempotence |
+| A2b.5 | resolved call targets, `TraitMethodCallee`, `trait_functions` by `TraitId` | typecheck stage |
+| A2b.6 | typed trait and impl info carry `TraitId` for lowering | Core suites |
+| A2b.7 | Core: impl and trait decls, trait calls, DCE keys, `synth_scalar_operator` and `trait_dispatch` literals by id; trait catalog for display; retire M2.3's `CoreImplMethodRole` (callback roles become pinned `(TraitId, NameId)` pairs) | `compiler-core-sanitize`, backend identity |
+
 ## Lane B: emission by id
 
 | Step | What | Files | Gate | Status |
