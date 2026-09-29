@@ -9,7 +9,8 @@ import:
 		CoreConcurrentlyLoop,
 		CoreConcurrentlyLoopItemMode(ConcurrentlyLoopCopyItem),
 		CoreConcurrentlyLoopOutput(ConcurrentlyLoopDiscard),
-		CoreDecl(FunctionDecl, GlobalDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl),
+		CoreEnumVariant,
 		CoreExpr(
 			CallExpr,
 			ClosureCreateExpr,
@@ -28,6 +29,7 @@ import:
 		),
 		CoreFunction,
 		CoreForeignArgPassing(ForeignBorrowArgs),
+		CoreForeignFunction,
 		CoreFunctionKind(ClosureBodyFunction, UserFunction),
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
 		CoreListStorageLayout(PointerListStorage),
@@ -40,7 +42,7 @@ import:
 		CoreVar,
 		static_string_literal_id,
 	../../../src/compiler/stage_09_core/pipeline: prepared_core_program
-	../../../src/compiler/stage_10_backend/c_naming: static_closure_name
+	../../../src/compiler/stage_10_backend/c_naming: static_closure_name, variant_constructor_symbol, variant_tag_symbol
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
 		CCallableSymbolCandidate,
 		CProjectedCallableKind(ProjectedClosureBody, ProjectedUserFunction),
@@ -54,6 +56,7 @@ import:
 			UnsupportedPreparedCallKind,
 			UnresolvedCallbackTarget,
 			UnprojectedCallableValue,
+			VariantSymbolCollision,
 		),
 		build_callable_symbol_plan,
 		c_emission_foreign_boundary_types,
@@ -1506,9 +1509,131 @@ pure func test_production_emits_canonical_empty_list_from_plan() -> Bool:
 			False
 
 
+pure func test_variant_symbols_are_spelled_from_definition_identity() -> Bool:
+	(
+		variant_constructor_symbol("Circle", Some(0)) == "brp_c_0"
+		and variant_tag_symbol("Shape", "Circle", Some(0)) == "brp_t_0"
+		and variant_constructor_symbol("Circle", Some(62)) == "brp_c_10"
+		and variant_tag_symbol("Shape", "Circle", Some(62)) == "brp_t_10"
+		and variant_constructor_symbol("Circle", Some(3)) != variant_constructor_symbol("Circle", Some(4))
+	)
+
+
+pure func test_variant_without_definition_identity_keeps_source_spelling() -> Bool:
+	(
+		variant_constructor_symbol("Circle", None) == "Circle"
+		and variant_tag_symbol("Shape", "Circle", None) == "TAG_Shape_Circle"
+	)
+
+
+pure func test_variant_symbols_cannot_spell_a_callable() -> Bool:
+	-- A callable is `brp_` followed directly by a base-62 digit; a variant
+	-- symbol has `_` there, so no def id makes the two families meet.
+	var disjoint: Bool = True
+
+	for id in 0..200:
+		disjoint = (
+			disjoint
+			and variant_constructor_symbol("V", Some(id)) != projected_callable_base_symbol(id)
+			and variant_tag_symbol("T", "V", Some(id)) != projected_callable_base_symbol(id)
+			and variant_constructor_symbol("V", Some(id)) != variant_tag_symbol("T", "V", Some(id))
+		)
+
+	disjoint
+
+
+private pure func enum_program_with_variant_symbols(
+	first_symbol: String,
+	second_symbol: String,
+	foreign_name: Option[String],
+) -> CoreProgram:
+	enum_decl: CoreDecl = EnumDecl({
+		abi_type = None,
+		name = "Shade",
+		type_params = [],
+		variants = [
+			{
+				name = "Light",
+				c_name = first_symbol,
+				tag = 0,
+				def_id = Some(7)
+			},
+			{
+				name = "Dark",
+				c_name = second_symbol,
+				tag = 1,
+				def_id = Some(8)
+			},
+		],
+		loc = synthetic_core_source_loc()
+	})
+
+	foreign_decls: List[CoreDecl] = match foreign_name:
+		Some(name):
+			[
+				FunctionDecl({
+					name = "foreign_named_like_variant",
+					source_module = None,
+					type_params = [],
+					params = [],
+					return_type = int_type(),
+					body = None,
+					is_pure = True,
+					function_kind = ForeignFunction({
+						c_name = name,
+						includes = [],
+						link_flags = [],
+						arg_passing = ForeignBorrowArgs,
+					}),
+					def_id = 9,
+					loc = synthetic_core_source_loc(),
+				}),
+			]
+		None:
+			[]
+
+	{
+		decls = [enum_decl].concat(foreign_decls),
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func test_variant_symbol_clashing_with_foreign_name_fails_closed() -> Bool:
+	match prepare_c_emission_symbols(
+		enum_program_with_variant_symbols("brp_c_7", "brp_c_8", Some("brp_c_7")),
+	):
+		Err(VariantSymbolCollision(name)):
+			name == "brp_c_7"
+		_:
+			False
+
+
+pure func test_duplicate_variant_symbols_fail_closed() -> Bool:
+	match prepare_c_emission_symbols(enum_program_with_variant_symbols("brp_c_7", "brp_c_7", None)):
+		Err(VariantSymbolCollision(name)):
+			name == "brp_c_7"
+		_:
+			False
+
+
+pure func test_distinct_variant_symbols_are_accepted() -> Bool:
+	match prepare_c_emission_symbols(enum_program_with_variant_symbols("brp_c_7", "brp_c_8", None)):
+		Ok(_):
+			True
+		_:
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler C symbol projection Tests",
 	tests = [
+		("variant symbols are spelled from definition identity", test_variant_symbols_are_spelled_from_definition_identity),
+		("variant without definition identity keeps source spelling", test_variant_without_definition_identity_keeps_source_spelling),
+		("variant symbols cannot spell a callable", test_variant_symbols_cannot_spell_a_callable),
+		("variant symbol clashing with foreign name fails closed", test_variant_symbol_clashing_with_foreign_name_fails_closed),
+		("duplicate variant symbols fail closed", test_duplicate_variant_symbols_fail_closed),
+		("distinct variant symbols are accepted", test_distinct_variant_symbols_are_accepted),
 		("callable ID contract fixed vectors", test_callable_id_contract_fixed_vectors),
 		(
 			"callable ID contract uses compact portable identifiers",

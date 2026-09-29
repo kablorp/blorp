@@ -3,6 +3,20 @@
 -- Projection happens only after the final Core pipeline has completed. This
 -- module therefore encodes validated artifact-wide definition IDs while
 -- retaining semantic names in every earlier compiler phase.
+--
+-- Compiler-owned C spelling families (all under the `brp_` namespace, kept
+-- disjoint by the character after the prefix; the spellers live in
+-- c_naming.brp):
+--   brp_<b62 def id>    callables (this module)
+--   brp_ty<b62 index>   artifact-local types (this module)
+--   brp_v_<b62 id>      authored locals, brp_vn_<b62 id> minted locals
+--   brp_g...            globals
+--   brp_c_<b62 def id>  union/enum variant constructors and enum constants
+--   brp_t_<b62 def id>  union variant tags
+-- A variant's def id is spelled at Core construction (lowering, monomorphic
+-- data materialization), so the symbol is already in Core when this module
+-- runs; `variant_symbol_collision` rejects a clash with a foreign or exported
+-- name, which cannot be suffixed away like a callable.
 import:
 	../stage_09_core/c_type_layout as TypeLayout
 	../stage_09_core/ir:
@@ -147,6 +161,7 @@ private record CEmissionCallablePlan {
 private record CProgramSymbolInventory {
 	candidates: List[CCallableSymbolCandidate],
 	preserved_names: List[String],
+	variant_symbols: List[String],
 	type_naming: Dict[String, BackendTypeNaming],
 	type_symbol_lookup: Dict[String, String]
 }
@@ -166,6 +181,7 @@ union CSymbolProjectionError:
 	UnprojectedCallableValue(String, Int)
 	InvalidCanonicalEmptyListLayout(String)
 	CanonicalEmptyListSymbolCollision(String)
+	VariantSymbolCollision(String)
 
 
 private record CEmissionSymbolPlanRep {
@@ -659,6 +675,7 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 	var candidates: List[CCallableSymbolCandidate] = []
 	var names: List[String] = ["main", "__blorp_init_globals", "__blorp_drop_globals"]
 	var type_candidates: List[String] = []
+	var variant_symbols: List[String] = []
 
 	names = names.append(BUILTIN_STACK_OPTION_INT128_OPTION_C_TYPE)
 	names = names.append(BUILTIN_STACK_OPTION_UINT128_OPTION_C_TYPE)
@@ -706,11 +723,17 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 					else:
 						void
 
-				-- Variant constructor spellings still carry the type's
-				-- original qualified name baked in from Core lowering; they
-				-- are not re-derived from the projected type symbol here.
+				-- A variant with a definition identity is spelled from it
+				-- (`variant_constructor_symbol`), a family disjoint from callable
+				-- spellings by construction; it is tracked separately and checked
+				-- against every other reserved name in `variant_symbol_collision`.
+				-- One without an identity keeps its source-derived spelling, which
+				-- callables must still avoid.
 				for variant in enum_decl.variants:
-					names = names.append(c_identifier(variant.c_name))
+					if variant.def_id.is_some():
+						variant_symbols = variant_symbols.append(variant.c_name)
+					else:
+						names = names.append(c_identifier(variant.c_name))
 			UnionDecl(union_decl):
 				if union_decl.abi_type.is_none():
 					type_candidates = type_candidates.append(union_decl.name)
@@ -723,8 +746,13 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 					names = names.append(facts.union_destroy_fields_name)
 
 				for variant in union_decl.variants:
-					names = names.append(c_identifier(variant.c_name))
-					names = names.append(c_identifier(variant.tag_c_name))
+					if variant.def_id.is_some():
+						variant_symbols = variant_symbols.append(variant.c_name)
+						variant_symbols = variant_symbols.append(variant.tag_c_name)
+					else:
+						names = names.append(c_identifier(variant.c_name))
+						names = names.append(c_identifier(variant.tag_c_name))
+
 					names = names.append(union_instance_name(variant.c_name))
 					names = names.append(union_init_name(variant.c_name))
 					names = names.append(union_reuse_name(union_decl.name, variant.c_name))
@@ -833,6 +861,7 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 	{
 		candidates = candidates,
 		preserved_names = names,
+		variant_symbols = variant_symbols,
 		type_naming = type_naming,
 		type_symbol_lookup = type_symbol_lookup
 	}
@@ -1226,6 +1255,29 @@ private pure func canonical_empty_list_symbol_collision(
 	collision
 
 
+---
+The first identity-spelled variant symbol that is spelled twice or that
+equals another reserved C name (a foreign or exported declaration, a runtime
+name). Callables step around a reserved name by suffixing; a variant symbol is
+already fixed in Core, so a clash is reported instead.
+---
+private pure func variant_symbol_collision(
+	variant_symbols: List[String],
+	preserved_names: List[String],
+) -> Option[String]:
+	var seen: Dict[String, Bool] = preserved_symbol_index(preserved_names)
+	var collision: Option[String] = None
+
+	for symbol in variant_symbols:
+		if collision.is_none():
+			if seen.contains(symbol):
+				collision = Some(symbol)
+			else:
+				seen = seen.set(symbol, True)
+
+	collision
+
+
 pure func prepare_c_emission_symbols(
 	program: CoreProgram,
 ) -> Result[CEmissionSymbolPlan, CSymbolProjectionError]:
@@ -1235,46 +1287,57 @@ pure func prepare_c_emission_symbols(
 		[]:
 			inventory: CProgramSymbolInventory = program_symbol_inventory(program)
 
-			match build_callable_symbol_plan(inventory.candidates, inventory.preserved_names):
-				Err(error):
+			match variant_symbol_collision(inventory.variant_symbols, inventory.preserved_names):
+				Some(name):
+					Err(VariantSymbolCollision(name))
+				None:
+					prepare_c_emission_symbols_for_inventory(program, inventory)
+
+
+private pure func prepare_c_emission_symbols_for_inventory(
+	program: CoreProgram,
+	inventory: CProgramSymbolInventory,
+) -> Result[CEmissionSymbolPlan, CSymbolProjectionError]:
+	match build_callable_symbol_plan(inventory.candidates, inventory.preserved_names):
+		Err(error):
+			Err(error)
+		Ok(preliminary_plan):
+			validation: CProjectionValidation = validate_program_projection(
+				Some(preliminary_plan),
+				program,
+			)
+
+			match validation.error:
+				Some(error):
 					Err(error)
-				Ok(preliminary_plan):
-					validation: CProjectionValidation = validate_program_projection(
-						Some(preliminary_plan),
-						program,
-					)
-
-					match validation.error:
-						Some(error):
-							Err(error)
+				None:
+					match canonical_empty_list_symbol_collision(
+						validation.canonical_empty_lists,
+						inventory.preserved_names,
+					):
+						Some(name):
+							Err(CanonicalEmptyListSymbolCollision(name))
 						None:
-							match canonical_empty_list_symbol_collision(
-								validation.canonical_empty_lists,
-								inventory.preserved_names,
-							):
-								Some(name):
-									Err(CanonicalEmptyListSymbolCollision(name))
-								None:
-									preserved_names: List[String] = inventory.preserved_names.concat(
-										canonical_empty_list_symbol_names(
-											validation.canonical_empty_lists,
-										),
-									)
+							preserved_names: List[String] = inventory.preserved_names.concat(
+								canonical_empty_list_symbol_names(
+									validation.canonical_empty_lists,
+								),
+							)
 
-									Ok(into_opaque CEmissionSymbolPlan({
-										callables = build_emission_callable_plan(
-											inventory.candidates,
-											preserved_names,
-										),
-										canonical_empty_lists = validation.canonical_empty_lists,
-										foreign_boundary_types = validation.foreign_boundary_types,
-										static_string_literals = finish_backend_static_string_literal_pool(
-											validation.static_string_literal_pool,
-										),
-										preserved_symbol_count = preserved_names.length(),
-										type_naming = inventory.type_naming,
-										type_symbol_lookup = inventory.type_symbol_lookup
-									}))
+							Ok(into_opaque CEmissionSymbolPlan({
+								callables = build_emission_callable_plan(
+									inventory.candidates,
+									preserved_names,
+								),
+								canonical_empty_lists = validation.canonical_empty_lists,
+								foreign_boundary_types = validation.foreign_boundary_types,
+								static_string_literals = finish_backend_static_string_literal_pool(
+									validation.static_string_literal_pool,
+								),
+								preserved_symbol_count = preserved_names.length(),
+								type_naming = inventory.type_naming,
+								type_symbol_lookup = inventory.type_symbol_lookup
+							}))
 
 
 pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
@@ -1305,3 +1368,5 @@ pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
 			"invalid canonical empty list layout: ${detail}"
 		CanonicalEmptyListSymbolCollision(name):
 			"canonical empty list symbol `${name}` conflicts with an existing C symbol"
+		VariantSymbolCollision(name):
+			"variant symbol `${name}` conflicts with an existing C symbol or another variant"

@@ -79,6 +79,10 @@ global (`brp_g...`), or field (`f<N>`/`field<N>`) grammars, by first occurrence
 per family. Local/temp/type/global ordinals reset at each top-level
 brace-enclosed body (approximating per-function scope); field ordinals are
 file-wide, since record members are referenced across many function bodies.
+Union/enum variant symbols are also normalized file-wide, as substrings of an
+identifier (they appear inside `__instance_<ctor>`, `__init_<ctor>` and
+`__blorp_reuse_<Type>_<ctor>`): a constructor is `brp_c_<id>` or the older
+`__def_<id>_<Variant>`, a tag is `brp_t_<id>` or the older `TAG_<Type>_<Variant>`.
 This is weaker than a sidecar: it has no owner/scope information, so it
 cannot tell two different bindings that happen to alternate spellings apart,
 and it matches identifiers by spelling alone regardless of C role (a field
@@ -639,6 +643,19 @@ PROJECT_LOCALS_PER_BODY_GRAMMARS = {
 PROJECT_LOCALS_FILE_WIDE_GRAMMARS = {
     "field": GENERATED_GRAMMARS["field"],
 }
+# Union/enum variant symbols. A variant symbol is a program-wide name that also
+# appears inside derived identifiers (`__instance_<ctor>`, `__init_<ctor>`,
+# `__blorp_reuse_<Type>_<ctor>`), so these grammars are matched as substrings
+# of an identifier, file-wide. Each family accepts both the id-derived spelling
+# (`brp_c_<b62 def id>` constructor, `brp_t_<b62 def id>` tag) and the
+# name-derived spelling it replaced (`__def_<id>_<Variant>`,
+# `TAG_<Type>_<Variant>`), so a parent using the old spelling normalizes
+# against a candidate using the new one. A variant with no definition identity
+# keeps the old spelling in both trees and normalizes with itself.
+PROJECT_LOCALS_VARIANT_SUBSTRING_GRAMMARS = {
+    "variant_constructor": re.compile(r"__def_[0-9]+_[A-Za-z0-9_]*|brp_c_[A-Za-z0-9]+"),
+    "variant_tag": re.compile(r"(?<![A-Za-z0-9_])(?:TAG_[A-Za-z0-9_]+|brp_t_[A-Za-z0-9]+)"),
+}
 
 
 def project_locals(text: str) -> str:
@@ -683,6 +700,16 @@ def project_locals(text: str) -> str:
                     if grammar.fullmatch(whole):
                         occurrences.append((-1, family, whole, lexeme.span()))
                         break
+                else:
+                    identifier_start = lexeme.start()
+                    for family, grammar in PROJECT_LOCALS_VARIANT_SUBSTRING_GRAMMARS.items():
+                        for found in grammar.finditer(whole):
+                            occurrences.append((
+                                -1,
+                                family,
+                                found.group(0),
+                                (identifier_start + found.start(), identifier_start + found.end()),
+                            ))
     first_seen: dict[tuple[int, str, str], int] = {}
     for scope, family, whole, span in occurrences:
         key = (scope, family, whole)

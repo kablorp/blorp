@@ -569,6 +569,34 @@ class GeneratedCSymbolTests(unittest.TestCase):
         # A callable whose base-62 id starts with `v` is not a local.
         self.assertIn("brp_v3K", normalizer.project_locals("void brp_v3K(void);"))
 
+    def test_project_locals_maps_old_and_new_variant_spellings_to_one_family(self):
+        parent = (
+            "#define TAG_Shape_Circle 0\n#define TAG_Shape_Sq 1\n"
+            "Shape* __def_45_Circle(void* field0) { __vc->tag = TAG_Shape_Circle; }\n"
+            "static Shape __instance___def_46_Sq;\n"
+            "static inline Shape* __blorp_reuse_Shape___def_45_Circle(Shape* __old) {\n"
+            "  if (x.tag == BLORP_TAG_SOME) return __def_45_Circle(0); }\n"
+        )
+        candidate = (
+            "#define brp_t_cU 0\n#define brp_t_cV 1\n"
+            "Shape* brp_c_cU(void* field0) { __vc->tag = brp_t_cU; }\n"
+            "static Shape __instance_brp_c_cV;\n"
+            "static inline Shape* __blorp_reuse_Shape_brp_c_cU(Shape* __old) {\n"
+            "  if (x.tag == BLORP_TAG_SOME) return brp_c_cU(0); }\n"
+        )
+        self.assertEqual(normalizer.project_locals(parent), normalizer.project_locals(candidate))
+        normalized = normalizer.project_locals(candidate)
+        # A runtime tag macro is not a variant tag.
+        self.assertIn("BLORP_TAG_SOME", normalized)
+        self.assertIn("@@project:variant_constructor:-1:0@@", normalized)
+        self.assertIn("@@project:variant_constructor:-1:1@@", normalized)
+        self.assertIn("@@project:variant_tag:-1:1@@", normalized)
+
+    def test_project_locals_distinguishes_variants_that_swap_order(self):
+        first = "void f(void) { brp_c_a(); brp_c_b(); brp_c_a(); }\n"
+        second = "void f(void) { brp_c_a(); brp_c_b(); brp_c_b(); }\n"
+        self.assertNotEqual(normalizer.project_locals(first), normalizer.project_locals(second))
+
     def test_local_families_accept_binder_id_spellings_and_keep_owner_forms(self):
         for kind in ("local_argument", "local_source_binder"):
             grammar = normalizer.GENERATED_GRAMMARS[kind]

@@ -24,6 +24,7 @@ import:
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
 		CoreConstructorMatchTest(StackOptionSomeConstructorTest, UnionTagConstructorTest),
+		CoreDecl(UnionDecl),
 		CoreDictEntry,
 		CoreExpr(
 			AssignExpr,
@@ -832,12 +833,36 @@ private pure func stack_option_match_parts(
 		Some(c_type):
 			Some((StackOptionSomeConstructorTest(c_type), StackOptionPayloadAccessor(RootAccessor)))
 		None:
-			Some(
-				(
-					UnionTagConstructorTest("TAG_Option_Some", "Option"),
-					VariantFieldAccessor(RootAccessor, "Option", "Some", 0),
-				),
-			)
+			boxed_option_some_match_parts(layout)
+
+
+---
+The `Some` test and payload accessor for an `Option` whose layout is the
+general tagged union. The tag macro belongs to the `Option` declaration's
+`Some` variant, so it is read from there rather than respelled here; `None`
+when the program declares no such variant.
+---
+private pure func boxed_option_some_match_parts(
+	layout: CoreSpecializeLayout,
+) -> Option[(CoreConstructorMatchTest, CoreAccessor)]:
+	var result: Option[(CoreConstructorMatchTest, CoreAccessor)] = None
+
+	for decl in layout.program.decls:
+		match decl:
+			UnionDecl(union_decl):
+				if union_decl.name == "Option":
+					for variant in union_decl.variants:
+						if variant.name == "Some":
+							result = Some(
+								(
+									UnionTagConstructorTest(variant.tag_c_name, "Option"),
+									VariantFieldAccessor(RootAccessor, "Option", "Some", 0),
+								),
+							)
+			_:
+				void
+
+	result
 
 
 private pure func list_filter_map_fallback(
@@ -845,6 +870,20 @@ private pure func list_filter_map_fallback(
 	self: CoreExpr,
 	function_expr: CoreExpr,
 	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	result_element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
+	match_parts ?= stack_option_match_parts(layout, result_element_type)
+
+	Some(list_filter_map_loop(layout, self, function_expr, result_type, match_parts, loc))
+
+
+private pure func list_filter_map_loop(
+	layout: CoreSpecializeLayout,
+	self: CoreExpr,
+	function_expr: CoreExpr,
+	result_type: CoreType,
+	match_parts: (CoreConstructorMatchTest, CoreAccessor),
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	source_type: CoreType = core_expr_type(self)
@@ -881,15 +920,6 @@ private pure func list_filter_map_fallback(
 			),
 			VoidType,
 			loc,
-		),
-	)
-	match_parts: (CoreConstructorMatchTest, CoreAccessor) = stack_option_match_parts(
-		layout,
-		result_element_type,
-	).get_or(
-		(
-			UnionTagConstructorTest("TAG_Option_Some", "Option"),
-			VariantFieldAccessor(RootAccessor, "Option", "Some", 0),
 		),
 	)
 	match_mapped: CoreExpr = ConstructorMatchExpr(
@@ -1196,7 +1226,7 @@ private pure func specialize_collection_call(
 					args.get_or(1, void_expr(loc)),
 					result_type,
 					loc,
-				)
+				).get_or(original)
 	else if list_parallel_map_arity(name, args.length()):
 		element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
 		append_release_flag(
