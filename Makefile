@@ -511,6 +511,7 @@ hygiene-check: build-blorp-cli
 	@scripts/check-c-symbol-projection-boundary
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
+	@python3 scripts/check-magic-spellings
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py

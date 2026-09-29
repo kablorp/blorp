@@ -665,6 +665,15 @@ the native Blorp file type, token lexer/parser, TextMate highlighter bridge, LSP
 provider, goto handler, and bundled TextMate grammar. It builds the default
 plugin zip before checking; pass a zip path to inspect an existing package.
 
+`scripts/check-magic-spellings` fails when a reader or producer of a name's
+prefix, suffix or embedded number (`starts_with`, `parse_int`, `__mono_`
+concatenation and the named accessors) appears that is not in
+`scripts/check-magic-spellings.allowlist`. `--report` prints per-family counts
+and `--update` regenerates the allowlist after a deletion; the families and
+their replacements are in
+`benchmarks/results/magic_spelling_census_2026-09-28.md`. `make hygiene-check`
+runs it.
+
 `scripts/check-std-builtins` verifies that standalone standard-library function builtin
 bodies use explicit identities matching their source declaration, for example
 `builtin("list.__unsafe_list_set_index")`. Bare `builtin` function bodies are not
