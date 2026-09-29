@@ -14,12 +14,18 @@ import:
 	../lib/source: SourceFile
 	frontend_output: typed_program_summary
 	frontend_request: FrontendCompilationGraph
+	io: print_error
 	path: dirname
-	stage_02_lex/name_table: EMPTY_NAME_TABLE, NameTable, SYNTHESIZED_NAME_TABLE
+	stage_02_lex/name_table:
+		EMPTY_NAME_TABLE,
+		NameTable,
+		SYNTHESIZED_NAME_TABLE,
+		name_table_count,
 	stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
 	stage_03_parse/language_parser: parse_compiler_source, parse_compiler_source_with_names
 	stage_03_parse/parsed_ast: ParsedProgram
 	stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_with_names,
 	stage_04_modules/frontend_graph:
@@ -31,6 +37,7 @@ import:
 		frontend_graph_module_ids,
 		frontend_graph_module_table,
 		frontend_graph_modules,
+		frontend_graph_name_table,
 		frontend_graph_root_ids,
 		frontend_graph_root_modules,
 	stage_04_modules/frontend_graph_service:
@@ -65,6 +72,12 @@ import:
 		FrontendTypecheckRequestError,
 		typecheck_frontend_graph_direct,
 		typecheck_request_for_frontend_module,
+	stage_06_typecheck/typed_name_identity:
+		NAME_IDENTITY_CENSUS_EMPTY,
+		NameIdentityCensus,
+		name_identity_census_sum,
+		name_identity_census_violations,
+		typed_program_name_identity_census,
 	stage_06_typecheck/graph/definition_index:
 		DefinitionTable,
 		definition_id_runtime_value,
@@ -138,6 +151,7 @@ import:
 		core_emit_error_message,
 		try_emit_prepared_core_program_c_artifact_with_profile_and_indentation,
 		try_emit_prepared_core_program_c_split_artifact_with_profile_and_indentation,
+	system: getenv
 
 
 private record DiscoveredFrontendSource {
@@ -147,9 +161,37 @@ private record DiscoveredFrontendSource {
 
 
 ---
-Parses (or accepts an already-finalized) source and folds any new spelling
-it adds into `names`, the compilation name table so far, so every file
-discovery walks contributes to the same running table.
+Accepts a caller-finalized program, which discovery must retain as given (it
+may carry compiler-owned import rewrites that its source text no longer
+shows). Its identifiers' ids index the single-file table it was parsed with
+(`parse_compiler_source`, from `SYNTHESIZED_NAME_TABLE`), so they are the
+compilation's ids only when discovery is still at that same starting table --
+the first candidate. Then the accumulator adopts the table that parse built,
+re-derived here by parsing the program's own source (deterministic, so the ids
+match, hole-introduced ones included) and dropping the program. A finalized
+program that is not first has ids from a table the accumulator no longer
+equals; they are kept as given, and the name-identity check
+(`BLORP_NAME_IDENTITY`) reports them as mismatched.
+---
+private pure func finalized_source_with_names(
+	finalized_program: FinalizedTypecheckProgram,
+	names: NameTable,
+) -> (FinalizedTypecheckProgram, NameTable):
+	if name_table_count(names) == name_table_count(SYNTHESIZED_NAME_TABLE):
+		(parsed, parsed_names) = parse_compiler_source_with_names(
+			finalized_typecheck_program_ast(finalized_program).source,
+			names,
+		)
+		(_, extended_names) = finalized_typecheck_program_with_names(parsed, parsed_names)
+		(finalized_program, extended_names)
+	else:
+		(finalized_program, names)
+
+
+---
+Parses and finalizes one candidate and folds every spelling it adds (its own
+lex and its interpolation holes) into `names`, the compilation name table so
+far, so every file discovery walks contributes to the same running table.
 ---
 private pure func discover_frontend_source(
 	candidate: FrontendSourceCandidate,
@@ -157,15 +199,20 @@ private pure func discover_frontend_source(
 ) -> (DiscoveredFrontendSource, NameTable):
 	(program, next_names) = match candidate.input:
 		RawFrontendSource(source):
-			(parsed, updated_names) = parse_compiler_source_with_names(source, names)
-			(finalized_typecheck_program_with_names(parsed, updated_names), updated_names)
-		FinalizedFrontendSource(program):
-			-- Identifiers of a program parsed before discovery carry ids from
-			-- a private table, so fold its declared spellings into the
+			(parsed, parsed_names) = parse_compiler_source_with_names(source, names)
+			-- Interpolation holes may add spellings after the file's own lex; the
+			-- finalize step returns the table extended with them.
+			finalized_typecheck_program_with_names(parsed, parsed_names)
+		FinalizedFrontendSource(finalized_program):
+			(retained, adopted_names) = finalized_source_with_names(finalized_program, names)
+			-- Whatever ids the program carries, fold its declared spellings into the
 			-- compilation table for the typechecker's by-spelling lookups.
 			(
-				program,
-				name_table_with_declared_names(names, [finalized_typecheck_program_ast(program)]),
+				retained,
+				name_table_with_declared_names(
+					adopted_names,
+					[finalized_typecheck_program_ast(retained)],
+				),
 			)
 
 	(
@@ -844,6 +891,59 @@ func compile_frontend_graph(
 	)
 
 
+private func name_identity_mode() -> Option[String]:
+	getenv("BLORP_NAME_IDENTITY")
+
+
+---
+The name-identity census (`typed_name_identity.brp`) over every typed module,
+run only when `BLORP_NAME_IDENTITY` is `report` (counts on stderr) or `strict`
+(counts, and any unresolved or mismatched identifier fails the compilation).
+Off by default: it walks every typed expression.
+---
+private func check_typed_name_identity(
+	graph: FrontendGraph,
+	typechecked: TypecheckedGraph,
+) -> List[String]:
+	mode = name_identity_mode()
+
+	if mode != Some("report") and mode != Some("strict"):
+		[]
+	else:
+		names = frontend_graph_name_table(graph)
+		var census: NameIdentityCensus = NAME_IDENTITY_CENSUS_EMPTY
+
+		for module in typechecked.modules.append(typechecked.target):
+			census = name_identity_census_sum(
+				census,
+				typed_program_name_identity_census(
+					names,
+					typechecked_module_program_with_ctfe_replacements(module),
+				),
+			)
+
+		print_error(
+			"name identity: resolved="
+			+ census.resolved.to_string()
+			+ " unresolved="
+			+ census.unresolved.to_string()
+			+ " mismatched="
+			+ census.mismatched.to_string(),
+		)
+
+		for example in census.violation_examples:
+			print_error("name identity:   " + example)
+
+		if mode == Some("strict") and name_identity_census_violations(census) != 0:
+			[
+				"name identity: "
+				+ name_identity_census_violations(census).to_string()
+				+ " identifiers do not resolve in the compilation name table",
+			]
+		else:
+			[]
+
+
 func run_typed_frontend_compilation(
 	graph: FrontendCompilationGraph,
 	policy: FrontendCompilePolicy,
@@ -879,7 +979,9 @@ func run_typed_frontend_compilation(
 					if errors.length() != 0:
 						Err(errors)
 					else:
-						validation_errors: List[String] = validate(typechecked)
+						validation_errors: List[String] = validate(typechecked).concat(
+							check_typed_name_identity(graph.graph, typechecked),
+						)
 
 						if validation_errors.length() != 0:
 							Err(validation_errors)

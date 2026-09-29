@@ -1,0 +1,205 @@
+-- Name-identity census over typed programs.
+--
+-- Every `ParsedIdentifier` carries a `NameId` into the compilation's name
+-- table (docs/CORE_ID_MIGRATION.md). This census walks the identifiers a typed
+-- program stores directly and reports how many resolve to their own spelling
+-- through that table, so the identifiers that still carry a placeholder id
+-- (`name_id_pending_dynamic_intern`) or a wrong one are counted rather than
+-- silently trusted. Report-only, like the binder identity contract: the
+-- pipeline runs it only when `BLORP_NAME_IDENTITY` is set (`report` prints the
+-- counts to stderr, `strict` also fails the compilation on any unresolved or
+-- mismatched identifier), so an ordinary compilation pays nothing for it.
+--
+-- Coverage: the identifiers stored directly on typed expression nodes (names,
+-- field accesses and record fields, assignments, tuple destructuring,
+-- question binds, lambda parameters, concurrent-for names, local
+-- declarations) and the names of function and global declarations. Pattern
+-- binders, for-loop binders, and parameter binders are not walked.
+import:
+	../stage_02_lex/name_table: NameTable, name_spelling
+	../stage_03_parse/parsed_ast: ParsedIdentifier
+	decl:
+		TypedDecl(TypedGlobalVarDecl, TypedPrivateDecl),
+		TypedProgram,
+		typed_decl_function_infos,
+	graph/typed_expr_children: typed_expr_children
+	infer:
+		TypedExpr(
+			TypedAssignExpr,
+			TypedConcurrentForExpr,
+			TypedFieldAccessExpr,
+			TypedLambdaExpr,
+			TypedNameExpr,
+			TypedQuestionBindExpr,
+			TypedRecordExpr,
+			TypedRecordUpdateExpr,
+			TypedTupleDestructExpr,
+			TypedVarDeclExpr,
+		),
+
+
+---
+How the walked identifiers resolved: `resolved` carry an id whose spelling in
+the table is the identifier's own text, `unresolved` carry an id the table
+has no spelling for (the pending placeholder among them), and `mismatched`
+carry an id that resolves to a different spelling than their text.
+---
+record NameIdentityCensus {
+	resolved: Int,
+	unresolved: Int,
+	mismatched: Int,
+	violation_examples: List[String]
+}
+
+
+NAME_IDENTITY_CENSUS_EMPTY: NameIdentityCensus = {
+	resolved = 0,
+	unresolved = 0,
+	mismatched = 0,
+	violation_examples = []
+}
+
+private MAX_VIOLATION_EXAMPLES: Int = 12
+
+
+pure func name_identity_census_sum(
+	left: NameIdentityCensus,
+	right: NameIdentityCensus,
+) -> NameIdentityCensus:
+	{
+		resolved = left.resolved + right.resolved,
+		unresolved = left.unresolved + right.unresolved,
+		mismatched = left.mismatched + right.mismatched,
+		violation_examples = left.violation_examples.concat(right.violation_examples)
+	}
+
+
+pure func name_identity_census_violations(census: NameIdentityCensus) -> Int:
+	census.unresolved + census.mismatched
+
+
+private pure func census_with_example(census: NameIdentityCensus, example: String) -> List[String]:
+	if census.violation_examples.length() < MAX_VIOLATION_EXAMPLES:
+		census.violation_examples.append(example)
+	else:
+		census.violation_examples
+
+
+private pure func census_identifier(
+	names: NameTable,
+	census: NameIdentityCensus,
+	identifier: ParsedIdentifier,
+) -> NameIdentityCensus:
+	match name_spelling(names, identifier.name):
+		Some(spelling):
+			if spelling == identifier.text:
+				{ census | resolved = census.resolved + 1 }
+			else:
+				{ census |
+					mismatched = census.mismatched + 1,
+					violation_examples = census_with_example(
+						census,
+						"mismatched `" + identifier.text + "` resolves to `" + spelling + "`",
+					)
+				}
+		None:
+			{ census |
+				unresolved = census.unresolved + 1,
+				violation_examples = census_with_example(
+					census,
+					"unresolved `" + identifier.text + "`",
+				)
+			}
+
+
+private pure func typed_expr_own_identifiers(expr: TypedExpr) -> List[ParsedIdentifier]:
+	match expr:
+		TypedNameExpr(identifier, _):
+			[identifier]
+		TypedTupleDestructExpr(identifiers, _, _, _):
+			identifiers
+		TypedAssignExpr(identifier, _, _, _, _):
+			[identifier]
+		TypedRecordExpr(fields, _, _):
+			fields.map(func(field): field.name)
+		TypedRecordUpdateExpr(_, fields, _, _, _):
+			fields.map(func(field): field.name)
+		TypedFieldAccessExpr(_, identifier, _, _, _):
+			[identifier]
+		TypedLambdaExpr(_, params, _, _, _, _):
+			params.map(func(param): param.name)
+		TypedConcurrentForExpr(identifier, _, _, _, _, _):
+			[identifier]
+		TypedQuestionBindExpr(identifier, _, _, _, _):
+			[identifier]
+		TypedVarDeclExpr(payload, _):
+			[payload.name]
+		_:
+			[]
+
+
+---
+The census of one expression tree. Iterative over a work list rather than
+recursive, so a deep generated spine cannot overflow the stack.
+---
+private pure func census_expr_tree(
+	names: NameTable,
+	root: TypedExpr,
+) -> NameIdentityCensus:
+	var census: NameIdentityCensus = NAME_IDENTITY_CENSUS_EMPTY
+	var pending: List[TypedExpr] = [root]
+	var next_index: Int = 0
+
+	while next_index < pending.length():
+		match pending.get(next_index):
+			Some(expr):
+				for identifier in typed_expr_own_identifiers(expr):
+					census = census_identifier(names, census, identifier)
+
+				pending = pending.concat(typed_expr_children(expr))
+			None:
+				void
+
+		next_index += 1
+
+	census
+
+
+private pure func census_decl(
+	names: NameTable,
+	decl: TypedDecl,
+) -> NameIdentityCensus:
+	match decl:
+		TypedGlobalVarDecl(info):
+			census_identifier(
+				names,
+				census_expr_tree(names, info.value),
+				info.decl.name,
+			)
+		TypedPrivateDecl(inner):
+			census_decl(names, inner)
+		_:
+			var census: NameIdentityCensus = NAME_IDENTITY_CENSUS_EMPTY
+
+			for info in typed_decl_function_infos(decl):
+				census = census_identifier(names, census, info.decl.name)
+
+				match info.body:
+					Some(body):
+						census = name_identity_census_sum(census, census_expr_tree(names, body))
+					None:
+						void
+
+			census
+
+
+pure func typed_program_name_identity_census(
+	names: NameTable,
+	program: TypedProgram,
+) -> NameIdentityCensus:
+	var census: NameIdentityCensus = NAME_IDENTITY_CENSUS_EMPTY
+
+	for decl in program.decls:
+		census = name_identity_census_sum(census, census_decl(names, decl))
+
+	census

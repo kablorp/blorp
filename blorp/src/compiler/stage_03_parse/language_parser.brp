@@ -15,12 +15,10 @@ import:
 		source_span,
 	../stage_02_lex/lexer: lex
 	../stage_02_lex/name_table:
-		EMPTY_NAME_TABLE,
 		NameId,
 		NameTable,
 		SYNTHESIZED_NAME_TABLE,
 		name_id_from_interned_index,
-		name_id_pending_dynamic_intern,
 		name_ids_equal,
 		name_table_dict,
 		name_table_find_id,
@@ -346,20 +344,6 @@ private pure func parsed_string_literal_form(kind: StringLiteralKind) -> ParsedS
 
 
 ---
-Where a `ParsedIdentifier`'s `NameId` comes from. A normal parse lexes against
-the compilation table, so an identifier token's payload already is its id.
-An interpolation hole is lexed against a private empty table (its
-identifiers sit inside a string token the compilation lexer never saw, and
-appending to the compilation table here would copy it), so its payloads mean
-nothing globally: `ResolveSpelling` looks each spelling up read-only in the
-compilation table and yields the pending id on a miss.
----
-private union NameIdSource:
-	TokenPayloadIds
-	ResolveSpelling(NameTable)
-
-
----
 Token storage as columns (struct of arrays) instead of a `List[Token]`
 (array of structs): reading one field of one token -- the common case,
 several times per parse decision -- is one scalar list index instead
@@ -379,8 +363,7 @@ private record ParserInput {
 	end_lines: List[Int],
 	end_columns: List[Int],
 	texts: List[String],
-	names: NameTable,
-	id_source: NameIdSource
+	names: NameTable
 }
 
 
@@ -858,7 +841,6 @@ private pure func initial_state(
 	path: String,
 	module_name: String,
 	location_offset_delta: Int,
-	id_source: NameIdSource,
 ) -> ParserInput:
 	capacity: Int = tokens.length()
 	var tags: List[TokenTag] = list(capacity)
@@ -893,8 +875,7 @@ private pure func initial_state(
 		end_lines = end_lines,
 		end_columns = end_columns,
 		texts = texts,
-		names = names,
-		id_source = id_source
+		names = names
 	}
 
 
@@ -1062,49 +1043,55 @@ private pure func current_text(state: ParserInput, index: Int) -> String:
 	)
 
 
-private pure func spelling_lookup_table(state: ParserInput) -> NameTable:
-	match state.id_source:
-		TokenPayloadIds:
-			state.names
-		ResolveSpelling(compilation_names):
-			compilation_names
-
-
+---
+The id of a spelling the lexer or the seeded synthesized vocabulary put in
+`state.names`. Every caller passes a spelling that is there by construction
+(an identifier token's own text, `#` + an identifier the lexer joined, or a
+`name_table_synthesized_spellings()` entry), so this is a read-only lookup.
+A miss means a caller parsed against a table that was not seeded from
+`SYNTHESIZED_NAME_TABLE`; it resolves to the id of `""` (the first seeded
+spelling) and the name-identity check reports the text/id mismatch.
+---
 private pure func resolve_spelling_id(state: ParserInput, spelling: String) -> NameId:
-	match name_table_dict(spelling_lookup_table(state)).get(spelling):
+	match name_table_dict(state.names).get(spelling):
 		Some(index):
 			name_id_from_interned_index(index)
 		None:
-			name_id_pending_dynamic_intern()
+			name_id_from_interned_index(0)
 
 
 ---
 Builds a `ParsedIdentifier` for the token at `index`, an `IdentifierTag`
 token whose payload the lexer already assigned from this same compilation's
 name table (`name_table_intern`, during lexing) -- so the payload already
-*is* the spelling's `NameId` index and no table lookup is needed here (an
-interpolation hole resolves by spelling instead; see `NameIdSource`).
+*is* the spelling's `NameId` index and no table lookup is needed here. An
+interpolation hole is lexed against the same accumulator (see
+`parse_interpolation_hole_source`), so its tokens satisfy this too.
 ---
 private pure func identifier_at_token(
 	state: ParserInput,
 	index: Int,
 	span: SourceLocation,
 ) -> ParsedIdentifier:
-	spelling: String = current_text(state, index)
+	parsed_identifier(
+		name_id_from_interned_index(current_payload(state, index)),
+		current_text(state, index),
+		span,
+	)
 
-	match state.id_source:
-		TokenPayloadIds:
-			parsed_identifier(
-				name_id_from_interned_index(current_payload(state, index)),
-				spelling,
-				span,
-			)
-		ResolveSpelling(_):
-			parsed_identifier(
-				resolve_spelling_id(state, spelling),
-				spelling,
-				span,
-			)
+
+---
+Builds the `#N` identifier for the `IdentifierTag` token at `index` (the
+token after a `#`). The lexer interned the joined spelling beside `N` when it
+saw the `#` (`last_token_is_hash`), so this is a read-only lookup.
+---
+private pure func hash_identifier_at_token(
+	state: ParserInput,
+	index: Int,
+	span: SourceLocation,
+) -> ParsedIdentifier:
+	spelling: String = "#" + current_text(state, index)
+	parsed_identifier(resolve_spelling_id(state, spelling), spelling, span)
 
 
 ---
@@ -1136,7 +1123,7 @@ private pure func identifier_is_underscore(
 	state: ParserInput,
 	identifier: ParsedIdentifier,
 ) -> Bool:
-	match name_table_find_id(spelling_lookup_table(state), "_"):
+	match name_table_find_id(state.names, "_"):
 		Some(underscore_id):
 			name_ids_equal(identifier.name, underscore_id)
 		None:
@@ -1835,9 +1822,9 @@ private pure func parse_hash_identifier_expected(
 			{
 				index = advance_parser(state, st),
 				diagnostics = st_diag,
-				value = parsed_identifier(
-					name_id_pending_dynamic_intern(),
-					"#" + current_text(state, st),
+				value = hash_identifier_at_token(
+					state,
+					st,
 					location_cover(
 						start_span,
 						current_location(state, st),
@@ -1901,9 +1888,9 @@ private pure func parse_dim_hash_suffix(
 	match current_tag(state, st_in):
 		IdentifierTag:
 			var st: Int = st_in
-			name: ParsedIdentifier = parsed_identifier(
-				name_id_pending_dynamic_intern(),
-				"#" + current_text(state, st),
+			name: ParsedIdentifier = hash_identifier_at_token(
+				state,
+				st,
 				location_cover(
 					start_span,
 					current_location(state, st),
@@ -7660,7 +7647,6 @@ pure func raw_expression_parser_checkpoint(
 		lex_result.path,
 		lex_result.module_name,
 		0,
-		TokenPayloadIds,
 	)
 	step = parse_expression_with_header_span(
 		state,
@@ -7690,7 +7676,6 @@ pure func raw_expression_parser_batch_checkpoint(
 		lex_result.path,
 		lex_result.module_name,
 		0,
-		TokenPayloadIds,
 	)
 	var indices: List[Int] = []
 	var diagnostics = lex_result.diagnostics
@@ -10011,11 +9996,10 @@ extended with any spelling this file adds, so a caller that threads one
 table across every file in a compilation (source discovery) gets ids
 shared across files with no remap step.
 ---
-private pure func parse_program_with_id_source(
+pure func parse_compiler_source_rebased_with_names(
 	source: SourceFile,
 	location_offset_delta: Int,
 	names: NameTable,
-	id_source: NameIdSource,
 ) -> (ParsedProgram, NameTable):
 	lex_result = lex(source, names)
 	state: ParserInput = initial_state(
@@ -10026,7 +10010,6 @@ private pure func parse_program_with_id_source(
 		lex_result.path,
 		lex_result.module_name,
 		location_offset_delta,
-		id_source,
 	)
 	var index: Int = skip_newlines(state, 0)
 	var diagnostics: List[ParseDiagnostic] = lex_result.diagnostics
@@ -10049,14 +10032,6 @@ private pure func parse_program_with_id_source(
 		}, lex_result.names)
 
 
-pure func parse_compiler_source_rebased_with_names(
-	source: SourceFile,
-	location_offset_delta: Int,
-	names: NameTable,
-) -> (ParsedProgram, NameTable):
-	parse_program_with_id_source(source, location_offset_delta, names, TokenPayloadIds)
-
-
 pure func parse_compiler_source_rebased(
 	source: SourceFile,
 	location_offset_delta: Int,
@@ -10070,24 +10045,19 @@ pure func parse_compiler_source_rebased(
 
 
 ---
-Parses one interpolation hole's wrapper source. The hole is lexed against a
-private empty table (see `NameIdSource`), so nothing is appended to and
-nothing is copied from `compilation_names`; each hole identifier resolves by
-spelling through a read-only `name_table_find_id`-style lookup and is the
-pending id on a miss. `.text` stays authoritative for those.
+Parses one interpolation hole's wrapper source against the compilation name
+table and returns the table extended with any spelling the hole introduces
+(a lambda parameter that appears nowhere else, for example), so hole
+identifiers carry real compilation ids exactly like identifiers outside
+holes. The caller (`finalize_interpolation_expr`) threads the returned table
+on to the next hole and finally back to discovery.
 ---
 pure func parse_interpolation_hole_source(
 	source: SourceFile,
 	location_offset_delta: Int,
 	compilation_names: NameTable,
-) -> ParsedProgram:
-	(program, _) = parse_program_with_id_source(
-		source,
-		location_offset_delta,
-		EMPTY_NAME_TABLE,
-		ResolveSpelling(compilation_names),
-	)
-	program
+) -> (ParsedProgram, NameTable):
+	parse_compiler_source_rebased_with_names(source, location_offset_delta, compilation_names)
 
 
 pure func parse_compiler_source(source: SourceFile) -> ParsedProgram:

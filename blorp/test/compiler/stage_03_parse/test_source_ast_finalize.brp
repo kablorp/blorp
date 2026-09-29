@@ -1,8 +1,10 @@
 import:
 	../../../src/compiler/stage_02_lex/name_table:
+		NameId,
 		SYNTHESIZED_NAME_TABLE,
-		name_id_pending_dynamic_intern,
 		name_ids_equal,
+		name_spelling,
+		name_table_count,
 		name_table_find_id,
 	../../../src/compiler/stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
 	../../../src/compiler/stage_03_parse/language_parser:
@@ -283,23 +285,75 @@ func test_split_interpolated_string_reports_unclosed_expr() -> Bool:
 			diagnostic.message.contains("Unclosed")
 
 
-func test_finalize_interpolation_hole_ids_resolve_against_compilation_table() -> Bool:
+func test_finalize_interpolation_hole_ids_extend_compilation_table() -> Bool:
 	program_source: String = "func message(name: String): \"" + "$" + "{name} " + "$" + "{missing_name}\""
 	(parsed, names) = parse_compiler_source_with_names(
 		source(program_source),
 		SYNTHESIZED_NAME_TABLE,
 	)
-	program: ParsedProgram = finalize_interpolation_program_with_names(parsed, names)
+	(program, extended_names) = finalize_interpolation_program_with_names(parsed, names)
 
-	match (first_function_body(program), name_table_find_id(names, "name")):
-		(Some(ParsedStringInterpolationPartsExpr(parts, _, _)), Some(name_id)):
+	match (
+		first_function_body(program),
+		name_table_find_id(names, "name"),
+		name_table_find_id(extended_names, "missing_name"),
+		name_table_find_id(names, "missing_name"),
+	):
+		(Some(ParsedStringInterpolationPartsExpr(parts, _, _)), Some(name_id), Some(missing_id), None):
 			match (parts.get(0), parts.get(2)):
 				(Some(ParsedInterpolationExpr(ParsedNameExpr(known))), Some(ParsedInterpolationExpr(ParsedNameExpr(unknown)))):
 					(
 						name_ids_equal(known.name, name_id)
-						and name_ids_equal(unknown.name, name_id_pending_dynamic_intern())
+						and name_ids_equal(unknown.name, missing_id)
+						and name_table_count(extended_names) > name_table_count(names)
 					)
 				_:
+					False
+		_:
+			False
+
+
+func test_finalize_interpolation_holes_share_one_id_for_a_new_spelling() -> Bool:
+	program_source: String = "func message(): \"" + "$" + "{fresh_one} " + "$" + "{fresh_one} " + "$" + "{fresh_two}\""
+	(parsed, names) = parse_compiler_source_with_names(
+		source(program_source),
+		SYNTHESIZED_NAME_TABLE,
+	)
+	(program, extended_names) = finalize_interpolation_program_with_names(parsed, names)
+
+	match first_function_body(program):
+		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
+			match (parts.get(0), parts.get(2), parts.get(4)):
+				(
+					Some(ParsedInterpolationExpr(ParsedNameExpr(first))),
+					Some(ParsedInterpolationExpr(ParsedNameExpr(again))),
+					Some(ParsedInterpolationExpr(ParsedNameExpr(second))),
+				):
+					(
+						name_ids_equal(first.name, again.name)
+						and not name_ids_equal(first.name, second.name)
+						and name_spelling(extended_names, first.name) == Some("fresh_one")
+						and name_spelling(extended_names, second.name) == Some("fresh_two")
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_dim_hash_identifiers_resolve_in_the_compilation_table() -> Bool:
+	(parsed, names) = parse_compiler_source_with_names(
+		source("pure func first[T, #N](items: T[#N]) -> Int:\n\t0\n"),
+		SYNTHESIZED_NAME_TABLE,
+	)
+	hash_spelling_id: Option[NameId] = name_table_find_id(names, "#N")
+
+	match (parsed.decls.get(0), hash_spelling_id):
+		(Some(FunctionParsedDecl(function_decl)), Some(hash_id)):
+			match function_decl.type_params.get(1):
+				Some(type_param):
+					name_ids_equal(type_param.name.name, hash_id)
+				None:
 					False
 		_:
 			False
@@ -870,8 +924,16 @@ tests: TestSuite = {
 			test_split_interpolated_string_preserves_multibyte_expr_text,
 		),
 		(
-			"finalize interpolation hole ids resolve against compilation table",
-			test_finalize_interpolation_hole_ids_resolve_against_compilation_table,
+			"finalize interpolation hole ids extend compilation table",
+			test_finalize_interpolation_hole_ids_extend_compilation_table,
+		),
+		(
+			"finalize interpolation holes share one id for a new spelling",
+			test_finalize_interpolation_holes_share_one_id_for_a_new_spelling,
+		),
+		(
+			"dim hash identifiers resolve in the compilation table",
+			test_dim_hash_identifiers_resolve_in_the_compilation_table,
 		),
 		(
 			"finalize interpolation program rewrites raw string",

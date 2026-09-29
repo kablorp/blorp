@@ -13,6 +13,17 @@
 -- different bindings that happen to share a spelling share a `NameId`.
 -- Hygiene (distinguishing same-named locals) and semantic identity remain
 -- the responsibility of later phases (see docs/CORE_ID_MIGRATION.md).
+--
+-- Where a `ParsedIdentifier`'s id comes from, by phase:
+--   * lexing: every identifier, integer-literal and `#`-prefixed dimension
+--     spelling in a file (and in each interpolation hole, which discovery
+--     lexes against the same accumulator) is interned here;
+--   * parsing: spellings the parser fabricates come from the closed
+--     `name_table_synthesized_spellings()` vocabulary, pre-seeded into every
+--     compilation's table;
+--   * after discovery has published the table (typecheck, CTFE, lowering)
+--     the table is immutable, so a phase that must mint a spelling the
+--     compilation never wrote uses a `NameTableExtension` (below).
 opaque type NameId = Int
 
 
@@ -131,7 +142,13 @@ reading from a token: every keyword spelling (a reserved keyword written
 where a name belongs is echoed back as that name, and several keywords have
 a soft-identifier use such as `after`/`debug`/`sealed`/`from`), the small set
 of literal names desugaring and parser self-tests fabricate (`_`, `#`,
-`resource`, `Type`, ...), and `""` for error recovery. Keeping the set here,
+`resource`, `Type`, ...), `""` for error recovery, and the closed
+vocabularies later phases synthesize: the builtin callees subscript lowering
+and the typechecker name (`checked_get` ... `tensor5_checked_set`, fixed by
+arity; `tensor.brp` stops at rank 5) and the foreign bridge JSON's argument
+names (`include`, `link`, `link_<platform>`), and the first
+`TUPLE_FIELD_SEEDED_COUNT` tuple field positions (`0` ... `15`), which a static
+tuple subscript names as a field. Keeping the set here,
 named, is what lets the parser only ever do read-only lookups
 (`name_table_find_id`) against a pre-seeded table instead of appending new
 spellings while it parses.
@@ -214,6 +231,39 @@ pure func name_table_synthesized_spellings() -> List[String]:
 		"item",
 		"other",
 		"Void",
+		"checked_get",
+		"checked_set",
+		"checked_slice",
+		"assert_shape",
+		"tensor_peel",
+		"matrix_checked_get",
+		"tensor3_checked_get",
+		"tensor4_checked_get",
+		"tensor5_checked_get",
+		"matrix_checked_set",
+		"tensor3_checked_set",
+		"tensor4_checked_set",
+		"tensor5_checked_set",
+		"include",
+		"link",
+		"link_linux",
+		"link_macos",
+		"0",
+		"1",
+		"2",
+		"3",
+		"4",
+		"5",
+		"6",
+		"7",
+		"8",
+		"9",
+		"10",
+		"11",
+		"12",
+		"13",
+		"14",
+		"15",
 	]
 
 
@@ -221,7 +271,7 @@ pure func name_table_synthesized_spellings() -> List[String]:
 The table pre-seeded with `name_table_synthesized_spellings()`, as a shared
 immutable constant (CTFE accepts the initializer): discovery, hole parses and
 single-file parses (formatter, LSP, tools, tests) share one copy instead of
-rebuilding the 73 entries, and ids for these spellings agree everywhere.
+rebuilding the vocabulary, and ids for these spellings agree everywhere.
 ---
 SYNTHESIZED_NAME_TABLE: NameTable = build_synthesized_name_table()
 
@@ -237,11 +287,17 @@ private pure func build_synthesized_name_table() -> NameTable:
 
 
 ---
-Looks up a synthesized spelling's id without a table in hand, for the rare
-caller (parser self-test/oracle helpers) that builds sample
-`ParsedIdentifier`s outside any real parse. Rebuilds the small seeded table
-per call, so this is for test and diagnostic scaffolding only -- real
-parsing threads a table through `ParserInput` instead.
+Looks up a synthesized spelling's id without a table in hand, for phases that
+mint a spelling from the closed synthesized vocabulary after discovery (the
+typechecker's builtin callees, the foreign bridge JSON) and for parser
+self-test/oracle helpers that build sample `ParsedIdentifier`s outside any
+real parse. Every compilation's table is seeded from
+`SYNTHESIZED_NAME_TABLE`, so the id agrees with the compilation's.
+
+`spelling` must be in `name_table_synthesized_spellings()`; a spelling outside
+it resolves to the id of `""`, which the name-identity check
+(`BLORP_NAME_IDENTITY`) reports as a text/id mismatch rather than letting it
+pass silently.
 ---
 pure func synthesized_name_id(spelling: String) -> NameId:
 	match name_table_find_id(SYNTHESIZED_NAME_TABLE, spelling):
@@ -252,18 +308,135 @@ pure func synthesized_name_id(spelling: String) -> NameId:
 
 
 ---
-A placeholder for a spelling the parser builds dynamically from source text
-(for example `"#" + current_text(...)` for a dim-hash suffix like `#N`) and
-therefore cannot resolve with a read-only lookup against the pre-seeded
-closed vocabulary -- it was never interned. `.text` stays authoritative for
-these identifiers until a caller interns the real spelling; the negative
-index can never equal a real `NameId` (every real one is a non-negative
-dense index), so no reader can mistake this for a resolved identity.
+How many tuple field positions (`"0"`, `"1"`, ...) the synthesized vocabulary
+seeds; a static subscript past the last one keeps the pending id. Must match
+the number of digit entries in `name_table_synthesized_spellings()`
+(a name-table test asserts it).
+---
+TUPLE_FIELD_SEEDED_COUNT: Int = 16
 
-TODO(name-id-migration): these sites are the "genuinely dynamic" spellings
-called out in the parsed-identifier-name-id slice; intern them for real at
-the discovery join (or thread a mutable table through this one call path)
-instead of using this placeholder.
+
+---
+The id of the field a static tuple subscript at `index` names: the seeded
+digit spelling, or `name_id_pending_dynamic_intern()` for a position past the
+seeded range (no tuple in the compiler or standard library is that wide).
+---
+pure func tuple_field_name_id(index: Int) -> NameId:
+	if index >= 0 and index < TUPLE_FIELD_SEEDED_COUNT:
+		synthesized_name_id(index.to_string())
+	else:
+		name_id_pending_dynamic_intern()
+
+
+---
+A table read-only after discovery, plus the spellings one later phase mints
+for itself.
+
+Discovery publishes one immutable `NameTable` (the frontend graph's). A phase
+that runs after that -- typecheck, CTFE, lowering -- cannot append to it, but
+can own a `NameTableExtension`: ids continue densely above the base table's
+count, a spelling the base already has resolves to the base id (an extension
+never re-mints a base spelling), and the phase publishes the extension on its
+result so a consumer can resolve any id with `name_spelling_in_extension`.
+Extensions of different phases (or different modules) are independent and
+their ids overlap; an id is only meaningful together with the base and
+extension it came from, so a phase must not mix them.
+
+No production phase owns one yet: each remaining post-discovery identifier
+site (see `name_id_pending_dynamic_intern`) lacks a way to reach the base
+table, let alone publish an extension, without new plumbing.
+---
+opaque type NameTableExtension = NameTableExtensionRep
+
+
+private record NameTableExtensionRep {
+	base_count: Int,
+	spellings: List[String],
+	id_by_spelling: Dict[String, Int]
+}
+
+
+pure func name_table_extension_empty(base: NameTable) -> NameTableExtension:
+	into_opaque NameTableExtension({
+			base_count = name_table_count(base),
+			spellings = [],
+			id_by_spelling = {}
+		})
+
+
+pure func name_table_extension_count(extension: NameTableExtension) -> Int:
+	from_opaque NameTableExtension(extension).spellings.length()
+
+
+---
+Resolves `spelling` to its base id if the base has it, else to the
+extension's id for it, minting the next id above the base when this is the
+first time either has seen it.
+---
+pure func name_table_extension_intern(
+	base: NameTable,
+	extension: NameTableExtension,
+	spelling: String,
+) -> (NameTableExtension, NameId):
+	match name_table_find_id(base, spelling):
+		Some(base_id):
+			(extension, base_id)
+		None:
+			rep = from_opaque NameTableExtension(extension)
+
+			match rep.id_by_spelling.get(spelling):
+				Some(existing_id):
+					(extension, name_id(existing_id))
+				None:
+					new_id = rep.base_count + rep.spellings.length()
+					(into_opaque NameTableExtension({
+								base_count = rep.base_count,
+								spellings = rep.spellings.append(spelling),
+								id_by_spelling = rep.id_by_spelling.set(spelling, new_id)
+							}), name_id(new_id))
+
+
+---
+The spelling of `id` in `base` extended by `extension`.
+---
+pure func name_spelling_in_extension(
+	base: NameTable,
+	extension: NameTableExtension,
+	id: NameId,
+) -> Option[String]:
+	rep = from_opaque NameTableExtension(extension)
+	index = name_id_index(id)
+
+	if index < rep.base_count:
+		name_spelling(base, id)
+	else:
+		rep.spellings.get(index - rep.base_count)
+
+
+---
+The id of an identifier that is still built from source text after discovery
+by a phase with no way to reach the compilation's name table. `.text` is
+authoritative for it; the negative index can never equal a real `NameId`
+(every real one is a non-negative dense index), so no reader can mistake this
+for a resolved identity, and the name-identity check counts each one.
+
+Survivors and the seam each needs:
+  * `source_ast_finalize.brp`: the callee of a subscript read with zero or
+    more than five indices (`tensorN_checked_get` does not exist in the
+    standard library, so the call is a name error anyway) -- the
+    `rewrite_subscript_read_*` pass takes no name accumulator.
+  * `stage_07_ctfe/materialize.brp` (seven sites): constructor, field and
+    function names of a materialized CTFE value -- `CtfeContext` carries no
+    `NameTable`; needs the frontend graph's table threaded through
+    `evaluated_typecheck_artifact` and `ctfe_context_from_program`.
+  * `stage_06_typecheck/infer.brp`: the `__resource_*` loop item, and the
+    tuple field named by a static subscript index past
+    `TUPLE_FIELD_SEEDED_COUNT` -- inference has no `NameTableExtension` to
+    append to or publish (expression recursion).
+  * `stage_06_typecheck/modules/module_prelude.brp`: the default import alias
+    -- module preparation has no table.
+  * `stage_08_core_lower/lower.brp`: the `with ?=` payload binder -- lowering
+    has no table.
 ---
 pure func name_id_pending_dynamic_intern() -> NameId:
 	name_id(-1)
