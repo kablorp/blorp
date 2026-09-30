@@ -24,6 +24,7 @@ import:
 	stage_03_parse/language_parser: parse_compiler_source, parse_compiler_source_with_names
 	stage_03_parse/parsed_ast: ParsedProgram
 	stage_03_parse/source_ast_finalize:
+		FinalizedTypecheckProgram,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_with_names,
 	stage_04_modules/frontend_graph:
@@ -182,27 +183,47 @@ private pure func discovery_names_table(names: DiscoveryNames) -> NameTable:
 
 
 ---
-The accumulator after a caller-finalized program, which discovery retains as
-given (it may carry compiler-owned import rewrites that its source text no
-longer shows). Its identifiers' ids index `program_names`, the table its
-caller parsed and finalized it against: `SYNTHESIZED_NAME_TABLE` plus the
-spellings the program's own lex and interpolation holes added. They are the
-compilation's ids only while nothing else has extended the accumulator, so
-only the `SeededTableOnly` state adopts `program_names`. A finalized program
-found after any other file has ids from a table the accumulator no longer
-equals; they are kept as given, and the name-identity check
-(`BLORP_NAME_IDENTITY`) reports them as mismatched (see the "non-first
-finalized root" row of docs/NAME_ID_ROADMAP.md).
+The program and accumulator after a caller-finalized program. Its identifiers'
+ids index `program_names`, the table its caller parsed and finalized it
+against: `SYNTHESIZED_NAME_TABLE` plus the spellings the program's own lex and
+interpolation holes added. They are the compilation's ids only while nothing
+else has extended the accumulator, so only the `SeededTableOnly` state adopts
+the program and `program_names` as given (it may carry compiler-owned import
+rewrites that its source text no longer shows).
+
+A finalized program found after any other file has ids from a table the
+accumulator no longer equals. Keeping them would make every later id lookup
+(`name_spelling`, the declaration index) read another file's spelling, so the
+program is finalized again from its own source against the accumulator, exactly
+as a raw file is. That drops compiler-owned import rewrites, which no caller
+applies before discovery (`finalized_typecheck_program_rewrite_import_paths`
+runs on graph modules afterwards); the cost is one extra parse of each
+non-first finalized root. Threading one table through every root's first parse
+would avoid that cost (see the "non-first finalized root" row of
+docs/NAME_ID_ROADMAP.md).
 ---
-private pure func names_after_finalized_source(
+private pure func finalized_source_against_names(
+	retained: FinalizedTypecheckProgram,
 	program_names: NameTable,
 	names: DiscoveryNames,
-) -> NameTable:
+) -> (FinalizedTypecheckProgram, NameTable):
 	match names:
 		SeededTableOnly:
-			program_names
+			-- Fold the declared spellings into the compilation table for the
+			-- typechecker's by-spelling lookups.
+			(
+				retained,
+				name_table_with_declared_names(
+					program_names,
+					[finalized_typecheck_program_ast(retained)],
+				),
+			)
 		AccumulatedTable(table):
-			table
+			(parsed, parsed_names) = parse_compiler_source_with_names(
+				finalized_typecheck_program_ast(retained).source,
+				table,
+			)
+			finalized_typecheck_program_with_names(parsed, parsed_names)
 
 
 ---
@@ -224,15 +245,7 @@ private pure func discover_frontend_source(
 			-- finalize step returns the table extended with them.
 			finalized_typecheck_program_with_names(parsed, parsed_names)
 		FinalizedFrontendSource(retained, program_names):
-			-- Whatever ids the program carries, fold its declared spellings into the
-			-- compilation table for the typechecker's by-spelling lookups.
-			(
-				retained,
-				name_table_with_declared_names(
-					names_after_finalized_source(program_names, names),
-					[finalized_typecheck_program_ast(retained)],
-				),
-			)
+			finalized_source_against_names(retained, program_names, names)
 
 	(
 		{

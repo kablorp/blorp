@@ -6,7 +6,8 @@ import:
 		finalized_typecheck_program_with_single_file_names,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_rewrite_import_paths,
-	../../src/compiler/stage_02_lex/name_table: name_table_find_id
+	../../src/compiler/stage_02_lex/name_table: NameTable, name_spelling, name_table_find_id
+	../../src/compiler/stage_03_parse/parsed_ast: ParsedDecl(FunctionParsedDecl)
 	../../src/compiler/stage_04_modules/frontend_graph:
 		frontend_graph_name_table,
 		frontend_graph_root_modules,
@@ -213,18 +214,67 @@ func test_finalized_root_table_keeps_interpolation_hole_spellings() -> Bool:
 	finalized_root_hole_spelling_is_published([])
 
 
---- A raw file that added no spelling still leaves the accumulator in the
---- `AccumulatedTable` state, so a finalized root after it keeps ids from its own
---- table and its hole spelling is not published. This pins the documented
---- non-first-root limitation (docs/NAME_ID_ROADMAP.md, Interim states); flip
---- it when the CLI threads one table through every root.
-func test_finalized_root_after_a_raw_file_without_new_spellings_is_not_adopted() -> Bool:
-	not finalized_root_hole_spelling_is_published([""])
+--- Every finalized root's identifiers must index the graph's name table, not
+--- only the first root's. This finalizes two roots against their own
+--- single-file tables (as `blorp test` does for each source and doctest root),
+--- discovers them together, and reports whether every top-level function name
+--- of every root spells the same in the graph table as in its source.
+func finalized_roots_identifiers_index_graph_table() -> Bool:
+	first_source = source_file("/workspace/first_root.brp", "first_root", "func first_only() -> Int: 1\n")
+	second_source = source_file("/workspace/second_root.brp", "second_root", "func second_only() -> Int: 2\n")
+	(first_program, first_names) = finalized_typecheck_program_with_single_file_names(
+		parse_compiler_source(first_source),
+	)
+	(second_program, second_names) = finalized_typecheck_program_with_single_file_names(
+		parse_compiler_source(second_source),
+	)
+
+	match frontend_graph_discover(
+		[
+			{
+				identity = resolved_module_identity_from_resolver("first_root", UserModule),
+				input = FinalizedFrontendSource(first_program, first_names)
+			},
+			{
+				identity = resolved_module_identity_from_resolver("second_root", UserModule),
+				input = FinalizedFrontendSource(second_program, second_names)
+			},
+		],
+		[],
+		func(_importer, _requested_path): Ok(FrontendSourceUnresolved),
+		func(_location): Err("not reached"),
+	):
+		Err(_):
+			False
+		Ok(graph):
+			table: NameTable = frontend_graph_name_table(graph)
+			var agreed: Bool = True
+			var checked: Int = 0
+
+			for module in frontend_graph_root_modules(graph):
+				for decl in finalized_typecheck_program_ast(module.program).decls:
+					match decl:
+						FunctionParsedDecl(function_decl):
+							checked += 1
+
+							if name_spelling(table, function_decl.name.name) != Some(function_decl.name.text):
+								agreed = False
+						_:
+							void
+
+			agreed and checked == 2
 
 
---- Same limitation, after a raw file that did add spellings.
-func test_finalized_root_after_a_raw_file_with_new_spellings_is_not_adopted() -> Bool:
-	not finalized_root_hole_spelling_is_published(["preceding_only_spelling = 1\n"])
+--- A finalized root after other files has ids from its own table, which the
+--- accumulator no longer equals, so discovery finalizes it again against the
+--- accumulator. Its interpolation-hole spelling is therefore published whether
+--- the files before it added spellings or not.
+func test_finalized_root_after_a_raw_file_without_new_spellings_is_published() -> Bool:
+	finalized_root_hole_spelling_is_published([""])
+
+
+func test_finalized_root_after_a_raw_file_with_new_spellings_is_published() -> Bool:
+	finalized_root_hole_spelling_is_published(["preceding_only_spelling = 1\n"])
 
 
 tests: TestSuite = {
@@ -243,12 +293,16 @@ tests: TestSuite = {
 			test_finalized_root_table_keeps_interpolation_hole_spellings,
 		),
 		(
-			"does not adopt a finalized root's table after a raw file without new spellings",
-			test_finalized_root_after_a_raw_file_without_new_spellings_is_not_adopted,
+			"publishes a finalized root's hole spelling after a raw file without new spellings",
+			test_finalized_root_after_a_raw_file_without_new_spellings_is_published,
 		),
 		(
-			"does not adopt a finalized root's table after a raw file with new spellings",
-			test_finalized_root_after_a_raw_file_with_new_spellings_is_not_adopted,
+			"publishes a finalized root's hole spelling after a raw file with new spellings",
+			test_finalized_root_after_a_raw_file_with_new_spellings_is_published,
+		),
+		(
+			"indexes every finalized root's identifiers into the graph name table",
+			finalized_roots_identifiers_index_graph_table,
 		),
 		(
 			"derives finalized root identity from program source",
