@@ -112,21 +112,23 @@ func discover[Provider:SourceProvider](
 	var pending: List[PendingImport] = []
 
 	for root_path in roots:
-		root: RootId = next_root_id(builder)
+		root: RootId = builder.next_root_id()
 		candidate: SourceCandidate = root_candidate(root_path)
-		request_path: PathId = interned_path_id(builder, root_path)
-		builder = intern_path(builder, root_path)
-		builder = append_root(builder, {request_path = request_path})
+		request_path: PathId = builder.interned_path_id(root_path)
+		builder = builder.intern_path(root_path)
+		builder = builder.append_root({request_path = request_path})
 
 		if (
-			loaded_module_at(builder, candidate.path).is_some()
+			builder
+				.loaded_module_at(candidate.path)
+				.is_some()
 			or provider.source_exists(candidate.path)
 		):
 			modules_before: Int = builder.modules.length()
 			builder = load_or_reuse(provider, builder, candidate, RootModule, RequestedByRoot(root))
-			pending = pending.concat(newly_loaded_imports(builder, modules_before, candidate))
+			pending = pending.concat(builder.newly_loaded_imports(modules_before, candidate))
 		else:
-			builder = report_root(builder, root, UnresolvedRootDiagnostic)
+			builder = builder.report_root(root, UnresolvedRootDiagnostic)
 
 	var next_pending: Int = 0
 
@@ -144,24 +146,19 @@ func discover[Provider:SourceProvider](
 							RequestedByImport(entry.import_id),
 						)
 						pending = pending.concat(
-							newly_loaded_imports(
-								builder,
+							builder.newly_loaded_imports(
 								modules_before,
 								candidate,
 							),
 						)
 					None:
-						builder = report_import(
-							builder,
-							entry.import_id,
-							UnresolvedImportDiagnostic,
-						)
+						builder = builder.report_import(entry.import_id, UnresolvedImportDiagnostic)
 			None:
 				void
 
 		next_pending += 1
 
-	freeze(builder)
+	builder.freeze()
 
 
 ---
@@ -185,21 +182,21 @@ private func load_or_reuse[Provider:SourceProvider](
 	reach: ModuleReach,
 	requester: ModuleRequester,
 ) -> DiscoveryBuilder:
-	match loaded_module_at(builder, candidate.path):
+	match builder.loaded_module_at(candidate.path):
 		Some(module):
-			record_target(builder, requester, module)
+			builder.record_target(requester, module)
 		None:
 			match provider.read_source(candidate.path):
 				SourceText(text):
-					match source_rejection(builder, text.length()):
+					match builder.source_rejection(text.length()):
 						Some(rejection):
-							report_rejected(builder, requester, rejection, text.length())
+							builder.report_rejected(requester, rejection, text.length())
 						None:
-							module: ModuleId = next_module_id(builder)
-							loaded: DiscoveryBuilder = load_module(builder, candidate, reach, text)
-							record_target(loaded, requester, module)
+							module: ModuleId = builder.next_module_id()
+							loaded: DiscoveryBuilder = builder.load_module(candidate, reach, text)
+							loaded.record_target(requester, module)
 				SourceUnreadable:
-					report_requester(builder, requester, UnreadableSourceDiagnostic)
+					builder.report_requester(requester, UnreadableSourceDiagnostic)
 
 
 ---
@@ -212,7 +209,7 @@ private pure func newly_loaded_imports(
 	candidate: SourceCandidate,
 ) -> List[PendingImport]:
 	if builder.modules.length() > modules_before:
-		module_import_requests(builder, module_id_at_row(modules_before), candidate)
+		builder.module_import_requests(module_id_at_row(modules_before), candidate)
 	else:
 		[]
 
@@ -224,21 +221,15 @@ private pure func record_target(
 ) -> DiscoveryBuilder:
 	match requester:
 		RequestedByRoot(root):
-			append_root_target(
-				builder,
-				{
-					root = root,
-					target = module
-				},
-			)
+			builder.append_root_target({
+				root = root,
+				target = module,
+			})
 		RequestedByImport(import_id):
-			append_import_target(
-				builder,
-				{
-					owner_import = import_id,
-					target = module
-				},
-			)
+			builder.append_import_target({
+				owner_import = import_id,
+				target = module,
+			})
 
 
 private pure func report_requester(
@@ -248,9 +239,9 @@ private pure func report_requester(
 ) -> DiscoveryBuilder:
 	match requester:
 		RequestedByRoot(root):
-			report_root(builder, root, code)
+			builder.report_root(root, code)
 		RequestedByImport(import_id):
-			report_import(builder, import_id, code)
+			builder.report_import(import_id, code)
 
 
 private pure func report_rejected(
@@ -261,18 +252,18 @@ private pure func report_rejected(
 ) -> DiscoveryBuilder:
 	match requester:
 		RequestedByRoot(root):
-			report_rejected_root(builder, root, rejection, byte_length)
+			builder.report_rejected_root(root, rejection, byte_length)
 		RequestedByImport(import_id):
-			report_rejected_import(builder, import_id, rejection, byte_length)
+			builder.report_rejected_import(import_id, rejection, byte_length)
 
 
 ---
 The module already loaded from `path`, if any.
 ---
 private pure func loaded_module_at(builder: DiscoveryBuilder, path: String) -> Option[ModuleId]:
-	match find_path_id(builder, path):
+	match builder.find_path_id(path):
 		Some(path_id):
-			find_module_by_path(builder, path_id)
+			builder.find_module_by_path(path_id)
 		None:
 			None
 
@@ -288,7 +279,7 @@ private func resolve_import[Provider:SourceProvider](
 ) -> Option[SourceCandidate]:
 	var found: Option[SourceCandidate] = None
 
-	for candidate in import_candidates(lookup, request):
+	for candidate in lookup.import_candidates(request):
 		if provider.source_exists(candidate.path):
 			found = Some(candidate)
 			break
@@ -306,14 +297,14 @@ pure func load_module(
 	reach: ModuleReach,
 	text: String,
 ) -> DiscoveryBuilder:
-	module: ModuleId = next_module_id(builder)
-	source: SourceId = next_source_id(builder)
-	canonical_path: PathId = interned_path_id(builder, candidate.path)
+	module: ModuleId = builder.next_module_id()
+	source: SourceId = builder.next_source_id()
+	canonical_path: PathId = builder.interned_path_id(candidate.path)
 	definitions_first: Int = builder.definitions.length()
 	imports_first: Int = builder.imports.length()
 	nodes_first: Int = builder.nodes.length()
 	diagnostics_first: Int = builder.diagnostics.length()
-	var out: DiscoveryBuilder = admit_source(builder, candidate.path, text)
+	var out: DiscoveryBuilder = builder.admit_source(candidate.path, text)
 	open_row: ModuleRow = {
 		source = source,
 		canonical_path = canonical_path,
@@ -336,10 +327,10 @@ pure func load_module(
 			count = 0
 		}
 	}
-	out = append_module(out, open_row)
-	out = record_module_package(out, module, candidate.package)
-	out = lex_source(out, source)
-	out = parse_module_declarations(out, module)
+	out = out.append_module(open_row)
+	out = out.record_module_package(module, candidate.package)
+	out = out.lex_source(source)
+	out = out.parse_module_declarations(module)
 	definitions_end: Int = out.definitions.length()
 	imports_end: Int = out.imports.length()
 	nodes_end: Int = out.nodes.length()
@@ -362,7 +353,7 @@ pure func load_module(
 			count = diagnostics_end - diagnostics_first
 		}
 	}
-	out = replace_module_row(out, module, closed_row)
+	out = out.replace_module_row(module, closed_row)
 	out
 
 
@@ -377,7 +368,7 @@ private pure func record_module_package(
 ) -> DiscoveryBuilder:
 	match package:
 		InNativePackage(name):
-			record_native_module_package(builder, module, name)
+			builder.record_native_module_package(module, name)
 		NotInPackage:
 			builder
 
@@ -392,20 +383,17 @@ private pure func record_native_module_package(
 	module: ModuleId,
 	name: String,
 ) -> DiscoveryBuilder:
-	package: PackageId = match existing_package(builder, name):
+	package: PackageId = match builder.existing_package(name):
 		Some(existing):
 			existing
 		None:
-			next_package_id(builder)
+			builder.next_package_id()
 
-	with_package: DiscoveryBuilder = ensure_native_package(builder, name)
-	append_module_package(
-		with_package,
-		{
-			module = module,
-			package = package
-		},
-	)
+	with_package: DiscoveryBuilder = builder.ensure_native_package(name)
+	with_package.append_module_package({
+		module = module,
+		package = package,
+	})
 
 
 ---
@@ -415,33 +403,38 @@ private pure func ensure_native_package(
 	builder: DiscoveryBuilder,
 	name: String,
 ) -> DiscoveryBuilder:
-	if existing_package(builder, name).is_some():
+	if (
+		builder
+			.existing_package(name)
+			.is_some()
+	):
 		builder
 	else:
-		package_name: NameId = match find_name_id(builder, name):
+		package_name: NameId = match builder.find_name_id(name):
 			Some(existing_name):
 				existing_name
 			None:
-				next_name_id(builder)
+				builder.next_name_id()
 
-		with_name: DiscoveryBuilder = ensure_name(builder, name)
-		append_package(
-			with_name,
-			{
-				name = package_name,
-				kind = NativePackage
-			},
-		)
+		with_name: DiscoveryBuilder = builder.ensure_name(name)
+		with_name.append_package({
+			name = package_name,
+			kind = NativePackage,
+		})
 
 
 ---
 Interns `name` unless it is already interned.
 ---
 private pure func ensure_name(builder: DiscoveryBuilder, name: String) -> DiscoveryBuilder:
-	if find_name_id(builder, name).is_some():
+	if (
+		builder
+			.find_name_id(name)
+			.is_some()
+	):
 		builder
 	else:
-		append_name(builder, name)
+		builder.append_name(name)
 
 
 ---
@@ -452,7 +445,7 @@ private pure func existing_package(builder: DiscoveryBuilder, name: String) -> O
 	var row: Int = 0
 
 	for package in builder.packages:
-		if builder.name_spellings.get(name_id_index(package.name)) == Some(name):
+		if builder.name_spellings.get(package.name.name_id_index()) == Some(name):
 			found = Some(package_id_at_row(row))
 			break
 
@@ -471,7 +464,7 @@ private pure func module_import_requests(
 ) -> List[PendingImport]:
 	var requests: List[PendingImport] = []
 
-	match builder.modules.get(module_id_index(module)):
+	match builder.modules.get(module.module_id_index()):
 		Some(module_row):
 			requester: ImportRequester = {
 				canonical_path = candidate.path,
@@ -487,9 +480,9 @@ private pure func module_import_requests(
 							request = {
 								kind = import_row.request_kind,
 								text = builder.paths
-									.get(path_id_index(import_row.request_path))
+									.get(import_row.request_path.path_id_index())
 									.get_or(""),
-								parts = import_path_part_spellings(builder, import_row),
+								parts = builder.import_path_part_spellings(import_row),
 								requester = requester
 							},
 						})
@@ -512,7 +505,7 @@ private pure func import_path_part_spellings(
 			Some(part):
 				parts = parts.append(
 					builder.name_spellings
-						.get(name_id_index(part))
+						.get(part.name_id_index())
 						.get_or(""),
 				)
 			None:
@@ -523,7 +516,7 @@ private pure func import_path_part_spellings(
 
 -- Diagnostics.
 private pure func import_span(builder: DiscoveryBuilder, import_id: ImportId) -> Span:
-	match builder.imports.get(import_id_index(import_id)):
+	match builder.imports.get(import_id.import_id_index()):
 		Some(import_row):
 			import_row.span
 		None:
@@ -538,8 +531,8 @@ private pure func report_import(
 	import_id: ImportId,
 	code: DiscoveryDiagnosticCode,
 ) -> DiscoveryBuilder:
-	span: Span = import_span(builder, import_id)
-	append_resolution_diagnostic_with_argument(builder, code, span, import_id_index(import_id))
+	span: Span = builder.import_span(import_id)
+	builder.append_resolution_diagnostic_with_argument(code, span, import_id.import_id_index())
 
 
 private pure func report_rejected_import(
@@ -548,18 +541,17 @@ private pure func report_rejected_import(
 	rejection: SourceRejection,
 	byte_length: Int,
 ) -> DiscoveryBuilder:
-	span: Span = import_span(builder, import_id)
+	span: Span = builder.import_span(import_id)
 
 	match rejection:
 		SourceTooLargeToSpan:
-			append_resolution_diagnostic_with_argument(
-				builder,
+			builder.append_resolution_diagnostic_with_argument(
 				SourceTooLargeDiagnostic,
 				span,
 				byte_length,
 			)
 		TooManySourcesToSpan:
-			append_plain_resolution_diagnostic(builder, TooManySourcesDiagnostic, span)
+			builder.append_plain_resolution_diagnostic(TooManySourcesDiagnostic, span)
 
 
 private pure func report_root(
@@ -567,18 +559,15 @@ private pure func report_root(
 	root: RootId,
 	code: DiscoveryDiagnosticCode,
 ) -> DiscoveryBuilder:
-	arguments_first: Int = next_diagnostic_argument_row(builder)
-	append_root_diagnostic(
-		builder,
-		{
-			root = root,
-			code = code,
-			arguments = {
-				first = arguments_first,
-				count = 0
-			}
+	arguments_first: Int = builder.next_diagnostic_argument_row()
+	builder.append_root_diagnostic({
+		root = root,
+		code = code,
+		arguments = {
+			first = arguments_first,
+			count = 0
 		},
-	)
+	})
 
 
 private pure func report_rejected_root(
@@ -589,19 +578,16 @@ private pure func report_rejected_root(
 ) -> DiscoveryBuilder:
 	match rejection:
 		SourceTooLargeToSpan:
-			arguments_first: Int = next_diagnostic_argument_row(builder)
-			var out: DiscoveryBuilder = append_diagnostic_argument(builder, byte_length)
-			out = append_root_diagnostic(
-				out,
-				{
-					root = root,
-					code = SourceTooLargeDiagnostic,
-					arguments = {
-						first = arguments_first,
-						count = 1
-					}
+			arguments_first: Int = builder.next_diagnostic_argument_row()
+			var out: DiscoveryBuilder = builder.append_diagnostic_argument(byte_length)
+			out = out.append_root_diagnostic({
+				root = root,
+				code = SourceTooLargeDiagnostic,
+				arguments = {
+					first = arguments_first,
+					count = 1
 				},
-			)
+			})
 			out
 		TooManySourcesToSpan:
-			report_root(builder, root, TooManySourcesDiagnostic)
+			builder.report_root(root, TooManySourcesDiagnostic)

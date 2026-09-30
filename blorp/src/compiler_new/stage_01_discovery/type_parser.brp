@@ -119,11 +119,11 @@ private MAX_TUPLE_ARITY: Int = 4
 
 
 pure func node_span(builder: DiscoveryBuilder, node: NodeId) -> Span:
-	match builder.nodes.get(node_id_index(node)):
+	match builder.nodes.get(node.node_id_index()):
 		Some(row):
 			row.span
 		None:
-			current_span(builder)
+			builder.current_span()
 
 
 ---
@@ -131,7 +131,7 @@ Whether `node` is a dimension: a dimension name, literal, wildcard or
 dimension arithmetic.
 ---
 pure func is_dimension_node(builder: DiscoveryBuilder, node: NodeId) -> Bool:
-	match builder.nodes.get(node_id_index(node)):
+	match builder.nodes.get(node.node_id_index()):
 		Some(row):
 			match row.kind:
 				DimensionNameTypeNode | VariadicDimensionNameTypeNode | DimensionWildcardTypeNode | VariadicDimensionWildcardTypeNode | DimensionLiteralTypeNode | DimensionAddTypeNode | DimensionSubtractTypeNode | DimensionMultiplyTypeNode | DimensionDivideTypeNode:
@@ -143,7 +143,7 @@ pure func is_dimension_node(builder: DiscoveryBuilder, node: NodeId) -> Bool:
 
 
 private pure func all_dimensions(builder: DiscoveryBuilder, nodes: List[NodeId]) -> Bool:
-	nodes.length() > 0 and nodes.all(pure func(node): is_dimension_node(builder, node))
+	nodes.length() > 0 and nodes.all(pure func(node): builder.is_dimension_node(node))
 
 
 -- Types.
@@ -151,7 +151,7 @@ private pure func all_dimensions(builder: DiscoveryBuilder, nodes: List[NodeId])
 A type expression; bounded arguments (`T: Eq`) are not allowed at the top.
 ---
 pure func parse_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	parse_type_allowing_bounds(builder, False)
+	builder.parse_type_allowing_bounds(False)
 
 
 ---
@@ -162,22 +162,22 @@ pure func parse_type_allowing_bounds(
 	builder: DiscoveryBuilder,
 	allow_bounds: Bool,
 ) -> DiscoveryBuilder:
-	match current_kind(builder):
+	match builder.current_kind():
 		IdentifierToken | SelfKeyword | VoidKeyword:
-			parse_named_type(builder, allow_bounds)
+			builder.parse_named_type(allow_bounds)
 		PureKeyword:
-			parse_pure_function_type(builder)
+			builder.parse_pure_function_type()
 		DimensionNameToken | HashSymbol | IntLiteralToken:
-			parse_dimension_expression(builder)
+			builder.parse_dimension_expression()
 		DotDotSymbol:
-			parse_range_type(builder)
+			builder.parse_range_type()
 		LeftParenSymbol:
-			if starts_parenthesized_dimension(builder, 1):
-				parse_dimension_expression(builder)
+			if builder.starts_parenthesized_dimension(1):
+				builder.parse_dimension_expression()
 			else:
-				parse_parenthesized_type(builder)
+				builder.parse_parenthesized_type()
 		_:
-			parse_missing_type(builder)
+			builder.parse_missing_type()
 
 
 ---
@@ -185,9 +185,9 @@ Reports a missing type and appends a `MissingTypeNode` at the offending
 token, which is skipped unless it is a soft boundary.
 ---
 private pure func parse_missing_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	span: Span = current_span(builder)
-	var out: DiscoveryBuilder = report_and_recover(builder, ExpectedTypeDiagnostic)
-	out = append_leaf_node(out, MissingTypeNode, span)
+	span: Span = builder.current_span()
+	var out: DiscoveryBuilder = builder.report_and_recover(ExpectedTypeDiagnostic)
+	out = out.append_leaf_node(MissingTypeNode, span)
 	out
 
 
@@ -196,11 +196,11 @@ Whether the token `ahead` of the cursor starts a dimension atom, looking
 through nested parentheses: `(#N + 1)` is a dimension, `(Int, #N)` is not.
 ---
 private pure func starts_parenthesized_dimension(builder: DiscoveryBuilder, ahead: Int) -> Bool:
-	match peek_kind(builder, ahead):
+	match builder.peek_kind(ahead):
 		HashSymbol | DimensionNameToken | IntLiteralToken:
 			True
 		LeftParenSymbol:
-			starts_parenthesized_dimension(builder, ahead + 1)
+			builder.starts_parenthesized_dimension(ahead + 1)
 		_:
 			False
 
@@ -210,25 +210,25 @@ The name a type position records for the current token: an identifier, or
 `Self` / `void` written as a type name.
 ---
 private pure func type_name_at_cursor(builder: DiscoveryBuilder) -> NameId:
-	kind: TokenKind = current_kind(builder)
+	kind: TokenKind = builder.current_kind()
 
 	if kind == SelfKeyword or kind == VoidKeyword:
-		match keyword_name_index(kind):
+		match kind.keyword_name_index():
 			Some(index):
 				name_id_at_row(index)
 			None:
 				name_id_at_row(EMPTY_NAME_INDEX)
 	else:
-		referenced_name_at_cursor(builder)
+		builder.referenced_name_at_cursor()
 
 
 private pure func consume_type_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	kind: TokenKind = current_kind(builder)
+	kind: TokenKind = builder.current_kind()
 
 	if kind == SelfKeyword or kind == VoidKeyword:
-		advance_token(builder)
+		builder.advance_token()
 	else:
-		consume_referenced_name(builder)
+		builder.consume_referenced_name()
 
 
 ---
@@ -239,35 +239,34 @@ private pure func parse_named_type(
 	builder: DiscoveryBuilder,
 	allow_bounds: Bool,
 ) -> DiscoveryBuilder:
-	can_qualify: Bool = current_kind(builder) == IdentifierToken
-	first_name: NameId = type_name_at_cursor(builder)
-	first_span: Span = current_span(builder)
-	var out: DiscoveryBuilder = consume_type_name(builder)
+	can_qualify: Bool = builder.current_kind() == IdentifierToken
+	first_name: NameId = builder.type_name_at_cursor()
+	first_span: Span = builder.current_span()
+	var out: DiscoveryBuilder = builder.consume_type_name()
 
-	if allow_bounds and at(out, ColonSymbol):
-		out = advance_token(out)
+	if allow_bounds and out.at(ColonSymbol):
+		out = out.advance_token()
 		var bounds: List[NodeId] = []
 		var end_span: Span = first_span
 		var parsing: Bool = True
 
 		while parsing:
-			bound_name: NameId = referenced_name_at_cursor(out)
-			bound_span: Span = current_span(out)
-			out = consume_referenced_name(out)
-			bound: NodeId = next_node_id(out)
-			out = append_name_leaf_node(out, TypeBoundNode, bound_span, bound_name)
+			bound_name: NameId = out.referenced_name_at_cursor()
+			bound_span: Span = out.current_span()
+			out = out.consume_referenced_name()
+			bound: NodeId = out.next_node_id()
+			out = out.append_name_leaf_node(TypeBoundNode, bound_span, bound_name)
 			bounds = bounds.append(bound)
 			end_span = bound_span
 
-			if at(out, PlusSymbol):
-				out = advance_token(out)
+			if out.at(PlusSymbol):
+				out = out.advance_token()
 			else:
 				parsing = False
 
-		out = append_named_parent_node(
-			out,
+		out = out.append_named_parent_node(
 			BoundedTypeNode,
-			span_covering(first_span, end_span),
+			first_span.span_covering(end_span),
 			first_name,
 			bounds,
 		)
@@ -277,41 +276,41 @@ private pure func parse_named_type(
 		var type_name: NameId = first_name
 		var type_name_span: Span = first_span
 
-		if can_qualify and at(out, DotSymbol):
-			out = advance_token(out)
+		if can_qualify and out.at(DotSymbol):
+			out = out.advance_token()
 			qualifier = Some((first_name, first_span))
-			type_name = referenced_name_at_cursor(out)
-			type_name_span = current_span(out)
-			out = consume_referenced_name(out)
+			type_name = out.referenced_name_at_cursor()
+			type_name_span = out.current_span()
+			out = out.consume_referenced_name()
 
 		var arguments: List[NodeId] = []
 		var end_span: Span = type_name_span
 
-		if at(out, LeftBracketSymbol):
-			out = advance_token(out)
+		if out.at(LeftBracketSymbol):
+			out = out.advance_token()
 
-			if not at(out, RightBracketSymbol):
+			if not out.at(RightBracketSymbol):
 				var parsing: Bool = True
 
-				while parsing and not at_end_of_tokens(out):
-					out = parse_type_allowing_bounds(out, True)
-					argument: NodeId = last_node_id(out)
+				while parsing and not out.at_end_of_tokens():
+					out = out.parse_type_allowing_bounds(True)
+					argument: NodeId = out.last_node_id()
 					arguments = arguments.append(argument)
-					end_span = node_span(out, argument)
+					end_span = out.node_span(argument)
 
-					if at(out, CommaSymbol):
-						out = advance_token(out)
+					if out.at(CommaSymbol):
+						out = out.advance_token()
 
-						if at(out, RightBracketSymbol):
+						if out.at(RightBracketSymbol):
 							parsing = False
 					else:
 						parsing = False
 
-			if at(out, RightBracketSymbol):
-				end_span = current_span(out)
-				out = advance_token(out)
+			if out.at(RightBracketSymbol):
+				end_span = out.current_span()
+				out = out.advance_token()
 			else:
-				out = report_at_current(out, ExpectedRightBracketDiagnostic)
+				out = out.report_at_current(ExpectedRightBracketDiagnostic)
 
 		name_start: Span = match qualifier:
 			Some((_, qualifier_span)):
@@ -319,33 +318,30 @@ private pure func parse_named_type(
 			None:
 				type_name_span
 
-		if all_dimensions(out, arguments):
-			out = append_named_type(
-				out,
+		if out.all_dimensions(arguments):
+			out = out.append_named_type(
 				qualifier,
 				type_name,
 				type_name_span,
-				span_covering(name_start, type_name_span),
+				name_start.span_covering(type_name_span),
 				[],
 			)
-			base: NodeId = last_node_id(out)
-			out = append_parent_node(
-				out,
+			base: NodeId = out.last_node_id()
+			out = out.append_parent_node(
 				ArrayTypeNode,
-				span_covering(name_start, end_span),
+				name_start.span_covering(end_span),
 				[base].concat(arguments),
 			)
 		else:
-			out = append_named_type(
-				out,
+			out = out.append_named_type(
 				qualifier,
 				type_name,
 				type_name_span,
-				span_covering(name_start, end_span),
+				name_start.span_covering(end_span),
 				arguments,
 			)
 
-		out = parse_array_suffixes(out)
+		out = out.parse_array_suffixes()
 		out
 
 
@@ -362,15 +358,13 @@ private pure func append_named_type(
 ) -> DiscoveryBuilder:
 	match qualifier:
 		Some((module_name, module_span)):
-			qualifier_node: NodeId = next_node_id(builder)
-			var out: DiscoveryBuilder = append_name_leaf_node(
-				builder,
+			qualifier_node: NodeId = builder.next_node_id()
+			var out: DiscoveryBuilder = builder.append_name_leaf_node(
 				TypeQualifierNode,
 				module_span,
 				module_name,
 			)
-			out = append_named_parent_node(
-				out,
+			out = out.append_named_parent_node(
 				QualifiedTypeNode,
 				span,
 				type_name,
@@ -378,19 +372,19 @@ private pure func append_named_type(
 			)
 			out
 		None:
-			append_named_parent_node(builder, NamedTypeNode, span, type_name, arguments)
+			builder.append_named_parent_node(NamedTypeNode, span, type_name, arguments)
 
 
 private pure func at_end_of_tokens(builder: DiscoveryBuilder) -> Bool:
-	current_token(builder).kind == EndOfFileToken
+	builder.current_token().kind == EndOfFileToken
 
 
 ---
 Array suffixes after a type: each `[dims]` wraps the type so far.
 ---
 private pure func parse_array_suffixes(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	if at(builder, LeftBracketSymbol):
-		parse_array_suffix_chain(builder)
+	if builder.at(LeftBracketSymbol):
+		builder.parse_array_suffix_chain()
 	else:
 		builder
 
@@ -400,10 +394,10 @@ Array suffixes when there is at least one; the first is parsed before the
 loop (builder threading rule 1).
 ---
 private pure func parse_array_suffix_chain(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = parse_array_suffix(builder)
+	var out: DiscoveryBuilder = builder.parse_array_suffix()
 
-	while at(out, LeftBracketSymbol):
-		out = parse_array_suffix(out)
+	while out.at(LeftBracketSymbol):
+		out = out.parse_array_suffix()
 
 	out
 
@@ -412,47 +406,46 @@ private pure func parse_array_suffix_chain(builder: DiscoveryBuilder) -> Discove
 One `[dims]` suffix, from its `[`, wrapping the last node.
 ---
 private pure func parse_array_suffix(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	element: NodeId = last_node_id(builder)
-	element_span: Span = node_span(builder, element)
-	var out: DiscoveryBuilder = advance_token(builder)
+	element: NodeId = builder.last_node_id()
+	element_span: Span = builder.node_span(element)
+	var out: DiscoveryBuilder = builder.advance_token()
 	var dimensions: List[NodeId] = []
 	var end_span: Span = element_span
 	var parsing: Bool = True
 
-	while parsing and not at_end_of_tokens(out):
-		out = parse_type_allowing_bounds(out, True)
-		dimension: NodeId = last_node_id(out)
+	while parsing and not out.at_end_of_tokens():
+		out = out.parse_type_allowing_bounds(True)
+		dimension: NodeId = out.last_node_id()
 		dimensions = dimensions.append(dimension)
-		end_span = node_span(out, dimension)
+		end_span = out.node_span(dimension)
 
-		if at(out, CommaSymbol):
-			out = advance_token(out)
+		if out.at(CommaSymbol):
+			out = out.advance_token()
 
-			if at(out, RightBracketSymbol):
+			if out.at(RightBracketSymbol):
 				parsing = False
 		else:
 			parsing = False
 
-	closed: Bool = at(out, RightBracketSymbol)
+	closed: Bool = out.at(RightBracketSymbol)
 
 	if closed:
-		closing_span: Span = current_span(out)
-		out = advance_token(out)
+		closing_span: Span = out.current_span()
+		out = out.advance_token()
 
-		if not all_dimensions(out, dimensions):
-			out = append_plain_diagnostic(out, ArrayDimensionsExpectedDiagnostic, end_span)
+		if not out.all_dimensions(dimensions):
+			out = out.append_plain_diagnostic(ArrayDimensionsExpectedDiagnostic, end_span)
 
 		end_span = closing_span
 	else:
-		out = report_at_current(out, ExpectedRightBracketDiagnostic)
+		out = out.report_at_current(ExpectedRightBracketDiagnostic)
 
-		if not all_dimensions(out, dimensions):
-			out = append_plain_diagnostic(out, ArrayDimensionsExpectedDiagnostic, end_span)
+		if not out.all_dimensions(dimensions):
+			out = out.append_plain_diagnostic(ArrayDimensionsExpectedDiagnostic, end_span)
 
-	out = append_parent_node(
-		out,
+	out = out.append_parent_node(
 		ArrayTypeNode,
-		span_covering(element_span, end_span),
+		element_span.span_covering(end_span),
 		[element].concat(dimensions),
 	)
 	out
@@ -463,126 +456,122 @@ private pure func parse_array_suffix(builder: DiscoveryBuilder) -> DiscoveryBuil
 grouping `(T)`, or a tuple `(T, U)`; then any array suffixes.
 ---
 private pure func parse_parenthesized_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	start: Span = current_span(builder)
-	var out: DiscoveryBuilder = advance_token(builder)
+	start: Span = builder.current_span()
+	var out: DiscoveryBuilder = builder.advance_token()
 
-	if at(out, RightParenSymbol):
-		close: Span = current_span(out)
-		out = advance_token(out)
+	if out.at(RightParenSymbol):
+		close: Span = out.current_span()
+		out = out.advance_token()
 
-		if at(out, ArrowSymbol):
-			out = advance_token(out)
-			out = parse_type(out)
-			return_type: NodeId = last_node_id(out)
-			end_span: Span = node_span(out, return_type)
-			out = append_parent_node(
-				out,
+		if out.at(ArrowSymbol):
+			out = out.advance_token()
+			out = out.parse_type()
+			return_type: NodeId = out.last_node_id()
+			end_span: Span = out.node_span(return_type)
+			out = out.append_parent_node(
 				FunctionTypeNode,
-				span_covering(start, end_span),
+				start.span_covering(end_span),
 				[return_type],
 			)
 			out
 		else:
-			void_span: Span = span_covering(start, close)
-			out = append_name_leaf_node(
-				out,
+			void_span: Span = start.span_covering(close)
+			out = out.append_name_leaf_node(
 				NamedTypeNode,
 				void_span,
 				name_id_at_row(VOID_NAME_INDEX),
 			)
-			out = parse_array_suffixes(out)
+			out = out.parse_array_suffixes()
 			out
 	else:
 		var items: List[NodeId] = []
 		var parsing: Bool = True
 
-		while parsing and not at_end_of_tokens(out):
-			out = parse_type_allowing_bounds(out, True)
-			items = items.append(last_node_id(out))
+		while parsing and not out.at_end_of_tokens():
+			out = out.parse_type_allowing_bounds(True)
+			items = items.append(out.last_node_id())
 
-			if at(out, CommaSymbol):
-				out = advance_token(out)
+			if out.at(CommaSymbol):
+				out = out.advance_token()
 
-				if at(out, RightParenSymbol):
+				if out.at(RightParenSymbol):
 					parsing = False
 			else:
 				parsing = False
 
-		close_span: Span = current_span(out)
-		out = expect_right_paren(out)
+		close_span: Span = out.current_span()
+		out = out.expect_right_paren()
 
-		if at(out, ArrowSymbol):
-			out = advance_token(out)
-			out = parse_type(out)
-			return_type: NodeId = last_node_id(out)
-			end_span: Span = node_span(out, return_type)
-			out = append_parent_node(
-				out,
+		if out.at(ArrowSymbol):
+			out = out.advance_token()
+			out = out.parse_type()
+			return_type: NodeId = out.last_node_id()
+			end_span: Span = out.node_span(return_type)
+			out = out.append_parent_node(
 				FunctionTypeNode,
-				span_covering(start, end_span),
+				start.span_covering(end_span),
 				items.append(return_type),
 			)
 			out
 		else:
-			tuple_span: Span = span_covering(start, close_span)
+			tuple_span: Span = start.span_covering(close_span)
 
 			if items.length() > MAX_TUPLE_ARITY:
-				out = append_plain_diagnostic(out, TupleArityDiagnostic, tuple_span)
+				out = out.append_plain_diagnostic(TupleArityDiagnostic, tuple_span)
 
 			if items.length() != 1:
-				out = append_parent_node(out, TupleTypeNode, tuple_span, items)
+				out = out.append_parent_node(TupleTypeNode, tuple_span, items)
 
-			out = parse_array_suffixes(out)
+			out = out.parse_array_suffixes()
 			out
 
 
 private pure func expect_right_paren(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	expect_token(builder, RightParenSymbol, ExpectedRightParenDiagnostic)
+	builder.expect_token(RightParenSymbol, ExpectedRightParenDiagnostic)
 
 
 ---
 `pure (T, ...) -> R`.
 ---
 private pure func parse_pure_function_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	start: Span = current_span(builder)
-	var out: DiscoveryBuilder = advance_token(builder)
+	start: Span = builder.current_span()
+	var out: DiscoveryBuilder = builder.advance_token()
 
-	if at(out, LeftParenSymbol):
-		out = advance_token(out)
+	if out.at(LeftParenSymbol):
+		out = out.advance_token()
 	else:
-		out = report_at_current(out, ExpectedLeftParenDiagnostic)
+		out = out.report_at_current(ExpectedLeftParenDiagnostic)
 
 	var parameters: List[NodeId] = []
 
-	if not at(out, RightParenSymbol):
+	if not out.at(RightParenSymbol):
 		var parsing: Bool = True
 
-		while parsing and not at_end_of_tokens(out):
-			out = parse_type_allowing_bounds(out, True)
-			parameters = parameters.append(last_node_id(out))
+		while parsing and not out.at_end_of_tokens():
+			out = out.parse_type_allowing_bounds(True)
+			parameters = parameters.append(out.last_node_id())
 
-			if at(out, CommaSymbol):
-				out = advance_token(out)
+			if out.at(CommaSymbol):
+				out = out.advance_token()
 
-				if at(out, RightParenSymbol):
+				if out.at(RightParenSymbol):
 					parsing = False
 			else:
 				parsing = False
 
-	out = expect_right_paren(out)
+	out = out.expect_right_paren()
 
-	if at(out, ArrowSymbol):
-		out = advance_token(out)
+	if out.at(ArrowSymbol):
+		out = out.advance_token()
 	else:
-		out = report_at_current(out, ExpectedArrowDiagnostic)
+		out = out.report_at_current(ExpectedArrowDiagnostic)
 
-	out = parse_type(out)
-	return_type: NodeId = last_node_id(out)
-	end_span: Span = node_span(out, return_type)
-	out = append_parent_node(
-		out,
+	out = out.parse_type()
+	return_type: NodeId = out.last_node_id()
+	end_span: Span = out.node_span(return_type)
+	out = out.append_parent_node(
 		PureFunctionTypeNode,
-		span_covering(start, end_span),
+		start.span_covering(end_span),
 		parameters.append(return_type),
 	)
 	out
@@ -592,24 +581,23 @@ private pure func parse_pure_function_type(builder: DiscoveryBuilder) -> Discove
 `..#N`: a range over a dimension.
 ---
 private pure func parse_range_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	start: Span = current_span(builder)
-	var out: DiscoveryBuilder = advance_token(builder)
-	kind: TokenKind = current_kind(out)
+	start: Span = builder.current_span()
+	var out: DiscoveryBuilder = builder.advance_token()
+	kind: TokenKind = out.current_kind()
 
 	if (
 		kind != HashSymbol
 		and kind != DimensionNameToken
 		and kind != LeftParenSymbol
 	):
-		out = report_at_current(out, ExpectedHashDiagnostic)
+		out = out.report_at_current(ExpectedHashDiagnostic)
 
-	out = parse_dimension_expression(out)
-	dimension: NodeId = last_node_id(out)
-	end_span: Span = node_span(out, dimension)
-	out = append_parent_node(
-		out,
+	out = out.parse_dimension_expression()
+	dimension: NodeId = out.last_node_id()
+	end_span: Span = out.node_span(dimension)
+	out = out.append_parent_node(
 		RangeTypeNode,
-		span_covering(start, end_span),
+		start.span_covering(end_span),
 		[dimension],
 	)
 	out
@@ -620,24 +608,23 @@ private pure func parse_range_type(builder: DiscoveryBuilder) -> DiscoveryBuilde
 A dimension expression: `+` and `-` over `*` and `/` over atoms.
 ---
 pure func parse_dimension_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = parse_dimension_product(builder)
+	var out: DiscoveryBuilder = builder.parse_dimension_product()
 
-	while at(out, PlusSymbol) or at(out, MinusSymbol):
-		kind: NodeKind = if at(out, PlusSymbol):
+	while out.at(PlusSymbol) or out.at(MinusSymbol):
+		kind: NodeKind = if out.at(PlusSymbol):
 			DimensionAddTypeNode
 		else:
 			DimensionSubtractTypeNode
 
-		left: NodeId = last_node_id(out)
-		out = advance_token(out)
-		out = parse_dimension_product(out)
-		right: NodeId = last_node_id(out)
+		left: NodeId = out.last_node_id()
+		out = out.advance_token()
+		out = out.parse_dimension_product()
+		right: NodeId = out.last_node_id()
 		span: Span = span_covering(
-			node_span(out, left),
-			node_span(out, right),
+			out.node_span(left),
+			out.node_span(right),
 		)
-		out = append_parent_node(
-			out,
+		out = out.append_parent_node(
 			kind,
 			span,
 			[left, right],
@@ -647,24 +634,23 @@ pure func parse_dimension_expression(builder: DiscoveryBuilder) -> DiscoveryBuil
 
 
 private pure func parse_dimension_product(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = parse_dimension_atom(builder)
+	var out: DiscoveryBuilder = builder.parse_dimension_atom()
 
-	while at(out, StarSymbol) or at(out, SlashSymbol):
-		kind: NodeKind = if at(out, StarSymbol):
+	while out.at(StarSymbol) or out.at(SlashSymbol):
+		kind: NodeKind = if out.at(StarSymbol):
 			DimensionMultiplyTypeNode
 		else:
 			DimensionDivideTypeNode
 
-		left: NodeId = last_node_id(out)
-		out = advance_token(out)
-		out = parse_dimension_atom(out)
-		right: NodeId = last_node_id(out)
+		left: NodeId = out.last_node_id()
+		out = out.advance_token()
+		out = out.parse_dimension_atom()
+		right: NodeId = out.last_node_id()
 		span: Span = span_covering(
-			node_span(out, left),
-			node_span(out, right),
+			out.node_span(left),
+			out.node_span(right),
 		)
-		out = append_parent_node(
-			out,
+		out = out.append_parent_node(
 			kind,
 			span,
 			[left, right],
@@ -678,24 +664,22 @@ private pure func parse_dimension_product(builder: DiscoveryBuilder) -> Discover
 dimension expression (which adds no node of its own).
 ---
 private pure func parse_dimension_atom(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	token: Token = current_token(builder)
+	token: Token = builder.current_token()
 
 	match token.kind:
 		DimensionNameToken:
-			var out: DiscoveryBuilder = advance_token(builder)
+			var out: DiscoveryBuilder = builder.advance_token()
 
-			if at(out, DotDotDotSymbol):
-				end: Span = current_span(out)
-				out = advance_token(out)
-				out = append_name_leaf_node(
-					out,
+			if out.at(DotDotDotSymbol):
+				end: Span = out.current_span()
+				out = out.advance_token()
+				out = out.append_name_leaf_node(
 					VariadicDimensionNameTypeNode,
-					span_covering(token.span, end),
+					token.span.span_covering(end),
 					name_id_at_row(token.payload),
 				)
 			else:
-				out = append_name_leaf_node(
-					out,
+				out = out.append_name_leaf_node(
 					DimensionNameTypeNode,
 					token.span,
 					name_id_at_row(token.payload),
@@ -704,24 +688,23 @@ private pure func parse_dimension_atom(builder: DiscoveryBuilder) -> DiscoveryBu
 			-- Builder threading rule 2.
 			out
 		HashSymbol:
-			advanced: DiscoveryBuilder = advance_token(builder)
-			parse_hash_dimension(advanced, token.span)
+			advanced: DiscoveryBuilder = builder.advance_token()
+			advanced.parse_hash_dimension(token.span)
 		IntLiteralToken:
-			advanced: DiscoveryBuilder = advance_token(builder)
-			append_literal_leaf_node(
-				advanced,
+			advanced: DiscoveryBuilder = builder.advance_token()
+			advanced.append_literal_leaf_node(
 				DimensionLiteralTypeNode,
 				token.span,
 				literal_id_at_row(token.payload),
 			)
 		LeftParenSymbol:
-			advanced: DiscoveryBuilder = advance_token(builder)
-			var out: DiscoveryBuilder = parse_dimension_expression(advanced)
-			out = expect_right_paren(out)
+			advanced: DiscoveryBuilder = builder.advance_token()
+			var out: DiscoveryBuilder = advanced.parse_dimension_expression()
+			out = out.expect_right_paren()
 			out
 		_:
-			var out: DiscoveryBuilder = report_at_current(builder, ExpectedDimensionDiagnostic)
-			out = append_leaf_node(out, MissingTypeNode, token.span)
+			var out: DiscoveryBuilder = builder.report_at_current(ExpectedDimensionDiagnostic)
+			out = out.append_leaf_node(MissingTypeNode, token.span)
 			out
 
 
@@ -734,40 +717,37 @@ private pure func parse_hash_dimension(
 	builder: DiscoveryBuilder,
 	hash_span: Span,
 ) -> DiscoveryBuilder:
-	token: Token = current_token(builder)
+	token: Token = builder.current_token()
 
 	match token.kind:
 		IntLiteralToken:
-			advanced: DiscoveryBuilder = advance_token(builder)
-			append_literal_leaf_node(
-				advanced,
+			advanced: DiscoveryBuilder = builder.advance_token()
+			advanced.append_literal_leaf_node(
 				DimensionLiteralTypeNode,
-				span_covering(hash_span, token.span),
+				hash_span.span_covering(token.span),
 				literal_id_at_row(token.payload),
 			)
 		UnderscoreSymbol:
-			var out: DiscoveryBuilder = advance_token(builder)
+			var out: DiscoveryBuilder = builder.advance_token()
 
-			if at(out, DotDotDotSymbol):
-				end: Span = current_span(out)
-				out = advance_token(out)
-				out = append_leaf_node(
-					out,
+			if out.at(DotDotDotSymbol):
+				end: Span = out.current_span()
+				out = out.advance_token()
+				out = out.append_leaf_node(
 					VariadicDimensionWildcardTypeNode,
-					span_covering(hash_span, end),
+					hash_span.span_covering(end),
 				)
 			else:
-				out = append_leaf_node(
-					out,
+				out = out.append_leaf_node(
 					DimensionWildcardTypeNode,
-					span_covering(hash_span, token.span),
+					hash_span.span_covering(token.span),
 				)
 
 			-- Builder threading rule 2.
 			out
 		_:
-			var out: DiscoveryBuilder = report_at_current(builder, ExpectedDimensionDiagnostic)
-			out = append_leaf_node(out, MissingTypeNode, hash_span)
+			var out: DiscoveryBuilder = builder.report_at_current(ExpectedDimensionDiagnostic)
+			out = out.append_leaf_node(MissingTypeNode, hash_span)
 			out
 
 
@@ -778,34 +758,31 @@ pure func parse_dimension_constraints(
 	builder: DiscoveryBuilder,
 	owner: DefinitionId,
 ) -> DiscoveryBuilder:
-	if not at(builder, WhereKeyword):
+	if not builder.at(WhereKeyword):
 		builder
 	else:
-		var out: DiscoveryBuilder = advance_token(builder)
+		var out: DiscoveryBuilder = builder.advance_token()
 		var parsing: Bool = True
 
-		while parsing and not at_end_of_tokens(out):
-			out = parse_dimension_expression(out)
-			left: NodeId = last_node_id(out)
-			out = expect_token(out, EqualEqualSymbol, ExpectedEqualEqualDiagnostic)
-			out = parse_dimension_expression(out)
-			right: NodeId = last_node_id(out)
+		while parsing and not out.at_end_of_tokens():
+			out = out.parse_dimension_expression()
+			left: NodeId = out.last_node_id()
+			out = out.expect_token(EqualEqualSymbol, ExpectedEqualEqualDiagnostic)
+			out = out.parse_dimension_expression()
+			right: NodeId = out.last_node_id()
 			span: Span = span_covering(
-				node_span(out, left),
-				node_span(out, right),
+				out.node_span(left),
+				out.node_span(right),
 			)
-			out = append_dimension_constraint(
-				out,
-				{
-					owner = owner,
-					left = left,
-					right = right,
-					span = span
-				},
-			)
+			out = out.append_dimension_constraint({
+				owner = owner,
+				left = left,
+				right = right,
+				span = span,
+			})
 
-			if at(out, CommaSymbol):
-				out = advance_token(out)
+			if out.at(CommaSymbol):
+				out = out.advance_token()
 			else:
 				parsing = False
 
@@ -817,28 +794,28 @@ pure func parse_dimension_constraints(
 `[T, #N, #_, T: Bound + ...]` type parameters of `owner`, if written.
 ---
 pure func parse_type_parameters(builder: DiscoveryBuilder, owner: DefinitionId) -> DiscoveryBuilder:
-	if not at(builder, LeftBracketSymbol):
+	if not builder.at(LeftBracketSymbol):
 		builder
 	else:
-		var out: DiscoveryBuilder = advance_token(builder)
+		var out: DiscoveryBuilder = builder.advance_token()
 		var ordinal: Int = 0
 
-		if not at(out, RightBracketSymbol):
+		if not out.at(RightBracketSymbol):
 			var parsing: Bool = True
 
-			while parsing and not at_end_of_tokens(out):
-				out = parse_type_parameter(out, owner, ordinal)
+			while parsing and not out.at_end_of_tokens():
+				out = out.parse_type_parameter(owner, ordinal)
 				ordinal += 1
 
-				if at(out, CommaSymbol):
-					out = advance_token(out)
+				if out.at(CommaSymbol):
+					out = out.advance_token()
 
-					if at(out, RightBracketSymbol):
+					if out.at(RightBracketSymbol):
 						parsing = False
 				else:
 					parsing = False
 
-		out = expect_token(out, RightBracketSymbol, ExpectedRightBracketDiagnostic)
+		out = out.expect_token(RightBracketSymbol, ExpectedRightBracketDiagnostic)
 		out
 
 
@@ -848,11 +825,11 @@ wildcard dimension, a `#` followed by anything else a (reported) dimension,
 and a name a type parameter.
 ---
 private pure func type_parameter_kind_at_cursor(builder: DiscoveryBuilder) -> TypeParameterKind:
-	match current_kind(builder):
+	match builder.current_kind():
 		DimensionNameToken:
 			DimensionParameter
 		HashSymbol:
-			if peek_kind(builder, 1) == UnderscoreSymbol:
+			if builder.peek_kind(1) == UnderscoreSymbol:
 				WildcardDimensionParameter
 			else:
 				DimensionParameter
@@ -869,16 +846,16 @@ private pure func consume_type_parameter_name(
 ) -> DiscoveryBuilder:
 	match kind:
 		TypeParameter:
-			consume_declared_name(builder)
+			builder.consume_declared_name()
 		WildcardDimensionParameter:
-			advanced: DiscoveryBuilder = advance_token(builder)
-			advance_token(advanced)
+			advanced: DiscoveryBuilder = builder.advance_token()
+			advanced.advance_token()
 		DimensionParameter:
-			if at(builder, HashSymbol):
-				advanced: DiscoveryBuilder = advance_token(builder)
-				report_at_current(advanced, ExpectedDimensionDiagnostic)
+			if builder.at(HashSymbol):
+				advanced: DiscoveryBuilder = builder.advance_token()
+				advanced.report_at_current(ExpectedDimensionDiagnostic)
 			else:
-				advance_token(builder)
+				builder.advance_token()
 
 
 private pure func token_span_at(builder: DiscoveryBuilder, index: Int) -> Span:
@@ -886,7 +863,7 @@ private pure func token_span_at(builder: DiscoveryBuilder, index: Int) -> Span:
 		Some(token):
 			token.span
 		None:
-			current_span(builder)
+			builder.current_span()
 
 
 private pure func parse_type_parameter(
@@ -894,12 +871,12 @@ private pure func parse_type_parameter(
 	owner: DefinitionId,
 	ordinal: Int,
 ) -> DiscoveryBuilder:
-	token: Token = current_token(builder)
-	kind: TypeParameterKind = type_parameter_kind_at_cursor(builder)
+	token: Token = builder.current_token()
+	kind: TypeParameterKind = builder.type_parameter_kind_at_cursor()
 
 	name: NameId = match kind:
 		TypeParameter:
-			declared_name_at_cursor(builder)
+			builder.declared_name_at_cursor()
 		DimensionParameter:
 			if token.kind == DimensionNameToken:
 				name_id_at_row(token.payload)
@@ -909,48 +886,39 @@ private pure func parse_type_parameter(
 			name_id_at_row(DISCARD_NAME_INDEX)
 
 	name_span: Span = if kind == WildcardDimensionParameter:
-		span_covering(
-			token.span,
-			token_span_at(builder, builder.token_cursor + 1),
-		)
+		token.span.span_covering(builder.token_span_at(builder.token_cursor + 1))
 	else:
 		token.span
 
-	var out: DiscoveryBuilder = consume_type_parameter_name(builder, kind)
+	var out: DiscoveryBuilder = builder.consume_type_parameter_name(kind)
 	var end_span: Span = name_span
 
-	if at(out, ColonSymbol):
-		out = advance_token(out)
+	if out.at(ColonSymbol):
+		out = out.advance_token()
 		var parsing: Bool = True
 
-		while parsing and not at_end_of_tokens(out):
-			bound_name: NameId = referenced_name_at_cursor(out)
-			bound_span: Span = current_span(out)
-			out = consume_referenced_name(out)
-			out = append_bound(
-				out,
-				{
-					owner = owner,
-					parameter_ordinal = ordinal,
-					trait_name = bound_name,
-					span = bound_span
-				},
-			)
+		while parsing and not out.at_end_of_tokens():
+			bound_name: NameId = out.referenced_name_at_cursor()
+			bound_span: Span = out.current_span()
+			out = out.consume_referenced_name()
+			out = out.append_bound({
+				owner = owner,
+				parameter_ordinal = ordinal,
+				trait_name = bound_name,
+				span = bound_span,
+			})
 			end_span = bound_span
 
-			if at(out, PlusSymbol):
-				out = advance_token(out)
+			if out.at(PlusSymbol):
+				out = out.advance_token()
 			else:
 				parsing = False
 
-	out = append_type_parameter(
-		out,
-		{
-			owner = owner,
-			ordinal = ordinal,
-			name = name,
-			kind = kind,
-			span = span_covering(name_span, end_span)
-		},
-	)
+	out = out.append_type_parameter({
+		owner = owner,
+		ordinal = ordinal,
+		name = name,
+		kind = kind,
+		span = name_span.span_covering(end_span),
+	})
 	out
