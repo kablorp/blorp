@@ -4,7 +4,7 @@ import:
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ANONYMOUS_IDENTITY,
 		ModuleIdentity,
-		ModuleOrigin(UserModule),
+		ModuleOrigin(StdlibModule, UserModule),
 		loaded_module_identity,
 		loaded_module_set,
 		loaded_module_set_target,
@@ -27,8 +27,20 @@ import:
 		func_callable_key,
 		func_callable_keys_equal,
 		source_definition_key,
+	../../../src/compiler/stage_06_typecheck/graph/definition_table_storage:
+		definition_table_first_graph_definition_id,
+		definition_table_prelude_traits_module_id,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		prelude_trait_compiler_builtin_id,
+		trait_id_from_definition_table,
+	../../../src/compiler/stage_06_typecheck/type_system/trait_identity:
+		TRAIT_ID_EQUATABLE,
+		TraitId,
+		trait_ids_equal,
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
 		DefinitionIndex,
+		definition_index_definition_table,
+		definition_index_for_loaded_modules,
 		DefinitionIndexConflict,
 		definition_index_conflict_message,
 		definition_index_conflict_message_for_module,
@@ -595,9 +607,82 @@ pure func test_definition_index_rejects_cross_kind_id_reuse() -> Bool:
 	definition_index_rejects_cross_kind_id_reuse().get_or(False)
 
 
+---
+The compiler builtin that the first trait declared by a one-module graph links
+to, with that module loaded under `origin` at `canonical_path` and named
+`source_module_name` in its source.
+---
+private pure func linked_builtin_of_first_trait(
+	origin: ModuleOrigin,
+	canonical_path: String,
+	source_module_name: String,
+) -> Option[TraitId]:
+	program = TypecheckTestSupport.finalized_typecheck_program_fixture(
+		"traits.brp",
+		source_module_name,
+		"trait Equatable:\n\tpure func equals(self: Self) -> Bool",
+	)
+	identity = resolved_module_identity_from_resolver(canonical_path, origin)
+	modules ?= loaded_module_set(module_load_candidate(identity, program), []).to_option()
+	table ?= module_table([identity]).to_option()
+	index ?= definition_index_for_loaded_modules(
+		definition_index_initial_seed(ENV_EMPTY),
+		table,
+		modules,
+	)
+	definition_table = definition_index_definition_table(index)
+	first_trait ?= trait_id_from_definition_table(
+		definition_table,
+		definition_table_first_graph_definition_id(definition_table),
+	)
+	prelude_trait_compiler_builtin_id(definition_table, first_trait)
+
+
+-- Std's prelude-traits module links its `Equatable` to the compiler builtin
+-- even when mounted under another canonical path, because the source module
+-- name still says `traits`.
+func test_mounted_std_traits_module_links_its_trait_to_the_builtin() -> Bool:
+	match linked_builtin_of_first_trait(StdlibModule, "mounted/traits", "traits"):
+		Some(id):
+			trait_ids_equal(id, TRAIT_ID_EQUATABLE)
+		None:
+			False
+
+
+-- A user module that happens to be named `traits` is not the prelude.
+func test_user_module_named_traits_does_not_link_to_a_builtin() -> Bool:
+	linked_builtin_of_first_trait(UserModule, "traits", "traits").is_none()
+
+
+-- A table built without the loaded-module path has no prelude module, so it
+-- never links a graph trait to a builtin.
+func test_graphless_definition_table_never_links_builtins() -> Bool:
+	match module_table([resolved_module_identity_from_resolver("traits", StdlibModule)]).to_option():
+		Some(table):
+			empty_table = definition_index_definition_table(
+				definition_index_empty(definition_index_initial_seed(ENV_EMPTY), table),
+			)
+
+			definition_table_prelude_traits_module_id(empty_table).is_none()
+		None:
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler definition index module identity",
 	tests = [
+		(
+			"mounted std traits module links its trait to the builtin",
+			test_mounted_std_traits_module_links_its_trait_to_the_builtin,
+		),
+		(
+			"user module named traits does not link to a builtin",
+			test_user_module_named_traits_does_not_link_to_a_builtin,
+		),
+		(
+			"graphless definition table never links builtins",
+			test_graphless_definition_table_never_links_builtins,
+		),
 		(
 			"definition keys include canonical module identity",
 			test_definition_keys_include_canonical_module_identity,

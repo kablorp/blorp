@@ -235,6 +235,7 @@ import:
 		GlobalId,
 		ImplId,
 		builtin_trait_id,
+		prelude_trait_compiler_builtin_id,
 		callable_id_definition_id,
 		callable_id_module_id,
 		callable_id_name,
@@ -254,6 +255,7 @@ import:
 		trait_id_name,
 		trait_id_source_span,
 	type_system/trait_identity:
+		EXIT_STATUS_TRAIT_NAME,
 		TraitId,
 		graph_trait_id,
 		trait_id_is_compiler_builtin,
@@ -602,6 +604,7 @@ import:
 		AcceptedTraitOnlyProjection,
 		AcceptedTraitTableRecord,
 		AcceptedTraitVisibility,
+		bound_trait_identity_from_id,
 		accepted_has_direct_trait_evidence,
 		accepted_implementation_definition_ids_for_owner,
 		accepted_resolve_trait_obligation,
@@ -2926,24 +2929,6 @@ private pure func callable_header_parameter_name(binder: CallableParameterBinder
 			None
 
 
-private pure func bound_trait_identity(
-	definition_table: DefinitionTable,
-	id: TraitId,
-) -> BoundTraitIdentity:
-	owner = match trait_id_module_id(definition_table, id):
-		Some(module_id):
-			GraphBoundTraitOwner(module_id)
-		None:
-			CompilerBuiltinBoundTraitOwner
-
-	{
-		owner = owner,
-		definition_id = trait_id_definition_id(id),
-		name = trait_id_name(definition_table, id),
-		span = trait_id_source_span(definition_table, id)
-	}
-
-
 private pure func callable_header_bound_type_params(
 	definition_table: DefinitionTable,
 	header: CallableHeader,
@@ -2992,7 +2977,7 @@ private pure func callable_header_bound_type_params(
 					callable_type_parameter_bounds(
 						parameter,
 					).map(
-						func(id): bound_trait_identity(definition_table, id),
+						func(id): bound_trait_identity_from_id(definition_table, id),
 					),
 				),
 			)
@@ -3741,7 +3726,7 @@ private pure func implementation_bound_type_params(
 			resolved_implementation_type_parameter_bounds(
 				parameter,
 			).map(
-				func(id): bound_trait_identity(definition_table, id),
+				func(id): bound_trait_identity_from_id(definition_table, id),
 			),
 		))
 
@@ -3760,7 +3745,7 @@ private pure func implementation_method_bound_type_params(
 			resolved_implementation_method_type_parameter_bounds(
 				parameter,
 			).map(
-				func(id): bound_trait_identity(definition_table, id),
+				func(id): bound_trait_identity_from_id(definition_table, id),
 			),
 		),
 	)
@@ -4428,17 +4413,22 @@ private pure func check_main_signature_for_program(
 				):
 					True
 				else:
-					return_resolution = typecheck_resolve_trait_obligation(
-						state,
-						trait_obligation(return_type, "ExitStatusAble"),
-					)
-
-					match return_resolution:
-						TraitObligationSatisfied:
-							True
-						TraitObligationDeferred:
-							False
-						TraitObligationUnsatisfied:
+					-- ExitStatusAble is a standard-library trait, so its identity comes
+					-- from the declaration the module can see; a module that cannot see
+					-- it has no evidence for a custom return type.
+					match typecheck_find_trait(state, EXIT_STATUS_TRAIT_NAME):
+						Some(exit_status_trait):
+							match typecheck_resolve_trait_obligation(
+								state,
+								trait_obligation(return_type, exit_status_trait.trait_id),
+							):
+								TraitObligationSatisfied:
+									True
+								TraitObligationDeferred:
+									False
+								TraitObligationUnsatisfied:
+									False
+						None:
 							False
 
 				if not param_valid and not return_valid:
@@ -5014,10 +5004,16 @@ private pure func impl_validate_supertraits(
 	var next = state
 
 	for supertrait in supertraits:
-		if not typecheck_has_direct_trait_evidence(
-			next,
-			trait_obligation(for_type, supertrait),
-		):
+		has_evidence = match typecheck_find_trait(next, supertrait):
+			Some(supertrait_def):
+				typecheck_has_direct_trait_evidence(
+					next,
+					trait_obligation(for_type, supertrait_def.trait_id),
+				)
+			None:
+				False
+
+		if not has_evidence:
 			next = typecheck_state_add_error(
 				next,
 				impl_error_message(
@@ -7104,22 +7100,10 @@ private pure func prepared_module_environments(
 			Some(index):
 				match bases.get(index):
 					Some(base):
-						program = bound_module_program(base.bound_module)
-						is_prelude_traits = prelude_traits_module_matches(
-							prepared_module_scope_origin(bound_module_scope(base.bound_module)),
-							base.module_path,
-							program.source.module_name,
+						compiler_builtin_id = prelude_trait_compiler_builtin_id(
+							definition_table,
+							trait_topology_header_id(header),
 						)
-
-						compiler_builtin_id = if is_prelude_traits:
-							builtin_trait_id(
-								trait_id_name(
-									definition_table,
-									trait_topology_header_id(header),
-								),
-							)
-						else:
-							None
 
 						match prepare_accepted_trait_header(
 							base.state,

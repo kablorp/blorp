@@ -40,6 +40,8 @@ import:
 		impl_ids_equal,
 		trait_id_definition_id,
 		trait_id_from_definition_table,
+		trait_id_compiler_identity,
+		trait_id_spelling,
 		trait_id_module_id,
 		trait_id_name,
 		trait_id_source_span,
@@ -47,6 +49,8 @@ import:
 		trait_method_id_owner,
 		trait_method_ids_equal,
 	../type_system/trait_identity:
+		TRAIT_ID_HAS_LENGTH,
+		TRAIT_ID_STRINGABLE,
 		TraitId,
 		trait_id_is_compiler_builtin,
 		trait_id_storage_key,
@@ -2202,7 +2206,10 @@ pure func accepted_qualified_trait_implementation_method(
 	from_opaque AcceptedQualifiedTraitMethodInfo(info).implementation_method
 
 
-private pure func bound_trait_identity_from_id(
+---
+The exact bound identity of the trait `id`, described by `definition_table`.
+---
+pure func bound_trait_identity_from_id(
 	definition_table: DefinitionTable,
 	id: TraitId,
 ) -> BoundTraitIdentity:
@@ -2213,6 +2220,7 @@ private pure func bound_trait_identity_from_id(
 			CompilerBuiltinBoundTraitOwner
 
 	{
+		trait_id = trait_id_compiler_identity(definition_table, id),
 		owner = owner,
 		definition_id = trait_id_definition_id(id),
 		name = trait_id_name(definition_table, id),
@@ -2776,7 +2784,7 @@ pure func accepted_resolve_exact_trait_obligation(
 							Some(_):
 								env_resolve_trait_obligation(
 									env,
-									trait_obligation(typ, identity.name),
+									trait_obligation(typ, identity.trait_id),
 								)
 							None:
 								TraitObligationUnsatisfied
@@ -2792,7 +2800,7 @@ pure func accepted_resolve_exact_trait_obligation(
 							Some(_):
 								env_resolve_trait_obligation(
 									env,
-									trait_obligation(typ, identity.name),
+									trait_obligation(typ, identity.trait_id),
 								)
 							None:
 								TraitObligationUnsatisfied
@@ -2800,7 +2808,7 @@ pure func accepted_resolve_exact_trait_obligation(
 			if identity.owner == CompilerBuiltinBoundTraitOwner:
 				env_resolve_trait_obligation(
 					env,
-					trait_obligation(typ, identity.name),
+					trait_obligation(typ, identity.trait_id),
 				)
 			else:
 				TraitObligationUnsatisfied
@@ -2823,10 +2831,7 @@ private pure func accepted_or_compiler_trait_id_obligation_resolution(
 		Some(compiler_id):
 			env_resolve_trait_obligation(
 				env,
-				trait_obligation(
-					typ,
-					trait_id_name(table.definition_table, compiler_id),
-				),
+				trait_obligation(typ, compiler_id),
 			)
 		None:
 			TraitObligationUnsatisfied
@@ -2891,24 +2896,36 @@ pure func accepted_find_unsatisfied_bound_type_param(
 ) -> Option[TraitObligation]:
 	var unsatisfied: Option[TraitObligation] = None
 
-	for indexed_name in param.bounds.enumerate():
-		name = indexed_name[1]
-
-		resolution = match param.bound_identities.get(indexed_name[0]):
-			Some(identity):
-				accepted_resolve_exact_trait_obligation(authority, env, concrete_type, identity)
-			None:
-				accepted_resolve_trait_obligation(
-					authority,
-					env,
-					trait_obligation(concrete_type, name),
-				)
-
-		if resolution == TraitObligationUnsatisfied:
-			unsatisfied = Some(trait_obligation(concrete_type, name))
+	for identity in param.bound_identities:
+		if accepted_resolve_exact_trait_obligation(
+			authority,
+			env,
+			concrete_type,
+			identity,
+		) == TraitObligationUnsatisfied:
+			unsatisfied = Some(trait_obligation(concrete_type, identity.trait_id))
 			break
 
 	unsatisfied
+
+
+---
+The spelling of the trait an obligation names, for the authority's name-indexed
+walks (supertraits, implementation candidates, compiler fallback) until they
+take identities themselves. The authority's own definition table describes the
+graph traits its obligations name; builtins need no table.
+---
+private pure func accepted_obligation_trait_name(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligation: TraitObligation,
+) -> Option[String]:
+	trait_id_spelling(
+		env,
+		Some(table_rep(authority_rep(authority).table).definition_table),
+		[],
+		obligation.trait_id,
+	)
 
 
 private pure func accepted_or_compiler_trait_obligation_resolution(
@@ -2916,35 +2933,57 @@ private pure func accepted_or_compiler_trait_obligation_resolution(
 	env: Env,
 	obligation: TraitObligation,
 ) -> TraitObligationResolution:
-	if accepted_trait_allows_compiler_fallback(authority, obligation.trait_name):
-		env_resolve_trait_obligation(env, obligation)
-	else:
-		TraitObligationUnsatisfied
+	match accepted_obligation_trait_name(authority, env, obligation):
+		Some(trait_name):
+			if accepted_trait_allows_compiler_fallback(authority, trait_name):
+				env_resolve_trait_obligation(env, obligation)
+			else:
+				TraitObligationUnsatisfied
+		None:
+			TraitObligationUnsatisfied
 
 
+---
+Resolve an obligation against the accepted implementations. The authority's
+candidate and supertrait walks are still name-indexed, so an obligation whose id
+no source can spell has nothing to look up and is unsatisfied.
+---
 pure func accepted_resolve_trait_obligation(
 	authority: AcceptedTraitImplementationAuthority,
 	env: Env,
 	obligation: TraitObligation,
 ) -> TraitObligationResolution:
+	match accepted_obligation_trait_name(authority, env, obligation):
+		Some(trait_name):
+			accepted_resolve_named_trait_obligation(authority, env, obligation, trait_name)
+		None:
+			TraitObligationUnsatisfied
+
+
+private pure func accepted_resolve_named_trait_obligation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligation: TraitObligation,
+	trait_name: String,
+) -> TraitObligationResolution:
 	match obligation.obligation_type:
 		SemanticMetaType(_, _):
 			TraitObligationDeferred
 		SemanticTypeVar(name, _):
-			if accepted_type_param_has_trait_bound(authority, env, name, obligation.trait_name):
+			if accepted_type_param_has_trait_bound(authority, env, name, trait_name):
 				TraitObligationSatisfied
 			else:
 				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
 		SemanticNamedType(name, args):
 			if (
 				args.length() == 0
-				and accepted_type_param_has_trait_bound(authority, env, name, obligation.trait_name)
+				and accepted_type_param_has_trait_bound(authority, env, name, trait_name)
 			):
 				TraitObligationSatisfied
 			else if accepted_has_matching_implementation(
 				authority,
 				env,
-				obligation.trait_name,
+				trait_name,
 				obligation.obligation_type,
 			):
 				TraitObligationSatisfied
@@ -2952,12 +2991,12 @@ pure func accepted_resolve_trait_obligation(
 				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
 		SemanticArrayType(_, _):
 			if (
-				obligation.trait_name == "HasLength"
-				or obligation.trait_name == "Stringable"
+				trait_ids_equal(obligation.trait_id, TRAIT_ID_HAS_LENGTH)
+				or trait_ids_equal(obligation.trait_id, TRAIT_ID_STRINGABLE)
 				or accepted_has_matching_implementation(
 					authority,
 					env,
-					obligation.trait_name,
+					trait_name,
 					obligation.obligation_type,
 				)
 			):
@@ -2968,7 +3007,7 @@ pure func accepted_resolve_trait_obligation(
 			if accepted_has_matching_implementation(
 				authority,
 				env,
-				obligation.trait_name,
+				trait_name,
 				obligation.obligation_type,
 			):
 				TraitObligationSatisfied
@@ -3334,21 +3373,32 @@ pure func accepted_has_direct_trait_evidence(
 	env: Env,
 	obligation: TraitObligation,
 ) -> Bool:
+	match accepted_obligation_trait_name(authority, env, obligation):
+		Some(trait_name):
+			accepted_has_named_direct_trait_evidence(authority, env, obligation, trait_name)
+		None:
+			False
+
+
+private pure func accepted_has_named_direct_trait_evidence(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	obligation: TraitObligation,
+	trait_name: String,
+) -> Bool:
 	-- Direct evidence deliberately excludes implementations of subtraits. The
 	-- canonical source-prelude declaration and its compiler builtin are the only
 	-- distinct IDs that can represent the same trait.
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
 
-	requested_trait_id = match representation.trait_indices_by_semantic_name.get(
-		obligation.trait_name,
-	):
+	requested_trait_id = match representation.trait_indices_by_semantic_name.get(trait_name):
 		Some(index):
 			table.traits
 				.get(index)
 				.map(func(item): item.id)
 		None:
-			builtin_trait_id(obligation.trait_name)
+			Some(obligation.trait_id)
 
 	var found: Bool = False
 
@@ -3356,7 +3406,7 @@ pure func accepted_has_direct_trait_evidence(
 		Some(requested):
 			for index in implementation_candidate_indices_for_trait(
 				representation,
-				obligation.trait_name,
+				trait_name,
 			):
 				match table.implementations.get(index):
 					Some(item):
@@ -3383,10 +3433,10 @@ pure func accepted_has_direct_trait_evidence(
 	else:
 		match obligation.obligation_type:
 			SemanticTypeVar(name, _):
-				accepted_type_param_has_trait_bound(authority, env, name, obligation.trait_name)
+				accepted_type_param_has_trait_bound(authority, env, name, trait_name)
 			_:
 				(
-					accepted_trait_allows_compiler_fallback(authority, obligation.trait_name)
+					accepted_trait_allows_compiler_fallback(authority, trait_name)
 					and env_resolve_trait_obligation(env, obligation) == TraitObligationSatisfied
 				)
 

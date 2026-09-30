@@ -148,6 +148,7 @@ import:
 		CallableId,
 		ConstructorId,
 		builtin_trait_id,
+		trait_id_spelling,
 		callable_id_definition_id,
 		callable_id_from_definition_table,
 		callable_id_from_reserved_graph_definition,
@@ -159,6 +160,16 @@ import:
 		trait_id_name,
 		trait_method_id_owner,
 	type_system/trait_identity:
+		TRAIT_ID_ADDABLE,
+		TRAIT_ID_DIVISIBLE,
+		TRAIT_ID_EQUATABLE,
+		TRAIT_ID_FLOATING_POINT,
+		TRAIT_ID_INTEGER,
+		TRAIT_ID_MODULABLE,
+		TRAIT_ID_MULTIPLIABLE,
+		TRAIT_ID_NEGATABLE,
+		TRAIT_ID_ORDERABLE,
+		TRAIT_ID_SUBTRACTABLE,
 		TraitId,
 		trait_ids_equal,
 	int: add_saturating, multiply_saturating
@@ -357,6 +368,7 @@ import:
 		env_get_opaque_alias,
 		env_get_record,
 		env_get_trait,
+		env_get_trait_by_id,
 		env_get_type_decl,
 		env_get_type_kind,
 		env_get_type_params,
@@ -1314,7 +1326,7 @@ private pure func infer_has_compiler_structural_equality(
 	obligation: TraitObligation,
 ) -> Bool:
 	(
-		obligation.trait_name == "Equatable"
+		trait_ids_equal(obligation.trait_id, TRAIT_ID_EQUATABLE)
 		and infer_type_has_compiler_structural_equality(session, obligation.obligation_type)
 	)
 
@@ -1330,7 +1342,7 @@ private pure func infer_resolve_trait_obligation(
 		-- exactly when their components are. Resolving the components here,
 		-- rather than through the stdlib impl's bounds, keeps enums (which only
 		-- the module view can identify) admissible as components.
-		components = if obligation.trait_name == "Equatable":
+		components = if trait_ids_equal(obligation.trait_id, TRAIT_ID_EQUATABLE):
 			equality_component_types(obligation.obligation_type)
 		else:
 			None
@@ -1357,7 +1369,7 @@ private pure func infer_resolve_all_equatable(
 		-- is decided by the scalar Int it defaults to.
 		match infer_resolve_trait_obligation(
 			session,
-			trait_obligation(scalar_int_value_type(typ), "Equatable"),
+			trait_obligation(scalar_int_value_type(typ), TRAIT_ID_EQUATABLE),
 		):
 			TraitObligationSatisfied:
 				void
@@ -6270,10 +6282,29 @@ private pure func is_modulo_binary_op(op: ParsedBinaryOp) -> Bool:
 			False
 
 
-private pure func arithmetic_trait_name(op: ParsedBinaryOp) -> String:
+private pure func arithmetic_trait_id(op: ParsedBinaryOp) -> TraitId:
 	match op:
 		ParsedAddOp:
-			"Addable"
+			TRAIT_ID_ADDABLE
+		ParsedSubtractOp:
+			TRAIT_ID_SUBTRACTABLE
+		ParsedMultiplyOp:
+			TRAIT_ID_MULTIPLIABLE
+		ParsedDivideOp:
+			TRAIT_ID_DIVISIBLE
+		ParsedModuloOp:
+			TRAIT_ID_MODULABLE
+		_:
+			TRAIT_ID_ADDABLE
+
+
+---
+How a diagnostic spells the arithmetic trait of `op`. Kept beside
+`arithmetic_trait_id` as the one place these five spellings live; nothing
+compares them.
+---
+private pure func arithmetic_trait_spelling(op: ParsedBinaryOp) -> String:
+	match op:
 		ParsedSubtractOp:
 			"Subtractable"
 		ParsedMultiplyOp:
@@ -6327,11 +6358,11 @@ private pure func type_param_name(context: InferContext, typ: SemanticType) -> O
 private pure func type_satisfies_trait(
 	context: InferContext,
 	typ: SemanticType,
-	trait_name: String,
+	trait_id: TraitId,
 ) -> Bool:
 	infer_resolve_trait_obligation(
 		context.state,
-		trait_obligation(typ, trait_name),
+		trait_obligation(typ, trait_id),
 	) == TraitObligationSatisfied
 
 
@@ -6346,13 +6377,13 @@ private pure func tensor_element_supports_native_arithmetic(
 		match type_param_name(context, typ):
 			Some(_):
 				(
-					type_satisfies_trait(context, typ, "Integer")
-					or type_satisfies_trait(context, typ, "FloatingPoint")
+					type_satisfies_trait(context, typ, TRAIT_ID_INTEGER)
+					or type_satisfies_trait(context, typ, TRAIT_ID_FLOATING_POINT)
 				)
 			None:
 				False
 
-	native_family and type_satisfies_trait(context, typ, arithmetic_trait_name(op))
+	native_family and type_satisfies_trait(context, typ, arithmetic_trait_id(op))
 
 
 private pure func dim_is_variadic(typ: SemanticType) -> Bool:
@@ -6452,7 +6483,8 @@ private pure func check_arithmetic_binary_op(
 			else:
 				left_param_name = type_param_name(context, left_type)
 				right_param_name = type_param_name(context, right_type)
-				trait_name = arithmetic_trait_name(op)
+				trait_id = arithmetic_trait_id(op)
+				trait_name = arithmetic_trait_spelling(op)
 
 				match (left_param_name, right_param_name):
 					(Some(left_name), Some(right_name)):
@@ -6466,7 +6498,7 @@ private pure func check_arithmetic_binary_op(
 								) + " and " + type_to_string(right_type),
 							)
 							checked_type(next, TYPE_VOID)
-						else if type_satisfies_trait(context, left_type, trait_name):
+						else if type_satisfies_trait(context, left_type, trait_id):
 							checked_type(context, left_type)
 						else:
 							next = infer_error(
@@ -6479,7 +6511,7 @@ private pure func check_arithmetic_binary_op(
 					_:
 						if (
 							types_equal(left_type, right_type)
-							and type_satisfies_trait(context, left_type, trait_name)
+							and type_satisfies_trait(context, left_type, trait_id)
 						):
 							checked_type(context, left_type)
 						else:
@@ -6510,7 +6542,7 @@ private pure func check_comparison_binary_op(
 					"Comparison requires the same type parameter, got " + left_name + " and " + right_name,
 				)
 				checked_type(next, TYPE_VOID)
-			else if type_satisfies_trait(context, left_type, "Orderable"):
+			else if type_satisfies_trait(context, left_type, TRAIT_ID_ORDERABLE):
 				checked_type(context, TYPE_BOOL)
 			else:
 				next = infer_error(
@@ -6521,7 +6553,7 @@ private pure func check_comparison_binary_op(
 		_:
 			if (
 				types_equal(left_type, right_type)
-				and type_satisfies_trait(context, left_type, "Orderable")
+				and type_satisfies_trait(context, left_type, TRAIT_ID_ORDERABLE)
 			):
 				checked_type(context, TYPE_BOOL)
 			else:
@@ -6549,7 +6581,7 @@ private pure func list_element_type(typ: SemanticType) -> Option[SemanticType]:
 private pure func equality_element_help(context: InferContext, typ: SemanticType) -> String:
 	match list_element_type(typ):
 		Some(element):
-			if type_satisfies_trait(context, element, "Equatable"):
+			if type_satisfies_trait(context, element, TRAIT_ID_EQUATABLE):
 				""
 			else:
 				" (List equality compares elements with ==; add 'implements Equatable for " + type_to_string(
@@ -6589,7 +6621,7 @@ private pure func check_equality_binary_op(
 							) + " because equality requires the same type",
 						)
 						checked_type(next, TYPE_VOID)
-					else if type_satisfies_trait(next_context, zonked_left, "Equatable"):
+					else if type_satisfies_trait(next_context, zonked_left, TRAIT_ID_EQUATABLE):
 						checked_type(next_context, TYPE_BOOL)
 					else:
 						next = infer_error(
@@ -6598,7 +6630,7 @@ private pure func check_equality_binary_op(
 						)
 						checked_type(next, TYPE_VOID)
 				_:
-					if type_satisfies_trait(next_context, zonked_left, "Equatable"):
+					if type_satisfies_trait(next_context, zonked_left, TRAIT_ID_EQUATABLE):
 						checked_type(next_context, TYPE_BOOL)
 					else:
 						next = infer_error_at(
@@ -6694,7 +6726,7 @@ private pure func tensor_negation_satisfies_trait(context: InferContext, typ: Se
 				or is_any_float_type(element_type)
 			)
 
-			native_family and type_satisfies_trait(context, element_type, "Negatable")
+			native_family and type_satisfies_trait(context, element_type, TRAIT_ID_NEGATABLE)
 		_:
 			False
 
@@ -6723,7 +6755,7 @@ private pure func check_unary_op(
 					"Cannot negate unsigned type " + type_to_string(operand_type),
 				)
 				checked_type(next, TYPE_VOID)
-			else if type_satisfies_trait(context, operand_type, "Negatable"):
+			else if type_satisfies_trait(context, operand_type, TRAIT_ID_NEGATABLE):
 				checked_type(context, operand_type)
 			else:
 				match type_param_name(context, operand_type):
@@ -9658,11 +9690,12 @@ private pure func check_call_trait_bounds_for_params(
 			Some(concrete_type):
 				match infer_find_unsatisfied_bound_type_param(next.state, param, concrete_type):
 					Some(obligation):
-						next = call_trait_bound_error(
+						next = report_unsatisfied_obligation(
 							next,
 							callee_name,
 							concrete_type,
-							obligation.trait_name,
+							param.bound_identities,
+							obligation,
 						)
 					None:
 						void
@@ -9670,6 +9703,33 @@ private pure func check_call_trait_bounds_for_params(
 				void
 
 	next
+
+
+---
+Report an obligation that failed: name the trait through `trait_id_spelling`
+(a bound's own identity first). A trait no source can spell is an internal
+invariant violation, not a message with a placeholder name.
+---
+private pure func report_unsatisfied_obligation(
+	context: InferContext,
+	callee_name: String,
+	concrete_type: SemanticType,
+	carried: List[BoundTraitIdentity],
+	obligation: TraitObligation,
+) -> InferContext:
+	match trait_id_spelling(
+		context.state.env,
+		infer_module_facts_definition_table(context.state.facts),
+		carried,
+		obligation.trait_id,
+	):
+		Some(trait_name):
+			call_trait_bound_error(context, callee_name, concrete_type, trait_name)
+		None:
+			infer_error(
+				context,
+				"internal typecheck error: an unsatisfied obligation names a trait with no known spelling",
+			)
 
 
 private pure func trait_self_type_from_call(
@@ -9709,13 +9769,13 @@ private pure func infer_find_unsatisfied_exact_trait_obligation(
 				obligation_type,
 				identity,
 			) == TraitObligationUnsatisfied:
-				Some(trait_obligation(obligation_type, identity.name))
+				Some(trait_obligation(obligation_type, identity.trait_id))
 			else:
 				None
 		None:
 			infer_find_unsatisfied_trait_obligation(
 				session,
-				[trait_obligation(obligation_type, identity.name)],
+				[trait_obligation(obligation_type, identity.trait_id)],
 			)
 
 
@@ -9742,22 +9802,18 @@ private pure func check_trait_method_self_bound(
 
 					resolution = match accepted_context:
 						(Some(accepted_authority), Some(issuing_table)):
-							is_structural_equality = match builtin_trait_id("Equatable"):
-								Some(compiler_trait_id):
-									(
-										accepted_trait_matches_compiler_identity(
-											accepted_authority,
-											issuing_table,
-											trait_id,
-											compiler_trait_id,
-										)
-										and infer_type_has_compiler_structural_equality(
-											context.state,
-											obligation_type,
-										)
-									)
-								None:
-									False
+							is_structural_equality = (
+								accepted_trait_matches_compiler_identity(
+									accepted_authority,
+									issuing_table,
+									trait_id,
+									TRAIT_ID_EQUATABLE,
+								)
+								and infer_type_has_compiler_structural_equality(
+									context.state,
+									obligation_type,
+								)
+							)
 
 							if is_structural_equality:
 								TraitObligationSatisfied
@@ -9787,26 +9843,33 @@ private pure func check_trait_method_self_bound(
 						self_type,
 					).get_or(self_type)
 
-					unsatisfied = match call.trait_identity:
+					-- A call resolved only by trait spelling (no exact identity) names a
+					-- trait through the environment; a spelling the environment does not
+					-- know cannot be satisfied.
+					unsatisfied_trait_name: Option[String] = match call.trait_identity:
 						Some(identity):
 							infer_find_unsatisfied_exact_trait_obligation(
 								context.state,
 								obligation_type,
 								identity,
-							)
+							).map(func(_obligation): identity.name)
 						None:
-							infer_find_unsatisfied_trait_obligation(
-								context.state,
-								[trait_obligation(obligation_type, trait_name)],
-							)
+							match env_get_trait(context.state.env, trait_name):
+								Some(trait_def):
+									infer_find_unsatisfied_trait_obligation(
+										context.state,
+										[trait_obligation(obligation_type, trait_def.trait_id)],
+									).map(func(_obligation): trait_name)
+								None:
+									Some(trait_name)
 
-					match unsatisfied:
-						Some(obligation):
+					match unsatisfied_trait_name:
+						Some(unsatisfied_name):
 							call_trait_bound_error(
 								context,
 								call.callee_name,
 								self_type,
-								obligation.trait_name,
+								unsatisfied_name,
 							)
 						None:
 							context
