@@ -3617,6 +3617,167 @@ private func accepted_trait_table_validation_is_owner_safe() -> Option[Bool]:
 	))
 
 
+private pure func generic_pair_record_decl() -> ParsedDecl:
+	RecordParsedDecl({
+		name = ident("Pair"),
+		type_params = [type_param("A"), type_param("B")],
+		fields = [field_decl("first", named_type("A")), field_decl("second", named_type("B"))],
+		is_struct = False,
+		doc = None,
+		span = fixture_source_span(),
+	})
+
+
+---
+The type parameters of the first typed impl, each as
+`name:written bounds|bound identity names`.
+---
+private func accepted_impl_type_params(decls: List[ParsedDecl]) -> String:
+	accepted = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program(decls),
+	)
+	var rendered: String = ""
+
+	for decl in accepted.program.decls:
+		match decl:
+			TypedImplDecl(info):
+				rendered = info.type_params
+					.map(
+						func(param): (
+							param.name
+							+ ":"
+							+ param.bounds.join("+")
+							+ "|"
+							+ param.bound_identities.map(func(identity): identity.name).join("+")
+						),
+					)
+					.join(",")
+				break
+			_:
+				void
+
+	rendered
+
+
+-- Accepted impl bodies take their type parameters from the implementation
+-- header: receiver type variables in order of appearance, an inline-bounded
+-- one at its own position, each with the identities of its bounds.
+func test_accepted_impl_type_params_follow_the_header_order() -> Bool:
+	params = accepted_impl_type_params([
+		trait_decl("Showable"),
+		trait_decl("Keyed"),
+		trait_decl("Display"),
+		generic_pair_record_decl(),
+		impl_decl_with_methods(
+			"Display",
+			generic_named_type(
+				"Pair",
+				[named_type("A"), bounded_type("B", ["Showable", "Keyed"])],
+			),
+			[],
+		),
+	])
+
+	params == "A:|,B:Showable+Keyed|Showable+Keyed"
+
+
+func test_accepted_impl_type_params_include_dimension_parameters() -> Bool:
+	params = accepted_impl_type_params([
+		trait_decl("Showable"),
+		trait_decl("Display"),
+		impl_decl_with_methods(
+			"Display",
+			ParsedArrayType(
+				bounded_type("T", ["Showable"]),
+				[ParsedDimNameType(ident("#N"), False, fixture_source_span())],
+				fixture_source_span(),
+			),
+			[],
+		),
+	])
+
+	params == "T:Showable|Showable,#N:|"
+
+
+private pure func generic_function_bounded_by(bound_name: String) -> ParsedDecl:
+	FunctionParsedDecl({
+		name = ident("bounded_identity"),
+		keyword_span = Some(fixture_source_span()),
+		type_params = [{ type_param("T") | bounds = [ident(bound_name)] }],
+		params = [],
+		return_type = None,
+		dim_constraints = [],
+		body = Some(int_expr()),
+		is_pure = False,
+		annotations = [],
+		doc = None,
+		span = fixture_source_span(),
+	})
+
+
+private pure func register_signatures_of(decl: ParsedDecl) -> TypecheckState:
+	source_program = program([decl])
+	typecheck_register_program_signature_decls(
+		typecheck_test_install_validated_type_headers(
+			typecheck_prescan_program(
+				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+
+
+-- A bound naming a trait the environment does not know is a typecheck error
+-- with a help line, not a String kept beside no identity.
+func test_signature_registration_rejects_an_unknown_trait_bound() -> Bool:
+	result = register_signatures_of(generic_function_bounded_by("UnheardOfTrait"))
+
+	result.errors == [
+		(
+			"Type parameter 'T' has unknown trait bound 'UnheardOfTrait'\n"
+			+ "    help: Declare 'trait UnheardOfTrait' or import it before using it as a bound"
+		),
+	]
+
+
+func test_signature_registration_resolves_a_known_trait_bound() -> Bool:
+	register_signatures_of(generic_function_bounded_by("Equatable")).errors.is_empty()
+
+
+-- The test-only impl registration resolves inline receiver bounds by name, so an
+-- unknown one is a typecheck error there as well (A2b.4b deletes this path).
+func test_test_only_impl_registration_rejects_an_unknown_inline_bound() -> Bool:
+	source_program = program([
+		trait_decl("Display"),
+		impl_decl_with_methods(
+			"Display",
+			generic_named_type("List", [bounded_type("T", ["UnheardOfTrait"])]),
+			[],
+		),
+	])
+	with_signatures = typecheck_register_program_signature_decls(
+		typecheck_test_install_validated_type_headers(
+			typecheck_prescan_program(
+				typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+				source_program,
+			),
+			source_program,
+		),
+		source_program,
+	)
+	result = typecheck_register_impl_decls(with_signatures, "main", source_program.decls)
+
+	result.errors.contains(
+		(
+			"Type parameter 'T' has unknown trait bound 'UnheardOfTrait'\n"
+			+ "    help: Declare 'trait UnheardOfTrait' or import it before using it as a bound"
+		),
+	)
+
+
 -- The test-only registration path cannot give an impl of an unknown trait a
 -- `TraitId`, so it reports an internal error and installs nothing.
 func test_test_only_impl_registration_reports_an_unknown_trait() -> Bool:
@@ -9775,6 +9936,26 @@ tests: TestSuite = {
 		(
 			"aliased trait rows report one method collision",
 			test_aliased_trait_rows_report_one_method_collision,
+		),
+		(
+			"accepted impl type params follow the header order",
+			test_accepted_impl_type_params_follow_the_header_order,
+		),
+		(
+			"accepted impl type params include dimension parameters",
+			test_accepted_impl_type_params_include_dimension_parameters,
+		),
+		(
+			"signature registration rejects an unknown trait bound",
+			test_signature_registration_rejects_an_unknown_trait_bound,
+		),
+		(
+			"signature registration resolves a known trait bound",
+			test_signature_registration_resolves_a_known_trait_bound,
+		),
+		(
+			"test-only impl registration rejects an unknown inline bound",
+			test_test_only_impl_registration_rejects_an_unknown_inline_bound,
 		),
 		(
 			"test-only impl registration reports an unknown trait",

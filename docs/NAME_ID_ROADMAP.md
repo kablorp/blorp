@@ -82,14 +82,15 @@ not declaration); `TraitId` is right.
 | Slice | What | Gate |
 | --- | --- | --- |
 | A2b.1 | leaf `type_system/trait_identity.brp` (opaque `TraitId`, 29 pinned builtin constants tested against `builtin_trait_registry_id`); mandatory `TraitDef.trait_id` and `ImplInstance.trait_id` written by the builtin registry and the accepted-header path; agreement test over `env.traits` and `env.impls` (including builtin `def_id` 100+ versus registry id) | typecheck stage; identical C |
-| A2b.4 | identities for every bound (`BoundTypeParam.bounds` derived from `bound_identities`; inline bounds through a module-view lookup where headers do not supply an identity); delete `TraitRef`. Needed before A2b.2 because `TraitObligation.trait_name` is built from bounds | typecheck stage; formatter idempotence |
+| A2b.4a | every bound carries its identity: `make_resolved_bound_type_param` is the only constructor (`make_bound_type_param` and `TraitRef` deleted); accepted impl bodies take bounds from the implementation header; the remaining by-name resolution (test-only registration, standalone bodies, error-recovery signature) reports an unknown bound as a typecheck error. Accepted impl parameters now follow the header: order of appearance, dimension parameters included, duplicates once (previously inline-bounded parameters first, dimension parameters skipped, duplicates kept; `Pair[A, B: Eq]` was `[B, A]`, now `[A, B]`); `env_extend_type_param_bounds` looks parameters up by name, so only a same-named duplicate could tell the orders apart | typecheck stage; identical C; message fixtures |
+| A2b.4b | option C: delete the test-only registration and standalone-infer path (`typecheck_register_*`, `register_*_decl`, `typecheck_check_standalone_program_bodies`, `typecheck_materialize_standalone_program_bodies`, `InferStandaloneFunctionBodies`, `impl_bounds_for_decl_type`, `bound_identity_for_trait_name`) and migrate its 139 test call sites to the accepted path: 60 `typecheck_register_program_signature_decls`, 41 `typecheck_check_standalone_program_bodies`, 19 `typecheck_materialize_standalone_program_bodies`, 16 `typecheck_register_program_impl_decls`, 3 `typecheck_register_impl_decls`, across `test_typecheck_decl`, `test_typecheck_impl_decl`, `test_typecheck_impl_defaults`, `test_typecheck_resource_decl` (`test_declaration_boundary.py` also names some) | typecheck stage; identical C |
 | A2b.2 | obligation readers compare pinned ids; delete `TraitObligation.trait_name` (the Equatable/HasLength/Stringable arms and 23 `infer.brp` literal compares go) | 860 `should_fail` messages unchanged |
 | A2b.3 | impl and supertrait walks by `TraitId`; delete `ImplInstance.trait_name`, `TraitDef.supertraits` Strings; authority dict keys by id | typecheck stage, sanitize |
 | A2b.5 | resolved call targets, `TraitMethodCallee`, `trait_functions` by `TraitId` | typecheck stage |
 | A2b.6 | typed trait and impl info carry `TraitId` for lowering | Core suites |
 | A2b.7 | Core: impl and trait decls, trait calls, DCE keys, `synth_scalar_operator` and `trait_dispatch` literals by id; trait catalog for display; retire M2.3's `CoreImplMethodRole` (callback roles become pinned `(TraitId, NameId)` pairs) | `compiler-core-sanitize`, backend identity |
 
-Order: A2b.1, A2b.4, A2b.2, A2b.3, A2b.5, A2b.6, A2b.7. The registration path
+Order: A2b.1, A2b.4a, A2b.4b, A2b.2, A2b.3, A2b.5, A2b.6, A2b.7. The registration path
 used only by tests (`register_trait_decl`, `register_impl_decl`,
 `register_impl_with_id`; no production callers) resolves its `TraitId` by name
 from the environment. Retiring it (about 75 test call sites) is a separate
@@ -143,6 +144,8 @@ becomes permanent by being forgotten.
 | Standalone graphs (`graph_source_name_table_for_programs`) give identifiers ids from private per-program tables; rendering there is `.text`-only (`SpellingsFromIdentifierText`) | A4a | before A5: standalone graphs share the discovery table |
 | `.text` lookups in type header resolution (`declared_unqualified_type`, `type_header_graph_has_unqualified_type_name`, `resolve_named_type`) kept beside `identifier.name` for import, alias and parameter lookups keyed by String | A2 | A4/A5 |
 | trait name Strings beside `TraitId` in `TraitDef`, `ImplInstance` (`TraitObligation.trait_name` unchanged; it waits for bound identities, A2b.4) | A2b.1 | A2b.2-A2b.3 |
+| `BoundTypeParam.bounds` Strings derived from `bound_identities` (about 14 readers in env, authority, typed AST JSON, lower, mono, infer still read the spelling) | A2b.4a | A2b.2-A2b.3 |
+| by-name bound resolution through `Env` (`bound_identity_for_trait_name`) for test-only registration and standalone bodies | A2b.4a | A2b.4b |
 
 ## Finished branches waiting to land
 

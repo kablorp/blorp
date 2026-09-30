@@ -509,6 +509,7 @@ import:
 		typecheck_state_is_reserved_for_scope,
 		typecheck_state_is_source_package,
 		typecheck_state_is_stdlib,
+		typecheck_state_definition_table,
 		typecheck_state_module_id,
 		typecheck_state_module_path_matches,
 		typecheck_state_remember_top_level_name,
@@ -714,7 +715,6 @@ import:
 		BoundTraitIdentity,
 		BoundTraitOwner(CompilerBuiltinBoundTraitOwner, GraphBoundTraitOwner),
 		BoundTypeParam,
-		make_bound_type_param,
 		make_resolved_bound_type_param,
 	type_system/meta_identity:
 		BodyMetaSessionPurpose,
@@ -757,7 +757,7 @@ import:
 		types_equal,
 	type_system/type_name_metadata: is_one_shot_stream_type_name, is_resource_source_type_name
 	type_system/type_widening: ValueSlot(KeptValueSlot)
-	types: bound_type_params_from_parsed, type_from_parsed_type_expr, type_param_names
+	types: type_from_parsed_type_expr, type_param_names
 
 
 private record FunctionBodySignature {
@@ -1327,10 +1327,17 @@ private pure func complete_body_outcome_table_from_source_order(
 		})
 
 
+---
+How function and impl bodies are produced. The reuse variants hold the accepted
+`ImplementationHeaderGraph` because it owns both the callable headers that
+locate independently checked bodies and the impl headers that carry each impl
+body's bound identities; the standalone variant has neither and resolves bounds
+by name (test-only, retired by A2b.4b).
+---
 private union FunctionBodyMaterialization:
 	InferStandaloneFunctionBodies
-	ReuseSelectedFunctionBodies(BodyOutcomeTable, CallableHeaderGraph)
-	ReuseCompleteFunctionBodies(CompleteBodyOutcomeTable, CallableHeaderGraph)
+	ReuseSelectedFunctionBodies(BodyOutcomeTable, ImplementationHeaderGraph)
+	ReuseCompleteFunctionBodies(CompleteBodyOutcomeTable, ImplementationHeaderGraph)
 
 
 private record BodySubsetProgramRep {
@@ -2796,12 +2803,107 @@ private pure func state_has_type_name(state: TypecheckState, name: String) -> Bo
 	)
 
 
+---
+Bound type parameters built from the trait names written in source, together
+with the messages for names that do not resolve.
+---
+private record BoundTypeParamsOutcome {
+	params: List[BoundTypeParam],
+	errors: List[String]
+}
+
+
+---
+The identity of the trait a source spelling names, found through the
+environment and the state's definition table. Environment lookup is by name, so
+it cannot tell same-named traits of different modules apart: only the test-only
+registration and standalone body paths and the error-recovery signature use it.
+The accepted paths take bound identities from their headers (retired with the
+test-only paths by A2b.4b).
+---
+private pure func bound_identity_for_trait_name(
+	state: TypecheckState,
+	trait_name: String,
+) -> Option[BoundTraitIdentity]:
+	table ?= typecheck_state_definition_table(state)
+	definition ?= env_get_trait(state.env, trait_name)
+	Some(bound_trait_identity(table, definition.trait_id))
+
+
+---
+The diagnostic for a bound whose trait the environment does not know, with the
+help line every unknown-bound message carries.
+---
+private pure func unknown_trait_bound_message(parameter: String, trait_name: String) -> String:
+	(
+		"Type parameter '"
+		+ parameter
+		+ "' has unknown trait bound '"
+		+ trait_name
+		+ "'\n    help: Declare 'trait "
+		+ trait_name
+		+ "' or import it before using it as a bound"
+	)
+
+
+---
+One type parameter bounded by the traits spelled in `trait_names`. Each spelling
+resolves through `bound_identity_for_trait_name`; an unresolved one is left out
+of the parameter and reported in the outcome's errors.
+---
+private pure func bound_type_param_from_trait_names(
+	state: TypecheckState,
+	parameter: String,
+	trait_names: List[String],
+) -> BoundTypeParamsOutcome:
+	var identities: List[BoundTraitIdentity] = []
+	var errors: List[String] = []
+
+	for trait_name in trait_names:
+		match bound_identity_for_trait_name(state, trait_name):
+			Some(identity):
+				identities = identities.append(identity)
+			None:
+				errors = errors.append(unknown_trait_bound_message(parameter, trait_name))
+
+	{
+		params = [make_resolved_bound_type_param(parameter, identities)],
+		errors = errors
+	}
+
+
+---
+Record each message as a typecheck error, in order.
+---
+private pure func typecheck_state_add_errors(
+	state: TypecheckState,
+	messages: List[String],
+) -> TypecheckState:
+	var next = state
+
+	for message in messages:
+		next = typecheck_state_add_error(next, message)
+
+	next
+
+
 private pure func effective_bound_type_params(
 	state: TypecheckState,
 	declared: List[ParsedTypeParamDecl],
 	func_type: SemanticType,
-) -> List[BoundTypeParam]:
-	var result = bound_type_params_from_parsed(declared)
+) -> BoundTypeParamsOutcome:
+	var result: List[BoundTypeParam] = []
+	var errors: List[String] = []
+
+	for parameter in declared:
+		resolved = bound_type_param_from_trait_names(
+			state,
+			parameter.name.text,
+			parameter.bounds.map(func(bound): bound.text),
+		)
+		result = result.concat(resolved.params)
+		errors = errors.concat(resolved.errors)
+
 	var seen = result.map(func(param): param.name)
 
 	for name in type_param_candidates(func_type):
@@ -2811,9 +2913,12 @@ private pure func effective_bound_type_params(
 			and not state_has_type_name(state, name)
 		):
 			seen = seen.append(name)
-			result = result.append(make_bound_type_param(name, []))
+			result = result.append(make_resolved_bound_type_param(name, []))
 
-	result
+	{
+		params = result,
+		errors = errors
+	}
 
 
 private pure func effective_function_type_params(
@@ -2833,11 +2938,13 @@ private pure func effective_function_type_params(
 		declared_type_param_names,
 		function_decl.return_type,
 	).get_or(TYPE_VOID)
+	-- Unknown bounds are reported where the declaration is registered (or by
+	-- its accepted header), so this recovery signature only drops them.
 	effective_bound_type_params(
 		state,
 		function_decl.type_params,
 		SemanticFunctionType(function_decl.is_pure, param_types, return_type),
-	)
+	).params
 
 
 private pure func function_body_signature_from_annotations(
@@ -2953,6 +3060,9 @@ private pure func loop_producer_from_body(body: Option[ParsedExpr]) -> Option[Lo
 			None
 
 
+---
+Test-only; retired by A2b.4b.
+---
 private pure func register_function_signature_with_semantic_types(
 	state: TypecheckState,
 	name: String,
@@ -2973,7 +3083,8 @@ private pure func register_function_signature_with_semantic_types(
 		param_types,
 		resolved_return_type,
 	)
-	effective_type_params = effective_bound_type_params(state, type_params, source_func_type)
+	resolved_type_params = effective_bound_type_params(state, type_params, source_func_type)
+	effective_type_params = resolved_type_params.params
 	type_param_names = effective_type_params.map(func(param): param.name)
 	semantic_param_types = param_types.map(
 		func(param): type_instantiate_type_params(type_param_names, param),
@@ -2993,7 +3104,7 @@ private pure func register_function_signature_with_semantic_types(
 		),
 	)
 	with_resource_result = validate_resource_result_annotation(
-		state,
+		typecheck_state_add_errors(state, resolved_type_params.errors),
 		name,
 		semantic_param_types,
 		semantic_return_type,
@@ -3550,6 +3661,9 @@ private pure func validate_trait_method_param_types(
 	next
 
 
+---
+Test-only; retired by A2b.4b.
+---
 private pure func register_trait_decl(
 	state: TypecheckState,
 	module_path: String,
@@ -3575,6 +3689,7 @@ Register a trait from its parsed declaration alone. Test-only: production
 registers traits from the accepted headers (`AcceptedTraitTableRecord`), which
 carry the header's `TraitId`; nothing outside tests calls this. Here the trait is
 a graph trait whose `TraitId` is the definition id just claimed for it.
+Retired by A2b.4b.
 ---
 private pure func register_trait_with_id(
 	state: TypecheckState,
@@ -3903,10 +4018,19 @@ private pure func impl_bound_name_is_candidate(state: TypecheckState, name: Stri
 	not is_dimension_parameter_name(name) and not typecheck_state_has_known_type_name(state, name)
 
 
+---
+A type parameter bounded inline in an impl's receiver type, as written.
+---
+private record ImplInlineBound {
+	parameter: String,
+	trait_names: List[String]
+}
+
+
 private pure func impl_inline_bounds_from_type_exprs(
 	type_exprs: List[ParsedTypeExpr],
-) -> List[BoundTypeParam]:
-	var result: List[BoundTypeParam] = []
+) -> List[ImplInlineBound]:
+	var result: List[ImplInlineBound] = []
 
 	for type_expr in type_exprs:
 		result = result.concat(impl_inline_bounds_from_type_expr(type_expr))
@@ -3916,13 +4040,13 @@ private pure func impl_inline_bounds_from_type_exprs(
 
 private pure func impl_inline_bounds_from_type_expr(
 	type_expr: ParsedTypeExpr,
-) -> List[BoundTypeParam]:
+) -> List[ImplInlineBound]:
 	match type_expr:
 		ParsedBoundedType(name, bounds, _):
-			[make_bound_type_param(
-					name.text,
-					bounds.map(func(bound): bound.text),
-				)]
+			[{
+					parameter = name.text,
+					trait_names = bounds.map(func(bound): bound.text)
+				}]
 		ParsedNamedType(_, args, _):
 			impl_inline_bounds_from_type_exprs(args)
 		ParsedQualifiedNamedType(_, _, args, _):
@@ -3949,28 +4073,136 @@ private pure func impl_inline_bounds_from_type_expr(
 			[]
 
 
-private pure func impl_bounds_for_type(
+---
+Receiver type variables that are not bounded inline but still parameterize the
+impl, in order of appearance.
+---
+private pure func impl_unbounded_type_param_names(
 	state: TypecheckState,
-	explicit_bounds: List[BoundTypeParam],
+	inline_names: List[String],
 	for_type: SemanticType,
-) -> List[BoundTypeParam]:
-	var result: List[BoundTypeParam] = explicit_bounds
-	var seen: List[String] = explicit_bounds.map(func(bound): bound.name)
+) -> List[String]:
+	var result: List[String] = []
+	var seen: List[String] = inline_names
 
 	for name in collect_type_vars(for_type):
 		if impl_bound_name_is_candidate(state, name) and not seen.contains(name):
 			seen = seen.append(name)
-			result = result.append(make_bound_type_param(name, []))
+			result = result.append(name)
 
 	result
 
 
+---
+Names of an impl's type parameters: inline-bounded ones first, then the other
+receiver type variables. Needs no trait resolution.
+---
+private pure func impl_type_param_names_for_decl_type(
+	state: TypecheckState,
+	type_expr: ParsedTypeExpr,
+	for_type: SemanticType,
+) -> List[String]:
+	inline_names = impl_inline_bounds_from_type_expr(type_expr).map(func(bound): bound.parameter)
+	inline_names.concat(impl_unbounded_type_param_names(state, inline_names, for_type))
+
+
+---
+An impl's type parameters with bounds resolved by trait name through the
+environment. Test-only registration and the standalone body path use this;
+accepted implementations take their bounds from the implementation header
+(`implementation_bound_type_params`). Retired by A2b.4b.
+---
 private pure func impl_bounds_for_decl_type(
 	state: TypecheckState,
 	type_expr: ParsedTypeExpr,
 	for_type: SemanticType,
-) -> List[BoundTypeParam]:
-	impl_bounds_for_type(state, impl_inline_bounds_from_type_expr(type_expr), for_type)
+) -> BoundTypeParamsOutcome:
+	inline_bounds = impl_inline_bounds_from_type_expr(type_expr)
+	var params: List[BoundTypeParam] = []
+	var errors: List[String] = []
+
+	for inline_bound in inline_bounds:
+		resolved = bound_type_param_from_trait_names(
+			state,
+			inline_bound.parameter,
+			inline_bound.trait_names,
+		)
+		params = params.concat(resolved.params)
+		errors = errors.concat(resolved.errors)
+
+	for name in impl_unbounded_type_param_names(
+		state,
+		inline_bounds.map(func(bound): bound.parameter),
+		for_type,
+	):
+		params = params.append(make_resolved_bound_type_param(name, []))
+
+	{
+		params = params,
+		errors = errors
+	}
+
+
+---
+An impl's type parameters for its body: from the accepted implementation header
+when the body policy reuses accepted headers, by name otherwise.
+---
+private pure func impl_body_bounds(
+	state: TypecheckState,
+	impl_decl: ParsedImplDecl,
+	for_type: SemanticType,
+	function_bodies: FunctionBodyMaterialization,
+) -> BoundTypeParamsOutcome:
+	match function_bodies:
+		InferStandaloneFunctionBodies:
+			impl_bounds_for_decl_type(state, impl_decl.for_type, for_type)
+		ReuseSelectedFunctionBodies(_, implementation_headers):
+			impl_bounds_from_accepted_headers(implementation_headers, impl_decl)
+		ReuseCompleteFunctionBodies(_, implementation_headers):
+			impl_bounds_from_accepted_headers(implementation_headers, impl_decl)
+
+
+---
+The bounds of an accepted impl, read from its implementation header. The header
+is found by matching the impl declaration's source span, the same convention
+`find_callable_id_from_span` uses for callables; carrying an implementation id
+from the declaration replaces this lookup with A2b.5 and the impl-id work.
+The header's parameters list receiver type variables in order of appearance
+(dimension parameters included, duplicates once), so an inline-bounded variable
+keeps its own position instead of moving first.
+---
+private pure func impl_bounds_from_accepted_headers(
+	implementation_headers: ImplementationHeaderGraph,
+	impl_decl: ParsedImplDecl,
+) -> BoundTypeParamsOutcome:
+	var found: Option[ImplementationHeader] = None
+
+	for header in implementation_header_graph_headers(implementation_headers):
+		if source_locations_equal(implementation_header_source(header).span, impl_decl.span):
+			found = Some(header)
+			break
+
+	match found:
+		Some(header):
+			{
+				params = implementation_bound_type_params(
+					implementation_header_graph_definition_table(implementation_headers),
+					header,
+				),
+				errors = []
+			}
+		None:
+			{
+				params = [],
+				errors = [
+					(
+						"internal typecheck error: accepted implementation header is missing for "
+						+ "implementation of '"
+						+ impl_decl.trait_name.text
+						+ "'"
+					),
+				]
+			}
 
 
 private pure func impl_parameterize_receiver_type(
@@ -4040,13 +4272,7 @@ private pure func impl_normalize_receiver_type(
 	type_expr: ParsedTypeExpr,
 	for_type: SemanticType,
 ) -> SemanticType:
-	type_param_names = impl_bounds_for_decl_type(
-		state,
-		type_expr,
-		for_type,
-	).map(
-		func(bound): bound.name,
-	)
+	type_param_names = impl_type_param_names_for_decl_type(state, type_expr, for_type)
 	impl_parameterize_receiver_type(type_param_names, for_type)
 
 
@@ -4060,6 +4286,9 @@ private union ImplMethodInfosClaim:
 	ImplMethodInfosMissing(TypecheckState)
 
 
+---
+Test-only; retired by A2b.4b.
+---
 private pure func impl_method_info_from_decl(
 	state: TypecheckState,
 	module_path: String,
@@ -4114,11 +4343,16 @@ private pure func impl_method_info_from_semantic_types(
 							),
 						)
 					Some(module_id):
+						resolved_type_params = effective_bound_type_params(
+							with_id,
+							method.type_params,
+							func_type,
+						)
 						info = impl_method_info(
 							method.name.text,
 							Some({callable_id = callable_id}),
 							func_type,
-							effective_bound_type_params(with_id, method.type_params, func_type),
+							resolved_type_params.params,
 							method.params.map(param_name_from_parsed),
 							purity_from_parsed(method.is_pure),
 							function_resource_arg_policy(
@@ -4130,9 +4364,15 @@ private pure func impl_method_info_from_semantic_types(
 							method.dim_constraints.map(dim_constraint_from_parsed),
 							method.annotations.any(annotation_is_debug_only),
 						)
-						ImplMethodInfoClaimed(with_id, info)
+						ImplMethodInfoClaimed(
+							typecheck_state_add_errors(with_id, resolved_type_params.errors),
+							info,
+						)
 
 
+---
+Test-only; retired by A2b.4b.
+---
 private pure func impl_method_infos_from_decl(
 	state: TypecheckState,
 	module_path: String,
@@ -4532,6 +4772,9 @@ private pure func prepare_accepted_implementation_header(
 								)
 
 
+---
+Test-only; retired by A2b.4b.
+---
 private pure func register_impl_decl_with_info(
 	state: TypecheckState,
 	module_path: String,
@@ -4567,7 +4810,7 @@ registers impls from the accepted headers, which carry the header's trait id;
 nothing outside tests calls this. The trait's identity is looked up in the
 environment by name. An impl of a trait the environment does not know cannot
 carry a `TraitId`, so it is reported as an internal error instead of being
-registered.
+registered. Retired by A2b.4b.
 ---
 private pure func register_impl_with_id(
 	state: TypecheckState,
@@ -4579,20 +4822,22 @@ private pure func register_impl_with_id(
 ) -> TypecheckState:
 	match env_get_trait(state.env, impl_decl.trait_name.text):
 		Some(trait_definition):
+			bounds = impl_bounds_for_decl_type(state, impl_decl.for_type, for_type)
 			instance = impl_instance_with_methods(
 				def_id,
 				trait_definition.trait_id,
 				impl_decl.trait_name.text,
 				for_type,
-				impl_bounds_for_decl_type(state, impl_decl.for_type, for_type),
+				bounds.params,
 				method_infos,
 				False,
 			)
+			reported = typecheck_state_add_errors(state, bounds.errors)
 
 			if is_private:
-				add_private_impl_checked(state, instance)
+				add_private_impl_checked(reported, instance)
 			else:
-				add_source_impl_checked(state, instance)
+				add_source_impl_checked(reported, instance)
 		None:
 			typecheck_state_add_error(
 				state,
@@ -4604,6 +4849,9 @@ private pure func register_impl_with_id(
 			)
 
 
+---
+Test-only; retired by A2b.4b.
+---
 private pure func register_impl_decl(
 	state: TypecheckState,
 	module_path: String,
@@ -4630,6 +4878,9 @@ private pure func register_impl_decl(
 			)
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_register_signature_decl(
 	state: TypecheckState,
 	module_path: String,
@@ -4655,6 +4906,9 @@ pure func typecheck_register_signature_decl(
 			state
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_register_signature_decls(
 	state: TypecheckState,
 	module_path: String,
@@ -4668,6 +4922,9 @@ pure func typecheck_register_signature_decls(
 	next
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_register_program_signature_decls(
 	state: TypecheckState,
 	program: ParsedProgram,
@@ -4679,6 +4936,9 @@ pure func typecheck_register_program_signature_decls(
 	)
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_register_impl_decl(
 	state: TypecheckState,
 	module_path: String,
@@ -4697,6 +4957,9 @@ pure func typecheck_register_impl_decl(
 			state
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_register_impl_decls(
 	state: TypecheckState,
 	module_path: String,
@@ -4710,6 +4973,9 @@ pure func typecheck_register_impl_decls(
 	next
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_register_program_impl_decls(
 	state: TypecheckState,
 	program: ParsedProgram,
@@ -6145,12 +6411,14 @@ private pure func typecheck_materialize_impl_body(
 		type_from_parsed_type_expr(impl_decl.for_type),
 	)
 	for_type: SemanticType = impl_normalize_receiver_type(state, impl_decl.for_type, raw_for_type)
-	bounds: List[BoundTypeParam] = impl_bounds_for_decl_type(state, impl_decl.for_type, for_type)
+	resolved_bounds = impl_body_bounds(state, impl_decl, for_type, function_bodies)
+	bounds: List[BoundTypeParam] = resolved_bounds.params
+	reported_state = typecheck_state_add_errors(state, resolved_bounds.errors)
 
 	state_with_bounds = if bounds.length() == 0:
-		state
+		reported_state
 	else:
-		{ state | env = env_extend_type_param_bounds(state.env, bounds) }
+		{ reported_state | env = env_extend_type_param_bounds(reported_state.env, bounds) }
 
 	validated = typecheck_validate_impl_decl(state_with_bounds, impl_decl, for_type)
 
@@ -6521,7 +6789,8 @@ private pure func typecheck_materialize_function_from_body_policy(
 					main_policy,
 				),
 			)
-		ReuseSelectedFunctionBodies(outcomes, callable_headers):
+		ReuseSelectedFunctionBodies(outcomes, implementation_headers):
+			callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 			callable_id = find_callable_id_from_span(
 				state,
 				function_decl.name.text,
@@ -6545,7 +6814,8 @@ private pure func typecheck_materialize_function_from_body_policy(
 						callable_id,
 						callable_headers,
 					)
-		ReuseCompleteFunctionBodies(complete, callable_headers):
+		ReuseCompleteFunctionBodies(complete, implementation_headers):
+			callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 			complete_representation = from_opaque CompleteBodyOutcomeTable(complete)
 			outcomes = complete_representation.table
 			callable_id = find_callable_id_from_span(
@@ -6732,6 +7002,9 @@ private pure func typecheck_materialize_decl_body(
 			}
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_check_standalone_program_bodies(
 	state: TypecheckState,
 	program: ParsedProgram,
@@ -6739,6 +7012,9 @@ pure func typecheck_check_standalone_program_bodies(
 	typecheck_materialize_standalone_program_bodies(state, program).state
 
 
+---
+Test-only; retired by A2b.4b.
+---
 pure func typecheck_materialize_standalone_program_bodies(
 	state: TypecheckState,
 	program: ParsedProgram,
@@ -10958,7 +11234,12 @@ private pure func prepare_implementation_body(
 		type_from_parsed_type_expr(impl_decl.for_type),
 	)
 	for_type = impl_normalize_receiver_type(base.state, impl_decl.for_type, raw_for_type)
-	bounds = impl_bounds_for_decl_type(base.state, impl_decl.for_type, for_type)
+	bounds = implementation_bound_type_params(
+		implementation_header_graph_definition_table(
+			base.representation.graph_facts.implementation_headers,
+		),
+		implementation,
+	)
 
 	with_bounds = if bounds.is_empty():
 		base.state
@@ -11881,7 +12162,7 @@ private pure func materialize_ctfe_subset_decl(
 	import_modules: List[ImportableModule],
 	completed_globals: CompletedGlobalHeaderGraph,
 	outcomes: BodyOutcomeTable,
-	callable_headers: CallableHeaderGraph,
+	implementation_headers: ImplementationHeaderGraph,
 	decl: ParsedDecl,
 ) -> CtfeSubsetDeclMaterialization:
 	match decl:
@@ -11898,7 +12179,7 @@ private pure func materialize_ctfe_subset_decl(
 				import_modules,
 				completed_globals,
 				outcomes,
-				callable_headers,
+				implementation_headers,
 				inner,
 			)
 			{
@@ -11917,7 +12198,7 @@ private pure func materialize_ctfe_subset_decl(
 				decls,
 				import_modules,
 				ReuseAcceptedGlobalBodies(completed_globals),
-				ReuseSelectedFunctionBodies(outcomes, callable_headers),
+				ReuseSelectedFunctionBodies(outcomes, implementation_headers),
 				decl,
 				IgnoreMainName,
 			)
@@ -11932,9 +12213,7 @@ private pure func materialize_subset_from_body_table(
 	table: BodyOutcomeTable,
 ) -> BodySubsetProgramBuild:
 	program = bound_module_program(base.representation.bound_module)
-	callable_headers = implementation_header_graph_callable_headers(
-		base.representation.graph_facts.implementation_headers,
-	)
+	implementation_headers = base.representation.graph_facts.implementation_headers
 	var next_state = base.state
 	var typed_decls: List[TypedDecl] = []
 
@@ -11954,7 +12233,7 @@ private pure func materialize_subset_from_body_table(
 					base.import_modules,
 					base.representation.graph_facts.completed_globals,
 					table,
-					callable_headers,
+					implementation_headers,
 					decl,
 				)
 				next_state = result.state
@@ -12015,9 +12294,7 @@ private pure func materialize_program_from_complete_body_table(
 		ReuseAcceptedGlobalBodies(base.representation.graph_facts.completed_globals),
 		ReuseCompleteFunctionBodies(
 			complete_table,
-			implementation_header_graph_callable_headers(
-				base.representation.graph_facts.implementation_headers,
-			),
+			base.representation.graph_facts.implementation_headers,
 		),
 		main_policy,
 	)
@@ -12330,7 +12607,6 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 	representation = accepted_typecheck_module_rep(input)
 	graph = representation.graph_facts
 	bound_module = representation.bound_module
-	callable_headers = implementation_header_graph_callable_headers(graph.implementation_headers)
 	program = bound_module_program(bound_module)
 	body_base = accepted_body_module_base(input)
 
@@ -12362,7 +12638,7 @@ private func typecheck_program_with_accepted_type_headers_and_trace(
 				program,
 				body_base.import_modules,
 				ReuseAcceptedGlobalBodies(graph.completed_globals),
-				ReuseCompleteFunctionBodies(table, callable_headers),
+				ReuseCompleteFunctionBodies(table, graph.implementation_headers),
 				trace,
 				complete_main_policy,
 			)
