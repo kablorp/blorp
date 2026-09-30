@@ -482,6 +482,21 @@ import:
 		is_one_shot_stream_type_name,
 		is_resource_source_type_name,
 		is_stream_type_name,
+	type_system/int_literal_range:
+		IntLiteralCheck(
+			IntLiteralInFloatPosition,
+			IntLiteralOfType,
+			IntLiteralOutOfRange,
+			IntLiteralRefinement,
+		),
+		IntLiteralSign(NegativeLiteral, NonNegativeLiteral),
+		IntLiteralValue,
+		check_int_literal,
+		int_literal_in_float_position_message,
+		int_literal_out_of_range_message,
+		int_literal_text,
+		int_literal_value,
+		int_literal_value_of_signed_text,
 	type_system/type_resolution: resolve_graph_qualified_type_names
 	type_system/type_widening:
 		CollectionKind,
@@ -8037,7 +8052,56 @@ private pure func infer_ascription_expr(
 	apply_ascription(inner_result.context, inner_result.expr, source_type, semantic_type, span)
 
 
+private pure func expects_dim_type(context: InferContext) -> Bool:
+	match infer_context_expected_type(context):
+		Some(expected_type):
+			is_dim_type(expected_type)
+		None:
+			False
+
+
+--- A negated literal such as `-128` is checked as one signed value, so it fits
+--- `Int8` although `128` alone does not. Dimension expectations keep the
+--- operand's singleton refinement instead, for static index proofs.
 private pure func infer_unary_expr(
+	context: InferContext,
+	op: ParsedUnaryOp,
+	operand: ParsedExpr,
+	span: SourceLocation,
+) -> InferResult:
+	match (op, operand):
+		(ParsedNegateOp, ParsedIntLiteralExpr(text, literal_span)):
+			if expects_dim_type(context):
+				infer_unary_operand_expr(context, op, operand, span)
+			else:
+				infer_negated_int_literal(context, text, literal_span, span)
+		_:
+			infer_unary_operand_expr(context, op, operand, span)
+
+
+private pure func infer_negated_int_literal(
+	context: InferContext,
+	text: String,
+	literal_span: SourceLocation,
+	span: SourceLocation,
+) -> InferResult:
+	checked = int_literal_checked_type(context, int_literal_value(NegativeLiteral, text))
+	typed_operand = TypedIntLiteralExpr(
+		text,
+		literal_span,
+		inferred_info(checked.context, checked.typ),
+	)
+	typed = TypedUnaryExpr(
+		ParsedNegateOp,
+		typed_operand,
+		span,
+		inferred_info(checked.context, checked.typ),
+	)
+
+	infer_result(checked.context, typed)
+
+
+private pure func infer_unary_operand_expr(
 	context: InferContext,
 	op: ParsedUnaryOp,
 	operand: ParsedExpr,
@@ -8067,6 +8131,114 @@ private pure func infer_unary_expr(
 	infer_result(checked.context, typed)
 
 
+private record InferredBinaryOperands {
+	left: TypedExpr,
+	right: TypedExpr,
+	context: InferContext
+}
+
+
+private pure func is_arithmetic_op(op: ParsedBinaryOp) -> Bool:
+	match op:
+		ParsedAddOp | ParsedSubtractOp | ParsedMultiplyOp | ParsedDivideOp | ParsedModuloOp:
+			True
+		_:
+			False
+
+
+--- An operand made only of integer literals: a literal, a negated literal, or
+--- arithmetic over such operands, such as `2 * (3 + 4)`.
+private pure func is_int_literal_operand(expr: ParsedExpr) -> Bool:
+	match expr:
+		ParsedIntLiteralExpr(_, _):
+			True
+		ParsedUnaryExpr(ParsedNegateOp, ParsedIntLiteralExpr(_, _), _):
+			True
+		ParsedBinaryExpr(op, left, right, _):
+			-- The right operand is tested first: in a left-nested chain such as
+			-- `a + b + c` it is a leaf, so the test stops at once instead of
+			-- walking the whole chain at every node.
+			is_arithmetic_op(op) and is_int_literal_operand(right) and is_int_literal_operand(left)
+		_:
+			False
+
+
+private pure func is_numeric_scalar_type(typ: SemanticType) -> Bool:
+	is_any_integer_type(typ) or is_any_float_type(typ)
+
+
+--- The expectation for a literal operand: the other operand's value type when
+--- that is a concrete integer or float type, so `value + 1` with `value: Int8`
+--- checks `1` as an `Int8`.
+private pure func literal_operand_context(
+	context: InferContext,
+	other_value_type: SemanticType,
+) -> InferContext:
+	if is_numeric_scalar_type(other_value_type):
+		infer_with_canonical_expected(context, other_value_type)
+	else:
+		infer_without_expected(context)
+
+
+--- The expectation for both operands when both are literal-only: arithmetic
+--- returns its operand type, so `sum: Int8 = 1 + 2` checks both literals as
+--- `Int8`. Comparisons return `Bool`, so their literals are plain `Int`s.
+private pure func all_literal_operands_context(
+	context: InferContext,
+	op: ParsedBinaryOp,
+) -> InferContext:
+	match infer_context_expected_type(context):
+		Some(expected_type):
+			if is_arithmetic_op(op) and is_numeric_scalar_type(expected_type):
+				infer_with_canonical_expected(context, expected_type)
+			else:
+				infer_without_expected(context)
+		None:
+			infer_without_expected(context)
+
+
+private pure func operand_value_type(op: ParsedBinaryOp, expr: TypedExpr) -> SemanticType:
+	numeric_operand_type(op, typed_expr_semantic_type(expr))
+
+
+--- Infers the operands of a binary operator. A literal-only operand is
+--- inferred after the other operand and checked against its type, whichever
+--- side it is on; otherwise the left operand is inferred first.
+private pure func infer_binary_operands(
+	context: InferContext,
+	op: ParsedBinaryOp,
+	left: ParsedExpr,
+	right: ParsedExpr,
+) -> InferredBinaryOperands:
+	match (is_int_literal_operand(left), is_int_literal_operand(right)):
+		(True, True):
+			operand_context = all_literal_operands_context(context, op)
+			left_result = infer_expr(operand_context, left)
+			right_result = infer_expr(
+				infer_context_with_state(operand_context, left_result.context.state),
+				right,
+			)
+			{left = left_result.expr, right = right_result.expr, context = right_result.context}
+		(True, False):
+			right_result = infer_expr(infer_without_expected(context), right)
+			left_result = infer_expr(
+				literal_operand_context(right_result.context, operand_value_type(op, right_result.expr)),
+				left,
+			)
+			{left = left_result.expr, right = right_result.expr, context = left_result.context}
+		(False, True):
+			left_result = infer_expr(infer_without_expected(context), left)
+			right_result = infer_expr(
+				literal_operand_context(left_result.context, operand_value_type(op, left_result.expr)),
+				right,
+			)
+			{left = left_result.expr, right = right_result.expr, context = right_result.context}
+		(False, False):
+			left_result = infer_expr(infer_without_expected(context), left)
+			right_result = infer_expr(infer_without_expected(left_result.context), right)
+			{left = left_result.expr, right = right_result.expr, context = right_result.context}
+
+
 private pure func infer_binary_expr(
 	context: InferContext,
 	op: ParsedBinaryOp,
@@ -8074,23 +8246,22 @@ private pure func infer_binary_expr(
 	right: ParsedExpr,
 	span: SourceLocation,
 ) -> InferResult:
-	left_result = infer_expr(infer_without_expected(context), left)
-	right_result = infer_expr(infer_without_expected(left_result.context), right)
-	left_semantic_type = typed_expr_semantic_type(left_result.expr)
-	right_semantic_type = typed_expr_semantic_type(right_result.expr)
+	operands = infer_binary_operands(context, op, left, right)
+	left_semantic_type = typed_expr_semantic_type(operands.left)
+	right_semantic_type = typed_expr_semantic_type(operands.right)
 	left_slot = numeric_operand_slot(op, left_semantic_type)
 	right_slot = numeric_operand_slot(op, right_semantic_type)
 	left_value_type = widening_value_type(left_slot)
 	right_value_type = widening_value_type(right_slot)
-	checked = check_binary_op(right_result.context, op, left_value_type, right_value_type, span)
+	checked = check_binary_op(operands.context, op, left_value_type, right_value_type, span)
 	result_type = mod_result_type(
 		op,
-		static_operand_semantic_type(left_result.expr),
-		static_operand_semantic_type(right_result.expr),
+		static_operand_semantic_type(operands.left),
+		static_operand_semantic_type(operands.right),
 		checked.typ,
 	)
-	typed_left = typed_expr_with_slot(left_result.expr, left_slot)
-	typed_right = typed_expr_with_slot(right_result.expr, right_slot)
+	typed_left = typed_expr_with_slot(operands.left, left_slot)
+	typed_right = typed_expr_with_slot(operands.right, right_slot)
 	typed = TypedBinaryExpr(
 		op,
 		typed_left,
@@ -14929,7 +15100,14 @@ private pure func infer_dict_entries(
 	while index < entries.length():
 		match entries.get(index):
 			Some(entry):
-				key_result = infer_expr(infer_without_expected(next_context), entry.key)
+				key_result = infer_expr(
+					infer_with_canonical_expected_value_slot(
+						next_context,
+						key_type,
+						ExpectedCollectionElementSlot(DictLiteral),
+					),
+					entry.key,
+				)
 				key_semantic_type = typed_expr_semantic_type(key_result.expr)
 				key_candidate_type = default_collection_element_type(key_semantic_type)
 				typed_key = typed_expr_with_slot(
@@ -14955,7 +15133,14 @@ private pure func infer_dict_entries(
 					key_value_type,
 				)
 
-				value_result = infer_expr(infer_without_expected(key_storage_context), entry.value)
+				value_result = infer_expr(
+					infer_with_canonical_expected_value_slot(
+						key_storage_context,
+						value_type,
+						ExpectedCollectionElementSlot(DictLiteral),
+					),
+					entry.value,
+				)
 				value_semantic_type = typed_expr_semantic_type(value_result.expr)
 				value_candidate_type = default_collection_element_type(value_semantic_type)
 				typed_value = typed_expr_with_slot(
@@ -18061,6 +18246,24 @@ private pure func int_pattern_scrutinee_type(typ: SemanticType) -> Bool:
 			is_any_integer_type(typ) or named_value_type_is(typ, "Int")
 
 
+--- An integer literal pattern follows the literal rule against the scrutinee's
+--- type, so an arm that could never match (`300` for a `UInt8`) is an error.
+private pure func check_int_pattern_range(
+	context: InferContext,
+	text: String,
+	scrutinee_type: SemanticType,
+) -> InferContext:
+	value = int_literal_value_of_signed_text(text)
+
+	match check_int_literal(Some(scrutinee_type), value):
+		IntLiteralOutOfRange(range):
+			infer_error(context, int_literal_out_of_range_message(range, value))
+		-- `int_pattern_scrutinee_type` admits only integer and singleton
+		-- scrutinees, so a float expectation cannot reach this check.
+		IntLiteralRefinement | IntLiteralOfType(_) | IntLiteralInFloatPosition(_):
+			context
+
+
 private pure func infer_pattern_result(
 	context: InferContext,
 	env: Env,
@@ -18453,7 +18656,7 @@ private pure func infer_pattern(
 			)
 		ParsedIntPattern(text, span):
 			next_context = if int_pattern_scrutinee_type(scrutinee_type):
-				context
+				check_int_pattern_range(context, text, scrutinee_type)
 			else:
 				pattern_type_error(context, "Int", TYPE_INT, scrutinee_type)
 
@@ -22502,33 +22705,53 @@ private pure func unsupported_expr(
 	)
 
 
---- Whether an expected type asks an integer literal to check against something
---- narrower than `Int`: a dimension or range refinement (`#3`, `..#N`), or a
---- sized integer (`Int8`, `UInt16`), which a literal adopts in an expected slot.
-private pure func expected_type_narrows_int_literal(expected_type: SemanticType) -> Bool:
-	is_dim_type(expected_type) or (
-		is_any_integer_type(expected_type) and not types_equal(expected_type, TYPE_INT)
+--- Infers an integer literal by checking it against the expected type (see
+--- `check_int_literal`). A literal that does not fit is reported here, at the
+--- literal, and still takes the expected type so the error does not cascade.
+--- Call arguments bound to generic dimension parameters do not reach this rule;
+--- they read the literal itself through `static_dim_from_typed_expr`.
+private pure func infer_int_literal(
+	context: InferContext,
+	text: String,
+	span: SourceLocation,
+) -> InferResult:
+	value = int_literal_value(NonNegativeLiteral, text)
+	checked = int_literal_checked_type(context, value)
+	infer_result(
+		checked.context,
+		TypedIntLiteralExpr(text, span, inferred_info(checked.context, checked.typ)),
 	)
 
 
---- An integer literal infers `Int`. Only when the surrounding context expects a
---- narrower type (see `expected_type_narrows_int_literal`) does it carry its
---- singleton refinement (`#42`) so the expected type can check it, which keeps
---- `v: Int[#3]` subscripts, `..#N` bindings and sized integer arguments working
---- while `var x = 42` stays an ordinary mutable `Int`. Call arguments bound to
---- generic dimension parameters do not reach this rule; they read the literal
---- itself through `static_dim_from_typed_expr`.
-private pure func inferred_int_literal_type(context: InferContext, text: String) -> SemanticType:
-	narrows = match infer_context_expected_type(context):
-		Some(expected_type):
-			expected_type_narrows_int_literal(expected_type)
-		None:
-			False
-
-	if narrows:
-		SemanticConstIntType(parse_int_literal(text))
-	else:
-		TYPE_INT
+private pure func int_literal_checked_type(context: InferContext, value: IntLiteralValue) -> CheckedType:
+	match check_int_literal(infer_context_expected_type(context), value):
+		-- `check_int_literal` has proved the value is in Int's range, so the
+		-- existing literal reader cannot fall back here.
+		IntLiteralRefinement:
+			checked_type(context, SemanticConstIntType(parse_int_literal(int_literal_text(value))))
+		IntLiteralOfType(typ):
+			checked_type(context, typ)
+		IntLiteralOutOfRange(range):
+			-- Recover as the integer type that was checked, so an out-of-range
+			-- literal does not also report a mismatch against that type, while
+			-- a non-integer expectation (`x: String = 9999999999999999999`)
+			-- still reports its own mismatch against `Int`.
+			next = infer_error(context, int_literal_out_of_range_message(range, value))
+			recovered_type = match infer_context_expected_type(context):
+				Some(expected_type):
+					if is_any_integer_type(expected_type):
+						expected_type
+					else:
+						TYPE_INT
+				None:
+					TYPE_INT
+			checked_type(next, recovered_type)
+		IntLiteralInFloatPosition(float_type):
+			next = infer_error(
+				context,
+				int_literal_in_float_position_message(type_to_string(float_type), value),
+			)
+			checked_type(next, float_type)
 
 
 private pure func infer_expr_inner(context: InferContext, expr: ParsedExpr) -> InferResult:
@@ -22536,14 +22759,7 @@ private pure func infer_expr_inner(context: InferContext, expr: ParsedExpr) -> I
 		ParsedNameExpr(name):
 			infer_name_expr(context, name)
 		ParsedIntLiteralExpr(text, span):
-			infer_result(
-				context,
-				TypedIntLiteralExpr(
-					text,
-					span,
-					inferred_info(context, inferred_int_literal_type(context, text)),
-				),
-			)
+			infer_int_literal(context, text, span)
 		ParsedFloatLiteralExpr(text, span):
 			infer_result(
 				context,

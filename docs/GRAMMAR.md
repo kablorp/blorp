@@ -73,7 +73,8 @@ Opaque representation conversions use `into_opaque` and `from_opaque`.
 
 ```
 INT                  = digit { digit }
-BIGINT               = digit { digit }              (* integer literal outside Int64 range *)
+BIGINT               = digit { digit }              (* integer literal outside Int64 range; valid only where
+                                                       UInt64 or a 128-bit type is expected, up to Int128 max *)
 FLOAT                = digit { digit } "." digit { digit } [ ("e" | "E") ["+" | "-"] digit { digit } ]
 STRING               = '"' { string_char } '"'
 STRING_INTERP        = '"' { string_char_or_interp } '"'

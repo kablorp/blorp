@@ -1397,15 +1397,51 @@ i = 2
 v[i]                    -- error: i is an Int, not a compile-time literal; use get()
 ```
 
-A literal is `Int` unless the position it is written in expects a dimension,
-range or sized integer type, in which case it takes that type:
+A literal is checked against the type its position expects. It takes an
+expected integer type when its value is in that type's range; with no integer
+expectation it is an `Int`, which must hold it too. A value out of range is a
+compile error at the literal, never a truncation at runtime:
 
 ```blorp
 small: Int8 = 5          -- the literal becomes Int8
+low: Int8 = -128         -- a negated literal is checked as one value
+big: UInt64 = 18446744073709551615
 v: Int[#3] = {1, 2, 3}   -- the vector literal has three elements
 count = 5                -- Int
 also: Int8 = count       -- rejected: `count` is an Int, not a literal
+x: Int8 = 300            -- error: Integer literal 300 does not fit in Int8
+                         --   help: Int8 holds -128 to 127; use a value in that
+                         --   range or a wider type such as Int16
 ```
+
+The expected type reaches a literal wherever one flows: bindings, arguments,
+returns, fields, `Option` and tuple payloads, list, tensor and dict elements,
+and `if`/`match` arms. An arithmetic or comparison operand takes the type of the
+operand on the other side, and arithmetic made only of literals takes the
+expected type:
+
+```blorp
+pure func step(value: Int8) -> Int8:
+    value + 1            -- 1 is an Int8
+
+bytes: List[UInt8] = [0, 255]
+sum: Int8 = 1 + 2        -- both literals are Int8
+var level: UInt8 = 0
+level += 1
+is_max = level == 255    -- 255 is a UInt8
+```
+
+Integer literals never become floats. Write the float spelling instead:
+
+```blorp
+ratio: Float = 3         -- error: Integer literal 3 is not a Float
+                         --   help: write 3.0 for a Float value
+ratio: Float = 3.0
+```
+
+A literal receiver of a generic call is inferred before the call's result type
+is known, so `[1, 2].map(...)` produces a `List[Int]` even where a `List[UInt8]`
+is expected. Bind the literal with its type first: `bytes: List[UInt8] = [1, 2]`.
 
 Compile-time proofs (subscripts, `assert_shape`, `checked_slice`, `for i in
 0..3` ranges, modulo narrowing, dimension arguments) read the literal itself,

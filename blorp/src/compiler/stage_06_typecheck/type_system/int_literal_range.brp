@@ -1,0 +1,348 @@
+-- Range checks for integer literals in frontend inference.
+--
+-- An integer literal is checked against the type its context expects: it has
+-- that type when its value is representable there, and is a compile error
+-- otherwise. Values and bounds are compared as decimal magnitudes, so one
+-- check covers UInt64 and the 128-bit types, whose bounds do not fit in `Int`.
+import:
+	semantic_type:
+		SemanticType(SemanticNamedType),
+		TYPE_INT,
+		TYPE_NAME_INT,
+		is_any_float_type,
+		is_dim_type,
+
+
+enum IntLiteralSign:
+	NonNegativeLiteral
+	NegativeLiteral
+
+
+--- An integer literal's value as a sign and a decimal magnitude with no
+--- leading zeros. Build it with `int_literal_value` so zero is always
+--- non-negative and `0042` compares equal to `42`.
+record IntLiteralValue {
+	sign: IntLiteralSign,
+	magnitude: String
+}
+
+
+--- The inclusive range of an integer type as decimal magnitudes: values run
+--- from `-negative_limit` to `positive_limit`.
+record IntegerTypeRange {
+	type_name: String,
+	negative_limit: String,
+	positive_limit: String
+}
+
+
+private ZERO_MAGNITUDE: String = "0"
+
+--- Wider types to suggest, narrowest first, when a literal does not fit.
+--- `Int` stands in for `Int64` because it is the language's 64-bit default.
+private SIGNED_INTEGER_TYPES_BY_WIDTH: List[String] = [
+	"Int8",
+	"Int16",
+	"Int32",
+	TYPE_NAME_INT,
+	"Int128",
+]
+
+private UNSIGNED_INTEGER_TYPES_BY_WIDTH: List[String] = [
+	"UInt8",
+	"UInt16",
+	"UInt32",
+	"UInt64",
+	"UInt128",
+]
+
+
+private pure func canonical_magnitude(digits: String) -> String:
+	var start: Int = 0
+
+	while start + 1 < digits.length() and digits.get_or(start, '1') == '0':
+		start += 1
+
+	digits.substring(start, digits.length() - start)
+
+
+pure func int_literal_value(sign: IntLiteralSign, digits: String) -> IntLiteralValue:
+	magnitude = canonical_magnitude(digits)
+
+	if magnitude == ZERO_MAGNITUDE:
+		{
+			sign = NonNegativeLiteral,
+			magnitude = magnitude
+		}
+	else:
+		{
+			sign = sign,
+			magnitude = magnitude
+		}
+
+
+--- The value of a singleton refinement such as `#300`, for checking it with
+--- the same rule as the literal it came from.
+pure func int_literal_value_of_int(value: Int) -> IntLiteralValue:
+	text = value.to_string()
+
+	if value < 0:
+		int_literal_value(
+			NegativeLiteral,
+			text.substring(1, text.length() - 1),
+		)
+	else:
+		int_literal_value(NonNegativeLiteral, text)
+
+
+--- The value of a literal spelled with an optional leading `-`, as integer
+--- literal patterns are (`-128`).
+pure func int_literal_value_of_signed_text(text: String) -> IntLiteralValue:
+	if text.starts_with("-"):
+		int_literal_value(
+			NegativeLiteral,
+			text.substring(1, text.length() - 1),
+		)
+	else:
+		int_literal_value(NonNegativeLiteral, text)
+
+
+pure func int_literal_text(value: IntLiteralValue) -> String:
+	match value.sign:
+		NonNegativeLiteral:
+			value.magnitude
+		NegativeLiteral:
+			"-" + value.magnitude
+
+
+--- Whether `left <= right` for canonical decimal magnitudes: a shorter
+--- magnitude is smaller, and equal lengths compare digit by digit.
+private pure func magnitude_at_most(left: String, right: String) -> Bool:
+	if left.length() != right.length():
+		left.length() < right.length()
+	else:
+		left <= right
+
+
+private pure func range_holds(range: IntegerTypeRange, value: IntLiteralValue) -> Bool:
+	match value.sign:
+		NonNegativeLiteral:
+			magnitude_at_most(value.magnitude, range.positive_limit)
+		NegativeLiteral:
+			magnitude_at_most(value.magnitude, range.negative_limit)
+
+
+private pure func int64_range(type_name: String) -> IntegerTypeRange:
+	{
+		type_name = type_name,
+		negative_limit = "9223372036854775808",
+		positive_limit = "9223372036854775807"
+	}
+
+
+--- The two's complement range of each integer type, by name. `Int` and
+--- `Int64` are both 64 bits wide.
+private pure func integer_type_range_by_name(name: String) -> Option[IntegerTypeRange]:
+	if name == TYPE_NAME_INT:
+		Some(int64_range(name))
+	else:
+		sized_integer_type_range(name)
+
+
+private pure func sized_integer_type_range(name: String) -> Option[IntegerTypeRange]:
+	match name:
+		"Int8":
+			Some({
+				type_name = name,
+				negative_limit = "128",
+				positive_limit = "127",
+			})
+		"Int16":
+			Some({
+				type_name = name,
+				negative_limit = "32768",
+				positive_limit = "32767",
+			})
+		"Int32":
+			Some({
+				type_name = name,
+				negative_limit = "2147483648",
+				positive_limit = "2147483647",
+			})
+		"Int64":
+			Some(int64_range(name))
+		"Int128":
+			Some({
+				type_name = name,
+				negative_limit = "170141183460469231731687303715884105728",
+				positive_limit = "170141183460469231731687303715884105727",
+			})
+		"UInt8":
+			Some({
+				type_name = name,
+				negative_limit = ZERO_MAGNITUDE,
+				positive_limit = "255",
+			})
+		"UInt16":
+			Some({
+				type_name = name,
+				negative_limit = ZERO_MAGNITUDE,
+				positive_limit = "65535",
+			})
+		"UInt32":
+			Some({
+				type_name = name,
+				negative_limit = ZERO_MAGNITUDE,
+				positive_limit = "4294967295",
+			})
+		"UInt64":
+			Some({
+				type_name = name,
+				negative_limit = ZERO_MAGNITUDE,
+				positive_limit = "18446744073709551615",
+			})
+		"UInt128":
+			Some({
+				type_name = name,
+				negative_limit = ZERO_MAGNITUDE,
+				positive_limit = "340282366920938463463374607431768211455",
+			})
+		_:
+			None
+
+
+--- The range of a concrete integer type; `None` for any other type.
+pure func integer_type_range(typ: SemanticType) -> Option[IntegerTypeRange]:
+	match typ:
+		SemanticNamedType(name, args):
+			if args.length() == 0:
+				integer_type_range_by_name(name)
+			else:
+				None
+		_:
+			None
+
+
+pure func int_literal_fits(range: IntegerTypeRange, value: IntLiteralValue) -> Bool:
+	range_holds(range, value)
+
+
+private pure func range_is_unsigned(range: IntegerTypeRange) -> Bool:
+	range.negative_limit == ZERO_MAGNITUDE
+
+
+--- The narrowest type that holds `value`: from the target's own family, or
+--- from the signed family when an unsigned target is given a negative value.
+private pure func narrowest_type_holding(
+	range: IntegerTypeRange,
+	value: IntLiteralValue,
+) -> Option[String]:
+	candidates = match value.sign:
+		NegativeLiteral:
+			SIGNED_INTEGER_TYPES_BY_WIDTH
+		NonNegativeLiteral:
+			if range_is_unsigned(range):
+				UNSIGNED_INTEGER_TYPES_BY_WIDTH
+			else:
+				SIGNED_INTEGER_TYPES_BY_WIDTH
+
+	var found: Option[String] = None
+
+	for name in candidates:
+		match integer_type_range_by_name(name):
+			Some(candidate):
+				if found.is_none() and range_holds(candidate, value):
+					found = Some(name)
+			None:
+				void
+
+	found
+
+
+private pure func range_minimum_text(range: IntegerTypeRange) -> String:
+	if range_is_unsigned(range):
+		ZERO_MAGNITUDE
+	else:
+		"-" + range.negative_limit
+
+
+pure func int_literal_out_of_range_message(
+	range: IntegerTypeRange,
+	value: IntLiteralValue,
+) -> String:
+	suggestion = match narrowest_type_holding(range, value):
+		Some(name):
+			if value.sign == NegativeLiteral and range_is_unsigned(range):
+				" or a signed type such as " + name
+			else:
+				" or a wider type such as " + name
+		None:
+			""
+
+	"Integer literal " + int_literal_text(
+		value,
+	) + " does not fit in " + range.type_name + "\n    help: " + range.type_name + " holds " + range_minimum_text(
+		range,
+	) + " to " + range.positive_limit + "; use a value in that range" + suggestion
+
+
+--- Integer literals are never converted to a float type; the help line shows
+--- the float spelling of the same value.
+pure func int_literal_in_float_position_message(
+	float_type_name: String,
+	value: IntLiteralValue,
+) -> String:
+	text = int_literal_text(value)
+	"Integer literal " + text + " is not a " + float_type_name + "\n    help: write " + text + ".0 for a " + float_type_name + " value"
+
+
+--- How an integer literal is checked, given the type its context expects:
+--- `IntLiteralRefinement` keeps the singleton refinement for a dimension or range
+--- expectation (`#3`, `..#N`), because index and shape proofs read it;
+--- `IntLiteralOfType` is an integer type whose range holds the value;
+--- `IntLiteralOutOfRange` names the range the value falls outside; and
+--- `IntLiteralInFloatPosition` is a float expectation, which an integer
+--- literal never satisfies.
+union IntLiteralCheck:
+	IntLiteralRefinement
+	IntLiteralOfType(SemanticType)
+	IntLiteralOutOfRange(IntegerTypeRange)
+	IntLiteralInFloatPosition(SemanticType)
+
+
+private pure func checked_against_range(
+	typ: SemanticType,
+	range: IntegerTypeRange,
+	value: IntLiteralValue,
+) -> IntLiteralCheck:
+	if range_holds(range, value):
+		IntLiteralOfType(typ)
+	else:
+		IntLiteralOutOfRange(range)
+
+
+--- The literal rule: a literal takes the expected integer type when its value
+--- fits, and with no integer expectation it is an `Int`, which must fit too.
+pure func check_int_literal(
+	expected: Option[SemanticType],
+	value: IntLiteralValue,
+) -> IntLiteralCheck:
+	int_range = int64_range(TYPE_NAME_INT)
+
+	match expected:
+		Some(target):
+			if is_dim_type(target):
+				if range_holds(int_range, value):
+					IntLiteralRefinement
+				else:
+					IntLiteralOutOfRange(int_range)
+			else if is_any_float_type(target):
+				IntLiteralInFloatPosition(target)
+			else:
+				match integer_type_range(target):
+					Some(range):
+						checked_against_range(target, range, value)
+					None:
+						checked_against_range(TYPE_INT, int_range, value)
+		None:
+			checked_against_range(TYPE_INT, int_range, value)
