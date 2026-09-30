@@ -86,6 +86,8 @@ import:
 		),
 		CoreForeignArgPassing(ForeignBorrowArgs),
 		CoreFunctionKind(ClosureBodyFunction, UserFunction),
+		CoreFunctionOrigin(ConsumingClone),
+		core_function_declared_origin,
 		CoreListAccessBounds(ProvenListAccess),
 		CoreListStorageLayout(PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
@@ -186,6 +188,7 @@ import:
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
 		balance_short_circuit_operands,
 		consumed_parameter_balancing_is_identity,
+		move_consumed_parameter_alias,
 	../../../src/compiler/stage_09_core/perceus/results_and_loops:
 		call_ownership_normalization_reuses_source,
 	../../../src/compiler/stage_09_core/perceus/uses:
@@ -18987,6 +18990,155 @@ pure func test_synthetic_binding_names_differ_by_call_site_node_id() -> Bool:
 			False
 
 
+
+---
+`decl` declared as a consuming clone that owns parameter 0.
+---
+pure func as_consuming_clone(decl: CoreDecl) -> CoreDecl:
+	match decl:
+		FunctionDecl(function_info):
+			FunctionDecl({ function_info |
+				origin = ConsumingClone(0, core_function_declared_origin(FIXTURE_SOURCE_FUNCTION_ORIGIN))
+			})
+		_:
+			decl
+
+
+---
+`forward_box__consume_arg0(box)` binds its owned parameter to `out` and hands
+`out` to a consuming callee. With `read_after`, the body returns `box` itself
+after the call, so `box` stays live past the alias.
+---
+pure func consumed_parameter_alias_program(read_after: Bool) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("Box")
+	consume_call: CoreExpr = user_call_expr(
+		"consume_box",
+		Some(90),
+		[],
+		[var_expr("out", box_type)],
+		box_type,
+	)
+	alias_body: CoreExpr = if read_after:
+		LetExpr(named_var("result"), False, box_type, consume_call, var_expr("box", box_type))
+	else:
+		consume_call
+
+	{
+		decls = [
+			HeapRecordDecl({
+				abi_type = None,
+				name = "Box",
+				type_params = [],
+				fields = [],
+				loc = synthetic_core_source_loc(),
+			}),
+			as_consuming_clone(
+				function_decl(
+					"consume_box",
+					90,
+					[core_param("box", box_type)],
+					box_type,
+					var_expr("box", box_type),
+				),
+			),
+			as_consuming_clone(
+				function_decl(
+					"forward_box__consume_arg0",
+					91,
+					[core_param("box", box_type)],
+					box_type,
+					LetExpr(named_var("out"), False, box_type, var_expr("box", box_type), alias_body),
+				),
+			),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+---
+The alias and the parameter's release are its only occurrences, so the
+retain/release pair becomes a move and `out` reaches the callee uniquely
+owned.
+---
+pure func test_consumed_parameter_alias_moves_into_binding() -> Bool:
+	rewritten: CoreProgram = insert_drops_program(consumed_parameter_alias_program(False))
+
+	match function_body(rewritten, "forward_box__consume_arg0"):
+		Some(body):
+			dup_count_for("box", body) == 0 and drop_count_for("box", body) == 0
+		None:
+			False
+
+
+---
+A parameter read after its alias keeps the retain: moving it would release
+the value the later read needs.
+---
+pure func test_consumed_parameter_alias_read_after_keeps_retain() -> Bool:
+	rewritten: CoreProgram = insert_drops_program(consumed_parameter_alias_program(True))
+
+	match function_body(rewritten, "forward_box__consume_arg0"):
+		Some(body):
+			dup_count_for("box", body) == 1
+		None:
+			False
+
+
+---
+`let out = DUP box; DROP box; out` with the given policies, as the balanced
+body of a function that consumes `box`.
+---
+pure func consumed_parameter_alias_pair(
+	retain_policy: CoreRetainPolicy,
+	release_policy: CoreReleasePolicy,
+) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("Box")
+
+	LetExpr(
+		named_var("out"),
+		False,
+		box_type,
+		DupExpr(
+			named_var("box"),
+			box_type,
+			retain_policy,
+			var_expr("box", box_type),
+			box_type,
+			synthetic_core_source_loc(),
+		),
+		DropExpr(
+			named_var("box"),
+			box_type,
+			release_policy,
+			var_expr("out", box_type),
+			box_type,
+			synthetic_core_source_loc(),
+		),
+	)
+
+
+---
+Only a reference-count retain and release pair is a move; a stack-result
+copy pair does more than move one reference and is left alone.
+---
+pure func test_consumed_parameter_alias_move_requires_arc_policies() -> Bool:
+	arc_moved: CoreExpr = move_consumed_parameter_alias(
+		named_var("box"),
+		consumed_parameter_alias_pair(ArcRetainPolicy, ArcReleasePolicy),
+	)
+	stack_result_kept: CoreExpr = move_consumed_parameter_alias(
+		named_var("box"),
+		consumed_parameter_alias_pair(StackResultRetainPolicy, StackResultReleasePolicy),
+	)
+
+	(
+		dup_count_for("box", arc_moved) == 0
+		and drop_count_for("box", arc_moved) == 0
+		and dup_count_for("box", stack_result_kept) == 1
+		and drop_count_for("box", stack_result_kept) == 1
+	)
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
@@ -20486,6 +20638,18 @@ tests: TestSuite = {
 		(
 			"synthetic binding names differ by call site node id",
 			test_synthetic_binding_names_differ_by_call_site_node_id,
+		),
+		(
+			"consumed parameter alias moves into binding",
+			test_consumed_parameter_alias_moves_into_binding,
+		),
+		(
+			"consumed parameter alias read after keeps retain",
+			test_consumed_parameter_alias_read_after_keeps_retain,
+		),
+		(
+			"consumed parameter alias move requires ARC policies",
+			test_consumed_parameter_alias_move_requires_arc_policies,
 		),
 	]
 }

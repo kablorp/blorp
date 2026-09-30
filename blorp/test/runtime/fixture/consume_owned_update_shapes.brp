@@ -1,0 +1,130 @@
+-- Allocation fixture for consuming-call specialization: four helper shapes
+-- that take a record and return it, each driven by `tables = helper(tables,
+-- i)`. Every shape must update the record in place, so the allocations for
+-- N appends grow only with the row list's capacity doublings, not with N.
+-- Before owned parameters were declared, the last three shapes copied the
+-- record's lists on every call (about 2N allocations).
+-- Run in its own process with --memory-stats
+-- (see test_alloc_oracle_blorp_level.sh).
+import:
+	memory: MemStats, get_mem_stats, mem_delta
+
+
+record Tables {
+	rows: List[Int],
+	other: List[Int]
+}
+
+
+-- The record is built before the measured region; inside it only the row
+-- list reallocates, once per capacity doubling (at most ceil(log2(N)) + 1
+-- times), plus a small constant for the first buffer.
+private CONSTANT_ALLOCATION_ALLOWANCE: Int = 4
+
+private SMALL_ROW_COUNT: Int = 1000
+
+private LARGE_ROW_COUNT: Int = 10000
+
+
+pure func append_row(tables: Tables, value: Int) -> Tables:
+	{ tables | rows = tables.rows.append(value) }
+
+
+pure func append_row_unless(tables: Tables, value: Int, skip: Bool) -> Tables:
+	if skip:
+		tables
+	else:
+		{ tables | rows = tables.rows.append(value) }
+
+
+pure func append_row_via_helper(tables: Tables, value: Int) -> Tables:
+	append_row(tables, value)
+
+
+pure func append_row_via_var(tables: Tables, value: Int) -> Tables:
+	var out: Tables = tables
+	out = append_row(out, value)
+	out
+
+
+pure func ceil_log2(value: Int) -> Int:
+	var bits: Int = 0
+	var capacity: Int = 1
+
+	while capacity < value:
+		capacity *= 2
+		bits += 1
+
+	bits
+
+
+pure func growth_allowance(rows: Int) -> Int:
+	ceil_log2(rows) + 1 + CONSTANT_ALLOCATION_ALLOWANCE
+
+
+func appended_allocations(shape: Int, rows: Int) -> Int:
+	var tables: Tables = {
+		rows = [],
+		other = []
+	}
+	before: MemStats = get_mem_stats()
+
+	for i in 0..rows:
+		match shape:
+			0:
+				tables = append_row(tables, i)
+			1:
+				tables = append_row_unless(tables, i, False)
+			2:
+				tables = append_row_via_helper(tables, i)
+			_:
+				tables = append_row_via_var(tables, i)
+
+	after: MemStats = get_mem_stats()
+
+	if tables.rows.length() == rows and tables.rows.get_or(rows - 1, -1) == rows - 1:
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+---
+The managed allocations between two snapshots, or -1 when counting was off
+(without `--memory-stats` every count reads 0, which would pass vacuously).
+---
+func counted_allocations(before: MemStats, after: MemStats) -> Int:
+	if before.memory_stats_active == 1 and after.memory_stats_active == 1:
+		mem_delta(before, after).total_allocations
+	else:
+		-1
+
+
+func main(args: List[String]):
+	names: List[String] = [
+		"record update",
+		"maybe-identity branch",
+		"call on parameter",
+		"var rebinding",
+	]
+	var failures: List[String] = []
+
+	for shape in 0..names.length():
+		small: Int = appended_allocations(shape, SMALL_ROW_COUNT)
+		large: Int = appended_allocations(shape, LARGE_ROW_COUNT)
+
+		if (
+			small < 0
+			or large < 0
+			or small > growth_allowance(SMALL_ROW_COUNT)
+			or large > growth_allowance(LARGE_ROW_COUNT)
+		):
+			failures = failures.append(
+				"${names.get_or(shape, "")}: ${small} allocations for ${SMALL_ROW_COUNT} rows, ${large} for ${LARGE_ROW_COUNT}",
+			)
+		else:
+			void
+
+	if failures.length() == 0:
+		print("PASS")
+	else:
+		print("FAIL: ${failures.join("; ")}")

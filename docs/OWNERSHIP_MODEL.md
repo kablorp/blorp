@@ -285,10 +285,35 @@ ARC balancing, but it is not their only producer.
 | --- | --- |
 | `synth_hash_collections` | Generated hash-collection accumulator cleanup |
 | `collection_pipeline` | Mutable accumulator replacement and handoff boundaries |
-| `consume_specialize` | Drops required by consuming-call protocols |
 | `perceus` | General lexical retains/releases and borrowed-to-owned normalization |
 | `closure` | Closure, capture, and task-environment lifetimes |
 | `resource` | Resource cleanup paths |
+
+`consume_specialize` produces no ownership nodes. A consuming clone declares
+its owned parameter in its `ConsumingClone` origin; ownership inference treats
+that parameter as consumed, and Perceus balances the unchanged body. The pass
+retargets a call to a clone where an owned record (a clone's owned parameter,
+a `let`-bound local, or the target of `x = f(x)`) is passed at its last use;
+clones are created transitively as clone bodies hand their parameter on. A
+clone is kept only when the record reaches an in-place update: a record
+update of the parameter or an alias in the clone, or a last-use hand-off to
+another clone that has one (a least fixpoint over the clones built). Calls to
+the other clones go back to the original function. Liveness is conservative
+inside loops, lambdas, logical operators and other constructs the pass does
+not model. Perceus is the safety net: a retargeted argument that is still
+live gets a retain, so imprecision costs a copy, never correctness. Perceus
+turns the reference-count retain/release pair of a consumed parameter's only
+alias (`let x = p` with no other use of `p`) into a move, so the alias
+reaches the next clone uniquely owned.
+
+Only record parameters are candidates. Union parameters used to get clones
+for `x = f(x)` over a match source, which let `reuse` rebuild the union in the
+source's storage; that was dropped because no self-compile benefit was
+measured and the benefit filter has no variant for it (a union tree
+`t = bump(t)` over 2,047 nodes now allocates 2,047 times).
+Follow-up: readmit union parameters under the benefit filter with a variant
+for "owned union reaches a reusable constructor after a match", verified by
+counting `union_reuse_construct` nodes in self-compile Core.
 
 Policy rewriters and consumers:
 

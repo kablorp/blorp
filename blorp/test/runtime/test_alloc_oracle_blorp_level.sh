@@ -11,6 +11,8 @@ SCALAR_FIXTURE=blorp/test/runtime/fixture/alloc_oracle_scalar.brp
 FOR_LOOP_FIXTURE=blorp/test/runtime/fixture/alloc_oracle_for_loop.brp
 MAP_FIXTURE=blorp/test/runtime/fixture/alloc_oracle_map.brp
 PROBE_FIXTURE=blorp/test/runtime/fixture/memory_stats_probe.brp
+CONSUME_UPDATE_FIXTURE=blorp/test/runtime/fixture/consume_owned_update_shapes.brp
+CONSUME_BUILDER_FIXTURE=blorp/test/runtime/fixture/consume_owned_builder_shapes.brp
 PASS=0
 FAIL=0
 
@@ -87,6 +89,28 @@ if [ "$retired_status" -ne 0 ] && grep -q -- "--memory-diagnostics" <<< "$retire
 else
     echo "FAIL (status $retired_status)"
     echo "  Got: $retired_output"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "Test 7: record helper shapes update in place (allocations grow with capacity, not rows)... "
+consume_update_output=$($BLORP run --memory-stats "$CONSUME_UPDATE_FIXTURE" 2>&1 || true)
+if grep -q "^PASS" <<< "$consume_update_output"; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL"
+    echo "  Got: $consume_update_output"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "Test 8: tree and helper-chain builders update in place transitively... "
+consume_builder_output=$($BLORP run --memory-stats "$CONSUME_BUILDER_FIXTURE" 2>&1 || true)
+if grep -q "^PASS" <<< "$consume_builder_output"; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL"
+    echo "  Got: $consume_builder_output"
     FAIL=$((FAIL + 1))
 fi
 

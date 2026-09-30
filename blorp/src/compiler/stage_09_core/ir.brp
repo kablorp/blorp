@@ -65,6 +65,8 @@ private MONO_INSTANCE_ORIGIN_TAG: String = "mono_instance"
 
 private SYNTHESIZED_ORIGIN_TAG: String = "synthesized"
 
+private CONSUMING_CLONE_ORIGIN_TAG: String = "consuming_clone"
+
 private HOISTED_LAMBDA_ORIGIN_TAG: String = "hoisted_lambda"
 
 private HOISTED_TASK_ORIGIN_TAG: String = "hoisted_task"
@@ -1038,7 +1040,6 @@ enum PassTempKind:
 	PipelineTemp
 	InlinedCalleeTemp
 	TensorViewTemp
-	ConsumeSpecializeTemp
 	MatchScrutineeTemp
 	TailrecTemp
 
@@ -1090,9 +1091,6 @@ SYNTH_BODY_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(SynthBodyTemp, 0)
 
 
 INLINED_CALLEE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(InlinedCalleeTemp, 0)
-
-
-CONSUME_SPECIALIZE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(ConsumeSpecializeTemp, 0)
 
 
 MATCH_SCRUTINEE_TEMP_ORIGIN: CoreBinderOrigin = PassTemporary(MatchScrutineeTemp, 0)
@@ -3105,10 +3103,20 @@ Synthesis runs after mono and fills the body of a bodyless source, pure or
 mono function, so readers that want the source name or the mono base follow
 `declared_as`. The name never carried the synthesis fact; readers recovered
 it by re-parsing the module-member name (F2 readers in the `synth_*` passes).
+
+`ConsumingClone(owned_parameter_index, declared_as)` is a copy that consume
+specialization made of a user function so callers can hand over the argument
+at `owned_parameter_index` instead of lending it. The index is the clone's
+declared ownership contract: ownership inference treats that parameter as
+consumed whatever the body does with it, so the body stays the original's and
+Perceus balances it (returning the parameter transfers it; paths that do not
+use it release it). Clones are made after synthesis and runtime projection,
+and no later reader needs the synthesis kind of a cloned synthesized function.
 ---
 union CoreFunctionOrigin:
 	Declared(CoreDeclaredOrigin)
 	Synthesized(CoreSynthesisKind, CoreDeclaredOrigin)
+	ConsumingClone(Int, CoreDeclaredOrigin)
 
 
 ---
@@ -3120,6 +3128,8 @@ pure func core_function_declared_origin(origin: CoreFunctionOrigin) -> CoreDecla
 		Declared(declared):
 			declared
 		Synthesized(_, declared_as):
+			declared_as
+		ConsumingClone(_, declared_as):
 			declared_as
 
 
@@ -15529,6 +15539,12 @@ pure func core_function_origin_to_json(origin: CoreFunctionOrigin) -> JsonValue:
 				("synthesis", JsonString(core_synthesis_kind_name(kind))),
 				("declared_as", core_declared_origin_to_json(declared_as)),
 			])
+		ConsumingClone(owned_parameter_index, declared_as):
+			JsonObject([
+				(KIND_FIELD, JsonString(CONSUMING_CLONE_ORIGIN_TAG)),
+				("owned_parameter", json_int(owned_parameter_index)),
+				("declared_as", core_declared_origin_to_json(declared_as)),
+			])
 
 
 private pure func module_origin_to_json(origin: ModuleOrigin) -> JsonValue:
@@ -15797,6 +15813,14 @@ pure func decode_core_function_origin_json(
 			path_field(path, "declared_as"),
 		)
 		Ok(Synthesized(kind, declared_as))
+	else if tag == CONSUMING_CLONE_ORIGIN_TAG:
+		owned_parameter_index ?= int_field(value, path, "owned_parameter")
+		declared_as_json ?= object_field(value, path, "declared_as")
+		declared_as ?= decode_core_declared_origin_json(
+			declared_as_json,
+			path_field(path, "declared_as"),
+		)
+		Ok(ConsumingClone(owned_parameter_index, declared_as))
 	else:
 		declared ?= decode_core_declared_origin_json(value, path)
 		Ok(Declared(declared))

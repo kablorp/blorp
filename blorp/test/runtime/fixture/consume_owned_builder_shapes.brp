@@ -1,0 +1,150 @@
+-- Allocation fixture for transitive consuming clones: a post-order tree
+-- builder that forwards its builder through two recursive calls, and a chain
+-- of three helpers that each forward the builder to the next. The builder is
+-- updated in place at every level, so the allocations grow only with the node
+-- list's capacity doublings, not with the node count.
+-- Run in its own process with --memory-stats
+-- (see test_alloc_oracle_blorp_level.sh).
+import:
+	memory: MemStats, get_mem_stats, mem_delta
+
+
+record Builder {
+	nodes: List[Int],
+	children: List[Int]
+}
+
+
+-- The builder is made before the measured region; inside it only the node
+-- list reallocates, once per capacity doubling (at most ceil(log2(N)) + 1
+-- times), plus a small constant for the first buffer.
+private CONSTANT_ALLOCATION_ALLOWANCE: Int = 4
+
+-- 2^11 - 1 and 2^15 - 1 nodes.
+private SMALL_TREE_DEPTH: Int = 10
+
+private LARGE_TREE_DEPTH: Int = 14
+
+private SMALL_CHAIN_COUNT: Int = 1000
+
+private LARGE_CHAIN_COUNT: Int = 10000
+
+
+pure func push_node(b: Builder, kind: Int) -> Builder:
+	{ b | nodes = b.nodes.append(kind) }
+
+
+pure func build_tree(b: Builder, depth: Int) -> Builder:
+	if depth == 0:
+		push_node(b, 0)
+	else:
+		left = build_tree(b, depth - 1)
+		right = build_tree(left, depth - 1)
+		push_node(right, depth)
+
+
+pure func inner(b: Builder, k: Int) -> Builder:
+	push_node(b, k)
+
+
+pure func middle(b: Builder, k: Int) -> Builder:
+	inner(b, k)
+
+
+pure func outer(b: Builder, k: Int) -> Builder:
+	middle(b, k)
+
+
+pure func ceil_log2(value: Int) -> Int:
+	var bits: Int = 0
+	var capacity: Int = 1
+
+	while capacity < value:
+		capacity *= 2
+		bits += 1
+
+	bits
+
+
+pure func growth_allowance(nodes: Int) -> Int:
+	ceil_log2(nodes) + 1 + CONSTANT_ALLOCATION_ALLOWANCE
+
+
+pure func tree_node_count(depth: Int) -> Int:
+	var count: Int = 1
+
+	for _ in 0..depth + 1:
+		count *= 2
+
+	count - 1
+
+
+func tree_allocations(depth: Int) -> Int:
+	var b: Builder = {
+		nodes = [],
+		children = []
+	}
+	before: MemStats = get_mem_stats()
+	b = build_tree(b, depth)
+	after: MemStats = get_mem_stats()
+
+	-- Post-order: the root's kind (its depth) comes last.
+	if (
+		b.nodes.length() == tree_node_count(depth)
+		and b.nodes.get_or(b.nodes.length() - 1, -1) == depth
+	):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+func chain_allocations(count: Int) -> Int:
+	var b: Builder = {
+		nodes = [],
+		children = []
+	}
+	before: MemStats = get_mem_stats()
+
+	for i in 0..count:
+		b = outer(b, i)
+
+	after: MemStats = get_mem_stats()
+
+	if b.nodes.length() == count and b.nodes.get_or(count - 1, -1) == count - 1:
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+pure func within(allocations: Int, items: Int) -> Bool:
+	allocations >= 0 and allocations <= growth_allowance(items)
+
+
+---
+The managed allocations between two snapshots, or -1 when counting was off
+(without `--memory-stats` every count reads 0, which would pass vacuously).
+---
+func counted_allocations(before: MemStats, after: MemStats) -> Int:
+	if before.memory_stats_active == 1 and after.memory_stats_active == 1:
+		mem_delta(before, after).total_allocations
+	else:
+		-1
+
+
+func main(args: List[String]):
+	small_tree: Int = tree_allocations(SMALL_TREE_DEPTH)
+	large_tree: Int = tree_allocations(LARGE_TREE_DEPTH)
+	small_chain: Int = chain_allocations(SMALL_CHAIN_COUNT)
+	large_chain: Int = chain_allocations(LARGE_CHAIN_COUNT)
+
+	if (
+		within(small_tree, tree_node_count(SMALL_TREE_DEPTH))
+		and within(large_tree, tree_node_count(LARGE_TREE_DEPTH))
+		and within(small_chain, SMALL_CHAIN_COUNT)
+		and within(large_chain, LARGE_CHAIN_COUNT)
+	):
+		print("PASS")
+	else:
+		print(
+			"FAIL: tree ${small_tree}/${large_tree}, chain ${small_chain}/${large_chain} allocations",
+		)

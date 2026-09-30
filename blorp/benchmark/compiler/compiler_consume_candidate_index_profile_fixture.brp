@@ -4,8 +4,8 @@ import:
 	../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../src/compiler/stage_09_core/ir:
 		CoreCallKind(UserCall),
-		CoreDecl(FunctionDecl, UnionDecl),
-		CoreExpr(AssignExpr, CallExpr, LetExpr, LiteralExpr, SeqExpr, VarExpr),
+		CoreDecl(FunctionDecl, HeapRecordDecl),
+		CoreExpr(AssignExpr, CallExpr, LetExpr, LiteralExpr, RecordUpdateExpr, SeqExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreLiteral(IntLiteral),
@@ -14,13 +14,10 @@ import:
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
-		CoreType(NamedType, UnionType, VoidType),
-		CoreUnionDecl,
-		CoreUnionField,
-		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
-		CoreUnionVariant,
+		CoreType(HeapRecordType, NamedType, VoidType),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
+		core_field_ref,
 		core_program_max_declared_definition_id,
 		core_program_to_json,
 
@@ -49,8 +46,10 @@ private pure func int_type() -> CoreType:
 	NamedType("Int", [])
 
 
+-- A record, because consume specialization only clones record parameters
+-- (only a record can be updated in place).
 private pure func expr_type() -> CoreType:
-	UnionType("Expr")
+	HeapRecordType("Expr")
 
 
 private pure func benchmark_var(name: String, def_id: Option[Int]) -> CoreVar:
@@ -104,54 +103,54 @@ private pure func lit_expr(value: Int) -> CoreExpr:
 	)
 
 
-private pure func expr_union_field() -> CoreUnionField:
-	{
-		typ = expr_type(),
-		release_policy = NoReleasePolicy
-	}
-
-
-private pure func expr_union_variant(
-	name: String,
-	tag: Int,
-	def_id: Int,
-	fields: List[CoreUnionField],
-) -> CoreUnionVariant:
-	{
-		name = name,
-		tag = tag,
-		fields = fields,
-		def_id = Some(def_id)
-	}
-
-
-private pure func expr_union_decl() -> CoreUnionDecl:
-	{
+private pure func expr_record_decl() -> CoreDecl:
+	HeapRecordDecl({
 		abi_type = None,
 		name = "Expr",
 		type_params = [],
-		payload_storage = ErasedUnionPayloadStorage,
-		variants = [
-			expr_union_variant(
-				"Lit",
-				0,
-				100,
+		fields = [
+			{
+				ref = core_field_ref(0),
+				name = "count",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
+		],
+		loc = synthetic_core_source_loc(),
+	})
+
+
+---
+`{ <parameter> | count = value }` in lowered form, followed by `rest`: every
+candidate parameter is updated in place, so each one's clone has a benefit.
+---
+private pure func update_param_then(parameter: String, value: Int, rest: CoreExpr) -> CoreExpr:
+	base: CoreVar = benchmark_var("__record_update_${parameter}", None)
+
+	LetExpr(
+		benchmark_var("updated_${parameter}", None),
+		False,
+		expr_type(),
+		LetExpr(
+			base,
+			False,
+			expr_type(),
+			expr_var(parameter),
+			RecordUpdateExpr(
+				VarExpr(base, expr_type(), synthetic_core_source_loc()),
 				[
 					{
-						typ = int_type(),
-						release_policy = NoReleasePolicy
+						ref = core_field_ref(0),
+						name = "count",
+						value = int_expr(value)
 					},
 				],
+				expr_type(),
+				synthetic_core_source_loc(),
 			),
-			expr_union_variant(
-				"Pair",
-				1,
-				101,
-				[expr_union_field(), expr_union_field()],
-			),
-		],
-		loc = synthetic_core_source_loc()
-	}
+		),
+		rest,
+	)
 
 
 private pure func benchmark_function_name(index: Int) -> String:
@@ -199,13 +198,20 @@ private pure func benchmark_function(
 
 	params = params.append(benchmark_param("pass", int_type()))
 
+	var body: CoreExpr = lit_expr(index)
+	var update_index: Int = candidate_param_count(config) - 1
+
+	while update_index >= 0:
+		body = update_param_then("expr_${update_index}", index, body)
+		update_index -= 1
+
 	{
 		name = benchmark_function_name(index),
 		source_module = Some("bench/consume_candidate_index"),
 		type_params = [],
 		params = params,
 		return_type = expr_type(),
-		body = Some(lit_expr(index)),
+		body = Some(body),
 		is_pure = True,
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
@@ -306,7 +312,7 @@ private pure func benchmark_run_function(
 pure func compiler_consume_candidate_index_profile_program(
 	config: CompilerConsumeCandidateIndexProfileConfig,
 ) -> CoreProgram:
-	var decls: List[CoreDecl] = [UnionDecl(expr_union_decl())]
+	var decls: List[CoreDecl] = [expr_record_decl()]
 	var index: Int = 0
 
 	while index < function_count(config):

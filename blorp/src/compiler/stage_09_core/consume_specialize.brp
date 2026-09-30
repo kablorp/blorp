@@ -1,52 +1,56 @@
 -- Consuming-call specialization before Perceus.
 --
--- Detect safe `owned = f(owned, ...)` rewrites, clone the callee with a
--- terminal drop for the consumed parameter, and retarget the assignment call
--- to that clone. Clone identity includes name and definition id, compiled
--- match bodies are rewritten recursively, and recursive match fields become
--- owned only when every branch transfers them exactly once.
+-- A call hands an owned record to a consuming clone of its callee where the
+-- record is at its last use: the owned parameter of a clone, a `let`-bound
+-- local, or the target of `x = f(x)`. The clone keeps the original body and
+-- declares the parameter owned through its `ConsumingClone` origin; ownership
+-- inference takes that declaration as the clone's contract floor, so Perceus
+-- transfers the parameter where the body returns or stores it and releases it
+-- on paths that do not. A clone may therefore return its parameter unchanged
+-- or pass it on, and its own body is retargeted the same way, so clones are
+-- created transitively until no new clone is used.
+--
+-- A clone only pays for itself when the owned record reaches an in-place
+-- update: a record update of the parameter (or an alias of it) in the clone
+-- itself, or a last-use hand-off to another clone that does. Every clone the
+-- walk creates is classified by a fixpoint over those hand-offs, and calls to
+-- clones without that benefit go back to the original function. Only record
+-- parameters are candidates, because only a record can be updated in place.
+--
+-- Last-use liveness is precise through bindings, sequences, branches, match
+-- results and call arguments and conservative everywhere else; a retargeted
+-- argument that is still live gets a retain from Perceus, so imprecision costs
+-- a copy, never correctness. Clone identity includes name and definition id.
 import:
 	ir:
-		CONSUME_SPECIALIZE_TEMP_ORIGIN,
-		CoreAccessor(RootAccessor, VariantFieldAccessor),
 		CoreCallKind(UserCall),
-		CoreConstructorLengthMatch,
-		CoreConstructorLengthMatchBranch,
-		CoreConstructorLiteralMatch,
-		CoreConstructorMatchBody(
-			ConstructorMatchBodyExpr,
-			ConstructorMatchBodyLength,
-			ConstructorMatchBodyLiteral,
-		),
-		CoreConstructorMatchCase,
-		CoreConstructorMatchFallback(
-			ConstructorMatchFallbackBindings,
-			ConstructorMatchFallbackBody,
-			ConstructorMatchFallbackFail,
-		),
-		CoreDecl(FunctionDecl, GlobalDecl, UnionDecl),
+		CoreDecl(FunctionDecl, GlobalDecl),
 		CoreExpr(
+			AccessorLiteralMatchExpr,
 			AssignExpr,
-			BoxExpr,
 			BorrowLetExpr,
+			BoxExpr,
 			CallExpr,
 			CastExpr,
 			ConstructorMatchExpr,
 			DropExpr,
 			DupExpr,
 			IfExpr,
+			LengthMatchExpr,
 			LetExpr,
+			LiteralExpr,
+			LiteralMatchExpr,
 			LogicalExpr,
-			RecordConstructExpr,
-			RecordExpr,
-			RecordCowUpdateExpr,
-			RecordReuseExpr,
 			RecordUpdateExpr,
 			SeqExpr,
+			StaticStringLiteralExpr,
 			UnboxExpr,
 			VarExpr,
+			VoidExpr,
 		),
 		CoreFunction,
+		CoreFunctionOrigin(ConsumingClone),
+		core_function_declared_origin,
 		CoreFunctionKind(
 			BuiltinFunction,
 			ClosureBodyFunction,
@@ -56,42 +60,13 @@ import:
 			UserFunction,
 		),
 		CoreGlobal,
-		CoreLiteralMatchFallback(
-			LiteralMatchFallbackBindings,
-			LiteralMatchFallbackBody,
-			LiteralMatchFallbackFail,
-		),
 		CoreMatchBinding,
-		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
-		CoreParam,
 		CoreProgram,
-		CoreReleasePolicy(ArcReleasePolicy),
-		CoreSourceLoc,
-		synthetic_core_source_loc,
-		CoreType(
-			BoxedResultType,
-			EnumType,
-			FunctionType,
-			HeapRecordType,
-			NamedType,
-			RangeType,
-			SelfType,
-			StackResultType,
-			TensorType,
-			TupleType,
-			TypeParameterType,
-			UnionType,
-			ValueRecordType,
-			VoidType,
-		),
-		CoreUnionDecl,
-		CoreUnionField,
-		CoreUnionVariant,
-		CoreBinderOrigin(AuthoredBinder, PassTemporary),
-		PassTempKind(ConsumeSpecializeTemp),
+		CoreType(HeapRecordType),
+		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
-		core_expr_type,
 		core_var_equal,
+	set as Sets
 	traverse as CoreTraverse
 
 
@@ -122,18 +97,21 @@ private record UsedCloneKeyIndex {
 }
 
 
+---
+`owned_record_types` is the set of parameter record types of the clone candidates. A
+`let`-bound local of another type can never be handed to a clone, so the
+last-use walk does not track it.
+---
 private record ConsumeSpecializeState {
-	unions: List[CoreUnionDecl],
 	candidates: CloneCandidateCatalog,
-	used_clone_keys: UsedCloneKeyIndex
+	used_clone_keys: UsedCloneKeyIndex,
+	owned_record_types: Set[String]
 }
 
 
 private record CloneCandidateDiscoveryState {
-	unions: List[CoreUnionDecl],
 	next_def_id: Int,
-	candidates: CloneCandidateCatalog,
-	analysis_state: ConsumeSpecializeState
+	candidates: CloneCandidateCatalog
 }
 
 
@@ -150,135 +128,41 @@ private record CloneTarget {
 }
 
 
-private struct OwnedUseAnalysis {
-	safe: Bool,
-	min_count: Int,
-	max_count: Int
-}
+---
+Whether handing an owned record to a consuming clone lets the record be
+updated in place instead of copied.
+
+`UpdatesOwnedRecordInPlace`: the clone updates the parameter, or an alias of
+it, with a record update, which record-update lowering turns into an in-place
+update of the owned record. `HandsOwnedRecordToBeneficialClone`: the clone
+hands the parameter, or an alias of it, at its last use to another clone
+with a benefit. `NoInPlaceBenefit`: neither, so the clone would only add code;
+calls to it go back to the original function.
+---
+private enum ConsumingCloneBenefit:
+	UpdatesOwnedRecordInPlace
+	HandsOwnedRecordToBeneficialClone
+	NoInPlaceBenefit
 
 
-private EMPTY_OWNED_USE: OwnedUseAnalysis = {
-	safe = True,
-	min_count = 0,
-	max_count = 0
-}
+---
+Candidates only ever have heap-record parameter types, so type identity here
+is heap-record name identity.
+---
+private pure func same_heap_record(record_name: String, typ: CoreType) -> Bool:
+	match typ:
+		HeapRecordType(name):
+			name == record_name
+		_:
+			False
 
-private UNSAFE_OWNED_USE: OwnedUseAnalysis = {
-	safe = False,
-	min_count = 0,
-	max_count = 0
-}
 
-
-private pure func core_type_lists_equal(left: List[CoreType], right: List[CoreType]) -> Bool:
+private pure func same_heap_record_type(left: CoreType, right: CoreType) -> Bool:
 	match left:
-		[]:
-			match right:
-				[]:
-					True
-				[right_head, ...right_tail]:
-					False
-		[left_head, ...left_tail]:
-			match right:
-				[]:
-					False
-				[right_head, ...right_tail]:
-					(
-						core_type_equal(left_head, right_head)
-						and core_type_lists_equal(left_tail, right_tail)
-					)
-
-
-private pure func core_type_equal(left: CoreType, right: CoreType) -> Bool:
-	match left:
-		VoidType:
-			match right:
-				VoidType:
-					True
-				_:
-					False
-		NamedType(left_name, left_args):
-			match right:
-				NamedType(right_name, right_args):
-					left_name == right_name and core_type_lists_equal(left_args, right_args)
-				_:
-					False
-		TypeParameterType(left_name):
-			match right:
-				TypeParameterType(right_name):
-					left_name == right_name
-				_:
-					False
-		SelfType:
-			match right:
-				SelfType:
-					True
-				_:
-					False
-		StackResultType(left_ok, left_err):
-			match right:
-				StackResultType(right_ok, right_err):
-					core_type_equal(left_ok, right_ok) and core_type_equal(left_err, right_err)
-				_:
-					False
-		BoxedResultType(left_ok, left_err):
-			match right:
-				BoxedResultType(right_ok, right_err):
-					core_type_equal(left_ok, right_ok) and core_type_equal(left_err, right_err)
-				_:
-					False
-		FunctionType(left_pure, left_params, left_return):
-			match right:
-				FunctionType(right_pure, right_params, right_return):
-					(
-						left_pure == right_pure
-						and core_type_lists_equal(left_params, right_params)
-						and core_type_equal(left_return, right_return)
-					)
-				_:
-					False
-		EnumType(left_name):
-			match right:
-				EnumType(right_name):
-					left_name == right_name
-				_:
-					False
-		ValueRecordType(left_name):
-			match right:
-				ValueRecordType(right_name):
-					left_name == right_name
-				_:
-					False
-		HeapRecordType(left_name):
-			match right:
-				HeapRecordType(right_name):
-					left_name == right_name
-				_:
-					False
-		UnionType(left_name):
-			match right:
-				UnionType(right_name):
-					left_name == right_name
-				_:
-					False
-		RangeType:
-			match right:
-				RangeType:
-					True
-				_:
-					False
-		TensorType(info):
-			match right:
-				TensorType(info):
-					True
-				_:
-					False
-		TupleType(left_items):
-			match right:
-				TupleType(right_items):
-					core_type_lists_equal(left_items, right_items)
-				_:
-					False
+		HeapRecordType(name):
+			same_heap_record(name, right)
+		_:
+			False
 
 
 private pure func direct_var(expr: CoreExpr) -> Option[CoreVar]:
@@ -293,33 +177,6 @@ private pure func direct_var(expr: CoreExpr) -> Option[CoreVar]:
 			direct_var(box.value)
 		_:
 			None
-
-
-private pure func max_int(left: Int, right: Int) -> Int:
-	if left > right:
-		left
-	else:
-		right
-
-
-private pure func min_int(left: Int, right: Int) -> Int:
-	if left < right:
-		left
-	else:
-		right
-
-
-private pure func collect_unions(program: CoreProgram) -> List[CoreUnionDecl]:
-	var unions: List[CoreUnionDecl] = []
-
-	for decl in program.decls:
-		match decl:
-			UnionDecl(union_decl):
-				unions = unions.append(union_decl)
-			_:
-				void
-
-	unions
 
 
 private pure func empty_clone_candidate_catalog() -> CloneCandidateCatalog:
@@ -377,22 +234,14 @@ private pure func finish_function_clone_candidates(
 		}
 
 
+
 private pure func discover_clone_candidates(
 	program: CoreProgram,
 	next_def_id: Int,
 ) -> CloneCandidateDiscoveryState:
-	unions: List[CoreUnionDecl] = collect_unions(program)
-	empty_candidates: CloneCandidateCatalog = empty_clone_candidate_catalog()
-	empty_used_keys: UsedCloneKeyIndex = empty_used_clone_key_index()
 	var discovery: CloneCandidateDiscoveryState = {
-		unions = unions,
 		next_def_id = next_def_id,
-		candidates = empty_candidates,
-		analysis_state = {
-			unions = unions,
-			candidates = empty_candidates,
-			used_clone_keys = empty_used_keys
-		}
+		candidates = empty_clone_candidate_catalog()
 	}
 
 	for decl in program.decls:
@@ -408,449 +257,41 @@ private pure func discover_clone_candidates(
 private pure func state_from_discovery(
 	discovery: CloneCandidateDiscoveryState,
 ) -> ConsumeSpecializeState:
+	var record_types: Set[String] = Sets.set()
+
+	for candidate in discovery.candidates.ordered:
+		match candidate.param_type:
+			HeapRecordType(name):
+				record_types = Sets.add(record_types, name)
+			_:
+				void
+
 	{
-		unions = discovery.unions,
 		candidates = discovery.candidates,
-		used_clone_keys = empty_used_clone_key_index()
+		used_clone_keys = empty_used_clone_key_index(),
+		owned_record_types = record_types
 	}
 
 
-private pure func find_union(state: ConsumeSpecializeState, name: String) -> Option[CoreUnionDecl]:
-	var found: Option[CoreUnionDecl] = None
-
-	for union_decl in state.unions:
-		if union_decl.name == name:
-			found = Some(union_decl)
-		else:
-			void
-
-	found
-
-
-private pure func find_union_variant(
-	state: ConsumeSpecializeState,
-	type_name: String,
-	constructor: String,
-) -> Option[CoreUnionVariant]:
-	match find_union(state, type_name):
-		Some(union_decl):
-			var found: Option[CoreUnionVariant] = None
-
-			for variant in union_decl.variants:
-				if variant.name == constructor:
-					found = Some(variant)
-				else:
-					void
-
-			found
-		None:
-			None
-
-
-private pure func source_managed_type_name(
-	state: ConsumeSpecializeState,
-	typ: CoreType,
-) -> Option[String]:
-	match typ:
-		UnionType(name):
-			find_union(state, name).map(func(union_decl): union_decl.name)
-		HeapRecordType(name):
-			Some(name)
-		NamedType(name, args):
-			None
-		_:
-			None
-
-
-private pure func direct_variant_field_type(
-	state: ConsumeSpecializeState,
-	scrutinee_type: CoreType,
-	constructor: String,
-	field_index: Int,
-) -> Option[CoreType]:
-	match scrutinee_type:
-		UnionType(type_name):
-			match find_union_variant(state, type_name, constructor):
-				Some(variant):
-					match variant.fields.get(field_index):
-						Some(field):
-							Some(field.typ)
-						None:
-							None
-				None:
-					None
-		_:
-			None
-
-
-private pure func alias_get(aliases: List[(CoreVar, Bool)], variable: CoreVar) -> Bool:
-	var found: Bool = False
-
-	for entry in aliases:
-		if core_var_equal(entry[0], variable):
-			found = entry[1]
-		else:
-			void
-
-	found
-
-
-private pure func alias_set(
-	aliases: List[(CoreVar, Bool)],
-	variable: CoreVar,
-	value: Bool,
-) -> List[(CoreVar, Bool)]:
-	var result: List[(CoreVar, Bool)] = [(variable, value)]
-
-	for entry in aliases:
-		if core_var_equal(entry[0], variable):
-			void
-		else:
-			result = result.append(entry)
-
-	result
-
-
-private pure func result_aliases_var(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	aliases: List[(CoreVar, Bool)],
-	expr: CoreExpr,
-) -> Bool:
-	match expr:
-		VarExpr(variable, typ, loc):
-			if core_var_equal(variable, target):
-				True
-			else:
-				alias_get(aliases, variable)
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			bind_aliases: Bool = result_aliases_var(state, target, aliases, rhs)
-			result_aliases_var(
-				state,
-				target,
-				alias_set(aliases, variable, bind_aliases),
-				body,
-			)
-		BorrowLetExpr(variable, typ, rhs, body):
-			bind_aliases: Bool = result_aliases_var(state, target, aliases, rhs)
-			result_aliases_var(
-				state,
-				target,
-				alias_set(aliases, variable, bind_aliases),
-				body,
-			)
-		SeqExpr(first, second):
-			result_aliases_var(state, target, aliases, second)
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			result_aliases_var(state, target, aliases, body)
-		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			result_aliases_var(state, target, aliases, body)
-		CastExpr(inner, typ, loc):
-			result_aliases_var(state, target, aliases, inner)
-		BoxExpr(box, typ, loc):
-			result_aliases_var(state, target, aliases, box.value)
-		UnboxExpr(kind, inner, typ, loc):
-			result_aliases_var(state, target, aliases, inner)
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			(
-				result_aliases_var(state, target, aliases, then_expr)
-				or result_aliases_var(state, target, aliases, else_expr)
-			)
-		CallExpr(UserCall(constructor, def_id, consumed_args), callee, args, typ, loc):
-			match typ:
-				UnionType(type_name):
-					match find_union_variant(state, type_name, constructor):
-						Some(variant):
-							var result: Bool = False
-
-							for arg in args:
-								if result_aliases_var(state, target, aliases, arg):
-									result = True
-									break
-								else:
-									void
-
-							result
-						None:
-							False
-				_:
-					False
-		CallExpr(kind, callee, args, typ, loc):
-			var result: Bool = False
-
-			for arg in args:
-				if result_aliases_var(state, target, aliases, arg):
-					result = True
-					break
-				else:
-					void
-
-			result
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			scrutinee_aliases: Bool = result_aliases_var(state, target, aliases, scrutinee)
-			var result: Bool = False
-
-			for match_case in cases:
-				if constructor_match_case_result_aliases_var(
-					state,
-					target,
-					aliases,
-					scrutinee_aliases,
-					match_case,
-				):
-					result = True
-					break
-				else:
-					void
-
-			(
-				result
-				or constructor_match_fallback_result_aliases_var(
-					state,
-					target,
-					aliases,
-					scrutinee_aliases,
-					fallback,
-				)
-			)
-		RecordExpr(fields, typ, loc) | RecordConstructExpr(_, fields, typ, loc) | RecordUpdateExpr(_, fields, typ, loc) | RecordReuseExpr(_, fields, typ, loc):
-			False
-		RecordCowUpdateExpr(_, _, _, _):
-			False
-		_:
-			CoreTraverse
-				.immediate_core_expr_children(expr)
-				.any(func(child): result_aliases_var(state, target, aliases, child))
-
-
-private pure func aliases_with_match_bindings(
-	aliases: List[(CoreVar, Bool)],
-	bindings: List[CoreMatchBinding],
-	scrutinee_aliases: Bool,
-) -> List[(CoreVar, Bool)]:
-	var result: List[(CoreVar, Bool)] = aliases
-
-	for binding in bindings:
-		result = alias_set(result, binding.variable, scrutinee_aliases)
-
-	result
-
-
-private pure func constructor_match_case_result_aliases_var(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	aliases: List[(CoreVar, Bool)],
-	scrutinee_aliases: Bool,
-	match_case: CoreConstructorMatchCase,
-) -> Bool:
-	case_aliases: List[(CoreVar, Bool)] = aliases_with_match_bindings(
-		aliases,
-		match_case.bindings,
-		scrutinee_aliases,
-	)
-	constructor_match_body_result_aliases_var(
-		state,
-		target,
-		case_aliases,
-		scrutinee_aliases,
-		match_case.body,
-	)
-
-
-private pure func constructor_literal_match_result_aliases_var(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	aliases: List[(CoreVar, Bool)],
-	scrutinee_aliases: Bool,
-	match_expr: CoreConstructorLiteralMatch,
-) -> Bool:
-	var result: Bool = False
-
-	for match_case in match_expr.cases:
-		case_aliases: List[(CoreVar, Bool)] = aliases_with_match_bindings(
-			aliases,
-			match_case.bindings,
-			scrutinee_aliases,
-		)
-
-		if result_aliases_var(state, target, case_aliases, match_case.body):
-			result = True
-			break
-		else:
-			void
-
-	if result:
-		True
-	else:
-		match match_expr.fallback:
-			LiteralMatchFallbackBody(body):
-				result_aliases_var(state, target, aliases, body)
-			LiteralMatchFallbackBindings(bindings, body):
-				fallback_aliases: List[(CoreVar, Bool)] = aliases_with_match_bindings(
-					aliases,
-					bindings,
-					scrutinee_aliases,
-				)
-				result_aliases_var(state, target, fallback_aliases, body)
-			LiteralMatchFallbackFail:
-				False
-
-
-private pure func constructor_length_branch_result_aliases_var(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	aliases: List[(CoreVar, Bool)],
-	scrutinee_aliases: Bool,
-	branch: CoreConstructorLengthMatchBranch,
-) -> Bool:
-	branch_aliases: List[(CoreVar, Bool)] = aliases_with_match_bindings(
-		aliases,
-		branch.bindings,
-		scrutinee_aliases,
-	)
-	constructor_match_body_result_aliases_var(
-		state,
-		target,
-		branch_aliases,
-		scrutinee_aliases,
-		branch.body,
-	)
-
-
-private pure func constructor_length_match_result_aliases_var(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	aliases: List[(CoreVar, Bool)],
-	scrutinee_aliases: Bool,
-	match_expr: CoreConstructorLengthMatch,
-) -> Bool:
-	var result: Bool = False
-
-	for match_case in match_expr.cases:
-		if constructor_length_branch_result_aliases_var(
-			state,
-			target,
-			aliases,
-			scrutinee_aliases,
-			match_case.branch,
-		):
-			result = True
-			break
-		else:
-			void
-
-	if not result:
-		match match_expr.geq:
-			Some(geq):
-				result = constructor_length_branch_result_aliases_var(
-					state,
-					target,
-					aliases,
-					scrutinee_aliases,
-					geq.branch,
-				)
-			None:
-				void
-	else:
-		void
-
-	if not result:
-		match match_expr.fallback:
-			Some(fallback):
-				result = constructor_length_branch_result_aliases_var(
-					state,
-					target,
-					aliases,
-					scrutinee_aliases,
-					fallback,
-				)
-			None:
-				void
-	else:
-		void
-
-	result
-
-
-private pure func constructor_match_body_result_aliases_var(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	aliases: List[(CoreVar, Bool)],
-	scrutinee_aliases: Bool,
-	body: CoreConstructorMatchBody,
-) -> Bool:
-	match body:
-		ConstructorMatchBodyExpr(expr):
-			result_aliases_var(state, target, aliases, expr)
-		ConstructorMatchBodyLiteral(match_expr):
-			constructor_literal_match_result_aliases_var(
-				state,
-				target,
-				aliases,
-				scrutinee_aliases,
-				match_expr,
-			)
-		ConstructorMatchBodyLength(match_expr):
-			constructor_length_match_result_aliases_var(
-				state,
-				target,
-				aliases,
-				scrutinee_aliases,
-				match_expr,
-			)
-
-
-private pure func constructor_match_fallback_result_aliases_var(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	aliases: List[(CoreVar, Bool)],
-	scrutinee_aliases: Bool,
-	fallback: CoreConstructorMatchFallback,
-) -> Bool:
-	match fallback:
-		ConstructorMatchFallbackBody(body):
-			result_aliases_var(state, target, aliases, body)
-		ConstructorMatchFallbackBindings(bindings, body):
-			fallback_aliases: List[(CoreVar, Bool)] = aliases_with_match_bindings(
-				aliases,
-				bindings,
-				scrutinee_aliases,
-			)
-			result_aliases_var(state, target, fallback_aliases, body)
-		ConstructorMatchFallbackFail:
-			False
-
-
-private pure func function_is_cloneable(
-	state: ConsumeSpecializeState,
-	arg_index: Int,
-	func_info: CoreFunction,
-) -> Bool:
+---
+Only a record parameter can be updated in place, so only record parameters
+of user functions that return the same record type are candidates.
+---
+private pure func function_is_cloneable(arg_index: Int, func_info: CoreFunction) -> Bool:
 	match func_info.function_kind:
 		UserFunction:
-			match func_info.body:
-				Some(body):
-					match func_info.params.get(arg_index):
-						Some(param):
-							managed_param: Bool = source_managed_type_name(
-								state,
-								param.typ,
-							).is_some()
-							returns_same_type: Bool = core_type_equal(
-								param.typ,
-								func_info.return_type,
-							)
-							result_does_not_alias_param: Bool = not result_aliases_var(
-								state,
-								param.name,
-								[],
-								body,
-							)
-							managed_param and returns_same_type and result_does_not_alias_param
-						None:
-							False
-				None:
-					False
+			if func_info.body.is_none():
+				False
+			else:
+				match func_info.params.get(arg_index):
+					Some(param):
+						match param.typ:
+							HeapRecordType(param_record):
+								same_heap_record(param_record, func_info.return_type)
+							_:
+								False
+					None:
+						False
 		ProgramEntrypointFunction:
 			False
 		BuiltinFunction(c_name):
@@ -879,14 +320,6 @@ private pure func clone_key(
 	}
 
 
-private pure func clone_key_equal(left: CloneKey, right: CloneKey) -> Bool:
-	(
-		left.original_name == right.original_name
-		and left.original_def_id == right.original_def_id
-		and left.arg_index == right.arg_index
-	)
-
-
 private pure func clone_callee_var(name: String, def_id: Int) -> CoreVar:
 	{
 		name = name,
@@ -906,44 +339,6 @@ private pure func rewrite_callee_expr(name: String, def_id: Int, callee: CoreExp
 			)
 		_:
 			callee
-
-
-private pure func is_call_to_function(original: CoreFunction, kind: CoreCallKind) -> Bool:
-	match kind:
-		UserCall(name, Some(def_id), consumed_args):
-			name == original.name and def_id == original.def_id
-		_:
-			False
-
-
-private pure func direct_arg_var(args: List[CoreExpr], index: Int) -> Option[CoreVar]:
-	match args.get(index):
-		Some(arg):
-			direct_var(arg)
-		None:
-			None
-
-
-private pure func seq_owned_use(
-	left: OwnedUseAnalysis,
-	right: OwnedUseAnalysis,
-) -> OwnedUseAnalysis:
-	{
-		safe = left.safe and right.safe,
-		min_count = left.min_count + right.min_count,
-		max_count = left.max_count + right.max_count
-	}
-
-
-private pure func join_owned_use(
-	left: OwnedUseAnalysis,
-	right: OwnedUseAnalysis,
-) -> OwnedUseAnalysis:
-	{
-		safe = left.safe and right.safe,
-		min_count = min_int(left.min_count, right.min_count),
-		max_count = max_int(left.max_count, right.max_count)
-	}
 
 
 private pure func expr_mentions_var(expr: CoreExpr, target: CoreVar) -> Bool:
@@ -967,437 +362,11 @@ private pure func expr_mentions_var(expr: CoreExpr, target: CoreVar) -> Bool:
 	)
 
 
-private pure func analyze_exprs_owned_use(
-	original: CoreFunction,
-	arg_index: Int,
-	target: CoreVar,
-	exprs: List[CoreExpr],
-) -> OwnedUseAnalysis:
-	var result: OwnedUseAnalysis = EMPTY_OWNED_USE
-
-	for expr in exprs:
-		result = seq_owned_use(
-			result,
-			analyze_owned_binding_use(original, arg_index, target, expr),
-		)
-
-	result
-
-
-private pure func allowed_owned_call_use(
-	original: CoreFunction,
-	arg_index: Int,
-	target: CoreVar,
-	kind: CoreCallKind,
-	args: List[CoreExpr],
-) -> Bool:
-	(
-		is_call_to_function(original, kind)
-		and direct_arg_var(args, arg_index)
-			.map(func(variable): core_var_equal(variable, target))
-			.get_or(False)
-	)
-
-
-private pure func analyze_owned_call_args(
-	original: CoreFunction,
-	arg_index: Int,
-	target: CoreVar,
-	args: List[CoreExpr],
-) -> OwnedUseAnalysis:
-	var result: OwnedUseAnalysis = EMPTY_OWNED_USE
-	var index: Int = 0
-
-	for arg in args:
-		if (
-			index == arg_index
-			and direct_var(arg)
-				.map(func(variable): core_var_equal(variable, target))
-				.get_or(False)
-		):
-			void
-		else:
-			result = seq_owned_use(
-				result,
-				analyze_owned_binding_use(original, arg_index, target, arg),
-			)
-
-		index += 1
-
-	result
-
-
-private pure func analyze_owned_binding_use(
-	original: CoreFunction,
-	arg_index: Int,
-	target: CoreVar,
-	expr: CoreExpr,
-) -> OwnedUseAnalysis:
-	match expr:
-		VarExpr(variable, typ, loc):
-			if core_var_equal(variable, target):
-				UNSAFE_OWNED_USE
-			else:
-				EMPTY_OWNED_USE
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			if core_var_equal(variable, target):
-				UNSAFE_OWNED_USE
-			else:
-				analyze_owned_binding_use(original, arg_index, target, body)
-		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			if core_var_equal(variable, target):
-				UNSAFE_OWNED_USE
-			else:
-				analyze_owned_binding_use(original, arg_index, target, body)
-		CallExpr(kind, callee, args, typ, loc):
-			if allowed_owned_call_use(original, arg_index, target, kind, args):
-				call_use: OwnedUseAnalysis = {
-					safe = True,
-					min_count = 1,
-					max_count = 1
-				}
-				seq_owned_use(
-					call_use,
-					analyze_owned_call_args(original, arg_index, target, args),
-				)
-			else:
-				analyze_exprs_owned_use(original, arg_index, target, args)
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			rhs_use: OwnedUseAnalysis = analyze_owned_binding_use(original, arg_index, target, rhs)
-
-			if core_var_equal(variable, target):
-				rhs_use
-			else:
-				seq_owned_use(
-					rhs_use,
-					analyze_owned_binding_use(original, arg_index, target, body),
-				)
-		BorrowLetExpr(variable, typ, rhs, body):
-			rhs_use: OwnedUseAnalysis = analyze_owned_binding_use(original, arg_index, target, rhs)
-
-			if core_var_equal(variable, target):
-				rhs_use
-			else:
-				seq_owned_use(
-					rhs_use,
-					analyze_owned_binding_use(original, arg_index, target, body),
-				)
-		SeqExpr(first, second):
-			seq_owned_use(
-				analyze_owned_binding_use(original, arg_index, target, first),
-				analyze_owned_binding_use(original, arg_index, target, second),
-			)
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			condition_use: OwnedUseAnalysis = analyze_owned_binding_use(
-				original,
-				arg_index,
-				target,
-				cond,
-			)
-			branch_use: OwnedUseAnalysis = join_owned_use(
-				analyze_owned_binding_use(original, arg_index, target, then_expr),
-				analyze_owned_binding_use(original, arg_index, target, else_expr),
-			)
-			seq_owned_use(condition_use, branch_use)
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			scrutinee_use: OwnedUseAnalysis = analyze_owned_binding_use(
-				original,
-				arg_index,
-				target,
-				scrutinee,
-			)
-			case_use: OwnedUseAnalysis = analyze_constructor_match_cases_owned_use(
-				original,
-				arg_index,
-				target,
-				cases,
-			)
-			seq_owned_use(scrutinee_use, case_use)
-		_:
-			if expr_mentions_var(expr, target):
-				UNSAFE_OWNED_USE
-			else:
-				EMPTY_OWNED_USE
-
-
-private pure func analyze_constructor_match_cases_owned_use(
-	original: CoreFunction,
-	arg_index: Int,
-	target: CoreVar,
-	cases: List[CoreConstructorMatchCase],
-) -> OwnedUseAnalysis:
-	var result: Option[OwnedUseAnalysis] = None
-
-	for match_case in cases:
-		case_use: OwnedUseAnalysis = analyze_constructor_match_body_owned_use(
-			original,
-			arg_index,
-			target,
-			match_case.body,
-		)
-
-		result = match result:
-			Some(current):
-				Some(join_owned_use(current, case_use))
-			None:
-				Some(case_use)
-
-	result.get_or(EMPTY_OWNED_USE)
-
-
-private pure func analyze_constructor_match_body_owned_use(
-	original: CoreFunction,
-	arg_index: Int,
-	target: CoreVar,
-	body: CoreConstructorMatchBody,
-) -> OwnedUseAnalysis:
-	match body:
-		ConstructorMatchBodyExpr(expr):
-			analyze_owned_binding_use(original, arg_index, target, expr)
-		ConstructorMatchBodyLiteral(match_expr):
-			EMPTY_OWNED_USE
-		ConstructorMatchBodyLength(match_expr):
-			EMPTY_OWNED_USE
-
-
-private pure func can_own_binding(
-	original: CoreFunction,
-	arg_index: Int,
-	binding: CoreMatchBinding,
-	body: CoreConstructorMatchBody,
-) -> Bool:
-	analysis: OwnedUseAnalysis = analyze_constructor_match_body_owned_use(
-		original,
-		arg_index,
-		binding.variable,
-		body,
-	)
-
-	analysis.safe and analysis.min_count == 1 and analysis.max_count == 1
-
-
-private pure func direct_owned_binding_candidate(
-	state: ConsumeSpecializeState,
-	param_type: CoreType,
-	binding: CoreMatchBinding,
-) -> Bool:
-	match binding.mode:
-		MatchBorrowBindingMode:
-			match binding.accessor:
-				VariantFieldAccessor(RootAccessor, union_c_type, constructor, field_index):
-					direct_variant_field_type(state, param_type, constructor, field_index)
-						.map(func(field_type):
-							same_type: Bool = core_type_equal(field_type, param_type)
-							managed_field: Bool = source_managed_type_name(
-								state,
-								field_type,
-							).is_some()
-
-							same_type and managed_field
-						)
-						.get_or(False)
-				_:
-					False
-		MatchOwnBindingMode:
-			False
-
-
-private pure func owned_binding_vars(
-	state: ConsumeSpecializeState,
-	original: CoreFunction,
-	arg_index: Int,
-	param_type: CoreType,
-	match_case: CoreConstructorMatchCase,
-) -> List[CoreVar]:
-	var variables: List[CoreVar] = []
-
-	for binding in match_case.bindings:
-		if (
-			direct_owned_binding_candidate(state, param_type, binding)
-			and can_own_binding(original, arg_index, binding, match_case.body)
-		):
-			variables = variables.append(binding.variable)
-		else:
-			void
-
-	variables
-
-
-private pure func list_contains_var(items: List[CoreVar], value: CoreVar) -> Bool:
-	var found: Bool = False
-
-	for item in items:
-		if core_var_equal(item, value):
-			found = True
-			break
-		else:
-			void
-
-	found
-
-
-private pure func rewrite_owned_recursive_call(
-	original: CoreFunction,
-	clone: CoreFunction,
-	arg_index: Int,
-	owned_vars: List[CoreVar],
-	expr: CoreExpr,
-) -> CoreExpr:
-	mapped: CoreExpr = match expr:
-		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(
-				expr,
-				func(
-					item,
-				): rewrite_owned_recursive_call(original, clone, arg_index, owned_vars, item),
-			)
-		LogicalExpr(_, _, _, _, _):
-			CoreTraverse.map_core_logical_tree(
-				expr,
-				func(
-					item,
-				): rewrite_owned_recursive_call(original, clone, arg_index, owned_vars, item),
-			)
-		_:
-			CoreTraverse.map_core_expr_children(
-				expr,
-				func(
-					child,
-				): rewrite_owned_recursive_call(original, clone, arg_index, owned_vars, child),
-			)
-
-	match mapped:
-		CallExpr(kind, callee, args, typ, loc):
-			if (
-				is_call_to_function(original, kind)
-				and direct_arg_var(args, arg_index)
-					.map(func(variable): list_contains_var(owned_vars, variable))
-					.get_or(False)
-			):
-				CallExpr(
-					UserCall(clone.name, Some(clone.def_id), []),
-					rewrite_callee_expr(clone.name, clone.def_id, callee),
-					args,
-					typ,
-					loc,
-				)
-			else:
-				mapped
-		_:
-			mapped
-
-
-private pure func rewrite_owned_recursive_match_body(
-	original: CoreFunction,
-	clone: CoreFunction,
-	arg_index: Int,
-	owned_vars: List[CoreVar],
-	body: CoreConstructorMatchBody,
-) -> CoreConstructorMatchBody:
-	match body:
-		ConstructorMatchBodyExpr(expr):
-			ConstructorMatchBodyExpr(
-				rewrite_owned_recursive_call(
-					original,
-					clone,
-					arg_index,
-					owned_vars,
-					expr,
-				),
-			)
-		ConstructorMatchBodyLiteral(match_expr):
-			ConstructorMatchBodyLiteral(match_expr)
-		ConstructorMatchBodyLength(match_expr):
-			ConstructorMatchBodyLength(match_expr)
-
-
-private pure func rewrite_owned_match_case(
-	state: ConsumeSpecializeState,
-	original: CoreFunction,
-	clone: CoreFunction,
-	arg_index: Int,
-	param_type: CoreType,
-	match_case: CoreConstructorMatchCase,
-) -> CoreConstructorMatchCase:
-	owned_vars: List[CoreVar] = owned_binding_vars(
-		state,
-		original,
-		arg_index,
-		param_type,
-		match_case,
-	)
-
-	if owned_vars.length() == 0:
-		match_case
-	else:
-		var bindings: List[CoreMatchBinding] = []
-
-		for binding in match_case.bindings:
-			if list_contains_var(owned_vars, binding.variable):
-				bindings = bindings.append({ binding | mode = MatchOwnBindingMode })
-			else:
-				bindings = bindings.append(binding)
-
-		{ match_case |
-			bindings = bindings,
-			body = rewrite_owned_recursive_match_body(
-				original,
-				clone,
-				arg_index,
-				owned_vars,
-				match_case.body,
-			)
-		}
-
-
-private pure func rewrite_owned_match_expr(
-	state: ConsumeSpecializeState,
-	original: CoreFunction,
-	clone: CoreFunction,
-	arg_index: Int,
-	param: CoreParam,
-	expr: CoreExpr,
-) -> CoreExpr:
-	match expr:
-		ConstructorMatchExpr(VarExpr(scrutinee, scrutinee_type, scrutinee_loc), release_policy, cases, fallback, typ, loc):
-			if core_var_equal(scrutinee, param.name):
-				var rewritten_cases: List[CoreConstructorMatchCase] = []
-
-				for match_case in cases:
-					rewritten_cases = rewritten_cases.append(
-						rewrite_owned_match_case(
-							state,
-							original,
-							clone,
-							arg_index,
-							param.typ,
-							match_case,
-						),
-					)
-
-				ConstructorMatchExpr(
-					VarExpr(scrutinee, scrutinee_type, scrutinee_loc),
-					release_policy,
-					rewritten_cases,
-					fallback,
-					typ,
-					loc,
-				)
-			else:
-				expr
-		_:
-			expr
-
-
-private pure func result_var_for_param(name: String) -> CoreVar:
-	{
-		name = "__consume_result_${name}",
-		id = 0,
-		def_id = None,
-		origin = CONSUME_SPECIALIZE_TEMP_ORIGIN
-	}
-
-
+---
+The clone of `original` that owns parameter `arg_index`: the original body
+with every call that hands an owned record on at its last use retargeted,
+starting from the owned parameter.
+---
 private pure func make_consuming_clone(
 	state: ConsumeSpecializeState,
 	original: CoreFunction,
@@ -1408,56 +377,29 @@ private pure func make_consuming_clone(
 		Some(param):
 			match original.body:
 				Some(body):
-					placeholder: CoreFunction = {
+					Some({
 						name = clone_name(original.name, arg_index),
 						source_module = original.source_module,
 						module = original.module,
 						type_params = original.type_params,
 						params = original.params,
 						return_type = original.return_type,
-						body = None,
+						body = Some(
+							rewrite_last_use(
+								{
+									state = state,
+									owned = [param.name],
+									after = NothingAfter
+								},
+								body,
+							),
+						),
 						is_pure = original.is_pure,
 						function_kind = original.function_kind,
-						origin = original.origin,
+						origin = ConsumingClone(arg_index, core_function_declared_origin(original.origin)),
 						def_id = clone_def_id,
 						loc = original.loc
-					}
-					rewritten_body: CoreExpr = rewrite_owned_match_expr(
-						state,
-						original,
-						placeholder,
-						arg_index,
-						param,
-						body,
-					)
-					result_var: CoreVar = result_var_for_param(param.name.name)
-					result_ref: CoreExpr = VarExpr(
-						result_var,
-						original.return_type,
-						synthetic_core_source_loc(),
-					)
-					drop_then_return: CoreExpr = DropExpr(
-						param.name,
-						param.typ,
-						ArcReleasePolicy,
-						result_ref,
-						original.return_type,
-						synthetic_core_source_loc(),
-					)
-
-					Some(
-						{ placeholder |
-							body = Some(
-								LetExpr(
-									result_var,
-									False,
-									original.return_type,
-									rewritten_body,
-									drop_then_return,
-								),
-							)
-						},
-					)
+					})
 				None:
 					None
 		None:
@@ -1474,10 +416,9 @@ private pure func collect_function_clone_candidates(
 		catalog = state.candidates,
 		ordinals = []
 	}
-	analysis_state: ConsumeSpecializeState = state.analysis_state
 
 	for param in func_info.params:
-		if function_is_cloneable(analysis_state, arg_index, func_info):
+		if function_is_cloneable(arg_index, func_info):
 			clone_def_id: Int = current.next_def_id
 			current = { current | next_def_id = current.next_def_id + 1 }
 			function_candidates = append_function_clone_candidate(
@@ -1522,7 +463,7 @@ private pure func find_clone_target(
 							candidate.key.original_name == original_name
 							and candidate.key.original_def_id == original_def_id
 							and candidate.key.arg_index == arg_index
-							and core_type_equal(candidate.param_type, target_type)
+							and same_heap_record_type(candidate.param_type, target_type)
 						):
 							found = Some({
 								key = candidate.key,
@@ -1578,95 +519,6 @@ private pure func mark_clone_used(
 		}
 
 
-private pure func call_arg_consumes_target(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	target_type: CoreType,
-	kind: CoreCallKind,
-	args: List[CoreExpr],
-) -> Option[CloneTarget]:
-	var candidate_index: Option[Int] = None
-	var index: Int = 0
-	var count: Int = 0
-
-	for arg in args:
-		if (
-			direct_var(arg)
-				.map(func(variable): core_var_equal(variable, target))
-				.get_or(False)
-		):
-			candidate_index = Some(index)
-			count += 1
-		else:
-			void
-
-		index += 1
-
-	if count == 1:
-		match candidate_index:
-			Some(arg_index):
-				match kind:
-					UserCall(name, Some(def_id), consumed_args):
-						find_clone_target(state, name, def_id, arg_index, target_type)
-					_:
-						None
-			None:
-				None
-	else:
-		None
-
-
-private pure func rewrite_assignment_call_expr(
-	state: ConsumeSpecializeState,
-	target: CoreVar,
-	target_type: CoreType,
-	rhs: CoreExpr,
-) -> CoreExpr:
-	match rhs:
-		CallExpr(kind, callee, args, typ, loc):
-			match call_arg_consumes_target(state, target, target_type, kind, args):
-				Some(target_clone):
-					CallExpr(
-						UserCall(target_clone.clone_name, Some(target_clone.clone_def_id), []),
-						rewrite_callee_expr(
-							target_clone.clone_name,
-							target_clone.clone_def_id,
-							callee,
-						),
-						args,
-						typ,
-						loc,
-					)
-				None:
-					rhs
-		_:
-			rhs
-
-
-private pure func rewrite_expr_total(state: ConsumeSpecializeState, expr: CoreExpr) -> CoreExpr:
-	mapped: CoreExpr = match expr:
-		SeqExpr(_, _):
-			CoreTraverse.map_core_sequence_items(expr, func(item): rewrite_expr_total(state, item))
-		LogicalExpr(_, _, _, _, _):
-			CoreTraverse.map_core_logical_tree_with_context(expr, state, rewrite_expr_total)
-		_:
-			CoreTraverse.map_core_expr_children_with_context(expr, state, rewrite_expr_total)
-
-	match mapped:
-		AssignExpr(target, rhs, typ, loc):
-			rhs_type: CoreType = core_expr_type(rhs)
-
-			rewritten_rhs: CoreExpr = match source_managed_type_name(state, rhs_type):
-				Some(type_name):
-					rewrite_assignment_call_expr(state, target, rhs_type, rhs)
-				None:
-					rhs
-
-			AssignExpr(target, rewritten_rhs, typ, loc)
-		_:
-			mapped
-
-
 private pure func candidate_for_clone_call(
 	state: ConsumeSpecializeState,
 	name: String,
@@ -1686,11 +538,436 @@ private pure func candidate_for_clone_call(
 			None
 
 
-private pure func collect_used_clone_keys_from_expr(
+private pure func var_list_contains(items: List[CoreVar], value: CoreVar) -> Bool:
+	items.any(func(item): core_var_equal(item, value))
+
+
+private pure func var_list_without(items: List[CoreVar], value: CoreVar) -> List[CoreVar]:
+	if var_list_contains(items, value):
+		items.filter(func(item): not core_var_equal(item, value))
+	else:
+		items
+
+
+-- Allocation identity for the reuse rule of the last-use walk: a rewritten
+-- child that is the same allocation as its input means nothing below it was
+-- retargeted, so the parent is handed back as is instead of rebuilt. Bound
+-- straight to the runtime primitive for the same bootstrap reason as the
+-- matching blocks in traverse.brp and tuple_sroa.brp; delete them together.
+foreign:
+	private pure func same_core_expr(left: CoreExpr, right: CoreExpr) -> Bool = "blorp_same_object"
+
+
+---
+The expressions that run after the one the walk is rewriting, innermost
+first. Only mentions matter: an owned variable mentioned in any of them is
+still live.
+---
+private union LastUseContinuation:
+	NothingAfter
+	EvaluatedAfter(CoreExpr, LastUseContinuation)
+
+
+---
+What the last-use walk knows at the expression it is rewriting.
+
+`owned` holds the variables this body owns and may hand to a consuming clone:
+the owned parameter of a clone and every `let`-bound local of a candidate
+record type. Borrowed parameters, borrow lets and match bindings are never in
+it. `after` holds what runs after the expression; it is only kept while
+`owned` is not empty, since it only answers liveness questions about owned
+variables. Inside loops, lambdas, logical operators and every other construct
+that may run a child more than once or not at all, the walk starts over with
+no owned variables, so it only retargets where straight-line control flow
+proves the last use.
+
+Perceus is the safety net for this analysis: a variable handed to a clone
+while still live gets a retain, so imprecision here costs a copy, never
+correctness.
+---
+private record LastUseWalk {
+	state: ConsumeSpecializeState,
+	owned: List[CoreVar],
+	after: LastUseContinuation
+}
+
+
+private NO_VARS: List[CoreVar] = []
+
+
+private pure func owned_candidate_type(state: ConsumeSpecializeState, typ: CoreType) -> Bool:
+	match typ:
+		HeapRecordType(name):
+			Sets.contains(state.owned_record_types, name)
+		_:
+			False
+
+
+private pure func read_after(variable: CoreVar, after: LastUseContinuation) -> Bool:
+	var rest: LastUseContinuation = after
+	var found: Bool = False
+
+	while not found:
+		match rest:
+			EvaluatedAfter(expr, remaining):
+				found = expr_mentions_var(expr, variable)
+				rest = remaining
+			NothingAfter:
+				break
+
+	found
+
+
+---
+`walk` for an expression followed by `later`.
+---
+private pure func walk_before(walk: LastUseWalk, later: CoreExpr) -> LastUseWalk:
+	if walk.owned.length() == 0:
+		walk
+	else:
+		{ walk | after = EvaluatedAfter(later, walk.after) }
+
+
+---
+`walk` for a construct the walk does not model: no outer variable is handed
+over inside it.
+---
+private pure func conservative_walk(walk: LastUseWalk) -> LastUseWalk:
+	if walk.owned.length() == 0:
+		walk
+	else:
+		{ walk | owned = NO_VARS, after = NothingAfter }
+
+
+private pure func walk_without(walk: LastUseWalk, variable: CoreVar) -> LastUseWalk:
+	if var_list_contains(walk.owned, variable):
+		{ walk | owned = var_list_without(walk.owned, variable) }
+	else:
+		walk
+
+
+private pure func walk_owning(walk: LastUseWalk, variable: CoreVar) -> LastUseWalk:
+	{ walk | owned = var_list_without(walk.owned, variable).append(variable) }
+
+
+private pure func is_leaf_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(_, _, _) | LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
+			True
+		_:
+			False
+
+
+private pure func rewrite_last_use_child(walk: LastUseWalk, child: CoreExpr) -> CoreExpr:
+	rewrite_last_use(walk, child)
+
+
+private pure func rewrite_last_use_match_result(
+	walk: LastUseWalk,
+	bindings: List[CoreMatchBinding],
+	result: CoreExpr,
+) -> CoreExpr:
+	var result_walk: LastUseWalk = walk
+
+	for binding in bindings:
+		result_walk = walk_without(result_walk, binding.variable)
+
+	rewrite_last_use(result_walk, result)
+
+
+private pure func rewrite_last_use_sequence(walk: LastUseWalk, expr: CoreExpr) -> CoreExpr:
+	spine = CoreTraverse.split_core_sequence(expr)
+	final_item: CoreExpr = rewrite_last_use(walk, spine.final_item)
+	var changed: Bool = not same_core_expr(final_item, spine.final_item)
+	var item_walk: LastUseWalk = walk_before(walk, spine.final_item)
+	var rewritten_reversed: List[CoreExpr] = []
+	var index: Int = spine.preceding_items.length() - 1
+
+	while index >= 0:
+		match spine.preceding_items.get(index):
+			Some(item):
+				rewritten: CoreExpr = rewrite_last_use(item_walk, item)
+				changed = changed or not same_core_expr(rewritten, item)
+				rewritten_reversed = rewritten_reversed.append(rewritten)
+				item_walk = walk_before(item_walk, item)
+			None:
+				void
+
+		index -= 1
+
+	if changed:
+		CoreTraverse.rebuild_core_sequence({
+			preceding_items = rewritten_reversed.reverse(),
+			final_item = final_item
+		})
+	else:
+		expr
+
+
+private pure func direct_arg_count(args: List[CoreExpr], variable: CoreVar) -> Int:
+	var count: Int = 0
+
+	for arg in args:
+		if (
+			direct_var(arg)
+				.map(func(arg_var): core_var_equal(arg_var, variable))
+				.get_or(False)
+		):
+			count += 1
+		else:
+			void
+
+	count
+
+
+---
+The clone a call can hand an owned argument to: the first argument that is
+an owned variable passed once among the call's direct arguments, not read
+after the call, and accepted by a clone. Uses of the same variable inside
+other arguments run before the call, so they do not keep it live past it.
+`assigned` is the target of `x = f(..., x, ...)`: the assignment ends its
+old value, so it needs no liveness check and is tried first.
+---
+private pure func last_use_clone_target(
+	walk: LastUseWalk,
+	assigned: Option[CoreVar],
+	kind: CoreCallKind,
+	args: List[CoreExpr],
+	result_type: CoreType,
+) -> Option[CloneTarget]:
+	match kind:
+		UserCall(name, Some(def_id), _):
+			var assigned_target: Option[CloneTarget] = None
+			var other_target: Option[CloneTarget] = None
+			var index: Int = 0
+
+			for arg in args:
+				match direct_var(arg):
+					Some(variable):
+						if var_list_contains(walk.owned, variable) and direct_arg_count(args, variable) == 1:
+							is_assigned: Bool = assigned
+								.map(func(target): core_var_equal(target, variable))
+								.get_or(False)
+
+							if is_assigned:
+								assigned_target = find_clone_target(walk.state, name, def_id, index, result_type)
+							else if other_target.is_none() and not read_after(variable, walk.after):
+								other_target = find_clone_target(walk.state, name, def_id, index, result_type)
+							else:
+								void
+						else:
+							void
+					None:
+						void
+
+				index += 1
+
+			match assigned_target:
+				Some(target_clone):
+					Some(target_clone)
+				None:
+					other_target
+		_:
+			None
+
+
+---
+`after` with every argument except the one at `skipped` in front of it:
+while one argument runs, the others are still to run or still to be passed.
+---
+private pure func other_args_after(
+	args: List[CoreExpr],
+	skipped: Int,
+	after: LastUseContinuation,
+) -> LastUseContinuation:
+	var result: LastUseContinuation = after
+	var index: Int = 0
+
+	for arg in args:
+		if index != skipped:
+			result = EvaluatedAfter(arg, result)
+		else:
+			void
+
+		index += 1
+
+	result
+
+
+private pure func rewrite_last_use_call(
+	walk: LastUseWalk,
+	assigned: Option[CoreVar],
+	expr: CoreExpr,
+) -> CoreExpr:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			var rewritten_args: List[CoreExpr] = []
+			var args_changed: Bool = False
+			var index: Int = 0
+
+			for arg in args:
+				rewritten: CoreExpr = if is_leaf_expr(arg):
+					arg
+				else if walk.owned.length() == 0:
+					rewrite_last_use(walk, arg)
+				else:
+					rewrite_last_use(
+						{ walk | after = other_args_after(args, index, walk.after) },
+						arg,
+					)
+
+				if args_changed:
+					rewritten_args = rewritten_args.append(rewritten)
+				else if not same_core_expr(rewritten, arg):
+					args_changed = True
+					rewritten_args = args.take(index).append(rewritten)
+				else:
+					void
+
+				index += 1
+
+			final_args: List[CoreExpr] = if args_changed:
+				rewritten_args
+			else:
+				args
+			rewritten_callee: CoreExpr = if is_leaf_expr(callee):
+				callee
+			else:
+				rewrite_last_use(conservative_walk(walk), callee)
+			target: Option[CloneTarget] = if walk.owned.length() == 0:
+				None
+			else:
+				last_use_clone_target(walk, assigned, kind, args, typ)
+
+			match target:
+				Some(target_clone):
+					CallExpr(
+						UserCall(target_clone.clone_name, Some(target_clone.clone_def_id), []),
+						rewrite_callee_expr(
+							target_clone.clone_name,
+							target_clone.clone_def_id,
+							rewritten_callee,
+						),
+						final_args,
+						typ,
+						loc,
+					)
+				None:
+					if args_changed or not same_core_expr(rewritten_callee, callee):
+						CallExpr(kind, rewritten_callee, final_args, typ, loc)
+					else:
+						expr
+		_:
+			rewrite_last_use(walk, expr)
+
+
+---
+Retargets every call that hands an owned record on at its last use to the
+consuming clone for that argument, rebuilding only the nodes above a change.
+`x = f(x)` is the case where the assignment ends the old value's life: when
+the right-hand side is that direct call, the target counts as owned inside
+it. Inside any other right-hand side the target is never handed over:
+Perceus releases the old value at the assignment unless the right-hand side
+as a whole consumes it, and it does not balance a right-hand side that
+consumes it on some paths only (`x = match k: A: f(x) B: {x | ...}` would
+leak the old value on the B path).
+---
+private pure func rewrite_last_use(walk: LastUseWalk, expr: CoreExpr) -> CoreExpr:
+	match expr:
+		VarExpr(_, _, _) | LiteralExpr(_, _, _) | StaticStringLiteralExpr(_, _, _, _) | VoidExpr(_, _):
+			expr
+		SeqExpr(_, _):
+			rewrite_last_use_sequence(walk, expr)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			body_walk: LastUseWalk = if owned_candidate_type(walk.state, typ):
+				walk_owning(walk, variable)
+			else:
+				walk_without(walk, variable)
+			rewritten_body: CoreExpr = rewrite_last_use(body_walk, body)
+			rewritten_rhs: CoreExpr = rewrite_last_use(walk_before(walk, body), rhs)
+
+			if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
+				expr
+			else:
+				LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
+		BorrowLetExpr(variable, typ, rhs, body):
+			rewritten_body: CoreExpr = rewrite_last_use(walk_without(walk, variable), body)
+			rewritten_rhs: CoreExpr = rewrite_last_use(walk_before(walk, body), rhs)
+
+			if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
+				expr
+			else:
+				BorrowLetExpr(variable, typ, rewritten_rhs, rewritten_body)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			rewritten_then: CoreExpr = rewrite_last_use(walk, then_expr)
+			rewritten_else: CoreExpr = rewrite_last_use(walk, else_expr)
+			rewritten_cond: CoreExpr = rewrite_last_use(
+				walk_before(walk_before(walk, else_expr), then_expr),
+				cond,
+			)
+
+			if (
+				same_core_expr(rewritten_cond, cond)
+				and same_core_expr(rewritten_then, then_expr)
+				and same_core_expr(rewritten_else, else_expr)
+			):
+				expr
+			else:
+				IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
+		AssignExpr(target, rhs, typ, loc):
+			rewritten_rhs: CoreExpr = match rhs:
+				CallExpr(_, _, _, _, _):
+					rewrite_last_use_call(walk_owning(walk, target), Some(target), rhs)
+				_:
+					rewrite_last_use(walk_without(walk, target), rhs)
+
+			if same_core_expr(rewritten_rhs, rhs):
+				expr
+			else:
+				AssignExpr(target, rewritten_rhs, typ, loc)
+		CallExpr(_, _, _, _, _):
+			rewrite_last_use_call(walk, None, expr)
+		ConstructorMatchExpr(_, _, _, _, _, _) | LiteralMatchExpr(_, _, _, _, _) | AccessorLiteralMatchExpr(_, _, _, _, _) | LengthMatchExpr(_, _, _, _, _):
+			-- Match results are the only children a match runs at most one of,
+			-- after the scrutinee; the scrutinee is left as is.
+			CoreTraverse.map_core_match_results_with_context(expr, walk, rewrite_last_use_match_result)
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree_with_context(
+				expr,
+				conservative_walk(walk),
+				rewrite_last_use_child,
+			)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				conservative_walk(walk),
+				rewrite_last_use_child,
+			)
+
+
+private pure func original_function_for_decl(decl: CoreDecl) -> Option[CoreFunction]:
+	match decl:
+		FunctionDecl(func_info):
+			Some(func_info)
+		_:
+			None
+
+
+---
+The clone def ids a rewritten body calls, marking each as used.
+---
+private record CloneCallCollection {
+	state: ConsumeSpecializeState,
+	called_clone_def_ids: List[Int]
+}
+
+
+private pure func collect_clone_calls_from_expr(
 	state: ConsumeSpecializeState,
 	expr: CoreExpr,
-) -> ConsumeSpecializeState:
+) -> CloneCallCollection:
 	var current: ConsumeSpecializeState = state
+	var called: List[Int] = []
 	var pending: List[CoreExpr] = [expr]
 	var index: Int = 0
 
@@ -1698,10 +975,11 @@ private pure func collect_used_clone_keys_from_expr(
 		match pending.get(index):
 			Some(current_expr):
 				match current_expr:
-					CallExpr(UserCall(name, Some(def_id), consumed_args), callee, args, typ, loc):
+					CallExpr(UserCall(name, Some(def_id), _), _, _, _, _):
 						match candidate_for_clone_call(current, name, def_id):
 							Some(candidate):
 								current = mark_clone_used(current, candidate.key)
+								called = called.append(def_id)
 							None:
 								void
 					_:
@@ -1714,78 +992,446 @@ private pure func collect_used_clone_keys_from_expr(
 
 		index += 1
 
-	current
+	{state = current, called_clone_def_ids = called}
 
 
-private pure func rewrite_func(
-	state: ConsumeSpecializeState,
-	func_info: CoreFunction,
-) -> CoreFunction:
-	match func_info.body:
-		Some(body):
-			rewritten_body: CoreExpr = rewrite_expr_total(state, body)
-			{
-				name = func_info.name,
-				source_module = func_info.source_module,
-				module = func_info.module,
-				type_params = func_info.type_params,
-				params = func_info.params,
-				return_type = func_info.return_type,
-				body = Some(rewritten_body),
-				is_pure = func_info.is_pure,
-				function_kind = func_info.function_kind,
-				origin = func_info.origin,
-				def_id = func_info.def_id,
-				loc = func_info.loc
-			}
-		None:
-			func_info
-
-
-private pure func rewrite_global(state: ConsumeSpecializeState, global: CoreGlobal) -> CoreGlobal:
-	rewritten_init: CoreExpr = rewrite_expr_total(state, global.init)
-	{
-		name = global.name,
-		source_module = global.source_module,
-		typ = global.typ,
-		init = rewritten_init,
-		is_mutable = global.is_mutable,
-		is_const = global.is_const,
-		is_private = global.is_private,
-		def_id = global.def_id,
-		loc = global.loc
-	}
+private pure func decl_body(decl: CoreDecl) -> Option[CoreExpr]:
+	match decl:
+		FunctionDecl(func_info):
+			func_info.body
+		GlobalDecl(global):
+			Some(global.init)
+		_:
+			None
 
 
 private pure func rewrite_decl_body(state: ConsumeSpecializeState, decl: CoreDecl) -> CoreDecl:
-	match decl:
-		FunctionDecl(func_info):
-			FunctionDecl(rewrite_func(state, func_info))
-		GlobalDecl(global):
-			GlobalDecl(rewrite_global(state, global))
-		_:
-			decl
+	start: LastUseWalk = {state = state, owned = NO_VARS, after = NothingAfter}
 
-
-private pure func collect_used_clone_keys_from_decl(
-	state: ConsumeSpecializeState,
-	decl: CoreDecl,
-) -> ConsumeSpecializeState:
 	match decl:
 		FunctionDecl(func_info):
 			match func_info.body:
 				Some(body):
-					collect_used_clone_keys_from_expr(state, body)
+					FunctionDecl({ func_info | body = Some(rewrite_last_use(start, body)) })
 				None:
-					state
+					decl
 		GlobalDecl(global):
-			collect_used_clone_keys_from_expr(state, global.init)
+			GlobalDecl({ global | init = rewrite_last_use(start, global.init) })
 		_:
-			state
+			decl
+
+
+---
+What one scan of a built clone's body finds about its owned parameter and the
+clones it calls. The owned family is the parameter and every `let` or `var`
+that binds a member of the family: record-update lowering binds the updated
+record this way, and `var acc = state` followed by `acc = { acc | ... }`
+updates the parameter's record through the variable.
+---
+private record ConsumingCloneScan {
+	updates_owned_record: Bool,
+	owned_hand_offs: List[Int],
+	called_clone_def_ids: List[Int]
+}
+
+
+---
+Whether the argument a clone consumes (its `owned_index`) is a member of the
+owned family. A family member at a borrowed position is not handed over.
+---
+private pure func hands_on_family_member(
+	family: List[CoreVar],
+	args: List[CoreExpr],
+	owned_index: Int,
+) -> Bool:
+	match args.get(owned_index):
+		Some(arg):
+			match direct_var(arg):
+				Some(variable):
+					var_list_contains(family, variable)
+				None:
+					False
+		None:
+			False
+
+
+private pure func hands_off_to_beneficial_clone(
+	benefits: Dict[Int, ConsumingCloneBenefit],
+	owned_hand_offs: List[Int],
+) -> Bool:
+	var found: Bool = False
+
+	for target in owned_hand_offs:
+		if is_beneficial(benefit_of(benefits, target)):
+			found = True
+		else:
+			void
+
+	found
+
+
+private pure func scan_consuming_clone(
+	state: ConsumeSpecializeState,
+	clone: CoreFunction,
+	arg_index: Int,
+) -> ConsumingCloneScan:
+	var family: List[CoreVar] = match clone.params.get(arg_index):
+		Some(param):
+			[param.name]
+		None:
+			[]
+	var updates_owned_record: Bool = False
+	var owned_hand_offs: List[Int] = []
+	var called: List[Int] = []
+	var pending: List[CoreExpr] = match clone.body:
+		Some(body):
+			[body]
+		None:
+			[]
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(current_expr):
+				match current_expr:
+					LetExpr(variable, _, _, rhs, _):
+						match rhs:
+							VarExpr(source, _, _):
+								if var_list_contains(family, source):
+									family = family.append(variable)
+								else:
+									void
+							_:
+								void
+					RecordUpdateExpr(update_base, _, _, _):
+						match update_base:
+							VarExpr(base, _, _):
+								if var_list_contains(family, base):
+									updates_owned_record = True
+								else:
+									void
+							_:
+								void
+					CallExpr(UserCall(name, Some(def_id), _), _, args, _, _):
+						match candidate_for_clone_call(state, name, def_id):
+							Some(candidate):
+								called = called.append(def_id)
+
+								if hands_on_family_member(family, args, candidate.key.arg_index):
+									owned_hand_offs = owned_hand_offs.append(def_id)
+								else:
+									void
+							None:
+								void
+					_:
+						void
+
+				for child in CoreTraverse.immediate_core_expr_children(current_expr):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	{
+		updates_owned_record = updates_owned_record,
+		owned_hand_offs = owned_hand_offs,
+		called_clone_def_ids = called
+	}
+
+
+private pure func is_beneficial(benefit: ConsumingCloneBenefit) -> Bool:
+	match benefit:
+		UpdatesOwnedRecordInPlace | HandsOwnedRecordToBeneficialClone:
+			True
+		NoInPlaceBenefit:
+			False
+
+
+private pure func benefit_of(
+	benefits: Dict[Int, ConsumingCloneBenefit],
+	clone_def_id: Int,
+) -> ConsumingCloneBenefit:
+	benefits.get_or(clone_def_id, NoInPlaceBenefit)
+
+
+---
+Least fixpoint of the benefit relation over the built clones: a clone
+benefits when it updates its owned record in place, or when it hands the
+record on at its last use to a clone that benefits. Starting from the direct
+updates and only ever adding hand-offs keeps recursion honest: a clone whose
+only hand-off is to itself never qualifies.
+---
+private pure func classify_consuming_clones(
+	scans: Dict[Int, ConsumingCloneScan],
+	clone_def_ids: List[Int],
+) -> Dict[Int, ConsumingCloneBenefit]:
+	var benefits: Dict[Int, ConsumingCloneBenefit] = {}
+
+	for clone_def_id in clone_def_ids:
+		match scans.get(clone_def_id):
+			Some(scan):
+				if scan.updates_owned_record:
+					benefits = benefits.set(clone_def_id, UpdatesOwnedRecordInPlace)
+				else:
+					benefits = benefits.set(clone_def_id, NoInPlaceBenefit)
+			None:
+				void
+
+	var changed: Bool = True
+
+	while changed:
+		changed = False
+
+		for clone_def_id in clone_def_ids:
+			if not is_beneficial(benefit_of(benefits, clone_def_id)):
+				match scans.get(clone_def_id):
+					Some(scan):
+						if hands_off_to_beneficial_clone(benefits, scan.owned_hand_offs):
+							benefits = benefits.set(clone_def_id, HandsOwnedRecordToBeneficialClone)
+							changed = True
+						else:
+							void
+					None:
+						void
+			else:
+				void
+
+	benefits
+
+
+---
+Calls to clones without a benefit go back to the original function.
+---
+private record CloneCallReversal {
+	state: ConsumeSpecializeState,
+	benefits: Dict[Int, ConsumingCloneBenefit]
+}
+
+
+private pure func revert_calls_without_benefit(
+	reversal: CloneCallReversal,
+	expr: CoreExpr,
+) -> CoreExpr:
+	mapped: CoreExpr = match expr:
+		SeqExpr(_, _):
+			CoreTraverse.map_core_sequence_items(
+				expr,
+				func(item): revert_calls_without_benefit(reversal, item),
+			)
+		LogicalExpr(_, _, _, _, _):
+			CoreTraverse.map_core_logical_tree_with_context(
+				expr,
+				reversal,
+				revert_calls_without_benefit,
+			)
+		_:
+			CoreTraverse.map_core_expr_children_with_context(
+				expr,
+				reversal,
+				revert_calls_without_benefit,
+			)
+
+	match mapped:
+		CallExpr(UserCall(name, Some(def_id), consumed_args), callee, args, typ, loc):
+			if is_beneficial(benefit_of(reversal.benefits, def_id)):
+				mapped
+			else:
+				match candidate_for_clone_call(reversal.state, name, def_id):
+					Some(candidate):
+						CallExpr(
+							UserCall(candidate.key.original_name, Some(candidate.key.original_def_id), consumed_args),
+							rewrite_callee_expr(
+								candidate.key.original_name,
+								candidate.key.original_def_id,
+								callee,
+							),
+							args,
+							typ,
+							loc,
+						)
+					None:
+						mapped
+		_:
+			mapped
+
+
+private pure func revert_decl_calls_without_benefit(
+	reversal: CloneCallReversal,
+	decl: CoreDecl,
+) -> CoreDecl:
+	match decl:
+		FunctionDecl(func_info):
+			match func_info.body:
+				Some(body):
+					FunctionDecl({ func_info | body = Some(revert_calls_without_benefit(reversal, body)) })
+				None:
+					decl
+		GlobalDecl(global):
+			GlobalDecl({ global | init = revert_calls_without_benefit(reversal, global.init) })
+		_:
+			decl
+
+
+private pure func calls_clone_without_benefit(
+	benefits: Dict[Int, ConsumingCloneBenefit],
+	called_clone_def_ids: List[Int],
+) -> Bool:
+	called_clone_def_ids.any(func(def_id): not is_beneficial(benefit_of(benefits, def_id)))
+
+
+---
+Functions that have clone candidates, by def id. A def id may be shared by
+functions of different names, so each entry lists every such function and
+the clone key's name picks among them.
+---
+private pure func original_functions_with_candidates(
+	state: ConsumeSpecializeState,
+	decls: List[CoreDecl],
+) -> Dict[Int, List[CoreFunction]]:
+	var originals: Dict[Int, List[CoreFunction]] = {}
+
+	for decl in decls:
+		match decl:
+			FunctionDecl(func_info):
+				if state.candidates.ordinals_by_original_def_id.contains(func_info.def_id):
+					originals = originals.set(
+						func_info.def_id,
+						originals.get_or(func_info.def_id, []).append(func_info),
+					)
+				else:
+					void
+			_:
+				void
+
+	originals
+
+
+private pure func original_function_for_key(
+	originals: Dict[Int, List[CoreFunction]],
+	key: CloneKey,
+) -> Option[CoreFunction]:
+	originals
+		.get_or(key.original_def_id, [])
+		.find(func(func_info): func_info.name == key.original_name)
+
+
+---
+Every clone the rewritten program uses, built until no new clone key appears
+(a clone's body hands its owned record on at its last use, which can use a
+clone of another function or of itself), with one scan of each clone's body.
+Every candidate already holds a reserved def id, so the loop only decides
+which clones exist; it ends because the candidate set is finite.
+---
+private record BuiltConsumingClones {
+	state: ConsumeSpecializeState,
+	clones_by_def_id: Dict[Int, CoreFunction],
+	scans: Dict[Int, ConsumingCloneScan],
+	built_order: List[Int]
+}
+
+
+private pure func build_used_clones(
+	state: ConsumeSpecializeState,
+	original_decls: List[CoreDecl],
+) -> BuiltConsumingClones:
+	originals: Dict[Int, List[CoreFunction]] = original_functions_with_candidates(state, original_decls)
+	var current: ConsumeSpecializeState = state
+	var clones_by_def_id: Dict[Int, CoreFunction] = {}
+	var scans: Dict[Int, ConsumingCloneScan] = {}
+	var built_order: List[Int] = []
+	var built_new_clone: Bool = True
+
+	while built_new_clone:
+		built_new_clone = False
+
+		for candidate in current.candidates.ordered:
+			if (
+				clone_key_used(current.used_clone_keys, candidate.key)
+				and not clones_by_def_id.contains(candidate.clone_def_id)
+			):
+				match original_function_for_key(originals, candidate.key):
+					Some(original_func):
+						match make_consuming_clone(
+							current,
+							original_func,
+							candidate.key.arg_index,
+							candidate.clone_def_id,
+						):
+							Some(clone):
+								scan: ConsumingCloneScan = scan_consuming_clone(
+									current,
+									clone,
+									candidate.key.arg_index,
+								)
+
+								for called_def_id in scan.called_clone_def_ids:
+									match current.candidates.ordinal_by_clone_def_id.get(called_def_id):
+										Some(ordinal):
+											match current.candidates.ordered.get(ordinal):
+												Some(called):
+													current = mark_clone_used(current, called.key)
+												None:
+													void
+										None:
+											void
+
+								clones_by_def_id = clones_by_def_id.set(candidate.clone_def_id, clone)
+								scans = scans.set(candidate.clone_def_id, scan)
+								built_order = built_order.append(candidate.clone_def_id)
+								built_new_clone = True
+							None:
+								void
+					None:
+						void
+			else:
+				void
+
+	{
+		state = current,
+		clones_by_def_id = clones_by_def_id,
+		scans = scans,
+		built_order = built_order
+	}
+
+
+---
+The beneficial clones reachable from the rewritten program: calls to clones
+without a benefit are reverted, so only those clones can still be called.
+---
+private pure func reachable_beneficial_clones(
+	built: BuiltConsumingClones,
+	benefits: Dict[Int, ConsumingCloneBenefit],
+	program_calls: List[Int],
+) -> Dict[Int, Bool]:
+	var reachable: Dict[Int, Bool] = {}
+	var pending: List[Int] = program_calls
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(clone_def_id):
+				if is_beneficial(benefit_of(benefits, clone_def_id)) and not reachable.contains(clone_def_id):
+					reachable = reachable.set(clone_def_id, True)
+
+					match built.scans.get(clone_def_id):
+						Some(scan):
+							pending = pending.concat(scan.called_clone_def_ids)
+						None:
+							void
+				else:
+					void
+			None:
+				break
+
+		index += 1
+
+	reachable
 
 
 private pure func clones_after(
 	state: ConsumeSpecializeState,
+	kept_clones: Dict[Int, CoreFunction],
 	original_func: CoreFunction,
 ) -> List[CoreDecl]:
 	var result: List[CoreDecl] = []
@@ -1798,14 +1444,8 @@ private pure func clones_after(
 						if (
 							candidate.key.original_name == original_func.name
 							and candidate.key.original_def_id == original_func.def_id
-							and clone_key_used(state.used_clone_keys, candidate.key)
 						):
-							match make_consuming_clone(
-								state,
-								original_func,
-								candidate.key.arg_index,
-								candidate.clone_def_id,
-							):
+							match kept_clones.get(candidate.clone_def_id):
 								Some(clone):
 									result = result.append(FunctionDecl(clone))
 								None:
@@ -1820,16 +1460,9 @@ private pure func clones_after(
 	result
 
 
-private pure func original_function_for_decl(decl: CoreDecl) -> Option[CoreFunction]:
-	match decl:
-		FunctionDecl(func_info):
-			Some(func_info)
-		_:
-			None
-
-
 private pure func insert_clones_after_functions(
 	state: ConsumeSpecializeState,
+	kept_clones: Dict[Int, CoreFunction],
 	original_decls: List[CoreDecl],
 	rewritten_decls: List[CoreDecl],
 ) -> List[CoreDecl]:
@@ -1843,7 +1476,7 @@ private pure func insert_clones_after_functions(
 			Some(original_decl):
 				match original_function_for_decl(original_decl):
 					Some(original_func):
-						for clone_decl in clones_after(state, original_func):
+						for clone_decl in clones_after(state, kept_clones, original_func):
 							result = result.append(clone_decl)
 					None:
 						void
@@ -1875,15 +1508,64 @@ pure func rewrite_program(program: CoreProgram, next_def_id: Int) -> ConsumeSpec
 	else:
 		var state: ConsumeSpecializeState = state_from_discovery(discovery)
 		var rewritten_decls: List[CoreDecl] = []
+		var calls_by_decl: List[List[Int]] = []
+		var program_calls: List[Int] = []
 
 		for decl in program.decls:
 			rewritten_decl: CoreDecl = rewrite_decl_body(state, decl)
-			state = collect_used_clone_keys_from_decl(state, rewritten_decl)
+			collection: CloneCallCollection = match decl_body(rewritten_decl):
+				Some(body):
+					collect_clone_calls_from_expr(state, body)
+				None:
+					{state = state, called_clone_def_ids = []}
+			state = collection.state
 			rewritten_decls = rewritten_decls.append(rewritten_decl)
+			calls_by_decl = calls_by_decl.append(collection.called_clone_def_ids)
+			program_calls = program_calls.concat(collection.called_clone_def_ids)
+
+		built: BuiltConsumingClones = build_used_clones(state, program.decls)
+		benefits: Dict[Int, ConsumingCloneBenefit] = classify_consuming_clones(built.scans, built.built_order)
+		reachable: Dict[Int, Bool] = reachable_beneficial_clones(built, benefits, program_calls)
+		reversal: CloneCallReversal = {state = built.state, benefits = benefits}
+		var final_decls: List[CoreDecl] = []
+		var index: Int = 0
+
+		for decl in rewritten_decls:
+			if calls_clone_without_benefit(benefits, calls_by_decl.get_or(index, [])):
+				final_decls = final_decls.append(revert_decl_calls_without_benefit(reversal, decl))
+			else:
+				final_decls = final_decls.append(decl)
+
+			index += 1
+
+		var kept_clones: Dict[Int, CoreFunction] = {}
+
+		for clone_def_id in built.built_order:
+			if reachable.contains(clone_def_id):
+				match built.clones_by_def_id.get(clone_def_id):
+					Some(clone):
+						scan: ConsumingCloneScan = built.scans.get(clone_def_id).get_or({
+							updates_owned_record = False,
+							owned_hand_offs = [],
+							called_clone_def_ids = []
+						})
+						kept: CoreFunction = if calls_clone_without_benefit(benefits, scan.called_clone_def_ids):
+							match revert_decl_calls_without_benefit(reversal, FunctionDecl(clone)):
+								FunctionDecl(reverted):
+									reverted
+								_:
+									clone
+						else:
+							clone
+						kept_clones = kept_clones.set(clone_def_id, kept)
+					_:
+						void
+			else:
+				void
 
 		{
 			program = {
-				decls = insert_clones_after_functions(state, program.decls, rewritten_decls),
+				decls = insert_clones_after_functions(built.state, kept_clones, program.decls, final_decls),
 				foreign_includes = program.foreign_includes,
 				source_files = program.source_files
 			},

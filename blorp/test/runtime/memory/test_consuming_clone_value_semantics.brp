@@ -1,0 +1,300 @@
+-- Value semantics across consuming clones.
+--
+-- A call that hands a record to a consuming clone lets the clone update the
+-- record in place. That is only sound when nothing else still holds the
+-- record: a caller that kept the old value (in another binding, a union
+-- payload, a record field, a dictionary, a list, or a short-circuit operand
+-- read after the call) must still see it unchanged. Every case here prints
+-- nothing and asserts both the old and the new value. This file is owned by
+-- the leak gate, so an unbalanced hand-over shows up as a leak or a double
+-- release.
+import:
+	test: TestSuite
+
+
+record Tables {rows: List[Int], other: List[Int]}
+
+
+record Labelled {name: String, tags: Dict[String, Int], tables: Tables}
+
+
+record Outer {inner: Tables, count: Int}
+
+
+union Holder:
+	Holding(Tables)
+	Empty
+
+
+pure func append_row(t: Tables, v: Int) -> Tables:
+	{ t | rows = t.rows.append(v) }
+
+
+pure func forward(t: Tables, v: Int) -> Tables:
+	append_row(t, v)
+
+
+pure func forward_via_var(t: Tables, v: Int) -> Tables:
+	var out: Tables = t
+	out = append_row(out, v)
+	out
+
+
+pure func append_unless(t: Tables, v: Int, skip: Bool) -> Tables:
+	if skip:
+		t
+	else:
+		{ t | rows = t.rows.append(v) }
+
+
+pure func append_by_parity(t: Tables, v: Int) -> Tables:
+	match v % 3:
+		0:
+			t
+		1:
+			append_row(t, v)
+		_:
+			forward(t, v)
+
+
+pure func append_many(t: Tables, v: Int, n: Int) -> Tables:
+	if n == 0:
+		t
+	else:
+		append_many(append_row(t, v), v, n - 1)
+
+
+pure func relabel(labelled: Labelled, tag: String) -> Labelled:
+	{ labelled |
+		name = labelled.name + "+" + tag,
+		tags = labelled.tags.set(tag, labelled.tags.length()),
+		tables = forward(labelled.tables, labelled.tags.length())
+	}
+
+
+record TreeBuilder {nodes: List[Int], labels: List[String]}
+
+
+pure func push_node(b: TreeBuilder, kind: Int) -> TreeBuilder:
+	{ b | nodes = b.nodes.append(kind), labels = b.labels.append("n${kind}") }
+
+
+pure func build_tree(b: TreeBuilder, depth: Int) -> TreeBuilder:
+	if depth == 0:
+		push_node(b, 0)
+	else:
+		left = build_tree(b, depth - 1)
+		right = build_tree(left, depth - 1)
+		push_node(right, depth)
+
+
+pure func lookup_row(key: Int) -> Result[Int, String]:
+	if key > 0:
+		Ok(key)
+	else:
+		Err("missing ${key}")
+
+
+pure func with_row(rows: List[Int], row: Int) -> List[Int]:
+	rows.append(row)
+
+
+---
+The assignment's right-hand side hands the old value to a clone on one arm
+and reads it into a fresh record on the other; the loop keeps `t` a mutable
+variable, so the assignment is not rewritten into a binding. The old value
+must be released on the reading arm.
+---
+pure func assign_over_match(t: Tables, key: Int, extra: List[Int]) -> Tables:
+	var current: Tables = t
+
+	current = match lookup_row(key):
+		Ok(row):
+			{ current | rows = with_row(current.rows, row) }
+		Err(message):
+			append_row(current, message.length())
+
+	for value in extra:
+		current = append_row(current, value)
+
+	current
+
+
+---
+Hands the parameter over while a later argument still reads it: the read
+runs before the call, so it must see the value before the append.
+---
+pure func append_own_length(t: Tables) -> Tables:
+	append_row(t, t.rows.length())
+
+
+pure func empty_tables() -> Tables:
+	{rows = [1], other = []}
+
+
+func test_saved_binding_keeps_old_value() -> Bool:
+	var t: Tables = empty_tables()
+	saved: Tables = t
+	t = forward(t, 2)
+	first_ok: Bool = saved.rows == [1] and t.rows == [1, 2]
+	kept: Tables = forward(saved, 3)
+
+	first_ok and saved.rows == [1] and kept.rows == [1, 3]
+
+
+func test_saved_binding_keeps_old_value_through_var_helper() -> Bool:
+	var t: Tables = empty_tables()
+	saved: Tables = t
+	t = forward_via_var(t, 2)
+
+	saved.rows == [1] and t.rows == [1, 2]
+
+
+func test_union_payload_keeps_old_value() -> Bool:
+	var t: Tables = empty_tables()
+	holder: Holder = Holding(t)
+	t = forward(t, 2)
+
+	held_rows: List[Int] = match holder:
+		Holding(held):
+			held.rows
+		Empty:
+			[]
+
+	held_rows == [1] and t.rows == [1, 2]
+
+
+func test_nested_record_keeps_old_value() -> Bool:
+	var outer: Outer = {inner = empty_tables(), count = 0}
+	saved: Outer = outer
+	outer = { outer | inner = forward(outer.inner, 2), count = outer.count + 1 }
+
+	saved.inner.rows == [1] and saved.count == 0 and outer.inner.rows == [1, 2] and outer.count == 1
+
+
+func test_dict_value_keeps_old_value() -> Bool:
+	var t: Tables = empty_tables()
+	by_id: Dict[Int, Tables] = {7 => t}
+	t = forward(t, 2)
+
+	by_id.get(7).map(func(old): old.rows).get_or([]) == [1] and t.rows == [1, 2]
+
+
+func test_short_circuit_operand_reads_old_value() -> Bool:
+	var t: Tables = empty_tables()
+	saved: Tables = t
+	t = append_unless(t, 2, False)
+	old_is_short: Bool = t.rows.length() == 2 and saved.rows.length() == 1
+	new_is_long: Bool = saved.rows.length() == 1 or t.rows.length() == 0
+
+	old_is_short and new_is_long and saved.rows == [1]
+
+
+func test_loop_keeps_each_old_value() -> Bool:
+	var t: Tables = {rows = [], other = []}
+	var olds: List[Tables] = []
+
+	for i in 0..5:
+		olds = olds.append(t)
+		t = forward(t, i)
+
+	olds.map(func(old): old.rows.length()) == [0, 1, 2, 3, 4] and t.rows == [0, 1, 2, 3, 4]
+
+
+func test_match_arms_return_parameter_or_forward_it() -> Bool:
+	var t: Tables = {rows = [], other = []}
+	saved_after_first: Tables = append_by_parity(t, 1)
+	t = saved_after_first
+
+	for v in 2..7:
+		t = append_by_parity(t, v)
+
+	saved_after_first.rows == [1] and t.rows == [1, 2, 4, 5]
+
+
+func test_recursion_keeps_old_value() -> Bool:
+	var t: Tables = empty_tables()
+	saved: Tables = t
+	t = append_many(t, 9, 3)
+
+	saved.rows == [1] and t.rows == [1, 9, 9, 9]
+
+
+func test_record_with_string_and_dict_keeps_old_value() -> Bool:
+	var labelled: Labelled = {name = "base", tags = {"a" => 0}, tables = empty_tables()}
+	saved: Labelled = labelled
+	labelled = relabel(labelled, "b")
+
+	(
+		saved.name == "base"
+		and saved.tags.length() == 1
+		and saved.tables.rows == [1]
+		and labelled.name == "base+b"
+		and labelled.tags.get("b") == Some(1)
+		and labelled.tables.rows == [1, 1]
+	)
+
+
+func test_post_order_tree_builder_keeps_old_value() -> Bool:
+	var b: TreeBuilder = {nodes = [], labels = []}
+	b = build_tree(b, 1)
+	saved: TreeBuilder = b
+	b = build_tree(b, 2)
+
+	(
+		saved.nodes == [0, 0, 1]
+		and saved.labels == ["n0", "n0", "n1"]
+		and b.nodes == [0, 0, 1, 0, 0, 1, 0, 0, 1, 2]
+	)
+
+
+func test_assignment_over_match_releases_old_value() -> Bool:
+	base: Tables = empty_tables()
+	found: Tables = assign_over_match(base, 4, [5])
+	missing: Tables = assign_over_match(base, 0, [])
+
+	base.rows == [1] and found.rows == [1, 4, 5] and missing.rows == [1, 9]
+
+
+func test_later_argument_reads_parameter_before_hand_off() -> Bool:
+	var t: Tables = {rows = [4, 5], other = []}
+	saved: Tables = t
+	t = append_own_length(t)
+	t = append_own_length(t)
+
+	saved.rows == [4, 5] and t.rows == [4, 5, 2, 3]
+
+
+tests: TestSuite = {
+	description = "Consuming clone value semantics",
+	tests = [
+		("saved binding keeps old value", test_saved_binding_keeps_old_value),
+		(
+			"saved binding keeps old value through var helper",
+			test_saved_binding_keeps_old_value_through_var_helper,
+		),
+		("union payload keeps old value", test_union_payload_keeps_old_value),
+		("nested record keeps old value", test_nested_record_keeps_old_value),
+		("dict value keeps old value", test_dict_value_keeps_old_value),
+		("short-circuit operand reads old value", test_short_circuit_operand_reads_old_value),
+		("loop keeps each old value", test_loop_keeps_each_old_value),
+		(
+			"match arms return parameter or forward it",
+			test_match_arms_return_parameter_or_forward_it,
+		),
+		("recursion keeps old value", test_recursion_keeps_old_value),
+		(
+			"record with string and dict keeps old value",
+			test_record_with_string_and_dict_keeps_old_value,
+		),
+		("post-order tree builder keeps old value", test_post_order_tree_builder_keeps_old_value),
+		(
+			"assignment over match releases old value",
+			test_assignment_over_match_releases_old_value,
+		),
+		(
+			"later argument reads parameter before hand-off",
+			test_later_argument_reads_parameter_before_hand_off,
+		),
+	]
+}

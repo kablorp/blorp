@@ -29,7 +29,6 @@ import:
 			BoxExpr,
 			CallExpr,
 			ConstructorMatchExpr,
-			DropExpr,
 			FieldExpr,
 			IfExpr,
 			LetExpr,
@@ -49,6 +48,8 @@ import:
 			WhileExpr,
 		),
 		CoreFunctionKind(UserFunction),
+		CoreFunctionOrigin(ConsumingClone),
+		core_function_declared_origin,
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral, StringLiteral),
 		CoreLiteralMatchCase,
@@ -61,7 +62,7 @@ import:
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreProgram,
-		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreReleasePolicy(NoReleasePolicy),
 		CoreSemanticMatchAccessor(RootSemanticMatchAccessor),
 		CoreSemanticMatchTree(SemanticLiteralMatch, SemanticMatchLeaf),
 		CoreSourceLoc,
@@ -851,9 +852,12 @@ pure func test_perceus_marks_heap_record_self_update_for_reuse() -> Bool:
 	)
 
 
-pure func consumed_record_result_program_with_release(
-	release_policy: CoreReleasePolicy,
-) -> CoreProgram:
+---
+`advance_box__consume_arg0(box) = { box | count = 11 }` declared with
+`origin`. With a `ConsumingClone(0, ...)` origin the function owns `box`, so
+record-update lowering may update it in place.
+---
+pure func consumed_record_result_program_with_origin(origin: CoreFunctionOrigin) -> CoreProgram:
 	box_type: CoreType = HeapRecordType("CounterBox")
 	box_var: CoreVar = {
 		name = "box",
@@ -864,12 +868,6 @@ pure func consumed_record_result_program_with_release(
 	update_base_var: CoreVar = {
 		name = "__record_update_box",
 		id = 1,
-		def_id = None,
-		origin = AuthoredBinder
-	}
-	result_var: CoreVar = {
-		name = "__consume_result_box",
-		id = 2,
 		def_id = None,
 		origin = AuthoredBinder
 	}
@@ -896,20 +894,6 @@ pure func consumed_record_result_program_with_release(
 			synthetic_core_source_loc(),
 		),
 	)
-	body: CoreExpr = LetExpr(
-		result_var,
-		False,
-		box_type,
-		update,
-		DropExpr(
-			box_var,
-			box_type,
-			release_policy,
-			VarExpr(result_var, box_type, synthetic_core_source_loc()),
-			box_type,
-			synthetic_core_source_loc(),
-		),
-	)
 
 	{
 		decls = [
@@ -926,9 +910,9 @@ pure func consumed_record_result_program_with_release(
 					},
 				],
 				return_type = box_type,
-				body = Some(body),
+				body = Some(update),
 				is_pure = True,
-				origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+				origin = origin,
 				module = FIXTURE_NO_SOURCE_MODULE,
 				function_kind = UserFunction,
 				def_id = 6,
@@ -941,7 +925,9 @@ pure func consumed_record_result_program_with_release(
 
 
 pure func consumed_record_result_program() -> CoreProgram:
-	consumed_record_result_program_with_release(ArcReleasePolicy)
+	consumed_record_result_program_with_origin(
+		ConsumingClone(0, core_function_declared_origin(FIXTURE_SOURCE_FUNCTION_ORIGIN)),
+	)
 
 
 ---
@@ -960,21 +946,13 @@ pure func preceding_binding_consumed_record_result_program(initial: CoreExpr) ->
 	match program.decls:
 		[record_decl, FunctionDecl(function_info)]:
 			match function_info.body:
-				Some(LetExpr(result_var, False, result_type, update, continuation)):
+				Some(update):
 					{ program |
 						decls = [
 							record_decl,
 							FunctionDecl(
 								{ function_info |
-									body = Some(
-										LetExpr(
-											result_var,
-											False,
-											result_type,
-											LetExpr(probe_var, False, int_type(), initial, update),
-											continuation,
-										),
-									)
+									body = Some(LetExpr(probe_var, False, int_type(), initial, update))
 								},
 							),
 						]
@@ -1055,7 +1033,7 @@ pure func malformed_consumed_record_result_program(
 	match program.decls:
 		[record_decl, FunctionDecl(function_info)]:
 			match function_info.body:
-				Some(LetExpr(result_var, False, result_type, update, continuation)):
+				Some(update):
 					match update:
 						LetExpr(update_base, False, binding_type, initial, RecordUpdateExpr(carrier, _, update_type, loc)):
 							update_base_ref: CoreExpr = VarExpr(
@@ -1090,17 +1068,10 @@ pure func malformed_consumed_record_result_program(
 									loc,
 								),
 							)
-							malformed_body: CoreExpr = LetExpr(
-								result_var,
-								False,
-								result_type,
-								malformed_update,
-								continuation,
-							)
 							{ program |
 								decls = [
 									record_decl,
-									FunctionDecl({ function_info | body = Some(malformed_body) }),
+									FunctionDecl({ function_info | body = Some(malformed_update) }),
 								]
 							}
 						_:
@@ -1174,23 +1145,93 @@ pure func test_consumed_record_result_transfers_owner_into_reuse() -> Bool:
 			False
 
 
-pure func test_consumed_record_result_requires_owning_drop() -> Bool:
-	lowered: CoreProgram = lower_record_updates_for_ownership(
-		consumed_record_result_program_with_release(NoReleasePolicy),
-	)
-	json: String = core_program_to_json(lowered).to_string()
+---
+A consuming clone that returns its owned parameter unchanged on one branch and
+updates it on the other still updates in place on the second branch: the
+unchanged branch hands on the owner it was given.
+---
+pure func test_owned_parameter_result_updates_beside_unchanged_branch() -> Bool:
+	program: CoreProgram = consumed_record_result_program()
+	box_type: CoreType = HeapRecordType("CounterBox")
 
-	preserves_drop: Bool = match lowered.decls:
+	branching: CoreProgram = match program.decls:
+		[record_decl, FunctionDecl(function_info)]:
+			-- One constructor per pattern (see the match-lowering note below).
+			match function_info.params:
+				[box_param]:
+					match function_info.body:
+						Some(update):
+							{ program |
+								decls = [
+									record_decl,
+									FunctionDecl(
+										{ function_info |
+											body = Some(
+												IfExpr(
+													LiteralExpr(BoolLiteral(True), bool_type(), synthetic_core_source_loc()),
+													VarExpr(box_param.name, box_type, synthetic_core_source_loc()),
+													update,
+													box_type,
+													synthetic_core_source_loc(),
+												),
+											)
+										},
+									),
+								]
+							}
+						None:
+							program
+				_:
+					program
+		_:
+			program
+
+	match lower_record_updates_for_ownership(branching).decls:
 		[HeapRecordDecl(_), FunctionDecl(function_info)]:
+			-- One nested constructor per pattern: the compiler does not test
+			-- the tag of a nested constructor in a later payload column, so a
+			-- combined pattern read the wrong payload and crashed when the
+			-- else branch was not an in-place update.
 			match function_info.body:
-				Some(LetExpr(_, False, _, _, DropExpr(_, _, NoReleasePolicy, _, _, _))):
-					True
+				Some(IfExpr(_, then_expr, else_expr, _, _)):
+					then_returns_box: Bool = match then_expr:
+						VarExpr(unchanged, _, _):
+							unchanged.name == "box"
+						_:
+							False
+					else_updates_box: Bool = match else_expr:
+						RecordCowUpdateExpr(source_expr, _, _, _):
+							match source_expr:
+								VarExpr(source, _, _):
+									source.name == "box"
+								_:
+									False
+						_:
+							False
+
+					then_returns_box and else_updates_box
 				_:
 					False
 		_:
 			False
 
-	preserves_drop and not json.contains("\"kind\":\"record_reuse\"")
+
+---
+The same function body without a `ConsumingClone` origin borrows `box`, so its
+record update must keep building a fresh record.
+---
+pure func test_record_result_without_owned_parameter_builds_fresh_record() -> Bool:
+	json: String = core_program_to_json(
+		lower_record_updates_for_ownership(
+			consumed_record_result_program_with_origin(FIXTURE_SOURCE_FUNCTION_ORIGIN),
+		),
+	).to_string()
+
+	(
+		json.contains("\"kind\":\"record\"")
+		and not json.contains("\"kind\":\"record_cow_update\"")
+		and not json.contains("\"kind\":\"record_reuse\"")
+	)
 
 
 pure func consuming_record_update_loop_program() -> CoreProgram:
@@ -3018,8 +3059,12 @@ tests: TestSuite = {
 			test_consumed_record_result_transfers_owner_into_reuse,
 		),
 		(
-			"consumed record result requires owning drop",
-			test_consumed_record_result_requires_owning_drop,
+			"owned parameter result updates beside unchanged branch",
+			test_owned_parameter_result_updates_beside_unchanged_branch,
+		),
+		(
+			"record result without owned parameter builds fresh record",
+			test_record_result_without_owned_parameter_builds_fresh_record,
 		),
 		(
 			"preceding field read keeps consumed record reuse",

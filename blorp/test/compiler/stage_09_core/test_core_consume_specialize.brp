@@ -21,6 +21,7 @@ import:
 			ConstructorMatchExpr,
 			DropExpr,
 			IfExpr,
+			LambdaExpr,
 			LetExpr,
 			LiteralExpr,
 			SeqExpr,
@@ -29,13 +30,14 @@ import:
 		),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
+		CoreFunctionOrigin(ConsumingClone),
 		CoreImplDecl,
 		CoreLiteral(BoolLiteral, IntLiteral),
 		CoreMatchBinding,
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
 		CoreProgram,
-		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(NamedType, UnionType, VoidType),
@@ -45,7 +47,9 @@ import:
 		CoreUnionVariant,
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
+		core_field_ref,
 		core_program_max_declared_definition_id,
+		core_program_to_json,
 	../../../src/compiler/stage_09_core/perceus: insert_drops_program
 	memory: get_mem_stats, reset_mem_stats
 	test: TestSuite
@@ -58,14 +62,11 @@ private pure func rewrite_program_for_test(program: CoreProgram) -> CoreProgram:
 	rewrite_program(program, core_program_max_declared_definition_id(program) + 1).program
 
 
--- Keep this exact enough to catch the two private result records that were once
--- allocated while threading state through geq and fallback branches. The
--- allowance includes complete Core traversal and nested-match alias analysis.
-private MAX_CONSUME_SPECIALIZE_LENGTH_MATCH_ALLOCATIONS: Int = 423
-
 private MAX_NO_CANDIDATE_REWRITE_ALLOCATIONS: Int = 16
 
-private LENGTH_MATCH_CONSUMING_CLONE_DEF_ID: Int = 102
+-- The fixture's highest definition id is `multi_rewrite`'s 30; its two record
+-- parameters reserve 31 and 32 whether or not the first clone is used.
+private MULTI_REWRITE_SECOND_CLONE_DEF_ID: Int = 32
 
 
 pure func named_var(name: String) -> CoreVar:
@@ -95,11 +96,11 @@ pure func bool_type() -> CoreType:
 
 
 pure func expr_type() -> CoreType:
-	UnionType("Expr")
+	HeapRecordType("Expr")
 
 
 pure func other_expr_type() -> CoreType:
-	UnionType("OtherExpr")
+	HeapRecordType("OtherExpr")
 
 
 pure func closure_type() -> CoreType:
@@ -162,58 +163,77 @@ pure func add_expr(left: CoreExpr, right: CoreExpr) -> CoreExpr:
 	)
 
 
-pure func expr_union_field() -> CoreUnionField:
-	{
-		typ = expr_type(),
-		release_policy = NoReleasePolicy
-	}
-
-
-pure func expr_union_variant(
-	name: String,
-	tag: Int,
-	def_id: Int,
-	fields: List[CoreUnionField],
-) -> CoreUnionVariant:
-	{
-		name = name,
-		tag = tag,
-		fields = fields,
-		def_id = Some(def_id)
-	}
-
-
-pure func expr_union_decl() -> CoreUnionDecl:
-	{
+---
+`Expr` as a heap record with one `count` field: consuming clones only exist
+for record parameters, because only a record can be updated in place.
+---
+pure func expr_record_decl() -> CoreDecl:
+	HeapRecordDecl({
 		abi_type = None,
 		name = "Expr",
 		type_params = [],
-		payload_storage = ErasedUnionPayloadStorage,
-		variants = [
-			expr_union_variant(
-				"Lit",
-				0,
-				100,
-				[
-					{
-						typ = int_type(),
-						release_policy = NoReleasePolicy
-					},
-				],
-			),
-			expr_union_variant(
-				"Add",
-				1,
-				101,
-				[expr_union_field(), expr_union_field()],
-			),
+		fields = [
+			{
+				ref = core_field_ref(0),name = "count",
+				typ = int_type(),
+				release_policy = NoReleasePolicy
+			},
 		],
-		loc = synthetic_core_source_loc()
-	}
+		loc = synthetic_core_source_loc(),
+	})
 
 
-pure func other_expr_union_decl() -> CoreUnionDecl:
-	{ expr_union_decl() | name = "OtherExpr" }
+pure func other_expr_record_decl() -> CoreDecl:
+	match expr_record_decl():
+		HeapRecordDecl(decl):
+			HeapRecordDecl({ decl | name = "OtherExpr" })
+		other:
+			other
+
+
+---
+`{ <parameter> | count = value }` in its lowered form: the parameter bound to
+a record-update temporary, then updated. This is the direct in-place benefit
+that makes a consuming clone of the enclosing function worthwhile.
+---
+pure func update_param_in_place(parameter: String, value: Int) -> CoreExpr:
+	base: CoreVar = named_var("__record_update_${parameter}")
+
+	LetExpr(
+		base,
+		False,
+		expr_type(),
+		var_expr(parameter, expr_type()),
+		RecordUpdateExpr(
+			VarExpr(base, expr_type(), synthetic_core_source_loc()),
+			[
+				{
+					ref = core_field_ref(0),name = "count",
+					value = int_expr(value)
+				},
+			],
+			expr_type(),
+			synthetic_core_source_loc(),
+		),
+	)
+
+
+pure func update_in_place(value: Int) -> CoreExpr:
+	update_param_in_place("expr", value)
+
+
+---
+Updates both record parameters of `multi_rewrite`, so a clone for either one
+has a direct benefit.
+---
+pure func multi_update_in_place() -> CoreExpr:
+	LetExpr(
+		named_var("updated_left"),
+		False,
+		expr_type(),
+		update_param_in_place("left_expr", 1),
+		update_param_in_place("right_expr", 2),
+	)
 
 
 pure func rewrite_function(body: CoreExpr) -> CoreFunction:
@@ -314,7 +334,7 @@ pure func run_function() -> CoreFunction:
 pure func program(rewrite_body: CoreExpr) -> CoreProgram:
 	{
 		decls = [
-			UnionDecl(expr_union_decl()),
+			expr_record_decl(),
 			FunctionDecl(rewrite_function(rewrite_body)),
 			FunctionDecl(run_function()),
 		],
@@ -384,35 +404,6 @@ pure func function_occurrence_count(program_value: CoreProgram, name: String) ->
 				void
 
 	count
-
-
-record CloneBodySummary {
-	owned_names: List[String],
-	rewrite_calls: List[String]
-}
-
-
-pure func clone_body_summary(program_value: CoreProgram, name: String) -> Option[CloneBodySummary]:
-	var found: Option[CloneBodySummary] = None
-
-	for decl in program_value.decls:
-		match decl:
-			FunctionDecl(func_info):
-				if func_info.name == name:
-					match func_info.body:
-						Some(LetExpr(result_var, is_mutable, result_type, bind_rhs, body)):
-							found = Some({
-								owned_names = owned_binding_names(bind_rhs),
-								rewrite_calls = rewrite_call_names(bind_rhs),
-							})
-						_:
-							void
-				else:
-					void
-			_:
-				void
-
-	found
 
 
 pure func assignment_call_name_matches_in_expr(expr: CoreExpr, expected: String) -> Option[Bool]:
@@ -507,6 +498,14 @@ pure func has_old_drop_reassign(name: String, expr: CoreExpr) -> Bool:
 			False
 
 
+pure func rewrite_expr_body_is_original_param(program_value: CoreProgram) -> Bool:
+	match function_body(program_value, "rewrite_expr"):
+		Some(VarExpr(variable, _, _)):
+			variable.name == "expr"
+		_:
+			False
+
+
 pure func function_body(program_value: CoreProgram, name: String) -> Option[CoreExpr]:
 	var found: Option[CoreExpr] = None
 
@@ -524,37 +523,42 @@ pure func function_body(program_value: CoreProgram, name: String) -> Option[Core
 	found
 
 
-pure func rewrite_expr_body_is_original_param(program_value: CoreProgram) -> Bool:
-	match function_body(program_value, "rewrite_expr"):
-		Some(VarExpr(variable, UnionType(type_name), loc)):
-			variable.name == "expr" and type_name == "Expr"
-		_:
-			False
-
-
-pure func clone_drops_consumed_param(program_value: CoreProgram, name: String) -> Bool:
+---
+True when the clone declares `owned_parameter_index` as owned through its
+origin and keeps the original body (a record update of the parameter): the
+old protocol wrapped the body as `let result = body; drop param; result`.
+---
+pure func clone_declares_owned_parameter_with_original_body(
+	program_value: CoreProgram,
+	name: String,
+	owned_parameter_index: Int,
+) -> Bool:
 	var found: Bool = False
 
 	for decl in program_value.decls:
 		match decl:
 			FunctionDecl(func_info):
 				if func_info.name == name:
-					match func_info.body:
-						Some(LetExpr(result_var, is_mutable, result_type, bind_rhs, DropExpr(drop_var, drop_type, release_policy, body, typ, loc))):
-							body_returns_result: Bool = match body:
-								VarExpr(returned, return_type, return_loc):
-									returned.name == "__consume_result_expr"
+					declares_owned: Bool = match func_info.origin:
+						ConsumingClone(index, _):
+							index == owned_parameter_index
+						_:
+							False
+					keeps_body: Bool = match func_info.body:
+						Some(body):
+							match body:
+								LetExpr(_, _, _, _, update):
+									match update:
+										RecordUpdateExpr(_, _, _, _):
+											True
+										_:
+											False
 								_:
 									False
+						None:
+							False
 
-							found = (
-								drop_var.name == "expr"
-								and result_var.name == "__consume_result_expr"
-								and release_policy == ArcReleasePolicy
-								and body_returns_result
-							)
-						_:
-							void
+					found = declares_owned and keeps_body
 				else:
 					void
 			_:
@@ -590,292 +594,8 @@ pure func add_match_case(body: CoreExpr) -> CoreConstructorMatchCase:
 	}
 
 
-pure func length_match_branch(body: CoreExpr) -> CoreConstructorLengthMatchBranch:
-	{
-		bindings = [],
-		body = ConstructorMatchBodyExpr(body)
-	}
-
-
-pure func length_match_rewrite_body() -> CoreExpr:
-	length_match: CoreConstructorLengthMatch = {
-		accessor = RootAccessor,
-		cases = [
-			{
-				length = 1,
-				branch = length_match_branch(lit_expr(1))
-			},
-		],
-		geq = Some({
-			minimum_length = 2,
-			branch = length_match_branch(lit_expr(2)),
-		}),
-		fallback = Some(length_match_branch(lit_expr(0))),
-		result_type = expr_type(),
-		loc = synthetic_core_source_loc()
-	}
-
-	ConstructorMatchExpr(
-		var_expr("expr", expr_type()),
-		NoReleasePolicy,
-		[{ add_match_case(lit_expr(3)) | body = ConstructorMatchBodyLength(length_match) }],
-		ConstructorMatchFallbackFail,
-		expr_type(),
-		synthetic_core_source_loc(),
-	)
-
-
-pure func length_match_aliasing_rewrite_body() -> CoreExpr:
-	length_match: CoreConstructorLengthMatch = {
-		accessor = RootAccessor,
-		cases = [
-			{
-				length = 1,
-				branch = length_match_branch(var_expr("expr", expr_type()))
-			},
-		],
-		geq = None,
-		fallback = Some(length_match_branch(lit_expr(0))),
-		result_type = expr_type(),
-		loc = synthetic_core_source_loc()
-	}
-
-	ConstructorMatchExpr(
-		var_expr("expr", expr_type()),
-		NoReleasePolicy,
-		[{ add_match_case(lit_expr(3)) | body = ConstructorMatchBodyLength(length_match) }],
-		ConstructorMatchFallbackFail,
-		expr_type(),
-		synthetic_core_source_loc(),
-	)
-
-
-pure func recursive_rewrite_body() -> CoreExpr:
-	left: CoreExpr = var_expr("left", expr_type())
-	right: CoreExpr = var_expr("right", expr_type())
-	recursive_left: CoreExpr = user_call(
-		"rewrite_expr",
-		10,
-		[left, var_expr("pass", int_type())],
-		expr_type(),
-	)
-	recursive_right: CoreExpr = user_call(
-		"rewrite_expr",
-		10,
-		[right, var_expr("pass", int_type())],
-		expr_type(),
-	)
-
-	ConstructorMatchExpr(
-		var_expr("expr", expr_type()),
-		NoReleasePolicy,
-		[add_match_case(add_expr(recursive_left, recursive_right))],
-		ConstructorMatchFallbackFail,
-		expr_type(),
-		synthetic_core_source_loc(),
-	)
-
-
-pure func recursive_one_sided_rewrite_body() -> CoreExpr:
-	left: CoreExpr = var_expr("left", expr_type())
-	recursive_left: CoreExpr = user_call(
-		"rewrite_expr",
-		10,
-		[left, var_expr("pass", int_type())],
-		expr_type(),
-	)
-
-	ConstructorMatchExpr(
-		var_expr("expr", expr_type()),
-		NoReleasePolicy,
-		[
-			add_match_case(
-				IfExpr(
-					bool_expr(True),
-					add_expr(recursive_left, lit_expr(1)),
-					lit_expr(2),
-					expr_type(),
-					synthetic_core_source_loc(),
-				),
-			),
-		],
-		ConstructorMatchFallbackFail,
-		expr_type(),
-		synthetic_core_source_loc(),
-	)
-
-
-pure func recursive_branch_swapped_rewrite_body() -> CoreExpr:
-	left: CoreExpr = var_expr("left", expr_type())
-	right: CoreExpr = var_expr("right", expr_type())
-	left_call: CoreExpr = user_call(
-		"rewrite_expr",
-		10,
-		[left, var_expr("pass", int_type())],
-		expr_type(),
-	)
-	right_call: CoreExpr = user_call(
-		"rewrite_expr",
-		10,
-		[right, var_expr("pass", int_type())],
-		expr_type(),
-	)
-
-	ConstructorMatchExpr(
-		var_expr("expr", expr_type()),
-		NoReleasePolicy,
-		[
-			add_match_case(
-				IfExpr(
-					bool_expr(True),
-					add_expr(left_call, right_call),
-					add_expr(right_call, left_call),
-					expr_type(),
-					synthetic_core_source_loc(),
-				),
-			),
-		],
-		ConstructorMatchFallbackFail,
-		expr_type(),
-		synthetic_core_source_loc(),
-	)
-
-
-pure func owned_binding_names_in_case(match_case: CoreConstructorMatchCase) -> List[String]:
-	var names: List[String] = []
-
-	for binding in match_case.bindings:
-		match binding.mode:
-			MatchOwnBindingMode:
-				names = names.append(binding.variable.name)
-			MatchBorrowBindingMode:
-				void
-
-	names
-
-
-pure func owned_binding_names(expr: CoreExpr) -> List[String]:
-	match expr:
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			var names: List[String] = []
-
-			for match_case in cases:
-				for name in owned_binding_names_in_case(match_case):
-					names = names.append(name)
-
-			names
-		_:
-			[]
-
-
-pure func rewrite_call_names(expr: CoreExpr) -> List[String]:
-	match expr:
-		CallExpr(UserCall(name, def_id, consumed_args), callee, args, typ, loc):
-			var names: List[String] = []
-
-			if name.starts_with("rewrite_expr"):
-				names = names.append(name)
-			else:
-				void
-
-			for arg in args:
-				for child_name in rewrite_call_names(arg):
-					names = names.append(child_name)
-
-			names
-		ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-			var names: List[String] = rewrite_call_names(scrutinee)
-
-			for match_case in cases:
-				match match_case.body:
-					ConstructorMatchBodyExpr(body):
-						for child_name in rewrite_call_names(body):
-							names = names.append(child_name)
-					_:
-						void
-
-			names
-		IfExpr(cond, then_expr, else_expr, typ, loc):
-			rewrite_call_names(cond) + rewrite_call_names(then_expr) + rewrite_call_names(else_expr)
-		_:
-			[]
-
-
-pure func literal_int_value(expr: CoreExpr) -> Option[Int]:
-	match expr:
-		LiteralExpr(IntLiteral(value), _, _):
-			Some(value)
-		_:
-			None
-
-
-pure func lit_call_value(expr: CoreExpr) -> Option[Int]:
-	match expr:
-		CallExpr(UserCall("Lit", Some(100), _), _, args, _, _):
-			match args:
-				[value]:
-					literal_int_value(value)
-				_:
-					None
-		_:
-			None
-
-
-pure func length_branch_literal_value(branch: CoreConstructorLengthMatchBranch) -> Option[Int]:
-	match branch.body:
-		ConstructorMatchBodyExpr(expr):
-			lit_call_value(expr)
-		_:
-			None
-
-
-pure func cloned_length_match_preserves_branches(program_value: CoreProgram) -> Bool:
-	match function_body(program_value, "rewrite_expr__consume_arg0"):
-		Some(LetExpr(_, _, _, bind_rhs, _)):
-			match bind_rhs:
-				ConstructorMatchExpr(_, _, cases, _, _, _):
-					match cases:
-						[match_case]:
-							match_case.constructor == "Add" and match match_case.body:
-								ConstructorMatchBodyLength(match_expr):
-									length_match_preserves_branches(match_expr)
-								_:
-									False
-						_:
-							False
-				_:
-					False
-		_:
-			False
-
-
-pure func length_match_preserves_branches(match_expr: CoreConstructorLengthMatch) -> Bool:
-	exact_case_ok: Bool = if match_expr.cases.length() == 1:
-		match match_expr.cases.get(0):
-			Some(match_case):
-				match_case.length == 1 and length_branch_literal_value(match_case.branch) == Some(1)
-			None:
-				False
-	else:
-		False
-
-	geq_ok: Bool = match match_expr.geq:
-		Some(geq_case):
-			geq_case.minimum_length == 2 and length_branch_literal_value(geq_case.branch) == Some(2)
-		_:
-			False
-
-	fallback_ok: Bool = match match_expr.fallback:
-		Some(branch):
-			length_branch_literal_value(branch) == Some(0)
-		None:
-			False
-
-	exact_case_ok and geq_ok and fallback_ok
-
-
 pure func test_rewrites_safe_self_replacement_call() -> Bool:
-	rewritten: CoreProgram = rewritten_program(lit_expr(7))
+	rewritten: CoreProgram = rewritten_program(update_in_place(7))
 	has_functions: Bool = function_names_are(
 		rewritten,
 		["rewrite_expr", "rewrite_expr__consume_arg0", "run"],
@@ -884,18 +604,22 @@ pure func test_rewrites_safe_self_replacement_call() -> Bool:
 		rewritten,
 		"rewrite_expr__consume_arg0",
 	)
-	clone_drops_param: Bool = clone_drops_consumed_param(rewritten, "rewrite_expr__consume_arg0")
+	clone_declares_owned_param: Bool = clone_declares_owned_parameter_with_original_body(
+		rewritten,
+		"rewrite_expr__consume_arg0",
+		0,
+	)
 
-	has_functions and retargeted_assignment and clone_drops_param
+	has_functions and retargeted_assignment and clone_declares_owned_param
 
 
 pure func test_clone_identity_uses_name_and_def_id() -> Bool:
-	other: CoreFunction = { rewrite_function(lit_expr(99)) | name = "other_rewrite" }
+	other: CoreFunction = { rewrite_function(update_in_place(99)) | name = "other_rewrite" }
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
+			expr_record_decl(),
 			FunctionDecl(other),
-			FunctionDecl(rewrite_function(lit_expr(7))),
+			FunctionDecl(rewrite_function(update_in_place(7))),
 			FunctionDecl(run_function()),
 		],
 		foreign_includes = [],
@@ -910,11 +634,11 @@ pure func test_clone_identity_uses_name_and_def_id() -> Bool:
 
 
 pure func test_later_same_def_id_name_does_not_steal_candidate() -> Bool:
-	later_same_id: CoreFunction = { rewrite_function(lit_expr(99)) | name = "later_rewrite" }
+	later_same_id: CoreFunction = { rewrite_function(update_in_place(99)) | name = "later_rewrite" }
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
-			FunctionDecl(rewrite_function(lit_expr(7))),
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
 			FunctionDecl(later_same_id),
 			FunctionDecl(run_function()),
 		],
@@ -951,9 +675,9 @@ pure func test_structurally_different_target_type_does_not_select_candidate() ->
 		) }
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
-			UnionDecl(other_expr_union_decl()),
-			FunctionDecl(rewrite_function(lit_expr(7))),
+			expr_record_decl(),
+			other_expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
 			FunctionDecl(other_run),
 		],
 		foreign_includes = [],
@@ -986,14 +710,14 @@ pure func test_clone_id_follows_every_declared_definition_id() -> Bool:
 		for_type = NamedType("HighIdType", []),
 		type_params = [],
 		methods = [
-			{ rewrite_function(lit_expr(0)) |
+			{ rewrite_function(update_in_place(0)) |
 				name = "high_id_method",
 				def_id = 6000
 			},
 		],
 		loc = synthetic_core_source_loc()
 	}
-	base: CoreProgram = program(lit_expr(7))
+	base: CoreProgram = program(update_in_place(7))
 	source_program: CoreProgram = { base |
 		decls = [EnumDecl(high_id_enum), ImplDecl(high_id_impl)].concat(base.decls)
 	}
@@ -1038,8 +762,8 @@ pure func test_later_used_candidate_retains_id_reserved_by_unused_candidate() ->
 	}
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
-			FunctionDecl(multi_rewrite_function(lit_expr(7))),
+			expr_record_decl(),
+			FunctionDecl(multi_rewrite_function(multi_update_in_place())),
 			FunctionDecl(multi_run),
 		],
 		foreign_includes = [],
@@ -1050,7 +774,9 @@ pure func test_later_used_candidate_retains_id_reserved_by_unused_candidate() ->
 	function_names_are(
 		rewritten,
 		["multi_rewrite", "multi_rewrite__consume_arg1", "run"],
-	) and function_definition_id(rewritten, "multi_rewrite__consume_arg1") == Some(103)
+	) and function_definition_id(rewritten, "multi_rewrite__consume_arg1") == Some(
+		MULTI_REWRITE_SECOND_CLONE_DEF_ID,
+	)
 
 
 pure func test_used_clones_emit_once_in_parameter_order() -> Bool:
@@ -1117,8 +843,8 @@ pure func test_used_clones_emit_once_in_parameter_order() -> Bool:
 	}
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
-			FunctionDecl(multi_rewrite_function(lit_expr(7))),
+			expr_record_decl(),
+			FunctionDecl(multi_rewrite_function(multi_update_in_place())),
 			FunctionDecl(multi_run),
 		],
 		foreign_includes = [],
@@ -1135,19 +861,65 @@ pure func test_used_clones_emit_once_in_parameter_order() -> Bool:
 	) == 1 and function_occurrence_count(rewritten, "multi_rewrite__consume_arg1") == 1
 
 
-pure func test_does_not_clone_when_result_is_consumed_param() -> Bool:
+---
+A clone that only returns its parameter updates nothing in place, so it would
+only add code: `expr = rewrite_expr(expr, 1)` keeps calling the original.
+---
+pure func test_does_not_clone_without_in_place_update() -> Bool:
 	rewritten: CoreProgram = rewritten_program(var_expr("expr", expr_type()))
-	has_functions: Bool = function_names_are(
-		rewritten,
-		["rewrite_expr", "run"],
-	)
-	keeps_original_assignment: Bool = assignment_call_name_matches(rewritten, "rewrite_expr")
 
-	has_functions and keeps_original_assignment
+	(
+		function_names_are(rewritten, ["rewrite_expr", "run"])
+		and assignment_call_name_matches(rewritten, "rewrite_expr")
+	)
+
+
+---
+A helper that hands its parameter to a function without an in-place update
+gets no clone either: the benefit is transitive only through clones that
+benefit.
+---
+pure func test_does_not_clone_hand_off_to_clone_without_benefit() -> Bool:
+	rewritten: CoreProgram = rewritten_forward_program(
+		var_expr("expr", expr_type()),
+		rewrite_call_on(var_expr("expr", expr_type()), 1),
+	)
+
+	(
+		function_names_are(rewritten, ["rewrite_expr", "multi_rewrite", "forward", "run"])
+		and function_calls_are(rewritten, "forward", ["rewrite_expr"])
+		and assignment_call_name_matches(rewritten, "forward")
+	)
+
+
+---
+Self-recursion that never updates its parameter has no benefit: the least
+fixpoint does not let a clone qualify through a hand-off to itself.
+---
+pure func test_does_not_clone_recursion_without_update() -> Bool:
+	rewritten: CoreProgram = rewritten_program(rewrite_call_on(var_expr("expr", expr_type()), 2))
+
+	(
+		function_names_are(rewritten, ["rewrite_expr", "run"])
+		and function_calls_are(rewritten, "rewrite_expr", ["rewrite_expr"])
+	)
 
 
 func test_no_candidate_program_rewrites_identically() -> Bool:
-	source_program: CoreProgram = program(var_expr("expr", expr_type()))
+	-- A result type different from the parameter's makes the function
+	-- ineligible, so no parameter of any function is a clone candidate.
+	source_program: CoreProgram = {
+		decls = [
+			expr_record_decl(),
+			FunctionDecl({
+				rewrite_function(var_expr("expr", expr_type())) |
+				return_type = other_expr_type()
+			}),
+			FunctionDecl(run_function()),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
 
 	reset_mem_stats()
 	rewritten: CoreProgram = rewrite_program_for_test(source_program)
@@ -1179,51 +951,8 @@ func test_no_candidate_program_rewrites_identically() -> Bool:
 	equivalent and allocations_ok
 
 
-pure func test_does_not_clone_when_result_contains_consumed_param() -> Bool:
-	rewritten: CoreProgram = rewritten_program(add_expr(var_expr("expr", expr_type()), lit_expr(1)))
-	has_functions: Bool = function_names_are(
-		rewritten,
-		["rewrite_expr", "run"],
-	)
-	keeps_original_assignment: Bool = assignment_call_name_matches(rewritten, "rewrite_expr")
-
-	has_functions and keeps_original_assignment
-
-
-pure func test_consuming_clone_owns_recursive_match_fields() -> Bool:
-	rewritten: CoreProgram = rewritten_program(recursive_rewrite_body())
-
-	match clone_body_summary(rewritten, "rewrite_expr__consume_arg0"):
-		Some(summary):
-			owns_fields: Bool = summary.owned_names == ["left", "right"]
-			rewrites_recursive_calls: Bool = summary.rewrite_calls == [
-				"rewrite_expr__consume_arg0",
-				"rewrite_expr__consume_arg0",
-			]
-			owns_fields and rewrites_recursive_calls
-		None:
-			False
-
-
-pure func test_consuming_clone_owns_branch_swapped_recursive_fields() -> Bool:
-	rewritten: CoreProgram = rewritten_program(recursive_branch_swapped_rewrite_body())
-
-	match clone_body_summary(rewritten, "rewrite_expr__consume_arg0"):
-		Some(summary):
-			owns_fields: Bool = summary.owned_names == ["left", "right"]
-			rewrites_recursive_calls: Bool = summary.rewrite_calls == [
-				"rewrite_expr__consume_arg0",
-				"rewrite_expr__consume_arg0",
-				"rewrite_expr__consume_arg0",
-				"rewrite_expr__consume_arg0",
-			]
-			owns_fields and rewrites_recursive_calls
-		None:
-			False
-
-
 pure func test_perceus_consuming_clone_skips_old_assignment_drop() -> Bool:
-	perceus: CoreProgram = insert_drops_program(rewritten_program(lit_expr(7)))
+	perceus: CoreProgram = insert_drops_program(rewritten_program(update_in_place(7)))
 
 	match function_body(perceus, "run"):
 		Some(body):
@@ -1257,8 +986,8 @@ pure func test_rewrites_assignment_nested_in_constructor_match() -> Bool:
 	}
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
-			FunctionDecl(rewrite_function(lit_expr(7))),
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
 			FunctionDecl(match_run),
 		],
 		foreign_includes = [],
@@ -1286,8 +1015,8 @@ pure func test_rewrites_assignment_nested_in_while() -> Bool:
 	}
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
-			FunctionDecl(rewrite_function(lit_expr(7))),
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
 			FunctionDecl(loop_run),
 		],
 		foreign_includes = [],
@@ -1333,8 +1062,8 @@ pure func test_same_named_distinct_argument_is_not_consumed() -> Bool:
 	}
 	source_program: CoreProgram = {
 		decls = [
-			UnionDecl(expr_union_decl()),
-			FunctionDecl(rewrite_function(lit_expr(7))),
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
 			FunctionDecl(identity_run),
 		],
 		foreign_includes = [],
@@ -1345,54 +1074,478 @@ pure func test_same_named_distinct_argument_is_not_consumed() -> Bool:
 	assignment_call_name_matches(rewritten, "rewrite_expr")
 
 
-pure func test_consuming_clone_rejects_one_sided_recursive_field_use() -> Bool:
-	rewritten: CoreProgram = rewritten_program(recursive_one_sided_rewrite_body())
+private FORWARD_DEF_ID: Int = 40
 
-	match clone_body_summary(rewritten, "rewrite_expr__consume_arg0"):
-		Some(summary):
-			expected_owned_names: List[String] = []
-			keeps_borrowed_fields: Bool = summary.owned_names == expected_owned_names
-			keeps_original_call: Bool = summary.rewrite_calls == ["rewrite_expr"]
-			keeps_borrowed_fields and keeps_original_call
+
+---
+`forward(expr, pass) = body`, a helper with the same signature as
+`rewrite_expr` that the last-use tests fill with different call shapes.
+---
+pure func forward_function(body: CoreExpr) -> CoreFunction:
+	{ rewrite_function(body) | name = "forward", def_id = FORWARD_DEF_ID }
+
+
+---
+`run` with `expr = forward(expr, 1)` in place of the `rewrite_expr` call.
+---
+pure func run_calling_forward() -> CoreFunction:
+	{ run_function() |
+		body = Some(
+			LetExpr(
+				named_var("expr"),
+				True,
+				expr_type(),
+				lit_expr(0),
+				SeqExpr(
+					assignment_expr_for_call(
+						named_var("expr"),
+						"forward",
+						FORWARD_DEF_ID,
+						[var_expr("expr", expr_type()), int_expr(1)],
+						expr_type(),
+					),
+					var_expr("expr", expr_type()),
+				),
+			),
+		)
+	}
+
+
+---
+Rewrites a program whose `rewrite_expr` has body `rewrite_body` and whose
+`forward` helper has body `forward_body`, called from `run`.
+---
+pure func rewritten_forward_program(rewrite_body: CoreExpr, forward_body: CoreExpr) -> CoreProgram:
+	rewrite_program_for_test({
+		decls = [
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(rewrite_body)),
+			FunctionDecl(multi_rewrite_function(multi_update_in_place())),
+			FunctionDecl(forward_function(forward_body)),
+			FunctionDecl(run_calling_forward()),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+
+pure func rewrite_call_on(argument: CoreExpr, pass: Int) -> CoreExpr:
+	user_call("rewrite_expr", 10, [argument, int_expr(pass)], expr_type())
+
+
+---
+Every user call name in `expr`, in evaluation order, through the node kinds
+these fixtures build.
+---
+pure func user_call_names(expr: CoreExpr) -> List[String]:
+	match expr:
+		CallExpr(kind, callee, args, typ, loc):
+			var names: List[String] = []
+
+			for arg in args:
+				names = names.concat(user_call_names(arg))
+
+			match kind:
+				UserCall(name, _, _):
+					names.append(name)
+				_:
+					names
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			user_call_names(rhs).concat(user_call_names(body))
+		SeqExpr(first, second):
+			user_call_names(first).concat(user_call_names(second))
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			user_call_names(cond).concat(user_call_names(then_expr)).concat(user_call_names(else_expr))
+		WhileExpr(cond, body, typ, loc):
+			user_call_names(cond).concat(user_call_names(body))
+		LambdaExpr(params, return_type, body, is_pure, typ, loc):
+			user_call_names(body)
+		AssignExpr(variable, rhs, typ, loc):
+			user_call_names(rhs)
+		_:
+			[]
+
+
+pure func function_calls_are(program_value: CoreProgram, name: String, expected: List[String]) -> Bool:
+	match function_body(program_value, name):
+		Some(body):
+			user_call_names(body) == expected
 		None:
 			False
 
 
-pure func test_consuming_clone_rejects_nested_match_result_alias() -> Bool:
-	rewritten: CoreProgram = rewritten_program(length_match_aliasing_rewrite_body())
+---
+A helper whose body is a call on its parameter: the clone hands the
+parameter on to `rewrite_expr`'s clone, which is created because the helper's
+clone uses it, while the original helper keeps borrowing.
+---
+pure func test_clones_helper_tail_call_transitively() -> Bool:
+	rewritten: CoreProgram = rewritten_forward_program(
+		update_in_place(7),
+		rewrite_call_on(var_expr("expr", expr_type()), 1),
+	)
 
-	function_names_are(
-		rewritten,
-		["rewrite_expr", "run"],
-	) and assignment_call_name_matches(rewritten, "rewrite_expr")
+	(
+		function_names_are(
+			rewritten,
+			[
+				"rewrite_expr",
+				"rewrite_expr__consume_arg0",
+				"multi_rewrite",
+				"forward",
+				"forward__consume_arg0",
+				"run",
+			],
+		)
+		and function_calls_are(rewritten, "forward__consume_arg0", ["rewrite_expr__consume_arg0"])
+		and function_calls_are(rewritten, "forward", ["rewrite_expr"])
+		and assignment_call_name_matches(rewritten, "forward__consume_arg0")
+	)
 
 
-func test_length_match_rewrite_avoids_ephemeral_result_records() -> Bool:
-	reset_mem_stats()
-	rewritten: CoreProgram = rewritten_program(length_match_rewrite_body())
-	stats = get_mem_stats()
+---
+A chain of let-bound calls: the clone hands its parameter to the first call
+and the first result to the second; the original keeps borrowing its
+parameter but still hands on the local it owns.
+---
+pure func test_retargets_let_bound_calls_at_last_use() -> Bool:
+	first_result: CoreVar = named_var("first_result")
+	body: CoreExpr = LetExpr(
+		first_result,
+		False,
+		expr_type(),
+		rewrite_call_on(var_expr("expr", expr_type()), 1),
+		rewrite_call_on(VarExpr(first_result, expr_type(), synthetic_core_source_loc()), 2),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
 
-	allocations_ok: Bool = stats.total_allocations <= MAX_CONSUME_SPECIALIZE_LENGTH_MATCH_ALLOCATIONS
-	behavior_ok: Bool = function_names_are(
-		rewritten,
-		["rewrite_expr", "rewrite_expr__consume_arg0", "run"],
-	) and assignment_call_name_matches(
-		rewritten,
-		"rewrite_expr__consume_arg0",
-	) and function_definition_id(
-		rewritten,
-		"rewrite_expr__consume_arg0",
-	) == Some(
-		LENGTH_MATCH_CONSUMING_CLONE_DEF_ID,
-	) and cloned_length_match_preserves_branches(rewritten)
+	(
+		function_calls_are(
+			rewritten,
+			"forward__consume_arg0",
+			["rewrite_expr__consume_arg0", "rewrite_expr__consume_arg0"],
+		)
+		and function_calls_are(rewritten, "forward", ["rewrite_expr", "rewrite_expr__consume_arg0"])
+	)
 
-	if not allocations_ok:
-		print("consume specialize length match allocations: ${stats.total_allocations}")
-	else:
-		void
 
-	allocations_ok and behavior_ok
+---
+A branch that hands the parameter on and a branch that returns it: the call
+is the parameter's last use on its path.
+---
+pure func test_retargets_branch_call_at_last_use() -> Bool:
+	body: CoreExpr = IfExpr(
+		bool_expr(True),
+		rewrite_call_on(var_expr("expr", expr_type()), 1),
+		var_expr("expr", expr_type()),
+		expr_type(),
+		synthetic_core_source_loc(),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
 
+	function_calls_are(rewritten, "forward__consume_arg0", ["rewrite_expr__consume_arg0"])
+
+
+---
+The parameter is read after the call, so the call keeps borrowing it.
+---
+pure func test_keeps_call_when_argument_is_read_after() -> Bool:
+	first_result: CoreVar = named_var("first_result")
+	body: CoreExpr = LetExpr(
+		first_result,
+		False,
+		expr_type(),
+		rewrite_call_on(var_expr("expr", expr_type()), 1),
+		add_expr(
+			var_expr("expr", expr_type()),
+			VarExpr(first_result, expr_type(), synthetic_core_source_loc()),
+		),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
+
+	-- A wrong retarget would hand the parameter on and make the helper's
+	-- clone beneficial; kept borrowing, the helper gets no clone at all.
+	(
+		function_occurrence_count(rewritten, "forward__consume_arg0") == 0
+		and function_calls_are(rewritten, "forward", ["rewrite_expr", "Add"])
+	)
+
+
+---
+The parameter passed twice to one call is never handed over.
+---
+pure func test_keeps_call_when_argument_is_passed_twice() -> Bool:
+	body: CoreExpr = user_call(
+		"multi_rewrite",
+		30,
+		[var_expr("expr", expr_type()), var_expr("expr", expr_type()), int_expr(1)],
+		expr_type(),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
+
+	-- A wrong retarget would hand the parameter on and make the helper's
+	-- clone beneficial; kept borrowing, the helper gets no clone at all.
+	(
+		function_occurrence_count(rewritten, "forward__consume_arg0") == 0
+		and function_calls_are(rewritten, "forward", ["multi_rewrite"])
+	)
+
+
+---
+A lambda that calls on the captured parameter borrows its capture: the call
+inside it is never retargeted.
+---
+pure func test_keeps_call_inside_lambda_on_captured_parameter() -> Bool:
+	lambda_type: CoreType = closure_type()
+	body: CoreExpr = LetExpr(
+		named_var("callback"),
+		False,
+		lambda_type,
+		LambdaExpr(
+			[param("pass_value", int_type())],
+			expr_type(),
+			rewrite_call_on(var_expr("expr", expr_type()), 1),
+			True,
+			lambda_type,
+			synthetic_core_source_loc(),
+		),
+		var_expr("expr", expr_type()),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
+
+	-- A wrong retarget would hand the parameter on and make the helper's
+	-- clone beneficial; kept borrowing, the helper gets no clone at all.
+	(
+		function_occurrence_count(rewritten, "forward__consume_arg0") == 0
+		and function_calls_are(rewritten, "forward", ["rewrite_expr"])
+	)
+
+
+---
+A call on the parameter inside a loop runs once per iteration, so the
+parameter stays live across it and the call keeps borrowing.
+---
+pure func test_keeps_call_inside_loop_on_outer_parameter() -> Bool:
+	body: CoreExpr = SeqExpr(
+		WhileExpr(
+			bool_expr(False),
+			rewrite_call_on(var_expr("expr", expr_type()), 1),
+			VoidType,
+			synthetic_core_source_loc(),
+		),
+		var_expr("expr", expr_type()),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
+
+	-- A wrong retarget would hand the parameter on and make the helper's
+	-- clone beneficial; kept borrowing, the helper gets no clone at all.
+	(
+		function_occurrence_count(rewritten, "forward__consume_arg0") == 0
+		and function_calls_are(rewritten, "forward", ["rewrite_expr"])
+	)
+
+
+---
+Self-recursion through the parameter: the clone calls itself, the original
+keeps calling the original.
+---
+pure func test_recursive_clone_hands_parameter_to_itself() -> Bool:
+	rewritten: CoreProgram = rewritten_program(
+		IfExpr(
+			bool_expr(True),
+			update_in_place(1),
+			rewrite_call_on(var_expr("expr", expr_type()), 2),
+			expr_type(),
+			synthetic_core_source_loc(),
+		),
+	)
+
+	(
+		function_calls_are(rewritten, "rewrite_expr__consume_arg0", ["rewrite_expr__consume_arg0"])
+		and function_calls_are(rewritten, "rewrite_expr", ["rewrite_expr"])
+	)
+
+
+---
+The safety net for imprecise last-use analysis: a call handed to a clone
+while its argument is still live gets a retain from Perceus, so the clone's
+in-place update cannot reach the caller's value.
+---
+pure func test_perceus_retains_live_argument_of_consuming_call() -> Bool:
+	base: CoreProgram = rewritten_program(update_in_place(7))
+	kept: CoreVar = named_var("kept")
+	clone_def_id: Int = function_definition_id(base, "rewrite_expr__consume_arg0").get_or(0)
+	keeps_old: CoreFunction = { run_function() |
+		name = "keeps_old",
+		def_id = 50,
+		body = Some(
+			LetExpr(
+				kept,
+				False,
+				expr_type(),
+				lit_expr(0),
+				add_expr(
+					user_call(
+						"rewrite_expr__consume_arg0",
+						clone_def_id,
+						[VarExpr(kept, expr_type(), synthetic_core_source_loc()), int_expr(1)],
+						expr_type(),
+					),
+					VarExpr(kept, expr_type(), synthetic_core_source_loc()),
+				),
+			),
+		)
+	}
+	perceus: CoreProgram = insert_drops_program({ base |
+		decls = base.decls.append(FunctionDecl(keeps_old))
+	})
+	json: String = core_program_to_json(perceus).to_string()
+
+	json.contains("\"kind\":\"dup\",\"var\":{\"name\":\"kept\"")
+
+
+---
+An unmanaged parameter has no reference to hand over, so `n = count_up(n)`
+never gets a clone even though the result type matches.
+---
+pure func test_does_not_clone_unmanaged_parameter() -> Bool:
+	count_up: CoreFunction = { rewrite_function(var_expr("n", int_type())) |
+		name = "count_up",
+		def_id = 60,
+		params = [param("n", int_type())],
+		return_type = int_type()
+	}
+	counter_run: CoreFunction = { run_function() |
+		return_type = int_type(),
+		body = Some(
+			LetExpr(
+				named_var("n"),
+				True,
+				int_type(),
+				int_expr(0),
+				SeqExpr(
+					assignment_expr_for_call(
+						named_var("n"),
+						"count_up",
+						60,
+						[var_expr("n", int_type())],
+						int_type(),
+					),
+					var_expr("n", int_type()),
+				),
+			),
+		)
+	}
+	rewritten: CoreProgram = rewrite_program_for_test({
+		decls = [expr_record_decl(), FunctionDecl(count_up), FunctionDecl(counter_run)],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	function_names_are(rewritten, ["count_up", "run"]) and assignment_call_name_matches(rewritten, "count_up")
+
+
+---
+`expr = if c: rewrite_expr(expr, 1) else Add(expr, 1)` would consume the
+old value on one branch only, which Perceus does not balance at an
+assignment, so a compound right-hand side never takes the assignment target.
+---
+pure func test_keeps_assignment_target_live_in_compound_right_hand_side() -> Bool:
+	branch_assignment: CoreExpr = AssignExpr(
+		named_var("expr"),
+		IfExpr(
+			bool_expr(True),
+			rewrite_call_on(var_expr("expr", expr_type()), 1),
+			add_expr(var_expr("expr", expr_type()), lit_expr(1)),
+			expr_type(),
+			synthetic_core_source_loc(),
+		),
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	branch_run: CoreFunction = { run_function() |
+		body = Some(
+			LetExpr(
+				named_var("expr"),
+				True,
+				expr_type(),
+				lit_expr(0),
+				SeqExpr(branch_assignment, var_expr("expr", expr_type())),
+			),
+		)
+	}
+	rewritten: CoreProgram = rewrite_program_for_test({
+		decls = [
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
+			FunctionDecl(branch_run),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	function_calls_are(rewritten, "run", ["Lit", "rewrite_expr", "Lit", "Add"])
+
+
+---
+`var out = expr; out = { out | count = 1 }; out` updates the parameter's
+record through the variable, which is a direct in-place benefit.
+---
+pure func test_clones_helper_updating_parameter_through_var() -> Bool:
+	body: CoreExpr = LetExpr(
+		named_var("out"),
+		True,
+		expr_type(),
+		var_expr("expr", expr_type()),
+		SeqExpr(
+			AssignExpr(
+				named_var("out"),
+				update_param_in_place("out", 1),
+				VoidType,
+				synthetic_core_source_loc(),
+			),
+			var_expr("out", expr_type()),
+		),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(var_expr("expr", expr_type()), body)
+
+	(
+		function_occurrence_count(rewritten, "forward__consume_arg0") == 1
+		and assignment_call_name_matches(rewritten, "forward__consume_arg0")
+	)
+
+
+---
+`let fresh = Lit(0); multi_rewrite(fresh, expr, 1)`: the call is retargeted
+to consume `fresh` (argument 0), so the helper's own parameter sits at a
+borrowed position and is not handed over. The helper's clone has no benefit
+and is not kept.
+---
+pure func test_does_not_count_borrowed_position_as_hand_off() -> Bool:
+	fresh: CoreVar = named_var("fresh")
+	body: CoreExpr = LetExpr(
+		fresh,
+		False,
+		expr_type(),
+		lit_expr(0),
+		user_call(
+			"multi_rewrite",
+			30,
+			[
+				VarExpr(fresh, expr_type(), synthetic_core_source_loc()),
+				var_expr("expr", expr_type()),
+				int_expr(1),
+			],
+			expr_type(),
+		),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(var_expr("expr", expr_type()), body)
+
+	(
+		function_occurrence_count(rewritten, "forward__consume_arg0") == 0
+		and function_calls_are(rewritten, "forward", ["Lit", "multi_rewrite__consume_arg0"])
+		and assignment_call_name_matches(rewritten, "forward")
+	)
 
 tests: TestSuite = {
 	description = "Blorp compiler Core consume specialize",
@@ -1416,25 +1569,15 @@ tests: TestSuite = {
 			test_later_used_candidate_retains_id_reserved_by_unused_candidate,
 		),
 		("used clones emit once in parameter order", test_used_clones_emit_once_in_parameter_order),
+		("does not clone without in-place update", test_does_not_clone_without_in_place_update),
 		(
-			"does not clone when result is consumed param",
-			test_does_not_clone_when_result_is_consumed_param,
+			"does not clone hand-off to clone without benefit",
+			test_does_not_clone_hand_off_to_clone_without_benefit,
 		),
+		("does not clone recursion without update", test_does_not_clone_recursion_without_update),
 		(
 			"no-candidate program rewrites identically",
 			test_no_candidate_program_rewrites_identically,
-		),
-		(
-			"does not clone when result contains consumed param",
-			test_does_not_clone_when_result_contains_consumed_param,
-		),
-		(
-			"consuming clone owns recursive match fields",
-			test_consuming_clone_owns_recursive_match_fields,
-		),
-		(
-			"consuming clone owns branch-swapped recursive fields",
-			test_consuming_clone_owns_branch_swapped_recursive_fields,
 		),
 		(
 			"Perceus consuming clone skips old assignment drop",
@@ -1450,16 +1593,47 @@ tests: TestSuite = {
 			test_same_named_distinct_argument_is_not_consumed,
 		),
 		(
-			"consuming clone rejects one-sided recursive field use",
-			test_consuming_clone_rejects_one_sided_recursive_field_use,
+			"clones helper tail call transitively",
+			test_clones_helper_tail_call_transitively,
+		),
+		("retargets let-bound calls at last use", test_retargets_let_bound_calls_at_last_use),
+		("retargets branch call at last use", test_retargets_branch_call_at_last_use),
+		(
+			"keeps call when argument is read after",
+			test_keeps_call_when_argument_is_read_after,
 		),
 		(
-			"consuming clone rejects nested match result alias",
-			test_consuming_clone_rejects_nested_match_result_alias,
+			"keeps call when argument is passed twice",
+			test_keeps_call_when_argument_is_passed_twice,
 		),
 		(
-			"length match rewrite avoids ephemeral result records",
-			test_length_match_rewrite_avoids_ephemeral_result_records,
+			"keeps call inside lambda on captured parameter",
+			test_keeps_call_inside_lambda_on_captured_parameter,
+		),
+		(
+			"keeps call inside loop on outer parameter",
+			test_keeps_call_inside_loop_on_outer_parameter,
+		),
+		(
+			"recursive clone hands parameter to itself",
+			test_recursive_clone_hands_parameter_to_itself,
+		),
+		(
+			"Perceus retains live argument of consuming call",
+			test_perceus_retains_live_argument_of_consuming_call,
+		),
+		("does not clone unmanaged parameter", test_does_not_clone_unmanaged_parameter),
+		(
+			"clones helper updating parameter through var",
+			test_clones_helper_updating_parameter_through_var,
+		),
+		(
+			"does not count borrowed position as hand-off",
+			test_does_not_count_borrowed_position_as_hand_off,
+		),
+		(
+			"keeps assignment target live in compound right-hand side",
+			test_keeps_assignment_target_live_in_compound_right_hand_side,
 		),
 	]
 }
