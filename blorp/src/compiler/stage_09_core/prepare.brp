@@ -1272,6 +1272,21 @@ private pure func prepare_list_storage_value(
 				value
 
 
+---
+Runs after Perceus, which has already settled whether the stack Result value
+itself is moved or borrowed. Either way emission creates a fresh box that
+owns one payload reference, so the literal hands that box to the dict, as
+`prepare_list_storage_value` does for pointer-backed lists.
+---
+private pure func transfer_stack_result_dict_value_box(
+	value: CoreBoxedStorageValue,
+) -> Option[CoreBoxedStorageValue]:
+	if is_stack_result_type(expr_type(value.value)) and not value.transfers_ownership:
+		Some({ value | transfers_ownership = True })
+	else:
+		None
+
+
 private pure func prepare_dict_entry(
 	decls: PrepareDecls,
 	entry: CoreDictEntry,
@@ -1279,12 +1294,16 @@ private pure func prepare_dict_entry(
 	prepared_key: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, entry.key)
 	prepared_value: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, entry.value)
 
-	if prepared_key.is_none() and prepared_value.is_none():
+	transferred_value: Option[CoreBoxedStorageValue] = transfer_stack_result_dict_value_box(
+		prepared_value.get_or(entry.value),
+	)
+
+	if prepared_key.is_none() and prepared_value.is_none() and transferred_value.is_none():
 		None
 	else:
 		Some({
 			key = prepared_key.get_or(entry.key),
-			value = prepared_value.get_or(entry.value),
+			value = transferred_value.get_or(prepared_value.get_or(entry.value)),
 		})
 
 
@@ -3218,9 +3237,9 @@ else, so transferring it consumes nothing in Perceus terms.
 
 Keys keep the borrowed default: struct-keyed dicts set no key release, so
 the runtime stores the key box without retaining it. Stack Results are
-excluded because their box retains a payload that may be managed, and
-emission retains it even for a moved value, so marking the entry
-transferred would trade the box leak for a payload leak.
+excluded here: their payload may be managed, so a transfer before Perceus
+would move the source variable into the box. `prepare_dict_entry` instead
+transfers their fresh box after Perceus has settled the payload's owner.
 ---
 private pure func dict_literal_value_storage_value(expr: CoreExpr) -> CoreBoxedStorageValue:
 	value: CoreBoxedStorageValue = boxed_storage_value_for_expr(expr)
@@ -3307,6 +3326,18 @@ private pure func prepare_dict_literal_entry(
 		})
 
 
+private pure func transfer_stack_result_dict_entry_box(entry: CoreDictEntry) -> Option[CoreDictEntry]:
+	match transfer_stack_result_dict_value_box(entry.value):
+		Some(value):
+			Some({ entry | value = value })
+		None:
+			None
+
+
+---
+A literal lowered here, after Perceus, gets the same stack Result box
+transfer that `prepare_dict_entry` gives a literal lowered before Perceus.
+---
 private pure func prepare_dict_expr(
 	decls: PrepareDecls,
 	expr: CoreExpr,
@@ -3314,7 +3345,7 @@ private pure func prepare_dict_expr(
 	typ: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	lower_dict_literal_expr(
+	lowered: CoreExpr = lower_dict_literal_expr(
 		decls,
 		expr,
 		entries,
@@ -3322,6 +3353,20 @@ private pure func prepare_dict_expr(
 		typ,
 		loc,
 	)
+
+	match lowered:
+		DictConstructExpr(construct, construct_type, construct_loc):
+			match prepare_list_items(construct.entries, transfer_stack_result_dict_entry_box):
+				Some(transferred_entries):
+					DictConstructExpr(
+						{ construct | entries = transferred_entries },
+						construct_type,
+						construct_loc,
+					)
+				None:
+					lowered
+		_:
+			lowered
 
 
 private pure func prepare_record_field(

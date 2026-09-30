@@ -2102,10 +2102,13 @@ pure func test_prepare_converts_raw_dict_literal() -> Bool:
 
 
 ---
-Prepares a one-entry `Dict[key_type, value_type]` literal whose key and
-value are the variables `key` and `value`, returning its prepared entry.
+Runs `lower_pass` on a one-entry `Dict[key_type, value_type]` literal whose
+key and value are the variables `key` and `value`, returning its lowered
+entry. The dict literal ownership pass lowers literals before Perceus;
+`prepare_program` lowers any that remain after it.
 ---
-pure func prepared_single_dict_literal_entry(
+pure func lowered_single_dict_literal_entry(
+	lower_pass: pure (CoreProgram) -> CoreProgram,
 	key_type: CoreType,
 	value_type: CoreType,
 ) -> Option[CoreDictEntry]:
@@ -2120,7 +2123,7 @@ pure func prepared_single_dict_literal_entry(
 		dict_type,
 		synthetic_core_source_loc(),
 	)
-	actual: CoreProgram = prepare_program(program_with_body(body, dict_type))
+	actual: CoreProgram = lower_pass(program_with_body(body, dict_type))
 
 	match actual.decls:
 		[FunctionDecl(function_info)]:
@@ -2137,8 +2140,8 @@ pure func prepared_single_dict_literal_entry(
 			None
 
 
-pure func test_prepare_transfers_struct_box_value_into_dict_literal() -> Bool:
-	match prepared_single_dict_literal_entry(int_type(), point_type()):
+pure func test_dict_literal_ownership_transfers_struct_box_value() -> Bool:
+	match lowered_single_dict_literal_entry(prepare_dict_literals_for_ownership, int_type(), point_type()):
 		Some(entry):
 			match entry.value.kind:
 				StructBox("Point"):
@@ -2149,8 +2152,12 @@ pure func test_prepare_transfers_struct_box_value_into_dict_literal() -> Bool:
 			False
 
 
-pure func test_prepare_keeps_stack_result_dict_literal_value_borrowed() -> Bool:
-	match prepared_single_dict_literal_entry(int_type(), stack_result_int_string_type()):
+pure func test_dict_literal_ownership_leaves_stack_result_value_to_perceus() -> Bool:
+	match lowered_single_dict_literal_entry(
+		prepare_dict_literals_for_ownership,
+		int_type(),
+		stack_result_int_string_type(),
+	):
 		Some(entry):
 			match entry.value.kind:
 				StructBox("blorp_StackResult"):
@@ -2161,8 +2168,59 @@ pure func test_prepare_keeps_stack_result_dict_literal_value_borrowed() -> Bool:
 			False
 
 
-pure func test_prepare_keeps_struct_box_dict_literal_key_borrowed() -> Bool:
-	match prepared_single_dict_literal_entry(point_type(), int_type()):
+pure func test_prepare_transfers_stack_result_box_of_dict_literal_lowered_after_perceus() -> Bool:
+	match lowered_single_dict_literal_entry(prepare_program, int_type(), stack_result_int_string_type()):
+		Some(entry):
+			match entry.value.kind:
+				StructBox("blorp_StackResult"):
+					entry.value.needs_release and entry.value.transfers_ownership
+				_:
+					False
+		None:
+			False
+
+
+pure func test_prepare_transfers_stack_result_box_into_dict_construct() -> Bool:
+	result_type: CoreType = stack_result_int_string_type()
+	dict_type: CoreType = NamedType("Dict", [int_type(), result_type])
+	body: CoreExpr = DictConstructExpr(
+		{
+			constructor = GenericHashContainerConstructor,
+			entries = [
+				{
+					key = int_boxed_value(int_literal(1)),
+					value = {
+						kind = StructBox("blorp_StackResult"),
+						value = VarExpr(named_var("result"), result_type, synthetic_core_source_loc()),
+						needs_release = True,
+						transfers_ownership = False
+					}
+				},
+			],
+			value_needs_release = True
+		},
+		dict_type,
+		synthetic_core_source_loc(),
+	)
+	actual: CoreProgram = prepare_program(program_with_body(body, dict_type))
+
+	match actual.decls:
+		[FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(DictConstructExpr(construct, _, _)):
+					match construct.entries:
+						[entry]:
+							entry.value.transfers_ownership and not entry.key.transfers_ownership
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_dict_literal_ownership_keeps_struct_box_key_borrowed() -> Bool:
+	match lowered_single_dict_literal_entry(prepare_dict_literals_for_ownership, point_type(), int_type()):
 		Some(entry):
 			match entry.key.kind:
 				StructBox("Point"):
@@ -3101,16 +3159,24 @@ tests: TestSuite = {
 		("prepare orders heap record fields", test_prepare_orders_heap_record_fields),
 		("prepare converts raw dict literal", test_prepare_converts_raw_dict_literal),
 		(
-			"prepare transfers struct box value into dict literal",
-			test_prepare_transfers_struct_box_value_into_dict_literal,
+			"dict literal ownership transfers struct box value",
+			test_dict_literal_ownership_transfers_struct_box_value,
 		),
 		(
-			"prepare keeps stack result dict literal value borrowed",
-			test_prepare_keeps_stack_result_dict_literal_value_borrowed,
+			"dict literal ownership leaves stack result value to perceus",
+			test_dict_literal_ownership_leaves_stack_result_value_to_perceus,
 		),
 		(
-			"prepare keeps struct box dict literal key borrowed",
-			test_prepare_keeps_struct_box_dict_literal_key_borrowed,
+			"prepare transfers stack result box of dict literal lowered after perceus",
+			test_prepare_transfers_stack_result_box_of_dict_literal_lowered_after_perceus,
+		),
+		(
+			"dict literal ownership keeps struct box key borrowed",
+			test_dict_literal_ownership_keeps_struct_box_key_borrowed,
+		),
+		(
+			"prepare transfers stack result box into dict construct",
+			test_prepare_transfers_stack_result_box_into_dict_construct,
 		),
 		("prepare converts raw vector literal", test_prepare_converts_raw_vector_literal),
 		(

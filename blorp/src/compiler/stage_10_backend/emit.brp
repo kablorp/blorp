@@ -7827,12 +7827,28 @@ private pure func emit_boxed_pointer_value(
 	value: CoreBoxedStorageValue,
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
+	emit_boxed_pointer_value_with_source(
+		value,
+		stack_result_box_source_is_owned(value.value),
+		emission_context,
+	)
+
+
+---
+`source_owned` says the emitted value already carries a reference the box
+may take, so a stack Result box must not retain its payload again.
+---
+private pure func emit_boxed_pointer_value_with_source(
+	value: CoreBoxedStorageValue,
+	source_owned: Bool,
+	emission_context: FunctionEmissionContext,
+) -> Option[String]:
 	value_c ?= emit_simple_expr(value.value, emission_context)
 	boxed_pointer_value_from_c(
 		value.kind,
 		core_expr_type(value.value),
 		value_c,
-		expr_retains_stack_result(value.value),
+		source_owned,
 		selected_type_symbol_lookup(emission_context.symbol_authority),
 	)
 
@@ -7845,6 +7861,42 @@ private pure func expr_retains_stack_result(expr: CoreExpr) -> Bool:
 					core_var_equal(variable, returned)
 				_:
 					False
+		_:
+			False
+
+
+---
+A stack Result box owns one reference to its payload. Only expressions that
+structurally produce a fresh reference hand it to the box: a caller-owned
+call result, a constructor, or a Perceus dup of the boxed variable, seen
+through lets, sequences, casts and ownership wrappers, and through both arms
+of an `if`. Everything else, including variables, field and tuple-slot
+projections, and list reads, is a borrowed place the box must retain. The
+borrowed default can at worst keep an extra reference; it never releases a
+reference that another owner still holds.
+---
+private pure func stack_result_box_source_is_owned(expr: CoreExpr) -> Bool:
+	match expr:
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			expr_retains_stack_result(expr) or stack_result_box_source_is_owned(body)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			stack_result_box_source_is_owned(body)
+		CallExpr(kind, callee, args, typ, loc):
+			call_result_transfers_ownership(kind, args.length())
+		UnionConstructExpr(construct, typ, loc):
+			True
+		UnionReuseConstructExpr(construct, typ, loc):
+			True
+		CastExpr(value, typ, loc):
+			stack_result_box_source_is_owned(value)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			stack_result_box_source_is_owned(body)
+		BorrowLetExpr(variable, typ, rhs, body):
+			stack_result_box_source_is_owned(body)
+		SeqExpr(first, second):
+			stack_result_box_source_is_owned(second)
+		IfExpr(cond, then_expr, else_expr, typ, loc):
+			stack_result_box_source_is_owned(then_expr) and stack_result_box_source_is_owned(else_expr)
 		_:
 			False
 
@@ -7863,7 +7915,50 @@ private pure func emit_boxed_pointer_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	match emit_boxed_pointer_value(value, emission_context):
+	emit_boxed_pointer_body_with_source(
+		value,
+		stack_result_box_source_is_owned(value.value),
+		next_temp,
+		emission_context,
+	)
+
+
+---
+Boxes a value whose reference Core already supplied: a union payload that
+Perceus moved or dup'd into the constructor, or a raw list store, where
+`list_set_owned` moves the caller's reference and every managed `list_set`
+synthesis first runs `list_retain_for`. Those consumers store a pointer value
+without retaining it, so a stack Result box takes that reference instead of
+retaining its payload again.
+---
+private pure func emit_owned_boxed_pointer_value(
+	value: CoreBoxedStorageValue,
+	emission_context: FunctionEmissionContext,
+) -> Option[String]:
+	emit_boxed_pointer_value_with_source(value, True, emission_context)
+
+
+---
+Statement-form sibling of `emit_owned_boxed_pointer_value`.
+---
+private pure func emit_owned_boxed_pointer_body(
+	value: CoreBoxedStorageValue,
+	next_temp: Int,
+	emission_context: FunctionEmissionContext,
+) -> Option[FunctionBodyC]:
+	emit_boxed_pointer_body_with_source(value, True, next_temp, emission_context)
+
+
+---
+Statement-form sibling of `emit_boxed_pointer_value_with_source`.
+---
+private pure func emit_boxed_pointer_body_with_source(
+	value: CoreBoxedStorageValue,
+	source_owned: Bool,
+	next_temp: Int,
+	emission_context: FunctionEmissionContext,
+) -> Option[FunctionBodyC]:
+	match emit_boxed_pointer_value_with_source(value, source_owned, emission_context):
 		Some(value_c):
 			Some(body_value(value_c, next_temp))
 		None:
@@ -7950,7 +8045,7 @@ private pure func emit_boxed_pointer_body(
 						value_expr: String = if CoreTypePolicy.is_stack_result_type(
 							core_expr_type(value.value),
 						):
-							emit_stack_result_box(value_c, expr_retains_stack_result(value.value))
+							emit_stack_result_box(value_c, source_owned)
 						else:
 							"({ " + resolved_c_type + " __box_struct_value = " + value_c + "; blorp_box_struct(&__box_struct_value, sizeof(" + resolved_c_type + ")); })"
 
@@ -10102,7 +10197,7 @@ private pure func emit_pointer_list_set(
 ) -> Option[String]:
 	list_c ?= emit_simple_expr(set.list, emission_context)
 	index_c ?= emit_simple_expr(set.index, emission_context)
-	value_c ?= emit_boxed_pointer_value(set.value, emission_context)
+	value_c ?= emit_owned_boxed_pointer_value(set.value, emission_context)
 
 	Some("({ blorp_list_set_raw((blorp_List*)" + list_c + ", " + index_c + ", " + value_c + "); })")
 
@@ -10114,7 +10209,7 @@ private pure func emit_pointer_list_set_body(
 ) -> Option[FunctionBodyC]:
 	list_c ?= emit_simple_expr(set.list, emission_context)
 	index_c ?= emit_simple_expr(set.index, emission_context)
-	value_body ?= emit_boxed_pointer_body(set.value, next_temp, emission_context)
+	value_body ?= emit_owned_boxed_pointer_body(set.value, next_temp, emission_context)
 	value ?= required_body_value(value_body)
 
 	Some({
@@ -10281,7 +10376,7 @@ private pure func emit_pointer_list_handoff_set_owned(
 ) -> Option[String]:
 	list_c ?= emit_simple_expr(set.list, emission_context)
 	index_c ?= emit_simple_expr(set.index, emission_context)
-	value_c ?= emit_boxed_pointer_value(set.value, emission_context)
+	value_c ?= emit_owned_boxed_pointer_value(set.value, emission_context)
 	args: PointerStoreArgs = {
 		list = list_c,
 		index = index_c,
@@ -10823,7 +10918,7 @@ private pure func emit_generic_union_arg(
 		TypedUnionPayloadStorage:
 			emit_simple_expr(arg.value, emission_context)
 		ErasedUnionPayloadStorage:
-			emit_boxed_pointer_value(arg, emission_context)
+			emit_owned_boxed_pointer_value(arg, emission_context)
 
 
 private pure func emit_generic_union_args(
@@ -10899,7 +10994,7 @@ private pure func emit_union_payload_arg_body(
 					),
 				)
 		ErasedUnionPayloadStorage:
-			body ?= emit_boxed_pointer_body(
+			body ?= emit_owned_boxed_pointer_body(
 				arg,
 				next_temp,
 				nested_emission_context(emission_context),
@@ -11008,7 +11103,7 @@ private pure func emit_stack_result_construct(
 ) -> Option[String]:
 	match construct.args:
 		[payload]:
-			payload_c ?= emit_boxed_pointer_value(payload, emission_context)
+			payload_c ?= emit_owned_boxed_pointer_value(payload, emission_context)
 			render_args: StackResultTaggedPayloadArgs = {
 				result_type = info.result_type,
 				tag = info.tag.to_string(),
@@ -11074,7 +11169,7 @@ private pure func emit_boxed_result_construct(
 ) -> Option[String]:
 	match construct.args:
 		[payload]:
-			payload_c ?= emit_boxed_pointer_value(payload, emission_context)
+			payload_c ?= emit_owned_boxed_pointer_value(payload, emission_context)
 			boxed_result_construct_value(
 				construct.constructor_name,
 				payload_c,
@@ -11306,7 +11401,7 @@ private pure func emit_stack_result_construct_body(
 ) -> Option[FunctionBodyC]:
 	match construct.args:
 		[payload]:
-			payload_body ?= emit_boxed_pointer_body(payload, next_temp, emission_context)
+			payload_body ?= emit_owned_boxed_pointer_body(payload, next_temp, emission_context)
 			payload_c ?= required_body_value(payload_body)
 			render_args: StackResultTaggedPayloadArgs = {
 				result_type = info.result_type,
@@ -11393,7 +11488,7 @@ private pure func emit_nullable_option_construct_body(
 		[]:
 			Some(body_value("NULL", next_temp))
 		[payload]:
-			emit_boxed_pointer_body(payload, next_temp, emission_context)
+			emit_owned_boxed_pointer_body(payload, next_temp, emission_context)
 		[first, second, ...rest]:
 			None
 
@@ -11405,7 +11500,7 @@ private pure func emit_boxed_result_construct_body(
 ) -> Option[FunctionBodyC]:
 	match construct.args:
 		[payload]:
-			payload_body ?= emit_boxed_pointer_body(payload, next_temp, emission_context)
+			payload_body ?= emit_owned_boxed_pointer_body(payload, next_temp, emission_context)
 			payload_c ?= required_body_value(payload_body)
 			value ?= boxed_result_construct_value(
 				construct.constructor_name,
@@ -22352,7 +22447,7 @@ private pure func emit_function_body(
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
-					emit_boxed_pointer_body(
+					emit_boxed_pointer_body_with_source(
 						{
 							kind = box.kind,
 							value = box.value,
@@ -22361,6 +22456,10 @@ private pure func emit_function_body(
 							),
 							transfers_ownership = False
 						},
+						-- Same rule as `emit_box_expr`: a standalone BoxExpr
+						-- treats only a Perceus self-dup as supplying the
+						-- payload reference.
+						expr_retains_stack_result(box.value),
 						next_temp,
 						emission_context,
 					)
