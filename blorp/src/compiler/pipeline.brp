@@ -20,12 +20,10 @@ import:
 		EMPTY_NAME_TABLE,
 		NameTable,
 		SYNTHESIZED_NAME_TABLE,
-		name_table_count,
 	stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
 	stage_03_parse/language_parser: parse_compiler_source, parse_compiler_source_with_names
 	stage_03_parse/parsed_ast: ParsedProgram
 	stage_03_parse/source_ast_finalize:
-		FinalizedTypecheckProgram,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_with_names,
 	stage_04_modules/frontend_graph:
@@ -163,31 +161,48 @@ private record DiscoveredFrontendSource {
 
 
 ---
-Accepts a caller-finalized program, which discovery must retain as given (it
-may carry compiler-owned import rewrites that its source text no longer
-shows). Its identifiers' ids index the single-file table it was parsed with
-(`parse_compiler_source`, from `SYNTHESIZED_NAME_TABLE`), so they are the
-compilation's ids only when discovery is still at that same starting table --
-the first candidate. Then the accumulator adopts the table that parse built,
-re-derived here by parsing the program's own source (deterministic, so the ids
-match, hole-introduced ones included) and dropping the program. A finalized
-program that is not first has ids from a table the accumulator no longer
-equals; they are kept as given, and the name-identity check
-(`BLORP_NAME_IDENTITY`) reports them as mismatched.
+The compilation name table discovery has built so far. It is explicit whether
+any file has contributed yet, because only in the first state do a finalized
+root's ids agree with the accumulator.
 ---
-private pure func finalized_source_with_names(
-	finalized_program: FinalizedTypecheckProgram,
-	names: NameTable,
-) -> (FinalizedTypecheckProgram, NameTable):
-	if name_table_count(names) == name_table_count(SYNTHESIZED_NAME_TABLE):
-		(parsed, parsed_names) = parse_compiler_source_with_names(
-			finalized_typecheck_program_ast(finalized_program).source,
-			names,
-		)
-		(_, extended_names) = finalized_typecheck_program_with_names(parsed, parsed_names)
-		(finalized_program, extended_names)
-	else:
-		(finalized_program, names)
+private union DiscoveryNames:
+	-- No file has been discovered: the accumulator is exactly
+	-- `SYNTHESIZED_NAME_TABLE`.
+	SeededTableOnly
+	-- At least one file has been discovered (even one that added no spelling).
+	AccumulatedTable(NameTable)
+
+
+private pure func discovery_names_table(names: DiscoveryNames) -> NameTable:
+	match names:
+		SeededTableOnly:
+			SYNTHESIZED_NAME_TABLE
+		AccumulatedTable(table):
+			table
+
+
+---
+The accumulator after a caller-finalized program, which discovery retains as
+given (it may carry compiler-owned import rewrites that its source text no
+longer shows). Its identifiers' ids index `program_names`, the table its
+caller parsed and finalized it against: `SYNTHESIZED_NAME_TABLE` plus the
+spellings the program's own lex and interpolation holes added. They are the
+compilation's ids only while nothing else has extended the accumulator, so
+only the `SeededTableOnly` state adopts `program_names`. A finalized program
+found after any other file has ids from a table the accumulator no longer
+equals; they are kept as given, and the name-identity check
+(`BLORP_NAME_IDENTITY`) reports them as mismatched (see the "non-first
+finalized root" row of docs/NAME_ID_ROADMAP.md).
+---
+private pure func names_after_finalized_source(
+	program_names: NameTable,
+	names: DiscoveryNames,
+) -> NameTable:
+	match names:
+		SeededTableOnly:
+			program_names
+		AccumulatedTable(table):
+			table
 
 
 ---
@@ -197,22 +212,24 @@ far, so every file discovery walks contributes to the same running table.
 ---
 private pure func discover_frontend_source(
 	candidate: FrontendSourceCandidate,
-	names: NameTable,
-) -> (DiscoveredFrontendSource, NameTable):
-	(program, next_names) = match candidate.input:
+	names: DiscoveryNames,
+) -> (DiscoveredFrontendSource, DiscoveryNames):
+	(program, next_table) = match candidate.input:
 		RawFrontendSource(source):
-			(parsed, parsed_names) = parse_compiler_source_with_names(source, names)
+			(parsed, parsed_names) = parse_compiler_source_with_names(
+				source,
+				discovery_names_table(names),
+			)
 			-- Interpolation holes may add spellings after the file's own lex; the
 			-- finalize step returns the table extended with them.
 			finalized_typecheck_program_with_names(parsed, parsed_names)
-		FinalizedFrontendSource(finalized_program):
-			(retained, adopted_names) = finalized_source_with_names(finalized_program, names)
+		FinalizedFrontendSource(retained, program_names):
 			-- Whatever ids the program carries, fold its declared spellings into the
 			-- compilation table for the typechecker's by-spelling lookups.
 			(
 				retained,
 				name_table_with_declared_names(
-					adopted_names,
+					names_after_finalized_source(program_names, names),
 					[finalized_typecheck_program_ast(retained)],
 				),
 			)
@@ -226,7 +243,7 @@ private pure func discover_frontend_source(
 				surface = module_surface_for_program(finalized_typecheck_program_ast(program))
 			}
 		},
-		next_names,
+		AccumulatedTable(next_table),
 	)
 
 
@@ -274,7 +291,7 @@ func frontend_graph_discover(
 	load: (FrontendSourceLocation) -> Result[SourceFile, String],
 ) -> Result[FrontendGraph, FrontendDiscoveryError]:
 	var discovered: List[DiscoveredFrontendSource] = []
-	var names: NameTable = SYNTHESIZED_NAME_TABLE
+	var names: DiscoveryNames = SeededTableOnly
 
 	for candidate in roots.concat(seed_modules):
 		(discovered_source, next_names) = discover_frontend_source(candidate, names)
@@ -366,7 +383,12 @@ func frontend_graph_discover(
 			modules = discovered.map(func(source): source.module)
 			root_identities = roots.map(func(root): root.identity)
 
-			match validated_frontend_graph_for_modules(modules, root_identities, edges, names):
+			match validated_frontend_graph_for_modules(
+				modules,
+				root_identities,
+				edges,
+				discovery_names_table(names),
+			):
 				Ok(graph):
 					Ok(graph)
 				Err(errors):

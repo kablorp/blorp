@@ -3,13 +3,16 @@ import:
 	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedImportPathRewrite,
-		finalized_typecheck_program,
+		finalized_typecheck_program_with_single_file_names,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_rewrite_import_paths,
-	../../src/compiler/stage_04_modules/frontend_graph: frontend_graph_root_modules
+	../../src/compiler/stage_02_lex/name_table: name_table_find_id
+	../../src/compiler/stage_04_modules/frontend_graph:
+		frontend_graph_name_table,
+		frontend_graph_root_modules,
 	../../src/compiler/stage_04_modules/frontend_graph_service:
 		FrontendSourceCandidate,
-		FrontendSourceInput(FinalizedFrontendSource),
+		FrontendSourceInput(FinalizedFrontendSource, RawFrontendSource),
 		FrontendSourceResolution(FrontendSourceUnresolved),
 	../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(UserModule),
@@ -84,7 +87,9 @@ func test_source_graph_setup_rejects_conflicting_project_contexts() -> Bool:
 --- reparsing the original text and silently losing the canonical path.
 func test_finalized_root_retains_rewritten_import_path() -> Bool:
 	source = source_file("/workspace/root.brp", "root", "import:\n\trequested\n\nVALUE = 1\n")
-	program = finalized_typecheck_program(parse_compiler_source(source))
+	(program, program_names) = finalized_typecheck_program_with_single_file_names(
+		parse_compiler_source(source),
+	)
 	rewritten = finalized_typecheck_program_rewrite_import_paths(
 		program,
 		source.path,
@@ -100,7 +105,7 @@ func test_finalized_root_retains_rewritten_import_path() -> Bool:
 	)
 	root: FrontendSourceCandidate = {
 		identity = resolved_module_identity_from_resolver("root", UserModule),
-		input = FinalizedFrontendSource(rewritten)
+		input = FinalizedFrontendSource(rewritten, program_names)
 	}
 
 	match (
@@ -131,12 +136,15 @@ func test_finalized_root_retains_rewritten_import_path() -> Bool:
 --- a stale identity after a compiler-owned transformation.
 func test_finalized_root_identity_comes_from_program_source() -> Bool:
 	program_source = source_file("/workspace/program_root.brp", "program_root", "VALUE = 1\n")
-	finalized = finalized_typecheck_program(parse_compiler_source(program_source))
+	(finalized, finalized_names) = finalized_typecheck_program_with_single_file_names(
+		parse_compiler_source(program_source),
+	)
 	stale_root: CliParsedSourceFile = {
 		path = "/workspace/stale_root.brp",
 		module_name = "stale_root",
 		source_text = "STALE = 0\n",
-		typecheck_program = finalized
+		typecheck_program = finalized,
+		typecheck_names = finalized_names
 	}
 	setup = source_graph_setup_for_paths(check_action(stale_root.path), [stale_root.path])
 
@@ -157,6 +165,68 @@ func test_finalized_root_identity_comes_from_program_source() -> Bool:
 					False
 
 
+--- A finalized root arrives with the table it was finalized against, so
+--- discovery adopts it rather than parsing the root's text again, but only
+--- while no other file has extended the accumulator. This discovers
+--- `preceding_texts` as raw roots first, then a finalized root whose only
+--- interpolation-hole spelling (a lambda parameter) `hole_only_marker` no other
+--- file lexes, and reports whether the graph's name table has that spelling.
+func finalized_root_hole_spelling_is_published(preceding_texts: List[String]) -> Bool:
+	-- The hole's `$` and `{` are spliced so this file does not interpolate them.
+	hole: String = "$" + "{[1].map(func(hole_only_marker): hole_only_marker)}"
+	source = source_file(
+		"/workspace/hole_root.brp",
+		"hole_root",
+		"pure func label() -> String:\n\t\"" + hole + "\"\n",
+	)
+	(program, program_names) = finalized_typecheck_program_with_single_file_names(
+		parse_compiler_source(source),
+	)
+	finalized_root: FrontendSourceCandidate = {
+		identity = resolved_module_identity_from_resolver("hole_root", UserModule),
+		input = FinalizedFrontendSource(program, program_names)
+	}
+	var roots: List[FrontendSourceCandidate] = []
+	var index: Int = 0
+
+	for text in preceding_texts:
+		module_name = "preceding_" + index.to_string()
+		roots = roots.append({
+			identity = resolved_module_identity_from_resolver(module_name, UserModule),
+			input = RawFrontendSource(source_file("/workspace/" + module_name + ".brp", module_name, text))
+		})
+		index += 1
+
+	match frontend_graph_discover(
+		roots.append(finalized_root),
+		[],
+		func(_importer, _requested_path): Ok(FrontendSourceUnresolved),
+		func(_location): Err("not reached"),
+	):
+		Err(_):
+			False
+		Ok(graph):
+			name_table_find_id(frontend_graph_name_table(graph), "hole_only_marker").is_some()
+
+
+func test_finalized_root_table_keeps_interpolation_hole_spellings() -> Bool:
+	finalized_root_hole_spelling_is_published([])
+
+
+--- A raw file that added no spelling still leaves the accumulator in the
+--- `AccumulatedTable` state, so a finalized root after it keeps ids from its own
+--- table and its hole spelling is not published. This pins the documented
+--- non-first-root limitation (docs/NAME_ID_ROADMAP.md, Interim states); flip
+--- it when the CLI threads one table through every root.
+func test_finalized_root_after_a_raw_file_without_new_spellings_is_not_adopted() -> Bool:
+	not finalized_root_hole_spelling_is_published([""])
+
+
+--- Same limitation, after a raw file that did add spellings.
+func test_finalized_root_after_a_raw_file_with_new_spellings_is_not_adopted() -> Bool:
+	not finalized_root_hole_spelling_is_published(["preceding_only_spelling = 1\n"])
+
+
 tests: TestSuite = {
 	description = "Shared source graph context",
 	tests = [
@@ -167,6 +237,18 @@ tests: TestSuite = {
 		(
 			"retains finalized root import rewrites",
 			test_finalized_root_retains_rewritten_import_path,
+		),
+		(
+			"keeps interpolation-hole spellings for a finalized root",
+			test_finalized_root_table_keeps_interpolation_hole_spellings,
+		),
+		(
+			"does not adopt a finalized root's table after a raw file without new spellings",
+			test_finalized_root_after_a_raw_file_without_new_spellings_is_not_adopted,
+		),
+		(
+			"does not adopt a finalized root's table after a raw file with new spellings",
+			test_finalized_root_after_a_raw_file_with_new_spellings_is_not_adopted,
 		),
 		(
 			"derives finalized root identity from program source",
