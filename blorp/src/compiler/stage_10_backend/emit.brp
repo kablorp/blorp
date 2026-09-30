@@ -8006,6 +8006,26 @@ private pure func render_list_construct_append_body(
 	})
 
 
+---
+Copies an already-rendered struct value into slot `index` of an inline struct
+list. `blorp_list_set_raw_copy` takes the element's address, so the value is
+first bound to a block-local C variable.
+---
+private pure func inline_struct_list_write_statement(
+	list_name: String,
+	index: Int,
+	c_type: String,
+	value_c: String,
+	emission_context: FunctionEmissionContext,
+) -> String:
+	elem_name: String = "__lst_elem_" + index.to_string()
+	resolved_c_type: String = TypeLayout.resolved_inline_struct_c_type(
+		c_type,
+		selected_type_symbol_lookup(emission_context.symbol_authority),
+	)
+	emission_context.indent + "{ " + resolved_c_type + " " + elem_name + " = " + value_c + "; blorp_list_set_raw_copy(" + list_name + ", " + index.to_string() + ", &" + elem_name + "); }\n"
+
+
 private pure func render_inline_struct_list_write(
 	list_name: String,
 	index: Int,
@@ -8014,15 +8034,40 @@ private pure func render_inline_struct_list_write(
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
 	value_c ?= emit_simple_expr(value.value, emission_context)
-	elem_name: String = "__lst_elem_" + index.to_string()
-	resolved_c_type: String = TypeLayout.resolved_inline_struct_c_type(
-		c_type,
-		selected_type_symbol_lookup(emission_context.symbol_authority),
-	)
+	Some(inline_struct_list_write_statement(list_name, index, c_type, value_c, emission_context))
 
-	Some(
-		emission_context.indent + "{ " + resolved_c_type + " " + elem_name + " = " + value_c + "; blorp_list_set_raw_copy(" + list_name + ", " + index.to_string() + ", &" + elem_name + "); }\n",
-	)
+
+---
+Statement-context counterpart of `render_inline_struct_list_write`. The
+expression form only accepts elements `emit_simple_expr` can render, and a
+multi-field struct whose fields can execute code or allocate (a call, an
+arithmetic or negated field) is not simple because C leaves constructor
+argument order unspecified. Emitting the element as a scoped body keeps the
+field-ordering contract of `emit_record_construct_body` and lets such
+elements be written inline instead of rejecting the whole function.
+---
+private pure func render_inline_struct_list_write_body(
+	list_name: String,
+	index: Int,
+	c_type: String,
+	value: CoreBoxedStorageValue,
+	next_temp: Int,
+	emission_context: FunctionEmissionContext,
+) -> Option[FunctionBodyC]:
+	value_body ?= emit_scoped_expr_value("list_elem", value.value, next_temp, emission_context)
+
+	Some({
+		statements = value_body.statements + inline_struct_list_write_statement(
+			list_name,
+			index,
+			c_type,
+			value_body.value,
+			emission_context,
+		),
+		value = "",
+		next_temp = value_body.next_temp,
+		returns = False,
+	})
 
 
 private pure func emit_allocated_list_construct(
@@ -8133,15 +8178,17 @@ private pure func emit_allocated_list_construct_body(
 		InlineStructListStorage(c_type):
 			for value in construct.elements:
 				if not failed:
-					match render_inline_struct_list_write(
+					match render_inline_struct_list_write_body(
 						list_name,
 						index,
 						c_type,
 						value,
+						temp_index,
 						emission_context,
 					):
-						Some(statement):
-							statements += statement
+						Some(value_body):
+							statements += value_body.statements
+							temp_index = value_body.next_temp
 						None:
 							failed = True
 							break

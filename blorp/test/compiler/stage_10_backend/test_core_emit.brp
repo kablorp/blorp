@@ -9330,6 +9330,71 @@ pure func statement_value_list_construct_function() -> CoreFunction:
 	}
 
 
+pure func statement_field_point_element(count_expr: CoreExpr, offset: Int) -> CoreBoxedStorageValue:
+	{
+		kind = StructBox("Point"),
+		value = RecordConstructExpr(
+			"Point",
+			[
+				{
+					ref = core_field_ref(0),name = "x",
+					value = UnaryExpr(NegateOp, count_expr, int_type(), synthetic_core_source_loc())
+				},
+				{
+					ref = core_field_ref(0),name = "y",
+					value = BinaryExpr(
+						SubtractOp,
+						count_expr,
+						LiteralExpr(IntLiteral(offset), int_type(), synthetic_core_source_loc()),
+						int_type(),
+						synthetic_core_source_loc(),
+					)
+				},
+			],
+			point_type(),
+			synthetic_core_source_loc(),
+		),
+		needs_release = False,
+		transfers_ownership = False
+	}
+
+
+---
+An inline struct list element whose fields can execute code: a multi-field
+constructor with a negated or computed field is not a simple C expression,
+so the statement-context list construct must emit it as a scoped body.
+---
+pure func statement_field_point_list_construct_function() -> CoreFunction:
+	count_expr: CoreExpr = VarExpr(named_var("count"), int_type(), synthetic_core_source_loc())
+	{
+		name = "statement_field_point_list",
+		source_module = None,
+		type_params = [],
+		params = [int_param("count")],
+		return_type = list_point_type(),
+		body = Some(
+			ListConstructExpr(
+				{
+					layout = InlineStructListStorage("Point"),
+					elements = [
+						statement_field_point_element(count_expr, 2),
+						statement_field_point_element(count_expr, 3),
+					],
+					elem_needs_release = False
+				},
+				list_point_type(),
+				synthetic_core_source_loc(),
+			),
+		),
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 1272,
+		loc = synthetic_core_source_loc()
+	}
+
+
 pure func nullable_option_statement_list_function() -> CoreFunction:
 	{
 		name = "some_statement_list",
@@ -15432,6 +15497,37 @@ pure func test_emit_statement_list_call_argument() -> Bool:
 		and artifact.c_code.contains("__lst = blorp_list_append_owned(__lst, __list_elem_0);")
 		and artifact.c_code.contains("consume_strings(brp_vt_5uFzovh2zo4_b0);")
 		and artifact.c_code.contains("blorp_release(brp_vt_5uFzovh2zo4_b0);")
+	)
+
+
+pure func test_emit_statement_field_inline_struct_list_element() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			ValueRecordDecl(point_record_decl()),
+			FunctionDecl(statement_field_point_list_construct_function()),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+	-- Fields are materialized in source order and each element is written
+	-- only after its own fields, so the C must appear in exactly this order.
+	first_x_index: Option[Int] = artifact.c_code.index_of("long __record_field_1 = (-count);")
+	first_y_index: Option[Int] = artifact.c_code.index_of("long __record_field_2 = (count - 2);")
+	first_write_index: Option[Int] = artifact.c_code.index_of(
+		"{ Point __lst_elem_0 = __list_elem_4; blorp_list_set_raw_copy(__lst_0, 0, &__lst_elem_0); }",
+	)
+	second_y_index: Option[Int] = artifact.c_code.index_of("long __record_field_6 = (count - 3);")
+	second_write_index: Option[Int] = artifact.c_code.index_of(
+		"{ Point __lst_elem_1 = __list_elem_8; blorp_list_set_raw_copy(__lst_0, 1, &__lst_elem_1); }",
+	)
+
+	(
+		not artifact.c_code.contains("could not emit function body")
+		and option_int_less_than(first_x_index, first_y_index)
+		and option_int_less_than(first_y_index, first_write_index)
+		and option_int_less_than(first_write_index, second_y_index)
+		and option_int_less_than(second_y_index, second_write_index)
 	)
 
 
@@ -28311,6 +28407,10 @@ tests: TestSuite = {
 			test_emit_nullable_option_statement_list_payload,
 		),
 		("emit statement list call argument", test_emit_statement_list_call_argument),
+		(
+			"emit statement field inline struct list element",
+			test_emit_statement_field_inline_struct_list_element,
+		),
 		("emit statement tuple elements", test_emit_statement_tuple_elements),
 		("emit nullable option constructor match", test_emit_nullable_option_constructor_match),
 		(
