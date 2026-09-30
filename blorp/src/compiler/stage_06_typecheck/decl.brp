@@ -250,10 +250,12 @@ import:
 		impl_id_module_id,
 		impl_id_name,
 		impl_id_source_span,
+		trait_id_compiler_identity,
 		trait_id_definition_id,
 		trait_id_module_id,
 		trait_id_name,
 		trait_id_source_span,
+		trait_id_spelling,
 	type_system/trait_identity:
 		EXIT_STATUS_TRAIT_NAME,
 		TraitId,
@@ -3363,13 +3365,7 @@ private pure func prepare_accepted_trait_header(
 								trait_topology_header_parameters(
 									header,
 								).map(trait_type_parameter_name),
-								trait_topology_header_supertraits(
-									header,
-								).map(
-									func(
-										supertrait_id,
-									): trait_id_name(definition_table, supertrait_id),
-								),
+								trait_topology_header_supertraits(header),
 								methods,
 								Some(module_path),
 							)
@@ -4077,7 +4073,6 @@ private pure func prepare_accepted_implementation_header(
 										instance = impl_instance_with_methods(
 											definition_id,
 											trait_id,
-											trait_id_name(definition_table, trait_id),
 											canonical_for_type,
 											implementation_bound_type_params(
 												definition_table,
@@ -4795,6 +4790,12 @@ private pure func check_mutable_global_startup_work(
 				"top-level initializer '" + typecheck_state_identifier_text(state, var_decl.name) + "' cannot call function '" + call_name + "'",
 			)
 
+		if scan.has_subscript_read:
+			next = typecheck_state_add_error(
+				next,
+				"top-level initializer '" + typecheck_state_identifier_text(state, var_decl.name) + "' cannot use a subscript expression",
+			)
+
 		if scan.has_subscript_assignment:
 			next = typecheck_state_add_error(
 				next,
@@ -4999,30 +5000,40 @@ private pure func impl_validate_supertraits(
 	state: TypecheckState,
 	impl_decl: ParsedImplDecl,
 	for_type: SemanticType,
-	supertraits: List[String],
+	supertraits: List[TraitId],
 ) -> TypecheckState:
 	var next = state
 
 	for supertrait in supertraits:
-		has_evidence = match typecheck_find_trait(next, supertrait):
-			Some(supertrait_def):
-				typecheck_has_direct_trait_evidence(
-					next,
-					trait_obligation(for_type, supertrait_def.trait_id),
-				)
+		-- Header supertrait ids name the graph declaration; obligations compare the
+		-- compiler builtin's id for a canonical prelude trait.
+		obligation_trait = match typecheck_state_definition_table(next):
+			Some(table):
+				trait_id_compiler_identity(table, supertrait)
 			None:
-				False
+				supertrait
 
-		if not has_evidence:
-			next = typecheck_state_add_error(
-				next,
-				impl_error_message(
-					state,
-					impl_decl,
-					for_type,
-					"supertrait '" + supertrait + "' is not implemented",
-				),
-			)
+		if not typecheck_has_direct_trait_evidence(
+			next,
+			trait_obligation(for_type, obligation_trait),
+		):
+			message = match trait_id_spelling(
+				next.env,
+				typecheck_state_definition_table(next),
+				[],
+				supertrait,
+			):
+				Some(supertrait_name):
+					impl_error_message(
+						state,
+						impl_decl,
+						for_type,
+						"supertrait '" + supertrait_name + "' is not implemented",
+					)
+				None:
+					"internal typecheck error: a supertrait of the implemented trait has no known spelling"
+
+			next = typecheck_state_add_error(next, message)
 
 	next
 

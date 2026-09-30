@@ -2209,6 +2209,11 @@ func compare_and_print[T: Orderable + Stringable](a: T, b: T) -> Void:
         print("${to_string(a)} > ${to_string(b)}")
 ```
 
+A trait you declare is its own trait, even when it shares a name with a standard
+one: a user `Addable` is not the prelude `Addable`, so bounding a type parameter
+by it does not make `+` available. Use the prelude trait, or implement it for the
+type.
+
 ### Standard Traits
 
 | Trait | Required Functions | Description |

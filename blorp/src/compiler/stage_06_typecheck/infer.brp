@@ -369,6 +369,7 @@ import:
 		env_get_record,
 		env_get_trait,
 		env_get_trait_by_id,
+		env_get_type_param_bound_identities,
 		env_get_type_decl,
 		env_get_type_kind,
 		env_get_type_params,
@@ -4500,9 +4501,11 @@ private pure func startup_call_name(callee: TypedExpr, info: TypedExprInfo) -> S
 ---
 What a typed initializer runs at startup.
 
-Subscript reads need no flag: the source-AST finalize pass rewrites every read
-into a `checked_get` call (or another `checked_*` builtin) before typechecking,
-so a read appears in `call_names` as that call. Subscript assignments are
+A subscript read appears in `call_names` as the `checked_get` call (or another
+`checked_*` builtin) the source-AST finalize pass rewrites it to before
+typechecking. A `TypedSubscriptExpr` that reaches the scan anyway means that
+rewrite was skipped, and sets `has_subscript_read` so the assumption fails as a
+compile error instead of being accepted silently. Subscript assignments are
 different: only `name[i] = v` on a plain local name lowers to a `checked_set`
 call, during inference. An assignment whose root is not a plain name
 (`record.field[i] = v`) or whose target differs from the assigned name stays a
@@ -4510,12 +4513,14 @@ call, during inference. An assignment whose root is not a plain name
 ---
 record TypedStartupWorkScan {
 	call_names: List[String],
+	has_subscript_read: Bool,
 	has_subscript_assignment: Bool
 }
 
 
 private STARTUP_WORK_SCAN_EMPTY: TypedStartupWorkScan = {
 	call_names = [],
+	has_subscript_read = False,
 	has_subscript_assignment = False
 }
 
@@ -4523,12 +4528,21 @@ private STARTUP_WORK_SCAN_EMPTY: TypedStartupWorkScan = {
 private pure func startup_work_scan_call(name: String) -> TypedStartupWorkScan:
 	{
 		call_names = [name],
+		has_subscript_read = False,
 		has_subscript_assignment = False
 	}
 
 
+private STARTUP_WORK_SCAN_SUBSCRIPT_READ: TypedStartupWorkScan = {
+	call_names = [],
+	has_subscript_read = True,
+	has_subscript_assignment = False
+}
+
+
 private STARTUP_WORK_SCAN_SUBSCRIPT_ASSIGNMENT: TypedStartupWorkScan = {
 	call_names = [],
+	has_subscript_read = False,
 	has_subscript_assignment = True
 }
 
@@ -4544,6 +4558,7 @@ private pure func append_startup_work_scan(
 
 	{
 		call_names = call_names,
+		has_subscript_read = left.has_subscript_read or right.has_subscript_read,
 		has_subscript_assignment = left.has_subscript_assignment or right.has_subscript_assignment
 	}
 
@@ -4692,8 +4707,11 @@ pure func typed_expr_startup_work_scan(expr: TypedExpr) -> TypedStartupWorkScan:
 			typed_expr_startup_work_scan(value)
 		TypedSubscriptExpr(receiver, indices, _, _):
 			append_startup_work_scan(
-				typed_expr_startup_work_scan(receiver),
-				typed_expr_list_startup_work_scan(indices),
+				append_startup_work_scan(
+					typed_expr_startup_work_scan(receiver),
+					typed_expr_list_startup_work_scan(indices),
+				),
+				STARTUP_WORK_SCAN_SUBSCRIPT_READ,
 			)
 		TypedSubscriptAssignExpr(_, receiver, indices, value, _, _):
 			with_indices = append_startup_work_scan(
@@ -6453,6 +6471,27 @@ private pure func tensor_arithmetic_satisfies_trait(
 			False
 
 
+---
+Extra help for a missing operator bound when the parameter is bounded by a trait
+that only shares the operator trait's spelling: a user trait is a different trait
+from the prelude one and does not satisfy the operator. Empty otherwise.
+---
+private pure func same_spelling_trait_help(
+	context: InferContext,
+	parameter_name: String,
+	trait_name: String,
+	trait_id: TraitId,
+) -> String:
+	lookalike = env_get_type_param_bound_identities(context.state.env, parameter_name).any(
+		func(bound): bound.name == trait_name and not trait_ids_equal(bound.trait_id, trait_id),
+	)
+
+	if lookalike:
+		"\n    help: '" + trait_name + "' here is your module's trait, not the prelude " + trait_name + "; use the prelude trait or implement it for " + parameter_name
+	else:
+		""
+
+
 private pure func check_arithmetic_binary_op(
 	context: InferContext,
 	op: ParsedBinaryOp,
@@ -6505,7 +6544,12 @@ private pure func check_arithmetic_binary_op(
 								context,
 								"Type parameter '" + left_name + "' requires " + trait_name + " bound for " + binary_op_symbol(
 									op,
-								) + " operator",
+								) + " operator" + same_spelling_trait_help(
+									context,
+									left_name,
+									trait_name,
+									trait_id,
+								),
 							)
 							checked_type(next, TYPE_VOID)
 					_:

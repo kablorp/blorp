@@ -1,5 +1,5 @@
 import:
-	fixtures/trait_identity_fixture: test_trait_id
+	fixtures/trait_identity_fixture: test_trait_id, test_trait_ids_equal
 	../../../src/compiler/stage_02_lex/name_table:
 		NameTable,
 		name_id_index,
@@ -356,10 +356,12 @@ import:
 		accepted_semantic_catalog_union_table,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
 		AcceptedImplementationTableRecord,
+		AcceptedTraitImplementationAuthority,
 		AcceptedTraitTableRecord,
 		accepted_find_qualified_trait_method_info,
 		accepted_has_direct_trait_evidence,
 		accepted_implementation_candidate_count,
+		accepted_trait_id_for_spelling,
 		accepted_qualified_trait_implementation_method,
 		accepted_qualified_trait_method_signature,
 		accepted_resolve_trait_id_obligation,
@@ -564,11 +566,11 @@ pure func main_signature_test_state() -> TypecheckState:
 	)
 	with_int_impl = env_add_impl(
 		with_trait,
-		impl_instance(9001, test_trait_id("ExitStatusAble"), "ExitStatusAble", TYPE_INT, [], True),
+		impl_instance(9001, test_trait_id("ExitStatusAble"), TYPE_INT, [], True),
 	)
 	with_void_impl = env_add_impl(
 		with_int_impl,
-		impl_instance(9002, test_trait_id("ExitStatusAble"), "ExitStatusAble", TYPE_VOID, [], True),
+		impl_instance(9002, test_trait_id("ExitStatusAble"), TYPE_VOID, [], True),
 	)
 	{ base | env = with_void_impl }
 
@@ -3113,7 +3115,7 @@ func test_ambient_tuple_module_registers_impls_without_source_import() -> Bool:
 		.map(
 			func(
 				authority,
-			): accepted_implementation_candidate_count(authority, "AmbientTupleTrait"),
+			): candidate_count_for_trait(authority, "AmbientTupleTrait"),
 		)
 		.get_or(0)
 
@@ -3551,7 +3553,7 @@ private func accepted_trait_table_validation_is_owner_safe() -> Option[Bool]:
 		and accepted_resolve_trait_obligation(
 			authority,
 			base_state.env,
-			trait_obligation(TYPE_INT, test_trait_id("Equatable")),
+			trait_obligation(TYPE_INT, id),
 		) == TraitObligationUnsatisfied
 		and accepted_trait_implementation_table({
 			module_table = owner_table,
@@ -3649,6 +3651,39 @@ func test_accepted_impl_type_params_include_dimension_parameters() -> Bool:
 	])
 
 	params == "T:Showable|Showable,#N:|"
+
+
+-- Obligations are keyed by trait identity: a user trait that shares the
+-- builtin Equatable's spelling neither hides the builtin nor inherits its
+-- implementations.
+func test_obligations_distinguish_a_user_trait_from_the_builtin_of_the_same_name() -> Bool:
+	result = typecheck_test_program(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program_for_module("shapes", [trait_decl("Equatable")]),
+	)
+	authority = module_view_accepted_trait_implementation_authority(result.state.module_view)
+
+	match authority.and_then(func(value): accepted_trait_find(value, "Equatable")):
+		Some(user_trait):
+			match authority:
+				Some(value):
+					(
+						result.state.errors.is_empty()
+						and accepted_resolve_trait_obligation(
+							value,
+							result.state.env,
+							trait_obligation(TYPE_INT, TRAIT_ID_EQUATABLE),
+						) == TraitObligationSatisfied
+						and accepted_resolve_trait_obligation(
+							value,
+							result.state.env,
+							trait_obligation(TYPE_INT, user_trait.trait_id),
+						) == TraitObligationUnsatisfied
+					)
+				None:
+					False
+		None:
+			False
 
 
 func test_accepted_trait_table_validation_is_owner_safe() -> Bool:
@@ -3934,7 +3969,7 @@ private func accepted_trait_method_lookup_preserves_exact_identity() -> Option[B
 					child_trait_id,
 					"Renderable",
 					[],
-					["BaseRenderable"],
+					[base_trait_id],
 					[],
 					Some(owner_path),
 				)
@@ -4312,7 +4347,6 @@ private func accepted_table_rejects_mismatched_method_identity() -> Option[Bool]
 	instance = impl_instance_with_methods(
 		impl_id_definition_id(implementation_id),
 		trait_id,
-		trait_id_name(definition_table, trait_id),
 		TYPE_INT,
 		[],
 		[correct_method],
@@ -5491,6 +5525,21 @@ func test_opaque_alias_records_type_home() -> Bool:
 			False
 
 
+---
+How many accepted implementations are candidates for the trait spelled
+`trait_name` as the authority sees it; zero when it sees no such trait.
+---
+private pure func candidate_count_for_trait(
+	authority: AcceptedTraitImplementationAuthority,
+	trait_name: String,
+) -> Int:
+	match accepted_trait_id_for_spelling(authority, trait_name):
+		Some(trait_id):
+			accepted_implementation_candidate_count(authority, trait_id)
+		None:
+			0
+
+
 private pure func accepted_callable_entry(state: TypecheckState, name: String) -> Option[OverloadEntry]:
 	match module_view_accepted_callable_authority(state.module_view):
 		Some(authority):
@@ -5791,7 +5840,11 @@ func test_registers_trait_definition_and_method_bindings() -> Bool:
 					False
 
 			(
-				trait_def.supertraits == ["Base"]
+				match authority.and_then(func(value): accepted_trait_find(value, "Base")):
+					Some(base_def):
+						test_trait_ids_equal([base_def.trait_id], trait_def.supertraits)
+					None:
+						False
 				and trait_def.type_params.length() == 1
 				and type_param_ok
 				and method_ok
@@ -6763,7 +6816,7 @@ func test_typecheck_program_runs_full_decl_pipeline() -> Bool:
 	accepted_impl_count = module_view_accepted_trait_implementation_authority(
 		result.state.module_view,
 	)
-		.map(func(authority): accepted_implementation_candidate_count(authority, "Display"))
+		.map(func(authority): candidate_count_for_trait(authority, "Display"))
 		.get_or(0)
 
 	(
@@ -6830,7 +6883,7 @@ func test_conflicting_accepted_implementation_is_not_indexed() -> Bool:
 	accepted_impl_count = module_view_accepted_trait_implementation_authority(
 		result.state.module_view,
 	)
-		.map(func(authority): accepted_implementation_candidate_count(authority, "ConflictTrait"))
+		.map(func(authority): candidate_count_for_trait(authority, "ConflictTrait"))
 		.get_or(0)
 
 	(
@@ -9128,6 +9181,10 @@ tests: TestSuite = {
 		(
 			"accepted impl type params include dimension parameters",
 			test_accepted_impl_type_params_include_dimension_parameters,
+		),
+		(
+			"obligations distinguish a user trait from the builtin of the same name",
+			test_obligations_distinguish_a_user_trait_from_the_builtin_of_the_same_name,
 		),
 		(
 			"accepted trait table validation is owner safe",
