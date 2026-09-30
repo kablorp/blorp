@@ -7,10 +7,14 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNNER = REPO_ROOT / "blorp/test/tool/test_compiler_tool_fixtures.py"
+sys.path.insert(0, str(REPO_ROOT / "blorp/test/lib"))
+
+import process_supervisor
 
 
 class CompilerToolFixtureRunnerTests(unittest.TestCase):
@@ -473,6 +477,20 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1)
             self.assertIn("capture limit", result.stdout)
+
+    def test_process_list_timeout_during_sampling_does_not_fail_command(self) -> None:
+        with mock.patch.object(
+            process_supervisor,
+            "owned_processes",
+            side_effect=subprocess.TimeoutExpired(["ps"], 1),
+        ) as sampler:
+            result = process_supervisor.run_command(
+                [sys.executable, "-c", "import time; time.sleep(0.3); print('ok')"], 30
+            )
+
+        sampler.assert_called()
+        self.assertEqual(result.returncode, 0, result.output)
+        self.assertEqual(result.output.strip(), "ok")
 
 
 if __name__ == "__main__":

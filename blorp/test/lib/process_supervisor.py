@@ -17,6 +17,13 @@ CAPTURE_LIMIT_EXIT = 125
 SUPERVISOR_ERROR_EXIT = 126
 DEFAULT_CAPTURE_LIMIT_BYTES = 1024 * 1024
 POLL_INTERVAL_SECONDS = 0.05
+# Descendant sampling runs a machine-wide `ps`, so it happens about once a
+# second rather than on every exit poll. A sample that times out under load is
+# skipped, not fatal: the next sample and the final sweep after exit still
+# record escaped descendants.
+DESCENDANT_SAMPLE_INTERVAL_SECONDS = 1.0
+# `ps` walks every process, which can take several seconds on a loaded machine.
+PROCESS_LIST_TIMEOUT_SECONDS = 5
 TERMINATION_GRACE_SECONDS = 1.0
 LINUX_SET_CHILD_SUBREAPER = 36
 
@@ -33,7 +40,7 @@ def process_children() -> dict[int, list[int]]:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
-        timeout=1,
+        timeout=PROCESS_LIST_TIMEOUT_SECONDS,
         check=False,
     )
     if result.returncode != 0:
@@ -202,20 +209,26 @@ def run_command(
     failure_code: int | None = None
     failure_detail = ""
 
+    next_sample_time = 0.0
     while process.poll() is None:
-        try:
-            descendants.update(
-                owned_processes(
-                    process.pid,
-                    supervisor_pid,
-                    baseline_children,
-                    child_subreaper_enabled,
+        now = time.monotonic()
+        if now >= next_sample_time:
+            try:
+                descendants.update(
+                    owned_processes(
+                        process.pid,
+                        supervisor_pid,
+                        baseline_children,
+                        child_subreaper_enabled,
+                    )
                 )
-            )
-        except (OSError, subprocess.TimeoutExpired, ValueError) as error:
-            failure_code = SUPERVISOR_ERROR_EXIT
-            failure_detail = f"process supervision failed: {error}"
-            break
+            except subprocess.TimeoutExpired:
+                pass  # skipped sample; see DESCENDANT_SAMPLE_INTERVAL_SECONDS
+            except (OSError, ValueError) as error:
+                failure_code = SUPERVISOR_ERROR_EXIT
+                failure_detail = f"process supervision failed: {error}"
+                break
+            next_sample_time = now + DESCENDANT_SAMPLE_INTERVAL_SECONDS
         if capture_exceeded.is_set():
             failure_code = CAPTURE_LIMIT_EXIT
             failure_detail = f"capture limit exceeded ({capture_limit} bytes)"
