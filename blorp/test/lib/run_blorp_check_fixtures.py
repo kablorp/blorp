@@ -12,7 +12,6 @@ from process_supervisor import CAPTURE_LIMIT_EXIT, PROCESS_TIMEOUT_EXIT, run_com
 
 
 MARKER = "-- RUN-BLORP-CHECK"
-PRODUCTION_FIXTURE_COUNT = 63
 
 
 @dataclass
@@ -157,9 +156,9 @@ def main() -> int:
     compiler = Path(args.blorp_bin).resolve()
     roots = [Path(root) for root in args.root] or [Path("blorp/test/compiler")]
     fixtures = discover_fixtures(roots)
+    # scripts/test owns the expected production count and passes it explicitly;
+    # a standalone run checks only that some fixture was found.
     expected_count = args.expected_count
-    if expected_count is None and not args.root:
-        expected_count = PRODUCTION_FIXTURE_COUNT
     if not fixtures:
         print("FAIL: no RUN-BLORP-CHECK fixtures found")
         print(

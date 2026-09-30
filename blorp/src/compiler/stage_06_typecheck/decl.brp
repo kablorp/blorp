@@ -490,7 +490,6 @@ import:
 		typecheck_state_add_diagnostic,
 		typecheck_state_add_error,
 		typecheck_state_add_error_at,
-		typecheck_state_add_private_impl,
 		typecheck_state_add_scoped_trait_function,
 		typecheck_state_allows_foreign,
 		typecheck_state_claim_func_callable_id,
@@ -498,7 +497,6 @@ import:
 		typecheck_state_definition_index,
 		typecheck_state_find_func_callable_id,
 		typecheck_state_find_imported_name,
-		typecheck_state_find_private_impl_conflict,
 		typecheck_state_find_source_definition_id,
 		typecheck_state_find_top_level_name,
 		typecheck_state_find_type_home,
@@ -683,7 +681,6 @@ import:
 		env_add_var_with_details,
 		env_add_var_with_module_details,
 		env_extend_type_param_bounds,
-		env_find_conflicting_impl,
 		env_from_prepared_infer_session,
 		env_from_prepared_module_declarations,
 		env_get_alias,
@@ -698,7 +695,6 @@ import:
 		env_push_scope,
 		env_resolve_trait_obligation,
 		env_symbols_named,
-		env_trait_function_collision,
 		env_trait_methods_with_declaring_trait,
 		func_symbol,
 		impl_instance_with_methods,
@@ -1331,11 +1327,9 @@ private pure func complete_body_outcome_table_from_source_order(
 How function and impl bodies are produced. The reuse variants hold the accepted
 `ImplementationHeaderGraph` because it owns both the callable headers that
 locate independently checked bodies and the impl headers that carry each impl
-body's bound identities; the standalone variant has neither and resolves bounds
-by name (test-only, retired by A2b.4b).
+body's bound identities.
 ---
 private union FunctionBodyMaterialization:
-	InferStandaloneFunctionBodies
 	ReuseSelectedFunctionBodies(BodyOutcomeTable, ImplementationHeaderGraph)
 	ReuseCompleteFunctionBodies(CompleteBodyOutcomeTable, ImplementationHeaderGraph)
 
@@ -2101,22 +2095,6 @@ private pure func param_name_from_parsed(param: ParsedParam) -> Option[String]:
 			None
 
 
-private pure func dim_constraint_from_parsed(
-	constraint: ParsedDimConstraint,
-) -> (SemanticType, SemanticType):
-	(type_from_parsed_type_expr(constraint.left), type_from_parsed_type_expr(constraint.right))
-
-
-private pure func canonical_dim_constraint_from_parsed(
-	state: TypecheckState,
-	constraint: ParsedDimConstraint,
-) -> (SemanticType, SemanticType):
-	(
-		canonical_annotation_type(state, type_from_parsed_type_expr(constraint.left)),
-		canonical_annotation_type(state, type_from_parsed_type_expr(constraint.right)),
-	)
-
-
 private pure func purity_from_parsed(is_pure: Bool) -> Purity:
 	if is_pure:
 		Pure
@@ -2593,16 +2571,6 @@ private pure func typecheck_prescan_graph_program(
 			typecheck_prescan_decls(scoped_state, program.decls)
 
 
-pure func typecheck_register_program_import_decls(
-	state: TypecheckState,
-	program: ParsedProgram,
-) -> TypecheckState:
-	register_program_import_syntax(
-		typecheck_state_scope_to_program(state, program),
-		program,
-	)
-
-
 private pure func claim_global_definition_id(
 	state: TypecheckState,
 	var_decl: ParsedVarDecl,
@@ -2618,105 +2586,6 @@ private pure func claim_global_definition_id(
 			(next, Some(found))
 		DefinitionIdMissing(next):
 			(next, None)
-
-
-private pure func register_var_decl_with_type(
-	state: TypecheckState,
-	module_path: String,
-	var_decl: ParsedVarDecl,
-	var_type: SemanticType,
-	source_type: Option[SemanticType],
-	definition_id: Option[Int],
-) -> TypecheckState:
-	env: Env = env_add_var_with_module_details(
-		state.env,
-		var_decl.name.text,
-		var_type,
-		source_type,
-		var_mutability(var_decl.is_mutable),
-		LetBinding,
-		UNREFINED_BINDING,
-		Some(module_path),
-		definition_id,
-	)
-
-	{ state | env = env }
-
-
-private pure func register_var_decl(
-	state: TypecheckState,
-	module_path: String,
-	var_decl: ParsedVarDecl,
-) -> TypecheckState:
-	(claimed_state, definition_id) = claim_global_definition_id(state, var_decl)
-
-	source_type: Option[SemanticType] = match var_decl.type_expr:
-		Some(type_expr):
-			Some(type_from_parsed_type_expr(type_expr))
-		None:
-			None
-
-	var_type: SemanticType = canonical_annotation_type(
-		claimed_state,
-		type_from_optional_parsed_type_expr(var_decl.type_expr),
-	)
-
-	register_var_decl_with_type(
-		claimed_state,
-		module_path,
-		var_decl,
-		var_type,
-		source_type,
-		definition_id,
-	)
-
-
-private pure func register_function_signature(
-	state: TypecheckState,
-	name: String,
-	params: List[ParsedParam],
-	return_type: SemanticType,
-	type_params: List[ParsedTypeParamDecl],
-	dim_constraints: List[ParsedDimConstraint],
-	is_pure: Bool,
-	annotations: List[ParsedFunctionAnnotation],
-	body: Option[ParsedExpr],
-	span: SourceLocation,
-	module_path: Option[String],
-	origin: FuncOrigin,
-) -> TypecheckState:
-	declared_type_param_names = type_param_names(type_params)
-	param_types: List[SemanticType] = params
-		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
-		.map(
-			func(
-				param_type,
-			): canonical_function_annotation_type(state, declared_type_param_names, param_type),
-		)
-	resolved_return_type: SemanticType = canonical_function_annotation_type(
-		state,
-		declared_type_param_names,
-		return_type,
-	)
-	semantic_dim_constraints: List[(SemanticType, SemanticType)] = dim_constraints.map(
-		func(constraint): canonical_dim_constraint_from_parsed(state, constraint),
-	)
-
-	register_function_signature_with_semantic_types(
-		state,
-		name,
-		params,
-		param_types,
-		resolved_return_type,
-		type_params,
-		semantic_dim_constraints,
-		is_pure,
-		annotations,
-		body,
-		span,
-		module_path,
-		origin,
-	)
 
 
 private pure func type_param_candidate_name_is_valid(name: String) -> Bool:
@@ -2814,65 +2683,6 @@ private record BoundTypeParamsOutcome {
 
 
 ---
-The identity of the trait a source spelling names, found through the
-environment and the state's definition table. Environment lookup is by name, so
-it cannot tell same-named traits of different modules apart: only the test-only
-registration and standalone body paths and the error-recovery signature use it.
-The accepted paths take bound identities from their headers (retired with the
-test-only paths by A2b.4b).
----
-private pure func bound_identity_for_trait_name(
-	state: TypecheckState,
-	trait_name: String,
-) -> Option[BoundTraitIdentity]:
-	table ?= typecheck_state_definition_table(state)
-	definition ?= env_get_trait(state.env, trait_name)
-	Some(bound_trait_identity(table, definition.trait_id))
-
-
----
-The diagnostic for a bound whose trait the environment does not know, with the
-help line every unknown-bound message carries.
----
-private pure func unknown_trait_bound_message(parameter: String, trait_name: String) -> String:
-	(
-		"Type parameter '"
-		+ parameter
-		+ "' has unknown trait bound '"
-		+ trait_name
-		+ "'\n    help: Declare 'trait "
-		+ trait_name
-		+ "' or import it before using it as a bound"
-	)
-
-
----
-One type parameter bounded by the traits spelled in `trait_names`. Each spelling
-resolves through `bound_identity_for_trait_name`; an unresolved one is left out
-of the parameter and reported in the outcome's errors.
----
-private pure func bound_type_param_from_trait_names(
-	state: TypecheckState,
-	parameter: String,
-	trait_names: List[String],
-) -> BoundTypeParamsOutcome:
-	var identities: List[BoundTraitIdentity] = []
-	var errors: List[String] = []
-
-	for trait_name in trait_names:
-		match bound_identity_for_trait_name(state, trait_name):
-			Some(identity):
-				identities = identities.append(identity)
-			None:
-				errors = errors.append(unknown_trait_bound_message(parameter, trait_name))
-
-	{
-		params = [make_resolved_bound_type_param(parameter, identities)],
-		errors = errors
-	}
-
-
----
 Record each message as a typecheck error, in order.
 ---
 private pure func typecheck_state_add_errors(
@@ -2887,23 +2697,21 @@ private pure func typecheck_state_add_errors(
 	next
 
 
+---
+Type parameters for a function signature rebuilt from its annotations during
+error recovery (no accepted signature exists). The declared bounds are left off
+on purpose: the header phase reports an unresolved bound and accepted signatures
+carry each bound's exact identity, so a recovery signature has no identity to
+give them.
+---
 private pure func effective_bound_type_params(
 	state: TypecheckState,
 	declared: List[ParsedTypeParamDecl],
 	func_type: SemanticType,
-) -> BoundTypeParamsOutcome:
-	var result: List[BoundTypeParam] = []
-	var errors: List[String] = []
-
-	for parameter in declared:
-		resolved = bound_type_param_from_trait_names(
-			state,
-			parameter.name.text,
-			parameter.bounds.map(func(bound): bound.text),
-		)
-		result = result.concat(resolved.params)
-		errors = errors.concat(resolved.errors)
-
+) -> List[BoundTypeParam]:
+	var result: List[BoundTypeParam] = declared.map(
+		func(parameter): make_resolved_bound_type_param(parameter.name.text, []),
+	)
 	var seen = result.map(func(param): param.name)
 
 	for name in type_param_candidates(func_type):
@@ -2915,10 +2723,7 @@ private pure func effective_bound_type_params(
 			seen = seen.append(name)
 			result = result.append(make_resolved_bound_type_param(name, []))
 
-	{
-		params = result,
-		errors = errors
-	}
+	result
 
 
 private pure func effective_function_type_params(
@@ -2938,13 +2743,11 @@ private pure func effective_function_type_params(
 		declared_type_param_names,
 		function_decl.return_type,
 	).get_or(TYPE_VOID)
-	-- Unknown bounds are reported where the declaration is registered (or by
-	-- its accepted header), so this recovery signature only drops them.
 	effective_bound_type_params(
 		state,
 		function_decl.type_params,
 		SemanticFunctionType(function_decl.is_pure, param_types, return_type),
-	).params
+	)
 
 
 private pure func function_body_signature_from_annotations(
@@ -3058,130 +2861,6 @@ private pure func loop_producer_from_body(body: Option[ParsedExpr]) -> Option[Lo
 			loop_producer_from_expr(expr)
 		None:
 			None
-
-
----
-Test-only; retired by A2b.4b.
----
-private pure func register_function_signature_with_semantic_types(
-	state: TypecheckState,
-	name: String,
-	params: List[ParsedParam],
-	param_types: List[SemanticType],
-	resolved_return_type: SemanticType,
-	type_params: List[ParsedTypeParamDecl],
-	dim_constraints: List[(SemanticType, SemanticType)],
-	is_pure: Bool,
-	annotations: List[ParsedFunctionAnnotation],
-	body: Option[ParsedExpr],
-	span: SourceLocation,
-	module_path: Option[String],
-	origin: FuncOrigin,
-) -> TypecheckState:
-	source_func_type: SemanticType = SemanticFunctionType(
-		is_pure,
-		param_types,
-		resolved_return_type,
-	)
-	resolved_type_params = effective_bound_type_params(state, type_params, source_func_type)
-	effective_type_params = resolved_type_params.params
-	type_param_names = effective_type_params.map(func(param): param.name)
-	semantic_param_types = param_types.map(
-		func(param): type_instantiate_type_params(type_param_names, param),
-	)
-	semantic_return_type = type_instantiate_type_params(type_param_names, resolved_return_type)
-	func_type: SemanticType = SemanticFunctionType(
-		is_pure,
-		semantic_param_types,
-		semantic_return_type,
-	)
-	semantic_dim_constraints = dim_constraints.map(
-		func(
-			constraint,
-		): (
-			type_instantiate_type_params(type_param_names, constraint[0]),
-			type_instantiate_type_params(type_param_names, constraint[1]),
-		),
-	)
-	with_resource_result = validate_resource_result_annotation(
-		typecheck_state_add_errors(state, resolved_type_params.errors),
-		name,
-		semantic_param_types,
-		semantic_return_type,
-		annotations,
-		body,
-	)
-	with_resource_boundary = validate_resource_signature_boundary(
-		with_resource_result,
-		name,
-		params,
-		semantic_param_types,
-		semantic_return_type,
-		body,
-	)
-	resource_arg_policy = function_resource_arg_policy(
-		with_resource_boundary,
-		semantic_param_types,
-		annotations,
-		body,
-	)
-	loop_producer = loop_producer_from_body(body)
-
-	match claim_callable_id_from_span(with_resource_boundary, name, span):
-		DefinitionIdClaimed(with_id, def_id):
-			register_function_with_id(
-				with_id,
-				def_id,
-				name,
-				func_type,
-				effective_type_params,
-				params,
-				is_pure,
-				origin,
-				resource_arg_policy,
-				module_path,
-				semantic_dim_constraints,
-				loop_producer,
-				annotations,
-			)
-		DefinitionIdMissing(with_error):
-			with_error
-
-
-private pure func register_function_with_id(
-	state: TypecheckState,
-	def_id: Int,
-	name: String,
-	func_type: SemanticType,
-	effective_type_params: List[BoundTypeParam],
-	params: List[ParsedParam],
-	is_pure: Bool,
-	origin: FuncOrigin,
-	resource_arg_policy: ResourceArgPolicy,
-	module_path: Option[String],
-	dim_constraints: List[(SemanticType, SemanticType)],
-	loop_producer: Option[LoopProducer],
-	annotations: List[ParsedFunctionAnnotation],
-) -> TypecheckState:
-	env: Env = env_add_func_with_info(
-		state.env,
-		name,
-		func_symbol(
-			def_id,
-			func_type,
-			effective_type_params,
-			params.map(param_name_from_parsed),
-			purity_from_parsed(is_pure),
-			origin,
-			resource_arg_policy,
-			module_path,
-			dim_constraints,
-			loop_producer,
-			annotations.any(annotation_is_debug_only),
-		),
-	)
-	with_env = { state | env = env }
-	with_env
 
 
 private union CallableHeaderRegistration:
@@ -3575,168 +3254,6 @@ private pure func prepare_accepted_callable_header(
 									}
 
 
-private pure func register_function_decl(
-	state: TypecheckState,
-	function_decl: ParsedFunctionDecl,
-) -> TypecheckState:
-	register_function_signature(
-		state,
-		function_decl.name.text,
-		function_decl.params,
-		type_from_optional_parsed_type_expr(function_decl.return_type),
-		function_decl.type_params,
-		function_decl.dim_constraints,
-		function_decl.is_pure,
-		function_decl.annotations,
-		function_decl.body,
-		function_decl.span,
-		None,
-		UserDefinedFunc,
-	)
-
-
-private pure func register_foreign_function_decl(
-	state: TypecheckState,
-	function_decl: ParsedForeignFunctionDecl,
-) -> TypecheckState:
-	next = if typecheck_state_allows_foreign(state):
-		state
-	else:
-		message: String = if typecheck_state_is_stdlib(state):
-			"'foreign' declarations cannot be used in the standard library"
-		else:
-			"'foreign' declarations cannot be used in source packages"
-
-		typecheck_state_add_error(state, message)
-
-	register_function_signature(
-		next,
-		function_decl.name.text,
-		function_decl.params,
-		type_from_parsed_type_expr(function_decl.return_type),
-		[],
-		[],
-		function_decl.is_pure,
-		function_decl.annotations,
-		None,
-		function_decl.span,
-		None,
-		ForeignFunc,
-	)
-
-
-private pure func add_trait_function_checked(
-	state: TypecheckState,
-	func_name: String,
-	trait_name: String,
-) -> TypecheckState:
-	match env_trait_function_collision(state.env, func_name, trait_name):
-		Some(existing_trait):
-			typecheck_state_add_error(
-				state,
-				"method '" + func_name + "' is already registered under trait '" + existing_trait + "'; cannot also register under '" + trait_name + "'",
-			)
-		None:
-			if env_get_function_trait(state.env, func_name) == Some(trait_name):
-				state
-			else:
-				{ state | env = env_add_trait_function(state.env, func_name, trait_name) }
-
-
-private pure func validate_trait_method_param_types(
-	state: TypecheckState,
-	trait_decl: ParsedTraitDecl,
-) -> TypecheckState:
-	var next = state
-
-	for method in trait_decl.methods:
-		for param in method.params:
-			if param.type_expr.is_none():
-				param_name: String = param_name_from_parsed(param).get_or("_")
-				next = typecheck_state_add_error(
-					next,
-					"trait " + typecheck_state_identifier_text(state, trait_decl.name) + " method '" + typecheck_state_identifier_text(state, method.name) + "': parameter '" + param_name + "' must have an explicit type",
-				)
-
-	next
-
-
----
-Test-only; retired by A2b.4b.
----
-private pure func register_trait_decl(
-	state: TypecheckState,
-	module_path: String,
-	trait_decl: ParsedTraitDecl,
-) -> TypecheckState:
-	next = validate_trait_method_param_types(state, trait_decl)
-
-	match claim_source_id_from_state(
-		next,
-		TraitDefinition,
-		trait_decl.name.text,
-		None,
-		trait_decl.span,
-	):
-		DefinitionIdClaimed(with_id, def_id):
-			register_trait_with_id(with_id, module_path, trait_decl, def_id)
-		DefinitionIdMissing(with_error):
-			with_error
-
-
----
-Register a trait from its parsed declaration alone. Test-only: production
-registers traits from the accepted headers (`AcceptedTraitTableRecord`), which
-carry the header's `TraitId`; nothing outside tests calls this. Here the trait is
-a graph trait whose `TraitId` is the definition id just claimed for it.
-Retired by A2b.4b.
----
-private pure func register_trait_with_id(
-	state: TypecheckState,
-	module_path: String,
-	trait_decl: ParsedTraitDecl,
-	def_id: Int,
-) -> TypecheckState:
-	match graph_trait_id(def_id):
-		Some(trait_id):
-			register_trait_with_identity(state, module_path, trait_decl, def_id, trait_id)
-		None:
-			typecheck_state_add_error(
-				state,
-				"internal typecheck error: trait '" + trait_decl.name.text + "' was claimed a negative definition id",
-			)
-
-
-private pure func register_trait_with_identity(
-	state: TypecheckState,
-	module_path: String,
-	trait_decl: ParsedTraitDecl,
-	def_id: Int,
-	trait_id: TraitId,
-) -> TypecheckState:
-	type_params = type_param_names(trait_decl.type_params)
-	trait_def = trait_def_with_details(
-		def_id,
-		trait_id,
-		trait_decl.name.text,
-		type_params,
-		trait_decl.supertraits.map(func(name): name.text),
-		trait_decl.methods.map(func(method): trait_method_from_parsed(method, type_params)),
-		Some(module_path),
-	)
-	env_with_trait = env_add_trait(state.env, trait_def)
-	var with_trait = { state | env = env_with_trait }
-
-	for method in trait_decl.methods:
-		with_trait = add_trait_function_checked(with_trait, method.name.text, trait_decl.name.text)
-
-	for pair in env_trait_methods_with_declaring_trait(with_trait.env, trait_decl.name.text):
-		if pair[1] != trait_decl.name.text:
-			with_trait = add_trait_function_checked(with_trait, pair[0], pair[1])
-
-	with_trait
-
-
 private union AcceptedTraitRecordClaim:
 	AcceptedTraitRecordClaimed(TypecheckState, AcceptedTraitTableRecord)
 	AcceptedTraitRecordMissing(TypecheckState)
@@ -3982,38 +3499,6 @@ private pure func impl_orphan_error_message(
 			None
 
 
-private pure func impl_conflict_message(instance: ImplInstance) -> String:
-	"conflicting implementation of trait '" + instance.trait_name + "' for type '" + impl_target_label(
-		instance.for_type,
-	) + "'"
-
-
-private pure func add_source_impl_checked(
-	state: TypecheckState,
-	instance: ImplInstance,
-) -> TypecheckState:
-	match env_find_conflicting_impl(state.env, instance):
-		Some(_):
-			typecheck_state_add_error(state, impl_conflict_message(instance))
-		None:
-			{ state | env = env_add_impl(state.env, instance) }
-
-
-private pure func add_private_impl_checked(
-	state: TypecheckState,
-	instance: ImplInstance,
-) -> TypecheckState:
-	match env_find_conflicting_impl(state.env, instance):
-		Some(_):
-			typecheck_state_add_error(state, impl_conflict_message(instance))
-		None:
-			match typecheck_state_find_private_impl_conflict(state, instance):
-				Some(_):
-					typecheck_state_add_error(state, impl_conflict_message(instance))
-				None:
-					typecheck_state_add_private_impl(state, instance)
-
-
 private pure func impl_bound_name_is_candidate(state: TypecheckState, name: String) -> Bool:
 	not is_dimension_parameter_name(name) and not typecheck_state_has_known_type_name(state, name)
 
@@ -4107,55 +3592,14 @@ private pure func impl_type_param_names_for_decl_type(
 
 
 ---
-An impl's type parameters with bounds resolved by trait name through the
-environment. Test-only registration and the standalone body path use this;
-accepted implementations take their bounds from the implementation header
-(`implementation_bound_type_params`). Retired by A2b.4b.
----
-private pure func impl_bounds_for_decl_type(
-	state: TypecheckState,
-	type_expr: ParsedTypeExpr,
-	for_type: SemanticType,
-) -> BoundTypeParamsOutcome:
-	inline_bounds = impl_inline_bounds_from_type_expr(type_expr)
-	var params: List[BoundTypeParam] = []
-	var errors: List[String] = []
-
-	for inline_bound in inline_bounds:
-		resolved = bound_type_param_from_trait_names(
-			state,
-			inline_bound.parameter,
-			inline_bound.trait_names,
-		)
-		params = params.concat(resolved.params)
-		errors = errors.concat(resolved.errors)
-
-	for name in impl_unbounded_type_param_names(
-		state,
-		inline_bounds.map(func(bound): bound.parameter),
-		for_type,
-	):
-		params = params.append(make_resolved_bound_type_param(name, []))
-
-	{
-		params = params,
-		errors = errors
-	}
-
-
----
-An impl's type parameters for its body: from the accepted implementation header
-when the body policy reuses accepted headers, by name otherwise.
+An impl's type parameters for its body, from the accepted implementation header
+that the body policy reuses.
 ---
 private pure func impl_body_bounds(
-	state: TypecheckState,
 	impl_decl: ParsedImplDecl,
-	for_type: SemanticType,
 	function_bodies: FunctionBodyMaterialization,
 ) -> BoundTypeParamsOutcome:
 	match function_bodies:
-		InferStandaloneFunctionBodies:
-			impl_bounds_for_decl_type(state, impl_decl.for_type, for_type)
 		ReuseSelectedFunctionBodies(_, implementation_headers):
 			impl_bounds_from_accepted_headers(implementation_headers, impl_decl)
 		ReuseCompleteFunctionBodies(_, implementation_headers):
@@ -4284,117 +3728,6 @@ private union ImplMethodInfoClaim:
 private union ImplMethodInfosClaim:
 	ImplMethodInfosClaimed(TypecheckState, List[ImplMethodInfo])
 	ImplMethodInfosMissing(TypecheckState)
-
-
----
-Test-only; retired by A2b.4b.
----
-private pure func impl_method_info_from_decl(
-	state: TypecheckState,
-	module_path: String,
-	method: ParsedFunctionDecl,
-) -> ImplMethodInfoClaim:
-	declared_type_param_names = type_param_names(method.type_params)
-	param_types: List[SemanticType] = method.params
-		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
-		.map(
-			func(
-				param_type,
-			): canonical_function_annotation_type(state, declared_type_param_names, param_type),
-		)
-	return_type: SemanticType = canonical_function_annotation_type(
-		state,
-		declared_type_param_names,
-		type_from_optional_parsed_type_expr(method.return_type),
-	)
-	impl_method_info_from_semantic_types(state, module_path, method, param_types, return_type)
-
-
-private pure func impl_method_info_from_semantic_types(
-	state: TypecheckState,
-	module_path: String,
-	method: ParsedFunctionDecl,
-	param_types: List[SemanticType],
-	return_type: SemanticType,
-) -> ImplMethodInfoClaim:
-	func_type: SemanticType = SemanticFunctionType(method.is_pure, param_types, return_type)
-
-	match claim_callable_id_from_span(state, method.name.text, method.span):
-		DefinitionIdMissing(with_error):
-			ImplMethodInfoMissing(with_error)
-		DefinitionIdClaimed(with_id, callable_id):
-			if not typecheck_state_module_path_matches(with_id, module_path):
-				ImplMethodInfoMissing(
-					typecheck_state_add_error(
-						with_id,
-						(
-							"internal typecheck error: implementation method module path does not match its "
-							+ "module ID"
-						),
-					),
-				)
-			else:
-				match typecheck_state_module_id(with_id):
-					None:
-						ImplMethodInfoMissing(
-							typecheck_state_add_error(
-								with_id,
-								"internal typecheck error: implementation method is missing its module ID",
-							),
-						)
-					Some(module_id):
-						resolved_type_params = effective_bound_type_params(
-							with_id,
-							method.type_params,
-							func_type,
-						)
-						info = impl_method_info(
-							method.name.text,
-							Some({callable_id = callable_id}),
-							func_type,
-							resolved_type_params.params,
-							method.params.map(param_name_from_parsed),
-							purity_from_parsed(method.is_pure),
-							function_resource_arg_policy(
-								with_id,
-								param_types,
-								method.annotations,
-								method.body,
-							),
-							method.dim_constraints.map(dim_constraint_from_parsed),
-							method.annotations.any(annotation_is_debug_only),
-						)
-						ImplMethodInfoClaimed(
-							typecheck_state_add_errors(with_id, resolved_type_params.errors),
-							info,
-						)
-
-
----
-Test-only; retired by A2b.4b.
----
-private pure func impl_method_infos_from_decl(
-	state: TypecheckState,
-	module_path: String,
-	methods: List[ParsedFunctionDecl],
-) -> ImplMethodInfosClaim:
-	var result: ImplMethodInfosClaim = ImplMethodInfosClaimed(state, [])
-
-	for method in methods:
-		match result:
-			ImplMethodInfosMissing(_):
-				void
-			ImplMethodInfosClaimed(next, infos):
-				result = match impl_method_info_from_decl(next, module_path, method):
-					ImplMethodInfoMissing(with_error):
-						ImplMethodInfosMissing(with_error)
-					ImplMethodInfoClaimed(with_method, info):
-						ImplMethodInfosClaimed(
-							with_method,
-							infos.append(info),
-						)
-
-	result
 
 
 private pure func implementation_bound_type_params(
@@ -4770,221 +4103,6 @@ private pure func prepare_accepted_implementation_header(
 										)
 									},
 								)
-
-
----
-Test-only; retired by A2b.4b.
----
-private pure func register_impl_decl_with_info(
-	state: TypecheckState,
-	module_path: String,
-	impl_decl: ParsedImplDecl,
-	for_type: SemanticType,
-	method_infos: List[ImplMethodInfo],
-	is_private: Bool,
-) -> TypecheckState:
-	trait_home = impl_orphan_trait_home(state, impl_decl.trait_name.text)
-
-	var next = match impl_orphan_error_message(state, module_path, trait_home, impl_decl, for_type):
-		Some(message):
-			typecheck_state_add_error(state, message)
-		None:
-			state
-
-	match claim_source_id_from_state(
-		next,
-		ImplDefinition,
-		impl_decl.trait_name.text,
-		None,
-		impl_decl.span,
-	):
-		DefinitionIdClaimed(with_id, def_id):
-			register_impl_with_id(with_id, impl_decl, for_type, method_infos, is_private, def_id)
-		DefinitionIdMissing(with_error):
-			with_error
-
-
----
-Register an impl from its parsed declaration alone. Test-only: production
-registers impls from the accepted headers, which carry the header's trait id;
-nothing outside tests calls this. The trait's identity is looked up in the
-environment by name. An impl of a trait the environment does not know cannot
-carry a `TraitId`, so it is reported as an internal error instead of being
-registered. Retired by A2b.4b.
----
-private pure func register_impl_with_id(
-	state: TypecheckState,
-	impl_decl: ParsedImplDecl,
-	for_type: SemanticType,
-	method_infos: List[ImplMethodInfo],
-	is_private: Bool,
-	def_id: Int,
-) -> TypecheckState:
-	match env_get_trait(state.env, impl_decl.trait_name.text):
-		Some(trait_definition):
-			bounds = impl_bounds_for_decl_type(state, impl_decl.for_type, for_type)
-			instance = impl_instance_with_methods(
-				def_id,
-				trait_definition.trait_id,
-				impl_decl.trait_name.text,
-				for_type,
-				bounds.params,
-				method_infos,
-				False,
-			)
-			reported = typecheck_state_add_errors(state, bounds.errors)
-
-			if is_private:
-				add_private_impl_checked(reported, instance)
-			else:
-				add_source_impl_checked(reported, instance)
-		None:
-			typecheck_state_add_error(
-				state,
-				(
-					"internal typecheck error: implementation of unknown trait '"
-					+ impl_decl.trait_name.text
-					+ "' reached test-only registration"
-				),
-			)
-
-
----
-Test-only; retired by A2b.4b.
----
-private pure func register_impl_decl(
-	state: TypecheckState,
-	module_path: String,
-	impl_decl: ParsedImplDecl,
-	is_private: Bool,
-) -> TypecheckState:
-	raw_for_type: SemanticType = canonical_annotation_type(
-		state,
-		type_from_parsed_type_expr(impl_decl.for_type),
-	)
-	for_type: SemanticType = impl_normalize_receiver_type(state, impl_decl.for_type, raw_for_type)
-
-	match impl_method_infos_from_decl(state, module_path, impl_decl.methods):
-		ImplMethodInfosMissing(with_error):
-			with_error
-		ImplMethodInfosClaimed(with_methods, method_infos):
-			register_impl_decl_with_info(
-				with_methods,
-				module_path,
-				impl_decl,
-				for_type,
-				method_infos,
-				is_private,
-			)
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_register_signature_decl(
-	state: TypecheckState,
-	module_path: String,
-	decl: ParsedDecl,
-) -> TypecheckState:
-	match decl:
-		FunctionParsedDecl(function_decl):
-			register_function_decl(state, function_decl)
-		VarParsedDecl(var_decl):
-			register_var_decl(state, module_path, var_decl)
-		ForeignBlockParsedDecl(_, functions, _):
-			var next = state
-
-			for function_decl in functions:
-				next = register_foreign_function_decl(next, function_decl)
-
-			next
-		TraitParsedDecl(trait_decl):
-			register_trait_decl(state, module_path, trait_decl)
-		PrivateParsedDecl(inner, _):
-			typecheck_register_signature_decl(state, module_path, inner)
-		_:
-			state
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_register_signature_decls(
-	state: TypecheckState,
-	module_path: String,
-	decls: List[ParsedDecl],
-) -> TypecheckState:
-	var next = state
-
-	for decl in decls:
-		next = typecheck_register_signature_decl(next, module_path, decl)
-
-	next
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_register_program_signature_decls(
-	state: TypecheckState,
-	program: ParsedProgram,
-) -> TypecheckState:
-	typecheck_register_signature_decls(
-		typecheck_state_scope_to_program(state, program),
-		program.source.module_name,
-		program.decls,
-	)
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_register_impl_decl(
-	state: TypecheckState,
-	module_path: String,
-	decl: ParsedDecl,
-) -> TypecheckState:
-	match decl:
-		ImplParsedDecl(impl_decl):
-			register_impl_decl(state, module_path, impl_decl, False)
-		PrivateParsedDecl(inner, _):
-			match inner:
-				ImplParsedDecl(impl_decl):
-					register_impl_decl(state, module_path, impl_decl, True)
-				_:
-					state
-		_:
-			state
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_register_impl_decls(
-	state: TypecheckState,
-	module_path: String,
-	decls: List[ParsedDecl],
-) -> TypecheckState:
-	var next = state
-
-	for decl in decls:
-		next = typecheck_register_impl_decl(next, module_path, decl)
-
-	next
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_register_program_impl_decls(
-	state: TypecheckState,
-	program: ParsedProgram,
-) -> TypecheckState:
-	typecheck_register_impl_decls(
-		typecheck_state_scope_to_program(state, program),
-		program.source.module_name,
-		program.decls,
-	)
 
 
 private pure func typecheck_register_import_modules_from(
@@ -5687,10 +4805,10 @@ private pure func check_mutable_global_startup_work(
 				"top-level initializer '" + typecheck_state_identifier_text(state, var_decl.name) + "' cannot call function '" + call_name + "'",
 			)
 
-		if scan.has_subscript:
+		if scan.has_subscript_assignment:
 			next = typecheck_state_add_error(
 				next,
-				"top-level initializer '" + typecheck_state_identifier_text(state, var_decl.name) + "' cannot use a subscript expression",
+				"top-level initializer '" + typecheck_state_identifier_text(state, var_decl.name) + "' cannot assign through a subscript",
 			)
 
 		next
@@ -6411,7 +5529,7 @@ private pure func typecheck_materialize_impl_body(
 		type_from_parsed_type_expr(impl_decl.for_type),
 	)
 	for_type: SemanticType = impl_normalize_receiver_type(state, impl_decl.for_type, raw_for_type)
-	resolved_bounds = impl_body_bounds(state, impl_decl, for_type, function_bodies)
+	resolved_bounds = impl_body_bounds(impl_decl, function_bodies)
 	bounds: List[BoundTypeParam] = resolved_bounds.params
 	reported_state = typecheck_state_add_errors(state, resolved_bounds.errors)
 
@@ -6781,14 +5899,6 @@ private pure func typecheck_materialize_function_from_body_policy(
 	function_bodies: FunctionBodyMaterialization,
 ) -> MaterializedFunctionBodyResult:
 	match function_bodies:
-		InferStandaloneFunctionBodies:
-			unvalidated_function_body_result(
-				typecheck_materialize_function_body_with_options(
-					state,
-					function_decl,
-					main_policy,
-				),
-			)
 		ReuseSelectedFunctionBodies(outcomes, implementation_headers):
 			callable_headers = implementation_header_graph_callable_headers(implementation_headers)
 			callable_id = find_callable_id_from_span(
@@ -7000,33 +6110,6 @@ private pure func typecheck_materialize_decl_body(
 				state = state,
 				decl = MaterializedUncheckedDecl(TypedParsedDecl(decl))
 			}
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_check_standalone_program_bodies(
-	state: TypecheckState,
-	program: ParsedProgram,
-) -> TypecheckState:
-	typecheck_materialize_standalone_program_bodies(state, program).state
-
-
----
-Test-only; retired by A2b.4b.
----
-pure func typecheck_materialize_standalone_program_bodies(
-	state: TypecheckState,
-	program: ParsedProgram,
-) -> TypecheckProgramResult:
-	typecheck_materialize_standalone_program_bodies_with_import_modules(
-		state,
-		program,
-		[],
-		InferStandaloneGlobalBodies,
-		InferStandaloneFunctionBodies,
-		ValidateProgramMain,
-	)
 
 
 private pure func typecheck_materialize_standalone_program_bodies_with_import_modules(
@@ -8302,8 +7385,7 @@ private pure func prepared_module_environments(
 					module_view = module_view_with_accepted_trait_implementation_authority(
 						prepared_state.module_view,
 						authority,
-					),
-					private_impls = []
+					)
 				}
 			None:
 				validation_errors = accepted_trait_implementation_table_validation_errors(
@@ -8366,7 +7448,6 @@ private pure func typecheck_session_for_prepared_module(
 		graph_import_admission = None,
 		module_scope = facts.module_scope,
 		allow_debug_only_calls = facts.allow_debug_only_calls,
-		private_impls = facts.private_impls,
 		known_type_index = facts.known_type_index,
 		scoped_trait_functions = facts.scoped_trait_functions,
 		type_homes = facts.type_homes,
@@ -10502,8 +9583,7 @@ private pure func prepare_ctfe_artifact_body_module(
 				accepted_trait_implementation_table,
 				bound_module,
 			),
-		),
-		private_impls = []
+		)
 	}
 	session_seed ?= body_infer_session_seed(base_state)
 
@@ -10949,7 +10029,6 @@ private pure func fresh_body_infer_session(
 		graph_import_admission = None,
 		module_scope = seed.module_facts.module_scope,
 		allow_debug_only_calls = seed.module_facts.allow_debug_only_calls,
-		private_impls = seed.module_facts.private_impls,
 		known_type_index = seed.module_facts.known_type_index,
 		scoped_trait_functions = seed.module_facts.scoped_trait_functions,
 		type_homes = seed.module_facts.type_homes,
