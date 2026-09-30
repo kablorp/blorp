@@ -1,4 +1,5 @@
 import:
+	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest: DeclaredAbiType(DeclaredAbiMemStats)
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(AddOp),
@@ -16,6 +17,7 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
+		CoreHeapRecordField,
 		CoreValueRecordDecl,
 		CoreSourceLoc,
 		synthetic_core_source_loc,
@@ -31,7 +33,7 @@ import:
 		projected_type_base_symbol,
 	../../../src/compiler/stage_10_backend/emit:
 		CTranslationUnitSet,
-		CoreEmitError,
+		CoreEmitError(UnresolvedRecordField),
 		static_string_literal_macro,
 		try_emit_prepared_core_program_c_artifact_with_profile,
 		try_emit_prepared_core_program_c_split_artifact_with_profile,
@@ -519,7 +521,7 @@ pure func test_all_type_sections_render_in_both_modes() -> Bool:
 		),
 	):
 		(Ok(single), Ok(split)):
-			point_header: String = "long x; long y;"
+			point_header: String = "long f0; long f1;"
 			enum_header: String = "#define __def_101_Red 0L"
 			union_header: String = "typedef struct " + projected_type_base_symbol(1) + " {"
 			heap_header: String = "typedef struct " + projected_type_base_symbol(0) + " {"
@@ -1140,15 +1142,16 @@ pure func runtime_reserved_field_split_program() -> CoreProgram:
 Test 12: the split path reuses the exact per-declaration emission records
 the single-file path builds (`value_record_emissions` / `heap_record_
 emissions` / `enum_emissions` / `union_emissions` on `CEmissionSections`),
-so a field named `header` must be escaped identically on both paths: the
-typedef routed to the shared header spells the member `__blorp_field_header`,
-the make function's assignment (a type-support definition, balanced across
-units like any other function) assigns through the same escaped name, and
-the raw collision (an unescaped
+so a field named `header` must be spelled identically on both paths: a
+non-ABI record's member is spelled from the field's position (`f<ordinal>`), so it
+cannot collide with the runtime's `header` member; the typedef routed to the
+shared header spells it that way, the make function's assignment (a
+type-support definition, balanced across units like any other function)
+assigns through the same spelling, and the raw collision (an unescaped
 `  long header;` member or `__rec->header =` assignment) never appears in
 the header or any body.
 ---
-pure func test_split_path_escapes_runtime_reserved_field_names() -> Bool:
+pure func test_split_path_spells_a_field_named_header_from_its_id() -> Bool:
 	match try_emit_prepared_core_program_c_split_artifact_with_profile(
 		run_pre_dce_tail(runtime_reserved_field_split_program()),
 		FunctionProfileOff,
@@ -1157,11 +1160,11 @@ pure func test_split_path_escapes_runtime_reserved_field_names() -> Bool:
 	):
 		Ok(result):
 			has_escaped_typedef: Bool = result.shared_header.contains(
-				"  blorp_Object header;\n  long __blorp_field_header;\n  blorp_String* label;",
+				"  blorp_Object header;\n  long f0;\n  blorp_String* f1;",
 			)
 			has_escaped_make_assignment: Bool = count_occurrences_across(
 				result.bodies,
-				"  __rec->__blorp_field_header = __blorp_field_header;",
+				"  __rec->f0 = f0;",
 			) == 1
 			no_raw_field_decl: Bool = not result.shared_header.contains("  long header;\n")
 			no_raw_assignment: Bool = count_occurrences_across(result.bodies, "__rec->header =") == 0
@@ -1381,6 +1384,71 @@ pure func projected_point_closure_split_program() -> CoreProgram:
 	}
 
 
+-- A non-ABI record's members are spelled from the field positions (`f<ordinal>`):
+-- the declaration and the read of `Point.x` (field id 3) agree, and the source
+-- name is gone from the C.
+pure func test_projected_emission_spells_a_non_abi_member_from_its_field_id() -> Bool:
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		run_pre_dce_tail(projected_point_closure_split_program()),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("long f0; long f1;")
+				and artifact.c_code.contains(".f0")
+				and not artifact.c_code.contains("long x; long y;")
+			)
+		Err(_):
+			False
+
+
+-- A declared ABI record keeps its member names: C code outside the compiler
+-- reads `MemStats`, so its constructor assigns the source-named members.
+pure func test_projected_emission_keeps_source_member_names_for_an_abi_record() -> Bool:
+	stats_decl: CoreValueRecordDecl = {
+		abi_type = Some(DeclaredAbiMemStats),
+		name = "MemStats",
+		type_params = [],
+		fields = [{ ref = core_field_ref(7), name = "allocated", typ = int_type() }],
+		loc = synthetic_core_source_loc(),
+	}
+	program: CoreProgram = split_test_program()
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		run_pre_dce_tail({ program | decls = program.decls.append(ValueRecordDecl(stats_decl)) }),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			artifact.c_code.contains(".allocated = allocated") and not artifact.c_code.contains("long f0; ")
+		Err(_):
+			False
+
+
+-- A non-ABI record's member is spelled from its field's position and looked up by
+-- its identity, so a field with no typecheck identity has no spelling: emission fails
+-- naming the record and the field, where an invalid C identifier would only fail in
+-- the C compiler. An ABI record keeps its source names and needs no identity.
+pure func test_unresolved_field_ref_on_a_non_abi_record_fails_at_emission() -> Bool:
+	header_box: CoreHeapRecordDecl = header_field_box_heap_record_decl()
+	unresolved_field: CoreHeapRecordField = {
+		ref = core_field_ref(-1),
+		name = "header",
+		typ = int_type(),
+		release_policy = NoReleasePolicy
+	}
+	broken: CoreHeapRecordDecl = { header_box | fields = [unresolved_field] }
+	program: CoreProgram = split_test_program()
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		run_pre_dce_tail({ program | decls = program.decls.append(HeapRecordDecl(broken)) }),
+		FunctionProfileOff,
+	):
+		Err(UnresolvedRecordField(record_name, field_name)):
+			record_name == "HeaderBox" and field_name == unresolved_field.name
+		_:
+			False
+
+
 pure func test_projected_closure_env_uses_projected_point_type() -> Bool:
 	match try_emit_prepared_core_program_c_split_artifact_with_profile(
 		run_pre_dce_tail(projected_point_closure_split_program()),
@@ -1428,6 +1496,18 @@ tests: TestSuite = {
 	tests = [
 		("unit count one matches single-file path", test_unit_count_one_matches_single_file_path),
 		("single function bodies follow declaration order", test_single_function_bodies_follow_declaration_order),
+		(
+			"projected emission spells a non-ABI member from its field id",
+			test_projected_emission_spells_a_non_abi_member_from_its_field_id,
+		),
+		(
+			"projected emission keeps source member names for an ABI record",
+			test_projected_emission_keeps_source_member_names_for_an_abi_record,
+		),
+		(
+			"unresolved field ref on a non-ABI record fails at emission",
+			test_unresolved_field_ref_on_a_non_abi_record_fails_at_emission,
+		),
 		("all type sections render in both modes", test_all_type_sections_render_in_both_modes),
 		("header/body partition at three units", test_header_body_partition_at_three_units),
 		(
@@ -1461,8 +1541,8 @@ tests: TestSuite = {
 			test_unit_count_exceeding_function_count_has_no_empty_bodies,
 		),
 		(
-			"split path escapes runtime-reserved field names",
-			test_split_path_escapes_runtime_reserved_field_names,
+			"split path spells a field named header from its id",
+			test_split_path_spells_a_field_named_header_from_its_id,
 		),
 		(
 			"type-support-heavy program balances across units",

@@ -54,6 +54,7 @@ import:
 		cancellation_variable_push_is_recorded,
 		cancellation_variable_requires_protection,
 	../stage_09_core/ir:
+		CoreFieldRef,
 		is_program_entrypoint_function_kind,
 		is_user_function_kind,
 		CoreAccessor(
@@ -566,10 +567,17 @@ import:
 		CHeapRecordFieldStorage(OrdinaryCHeapRecordField, PackedBooleanCHeapRecordField),
 		CRecordLayout(ForeignAbiLayout, InternalLayout),
 		CRecordLayoutRegistry,
+		CRecordLayoutError(UnresolvedRecordFieldRef),
+		CRecordMemberSelector(MembersByLayout, UnprojectedSourceMembers),
+		CRecordMemberScope,
 		CValueRecordFieldStorage(OrdinaryCValueRecordField, PackedBooleanCValueRecordField),
 		c_heap_record_field_storage,
 		c_heap_record_layout,
 		c_record_layout,
+		c_record_member,
+		c_declared_record_member,
+		c_record_member_of,
+		c_record_member_scope,
 		c_value_record_field_storage,
 		c_value_record_field_type_is_boolean,
 		classify_c_record_layouts,
@@ -973,6 +981,7 @@ union CoreEmitError:
 	CallableSymbolProjectionFailed(CSymbolProjectionError)
 	InvalidStaticStringLiteralPool(StaticStringLiteralPoolError)
 	UnknownProfileModule(String)
+	UnresolvedRecordField(String, String)
 	UnknownProfileFunction(String, String)
 	AmbiguousProfileFunction(String, String)
 
@@ -981,6 +990,8 @@ pure func core_emit_error_message(error: CoreEmitError) -> String:
 	match error:
 		UnsupportedGlobalInitializer(global_name):
 			"unsupported global initializer for `${global_name}`"
+		UnresolvedRecordField(record_name, field_name):
+			"field `${field_name}` of record `${record_name}` has no field identity, so its C member cannot be spelled"
 		CallableSymbolProjectionFailed(projection_error):
 			symbol_projection_error_text(projection_error)
 		InvalidStaticStringLiteralPool(pool_error):
@@ -1027,6 +1038,7 @@ private record FunctionEmissionContext {
 	specialize_layout: Option[CoreSpecializeLayout],
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
+	record_members: CRecordMemberSelector,
 	indent: String,
 	-- When true, `base_emission_context`/`nested_emission_context` keep
 	-- `indent` at `""` instead of growing a fresh indent string per nesting
@@ -1101,6 +1113,27 @@ private pure func selected_type_symbol_lookup(authority: CEmissionSymbolAuthorit
 			c_emission_type_symbol_lookup(plan)
 		UnprojectedCEmissionSymbolsForTests:
 			{}
+
+
+---
+What decides member spelling for this emission: the layout registry when symbols are
+projected, source names for the unprojected diagnostic and test emission.
+---
+private pure func unresolved_record_field_error(error: CRecordLayoutError) -> CoreEmitError:
+	match error:
+		UnresolvedRecordFieldRef(record_name, field_name):
+			UnresolvedRecordField(record_name, field_name)
+
+
+private pure func selected_record_member_selector(
+	authority: CEmissionSymbolAuthority,
+	layouts: CRecordLayoutRegistry,
+) -> CRecordMemberSelector:
+	match authority:
+		ValidatedCEmissionSymbols(_):
+			MembersByLayout(layouts)
+		UnprojectedCEmissionSymbolsForTests:
+			UnprojectedSourceMembers
 
 
 private pure func selected_foreign_boundary_types(
@@ -1251,6 +1284,7 @@ private pure func function_parameter_variables(func_info: CoreFunction) -> List[
 private pure func emission_context_from_plan(
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector,
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
 	parameter_variables: List[CoreVar],
@@ -1266,6 +1300,7 @@ private pure func emission_context_from_plan(
 		specialize_layout = Some(specialize_layout),
 		profile_function_id = profile_function_id,
 		symbol_authority = symbol_authority,
+		record_members = record_members,
 		indent = initial_indent,
 		compact = compact,
 		parameter_variables = parameter_variables
@@ -1281,6 +1316,7 @@ private pure func diagnostic_emission_context(expr: CoreExpr) -> FunctionEmissio
 		specialize_layout = None,
 		profile_function_id = None,
 		symbol_authority = UnprojectedCEmissionSymbolsForTests,
+		record_members = UnprojectedSourceMembers,
 		indent = BASE_INDENT,
 		compact = False,
 		parameter_variables = []
@@ -10608,9 +10644,10 @@ private pure func emit_record_reuse_body(
 private pure func record_cow_field_release_statement(
 	indent: String,
 	record_value: String,
+	member: String,
 	field: CoreHeapRecordField,
 ) -> String:
-	field_value: String = record_value + "->" + c_field_name(field.name)
+	field_value: String = record_value + "->" + member
 
 	match field.release_policy:
 		NoReleasePolicy:
@@ -10626,9 +10663,10 @@ private pure func record_cow_field_release_statement(
 private pure func record_cow_field_retain_statement(
 	indent: String,
 	record_value: String,
+	member: String,
 	field: CoreHeapRecordField,
 ) -> String:
-	field_value: String = record_value + "->" + c_field_name(field.name)
+	field_value: String = record_value + "->" + member
 
 	match field.release_policy:
 		NoReleasePolicy:
@@ -10715,47 +10753,63 @@ private pure func emit_record_cow_update_body(
 				var shared_body: String = ""
 				var constructor_args: List[String] = []
 
-				for field in emitted_fields:
-					field_access: String = source_slot + "->" + c_field_name(field.field.name)
-
-					match field.replacement:
-						Some(replacement):
-							unique_body += record_cow_field_release_statement(
-								emission_context.indent,
-								source_slot,
-								field.field,
-							)
-							unique_body += emission_context.indent + "  " + field_access + " = " + replacement + ";\n"
-							constructor_args = constructor_args.append(replacement)
-						None:
-							shared_body += record_cow_field_retain_statement(
-								emission_context.indent,
-								source_slot,
-								field.field,
-							)
-							constructor_args = constructor_args.append(field_access)
-
-				statements += emission_context.indent + record_c_type + " " + source_slot + " = " + source_c + ";\n"
-				statements += cleanup_pops
-				statements += emission_context.indent + record_c_type + " " + result_slot + ";\n"
-				statements += emission_context.indent + "if (blorp_is_unique(" + source_slot + ")) {\n"
-				statements += unique_body
-				statements += emission_context.indent + "  " + result_slot + " = " + source_slot + ";\n"
-				statements += emission_context.indent + "} else {\n"
-				statements += shared_body
-				statements += emission_context.indent + "  " + result_slot + " = " + selected_type_naming(
-					emission_context.symbol_authority,
+				member_spelling: CRecordMemberScope = c_record_member_scope(
+					emission_context.record_members,
 					type_name,
-				).make_name + "(" + constructor_args.join(", ") + ");\n"
-				statements += emission_context.indent + "  " + "blorp_release(" + source_slot + ");\n"
-				statements += emission_context.indent + "}\n"
+				)
 
-				Some({
-					statements = statements,
-					value = result_slot,
-					next_temp = temp_index + 2,
-					returns = False,
-				})
+				var unspelled_member: Bool = False
+
+				for field in emitted_fields:
+					match c_record_member(member_spelling, field.field.name, field.field.ref):
+						Some(member):
+							field_access: String = source_slot + "->" + member
+
+							match field.replacement:
+								Some(replacement):
+									unique_body += record_cow_field_release_statement(
+										emission_context.indent,
+										source_slot,
+										member,
+										field.field,
+									)
+									unique_body += emission_context.indent + "  " + field_access + " = " + replacement + ";\n"
+									constructor_args = constructor_args.append(replacement)
+								None:
+									shared_body += record_cow_field_retain_statement(
+										emission_context.indent,
+										source_slot,
+										member,
+										field.field,
+									)
+									constructor_args = constructor_args.append(field_access)
+						None:
+							unspelled_member = True
+
+				if unspelled_member:
+					None
+				else:
+					statements += emission_context.indent + record_c_type + " " + source_slot + " = " + source_c + ";\n"
+					statements += cleanup_pops
+					statements += emission_context.indent + record_c_type + " " + result_slot + ";\n"
+					statements += emission_context.indent + "if (blorp_is_unique(" + source_slot + ")) {\n"
+					statements += unique_body
+					statements += emission_context.indent + "  " + result_slot + " = " + source_slot + ";\n"
+					statements += emission_context.indent + "} else {\n"
+					statements += shared_body
+					statements += emission_context.indent + "  " + result_slot + " = " + selected_type_naming(
+						emission_context.symbol_authority,
+						type_name,
+					).make_name + "(" + constructor_args.join(", ") + ");\n"
+					statements += emission_context.indent + "  " + "blorp_release(" + source_slot + ");\n"
+					statements += emission_context.indent + "}\n"
+
+					Some({
+						statements = statements,
+						value = result_slot,
+						next_temp = temp_index + 2,
+						returns = False,
+					})
 		_:
 			None
 
@@ -11550,17 +11604,19 @@ private pure func emit_tuple_field_access(
 private pure func c_field_access_value(
 	expr_value: CoreExpr,
 	field_name: String,
+	field_ref: CoreFieldRef,
 	expr_c: String,
+	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
-	field_c: String = c_field_name(field_name)
-
 	match core_expr_type(expr_value):
 		HeapRecordType(name):
-			Some(expr_c + "->" + field_c)
+			member ?= c_record_member_of(emission_context.record_members, name, field_name, field_ref)
+			Some(expr_c + "->" + member)
 		ValueRecordType(name):
-			Some(expr_c + "." + field_c)
+			member ?= c_record_member_of(emission_context.record_members, name, field_name, field_ref)
+			Some(expr_c + "." + member)
 		RangeType:
-			Some(expr_c + "." + field_c)
+			Some(expr_c + "." + c_field_name(field_name))
 		VoidType:
 			None
 		NamedType(name, args):
@@ -11586,22 +11642,24 @@ private pure func c_field_access_value(
 private pure func emit_field_access(
 	expr_value: CoreExpr,
 	field_name: String,
+	field_ref: CoreFieldRef,
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
 	expr_c ?= emit_simple_expr(expr_value, emission_context)
-	c_field_access_value(expr_value, field_name, expr_c)
+	c_field_access_value(expr_value, field_name, field_ref, expr_c, emission_context)
 
 
 private pure func emit_field_access_body(
 	expr_value: CoreExpr,
 	field_name: String,
+	field_ref: CoreFieldRef,
 	typ: CoreType,
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
 	expr_body ?= emit_function_body(expr_value, next_temp, emission_context)
 	expr_c ?= required_body_value(expr_body)
-	value ?= c_field_access_value(expr_value, field_name, expr_c)
+	value ?= c_field_access_value(expr_value, field_name, field_ref, expr_c, emission_context)
 
 	Some(
 		emit_temp_value_body(
@@ -13073,6 +13131,7 @@ private pure func emit_closure_body_function(
 	abi: CoreClosureAbi,
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 	compact: Bool,
@@ -13087,6 +13146,7 @@ private pure func emit_closure_body_function(
 			emission_context: FunctionEmissionContext = emission_context_from_plan(
 				plan,
 				specialize_layout,
+				record_members,
 				None,
 				symbol_authority,
 				function_parameter_variables(func_info),
@@ -13735,7 +13795,7 @@ private pure func emit_dup_statement(
 	variable: CoreVar,
 	retain_policy: CoreRetainPolicy,
 	emission_context: FunctionEmissionContext,
-) -> String:
+) -> Option[String]:
 	duplicate_cleanup: String = if (
 		cancellation_variable_requires_protection(
 			emission_context.cleanup_plan,
@@ -13757,23 +13817,33 @@ private pure func emit_dup_statement(
 
 	match retain_policy:
 		NoRetainPolicy:
-			""
+			Some("")
 		ArcRetainPolicy:
-			emission_context.indent + "blorp_retain(" + c_var_name(
-				variable,
-			) + ");" + duplicate_cleanup + "\n"
+			Some(
+				emission_context.indent + "blorp_retain(" + c_var_name(
+					variable,
+				) + ");" + duplicate_cleanup + "\n",
+			)
 		StackResultRetainPolicy:
-			emission_context.indent + "blorp_stack_result_retain(" + c_var_name(
-				variable,
-			) + ");" + duplicate_cleanup + "\n"
-		CowFieldTakeRetainPolicy(record_var, field_name):
+			Some(
+				emission_context.indent + "blorp_stack_result_retain(" + c_var_name(
+					variable,
+				) + ");" + duplicate_cleanup + "\n",
+			)
+		CowFieldTakeRetainPolicy(record_var, field_name, field_ref, record_name):
 			record_c: String = c_var_name(record_var)
-
-			emission_context.indent + "if (blorp_is_unique(" + record_c + ")) { " + record_c + "->" + c_field_name(
+			member ?= c_record_member_of(
+				emission_context.record_members,
+				record_name,
 				field_name,
-			) + " = NULL; } else { blorp_retain(" + c_var_name(
-				variable,
-			) + "); }" + duplicate_cleanup + "\n"
+				field_ref,
+			)
+
+			Some(
+				emission_context.indent + "if (blorp_is_unique(" + record_c + ")) { " + record_c + "->" + member + " = NULL; } else { blorp_retain(" + c_var_name(
+					variable,
+				) + "); }" + duplicate_cleanup + "\n",
+			)
 
 
 private pure func statement_expr(statement: String, value: String) -> String:
@@ -14275,8 +14345,8 @@ private pure func emit_simple_expr_leaf(
 			emit_box_expr(box, emission_context)
 		UnboxExpr(unbox_kind, expr_value, typ, loc):
 			emit_unbox_expr(unbox_kind, expr_value, typ, emission_context)
-		FieldExpr(expr_value, field_name, _field_ref, typ, loc):
-			emit_field_access(expr_value, field_name, emission_context)
+		FieldExpr(expr_value, field_name, field_ref, typ, loc):
+			emit_field_access(expr_value, field_name, field_ref, emission_context)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
 			emit_tuple_field_access(expr_value, field_index, typ, emission_context)
 		TupleExpr(items, typ, loc):
@@ -14390,13 +14460,14 @@ private pure func emit_simple_expr_leaf(
 			emit_union_reuse_construct(construct, emission_context)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			body_c ?= emit_simple_expr(body, emission_context)
+			dup_statement ?= emit_dup_statement(
+				variable,
+				retain_policy,
+				base_emission_context(emission_context),
+			)
 			Some(
 				statement_expr(
-					emit_dup_statement(
-						variable,
-						retain_policy,
-						base_emission_context(emission_context),
-					),
+					dup_statement,
 					body_c,
 				),
 			)
@@ -14834,7 +14905,7 @@ private pure func emit_tailrec_tail(
 		UnionReuseConstructExpr(construct, typ, loc):
 			emit_tailrec_return(return_type, expr, next_temp, emission_context)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			retain_statement: String = emit_dup_statement(variable, retain_policy, emission_context)
+			retain_statement ?= emit_dup_statement(variable, retain_policy, emission_context)
 			body_c ?= emit_tailrec_tail(params, return_type, body, next_temp, emission_context)
 			Some(terminal_body(retain_statement + body_c.statements, body_c.next_temp))
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
@@ -15578,7 +15649,7 @@ private pure func emit_tailrec_list_spread_tail(
 				),
 			)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			retain_statement: String = emit_dup_statement(variable, retain_policy, emission_context)
+			retain_statement ?= emit_dup_statement(variable, retain_policy, emission_context)
 			body_c ?= emit_tailrec_list_spread_tail(loop, body, next_temp, emission_context)
 			Some(terminal_body(retain_statement + body_c.statements, body_c.next_temp))
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
@@ -22299,12 +22370,12 @@ private pure func emit_function_body(
 					Some(body_value(value, next_temp))
 				None:
 					emit_unbox_body(unbox_kind, expr_value, typ, next_temp, emission_context)
-		FieldExpr(expr_value, field_name, _field_ref, typ, loc):
+		FieldExpr(expr_value, field_name, field_ref, typ, loc):
 			match emit_simple_expr(expr, emission_context):
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
-					emit_field_access_body(expr_value, field_name, typ, next_temp, emission_context)
+					emit_field_access_body(expr_value, field_name, field_ref, typ, next_temp, emission_context)
 		TupleFieldExpr(expr_value, field_index, typ, loc):
 			value ?= emit_simple_expr(expr, emission_context)
 			Some(body_value(value, next_temp))
@@ -22439,7 +22510,7 @@ private pure func emit_function_body(
 				None:
 					emit_union_reuse_construct_body(construct, next_temp, emission_context)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			retain_statement: String = emit_dup_statement(variable, retain_policy, emission_context)
+			retain_statement ?= emit_dup_statement(variable, retain_policy, emission_context)
 			body_c ?= emit_function_body(body, next_temp, emission_context)
 			Some({
 				statements = retain_statement + body_c.statements,
@@ -23323,6 +23394,7 @@ private pure func emit_supported_user_function(
 	profile_function_id: Option[ProfileFunctionId],
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Option[String]:
@@ -23331,6 +23403,7 @@ private pure func emit_supported_user_function(
 			emission_context: FunctionEmissionContext = emission_context_from_plan(
 				plan,
 				specialize_layout,
+				record_members,
 				profile_function_id,
 				symbol_authority,
 				function_parameter_variables(func_info),
@@ -23466,6 +23539,7 @@ private pure func emit_function(
 	internal_linkage: Bool,
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 	compact: Bool,
@@ -23481,6 +23555,7 @@ private pure func emit_function(
 						profile_function_id,
 						plan,
 						specialize_layout,
+						record_members,
 						symbol_authority,
 						compact,
 					):
@@ -23500,6 +23575,7 @@ private pure func emit_function(
 						profile_function_id,
 						plan,
 						specialize_layout,
+						record_members,
 						symbol_authority,
 						compact,
 					):
@@ -23521,6 +23597,7 @@ private pure func emit_function(
 				abi,
 				plan,
 				specialize_layout,
+				record_members,
 				symbol_authority,
 				internal_type_linkage,
 				compact,
@@ -24612,25 +24689,32 @@ private pure func static_literal_value_initializer(
 private pure func static_record_field_initializer(
 	parent_path: String,
 	field: CoreRecordFieldValue,
+	member_spelling: CRecordMemberScope,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	field_init ?= static_value_initializer(
 		static_child_path(parent_path, field.name),
 		core_expr_type(field.value),
 		field.value,
 		type_symbol_lookup,
+		record_members,
 	)
+
+	member ?= c_record_member(member_spelling, field.name, field.ref)
 
 	Some({
 		definitions = owned_static_fragment(field_init.definitions),
-		value = "." + c_field_name(field.name) + " = " + field_init.value,
+		value = "." + member + " = " + field_init.value,
 	})
 
 
 private pure func static_record_field_initializers(
 	parent_path: String,
+	member_spelling: CRecordMemberScope,
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -24638,7 +24722,13 @@ private pure func static_record_field_initializers(
 
 	for field in fields:
 		if not failed:
-			match static_record_field_initializer(parent_path, field, type_symbol_lookup):
+			match static_record_field_initializer(
+				parent_path,
+				field,
+				member_spelling,
+				type_symbol_lookup,
+				record_members,
+			):
 				Some(field_init):
 					definitions = definitions.append(field_init.definitions)
 					values = values.append(field_init.value)
@@ -24660,8 +24750,15 @@ private pure func static_heap_record_initializer(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
-	field_inits ?= static_record_field_initializers(path_c, fields, type_symbol_lookup)
+	field_inits ?= static_record_field_initializers(
+		path_c,
+		c_record_member_scope(record_members, type_name),
+		fields,
+		type_symbol_lookup,
+		record_members,
+	)
 	storage_name: String = static_record_storage_name(path_c)
 	record_c_type: String = type_symbol_lookup.get(type_name).get_or(type_name)
 
@@ -24680,10 +24777,18 @@ private pure func static_heap_record_initializer(
 
 private pure func static_value_record_initializer(
 	path_c: String,
+	type_name: String,
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
-	field_inits ?= static_record_field_initializers(path_c, fields, type_symbol_lookup)
+	field_inits ?= static_record_field_initializers(
+		path_c,
+		c_record_member_scope(record_members, type_name),
+		fields,
+		type_symbol_lookup,
+		record_members,
+	)
 
 	Some({
 		definitions = owned_static_fragment(field_inits.definitions),
@@ -24696,6 +24801,7 @@ private pure func static_value_initializer(
 	typ: CoreType,
 	expr: CoreExpr,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match expr:
 		LiteralExpr(literal, literal_type, loc):
@@ -24710,19 +24816,31 @@ private pure func static_value_initializer(
 						value = "(blorp_List*)&" + canonical.symbol_name,
 					})
 				None:
-					static_list_initializer(path_c, construct, type_symbol_lookup)
+					static_list_initializer(path_c, construct, type_symbol_lookup, record_members)
 		TupleConstructExpr(construct, tuple_type, loc):
-			static_tuple_initializer(path_c, construct, type_symbol_lookup)
+			static_tuple_initializer(path_c, construct, type_symbol_lookup, record_members)
 		UnionConstructExpr(construct, union_type, loc):
-			static_union_initializer(path_c, construct, type_symbol_lookup)
+			static_union_initializer(path_c, construct, type_symbol_lookup, record_members)
 		UnionReuseConstructExpr(construct, union_type, loc):
 			None
 		RecordConstructExpr(type_name, fields, record_type, loc):
 			match typ:
 				HeapRecordType(name):
-					static_heap_record_initializer(path_c, type_name, fields, type_symbol_lookup)
+					static_heap_record_initializer(
+						path_c,
+						type_name,
+						fields,
+						type_symbol_lookup,
+						record_members,
+					)
 				ValueRecordType(name):
-					static_value_record_initializer(path_c, fields, type_symbol_lookup)
+					static_value_record_initializer(
+						path_c,
+						type_name,
+						fields,
+						type_symbol_lookup,
+						record_members,
+					)
 				VoidType:
 					None
 				StackResultType(ok_type, err_type):
@@ -24754,6 +24872,7 @@ private pure func static_pointer_list_slot_initializer(
 	index: Int,
 	value: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match value.kind:
 		PointerBox:
@@ -24762,6 +24881,7 @@ private pure func static_pointer_list_slot_initializer(
 				core_expr_type(value.value),
 				value.value,
 				type_symbol_lookup,
+				record_members,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -24792,6 +24912,7 @@ private pure func static_pointer_list_slots(
 	parent_path: String,
 	elements: List[CoreBoxedStorageValue],
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -24800,7 +24921,13 @@ private pure func static_pointer_list_slots(
 
 	for element in elements:
 		if not failed:
-			match static_pointer_list_slot_initializer(parent_path, index, element, type_symbol_lookup):
+			match static_pointer_list_slot_initializer(
+				parent_path,
+				index,
+				element,
+				type_symbol_lookup,
+				record_members,
+			):
 				Some(slot):
 					definitions = definitions.append(slot.definitions)
 					values = values.append(slot.value)
@@ -24829,6 +24956,7 @@ private pure func static_tuple_element_initializer(
 	index: Int,
 	element: CoreTupleElement,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match element:
 		TuplePrimElement(value):
@@ -24844,6 +24972,7 @@ private pure func static_tuple_element_initializer(
 				core_expr_type(value),
 				value,
 				type_symbol_lookup,
+				record_members,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -24882,6 +25011,7 @@ private pure func static_tuple_slots(
 	parent_path: String,
 	elements: List[CoreTupleElement],
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -24890,7 +25020,13 @@ private pure func static_tuple_slots(
 
 	for element in elements:
 		if not failed:
-			match static_tuple_element_initializer(parent_path, index, element, type_symbol_lookup):
+			match static_tuple_element_initializer(
+				parent_path,
+				index,
+				element,
+				type_symbol_lookup,
+				record_members,
+			):
 				Some(slot):
 					definitions = definitions.append(slot.definitions)
 					values = values.append(slot.value)
@@ -24944,8 +25080,9 @@ private pure func static_tuple_initializer(
 	path_c: String,
 	construct: CoreTupleConstruct,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
-	slots ?= static_tuple_slots(path_c, construct.elements, type_symbol_lookup)
+	slots ?= static_tuple_slots(path_c, construct.elements, type_symbol_lookup, record_members)
 	storage_name: String = static_tuple_storage_name(path_c)
 	arity: Int = construct.elements.length()
 	storage_slots: Int = static_tuple_storage_slots(arity)
@@ -24964,6 +25101,7 @@ private pure func static_result_payload_slot_initializer(
 	constructor_name: String,
 	value: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match value.kind:
 		PointerBox:
@@ -24972,6 +25110,7 @@ private pure func static_result_payload_slot_initializer(
 				core_expr_type(value.value),
 				value.value,
 				type_symbol_lookup,
+				record_members,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -25008,6 +25147,7 @@ private pure func static_stack_result_initializer(
 	construct: CoreUnionConstruct,
 	representation: CoreStackResultRepresentation,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match construct.args:
 		[arg]:
@@ -25016,6 +25156,7 @@ private pure func static_stack_result_initializer(
 				construct.constructor_name,
 				arg,
 				type_symbol_lookup,
+				record_members,
 			)
 			Some({
 				definitions = owned_static_fragment(payload.definitions),
@@ -25039,6 +25180,7 @@ private pure func static_generic_union_arg_initializer(
 	index: Int,
 	arg: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match arg.kind:
 		PointerBox:
@@ -25047,6 +25189,7 @@ private pure func static_generic_union_arg_initializer(
 				core_expr_type(arg.value),
 				arg.value,
 				type_symbol_lookup,
+				record_members,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -25083,6 +25226,7 @@ private pure func static_generic_union_arg_initializers(
 	constructor_name: String,
 	args: List[CoreBoxedStorageValue],
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -25091,7 +25235,14 @@ private pure func static_generic_union_arg_initializers(
 
 	for arg in args:
 		if not failed:
-			match static_generic_union_arg_initializer(parent_path, constructor_name, index, arg, type_symbol_lookup):
+			match static_generic_union_arg_initializer(
+				parent_path,
+				constructor_name,
+				index,
+				arg,
+				type_symbol_lookup,
+				record_members,
+			):
 				Some(arg_init):
 					definitions = definitions.append(arg_init.definitions)
 					values = values.append(arg_init.value)
@@ -25114,6 +25265,7 @@ private pure func static_generic_union_initializer(
 	path_c: String,
 	construct: CoreUnionConstruct,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match construct.payload_storage:
 		TypedUnionPayloadStorage:
@@ -25122,6 +25274,7 @@ private pure func static_generic_union_initializer(
 				construct.constructor_name,
 				construct.args,
 				type_symbol_lookup,
+				record_members,
 			)
 			storage_name: String = static_union_storage_name(path_c)
 			union_c_type: String = type_symbol_lookup.get(construct.type_name).get_or(construct.type_name)
@@ -25141,12 +25294,19 @@ private pure func static_union_initializer(
 	path_c: String,
 	construct: CoreUnionConstruct,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	match construct.representation:
 		StackResultRepresentation(representation):
-			static_stack_result_initializer(path_c, construct, representation, type_symbol_lookup)
+			static_stack_result_initializer(
+				path_c,
+				construct,
+				representation,
+				type_symbol_lookup,
+				record_members,
+			)
 		GenericUnionRepresentation:
-			static_generic_union_initializer(path_c, construct, type_symbol_lookup)
+			static_generic_union_initializer(path_c, construct, type_symbol_lookup, record_members)
 		BoxedOptionRepresentation:
 			None
 		StackOptionRepresentation(representation):
@@ -25183,6 +25343,7 @@ private pure func static_list_initializer(
 	path_c: String,
 	construct: CoreListConstruct,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[StaticValueInitializer]:
 	storage_name: String = static_list_storage_name(path_c)
 	elem_count: Int = construct.elements.length()
@@ -25190,7 +25351,12 @@ private pure func static_list_initializer(
 
 	match construct.layout:
 		PointerListStorage:
-			slots ?= static_pointer_list_slots(path_c, construct.elements, type_symbol_lookup)
+			slots ?= static_pointer_list_slots(
+				path_c,
+				construct.elements,
+				type_symbol_lookup,
+				record_members,
+			)
 
 			elem_release: String = if construct.elem_needs_release:
 				"blorp_elem_release_fn"
@@ -25387,12 +25553,19 @@ private pure func emit_static_managed_global_decl(
 	global: CoreGlobal,
 	internal_type_linkage: Bool,
 	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
 ) -> Option[String]:
 	if not global_has_static_managed_decl(global):
 		None
 	else:
 		name_c: String = c_var_name(global.name)
-		init ?= static_value_initializer(name_c, global.typ, global.init, type_symbol_lookup)
+		init ?= static_value_initializer(
+			name_c,
+			global.typ,
+			global.init,
+			type_symbol_lookup,
+			record_members,
+		)
 
 		storage_class: String = if internal_type_linkage:
 			"static "
@@ -25609,8 +25782,18 @@ private pure func emit_global_static_init_expr(init: CoreExpr) -> Option[String]
 			None
 
 
-private pure func emit_global_decl(global: CoreGlobal, internal_type_linkage: Bool, type_symbol_lookup: Dict[String, String]) -> String:
-	match emit_static_managed_global_decl(global, internal_type_linkage, type_symbol_lookup):
+private pure func emit_global_decl(
+	global: CoreGlobal,
+	internal_type_linkage: Bool,
+	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
+) -> String:
+	match emit_static_managed_global_decl(
+		global,
+		internal_type_linkage,
+		type_symbol_lookup,
+		record_members,
+	):
 		Some(decl):
 			decl
 		None:
@@ -25654,12 +25837,14 @@ private pure func emit_global_runtime_init_body(
 	next_temp: Int,
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Option[FunctionBodyC]:
 	emission_context: FunctionEmissionContext = emission_context_from_plan(
 		plan,
 		specialize_layout,
+		record_members,
 		None,
 		symbol_authority,
 		[],
@@ -25687,11 +25872,13 @@ private pure func emit_global_runtime_init_body(
 
 private pure func c_value_record_field_decl(
 	field: CoreValueRecordField,
+	member_spelling: CRecordMemberScope,
+	ordinal: Int,
 	layout: CRecordLayout,
 	has_boolean_neighbor: Bool,
 	type_symbol_lookup: Dict[String, String],
 ) -> String:
-	field_name: String = c_field_name(field.name)
+	field_name: String = c_declared_record_member(member_spelling, field.name, ordinal)
 
 	match c_value_record_field_storage(layout, field.typ, has_boolean_neighbor, type_symbol_lookup):
 		OrdinaryCValueRecordField(c_type):
@@ -25725,6 +25912,7 @@ private record CValueRecordDeclEmission {
 private pure func emit_value_record_decl(
 	record_decl: CoreValueRecordDecl,
 	layout: CRecordLayout,
+	member_spelling: CRecordMemberScope,
 	authority: CEmissionSymbolAuthority,
 ) -> CValueRecordDeclEmission:
 	var source_order_fields_c: String = ""
@@ -25745,7 +25933,7 @@ private pure func emit_value_record_decl(
 	)
 
 	for field in record_decl.fields:
-		field_name: String = c_field_name(field.name)
+		field_name: String = c_declared_record_member(member_spelling, field.name, field_index)
 		has_boolean_neighbor: Bool = (
 			(
 				field_index > 0
@@ -25754,7 +25942,14 @@ private pure func emit_value_record_decl(
 			or value_record_field_at_is_boolean(record_decl.fields, field_index + 1)
 		)
 
-		field_decl: String = c_value_record_field_decl(field, layout, has_boolean_neighbor, selected_type_symbol_lookup(authority))
+		field_decl: String = c_value_record_field_decl(
+			field,
+			member_spelling,
+			field_index,
+			layout,
+			has_boolean_neighbor,
+			selected_type_symbol_lookup(authority),
+		)
 
 		match layout:
 			InternalLayout:
@@ -25765,7 +25960,7 @@ private pure func emit_value_record_decl(
 			ForeignAbiLayout:
 				source_order_fields_c += field_decl
 
-		params = params.append(TypeLayout.c_type_name(field.typ, selected_type_symbol_lookup(authority)) + " " + c_field_name(field.name))
+		params = params.append(TypeLayout.c_type_name(field.typ, selected_type_symbol_lookup(authority)) + " " + field_name)
 		init_fields = init_fields.append("." + field_name + " = " + field_name)
 		field_index += 1
 
@@ -25800,12 +25995,14 @@ private pure func emit_value_record_decl(
 
 private pure func heap_record_field_decl(
 	field: CoreHeapRecordField,
+	member_spelling: CRecordMemberScope,
+	ordinal: Int,
 	layouts: CRecordLayoutRegistry,
 	layout: CRecordLayout,
 	has_boolean_neighbor: Bool,
 	type_symbol_lookup: Dict[String, String],
 ) -> String:
-	field_name: String = c_field_name(field.name)
+	field_name: String = c_declared_record_member(member_spelling, field.name, ordinal)
 
 	match c_heap_record_field_storage(
 		layouts.byte_sized_enum_names,
@@ -25820,8 +26017,13 @@ private pure func heap_record_field_decl(
 			"  _Bool " + field_name + " : 1;\n"
 
 
-private pure func heap_record_make_param(field: CoreHeapRecordField, type_symbol_lookup: Dict[String, String]) -> String:
-	TypeLayout.c_type_name(field.typ, type_symbol_lookup) + " " + c_field_name(field.name)
+private pure func heap_record_make_param(
+	field: CoreHeapRecordField,
+	member_spelling: CRecordMemberScope,
+	ordinal: Int,
+	type_symbol_lookup: Dict[String, String],
+) -> String:
+	TypeLayout.c_type_name(field.typ, type_symbol_lookup) + " " + c_declared_record_member(member_spelling, field.name, ordinal)
 
 
 private pure func heap_record_field_at_is_boolean(
@@ -25835,8 +26037,12 @@ private pure func heap_record_field_at_is_boolean(
 			False
 
 
-private pure func heap_record_field_release_statement(field: CoreHeapRecordField) -> String:
-	field_name: String = c_field_name(field.name)
+private pure func heap_record_field_release_statement(
+	field: CoreHeapRecordField,
+	member_spelling: CRecordMemberScope,
+	ordinal: Int,
+) -> String:
+	field_name: String = c_declared_record_member(member_spelling, field.name, ordinal)
 
 	match field.release_policy:
 		NoReleasePolicy:
@@ -25881,6 +26087,7 @@ private pure func destroy_function_signature(destroy_name: String) -> String:
 
 private pure func emit_heap_record_destructor(
 	record_decl: CoreHeapRecordDecl,
+	member_spelling: CRecordMemberScope,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
@@ -25888,8 +26095,8 @@ private pure func emit_heap_record_destructor(
 	if cleanup_type_plan_has_destructor(type_plan):
 		var releases: String = ""
 
-		for field in record_decl.fields:
-			releases += heap_record_field_release_statement(field)
+		for entry in record_decl.fields.enumerate():
+			releases += heap_record_field_release_statement(entry[1], member_spelling, entry[0])
 
 		storage_class: String = if internal_type_linkage:
 			"static "
@@ -25905,6 +26112,7 @@ private pure func emit_heap_record_destructor(
 
 private pure func emit_heap_record_reuse(
 	record_decl: CoreHeapRecordDecl,
+	member_spelling: CRecordMemberScope,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	type_symbol_lookup: Dict[String, String],
@@ -25914,9 +26122,9 @@ private pure func emit_heap_record_reuse(
 	var field_names: List[String] = []
 	var assignments: String = ""
 
-	for field in record_decl.fields:
-		field_name: String = c_field_name(field.name)
-		params = params.append(heap_record_make_param(field, type_symbol_lookup))
+	for entry in record_decl.fields.enumerate():
+		field_name: String = c_declared_record_member(member_spelling, entry[1].name, entry[0])
+		params = params.append(heap_record_make_param(entry[1], member_spelling, entry[0], type_symbol_lookup))
 		field_names = field_names.append(field_name)
 		assignments += "    __old->" + field_name + " = " + field_name + ";\n"
 
@@ -25962,6 +26170,10 @@ private pure func emit_heap_record_decl(
 	var assignments: String = ""
 	record_c_type: String = TypeLayout.c_type_name(HeapRecordType(record_decl.name), selected_type_symbol_lookup(authority))
 	naming: BackendTypeNaming = selected_type_naming(authority, record_decl.name)
+	member_spelling: CRecordMemberScope = c_record_member_scope(
+		selected_record_member_selector(authority, layouts),
+		record_decl.name,
+	)
 
 	reorder_internal_boolean_fields: Bool = match layout:
 		InternalLayout:
@@ -25972,7 +26184,7 @@ private pure func emit_heap_record_decl(
 	var field_index: Int = 0
 
 	for field in record_decl.fields:
-		field_name: String = c_field_name(field.name)
+		field_name: String = c_declared_record_member(member_spelling, field.name, field_index)
 		has_boolean_neighbor: Bool = (
 			field_index > 0 and heap_record_field_at_is_boolean(record_decl.fields, field_index - 1)
 			or heap_record_field_at_is_boolean(record_decl.fields, field_index + 1)
@@ -25980,6 +26192,8 @@ private pure func emit_heap_record_decl(
 
 		field_decl: String = heap_record_field_decl(
 			field,
+			member_spelling,
+			field_index,
 			layouts,
 			layout,
 			has_boolean_neighbor,
@@ -25994,7 +26208,9 @@ private pure func emit_heap_record_decl(
 		else:
 			source_order_fields_c += field_decl
 
-		params = params.append(heap_record_make_param(field, selected_type_symbol_lookup(authority)))
+		params = params.append(
+			heap_record_make_param(field, member_spelling, field_index, selected_type_symbol_lookup(authority)),
+		)
 		assignments += "  __rec->" + field_name + " = " + field_name + ";\n"
 		field_index += 1
 
@@ -26018,6 +26234,7 @@ private pure func emit_heap_record_decl(
 	header: String = "typedef struct " + naming.c_name + " {\n" + "  blorp_Object header;\n" + fields_c + "} " + naming.c_name + ";\n\n"
 	destructor_c: String = emit_heap_record_destructor(
 		record_decl,
+		member_spelling,
 		type_plan,
 		naming,
 		internal_type_linkage,
@@ -26028,7 +26245,13 @@ private pure func emit_heap_record_decl(
 	{
 		type_header = header,
 		functions = [destructor_c, make_c],
-		inline_support = emit_heap_record_reuse(record_decl, type_plan, naming, selected_type_symbol_lookup(authority))
+		inline_support = emit_heap_record_reuse(
+			record_decl,
+			member_spelling,
+			type_plan,
+			naming,
+			selected_type_symbol_lookup(authority),
+		)
 	}
 
 
@@ -26659,7 +26882,12 @@ private pure func emit_generated_stack_option_typedefs(decls: List[CoreDecl], ty
 		c_code + "\n"
 
 
-private pure func emit_global_decls(decls: List[CoreDecl], internal_type_linkage: Bool, type_symbol_lookup: Dict[String, String]) -> String:
+private pure func emit_global_decls(
+	decls: List[CoreDecl],
+	internal_type_linkage: Bool,
+	type_symbol_lookup: Dict[String, String],
+	record_members: CRecordMemberSelector,
+) -> String:
 	var c_code: String = make_string(0)
 
 	for decl in decls:
@@ -26667,7 +26895,7 @@ private pure func emit_global_decls(decls: List[CoreDecl], internal_type_linkage
 			GlobalDecl(global):
 				c_code = append_emitted_c(
 					c_code,
-					emit_global_decl(global, internal_type_linkage, type_symbol_lookup),
+					emit_global_decl(global, internal_type_linkage, type_symbol_lookup, record_members),
 				)
 			EnumDecl(enum_decl):
 				void
@@ -26767,6 +26995,7 @@ private pure func emit_global_init_function(
 	decls: List[CoreDecl],
 	cancellation_table: CancellationPlanTable,
 	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Result[String, CoreEmitError]:
@@ -26795,6 +27024,7 @@ private pure func emit_global_init_function(
 								temp_index,
 								plan,
 								specialize_layout,
+								record_members,
 								symbol_authority,
 								compact,
 							):
@@ -26862,7 +27092,8 @@ private record CFunctionEmission {
 
 private record CFunctionEmissionContext {
 	profile_plan: Option[ProfileEmissionPlan],
-	specialize_layout: CoreSpecializeLayout
+	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector
 }
 
 
@@ -26903,6 +27134,7 @@ private pure func emit_function_decls(
 	internal_linkage: Bool,
 	cancellation_table: CancellationPlanTable,
 	specialize_layout: CoreSpecializeLayout,
+	record_members: CRecordMemberSelector,
 	internal_type_linkage: Bool,
 	compact: Bool,
 ) -> List[CFunctionEmission]:
@@ -26942,6 +27174,7 @@ private pure func emit_function_decls(
 						internal_linkage,
 						plan,
 						specialize_layout,
+						record_members,
 						symbol_authority,
 						internal_type_linkage,
 						compact,
@@ -27154,6 +27387,7 @@ private pure func render_single_translation_unit(
 					internal_linkage,
 					plan,
 					context.specialize_layout,
+					context.record_members,
 					symbol_authority,
 					internal_type_linkage,
 					compact,
@@ -27238,6 +27472,7 @@ private pure func collect_value_record_decl_emissions(
 			emit_value_record_decl(
 				record_decl,
 				c_record_layout(layouts.foreign_abi_value_record_names, record_decl.name),
+				c_record_member_scope(selected_record_member_selector(authority, layouts), record_decl.name),
 				authority,
 			),
 		)
@@ -27440,10 +27675,13 @@ private pure func emit_decls(
 ) -> Result[(CEmissionSections, CTypeDeclEmissions, CFunctionEmissionContext), CoreEmitError]:
 	decls: List[CoreDecl] = program.decls
 	specialize_layout: CoreSpecializeLayout = build_specialize_layout(program)
-	layouts: CRecordLayoutRegistry = classify_c_record_layouts(
+	layouts ?= classify_c_record_layouts(
 		specialize_layout,
 		selected_foreign_boundary_types(symbol_authority, program),
+	).map_err(
+		func(error): unresolved_record_field_error(error),
 	)
+	record_members: CRecordMemberSelector = selected_record_member_selector(symbol_authority, layouts)
 	static_string_literals ?= selected_static_string_literals(
 		symbol_authority,
 		program,
@@ -27454,6 +27692,7 @@ private pure func emit_decls(
 		decls,
 		cancellation_table,
 		specialize_layout,
+		record_members,
 		symbol_authority,
 		compact,
 	)
@@ -27497,6 +27736,7 @@ private pure func emit_decls(
 			internal_linkage,
 			cancellation_table,
 			specialize_layout,
+			record_members,
 			internal_type_linkage,
 			compact,
 		)
@@ -27522,7 +27762,12 @@ private pure func emit_decls(
 		closure_env_destructor_prototypes = closure_env_emission_destructor_prototypes(
 			closure_env_emissions,
 		),
-		global_decls = emit_global_decls(decls, internal_type_linkage, selected_type_symbol_lookup(symbol_authority)),
+		global_decls = emit_global_decls(
+			decls,
+			internal_type_linkage,
+			selected_type_symbol_lookup(symbol_authority),
+			record_members,
+		),
 		global_init = global_init,
 		profile_metadata = emit_profile_metadata(profile_plan, internal_type_linkage),
 		function_definitions = function_definitions,
@@ -27535,7 +27780,8 @@ private pure func emit_decls(
 	}
 	Ok((sections, type_emissions, {
 		profile_plan = profile_plan,
-		specialize_layout = specialize_layout
+		specialize_layout = specialize_layout,
+		record_members = record_members
 	}))
 
 
@@ -27743,13 +27989,15 @@ prototype anywhere, because a single translation unit never needed one.
 Splitting does: these functions are defined once (in TU 0) and every other
 TU calls them. Each mirrors the parameter-list computation the matching
 definition already makes (`emit_heap_record_decl`, `emit_union_constructor`)
-so the two can never disagree.
+so the two can never disagree. A prototype needs no parameter names, so the
+heap record prototype lists the parameter types only and does not spell the
+members (readability of the prototype is traded for size).
 ---
 private pure func heap_record_make_param_list(record_decl: CoreHeapRecordDecl, type_symbol_lookup: Dict[String, String]) -> String:
 	var params: List[String] = []
 
 	for field in record_decl.fields:
-		params = params.append(heap_record_make_param(field, type_symbol_lookup))
+		params = params.append(TypeLayout.c_type_name(field.typ, type_symbol_lookup))
 
 	if params.length() == 0:
 		"void"

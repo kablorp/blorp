@@ -445,6 +445,14 @@ class GeneratedCSymbolTests(unittest.TestCase):
         kept = "struct S { int header; int tag; }; void f(struct S s) { use(s.header, s.tag); }"
         self.assertEqual(normalizer.normalize(kept), kept)
 
+    def test_record_member_ordinals_normalize_by_first_occurrence(self):
+        old = "struct S { int f3; int f4; }; void f(struct S s) { use(s.f3, s.f4); }"
+        new = "struct S { int f9; int f12; }; void f(struct S s) { use(s.f9, s.f12); }"
+        self.different(old, new)
+        self.assertEqual(normalizer.project_locals(old), normalizer.project_locals(new))
+        swapped = "struct S { int f4; int f3; }; void f(struct S s) { use(s.f3, s.f4); }"
+        self.assertNotEqual(normalizer.project_locals(old), normalizer.project_locals(swapped))
+
     def test_typedef_declared_type_authorizes_local_declaration(self):
         code = self.body("blorp_List x; use(x);")
         sidecar = self.sidecar(code, "x")
