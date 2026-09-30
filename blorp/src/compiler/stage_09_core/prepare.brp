@@ -182,12 +182,7 @@ import:
 		CoreFieldRef,
 		CoreFunction,
 		CoreGlobal,
-		CoreHashContainerConstructor(
-			CustomHashContainerConstructor,
-			FloatHashContainerConstructor,
-			GenericHashContainerConstructor,
-			StringHashContainerConstructor,
-		),
+		CoreHashContainerConstructor,
 		CoreHeapRecordDecl,
 		CoreListAlloc,
 		CoreListConstruct,
@@ -218,7 +213,6 @@ import:
 		),
 		CoreLogicalOp,
 		CoreProgram,
-		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreRawMatchCase,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
@@ -303,16 +297,12 @@ import:
 		core_var_equal,
 	mono: core_mono_type_equal
 	release_mask: release_mask_bit, release_mask_first_word
-	runtime_callbacks:
-		CoreRuntimeCallbackTable,
-		build_runtime_callback_table,
-		find_runtime_callback,
 	specialize_layout:
 		CoreSpecializeLayout,
 		boxed_storage_slot_needs_release,
 		boxed_storage_value,
 		build_specialize_layout,
-		generic_hash_container_type_name
+		hash_container_constructor_for_key,
 	traverse as CoreTraverse
 	type_policy:
 		is_core_fallible_stream_type_name,
@@ -456,13 +446,9 @@ is a lookup accelerator, never a second authority on declaration order.
 private record PrepareDecls {
 	decls: List[CoreDecl],
 	unions_by_name: Dict[String, CoreUnionDecl],
-	-- Present only for the later construction-preparation pass. The earlier
-	-- dictionary-ownership traversal has its own mapper and never calls
-	-- prepare_union_construct, so it intentionally has no layout index.
-	specialize_layout: Option[CoreSpecializeLayout],
-	-- Built with the union index: the functions a custom-key Dict literal
-	-- calls back for `Hashable.hash` and `Equatable.equals`.
-	callbacks: CoreRuntimeCallbackTable
+	-- Both preparation passes lower dict literals, whose hash-key strategy
+	-- depends on resolved key layouts.
+	specialize_layout: CoreSpecializeLayout
 }
 
 
@@ -473,8 +459,7 @@ distinct because only union declarations enter this dictionary.
 ---
 private pure func prepare_decls(
 	decls: List[CoreDecl],
-	specialize_layout: Option[CoreSpecializeLayout],
-	callbacks: CoreRuntimeCallbackTable,
+	specialize_layout: CoreSpecializeLayout,
 ) -> PrepareDecls:
 	var unions_by_name: Dict[String, CoreUnionDecl] = {}
 
@@ -491,8 +476,7 @@ private pure func prepare_decls(
 	{
 		decls = decls,
 		unions_by_name = unions_by_name,
-		specialize_layout = specialize_layout,
-		callbacks = callbacks
+		specialize_layout = specialize_layout
 	}
 
 
@@ -1277,7 +1261,7 @@ itself is moved or borrowed. Either way emission creates a fresh box that
 owns one payload reference, so the literal hands that box to the dict, as
 `prepare_list_storage_value` does for pointer-backed lists.
 ---
-private pure func transfer_stack_result_dict_value_box(
+private pure func transfer_stack_result_dict_box(
 	value: CoreBoxedStorageValue,
 ) -> Option[CoreBoxedStorageValue]:
 	if is_stack_result_type(expr_type(value.value)) and not value.transfers_ownership:
@@ -1293,15 +1277,23 @@ private pure func prepare_dict_entry(
 	prepared_key: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, entry.key)
 	prepared_value: Option[CoreBoxedStorageValue] = prepare_boxed_storage_value(decls, entry.value)
 
-	transferred_value: Option[CoreBoxedStorageValue] = transfer_stack_result_dict_value_box(
+	-- A stack Result key only occurs in a trait-hashed dict, whose key slot
+	-- owns its box like a value slot does.
+	transferred_key: Option[CoreBoxedStorageValue] = transfer_stack_result_dict_box(prepared_key.get_or(entry.key))
+	transferred_value: Option[CoreBoxedStorageValue] = transfer_stack_result_dict_box(
 		prepared_value.get_or(entry.value),
 	)
 
-	if prepared_key.is_none() and prepared_value.is_none() and transferred_value.is_none():
+	if (
+		prepared_key.is_none()
+		and prepared_value.is_none()
+		and transferred_key.is_none()
+		and transferred_value.is_none()
+	):
 		None
 	else:
 		Some({
-			key = prepared_key.get_or(entry.key),
+			key = transferred_key.get_or(prepared_key.get_or(entry.key)),
 			value = transferred_value.get_or(prepared_value.get_or(entry.value)),
 		})
 
@@ -3157,100 +3149,42 @@ private pure func dict_key_value_types(typ: CoreType) -> Option[DictKeyValueType
 			None
 
 
-private pure func enum_decl_name_matches(decl: CoreDecl, name: String) -> Bool:
-	match decl:
-		EnumDecl(enum_decl):
-			enum_decl.name == name
-		_:
-			False
-
-
-private pure func has_enum_decl(decls: PrepareDecls, name: String) -> Bool:
-	var result: Bool = False
-
-	for decl in decls.decls:
-		if enum_decl_name_matches(decl, name):
-			result = True
-			break
-
-	result
-
-
----
-The container constructor for a Dict literal keyed by `key_type`. A key type
-with its own `Hashable.hash` and `Equatable.equals` uses those functions,
-found through the callback table; a key without one (or one the table does
-not know) hashes generically.
----
+--- Backend projection already lowered trait-keyed literals; a trait key here is an invariant failure C symbol projection reports.
 private pure func hash_container_constructor_for_key_type(
 	decls: PrepareDecls,
 	key_type: CoreType,
 ) -> CoreHashContainerConstructor:
-	match key_type:
-		NamedType(name, args):
-			if name == "String" and args.length() == 0:
-				StringHashContainerConstructor
-			else if (
-				(name == "Float" or name == "Float32" or name == "Float16")
-				and args.length() == 0
-			):
-				FloatHashContainerConstructor
-			else if has_enum_decl(decls, name) or generic_hash_container_type_name(name):
-				GenericHashContainerConstructor
-			else:
-				custom_hash_container_constructor_or_generic(
-					decls,
-					key_type,
-					pointer_box_storage_needs_release_type(key_type),
-				)
-		EnumType(name):
-			GenericHashContainerConstructor
-		ValueRecordType(name):
-			custom_hash_container_constructor_or_generic(decls, key_type, False)
-		_:
-			GenericHashContainerConstructor
-
-
-private pure func custom_hash_container_constructor_or_generic(
-	decls: PrepareDecls,
-	key_type: CoreType,
-	needs_release: Bool,
-) -> CoreHashContainerConstructor:
-	match (
-		find_runtime_callback(decls.callbacks, HashableHashCallback, key_type),
-		find_runtime_callback(decls.callbacks, EquatableEqualsCallback, key_type),
-	):
-		(Some(hash_fn), Some(equals_fn)):
-			CustomHashContainerConstructor(hash_fn, equals_fn, needs_release)
-		_:
-			GenericHashContainerConstructor
+	hash_container_constructor_for_key(decls.specialize_layout, key_type)
 
 
 ---
-Emission allocates a fresh box for a struct-boxed dict value, and
-`blorp_dict_insert` retains it under the dict's value release, so the
-literal must hand its own reference to the dict. Perceus cannot see this
-owner: it decides transfer from the boxed value, and value structs and stack
-Options are unmanaged. Their box is a plain byte copy that owns nothing
-else, so transferring it consumes nothing in Perceus terms.
+Emission allocates a fresh box for a struct-boxed dict entry, and
+`blorp_dict_insert` retains it under the dict's release for that slot, so the
+literal must hand its own reference to the dict. That holds for values, and
+for keys of trait-hashed dicts, whose slot adapters own the key box
+(`boxed_storage_slot_needs_release`). Perceus cannot see this owner: it
+decides transfer from the boxed value, and value structs and stack Options
+are unmanaged. Their box is a plain byte copy that owns nothing else, so
+transferring it consumes nothing in Perceus terms.
 
-Keys keep the borrowed default: struct-keyed dicts set no key release, so
-the runtime stores the key box without retaining it. Stack Results are
-excluded here: their payload may be managed, so a transfer before Perceus
-would move the source variable into the box. `prepare_dict_entry` instead
-transfers their fresh box after Perceus has settled the payload's owner.
+Stack Results are excluded here: their payload may be managed, so a transfer
+before Perceus would move the source variable into the box.
+`prepare_dict_entry` instead transfers their fresh box after Perceus has
+settled the payload's owner.
 ---
-private pure func dict_literal_value_storage_value(expr: CoreExpr) -> CoreBoxedStorageValue:
-	value: CoreBoxedStorageValue = boxed_storage_value_for_expr(expr)
-
+private pure func transfer_fresh_struct_box(value: CoreBoxedStorageValue) -> CoreBoxedStorageValue:
 	match value.kind:
 		StructBox(_):
-			if is_stack_result_type(expr_type(expr)):
+			if is_stack_result_type(expr_type(value.value)):
 				value
 			else:
 				{ value | transfers_ownership = True }
 		_:
 			value
+
+
+private pure func dict_literal_value_storage_value(expr: CoreExpr) -> CoreBoxedStorageValue:
+	transfer_fresh_struct_box(boxed_storage_value_for_expr(expr))
 
 
 private pure func box_dict_literal_entry(entry: CoreDictLiteralEntry) -> CoreDictEntry:
@@ -3276,6 +3210,46 @@ private pure func dict_literal_construct_expr(
 		},
 		typ,
 		loc,
+	)
+
+
+private pure func trait_keyed_dict_entry(
+	layout: CoreSpecializeLayout,
+	entry: CoreDictLiteralEntry,
+) -> CoreDictEntry:
+	{
+		key = transfer_fresh_struct_box(boxed_storage_value(layout, entry.key, False)),
+		value = dict_literal_value_storage_value(entry.value)
+	}
+
+
+---
+Lowers a trait-keyed Dict literal with the constructor backend projection
+bound, so the literal's key callbacks are referenced before dead-code
+elimination runs. Keys are boxed from the same specialize layout the key
+callbacks unbox with; values are boxed as the dict-literal ownership pass
+would box them.
+---
+pure func lower_trait_keyed_dict_literal(
+	layout: CoreSpecializeLayout,
+	constructor: CoreHashContainerConstructor,
+	entries: List[CoreDictLiteralEntry],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	types ?= dict_key_value_types(typ)
+	value_kind: CoreBoxKind = boxed_kind_for_type(types.value_type)
+
+	Some(
+		DictConstructExpr(
+			{
+				constructor = constructor,
+				entries = entries.map(func(entry): trait_keyed_dict_entry(layout, entry)),
+				value_needs_release = boxed_storage_type_needs_release(types.value_type, value_kind)
+			},
+			typ,
+			loc,
+		),
 	)
 
 
@@ -3326,11 +3300,14 @@ private pure func prepare_dict_literal_entry(
 
 
 private pure func transfer_stack_result_dict_entry_box(entry: CoreDictEntry) -> Option[CoreDictEntry]:
-	match transfer_stack_result_dict_value_box(entry.value):
-		Some(value):
-			Some({ entry | value = value })
-		None:
+	match (transfer_stack_result_dict_box(entry.key), transfer_stack_result_dict_box(entry.value)):
+		(None, None):
 			None
+		(key, value):
+			Some({
+				key = key.get_or(entry.key),
+				value = value.get_or(entry.value)
+			})
 
 
 ---
@@ -4106,7 +4083,7 @@ private pure func prepare_union_construct(
 	args: List[CoreExpr],
 	typ: CoreType,
 ) -> Option[CoreUnionConstruct]:
-	layout ?= decls.specialize_layout
+	layout: CoreSpecializeLayout = decls.specialize_layout
 
 	match typ:
 		UnionType(type_name):
@@ -5628,7 +5605,7 @@ private pure func prepare_dict_literals_for_ownership_decl(
 
 
 pure func prepare_dict_literals_for_ownership(program: CoreProgram) -> CoreProgram:
-	indexed: PrepareDecls = prepare_decls(program.decls, None, build_runtime_callback_table(program))
+	indexed: PrepareDecls = prepare_decls(program.decls, build_specialize_layout(program))
 
 	{ program |
 		decls = program.decls.map(
@@ -5693,7 +5670,7 @@ private pure func prepare_decl(decls: PrepareDecls, decl: CoreDecl) -> CoreDecl:
 
 pure func prepare_program(program: CoreProgram) -> CoreProgram:
 	layout: CoreSpecializeLayout = build_specialize_layout(program)
-	indexed: PrepareDecls = prepare_decls(program.decls, Some(layout), build_runtime_callback_table(program))
+	indexed: PrepareDecls = prepare_decls(program.decls, layout)
 	var decls: List[CoreDecl] = []
 
 	for decl in program.decls:

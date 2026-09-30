@@ -992,6 +992,17 @@ Insertion-ordered key-value maps with copy-on-write semantics. Iteration
 preserves the order keys were inserted; removing a key preserves the
 relative order of remaining keys.
 
+Keys are compared by value. Strings, floats, integers up to 64 bits, `Bool`,
+`Char`, and enums hash directly. Other key types (for example `Option[Int]`,
+`Result[Int, String]`, or your own `struct` and `record` types) hash and
+compare through their `Hashable` and `Equatable` implementations. `Option` and
+`Result` implement `Hashable` when their payloads do. A key stored as a
+copied value (a `struct`, a 128-bit integer, or an `Option` or `Result` of
+scalars and structs) without those implementations is a compile error. Any
+other key without them (a `record`, `List`, or tuple) currently falls back
+to comparing object identity, so implement both traits for such keys. The same
+rules apply to `Set` elements.
+
 ```blorp
 import:
     dict as D

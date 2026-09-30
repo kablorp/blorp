@@ -1,0 +1,358 @@
+-- Runtime key callbacks for Dict and Set keys that hash through their
+-- Hashable and Equatable impls.
+--
+-- The runtime stores every key in a `void*` slot and calls its hash and
+-- equality callbacks with those slots. An impl takes the key by its own Core
+-- type, which is a boxed copy for value structs, stack options, and stack
+-- results, so the impl cannot be the callback itself. Before backend
+-- projection, `mint_hash_key_callbacks` adds one adapter per impl method of a
+-- trait-hashed key type (origin `HashKeySlotAdapter(impl_def)`): it takes the
+-- slot as `Ptr`, unboxes it with the key's boxed-storage layout, and calls the
+-- impl. Backend projection then binds every trait-hashed constructor with
+-- `bound_hash_container_constructor`. Minting only scans declarations, and
+-- DCE drops the adapters of key types no container uses.
+import:
+	ir:
+		CoreBoxKind(
+			Float16Box,
+			Float32Box,
+			FloatBox,
+			Int128Box,
+			PointerBox,
+			PrimBox,
+			StructBox,
+			UInt128Box,
+			VoidBox,
+		),
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl),
+		CoreDeclaredOrigin(HashKeySlotAdapter),
+		CoreExpr(CallExpr, UnboxExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreFunctionOrigin(Declared),
+		CoreHashContainerConstructor(
+			CustomHashContainerConstructor,
+			GenericHashContainerConstructor,
+			TraitHashContainerConstructor,
+		),
+		CoreModuleOrigin(NoSourceModule),
+		CoreParam,
+		CoreProgram,
+		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
+		CoreSourceLoc,
+		CoreType(FunctionType, NamedType),
+		CoreUnboxKind(
+			Float16Unbox,
+			Float32Unbox,
+			FloatUnbox,
+			Int128Unbox,
+			PointerUnbox,
+			PrimUnbox,
+			StructUnbox,
+			UInt128Unbox,
+		),
+		CoreVar,
+		core_function_declared_origin,
+		synthetic_core_source_loc,
+	runtime_callbacks: CoreRuntimeCallbackTable, build_runtime_callback_table, find_runtime_callback
+	specialize_layout:
+		CoreHashKeyStrategy(FloatHashKeys, StringHashKeys, TraitHashKeys, WordHashKeys),
+		CoreSpecializeLayout,
+		boxed_storage_kind,
+		boxed_storage_slot_needs_release,
+		boxed_storage_unbox_kind,
+		build_specialize_layout,
+		hash_container_constructor_for_key,
+		hash_key_strategy,
+		resolve_specialize_type
+	synth_nodes: core_var
+
+
+private POINTER_TYPE: CoreType = NamedType("Ptr", [])
+
+-- Display names only: an adapter is identified by its origin and emitted by
+-- its definition id. `origin_name_agreement` checks the two agree.
+HASH_KEY_HASH_ADAPTER_NAME: String = "__hash_key_slot"
+
+HASH_KEY_EQUALS_ADAPTER_NAME: String = "__equals_key_slot"
+
+private KEY_PARAM_NAME: String = "key_slot"
+
+private LEFT_PARAM_NAME: String = "left_slot"
+
+private RIGHT_PARAM_NAME: String = "right_slot"
+
+
+--- The program with adapters appended and the definition-id frontier after them.
+record HashKeyCallbackResult {
+	program: CoreProgram,
+	next_def_id: Int
+}
+
+
+--- A minted adapter: its definition id and the slot layout it unboxes.
+record HashKeySlotAdapterInfo {
+	def_id: Int,
+	slot: CoreUnboxKind
+}
+
+
+---
+What backend projection binds trait-hashed containers with: the impl methods
+by key type (`callbacks`) and each impl method's slot adapter, keyed by the
+impl's definition id.
+---
+record HashKeyAdapterTable {
+	callbacks: CoreRuntimeCallbackTable,
+	adapters: Dict[Int, HashKeySlotAdapterInfo]
+}
+
+
+private pure func same_unbox_kind(left: CoreUnboxKind, right: CoreUnboxKind) -> Bool:
+	match (left, right):
+		(StructUnbox(left_type), StructUnbox(right_type)):
+			left_type == right_type
+		(FloatUnbox, FloatUnbox) | (Float32Unbox, Float32Unbox) | (Float16Unbox, Float16Unbox) | (Int128Unbox, Int128Unbox) | (UInt128Unbox, UInt128Unbox) | (PointerUnbox, PointerUnbox) | (PrimUnbox, PrimUnbox):
+			True
+		_:
+			False
+
+
+---
+The adapters `mint_hash_key_callbacks` added, found by origin. Each adapter's
+slot layout is the boxed-storage layout of its impl's key parameter, the same
+layout minting unboxed with, so binding can compare it with the container's
+own key layout.
+---
+pure func build_hash_key_adapter_table(
+	program: CoreProgram,
+	layout: CoreSpecializeLayout,
+	callbacks: CoreRuntimeCallbackTable,
+) -> HashKeyAdapterTable:
+	functions: Dict[Int, CoreFunction] = program_functions_by_def_id(program)
+	var adapters: Dict[Int, HashKeySlotAdapterInfo] = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match core_function_declared_origin(function_info.origin):
+					HashKeySlotAdapter(impl_def):
+						match functions.get(impl_def).and_then(func(impl_method): impl_method.params.get(0)):
+							Some(key_param):
+								adapters = adapters.set(impl_def, {
+									def_id = function_info.def_id,
+									slot = boxed_storage_unbox_kind(layout, resolve_specialize_type(layout, key_param.typ))
+								})
+							None:
+								void
+					_:
+						void
+			_:
+				void
+
+	{
+		callbacks = callbacks,
+		adapters = adapters
+	}
+
+
+private pure func program_functions_by_def_id(program: CoreProgram) -> Dict[Int, CoreFunction]:
+	var functions: Dict[Int, CoreFunction] = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				functions = functions.set(function_info.def_id, function_info)
+			_:
+				void
+
+	functions
+
+
+private pure func param_types(function_info: CoreFunction) -> List[CoreType]:
+	function_info.params.map(func(param): param.typ)
+
+
+private pure func slot_param(name: String, loc: CoreSourceLoc) -> CoreParam:
+	{
+		name = core_var(name),
+		typ = POINTER_TYPE,
+		loc = loc
+	}
+
+
+private pure func unboxed_slot(
+	layout: CoreSpecializeLayout,
+	name: String,
+	key_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	UnboxExpr(
+		boxed_storage_unbox_kind(layout, key_type),
+		VarExpr(core_var(name), POINTER_TYPE, loc),
+		key_type,
+		loc,
+	)
+
+
+private pure func adapter_function(
+	layout: CoreSpecializeLayout,
+	impl: CoreFunction,
+	key_type: CoreType,
+	name: String,
+	param_names: List[String],
+	def_id: Int,
+) -> CoreFunction:
+	loc: CoreSourceLoc = synthetic_core_source_loc()
+	callee_type: CoreType = FunctionType(impl.is_pure, param_types(impl), impl.return_type)
+	impl_var: CoreVar = core_var(impl.name)
+	callee: CoreVar = { impl_var | def_id = Some(impl.def_id) }
+
+	{
+		name = name,
+		source_module = None,
+		module = NoSourceModule,
+		type_params = [],
+		params = param_names.map(func(param_name): slot_param(param_name, loc)),
+		return_type = impl.return_type,
+		body = Some(
+			CallExpr(
+				UserCall(impl.name, Some(impl.def_id), []),
+				VarExpr(callee, callee_type, loc),
+				param_names.map(func(param_name): unboxed_slot(layout, param_name, key_type, loc)),
+				impl.return_type,
+				loc,
+			),
+		),
+		is_pure = impl.is_pure,
+		function_kind = UserFunction,
+		origin = Declared(HashKeySlotAdapter(impl.def_id)),
+		def_id = def_id,
+		loc = loc
+	}
+
+
+---
+Appends a slot adapter for the Hashable and Equatable impl methods of every
+trait-hashed key type that has both. Keys the runtime hashes itself (words,
+strings, floats) never get adapters. Only declarations are scanned.
+---
+pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> HashKeyCallbackResult:
+	layout: CoreSpecializeLayout = build_specialize_layout(program)
+	callbacks: CoreRuntimeCallbackTable = build_runtime_callback_table(program)
+	functions: Dict[Int, CoreFunction] = program_functions_by_def_id(program)
+	var adapters: List[CoreDecl] = []
+	var next_id: Int = next_def_id
+
+	for (type_key, hash_def) in callbacks.hashable_hash:
+		match (functions.get(hash_def), callbacks.equatable_equals.get(type_key)):
+			(Some(hash_impl), Some(equals_def)):
+				match (hash_impl.params, functions.get(equals_def)):
+					([key_param], Some(equals_impl)):
+						key_type: CoreType = resolve_specialize_type(layout, key_param.typ)
+
+						match hash_key_strategy(layout, key_type):
+							TraitHashKeys:
+								adapters = adapters.concat([
+									FunctionDecl(
+										adapter_function(
+											layout,
+											hash_impl,
+											key_type,
+											HASH_KEY_HASH_ADAPTER_NAME,
+											[KEY_PARAM_NAME],
+											next_id,
+										),
+									),
+									FunctionDecl(
+										adapter_function(
+											layout,
+											equals_impl,
+											key_type,
+											HASH_KEY_EQUALS_ADAPTER_NAME,
+											[LEFT_PARAM_NAME, RIGHT_PARAM_NAME],
+											next_id + 1,
+										),
+									),
+								])
+								next_id += 2
+							WordHashKeys | StringHashKeys | FloatHashKeys:
+								void
+					_:
+						void
+			_:
+				void
+
+	{
+		program = { program | decls = program.decls.concat(adapters) },
+		next_def_id = next_id
+	}
+
+
+---
+A key whose slot is a fresh box per insert (value structs, stack options and
+results, 128-bit integers) can never be found again by pointer identity, so
+a missing adapter for it stays an unbound trait constructor, which C symbol
+projection reports. Pointer-shaped keys without impls (records, lists,
+tuples) keep pointer-identity hashing until Dict and Set require
+`K: Hashable` at typecheck. 128-bit integers land in the first group even
+though they are Hashable: their impl is a runtime builtin with no Core
+function to adapt.
+---
+private pure func missing_impls_are_fatal(layout: CoreSpecializeLayout, key_type: CoreType) -> Bool:
+	match boxed_storage_kind(layout, key_type):
+		StructBox(_) | Int128Box | UInt128Box:
+			True
+		PointerBox | PrimBox | VoidBox | FloatBox | Float32Box | Float16Box:
+			False
+
+
+---
+The adapter for `role`'s impl method on `key_type`, when it unboxes the slot
+layout the container boxes. The type key alone does not distinguish, say,
+stack and boxed results, so the layouts must agree.
+---
+private pure func slot_adapter(
+	layout: CoreSpecializeLayout,
+	table: HashKeyAdapterTable,
+	role: CoreRuntimeCallbackRole,
+	key_type: CoreType,
+) -> Option[Int]:
+	impl_def ?= find_runtime_callback(table.callbacks, role, key_type)
+	adapter ?= table.adapters.get(impl_def)
+
+	if same_unbox_kind(adapter.slot, boxed_storage_unbox_kind(layout, key_type)):
+		Some(adapter.def_id)
+	else:
+		None
+
+
+---
+The constructor for a Dict or Set keyed by `key_type`. A trait-hashed key
+binds to the slot adapters of its Hashable and Equatable impls.
+---
+pure func bound_hash_container_constructor(
+	layout: CoreSpecializeLayout,
+	table: HashKeyAdapterTable,
+	key_type: CoreType,
+) -> CoreHashContainerConstructor:
+	match hash_container_constructor_for_key(layout, key_type):
+		TraitHashContainerConstructor(key):
+			match (
+				slot_adapter(layout, table, HashableHashCallback, key),
+				slot_adapter(layout, table, EquatableEqualsCallback, key),
+			):
+				(Some(hash_adapter), Some(equals_adapter)):
+					CustomHashContainerConstructor(
+						hash_adapter,
+						equals_adapter,
+						boxed_storage_slot_needs_release(layout, key),
+					)
+				_:
+					if missing_impls_are_fatal(layout, key):
+						TraitHashContainerConstructor(key)
+					else:
+						GenericHashContainerConstructor
+		constructor:
+			constructor

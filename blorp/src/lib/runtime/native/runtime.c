@@ -21800,18 +21800,16 @@ void blorp_dict_init_key_string(blorp_Dict* dict) {
 // ---------------------------------------------------------------------------
 // Custom (user-defined Hashable+Equatable) key dispatch
 // ---------------------------------------------------------------------------
-// Takes caller-supplied hash_fn and eq_fn for keys whose types live outside
-// the primitive set. The codegen for [Dict[UserType, V]] (where UserType
-// has source-level Hashable + Equatable impls) routes construction through
-// this entry point, passing the user impl functions with ABI-compatible
-// pointer casts. key_release is NULL for value-type keys (structs held by
-// value boxed into void*) and the standard ARC release otherwise.
+// Takes caller-supplied hash_fn and eq_fn for keys that hash through their
+// Hashable + Equatable impls (Option, Result, structs, records, ...). The
+// compiler's hash-key-callback pass passes minted adapters that take the key's
+// void* slot, unbox it, and call the impl, so each callback's parameters are
+// pointer-shaped. key_release is the standard ARC release whenever the slot
+// owns a box or a managed pointer.
 //
-// The cast of the user's [Hashable_hash_T(T*) -> long] to
-// [unsigned long (*)(void*)] is technically UB under strict C, but every
-// platform blorp targets (x86_64 / aarch64 macOS, Linux, BSD) has
-// ABI-compatible layouts for pointer-arg + word-return. If CFI is ever
-// enabled, this call site needs per-type shims instead.
+// The remaining casts ([long (*)(void*)] to [unsigned long (*)(void*)] and a
+// Bool-returning adapter to [bool (*)(void*, void*)]) only change the integer
+// return type; every platform blorp targets returns both in the same register.
 blorp_Dict* blorp_dict_new_custom(
     unsigned long (*hash_fn)(void*),
     bool (*eq_fn)(void*, void*),

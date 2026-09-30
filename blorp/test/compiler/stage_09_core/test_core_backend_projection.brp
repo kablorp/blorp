@@ -13,7 +13,7 @@ import:
 			ListToStringCall,
 			OperationResultCall,
 		),
-		CoreDeclaredOrigin(ProjectedImplMethod),
+		CoreDeclaredOrigin(HashKeySlotAdapter, ProjectedImplMethod),
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, UnionDecl),
 		CoreDirectRuntimeArgs(
 			DirectRuntimeArgsAppendListParallelLayout,
@@ -39,14 +39,20 @@ import:
 			StringSetLenExpr,
 			TensorRawFillExpr,
 			VarExpr,
+			UnboxExpr,
 			VoidExpr,
 		),
 		CoreFallibleStreamTerminalPayload(FallibleStreamPayloadInt),
 		CoreFunctionKind(UserFunction),
-		CoreHashContainerConstructor(CustomHashContainerConstructor),
+		CoreHashContainerConstructor(
+			CustomHashContainerConstructor,
+			GenericHashContainerConstructor,
+			TraitHashContainerConstructor,
+		),
 		CoreListAccessBounds(ProvenListAccess),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreOperationResultLayoutPolicy(BoxedResultOnlyPolicy, DefaultResultLayoutPolicy),
+		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
 		CoreRuntimeSuccessPayload(
@@ -69,11 +75,13 @@ import:
 			UnionType,
 			VoidType,
 		),
+		CoreUnboxKind(PointerUnbox),
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionVariant,
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 	../../../src/compiler/stage_10_backend/c_naming: variant_constructor_symbol
+	list: repeat
 	test: TestSuite
 
 
@@ -497,6 +505,70 @@ pure func test_projects_list_string_callback() -> Bool:
 			False
 
 
+pure func pointer_slot_call(slot_count: Int) -> CoreExpr:
+	slot: CoreExpr = UnboxExpr(
+		PointerUnbox,
+		variable("slot", named_type("Ptr")),
+		UnionType("Key"),
+		synthetic_core_source_loc(),
+	)
+	args: List[CoreExpr] = if slot_count == 1:
+		[slot]
+	else:
+		[slot, slot]
+	builtin_call("impl", args, named_type("Int"))
+
+
+---
+A slot adapter the way `hash_key_callbacks` mints one: identified by its
+origin, whose payload is the impl method it calls.
+---
+pure func slot_adapter_decl(def_id: Int, impl_def: Int, slot_count: Int) -> CoreDecl:
+	match function_decl("adapter", def_id, Some(pointer_slot_call(slot_count))):
+		FunctionDecl(function):
+			FunctionDecl({ function | origin = Declared(HashKeySlotAdapter(impl_def)) })
+		other:
+			other
+
+
+--- An impl method taking `param_count` keys, as the adapter table reads it.
+pure func key_callback_decl(
+	def_id: Int,
+	role: CoreRuntimeCallbackRole,
+	param_count: Int,
+) -> CoreDecl:
+	key_type: CoreType = UnionType("Key")
+	key_param: CoreParam = {
+		name = core_var("key"),
+		typ = key_type,
+		loc = synthetic_core_source_loc()
+	}
+
+	match callback_decl("key_callback", def_id, key_type, role):
+		FunctionDecl(function):
+			FunctionDecl({ function | params = repeat(key_param, param_count) })
+		other:
+			other
+
+
+--- Key's hash and equals impls (defs 2 and 3) and their slot adapters (4 and 5).
+pure func key_adapter_decls() -> List[CoreDecl]:
+	[
+		key_callback_decl(2, HashableHashCallback, 1),
+		key_callback_decl(3, EquatableEqualsCallback, 2),
+		slot_adapter_decl(4, 2, 1),
+		slot_adapter_decl(5, 3, 2),
+	]
+
+
+pure func binds_key_adapters(constructor: CoreHashContainerConstructor) -> Bool:
+	match constructor:
+		CustomHashContainerConstructor(hash_fn, equals_fn, needs_release):
+			hash_fn == 4 and equals_fn == 5 and needs_release
+		_:
+			False
+
+
 pure func test_projects_custom_dict_constructor() -> Bool:
 	key_type: CoreType = UnionType("Key")
 	dict_type: CoreType = NamedType(
@@ -509,22 +581,14 @@ pure func test_projects_custom_dict_constructor() -> Bool:
 		dict_type,
 	)
 	program: CoreProgram = {
-		decls = [
-			function_decl("main", 1, Some(call)),
-			callback_decl("pkg__Hashable_hash_Key", 2, UnionType("Key"), HashableHashCallback),
-			callback_decl("pkg__Equatable_equals_Key", 3, UnionType("Key"), EquatableEqualsCallback),
-		],
+		decls = [function_decl("main", 1, Some(call))].concat(key_adapter_decls()),
 		foreign_includes = [],
 		source_files = []
 	}
 
 	match projected_body(program):
-		Some(CallExpr(DictWithCapacityCall(CustomHashContainerConstructor(hash_fn, equals_fn, needs_release)), _, _, _, _)):
-			(
-				hash_fn == 2
-				and equals_fn == 3
-				and needs_release
-			)
+		Some(CallExpr(DictWithCapacityCall(constructor), _, _, _, _)):
+			binds_key_adapters(constructor)
 		_:
 			False
 
@@ -536,22 +600,14 @@ pure func test_callback_lookup_reads_origin_not_spelling() -> Bool:
 	dict_type: CoreType = NamedType("Dict", [key_type, named_type("Int")])
 	call: CoreExpr = builtin_call("blorp_dict_new_custom", [], dict_type)
 	program: CoreProgram = {
-		decls = [
-			function_decl("main", 1, Some(call)),
-			callback_decl("key_hasher", 2, key_type, HashableHashCallback),
-			callback_decl("key_equality", 3, key_type, EquatableEqualsCallback),
-		],
+		decls = [function_decl("main", 1, Some(call))].concat(key_adapter_decls()),
 		foreign_includes = [],
 		source_files = []
 	}
 
 	match projected_body(program):
 		Some(DictConstructExpr(construct, _, _)):
-			match construct.constructor:
-				CustomHashContainerConstructor(hash_fn, equals_fn, _):
-					hash_fn == 2 and equals_fn == 3
-				_:
-					False
+			binds_key_adapters(construct.constructor)
 		_:
 			False
 
@@ -571,8 +627,12 @@ pure func test_functions_spelled_like_callbacks_without_the_origin_are_not_callb
 	}
 
 	match projected_body(program):
-		Some(CallExpr(BuiltinCall(_), _, _, _, _)):
-			True
+		Some(DictConstructExpr(construct, _, _)):
+			match construct.constructor:
+				CustomHashContainerConstructor(_, _, _):
+					False
+				_:
+					True
 		_:
 			False
 
@@ -585,28 +645,18 @@ pure func test_projects_empty_custom_dict_constructor() -> Bool:
 	)
 	call: CoreExpr = builtin_call("blorp_dict_new_custom", [], dict_type)
 	program: CoreProgram = {
-		decls = [
-			function_decl("main", 1, Some(call)),
-			callback_decl("pkg__Hashable_hash_Key", 2, UnionType("Key"), HashableHashCallback),
-			callback_decl("pkg__Equatable_equals_Key", 3, UnionType("Key"), EquatableEqualsCallback),
-		],
+		decls = [function_decl("main", 1, Some(call))].concat(key_adapter_decls()),
 		foreign_includes = [],
 		source_files = []
 	}
 
 	match projected_body(program):
 		Some(DictConstructExpr(construct, _, _)):
-			match construct.constructor:
-				CustomHashContainerConstructor(hash_fn, equals_fn, needs_release):
-					(
-						hash_fn == 2
-						and equals_fn == 3
-						and needs_release
-						and construct.entries.is_empty()
-						and not construct.value_needs_release
-					)
-				_:
-					False
+			(
+				binds_key_adapters(construct.constructor)
+				and construct.entries.is_empty()
+				and not construct.value_needs_release
+			)
 		_:
 			False
 
@@ -616,22 +666,103 @@ pure func test_projects_empty_custom_set_constructor() -> Bool:
 	set_type: CoreType = NamedType("Set", [element_type])
 	call: CoreExpr = builtin_call("blorp_set_new_custom", [], set_type)
 	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(call))].concat(key_adapter_decls()),
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match projected_body(program):
+		Some(SetAllocExpr(constructor, _, _)):
+			binds_key_adapters(constructor)
+		_:
+			False
+
+
+pure func test_keeps_identity_hashing_for_pointer_key_without_adapters() -> Bool:
+	set_type: CoreType = NamedType("Set", [UnionType("Key")])
+	call: CoreExpr = builtin_call("blorp_set_new_custom", [], set_type)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(call))],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match projected_body(program):
+		Some(SetAllocExpr(GenericHashContainerConstructor, _, _)):
+			True
+		_:
+			False
+
+
+pure func test_lowers_trait_keyed_dict_literal_with_adapters() -> Bool:
+	key_type: CoreType = UnionType("Key")
+	dict_type: CoreType = NamedType("Dict", [key_type, named_type("Int")])
+	literal: CoreExpr = DictExpr(
+		[
+			{
+				key = variable("key", key_type),
+				value = variable("value", named_type("Int"))
+			},
+		],
+		dict_type,
+		synthetic_core_source_loc(),
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(literal))].concat(key_adapter_decls()),
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match projected_body(program):
+		Some(DictConstructExpr(construct, _, _)):
+			binds_key_adapters(construct.constructor) and construct.entries.length() == 1
+		_:
+			False
+
+
+pure func test_leaves_word_keyed_dict_literal_for_ownership_pass() -> Bool:
+	dict_type: CoreType = NamedType("Dict", [named_type("Int"), named_type("Int")])
+	literal: CoreExpr = DictExpr(
+		[
+			{
+				key = variable("key", named_type("Int")),
+				value = variable("value", named_type("Int"))
+			},
+		],
+		dict_type,
+		synthetic_core_source_loc(),
+	)
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(literal))],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match projected_body(program):
+		Some(DictExpr(entries, _, _)):
+			entries.length() == 1
+		_:
+			False
+
+
+pure func test_projects_empty_option_keyed_set_as_trait_hashed() -> Bool:
+	element_type: CoreType = NamedType("Option", [named_type("Int")])
+	set_type: CoreType = NamedType("Set", [element_type])
+	program: CoreProgram = {
 		decls = [
-			function_decl("main", 1, Some(call)),
-			callback_decl("pkg__Hashable_hash_Key", 2, UnionType("Key"), HashableHashCallback),
-			callback_decl("pkg__Equatable_equals_Key", 3, UnionType("Key"), EquatableEqualsCallback),
+			function_decl(
+				"main",
+				1,
+				Some(DictExpr([], set_type, synthetic_core_source_loc())),
+			),
 		],
 		foreign_includes = [],
 		source_files = []
 	}
 
 	match projected_body(program):
-		Some(SetAllocExpr(CustomHashContainerConstructor(hash_fn, equals_fn, needs_release), _, _)):
-			(
-				hash_fn == 2
-				and equals_fn == 3
-				and needs_release
-			)
+		Some(SetAllocExpr(TraitHashContainerConstructor(NamedType("Option", [NamedType("Int", [])])), _, _)):
+			True
 		_:
 			False
 
@@ -1951,6 +2082,19 @@ tests: TestSuite = {
 		),
 		("projects empty custom dict constructor", test_projects_empty_custom_dict_constructor),
 		("projects empty custom set constructor", test_projects_empty_custom_set_constructor),
+		(
+			"projects empty option-keyed set as trait hashed",
+			test_projects_empty_option_keyed_set_as_trait_hashed,
+		),
+		(
+			"keeps identity hashing for pointer key without adapters",
+			test_keeps_identity_hashing_for_pointer_key_without_adapters,
+		),
+		("lowers trait-keyed dict literal with adapters", test_lowers_trait_keyed_dict_literal_with_adapters),
+		(
+			"leaves word-keyed dict literal for ownership pass",
+			test_leaves_word_keyed_dict_literal_for_ownership_pass,
+		),
 		("projects singleton constructor value", test_projects_singleton_constructor_value),
 		(
 			"projects global singleton constructor value",

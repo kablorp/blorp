@@ -289,6 +289,7 @@ lower + ffi_boundary + list_layout
   -> string_pipeline + collection_pipeline
   -> parallel_tensor_pipeline + tensor_fusion + tuple_sroa
   -> function-reference adaptation + tensor_specialize + specialize
+  -> hash-key callbacks
   -> callable resolution + backend projection + match projection + dce
   -> consume_specialize
   -> static_string_literals
@@ -311,7 +312,13 @@ affected stages.
 The grouped late stages above are semantically significant. Specialization
 first adapts function references and specializes tensor dispatch before general
 ABI specialization. The projected DCE stage then resolves callable IDs and
-projects backend calls and matches before pruning. Perceus ingress runs consume
+projects backend calls and matches before pruning. Just before projection,
+`hash_key_callbacks.brp` mints, from declarations alone, adapter functions
+that take the runtime's boxed key slot and call a key type's Hashable and
+Equatable impls. Backend projection binds every trait-hashed Dict and Set
+constructor (and lowers trait-keyed Dict literals) to those adapters by
+definition id, DCE drops adapters no container uses, and Perceus sees the adapters'
+borrowed unboxing. Perceus ingress runs consume
 specialization, lowers record updates to ownership-visible forms, and prepares
 dictionary literals so every transferred entry is explicit. These operations
 are not emitter cleanup and must not be reordered or omitted from ownership

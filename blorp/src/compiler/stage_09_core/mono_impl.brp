@@ -9,11 +9,11 @@ import:
 		CoreMonoSubstitutionValue(TypeSubstitution),
 		CoreCallKind(BuiltinCall, DeferredTraitCall, SelectedDirectCall, SelectedTraitCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
-		CoreExpr(BinaryExpr, CallExpr, LogicalExpr, SeqExpr, UnaryExpr, VarExpr),
+		CoreExpr(BinaryExpr, CallExpr, DictExpr, LogicalExpr, SeqExpr, UnaryExpr, VarExpr),
 		CoreFunction,
 		CoreImplDecl,
 		CoreProgram,
-		CoreType(NamedType),
+		CoreType(NamedType, TupleType),
 		CoreTypeParam,
 		CoreVar,
 		core_expr_type,
@@ -29,6 +29,8 @@ import:
 		CoreTraitMethodIdentity,
 		core_binary_trait_method,
 		core_builtin_trait_method,
+		core_hash_key_equals_method,
+		core_hash_key_hash_method,
 		core_unary_trait_method,
 	traverse as CoreTraverse
 
@@ -70,6 +72,10 @@ private type alias CoreMonoDefIdMap = List[CoreMonoMethodIdRewrite]
 private LIST_TYPE_NAME: String = "List"
 
 private TO_STRING_CORE_SENTINEL: String = "blorp_to_string"
+
+private DICT_TYPE_NAME: String = "Dict"
+
+private SET_TYPE_NAME: String = "Set"
 
 
 private pure func impl_type_param_names(type_params: List[CoreTypeParam]) -> List[String]:
@@ -272,6 +278,99 @@ private pure func list_element_type(typ: CoreType) -> Option[CoreType]:
 			None
 
 
+---
+The key type of a Dict or Set value, when it instantiates a generic type. A
+generic impl template can only match an instantiated type, so bare named
+keys (Int, String, user records) never need a materialization request, and
+skipping them keeps this off the hot path of every `dict.set` call.
+---
+private pure func hash_container_key_type(typ: CoreType) -> Option[CoreType]:
+	key_type ?= match typ:
+		NamedType(name, args):
+			if name == DICT_TYPE_NAME and args.length() == 2:
+				args.get(0)
+			else if name == SET_TYPE_NAME and args.length() == 1:
+				args.get(0)
+			else:
+				None
+		_:
+			None
+
+	match key_type:
+		NamedType(_, []):
+			None
+		NamedType(_, _) | TupleType(_):
+			Some(key_type)
+		_:
+			None
+
+
+--- A container is only ever produced by a call or a literal.
+private pure func hash_container_produced_key_type(expr: CoreExpr) -> Option[CoreType]:
+	match expr:
+		CallExpr(_, _, _, result_type, _):
+			hash_container_key_type(result_type)
+		DictExpr(_, typ, _):
+			hash_container_key_type(typ)
+		_:
+			None
+
+
+private pure func append_identity_request(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	unresolved_type_params: List[String],
+	identity: CoreTraitMethodIdentity,
+	receiver_type: CoreType,
+) -> List[CoreMonoImplRequest]:
+	match request_for_identity(
+		generic_impls,
+		concrete_keys,
+		requests,
+		unresolved_type_params,
+		identity,
+		receiver_type,
+	):
+		Some(request):
+			append_request(concrete_keys, requests, request)
+		None:
+			requests
+
+
+---
+Dict and Set hash and compare keys through the key type's Hashable and
+Equatable impls (`hash_key_callbacks`), which nothing else calls directly.
+---
+private pure func collect_hash_key_requests(
+	generic_impls: List[CoreImplDecl],
+	concrete_keys: List[String],
+	requests: List[CoreMonoImplRequest],
+	unresolved_type_params: List[String],
+	expr: CoreExpr,
+) -> List[CoreMonoImplRequest]:
+	match hash_container_produced_key_type(expr):
+		Some(key_type):
+			with_hash: List[CoreMonoImplRequest] = append_identity_request(
+				generic_impls,
+				concrete_keys,
+				requests,
+				unresolved_type_params,
+				core_hash_key_hash_method(),
+				key_type,
+			)
+			append_identity_request(
+				generic_impls,
+				concrete_keys,
+				with_hash,
+				unresolved_type_params,
+				core_hash_key_equals_method(),
+				key_type,
+			)
+		None:
+			requests
+
+
 private pure func collect_builtin_trait_dependency_requests(
 	generic_impls: List[CoreImplDecl],
 	concrete_keys: List[String],
@@ -404,6 +503,13 @@ private pure func collect_expr_requests(
 						void
 
 				collected = collect_builtin_trait_dependency_requests(
+					generic_impls,
+					concrete_keys,
+					collected,
+					unresolved_type_params,
+					node,
+				)
+				collected = collect_hash_key_requests(
 					generic_impls,
 					concrete_keys,
 					collected,

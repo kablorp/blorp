@@ -1,0 +1,311 @@
+import:
+	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
+	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/hash_key_callbacks:
+		HashKeyAdapterTable,
+		HashKeyCallbackResult,
+		bound_hash_container_constructor,
+		build_hash_key_adapter_table,
+		mint_hash_key_callbacks,
+	../../../src/compiler/stage_09_core/runtime_callbacks: build_runtime_callback_table
+	../../../src/compiler/stage_09_core/specialize_layout: build_specialize_layout
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinderOrigin(AuthoredBinder),
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl),
+		CoreDeclaredOrigin(HashKeySlotAdapter, ProjectedImplMethod),
+		CoreExpr(CallExpr, LiteralExpr, UnboxExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreFunctionOrigin(Declared),
+		CoreHashContainerConstructor(
+			CustomHashContainerConstructor,
+			GenericHashContainerConstructor,
+			TraitHashContainerConstructor,
+		),
+		CoreImplMethodRole(RuntimeCallbackMethod),
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
+		CoreType(HeapRecordType, NamedType, ValueRecordType),
+		CoreUnboxKind(PointerUnbox, StructUnbox),
+		CoreVar,
+		core_function_declared_origin,
+		synthetic_core_source_loc,
+	test: TestSuite
+
+
+private POINT_TYPE: CoreType = ValueRecordType("Point")
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private FIRST_FREE_DEF_ID: Int = 100
+
+private MAIN_DEF_ID: Int = 1
+
+private HASH_IMPL_DEF_ID: Int = 2
+
+private EQUALS_IMPL_DEF_ID: Int = 3
+
+
+pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		id = 0,
+		def_id = None,
+		origin = AuthoredBinder
+	}
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name),
+		typ = typ,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, synthetic_core_source_loc())
+
+
+pure func function_info(
+	name: String,
+	def_id: Int,
+	params: List[CoreParam],
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = Some(body),
+		is_pure = True,
+		function_kind = UserFunction,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		def_id = def_id,
+		loc = synthetic_core_source_loc()
+	}
+
+
+---
+An impl method as runtime projection leaves it. The name is deliberately not
+the `Trait_method_Type` spelling: only the origin says what it implements.
+---
+pure func impl_method(
+	def_id: Int,
+	key_type: CoreType,
+	role: CoreRuntimeCallbackRole,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreDecl:
+	FunctionDecl({ function_info("impl", def_id, params, return_type, int_literal(0)) |
+		origin = Declared(
+			ProjectedImplMethod(
+				synthesized_name_id("_"),
+				synthesized_name_id("_"),
+				key_type,
+				RuntimeCallbackMethod(role),
+			),
+		)
+	})
+
+
+pure func hash_impl(key_type: CoreType) -> CoreDecl:
+	impl_method(HASH_IMPL_DEF_ID, key_type, HashableHashCallback, [param("self", key_type)], INT_TYPE)
+
+
+pure func equals_impl(key_type: CoreType) -> CoreDecl:
+	impl_method(
+		EQUALS_IMPL_DEF_ID,
+		key_type,
+		EquatableEqualsCallback,
+		[param("a", key_type), param("b", key_type)],
+		BOOL_TYPE,
+	)
+
+
+pure func program_with(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = [FunctionDecl(function_info("main", MAIN_DEF_ID, [], INT_TYPE, int_literal(0)))].concat(decls),
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func minted(decls: List[CoreDecl]) -> HashKeyCallbackResult:
+	mint_hash_key_callbacks(program_with(decls), FIRST_FREE_DEF_ID)
+
+
+pure func adapter_for(program: CoreProgram, impl_def: Int) -> Option[CoreFunction]:
+	var found: Option[CoreFunction] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(candidate):
+				match core_function_declared_origin(candidate.origin):
+					HashKeySlotAdapter(target):
+						if found.is_none() and target == impl_def:
+							found = Some(candidate)
+					_:
+						void
+			_:
+				void
+
+	found
+
+
+pure func is_struct_slot_unbox(expr: CoreExpr, slot_name: String, struct_name: String) -> Bool:
+	match expr:
+		UnboxExpr(StructUnbox(c_type), VarExpr(slot, NamedType("Ptr", []), _), ValueRecordType(unboxed), _):
+			c_type == struct_name and slot.name == slot_name and unboxed == struct_name
+		_:
+			False
+
+
+pure func adapter_table(program: CoreProgram) -> HashKeyAdapterTable:
+	build_hash_key_adapter_table(program, build_specialize_layout(program), build_runtime_callback_table(program))
+
+
+pure func test_mints_value_record_slot_adapters() -> Bool:
+	result: HashKeyCallbackResult = minted([hash_impl(POINT_TYPE), equals_impl(POINT_TYPE)])
+
+	hash_adapter_calls_impl: Bool = match adapter_for(result.program, HASH_IMPL_DEF_ID):
+		Some(adapter):
+			match adapter.body:
+				Some(CallExpr(UserCall(_, Some(impl_id), _), _, [key], _, _)):
+					(
+						impl_id == HASH_IMPL_DEF_ID
+						and adapter.def_id == FIRST_FREE_DEF_ID
+						and adapter.params.map(func(p): p.typ) == [NamedType("Ptr", [])]
+						and is_struct_slot_unbox(key, "key_slot", "Point")
+					)
+				_:
+					False
+		None:
+			False
+
+	equals_adapter_calls_impl: Bool = match adapter_for(result.program, EQUALS_IMPL_DEF_ID):
+		Some(adapter):
+			match adapter.body:
+				Some(CallExpr(UserCall(_, Some(impl_id), _), _, [left, right], _, _)):
+					(
+						impl_id == EQUALS_IMPL_DEF_ID
+						and adapter.def_id == FIRST_FREE_DEF_ID + 1
+						and is_struct_slot_unbox(left, "left_slot", "Point")
+						and is_struct_slot_unbox(right, "right_slot", "Point")
+					)
+				_:
+					False
+		None:
+			False
+
+	hash_adapter_calls_impl and equals_adapter_calls_impl and result.next_def_id == FIRST_FREE_DEF_ID + 2
+
+
+pure func test_mints_nothing_without_hash_impls() -> Bool:
+	result: HashKeyCallbackResult = minted([])
+	result.program.decls.length() == 1 and result.next_def_id == FIRST_FREE_DEF_ID
+
+
+pure func test_needs_both_impls_to_mint() -> Bool:
+	result: HashKeyCallbackResult = minted([hash_impl(POINT_TYPE)])
+	adapter_for(result.program, HASH_IMPL_DEF_ID).is_none() and result.next_def_id == FIRST_FREE_DEF_ID
+
+
+pure func test_mints_nothing_for_runtime_hashed_keys() -> Bool:
+	result: HashKeyCallbackResult = minted([hash_impl(INT_TYPE), equals_impl(INT_TYPE)])
+	result.next_def_id == FIRST_FREE_DEF_ID
+
+
+pure func test_unboxes_heap_record_slot_as_pointer() -> Bool:
+	key_type: CoreType = HeapRecordType("Account")
+	result: HashKeyCallbackResult = minted([hash_impl(key_type), equals_impl(key_type)])
+
+	match adapter_for(result.program, HASH_IMPL_DEF_ID):
+		Some(adapter):
+			match adapter.body:
+				Some(CallExpr(_, _, [UnboxExpr(PointerUnbox, _, HeapRecordType("Account"), _)], _, _)):
+					True
+				_:
+					False
+		None:
+			False
+
+
+pure func test_binds_value_record_key_to_minted_adapters() -> Bool:
+	result: HashKeyCallbackResult = minted([hash_impl(POINT_TYPE), equals_impl(POINT_TYPE)])
+
+	match bound_hash_container_constructor(
+		build_specialize_layout(result.program),
+		adapter_table(result.program),
+		POINT_TYPE,
+	):
+		-- The slot owns the key's struct box, so the container releases it.
+		CustomHashContainerConstructor(hash_fn, equals_fn, needs_release):
+			hash_fn == FIRST_FREE_DEF_ID and equals_fn == FIRST_FREE_DEF_ID + 1 and needs_release
+		_:
+			False
+
+
+pure func test_leaves_boxed_key_without_adapters_unbound() -> Bool:
+	program: CoreProgram = program_with([])
+
+	match bound_hash_container_constructor(build_specialize_layout(program), adapter_table(program), POINT_TYPE):
+		TraitHashContainerConstructor(ValueRecordType("Point")):
+			True
+		_:
+			False
+
+
+pure func test_refuses_adapters_with_a_different_slot_layout() -> Bool:
+	-- Adapters minted for a heap record never bind a value record that shares
+	-- its impls' type key, since they unbox a pointer, not a struct.
+	result: HashKeyCallbackResult = minted([hash_impl(HeapRecordType("Point")), equals_impl(HeapRecordType("Point"))])
+
+	match bound_hash_container_constructor(
+		build_specialize_layout(result.program),
+		adapter_table(result.program),
+		POINT_TYPE,
+	):
+		TraitHashContainerConstructor(_):
+			True
+		_:
+			False
+
+
+pure func test_keeps_identity_hashing_for_record_without_adapters() -> Bool:
+	program: CoreProgram = program_with([])
+
+	match bound_hash_container_constructor(
+		build_specialize_layout(program),
+		adapter_table(program),
+		HeapRecordType("Account"),
+	):
+		GenericHashContainerConstructor:
+			True
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Core hash-key callback adapters",
+	tests = [
+		("mints value record slot adapters", test_mints_value_record_slot_adapters),
+		("mints nothing without hash impls", test_mints_nothing_without_hash_impls),
+		("needs both impls to mint", test_needs_both_impls_to_mint),
+		("mints nothing for runtime-hashed keys", test_mints_nothing_for_runtime_hashed_keys),
+		("unboxes heap record slot as pointer", test_unboxes_heap_record_slot_as_pointer),
+		("binds value record key to minted adapters", test_binds_value_record_key_to_minted_adapters),
+		("leaves boxed key without adapters unbound", test_leaves_boxed_key_without_adapters_unbound),
+		("refuses adapters with a different slot layout", test_refuses_adapters_with_a_different_slot_layout),
+		("keeps identity hashing for record without adapters", test_keeps_identity_hashing_for_record_without_adapters),
+	]
+}
