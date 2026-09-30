@@ -33,9 +33,21 @@ def load_manifest(path: Path) -> dict[str, object]:
 
 
 def source_imports(path: Path) -> list[str]:
+	"""Import module names of a real Blorp source, which must be UTF-8.
+
+	Fixture inputs are not sources and never reach this function: they may
+	contain invalid bytes on purpose (see `test_module_sources`).
+	"""
 	imports: list[str] = []
 	in_import_block = False
-	for line in path.read_text(encoding="utf-8").splitlines():
+	try:
+		text = path.read_text(encoding="utf-8")
+	except UnicodeDecodeError as error:
+		raise ValueError(
+			f"{path} is not valid UTF-8 at byte {error.start}: "
+			"Blorp sources must be UTF-8"
+		) from error
+	for line in text.splitlines():
 		if line == "import:":
 			in_import_block = True
 			continue
@@ -74,6 +86,26 @@ def module_owner(path: Path, source_root: Path, owners: set[str]) -> str | None:
 	if len(relative.parts) == 1:
 		return None
 	return relative.parts[0] if relative.parts[0] in owners | {"lib"} else None
+
+
+def test_module_sources(
+	test_root: Path,
+	owner_test_root: Path,
+	fixture_directories: set[str],
+) -> list[Path]:
+	"""Test modules below an owner's test tree, excluding fixture inputs.
+
+	A fixture is test data for the compiler under test, not a module of the
+	owner: its imports do not count toward isolation and its bytes may be
+	deliberately invalid UTF-8.
+	"""
+	return [
+		test
+		for test in sorted(owner_test_root.rglob("*.brp"))
+		if not fixture_directories.intersection(
+			test.relative_to(test_root).parts[:-1]
+		)
+	]
 
 
 def validate_test_names(
@@ -116,10 +148,8 @@ def validate_isolated_test_imports(
 			(source_root / owner).resolve(),
 			(source_root / "lib").resolve(),
 		]
-		for test in sorted(owner_test_root.rglob("*.brp")):
+		for test in test_module_sources(test_root, owner_test_root, fixture_directories):
 			relative = test.relative_to(test_root)
-			if fixture_directories.intersection(relative.parts[:-1]):
-				continue
 			for module in source_imports(test):
 				target = resolve_import(test, module, source_root)
 				if target is None:
@@ -142,6 +172,7 @@ def validate_isolated_reachability(
 	isolated_test_owners: set[str],
 	owner_sources: dict[str, set[Path]],
 	graph: dict[Path, set[Path]],
+	fixture_directories: set[str],
 	errors: list[str],
 ) -> None:
 	"""An isolated owner reaches only itself and lib, also through lib.
@@ -157,7 +188,7 @@ def validate_isolated_reachability(
 		starts = set(owner_sources.get(owner, set()))
 		owner_test_root = test_root / owner
 		if owner_test_root.is_dir():
-			for test in sorted(owner_test_root.rglob("*.brp")):
+			for test in test_module_sources(test_root, owner_test_root, fixture_directories):
 				for module in source_imports(test):
 					target = resolve_import(test, module, source_root)
 					if target is not None and is_within(target, lib_root):
@@ -361,6 +392,7 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 		isolated_test_owners,
 		owner_sources,
 		graph,
+		fixture_directories,
 		errors,
 	)
 	validate_test_names(test_root, fixture_directories, test_support_paths, errors)

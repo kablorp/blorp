@@ -386,6 +386,42 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("isolated owner run reaches another owner through lib", result.stderr)
 
+	def test_isolated_owner_ignores_fixture_with_invalid_utf8(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root, isolated_test_owners=["compiler"])
+			fixtures = root / "blorp/test/compiler/stage/fixtures/should_fail"
+			fixtures.mkdir(parents=True)
+			(fixtures / "invalid_utf8.brp").write_bytes(b'x: String = "\xff"\n')
+
+			result = self.run_checker(root)
+
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def test_isolated_owner_names_test_module_with_invalid_utf8(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root, isolated_test_owners=["compiler"])
+			(root / "blorp/test/compiler/test_bad.brp").write_bytes(b'x = "\xff"\n')
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertNotIn("Traceback", result.stderr)
+			self.assertIn("test_bad.brp is not valid UTF-8 at byte 5", result.stderr)
+
+	def test_source_with_invalid_utf8_is_a_clear_error(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root)
+			(root / "blorp/src/compiler/bad.brp").write_bytes(b'x = "\xff"\n')
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertNotIn("Traceback", result.stderr)
+			self.assertIn("bad.brp is not valid UTF-8 at byte 5", result.stderr)
+
 	def test_isolated_test_owner_must_be_registered(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:
 			root = Path(directory)
