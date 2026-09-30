@@ -307,13 +307,14 @@ import:
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_field_ref,
+		CoreVariantRef(BuiltinOptionSome, VariantById),
 	../../../src/compiler/stage_09_core/pipeline:
 		PreparedCoreProgram,
 		prepared_core_program,
 		prepared_core_program_value,
 		run_pre_dce_tail,
 	../../../src/compiler/stage_09_core/static_string_literals: rewrite_static_string_literals
-	../../../src/compiler/stage_10_backend/c_naming: c_identifier, c_local_name, encode_base62
+	../../../src/compiler/stage_10_backend/c_naming: c_identifier, c_local_name, encode_base62, variant_constructor_symbol, variant_tag_symbol
 	../../../src/compiler/stage_10_backend/c_symbol_projection:
 		CEmissionSymbolPlan,
 		c_emission_type_symbol_lookup,
@@ -356,6 +357,38 @@ record SourceSpelling {
 }
 
 
+---
+A variant with a definition id is emitted under its projected constructor (and,
+for a union, tag) symbol. The constructor maps back to `__def_<id>_<name>` and
+the tag to the `TAG_<type>_<name>` spelling a variant without an id gets.
+---
+pure func variant_source_spellings(
+	type_name: String,
+	variant_name: String,
+	def_id: Option[Int],
+	has_tag: Bool,
+) -> List[SourceSpelling]:
+	match def_id:
+		Some(id):
+			constructor: SourceSpelling = {
+				projected = variant_constructor_symbol(id),
+				original = DEF_ID_TEST_SPELLING_PREFIX + id.to_string() + "_" + variant_name,
+			}
+
+			if has_tag:
+				[
+					constructor,
+					{
+						projected = variant_tag_symbol(id),
+						original = "TAG_" + type_name + "_" + variant_name,
+					},
+				]
+			else:
+				[constructor]
+		None:
+			[]
+
+
 pure func source_spelling_pairs(
 	program: CoreProgram,
 	plan: CEmissionSymbolPlan,
@@ -369,12 +402,18 @@ pure func source_spelling_pairs(
 					Some(projected):
 						original: String = match function_info.function_kind:
 							ClosureBodyFunction(_):
-								CLOSURE_BODY_TEST_SPELLING_PREFIX + function_info.def_id.to_string() + "_" + function_info.name
+								DEF_ID_TEST_SPELLING_PREFIX + function_info.def_id.to_string() + "_" + function_info.name
 							_:
 								function_info.name
 						pairs = pairs.append({ projected = projected, original = c_identifier(original) })
 					None:
 						void
+			UnionDecl(union_decl):
+				for variant in union_decl.variants:
+					pairs = pairs.concat(variant_source_spellings(union_decl.name, variant.name, variant.def_id, True))
+			EnumDecl(enum_decl):
+				for variant in enum_decl.variants:
+					pairs = pairs.concat(variant_source_spellings(enum_decl.name, variant.name, variant.def_id, False))
 			_:
 				void
 
@@ -447,10 +486,11 @@ MAX_STUB_CALLEES: Int = 64
 
 
 ---
-The spelling this file's assertions use for a closure body (`__def_<id>_<name>`).
-Production never spells it: the body is named from its definition id alone.
+The spelling this file's assertions use for a closure body or a variant
+constructor with a definition id (`__def_<id>_<name>`). Production never spells
+it: such a symbol is named from its definition id alone.
 ---
-CLOSURE_BODY_TEST_SPELLING_PREFIX: String = "__def_"
+DEF_ID_TEST_SPELLING_PREFIX: String = "__def_"
 
 
 pure func stub_callee_function(name: String, def_id: Int) -> CoreFunction:
@@ -1820,12 +1860,16 @@ pure func static_stack_result_expr(
 	arg: CoreBoxedStorageValue,
 	typ: CoreType,
 ) -> CoreExpr:
+	result_variant: CoreVariantRef = if constructor_name == "Ok":
+		BuiltinResultOk
+	else:
+		BuiltinResultErr
+
 	UnionConstructExpr(
 		{
 			type_name = "Result",
 			constructor_name = constructor_name,
-			constructor_c_name = constructor_name,
-			tag_c_name = "TAG_" + "Result" + "_" + constructor_name,
+			variant = result_variant,
 			representation = StackResultRepresentation({
 				result_type = "blorp_StackResult",
 				tag = tag,
@@ -1948,8 +1992,7 @@ pure func static_choice_expr() -> CoreExpr:
 		{
 			type_name = "Choice__mono_String",
 			constructor_name = "Picked",
-			constructor_c_name = "__def_144_Picked",
-			tag_c_name = "TAG_Choice__mono_String_Picked",
+			variant = VariantById(144),
 			representation = GenericUnionRepresentation,
 			payload_storage = TypedUnionPayloadStorage,
 			uses_release_mask = False,
@@ -1997,8 +2040,7 @@ pure func dynamic_erased_box_union_expr() -> CoreExpr:
 		{
 			type_name = "BoxPayload",
 			constructor_name = "WithBox",
-			constructor_c_name = "__def_600_WithBox",
-			tag_c_name = "TAG_BoxPayload_WithBox",
+			variant = VariantById(600),
 			representation = GenericUnionRepresentation,
 			payload_storage = ErasedUnionPayloadStorage,
 			uses_release_mask = True,
@@ -2917,13 +2959,11 @@ pure func color_enum_decl() -> CoreEnumDecl:
 		variants = [
 			{
 				name = "Red",
-				c_name = "__def_101_Red",
 				tag = 0,
 				def_id = Some(101)
 			},
 			{
 				name = "Blue",
-				c_name = "__def_102_Blue",
 				tag = 1,
 				def_id = Some(102)
 			},
@@ -3008,8 +3048,6 @@ pure func choice_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Picked",
-				c_name = "__def_44_Picked",
-				tag_c_name = "TAG_Choice_Picked",
 				tag = 0,
 				fields = [no_release_union_field(int_type())],
 				def_id = Some(44)
@@ -3028,32 +3066,24 @@ pure func doc_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Nil",
-				c_name = "__def_700_Nil",
-				tag_c_name = "TAG_Doc_Nil",
 				tag = 0,
 				fields = [],
 				def_id = Some(700)
 			},
 			{
 				name = "Text",
-				c_name = "__def_701_Text",
-				tag_c_name = "TAG_Doc_Text",
 				tag = 1,
 				fields = [arc_release_union_field(string_type())],
 				def_id = Some(701)
 			},
 			{
 				name = "Group",
-				c_name = "__def_702_Group",
-				tag_c_name = "TAG_Doc_Group",
 				tag = 2,
 				fields = [arc_release_union_field(doc_type())],
 				def_id = Some(702)
 			},
 			{
 				name = "Concat",
-				c_name = "__def_703_Concat",
-				tag_c_name = "TAG_Doc_Concat",
 				tag = 3,
 				fields = [arc_release_union_field(doc_type()), arc_release_union_field(doc_type())],
 				def_id = Some(703)
@@ -3072,8 +3102,6 @@ pure func item_bag_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Items",
-				c_name = "__def_301_Items",
-				tag_c_name = "TAG_ItemBag_Items",
 				tag = 0,
 				fields = [arc_release_union_field(list_int_type())],
 				def_id = Some(301)
@@ -3092,8 +3120,6 @@ pure func wide_erased_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "WideValue",
-				c_name = "__def_700_WideValue",
-				tag_c_name = "TAG_Wide_WideValue",
 				tag = 0,
 				fields = [arc_release_union_field(int128_type())],
 				def_id = Some(700)
@@ -3112,16 +3138,12 @@ pure func choice_string_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Picked",
-				c_name = "__def_144_Picked",
-				tag_c_name = "TAG_Choice__mono_String_Picked",
 				tag = 0,
 				fields = [arc_release_union_field(string_type())],
 				def_id = Some(144)
 			},
 			{
 				name = "Missing",
-				c_name = "__def_145_Missing",
-				tag_c_name = "TAG_Choice__mono_String_Missing",
 				tag = 1,
 				fields = [],
 				def_id = Some(145)
@@ -3140,8 +3162,6 @@ pure func box_payload_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "WithBox",
-				c_name = "__def_600_WithBox",
-				tag_c_name = "TAG_BoxPayload_WithBox",
 				tag = 0,
 				fields = [arc_release_union_field(box_type())],
 				def_id = Some(600)
@@ -3160,32 +3180,24 @@ pure func paint_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Red",
-				c_name = "__def_501_Red",
-				tag_c_name = "TAG_Paint_Red",
 				tag = 0,
 				fields = [],
 				def_id = Some(501)
 			},
 			{
 				name = "Green",
-				c_name = "__def_502_Green",
-				tag_c_name = "TAG_Paint_Green",
 				tag = 1,
 				fields = [],
 				def_id = Some(502)
 			},
 			{
 				name = "Blue",
-				c_name = "__def_503_Blue",
-				tag_c_name = "TAG_Paint_Blue",
 				tag = 2,
 				fields = [],
 				def_id = Some(503)
 			},
 			{
 				name = "Custom",
-				c_name = "__def_504_Custom",
-				tag_c_name = "TAG_Paint_Custom",
 				tag = 3,
 				fields = [no_release_union_field(int_type())],
 				def_id = Some(504)
@@ -3204,8 +3216,6 @@ pure func io_error_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "NotFound",
-				c_name = "__def_144_NotFound",
-				tag_c_name = "TAG_IOError_NotFound",
 				tag = 0,
 				fields = [arc_release_union_field(string_type())],
 				def_id = Some(144)
@@ -3224,32 +3234,24 @@ pure func codec_value_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "VNull",
-				c_name = "__def_301_VNull",
-				tag_c_name = "TAG_Value_VNull",
 				tag = 0,
 				fields = [],
 				def_id = Some(301)
 			},
 			{
 				name = "VString",
-				c_name = "__def_302_VString",
-				tag_c_name = "TAG_Value_VString",
 				tag = 1,
 				fields = [arc_release_union_field(string_type())],
 				def_id = Some(302)
 			},
 			{
 				name = "VList",
-				c_name = "__def_303_VList",
-				tag_c_name = "TAG_Value_VList",
 				tag = 2,
 				fields = [arc_release_union_field(list_value_type())],
 				def_id = Some(303)
 			},
 			{
 				name = "VRecord",
-				c_name = "__def_304_VRecord",
-				tag_c_name = "TAG_Value_VRecord",
 				tag = 3,
 				fields = [arc_release_union_field(list_string_value_pair_type())],
 				def_id = Some(304)
@@ -3268,16 +3270,12 @@ pure func option_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Some",
-				c_name = "__def_401_Some",
-				tag_c_name = "TAG_Option_Some",
 				tag = 0,
 				fields = [arc_release_union_field(any_type())],
 				def_id = Some(401)
 			},
 			{
 				name = "None",
-				c_name = "__def_402_None",
-				tag_c_name = "TAG_Option_None",
 				tag = 1,
 				fields = [],
 				def_id = Some(402)
@@ -3296,32 +3294,24 @@ pure func send_attempt_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "SendAccepted",
-				c_name = "__def_601_SendAccepted",
-				tag_c_name = "TAG_SendAttempt_SendAccepted",
 				tag = 0,
 				fields = [],
 				def_id = Some(601)
 			},
 			{
 				name = "SendWouldBlock",
-				c_name = "__def_602_SendWouldBlock",
-				tag_c_name = "TAG_SendAttempt_SendWouldBlock",
 				tag = 1,
 				fields = [],
 				def_id = Some(602)
 			},
 			{
 				name = "SendSealed",
-				c_name = "__def_603_SendSealed",
-				tag_c_name = "TAG_SendAttempt_SendSealed",
 				tag = 2,
 				fields = [],
 				def_id = Some(603)
 			},
 			{
 				name = "SendTimedOut",
-				c_name = "__def_604_SendTimedOut",
-				tag_c_name = "TAG_SendAttempt_SendTimedOut",
 				tag = 3,
 				fields = [],
 				def_id = Some(604)
@@ -3340,32 +3330,24 @@ pure func recv_attempt_string_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "RecvValue",
-				c_name = "__def_605_RecvValue",
-				tag_c_name = "TAG_RecvAttemptString_RecvValue",
 				tag = 0,
 				fields = [arc_release_union_field(string_type())],
 				def_id = Some(605)
 			},
 			{
 				name = "RecvWouldBlock",
-				c_name = "__def_606_RecvWouldBlock",
-				tag_c_name = "TAG_RecvAttemptString_RecvWouldBlock",
 				tag = 1,
 				fields = [],
 				def_id = Some(606)
 			},
 			{
 				name = "RecvSealed",
-				c_name = "__def_607_RecvSealed",
-				tag_c_name = "TAG_RecvAttemptString_RecvSealed",
 				tag = 2,
 				fields = [],
 				def_id = Some(607)
 			},
 			{
 				name = "RecvTimedOut",
-				c_name = "__def_608_RecvTimedOut",
-				tag_c_name = "TAG_RecvAttemptString_RecvTimedOut",
 				tag = 3,
 				fields = [],
 				def_id = Some(608)
@@ -3384,32 +3366,24 @@ pure func recv_attempt_point_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "RecvValue",
-				c_name = "__def_609_RecvValue",
-				tag_c_name = "TAG_RecvAttemptPoint_RecvValue",
 				tag = 0,
 				fields = [no_release_union_field(point_type())],
 				def_id = Some(609)
 			},
 			{
 				name = "RecvWouldBlock",
-				c_name = "__def_610_RecvWouldBlock",
-				tag_c_name = "TAG_RecvAttemptPoint_RecvWouldBlock",
 				tag = 1,
 				fields = [],
 				def_id = Some(610)
 			},
 			{
 				name = "RecvSealed",
-				c_name = "__def_611_RecvSealed",
-				tag_c_name = "TAG_RecvAttemptPoint_RecvSealed",
 				tag = 2,
 				fields = [],
 				def_id = Some(611)
 			},
 			{
 				name = "RecvTimedOut",
-				c_name = "__def_612_RecvTimedOut",
-				tag_c_name = "TAG_RecvAttemptPoint_RecvTimedOut",
 				tag = 3,
 				fields = [],
 				def_id = Some(612)
@@ -4909,8 +4883,6 @@ pure func pair_choice_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Pair",
-				c_name = "__def_336_Pair",
-				tag_c_name = "TAG_PairChoice_Pair",
 				tag = 0,
 				fields = [no_release_union_field(int_type()), no_release_union_field(int_type())],
 				def_id = Some(336)
@@ -5461,8 +5433,7 @@ pure func ordered_union_payloads_function() -> CoreFunction:
 				{
 					type_name = "PairChoice",
 					constructor_name = "Pair",
-					constructor_c_name = "__def_336_Pair",
-					tag_c_name = "TAG_PairChoice_Pair",
+					variant = VariantById(336),
 					representation = GenericUnionRepresentation,
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -5497,8 +5468,7 @@ pure func duplicate_inner_union_payloads_function() -> CoreFunction:
 				{
 					type_name = "PairChoice",
 					constructor_name = "Pair",
-					constructor_c_name = "__def_336_Pair",
-					tag_c_name = "TAG_PairChoice_Pair",
+					variant = VariantById(336),
 					representation = GenericUnionRepresentation,
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -5538,8 +5508,7 @@ pure func duplicate_inner_union_reuse_payloads_function() -> CoreFunction:
 					source = VarExpr(source_var, pair_choice_type(), synthetic_core_source_loc()),
 					type_name = "PairChoice",
 					constructor_name = "Pair",
-					constructor_c_name = "__def_336_Pair",
-					reuse_constructor_c_name = "__blorp_reuse_PairChoice___def_336_Pair",
+					variant = VariantById(336),
 					representation = GenericUnionRepresentation,
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -6125,14 +6094,14 @@ pure func classify_color_function() -> CoreFunction:
 	red_case: CoreConstructorMatchCase = {
 		constructor = "Red",
 		accessor = RootAccessor,
-		test = EnumConstructorTest("__def_101_Red"),
+		test = EnumConstructorTest(VariantById(101)),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc()))
 	}
 	blue_case: CoreConstructorMatchCase = {
 		constructor = "Blue",
 		accessor = RootAccessor,
-		test = EnumConstructorTest("__def_102_Blue"),
+		test = EnumConstructorTest(VariantById(102)),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc()))
 	}
@@ -6176,14 +6145,14 @@ pure func classify_color_from_let_function() -> CoreFunction:
 	red_case: CoreConstructorMatchCase = {
 		constructor = "Red",
 		accessor = RootAccessor,
-		test = EnumConstructorTest("__def_101_Red"),
+		test = EnumConstructorTest(VariantById(101)),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc()))
 	}
 	blue_case: CoreConstructorMatchCase = {
 		constructor = "Blue",
 		accessor = RootAccessor,
-		test = EnumConstructorTest("__def_102_Blue"),
+		test = EnumConstructorTest(VariantById(102)),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc()))
 	}
@@ -6242,8 +6211,7 @@ pure func make_choice_function() -> CoreFunction:
 				{
 					type_name = "Choice",
 					constructor_name = "Picked",
-					constructor_c_name = "__def_44_Picked",
-					tag_c_name = "TAG_Choice_Picked",
+					variant = VariantById(44),
 					representation = GenericUnionRepresentation,
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -6280,7 +6248,7 @@ pure func picked_value_function() -> CoreFunction:
 	picked_case: CoreConstructorMatchCase = {
 		constructor = "Picked",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Choice_Picked", "Choice"),
+		test = UnionTagConstructorTest(VariantById(44), "Choice"),
 		bindings = [
 			{
 				variable = picked_value_var(),
@@ -6323,7 +6291,7 @@ pure func picked_value_from_owned_call_function() -> CoreFunction:
 	picked_case: CoreConstructorMatchCase = {
 		constructor = "Picked",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Choice_Picked", "Choice"),
+		test = UnionTagConstructorTest(VariantById(44), "Choice"),
 		bindings = [
 			{
 				variable = picked_value_var(),
@@ -6378,7 +6346,7 @@ pure func picked_value_after_checkpoint_function() -> CoreFunction:
 	picked_case: CoreConstructorMatchCase = {
 		constructor = "Picked",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Choice_Picked", "Choice"),
+		test = UnionTagConstructorTest(VariantById(44), "Choice"),
 		bindings = [
 			{
 				variable = picked_value_var(),
@@ -6435,7 +6403,7 @@ pure func picked_value_during_checkpoint_function() -> CoreFunction:
 	picked_case: CoreConstructorMatchCase = {
 		constructor = "Picked",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Choice_Picked", "Choice"),
+		test = UnionTagConstructorTest(VariantById(44), "Choice"),
 		bindings = [
 			{
 				variable = picked_value_var(),
@@ -6595,7 +6563,7 @@ pure func nullable_choice_match_after_drop_function() -> CoreFunction:
 	picked_case: CoreConstructorMatchCase = {
 		constructor = "Picked",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Choice_Picked", "Choice"),
+		test = UnionTagConstructorTest(VariantById(44), "Choice"),
 		bindings = [
 			{
 				variable = picked_value_var(),
@@ -6705,7 +6673,7 @@ pure func nullable_choice_match_after_drop_function() -> CoreFunction:
 
 pure func paint_construct_expr(
 	constructor_name: String,
-	constructor_c_name: String,
+	constructor_def_id: Int,
 	arg: Option[CoreExpr],
 ) -> CoreExpr:
 	args: List[CoreBoxedStorageValue] = match arg:
@@ -6718,8 +6686,7 @@ pure func paint_construct_expr(
 		{
 			type_name = "Paint",
 			constructor_name = constructor_name,
-			constructor_c_name = constructor_c_name,
-			tag_c_name = "TAG_" + "Paint" + "_" + constructor_name,
+			variant = VariantById(constructor_def_id),
 			representation = GenericUnionRepresentation,
 			payload_storage = ErasedUnionPayloadStorage,
 			uses_release_mask = False,
@@ -6732,21 +6699,21 @@ pure func paint_construct_expr(
 
 
 pure func red_paint_expr() -> CoreExpr:
-	paint_construct_expr("Red", "__def_501_Red", None)
+	paint_construct_expr("Red", 501, None)
 
 
 pure func green_paint_expr() -> CoreExpr:
-	paint_construct_expr("Green", "__def_502_Green", None)
+	paint_construct_expr("Green", 502, None)
 
 
 pure func blue_paint_expr() -> CoreExpr:
-	paint_construct_expr("Blue", "__def_503_Blue", None)
+	paint_construct_expr("Blue", 503, None)
 
 
 pure func custom_paint_expr(value: Int) -> CoreExpr:
 	paint_construct_expr(
 		"Custom",
-		"__def_504_Custom",
+		504,
 		Some(LiteralExpr(IntLiteral(value), int_type(), synthetic_core_source_loc())),
 	)
 
@@ -6773,8 +6740,7 @@ pure func paint_option_some_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "Some",
-			constructor_c_name = "__def_42259_Some",
-			tag_c_name = "TAG_Option_Some",
+			variant = VariantById(42259),
 			representation = NullableOptionRepresentation,
 			payload_storage = TypedUnionPayloadStorage,
 			uses_release_mask = True,
@@ -6791,8 +6757,7 @@ pure func paint_option_none_expr() -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "None",
-			constructor_c_name = "__def_42260_None",
-			tag_c_name = "TAG_Option_None",
+			variant = VariantById(42260),
 			representation = NullableOptionRepresentation,
 			payload_storage = TypedUnionPayloadStorage,
 			uses_release_mask = False,
@@ -6896,13 +6861,13 @@ pure func paint_list_get_option_expr(colors_expr: CoreExpr) -> CoreExpr:
 
 pure func paint_tag_case(
 	constructor_name: String,
-	tag_c_name: String,
+	constructor_def_id: Int,
 	result: Bool,
 ) -> CoreConstructorMatchCase:
 	{
 		constructor = constructor_name,
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest(tag_c_name, "Paint"),
+		test = UnionTagConstructorTest(VariantById(constructor_def_id), "Paint"),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(
 			LiteralExpr(
@@ -6919,10 +6884,10 @@ pure func selected_paint_match_expr(value_expr: CoreExpr) -> CoreExpr:
 		value_expr,
 		NoReleasePolicy,
 		[
-			paint_tag_case("Red", "TAG_Paint_Red", True),
-			paint_tag_case("Green", "TAG_Paint_Green", False),
-			paint_tag_case("Blue", "TAG_Paint_Blue", False),
-			paint_tag_case("Custom", "TAG_Paint_Custom", False),
+			paint_tag_case("Red", 501, True),
+			paint_tag_case("Green", 502, False),
+			paint_tag_case("Blue", 503, False),
+			paint_tag_case("Custom", 504, False),
 		],
 		ConstructorMatchFallbackFail,
 		bool_type(),
@@ -7023,8 +6988,7 @@ pure func make_not_found_function() -> CoreFunction:
 				{
 					type_name = "IOError",
 					constructor_name = "NotFound",
-					constructor_c_name = "__def_144_NotFound",
-					tag_c_name = "TAG_IOError_NotFound",
+					variant = VariantById(144),
 					representation = GenericUnionRepresentation,
 					payload_storage = ErasedUnionPayloadStorage,
 					uses_release_mask = True,
@@ -7064,8 +7028,7 @@ pure func make_null_value_function() -> CoreFunction:
 				{
 					type_name = "Value",
 					constructor_name = "VNull",
-					constructor_c_name = "__def_301_VNull",
-					tag_c_name = "TAG_Value_VNull",
+					variant = VariantById(301),
 					representation = GenericUnionRepresentation,
 					payload_storage = ErasedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -7105,8 +7068,7 @@ pure func make_string_value_function() -> CoreFunction:
 				{
 					type_name = "Value",
 					constructor_name = "VString",
-					constructor_c_name = "__def_302_VString",
-					tag_c_name = "TAG_Value_VString",
+					variant = VariantById(302),
 					representation = GenericUnionRepresentation,
 					payload_storage = ErasedUnionPayloadStorage,
 					uses_release_mask = True,
@@ -7148,8 +7110,7 @@ pure func make_boxed_some_function() -> CoreFunction:
 				{
 					type_name = "Option",
 					constructor_name = "Some",
-					constructor_c_name = "__def_401_Some",
-					tag_c_name = "TAG_Option_Some",
+					variant = VariantById(401),
 					representation = BoxedOptionRepresentation,
 					payload_storage = ErasedUnionPayloadStorage,
 					uses_release_mask = True,
@@ -7183,8 +7144,7 @@ pure func make_boxed_none_function() -> CoreFunction:
 				{
 					type_name = "Option",
 					constructor_name = "None",
-					constructor_c_name = "__def_402_None",
-					tag_c_name = "TAG_Option_None",
+					variant = VariantById(402),
 					representation = BoxedOptionRepresentation,
 					payload_storage = ErasedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -7208,7 +7168,7 @@ pure func not_found_path_function() -> CoreFunction:
 	not_found_case: CoreConstructorMatchCase = {
 		constructor = "NotFound",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_IOError_NotFound", "IOError"),
+		test = UnionTagConstructorTest(VariantById(144), "IOError"),
 		bindings = [
 			{
 				variable = error_path_var(),
@@ -9204,8 +9164,7 @@ pure func nullable_option_some_function() -> CoreFunction:
 				{
 					type_name = "Option",
 					constructor_name = "Some",
-					constructor_c_name = "Some",
-					tag_c_name = "TAG_Option_Some",
+					variant = BuiltinOptionSome,
 					representation = NullableOptionRepresentation,
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -9245,8 +9204,7 @@ pure func nullable_option_none_function() -> CoreFunction:
 				{
 					type_name = "Option",
 					constructor_name = "None",
-					constructor_c_name = "None",
-					tag_c_name = "TAG_Option_None",
+					variant = BuiltinOptionNone,
 					representation = NullableOptionRepresentation,
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -9328,8 +9286,7 @@ pure func nullable_option_statement_list_function() -> CoreFunction:
 				{
 					type_name = "Option",
 					constructor_name = "Some",
-					constructor_c_name = "Some",
-					tag_c_name = "TAG_Option_Some",
+					variant = BuiltinOptionSome,
 					representation = NullableOptionRepresentation,
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -10045,7 +10002,7 @@ pure func boxed_option_stack_result_match_function() -> CoreFunction:
 	none_case: CoreConstructorMatchCase = {
 		constructor = "None",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Option_None", "Option"),
+		test = UnionTagConstructorTest(VariantById(402), "Option"),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(-1), int_type(), synthetic_core_source_loc()))
 	}
@@ -10090,8 +10047,7 @@ pure func boxed_option_some_stack_result_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "Some",
-			constructor_c_name = "__def_42259_Some",
-			tag_c_name = "TAG_Option_Some",
+			variant = VariantById(42259),
 			representation = BoxedOptionRepresentation,
 			payload_storage = ErasedUnionPayloadStorage,
 			uses_release_mask = True,
@@ -10108,8 +10064,7 @@ pure func boxed_option_none_result_expr() -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "None",
-			constructor_c_name = "__def_42260_None",
-			tag_c_name = "TAG_Option_None",
+			variant = VariantById(42260),
 			representation = BoxedOptionRepresentation,
 			payload_storage = TypedUnionPayloadStorage,
 			uses_release_mask = False,
@@ -10220,7 +10175,7 @@ pure func first_option_result_from_list_match_function() -> CoreFunction:
 	none_case: CoreConstructorMatchCase = {
 		constructor = "None",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Option_None", "Option"),
+		test = UnionTagConstructorTest(VariantById(402), "Option"),
 		bindings = [],
 		body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(-1), int_type(), synthetic_core_source_loc()))
 	}
@@ -12768,6 +12723,47 @@ pure func test_emit_foreign_reachable_record_escapes_reserved_member_names() -> 
 			)
 		Err(_):
 			False
+
+
+---
+A generic union construct that names a builtin Option or Result variant (a
+representation and variant that disagree) has no constructor to call, so the
+function is reported as one the backend could not emit rather than emitted
+with a made-up symbol.
+---
+pure func test_emit_generic_construct_of_builtin_variant_is_unsupported() -> Bool:
+	construct: CoreExpr = UnionConstructExpr(
+		{
+			type_name = "Paint",
+			constructor_name = "Red",
+			variant = BuiltinOptionSome,
+			representation = GenericUnionRepresentation,
+			payload_storage = ErasedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = []
+		},
+		paint_type(),
+		synthetic_core_source_loc(),
+	)
+	function_info: CoreFunction = { main_return_zero_function() |
+		name = "mismatched_variant",
+		return_type = paint_type(),
+		body = Some(construct),
+		function_kind = UserFunction,
+		def_id = 9901
+	}
+	program: CoreProgram = {
+		decls = [UnionDecl(paint_union_decl()), FunctionDecl(function_info)],
+		foreign_includes = [],
+		source_files = []
+	}
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+
+	(
+		artifact.c_code.contains("Blorp backend could not emit function body: mismatched_variant")
+		and not artifact.c_code.contains("__blorp_invalid_projected_variant")
+	)
 
 
 pure func test_emit_range_value_for_loop() -> Bool:
@@ -16410,8 +16406,7 @@ pure func choice_string_reuse_function() -> CoreFunction:
 		{
 			type_name = "Choice__mono_String",
 			constructor_name = "Picked",
-			constructor_c_name = "__def_144_Picked",
-			tag_c_name = "TAG_Choice__mono_String_Picked",
+			variant = VariantById(144),
 			representation = GenericUnionRepresentation,
 			payload_storage = TypedUnionPayloadStorage,
 			uses_release_mask = True,
@@ -16424,7 +16419,7 @@ pure func choice_string_reuse_function() -> CoreFunction:
 	picked_case: CoreConstructorMatchCase = {
 		constructor = "Picked",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_Choice__mono_String_Picked", "Choice__mono_String"),
+		test = UnionTagConstructorTest(VariantById(144), "Choice__mono_String"),
 		bindings = [
 			{
 				variable = payload_var,
@@ -16994,12 +16989,12 @@ pure func fallible_stream_file_error_domain() -> CoreFallibleStreamErrorDomain:
 	{
 		domain_tag = "BLORP_FALLIBLE_STREAM_ERROR_DOMAIN_FILE",
 		other_constructor = "NotFound",
-		other_constructor_c_name = "__def_144_NotFound",
+		other_constructor_def_id = 144,
 		cases = [
 			{
 				runtime_tag = "BLORP_FILE_ERROR_NOT_FOUND",
 				constructor_name = "NotFound",
-				constructor_c_name = "__def_144_NotFound"
+				constructor_def_id = 144
 			},
 		]
 	}
@@ -17671,8 +17666,7 @@ pure func stack_option_some_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "Some",
-			constructor_c_name = "__def_42259_Some",
-			tag_c_name = "TAG_Option_Some",
+			variant = VariantById(42259),
 			representation = StackOptionRepresentation({
 				option_type = "blorp_StackOption_Int",
 				tag = 0,
@@ -17732,8 +17726,7 @@ pure func stack_option_void_some_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "Some",
-			constructor_c_name = "__def_42259_Some",
-			tag_c_name = "TAG_Option_Some",
+			variant = VariantById(42259),
 			representation = StackOptionRepresentation({
 				option_type = "blorp_StackOption_Void",
 				tag = 0,
@@ -17754,8 +17747,7 @@ pure func stack_option_range_some_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "Some",
-			constructor_c_name = "Some",
-			tag_c_name = "TAG_Option_Some",
+			variant = BuiltinOptionSome,
 			representation = StackOptionRepresentation({
 				option_type = "blorp_StackOption_Range",
 				tag = 0,
@@ -17794,8 +17786,7 @@ pure func stack_option_point_some_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "Some",
-			constructor_c_name = "Some",
-			tag_c_name = "TAG_Option_Some",
+			variant = BuiltinOptionSome,
 			representation = StackOptionRepresentation({
 				option_type = "blorp_StackOption_Point",
 				tag = 0,
@@ -17870,8 +17861,7 @@ pure func stack_result_ok_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Result",
 			constructor_name = "Ok",
-			constructor_c_name = "Ok",
-			tag_c_name = "TAG_Result_Ok",
+			variant = BuiltinResultOk,
 			representation = StackResultRepresentation({
 				result_type = "blorp_StackResult",
 				tag = 0,
@@ -17902,8 +17892,7 @@ pure func boxed_result_ok_expr(
 		{
 			type_name = "Result",
 			constructor_name = "Ok",
-			constructor_c_name = "blorp_result_ok",
-			tag_c_name = "TAG_Result_Ok",
+			variant = BuiltinResultOk,
 			representation = GenericUnionRepresentation,
 			payload_storage = ErasedUnionPayloadStorage,
 			uses_release_mask = False,
@@ -19756,7 +19745,7 @@ pure func union_payload_list_length_match_function() -> CoreFunction:
 	items_case: CoreConstructorMatchCase = {
 		constructor = "Items",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_ItemBag_Items", "ItemBag"),
+		test = UnionTagConstructorTest(VariantById(301), "ItemBag"),
 		bindings = [
 			{
 				variable = items_var,
@@ -19836,7 +19825,7 @@ pure func union_payload_list_length_expr_function() -> CoreFunction:
 	items_case: CoreConstructorMatchCase = {
 		constructor = "Items",
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest("TAG_ItemBag_Items", "ItemBag"),
+		test = UnionTagConstructorTest(VariantById(301), "ItemBag"),
 		bindings = [
 			{
 				variable = items_var,
@@ -22869,8 +22858,7 @@ pure func nullable_option_string_some_expr(value: CoreExpr) -> CoreExpr:
 		{
 			type_name = "Option",
 			constructor_name = "Some",
-			constructor_c_name = "Some",
-			tag_c_name = "TAG_Option_Some",
+			variant = BuiltinOptionSome,
 			representation = NullableOptionRepresentation,
 			payload_storage = TypedUnionPayloadStorage,
 			uses_release_mask = False,
@@ -28132,6 +28120,10 @@ tests: TestSuite = {
 		(
 			"emit foreign-reachable record escapes reserved member names",
 			test_emit_foreign_reachable_record_escapes_reserved_member_names,
+		),
+		(
+			"emit generic construct of builtin variant is unsupported",
+			test_emit_generic_construct_of_builtin_variant_is_unsupported,
 		),
 		("emit Range value for loop", test_emit_range_value_for_loop),
 		("emit literal match expression", test_emit_literal_match_expression),

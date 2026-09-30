@@ -5,7 +5,6 @@
 -- constructs such as record literals and primitive tuple literals itself.
 import:
 	../stage_08_core_lower/list_layout: tensor_for_element_storage_for_canonical_type
-	../stage_10_backend/c_naming: variant_constructor_symbol, variant_tag_symbol
 	allocation_contracts:
 		UnionCleanupKind(DirectUnionCleanup, IterativeUnionCleanup, NoUnionCleanup),
 		release_policy_requires_cleanup,
@@ -288,6 +287,7 @@ import:
 		CoreUnionDecl,
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
+		CoreVariantRef(BuiltinOptionNone, BuiltinOptionSome, BuiltinResultErr, BuiltinResultOk, VariantById),
 		CoreUnionRepresentation(
 			BoxedOptionRepresentation,
 			GenericUnionRepresentation,
@@ -567,30 +567,30 @@ private pure func find_union_decl(
 	unions_by_name.get(name)
 
 
+---
+A reference names a variant by its definition id alone: the spelling a
+reference carries (source name or projected C symbol) says nothing the id does
+not, and a reference without an id names no declared variant.
+---
 private pure func union_variant_matches_reference(
 	variant: CoreUnionVariant,
-	constructor_name: String,
 	def_id: Option[Int],
 ) -> Bool:
-	if not (variant.name == constructor_name or variant.c_name == constructor_name):
-		False
-	else:
-		match (def_id, variant.def_id):
-			(Some(reference_id), Some(constructor_id)):
-				reference_id == constructor_id
-			_:
-				False
+	match (def_id, variant.def_id):
+		(Some(reference_id), Some(constructor_id)):
+			reference_id == constructor_id
+		_:
+			False
 
 
 private pure func find_union_variant_by_reference(
 	variants: List[CoreUnionVariant],
-	constructor_name: String,
 	def_id: Option[Int],
 ) -> Option[CoreUnionVariant]:
 	var result: Option[CoreUnionVariant] = None
 
 	for variant in variants:
-		if union_variant_matches_reference(variant, constructor_name, def_id):
+		if union_variant_matches_reference(variant, def_id):
 			result = Some(variant)
 			break
 
@@ -605,7 +605,7 @@ private pure func canonical_union_constructor_name(
 ) -> Option[String]:
 	match find_union_decl(decls.unions_by_name, type_name):
 		Some(union_decl):
-			match find_union_variant_by_reference(union_decl.variants, constructor_name, def_id):
+			match find_union_variant_by_reference(union_decl.variants, def_id):
 				Some(variant):
 					Some(variant.name)
 				None:
@@ -623,7 +623,6 @@ private pure func variable_is_union_constructor(
 		Some(union_decl):
 			match find_union_variant_by_reference(
 				union_decl.variants,
-				variable.name,
 				variable.def_id,
 			):
 				Some(variant):
@@ -3723,8 +3722,7 @@ private pure func prepare_stack_option_constructor(
 				Some({
 					type_name = "Option",
 					constructor_name = "Some",
-					constructor_c_name = "Some",
-					tag_c_name = variant_tag_symbol("Option", "Some", None),
+					variant = BuiltinOptionSome,
 					representation = StackOptionRepresentation(representation),
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -3736,8 +3734,7 @@ private pure func prepare_stack_option_constructor(
 					Some({
 						type_name = "Option",
 						constructor_name = "Some",
-						constructor_c_name = "Some",
-						tag_c_name = variant_tag_symbol("Option", "Some", None),
+						variant = BuiltinOptionSome,
 						representation = NullableOptionRepresentation,
 						payload_storage = TypedUnionPayloadStorage,
 						uses_release_mask = False,
@@ -3745,13 +3742,13 @@ private pure func prepare_stack_option_constructor(
 						args = boxed_storage_values_for_exprs(args),
 					})
 				else:
+					declared_id ?= def_id
 					boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
 
 					Some({
 						type_name = "Option",
 						constructor_name = "Some",
-						constructor_c_name = variant_constructor_symbol(constructor_name, def_id),
-						tag_c_name = variant_tag_symbol("Option", "Some", def_id),
+						variant = VariantById(declared_id),
 						representation = BoxedOptionRepresentation,
 						payload_storage = ErasedUnionPayloadStorage,
 						uses_release_mask = True,
@@ -3764,8 +3761,7 @@ private pure func prepare_stack_option_constructor(
 				Some({
 					type_name = "Option",
 					constructor_name = "None",
-					constructor_c_name = "None",
-					tag_c_name = variant_tag_symbol("Option", "None", None),
+					variant = BuiltinOptionNone,
 					representation = StackOptionRepresentation(representation),
 					payload_storage = TypedUnionPayloadStorage,
 					uses_release_mask = False,
@@ -3777,8 +3773,7 @@ private pure func prepare_stack_option_constructor(
 					Some({
 						type_name = "Option",
 						constructor_name = "None",
-						constructor_c_name = "None",
-						tag_c_name = variant_tag_symbol("Option", "None", None),
+						variant = BuiltinOptionNone,
 						representation = NullableOptionRepresentation,
 						payload_storage = TypedUnionPayloadStorage,
 						uses_release_mask = False,
@@ -3786,11 +3781,12 @@ private pure func prepare_stack_option_constructor(
 						args = [],
 					})
 				else:
+					declared_id ?= def_id
+
 					Some({
 						type_name = "Option",
 						constructor_name = "None",
-						constructor_c_name = variant_constructor_symbol(constructor_name, def_id),
-						tag_c_name = variant_tag_symbol("Option", "None", def_id),
+						variant = VariantById(declared_id),
 						representation = BoxedOptionRepresentation,
 						payload_storage = TypedUnionPayloadStorage,
 						uses_release_mask = False,
@@ -3801,6 +3797,14 @@ private pure func prepare_stack_option_constructor(
 		None
 
 
+---
+Option constructs are recognised by the literal type name `"Option"` (and
+`"Result"` for the Result paths below), and their builtin variants
+(`BuiltinOptionSome` and friends) exist for exactly those types. A user type
+named `Option` cannot reach this: `flatten.brp`'s `module_type_name` qualifies
+every non-ABI type with its module before this pass, so only the standard
+library's own `Option` and `Result` keep the bare name.
+---
 private pure func prepare_stack_option_construct(
 	decls: PrepareDecls,
 	kind: CoreCallKind,
@@ -3848,6 +3852,16 @@ private pure func prepare_stack_option_construct(
 		SelectedTraitCall(trait_name, method_name, module_path, def_id):
 			None
 		SelectedDirectCall(def_id):
+			None
+
+
+private pure func builtin_result_variant(constructor_name: String) -> Option[CoreVariantRef]:
+	match constructor_name:
+		"Ok":
+			Some(BuiltinResultOk)
+		"Err":
+			Some(BuiltinResultErr)
+		_:
 			None
 
 
@@ -3931,6 +3945,7 @@ private pure func prepare_stack_result_constructor(
 	typ: CoreType,
 ) -> Option[CoreUnionConstruct]:
 	tag ?= stack_result_tag(constructor_name)
+	result_variant ?= builtin_result_variant(constructor_name)
 	payload_type ?= stack_result_payload_type(constructor_name, typ)
 
 	if args.length() == 1 and stack_result_payload_has_erased_storage(payload_type):
@@ -3948,8 +3963,7 @@ private pure func prepare_stack_result_constructor(
 		Some({
 			type_name = "Result",
 			constructor_name = constructor_name,
-			constructor_c_name = constructor_name,
-			tag_c_name = variant_tag_symbol("Result", constructor_name, None),
+			variant = result_variant,
 			representation = StackResultRepresentation({
 				result_type = "blorp_StackResult",
 				tag = tag,
@@ -4014,21 +4028,11 @@ private pure func prepare_stack_result_construct(
 			None
 
 
-private pure func boxed_result_constructor_c_name(constructor_name: String) -> Option[String]:
-	match constructor_name:
-		"Ok":
-			Some("blorp_result_ok")
-		"Err":
-			Some("blorp_result_err")
-		_:
-			None
-
-
 private pure func prepare_boxed_result_constructor(
 	constructor_name: String,
 	args: List[CoreExpr],
 ) -> Option[CoreUnionConstruct]:
-	constructor_c_name ?= boxed_result_constructor_c_name(constructor_name)
+	result_variant ?= builtin_result_variant(constructor_name)
 
 	if args.length() == 1:
 		boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(args)
@@ -4036,8 +4040,7 @@ private pure func prepare_boxed_result_constructor(
 		Some({
 			type_name = "Result",
 			constructor_name = constructor_name,
-			constructor_c_name = constructor_c_name,
-			tag_c_name = variant_tag_symbol("Result", constructor_name, None),
+			variant = result_variant,
 			representation = GenericUnionRepresentation,
 			payload_storage = ErasedUnionPayloadStorage,
 			uses_release_mask = False,
@@ -4113,10 +4116,11 @@ private pure func prepare_union_construct(
 						Some(union_decl):
 							match find_union_variant_by_reference(
 								union_decl.variants,
-								constructor_name,
 								def_id,
 							):
 								Some(variant):
+									declared_id ?= variant.def_id
+
 									if variant.fields.length() == args.length():
 										boxed_args: List[CoreBoxedStorageValue] = boxed_storage_values_for_union_payload(
 											layout,
@@ -4137,8 +4141,7 @@ private pure func prepare_union_construct(
 										Some({
 											type_name = type_name,
 											constructor_name = variant.name,
-											constructor_c_name = variant.c_name,
-											tag_c_name = variant.tag_c_name,
+											variant = VariantById(declared_id),
 											representation = GenericUnionRepresentation,
 											payload_storage = union_decl.payload_storage,
 											uses_release_mask = uses_release_mask,

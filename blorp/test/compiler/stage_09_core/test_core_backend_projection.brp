@@ -73,6 +73,7 @@ import:
 		CoreUnionVariant,
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
+	../../../src/compiler/stage_10_backend/c_naming: variant_constructor_symbol
 	test: TestSuite
 
 
@@ -169,8 +170,6 @@ pure func callback_decl(
 pure func union_variant(name: String, tag: Int) -> CoreUnionVariant:
 	{
 		name = name,
-		c_name = "__${name}_${tag}",
-		tag_c_name = "__TAG_${name}_${tag}",
 		tag = tag,
 		fields = [],
 		def_id = Some(100 + tag)
@@ -664,7 +663,6 @@ pure func test_projects_singleton_constructor_value() -> Bool:
 				variants = [
 					{
 						name = "Ready",
-						c_name = "__def_2_Ready",
 						tag = 0,
 						def_id = Some(2)
 					},
@@ -678,7 +676,7 @@ pure func test_projects_singleton_constructor_value() -> Bool:
 
 	match projected_body(program):
 		Some(VarExpr(variable, EnumType("Status"), _)):
-			variable.name == "__def_2_Ready"
+			variable.name == variant_constructor_symbol(2)
 		_:
 			False
 
@@ -719,7 +717,6 @@ pure func test_projects_global_singleton_constructor_value() -> Bool:
 				variants = [
 					{
 						name = "Ready",
-						c_name = "__def_2_Ready",
 						tag = 0,
 						def_id = Some(2)
 					},
@@ -735,7 +732,7 @@ pure func test_projects_global_singleton_constructor_value() -> Bool:
 		[GlobalDecl(global), ..._]:
 			match global.init:
 				VarExpr(variable, EnumType("Status"), _):
-					variable.name == "__def_2_Ready"
+					variable.name == variant_constructor_symbol(2)
 				_:
 					False
 		_:
@@ -769,11 +766,9 @@ private pure func constructor_kind_collision_program(typ: CoreType) -> CoreProgr
 				variants = [
 					{
 						name = "Ready",
-						c_name = "__union_Ready",
-						tag_c_name = "__TAG_union_Ready",
 						tag = 0,
 						fields = [],
-						def_id = Some(2)
+						def_id = Some(3)
 					},
 				],
 				loc = synthetic_core_source_loc(),
@@ -785,7 +780,6 @@ private pure func constructor_kind_collision_program(typ: CoreType) -> CoreProgr
 				variants = [
 					{
 						name = "Ready",
-						c_name = "__enum_Ready",
 						tag = 0,
 						def_id = Some(2)
 					},
@@ -798,13 +792,13 @@ private pure func constructor_kind_collision_program(typ: CoreType) -> CoreProgr
 	}
 
 
-pure func test_constructor_index_preserves_parent_kind() -> Bool:
+pure func test_constructor_index_does_not_match_variant_of_other_parent_kind() -> Bool:
 	match (
 		projected_body(constructor_kind_collision_program(EnumType("Status"))),
 		projected_body(constructor_kind_collision_program(UnionType("Status"))),
 	):
 		(Some(VarExpr(enum_var, _, _)), Some(VarExpr(union_var, _, _))):
-			enum_var.name == "__enum_Ready" and union_var.name == "__union_Ready"
+			enum_var.name == variant_constructor_symbol(2) and union_var.name == "Ready"
 		_:
 			False
 
@@ -837,8 +831,6 @@ pure func test_constructor_index_excludes_payload_variants() -> Bool:
 				variants = [
 					{
 						name = "Value",
-						c_name = "__def_4_Value",
-						tag_c_name = "__TAG_Value",
 						tag = 0,
 						fields = [
 							{
@@ -890,7 +882,6 @@ pure func test_preserves_resolved_nonconstructor_with_constructor_name() -> Bool
 				variants = [
 					{
 						name = "Ready",
-						c_name = "__def_2_Ready",
 						tag = 0,
 						def_id = Some(2)
 					},
@@ -936,7 +927,6 @@ pure func test_preserves_resolved_nonconstructor_with_constructor_id() -> Bool:
 				variants = [
 					{
 						name = "Ready",
-						c_name = "__def_2_Ready",
 						tag = 0,
 						def_id = Some(2)
 					},
@@ -982,10 +972,7 @@ pure func test_projects_boxed_option_none_constructor_value() -> Bool:
 				payload_storage = ErasedUnionPayloadStorage,
 				variants = [
 					union_variant("Some", 1),
-					{ union_variant("None", 2) |
-						c_name = "__def_102_None",
-						def_id = Some(102)
-					},
+					{ union_variant("None", 2) | def_id = Some(102) },
 				],
 				loc = synthetic_core_source_loc(),
 			}),
@@ -996,7 +983,7 @@ pure func test_projects_boxed_option_none_constructor_value() -> Bool:
 
 	match projected_body(program):
 		Some(VarExpr(variable, NamedType("Option", _), _)):
-			variable.name == "__def_102_None"
+			variable.name == variant_constructor_symbol(102)
 		_:
 			False
 
@@ -1028,10 +1015,7 @@ pure func test_preserves_stack_option_none_constructor_value() -> Bool:
 				payload_storage = ErasedUnionPayloadStorage,
 				variants = [
 					union_variant("Some", 1),
-					{ union_variant("None", 2) |
-						c_name = "__def_102_None",
-						def_id = Some(102)
-					},
+					{ union_variant("None", 2) | def_id = Some(102) },
 				],
 				loc = synthetic_core_source_loc(),
 			}),
@@ -1079,11 +1063,45 @@ pure func test_projects_boxed_file_open_result() -> Bool:
 				and bridge.temp_prefix == "file_open"
 				and layout_is_boxed
 				and payload_is_handle
-				and bridge.error.other_constructor_c_name == "__Other_7"
+				and bridge.error.other_constructor_def_id == 107
 				and bridge.error.cases.length() == 8
 			)
 		_:
 			False
+
+
+---
+The bridge spells its error constructors from their definition ids, so a
+variant declared without an id makes the operation's metadata unavailable and
+the builtin call stays unprojected.
+---
+pure func test_boxed_file_open_result_needs_error_variant_ids() -> Bool:
+	result_type: CoreType = BoxedResultType(named_type("FileReader"), UnionType("IOError"))
+	call: CoreExpr = builtin_call(
+		"blorp_file_open_read_raw",
+		[variable("path", named_type("String"))],
+		result_type,
+	)
+	decl_without_ids: CoreDecl = UnionDecl({
+		abi_type = None,
+		name = "IOError",
+		type_params = [],
+		payload_storage = TypedUnionPayloadStorage,
+		variants = ["NotFound", "PermissionDenied", "AlreadyExists", "InvalidInput", "Interrupted", "TimedOut", "Unsupported", "Other"]
+			.map(func(name): { union_variant(name, 0) | def_id = None }),
+		loc = synthetic_core_source_loc(),
+	})
+	program: CoreProgram = {
+		decls = [function_decl("main", 1, Some(call)), decl_without_ids],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match projected_body(program):
+		Some(CallExpr(OperationResultCall(_), _, _, _, _)):
+			False
+		_:
+			True
 
 
 pure func projects_compiler_stdio_error_name(error_name: String) -> Bool:
@@ -1103,7 +1121,7 @@ pure func projects_compiler_stdio_error_name(error_name: String) -> Bool:
 		Some(CallExpr(OperationResultCall(bridge), _, _, _, _)):
 			(
 				bridge.error.cases.length() == 3
-				and bridge.error.other_constructor_c_name == "__CompilerStdoutWriteFailed_2"
+				and bridge.error.other_constructor_def_id == 102
 			)
 		_:
 			False
@@ -1299,19 +1317,19 @@ pure func test_projects_process_session_state_typed_int_payloads() -> Bool:
 						and bridge.error.none_tag == "BLORP_PROCESS_ERROR_NONE"
 						and running.runtime_tag == "BLORP_PROCESS_SESSION_STATE_RUNNING"
 						and running.constructor_name == "SessionRunning"
-						and running.constructor_c_name == "__SessionRunning_0"
+						and running.constructor_def_id == 100
 						and runtime_union_args_are_empty(running.args)
 						and exited.runtime_tag == "BLORP_PROCESS_SESSION_STATE_EXITED"
 						and exited.constructor_name == "SessionExited"
-						and exited.constructor_c_name == "__SessionExited_1"
+						and exited.constructor_def_id == 101
 						and exit_arg_is_typed
 						and signaled.runtime_tag == "BLORP_PROCESS_SESSION_STATE_SIGNALED"
 						and signaled.constructor_name == "SessionSignaled"
-						and signaled.constructor_c_name == "__SessionSignaled_2"
+						and signaled.constructor_def_id == 102
 						and signal_arg_is_typed
 						and timed_out.runtime_tag == "BLORP_PROCESS_SESSION_STATE_TIMED_OUT"
 						and timed_out.constructor_name == "SessionTimedOut"
-						and timed_out.constructor_c_name == "__SessionTimedOut_3"
+						and timed_out.constructor_def_id == 103
 						and runtime_union_args_are_empty(timed_out.args)
 					)
 				_:
@@ -1356,15 +1374,15 @@ pure func test_projects_process_session_write_typed_int_payload() -> Bool:
 						and bridge.error.none_tag == "BLORP_PROCESS_ERROR_NONE"
 						and wrote.runtime_tag == "BLORP_PROCESS_SESSION_WRITE_WROTE"
 						and wrote.constructor_name == "Wrote"
-						and wrote.constructor_c_name == "__Wrote_0"
+						and wrote.constructor_def_id == 100
 						and write_arg_is_typed
 						and would_block.runtime_tag == "BLORP_PROCESS_SESSION_WRITE_WOULD_BLOCK"
 						and would_block.constructor_name == "WriteWouldBlock"
-						and would_block.constructor_c_name == "__WriteWouldBlock_1"
+						and would_block.constructor_def_id == 101
 						and runtime_union_args_are_empty(would_block.args)
 						and closed.runtime_tag == "BLORP_PROCESS_SESSION_WRITE_CLOSED"
 						and closed.constructor_name == "StdinClosed"
-						and closed.constructor_c_name == "__StdinClosed_2"
+						and closed.constructor_def_id == 102
 						and runtime_union_args_are_empty(closed.args)
 					)
 				_:
@@ -1555,7 +1573,7 @@ pure func test_projects_websocket_union_result() -> Bool:
 							(
 								cases.length() == 5
 								and first.constructor_name == "Text"
-								and first.constructor_c_name == "__Text_0"
+								and first.constructor_def_id == 100
 								and close.constructor_name == "Close"
 								and close_args_are_erased
 							)
@@ -1669,13 +1687,11 @@ pure func test_projects_parallel_list_alloc() -> Bool:
 				variants = [
 					{
 						name = "True",
-						c_name = "__def_2_True",
 						tag = 0,
 						def_id = Some(2)
 					},
 					{
 						name = "False",
-						c_name = "__def_3_False",
 						tag = 1,
 						def_id = Some(3)
 					},
@@ -1940,7 +1956,7 @@ tests: TestSuite = {
 			"projects global singleton constructor value",
 			test_projects_global_singleton_constructor_value,
 		),
-		("constructor index preserves parent kind", test_constructor_index_preserves_parent_kind),
+		("constructor index does not match a variant of the other parent kind", test_constructor_index_does_not_match_variant_of_other_parent_kind),
 		(
 			"constructor index excludes payload variants",
 			test_constructor_index_excludes_payload_variants,
@@ -1962,6 +1978,7 @@ tests: TestSuite = {
 			test_preserves_stack_option_none_constructor_value,
 		),
 		("projects boxed file-open result", test_projects_boxed_file_open_result),
+		("boxed file-open result needs error variant ids", test_boxed_file_open_result_needs_error_variant_ids),
 		(
 			"projects only canonical compiler stdio results",
 			test_projects_only_canonical_compiler_stdio_results,

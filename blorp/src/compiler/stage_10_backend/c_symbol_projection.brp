@@ -119,6 +119,8 @@ import:
 		union_init_name,
 		union_instance_name,
 		union_reuse_name,
+		variant_constructor_symbol,
+		variant_tag_symbol,
 	canonical_empty_list:
 		CanonicalEmptyList,
 		canonical_empty_list_for_construct,
@@ -176,10 +178,24 @@ private record CEmissionCallablePlan {
 }
 
 
+---
+The C symbols of every declared variant, spelled once from its definition id:
+constructor (enum and union), tag macro and reuse helper (union only). Emission
+reads them here instead of spelling per use.
+---
+private record CVariantSymbolTable {
+	constructors: Dict[Int, String],
+	tags: Dict[Int, String],
+	reuse_helpers: Dict[Int, String]
+}
+
+
 private record CProgramSymbolInventory {
 	candidates: List[CCallableSymbolCandidate],
 	preserved_names: List[String],
 	variant_symbols: List[String],
+	variant_table: CVariantSymbolTable,
+	variant_without_id: Option[CSymbolProjectionError],
 	type_naming: Dict[String, BackendTypeNaming],
 	type_symbol_lookup: Dict[String, String]
 }
@@ -195,6 +211,7 @@ union CSymbolProjectionError:
 	UnresolvedProjectedCallable(String)
 	UnresolvedCallbackTarget(String)
 	MissingProjectedHoistedCallable(Int)
+	VariantWithoutDefinitionId(String, String)
 	UnsupportedPreparedCallKind(String)
 	UnprojectedCallableValue(String, Int)
 	InvalidCanonicalEmptyListLayout(String)
@@ -209,7 +226,8 @@ private record CEmissionSymbolPlanRep {
 	static_string_literals: Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError],
 	preserved_symbol_count: Int,
 	type_naming: Dict[String, BackendTypeNaming],
-	type_symbol_lookup: Dict[String, String]
+	type_symbol_lookup: Dict[String, String],
+	variant_symbols: CVariantSymbolTable
 }
 
 
@@ -241,6 +259,13 @@ private PROJECTED_TYPE_PREFIX: String = "brp_ty"
 -- internal symbol here ensures future validator/projector drift cannot emit a
 -- partially projected reference to the original callable.
 private INVALID_PROJECTED_CALLABLE_NAME: String = "__blorp_invalid_projected_callable"
+
+---
+The symbol emitted for a variant the plan has no row for, or for a builtin
+variant (which is never spelled): invalid C that fails loudly instead of a
+recomputed spelling that could disagree with the declaration.
+---
+INVALID_PROJECTED_VARIANT_NAME: String = "__blorp_invalid_projected_variant"
 
 
 pure func projected_callable_base_symbol(def_id: Int) -> String:
@@ -503,6 +528,27 @@ pure func emitted_callback_name(plan: CEmissionSymbolPlan, original_name: String
 	planned_emitted_callback_name(plan, original_name).get_or(INVALID_PROJECTED_CALLABLE_NAME)
 
 
+---
+The constructor symbol of the declared variant `def_id` names, read from the
+plan's once-built table. An id with no row is invalid C
+(`INVALID_PROJECTED_VARIANT_NAME`), never a recomputed spelling that could
+disagree with the declaration.
+---
+pure func emitted_variant_constructor(plan: CEmissionSymbolPlan, def_id: Int) -> String:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.variant_symbols.constructors.get(def_id).get_or(INVALID_PROJECTED_VARIANT_NAME)
+
+
+pure func emitted_variant_tag(plan: CEmissionSymbolPlan, def_id: Int) -> String:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.variant_symbols.tags.get(def_id).get_or(INVALID_PROJECTED_VARIANT_NAME)
+
+
+pure func emitted_variant_reuse_helper(plan: CEmissionSymbolPlan, def_id: Int) -> String:
+	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
+	representation.variant_symbols.reuse_helpers.get(def_id).get_or(INVALID_PROJECTED_VARIANT_NAME)
+
+
 pure func c_emission_canonical_empty_lists(plan: CEmissionSymbolPlan) -> List[CanonicalEmptyList]:
 	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
 	representation.canonical_empty_lists
@@ -701,6 +747,10 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 	var names: List[String] = ["main", "__blorp_init_globals", "__blorp_drop_globals"]
 	var type_candidates: List[String] = []
 	var variant_symbols: List[String] = []
+	var variant_constructors: Dict[Int, String] = {}
+	var variant_tags: Dict[Int, String] = {}
+	var variant_reuse_helpers: Dict[Int, String] = {}
+	var variant_without_id: Option[CSymbolProjectionError] = None
 
 	names = names.append(BUILTIN_STACK_OPTION_INT128_OPTION_C_TYPE)
 	names = names.append(BUILTIN_STACK_OPTION_UINT128_OPTION_C_TYPE)
@@ -748,17 +798,20 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 					else:
 						void
 
-				-- A variant with a definition identity is spelled from it
+				-- A variant is spelled from its definition identity
 				-- (`variant_constructor_symbol`), a family disjoint from callable
 				-- spellings by construction; it is tracked separately and checked
 				-- against every other reserved name in `variant_symbol_collision`.
-				-- One without an identity keeps its source-derived spelling, which
-				-- callables must still avoid.
+				-- A declared variant without an identity fails closed.
 				for variant in enum_decl.variants:
-					if variant.def_id.is_some():
-						variant_symbols = variant_symbols.append(variant.c_name)
-					else:
-						names = names.append(c_identifier(variant.c_name))
+					match variant.def_id:
+						Some(variant_id):
+							constructor_symbol: String = variant_constructor_symbol(variant_id)
+							variant_symbols = variant_symbols.append(constructor_symbol)
+							variant_constructors = variant_constructors.set(variant_id, constructor_symbol)
+						None:
+							if variant_without_id.is_none():
+								variant_without_id = Some(VariantWithoutDefinitionId(enum_decl.name, variant.name))
 			UnionDecl(union_decl):
 				if union_decl.abi_type.is_none():
 					type_candidates = type_candidates.append(union_decl.name)
@@ -771,16 +824,22 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 					names = names.append(facts.union_destroy_fields_name)
 
 				for variant in union_decl.variants:
-					if variant.def_id.is_some():
-						variant_symbols = variant_symbols.append(variant.c_name)
-						variant_symbols = variant_symbols.append(variant.tag_c_name)
-					else:
-						names = names.append(c_identifier(variant.c_name))
-						names = names.append(c_identifier(variant.tag_c_name))
-
-					names = names.append(union_instance_name(variant.c_name))
-					names = names.append(union_init_name(variant.c_name))
-					names = names.append(union_reuse_name(union_decl.name, variant.c_name))
+					match variant.def_id:
+						Some(variant_id):
+							constructor_symbol: String = variant_constructor_symbol(variant_id)
+							tag_symbol: String = variant_tag_symbol(variant_id)
+							reuse_symbol: String = union_reuse_name(union_decl.name, constructor_symbol)
+							variant_symbols = variant_symbols.append(constructor_symbol)
+							variant_symbols = variant_symbols.append(tag_symbol)
+							variant_constructors = variant_constructors.set(variant_id, constructor_symbol)
+							variant_tags = variant_tags.set(variant_id, tag_symbol)
+							variant_reuse_helpers = variant_reuse_helpers.set(variant_id, reuse_symbol)
+							names = names.append(union_instance_name(constructor_symbol))
+							names = names.append(union_init_name(constructor_symbol))
+							names = names.append(reuse_symbol)
+						None:
+							if variant_without_id.is_none():
+								variant_without_id = Some(VariantWithoutDefinitionId(union_decl.name, variant.name))
 			ValueRecordDecl(record_decl):
 				if record_decl.abi_type.is_none():
 					type_candidates = type_candidates.append(record_decl.name)
@@ -887,6 +946,12 @@ private pure func program_symbol_inventory(program: CoreProgram) -> CProgramSymb
 		candidates = candidates,
 		preserved_names = names,
 		variant_symbols = variant_symbols,
+		variant_table = {
+			constructors = variant_constructors,
+			tags = variant_tags,
+			reuse_helpers = variant_reuse_helpers
+		},
+		variant_without_id = variant_without_id,
 		type_naming = type_naming,
 		type_symbol_lookup = type_symbol_lookup
 	}
@@ -1267,17 +1332,24 @@ private pure func variant_symbol_collision(
 pure func prepare_c_emission_symbols(
 	program: CoreProgram,
 ) -> Result[CEmissionSymbolPlan, CSymbolProjectionError]:
-	match check_definition_id_uniqueness(program):
-		[violation, ..._]:
-			Err(InvalidCoreDefinitionIdentity(core_late_invariant_message(violation)))
-		[]:
-			inventory: CProgramSymbolInventory = program_symbol_inventory(program)
+	inventory: CProgramSymbolInventory = program_symbol_inventory(program)
 
+	-- Variant symbols come from ids alone, so two variants sharing an id show up
+	-- as a symbol collision; that is checked before the general uniqueness
+	-- check, which would report the same fault less specifically.
+	match inventory.variant_without_id:
+		Some(error):
+			Err(error)
+		None:
 			match variant_symbol_collision(inventory.variant_symbols, inventory.preserved_names):
 				Some(name):
 					Err(VariantSymbolCollision(name))
 				None:
-					prepare_c_emission_symbols_for_inventory(program, inventory)
+					match check_definition_id_uniqueness(program):
+						[violation, ..._]:
+							Err(InvalidCoreDefinitionIdentity(core_late_invariant_message(violation)))
+						[]:
+							prepare_c_emission_symbols_for_inventory(program, inventory)
 
 
 private pure func prepare_c_emission_symbols_for_inventory(
@@ -1322,7 +1394,8 @@ private pure func prepare_c_emission_symbols_for_inventory(
 								),
 								preserved_symbol_count = preserved_names.length(),
 								type_naming = inventory.type_naming,
-								type_symbol_lookup = inventory.type_symbol_lookup
+								type_symbol_lookup = inventory.type_symbol_lookup,
+								variant_symbols = inventory.variant_table
 							}))
 
 
@@ -1344,6 +1417,8 @@ pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
 			"callable `${name}` has no resolved definition id at final C projection"
 		UnresolvedCallbackTarget(name):
 			"callback `${name}` does not resolve to a projected callable"
+		VariantWithoutDefinitionId(type_name, variant_name):
+			"variant `${variant_name}` of `${type_name}` has no definition id at final C projection"
 		MissingProjectedHoistedCallable(def_id):
 			"missing projected closure or task body (${def_id}); a pass dropped or renumbered a hoisted body after closure conversion"
 		UnsupportedPreparedCallKind(kind):

@@ -9,7 +9,7 @@ import:
 		prepared_reuse_profile_observe_with_algorithm,
 		prepared_reuse_profile_worst_case_program,
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
-	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN, unspelled_test_variant
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(RootAccessor, VariantFieldAccessor),
 		CoreBoxKind(PointerBox),
@@ -170,13 +170,13 @@ import:
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_field_ref,
+		CoreVariantRef(BuiltinResultOk),
 		core_program_to_json,
 	../../../src/compiler/stage_09_core/reuse:
 		rewrite_post_perceus_expr,
 		rewrite_prepared_expr,
 		rewrite_prepared_program,
 		union_reuse_construct,
-	../../../src/compiler/stage_10_backend/c_naming: union_reuse_name
 	test: TestSuite
 
 
@@ -297,16 +297,12 @@ pure func expr_union_decl() -> CoreUnionDecl:
 		variants = [
 			{
 				name = "Add",
-				c_name = "Expr_Add",
-				tag_c_name = "BLORP_TAG_EXPR_ADD",
 				tag = 1,
 				fields = [expr_union_field(), expr_union_field()],
 				def_id = None
 			},
 			{
 				name = "Num",
-				c_name = "Expr_Num",
-				tag_c_name = "BLORP_TAG_EXPR_NUM",
 				tag = 2,
 				fields = [],
 				def_id = None
@@ -372,8 +368,6 @@ pure func variant_with_fields(
 ) -> CoreUnionVariant:
 	{
 		name = name,
-		c_name = name + "_c",
-		tag_c_name = "TAG_" + name,
 		tag = tag,
 		fields = fields,
 		def_id = Some(9200 + tag)
@@ -427,13 +421,13 @@ pure func pointer_box(value: CoreExpr) -> CoreBoxedStorageValue:
 
 
 pure func add_construct(args: List[CoreBoxedStorageValue]) -> CoreExpr:
-	union_construct("Expr", "Add", "Expr_Add", expr_type(), args)
+	union_construct("Expr", "Add", unspelled_test_variant(), expr_type(), args)
 
 
 pure func union_construct(
 	type_name: String,
 	constructor_name: String,
-	constructor_c_name: String,
+	variant: CoreVariantRef,
 	typ: CoreType,
 	args: List[CoreBoxedStorageValue],
 ) -> CoreExpr:
@@ -441,8 +435,7 @@ pure func union_construct(
 		{
 			type_name = type_name,
 			constructor_name = constructor_name,
-			constructor_c_name = constructor_c_name,
-			tag_c_name = "TAG_" + type_name + "_" + constructor_name,
+			variant = variant,
 			representation = GenericUnionRepresentation,
 			payload_storage = ErasedUnionPayloadStorage,
 			uses_release_mask = True,
@@ -513,7 +506,7 @@ pure func constructor_case(
 	{
 		constructor = constructor_name,
 		accessor = RootAccessor,
-		test = UnionTagConstructorTest(type_name, constructor_name),
+		test = UnionTagConstructorTest(unspelled_test_variant(), type_name),
 		bindings = bindings,
 		body = ConstructorMatchBodyExpr(body)
 	}
@@ -1679,7 +1672,7 @@ pure func test_prepared_reuse_recognizes_union_and_zero_arg_named_types() -> Boo
 			union_construct(
 				"Expr",
 				"Add",
-				"Expr_Add",
+				unspelled_test_variant(),
 				named_expr_type(),
 				[pointer_box(typed_var_expr(left_var(), named_expr_type()))],
 			),
@@ -1706,6 +1699,29 @@ pure func test_prepared_reuse_recognizes_union_and_zero_arg_named_types() -> Boo
 	union_type_count == 1 and named_type_count == 1 and parameterized_count == 0
 
 
+---
+The reuse helper is spelled from the variant's id, so a generic union construct
+naming a builtin Option or Result variant (a representation and variant that
+disagree) is never rewritten to an in-place reuse.
+---
+pure func test_prepared_reuse_rejects_generic_construct_of_builtin_variant() -> Bool:
+	body: CoreExpr = prepared_let_drop(
+		owned_add_bindings(),
+		union_construct(
+			"Expr",
+			"Add",
+			BuiltinResultOk,
+			expr_type(),
+			[
+				pointer_box(expr_var_expr(left_var())),
+				pointer_box(expr_var_expr(right_var())),
+			],
+		),
+	)
+
+	rewrite_program_reuse_count(decls(), body) == 0
+
+
 pure func test_prepared_reuse_fails_closed_for_missing_union_or_variant() -> Bool:
 	body: CoreExpr = prepared_let_drop(owned_add_bindings(), add_construct_from_fields())
 	missing_union: Int = rewrite_program_reuse_count([], body)
@@ -1715,35 +1731,6 @@ pure func test_prepared_reuse_fails_closed_for_missing_union_or_variant() -> Boo
 	)
 
 	missing_union == 0 and missing_variant == 0
-
-
----
-The reuse rewrite names the reuse helper it calls; the emitter declares that
-helper under `union_reuse_name`. A union type or variant spelled as a C
-reserved word must get the identical escaped spelling from both.
----
-pure func test_union_reuse_construct_names_reserved_word_helper_like_the_emitter() -> Bool:
-	construct_expr: CoreExpr = union_construct(
-		"auto",
-		"linux",
-		"linux",
-		union_type("auto"),
-		[pointer_box(expr_var_expr(left_var()))],
-	)
-
-	match construct_expr:
-		UnionConstructExpr(construct, _, _):
-			reuse: CoreUnionReuseConstruct = union_reuse_construct(
-				expr_var_expr(expr_var()),
-				construct,
-			)
-
-			(
-				reuse.reuse_constructor_c_name == union_reuse_name("auto", "linux")
-				and reuse.reuse_constructor_c_name == "__blorp_reuse_auto__linux_"
-			)
-		_:
-			False
 
 
 pure func test_prepared_reuse_keeps_same_spelling_variants_independent() -> Bool:
@@ -1759,7 +1746,7 @@ pure func test_prepared_reuse_keeps_same_spelling_variants_independent() -> Bool
 			union_construct(
 				"Other",
 				"Add",
-				"Other_Add",
+				unspelled_test_variant(),
 				other_type,
 				[pointer_box(typed_var_expr(left_var(), other_type))],
 			),
@@ -3340,6 +3327,10 @@ tests: TestSuite = {
 			test_prepared_reuse_recognizes_union_and_zero_arg_named_types,
 		),
 		(
+			"prepared reuse rejects generic construct of builtin variant",
+			test_prepared_reuse_rejects_generic_construct_of_builtin_variant,
+		),
+		(
 			"prepared reuse fails closed for missing union or variant",
 			test_prepared_reuse_fails_closed_for_missing_union_or_variant,
 		),
@@ -3374,10 +3365,6 @@ tests: TestSuite = {
 		(
 			"prepared reuse profile reports indexed declaration work",
 			test_prepared_reuse_profile_reports_indexed_declaration_work,
-		),
-		(
-			"union reuse construct names reserved word helper like the emitter",
-			test_union_reuse_construct_names_reserved_word_helper_like_the_emitter,
 		),
 		("rewrites owned union match result", test_rewrites_owned_union_match_result),
 		("rejects borrowed union match fields", test_rejects_borrowed_union_match_fields),

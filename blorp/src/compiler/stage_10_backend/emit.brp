@@ -472,6 +472,7 @@ import:
 		),
 		CoreUnionReuseConstruct,
 		CoreUnionVariant,
+		CoreVariantRef(BuiltinOptionNone, BuiltinOptionSome, BuiltinResultErr, BuiltinResultOk, VariantById),
 		CoreValueRecordDecl,
 		CoreValueRecordField,
 		CoreBinderOrigin(AuthoredBinder),
@@ -534,7 +535,6 @@ import:
 		static_union_storage_name,
 		union_init_name,
 		union_instance_name,
-		union_reuse_name,
 	c_symbol_projection:
 		CEmissionSymbolPlan,
 		CSymbolProjectionError,
@@ -543,7 +543,11 @@ import:
 		c_emission_static_string_literals,
 		c_emission_type_naming,
 		c_emission_type_symbol_lookup,
+		INVALID_PROJECTED_VARIANT_NAME,
 		emitted_callable_name,
+		emitted_variant_constructor,
+		emitted_variant_reuse_helper,
+		emitted_variant_tag,
 		emitted_callback_name,
 		prepare_c_emission_symbols,
 		symbol_projection_error_text,
@@ -4107,6 +4111,7 @@ private pure func emit_runtime_union_payload_expr(
 	cases: List[CoreRuntimeUnionCase],
 	next_temp: Int,
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	payload_type_name ?= payload_named_type_name(ok_type)
 	payload_tmp: String = temp_name(temp_prefix + "_payload", next_temp, compact)
@@ -4117,7 +4122,7 @@ private pure func emit_runtime_union_payload_expr(
 
 		match case.args:
 			[]:
-				c_code += "(void*)" + case.constructor_c_name
+				c_code += "(void*)" + emitted_variant_constructor(authority, case.constructor_def_id)
 			[first, ...rest]:
 				var args_c: String = runtime_union_arg_values(op_tmp, case.args)
 				release_mask: Int = runtime_union_release_mask(case.args)
@@ -4125,7 +4130,7 @@ private pure func emit_runtime_union_payload_expr(
 				if runtime_union_uses_erased_payload(case.args):
 					args_c += ", " + release_mask.to_string() + "UL"
 
-				c_code += "(void*)" + case.constructor_c_name + "(" + args_c + ")"
+				c_code += "(void*)" + emitted_variant_constructor(authority, case.constructor_def_id) + "(" + args_c + ")"
 
 		c_code += "; break; "
 
@@ -4140,6 +4145,7 @@ private pure func emit_operation_success_payload_expr(
 	next_temp: Int,
 	type_symbol_lookup: Dict[String, String],
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	match bridge.success.runtime_payload:
 		RuntimeNoPayload:
@@ -4164,6 +4170,7 @@ private pure func emit_operation_success_payload_expr(
 				cases,
 				next_temp,
 				compact,
+				authority,
 			)
 
 
@@ -4171,11 +4178,12 @@ private pure func operation_error_switch_cases(
 	error: CoreOperationErrorMapping,
 	op_tmp: String,
 	err_tmp: String,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var c_code: String = ""
 
 	for case in error.cases:
-		c_code += "case " + case.runtime_tag + ": " + err_tmp + " = " + case.constructor_c_name + "((void*)" + op_tmp + "." + error.detail_field + ", " + op_tmp + "." + error.detail_field + " ? 1UL : 0UL); break; "
+		c_code += "case " + case.runtime_tag + ": " + err_tmp + " = " + emitted_variant_constructor(authority, case.constructor_def_id) + "((void*)" + op_tmp + "." + error.detail_field + ", " + op_tmp + "." + error.detail_field + " ? 1UL : 0UL); break; "
 
 	c_code
 
@@ -4183,8 +4191,9 @@ private pure func operation_error_switch_cases(
 private pure func operation_other_error_expr(
 	error: CoreOperationErrorMapping,
 	op_tmp: String,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
-	error.other_constructor_c_name + "((void*)" + op_tmp + "." + error.detail_field + ", " + op_tmp + "." + error.detail_field + " ? 1UL : 0UL)"
+	emitted_variant_constructor(authority, error.other_constructor_def_id) + "((void*)" + op_tmp + "." + error.detail_field + ", " + op_tmp + "." + error.detail_field + " ? 1UL : 0UL)"
 
 
 private pure func emit_boxed_operation_result_bridge_body(
@@ -4196,11 +4205,12 @@ private pure func emit_boxed_operation_result_bridge_body(
 	next_temp: Int,
 	type_symbol_lookup: Dict[String, String],
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
 	op_tmp: String = temp_name(bridge.temp_prefix + "_op", next_temp, compact)
 	result_tmp: String = temp_name(bridge.temp_prefix + "_result", next_temp + 1, compact)
 	err_tmp: String = temp_name(bridge.temp_prefix + "_error", next_temp + 2, compact)
-	ok_payload ?= emit_operation_success_payload_expr(bridge, op_tmp, ok_type, next_temp + 3, type_symbol_lookup, compact)
+	ok_payload ?= emit_operation_success_payload_expr(bridge, op_tmp, ok_type, next_temp + 3, type_symbol_lookup, compact, authority)
 	result_c: String = TypeLayout.c_type_name(typ, type_symbol_lookup)
 	err_c: String = TypeLayout.c_type_name(err_type, type_symbol_lookup)
 
@@ -4213,9 +4223,11 @@ private pure func emit_boxed_operation_result_bridge_body(
 		bridge.error,
 		op_tmp,
 		err_tmp,
+		authority,
 	) + "default: " + err_tmp + " = " + operation_other_error_expr(
 		bridge.error,
 		op_tmp,
+		authority,
 	) + "; break; } " + result_tmp + " = (" + result_c + ")blorp_result_err((void*)" + err_tmp + "); ((blorp_Result*)" + result_tmp + ")->release_mask = 1UL; } " + result_tmp + "; })"
 
 	Some(body_value(value, next_temp + 4))
@@ -4230,11 +4242,12 @@ private pure func emit_stack_operation_result_bridge_body(
 	next_temp: Int,
 	type_symbol_lookup: Dict[String, String],
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
 	op_tmp: String = temp_name(bridge.temp_prefix + "_op", next_temp, compact)
 	result_tmp: String = temp_name(bridge.temp_prefix + "_result", next_temp + 1, compact)
 	err_tmp: String = temp_name(bridge.temp_prefix + "_error", next_temp + 2, compact)
-	ok_payload ?= emit_operation_success_payload_expr(bridge, op_tmp, ok_type, next_temp + 3, type_symbol_lookup, compact)
+	ok_payload ?= emit_operation_success_payload_expr(bridge, op_tmp, ok_type, next_temp + 3, type_symbol_lookup, compact, authority)
 	result_c: String = TypeLayout.c_type_name(typ, type_symbol_lookup)
 	err_c: String = TypeLayout.c_type_name(err_type, type_symbol_lookup)
 
@@ -4242,9 +4255,11 @@ private pure func emit_stack_operation_result_bridge_body(
 		bridge.error,
 		op_tmp,
 		err_tmp,
+		authority,
 	) + "default: " + err_tmp + " = " + operation_other_error_expr(
 		bridge.error,
 		op_tmp,
+		authority,
 	) + "; break; } " + result_tmp + " = ((" + result_c + "){ .tag = BLORP_TAG_ERR, .release_mask = 1UL, .data.Err.field0 = (void*)" + err_tmp + " }); } " + result_tmp + "; })"
 
 	Some(body_value(value, next_temp + 4))
@@ -4258,6 +4273,7 @@ private pure func emit_operation_result_bridge_layout_body(
 	next_temp: Int,
 	type_symbol_lookup: Dict[String, String],
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
 	match layout:
 		BoxedResultBridgeLayout(ok_type, err_type):
@@ -4270,6 +4286,7 @@ private pure func emit_operation_result_bridge_layout_body(
 				next_temp,
 				type_symbol_lookup,
 				compact,
+				authority,
 			)
 		StackResultBridgeLayout(ok_type, err_type):
 			emit_stack_operation_result_bridge_body(
@@ -4281,6 +4298,7 @@ private pure func emit_operation_result_bridge_layout_body(
 				next_temp,
 				type_symbol_lookup,
 				compact,
+				authority,
 			)
 
 
@@ -4303,6 +4321,7 @@ private pure func emit_operation_result_bridge_body(
 		args_body.next_temp,
 		selected_type_symbol_lookup(emission_context.symbol_authority),
 		emission_context.compact,
+		emission_context.symbol_authority,
 	)
 
 	Some({
@@ -4438,11 +4457,12 @@ private pure func fallible_stream_error_switch_cases(
 	error_domain: CoreFallibleStreamErrorDomain,
 	op_tmp: String,
 	err_tmp: String,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var c_code: String = ""
 
 	for case in error_domain.cases:
-		c_code += "case " + case.runtime_tag + ": " + err_tmp + " = " + case.constructor_c_name + "((void*)" + op_tmp + ".error.detail, " + op_tmp + ".error.detail ? 1UL : 0UL); break; "
+		c_code += "case " + case.runtime_tag + ": " + err_tmp + " = " + emitted_variant_constructor(authority, case.constructor_def_id) + "((void*)" + op_tmp + ".error.detail, " + op_tmp + ".error.detail ? 1UL : 0UL); break; "
 
 	c_code
 
@@ -4451,8 +4471,9 @@ private pure func fallible_stream_other_error_expr(
 	error_domain: CoreFallibleStreamErrorDomain,
 	detail_expr: String,
 	detail_owned: String,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
-	error_domain.other_constructor_c_name + "((void*)" + detail_expr + ", " + detail_owned + ")"
+	emitted_variant_constructor(authority, error_domain.other_constructor_def_id) + "((void*)" + detail_expr + ", " + detail_owned + ")"
 
 
 private pure func fallible_stream_error_value_statement(
@@ -4460,21 +4481,25 @@ private pure func fallible_stream_error_value_statement(
 	op_tmp: String,
 	err_tmp: String,
 	detail_tmp: String,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	"if (" + op_tmp + ".error.domain == " + error_domain.domain_tag + ") { switch (" + op_tmp + ".error.kind) { " + fallible_stream_error_switch_cases(
 		error_domain,
 		op_tmp,
 		err_tmp,
+		authority,
 	) + "default: " + err_tmp + " = " + fallible_stream_other_error_expr(
 		error_domain,
 		op_tmp + ".error.detail",
 		op_tmp + ".error.detail ? 1UL : 0UL",
+		authority,
 	) + "; break; } } else { blorp_String* " + detail_tmp + " = " + op_tmp + ".error.detail ? " + op_tmp + ".error.detail : " + render_prepared_backend_op(
 		BackendStringCreateFromCString("\"fallible stream error domain mismatch\""),
 	) + "; " + err_tmp + " = " + fallible_stream_other_error_expr(
 		error_domain,
 		detail_tmp,
 		op_tmp + ".error.detail ? 1UL : 0UL",
+		authority,
 	) + "; } "
 
 
@@ -4487,6 +4512,7 @@ private pure func emit_boxed_fallible_stream_terminal_bridge_body(
 	next_temp: Int,
 	type_symbol_lookup: Dict[String, String],
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
 	op_tmp: String = temp_name("stream_op", next_temp, compact)
 	result_tmp: String = temp_name("stream_result", next_temp + 1, compact)
@@ -4507,6 +4533,7 @@ private pure func emit_boxed_fallible_stream_terminal_bridge_body(
 		op_tmp,
 		err_tmp,
 		detail_tmp,
+		authority,
 	) + result_tmp + " = (" + result_c + ")blorp_result_err((void*)" + err_tmp + "); ((blorp_Result*)" + result_tmp + ")->release_mask = 1UL; } " + result_tmp + "; })"
 
 	Some(body_value(value, next_temp + 4))
@@ -4521,6 +4548,7 @@ private pure func emit_stack_fallible_stream_terminal_bridge_body(
 	next_temp: Int,
 	type_symbol_lookup: Dict[String, String],
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
 	op_tmp: String = temp_name("stream_op", next_temp, compact)
 	result_tmp: String = temp_name("stream_result", next_temp + 1, compact)
@@ -4536,6 +4564,7 @@ private pure func emit_stack_fallible_stream_terminal_bridge_body(
 		op_tmp,
 		err_tmp,
 		detail_tmp,
+		authority,
 	) + result_tmp + " = ((" + result_c + "){ .tag = BLORP_TAG_ERR, .release_mask = 1UL, .data.Err.field0 = (void*)" + err_tmp + " }); } " + result_tmp + "; })"
 
 	Some(body_value(value, next_temp + 4))
@@ -4549,6 +4578,7 @@ private pure func emit_fallible_stream_terminal_bridge_layout_body(
 	next_temp: Int,
 	type_symbol_lookup: Dict[String, String],
 	compact: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[FunctionBodyC]:
 	match layout:
 		BoxedResultBridgeLayout(ok_type, err_type):
@@ -4561,6 +4591,7 @@ private pure func emit_fallible_stream_terminal_bridge_layout_body(
 				next_temp,
 				type_symbol_lookup,
 				compact,
+				authority,
 			)
 		StackResultBridgeLayout(ok_type, err_type):
 			emit_stack_fallible_stream_terminal_bridge_body(
@@ -4572,6 +4603,7 @@ private pure func emit_fallible_stream_terminal_bridge_layout_body(
 				next_temp,
 				type_symbol_lookup,
 				compact,
+				authority,
 			)
 
 
@@ -4594,6 +4626,7 @@ private pure func emit_fallible_stream_terminal_bridge_body(
 		args_body.next_temp,
 		selected_type_symbol_lookup(emission_context.symbol_authority),
 		emission_context.compact,
+		emission_context.symbol_authority,
 	)
 
 	Some({
@@ -11088,14 +11121,15 @@ private pure func emit_generic_union_construct_call(
 	construct: CoreUnionConstruct,
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
+	variant_id ?= declared_variant_id(construct.variant)
 	initial_args ?= emit_generic_union_args(construct, emission_context)
 	var args: List[String] = initial_args
 
 	if args.length() == 0:
-		Some(construct.constructor_c_name)
+		Some(emitted_variant_constructor(emission_context.symbol_authority, variant_id))
 	else:
 		Some(
-			construct.constructor_c_name + "(" + call_args_text(
+			emitted_variant_constructor(emission_context.symbol_authority, variant_id) + "(" + call_args_text(
 				args,
 				construct.uses_release_mask,
 				construct.release_mask,
@@ -11127,6 +11161,7 @@ private pure func emit_union_reuse_construct(
 ) -> Option[String]:
 	match construct.representation:
 		GenericUnionRepresentation:
+			variant_id ?= declared_variant_id(construct.variant)
 			source_c ?= emit_simple_expr(construct.source, emission_context)
 			payload_args ?= emit_generic_union_reuse_args(
 				construct.payload_storage,
@@ -11139,7 +11174,7 @@ private pure func emit_union_reuse_construct(
 				args = args.append(payload_arg)
 
 			Some(
-				construct.reuse_constructor_c_name + "(" + call_args_text(
+				emitted_variant_reuse_helper(emission_context.symbol_authority, variant_id) + "(" + call_args_text(
 					args,
 					construct.uses_release_mask,
 					construct.release_mask,
@@ -11180,6 +11215,7 @@ private pure func emit_generic_union_construct_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
+	variant_id ?= declared_variant_id(construct.variant)
 	var statements: String = ""
 	var args: List[String] = []
 	var failed: Bool = False
@@ -11211,12 +11247,12 @@ private pure func emit_generic_union_construct_body(
 	else if args.length() == 0:
 		Some({
 			statements = statements,
-			value = construct.constructor_c_name,
+			value = emitted_variant_constructor(emission_context.symbol_authority, variant_id),
 			next_temp = temp_index,
 			returns = False,
 		})
 	else:
-		constructor_value: String = construct.constructor_c_name + "(" + call_args_text(
+		constructor_value: String = emitted_variant_constructor(emission_context.symbol_authority, variant_id) + "(" + call_args_text(
 			args,
 			construct.uses_release_mask,
 			construct.release_mask,
@@ -11241,6 +11277,7 @@ private pure func emit_generic_union_reuse_construct_body(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
+	variant_id ?= declared_variant_id(construct.variant)
 	source_body ?= emit_function_body(construct.source, next_temp, emission_context)
 
 	if source_body.returns:
@@ -11276,7 +11313,7 @@ private pure func emit_generic_union_reuse_construct_body(
 		if failed:
 			None
 		else:
-			constructor_value: String = construct.reuse_constructor_c_name + "(" + call_args_text(
+			constructor_value: String = emitted_variant_reuse_helper(emission_context.symbol_authority, variant_id) + "(" + call_args_text(
 				args,
 				construct.uses_release_mask,
 				construct.release_mask,
@@ -18742,12 +18779,13 @@ private pure func emit_constructor_match_test(
 	accessor: CoreAccessor,
 	test: CoreConstructorMatchTest,
 	type_symbol_lookup: Dict[String, String],
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	match test:
-		EnumConstructorTest(c_name):
-			scrutinee_temp + " == " + c_name
-		UnionTagConstructorTest(tag_c_name, union_c_type):
-			constructor_match_test_target(scrutinee_temp, test, type_symbol_lookup) + "->tag == " + tag_c_name
+		EnumConstructorTest(variant):
+			scrutinee_temp + " == " + variant_ref_constructor_symbol(authority, variant)
+		UnionTagConstructorTest(variant, union_c_type):
+			constructor_match_test_target(scrutinee_temp, test, type_symbol_lookup) + "->tag == " + variant_ref_tag_symbol(authority, variant)
 		NullableOptionSomeConstructorTest:
 			scrutinee_temp + " != NULL"
 		NullableOptionNoneConstructorTest:
@@ -18795,7 +18833,7 @@ private pure func constructor_match_union_scrutinee_type(
 
 	for match_case in cases:
 		match match_case.test:
-			UnionTagConstructorTest(tag_c_name, union_c_type):
+			UnionTagConstructorTest(variant, union_c_type):
 				if accessors_equal(match_case.accessor, RootAccessor):
 					match result:
 						Some(c_type):
@@ -18805,7 +18843,7 @@ private pure func constructor_match_union_scrutinee_type(
 				else:
 					has_non_root_union_test = True
 					break
-			EnumConstructorTest(c_name):
+			EnumConstructorTest(variant):
 				void
 			NullableOptionSomeConstructorTest:
 				void
@@ -19555,9 +19593,9 @@ private pure func constructor_match_test_target(
 	type_symbol_lookup: Dict[String, String],
 ) -> String:
 	match test:
-		UnionTagConstructorTest(tag_c_name, union_c_type):
+		UnionTagConstructorTest(variant, union_c_type):
 			"((" + type_symbol_lookup.get(union_c_type).get_or(union_c_type) + "*)" + source_c + ")"
-		EnumConstructorTest(c_name):
+		EnumConstructorTest(variant):
 			source_c
 		NullableOptionSomeConstructorTest:
 			source_c
@@ -19708,9 +19746,9 @@ private pure func emit_match_accessor_for_constructor_case(
 								TypeLayout.resolved_stack_option_type_name(option_type, type_symbol_lookup),
 							) + ".value",
 						)
-					EnumConstructorTest(c_name):
+					EnumConstructorTest(variant):
 						None
-					UnionTagConstructorTest(tag_c_name, union_c_type):
+					UnionTagConstructorTest(variant, union_c_type):
 						None
 					NullableOptionSomeConstructorTest:
 						None
@@ -21649,6 +21687,7 @@ private pure func emit_constructor_match(
 						match_case.accessor,
 						match_case.test,
 						selected_type_symbol_lookup(emission_context.symbol_authority),
+						emission_context.symbol_authority,
 					)
 
 					match emit_constructor_match_branch_body(
@@ -22760,17 +22799,100 @@ private pure func find_union_variant(
 	found
 
 
+private pure func union_variant_constructor_symbol(
+	authority: CEmissionSymbolAuthority,
+	variant: CoreUnionVariant,
+) -> String:
+	match variant.def_id:
+		Some(def_id):
+			emitted_variant_constructor(authority, def_id)
+		None:
+			INVALID_PROJECTED_VARIANT_NAME
+
+
+private pure func union_variant_reuse_symbol(
+	authority: CEmissionSymbolAuthority,
+	variant: CoreUnionVariant,
+) -> String:
+	match variant.def_id:
+		Some(def_id):
+			emitted_variant_reuse_helper(authority, def_id)
+		None:
+			INVALID_PROJECTED_VARIANT_NAME
+
+
+private pure func enum_variant_constructor_symbol(
+	authority: CEmissionSymbolAuthority,
+	variant: CoreEnumVariant,
+) -> String:
+	match variant.def_id:
+		Some(def_id):
+			emitted_variant_constructor(authority, def_id)
+		None:
+			INVALID_PROJECTED_VARIANT_NAME
+
+
+private pure func union_variant_tag_symbol(
+	authority: CEmissionSymbolAuthority,
+	variant: CoreUnionVariant,
+) -> String:
+	match variant.def_id:
+		Some(def_id):
+			emitted_variant_tag(authority, def_id)
+		None:
+			INVALID_PROJECTED_VARIANT_NAME
+
+
+private pure func variant_ref_constructor_symbol(
+	authority: CEmissionSymbolAuthority,
+	variant: CoreVariantRef,
+) -> String:
+	match variant:
+		VariantById(def_id):
+			emitted_variant_constructor(authority, def_id)
+		BuiltinOptionSome | BuiltinOptionNone | BuiltinResultOk | BuiltinResultErr:
+			INVALID_PROJECTED_VARIANT_NAME
+
+
+---
+The definition id of a construct's variant. Only a declared variant has one, and
+only the generic union and boxed Option emit paths spell a variant, so a builtin
+Option or Result variant reaching them (a representation and variant that
+disagree) makes the construct unsupported: the function body is reported as one
+the backend could not emit.
+---
+private pure func declared_variant_id(variant: CoreVariantRef) -> Option[Int]:
+	match variant:
+		VariantById(def_id):
+			Some(def_id)
+		BuiltinOptionSome | BuiltinOptionNone | BuiltinResultOk | BuiltinResultErr:
+			None
+
+
+private pure func variant_ref_tag_symbol(
+	authority: CEmissionSymbolAuthority,
+	variant: CoreVariantRef,
+) -> String:
+	match variant:
+		VariantById(def_id):
+			emitted_variant_tag(authority, def_id)
+		BuiltinOptionSome | BuiltinOptionNone | BuiltinResultOk | BuiltinResultErr:
+			INVALID_PROJECTED_VARIANT_NAME
+
+
 private pure func union_variant_c_name(
 	union_decl: CoreUnionDecl,
 	variant_name: String,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	variant ?= find_union_variant(union_decl.variants, variant_name)
-	Some(variant.c_name)
+	Some(union_variant_constructor_symbol(authority, variant))
 
 
 private pure func channel_attempt_constructors(
 	union_decl: CoreUnionDecl,
 	layout: CoreSpecializeLayout,
+	authority: CEmissionSymbolAuthority,
 ) -> ChannelAttemptConstructors:
 	recv_value_variant: Option[CoreUnionVariant] = find_union_variant(
 		union_decl.variants,
@@ -22788,14 +22910,14 @@ private pure func channel_attempt_constructors(
 			False
 
 	{
-		recv_value = union_variant_c_name(union_decl, "RecvValue"),
-		recv_would_block = union_variant_c_name(union_decl, "RecvWouldBlock"),
-		recv_sealed = union_variant_c_name(union_decl, "RecvSealed"),
-		recv_timed_out = union_variant_c_name(union_decl, "RecvTimedOut"),
-		send_accepted = union_variant_c_name(union_decl, "SendAccepted"),
-		send_would_block = union_variant_c_name(union_decl, "SendWouldBlock"),
-		send_sealed = union_variant_c_name(union_decl, "SendSealed"),
-		send_timed_out = union_variant_c_name(union_decl, "SendTimedOut"),
+		recv_value = union_variant_c_name(union_decl, "RecvValue", authority),
+		recv_would_block = union_variant_c_name(union_decl, "RecvWouldBlock", authority),
+		recv_sealed = union_variant_c_name(union_decl, "RecvSealed", authority),
+		recv_timed_out = union_variant_c_name(union_decl, "RecvTimedOut", authority),
+		send_accepted = union_variant_c_name(union_decl, "SendAccepted", authority),
+		send_would_block = union_variant_c_name(union_decl, "SendWouldBlock", authority),
+		send_sealed = union_variant_c_name(union_decl, "SendSealed", authority),
+		send_timed_out = union_variant_c_name(union_decl, "SendTimedOut", authority),
 		recv_value_uses_release_mask = recv_value_uses_release_mask
 	}
 
@@ -23109,7 +23231,7 @@ private pure func emit_channel_attempt_user_function(
 	type_name ?= union_type_name(func_info.return_type)
 	union_decl ?= find_union_decl(decls, type_name)
 	layout ?= emission_context.specialize_layout
-	constructors: ChannelAttemptConstructors = channel_attempt_constructors(union_decl, layout)
+	constructors: ChannelAttemptConstructors = channel_attempt_constructors(union_decl, layout, emission_context.symbol_authority)
 	temp_seed: String = func_info.def_id.to_string()
 
 	match body:
@@ -23721,8 +23843,11 @@ private pure func emit_static_closure_forward_decl(
 			""
 
 
-private pure func emit_enum_to_string_case(variant: CoreEnumVariant) -> String:
-	"    case " + variant.c_name + ": return " + render_prepared_backend_op(
+private pure func emit_enum_to_string_case(
+	authority: CEmissionSymbolAuthority,
+	variant: CoreEnumVariant,
+) -> String:
+	"    case " + enum_variant_constructor_symbol(authority, variant) + ": return " + render_prepared_backend_op(
 		BackendStringCreateFromCString(c_string_literal(variant.name)),
 	) + ";\n"
 
@@ -23741,6 +23866,7 @@ private pure func emit_enum_to_string_function(
 	enum_decl: CoreEnumDecl,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	storage_class: String = if internal_type_linkage:
 		"static "
@@ -23751,7 +23877,7 @@ private pure func emit_enum_to_string_function(
 	c_code += "    switch (v) {\n"
 
 	for variant in enum_decl.variants:
-		c_code += emit_enum_to_string_case(variant)
+		c_code += emit_enum_to_string_case(authority, variant)
 
 	c_code += "    default: return blorp_to_string(v);\n"
 	c_code += "    }\n"
@@ -23785,12 +23911,12 @@ private pure func emit_enum_decl(
 	naming: BackendTypeNaming = selected_type_naming(authority, enum_decl.name)
 
 	for variant in enum_decl.variants:
-		type_header += "#define " + variant.c_name + " " + variant.tag.to_string() + "L\n"
+		type_header += "#define " + enum_variant_constructor_symbol(authority, variant) + " " + variant.tag.to_string() + "L\n"
 
 	{
 		type_header = type_header,
 		functions = [
-			emit_enum_to_string_function(enum_decl, naming, internal_type_linkage),
+			emit_enum_to_string_function(enum_decl, naming, internal_type_linkage, authority),
 			emit_enum_vector_to_string_function(naming),
 		]
 	}
@@ -24681,6 +24807,7 @@ private pure func static_record_field_initializer(
 	member_spelling: CRecordMemberScope,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	field_init ?= static_value_initializer(
 		static_child_path(parent_path, field.name),
@@ -24688,6 +24815,7 @@ private pure func static_record_field_initializer(
 		field.value,
 		type_symbol_lookup,
 		record_members,
+		authority,
 	)
 
 	member ?= c_record_member(member_spelling, field.name, field.ref)
@@ -24704,6 +24832,7 @@ private pure func static_record_field_initializers(
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -24717,6 +24846,7 @@ private pure func static_record_field_initializers(
 				member_spelling,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			):
 				Some(field_init):
 					definitions = definitions.append(field_init.definitions)
@@ -24740,6 +24870,7 @@ private pure func static_heap_record_initializer(
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	field_inits ?= static_record_field_initializers(
 		path_c,
@@ -24747,6 +24878,7 @@ private pure func static_heap_record_initializer(
 		fields,
 		type_symbol_lookup,
 		record_members,
+		authority,
 	)
 	storage_name: String = static_record_storage_name(path_c)
 	record_c_type: String = type_symbol_lookup.get(type_name).get_or(type_name)
@@ -24770,6 +24902,7 @@ private pure func static_value_record_initializer(
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	field_inits ?= static_record_field_initializers(
 		path_c,
@@ -24777,6 +24910,7 @@ private pure func static_value_record_initializer(
 		fields,
 		type_symbol_lookup,
 		record_members,
+		authority,
 	)
 
 	Some({
@@ -24791,6 +24925,7 @@ private pure func static_value_initializer(
 	expr: CoreExpr,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	match expr:
 		LiteralExpr(literal, literal_type, loc):
@@ -24805,11 +24940,11 @@ private pure func static_value_initializer(
 						value = "(blorp_List*)&" + canonical.symbol_name,
 					})
 				None:
-					static_list_initializer(path_c, construct, type_symbol_lookup, record_members)
+					static_list_initializer(path_c, construct, type_symbol_lookup, record_members, authority)
 		TupleConstructExpr(construct, tuple_type, loc):
-			static_tuple_initializer(path_c, construct, type_symbol_lookup, record_members)
+			static_tuple_initializer(path_c, construct, type_symbol_lookup, record_members, authority)
 		UnionConstructExpr(construct, union_type, loc):
-			static_union_initializer(path_c, construct, type_symbol_lookup, record_members)
+			static_union_initializer(path_c, construct, type_symbol_lookup, record_members, authority)
 		UnionReuseConstructExpr(construct, union_type, loc):
 			None
 		RecordConstructExpr(type_name, fields, record_type, loc):
@@ -24821,6 +24956,7 @@ private pure func static_value_initializer(
 						fields,
 						type_symbol_lookup,
 						record_members,
+						authority,
 					)
 				ValueRecordType(name):
 					static_value_record_initializer(
@@ -24829,6 +24965,7 @@ private pure func static_value_initializer(
 						fields,
 						type_symbol_lookup,
 						record_members,
+						authority,
 					)
 				VoidType:
 					None
@@ -24862,6 +24999,7 @@ private pure func static_pointer_list_slot_initializer(
 	value: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	match value.kind:
 		PointerBox:
@@ -24871,6 +25009,7 @@ private pure func static_pointer_list_slot_initializer(
 				value.value,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -24902,6 +25041,7 @@ private pure func static_pointer_list_slots(
 	elements: List[CoreBoxedStorageValue],
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -24916,6 +25056,7 @@ private pure func static_pointer_list_slots(
 				element,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			):
 				Some(slot):
 					definitions = definitions.append(slot.definitions)
@@ -24946,6 +25087,7 @@ private pure func static_tuple_element_initializer(
 	element: CoreTupleElement,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	match element:
 		TuplePrimElement(value):
@@ -24962,6 +25104,7 @@ private pure func static_tuple_element_initializer(
 				value,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -25001,6 +25144,7 @@ private pure func static_tuple_slots(
 	elements: List[CoreTupleElement],
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -25015,6 +25159,7 @@ private pure func static_tuple_slots(
 				element,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			):
 				Some(slot):
 					definitions = definitions.append(slot.definitions)
@@ -25070,8 +25215,9 @@ private pure func static_tuple_initializer(
 	construct: CoreTupleConstruct,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
-	slots ?= static_tuple_slots(path_c, construct.elements, type_symbol_lookup, record_members)
+	slots ?= static_tuple_slots(path_c, construct.elements, type_symbol_lookup, record_members, authority)
 	storage_name: String = static_tuple_storage_name(path_c)
 	arity: Int = construct.elements.length()
 	storage_slots: Int = static_tuple_storage_slots(arity)
@@ -25091,6 +25237,7 @@ private pure func static_result_payload_slot_initializer(
 	value: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	match value.kind:
 		PointerBox:
@@ -25100,6 +25247,7 @@ private pure func static_result_payload_slot_initializer(
 				value.value,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -25137,6 +25285,7 @@ private pure func static_stack_result_initializer(
 	representation: CoreStackResultRepresentation,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	match construct.args:
 		[arg]:
@@ -25146,6 +25295,7 @@ private pure func static_stack_result_initializer(
 				arg,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 			Some({
 				definitions = owned_static_fragment(payload.definitions),
@@ -25170,6 +25320,7 @@ private pure func static_generic_union_arg_initializer(
 	arg: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	match arg.kind:
 		PointerBox:
@@ -25179,6 +25330,7 @@ private pure func static_generic_union_arg_initializer(
 				arg.value,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 			Some({
 				definitions = owned_static_fragment(child.definitions),
@@ -25216,6 +25368,7 @@ private pure func static_generic_union_arg_initializers(
 	args: List[CoreBoxedStorageValue],
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -25231,6 +25384,7 @@ private pure func static_generic_union_arg_initializers(
 				arg,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			):
 				Some(arg_init):
 					definitions = definitions.append(arg_init.definitions)
@@ -25255,7 +25409,9 @@ private pure func static_generic_union_initializer(
 	construct: CoreUnionConstruct,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
+	variant_id ?= declared_variant_id(construct.variant)
 	match construct.payload_storage:
 		TypedUnionPayloadStorage:
 			args ?= static_generic_union_arg_initializers(
@@ -25264,10 +25420,11 @@ private pure func static_generic_union_initializer(
 				construct.args,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 			storage_name: String = static_union_storage_name(path_c)
 			union_c_type: String = type_symbol_lookup.get(construct.type_name).get_or(construct.type_name)
-			definition: String = args.definitions + "static " + union_c_type + " " + storage_name + " = {\n  .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  .tag = " + c_identifier(construct.tag_c_name) + ",\n  .data." + c_identifier(
+			definition: String = args.definitions + "static " + union_c_type + " " + storage_name + " = {\n  .header = { BLORP_IMMORTAL_REFCOUNT, BLORP_ALLOC_CLASS_DIRECT, 0 },\n  .tag = " + c_identifier(emitted_variant_tag(authority, variant_id)) + ",\n  .data." + c_identifier(
 				construct.constructor_name,
 			) + " = { " + args.value + " }\n};\n\n"
 
@@ -25284,6 +25441,7 @@ private pure func static_union_initializer(
 	construct: CoreUnionConstruct,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	match construct.representation:
 		StackResultRepresentation(representation):
@@ -25293,9 +25451,10 @@ private pure func static_union_initializer(
 				representation,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 		GenericUnionRepresentation:
-			static_generic_union_initializer(path_c, construct, type_symbol_lookup, record_members)
+			static_generic_union_initializer(path_c, construct, type_symbol_lookup, record_members, authority)
 		BoxedOptionRepresentation:
 			None
 		StackOptionRepresentation(representation):
@@ -25333,6 +25492,7 @@ private pure func static_list_initializer(
 	construct: CoreListConstruct,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[StaticValueInitializer]:
 	storage_name: String = static_list_storage_name(path_c)
 	elem_count: Int = construct.elements.length()
@@ -25345,6 +25505,7 @@ private pure func static_list_initializer(
 				construct.elements,
 				type_symbol_lookup,
 				record_members,
+				authority,
 			)
 
 			elem_release: String = if construct.elem_needs_release:
@@ -25543,6 +25704,7 @@ private pure func emit_static_managed_global_decl(
 	internal_type_linkage: Bool,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	if not global_has_static_managed_decl(global):
 		None
@@ -25554,6 +25716,7 @@ private pure func emit_static_managed_global_decl(
 			global.init,
 			type_symbol_lookup,
 			record_members,
+			authority,
 		)
 
 		storage_class: String = if internal_type_linkage:
@@ -25776,12 +25939,14 @@ private pure func emit_global_decl(
 	internal_type_linkage: Bool,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	match emit_static_managed_global_decl(
 		global,
 		internal_type_linkage,
 		type_symbol_lookup,
 		record_members,
+		authority,
 	):
 		Some(decl):
 			decl
@@ -26384,6 +26549,7 @@ private pure func emit_union_destructor_cases(
 	union_decl: CoreUnionDecl,
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var cases_c: String = ""
 	var variant_index: Int = 0
@@ -26410,7 +26576,7 @@ private pure func emit_union_destructor_cases(
 				)
 				index += 1
 
-			cases_c += "    case " + variant.tag_c_name + ":\n" + releases_c + "      break;\n"
+			cases_c += "    case " + union_variant_tag_symbol(authority, variant) + ":\n" + releases_c + "      break;\n"
 		else:
 			void
 
@@ -26424,6 +26590,7 @@ private pure func emit_simple_union_destructor(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	storage_class: String = if internal_type_linkage:
 		"static "
@@ -26436,6 +26603,7 @@ private pure func emit_simple_union_destructor(
 		union_decl,
 		type_plan,
 		naming,
+		authority,
 	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n"
 
 
@@ -26444,6 +26612,7 @@ private pure func emit_iterative_union_destructor(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	type_name: String = naming.c_name
 	stack_push_name: String = naming.union_destroy_stack_push_name
@@ -26459,6 +26628,7 @@ private pure func emit_iterative_union_destructor(
 		union_decl,
 		type_plan,
 		naming,
+		authority,
 	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + storage_class + destroy_function_signature(
 		naming.destroy_name,
 	) + " {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n"
@@ -26469,14 +26639,15 @@ private pure func emit_union_destructor(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	match cleanup_type_plan_strategy(type_plan):
 		NoCleanup:
 			""
 		IterativeCleanup:
-			emit_iterative_union_destructor(union_decl, type_plan, naming, internal_type_linkage)
+			emit_iterative_union_destructor(union_decl, type_plan, naming, internal_type_linkage, authority)
 		DirectCleanup:
-			emit_simple_union_destructor(union_decl, type_plan, naming, internal_type_linkage)
+			emit_simple_union_destructor(union_decl, type_plan, naming, internal_type_linkage, authority)
 
 
 private pure func emit_union_constructor(
@@ -26486,12 +26657,13 @@ private pure func emit_union_constructor(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	type_symbol_lookup: Dict[String, String],
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	if variant.fields.length() == 0:
-		instance_name: String = union_instance_name(variant.c_name)
-		init_name: String = union_init_name(variant.c_name)
+		instance_name: String = union_instance_name(union_variant_constructor_symbol(authority, variant))
+		init_name: String = union_init_name(union_variant_constructor_symbol(authority, variant))
 
-		"static " + naming.c_name + " " + instance_name + ";\n" + "__attribute__((constructor)) static void " + init_name + "(void) {\n" + "  atomic_store_explicit(&" + instance_name + ".header.refcount, BLORP_IMMORTAL_REFCOUNT, memory_order_relaxed);\n" + "  " + instance_name + ".tag = " + variant.tag_c_name + ";\n" + "}\n" + "#define " + variant.c_name + " ((" + naming.c_name + "*)&" + instance_name + ")\n\n"
+		"static " + naming.c_name + " " + instance_name + ";\n" + "__attribute__((constructor)) static void " + init_name + "(void) {\n" + "  atomic_store_explicit(&" + instance_name + ".header.refcount, BLORP_IMMORTAL_REFCOUNT, memory_order_relaxed);\n" + "  " + instance_name + ".tag = " + union_variant_tag_symbol(authority, variant) + ";\n" + "}\n" + "#define " + union_variant_constructor_symbol(authority, variant) + " ((" + naming.c_name + "*)&" + instance_name + ")\n\n"
 	else:
 		var params: List[String] = []
 		var assignments: String = ""
@@ -26534,9 +26706,9 @@ private pure func emit_union_constructor(
 
 		union_alloc: String = render_prepared_backend_op(BackendGenericObjectAlloc(naming.c_name))
 
-		naming.c_name + "* " + variant.c_name + "(" + params.join(
+		naming.c_name + "* " + union_variant_constructor_symbol(authority, variant) + "(" + params.join(
 			", ",
-		) + ") {\n" + "  " + naming.c_name + "* __vc = (" + naming.c_name + "*)" + union_alloc + ";\n" + type_install + "  __vc->tag = " + variant.tag_c_name + ";\n" + release_mask_init + assignments + "  return __vc;\n}\n\n"
+		) + ") {\n" + "  " + naming.c_name + "* __vc = (" + naming.c_name + "*)" + union_alloc + ";\n" + type_install + "  __vc->tag = " + union_variant_tag_symbol(authority, variant) + ";\n" + release_mask_init + assignments + "  return __vc;\n}\n\n"
 
 
 private pure func emit_union_reuse_constructor(
@@ -26546,6 +26718,7 @@ private pure func emit_union_reuse_constructor(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	type_symbol_lookup: Dict[String, String],
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	if variant.fields.length() == 0:
 		""
@@ -26560,7 +26733,7 @@ private pure func emit_union_reuse_constructor(
 			variant_index,
 		)
 		has_release_mask: Bool = union_decl_has_release_mask(union_decl, type_plan)
-		reuse_name: String = union_reuse_name(union_decl.name, variant.c_name)
+		reuse_name: String = union_variant_reuse_symbol(authority, variant)
 
 		for field in variant.fields:
 			field_name: String = "field" + index.to_string()
@@ -26594,7 +26767,7 @@ private pure func emit_union_reuse_constructor(
 
 		"static inline " + naming.c_name + "* " + reuse_name + "(" + params.join(
 			", ",
-		) + ") {\n" + "  if (__old && blorp_is_unique(__old)) {\n" + destroy_old_fields + "    __old->tag = " + variant.tag_c_name + ";\n" + release_mask_update + assignments + "    return __old;\n" + "  }\n" + "  " + naming.c_name + "* __fresh = " + variant.c_name + "(" + fresh_args.join(
+		) + ") {\n" + "  if (__old && blorp_is_unique(__old)) {\n" + destroy_old_fields + "    __old->tag = " + union_variant_tag_symbol(authority, variant) + ";\n" + release_mask_update + assignments + "    return __old;\n" + "  }\n" + "  " + naming.c_name + "* __fresh = " + union_variant_constructor_symbol(authority, variant) + "(" + fresh_args.join(
 			", ",
 		) + ");\n" + "  if (__old) blorp_release(__old);\n" + "  return __fresh;\n}\n\n"
 
@@ -26672,7 +26845,7 @@ private pure func emit_union_decl(
 		)
 		tags_c = append_emitted_c(
 			tags_c,
-			"#define " + variant.tag_c_name + " " + variant.tag.to_string() + "\n",
+			"#define " + union_variant_tag_symbol(authority, variant) + " " + variant.tag.to_string() + "\n",
 		)
 		constructor_pieces = constructor_pieces.append({
 			is_owner_data = variant.fields.length() == 0,
@@ -26683,6 +26856,7 @@ private pure func emit_union_decl(
 				type_plan,
 				naming,
 				selected_type_symbol_lookup(authority),
+				authority,
 			),
 		})
 		reuse_constructors_c = append_emitted_c(
@@ -26694,6 +26868,7 @@ private pure func emit_union_decl(
 				type_plan,
 				naming,
 				selected_type_symbol_lookup(authority),
+				authority,
 			),
 		)
 
@@ -26701,7 +26876,7 @@ private pure func emit_union_decl(
 
 	{
 		type_header = header,
-		functions = [emit_union_destructor(union_decl, type_plan, naming, internal_type_linkage)],
+		functions = [emit_union_destructor(union_decl, type_plan, naming, internal_type_linkage, authority)],
 		constructor_pieces = constructor_pieces,
 		inline_support = reuse_constructors_c
 	}
@@ -26876,6 +27051,7 @@ private pure func emit_global_decls(
 	internal_type_linkage: Bool,
 	type_symbol_lookup: Dict[String, String],
 	record_members: CRecordLayoutRegistry,
+	authority: CEmissionSymbolAuthority,
 ) -> String:
 	var c_code: String = make_string(0)
 
@@ -26884,7 +27060,7 @@ private pure func emit_global_decls(
 			GlobalDecl(global):
 				c_code = append_emitted_c(
 					c_code,
-					emit_global_decl(global, internal_type_linkage, type_symbol_lookup, record_members),
+					emit_global_decl(global, internal_type_linkage, type_symbol_lookup, record_members, authority),
 				)
 			EnumDecl(enum_decl):
 				void
@@ -27753,6 +27929,7 @@ private pure func emit_decls(
 			internal_type_linkage,
 			selected_type_symbol_lookup(symbol_authority),
 			record_members,
+			symbol_authority,
 		),
 		global_init = global_init,
 		profile_metadata = emit_profile_metadata(profile_plan, internal_type_linkage),
@@ -27967,8 +28144,9 @@ private pure func union_constructor_signature(
 	variant_index: Int,
 	type_plan: CleanupTypePlan,
 	type_symbol_lookup: Dict[String, String],
+	authority: CEmissionSymbolAuthority,
 ) -> String:
-	type_symbol_lookup.get(union_decl.name).get_or(union_decl.name) + "* " + variant.c_name + "(" + union_constructor_param_list(
+	type_symbol_lookup.get(union_decl.name).get_or(union_decl.name) + "* " + union_variant_constructor_symbol(authority, variant) + "(" + union_constructor_param_list(
 		union_decl,
 		variant,
 		variant_index,
@@ -28057,21 +28235,23 @@ private pure func emit_union_owner_data_split(
 	union_decl: CoreUnionDecl,
 	variant: CoreUnionVariant,
 	type_symbol_lookup: Dict[String, String],
+	authority: CEmissionSymbolAuthority,
 ) -> CUnionOwnerDataSplitEmission:
-	instance_name: String = union_instance_name(variant.c_name)
-	init_name: String = union_init_name(variant.c_name)
+	instance_name: String = union_instance_name(union_variant_constructor_symbol(authority, variant))
+	init_name: String = union_init_name(union_variant_constructor_symbol(authority, variant))
 	union_c_type: String = type_symbol_lookup.get(union_decl.name).get_or(union_decl.name)
 
 	{
 		header_extern = "extern " + union_c_type + " " + instance_name + ";\n",
-		header_define = "#define " + variant.c_name + " ((" + union_c_type + "*)&" + instance_name + ")\n\n",
-		tu0_definition = union_c_type + " " + instance_name + ";\n" + "__attribute__((constructor)) static void " + init_name + "(void) {\n" + "  atomic_store_explicit(&" + instance_name + ".header.refcount, BLORP_IMMORTAL_REFCOUNT, memory_order_relaxed);\n" + "  " + instance_name + ".tag = " + variant.tag_c_name + ";\n" + "}\n"
+		header_define = "#define " + union_variant_constructor_symbol(authority, variant) + " ((" + union_c_type + "*)&" + instance_name + ")\n\n",
+		tu0_definition = union_c_type + " " + instance_name + ";\n" + "__attribute__((constructor)) static void " + init_name + "(void) {\n" + "  atomic_store_explicit(&" + instance_name + ".header.refcount, BLORP_IMMORTAL_REFCOUNT, memory_order_relaxed);\n" + "  " + instance_name + ".tag = " + union_variant_tag_symbol(authority, variant) + ";\n" + "}\n"
 	}
 
 
 private pure func collect_union_owner_data_split_emissions(
 	decls: List[CoreDecl],
 	type_symbol_lookup: Dict[String, String],
+	authority: CEmissionSymbolAuthority,
 ) -> List[CUnionOwnerDataSplitEmission]:
 	var result: List[CUnionOwnerDataSplitEmission] = []
 
@@ -28080,7 +28260,7 @@ private pure func collect_union_owner_data_split_emissions(
 			UnionDecl(union_decl):
 				for variant in union_decl.variants:
 					if variant.fields.length() == 0:
-						result = result.append(emit_union_owner_data_split(union_decl, variant, type_symbol_lookup))
+						result = result.append(emit_union_owner_data_split(union_decl, variant, type_symbol_lookup, authority))
 			HeapRecordDecl(record_decl):
 				void
 			ValueRecordDecl(record_decl):
@@ -28156,6 +28336,7 @@ private pure func type_support_function_prototypes(
 								variant_index,
 								type_plan,
 								selected_type_symbol_lookup(authority),
+								authority,
 							) + ";\n",
 						)
 			EnumDecl(enum_decl):
@@ -28410,6 +28591,7 @@ private pure func render_split_translation_units(
 	owner_data_emissions: List[CUnionOwnerDataSplitEmission] = collect_union_owner_data_split_emissions(
 		decls,
 		selected_type_symbol_lookup(authority),
+		authority,
 	)
 
 	var header_owner_data: String = make_string(0)

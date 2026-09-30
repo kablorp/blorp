@@ -617,6 +617,16 @@ private ENUM_CONSTRUCTOR_TEST_TAG: String = "enum"
 
 private UNION_TAG_CONSTRUCTOR_TEST_TAG: String = "union_tag"
 
+private VARIANT_BY_ID_TAG: String = "by_id"
+
+private BUILTIN_OPTION_SOME_TAG: String = "builtin_option_some"
+
+private BUILTIN_OPTION_NONE_TAG: String = "builtin_option_none"
+
+private BUILTIN_RESULT_OK_TAG: String = "builtin_result_ok"
+
+private BUILTIN_RESULT_ERR_TAG: String = "builtin_result_err"
+
 private NULLABLE_OPTION_SOME_CONSTRUCTOR_TEST_TAG: String = "nullable_option_some"
 
 private NULLABLE_OPTION_NONE_CONSTRUCTOR_TEST_TAG: String = "nullable_option_none"
@@ -1445,7 +1455,7 @@ union CoreRuntimeUnionArg:
 record CoreRuntimeUnionCase {
 	runtime_tag: String,
 	constructor_name: String,
-	constructor_c_name: String,
+	constructor_def_id: Int,
 	args: List[CoreRuntimeUnionArg]
 }
 
@@ -1466,7 +1476,7 @@ record CoreOperationSuccessPayload {
 record CoreOperationErrorCase {
 	runtime_tag: String,
 	constructor_name: String,
-	constructor_c_name: String
+	constructor_def_id: Int
 }
 
 
@@ -1474,7 +1484,7 @@ record CoreOperationErrorMapping {
 	none_tag: String,
 	detail_field: String,
 	other_constructor: String,
-	other_constructor_c_name: String,
+	other_constructor_def_id: Int,
 	cases: List[CoreOperationErrorCase]
 }
 
@@ -1527,7 +1537,7 @@ union CoreFallibleStreamTerminalPayload:
 record CoreFallibleStreamErrorDomain {
 	domain_tag: String,
 	other_constructor: String,
-	other_constructor_c_name: String,
+	other_constructor_def_id: Int,
 	cases: List[CoreOperationErrorCase]
 }
 
@@ -2651,15 +2661,15 @@ enum CoreUnionPayloadStorage:
 
 
 ---
-`tag_c_name` is the C macro for the variant's tag. Only the static generic
-union initializer reads it (a static value spells its `.tag` directly);
-constructors and match tests take theirs from the declaration.
+`variant` names the constructed variant: a declared one by its definition id
+(emission reads its constructor, tag and reuse helper from the plan's
+per-variant table), or one of the four builtin Option and Result variants,
+whose constructor and tag are never spelled.
 ---
 record CoreUnionConstruct {
 	type_name: String,
 	constructor_name: String,
-	constructor_c_name: String,
-	tag_c_name: String,
+	variant: CoreVariantRef,
 	representation: CoreUnionRepresentation,
 	payload_storage: CoreUnionPayloadStorage,
 	uses_release_mask: Bool,
@@ -2672,8 +2682,7 @@ record CoreUnionReuseConstruct {
 	source: CoreExpr,
 	type_name: String,
 	constructor_name: String,
-	constructor_c_name: String,
-	reuse_constructor_c_name: String,
+	variant: CoreVariantRef,
 	representation: CoreUnionRepresentation,
 	payload_storage: CoreUnionPayloadStorage,
 	uses_release_mask: Bool,
@@ -2727,9 +2736,23 @@ union CoreLiteralMatchFallback:
 	LiteralMatchFallbackFail
 
 
+---
+Identifies a variant for symbol spelling. A declared variant is named by its
+definition id alone. The four builtin variants of `Option` and `Result` have no
+declaration and no id; the stack, nullable and boxed-Result constructs that
+name them never spell a constructor or tag.
+---
+union CoreVariantRef:
+	VariantById(Int)
+	BuiltinOptionSome
+	BuiltinOptionNone
+	BuiltinResultOk
+	BuiltinResultErr
+
+
 union CoreConstructorMatchTest:
-	EnumConstructorTest(String)
-	UnionTagConstructorTest(String, String)
+	EnumConstructorTest(CoreVariantRef)
+	UnionTagConstructorTest(CoreVariantRef, String)
 	NullableOptionSomeConstructorTest
 	NullableOptionNoneConstructorTest
 	StackOptionSomeConstructorTest(String)
@@ -3304,7 +3327,6 @@ record CoreGlobal {
 
 record CoreEnumVariant {
 	name: String,
-	c_name: String,
 	tag: Int,
 	def_id: Option[Int]
 }
@@ -3321,8 +3343,6 @@ record CoreEnumDecl {
 
 record CoreUnionVariant {
 	name: String,
-	c_name: String,
-	tag_c_name: String,
 	tag: Int,
 	fields: List[CoreUnionField],
 	def_id: Option[Int]
@@ -4764,7 +4784,7 @@ private pure func runtime_union_case_to_json(case: CoreRuntimeUnionCase) -> Json
 	JsonObject([
 		("runtime_tag", JsonString(case.runtime_tag)),
 		("constructor_name", JsonString(case.constructor_name)),
-		("constructor_c_name", JsonString(case.constructor_c_name)),
+		("constructor_def_id", json_int(case.constructor_def_id)),
 		("args", JsonVector(case.args.map(runtime_union_arg_to_json))),
 	])
 
@@ -4775,13 +4795,13 @@ private pure func decode_runtime_union_case_json(
 ) -> Result[CoreRuntimeUnionCase, CoreJsonError]:
 	runtime_tag ?= string_field(value, path, "runtime_tag")
 	constructor_name ?= string_field(value, path, "constructor_name")
-	constructor_c_name ?= string_field(value, path, "constructor_c_name")
+	constructor_def_id ?= int_field(value, path, "constructor_def_id")
 	args ?= decode_runtime_union_args(value, path, "args")
 
 	Ok({
 		runtime_tag = runtime_tag,
 		constructor_name = constructor_name,
-		constructor_c_name = constructor_c_name,
+		constructor_def_id = constructor_def_id,
 		args = args,
 	})
 
@@ -4896,7 +4916,7 @@ private pure func operation_error_case_to_json(case: CoreOperationErrorCase) -> 
 	JsonObject([
 		("runtime_tag", JsonString(case.runtime_tag)),
 		("constructor_name", JsonString(case.constructor_name)),
-		("constructor_c_name", JsonString(case.constructor_c_name)),
+		("constructor_def_id", json_int(case.constructor_def_id)),
 	])
 
 
@@ -4910,12 +4930,12 @@ private pure func decode_operation_error_case_json(
 ) -> Result[CoreOperationErrorCase, CoreJsonError]:
 	runtime_tag ?= string_field(value, path, "runtime_tag")
 	constructor_name ?= string_field(value, path, "constructor_name")
-	constructor_c_name ?= string_field(value, path, "constructor_c_name")
+	constructor_def_id ?= int_field(value, path, "constructor_def_id")
 
 	Ok({
 		runtime_tag = runtime_tag,
 		constructor_name = constructor_name,
-		constructor_c_name = constructor_c_name,
+		constructor_def_id = constructor_def_id,
 	})
 
 
@@ -4960,7 +4980,7 @@ private pure func operation_error_mapping_to_json(error: CoreOperationErrorMappi
 		("none_tag", JsonString(error.none_tag)),
 		("detail_field", JsonString(error.detail_field)),
 		("other_constructor", JsonString(error.other_constructor)),
-		("other_constructor_c_name", JsonString(error.other_constructor_c_name)),
+		("other_constructor_def_id", json_int(error.other_constructor_def_id)),
 		("cases", operation_error_cases_to_json(error.cases)),
 	])
 
@@ -4972,14 +4992,14 @@ private pure func decode_operation_error_mapping_json(
 	none_tag ?= string_field(value, path, "none_tag")
 	detail_field ?= string_field(value, path, "detail_field")
 	other_constructor ?= string_field(value, path, "other_constructor")
-	other_constructor_c_name ?= string_field(value, path, "other_constructor_c_name")
+	other_constructor_def_id ?= int_field(value, path, "other_constructor_def_id")
 	cases ?= decode_operation_error_cases(value, path, "cases")
 
 	Ok({
 		none_tag = none_tag,
 		detail_field = detail_field,
 		other_constructor = other_constructor,
-		other_constructor_c_name = other_constructor_c_name,
+		other_constructor_def_id = other_constructor_def_id,
 		cases = cases,
 	})
 
@@ -5110,7 +5130,7 @@ private pure func fallible_stream_error_domain_to_json(
 	JsonObject([
 		("domain_tag", JsonString(error_domain.domain_tag)),
 		("other_constructor", JsonString(error_domain.other_constructor)),
-		("other_constructor_c_name", JsonString(error_domain.other_constructor_c_name)),
+		("other_constructor_def_id", json_int(error_domain.other_constructor_def_id)),
 		("cases", operation_error_cases_to_json(error_domain.cases)),
 	])
 
@@ -5121,13 +5141,13 @@ private pure func decode_fallible_stream_error_domain_json(
 ) -> Result[CoreFallibleStreamErrorDomain, CoreJsonError]:
 	domain_tag ?= string_field(value, path, "domain_tag")
 	other_constructor ?= string_field(value, path, "other_constructor")
-	other_constructor_c_name ?= string_field(value, path, "other_constructor_c_name")
+	other_constructor_def_id ?= int_field(value, path, "other_constructor_def_id")
 	cases ?= decode_operation_error_cases(value, path, "cases")
 
 	Ok({
 		domain_tag = domain_tag,
 		other_constructor = other_constructor,
-		other_constructor_c_name = other_constructor_c_name,
+		other_constructor_def_id = other_constructor_def_id,
 		cases = cases,
 	})
 
@@ -7297,8 +7317,7 @@ pure func core_union_construct_to_json(construct: CoreUnionConstruct) -> JsonVal
 	JsonObject([
 		("type_name", JsonString(construct.type_name)),
 		("constructor_name", JsonString(construct.constructor_name)),
-		("constructor_c_name", JsonString(construct.constructor_c_name)),
-		("tag_c_name", JsonString(construct.tag_c_name)),
+		("variant", core_variant_ref_to_json(construct.variant)),
 		("representation", core_union_representation_to_json(construct.representation)),
 		("payload_storage", core_union_payload_storage_to_json(construct.payload_storage)),
 		("uses_release_mask", JsonBool(construct.uses_release_mask)),
@@ -7313,8 +7332,7 @@ pure func decode_core_union_construct_json(
 ) -> Result[CoreUnionConstruct, CoreJsonError]:
 	type_name ?= string_field(value, path, "type_name")
 	constructor_name ?= string_field(value, path, "constructor_name")
-	constructor_c_name ?= string_field(value, path, "constructor_c_name")
-	tag_c_name ?= string_field(value, path, "tag_c_name")
+	variant ?= decode_core_variant_ref_field(value, path)
 	representation_json ?= object_field(value, path, "representation")
 	representation ?= decode_core_union_representation_json(
 		representation_json,
@@ -7332,8 +7350,7 @@ pure func decode_core_union_construct_json(
 	Ok({
 		type_name = type_name,
 		constructor_name = constructor_name,
-		constructor_c_name = constructor_c_name,
-		tag_c_name = tag_c_name,
+		variant = variant,
 		representation = representation,
 		payload_storage = payload_storage,
 		uses_release_mask = uses_release_mask,
@@ -7347,8 +7364,7 @@ pure func core_union_reuse_construct_to_json(construct: CoreUnionReuseConstruct)
 		("source", core_expr_to_json(construct.source)),
 		("type_name", JsonString(construct.type_name)),
 		("constructor_name", JsonString(construct.constructor_name)),
-		("constructor_c_name", JsonString(construct.constructor_c_name)),
-		("reuse_constructor_c_name", JsonString(construct.reuse_constructor_c_name)),
+		("variant", core_variant_ref_to_json(construct.variant)),
 		("representation", core_union_representation_to_json(construct.representation)),
 		("payload_storage", core_union_payload_storage_to_json(construct.payload_storage)),
 		("uses_release_mask", JsonBool(construct.uses_release_mask)),
@@ -7368,8 +7384,7 @@ pure func decode_core_union_reuse_construct_json(
 	)
 	type_name ?= string_field(value, path, "type_name")
 	constructor_name ?= string_field(value, path, "constructor_name")
-	constructor_c_name ?= string_field(value, path, "constructor_c_name")
-	reuse_constructor_c_name ?= string_field(value, path, "reuse_constructor_c_name")
+	variant ?= decode_core_variant_ref_field(value, path)
 	representation_json ?= object_field(value, path, "representation")
 	representation ?= decode_core_union_representation_json(
 		representation_json,
@@ -7388,8 +7403,7 @@ pure func decode_core_union_reuse_construct_json(
 		source = source,
 		type_name = type_name,
 		constructor_name = constructor_name,
-		constructor_c_name = constructor_c_name,
-		reuse_constructor_c_name = reuse_constructor_c_name,
+		variant = variant,
 		representation = representation,
 		payload_storage = payload_storage,
 		uses_release_mask = uses_release_mask,
@@ -9060,17 +9074,63 @@ pure func decode_core_literal_match_fallback_json(
 		Err(CoreUnsupportedTag(path, tag))
 
 
+private pure func core_variant_ref_to_json(variant: CoreVariantRef) -> JsonValue:
+	match variant:
+		VariantById(def_id):
+			JsonObject([
+				(KIND_FIELD, JsonString(VARIANT_BY_ID_TAG)),
+				("def_id", json_int(def_id)),
+			])
+		BuiltinOptionSome:
+			JsonObject([(KIND_FIELD, JsonString(BUILTIN_OPTION_SOME_TAG))])
+		BuiltinOptionNone:
+			JsonObject([(KIND_FIELD, JsonString(BUILTIN_OPTION_NONE_TAG))])
+		BuiltinResultOk:
+			JsonObject([(KIND_FIELD, JsonString(BUILTIN_RESULT_OK_TAG))])
+		BuiltinResultErr:
+			JsonObject([(KIND_FIELD, JsonString(BUILTIN_RESULT_ERR_TAG))])
+
+
+pure func decode_core_variant_ref_json(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreVariantRef, CoreJsonError]:
+	tag ?= kind_field(value, path)
+
+	if tag == VARIANT_BY_ID_TAG:
+		def_id ?= int_field(value, path, "def_id")
+		Ok(VariantById(def_id))
+	else if tag == BUILTIN_OPTION_SOME_TAG:
+		Ok(BuiltinOptionSome)
+	else if tag == BUILTIN_OPTION_NONE_TAG:
+		Ok(BuiltinOptionNone)
+	else if tag == BUILTIN_RESULT_OK_TAG:
+		Ok(BuiltinResultOk)
+	else if tag == BUILTIN_RESULT_ERR_TAG:
+		Ok(BuiltinResultErr)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
+private pure func decode_core_variant_ref_field(
+	value: JsonValue,
+	path: String,
+) -> Result[CoreVariantRef, CoreJsonError]:
+	variant_json ?= object_field(value, path, "variant")
+	decode_core_variant_ref_json(variant_json, path_field(path, "variant"))
+
+
 pure func core_constructor_match_test_to_json(test: CoreConstructorMatchTest) -> JsonValue:
 	match test:
-		EnumConstructorTest(c_name):
+		EnumConstructorTest(variant):
 			JsonObject([
 				(KIND_FIELD, JsonString(ENUM_CONSTRUCTOR_TEST_TAG)),
-				("c_name", JsonString(c_name)),
+				("variant", core_variant_ref_to_json(variant)),
 			])
-		UnionTagConstructorTest(tag_c_name, union_c_type):
+		UnionTagConstructorTest(variant, union_c_type):
 			JsonObject([
 				(KIND_FIELD, JsonString(UNION_TAG_CONSTRUCTOR_TEST_TAG)),
-				("tag_c_name", JsonString(tag_c_name)),
+				("variant", core_variant_ref_to_json(variant)),
 				("union_c_type", JsonString(union_c_type)),
 			])
 		NullableOptionSomeConstructorTest:
@@ -9114,12 +9174,12 @@ pure func decode_core_constructor_match_test_json(
 	tag ?= kind_field(value, path)
 
 	if tag == ENUM_CONSTRUCTOR_TEST_TAG:
-		c_name ?= string_field(value, path, "c_name")
-		Ok(EnumConstructorTest(c_name))
+		variant ?= decode_core_variant_ref_field(value, path)
+		Ok(EnumConstructorTest(variant))
 	else if tag == UNION_TAG_CONSTRUCTOR_TEST_TAG:
-		tag_c_name ?= string_field(value, path, "tag_c_name")
+		variant ?= decode_core_variant_ref_field(value, path)
 		union_c_type ?= string_field(value, path, "union_c_type")
-		Ok(UnionTagConstructorTest(tag_c_name, union_c_type))
+		Ok(UnionTagConstructorTest(variant, union_c_type))
 	else if tag == NULLABLE_OPTION_SOME_CONSTRUCTOR_TEST_TAG:
 		Ok(NullableOptionSomeConstructorTest)
 	else if tag == NULLABLE_OPTION_NONE_CONSTRUCTOR_TEST_TAG:
@@ -15651,7 +15711,6 @@ pure func decode_core_global_json(
 pure func core_enum_variant_to_json(variant: CoreEnumVariant) -> JsonValue:
 	JsonObject([
 		("name", JsonString(variant.name)),
-		("c_name", JsonString(variant.c_name)),
 		("tag", json_int(variant.tag)),
 		("def_id", option_int_to_json(variant.def_id)),
 	])
@@ -15662,13 +15721,11 @@ pure func decode_core_enum_variant_json(
 	path: String,
 ) -> Result[CoreEnumVariant, CoreJsonError]:
 	name ?= string_field(value, path, "name")
-	c_name ?= string_field(value, path, "c_name")
 	tag ?= int_field(value, path, "tag")
 	def_id ?= decode_optional_int(value, path, "def_id")
 
 	Ok({
 		name = name,
-		c_name = c_name,
 		tag = tag,
 		def_id = def_id,
 	})
@@ -15811,8 +15868,6 @@ private pure func decode_core_union_variant_fields(
 pure func core_union_variant_to_json(variant: CoreUnionVariant) -> JsonValue:
 	JsonObject([
 		("name", JsonString(variant.name)),
-		("c_name", JsonString(variant.c_name)),
-		("tag_c_name", JsonString(variant.tag_c_name)),
 		("tag", json_int(variant.tag)),
 		("fields", JsonVector(variant.fields.map(core_union_field_to_json))),
 		("def_id", option_int_to_json(variant.def_id)),
@@ -15824,16 +15879,12 @@ pure func decode_core_union_variant_json(
 	path: String,
 ) -> Result[CoreUnionVariant, CoreJsonError]:
 	name ?= string_field(value, path, "name")
-	c_name ?= string_field(value, path, "c_name")
-	tag_c_name ?= string_field(value, path, "tag_c_name")
 	tag ?= int_field(value, path, "tag")
 	fields ?= decode_core_union_variant_fields(value, path, "fields")
 	def_id ?= decode_optional_int(value, path, "def_id")
 
 	Ok({
 		name = name,
-		c_name = c_name,
-		tag_c_name = tag_c_name,
 		tag = tag,
 		fields = fields,
 		def_id = def_id,
