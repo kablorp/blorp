@@ -19139,6 +19139,163 @@ pure func test_consumed_parameter_alias_move_requires_arc_policies() -> Bool:
 		and drop_count_for("box", stack_result_kept) == 1
 	)
 
+
+---
+`forward_box__consume_arg0(box, skip)` binds its owned parameter to a `var`
+whose first update runs only when `skip` holds, then updates it again
+unconditionally and returns it:
+
+    var out = box
+    if skip: out = consume_box(out)
+    out = consume_box(out)
+    out
+
+The branch keeps `out` a mutable slot, so SSA renaming leaves it alone.
+---
+pure func conditionally_updated_parameter_alias_program() -> CoreProgram:
+	box_type: CoreType = HeapRecordType("Box")
+	consume_out: CoreExpr = user_call_expr(
+		"consume_box",
+		Some(90),
+		[],
+		[var_expr("out", box_type)],
+		box_type,
+	)
+	conditional_update: CoreExpr = IfExpr(
+		var_expr("skip", bool_type()),
+		AssignExpr(named_var("out"), consume_out, VoidType, synthetic_core_source_loc()),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	unconditional_update: CoreExpr = AssignExpr(
+		named_var("out"),
+		consume_out,
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+
+	{
+		decls = [
+			HeapRecordDecl({
+				abi_type = None,
+				name = "Box",
+				type_params = [],
+				fields = [],
+				loc = synthetic_core_source_loc(),
+			}),
+			as_consuming_clone(
+				function_decl(
+					"consume_box",
+					90,
+					[core_param("box", box_type)],
+					box_type,
+					var_expr("box", box_type),
+				),
+			),
+			as_consuming_clone(
+				function_decl(
+					"forward_box__consume_arg0",
+					91,
+					[core_param("box", box_type), core_param("skip", bool_type())],
+					box_type,
+					LetExpr(
+						named_var("out"),
+						True,
+						box_type,
+						var_expr("box", box_type),
+						SeqExpr(
+							conditional_update,
+							SeqExpr(unconditional_update, var_expr("out", box_type)),
+						),
+					),
+				),
+			),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+---
+A `var` alias is a move like an immutable one: the slot takes the parameter's
+reference, so its first update, conditional or not, sees the record uniquely
+owned.
+---
+pure func test_consumed_parameter_mutable_alias_moves_into_slot() -> Bool:
+	rewritten: CoreProgram = insert_drops_program(conditionally_updated_parameter_alias_program())
+
+	match function_body(rewritten, "forward_box__consume_arg0"):
+		Some(body):
+			(
+				dup_count_for("box", body) == 0
+				and drop_count_for("box", body) == 0
+				and binds_mutable_var("out", body)
+			)
+		None:
+			False
+
+
+---
+Whether a `var` binding named `name` is on the spine of `expr`, through
+bindings, sequences, retains and releases.
+---
+pure func binds_mutable_var(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, _, rhs, body):
+			(
+				(variable.name == name and is_mutable)
+				or binds_mutable_var(name, rhs)
+				or binds_mutable_var(name, body)
+			)
+		SeqExpr(first, second):
+			binds_mutable_var(name, first) or binds_mutable_var(name, second)
+		DupExpr(_, _, _, body, _, _):
+			binds_mutable_var(name, body)
+		DropExpr(_, _, _, body, _, _):
+			binds_mutable_var(name, body)
+		_:
+			False
+
+
+---
+A `var` alias of a parameter that is still read after the alias keeps its
+retain, exactly like an immutable one:
+
+    var out = DUP box; box
+    box
+    DROP box; out
+---
+pure func test_consumed_parameter_mutable_alias_read_after_keeps_retain() -> Bool:
+	box_type: CoreType = HeapRecordType("Box")
+	body: CoreExpr = LetExpr(
+		named_var("out"),
+		True,
+		box_type,
+		DupExpr(
+			named_var("box"),
+			box_type,
+			ArcRetainPolicy,
+			var_expr("box", box_type),
+			box_type,
+			synthetic_core_source_loc(),
+		),
+		SeqExpr(
+			var_expr("box", box_type),
+			DropExpr(
+				named_var("box"),
+				box_type,
+				ArcReleasePolicy,
+				var_expr("out", box_type),
+				box_type,
+				synthetic_core_source_loc(),
+			),
+		),
+	)
+	kept: CoreExpr = move_consumed_parameter_alias(named_var("box"), body)
+
+	dup_count_for("box", kept) == 1 and drop_count_for("box", kept) == 1
+
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
@@ -20648,8 +20805,16 @@ tests: TestSuite = {
 			test_consumed_parameter_alias_read_after_keeps_retain,
 		),
 		(
+			"consumed parameter mutable alias read after keeps retain",
+			test_consumed_parameter_mutable_alias_read_after_keeps_retain,
+		),
+		(
 			"consumed parameter alias move requires ARC policies",
 			test_consumed_parameter_alias_move_requires_arc_policies,
+		),
+		(
+			"consumed parameter mutable alias moves into slot",
+			test_consumed_parameter_mutable_alias_moves_into_slot,
 		),
 	]
 }

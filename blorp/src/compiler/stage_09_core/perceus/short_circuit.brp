@@ -4,7 +4,7 @@
 -- per-parameter drop (simple_consumed_parameter_catalog/prove_simple_
 -- consumed_parameter_balance walk the whole body once to prove it safe);
 -- move_consumed_parameter_alias then turns the retain/release pair of a
--- consumed parameter's only alias into a move;
+-- consumed parameter's only alias (immutable or `var`) into a move;
 -- balance_short_circuit_operands protects a short-circuited `and`/`or`
 -- operand's reads so a value the left operand consumed cannot be read again
 -- if the right operand is skipped.
@@ -186,10 +186,6 @@ private record ConsumedParameterAliasCensus {
 }
 
 
----
-Whether `expr` is `DUP p; p`, the retained right-hand side Perceus gives
-`let x = p`.
----
 private pure func is_arc_retain(policy: CoreRetainPolicy) -> Bool:
 	match policy:
 		ArcRetainPolicy:
@@ -207,9 +203,11 @@ private pure func is_arc_release(policy: CoreReleasePolicy) -> Bool:
 
 
 ---
-Only a plain reference-count retain paired with a plain reference-count
-release is a move of one reference; any other policy (a stack-result copy, a
-copy-on-write field take) does more than that and is left alone.
+Whether `expr` is `DUP p; p`, the retained right-hand side Perceus gives
+`let x = p` or `var x = p`. Only a plain reference-count retain paired with a
+plain reference-count release is a move of one reference; any other policy (a
+stack-result copy, a copy-on-write field take) does more than that and is
+left alone.
 ---
 private pure func is_parameter_alias_retain(parameter: CoreVar, expr: CoreExpr) -> Bool:
 	match expr:
@@ -318,8 +316,8 @@ private pure func count_spine_alias_and_drop(
 		match pending.get(index):
 			Some(current):
 				match current:
-					LetExpr(variable, is_mutable, _, rhs, let_body):
-						if not is_mutable and is_parameter_alias_retain(parameter, rhs):
+					LetExpr(_, _, _, rhs, let_body):
+						if is_parameter_alias_retain(parameter, rhs):
 							alias_on_spine += 1
 						else:
 							pending = pending.append(rhs)
@@ -358,11 +356,11 @@ private pure func remove_parameter_alias_retain_and_drop(
 	expr: CoreExpr,
 ) -> CoreExpr:
 	stripped: CoreExpr = match expr:
-		LetExpr(variable, False, typ, rhs, body):
+		LetExpr(variable, is_mutable, typ, rhs, body):
 			if is_parameter_alias_retain(parameter, rhs):
 				match rhs:
 					DupExpr(_, _, _, alias_reference, _, _):
-						LetExpr(variable, False, typ, alias_reference, body)
+						LetExpr(variable, is_mutable, typ, alias_reference, body)
 					_:
 						expr
 			else:
@@ -392,7 +390,10 @@ and that release are the only occurrences of the consumed parameter `p`, and
 both run exactly once on every path, the retain/release pair only moves the
 reference into `x`. Removing both hands `x` the parameter's reference
 directly, so a callee that takes `x` sees it uniquely owned and can update
-it in place.
+it in place. A `var x = p` slot is the same move: the slot owns its current
+value and releases it when an assignment replaces it or the scope ends, so
+it may start from the parameter's reference even when its first update sits
+under a branch or loop that does not run.
 ---
 pure func move_consumed_parameter_alias(parameter: CoreVar, body: CoreExpr) -> CoreExpr:
 	census: ConsumedParameterAliasCensus = count_parameter_occurrences(parameter, body)

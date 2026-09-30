@@ -303,8 +303,9 @@ inside loops, lambdas, logical operators and other constructs the pass does
 not model. Perceus is the safety net: a retargeted argument that is still
 live gets a retain, so imprecision costs a copy, never correctness. Perceus
 turns the reference-count retain/release pair of a consumed parameter's only
-alias (`let x = p` with no other use of `p`) into a move, so the alias
-reaches the next clone uniquely owned.
+alias (`let x = p` or `var x = p`, with no other use of `p`) into a move, so
+the alias reaches the next clone uniquely owned even when its first update
+sits under a branch or loop.
 
 Only record parameters are candidates. Union parameters used to get clones
 for `x = f(x)` over a match source, which let `reuse` rebuild the union in the
