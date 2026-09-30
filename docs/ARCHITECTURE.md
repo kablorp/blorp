@@ -318,7 +318,9 @@ that take the runtime's boxed key slot and call a key type's Hashable and
 Equatable impls. Backend projection binds every trait-hashed Dict and Set
 constructor (and lowers trait-keyed Dict literals) to those adapters by
 definition id, DCE drops adapters no container uses, and Perceus sees the adapters'
-borrowed unboxing. Perceus ingress runs consume
+borrowed unboxing. Typecheck requires `K: Hashable` of every Dict and Set key,
+so there is no identity-hashing fallback: a trait-hashed key left without
+adapters is an internal error at C symbol projection. Perceus ingress runs consume
 specialization, lowers record updates to ownership-visible forms, and prepares
 dictionary literals so every transferred entry is explicit. These operations
 are not emitter cleanup and must not be reordered or omitted from ownership

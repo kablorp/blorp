@@ -992,16 +992,64 @@ Insertion-ordered key-value maps with copy-on-write semantics. Iteration
 preserves the order keys were inserted; removing a key preserves the
 relative order of remaining keys.
 
-Keys are compared by value. Strings, floats, integers up to 64 bits, `Bool`,
-`Char`, and enums hash directly. Other key types (for example `Option[Int]`,
-`Result[Int, String]`, or your own `struct` and `record` types) hash and
-compare through their `Hashable` and `Equatable` implementations. `Option` and
-`Result` implement `Hashable` when their payloads do. A key stored as a
-copied value (a `struct`, a 128-bit integer, or an `Option` or `Result` of
-scalars and structs) without those implementations is a compile error. Any
-other key without them (a `record`, `List`, or tuple) currently falls back
-to comparing object identity, so implement both traits for such keys. The same
-rules apply to `Set` elements.
+Keys are compared by value, so a key type must implement `Hashable` (which
+requires `Equatable`); the same holds for `Set` elements. The Dict and Set
+functions that build, look up or hash declare `K: Hashable`, and a Dict or Set
+literal checks its key type too, so a key type without an implementation is a
+compile error that names the type:
+
+```text
+error: `Point` cannot be a Dict key because it does not implement Hashable at app.brp:14:33
+    help: Dict keys and Set elements are compared by value, so `Point` must implement Equatable and Hashable over the same fields: ...
+```
+
+These types are `Hashable` already:
+
+- integers of every width, `Float`, `Float32`, `Float16`, `Bool`, `Char` and
+  `String`;
+- fieldless enums, compared and hashed by variant;
+- `StringSlice` (by contents, hashing like the equal `String`) and `Bytes`
+  (byte by byte);
+- tuples of two to four elements, `List[T]`, `Option[T]` and `Result[T, E]`
+  whose components are `Hashable`, element by element.
+
+`Dict` and `Set` are not `Hashable`; key by a sorted `List` of entries instead.
+For your own `struct`, `record` and `union` types, implement both traits over
+the same fields:
+
+```blorp
+record Point {
+    x: Int,
+    y: Int
+}
+
+implements Equatable for Point:
+    pure func equals(a: Point, b: Point) -> Bool:
+        a.x == b.x and a.y == b.y
+
+implements Hashable for Point:
+    pure func hash(self: Point) -> Int:
+        hash_combine(self.x.hash(), self.y.hash())
+```
+
+An `opaque type` needs its own implementations too. When its representation is
+an integer, float or `String`, Dict and Set compare its keys by that
+representation, so its `equals` must agree with equality of the representation.
+
+Generic code that builds or looks up a Dict or Set declares the bound itself:
+
+```blorp
+func count_all[K: Hashable](items: List[K]) -> Dict[K, Int]:
+    var counts: Dict[K, Int] = {}
+
+    for item in items:
+        counts = counts.set(item, counts.get_or(item, 0) + 1)
+
+    counts
+```
+
+Reading a Dict or Set without hashing (`keys`, `values`, `entries`, `length`,
+`is_empty`, `fold`, `to_list`) needs no bound.
 
 ```blorp
 import:
@@ -1039,7 +1087,8 @@ func dict_examples() -> Int:
 
 ### Sets
 
-Hash sets with COW semantics. Use qualified import:
+Hash sets with COW semantics. Elements must be `Hashable`, like Dict keys (see
+[Dictionaries](#dictionaries)). Use qualified import:
 
 ```blorp
 import:
@@ -2315,6 +2364,7 @@ type.
 | `Negatable` | `negate` | Unary negation (`-a`) |
 | `Numeric` | `add`, `multiply`, `zero` | Basic numeric reductions |
 | `Equatable` | `equals`, `not_equals` | Equality (`==`, `!=`) |
+| `Hashable` | Equatable + `hash` | Dict keys and Set elements |
 | `Orderable` | Equatable + `less_than`, `greater_than`, `less_than_or_equal`, `greater_than_or_equal` | Ordering |
 | `Stringable` | `to_string` | String conversion |
 | `ToBool` | `to_bool` | Boolean conversion |
@@ -2322,6 +2372,8 @@ type.
 | `Collection` | `length`, `is_empty` | Collection basics |
 
 Traits are implemented for: `Int`, `Float`, `String`, `Bool`, `Char`, `Option[T]`, `Result[T, E]`, `List[T]`.
+Fieldless enums implement `Equatable` and `Hashable` without an `implements`
+block, so they satisfy `T: Equatable` and `T: Hashable` bounds.
 
 ---
 

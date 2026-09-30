@@ -164,6 +164,7 @@ import:
 		TRAIT_ID_DIVISIBLE,
 		TRAIT_ID_EQUATABLE,
 		TRAIT_ID_FLOATING_POINT,
+		TRAIT_ID_HASHABLE,
 		TRAIT_ID_INTEGER,
 		TRAIT_ID_MODULABLE,
 		TRAIT_ID_MULTIPLIABLE,
@@ -283,7 +284,6 @@ import:
 		accepted_union_find_constructor_symbol,
 		accepted_union_find_constructor_symbol_for_parent,
 		accepted_union_find_module_constructor,
-		accepted_union_is_enum,
 		accepted_union_may_contain_function,
 		accepted_union_may_contain_one_shot_stream,
 		accepted_union_may_contain_resource_source,
@@ -482,6 +482,7 @@ import:
 		is_one_shot_stream_type_name,
 		is_resource_source_type_name,
 		is_stream_type_name,
+		type_name_has_componentwise_equality,
 	type_system/int_literal_range:
 		IntLiteralCheck(
 			IntLiteralInFloatPosition,
@@ -1319,22 +1320,12 @@ private pure func infer_find_impl_method_info_for_callee(
 			)
 
 
+--- Fieldless enums reach the environment even when the accepted union authority owns them (`env_type_is_fieldless_enum`).
 private pure func infer_type_has_compiler_structural_equality(
 	session: InferSession,
 	typ: SemanticType,
 ) -> Bool:
-	if env_has_compiler_structural_equality(session.env, typ):
-		True
-	else:
-		match typ:
-			SemanticNamedType(name, _):
-				match module_view_accepted_union_authority(session.facts.module_view):
-					Some(authority):
-						accepted_union_is_enum(authority, name) == Some(True)
-					None:
-						False
-			_:
-				False
+	env_has_compiler_structural_equality(session.env, typ)
 
 
 private pure func infer_has_compiler_structural_equality(
@@ -6247,7 +6238,17 @@ private pure func infer_error_at(
 	message: String,
 	span: SourceLocation,
 ) -> InferContext:
-	located_message = message + " at " + infer_source_location_label(context, span)
+	infer_error_at_with_help(context, message, span, "")
+
+
+--- `infer_error_at` with a `\n    help: ...` suffix after the location.
+private pure func infer_error_at_with_help(
+	context: InferContext,
+	message: String,
+	span: SourceLocation,
+	help: String,
+) -> InferContext:
+	located_message = message + " at " + infer_source_location_label(context, span) + help
 	diagnostic = typecheck_diagnostic(located_message, Some(span))
 	infer_context_with_state(
 		context,
@@ -8928,8 +8929,12 @@ private pure func complete_call_type_subst(
 	var next_context: InferContext = context
 	var next_subst: List[SemanticTypeSubstEntry] = subst
 
+	-- A bounded parameter gets a meta too: a zero-argument generic such as
+	-- `set[T: Hashable]()` learns its type from a later call (`set().add(1)`),
+	-- and a parameter left unsubstituted would reach Core as the callee's own
+	-- type variable. Its bound check on the unresolved meta is deferred.
 	for param in bound_params:
-		if param.bounds.length() == 0 and find_type_subst(next_subst, param.name).is_none():
+		if find_type_subst(next_subst, param.name).is_none():
 			match fresh_meta_with_origin(next_context.state.context, param.name):
 				Some(step):
 					next_state = { next_context.state | context = step.context }
@@ -9870,24 +9875,139 @@ private pure func callee_bound_type_params(
 			declared_callee_bound_type_params(context, callee)
 
 
+--- Only a definite failure counts: a key still partly inferred (`{None => 1}`) is checked where it is used.
+private pure func type_fails_hashable(context: InferContext, typ: SemanticType) -> Bool:
+	infer_resolve_trait_obligation(
+		context.state,
+		trait_obligation(typ, TRAIT_ID_HASHABLE),
+	) == TraitObligationUnsatisfied
+
+
+---
+The component types a standard-library Hashable impl hashes element-wise,
+when `typ` is one of those containers.
+---
+private pure func hashable_component_types(typ: SemanticType) -> List[SemanticType]:
+	match typ:
+		SemanticTupleType(items):
+			items
+		SemanticNamedType(name, args):
+			if type_name_has_componentwise_equality(name):
+				args
+			else:
+				[]
+		_:
+			[]
+
+
+---
+The innermost type that keeps `typ` from being Hashable: `typ` itself unless it
+is an element-wise container with a component that is the problem.
+---
+private pure func innermost_unhashable_type(context: InferContext, typ: SemanticType) -> SemanticType:
+	match hashable_component_types(typ).find(func(component): type_fails_hashable(context, component)):
+		Some(component):
+			innermost_unhashable_type(context, component)
+		None:
+			typ
+
+
+---
+How to make `typ` Hashable. Dict keys and Set elements are the reason a program
+needs Hashable, so the help says why and shows both impls; a Dict or Set key
+suggests a different key instead, since neither container is Hashable.
+---
+private pure func missing_hashable_help(context: InferContext, typ: SemanticType) -> String:
+	match typ:
+		SemanticTypeVar(name, _):
+			"\n    help: Dict keys and Set elements are compared by value, so add the bound where `" + name + "` is declared: `[" + name + ": Hashable]`"
+		_:
+			culprit: SemanticType = innermost_unhashable_type(context, typ)
+			culprit_text: String = type_to_string(culprit)
+
+			match culprit:
+				SemanticNamedType("Dict", _) | SemanticNamedType("Set", _):
+					"\n    help: `" + culprit_text + "` is not Hashable; use a sorted List of its entries as the key instead"
+				SemanticTypeVar(name, _):
+					"\n    help: add the bound where `" + name + "` is declared: `[" + name + ": Hashable]`"
+				_:
+					"\n    help: Dict keys and Set elements are compared by value, so `" + culprit_text + "` must implement Equatable and Hashable over the same fields: `implements Equatable for " + culprit_text + "` (define `equals`) and `implements Hashable for " + culprit_text + "` (define `hash`, for example `hash_combine(self.x.hash(), self.y.hash())`)"
+
+
+--- Which hash container a literal builds, for the key diagnostic's wording.
+enum HashContainerKind:
+	DictKeyContainer
+	SetElementContainer
+
+
+---
+Dict and Set literals do not go through a bounded standard-library function,
+so their key type is checked here. A key type still being inferred is checked
+where it is used.
+---
+private pure func check_hash_container_key(
+	context: InferContext,
+	container: HashContainerKind,
+	key_type: SemanticType,
+	span: SourceLocation,
+) -> InferContext:
+	-- An unsolved meta (say, a bounded parameter's) stays a meta and is skipped.
+	key: SemanticType = resolve_type_metas(context.state.context, key_type)
+	role: String = match container:
+		DictKeyContainer:
+			"a Dict key"
+		SetElementContainer:
+			"a Set element"
+
+	match key:
+		SemanticMetaType(_, _):
+			context
+		_:
+			if not type_fails_hashable(context, key):
+				context
+			else:
+				culprit: SemanticType = innermost_unhashable_type(context, key)
+				reason: String = match culprit:
+					SemanticTypeVar(name, _):
+						"type parameter `" + name + "` has no Hashable bound"
+					_:
+						if types_equal(culprit, key):
+							"it does not implement Hashable"
+						else:
+							"its element type `" + type_to_string(culprit) + "` does not implement Hashable"
+
+				infer_error_at_with_help(
+					context,
+					"`" + type_to_string(key) + "` cannot be " + role + " because " + reason,
+					span,
+					missing_hashable_help(context, key),
+				)
+
+
 private pure func call_trait_bound_error(
 	context: InferContext,
 	callee_name: String,
 	concrete_type: SemanticType,
 	trait_name: String,
+	trait_id: Option[TraitId],
 ) -> InferContext:
+	help: String = if trait_id.map(func(id): trait_ids_equal(id, TRAIT_ID_HASHABLE)).get_or(False):
+		missing_hashable_help(context, concrete_type)
+	else:
+		""
+
 	match concrete_type:
 		SemanticTypeVar(name, _):
 			infer_error(
 				context,
-				"Type parameter " + name + " does not have bound " + trait_name + " (required by " + callee_name + ")",
+				"Type parameter " + name + " does not have bound " + trait_name + " (required by " + callee_name + ")" + help,
 			)
 		_:
 			infer_error(
 				context,
 				"Type " + type_to_string(
 					concrete_type,
-				) + " does not implement trait " + trait_name + " (required by " + callee_name + ")",
+				) + " does not implement trait " + trait_name + " (required by " + callee_name + ")" + help,
 			)
 
 
@@ -9907,7 +10027,13 @@ private pure func check_call_trait_bounds_for_params(
 
 	for param in bound_params:
 		match find_type_subst(subst, param.name):
-			Some(concrete_type):
+			Some(substituted_type):
+				-- The substitution can hold a meta the arguments have since
+				-- solved (`set().add(point)` binds `T` to the receiver's meta,
+				-- then the argument solves it), so check the solved type. An
+				-- unsolved meta stays a meta, and its check is deferred.
+				concrete_type: SemanticType = resolve_type_metas(next.state.context, substituted_type)
+
 				match infer_find_unsatisfied_bound_type_param(next.state, param, concrete_type):
 					Some(obligation):
 						next = report_unsatisfied_obligation(
@@ -9944,7 +10070,7 @@ private pure func report_unsatisfied_obligation(
 		obligation.trait_id,
 	):
 		Some(trait_name):
-			call_trait_bound_error(context, callee_name, concrete_type, trait_name)
+			call_trait_bound_error(context, callee_name, concrete_type, trait_name, Some(obligation.trait_id))
 		None:
 			infer_error(
 				context,
@@ -10053,7 +10179,7 @@ private pure func check_trait_method_self_bound(
 							.map(func(table): trait_id_name(table, trait_id))
 							.get_or("<unknown trait>")
 
-						call_trait_bound_error(context, call.callee_name, self_type, trait_name)
+						call_trait_bound_error(context, call.callee_name, self_type, trait_name, Some(trait_id))
 					else:
 						context
 				ResolvedSelectedTraitMethodCall(trait_name, _) | ResolvedUnindexedSelectedTraitMethodCall(trait_name, _) | ResolvedUnresolvedTraitMethodCall(trait_name):
@@ -10090,6 +10216,7 @@ private pure func check_trait_method_self_bound(
 								call.callee_name,
 								self_type,
 								unsatisfied_name,
+								None,
 							)
 						None:
 							context
@@ -15188,11 +15315,12 @@ private pure func infer_dict_expr(
 ) -> InferResult:
 	match expected_dict_types(context):
 		Some((key_type, value_type)):
+			hashed_context = check_hash_container_key(context, DictKeyContainer, key_type, span)
 			initial_context = if entries.length() == 0:
-				key_context = check_resource_capability_storage(context, "Dict literals", key_type)
+				key_context = check_resource_capability_storage(hashed_context, "Dict literals", key_type)
 				check_resource_capability_storage(key_context, "Dict literals", value_type)
 			else:
-				context
+				hashed_context
 
 			entries_result = infer_dict_entries(
 				initial_context,
@@ -15240,7 +15368,7 @@ private pure func infer_dict_expr(
 							),
 						)
 						first_key_context = check_resource_capability_storage(
-							first_key_result.context,
+							check_hash_container_key(first_key_result.context, DictKeyContainer, key_type, span),
 							"Dict literals",
 							typed_expr_value_type(first_key),
 						)
@@ -15785,7 +15913,15 @@ private pure func infer_empty_record_collection_expr(
 		_:
 			"Dict literals"
 
-	result_context = check_resource_capability_storage(context, container, collection_type)
+	hashed_context = match collection_type:
+		SemanticNamedType("Set", [element_type]):
+			check_hash_container_key(context, SetElementContainer, element_type, span)
+		SemanticNamedType("Dict", [key_type, _]):
+			check_hash_container_key(context, DictKeyContainer, key_type, span)
+		_:
+			context
+
+	result_context = check_resource_capability_storage(hashed_context, container, collection_type)
 	typed = TypedDictExpr(
 		[],
 		span,
