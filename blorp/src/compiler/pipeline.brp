@@ -900,16 +900,29 @@ func typecheck_compiler_frontend_graph_with_context(
 	Ok({ result | analysis_context = Some(analysis_context) })
 
 
-private pure func typechecked_module_diagnostics(module: TypecheckedModule) -> List[String]:
-	module.parsed_program.diagnostics
-		.map(parse_diagnostic_to_string)
-		.concat(module.errors)
+---
+Parse diagnostics of every module in the graph, each already rendered in its
+final printable form (`path:line:column: error: message`). A graph with any of
+these is not typechecked: the typechecker needs well-formed declarations, and
+its follow-on errors about a half-parsed module are noise next to the parse
+error. Callers print these as-is; only unlocated messages get a CLI prefix.
+---
+pure func frontend_graph_parse_diagnostics(graph: FrontendGraph) -> List[String]:
+	frontend_graph_modules(graph).flat_map(
+		func(module): finalized_typecheck_program_ast(module.program).diagnostics.map(
+			parse_diagnostic_to_string,
+		),
+	)
 
 
-pure func typechecked_graph_diagnostics(graph: TypecheckedGraph) -> List[String]:
+---
+Unrendered typecheck messages of every module. Parse diagnostics are reported
+by `frontend_graph_parse_diagnostics` before typechecking, not here.
+---
+pure func typechecked_graph_typecheck_messages(graph: TypecheckedGraph) -> List[String]:
 	graph.modules
-		.flat_map(typechecked_module_diagnostics)
-		.concat(typechecked_module_diagnostics(graph.target))
+		.flat_map(func(module): module.errors)
+		.concat(graph.target.errors)
 
 
 func compile_frontend_graph(
@@ -993,6 +1006,37 @@ func run_typed_frontend_compilation(
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
 ) -> Result[TypedFrontendCompilation, List[String]]:
+	parse_diagnostics: List[String] = frontend_graph_parse_diagnostics(graph.graph)
+
+	if parse_diagnostics.is_empty():
+		typecheck_parsed_frontend_compilation(
+			graph,
+			policy,
+			validate,
+			render_typecheck_diagnostics,
+			require_main,
+			check_invariants,
+			early_observations,
+			early_stop,
+		)
+	else:
+		Err(graph.diagnostics.concat(parse_diagnostics))
+
+
+---
+The typecheck half of `run_typed_frontend_compilation`, entered only for graphs
+whose modules all parsed cleanly.
+---
+private func typecheck_parsed_frontend_compilation(
+	graph: FrontendCompilationGraph,
+	policy: FrontendCompilePolicy,
+	validate: pure (TypecheckedGraph) -> List[String],
+	render_typecheck_diagnostics: pure (List[String]) -> List[String],
+	require_main: Bool,
+	check_invariants: Bool,
+	early_observations: List[CoreEarlyPipelineStage],
+	early_stop: Option[CoreEarlyPipelineStage],
+) -> Result[TypedFrontendCompilation, List[String]]:
 	match frontend_graph_root_ids(graph.graph):
 		[root_id]:
 			module_target_ids = frontend_graph_module_ids(
@@ -1012,7 +1056,7 @@ func run_typed_frontend_compilation(
 					Err(["validated frontend graph lost its compilation root"])
 				Some(typechecked):
 					errors = graph.diagnostics.concat(
-						render_typecheck_diagnostics(typechecked_graph_diagnostics(typechecked)),
+						render_typecheck_diagnostics(typechecked_graph_typecheck_messages(typechecked)),
 					)
 
 					if errors.length() != 0:

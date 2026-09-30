@@ -128,7 +128,7 @@ class BlorpCheckFixtureRunnerTests(unittest.TestCase):
             compiler = root / "bin" / "blorp"
             compiler.parent.mkdir(parents=True, exist_ok=True)
             compiler.write_text(
-                "#!/bin/sh\nprintf '%s\\n' 'error: fails.brp:2:5: error: wanted'\nexit 1\n",
+                "#!/bin/sh\nprintf '%s\\n' 'fails.brp:2:5: error: wanted'\nexit 1\n",
                 encoding="utf-8",
             )
             compiler.chmod(0o755)

@@ -47,22 +47,12 @@ def parse_expectations(source: str) -> Expectations:
 SEVERITY_MARKERS = ((": error: ", "error: "), (": warning: ", "warning: "))
 
 
-def strip_source_label(diagnostic: str) -> str:
-    """Drop a `path:line:col:` label so that "error: path:1:2: error: message"
-    (the CLI's parser diagnostic shape) and "path:1:2: error: message" both
-    normalize to "error: message" for exact expectations."""
-    for marker, prefix in SEVERITY_MARKERS:
-        if marker in diagnostic:
-            return prefix + diagnostic.split(marker, 1)[1]
-    return diagnostic
-
-
 def normalized_diagnostics(output: str) -> list[str]:
     diagnostics: list[str] = []
     for line in output.splitlines():
         stripped = line.strip()
         if stripped.startswith(("error: ", "warning: ")):
-            diagnostics.append(strip_source_label(stripped))
+            diagnostics.append(stripped)
             continue
         for marker, prefix in SEVERITY_MARKERS:
             if marker in stripped:
