@@ -381,6 +381,14 @@ code-optimizer hypothesis and measured
 verification. One worker may carry several roles when qualified; do not spawn
 separate agents merely to reproduce a fixed chain. Run a quick `make` directly
 rather than spawning an agent for build status.
+
+Subagent definitions live in `.claude/agents/`. Use `compiler-expert` as the
+default implementer for compiler, runtime and code-generation work; the
+specialist roles above add their input to it rather than replacing it. Run
+subagents on Sonnet by default. Choose Opus only when a task is demanding
+enough to need it, such as a design that spans several phases or a subtle
+ownership or miscompilation investigation, and say why when you do.
+
 Every change still gets code-reviewer and test-runner review before commit.
 A worker should ask for guidance when a boundary or result is ambiguous, and
 a negative performance experiment is a valid result.
