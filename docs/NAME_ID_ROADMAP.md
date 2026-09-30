@@ -96,6 +96,45 @@ used only by tests (`register_trait_decl`, `register_impl_decl`,
 from the environment. Retiring it (about 75 test call sites) is a separate
 cleanup, not part of these slices.
 
+## A2c: Core-side and typecheck builtin vocabularies
+
+A2's first slice left five vocabularies as String `match` arms. Surveyed
+2026-09-29, each by the domain of its keys and by what identity its readers hold:
+
+| Vocabulary | Arms | Key domain | Readers hold |
+| --- | --- | --- | --- |
+| `builtin_special_inference` (`type_system/builtins.brp`) | 27 | source function names | `infer.brp:10232` a `ResolvedCallInfo.callee_name` String; `infer.brp:17322` a `ParsedIdentifier` (NameId at hand) |
+| `builtin_runtime_effect` (same file) | 127 | 48 runtime ABI names (`blorp_tcp_read_raw`) and 79 source names (`print`, `yield_now`) | `cancellation_plan.brp` reads the ABI name inside a builtin or intrinsic call kind |
+| `prelude_builtin_name` and the 14 module `*_builtin_name` tables (`stage_09_core/builtin_registry.brp`) | about 126 + module tables | source names; the values are `blorp_*` runtime names and stay Strings | `resolve.brp`, `synth.brp`, `trait_resolve.brp` read `CoreVar.name`, a String; the registry serves sentinels that have no declaration to read an origin from |
+| `ctfe_builtin_intrinsic` and module tables (`stage_07_ctfe/intrinsic.brp`) | 79 + module tables | source names (with the std module path) | `stage_07_ctfe/ir.brp:600`, `eval.brp:2546` read `ResolvedCallInfo.source_name`, a String |
+| `intrinsic_contract` / `builtin_contract` (`stage_09_core/ownership.brp`) | 169 + about 21 (181 counted earlier) | names inside `IntrinsicCall(String)` (`list_len`, `elem_release_fn`) and `BuiltinCall(String)` (`blorp_*`): compiler-internal and runtime ABI names, not Blorp identifiers | Core passes through the call kind payloads |
+
+So only the three source-name vocabularies (special inference, CTFE intrinsics,
+the source half of the effect table) and the builtin registry are `NameId`-able,
+and they all read `ResolvedCallInfo.source_name` / `callee_name` or `CoreVar.name`,
+which are Strings. The ABI-keyed vocabularies are a different problem (see
+"runtime operation ids" below). Steps:
+
+| Step | What | Gate |
+| --- | --- | --- |
+| A2c.1 (done) | `ResolvedCallInfo.source_name_id: Option[NameId]` written where the callee is resolved (every constructor helper, `TraitMethodCallee`, `AcceptedCallableBinding`; `None` for a closure call and a CTFE-materialized call, which have no source name; an `import ... as` alias resolves its original name through the synthesized vocabulary); the Strings stay until their readers move (interim row); id and spelling checked by the `BLORP_NAME_IDENTITY` census (`mismatched` stays 0); 67 spellings seeded and pinned as `NAME_ID_STD_*` | identical C |
+| A2c.2 (done) | `builtin_special_inference` and the seven CTFE tables as global `Dict[NameId, <intrinsic union>]` constants (the CTFE module is still selected by comparing the std module path); the String arms deleted; `builtin_is_registered` still answers for the special-inference names, through `synthesized_name_id` (92b0f0321), because cancellation classification asks it about Core `BuiltinCall` names, which are Strings (interim row) | identical C; stage-2 instructions flat or down |
+| A2c.3 | the source-name half of `builtin_runtime_effect` (its readers first need the identity at the typecheck effect sites) | identical C |
+| A2c.4 | `core_builtin_name`: needs `CoreVar` to carry its declaration's `NameId`, or resolution through `CoreFunction.origin` where a declaration exists; last | identical C |
+
+## Runtime operation ids
+
+The ABI-keyed vocabularies are not identifiers and should not become `NameId`s:
+`IntrinsicCall(String)` and `BuiltinCall(String)` carry runtime and
+compiler-internal operation names, and `ownership.brp` (about 190 contract arms)
+plus the `blorp_*` half of `builtin_runtime_effect` (48 arms) key on them. They
+become a closed enum or id of runtime operations, written where the call kind is
+created (lowering, synthesis, backend projection), with the ABI spelling kept in
+one named field for the emitter. Adjacent to Lane B (emission by id): the C
+symbol for a runtime operation would then be computed from the id. Not started;
+owns the payload of `CoreCallKind.BuiltinCall` and `IntrinsicCall`, so it
+touches every pass that matches those kinds.
+
 ## Lane B: emission by id
 
 | Step | What | Files | Gate | Status |
@@ -138,6 +177,11 @@ becomes permanent by being forgotten.
 | `CoreImplMethodRole` on `ImplMethod` (and the pinned `NAME_ID_*` callback constants) stands in for the trait identity of Stringable, Hashable and Equatable | M2.3 | Typed impls carrying trait definition ids: the payload becomes `(trait DefinitionId, method NameId)` and the enum, `impl_method_role` and the constants go |
 | `CoreRuntimeCallbackTable` keyed by the rendered `core_trait_impl_type_key` String | M2.3 | D9 (type ids): key on the target type's id |
 | Origin payloads that hold a `CoreType` go stale when flatten renames types (precondition: write them after flatten, as `ProjectedImplMethod` and `MonoInstance` are, or use ids) | M2.3 | Type ids (D9) |
+| `ResolvedCallInfo.callee_name` / `.source_name` Strings kept beside `source_name_id` (also `CtfeIrDirectCall.source_name`); `AcceptedCallableBinding.source_name`; CTFE-materialized calls have `source_name_id = None` because the CTFE value payloads hold Strings | A2c.1 | readers of the Strings move (A2c.3 the effect table's source half, A2c.4 `core_builtin_name`, the `source_name` diagnostics in A4), then the Strings are deleted |
+| `builtin_is_registered(name: String)` recognizes special-inference names by `synthesized_name_id(name)`, a String-to-id lookup, because its caller (cancellation classification) holds a Core `BuiltinCall` String | A2c.2 (92b0f0321) | A2c.4 (`core_builtin_name`), when Core carries the declaration's `NameId` |
+| `infer_source_name_id` recovers the id of an `import ... as` alias's original name, and of an `AcceptedCallableBinding`'s defining spelling, with a lookup of the spelling in the synthesized table (`None` when it is not seeded): `ImportedNameBinding.original_name` is a String (its standalone-module constructors have no name table), and the accepted graph's source name table is not guaranteed to be the seeded compilation table, so a slot's id cannot be compared with the pinned vocabulary keys (a first attempt that used the slot id broke the compile-time `upper` intrinsic lookup) | A2c.1 | both bindings carrying ids from the compilation's table, once standalone graphs share the discovery table (with the standalone-graph row above, A5) |
+| `ctfe_imported_intrinsic` selects its intrinsic table by comparing the std module path String against `STD_*_MODULE_PATH` | A2c.2 | modules having ids: the table is selected by `ModuleId` |
+| Strings kept beside the new ids: `ResolvedCallInfo.callee_name` / `.source_name`, `TraitMethodCallee.source_name` and `.method_name`, `CtfeIrDirectCall.source_name`, `AcceptedCallableBinding.source_name`, and the String arms `builtin_runtime_effect` and `prelude_builtin_name` still key on | A2c.1 | A2c.3 and A2c.4, then the String deletion step of A2c (deferred, not part of the first A2c branch) |
 | Span-derived positive binder ids for authored binders | B0/B1a | A1b (parser-minted ids) |
 | One sigil read left in `type_parameter_name_kind` (`List[String]` type parameters) | D7 (230835a0b) | type interning, when type-parameter lists carry kinds |
 | `--dump-core` JSON carries both name Strings and ids | A0 | A5 |

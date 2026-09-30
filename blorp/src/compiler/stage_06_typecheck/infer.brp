@@ -12,11 +12,22 @@ import:
 		source_location_start_offset,
 		source_span_label,
 	../stage_02_lex/name_table:
+		NAME_ID_BUILTIN_ASSERT_SHAPE,
+		NAME_ID_BUILTIN_CHECKED_GET,
+		NAME_ID_BUILTIN_CHECKED_SET,
+		NAME_ID_BUILTIN_CHECKED_SLICE,
+		NAME_ID_BUILTIN_MATRIX_CHECKED_SET,
+		NAME_ID_BUILTIN_TENSOR3_CHECKED_SET,
+		NAME_ID_BUILTIN_TENSOR4_CHECKED_SET,
+		NAME_ID_BUILTIN_TENSOR5_CHECKED_SET,
+		NAME_ID_BUILTIN_TENSOR_PEEL,
 		NAME_ID_LENGTH,
 		NAME_ID_WILDCARD,
+		NameId,
+		SYNTHESIZED_NAME_TABLE,
 		name_id_pending_dynamic_intern,
 		name_ids_equal,
-		synthesized_name_id,
+		name_table_find_id,
 		tuple_field_name_id,
 	../stage_03_parse/parsed_ast:
 		ParsedBinaryOp(
@@ -519,9 +530,20 @@ enum ResolvedLoopProducer:
 	ResolvedLoopProducerWindows
 
 
+---
+`source_name_id` is the interned spelling of `source_name`, written where the
+callee is resolved, so vocabularies keyed by a function's source name (special
+inference, CTFE intrinsics) can compare pinned ids. The String stays until its
+readers move (A2c.2 onward). It is `None` for a call that has no source name to
+look up: a closure call, and a call CTFE materializes from a value (which
+describes a result, not a callee). `Option` rather than a sentinel id, because
+every `NameId` value, including the wildcard and the unseeded spelling, is a
+name some vocabulary could key.
+---
 record ResolvedCallInfo {
 	callee_name: String,
 	source_name: String,
+	source_name_id: Option[NameId],
 	purity: Purity,
 	target: ResolvedCallTarget,
 	trait_identity: Option[BoundTraitIdentity],
@@ -542,6 +564,7 @@ private union TraitMethodCalleeIdentity:
 
 private record TraitMethodCallee {
 	source_name: String,
+	source_name_id: NameId,
 	method_name: String,
 	trait_name: String,
 	method: TraitMethodSig,
@@ -1163,6 +1186,7 @@ private pure func infer_find_trait_method(
 private pure func infer_find_function_trait_method(
 	context: InferContext,
 	source_name: String,
+	source_name_id: NameId,
 	method_name: String,
 ) -> Option[TraitMethodCallee]:
 	match module_view_accepted_trait_implementation_authority(context.state.facts.module_view):
@@ -1171,6 +1195,7 @@ private pure func infer_find_function_trait_method(
 				Some(found):
 					Some({
 						source_name = source_name,
+						source_name_id = source_name_id,
 						method_name = method_name,
 						trait_name = accepted_trait_method_binding_declaring_trait_name(found),
 						method = accepted_trait_method_binding_signature(found),
@@ -1188,6 +1213,7 @@ private pure func infer_find_function_trait_method(
 						): trait_method_callee_from_trait(
 							context,
 							source_name,
+							source_name_id,
 							method_name,
 							trait_name,
 						),
@@ -1199,7 +1225,7 @@ private pure func infer_find_function_trait_method(
 			).and_then(
 				func(
 					trait_name,
-				): trait_method_callee_from_trait(context, source_name, method_name, trait_name),
+				): trait_method_callee_from_trait(context, source_name, source_name_id, method_name, trait_name),
 			)
 
 
@@ -1606,6 +1632,7 @@ private pure func resolved_call_from_trait_method_callee(
 	{
 		callee_name = callee.method_name,
 		source_name = callee.source_name,
+		source_name_id = Some(callee.source_name_id),
 		purity = purity,
 		target = target,
 		trait_identity = trait_identity,
@@ -1645,6 +1672,7 @@ private pure func resolved_call_from_closure(
 	{
 		callee_name = "<closure>",
 		source_name = "<closure>",
+		source_name_id = None,
 		purity = purity,
 		target = ResolvedClosureCall,
 		trait_identity = None,
@@ -1704,6 +1732,7 @@ private pure func resolved_call_from_func_symbol_with_source(
 	facts: InferModuleFacts,
 	callee_name: String,
 	source_name: String,
+	source_name_id: Option[NameId],
 	func_symbol: FuncSymbol,
 ) -> ResolvedCallInfo:
 	category = if func_symbol.origin == ForeignFunc:
@@ -1724,6 +1753,7 @@ private pure func resolved_call_from_func_symbol_with_source(
 	{
 		callee_name = callee_name,
 		source_name = source_name,
+		source_name_id = source_name_id,
 		purity = func_symbol.purity,
 		target = resolved_target,
 		trait_identity = None,
@@ -1740,12 +1770,14 @@ private pure func resolved_call_from_func_symbol_with_source(
 private pure func resolved_call_from_overload_entry_with_target(
 	callee_name: String,
 	source_name: String,
+	source_name_id: Option[NameId],
 	entry: OverloadEntry,
 	resolved_target: ResolvedCallTarget,
 ) -> ResolvedCallInfo:
 	{
 		callee_name = callee_name,
 		source_name = source_name,
+		source_name_id = source_name_id,
 		purity = entry.purity,
 		target = resolved_target,
 		trait_identity = None,
@@ -1762,6 +1794,7 @@ private pure func resolved_call_from_overload_entry_with_target(
 private pure func resolved_call_from_graph_overload_entry(
 	callee_name: String,
 	source_name: String,
+	source_name_id: Option[NameId],
 	id: CallableId,
 	entry: OverloadEntry,
 ) -> ResolvedCallInfo:
@@ -1773,6 +1806,7 @@ private pure func resolved_call_from_graph_overload_entry(
 	resolved_call_from_overload_entry_with_target(
 		callee_name,
 		source_name,
+		source_name_id,
 		entry,
 		ResolvedGraphCallableCall(id, category),
 	)
@@ -1782,6 +1816,7 @@ private pure func resolved_call_from_overload_entry(
 	facts: InferModuleFacts,
 	callee_name: String,
 	source_name: String,
+	source_name_id: Option[NameId],
 	entry: OverloadEntry,
 ) -> ResolvedCallInfo:
 	category = if entry.origin == ForeignFunc:
@@ -1799,11 +1834,12 @@ private pure func resolved_call_from_overload_entry(
 	else:
 		ResolvedUnindexedCallableCall(entry.def_id, category)
 
-	resolved_call_from_overload_entry_with_target(callee_name, source_name, entry, target)
+	resolved_call_from_overload_entry_with_target(callee_name, source_name, source_name_id, entry, target)
 
 
 private pure func resolved_call_from_constructor(
 	callee_name: String,
+	callee_name_id: NameId,
 	runtime_constructor_id: Int,
 	identity_domain: ConstructorIdentityDomain,
 	parent_type: String,
@@ -1821,6 +1857,7 @@ private pure func resolved_call_from_constructor(
 	{
 		callee_name = callee_name,
 		source_name = callee_name,
+		source_name_id = Some(callee_name_id),
 		purity = Pure,
 		target = resolved_target,
 		trait_identity = None,
@@ -2986,6 +3023,7 @@ private pure func zonk_resolved_call_info(
 	{
 		callee_name = info.callee_name,
 		source_name = info.source_name,
+		source_name_id = info.source_name_id,
 		purity = info.purity,
 		target = info.target,
 		trait_identity = info.trait_identity,
@@ -6946,6 +6984,7 @@ private pure func infer_constructor_name_expr(
 	constructor_type = constructor_step.typ
 	resolved_call = resolved_call_from_constructor(
 		name.text,
+		name.name,
 		ctor.constructor_id,
 		ctor.identity_domain,
 		ctor.parent_type,
@@ -7164,6 +7203,7 @@ private pure func symbol_from_imported_binding(
 private pure func trait_method_callee_from_trait(
 	context: InferContext,
 	source_name: String,
+	source_name_id: NameId,
 	method_name: String,
 	trait_name: String,
 ) -> Option[TraitMethodCallee]:
@@ -7171,6 +7211,7 @@ private pure func trait_method_callee_from_trait(
 		Some((method, declaring_trait)):
 			Some({
 				source_name = source_name,
+				source_name_id = source_name_id,
 				method_name = method_name,
 				trait_name = declaring_trait,
 				method = method,
@@ -7183,8 +7224,9 @@ private pure func trait_method_callee_from_trait(
 private pure func local_trait_method_callee(
 	context: InferContext,
 	name: String,
+	name_id: NameId,
 ) -> Option[TraitMethodCallee]:
-	match infer_find_function_trait_method(context, name, name):
+	match infer_find_function_trait_method(context, name, name_id, name):
 		Some(callee):
 			if context.state.facts.scoped_trait_functions.any(
 				func(pair): pair[0] == name and pair[1] == callee.trait_name,
@@ -7214,9 +7256,9 @@ private pure func lookup_trait_method_callee(
 ) -> Option[TraitMethodCallee]:
 	match module_view_find_imported_name(context.state.facts.module_view, name.text):
 		Some(binding):
-			infer_find_function_trait_method(context, name.text, binding.original_name)
+			infer_find_function_trait_method(context, name.text, name.name, binding.original_name)
 		None:
-			local_trait_method_callee(context, name.text)
+			local_trait_method_callee(context, name.text, name.name)
 
 
 private union ImportedReceiverTraitMethodLookup:
@@ -7250,6 +7292,7 @@ private pure func imported_receiver_trait_method_callee(
 					AcceptedTraitUfcsMethodFound(found):
 						ImportedReceiverTraitMethodFound({
 							source_name = name.text,
+							source_name_id = name.name,
 							method_name = name.text,
 							trait_name = accepted_trait_method_binding_declaring_trait_name(found),
 							method = accepted_trait_method_binding_signature(found),
@@ -7262,7 +7305,7 @@ private pure func imported_receiver_trait_method_callee(
 					AcceptedTraitUfcsMethodNotFound:
 						ImportedReceiverTraitMethodNotFound
 			None:
-				match infer_find_function_trait_method(context, name.text, name.text):
+				match infer_find_function_trait_method(context, name.text, name.name, name.text):
 					Some(callee):
 						match infer_find_impl_method_info_for_callee(
 							context.state,
@@ -7395,6 +7438,33 @@ private pure func lookup_bare_value(
 															None
 
 
+---
+The interned id of a resolved callee's `source_name`, for a callee found through
+`ImportedNameBinding` or `AcceptedCallableBinding`. It is the spelled
+identifier's own id when the source name is that spelling, which is every call
+except one made through an `import ... as` alias, or one whose binding names
+the defining row's spelling rather than the call's.
+
+The lookup by spelling stays for the other case, for two reasons. An
+`ImportedNameBinding` holds the original name as a String (its standalone-module
+constructors have no name table). And the id an `AcceptedCallableBinding`'s
+slot holds comes from the accepted graph's source name table, which is not
+guaranteed to be the compilation's seeded table (standalone graphs build private
+tables, see the interim states in `docs/NAME_ID_ROADMAP.md`), so it cannot be
+compared with the pinned vocabulary keys. The id is therefore recovered from the
+closed synthesized vocabulary, where every builtin the id-keyed vocabularies
+care about lives. A name outside it has no id (`None`), the same answer the String
+comparison gave: no vocabulary key. Deleted when
+both bindings carry ids from the compilation's table (standalone graphs sharing
+the discovery table).
+---
+private pure func infer_source_name_id(source_name: String, spelled: ParsedIdentifier) -> Option[NameId]:
+	if source_name == spelled.text:
+		Some(spelled.name)
+	else:
+		name_table_find_id(SYNTHESIZED_NAME_TABLE, source_name)
+
+
 private pure func source_name_for_imported_module_path(
 	context: InferContext,
 	local_name: String,
@@ -7445,7 +7515,7 @@ private pure func scoped_trait_method_callee(
 		None
 	else:
 		trait_name ?= infer_facts_find_scoped_trait_function(context.state.facts, name.text)
-		trait_method_callee_from_trait(context, name.text, name.text, trait_name)
+		trait_method_callee_from_trait(context, name.text, name.name, name.text, trait_name)
 
 
 private pure func builtin_symbol_prefers_trait_dispatch(name: String) -> Bool:
@@ -7489,6 +7559,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 			resolved_call = resolved_call_from_graph_overload_entry(
 				name.text,
 				binding.source_name,
+				infer_source_name_id(binding.source_name, name),
 				binding.id,
 				entry,
 			)
@@ -7594,6 +7665,7 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 								context.state.facts,
 								name.text,
 								source_name,
+								infer_source_name_id(source_name, name),
 								func_symbol,
 							)
 							next_context = check_debug_only_reference(
@@ -9166,6 +9238,7 @@ private pure func typed_qualified_module_constructor_expr(
 	constructor_type = constructor_step.typ
 	resolved_call = resolved_call_from_constructor(
 		field.text,
+		field.name,
 		ctor.constructor_id,
 		ctor.identity_domain,
 		ctor.parent_type,
@@ -9219,6 +9292,7 @@ private pure func infer_qualified_module_callee(
 									resolved_call = resolved_call_from_graph_overload_entry(
 										field.text,
 										binding.source_name,
+										infer_source_name_id(binding.source_name, field),
 										binding.id,
 										entry,
 									)
@@ -9273,6 +9347,7 @@ private pure func infer_qualified_module_field_expr(
 							resolved_call = resolved_call_from_graph_overload_entry(
 								field.text,
 								binding.source_name,
+								infer_source_name_id(binding.source_name, field),
 								binding.id,
 								entry,
 							)
@@ -10230,7 +10305,11 @@ private pure func refined_builtin_return_type(
 	fallback: SemanticType,
 ) -> SemanticType:
 	name = resolved_call_display_name(resolved_call)
-	special_inference = builtin_special_inference(name)
+	special_inference = match resolved_call:
+		Some(call):
+			call.source_name_id.and_then(builtin_special_inference)
+		None:
+			None
 
 	elementwise_return = if args.length() == 1:
 		match args.get(0):
@@ -10610,6 +10689,7 @@ private pure func infer_ufcs_call_with_receiver_result(
 		context.state.facts,
 		method.text,
 		source_name,
+		infer_source_name_id(source_name, method),
 		entry,
 	)
 	infer_ufcs_call_with_resolved_call(
@@ -10635,6 +10715,7 @@ private pure func infer_accepted_ufcs_call_with_receiver_result(
 	resolved_call_info = resolved_call_from_graph_overload_entry(
 		method.text,
 		binding.source_name,
+		infer_source_name_id(binding.source_name, method),
 		binding.id,
 		entry,
 	)
@@ -11120,6 +11201,7 @@ private pure func infer_find_qualified_trait_method_selection(
 	context: InferContext,
 	module_path: String,
 	method_name: String,
+	method_name_id: NameId,
 	receiver_type: SemanticType,
 ) -> Option[QualifiedTraitMethodSelection]:
 	match module_view_accepted_trait_implementation_authority(context.state.facts.module_view):
@@ -11136,7 +11218,7 @@ private pure func infer_find_qualified_trait_method_selection(
 				None:
 					None
 		None:
-			method_callee ?= infer_find_function_trait_method(context, method_name, method_name)
+			method_callee ?= infer_find_function_trait_method(context, method_name, method_name_id, method_name)
 
 			if not qualified_module_owns_trait_dispatch(
 				context,
@@ -11234,6 +11316,7 @@ private pure func infer_qualified_module_trait_call_expr(
 									context,
 									module_path,
 									method.text,
+									method.name,
 									receiver_type,
 								):
 									Some(AcceptedQualifiedTraitMethodSelection(qualified_method)):
@@ -11242,6 +11325,7 @@ private pure func infer_qualified_module_trait_call_expr(
 										)
 										method_callee: TraitMethodCallee = {
 											source_name = method.text,
+											source_name_id = method.name,
 											method_name = method.text,
 											trait_name = accepted_qualified_trait_method_declaring_trait_name(
 												qualified_method,
@@ -16619,13 +16703,14 @@ private pure func infer_subscript_expr(
 
 
 private pure func builtin_resolved_call(
-	name: String,
+	builtin_callee: SynthesizedBuiltinCallee,
 	params: List[SemanticType],
 	return_type: SemanticType,
 ) -> ResolvedCallInfo:
 	{
-		callee_name = name,
-		source_name = name,
+		callee_name = builtin_callee.name,
+		source_name = builtin_callee.name,
+		source_name_id = Some(builtin_callee.name_id),
 		purity = Pure,
 		target = ResolvedIntrinsicCall,
 		trait_identity = None,
@@ -16640,12 +16725,84 @@ private pure func builtin_resolved_call(
 
 
 ---
-The callee of a synthesized builtin call. `name` is one of the closed builtin
-callee spellings in `name_table_synthesized_spellings()` (subscript and
-slice/set/peel/assert_shape lowering), so its id is the compilation's.
+A builtin callee that typecheck synthesizes or recognizes by spelling: the text
+and the id it is keyed by. Carrying the id from the site that chose the callee
+avoids re-interning the spelling on every synthesized call. A synthesized callee
+is one of the `BUILTIN_CALLEE_*` constants, which pair a spelling with its pinned
+`NAME_ID_BUILTIN_*` once, in one place; a spelled callee takes the identifier's
+own id (`spelled_builtin_callee`).
+---
+record SynthesizedBuiltinCallee {
+	name: String,
+	name_id: NameId
+}
+
+
+BUILTIN_CALLEE_ASSERT_SHAPE: SynthesizedBuiltinCallee = {
+	name = "assert_shape",
+	name_id = NAME_ID_BUILTIN_ASSERT_SHAPE
+}
+BUILTIN_CALLEE_CHECKED_GET: SynthesizedBuiltinCallee = {
+	name = "checked_get",
+	name_id = NAME_ID_BUILTIN_CHECKED_GET
+}
+BUILTIN_CALLEE_CHECKED_SET: SynthesizedBuiltinCallee = {
+	name = "checked_set",
+	name_id = NAME_ID_BUILTIN_CHECKED_SET
+}
+BUILTIN_CALLEE_CHECKED_SLICE: SynthesizedBuiltinCallee = {
+	name = "checked_slice",
+	name_id = NAME_ID_BUILTIN_CHECKED_SLICE
+}
+BUILTIN_CALLEE_MATRIX_CHECKED_SET: SynthesizedBuiltinCallee = {
+	name = "matrix_checked_set",
+	name_id = NAME_ID_BUILTIN_MATRIX_CHECKED_SET
+}
+BUILTIN_CALLEE_TENSOR3_CHECKED_SET: SynthesizedBuiltinCallee = {
+	name = "tensor3_checked_set",
+	name_id = NAME_ID_BUILTIN_TENSOR3_CHECKED_SET
+}
+BUILTIN_CALLEE_TENSOR4_CHECKED_SET: SynthesizedBuiltinCallee = {
+	name = "tensor4_checked_set",
+	name_id = NAME_ID_BUILTIN_TENSOR4_CHECKED_SET
+}
+BUILTIN_CALLEE_TENSOR5_CHECKED_SET: SynthesizedBuiltinCallee = {
+	name = "tensor5_checked_set",
+	name_id = NAME_ID_BUILTIN_TENSOR5_CHECKED_SET
+}
+BUILTIN_CALLEE_TENSOR_PEEL: SynthesizedBuiltinCallee = {
+	name = "tensor_peel",
+	name_id = NAME_ID_BUILTIN_TENSOR_PEEL
+}
+
+
+---
+Every `BUILTIN_CALLEE_*`, so a test can check that each constant's id is the
+seeded id of its name.
+---
+BUILTIN_CALLEES: List[SynthesizedBuiltinCallee] = [
+	BUILTIN_CALLEE_ASSERT_SHAPE,
+	BUILTIN_CALLEE_CHECKED_GET,
+	BUILTIN_CALLEE_CHECKED_SET,
+	BUILTIN_CALLEE_CHECKED_SLICE,
+	BUILTIN_CALLEE_MATRIX_CHECKED_SET,
+	BUILTIN_CALLEE_TENSOR3_CHECKED_SET,
+	BUILTIN_CALLEE_TENSOR4_CHECKED_SET,
+	BUILTIN_CALLEE_TENSOR5_CHECKED_SET,
+	BUILTIN_CALLEE_TENSOR_PEEL,
+]
+
+
+private pure func spelled_builtin_callee(identifier: ParsedIdentifier) -> SynthesizedBuiltinCallee:
+	{ name = identifier.text, name_id = identifier.name }
+
+
+---
+The callee of a synthesized builtin call (subscript and slice/set/peel/
+assert_shape lowering, or a spelled `__checked_get` family call).
 ---
 private pure func typed_builtin_callee(
-	name: String,
+	builtin_callee: SynthesizedBuiltinCallee,
 	params: List[SemanticType],
 	return_type: SemanticType,
 	span: SourceLocation,
@@ -16654,7 +16811,7 @@ private pure func typed_builtin_callee(
 	func_type = SemanticFunctionType(True, params, return_type)
 
 	TypedNameExpr(
-		parsed_identifier(synthesized_name_id(name), name, span),
+		parsed_identifier(builtin_callee.name_id, builtin_callee.name, span),
 		typed_expr_info_from_slot(
 			None,
 			InferredOrigin,
@@ -16694,8 +16851,9 @@ private pure func assert_shape_result(
 	result_inner = SemanticArrayType(element_type, [SemanticConstIntType(expected_length)])
 	result_type = SemanticNamedType("Option", [result_inner])
 	params = [receiver_type, TYPE_INT]
-	resolved_call = builtin_resolved_call("assert_shape", params, result_type)
-	callee = typed_builtin_callee("assert_shape", params, result_type, span, resolved_call)
+	builtin_callee = BUILTIN_CALLEE_ASSERT_SHAPE
+	resolved_call = builtin_resolved_call(builtin_callee, params, result_type)
+	callee = typed_builtin_callee(builtin_callee, params, result_type, span, resolved_call)
 	typed = TypedCallExpr(
 		callee,
 		[receiver, length],
@@ -16801,7 +16959,7 @@ private pure func infer_assert_shape_call(
 private pure func checked_get_builtin_result(
 	context: InferContext,
 	next_context: InferContext,
-	callee_name: String,
+	builtin_callee: SynthesizedBuiltinCallee,
 	receiver: TypedExpr,
 	index: TypedExpr,
 	receiver_type: SemanticType,
@@ -16810,8 +16968,8 @@ private pure func checked_get_builtin_result(
 ) -> InferResult:
 	result_context = infer_context_with_state(context, next_context.state)
 	params: List[SemanticType] = [receiver_type, TYPE_INT]
-	resolved_call = builtin_resolved_call(callee_name, params, result_type)
-	callee = typed_builtin_callee(callee_name, params, result_type, span, resolved_call)
+	resolved_call = builtin_resolved_call(builtin_callee, params, result_type)
+	callee = typed_builtin_callee(builtin_callee, params, result_type, span, resolved_call)
 	typed = TypedCallExpr(
 		callee,
 		[receiver, index],
@@ -16884,15 +17042,15 @@ private pure func checked_get_array_result(
 		),
 	)
 
-	callee_name: String = if dims.length() > 1:
-		"tensor_peel"
+	builtin_callee: SynthesizedBuiltinCallee = if dims.length() > 1:
+		BUILTIN_CALLEE_TENSOR_PEEL
 	else:
-		"checked_get"
+		BUILTIN_CALLEE_CHECKED_GET
 
 	checked_get_builtin_result(
 		context,
 		validated.context,
-		callee_name,
+		builtin_callee,
 		receiver,
 		index,
 		receiver_type,
@@ -16922,7 +17080,7 @@ private pure func checked_get_unsupported_result(
 	checked_get_builtin_result(
 		context,
 		next_context,
-		"checked_get",
+		BUILTIN_CALLEE_CHECKED_GET,
 		receiver,
 		index,
 		receiver_type,
@@ -17014,7 +17172,7 @@ private pure func infer_checked_get_call(
 
 
 private pure func nd_checked_get_result(
-	name: String,
+	builtin_callee: SynthesizedBuiltinCallee,
 	result: InferResult,
 	span: SourceLocation,
 ) -> InferResult:
@@ -17025,8 +17183,8 @@ private pure func nd_checked_get_result(
 			params = [receiver_type].concat(indices.map(
 				func(_): TYPE_INT,
 			))
-			resolved_call = builtin_resolved_call(name, params, result_type)
-			callee = typed_builtin_callee(name, params, result_type, span, resolved_call)
+			resolved_call = builtin_resolved_call(builtin_callee, params, result_type)
+			callee = typed_builtin_callee(builtin_callee, params, result_type, span, resolved_call)
 			typed = TypedCallExpr(
 				callee,
 				[receiver].concat(indices),
@@ -17040,13 +17198,13 @@ private pure func nd_checked_get_result(
 
 private pure func infer_nd_checked_get_call(
 	context: InferContext,
-	name: String,
+	name: ParsedIdentifier,
 	index_count: Int,
 	args: List[ParsedExpr],
 	span: SourceLocation,
 ) -> InferResult:
 	if args.length() != index_count + 1:
-		next = infer_error(context, "${name} takes ${index_count + 1} arguments")
+		next = infer_error(context, "${name.text} takes ${index_count + 1} arguments")
 		missing = TypedMissingExpr(
 			span,
 			inferred_info(next, TYPE_VOID),
@@ -17056,7 +17214,7 @@ private pure func infer_nd_checked_get_call(
 		receiver = args.get_or(0, ParsedMissingExpr(span))
 		parsed_indices: List[ParsedExpr] = parsed_args_after_first(args)
 		nd_checked_get_result(
-			name,
+			spelled_builtin_callee(name),
 			infer_subscript_expr(context, receiver, parsed_indices, span),
 			span,
 		)
@@ -17117,9 +17275,10 @@ private pure func checked_slice_result(
 					[SemanticConstIntType(end_value - start_value)],
 				)
 				params = [receiver_type, TYPE_INT, TYPE_INT]
-				resolved_call = builtin_resolved_call("checked_slice", params, result_type)
+				builtin_callee = BUILTIN_CALLEE_CHECKED_SLICE
+				resolved_call = builtin_resolved_call(builtin_callee, params, result_type)
 				callee = typed_builtin_callee(
-					"checked_slice",
+					builtin_callee,
 					params,
 					result_type,
 					span,
@@ -17320,7 +17479,7 @@ private pure func infer_special_builtin_call_expr(
 			if not is_builtin:
 				None
 			else:
-				match builtin_special_inference(name.text):
+				match builtin_special_inference(name.name):
 					Some(AssertShapeInference):
 						Some(infer_assert_shape_call(context, args, span))
 					Some(CheckedGetInference):
@@ -17330,11 +17489,11 @@ private pure func infer_special_builtin_call_expr(
 					Some(CheckedSliceInference):
 						Some(infer_checked_slice_call(context, args, span))
 					Some(MatrixCheckedGetInference):
-						Some(infer_nd_checked_get_call(context, name.text, 2, args, span))
+						Some(infer_nd_checked_get_call(context, name, 2, args, span))
 					Some(MatrixCheckedSetInference):
 						Some(infer_checked_set_call(context, name.text, 2, args, span))
 					Some(TensorCheckedGetInference(rank)):
-						Some(infer_nd_checked_get_call(context, name.text, rank, args, span))
+						Some(infer_nd_checked_get_call(context, name, rank, args, span))
 					Some(TensorCheckedSetInference(rank)):
 						Some(infer_checked_set_call(context, name.text, rank, args, span))
 					_:
@@ -17482,18 +17641,18 @@ private pure func infer_subscript_assign_result(
 	infer_result(result_context, typed)
 
 
-private pure func checked_set_callee_name(index_count: Int) -> String:
+private pure func checked_set_callee(index_count: Int) -> SynthesizedBuiltinCallee:
 	match index_count:
 		2:
-			"matrix_checked_set"
+			BUILTIN_CALLEE_MATRIX_CHECKED_SET
 		3:
-			"tensor3_checked_set"
+			BUILTIN_CALLEE_TENSOR3_CHECKED_SET
 		4:
-			"tensor4_checked_set"
+			BUILTIN_CALLEE_TENSOR4_CHECKED_SET
 		5:
-			"tensor5_checked_set"
+			BUILTIN_CALLEE_TENSOR5_CHECKED_SET
 		_:
-			"checked_set"
+			BUILTIN_CALLEE_CHECKED_SET
 
 
 private pure func checked_set_call(
@@ -17505,14 +17664,14 @@ private pure func checked_set_call(
 	element_type: SemanticType,
 	span: SourceLocation,
 ) -> TypedExpr:
-	callee_name = checked_set_callee_name(indices.length())
+	builtin_callee = checked_set_callee(indices.length())
 	params = [target_type]
 		.concat(indices.map(
 			func(_): TYPE_INT,
 		))
 		.append(element_type)
-	resolved_call = builtin_resolved_call(callee_name, params, target_type)
-	callee = typed_builtin_callee(callee_name, params, target_type, span, resolved_call)
+	resolved_call = builtin_resolved_call(builtin_callee, params, target_type)
+	callee = typed_builtin_callee(builtin_callee, params, target_type, span, resolved_call)
 
 	TypedCallExpr(
 		callee,

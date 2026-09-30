@@ -22,7 +22,15 @@
 -- declarations) and the names of function and global declarations. Pattern
 -- binders, for-loop binders, and parameter binders are not walked.
 import:
-	../stage_02_lex/name_table: NameTable, name_spelling, name_spelling_or_text
+	../stage_02_lex/name_table:
+		NameTable,
+		NameId,
+		name_id_pending_dynamic_intern,
+		name_id_unseeded_spelling,
+		name_ids_equal,
+		name_spelling,
+		name_spelling_or_text,
+		synthesized_name_id
 	../stage_03_parse/parsed_ast: ParsedIdentifier
 	decl:
 		TypedDecl(TypedGlobalVarDecl, TypedPrivateDecl),
@@ -30,6 +38,8 @@ import:
 		typed_decl_function_infos,
 	graph/typed_expr_children: typed_expr_children
 	infer:
+		ResolvedCallInfo,
+		ResolvedCallTarget(ResolvedClosureCall),
 		TypedExpr(
 			TypedAssignExpr,
 			TypedConcurrentForExpr,
@@ -42,6 +52,7 @@ import:
 			TypedTupleDestructExpr,
 			TypedVarDeclExpr,
 		),
+		typed_expr_resolved_call,
 
 
 ---
@@ -118,6 +129,60 @@ private pure func census_identifier(
 			}
 
 
+---
+A resolved call's `source_name_id`, when the table has a spelling for it, must
+be its `source_name`; anything else is `mismatched`, which must stay zero. An id
+with no spelling in the table is not counted again: it is the same class of
+unresolved identifier `census_identifier` already reports, and a call whose id
+is the pending placeholder is exactly such an identifier. A closure call has no
+source name (`None`) and is skipped, as is a call CTFE materializes from a
+value.
+---
+private pure func census_call_source_name(
+	names: NameTable,
+	census: NameIdentityCensus,
+	call: ResolvedCallInfo,
+) -> NameIdentityCensus:
+	match call.source_name_id:
+		None:
+			census
+		Some(source_name_id):
+			if name_ids_equal(source_name_id, name_id_pending_dynamic_intern()):
+				census
+			else:
+				census_call_spelling(names, census, call, source_name_id)
+
+
+private pure func census_call_spelling(
+	names: NameTable,
+	census: NameIdentityCensus,
+	call: ResolvedCallInfo,
+	source_name_id: NameId,
+) -> NameIdentityCensus:
+	seeded_id: NameId = synthesized_name_id(call.source_name)
+
+	match name_spelling(names, source_name_id):
+		Some(spelling):
+			-- A seeded spelling has one id in every table, and the id-keyed builtin
+			-- vocabularies compare against exactly that id, so a call whose source
+			-- name is seeded must carry it.
+			if spelling == call.source_name and (
+				name_ids_equal(seeded_id, name_id_unseeded_spelling())
+				or name_ids_equal(seeded_id, source_name_id)
+			):
+				{ census | resolved = census.resolved + 1 }
+			else:
+				{ census |
+					mismatched = census.mismatched + 1,
+					violation_examples = census_with_example(
+						census,
+						"call source name `" + call.source_name + "` has id spelled `" + spelling + "`",
+					)
+				}
+		None:
+			census
+
+
 private pure func typed_expr_own_identifiers(expr: TypedExpr) -> List[ParsedIdentifier]:
 	match expr:
 		TypedNameExpr(identifier, _):
@@ -161,6 +226,12 @@ private pure func census_expr_tree(
 			Some(expr):
 				for identifier in typed_expr_own_identifiers(expr):
 					census = census_identifier(names, census, identifier)
+
+				match typed_expr_resolved_call(expr):
+					Some(call):
+						census = census_call_source_name(names, census, call)
+					None:
+						void
 
 				pending = pending.concat(typed_expr_children(expr))
 			None:
