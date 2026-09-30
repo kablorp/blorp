@@ -1374,6 +1374,46 @@ list = [1, 2, 3]       -- List[Int] inferred
 -- empty = []                     -- Error: no element type
 ```
 
+#### Integer Literals Infer `Int`
+
+An integer literal infers `Int`. A binding initialized from a literal is an
+ordinary `Int`, so a mutable one can change freely:
+
+```blorp
+var count = 42
+count += 1              -- fine: count is Int, not a type that only holds 42
+```
+
+A refinement such as `#42` or `..#5` applies only where a type writes it. The
+literal is then checked against that type:
+
+```blorp
+var y: #42 = 42
+y = 43                  -- error: expected #42, found #43
+
+v: Int[#3] = {1, 2, 3}
+v[2]                    -- the literal index is proved against #3
+i = 2
+v[i]                    -- error: i is an Int, not a compile-time literal; use get()
+```
+
+A literal is `Int` unless the position it is written in expects a dimension,
+range or sized integer type, in which case it takes that type:
+
+```blorp
+small: Int8 = 5          -- the literal becomes Int8
+v: Int[#3] = {1, 2, 3}   -- the vector literal has three elements
+count = 5                -- Int
+also: Int8 = count       -- rejected: `count` is an Int, not a literal
+```
+
+Compile-time proofs (subscripts, `assert_shape`, `checked_slice`, `for i in
+0..3` ranges, modulo narrowing, dimension arguments) read the literal itself,
+not the type of a binding that holds it. To carry a literal's value in a name,
+state the refinement: `n: #3 = 3`. A `var` with no annotation holds the base
+`Int` of its initializer (`var z = n` is an `Int`); `var z: #3 = n` keeps the
+refinement.
+
 ### Expression Type Ascription
 
 Use `expr as Type` when an expression needs an inline expected type. This is

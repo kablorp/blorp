@@ -8083,7 +8083,12 @@ private pure func infer_binary_expr(
 	left_value_type = widening_value_type(left_slot)
 	right_value_type = widening_value_type(right_slot)
 	checked = check_binary_op(right_result.context, op, left_value_type, right_value_type, span)
-	result_type = mod_result_type(op, left_semantic_type, right_semantic_type, checked.typ)
+	result_type = mod_result_type(
+		op,
+		static_operand_semantic_type(left_result.expr),
+		static_operand_semantic_type(right_result.expr),
+		checked.typ,
+	)
 	typed_left = typed_expr_with_slot(left_result.expr, left_slot)
 	typed_right = typed_expr_with_slot(right_result.expr, right_slot)
 	typed = TypedBinaryExpr(
@@ -16352,7 +16357,7 @@ private pure func typed_name_text(expr: TypedExpr) -> Option[String]:
 
 
 private pure func positive_modulo_bound(expr: TypedExpr) -> Option[Int]:
-	match typed_expr_semantic_type(expr):
+	match static_operand_semantic_type(expr):
 		SemanticConstIntType(value):
 			if value > 0:
 				Some(value)
@@ -17031,7 +17036,7 @@ private pure func infer_assert_shape_call(
 						receiver_type,
 					)
 				else:
-					match typed_expr_semantic_type(length_result.expr):
+					match static_operand_semantic_type(length_result.expr):
 						SemanticConstIntType(expected_length):
 							if expected_length > 0:
 								assert_shape_result(
@@ -17351,7 +17356,7 @@ private pure func checked_slice_error(
 
 
 private pure func typed_static_int(expr: TypedExpr) -> Option[Int]:
-	match typed_expr_semantic_type(expr):
+	match static_operand_semantic_type(expr):
 		SemanticConstIntType(value):
 			Some(value)
 		_:
@@ -19827,6 +19832,18 @@ private pure func add_tuple_for_bindings(
 	next_env
 
 
+--- The compile-time type of an operand that feeds a range, modulo or other
+--- refinement rule. An integer literal is `Int` in inference, so its value is
+--- read from the literal itself; any other operand contributes the type
+--- inference gave it (for example `length(v)` of a `T[#N]`).
+private pure func static_operand_semantic_type(bound: TypedExpr) -> SemanticType:
+	match bound:
+		TypedIntLiteralExpr(text, _, _):
+			SemanticConstIntType(parse_int_literal(text))
+		_:
+			typed_expr_semantic_type(bound)
+
+
 private pure func for_name_binding_type(
 	loop_view: Option[TypedLoopView],
 	iterable: TypedExpr,
@@ -19838,10 +19855,7 @@ private pure func for_name_binding_type(
 		None:
 			match iterable:
 				TypedRangeExpr(start_expr, end_expr, _, _):
-					match (
-						typed_expr_semantic_type(start_expr),
-						typed_expr_semantic_type(end_expr),
-					):
+					match (static_operand_semantic_type(start_expr), static_operand_semantic_type(end_expr)):
 						(SemanticConstIntType(start), SemanticConstIntType(end)):
 							if start >= 0 and end > start:
 								SemanticRangeType(SemanticConstIntType(end))
@@ -19858,7 +19872,7 @@ private pure func for_name_binding_type(
 private pure func for_name_binding_refinement(iterable: TypedExpr) -> ValueProofs:
 	match iterable:
 		TypedRangeExpr(start_expr, end_expr, _, _):
-			match (typed_expr_semantic_type(start_expr), typed_expr_semantic_type(end_expr)):
+			match (static_operand_semantic_type(start_expr), static_operand_semantic_type(end_expr)):
 				(SemanticConstIntType(start), SemanticConstIntType(end)):
 					match range_upper_lit(end):
 						Some(upper):
@@ -20486,7 +20500,13 @@ private pure func infer_var_decl_expr(
 		Some(typ):
 			typ
 		None:
-			typed_expr_semantic_type(value_result.expr)
+			-- A `var` with no annotation will be reassigned, so it holds the
+			-- base type of a refined initializer; `var z: #3 = n` keeps the
+			-- refinement because the annotation states it.
+			if is_mutable:
+				scalar_int_value_type(typed_expr_semantic_type(value_result.expr))
+			else:
+				typed_expr_semantic_type(value_result.expr)
 
 	source_type = match source_declared_type:
 		Some(typ):
@@ -20509,8 +20529,16 @@ private pure func infer_var_decl_expr(
 		_:
 			value_result.context
 
+	initializer_semantic_type = match semantic_declared_type:
+		Some(typ):
+			typ
+		None:
+			typed_expr_semantic_type(value_result.expr)
+
 	initializer_slot = if is_mutable:
-		mutable_binding_slot(binding_type)
+		-- The slot keeps the initializer's own type so Core still sees the
+		-- refined-to-base conversion when the binding is widened.
+		mutable_binding_slot(initializer_semantic_type)
 	else:
 		KeptValueSlot(binding_type)
 
@@ -22474,6 +22502,35 @@ private pure func unsupported_expr(
 	)
 
 
+--- Whether an expected type asks an integer literal to check against something
+--- narrower than `Int`: a dimension or range refinement (`#3`, `..#N`), or a
+--- sized integer (`Int8`, `UInt16`), which a literal adopts in an expected slot.
+private pure func expected_type_narrows_int_literal(expected_type: SemanticType) -> Bool:
+	is_dim_type(expected_type) or (
+		is_any_integer_type(expected_type) and not types_equal(expected_type, TYPE_INT)
+	)
+
+
+--- An integer literal infers `Int`. Only when the surrounding context expects a
+--- narrower type (see `expected_type_narrows_int_literal`) does it carry its
+--- singleton refinement (`#42`) so the expected type can check it, which keeps
+--- `v: Int[#3]` subscripts, `..#N` bindings and sized integer arguments working
+--- while `var x = 42` stays an ordinary mutable `Int`. Call arguments bound to
+--- generic dimension parameters do not reach this rule; they read the literal
+--- itself through `static_dim_from_typed_expr`.
+private pure func inferred_int_literal_type(context: InferContext, text: String) -> SemanticType:
+	narrows = match infer_context_expected_type(context):
+		Some(expected_type):
+			expected_type_narrows_int_literal(expected_type)
+		None:
+			False
+
+	if narrows:
+		SemanticConstIntType(parse_int_literal(text))
+	else:
+		TYPE_INT
+
+
 private pure func infer_expr_inner(context: InferContext, expr: ParsedExpr) -> InferResult:
 	match expr:
 		ParsedNameExpr(name):
@@ -22484,7 +22541,7 @@ private pure func infer_expr_inner(context: InferContext, expr: ParsedExpr) -> I
 				TypedIntLiteralExpr(
 					text,
 					span,
-					inferred_info(context, SemanticConstIntType(parse_int_literal(text))),
+					inferred_info(context, inferred_int_literal_type(context, text)),
 				),
 			)
 		ParsedFloatLiteralExpr(text, span):
