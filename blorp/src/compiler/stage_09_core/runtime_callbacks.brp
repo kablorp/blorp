@@ -31,9 +31,8 @@ Keyed by the target type's `core_trait_impl_type_key`, the same identity trait
 dispatch uses, so a generic impl specialized at `Box[Int]` and a lookup for
 `Box[Int]` agree. INTERIM: that key is a rendered String; it becomes the
 target type's id when Core has type ids (D9), and this table then keys on that.
-The value is the function's name: the callback payloads
-(`CustomHashContainerConstructor`, `ListToStringCall`) still carry names until
-they carry definition ids.
+The value is the function's definition id, which is what the callback payloads
+(`CustomHashContainerConstructor`, `ListToStringCall`) carry.
 
 Each role has at most one function per type: trait coherence guarantees one
 impl, and `duplicate_runtime_callbacks` reports a program that breaks it (the
@@ -41,9 +40,9 @@ always-on definition-id check enforces that), so building the table needs no
 tie-break.
 ---
 record CoreRuntimeCallbackTable {
-	stringable_to_string: Dict[String, String],
-	hashable_hash: Dict[String, String],
-	equatable_equals: Dict[String, String]
+	stringable_to_string: Dict[String, Int],
+	hashable_hash: Dict[String, Int],
+	equatable_equals: Dict[String, Int]
 }
 
 
@@ -53,7 +52,8 @@ One function implementing a callback role on a target type.
 private record RuntimeCallbackEntry {
 	role: CoreRuntimeCallbackRole,
 	type_key: String,
-	function_name: String
+	function_name: String,
+	def_id: Int
 }
 
 
@@ -82,7 +82,8 @@ private pure func runtime_callback_entries(program: CoreProgram) -> List[Runtime
 								entries = entries.append({
 									role = role,
 									type_key = type_key,
-									function_name = function.name
+									function_name = function.name,
+									def_id = function.def_id
 								})
 							None:
 								void
@@ -97,7 +98,7 @@ private pure func runtime_callback_entries(program: CoreProgram) -> List[Runtime
 private pure func role_table(
 	table: CoreRuntimeCallbackTable,
 	role: CoreRuntimeCallbackRole,
-) -> Dict[String, String]:
+) -> Dict[String, Int]:
 	match role:
 		StringableToStringCallback:
 			table.stringable_to_string
@@ -112,18 +113,18 @@ Indexes every top-level function whose origin is a callback-role impl method.
 Run once per program; lookups never scan the function list.
 ---
 pure func build_runtime_callback_table(program: CoreProgram) -> CoreRuntimeCallbackTable:
-	var stringable_to_string: Dict[String, String] = {}
-	var hashable_hash: Dict[String, String] = {}
-	var equatable_equals: Dict[String, String] = {}
+	var stringable_to_string: Dict[String, Int] = {}
+	var hashable_hash: Dict[String, Int] = {}
+	var equatable_equals: Dict[String, Int] = {}
 
 	for entry in runtime_callback_entries(program):
 		match entry.role:
 			StringableToStringCallback:
-				stringable_to_string = stringable_to_string.set(entry.type_key, entry.function_name)
+				stringable_to_string = stringable_to_string.set(entry.type_key, entry.def_id)
 			HashableHashCallback:
-				hashable_hash = hashable_hash.set(entry.type_key, entry.function_name)
+				hashable_hash = hashable_hash.set(entry.type_key, entry.def_id)
 			EquatableEqualsCallback:
-				equatable_equals = equatable_equals.set(entry.type_key, entry.function_name)
+				equatable_equals = equatable_equals.set(entry.type_key, entry.def_id)
 
 	{
 		stringable_to_string = stringable_to_string,
@@ -137,51 +138,48 @@ Every (role, target type) implemented by more than one function. Empty for any
 coherent program.
 ---
 pure func duplicate_runtime_callbacks(program: CoreProgram) -> List[CoreDuplicateRuntimeCallback]:
-	var seen: CoreRuntimeCallbackTable = {
-		stringable_to_string = {},
-		hashable_hash = {},
-		equatable_equals = {}
-	}
+	var stringable_names: Dict[String, String] = {}
+	var hashable_names: Dict[String, String] = {}
+	var equatable_names: Dict[String, String] = {}
 	var duplicates: List[CoreDuplicateRuntimeCallback] = []
 
 	for entry in runtime_callback_entries(program):
-		match role_table(seen, entry.role).get(entry.type_key):
-			Some(first_name):
+		first_name: Option[String] = match entry.role:
+			StringableToStringCallback:
+				stringable_names.get(entry.type_key)
+			HashableHashCallback:
+				hashable_names.get(entry.type_key)
+			EquatableEqualsCallback:
+				equatable_names.get(entry.type_key)
+
+		match first_name:
+			Some(first):
 				duplicates = duplicates.append({
 					role = entry.role,
 					type_key = entry.type_key,
-					first = first_name,
+					first = first,
 					second = entry.function_name
 				})
 			None:
 				match entry.role:
 					StringableToStringCallback:
-						seen = { seen |
-							stringable_to_string = seen.stringable_to_string.set(
-								entry.type_key,
-								entry.function_name,
-							)
-						}
+						stringable_names = stringable_names.set(entry.type_key, entry.function_name)
 					HashableHashCallback:
-						seen = { seen |
-							hashable_hash = seen.hashable_hash.set(entry.type_key, entry.function_name)
-						}
+						hashable_names = hashable_names.set(entry.type_key, entry.function_name)
 					EquatableEqualsCallback:
-						seen = { seen |
-							equatable_equals = seen.equatable_equals.set(entry.type_key, entry.function_name)
-						}
+						equatable_names = equatable_names.set(entry.type_key, entry.function_name)
 
 	duplicates
 
 
 ---
-The function implementing `role` on `target`, if the program has one.
+The definition id of the function implementing `role` on `target`, if the program has one.
 ---
 pure func find_runtime_callback(
 	table: CoreRuntimeCallbackTable,
 	role: CoreRuntimeCallbackRole,
 	target: CoreType,
-) -> Option[String]:
+) -> Option[Int]:
 	type_key ?= core_trait_impl_type_key(target)
 
 	role_table(table, role).get(type_key)

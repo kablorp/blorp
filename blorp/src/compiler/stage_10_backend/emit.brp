@@ -548,7 +548,6 @@ import:
 		emitted_variant_constructor,
 		emitted_variant_reuse_helper,
 		emitted_variant_tag,
-		emitted_callback_name,
 		prepare_c_emission_symbols,
 		symbol_projection_error_text,
 	canonical_empty_list: CanonicalEmptyList, canonical_empty_list_for_construct
@@ -1112,27 +1111,6 @@ private pure func selected_static_string_literals(
 ) -> Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError]:
 	c_emission_static_string_literals(authority)
 
-private pure func selected_callback_name(
-	authority: CEmissionSymbolAuthority,
-	original_name: String,
-) -> String:
-	emitted_callback_name(authority, original_name)
-
-private pure func selected_hash_container_constructor(
-	authority: CEmissionSymbolAuthority,
-	constructor: CoreHashContainerConstructor,
-) -> CoreHashContainerConstructor:
-	match constructor:
-		CustomHashContainerConstructor(hash_name, equals_name, needs_release):
-			CustomHashContainerConstructor(
-				selected_callback_name(authority, hash_name),
-				selected_callback_name(authority, equals_name),
-				needs_release,
-			)
-		_:
-			constructor
-
-
 private ENUM_VECTOR_TO_STRING_PREFIX: String = "blorp_vector_to_string_"
 
 
@@ -1168,10 +1146,6 @@ private pure func selected_call_kind(
 	match kind:
 		BuiltinCall(name):
 			BuiltinCall(selected_builtin_call_name(authority, name))
-		ListToStringCall(callback_name):
-			ListToStringCall(selected_callback_name(authority, callback_name))
-		DictWithCapacityCall(constructor):
-			DictWithCapacityCall(selected_hash_container_constructor(authority, constructor))
 		DirectRuntimeCall(call):
 			-- `builtin_contract`'s `blorp_vector_to_string_` prefix match
 			-- (see ownership.brp) promotes the enum-vector-to-string builtin
@@ -7107,12 +7081,12 @@ private pure func emit_call_value_from_args(
 				)
 		ForeignCall(name, arg_passing):
 			None
-		ListToStringCall(callback_name):
+		ListToStringCall(callback_def_id):
 			match args:
 				[list_value]:
 					Some(
 						"blorp_list_to_string_cb(" + list_value + ", (blorp_String* (*)(void*))" + c_identifier(
-							callback_name,
+							emitted_callable_name(emission_context.symbol_authority, callback_def_id),
 						) + ")",
 					)
 				[]:
@@ -7122,7 +7096,7 @@ private pure func emit_call_value_from_args(
 		TensorParallelCall(name, layout):
 			emit_tensor_parallel_runtime_call(name, layout, args, typ, type_symbol_lookup)
 		DictWithCapacityCall(constructor):
-			emit_dict_with_capacity_call(constructor, args, typ)
+			emit_dict_with_capacity_call(emission_context.symbol_authority, constructor, args, typ)
 		DirectRuntimeCall(call):
 			match emit_release_aware_direct_dict_constructor_call(call, args, typ, type_symbol_lookup):
 				Some(rendered):
@@ -9909,14 +9883,21 @@ private pure func hash_container_release_arg(needs_release: Bool) -> ElemRelease
 		NoElemRelease
 
 
-private pure func custom_ctor_args(hash_fn: String, equals_fn: String) -> CustomCtorArgs:
+private pure func custom_ctor_args(
+	authority: CEmissionSymbolAuthority,
+	hash_def_id: Int,
+	equals_def_id: Int,
+) -> CustomCtorArgs:
 	{
-		hash_fn = hash_fn,
-		equals_fn = equals_fn
+		hash_fn = emitted_callable_name(authority, hash_def_id),
+		equals_fn = emitted_callable_name(authority, equals_def_id)
 	}
 
 
-private pure func emit_dict_constructor(constructor: CoreHashContainerConstructor) -> String:
+private pure func emit_dict_constructor(
+	authority: CEmissionSymbolAuthority,
+	constructor: CoreHashContainerConstructor,
+) -> String:
 	match constructor:
 		GenericHashContainerConstructor:
 			render_prepared_backend_op(BackendDictCtorGeneric)
@@ -9924,10 +9905,10 @@ private pure func emit_dict_constructor(constructor: CoreHashContainerConstructo
 			render_prepared_backend_op(BackendDictCtorString)
 		FloatHashContainerConstructor:
 			render_prepared_backend_op(BackendDictCtorFloat)
-		CustomHashContainerConstructor(hash_fn, equals_fn, elem_needs_release):
+		CustomHashContainerConstructor(hash_def_id, equals_def_id, elem_needs_release):
 			render_prepared_backend_op(
 				BackendDictCtorCustom(
-					custom_ctor_args(hash_fn, equals_fn),
+					custom_ctor_args(authority, hash_def_id, equals_def_id),
 					hash_container_release_arg(elem_needs_release),
 				),
 			)
@@ -9951,18 +9932,20 @@ private pure func emit_dict_construct_result(ctor_c: String, typ: CoreType) -> S
 
 
 private pure func capacity_custom_ctor_args(
+	authority: CEmissionSymbolAuthority,
 	capacity: String,
-	hash_fn: String,
-	equals_fn: String,
+	hash_def_id: Int,
+	equals_def_id: Int,
 ) -> CapacityCustomCtorArgs:
 	{
 		capacity = capacity,
-		hash_fn = hash_fn,
-		equals_fn = equals_fn
+		hash_fn = emitted_callable_name(authority, hash_def_id),
+		equals_fn = emitted_callable_name(authority, equals_def_id)
 	}
 
 
 private pure func emit_dict_with_capacity_constructor(
+	authority: CEmissionSymbolAuthority,
 	constructor: CoreHashContainerConstructor,
 	capacity: String,
 ) -> String:
@@ -9973,16 +9956,17 @@ private pure func emit_dict_with_capacity_constructor(
 			render_prepared_backend_op(BackendDictWithCapacityString(capacity))
 		FloatHashContainerConstructor:
 			render_prepared_backend_op(BackendDictWithCapacityFloat(capacity))
-		CustomHashContainerConstructor(hash_fn, equals_fn, elem_needs_release):
+		CustomHashContainerConstructor(hash_def_id, equals_def_id, elem_needs_release):
 			render_prepared_backend_op(
 				BackendDictWithCapacityCustom(
-					capacity_custom_ctor_args(capacity, hash_fn, equals_fn),
+					capacity_custom_ctor_args(authority, capacity, hash_def_id, equals_def_id),
 					hash_container_release_arg(elem_needs_release),
 				),
 			)
 
 
 private pure func emit_dict_with_capacity_call(
+	authority: CEmissionSymbolAuthority,
 	constructor: CoreHashContainerConstructor,
 	args: List[String],
 	typ: CoreType,
@@ -9991,7 +9975,7 @@ private pure func emit_dict_with_capacity_call(
 		[capacity]:
 			Some(
 				emit_dict_construct_result(
-					emit_dict_with_capacity_constructor(constructor, capacity),
+					emit_dict_with_capacity_constructor(authority, constructor, capacity),
 					typ,
 				),
 			)
@@ -10001,7 +9985,10 @@ private pure func emit_dict_with_capacity_call(
 			None
 
 
-private pure func emit_set_constructor(constructor: CoreHashContainerConstructor) -> String:
+private pure func emit_set_constructor(
+	authority: CEmissionSymbolAuthority,
+	constructor: CoreHashContainerConstructor,
+) -> String:
 	match constructor:
 		GenericHashContainerConstructor:
 			render_prepared_backend_op(BackendSetCtorGeneric)
@@ -10009,10 +9996,10 @@ private pure func emit_set_constructor(constructor: CoreHashContainerConstructor
 			render_prepared_backend_op(BackendSetCtorString)
 		FloatHashContainerConstructor:
 			render_prepared_backend_op(BackendSetCtorFloat)
-		CustomHashContainerConstructor(hash_fn, equals_fn, elem_needs_release):
+		CustomHashContainerConstructor(hash_def_id, equals_def_id, elem_needs_release):
 			render_prepared_backend_op(
 				BackendSetCtorCustom(
-					custom_ctor_args(hash_fn, equals_fn),
+					custom_ctor_args(authority, hash_def_id, equals_def_id),
 					hash_container_release_arg(elem_needs_release),
 				),
 			)
@@ -10071,7 +10058,7 @@ private pure func emit_dict_construct(
 	construct: CoreDictConstruct,
 	emission_context: FunctionEmissionContext,
 ) -> Option[String]:
-	ctor_c: String = emit_dict_constructor(construct.constructor)
+	ctor_c: String = emit_dict_constructor(emission_context.symbol_authority, construct.constructor)
 
 	if construct.entries.length() == 0 and not construct.value_needs_release:
 		Some(render_prepared_backend_op(BackendDictConstructEmpty(ctor_c)))
@@ -14430,26 +14417,11 @@ private pure func emit_simple_expr_leaf(
 			body_c ?= emit_simple_expr(body, emission_context)
 			Some(statement_expr(decl + ";", body_c))
 		DictConstructExpr(construct, typ, loc):
-			emit_dict_construct(
-				{ construct |
-					constructor = selected_hash_container_constructor(
-						emission_context.symbol_authority,
-						construct.constructor,
-					)
-				},
-				emission_context,
-			)
+			emit_dict_construct(construct, emission_context)
 		DictExpr(entries, typ, loc):
 			None
 		SetAllocExpr(alloc, typ, loc):
-			Some(
-				emit_set_constructor(
-					selected_hash_container_constructor(
-						emission_context.symbol_authority,
-						alloc,
-					),
-				),
-			)
+			Some(emit_set_constructor(emission_context.symbol_authority, alloc))
 		ListRetainExpr(retain, typ, loc):
 			emit_list_retain(retain, emission_context)
 		ListSetExpr(set, typ, loc):

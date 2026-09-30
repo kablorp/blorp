@@ -144,16 +144,13 @@ enum CProjectedCallableKind:
 
 
 ---
-`original_c_spelling` is the C name a callable had before projection. A closure
-body never had one (it is only ever named from its definition id), so it is
-`None` and the body is neither reachable through `by_original_c_spelling` nor
-checked for a duplicate C name; its identity check is the definition id.
+A callable is identified by its definition id; `qualified_name` is only for the
+diagnostics that name it.
 ---
 record CCallableSymbolCandidate {
 	kind: CProjectedCallableKind,
 	qualified_name: String,
-	def_id: Int,
-	original_c_spelling: Option[String]
+	def_id: Int
 }
 
 
@@ -161,20 +158,17 @@ record CCallableSymbol {
 	kind: CProjectedCallableKind,
 	qualified_name: String,
 	def_id: Int,
-	original_c_spelling: Option[String],
 	projected_name: String
 }
 
 
 record CCallableSymbolPlan {
-	by_definition_id: Dict[Int, CCallableSymbol],
-	by_original_c_spelling: Dict[String, CCallableSymbol]
+	by_definition_id: Dict[Int, CCallableSymbol]
 }
 
 
 private record CEmissionCallablePlan {
-	by_definition_id: Dict[Int, String],
-	by_original_c_spelling: Dict[String, String]
+	by_definition_id: Dict[Int, String]
 }
 
 
@@ -204,12 +198,11 @@ private record CProgramSymbolInventory {
 union CSymbolProjectionError:
 	DuplicateCallableDefinitionId(Int, String, String)
 	DuplicateCallableIdentity(String, Int)
-	DuplicateCallableCName(String)
 	InvalidCoreDefinitionIdentity(String)
 	InvalidCallableDefinitionId(Int, String)
 	MissingProjectedCallable(String, Int)
 	UnresolvedProjectedCallable(String)
-	UnresolvedCallbackTarget(String)
+	UnresolvedCallbackDefinition(Int)
 	MissingProjectedHoistedCallable(Int)
 	VariantWithoutDefinitionId(String, String)
 	UnsupportedPreparedCallKind(String)
@@ -337,12 +330,10 @@ private pure func callable_symbol(
 	candidate: CCallableSymbolCandidate,
 	preserved: Dict[String, Bool],
 ) -> CCallableSymbol:
-	original_c_spelling: Option[String] = candidate.original_c_spelling.map(c_identifier)
 	{
 		kind = candidate.kind,
 		qualified_name = candidate.qualified_name,
 		def_id = candidate.def_id,
-		original_c_spelling = original_c_spelling,
 		projected_name = available_projected_callable_name(
 			candidate.def_id,
 			candidate.kind,
@@ -356,7 +347,6 @@ pure func build_callable_symbol_plan(
 	preserved_names: List[String],
 ) -> Result[CCallableSymbolPlan, CSymbolProjectionError]:
 	var by_definition_id: Dict[Int, CCallableSymbol] = {}
-	var by_original: Dict[String, CCallableSymbol] = {}
 	var plan_error: Option[CSymbolProjectionError] = None
 	preserved: Dict[String, Bool] = preserved_symbol_index(preserved_names)
 
@@ -389,7 +379,6 @@ pure func build_callable_symbol_plan(
 						else if (
 							existing.kind != symbol.kind
 							or existing.def_id != symbol.def_id
-							or existing.original_c_spelling != symbol.original_c_spelling
 							or existing.projected_name != symbol.projected_name
 						):
 							plan_error = Some(
@@ -401,22 +390,6 @@ pure func build_callable_symbol_plan(
 						else:
 							void
 					None:
-						match symbol.original_c_spelling:
-							Some(original):
-								match by_original.get(original):
-									Some(existing):
-										if (
-											existing.qualified_name != symbol.qualified_name
-											or existing.def_id != symbol.def_id
-										):
-											plan_error = Some(DuplicateCallableCName(original))
-										else:
-											void
-									None:
-										by_original = by_original.set(original, symbol)
-							None:
-								void
-
 						by_definition_id = by_definition_id.set(candidate.def_id, symbol)
 		else:
 			void
@@ -425,10 +398,7 @@ pure func build_callable_symbol_plan(
 		Some(error):
 			Err(error)
 		None:
-			Ok({
-				by_definition_id = by_definition_id,
-				by_original_c_spelling = by_original,
-			})
+			Ok({ by_definition_id = by_definition_id })
 
 
 ---
@@ -441,7 +411,6 @@ private pure func build_emission_callable_plan(
 	preserved_names: List[String],
 ) -> CEmissionCallablePlan:
 	var by_definition_id: Dict[Int, String] = {}
-	var by_original: Dict[String, String] = {}
 	preserved: Dict[String, Bool] = preserved_symbol_index(preserved_names)
 
 	for candidate in candidates:
@@ -452,16 +421,7 @@ private pure func build_emission_callable_plan(
 		)
 		by_definition_id = by_definition_id.set(candidate.def_id, projected_name)
 
-		match candidate.original_c_spelling:
-			Some(original):
-				by_original = by_original.set(c_identifier(original), projected_name)
-			None:
-				void
-
-	{
-		by_definition_id = by_definition_id,
-		by_original_c_spelling = by_original,
-	}
+	{ by_definition_id = by_definition_id }
 
 
 pure func projected_callable_name(
@@ -487,15 +447,6 @@ private pure func planned_callable(
 			None
 
 
-private pure func projected_callback_name(
-	by_original_c_spelling: Dict[String, CCallableSymbol],
-	original_name: String,
-) -> Option[String]:
-	by_original_c_spelling
-		.get(c_identifier(original_name))
-		.map(func(symbol): symbol.projected_name)
-
-
 private pure func c_emission_callable_plan(plan: CEmissionSymbolPlan) -> CEmissionCallablePlan:
 	representation: CEmissionSymbolPlanRep = from_opaque CEmissionSymbolPlan(plan)
 	representation.callables
@@ -508,24 +459,11 @@ pure func planned_emitted_callable_name(
 	c_emission_callable_plan(plan).by_definition_id.get(def_id)
 
 
-pure func planned_emitted_callback_name(
-	plan: CEmissionSymbolPlan,
-	original_name: String,
-) -> Option[String]:
-	c_emission_callable_plan(plan)
-		.by_original_c_spelling
-		.get(c_identifier(original_name))
-
-
 pure func emitted_callable_name(
 	plan: CEmissionSymbolPlan,
 	def_id: Int,
 ) -> String:
 	planned_emitted_callable_name(plan, def_id).get_or(INVALID_PROJECTED_CALLABLE_NAME)
-
-
-pure func emitted_callback_name(plan: CEmissionSymbolPlan, original_name: String) -> String:
-	planned_emitted_callback_name(plan, original_name).get_or(INVALID_PROJECTED_CALLABLE_NAME)
 
 
 ---
@@ -614,14 +552,12 @@ private pure func callable_candidate(
 					kind = ProjectedUserFunction,
 					qualified_name = function_info.name,
 					def_id = function_info.def_id,
-					original_c_spelling = Some(function_info.name),
 				})
 			ClosureBodyFunction(abi):
 				Some({
 					kind = ProjectedClosureBody,
 					qualified_name = function_info.name,
 					def_id = function_info.def_id,
-					original_c_spelling = None,
 				})
 			_:
 				None
@@ -972,14 +908,19 @@ private pure func missing_structured_callable(
 			Some(UnresolvedProjectedCallable(name))
 
 
-private pure func unresolved_callback(
+---
+A runtime callback is named only by its definition id; a miss means the pass
+that chose it (`backend_projection`) or a later one dropped or renumbered the
+function.
+---
+private pure func unresolved_callback_definition(
 	plan: CCallableSymbolPlan,
-	name: String,
+	def_id: Int,
 ) -> Option[CSymbolProjectionError]:
-	if projected_callback_name(plan.by_original_c_spelling, name).is_some():
+	if plan.by_definition_id.contains(def_id):
 		None
 	else:
-		Some(UnresolvedCallbackTarget(name))
+		Some(UnresolvedCallbackDefinition(def_id))
 
 
 ---
@@ -1010,12 +951,12 @@ private pure func constructor_projection_error(
 	constructor: CoreHashContainerConstructor,
 ) -> Option[CSymbolProjectionError]:
 	match constructor:
-		CustomHashContainerConstructor(hash_name, equals_name, _):
-			match unresolved_callback(plan, hash_name):
+		CustomHashContainerConstructor(hash_def_id, equals_def_id, _):
+			match unresolved_callback_definition(plan, hash_def_id):
 				Some(error):
 					Some(error)
 				None:
-					unresolved_callback(plan, equals_name)
+					unresolved_callback_definition(plan, equals_def_id)
 		_:
 			None
 
@@ -1035,8 +976,8 @@ private pure func expr_projection_error(
 			Some(UnsupportedPreparedCallKind("selected_trait"))
 		CallExpr(UserCall(name, def_id, _), _, _, _, _):
 			missing_structured_callable(plan, name, def_id)
-		CallExpr(ListToStringCall(callback_name), _, _, _, _):
-			unresolved_callback(plan, callback_name)
+		CallExpr(ListToStringCall(callback_def_id), _, _, _, _):
+			unresolved_callback_definition(plan, callback_def_id)
 		CallExpr(DictWithCapacityCall(constructor), _, _, _, _):
 			constructor_projection_error(plan, constructor)
 		DictConstructExpr(construct, _, _):
@@ -1405,8 +1346,6 @@ pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
 			"callable definition ID ${def_id} is owned by both `${first}` and `${second}`"
 		DuplicateCallableIdentity(name, def_id):
 			"duplicate callable identity `${name}` (${def_id}) has inconsistent C metadata"
-		DuplicateCallableCName(name):
-			"multiple callable identities emit the C name `${name}`"
 		InvalidCoreDefinitionIdentity(detail):
 			"invalid final Core definition identity: ${detail}"
 		InvalidCallableDefinitionId(def_id, name):
@@ -1415,8 +1354,8 @@ pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
 			"missing projected callable `${name}` (${def_id})"
 		UnresolvedProjectedCallable(name):
 			"callable `${name}` has no resolved definition id at final C projection"
-		UnresolvedCallbackTarget(name):
-			"callback `${name}` does not resolve to a projected callable"
+		UnresolvedCallbackDefinition(def_id):
+			"callback definition ${def_id} does not resolve to a projected callable"
 		VariantWithoutDefinitionId(type_name, variant_name):
 			"variant `${variant_name}` of `${type_name}` has no definition id at final C projection"
 		MissingProjectedHoistedCallable(def_id):
