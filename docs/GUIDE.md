@@ -206,7 +206,9 @@ func main(args: List[String]) -> Int:
 
 Compile-time evaluation follows source order, so later constants can reference
 earlier evaluated constants. A constant may not reference itself or a later
-constant. Top-level `var` bindings are mutable runtime globals, not constants.
+constant. A constant may also be initialized from another module's constant,
+including structs, records, enums, unions and lists whose types that module
+owns. Top-level `var` bindings are mutable runtime globals, not constants.
 Local `var` mutation is allowed inside pure functions evaluated by the
 compiler.
 

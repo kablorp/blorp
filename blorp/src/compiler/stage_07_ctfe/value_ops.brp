@@ -2,7 +2,10 @@
 -- std intrinsic evaluation.
 import:
 	../../lib/source: SourceLocation
-	../stage_06_typecheck/type_system/semantic_type: SemanticType
+	../stage_06_typecheck/type_system/semantic_type:
+		SemanticType,
+		qualify_module_local_type_name,
+		qualify_module_local_types,
 	value:
 		CtfeError(CtfeUnsupported),
 		CtfeValue,
@@ -10,9 +13,15 @@ import:
 			CtfeBoolValue,
 			CtfeCharValue,
 			CtfeConstructorValue,
+			CtfeDictValue,
 			CtfeFloatValue,
 			CtfeIntValue,
+			CtfeListValue,
+			CtfeRangeValue,
+			CtfeRecordValue,
 			CtfeStringValue,
+			CtfeTupleValue,
+			CtfeVectorValue,
 		),
 		ctfe_constructor_info,
 		ctfe_int_value_text,
@@ -153,3 +162,69 @@ pure func ctfe_string_text_of_value(value: CtfeValue) -> Result[String, CtfeErro
 			Ok(char.to_string())
 		_:
 			Err(CtfeUnsupported("String interpolation for " + ctfe_value_kind(value) + " values"))
+
+
+---
+Re-spells every type a value carries, at any depth, from the owning module's
+local names (`Extent`) to the canonical names (`module::Extent`) every other
+module uses. A module evaluates its own globals and function bodies with local
+spellings; a value crossing a module boundary, either as an imported global or
+as the result of an imported function call, must use the reader's spelling, or
+a later phase cannot find the type or constructor the folded initializer names.
+Function references and lambdas keep their payloads: they close over the
+defining module's own context and are never materialized into another
+module's initializer.
+---
+pure func ctfe_value_qualify_module_local_types(
+	module_path: String,
+	local_type_names: List[String],
+	value: CtfeValue,
+) -> CtfeValue:
+	typ = qualify_module_local_types(module_path, local_type_names, value.typ)
+
+	desc = match value.desc:
+		CtfeTupleValue(items):
+			CtfeTupleValue(ctfe_values_qualify_module_local_types(module_path, local_type_names, items))
+		CtfeListValue(items):
+			CtfeListValue(ctfe_values_qualify_module_local_types(module_path, local_type_names, items))
+		CtfeVectorValue(items):
+			CtfeVectorValue(ctfe_values_qualify_module_local_types(module_path, local_type_names, items))
+		CtfeDictValue(entries):
+			CtfeDictValue(entries.map(func(entry): (
+				ctfe_value_qualify_module_local_types(module_path, local_type_names, entry[0]),
+				ctfe_value_qualify_module_local_types(module_path, local_type_names, entry[1]),
+			)))
+		CtfeRecordValue(fields):
+			CtfeRecordValue(fields.map(func(field): (
+				field[0],
+				ctfe_value_qualify_module_local_types(module_path, local_type_names, field[1]),
+				field[2],
+			)))
+		CtfeRangeValue(start_value, end_value):
+			CtfeRangeValue(
+				ctfe_value_qualify_module_local_types(module_path, local_type_names, start_value),
+				ctfe_value_qualify_module_local_types(module_path, local_type_names, end_value),
+			)
+		CtfeConstructorValue(payload):
+			CtfeConstructorValue({ payload |
+				args = ctfe_values_qualify_module_local_types(module_path, local_type_names, payload.args),
+				constructor_info = { payload.constructor_info |
+					parent_type = qualify_module_local_type_name(
+						module_path,
+						local_type_names,
+						payload.constructor_info.parent_type,
+					)
+				}
+			})
+		_:
+			value.desc
+
+	{ value | typ = typ, desc = desc }
+
+
+private pure func ctfe_values_qualify_module_local_types(
+	module_path: String,
+	local_type_names: List[String],
+	values: List[CtfeValue],
+) -> List[CtfeValue]:
+	values.map(func(item): ctfe_value_qualify_module_local_types(module_path, local_type_names, item))
