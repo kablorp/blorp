@@ -18,7 +18,7 @@ EXPECTED_FULL_FIELD_SITES = {
     "stage_08_core_lower/lower.brp": 2,
     "stage_09_core/clone.brp": 1,
     "stage_09_core/closure.brp": 2,
-    "stage_09_core/consume_specialize.brp": 2,
+    "stage_09_core/consume_specialize.brp": 1,
     "stage_09_core/ir.brp": 1,
     "stage_09_core/match_projection.brp": 2,
     "stage_09_core/mono_option.brp": 1,
@@ -37,7 +37,7 @@ EXPECTED_FULL_FIELD_SITES = {
     "stage_09_core/trait_resolve.brp": 2,
     "stage_09_core/tuple_sroa.brp": 1,
 }
-EXPECTED_FULL_FIELD_SITE_TOTAL = 41
+EXPECTED_FULL_FIELD_SITE_TOTAL = 40
 
 
 def format_sites(sites: dict) -> str:
