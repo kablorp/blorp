@@ -2,12 +2,11 @@
 -- each supported chain to one runtime parallel call. Unsupported shapes remain
 -- unchanged so the synthesized std wrapper stays the correctness fallback.
 import:
-	../stage_08_core_lower/identity: core_module_member_prefix
 	ir:
 		CoreCallKind(BuiltinCall, ClosureCall, UserCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreExpr(CallExpr, LambdaExpr, LetExpr, VarExpr, VoidExpr),
-		CoreCopyDeclarationNames,
+		CoreDeclarationIndex,
 		CoreFunction,
 		CoreParam,
 		CoreProgram,
@@ -18,11 +17,20 @@ import:
 		CoreBinderOrigin(PassTemporary),
 		PassTempKind(PipelineTemp),
 		CoreVar,
-		core_declaration_name,
 		core_expr_type,
 		core_var_equal,
 	mono: core_mono_type_equal
-	synth_name: synthesis_source_name_with_prefix
+	known_functions:
+		CoreKnownFunction(
+			MatrixParallel,
+			ParallelMatrixMap,
+			ParallelMatrixMapIndexed,
+			ParallelMatrixZipMap,
+			ParallelVectorMap,
+			ParallelVectorMapIndexed,
+			ParallelVectorZipMap,
+			VectorParallel,
+		),
 	synth_nodes: intrinsic_call_at as intrinsic_call
 	traverse: map_core_expr_children
 
@@ -34,17 +42,6 @@ private INT_TYPE: CoreType = NamedType("Int", [])
 private INDEX_TYPE: CoreType = RangeType
 
 private COMPILER_LOCAL_PREFIX: String = "$blorp$parallel_tensor$"
-
-
-private enum CoreParallelStdCallKind:
-	VectorParallelCall
-	ParallelVectorMapCall
-	ParallelVectorMapIndexedCall
-	ParallelVectorZipMapCall
-	MatrixParallelCall
-	ParallelMatrixMapCall
-	ParallelMatrixMapIndexedCall
-	ParallelMatrixZipMapCall
 
 
 private union CoreParallelPipelineStageKind:
@@ -61,7 +58,7 @@ private record CoreParallelPipelineStage {
 
 private struct CoreParallelStdCall {
 	def_id: Int,
-	kind: CoreParallelStdCallKind
+	kind: CoreKnownFunction
 }
 
 
@@ -175,68 +172,34 @@ private pure func matrix_shape(typ: CoreType) -> Option[CoreMatrixShape]:
 			None
 
 
-private pure func classify_std_function(
-	module_prefix: String,
-	names: CoreCopyDeclarationNames,
-	function_info: CoreFunction,
-) -> Option[CoreParallelStdCallKind]:
-	module_name ?= function_info.source_module
-	source_name ?= synthesis_source_name_with_prefix(
-		module_prefix,
-		core_declaration_name(names, function_info),
-	)
-
-	match (module_name, source_name):
-		("vector", "parallel"):
-			Some(VectorParallelCall)
-		("parallel_vector", "map"):
-			Some(ParallelVectorMapCall)
-		("parallel_vector", "map_indexed"):
-			Some(ParallelVectorMapIndexedCall)
-		("parallel_vector", "zip_map"):
-			Some(ParallelVectorZipMapCall)
-		("matrix", "parallel"):
-			Some(MatrixParallelCall)
-		("parallel_matrix", "map"):
-			Some(ParallelMatrixMapCall)
-		("parallel_matrix", "map_indexed"):
-			Some(ParallelMatrixMapIndexedCall)
-		("parallel_matrix", "zip_map"):
-			Some(ParallelMatrixZipMapCall)
+---
+Whether `function` is one of the ParallelVector / ParallelMatrix entry points or
+combinators this pass rewrites.
+---
+private pure func is_parallel_std_function(function: CoreKnownFunction) -> Bool:
+	match function:
+		VectorParallel | ParallelVectorMap | ParallelVectorMapIndexed | ParallelVectorZipMap | MatrixParallel | ParallelMatrixMap | ParallelMatrixMapIndexed | ParallelMatrixZipMap:
+			True
 		_:
-			None
+			False
 
 
 private pure func collect_std_calls(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 ) -> List[CoreParallelStdCall]:
 	var calls: List[CoreParallelStdCall] = []
-	-- Sanitize each source module once; every function of that module then
-	-- classifies through the precomputed prefix.
-	var module_prefixes: Dict[String, String] = {}
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				match function_info.source_module:
-					Some(module_name):
-						module_prefix: String = match module_prefixes.get(module_name):
-							Some(existing):
-								existing
-							None:
-								core_module_member_prefix(module_name)
-
-						module_prefixes = module_prefixes.set(module_name, module_prefix)
-
-						match classify_std_function(module_prefix, names, function_info):
-							Some(kind):
-								calls = calls.append({
-									def_id = function_info.def_id,
-									kind = kind,
-								})
-							None:
-								void
+				match declarations.known_functions.get(function_info.def_id):
+					Some(function):
+						if is_parallel_std_function(function):
+							calls = calls.append({
+								def_id = function_info.def_id,
+								kind = function,
+							})
 					None:
 						void
 			_:
@@ -248,8 +211,8 @@ private pure func collect_std_calls(
 private pure func std_call_kind(
 	calls: List[CoreParallelStdCall],
 	def_id: Int,
-) -> Option[CoreParallelStdCallKind]:
-	var found: Option[CoreParallelStdCallKind] = None
+) -> Option[CoreKnownFunction]:
+	var found: Option[CoreKnownFunction] = None
 
 	for call in calls:
 		if call.def_id == def_id:
@@ -262,7 +225,7 @@ private pure func std_call_kind(
 private pure func parallel_entrypoint_kind(
 	calls: List[CoreParallelStdCall],
 	call_kind: CoreCallKind,
-) -> Option[CoreParallelStdCallKind]:
+) -> Option[CoreKnownFunction]:
 	match call_kind:
 		UserCall(_, Some(def_id), _):
 			std_call_kind(calls, def_id)
@@ -292,7 +255,7 @@ private pure func vector_stages(
 				other_shape ?= vector_shape(core_expr_type(other))
 
 				match std_call_kind(calls, def_id):
-					Some(ParallelVectorZipMapCall):
+					Some(ParallelVectorZipMap):
 						if (
 							not tensor_dims_equal(dim, output.dim)
 							or not tensor_dims_equal(dim, other_shape.dim)
@@ -320,12 +283,12 @@ private pure func vector_stages(
 						None
 					else:
 						match std_call_kind(calls, def_id):
-							Some(ParallelVectorMapCall):
+							Some(ParallelVectorMap):
 								Some(input_stages.append({
 									kind = ParallelMapStage(callback),
 									output_type = output.element_type,
 								}))
-							Some(ParallelVectorMapIndexedCall):
+							Some(ParallelVectorMapIndexed):
 								Some(input_stages.append({
 									kind = ParallelMapIndexedStage(callback),
 									output_type = output.element_type,
@@ -361,7 +324,7 @@ private pure func matrix_stages(
 				other_shape ?= matrix_shape(core_expr_type(other))
 
 				match std_call_kind(calls, def_id):
-					Some(ParallelMatrixZipMapCall):
+					Some(ParallelMatrixZipMap):
 						if (
 							not tensor_dims_equal(rows, output.rows)
 							or not tensor_dims_equal(cols, output.cols)
@@ -394,12 +357,12 @@ private pure func matrix_stages(
 						None
 					else:
 						match std_call_kind(calls, def_id):
-							Some(ParallelMatrixMapCall):
+							Some(ParallelMatrixMap):
 								Some(input_stages.append({
 									kind = ParallelMapStage(callback),
 									output_type = output.element_type,
 								}))
-							Some(ParallelMatrixMapIndexedCall):
+							Some(ParallelMatrixMapIndexed):
 								Some(input_stages.append({
 									kind = ParallelMapIndexedStage(callback),
 									output_type = output.element_type,
@@ -1140,13 +1103,13 @@ private pure func rewrite_parallel_tensor_expr(
 		CallExpr(call_kind, callee, args, result_type, loc):
 			match parallel_call_args(args):
 				Some(call_args):
-					entrypoint: Option[CoreParallelStdCallKind] = parallel_entrypoint_kind(
+					entrypoint: Option[CoreKnownFunction] = parallel_entrypoint_kind(
 						calls,
 						call_kind,
 					)
 
 					match entrypoint:
-						Some(VectorParallelCall):
+						Some(VectorParallel):
 							rewritten_source: CoreExpr = rewrite_parallel_tensor_expr(
 								calls,
 								call_args.source,
@@ -1172,7 +1135,7 @@ private pure func rewrite_parallel_tensor_expr(
 										result_type,
 										loc,
 									)
-						Some(MatrixParallelCall):
+						Some(MatrixParallel):
 							rewritten_source: CoreExpr = rewrite_parallel_tensor_expr(
 								calls,
 								call_args.source,
@@ -1251,8 +1214,8 @@ private pure func rewrite_parallel_tensor_decl(
 			decl
 
 
-pure func fuse_parallel_tensor_program(names: CoreCopyDeclarationNames, program: CoreProgram) -> CoreProgram:
-	calls: List[CoreParallelStdCall] = collect_std_calls(names, program)
+pure func fuse_parallel_tensor_program(declarations: CoreDeclarationIndex, program: CoreProgram) -> CoreProgram:
+	calls: List[CoreParallelStdCall] = collect_std_calls(declarations, program)
 
 	if calls.is_empty():
 		program

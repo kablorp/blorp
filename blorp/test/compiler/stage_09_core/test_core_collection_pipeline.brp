@@ -1,4 +1,5 @@
 import:
+	../../../src/compiler/stage_02_lex/name_table: SYNTHESIZED_NAME_TABLE
 	../../../src/compiler/stage_09_core/collection_pipeline:
 		collection_collect_policy_for_plan,
 		fuse_collection_expr,
@@ -6,7 +7,7 @@ import:
 		CoreCollectionPipelineSink(CollectionFoldSink),
 		CoreCollectionPipelineSource(CollectionListSource),
 		CoreCollectionPipelineStage(CollectionFilterStage, CollectionMapStage),
-		collection_pipeline_call_base_and_args,
+		collection_pipeline_known_call,
 		collection_pipeline_plan,
 		collection_pipeline_stages,
 		fold_collection_pipeline_stages,
@@ -24,7 +25,7 @@ import:
 		collection_same_type_source_access_policy,
 	../../../src/compiler/stage_09_core/ir:
 		CoreCallKind(ClosureCall, IntrinsicCall, UserCall),
-		CoreCopyDeclarationNames,
+		CoreDeclarationIndex,
 		CoreDecl(FunctionDecl, HeapRecordDecl, TypeAliasDecl),
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction),
@@ -50,13 +51,15 @@ import:
 		CoreTypeAliasDecl,
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
-		core_copy_declaration_names,
+		core_declaration_index,
 		core_expr_type,
 	../../../src/compiler/stage_09_core/function_origin_fixture:
 		FIXTURE_NO_SOURCE_MODULE,
-		FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		fixture_mono_instance_of,
+		fixture_source_function_origin_named,
 		fixture_pure_variant_of,
+	../../../src/compiler/stage_09_core/known_functions:
+		CoreKnownFunction(ListFilter, ListFilterMap, ListFoldLeft, ListLength, ListMap, ListRange)
 	../../../src/compiler/stage_09_core/mono: core_mono_type_equal
 	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
 	test: TestSuite
@@ -84,15 +87,16 @@ LIST_OPTION_INT: CoreType = NamedType("List", [NamedType("Option", [TY_INT])])
 
 LIST_WIDGET: CoreType = NamedType("List", [TY_WIDGET])
 
--- The `list` declarations the fixture calls reach, by declared name, each with
+-- The `list` declarations the fixture calls reach, by member name, each with
 -- the mono instance the call site names. A call's declared name is read through
 -- the instance's origin, so the instance's own spelling can be anything.
 private LIST_FIXTURE_DECLARATIONS: List[(String, String)] = [
-	("list__filter", "list__filter__mono_Value"),
-	("list__map", "list__map__mono_Value_Value"),
-	("list__filter_map", "list__filter_map__mono_Value_Value"),
-	("list__fold_left", "list__fold_left__mono_Value_Value"),
-	("list__length", "list__length__mono_Value"),
+	("filter", "list__filter__mono_Value"),
+	("map", "list__map__mono_Value_Value"),
+	("filter_map", "list__filter_map__mono_Value_Value"),
+	("fold_left", "list__fold_left__mono_Value_Value"),
+	("length", "list__length__mono_Value"),
+	("range", "list__range"),
 ]
 
 private FIXTURE_DECLARATION_ID_BASE: Int = 100
@@ -108,9 +112,9 @@ private FIXTURE_PURE_FILTER_INSTANCE_ID: Int = 301
 private FIXTURE_PURE_FILTER_INSTANCE_NAME: String = "list__filter__pure__mono_Int"
 
 
-private pure func fixture_list_function(name: String, def_id: Int) -> CoreFunction:
+private pure func fixture_list_function(member: String, def_id: Int) -> CoreFunction:
 	{
-		name = name,
+		name = "list__" + member,
 		source_module = Some("list"),
 		module = FIXTURE_NO_SOURCE_MODULE,
 		type_params = [],
@@ -118,7 +122,7 @@ private pure func fixture_list_function(name: String, def_id: Int) -> CoreFuncti
 		return_type = VoidType,
 		body = None,
 		is_pure = True,
-		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		origin = fixture_source_function_origin_named(member),
 		function_kind = UnresolvedBuiltinFunction,
 		def_id = def_id,
 		loc = synthetic_core_source_loc()
@@ -138,7 +142,7 @@ private pure func fixture_list_program() -> CoreProgram:
 			.append(FunctionDecl(fixture_mono_instance_of(declaration, entry[1], instance_id)))
 		index += 1
 
-	filter_declaration: CoreFunction = fixture_list_function("list__filter", FIXTURE_DECLARATION_ID_BASE)
+	filter_declaration: CoreFunction = fixture_list_function("filter", FIXTURE_DECLARATION_ID_BASE)
 	pure_filter: CoreFunction = fixture_pure_variant_of(
 		filter_declaration,
 		"list__filter__pure",
@@ -164,11 +168,15 @@ private pure func fixture_list_program() -> CoreProgram:
 
 -- The fixture program's mono instances and pure variants, by def id.
 pure func collection_pipeline_model(program: CoreProgram) -> CoreCollectionPipelineModel:
-	collection_pipeline_model_with_names(core_copy_declaration_names(program), program)
+	collection_pipeline_model_with_names(fixture_declarations(program), program)
 
 
-private pure func fixture_copy_names() -> CoreCopyDeclarationNames:
-	core_copy_declaration_names(fixture_list_program())
+private pure func fixture_declarations(program: CoreProgram) -> CoreDeclarationIndex:
+	core_declaration_index(SYNTHESIZED_NAME_TABLE, program)
+
+
+private pure func fixture_copy_names() -> CoreDeclarationIndex:
+	fixture_declarations(fixture_list_program())
 
 
 private pure func fixture_callee_def_id(name: String) -> Int:
@@ -337,11 +345,29 @@ private pure func count_expr(
 	count
 
 
-private pure func count_list_call(name: String, expr: CoreExpr) -> Int:
+private pure func known_list_function(member: String) -> Option[CoreKnownFunction]:
+	match member:
+		"range":
+			Some(ListRange)
+		"filter":
+			Some(ListFilter)
+		"filter_map":
+			Some(ListFilterMap)
+		"map":
+			Some(ListMap)
+		"fold_left":
+			Some(ListFoldLeft)
+		"length":
+			Some(ListLength)
+		_:
+			None
+
+
+private pure func count_list_call(member: String, expr: CoreExpr) -> Int:
 	count_expr(expr, pure func(candidate):
-		match collection_pipeline_call_base_and_args(fixture_copy_names(), candidate):
+		match collection_pipeline_known_call(fixture_copy_names(), candidate):
 			Some(call):
-				call.base == name
+				known_list_function(member) == Some(call.function)
 			None:
 				False
 	)
@@ -454,9 +480,9 @@ pure func test_reads_a_pure_mono_instance_through_its_declaration() -> Bool:
 		synthetic_core_source_loc(),
 	)
 
-	match collection_pipeline_call_base_and_args(fixture_copy_names(), call):
+	match collection_pipeline_known_call(fixture_copy_names(), call):
 		Some(recognized):
-			recognized.base == "filter"
+			recognized.function == ListFilter
 		None:
 			False
 
@@ -472,7 +498,7 @@ pure func test_does_not_read_a_mono_marker_from_a_name() -> Bool:
 		synthetic_core_source_loc(),
 	)
 
-	collection_pipeline_call_base_and_args(fixture_copy_names(), call).is_none()
+	collection_pipeline_known_call(fixture_copy_names(), call).is_none()
 
 
 pure func test_lowers_filter_map_fold_without_intermediate_lists() -> Bool:

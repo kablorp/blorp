@@ -45,7 +45,8 @@ import:
 			SemanticMatchFail,
 			SemanticMatchLeaf,
 		),
-		CoreCopyDeclarationNames,
+		CoreDeclarationIndex,
+		core_empty_declaration_index,
 		CoreSourceLoc,
 		CoreBinderOrigin(
 			AuthoredBinder,
@@ -116,17 +117,19 @@ boundary reaches its spelling through it (`name_spelling_or_text`). Plain
 `core_pass_state` starts from `EMPTY_NAME_TABLE`, and
 `core_pass_state_carry_ids` carries `base.names` forward.
 
-`copy_declaration_names` is `core_copy_declaration_names` of the program right
-after mono, computed once and read-only after that: mono instances and pure variants are the only
-copies, and by the time the passes that ask which declaration a copy is of have
-run (resolve, std inlining, the fusion passes) the declaration itself has been
-pruned. Empty until mono records it, so a read before mono is a bug (the origin agreement
-invariant reports a copy missing from the table once it is recorded).
-`core_pass_state_carry_ids` carries it. No pass after mono creates a copy: mono
-creates every `MonoInstance`, and flatten's `PureVariant`s are minted during
-lowering, before `prune_early` and mono. `prune_early` runs before this table is
-built, so a declaration it dropped would leave its variant unlisted; the origin
-agreement invariant reports such a copy (the strict self-compile is clean).
+`declaration_index` is the `core_declaration_index` of the program right after
+mono, computed once and read-only after that. It answers, for the passes that ask
+which source declaration a function is or copies, and which standard-library
+function a callee is, what `CoreFunction.origin` says: mono instances and pure
+variants are the only copies, and by the time the passes that ask (synthesis,
+resolve, std inlining, the fusion passes) have run, the declaration itself may
+have been pruned. Empty until mono records it, so a read before mono is a bug
+(the origin agreement invariant reports a copy missing from it once it is
+recorded). `core_pass_state_carry_ids` carries it. No pass after mono creates a
+copy: mono creates every `MonoInstance`, and flatten's `PureVariant`s are minted
+during lowering, before `prune_early` and mono. `prune_early` runs before this
+index is built, so a declaration it dropped would leave its variant unlisted; the
+origin agreement invariant reports such a copy (the strict self-compile is clean).
 ---
 record CorePassState {
 	program: CoreProgram,
@@ -136,7 +139,7 @@ record CorePassState {
 	ownership_contract_facts: OwnershipContractFacts,
 	next_binder_id: Int,
 	names: NameTable,
-	copy_declaration_names: CoreCopyDeclarationNames
+	declaration_index: CoreDeclarationIndex
 }
 
 
@@ -1083,12 +1086,12 @@ violations that predate `origin`, which would hide this check's result.
 Temporary: deleted in step M3.1 with the name markers it reads.
 ---
 func core_pass_state_origin_name_program_violation(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	pass_name: String,
 	program: CoreProgram,
 	modules: ModuleCheckScope,
 ) -> Option[CorePassDiagnostic]:
-	agreement = origin_name_agreement(names, program, modules)
+	agreement = origin_name_agreement(declarations, program, modules)
 	violations: List[CorePassDiagnostic] = agreement.violations.map(
 		pure func(message: String) -> CorePassDiagnostic: CorePassMessage(
 			"pass `${pass_name}` left ${message}",
@@ -1125,7 +1128,7 @@ pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassSta
 		ownership_contract_facts = empty_ownership_contract_facts(),
 		next_binder_id = FIRST_MINTED_BINDER_ID,
 		names = EMPTY_NAME_TABLE,
-		copy_declaration_names = {}
+		declaration_index = core_empty_declaration_index()
 	}
 
 
@@ -1146,7 +1149,7 @@ pure func core_pass_state_carry_ids(
 		minted_origins = base.minted_origins,
 		next_binder_id = base.next_binder_id,
 		names = base.names,
-		copy_declaration_names = base.copy_declaration_names
+		declaration_index = base.declaration_index
 	}
 
 
@@ -1200,7 +1203,7 @@ pure func core_program_pass(
 ---
 An invariant that reads only the program, as most do, as the state invariant a
 `CorePass` carries. An invariant that also needs the state (the std-inline
-check reads `copy_declaration_names`) takes the state directly.
+check reads `declaration_index`) takes the state directly.
 ---
 pure func core_program_invariant(
 	check: pure (CoreProgram) -> Option[CorePassDiagnostic],
@@ -1291,7 +1294,7 @@ func run_core_passes(
 														Some(diagnostic)
 													None:
 														match core_pass_state_origin_name_program_violation(
-															current.copy_declaration_names,
+															current.declaration_index,
 															pass.name,
 															current.program,
 															control.modules,

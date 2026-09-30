@@ -96,7 +96,7 @@ import:
 		CoreMatchBinding,
 		CoreParam,
 		CorePreClosureConcurrentBinding,
-		CoreCopyDeclarationNames,
+		CoreDeclarationIndex,
 		CoreProgram,
 		CoreSelectArm,
 		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
@@ -106,7 +106,7 @@ import:
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_expr_type,
-		core_declaration_name,
+		core_source_function_member_spelling,
 		core_function_declared_origin,
 	mono: core_mono_type_equal
 	set as Sets
@@ -393,31 +393,17 @@ private pure func env_pure_overload_function_name(
 
 
 ---
-`module_prefix` is the precomputed member prefix of the function's source
-module (None when it has none), so this never re-sanitizes per function.
+The name `function_info` is registered and looked up under inside its module:
+the spelling of the source function it is, or is a mono instance or pure variant
+of (`CoreDeclarationIndex`), else the function's own name (an impl method, whose
+member is not a module-level name, or a function no source declaration stands
+behind).
 ---
 private pure func source_name_for_function(
-	names: CoreCopyDeclarationNames,
-	module_prefix: Option[String],
+	declarations: CoreDeclarationIndex,
 	function_info: CoreFunction,
 ) -> String:
-	-- A mono instance or pure variant is registered under the source name of the
-	-- declaration it is a copy of (`names`); any other function under its own.
-	var source_name: String = core_declaration_name(names, function_info)
-
-	match module_prefix:
-		Some(prefix):
-			if source_name.starts_with(prefix):
-				source_name = source_name.substring(
-					prefix.length(),
-					source_name.length() - prefix.length(),
-				)
-			else:
-				void
-		None:
-			void
-
-	source_name
+	core_source_function_member_spelling(declarations, function_info).get_or(function_info.name)
 
 
 private pure func callable_target(
@@ -436,12 +422,11 @@ private pure func callable_target(
 
 
 private pure func materialized_function_disposition(
-	names: CoreCopyDeclarationNames,
-	module_prefix: Option[String],
+	declarations: CoreDeclarationIndex,
 	function_info: CoreFunction,
 ) -> CoreCallResolveFunctionDisposition:
 	module_path: String = function_info.source_module.get_or("")
-	source_name: String = source_name_for_function(names, module_prefix, function_info)
+	source_name: String = source_name_for_function(declarations, function_info)
 
 	match core_builtin_name(module_path, source_name):
 		Some(runtime_name):
@@ -461,8 +446,7 @@ private pure func materialized_function_disposition(
 
 
 private pure func call_resolve_function_disposition(
-	names: CoreCopyDeclarationNames,
-	module_prefix: Option[String],
+	declarations: CoreDeclarationIndex,
 	function_info: CoreFunction,
 ) -> CoreCallResolveFunctionDisposition:
 	match function_info.function_kind:
@@ -475,7 +459,7 @@ private pure func call_resolve_function_disposition(
 			CallResolveRememberBuiltinFunction(runtime_name)
 		UnresolvedBuiltinFunction:
 			module_path: String = function_info.source_module.get_or("")
-			source_name: String = source_name_for_function(names, module_prefix, function_info)
+			source_name: String = source_name_for_function(declarations, function_info)
 
 			match core_builtin_name(module_path, source_name):
 				Some(runtime_name):
@@ -495,7 +479,7 @@ private pure func call_resolve_function_disposition(
 				-- Lowering can materialize an exact runtime forward. Synthesis
 				-- records registry ownership as BuiltinFunction before this pass;
 				-- unknown body-bearing functions remain users.
-				materialized_function_disposition(names, module_prefix, function_info)
+				materialized_function_disposition(declarations, function_info)
 
 
 private pure func import_index(
@@ -510,7 +494,7 @@ private pure func import_index(
 
 
 private pure func collect_call_resolve_env(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 	import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
@@ -559,24 +543,7 @@ private pure func collect_call_resolve_env(
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				var module_prefix: Option[String] = None
-
-				match function_info.source_module:
-					Some(module_path):
-						match module_member_prefixes.get(module_path):
-							Some(existing):
-								module_prefix = Some(existing)
-							None:
-								computed: String = core_module_member_prefix(module_path)
-								module_member_prefixes = module_member_prefixes.set(
-									module_path,
-									computed,
-								)
-								module_prefix = Some(computed)
-					None:
-						void
-
-				match call_resolve_function_disposition(names, module_prefix, function_info):
+				match call_resolve_function_disposition(declarations, function_info):
 					CallResolveRememberForeignFunction(foreign_target):
 						target = callable_target(
 							function_info,
@@ -631,11 +598,7 @@ private pure func collect_call_resolve_env(
 								else:
 									void
 
-								source_name: String = source_name_for_function(
-									names,
-									module_prefix,
-									function_info,
-								)
+								source_name: String = source_name_for_function(declarations, function_info)
 
 								if function_info.name != source_name:
 									builtin_functions = builtin_functions.set(
@@ -683,11 +646,7 @@ private pure func collect_call_resolve_env(
 								else:
 									void
 
-								source_name: String = source_name_for_function(
-									names,
-									module_prefix,
-									function_info,
-								)
+								source_name: String = source_name_for_function(declarations, function_info)
 								module_functions = module_functions.set(
 									module_function_key(
 										module_path,
@@ -969,12 +928,12 @@ environment builder as resolve_core_program so the snapshot cannot drift
 into a second call-resolution construction path.
 ---
 pure func observe_core_call_resolve_env(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 	import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
 ) -> CoreCallResolveEnvObservation:
-	observe_call_resolve_env(collect_call_resolve_env(names, program, import_bindings, module_imports))
+	observe_call_resolve_env(collect_call_resolve_env(declarations, program, import_bindings, module_imports))
 
 
 private pure func scope_with_var(scope: List[String], variable: CoreVar) -> List[String]:
@@ -3448,14 +3407,14 @@ pure func resolve_global_value_refs(program: CoreProgram) -> CoreProgram:
 
 
 pure func resolve_core_program(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 	import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
 ) -> CoreProgram:
 	resolutions: CoreProgramResolution = {
 		global_values = program_global_value_resolutions(program),
-		call_env = Some(collect_call_resolve_env(names, program, import_bindings, module_imports)),
+		call_env = Some(collect_call_resolve_env(declarations, program, import_bindings, module_imports)),
 		module_path = ""
 	}
 	var decls: List[CoreDecl] = []

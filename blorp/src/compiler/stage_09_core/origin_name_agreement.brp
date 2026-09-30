@@ -12,12 +12,14 @@
 import:
 	../stage_08_core_lower/entrypoint: ENTRYPOINT_NAME, USER_MAIN_NAME_PREFIX
 	../stage_08_core_lower/identity: CORE_PURE_OVERLOAD_SUFFIX, core_module_member_prefix
+	../stage_02_lex/name_table: name_id_index, name_spelling, name_table_count
 	../stage_04_modules/loaded_module: ModuleOrigin, module_origins_equal
 	../stage_04_modules/module_table: ModuleId, ModuleTable, module_ids_equal, module_table_canonical_path, module_table_origin
 	closure: ETA_NAME_PREFIX, LAMBDA_NAME_PREFIX, TASK_NAME_PREFIX
 	ir:
-		CoreCopyDeclarationNames,
+		CoreCopyDeclarations,
 		CoreDecl(FunctionDecl, ImplDecl, TraitDecl),
+		CoreDeclarationIndex,
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunction,
 		CoreDeclaredOrigin(
@@ -34,6 +36,7 @@ import:
 		CoreFunctionOrigin(Declared, Synthesized),
 		CoreModuleOrigin(NoSourceModule, SourceModule),
 		CoreProgram,
+		core_declared_member,
 		core_function_declared_origin,
 	synth_name: MONO_NAME_MARKER
 
@@ -410,26 +413,51 @@ private pure func case_counts_in_order(counts: Dict[String, Int]) -> List[(Strin
 
 
 ---
-A mono instance or pure variant must have an entry in the recorded declaration
-names once mono has recorded them (`names` is empty until then, and before mono
-there is nothing to check). A missing entry means the declaration was pruned
-before mono recorded the table, and every reader of the copy's declaration would
-then read its mangled name instead, silently.
+A mono instance or pure variant must have an entry in the recorded copy
+declarations once mono has recorded them (`copy_declarations` is empty until then,
+and before mono there is nothing to check). A missing entry means the declaration
+was pruned before mono recorded the index, and every reader of the copy's source
+declaration would then find none, silently.
 ---
 private pure func unrecorded_copy_disagreement(
-	names: CoreCopyDeclarationNames,
+	copy_declarations: CoreCopyDeclarations,
 	function_info: CoreFunction,
 ) -> Option[String]:
-	if names.is_empty() or names.contains(function_info.def_id):
+	if copy_declarations.is_empty() or copy_declarations.contains(function_info.def_id):
 		None
 	else:
 		match core_function_declared_origin(function_info.origin):
 			MonoInstance(_, _) | PureVariant(_):
 				Some(
-					"function `${function_info.name}` (def ${function_info.def_id.to_string()}) is a copy with no entry in the recorded declaration names",
+					"function `${function_info.name}` (def ${function_info.def_id.to_string()}) is a copy with no entry in the recorded copy declarations",
 				)
 			_:
 				None
+
+
+---
+A function's source member must be a spelling in the compilation's name table once
+the table is recorded (the table is empty before mono records the index, and a
+single-file tool has none). `core_declared_member_spelling` and
+`core_source_function_member_spelling` turn a table miss into `None`, so synthesis,
+resolve and std inlining would silently skip the function; this reports it instead.
+---
+private pure func unresolved_member_disagreement(
+	declarations: CoreDeclarationIndex,
+	function_info: CoreFunction,
+) -> Option[String]:
+	if name_table_count(declarations.names) == 0:
+		None
+	else:
+		member ?= core_declared_member(declarations, function_info)
+
+		match name_spelling(declarations.names, member):
+			Some(_):
+				None
+			None:
+				Some(
+					"function `${function_info.name}` (def ${function_info.def_id.to_string()}) declares member name id ${name_id_index(member).to_string()}, which is not in the name table",
+				)
 
 
 ---
@@ -438,7 +466,7 @@ against its name. An impl method must also carry an impl-method origin: it is
 declared inside an `impl`, whatever its name looks like.
 ---
 pure func origin_name_agreement(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 	modules: ModuleCheckScope,
 ) -> OriginNameAgreement:
@@ -459,7 +487,13 @@ pure func origin_name_agreement(
 					None:
 						void
 
-				match unrecorded_copy_disagreement(names, function_info):
+				match unrecorded_copy_disagreement(declarations.copy_declarations, function_info):
+					Some(message):
+						violations = violations.append(message)
+					None:
+						void
+
+				match unresolved_member_disagreement(declarations, function_info):
 					Some(message):
 						violations = violations.append(message)
 					None:
@@ -470,6 +504,12 @@ pure func origin_name_agreement(
 					counts = count_origin_case(counts, method)
 
 					match module_disagreement(method, modules):
+						Some(message):
+							violations = violations.append(message)
+						None:
+							void
+
+					match unresolved_member_disagreement(declarations, method):
 						Some(message):
 							violations = violations.append(message)
 						None:

@@ -1,8 +1,12 @@
 import:
-	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_02_lex/name_table: NameTable
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		fixture_member_spelling,
+		fixture_name_table,
+		fixture_source_function_origin_in,
 	../../../src/compiler/stage_09_core/ir:
-		core_copy_declaration_names,
-		is_unresolved_builtin_function_kind,
 		CoreBinaryOp(
 			AddOp,
 			DivideOp,
@@ -16,22 +20,24 @@ import:
 			NotEqualOp,
 			SubtractOp,
 		),
+		CoreBinderOrigin(AuthoredBinder),
 		CoreDecl(FunctionDecl, ImplDecl, ValueRecordDecl),
+		CoreDeclaredOrigin(MonoInstance, SourceFunction),
 		CoreExpr(BinaryExpr, UnaryExpr),
 		CoreFunction,
 		CoreFunctionKind(BuiltinFunction, UnresolvedBuiltinFunction),
-		CoreDeclaredOrigin(MonoInstance, SourceFunction),
 		CoreFunctionOrigin(Declared, Synthesized),
-		CoreSynthesisKind(ScalarOperatorSynthesis, TensorSynthesis),
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc,
-		synthetic_core_source_loc,
+		CoreSynthesisKind(ScalarOperatorSynthesis, TensorSynthesis),
 		CoreTensorDim(TensorStaticDim),
 		CoreType(FunctionType, NamedType, TensorType),
 		CoreUnaryOp(NegateOp),
-		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
+		core_declaration_index,
+		is_unresolved_builtin_function_kind,
+		synthetic_core_source_loc,
 	../../../src/compiler/stage_09_core/synth: synthesize_program as synthesize_program_with_names
 	../../../src/compiler/stage_09_core/synth_error:
 		CoreSynthError(UnsupportedTensorReductionElement),
@@ -63,10 +69,40 @@ private DICT_INT_TYPE: CoreType = NamedType(
 )
 
 
--- The pipeline records the names after mono, while every declaration is still in
--- the program; a fixture's program is that program.
+-- The module members the fixtures declare, so a declaration's origin can carry each
+-- member's id in the name table the synthesis reads spellings from.
+private pure func fixture_names() -> NameTable:
+	fixture_name_table([
+		"add",
+		"divide",
+		"equals",
+		"not_equals",
+		"less_than",
+		"greater_than",
+		"less_than_or_equal",
+		"greater_than_or_equal",
+		"is_finite",
+		"length",
+		"max",
+		"modulo",
+		"multiply",
+		"negate",
+		"operation",
+		"parallel",
+		"remainder",
+		"set",
+		"subtract",
+		"sum",
+	])
+
+
+-- The pipeline records the declaration index after mono, while every declaration is
+-- still in the program; a fixture's program is that program.
 pure func synthesize_program(program: CoreProgram) -> Result[CoreProgram, CoreSynthError]:
-	synthesize_program_with_names(core_copy_declaration_names(program), program)
+	synthesize_program_with_names(
+		core_declaration_index(fixture_names(), program),
+		program,
+	)
 
 
 pure func core_var(name: String) -> CoreVar:
@@ -100,7 +136,7 @@ pure func builtin_function(
 		return_type = return_type,
 		body = None,
 		is_pure = True,
-		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		origin = fixture_source_function_origin_in(fixture_names(), source_name),
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = UnresolvedBuiltinFunction,
 		def_id = 1,
@@ -339,7 +375,10 @@ pure func test_scalar_operator_impl_records_scalar_operator_synthesis() -> Bool:
 				[ImplDecl(impl_info)]:
 					match impl_info.methods:
 						[synthesized]:
-							origin_is_synthesized_from_source(synthesized.origin, ScalarOperatorSynthesis)
+							origin_is_synthesized_from_source(
+								synthesized.origin,
+								ScalarOperatorSynthesis,
+							)
 						_:
 							False
 				_:
@@ -366,11 +405,13 @@ pure func test_synthesizing_a_mono_instance_keeps_its_mono_origin() -> Bool:
 		origin = Declared(MonoInstance(5, []))
 	}
 
-	match synthesize_program({
-		decls = [FunctionDecl(base), FunctionDecl(instance)],
-		foreign_includes = [],
-		source_files = []
-	}):
+	match (
+		synthesize_program({
+			decls = [FunctionDecl(base), FunctionDecl(instance)],
+			foreign_includes = [],
+			source_files = [],
+		})
+	):
 		Ok(program):
 			match program.decls:
 				[_, FunctionDecl(synthesized)]:
@@ -764,36 +805,57 @@ pure func test_scalar_operator_synthesis_rejects_malformed_candidates() -> Bool:
 	}
 	wrong_negate_operand: CoreFunction = { canonical_negate | params = [param("value", INT_TYPE)] }
 	wrong_negate_result: CoreFunction = { canonical_negate | return_type = INT_TYPE }
+	subtract_string: CoreFunction = builtin_function(
+		"string",
+		"subtract",
+		[param("left", STRING_TYPE), param("right", STRING_TYPE)],
+		STRING_TYPE,
+	)
+	remainder_fixed: CoreFunction = builtin_function(
+		"fixed",
+		"remainder",
+		[param("left", FIXED_TYPE), param("right", FIXED_TYPE)],
+		FIXED_TYPE,
+	)
+	negate_uint8: CoreFunction = builtin_function(
+		"uint8",
+		"negate",
+		[param("value", UINT8_TYPE)],
+		UINT8_TYPE,
+	)
 
 	(
-		synthesize_scalar_operator_impl_body("Multipliable", INT16_TYPE, canonical).is_some()
+		synthesize_scalar_operator_impl_body(
+			"Multipliable",
+			INT16_TYPE,
+			canonical,
+			fixture_member_spelling(canonical),
+		).is_some()
 		and [wrong_owner, wrong_arity, wrong_operand, wrong_result].all(pure func(candidate):
-			synthesize_scalar_operator_impl_body("Multipliable", INT16_TYPE, candidate).is_none()
+			synthesize_scalar_operator_impl_body(
+				"Multipliable",
+				INT16_TYPE,
+				candidate,
+				fixture_member_spelling(candidate),
+			).is_none()
 		)
 		and synthesize_scalar_operator_impl_body(
 			"Subtractable",
 			STRING_TYPE,
-			builtin_function(
-				"string",
-				"subtract",
-				[param("left", STRING_TYPE), param("right", STRING_TYPE)],
-				STRING_TYPE,
-			),
+			subtract_string,
+			fixture_member_spelling(subtract_string),
 		).is_none()
 		and synthesize_scalar_operator_impl_body(
 			"Modulable",
 			FIXED_TYPE,
-			builtin_function(
-				"fixed",
-				"remainder",
-				[param("left", FIXED_TYPE), param("right", FIXED_TYPE)],
-				FIXED_TYPE,
-			),
+			remainder_fixed,
+			fixture_member_spelling(remainder_fixed),
 		).is_none()
 		and synthesize_scalar_operator_impl_body(
 			"Negatable",
 			INT16_TYPE,
 			canonical_negate,
+			fixture_member_spelling(canonical_negate),
 		).is_some()
 		and [
 			wrong_negate_owner,
@@ -801,12 +863,18 @@ pure func test_scalar_operator_synthesis_rejects_malformed_candidates() -> Bool:
 			wrong_negate_operand,
 			wrong_negate_result,
 		].all(pure func(candidate):
-			synthesize_scalar_operator_impl_body("Negatable", INT16_TYPE, candidate).is_none()
+			synthesize_scalar_operator_impl_body(
+				"Negatable",
+				INT16_TYPE,
+				candidate,
+				fixture_member_spelling(candidate),
+			).is_none()
 		)
 		and synthesize_scalar_operator_impl_body(
 			"Negatable",
 			UINT8_TYPE,
-			builtin_function("uint8", "negate", [param("value", UINT8_TYPE)], UINT8_TYPE),
+			negate_uint8,
+			fixture_member_spelling(negate_uint8),
 		).is_none()
 	)
 

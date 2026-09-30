@@ -1,5 +1,8 @@
 import:
-	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		fixture_source_function_origin_named,
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(AddOp),
 		CoreBoxKind(PrimBox),
@@ -21,7 +24,8 @@ import:
 			VarExpr,
 			VoidExpr,
 		),
-		CoreFunctionKind(UserFunction),
+		CoreFunction,
+		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreLiteral(FloatLiteral, IntLiteral),
 		CoreLoopBinder,
 		CoreLoopRangeDirection(RangeForwardOnly),
@@ -144,6 +148,38 @@ pure func specialized_body(body: CoreExpr) -> Option[CoreExpr]:
 			function_info.body
 		_:
 			None
+
+
+-- The `main` body after specializing a program that also declares `callee`, the
+-- function the body's calls reach by definition id.
+pure func specialized_body_with_callee(callee: CoreFunction, body: CoreExpr) -> Option[CoreExpr]:
+	program: CoreProgram = program_with_body(body)
+	declared: CoreProgram = { program | decls = program.decls.append(FunctionDecl(callee)) }
+
+	match specialize_program(declared).decls:
+		[FunctionDecl(main), _]:
+			main.body
+		_:
+			None
+
+
+-- A bodyless standard-library declaration `module.member` with the definition id
+-- the math call fixtures reach (17).
+pure func stdlib_math_declaration(module_path: String, member: String) -> CoreFunction:
+	{
+		name = "flattened_name_that_no_reader_may_parse",
+		source_module = Some(module_path),
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = None,
+		is_pure = True,
+		origin = fixture_source_function_origin_named(member),
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UnresolvedBuiltinFunction,
+		def_id = 17,
+		loc = synthetic_core_source_loc()
+	}
 
 
 pure func exprs_equal(left: CoreExpr, right: CoreExpr) -> Bool:
@@ -678,8 +714,10 @@ pure func test_float32_unary_tensor_math_selects_runtime() -> Bool:
 
 pure func test_imported_scalar_math_lift_selects_tensor_runtime() -> Bool:
 	vector_type: CoreType = tensor_with_dims(FLOAT_TYPE, [TensorStaticDim(4)])
+	float_sqrt: CoreFunction = stdlib_math_declaration("float", "sqrt")
 
-	selected_ok: Bool = match specialized_body(
+	selected_ok: Bool = match specialized_body_with_callee(
+		float_sqrt,
 		selected_unary_tensor_math_call(
 			"float__sqrt",
 			FLOAT_TYPE,
@@ -691,7 +729,8 @@ pure func test_imported_scalar_math_lift_selects_tensor_runtime() -> Bool:
 		_:
 			False
 
-	user_ok: Bool = match specialized_body(
+	user_ok: Bool = match specialized_body_with_callee(
+		float_sqrt,
 		user_unary_tensor_math_call(
 			"float__sqrt",
 			FLOAT_TYPE,
@@ -704,6 +743,42 @@ pure func test_imported_scalar_math_lift_selects_tensor_runtime() -> Bool:
 			False
 
 	selected_ok and user_ok
+
+
+-- The callee is identified by its definition id: the `vector` member lifts too,
+-- whatever its flattened name, while a call whose id is no known function, or is a
+-- function of another module with the same member, is left alone.
+pure func test_math_lift_reads_the_callee_identity_not_its_name() -> Bool:
+	vector_type: CoreType = tensor_with_dims(FLOAT_TYPE, [TensorStaticDim(4)])
+	call: CoreExpr = user_unary_tensor_math_call("flattened_spelling", FLOAT_TYPE, vector_type)
+
+	vector_member_lifts: Bool = match specialized_body_with_callee(
+		stdlib_math_declaration("vector", "norm"),
+		call,
+	):
+		Some(body):
+			contains_builtin_named(body, "blorp_vector_norm")
+		_:
+			False
+
+	other_module_left: Bool = match specialized_body_with_callee(
+		stdlib_math_declaration("app/geometry", "sqrt"),
+		user_unary_tensor_math_call("float__sqrt", FLOAT_TYPE, vector_type),
+	):
+		Some(body):
+			not contains_builtin_named(body, "blorp_vector_sqrt")
+		_:
+			False
+
+	undeclared_left: Bool = match specialized_body(
+		user_unary_tensor_math_call("float__sqrt", FLOAT_TYPE, vector_type),
+	):
+		Some(body):
+			not contains_builtin_named(body, "blorp_vector_sqrt")
+		_:
+			False
+
+	vector_member_lifts and other_module_left and undeclared_left
 
 
 pure func test_float16_unary_tensor_math_selects_runtime() -> Bool:
@@ -1138,6 +1213,10 @@ tests: TestSuite = {
 		(
 			"imported scalar math lift selects tensor runtime",
 			test_imported_scalar_math_lift_selects_tensor_runtime,
+		),
+		(
+			"math lift reads the callee identity, not its name",
+			test_math_lift_reads_the_callee_identity_not_its_name,
 		),
 		(
 			"Float16 unary tensor math selects runtime",

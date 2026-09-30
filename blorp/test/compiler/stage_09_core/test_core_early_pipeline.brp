@@ -1,6 +1,6 @@
 import:
 	../../../src/compiler/stage_09_core/origin_name_agreement: ModuleCheckScope(CheckWithoutModuleTable)
-	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE
+	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE, NameTable, SYNTHESIZED_NAME_TABLE, synthesized_name_id
 	../../../src/compiler/stage_09_core/early_invariants:
 		CoreEarlyInvariantViolation(MonoBoxSourceTypeUnresolved, SelectedDirectCallSurvived),
 		check_debug_invariants,
@@ -31,11 +31,17 @@ import:
 		parse_core_early_pipeline_stage,
 		run_early_core_pipeline,
 		run_early_core_pipeline_to_runtime_projection,
-	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		fixture_name_table,
+		fixture_source_function_origin_in,
+		fixture_source_function_origin_named,
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(AddOp),
 		CoreBoxKind(PrimBox),
 		CoreCallKind(IntrinsicCall, SelectedDirectCall, UserCall),
+		CoreDeclaredOrigin(ImplMethod),
 		CoreDecl(FunctionDecl),
 		CoreExpr(
 			BinaryExpr,
@@ -52,6 +58,8 @@ import:
 		),
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
+		CoreFunctionOrigin(Declared),
+		CoreImplMethodRole(OrdinaryImplMethod),
 		CoreLiteral(IntLiteral, StringLiteral),
 		CoreParam,
 		CorePattern(WildcardPattern),
@@ -474,7 +482,7 @@ func test_pipeline_can_observe_and_stop_at_post_synth_boundary() -> Bool:
 		return_type = int_type,
 		body = None,
 		is_pure = True,
-		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		origin = fixture_source_function_origin_named("length"),
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = UnresolvedBuiltinFunction,
 		def_id = 20,
@@ -487,7 +495,7 @@ func test_pipeline_can_observe_and_stop_at_post_synth_boundary() -> Bool:
 				program = program([FunctionDecl(bytes_length)]),
 				next_def_id = 100,
 				next_binder_id = -1,
-				names = EMPTY_NAME_TABLE
+				names = SYNTHESIZED_NAME_TABLE
 			},
 			configuration(
 				False,
@@ -663,6 +671,7 @@ func test_pipeline_returns_synth_diagnostic() -> Bool:
 		element_type = string_type,
 		dims = [TensorStaticDim(4)],
 	})
+	names: NameTable = fixture_name_table(["sum"])
 	reduction: CoreFunction = {
 		name = "vector__sum",
 		source_module = Some("vector"),
@@ -671,7 +680,7 @@ func test_pipeline_returns_synth_diagnostic() -> Bool:
 		return_type = string_type,
 		body = None,
 		is_pure = True,
-		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		origin = fixture_source_function_origin_in(names, "sum"),
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = UnresolvedBuiltinFunction,
 		def_id = 20,
@@ -684,7 +693,7 @@ func test_pipeline_returns_synth_diagnostic() -> Bool:
 				program = program([FunctionDecl(reduction)]),
 				next_def_id = 100,
 				next_binder_id = -1,
-				names = EMPTY_NAME_TABLE
+				names = names
 			},
 			configuration(
 				False,
@@ -754,11 +763,44 @@ func test_pipeline_owns_string_fusion_before_worker_boundary() -> Bool:
 		string_type,
 	)
 	length: CoreExpr = user_call("HasLength_length_String", 402, [reversed], int_type)
+	source_param: CoreParam = param("source", string_type)
+	reverse_declaration: CoreFunction = { function(
+			"string__reverse",
+			401,
+			[],
+			[source_param],
+			string_type,
+			VarExpr(source_param.name, string_type, synthetic_core_source_loc()),
+		) |
+		source_module = Some("string"),
+		origin = fixture_source_function_origin_named("reverse")
+	}
+	length_declaration: CoreFunction = { function(
+			"HasLength_length_String",
+			402,
+			[],
+			[source_param],
+			int_type,
+			LiteralExpr(IntLiteral(0), int_type, synthetic_core_source_loc()),
+		) |
+		source_module = Some("string"),
+		origin = Declared(
+			ImplMethod(
+				synthesized_name_id("HasLength"),
+				synthesized_name_id("length"),
+				OrdinaryImplMethod,
+			),
+		)
+	}
 
 	match (
 		run_early_core_pipeline_to_runtime_projection(
 			{
-				program = program([FunctionDecl(function("main", 20, [], [], int_type, length))]),
+				program = program([
+						FunctionDecl(function("main", 20, [], [], int_type, length)),
+						FunctionDecl(reverse_declaration),
+						FunctionDecl(length_declaration),
+					]),
 				next_def_id = 500,
 				next_binder_id = -1,
 				names = EMPTY_NAME_TABLE
@@ -775,11 +817,11 @@ func test_pipeline_owns_string_fusion_before_worker_boundary() -> Bool:
 		)
 	):
 		CoreEarlyPipelineCompleted(output):
-			match output.program.decls:
-				[FunctionDecl(function_info)]:
+			match output.program.decls.get(0):
+				Some(FunctionDecl(function_info)):
 					match function_info.body:
 						Some(body):
-							count_intrinsic("string_len", body) > 0
+							function_info.name == "main" and count_intrinsic("string_len", body) > 0
 						None:
 							False
 				_:

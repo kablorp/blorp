@@ -6,7 +6,6 @@
 -- spellings alone never authorize expansion.
 import:
 	../stage_04_modules/loaded_module: ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule)
-	../stage_08_core_lower/identity: core_module_member_prefix
 	ir:
 		INLINED_CALLEE_TEMP_ORIGIN,
 		CoreModuleOrigin(NoSourceModule, SourceModule),
@@ -102,14 +101,14 @@ import:
 			SemanticMatchFail,
 			SemanticMatchLeaf,
 		),
-		CoreCopyDeclarationNames,
+		CoreDeclarationIndex,
 		CoreSourceLoc,
 		CoreTensorLiteralPayload(TensorInlineStructLiteralPayload, TensorRawLiteralPayload),
 		CoreType,
 		CoreBinderOrigin(PassTemporary),
 		PassTempKind(InlinedCalleeTemp),
 		CoreVar,
-		core_declaration_name,
+		core_source_function_member_spelling,
 		core_var_equal,
 	traverse: CoreMapState, immediate_core_expr_children, map_core_expr_children, map_core_expr_children_with_state
 
@@ -242,22 +241,6 @@ private record StdInlineSemanticResult {
 }
 
 
----
-`module_prefix` is the precomputed `core_module_member_prefix` of the
-function's source module, spelled once per module by the caller. `declaration_name`
-is the name of the declaration the function is, or is an instance or pure variant
-of (`core_function_base_declaration`).
----
-private pure func source_name(module_prefix: String, declaration_name: String) -> String:
-	if declaration_name.starts_with(module_prefix):
-		declaration_name.substring(
-			module_prefix.length(),
-			declaration_name.length() - module_prefix.length(),
-		)
-	else:
-		declaration_name
-
-
 private pure func readonly_bindings(params: List[CoreParam]) -> List[StdInlineArgBinding]:
 	params.map(pure func(_): StdInlineBorrowExisting)
 
@@ -297,42 +280,23 @@ private pure func tensor_bindings(
 		None
 
 
-private record StdInlineModulePrefixes {
-	list: String,
-	tensor: String
-}
-
-
 ---
-The two inlinable std modules, sanitized once per target collection.
+How a call to `function_info` binds its arguments when inlined, for the two
+inlinable std modules. The member is the spelling of the source function
+`function_info` is, or is a mono instance or pure variant of
+(`CoreDeclarationIndex`); an impl method of the module is not a member here.
 ---
-private pure func std_inline_module_prefixes() -> StdInlineModulePrefixes:
-	{
-		list = core_module_member_prefix("list"),
-		tensor = core_module_member_prefix("tensor")
-	}
-
-
 private pure func target_bindings(
-	prefixes: StdInlineModulePrefixes,
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	function_info: CoreFunction,
 ) -> Option[List[StdInlineArgBinding]]:
 	match function_info.source_module:
-		Some(module_name):
-			match module_name:
-				"list":
-					list_bindings(
-						source_name(prefixes.list, core_declaration_name(names, function_info)),
-						function_info.params,
-					)
-				"tensor":
-					tensor_bindings(
-						source_name(prefixes.tensor, core_declaration_name(names, function_info)),
-						function_info.params,
-					)
-				_:
-					None
+		Some("list"):
+			member ?= core_source_function_member_spelling(declarations, function_info)
+			list_bindings(member, function_info.params)
+		Some("tensor"):
+			member ?= core_source_function_member_spelling(declarations, function_info)
+			tensor_bindings(member, function_info.params)
 		_:
 			None
 
@@ -349,16 +313,15 @@ private pure func add_std_inline_target(
 
 
 pure func collect_targets(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 ) -> StdInlineTargets:
 	var targets: StdInlineTargets = {by_name = {}}
-	prefixes: StdInlineModulePrefixes = std_inline_module_prefixes()
 
 	for decl in program.decls:
 		match decl:
 			FunctionDecl(function_info):
-				match (function_info.body, target_bindings(prefixes, names, function_info)):
+				match (function_info.body, target_bindings(declarations, function_info)):
 					(Some(body), Some(arg_bindings)):
 						if function_info.type_params.is_empty():
 							targets = add_std_inline_target(
@@ -1717,10 +1680,10 @@ private pure func first_function_target_call(
 
 
 pure func first_uninlined_std_wrapper_call(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 ) -> Option[(String, CoreSourceLoc)]:
-	targets: StdInlineTargets = collect_targets(names, program)
+	targets: StdInlineTargets = collect_targets(declarations, program)
 	var found: Option[(String, CoreSourceLoc)] = None
 
 	for decl in program.decls:
@@ -1760,11 +1723,11 @@ record StdInlineResult {
 
 
 pure func inline_std_wrappers_minting(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	program: CoreProgram,
 	id_base: Int,
 ) -> StdInlineResult:
-	targets: StdInlineTargets = collect_targets(names, program)
+	targets: StdInlineTargets = collect_targets(declarations, program)
 
 	if targets.by_name.is_empty():
 		{ program = program, ids_used = 0 }
@@ -1799,5 +1762,5 @@ pure func inline_std_wrappers_minting(
 		{ program = { program | decls = rewritten_decls }, ids_used = ids_used }
 
 
-pure func inline_std_wrappers(names: CoreCopyDeclarationNames, program: CoreProgram) -> CoreProgram:
-	inline_std_wrappers_minting(names, program, FIRST_MINTED_BINDER_ID).program
+pure func inline_std_wrappers(declarations: CoreDeclarationIndex, program: CoreProgram) -> CoreProgram:
+	inline_std_wrappers_minting(declarations, program, FIRST_MINTED_BINDER_ID).program

@@ -16,7 +16,7 @@ import:
 			SubtractOp,
 		),
 		CoreCallKind(IntrinsicCall, UnknownCall, UserCall),
-		CoreCopyDeclarationNames,
+		CoreDeclarationIndex,
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreExpr(
 			AssignExpr,
@@ -39,8 +39,22 @@ import:
 		synthetic_core_source_loc,
 		CoreType(NamedType, RangeType, VoidType),
 		CoreVar,
-		core_callee_declaration_name,
 		core_expr_type,
+		core_known_callee,
+	known_functions:
+		CoreKnownFunction(
+			StringDropLeft,
+			StringDropRight,
+			StringLength,
+			StringReplace,
+			StringReverse,
+			StringSubstring,
+			StringTakeLeft,
+			StringTakeRight,
+			StringTrim,
+			StringTrimLeft,
+			StringTrimRight,
+		),
 	traverse: CoreMapState, map_core_expr_children, map_core_expr_children_with_state
 	synth_nodes:
 		bool_literal,
@@ -121,7 +135,7 @@ private union StringLengthState:
 
 
 private record StringCall {
-	name: String,
+	function: CoreKnownFunction,
 	args: List[CoreExpr]
 }
 
@@ -385,74 +399,38 @@ private pure func replace_is_statically_length_preserving(old: CoreExpr, new: Co
 			False
 
 
-private pure func supported_string_function_name(name: String) -> Option[String]:
-	match name:
-		"drop_left" | "drop_right" | "replace" | "reverse" | "substring" | "take_left" | "take_right" | "trim" | "trim_left" | "trim_right" | "length":
-			Some(name)
-		_:
-			None
-
-
-private pure func strip_supported_prefix(name: String, prefix: String) -> Option[String]:
-	if name.starts_with(prefix):
-		supported_string_function_name(
-			name.substring(
-				prefix.length(),
-				name.length() - prefix.length(),
-			),
-		)
-	else:
-		None
-
-
 ---
-The string function a call reaches, by its supported base name. `declared_name`
-is the callee's declared name (`core_callee_declaration_name`): a mono instance
-or pure variant is read through the declaration its origin names, so only a
-`string__` module prefix (or the UFCS wrapper's `__ufcs_string__` prefix) is
-left to strip here.
+The string function a call reaches, by the callee's definition id: a mono
+instance or pure variant of a `string` function, or the `HasLength` method of
+`string`, is recognised through the declaration it is
+(`CoreDeclarationIndex.known_functions`), so no name is parsed.
 ---
-private pure func base_string_function_name(declared_name: String) -> Option[String]:
-	match strip_supported_prefix(declared_name, "string__"):
-		Some(function_name):
-			Some(function_name)
-		None:
-			match strip_supported_prefix(declared_name, "__ufcs_string__"):
-				Some(function_name):
-					Some(function_name)
-				None:
-					if declared_name.starts_with("HasLength_length_String"):
-						Some("length")
-					else:
-						None
-
-
-private pure func call_base_and_args(
-	names: CoreCopyDeclarationNames,
+private pure func known_string_call(
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 ) -> Option[StringCall]:
 	match expr:
-		CallExpr(UserCall(name, def_id, _), _, args, _, _):
-			match base_string_function_name(core_callee_declaration_name(names, def_id, name)):
-				Some(base):
+		CallExpr(UserCall(_, def_id, _), _, args, _, _):
+			match core_known_callee(declarations, def_id):
+				Some(function):
 					Some({
-						name = base,
+						function = function,
 						args = args,
 					})
 				None:
 					None
 		CallExpr(UnknownCall, VarExpr(callee, _, _), args, _, _):
-			match base_string_function_name(core_callee_declaration_name(names, callee.def_id, callee.name)):
-				Some(base):
+			match core_known_callee(declarations, callee.def_id):
+				Some(function):
 					Some({
-						name = base,
+						function = function,
 						args = args,
 					})
 				None:
 					None
 		CallExpr(IntrinsicCall("string_len"), _, args, _, _):
 			Some({
-				name = "length",
+				function = StringLength,
 				args = args,
 			})
 		_:
@@ -460,14 +438,14 @@ private pure func call_base_and_args(
 
 
 private pure func append_pipeline_stage(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	source: CoreExpr,
 	stage: StringPipelineStage,
 ) -> Option[StringPipeline]:
 	if not is_string_type(core_expr_type(source)):
 		None
 	else:
-		pipeline: StringPipeline = match pipeline_of_expr_reversed(names, source):
+		pipeline: StringPipeline = match pipeline_of_expr_reversed(declarations, source):
 			Some(nested):
 				nested
 			None:
@@ -479,72 +457,72 @@ private pure func append_pipeline_stage(
 		Some({ pipeline | stages = [stage].concat(pipeline.stages) })
 
 
-private pure func pipeline_of_expr(names: CoreCopyDeclarationNames, expr: CoreExpr) -> Option[StringPipeline]:
-	pipeline ?= pipeline_of_expr_reversed(names, expr)
+private pure func pipeline_of_expr(declarations: CoreDeclarationIndex, expr: CoreExpr) -> Option[StringPipeline]:
+	pipeline ?= pipeline_of_expr_reversed(declarations, expr)
 	Some({ pipeline | stages = pipeline.stages.reverse() })
 
 
-private pure func pipeline_of_expr_reversed(names: CoreCopyDeclarationNames, expr: CoreExpr) -> Option[StringPipeline]:
-	call ?= call_base_and_args(names, expr)
+private pure func pipeline_of_expr_reversed(declarations: CoreDeclarationIndex, expr: CoreExpr) -> Option[StringPipeline]:
+	call ?= known_string_call(declarations, expr)
 
-	match (call.name, call.args):
-		("reverse", [source]):
+	match (call.function, call.args):
+		(StringReverse, [source]):
 			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
-				append_pipeline_stage(names, source, ReverseBytesStage)
+				append_pipeline_stage(declarations, source, ReverseBytesStage)
 			else:
 				None
-		("trim", [source]):
+		(StringTrim, [source]):
 			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
-				append_pipeline_stage(names, source, TrimBytesStage)
+				append_pipeline_stage(declarations, source, TrimBytesStage)
 			else:
 				None
-		("trim_left", [source]):
+		(StringTrimLeft, [source]):
 			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
-				append_pipeline_stage(names, source, TrimLeftBytesStage)
+				append_pipeline_stage(declarations, source, TrimLeftBytesStage)
 			else:
 				None
-		("trim_right", [source]):
+		(StringTrimRight, [source]):
 			if is_string_type(core_expr_type(source)) and is_string_type(core_expr_type(expr)):
-				append_pipeline_stage(names, source, TrimRightBytesStage)
+				append_pipeline_stage(declarations, source, TrimRightBytesStage)
 			else:
 				None
-		("take_left", [source, count]):
+		(StringTakeLeft, [source, count]):
 			if (
 				is_string_type(core_expr_type(source))
 				and is_int_value_type(core_expr_type(count))
 				and is_string_type(core_expr_type(expr))
 			):
-				append_pipeline_stage(names, source, TakeLeftBytesStage(count))
+				append_pipeline_stage(declarations, source, TakeLeftBytesStage(count))
 			else:
 				None
-		("drop_left", [source, count]):
+		(StringDropLeft, [source, count]):
 			if (
 				is_string_type(core_expr_type(source))
 				and is_int_value_type(core_expr_type(count))
 				and is_string_type(core_expr_type(expr))
 			):
-				append_pipeline_stage(names, source, DropLeftBytesStage(count))
+				append_pipeline_stage(declarations, source, DropLeftBytesStage(count))
 			else:
 				None
-		("take_right", [source, count]):
+		(StringTakeRight, [source, count]):
 			if (
 				is_string_type(core_expr_type(source))
 				and is_int_value_type(core_expr_type(count))
 				and is_string_type(core_expr_type(expr))
 			):
-				append_pipeline_stage(names, source, TakeRightBytesStage(count))
+				append_pipeline_stage(declarations, source, TakeRightBytesStage(count))
 			else:
 				None
-		("drop_right", [source, count]):
+		(StringDropRight, [source, count]):
 			if (
 				is_string_type(core_expr_type(source))
 				and is_int_value_type(core_expr_type(count))
 				and is_string_type(core_expr_type(expr))
 			):
-				append_pipeline_stage(names, source, DropRightBytesStage(count))
+				append_pipeline_stage(declarations, source, DropRightBytesStage(count))
 			else:
 				None
-		("substring", [source, start, length]):
+		(StringSubstring, [source, start, length]):
 			if (
 				is_string_type(core_expr_type(source))
 				and is_int_value_type(core_expr_type(start))
@@ -552,13 +530,13 @@ private pure func pipeline_of_expr_reversed(names: CoreCopyDeclarationNames, exp
 				and is_string_type(core_expr_type(expr))
 			):
 				append_pipeline_stage(
-					names,
+					declarations,
 					source,
 					SubstringBytesStage(start, length),
 				)
 			else:
 				None
-		("replace", [source, old, new]):
+		(StringReplace, [source, old, new]):
 			if (
 				is_string_type(core_expr_type(source))
 				and is_string_type(core_expr_type(old))
@@ -566,7 +544,7 @@ private pure func pipeline_of_expr_reversed(names: CoreCopyDeclarationNames, exp
 				and is_string_type(core_expr_type(expr))
 			):
 				append_pipeline_stage(
-					names,
+					declarations,
 					source,
 					ReplaceBytesStage(old, new),
 				)
@@ -1641,13 +1619,13 @@ private pure func direct_string_length(source: CoreExpr, loc: CoreSourceLoc) -> 
 
 
 private pure func try_fuse_length(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 	fusion_index: Int,
 ) -> Option[CoreExpr]:
-	call ?= call_base_and_args(names, expr)
+	call ?= known_string_call(declarations, expr)
 
-	if call.name != "length":
+	if call.function != StringLength:
 		None
 	else:
 		match call.args:
@@ -1656,7 +1634,7 @@ private pure func try_fuse_length(
 					is_string_type(core_expr_type(source))
 					and is_int_value_type(core_expr_type(expr))
 				):
-					match pipeline_of_expr(names, source):
+					match pipeline_of_expr(declarations, source):
 						Some(pipeline):
 							lower_pipeline_with_source(pipeline, lower_length_stages, fusion_index)
 						None:
@@ -1674,14 +1652,14 @@ private pure func try_fuse_length(
 
 
 private pure func try_fuse_materialization(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 	fusion_index: Int,
 ) -> Option[CoreExpr]:
 	if not is_string_type(core_expr_type(expr)):
 		None
 	else:
-		pipeline ?= pipeline_of_expr(names, expr)
+		pipeline ?= pipeline_of_expr(declarations, expr)
 
 		match lower_materialized_replace(pipeline, fusion_index):
 			Some(fused):
@@ -1696,12 +1674,12 @@ private pure func try_fuse_materialization(
 
 ---
 What the string fusion walk carries from node to node. The map state is rebuilt
-only when a node fuses, so `names` rides along at no per-node cost, where a
+only when a node fuses, so `declarations` rides along at no per-node cost, where a
 closure capturing it would be built for every node visited.
 ---
 private record StringFusionState {
 	next_fusion_index: Int,
-	names: CoreCopyDeclarationNames
+	declarations: CoreDeclarationIndex
 }
 
 
@@ -1714,11 +1692,11 @@ private pure func fuse_string_expr_at(
 	state: StringFusionState,
 	expr: CoreExpr,
 ) -> CoreMapState[StringFusionState, CoreExpr]:
-	match try_fuse_length(state.names, expr, state.next_fusion_index):
+	match try_fuse_length(state.declarations, expr, state.next_fusion_index):
 		Some(fused):
 			{ state = { state | next_fusion_index = state.next_fusion_index + 1 }, value = fused }
 		None:
-			match try_fuse_materialization(state.names, expr, state.next_fusion_index):
+			match try_fuse_materialization(state.declarations, expr, state.next_fusion_index):
 				Some(fused):
 					{ state = { state | next_fusion_index = state.next_fusion_index + 1 }, value = fused }
 				None:
@@ -1730,11 +1708,11 @@ private pure func fuse_string_expr_at(
 					mapped: CoreExpr = mapped_children.value
 					after: StringFusionState = mapped_children.state
 
-					match try_fuse_length(after.names, mapped, after.next_fusion_index):
+					match try_fuse_length(after.declarations, mapped, after.next_fusion_index):
 						Some(fused):
 							{ state = { after | next_fusion_index = after.next_fusion_index + 1 }, value = fused }
 						None:
-							match try_fuse_materialization(after.names, mapped, after.next_fusion_index):
+							match try_fuse_materialization(after.declarations, mapped, after.next_fusion_index):
 								Some(fused):
 									{ state = { after | next_fusion_index = after.next_fusion_index + 1 }, value = fused }
 								None:
@@ -1743,33 +1721,33 @@ private pure func fuse_string_expr_at(
 
 ---
 Keep the public single-expression API for existing callers and tests.
-Each expression starts its successful-rewrite ordinal at zero. `names` is the
-`core_copy_declaration_names` of the program the expression belongs to.
+Each expression starts its successful-rewrite ordinal at zero. `declarations` is the
+`core_declaration_index` of the program the expression belongs to.
 ---
-pure func fuse_string_expr(names: CoreCopyDeclarationNames, expr: CoreExpr) -> CoreExpr:
-	fuse_string_expr_at({ next_fusion_index = 0, names = names }, expr).value
+pure func fuse_string_expr(declarations: CoreDeclarationIndex, expr: CoreExpr) -> CoreExpr:
+	fuse_string_expr_at({ next_fusion_index = 0, declarations = declarations }, expr).value
 
 
 private pure func fuse_string_function(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	function_info: CoreFunction,
 ) -> CoreFunction:
-	{ function_info | body = function_info.body.map(pure func(body): fuse_string_expr(names, body)) }
+	{ function_info | body = function_info.body.map(pure func(body): fuse_string_expr(declarations, body)) }
 
 
-private pure func fuse_string_decl(names: CoreCopyDeclarationNames, decl: CoreDecl) -> CoreDecl:
+private pure func fuse_string_decl(declarations: CoreDeclarationIndex, decl: CoreDecl) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(fuse_string_function(names, function_info))
+			FunctionDecl(fuse_string_function(declarations, function_info))
 		GlobalDecl(global):
-			GlobalDecl({ global | init = fuse_string_expr(names, global.init) })
+			GlobalDecl({ global | init = fuse_string_expr(declarations, global.init) })
 		ImplDecl(impl):
 			ImplDecl({ impl |
-				methods = impl.methods.map(pure func(method): fuse_string_function(names, method))
+				methods = impl.methods.map(pure func(method): fuse_string_function(declarations, method))
 			})
 		_:
 			decl
 
 
-pure func fuse_string_program(names: CoreCopyDeclarationNames, program: CoreProgram) -> CoreProgram:
-	{ program | decls = program.decls.map(pure func(decl): fuse_string_decl(names, decl)) }
+pure func fuse_string_program(declarations: CoreDeclarationIndex, program: CoreProgram) -> CoreProgram:
+	{ program | decls = program.decls.map(pure func(decl): fuse_string_decl(declarations, decl)) }

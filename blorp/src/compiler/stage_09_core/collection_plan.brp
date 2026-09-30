@@ -6,13 +6,14 @@
 import:
 	ir:
 		CoreCallKind(UnknownCall, UserCall),
-		CoreCopyDeclarationNames,
+		CoreDeclarationIndex,
 		CoreExpr(CallExpr, VarExpr),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(NamedType),
-		core_callee_declaration_name,
+		core_known_callee,
 		core_expr_type,
+	known_functions: CoreKnownFunction(ListFilter, ListFilterMap, ListFoldLeft, ListLength, ListMap, ListRange)
 
 
 private INT_TYPE: CoreType = NamedType("Int", [])
@@ -66,7 +67,7 @@ private record CollectedCollectionPipeline {
 
 
 record CoreCollectionPipelineCall {
-	base: String,
+	function: CoreKnownFunction,
 	args: List[CoreExpr]
 }
 
@@ -101,75 +102,35 @@ pure func collection_list_element_type(typ: CoreType) -> Option[CoreType]:
 			None
 
 
-private pure func strip_prefix(name: String, prefix: String) -> Option[String]:
-	if name.starts_with(prefix):
-		Some(name.substring(prefix.length(), name.length() - prefix.length()))
-	else:
-		None
-
-
-private pure func supported_list_base_name(name: String) -> Option[String]:
-	match name:
-		"filter" | "filter_map" | "map" | "fold_left" | "length" | "range" | "flat_map" | "partition" | "scan" | "sort" | "reverse" | "zip" | "zip_with":
-			Some(name)
-		_:
-			None
-
-
 ---
-The list pipeline function a call reaches, by its supported base name (`map`,
-`filter`, ...). `declared_name` is the callee's declared name
-(`core_callee_declaration_name`): a mono instance or pure variant is read through
-the declaration its origin names, so only a `list__` module prefix (or the UFCS
-wrapper's `__ufcs_list__` prefix) is left to strip here.
+The list pipeline function a call reaches, by the callee's definition id: a
+mono instance, pure variant or `HasLength` method of `list` is recognised
+through the declaration it is (`CoreDeclarationIndex.known_functions`), so no
+name is parsed.
 ---
-pure func collection_pipeline_base_name(declared_name: String) -> Option[String]:
-	base: String = match strip_prefix(declared_name, "list__"):
-		Some(rest):
-			rest
-		None:
-			strip_prefix(declared_name, "__ufcs_list__").get_or(declared_name)
-
-	match supported_list_base_name(base):
-		Some(supported):
-			Some(supported)
-		None:
-			if base.starts_with("HasLength_length_List"):
-				Some("length")
-			else:
-				None
-
-
-pure func collection_pipeline_call_base_and_args(
-	names: CoreCopyDeclarationNames,
+pure func collection_pipeline_known_call(
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 ) -> Option[CoreCollectionPipelineCall]:
 	match expr:
 		CallExpr(call_kind, callee, args, _, _):
-			name: Option[String] = match call_kind:
-				UserCall(user_name, user_def_id, _):
-					Some(core_callee_declaration_name(names, user_def_id, user_name))
+			callee_def_id: Option[Int] = match call_kind:
+				UserCall(_, user_def_id, _):
+					user_def_id
 				UnknownCall:
 					match callee:
 						VarExpr(variable, _, _):
-							Some(core_callee_declaration_name(names, variable.def_id, variable.name))
+							variable.def_id
 						_:
 							None
 				_:
 					None
 
-			match name:
-				Some(call_name):
-					match collection_pipeline_base_name(call_name):
-						Some(base):
-							Some({
-								base = base,
-								args = args,
-							})
-						None:
-							None
-				None:
-					None
+			function ?= core_known_callee(declarations, callee_def_id)
+			Some({
+				function = function,
+				args = args,
+			})
 		_:
 			None
 
@@ -211,12 +172,12 @@ private pure func append_collection_stage(
 
 
 private pure func collect_collection_pipeline(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 ) -> Option[CollectedCollectionPipeline]:
-	match collection_pipeline_call_base_and_args(names, expr):
+	match collection_pipeline_known_call(declarations, expr):
 		Some(call):
-			collect_collection_call(names, expr, call)
+			collect_collection_call(declarations, expr, call)
 		None:
 			element_type ?= collection_list_element_type(core_expr_type(expr))
 			Some({
@@ -228,11 +189,11 @@ private pure func collect_collection_pipeline(
 
 
 private pure func collect_collection_call(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 	call: CoreCollectionPipelineCall,
 ) -> Option[CollectedCollectionPipeline]:
-	if call.base == "range" and call.args.length() == 2:
+	if call.function == ListRange and call.args.length() == 2:
 		start ?= call.args.get(0)
 		stop ?= call.args.get(1)
 		Some({
@@ -241,16 +202,16 @@ private pure func collect_collection_call(
 			cardinality = CollectionExactCardinality,
 			element_type = INT_TYPE,
 		})
-	else if call.base == "filter" and call.args.length() == 2:
+	else if call.function == ListFilter and call.args.length() == 2:
 		source ?= call.args.get(0)
 		callback ?= call.args.get(1)
-		collected ?= collect_collection_pipeline(names, source)
+		collected ?= collect_collection_pipeline(declarations, source)
 		stage: CoreCollectionPipelineStage = CollectionFilterStage(callback, collected.element_type)
 		Some(append_collection_stage(collected, stage, collected.element_type))
-	else if call.base == "filter_map" and call.args.length() == 2:
+	else if call.function == ListFilterMap and call.args.length() == 2:
 		source ?= call.args.get(0)
 		callback ?= call.args.get(1)
-		collected ?= collect_collection_pipeline(names, source)
+		collected ?= collect_collection_pipeline(declarations, source)
 		output_type ?= collection_list_element_type(core_expr_type(expr))
 		option_type: CoreType = NamedType("Option", [output_type])
 		stage: CoreCollectionPipelineStage = CollectionFilterMapStage(
@@ -260,10 +221,10 @@ private pure func collect_collection_call(
 			option_type,
 		)
 		Some(append_collection_stage(collected, stage, output_type))
-	else if call.base == "map" and call.args.length() == 2:
+	else if call.function == ListMap and call.args.length() == 2:
 		source ?= call.args.get(0)
 		callback ?= call.args.get(1)
-		collected ?= collect_collection_pipeline(names, source)
+		collected ?= collect_collection_pipeline(declarations, source)
 		output_type ?= collection_list_element_type(core_expr_type(expr))
 		stage: CoreCollectionPipelineStage = CollectionMapStage(
 			callback,
@@ -314,16 +275,16 @@ private pure func make_collection_pipeline_plan(
 
 
 pure func collection_pipeline_plan(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 ) -> Option[CoreCollectionPipelinePlan]:
-	match collection_pipeline_call_base_and_args(names, expr):
+	match collection_pipeline_known_call(declarations, expr):
 		Some(call):
-			if call.base == "fold_left" and call.args.length() == 3:
+			if call.function == ListFoldLeft and call.args.length() == 3:
 				source ?= call.args.get(0)
 				initial ?= call.args.get(1)
 				reducer ?= call.args.get(2)
-				collected ?= collect_collection_pipeline(names, source)
+				collected ?= collect_collection_pipeline(declarations, source)
 				make_collection_pipeline_plan(
 					collected.source,
 					collected.stages,
@@ -332,9 +293,9 @@ pure func collection_pipeline_plan(
 					core_expr_type(expr),
 					collection_expr_loc(expr),
 				)
-			else if call.base == "length" and call.args.length() == 1:
+			else if call.function == ListLength and call.args.length() == 1:
 				source ?= call.args.get(0)
-				collected ?= collect_collection_pipeline(names, source)
+				collected ?= collect_collection_pipeline(declarations, source)
 				make_collection_pipeline_plan(
 					collected.source,
 					collected.stages,
@@ -344,16 +305,16 @@ pure func collection_pipeline_plan(
 					collection_expr_loc(expr),
 				)
 			else:
-				collection_collect_plan(names, expr)
+				collection_collect_plan(declarations, expr)
 		None:
-			collection_collect_plan(names, expr)
+			collection_collect_plan(declarations, expr)
 
 
 private pure func collection_collect_plan(
-	names: CoreCopyDeclarationNames,
+	declarations: CoreDeclarationIndex,
 	expr: CoreExpr,
 ) -> Option[CoreCollectionPipelinePlan]:
-	collected ?= collect_collection_pipeline(names, expr)
+	collected ?= collect_collection_pipeline(declarations, expr)
 	make_collection_pipeline_plan(
 		collected.source,
 		collected.stages,

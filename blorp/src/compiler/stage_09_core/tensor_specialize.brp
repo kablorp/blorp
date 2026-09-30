@@ -33,6 +33,7 @@ import:
 			VoidExpr,
 		),
 		CoreFunction,
+		CoreKnownFunctions,
 		CoreLiteral(IntLiteral),
 		CoreLogicalOp(AndOp),
 		CoreProgram,
@@ -45,7 +46,9 @@ import:
 		PassTempKind(TensorViewTemp),
 		CoreVar,
 		core_expr_type,
+		core_known_functions,
 		core_var_equal,
+	known_functions: CoreKnownFunction(FloatAbs, FloatExp, FloatLog, FloatSqrt, VectorAbs, VectorExp, VectorLog, VectorNorm, VectorSqrt)
 	synth_nodes: intrinsic_call_at as intrinsic_call
 	traverse as CoreTraverse
 
@@ -584,35 +587,26 @@ private pure func unary_tensor_math_kind(name: String) -> Option[UnaryTensorMath
 	if (
 		name == "blorp_vector_norm"
 		or name == "norm"
-		or name == "vector__norm"
 	):
 		Some(UnaryTensorNorm)
 	else if (
 		name == "blorp_vector_sqrt"
 		or name == "sqrt"
-		or name == "float__sqrt"
-		or name == "vector__sqrt"
 	):
 		Some(UnaryTensorSqrt)
 	else if (
 		name == "blorp_vector_exp"
 		or name == "exp"
-		or name == "float__exp"
-		or name == "vector__exp"
 	):
 		Some(UnaryTensorExp)
 	else if (
 		name == "blorp_vector_log"
 		or name == "log"
-		or name == "float__log"
-		or name == "vector__log"
 	):
 		Some(UnaryTensorLog)
 	else if (
 		name == "blorp_vector_abs"
 		or name == "abs"
-		or name == "float__abs"
-		or name == "vector__abs"
 	):
 		Some(UnaryTensorAbs)
 	else:
@@ -641,10 +635,9 @@ private pure func tensor_float_kind(typ: CoreType) -> Option[TensorFloatKind]:
 
 
 private pure func unary_tensor_math_runtime_name(
-	name: String,
+	operation: UnaryTensorMathKind,
 	receiver_type: CoreType,
 ) -> Option[String]:
-	operation ?= unary_tensor_math_kind(name)
 	float_kind ?= tensor_float_kind(receiver_type)
 
 	base: String = match operation:
@@ -676,39 +669,83 @@ private pure func unary_tensor_math_runtime_name(
 	Some(base + suffix)
 
 
-private pure func unary_tensor_math_call_name(
-	kind: CoreCallKind,
-	callee: CoreExpr,
-) -> Option[String]:
-	match kind:
-		BuiltinCall(name):
-			Some(name)
-		SelectedDirectCall(_):
-			match callee:
-				VarExpr(variable, _, _):
-					if unary_tensor_math_kind(variable.name).is_some():
-						Some(variable.name)
-					else:
-						None
-				_:
-					None
-		UserCall(name, _, _):
-			if unary_tensor_math_kind(name).is_some():
-				Some(name)
-			else:
-				None
+---
+The unary tensor math a standard-library function is: the `vector` member itself,
+or the scalar `float` member a call lifts over a tensor.
+---
+private pure func known_unary_tensor_math_kind(
+	function: CoreKnownFunction,
+) -> Option[UnaryTensorMathKind]:
+	match function:
+		VectorNorm:
+			Some(UnaryTensorNorm)
+		VectorSqrt | FloatSqrt:
+			Some(UnaryTensorSqrt)
+		VectorExp | FloatExp:
+			Some(UnaryTensorExp)
+		VectorLog | FloatLog:
+			Some(UnaryTensorLog)
+		VectorAbs | FloatAbs:
+			Some(UnaryTensorAbs)
 		_:
 			None
 
 
-private pure func specialize_unary_tensor_math(expr: CoreExpr) -> CoreExpr:
+---
+The unary tensor math a call performs: a runtime or bare name the call spells, or a
+standard-library function its callee's definition id is (`known_functions`).
+---
+private pure func unary_tensor_math_call_kind(
+	known_functions: CoreKnownFunctions,
+	kind: CoreCallKind,
+	callee: CoreExpr,
+) -> Option[UnaryTensorMathKind]:
+	match kind:
+		BuiltinCall(name):
+			unary_tensor_math_kind(name)
+		SelectedDirectCall(def_id):
+			match callee:
+				VarExpr(variable, _, _):
+					match unary_tensor_math_kind(variable.name):
+						Some(operation):
+							Some(operation)
+						None:
+							known_unary_tensor_math_kind_of(known_functions, Some(def_id))
+				_:
+					None
+		UserCall(name, def_id, _):
+			match unary_tensor_math_kind(name):
+				Some(operation):
+					Some(operation)
+				None:
+					known_unary_tensor_math_kind_of(known_functions, def_id)
+		_:
+			None
+
+
+private pure func known_unary_tensor_math_kind_of(
+	known_functions: CoreKnownFunctions,
+	def_id: Option[Int],
+) -> Option[UnaryTensorMathKind]:
+	match def_id:
+		Some(id):
+			function ?= known_functions.get(id)
+			known_unary_tensor_math_kind(function)
+		None:
+			None
+
+
+private pure func specialize_unary_tensor_math(
+	known_functions: CoreKnownFunctions,
+	expr: CoreExpr,
+) -> CoreExpr:
 	match expr:
 		CallExpr(kind, callee, args, result_type, loc):
-			match unary_tensor_math_call_name(kind, callee):
-				Some(name):
+			match unary_tensor_math_call_kind(known_functions, kind, callee):
+				Some(operation):
 					match args:
 						[receiver]:
-							match unary_tensor_math_runtime_name(name, core_expr_type(receiver)):
+							match unary_tensor_math_runtime_name(operation, core_expr_type(receiver)):
 								Some(runtime_name):
 									runtime_builtin_call(
 										runtime_name,
@@ -1693,11 +1730,11 @@ Exported so the fused tensor_specialize/specialize walk
 directly; `specialize_program` below keeps using it through its own
 unchanged recursive `specialize_expr`.
 ---
-pure func specialize_current_expr(expr: CoreExpr) -> CoreExpr:
+pure func specialize_current_expr(known_functions: CoreKnownFunctions, expr: CoreExpr) -> CoreExpr:
 	length_specialized: CoreExpr = specialize_length(expr)
 	access_specialized: CoreExpr = specialize_numeric_checked_access(length_specialized)
 	fill_specialized: CoreExpr = specialize_numeric_tensor_fill(access_specialized)
-	math_specialized: CoreExpr = specialize_unary_tensor_math(fill_specialized)
+	math_specialized: CoreExpr = specialize_unary_tensor_math(known_functions, fill_specialized)
 	reduction_specialized: CoreExpr = specialize_tensor_reduction(math_specialized)
 
 	match reduction_specialized:
@@ -1716,7 +1753,7 @@ Logical chains can be deeply associated and this pass's generated child
 mapper has a large frame. Use explicit postorder tasks for the logical tree,
 while ordinary subexpressions continue through specialize_expr.
 ---
-private pure func specialize_logical_expr(expr: CoreExpr) -> CoreExpr:
+private pure func specialize_logical_expr(known_functions: CoreKnownFunctions, expr: CoreExpr) -> CoreExpr:
 	var tasks: List[TensorSpecializeLogicalTask] = [SpecializeLogicalNode(expr)]
 	var task_count: Int = 1
 	var rewritten: List[CoreExpr] = []
@@ -1765,7 +1802,7 @@ private pure func specialize_logical_expr(expr: CoreExpr) -> CoreExpr:
 
 								task_count += 1
 							_:
-								specialized: CoreExpr = specialize_expr(current_expr)
+								specialized: CoreExpr = specialize_expr(known_functions, current_expr)
 
 								rewritten = if rewritten_count < rewritten.length():
 									rewritten.set(rewritten_count, specialized)
@@ -1782,6 +1819,7 @@ private pure func specialize_logical_expr(expr: CoreExpr) -> CoreExpr:
 								rewritten = rewritten.set(
 									rewritten_count - 2,
 									specialize_current_expr(
+										known_functions,
 										LogicalExpr(
 											op,
 											left,
@@ -1803,31 +1841,58 @@ private pure func specialize_logical_expr(expr: CoreExpr) -> CoreExpr:
 		expr
 
 
-private pure func specialize_expr(expr: CoreExpr) -> CoreExpr:
+private pure func specialize_expr(known_functions: CoreKnownFunctions, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LogicalExpr(_, _, _, _, _):
-			specialize_logical_expr(expr)
+			specialize_logical_expr(known_functions, expr)
 		SeqExpr(_, _):
-			specialize_current_expr(CoreTraverse.map_core_sequence_items(expr, specialize_expr))
+			specialize_current_expr(
+				known_functions,
+				CoreTraverse.map_core_sequence_items(
+					expr,
+					func(item): specialize_expr(known_functions, item),
+				),
+			)
 		_:
-			specialize_current_expr(CoreTraverse.map_core_expr_children(expr, specialize_expr))
+			specialize_current_expr(
+				known_functions,
+				CoreTraverse.map_core_expr_children(
+					expr,
+					func(child): specialize_expr(known_functions, child),
+				),
+			)
 
 
-private pure func specialize_function(function_info: CoreFunction) -> CoreFunction:
-	{ function_info | body = function_info.body.map(specialize_expr) }
+private pure func specialize_function(
+	known_functions: CoreKnownFunctions,
+	function_info: CoreFunction,
+) -> CoreFunction:
+	{ function_info |
+		body = function_info.body.map(func(body): specialize_expr(known_functions, body))
+	}
 
 
-private pure func specialize_decl(decl: CoreDecl) -> CoreDecl:
+private pure func specialize_decl(known_functions: CoreKnownFunctions, decl: CoreDecl) -> CoreDecl:
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(specialize_function(function_info))
+			FunctionDecl(specialize_function(known_functions, function_info))
 		GlobalDecl(global):
-			GlobalDecl({ global | init = specialize_expr(global.init) })
+			GlobalDecl({ global | init = specialize_expr(known_functions, global.init) })
 		ImplDecl(impl_decl):
-			ImplDecl({ impl_decl | methods = impl_decl.methods.map(specialize_function) })
+			ImplDecl({ impl_decl |
+				methods = impl_decl.methods.map(
+					func(method): specialize_function(known_functions, method),
+				)
+			})
 		_:
 			decl
 
 
+---
+The known functions this pass reads are the program's declarations: a call reaches
+`float.sqrt` or `vector.sqrt` by its callee's definition id, and an instance or
+variant is not one of them.
+---
 pure func specialize_program(program: CoreProgram) -> CoreProgram:
-	{ program | decls = program.decls.map(specialize_decl) }
+	known_functions: CoreKnownFunctions = core_known_functions({}, program)
+	{ program | decls = program.decls.map(func(decl): specialize_decl(known_functions, decl)) }

@@ -3,15 +3,21 @@
 -- measure the same private builder used by production resolve_core_program.
 import:
 	../../src/compiler/stage_08_core_lower/identity: core_module_member_name
-	../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../src/compiler/stage_02_lex/name_table: NameTable
+	../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		fixture_name_table,
+		fixture_source_function_origin_in,
 	../../src/compiler/stage_09_core/ir:
 		CoreCallKind(BuiltinCall),
 		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, ImplDecl, UnionDecl),
 		CoreEnumVariant,
 		CoreExpr(CallExpr, LiteralExpr, VarExpr),
 		CoreForeignArgPassing(ForeignBorrowArgs),
-		core_copy_declaration_names,
 		CoreFunction,
+		CoreFunctionOrigin,
+		core_declaration_index,
 		CoreFunctionKind(BuiltinFunction, ForeignFunction, UnresolvedBuiltinFunction, UserFunction),
 		CoreLiteral(IntLiteral),
 		CoreParam,
@@ -56,6 +62,7 @@ struct CompilerCoreCallResolveProfileConfig {
 record CompilerCoreCallResolveBenchmarkInput {
 	config: CompilerCoreCallResolveProfileConfig,
 	program: CoreProgram,
+	names: NameTable,
 	import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
 	expected_declaration_count: Int,
@@ -165,12 +172,13 @@ private pure func benchmark_runtime_forward(runtime_name: String) -> CoreExpr:
 	)
 
 
-private pure func benchmark_function(
+private pure func benchmark_function_with_origin(
 	name: String,
 	source_module: Option[String],
 	def_id: Int,
 	body: Option[CoreExpr],
 	function_kind: CoreFunctionKind,
+	origin: CoreFunctionOrigin,
 ) -> CoreFunction:
 	{
 		name = name,
@@ -180,7 +188,7 @@ private pure func benchmark_function(
 		return_type = int_type(),
 		body = body,
 		is_pure = True,
-		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		origin = origin,
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = function_kind,
 		def_id = def_id,
@@ -188,19 +196,40 @@ private pure func benchmark_function(
 	}
 
 
+-- A function no reader asks the member of: it has no module, or its module member
+-- name is irrelevant to the workload.
+private pure func benchmark_function(
+	name: String,
+	source_module: Option[String],
+	def_id: Int,
+	body: Option[CoreExpr],
+	function_kind: CoreFunctionKind,
+) -> CoreFunction:
+	benchmark_function_with_origin(
+		name,
+		source_module,
+		def_id,
+		body,
+		function_kind,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
+	)
+
+
 private pure func benchmark_module_function_decl(
+	names: NameTable,
 	function_index: Int,
 	module_count: Int,
 	duplicate_id_interval: Int,
 ) -> CoreDecl:
 	module_path: String = benchmark_module_path(function_index % module_count)
 	FunctionDecl(
-		benchmark_function(
+		benchmark_function_with_origin(
 			benchmark_function_name(function_index, module_count),
 			Some(module_path),
 			benchmark_function_def_id(function_index, duplicate_id_interval),
 			Some(benchmark_int_literal(function_index)),
 			UserFunction,
+			fixture_source_function_origin_in(names, benchmark_function_source_name(function_index)),
 		),
 	)
 
@@ -271,26 +300,28 @@ private pure func benchmark_builtin_function_decl() -> CoreDecl:
 	)
 
 
-private pure func benchmark_module_builtin_function_decl() -> CoreDecl:
+private pure func benchmark_module_builtin_function_decl(names: NameTable) -> CoreDecl:
 	FunctionDecl(
-		benchmark_function(
+		benchmark_function_with_origin(
 			core_module_member_name("list", "list"),
 			Some("list"),
 			BENCHMARK_SPECIAL_DEF_ID_BASE + 12,
 			None,
 			UnresolvedBuiltinFunction,
+			fixture_source_function_origin_in(names, "list"),
 		),
 	)
 
 
-private pure func benchmark_materialized_builtin_forward_decl() -> CoreDecl:
+private pure func benchmark_materialized_builtin_forward_decl(names: NameTable) -> CoreDecl:
 	FunctionDecl(
-		benchmark_function(
+		benchmark_function_with_origin(
 			core_module_member_name("string", "upper"),
 			Some("string"),
 			BENCHMARK_SPECIAL_DEF_ID_BASE + 13,
 			Some(benchmark_runtime_forward("blorp_upper")),
 			UserFunction,
+			fixture_source_function_origin_in(names, "upper"),
 		),
 	)
 
@@ -431,7 +462,24 @@ private pure func benchmark_module_imports(
 	imports
 
 
-private pure func benchmark_program(config: CompilerCoreCallResolveProfileConfig) -> CoreProgram:
+---
+The name table the benchmark's declarations carry their member ids in: the two
+standard-library members the workload declares and one member per generated
+module function.
+---
+private pure func benchmark_names(config: CompilerCoreCallResolveProfileConfig) -> NameTable:
+	var spellings: List[String] = ["list", "upper"]
+
+	for function_index in 0..config.function_count:
+		spellings = spellings.append(benchmark_function_source_name(function_index))
+
+	fixture_name_table(spellings)
+
+
+private pure func benchmark_program(
+	config: CompilerCoreCallResolveProfileConfig,
+	names: NameTable,
+) -> CoreProgram:
 	module_count: Int = benchmark_module_count(config)
 	var decls: List[CoreDecl] = [
 		benchmark_plain_function_decl(),
@@ -440,13 +488,14 @@ private pure func benchmark_program(config: CompilerCoreCallResolveProfileConfig
 		benchmark_first_foreign_function_decl(),
 		benchmark_borrow_foreign_function_decl(),
 		benchmark_builtin_function_decl(),
-		benchmark_module_builtin_function_decl(),
-		benchmark_materialized_builtin_forward_decl(),
+		benchmark_module_builtin_function_decl(names),
+		benchmark_materialized_builtin_forward_decl(names),
 	]
 
 	for function_index in 0..config.function_count:
 		decls = decls.append(
 			benchmark_module_function_decl(
+				names,
 				function_index,
 				module_count,
 				config.duplicate_id_interval,
@@ -511,6 +560,7 @@ private pure func module_path_membership_check_count(
 private pure func benchmark_input_from_parts(
 	config: CompilerCoreCallResolveProfileConfig,
 	program: CoreProgram,
+	names: NameTable,
 	import_bindings: List[CoreResolveImportBinding],
 	module_imports: List[CoreResolveModuleImports],
 ) -> CompilerCoreCallResolveBenchmarkInput:
@@ -530,6 +580,7 @@ private pure func benchmark_input_from_parts(
 	{
 		config = config,
 		program = program,
+		names = names,
 		import_bindings = import_bindings,
 		module_imports = module_imports,
 		expected_declaration_count = config.function_count + config.module_count + special_non_collection_decls + collection_decls,
@@ -557,10 +608,12 @@ private pure func benchmark_input_from_parts(
 pure func compiler_core_call_resolve_benchmark_input(
 	config: CompilerCoreCallResolveProfileConfig,
 ) -> CompilerCoreCallResolveBenchmarkInput:
-	program = benchmark_program(config)
+	names = benchmark_names(config)
+	program = benchmark_program(config, names)
 	benchmark_input_from_parts(
 		config,
 		program,
+		names,
 		benchmark_top_import_bindings(config),
 		benchmark_module_imports(config),
 	)
@@ -623,7 +676,7 @@ pure func compiler_core_call_resolve_benchmark_with_input(
 
 	for _ in 0..input.config.iterations:
 		observation = observe_core_call_resolve_env(
-			core_copy_declaration_names(input.program),
+			core_declaration_index(input.names, input.program),
 			input.program,
 			input.import_bindings,
 			input.module_imports,
