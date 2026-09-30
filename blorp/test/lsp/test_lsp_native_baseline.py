@@ -30,6 +30,11 @@ LIFECYCLE_ONLY_ROOT = ROOT / "blorp/test/lsp/fixtures/navigation"
 # compiler workers as interactive analysis, so give diagnostics waits in
 # those tests real headroom instead of the small-fixture default.
 HEAVY_WORKSPACE_TIMEOUT_SECONDS = 90.0
+# How many times slower than an empty root `initialize` may be on the
+# repository root. Lazy indexing measures about 2-3x under load; an eager
+# scan measured about 45x, so 8x leaves room for a load spike during the
+# repository run without hiding the regression.
+REPOSITORY_ROOT_INITIALIZE_MAX_RATIO = 8.0
 RUNNER_PATH = pathlib.Path(__file__).with_name("run_lsp_fixtures.py")
 RUNNER_SPEC = importlib.util.spec_from_file_location("run_lsp_fixtures", RUNNER_PATH)
 if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
@@ -39,30 +44,46 @@ sys.modules[RUNNER_SPEC.name] = RUNNER
 RUNNER_SPEC.loader.exec_module(RUNNER)
 
 class NativeLspBaselineTests(unittest.TestCase):
-    def test_initialize_completes_quickly_for_whole_repository_root(self) -> None:
+    def test_initialize_does_not_scan_whole_repository_root(self) -> None:
         # rootUri here is the whole monorepo (thousands of .brp files). Workspace-
         # root sources must be indexed lazily -- text loaded on open, on import
         # resolution, or filled in the background after the response -- so
         # `initialize` never pays for a whole-repository scan.
-        client = None
+        #
+        # The server exposes no work counter for this, so the test compares
+        # `initialize` latency on the repository root against an empty
+        # directory measured in the same run. An absolute bound flakes under
+        # machine load, but load slows both measurements alike, while an eager
+        # scan costs tens of times the empty-root time (68s against 1.5-3s
+        # when last forced). The empty-root baseline is the slower of two
+        # samples taken around the repository measurement so a load spike
+        # cannot make the baseline look unrealistically cheap.
+        expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
 
-        try:
-            expected_version = RUNNER.public_compiler_version(str(BLORP), ROOT)
-            client = RUNNER.LspClient(str(BLORP), ROOT)
-            started = time.monotonic()
-            client.initialize(ROOT.as_uri(), expected_version)
-            elapsed = time.monotonic() - started
-            # The eager whole-repository scan this replaced took over 10s here;
-            # 3s leaves a wide margin against that regression without flaking
-            # under contention on the gate's default -O0 build.
-            self.assertLess(
-                elapsed,
-                3.0,
-                f"initialize against the repository root took {elapsed:.3f}s",
-            )
-        finally:
-            if client is not None:
-                client.close()
+        def time_initialize(root: pathlib.Path) -> float:
+            client = None
+            try:
+                client = RUNNER.LspClient(str(BLORP), ROOT)
+                started = time.monotonic()
+                client.initialize(root.as_uri(), expected_version)
+                return time.monotonic() - started
+            finally:
+                if client is not None:
+                    client.close()
+
+        with tempfile.TemporaryDirectory() as empty_root:
+            empty = pathlib.Path(empty_root).resolve()
+            empty_before = time_initialize(empty)
+            repository = time_initialize(ROOT)
+            empty_after = time_initialize(empty)
+
+        baseline = max(empty_before, empty_after)
+        self.assertLess(
+            repository,
+            REPOSITORY_ROOT_INITIALIZE_MAX_RATIO * baseline,
+            f"initialize against the repository root took {repository:.3f}s; "
+            f"empty root took {empty_before:.3f}s and {empty_after:.3f}s",
+        )
 
     def test_clean_eof_before_initialize_is_successful_shutdown(self) -> None:
         client = RUNNER.LspClient(str(BLORP), ROOT)
