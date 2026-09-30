@@ -3237,13 +3237,20 @@ private pure func expr_consumes_var(expr: CoreExpr, variable: CoreVar) -> Bool:
 			expr_consumes_var(start, variable) or expr_consumes_var(end_value, variable)
 
 
+--- A copied task capture released after the task body, with the type it is released as.
+private record CoreDroppedCapture {
+	variable: CoreVar,
+	value_type: CoreType
+}
+
+
 ---
-`body` followed by a drop of `variable`. A body that yields a value is bound
-to a temporary so the drop can run between computing it and returning it; the
-temporary takes `next_binder_id - 1` (`CorePassState.next_binder_id`, see
-`FIRST_MINTED_BINDER_ID` in ir.brp), and `ids_used` is 1 exactly then. It is
-derived from `variable`; the minted id, negated, is its ordinal, so two drops of
-one variable never share a spelling.
+A task body with the drops of its unconsumed copied captures appended. A body
+that yields a value is bound to a temporary so the drops can run between
+computing it and returning it; the temporary takes `next_binder_id - 1`
+(`CorePassState.next_binder_id`, see `FIRST_MINTED_BINDER_ID` in ir.brp), and
+`ids_used` is 1 exactly then. It is derived from the first dropped capture; the
+minted id, negated, is its ordinal, so two tasks never share a spelling.
 ---
 private record DroppedBody {
 	expr: CoreExpr,
@@ -3251,86 +3258,64 @@ private record DroppedBody {
 }
 
 
-private pure func drop_after_body(
-	next_binder_id: Int,
-	variable: CoreVar,
-	value_type: CoreType,
-	body: CoreExpr,
-	loc: CoreSourceLoc,
-) -> DroppedBody:
-	release_policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(value_type)
-
-	if core_type_is_void(core_expr_type(body)):
-		{
-			expr = SeqExpr(
-				body,
-				DropExpr(
-					variable,
-					value_type,
-					release_policy,
-					VoidExpr(VoidType, loc),
-					VoidType,
-					loc,
-				),
-			),
-			ids_used = 0
-		}
-	else:
-		drop_id: Int = next_binder_id - 1
-		anchor_key: String = derived_anchor_key(variable)
-		result_var: CoreVar = {
-			name = derived_temporary_spelling(anchor_key, ClosureDropTemp, 0 - drop_id),
-			id = drop_id,
-			def_id = None,
-			origin = DerivedFrom(anchor_key, ClosureDropTemp, 0 - drop_id)
-		}
-		result_type: CoreType = core_expr_type(body)
-		{
-			expr = LetExpr(
-				result_var,
-				False,
-				result_type,
-				body,
-				DropExpr(
-					variable,
-					value_type,
-					release_policy,
-					VarExpr(result_var, result_type, loc),
-					result_type,
-					loc,
-				),
-			),
-			ids_used = 1
-		}
-
-
-private pure func balance_task_copy_capture(
-	next_binder_id: Int,
-	body: CoreExpr,
+--- The variable of `capture` when the task owns a copy that its body leaves
+--- unconsumed and so must release before the task returns; `None` otherwise.
+private pure func task_capture_dropped_after_body(
 	capture: CoreTaskCapture,
-	loc: CoreSourceLoc,
-) -> DroppedBody:
+	body: CoreExpr,
+) -> Option[CoreVar]:
 	match capture.kind:
 		TaskCopyCapture:
 			variable: CoreVar = { name = capture.name, id = capture.id, def_id = None, origin = capture.origin }
 
 			if expr_consumes_var(body, variable):
-				{
-					expr = body,
-					ids_used = 0
-				}
+				None
 			else:
-				drop_after_body(next_binder_id, variable, capture.typ, body, loc)
+				Some(variable)
 		TaskMoveResourceItem:
-			{
-				expr = body,
-				ids_used = 0
-			}
+			None
 		TaskStructuredTaskBorrow:
-			{
-				expr = body,
-				ids_used = 0
-			}
+			None
+
+
+--- The unconsumed copied captures of a task in capture order, paired with the
+--- type each is released as.
+private pure func task_captures_dropped_after_body(
+	captures: List[CoreTaskCapture],
+	body: CoreExpr,
+) -> List[CoreDroppedCapture]:
+	captures.filter_map(func(capture):
+		match task_capture_dropped_after_body(capture, body):
+			Some(variable):
+				Some({ variable = variable, value_type = capture.typ })
+			None:
+				None
+	)
+
+
+--- `tail` preceded by a drop of each capture, the last capture first. The drops
+--- form one chain of `DropExpr` continuations rather than a body wrapped once
+--- per capture, so a task with hundreds of captures stays flat instead of
+--- nesting a statement expression per capture (C compilers cap bracket depth).
+private pure func drop_captures_before(
+	dropped: List[CoreDroppedCapture],
+	tail: CoreExpr,
+	tail_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreExpr:
+	var chained: CoreExpr = tail
+
+	for capture in dropped:
+		chained = DropExpr(
+			capture.variable,
+			capture.value_type,
+			CoreTypePolicy.cleanup_release_policy_for_type(capture.value_type),
+			chained,
+			tail_type,
+			loc,
+		)
+
+	chained
 
 
 private pure func balance_task_copy_captures(
@@ -3339,30 +3324,40 @@ private pure func balance_task_copy_captures(
 	body: CoreExpr,
 	loc: CoreSourceLoc,
 ) -> DroppedBody:
-	var balanced: CoreExpr = body
-	var ids_used: Int = 0
-	var index: Int = captures.length() - 1
+	dropped: List[CoreDroppedCapture] = task_captures_dropped_after_body(captures, body)
 
-	while index >= 0:
-		match captures.get(index):
-			Some(capture):
-				dropped: DroppedBody = balance_task_copy_capture(
-					next_binder_id - ids_used,
-					balanced,
-					capture,
-					loc,
-				)
-				balanced = dropped.expr
-				ids_used += dropped.ids_used
-			None:
-				void
-
-		index -= 1
-
-	{
-		expr = balanced,
-		ids_used = ids_used
-	}
+	match dropped.get(0):
+		None:
+			{
+				expr = body,
+				ids_used = 0
+			}
+		Some(first):
+			if core_type_is_void(core_expr_type(body)):
+				{
+					expr = SeqExpr(body, drop_captures_before(dropped, VoidExpr(VoidType, loc), VoidType, loc)),
+					ids_used = 0
+				}
+			else:
+				drop_id: Int = next_binder_id - 1
+				anchor_key: String = derived_anchor_key(first.variable)
+				result_var: CoreVar = {
+					name = derived_temporary_spelling(anchor_key, ClosureDropTemp, 0 - drop_id),
+					id = drop_id,
+					def_id = None,
+					origin = DerivedFrom(anchor_key, ClosureDropTemp, 0 - drop_id)
+				}
+				result_type: CoreType = core_expr_type(body)
+				{
+					expr = LetExpr(
+						result_var,
+						False,
+						result_type,
+						body,
+						drop_captures_before(dropped, VarExpr(result_var, result_type, loc), result_type, loc),
+					),
+					ids_used = 1
+				}
 
 
 private pure func add_hoisted_function(

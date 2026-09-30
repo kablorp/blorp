@@ -481,6 +481,114 @@ pure func copied_task_capture_transfer_program() -> CoreProgram:
 	}
 
 
+pure func numbered_string_params(count: Int) -> List[CoreParam]:
+	var params: List[CoreParam] = []
+
+	for index in 0..count:
+		params = params.append(local_param("capture_" + index.to_string(), string_type()))
+
+	params
+
+
+pure func string_param_vars(params: List[CoreParam]) -> List[CoreExpr]:
+	params.map(func(param): VarExpr(param.name, string_type(), synthetic_core_source_loc()))
+
+
+--- A concurrent block whose task body calls a function on `capture_count` copied
+--- String parameters, so the task must release all of them after computing its Int.
+pure func wide_capture_concurrent_program(capture_count: Int) -> CoreProgram:
+	params: List[CoreParam] = numbered_string_params(capture_count)
+	run_concurrent: CoreFunction = {
+		name = "run_wide_capture_concurrent",
+		source_module = None,
+		type_params = [],
+		params = params,
+		return_type = int_type(),
+		body = Some(
+			PreClosureConcurrentExpr(
+				{
+					bindings = [
+						{
+							variable = local_var("produced"),
+							typ = StackResultType(int_type(), int_type()),
+							rhs = CallExpr(
+								UserCall("total_length", Some(78), []),
+								VarExpr(
+									local_var("total_length"),
+									closure_type(),
+									synthetic_core_source_loc(),
+								),
+								string_param_vars(params),
+								int_type(),
+								synthetic_core_source_loc(),
+							)
+						},
+					],
+					body = VarExpr(
+						local_var("produced"),
+						StackResultType(int_type(), int_type()),
+						synthetic_core_source_loc(),
+					),
+					timeout = None,
+					max_threads = None
+				},
+				int_type(),
+				synthetic_core_source_loc(),
+			),
+		),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 31,
+		loc = synthetic_core_source_loc()
+	}
+
+	{
+		decls = [FunctionDecl(run_concurrent)],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+--- A detached task whose void body calls a function on `capture_count` copied
+--- String parameters.
+pure func wide_capture_detach_program(capture_count: Int) -> CoreProgram:
+	params: List[CoreParam] = numbered_string_params(capture_count)
+	run_detach: CoreFunction = {
+		name = "run_wide_capture_detach",
+		source_module = None,
+		type_params = [],
+		params = params,
+		return_type = VoidType,
+		body = Some(
+			PreClosureDetachExpr(
+				CallExpr(
+					UserCall("consume_all", Some(79), []),
+					VarExpr(local_var("consume_all"), closure_type(), synthetic_core_source_loc()),
+					string_param_vars(params),
+					VoidType,
+					synthetic_core_source_loc(),
+				),
+				VoidType,
+				synthetic_core_source_loc(),
+			),
+		),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 32,
+		loc = synthetic_core_source_loc()
+	}
+
+	{
+		decls = [FunctionDecl(run_detach)],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
 pure func concurrent_program() -> CoreProgram:
 	run_concurrent: CoreFunction = {
 		name = "run_concurrent",
@@ -1043,6 +1151,123 @@ pure func test_pre_closure_concurrent_task_returns_rhs_type() -> Bool:
 			False
 
 
+--- The names a chain of `DropExpr` continuations releases, outermost first, and
+--- the expression the chain ends in. Walked iteratively with one-level matches.
+private record DropChain {
+	names: List[String],
+	tail: CoreExpr
+}
+
+
+pure func drop_chain_of(expr: CoreExpr) -> DropChain:
+	var names: List[String] = []
+	var current: CoreExpr = expr
+	var walking: Bool = True
+
+	while walking:
+		match current:
+			DropExpr(variable, value_type, release_policy, next, typ, loc):
+				names = names.append(variable.name)
+				current = next
+			_:
+				walking = False
+
+	{ names = names, tail = current }
+
+
+--- The hoisted task function's body, which is the second declaration after the
+--- function that spawned it.
+pure func hoisted_task_body(program: CoreProgram) -> Option[CoreExpr]:
+	converted: CoreProgram = convert_program_for_test(program)
+
+	match converted.decls.get(1):
+		Some(FunctionDecl(task_func)):
+			task_func.body
+		_:
+			None
+
+
+pure func expected_release_order(count: Int) -> List[String]:
+	var names: List[String] = []
+
+	for index in 0..count:
+		names = [("capture_" + index.to_string())] + names
+
+	names
+
+
+--- A task result is bound to one temporary and the captures are released by one
+--- flat chain of drops after it. Wrapping the body once per capture would emit a
+--- statement expression per capture, which Linux clang rejects past its
+--- bracket-depth limit for tasks with a hundred or more captures.
+pure func task_result_is_released_by_one_chain(capture_count: Int) -> Bool:
+	match hoisted_task_body(wide_capture_concurrent_program(capture_count)):
+		Some(body):
+			match body:
+				LetExpr(result_var, is_mutable, result_type, value, rest):
+					chain: DropChain = drop_chain_of(rest)
+					(
+						chain.names == expected_release_order(capture_count)
+						and is_int_type(result_type)
+						and expr_is_var_with_id(chain.tail, result_var.id)
+						and not expr_is_let(value)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func expr_is_var_with_id(expr: CoreExpr, id: Int) -> Bool:
+	match expr:
+		VarExpr(variable, typ, loc):
+			variable.id == id
+		_:
+			False
+
+
+pure func expr_is_let(expr: CoreExpr) -> Bool:
+	match expr:
+		LetExpr(variable, is_mutable, typ, value, body):
+			True
+		_:
+			False
+
+
+pure func test_task_releases_copy_captures_in_one_flat_chain() -> Bool:
+	task_result_is_released_by_one_chain(3)
+
+
+pure func test_task_with_wide_captures_releases_in_one_flat_chain() -> Bool:
+	task_result_is_released_by_one_chain(130)
+
+
+--- A void task needs no result temporary: the body runs, then the drops.
+pure func test_void_task_releases_copy_captures_without_a_temporary() -> Bool:
+	match hoisted_task_body(wide_capture_detach_program(3)):
+		Some(body):
+			match body:
+				SeqExpr(first, second):
+					chain: DropChain = drop_chain_of(second)
+					(
+						chain.names == expected_release_order(3)
+						and is_void_expr(chain.tail)
+						and not expr_is_let(first)
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func is_void_expr(expr: CoreExpr) -> Bool:
+	match expr:
+		VoidExpr(typ, loc):
+			True
+		_:
+			False
+
+
 pure func test_pre_closure_resource_loop_captures_moved_item_not_callee_alias() -> Bool:
 	converted: CoreProgram = convert_program_for_test(resource_concurrent_loop_program())
 
@@ -1402,6 +1627,18 @@ tests: TestSuite = {
 		(
 			"pre-closure detach balances copied task captures",
 			test_pre_closure_detach_balances_copy_captures,
+		),
+		(
+			"task releases copied captures in one flat chain",
+			test_task_releases_copy_captures_in_one_flat_chain,
+		),
+		(
+			"task with 130 captures releases them in one flat chain",
+			test_task_with_wide_captures_releases_in_one_flat_chain,
+		),
+		(
+			"void task releases copied captures without a temporary",
+			test_void_task_releases_copy_captures_without_a_temporary,
 		),
 		(
 			"pre-closure concurrent task returns rhs type",
