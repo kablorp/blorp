@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check tooling-check artifact-scan quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -501,10 +501,13 @@ smoke: all
 
 quality:
 	$(MAKE) hygiene-check
+	$(MAKE) tooling-check
+	$(MAKE) artifact-scan
 	$(MAKE) c-static-analysis
 
 quality-full: quality
 
+# Seconds-long static checks; `scripts/land` runs this on every landing.
 hygiene-check: build-blorp-cli
 	@scripts/check-blorp-layout
 	@scripts/check-editor-drift
@@ -512,6 +515,26 @@ hygiene-check: build-blorp-cli
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
 	@python3 scripts/check-magic-spellings
+	@$(MAKE) --no-print-directory artifact-scan
+
+# Stray generated files left by builds or tests.
+artifact-scan:
+	@artifacts=$$( \
+		find . \
+			\( -path './.git' -o -path './blorp/build/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \
+			\( -name 'runtime_decl.plist' -o -name '*.generated.c' -o -name '.blorp_doctest_*' \) -print; \
+		find blorp/test $(STANDARD_LIBRARY_TEST_ROOT) pkg/test -name '*.c' -print 2>/dev/null; \
+	); \
+	if [ -n "$$artifacts" ]; then \
+		echo "Generated artifacts should not be left in the repo:"; \
+		echo "$$artifacts"; \
+		exit 1; \
+	fi
+
+# The benchmark-worker checks and the Python/shell tooling suites. They audit
+# compiler, runtime and script sources, so run them in `quality` and the
+# premerge gate rather than per landing.
+tooling-check: build-blorp-cli
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
@@ -555,18 +578,8 @@ hygiene-check: build-blorp-cli
 	@blorp/test/build/test_build_source_generator.sh
 	@blorp/test/build/test_release_toolchain.sh
 	@blorp/test/build/test_scripts_test_harness.sh
+	@blorp/test/build/test_land_lock.sh
 	@blorp/test/build/test_split_translation_units.sh
-	@artifacts=$$( \
-		find . \
-			\( -path './.git' -o -path './blorp/build/_build' -o -path './_build' -o -path './cmake-build-debug' \) -prune -o \
-			\( -name 'runtime_decl.plist' -o -name '*.generated.c' -o -name '.blorp_doctest_*' \) -print; \
-		find blorp/test $(STANDARD_LIBRARY_TEST_ROOT) pkg/test -name '*.c' -print 2>/dev/null; \
-	); \
-	if [ -n "$$artifacts" ]; then \
-		echo "Generated artifacts should not be left in the repo:"; \
-		echo "$$artifacts"; \
-		exit 1; \
-	fi
 
 c-static-analysis:
 	@command -v clang >/dev/null 2>&1 || { \

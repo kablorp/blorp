@@ -493,47 +493,47 @@ if ! grep -Fq "find blorp/src -name '*.brp' -type f -print" <<<"$cli_build_plan"
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_allocator_stats.py' Makefile; then
-	echo "FAIL: hygiene-check must include the optimized runtime allocator regression" >&2
+	echo "FAIL: tooling-check must include the optimized runtime allocator regression" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_float_to_string.py' Makefile; then
-	echo "FAIL: hygiene-check must include the Float to_string precision-search differential" >&2
+	echo "FAIL: tooling-check must include the Float to_string precision-search differential" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_memory_diagnostics.py' Makefile; then
-	echo "FAIL: hygiene-check must include the split-link memory diagnostics contract" >&2
+	echo "FAIL: tooling-check must include the split-link memory diagnostics contract" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_type_registry.py' Makefile; then
-	echo "FAIL: hygiene-check must include the type registry and bootstrap-macro compatibility contract" >&2
+	echo "FAIL: tooling-check must include the type registry and bootstrap-macro compatibility contract" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_release_path.py' Makefile; then
-	echo "FAIL: hygiene-check must include the final-release path contract" >&2
+	echo "FAIL: tooling-check must include the final-release path contract" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle.py' Makefile; then
-	echo "FAIL: hygiene-check must include the allocation oracle counter contract" >&2
+	echo "FAIL: tooling-check must include the allocation oracle counter contract" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_unicode_case_map.py' Makefile; then
-	echo "FAIL: hygiene-check must include the Unicode case-map differential" >&2
+	echo "FAIL: tooling-check must include the Unicode case-map differential" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_alloc_oracle_coverage.py' Makefile; then
-	echo "FAIL: hygiene-check must include the allocation oracle raw-call coverage gate" >&2
+	echo "FAIL: tooling-check must include the allocation oracle raw-call coverage gate" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_fatal_messages.py' Makefile; then
-	echo "FAIL: hygiene-check must include the runtime fatal message newline contract" >&2
+	echo "FAIL: tooling-check must include the runtime fatal message newline contract" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/runtime/test_runtime_compiler_only_metrics.py' Makefile; then
-	echo "FAIL: hygiene-check must include the compiler-only metrics runtime split" >&2
+	echo "FAIL: tooling-check must include the compiler-only metrics runtime split" >&2
 	exit 1
 fi
 if ! grep -Fq 'python3 -m unittest blorp/test/build/test_record_validation.py' Makefile; then
-	echo "FAIL: hygiene-check must include the validation evidence recorder contract" >&2
+	echo "FAIL: tooling-check must include the validation evidence recorder contract" >&2
 	exit 1
 fi
 if ! grep -Fq -- '--print-path' <<<"$cli_build_plan"; then

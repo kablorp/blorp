@@ -6,7 +6,8 @@
 #       [--dry-run]
 set -euo pipefail
 
-lock() { "$@"; }
+phase_start=$(date +%s)
+phase() { echo "LAND_PHASE $1 $(( $(date +%s) - phase_start ))s"; phase_start=$(date +%s); }
 verdict_status() { grep '^BLORP_GATE_RESULT ' | tail -1 | sed -n 's/.*status=\([A-Z]*\).*/\1/p'; }
 emit_verdict() { printf 'BLORP_GATE_RESULT gate=land status=%s passed=%s failed=%s tests=1\n' "$1" "$2" "$3"; }
 usage() {
@@ -46,6 +47,37 @@ if [ -n "$(git status --porcelain)" ]; then
     echo "Refusing: run scripts/land from a clean worktree." >&2
     exit 1
 fi
+
+# One landing at a time across all worktrees, from the first fetch until exit,
+# so a landing gates against exactly the main it pushes onto. The lock is a
+# symlink in the shared git directory whose target names the holder. Creating
+# it is atomic and records the owner in the same step, so a lock never exists
+# without one (macOS has no flock). A holder that died without releasing (a
+# hard kill) is taken over when its pid is gone. Two waiters taking over the
+# same dead holder can race; that is accepted, because takeover only follows a
+# hard kill. A stuck lock can be removed by hand: rm "<git-common-dir>/land.lock".
+# Dry runs take the lock too: they build and gate the same way, and one code
+# path is simpler than a bypass.
+land_lock="$(git rev-parse --path-format=absolute --git-common-dir)/land.lock"
+
+acquire_land_lock() {
+    my_owner="$$ $ref $(date +%H:%M)"
+    until ln -s "$my_owner" "$land_lock" 2>/dev/null; do
+        holder="$(readlink "$land_lock" 2>/dev/null || true)"
+        if [ -n "$holder" ] && ! kill -0 "${holder%% *}" 2>/dev/null; then
+            rm -f "$land_lock"
+            continue
+        fi
+        echo "queued behind: ${holder:-(lock just released)} (lock: $land_lock)"
+        sleep "${LAND_LOCK_POLL_SECONDS:-30}"
+    done
+    # Release only our own lock, even if it was taken over after a race.
+    trap '[ "$(readlink "$land_lock" 2>/dev/null)" = "$my_owner" ] && rm -f "$land_lock" || true' EXIT
+    trap 'exit 143' TERM INT
+}
+
+acquire_land_lock
+phase queue
 
 git fetch origin
 git merge --ff-only origin/main
@@ -88,24 +120,31 @@ fi
 make
 echo "Build stamp: $(bin/blorp --version)"
 scripts/compiler-build-status
+phase build
 
-# Cheap repository hygiene (layout, manifest, boundary and coverage checks)
-# runs on every landing, so a missing manifest entry or an unowned raw
-# allocation site cannot reach main through a gate that does not select it.
+# Static repository hygiene (layout, manifest, boundary checks) runs on every
+# landing, so a missing manifest entry or an unowned raw allocation site cannot
+# reach main through a gate that does not select it. The tooling suites
+# (`make tooling-check`) audit compiler and runtime sources too, so no short
+# path list selects them correctly; they run in `make quality` and the
+# premerge gate instead.
 overall="PASS"
-if ! lock make hygiene-check; then
+if ! make hygiene-check; then
     echo "hygiene-check failed" >&2
     overall="FAIL"
 fi
+phase hygiene
 
-result="$(lock scripts/compiler-check --changed --base origin/main | tee /dev/stderr || true)"
+result="$(scripts/compiler-check --changed --base origin/main | tee /dev/stderr || true)"
 [ "$(printf '%s\n' "$result" | verdict_status)" = "PASS" ] || overall="FAIL"
+phase compiler-check
 gate_count=${#gates[@]}
 i=0
 while [ "$i" -lt "$gate_count" ]; do
     gate="${gates[$i]}"
-    result="$(lock scripts/test --no-build "$gate" | tee /dev/stderr || true)"
+    result="$(scripts/test --no-build "$gate" | tee /dev/stderr || true)"
     [ "$(printf '%s\n' "$result" | verdict_status)" = "PASS" ] || overall="FAIL"
+    phase "gate:$gate"
     i=$((i + 1))
 done
 
@@ -129,5 +168,6 @@ if ! git merge-base --is-ancestor origin/main HEAD; then
 fi
 
 git push origin HEAD:main
+phase push
 emit_verdict PASS 1 0
 echo "Landed $landed_sha on main."
