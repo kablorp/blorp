@@ -307,18 +307,25 @@ import:
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_field_ref,
-	../../../src/compiler/stage_09_core/pipeline: PreparedCoreProgram, prepared_core_program
+	../../../src/compiler/stage_09_core/pipeline:
+		PreparedCoreProgram,
+		prepared_core_program,
+		prepared_core_program_value,
+		run_pre_dce_tail,
 	../../../src/compiler/stage_09_core/static_string_literals: rewrite_static_string_literals
-	../../../src/compiler/stage_10_backend/c_naming: c_local_name, encode_base62
-	../../../src/compiler/stage_10_backend/c_symbol_projection: projected_callable_base_symbol
+	../../../src/compiler/stage_10_backend/c_naming: c_identifier, c_local_name, encode_base62
+	../../../src/compiler/stage_10_backend/c_symbol_projection:
+		CEmissionSymbolPlan,
+		c_emission_type_symbol_lookup,
+		planned_emitted_callable_name,
+		CSymbolProjectionError(MissingProjectedCallable),
+		prepare_c_emission_symbols,
+		projected_callable_base_symbol,
 	../../../src/compiler/stage_10_backend/emit:
-		CoreEmitError,
+		CoreEmitError(CallableSymbolProjectionFailed),
 		core_emit_error_message,
-		emit_unprojected_core_program_c_artifact_for_tests,
-		emit_unprojected_core_program_c_artifact_with_profile_for_tests,
 		try_emit_prepared_core_program_c_artifact_with_profile,
 		try_emit_prepared_core_program_c_artifact_with_profile_and_indentation,
-		try_emit_unprojected_prepared_core_program_c_artifact_for_tests,
 		variable_has_cleanup_slot,
 	../../../src/lib/build_artifact: CArtifact
 	../../../src/lib/function_profile:
@@ -337,16 +344,277 @@ DEEP_EMIT_LOGICAL_DEPTH: Int = 512
 
 
 ---
+Emits `program` through the production projected path, then rewrites every
+projected callable and type symbol back to the spelling its declaration
+carries in Core, so assertions in this file read the source names they
+construct. The projected symbols are the only ones production emits; the
+rewrite exists only so a fixture does not have to spell `brp_c_<id>`.
+---
+record SourceSpelling {
+	projected: String,
+	original: String
+}
+
+
+pure func source_spelling_pairs(
+	program: CoreProgram,
+	plan: CEmissionSymbolPlan,
+) -> List[SourceSpelling]:
+	var pairs: List[SourceSpelling] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match planned_emitted_callable_name(plan, function_info.def_id):
+					Some(projected):
+						original: String = match function_info.function_kind:
+							ClosureBodyFunction(_):
+								CLOSURE_BODY_TEST_SPELLING_PREFIX + function_info.def_id.to_string() + "_" + function_info.name
+							_:
+								function_info.name
+						pairs = pairs.append({ projected = projected, original = c_identifier(original) })
+					None:
+						void
+			_:
+				void
+
+	for entry in c_emission_type_symbol_lookup(plan).entries():
+		(declared, projected) = entry
+		pairs = pairs.append({ projected = projected, original = declared })
+
+	pairs.sort_by(func(pair): 0 - pair.projected.length())
+
+
+---
+A projected symbol ends where the next character cannot continue its base62
+spelling. `_` continues a derived helper name (`<symbol>_destroy`), but not
+when a decimal follows it: that is a binder-id local (`brp_v_5`) sharing a
+prefix with a callable whose id spells `v`.
+---
+pure func projected_symbol_ends_before(rest: String) -> Bool:
+	if rest.length() == 0:
+		True
+	else:
+		next: String = rest.substring(0, 1)
+
+		if next == "_":
+			if rest.length() == 1:
+				True
+			else:
+				not "0123456789".contains(rest.substring(1, 1))
+		else:
+			not (
+				"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(next)
+			)
+
+
+pure func rewrite_projected_symbol(code: String, spelling: SourceSpelling) -> String:
+	parts: List[String] = code.split(spelling.projected)
+	var result: String = parts.get(0).get_or("")
+	var index: Int = 1
+
+	while index < parts.length():
+		rest: String = parts.get(index).get_or("")
+
+		if projected_symbol_ends_before(rest):
+			result = result + spelling.original + rest
+		else:
+			result = result + spelling.projected + rest
+
+		index += 1
+
+	result
+
+
+pure func rewrite_source_spellings(code: String, pairs: List[SourceSpelling]) -> String:
+	var result: String = code
+
+	for pair in pairs:
+		result = rewrite_projected_symbol(result, pair)
+
+	result
+
+
+---
+Fixtures call helpers they never declare (only the call shape matters to their
+assertions), but final C symbol projection requires every direct callee to be
+a declared function. Each missing callee gets a stub body so the fixture
+reaches emission; the stubs only add unrelated definitions to the artifact.
+`MAX_STUB_CALLEES` bounds the retry loop against a projection error that
+adding a stub cannot fix.
+---
+MAX_STUB_CALLEES: Int = 64
+
+
+---
+The spelling this file's assertions use for a closure body (`__def_<id>_<name>`).
+Production never spells it: the body is named from its definition id alone.
+---
+CLOSURE_BODY_TEST_SPELLING_PREFIX: String = "__def_"
+
+
+pure func stub_callee_function(name: String, def_id: Int) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc())),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func program_with_stub_callees(program: CoreProgram) -> CoreProgram:
+	var current: CoreProgram = program
+	var attempts: Int = 0
+	var settled: Bool = False
+
+	while not settled and attempts < MAX_STUB_CALLEES:
+		attempts += 1
+
+		match prepare_c_emission_symbols(current):
+			Err(MissingProjectedCallable(name, def_id)):
+				current = { current | decls = current.decls.append(FunctionDecl(stub_callee_function(name, def_id))) }
+			_:
+				settled = True
+
+	current
+
+
+pure func try_emit_source_spelled_prepared_c_artifact(
+	prepared: PreparedCoreProgram,
+	profile_configuration: FunctionProfileConfiguration,
+) -> Result[CArtifact, CoreEmitError]:
+	program: CoreProgram = prepared_core_program_value(prepared)
+
+	match prepare_c_emission_symbols(program):
+		Err(error):
+			Err(CallableSymbolProjectionFailed(error))
+		Ok(plan):
+			artifact ?= try_emit_prepared_core_program_c_artifact_with_profile(
+				prepared,
+				profile_configuration,
+			)
+			Ok({
+				artifact |
+				c_code = rewrite_source_spellings(
+					artifact.c_code,
+					source_spelling_pairs(program, plan),
+				)
+			})
+
+
+pure func emit_source_spelled_c_artifact_with_profile(
+	program: CoreProgram,
+	profile_configuration: FunctionProfileConfiguration,
+) -> CArtifact:
+	match try_emit_source_spelled_prepared_c_artifact(
+		run_pre_dce_tail(program_with_stub_callees(program)),
+		profile_configuration,
+	):
+		Ok(artifact):
+			artifact
+		Err(error):
+			{
+				c_code = "/* " + core_emit_error_message(error) + " */",
+				extra_units = [],
+				link_flags = [],
+				include_dirs = []
+			}
+
+
+pure func emit_source_spelled_c_artifact(program: CoreProgram) -> CArtifact:
+	emit_source_spelled_c_artifact_with_profile(program, FunctionProfileOff)
+
+
+
+---
+A name missing from the table gets the unresolved-ref sentinel, so a fixture that
+uses an unlisted field fails emission with `UnresolvedRecordField` instead of
+silently sharing another field's ref.
+---
+UNKNOWN_TEST_FIELD_REF_ID: Int = -1
+
+
+---
 Fixture field identity: this emitter test builds Core expressions directly
 rather than lowering them from declarations, so there is no real declaration
-ordinal available. The emitter only reads a field access's spelling, never
-its ref, so a fixed placeholder ref is sufficient for field accesses. Record
-declarations and literals are different: `prepare` orders literal fields by
-comparing refs with the declaration, so those fixtures give each field name
-its own ref (the same name gets the same ref in a declaration and a literal).
+ordinal available. Record declarations, literals, and field accesses all give
+a field name its own ref (the same name gets the same ref everywhere), and the
+emitter resolves a member's spelling from the declaring record's ref.
+`test_field_ref` is the single table of those refs, keyed by field name;
+declarations and literals spell the same values inline.
 ---
-pure func test_field_ref() -> CoreFieldRef:
-	core_field_ref(0)
+pure func test_field_ref(name: String) -> CoreFieldRef:
+	match name:
+		"count":
+			core_field_ref(1)
+		"label":
+			core_field_ref(2)
+		"start":
+			core_field_ref(3)
+		"end":
+			core_field_ref(4)
+		"x":
+			core_field_ref(5)
+		"y":
+			core_field_ref(6)
+		"short":
+			core_field_ref(7)
+		"first":
+			core_field_ref(8)
+		"second":
+			core_field_ref(9)
+		"total":
+			core_field_ref(10)
+		"arc_value":
+			core_field_ref(11)
+		"arc_only_value":
+			core_field_ref(12)
+		"result_value":
+			core_field_ref(13)
+		"flag":
+			core_field_ref(14)
+		"other_flag":
+			core_field_ref(15)
+		"inherited":
+			core_field_ref(16)
+		"long":
+			core_field_ref(17)
+		"header":
+			core_field_ref(18)
+		"__blorp_field_header":
+			core_field_ref(19)
+		"enabled":
+			core_field_ref(20)
+		"visible":
+			core_field_ref(21)
+		"archived":
+			core_field_ref(22)
+		"total_allocations":
+			core_field_ref(23)
+		"total_releases":
+			core_field_ref(24)
+		"color":
+			core_field_ref(25)
+		"z":
+			core_field_ref(26)
+		"saw_dot":
+			core_field_ref(27)
+		"offset":
+			core_field_ref(28)
+		"line":
+			core_field_ref(29)
+		"value":
+			core_field_ref(30)
+		_:
+			core_field_ref(UNKNOWN_TEST_FIELD_REF_ID)
 
 
 pure func empty_program() -> CoreProgram:
@@ -2696,7 +2964,7 @@ pure func foreign_color_field_function() -> CoreFunction:
 	color_type: CoreType = EnumType("Color")
 	color_field: CoreExpr = FieldExpr(
 		VarExpr(state_var, state_type, synthetic_core_source_loc()),
-		"color", test_field_ref(),
+		"color", test_field_ref("color"),
 		color_type,
 		synthetic_core_source_loc(),
 	)
@@ -3355,7 +3623,6 @@ pure func closure_stack_result_call_function() -> CoreFunction:
 
 pure func static_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_77__blorp_eta_0",
 		params = [int_param("x")],
 		captures = [],
 		moved_captures = [],
@@ -3400,7 +3667,6 @@ pure func wide_closure_capture_program(
 	function_name: String = "_blorp_eta_wide_" + suffix
 	static_name: String = "__sc_" + c_name
 	abi: CoreClosureAbi = {
-		c_name = c_name,
 		params = [],
 		captures = [capture],
 		moved_captures = [],
@@ -3431,10 +3697,7 @@ pure func wide_closure_capture_program(
 		}],
 		return_type = closure_type(),
 		body = Some(ClosureCreateExpr({
-			function_name = function_name,
 			def_id = def_id,
-			c_name = c_name,
-			static_name = static_name,
 			captures = [capture]
 		}, closure_type(), synthetic_core_source_loc())),
 		is_pure = True,
@@ -3461,7 +3724,6 @@ private pure func stack_result_closure_capture_program() -> CoreProgram:
 	c_name: String = "__def_940__blorp_eta_stack_result_capture"
 	function_name: String = "_blorp_eta_stack_result_capture"
 	closure_abi: CoreClosureAbi = {
-		c_name = c_name,
 		params = [],
 		captures = [capture],
 		moved_captures = [],
@@ -3493,10 +3755,7 @@ private pure func stack_result_closure_capture_program() -> CoreProgram:
 		return_type = closure_type(),
 		body = Some(
 			ClosureCreateExpr({
-				function_name = function_name,
 				def_id = 940,
-				c_name = c_name,
-				static_name = "__sc_" + c_name,
 				captures = [capture],
 			}, closure_type(), synthetic_core_source_loc()),
 		),
@@ -3563,7 +3822,6 @@ pure func mixed_point_string_closure_body_function() -> CoreFunction:
 	point_capture: CoreClosureCapture = point_closure_capture()
 	label_capture: CoreClosureCapture = string_closure_capture()
 	abi: CoreClosureAbi = {
-		c_name = "__def_936__blorp_eta_mixed_point_string",
 		params = [],
 		captures = [point_capture, label_capture],
 		moved_captures = [],
@@ -3578,7 +3836,7 @@ pure func mixed_point_string_closure_body_function() -> CoreFunction:
 		body = Some(
 			FieldExpr(
 				VarExpr(named_var("point"), point_type(), synthetic_core_source_loc()),
-				"x", test_field_ref(),
+				"x", test_field_ref("x"),
 				int_type(),
 				synthetic_core_source_loc(),
 			),
@@ -3602,10 +3860,7 @@ pure func mixed_point_string_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_mixed_point_string",
 					def_id = 936,
-					c_name = "__def_936__blorp_eta_mixed_point_string",
-					static_name = "__sc___def_936__blorp_eta_mixed_point_string",
 					captures = [point_closure_capture(), string_closure_capture()],
 				},
 				closure_type(),
@@ -3680,7 +3935,6 @@ pure func raw_pointer_tuple_closure_pointer_capture() -> CoreClosureCapture:
 
 pure func captured_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_80__blorp_eta_1",
 		params = [int_param("x")],
 		captures = [captured_closure_capture()],
 		moved_captures = [],
@@ -3690,7 +3944,6 @@ pure func captured_closure_body_abi() -> CoreClosureAbi:
 
 pure func float_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_295__blorp_eta_6",
 		params = [],
 		captures = [float_closure_capture()],
 		moved_captures = [],
@@ -3700,7 +3953,6 @@ pure func float_closure_body_abi() -> CoreClosureAbi:
 
 pure func string_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_82__blorp_eta_2",
 		params = [string_param("x")],
 		captures = [string_closure_capture()],
 		moved_captures = [],
@@ -3710,7 +3962,6 @@ pure func string_closure_body_abi() -> CoreClosureAbi:
 
 pure func nullable_option_string_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_724__blorp_clambda_2",
 		params = [string_param("candidate")],
 		captures = [nullable_option_string_closure_capture()],
 		moved_captures = [],
@@ -3720,7 +3971,6 @@ pure func nullable_option_string_closure_body_abi() -> CoreClosureAbi:
 
 pure func nullable_option_list_int_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_726__blorp_clambda_3",
 		params = [
 			{
 				name = named_var("candidate"),
@@ -3736,7 +3986,6 @@ pure func nullable_option_list_int_closure_body_abi() -> CoreClosureAbi:
 
 pure func point_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_84__blorp_eta_3",
 		params = [],
 		captures = [point_closure_capture()],
 		moved_captures = [],
@@ -3746,7 +3995,6 @@ pure func point_closure_body_abi() -> CoreClosureAbi:
 
 pure func tensor_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_86__blorp_eta_4",
 		params = [],
 		captures = [tensor_closure_capture()],
 		moved_captures = [],
@@ -3756,7 +4004,6 @@ pure func tensor_closure_body_abi() -> CoreClosureAbi:
 
 pure func channel_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_285__blorp_eta_5",
 		params = [],
 		captures = [channel_closure_capture()],
 		moved_captures = [],
@@ -3766,7 +4013,6 @@ pure func channel_closure_body_abi() -> CoreClosureAbi:
 
 pure func raw_pointer_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_720__blorp_eta_20",
 		params = [],
 		captures = [raw_pointer_closure_capture()],
 		moved_captures = [],
@@ -3776,7 +4022,6 @@ pure func raw_pointer_closure_body_abi() -> CoreClosureAbi:
 
 pure func raw_pointer_tuple_closure_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_722__blorp_clambda_1",
 		params = [],
 		captures = [
 			raw_pointer_tuple_closure_int_capture(),
@@ -3789,7 +4034,6 @@ pure func raw_pointer_tuple_closure_body_abi() -> CoreClosureAbi:
 
 pure func moved_channel_task_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_286__blorp_task_0",
 		params = [],
 		captures = [channel_closure_capture()],
 		moved_captures = ["ch"],
@@ -3799,7 +4043,6 @@ pure func moved_channel_task_body_abi() -> CoreClosureAbi:
 
 pure func stack_result_task_body_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_721__blorp_task_21",
 		params = [],
 		captures = [],
 		moved_captures = [],
@@ -3957,7 +4200,7 @@ pure func point_closure_body_function() -> CoreFunction:
 		body = Some(
 			FieldExpr(
 				VarExpr(named_var("point"), point_type(), synthetic_core_source_loc()),
-				"x", test_field_ref(),
+				"x", test_field_ref("x"),
 				int_type(),
 				synthetic_core_source_loc(),
 			),
@@ -3983,7 +4226,6 @@ pure func stack_option_int_closure_body_function() -> CoreFunction:
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = ClosureBodyFunction({
-			c_name = "__def_728__blorp_clambda_4",
 			params = [],
 			captures = [stack_option_int_closure_capture()],
 			moved_captures = [],
@@ -4129,7 +4371,6 @@ pure func moved_channel_yield_task_body_function() -> CoreFunction:
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = ClosureBodyFunction({
-			c_name = "__def_916__blorp_task_22",
 			params = [],
 			captures = [channel_capture],
 			moved_captures = ["ch"],
@@ -4174,7 +4415,6 @@ pure func moved_stack_result_yield_task_body_function() -> CoreFunction:
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = ClosureBodyFunction({
-			c_name = "__def_918__blorp_task_23",
 			params = [],
 			captures = [{ name = "result", id = 0, typ = result_type, origin = AuthoredBinder }],
 			moved_captures = ["result"],
@@ -4213,10 +4453,7 @@ pure func stack_result_task_body_function() -> CoreFunction:
 pure func static_closure_create_expr() -> CoreExpr:
 	ClosureCreateExpr(
 		{
-			function_name = "_blorp_eta_0",
 			def_id = 77,
-			c_name = "__def_77__blorp_eta_0",
-			static_name = "__sc___def_77__blorp_eta_0",
 			captures = []
 		},
 		closure_type(),
@@ -4278,10 +4515,7 @@ pure func captured_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_1",
 					def_id = 80,
-					c_name = "__def_80__blorp_eta_1",
-					static_name = "__sc___def_80__blorp_eta_1",
 					captures = [captured_closure_capture()]
 				},
 				closure_type(),
@@ -4307,10 +4541,7 @@ pure func float_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_6",
 					def_id = 295,
-					c_name = "__def_295__blorp_eta_6",
-					static_name = "__sc___def_295__blorp_eta_6",
 					captures = [float_closure_capture()]
 				},
 				closure_type(),
@@ -4336,10 +4567,7 @@ pure func string_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_2",
 					def_id = 82,
-					c_name = "__def_82__blorp_eta_2",
-					static_name = "__sc___def_82__blorp_eta_2",
 					captures = [string_closure_capture()]
 				},
 				closure_type(),
@@ -4358,10 +4586,7 @@ pure func string_closure_create_function() -> CoreFunction:
 pure func nullable_option_string_closure_create_expr() -> CoreExpr:
 	ClosureCreateExpr(
 		{
-			function_name = "_blorp_clambda_2",
 			def_id = 724,
-			c_name = "__def_724__blorp_clambda_2",
-			static_name = "__sc___def_724__blorp_clambda_2",
 			captures = [nullable_option_string_closure_capture()]
 		},
 		closure_type(),
@@ -4408,10 +4633,7 @@ pure func nullable_option_list_int_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_clambda_3",
 					def_id = 726,
-					c_name = "__def_726__blorp_clambda_3",
-					static_name = "__sc___def_726__blorp_clambda_3",
 					captures = [nullable_option_list_int_closure_capture()]
 				},
 				closure_type(),
@@ -4443,10 +4665,7 @@ pure func stack_option_int_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_clambda_4",
 					def_id = 728,
-					c_name = "__def_728__blorp_clambda_4",
-					static_name = "__sc___def_728__blorp_clambda_4",
 					captures = [stack_option_int_closure_capture()]
 				},
 				closure_type(),
@@ -5294,7 +5513,7 @@ pure func duplicate_inner_union_payloads_function() -> CoreFunction:
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = UserFunction,
-		def_id = 336,
+		def_id = 9336,
 		loc = synthetic_core_source_loc()
 	}
 
@@ -5355,7 +5574,7 @@ pure func void_let_function() -> CoreFunction:
 				CallExpr(
 					UserCall(
 						"touch",
-						None,
+						Some(9403),
 						[],
 					),
 					VarExpr(
@@ -5867,7 +6086,7 @@ pure func range_start_function() -> CoreFunction:
 		type_params = [],
 		params = [],
 		return_type = int_type(),
-		body = Some(FieldExpr(range_expr, "start", test_field_ref(), int_type(), synthetic_core_source_loc())),
+		body = Some(FieldExpr(range_expr, "start", test_field_ref("start"), int_type(), synthetic_core_source_loc())),
 		is_pure = True,
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
@@ -7387,7 +7606,7 @@ pure func resource_func_var(name: String) -> CoreVar:
 
 pure func open_resource_call() -> CoreExpr:
 	CallExpr(
-		UserCall("open_handle", None, []),
+		UserCall("open_handle", Some(9401), []),
 		VarExpr(resource_func_var("open_handle"), closure_type(), synthetic_core_source_loc()),
 		[],
 		test_resource_type(),
@@ -7397,7 +7616,7 @@ pure func open_resource_call() -> CoreExpr:
 
 pure func close_resource_call() -> CoreExpr:
 	CallExpr(
-		UserCall("close_handle", None, []),
+		UserCall("close_handle", Some(9402), []),
 		VarExpr(resource_func_var("close_handle"), closure_type(), synthetic_core_source_loc()),
 		[VarExpr(resource_var(), test_resource_type(), synthetic_core_source_loc())],
 		VoidType,
@@ -7972,8 +8191,8 @@ pure func range_value_sum_function() -> CoreFunction:
 				SeqExpr(
 					ForRangeExpr(
 						range_loop_binder(),
-						FieldExpr(range_expr, "start", test_field_ref(), int_type(), synthetic_core_source_loc()),
-						FieldExpr(range_expr, "end", test_field_ref(), int_type(), synthetic_core_source_loc()),
+						FieldExpr(range_expr, "start", test_field_ref("start"), int_type(), synthetic_core_source_loc()),
+						FieldExpr(range_expr, "end", test_field_ref("end"), int_type(), synthetic_core_source_loc()),
 						AssignExpr(
 							local_counter(),
 							BinaryExpr(
@@ -8784,7 +9003,7 @@ pure func call_then_return_function() -> CoreFunction:
 				CallExpr(
 					UserCall(
 						"touch",
-						None,
+						Some(9404),
 						[],
 					),
 					VarExpr(
@@ -10230,10 +10449,7 @@ pure func point_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_3",
 					def_id = 84,
-					c_name = "__def_84__blorp_eta_3",
-					static_name = "__sc___def_84__blorp_eta_3",
 					captures = [point_closure_capture()]
 				},
 				closure_type(),
@@ -10259,10 +10475,7 @@ pure func tensor_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_4",
 					def_id = 86,
-					c_name = "__def_86__blorp_eta_4",
-					static_name = "__sc___def_86__blorp_eta_4",
 					captures = [tensor_closure_capture()]
 				},
 				closure_type(),
@@ -10288,10 +10501,7 @@ pure func channel_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_5",
 					def_id = 285,
-					c_name = "__def_285__blorp_eta_5",
-					static_name = "__sc___def_285__blorp_eta_5",
 					captures = [channel_closure_capture()]
 				},
 				closure_type(),
@@ -10323,10 +10533,7 @@ pure func raw_pointer_closure_create_function() -> CoreFunction:
 		body = Some(
 			ClosureCreateExpr(
 				{
-					function_name = "_blorp_eta_20",
 					def_id = 720,
-					c_name = "__def_720__blorp_eta_20",
-					static_name = "__sc___def_720__blorp_eta_20",
 					captures = [raw_pointer_closure_capture()]
 				},
 				closure_type(),
@@ -10557,7 +10764,7 @@ pure func nested_if_with_let_branch_function() -> CoreFunction:
 
 
 pure func test_emit_empty_program_artifact_shape() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(empty_program())
+	artifact: CArtifact = emit_source_spelled_c_artifact(empty_program())
 
 	(
 		artifact.c_code.contains("Blorp final Core C artifact")
@@ -10573,7 +10780,7 @@ pure func test_emit_foreign_includes_before_declarations() -> Bool:
 		foreign_includes = ["ffi_bytes_inspect_header.h", "string.h"],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	std_include_index: Option[Int] = artifact.c_code.index_of("#include <string.h>")
 	foreign_include_index: Option[Int] = artifact.c_code.index_of(
 		"#include \"ffi_bytes_inspect_header.h\"",
@@ -10594,7 +10801,7 @@ pure func test_emit_foreign_default_bytes_call_copies_and_releases() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	copy_index: Option[Int] = artifact.c_code.index_of("blorp_Bytes* __ffi_bytes_copy_")
 	call_index: Option[Int] = artifact.c_code.index_of("inspect_bytes(__ffi_bytes_copy_")
 	release_index: Option[Int] = artifact.c_code.index_of("blorp_release(__ffi_bytes_copy_")
@@ -10612,7 +10819,7 @@ pure func test_emit_function_inventory_comment() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("function main") and artifact.c_code.contains("def_id=1")
 
@@ -10623,7 +10830,7 @@ pure func test_emit_main_return_int_literal() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int main(void)")
@@ -10638,7 +10845,7 @@ pure func test_emit_main_with_source_args_uses_c_entrypoint_signature() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int main(int argc, char** argv)")
@@ -10659,7 +10866,7 @@ pure func test_emit_profiled_main_uses_runtime_owned_exit_report() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		program,
 		FunctionProfileExact([]),
 	)
@@ -10684,7 +10891,7 @@ pure func test_emit_profiled_main_uses_runtime_owned_exit_report() -> Bool:
 
 
 pure func test_profile_is_enabled_before_dynamic_global_initializers() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		{
 			decls = [
 				FunctionDecl(identity_function()),
@@ -10712,11 +10919,11 @@ pure func test_emit_profile_disabled_omits_hooks() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	explicit: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	explicit: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		program,
 		FunctionProfileOff,
 	)
-	default: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	default: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		not explicit.c_code.contains("blorp_profile_enable")
@@ -10732,7 +10939,7 @@ pure func test_emit_profile_disabled_omits_hooks() -> Bool:
 
 
 pure func test_emit_prepared_program_boundary() -> Bool:
-	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(empty_program()),
 		FunctionProfileOff,
 	):
@@ -10743,7 +10950,7 @@ pure func test_emit_prepared_program_boundary() -> Bool:
 
 
 pure func test_emit_unsupported_global_returns_structured_error() -> Bool:
-	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(unsupported_global_program()),
 		FunctionProfileOff,
 	):
@@ -10759,7 +10966,7 @@ pure func test_emit_identity_function_with_int_param() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long id(long x)")
@@ -10774,7 +10981,7 @@ pure func test_emit_profiled_named_function() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		program,
 		FunctionProfileExact([]),
 	)
@@ -10819,7 +11026,7 @@ pure func test_user_call_uses_projected_symbol_and_unprojected_fallback() -> Boo
 		source_files = []
 	}
 	projected_name: String = projected_callable_base_symbol(2)
-	unprojected: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	unprojected: CArtifact = emit_source_spelled_c_artifact(program)
 
 	match try_emit_prepared_core_program_c_artifact_with_profile(
 		prepared_core_program(program),
@@ -10962,16 +11169,16 @@ pure func test_resolved_some_user_call_is_not_suppressed() -> Bool:
 			False
 
 
-pure func test_profile_ids_distinguish_duplicate_logical_names() -> Bool:
+pure func test_profile_ids_are_dense_in_declaration_order() -> Bool:
 	first: CoreFunction = identity_function()
-	second: CoreFunction = { identity_function() | def_id = 3 }
+	second: CoreFunction = { identity_function() | name = "id_second", def_id = 3 }
 	program: CoreProgram = {
 		decls = [FunctionDecl(first), FunctionDecl(second)],
 		foreign_includes = [],
 		source_files = []
 	}
 
-	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(program),
 		FunctionProfileExact([]),
 	):
@@ -10981,6 +11188,7 @@ pure func test_profile_ids_distinguish_duplicate_logical_names() -> Bool:
 					"static const blorp_ProfileFunctionMetadata __blorp_profile_functions[2]",
 				)
 				and artifact.c_code.contains("{\"id\", \"id\", NULL, 2, 0u}")
+				and artifact.c_code.contains("{\"id_second\", \"id_second\", NULL, 3, 0u}")
 				and artifact.c_code.contains("blorp_profile_start_id(0);")
 				and artifact.c_code.contains("blorp_profile_end_id(0);")
 				and artifact.c_code.contains("blorp_profile_start_id(1);")
@@ -10999,7 +11207,7 @@ pure func test_profile_id_order_matches_metadata_and_function_bodies() -> Bool:
 		name = "profile_second",
 		def_id = 32
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		{
 			decls = [FunctionDecl(first), FunctionDecl(second)],
 			foreign_includes = [],
@@ -11027,7 +11235,7 @@ pure func test_profile_ids_have_no_fixed_function_ceiling() -> Bool:
 		}
 		decls = decls.append(FunctionDecl(function_info))
 
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		{
 			decls = decls,
 			foreign_includes = [],
@@ -11046,7 +11254,7 @@ pure func test_profile_ids_have_no_fixed_function_ceiling() -> Bool:
 
 
 pure func test_profile_plan_empty_selection_emits_no_profile_data() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		empty_program(),
 		FunctionProfileExact([]),
 	)
@@ -11069,11 +11277,11 @@ pure func test_profile_plan_is_deterministic_and_excludes_bodyless_functions() -
 		foreign_includes = [],
 		source_files = []
 	}
-	first: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	first: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		program,
 		FunctionProfileExact([]),
 	)
-	second: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	second: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		program,
 		FunctionProfileExact([]),
 	)
@@ -11104,7 +11312,7 @@ pure func test_calls_profile_selects_module_without_timing_probes() -> Bool:
 	}
 
 	match (
-		try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+		try_emit_source_spelled_prepared_c_artifact(
 			prepared_core_program({
 				decls = [FunctionDecl(second), FunctionDecl(first)],
 				foreign_includes = [],
@@ -11148,7 +11356,7 @@ pure func test_exact_profile_selects_canonical_function_identity() -> Bool:
 	}
 
 	match (
-		try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+		try_emit_source_spelled_prepared_c_artifact(
 			prepared_core_program({
 				decls = [
 					FunctionDecl(selected),
@@ -11184,13 +11392,13 @@ pure func test_exact_profile_selector_preserves_composite_module_identity() -> B
 		def_id = 54
 	}
 	underscore_module: CoreFunction = { identity_function() |
-		name = "a_b__selected",
+		name = "a_b__selected_underscore",
 		source_module = Some("a_b"),
 		def_id = 55
 	}
 
 	match (
-		try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+		try_emit_source_spelled_prepared_c_artifact(
 			prepared_core_program({
 				decls = [FunctionDecl(path_module), FunctionDecl(underscore_module)],
 				foreign_includes = [],
@@ -11205,7 +11413,7 @@ pure func test_exact_profile_selector_preserves_composite_module_identity() -> B
 					"{\"a_b__selected\", \"a_b__selected\", \"a/b\", 54, BLORP_PROFILE_METADATA_HAS_MODULE}",
 				)
 				and not artifact.c_code.contains(
-					"{\"a_b__selected\", \"a_b__selected\", \"a_b\", 55, BLORP_PROFILE_METADATA_HAS_MODULE}",
+					"{\"a_b__selected_underscore\", \"a_b__selected_underscore\", \"a_b\", 55, BLORP_PROFILE_METADATA_HAS_MODULE}",
 				)
 				and artifact.c_code.contains("blorp_profile_start_id(0);")
 				and not artifact.c_code.contains("blorp_profile_start_id(1);")
@@ -11224,7 +11432,7 @@ pure func test_profile_rejects_unknown_selectors_before_emission() -> Bool:
 		source_files = []
 	}
 
-	unknown_module_ok: Bool = match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	unknown_module_ok: Bool = match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(program),
 		FunctionProfileCalls([ProfileModule("missing")]),
 	):
@@ -11236,7 +11444,7 @@ pure func test_profile_rejects_unknown_selectors_before_emission() -> Bool:
 		Ok(_):
 			False
 
-	unknown_function_ok: Bool = match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	unknown_function_ok: Bool = match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(program),
 		FunctionProfileExact([ProfileFunction("fixture", "missing")]),
 	):
@@ -11254,7 +11462,7 @@ pure func test_profile_rejects_unknown_selectors_before_emission() -> Bool:
 		def_id = 2
 	}
 
-	ambiguous_ok: Bool = match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	ambiguous_ok: Bool = match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program({ program | decls = program.decls.append(FunctionDecl(duplicate)) }),
 		FunctionProfileExact([ProfileFunction("fixture", "selected")]),
 	):
@@ -11295,7 +11503,7 @@ pure func test_emit_closure_param_function_signature() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("long accept_callback(blorp_Closure* callback)")
 
@@ -11306,7 +11514,7 @@ pure func test_emit_closure_call_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long call_callback(blorp_Closure* callback, long value)")
@@ -11326,7 +11534,7 @@ pure func test_emit_closure_call_stack_result_retains_unboxed_payload() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackResult call_result_callback(blorp_Closure* callback)")
@@ -11349,7 +11557,7 @@ pure func test_emit_static_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_77__blorp_eta_0(void* __env, void* __arg0)")
@@ -11374,7 +11582,7 @@ pure func test_emit_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	prototype_index: Option[Int] = artifact.c_code.index_of(
 		"void* __def_80__blorp_eta_1(void* __env, void* __arg0);",
 	)
@@ -11409,7 +11617,7 @@ pure func test_emit_float_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_295__blorp_eta_6(void* __env)")
@@ -11425,7 +11633,7 @@ pure func test_emit_float_captured_closure_create() -> Bool:
 
 
 pure func test_emit_stack_result_capture_retains_and_releases() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		stack_result_closure_capture_program(),
 	)
 	(
@@ -11443,7 +11651,7 @@ pure func test_emit_stack_result_capture_retains_and_releases() -> Bool:
 
 
 pure func test_emit_float32_capture_uses_legacy_slot_encoding() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		wide_closure_capture_program(float32_type(), "float32", 920),
 	)
 
@@ -11455,7 +11663,7 @@ pure func test_emit_float32_capture_uses_legacy_slot_encoding() -> Bool:
 
 
 pure func test_emit_float16_capture_uses_legacy_slot_encoding() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		wide_closure_capture_program(float16_type(), "float16", 922),
 	)
 
@@ -11475,7 +11683,7 @@ pure func test_emit_string_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_82__blorp_eta_2(void* __env, void* __arg0)")
@@ -11501,7 +11709,7 @@ pure func test_emit_nullable_option_string_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_724__blorp_clambda_2(void* __env, void* __arg0)")
@@ -11530,7 +11738,7 @@ pure func test_emit_nullable_option_list_int_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_726__blorp_clambda_3(void* __env, void* __arg0)")
@@ -11559,7 +11767,7 @@ pure func test_emit_stack_option_int_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -11589,7 +11797,7 @@ pure func test_emit_value_record_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_84__blorp_eta_3(void* __env)")
@@ -11602,7 +11810,7 @@ pure func test_emit_value_record_captured_closure_create() -> Bool:
 			+ "(__blorp_closure_env___def_84__blorp_eta_3*)__env;",
 		)
 		and artifact.c_code.contains("Point point = __e->capture_0;")
-		and artifact.c_code.contains("return (void*)(long)(point.x);")
+		and artifact.c_code.contains("return (void*)(long)(point.f0);")
 		and artifact.c_code.contains("blorp_Closure* make_point_reader(Point point)")
 		and artifact.c_code.contains((
 				"blorp_closure_new_typed_inline((void*)__def_84__blorp_eta_3, sizeof("
@@ -11619,7 +11827,7 @@ pure func test_emit_value_record_captured_closure_create() -> Bool:
 
 
 pure func test_emit_mixed_struct_and_string_closure_uses_typed_tail() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		mixed_point_string_closure_program(),
 	)
 	env_name: String = "__blorp_closure_env___def_936__blorp_eta_mixed_point_string"
@@ -11649,7 +11857,7 @@ pure func test_emit_stack_result_task_closure_return_uses_stack_result_box() -> 
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_721__blorp_task_21(void* __env)")
@@ -11670,10 +11878,7 @@ pure func point_copy_task_capture() -> CoreTaskCapture:
 
 pure func point_copy_task_closure() -> CoreTaskClosure:
 	{
-		function_name = "_blorp_task_copy_point",
 		def_id = 938,
-		c_name = "__def_938__blorp_task_copy_point",
-		static_name = "__sc___def_938__blorp_task_copy_point",
 		captures = [point_copy_task_capture()],
 		return_type = VoidType,
 	}
@@ -11692,7 +11897,6 @@ pure func point_copy_task_body_function() -> CoreFunction:
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = ClosureBodyFunction({
-			c_name = "__def_938__blorp_task_copy_point",
 			params = [],
 			captures = [capture],
 			moved_captures = [],
@@ -11733,7 +11937,7 @@ pure func point_copy_task_program() -> CoreProgram:
 
 
 pure func test_emit_task_copy_struct_keeps_legacy_slots() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		point_copy_task_program(),
 	)
 	(
@@ -11762,7 +11966,7 @@ pure func test_emit_tensor_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_86__blorp_eta_4(void* __env)")
@@ -11787,7 +11991,7 @@ pure func test_emit_channel_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_285__blorp_eta_5(void* __env)")
@@ -11812,7 +12016,7 @@ pure func test_emit_raw_pointer_captured_closure_create() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_720__blorp_eta_20(void* __env)")
@@ -11834,7 +12038,7 @@ pure func test_emit_raw_pointer_tuple_closure_body() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __def_722__blorp_clambda_1(void* __env)")
@@ -11855,7 +12059,7 @@ pure func test_emit_if_expression_as_ternary() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("return (1 ? 1 : 2);")
 
@@ -11866,7 +12070,7 @@ pure func test_emit_statement_condition_if() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long statement_if(void)")
@@ -11885,7 +12089,7 @@ pure func test_emit_list_handoff_nullable_option_capture_condition() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_List* handoff_with_nullable_option_capture_condition")
@@ -11905,7 +12109,7 @@ pure func test_emit_binary_add_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("long add_one(long x)") and artifact.c_code.contains("return (x + 1);")
 
@@ -11916,7 +12120,7 @@ pure func test_emit_let_collection_equality_consumes_cleanup() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("return blorp_dict_eq(values, right);")
@@ -11933,7 +12137,7 @@ pure func test_emit_dict_equality_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int dict_int_equal(blorp_Dict* left, blorp_Dict* right)")
@@ -11952,7 +12156,7 @@ pure func test_emit_set_equality_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int set_int_equal(blorp_Set* left, blorp_Set* right)")
@@ -11967,7 +12171,7 @@ pure func test_emit_fixed_binary_expressions() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -11987,7 +12191,7 @@ pure func test_emit_binary_divide_expression_is_infallible() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("long safe_divide(void)") and artifact.c_code.contains((
 			"return ({ long __blorp_internal_arithmetic_left = 7; long "
@@ -12013,7 +12217,7 @@ pure func test_emit_float_divide_expression_preserves_ieee_semantics() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("double ieee_float_divide(void)")
@@ -12027,7 +12231,7 @@ pure func test_emit_binary_modulo_expression_is_infallible() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("long safe_modulo(void)") and artifact.c_code.contains((
 			"return ({ long __blorp_internal_arithmetic_left = 7; long "
@@ -12049,7 +12253,7 @@ pure func test_emit_unary_negate_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("long negate(void)") and artifact.c_code.contains("return (-7);")
 
@@ -12060,7 +12264,7 @@ pure func test_emit_unary_negate_negative_literal_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long negate_negative_literal(void)")
@@ -12074,7 +12278,7 @@ pure func test_emit_unary_negate_preserves_narrow_integer_width() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int8_t negate_int8(void)")
@@ -12088,7 +12292,7 @@ pure func test_emit_unary_not_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("int not_false(void)") and artifact.c_code.contains("return (!0);")
 
@@ -12099,7 +12303,7 @@ pure func test_emit_cast_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("double int_to_float(void)")
@@ -12113,7 +12317,7 @@ pure func test_emit_primitive_box_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* box_int(void)")
@@ -12127,7 +12331,7 @@ pure func test_emit_int128_box_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* box_int128(void)")
@@ -12141,7 +12345,7 @@ pure func test_emit_stack_result_box_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* box_stack_result(void)")
@@ -12158,7 +12362,7 @@ pure func test_emit_resource_scope_cleans_up_value_body() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long with_resource_value(void)")
@@ -12184,7 +12388,7 @@ pure func test_emit_resource_cleanup_exit_before_break() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	match artifact.c_code.index_of("blorp_task_cleanup_pop_slot_with_task(&handle, __blorp_task);"):
 		Some(pop_index):
@@ -12206,7 +12410,7 @@ pure func test_emit_resource_cleanup_exit_before_break() -> Bool:
 
 
 pure func test_string_literal_dispatch_preserves_loop_break_target() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests({
+	artifact: CArtifact = emit_source_spelled_c_artifact({
 		decls = [FunctionDecl(length_dispatch_break_function())],
 		foreign_includes = [],
 		source_files = []
@@ -12243,7 +12447,7 @@ pure func test_emit_releasing_match_without_cancellation_omits_cleanup_slot() ->
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	function_start: Int = artifact.c_code
 		.index_of("void releasing_match_break(Choice* choice) {")
 		.get_or(0)
@@ -12276,7 +12480,7 @@ pure func test_emit_float_literal_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("double float_literal(void)")
@@ -12308,7 +12512,7 @@ pure func test_emit_nonfinite_float_literal_expressions() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("double positive_infinity(void)")
@@ -12326,7 +12530,7 @@ pure func test_emit_char_literal_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int32_t char_literal(void)")
@@ -12340,7 +12544,7 @@ pure func test_emit_sized_scalar_function_signature() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("int32_t id32(int32_t x)") and artifact.c_code.contains("return x;")
 
@@ -12351,7 +12555,7 @@ pure func test_emit_unsigned_sized_scalar_return() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("uint8_t uint8_literal(void)")
@@ -12365,7 +12569,7 @@ pure func test_emit_unmanaged_tailrec_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_to(long n, long brp_v_1)")
@@ -12387,7 +12591,7 @@ pure func test_emit_profiled_tailrec_loop_balances_direct_return() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_with_profile_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact_with_profile(
 		program,
 		FunctionProfileExact([]),
 	)
@@ -12405,7 +12609,7 @@ pure func test_emit_tailrec_literal_match_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_to_match(long n, long brp_v_1)")
@@ -12424,7 +12628,7 @@ pure func test_emit_tailrec_list_spread_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_recursive(blorp_List* brp_v_2, long brp_v_1)")
@@ -12446,7 +12650,7 @@ pure func test_emit_range_for_loop_with_dynamic_step() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_range(void)")
@@ -12470,7 +12674,7 @@ pure func test_emit_forward_only_range_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_forward_range(void)")
@@ -12483,18 +12687,101 @@ pure func test_emit_forward_only_range_for_loop() -> Bool:
 	)
 
 
-pure func test_emit_range_value_for_loop() -> Bool:
+pure func test_emit_unsupported_function_diagnostic_names_failing_child() -> Bool:
+	-- The Range field access has no declared Range record, so its member cannot
+	-- be spelled; the diagnostic must still point at the failing child.
 	program: CoreProgram = {
 		decls = [FunctionDecl(range_value_sum_function())],
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+
+	artifact.c_code.contains(
+		"unsupported function sum_range_value kind=user def_id=203 child_path=1.0.0 child_kind=nested_emission",
+	)
+
+
+pure func reserved_abi_record_decl() -> CoreValueRecordDecl:
+	{
+		abi_type = None,
+		name = "short",
+		type_params = [],
+		fields = [
+			{
+				ref = core_field_ref(17),name = "long",
+				typ = int_type()
+			},
+			{
+				ref = core_field_ref(1),name = "count",
+				typ = int_type()
+			},
+		],
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func reserved_abi_probe_function() -> CoreFunction:
+	{ foreign_value_flags_probe_function() |
+		name = "reserved_abi_probe",
+		params = [
+			{
+				name = {
+					name = "value",
+					id = 0,
+					def_id = None,
+					origin = AuthoredBinder
+				},
+				typ = ValueRecordType("short"),
+				loc = synthetic_core_source_loc()
+			},
+		],
+		def_id = 9202
+	}
+
+
+---
+A record reachable from a foreign signature keeps its source member names, so a
+member spelled like a C keyword must still be escaped; the record's own name is
+projected, so a reserved-word type name cannot reach C at all.
+---
+pure func test_emit_foreign_reachable_record_escapes_reserved_member_names() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			ValueRecordDecl(reserved_abi_record_decl()),
+			FunctionDecl(reserved_abi_probe_function()),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(
+		run_pre_dce_tail(program),
+		FunctionProfileOff,
+	):
+		Ok(artifact):
+			(
+				artifact.c_code.contains("{ long long_; long count; }")
+				and artifact.c_code.contains("{ .long_ = long_, .count = count }")
+				and not artifact.c_code.contains(" short;")
+				and not artifact.c_code.contains("} short")
+			)
+		Err(_):
+			False
+
+
+pure func test_emit_range_value_for_loop() -> Bool:
+	program: CoreProgram = {
+		decls = [ValueRecordDecl(range_record_decl()), FunctionDecl(range_value_sum_function())],
+		foreign_includes = [],
+		source_files = []
+	}
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_range_value(Range range)")
-		and artifact.c_code.contains("long __range_start_0 = range.start;")
-		and artifact.c_code.contains("long __range_end_0 = range.end;")
+		and artifact.c_code.contains("long __range_start_0 = range.f0;")
+		and artifact.c_code.contains("long __range_end_0 = range.f1;")
 		and artifact.c_code.contains(
 			"for (long brp_v_2 = __range_start_0; brp_v_2 != __range_end_0; brp_v_2 += __range_step_0) {",
 		)
@@ -12509,7 +12796,7 @@ pure func test_emit_literal_match_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long classify(long brp_v_3)")
@@ -12531,7 +12818,7 @@ pure func test_emit_literal_match_fail_fallback() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("#include <stdio.h>")
@@ -12555,7 +12842,7 @@ pure func test_emit_string_literal_match_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long classify_label(blorp_String* label)")
@@ -12577,7 +12864,7 @@ pure func test_emit_string_literal_match_length_dispatch() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	case_zero_index: Option[Int] = artifact.c_code.index_of("case 0L:")
 	case_one_index: Option[Int] = artifact.c_code.index_of("case 1L:")
 	case_two_index: Option[Int] = artifact.c_code.index_of("case 2L:")
@@ -12615,7 +12902,7 @@ pure func test_emit_string_literal_match_length_dispatch() -> Bool:
 
 
 pure func test_string_literal_length_dispatch_eligibility() -> Bool:
-	three_cases: CArtifact = emit_unprojected_core_program_c_artifact_for_tests({
+	three_cases: CArtifact = emit_source_spelled_c_artifact({
 		decls = [
 			FunctionDecl(
 				literal_match_function_for_dispatch_eligibility(
@@ -12632,7 +12919,7 @@ pure func test_string_literal_length_dispatch_eligibility() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	})
-	single_length: CArtifact = emit_unprojected_core_program_c_artifact_for_tests({
+	single_length: CArtifact = emit_source_spelled_c_artifact({
 		decls = [
 			FunctionDecl(
 				literal_match_function_for_dispatch_eligibility(
@@ -12650,7 +12937,7 @@ pure func test_string_literal_length_dispatch_eligibility() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	})
-	mixed_literals: CArtifact = emit_unprojected_core_program_c_artifact_for_tests({
+	mixed_literals: CArtifact = emit_source_spelled_c_artifact({
 		decls = [
 			FunctionDecl(
 				literal_match_function_for_dispatch_eligibility(
@@ -12685,7 +12972,7 @@ pure func test_emit_tailrec_string_literal_match_length_dispatch() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -12708,7 +12995,7 @@ pure func test_emit_literal_match_fallback_binding() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int matches_fallback_label(blorp_String* label)")
@@ -12726,7 +13013,7 @@ pure func test_emit_logical_and_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int logical_and(void)")
@@ -12740,7 +13027,7 @@ pure func test_emit_logical_or_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int logical_or(void)")
@@ -12754,7 +13041,7 @@ pure func test_emit_deep_logical_expression_is_stack_bounded() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	last_condition_name: String = "brp_v_" + encode_base62(DEEP_EMIT_LOGICAL_DEPTH - 1)
 
 	(
@@ -12771,7 +13058,7 @@ pure func test_emit_deep_left_logical_expression_is_stack_bounded() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	last_condition_name: String = "brp_v_" + encode_base62(DEEP_EMIT_LOGICAL_DEPTH - 1)
 
 	(
@@ -12788,7 +13075,7 @@ pure func test_emit_deep_simple_logical_expression_is_stack_bounded() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int deep_simple_logical(void)")
@@ -12803,7 +13090,7 @@ pure func test_emit_escaped_string_literal() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_String* escaped_string(void)")
@@ -12819,7 +13106,7 @@ pure func test_emit_nul_string_literal_with_explicit_length() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_String* nul_string(void)")
@@ -12837,7 +13124,7 @@ pure func test_emit_unicode_string_literal_escapes_bytes() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_String* unicode_string(void)")
@@ -12852,7 +13139,7 @@ pure func test_emit_simple_user_call_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long id(long x)")
@@ -12867,7 +13154,7 @@ pure func test_emit_function_forward_declarations() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	prototype_index: Option[Int] = artifact.c_code.index_of("long id(long x);")
 	main_index: Option[Int] = artifact.c_code.index_of("int main(void)")
 	definition_index: Option[Int] = artifact.c_code.index_of("long id(long x) {")
@@ -12885,7 +13172,7 @@ pure func test_emit_intrinsic_call_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long shift_left_intrinsic(void)")
@@ -12904,7 +13191,7 @@ pure func test_emit_prepared_list_ensure_intrinsic_calls() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_List* ensure_unique_list(blorp_List* xs)")
@@ -12933,7 +13220,7 @@ pure func test_emit_scalar_builtin_call_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int8_t to_int8_builtin(long x)")
@@ -12947,7 +13234,7 @@ pure func test_emit_string_eq_builtin_call_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int strings_equal(blorp_String* left, blorp_String* right)")
@@ -13660,7 +13947,7 @@ pure func test_emit_direct_runtime_builtin_call_shapes() -> Bool:
 					"blorp_tcp_close_listener",
 					[tcp_listener_param("listener")],
 					VoidType,
-					215,
+					9215,
 				),
 			),
 			FunctionDecl(
@@ -13958,7 +14245,7 @@ pure func test_emit_direct_runtime_builtin_call_shapes() -> Bool:
 					"blorp_vector_scalar_op_rev_float32",
 					[int_param("op"), tensor_param("items"), float32_param("scalar")],
 					tensor_type(),
-					278,
+					9278,
 				),
 			),
 			FunctionDecl(
@@ -13997,7 +14284,7 @@ pure func test_emit_direct_runtime_builtin_call_shapes() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long hash_runtime_key(long value)")
@@ -14380,7 +14667,7 @@ pure func test_emit_direct_runtime_list_layout_arity_contract() -> Bool:
 		int_param("elem_size"),
 		int_param("value_encoding"),
 	]
-	expanded: CArtifact = emit_unprojected_core_program_c_artifact_for_tests({
+	expanded: CArtifact = emit_source_spelled_c_artifact({
 		decls = [
 			FunctionDecl(
 				direct_runtime_call_function_with_policy(
@@ -14397,7 +14684,7 @@ pure func test_emit_direct_runtime_list_layout_arity_contract() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	})
-	invalid: CArtifact = emit_unprojected_core_program_c_artifact_for_tests({
+	invalid: CArtifact = emit_source_spelled_c_artifact({
 		decls = [
 			FunctionDecl(
 				direct_runtime_call_function_with_policy(
@@ -14427,11 +14714,15 @@ pure func test_emit_direct_runtime_list_layout_arity_contract() -> Bool:
 
 pure func test_emit_custom_dict_with_capacity_call() -> Bool:
 	program: CoreProgram = {
-		decls = [FunctionDecl(custom_dict_with_capacity_function())],
+		decls = [
+			FunctionDecl(stub_callee_function("Hashable_hash_Point", 9601)),
+			FunctionDecl(stub_callee_function("Equatable_equals_Point", 9602)),
+			FunctionDecl(custom_dict_with_capacity_function()),
+		],
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Dict* custom_dict_with_capacity(long capacity)")
@@ -14471,7 +14762,7 @@ pure func test_emit_tensor_parallel_inline_struct_layout_metadata() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"blorp_Vector* parallel_accel(blorp_Vector* items, blorp_Closure* f, long "
@@ -14491,7 +14782,7 @@ pure func test_emit_fallible_stream_collect_bridge() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -14520,7 +14811,7 @@ pure func test_emit_fallible_stream_find_nested_option_bridge() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"blorp_StackResult find_fallible_stream(blorp_FallibleStream* stream, "
@@ -14762,7 +15053,7 @@ pure func test_emit_managed_channel_allocation_initializes_elem_release() -> Boo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Channel* make_string_channel(long capacity)")
@@ -14786,7 +15077,7 @@ pure func test_emit_channel_allocated_box_release_callbacks() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	point_start: Int = artifact.c_code
 		.index_of("blorp_Channel* make_point_channel(long capacity) {")
 		.get_or(0)
@@ -14832,7 +15123,7 @@ pure func test_emit_channel_attempt_wrappers_use_prepared_backend() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"SendAttempt* send_timeout_attempt(blorp_Channel* ch, blorp_String* value, long "
@@ -14876,7 +15167,7 @@ pure func test_emit_recv_attempt_point_storage_release_mask() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains(
 		"RecvAttemptPoint* __def_609_RecvValue(void* field0, unsigned long release_mask)",
@@ -14897,7 +15188,7 @@ pure func test_emit_channel_send_attempt_retains_boxed_temp() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* __chan_send_value_1242 = blorp_box_stack_result(")
@@ -14924,7 +15215,7 @@ pure func test_emit_stack_result_box_retains_actual_returned_value() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_box_stack_result(blorp_stack_result_retain_value(")
@@ -14938,7 +15229,7 @@ pure func test_emit_channel_send_retains_boxed_temp() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -14969,7 +15260,7 @@ pure func test_emit_raw_scalar_tensor_get_unchecked() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long unchecked_tensor_item(blorp_Vector* items, long index)")
@@ -14983,7 +15274,7 @@ pure func test_emit_statement_shaped_binary_operand() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int statement_shaped_binary_operand(void)")
@@ -15004,7 +15295,7 @@ pure func test_emit_protects_owned_argument_during_later_checkpoint() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	push_index: Option[Int] = artifact.c_code.index_of(
 		"blorp_task_cleanup_push_with_task(&__blorp_cleanup_brp_vt_5uFzovh2zo4_b0",
 	)
@@ -15030,7 +15321,7 @@ pure func test_emit_nullable_option_construction() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void* some_string(blorp_String* value)")
@@ -15050,7 +15341,7 @@ pure func test_emit_nullable_option_statement_list_payload() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_List* statement_value_list(void)")
@@ -15074,7 +15365,7 @@ pure func test_emit_statement_list_call_argument() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long consume_strings(blorp_List* items)")
@@ -15098,7 +15389,7 @@ pure func test_emit_statement_tuple_elements() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Tuple* statement_value_tuple(void)")
@@ -15120,7 +15411,7 @@ pure func test_emit_nullable_option_constructor_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int option_string_is_self_equal(void* option)")
@@ -15138,7 +15429,7 @@ pure func test_emit_constructor_payload_string_literal_length_dispatch() -> Bool
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long option_string_dispatch(void* option)")
@@ -15163,7 +15454,7 @@ pure func test_emit_stack_option_constructor_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long option_int_or_zero(blorp_StackOption_Int option)")
@@ -15181,7 +15472,7 @@ pure func test_emit_constructor_payload_literal_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long option_int_special_or_payload(blorp_StackOption_Int option)")
@@ -15200,7 +15491,7 @@ pure func test_emit_boxed_result_payload_literal_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long boxed_result_int_special_or_negative(blorp_Result* result)")
@@ -15219,7 +15510,7 @@ pure func test_emit_stack_result_constructor_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long result_int_or_negative_one(blorp_StackResult result)")
@@ -15243,7 +15534,7 @@ pure func test_emit_boxed_option_stack_result_constructor_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long option_result_first_or_negative(void* option_result)")
@@ -15263,7 +15554,7 @@ pure func test_emit_boxed_option_stack_result_from_list_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long first_option_result_from_list(blorp_List* values)")
@@ -15291,7 +15582,7 @@ pure func test_emit_stack_result_void_payload_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long result_void_or_negative_one(blorp_StackResult result)")
@@ -15308,7 +15599,7 @@ pure func test_emit_bool_constructor_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long bool_to_int_match(int brp_v_4)")
@@ -15326,7 +15617,7 @@ pure func test_emit_stack_result_construction() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("blorp_StackResult make_result(void)") and artifact.c_code.contains((
 			"return ((blorp_StackResult){ .tag = 0, .release_mask = 0UL, .data.Ok.field0 = "
@@ -15343,7 +15634,7 @@ pure func test_emit_boxed_result_construction() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Result* make_boxed_result(void)")
@@ -15364,7 +15655,7 @@ pure func test_emit_stack_result_option_payload_boxes_stack_option() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackResult make_result_option(void)")
@@ -15385,7 +15676,7 @@ pure func test_emit_stack_result_tuple_payload_with_statement_body() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackResult scanner_literal_shape(int flag, Value* value)")
@@ -15411,8 +15702,8 @@ pure func test_emit_generated_stack_option_typedefs() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
-	point_index: Option[Int] = artifact.c_code.index_of("typedef struct { long x; long y; } Point;")
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+	point_index: Option[Int] = artifact.c_code.index_of("typedef struct { long f0; long f1; } Point;")
 	point_option_index: Option[Int] = artifact.c_code.index_of(
 		"typedef struct { int tag; Point value; } blorp_StackOption_Point;",
 	)
@@ -15480,14 +15771,14 @@ pure func test_emit_value_record_typedefs_follow_field_dependencies() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	cursor_index: Option[Int] = artifact.c_code.index_of("} z_base__Cursor;")
 	scan_index: Option[Int] = artifact.c_code.index_of("} b_scan__Scan;")
 
 	(
-		artifact.c_code.contains("typedef struct { long offset; long line; } z_base__Cursor;")
+		artifact.c_code.contains("typedef struct { long f0; long f1; } z_base__Cursor;")
 		and artifact.c_code.contains(
-			"typedef struct { z_base__Cursor end; _Bool saw_dot; } b_scan__Scan;",
+			"typedef struct { z_base__Cursor f0; _Bool f1; } b_scan__Scan;",
 		)
 		and option_int_less_than(cursor_index, scan_index)
 	)
@@ -15499,7 +15790,7 @@ pure func test_emit_bounded_range_stack_option() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackOption_Range choose_range(long idx)")
@@ -15516,7 +15807,7 @@ pure func test_emit_void_stack_option_payload() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackOption_Void make_void_option(void)")
@@ -15532,7 +15823,7 @@ pure func test_emit_builtin_option_constructors_prepare_to_stack_option() -> Boo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackOption_Int maybe_number(int flag)")
@@ -15547,7 +15838,7 @@ pure func test_emit_stack_option_uses_raw_boxed_primitive_payload() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackOption_Int maybe_boxed_number(void)")
@@ -15562,7 +15853,7 @@ pure func test_emit_value_record_stack_option_payload() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackOption_Point make_point_option(void)")
@@ -15578,7 +15869,7 @@ pure func test_emit_reserved_c_identifier() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long return_unsigned(long unsigned_)")
@@ -15593,7 +15884,7 @@ pure func test_emit_predefined_c_macro_identifier() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long return_linux(long linux_)")
@@ -15611,7 +15902,7 @@ pure func test_emit_reserved_c_function_identifier() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long double_(long x);")
@@ -15628,7 +15919,7 @@ pure func test_emit_static_scalar_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	prototype_index: Option[Int] = artifact.c_code.index_of("long return_answer(void);")
 	global_index: Option[Int] = artifact.c_code.index_of("static long ANSWER = 42L;")
 	function_index: Option[Int] = artifact.c_code.index_of("long return_answer(void) {")
@@ -15648,7 +15939,7 @@ pure func test_emit_literal_string_global_uses_static_pool() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -15668,7 +15959,7 @@ pure func test_emit_static_inline_int_list_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"static struct { blorp_Object header; long len; long capacity; void "
@@ -15697,7 +15988,7 @@ pure func test_emit_owned_heap_record_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static Box* STATIC_BOX;")
@@ -15717,152 +16008,17 @@ pure func test_emit_heap_record_reuse_with_unique_and_fresh_paths() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static inline Box* __blorp_reuse_record_Box(Box* __old")
 		and artifact.c_code.contains("if (__old && blorp_is_unique(__old))")
 		and artifact.c_code.contains("Box_destroy(__old);")
-		and artifact.c_code.contains("__old->count = count;")
-		and artifact.c_code.contains("__old->label = label;")
-		and artifact.c_code.contains("Box* __fresh = Box_make(count, label);")
+		and artifact.c_code.contains("__old->f0 = f0;")
+		and artifact.c_code.contains("__old->f1 = f1;")
+		and artifact.c_code.contains("Box* __fresh = Box_make(f0, f1);")
 		and artifact.c_code.contains("if (__old) blorp_release(__old);")
 		and artifact.c_code.contains("__blorp_reuse_record_Box(box,")
-	)
-
-
-pure func reserved_word_heap_record_decl() -> CoreHeapRecordDecl:
-	{
-		abi_type = None,
-		name = "int",
-		type_params = [],
-		fields = [
-			{
-				ref = core_field_ref(30),name = "value",
-				typ = int_type(),
-				release_policy = NoReleasePolicy
-			},
-			{
-				ref = core_field_ref(2),name = "label",
-				typ = string_type(),
-				release_policy = ArcReleasePolicy
-			},
-		],
-		loc = synthetic_core_source_loc()
-	}
-
-
-pure func reserved_word_box_type() -> CoreType:
-	HeapRecordType("int")
-
-
-pure func reserved_word_enum_decl() -> CoreEnumDecl:
-	{
-		abi_type = None,
-		name = "float",
-		type_params = [],
-		variants = [
-			{
-				name = "Low",
-				c_name = "__def_201_Low",
-				tag = 0,
-				def_id = Some(201)
-			},
-			{
-				name = "High",
-				c_name = "__def_202_High",
-				tag = 1,
-				def_id = Some(202)
-			},
-		],
-		loc = synthetic_core_source_loc()
-	}
-
-
-pure func reserved_word_reuse_function() -> CoreFunction:
-	register_var: CoreVar = {
-		name = "register",
-		id = 0,
-		def_id = None,
-		origin = AuthoredBinder
-	}
-
-	{
-		name = "reuse_reserved",
-		source_module = None,
-		type_params = [],
-		params = [
-			{
-				name = register_var,
-				typ = reserved_word_box_type(),
-				loc = synthetic_core_source_loc()
-			},
-		],
-		return_type = reserved_word_box_type(),
-		body = Some(
-			RecordReuseExpr(
-				VarExpr(
-					register_var,
-					reserved_word_box_type(),
-					synthetic_core_source_loc(),
-				),
-				[
-					{
-						ref = core_field_ref(30),name = "value",
-						value = LiteralExpr(IntLiteral(9), int_type(), synthetic_core_source_loc())
-					},
-					{
-						ref = core_field_ref(2),name = "label",
-						value = LiteralExpr(
-							StringLiteral("reserved"),
-							string_type(),
-							synthetic_core_source_loc(),
-						)
-					},
-				],
-				reserved_word_box_type(),
-				synthetic_core_source_loc(),
-			),
-		),
-		is_pure = True,
-		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
-		module = FIXTURE_NO_SOURCE_MODULE,
-		function_kind = UserFunction,
-		def_id = 84,
-		loc = synthetic_core_source_loc()
-	}
-
-
--- Protects the F3 backend naming facts: a reserved-C-word type name (record
--- make/destroy/reuse and enum to-string helpers all escape through the same
--- `backend_type_naming` builder) and a reserved-C-word local spelling, so a
--- regression in either the once-built facts table or the still-per-call
--- `c_local_name` path shows up as a changed C spelling here.
-pure func test_emit_reserved_word_type_naming_facts() -> Bool:
-	program: CoreProgram = {
-		decls = [
-			HeapRecordDecl(reserved_word_heap_record_decl()),
-			EnumDecl(reserved_word_enum_decl()),
-			FunctionDecl(reserved_word_reuse_function()),
-		],
-		foreign_includes = [],
-		source_files = []
-	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
-
-	(
-		artifact.c_code.contains("static inline int* __blorp_reuse_record_int_(int* __old")
-		and artifact.c_code.contains("int__destroy(__old);")
-		and artifact.c_code.contains("int* __fresh = int__make(value, label);")
-		and artifact.c_code.contains("__old->value = value;")
-		and artifact.c_code.contains("__old->label = label;")
-		and artifact.c_code.contains("__blorp_reuse_record_int_(register_,")
-		and artifact.c_code.contains("static blorp_String* __blorp_enum_to_string_float_(long v)")
-		and artifact.c_code.contains("blorp_String* blorp_vector_to_string_float_(blorp_Vector* v)")
-		and artifact.c_code.contains(
-			"blorp_vector_to_string_packed_enum(v, __blorp_enum_to_string_float_)",
-		)
-		and artifact.c_code.contains("#define __def_201_Low 0L")
 	)
 
 
@@ -15920,14 +16076,14 @@ pure func box_record_take_label_function() -> CoreFunction:
 								string_type(),
 								FieldExpr(
 									VarExpr(box_var, box_type(), synthetic_core_source_loc()),
-									"label", test_field_ref(),
+									"label", test_field_ref("label"),
 									string_type(),
 									synthetic_core_source_loc(),
 								),
 								DupExpr(
 									owned_label,
 									string_type(),
-									CowFieldTakeRetainPolicy(box_var, "label", test_field_ref(), "Box"),
+									CowFieldTakeRetainPolicy(box_var, "label", test_field_ref("label"), "Box"),
 									VarExpr(owned_label, string_type(), synthetic_core_source_loc()),
 									string_type(),
 									synthetic_core_source_loc(),
@@ -15958,7 +16114,7 @@ pure func test_emit_cow_field_take_empties_unique_source_slot() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	function_start: Int = artifact.c_code
 		.index_of("Box* take_box_label(Box* box) {")
 		.get_or(0)
@@ -15967,7 +16123,7 @@ pure func test_emit_cow_field_take_empties_unique_source_slot() -> Bool:
 		artifact.c_code.length() - function_start,
 	)
 	take_index: Option[Int] = function_c.index_of((
-			"if (blorp_is_unique(box)) { box->label = NULL; } else { "
+			"if (blorp_is_unique(box)) { box->f1 = NULL; } else { "
 			+ "blorp_retain(owned_label); }"
 		))
 	source_test_index: Option[Int] = function_c.index_of("if (blorp_is_unique(__record_cow_source_")
@@ -15982,7 +16138,7 @@ pure func test_emit_cow_field_take_empties_unique_source_slot() -> Bool:
 		function_start > 0
 		and take_precedes_source_test
 		and function_c.count("blorp_is_unique(box)") == 1
-		and function_c.contains("->label);")
+		and function_c.contains("->f1);")
 	)
 
 
@@ -15995,7 +16151,7 @@ pure func test_emit_sparse_heap_record_update_mutates_only_replacement_fields() 
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	function_start: Int = artifact.c_code
 		.index_of("Box* update_box_count(Box* box) {")
 		.get_or(0)
@@ -16012,14 +16168,14 @@ pure func test_emit_sparse_heap_record_update_mutates_only_replacement_fields() 
 		and function_end > function_start
 		and shared_start > 0
 		and unique_c.contains("if (blorp_is_unique(__record_cow_source_")
-		and unique_c.contains("->count = __record_cow_field_")
-		and not unique_c.contains("->label")
+		and unique_c.contains("->f0 = __record_cow_field_")
+		and not unique_c.contains("->f1")
 		and not unique_c.contains("Box_make(")
 		and not unique_c.contains("Box_destroy(")
 		and not unique_c.contains("blorp_retain(")
 		and not unique_c.contains("blorp_release(")
 		and shared_c.count("blorp_retain(__record_cow_source_") == 1
-		and shared_c.contains("->label);")
+		and shared_c.contains("->f1);")
 		and shared_c.count("Box_make(") == 1
 		and shared_c.count("blorp_release(__record_cow_source_") == 1
 		and function_c.count("blorp_is_unique(") == 1
@@ -16035,7 +16191,7 @@ pure func test_emit_sparse_heap_record_update_honors_every_release_policy() -> B
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	replacement_index: Option[Int] = artifact.c_code.index_of("blorp_String* __record_cow_field_")
 	uniqueness_index: Option[Int] = artifact.c_code.index_of(
 		"if (blorp_is_unique(__record_cow_source_",
@@ -16053,17 +16209,17 @@ pure func test_emit_sparse_heap_record_update_honors_every_release_policy() -> B
 		and artifact.c_code.count(" = brp_v_1;") == 1
 		and artifact.c_code.count(" = brp_v_1;") == 1
 		and artifact.c_code.contains("blorp_release((blorp_Object*)__record_cow_source_")
-		and artifact.c_code.contains("->arc_value);")
+		and artifact.c_code.contains("->f0);")
 		and artifact.c_code.contains("blorp_release_arc_only(__record_cow_source_")
-		and artifact.c_code.contains("->arc_only_value);")
+		and artifact.c_code.contains("->f1);")
 		and artifact.c_code.contains("blorp_stack_result_release(__record_cow_source_")
-		and artifact.c_code.contains("->result_value);")
-		and artifact.c_code.contains("->flag = __record_cow_field_")
+		and artifact.c_code.contains("->f2);")
+		and artifact.c_code.contains("->f3 = __record_cow_field_")
 		and artifact.c_code.contains("blorp_retain(__record_cow_source_")
-		and artifact.c_code.contains("->inherited);")
+		and artifact.c_code.contains("->f5);")
 		and artifact.c_code.contains("PolicyBox_make(")
-		and artifact.c_code.contains("_Bool flag : 1;")
-		and artifact.c_code.contains("_Bool other_flag : 1;")
+		and artifact.c_code.contains("_Bool f3 : 1;")
+		and artifact.c_code.contains("_Bool f4 : 1;")
 	)
 
 
@@ -16078,7 +16234,7 @@ pure func test_emit_multiple_sparse_record_update_sites_remain_site_local() -> B
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.count("if (blorp_is_unique(__record_cow_source_") == 2
@@ -16097,7 +16253,7 @@ pure func test_emit_owned_heap_record_list_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static blorp_List* STATIC_BOXES;")
@@ -16123,7 +16279,7 @@ pure func test_emit_owned_tuple_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static blorp_Tuple* STATIC_PAIR;")
@@ -16148,7 +16304,7 @@ pure func test_emit_static_float_tuple_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"static struct { blorp_Object header; long arity; long release_mask; void* "
@@ -16185,7 +16341,7 @@ pure func test_emit_owned_stack_result_globals() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static blorp_StackResult STATIC_RESULT;")
@@ -16215,7 +16371,7 @@ pure func test_emit_owned_generic_union_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static Choice__mono_String* CHOSEN;")
@@ -16234,7 +16390,7 @@ pure func test_emit_union_reuse_constructor_helper() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static inline Choice* __blorp_reuse_Choice___def_44_Picked")
@@ -16333,7 +16489,7 @@ pure func test_emit_core_pipeline_runs_union_reuse() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("__blorp_reuse_Choice__mono_String___def_144_Picked(source")
 
@@ -16348,7 +16504,7 @@ pure func test_emit_static_nonfinite_float_globals() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static double POS_INF = INFINITY;")
@@ -16366,7 +16522,7 @@ pure func test_emit_static_wide_int_globals() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static long INT_BOUND_MAX = 9223372036854775807L;")
@@ -16380,7 +16536,7 @@ pure func test_emit_mutable_scalar_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("static long COUNTER = 0L;")
 
@@ -16391,7 +16547,7 @@ pure func test_emit_dynamic_global_init() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static blorp_List* TEST_ITEMS;")
@@ -16417,7 +16573,7 @@ pure func test_emit_dynamic_global_init_function_prototypes() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	prototype_index: Option[Int] = artifact.c_code.index_of("long id(long x);")
 	init_index: Option[Int] = artifact.c_code.index_of("void __blorp_init_globals(void)")
 	definition_index: Option[Int] = artifact.c_code.index_of("long id(long x) {")
@@ -16439,7 +16595,7 @@ pure func test_emit_owned_const_dict_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static blorp_Dict* WORD_COUNTS;")
@@ -16461,7 +16617,7 @@ pure func test_emit_owned_const_erased_union_global() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("static BoxPayload* GLOBAL_BOX_PAYLOAD;")
@@ -16485,7 +16641,7 @@ pure func test_emit_static_closure_forward_decl() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	forward_index: Option[Int] = artifact.c_code.index_of(
 		"static blorp_Closure __sc___def_77__blorp_eta_0;",
 	)
@@ -16507,7 +16663,7 @@ pure func test_emit_noncancelling_task_closure_omits_moved_capture_cleanup() -> 
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	prototype_index: Option[Int] = artifact.c_code.index_of(
 		"void* __def_286__blorp_task_0(void* __env);",
 	)
@@ -16533,7 +16689,7 @@ pure func test_emit_moved_task_capture_cleanup_uses_legacy_slots() -> Bool:
 		foreign_includes = [],
 		source_files = [],
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	move_index: Option[Int] = artifact.c_code.index_of(
 		"__e[0] = NULL;",
 	)
@@ -16553,7 +16709,7 @@ pure func test_emit_moved_task_capture_cleanup_uses_legacy_slots() -> Bool:
 
 
 pure func test_emit_moved_stack_result_capture_cleanup() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests({
+	artifact: CArtifact = emit_source_spelled_c_artifact({
 		decls = [FunctionDecl(moved_stack_result_yield_task_body_function())],
 		foreign_includes = [],
 		source_files = [],
@@ -19043,10 +19199,7 @@ pure func moved_conn_task_capture() -> CoreTaskCapture:
 
 pure func resource_concurrently_task() -> CoreTaskClosure:
 	{
-		function_name = "_blorp_task_0",
 		def_id = 228,
-		c_name = "__def_228__blorp_task_0",
-		static_name = "__sc___def_228__blorp_task_0",
 		captures = [moved_conn_task_capture()],
 		return_type = VoidType
 	}
@@ -19054,7 +19207,6 @@ pure func resource_concurrently_task() -> CoreTaskClosure:
 
 pure func resource_concurrently_task_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_228__blorp_task_0",
 		params = [],
 		captures = [
 			{
@@ -19208,7 +19360,6 @@ pure func structured_borrow_conn_task_capture() -> CoreTaskCapture:
 
 pure func structured_borrow_conn_task_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_931__blorp_task_structured_borrow",
 		params = [],
 		captures = [{ name = "conn", id = 0, typ = tcp_stream_type(), origin = AuthoredBinder }],
 		moved_captures = [],
@@ -19218,10 +19369,7 @@ pure func structured_borrow_conn_task_abi() -> CoreClosureAbi:
 
 pure func structured_borrow_conn_task() -> CoreTaskClosure:
 	{
-		function_name = "_blorp_task_structured_borrow",
 		def_id = 931,
-		c_name = "__def_931__blorp_task_structured_borrow",
-		static_name = "__sc___def_931__blorp_task_structured_borrow",
 		captures = [structured_borrow_conn_task_capture()],
 		return_type = VoidType
 	}
@@ -19302,7 +19450,6 @@ pure func owned_resource_concurrently_program() -> CoreProgram:
 
 pure func detach_task_abi() -> CoreClosureAbi:
 	{
-		c_name = "__def_901__blorp_detach_task",
 		params = [],
 		captures = [],
 		moved_captures = [],
@@ -19329,10 +19476,7 @@ pure func detach_task_function() -> CoreFunction:
 
 pure func detach_task_closure() -> CoreTaskClosure:
 	{
-		function_name = "_blorp_detach_task",
 		def_id = 901,
-		c_name = "__def_901__blorp_detach_task",
-		static_name = "__sc___def_901__blorp_detach_task",
 		captures = [],
 		return_type = VoidType
 	}
@@ -21759,7 +21903,7 @@ pure func tensor_inline_struct_for_function() -> CoreFunction:
 			BinaryExpr(
 				AddOp,
 				VarExpr(total_var, int_type(), synthetic_core_source_loc()),
-				FieldExpr(point_expr, "x", test_field_ref(), int_type(), synthetic_core_source_loc()),
+				FieldExpr(point_expr, "x", test_field_ref("x"), int_type(), synthetic_core_source_loc()),
 				int_type(),
 				synthetic_core_source_loc(),
 			),
@@ -22161,7 +22305,7 @@ pure func int_list_dict_with_capacity_function() -> CoreFunction:
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = UserFunction,
-		def_id = 9127,
+		def_id = 9501,
 		loc = synthetic_core_source_loc()
 	}
 
@@ -23833,7 +23977,7 @@ pure func test_emit_tuple_construct_and_field_access() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Tuple* make_pair(long a, long b)")
@@ -23860,7 +24004,7 @@ pure func test_emit_struct_tuple_construct() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Tuple* point_tuple(void)")
@@ -23882,7 +24026,7 @@ pure func test_emit_stack_result_tuple_construct() -> Bool:
 		source_files = []
 	}
 
-	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(program),
 		FunctionProfileOff,
 	):
@@ -23904,7 +24048,7 @@ pure func test_emit_stack_result_tuple_field_retains_borrowed_value() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackResult stack_result_tuple_field(blorp_Tuple* pair)")
@@ -23924,7 +24068,7 @@ pure func test_emit_statement_stack_result_tuple_construct() -> Bool:
 		source_files = []
 	}
 
-	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(rewrite_static_string_literals(program)),
 		FunctionProfileOff,
 	):
@@ -23947,7 +24091,7 @@ pure func test_emit_managed_tuple_construct() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Tuple* make_managed_pair(blorp_String* label, long value)")
@@ -23968,7 +24112,7 @@ pure func test_emit_float_tuple_construct() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Tuple* make_float_pair(double left, double right)")
@@ -23986,7 +24130,7 @@ pure func test_emit_pointer_tuple_field_access() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_String* pair_label(blorp_Tuple* pair)")
@@ -24005,7 +24149,7 @@ pure func test_emit_float_tuple_field_access() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("double pair_float_left(blorp_Tuple* pair)")
@@ -24019,7 +24163,7 @@ pure func test_emit_stack_option_tuple_field_access() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_StackOption_Int option_int_tuple_left(blorp_Tuple* pair)")
@@ -24039,7 +24183,7 @@ pure func test_emit_managed_builtin_tuple_field_access() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Fixed* pair_fixed_left(blorp_Tuple* pair)")
@@ -24063,7 +24207,7 @@ pure func test_emit_stack_option_tuple_field_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int option_float_pair_match(void)")
@@ -24083,7 +24227,7 @@ pure func test_emit_nullable_option_tuple_field_match() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int option_string_pair_match(void)")
@@ -24102,7 +24246,7 @@ pure func test_emit_nullable_option_tuple_field_match_from_generated_let() -> Bo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int option_string_pair_direct_match(void)")
@@ -24121,7 +24265,7 @@ pure func test_emit_nullable_option_tuple_field_match_from_tuple_scrutinee() -> 
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int option_string_pair_tuple_match(void)")
@@ -24139,7 +24283,7 @@ pure func test_emit_inline_struct_list_construct() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_List* make_options(void)")
@@ -24161,7 +24305,7 @@ pure func test_emit_boxed_struct_value_uses_temp() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("blorp_List* make_boxed_options(void)") and artifact.c_code.contains((
 			"blorp_StackOption_Int __box_struct_value = ((blorp_StackOption_Int){ .tag = 0, ."
@@ -24177,7 +24321,7 @@ pure func test_emit_pointer_list_retain_and_set() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void retain_and_set_string(blorp_List* xs, blorp_String* value)")
@@ -24195,7 +24339,7 @@ pure func test_emit_inline_struct_list_retain_is_noop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void retain_inline_point(blorp_List* xs, Point point)")
@@ -24211,7 +24355,7 @@ pure func test_emit_list_retain_uses_prepared_value_ownership() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("blorp_list_retain_for((blorp_List*)xs, (void*)value)")
 
@@ -24222,7 +24366,7 @@ pure func test_emit_raw_stack_result_list_retain() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -24239,7 +24383,7 @@ pure func test_emit_raw_pointer_list_retain_uses_runtime_policy() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("blorp_list_retain_for((blorp_List*)values, (void*)value)")
 
@@ -24253,7 +24397,7 @@ pure func test_emit_raw_inline_struct_list_retain_is_noop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void raw_retain_inline_point(blorp_List* values, Point value)")
@@ -24269,7 +24413,7 @@ pure func test_emit_inline_list_get_and_unbox() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long first_int_from_list(blorp_List* xs)")
@@ -24286,7 +24430,7 @@ pure func test_emit_inline_float_list_get_and_unbox() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("double first_float_from_list(blorp_List* xs)")
@@ -24303,7 +24447,7 @@ pure func test_emit_inline_struct_list_get_and_unbox() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -24325,7 +24469,7 @@ pure func test_emit_inline_struct_list_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_inline_struct_options(blorp_List* options)")
@@ -24346,7 +24490,7 @@ pure func test_emit_inline_scalar_list_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_inline_ints(blorp_List* values)")
@@ -24368,7 +24512,7 @@ pure func test_emit_statement_iterable_list_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_statement_iterable_strings(void)")
@@ -24385,7 +24529,7 @@ pure func test_emit_string_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_string_chars(blorp_String* text)")
@@ -24403,7 +24547,7 @@ pure func test_emit_dict_key_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_dict_int_keys(blorp_Dict* items)")
@@ -24423,7 +24567,7 @@ pure func test_emit_dict_pair_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_dict_int_pairs(blorp_Dict* items)")
@@ -24444,7 +24588,7 @@ pure func test_emit_set_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_set_ints(blorp_Set* items)")
@@ -24465,7 +24609,7 @@ pure func test_emit_stream_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_stream_ints(blorp_Stream* items)")
@@ -24487,7 +24631,7 @@ pure func test_emit_resource_source_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -24507,7 +24651,7 @@ pure func test_emit_resource_source_for_loop() -> Bool:
 
 
 pure func test_emit_resource_source_concurrently_loop() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		resource_concurrently_program(),
 	)
 
@@ -24534,7 +24678,7 @@ pure func test_emit_resource_source_concurrently_loop() -> Bool:
 
 
 pure func test_emit_structured_borrow_task_remains_unsupported() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		structured_borrow_concurrently_program(),
 	)
 
@@ -24549,7 +24693,7 @@ pure func test_emit_structured_borrow_task_remains_unsupported() -> Bool:
 
 
 pure func test_emit_owned_resource_source_concurrently_loop_cleans_source() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(
+	artifact: CArtifact = emit_source_spelled_c_artifact(
 		owned_resource_concurrently_program(),
 	)
 
@@ -24566,7 +24710,7 @@ pure func test_emit_owned_resource_source_concurrently_loop_cleans_source() -> B
 
 
 pure func test_emit_detach() -> Bool:
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(detach_program())
+	artifact: CArtifact = emit_source_spelled_c_artifact(detach_program())
 
 	(
 		artifact.c_code.contains("static blorp_Closure __sc___def_901__blorp_detach_task")
@@ -24584,7 +24728,7 @@ pure func test_emit_channel_stack_result_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_channel_results(blorp_Channel* ch)")
@@ -24605,7 +24749,7 @@ pure func test_emit_channel_managed_value_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_channel_strings(blorp_Channel* ch)")
@@ -24620,7 +24764,7 @@ pure func test_emit_select_channel_timer_wait() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void wait_for_select(blorp_Channel* ch, long timeout)")
@@ -24642,7 +24786,7 @@ pure func test_emit_select_stack_result_receive_cleanup() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void wait_for_result(blorp_Channel* ch)")
@@ -24666,7 +24810,7 @@ pure func test_emit_list_length_match_with_spread_binding() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int list_length_match(blorp_List* xs)")
@@ -24687,7 +24831,7 @@ pure func test_emit_union_payload_list_length_match_uses_payload_root() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long first_item_from_bag(ItemBag* bag)")
@@ -24714,7 +24858,7 @@ pure func test_emit_union_payload_list_length_expr_uses_bound_scrutinee() -> Boo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long first_item_from_bag_expr(ItemBag* bag)")
@@ -24735,7 +24879,7 @@ pure func test_emit_owned_list_literal_length_match_releases_scrutinee() -> Bool
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int owned_list_literal_length_match(void)")
@@ -24758,7 +24902,7 @@ pure func test_emit_inline_list_set() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void set_first_int(blorp_List* xs, long value)")
@@ -24777,7 +24921,7 @@ pure func test_emit_inline_float_list_set() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void set_first_float(blorp_List* xs, double value)")
@@ -24795,7 +24939,7 @@ pure func test_emit_inline_list_swap() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void swap_first_two_ints(blorp_List* xs)")
@@ -24816,7 +24960,7 @@ pure func test_emit_pointer_list_set_statement_value() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void statement_value_list_set(blorp_List* result, long index)")
@@ -24835,7 +24979,7 @@ pure func test_emit_list_handoff_reuse_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long __lh_cap_0 = 4;")
@@ -24855,7 +24999,7 @@ pure func test_emit_inline_scalar_list_handoff_set() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long __list_store_value_inline_set = value;")
@@ -24870,7 +25014,7 @@ pure func test_emit_list_handoff_store_statement_value() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -24896,7 +25040,7 @@ pure func test_emit_string_byte_operations() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("#include <string.h>")
@@ -24922,7 +25066,7 @@ pure func test_emit_string_byte_write_with_ordered_intrinsic() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	target_index: Option[Int] = artifact.c_code.index_of(
 		"blorp_String* __string_write_target_0 = target;",
 	)
@@ -24949,7 +25093,7 @@ pure func test_emit_tensor_raw_operations() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("double raw_read(blorp_Vector* tensor, long index)")
@@ -24973,7 +25117,7 @@ pure func test_emit_tensor_raw_write_materializes_ordered_value() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	index_call: Option[Int] = artifact.c_code.index_of("observe_index(index)")
 	value_call: Option[Int] = artifact.c_code.index_of("observe_value(value)")
 	raw_write: Option[Int] = artifact.c_code.index_of("__raw[__tensor_raw_write_index_")
@@ -24999,7 +25143,7 @@ pure func test_emit_tensor_raw_fill_unboxes_scalar_value() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* raw_i64_fill(void)")
@@ -25018,7 +25162,7 @@ pure func test_emit_tensor_inline_struct_literal() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* point_tensor(void)")
@@ -25036,7 +25180,7 @@ pure func test_emit_tensor_boxed_literal_release_policy() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* string_tensor(void)")
@@ -25055,7 +25199,7 @@ pure func test_emit_tensor_inline_struct_get_unchecked() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("Point point_at(blorp_Vector* tensor, long index)")
@@ -25077,7 +25221,7 @@ pure func test_emit_tensor_inline_struct_get_checked() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("Point point_checked_at(blorp_Vector* tensor, long index)")
@@ -25098,7 +25242,7 @@ pure func test_emit_tensor_inline_struct_get_or_shape() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("Point point_or_default(blorp_Vector* tensor, long index)")
@@ -25118,7 +25262,7 @@ pure func test_emit_tensor_inline_struct_set_nullable() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* set_point(blorp_Vector* tensor, long index)")
@@ -25148,7 +25292,7 @@ pure func test_emit_tensor_inline_struct_checked_set() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -25180,7 +25324,7 @@ pure func test_emit_direct_runtime_inline_struct_tensor_helpers() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	fill_value_index: Option[Int] = artifact.c_code.index_of(
 		"Point __fill_tensor_fill = Point_make(12, 13);",
 	)
@@ -25224,7 +25368,7 @@ pure func test_emit_direct_runtime_boxed_int128_fill_owns_elements() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* fill_boxed_int128_vector(void)")
@@ -25244,7 +25388,7 @@ pure func test_emit_direct_runtime_tensor_set_consumes_owned_receiver() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* set_owned_int_tensor(void)")
@@ -25261,7 +25405,7 @@ pure func test_emit_direct_runtime_consumes_owned_nonfirst_argument() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_String* concat_owned_argument(void)")
@@ -25290,7 +25434,7 @@ pure func test_emit_direct_string_tensor_fill_and_set() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	fill_value_index: Option[Int] = artifact.c_code.index_of(
 		"blorp_String* __fill_value_tensor_fill = value;",
 	)
@@ -25333,7 +25477,7 @@ pure func test_emit_borrowed_runtime_result_as_borrowed_call_argument() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -25351,7 +25495,7 @@ pure func test_emit_owned_raw_runtime_result_cast_as_managed_call_argument() -> 
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long first_owned_slice_value(blorp_Vector* tensor)")
@@ -25372,7 +25516,7 @@ pure func test_emit_ranked_tensor_checked_get_injects_static_shape() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long ranked_tensor_at(blorp_Vector* tensor")
@@ -25388,7 +25532,7 @@ pure func test_emit_unbox_statement_shaped_stream_fold() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long fold_statement_stream(blorp_Closure* combine)")
@@ -25418,7 +25562,7 @@ pure func test_emit_tensor_packed_fill() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	fill_value_index: Option[Int] = artifact.c_code.index_of(
 		"long __tensor_fill_value_tensor_packed_fill = 1;",
 	)
@@ -25443,7 +25587,7 @@ pure func test_emit_tensor_packed_matrix_checked_set() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* set_packed_cell(blorp_Vector* grid)")
@@ -25465,7 +25609,7 @@ pure func test_emit_float16_tensor_set_does_not_release_immediate_box() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Vector* set_float16_value(blorp_Vector* values)")
@@ -25489,7 +25633,7 @@ pure func test_emit_tensor_inline_struct_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_point_x(blorp_Vector* points)")
@@ -25499,7 +25643,7 @@ pure func test_emit_tensor_inline_struct_for_loop() -> Bool:
 		and artifact.c_code.contains("Point point = ({")
 		and artifact.c_code.contains("__tgu_vec_0 = (blorp_Vector*)__iter_0")
 		and artifact.c_code.contains("__tgu_idx_0 = __i_0")
-		and artifact.c_code.contains("total = (total + point.x);")
+		and artifact.c_code.contains("total = (total + point.f0);")
 		and artifact.c_code.contains("return total;")
 	)
 
@@ -25510,7 +25654,7 @@ pure func test_emit_tensor_runtime_read_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long sum_tensor_values(blorp_Vector* items)")
@@ -25529,7 +25673,7 @@ pure func test_emit_tensor_raw_scalar_for_loop() -> Bool:
 		source_files = []
 	}
 
-	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
+	match try_emit_source_spelled_prepared_c_artifact(
 		prepared_core_program(program),
 		FunctionProfileOff,
 	):
@@ -25550,7 +25694,7 @@ pure func test_emit_tensor_row_slice_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_matrix_rows(blorp_Vector* matrix)")
@@ -25569,7 +25713,7 @@ pure func test_emit_tensor_boxed_for_loop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("void visit_tensor_strings(blorp_Vector* items)")
@@ -25591,7 +25735,7 @@ pure func test_emit_hash_container_constructors() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Dict* empty_string_dict(void)")
@@ -25607,7 +25751,7 @@ pure func test_emit_dict_constructor_consumes_owned_entries() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"__dict_dict = blorp_dict_insert(__dict_dict, (void*)(blorp_String*)&__blorp_stri"
@@ -25632,7 +25776,7 @@ pure func test_emit_managed_value_dict_constructors_initialize_release() -> Bool
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Dict* empty_int_list_dict(void)")
@@ -25656,7 +25800,7 @@ pure func test_emit_dict_get_int_builtin_call() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -25675,7 +25819,7 @@ pure func test_emit_dict_get_value_record_builtin_call() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -25696,7 +25840,7 @@ pure func test_emit_dict_remove_builtin_call() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Dict* dict_remove_key(blorp_Dict* dict, blorp_String* key)")
@@ -25710,7 +25854,7 @@ pure func test_emit_set_add_builtin_call() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Set* add_to_set(blorp_Set* set, blorp_String* value)")
@@ -25753,7 +25897,7 @@ pure func test_emit_drop_release_policies() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long drop_arc_only(blorp_String* value)")
@@ -25781,7 +25925,7 @@ pure func test_emit_let_cleanup_tracks_owned_bytes() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Bytes* payload = ({")
@@ -25807,7 +25951,7 @@ pure func test_emit_discard_assignment_borrows_then_drops_string() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_String* cwd = system__getcwd();")
@@ -25823,7 +25967,7 @@ pure func test_emit_discard_assignment_releases_owned_string() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.count("system__getcwd()") == 1
@@ -25839,7 +25983,7 @@ pure func test_emit_discarded_scalar_expression_is_explicit() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains("(void)(1);")
 
@@ -25850,7 +25994,7 @@ pure func test_emit_borrow_let_string_alias_has_no_cleanup() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_String* __sp_source_1 = full_path;")
@@ -25867,7 +26011,7 @@ pure func test_emit_let_direct_return_transfers_owned_bytes() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Bytes* payload = ({")
@@ -25886,7 +26030,7 @@ pure func test_emit_noncancelling_let_alias_return_omits_source_cleanup() -> Boo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Bytes* payload = ({")
@@ -25912,7 +26056,7 @@ pure func test_emit_let_user_call_transfers_owned_bytes() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long let_bytes_user_call_transfer(blorp_Bytes* input)")
@@ -25935,7 +26079,7 @@ pure func test_emit_let_user_call_transfer_pops_cleanup_at_call_site() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -25957,7 +26101,7 @@ pure func test_emit_noncancelling_let_transfer_tail_omits_alias_cleanup() -> Boo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_List* let_list_append_transfer")
@@ -25987,7 +26131,7 @@ pure func test_emit_compiler_owned_result_temp_is_hygienic() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -26003,7 +26147,7 @@ pure func test_emit_tuple_literal_preparation() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("blorp_Tuple* make_pair_literal(long a, long b)")
@@ -26187,7 +26331,7 @@ pure func box_count_function() -> CoreFunction:
 		type_params = [],
 		params = [box_param()],
 		return_type = int_type(),
-		body = Some(FieldExpr(box_expr, "count", test_field_ref(), int_type(), synthetic_core_source_loc())),
+		body = Some(FieldExpr(box_expr, "count", test_field_ref("count"), int_type(), synthetic_core_source_loc())),
 		is_pure = True,
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
@@ -26216,8 +26360,8 @@ pure func runtime_member_box_total_function() -> CoreFunction:
 		body = Some(
 			BinaryExpr(
 				AddOp,
-				FieldExpr(box_expr, "header", test_field_ref(), int_type(), synthetic_core_source_loc()),
-				FieldExpr(box_expr, "__blorp_field_header", test_field_ref(), int_type(), synthetic_core_source_loc()),
+				FieldExpr(box_expr, "header", test_field_ref("header"), int_type(), synthetic_core_source_loc()),
+				FieldExpr(box_expr, "__blorp_field_header", test_field_ref("__blorp_field_header"), int_type(), synthetic_core_source_loc()),
 				int_type(),
 				synthetic_core_source_loc(),
 			),
@@ -26250,8 +26394,8 @@ pure func reserved_box_total_function() -> CoreFunction:
 		body = Some(
 			BinaryExpr(
 				AddOp,
-				FieldExpr(box_expr, "short", test_field_ref(), int_type(), synthetic_core_source_loc()),
-				FieldExpr(box_expr, "long", test_field_ref(), int_type(), synthetic_core_source_loc()),
+				FieldExpr(box_expr, "short", test_field_ref("short"), int_type(), synthetic_core_source_loc()),
+				FieldExpr(box_expr, "long", test_field_ref("long"), int_type(), synthetic_core_source_loc()),
 				int_type(),
 				synthetic_core_source_loc(),
 			),
@@ -26319,8 +26463,8 @@ pure func point_sum_function() -> CoreFunction:
 		body = Some(
 			BinaryExpr(
 				AddOp,
-				FieldExpr(point_expr, "x", test_field_ref(), int_type(), synthetic_core_source_loc()),
-				FieldExpr(point_expr, "y", test_field_ref(), int_type(), synthetic_core_source_loc()),
+				FieldExpr(point_expr, "x", test_field_ref("x"), int_type(), synthetic_core_source_loc()),
+				FieldExpr(point_expr, "y", test_field_ref("y"), int_type(), synthetic_core_source_loc()),
 				int_type(),
 				synthetic_core_source_loc(),
 			),
@@ -26350,7 +26494,7 @@ pure func point_statement_field_access_function() -> CoreFunction:
 		type_params = [],
 		params = [],
 		return_type = int_type(),
-		body = Some(FieldExpr(point_expr, "x", test_field_ref(), int_type(), synthetic_core_source_loc())),
+		body = Some(FieldExpr(point_expr, "x", test_field_ref("x"), int_type(), synthetic_core_source_loc())),
 		is_pure = True,
 		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
 		module = FIXTURE_NO_SOURCE_MODULE,
@@ -26370,28 +26514,28 @@ pure func test_emit_value_record_construct_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
-		artifact.c_code.contains("typedef struct { long x; long y; } Point;")
-		and artifact.c_code.contains("Point __r = { .x = x, .y = y };")
+		artifact.c_code.contains("typedef struct { long f0; long f1; } Point;")
+		and artifact.c_code.contains("Point __r = { .f0 = f0, .f1 = f1 };")
 		and artifact.c_code.contains("Point make_point(long x, long y)")
 		and artifact.c_code.contains("return Point_make(x, y);")
 		and artifact.c_code.contains("long point_sum(Point point)")
-		and artifact.c_code.contains("return (point.x + point.y);")
+		and artifact.c_code.contains("return (point.f0 + point.f1);")
 	)
 
 
-pure func test_emit_value_record_constructor_escapes_reserved_field() -> Bool:
+pure func test_emit_value_record_constructor_ignores_reserved_source_field() -> Bool:
 	program: CoreProgram = {
 		decls = [ValueRecordDecl(reserved_field_value_record_decl())],
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains(
-		"typedef struct { long short_; } ReservedFieldValue;\n" + "static inline ReservedFieldValue ReservedFieldValue_make(long short_) " + "{ ReservedFieldValue __r = { .short_ = short_ }; return __r; }",
+		"typedef struct { long f0; } ReservedFieldValue;\n" + "static inline ReservedFieldValue ReservedFieldValue_make(long f0) " + "{ ReservedFieldValue __r = { .f0 = f0 }; return __r; }",
 	)
 
 
@@ -26405,15 +26549,14 @@ pure func test_emit_internal_value_record_boolean_tail_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
-			"typedef struct { long count; long total; _Bool first; _Bool second; } "
+			"typedef struct { long f1; long f3; _Bool f0; _Bool f2; } "
 			+ "InternalValueFlags;"
 		)) and artifact.c_code.contains((
-			"InternalValueFlags_make(int first, long count, int second, long total) { "
-			+ "InternalValueFlags __r = { .first = first, .count = count, .second = second, ."
-			+ "total = total };"
+			"InternalValueFlags_make(int f0, long f1, int f2, long f3) { "
+			+ "InternalValueFlags __r = { .f0 = f0, .f1 = f1, .f2 = f2, .f3 = f3 };"
 		)) and artifact.c_code.contains((
 			"typedef struct { int first; long count; int second; long total; } "
 			+ "ForeignValueFlags;"
@@ -26433,7 +26576,7 @@ pure func test_emit_value_record_construct_statement_field() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("Point make_point_with_statement_field(void)")
@@ -26456,13 +26599,13 @@ pure func test_emit_statement_shaped_value_record_field_access() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long point_statement_field_access(void)")
 		and artifact.c_code.contains("Point __point = Point_make(9, 10);")
 		and artifact.c_code.contains("long __field_result_")
-		and artifact.c_code.contains("= __point.x;")
+		and artifact.c_code.contains("= __point.f0;")
 		and artifact.c_code.contains("return __field_result_")
 		and not artifact.c_code.contains("#error unsupported")
 	)
@@ -26474,7 +26617,7 @@ pure func test_emit_value_record_literal_preparation() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("Point literal_point(void)")
@@ -26488,14 +26631,14 @@ pure func test_emit_value_record_range_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	record_index: Option[Int] = artifact.c_code.index_of(
-		"typedef struct { long start; long end; } Range;",
+		"typedef struct { long f0; long f1; } Range;",
 	)
 	function_index: Option[Int] = artifact.c_code.index_of("long range_start(void)")
 
 	(
-		artifact.c_code.contains("static inline Range Range_make(long start, long end)")
+		artifact.c_code.contains("static inline Range Range_make(long f0, long f1)")
 		and artifact.c_code.contains("Range __range_value = { 1, 4 };")
 		and artifact.c_code.contains(
 			"return ({ Range __range_value = { 1, 4 }; __range_value; }).start;",
@@ -26510,7 +26653,7 @@ pure func test_emit_heap_record_declaration_and_field_access() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	forward_index: Option[Int] = artifact.c_code.index_of("typedef struct Box Box;")
 	record_index: Option[Int] = artifact.c_code.index_of("typedef struct Box {")
 	function_index: Option[Int] = artifact.c_code.index_of("long box_count(Box* box)")
@@ -26519,16 +26662,16 @@ pure func test_emit_heap_record_declaration_and_field_access() -> Bool:
 		artifact.c_code.contains("typedef struct Box Box;")
 		and artifact.c_code.contains("typedef struct Box {")
 		and artifact.c_code.contains("  blorp_Object header;")
-		and artifact.c_code.contains("  long count;")
-		and artifact.c_code.contains("  blorp_String* label;")
+		and artifact.c_code.contains("  long f0;")
+		and artifact.c_code.contains("  blorp_String* f1;")
 		and artifact.c_code.contains("static void Box_destroy(void* obj)")
 		and artifact.c_code.contains(
-			"if (__rec->label) blorp_release((blorp_Object*)__rec->label);",
+			"if (__rec->f1) blorp_release((blorp_Object*)__rec->f1);",
 		)
-		and artifact.c_code.contains("Box* Box_make(long count, blorp_String* label)")
+		and artifact.c_code.contains("Box* Box_make(long f0, blorp_String* f1)")
 		and artifact.c_code.contains("BLORP_INSTALL_TYPE(__rec, Box_destroy, \"Box\");")
 		and artifact.c_code.contains("long box_count(Box* box)")
-		and artifact.c_code.contains("return box->count;")
+		and artifact.c_code.contains("return box->f0;")
 		and option_int_less_than(forward_index, record_index)
 		and option_int_less_than(record_index, function_index)
 	)
@@ -26540,17 +26683,17 @@ pure func test_emit_heap_record_boolean_field_storage() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
-			"  blorp_Object header;\n  long count;\n  _Bool enabled : 1;\n  _Bool visible : 1;\n  _Bool archived;",
+			"  blorp_Object header;\n  long f2;\n  _Bool f0 : 1;\n  _Bool f1 : 1;\n  _Bool f3;",
 		)
 		and artifact.c_code.contains(
-			"HeapFlags* HeapFlags_make(int enabled, int visible, long count, int archived)",
+			"HeapFlags* HeapFlags_make(int f0, int f1, long f2, int f3)",
 		)
 		and artifact.c_code.contains(
-			"  __rec->enabled = enabled;\n  __rec->visible = visible;\n  __rec->count = count;\n  __rec->archived = archived;",
+			"  __rec->f0 = f0;\n  __rec->f1 = f1;\n  __rec->f2 = f2;\n  __rec->f3 = f3;",
 		)
 	)
 
@@ -26565,14 +26708,14 @@ pure func test_emit_internal_heap_record_byte_enum_field_storage() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
-			"typedef struct ColorState {\n  blorp_Object header;\n  long count;\n  uint8_t color;",
+			"typedef struct ColorState {\n  blorp_Object header;\n  long f0;\n  uint8_t f1;",
 		)
-		and artifact.c_code.contains("ColorState* ColorState_make(long count, long color)")
-		and artifact.c_code.contains("long __ffi_scalar_arg_0 = state->color;")
+		and artifact.c_code.contains("ColorState* ColorState_make(long f0, long f1)")
+		and artifact.c_code.contains("long __ffi_scalar_arg_0 = state->f1;")
 		and artifact.c_code.contains("inspect_color(__ffi_scalar_arg_0)")
 	)
 
@@ -26583,7 +26726,7 @@ pure func test_emit_runtime_backed_value_record_uses_runtime_typedef() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"static inline blorp_MemStats MemStats_make(long total_allocations, long "
@@ -26600,7 +26743,7 @@ pure func test_emit_foreign_heap_record_preserves_field_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -26612,7 +26755,7 @@ pure func test_emit_foreign_heap_record_preserves_field_order() -> Bool:
 	)
 
 
-pure func test_emit_reserved_record_field_names() -> Bool:
+pure func test_emit_reserved_source_record_field_names_use_ordinals() -> Bool:
 	program: CoreProgram = {
 		decls = [
 			HeapRecordDecl(reserved_box_heap_record_decl()),
@@ -26621,15 +26764,15 @@ pure func test_emit_reserved_record_field_names() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
-		artifact.c_code.contains("  long short_;")
-		and artifact.c_code.contains("  long long_;")
-		and artifact.c_code.contains("ReservedBox* ReservedBox_make(long short_, long long_)")
-		and artifact.c_code.contains("return (box->short_ + box->long_);")
-		and not artifact.c_code.contains("box->short;")
-		and not artifact.c_code.contains("box->long;")
+		artifact.c_code.contains("  long f0;")
+		and artifact.c_code.contains("  long f1;")
+		and artifact.c_code.contains("ReservedBox* ReservedBox_make(long f0, long f1)")
+		and artifact.c_code.contains("return (box->f0 + box->f1);")
+		and not artifact.c_code.contains("short")
+		and not artifact.c_code.contains("box->long")
 	)
 
 
@@ -26642,7 +26785,7 @@ reuse path and the field reads, on both heap and value records, and pins that
 the escape stays one-to-one when a source field is already spelled with the
 escape prefix.
 ---
-pure func test_emit_runtime_reserved_record_member_names() -> Bool:
+pure func test_emit_runtime_reserved_source_member_names_use_ordinals() -> Bool:
 	program: CoreProgram = {
 		decls = [
 			ValueRecordDecl(runtime_member_value_record_decl()),
@@ -26652,26 +26795,18 @@ pure func test_emit_runtime_reserved_record_member_names() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
-		artifact.c_code.contains(
-			"  blorp_Object header;\n  long __blorp_field_header;\n" + "  long __blorp_field___blorp_field_header;\n  blorp_String* label;",
-		)
-		and artifact.c_code.contains((
-				"RuntimeMemberBox* RuntimeMemberBox_make(long __blorp_field_header, long "
-				+ "__blorp_field___blorp_field_header, blorp_String* label)"
-			))
-		and artifact.c_code.contains("  __rec->__blorp_field_header = __blorp_field_header;")
-		and artifact.c_code.contains("    __old->__blorp_field_header = __blorp_field_header;")
+		artifact.c_code.contains("  blorp_Object header;\n  long f0;\n  long f1;\n  blorp_String* f2;")
 		and artifact.c_code.contains(
-			"return (box->__blorp_field_header + box->__blorp_field___blorp_field_header);",
+			"RuntimeMemberBox* RuntimeMemberBox_make(long f0, long f1, blorp_String* f2)",
 		)
-		and artifact.c_code.contains(
-			"typedef struct { long __blorp_field_header; } RuntimeMemberValue;",
-		)
-		and not artifact.c_code.contains("  long header;")
-		and not artifact.c_code.contains("__rec->header =")
+		and artifact.c_code.contains("  __rec->f0 = f0;")
+		and artifact.c_code.contains("    __old->f0 = f0;")
+		and artifact.c_code.contains("return (box->f0 + box->f1);")
+		and artifact.c_code.contains("typedef struct { long f0; } RuntimeMemberValue;")
+		and not artifact.c_code.contains("__blorp_field_")
 		and not artifact.c_code.contains("box->header")
 	)
 
@@ -26682,7 +26817,7 @@ pure func test_emit_heap_record_construct_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("Box* make_box(long count, blorp_String* label)")
@@ -26697,7 +26832,7 @@ pure func test_emit_enum_declaration_and_typed_function() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	red_define_index: Option[Int] = artifact.c_code.index_of("#define __def_101_Red 0L")
 	function_index: Option[Int] = artifact.c_code.index_of("int is_red(long brp_v_5)")
 	define_before_function: Bool = option_int_less_than(red_define_index, function_index)
@@ -26724,7 +26859,7 @@ pure func test_emit_constructor_match_expression() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long classify_color(long brp_v_5)")
@@ -26747,7 +26882,7 @@ pure func test_emit_constructor_match_with_let_scrutinee() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long classify_color_from_let(long brp_v_5)")
@@ -26764,7 +26899,7 @@ pure func test_emit_union_declaration_and_constructor() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	union_index: Option[Int] = artifact.c_code.index_of("typedef struct Choice")
 	function_index: Option[Int] = artifact.c_code.index_of("Choice* make_choice(long brp_v_h)")
 
@@ -26793,7 +26928,7 @@ pure func test_emit_self_recursive_union_destructor_is_iterative() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"static void Doc_destroy_release_child(Doc*** stack, long* count, long* capacity,"
@@ -26833,7 +26968,7 @@ pure func test_emit_union_int128_boxed_payload_destroy() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("typedef struct Wide {")
@@ -26858,7 +26993,7 @@ pure func test_emit_constructor_match_with_union_payload_binding() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long picked_value(Choice* brp_v_i)")
@@ -26880,7 +27015,7 @@ pure func test_emit_noncancelling_constructor_match_omits_scrutinee_cleanup() ->
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long picked_value_from_owned_call(void)")
@@ -26906,7 +27041,7 @@ pure func test_emit_inert_constructor_match_omits_only_scrutinee_cleanup() -> Bo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long picked_value_after_checkpoint(void)")
@@ -26934,7 +27069,7 @@ pure func test_emit_cancelling_constructor_match_retains_scrutinee_cleanup() -> 
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long picked_value_during_checkpoint(void)")
@@ -26963,7 +27098,7 @@ pure func test_emit_inert_length_match_omits_only_scrutinee_cleanup() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int length_match_after_checkpoint(void)")
@@ -26985,7 +27120,7 @@ pure func test_emit_cancelling_accessor_match_retains_scrutinee_cleanup() -> Boo
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("int accessor_literal_match_during_checkpoint(void)")
@@ -27015,7 +27150,7 @@ pure func test_emit_nullable_union_match_after_drop() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -27042,7 +27177,7 @@ pure func test_emit_nullable_singleton_union_from_list_get() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		not artifact.c_code.contains("unsupported function paint_nullary_in_list")
@@ -27076,7 +27211,7 @@ pure func test_emit_erased_union_with_managed_payload() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("typedef struct IOError {")
@@ -27111,7 +27246,7 @@ pure func test_emit_erased_union_with_nullary_singleton() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("typedef struct Value {")
@@ -27149,7 +27284,7 @@ pure func test_emit_boxed_option_constructor() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("typedef struct Option {")
@@ -27175,7 +27310,7 @@ pure func test_emit_let_binding_statement() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long let_add(void)")
@@ -27190,7 +27325,7 @@ pure func test_emit_let_binding_from_statement_rhs() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long let_from_statement_rhs(void)")
@@ -27207,7 +27342,7 @@ pure func test_emit_statement_rhs_scopes_reused_inner_names() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long duplicate_inner_let_rhs(void)")
@@ -27225,7 +27360,7 @@ pure func test_emit_void_statement_rhs_scopes_reused_inner_names() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long duplicate_inner_void_let_rhs(void)")
@@ -27241,7 +27376,7 @@ pure func test_emit_binary_operands_scope_reused_inner_names() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long duplicate_inner_binary_operands(void)")
@@ -27260,7 +27395,7 @@ pure func test_emit_union_payloads_scope_reused_inner_names() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("PairChoice* duplicate_inner_union_payloads(void)")
@@ -27281,7 +27416,7 @@ pure func test_emit_union_payloads_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of("long __union_arg_0 = first_payload();")
 	second_index: Option[Int] = artifact.c_code.index_of("long __union_arg_1 = second_payload();")
 	constructor_index: Option[Int] = artifact.c_code.index_of(
@@ -27304,7 +27439,7 @@ pure func test_emit_record_fields_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of(
 		"long __record_field_0 = first_record_field();",
 	)
@@ -27328,7 +27463,7 @@ pure func test_emit_call_arguments_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of("long __call_arg_0 = first_call_arg();")
 	second_index: Option[Int] = artifact.c_code.index_of("long __call_arg_1 = second_call_arg();")
 	call_index: Option[Int] = artifact.c_code.index_of("combine(__call_arg_0, __call_arg_1)")
@@ -27346,7 +27481,7 @@ pure func test_emit_mixed_simple_complex_call_args_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	literal_index: Option[Int] = artifact.c_code.index_of("long __call_arg_0 = 11;")
 	variable_index: Option[Int] = artifact.c_code.index_of("long __call_arg_1 = source;")
 	void_index: Option[Int] = artifact.c_code.index_of("(void)((void)0);")
@@ -27371,7 +27506,7 @@ pure func test_emit_intrinsic_call_arguments_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of(
 		"long __call_arg_0 = first_intrinsic_arg();",
 	)
@@ -27394,7 +27529,7 @@ pure func test_emit_direct_runtime_call_arguments_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of("long __call_arg_0 = first_runtime_arg();")
 	second_index: Option[Int] = artifact.c_code.index_of(
 		"long __call_arg_1 = second_runtime_arg();",
@@ -27415,7 +27550,7 @@ pure func test_emit_borrowed_tuple_projection_call_without_release() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	artifact.c_code.contains((
 			"blorp_string_eq(((blorp_String*)((blorp_Tuple*)pair)->elem[0]), "
@@ -27431,7 +27566,7 @@ pure func test_emit_builtin_call_arguments_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of("long __call_arg_0 = first_builtin_arg();")
 	second_index: Option[Int] = artifact.c_code.index_of(
 		"void* __call_arg_1 = (void*)(long)(second_builtin_arg());",
@@ -27452,7 +27587,7 @@ pure func test_emit_foreign_call_arguments_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of("long __call_arg_0 = first_foreign_arg();")
 	second_index: Option[Int] = artifact.c_code.index_of(
 		"long __call_arg_1 = second_foreign_arg();",
@@ -27473,7 +27608,7 @@ pure func test_emit_closure_call_arguments_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	first_index: Option[Int] = artifact.c_code.index_of("long __call_arg_1 = first_closure_arg();")
 	second_index: Option[Int] = artifact.c_code.index_of(
 		"long __call_arg_2 = second_closure_arg();",
@@ -27492,7 +27627,7 @@ pure func test_emit_ordered_closure_void_argument_without_invalid_declaration() 
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	void_index: Option[Int] = artifact.c_code.index_of("(void)((void)0);")
 	effect_index: Option[Int] = artifact.c_code.index_of("effectful_after_void();")
 
@@ -27509,7 +27644,7 @@ pure func test_emit_static_literal_ordering_temp_does_not_allocate() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	literal_index: Option[Int] = artifact.c_code.index_of(
 		"blorp_String* __call_arg_0 = (blorp_String*)&__blorp_string_literal_0;",
 	)
@@ -27561,7 +27696,7 @@ pure func test_emit_static_literal_let_has_no_cancellation_cleanup() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -27578,7 +27713,7 @@ pure func test_emit_single_effect_intrinsic_argument_without_nested_failure() ->
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long __call_arg_0 = 192;")
@@ -27594,7 +27729,7 @@ pure func test_emit_read_before_effectful_argument_in_source_order() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 	read_index: Option[Int] = artifact.c_code.index_of("long __call_arg_0 = value;")
 	effect_index: Option[Int] = artifact.c_code.index_of(
 		"long __call_arg_1 = effectful_second_arg();",
@@ -27616,7 +27751,7 @@ pure func test_emit_union_reuse_payloads_scope_reused_inner_names() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains(
@@ -27638,7 +27773,7 @@ pure func test_emit_void_let_as_statement_sequence() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long void_let(void)")
@@ -27654,7 +27789,7 @@ pure func test_emit_discard_let_without_binding_declaration() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long discard_let(void)")
@@ -27670,7 +27805,7 @@ pure func test_emit_assignment_statement() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long assign_then_return(void)")
@@ -27687,7 +27822,7 @@ pure func test_emit_while_statement() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long count_to_three(void)")
@@ -27705,7 +27840,7 @@ pure func test_emit_break_and_continue_statements() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long break_continue_loop(void)")
@@ -27739,7 +27874,7 @@ pure func test_emit_sequence_statement_before_return() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long call_then_return(void)")
@@ -27754,7 +27889,7 @@ pure func test_emit_statement_if_with_result_temp() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long branch_let(void)")
@@ -27774,7 +27909,7 @@ pure func test_emit_nested_statement_if_with_distinct_temps() -> Bool:
 		foreign_includes = [],
 		source_files = []
 	}
-	artifact: CArtifact = emit_unprojected_core_program_c_artifact_for_tests(program)
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
 	(
 		artifact.c_code.contains("long nested_branch_let(void)")
@@ -27845,8 +27980,8 @@ tests: TestSuite = {
 			test_resolved_some_user_call_is_not_suppressed,
 		),
 		(
-			"profile IDs distinguish duplicate logical names",
-			test_profile_ids_distinguish_duplicate_logical_names,
+			"profile IDs are dense in declaration order",
+			test_profile_ids_are_dense_in_declaration_order,
 		),
 		(
 			"profile ID order matches metadata and function bodies",
@@ -27990,6 +28125,14 @@ tests: TestSuite = {
 		("emit tailrec list-spread loop", test_emit_tailrec_list_spread_loop),
 		("emit range for loop with dynamic step", test_emit_range_for_loop_with_dynamic_step),
 		("emit forward only range for loop", test_emit_forward_only_range_for_loop),
+		(
+			"emit unsupported function diagnostic names failing child",
+			test_emit_unsupported_function_diagnostic_names_failing_child,
+		),
+		(
+			"emit foreign-reachable record escapes reserved member names",
+			test_emit_foreign_reachable_record_escapes_reserved_member_names,
+		),
 		("emit Range value for loop", test_emit_range_value_for_loop),
 		("emit literal match expression", test_emit_literal_match_expression),
 		("emit literal match fail fallback", test_emit_literal_match_fail_fallback),
@@ -28182,7 +28325,6 @@ tests: TestSuite = {
 			"emit heap record reuse with unique and fresh paths",
 			test_emit_heap_record_reuse_with_unique_and_fresh_paths,
 		),
-		("emit reserved word type naming facts", test_emit_reserved_word_type_naming_facts),
 		(
 			"emit sparse heap record update mutates only replacement fields",
 			test_emit_sparse_heap_record_update_mutates_only_replacement_fields,
@@ -28439,8 +28581,8 @@ tests: TestSuite = {
 		("emit tuple literal preparation", test_emit_tuple_literal_preparation),
 		("emit value record construct expression", test_emit_value_record_construct_expression),
 		(
-			"emit value record constructor escapes reserved field",
-			test_emit_value_record_constructor_escapes_reserved_field,
+			"emit value record constructor ignores reserved source field",
+			test_emit_value_record_constructor_ignores_reserved_source_field,
 		),
 		(
 			"emit internal value record Boolean-tail order",
@@ -28473,10 +28615,10 @@ tests: TestSuite = {
 			"emit foreign heap record preserves field order",
 			test_emit_foreign_heap_record_preserves_field_order,
 		),
-		("emit reserved record field names", test_emit_reserved_record_field_names),
+		("emit reserved source record field names use ordinals", test_emit_reserved_source_record_field_names_use_ordinals),
 		(
-			"emit runtime-reserved record member names",
-			test_emit_runtime_reserved_record_member_names,
+			"emit runtime-reserved source member names use ordinals",
+			test_emit_runtime_reserved_source_member_names_use_ordinals,
 		),
 		("emit heap record construct expression", test_emit_heap_record_construct_expression),
 		("emit enum declaration and typed function", test_emit_enum_declaration_and_typed_function),

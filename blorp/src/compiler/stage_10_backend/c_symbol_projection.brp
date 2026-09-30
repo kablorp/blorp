@@ -141,11 +141,17 @@ enum CProjectedCallableKind:
 	ProjectedClosureBody
 
 
+---
+`original_c_spelling` is the C name a callable had before projection. A closure
+body never had one (it is only ever named from its definition id), so it is
+`None` and the body is neither reachable through `by_original_c_spelling` nor
+checked for a duplicate C name; its identity check is the definition id.
+---
 record CCallableSymbolCandidate {
 	kind: CProjectedCallableKind,
 	qualified_name: String,
 	def_id: Int,
-	original_c_spelling: String
+	original_c_spelling: Option[String]
 }
 
 
@@ -153,7 +159,7 @@ record CCallableSymbol {
 	kind: CProjectedCallableKind,
 	qualified_name: String,
 	def_id: Int,
-	original_c_spelling: String,
+	original_c_spelling: Option[String],
 	projected_name: String
 }
 
@@ -188,7 +194,7 @@ union CSymbolProjectionError:
 	MissingProjectedCallable(String, Int)
 	UnresolvedProjectedCallable(String)
 	UnresolvedCallbackTarget(String)
-	CallableCNameMismatch(String, String)
+	MissingProjectedHoistedCallable(Int)
 	UnsupportedPreparedCallKind(String)
 	UnprojectedCallableValue(String, Int)
 	InvalidCanonicalEmptyListLayout(String)
@@ -306,7 +312,7 @@ private pure func callable_symbol(
 	candidate: CCallableSymbolCandidate,
 	preserved: Dict[String, Bool],
 ) -> CCallableSymbol:
-	original_c_spelling: String = c_identifier(candidate.original_c_spelling)
+	original_c_spelling: Option[String] = candidate.original_c_spelling.map(c_identifier)
 	{
 		kind = candidate.kind,
 		qualified_name = candidate.qualified_name,
@@ -370,19 +376,21 @@ pure func build_callable_symbol_plan(
 						else:
 							void
 					None:
-						match by_original.get(symbol.original_c_spelling):
-							Some(existing):
-								if (
-									existing.qualified_name != symbol.qualified_name
-									or existing.def_id != symbol.def_id
-								):
-									plan_error = Some(
-										DuplicateCallableCName(symbol.original_c_spelling),
-									)
-								else:
-									void
+						match symbol.original_c_spelling:
+							Some(original):
+								match by_original.get(original):
+									Some(existing):
+										if (
+											existing.qualified_name != symbol.qualified_name
+											or existing.def_id != symbol.def_id
+										):
+											plan_error = Some(DuplicateCallableCName(original))
+										else:
+											void
+									None:
+										by_original = by_original.set(original, symbol)
 							None:
-								by_original = by_original.set(symbol.original_c_spelling, symbol)
+								void
 
 						by_definition_id = by_definition_id.set(candidate.def_id, symbol)
 		else:
@@ -418,7 +426,12 @@ private pure func build_emission_callable_plan(
 			preserved,
 		)
 		by_definition_id = by_definition_id.set(candidate.def_id, projected_name)
-		by_original = by_original.set(c_identifier(candidate.original_c_spelling), projected_name)
+
+		match candidate.original_c_spelling:
+			Some(original):
+				by_original = by_original.set(c_identifier(original), projected_name)
+			None:
+				void
 
 	{
 		by_definition_id = by_definition_id,
@@ -555,14 +568,14 @@ private pure func callable_candidate(
 					kind = ProjectedUserFunction,
 					qualified_name = function_info.name,
 					def_id = function_info.def_id,
-					original_c_spelling = function_info.name,
+					original_c_spelling = Some(function_info.name),
 				})
 			ClosureBodyFunction(abi):
 				Some({
 					kind = ProjectedClosureBody,
 					qualified_name = function_info.name,
 					def_id = function_info.def_id,
-					original_c_spelling = abi.c_name,
+					original_c_spelling = None,
 				})
 			_:
 				None
@@ -904,29 +917,27 @@ private pure func unresolved_callback(
 		Some(UnresolvedCallbackTarget(name))
 
 
+---
+A closure or task body is named only from its definition id, so the one thing
+projection can check is that the body was declared. A miss means a pass
+dropped or renumbered a hoisted body after closure conversion.
+---
+private pure func hoisted_callable_projection_error(
+	plan: CCallableSymbolPlan,
+	def_id: Int,
+) -> Option[CSymbolProjectionError]:
+	match plan.by_definition_id.get(def_id):
+		Some(_):
+			None
+		None:
+			Some(MissingProjectedHoistedCallable(def_id))
+
+
 private pure func task_projection_error(
 	plan: CCallableSymbolPlan,
 	task: CoreTaskClosure,
 ) -> Option[CSymbolProjectionError]:
-	match projected_callable_name(plan, task.function_name, task.def_id):
-		Some(_):
-			match planned_callable(plan.by_definition_id, task.function_name, task.def_id):
-				Some(symbol):
-					if symbol.original_c_spelling != c_identifier(task.c_name):
-						Some(CallableCNameMismatch(symbol.original_c_spelling, task.c_name))
-					else if task.static_name != static_closure_name(symbol.original_c_spelling):
-						Some(
-							CallableCNameMismatch(
-								static_closure_name(symbol.original_c_spelling),
-								task.static_name,
-							),
-						)
-					else:
-						None
-				None:
-					Some(MissingProjectedCallable(task.function_name, task.def_id))
-		None:
-			Some(MissingProjectedCallable(task.function_name, task.def_id))
+	hoisted_callable_projection_error(plan, task.def_id)
 
 
 private pure func constructor_projection_error(
@@ -968,32 +979,7 @@ private pure func expr_projection_error(
 		SetAllocExpr(constructor, _, _):
 			constructor_projection_error(plan, constructor)
 		ClosureCreateExpr(closure, _, _):
-			match projected_callable_name(plan, closure.function_name, closure.def_id):
-				Some(_):
-					match planned_callable(plan.by_definition_id, closure.function_name, closure.def_id):
-						Some(symbol):
-							if symbol.original_c_spelling != c_identifier(closure.c_name):
-								Some(
-									CallableCNameMismatch(
-										symbol.original_c_spelling,
-										closure.c_name,
-									),
-								)
-							else if closure.static_name != static_closure_name(
-								symbol.original_c_spelling,
-							):
-								Some(
-									CallableCNameMismatch(
-										static_closure_name(symbol.original_c_spelling),
-										closure.static_name,
-									),
-								)
-							else:
-								None
-						None:
-							Some(MissingProjectedCallable(closure.function_name, closure.def_id))
-				None:
-					Some(MissingProjectedCallable(closure.function_name, closure.def_id))
+			hoisted_callable_projection_error(plan, closure.def_id)
 		DetachExpr(task, _, _):
 			task_projection_error(plan, task)
 		ConcurrentlyLoopExpr(loop, _, _):
@@ -1238,18 +1224,6 @@ private pure func validate_program_projection(
 	}
 
 
-pure func canonical_empty_lists_for_unprojected_program(
-	program: CoreProgram,
-) -> Result[List[CanonicalEmptyList], CSymbolProjectionError]:
-	validation: CProjectionValidation = validate_program_projection(None, program)
-
-	match validation.error:
-		Some(error):
-			Err(error)
-		None:
-			Ok(validation.canonical_empty_lists)
-
-
 private pure func canonical_empty_list_symbol_collision(
 	items: List[CanonicalEmptyList],
 	preserved_names: List[String],
@@ -1370,8 +1344,8 @@ pure func symbol_projection_error_text(error: CSymbolProjectionError) -> String:
 			"callable `${name}` has no resolved definition id at final C projection"
 		UnresolvedCallbackTarget(name):
 			"callback `${name}` does not resolve to a projected callable"
-		CallableCNameMismatch(expected, actual):
-			"callable C name `${actual}` does not agree with declared C name `${expected}`"
+		MissingProjectedHoistedCallable(def_id):
+			"missing projected closure or task body (${def_id}); a pass dropped or renumbered a hoisted body after closure conversion"
 		UnsupportedPreparedCallKind(kind):
 			"unresolved `${kind}` call kind reached final C symbol projection"
 		UnprojectedCallableValue(name, def_id):

@@ -61,7 +61,7 @@ import:
 		CSymbolProjectionError(
 			DuplicateCallableDefinitionId,
 			DuplicateCallableIdentity,
-			CallableCNameMismatch,
+			MissingProjectedHoistedCallable,
 			InvalidCoreDefinitionIdentity,
 			InvalidCallableDefinitionId,
 			MissingProjectedCallable,
@@ -96,7 +96,7 @@ private pure func candidate(
 		kind = kind,
 		qualified_name = name,
 		def_id = def_id,
-		original_c_spelling = name
+		original_c_spelling = Some(name)
 	}
 
 
@@ -357,7 +357,6 @@ private pure func malformed_global_initializer_program() -> CoreProgram:
 
 private pure func closure_abi(c_name: String, task_abi: Bool) -> CoreClosureAbi:
 	{
-		c_name = c_name,
 		params = [],
 		captures = [],
 		moved_captures = [],
@@ -387,7 +386,7 @@ private pure func closure_body_function(
 	}
 
 
-private pure func closure_create_program(static_name: String) -> CoreProgram:
+private pure func closure_create_program() -> CoreProgram:
 	semantic_name: String = "fixture_long_closure"
 	c_name: String = "fixture_long_closure_body"
 	body = closure_body_function(semantic_name, 4, c_name, False)
@@ -396,10 +395,7 @@ private pure func closure_create_program(static_name: String) -> CoreProgram:
 		5,
 		ClosureCreateExpr(
 			{
-				function_name = semantic_name,
 				def_id = 4,
-				c_name = c_name,
-				static_name = static_name,
 				captures = []
 			},
 			function_type(),
@@ -435,10 +431,7 @@ private pure func captured_closure_create_program() -> CoreProgram:
 			15,
 			ClosureCreateExpr(
 				{
-					function_name = semantic_name,
 					def_id = 14,
-					c_name = c_name,
-					static_name = static_closure_name(c_name),
 					captures = [capture]
 				},
 				function_type(),
@@ -464,10 +457,7 @@ private pure func task_program() -> CoreProgram:
 	c_name: String = "fixture_long_task_body"
 	body = closure_body_function(semantic_name, 6, c_name, True)
 	task: CoreTaskClosure = {
-		function_name = semantic_name,
 		def_id = 6,
-		c_name = c_name,
-		static_name = static_closure_name(c_name),
 		captures = [],
 		return_type = VoidType
 	}
@@ -488,10 +478,7 @@ private pure func concurrently_loop_program() -> CoreProgram:
 	c_name: String = "fixture_long_concurrently_loop_task_body"
 	body = closure_body_function(semantic_name, 11, c_name, True)
 	task: CoreTaskClosure = {
-		function_name = semantic_name,
 		def_id = 11,
-		c_name = c_name,
-		static_name = static_closure_name(c_name),
 		captures = [],
 		return_type = VoidType
 	}
@@ -528,10 +515,7 @@ private pure func concurrent_block_program() -> CoreProgram:
 	c_name: String = "fixture_long_concurrent_block_task_body"
 	body = closure_body_function(semantic_name, 13, c_name, True)
 	task: CoreTaskClosure = {
-		function_name = semantic_name,
 		def_id = 13,
-		c_name = c_name,
-		static_name = static_closure_name(c_name),
 		captures = [],
 		return_type = VoidType
 	}
@@ -816,7 +800,7 @@ pure func test_callable_plan_coalesces_repeated_identity() -> Bool:
 
 pure func test_callable_plan_rejects_disagreeing_repeated_identity() -> Bool:
 	first = candidate("module_repeat", 9, ProjectedUserFunction)
-	second = { first | original_c_spelling = "different_c_spelling" }
+	second = { first | original_c_spelling = Some("different_c_spelling") }
 
 	match (
 		build_callable_symbol_plan(
@@ -1160,9 +1144,7 @@ pure func test_projection_rejects_malformed_global_initializer() -> Bool:
 
 
 pure func test_projects_closure_body_create_and_static_object_together() -> Bool:
-	original_c_name: String = "fixture_long_closure_body"
-
-	match prepare_c_emission_symbols(closure_create_program(static_closure_name(original_c_name))):
+	match prepare_c_emission_symbols(closure_create_program()):
 		Ok(plan):
 			planned_emitted_callable_name(
 				plan,
@@ -1172,10 +1154,48 @@ pure func test_projects_closure_body_create_and_static_object_together() -> Bool
 			False
 
 
-pure func test_rejects_stale_closure_static_name() -> Bool:
-	match prepare_c_emission_symbols(closure_create_program("stale_static_name")):
-		Err(CallableCNameMismatch(expected, actual)):
-			expected == "__sc_fixture_long_closure_body" and actual == "stale_static_name"
+pure func test_rejects_closure_create_without_projected_body() -> Bool:
+	host = user_function(
+		"fixture_closure_host",
+		5,
+		ClosureCreateExpr(
+			{ def_id = 77, captures = [] },
+			function_type(),
+			synthetic_core_source_loc(),
+		),
+	)
+	program: CoreProgram = {
+		decls = [FunctionDecl(host)],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Err(MissingProjectedHoistedCallable(def_id)):
+			def_id == 77
+		_:
+			False
+
+
+pure func test_rejects_task_without_projected_body() -> Bool:
+	host = user_function(
+		"fixture_task_host",
+		7,
+		DetachExpr(
+			{ def_id = 78, captures = [], return_type = VoidType },
+			VoidType,
+			synthetic_core_source_loc(),
+		),
+	)
+	program: CoreProgram = {
+		decls = [FunctionDecl(host)],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Err(MissingProjectedHoistedCallable(def_id)):
+			def_id == 78
 		_:
 			False
 
@@ -1340,7 +1360,7 @@ pure func test_production_emits_closure_and_task_helpers_from_original_core() ->
 
 	closure_ok: Bool = match try_emit_prepared_core_program_c_artifact_with_profile(
 		prepared_core_program(
-			closure_create_program(static_closure_name("fixture_long_closure_body")),
+			closure_create_program(),
 		),
 		FunctionProfileOff,
 	):
@@ -1893,7 +1913,8 @@ tests: TestSuite = {
 			"projects closure body create and static object together",
 			test_projects_closure_body_create_and_static_object_together,
 		),
-		("rejects stale closure static name", test_rejects_stale_closure_static_name),
+		("rejects closure create without projected body", test_rejects_closure_create_without_projected_body),
+		("rejects task without projected body", test_rejects_task_without_projected_body),
 		("projects detached task closure", test_projects_detached_task_closure),
 		("projects concurrently loop task closure", test_projects_concurrently_loop_task_closure),
 		("projects concurrent block task closure", test_projects_concurrent_block_task_closure),

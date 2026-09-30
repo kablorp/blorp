@@ -517,7 +517,6 @@ import:
 		BUILTIN_STACK_OPTION_RANGE_OPTION_C_TYPE,
 		BUILTIN_STACK_OPTION_UINT128_OPTION_C_TYPE,
 		BackendTypeNaming,
-		backend_type_naming,
 		c_field_name,
 		c_identifier,
 		c_binder_name,
@@ -544,7 +543,6 @@ import:
 		c_emission_static_string_literals,
 		c_emission_type_naming,
 		c_emission_type_symbol_lookup,
-		canonical_empty_lists_for_unprojected_program,
 		emitted_callable_name,
 		emitted_callback_name,
 		prepare_c_emission_symbols,
@@ -568,7 +566,6 @@ import:
 		CRecordLayout(ForeignAbiLayout, InternalLayout),
 		CRecordLayoutRegistry,
 		CRecordLayoutError(UnresolvedRecordFieldRef),
-		CRecordMemberSelector(MembersByLayout, UnprojectedSourceMembers),
 		CRecordMemberScope,
 		CValueRecordFieldStorage(OrdinaryCValueRecordField, PackedBooleanCValueRecordField),
 		c_heap_record_field_storage,
@@ -581,7 +578,6 @@ import:
 		c_value_record_field_storage,
 		c_value_record_field_type_is_boolean,
 		classify_c_record_layouts,
-		collect_foreign_boundary_types,
 	intrinsic_renderer as Intrinsic
 	list: list
 	prepared_backend_renderer:
@@ -1026,9 +1022,13 @@ private record FunctionBodyC {
 }
 
 
-private union CEmissionSymbolAuthority:
-	ValidatedCEmissionSymbols(CEmissionSymbolPlan)
-	UnprojectedCEmissionSymbolsForTests
+---
+The symbols every emission spells from: the validated plan `prepare_c_emission_symbols`
+built. Callables, closures, task closures, closure environments and types are all
+spelled from their definition ids through it. The alias names the role at the
+`selected_*` accessors below, which are the only readers of the plan's facts.
+---
+private type alias CEmissionSymbolAuthority = CEmissionSymbolPlan
 
 
 private record FunctionEmissionContext {
@@ -1038,7 +1038,7 @@ private record FunctionEmissionContext {
 	specialize_layout: Option[CoreSpecializeLayout],
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	indent: String,
 	-- When true, `base_emission_context`/`nested_emission_context` keep
 	-- `indent` at `""` instead of growing a fresh indent string per nesting
@@ -1054,12 +1054,7 @@ private pure func selected_callable_name(
 	qualified_name: String,
 	def_id: Int,
 ) -> String:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			emitted_callable_name(plan, def_id)
-		UnprojectedCEmissionSymbolsForTests:
-			qualified_name
-
+	emitted_callable_name(authority, def_id)
 
 private pure func selected_user_call_name(
 	authority: CEmissionSymbolAuthority,
@@ -1078,108 +1073,46 @@ private pure func is_unprojected_option_constructor_call(
 	name: String,
 	def_id: Option[Int],
 ) -> Bool:
-	match authority:
-		ValidatedCEmissionSymbols(_):
-			def_id.is_none() and (name == "Some" or name == "None")
-		UnprojectedCEmissionSymbolsForTests:
-			name == "Some" or name == "None"
-
+	def_id.is_none() and (name == "Some" or name == "None")
 
 ---
-A declared type's C spellings, read from the once-built plan when one is
-available; test callers with no plan derive it directly (the same
-computation `program_symbol_inventory` ran during planning).
+A declared type's C spellings, read from the once-built plan.
 ---
 private pure func selected_type_naming(
 	authority: CEmissionSymbolAuthority,
 	type_name: String,
 ) -> BackendTypeNaming:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			c_emission_type_naming(plan, type_name)
-		UnprojectedCEmissionSymbolsForTests:
-			backend_type_naming(type_name)
-
+	c_emission_type_naming(authority, type_name)
 
 ---
 The artifact-local declared-name -> projected-symbol lookup for
 `TypeLayout.c_type_name`/`TypeLayout.stack_option_c_type`, read from the
-same plan `selected_type_naming` uses (empty, i.e. unprojected, for a test
-caller with no plan).
+same plan `selected_type_naming` uses.
 ---
 private pure func selected_type_symbol_lookup(authority: CEmissionSymbolAuthority) -> Dict[String, String]:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			c_emission_type_symbol_lookup(plan)
-		UnprojectedCEmissionSymbolsForTests:
-			{}
+	c_emission_type_symbol_lookup(authority)
 
-
----
-What decides member spelling for this emission: the layout registry when symbols are
-projected, source names for the unprojected diagnostic and test emission.
----
 private pure func unresolved_record_field_error(error: CRecordLayoutError) -> CoreEmitError:
 	match error:
 		UnresolvedRecordFieldRef(record_name, field_name):
 			UnresolvedRecordField(record_name, field_name)
 
 
-private pure func selected_record_member_selector(
-	authority: CEmissionSymbolAuthority,
-	layouts: CRecordLayoutRegistry,
-) -> CRecordMemberSelector:
-	match authority:
-		ValidatedCEmissionSymbols(_):
-			MembersByLayout(layouts)
-		UnprojectedCEmissionSymbolsForTests:
-			UnprojectedSourceMembers
-
-
 private pure func selected_foreign_boundary_types(
 	authority: CEmissionSymbolAuthority,
-	program: CoreProgram,
 ) -> List[CoreType]:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			c_emission_foreign_boundary_types(plan)
-		UnprojectedCEmissionSymbolsForTests:
-			collect_foreign_boundary_types(program)
-
+	c_emission_foreign_boundary_types(authority)
 
 private pure func selected_static_string_literals(
 	authority: CEmissionSymbolAuthority,
-	program: CoreProgram,
 ) -> Result[List[BackendStaticStringLiteral], StaticStringLiteralPoolError]:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			c_emission_static_string_literals(plan)
-		UnprojectedCEmissionSymbolsForTests:
-			collect_backend_static_string_literals(program)
-
-
-private pure func selected_callable_c_spelling(
-	authority: CEmissionSymbolAuthority,
-	def_id: Int,
-	original_c_spelling: String,
-) -> String:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			emitted_callable_name(plan, def_id)
-		UnprojectedCEmissionSymbolsForTests:
-			original_c_spelling
-
+	c_emission_static_string_literals(authority)
 
 private pure func selected_callback_name(
 	authority: CEmissionSymbolAuthority,
 	original_name: String,
 ) -> String:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			emitted_callback_name(plan, original_name)
-		UnprojectedCEmissionSymbolsForTests:
-			original_name
-
+	emitted_callback_name(authority, original_name)
 
 private pure func selected_hash_container_constructor(
 	authority: CEmissionSymbolAuthority,
@@ -1248,21 +1181,6 @@ private pure func selected_call_kind(
 			kind
 
 
-private pure func selected_task_closure(
-	authority: CEmissionSymbolAuthority,
-	task: CoreTaskClosure,
-) -> CoreTaskClosure:
-	match authority:
-		ValidatedCEmissionSymbols(plan):
-			name: String = emitted_callable_name(plan, task.def_id)
-			{ task |
-				c_name = name,
-				static_name = static_closure_name(name)
-			}
-		UnprojectedCEmissionSymbolsForTests:
-			task
-
-
 private pure func activation_requires_local_owner_protection(
 	emission_context: FunctionEmissionContext,
 ) -> Bool:
@@ -1284,7 +1202,7 @@ private pure func function_parameter_variables(func_info: CoreFunction) -> List[
 private pure func emission_context_from_plan(
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
 	parameter_variables: List[CoreVar],
@@ -1304,22 +1222,6 @@ private pure func emission_context_from_plan(
 		indent = initial_indent,
 		compact = compact,
 		parameter_variables = parameter_variables
-	}
-
-
-private pure func diagnostic_emission_context(expr: CoreExpr) -> FunctionEmissionContext:
-	{
-		cleanup_plan = build_current_behavior_cancellation_plan(FunctionCancellationActivation({
-			name = "__backend_diagnostic",
-			def_id = -1,
-		}), expr),
-		specialize_layout = None,
-		profile_function_id = None,
-		symbol_authority = UnprojectedCEmissionSymbolsForTests,
-		record_members = UnprojectedSourceMembers,
-		indent = BASE_INDENT,
-		compact = False,
-		parameter_variables = []
 	}
 
 
@@ -1502,13 +1404,14 @@ private pure func emit_function_inventory(func_info: CoreFunction, display_name:
 private pure func emit_unsupported_function_error(
 	func_info: CoreFunction,
 	display_name: String,
+	emission_context: FunctionEmissionContext,
 ) -> String:
 	"/* unsupported function " + display_name + " kind=" + function_kind_label(
 		func_info.function_kind,
 	) + " def_id=" + func_info.def_id.to_string() + " child_path=" + func_info.body
-		.map(unsupported_expr_child_path)
+		.map(func(body: CoreExpr) -> String: unsupported_expr_child_path(body, emission_context))
 		.get_or("") + " child_kind=" + func_info.body
-		.map(unsupported_expr_child_kind)
+		.map(func(body: CoreExpr) -> String: unsupported_expr_child_kind(body, emission_context))
 		.get_or(
 			"",
 		) + " */\n#error \"Blorp backend could not emit function body: " + display_name + "\"\n"
@@ -12914,11 +12817,7 @@ private pure func collect_closure_env_emissions(
 							LegacyVoidPointerSlots:
 								void
 							TypedInlineTail:
-								emitted_name: String = selected_callable_c_spelling(
-									authority,
-									func_info.def_id,
-									abi.c_name,
-								)
+								emitted_name: String = emitted_callable_name(authority, func_info.def_id)
 								match closure_env_emission(
 									abi.captures,
 									emitted_name,
@@ -12962,12 +12861,11 @@ private pure func closure_env_emission_destructor_prototypes(
 private pure func emit_closure_create(
 	closure: CoreClosureCreate,
 	c_name: String,
-	static_name: String,
 	storage_kind: ClosureEnvStorageKind,
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	if closure.captures.length() == 0:
-		Some("((void*)&" + c_identifier(static_name) + ")")
+		Some("((void*)&" + c_identifier(static_closure_name(c_name)) + ")")
 	else:
 		match storage_kind:
 			LegacyVoidPointerSlots:
@@ -13226,18 +13124,14 @@ private pure func emit_closure_body_function(
 	abi: CoreClosureAbi,
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 	compact: Bool,
 ) -> Option[String]:
 	match func_info.body:
 		Some(body):
-			emitted_name: String = selected_callable_c_spelling(
-				symbol_authority,
-				func_info.def_id,
-				abi.c_name,
-			)
+			emitted_name: String = emitted_callable_name(symbol_authority, func_info.def_id)
 			emission_context: FunctionEmissionContext = emission_context_from_plan(
 				plan,
 				specialize_layout,
@@ -14456,23 +14350,9 @@ private pure func emit_simple_expr_leaf(
 			type_symbol_lookup: Dict[String, String] = selected_type_symbol_lookup(
 				emission_context.symbol_authority,
 			)
-			c_name: String = selected_callable_c_spelling(
-				emission_context.symbol_authority,
-				closure.def_id,
-				closure.c_name,
-			)
-			static_name: String = if closure.captures.length() == 0:
-				match emission_context.symbol_authority:
-					ValidatedCEmissionSymbols(_):
-						static_closure_name(c_name)
-					UnprojectedCEmissionSymbolsForTests:
-						closure.static_name
-			else:
-				closure.static_name
 			emit_closure_create(
 				closure,
-				c_name,
-				static_name,
+				emitted_callable_name(emission_context.symbol_authority, closure.def_id),
 				closure_env_storage_kind(closure.captures, False, type_symbol_lookup),
 				type_symbol_lookup,
 			)
@@ -16449,10 +16329,7 @@ private pure func task_as_copy_closure_create(task: CoreTaskClosure) -> Option[C
 	captures ?= task_copy_captures_to_closure_captures(task.captures)
 
 	Some({
-		function_name = task.function_name,
 		def_id = task.def_id,
-		c_name = task.c_name,
-		static_name = task.static_name,
 		captures = captures,
 	})
 
@@ -16465,11 +16342,10 @@ private pure func emit_copy_concurrent_task_closure(
 	symbol_authority: CEmissionSymbolAuthority,
 ) -> Option[String]:
 	fn_name: String = concurrent_task_function_name(base_temp, binding_index)
-	closure ?= task_as_copy_closure_create(selected_task_closure(symbol_authority, task))
+	closure ?= task_as_copy_closure_create(task)
 	closure_value ?= emit_closure_create(
 		closure,
-		closure.c_name,
-		closure.static_name,
+		emitted_callable_name(symbol_authority, task.def_id),
 		LegacyVoidPointerSlots,
 		selected_type_symbol_lookup(symbol_authority),
 	)
@@ -16560,10 +16436,11 @@ private pure func task_capture_release_words(captures: List[CoreTaskCapture], ty
 
 private pure func emit_task_closure_create(
 	task: CoreTaskClosure,
+	c_name: String,
 	type_symbol_lookup: Dict[String, String],
 ) -> Option[String]:
 	if task.captures.length() == 0:
-		Some("((void*)&" + c_identifier(task.static_name) + ")")
+		Some("((void*)&" + c_identifier(static_closure_name(c_name)) + ")")
 	else:
 		assignments ?= task_capture_assignments(task.captures, type_symbol_lookup)
 		mask_words ?= task_capture_release_words(task.captures, type_symbol_lookup)
@@ -16571,7 +16448,7 @@ private pure func emit_task_closure_create(
 
 		Some(
 			"({ blorp_Closure* __cl_new = " + closure_new_inline_call(
-				task.c_name,
+				c_name,
 				capture_count,
 				mask_words,
 			) + ";" + assignments + closure_release_mask_statements(capture_count, mask_words) + " __cl_new; })",
@@ -16586,7 +16463,8 @@ private pure func emit_resource_concurrent_task_closure(
 ) -> Option[String]:
 	fn_name: String = concurrent_task_function_name(base_temp, 0)
 	closure_value ?= emit_task_closure_create(
-		selected_task_closure(symbol_authority, task),
+		task,
+		emitted_callable_name(symbol_authority, task.def_id),
 		selected_type_symbol_lookup(symbol_authority),
 	)
 
@@ -22740,7 +22618,7 @@ private pure func emit_function_body(
 			emit_if_body(cond, then_expr, else_expr, typ, loc, next_temp, emission_context)
 
 
-private pure func unsupported_expr_child_path(expr: CoreExpr) -> String:
+private pure func unsupported_expr_child_path(expr: CoreExpr, emission_context: FunctionEmissionContext) -> String:
 	children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(expr)
 	var child_index: Int = 0
 	var path: String = ""
@@ -22748,9 +22626,9 @@ private pure func unsupported_expr_child_path(expr: CoreExpr) -> String:
 	for child in children:
 		if (
 			path.is_empty()
-			and emit_function_body(child, 0, diagnostic_emission_context(child)).is_none()
+			and emit_function_body(child, 0, emission_context).is_none()
 		):
-			child_path: String = unsupported_expr_child_path(child)
+			child_path: String = unsupported_expr_child_path(child, emission_context)
 
 			path = if child_path.is_empty():
 				child_index.to_string()
@@ -22762,16 +22640,16 @@ private pure func unsupported_expr_child_path(expr: CoreExpr) -> String:
 	path
 
 
-private pure func unsupported_expr_child_kind(expr: CoreExpr) -> String:
+private pure func unsupported_expr_child_kind(expr: CoreExpr, emission_context: FunctionEmissionContext) -> String:
 	children: List[CoreExpr] = CoreTraverse.immediate_core_expr_children(expr)
 	var kind: String = ""
 
 	for child in children:
 		if (
 			kind.is_empty()
-			and emit_function_body(child, 0, diagnostic_emission_context(child)).is_none()
+			and emit_function_body(child, 0, emission_context).is_none()
 		):
-			kind = unsupported_expr_child_kind(child)
+			kind = unsupported_expr_child_kind(child, emission_context)
 		else:
 			void
 
@@ -23493,7 +23371,7 @@ private pure func emit_supported_user_function(
 	profile_function_id: Option[ProfileFunctionId],
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Option[String]:
@@ -23638,7 +23516,7 @@ private pure func emit_function(
 	internal_linkage: Bool,
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	symbol_authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
 	compact: Bool,
@@ -23661,7 +23539,19 @@ private pure func emit_function(
 						Some(c_code):
 							c_code
 						None:
-							emit_unsupported_function_error(func_info, display_name)
+							emit_unsupported_function_error(
+								func_info,
+								display_name,
+								emission_context_from_plan(
+									plan,
+									specialize_layout,
+									record_members,
+									profile_function_id,
+									symbol_authority,
+									function_parameter_variables(func_info),
+									compact,
+								),
+							)
 				None:
 					emit_function_inventory(func_info, display_name)
 		ProgramEntrypointFunction:
@@ -23681,7 +23571,19 @@ private pure func emit_function(
 						Some(c_code):
 							c_code
 						None:
-							emit_unsupported_function_error(func_info, display_name)
+							emit_unsupported_function_error(
+								func_info,
+								display_name,
+								emission_context_from_plan(
+									plan,
+									specialize_layout,
+									record_members,
+									profile_function_id,
+									symbol_authority,
+									function_parameter_variables(func_info),
+									compact,
+								),
+							)
 				None:
 					emit_function_inventory(func_info, display_name)
 		BuiltinFunction(c_name):
@@ -23712,11 +23614,7 @@ private pure func emit_function(
 			if abi.captures.length() == 0:
 				""
 			else:
-				emitted_name: String = selected_callable_c_spelling(
-					symbol_authority,
-					func_info.def_id,
-					abi.c_name,
-				)
+				emitted_name: String = emitted_callable_name(symbol_authority, func_info.def_id)
 				type_symbol_lookup: Dict[String, String] = selected_type_symbol_lookup(symbol_authority)
 				match closure_env_storage_kind(abi.captures, abi.task_abi, type_symbol_lookup):
 					LegacyVoidPointerSlots:
@@ -23782,11 +23680,7 @@ private pure func emit_function_forward_decl(
 					closure_body_signature(
 						func_info.return_type,
 						abi,
-						selected_callable_c_spelling(
-							symbol_authority,
-							func_info.def_id,
-							abi.c_name,
-						),
+						emitted_callable_name(symbol_authority, func_info.def_id),
 					) + ";\n"
 				None:
 					""
@@ -23811,11 +23705,7 @@ private pure func emit_static_closure_forward_decl(
 					"extern "
 
 				storage_class + "blorp_Closure " + static_closure_name(
-					selected_callable_c_spelling(
-						symbol_authority,
-						func_info.def_id,
-						abi.c_name,
-					),
+					emitted_callable_name(symbol_authority, func_info.def_id),
 				) + ";\n"
 			else:
 				""
@@ -24790,7 +24680,7 @@ private pure func static_record_field_initializer(
 	field: CoreRecordFieldValue,
 	member_spelling: CRecordMemberScope,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	field_init ?= static_value_initializer(
 		static_child_path(parent_path, field.name),
@@ -24813,7 +24703,7 @@ private pure func static_record_field_initializers(
 	member_spelling: CRecordMemberScope,
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -24849,7 +24739,7 @@ private pure func static_heap_record_initializer(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	field_inits ?= static_record_field_initializers(
 		path_c,
@@ -24879,7 +24769,7 @@ private pure func static_value_record_initializer(
 	type_name: String,
 	fields: List[CoreRecordFieldValue],
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	field_inits ?= static_record_field_initializers(
 		path_c,
@@ -24900,7 +24790,7 @@ private pure func static_value_initializer(
 	typ: CoreType,
 	expr: CoreExpr,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match expr:
 		LiteralExpr(literal, literal_type, loc):
@@ -24971,7 +24861,7 @@ private pure func static_pointer_list_slot_initializer(
 	index: Int,
 	value: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match value.kind:
 		PointerBox:
@@ -25011,7 +24901,7 @@ private pure func static_pointer_list_slots(
 	parent_path: String,
 	elements: List[CoreBoxedStorageValue],
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -25055,7 +24945,7 @@ private pure func static_tuple_element_initializer(
 	index: Int,
 	element: CoreTupleElement,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match element:
 		TuplePrimElement(value):
@@ -25110,7 +25000,7 @@ private pure func static_tuple_slots(
 	parent_path: String,
 	elements: List[CoreTupleElement],
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -25179,7 +25069,7 @@ private pure func static_tuple_initializer(
 	path_c: String,
 	construct: CoreTupleConstruct,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	slots ?= static_tuple_slots(path_c, construct.elements, type_symbol_lookup, record_members)
 	storage_name: String = static_tuple_storage_name(path_c)
@@ -25200,7 +25090,7 @@ private pure func static_result_payload_slot_initializer(
 	constructor_name: String,
 	value: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match value.kind:
 		PointerBox:
@@ -25246,7 +25136,7 @@ private pure func static_stack_result_initializer(
 	construct: CoreUnionConstruct,
 	representation: CoreStackResultRepresentation,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match construct.args:
 		[arg]:
@@ -25279,7 +25169,7 @@ private pure func static_generic_union_arg_initializer(
 	index: Int,
 	arg: CoreBoxedStorageValue,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match arg.kind:
 		PointerBox:
@@ -25325,7 +25215,7 @@ private pure func static_generic_union_arg_initializers(
 	constructor_name: String,
 	args: List[CoreBoxedStorageValue],
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	var definitions: List[String] = []
 	var values: List[String] = []
@@ -25364,7 +25254,7 @@ private pure func static_generic_union_initializer(
 	path_c: String,
 	construct: CoreUnionConstruct,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match construct.payload_storage:
 		TypedUnionPayloadStorage:
@@ -25393,7 +25283,7 @@ private pure func static_union_initializer(
 	path_c: String,
 	construct: CoreUnionConstruct,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	match construct.representation:
 		StackResultRepresentation(representation):
@@ -25442,7 +25332,7 @@ private pure func static_list_initializer(
 	path_c: String,
 	construct: CoreListConstruct,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[StaticValueInitializer]:
 	storage_name: String = static_list_storage_name(path_c)
 	elem_count: Int = construct.elements.length()
@@ -25652,7 +25542,7 @@ private pure func emit_static_managed_global_decl(
 	global: CoreGlobal,
 	internal_type_linkage: Bool,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> Option[String]:
 	if not global_has_static_managed_decl(global):
 		None
@@ -25885,7 +25775,7 @@ private pure func emit_global_decl(
 	global: CoreGlobal,
 	internal_type_linkage: Bool,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> String:
 	match emit_static_managed_global_decl(
 		global,
@@ -25936,7 +25826,7 @@ private pure func emit_global_runtime_init_body(
 	next_temp: Int,
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Option[FunctionBodyC]:
@@ -26270,7 +26160,7 @@ private pure func emit_heap_record_decl(
 	record_c_type: String = TypeLayout.c_type_name(HeapRecordType(record_decl.name), selected_type_symbol_lookup(authority))
 	naming: BackendTypeNaming = selected_type_naming(authority, record_decl.name)
 	member_spelling: CRecordMemberScope = c_record_member_scope(
-		selected_record_member_selector(authority, layouts),
+		layouts,
 		record_decl.name,
 	)
 
@@ -26985,7 +26875,7 @@ private pure func emit_global_decls(
 	decls: List[CoreDecl],
 	internal_type_linkage: Bool,
 	type_symbol_lookup: Dict[String, String],
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 ) -> String:
 	var c_code: String = make_string(0)
 
@@ -27094,7 +26984,7 @@ private pure func emit_global_init_function(
 	decls: List[CoreDecl],
 	cancellation_table: CancellationPlanTable,
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	symbol_authority: CEmissionSymbolAuthority,
 	compact: Bool,
 ) -> Result[String, CoreEmitError]:
@@ -27192,7 +27082,7 @@ private record CFunctionEmission {
 private record CFunctionEmissionContext {
 	profile_plan: Option[ProfileEmissionPlan],
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector
+	record_members: CRecordLayoutRegistry
 }
 
 
@@ -27233,7 +27123,7 @@ private pure func emit_function_decls(
 	internal_linkage: Bool,
 	cancellation_table: CancellationPlanTable,
 	specialize_layout: CoreSpecializeLayout,
-	record_members: CRecordMemberSelector,
+	record_members: CRecordLayoutRegistry,
 	internal_type_linkage: Bool,
 	compact: Bool,
 ) -> List[CFunctionEmission]:
@@ -27571,7 +27461,7 @@ private pure func collect_value_record_decl_emissions(
 			emit_value_record_decl(
 				record_decl,
 				c_record_layout(layouts.foreign_abi_value_record_names, record_decl.name),
-				c_record_member_scope(selected_record_member_selector(authority, layouts), record_decl.name),
+				c_record_member_scope(layouts, record_decl.name),
 				authority,
 			),
 		)
@@ -27776,15 +27666,12 @@ private pure func emit_decls(
 	specialize_layout: CoreSpecializeLayout = build_specialize_layout(program)
 	layouts ?= classify_c_record_layouts(
 		specialize_layout,
-		selected_foreign_boundary_types(symbol_authority, program),
+		selected_foreign_boundary_types(symbol_authority),
 	).map_err(
 		func(error): unresolved_record_field_error(error),
 	)
-	record_members: CRecordMemberSelector = selected_record_member_selector(symbol_authority, layouts)
-	static_string_literals ?= selected_static_string_literals(
-		symbol_authority,
-		program,
-	).map_err(
+	record_members: CRecordLayoutRegistry = layouts
+	static_string_literals ?= selected_static_string_literals(symbol_authority).map_err(
 		func(error): InvalidStaticStringLiteralPool(error),
 	)
 	global_init ?= emit_global_init_function(
@@ -27953,7 +27840,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile_and_indentation
 				plan,
 				cancellation_table,
 				profile_configuration,
-				ValidatedCEmissionSymbols(symbol_plan),
+				symbol_plan,
 				c_emission_canonical_empty_lists(symbol_plan),
 				True,
 				True,
@@ -27968,7 +27855,7 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile_and_indentation
 					C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes),
 					program.decls,
 					emitted[2],
-					ValidatedCEmissionSymbols(symbol_plan),
+					symbol_plan,
 					True,
 					cancellation_table,
 					True,
@@ -27991,69 +27878,6 @@ pure func try_emit_prepared_core_program_c_artifact_with_profile(
 	)
 
 
-pure func try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
-	prepared: PreparedCoreProgram,
-	profile_configuration: FunctionProfileConfiguration,
-) -> Result[CArtifact, CoreEmitError]:
-	program: CoreProgram = prepared_core_program_value(prepared)
-	plan: CleanupPlan = prepared_core_program_cleanup_plan(prepared)
-	cancellation_table: CancellationPlanTable = prepared_core_program_cancellation_plan_table(
-		prepared,
-	)
-	canonical_empty_lists ?= canonical_empty_lists_for_unprojected_program(
-		program,
-	).map_err(
-		func(error): CallableSymbolProjectionFailed(error),
-	)
-
-	emitted ?= emit_single_decls(
-		program,
-		plan,
-		cancellation_table,
-		profile_configuration,
-		UnprojectedCEmissionSymbolsForTests,
-		canonical_empty_lists,
-		False,
-		True,
-		False,
-	)
-	sections: CEmissionSections = emitted[0]
-	type_decls: CFlatTypeDeclSections = emitted[1]
-	Ok({
-		c_code = render_single_translation_unit(
-			sections,
-			type_decls,
-			C_ARTIFACT_HEADER + emit_foreign_includes(program.foreign_includes),
-			program.decls,
-			emitted[2],
-			UnprojectedCEmissionSymbolsForTests,
-			False,
-			cancellation_table,
-			True,
-			False,
-		),
-		extra_units = [],
-		link_flags = [],
-		include_dirs = [],
-	})
-
-
-pure func emit_unprojected_core_program_c_artifact_with_profile_for_tests(
-	program: CoreProgram,
-	profile_configuration: FunctionProfileConfiguration,
-) -> CArtifact:
-	prepared_program: PreparedCoreProgram = run_pre_dce_tail(program)
-
-	match try_emit_unprojected_prepared_core_program_c_artifact_for_tests(
-		prepared_program,
-		profile_configuration,
-	):
-		Ok(artifact):
-			artifact
-		Err(error):
-			error_artifact(error)
-
-
 pure func try_emit_core_program_c_artifact_with_profile(
 	program: CoreProgram,
 	profile_configuration: FunctionProfileConfiguration,
@@ -28061,13 +27885,6 @@ pure func try_emit_core_program_c_artifact_with_profile(
 	prepared_program: PreparedCoreProgram = run_pre_dce_tail(program)
 
 	try_emit_prepared_core_program_c_artifact_with_profile(prepared_program, profile_configuration)
-
-
-pure func emit_unprojected_core_program_c_artifact_for_tests(program: CoreProgram) -> CArtifact:
-	emit_unprojected_core_program_c_artifact_with_profile_for_tests(
-		program,
-		DEFAULT_PROFILE_CONFIGURATION,
-	)
 
 
 ---
@@ -28749,7 +28566,7 @@ pure func try_emit_prepared_core_program_c_split_artifact_with_profile_and_inden
 			Err(error):
 				Err(CallableSymbolProjectionFailed(error))
 			Ok(symbol_plan):
-				authority: CEmissionSymbolAuthority = ValidatedCEmissionSymbols(symbol_plan)
+				authority: CEmissionSymbolAuthority = symbol_plan
 				canonical_empty_lists: List[CanonicalEmptyList] = c_emission_canonical_empty_lists(
 					symbol_plan,
 				)
