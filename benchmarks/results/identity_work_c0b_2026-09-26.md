@@ -136,13 +136,20 @@ not improve resources (`/tmp/blorp-id-c0b-no-dump-1.log`).
 
 ## Coverage limits
 
+At this checkpoint the worker reported
 `covered_helper_sites = [stage_08_core_lower/lower.brp:core_var_impl]` and
-`total_static_constructor_sites = 47`. The denominator is a pinned,
+`total_static_constructor_sites = 47`. That denominator was a pinned,
 source-shape-conditional census of lexically adjacent `name`, `id`, `def_id`
-fields in complete-field CoreVar literals under stage 8/9. It excludes record
-updates and is **not** a semantic total-construction count. The test fails if
-the per-file census or observed helper changes. C3a owns moving remaining
-raw sites to a central constructor; this checkpoint does not rewrite them.
+fields in complete-field CoreVar literals under stage 8/9. It excluded record
+updates and was **not** a semantic total-construction count. A test failed if
+the per-file census or observed helper changed, and C3a was to move the
+remaining raw sites to a central constructor.
+
+Retired 2026-09-30: C3a never landed and `NAME_ID_ROADMAP.md` superseded the
+C-cut plan, so the census guarded no live migration. Its test table (41 sites)
+had already diverged from the reported 47, and it failed on ordinary deletions
+such as 710a799c7. The census test, its table and the two JSON fields are
+removed; a test still checks that the profiled `core_var_impl` exists.
 
 No current central ID-to-display/name accessor serves Core and backend.
 C1/C3 must add the display selector at that authority when it exists. Separate

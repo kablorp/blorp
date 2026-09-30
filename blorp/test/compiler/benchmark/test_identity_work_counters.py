@@ -1,7 +1,6 @@
 """Contract for direct identity hot-path profiling without production markers."""
 
 from pathlib import Path
-import re
 import runpy
 import sys
 import unittest
@@ -13,36 +12,6 @@ PARSER = runpy.run_path(str(ROOT / "benchmarks/compiler_identity_work_counters")
 REPLAY = runpy.run_path(str(ROOT / "benchmarks/compiler_identity_work_replay"))
 WORKER_HELPER = runpy.run_path(str(ROOT / "benchmarks/compiler_benchmark_worker.py"))
 FUNCTIONS = PARSER["FUNCTIONS"]
-EXPECTED_FULL_FIELD_SITES = {
-    "stage_08_core_lower/entrypoint.brp": 2,
-    "stage_08_core_lower/lower.brp": 2,
-    "stage_09_core/clone.brp": 1,
-    "stage_09_core/closure.brp": 2,
-    "stage_09_core/consume_specialize.brp": 1,
-    "stage_09_core/ir.brp": 1,
-    "stage_09_core/match_projection.brp": 2,
-    "stage_09_core/mono_option.brp": 1,
-    "stage_09_core/parallel_tensor_pipeline.brp": 1,
-    "stage_09_core/perceus/balance.brp": 2,
-    "stage_09_core/perceus/borrowed.brp": 1,
-    "stage_09_core/perceus/mutable.brp": 1,
-    "stage_09_core/perceus/results_and_loops.brp": 3,
-    "stage_09_core/record_update.brp": 1,
-    "stage_09_core/resolve.brp": 10,
-    "stage_09_core/ssa.brp": 1,
-    "stage_09_core/std_inline.brp": 1,
-    "stage_09_core/synth_nodes.brp": 1,
-    "stage_09_core/tailrec.brp": 1,
-    "stage_09_core/tensor_specialize.brp": 2,
-    "stage_09_core/trait_resolve.brp": 2,
-    "stage_09_core/tuple_sroa.brp": 1,
-}
-EXPECTED_FULL_FIELD_SITE_TOTAL = 40
-
-
-def format_sites(sites: dict) -> str:
-    rows = "".join(f'    "{path}": {count},\n' for path, count in sorted(sites.items()))
-    return "EXPECTED_FULL_FIELD_SITES = {\n" + rows + "}"
 
 
 def diagnostics(mode: str, selected: int, observed: int, calls: int) -> str:
@@ -147,27 +116,11 @@ class IdentityWorkCounterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse("       39.43 real        37.93 user")
 
-    def test_constructor_denominator_is_explicitly_source_shape_conditional(self) -> None:
-        source_root = ROOT / "blorp/src/compiler"
-        literal = re.compile(r"(?m)^\s*name\s*=.*\n\s*id\s*=.*\n\s*def_id\s*=")
-        sites = {}
-        for stage in ("stage_08_core_lower", "stage_09_core"):
-            for path in (source_root / stage).rglob("*.brp"):
-                count = len(literal.findall(path.read_text()))
-                if count:
-                    sites[str(path.relative_to(source_root))] = count
-        # The failure message is the refreshed table, ready to paste over
-        # EXPECTED_FULL_FIELD_SITES (and its total below) when the census drifts.
-        self.assertEqual(
-            sites,
-            EXPECTED_FULL_FIELD_SITES,
-            "full-field constructor census drifted; replace EXPECTED_FULL_FIELD_SITES "
-            f"(total {sum(sites.values())}) with:\n" + format_sites(sites),
-        )
-        self.assertEqual(sum(sites.values()), EXPECTED_FULL_FIELD_SITE_TOTAL)
-        lower = (source_root / "stage_08_core_lower/lower.brp").read_text()
+    def test_replayed_constructor_helper_exists(self) -> None:
+        # The replay selects lower::core_var_impl; a rename would leave the
+        # selector matching nothing.
+        lower = (ROOT / "blorp/src/compiler/stage_08_core_lower/lower.brp").read_text()
         self.assertIn("private pure func core_var_impl(", lower)
-        self.assertIn("name = name,\n\t\tid = 0,\n\t\tdef_id = def_id", lower)
 
     def test_production_has_no_identity_marker_import_or_call(self) -> None:
         compiler = ROOT / "blorp/src/compiler"
