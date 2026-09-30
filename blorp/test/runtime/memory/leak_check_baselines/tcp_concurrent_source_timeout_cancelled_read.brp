@@ -1,0 +1,77 @@
+-- Regression: a `for ... concurrently` child over a TCP resource source owns the
+-- accepted stream twice over during its body: once as the moved task capture
+-- and once as the loop's resource binding, which closes (and releases) it. When
+-- the child was cancelled while parked in `read_chunk`, the cancellation drain
+-- ran both cleanup frames and released the stream twice. The loop-wide timeout
+-- cancels the loop, including the child parked mid-read (the client never
+-- writes). The listener's accept timeout is only a backstop that ends the
+-- source if the loop timeout fires before the first accept completes. Timing is
+-- best-effort: a child that has not yet parked when the timeout fires still
+-- passes, so this can miss the bug but cannot fail spuriously. The emitted
+-- handoff order is pinned deterministically in test_core_emit.brp.
+import:
+	net/tcp:
+		IpFamily(IPv4),
+		TcpError,
+		connect_loopback,
+		connections_stop_on_error,
+		listen_loopback_any_port,
+		local_port,
+		message,
+		port,
+		read_chunk,
+		set_timeout,
+	string: contains
+	units: milliseconds
+
+
+private CHILD_TIMEOUT_MS: Int = 20
+
+private ACCEPT_TIMEOUT_MS: Int = 200
+
+private READ_CHUNK_BYTES: Int = 64
+
+
+pure func is_socket_permission_error(err: TcpError) -> Bool:
+	detail: String = message(err)
+	detail.contains("Operation not permitted") or detail.contains("Permission denied")
+
+
+func listen_probe() -> Result[Bool, TcpError]:
+	with _ ?= listen_loopback_any_port(IPv4, 1):
+		Ok(True)
+
+
+func child_cancelled_mid_read() -> Result[Int, TcpError]:
+	with listener ?= listen_loopback_any_port(IPv4, 16):
+		timeout_set: Bool = set_timeout(listener, ACCEPT_TIMEOUT_MS).is_ok()
+		_ = timeout_set
+		port_num ?= local_port(listener)
+		remote ?= port(port_num)
+
+		with _ ?= connect_loopback(IPv4, remote):
+			for peer in connections_stop_on_error(
+				listener,
+			) concurrently(limit: 1, timeout: milliseconds(CHILD_TIMEOUT_MS)):
+				match read_chunk(peer, READ_CHUNK_BYTES):
+					Ok(_):
+						void
+					Err(_):
+						void
+
+			Ok(1)
+
+
+func main(args: List[String]) -> Int:
+	match listen_probe():
+		Ok(_):
+			match child_cancelled_mid_read():
+				Ok(_):
+					0
+				Err(_):
+					1
+		Err(err):
+			if is_socket_permission_error(err):
+				0
+			else:
+				1

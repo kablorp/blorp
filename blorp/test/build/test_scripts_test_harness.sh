@@ -629,14 +629,14 @@ fi
 echo "PASS: scripts/test leak links the isolated leak-baseline programs into one dispatch binary"
 
 if ! grep -Fxq 'Diagnostic results: 1 passed, 0 failed' "$leak_output_file" \
-	|| ! grep -Fxq 'Results: 20 passed, 0 failed (20 leak checks)' "$leak_output_file"
+	|| ! grep -Fxq 'Results: 21 passed, 0 failed (21 leak checks)' "$leak_output_file"
 then
 	echo "FAIL: scripts/test leak should distinguish its diagnostic subtotal from the combined result"
 	cat "$leak_output_file"
 	exit 1
 fi
 
-if ! grep -Fq -- '-- Leak-Check Isolated Programs (one link, 18 launches) --' "$leak_output_file"; then
+if ! grep -Fq -- '-- Leak-Check Isolated Programs (one link, 19 launches) --' "$leak_output_file"; then
 	echo "FAIL: scripts/test leak should report the isolated dispatch launch count"
 	cat "$leak_output_file"
 	exit 1
@@ -654,7 +654,7 @@ missing_diag_output="$TMP_HARNESS/missing-diag-output.txt"
 ) > "$missing_diag_output" 2>&1
 missing_diag_status=$?
 if [ "$missing_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+19[[:space:]]+1[[:space:]]+20' \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+20[[:space:]]+1[[:space:]]+21' \
 		"$missing_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject missing diagnostic verdicts"
@@ -675,7 +675,7 @@ malformed_diag_output="$TMP_HARNESS/malformed-diag-output.txt"
 ) > "$malformed_diag_output" 2>&1
 malformed_diag_status=$?
 if [ "$malformed_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+19[[:space:]]+1[[:space:]]+20' \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+20[[:space:]]+1[[:space:]]+21' \
 		"$malformed_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject malformed diagnostic verdicts"
@@ -693,7 +693,7 @@ duplicate_diag_output="$TMP_HARNESS/duplicate-diag-output.txt"
 ) > "$duplicate_diag_output" 2>&1
 duplicate_diag_status=$?
 if [ "$duplicate_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+19[[:space:]]+1[[:space:]]+20' \
+	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+20[[:space:]]+1[[:space:]]+21' \
 		"$duplicate_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject duplicate diagnostic verdicts"

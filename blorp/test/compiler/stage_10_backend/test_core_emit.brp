@@ -4399,6 +4399,62 @@ pure func moved_stack_result_yield_task_body_function() -> CoreFunction:
 	}
 
 
+--- A concurrently-loop child over a resource source: the moved item capture is
+--- acquired by the body's resource scope, which closes it. The yield makes the
+--- body a cancellation point so both cleanup frames are live together.
+pure func moved_resource_item_scope_task_body_function() -> CoreFunction:
+	item: CoreVar = named_var("item")
+	peer: CoreVar = named_var("peer")
+	yield_call: CoreExpr = CallExpr(
+		BuiltinCall("blorp_yield_now"),
+		VarExpr(named_var("blorp_yield_now"), closure_type(), synthetic_core_source_loc()),
+		[],
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	close_peer: CoreExpr = CallExpr(
+		DirectRuntimeCall({
+			name = "blorp_tcp_close_stream",
+			args = DirectRuntimeArgsAsWritten,
+			result = DirectRuntimeResultAsWritten,
+		}),
+		VarExpr(named_var("blorp_tcp_close_stream"), closure_type(), synthetic_core_source_loc()),
+		[VarExpr(peer, tcp_stream_type(), synthetic_core_source_loc())],
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	body: CoreExpr = ResourceScopeExpr(
+		{
+			variable = peer,
+			typ = tcp_stream_type(),
+			acquire = VarExpr(item, tcp_stream_type(), synthetic_core_source_loc()),
+			body = yield_call,
+			cleanup = close_peer
+		},
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	{
+		name = "_blorp_task_24",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = VoidType,
+		body = Some(body),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = ClosureBodyFunction({
+			params = [],
+			captures = [{ name = "item", id = 0, typ = tcp_stream_type(), origin = AuthoredBinder }],
+			moved_captures = ["item"],
+			task_abi = True,
+		}),
+		def_id = 919,
+		loc = synthetic_core_source_loc()
+	}
+
+
 pure func stack_result_task_body_function() -> CoreFunction:
 	{
 		name = "_blorp_task_21",
@@ -16727,6 +16783,36 @@ pure func test_emit_moved_stack_result_capture_cleanup() -> Bool:
 	)
 
 
+--- Cancellation mid-body used to drain both the moved item's release frame and
+--- the resource close frame, releasing the same object twice. The resource
+--- scope takes over the item's ownership, so it retires the item's frame
+--- before registering its own close frame.
+pure func test_emit_resource_scope_takes_over_moved_task_capture_cleanup() -> Bool:
+	artifact: CArtifact = emit_source_spelled_c_artifact({
+		decls = [FunctionDecl(moved_resource_item_scope_task_body_function())],
+		foreign_includes = [],
+		source_files = [],
+	})
+	item_push_index: Option[Int] = artifact.c_code.index_of(
+		"blorp_task_cleanup_push_with_task(&__blorp_cleanup_item, &item, (void*)item, blorp_cleanup_release_arc_value, __blorp_task);",
+	)
+	resource_binding_index: Option[Int] = artifact.c_code.index_of("blorp_TcpStream* peer = item;")
+	item_pop_index: Option[Int] = artifact.c_code.index_of(
+		"blorp_task_cleanup_pop_slot_with_task(&item, __blorp_task);",
+	)
+	resource_push_index: Option[Int] = artifact.c_code.index_of((
+			"blorp_task_cleanup_push_with_task(&__blorp_cleanup_peer, &peer, "
+			+ "(void*)peer, (blorp_CancelCleanupFn)blorp_tcp_close_stream, __blorp_task);"
+		))
+
+	(
+		option_int_less_than(item_push_index, resource_binding_index)
+		and option_int_less_than(resource_binding_index, item_pop_index)
+		and option_int_less_than(item_pop_index, resource_push_index)
+		and artifact.c_code.contains("(void)(blorp_tcp_close_stream(peer));")
+	)
+
+
 pure func int_param(name: String) -> CoreParam:
 	{
 		name = {
@@ -28354,6 +28440,10 @@ tests: TestSuite = {
 		(
 			"emit moved StackResult capture cleanup",
 			test_emit_moved_stack_result_capture_cleanup,
+		),
+		(
+			"emit resource scope takes over moved task capture cleanup",
+			test_emit_resource_scope_takes_over_moved_task_capture_cleanup,
 		),
 		("emit tuple construct and field access", test_emit_tuple_construct_and_field_access),
 		("emit struct tuple construct", test_emit_struct_tuple_construct),

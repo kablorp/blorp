@@ -1048,7 +1048,12 @@ private record FunctionEmissionContext {
 	-- level (see the pattern-census whitespace finding: 16.55 MB of the
 	-- self-compile artifact is leading indentation and newlines).
 	compact: Bool,
-	parameter_variables: List[CoreVar]
+	parameter_variables: List[CoreVar],
+	-- Moved task captures (copied captures and resource items, whose env slot
+	-- the prelude clears) whose ownership the closure prelude registers in a
+	-- cancellation cleanup frame. The prelude push and the resource-scope
+	-- ownership handoff both read this list, so they cannot disagree.
+	tracked_moved_captures: List[CoreVar]
 }
 
 
@@ -1199,7 +1204,8 @@ private pure func emission_context_from_plan(
 		record_members = record_members,
 		indent = initial_indent,
 		compact = compact,
-		parameter_variables = parameter_variables
+		parameter_variables = parameter_variables,
+		tracked_moved_captures = []
 	}
 
 
@@ -12739,20 +12745,8 @@ private pure func closure_env_capture_declarations(
 					field: String = env_local_name + "->" + closure_env_field_name(index)
 					result += "  " + c_type + " " + c_local_spelling(capture.name, capture.id, capture.origin) + " = " + field + ";\n"
 					if moved_captures.contains(capture.name):
-						capture_var: CoreVar = {
-							name = capture.name,
-							id = capture.id,
-							def_id = None,
-							origin = capture.origin
-						}
 						result += closure_env_capture_clear_statement(capture, field)
-						result += planned_variable_cleanup_push_statement(
-							emission_context,
-							index,
-							ClosureMoveTemporary(index),
-							capture_var,
-							CoreTypePolicy.cleanup_release_policy_for_type(capture.typ),
-						)
+						result += moved_capture_cleanup_push_statement(capture, emission_context)
 				None:
 					failed = True
 					break
@@ -12973,6 +12967,71 @@ private pure func closure_param_decls(params: List[CoreParam], type_symbol_looku
 		Some(result)
 
 
+private pure func moved_capture_var(capture: CoreClosureCapture) -> CoreVar:
+	{
+		name = capture.name,
+		id = capture.id,
+		def_id = None,
+		origin = capture.origin
+	}
+
+
+private pure func emission_tracks_moved_capture(
+	emission_context: FunctionEmissionContext,
+	variable: CoreVar,
+) -> Bool:
+	emission_context.tracked_moved_captures.contains(variable)
+
+
+---
+The moved task captures (both copied captures and resource items) whose
+ownership the closure prelude registers for cancellation cleanup: the planner
+selected the capture's move temporary and its type has a cleanup release
+function.
+---
+private pure func tracked_moved_captures(
+	abi: CoreClosureAbi,
+	emission_context: FunctionEmissionContext,
+) -> List[CoreVar]:
+	var tracked: List[CoreVar] = []
+	var index: Int = 0
+
+	for capture in abi.captures:
+		policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(capture.typ)
+
+		if (
+			abi.moved_captures.contains(capture.name)
+			and backend_temporary_tracks_cleanup(
+				emission_context,
+				index,
+				ClosureMoveTemporary(index),
+				policy,
+			)
+			and owned_temp_cleanup_release_fn(policy).is_some()
+		):
+			tracked = tracked.append(moved_capture_var(capture))
+
+		index += 1
+
+	tracked
+
+
+private pure func moved_capture_cleanup_push_statement(
+	capture: CoreClosureCapture,
+	emission_context: FunctionEmissionContext,
+) -> String:
+	variable: CoreVar = moved_capture_var(capture)
+
+	if emission_tracks_moved_capture(emission_context, variable):
+		cancellation_cleanup_push_statement(
+			BASE_INDENT,
+			variable,
+			CoreTypePolicy.cleanup_release_policy_for_type(capture.typ),
+		)
+	else:
+		""
+
+
 private pure func closure_capture_decl(
 	capture: CoreClosureCapture,
 	index: Int,
@@ -12982,19 +13041,10 @@ private pure func closure_capture_decl(
 	decl ?= closure_slot_decl(capture.typ, c_local_spelling(capture.name, capture.id, capture.origin), "__e[" + index.to_string() + "]", selected_type_symbol_lookup(emission_context.symbol_authority))
 
 	if moved_captures.contains(capture.name):
-		capture_var: CoreVar = {
-			name = capture.name,
-			id = capture.id,
-			def_id = None,
-			origin = capture.origin
-		}
 		Some(
-			decl + "  __e[" + index.to_string() + "] = NULL;\n" + planned_variable_cleanup_push_statement(
+			decl + "  __e[" + index.to_string() + "] = NULL;\n" + moved_capture_cleanup_push_statement(
+				capture,
 				emission_context,
-				index,
-				ClosureMoveTemporary(index),
-				capture_var,
-				CoreTypePolicy.cleanup_release_policy_for_type(capture.typ),
 			),
 		)
 	else:
@@ -13156,7 +13206,7 @@ private pure func emit_closure_body_function(
 	match func_info.body:
 		Some(body):
 			emitted_name: String = emitted_callable_name(symbol_authority, func_info.def_id)
-			emission_context: FunctionEmissionContext = emission_context_from_plan(
+			planned_context: FunctionEmissionContext = emission_context_from_plan(
 				plan,
 				specialize_layout,
 				record_members,
@@ -13165,6 +13215,9 @@ private pure func emit_closure_body_function(
 				function_parameter_variables(func_info),
 				compact,
 			)
+			emission_context: FunctionEmissionContext = { planned_context |
+				tracked_moved_captures = tracked_moved_captures(abi, planned_context)
+			}
 			discard_indent: String = if compact:
 				""
 			else:
@@ -13470,19 +13523,6 @@ private pure func planned_match_scrutinee_cleanup_pop_statement(
 ) -> String:
 	if tracks_cleanup:
 		owned_temp_cleanup_pop_statement(indent, slot, policy)
-	else:
-		""
-
-
-private pure func planned_variable_cleanup_push_statement(
-	emission_context: FunctionEmissionContext,
-	temporary_index: Int,
-	role: BackendCleanupTemporaryRole,
-	variable: CoreVar,
-	policy: CoreReleasePolicy,
-) -> String:
-	if backend_temporary_tracks_cleanup(emission_context, temporary_index, role, policy):
-		cancellation_cleanup_push_statement(BASE_INDENT, variable, policy)
 	else:
 		""
 
@@ -21830,6 +21870,29 @@ private pure func emit_resource_cleanup_exit(
 	})
 
 
+---
+The resource scope owns its acquired value from the binding on, and its close
+frame releases it if the body is cancelled. A `for ... concurrently` child over
+a resource source acquires its moved item capture (and a task body may acquire
+any other moved capture), which the closure prelude already registered for
+release. Retire that frame at the handoff, before the
+close frame is pushed, or cancellation drains both frames and releases the
+item twice. Normal exit already treats the item as moved into the scope.
+---
+private pure func resource_acquire_cleanup_handoff_pop(
+	acquire: CoreExpr,
+	emission_context: FunctionEmissionContext,
+) -> String:
+	match acquire:
+		VarExpr(variable, typ, loc):
+			if emission_tracks_moved_capture(emission_context, variable):
+				cancellation_cleanup_pop_statement(emission_context.indent, variable)
+			else:
+				""
+		_:
+			""
+
+
 private pure func emit_resource_scope(
 	scope: CoreResourceScope,
 	typ: CoreType,
@@ -21839,11 +21902,15 @@ private pure func emit_resource_scope(
 	acquire_c ?= emit_simple_expr(scope.acquire, emission_context)
 	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
 	inner_indent: String = inner_context.indent
-	push_statement ?= resource_cleanup_push_statement(
+	cleanup_push_statement ?= resource_cleanup_push_statement(
 		inner_indent,
 		scope,
 		emission_context.symbol_authority,
 	)
+	push_statement: String = resource_acquire_cleanup_handoff_pop(
+		scope.acquire,
+		inner_context,
+	) + cleanup_push_statement
 	resource_declaration: String = inner_indent + TypeLayout.c_type_name(
 		scope.typ,
 		selected_type_symbol_lookup(emission_context.symbol_authority),
