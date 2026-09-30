@@ -134,6 +134,17 @@ I5. The pin is `(std module origin, NameId)` resolved to a
 | Q4 | `known_stdlib_type_of_*` reads the identity (per-declaration classification stored on `TypeHeader`) instead of the String; the two string-to-enum constructors and the `is_global_abi_type_name` list, `normalize_type_name`'s `Vector`/`Matrix` fold and the 60-name list's readers go. `net_*` package types classify by module origin through the same path | about 30 literals, 60-name list | the constructor tables | same-named-type-in-two-modules fixtures (Q0); identical C |
 | Q5 | Delete the parsers. `SemanticQualifiedNamedType(alias, name)` replaces `alias.Name` (`types.brp:92`, `type_resolution.brp:112`); `display_type_name` renders from identity plus the module table; `split_canonical_module_type_name`, `split_qualified_type_name`, `owner_local_type_name` and the `::` parse in `identity.brp:160` go with M3.1 (Core stops flattening by String) | 4 parsers, 3 helpers | the parsers | 860 diagnostic fixtures; `type_name` intrinsic tests; identical C |
 
+Status. Q0 and Q1 landed (`benchmarks/results/type_name_dead_arms_2026-09-29.md`):
+each phase's readers now accept only the spellings that phase can produce.
+Open collision: a module's own type whose name is on `is_global_abi_type_name`
+(`Stream`, `FallibleStream`, `Channel`, `Directory`, `FileReader`, `Port`, ...)
+is spelled bare, exactly like the stdlib type, so no spelling separates them
+and the typechecker treats a user `record FallibleStream[T, E]` as the stdlib
+stream (pinned by `typecheck/should_fail/user_fallible_stream_named_like_stdlib.brp`).
+Only Q3 and Q4 (identity beside the String, readers comparing identities) fix
+it; the fixture moves to `should_pass` then. `ResourceSource` (not ABI-listed)
+was separated by Q1 and is covered by a `should_pass` fixture.
+
 Sequencing. Q0, Q1, Q2a to Q2c need no representation change and can run
 now, one landing at a time; Q2 is on the path (not a bounded detour)
 because it converts each reader exactly once, to an enum whose constructor
