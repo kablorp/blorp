@@ -1,6 +1,7 @@
 import:
-	../../src/compiler/stage_09_core/origin_name_agreement: ModuleCheckScope(CheckWithoutModuleTable)
 	../../src/compiler/pipeline:
+		LateCoreExecution(LateCoreCompleted),
+		execute_late_core_stages,
 		CompilerPhase(
 			ArtifactConstructionPhase,
 			BackendEmissionPhase,
@@ -22,8 +23,12 @@ import:
 		CoreDecl(FunctionDecl),
 		CoreExpr(CallExpr),
 		CoreProgram,
-	../../src/compiler/stage_09_core/pass_runner: CorePass, CorePassControl
-	../../src/compiler/stage_09_core/pipeline: late_core_passes_for_control
+		CoreStandardModule(ListModule),
+		core_standard_module_id,
+		core_standard_modules,
+	../../src/compiler/stage_09_core/pass_runner: CoreModuleTableCheck(SkipModuleTableCheck), CorePass, CorePassControl
+	../../src/compiler/stage_09_core/pipeline: late_core_passes_for_control, prepared_core_program_module_table
+	../../src/compiler/stage_04_modules/module_table: module_table_count
 	../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
 	../../src/lib/cli_plan: CliCompilePlan, CliRunPlan(CliRunCompile)
 	../../src/lib/compilation:
@@ -296,14 +301,14 @@ private pure func expected_pass_names() -> List[String]:
 		check_invariants = False,
 		observations = [],
 		stop_after = None,
-		modules = CheckWithoutModuleTable
+		modules = SkipModuleTableCheck
 	}
 	late_control: CorePassControl = {
 		observe = [],
 		stop_after = None,
 		check_invariants = False,
 		record_timings = True,
-		modules = CheckWithoutModuleTable
+		modules = SkipModuleTableCheck
 	}
 	passes: List[CorePass] = early_core_lowering_passes(configuration)
 		.concat(early_core_resolution_passes([], []))
@@ -460,6 +465,74 @@ func test_allocation_report_stops_before_backend_phases() -> Bool:
 				False
 
 
+---
+A real compile of a program that imports `list`: the prepared compilation holds a
+module table that contains the standard-library `list` module (not an empty table
+that would make every standard-module lookup silently miss), and that table is what
+`execute_late_core_stages` hands to the prepared program's `modules`.
+---
+func test_real_compile_threads_a_populated_module_table_to_late_core() -> Bool:
+	path: String = temp_dir() + "/blorp_cli_module_table_threading.brp"
+	_ = remove_file(path)
+	source: String =
+		|import:
+		|	list: map
+		|
+		|func main(args: List[String]) -> Int:
+		|	[1, 2, 3].map(func(value: Int) -> Int: value + 1).length()
+
+	if not write_source(path, source):
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				policy: FrontendCompilePolicy = {
+					allow_debug_only_calls = False,
+					retain_debug_blocks = False,
+					include_typed_summary = False
+				}
+
+				match prepare_compile_plan_with_frontend_policy(compile_plan, policy):
+					Ok(CompilePreparationReady(prepared)):
+						compilation = prepared.compilation
+						has_list: Bool = core_standard_module_id(
+							core_standard_modules(compilation.modules),
+							ListModule,
+						).is_some()
+
+						match execute_late_core_stages(
+							compilation.program,
+							compilation.next_def_id,
+							compilation.next_binder_id,
+							compilation.names,
+							compilation.modules,
+							prepared.early_observations,
+							prepared.late_stages,
+							False,
+							False,
+						):
+							LateCoreCompleted(prepared_core, _, _):
+								(
+									has_list
+									and module_table_count(compilation.modules) > 0
+									and module_table_count(
+										prepared_core_program_module_table(prepared_core),
+									) == module_table_count(compilation.modules)
+								)
+							_:
+								False
+					Err(errors):
+						print_error("compile preparation failed:\n" + errors.join("\n"))
+						False
+					Ok(_):
+						False
+			_:
+				False
+
+
 tests: TestSuite = {
 	description = "Blorp CLI frontend boundaries",
 	tests = [
@@ -493,6 +566,10 @@ tests: TestSuite = {
 		(
 			"allocation report stops before backend phases",
 			test_allocation_report_stops_before_backend_phases,
+		),
+		(
+			"real compile threads a populated module table to late Core",
+			test_real_compile_threads_a_populated_module_table_to_late_core,
 		),
 	]
 }

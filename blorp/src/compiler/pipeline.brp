@@ -54,7 +54,6 @@ import:
 		resolved_module_identities_equal,
 		resolved_module_identity_storage_key,
 	stage_04_modules/module_surface: module_surface_for_program
-	stage_09_core/origin_name_agreement: ModuleCheckScope(CheckAgainstModuleTable, CheckWithoutModuleTable)
 	stage_04_modules/module_table: ModuleId, ModuleTable, module_table_canonical_path
 	stage_06_typecheck/bridge:
 		TypecheckGraphRequest,
@@ -119,6 +118,7 @@ import:
 		CoreProgram,
 		core_program_to_json,
 	stage_09_core/pass_runner:
+		CoreModuleTableCheck(CheckStateModuleTable, SkipModuleTableCheck),
 		CorePassControl,
 		CorePassDiagnostic,
 		CorePassObservation,
@@ -402,6 +402,7 @@ record CoreCompilation {
 	next_def_id: Int,
 	next_binder_id: Int,
 	names: NameTable,
+	modules: ModuleTable,
 	check_invariants: Bool
 }
 
@@ -539,6 +540,7 @@ private record RuntimeProjectedCompilationRep {
 	next_def_id: Int,
 	next_binder_id: Int,
 	names: NameTable,
+	modules: ModuleTable,
 	observations: List[CoreObservation]
 }
 
@@ -1154,7 +1156,7 @@ pure func prepare_core_lowering_request(
 		check_invariants = representation.check_invariants,
 		observations = representation.early_observations,
 		stop_after = representation.early_stop,
-		modules = CheckAgainstModuleTable(definition_table_module_table(input.definition_table))
+		modules = CheckStateModuleTable
 	}
 
 	Ok(into_opaque PreparedCoreLoweringRequest({
@@ -1191,7 +1193,8 @@ pure func lower_prepared_core_request(
 		program = prepared_graph.program,
 		next_def_id = prepared_graph.next_def_id,
 		next_binder_id = FIRST_MINTED_BINDER_ID,
-		names = input.names
+		names = input.names,
+		modules = definition_table_module_table(input.definition_table)
 	}
 
 	Ok(into_opaque LoweredCoreCompilation({
@@ -1292,6 +1295,7 @@ func project_runtime_compilation(
 									next_def_id = completed.next_def_id,
 									next_binder_id = completed.next_binder_id,
 									names = completed.names,
+									modules = completed.modules,
 									observations = completed.observations.map(early_observation)
 								}),
 							completed.pass_timings,
@@ -1311,6 +1315,7 @@ pure func runtime_projected_core_compilation(
 		next_def_id = representation.next_def_id,
 		next_binder_id = representation.next_binder_id,
 		names = representation.names,
+		modules = representation.modules,
 		check_invariants = representation.check_invariants
 	}
 
@@ -1448,6 +1453,7 @@ func execute_late_core_stages(
 	next_def_id: Int,
 	next_binder_id: Int,
 	names: NameTable,
+	modules: ModuleTable,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
@@ -1458,20 +1464,21 @@ func execute_late_core_stages(
 		stop_after = late_stop_pass_name(stages),
 		check_invariants = check_invariants,
 		record_timings = record_timings,
-		modules = CheckWithoutModuleTable
+		modules = SkipModuleTableCheck
 	}
 
 	match run_core_passes(
 		late_core_passes_for_control(control),
 		{ core_pass_state(pre_dce_core, next_def_id) |
 			next_binder_id = next_binder_id,
-			names = names
+			names = names,
+			modules = modules
 		},
 		control,
 	):
 		CorePassesCompleted(completed, pass_observations, timings):
 			LateCoreCompleted(
-				prepared_core_program_with_checkpoints(completed.program, names),
+				prepared_core_program_with_checkpoints(completed.program, names, modules),
 				late_core_observations(observations, pass_observations),
 				timings,
 			)
@@ -1509,6 +1516,7 @@ func run_late_core_compilation(
 		representation.next_def_id,
 		representation.next_binder_id,
 		representation.names,
+		representation.modules,
 		representation.observations,
 		stages,
 		representation.check_invariants,
@@ -1599,6 +1607,7 @@ func finish_compiler_pipeline(
 	next_def_id: Int,
 	next_binder_id: Int,
 	names: NameTable,
+	modules: ModuleTable,
 	observations: List[CoreObservation],
 	stages: List[LateCoreStageRequest],
 	check_invariants: Bool,
@@ -1609,6 +1618,7 @@ func finish_compiler_pipeline(
 		next_def_id,
 		next_binder_id,
 		names,
+		modules,
 		observations,
 		stages,
 		check_invariants,

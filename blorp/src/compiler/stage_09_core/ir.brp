@@ -6,7 +6,14 @@
 -- can make illegal states unrepresentable as the port expands.
 import:
 	../stage_04_modules/loaded_module: ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule)
-	../stage_04_modules/module_table: ModuleId, module_id_from_serialized_index, module_id_table_index
+	../stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		empty_module_table,
+		module_id_from_serialized_index,
+		module_id_table_index,
+		module_table_find_id_by_canonical_path,
+		module_table_origin,
 	../stage_02_lex/name_table: EMPTY_NAME_TABLE, NameId, NameTable, name_id_from_interned_index, name_id_index, name_spelling
 	known_functions: CoreKnownFunction, core_known_function, core_known_impl_method
 	../stage_06_typecheck/type_system/language_surface_manifest:
@@ -3392,13 +3399,138 @@ live reaches is pruned before the readers run):
     pure variant;
   * `known_functions`: the recognised standard-library functions;
   * `names`: the compilation's name table, which the declarations' `NameId`s
-    index, for the readers that key on a member's spelling.
+    index, for the readers that key on a member's spelling;
+  * `modules`: the compilation's module table, which the functions' `ModuleId`s
+    index, and `standard_modules`, the ids of the standard-library modules the
+    passes ask about (see `CoreStandardModules`).
 ---
 record CoreDeclarationIndex {
 	names: NameTable,
+	modules: ModuleTable,
+	standard_modules: CoreStandardModules,
 	copy_declarations: CoreCopyDeclarations,
 	known_functions: CoreKnownFunctions
 }
+
+
+---
+A standard-library module the Core passes recognise a function's module by. A new
+module is one variant here, one arm in `core_standard_module_path`, and one entry
+in `core_standard_module_variants`.
+---
+enum CoreStandardModule:
+	ListModule
+	StringModule
+	VectorModule
+	MatrixModule
+	FloatModule
+	FixedModule
+	SliceModule
+	BytesModule
+	SetModule
+	DictModule
+
+
+---
+Every `CoreStandardModule`, in the order `core_standard_modules` looks them up.
+---
+pure func core_standard_module_variants() -> List[CoreStandardModule]:
+	[
+		ListModule,
+		StringModule,
+		VectorModule,
+		MatrixModule,
+		FloatModule,
+		FixedModule,
+		SliceModule,
+		BytesModule,
+		SetModule,
+		DictModule,
+	]
+
+
+---
+The canonical path of a standard-library module: the standard library's own
+module name (`standard_library/src/<name>.brp`).
+---
+pure func core_standard_module_path(module: CoreStandardModule) -> String:
+	match module:
+		ListModule:
+			"list"
+		StringModule:
+			"string"
+		VectorModule:
+			"vector"
+		MatrixModule:
+			"matrix"
+		FloatModule:
+			"float"
+		FixedModule:
+			"fixed"
+		SliceModule:
+			"slice"
+		BytesModule:
+			"bytes"
+		SetModule:
+			"set"
+		DictModule:
+			"dict"
+
+
+---
+The ids of the standard-library modules a compilation contains. A `ModuleId` is an
+index into one compilation's `ModuleTable`, so it means nothing outside that
+compilation: the same module is a different id in the next compile, and a module
+the program never imports has no id at all. The ids are therefore looked up once,
+when the declaration index is built (`core_standard_modules`), and a pass compares
+a function's `CoreModuleOrigin` against `core_standard_module_id` instead of
+comparing the path String. A module the compilation does not contain is absent, so
+no function can be in it.
+---
+record CoreStandardModules {
+	found: List[CoreStandardModuleEntry]
+}
+
+
+record CoreStandardModuleEntry {
+	module: CoreStandardModule,
+	id: ModuleId
+}
+
+
+private pure func is_standard_library_origin(origin: Option[ModuleOrigin]) -> Bool:
+	match origin:
+		Some(StdlibModule):
+			True
+		_:
+			False
+
+
+---
+The id `modules` gives each standard-library module it contains. The canonical
+path alone does not decide it: a user module named `list` has the path `list` too,
+so the table's origin must be `StdlibModule` as well.
+---
+pure func core_standard_modules(modules: ModuleTable) -> CoreStandardModules:
+	var found: List[CoreStandardModuleEntry] = []
+
+	for module in core_standard_module_variants():
+		match module_table_find_id_by_canonical_path(modules, core_standard_module_path(module)):
+			Some(id):
+				if is_standard_library_origin(module_table_origin(modules, id)):
+					found = found.append({ module = module, id = id })
+			None:
+				void
+
+	{ found = found }
+
+
+---
+The id of `module` in this compilation, `None` when the compilation does not
+contain it.
+---
+pure func core_standard_module_id(standard: CoreStandardModules, module: CoreStandardModule) -> Option[ModuleId]:
+	standard.found.find(func(entry): entry.module == module).map(func(entry): entry.id)
 
 
 ---
@@ -3407,20 +3539,30 @@ records the real one. A function, not a constant, because a global initializer m
 not read `EMPTY_NAME_TABLE`, a global of another module (see `core_synth_context_empty`).
 ---
 pure func core_empty_declaration_index() -> CoreDeclarationIndex:
+	empty_modules: ModuleTable = empty_module_table()
 	{
 		names = EMPTY_NAME_TABLE,
+		modules = empty_modules,
+		standard_modules = core_standard_modules(empty_modules),
 		copy_declarations = {},
 		known_functions = {}
 	}
 
 
 ---
-The `CoreDeclarationIndex` of `program`, whose declarations' names are in `names`.
+The `CoreDeclarationIndex` of `program`, whose declarations' names are in `names`
+and whose functions' module ids index `modules`.
 ---
-pure func core_declaration_index(names: NameTable, program: CoreProgram) -> CoreDeclarationIndex:
+pure func core_declaration_index(
+	names: NameTable,
+	modules: ModuleTable,
+	program: CoreProgram,
+) -> CoreDeclarationIndex:
 	copy_declarations: CoreCopyDeclarations = core_copy_declarations(program)
 	{
 		names = names,
+		modules = modules,
+		standard_modules = core_standard_modules(modules),
 		copy_declarations = copy_declarations,
 		known_functions = core_known_functions(copy_declarations, program)
 	}

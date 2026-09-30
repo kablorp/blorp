@@ -1,0 +1,211 @@
+import:
+	../../../src/compiler/stage_02_lex/name_table: SYNTHESIZED_NAME_TABLE
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(StdlibModule, UserModule),
+		resolved_module_identity_from_resolver,
+	../../../src/compiler/stage_04_modules/module_table:
+		ModuleId,
+		ModuleTable,
+		empty_module_table,
+		module_ids_equal,
+		module_table,
+		module_table_count,
+		module_table_id_at,
+	../../../src/compiler/stage_09_core/ir:
+		CoreProgram,
+		core_declaration_index,
+		core_empty_declaration_index,
+		CoreStandardModule(
+			BytesModule,
+			DictModule,
+			FixedModule,
+			FloatModule,
+			ListModule,
+			MatrixModule,
+			SetModule,
+			SliceModule,
+			StringModule,
+			VectorModule,
+		),
+		core_standard_module_id,
+		core_standard_modules,
+	../../../src/compiler/stage_09_core/early_pipeline: CoreEarlyPipelineConfiguration, early_core_lowering_passes
+	../../../src/compiler/stage_09_core/pass_runner:
+		CoreModuleTableCheck(SkipModuleTableCheck),
+		CorePassControl,
+		CorePassRun(CorePassesCompleted),
+		core_pass_state,
+		core_pass_state_carry_ids,
+		run_core_passes,
+	../../../src/compiler/stage_09_core/pipeline: prepared_core_program, prepared_core_program_module_table
+	test: TestSuite
+
+
+-- The compilation these tests stand in for: the user's `main` module first,
+-- then the standard-library `list` and `string` modules it imports.
+private MAIN_PATH: String = "main"
+
+private LIST_PATH: String = "list"
+
+private STRING_PATH: String = "string"
+
+private LIST_TABLE_INDEX: Int = 1
+
+private STRING_TABLE_INDEX: Int = 2
+
+private EXPECTED_MODULE_COUNT: Int = 3
+
+
+private pure func compilation_modules() -> ModuleTable:
+	match module_table([
+		resolved_module_identity_from_resolver(MAIN_PATH, UserModule),
+		resolved_module_identity_from_resolver(LIST_PATH, StdlibModule),
+		resolved_module_identity_from_resolver(STRING_PATH, StdlibModule),
+	]):
+		Ok(table):
+			table
+		Err(_):
+			empty_module_table()
+
+
+private pure func empty_program() -> CoreProgram:
+	{
+		decls = [],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+private pure func same_optional_id(id: Option[ModuleId], table: ModuleTable, index: Int) -> Bool:
+	match (id, module_table_id_at(table, index)):
+		(Some(found), Some(expected)):
+			module_ids_equal(found, expected)
+		_:
+			False
+
+
+pure func test_the_standard_modules_are_found_by_canonical_path_once() -> Bool:
+	table = compilation_modules()
+	standard = core_standard_modules(table)
+
+	(
+		same_optional_id(core_standard_module_id(standard, ListModule), table, LIST_TABLE_INDEX)
+		and same_optional_id(core_standard_module_id(standard, StringModule), table, STRING_TABLE_INDEX)
+		and core_standard_module_id(standard, VectorModule).is_none()
+		and core_standard_module_id(standard, FloatModule).is_none()
+		and core_standard_module_id(standard, SetModule).is_none()
+	)
+
+
+pure func test_a_standard_module_the_compilation_lacks_has_no_id() -> Bool:
+	standard = core_standard_modules(empty_module_table())
+
+	(
+		core_standard_module_id(standard, ListModule).is_none()
+		and core_standard_module_id(standard, StringModule).is_none()
+		and core_standard_module_id(standard, VectorModule).is_none()
+		and core_standard_module_id(standard, MatrixModule).is_none()
+		and core_standard_module_id(standard, FloatModule).is_none()
+		and core_standard_module_id(standard, FixedModule).is_none()
+		and core_standard_module_id(standard, SliceModule).is_none()
+		and core_standard_module_id(standard, BytesModule).is_none()
+		and core_standard_module_id(standard, SetModule).is_none()
+		and core_standard_module_id(standard, DictModule).is_none()
+	)
+
+
+pure func test_a_user_module_named_like_a_standard_module_is_not_it() -> Bool:
+	match module_table([
+		resolved_module_identity_from_resolver(LIST_PATH, UserModule),
+		resolved_module_identity_from_resolver(STRING_PATH, StdlibModule),
+	]):
+		Ok(table):
+			standard = core_standard_modules(table)
+			core_standard_module_id(standard, ListModule).is_none() and core_standard_module_id(standard, StringModule).is_some()
+		Err(_):
+			False
+
+
+---
+The early passes through mono, run from a state that holds the compilation's
+table: the index mono records is built from that table, not from the empty one a
+plain `core_pass_state` starts with (which would make every standard-module
+lookup silently miss).
+---
+func test_mono_builds_the_declaration_index_from_the_state_table() -> Bool:
+	configuration: CoreEarlyPipelineConfiguration = {
+		debug = False,
+		check_invariants = False,
+		observations = [],
+		stop_after = None,
+		modules = SkipModuleTableCheck
+	}
+	control: CorePassControl = {
+		observe = [],
+		stop_after = None,
+		check_invariants = False,
+		record_timings = False,
+		modules = SkipModuleTableCheck
+	}
+	state = { core_pass_state(empty_program(), 0) | modules = compilation_modules() }
+
+	match run_core_passes(early_core_lowering_passes(configuration), state, control):
+		CorePassesCompleted(completed, _, _):
+			(
+				module_table_count(completed.declaration_index.modules) == EXPECTED_MODULE_COUNT
+				and core_standard_module_id(completed.declaration_index.standard_modules, ListModule).is_some()
+			)
+		_:
+			False
+
+
+pure func test_the_declaration_index_carries_the_compilation_table() -> Bool:
+	index = core_declaration_index(SYNTHESIZED_NAME_TABLE, compilation_modules(), empty_program())
+
+	(
+		module_table_count(index.modules) == EXPECTED_MODULE_COUNT
+		and core_standard_module_id(index.standard_modules, ListModule).is_some()
+		and core_standard_module_id(index.standard_modules, StringModule).is_some()
+		and core_standard_module_id(index.standard_modules, DictModule).is_none()
+	)
+
+
+pure func test_the_empty_declaration_index_has_no_modules() -> Bool:
+	index = core_empty_declaration_index()
+
+	(
+		module_table_count(index.modules) == 0
+		and core_standard_module_id(index.standard_modules, ListModule).is_none()
+		and core_standard_module_id(index.standard_modules, StringModule).is_none()
+	)
+
+
+pure func test_a_pass_state_starts_with_no_modules_and_carries_its_table() -> Bool:
+	fresh = core_pass_state(empty_program(), 0)
+	threaded = { core_pass_state(empty_program(), 0) | modules = compilation_modules() }
+	carried = core_pass_state_carry_ids(threaded, empty_program(), 0)
+
+	(
+		module_table_count(fresh.modules) == 0
+		and module_table_count(threaded.modules) == EXPECTED_MODULE_COUNT
+		and module_table_count(carried.modules) == EXPECTED_MODULE_COUNT
+	)
+
+
+pure func test_a_prepared_program_built_outside_a_compilation_has_an_empty_table() -> Bool:
+	module_table_count(prepared_core_program_module_table(prepared_core_program(empty_program()))) == 0
+
+
+tests: TestSuite = {
+	description = "Core module table threading",
+	tests = [
+		("standard modules by path", test_the_standard_modules_are_found_by_canonical_path_once),
+		("absent standard modules", test_a_standard_module_the_compilation_lacks_has_no_id),
+		("user module is not stdlib", test_a_user_module_named_like_a_standard_module_is_not_it),
+		("mono index uses the state table", test_mono_builds_the_declaration_index_from_the_state_table),
+		("index carries table", test_the_declaration_index_carries_the_compilation_table),
+		("empty index", test_the_empty_declaration_index_has_no_modules),
+		("pass state carries table", test_a_pass_state_starts_with_no_modules_and_carries_its_table),
+		("prepared program table", test_a_prepared_program_built_outside_a_compilation_has_an_empty_table),
+	]
+}

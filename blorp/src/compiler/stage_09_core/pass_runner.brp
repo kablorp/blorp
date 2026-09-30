@@ -7,6 +7,7 @@
 import:
 	../stage_10_backend/c_naming: projected_temporary_spelling
 	../stage_02_lex/name_table: EMPTY_NAME_TABLE, NameTable, name_spelling_of_text
+	../stage_04_modules/module_table: ModuleTable, empty_module_table
 	early_invariants:
 		CoreEarlyInvariantViolation,
 		core_early_invariant_hint,
@@ -67,7 +68,7 @@ import:
 	memory: same_object
 	mono_specialize: CoreMonoDiagnostic, core_mono_diagnostic_hint, core_mono_diagnostic_message
 	origin_name_agreement:
-		ModuleCheckScope,
+		ModuleCheckScope(CheckAgainstModuleTable, CheckWithoutModuleTable),
 		origin_name_agreement,
 		origin_name_agreement_summary,
 	ownership_contracts: OwnershipContractFacts, empty_ownership_contract_facts
@@ -117,6 +118,11 @@ boundary reaches its spelling through it (`name_spelling_or_text`). Plain
 `core_pass_state` starts from `EMPTY_NAME_TABLE`, and
 `core_pass_state_carry_ids` carries `base.names` forward.
 
+`modules` is the compilation's module table, read-only like `names`: the
+`ModuleId` a function's `CoreFunction.module` holds indexes it. Plain
+`core_pass_state` starts from `empty_module_table()` (a state built outside a
+compilation), and `core_pass_state_carry_ids` carries `base.modules` forward.
+
 `declaration_index` is the `core_declaration_index` of the program right after
 mono, computed once and read-only after that. It answers, for the passes that ask
 which source declaration a function is or copies, and which standard-library
@@ -139,6 +145,7 @@ record CorePassState {
 	ownership_contract_facts: OwnershipContractFacts,
 	next_binder_id: Int,
 	names: NameTable,
+	modules: ModuleTable,
 	declaration_index: CoreDeclarationIndex
 }
 
@@ -205,10 +212,20 @@ record CorePassControl {
 	stop_after: Option[String],
 	check_invariants: Bool,
 	record_timings: Bool,
-	-- The compilation's module table, for the invariants only (no pass reads
-	-- it): reachable for the early passes, absent for the late ones.
-	modules: ModuleCheckScope
+	modules: CoreModuleTableCheck
 }
+
+
+---
+Whether the origin agreement invariant checks each function's module id against
+`CorePassState.modules`. The table is threaded through every pass state, but
+only the early passes run with a table that agrees with the ids (a test that
+builds Core by hand mints ids from one-row tables of its own), so a late list
+skips the table rules and applies the table-free ones alone.
+---
+enum CoreModuleTableCheck:
+	CheckStateModuleTable
+	SkipModuleTableCheck
 
 
 record CorePassObservation {
@@ -1128,8 +1145,21 @@ pure func core_pass_state(program: CoreProgram, next_def_id: Int) -> CorePassSta
 		ownership_contract_facts = empty_ownership_contract_facts(),
 		next_binder_id = FIRST_MINTED_BINDER_ID,
 		names = EMPTY_NAME_TABLE,
+		modules = empty_module_table(),
 		declaration_index = core_empty_declaration_index()
 	}
+
+
+---
+The agreement invariant's view of the module table for one state: the state's own
+table when the list checks it, none when the list skips the table rules.
+---
+private pure func module_check_scope(check: CoreModuleTableCheck, modules: ModuleTable) -> ModuleCheckScope:
+	match check:
+		CheckStateModuleTable:
+			CheckAgainstModuleTable(modules)
+		SkipModuleTableCheck:
+			CheckWithoutModuleTable
 
 
 --- Same as `core_pass_state`, but carries the node id allocator forward
@@ -1149,6 +1179,7 @@ pure func core_pass_state_carry_ids(
 		minted_origins = base.minted_origins,
 		next_binder_id = base.next_binder_id,
 		names = base.names,
+		modules = base.modules,
 		declaration_index = base.declaration_index
 	}
 
@@ -1297,7 +1328,7 @@ func run_core_passes(
 															current.declaration_index,
 															pass.name,
 															current.program,
-															control.modules,
+															module_check_scope(control.modules, current.modules),
 														):
 															Some(diagnostic):
 																Some(diagnostic)
