@@ -1,0 +1,607 @@
+-- The module walker: discovery's only loop over modules.
+--
+-- Roots are loaded in the order given, then every import in the order its
+-- module was loaded and, within a module, in source order (breadth first).
+-- A module is loaded once per canonical path, whichever request reaches it
+-- first, so ids depend only on the roots and the sources, never on the order
+-- in which a provider happens to answer. An import that resolves to no source
+-- is recorded as a diagnostic row and discovery goes on.
+import:
+	declaration_parser: parse_module_declarations
+	discovery_builder:
+		DiscoveryBuilder,
+		ImportId,
+		ImportRow,
+		ModuleId,
+		ModuleRow,
+		NameId,
+		PackageId,
+		PathId,
+		RootId,
+		SourceId,
+		append_diagnostic_argument,
+		append_import_target,
+		append_module,
+		append_module_package,
+		append_name,
+		append_package,
+		append_plain_resolution_diagnostic,
+		append_resolution_diagnostic_with_argument,
+		append_root,
+		append_root_diagnostic,
+		append_root_target,
+		empty_discovery_builder,
+		find_module_by_path,
+		find_name_id,
+		find_path_id,
+		import_id_at_row,
+		import_id_index,
+		module_id_at_row,
+		module_id_index,
+		name_id_index,
+		next_diagnostic_argument_row,
+		next_module_id,
+		next_name_id,
+		next_package_id,
+		next_root_id,
+		next_source_id,
+		package_id_at_row,
+		path_id_index,
+		replace_module_row,
+	discovery_diagnostic_code:
+		DiscoveryDiagnosticCode(
+			SourceTooLargeDiagnostic,
+			TooManySourcesDiagnostic,
+			UnreadableSourceDiagnostic,
+			UnresolvedImportDiagnostic,
+			UnresolvedRootDiagnostic,
+		),
+	frontend_tables: FreezeOutcome, freeze
+	lexer: lex_source
+	row_kinds: ModuleReach(ImportedModule, RootModule), PackageKind(NativePackage)
+	source_admission:
+		SourceRejection(SourceTooLargeToSpan, TooManySourcesToSpan),
+		admit_source,
+		intern_path,
+		interned_path_id,
+		source_rejection,
+	source_provider:
+		ImportRequest,
+		ImportRequester,
+		PackageMembership(InNativePackage, NotInPackage),
+		SourceCandidate,
+		SourceLookupRoots,
+		SourceProvider,
+		SourceRead(SourceText, SourceUnreadable),
+		import_candidates,
+		read_source,
+		root_candidate,
+		source_exists,
+	span: Span, pack_span
+
+
+---
+An import waiting to be resolved, with the facts of the module it came
+from.
+---
+private record PendingImport {
+	import_id: ImportId,
+	request: ImportRequest
+}
+
+
+---
+Where a module came from, for its module row and for resolving its imports.
+---
+private record LoadedModuleFacts {
+	candidate: SourceCandidate,
+	reach: ModuleReach
+}
+
+
+---
+Discovers every module reachable from `roots` (source paths) through
+`provider`, then freezes the tables.
+---
+func discover[Provider:SourceProvider](
+	provider: Provider,
+	lookup: SourceLookupRoots,
+	roots: List[String],
+) -> FreezeOutcome:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	var pending: List[PendingImport] = []
+
+	for root_path in roots:
+		root: RootId = next_root_id(builder)
+		candidate: SourceCandidate = root_candidate(root_path)
+		request_path: PathId = interned_path_id(builder, root_path)
+		builder = intern_path(builder, root_path)
+		builder = append_root(builder, {request_path = request_path})
+
+		if (
+			loaded_module_at(builder, candidate.path).is_some()
+			or provider.source_exists(candidate.path)
+		):
+			modules_before: Int = builder.modules.length()
+			builder = load_or_reuse(provider, builder, candidate, RootModule, RequestedByRoot(root))
+			pending = pending.concat(newly_loaded_imports(builder, modules_before, candidate))
+		else:
+			builder = report_root(builder, root, UnresolvedRootDiagnostic)
+
+	var next_pending: Int = 0
+
+	while next_pending < pending.length():
+		match pending.get(next_pending):
+			Some(entry):
+				match resolve_import(provider, lookup, builder, entry.request):
+					Some(candidate):
+						modules_before: Int = builder.modules.length()
+						builder = load_or_reuse(
+							provider,
+							builder,
+							candidate,
+							ImportedModule,
+							RequestedByImport(entry.import_id),
+						)
+						pending = pending.concat(
+							newly_loaded_imports(
+								builder,
+								modules_before,
+								candidate,
+							),
+						)
+					None:
+						builder = report_import(
+							builder,
+							entry.import_id,
+							UnresolvedImportDiagnostic,
+						)
+			None:
+				void
+
+		next_pending += 1
+
+	freeze(builder)
+
+
+---
+What asked for a module: a root or an import. Its target or diagnostic
+row is recorded against it.
+---
+private union ModuleRequester:
+	RequestedByRoot(RootId)
+	RequestedByImport(ImportId)
+
+
+---
+Loads `candidate` for `requester` unless a module was already loaded from
+its path, and records the module as the requester's target; a source that
+cannot be read or admitted is reported against the requester instead.
+---
+private func load_or_reuse[Provider:SourceProvider](
+	provider: Provider,
+	builder: DiscoveryBuilder,
+	candidate: SourceCandidate,
+	reach: ModuleReach,
+	requester: ModuleRequester,
+) -> DiscoveryBuilder:
+	match loaded_module_at(builder, candidate.path):
+		Some(module):
+			record_target(builder, requester, module)
+		None:
+			match provider.read_source(candidate.path):
+				SourceText(text):
+					match source_rejection(builder, text.length()):
+						Some(rejection):
+							report_rejected(builder, requester, rejection, text.length())
+						None:
+							module: ModuleId = next_module_id(builder)
+							loaded: DiscoveryBuilder = load_module(builder, candidate, reach, text)
+							record_target(loaded, requester, module)
+				SourceUnreadable:
+					report_requester(builder, requester, UnreadableSourceDiagnostic)
+
+
+---
+The import requests of the module `load_or_reuse` loaded, if it loaded one
+(the module count grew past `modules_before`).
+---
+private pure func newly_loaded_imports(
+	builder: DiscoveryBuilder,
+	modules_before: Int,
+	candidate: SourceCandidate,
+) -> List[PendingImport]:
+	if builder.modules.length() > modules_before:
+		module_import_requests(builder, module_id_at_row(modules_before), candidate)
+	else:
+		[]
+
+
+private pure func record_target(
+	builder: DiscoveryBuilder,
+	requester: ModuleRequester,
+	module: ModuleId,
+) -> DiscoveryBuilder:
+	match requester:
+		RequestedByRoot(root):
+			append_root_target(
+				builder,
+				{
+					root = root,
+					target = module
+				},
+			)
+		RequestedByImport(import_id):
+			append_import_target(
+				builder,
+				{
+					owner_import = import_id,
+					target = module
+				},
+			)
+
+
+private pure func report_requester(
+	builder: DiscoveryBuilder,
+	requester: ModuleRequester,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	match requester:
+		RequestedByRoot(root):
+			report_root(builder, root, code)
+		RequestedByImport(import_id):
+			report_import(builder, import_id, code)
+
+
+private pure func report_rejected(
+	builder: DiscoveryBuilder,
+	requester: ModuleRequester,
+	rejection: SourceRejection,
+	byte_length: Int,
+) -> DiscoveryBuilder:
+	match requester:
+		RequestedByRoot(root):
+			report_rejected_root(builder, root, rejection, byte_length)
+		RequestedByImport(import_id):
+			report_rejected_import(builder, import_id, rejection, byte_length)
+
+
+---
+The module already loaded from `path`, if any.
+---
+private pure func loaded_module_at(builder: DiscoveryBuilder, path: String) -> Option[ModuleId]:
+	match find_path_id(builder, path):
+		Some(path_id):
+			find_module_by_path(builder, path_id)
+		None:
+			None
+
+
+---
+The first candidate for `request` that `provider` has.
+---
+private func resolve_import[Provider:SourceProvider](
+	provider: Provider,
+	lookup: SourceLookupRoots,
+	builder: DiscoveryBuilder,
+	request: ImportRequest,
+) -> Option[SourceCandidate]:
+	var found: Option[SourceCandidate] = None
+
+	for candidate in import_candidates(lookup, request):
+		if provider.source_exists(candidate.path):
+			found = Some(candidate)
+			break
+
+	found
+
+
+---
+Admits `text` as a new module at `candidate`, lexes it and parses it, and
+closes its row's ranges over the rows its parse appended.
+---
+pure func load_module(
+	builder: DiscoveryBuilder,
+	candidate: SourceCandidate,
+	reach: ModuleReach,
+	text: String,
+) -> DiscoveryBuilder:
+	module: ModuleId = next_module_id(builder)
+	source: SourceId = next_source_id(builder)
+	canonical_path: PathId = interned_path_id(builder, candidate.path)
+	definitions_first: Int = builder.definitions.length()
+	imports_first: Int = builder.imports.length()
+	nodes_first: Int = builder.nodes.length()
+	diagnostics_first: Int = builder.diagnostics.length()
+	var out: DiscoveryBuilder = admit_source(builder, candidate.path, text)
+	open_row: ModuleRow = {
+		source = source,
+		canonical_path = canonical_path,
+		origin = candidate.origin,
+		reach = reach,
+		definitions = {
+			first = definitions_first,
+			count = 0
+		},
+		imports = {
+			first = imports_first,
+			count = 0
+		},
+		nodes = {
+			first = nodes_first,
+			count = 0
+		},
+		diagnostics = {
+			first = diagnostics_first,
+			count = 0
+		}
+	}
+	out = append_module(out, open_row)
+	out = record_module_package(out, module, candidate.package)
+	out = lex_source(out, source)
+	out = parse_module_declarations(out, module)
+	definitions_end: Int = out.definitions.length()
+	imports_end: Int = out.imports.length()
+	nodes_end: Int = out.nodes.length()
+	diagnostics_end: Int = out.diagnostics.length()
+	closed_row: ModuleRow = { open_row |
+		definitions = {
+			first = definitions_first,
+			count = definitions_end - definitions_first
+		},
+		imports = {
+			first = imports_first,
+			count = imports_end - imports_first
+		},
+		nodes = {
+			first = nodes_first,
+			count = nodes_end - nodes_first
+		},
+		diagnostics = {
+			first = diagnostics_first,
+			count = diagnostics_end - diagnostics_first
+		}
+	}
+	out = replace_module_row(out, module, closed_row)
+	out
+
+
+---
+Records `module`'s package, adding the package row the first time a module
+of that package is loaded.
+---
+private pure func record_module_package(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	package: PackageMembership,
+) -> DiscoveryBuilder:
+	match package:
+		InNativePackage(name):
+			record_native_module_package(builder, module, name)
+		NotInPackage:
+			builder
+
+
+---
+Records that `module` belongs to the native package `name`. Each step is a
+helper that returns its builder unchanged when there is nothing to add
+(builder threading rule 1).
+---
+private pure func record_native_module_package(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	name: String,
+) -> DiscoveryBuilder:
+	package: PackageId = match existing_package(builder, name):
+		Some(existing):
+			existing
+		None:
+			next_package_id(builder)
+
+	with_package: DiscoveryBuilder = ensure_native_package(builder, name)
+	append_module_package(
+		with_package,
+		{
+			module = module,
+			package = package
+		},
+	)
+
+
+---
+Adds the package row for `name` unless one exists.
+---
+private pure func ensure_native_package(
+	builder: DiscoveryBuilder,
+	name: String,
+) -> DiscoveryBuilder:
+	if existing_package(builder, name).is_some():
+		builder
+	else:
+		package_name: NameId = match find_name_id(builder, name):
+			Some(existing_name):
+				existing_name
+			None:
+				next_name_id(builder)
+
+		with_name: DiscoveryBuilder = ensure_name(builder, name)
+		append_package(
+			with_name,
+			{
+				name = package_name,
+				kind = NativePackage
+			},
+		)
+
+
+---
+Interns `name` unless it is already interned.
+---
+private pure func ensure_name(builder: DiscoveryBuilder, name: String) -> DiscoveryBuilder:
+	if find_name_id(builder, name).is_some():
+		builder
+	else:
+		append_name(builder, name)
+
+
+---
+The package already recorded under `name`, if any.
+---
+private pure func existing_package(builder: DiscoveryBuilder, name: String) -> Option[PackageId]:
+	var found: Option[PackageId] = None
+	var row: Int = 0
+
+	for package in builder.packages:
+		if builder.name_spellings.get(name_id_index(package.name)) == Some(name):
+			found = Some(package_id_at_row(row))
+			break
+
+		row += 1
+
+	found
+
+
+---
+The import requests of `module`'s import rows, in source order.
+---
+private pure func module_import_requests(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	candidate: SourceCandidate,
+) -> List[PendingImport]:
+	var requests: List[PendingImport] = []
+
+	match builder.modules.get(module_id_index(module)):
+		Some(module_row):
+			requester: ImportRequester = {
+				canonical_path = candidate.path,
+				origin = candidate.origin,
+				package = candidate.package
+			}
+
+			for index in module_row.imports.first..module_row.imports.first + module_row.imports.count:
+				match builder.imports.get(index):
+					Some(import_row):
+						requests = requests.append({
+							import_id = import_id_at_row(index),
+							request = {
+								kind = import_row.request_kind,
+								text = builder.paths
+									.get(path_id_index(import_row.request_path))
+									.get_or(""),
+								parts = import_path_part_spellings(builder, import_row),
+								requester = requester
+							},
+						})
+					None:
+						void
+		None:
+			void
+
+	requests
+
+
+private pure func import_path_part_spellings(
+	builder: DiscoveryBuilder,
+	import_row: ImportRow,
+) -> List[String]:
+	var parts: List[String] = []
+
+	for index in import_row.path_parts.first..import_row.path_parts.first + import_row.path_parts.count:
+		match builder.import_path_parts.get(index):
+			Some(part):
+				parts = parts.append(
+					builder.name_spellings
+						.get(name_id_index(part))
+						.get_or(""),
+				)
+			None:
+				void
+
+	parts
+
+
+-- Diagnostics.
+private pure func import_span(builder: DiscoveryBuilder, import_id: ImportId) -> Span:
+	match builder.imports.get(import_id_index(import_id)):
+		Some(import_row):
+			import_row.span
+		None:
+			pack_span(0, 0, 0)
+
+
+---
+Reports that `import_id` loaded no module, with its id as the argument.
+---
+private pure func report_import(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	span: Span = import_span(builder, import_id)
+	append_resolution_diagnostic_with_argument(builder, code, span, import_id_index(import_id))
+
+
+private pure func report_rejected_import(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+	rejection: SourceRejection,
+	byte_length: Int,
+) -> DiscoveryBuilder:
+	span: Span = import_span(builder, import_id)
+
+	match rejection:
+		SourceTooLargeToSpan:
+			append_resolution_diagnostic_with_argument(
+				builder,
+				SourceTooLargeDiagnostic,
+				span,
+				byte_length,
+			)
+		TooManySourcesToSpan:
+			append_plain_resolution_diagnostic(builder, TooManySourcesDiagnostic, span)
+
+
+private pure func report_root(
+	builder: DiscoveryBuilder,
+	root: RootId,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	arguments_first: Int = next_diagnostic_argument_row(builder)
+	append_root_diagnostic(
+		builder,
+		{
+			root = root,
+			code = code,
+			arguments = {
+				first = arguments_first,
+				count = 0
+			}
+		},
+	)
+
+
+private pure func report_rejected_root(
+	builder: DiscoveryBuilder,
+	root: RootId,
+	rejection: SourceRejection,
+	byte_length: Int,
+) -> DiscoveryBuilder:
+	match rejection:
+		SourceTooLargeToSpan:
+			arguments_first: Int = next_diagnostic_argument_row(builder)
+			var out: DiscoveryBuilder = append_diagnostic_argument(builder, byte_length)
+			out = append_root_diagnostic(
+				out,
+				{
+					root = root,
+					code = SourceTooLargeDiagnostic,
+					arguments = {
+						first = arguments_first,
+						count = 1
+					}
+				},
+			)
+			out
+		TooManySourcesToSpan:
+			report_root(builder, root, TooManySourcesDiagnostic)

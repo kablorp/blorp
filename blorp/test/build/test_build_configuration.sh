@@ -902,7 +902,7 @@ if ! grep -Fq 'BLORP_BUILD_VERSION: ${{ steps.release-meta.outputs.version }}' "
 	! grep -Fq '"display_name": "Quality"' <<<"$ubuntu_call" ||
 	! grep -Fq '"display_name": "Test — Compiler"' <<<"$ubuntu_call" ||
 	! grep -Fq '"display_name": "Test — Product"' <<<"$ubuntu_call" ||
-	! grep -Fq '"gates": "compiler-blorp"' <<<"$ubuntu_call" ||
+	! grep -Fq '"gates": "compiler-blorp compiler-new"' <<<"$ubuntu_call" ||
 	! grep -Fq '"gates": "runtime leak doctest cli lsp package"' <<<"$ubuntu_call" ||
 	! grep -Fq 'name: Linux ARM64' <<<"$arm_call" ||
 	! grep -Fq 'runner: ubuntu-24.04-arm' <<<"$arm_call" ||
@@ -933,7 +933,7 @@ then
 	exit 1
 fi
 if ! grep -Fq '"scope": "compiler-blorp"' <<<"$compiler_blorp_lane" ||
-	[ "$(grep -Fc '"gates": "compiler-blorp"' <<<"$compiler_blorp_lane")" -ne 1 ] ||
+	[ "$(grep -Fc '"gates": "compiler-blorp compiler-new"' <<<"$compiler_blorp_lane")" -ne 1 ] ||
 	[ "$(grep -Fc '"compiler_test_progress": 1' <<<"$compiler_blorp_lane")" -ne 1 ] ||
 	[ "$(grep -Fc '"run_rebuilt_cli": true' <<<"$compiler_blorp_lane")" -ne 1 ]
 then

@@ -1,0 +1,220 @@
+-- Body parser behaviour: each case parses one module and compares its body
+-- trees and diagnostics, then checks that the tables freeze with every
+-- invariant. The expectations were checked against the existing parser:
+-- every case it accepts is accepted here, and the malformed case reports the
+-- diagnostics it reports.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiscoveryBuilder,
+		empty_discovery_builder,
+	../../../src/compiler_new/stage_01_discovery/discovery_diagnostic_code: diagnostic_code_name
+	../../../src/compiler_new/stage_01_discovery/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		freeze,
+	../../../src/compiler_new/stage_01_discovery/module_walker: load_module
+	../../../src/compiler_new/stage_01_discovery/row_kinds:
+		ModuleOriginKind(UserModule),
+		ModuleReach(RootModule),
+	../../../src/compiler_new/stage_01_discovery/source_provider: PackageMembership(NotInPackage)
+	../../../src/compiler_new/stage_01_discovery/span: span_start
+	../support/body_dump: bodies_dump
+	test: TestSuite
+
+
+---
+`$` then `{`: spelled apart so the test sources can hold interpolation holes
+without opening one here.
+---
+INTERPOLATION_OPENER: String = "$" + "{"
+
+
+pure func parsed(text: String) -> DiscoveryBuilder:
+	load_module(
+		empty_discovery_builder(),
+		{
+			path = "case.brp",
+			origin = UserModule,
+			package = NotInPackage
+		},
+		RootModule,
+		text,
+	)
+
+
+---
+Whether `text` parses to the `expected` body trees and diagnostic lines and
+its tables freeze with every invariant.
+---
+pure func bodies_are(text: String, expected: List[String]) -> Bool:
+	builder: DiscoveryBuilder = parsed(text)
+	var lines: List[String] = bodies_dump(builder)
+
+	for row in builder.diagnostics:
+		lines = lines.append("diagnostic ${diagnostic_code_name(row.code)}@${span_start(row.span)}")
+
+	lines.join("\n") == expected.join("\n") and freezes_with_invariants(builder)
+
+
+pure func freezes_with_invariants(builder: DiscoveryBuilder) -> Bool:
+	match freeze(builder):
+		FrozenTables(_):
+			True
+		TableInvariantsViolated(_):
+			False
+
+
+pure func test_binary_operators_nest_by_precedence_and_as_applies_to_the_whole_expression() -> Bool:
+	bodies_are(
+		"func f(a, b, c, d, e, g):\n\tx = a + b * c == d and not e or g as Int\n\ty = -a..b % 2\n",
+		[
+			"f = (BlockNode (AssignmentNode x (AscriptionNode (OrNode (AndNode (EqualNode (AddNode (IdentifierNode a) (MultiplyNode (IdentifierNode b) (IdentifierNode c))) (IdentifierNode d)) (NotNode (IdentifierNode e))) (IdentifierNode g)) (NamedTypeNode Int))) (AssignmentNode y (RangeNode (NegateNode (IdentifierNode a)) (ModuloNode (IdentifierNode b) (IntegerLiteralNode \"2\")))))",
+		],
+	)
+
+
+pure func test_postfix_chains_calls_lambdas_and_leading_dot_continuations() -> Bool:
+	bodies_are(
+		"func f(xs, d):\n\ta = xs.map(func(x): x + 1).filter(pure func(x: Int) -> Bool: x > 0)[0]\n\tb = d\n\t\t.get(\"k\")\n\t\t.get_or(0)\n\tc = xs.length() + d\n\t\t.size()\n\tc\n",
+		[
+			"f = (BlockNode (AssignmentNode a (SubscriptNode (CallNode (FieldAccessNode filter (CallNode (FieldAccessNode map (IdentifierNode xs)) (LambdaNode (LambdaParameterNode x) (AddNode (IdentifierNode x) (IntegerLiteralNode \"1\"))))) (PureLambdaNode (LambdaParameterNode x (NamedTypeNode Int)) (NamedTypeNode Bool) (GreaterNode (IdentifierNode x) (IntegerLiteralNode \"0\")))) (IntegerLiteralNode \"0\"))) (AssignmentNode b (CallNode (FieldAccessNode get_or (CallNode (FieldAccessNode get (IdentifierNode d)) (StringLiteralNode \"k\"))) (IntegerLiteralNode \"0\"))) (AssignmentNode c (AddNode (CallNode (FieldAccessNode length (IdentifierNode xs))) (CallNode (FieldAccessNode size (IdentifierNode d))))) (IdentifierNode c))",
+		],
+	)
+
+
+pure func test_statements_bind_assign_and_destructure() -> Bool:
+	bodies_are(
+		"func f(xs):\n\tvar total: Int = 0\n\tlimit: Int = 10\n\ttotal += 1\n\ttotal -= 2\n\ttotal *= 3\n\ttotal /= 4\n\titem ?= xs.first()\n\ttyped: Int ?= xs.last()\n\txs[0] = 5\n\t(a, _) = pair\n\tvar later =\n\t\tcompute()\n\ttotal\n",
+		[
+			"f = (BlockNode (VarDeclarationNode total (NamedTypeNode Int) (IntegerLiteralNode \"0\")) (TypedBindingNode limit (NamedTypeNode Int) (IntegerLiteralNode \"10\")) (AddAssignNode total (IntegerLiteralNode \"1\")) (SubtractAssignNode total (IntegerLiteralNode \"2\")) (MultiplyAssignNode total (IntegerLiteralNode \"3\")) (DivideAssignNode total (IntegerLiteralNode \"4\")) (QuestionBindNode item (CallNode (FieldAccessNode first (IdentifierNode xs)))) (QuestionBindNode typed (NamedTypeNode Int) (CallNode (FieldAccessNode last (IdentifierNode xs)))) (SubscriptAssignmentNode (SubscriptNode (IdentifierNode xs) (IntegerLiteralNode \"0\")) (IntegerLiteralNode \"5\")) (TupleDestructureNode (DestructureBinderNode a) (DestructureBinderNode _) (IdentifierNode pair)) (VarDeclarationNode later (CallNode (IdentifierNode compute))) (IdentifierNode total))",
+		],
+	)
+
+
+pure func test_control_flow_constructs_and_match_patterns() -> Bool:
+	bodies_are(
+		"func f(xs, ch, n):\n\tif n > 0:\n\t\t1\n\telse if n < 0:\n\t\t2\n\telse:\n\t\t3\n\twhile n > 0:\n\t\tbreak\n\tfor (i, x) in xs:\n\t\tcontinue\n\tmatch n:\n\t\t0 | 1:\n\t\t\t\"small\"\n\t\tShape.Circle(r):\n\t\t\tr\n\t\tSome([first, ...rest]):\n\t\t\tfirst\n\t\t(a, -1):\n\t\t\ta\n\t\t_: \"other\"\n\tselect:\n\t\tmsg from ch:\n\t\t\tmsg\n\t\tsealed ch:\n\t\t\t0\n\t\t_ after 5:\n\t\t\t1\n\twith file ?= open(\"x\") on e => wrap(e):\n\t\tfile.read()\n\tconcurrent(limit: 2):\n\t\twork()\n\tfor item in xs concurrently(limit: 4):\n\t\titem\n\tdebug:\n\t\tlog(n)\n",
+		[
+			"f = (BlockNode (IfNode (GreaterNode (IdentifierNode n) (IntegerLiteralNode \"0\")) (BlockNode (IntegerLiteralNode \"1\")) (IfNode (LessNode (IdentifierNode n) (IntegerLiteralNode \"0\")) (BlockNode (IntegerLiteralNode \"2\")) (BlockNode (IntegerLiteralNode \"3\")))) (WhileNode (GreaterNode (IdentifierNode n) (IntegerLiteralNode \"0\")) (BlockNode (BreakNode))) (ForNode (TupleLoopBinderNode (LoopBinderNode i) (LoopBinderNode x)) (IdentifierNode xs) (BlockNode (ContinueNode))) (MatchNode (IdentifierNode n) (MatchCaseNode (OrPatternNode (IntegerPatternNode \"0\") (IntegerPatternNode \"1\")) (BlockNode (StringLiteralNode \"small\"))) (MatchCaseNode (QualifiedConstructorPatternNode Circle (PatternQualifierNode Shape) (NamePatternNode r)) (BlockNode (IdentifierNode r))) (MatchCaseNode (ConstructorPatternNode Some (ListPatternNode (NamePatternNode first) (ListSpreadNameNode rest))) (BlockNode (IdentifierNode first))) (MatchCaseNode (TuplePatternNode (NamePatternNode a) (NegativeIntegerPatternNode \"1\")) (BlockNode (IdentifierNode a))) (MatchCaseNode (WildcardPatternNode) (StringLiteralNode \"other\"))) (SelectNode (SelectReceiveArmNode msg (IdentifierNode ch) (BlockNode (IdentifierNode msg))) (SelectSealedArmNode (IdentifierNode ch) (BlockNode (IntegerLiteralNode \"0\"))) (SelectAfterArmNode (IntegerLiteralNode \"5\") (BlockNode (IntegerLiteralNode \"1\")))) (WithNode (WithTryBindingNode file (CallNode (IdentifierNode open) (StringLiteralNode \"x\")) (WithErrorMapNode e (CallNode (IdentifierNode wrap) (IdentifierNode e)))) (BlockNode (CallNode (FieldAccessNode read (IdentifierNode file))))) (ConcurrentBlockNode (ConcurrentParameterNode limit (IntegerLiteralNode \"2\")) (BlockNode (CallNode (IdentifierNode work)))) (ConcurrentForNode (LoopBinderNode item) (IdentifierNode xs) (ConcurrentParameterNode limit (IntegerLiteralNode \"4\")) (BlockNode (IdentifierNode item))) (DebugBlockNode (BlockNode (CallNode (IdentifierNode log) (IdentifierNode n)))))",
+		],
+	)
+
+
+pure func test_literals_brackets_conversions_builtins_and_interpolation() -> Bool:
+	bodies_are(
+		"func f(r, k, v):\n\tl = [1, 2.5, \"s\", 'c', True, False]\n\tt = (1, 2)\n\tg = (1)\n\trec = {name = \"n\", age = 3}\n\tup = {r | age = 4}\n\td = {k => v, \"a\" => 1}\n\tvec = {1, 2}\n\tempty = {}\n\tu = ()\n\to = into_opaque Email(v)\n\tp = from_opaque Email(o)\n\ts = \"a " + INTERPOLATION_OPENER + "k + 1} b " + INTERPOLATION_OPENER + "v.name}\"\n\tq = raw\"x\\y\"\n\tvoid\n\n\nfunc g() -> Int: builtin(\"helper\")\n\n\nfunc h(): builtin\n",
+		[
+			"f = (BlockNode (AssignmentNode l (ListLiteralNode (IntegerLiteralNode \"1\") (FloatLiteralNode \"2.5\") (StringLiteralNode \"s\") (CharLiteralNode '99') (TrueLiteralNode) (FalseLiteralNode))) (AssignmentNode t (TupleNode (IntegerLiteralNode \"1\") (IntegerLiteralNode \"2\"))) (AssignmentNode g (IntegerLiteralNode \"1\")) (AssignmentNode rec (RecordLiteralNode (RecordFieldNode name (StringLiteralNode \"n\")) (RecordFieldNode age (IntegerLiteralNode \"3\")))) (AssignmentNode up (RecordUpdateNode (IdentifierNode r) (RecordFieldNode age (IntegerLiteralNode \"4\")))) (AssignmentNode d (DictLiteralNode (DictEntryNode (IdentifierNode k) (IdentifierNode v)) (DictEntryNode (StringLiteralNode \"a\") (IntegerLiteralNode \"1\")))) (AssignmentNode vec (VectorLiteralNode (IntegerLiteralNode \"1\") (IntegerLiteralNode \"2\"))) (AssignmentNode empty (RecordLiteralNode)) (AssignmentNode u (VoidNode)) (AssignmentNode o (IntoOpaqueNode (NamedTypeNode Email) (IdentifierNode v))) (AssignmentNode p (FromOpaqueNode (NamedTypeNode Email) (IdentifierNode o))) (AssignmentNode s (InterpolatedStringNode (InterpolationTextNode \"a \") (AddNode (IdentifierNode k) (IntegerLiteralNode \"1\")) (InterpolationTextNode \" b \") (FieldAccessNode name (IdentifierNode v)))) (AssignmentNode q (RawStringLiteralNode \"x\\y\")) (VoidNode))",
+			"g = (NamedBuiltinNode \"helper\")",
+			"h = (BuiltinNode)",
+		],
+	)
+
+
+pure func test_lambda_blocks_and_anchored_if_and_match_values() -> Bool:
+	bodies_are(
+		"func f(xs, n):\n\ttotal = xs.fold(0, func(acc, x):\n\t\tnext = acc + x\n\t\tnext\n\t)\n\tpick = if n > 0:\n\t\t\"positive\"\n\telse:\n\t\t\"other\"\n\tkind = match n:\n\t\t0: \"zero\"\n\t\t_: if n > 10:\n\t\t\t\"big\"\n\t\telse:\n\t\t\t\"small\"\n\ttotal\n",
+		[
+			"f = (BlockNode (AssignmentNode total (CallNode (FieldAccessNode fold (IdentifierNode xs)) (IntegerLiteralNode \"0\") (LambdaNode (LambdaParameterNode acc) (LambdaParameterNode x) (BlockNode (AssignmentNode next (AddNode (IdentifierNode acc) (IdentifierNode x))) (IdentifierNode next))))) (AssignmentNode pick (IfNode (GreaterNode (IdentifierNode n) (IntegerLiteralNode \"0\")) (BlockNode (StringLiteralNode \"positive\")) (BlockNode (StringLiteralNode \"other\")))) (AssignmentNode kind (MatchNode (IdentifierNode n) (MatchCaseNode (IntegerPatternNode \"0\") (StringLiteralNode \"zero\")) (MatchCaseNode (WildcardPatternNode) (IfNode (GreaterNode (IdentifierNode n) (IntegerLiteralNode \"10\")) (BlockNode (StringLiteralNode \"big\")) (BlockNode (StringLiteralNode \"small\")))))) (IdentifierNode total))",
+		],
+	)
+
+
+pure func test_interpolation_holes_are_parsed_as_nested_expressions() -> Bool:
+	bodies_are(
+		"func f(user, items):\n\ta = \"name: " + INTERPOLATION_OPENER + "user.name}, count: " + INTERPOLATION_OPENER + "items.length() + 1}, nested: " + INTERPOLATION_OPENER + "\"" + INTERPOLATION_OPENER + "user.id}\"}\"\n\tb = \"{kept} tab\\t" + INTERPOLATION_OPENER + "user}\\{\"\n\tc =\n\t\t|first " + INTERPOLATION_OPENER + "user}\n\t\t||second " + INTERPOLATION_OPENER + "items}!\n\ta\n",
+		[
+			"f = (BlockNode (AssignmentNode a (InterpolatedStringNode (InterpolationTextNode \"name: \") (FieldAccessNode name (IdentifierNode user)) (InterpolationTextNode \", count: \") (AddNode (CallNode (FieldAccessNode length (IdentifierNode items))) (IntegerLiteralNode \"1\")) (InterpolationTextNode \", nested: \") (InterpolatedStringNode (FieldAccessNode id (IdentifierNode user))))) (AssignmentNode b (InterpolatedStringNode (InterpolationTextNode \"{kept} tab\t\") (IdentifierNode user) (InterpolationTextNode \"{\"))) (AssignmentNode c (InterpolatedPipeStringNode (InterpolationTextNode \"first \") (IdentifierNode user) (InterpolationTextNode \"",
+			"|second \") (IdentifierNode items) (InterpolationTextNode \"!\"))) (IdentifierNode a))",
+		],
+	)
+
+
+pure func test_local_functions_global_values_and_trait_default_bodies_get_body_rows() -> Bool:
+	bodies_are(
+		"func outer(n):\n\tpure func inner(x: Int) -> Int:\n\t\tx * 2\n\tfunc other(y):\n\t\ty\n\tinner(n) + other(n)\n\n\nlimit: Int = 3 + 4\n\n\ntrait Show:\n\tfunc show(x: Self) -> String:\n\t\t\"shown\"\n",
+		[
+			"inner = (BlockNode (MultiplyNode (IdentifierNode x) (IntegerLiteralNode \"2\")))",
+			"other = (BlockNode (IdentifierNode y))",
+			(
+				"outer = (BlockNode (LocalFunctionNode def1) (LocalFunctionNode def2) (AddNode "
+				+ "(CallNode (IdentifierNode inner) (IdentifierNode n)) (CallNode (IdentifierNode "
+				+ "other) (IdentifierNode n))))"
+			),
+			"limit = (AddNode (IntegerLiteralNode \"3\") (IntegerLiteralNode \"4\"))",
+			"show = (BlockNode (StringLiteralNode \"shown\"))",
+		],
+	)
+
+
+pure func test_named_arguments_are_assignments_inside_a_call() -> Bool:
+	bodies_are(
+		"func g(xs):\n\tf(a = 1, xs)\n",
+		[
+			"g = (BlockNode (CallNode (IdentifierNode f) (AssignmentNode a (IntegerLiteralNode \"1\")) (IdentifierNode xs)))",
+		],
+	)
+
+
+pure func test_malformed_bodies_are_reported_with_coded_diagnostics() -> Bool:
+	bodies_are(
+		"func f(x):\n\ta = )\n\tb = into Email(x)\n\tc = from Email(x)\n\t_ ?= x\n\tx.field = 1\n\ts = \"" + INTERPOLATION_OPENER + "a b}\"\n\tmatch x:\n\t\t-foo: 1\n\twith a = x, b = x:\n\t\ta\n",
+		[
+			"f = (BlockNode (AssignmentNode a (MissingExpressionNode)) (MissingExpressionNode) (MissingExpressionNode) (AssignmentNode b (IntoOpaqueNode (NamedTypeNode Email) (IdentifierNode x))) (AssignmentNode c (FromOpaqueNode (NamedTypeNode Email) (IdentifierNode x))) (QuestionBindNode _ (IdentifierNode x)) (MissingExpressionNode (FieldAccessNode field (IdentifierNode x)) (IntegerLiteralNode \"1\")) (AssignmentNode s (InterpolatedStringNode (IdentifierNode a))) (MatchNode (IdentifierNode x) (MatchCaseNode (MissingPatternNode) (IdentifierNode foo)) (MatchCaseNode (MissingPatternNode) (IntegerLiteralNode \"1\"))) (WithNode (WithBindingNode a (IdentifierNode x)) (BlockNode (IdentifierNode a))))",
+			"diagnostic ExpectedExpressionDiagnostic@16",
+			"diagnostic ExpectedExpressionDiagnostic@16",
+			"diagnostic ExpectedExpressionDiagnostic@19",
+			"diagnostic RemovedIntoConversionDiagnostic@23",
+			"diagnostic RemovedFromConversionDiagnostic@42",
+			"diagnostic DiscardedQuestionBindDiagnostic@57",
+			"diagnostic FieldAssignmentDiagnostic@65",
+			"diagnostic InterpolationHoleNotExpressionDiagnostic@87",
+			"diagnostic ExpectedNumberAfterMinusDiagnostic@103",
+			"diagnostic ExpectedColonDiagnostic@104",
+			"diagnostic ExpectedPatternDiagnostic@107",
+			"diagnostic WithMultipleBindingsDiagnostic@122",
+		],
+	)
+
+
+tests: TestSuite = {
+	description = "Discovery body parser",
+	tests = [
+		(
+			"binary operators nest by precedence and as applies to the whole expression",
+			test_binary_operators_nest_by_precedence_and_as_applies_to_the_whole_expression,
+		),
+		(
+			"postfix chains calls lambdas and leading dot continuations",
+			test_postfix_chains_calls_lambdas_and_leading_dot_continuations,
+		),
+		("statements bind assign and destructure", test_statements_bind_assign_and_destructure),
+		(
+			"control flow constructs and match patterns",
+			test_control_flow_constructs_and_match_patterns,
+		),
+		(
+			"literals brackets conversions builtins and interpolation",
+			test_literals_brackets_conversions_builtins_and_interpolation,
+		),
+		(
+			"lambda blocks and anchored if and match values",
+			test_lambda_blocks_and_anchored_if_and_match_values,
+		),
+		(
+			"interpolation holes are parsed as nested expressions",
+			test_interpolation_holes_are_parsed_as_nested_expressions,
+		),
+		(
+			"local functions global values and trait default bodies get body rows",
+			test_local_functions_global_values_and_trait_default_bodies_get_body_rows,
+		),
+		(
+			"named arguments are assignments inside a call",
+			test_named_arguments_are_assignments_inside_a_call,
+		),
+		(
+			"malformed bodies are reported with coded diagnostics",
+			test_malformed_bodies_are_reported_with_coded_diagnostics,
+		),
+	]
+}

@@ -1,0 +1,401 @@
+-- Token access for the discovery parser.
+--
+-- The parser reads the builder's transient token table through the builder's
+-- token cursor. Every routine here either reads (and returns a plain value)
+-- or takes the builder and returns it updated; parse routines read what they
+-- need into locals before handing the builder on.
+import:
+	discovery_builder:
+		DiscoveryBuilder,
+		NameId,
+		advance_token,
+		append_plain_diagnostic,
+		move_token_cursor,
+		name_id_at_row,
+	discovery_diagnostic_code:
+		DiscoveryDiagnosticCode(ExpectedNameDiagnostic, ReservedKeywordAsNameDiagnostic),
+	name_vocabulary: DISCARD_NAME_INDEX
+	span: Span, pack_span, span_source_index, span_start
+	token:
+		FIRST_KEYWORD_NAME_INDEX,
+		KEYWORD_KINDS_IN_SEEDED_ORDER,
+		NO_TOKEN_PAYLOAD,
+		Token,
+		TokenKind(
+			AfterKeyword,
+			ColonSymbol,
+			CommaSymbol,
+			ConcurrentKeyword,
+			ConcurrentlyKeyword,
+			DebugKeyword,
+			DedentToken,
+			EndOfFileToken,
+			IdentifierToken,
+			IndentToken,
+			LeftParenSymbol,
+			NewlineToken,
+			OnKeyword,
+			RightBracketSymbol,
+			RightParenSymbol,
+			SealedKeyword,
+			SelectKeyword,
+			UnderscoreSymbol,
+			WithKeyword,
+		),
+
+
+---
+The index of the empty spelling `""` in the seeded vocabulary: the name
+recorded where a required name is missing (a diagnostic row reports it).
+---
+EMPTY_NAME_INDEX: Int = 0
+
+
+---
+The token under the cursor. The lexer ends every token table with
+`EndOfFileToken` and the parser never moves past it, so the fallback is
+unreachable; it is an end-of-file token at the start of the source.
+---
+pure func current_token(builder: DiscoveryBuilder) -> Token:
+	match builder.tokens.get(builder.token_cursor):
+		Some(token):
+			token
+		None:
+			{
+				kind = EndOfFileToken,
+				span = pack_span(0, 0, 0),
+				payload = NO_TOKEN_PAYLOAD
+			}
+
+
+---
+The token at `index`; past the end of the table it is the end-of-file token
+at the start of the source, as for `current_token`.
+---
+pure func token_at(builder: DiscoveryBuilder, index: Int) -> Token:
+	match builder.tokens.get(index):
+		Some(token):
+			token
+		None:
+			{
+				kind = EndOfFileToken,
+				span = pack_span(0, 0, 0),
+				payload = NO_TOKEN_PAYLOAD
+			}
+
+
+pure func current_kind(builder: DiscoveryBuilder) -> TokenKind:
+	current_token(builder).kind
+
+
+pure func at(builder: DiscoveryBuilder, kind: TokenKind) -> Bool:
+	current_kind(builder) == kind
+
+
+pure func peek_kind(builder: DiscoveryBuilder, ahead: Int) -> TokenKind:
+	match builder.tokens.get(builder.token_cursor + ahead):
+		Some(token):
+			token.kind
+		None:
+			EndOfFileToken
+
+
+pure func current_span(builder: DiscoveryBuilder) -> Span:
+	current_token(builder).span
+
+
+---
+The span of the token before the cursor: the end of what was just parsed.
+---
+pure func previous_span(builder: DiscoveryBuilder) -> Span:
+	match builder.tokens.get(builder.token_cursor - 1):
+		Some(token):
+			token.span
+		None:
+			current_span(builder)
+
+
+---
+The span of the last token before the cursor that is not layout (a newline,
+indent or dedent): where a construct that ended in a block really ends.
+---
+pure func previous_content_span(builder: DiscoveryBuilder) -> Span:
+	var index: Int = builder.token_cursor - 1
+	var found: Span = current_span(builder)
+
+	while index >= 0:
+		match builder.tokens.get(index):
+			Some(token):
+				if (
+					token.kind != NewlineToken
+					and token.kind != IndentToken
+					and token.kind != DedentToken
+				):
+					found = token.span
+					break
+			None:
+				void
+
+		index -= 1
+
+	found
+
+
+---
+An empty span at the start of the current token, where a missing token is
+reported.
+---
+pure func span_before_current(builder: DiscoveryBuilder) -> Span:
+	span: Span = current_span(builder)
+	pack_span(span_source_index(span), span_start(span), span_start(span))
+
+
+---
+Whether the current token ends a block: a dedent or the end of the source.
+---
+pure func at_block_end(builder: DiscoveryBuilder) -> Bool:
+	kind: TokenKind = current_kind(builder)
+	kind == DedentToken or kind == EndOfFileToken
+
+
+---
+Whether the current token is a place error recovery stops at instead of
+skipping: the end of a line or block, or a delimiter that closes or
+separates the enclosing construct.
+---
+pure func at_soft_boundary(builder: DiscoveryBuilder) -> Bool:
+	match current_kind(builder):
+		EndOfFileToken | NewlineToken | DedentToken | ColonSymbol | CommaSymbol | LeftParenSymbol | RightBracketSymbol | RightParenSymbol:
+			True
+		_:
+			False
+
+
+---
+Advances past any newline tokens.
+---
+pure func skip_newlines(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	-- Scanned, then consumed in one update (builder threading rule 1).
+	end: Int = run_end(builder, NewlineToken)
+	move_token_cursor(builder, end)
+
+
+---
+The index of the first token at or after the cursor that is not `kind`.
+---
+pure func run_end(builder: DiscoveryBuilder, kind: TokenKind) -> Int:
+	run_end_after(builder, builder.token_cursor, kind)
+
+
+---
+The index of the first token at or after `start` that is not `kind`.
+---
+pure func run_end_after(builder: DiscoveryBuilder, start: Int, kind: TokenKind) -> Int:
+	var index: Int = start
+
+	while token_kind_at(builder, index) == kind:
+		index += 1
+
+	index
+
+
+pure func token_kind_at(builder: DiscoveryBuilder, index: Int) -> TokenKind:
+	match builder.tokens.get(index):
+		Some(token):
+			token.kind
+		None:
+			EndOfFileToken
+
+
+---
+Advances to the newline or block end that ends the current line.
+---
+pure func skip_rest_of_line(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var index: Int = builder.token_cursor
+
+	while not ends_line(token_kind_at(builder, index)):
+		index += 1
+
+	move_token_cursor(builder, index)
+
+
+private pure func ends_line(kind: TokenKind) -> Bool:
+	kind == NewlineToken or kind == DedentToken or kind == EndOfFileToken
+
+
+---
+Advances past a `kind` token when the cursor is at one.
+
+Parse routines use this (and `skip_newlines`, `skip_rest_of_line`) to keep
+their first update of the builder unconditional (builder threading rule 1).
+---
+pure func skip_optional_token(builder: DiscoveryBuilder, kind: TokenKind) -> DiscoveryBuilder:
+	if at(builder, kind):
+		advance_token(builder)
+	else:
+		builder
+
+
+---
+Reports `code` at the current token.
+---
+pure func report_at_current(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	span: Span = span_before_current(builder)
+	append_plain_diagnostic(builder, code, span)
+
+
+---
+Advances past a `kind` token, or reports `code` there without advancing.
+---
+pure func expect_token(
+	builder: DiscoveryBuilder,
+	kind: TokenKind,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	if current_kind(builder) == kind:
+		advance_token(builder)
+	else:
+		report_at_current(builder, code)
+
+
+---
+Reports `code` and, unless the cursor is at a soft boundary, skips the
+offending token: the shared recovery for a missing required item.
+---
+pure func report_and_recover(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	boundary: Bool = at_soft_boundary(builder)
+	var out: DiscoveryBuilder = report_at_current(builder, code)
+
+	if not boundary:
+		out = advance_token(out)
+
+	out
+
+
+-- Names.
+---
+The seeded name index of a keyword kind, or `None` for a kind that is not a
+keyword.
+---
+pure func keyword_name_index(kind: TokenKind) -> Option[Int]:
+	var found: Option[Int] = None
+	var position: Int = 0
+
+	for keyword in KEYWORD_KINDS_IN_SEEDED_ORDER:
+		if keyword == kind:
+			found = Some(FIRST_KEYWORD_NAME_INDEX + position)
+			break
+
+		position += 1
+
+	found
+
+
+---
+Keywords that may be written where a name belongs; their name is their
+seeded spelling.
+---
+pure func is_soft_keyword(kind: TokenKind) -> Bool:
+	match kind:
+		DebugKeyword | WithKeyword | ConcurrentKeyword | ConcurrentlyKeyword | SelectKeyword | AfterKeyword | SealedKeyword | OnKeyword:
+			True
+		_:
+			False
+
+
+---
+The name of the current token when it is a name: an identifier, or a soft
+keyword spelled as one.
+---
+pure func current_name(builder: DiscoveryBuilder) -> Option[NameId]:
+	token: Token = current_token(builder)
+
+	if token.kind == IdentifierToken:
+		Some(name_id_at_row(token.payload))
+	else if is_soft_keyword(token.kind):
+		keyword_name_index(token.kind).map(name_id_at_row)
+	else:
+		None
+
+
+---
+The name a name-expecting routine records for the current token: its name
+when it is one, the keyword's spelling when it is a reserved keyword (which
+`consume_declared_name` reports), else the empty name.
+---
+pure func declared_name_at_cursor(builder: DiscoveryBuilder) -> NameId:
+	match current_name(builder):
+		Some(name):
+			name
+		None:
+			match keyword_name_index(current_kind(builder)):
+				Some(index):
+					name_id_at_row(index)
+				None:
+					name_id_at_row(EMPTY_NAME_INDEX)
+
+
+---
+Consumes a name that introduces a new binding or declaration. A reserved
+keyword there is reported and consumed as if it were the name; anything else
+that is not a name is reported and skipped unless it is a soft boundary.
+Read the name first with `declared_name_at_cursor`.
+---
+pure func consume_declared_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if current_name(builder).is_some():
+		advance_token(builder)
+	else if keyword_name_index(current_kind(builder)).is_some():
+		reported: DiscoveryBuilder = report_at_current(builder, ReservedKeywordAsNameDiagnostic)
+		advance_token(reported)
+	else:
+		report_and_recover(builder, ExpectedNameDiagnostic)
+
+
+---
+The name a reference-position routine records: the current token's name, or
+the empty name when it is not one (`consume_referenced_name` reports it).
+---
+pure func referenced_name_at_cursor(builder: DiscoveryBuilder) -> NameId:
+	match current_name(builder):
+		Some(name):
+			name
+		None:
+			name_id_at_row(EMPTY_NAME_INDEX)
+
+
+---
+Consumes a name in a reference position (a trait, bound or supertrait name):
+anything that is not a name, keywords included, is reported and skipped
+unless it is a soft boundary.
+---
+pure func consume_referenced_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if current_name(builder).is_some():
+		advance_token(builder)
+	else:
+		report_and_recover(builder, ExpectedNameDiagnostic)
+
+
+---
+The name a binder position records: `_` (the discard name) or a declared name.
+---
+pure func binder_name_at_cursor(builder: DiscoveryBuilder) -> NameId:
+	if at(builder, UnderscoreSymbol):
+		name_id_at_row(DISCARD_NAME_INDEX)
+	else:
+		declared_name_at_cursor(builder)
+
+
+---
+Consumes a binder: `_`, or a declared name (see `consume_declared_name`).
+---
+pure func consume_binder_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, UnderscoreSymbol):
+		advance_token(builder)
+	else:
+		consume_declared_name(builder)

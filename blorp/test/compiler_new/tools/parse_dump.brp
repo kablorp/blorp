@@ -1,0 +1,92 @@
+-- Parses every file named in a list as its own module (imports are not
+-- followed) with one shared builder, and prints each file's diagnostic count
+-- and codes, then per-table totals. The corpus parity check compares the
+-- counts with the existing parser's.
+--
+-- Usage: parse_dump.brp <file listing one source path per line>
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiscoveryBuilder,
+		empty_discovery_builder,
+	../../../src/compiler_new/stage_01_discovery/discovery_diagnostic_code: diagnostic_code_name
+	../../../src/compiler_new/stage_01_discovery/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		freeze,
+	../../../src/compiler_new/stage_01_discovery/module_walker: load_module
+	../../../src/compiler_new/stage_01_discovery/row_kinds:
+		ModuleOriginKind(UserModule),
+		ModuleReach(RootModule),
+	../../../src/compiler_new/stage_01_discovery/source_provider: PackageMembership(NotInPackage)
+	../../../src/compiler_new/stage_01_discovery/span: span_start
+	../support/tables_dump: table_counts_line
+	memory: MemStats, get_mem_stats, mem_delta
+	system: read_file
+
+
+---
+Position of the file-list argument; position 0 is the program.
+---
+LIST_ARGUMENT: Int = 1
+
+EXIT_INVARIANT_VIOLATION: Int = 3
+
+
+func read_paths(list_path: String) -> List[String]:
+	match read_file(list_path):
+		Ok(listing):
+			listing
+				.lines()
+				.filter(pure func(line): not line.is_empty())
+		Err(_):
+			[]
+
+
+func main(args: List[String]) -> Int:
+	paths: List[String] = read_paths(
+		args
+			.get(LIST_ARGUMENT)
+			.get_or(""),
+	)
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	var allocations: Int = 0
+
+	for path in paths:
+		match read_file(path):
+			Ok(text):
+				diagnostics_before: Int = builder.diagnostics.length()
+				before: MemStats = get_mem_stats()
+				builder = load_module(
+					builder,
+					{
+						path = path,
+						origin = UserModule,
+						package = NotInPackage
+					},
+					RootModule,
+					text,
+				)
+				after: MemStats = get_mem_stats()
+				allocations += mem_delta(before, after).total_allocations
+				var codes: List[String] = []
+
+				for index in diagnostics_before..builder.diagnostics.length():
+					match builder.diagnostics.get(index):
+						Some(row):
+							codes = codes.append(
+								"${diagnostic_code_name(row.code)}@${span_start(row.span)}",
+							)
+						None:
+							void
+
+				print("${path} ${codes.length()} ${codes.join(" ")}")
+			Err(message):
+				print("unreadable ${path}: ${message}")
+
+	match freeze(builder):
+		FrozenTables(tables):
+			print(table_counts_line(tables))
+			print("parse allocations=${allocations}")
+			0
+		TableInvariantsViolated(violations):
+			print("table invariants violated: ${violations.length()}")
+			EXIT_INVARIANT_VIOLATION

@@ -1,0 +1,162 @@
+-- Packed source spans.
+--
+-- A span is one Int: the source index in the high bits, then the start byte
+-- offset, then the length in bytes. Discovery admits a source only when every
+-- span inside it fits (`source_fits_span_limits`), and refuses to admit more
+-- sources than the source field can number (`source_index_fits_span`), so
+-- packing never loses information for an admitted source.
+--
+-- The widths differ from the design sketch (20/24/19): a length field
+-- narrower than the start field cannot hold a span covering most of a large
+-- source, and the corpus already has sources near 1 MiB with string literals
+-- of hundreds of KiB (the embedded standard library). Start and length share
+-- one width, so any span inside an admitted source fits; the source field
+-- takes what remains of the 63 non-negative bits.
+---
+A packed `(source, start, length)` triple. Built only by `pack_span`.
+---
+opaque type Span = Int
+
+---
+Bits holding the source index: at most 32768 sources per discovery.
+---
+SPAN_SOURCE_BITS: Int = 15
+
+---
+Bits holding the start byte offset: sources are at most 16 MiB.
+---
+SPAN_START_BITS: Int = 24
+
+---
+Bits holding the length in bytes; equal to the start width so a span can
+cover a whole admitted source.
+---
+SPAN_LENGTH_BITS: Int = 24
+
+---
+One more than the largest source index a span can hold.
+---
+SPAN_SOURCE_LIMIT: Int = power_of_two(SPAN_SOURCE_BITS)
+
+---
+One more than the largest start offset a span can hold.
+---
+SPAN_OFFSET_LIMIT: Int = power_of_two(SPAN_START_BITS)
+
+---
+One more than the largest length a span can hold.
+---
+SPAN_LENGTH_LIMIT: Int = power_of_two(SPAN_LENGTH_BITS)
+
+
+---
+`2^exponent` for a small non-negative exponent; used to derive the field
+limits from their bit widths.
+---
+pure func power_of_two(exponent: Int) -> Int:
+	var result: Int = 1
+
+	for step in 0..exponent:
+		result *= 2
+
+	result
+
+
+---
+Whether a source with index `source_index` can be admitted: its index must
+fit in the span's source field.
+---
+pure func source_index_fits_span(source_index: Int) -> Bool:
+	source_index >= 0 and source_index < SPAN_SOURCE_LIMIT
+
+
+---
+Whether a source text of `byte_length` bytes can be admitted: every offset
+inside it, including the end-of-source offset `byte_length` itself, and
+every length must fit the span's fields.
+---
+pure func source_fits_span_limits(byte_length: Int) -> Bool:
+	byte_length >= 0 and byte_length < SPAN_OFFSET_LIMIT and byte_length < SPAN_LENGTH_LIMIT
+
+
+---
+Which field of a span a byte range does not fit.
+---
+enum SpanOverflow:
+	SourceIndexOverflow
+	StartOffsetOverflow
+	LengthOverflow
+
+
+---
+Packs the byte range `start .. end` of source `source_index`, or reports the
+field it does not fit; a range never wraps into another field's bits.
+---
+pure func pack_checked_span(source_index: Int, start: Int, end: Int) -> Result[Span, SpanOverflow]:
+	if not source_index_fits_span(source_index):
+		Err(SourceIndexOverflow)
+	else if start < 0 or start >= SPAN_OFFSET_LIMIT:
+		Err(StartOffsetOverflow)
+	else if end < start or end - start >= SPAN_LENGTH_LIMIT:
+		Err(LengthOverflow)
+	else:
+		Ok(
+			into_opaque Span(
+				(source_index * SPAN_OFFSET_LIMIT + start) * SPAN_LENGTH_LIMIT + end - start
+			),
+		)
+
+
+---
+Packs the byte range `start .. end` of an admitted source: the lexer and
+parser's hot path. Admission (`source_fits_span_limits`,
+`source_index_fits_span`) guarantees every range inside an admitted source
+fits, so the clamping here is unreachable there; it only keeps a range that
+bypassed admission from wrapping into another field's bits. Use
+`pack_checked_span` where the range is not known to lie in an admitted
+source.
+---
+pure func pack_span(source_index: Int, start: Int, end: Int) -> Span:
+	bounded_source: Int = clamp_to_field(source_index, SPAN_SOURCE_LIMIT)
+	bounded_start: Int = clamp_to_field(start, SPAN_OFFSET_LIMIT)
+	bounded_length: Int = clamp_to_field(end - bounded_start, SPAN_LENGTH_LIMIT)
+	into_opaque Span(
+		(bounded_source * SPAN_OFFSET_LIMIT + bounded_start) * SPAN_LENGTH_LIMIT + bounded_length
+	)
+
+
+private pure func clamp_to_field(value: Int, limit: Int) -> Int:
+	if value < 0:
+		0
+	else if value >= limit:
+		limit - 1
+	else:
+		value
+
+
+pure func span_source_index(span: Span) -> Int:
+	from_opaque Span(span) / SPAN_LENGTH_LIMIT / SPAN_OFFSET_LIMIT
+
+
+pure func span_start(span: Span) -> Int:
+	from_opaque Span(span) / SPAN_LENGTH_LIMIT % SPAN_OFFSET_LIMIT
+
+
+pure func span_length(span: Span) -> Int:
+	from_opaque Span(span) % SPAN_LENGTH_LIMIT
+
+
+pure func span_end(span: Span) -> Int:
+	span_start(span) + span_length(span)
+
+
+---
+The span from the start of `first` to the end of `last`; both must lie in
+one source.
+---
+pure func span_covering(first: Span, last: Span) -> Span:
+	pack_span(span_source_index(first), span_start(first), span_end(last))
+
+
+pure func spans_equal(left: Span, right: Span) -> Bool:
+	from_opaque Span(left) == from_opaque Span(right)

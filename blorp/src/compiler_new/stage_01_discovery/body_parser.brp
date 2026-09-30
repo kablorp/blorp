@@ -1,0 +1,3452 @@
+-- Function declarations and bodies: expressions, statements and blocks,
+-- parsed into the node table.
+--
+-- Nodes are appended post-order: every routine appends the root of what it
+-- parsed last, so a caller reads the root with `last_node_id`. A parent with
+-- several children has each child's root pushed on the builder's child stack
+-- as the child is finished and claims them with
+-- `append_parent_node_from_stack`; no list of child ids is built per node.
+--
+-- Function declarations live here, not in the declaration parser, because a
+-- body may declare a local function: the two recurse into each other, and a
+-- module cannot import a module that imports it.
+--
+-- The grammar, its layout rules and its recovery follow the existing parser
+-- (`language_parser.brp`) so that the same sources are accepted. Layout
+-- decisions that depend on columns compare token positions with an anchor,
+-- the span a construct's header starts at: a block belongs to a header when
+-- its tokens sit on a later line and in a later column.
+import:
+	declaration_header: DeclarationHeader, close_definition, open_definition, plain_header
+	discovery_builder:
+		DefinitionId,
+		DiscoveryBuilder,
+		InterpolationPart(HolePart, TextPart),
+		InterpolationPartRow,
+		LiteralId,
+		ModuleId,
+		NameId,
+		NodeId,
+		NodeRow,
+		ParameterId,
+		ParseCheckpoint,
+		RowRange,
+		advance_token,
+		append_binder_name,
+		append_body,
+		append_codepoint_leaf_node,
+		append_definition_leaf_node,
+		append_definition_type,
+		append_leaf_node,
+		append_literal_leaf_node,
+		append_name_leaf_node,
+		append_named_parent_node_from_stack,
+		append_parameter,
+		append_parameter_type,
+		append_parent_node_from_stack,
+		append_plain_diagnostic,
+		append_signature,
+		child_stack_depth,
+		definition_id_index,
+		discard_last_leaf_node,
+		interpolation_part_at,
+		interpolation_parts_of,
+		interpolation_text_at,
+		last_node_id,
+		literal_id_at_row,
+		module_id_at_row,
+		move_token_cursor,
+		name_id_at_row,
+		name_id_index,
+		next_binder_name_row,
+		next_definition_id,
+		next_parameter_id,
+		node_child_at,
+		node_row_at,
+		parse_checkpoint,
+		pending_annotation_count,
+		push_last_node,
+		replace_last_node_span,
+		rollback_to,
+		source_id_at_row,
+		token_count,
+	discovery_diagnostic_code:
+		DiscoveryDiagnosticCode(
+			ConcurrentForTupleBinderDiagnostic,
+			DiscardedQuestionBindDiagnostic,
+			ExpectedAssignmentOperatorDiagnostic,
+			ExpectedBuiltinNameDiagnostic,
+			ExpectedColonDiagnostic,
+			ExpectedCommaDiagnostic,
+			ExpectedConcurrentParameterDiagnostic,
+			ExpectedEqualDiagnostic,
+			ExpectedExpressionDiagnostic,
+			ExpectedFatArrowDiagnostic,
+			ExpectedIndentDiagnostic,
+			ExpectedKeywordDiagnostic,
+			ExpectedLeftParenDiagnostic,
+			ExpectedNameDiagnostic,
+			ExpectedNewlineDiagnostic,
+			ExpectedPipeDiagnostic,
+			ExpectedRightBraceDiagnostic,
+			ExpectedRightBracketDiagnostic,
+			ExpectedRightParenDiagnostic,
+			FieldAssignmentDiagnostic,
+			InterpolationHoleNotExpressionDiagnostic,
+			RemovedFromConversionDiagnostic,
+			RemovedIntoConversionDiagnostic,
+			TupleArityDiagnostic,
+			WithMultipleBindingsDiagnostic,
+		),
+	lexer: lex_interpolation_hole
+	name_vocabulary: DISCARD_NAME_INDEX, REMOVED_INTO_NAME_INDEX
+	parser_cursor:
+		at,
+		at_block_end,
+		binder_name_at_cursor,
+		consume_binder_name,
+		consume_declared_name,
+		consume_referenced_name,
+		current_kind,
+		current_name,
+		current_span,
+		current_token,
+		declared_name_at_cursor,
+		expect_token,
+		is_soft_keyword,
+		keyword_name_index,
+		peek_kind,
+		referenced_name_at_cursor,
+		report_and_recover,
+		report_at_current,
+		run_end,
+		skip_newlines,
+		token_at,
+		token_kind_at,
+	pattern_parser: parse_pattern
+	row_kinds:
+		DefinitionKind(LocalFunctionDefinition),
+		NodeKind(
+			AddAssignNode,
+			AddNode,
+			AndNode,
+			AscriptionNode,
+			AssignmentNode,
+			BlockNode,
+			BreakNode,
+			BuiltinNode,
+			CallNode,
+			CharLiteralNode,
+			ConcurrentBlockNode,
+			ConcurrentForNode,
+			ConcurrentParameterNode,
+			ContinueNode,
+			DebugBlockNode,
+			DestructureBinderNode,
+			DetachNode,
+			DictEntryNode,
+			DictLiteralNode,
+			DivideAssignNode,
+			DivideNode,
+			EqualNode,
+			FalseLiteralNode,
+			FieldAccessNode,
+			FloatLiteralNode,
+			ForNode,
+			FromOpaqueNode,
+			GreaterEqualNode,
+			GreaterNode,
+			IdentifierNode,
+			IfNode,
+			IntegerLiteralNode,
+			InterpolatedPipeStringNode,
+			InterpolatedStringNode,
+			InterpolationTextNode,
+			IntoOpaqueNode,
+			LambdaNode,
+			LambdaParameterNode,
+			LessEqualNode,
+			LessNode,
+			ListLiteralNode,
+			LocalFunctionNode,
+			LoopBinderNode,
+			MatchCaseNode,
+			MatchNode,
+			MissingExpressionNode,
+			ModuloNode,
+			MultiplyAssignNode,
+			MultiplyNode,
+			NamedBuiltinNode,
+			NegateNode,
+			NotEqualNode,
+			NotNode,
+			OrNode,
+			PipeStringLiteralNode,
+			PureLambdaNode,
+			QuestionBindNode,
+			RangeNode,
+			RawPipeStringLiteralNode,
+			RawStringLiteralNode,
+			RecordFieldNode,
+			RecordLiteralNode,
+			RecordUpdateNode,
+			SelectAfterArmNode,
+			SelectNode,
+			SelectReceiveArmNode,
+			SelectSealedArmNode,
+			StringLiteralNode,
+			SubscriptAssignmentNode,
+			SubscriptNode,
+			SubtractAssignNode,
+			SubtractNode,
+			TrueLiteralNode,
+			TupleDestructureNode,
+			TupleLoopBinderNode,
+			TupleNode,
+			TypedBindingNode,
+			VarDeclarationNode,
+			VectorLiteralNode,
+			VoidNode,
+			WhileNode,
+			WithBindingNode,
+			WithErrorMapNode,
+			WithNode,
+			WithTryBindingNode,
+		),
+		ParameterBinder(NamedParameterBinder, TupleParameterBinder, WildcardParameterBinder),
+		Purity(ImpureFunction, PureFunction),
+	source_position: LineColumn, span_end_line, span_start_line, span_start_position
+	span: Span, pack_span, span_covering, span_source_index, spans_equal
+	token:
+		Token,
+		TokenKind(
+			AfterKeyword,
+			AndKeyword,
+			ArrowSymbol,
+			AsKeyword,
+			BreakKeyword,
+			BuiltinKeyword,
+			CharLiteralToken,
+			ColonSymbol,
+			CommaSymbol,
+			ConcurrentKeyword,
+			ConcurrentlyKeyword,
+			ContinueKeyword,
+			DebugKeyword,
+			DedentToken,
+			DetachKeyword,
+			DotSymbol,
+			ElseKeyword,
+			EndOfFileToken,
+			EqualEqualSymbol,
+			EqualSymbol,
+			FalseKeyword,
+			FatArrowSymbol,
+			FloatLiteralToken,
+			ForKeyword,
+			FromKeyword,
+			FromOpaqueKeyword,
+			FuncKeyword,
+			GreaterEqualSymbol,
+			GreaterSymbol,
+			IdentifierToken,
+			IfKeyword,
+			InKeyword,
+			IndentToken,
+			InterpolatedPipeStringToken,
+			InterpolatedStringToken,
+			IntLiteralToken,
+			IntoOpaqueKeyword,
+			LeftBraceSymbol,
+			LeftBracketSymbol,
+			LeftParenSymbol,
+			LessEqualSymbol,
+			LessSymbol,
+			MatchKeyword,
+			MinusEqualSymbol,
+			MinusSymbol,
+			NewlineToken,
+			NormalStringToken,
+			NotEqualSymbol,
+			NotKeyword,
+			OnKeyword,
+			OrKeyword,
+			PercentSymbol,
+			PipeStringToken,
+			PipeSymbol,
+			PlusEqualSymbol,
+			PlusSymbol,
+			PureKeyword,
+			QuestionEqualsSymbol,
+			RawPipeStringToken,
+			RawStringToken,
+			RightBraceSymbol,
+			RightBracketSymbol,
+			RightParenSymbol,
+			SealedKeyword,
+			SelectKeyword,
+			SlashEqualSymbol,
+			SlashSymbol,
+			StarEqualSymbol,
+			StarSymbol,
+			TrueKeyword,
+			UnderscoreSymbol,
+			VarKeyword,
+			VoidKeyword,
+			WhileKeyword,
+			WithKeyword,
+			DotDotSymbol,
+		),
+	type_parser: node_span, parse_dimension_constraints, parse_type, parse_type_parameters
+
+
+-- Precedence levels of the binary operators, loosest first; `as` binds at the
+-- loosest level and applies only there.
+private LOWEST_PRECEDENCE: Int = 0
+
+private ASCRIPTION_PRECEDENCE: Int = 0
+
+private OR_PRECEDENCE: Int = 1
+
+private AND_PRECEDENCE: Int = 2
+
+private COMPARISON_PRECEDENCE: Int = 3
+
+private RANGE_PRECEDENCE: Int = 4
+
+private ADDITIVE_PRECEDENCE: Int = 5
+
+private MULTIPLICATIVE_PRECEDENCE: Int = 6
+
+---
+The most elements a tuple expression may have; the fewest and most names a
+tuple binder may have.
+---
+private MAX_TUPLE_ITEMS: Int = 4
+
+private MIN_TUPLE_BINDER_NAMES: Int = 2
+
+private MAX_TUPLE_BINDER_NAMES: Int = 4
+
+
+-- Function declarations.
+---
+`func name[T](params) -> R where ... : body` for a function, an impl method or
+a local function (`kind`); the header carries what came before `func`.
+---
+pure func parse_function(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	keyword_span: Span = current_span(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	out = open_definition(out, header, kind, name, name_span)
+	out = parse_type_parameters(out, definition)
+	out = parse_signature(out, definition, header.purity, keyword_span)
+	var end: Span = name_span
+
+	if at(out, ArrowSymbol):
+		out = advance_token(out)
+		out = parse_type(out)
+		return_type: NodeId = last_node_id(out)
+		out = append_definition_type(
+			out,
+			{
+				definition = definition,
+				type_root = return_type
+			},
+		)
+		end = node_span(out, return_type)
+
+	constraints_before: Int = out.dimension_constraints.length()
+	out = parse_dimension_constraints(out, definition)
+
+	if out.dimension_constraints.length() > constraints_before:
+		end = constraint_end(out)
+
+	var has_body: Bool = False
+
+	if at(out, ColonSymbol):
+		colon_line: Int = span_start_line(out, current_span(out))
+		out = advance_token(out)
+
+		if function_body_follows(out, colon_line):
+			out = parse_function_body(out, definition, header.start)
+			has_body = True
+			end = node_span(out, last_node_id(out))
+	else if not (at(out, NewlineToken) or at_block_end(out)):
+		out = report_at_current(out, ExpectedColonDiagnostic)
+
+	if not has_body and spans_equal(end, name_span):
+		end = keyword_span
+
+	out = close_definition(out, definition, header, kind, name, name_span, end)
+	out
+
+
+---
+The span a function's last dimension constraint ends with.
+---
+private pure func constraint_end(builder: DiscoveryBuilder) -> Span:
+	match builder.dimension_constraints.get(builder.dimension_constraints.length() - 1):
+		Some(constraint):
+			constraint.span
+		None:
+			current_span(builder)
+
+
+---
+Whether a body follows a function's `:`: not at the end of a block, not a
+new line without an indented block (a declaration without a body), and not
+a token on a later line (which belongs to what follows).
+---
+private pure func function_body_follows(builder: DiscoveryBuilder, colon_line: Int) -> Bool:
+	if at_block_end(builder):
+		False
+	else if at(builder, NewlineToken):
+		peek_kind(builder, 1) == IndentToken
+	else:
+		span_start_line(builder, current_span(builder)) <= colon_line
+
+
+---
+The body after a function's or trait method's `:`, with its body row. An
+indented block on the next line, or an expression on the `:` line.
+`anchor` is where the declaration starts.
+---
+pure func parse_function_body(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_body_expression(builder, anchor)
+	root: NodeId = last_node_id(out)
+	out = append_body(
+		out,
+		{
+			definition = definition,
+			root = root
+		},
+	)
+	out
+
+
+private pure func parse_body_expression(
+	builder: DiscoveryBuilder,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	if at(builder, NewlineToken):
+		parse_block_after_colon(builder, anchor)
+	else:
+		parse_expression(builder)
+
+
+---
+A global's value after its `=` (or where the missing `=` was reported), with
+its body row. `anchor` is where the declaration starts.
+---
+pure func parse_global_value(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_assignment_value(builder, anchor)
+	root: NodeId = last_node_id(out)
+	out = append_body(
+		out,
+		{
+			definition = definition,
+			root = root
+		},
+	)
+	out
+
+
+---
+`(params)` of `definition` and its signature row.
+---
+pure func parse_signature(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	purity: Purity,
+	keyword_span: Span,
+) -> DiscoveryBuilder:
+	parameters_first: Int = builder.parameters.length()
+	var out: DiscoveryBuilder = parse_parenthesized_parameters(builder, definition)
+	parameters_count: Int = out.parameters.length() - parameters_first
+	out = append_signature(
+		out,
+		{
+			definition = definition,
+			purity = purity,
+			keyword_span = keyword_span,
+			parameters = {
+				first = parameters_first,
+				count = parameters_count
+			}
+		},
+	)
+	out
+
+
+---
+`(params)`, or a report that the `(` is missing.
+---
+pure func parse_parenthesized_parameters(
+	builder: DiscoveryBuilder,
+	owner: DefinitionId,
+) -> DiscoveryBuilder:
+	if at(builder, LeftParenSymbol):
+		advanced: DiscoveryBuilder = advance_token(builder)
+		parse_parameters(advanced, owner)
+	else:
+		report_at_current(builder, ExpectedLeftParenDiagnostic)
+
+
+---
+Parameters after `(`, through `)`; they may continue on indented lines.
+---
+private pure func parse_parameters(
+	builder: DiscoveryBuilder,
+	owner: DefinitionId,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = skip_newlines(builder)
+	var opened_indent: Bool = False
+	var ordinal: Int = 0
+
+	if at(out, IndentToken):
+		opened_indent = True
+		out = advance_token(out)
+		out = skip_newlines(out)
+
+	if not at(out, RightParenSymbol):
+		var parsing: Bool = True
+
+		while parsing and not at(out, EndOfFileToken):
+			out = parse_parameter(out, owner, ordinal)
+			ordinal += 1
+
+			if at(out, CommaSymbol):
+				out = advance_token(out)
+				out = skip_newlines(out)
+
+				if opened_indent and at(out, DedentToken):
+					out = advance_token(out)
+					out = skip_newlines(out)
+
+				if at(out, RightParenSymbol):
+					parsing = False
+			else:
+				parsing = False
+
+	out = skip_newlines(out)
+
+	if opened_indent and at(out, DedentToken):
+		out = advance_token(out)
+		out = skip_newlines(out)
+
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	out
+
+
+---
+One parameter: `name`, `name: T`, `_`, `_: T`, or `(a, b): T`.
+---
+private pure func parse_parameter(
+	builder: DiscoveryBuilder,
+	owner: DefinitionId,
+	ordinal: Int,
+) -> DiscoveryBuilder:
+	parameter: ParameterId = next_parameter_id(builder)
+	names_first: Int = next_binder_name_row(builder)
+	binder_start: Span = current_span(builder)
+	binder: ParameterBinder = parameter_binder_at_cursor(builder)
+	var out: DiscoveryBuilder = parse_parameter_binder(builder, binder)
+	names_count: Int = next_binder_name_row(out) - names_first
+
+	binder_span: Span = if binder == TupleParameterBinder:
+		span_covering(binder_start, tuple_binder_close_span(out))
+	else:
+		binder_start
+
+	if (
+		binder == TupleParameterBinder
+		and (names_count < MIN_TUPLE_BINDER_NAMES or names_count > MAX_TUPLE_BINDER_NAMES)
+	):
+		out = append_plain_diagnostic(out, TupleArityDiagnostic, binder_span)
+
+	var span: Span = binder_span
+
+	if at(out, ColonSymbol):
+		out = advance_token(out)
+		out = parse_type(out)
+		parameter_type: NodeId = last_node_id(out)
+		out = append_parameter_type(
+			out,
+			{
+				parameter = parameter,
+				type_root = parameter_type
+			},
+		)
+		span = span_covering(
+			binder_span,
+			node_span(out, parameter_type),
+		)
+
+	out = append_parameter(
+		out,
+		{
+			owner = owner,
+			ordinal = ordinal,
+			binder = binder,
+			binder_names = {
+				first = names_first,
+				count = names_count
+			},
+			binder_span = binder_span,
+			span = span
+		},
+	)
+	out
+
+
+---
+The binder form of the parameter at the cursor: `(a, b)` is a tuple, a lone
+`_` a wildcard, and a name or `_: T` a named binder (`_` binds the discard
+name).
+---
+private pure func parameter_binder_at_cursor(builder: DiscoveryBuilder) -> ParameterBinder:
+	if at(builder, LeftParenSymbol):
+		TupleParameterBinder
+	else if at(builder, UnderscoreSymbol) and peek_kind(builder, 1) != ColonSymbol:
+		WildcardParameterBinder
+	else:
+		NamedParameterBinder
+
+
+---
+Consumes a parameter's binder and appends its binder names.
+---
+private pure func parse_parameter_binder(
+	builder: DiscoveryBuilder,
+	binder: ParameterBinder,
+) -> DiscoveryBuilder:
+	binder_start: Span = current_span(builder)
+
+	match binder:
+		TupleParameterBinder:
+			advanced: DiscoveryBuilder = advance_token(builder)
+			parse_tuple_binder_names(advanced)
+		WildcardParameterBinder:
+			advance_token(builder)
+		NamedParameterBinder:
+			if at(builder, UnderscoreSymbol):
+				advanced: DiscoveryBuilder = advance_token(builder)
+				append_binder_name(
+					advanced,
+					{
+						name = name_id_at_row(DISCARD_NAME_INDEX),
+						span = binder_start
+					},
+				)
+			else:
+				parse_binder_name(builder)
+
+
+---
+One binder name, appended with its span.
+---
+private pure func parse_binder_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = declared_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	out: DiscoveryBuilder = consume_declared_name(builder)
+	append_binder_name(
+		out,
+		{
+			name = name,
+			span = name_span
+		},
+	)
+
+
+---
+The names of a tuple binder after its `(`, through the `)`.
+---
+private pure func parse_tuple_binder_names(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, EndOfFileToken):
+		expect_token(builder, RightParenSymbol, ExpectedRightParenDiagnostic)
+	else:
+		parse_tuple_binder_name_list(builder)
+
+
+private pure func parse_tuple_binder_name_list(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_binder_name(builder)
+	var parsing: Bool = True
+
+	while parsing:
+		if at(out, CommaSymbol):
+			out = advance_token(out)
+
+			if at(out, RightParenSymbol) or at(out, EndOfFileToken):
+				parsing = False
+			else:
+				out = parse_binder_name(out)
+		else:
+			parsing = False
+
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	out
+
+
+---
+The token a tuple binder's span ends at: its `)` when `parse_tuple_binder_names`
+consumed one, else the token that stood in its place. The names never consume
+a `)` (it is a soft boundary), so a `)` just before the cursor is the close.
+---
+private pure func tuple_binder_close_span(builder: DiscoveryBuilder) -> Span:
+	if token_kind_at(builder, builder.token_cursor - 1) == RightParenSymbol:
+		token_at(builder, builder.token_cursor - 1).span
+	else:
+		current_span(builder)
+
+
+-- Layout.
+---
+The line and column of the token at `index`.
+---
+private pure func token_position(builder: DiscoveryBuilder, index: Int) -> LineColumn:
+	span_start_position(builder, token_at(builder, index).span)
+
+
+---
+Whether the token at `index` belongs to a block anchored at `anchor`: it is
+not the end of a block and sits on a later line in a later column.
+---
+private pure func indented_past(builder: DiscoveryBuilder, index: Int, anchor: LineColumn) -> Bool:
+	kind: TokenKind = token_kind_at(builder, index)
+
+	if kind == EndOfFileToken or kind == DedentToken:
+		False
+	else:
+		position: LineColumn = token_position(builder, index)
+		position.line > anchor.line and position.column > anchor.column
+
+
+---
+A block after a `:`: a new line, then the indented statements.
+---
+private pure func parse_block_after_colon(
+	builder: DiscoveryBuilder,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	expected: DiscoveryBuilder = expect_token(builder, NewlineToken, ExpectedNewlineDiagnostic)
+	parse_indented_block(expected, anchor)
+
+
+---
+The statements of a block anchored at `anchor`, with the block's indent and
+dedent. A block written without an indent token is accepted when its first
+token sits past the anchor.
+---
+private pure func parse_indented_block(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	anchor_position: LineColumn = span_start_position(builder, anchor)
+	var out: DiscoveryBuilder = consume_block_indent(builder, anchor_position)
+	out = skip_newlines(out)
+	depth_before: Int = child_stack_depth(out)
+	nodes_before: Int = out.nodes.length()
+	out = parse_statement_list(out, anchor_position)
+	count: Int = child_stack_depth(out) - depth_before
+	span: Span = block_span(out, nodes_before, count, anchor)
+
+	if at(out, DedentToken):
+		out = advance_token(out)
+
+	out = append_parent_node_from_stack(out, BlockNode, span, count)
+	out
+
+
+---
+The span of a block's statements: from the first statement to the last, or
+the anchor when the block is empty. The first statement's subtree starts at
+node `nodes_before`; its root is the first child on the stack.
+---
+private pure func block_span(
+	builder: DiscoveryBuilder,
+	nodes_before: Int,
+	count: Int,
+	anchor: Span,
+) -> Span:
+	if count == 0:
+		anchor
+	else:
+		first: NodeId = builder.child_stack
+			.get(builder.child_stack_depth - count)
+			.get_or(last_node_id(builder))
+		span_covering(
+			node_span(builder, first),
+			node_span(builder, last_node_id(builder)),
+		)
+
+
+---
+Consumes a block's indent: skips newlines, then an indent token, or nothing
+when the first token already sits past the anchor; otherwise reports the
+missing indent.
+---
+private pure func consume_block_indent(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	start: Int = run_end(builder, NewlineToken)
+
+	if token_kind_at(builder, start) == IndentToken:
+		move_token_cursor(builder, start + 1)
+	else if indented_past(builder, start, anchor):
+		move_token_cursor(builder, start)
+	else:
+		moved: DiscoveryBuilder = move_token_cursor(builder, start)
+		report_at_current(moved, ExpectedIndentDiagnostic)
+
+
+---
+Statements while the tokens sit past the anchor, each pushed on the child
+stack. A statement that consumes nothing is skipped past so the loop ends.
+---
+private pure func parse_statement_list(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	if at_block_end(builder) or not indented_past(builder, builder.token_cursor, anchor):
+		builder
+	else:
+		parse_statements(builder, anchor)
+
+
+private pure func parse_statements(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_statement_and_push(builder, anchor)
+
+	while not at_block_end(out) and indented_past(out, out.token_cursor, anchor):
+		out = parse_statement_and_push(out, anchor)
+
+	out
+
+
+private pure func parse_statement_and_push(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	before: Int = builder.token_cursor
+	parsed: DiscoveryBuilder = parse_statement(builder)
+	var out: DiscoveryBuilder = push_last_node(parsed)
+	out = skip_newlines(out)
+
+	if (
+		out.token_cursor == before
+		and not at_block_end(out)
+		and indented_past(out, out.token_cursor, anchor)
+	):
+		out = advance_token(out)
+
+	out
+
+
+-- Statements.
+---
+One statement, then the dedent that closes a leading-dot continuation
+(`value\n\t.method()`) inside a binary expression.
+---
+private pure func parse_statement(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_statement_form(builder)
+	out = consume_continuation_dedent(out)
+	out
+
+
+private pure func parse_statement_form(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	match current_kind(builder):
+		VarKeyword:
+			parse_var_declaration(builder)
+		WhileKeyword:
+			parse_while(builder)
+		ForKeyword:
+			parse_for_statement(builder)
+		FuncKeyword | PureKeyword:
+			if starts_local_function(builder):
+				parse_local_function(builder)
+			else:
+				parse_named_statement_or_expression(builder)
+		LeftParenSymbol:
+			if starts_tuple_destructure(builder):
+				parse_tuple_destructure(builder)
+			else:
+				parse_named_statement_or_expression(builder)
+		_:
+			parse_named_statement_or_expression(builder)
+
+
+---
+A `for` statement, anchored at its own keyword.
+---
+private pure func parse_for_statement(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	-- Builder threading rule 3.
+	anchor: Span = current_span(builder)
+	parse_for(builder, anchor)
+
+
+---
+After a statement: when the tokens that follow are newlines and a dedent,
+and the statement is a binary expression whose left side continued onto a
+later line with a leading `.`, the dedent belongs to that continuation and
+is consumed here.
+---
+private pure func consume_continuation_dedent(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	after: Int = run_end(builder, NewlineToken)
+
+	if (
+		token_kind_at(builder, after) == DedentToken
+		and needs_continuation_dedent(builder, last_node_id(builder))
+	):
+		move_token_cursor(builder, after + 1)
+	else:
+		builder
+
+
+---
+Whether `node` is a binary expression (or ascription) whose left side holds
+a leading-dot continuation, or whose right side needs one.
+---
+private pure func needs_continuation_dedent(builder: DiscoveryBuilder, node: NodeId) -> Bool:
+	row: NodeRow = node_row_at(builder, node)
+
+	match row.kind:
+		AddNode | SubtractNode | MultiplyNode | DivideNode | ModuloNode | EqualNode | NotEqualNode | LessNode | LessEqualNode | GreaterNode | GreaterEqualNode | AndNode | OrNode:
+			(
+				child_has_leading_dot_continuation(builder, node, 0)
+				or child_needs_continuation_dedent(builder, node, 1)
+			)
+		AscriptionNode:
+			child_has_leading_dot_continuation(builder, node, 0)
+		_:
+			False
+
+
+private pure func child_needs_continuation_dedent(
+	builder: DiscoveryBuilder,
+	node: NodeId,
+	position: Int,
+) -> Bool:
+	match node_child_at(builder, node, position):
+		Some(child):
+			needs_continuation_dedent(builder, child)
+		None:
+			False
+
+
+private pure func child_has_leading_dot_continuation(
+	builder: DiscoveryBuilder,
+	node: NodeId,
+	position: Int,
+) -> Bool:
+	match node_child_at(builder, node, position):
+		Some(child):
+			has_leading_dot_continuation(builder, child)
+		None:
+			False
+
+
+---
+Whether `node` holds a field access whose field sits on a later line than
+its receiver ends: a `.field` that continued the expression onto a new line.
+---
+private pure func has_leading_dot_continuation(builder: DiscoveryBuilder, node: NodeId) -> Bool:
+	row: NodeRow = node_row_at(builder, node)
+
+	match row.kind:
+		FieldAccessNode:
+			match node_child_at(builder, node, 0):
+				Some(receiver):
+					span_end_line(builder, row.span) > span_end_line(
+						builder,
+						node_span(builder, receiver),
+					) or has_leading_dot_continuation(builder, receiver)
+				None:
+					False
+		CallNode | SubscriptNode | AddNode | SubtractNode | MultiplyNode | DivideNode | ModuloNode | EqualNode | NotEqualNode | LessNode | LessEqualNode | GreaterNode | GreaterEqualNode | AndNode | OrNode:
+			any_child_has_leading_dot_continuation(builder, row)
+		AscriptionNode:
+			child_has_leading_dot_continuation(builder, node, 0)
+		_:
+			False
+
+
+private pure func any_child_has_leading_dot_continuation(
+	builder: DiscoveryBuilder,
+	row: NodeRow,
+) -> Bool:
+	var found: Bool = False
+	var position: Int = 0
+
+	while not found and position < row.children.count:
+		match builder.node_children.get(row.children.first + position):
+			Some(child):
+				found = has_leading_dot_continuation(builder, child)
+			None:
+				void
+
+		position += 1
+
+	found
+
+
+---
+`func name(...)` or `pure func name(...)` in a body: a local function, as
+opposed to a lambda (`func(...)`).
+---
+private pure func starts_local_function(builder: DiscoveryBuilder) -> Bool:
+	if at(builder, FuncKeyword):
+		peek_kind(builder, 1) != LeftParenSymbol
+	else:
+		peek_kind(builder, 1) == FuncKeyword and peek_kind(builder, 2) != LeftParenSymbol
+
+
+---
+A local function declaration and its `LocalFunctionNode`.
+---
+private pure func parse_local_function(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	definition: DefinitionId = next_definition_id(builder)
+	header: DeclarationHeader = { plain_header(
+		module_being_parsed(builder),
+		start,
+		pending_annotation_count(builder),
+	) |
+		purity = local_function_purity(builder)
+	}
+	after_pure: DiscoveryBuilder = skip_pure_keyword(builder)
+	var out: DiscoveryBuilder = parse_function(after_pure, header, LocalFunctionDefinition)
+	span: Span = definition_span(out, definition)
+	out = append_definition_leaf_node(out, LocalFunctionNode, span, definition)
+	out
+
+
+private pure func local_function_purity(builder: DiscoveryBuilder) -> Purity:
+	if at(builder, PureKeyword):
+		PureFunction
+	else:
+		ImpureFunction
+
+
+private pure func skip_pure_keyword(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, PureKeyword):
+		advance_token(builder)
+	else:
+		builder
+
+
+private pure func definition_span(builder: DiscoveryBuilder, definition: DefinitionId) -> Span:
+	match builder.definitions.get(definition_id_index(definition)):
+		Some(row):
+			row.span
+		None:
+			current_span(builder)
+
+
+---
+The module whose body is being parsed. `load_module` appends a module's row
+before it lexes and parses the module's tokens, so it is the last module row;
+this saves threading the module through every expression routine for the
+one that needs it.
+---
+private pure func module_being_parsed(builder: DiscoveryBuilder) -> ModuleId:
+	module_id_at_row(builder.modules.length() - 1)
+
+
+---
+`var name [: T] = value`.
+---
+private pure func parse_var_declaration(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	name: NameId = binder_name_at_cursor(out)
+	out = consume_binder_name(out)
+	out = parse_optional_type_annotation(out)
+	out = expect_token(out, EqualSymbol, ExpectedEqualDiagnostic)
+	out = parse_assignment_value(out, start)
+	value_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_named_parent_node_from_stack(
+		out,
+		VarDeclarationNode,
+		span_covering(start, value_span),
+		name,
+		count,
+	)
+	out
+
+
+---
+`: T` when written, its root pushed on the child stack.
+---
+private pure func parse_optional_type_annotation(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, ColonSymbol):
+		advanced: DiscoveryBuilder = advance_token(builder)
+		typed: DiscoveryBuilder = parse_type(advanced)
+		push_last_node(typed)
+	else:
+		builder
+
+
+---
+A value after `=`: an expression on the same line, or an indented expression
+on the next.
+---
+private pure func parse_assignment_value(
+	builder: DiscoveryBuilder,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	if at(builder, NewlineToken):
+		advanced: DiscoveryBuilder = advance_token(builder)
+		parse_indented_assignment_value(advanced)
+	else:
+		with_item: DiscoveryBuilder = parse_anchored_expression(builder, anchor)
+		consume_continuation_dedent(with_item)
+
+
+private pure func parse_indented_assignment_value(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = expect_token(builder, IndentToken, ExpectedIndentDiagnostic)
+	out = parse_expression(out)
+	after: Int = run_end(out, NewlineToken)
+
+	if token_kind_at(out, after) == DedentToken:
+		out = move_token_cursor(out, after + 1)
+	else:
+		out = move_token_cursor(out, after)
+
+	out
+
+
+---
+A statement that starts with a name (a binding, an assignment) or any other
+expression statement.
+---
+private pure func parse_named_statement_or_expression(
+	builder: DiscoveryBuilder,
+) -> DiscoveryBuilder:
+	if can_start_named_statement(builder):
+		after_name: Int = builder.token_cursor + 1
+
+		if (
+			token_kind_at(builder, after_name) == ColonSymbol
+			and colon_starts_typed_assignment(builder, after_name)
+		):
+			parse_typed_named_statement(builder)
+		else if starts_assignment_tail(token_kind_at(builder, after_name)):
+			parse_named_statement(builder)
+		else:
+			parsed: DiscoveryBuilder = parse_expression(builder)
+			assignment_after_expression(parsed)
+	else if at(builder, UnderscoreSymbol):
+		if starts_assignment_tail(peek_kind(builder, 1)):
+			parse_named_statement(builder)
+		else:
+			parse_expression(builder)
+	else:
+		parsed: DiscoveryBuilder = parse_expression(builder)
+		assignment_after_expression(parsed)
+
+
+---
+Whether the token at the cursor can name a binding: a name, or a reserved
+keyword followed by a binding tail (which is then reported once as a
+reserved name).
+---
+private pure func can_start_named_statement(builder: DiscoveryBuilder) -> Bool:
+	if current_name(builder).is_some():
+		True
+	else if keyword_name_index(current_kind(builder)).is_some():
+		after_name: Int = builder.token_cursor + 1
+		(
+			starts_assignment_tail(token_kind_at(builder, after_name))
+			or (
+				token_kind_at(builder, after_name) == ColonSymbol
+				and colon_starts_typed_assignment(builder, after_name)
+			)
+		)
+	else:
+		False
+
+
+private pure func starts_assignment_tail(kind: TokenKind) -> Bool:
+	match kind:
+		EqualSymbol | QuestionEqualsSymbol | PlusEqualSymbol | MinusEqualSymbol | StarEqualSymbol | SlashEqualSymbol:
+			True
+		_:
+			False
+
+
+---
+Whether the `:` at `colon` starts a type annotation of a binding: an `=` or
+`?=` follows at bracket depth zero before the end of the line, a `,`, a `:`
+or an unmatched closing bracket.
+---
+private pure func colon_starts_typed_assignment(builder: DiscoveryBuilder, colon: Int) -> Bool:
+	var index: Int = colon + 1
+	var depth: Int = 0
+	var found: Bool = False
+	var scanning: Bool = True
+
+	while scanning:
+		match token_kind_at(builder, index):
+			EndOfFileToken | NewlineToken | DedentToken:
+				scanning = False
+			EqualSymbol | QuestionEqualsSymbol:
+				if depth == 0:
+					found = True
+					scanning = False
+				else:
+					index += 1
+			LeftParenSymbol | LeftBracketSymbol | LeftBraceSymbol:
+				depth += 1
+				index += 1
+			RightParenSymbol | RightBracketSymbol | RightBraceSymbol:
+				if depth == 0:
+					scanning = False
+				else:
+					depth -= 1
+					index += 1
+			CommaSymbol | ColonSymbol:
+				if depth == 0:
+					scanning = False
+				else:
+					index += 1
+			_:
+				index += 1
+
+	found
+
+
+---
+`name: T = value` or `name: T ?= value`. A compound assignment never has a
+type: `colon_starts_typed_assignment` looks for `=` or `?=` only.
+---
+private pure func parse_typed_named_statement(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = binder_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = consume_binder_name(builder)
+	out = parse_optional_type_annotation(out)
+	out = parse_named_assignment_tail(out, name, name_span, depth_before)
+	out
+
+
+---
+`name = value`, `name ?= value` or `name op= value`.
+---
+private pure func parse_named_statement(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = binder_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = consume_binder_name(builder)
+	out = parse_named_assignment_tail(out, name, name_span, depth_before)
+	out
+
+
+---
+The operator and value of a binding or assignment to `name`. Children pushed
+since `depth_before` (the type, when written) belong to the statement.
+---
+private pure func parse_named_assignment_tail(
+	builder: DiscoveryBuilder,
+	name: NameId,
+	name_span: Span,
+	depth_before: Int,
+) -> DiscoveryBuilder:
+	typed: Bool = child_stack_depth(builder) > depth_before
+
+	match current_kind(builder):
+		EqualSymbol:
+			if typed:
+				parse_named_value(builder, TypedBindingNode, name, name_span, depth_before)
+			else:
+				parse_named_value(builder, AssignmentNode, name, name_span, depth_before)
+		QuestionEqualsSymbol:
+			parse_question_bind_value(builder, name, name_span, depth_before)
+		PlusEqualSymbol:
+			parse_named_value(builder, AddAssignNode, name, name_span, depth_before)
+		MinusEqualSymbol:
+			parse_named_value(builder, SubtractAssignNode, name, name_span, depth_before)
+		StarEqualSymbol:
+			parse_named_value(builder, MultiplyAssignNode, name, name_span, depth_before)
+		SlashEqualSymbol:
+			parse_named_value(builder, DivideAssignNode, name, name_span, depth_before)
+		_:
+			reported: DiscoveryBuilder = report_at_current(
+				builder,
+				ExpectedAssignmentOperatorDiagnostic,
+			)
+			missing_statement(reported, name_span, depth_before)
+
+
+---
+The value after the operator at the cursor and the `kind` statement over it.
+---
+private pure func parse_named_value(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	name: NameId,
+	name_span: Span,
+	depth_before: Int,
+) -> DiscoveryBuilder:
+	advanced: DiscoveryBuilder = advance_token(builder)
+	valued: DiscoveryBuilder = parse_assignment_value(advanced, name_span)
+	finish_named_statement(valued, kind, name, name_span, depth_before)
+
+
+private pure func parse_question_bind_value(
+	builder: DiscoveryBuilder,
+	name: NameId,
+	name_span: Span,
+	depth_before: Int,
+) -> DiscoveryBuilder:
+	advanced: DiscoveryBuilder = advance_token(builder)
+	valued: DiscoveryBuilder = parse_assignment_value(advanced, name_span)
+	finish_question_bind(valued, name, name_span, depth_before)
+
+
+---
+Appends a named statement over the children pushed since `depth_before`
+and the value just parsed.
+---
+private pure func finish_named_statement(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	name: NameId,
+	name_span: Span,
+	depth_before: Int,
+) -> DiscoveryBuilder:
+	value_span: Span = node_span(builder, last_node_id(builder))
+	var out: DiscoveryBuilder = push_last_node(builder)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_named_parent_node_from_stack(
+		out,
+		kind,
+		span_covering(name_span, value_span),
+		name,
+		count,
+	)
+	out
+
+
+---
+`name ?= value`; `_ ?= value` is reported, since the unwrapped value needs a
+name.
+---
+private pure func finish_question_bind(
+	builder: DiscoveryBuilder,
+	name: NameId,
+	name_span: Span,
+	depth_before: Int,
+) -> DiscoveryBuilder:
+	if name_id_index(name) == DISCARD_NAME_INDEX:
+		reported: DiscoveryBuilder = append_plain_diagnostic(
+			builder,
+			DiscardedQuestionBindDiagnostic,
+			name_span,
+		)
+		finish_named_statement(reported, QuestionBindNode, name, name_span, depth_before)
+	else:
+		finish_named_statement(builder, QuestionBindNode, name, name_span, depth_before)
+
+
+---
+A statement that could not be parsed, over the children pushed since
+`depth_before`.
+---
+private pure func missing_statement(
+	builder: DiscoveryBuilder,
+	span: Span,
+	depth_before: Int,
+) -> DiscoveryBuilder:
+	count: Int = child_stack_depth(builder) - depth_before
+	append_parent_node_from_stack(builder, MissingExpressionNode, span, count)
+
+
+---
+An `=` after a parsed expression: an assignment to a name, a subscript
+assignment, or a reported field assignment. Any other expression is left as
+it is and the `=` unconsumed.
+---
+private pure func assignment_after_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, EqualSymbol):
+		target: NodeRow = node_row_at(builder, last_node_id(builder))
+
+		match target.kind:
+			IdentifierNode:
+				-- A named argument (`f(name = value)`): the assignment records the
+				-- name itself, so the identifier node is discarded, not orphaned.
+				depth: Int = child_stack_depth(builder)
+				discarded: DiscoveryBuilder = discard_last_leaf_node(builder)
+				advanced: DiscoveryBuilder = advance_token(discarded)
+				valued: DiscoveryBuilder = parse_assignment_value(advanced, target.span)
+				finish_named_statement(
+					valued,
+					AssignmentNode,
+					name_id_at_row(target.payload),
+					target.span,
+					depth,
+				)
+			SubscriptNode:
+				pushed: DiscoveryBuilder = push_last_node(builder)
+				finish_target_assignment(pushed, SubscriptAssignmentNode, target.span)
+			FieldAccessNode:
+				pushed: DiscoveryBuilder = push_last_node(builder)
+				reported: DiscoveryBuilder = append_plain_diagnostic(
+					pushed,
+					FieldAssignmentDiagnostic,
+					target.span,
+				)
+				finish_target_assignment(reported, MissingExpressionNode, target.span)
+			_:
+				builder
+	else:
+		builder
+
+
+---
+The value after an `=` whose target the caller pushed, and the node over
+both.
+---
+private pure func finish_target_assignment(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	target_span: Span,
+) -> DiscoveryBuilder:
+	advanced: DiscoveryBuilder = advance_token(builder)
+	var out: DiscoveryBuilder = parse_assignment_value(advanced, target_span)
+	value_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = append_parent_node_from_stack(
+		out,
+		kind,
+		span_covering(target_span, value_span),
+		2,
+	)
+	out
+
+
+---
+Whether `(` starts a tuple destructuring assignment: two or more binder
+names (names, `_`, or reserved keywords, which are then reported) separated
+by commas, a `)`, and `=`.
+---
+private pure func starts_tuple_destructure(builder: DiscoveryBuilder) -> Bool:
+	var index: Int = builder.token_cursor + 1
+	var saw_comma: Bool = False
+	var expecting_name: Bool = True
+	var closed: Bool = False
+	var valid: Bool = True
+
+	while valid and not closed:
+		kind: TokenKind = token_kind_at(builder, index)
+
+		if expecting_name:
+			if (
+				kind == IdentifierToken
+				or kind == UnderscoreSymbol
+				or is_reserved_keyword(kind)
+			):
+				index += 1
+				expecting_name = False
+			else:
+				valid = False
+		else if kind == CommaSymbol:
+			saw_comma = True
+			index += 1
+
+			if token_kind_at(builder, index) == RightParenSymbol:
+				closed = True
+			else:
+				expecting_name = True
+		else if kind == RightParenSymbol:
+			closed = True
+		else:
+			valid = False
+
+	valid and closed and saw_comma and token_kind_at(builder, index + 1) == EqualSymbol
+
+
+private pure func is_reserved_keyword(kind: TokenKind) -> Bool:
+	keyword_name_index(kind).is_some() and not is_soft_keyword(kind)
+
+
+---
+`(a, b) = value`.
+---
+private pure func parse_tuple_destructure(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	var out: DiscoveryBuilder = parse_tuple_binder(advanced, start, DestructureBinderNode)
+	out = expect_token(out, EqualSymbol, ExpectedEqualDiagnostic)
+	out = parse_assignment_value(out, start)
+	value_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		TupleDestructureNode,
+		span_covering(start, value_span),
+		count,
+	)
+	out
+
+
+---
+The names of a tuple binder after its `(`, through the `)`, each a `kind`
+leaf pushed on the child stack; `_` is allowed. Two to four names.
+---
+private pure func parse_tuple_binder(
+	builder: DiscoveryBuilder,
+	start: Span,
+	kind: NodeKind,
+) -> DiscoveryBuilder:
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = push_binder_leaf(builder, kind)
+	var end: Span = node_span(out, last_node_id(out))
+
+	if at(out, CommaSymbol):
+		out = advance_token(out)
+		var parsing: Bool = True
+
+		while parsing and not at(out, EndOfFileToken):
+			if at(out, RightParenSymbol):
+				out = report_at_current(out, ExpectedNameDiagnostic)
+				parsing = False
+			else:
+				out = push_binder_leaf(out, kind)
+				end = node_span(out, last_node_id(out))
+
+				if at(out, CommaSymbol):
+					out = advance_token(out)
+
+					if at(out, RightParenSymbol):
+						parsing = False
+				else:
+					parsing = False
+	else:
+		out = report_at_current(out, ExpectedCommaDiagnostic)
+
+	if at(out, RightParenSymbol):
+		end = current_span(out)
+
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+
+	if count < MIN_TUPLE_BINDER_NAMES or count > MAX_TUPLE_BINDER_NAMES:
+		out = append_plain_diagnostic(
+			out,
+			TupleArityDiagnostic,
+			span_covering(start, end),
+		)
+
+	out
+
+
+---
+A binder name (`_` allowed) as a `kind` leaf, pushed on the child stack.
+---
+private pure func push_binder_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+	name: NameId = binder_name_at_cursor(builder)
+	span: Span = current_span(builder)
+	after_name: DiscoveryBuilder = consume_binder_name(builder)
+	with_leaf: DiscoveryBuilder = append_name_leaf_node(after_name, kind, span, name)
+	push_last_node(with_leaf)
+
+
+-- Control flow.
+---
+`while condition: body`.
+---
+private pure func parse_while(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	parsed: DiscoveryBuilder = parse_expression(advanced)
+	var out: DiscoveryBuilder = push_last_node(parsed)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_block_after_colon(out, start)
+	out = finish_with_body(out, WhileNode, start, 2)
+	out
+
+
+---
+Appends a `kind` node over `count` children, the last of which is the body
+just parsed (and not yet pushed), spanning from `start` to the body.
+---
+private pure func finish_with_body(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	start: Span,
+	count: Int,
+) -> DiscoveryBuilder:
+	body_span: Span = node_span(builder, last_node_id(builder))
+	var out: DiscoveryBuilder = push_last_node(builder)
+	out = append_parent_node_from_stack(
+		out,
+		kind,
+		span_covering(start, body_span),
+		count,
+	)
+	out
+
+
+---
+`if condition: block [else if ... | else: block]`.
+---
+private pure func parse_if(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	parsed: DiscoveryBuilder = parse_expression(advanced)
+	var out: DiscoveryBuilder = push_last_node(parsed)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_block_after_colon(out, anchor)
+	var end: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+
+	if at(out, ElseKeyword):
+		out = parse_else_branch(out)
+		end = node_span(out, last_node_id(out))
+		out = push_last_node(out)
+
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		IfNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+private pure func parse_else_branch(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	else_span: Span = current_span(builder)
+	out: DiscoveryBuilder = advance_token(builder)
+
+	if at(out, IfKeyword):
+		parse_if(out, else_span)
+	else:
+		expected: DiscoveryBuilder = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+		parse_block_after_colon(expected, else_span)
+
+
+---
+`match scrutinee:` then an indented block of cases.
+---
+private pure func parse_match(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	parsed: DiscoveryBuilder = parse_expression(advanced)
+	var out: DiscoveryBuilder = push_last_node(parsed)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = expect_token(out, NewlineToken, ExpectedNewlineDiagnostic)
+	anchor_position: LineColumn = span_start_position(out, anchor)
+	out = consume_block_indent(out, anchor_position)
+	out = skip_newlines(out)
+	out = parse_match_cases(out, anchor_position)
+	end: Span = arms_end_span(out, start)
+	out = skip_dedent(out)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		MatchNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+---
+Where a match or select ends: its closing dedent, or its keyword when the
+arms end some other way.
+---
+private pure func arms_end_span(builder: DiscoveryBuilder, start: Span) -> Span:
+	if at(builder, DedentToken):
+		current_span(builder)
+	else:
+		start
+
+
+private pure func skip_dedent(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, DedentToken):
+		advance_token(builder)
+	else:
+		builder
+
+
+---
+Match cases while the tokens sit past the anchor, each pushed.
+---
+private pure func parse_match_cases(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	if at_block_end(builder) or not indented_past(builder, builder.token_cursor, anchor):
+		builder
+	else:
+		parse_match_case_run(builder, anchor)
+
+
+private pure func parse_match_case_run(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_match_case_and_push(builder, anchor)
+
+	while not at_block_end(out) and indented_past(out, out.token_cursor, anchor):
+		out = parse_match_case_and_push(out, anchor)
+
+	out
+
+
+private pure func parse_match_case_and_push(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	before: Int = builder.token_cursor
+	with_case: DiscoveryBuilder = parse_match_case(builder)
+	var out: DiscoveryBuilder = push_last_node(with_case)
+	out = skip_newlines(out)
+
+	if (
+		out.token_cursor == before
+		and not at_block_end(out)
+		and indented_past(out, out.token_cursor, anchor)
+	):
+		out = advance_token(out)
+
+	out
+
+
+---
+`pattern: body`: a block on the next lines, a `match` or `if` on the same
+line (anchored at the pattern), or a statement.
+---
+private pure func parse_match_case(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_pattern(builder)
+	pattern_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_case_body(out, pattern_span)
+	out = finish_with_body(out, MatchCaseNode, pattern_span, 2)
+	out
+
+
+private pure func parse_case_body(
+	builder: DiscoveryBuilder,
+	pattern_span: Span,
+) -> DiscoveryBuilder:
+	match current_kind(builder):
+		NewlineToken:
+			parse_block_after_colon(builder, pattern_span)
+		MatchKeyword:
+			parse_match(builder, pattern_span)
+		IfKeyword:
+			parse_if(builder, pattern_span)
+		_:
+			parse_statement(builder)
+
+
+---
+`select:` then an indented block of arms.
+---
+private pure func parse_select(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = expect_token(out, NewlineToken, ExpectedNewlineDiagnostic)
+	anchor_position: LineColumn = span_start_position(out, anchor)
+	out = consume_block_indent(out, anchor_position)
+	out = skip_newlines(out)
+	out = parse_select_arms(out, anchor_position)
+	end: Span = arms_end_span(out, start)
+	out = skip_dedent(out)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		SelectNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+private pure func parse_select_arms(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	if at_block_end(builder) or not indented_past(builder, builder.token_cursor, anchor):
+		builder
+	else:
+		parse_select_arm_run(builder, anchor)
+
+
+private pure func parse_select_arm_run(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_select_arm_and_push(builder, anchor)
+
+	while not at_block_end(out) and indented_past(out, out.token_cursor, anchor):
+		out = parse_select_arm_and_push(out, anchor)
+
+	out
+
+
+private pure func parse_select_arm_and_push(
+	builder: DiscoveryBuilder,
+	anchor: LineColumn,
+) -> DiscoveryBuilder:
+	before: Int = builder.token_cursor
+	with_arm: DiscoveryBuilder = parse_select_arm(builder)
+	var out: DiscoveryBuilder = push_last_node(with_arm)
+	out = skip_newlines(out)
+
+	if (
+		out.token_cursor == before
+		and not at_block_end(out)
+		and indented_past(out, out.token_cursor, anchor)
+	):
+		out = advance_token(out)
+
+	out
+
+
+---
+`sealed channel: body`, `_ after timeout: body`, or `name from channel: body`.
+---
+private pure func parse_select_arm(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, SealedKeyword):
+		start: Span = current_span(builder)
+		advanced: DiscoveryBuilder = advance_token(builder)
+		parse_select_channel_arm(advanced, start, SelectSealedArmNode)
+	else if at(builder, UnderscoreSymbol) and peek_kind(builder, 1) == AfterKeyword:
+		start: Span = current_span(builder)
+		-- Past the `_` and the `after`.
+		after_keyword_index: Int = builder.token_cursor + 2
+		after_keyword: DiscoveryBuilder = move_token_cursor(builder, after_keyword_index)
+		parse_select_channel_arm(after_keyword, start, SelectAfterArmNode)
+	else:
+		parse_select_receive_arm(builder)
+
+
+---
+The expression, `:` and body of a sealed or timeout arm, from after its
+leading keyword.
+---
+private pure func parse_select_channel_arm(
+	builder: DiscoveryBuilder,
+	start: Span,
+	kind: NodeKind,
+) -> DiscoveryBuilder:
+	parsed: DiscoveryBuilder = parse_expression(builder)
+	var out: DiscoveryBuilder = push_last_node(parsed)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_block_after_colon(out, start)
+	out = finish_with_body(out, kind, start, 2)
+	out
+
+
+---
+`name from channel: body`; the binder may also be `_`, `after` or `from`.
+---
+private pure func parse_select_receive_arm(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	binder: NameId = receive_binder_at_cursor(builder)
+	var out: DiscoveryBuilder = consume_receive_binder(builder)
+	out = expect_token(out, FromKeyword, ExpectedKeywordDiagnostic)
+	out = parse_expression(out)
+	out = push_last_node(out)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_block_after_colon(out, start)
+	body_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = append_named_parent_node_from_stack(
+		out,
+		SelectReceiveArmNode,
+		span_covering(start, body_span),
+		binder,
+		2,
+	)
+	out
+
+
+private pure func receive_binder_at_cursor(builder: DiscoveryBuilder) -> NameId:
+	if at(builder, FromKeyword):
+		match keyword_name_index(FromKeyword):
+			Some(index):
+				name_id_at_row(index)
+			None:
+				binder_name_at_cursor(builder)
+	else:
+		binder_name_at_cursor(builder)
+
+
+private pure func consume_receive_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, FromKeyword):
+		advance_token(builder)
+	else:
+		consume_binder_name(builder)
+
+
+---
+`for binder in iterable: body`, or `for x in xs concurrently(...): body`.
+---
+private pure func parse_for(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	tuple_binder: Bool = at(out, LeftParenSymbol)
+	out = parse_loop_binder(out)
+	out = expect_token(out, InKeyword, ExpectedKeywordDiagnostic)
+	out = parse_expression(out)
+	out = push_last_node(out)
+
+	if at(out, ConcurrentlyKeyword):
+		if tuple_binder:
+			out = report_at_current(out, ConcurrentForTupleBinderDiagnostic)
+
+		out = advance_token(out)
+		out = parse_concurrent_parameters_after_concurrently(out)
+		out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+		out = parse_block_after_colon(out, anchor)
+		count: Int = child_stack_depth(out) + 1 - depth_before
+		out = finish_with_body(out, ConcurrentForNode, start, count)
+	else:
+		out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+		out = parse_block_after_colon(out, anchor)
+		count: Int = child_stack_depth(out) + 1 - depth_before
+		out = finish_with_body(out, ForNode, start, count)
+
+	out
+
+
+---
+A loop variable, or `(a, b)` loop variables, pushed on the child stack.
+---
+private pure func parse_loop_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, LeftParenSymbol):
+		parse_tuple_loop_binder(builder)
+	else:
+		push_binder_leaf(builder, LoopBinderNode)
+
+
+private pure func parse_tuple_loop_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	var out: DiscoveryBuilder = parse_tuple_binder(advanced, start, LoopBinderNode)
+	count: Int = child_stack_depth(out) - depth_before
+	span: Span = span_covering(start, token_at(out, out.token_cursor - 1).span)
+	out = append_parent_node_from_stack(out, TupleLoopBinderNode, span, count)
+	out = push_last_node(out)
+	out
+
+
+---
+The `(name: value, ...)` after `concurrently`, each parameter pushed; a
+missing `(` is reported.
+---
+private pure func parse_concurrent_parameters_after_concurrently(
+	builder: DiscoveryBuilder,
+) -> DiscoveryBuilder:
+	if at(builder, LeftParenSymbol):
+		advanced: DiscoveryBuilder = advance_token(builder)
+		parse_concurrent_parameter_list(advanced)
+	else:
+		report_at_current(builder, ExpectedLeftParenDiagnostic)
+
+
+---
+Concurrent parameters after `(`, through the `)`; at least one.
+---
+private pure func parse_concurrent_parameter_list(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_concurrent_parameters(builder)
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	out
+
+
+private pure func parse_concurrent_parameters(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, RightParenSymbol):
+		report_at_current(builder, ExpectedConcurrentParameterDiagnostic)
+	else if at(builder, EndOfFileToken):
+		builder
+	else:
+		parse_concurrent_parameter_run(builder)
+
+
+private pure func parse_concurrent_parameter_run(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_concurrent_parameter(builder)
+
+	while not at(out, RightParenSymbol) and not at(out, EndOfFileToken):
+		out = parse_concurrent_parameter(out)
+
+	out
+
+
+---
+`name: value` and the comma after it, pushed. It always moves the cursor
+unless the cursor is at the `)`, so the list above ends.
+---
+private pure func parse_concurrent_parameter(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	before: Int = builder.token_cursor
+	name: NameId = referenced_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	var out: DiscoveryBuilder = consume_referenced_name(builder)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_expression(out)
+	value_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = append_named_parent_node_from_stack(
+		out,
+		ConcurrentParameterNode,
+		span_covering(name_span, value_span),
+		name,
+		1,
+	)
+	out = push_last_node(out)
+
+	if at(out, CommaSymbol):
+		out = advance_token(out)
+	else if not at(out, RightParenSymbol):
+		out = report_at_current(out, ExpectedCommaDiagnostic)
+
+	if out.token_cursor == before and not at(out, RightParenSymbol):
+		out = advance_token(out)
+
+	out
+
+
+---
+`concurrent[(params)]: body`.
+---
+private pure func parse_concurrent_block(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+
+	if at(out, LeftParenSymbol):
+		out = advance_token(out)
+		out = parse_concurrent_parameter_list(out)
+
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_block_after_colon(out, start)
+	count: Int = child_stack_depth(out) + 1 - depth_before
+	out = finish_with_body(out, ConcurrentBlockNode, start, count)
+	out
+
+
+---
+`debug: body`; `debug.name` is the name `debug` (see `parse_primary`).
+---
+private pure func parse_debug_block(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	var out: DiscoveryBuilder = expect_token(advanced, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_block_after_colon(out, start)
+	out = finish_with_body(out, DebugBlockNode, start, 1)
+	out
+
+
+---
+`with name [: T] = value: body` or `with name [: T] ?= value [on e =>
+mapped]: body`.
+---
+private pure func parse_with(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	with_binding: DiscoveryBuilder = parse_with_binding(advanced)
+	var out: DiscoveryBuilder = push_last_node(with_binding)
+
+	if at(out, CommaSymbol):
+		out = report_at_current(out, WithMultipleBindingsDiagnostic)
+		out = skip_to_header_colon(out)
+
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_block_after_colon(out, start)
+	out = finish_with_body(out, WithNode, start, 2)
+	out
+
+
+---
+Skips the extra bindings of a reported multi-binding `with` header, up to
+its `:` or the end of its line.
+---
+private pure func skip_to_header_colon(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var index: Int = builder.token_cursor
+
+	while (
+		token_kind_at(builder, index) != EndOfFileToken
+		and token_kind_at(builder, index) != NewlineToken
+		and token_kind_at(builder, index) != ColonSymbol
+	):
+		index += 1
+
+	move_token_cursor(builder, index)
+
+
+private pure func parse_with_binding(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = binder_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = consume_binder_name(builder)
+	out = parse_optional_type_annotation(out)
+	tried: Bool = at(out, QuestionEqualsSymbol)
+
+	if tried:
+		out = advance_token(out)
+	else:
+		out = expect_token(out, EqualSymbol, ExpectedEqualDiagnostic)
+
+	out = parse_expression(out)
+	var end: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+
+	if tried and at(out, OnKeyword):
+		out = parse_with_error_map(out)
+		end = node_span(out, last_node_id(out))
+		out = push_last_node(out)
+
+	kind: NodeKind = if tried:
+		WithTryBindingNode
+	else:
+		WithBindingNode
+
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_named_parent_node_from_stack(
+		out,
+		kind,
+		span_covering(name_span, end),
+		name,
+		count,
+	)
+	out
+
+
+---
+`on name => value`.
+---
+private pure func parse_with_error_map(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = advance_token(builder)
+	name: NameId = binder_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_binder_name(out)
+	out = expect_token(out, FatArrowSymbol, ExpectedFatArrowDiagnostic)
+	out = parse_expression(out)
+	value_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = append_named_parent_node_from_stack(
+		out,
+		WithErrorMapNode,
+		span_covering(name_span, value_span),
+		name,
+		1,
+	)
+	out
+
+
+-- Lambdas.
+---
+`func(params) [-> R]: body` or `pure func(...)`. The body is an expression
+on the `:` line, a block on the next lines, or an indented block on a later
+line reached without a newline token (inside brackets).
+---
+private pure func parse_lambda(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+
+	kind: NodeKind = if at(builder, PureKeyword):
+		PureLambdaNode
+	else:
+		LambdaNode
+
+	var out: DiscoveryBuilder = skip_pure_keyword(builder)
+	out = expect_token(out, FuncKeyword, ExpectedKeywordDiagnostic)
+
+	if at(out, LeftParenSymbol):
+		out = advance_token(out)
+		out = parse_lambda_parameters(out)
+	else:
+		out = report_at_current(out, ExpectedLeftParenDiagnostic)
+
+	if at(out, ArrowSymbol):
+		advanced: DiscoveryBuilder = advance_token(out)
+		typed: DiscoveryBuilder = parse_type(advanced)
+		out = push_last_node(typed)
+
+	colon_line: Int = span_start_line(out, current_span(out))
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_lambda_body(out, colon_line, anchor)
+	count: Int = child_stack_depth(out) + 1 - depth_before
+	out = finish_with_body(out, kind, start, count)
+	out
+
+
+private pure func parse_lambda_body(
+	builder: DiscoveryBuilder,
+	colon_line: Int,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	if at(builder, NewlineToken):
+		parse_block_after_colon(builder, anchor)
+	else if span_start_line(builder, current_span(builder)) > colon_line and indented_past(
+		builder,
+		builder.token_cursor,
+		span_start_position(builder, anchor),
+	):
+		parse_indented_block(builder, anchor)
+	else:
+		parse_expression(builder)
+
+
+---
+Lambda parameters after `(`, through `)`, each pushed; they may continue on
+indented lines.
+---
+private pure func parse_lambda_parameters(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = skip_newlines(builder)
+	var opened_indent: Bool = False
+
+	if at(out, IndentToken):
+		opened_indent = True
+		out = advance_token(out)
+		out = skip_newlines(out)
+
+	if not at(out, RightParenSymbol):
+		var parsing: Bool = True
+
+		while parsing and not at(out, EndOfFileToken):
+			out = parse_lambda_parameter(out)
+			out = push_last_node(out)
+
+			if at(out, CommaSymbol):
+				out = advance_token(out)
+				out = skip_newlines(out)
+
+				if opened_indent and at(out, DedentToken):
+					out = advance_token(out)
+					out = skip_newlines(out)
+
+				if at(out, RightParenSymbol):
+					parsing = False
+			else:
+				parsing = False
+
+	out = skip_newlines(out)
+
+	if opened_indent and at(out, DedentToken):
+		out = advance_token(out)
+		out = skip_newlines(out)
+
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	out
+
+
+private pure func parse_lambda_parameter(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = binder_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	after_name: DiscoveryBuilder = consume_binder_name(builder)
+	var out: DiscoveryBuilder = parse_optional_type_annotation(after_name)
+	count: Int = child_stack_depth(out) - depth_before
+
+	span: Span = if count > 0:
+		span_covering(
+			name_span,
+			node_span(out, last_node_id(out)),
+		)
+	else:
+		name_span
+
+	out = append_named_parent_node_from_stack(out, LambdaParameterNode, span, name, count)
+	out
+
+
+-- Expressions.
+---
+An expression at the lowest precedence, anchored at its own start.
+---
+pure func parse_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	anchor: Span = current_span(builder)
+	parse_expression_at(builder, LOWEST_PRECEDENCE, anchor)
+
+
+---
+An expression that may start a block-bearing construct (`if`, `match`,
+`select`, `for`, a lambda) anchored at `anchor` rather than at itself.
+---
+private pure func parse_anchored_expression(
+	builder: DiscoveryBuilder,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	match current_kind(builder):
+		IfKeyword:
+			parse_if(builder, anchor)
+		MatchKeyword:
+			parse_match(builder, anchor)
+		SelectKeyword:
+			parse_select(builder, anchor)
+		ForKeyword:
+			parse_for(builder, anchor)
+		FuncKeyword | PureKeyword:
+			parse_lambda(builder, anchor)
+		_:
+			parse_expression_at(builder, LOWEST_PRECEDENCE, anchor)
+
+
+---
+Binary operators of at least `min_precedence` over prefix expressions; at
+the lowest precedence, also an assignment after the expression.
+---
+private pure func parse_expression_at(
+	builder: DiscoveryBuilder,
+	min_precedence: Int,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_prefix(builder, anchor)
+	var parsing: Bool = True
+
+	while parsing and not at(out, EndOfFileToken):
+		kind: TokenKind = current_kind(out)
+
+		if kind == AsKeyword:
+			if ASCRIPTION_PRECEDENCE < min_precedence:
+				parsing = False
+			else:
+				out = parse_ascription(out)
+		else:
+			match binary_operator(kind):
+				Some(operator):
+					if operator_precedence(operator) < min_precedence:
+						parsing = False
+					else:
+						out = parse_binary(out, operator, anchor)
+				None:
+					parsing = False
+
+	if min_precedence <= LOWEST_PRECEDENCE:
+		out = assignment_after_expression(out)
+
+	out
+
+
+---
+`value as T`, the value parsed.
+---
+private pure func parse_ascription(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	value_span: Span = node_span(builder, last_node_id(builder))
+	pushed: DiscoveryBuilder = push_last_node(builder)
+	advanced: DiscoveryBuilder = advance_token(pushed)
+	var out: DiscoveryBuilder = parse_type(advanced)
+	type_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = append_parent_node_from_stack(
+		out,
+		AscriptionNode,
+		span_covering(value_span, type_span),
+		2,
+	)
+	out
+
+
+---
+`left op right`, the left operand parsed; the right operand binds tighter.
+---
+private pure func parse_binary(
+	builder: DiscoveryBuilder,
+	operator: BinaryOperator,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	precedence: Int = operator_precedence(operator)
+	left_span: Span = node_span(builder, last_node_id(builder))
+	pushed: DiscoveryBuilder = push_last_node(builder)
+	advanced: DiscoveryBuilder = advance_token(pushed)
+	var out: DiscoveryBuilder = skip_newlines(advanced)
+	out = parse_expression_at(out, precedence + 1, anchor)
+	right_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = append_parent_node_from_stack(
+		out,
+		operator_node_kind(operator),
+		span_covering(left_span, right_span),
+		2,
+	)
+	out
+
+
+---
+The binary operators. `binary_operator` reads one from its token, and
+`operator_precedence` and `operator_node_kind` give its precedence and the
+node it makes: each is one exhaustive match over this enum.
+---
+private enum BinaryOperator:
+	OrOperator
+	AndOperator
+	EqualOperator
+	NotEqualOperator
+	LessOperator
+	LessEqualOperator
+	GreaterOperator
+	GreaterEqualOperator
+	RangeOperator
+	AddOperator
+	SubtractOperator
+	MultiplyOperator
+	DivideOperator
+	ModuloOperator
+
+
+private pure func binary_operator(kind: TokenKind) -> Option[BinaryOperator]:
+	match kind:
+		OrKeyword:
+			Some(OrOperator)
+		AndKeyword:
+			Some(AndOperator)
+		EqualEqualSymbol:
+			Some(EqualOperator)
+		NotEqualSymbol:
+			Some(NotEqualOperator)
+		LessSymbol:
+			Some(LessOperator)
+		LessEqualSymbol:
+			Some(LessEqualOperator)
+		GreaterSymbol:
+			Some(GreaterOperator)
+		GreaterEqualSymbol:
+			Some(GreaterEqualOperator)
+		DotDotSymbol:
+			Some(RangeOperator)
+		PlusSymbol:
+			Some(AddOperator)
+		MinusSymbol:
+			Some(SubtractOperator)
+		StarSymbol:
+			Some(MultiplyOperator)
+		SlashSymbol:
+			Some(DivideOperator)
+		PercentSymbol:
+			Some(ModuloOperator)
+		_:
+			None
+
+
+private pure func operator_precedence(operator: BinaryOperator) -> Int:
+	match operator:
+		OrOperator:
+			OR_PRECEDENCE
+		AndOperator:
+			AND_PRECEDENCE
+		EqualOperator | NotEqualOperator | LessOperator | LessEqualOperator | GreaterOperator | GreaterEqualOperator:
+			COMPARISON_PRECEDENCE
+		RangeOperator:
+			RANGE_PRECEDENCE
+		AddOperator | SubtractOperator:
+			ADDITIVE_PRECEDENCE
+		MultiplyOperator | DivideOperator | ModuloOperator:
+			MULTIPLICATIVE_PRECEDENCE
+
+
+private pure func operator_node_kind(operator: BinaryOperator) -> NodeKind:
+	match operator:
+		OrOperator:
+			OrNode
+		AndOperator:
+			AndNode
+		EqualOperator:
+			EqualNode
+		NotEqualOperator:
+			NotEqualNode
+		LessOperator:
+			LessNode
+		LessEqualOperator:
+			LessEqualNode
+		GreaterOperator:
+			GreaterNode
+		GreaterEqualOperator:
+			GreaterEqualNode
+		RangeOperator:
+			RangeNode
+		AddOperator:
+			AddNode
+		SubtractOperator:
+			SubtractNode
+		MultiplyOperator:
+			MultiplyNode
+		DivideOperator:
+			DivideNode
+		ModuloOperator:
+			ModuloNode
+
+
+---
+`-x`, `not x`, `detach x`, the block-bearing constructs (anchored at
+`anchor`), or a primary expression with its postfix operations.
+---
+private pure func parse_prefix(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	match current_kind(builder):
+		MinusSymbol:
+			parse_unary(builder, NegateNode, anchor)
+		NotKeyword:
+			parse_unary(builder, NotNode, anchor)
+		DetachKeyword:
+			parse_unary(builder, DetachNode, anchor)
+		FuncKeyword | PureKeyword:
+			parse_lambda(builder, anchor)
+		IfKeyword:
+			parse_if(builder, anchor)
+		MatchKeyword:
+			parse_match(builder, anchor)
+		SelectKeyword:
+			parse_select(builder, anchor)
+		ForKeyword:
+			parse_for(builder, anchor)
+		_:
+			with_primary: DiscoveryBuilder = parse_primary(builder)
+			parse_postfix(with_primary, anchor)
+
+
+private pure func parse_unary(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	var out: DiscoveryBuilder = parse_prefix(advanced, anchor)
+	out = finish_with_body(out, kind, start, 1)
+	out
+
+
+---
+Field accesses, calls and subscripts after a primary expression. A `.` may
+start a continuation line (`value\n\t.method()`); each indent such a line
+opens is closed by the dedent that ends the chain.
+---
+private pure func parse_postfix(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	-- Builder threading rule 1: a no-op move is the unconditional first update.
+	cursor: Int = builder.token_cursor
+	var out: DiscoveryBuilder = move_token_cursor(builder, cursor)
+	var parsing: Bool = True
+	var continuation_indents: Int = 0
+
+	while parsing and not at(out, EndOfFileToken):
+		if continuation_indents > 0 and at(out, DedentToken):
+			out = advance_token(out)
+			continuation_indents -= 1
+			parsing = continuation_indents > 0
+		else if continuation_indents > 0 and at(out, NewlineToken):
+			after_newline: Int = out.token_cursor + 1
+
+			if token_kind_at(out, after_newline) == DedentToken:
+				out = move_token_cursor(out, after_newline + 1)
+				continuation_indents -= 1
+				parsing = continuation_indents > 0
+			else:
+				continuation: Int = continuation_start(out)
+
+				if continuation == out.token_cursor:
+					-- A new line that continues nothing ends the chain.
+					parsing = False
+				else:
+					if token_kind_at(out, continuation - 1) == IndentToken:
+						continuation_indents += 1
+
+					out = move_token_cursor(out, continuation)
+		else:
+			continuation: Int = continuation_start(out)
+
+			if continuation != out.token_cursor:
+				if token_kind_at(out, continuation - 1) == IndentToken:
+					continuation_indents += 1
+
+				out = move_token_cursor(out, continuation)
+
+			match current_kind(out):
+				DotSymbol:
+					out = parse_field_access(out)
+				LeftParenSymbol:
+					out = parse_call(out, anchor)
+				LeftBracketSymbol:
+					out = parse_subscript(out, anchor)
+				_:
+					parsing = False
+
+	out
+
+
+---
+Where a postfix chain continues after a newline: the `.` on the next line
+(after an indent, which the chain then owns), or the cursor itself when no
+`.` continues it.
+---
+private pure func continuation_start(builder: DiscoveryBuilder) -> Int:
+	cursor: Int = builder.token_cursor
+
+	if token_kind_at(builder, cursor) != NewlineToken:
+		cursor
+	else if token_kind_at(builder, cursor + 1) == IndentToken:
+		if token_kind_at(builder, cursor + 2) == DotSymbol:
+			cursor + 2
+		else:
+			cursor
+	else if token_kind_at(builder, cursor + 1) == DotSymbol:
+		cursor + 1
+	else:
+		cursor
+
+
+---
+`.field` after a receiver.
+---
+private pure func parse_field_access(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	receiver_span: Span = node_span(builder, last_node_id(builder))
+	pushed: DiscoveryBuilder = push_last_node(builder)
+	var out: DiscoveryBuilder = advance_token(pushed)
+	field: NameId = referenced_name_at_cursor(out)
+	field_span: Span = current_span(out)
+	out = consume_referenced_name(out)
+	out = append_named_parent_node_from_stack(
+		out,
+		FieldAccessNode,
+		span_covering(receiver_span, field_span),
+		field,
+		1,
+	)
+	out
+
+
+---
+`(arguments)` after a callee.
+---
+private pure func parse_call(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	callee_span: Span = node_span(builder, last_node_id(builder))
+	depth_before: Int = child_stack_depth(builder)
+	pushed: DiscoveryBuilder = push_last_node(builder)
+	var out: DiscoveryBuilder = advance_token(pushed)
+	out = parse_expression_list(out, RightParenSymbol, True, anchor)
+	end: Span = closing_span_or(out, RightParenSymbol, callee_span)
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		CallNode,
+		span_covering(callee_span, end),
+		count,
+	)
+	out
+
+
+---
+`[indices]` after a target.
+---
+private pure func parse_subscript(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
+	target_span: Span = node_span(builder, last_node_id(builder))
+	depth_before: Int = child_stack_depth(builder)
+	pushed: DiscoveryBuilder = push_last_node(builder)
+	var out: DiscoveryBuilder = advance_token(pushed)
+	out = parse_expression_list(out, RightBracketSymbol, False, anchor)
+	end: Span = closing_span_or(out, RightBracketSymbol, target_span)
+	out = expect_token(out, RightBracketSymbol, ExpectedRightBracketDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		SubscriptNode,
+		span_covering(target_span, end),
+		count,
+	)
+	out
+
+
+---
+The span of the closing `kind` token at the cursor, or `fallback` when the
+cursor is not at one (the caller then reports it).
+---
+private pure func closing_span_or(
+	builder: DiscoveryBuilder,
+	kind: TokenKind,
+	fallback: Span,
+) -> Span:
+	if at(builder, kind):
+		current_span(builder)
+	else:
+		fallback
+
+
+---
+Expressions separated by commas up to `end` (not consumed), each pushed;
+with `allow_empty` there may be none. After a comma, newlines and dedents
+that lead only to `end` are consumed.
+---
+private pure func parse_expression_list(
+	builder: DiscoveryBuilder,
+	end: TokenKind,
+	allow_empty: Bool,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	if allow_empty and at(builder, end):
+		builder
+	else if at(builder, EndOfFileToken):
+		builder
+	else:
+		parse_expression_items(builder, end, anchor)
+
+
+private pure func parse_expression_items(
+	builder: DiscoveryBuilder,
+	end: TokenKind,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	with_item: DiscoveryBuilder = parse_anchored_expression(builder, anchor)
+	var out: DiscoveryBuilder = push_last_node(with_item)
+	var parsing: Bool = True
+
+	while parsing:
+		if at(out, CommaSymbol):
+			out = advance_token(out)
+			layout_follows: Bool = at(out, NewlineToken) or at(out, DedentToken)
+			out = skip_newlines(out)
+
+			if layout_follows:
+				out = consume_layout_before(out, end)
+
+			if at(out, end) or at(out, EndOfFileToken):
+				parsing = False
+			else:
+				out = parse_anchored_expression(out, anchor)
+				out = push_last_node(out)
+		else:
+			parsing = False
+
+	out
+
+
+---
+Consumes newlines and dedents when they lead only to `end`.
+---
+private pure func consume_layout_before(
+	builder: DiscoveryBuilder,
+	end: TokenKind,
+) -> DiscoveryBuilder:
+	var index: Int = builder.token_cursor
+
+	while (
+		token_kind_at(builder, index) == NewlineToken
+		or token_kind_at(builder, index) == DedentToken
+	):
+		index += 1
+
+	if token_kind_at(builder, index) == end:
+		move_token_cursor(builder, index)
+	else:
+		builder
+
+
+-- Primary expressions.
+---
+A name, literal, bracketed form, keyword expression, or a reported missing
+expression.
+---
+private pure func parse_primary(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	token: Token = current_token(builder)
+
+	match token.kind:
+		IdentifierToken:
+			parse_identifier_expression(builder)
+		IntLiteralToken:
+			literal_leaf(builder, IntegerLiteralNode)
+		FloatLiteralToken:
+			literal_leaf(builder, FloatLiteralNode)
+		NormalStringToken:
+			literal_leaf(builder, StringLiteralNode)
+		RawStringToken:
+			literal_leaf(builder, RawStringLiteralNode)
+		PipeStringToken:
+			literal_leaf(builder, PipeStringLiteralNode)
+		RawPipeStringToken:
+			literal_leaf(builder, RawPipeStringLiteralNode)
+		InterpolatedStringToken:
+			parse_interpolated_string(builder, InterpolatedStringNode)
+		InterpolatedPipeStringToken:
+			parse_interpolated_string(builder, InterpolatedPipeStringNode)
+		CharLiteralToken:
+			char_leaf(builder)
+		TrueKeyword:
+			keyword_leaf(builder, TrueLiteralNode)
+		FalseKeyword:
+			keyword_leaf(builder, FalseLiteralNode)
+		BreakKeyword:
+			keyword_leaf(builder, BreakNode)
+		ContinueKeyword:
+			keyword_leaf(builder, ContinueNode)
+		VoidKeyword | UnderscoreSymbol:
+			keyword_leaf(builder, VoidNode)
+		AfterKeyword | SealedKeyword:
+			keyword_name_leaf(builder)
+		BuiltinKeyword:
+			parse_builtin(builder)
+		IntoOpaqueKeyword:
+			parse_opaque_conversion(builder, IntoOpaqueNode)
+		FromOpaqueKeyword:
+			parse_opaque_conversion(builder, FromOpaqueNode)
+		FromKeyword:
+			parse_removed_conversion_or_name(
+				builder,
+				FromOpaqueNode,
+				RemovedFromConversionDiagnostic,
+			)
+		FuncKeyword | PureKeyword:
+			parse_lambda(builder, token.span)
+		IfKeyword:
+			parse_if(builder, token.span)
+		MatchKeyword:
+			parse_match(builder, token.span)
+		SelectKeyword:
+			parse_select(builder, token.span)
+		DebugKeyword:
+			if peek_kind(builder, 1) == DotSymbol:
+				keyword_name_leaf(builder)
+			else:
+				parse_debug_block(builder)
+		WithKeyword:
+			parse_with(builder)
+		ConcurrentKeyword:
+			parse_concurrent_block(builder)
+		LeftParenSymbol:
+			parse_parenthesized(builder)
+		LeftBracketSymbol:
+			parse_list_literal(builder)
+		LeftBraceSymbol:
+			parse_braced(builder)
+		_:
+			missing_expression(builder)
+
+
+---
+Reports a missing expression and appends a `MissingExpressionNode`; the
+offending token is skipped unless it is a soft boundary.
+---
+private pure func missing_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	span: Span = current_span(builder)
+	recovered: DiscoveryBuilder = report_and_recover(builder, ExpectedExpressionDiagnostic)
+	append_leaf_node(recovered, MissingExpressionNode, span)
+
+
+private pure func literal_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+	token: Token = current_token(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	append_literal_leaf_node(advanced, kind, token.span, literal_id_at_row(token.payload))
+
+
+private pure func char_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	token: Token = current_token(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	append_codepoint_leaf_node(advanced, CharLiteralNode, token.span, token.payload)
+
+
+private pure func keyword_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+	span: Span = current_span(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	append_leaf_node(advanced, kind, span)
+
+
+---
+A keyword used as a name (`after`, `sealed`, `from`, `debug`): an identifier
+spelled as the keyword.
+---
+private pure func keyword_name_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	token: Token = current_token(builder)
+
+	match keyword_name_index(token.kind):
+		Some(index):
+			advanced: DiscoveryBuilder = advance_token(builder)
+			append_name_leaf_node(advanced, IdentifierNode, token.span, name_id_at_row(index))
+		None:
+			missing_expression(builder)
+
+
+---
+A name, or the removed `into Type(...)` conversion.
+---
+private pure func parse_identifier_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	token: Token = current_token(builder)
+
+	if is_removed_into_spelling(token):
+		parse_removed_conversion_or_name(builder, IntoOpaqueNode, RemovedIntoConversionDiagnostic)
+	else:
+		advanced: DiscoveryBuilder = advance_token(builder)
+		append_name_leaf_node(advanced, IdentifierNode, token.span, name_id_at_row(token.payload))
+
+
+private pure func is_removed_into_spelling(token: Token) -> Bool:
+	token.payload == REMOVED_INTO_NAME_INDEX
+
+
+---
+The removed spelling of a conversion (`into Type(...)`, `from Type(...)`)
+when a type that parses cleanly and then `(` follow the word, reported and
+parsed as its replacement; otherwise the word is a name. Decided by a
+speculative parse of the type, rolled back either way.
+---
+private pure func parse_removed_conversion_or_name(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	word: Token = current_token(builder)
+	name_payload: Int = removed_conversion_word_name(word)
+	checkpoint: ParseCheckpoint = parse_checkpoint(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	speculative: DiscoveryBuilder = parse_type(advanced)
+	removed: Bool = (
+		speculative.diagnostics.length() == checkpoint.diagnostics
+		and at(speculative, LeftParenSymbol)
+	)
+	restored: DiscoveryBuilder = rollback_to(speculative, checkpoint)
+
+	if removed:
+		report_removed_conversion(restored, kind, code)
+	else:
+		name_advanced: DiscoveryBuilder = advance_token(restored)
+		append_name_leaf_node(
+			name_advanced,
+			IdentifierNode,
+			word.span,
+			name_id_at_row(name_payload),
+		)
+
+
+---
+The name a conversion word stands for when it is not a conversion: the
+identifier's name, or the keyword's spelling for `from`.
+---
+private pure func removed_conversion_word_name(word: Token) -> Int:
+	if word.kind == IdentifierToken:
+		word.payload
+	else:
+		match keyword_name_index(word.kind):
+			Some(index):
+				index
+			None:
+				word.payload
+
+
+---
+Parses the removed conversion as its replacement and reports the removal.
+---
+private pure func report_removed_conversion(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	span: Span = current_span(builder)
+	converted: DiscoveryBuilder = parse_opaque_conversion(builder, kind)
+	append_plain_diagnostic(converted, code, span)
+
+
+---
+`into_opaque T(value)` or `from_opaque T(value)`.
+---
+private pure func parse_opaque_conversion(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	typed: DiscoveryBuilder = parse_type(advanced)
+	var out: DiscoveryBuilder = push_last_node(typed)
+	out = expect_token(out, LeftParenSymbol, ExpectedLeftParenDiagnostic)
+	out = parse_expression(out)
+	var end: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+
+	if at(out, RightParenSymbol):
+		end = current_span(out)
+
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	out = append_parent_node_from_stack(
+		out,
+		kind,
+		span_covering(start, end),
+		2,
+	)
+	out
+
+
+---
+`builtin` or `builtin("name")`.
+---
+private pure func parse_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if peek_kind(builder, 1) == LeftParenSymbol:
+		parse_named_builtin(builder)
+	else:
+		keyword_leaf(builder, BuiltinNode)
+
+
+private pure func parse_named_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	var out: DiscoveryBuilder = advance_token(advanced)
+	name: Token = current_token(out)
+	named: Bool = is_literal_string_token(name.kind)
+
+	if named:
+		out = advance_token(out)
+	else:
+		out = report_and_recover(out, ExpectedBuiltinNameDiagnostic)
+
+	end: Span = closing_span_or(out, RightParenSymbol, name.span)
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+
+	if named:
+		out = append_literal_leaf_node(
+			out,
+			NamedBuiltinNode,
+			span_covering(start, end),
+			literal_id_at_row(name.payload),
+		)
+	else:
+		out = append_leaf_node(
+			out,
+			BuiltinNode,
+			span_covering(start, end),
+		)
+
+	out
+
+
+---
+A string token whose payload is its text: any string but an interpolated
+one, whose text is split around its holes.
+---
+private pure func is_literal_string_token(kind: TokenKind) -> Bool:
+	match kind:
+		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+			True
+		_:
+			False
+
+
+---
+`()` (void), `(expr)` (grouping, which widens the expression's span to the
+parentheses), or a tuple `(a, b, ...)`.
+---
+private pure func parse_parenthesized(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	out: DiscoveryBuilder = advance_token(builder)
+
+	if at(out, RightParenSymbol):
+		close: Span = current_span(out)
+		advanced: DiscoveryBuilder = advance_token(out)
+		append_leaf_node(
+			advanced,
+			VoidNode,
+			span_covering(start, close),
+		)
+	else:
+		with_item: DiscoveryBuilder = parse_expression_at(out, LOWEST_PRECEDENCE, start)
+		parse_grouping_or_tuple(with_item, start)
+
+
+private pure func parse_grouping_or_tuple(
+	builder: DiscoveryBuilder,
+	start: Span,
+) -> DiscoveryBuilder:
+	if at(builder, CommaSymbol):
+		parse_tuple_rest(builder, start)
+	else if at(builder, RightParenSymbol):
+		close: Span = current_span(builder)
+		advanced: DiscoveryBuilder = advance_token(builder)
+		replace_last_node_span(
+			advanced,
+			span_covering(start, close),
+		)
+	else:
+		report_at_current(builder, ExpectedRightParenDiagnostic)
+
+
+---
+The rest of a tuple after its first item, which the caller parsed.
+---
+private pure func parse_tuple_rest(builder: DiscoveryBuilder, start: Span) -> DiscoveryBuilder:
+	first_span: Span = node_span(builder, last_node_id(builder))
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = push_last_node(builder)
+	var parsing: Bool = True
+
+	while parsing and not at(out, EndOfFileToken):
+		if at(out, CommaSymbol):
+			out = advance_token(out)
+
+			if at(out, RightParenSymbol):
+				parsing = False
+			else:
+				out = parse_expression_at(out, LOWEST_PRECEDENCE, start)
+				out = push_last_node(out)
+		else:
+			parsing = False
+
+	end: Span = closing_span_or(out, RightParenSymbol, first_span)
+	out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	span: Span = span_covering(start, end)
+
+	if count > MAX_TUPLE_ITEMS:
+		out = append_plain_diagnostic(out, TupleArityDiagnostic, span)
+
+	out = append_parent_node_from_stack(out, TupleNode, span, count)
+	out
+
+
+---
+`[items]`.
+---
+private pure func parse_list_literal(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	depth_before: Int = child_stack_depth(builder)
+	advanced: DiscoveryBuilder = advance_token(builder)
+	var out: DiscoveryBuilder = parse_expression_list(advanced, RightBracketSymbol, True, start)
+	end: Span = closing_span_or(out, RightBracketSymbol, start)
+	out = expect_token(out, RightBracketSymbol, ExpectedRightBracketDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		ListLiteralNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+---
+`{...}`: a record literal (`{}` or `{name = ...}`), a dict literal
+(`{key => value}`), a record update (`{record | name = ...}`), or a vector
+literal (`{a, b}`).
+---
+private pure func parse_braced(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	out: DiscoveryBuilder = advance_token(builder)
+
+	if at(out, RightBraceSymbol) or starts_record_field(out):
+		parse_record_literal(out, start)
+	else:
+		parsed: DiscoveryBuilder = parse_expression(out)
+		parse_braced_after_first(parsed, start)
+
+
+private pure func starts_record_field(builder: DiscoveryBuilder) -> Bool:
+	current_name(builder).is_some() and peek_kind(builder, 1) == EqualSymbol
+
+
+private pure func parse_braced_after_first(
+	builder: DiscoveryBuilder,
+	start: Span,
+) -> DiscoveryBuilder:
+	match current_kind(builder):
+		FatArrowSymbol:
+			parse_dict_rest(builder, start)
+		PipeSymbol:
+			parse_record_update_rest(builder, start)
+		_:
+			parse_vector_rest(builder, start)
+
+
+private pure func parse_record_literal(builder: DiscoveryBuilder, start: Span) -> DiscoveryBuilder:
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = parse_record_fields(builder, True)
+	end: Span = closing_span_or(out, RightBraceSymbol, start)
+	out = expect_token(out, RightBraceSymbol, ExpectedRightBraceDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		RecordLiteralNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+---
+Record fields up to `}` (not consumed), each pushed; with `allow_empty`
+there may be none.
+---
+private pure func parse_record_fields(
+	builder: DiscoveryBuilder,
+	allow_empty: Bool,
+) -> DiscoveryBuilder:
+	if allow_empty and at(builder, RightBraceSymbol):
+		builder
+	else if at(builder, EndOfFileToken):
+		builder
+	else:
+		parse_record_field_run(builder)
+
+
+private pure func parse_record_field_run(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	with_field: DiscoveryBuilder = parse_record_field(builder)
+	var out: DiscoveryBuilder = push_last_node(with_field)
+	var parsing: Bool = True
+
+	while parsing:
+		if at(out, CommaSymbol):
+			out = advance_token(out)
+
+			if at(out, RightBraceSymbol) or at(out, EndOfFileToken):
+				parsing = False
+			else:
+				out = parse_record_field(out)
+				out = push_last_node(out)
+		else:
+			parsing = False
+
+	out
+
+
+---
+`name = value`.
+---
+private pure func parse_record_field(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = referenced_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	var out: DiscoveryBuilder = consume_referenced_name(builder)
+	out = expect_token(out, EqualSymbol, ExpectedEqualDiagnostic)
+	out = parse_expression(out)
+	value_span: Span = node_span(out, last_node_id(out))
+	out = push_last_node(out)
+	out = append_named_parent_node_from_stack(
+		out,
+		RecordFieldNode,
+		span_covering(name_span, value_span),
+		name,
+		1,
+	)
+	out
+
+
+---
+`{record | fields}` after the record, which the caller parsed.
+---
+private pure func parse_record_update_rest(
+	builder: DiscoveryBuilder,
+	start: Span,
+) -> DiscoveryBuilder:
+	record_span: Span = node_span(builder, last_node_id(builder))
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = push_last_node(builder)
+	out = expect_token(out, PipeSymbol, ExpectedPipeDiagnostic)
+	out = parse_record_fields(out, False)
+	end: Span = closing_span_or(out, RightBraceSymbol, record_span)
+	out = expect_token(out, RightBraceSymbol, ExpectedRightBraceDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		RecordUpdateNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+---
+`{key => value, ...}` after the first key, which the caller parsed.
+---
+private pure func parse_dict_rest(builder: DiscoveryBuilder, start: Span) -> DiscoveryBuilder:
+	first_span: Span = node_span(builder, last_node_id(builder))
+	depth_before: Int = child_stack_depth(builder)
+	with_entry: DiscoveryBuilder = parse_dict_entry_after_key(builder)
+	var out: DiscoveryBuilder = push_last_node(with_entry)
+	var parsing: Bool = True
+
+	while parsing and not at(out, EndOfFileToken):
+		if at(out, CommaSymbol):
+			out = advance_token(out)
+
+			if at(out, RightBraceSymbol):
+				parsing = False
+			else:
+				out = parse_expression(out)
+				out = parse_dict_entry_after_key(out)
+				out = push_last_node(out)
+		else:
+			parsing = False
+
+	end: Span = closing_span_or(out, RightBraceSymbol, first_span)
+	out = expect_token(out, RightBraceSymbol, ExpectedRightBraceDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		DictLiteralNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+---
+`=> value` after a dict key, which the caller parsed, and the entry node.
+---
+private pure func parse_dict_entry_after_key(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	key_span: Span = node_span(builder, last_node_id(builder))
+	var out: DiscoveryBuilder = push_last_node(builder)
+	out = expect_token(out, FatArrowSymbol, ExpectedFatArrowDiagnostic)
+	out = parse_expression(out)
+	out = finish_with_body(out, DictEntryNode, key_span, 2)
+	out
+
+
+---
+`{a, b, ...}` after the first item, which the caller parsed.
+---
+private pure func parse_vector_rest(builder: DiscoveryBuilder, start: Span) -> DiscoveryBuilder:
+	first_span: Span = node_span(builder, last_node_id(builder))
+	depth_before: Int = child_stack_depth(builder)
+	var out: DiscoveryBuilder = push_last_node(builder)
+	var parsing: Bool = True
+
+	while parsing and not at(out, EndOfFileToken):
+		if at(out, CommaSymbol):
+			out = advance_token(out)
+
+			if at(out, RightBraceSymbol):
+				parsing = False
+			else:
+				out = parse_expression(out)
+				out = push_last_node(out)
+		else:
+			parsing = False
+
+	end: Span = closing_span_or(out, RightBraceSymbol, first_span)
+	out = expect_token(out, RightBraceSymbol, ExpectedRightBraceDiagnostic)
+	count: Int = child_stack_depth(out) - depth_before
+	out = append_parent_node_from_stack(
+		out,
+		VectorLiteralNode,
+		span_covering(start, end),
+		count,
+	)
+	out
+
+
+-- Interpolated strings.
+---
+An interpolated string: its text pieces (`InterpolationTextNode`) and holes
+in source order, each pushed. The lexer found the pieces and hole ranges;
+each hole's source text is lexed into tokens appended after the module's
+own and parsed there as one expression, and the cursor then returns to after
+the string.
+---
+private pure func parse_interpolated_string(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+) -> DiscoveryBuilder:
+	token: Token = current_token(builder)
+	resume: Int = builder.token_cursor + 1
+	depth_before: Int = child_stack_depth(builder)
+	parts: RowRange = interpolation_parts_of(builder, token.payload)
+	var out: DiscoveryBuilder = parse_interpolation_parts(
+		builder,
+		span_source_index(token.span),
+		parts,
+	)
+	count: Int = child_stack_depth(out) - depth_before
+	out = move_token_cursor(out, resume)
+	out = append_parent_node_from_stack(out, kind, token.span, count)
+	out
+
+
+private pure func parse_interpolation_parts(
+	builder: DiscoveryBuilder,
+	source_index: Int,
+	parts: RowRange,
+) -> DiscoveryBuilder:
+	if parts.count == 0:
+		builder
+	else:
+		parse_interpolation_part_run(builder, source_index, parts)
+
+
+private pure func parse_interpolation_part_run(
+	builder: DiscoveryBuilder,
+	source_index: Int,
+	parts: RowRange,
+) -> DiscoveryBuilder:
+	first: InterpolationPartRow = interpolation_part_at(builder, parts.first)
+	var out: DiscoveryBuilder = parse_interpolation_part(builder, source_index, first)
+	var index: Int = parts.first + 1
+
+	while index < parts.first + parts.count:
+		part: InterpolationPartRow = interpolation_part_at(out, index)
+		out = parse_interpolation_part(out, source_index, part)
+		index += 1
+
+	out
+
+
+---
+One piece, pushed: a text node, or the hole's expression.
+---
+private pure func parse_interpolation_part(
+	builder: DiscoveryBuilder,
+	source_index: Int,
+	part: InterpolationPartRow,
+) -> DiscoveryBuilder:
+	span: Span = pack_span(source_index, part.start, part.end)
+
+	match part.part:
+		TextPart:
+			text: LiteralId = interpolation_text_at(builder, part.text.first)
+			with_text: DiscoveryBuilder = append_literal_leaf_node(
+				builder,
+				InterpolationTextNode,
+				span,
+				text,
+			)
+			push_last_node(with_text)
+		HolePart:
+			parse_interpolation_hole(builder, source_index, part)
+
+
+---
+Lexes one hole, parses it as a single expression, and pushes it.
+---
+private pure func parse_interpolation_hole(
+	builder: DiscoveryBuilder,
+	source_index: Int,
+	hole: InterpolationPartRow,
+) -> DiscoveryBuilder:
+	hole_start: Int = token_count(builder)
+	anchor: Span = pack_span(source_index, hole.start, hole.start)
+	var out: DiscoveryBuilder = lex_interpolation_hole(
+		builder,
+		source_id_at_row(source_index),
+		hole.start,
+		hole.end,
+	)
+	out = move_token_cursor(out, hole_start)
+	out = parse_assignment_value(out, anchor)
+	out = push_last_node(out)
+	out = skip_newlines(out)
+
+	if not at(out, EndOfFileToken):
+		out = report_at_current(out, InterpolationHoleNotExpressionDiagnostic)
+
+	out

@@ -1,0 +1,2766 @@
+-- The discovery lexer: one source text into the builder's transient token
+-- table, interning every identifier as a name and every literal's text as a
+-- literal as it goes.
+--
+-- It reproduces the existing compiler's lexer token for token (kinds, spans,
+-- literal texts, indentation, newline and lambda-body rules), with four
+-- differences in what it records rather than what it recognizes: a `#`
+-- directly followed by a name is one `DimensionNameToken` over the plain name
+-- (the existing lexer emits `#` and the name, and interns a `#name` spelling;
+-- no table here holds such a spelling); comments are skipped instead of kept
+-- as trivia, since no table needs them; literal texts (numbers, strings,
+-- docstrings) go to the literals table instead of the name table; and
+-- diagnostics are coded rows instead of rendered messages.
+--
+-- The source is scanned by byte offset. Columns are not tracked: only a pipe
+-- string's margin needs one, and it is computed from the line start then.
+import:
+	discovery_builder:
+		DiscoveryBuilder,
+		EMPTY_ROW_RANGE,
+		InterpolationPart(HolePart, TextPart),
+		NOT_INTERNED,
+		SourceId,
+		append_diagnostic_with_argument,
+		append_interpolation,
+		append_interpolation_part,
+		append_interpolation_text,
+		append_literal,
+		append_name,
+		append_plain_diagnostic,
+		append_token,
+		interned_literal_index,
+		interned_literal_slice_index,
+		interned_name_slice_index,
+		literal_id_at_row,
+		source_id_index,
+		without_transient_tables,
+	discovery_diagnostic_code:
+		DiscoveryDiagnosticCode(
+			InconsistentIndentationDiagnostic,
+			IntegerLiteralOverflowDiagnostic,
+			InterpolatedEscapeAtEndDiagnostic,
+			InterpolationTooDeepDiagnostic,
+			InvalidCharLiteralDiagnostic,
+			MissingPipeMarkerDiagnostic,
+			MultilineInterpolatedStringDiagnostic,
+			MultilineRawStringDiagnostic,
+			MultilineStringDiagnostic,
+			UnexpectedByteDiagnostic,
+			UnexpectedCharacterDiagnostic,
+			UnicodeCodepointOutOfRangeDiagnostic,
+			UnicodeEscapeDigitCountDiagnostic,
+			UnicodeEscapeNonHexDiagnostic,
+			UnknownEscapeDiagnostic,
+			UnterminatedCharLiteralDiagnostic,
+			UnterminatedDocstringDiagnostic,
+			UnterminatedEscapeDiagnostic,
+			UnterminatedInterpolatedStringDiagnostic,
+			UnterminatedRawStringDiagnostic,
+			UnterminatedStringDiagnostic,
+			UnterminatedUnicodeEscapeDiagnostic,
+		),
+	source_position: column_at, tab_advance
+	span: pack_span
+	string: string
+	token:
+		FIRST_KEYWORD_NAME_INDEX,
+		KEYWORD_KINDS_IN_SEEDED_ORDER,
+		NO_TOKEN_PAYLOAD,
+		TokenKind(
+			ArrowSymbol,
+			AtSymbol,
+			CharLiteralToken,
+			ColonSymbol,
+			CommaSymbol,
+			DedentToken,
+			DimensionNameToken,
+			DocStringToken,
+			DotDotDotSymbol,
+			DotDotSymbol,
+			DotSymbol,
+			EndOfFileToken,
+			EqualEqualSymbol,
+			EqualSymbol,
+			FatArrowSymbol,
+			FloatLiteralToken,
+			GreaterEqualSymbol,
+			GreaterSymbol,
+			HashSymbol,
+			IdentifierToken,
+			IndentToken,
+			IntLiteralToken,
+			InterpolatedPipeStringToken,
+			InterpolatedStringToken,
+			LeftBraceSymbol,
+			LeftBracketSymbol,
+			LeftParenSymbol,
+			LessEqualSymbol,
+			LessSymbol,
+			MinusEqualSymbol,
+			MinusSymbol,
+			NewlineToken,
+			NormalStringToken,
+			NotEqualSymbol,
+			PercentSymbol,
+			PipeStringToken,
+			PipeSymbol,
+			PlusEqualSymbol,
+			PlusSymbol,
+			QuestionEqualsSymbol,
+			RawPipeStringToken,
+			RawStringToken,
+			RightBraceSymbol,
+			RightBracketSymbol,
+			RightParenSymbol,
+			SlashEqualSymbol,
+			SlashSymbol,
+			StarEqualSymbol,
+			StarSymbol,
+			UnderscoreSymbol,
+		),
+		is_unicode_scalar,
+
+
+---
+The deepest nesting of `${` holes an interpolated string may have.
+---
+private MAX_INTERPOLATION_DEPTH: Int = 64
+
+---
+The largest integer literal the language accepts: the Int128 maximum.
+---
+private INT128_MAX_DECIMAL: String = "170141183460469231731687303715884105727"
+
+---
+The byte `byte_at` returns past the end of the text. Scanners test the offset
+against the length where the end must differ from a NUL byte in the source.
+---
+private PAST_END_BYTE: Char = '\0'
+
+---
+`${`, which opens an interpolation hole. Written as a concatenation because
+the two characters together inside a string literal would open a hole there.
+---
+private INTERPOLATION_OPENER: String = "$" + "{"
+
+---
+The most hex digits a `\u{...}` escape may hold.
+---
+private MAX_UNICODE_ESCAPE_DIGITS: Int = 6
+
+---
+The indentation of a line outside every block.
+---
+private TOP_LEVEL_INDENT: Int = 0
+
+-- UTF-8 lead and continuation byte bounds: bytes below
+-- `UTF8_FIRST_MULTIBYTE` are ASCII; two-, three- and four-byte leads start at
+-- the named values (the leads RFC 3629 allows: overlong two-byte leads
+-- 0xC0-0xC1 and leads above U+10FFFF are excluded); continuations lie in
+-- 0x80-0xBF. As in the existing lexer, the second byte of a three- or
+-- four-byte sequence is only checked to be a continuation byte, so the few
+-- overlong and surrogate encodings RFC 3629 rules out there (E0 80-9F,
+-- ED A0-BF, F0 80-8F, F4 90-BF) are taken as one character. Such a byte only
+-- ever ends up in an unexpected-character diagnostic's span.
+private UTF8_FIRST_MULTIBYTE: Int = 128
+
+private UTF8_FIRST_TWO_BYTE_LEAD: Int = 194
+
+private UTF8_LAST_TWO_BYTE_LEAD: Int = 223
+
+private UTF8_FIRST_THREE_BYTE_LEAD: Int = 224
+
+private UTF8_LAST_THREE_BYTE_LEAD: Int = 239
+
+private UTF8_FIRST_FOUR_BYTE_LEAD: Int = 240
+
+private UTF8_LAST_FOUR_BYTE_LEAD: Int = 244
+
+private UTF8_FIRST_CONTINUATION: Int = 128
+
+private UTF8_LAST_CONTINUATION: Int = 191
+
+
+---
+The lexer's layout stacks: the enclosing indentation levels (the first is
+the top level) and the open lambda bodies, each opened inside brackets at
+`lambda_groups[i]` bracket depth by a line indented `lambda_bases[i]`.
+Newlines inside a lambda body are significant again. Each stack is a list
+and a depth, so pushing and popping reuse the list instead of allocating.
+---
+private record LayoutStacks {
+	indent_levels: List[Int],
+	indent_depth: Int,
+	lambda_groups: List[Int],
+	lambda_bases: List[Int],
+	lambda_count: Int
+}
+
+
+---
+What a layout query returns when no dedent is due: never an indentation,
+which is never negative.
+---
+private NO_DEDENT: Int = -1
+
+
+---
+A diagnostic found by a literal scanner, appended by the lexer loop.
+`argument_count` is 0 or 1.
+---
+private struct PendingDiagnostic {
+	code: DiscoveryDiagnosticCode,
+	start: Int,
+	end: Int,
+	argument: Int,
+	argument_count: Int
+}
+
+
+---
+What a literal scanner found.
+---
+private union ScannedLiteral:
+	TextLiteral(TokenKind, String)
+	InterpolatedLiteral(TokenKind)
+	CodepointLiteral(Int)
+	NoLiteral
+
+
+---
+A literal scanner's result: where the scan stopped, what it found, what went
+wrong, and (for pipe strings) whether it consumed the newline ending its
+last line.
+---
+private record LiteralScan {
+	end: Int,
+	literal: ScannedLiteral,
+	diagnostics: List[PendingDiagnostic],
+	ended_with_newline: Bool
+}
+
+
+private record UnicodeEscapeScan {
+	end: Int,
+	codepoint: Option[Int],
+	diagnostics: List[PendingDiagnostic]
+}
+
+
+private struct PipeLineScan {
+	end: Int,
+	saw_interpolation: Bool,
+	ended_with_newline: Bool
+}
+
+
+private pure func pending(code: DiscoveryDiagnosticCode, start: Int, end: Int) -> PendingDiagnostic:
+	{
+		code = code,
+		start = start,
+		end = end,
+		argument = 0,
+		argument_count = 0
+	}
+
+
+private pure func pending_with_argument(
+	code: DiscoveryDiagnosticCode,
+	at: Int,
+	argument: Int,
+) -> PendingDiagnostic:
+	{
+		code = code,
+		start = at,
+		end = at,
+		argument = argument,
+		argument_count = 1
+	}
+
+
+private pure func failed_scan(end: Int, diagnostics: List[PendingDiagnostic]) -> LiteralScan:
+	{
+		end = end,
+		literal = NoLiteral,
+		diagnostics = diagnostics,
+		ended_with_newline = False
+	}
+
+
+-- Byte classes.
+private pure func byte_at(text: String, offset: Int) -> Char:
+	text.get_or(offset, PAST_END_BYTE)
+
+
+private pure func is_digit_byte(c: Char) -> Bool:
+	c >= '0' and c <= '9'
+
+
+private pure func is_hex_byte(c: Char) -> Bool:
+	is_digit_byte(c) or c >= 'a' and c <= 'f' or c >= 'A' and c <= 'F'
+
+
+private pure func is_identifier_start(c: Char) -> Bool:
+	c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c == '_'
+
+
+private pure func is_identifier_continue(c: Char) -> Bool:
+	is_identifier_start(c) or is_digit_byte(c)
+
+
+private pure func hex_value(c: Char) -> Int:
+	if c >= '0' and c <= '9':
+		to_int(c) - to_int('0')
+	else if c >= 'a' and c <= 'f':
+		10 + to_int(c) - to_int('a')
+	else:
+		10 + to_int(c) - to_int('A')
+
+
+---
+Whether `expected` occurs in `text` at `offset`.
+---
+private pure func text_at(text: String, offset: Int, expected: String) -> Bool:
+	expected_length: Int = expected.length()
+
+	if offset + expected_length > text.length():
+		False
+	else:
+		var index: Int = 0
+		var matches: Bool = True
+
+		while matches and index < expected_length:
+			if byte_at(text, offset + index) == byte_at(expected, index):
+				index += 1
+			else:
+				matches = False
+
+		matches
+
+
+---
+Whether only spaces and tabs follow `offset` before the end of the line.
+---
+private pure func rest_of_line_is_blank(text: String, offset: Int) -> Bool:
+	length: Int = text.length()
+	var position: Int = offset
+	var blank: Bool = False
+
+	while True:
+		if position >= length:
+			blank = True
+			break
+
+		c: Char = byte_at(text, position)
+
+		if c == ' ' or c == '\t':
+			position += 1
+		else:
+			blank = c == '\n'
+			break
+
+	blank
+
+
+---
+A docstring fence: `---` followed by nothing but blanks on its line.
+---
+private pure func docstring_fence_at(text: String, offset: Int) -> Bool:
+	text_at(text, offset, "---") and rest_of_line_is_blank(text, offset + 3)
+
+
+---
+Whether `raw` at `offset` is a whole word (a raw string or raw pipe
+introducer) rather than the start of a longer identifier.
+---
+private pure func raw_word_at(text: String, offset: Int) -> Bool:
+	text_at(text, offset, "raw") and not is_identifier_continue(byte_at(text, offset + 3))
+
+
+---
+The offset after the line containing `offset`, past its newline.
+---
+private pure func after_line(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length and byte_at(text, position) != '\n':
+		position += 1
+
+	if position < length:
+		position + 1
+	else:
+		position
+
+
+---
+The offset of the newline ending the line containing `offset`, or the end.
+---
+private pure func line_end(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length and byte_at(text, position) != '\n':
+		position += 1
+
+	position
+
+
+private pure func after_blanks(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length and (byte_at(text, position) == ' ' or byte_at(text, position) == '\t'):
+		position += 1
+
+	position
+
+
+---
+The tab-expanded indentation width of the blanks starting at `offset`.
+---
+private pure func indent_width(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+	var indent: Int = 0
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if c == ' ':
+			indent += 1
+			position += 1
+		else if c == '\t':
+			indent += tab_advance(indent + 1)
+			position += 1
+		else:
+			break
+
+	indent
+
+
+private pure func identifier_end(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length and is_identifier_continue(byte_at(text, position)):
+		position += 1
+
+	position
+
+
+-- Escapes.
+private pure func escaped_char(c: Char) -> Option[Char]:
+	match c:
+		'n':
+			Some('\n')
+		't':
+			Some('\t')
+		'r':
+			Some('\r')
+		'\\':
+			Some('\\')
+		'\"':
+			Some('\"')
+		'\'':
+			Some('\'')
+		'0':
+			Some(to_char(0))
+		'{':
+			Some('{')
+		'}':
+			Some('}')
+		_:
+			None
+
+
+---
+Scans `\u{...}` at `offset` (the backslash). On success `end` is past the
+closing brace; on failure it is where scanning stopped, as in the existing
+lexer, so the enclosing literal keeps scanning from there.
+---
+private pure func scan_unicode_escape(text: String, offset: Int) -> UnicodeEscapeScan:
+	length: Int = text.length()
+	var position: Int = offset + 3
+	var codepoint: Int = 0
+	var digits: Int = 0
+	var failure: Option[PendingDiagnostic] = None
+
+	while failure.is_none():
+		if position >= length:
+			failure = Some(pending(UnterminatedUnicodeEscapeDiagnostic, position, position))
+		else:
+			c: Char = byte_at(text, position)
+
+			if c == '}':
+				break
+			else if is_hex_byte(c):
+				digits += 1
+
+				if digits > MAX_UNICODE_ESCAPE_DIGITS:
+					failure = Some(pending(UnicodeEscapeDigitCountDiagnostic, position, position))
+				else:
+					codepoint = codepoint * 16 + hex_value(c)
+					position += 1
+			else:
+				failure = Some(pending(UnicodeEscapeNonHexDiagnostic, position, position))
+
+	match failure:
+		Some(diagnostic):
+			{
+				end = position,
+				codepoint = None,
+				diagnostics = [diagnostic]
+			}
+		None:
+			if digits == 0:
+				{
+					end = position,
+					codepoint = None,
+					diagnostics = [pending(UnicodeEscapeDigitCountDiagnostic, position, position)]
+				}
+			else:
+				after_close: Int = position + 1
+
+				if not is_unicode_scalar(codepoint):
+					{
+						end = after_close,
+						codepoint = None,
+						diagnostics = [
+							pending(
+								UnicodeCodepointOutOfRangeDiagnostic,
+								after_close,
+								after_close,
+							),
+						]
+					}
+				else:
+					{
+						end = after_close,
+						codepoint = Some(codepoint),
+						diagnostics = []
+					}
+
+
+private pure func with_source_segment(
+	text: String,
+	source: String,
+	start: Int,
+	end: Int,
+) -> String:
+	if end > start:
+		text + source.substring(start, end - start)
+	else:
+		text
+
+
+-- Literal scanners. Each starts at the literal's first byte.
+---
+A `---` docstring: the lines between the opening and closing fences, joined
+by newlines. The token ends past the closing fence's line.
+---
+private pure func scan_docstring(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	var position: Int = after_line(text, offset)
+	var body: String = string(128)
+	var first_line: Bool = True
+	var failure: Option[PendingDiagnostic] = None
+
+	while failure.is_none():
+		if docstring_fence_at(text, position):
+			position = after_line(text, position)
+			break
+		else if position >= length:
+			failure = Some(pending(UnterminatedDocstringDiagnostic, position, position))
+		else:
+			end: Int = line_end(text, position)
+			line: String = text.substring(position, end - position)
+
+			if first_line:
+				body = line
+				first_line = False
+			else:
+				body = body + "\n" + line
+
+			position = if end < length:
+				end + 1
+			else:
+				end
+
+	match failure:
+		Some(diagnostic):
+			failed_scan(position, [diagnostic])
+		None:
+			{
+				end = position,
+				literal = TextLiteral(DocStringToken, body),
+				diagnostics = [],
+				ended_with_newline = False
+			}
+
+
+---
+What `plain_string_close` returns for a string that is not plain.
+---
+private NO_PLAIN_STRING_CLOSE: Int = -1
+
+
+---
+The offset of the closing quote of the string opening at `offset`, when its
+body holds no escape, no `${` hole and no line break (so its text is its
+bytes); otherwise `NO_PLAIN_STRING_CLOSE`.
+---
+private pure func plain_string_close(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset + 1
+	var close: Int = NO_PLAIN_STRING_CLOSE
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if c == '\"':
+			close = position
+			break
+		else if (
+			c == '\\'
+			or c == '\n'
+			or c == '$' and byte_at(text, position + 1) == '{'
+		):
+			break
+
+		position += 1
+
+	close
+
+
+---
+The offset where the verbatim run inside a string body ends: the closing
+quote, a newline, an escape, an interpolation marker or the end.
+---
+private pure func plain_string_run_end(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if (
+			c == '\"'
+			or c == '\n'
+			or c == '\\'
+			or c == '$'
+		):
+			break
+
+		position += 1
+
+	position
+
+
+private pure func scan_string_literal(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	var position: Int = offset + 1
+	var segment_start: Int = position
+	var body: String = string(32)
+	var failed: Bool = False
+	var interpolated: Bool = False
+	var diagnostics: List[PendingDiagnostic] = []
+
+	while True:
+		position = plain_string_run_end(text, position)
+
+		if position >= length:
+			failed = True
+			diagnostics = diagnostics.append(
+				pending(
+					UnterminatedStringDiagnostic,
+					position,
+					position,
+				),
+			)
+			break
+
+		c: Char = byte_at(text, position)
+
+		if c == '\"':
+			body = with_source_segment(body, text, segment_start, position)
+			position += 1
+			break
+		else if c == '\n':
+			failed = True
+			diagnostics = diagnostics.append(pending(MultilineStringDiagnostic, position, position))
+			position += 1
+			break
+		else if c == '\\':
+			body = with_source_segment(body, text, segment_start, position)
+
+			if text_at(text, position, "\\u{"):
+				escape: UnicodeEscapeScan = scan_unicode_escape(text, position)
+				position = escape.end
+				diagnostics = diagnostics.concat(escape.diagnostics)
+
+				match escape.codepoint:
+					Some(value):
+						body = body.append_char(to_char(value))
+						segment_start = position
+					None:
+						failed = True
+			else:
+				escape_start: Int = position
+				position += 1
+
+				if position >= length:
+					failed = True
+					diagnostics = diagnostics.append(
+						pending(
+							UnterminatedEscapeDiagnostic,
+							escape_start,
+							escape_start,
+						),
+					)
+					break
+
+				escaped: Char = byte_at(text, position)
+
+				match escaped_char(escaped):
+					Some(value):
+						body = body.append_char(value)
+						position += 1
+						segment_start = position
+					None:
+						failed = True
+						diagnostics = diagnostics.append(
+							pending_with_argument(
+								UnknownEscapeDiagnostic,
+								escape_start,
+								to_int(escaped),
+							),
+						)
+						position += 1
+		else if text_at(text, position, INTERPOLATION_OPENER):
+			body = with_source_segment(body, text, segment_start, position)
+			interpolated = True
+			position += 2
+			break
+		else:
+			position += 1
+
+	if failed:
+		failed_scan(position, diagnostics)
+	else if interpolated:
+		scan_interpolated_string_tail(text, position)
+	else:
+		{
+			end = position,
+			literal = TextLiteral(NormalStringToken, body),
+			diagnostics = diagnostics,
+			ended_with_newline = False
+		}
+
+
+---
+`raw"..."`: the body as written, on one line.
+---
+private pure func scan_raw_string_literal(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	body_start: Int = offset + 4
+	var position: Int = body_start
+
+	while (
+		position < length
+		and byte_at(text, position) != '\"'
+		and byte_at(text, position) != '\n'
+	):
+		position += 1
+
+	body: String = text.substring(body_start, position - body_start)
+
+	if position >= length:
+		failed_scan(position, [pending(UnterminatedRawStringDiagnostic, position, position)])
+	else if byte_at(text, position) == '\n':
+		failed_scan(position + 1, [pending(MultilineRawStringDiagnostic, position, position)])
+	else:
+		{
+			end = position + 1,
+			literal = TextLiteral(RawStringToken, body),
+			diagnostics = [],
+			ended_with_newline = False
+		}
+
+
+private pure func plain_interpolation_run_end(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if (
+			c == '\"'
+			or c == '$'
+			or c == '{'
+			or c == '}'
+			or c == '\\'
+			or c == '\n'
+		):
+			break
+
+		position += 1
+
+	position
+
+
+---
+The rest of an interpolated string after its first `${`: where it ends and
+what went wrong. Its text pieces and holes are read from the source by
+`interpolation_parts` once the string's extent is known.
+---
+private pure func scan_interpolated_string_tail(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	var position: Int = offset
+	var brace_depth: Int = 1
+	var in_string: Bool = False
+	var failure: Option[PendingDiagnostic] = None
+
+	while failure.is_none():
+		position = plain_interpolation_run_end(text, position)
+
+		if position >= length:
+			failure = Some(pending(UnterminatedInterpolatedStringDiagnostic, position, position))
+		else:
+			c: Char = byte_at(text, position)
+
+			if c == '\"':
+				position += 1
+
+				if brace_depth > 0:
+					in_string = not in_string
+				else:
+					break
+			else if c == '$':
+				if text_at(text, position, INTERPOLATION_OPENER):
+					if not in_string:
+						brace_depth += 1
+
+						if brace_depth > MAX_INTERPOLATION_DEPTH:
+							failure = Some(
+								pending_with_argument(
+									InterpolationTooDeepDiagnostic,
+									position,
+									MAX_INTERPOLATION_DEPTH,
+								),
+							)
+
+					if failure.is_none():
+						position += 2
+				else:
+					position += 1
+			else if c == '{':
+				if not in_string and brace_depth > 0:
+					brace_depth += 1
+
+				position += 1
+			else if c == '}':
+				if not in_string and brace_depth > 0:
+					brace_depth -= 1
+
+				position += 1
+			else if c == '\\':
+				position += 1
+
+				if position >= length:
+					failure = Some(pending(InterpolatedEscapeAtEndDiagnostic, position, position))
+				else:
+					position += 1
+			else:
+				-- A newline: the only byte the run stops at that is left.
+				failure = Some(pending(MultilineInterpolatedStringDiagnostic, position, position))
+				position += 1
+
+	match failure:
+		Some(diagnostic):
+			failed_scan(position, [diagnostic])
+		None:
+			{
+				end = position,
+				literal = InterpolatedLiteral(InterpolatedStringToken),
+				diagnostics = [],
+				ended_with_newline = False
+			}
+
+
+-- Interpolated string parts.
+---
+The source bytes an interpolated string's text is read from, and the text
+that precedes them: nothing for a quoted string, and for each later line of
+a pipe string the line break, plus a `|` when the line's marker is `||`.
+---
+private record InterpolationSegment {
+	start: Int,
+	end: Int,
+	lead: String
+}
+
+
+---
+How a scanned text piece's text is held: as its source bytes, which are the
+text itself when the piece has no escape and lies in one segment, or as the
+decoded text otherwise.
+---
+private enum PieceText:
+	SourceBytes
+	DecodedText
+
+
+---
+A text piece or hole as `interpolation_parts` found it. `decoded` holds the
+text when `text` is `DecodedText`; `start .. end` are the source bytes.
+---
+private record ScannedPart {
+	part: InterpolationPart,
+	start: Int,
+	end: Int,
+	text: PieceText,
+	decoded: String
+}
+
+
+---
+The open text piece while `interpolation_parts` scans: where it starts,
+the decoded text before `run_start` when it needed decoding, and whether it
+did.
+---
+private record PieceScan {
+	parts: List[ScannedPart],
+	piece_start: Int,
+	run_start: Int,
+	decoded: String,
+	text: PieceText
+}
+
+
+---
+What `PieceScan.piece_start` holds while no text piece is open.
+---
+private NO_PIECE: Int = -1
+
+
+---
+The segments of an interpolated string token spanning `start .. end`: the
+bytes between the quotes, or the content of each pipe-string line.
+---
+private pure func interpolation_segments(
+	text: String,
+	kind: TokenKind,
+	start: Int,
+	end: Int,
+) -> List[InterpolationSegment]:
+	if kind == InterpolatedStringToken:
+		[
+			{
+				start = start + 1,
+				end = end - 1,
+				lead = ""
+			},
+		]
+	else:
+		pipe_segments(text, start, end)
+
+
+private pure func pipe_segments(text: String, start: Int, end: Int) -> List[InterpolationSegment]:
+	var segments: List[InterpolationSegment] = []
+	var marker: Int = start
+	var lead: String = ""
+
+	while marker < end:
+		doubled: Bool = text_at(text, marker, "||")
+
+		content: Int = if doubled:
+			marker + 2
+		else:
+			marker + 1
+
+		line_lead: String = if doubled:
+			lead + "|"
+		else:
+			lead
+
+		content_end: Int = line_end(text, content)
+
+		segment_end: Int = if content_end < end:
+			content_end
+		else:
+			end
+
+		segments = segments.append({
+			start = content,
+			end = segment_end,
+			lead = line_lead,
+		})
+
+		if content_end >= end:
+			break
+
+		marker = after_blanks(text, content_end + 1)
+		lead = "\n"
+
+	segments
+
+
+---
+The text pieces and holes of an interpolated string, in order. Escapes in
+text are decoded as the existing compiler decodes them; a hole runs from
+after its `${` to the `}` that closes it outside string literals. A `{` or
+`}` outside a hole is text.
+---
+private pure func interpolation_parts(
+	text: String,
+	segments: List[InterpolationSegment],
+) -> List[ScannedPart]:
+	var scan: PieceScan = {
+		parts = [],
+		piece_start = NO_PIECE,
+		run_start = 0,
+		decoded = "",
+		text = SourceBytes
+	}
+	var index: Int = 0
+
+	for segment in segments:
+		scan = scan_segment(text, segment, scan, index + 1 < segments.length())
+		index += 1
+
+	close_piece(text, scan, last_segment_end(segments))
+
+
+private pure func last_segment_end(segments: List[InterpolationSegment]) -> Int:
+	match segments.get(segments.length() - 1):
+		Some(segment):
+			segment.end
+		None:
+			0
+
+
+private pure func scan_segment(
+	text: String,
+	segment: InterpolationSegment,
+	start_scan: PieceScan,
+	more_follow: Bool,
+) -> PieceScan:
+	var scan: PieceScan = with_lead(text, segment, start_scan)
+	var position: Int = segment.start
+
+	while position < segment.end:
+		c: Char = byte_at(text, position)
+
+		if c == '\\':
+			scan = decoded_through(
+				text,
+				open_piece(scan, position),
+				position,
+			)
+			escape: EscapeDecode = decoded_escape(text, position, segment.end)
+			scan = { scan |
+				decoded = scan.decoded + escape.text,
+				run_start = escape.end
+			}
+			position = escape.end
+		else if (
+			c == '$'
+			and byte_at(text, position + 1) == '{'
+			and position + 1 < segment.end
+		):
+			scan = close_piece_into(text, scan, position)
+			hole_start: Int = position + 2
+			hole_end: Int = hole_close(text, hole_start, segment.end)
+			scan = { scan |
+				parts = scan.parts.append({
+					part = HolePart,
+					start = hole_start,
+					end = hole_end,
+					text = SourceBytes,
+					decoded = "",
+				}),
+				run_start = hole_end + 1
+			}
+			position = hole_end + 1
+		else:
+			scan = open_piece(scan, position)
+			position += 1
+
+	-- A piece that continues on the next line cannot be one source slice.
+	if more_follow and scan.piece_start != NO_PIECE:
+		scan = decoded_through(text, scan, segment.end)
+
+	scan
+
+
+---
+Opens a text piece at `position` unless one is open.
+---
+private pure func open_piece(scan: PieceScan, position: Int) -> PieceScan:
+	if scan.piece_start == NO_PIECE:
+		{ scan |
+			piece_start = position,
+			run_start = position,
+			decoded = "",
+			text = SourceBytes
+		}
+	else:
+		scan
+
+
+---
+The segment's lead text, which opens a piece and makes it decoded.
+---
+private pure func with_lead(
+	text: String,
+	segment: InterpolationSegment,
+	scan: PieceScan,
+) -> PieceScan:
+	if segment.lead.is_empty():
+		{ scan | run_start = segment.start }
+	else:
+		opened: PieceScan = open_piece(scan, segment.start)
+		{ opened |
+			decoded = opened.decoded + segment.lead,
+			run_start = segment.start,
+			text = DecodedText
+		}
+
+
+---
+Moves the open piece's undecoded bytes up to `position` into its decoded
+text, making it decoded.
+---
+private pure func decoded_through(text: String, scan: PieceScan, position: Int) -> PieceScan:
+	prefix: String = if scan.text == DecodedText:
+		scan.decoded
+	else:
+		""
+
+	{ scan |
+		decoded = with_source_segment(prefix, text, scan.run_start, position),
+		run_start = position,
+		text = DecodedText
+	}
+
+
+---
+Closes the open piece, if any, at `position`, appending it to the parts.
+---
+private pure func close_piece_into(text: String, scan: PieceScan, position: Int) -> PieceScan:
+	if scan.piece_start == NO_PIECE:
+		scan
+	else:
+		closed: PieceScan = if scan.text == DecodedText:
+			decoded_through(text, scan, position)
+		else:
+			scan
+
+		{ closed |
+			parts = closed.parts.append({
+				part = TextPart,
+				start = closed.piece_start,
+				end = position,
+				text = closed.text,
+				decoded = closed.decoded,
+			}),
+			piece_start = NO_PIECE,
+			decoded = "",
+			text = SourceBytes
+		}
+
+
+private pure func close_piece(text: String, scan: PieceScan, position: Int) -> List[ScannedPart]:
+	close_piece_into(text, scan, position).parts
+
+
+---
+A decoded escape: its text and where the scan resumes.
+---
+private record EscapeDecode {
+	text: String,
+	end: Int
+}
+
+
+---
+Decodes the escape at `position` (a backslash) as the existing compiler's
+interpolation splitter does: the named escapes, braces and `\u{...}`; an
+unknown escape keeps its backslash and the next byte is read as text.
+---
+private pure func decoded_escape(text: String, position: Int, end: Int) -> EscapeDecode:
+	if text_at(text, position, "\\u{"):
+		escape: UnicodeEscapeScan = scan_unicode_escape(text, position)
+
+		match escape.codepoint:
+			Some(codepoint):
+				{
+					text = string(1).append_char(to_char(codepoint)),
+					end = escape.end
+				}
+			None:
+				{
+					text = text.substring(position, escape.end - position),
+					end = escape.end
+				}
+	else if position + 1 < end:
+		match escaped_char(byte_at(text, position + 1)):
+			Some(value):
+				{
+					text = string(1).append_char(value),
+					end = position + 2
+				}
+			None:
+				{
+					text = "\\",
+					end = position + 1
+				}
+	else:
+		{
+			text = "\\",
+			end = position + 1
+		}
+
+
+---
+The offset of the `}` closing a hole whose text starts at `start`, found as
+the existing compiler finds it: braces are counted outside string literals,
+and a backslash skips the byte after it.
+---
+private pure func hole_close(text: String, start: Int, end: Int) -> Int:
+	var position: Int = start
+	var depth: Int = 1
+	var in_string: Bool = False
+	var close: Int = end
+
+	while position < end and depth > 0:
+		c: Char = byte_at(text, position)
+
+		if c == '\\':
+			position += 2
+		else if c == '\"':
+			in_string = not in_string
+			position += 1
+		else if not in_string and c == '{':
+			depth += 1
+			position += 1
+		else if not in_string and c == '}':
+			depth -= 1
+
+			if depth == 0:
+				close = position
+
+			position += 1
+		else:
+			position += 1
+
+	close
+
+
+---
+Appends the parts of one interpolated string and its row; its index is the
+string token's payload.
+---
+private pure func append_scanned_interpolation(
+	builder: DiscoveryBuilder,
+	text: String,
+	parts: List[ScannedPart],
+) -> DiscoveryBuilder:
+	parts_first: Int = builder.interpolation_parts.length()
+	var out: DiscoveryBuilder = append_interpolation(
+		builder,
+		{
+			first = parts_first,
+			count = parts.length()
+		},
+	)
+
+	for part in parts:
+		out = append_scanned_part(out, text, part)
+
+	out
+
+
+private pure func append_scanned_part(
+	builder: DiscoveryBuilder,
+	text: String,
+	part: ScannedPart,
+) -> DiscoveryBuilder:
+	if part.part == HolePart:
+		append_interpolation_part(
+			builder,
+			{
+				part = HolePart,
+				start = part.start,
+				end = part.end,
+				text = EMPTY_ROW_RANGE
+			},
+		)
+	else:
+		append_text_part(builder, text, part)
+
+
+---
+A text piece: its text interned as a literal (found in place when it is its
+source bytes), then its row.
+---
+private pure func append_text_part(
+	builder: DiscoveryBuilder,
+	text: String,
+	part: ScannedPart,
+) -> DiscoveryBuilder:
+	existing: Int = if part.text == SourceBytes:
+		interned_literal_slice_index(builder, text, part.start, part.end)
+	else:
+		interned_literal_index(builder, part.decoded)
+
+	literal_row: Int = if existing == NOT_INTERNED:
+		builder.literals.length()
+	else:
+		existing
+
+	var out: DiscoveryBuilder = with_part_literal(builder, text, part, existing)
+	text_row: Int = out.interpolation_texts.length()
+	out = append_interpolation_text(out, literal_id_at_row(literal_row))
+	out = append_interpolation_part(
+		out,
+		{
+			part = TextPart,
+			start = part.start,
+			end = part.end,
+			text = {
+				first = text_row,
+				count = 1
+			}
+		},
+	)
+	out
+
+
+private pure func with_part_literal(
+	builder: DiscoveryBuilder,
+	text: String,
+	part: ScannedPart,
+	existing: Int,
+) -> DiscoveryBuilder:
+	if existing != NOT_INTERNED:
+		builder
+	else if part.text == SourceBytes:
+		append_literal(
+			builder,
+			text.substring(part.start, part.end - part.start),
+		)
+	else:
+		append_literal(builder, part.decoded)
+
+
+---
+The content of one pipe-string line after its marker, appended to `body`
+by the caller from the returned end; `$` introduces a hole unless `raw`.
+---
+private pure func pipe_line_content(text: String, offset: Int, raw: Bool) -> (String, PipeLineScan):
+	length: Int = text.length()
+	var position: Int = offset
+	var content: String = string(64)
+	var saw_interpolation: Bool = False
+	var ended_with_newline: Bool = False
+
+	while True:
+		run_start: Int = position
+
+		while (
+			position < length
+			and byte_at(text, position) != '\n'
+			and byte_at(text, position) != '$'
+		):
+			position += 1
+
+		content = with_source_segment(content, text, run_start, position)
+
+		if position >= length:
+			break
+
+		c: Char = byte_at(text, position)
+
+		if c == '\n':
+			position += 1
+			ended_with_newline = True
+			break
+		else if not raw and text_at(text, position, INTERPOLATION_OPENER):
+			content = content.append_char('{')
+			saw_interpolation = True
+			position += 2
+		else:
+			content = content.append_char('$')
+			position += 1
+
+	(content, {
+			end = position,
+			saw_interpolation = saw_interpolation,
+			ended_with_newline = ended_with_newline
+		})
+
+
+---
+A block of pipe-string lines whose markers sit at `margin_column`, starting
+at the first marker at `offset`.
+---
+private pure func scan_pipe_block(
+	text: String,
+	offset: Int,
+	margin_column: Int,
+	raw: Bool,
+) -> LiteralScan:
+	var position: Int = offset
+	var body: String = string(128)
+	var saw_interpolation: Bool = False
+	var first_line: Bool = True
+	var ended_with_newline: Bool = False
+	var failure: Option[PendingDiagnostic] = None
+
+	while failure.is_none():
+		if not first_line:
+			body = body.append_char('\n')
+
+		if not raw and text_at(text, position, "||"):
+			body = body.append_char('|')
+			position += 2
+		else if byte_at(text, position) == '|' and position < text.length():
+			position += 1
+		else:
+			failure = Some(
+				pending_with_argument(
+					MissingPipeMarkerDiagnostic,
+					position,
+					margin_column,
+				),
+			)
+
+		if failure.is_none():
+			(content, line) = pipe_line_content(text, position, raw)
+			body += content
+			saw_interpolation = saw_interpolation or line.saw_interpolation
+			position = line.end
+			ended_with_newline = line.ended_with_newline
+
+			if ended_with_newline:
+				marker: Int = after_blanks(text, position)
+
+				if (
+					indent_width(text, position) == margin_column - 1
+					and byte_at(text, marker) == '|'
+					and marker < text.length()
+				):
+					position = marker
+					first_line = False
+				else:
+					break
+			else:
+				break
+
+	match failure:
+		Some(diagnostic):
+			{
+				end = position,
+				literal = NoLiteral,
+				diagnostics = [diagnostic],
+				ended_with_newline = ended_with_newline
+			}
+		None:
+			literal: ScannedLiteral = if raw:
+				TextLiteral(RawPipeStringToken, body)
+			else if saw_interpolation:
+				InterpolatedLiteral(InterpolatedPipeStringToken)
+			else:
+				TextLiteral(PipeStringToken, body)
+
+			{
+				end = position,
+				literal = literal,
+				diagnostics = [],
+				ended_with_newline = ended_with_newline
+			}
+
+
+---
+`raw` then blanks, a newline, and a line whose first non-blank byte is the
+`|` marker: that marker's offset, with its column as the block's margin.
+---
+private pure func raw_pipe_marker_after(text: String, offset: Int) -> Option[(Int, Int)]:
+	after_raw: Int = offset + 3
+	blanks_end: Int = after_blanks(text, after_raw)
+
+	if blanks_end < text.length() and byte_at(text, blanks_end) == '\n':
+		next_line: Int = blanks_end + 1
+		marker: Int = after_blanks(text, next_line)
+
+		if marker < text.length() and byte_at(text, marker) == '|':
+			Some((marker, indent_width(text, next_line) + 1))
+		else:
+			None
+	else:
+		None
+
+
+---
+The offset after the next `'` on this line, or where the line or text ends:
+where a failed character literal resumes scanning.
+---
+private pure func after_closing_quote(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if c == '\'':
+			position += 1
+			break
+		else if c == '\n':
+			break
+
+		position += 1
+
+	position
+
+
+private pure func scan_char_literal(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	var position: Int = offset + 1
+	var codepoint: Int = 0
+	var has_value: Bool = False
+	var diagnostics: List[PendingDiagnostic] = []
+
+	if position >= length:
+		diagnostics = diagnostics.append(
+			pending(
+				UnterminatedCharLiteralDiagnostic,
+				position,
+				position,
+			),
+		)
+	else:
+		c: Char = byte_at(text, position)
+
+		if c == '\\':
+			if text_at(text, position, "\\u{"):
+				escape: UnicodeEscapeScan = scan_unicode_escape(text, position)
+				position = escape.end
+				diagnostics = diagnostics.concat(escape.diagnostics)
+
+				match escape.codepoint:
+					Some(value):
+						codepoint = value
+						has_value = True
+					None:
+						void
+			else:
+				escape_start: Int = position
+				position += 1
+
+				if position >= length:
+					diagnostics = diagnostics.append(
+						pending(
+							UnterminatedCharLiteralDiagnostic,
+							escape_start,
+							escape_start,
+						),
+					)
+				else:
+					escaped: Char = byte_at(text, position)
+
+					match escaped_char(escaped):
+						Some(value):
+							codepoint = to_int(value)
+							has_value = True
+							position += 1
+						None:
+							diagnostics = diagnostics.append(
+								pending_with_argument(
+									UnknownEscapeDiagnostic,
+									escape_start,
+									to_int(escaped),
+								),
+							)
+							position += 1
+		else if c == '\n':
+			diagnostics = diagnostics.append(
+				pending(
+					InvalidCharLiteralDiagnostic,
+					position,
+					position,
+				),
+			)
+		else:
+			codepoint = to_int(c)
+			has_value = True
+			position += 1
+
+	if diagnostics.is_empty():
+		if position < length and byte_at(text, position) == '\'':
+			position += 1
+		else:
+			diagnostics = diagnostics.append(
+				pending(
+					InvalidCharLiteralDiagnostic,
+					position,
+					position,
+				),
+			)
+
+	if diagnostics.is_empty() and has_value:
+		{
+			end = position,
+			literal = CodepointLiteral(codepoint),
+			diagnostics = [],
+			ended_with_newline = False
+		}
+	else:
+		failed_scan(
+			after_closing_quote(text, position),
+			diagnostics,
+		)
+
+
+-- Numbers and symbols.
+private pure func first_significant_digit(digits: String) -> Int:
+	var index: Int = 0
+
+	while index + 1 < digits.length() and byte_at(digits, index) == '0':
+		index += 1
+
+	index
+
+
+---
+Whether the decimal digits `left` denote a value at most `right`'s.
+---
+private pure func decimal_at_most(left: String, right: String) -> Bool:
+	left_start: Int = first_significant_digit(left)
+	right_start: Int = first_significant_digit(right)
+	left_length: Int = left.length() - left_start
+	right_length: Int = right.length() - right_start
+
+	if left_length != right_length:
+		left_length < right_length
+	else:
+		var result: Bool = True
+		var index: Int = 0
+
+		while index < left_length:
+			left_digit: Char = byte_at(left, left_start + index)
+			right_digit: Char = byte_at(right, right_start + index)
+
+			if left_digit != right_digit:
+				result = left_digit < right_digit
+				break
+
+			index += 1
+
+		result
+
+
+---
+Digits with at most one `.` that is followed by a digit.
+---
+private struct NumberScan {
+	end: Int,
+	saw_dot: Bool
+}
+
+
+private pure func scan_number(text: String, offset: Int) -> NumberScan:
+	length: Int = text.length()
+	var position: Int = offset
+	var saw_dot: Bool = False
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if is_digit_byte(c):
+			position += 1
+		else if (
+			c == '.'
+			and not saw_dot
+			and position + 1 < length
+			and is_digit_byte(byte_at(text, position + 1))
+		):
+			saw_dot = True
+			position += 1
+		else:
+			break
+
+	{
+		end = position,
+		saw_dot = saw_dot
+	}
+
+
+private struct SymbolMatch {
+	kind: TokenKind,
+	width: Int
+}
+
+
+---
+What `symbol_at` returns for a byte `starts_symbol` rejects; never used.
+---
+private UNREACHABLE_SYMBOL_MATCH: SymbolMatch = {
+	kind = EndOfFileToken,
+	width = 1
+}
+
+
+---
+Whether a symbol starts at `offset`. Checked before `symbol_at` so that
+matching a symbol allocates nothing: an `Option` of a struct is boxed.
+---
+private pure func starts_symbol(text: String, offset: Int) -> Bool:
+	c: Char = byte_at(text, offset)
+
+	if c == '!' or c == '?':
+		offset + 1 < text.length() and byte_at(text, offset + 1) == '='
+	else:
+		match c:
+			'-' | '=' | '<' | '>' | '.' | '+' | '*' | '/' | '(' | ')' | '[' | ']' | '{' | '}' | ':' | ',' | '_' | '%' | '#' | '@' | '|':
+				True
+			_:
+				False
+
+
+---
+The symbol at `offset`, longest first. Only called where `starts_symbol`
+holds; the fallback for any other byte is unreachable.
+---
+private pure func symbol_at(text: String, offset: Int) -> SymbolMatch:
+	next: Char = byte_at(text, offset + 1)
+	has_next: Bool = offset + 1 < text.length()
+	next_is_equal: Bool = has_next and next == '='
+
+	match byte_at(text, offset):
+		'-':
+			if has_next and next == '>':
+				{
+					kind = ArrowSymbol,
+					width = 2
+				}
+			else if next_is_equal:
+				{
+					kind = MinusEqualSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = MinusSymbol,
+					width = 1
+				}
+		'=':
+			if has_next and next == '>':
+				{
+					kind = FatArrowSymbol,
+					width = 2
+				}
+			else if next_is_equal:
+				{
+					kind = EqualEqualSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = EqualSymbol,
+					width = 1
+				}
+		'<':
+			if next_is_equal:
+				{
+					kind = LessEqualSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = LessSymbol,
+					width = 1
+				}
+		'>':
+			if next_is_equal:
+				{
+					kind = GreaterEqualSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = GreaterSymbol,
+					width = 1
+				}
+		'!':
+			if next_is_equal:
+				{
+					kind = NotEqualSymbol,
+					width = 2
+				}
+			else:
+				UNREACHABLE_SYMBOL_MATCH
+		'?':
+			if next_is_equal:
+				{
+					kind = QuestionEqualsSymbol,
+					width = 2
+				}
+			else:
+				UNREACHABLE_SYMBOL_MATCH
+		'.':
+			if text_at(text, offset, "..."):
+				{
+					kind = DotDotDotSymbol,
+					width = 3
+				}
+			else if has_next and next == '.':
+				{
+					kind = DotDotSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = DotSymbol,
+					width = 1
+				}
+		'+':
+			if next_is_equal:
+				{
+					kind = PlusEqualSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = PlusSymbol,
+					width = 1
+				}
+		'*':
+			if next_is_equal:
+				{
+					kind = StarEqualSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = StarSymbol,
+					width = 1
+				}
+		'/':
+			if next_is_equal:
+				{
+					kind = SlashEqualSymbol,
+					width = 2
+				}
+			else:
+				{
+					kind = SlashSymbol,
+					width = 1
+				}
+		'(':
+			{
+				kind = LeftParenSymbol,
+				width = 1
+			}
+		')':
+			{
+				kind = RightParenSymbol,
+				width = 1
+			}
+		'[':
+			{
+				kind = LeftBracketSymbol,
+				width = 1
+			}
+		']':
+			{
+				kind = RightBracketSymbol,
+				width = 1
+			}
+		'{':
+			{
+				kind = LeftBraceSymbol,
+				width = 1
+			}
+		'}':
+			{
+				kind = RightBraceSymbol,
+				width = 1
+			}
+		':':
+			{
+				kind = ColonSymbol,
+				width = 1
+			}
+		',':
+			{
+				kind = CommaSymbol,
+				width = 1
+			}
+		'_':
+			{
+				kind = UnderscoreSymbol,
+				width = 1
+			}
+		'%':
+			{
+				kind = PercentSymbol,
+				width = 1
+			}
+		'#':
+			{
+				kind = HashSymbol,
+				width = 1
+			}
+		'@':
+			{
+				kind = AtSymbol,
+				width = 1
+			}
+		'|':
+			{
+				kind = PipeSymbol,
+				width = 1
+			}
+		_:
+			UNREACHABLE_SYMBOL_MATCH
+
+
+private pure func group_depth_after(depth: Int, kind: TokenKind) -> Int:
+	match kind:
+		LeftParenSymbol:
+			depth + 1
+		LeftBracketSymbol:
+			depth + 1
+		LeftBraceSymbol:
+			depth + 1
+		RightParenSymbol:
+			max(depth - 1, 0)
+		RightBracketSymbol:
+			max(depth - 1, 0)
+		RightBraceSymbol:
+			max(depth - 1, 0)
+		_:
+			depth
+
+
+---
+Continuation bytes after a UTF-8 lead byte, or `None` for a byte that starts
+no sequence.
+---
+private pure func utf8_continuation_count(lead: Int) -> Option[Int]:
+	if lead < UTF8_FIRST_MULTIBYTE:
+		Some(0)
+	else if lead >= UTF8_FIRST_TWO_BYTE_LEAD and lead <= UTF8_LAST_TWO_BYTE_LEAD:
+		Some(1)
+	else if lead >= UTF8_FIRST_THREE_BYTE_LEAD and lead <= UTF8_LAST_THREE_BYTE_LEAD:
+		Some(2)
+	else if lead >= UTF8_FIRST_FOUR_BYTE_LEAD and lead <= UTF8_LAST_FOUR_BYTE_LEAD:
+		Some(3)
+	else:
+		None
+
+
+---
+The byte width of the complete UTF-8 sequence at `offset`, or `None` when
+the bytes there are not one.
+---
+private pure func utf8_sequence_width(text: String, offset: Int) -> Option[Int]:
+	match utf8_continuation_count(to_int(byte_at(text, offset))):
+		Some(continuations):
+			var complete: Bool = offset + continuations < text.length()
+			var index: Int = 1
+
+			while complete and index <= continuations:
+				value: Int = to_int(byte_at(text, offset + index))
+
+				if value < UTF8_FIRST_CONTINUATION or value > UTF8_LAST_CONTINUATION:
+					complete = False
+
+				index += 1
+
+			if complete:
+				Some(continuations + 1)
+			else:
+				None
+		None:
+			None
+
+
+-- Indentation and lambda bodies.
+private pure func initial_layout() -> LayoutStacks:
+	{
+		indent_levels = [TOP_LEVEL_INDENT],
+		indent_depth = 1,
+		lambda_groups = [],
+		lambda_bases = [],
+		lambda_count = 0
+	}
+
+
+private pure func top_indent(layout: LayoutStacks) -> Int:
+	layout.indent_levels.get_or(layout.indent_depth - 1, TOP_LEVEL_INDENT)
+
+
+private pure func with_indent_pushed(layout: LayoutStacks, indent: Int) -> LayoutStacks:
+	depth: Int = layout.indent_depth
+
+	if depth < layout.indent_levels.length():
+		{ layout |
+			indent_levels = layout.indent_levels.set(depth, indent),
+			indent_depth = depth + 1
+		}
+	else:
+		{ layout |
+			indent_levels = layout.indent_levels.append(indent),
+			indent_depth = depth + 1
+		}
+
+
+private pure func with_indent_popped(layout: LayoutStacks) -> LayoutStacks:
+	depth: Int = layout.indent_depth - 1
+	{ layout | indent_depth = depth }
+
+
+---
+Opens a lambda body at `group_depth`. The layout helpers read fields rather
+than passing the record to a function before updating it (the builder
+threading rules in `discovery_builder.brp` hold for any record).
+---
+private pure func with_lambda_opened(layout: LayoutStacks, group_depth: Int) -> LayoutStacks:
+	count: Int = layout.lambda_count
+	base: Int = layout.indent_levels.get_or(layout.indent_depth - 1, TOP_LEVEL_INDENT)
+
+	if count < layout.lambda_groups.length():
+		{ layout |
+			lambda_groups = layout.lambda_groups.set(count, group_depth),
+			lambda_bases = layout.lambda_bases.set(count, base),
+			lambda_count = count + 1
+		}
+	else:
+		{ layout |
+			lambda_groups = layout.lambda_groups.append(group_depth),
+			lambda_bases = layout.lambda_bases.append(base),
+			lambda_count = count + 1
+		}
+
+
+---
+The bracket depth and base indentation of the innermost open lambda body;
+only read when `lambda_count > 0`.
+---
+private pure func top_lambda_group(layout: LayoutStacks) -> Int:
+	layout.lambda_groups.get_or(layout.lambda_count - 1, 0)
+
+
+private pure func top_lambda_base(layout: LayoutStacks) -> Int:
+	layout.lambda_bases.get_or(layout.lambda_count - 1, TOP_LEVEL_INDENT)
+
+
+---
+Whether a newline at bracket depth `group_depth` is insignificant: inside
+brackets and not directly inside a lambda body opened at this depth.
+---
+private pure func newline_is_insignificant(layout: LayoutStacks, group_depth: Int) -> Bool:
+	if group_depth <= 0:
+		False
+	else if layout.lambda_count == 0:
+		True
+	else:
+		group: Int = top_lambda_group(layout)
+		group_depth < group or group_depth > group
+
+
+---
+A newline after a `:` inside brackets opens a lambda body, unless the
+innermost open body is at this depth or deeper.
+---
+private pure func opens_lambda_body(
+	layout: LayoutStacks,
+	group_depth: Int,
+	after_colon: Bool,
+) -> Bool:
+	if group_depth <= 0 or not after_colon:
+		False
+	else if layout.lambda_count == 0:
+		True
+	else:
+		group_depth > top_lambda_group(layout)
+
+
+---
+The number of lambda bodies still open after a dedent to `indent`: those
+whose base indentation `indent` still exceeds.
+---
+private pure func lambdas_open_after_dedent(bases: List[Int], count: Int, indent: Int) -> Int:
+	var remaining: Int = count
+
+	while remaining > 0 and indent <= bases.get_or(remaining - 1, TOP_LEVEL_INDENT):
+		remaining -= 1
+
+	remaining
+
+
+---
+Closes the lambda bodies whose base indentation the current indentation no
+longer exceeds.
+---
+private pure func with_lambdas_closed_after_dedent(layout: LayoutStacks) -> LayoutStacks:
+	indent: Int = layout.indent_levels.get_or(layout.indent_depth - 1, TOP_LEVEL_INDENT)
+	remaining: Int = lambdas_open_after_dedent(layout.lambda_bases, layout.lambda_count, indent)
+	{ layout | lambda_count = remaining }
+
+
+---
+Whether dedenting to `indent` would land between two enclosing levels.
+---
+private pure func dedent_lands_between_levels(layout: LayoutStacks, indent: Int) -> Bool:
+	var index: Int = layout.indent_depth - 1
+	var between: Bool = False
+
+	while index >= 0:
+		level: Int = layout.indent_levels.get_or(index, TOP_LEVEL_INDENT)
+
+		if indent >= level:
+			break
+
+		enclosing: Int = layout.indent_levels.get_or(index - 1, TOP_LEVEL_INDENT)
+
+		if indent > enclosing:
+			between = True
+			break
+
+		index -= 1
+
+	between
+
+
+---
+A line indented between a lambda body's base and the body's own level, at
+the bracket depth the body opened at, closes the body: the indentation to
+dedent to (the body's base), or `NO_DEDENT`.
+---
+private pure func lambda_body_close_target(
+	layout: LayoutStacks,
+	group_depth: Int,
+	indent: Int,
+) -> Int:
+	if layout.lambda_count == 0:
+		NO_DEDENT
+	else:
+		base: Int = top_lambda_base(layout)
+
+		if (
+			group_depth == top_lambda_group(layout)
+			and indent > base
+			and indent < top_indent(layout)
+			and dedent_lands_between_levels(layout, indent)
+		):
+			base
+		else:
+			NO_DEDENT
+
+
+-- Interning.
+---
+Whether a name follows the `#` just before `offset` directly, making the
+two one dimension name: an identifier that is neither a keyword nor the
+lone `_`. Otherwise the `#` stays a `HashSymbol` for the parser to diagnose.
+---
+private pure func dimension_name_follows(
+	builder: DiscoveryBuilder,
+	text: String,
+	offset: Int,
+) -> Bool:
+	if offset >= text.length() or not is_identifier_start(byte_at(text, offset)):
+		False
+	else:
+		end: Int = identifier_end(text, offset)
+		lone_underscore: Bool = end - offset == 1 and byte_at(text, offset) == '_'
+		name_index: Int = interned_name_slice_index(builder, text, offset, end)
+		not lone_underscore and not is_keyword_name_index(name_index)
+
+
+---
+Whether a name index is a keyword's: keywords are the seeded names
+`FIRST_KEYWORD_NAME_INDEX ..= LAST_KEYWORD_NAME_INDEX`.
+---
+private pure func is_keyword_name_index(name_index: Int) -> Bool:
+	name_index >= FIRST_KEYWORD_NAME_INDEX and name_index <= LAST_KEYWORD_NAME_INDEX
+
+
+---
+The keyword kind of a keyword's name index (see `is_keyword_name_index`);
+the fallback for any other index is unreachable.
+---
+private pure func keyword_kind_at_name_index(name_index: Int) -> TokenKind:
+	KEYWORD_KINDS_IN_SEEDED_ORDER.get_or(name_index - FIRST_KEYWORD_NAME_INDEX, IdentifierToken)
+
+
+---
+The name index of the last keyword spelling in the seeded vocabulary; any
+larger index is not a keyword.
+---
+private LAST_KEYWORD_NAME_INDEX: Int = FIRST_KEYWORD_NAME_INDEX + KEYWORD_KINDS_IN_SEEDED_ORDER.length() - 1
+
+
+---
+Lexes source `source` of `builder` into its token table, replacing the
+previous module's tokens. Identifiers are interned as names (and `#name` as
+well after a `#`, the spelling the parser gives a dimension), literal texts as
+literals, and every problem is a diagnostic row; an unrecognized byte never
+stops the lexer.
+---
+pure func lex_source(builder: DiscoveryBuilder, source: SourceId) -> DiscoveryBuilder:
+	text: String = builder.source_texts
+		.get(source_id_index(source))
+		.get_or("")
+	cleared: DiscoveryBuilder = without_transient_tables(builder)
+	lex_text_range(
+		cleared,
+		source,
+		text,
+		{
+			start = 0,
+			end = text.length(),
+			position = AtLineStart
+		},
+	)
+
+
+---
+Lexes the text of an interpolation hole, bytes `start .. end` of `source`,
+appending its tokens and an end-of-file token after the tokens already in
+the table. The parser moves its cursor there to parse the hole and back
+afterwards. A hole lies within one line, so its tokens hold no layout.
+---
+pure func lex_interpolation_hole(
+	builder: DiscoveryBuilder,
+	source: SourceId,
+	start: Int,
+	end: Int,
+) -> DiscoveryBuilder:
+	text: String = builder.source_texts
+		.get(source_id_index(source))
+		.get_or("")
+	lex_text_range(
+		builder,
+		source,
+		text,
+		{
+			start = start,
+			end = end,
+			position = WithinLine
+		},
+	)
+
+
+---
+Where a lexed range starts: at the start of a line, where indentation is
+measured, or after other tokens of its line (an interpolation hole).
+---
+enum RangeStart:
+	AtLineStart
+	WithinLine
+
+
+---
+The bytes a lexing run covers and where the first of them sits.
+---
+struct LexRange {
+	start: Int,
+	end: Int,
+	position: RangeStart
+}
+
+
+private pure func lex_text_range(
+	builder: DiscoveryBuilder,
+	source: SourceId,
+	text: String,
+	range: LexRange,
+) -> DiscoveryBuilder:
+	source_index: Int = source_id_index(source)
+	length: Int = text.length()
+	end_offset: Int = range.end
+	within_line: Bool = range.position == WithinLine
+	var out: DiscoveryBuilder = builder
+	var offset: Int = range.start
+	var line_start: Int = line_start_before(text, range.start)
+	var layout: LayoutStacks = initial_layout()
+	var group_depth: Int = 0
+	var pending_newline: Bool = False
+	var at_line_start: Bool = not within_line
+	var line_has_token: Bool = within_line
+
+	-- The kind of the last token appended; a line start stands in before the
+	-- first, since it is neither a `:` nor a `#`. Within a line, the string
+	-- holding the hole stands in.
+	var previous_kind: TokenKind = if within_line:
+		InterpolatedStringToken
+	else:
+		NewlineToken
+
+	while True:
+		if at_line_start:
+			indent_start: Int = offset
+			indent: Int = indent_width(text, offset)
+			offset = after_blanks(text, offset)
+
+			if newline_is_insignificant(layout, group_depth):
+				pending_newline = False
+				at_line_start = False
+			else if offset < end_offset and byte_at(text, offset) != '\n':
+				current_indent: Int = top_indent(layout)
+				var dedent_target: Int = lambda_body_close_target(layout, group_depth, indent)
+
+				if dedent_target == NO_DEDENT:
+					if indent > current_indent:
+						if pending_newline:
+							out = append_token(
+								out,
+								{
+									kind = NewlineToken,
+									span = pack_span(source_index, offset, offset),
+									payload = NO_TOKEN_PAYLOAD
+								},
+							)
+							pending_newline = False
+
+						layout = with_indent_pushed(layout, indent)
+						out = append_token(
+							out,
+							{
+								kind = IndentToken,
+								span = pack_span(source_index, indent_start, offset),
+								payload = NO_TOKEN_PAYLOAD
+							},
+						)
+						previous_kind = IndentToken
+					else if indent == current_indent:
+						if pending_newline:
+							out = append_token(
+								out,
+								{
+									kind = NewlineToken,
+									span = pack_span(source_index, offset, offset),
+									payload = NO_TOKEN_PAYLOAD
+								},
+							)
+							previous_kind = NewlineToken
+							pending_newline = False
+					else:
+						dedent_target = indent
+
+				if dedent_target != NO_DEDENT:
+					pending_newline = False
+
+					while top_indent(layout) > dedent_target:
+						out = append_token(
+							out,
+							{
+								kind = DedentToken,
+								span = pack_span(source_index, offset, offset),
+								payload = NO_TOKEN_PAYLOAD
+							},
+						)
+						previous_kind = DedentToken
+						layout = with_indent_popped(layout)
+
+					if top_indent(layout) != dedent_target:
+						out = append_plain_diagnostic(
+							out,
+							InconsistentIndentationDiagnostic,
+							pack_span(source_index, offset, offset),
+						)
+					else:
+						layout = with_lambdas_closed_after_dedent(layout)
+
+				at_line_start = False
+
+		if offset >= end_offset:
+			break
+
+		c: Char = byte_at(text, offset)
+		token_start: Int = offset
+
+		if c == '\n':
+			if opens_lambda_body(layout, group_depth, previous_kind == ColonSymbol):
+				layout = with_lambda_opened(layout, group_depth)
+				pending_newline = True
+			else if newline_is_insignificant(layout, group_depth):
+				pending_newline = False
+			else:
+				pending_newline = pending_newline or line_has_token
+
+			offset += 1
+			line_start = offset
+			at_line_start = True
+			line_has_token = False
+		else if c == ' ' or c == '\t':
+			offset = after_blanks(text, offset)
+		else if c == '\"' and plain_string_close(text, offset) != NO_PLAIN_STRING_CLOSE:
+			-- The common string: no escape, hole or line break before its
+			-- closing quote. Its text is the bytes between the quotes, looked
+			-- up in place, so a repeated string allocates nothing.
+			close: Int = plain_string_close(text, offset)
+			var payload: Int = interned_literal_slice_index(out, text, offset + 1, close)
+
+			if payload == NOT_INTERNED:
+				payload = out.literals.length()
+				out = append_literal(
+					out,
+					text.substring(offset + 1, close - offset - 1),
+				)
+
+			out = append_token(
+				out,
+				{
+					kind = NormalStringToken,
+					span = pack_span(source_index, offset, close + 1),
+					payload = payload
+				},
+			)
+			previous_kind = NormalStringToken
+			line_has_token = True
+			offset = close + 1
+		else if (
+			c == '\"'
+			or c == '\''
+			or c == '-' and docstring_fence_at(text, offset)
+			or c == '|' and not line_has_token
+			or (
+				c == 'r'
+				and raw_word_at(text, offset)
+				and ((
+					text_at(text, offset, "raw\"")
+					or raw_pipe_marker_after(text, offset).is_some()
+				))
+			)
+		):
+			scan: LiteralScan = if c == '\"':
+				scan_string_literal(text, offset)
+			else if c == '\'':
+				scan_char_literal(text, offset)
+			else if c == '-':
+				scan_docstring(text, offset)
+			else if c == '|':
+				scan_pipe_block(
+					text,
+					offset,
+					column_at(text, line_start, offset),
+					False,
+				)
+			else if text_at(text, offset, "raw\""):
+				scan_raw_string_literal(text, offset)
+			else:
+				match raw_pipe_marker_after(text, offset):
+					Some((marker, margin_column)):
+						scan_pipe_block(text, marker, margin_column, True)
+					None:
+						failed_scan(offset, [])
+
+			for diagnostic in scan.diagnostics:
+				diagnostic_span = pack_span(source_index, diagnostic.start, diagnostic.end)
+
+				if diagnostic.argument_count == 0:
+					out = append_plain_diagnostic(out, diagnostic.code, diagnostic_span)
+				else:
+					out = append_diagnostic_with_argument(
+						out,
+						diagnostic.code,
+						diagnostic_span,
+						diagnostic.argument,
+					)
+
+			offset = scan.end
+			line_start = line_start_after(text, token_start, offset, line_start)
+			token_span = pack_span(source_index, token_start, scan.end)
+
+			match scan.literal:
+				TextLiteral(kind, literal_text):
+					var payload: Int = interned_literal_index(out, literal_text)
+
+					if payload == NOT_INTERNED:
+						payload = out.literals.length()
+						out = append_literal(out, literal_text)
+
+					out = append_token(
+						out,
+						{
+							kind = kind,
+							span = token_span,
+							payload = payload
+						},
+					)
+					previous_kind = kind
+
+					if kind == DocStringToken:
+						pending_newline = False
+						at_line_start = True
+						line_has_token = False
+					else:
+						line_has_token = True
+
+						if scan.ended_with_newline:
+							pending_newline = True
+							at_line_start = True
+							line_has_token = False
+				InterpolatedLiteral(kind):
+					segments: List[InterpolationSegment] = interpolation_segments(
+						text,
+						kind,
+						token_start,
+						scan.end,
+					)
+					parts: List[ScannedPart] = interpolation_parts(text, segments)
+					interpolation: Int = out.interpolations.length()
+					out = append_scanned_interpolation(out, text, parts)
+					out = append_token(
+						out,
+						{
+							kind = kind,
+							span = token_span,
+							payload = interpolation
+						},
+					)
+					previous_kind = kind
+					line_has_token = True
+
+					if scan.ended_with_newline:
+						pending_newline = True
+						at_line_start = True
+						line_has_token = False
+				CodepointLiteral(codepoint):
+					out = append_token(
+						out,
+						{
+							kind = CharLiteralToken,
+							span = token_span,
+							payload = codepoint
+						},
+					)
+					previous_kind = CharLiteralToken
+					line_has_token = True
+				NoLiteral:
+					void
+		else if (
+			c == '-'
+			and byte_at(text, offset + 1) == '-'
+			and offset + 1 < length
+		):
+			-- A comment runs to the end of the line; it is not recorded.
+			offset = line_end(text, offset)
+		else if (
+			c == '_'
+			and not (offset + 1 < length and is_identifier_continue(byte_at(text, offset + 1)))
+		):
+			offset += 1
+			out = append_token(
+				out,
+				{
+					kind = UnderscoreSymbol,
+					span = pack_span(source_index, token_start, offset),
+					payload = NO_TOKEN_PAYLOAD
+				},
+			)
+			previous_kind = UnderscoreSymbol
+			line_has_token = True
+		else if is_identifier_start(c):
+			end: Int = identifier_end(text, offset)
+			word_span = pack_span(source_index, offset, end)
+			-- Looked up by the bytes it spans: only a new spelling allocates.
+			var name_index: Int = interned_name_slice_index(out, text, offset, end)
+
+			if name_index == NOT_INTERNED:
+				name_index = out.name_spellings.length()
+				out = append_name(
+					out,
+					text.substring(offset, end - offset),
+				)
+
+			offset = end
+
+			if is_keyword_name_index(name_index):
+				keyword_kind: TokenKind = keyword_kind_at_name_index(name_index)
+				out = append_token(
+					out,
+					{
+						kind = keyword_kind,
+						span = word_span,
+						payload = NO_TOKEN_PAYLOAD
+					},
+				)
+				previous_kind = keyword_kind
+			else:
+				out = append_token(
+					out,
+					{
+						kind = IdentifierToken,
+						span = word_span,
+						payload = name_index
+					},
+				)
+				previous_kind = IdentifierToken
+
+			line_has_token = True
+		else if c == '#' and dimension_name_follows(out, text, offset + 1):
+			name_start: Int = offset + 1
+			end: Int = identifier_end(text, name_start)
+			dimension_span = pack_span(source_index, offset, end)
+			var name_index: Int = interned_name_slice_index(out, text, name_start, end)
+
+			if name_index == NOT_INTERNED:
+				name_index = out.name_spellings.length()
+				out = append_name(
+					out,
+					text.substring(name_start, end - name_start),
+				)
+
+			offset = end
+
+			out = append_token(
+				out,
+				{
+					kind = DimensionNameToken,
+					span = dimension_span,
+					payload = name_index
+				},
+			)
+			previous_kind = DimensionNameToken
+			line_has_token = True
+		else if is_digit_byte(c):
+			number: NumberScan = scan_number(text, offset)
+			number_span = pack_span(source_index, offset, number.end)
+			digit_count: Int = number.end - offset
+			var payload: Int = interned_literal_slice_index(out, text, offset, number.end)
+
+			if payload == NOT_INTERNED:
+				payload = out.literals.length()
+				out = append_literal(
+					out,
+					text.substring(offset, digit_count),
+				)
+
+			-- Only a literal as long as the Int128 maximum can exceed it.
+			overflows: Bool = (
+				not number.saw_dot
+				and digit_count >= INT128_MAX_DECIMAL.length()
+				and not decimal_at_most(
+					text.substring(offset, digit_count),
+					INT128_MAX_DECIMAL,
+				)
+			)
+			offset = number.end
+
+			if overflows:
+				out = append_diagnostic_with_argument(
+					out,
+					IntegerLiteralOverflowDiagnostic,
+					number_span,
+					payload,
+				)
+
+			kind: TokenKind = if number.saw_dot:
+				FloatLiteralToken
+			else:
+				IntLiteralToken
+
+			out = append_token(
+				out,
+				{
+					kind = kind,
+					span = number_span,
+					payload = payload
+				},
+			)
+			previous_kind = kind
+			line_has_token = True
+		else:
+			if starts_symbol(text, offset):
+				found: SymbolMatch = symbol_at(text, offset)
+				offset += found.width
+				out = append_token(
+					out,
+					{
+						kind = found.kind,
+						span = pack_span(source_index, token_start, offset),
+						payload = NO_TOKEN_PAYLOAD
+					},
+				)
+				previous_kind = found.kind
+				line_has_token = True
+				group_depth = group_depth_after(group_depth, found.kind)
+			else:
+				-- Scanned by byte: quote a whole UTF-8 character once, and
+				-- report a byte that starts none by value.
+				match utf8_sequence_width(text, offset):
+					Some(width):
+						out = append_plain_diagnostic(
+							out,
+							UnexpectedCharacterDiagnostic,
+							pack_span(source_index, offset, offset + width),
+						)
+						offset += width
+					None:
+						out = append_diagnostic_with_argument(
+							out,
+							UnexpectedByteDiagnostic,
+							pack_span(source_index, offset, offset),
+							to_int(c),
+						)
+						offset += 1
+
+	while top_indent(layout) > TOP_LEVEL_INDENT:
+		out = append_token(
+			out,
+			{
+				kind = DedentToken,
+				span = pack_span(source_index, offset, offset),
+				payload = NO_TOKEN_PAYLOAD
+			},
+		)
+		layout = with_indent_popped(layout)
+
+	out = append_token(
+		out,
+		{
+			kind = EndOfFileToken,
+			span = pack_span(source_index, offset, offset),
+			payload = NO_TOKEN_PAYLOAD
+		},
+	)
+	out
+
+
+---
+The start of the line holding `offset`.
+---
+private pure func line_start_before(text: String, offset: Int) -> Int:
+	var position: Int = offset
+
+	while position > 0 and byte_at(text, position - 1) != '\n':
+		position -= 1
+
+	position
+
+
+---
+The start of the line holding `end`, given that a scan from `start` to `end`
+may have crossed newlines; `current` when it crossed none.
+---
+private pure func line_start_after(text: String, start: Int, end: Int, current: Int) -> Int:
+	var position: Int = end - 1
+	var found: Int = current
+
+	while position >= start:
+		if byte_at(text, position) == '\n':
+			found = position + 1
+			break
+
+		position -= 1
+
+	found

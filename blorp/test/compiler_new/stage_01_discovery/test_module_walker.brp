@@ -1,0 +1,376 @@
+-- Module walker tests over in-memory module graphs. Every discovery here
+-- freezes with the table invariants checked, so each test also shows the
+-- walker's output satisfies them.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder: RowRange, module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
+		import_count,
+		module_count,
+		module_row,
+	../../../src/compiler_new/stage_01_discovery/module_walker: discover
+	../../../src/compiler_new/stage_01_discovery/source_provider:
+		InMemorySourceProvider,
+		SourceLookupRoots,
+	../../../src/compiler_new/stage_01_discovery/span: SPAN_OFFSET_LIMIT
+	../support/tables_dump: tables_dump
+	test: TestSuite
+
+
+LOOKUP_ROOTS: SourceLookupRoots = {
+	standard_library_root = "std",
+	native_package_roots = ["pkg"]
+}
+
+
+---
+Discovers `roots` over `sources`, or `None` (with the violations printed)
+when the result breaks a table invariant.
+---
+func discovered(sources: Dict[String, String], roots: List[String]) -> Option[FrontendTables]:
+	provider: InMemorySourceProvider = {sources = sources}
+
+	match discover(provider, LOOKUP_ROOTS, roots):
+		FrozenTables(tables):
+			Some(tables)
+		TableInvariantsViolated(violations):
+			print("invariant violations: ${violations.length()}")
+			None
+
+
+---
+Whether discovering `roots` over `sources` renders exactly `expected`.
+---
+func dumps_as(sources: Dict[String, String], roots: List[String], expected: List[String]) -> Bool:
+	match discovered(sources, roots):
+		Some(tables):
+			actual: String = tables_dump(tables)
+			matches: Bool = actual == expected.join("\n")
+
+			if not matches:
+				print("actual dump:\n${actual}")
+
+			matches
+		None:
+			False
+
+
+func test_modules_load_roots_first_then_imports_breadth_first() -> Bool:
+	dumps_as(
+		{
+			"app/main.brp" => "import:\n\t./a\n\t./b\n\nfunc main(args: List[String]) -> Int:\n\t0\n",
+			"app/a.brp" => "import:\n\t./c\n",
+			"app/b.brp" => "import:\n\t./d\n",
+			"app/c.brp" => "x: Int = 1\n",
+			"app/d.brp" => "y: Int = 2\n",
+		},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+2 diagnostics=0+0",
+			"  import i0 relative ./a parents=0 parts=a items=[] -> m1:app/a.brp",
+			"  import i1 relative ./b parents=0 parts=b items=[] -> m2:app/b.brp",
+			"module m1:app/a.brp source=s1 user imported imports=2+1 diagnostics=0+0",
+			"  import i2 relative ./c parents=0 parts=c items=[] -> m3:app/c.brp",
+			"module m2:app/b.brp source=s2 user imported imports=3+1 diagnostics=0+0",
+			"  import i3 relative ./d parents=0 parts=d items=[] -> m4:app/d.brp",
+			"module m3:app/c.brp source=s3 user imported imports=4+0 diagnostics=0+0",
+			"module m4:app/d.brp source=s4 user imported imports=4+0 diagnostics=0+0",
+		],
+	)
+
+
+func test_import_cycle_and_shared_import_load_each_module_once() -> Bool:
+	dumps_as(
+		{
+			"app/main.brp" => "import:\n\t./a\n\t./b\n",
+			"app/a.brp" => "import:\n\t./b\n\t./shared\n",
+			"app/b.brp" => "import:\n\t./a\n\t./shared\n",
+			"app/shared.brp" => "import:\n\t./main\n",
+		},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+2 diagnostics=0+0",
+			"  import i0 relative ./a parents=0 parts=a items=[] -> m1:app/a.brp",
+			"  import i1 relative ./b parents=0 parts=b items=[] -> m2:app/b.brp",
+			"module m1:app/a.brp source=s1 user imported imports=2+2 diagnostics=0+0",
+			"  import i2 relative ./b parents=0 parts=b items=[] -> m2:app/b.brp",
+			(
+				"  import i3 relative ./shared parents=0 parts=shared items=[] -> m3:app/shared."
+				+ "brp"
+			),
+			"module m2:app/b.brp source=s2 user imported imports=4+2 diagnostics=0+0",
+			"  import i4 relative ./a parents=0 parts=a items=[] -> m1:app/a.brp",
+			(
+				"  import i5 relative ./shared parents=0 parts=shared items=[] -> m3:app/shared."
+				+ "brp"
+			),
+			"module m3:app/shared.brp source=s3 user imported imports=6+1 diagnostics=0+0",
+			"  import i6 relative ./main parents=0 parts=main items=[] -> m0:app/main.brp",
+		],
+	)
+
+
+func test_duplicate_roots_and_a_missing_root() -> Bool:
+	dumps_as(
+		{"app/main.brp" => ""},
+		["app/main.brp", "app/./main.brp", "app/missing.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"root r1 app/./main.brp -> m0:app/main.brp",
+			"root r2 app/missing.brp -> unloaded",
+			"root diagnostic r2 UnresolvedRootDiagnostic",
+			"module m0:app/main.brp source=s0 user root imports=0+0 diagnostics=0+0",
+		],
+	)
+
+
+func test_requests_resolve_by_kind_and_unresolved_imports_are_rows() -> Bool:
+	dumps_as(
+		{
+			"app/main.brp" => "import:\n\tlist_tools\n\tlocal_mod\n\tpkg/net/http as H: get\n\tmissing: thing\n\t../lib/util\n",
+			"app/local_mod.brp" => "",
+			"lib/util.brp" => "",
+			"std/list_tools.brp" => "import:\n\t./helpers\n\tlocal_mod\n",
+			"std/helpers.brp" => "",
+			"pkg/net/http.brp" => "import:\n\t./codec\n",
+			"pkg/net/codec.brp" => "",
+		},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+5 diagnostics=0+0",
+			(
+				"  import i0 bare list_tools parents=0 parts=list_tools items=[] -> m1:std/"
+				+ "list_tools.brp"
+			),
+			(
+				"  import i1 bare local_mod parents=0 parts=local_mod items=[] -> m2:app/"
+				+ "local_mod.brp"
+			),
+			(
+				"  import i2 native-package pkg/net/http parents=0 parts=pkg/net/http as H "
+				+ "items=[get] -> m3:pkg/net/http.brp"
+			),
+			"  import i3 bare missing parents=0 parts=missing items=[thing] -> unresolved",
+			(
+				"  import i4 relative ../lib/util parents=1 parts=lib/util items=[] -> m4:lib/"
+				+ "util.brp"
+			),
+			(
+				"module m1:std/list_tools.brp source=s1 stdlib imported imports=5+2 "
+				+ "diagnostics=0+0"
+			),
+			(
+				"  import i5 relative ./helpers parents=0 parts=helpers items=[] -> m5:std/"
+				+ "helpers.brp"
+			),
+			"  import i6 bare local_mod parents=0 parts=local_mod items=[] -> unresolved",
+			"module m2:app/local_mod.brp source=s2 user imported imports=7+0 diagnostics=0+0",
+			(
+				"module m3:pkg/net/http.brp source=s3 package imported package=net imports=7+1 "
+				+ "diagnostics=0+0"
+			),
+			(
+				"  import i7 relative ./codec parents=0 parts=codec items=[] -> m6:pkg/net/codec."
+				+ "brp"
+			),
+			"module m4:lib/util.brp source=s4 user imported imports=8+0 diagnostics=0+0",
+			"module m5:std/helpers.brp source=s5 stdlib imported imports=8+0 diagnostics=0+0",
+			(
+				"module m6:pkg/net/codec.brp source=s6 package imported package=net imports=8+0 "
+				+ "diagnostics=0+0"
+			),
+			"  resolution diagnostic UnresolvedImportDiagnostic s0@56-70 3",
+			"  resolution diagnostic UnresolvedImportDiagnostic s1@20-29 6",
+		],
+	)
+
+
+func test_bare_request_prefers_the_standard_library_over_a_local_module() -> Bool:
+	dumps_as(
+		{"app/main.brp" => "import:\n\tshadow\n", "app/shadow.brp" => "", "std/shadow.brp" => ""},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+1 diagnostics=0+0",
+			"  import i0 bare shadow parents=0 parts=shadow items=[] -> m1:std/shadow.brp",
+			"module m1:std/shadow.brp source=s1 stdlib imported imports=1+0 diagnostics=0+0",
+		],
+	)
+
+
+func test_import_items_symbols_variants_and_aliases_are_rows() -> Bool:
+	dumps_as(
+		{
+			"app/main.brp" => "import:\n\t./kinds as K: Shape(Circle, Square,), area as shape_area, debug\n\t./more:\n\t\tfirst, second\n\t\tthird as last,\n\n",
+			"app/kinds.brp" => "",
+			"app/more.brp" => "",
+		},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+2 diagnostics=0+0",
+			(
+				"  import i0 relative ./kinds parents=0 parts=kinds as K items=[Shape(Circle, "
+				+ "Square), area as shape_area, debug] -> m1:app/kinds.brp"
+			),
+			(
+				"  import i1 relative ./more parents=0 parts=more items=[first, second, third as "
+				+ "last] -> m2:app/more.brp"
+			),
+			"module m1:app/kinds.brp source=s1 user imported imports=2+0 diagnostics=0+0",
+			"module m2:app/more.brp source=s2 user imported imports=2+0 diagnostics=0+0",
+		],
+	)
+
+
+func test_malformed_import_headers_are_diagnostic_rows_of_their_module() -> Bool:
+	dumps_as(
+		{
+			"app/main.brp" => "import\n\t./a\n",
+			"app/other.brp" => "import: ./a\n",
+			"app/a.brp" => "",
+		},
+		["app/main.brp", "app/other.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"root r1 app/other.brp -> m1:app/other.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+1 diagnostics=0+1",
+			"  import i0 relative ./a parents=0 parts=a items=[] -> m2:app/a.brp",
+			"module m1:app/other.brp source=s1 user root imports=1+1 diagnostics=1+3",
+			"  import i1 relative ./a parents=0 parts=a items=[] -> m2:app/a.brp",
+			"module m2:app/a.brp source=s2 user imported imports=2+0 diagnostics=4+0",
+			"  diagnostic ExpectedColonAfterImportDiagnostic s0@8-8",
+			"  diagnostic ExpectedNewlineAfterImportHeaderDiagnostic s1@8-8",
+			"  diagnostic ExpectedIndentedImportsDiagnostic s1@8-8",
+			"  diagnostic ExpectedDedentDiagnostic s1@12-12",
+		],
+	)
+
+
+func test_malformed_import_items_report_each_problem() -> Bool:
+	dumps_as(
+		{
+			"app/main.brp" => "import:\n\t./a: b c\n\t./a: X()\n\t./a as import\n\t/x\n",
+			"app/a.brp" => "",
+		},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+3 diagnostics=0+4",
+			"  import i0 relative ./a parents=0 parts=a items=[b, c] -> m1:app/a.brp",
+			"  import i1 relative ./a parents=0 parts=a items=[X] -> m1:app/a.brp",
+			"  import i2 relative ./a parents=0 parts=a items=[] -> m1:app/a.brp",
+			"module m1:app/a.brp source=s1 user imported imports=3+0 diagnostics=4+0",
+			"  diagnostic ExpectedCommaBetweenImportSymbolsDiagnostic s0@16-16",
+			"  diagnostic ExpectedConstructorNameDiagnostic s0@26-26",
+			"  diagnostic ExpectedAliasNameDiagnostic s0@36-36",
+			"  diagnostic ExpectedModulePathDiagnostic s0@44-44",
+		],
+	)
+
+
+func test_identical_inputs_produce_identical_tables() -> Bool:
+	sources: Dict[String, String] = {
+		"app/main.brp" => "import:\n\t./a\n\tlist_tools\n\t./b\n",
+		"app/a.brp" => "import:\n\t./b\n",
+		"app/b.brp" => "import:\n\t./a\n\tmissing\n",
+		"std/list_tools.brp" => "",
+	}
+
+	match (discovered(sources, ["app/main.brp"]), discovered(sources, ["app/main.brp"])):
+		(Some(first), Some(second)):
+			tables_dump(first) == tables_dump(second)
+		_:
+			False
+
+
+func test_module_import_blocks_are_contiguous_and_in_module_order() -> Bool:
+	sources: Dict[String, String] = {
+		"app/main.brp" => "import:\n\t./a\n\t./b\n",
+		"app/a.brp" => "import:\n\t./b\n\t./c\n",
+		"app/b.brp" => "import:\n\t./c\n",
+		"app/c.brp" => "",
+	}
+
+	match discovered(sources, ["app/main.brp"]):
+		Some(tables):
+			var next_first: Int = 0
+			var contiguous: Bool = True
+
+			for index in 0..module_count(tables):
+				imports: RowRange = module_row(tables, module_id_at_row(index)).imports
+
+				if imports.first != next_first:
+					contiguous = False
+
+				next_first = imports.first + imports.count
+
+			contiguous and next_first == import_count(tables)
+		None:
+			False
+
+
+func test_source_too_large_to_span_is_rejected_with_a_row() -> Bool:
+	huge: String = "a".repeat(SPAN_OFFSET_LIMIT)
+	dumps_as(
+		{"app/main.brp" => "import:\n\t./huge\n", "app/huge.brp" => huge},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+1 diagnostics=0+0",
+			"  import i0 relative ./huge parents=0 parts=huge items=[] -> unresolved",
+			"  resolution diagnostic SourceTooLargeDiagnostic s0@9-15 16777216",
+		],
+	)
+
+
+tests: TestSuite = {
+	description = "Discovery module walker",
+	tests = [
+		(
+			"modules load roots first, then imports breadth first",
+			test_modules_load_roots_first_then_imports_breadth_first,
+		),
+		(
+			"import cycle and shared import load each module once",
+			test_import_cycle_and_shared_import_load_each_module_once,
+		),
+		("duplicate roots and a missing root", test_duplicate_roots_and_a_missing_root),
+		(
+			"requests resolve by kind and unresolved imports are rows",
+			test_requests_resolve_by_kind_and_unresolved_imports_are_rows,
+		),
+		(
+			"bare request prefers the standard library over a local module",
+			test_bare_request_prefers_the_standard_library_over_a_local_module,
+		),
+		(
+			"import items, symbols, variants and aliases are rows",
+			test_import_items_symbols_variants_and_aliases_are_rows,
+		),
+		(
+			"malformed import headers are diagnostic rows of their module",
+			test_malformed_import_headers_are_diagnostic_rows_of_their_module,
+		),
+		(
+			"malformed import items report each problem",
+			test_malformed_import_items_report_each_problem,
+		),
+		(
+			"identical inputs produce identical tables",
+			test_identical_inputs_produce_identical_tables,
+		),
+		(
+			"module import blocks are contiguous and in module order",
+			test_module_import_blocks_are_contiguous_and_in_module_order,
+		),
+		(
+			"source too large to span is rejected with a row",
+			test_source_too_large_to_span_is_rejected_with_a_row,
+		),
+	]
+}

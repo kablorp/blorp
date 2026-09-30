@@ -1,0 +1,311 @@
+-- An open-addressing index from text to row for the name and literal tables,
+-- searchable by a slice of a source text without allocating the slice.
+--
+-- The lexer interns an identifier, keyword or number by looking up the bytes
+-- it spans in the source: a spelling that is already interned costs no
+-- string at all, and only a new spelling allocates the string it stores. A
+-- `Dict[String, Int]` cannot do that, since its key must be a `String`.
+--
+-- The slot table is one `List[Int]` of `SLOT_WIDTH`-int entries: the row the
+-- entry holds (or `EMPTY_SLOT`) and that row's text hash. Keeping the hash in
+-- the entry lets a lookup skip most text comparisons and lets the table grow
+-- without reading the texts, so appending a row updates only the slot table
+-- field besides the text table and never copies either. The table holds at
+-- least twice as many slots as rows; its slot count is a power of two.
+import:
+	list: repeat
+
+
+---
+A slot that holds no row.
+---
+EMPTY_SLOT: Int = -1
+
+---
+What a lookup returns when the text has no row.
+---
+NO_ROW: Int = -1
+
+---
+The number of slots before any growth; a power of two.
+---
+INITIAL_SLOT_COUNT: Int = 1024
+
+---
+Ints per slot entry: the row, then its hash.
+---
+private SLOT_WIDTH: Int = 2
+
+private ROW_FIELD: Int = 0
+
+private HASH_FIELD: Int = 1
+
+---
+The multiplier of the polynomial byte hash.
+---
+private HASH_MULTIPLIER: Int = 31
+
+---
+The shift and multipliers of MurmurHash3's 64-bit finalizer (`fmix64`), as
+signed 64-bit integers.
+---
+private FINALIZER_SHIFT: Int = 33
+
+private FINALIZER_FIRST_MULTIPLIER: Int = -49064778989728563
+
+private FINALIZER_SECOND_MULTIPLIER: Int = -4265267296055464877
+
+---
+The byte a read past the end of a text returns; lookups compare lengths
+first, so it is never compared.
+---
+private PAST_END_BYTE: Char = '\0'
+
+---
+The text a lookup reads for a row outside the texts; entries always name a
+text, so it is never compared.
+---
+private NO_TEXT: String = ""
+
+
+---
+The hash of the bytes `start .. end` of `text`: a polynomial over the bytes,
+wrapping on overflow as all integer arithmetic does.
+---
+pure func slice_hash(text: String, start: Int, end: Int) -> Int:
+	var hash: Int = 0
+	var position: Int = start
+
+	while position < end:
+		hash = hash * HASH_MULTIPLIER + to_int(text.get_or(position, PAST_END_BYTE))
+		position += 1
+
+	finalized_hash(hash)
+
+
+---
+MurmurHash3's 64-bit finalizer: spreads the polynomial hash's low-entropy
+high bits and correlated low bits across the word, so the slot a hash picks
+from its low bits depends on every byte.
+---
+private pure func finalized_hash(hash: Int) -> Int:
+	var mixed: Int = bit_xor(
+		hash,
+		shift_right(hash, FINALIZER_SHIFT),
+	)
+	mixed *= FINALIZER_FIRST_MULTIPLIER
+	mixed = bit_xor(
+		mixed,
+		shift_right(mixed, FINALIZER_SHIFT),
+	)
+	mixed *= FINALIZER_SECOND_MULTIPLIER
+	bit_xor(
+		mixed,
+		shift_right(mixed, FINALIZER_SHIFT),
+	)
+
+
+pure func text_hash(text: String) -> Int:
+	slice_hash(text, 0, text.length())
+
+
+---
+A slot table of `slot_count` empty slots.
+---
+pure func empty_slots(slot_count: Int) -> List[Int]:
+	repeat(EMPTY_SLOT, slot_count * SLOT_WIDTH)
+
+
+pure func slot_count(slots: List[Int]) -> Int:
+	slots.length() / SLOT_WIDTH
+
+
+private pure func slot_row(slots: List[Int], slot: Int) -> Int:
+	slots.get_or(slot * SLOT_WIDTH + ROW_FIELD, EMPTY_SLOT)
+
+
+private pure func slot_hash(slots: List[Int], slot: Int) -> Int:
+	slots.get_or(slot * SLOT_WIDTH + HASH_FIELD, 0)
+
+
+---
+The first slot a hash probes.
+---
+private pure func home_slot(hash: Int, count: Int) -> Int:
+	remainder: Int = hash % count
+
+	if remainder < 0:
+		remainder + count
+	else:
+		remainder
+
+
+---
+Whether `stored` equals the bytes `start .. end` of `source`.
+---
+private pure func slice_equals(
+	stored: String,
+	source: String,
+	start: Int,
+	end: Int,
+) -> Bool:
+	if stored.length() != end - start:
+		False
+	else:
+		var equal: Bool = True
+		var offset: Int = 0
+
+		while equal and start + offset < end:
+			if stored.get_or(offset, PAST_END_BYTE) != source.get_or(start + offset, PAST_END_BYTE):
+				equal = False
+
+			offset += 1
+
+		equal
+
+
+---
+The row holding the bytes `start .. end` of `source`, whose hash is `hash`,
+or `NO_ROW`.
+---
+pure func find_slice(
+	texts: List[String],
+	slots: List[Int],
+	source: String,
+	start: Int,
+	end: Int,
+	hash: Int,
+) -> Int:
+	count: Int = slot_count(slots)
+	var slot: Int = home_slot(hash, count)
+	var found: Int = NO_ROW
+
+	while True:
+		row: Int = slot_row(slots, slot)
+
+		if row == EMPTY_SLOT:
+			break
+
+		if slot_hash(slots, slot) == hash and slice_equals(
+			texts.get_or(row, NO_TEXT),
+			source,
+			start,
+			end,
+		):
+			found = row
+			break
+
+		slot = (slot + 1) % count
+
+	found
+
+
+---
+`slots` with `row` (whose hash is `hash`) inserted, doubled first when
+`row_count` rows would fill more than half of it.
+---
+pure func slots_with_row(
+	slots: List[Int],
+	row: Int,
+	hash: Int,
+	row_count: Int,
+) -> List[Int]:
+	count: Int = slot_count(slots)
+
+	if row_count * 2 > count:
+		insert_entry(
+			grown_slots(slots, count * 2),
+			row,
+			hash,
+		)
+	else:
+		insert_entry(slots, row, hash)
+
+
+---
+A table of `new_count` slots holding every entry of `slots`.
+---
+private pure func grown_slots(slots: List[Int], new_count: Int) -> List[Int]:
+	var table: List[Int] = empty_slots(new_count)
+	var slot: Int = 0
+	count: Int = slot_count(slots)
+
+	while slot < count:
+		row: Int = slot_row(slots, slot)
+
+		if row != EMPTY_SLOT:
+			table = insert_entry(
+				table,
+				row,
+				slot_hash(slots, slot),
+			)
+
+		slot += 1
+
+	table
+
+
+---
+A table of `count` slots holding rows `0 ..` of `texts`.
+---
+pure func slots_for_texts(texts: List[String], count: Int) -> List[Int]:
+	var table: List[Int] = empty_slots(count)
+	var row: Int = 0
+
+	for text in texts:
+		table = insert_entry(table, row, text_hash(text))
+		row += 1
+
+	table
+
+
+private pure func insert_entry(slots: List[Int], row: Int, hash: Int) -> List[Int]:
+	count: Int = slot_count(slots)
+	var slot: Int = home_slot(hash, count)
+
+	while slot_row(slots, slot) != EMPTY_SLOT:
+		slot = (slot + 1) % count
+
+	slots
+		.set(slot * SLOT_WIDTH + ROW_FIELD, row)
+		.set(slot * SLOT_WIDTH + HASH_FIELD, hash)
+
+
+---
+The number of occupied slots, for the table invariants.
+---
+pure func occupied_slot_count(slots: List[Int]) -> Int:
+	var occupied: Int = 0
+	var slot: Int = 0
+	count: Int = slot_count(slots)
+
+	while slot < count:
+		if slot_row(slots, slot) != EMPTY_SLOT:
+			occupied += 1
+
+		slot += 1
+
+	occupied
+
+
+---
+The probes a lookup of every occupied entry takes, summed: each entry's
+distance from its home slot plus one. With `occupied_slot_count` it gives the
+average probe length, for measuring the hash.
+---
+pure func total_probe_length(slots: List[Int]) -> Int:
+	count: Int = slot_count(slots)
+	var total: Int = 0
+	var slot: Int = 0
+
+	while slot < count:
+		if slot_row(slots, slot) != EMPTY_SLOT:
+			home: Int = home_slot(
+				slot_hash(slots, slot),
+				count,
+			)
+			total += (slot - home + count) % count + 1
+
+		slot += 1
+
+	total

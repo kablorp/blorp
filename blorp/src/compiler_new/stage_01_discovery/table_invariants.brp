@@ -1,0 +1,1855 @@
+-- The invariants every frozen set of discovery tables satisfies.
+--
+-- `check_table_invariants` reads each table once, so its cost is linear in
+-- the total number of rows. Readers of frozen tables rely on these facts
+-- instead of re-checking them: every stored id names a row of the right
+-- table, every range lies inside its child table, each module's blocks are
+-- disjoint from the previous module's, children precede their parents, body
+-- roots lie in their definition's module, and the seeded names sit at their
+-- pinned ids.
+import:
+	discovery_builder:
+		DiscoveryBuilder,
+		NO_NODE_PAYLOAD,
+		NodeRow,
+		RowRange,
+		definition_id_index,
+		foreign_block_id_index,
+		import_id_index,
+		import_item_id_index,
+		literal_id_index,
+		module_id_index,
+		name_id_index,
+		node_id_index,
+		package_id_index,
+		parameter_id_index,
+		path_id_index,
+		root_id_index,
+		source_id_index,
+	intern_index: find_slice, occupied_slot_count, text_hash
+	list: repeat
+	row_kinds:
+		DefinitionKind(
+			ForeignFunctionDefinition,
+			FunctionDefinition,
+			ImplMethodDefinition,
+			LocalFunctionDefinition,
+			TraitMethodDefinition,
+		),
+		NodePayloadReference(
+			CodepointPayload,
+			DefinitionPayload,
+			LiteralPayload,
+			NamePayload,
+			NoPayload,
+		),
+		node_payload_reference,
+	span: Span, span_end, span_source_index
+	token: is_unicode_scalar
+
+
+---
+Every discovery table, for naming where a violation was found.
+---
+enum DiscoveryTable:
+	NameTable
+	PathTable
+	SourceTextTable
+	SourceTable
+	LineStartTable
+	PackageTable
+	ModuleTable
+	ModulePackageTable
+	RootTable
+	RootTargetTable
+	RootDiagnosticTable
+	ImportTable
+	ImportPathPartTable
+	ImportItemTable
+	ImportItemVariantTable
+	ImportTargetTable
+	ImportAliasTable
+	ImportItemAliasTable
+	ImportBlockTable
+	DefinitionTable
+	MemberTable
+	DocumentationTable
+	AnnotationTable
+	TypeParameterTable
+	BoundTable
+	SupertraitTable
+	SignatureTable
+	ParameterTable
+	BinderNameTable
+	ParameterTypeTable
+	DefinitionTypeTable
+	VariantPayloadTable
+	DimensionConstraintTable
+	ForeignBlockTable
+	ForeignArgumentTable
+	ForeignBindingTable
+	ForeignCNameTable
+	ResourceCleanupTable
+	BodyTable
+	NodeTable
+	NodeChildTable
+	LiteralTable
+	DiagnosticTable
+	ResolutionDiagnosticTable
+	DiagnosticArgumentTable
+
+
+---
+What a violation breaks. The meaning of `TableInvariantViolation.value` and
+`related_table` is given per kind.
+
+- `DanglingReference`: A row stores an id with no row in `related_table`; `value` is the id's index.
+- `RangeOutOfBounds`: A row's range runs outside `related_table`; `value` is the range's end.
+- `ModuleRangesOverlap`: A module's block of `related_table` starts before the previous module's block ends; `value` is the previous module's index.
+- `NodeChildNotBeforeParent`: A node's child was not appended before it; `value` is the child's index.
+- `BodyRootOutsideModule`: A body's root node lies outside its definition's module's node block; `value` is the root's index.
+- `SeededNameMoved`: The name at a pinned id is not the seeded spelling; the row is the id.
+- `InternIndexMismatch`: An intern index disagrees with its table: the dictionary maps a row's text to another row, or has an entry with no row. `value` is the index the dictionary holds.
+- `SpanOutsideSources`: A span names no source; `value` is the span's source index.
+- `DuplicateSideRow`: A side table holds more than one row for an owner that may have at most one; the row is the owner's index in `related_table` and `value` the row count.
+- `RootOutcomeMismatch`: A root has not exactly one of a target and a root diagnostic; `value` is how many it has.
+- `SignatureCountMismatch`: A function-like definition has not exactly one signature row, or another definition has one; the row is the definition and `value` its signature count.
+- `SideTableUnsorted`: A side table read by owner is not sorted by strictly increasing owner; `value` is the row's owner.
+- `SpanPastSourceEnd`: A span ends past its source's text; `value` is the span's end.
+- `ParallelTableMismatch`: Two parallel tables differ in length; `value` is `related_table`'s length.
+- `PayloadOutOfRange`: A node's payload is outside what its kind allows: a codepoint that is no Unicode scalar value, or a payload on a kind that has none; `value` is the payload.
+- `UnreferencedNode`: A node is neither any node's child nor a root a row names (a body, a parameter or definition type, a variant payload, a dimension constraint side); the row is the node.
+- `NodeReferencedTwice`: A node is a child or root more than once; `value` is how many times.
+- `LocalFunctionNodeMismatch`: A `LocalFunctionNode` names a definition that is not a local function; `value` is the definition's index.
+---
+enum TableInvariantKind:
+	DanglingReference
+	RangeOutOfBounds
+	ModuleRangesOverlap
+	NodeChildNotBeforeParent
+	BodyRootOutsideModule
+	SeededNameMoved
+	InternIndexMismatch
+	ParallelTableMismatch
+	SpanOutsideSources
+	SpanPastSourceEnd
+	DuplicateSideRow
+	RootOutcomeMismatch
+	SignatureCountMismatch
+	SideTableUnsorted
+	LocalFunctionNodeMismatch
+	UnreferencedNode
+	NodeReferencedTwice
+	PayloadOutOfRange
+
+
+struct TableInvariantViolation {
+	kind: TableInvariantKind,
+	table: DiscoveryTable,
+	row: Int,
+	related_table: DiscoveryTable,
+	value: Int
+}
+
+
+private pure func violation(
+	kind: TableInvariantKind,
+	table: DiscoveryTable,
+	row: Int,
+	related_table: DiscoveryTable,
+	value: Int,
+) -> TableInvariantViolation:
+	{
+		kind = kind,
+		table = table,
+		row = row,
+		related_table = related_table,
+		value = value
+	}
+
+
+private pure func index_in(index: Int, length: Int) -> Bool:
+	index >= 0 and index < length
+
+
+private pure func range_end(range: RowRange) -> Int:
+	range.first + range.count
+
+
+private pure func range_in(range: RowRange, length: Int) -> Bool:
+	range.first >= 0 and range.count >= 0 and range_end(range) <= length
+
+
+---
+Appends a `DanglingReference` to `found` unless `index` names a row of a
+table with `length` rows.
+---
+private pure func check_reference(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	row: Int,
+	related_table: DiscoveryTable,
+	index: Int,
+	length: Int,
+) -> List[TableInvariantViolation]:
+	if index_in(index, length):
+		found
+	else:
+		found.append(violation(DanglingReference, table, row, related_table, index))
+
+
+private pure func check_range(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	row: Int,
+	related_table: DiscoveryTable,
+	range: RowRange,
+	length: Int,
+) -> List[TableInvariantViolation]:
+	if range_in(range, length):
+		found
+	else:
+		found.append(violation(RangeOutOfBounds, table, row, related_table, range_end(range)))
+
+
+---
+Every invariant violation in `builder`, checked against the vocabulary
+`seeded_spellings` its name table must start with. Empty for a well-formed
+builder.
+---
+pure func check_table_invariants(
+	builder: DiscoveryBuilder,
+	seeded_spellings: List[String],
+) -> List[TableInvariantViolation]:
+	check_seeded_names(builder, seeded_spellings)
+		.concat(check_intern_indexes(builder))
+		.concat(check_source_rows(builder))
+		.concat(check_module_rows(builder))
+		.concat(check_module_ranges(builder))
+		.concat(check_root_rows(builder))
+		.concat(check_import_rows(builder))
+		.concat(check_declaration_rows(builder))
+		.concat(check_node_rows(builder))
+		.concat(check_node_references(builder))
+		.concat(check_cardinalities(builder))
+		.concat(check_body_rows(builder))
+		.concat(check_diagnostic_rows(builder))
+		.concat(check_spans(builder))
+
+
+private pure func check_seeded_names(
+	builder: DiscoveryBuilder,
+	seeded_spellings: List[String],
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var pinned: Int = 0
+
+	for seeded in seeded_spellings:
+		matches: Bool = match builder.name_spellings.get(pinned):
+			Some(spelling):
+				spelling == seeded
+			None:
+				False
+
+		if not matches:
+			found = found.append(violation(SeededNameMoved, NameTable, pinned, NameTable, pinned))
+
+		pinned += 1
+
+	found
+
+
+---
+Checks that each intern index maps every row's text back to that row and
+holds no other entries.
+---
+private pure func check_intern_indexes(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	check_slot_intern_index(builder.name_spellings, builder.name_slots, NameTable)
+		.concat(check_text_intern_index(builder.paths, builder.path_ids_by_text, PathTable))
+		.concat(check_slot_intern_index(builder.literals, builder.literal_slots, LiteralTable))
+
+
+---
+The slot table finds every text at its own row and holds nothing else.
+---
+private pure func check_slot_intern_index(
+	texts: List[String],
+	slots: List[Int],
+	table: DiscoveryTable,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for text in texts:
+		located: Int = find_slice(texts, slots, text, 0, text.length(), text_hash(text))
+
+		if located != row:
+			found = found.append(violation(InternIndexMismatch, table, row, table, located))
+
+		row += 1
+
+	occupied: Int = occupied_slot_count(slots)
+
+	if occupied != texts.length():
+		found = found.append(violation(InternIndexMismatch, table, texts.length(), table, occupied))
+
+	found
+
+
+private pure func check_text_intern_index(
+	texts: List[String],
+	ids_by_text: Dict[String, Int],
+	table: DiscoveryTable,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for text in texts:
+		match ids_by_text.get(text):
+			Some(index):
+				if index != row:
+					found = found.append(violation(InternIndexMismatch, table, row, table, index))
+			None:
+				found = found.append(violation(InternIndexMismatch, table, row, table, row))
+
+		row += 1
+
+	if ids_by_text.length() != texts.length():
+		found = found.append(
+			violation(
+				InternIndexMismatch,
+				table,
+				texts.length(),
+				table,
+				ids_by_text.length(),
+			),
+		)
+
+	found
+
+
+private pure func check_source_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	source_count: Int = builder.sources.length()
+	path_count: Int = builder.paths.length()
+	line_start_count: Int = builder.line_starts.length()
+
+	if builder.source_texts.length() != source_count:
+		found = found.append(
+			violation(
+				ParallelTableMismatch,
+				SourceTable,
+				source_count,
+				SourceTextTable,
+				builder.source_texts.length(),
+			),
+		)
+
+	var row: Int = 0
+
+	for source in builder.sources:
+		found = check_reference(
+			found,
+			SourceTable,
+			row,
+			PathTable,
+			path_id_index(source.path),
+			path_count,
+		)
+		found = check_range(
+			found,
+			SourceTable,
+			row,
+			LineStartTable,
+			source.line_starts,
+			line_start_count,
+		)
+		row += 1
+
+	found
+
+
+private pure func check_module_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	module_count: Int = builder.modules.length()
+	source_count: Int = builder.sources.length()
+	path_count: Int = builder.paths.length()
+	var row: Int = 0
+
+	for module in builder.modules:
+		found = check_reference(
+			found,
+			ModuleTable,
+			row,
+			SourceTable,
+			source_id_index(module.source),
+			source_count,
+		)
+		found = check_reference(
+			found,
+			ModuleTable,
+			row,
+			PathTable,
+			path_id_index(module.canonical_path),
+			path_count,
+		)
+
+		match builder.module_ids_by_path.get(path_id_index(module.canonical_path)):
+			Some(indexed):
+				if indexed != row:
+					found = found.append(
+						violation(
+							InternIndexMismatch,
+							ModuleTable,
+							row,
+							ModuleTable,
+							indexed,
+						),
+					)
+			None:
+				found = found.append(
+					violation(
+						InternIndexMismatch,
+						ModuleTable,
+						row,
+						ModuleTable,
+						row,
+					),
+				)
+
+		row += 1
+
+	if builder.module_ids_by_path.length() != module_count:
+		found = found.append(
+			violation(
+				InternIndexMismatch,
+				ModuleTable,
+				module_count,
+				ModuleTable,
+				builder.module_ids_by_path.length(),
+			),
+		)
+
+	var package_row: Int = 0
+	package_count: Int = builder.packages.length()
+
+	for module_package in builder.module_packages:
+		found = check_reference(
+			found,
+			ModulePackageTable,
+			package_row,
+			ModuleTable,
+			module_id_index(module_package.module),
+			module_count,
+		)
+		found = check_reference(
+			found,
+			ModulePackageTable,
+			package_row,
+			PackageTable,
+			package_id_index(module_package.package),
+			package_count,
+		)
+		package_row += 1
+
+	var package_name_row: Int = 0
+	name_count: Int = builder.name_spellings.length()
+
+	for package in builder.packages:
+		found = check_reference(
+			found,
+			PackageTable,
+			package_name_row,
+			NameTable,
+			name_id_index(package.name),
+			name_count,
+		)
+		package_name_row += 1
+
+	found
+
+
+---
+Each module's blocks lie inside their tables and start at or after the end
+of the previous module's blocks: modules are parsed one after another, so
+their blocks are disjoint and in module order.
+---
+private pure func check_module_ranges(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	definition_count: Int = builder.definitions.length()
+	import_count: Int = builder.imports.length()
+	node_count: Int = builder.nodes.length()
+	diagnostic_count: Int = builder.diagnostics.length()
+	var previous_definitions_end: Int = 0
+	var previous_imports_end: Int = 0
+	var previous_nodes_end: Int = 0
+	var previous_diagnostics_end: Int = 0
+	var row: Int = 0
+
+	for module in builder.modules:
+		previous: Int = row - 1
+		found = check_range(
+			found,
+			ModuleTable,
+			row,
+			DefinitionTable,
+			module.definitions,
+			definition_count,
+		)
+		found = check_range(found, ModuleTable, row, ImportTable, module.imports, import_count)
+		found = check_range(found, ModuleTable, row, NodeTable, module.nodes, node_count)
+		found = check_range(
+			found,
+			ModuleTable,
+			row,
+			DiagnosticTable,
+			module.diagnostics,
+			diagnostic_count,
+		)
+
+		if module.definitions.first < previous_definitions_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					DefinitionTable,
+					previous,
+				),
+			)
+
+		if module.imports.first < previous_imports_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					ImportTable,
+					previous,
+				),
+			)
+
+		if module.nodes.first < previous_nodes_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					NodeTable,
+					previous,
+				),
+			)
+
+		if module.diagnostics.first < previous_diagnostics_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					DiagnosticTable,
+					previous,
+				),
+			)
+
+		previous_definitions_end = range_end(module.definitions)
+		previous_imports_end = range_end(module.imports)
+		previous_nodes_end = range_end(module.nodes)
+		previous_diagnostics_end = range_end(module.diagnostics)
+		row += 1
+
+	found
+
+
+private pure func check_root_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	root_count: Int = builder.roots.length()
+	module_count: Int = builder.modules.length()
+	path_count: Int = builder.paths.length()
+	argument_count: Int = builder.diagnostic_arguments.length()
+	var row: Int = 0
+
+	for root in builder.roots:
+		found = check_reference(
+			found,
+			RootTable,
+			row,
+			PathTable,
+			path_id_index(root.request_path),
+			path_count,
+		)
+		row += 1
+
+	var target_row: Int = 0
+
+	for target in builder.root_targets:
+		found = check_reference(
+			found,
+			RootTargetTable,
+			target_row,
+			RootTable,
+			root_id_index(target.root),
+			root_count,
+		)
+		found = check_reference(
+			found,
+			RootTargetTable,
+			target_row,
+			ModuleTable,
+			module_id_index(target.target),
+			module_count,
+		)
+		target_row += 1
+
+	var diagnostic_row: Int = 0
+
+	for root_diagnostic in builder.root_diagnostics:
+		found = check_reference(
+			found,
+			RootDiagnosticTable,
+			diagnostic_row,
+			RootTable,
+			root_id_index(root_diagnostic.root),
+			root_count,
+		)
+		found = check_range(
+			found,
+			RootDiagnosticTable,
+			diagnostic_row,
+			DiagnosticArgumentTable,
+			root_diagnostic.arguments,
+			argument_count,
+		)
+		diagnostic_row += 1
+
+	found
+
+
+private pure func check_import_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	import_count: Int = builder.imports.length()
+	item_count: Int = builder.import_items.length()
+	part_count: Int = builder.import_path_parts.length()
+	variant_count: Int = builder.import_item_variants.length()
+	module_count: Int = builder.modules.length()
+	path_count: Int = builder.paths.length()
+	name_count: Int = builder.name_spellings.length()
+	var row: Int = 0
+
+	for import_row in builder.imports:
+		found = check_reference(
+			found,
+			ImportTable,
+			row,
+			ModuleTable,
+			module_id_index(import_row.importer),
+			module_count,
+		)
+		found = check_reference(
+			found,
+			ImportTable,
+			row,
+			PathTable,
+			path_id_index(import_row.request_path),
+			path_count,
+		)
+		found = check_range(found, ImportTable, row, ImportItemTable, import_row.items, item_count)
+		found = check_range(
+			found,
+			ImportTable,
+			row,
+			ImportPathPartTable,
+			import_row.path_parts,
+			part_count,
+		)
+		row += 1
+
+	var item_row: Int = 0
+
+	for item in builder.import_items:
+		found = check_reference(
+			found,
+			ImportItemTable,
+			item_row,
+			ImportTable,
+			import_id_index(item.owner_import),
+			import_count,
+		)
+		found = check_reference(
+			found,
+			ImportItemTable,
+			item_row,
+			NameTable,
+			name_id_index(item.name),
+			name_count,
+		)
+		found = check_range(
+			found,
+			ImportItemTable,
+			item_row,
+			ImportItemVariantTable,
+			item.variants,
+			variant_count,
+		)
+		item_row += 1
+
+	var variant_row: Int = 0
+
+	for variant in builder.import_item_variants:
+		found = check_reference(
+			found,
+			ImportItemVariantTable,
+			variant_row,
+			ImportItemTable,
+			import_item_id_index(variant.item),
+			item_count,
+		)
+		found = check_reference(
+			found,
+			ImportItemVariantTable,
+			variant_row,
+			NameTable,
+			name_id_index(variant.name),
+			name_count,
+		)
+		variant_row += 1
+
+	var part_row: Int = 0
+
+	for part in builder.import_path_parts:
+		found = check_reference(
+			found,
+			ImportPathPartTable,
+			part_row,
+			NameTable,
+			name_id_index(part),
+			name_count,
+		)
+		part_row += 1
+
+	var target_row: Int = 0
+
+	for target in builder.import_targets:
+		found = check_reference(
+			found,
+			ImportTargetTable,
+			target_row,
+			ImportTable,
+			import_id_index(target.owner_import),
+			import_count,
+		)
+		found = check_reference(
+			found,
+			ImportTargetTable,
+			target_row,
+			ModuleTable,
+			module_id_index(target.target),
+			module_count,
+		)
+		target_row += 1
+
+	var alias_row: Int = 0
+
+	for alias_entry in builder.import_aliases:
+		found = check_reference(
+			found,
+			ImportAliasTable,
+			alias_row,
+			ImportTable,
+			import_id_index(alias_entry.owner_import),
+			import_count,
+		)
+		found = check_reference(
+			found,
+			ImportAliasTable,
+			alias_row,
+			NameTable,
+			name_id_index(alias_entry.alias_name),
+			name_count,
+		)
+		alias_row += 1
+
+	var item_alias_row: Int = 0
+
+	for item_alias in builder.import_item_aliases:
+		found = check_reference(
+			found,
+			ImportItemAliasTable,
+			item_alias_row,
+			ImportItemTable,
+			import_item_id_index(item_alias.item),
+			item_count,
+		)
+		found = check_reference(
+			found,
+			ImportItemAliasTable,
+			item_alias_row,
+			NameTable,
+			name_id_index(item_alias.alias_name),
+			name_count,
+		)
+		item_alias_row += 1
+
+	found
+
+
+private pure func check_declaration_rows(
+	builder: DiscoveryBuilder,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	definition_count: Int = builder.definitions.length()
+	module_count: Int = builder.modules.length()
+	name_count: Int = builder.name_spellings.length()
+	literal_count: Int = builder.literals.length()
+	node_count: Int = builder.nodes.length()
+	import_count: Int = builder.imports.length()
+	parameter_count: Int = builder.parameters.length()
+	binder_name_count: Int = builder.binder_names.length()
+	foreign_argument_count: Int = builder.foreign_arguments.length()
+	foreign_block_count: Int = builder.foreign_blocks.length()
+	var row: Int = 0
+
+	for block in builder.import_blocks:
+		found = check_reference(
+			found,
+			ImportBlockTable,
+			row,
+			ModuleTable,
+			module_id_index(block.module),
+			module_count,
+		)
+		found = check_range(found, ImportBlockTable, row, ImportTable, block.imports, import_count)
+		row += 1
+
+	row = 0
+
+	for definition in builder.definitions:
+		found = check_reference(
+			found,
+			DefinitionTable,
+			row,
+			ModuleTable,
+			module_id_index(definition.module),
+			module_count,
+		)
+		found = check_reference(
+			found,
+			DefinitionTable,
+			row,
+			NameTable,
+			name_id_index(definition.name),
+			name_count,
+		)
+		row += 1
+
+	row = 0
+
+	for member in builder.members:
+		found = check_reference(
+			found,
+			MemberTable,
+			row,
+			DefinitionTable,
+			definition_id_index(member.definition),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			MemberTable,
+			row,
+			DefinitionTable,
+			definition_id_index(member.owner),
+			definition_count,
+		)
+		row += 1
+
+	row = 0
+
+	for documentation in builder.documentation:
+		found = check_reference(
+			found,
+			DocumentationTable,
+			row,
+			DefinitionTable,
+			definition_id_index(documentation.definition),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			DocumentationTable,
+			row,
+			LiteralTable,
+			literal_id_index(documentation.text),
+			literal_count,
+		)
+		row += 1
+
+	row = 0
+
+	for annotation in builder.annotations:
+		found = check_reference(
+			found,
+			AnnotationTable,
+			row,
+			DefinitionTable,
+			definition_id_index(annotation.definition),
+			definition_count,
+		)
+		row += 1
+
+	row = 0
+
+	for parameter in builder.type_parameters:
+		found = check_reference(
+			found,
+			TypeParameterTable,
+			row,
+			DefinitionTable,
+			definition_id_index(parameter.owner),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			TypeParameterTable,
+			row,
+			NameTable,
+			name_id_index(parameter.name),
+			name_count,
+		)
+		row += 1
+
+	row = 0
+
+	for bound in builder.bounds:
+		found = check_reference(
+			found,
+			BoundTable,
+			row,
+			DefinitionTable,
+			definition_id_index(bound.owner),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			BoundTable,
+			row,
+			NameTable,
+			name_id_index(bound.trait_name),
+			name_count,
+		)
+		row += 1
+
+	row = 0
+
+	for supertrait in builder.supertraits:
+		found = check_reference(
+			found,
+			SupertraitTable,
+			row,
+			DefinitionTable,
+			definition_id_index(supertrait.trait_definition),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			SupertraitTable,
+			row,
+			NameTable,
+			name_id_index(supertrait.name),
+			name_count,
+		)
+		row += 1
+
+	row = 0
+
+	for signature in builder.signatures:
+		found = check_reference(
+			found,
+			SignatureTable,
+			row,
+			DefinitionTable,
+			definition_id_index(signature.definition),
+			definition_count,
+		)
+		found = check_range(
+			found,
+			SignatureTable,
+			row,
+			ParameterTable,
+			signature.parameters,
+			parameter_count,
+		)
+		row += 1
+
+	row = 0
+
+	for parameter in builder.parameters:
+		found = check_reference(
+			found,
+			ParameterTable,
+			row,
+			DefinitionTable,
+			definition_id_index(parameter.owner),
+			definition_count,
+		)
+		found = check_range(
+			found,
+			ParameterTable,
+			row,
+			BinderNameTable,
+			parameter.binder_names,
+			binder_name_count,
+		)
+		row += 1
+
+	row = 0
+
+	for binder_name in builder.binder_names:
+		found = check_reference(
+			found,
+			BinderNameTable,
+			row,
+			NameTable,
+			name_id_index(binder_name.name),
+			name_count,
+		)
+		row += 1
+
+	row = 0
+
+	for parameter_type in builder.parameter_types:
+		found = check_reference(
+			found,
+			ParameterTypeTable,
+			row,
+			ParameterTable,
+			parameter_id_index(parameter_type.parameter),
+			parameter_count,
+		)
+		found = check_reference(
+			found,
+			ParameterTypeTable,
+			row,
+			NodeTable,
+			node_id_index(parameter_type.type_root),
+			node_count,
+		)
+		row += 1
+
+	row = 0
+
+	for definition_type in builder.definition_types:
+		found = check_reference(
+			found,
+			DefinitionTypeTable,
+			row,
+			DefinitionTable,
+			definition_id_index(definition_type.definition),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			DefinitionTypeTable,
+			row,
+			NodeTable,
+			node_id_index(definition_type.type_root),
+			node_count,
+		)
+		row += 1
+
+	row = 0
+
+	for payload in builder.variant_payloads:
+		found = check_reference(
+			found,
+			VariantPayloadTable,
+			row,
+			DefinitionTable,
+			definition_id_index(payload.variant),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			VariantPayloadTable,
+			row,
+			NodeTable,
+			node_id_index(payload.type_root),
+			node_count,
+		)
+		row += 1
+
+	row = 0
+
+	for constraint in builder.dimension_constraints:
+		found = check_reference(
+			found,
+			DimensionConstraintTable,
+			row,
+			DefinitionTable,
+			definition_id_index(constraint.owner),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			DimensionConstraintTable,
+			row,
+			NodeTable,
+			node_id_index(constraint.left),
+			node_count,
+		)
+		found = check_reference(
+			found,
+			DimensionConstraintTable,
+			row,
+			NodeTable,
+			node_id_index(constraint.right),
+			node_count,
+		)
+		row += 1
+
+	row = 0
+
+	for block in builder.foreign_blocks:
+		found = check_reference(
+			found,
+			ForeignBlockTable,
+			row,
+			ModuleTable,
+			module_id_index(block.module),
+			module_count,
+		)
+		found = check_range(
+			found,
+			ForeignBlockTable,
+			row,
+			ForeignArgumentTable,
+			block.arguments,
+			foreign_argument_count,
+		)
+		row += 1
+
+	row = 0
+
+	for argument in builder.foreign_arguments:
+		found = check_reference(
+			found,
+			ForeignArgumentTable,
+			row,
+			NameTable,
+			name_id_index(argument.name),
+			name_count,
+		)
+		found = check_reference(
+			found,
+			ForeignArgumentTable,
+			row,
+			LiteralTable,
+			literal_id_index(argument.value),
+			literal_count,
+		)
+		row += 1
+
+	row = 0
+
+	for binding in builder.foreign_bindings:
+		found = check_reference(
+			found,
+			ForeignBindingTable,
+			row,
+			DefinitionTable,
+			definition_id_index(binding.definition),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			ForeignBindingTable,
+			row,
+			ForeignBlockTable,
+			foreign_block_id_index(binding.block),
+			foreign_block_count,
+		)
+		row += 1
+
+	row = 0
+
+	for c_name in builder.foreign_c_names:
+		found = check_reference(
+			found,
+			ForeignCNameTable,
+			row,
+			DefinitionTable,
+			definition_id_index(c_name.definition),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			ForeignCNameTable,
+			row,
+			LiteralTable,
+			literal_id_index(c_name.c_name),
+			literal_count,
+		)
+		row += 1
+
+	row = 0
+
+	for cleanup in builder.resource_cleanups:
+		found = check_reference(
+			found,
+			ResourceCleanupTable,
+			row,
+			DefinitionTable,
+			definition_id_index(cleanup.definition),
+			definition_count,
+		)
+		found = check_reference(
+			found,
+			ResourceCleanupTable,
+			row,
+			LiteralTable,
+			literal_id_index(cleanup.builtin_name),
+			literal_count,
+		)
+		row += 1
+
+	found
+
+
+---
+Every node's child block lies inside the edge table, and every child is an
+existing node appended before its parent (post-order).
+---
+private pure func check_node_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	node_count: Int = builder.nodes.length()
+	edge_count: Int = builder.node_children.length()
+	var row: Int = 0
+
+	for node in builder.nodes:
+		if range_in(node.children, edge_count):
+			for edge in node.children.first..range_end(node.children):
+				match builder.node_children.get(edge):
+					Some(child):
+						child_index: Int = node_id_index(child)
+
+						if not index_in(child_index, node_count):
+							found = found.append(
+								violation(
+									DanglingReference,
+									NodeTable,
+									row,
+									NodeTable,
+									child_index,
+								),
+							)
+						else if child_index >= row:
+							found = found.append(
+								violation(
+									NodeChildNotBeforeParent,
+									NodeTable,
+									row,
+									NodeTable,
+									child_index,
+								),
+							)
+					None:
+						found = found.append(
+							violation(
+								RangeOutOfBounds,
+								NodeTable,
+								row,
+								NodeChildTable,
+								edge,
+							),
+						)
+		else:
+			found = found.append(
+				violation(
+					RangeOutOfBounds,
+					NodeTable,
+					row,
+					NodeChildTable,
+					range_end(node.children),
+				),
+			)
+
+		found = check_node_payload(found, builder, row, node)
+
+		row += 1
+
+	found
+
+
+---
+Every node is referenced exactly once: as one node's child, or as a root a
+row names (a body root, a parameter or definition type, a variant payload,
+either side of a dimension constraint). One pass counts the references.
+---
+private pure func check_node_references(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	node_count: Int = builder.nodes.length()
+	var references: List[Int] = repeat(0, node_count)
+
+	for child in builder.node_children:
+		references = counted(references, node_id_index(child))
+
+	for body in builder.bodies:
+		references = counted(references, node_id_index(body.root))
+
+	for parameter_type in builder.parameter_types:
+		references = counted(references, node_id_index(parameter_type.type_root))
+
+	for definition_type in builder.definition_types:
+		references = counted(references, node_id_index(definition_type.type_root))
+
+	for payload in builder.variant_payloads:
+		references = counted(references, node_id_index(payload.type_root))
+
+	for constraint in builder.dimension_constraints:
+		references = counted(references, node_id_index(constraint.left))
+		references = counted(references, node_id_index(constraint.right))
+
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for count in references:
+		if count == 0:
+			found = found.append(violation(UnreferencedNode, NodeTable, row, NodeTable, row))
+		else if count > 1:
+			found = found.append(violation(NodeReferencedTwice, NodeTable, row, NodeTable, count))
+
+		row += 1
+
+	found
+
+
+---
+Side tables that hold at most one row per owner do; each root has exactly
+one outcome (a target or a root diagnostic); each function-like definition
+has exactly one signature and no other definition has one.
+---
+private pure func check_cardinalities(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	imports: Int = builder.imports.length()
+	roots: Int = builder.roots.length()
+	definitions: Int = builder.definitions.length()
+	root_targets: List[Int] = owner_counts(
+		roots,
+		builder.root_targets.map(pure func(row): root_id_index(row.root)),
+	)
+	root_diagnostics: List[Int] = owner_counts(
+		roots,
+		builder.root_diagnostics.map(pure func(row): root_id_index(row.root)),
+	)
+	signatures: List[Int] = owner_counts(
+		definitions,
+		builder.signatures.map(pure func(row): definition_id_index(row.definition)),
+	)
+	var found: List[TableInvariantViolation] = at_most_one(
+		[],
+		ImportTargetTable,
+		ImportTable,
+		owner_counts(
+			imports,
+			builder.import_targets.map(pure func(row): import_id_index(row.owner_import)),
+		),
+	)
+	found = at_most_one(
+		found,
+		ImportAliasTable,
+		ImportTable,
+		owner_counts(
+			imports,
+			builder.import_aliases.map(pure func(row): import_id_index(row.owner_import)),
+		),
+	)
+	found = at_most_one(found, RootTargetTable, RootTable, root_targets)
+	found = sorted_by_owner(
+		found,
+		ImportTargetTable,
+		builder.import_targets.map(pure func(row): import_id_index(row.owner_import)),
+	)
+	found = sorted_by_owner(
+		found,
+		ImportAliasTable,
+		builder.import_aliases.map(pure func(row): import_id_index(row.owner_import)),
+	)
+	found = sorted_by_owner(
+		found,
+		ImportItemAliasTable,
+		builder.import_item_aliases.map(pure func(row): import_item_id_index(row.item)),
+	)
+	found = sorted_by_owner(
+		found,
+		RootTargetTable,
+		builder.root_targets.map(pure func(row): root_id_index(row.root)),
+	)
+	found = sorted_by_owner(
+		found,
+		ModulePackageTable,
+		builder.module_packages.map(pure func(row): module_id_index(row.module)),
+	)
+	found = at_most_one(
+		found,
+		ModulePackageTable,
+		ModuleTable,
+		owner_counts(
+			builder.modules.length(),
+			builder.module_packages.map(pure func(row): module_id_index(row.module)),
+		),
+	)
+	found = at_most_one(
+		found,
+		DefinitionTypeTable,
+		DefinitionTable,
+		owner_counts(
+			definitions,
+			builder.definition_types.map(pure func(row): definition_id_index(row.definition)),
+		),
+	)
+	found = at_most_one(
+		found,
+		BodyTable,
+		DefinitionTable,
+		owner_counts(
+			definitions,
+			builder.bodies.map(pure func(row): definition_id_index(row.definition)),
+		),
+	)
+	var root: Int = 0
+
+	while root < roots:
+		outcomes: Int = root_targets.get_or(root, 0) + root_diagnostics.get_or(root, 0)
+
+		if outcomes != 1:
+			found = found.append(
+				violation(
+					RootOutcomeMismatch,
+					RootTable,
+					root,
+					RootTargetTable,
+					outcomes,
+				),
+			)
+
+		root += 1
+
+	var row: Int = 0
+
+	for definition in builder.definitions:
+		expected: Int = if has_signature(definition.kind):
+			1
+		else:
+			0
+
+		count: Int = signatures.get_or(row, 0)
+
+		if count != expected:
+			found = found.append(
+				violation(
+					SignatureCountMismatch,
+					DefinitionTable,
+					row,
+					SignatureTable,
+					count,
+				),
+			)
+
+		row += 1
+
+	found
+
+
+---
+Whether a definition of `kind` has a signature row.
+---
+private pure func has_signature(kind: DefinitionKind) -> Bool:
+	match kind:
+		FunctionDefinition | TraitMethodDefinition | ImplMethodDefinition | ForeignFunctionDefinition | LocalFunctionDefinition:
+			True
+		_:
+			False
+
+
+---
+How many rows name each of `owner_count` owners, from the owner index of
+each row; an index outside the owners is a dangling reference the row
+checks report.
+---
+private pure func owner_counts(owner_count: Int, owners: List[Int]) -> List[Int]:
+	var counts: List[Int] = repeat(0, owner_count)
+
+	for owner in owners:
+		counts = counted(counts, owner)
+
+	counts
+
+
+---
+A `SideTableUnsorted` for each row whose owner is not greater than the
+previous row's: the frozen tables find a side row by binary search.
+---
+private pure func sorted_by_owner(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	owners: List[Int],
+) -> List[TableInvariantViolation]:
+	var out: List[TableInvariantViolation] = found
+	var previous: Int = -1
+	var row: Int = 0
+
+	for owner in owners:
+		if owner <= previous:
+			out = out.append(violation(SideTableUnsorted, table, row, table, owner))
+
+		previous = owner
+		row += 1
+
+	out
+
+
+---
+A `DuplicateSideRow` for each owner `counts` gives more than one row.
+---
+private pure func at_most_one(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	owner_table: DiscoveryTable,
+	counts: List[Int],
+) -> List[TableInvariantViolation]:
+	var out: List[TableInvariantViolation] = found
+	var owner: Int = 0
+
+	for count in counts:
+		if count > 1:
+			out = out.append(violation(DuplicateSideRow, table, owner, owner_table, count))
+
+		owner += 1
+
+	out
+
+
+---
+`references` with the count at `index` raised by one; an index outside the
+node table is a dangling reference, which the row checks report.
+---
+private pure func counted(references: List[Int], index: Int) -> List[Int]:
+	match references.get(index):
+		Some(count):
+			references.set(index, count + 1)
+		None:
+			references
+
+
+---
+A node's payload indexes the table its kind names (`node_payload_reference`):
+a name, a literal, a Unicode scalar value, a local function's definition, or
+nothing (`NO_NODE_PAYLOAD`).
+---
+private pure func check_node_payload(
+	found: List[TableInvariantViolation],
+	builder: DiscoveryBuilder,
+	row: Int,
+	node: NodeRow,
+) -> List[TableInvariantViolation]:
+	match node_payload_reference(node.kind):
+		NamePayload:
+			check_reference(
+				found,
+				NodeTable,
+				row,
+				NameTable,
+				node.payload,
+				builder.name_spellings.length(),
+			)
+		LiteralPayload:
+			check_reference(
+				found,
+				NodeTable,
+				row,
+				LiteralTable,
+				node.payload,
+				builder.literals.length(),
+			)
+		CodepointPayload:
+			if is_unicode_scalar(node.payload):
+				found
+			else:
+				found.append(violation(PayloadOutOfRange, NodeTable, row, NodeTable, node.payload))
+		DefinitionPayload:
+			check_local_function_node(found, builder, row, node.payload)
+		NoPayload:
+			if node.payload == NO_NODE_PAYLOAD:
+				found
+			else:
+				found.append(violation(PayloadOutOfRange, NodeTable, row, NodeTable, node.payload))
+
+
+---
+A `LocalFunctionNode` at `row` names an existing `LocalFunctionDefinition`.
+---
+private pure func check_local_function_node(
+	found: List[TableInvariantViolation],
+	builder: DiscoveryBuilder,
+	row: Int,
+	definition_index: Int,
+) -> List[TableInvariantViolation]:
+	match builder.definitions.get(definition_index):
+		Some(definition):
+			if definition.kind == LocalFunctionDefinition:
+				found
+			else:
+				found.append(
+					violation(
+						LocalFunctionNodeMismatch,
+						NodeTable,
+						row,
+						DefinitionTable,
+						definition_index,
+					),
+				)
+		None:
+			found.append(
+				violation(
+					DanglingReference,
+					NodeTable,
+					row,
+					DefinitionTable,
+					definition_index,
+				),
+			)
+
+
+---
+Every body names an existing definition, and its root is a node inside the
+node block of that definition's module.
+---
+private pure func check_body_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	definition_count: Int = builder.definitions.length()
+	var row: Int = 0
+
+	for body in builder.bodies:
+		definition_index: Int = definition_id_index(body.definition)
+		root_index: Int = node_id_index(body.root)
+
+		match builder.definitions.get(definition_index):
+			Some(definition):
+				match builder.modules.get(module_id_index(definition.module)):
+					Some(module):
+						if not index_in(root_index - module.nodes.first, module.nodes.count):
+							found = found.append(
+								violation(
+									BodyRootOutsideModule,
+									BodyTable,
+									row,
+									NodeTable,
+									root_index,
+								),
+							)
+					None:
+						found = found.append(
+							violation(
+								DanglingReference,
+								BodyTable,
+								row,
+								ModuleTable,
+								module_id_index(definition.module),
+							),
+						)
+			None:
+				found = found.append(
+					violation(
+						DanglingReference,
+						BodyTable,
+						row,
+						DefinitionTable,
+						definition_index,
+					),
+				)
+
+		row += 1
+
+	found
+
+
+private pure func check_diagnostic_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	argument_count: Int = builder.diagnostic_arguments.length()
+	var row: Int = 0
+
+	for diagnostic in builder.diagnostics:
+		found = check_range(
+			found,
+			DiagnosticTable,
+			row,
+			DiagnosticArgumentTable,
+			diagnostic.arguments,
+			argument_count,
+		)
+		row += 1
+
+	row = 0
+
+	for diagnostic in builder.resolution_diagnostics:
+		found = check_range(
+			found,
+			ResolutionDiagnosticTable,
+			row,
+			DiagnosticArgumentTable,
+			diagnostic.arguments,
+			argument_count,
+		)
+		row += 1
+
+	found
+
+
+---
+Appends a `SpanOutsideSources` violation unless `span` names a source.
+---
+private pure func check_span(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	row: Int,
+	span: Span,
+	source_lengths: List[Int],
+) -> List[TableInvariantViolation]:
+	source_index: Int = span_source_index(span)
+
+	match source_lengths.get(source_index):
+		Some(length):
+			if span_end(span) <= length:
+				found
+			else:
+				found.append(violation(SpanPastSourceEnd, table, row, SourceTable, span_end(span)))
+		None:
+			found.append(violation(SpanOutsideSources, table, row, SourceTable, source_index))
+
+
+---
+Every span stored in a row names a source and ends within its text.
+---
+private pure func check_spans(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	sources: List[Int] = builder.source_texts.map(pure func(text): text.length())
+	var row: Int = 0
+
+	for import_row in builder.imports:
+		found = check_span(found, ImportTable, row, import_row.span, sources)
+		row += 1
+
+	row = 0
+
+	for item in builder.import_items:
+		found = check_span(found, ImportItemTable, row, item.span, sources)
+		row += 1
+
+	row = 0
+
+	for variant in builder.import_item_variants:
+		found = check_span(found, ImportItemVariantTable, row, variant.span, sources)
+		row += 1
+
+	row = 0
+
+	for block in builder.import_blocks:
+		found = check_span(found, ImportBlockTable, row, block.span, sources)
+		row += 1
+
+	row = 0
+
+	for definition in builder.definitions:
+		found = check_span(found, DefinitionTable, row, definition.span, sources)
+		found = check_span(found, DefinitionTable, row, definition.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for annotation in builder.annotations:
+		found = check_span(found, AnnotationTable, row, annotation.span, sources)
+		row += 1
+
+	row = 0
+
+	for parameter in builder.type_parameters:
+		found = check_span(found, TypeParameterTable, row, parameter.span, sources)
+		row += 1
+
+	row = 0
+
+	for bound in builder.bounds:
+		found = check_span(found, BoundTable, row, bound.span, sources)
+		row += 1
+
+	row = 0
+
+	for supertrait in builder.supertraits:
+		found = check_span(found, SupertraitTable, row, supertrait.span, sources)
+		row += 1
+
+	row = 0
+
+	for signature in builder.signatures:
+		found = check_span(found, SignatureTable, row, signature.keyword_span, sources)
+		row += 1
+
+	row = 0
+
+	for parameter in builder.parameters:
+		found = check_span(found, ParameterTable, row, parameter.binder_span, sources)
+		found = check_span(found, ParameterTable, row, parameter.span, sources)
+		row += 1
+
+	row = 0
+
+	for binder_name in builder.binder_names:
+		found = check_span(found, BinderNameTable, row, binder_name.span, sources)
+		row += 1
+
+	row = 0
+
+	for constraint in builder.dimension_constraints:
+		found = check_span(found, DimensionConstraintTable, row, constraint.span, sources)
+		row += 1
+
+	row = 0
+
+	for block in builder.foreign_blocks:
+		found = check_span(found, ForeignBlockTable, row, block.span, sources)
+		row += 1
+
+	row = 0
+
+	for argument in builder.foreign_arguments:
+		found = check_span(found, ForeignArgumentTable, row, argument.span, sources)
+		row += 1
+
+	row = 0
+
+	for c_name in builder.foreign_c_names:
+		found = check_span(found, ForeignCNameTable, row, c_name.span, sources)
+		row += 1
+
+	row = 0
+
+	for cleanup in builder.resource_cleanups:
+		found = check_span(found, ResourceCleanupTable, row, cleanup.span, sources)
+		row += 1
+
+	row = 0
+
+	for node in builder.nodes:
+		found = check_span(found, NodeTable, row, node.span, sources)
+		row += 1
+
+	row = 0
+
+	for diagnostic in builder.diagnostics:
+		found = check_span(found, DiagnosticTable, row, diagnostic.span, sources)
+		row += 1
+
+	row = 0
+
+	for diagnostic in builder.resolution_diagnostics:
+		found = check_span(found, ResolutionDiagnosticTable, row, diagnostic.span, sources)
+		row += 1
+
+	found

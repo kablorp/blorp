@@ -1,0 +1,572 @@
+-- Frozen discovery tables and their read-only accessors.
+--
+-- `freeze` seals a builder once discovery is done. It first runs
+-- `check_table_invariants` and refuses to freeze a builder that breaks them.
+-- Readers rely on those invariants: an id they were handed names a row, so
+-- the row accessors below never need an absent case. The fallback rows they
+-- carry for an index outside a table are unreachable for ids read from
+-- frozen tables; they exist because a list read is total.
+import:
+	discovery_builder:
+		DefinitionId,
+		DefinitionRow,
+		DiagnosticRow,
+		DiscoveryBuilder,
+		EMPTY_ROW_RANGE,
+		ImportId,
+		ImportItemId,
+		ImportItemRow,
+		ImportItemVariantRow,
+		ImportRow,
+		LiteralId,
+		ModuleId,
+		ModuleRow,
+		NameId,
+		NodeId,
+		NodeRow,
+		PackageRow,
+		PathId,
+		RootDiagnosticRow,
+		RootId,
+		RootRow,
+		RowRange,
+		SourceId,
+		SourceRow,
+		definition_id_index,
+		find_name_id,
+		import_id_index,
+		import_item_id_index,
+		literal_id_index,
+		module_id_at_row,
+		module_id_index,
+		name_id_at_row,
+		name_id_index,
+		node_id_index,
+		package_id_index,
+		path_id_at_row,
+		path_id_index,
+		root_id_index,
+		source_id_at_row,
+		source_id_index,
+		without_transient_tables,
+	name_vocabulary: ALL_SEEDED_NAME_SPELLINGS
+	row_kinds:
+		DefinitionKind(FunctionDefinition),
+		ImportRequestKind(BareModuleRequest),
+		ModuleOriginKind(UserModule),
+		ModuleReach(ImportedModule),
+		NodeKind(MissingExpressionNode),
+		Visibility(PublicVisibility),
+	span: pack_span
+	table_invariants: TableInvariantViolation, check_table_invariants
+
+
+---
+The sealed discovery output. Only `freeze` makes one.
+---
+opaque type FrontendTables = DiscoveryBuilder
+
+
+union FreezeOutcome:
+	FrozenTables(FrontendTables)
+	TableInvariantsViolated(List[TableInvariantViolation])
+
+
+---
+Seals `builder`, dropping its transient tables. A builder that breaks an
+invariant is reported with every violation instead of being sealed; the
+check reads each row a bounded number of times.
+---
+pure func freeze(builder: DiscoveryBuilder) -> FreezeOutcome:
+	-- The transient tables are not part of the frozen output.
+	sealed_tables: DiscoveryBuilder = without_transient_tables(builder)
+	violations: List[TableInvariantViolation] = check_table_invariants(
+		sealed_tables,
+		ALL_SEEDED_NAME_SPELLINGS,
+	)
+
+	if violations.is_empty():
+		FrozenTables(into_opaque FrontendTables(sealed_tables))
+	else:
+		TableInvariantsViolated(violations)
+
+
+private pure func tables_of(tables: FrontendTables) -> DiscoveryBuilder:
+	from_opaque FrontendTables(tables)
+
+
+-- Unreachable fallback rows (see the module comment) are written inline in
+-- each accessor's out-of-range arm because the backend cannot yet emit a
+-- global struct constant whose initializer calls an opaque constructor
+-- ("unsupported global initializer"); make them constants once it can.
+---
+Text read for an index outside a text table; unreachable for frozen ids.
+---
+private UNREACHABLE_TEXT_LITERAL: String = ""
+
+
+-- Counts.
+pure func module_count(tables: FrontendTables) -> Int:
+	tables_of(tables).modules.length()
+
+
+pure func definition_count(tables: FrontendTables) -> Int:
+	tables_of(tables).definitions.length()
+
+
+pure func node_count(tables: FrontendTables) -> Int:
+	tables_of(tables).nodes.length()
+
+
+pure func node_child_count(tables: FrontendTables) -> Int:
+	tables_of(tables).node_children.length()
+
+
+pure func name_count(tables: FrontendTables) -> Int:
+	tables_of(tables).name_spellings.length()
+
+
+pure func path_count(tables: FrontendTables) -> Int:
+	tables_of(tables).paths.length()
+
+
+pure func literal_count(tables: FrontendTables) -> Int:
+	tables_of(tables).literals.length()
+
+
+pure func source_count(tables: FrontendTables) -> Int:
+	tables_of(tables).sources.length()
+
+
+pure func root_count(tables: FrontendTables) -> Int:
+	tables_of(tables).roots.length()
+
+
+pure func import_count(tables: FrontendTables) -> Int:
+	tables_of(tables).imports.length()
+
+
+pure func diagnostic_count(tables: FrontendTables) -> Int:
+	tables_of(tables).diagnostics.length()
+
+
+pure func root_diagnostic_count(tables: FrontendTables) -> Int:
+	tables_of(tables).root_diagnostics.length()
+
+
+-- Rows by id.
+pure func module_row(tables: FrontendTables, id: ModuleId) -> ModuleRow:
+	match tables_of(tables).modules.get(module_id_index(id)):
+		Some(row):
+			row
+		None:
+			{
+				source = source_id_at_row(0),
+				canonical_path = path_id_at_row(0),
+				origin = UserModule,
+				reach = ImportedModule,
+				definitions = EMPTY_ROW_RANGE,
+				imports = EMPTY_ROW_RANGE,
+				nodes = EMPTY_ROW_RANGE,
+				diagnostics = EMPTY_ROW_RANGE
+			}
+
+
+pure func definition_row(tables: FrontendTables, id: DefinitionId) -> DefinitionRow:
+	match tables_of(tables).definitions.get(definition_id_index(id)):
+		Some(row):
+			row
+		None:
+			{
+				module = module_id_at_row(0),
+				kind = FunctionDefinition,
+				name = name_id_at_row(0),
+				name_span = pack_span(0, 0, 0),
+				visibility = PublicVisibility,
+				span = pack_span(0, 0, 0)
+			}
+
+
+pure func node_row(tables: FrontendTables, id: NodeId) -> NodeRow:
+	match tables_of(tables).nodes.get(node_id_index(id)):
+		Some(row):
+			row
+		None:
+			{
+				kind = MissingExpressionNode,
+				span = pack_span(0, 0, 0),
+				payload = 0,
+				children = EMPTY_ROW_RANGE
+			}
+
+
+pure func import_row(tables: FrontendTables, id: ImportId) -> ImportRow:
+	match tables_of(tables).imports.get(import_id_index(id)):
+		Some(row):
+			row
+		None:
+			{
+				importer = module_id_at_row(0),
+				request_kind = BareModuleRequest,
+				request_path = path_id_at_row(0),
+				parent_steps = 0,
+				path_parts = EMPTY_ROW_RANGE,
+				items = EMPTY_ROW_RANGE,
+				span = pack_span(0, 0, 0)
+			}
+
+
+pure func source_row(tables: FrontendTables, id: SourceId) -> SourceRow:
+	match tables_of(tables).sources.get(source_id_index(id)):
+		Some(row):
+			row
+		None:
+			{
+				path = path_id_at_row(0),
+				line_starts = EMPTY_ROW_RANGE
+			}
+
+
+pure func root_row(tables: FrontendTables, id: RootId) -> RootRow:
+	match tables_of(tables).roots.get(root_id_index(id)):
+		Some(row):
+			row
+		None:
+			{request_path = path_id_at_row(0)}
+
+
+---
+Child `ordinal` of `node`, or `None` when the node has fewer children.
+---
+pure func node_child(tables: FrontendTables, node: NodeId, ordinal: Int) -> Option[NodeId]:
+	children: RowRange = node_row(tables, node).children
+
+	if ordinal < children.count:
+		tables_of(tables).node_children.get(children.first + ordinal)
+	else:
+		None
+
+
+-- Text.
+pure func name_spelling(tables: FrontendTables, id: NameId) -> String:
+	tables_of(tables).name_spellings
+		.get(name_id_index(id))
+		.get_or(UNREACHABLE_TEXT_LITERAL)
+
+
+pure func path_text(tables: FrontendTables, id: PathId) -> String:
+	tables_of(tables).paths
+		.get(path_id_index(id))
+		.get_or(UNREACHABLE_TEXT_LITERAL)
+
+
+pure func literal_text(tables: FrontendTables, id: LiteralId) -> String:
+	tables_of(tables).literals
+		.get(literal_id_index(id))
+		.get_or(UNREACHABLE_TEXT_LITERAL)
+
+
+pure func source_text(tables: FrontendTables, id: SourceId) -> String:
+	tables_of(tables).source_texts
+		.get(source_id_index(id))
+		.get_or(UNREACHABLE_TEXT_LITERAL)
+
+
+---
+The id `spelling` has in these tables, if any row holds it.
+---
+pure func lookup_name_id(tables: FrontendTables, spelling: String) -> Option[NameId]:
+	find_name_id(tables_of(tables), spelling)
+
+
+-- Optional relationships (side tables).
+---
+The module `import_id` loaded, or `None` when it loaded none. Side tables
+are sorted by owner (an invariant), so this and the other side-table lookups
+are binary searches.
+---
+pure func import_target(tables: FrontendTables, import_id: ImportId) -> Option[ModuleId]:
+	builder: DiscoveryBuilder = tables_of(tables)
+	row: Int = owner_row(
+		builder.import_targets.length(),
+		import_id_index(import_id),
+		pure func(index): import_target_owner(builder, index),
+	)
+
+	match builder.import_targets.get(row):
+		Some(target):
+			Some(target.target)
+		None:
+			None
+
+
+private pure func import_target_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+	match builder.import_targets.get(row):
+		Some(target):
+			import_id_index(target.owner_import)
+		None:
+			NO_OWNER_ROW
+
+
+---
+The module root `root` loaded, or `None` when it loaded none.
+---
+pure func root_target(tables: FrontendTables, root: RootId) -> Option[ModuleId]:
+	builder: DiscoveryBuilder = tables_of(tables)
+	row: Int = owner_row(
+		builder.root_targets.length(),
+		root_id_index(root),
+		pure func(index): root_target_owner(builder, index),
+	)
+
+	match builder.root_targets.get(row):
+		Some(target):
+			Some(target.target)
+		None:
+			None
+
+
+private pure func root_target_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+	match builder.root_targets.get(row):
+		Some(target):
+			root_id_index(target.root)
+		None:
+			NO_OWNER_ROW
+
+
+---
+The module loaded from `canonical_path`, if any.
+---
+pure func module_at_path(tables: FrontendTables, canonical_path: String) -> Option[ModuleId]:
+	builder: DiscoveryBuilder = tables_of(tables)
+
+	match builder.path_ids_by_text.get(canonical_path):
+		Some(path_index):
+			match builder.module_ids_by_path.get(path_index):
+				Some(module_index):
+					Some(module_id_at_row(module_index))
+				None:
+					None
+		None:
+			None
+
+
+-- Import details.
+pure func import_item_row_at(tables: FrontendTables, item: ImportItemId) -> Option[ImportItemRow]:
+	tables_of(tables).import_items.get(import_item_id_index(item))
+
+
+pure func import_item_variant_row_at(
+	tables: FrontendTables,
+	index: Int,
+) -> Option[ImportItemVariantRow]:
+	tables_of(tables).import_item_variants.get(index)
+
+
+---
+The `ordinal`th path part of an import.
+---
+pure func import_path_part(tables: FrontendTables, row: ImportRow, ordinal: Int) -> Option[NameId]:
+	tables_of(tables).import_path_parts.get(row.path_parts.first + ordinal)
+
+
+---
+The alias of `import_id` (`module as alias`), if it has one.
+---
+pure func import_alias(tables: FrontendTables, import_id: ImportId) -> Option[NameId]:
+	builder: DiscoveryBuilder = tables_of(tables)
+	row: Int = owner_row(
+		builder.import_aliases.length(),
+		import_id_index(import_id),
+		pure func(index): import_alias_owner(builder, index),
+	)
+
+	match builder.import_aliases.get(row):
+		Some(alias_row):
+			Some(alias_row.alias_name)
+		None:
+			None
+
+
+private pure func import_alias_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+	match builder.import_aliases.get(row):
+		Some(alias_row):
+			import_id_index(alias_row.owner_import)
+		None:
+			NO_OWNER_ROW
+
+
+---
+The alias of import item `item` (`name as alias`), if any.
+---
+pure func import_item_alias(tables: FrontendTables, item: ImportItemId) -> Option[NameId]:
+	builder: DiscoveryBuilder = tables_of(tables)
+	row: Int = owner_row(
+		builder.import_item_aliases.length(),
+		import_item_id_index(item),
+		pure func(index): import_item_alias_owner(builder, index),
+	)
+
+	match builder.import_item_aliases.get(row):
+		Some(alias_row):
+			Some(alias_row.alias_name)
+		None:
+			None
+
+
+private pure func import_item_alias_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+	match builder.import_item_aliases.get(row):
+		Some(alias_row):
+			import_item_id_index(alias_row.item)
+		None:
+			NO_OWNER_ROW
+
+
+---
+The package of `module`, if it belongs to one.
+---
+pure func module_package(tables: FrontendTables, module: ModuleId) -> Option[PackageRow]:
+	builder: DiscoveryBuilder = tables_of(tables)
+	row: Int = owner_row(
+		builder.module_packages.length(),
+		module_id_index(module),
+		pure func(index): module_package_owner(builder, index),
+	)
+
+	match builder.module_packages.get(row):
+		Some(membership):
+			builder.packages.get(package_id_index(membership.package))
+		None:
+			None
+
+
+private pure func module_package_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+	match builder.module_packages.get(row):
+		Some(membership):
+			module_id_index(membership.module)
+		None:
+			NO_OWNER_ROW
+
+
+---
+What `owner_row` returns when no row has the owner, and what an owner
+reader returns for a row outside its table.
+---
+private NO_OWNER_ROW: Int = -1
+
+
+---
+The row of a side table sorted by owner whose owner is `wanted`, or
+`NO_OWNER_ROW`: a binary search over `count` rows read through `owner_at`.
+---
+private pure func owner_row(
+	count: Int,
+	wanted: Int,
+	owner_at: pure (Int) -> Int,
+) -> Int:
+	var lower: Int = 0
+	var upper: Int = count
+
+	while lower < upper:
+		middle: Int = (lower + upper) / 2
+
+		if owner_at(middle) < wanted:
+			lower = middle + 1
+		else:
+			upper = middle
+
+	if lower < count and owner_at(lower) == wanted:
+		lower
+	else:
+		NO_OWNER_ROW
+
+
+-- Diagnostics.
+pure func root_diagnostic_row_at(tables: FrontendTables, index: Int) -> Option[RootDiagnosticRow]:
+	tables_of(tables).root_diagnostics.get(index)
+
+
+pure func root_diagnostic_argument(
+	tables: FrontendTables,
+	row: RootDiagnosticRow,
+	ordinal: Int,
+) -> Option[Int]:
+	tables_of(tables).diagnostic_arguments.get(row.arguments.first + ordinal)
+
+
+---
+Row counts of every table, by table name, for dumps and measurements.
+---
+pure func table_row_counts(tables: FrontendTables) -> List[(String, Int)]:
+	builder: DiscoveryBuilder = tables_of(tables)
+	[
+		("names", builder.name_spellings.length()),
+		("paths", builder.paths.length()),
+		("sources", builder.sources.length()),
+		("line_starts", builder.line_starts.length()),
+		("packages", builder.packages.length()),
+		("modules", builder.modules.length()),
+		("module_packages", builder.module_packages.length()),
+		("roots", builder.roots.length()),
+		("root_targets", builder.root_targets.length()),
+		("root_diagnostics", builder.root_diagnostics.length()),
+		("imports", builder.imports.length()),
+		("import_path_parts", builder.import_path_parts.length()),
+		("import_items", builder.import_items.length()),
+		("import_item_variants", builder.import_item_variants.length()),
+		("import_targets", builder.import_targets.length()),
+		("import_aliases", builder.import_aliases.length()),
+		("import_item_aliases", builder.import_item_aliases.length()),
+		("import_blocks", builder.import_blocks.length()),
+		("definitions", builder.definitions.length()),
+		("members", builder.members.length()),
+		("documentation", builder.documentation.length()),
+		("annotations", builder.annotations.length()),
+		("type_parameters", builder.type_parameters.length()),
+		("bounds", builder.bounds.length()),
+		("supertraits", builder.supertraits.length()),
+		("signatures", builder.signatures.length()),
+		("parameters", builder.parameters.length()),
+		("binder_names", builder.binder_names.length()),
+		("parameter_types", builder.parameter_types.length()),
+		("definition_types", builder.definition_types.length()),
+		("variant_payloads", builder.variant_payloads.length()),
+		("dimension_constraints", builder.dimension_constraints.length()),
+		("foreign_blocks", builder.foreign_blocks.length()),
+		("foreign_arguments", builder.foreign_arguments.length()),
+		("foreign_bindings", builder.foreign_bindings.length()),
+		("foreign_c_names", builder.foreign_c_names.length()),
+		("resource_cleanups", builder.resource_cleanups.length()),
+		("bodies", builder.bodies.length()),
+		("nodes", builder.nodes.length()),
+		("node_children", builder.node_children.length()),
+		("literals", builder.literals.length()),
+		("diagnostics", builder.diagnostics.length()),
+		("resolution_diagnostics", builder.resolution_diagnostics.length()),
+		("diagnostic_arguments", builder.diagnostic_arguments.length()),
+	]
+
+
+pure func diagnostic_row_at(tables: FrontendTables, index: Int) -> Option[DiagnosticRow]:
+	tables_of(tables).diagnostics.get(index)
+
+
+---
+The walker's diagnostics, outside every module's block: imports that loaded
+no module and sources that could not be admitted. Their spans point at the
+requesting import.
+---
+pure func resolution_diagnostic_count(tables: FrontendTables) -> Int:
+	tables_of(tables).resolution_diagnostics.length()
+
+
+pure func resolution_diagnostic_row_at(tables: FrontendTables, index: Int) -> Option[DiagnosticRow]:
+	tables_of(tables).resolution_diagnostics.get(index)
+
+
+pure func diagnostic_argument(
+	tables: FrontendTables,
+	row: DiagnosticRow,
+	ordinal: Int,
+) -> Option[Int]:
+	tables_of(tables).diagnostic_arguments.get(row.arguments.first + ordinal)

@@ -31,6 +31,20 @@ FIXTURE_DIRECTORY_NAMES = {"fixture", "fixtures", "should_pass", "should_fail", 
 # than by compiler source ownership. Keep their inventory out of this focused
 # compiler manifest without misclassifying them as fixture inputs.
 BROAD_GATE_SUITE_OWNER_DIRECTORIES = {"runtime"}
+# Source owners with their own test manifest and gate, outside this manifest:
+# the rewritten compiler stages are not linked into bin/blorp yet, so no check
+# of the existing compiler is selected for them. Their sources live under
+# blorp/src/<owner> and their suites under blorp/test/<owner>.
+SEPARATELY_GATED_OWNERS = {"compiler_new": "scripts/test compiler-new"}
+
+
+def separately_gated_owner(path: str) -> str | None:
+    parts = Path(path).parts
+    if len(parts) > 2 and parts[0] == "blorp" and parts[1] in {"src", "test"}:
+        owner = parts[2]
+        if owner in SEPARATELY_GATED_OWNERS:
+            return owner
+    return None
 
 
 class ManifestError(Exception):
@@ -333,7 +347,9 @@ def load_manifest(root: Path) -> Manifest:
     production_paths = {
         path
         for path in production_paths
-        if path.endswith(".brp") and (root / path).is_file()
+        if path.endswith(".brp")
+        and (root / path).is_file()
+        and separately_gated_owner(path) is None
     }
     production_paths.update(
         path.as_posix()
@@ -357,6 +373,7 @@ def load_manifest(root: Path) -> Manifest:
         )
         and path.relative_to(root / COMPILER_TEST_DIRECTORY).parts[0]
         not in BROAD_GATE_SUITE_OWNER_DIRECTORIES
+        and separately_gated_owner(path.relative_to(root).as_posix()) is None
         and TEST_SUITE_DECLARATION.search(path.read_text(encoding="utf-8"))
     }
     for path in sorted(executable_suite_paths - set(suites_by_path)):
@@ -421,7 +438,11 @@ def changed_production_sources(changed_paths: Iterable[str]) -> tuple[str, ...]:
         sorted(
             path
             for path in changed_paths
-            if (path.startswith(prefix) and path.endswith(".brp"))
+            if (
+                path.startswith(prefix)
+                and path.endswith(".brp")
+                and separately_gated_owner(path) is None
+            )
             or path in composition_roots
         )
     )
@@ -873,6 +894,18 @@ def main(arguments: list[str]) -> int:
         parser.error(str(error))
 
     if options.changed:
+        gated_owners = sorted(
+            {
+                owner
+                for path in changed_paths
+                if (owner := separately_gated_owner(path)) is not None
+            }
+        )
+        for owner in gated_owners:
+            print(
+                f"Changes under blorp/src/{owner} or blorp/test/{owner} are not selected here; "
+                f"run {SEPARATELY_GATED_OWNERS[owner]}."
+            )
         changed_tests = directly_changed_suites(manifest, changed_paths)
         source_label = "Changed production source"
     else:

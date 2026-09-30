@@ -1,0 +1,1211 @@
+-- Top-level declarations, parsed into definition, member, signature and
+-- type rows. Function declarations, bodies and global values are parsed by
+-- the body parser.
+--
+-- Every declaration reads its `DefinitionId` before appending its row, appends
+-- the row with the span known so far, appends its members and signature, and
+-- replaces the row with its final span at the end.
+import:
+	body_parser: parse_function, parse_function_body, parse_global_value, parse_signature
+	declaration_header:
+		DeclarationHeader,
+		annotations_since,
+		close_definition,
+		consume_annotations,
+		open_definition,
+		plain_header,
+	discovery_builder:
+		DefinitionId,
+		DiscoveryBuilder,
+		ForeignBlockId,
+		LiteralId,
+		ModuleId,
+		NameId,
+		NodeId,
+		RowRange,
+		advance_token,
+		append_definition_type,
+		append_foreign_argument,
+		append_foreign_binding,
+		append_foreign_block,
+		append_foreign_c_name,
+		append_import_block,
+		append_member,
+		append_pending_docstring,
+		append_plain_diagnostic,
+		append_resource_cleanup,
+		append_supertrait,
+		append_variant_payload,
+		last_node_id,
+		literal_id_at_row,
+		move_token_cursor,
+		next_definition_id,
+		next_foreign_block_id,
+		pending_annotation_count,
+		pending_docstring_count,
+		replace_foreign_block_row,
+	discovery_diagnostic_code:
+		DiscoveryDiagnosticCode(
+			AnnotationWithoutFunctionDiagnostic,
+			BuiltinTypeArgumentsDiagnostic,
+			ExpectedArrowDiagnostic,
+			ExpectedCleanupBuiltinNameDiagnostic,
+			ExpectedColonDiagnostic,
+			ExpectedCommaDiagnostic,
+			ExpectedDeclarationDiagnostic,
+			ExpectedDedentDiagnostic,
+			ExpectedEqualDiagnostic,
+			ExpectedForeignArgumentDiagnostic,
+			ExpectedForeignArgumentValueDiagnostic,
+			ExpectedForeignCNameDiagnostic,
+			ExpectedForeignFunctionDiagnostic,
+			ExpectedImplMethodDiagnostic,
+			ExpectedIndentDiagnostic,
+			ExpectedKeywordDiagnostic,
+			ExpectedLeftBraceDiagnostic,
+			ExpectedNewlineDiagnostic,
+			ExpectedRightBraceDiagnostic,
+			ExpectedRightParenDiagnostic,
+			ExpectedSupertraitOrMethodsDiagnostic,
+			ForeignFunctionOutsideBlockDiagnostic,
+		),
+	import_parser: parse_import_block
+	parser_cursor:
+		at,
+		at_block_end,
+		binder_name_at_cursor,
+		consume_binder_name,
+		consume_declared_name,
+		consume_referenced_name,
+		current_kind,
+		current_span,
+		current_token,
+		declared_name_at_cursor,
+		expect_token,
+		keyword_name_index,
+		peek_kind,
+		previous_content_span,
+		referenced_name_at_cursor,
+		report_and_recover,
+		report_at_current,
+		run_end_after,
+		skip_newlines,
+		skip_optional_token,
+		span_before_current,
+	row_kinds:
+		DefinitionKind(
+			BuiltinTypeDefinition,
+			ConstantDefinition,
+			EnumDefinition,
+			FieldDefinition,
+			ForeignFunctionDefinition,
+			FunctionDefinition,
+			ImplDefinition,
+			ImplMethodDefinition,
+			MutableGlobalDefinition,
+			OpaqueTypeDefinition,
+			RecordDefinition,
+			ResourceTypeDefinition,
+			StructDefinition,
+			TraitDefinition,
+			TraitMethodDefinition,
+			TypeAliasDefinition,
+			UnionDefinition,
+			VariantDefinition,
+		),
+		Purity(ImpureFunction, PureFunction),
+		Visibility(PrivateVisibility, PublicVisibility),
+	span: Span, span_covering
+	token:
+		Token,
+		TokenKind(
+			AliasKeyword,
+			ArrowSymbol,
+			AtSymbol,
+			BuiltinKeyword,
+			ColonSymbol,
+			CommaSymbol,
+			DedentToken,
+			DocStringToken,
+			EndOfFileToken,
+			EnumKeyword,
+			EqualSymbol,
+			FalseKeyword,
+			ForKeyword,
+			ForeignKeyword,
+			FuncKeyword,
+			IdentifierToken,
+			ImplementsKeyword,
+			ImportKeyword,
+			IndentToken,
+			LeftBraceSymbol,
+			LeftParenSymbol,
+			NewlineToken,
+			NormalStringToken,
+			OpaqueKeyword,
+			PipeStringToken,
+			PlusSymbol,
+			PrivateKeyword,
+			PureKeyword,
+			RawPipeStringToken,
+			RawStringToken,
+			RecordKeyword,
+			ResourceKeyword,
+			RightBraceSymbol,
+			RightParenSymbol,
+			StructKeyword,
+			TraitKeyword,
+			TrueKeyword,
+			TypeKeyword,
+			UnderscoreSymbol,
+			UnionKeyword,
+			VarKeyword,
+		),
+	type_parser: node_span, parse_type, parse_type_parameters
+
+
+-- Module.
+---
+Parses one module's declarations, import blocks and foreign blocks.
+---
+pure func parse_module_declarations(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = skip_newlines(builder)
+
+	while not at(out, EndOfFileToken):
+		before: Int = out.token_cursor
+		out = parse_declaration(out, module)
+		out = skip_newlines(out)
+
+		if out.token_cursor == before and not at(out, EndOfFileToken):
+			out = advance_token(out)
+
+	out
+
+
+---
+One top-level item: a docstring, annotations and `pure` may precede it.
+---
+pure func parse_declaration(builder: DiscoveryBuilder, module: ModuleId) -> DiscoveryBuilder:
+	var start: Span = current_span(builder)
+	docstring_first: Int = pending_docstring_count(builder)
+	var out: DiscoveryBuilder = consume_docstring(builder)
+	docstring: RowRange = {
+		first = docstring_first,
+		count = pending_docstring_count(out) - docstring_first
+	}
+	documented: Bool = docstring.count > 0
+
+	annotation_start: Span = current_span(out)
+	annotations_first: Int = pending_annotation_count(out)
+	out = consume_annotations(out, True)
+	annotations: RowRange = annotations_since(out, annotations_first)
+
+	if annotations.count > 0 and not documented:
+		start = annotation_start
+
+	var purity: Purity = ImpureFunction
+
+	if at(out, PureKeyword):
+		purity = PureFunction
+
+		if not documented and annotations.count == 0:
+			start = current_span(out)
+
+		out = advance_token(out)
+
+	if annotations.count > 0 and not at(out, FuncKeyword):
+		out = report_at_current(out, AnnotationWithoutFunctionDiagnostic)
+
+	header: DeclarationHeader = {
+		module = module,
+		start = start,
+		visibility = PublicVisibility,
+		purity = purity,
+		docstring = docstring,
+		annotations = annotations
+	}
+
+	-- Builder threading rule 2.
+	out = parse_declaration_introduced_by(out, header)
+	out
+
+
+---
+A docstring at the cursor and the newlines after it, recorded as a pending
+docstring for the declaration that follows.
+---
+private pure func consume_docstring(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, DocStringToken):
+		text: LiteralId = literal_id_at_row(current_token(builder).payload)
+		after: Int = run_end_after(builder, builder.token_cursor + 1, NewlineToken)
+		moved: DiscoveryBuilder = move_token_cursor(builder, after)
+		append_pending_docstring(moved, text)
+	else:
+		builder
+
+
+---
+The item a header introduces.
+---
+private pure func parse_declaration_introduced_by(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+) -> DiscoveryBuilder:
+	match current_kind(builder):
+		PrivateKeyword:
+			parse_private_declaration(builder, header)
+		ImportKeyword:
+			parse_import_block_declaration(builder, header.module)
+		ForeignKeyword:
+			parse_foreign_block(builder, header.module, header.start)
+		_:
+			parse_declaration_after_header(builder, header)
+
+
+---
+The declarations that may follow a header, with or without `private`.
+---
+private pure func parse_declaration_after_header(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+) -> DiscoveryBuilder:
+	match current_kind(builder):
+		FuncKeyword:
+			parse_function(builder, header, FunctionDefinition)
+		VarKeyword:
+			advanced: DiscoveryBuilder = advance_token(builder)
+			parse_global(advanced, header, MutableGlobalDefinition)
+		RecordKeyword:
+			parse_record(builder, header, RecordDefinition)
+		StructKeyword:
+			parse_record(builder, header, StructDefinition)
+		UnionKeyword:
+			parse_union(builder, header, UnionDefinition)
+		EnumKeyword:
+			parse_union(builder, header, EnumDefinition)
+		TypeKeyword:
+			if peek_kind(builder, 1) == AliasKeyword:
+				advanced: DiscoveryBuilder = advance_token(builder)
+				parse_type_alias(advanced, header, TypeAliasDefinition, AliasKeyword)
+			else:
+				parse_builtin_type(builder, header, BuiltinTypeDefinition)
+		OpaqueKeyword:
+			advanced: DiscoveryBuilder = advance_token(builder)
+			parse_type_alias(advanced, header, OpaqueTypeDefinition, TypeKeyword)
+		ResourceKeyword:
+			advanced: DiscoveryBuilder = advance_token(builder)
+			parse_builtin_type(advanced, header, ResourceTypeDefinition)
+		TraitKeyword:
+			parse_trait(builder, header)
+		ImplementsKeyword:
+			parse_impl(builder, header)
+		IdentifierToken | UnderscoreSymbol:
+			parse_global(builder, header, ConstantDefinition)
+		_:
+			if reserved_keyword_starts_binding(builder):
+				parse_global(builder, header, ConstantDefinition)
+			else:
+				parse_error_declaration(builder)
+
+
+---
+A reserved keyword written where a global's name belongs (`type = 1`),
+recognized so the global still parses after the reserved-name report.
+---
+private pure func reserved_keyword_starts_binding(builder: DiscoveryBuilder) -> Bool:
+	kind: TokenKind = current_kind(builder)
+	after: TokenKind = peek_kind(builder, 1)
+	keyword_name_index(kind).is_some() and (after == EqualSymbol or after == ColonSymbol)
+
+
+private pure func parse_error_declaration(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	end_of_source: Bool = at(builder, EndOfFileToken)
+	var out: DiscoveryBuilder = report_at_current(builder, ExpectedDeclarationDiagnostic)
+
+	if not end_of_source:
+		out = advance_token(out)
+
+	out
+
+
+---
+`private` then any declaration but an import or foreign block; annotations
+and `pure` may follow `private`.
+---
+private pure func parse_private_declaration(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = advance_token(builder)
+	annotations_first: Int = pending_annotation_count(out)
+	out = consume_annotations(out, False)
+	added_annotations: Int = pending_annotation_count(out) - annotations_first
+	var purity: Purity = header.purity
+
+	if at(out, PureKeyword):
+		purity = PureFunction
+		out = advance_token(out)
+
+	-- The header's annotations were the last pending rows before `private`,
+	-- so they and the ones after it form one block.
+	all_annotations: RowRange = annotations_since(out, header.annotations.first)
+
+	if added_annotations > 0 and not at(out, FuncKeyword):
+		out = report_at_current(out, AnnotationWithoutFunctionDiagnostic)
+
+	private_header: DeclarationHeader = { header |
+		visibility = PrivateVisibility,
+		purity = purity,
+		annotations = all_annotations
+	}
+	-- Builder threading rule 2.
+	out = parse_declaration_after_header(out, private_header)
+	out
+
+
+-- Globals.
+---
+`name [: T] = value` after `var` (the caller consumed it) or at the start.
+---
+private pure func parse_global(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	name_span: Span = current_span(builder)
+	name: NameId = binder_name_at_cursor(builder)
+	var out: DiscoveryBuilder = consume_binder_name(builder)
+	out = open_definition(out, header, kind, name, name_span)
+
+	if at(out, ColonSymbol):
+		out = advance_token(out)
+		out = parse_type(out)
+		declared_type: NodeId = last_node_id(out)
+		out = append_definition_type(
+			out,
+			{
+				definition = definition,
+				type_root = declared_type
+			},
+		)
+
+	-- The value is parsed even when the `=` is missing, as the existing
+	-- parser does.
+	out = expect_token(out, EqualSymbol, ExpectedEqualDiagnostic)
+	out = parse_global_value(out, definition, header.start)
+	end: Span = node_span(out, last_node_id(out))
+	out = close_definition(out, definition, header, kind, name, name_span, end)
+	out
+
+
+-- Records and structs.
+---
+`record Name[T] {fields}` or `struct Name {fields}`.
+---
+private pure func parse_record(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	out = open_definition(out, header, kind, name, name_span)
+
+	if kind == RecordDefinition:
+		out = parse_type_parameters(out, definition)
+
+	out = expect_token(out, LeftBraceSymbol, ExpectedLeftBraceDiagnostic)
+	var ordinal: Int = 0
+
+	if not at(out, RightBraceSymbol):
+		var parsing: Bool = True
+
+		while parsing and not at(out, EndOfFileToken):
+			out = parse_field(out, header.module, definition, ordinal)
+			ordinal += 1
+
+			if at(out, CommaSymbol):
+				out = advance_token(out)
+
+				if at(out, RightBraceSymbol):
+					parsing = False
+			else:
+				parsing = False
+
+	end: Span = current_span(out)
+	out = expect_token(out, RightBraceSymbol, ExpectedRightBraceDiagnostic)
+	out = close_definition(out, definition, header, kind, name, name_span, end)
+	out
+
+
+private pure func parse_field(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	owner: DefinitionId,
+	ordinal: Int,
+) -> DiscoveryBuilder:
+	field: DefinitionId = next_definition_id(builder)
+	name: NameId = declared_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	header: DeclarationHeader = plain_header(module, name_span, pending_annotation_count(builder))
+	var out: DiscoveryBuilder = consume_declared_name(builder)
+	out = open_definition(out, header, FieldDefinition, name, name_span)
+	out = append_member(
+		out,
+		{
+			definition = field,
+			owner = owner,
+			ordinal = ordinal
+		},
+	)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = parse_type(out)
+	field_type: NodeId = last_node_id(out)
+	out = append_definition_type(
+		out,
+		{
+			definition = field,
+			type_root = field_type
+		},
+	)
+	end: Span = node_span(out, field_type)
+	out = close_definition(out, field, header, FieldDefinition, name, name_span, end)
+	out
+
+
+-- Unions and enums.
+---
+`union Name[T]:` or `enum Name:` then an indented block of variants.
+---
+private pure func parse_union(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	out = open_definition(out, header, kind, name, name_span)
+
+	if kind == UnionDefinition:
+		out = parse_type_parameters(out, definition)
+
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = expect_token(out, NewlineToken, ExpectedNewlineDiagnostic)
+	out = expect_token(out, IndentToken, ExpectedIndentDiagnostic)
+	out = skip_newlines(out)
+	var ordinal: Int = 0
+
+	while not at_block_end(out):
+		before: Int = out.token_cursor
+		out = parse_variant(out, header.module, definition, ordinal)
+		ordinal += 1
+		out = skip_newlines(out)
+
+		if out.token_cursor == before and not at_block_end(out):
+			out = advance_token(out)
+
+	var end: Span = name_span
+
+	if at(out, DedentToken):
+		end = current_span(out)
+
+	out = expect_token(out, DedentToken, ExpectedDedentDiagnostic)
+	out = close_definition(out, definition, header, kind, name, name_span, end)
+	out
+
+
+---
+Consumes a variant's name; `True` and `False` are variant names too.
+---
+private pure func consume_variant_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, TrueKeyword) or at(builder, FalseKeyword):
+		advance_token(builder)
+	else:
+		consume_declared_name(builder)
+
+
+---
+`Name` or `Name(T, ...)`; `True` and `False` are variant names too.
+---
+private pure func parse_variant(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	owner: DefinitionId,
+	ordinal: Int,
+) -> DiscoveryBuilder:
+	variant: DefinitionId = next_definition_id(builder)
+	name_span: Span = current_span(builder)
+	name: NameId = declared_name_at_cursor(builder)
+	header: DeclarationHeader = plain_header(module, name_span, pending_annotation_count(builder))
+	var out: DiscoveryBuilder = consume_variant_name(builder)
+	out = open_definition(out, header, VariantDefinition, name, name_span)
+	out = append_member(
+		out,
+		{
+			definition = variant,
+			owner = owner,
+			ordinal = ordinal
+		},
+	)
+	var end: Span = name_span
+
+	if at(out, LeftParenSymbol):
+		out = advance_token(out)
+		var payload_ordinal: Int = 0
+
+		if not at(out, RightParenSymbol):
+			var parsing: Bool = True
+
+			while parsing and not at(out, EndOfFileToken):
+				out = parse_type(out)
+				payload: NodeId = last_node_id(out)
+				out = append_variant_payload(
+					out,
+					{
+						variant = variant,
+						ordinal = payload_ordinal,
+						type_root = payload
+					},
+				)
+				payload_ordinal += 1
+
+				if at(out, CommaSymbol):
+					out = advance_token(out)
+
+					if at(out, RightParenSymbol):
+						parsing = False
+				else:
+					parsing = False
+
+		if at(out, RightParenSymbol):
+			end = current_span(out)
+			out = advance_token(out)
+		else:
+			out = report_at_current(out, ExpectedRightParenDiagnostic)
+
+	out = close_definition(out, variant, header, VariantDefinition, name, name_span, end)
+	out
+
+
+-- Builtin types and aliases.
+---
+`type Name[T] = builtin`, or after `resource` (consumed by the caller)
+`type Name[T] = builtin("cleanup")`.
+---
+private pure func parse_builtin_type(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	var out: DiscoveryBuilder = expect_keyword(builder, TypeKeyword)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	out = open_definition(out, header, kind, name, name_span)
+	out = parse_type_parameters(out, definition)
+	out = expect_token(out, EqualSymbol, ExpectedEqualDiagnostic)
+	var end: Span = current_span(out)
+	out = expect_keyword(out, BuiltinKeyword)
+
+	if at(out, LeftParenSymbol):
+		if kind == ResourceTypeDefinition:
+			out = advance_token(out)
+
+			match string_literal_at_cursor(out):
+				Some(builtin_name):
+					cleanup_span: Span = current_span(out)
+					out = advance_token(out)
+					out = append_resource_cleanup(
+						out,
+						{
+							definition = definition,
+							builtin_name = builtin_name,
+							span = cleanup_span
+						},
+					)
+					end = cleanup_span
+				None:
+					out = report_and_recover(out, ExpectedCleanupBuiltinNameDiagnostic)
+
+			if at(out, RightParenSymbol):
+				end = current_span(out)
+				out = advance_token(out)
+			else:
+				out = report_at_current(out, ExpectedRightParenDiagnostic)
+		else:
+			out = report_at_current(out, BuiltinTypeArgumentsDiagnostic)
+			out = advance_token(out)
+
+			while (
+				not at(out, RightParenSymbol)
+				and not at(out, NewlineToken)
+				and not at(out, EndOfFileToken)
+			):
+				out = advance_token(out)
+
+			if at(out, RightParenSymbol):
+				out = advance_token(out)
+
+	out = close_definition(out, definition, header, kind, name, name_span, end)
+	out
+
+
+---
+The `LiteralId` of a plain, raw or pipe string literal at the cursor.
+---
+private pure func string_literal_at_cursor(builder: DiscoveryBuilder) -> Option[LiteralId]:
+	token: Token = current_token(builder)
+
+	match token.kind:
+		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+			Some(literal_id_at_row(token.payload))
+		_:
+			None
+
+
+private pure func expect_keyword(builder: DiscoveryBuilder, kind: TokenKind) -> DiscoveryBuilder:
+	expect_token(builder, kind, ExpectedKeywordDiagnostic)
+
+
+---
+After `type` (consumed by the caller), `alias Name[T] = Target`; after
+`opaque`, `type Name[T] = Target`. `second_keyword` is the keyword expected
+next.
+---
+private pure func parse_type_alias(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+	second_keyword: TokenKind,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	var out: DiscoveryBuilder = expect_keyword(builder, second_keyword)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	out = open_definition(out, header, kind, name, name_span)
+	out = parse_type_parameters(out, definition)
+	out = expect_token(out, EqualSymbol, ExpectedEqualDiagnostic)
+	out = parse_type(out)
+	target: NodeId = last_node_id(out)
+	out = append_definition_type(
+		out,
+		{
+			definition = definition,
+			type_root = target
+		},
+	)
+	end: Span = node_span(out, target)
+	out = close_definition(out, definition, header, kind, name, name_span, end)
+	out
+
+
+-- Traits and impls.
+---
+`trait Name[T]:` with a method block, `trait Name: Super + ...`, or both
+(`trait Name: Super: methods`).
+---
+private pure func parse_trait(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	out = open_definition(out, header, TraitDefinition, name, name_span)
+	out = parse_type_parameters(out, definition)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	var end: Span = name_span
+	var has_methods: Bool = False
+
+	if at(out, NewlineToken):
+		has_methods = True
+	else if at_block_end(out):
+		out = report_at_current(out, ExpectedSupertraitOrMethodsDiagnostic)
+	else:
+		var ordinal: Int = 0
+		var parsing: Bool = True
+
+		while parsing and not at(out, EndOfFileToken):
+			supertrait: NameId = referenced_name_at_cursor(out)
+			supertrait_span: Span = current_span(out)
+			out = consume_referenced_name(out)
+			out = append_supertrait(
+				out,
+				{
+					trait_definition = definition,
+					ordinal = ordinal,
+					name = supertrait,
+					span = supertrait_span
+				},
+			)
+			end = supertrait_span
+			ordinal += 1
+
+			if at(out, PlusSymbol):
+				out = advance_token(out)
+			else:
+				parsing = False
+
+		if at(out, ColonSymbol):
+			out = advance_token(out)
+			has_methods = True
+
+	if has_methods:
+		out = expect_token(out, NewlineToken, ExpectedNewlineDiagnostic)
+		out = expect_token(out, IndentToken, ExpectedIndentDiagnostic)
+		out = skip_newlines(out)
+		var ordinal: Int = 0
+
+		while not at_block_end(out):
+			before: Int = out.token_cursor
+			out = parse_trait_method(out, header.module, definition, ordinal)
+			ordinal += 1
+			out = skip_newlines(out)
+
+			if out.token_cursor == before and not at_block_end(out):
+				out = advance_token(out)
+
+		if at(out, DedentToken):
+			end = current_span(out)
+
+		out = expect_token(out, DedentToken, ExpectedDedentDiagnostic)
+
+	out = close_definition(out, definition, header, TraitDefinition, name, name_span, end)
+	out
+
+
+---
+`[pure] func name(params) [-> R] [: default body]`.
+---
+private pure func parse_trait_method(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	owner: DefinitionId,
+	ordinal: Int,
+) -> DiscoveryBuilder:
+	method: DefinitionId = next_definition_id(builder)
+	start: Span = current_span(builder)
+
+	purity: Purity = if at(builder, PureKeyword):
+		PureFunction
+	else:
+		ImpureFunction
+
+	var out: DiscoveryBuilder = skip_optional_token(builder, PureKeyword)
+	keyword_span: Span = current_span(out)
+	out = expect_keyword(out, FuncKeyword)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	header: DeclarationHeader = { plain_header(module, start, pending_annotation_count(out)) |
+		purity = purity
+	}
+	out = open_definition(out, header, TraitMethodDefinition, name, name_span)
+	out = append_member(
+		out,
+		{
+			definition = method,
+			owner = owner,
+			ordinal = ordinal
+		},
+	)
+	out = parse_signature(out, method, purity, keyword_span)
+	var end: Span = name_span
+
+	if at(out, ArrowSymbol):
+		out = advance_token(out)
+		out = parse_type(out)
+		return_type: NodeId = last_node_id(out)
+		out = append_definition_type(
+			out,
+			{
+				definition = method,
+				type_root = return_type
+			},
+		)
+		end = node_span(out, return_type)
+
+	-- After a `:` the existing parser always parses a body, so a trait method
+	-- written with a `:` and no body is reported by the block parser.
+	if at(out, ColonSymbol):
+		out = advance_token(out)
+		out = parse_function_body(out, method, start)
+		end = node_span(out, last_node_id(out))
+
+	out = close_definition(out, method, header, TraitMethodDefinition, name, name_span, end)
+	out
+
+
+---
+`implements Trait for Type:` then an indented block of methods.
+---
+private pure func parse_impl(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	var out: DiscoveryBuilder = advance_token(builder)
+	trait_name: NameId = referenced_name_at_cursor(out)
+	trait_span: Span = current_span(out)
+	out = consume_referenced_name(out)
+	out = open_definition(out, header, ImplDefinition, trait_name, trait_span)
+	out = expect_keyword(out, ForKeyword)
+	out = parse_type(out)
+	receiver: NodeId = last_node_id(out)
+	out = append_definition_type(
+		out,
+		{
+			definition = definition,
+			type_root = receiver
+		},
+	)
+	var end: Span = node_span(out, receiver)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+	out = expect_token(out, NewlineToken, ExpectedNewlineDiagnostic)
+	out = expect_token(out, IndentToken, ExpectedIndentDiagnostic)
+	out = skip_newlines(out)
+	var ordinal: Int = 0
+
+	while not at_block_end(out):
+		before: Int = out.token_cursor
+		out = parse_impl_method(out, header.module, definition, ordinal)
+		ordinal += 1
+		out = skip_newlines(out)
+
+		if out.token_cursor == before and not at_block_end(out):
+			out = advance_token(out)
+
+	if at(out, DedentToken):
+		end = current_span(out)
+
+	out = expect_token(out, DedentToken, ExpectedDedentDiagnostic)
+	out = close_definition(out, definition, header, ImplDefinition, trait_name, trait_span, end)
+	out
+
+
+---
+One impl method: annotations, `pure`, then a full function declaration.
+---
+private pure func parse_impl_method(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	owner: DefinitionId,
+	ordinal: Int,
+) -> DiscoveryBuilder:
+	-- The method starts at its first annotation, else at `pure`, else at
+	-- `func`, as in the existing parser.
+	var start: Span = current_span(builder)
+	annotations_first: Int = pending_annotation_count(builder)
+	var out: DiscoveryBuilder = consume_annotations(builder, True)
+	annotations: RowRange = annotations_since(out, annotations_first)
+	var purity: Purity = ImpureFunction
+
+	if at(out, PureKeyword):
+		purity = PureFunction
+
+		if annotations.count == 0:
+			start = current_span(out)
+
+		out = advance_token(out)
+
+	if at(out, FuncKeyword):
+		method: DefinitionId = next_definition_id(out)
+		header: DeclarationHeader = { plain_header(module, start, annotations.first) |
+			purity = purity,
+			annotations = annotations
+		}
+		out = parse_function(out, header, ImplMethodDefinition)
+		out = append_member(
+			out,
+			{
+				definition = method,
+				owner = owner,
+				ordinal = ordinal
+			},
+		)
+		out
+	else:
+		block_end: Bool = at_block_end(out)
+		out = report_at_current(out, ExpectedImplMethodDiagnostic)
+
+		if not block_end:
+			out = advance_token(out)
+
+		out
+
+
+-- Import and foreign blocks.
+---
+An import block, recorded with its span and its block of import rows.
+---
+private pure func parse_import_block_declaration(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+) -> DiscoveryBuilder:
+	start: Span = current_span(builder)
+	imports_first: Int = builder.imports.length()
+	var out: DiscoveryBuilder = parse_import_block(builder, module)
+	imports_count: Int = out.imports.length() - imports_first
+	end: Span = previous_content_span(out)
+	out = append_import_block(
+		out,
+		{
+			module = module,
+			imports = {
+				first = imports_first,
+				count = imports_count
+			},
+			span = span_covering(start, end)
+		},
+	)
+	out
+
+
+---
+`foreign [(name: "value", ...)]:` then an indented block of foreign function
+signatures. `foreign func` without a block is reported.
+---
+private pure func parse_foreign_block(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	start: Span,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = advance_token(builder)
+
+	if at(out, PureKeyword) or at(out, FuncKeyword):
+		out = append_plain_diagnostic(out, ForeignFunctionOutsideBlockDiagnostic, start)
+		out = advance_token(out)
+		out
+	else:
+		block: ForeignBlockId = next_foreign_block_id(out)
+		arguments_first: Int = out.foreign_arguments.length()
+		out = append_foreign_block(
+			out,
+			{
+				module = module,
+				arguments = {
+					first = arguments_first,
+					count = 0
+				},
+				span = start
+			},
+		)
+
+		if at(out, LeftParenSymbol):
+			out = advance_token(out)
+			out = parse_foreign_arguments(out)
+			out = expect_token(out, RightParenSymbol, ExpectedRightParenDiagnostic)
+
+		arguments_count: Int = out.foreign_arguments.length() - arguments_first
+		out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+		out = expect_token(out, NewlineToken, ExpectedNewlineDiagnostic)
+		out = expect_token(out, IndentToken, ExpectedIndentDiagnostic)
+		out = skip_newlines(out)
+
+		while not at_block_end(out):
+			before: Int = out.token_cursor
+
+			if starts_foreign_function(out):
+				out = parse_foreign_function(out, module, block)
+				out = skip_newlines(out)
+			else:
+				block_end: Bool = at_block_end(out)
+				out = report_at_current(out, ExpectedForeignFunctionDiagnostic)
+
+				if not block_end:
+					out = advance_token(out)
+
+				out = skip_newlines(out)
+
+			if out.token_cursor == before and not at_block_end(out):
+				out = advance_token(out)
+
+		var end: Span = start
+
+		if at(out, DedentToken):
+			end = current_span(out)
+
+		out = expect_token(out, DedentToken, ExpectedDedentDiagnostic)
+		out = replace_foreign_block_row(
+			out,
+			block,
+			{
+				module = module,
+				arguments = {
+					first = arguments_first,
+					count = arguments_count
+				},
+				span = span_covering(start, end)
+			},
+		)
+		out
+
+
+private pure func starts_foreign_function(builder: DiscoveryBuilder) -> Bool:
+	match current_kind(builder):
+		PrivateKeyword | PureKeyword | FuncKeyword | AtSymbol:
+			True
+		_:
+			False
+
+
+---
+`name: "value", ...` inside the foreign block's parentheses.
+---
+private pure func parse_foreign_arguments(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if at(builder, RightParenSymbol):
+		report_at_current(builder, ExpectedForeignArgumentDiagnostic)
+	else if at(builder, EndOfFileToken):
+		builder
+	else:
+		parse_foreign_argument_list(builder)
+
+
+---
+Foreign arguments up to the `)` or the end of the source; there is at least
+one.
+---
+private pure func parse_foreign_argument_list(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_foreign_argument(builder)
+
+	while not at(out, RightParenSymbol) and not at(out, EndOfFileToken):
+		out = parse_foreign_argument(out)
+
+	out
+
+
+---
+One `name: "value"` and the comma after it. It always moves the cursor unless
+the cursor is at the `)`, so the list above ends.
+---
+private pure func parse_foreign_argument(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	before: Int = builder.token_cursor
+	name: NameId = referenced_name_at_cursor(builder)
+	name_span: Span = current_span(builder)
+	var out: DiscoveryBuilder = consume_referenced_name(builder)
+	out = expect_token(out, ColonSymbol, ExpectedColonDiagnostic)
+
+	match string_literal_at_cursor(out):
+		Some(value):
+			value_span: Span = current_span(out)
+			out = advance_token(out)
+			out = append_foreign_argument(
+				out,
+				{
+					name = name,
+					value = value,
+					span = span_covering(name_span, value_span)
+				},
+			)
+		None:
+			out = report_and_recover(out, ExpectedForeignArgumentValueDiagnostic)
+
+	if at(out, CommaSymbol):
+		out = advance_token(out)
+	else if not at(out, RightParenSymbol):
+		out = report_at_current(out, ExpectedCommaDiagnostic)
+
+	if out.token_cursor == before and not at(out, RightParenSymbol):
+		out = advance_token(out)
+
+	out
+
+
+---
+`[private] [@annotations] [pure] func name(params) -> R [= "c_name"]`.
+---
+private pure func parse_foreign_function(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	block: ForeignBlockId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = next_definition_id(builder)
+	start: Span = current_span(builder)
+
+	visibility: Visibility = if at(builder, PrivateKeyword):
+		PrivateVisibility
+	else:
+		PublicVisibility
+
+	var out: DiscoveryBuilder = skip_optional_token(builder, PrivateKeyword)
+	annotations_first: Int = pending_annotation_count(out)
+	out = consume_annotations(out, False)
+	annotations: RowRange = annotations_since(out, annotations_first)
+	var purity: Purity = ImpureFunction
+
+	if at(out, PureKeyword):
+		purity = PureFunction
+		out = advance_token(out)
+
+	keyword_span: Span = current_span(out)
+	out = expect_keyword(out, FuncKeyword)
+	name: NameId = declared_name_at_cursor(out)
+	name_span: Span = current_span(out)
+	out = consume_declared_name(out)
+	header: DeclarationHeader = { plain_header(module, start, annotations.first) |
+		visibility = visibility,
+		purity = purity,
+		annotations = annotations
+	}
+	out = open_definition(out, header, ForeignFunctionDefinition, name, name_span)
+	out = append_foreign_binding(
+		out,
+		{
+			definition = definition,
+			block = block
+		},
+	)
+	out = parse_signature(out, definition, purity, keyword_span)
+	var end: Span = name_span
+
+	if at(out, ArrowSymbol):
+		out = advance_token(out)
+		out = parse_type(out)
+		return_type: NodeId = last_node_id(out)
+		out = append_definition_type(
+			out,
+			{
+				definition = definition,
+				type_root = return_type
+			},
+		)
+		end = node_span(out, return_type)
+	else:
+		end = span_before_current(out)
+		out = report_at_current(out, ExpectedArrowDiagnostic)
+
+	if at(out, EqualSymbol):
+		out = advance_token(out)
+
+		match string_literal_at_cursor(out):
+			Some(c_name):
+				c_name_span: Span = current_span(out)
+				out = advance_token(out)
+				out = append_foreign_c_name(
+					out,
+					{
+						definition = definition,
+						c_name = c_name,
+						span = c_name_span
+					},
+				)
+				end = c_name_span
+			None:
+				out = report_and_recover(out, ExpectedForeignCNameDiagnostic)
+
+	out = close_definition(out, definition, header, ForeignFunctionDefinition, name, name_span, end)
+	out

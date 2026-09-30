@@ -39,6 +39,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		legacy_owner_importers: dict[str, list[str]] | None = None,
 		temporary_cross_owner_imports: dict[str, list[str]] | None = None,
 		forbidden_top_level_paths: list[str] | None = None,
+		isolated_test_owners: list[str] | None = None,
 	) -> None:
 		(root / "blorp/src/compiler").mkdir(parents=True)
 		(root / "blorp/src/run").mkdir(parents=True)
@@ -62,6 +63,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 					"temporary_cross_owner_imports": temporary_cross_owner_imports or {},
 					"fixture_directories": ["fixture", "should_pass", "should_fail"],
 					"shared_module_consumers": shared_consumers or {},
+					"isolated_test_owners": isolated_test_owners or [],
 				}
 			),
 			encoding="utf-8",
@@ -330,6 +332,69 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("fixture directory is not allowed", result.stderr)
+
+	def write_isolated_run_owner(self, root: Path, test_imports: str) -> None:
+		self.write_layout(root, isolated_test_owners=["run"])
+		(root / "blorp/src/run/command.brp").write_text("", encoding="utf-8")
+		(root / "blorp/src/lib/shared.brp").write_text("", encoding="utf-8")
+		(root / "blorp/src/compiler/pipeline.brp").write_text("", encoding="utf-8")
+		(root / "blorp/test/run").mkdir(parents=True)
+		(root / "blorp/test/run/test_command.brp").write_text(
+			f"import:\n{test_imports}",
+			encoding="utf-8",
+		)
+
+	def test_isolated_test_owner_accepts_its_owner_lib_and_standard_library(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_isolated_run_owner(
+				root,
+				"\t../../src/run/command: run_command\n"
+				"\t../../src/lib/shared: shared\n"
+				"\ttest: TestSuite\n",
+			)
+
+			result = self.run_checker(root)
+
+			self.assertNotIn("isolated test owner", result.stderr)
+
+	def test_isolated_test_owner_rejects_another_owners_source(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_isolated_run_owner(root, "\t../../src/compiler/pipeline: compile\n")
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("isolated test owner run may import only run, lib", result.stderr)
+
+	def test_isolated_owner_rejects_another_owner_reached_through_lib(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_isolated_run_owner(root, "\t../../src/run/command: run_command\n")
+			(root / "blorp/src/run/command.brp").write_text(
+				"import:\n\t../lib/shared: shared\n",
+				encoding="utf-8",
+			)
+			(root / "blorp/src/lib/shared.brp").write_text(
+				"import:\n\t../compiler/pipeline: compile\n",
+				encoding="utf-8",
+			)
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("isolated owner run reaches another owner through lib", result.stderr)
+
+	def test_isolated_test_owner_must_be_registered(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root, isolated_test_owners=["missing"])
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("isolated test owner is not a registered owner: missing", result.stderr)
 
 
 if __name__ == "__main__":

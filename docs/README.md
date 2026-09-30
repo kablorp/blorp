@@ -54,6 +54,7 @@ module inventory lives in
 - [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
   plan for publishing each stage's facts as id-keyed tables (module,
   name, definition tables) and removing threaded state from typecheck.
+- [`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) — discovery rebuilt to produce normalized tables of struct rows (node table, definition ids minted in discovery, packed spans); implemented under `blorp/src/compiler_new/stage_01_discovery/`, with the legacy adapter and prelude loading pending.
 - [`NAME_ID_ROADMAP.md`](NAME_ID_ROADMAP.md) — names become ids: Lane A (identifier text to `NameId` then `Int`, identical C) and Lane B (emission spelled from definition and binder ids, smaller C); the one tracked plan for the name-to-id work, superseding the catalog's task order.
 - [`NAME_MANGLING_REMOVAL_ROADMAP.md`](NAME_MANGLING_REMOVAL_ROADMAP.md) — Lane A step A3 expanded: `CoreFunctionOrigin` beside the name, instantiation-specific definition ids, readers moved one census family at a time, producers deleted last; binders, types and emitter temporaries follow; progress measured by the `check-magic-spellings` allowlist.
 - [`CORE_NODE_TABLE_ROADMAP.md`](CORE_NODE_TABLE_ROADMAP.md) — Core expressions get node ids and facts move into published id-keyed tables; steps N1-N6 (compact locations first), each with ROI, risks, oracle.

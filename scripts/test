@@ -7,6 +7,7 @@
 #   scripts/test compiler-tools     # Formatter/purify/lint fixtures and compiler-tool guards
 #   scripts/test compiler-core-sanitize  # Focused Core .brp tests under ASan + UBSan
 #   scripts/test compiler-blorp-sanitize # Compiler-owned .brp tests under ASan + UBSan
+#   scripts/test compiler-new       # Rewritten compiler stages (blorp/src/compiler_new) TestSuites
 #   scripts/test std-check          # Broad standard-library source typecheck sweep
 #   scripts/test runtime            # Runtime .brp tests (language features)
 #   scripts/test leak               # Focused --leak-check suites and leak diagnostics
@@ -55,7 +56,7 @@ format_seconds() {
 }
 
 usage() {
-    echo "Usage: $runner_label [options] [compiler-blorp] [compiler-tools] [compiler-core-sanitize] [compiler-blorp-sanitize] [std-check] [runtime] [leak] [doctest] [cli] [cli-deep] [lsp] [package]"
+    echo "Usage: $runner_label [options] [compiler-blorp] [compiler-tools] [compiler-core-sanitize] [compiler-blorp-sanitize] [compiler-new] [std-check] [runtime] [leak] [doctest] [cli] [cli-deep] [lsp] [package]"
     cat <<'EOF'
 
 Options:
@@ -114,6 +115,7 @@ while [ $# -gt 0 ]; do
         compiler-tools) gates+=("compiler_tools") ;;
         compiler-core-sanitize) gates+=("compiler_core_sanitize") ;;
         compiler-blorp-sanitize) gates+=("compiler_blorp_sanitize") ;;
+        compiler-new) gates+=("compiler_new") ;;
         std-check) gates+=("std_check") ;;
         cli-deep) gates+=("cli_deep") ;;
         runtime|leak|doctest|cli|lsp|package) gates+=("$arg") ;;
@@ -129,7 +131,7 @@ if $timings; then
     export BLORP_TEST_TIMINGS=1
 fi
 
-default_gates=(compiler_blorp runtime leak doctest cli)
+default_gates=(compiler_blorp compiler_new runtime leak doctest cli)
 if [ ${#gates[@]} -eq 0 ]; then
     gates=("${default_gates[@]}")
 fi
@@ -421,6 +423,7 @@ compiler_blorp_status="SKIP"; compiler_blorp_passed=0; compiler_blorp_failed=0; 
 compiler_tools_status="SKIP"; compiler_tools_passed=0; compiler_tools_failed=0; compiler_tools_tests=0; compiler_tools_failures=""
 compiler_core_sanitize_status="SKIP"; compiler_core_sanitize_passed=0; compiler_core_sanitize_failed=0; compiler_core_sanitize_tests=0; compiler_core_sanitize_failures=""
 compiler_blorp_sanitize_status="SKIP"; compiler_blorp_sanitize_passed=0; compiler_blorp_sanitize_failed=0; compiler_blorp_sanitize_tests=0; compiler_blorp_sanitize_failures=""
+compiler_new_status="SKIP"; compiler_new_passed=0; compiler_new_failed=0; compiler_new_tests=0; compiler_new_failures=""
 std_check_status="SKIP"; std_check_passed=0; std_check_failed=0; std_check_tests=0; std_check_failures=""
 runtime_status="SKIP"; runtime_passed=0; runtime_failed=0; runtime_tests=0; runtime_failures=""
 leak_status="SKIP"; leak_passed=0; leak_failed=0; leak_tests=0; leak_failures=""
@@ -434,6 +437,7 @@ compiler_blorp_seconds=0
 compiler_tools_seconds=0
 compiler_core_sanitize_seconds=0
 compiler_blorp_sanitize_seconds=0
+compiler_new_seconds=0
 std_check_seconds=0
 runtime_seconds=0
 leak_seconds=0
@@ -1010,15 +1014,15 @@ run_runtime_gate_commands() {
     return "$suite_status"
 }
 
-load_compiler_blorp_test_sources() {
-    local output_file="$1"
-    local inventory
-
-    if ! inventory=$(python3 - <<'PY' 2>&1
+# Print the suite paths a compiler test ownership manifest registers, one per
+# line; fail with a message when the manifest or a suite is missing.
+print_manifest_suite_paths() {
+    python3 - "$1" <<'PY' 2>&1
 import json
+import sys
 from pathlib import Path
 
-manifest_path = Path("blorp/test/compiler/compiler_test_ownership.json")
+manifest_path = Path(sys.argv[1])
 try:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError) as error:
@@ -1037,7 +1041,13 @@ for suite in suites:
 for path in paths:
     print(path)
 PY
-    ); then
+}
+
+load_compiler_blorp_test_sources() {
+    local output_file="$1"
+    local inventory
+
+    if ! inventory=$(print_manifest_suite_paths "blorp/test/compiler/compiler_test_ownership.json"); then
         echo "Error: $inventory" >&2
         echo "Error: $inventory" >> "$output_file"
         return 1
@@ -1047,6 +1057,78 @@ PY
     while IFS= read -r source_path; do
         [ -n "$source_path" ] && compiler_blorp_test_sources+=("$source_path")
     done <<< "$inventory"
+}
+
+load_compiler_new_test_sources() {
+    local output_file="$1"
+    local inventory
+
+    if ! inventory=$(print_manifest_suite_paths "blorp/test/compiler_new/compiler_new_test_ownership.json"); then
+        echo "Error: $inventory" >&2
+        echo "Error: $inventory" >> "$output_file"
+        return 1
+    fi
+
+    compiler_new_test_sources=()
+    while IFS= read -r source_path; do
+        [ -n "$source_path" ] && compiler_new_test_sources+=("$source_path")
+    done <<< "$inventory"
+}
+
+# Every test_*.brp under blorp/test/compiler_new must be registered in the
+# manifest, so a new suite cannot silently stay out of the gate.
+check_compiler_new_manifest_complete() {
+    local output_file="$1"
+    local missing=""
+    local source_path
+
+    while IFS= read -r source_path; do
+        local registered=false
+        local listed
+        for listed in "${compiler_new_test_sources[@]}"; do
+            if [ "$listed" = "$source_path" ]; then
+                registered=true
+                break
+            fi
+        done
+        if ! $registered; then
+            missing="$missing $source_path"
+        fi
+    done < <(find blorp/test/compiler_new -name 'test_*.brp' | LC_ALL=C sort)
+
+    if [ -n "$missing" ]; then
+        echo "Error: compiler_new suites missing from compiler_new_test_ownership.json:$missing" | tee -a "$output_file" >&2
+        return 1
+    fi
+}
+
+# The compiler_new tools and test support modules are not TestSuites; type
+# check them so they cannot rot unnoticed.
+check_compiler_new_tools() {
+    local output_file="$1"
+    local tool
+
+    for tool in blorp/test/compiler_new/tools/*.brp blorp/test/compiler_new/support/*.brp; do
+        if ! bin/blorp check --no-format "$tool" >> "$output_file" 2>&1; then
+            echo "Error: compiler_new tool does not type check: $tool" | tee -a "$output_file" >&2
+            return 1
+        fi
+    done
+}
+
+# The rewritten compiler stages under blorp/src/compiler_new, which are not
+# linked into bin/blorp yet: their TestSuites, registered in their own manifest.
+run_compiler_new_gate_commands() {
+    local output_file="$1"
+    local live="${2:-false}"
+
+    load_compiler_new_test_sources "$output_file" || return 1
+    check_compiler_new_manifest_complete "$output_file" || return 1
+    check_compiler_new_tools "$output_file" || return 1
+    capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_new \
+        bin/blorp test $blorp_test_artifact_flags --suite \
+        --timeout "$compiler_blorp_test_timeout" \
+        "${compiler_new_test_sources[@]}"
 }
 
 run_compiler_blorp_tests() {
@@ -1359,6 +1441,27 @@ run_compiler_blorp_sanitize() {
     return $exit_code
 }
 
+run_compiler_new() {
+    echo "═══ Rewritten Compiler Stage TestSuites (compiler_new) ═══"
+    echo ""
+    local output exit_code output_file start_seconds
+    start_seconds=$(now_seconds)
+    output_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_new.XXXXXX") || exit 1
+    : > "$output_file"
+    run_compiler_new_gate_commands "$output_file" "$verbose"
+    exit_code=$?
+    output=$(cat "$output_file")
+    record_gate_log "compiler-new" "$output_file"
+    maybe_print_failure_excerpt "compiler-new" "$output_file" "$exit_code"
+    print_blorp_test_timing_summary "$output_file"
+    rm -f "$output_file"
+    compiler_new_seconds=$(elapsed_since "$start_seconds")
+    echo ""
+    parse_blorp_output "$output" "compiler_new"
+    mark_gate_process_failure "compiler_new" "$exit_code"
+    return $exit_code
+}
+
 run_std_check() {
     echo "═══ Std Typecheck Check ═══"
     echo ""
@@ -1606,6 +1709,12 @@ init_gate_output() {
                 echo ""
             } > "$outfile"
             ;;
+        compiler_new)
+            {
+                echo "═══ Rewritten Compiler Stage TestSuites (compiler_new) ═══"
+                echo ""
+            } > "$outfile"
+            ;;
         std_check)
             {
                 echo "═══ Std Typecheck Check ═══"
@@ -1673,6 +1782,9 @@ run_gate_to_file() {
             ;;
         compiler_blorp_sanitize)
             run_compiler_blorp_sanitize_commands "$outfile" false
+            ;;
+        compiler_new)
+            run_compiler_new_gate_commands "$outfile" false
             ;;
         std_check)
             run_std_check_gate_commands "$outfile"
@@ -1781,6 +1893,7 @@ collect_gate_worker() {
         compiler_tools) parse_blorp_output "$local_output" "compiler_tools" ;;
         compiler_core_sanitize) parse_blorp_output "$local_output" "compiler_core_sanitize" ;;
         compiler_blorp_sanitize) parse_blorp_output "$local_output" "compiler_blorp_sanitize" ;;
+        compiler_new) parse_blorp_output "$local_output" "compiler_new" ;;
         std_check) parse_std_check_gate_output "$local_output" ;;
         runtime)  parse_blorp_output "$local_output" "runtime" ;;
         leak)     parse_blorp_output "$local_output" "leak" ;;
@@ -1850,6 +1963,7 @@ elif $serial || [ ${#parallel_gates[@]} -le 1 ]; then
             compiler_tools) run_compiler_tools || any_failed=true ;;
             compiler_core_sanitize) run_compiler_core_sanitize || any_failed=true ;;
             compiler_blorp_sanitize) run_compiler_blorp_sanitize || any_failed=true ;;
+            compiler_new) run_compiler_new || any_failed=true ;;
             std_check) run_std_check || any_failed=true ;;
             runtime)  run_runtime  || any_failed=true ;;
             leak)     run_leak     || any_failed=true ;;
@@ -1874,6 +1988,7 @@ else
     run_gate_wave "compiler-tools" compiler_tools
     run_gate_wave "compiler-core-sanitize" compiler_core_sanitize
     run_gate_wave "compiler-blorp-sanitize" compiler_blorp_sanitize
+    run_gate_wave "compiler-new" compiler_new
     run_gate_wave "std-check" std_check
     run_gate_wave "runtime" runtime
     run_gate_wave "tail" leak doctest cli lsp
@@ -1920,6 +2035,7 @@ for s in "${gates[@]}"; do
         compiler_tools) label="Compiler-Tools" ;;
         compiler_core_sanitize) label="Compiler-Core-ASan" ;;
         compiler_blorp_sanitize) label="Compiler-Blorp-ASan" ;;
+        compiler_new) label="Compiler-New" ;;
         std_check) label="Std-check" ;;
         runtime)  label="Runtime" ;;
         leak)     label="Leak-check" ;;

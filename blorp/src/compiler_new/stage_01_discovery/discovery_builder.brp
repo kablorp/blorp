@@ -1,0 +1,2021 @@
+-- The discovery builder: the one owner of every discovery table and every id.
+--
+-- Each table is a `List` of struct rows, and an id is the index of its row, so
+-- the only way to mint an id is to read `next_*_id` before the matching
+-- `append_*`.
+--
+-- Builder threading rules. Every table must stay uniquely referenced so each
+-- append grows its list in place; when the compiler cannot see that a builder
+-- is handed on at its last use, it keeps a second reference, and the next
+-- update copies the builder record and then every table appended to while the
+-- old record lives: an O(n) copy per append. The current compiler hands a
+-- builder on only in these shapes, so every routine follows them (sites cite
+-- the rule by number):
+--
+-- 1. The first update of a builder parameter (or of a `var` bound to it) is
+--    unconditional. Branch in a helper whose arms each call on the parameter
+--    (`if at(b, K): advance_token(b) else: b`), scan ahead and move the cursor
+--    once, or parse the first item before a loop.
+-- 2. A `var` builder reassigned under an `if` or a loop is not passed to a
+--    call in tail position; assign the call's result and return the `var`.
+-- 3. The builder is not read in another argument of the call it is handed
+--    to; read what the call needs into a local first.
+-- 4. A call's result is not passed straight on as another call's builder
+--    argument (`f(g(b))`); bind it to a named local first.
+-- 5. Inside a loop, update the loop's `var` directly (`out = f(out)`), never
+--    through a temporary (`t = f(out); out = g(t)`).
+-- 6. A record update's new field value reads only that field of the record;
+--    no other field of it, or list held from it, stays live across the
+--    update. Read single values into locals first.
+-- 7. The builder is not bound to a second name, stored in another value, or
+--    captured in a closure.
+--
+-- `tools/builder_append_probe.brp` and `tools/discovery_dump.brp` measure the
+-- effect, and the compiler-new gate fails when appends start copying tables.
+--
+-- Text lives only in the names, paths, source texts and literals tables. An
+-- optional relationship is a row in a side table; variable-length data is a
+-- contiguous block of a child table addressed by a `RowRange`.
+import:
+	debug as dbg
+	discovery_diagnostic_code: DiscoveryDiagnosticCode
+	intern_index:
+		INITIAL_SLOT_COUNT,
+		NO_ROW,
+		empty_slots,
+		find_slice,
+		slice_hash,
+		slots_for_texts,
+		slots_with_row,
+		text_hash,
+	name_vocabulary: ALL_SEEDED_NAME_SPELLINGS
+	row_kinds:
+		DefinitionKind,
+		FunctionAnnotation(TailRecursiveAnnotation),
+		ImportRequestKind,
+		ModuleOriginKind,
+		ModuleReach,
+		NodeKind(MissingExpressionNode),
+		PackageKind,
+		ParameterBinder,
+		Purity,
+		TypeParameterKind,
+		Visibility,
+	span: Span, pack_span
+	token: Token
+
+
+---
+A spelling identity: two names with the same spelling share one id.
+---
+opaque type NameId = Int
+
+---
+One source text read by the walker.
+---
+opaque type SourceId = Int
+
+---
+One interned path: a canonical module path or an import request's text.
+---
+opaque type PathId = Int
+
+opaque type PackageId = Int
+
+opaque type ModuleId = Int
+
+---
+One root request given to the walker, in the order given.
+---
+opaque type RootId = Int
+
+opaque type ImportId = Int
+
+opaque type ImportItemId = Int
+
+---
+A declared thing (function, type, member, ...), minted in discovery.
+---
+opaque type DefinitionId = Int
+
+---
+One syntax node of a function body in the flat node table.
+---
+opaque type NodeId = Int
+
+---
+One interned literal text (string or number spelling, or foreign C text).
+---
+opaque type LiteralId = Int
+
+opaque type DiagnosticId = Int
+
+---
+One parameter of a function, method or foreign function.
+---
+opaque type ParameterId = Int
+
+---
+One `foreign:` block, whose arguments apply to every function it declares.
+---
+opaque type ForeignBlockId = Int
+
+
+---
+A contiguous block of rows in a child table: rows `first .. first + count`.
+---
+struct RowRange {
+	first: Int,
+	count: Int
+}
+
+
+---
+The range with no rows, used for a parent row appended before its children
+are known; the builder closes it once they are.
+---
+EMPTY_ROW_RANGE: RowRange = {
+	first = 0,
+	count = 0
+}
+
+
+---
+The line starts of a source are rows `line_starts` of the `line_starts`
+table; the text itself is `source_texts[source]`.
+---
+struct SourceRow {
+	path: PathId,
+	line_starts: RowRange
+}
+
+
+struct PackageRow {
+	name: NameId,
+	kind: PackageKind
+}
+
+
+---
+One module. Its rows in the definitions, imports, nodes and diagnostics
+tables are the contiguous blocks named here, closed when its parse ends.
+---
+struct ModuleRow {
+	source: SourceId,
+	canonical_path: PathId,
+	origin: ModuleOriginKind,
+	reach: ModuleReach,
+	definitions: RowRange,
+	imports: RowRange,
+	nodes: RowRange,
+	diagnostics: RowRange
+}
+
+
+---
+A package module's package; most modules have none.
+---
+struct ModulePackageRow {
+	module: ModuleId,
+	package: PackageId
+}
+
+
+---
+A root given to the walker: a source path, as given.
+---
+struct RootRow {
+	request_path: PathId
+}
+
+
+---
+The module a root request loaded; absent when it loaded none.
+---
+struct RootTargetRow {
+	root: RootId,
+	target: ModuleId
+}
+
+
+---
+A root request that loaded no module, with the reason as a code and its
+arguments (a block of `diagnostic_arguments`).
+---
+struct RootDiagnosticRow {
+	root: RootId,
+	code: DiscoveryDiagnosticCode,
+	arguments: RowRange
+}
+
+
+---
+One import item of a module's import block. `request_path` is the import
+syntax, kept as text on purpose (for diagnostics and the legacy adapter);
+resolution reads the structured form: `parent_steps` leading `../` (0 for
+`./` and for non-relative requests), then the path parts, a block of
+`import_path_parts`. `items` is a block of `import_items`.
+---
+struct ImportRow {
+	importer: ModuleId,
+	request_kind: ImportRequestKind,
+	request_path: PathId,
+	parent_steps: Int,
+	path_parts: RowRange,
+	items: RowRange,
+	span: Span
+}
+
+
+---
+One selected symbol; `variants` is a block of `import_item_variants` for
+`name(Variant, ...)` selections.
+---
+struct ImportItemRow {
+	owner_import: ImportId,
+	name: NameId,
+	variants: RowRange,
+	span: Span
+}
+
+
+struct ImportItemVariantRow {
+	item: ImportItemId,
+	name: NameId,
+	span: Span
+}
+
+
+---
+The module an import loaded; absent when it loaded none.
+---
+struct ImportTargetRow {
+	owner_import: ImportId,
+	target: ModuleId
+}
+
+
+struct ImportAliasRow {
+	owner_import: ImportId,
+	alias_name: NameId
+}
+
+
+struct ImportItemAliasRow {
+	item: ImportItemId,
+	alias_name: NameId
+}
+
+
+---
+One row per declared thing, including members. `span` covers the whole
+declaration (from its docstring, annotations or `pure`, when present);
+`name_span` covers the name. Impls have no name of their own, so their name
+columns hold the implemented trait's name.
+---
+struct DefinitionRow {
+	module: ModuleId,
+	kind: DefinitionKind,
+	name: NameId,
+	name_span: Span,
+	visibility: Visibility,
+	span: Span
+}
+
+
+---
+A field, variant or method, with its owner and declaration order.
+---
+struct MemberRow {
+	definition: DefinitionId,
+	owner: DefinitionId,
+	ordinal: Int
+}
+
+
+---
+A declaration's docstring; most declarations have none.
+---
+struct DocumentationRow {
+	definition: DefinitionId,
+	text: LiteralId
+}
+
+
+---
+The two kinds of piece an interpolated string is made of.
+---
+enum InterpolationPart:
+	TextPart
+	HolePart
+
+
+---
+One piece of an interpolated string, in source order. `start .. end` are its
+source bytes: the text as written, or a hole's expression between `${` and
+its `}`. `text` is one row of `interpolation_texts` holding the decoded text
+for a `TextPart`, and empty for a `HolePart`.
+---
+struct InterpolationPartRow {
+	part: InterpolationPart,
+	start: Int,
+	end: Int,
+	text: RowRange
+}
+
+
+---
+An annotation read before the declaration it belongs to has a row: a
+transient row the declaration copies into `annotations` once its
+`DefinitionId` is known.
+---
+struct PendingAnnotationRow {
+	annotation: FunctionAnnotation,
+	span: Span
+}
+
+
+---
+One `@annotation` of a function, in written order.
+---
+struct AnnotationRow {
+	definition: DefinitionId,
+	annotation: FunctionAnnotation,
+	span: Span
+}
+
+
+struct TypeParameterRow {
+	owner: DefinitionId,
+	ordinal: Int,
+	name: NameId,
+	kind: TypeParameterKind,
+	span: Span
+}
+
+
+---
+A written trait bound on the type parameter at `parameter_ordinal`,
+unresolved; typecheck turns `trait_name` into a trait.
+---
+struct BoundRow {
+	owner: DefinitionId,
+	parameter_ordinal: Int,
+	trait_name: NameId,
+	span: Span
+}
+
+
+---
+A supertrait a trait names, in written order.
+---
+struct SupertraitRow {
+	trait_definition: DefinitionId,
+	ordinal: Int,
+	name: NameId,
+	span: Span
+}
+
+
+---
+The signature of a function, method or foreign function: its purity, the
+span of its `func` keyword, and its parameters, a block of `parameters`.
+Every function-like definition has exactly one.
+---
+struct SignatureRow {
+	definition: DefinitionId,
+	purity: Purity,
+	keyword_span: Span,
+	parameters: RowRange
+}
+
+
+---
+One parameter. `binder_names` is a block of `binder_names`: one name for a
+named binder (`_` for a typed discard), none for a wildcard, two to four for
+a tuple binder. `binder_span` covers the binder, `span` the whole parameter.
+---
+struct ParameterRow {
+	owner: DefinitionId,
+	ordinal: Int,
+	binder: ParameterBinder,
+	binder_names: RowRange,
+	binder_span: Span,
+	span: Span
+}
+
+
+struct BinderNameRow {
+	name: NameId,
+	span: Span
+}
+
+
+---
+A parameter's written type; absent when the type is inferred.
+---
+struct ParameterTypeRow {
+	parameter: ParameterId,
+	type_root: NodeId
+}
+
+
+---
+The one type a definition declares, whose role its kind fixes: a
+function's, method's or foreign function's return type, a global's declared
+type, an alias's or opaque type's target, an impl's receiver type, a field's
+type. Absent when not written.
+---
+struct DefinitionTypeRow {
+	definition: DefinitionId,
+	type_root: NodeId
+}
+
+
+---
+One payload type of a variant, in written order.
+---
+struct VariantPayloadRow {
+	variant: DefinitionId,
+	ordinal: Int,
+	type_root: NodeId
+}
+
+
+---
+One `where left == right` dimension constraint of a function.
+---
+struct DimensionConstraintRow {
+	owner: DefinitionId,
+	left: NodeId,
+	right: NodeId,
+	span: Span
+}
+
+
+---
+One `import:` block; `imports` is its block of `imports`.
+---
+struct ImportBlockRow {
+	module: ModuleId,
+	imports: RowRange,
+	span: Span
+}
+
+
+---
+One `foreign:` block; `arguments` is its block of `foreign_arguments`.
+---
+struct ForeignBlockRow {
+	module: ModuleId,
+	arguments: RowRange,
+	span: Span
+}
+
+
+---
+One `name: "value"` argument of a foreign block, such as `include`.
+---
+struct ForeignArgumentRow {
+	name: NameId,
+	value: LiteralId,
+	span: Span
+}
+
+
+---
+The foreign block a foreign function belongs to.
+---
+struct ForeignBindingRow {
+	definition: DefinitionId,
+	block: ForeignBlockId
+}
+
+
+---
+A foreign function's explicit C name (`= "c_name"`); absent when the C name
+is the Blorp name.
+---
+struct ForeignCNameRow {
+	definition: DefinitionId,
+	c_name: LiteralId,
+	span: Span
+}
+
+
+---
+A resource type's cleanup builtin (`= builtin("cleanup")`).
+---
+struct ResourceCleanupRow {
+	definition: DefinitionId,
+	builtin_name: LiteralId,
+	span: Span
+}
+
+
+---
+A function's, method's or global's body: the root of its nodes.
+---
+struct BodyRow {
+	definition: DefinitionId,
+	root: NodeId
+}
+
+
+---
+One body node. `payload` is fixed by `kind`; `children` addresses a block of
+the `node_children` edge table.
+---
+struct NodeRow {
+	kind: NodeKind,
+	span: Span,
+	payload: Int,
+	children: RowRange
+}
+
+
+---
+A diagnostic at a source span; `arguments` is a block of
+`diagnostic_arguments`, interpreted by `code`.
+---
+struct DiagnosticRow {
+	code: DiscoveryDiagnosticCode,
+	span: Span,
+	arguments: RowRange
+}
+
+
+---
+Every discovery table. Flat on purpose: each level of nesting is one more
+uniqueness check a copy-on-write update has to pass.
+
+`diagnostics` holds each module's lex and parse diagnostics, in the module's
+contiguous block; `resolution_diagnostics` holds the walker's: imports that
+loaded no module, and sources that could not be admitted.
+
+The fields after `diagnostic_arguments` are transient: the tokens of the
+one module being parsed (and of its interpolation holes, appended after its
+end-of-file token), the index of the parser's next token, the docstrings and
+annotations read before their declaration's row exists, the parts of the
+module's interpolated strings, and the roots of the child nodes a parent
+node has not yet claimed. `without_transient_tables` empties them; lexing a
+module starts from it and `freeze` drops them with it. They live here because lexing interns names and
+literals into this builder while it produces tokens, and parsing appends
+rows while it consumes them; the builder is the only value threaded through
+that work.
+---
+record DiscoveryBuilder {
+	name_spellings: List[String],
+	name_slots: List[Int],
+	paths: List[String],
+	path_ids_by_text: Dict[String, Int],
+	source_texts: List[String],
+	sources: List[SourceRow],
+	line_starts: List[Int],
+	packages: List[PackageRow],
+	modules: List[ModuleRow],
+	module_packages: List[ModulePackageRow],
+	module_ids_by_path: Dict[Int, Int],
+	roots: List[RootRow],
+	root_targets: List[RootTargetRow],
+	root_diagnostics: List[RootDiagnosticRow],
+	imports: List[ImportRow],
+	import_path_parts: List[NameId],
+	import_items: List[ImportItemRow],
+	import_item_variants: List[ImportItemVariantRow],
+	import_targets: List[ImportTargetRow],
+	import_aliases: List[ImportAliasRow],
+	import_item_aliases: List[ImportItemAliasRow],
+	import_blocks: List[ImportBlockRow],
+	definitions: List[DefinitionRow],
+	members: List[MemberRow],
+	documentation: List[DocumentationRow],
+	annotations: List[AnnotationRow],
+	type_parameters: List[TypeParameterRow],
+	bounds: List[BoundRow],
+	supertraits: List[SupertraitRow],
+	signatures: List[SignatureRow],
+	parameters: List[ParameterRow],
+	binder_names: List[BinderNameRow],
+	parameter_types: List[ParameterTypeRow],
+	definition_types: List[DefinitionTypeRow],
+	variant_payloads: List[VariantPayloadRow],
+	dimension_constraints: List[DimensionConstraintRow],
+	foreign_blocks: List[ForeignBlockRow],
+	foreign_arguments: List[ForeignArgumentRow],
+	foreign_bindings: List[ForeignBindingRow],
+	foreign_c_names: List[ForeignCNameRow],
+	resource_cleanups: List[ResourceCleanupRow],
+	bodies: List[BodyRow],
+	nodes: List[NodeRow],
+	node_children: List[NodeId],
+	literals: List[String],
+	literal_slots: List[Int],
+	diagnostics: List[DiagnosticRow],
+	resolution_diagnostics: List[DiagnosticRow],
+	diagnostic_arguments: List[Int],
+	tokens: List[Token],
+	token_cursor: Int,
+	pending_docstrings: List[LiteralId],
+	pending_annotations: List[PendingAnnotationRow],
+	interpolations: List[RowRange],
+	interpolation_parts: List[InterpolationPartRow],
+	interpolation_texts: List[LiteralId],
+	child_stack: List[NodeId],
+	child_stack_depth: Int
+}
+
+
+---
+A builder whose name table holds `ALL_SEEDED_NAME_SPELLINGS` at their pinned ids
+and whose other tables are empty.
+---
+pure func empty_discovery_builder() -> DiscoveryBuilder:
+	{
+		name_spellings = ALL_SEEDED_NAME_SPELLINGS,
+		name_slots = slots_for_texts(ALL_SEEDED_NAME_SPELLINGS, INITIAL_SLOT_COUNT),
+		paths = [],
+		path_ids_by_text = {},
+		source_texts = [],
+		sources = [],
+		line_starts = [],
+		packages = [],
+		modules = [],
+		module_packages = [],
+		module_ids_by_path = {},
+		roots = [],
+		root_targets = [],
+		root_diagnostics = [],
+		imports = [],
+		import_path_parts = [],
+		import_items = [],
+		import_item_variants = [],
+		import_targets = [],
+		import_aliases = [],
+		import_item_aliases = [],
+		import_blocks = [],
+		definitions = [],
+		members = [],
+		documentation = [],
+		annotations = [],
+		type_parameters = [],
+		bounds = [],
+		supertraits = [],
+		signatures = [],
+		parameters = [],
+		binder_names = [],
+		parameter_types = [],
+		definition_types = [],
+		variant_payloads = [],
+		dimension_constraints = [],
+		foreign_blocks = [],
+		foreign_arguments = [],
+		foreign_bindings = [],
+		foreign_c_names = [],
+		resource_cleanups = [],
+		bodies = [],
+		nodes = [],
+		node_children = [],
+		literals = [],
+		literal_slots = empty_slots(INITIAL_SLOT_COUNT),
+		diagnostics = [],
+		resolution_diagnostics = [],
+		diagnostic_arguments = [],
+		tokens = [],
+		token_cursor = 0,
+		pending_docstrings = [],
+		pending_annotations = [],
+		interpolations = [],
+		interpolation_parts = [],
+		interpolation_texts = [],
+		child_stack = [],
+		child_stack_depth = 0
+	}
+
+
+-- Id readers. Every id is the index of its row.
+pure func name_id_index(id: NameId) -> Int:
+	from_opaque NameId(id)
+
+
+pure func source_id_index(id: SourceId) -> Int:
+	from_opaque SourceId(id)
+
+
+pure func path_id_index(id: PathId) -> Int:
+	from_opaque PathId(id)
+
+
+pure func package_id_index(id: PackageId) -> Int:
+	from_opaque PackageId(id)
+
+
+pure func module_id_index(id: ModuleId) -> Int:
+	from_opaque ModuleId(id)
+
+
+pure func root_id_index(id: RootId) -> Int:
+	from_opaque RootId(id)
+
+
+pure func import_id_index(id: ImportId) -> Int:
+	from_opaque ImportId(id)
+
+
+pure func import_item_id_index(id: ImportItemId) -> Int:
+	from_opaque ImportItemId(id)
+
+
+pure func definition_id_index(id: DefinitionId) -> Int:
+	from_opaque DefinitionId(id)
+
+
+pure func node_id_index(id: NodeId) -> Int:
+	from_opaque NodeId(id)
+
+
+pure func literal_id_index(id: LiteralId) -> Int:
+	from_opaque LiteralId(id)
+
+
+pure func diagnostic_id_index(id: DiagnosticId) -> Int:
+	from_opaque DiagnosticId(id)
+
+
+pure func parameter_id_index(id: ParameterId) -> Int:
+	from_opaque ParameterId(id)
+
+
+pure func foreign_block_id_index(id: ForeignBlockId) -> Int:
+	from_opaque ForeignBlockId(id)
+
+
+pure func name_ids_equal(left: NameId, right: NameId) -> Bool:
+	name_id_index(left) == name_id_index(right)
+
+
+pure func module_ids_equal(left: ModuleId, right: ModuleId) -> Bool:
+	module_id_index(left) == module_id_index(right)
+
+
+pure func definition_ids_equal(left: DefinitionId, right: DefinitionId) -> Bool:
+	definition_id_index(left) == definition_id_index(right)
+
+
+pure func node_ids_equal(left: NodeId, right: NodeId) -> Bool:
+	node_id_index(left) == node_id_index(right)
+
+
+---
+Row-position conversions for readers walking a table or a `RowRange` that
+freezing has validated. They are the read side of "an id is its row's
+index"; only `next_*_id` mints an id for a row that does not exist yet.
+---
+pure func name_id_at_row(index: Int) -> NameId:
+	into_opaque NameId(index)
+
+
+pure func source_id_at_row(index: Int) -> SourceId:
+	into_opaque SourceId(index)
+
+
+pure func path_id_at_row(index: Int) -> PathId:
+	into_opaque PathId(index)
+
+
+pure func package_id_at_row(index: Int) -> PackageId:
+	into_opaque PackageId(index)
+
+
+pure func module_id_at_row(index: Int) -> ModuleId:
+	into_opaque ModuleId(index)
+
+
+pure func root_id_at_row(index: Int) -> RootId:
+	into_opaque RootId(index)
+
+
+pure func import_id_at_row(index: Int) -> ImportId:
+	into_opaque ImportId(index)
+
+
+pure func import_item_id_at_row(index: Int) -> ImportItemId:
+	into_opaque ImportItemId(index)
+
+
+pure func definition_id_at_row(index: Int) -> DefinitionId:
+	into_opaque DefinitionId(index)
+
+
+pure func node_id_at_row(index: Int) -> NodeId:
+	into_opaque NodeId(index)
+
+
+pure func literal_id_at_row(index: Int) -> LiteralId:
+	into_opaque LiteralId(index)
+
+
+pure func diagnostic_id_at_row(index: Int) -> DiagnosticId:
+	into_opaque DiagnosticId(index)
+
+
+pure func parameter_id_at_row(index: Int) -> ParameterId:
+	into_opaque ParameterId(index)
+
+
+pure func foreign_block_id_at_row(index: Int) -> ForeignBlockId:
+	into_opaque ForeignBlockId(index)
+
+
+-- Names, paths and literals: interned text.
+---
+What the `interned_*_index` lookups return for text that is not interned:
+never a row index. The hot lexer path uses these instead of `Option`
+lookups, which allocate.
+---
+NOT_INTERNED: Int = NO_ROW
+
+
+---
+The row of `spelling` in the name table, or `NOT_INTERNED`.
+---
+pure func interned_name_index(builder: DiscoveryBuilder, spelling: String) -> Int:
+	interned_name_slice_index(builder, spelling, 0, spelling.length())
+
+
+---
+The row of the name spelled by bytes `start .. end` of `source`, or
+`NOT_INTERNED`; allocates nothing.
+---
+pure func interned_name_slice_index(
+	builder: DiscoveryBuilder,
+	source: String,
+	start: Int,
+	end: Int,
+) -> Int:
+	hash: Int = slice_hash(source, start, end)
+	find_slice(builder.name_spellings, builder.name_slots, source, start, end, hash)
+
+
+---
+The row of `text` in the literal table, or `NOT_INTERNED`.
+---
+pure func interned_literal_index(builder: DiscoveryBuilder, text: String) -> Int:
+	interned_literal_slice_index(builder, text, 0, text.length())
+
+
+---
+The row of the literal spelled by bytes `start .. end` of `source`, or
+`NOT_INTERNED`; allocates nothing.
+---
+pure func interned_literal_slice_index(
+	builder: DiscoveryBuilder,
+	source: String,
+	start: Int,
+	end: Int,
+) -> Int:
+	hash: Int = slice_hash(source, start, end)
+	find_slice(builder.literals, builder.literal_slots, source, start, end, hash)
+
+
+---
+The id `spelling` already has, if it was interned before.
+---
+pure func find_name_id(builder: DiscoveryBuilder, spelling: String) -> Option[NameId]:
+	index: Int = interned_name_index(builder, spelling)
+
+	if index == NOT_INTERNED:
+		None
+	else:
+		Some(into_opaque NameId(index))
+
+
+---
+The id the next appended name will receive.
+---
+pure func next_name_id(builder: DiscoveryBuilder) -> NameId:
+	into_opaque NameId(builder.name_spellings.length())
+
+
+---
+Appends a spelling that is not interned yet; callers check
+`interned_name_index` or `interned_name_slice_index` first. It is
+unconditional on purpose (builder threading rule 1).
+---
+pure func append_name(builder: DiscoveryBuilder, spelling: String) -> DiscoveryBuilder:
+	row: Int = builder.name_spellings.length()
+	hash: Int = text_hash(spelling)
+	-- One record update (builder threading rule 6).
+	{ builder |
+		name_slots = slots_with_row(builder.name_slots, row, hash, row + 1),
+		name_spellings = builder.name_spellings.append(spelling)
+	}
+
+
+pure func find_path_id(builder: DiscoveryBuilder, text: String) -> Option[PathId]:
+	match builder.path_ids_by_text.get(text):
+		Some(index):
+			Some(into_opaque PathId(index))
+		None:
+			None
+
+
+pure func next_path_id(builder: DiscoveryBuilder) -> PathId:
+	into_opaque PathId(builder.paths.length())
+
+
+---
+Appends a path text that is not interned yet; callers check `find_path_id`
+first.
+---
+pure func append_path(builder: DiscoveryBuilder, text: String) -> DiscoveryBuilder:
+	index: Int = builder.paths.length()
+	{ builder |
+		paths = builder.paths.append(text),
+		path_ids_by_text = builder.path_ids_by_text.set(text, index)
+	}
+
+
+pure func find_literal_id(builder: DiscoveryBuilder, text: String) -> Option[LiteralId]:
+	index: Int = interned_literal_index(builder, text)
+
+	if index == NOT_INTERNED:
+		None
+	else:
+		Some(into_opaque LiteralId(index))
+
+
+pure func next_literal_id(builder: DiscoveryBuilder) -> LiteralId:
+	into_opaque LiteralId(builder.literals.length())
+
+
+---
+Appends a literal text that is not interned yet; callers check
+`interned_literal_index` or `interned_literal_slice_index` first.
+---
+pure func append_literal(builder: DiscoveryBuilder, text: String) -> DiscoveryBuilder:
+	row: Int = builder.literals.length()
+	hash: Int = text_hash(text)
+	{ builder |
+		literal_slots = slots_with_row(builder.literal_slots, row, hash, row + 1),
+		literals = builder.literals.append(text)
+	}
+
+
+-- Sources, packages and modules.
+pure func next_source_id(builder: DiscoveryBuilder) -> SourceId:
+	into_opaque SourceId(builder.sources.length())
+
+
+pure func next_line_start_row(builder: DiscoveryBuilder) -> Int:
+	builder.line_starts.length()
+
+
+pure func append_line_start(builder: DiscoveryBuilder, offset: Int) -> DiscoveryBuilder:
+	{ builder | line_starts = builder.line_starts.append(offset) }
+
+
+---
+Appends a source's text and row; its line starts must already be the block
+`row.line_starts` of the line-start table.
+---
+pure func append_source(
+	builder: DiscoveryBuilder,
+	text: String,
+	row: SourceRow,
+) -> DiscoveryBuilder:
+	{ builder |
+		source_texts = builder.source_texts.append(text),
+		sources = builder.sources.append(row)
+	}
+
+
+pure func next_package_id(builder: DiscoveryBuilder) -> PackageId:
+	into_opaque PackageId(builder.packages.length())
+
+
+pure func append_package(builder: DiscoveryBuilder, row: PackageRow) -> DiscoveryBuilder:
+	{ builder | packages = builder.packages.append(row) }
+
+
+pure func next_module_id(builder: DiscoveryBuilder) -> ModuleId:
+	into_opaque ModuleId(builder.modules.length())
+
+
+---
+The module already loaded from `canonical_path`, if any.
+---
+pure func find_module_by_path(
+	builder: DiscoveryBuilder,
+	canonical_path: PathId,
+) -> Option[ModuleId]:
+	match builder.module_ids_by_path.get(path_id_index(canonical_path)):
+		Some(index):
+			Some(into_opaque ModuleId(index))
+		None:
+			None
+
+
+---
+Appends a module row and indexes it by its canonical path. Its ranges are
+replaced by the walker once its parse ends.
+---
+pure func append_module(builder: DiscoveryBuilder, row: ModuleRow) -> DiscoveryBuilder:
+	index: Int = builder.modules.length()
+	path_index: Int = path_id_index(row.canonical_path)
+	{ builder |
+		modules = builder.modules.append(row),
+		module_ids_by_path = builder.module_ids_by_path.set(path_index, index)
+	}
+
+
+---
+Replaces a module's row; the walker appends a module with empty ranges and
+replaces the row with the closed ranges at the end of its parse.
+---
+pure func replace_module_row(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	row: ModuleRow,
+) -> DiscoveryBuilder:
+	index: Int = module_id_index(module)
+	{ builder | modules = builder.modules.set(index, row) }
+
+
+pure func append_module_package(
+	builder: DiscoveryBuilder,
+	row: ModulePackageRow,
+) -> DiscoveryBuilder:
+	{ builder | module_packages = builder.module_packages.append(row) }
+
+
+-- Roots and imports.
+pure func next_root_id(builder: DiscoveryBuilder) -> RootId:
+	into_opaque RootId(builder.roots.length())
+
+
+pure func append_root(builder: DiscoveryBuilder, row: RootRow) -> DiscoveryBuilder:
+	{ builder | roots = builder.roots.append(row) }
+
+
+pure func append_root_target(builder: DiscoveryBuilder, row: RootTargetRow) -> DiscoveryBuilder:
+	{ builder | root_targets = builder.root_targets.append(row) }
+
+
+pure func append_root_diagnostic(
+	builder: DiscoveryBuilder,
+	row: RootDiagnosticRow,
+) -> DiscoveryBuilder:
+	{ builder | root_diagnostics = builder.root_diagnostics.append(row) }
+
+
+pure func next_import_id(builder: DiscoveryBuilder) -> ImportId:
+	into_opaque ImportId(builder.imports.length())
+
+
+pure func append_import(builder: DiscoveryBuilder, row: ImportRow) -> DiscoveryBuilder:
+	{ builder | imports = builder.imports.append(row) }
+
+
+---
+Replaces an import's row; the parser appends an import before its items and
+closes its item range afterwards.
+---
+pure func replace_import_row(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+	row: ImportRow,
+) -> DiscoveryBuilder:
+	index: Int = import_id_index(import_id)
+	{ builder | imports = builder.imports.set(index, row) }
+
+
+pure func next_import_path_part_row(builder: DiscoveryBuilder) -> Int:
+	builder.import_path_parts.length()
+
+
+pure func append_import_path_part(builder: DiscoveryBuilder, part: NameId) -> DiscoveryBuilder:
+	{ builder | import_path_parts = builder.import_path_parts.append(part) }
+
+
+pure func next_import_item_id(builder: DiscoveryBuilder) -> ImportItemId:
+	into_opaque ImportItemId(builder.import_items.length())
+
+
+pure func append_import_item(builder: DiscoveryBuilder, row: ImportItemRow) -> DiscoveryBuilder:
+	{ builder | import_items = builder.import_items.append(row) }
+
+
+pure func replace_import_item_row(
+	builder: DiscoveryBuilder,
+	item: ImportItemId,
+	row: ImportItemRow,
+) -> DiscoveryBuilder:
+	index: Int = import_item_id_index(item)
+	{ builder | import_items = builder.import_items.set(index, row) }
+
+
+pure func next_import_item_variant_row(builder: DiscoveryBuilder) -> Int:
+	builder.import_item_variants.length()
+
+
+pure func append_import_item_variant(
+	builder: DiscoveryBuilder,
+	row: ImportItemVariantRow,
+) -> DiscoveryBuilder:
+	{ builder | import_item_variants = builder.import_item_variants.append(row) }
+
+
+pure func append_import_target(builder: DiscoveryBuilder, row: ImportTargetRow) -> DiscoveryBuilder:
+	{ builder | import_targets = builder.import_targets.append(row) }
+
+
+pure func append_import_alias(builder: DiscoveryBuilder, row: ImportAliasRow) -> DiscoveryBuilder:
+	{ builder | import_aliases = builder.import_aliases.append(row) }
+
+
+pure func append_import_item_alias(
+	builder: DiscoveryBuilder,
+	row: ImportItemAliasRow,
+) -> DiscoveryBuilder:
+	{ builder | import_item_aliases = builder.import_item_aliases.append(row) }
+
+
+-- Declarations.
+---
+The id the next appended definition will receive.
+---
+pure func next_definition_id(builder: DiscoveryBuilder) -> DefinitionId:
+	into_opaque DefinitionId(builder.definitions.length())
+
+
+pure func append_definition(builder: DiscoveryBuilder, row: DefinitionRow) -> DiscoveryBuilder:
+	{ builder | definitions = builder.definitions.append(row) }
+
+
+pure func append_member(builder: DiscoveryBuilder, row: MemberRow) -> DiscoveryBuilder:
+	{ builder | members = builder.members.append(row) }
+
+
+pure func append_type_parameter(
+	builder: DiscoveryBuilder,
+	row: TypeParameterRow,
+) -> DiscoveryBuilder:
+	{ builder | type_parameters = builder.type_parameters.append(row) }
+
+
+pure func append_bound(builder: DiscoveryBuilder, row: BoundRow) -> DiscoveryBuilder:
+	{ builder | bounds = builder.bounds.append(row) }
+
+
+pure func append_foreign_binding(
+	builder: DiscoveryBuilder,
+	row: ForeignBindingRow,
+) -> DiscoveryBuilder:
+	{ builder | foreign_bindings = builder.foreign_bindings.append(row) }
+
+
+pure func append_import_block(builder: DiscoveryBuilder, row: ImportBlockRow) -> DiscoveryBuilder:
+	{ builder | import_blocks = builder.import_blocks.append(row) }
+
+
+---
+Replaces a definition's row; declarations whose span ends after their
+members are appended first and closed afterwards.
+---
+pure func replace_definition_row(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	row: DefinitionRow,
+) -> DiscoveryBuilder:
+	index: Int = definition_id_index(definition)
+	{ builder | definitions = builder.definitions.set(index, row) }
+
+
+pure func append_documentation(
+	builder: DiscoveryBuilder,
+	row: DocumentationRow,
+) -> DiscoveryBuilder:
+	{ builder | documentation = builder.documentation.append(row) }
+
+
+pure func append_annotation(builder: DiscoveryBuilder, row: AnnotationRow) -> DiscoveryBuilder:
+	{ builder | annotations = builder.annotations.append(row) }
+
+
+pure func append_supertrait(builder: DiscoveryBuilder, row: SupertraitRow) -> DiscoveryBuilder:
+	{ builder | supertraits = builder.supertraits.append(row) }
+
+
+pure func append_signature(builder: DiscoveryBuilder, row: SignatureRow) -> DiscoveryBuilder:
+	{ builder | signatures = builder.signatures.append(row) }
+
+
+pure func next_parameter_id(builder: DiscoveryBuilder) -> ParameterId:
+	into_opaque ParameterId(builder.parameters.length())
+
+
+pure func append_parameter(builder: DiscoveryBuilder, row: ParameterRow) -> DiscoveryBuilder:
+	{ builder | parameters = builder.parameters.append(row) }
+
+
+pure func next_binder_name_row(builder: DiscoveryBuilder) -> Int:
+	builder.binder_names.length()
+
+
+pure func append_binder_name(builder: DiscoveryBuilder, row: BinderNameRow) -> DiscoveryBuilder:
+	{ builder | binder_names = builder.binder_names.append(row) }
+
+
+pure func append_parameter_type(
+	builder: DiscoveryBuilder,
+	row: ParameterTypeRow,
+) -> DiscoveryBuilder:
+	{ builder | parameter_types = builder.parameter_types.append(row) }
+
+
+pure func append_definition_type(
+	builder: DiscoveryBuilder,
+	row: DefinitionTypeRow,
+) -> DiscoveryBuilder:
+	{ builder | definition_types = builder.definition_types.append(row) }
+
+
+pure func append_variant_payload(
+	builder: DiscoveryBuilder,
+	row: VariantPayloadRow,
+) -> DiscoveryBuilder:
+	{ builder | variant_payloads = builder.variant_payloads.append(row) }
+
+
+pure func append_dimension_constraint(
+	builder: DiscoveryBuilder,
+	row: DimensionConstraintRow,
+) -> DiscoveryBuilder:
+	{ builder | dimension_constraints = builder.dimension_constraints.append(row) }
+
+
+pure func next_foreign_block_id(builder: DiscoveryBuilder) -> ForeignBlockId:
+	into_opaque ForeignBlockId(builder.foreign_blocks.length())
+
+
+pure func append_foreign_block(builder: DiscoveryBuilder, row: ForeignBlockRow) -> DiscoveryBuilder:
+	{ builder | foreign_blocks = builder.foreign_blocks.append(row) }
+
+
+pure func replace_foreign_block_row(
+	builder: DiscoveryBuilder,
+	block: ForeignBlockId,
+	row: ForeignBlockRow,
+) -> DiscoveryBuilder:
+	index: Int = foreign_block_id_index(block)
+	{ builder | foreign_blocks = builder.foreign_blocks.set(index, row) }
+
+
+pure func append_foreign_argument(
+	builder: DiscoveryBuilder,
+	row: ForeignArgumentRow,
+) -> DiscoveryBuilder:
+	{ builder | foreign_arguments = builder.foreign_arguments.append(row) }
+
+
+pure func append_foreign_c_name(
+	builder: DiscoveryBuilder,
+	row: ForeignCNameRow,
+) -> DiscoveryBuilder:
+	{ builder | foreign_c_names = builder.foreign_c_names.append(row) }
+
+
+pure func append_resource_cleanup(
+	builder: DiscoveryBuilder,
+	row: ResourceCleanupRow,
+) -> DiscoveryBuilder:
+	{ builder | resource_cleanups = builder.resource_cleanups.append(row) }
+
+
+pure func append_resolution_diagnostic(
+	builder: DiscoveryBuilder,
+	row: DiagnosticRow,
+) -> DiscoveryBuilder:
+	{ builder | resolution_diagnostics = builder.resolution_diagnostics.append(row) }
+
+
+pure func append_body(builder: DiscoveryBuilder, row: BodyRow) -> DiscoveryBuilder:
+	{ builder | bodies = builder.bodies.append(row) }
+
+
+-- Body nodes.
+---
+The id the next appended node will receive.
+---
+pure func next_node_id(builder: DiscoveryBuilder) -> NodeId:
+	into_opaque NodeId(builder.nodes.length())
+
+
+pure func append_node(builder: DiscoveryBuilder, row: NodeRow) -> DiscoveryBuilder:
+	{ builder | nodes = builder.nodes.append(row) }
+
+
+---
+The node appended most recently. Parse routines append a construct's root
+node last, so a caller reads the root it just parsed here; it names a real
+node whenever the caller has appended one.
+---
+pure func last_node_id(builder: DiscoveryBuilder) -> NodeId:
+	into_opaque NodeId(builder.nodes.length() - 1)
+
+
+---
+The row of `node`. Parse routines read only nodes they appended, so the
+fallback (an empty missing-expression row) is unreachable.
+---
+pure func node_row_at(builder: DiscoveryBuilder, node: NodeId) -> NodeRow:
+	match builder.nodes.get(node_id_index(node)):
+		Some(row):
+			row
+		None:
+			{
+				kind = MissingExpressionNode,
+				span = pack_span(0, 0, 0),
+				payload = NO_NODE_PAYLOAD,
+				children = {
+					first = 0,
+					count = 0
+				}
+			}
+
+
+---
+Child `position` of `node`, or `None` when the node has fewer children (a
+node in recovery may).
+---
+pure func node_child_at(builder: DiscoveryBuilder, node: NodeId, position: Int) -> Option[NodeId]:
+	row: NodeRow = node_row_at(builder, node)
+
+	if position < row.children.count:
+		builder.node_children.get(row.children.first + position)
+	else:
+		None
+
+
+---
+Removes the node appended last, which must be a leaf no row or stack entry
+references yet: how an identifier that turns out to be the name of a named
+argument (`f(name = value)`) is replaced by the assignment that records the
+name itself.
+---
+pure func discard_last_leaf_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	{ builder | nodes = builder.nodes.drop_last() }
+
+
+---
+Widens the span of the node appended last: how grouping parentheses, which
+add no node, extend the enclosed expression's span to both delimiters.
+---
+pure func replace_last_node_span(builder: DiscoveryBuilder, span: Span) -> DiscoveryBuilder:
+	index: Int = builder.nodes.length() - 1
+	{ builder | nodes = with_node_span(builder.nodes, index, span) }
+
+
+private pure func with_node_span(nodes: List[NodeRow], index: Int, span: Span) -> List[NodeRow]:
+	match nodes.get(index):
+		Some(row):
+			nodes.set(index, { row | span = span })
+		None:
+			nodes
+
+
+---
+Pushes the node appended last onto the child stack (see `push_child`).
+---
+pure func push_last_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	depth: Int = builder.child_stack_depth
+	last: NodeId = into_opaque NodeId(builder.nodes.length() - 1)
+	{ builder |
+		child_stack = stack_with_entry(builder.child_stack, depth, last),
+		child_stack_depth = depth + 1
+	}
+
+
+---
+The table lengths and cursor a speculative parse can roll back to: the node,
+edge and diagnostic tables and the child stack. A speculative parse must not
+intern names or literals; `names` and `literals` are recorded so a debug
+build can check that at rollback.
+---
+struct ParseCheckpoint {
+	token_cursor: Int,
+	nodes: Int,
+	node_children: Int,
+	child_stack_depth: Int,
+	diagnostics: Int,
+	diagnostic_arguments: Int,
+	names: Int,
+	literals: Int
+}
+
+
+pure func parse_checkpoint(builder: DiscoveryBuilder) -> ParseCheckpoint:
+	{
+		token_cursor = builder.token_cursor,
+		nodes = builder.nodes.length(),
+		node_children = builder.node_children.length(),
+		child_stack_depth = builder.child_stack_depth,
+		diagnostics = builder.diagnostics.length(),
+		diagnostic_arguments = builder.diagnostic_arguments.length(),
+		names = builder.name_spellings.length(),
+		literals = builder.literals.length()
+	}
+
+
+---
+Undoes everything a speculative parse appended since `checkpoint`.
+---
+pure func rollback_to(builder: DiscoveryBuilder, checkpoint: ParseCheckpoint) -> DiscoveryBuilder:
+	debug:
+		if (
+			builder.name_spellings.length() != checkpoint.names
+			or builder.literals.length() != checkpoint.literals
+		):
+			dbg.error("a speculative parse interned a name or literal; rollback cannot undo it")
+
+	{ builder |
+		token_cursor = checkpoint.token_cursor,
+		nodes = builder.nodes.take(checkpoint.nodes),
+		node_children = builder.node_children.take(checkpoint.node_children),
+		child_stack_depth = checkpoint.child_stack_depth,
+		diagnostics = builder.diagnostics.take(checkpoint.diagnostics),
+		diagnostic_arguments = builder.diagnostic_arguments.take(checkpoint.diagnostic_arguments)
+	}
+
+
+---
+Where the next block of node children will start.
+---
+pure func next_node_child_row(builder: DiscoveryBuilder) -> Int:
+	builder.node_children.length()
+
+
+pure func append_node_child(builder: DiscoveryBuilder, child: NodeId) -> DiscoveryBuilder:
+	{ builder | node_children = builder.node_children.append(child) }
+
+
+-- Diagnostics.
+pure func next_diagnostic_id(builder: DiscoveryBuilder) -> DiagnosticId:
+	into_opaque DiagnosticId(builder.diagnostics.length())
+
+
+pure func next_diagnostic_argument_row(builder: DiscoveryBuilder) -> Int:
+	builder.diagnostic_arguments.length()
+
+
+pure func append_diagnostic_argument(builder: DiscoveryBuilder, argument: Int) -> DiscoveryBuilder:
+	{ builder | diagnostic_arguments = builder.diagnostic_arguments.append(argument) }
+
+
+pure func append_diagnostic(builder: DiscoveryBuilder, row: DiagnosticRow) -> DiscoveryBuilder:
+	{ builder | diagnostics = builder.diagnostics.append(row) }
+
+
+---
+Appends a diagnostic with no arguments.
+---
+pure func append_plain_diagnostic(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+	span: Span,
+) -> DiscoveryBuilder:
+	arguments_first: Int = builder.diagnostic_arguments.length()
+	append_diagnostic(
+		builder,
+		{
+			code = code,
+			span = span,
+			arguments = {
+				first = arguments_first,
+				count = 0
+			}
+		},
+	)
+
+
+---
+Appends a diagnostic with one integer argument, whose meaning `code` fixes.
+---
+pure func append_diagnostic_with_argument(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+	span: Span,
+	argument: Int,
+) -> DiscoveryBuilder:
+	arguments_first: Int = builder.diagnostic_arguments.length()
+	var out: DiscoveryBuilder = append_diagnostic_argument(builder, argument)
+	out = append_diagnostic(
+		out,
+		{
+			code = code,
+			span = span,
+			arguments = {
+				first = arguments_first,
+				count = 1
+			}
+		},
+	)
+	out
+
+
+-- Transient tables of the module being lexed and parsed.
+---
+`builder` with its transient tables empty: how a module's lexing starts and
+how `freeze` seals the tables.
+---
+pure func without_transient_tables(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	{ builder |
+		tokens = [],
+		token_cursor = 0,
+		pending_docstrings = [],
+		pending_annotations = [],
+		interpolations = [],
+		interpolation_parts = [],
+		interpolation_texts = [],
+		child_stack = [],
+		child_stack_depth = 0
+	}
+
+
+---
+Appends a docstring read before its declaration's row exists.
+---
+pure func append_pending_docstring(builder: DiscoveryBuilder, text: LiteralId) -> DiscoveryBuilder:
+	{ builder | pending_docstrings = builder.pending_docstrings.append(text) }
+
+
+pure func pending_docstring_count(builder: DiscoveryBuilder) -> Int:
+	builder.pending_docstrings.length()
+
+
+---
+The pending docstring at `index`; callers pass an index inside a docstring
+range they read, so the fallback is unreachable.
+---
+pure func pending_docstring_at(builder: DiscoveryBuilder, index: Int) -> LiteralId:
+	match builder.pending_docstrings.get(index):
+		Some(text):
+			text
+		None:
+			into_opaque LiteralId(0)
+
+
+-- Interpolated strings.
+---
+Appends one piece of an interpolated string: a hole's byte range, or a text
+piece with its decoded text (appended to `interpolation_texts` first by
+`append_interpolation_text`).
+---
+pure func append_interpolation_part(
+	builder: DiscoveryBuilder,
+	row: InterpolationPartRow,
+) -> DiscoveryBuilder:
+	{ builder | interpolation_parts = builder.interpolation_parts.append(row) }
+
+
+pure func append_interpolation_text(builder: DiscoveryBuilder, text: LiteralId) -> DiscoveryBuilder:
+	{ builder | interpolation_texts = builder.interpolation_texts.append(text) }
+
+
+---
+Appends the row of an interpolated string whose parts are
+`interpolation_parts` rows `parts`; the token's payload is its index.
+---
+pure func append_interpolation(builder: DiscoveryBuilder, parts: RowRange) -> DiscoveryBuilder:
+	{ builder | interpolations = builder.interpolations.append(parts) }
+
+
+pure func interpolation_parts_of(builder: DiscoveryBuilder, interpolation: Int) -> RowRange:
+	match builder.interpolations.get(interpolation):
+		Some(parts):
+			parts
+		None:
+			EMPTY_ROW_RANGE
+
+
+---
+Interpolation part `index`; callers pass an index inside a parts range, so
+the fallback is unreachable.
+---
+pure func interpolation_part_at(builder: DiscoveryBuilder, index: Int) -> InterpolationPartRow:
+	match builder.interpolation_parts.get(index):
+		Some(row):
+			row
+		None:
+			{
+				part = HolePart,
+				start = 0,
+				end = 0,
+				text = EMPTY_ROW_RANGE
+			}
+
+
+pure func interpolation_text_at(builder: DiscoveryBuilder, index: Int) -> LiteralId:
+	match builder.interpolation_texts.get(index):
+		Some(text):
+			text
+		None:
+			into_opaque LiteralId(0)
+
+
+pure func append_pending_annotation(
+	builder: DiscoveryBuilder,
+	row: PendingAnnotationRow,
+) -> DiscoveryBuilder:
+	{ builder | pending_annotations = builder.pending_annotations.append(row) }
+
+
+pure func pending_annotation_count(builder: DiscoveryBuilder) -> Int:
+	builder.pending_annotations.length()
+
+
+---
+The pending annotation at `index`. Callers pass an index inside a range they
+read from `pending_annotation_count`, so the fallback is unreachable.
+---
+pure func pending_annotation_at(builder: DiscoveryBuilder, index: Int) -> PendingAnnotationRow:
+	match builder.pending_annotations.get(index):
+		Some(row):
+			row
+		None:
+			{
+				annotation = TailRecursiveAnnotation,
+				span = pack_span(0, 0, 0)
+			}
+
+
+---
+Pushes `node` as the next child of the parent node being parsed. A parse
+routine pushes each child's root as it finishes the child, then appends the
+parent with `append_parent_node_from_stack`, which claims them: no list of
+child ids is built per parent. The stack is a list with an explicit depth
+so that popping keeps its storage for the next push.
+---
+pure func push_child(builder: DiscoveryBuilder, node: NodeId) -> DiscoveryBuilder:
+	depth: Int = builder.child_stack_depth
+	{ builder |
+		child_stack = stack_with_entry(builder.child_stack, depth, node),
+		child_stack_depth = depth + 1
+	}
+
+
+private pure func stack_with_entry(stack: List[NodeId], depth: Int, node: NodeId) -> List[NodeId]:
+	if depth < stack.length():
+		stack.set(depth, node)
+	else:
+		stack.append(node)
+
+
+pure func child_stack_depth(builder: DiscoveryBuilder) -> Int:
+	builder.child_stack_depth
+
+
+pure func append_token(builder: DiscoveryBuilder, token: Token) -> DiscoveryBuilder:
+	{ builder | tokens = builder.tokens.append(token) }
+
+
+pure func token_count(builder: DiscoveryBuilder) -> Int:
+	builder.tokens.length()
+
+
+---
+Moves the parser to token `index`: how a routine that first scans ahead
+without consuming (a run of newlines, a skipped body) then consumes the
+scanned tokens in one update.
+---
+pure func move_token_cursor(builder: DiscoveryBuilder, index: Int) -> DiscoveryBuilder:
+	{ builder | token_cursor = index }
+
+
+---
+Moves the parser to the next token.
+---
+pure func advance_token(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	next: Int = builder.token_cursor + 1
+	{ builder | token_cursor = next }
+
+
+---
+Appends a walker diagnostic (an import that loaded no module, a source that
+could not be admitted) with one integer argument, whose meaning `code` fixes.
+---
+pure func append_resolution_diagnostic_with_argument(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+	span: Span,
+	argument: Int,
+) -> DiscoveryBuilder:
+	arguments_first: Int = builder.diagnostic_arguments.length()
+	var out: DiscoveryBuilder = append_diagnostic_argument(builder, argument)
+	out = append_resolution_diagnostic(
+		out,
+		{
+			code = code,
+			span = span,
+			arguments = {
+				first = arguments_first,
+				count = 1
+			}
+		},
+	)
+	out
+
+
+---
+Appends a walker diagnostic with no arguments.
+---
+pure func append_plain_resolution_diagnostic(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+	span: Span,
+) -> DiscoveryBuilder:
+	arguments_first: Int = builder.diagnostic_arguments.length()
+	append_resolution_diagnostic(
+		builder,
+		{
+			code = code,
+			span = span,
+			arguments = {
+				first = arguments_first,
+				count = 0
+			}
+		},
+	)
+
+
+---
+The payload of a node whose kind has none.
+---
+NO_NODE_PAYLOAD: Int = 0
+
+
+---
+Appends `children` as one block of the edge table, then the node over them:
+the post-order write every parent node takes. Read the new node's id first
+with `next_node_id`, or afterwards with `last_node_id`.
+---
+pure func append_parent_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	append_parent_node_with_payload(builder, kind, span, NO_NODE_PAYLOAD, children)
+
+
+---
+`append_parent_node` for a kind whose payload is a name.
+---
+pure func append_named_parent_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	append_parent_node_with_payload(builder, kind, span, name_id_index(name), children)
+
+
+private pure func append_parent_node_with_payload(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	payload: Int,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	first_child: Int = builder.node_children.length()
+	with_children: DiscoveryBuilder = append_node_children(builder, children)
+	append_node(
+		with_children,
+		{
+			kind = kind,
+			span = span,
+			payload = payload,
+			children = {
+				first = first_child,
+				count = children.length()
+			}
+		},
+	)
+
+
+---
+Appends `children` to the edge table in one update of the builder; the loop
+runs over the edge list alone (builder threading rule 1).
+---
+private pure func append_node_children(
+	builder: DiscoveryBuilder,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	{ builder | node_children = with_node_children(builder.node_children, children) }
+
+
+---
+`edges` followed by `children`. The first append is unconditional, as rule 1
+requires of lists too.
+---
+private pure func with_node_children(edges: List[NodeId], children: List[NodeId]) -> List[NodeId]:
+	match children.get(0):
+		Some(first):
+			var out: List[NodeId] = edges.append(first)
+			var index: Int = 1
+
+			while index < children.length():
+				match children.get(index):
+					Some(child):
+						out = out.append(child)
+					None:
+						void
+
+				index += 1
+
+			out
+		None:
+			edges
+
+
+---
+Appends a node over the last `count` children pushed with `push_child`,
+claiming them from the stack: the edges are copied into `node_children` and
+the node row is appended after them in one update each.
+---
+pure func append_parent_node_from_stack(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	count: Int,
+) -> DiscoveryBuilder:
+	append_parent_node_from_stack_with_payload(builder, kind, span, NO_NODE_PAYLOAD, count)
+
+
+---
+`append_parent_node_from_stack` for a kind whose payload is a name.
+---
+pure func append_named_parent_node_from_stack(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+	count: Int,
+) -> DiscoveryBuilder:
+	append_parent_node_from_stack_with_payload(builder, kind, span, name_id_index(name), count)
+
+
+private pure func append_parent_node_from_stack_with_payload(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	payload: Int,
+	count: Int,
+) -> DiscoveryBuilder:
+	first_child: Int = builder.node_children.length()
+	depth: Int = builder.child_stack_depth
+	var out: DiscoveryBuilder = claim_stack_children(builder, depth - count, depth)
+	out = with_child_stack_depth(out, depth - count)
+	out = append_node(
+		out,
+		{
+			kind = kind,
+			span = span,
+			payload = payload,
+			children = {
+				first = first_child,
+				count = count
+			}
+		},
+	)
+	out
+
+
+---
+Copies child stack entries `first_index .. end_index` to the edge table,
+reading each entry into a local before its append (builder threading rule 6).
+---
+private pure func claim_stack_children(
+	builder: DiscoveryBuilder,
+	first_index: Int,
+	end_index: Int,
+) -> DiscoveryBuilder:
+	if first_index >= end_index:
+		builder
+	else:
+		claim_stack_child_run(builder, first_index, end_index)
+
+
+private pure func claim_stack_child_run(
+	builder: DiscoveryBuilder,
+	first_index: Int,
+	end_index: Int,
+) -> DiscoveryBuilder:
+	first: NodeId = stack_entry(builder, first_index)
+	var out: DiscoveryBuilder = append_node_child(builder, first)
+	var index: Int = first_index + 1
+
+	while index < end_index:
+		child: NodeId = stack_entry(out, index)
+		out = append_node_child(out, child)
+		index += 1
+
+	out
+
+
+---
+Child stack entry `index`; callers pass an index below the stack depth, so
+the fallback is unreachable.
+---
+private pure func stack_entry(builder: DiscoveryBuilder, index: Int) -> NodeId:
+	match builder.child_stack.get(index):
+		Some(node):
+			node
+		None:
+			into_opaque NodeId(0)
+
+
+private pure func with_child_stack_depth(builder: DiscoveryBuilder, depth: Int) -> DiscoveryBuilder:
+	{ builder | child_stack_depth = depth }
+
+
+---
+Appends a node with no children.
+---
+pure func append_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+) -> DiscoveryBuilder:
+	append_leaf_node_with_payload(builder, kind, span, NO_NODE_PAYLOAD)
+
+
+---
+A leaf whose payload is a name (see `node_payload_reference`).
+---
+pure func append_name_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+) -> DiscoveryBuilder:
+	append_leaf_node_with_payload(builder, kind, span, name_id_index(name))
+
+
+---
+A leaf whose payload is a literal.
+---
+pure func append_literal_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	literal: LiteralId,
+) -> DiscoveryBuilder:
+	append_leaf_node_with_payload(builder, kind, span, literal_id_index(literal))
+
+
+---
+A leaf whose payload is a character's codepoint.
+---
+pure func append_codepoint_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	codepoint: Int,
+) -> DiscoveryBuilder:
+	append_leaf_node_with_payload(builder, kind, span, codepoint)
+
+
+---
+A leaf whose payload is a definition.
+---
+pure func append_definition_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	definition: DefinitionId,
+) -> DiscoveryBuilder:
+	append_leaf_node_with_payload(builder, kind, span, definition_id_index(definition))
+
+
+private pure func append_leaf_node_with_payload(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	payload: Int,
+) -> DiscoveryBuilder:
+	first_child: Int = builder.node_children.length()
+	append_node(
+		builder,
+		{
+			kind = kind,
+			span = span,
+			payload = payload,
+			children = {
+				first = first_child,
+				count = 0
+			}
+		},
+	)

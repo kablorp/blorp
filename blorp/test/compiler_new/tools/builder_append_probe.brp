@@ -1,0 +1,592 @@
+-- Copy-on-write probe for the discovery builder.
+--
+-- Appends rows to the definitions, nodes, node_children and name tables
+-- through the builder API in one of several calling shapes, then reads every
+-- row back by index. Run each shape as its own process under
+-- `bin/blorp run --memory-diagnostics` and compare allocation counts across
+-- row counts: list growth alone is logarithmic in the row count, and any
+-- per-append copy of a table shows up as allocations (and copied bytes)
+-- linear in it.
+--
+-- Usage: builder_append_probe.brp <shape> <rows>
+--
+-- Shapes:
+-- 	baseline      build the name spellings only, append nothing
+-- 	loop          one `var builder`, appended from a loop
+-- 	helpers       helpers that take and return the builder, called from a loop
+-- 	chains        recursive helpers, each frame appending then recursing
+-- 	tree          post-order binary tree of nodes, the parser's shape
+-- 	reads         the loop shape, then an indexed read of every row
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DefinitionId,
+		DiscoveryBuilder,
+		EMPTY_ROW_RANGE,
+		ModuleId,
+		NameId,
+		NodeId,
+		PathId,
+		SourceId,
+		append_body,
+		append_definition,
+		append_module,
+		append_name,
+		append_node,
+		append_node_child,
+		append_path,
+		append_source,
+		definition_id_at_row,
+		definition_id_index,
+		empty_discovery_builder,
+		find_name_id,
+		last_node_id,
+		module_id_at_row,
+		name_id_at_row,
+		name_id_index,
+		next_definition_id,
+		next_module_id,
+		next_name_id,
+		next_node_child_row,
+		next_node_id,
+		next_path_id,
+		next_source_id,
+		node_id_at_row,
+		node_id_index,
+		replace_module_row,
+	../../../src/compiler_new/stage_01_discovery/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
+		definition_count,
+		definition_row,
+		freeze,
+		name_count,
+		name_spelling,
+		node_child,
+		node_count,
+		node_row,
+	../../../src/compiler_new/stage_01_discovery/row_kinds:
+		DefinitionKind(FunctionDefinition),
+		ModuleOriginKind(UserModule),
+		ModuleReach(RootModule),
+		NodeKind(CallNode, IdentifierNode),
+		Visibility(PublicVisibility),
+	../../../src/compiler_new/stage_01_discovery/span: Span, pack_span, span_start
+	memory: MemStats, get_mem_stats, mem_delta
+
+
+---
+Frames per recursive chain in the `chains` shape: deep enough to cross many
+stack frames, shallow enough to stay far from the fiber stack limit.
+---
+CHAIN_DEPTH: Int = 1000
+
+---
+Children per internal node in the `tree` shape.
+---
+TREE_FANOUT: Int = 2
+
+
+---
+A distinct span per row, so rows are not all equal.
+---
+pure func probe_span(index: Int) -> Span:
+	pack_span(0, index % PROBE_SPAN_PERIOD, index % PROBE_SPAN_PERIOD)
+
+
+---
+Offsets the probe's spans cycle through; any value inside the span limits.
+---
+PROBE_SPAN_PERIOD: Int = 4096
+
+
+pure func probe_spelling(index: Int) -> String:
+	"name_${index}"
+
+
+---
+Appends one row to each of the four tables, reading every id before its
+append.
+---
+pure func append_one_of_each(builder: DiscoveryBuilder, index: Int) -> DiscoveryBuilder:
+	spelling: String = probe_spelling(index)
+	name: NameId = next_name_id(builder)
+	-- Interned by a helper so this routine's first update of the builder is
+	-- unconditional: a routine that aliases its builder and first updates it
+	-- under an `if` copies it and every table it then appends to.
+	var out: DiscoveryBuilder = with_probe_name(builder, spelling)
+	definition: DefinitionId = next_definition_id(out)
+	out = append_definition(
+		out,
+		{
+			module = module_id_at_row(0),
+			kind = FunctionDefinition,
+			name = name,
+			name_span = probe_span(0),
+			visibility = PublicVisibility,
+			span = probe_span(definition_id_index(definition))
+		},
+	)
+	node: NodeId = next_node_id(out)
+	out = append_node(
+		out,
+		{
+			kind = IdentifierNode,
+			span = probe_span(index),
+			payload = name_id_index(name),
+			children = {
+				first = 0,
+				count = 0
+			}
+		},
+	)
+	out = append_node_child(out, node)
+	out
+
+
+pure func with_probe_name(builder: DiscoveryBuilder, spelling: String) -> DiscoveryBuilder:
+	if find_name_id(builder, spelling).is_some():
+		builder
+	else:
+		append_name(builder, spelling)
+
+
+pure func append_by_loop(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+
+	for index in 0..rows:
+		spelling: String = probe_spelling(index)
+		name: NameId = next_name_id(builder)
+
+		if find_name_id(builder, spelling).is_none():
+			builder = append_name(builder, spelling)
+
+		definition: DefinitionId = next_definition_id(builder)
+		builder = append_definition(
+			builder,
+			{
+				module = module_id_at_row(0),
+				kind = FunctionDefinition,
+				name = name,
+				name_span = probe_span(0),
+				visibility = PublicVisibility,
+				span = probe_span(definition_id_index(definition))
+			},
+		)
+		node: NodeId = next_node_id(builder)
+		builder = append_node(
+			builder,
+			{
+				kind = IdentifierNode,
+				span = probe_span(index),
+				payload = name_id_index(name),
+				children = {
+					first = 0,
+					count = 0
+				}
+			},
+		)
+		builder = append_node_child(builder, node)
+
+	builder
+
+
+pure func append_definitions_only(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+
+	for index in 0..rows:
+		definition: DefinitionId = next_definition_id(builder)
+		builder = append_definition(
+			builder,
+			{
+				module = module_id_at_row(0),
+				kind = FunctionDefinition,
+				name = name_id_at_row(0),
+				name_span = probe_span(0),
+				visibility = PublicVisibility,
+				span = probe_span(definition_id_index(definition))
+			},
+		)
+
+	builder
+
+
+pure func append_nodes_only(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+
+	for index in 0..rows:
+		builder = append_node(
+			builder,
+			{
+				kind = IdentifierNode,
+				span = probe_span(index),
+				payload = index,
+				children = {
+					first = 0,
+					count = 0
+				}
+			},
+		)
+
+	builder
+
+
+pure func append_node_children_only(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+
+	for index in 0..rows:
+		builder = append_node_child(builder, node_id_at_row(index))
+
+	builder
+
+
+pure func append_names_only(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+
+	for index in 0..rows:
+		spelling: String = probe_spelling(index)
+
+		if find_name_id(builder, spelling).is_none():
+			builder = append_name(builder, spelling)
+
+	builder
+
+
+---
+One module whose definitions each own a body node whose child is the
+previous node: every table the invariants check has one row per row count,
+and every invariant holds.
+---
+pure func append_chained_nodes_in_one_module(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	module: ModuleId = next_module_id(builder)
+	path: PathId = next_path_id(builder)
+	source: SourceId = next_source_id(builder)
+	builder = append_path(builder, "probe.brp")
+	builder = append_source(
+		builder,
+		"",
+		{
+			path = path,
+			line_starts = EMPTY_ROW_RANGE
+		},
+	)
+	builder = append_module(
+		builder,
+		{
+			source = source,
+			canonical_path = path,
+			origin = UserModule,
+			reach = RootModule,
+			definitions = EMPTY_ROW_RANGE,
+			imports = EMPTY_ROW_RANGE,
+			nodes = EMPTY_ROW_RANGE,
+			diagnostics = EMPTY_ROW_RANGE
+		},
+	)
+
+	for index in 0..rows:
+		definition: DefinitionId = next_definition_id(builder)
+		builder = append_definition(
+			builder,
+			{
+				module = module,
+				kind = FunctionDefinition,
+				name = name_id_at_row(0),
+				name_span = probe_span(0),
+				visibility = PublicVisibility,
+				span = probe_span(index)
+			},
+		)
+		first_child: Int = next_node_child_row(builder)
+		child_count: Int = min(index, 1)
+
+		if index > 0:
+			builder = append_node_child(builder, node_id_at_row(index - 1))
+
+		node: NodeId = next_node_id(builder)
+		builder = append_node(
+			builder,
+			{
+				kind = CallNode,
+				span = probe_span(index),
+				payload = 0,
+				children = {
+					first = first_child,
+					count = child_count
+				}
+			},
+		)
+		builder = append_body(
+			builder,
+			{
+				definition = definition,
+				root = node
+			},
+		)
+
+	definition_total: Int = builder.definitions.length()
+	node_total: Int = builder.nodes.length()
+	builder = replace_module_row(
+		builder,
+		module,
+		{
+			source = source,
+			canonical_path = path,
+			origin = UserModule,
+			reach = RootModule,
+			definitions = {
+				first = 0,
+				count = definition_total
+			},
+			imports = EMPTY_ROW_RANGE,
+			nodes = {
+				first = 0,
+				count = node_total
+			},
+			diagnostics = EMPTY_ROW_RANGE
+		},
+	)
+	builder
+
+
+pure func append_by_helpers(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+
+	for index in 0..rows:
+		builder = append_one_of_each(builder, index)
+
+	builder
+
+
+---
+Appends `remaining` rows of each table, one per frame, recursing after the
+append so every frame hands a freshly updated builder to the next.
+---
+pure func append_chain(builder: DiscoveryBuilder, start: Int, remaining: Int) -> DiscoveryBuilder:
+	if remaining <= 0:
+		builder
+	else:
+		var out: DiscoveryBuilder = append_one_of_each(builder, start)
+		out = append_chain(out, start + 1, remaining - 1)
+		out
+
+
+pure func append_by_chains(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	var start: Int = 0
+
+	while start < rows:
+		remaining: Int = rows - start
+		frames: Int = min(remaining, CHAIN_DEPTH)
+		builder = append_chain(builder, start, frames)
+		start += frames
+
+	builder
+
+
+---
+Appends a complete binary subtree of `depth` levels post-order, the way the
+parser appends an expression: children first, then their ids as one block of
+`node_children`, then the parent node pointing at that block. The subtree's
+root is the last node appended.
+---
+pure func append_subtree(builder: DiscoveryBuilder, depth: Int) -> DiscoveryBuilder:
+	if depth <= 0:
+		leaf: NodeId = next_node_id(builder)
+		append_node(
+			builder,
+			{
+				kind = IdentifierNode,
+				span = probe_span(node_id_index(leaf)),
+				payload = 0,
+				children = {
+					first = 0,
+					count = 0
+				}
+			},
+		)
+	else:
+		var out: DiscoveryBuilder = append_subtree(builder, depth - 1)
+		left: NodeId = last_node_id(out)
+		out = append_subtree(out, depth - 1)
+		right: NodeId = last_node_id(out)
+		first_child: Int = next_node_child_row(out)
+		out = append_node_child(out, left)
+		out = append_node_child(out, right)
+		out = append_node(
+			out,
+			{
+				kind = CallNode,
+				span = probe_span(depth),
+				payload = 0,
+				children = {
+					first = first_child,
+					count = TREE_FANOUT
+				}
+			},
+		)
+		out
+
+
+pure func tree_depth_for_rows(rows: Int) -> Int:
+	var depth: Int = 0
+	var size: Int = 1
+
+	while size * TREE_FANOUT < rows:
+		size *= TREE_FANOUT
+		depth += 1
+
+	depth
+
+
+pure func append_by_tree(rows: Int) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	builder = append_subtree(builder, tree_depth_for_rows(rows))
+	builder
+
+
+---
+Reads every row of every table by index and folds the fields into one
+number, so the reads cannot be optimized away.
+---
+pure func read_every_row(tables: FrontendTables) -> Int:
+	var checksum: Int = 0
+
+	for index in 0..definition_count(tables):
+		checksum += span_start(definition_row(tables, definition_id_at_row(index)).span)
+
+	for index in 0..node_count(tables):
+		node: NodeId = node_id_at_row(index)
+		checksum += node_row(tables, node).payload
+
+		if node_row(tables, node).children.count > 0:
+			match node_child(tables, node, 0):
+				Some(child):
+					checksum += node_id_index(child)
+				None:
+					void
+
+	for index in 0..name_count(tables):
+		checksum += name_spelling(tables, name_id_at_row(index)).length()
+
+	checksum
+
+
+pure func build_spellings_only(rows: Int) -> Int:
+	var total_length: Int = 0
+
+	for index in 0..rows:
+		total_length += probe_spelling(index).length()
+
+	total_length
+
+
+pure func table_summary(builder: DiscoveryBuilder) -> String:
+	"definitions=${builder.definitions.length()} nodes=${builder.nodes.length()} node_children=${builder.node_children.length()} names=${builder.name_spellings.length()}"
+
+
+---
+One phase's counter deltas on one line: managed allocations and releases,
+raw buffer events (list storage lives in raw buffers), and bytes.
+---
+pure func phase_report(phase: String, before: MemStats, after: MemStats) -> String:
+	delta: MemStats = mem_delta(before, after)
+	"${phase}: allocations=${delta.total_allocations} releases=${delta.total_releases} live=${delta.current_objects} raw_malloc=${delta.raw_buffer_malloc_events} raw_calloc=${delta.raw_buffer_calloc_events} raw_realloc=${delta.raw_buffer_realloc_events} backing_malloc=${delta.backing_libc_malloc_events} counters_active=${delta.memory_stats_active} oracle_active=${delta.oracle_stats_active}"
+
+
+---
+Positions of the probe's command-line arguments; position 0 is the program.
+---
+SHAPE_ARGUMENT: Int = 1
+
+ROWS_ARGUMENT: Int = 2
+
+EXIT_USAGE: Int = 2
+
+
+pure func argument_or_empty(args: List[String], position: Int) -> String:
+	match args.get(position):
+		Some(argument):
+			argument
+		None:
+			""
+
+
+pure func build_by_shape(shape: String, rows: Int) -> Option[DiscoveryBuilder]:
+	match shape:
+		"loop":
+			Some(append_by_loop(rows))
+		"reads":
+			Some(append_by_loop(rows))
+		"freeze":
+			Some(append_chained_nodes_in_one_module(rows))
+		"helpers":
+			Some(append_by_helpers(rows))
+		"definitions":
+			Some(append_definitions_only(rows))
+		"nodes":
+			Some(append_nodes_only(rows))
+		"children":
+			Some(append_node_children_only(rows))
+		"names":
+			Some(append_names_only(rows))
+		"chains":
+			Some(append_by_chains(rows))
+		"tree":
+			Some(append_by_tree(rows))
+		_:
+			None
+
+
+func main(args: List[String]) -> Int:
+	shape: String = argument_or_empty(args, SHAPE_ARGUMENT)
+	rows: Int = argument_or_empty(args, ROWS_ARGUMENT)
+		.parse_int()
+		.get_or(0)
+
+	if shape == "baseline":
+		before_spellings: MemStats = get_mem_stats()
+		spelling_bytes: Int = build_spellings_only(rows)
+		after_spellings: MemStats = get_mem_stats()
+		print("baseline rows=${rows} spelling_bytes=${spelling_bytes}")
+		print(phase_report("spellings", before_spellings, after_spellings))
+		0
+	else:
+		before_build: MemStats = get_mem_stats()
+		built: Option[DiscoveryBuilder] = build_by_shape(shape, rows)
+		after_build: MemStats = get_mem_stats()
+
+		match built:
+			Some(builder):
+				print("${shape} rows=${rows} ${table_summary(builder)}")
+				print(phase_report("append", before_build, after_build))
+
+				if shape == "freeze":
+					before_freeze: MemStats = get_mem_stats()
+					outcome: FreezeOutcome = freeze(builder)
+					after_freeze: MemStats = get_mem_stats()
+
+					match outcome:
+						FrozenTables(_):
+							print("frozen with invariants checked")
+						TableInvariantsViolated(violations):
+							print("unexpected invariant violations: ${violations.length()}")
+
+					print(phase_report("freeze", before_freeze, after_freeze))
+				else if shape == "reads":
+					match freeze(builder):
+						FrozenTables(tables):
+							before_reads: MemStats = get_mem_stats()
+							checksum: Int = read_every_row(tables)
+							after_reads: MemStats = get_mem_stats()
+							print("checksum=${checksum}")
+							print(phase_report("reads", before_reads, after_reads))
+						TableInvariantsViolated(violations):
+							print("unexpected invariant violations: ${violations.length()}")
+
+				0
+			None:
+				print(
+					"usage: builder_append_probe.brp <baseline|loop|helpers|chains|tree|reads> <rows>",
+				)
+				EXIT_USAGE

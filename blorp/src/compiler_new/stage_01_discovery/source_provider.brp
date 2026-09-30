@@ -1,0 +1,222 @@
+-- Where discovery's source texts come from.
+--
+-- Reading sources is discovery's only effect, and it sits behind
+-- `SourceProvider`, which answers two questions about a path: does a source
+-- exist there, and what is its text. Everything else, including the order in
+-- which an import request's candidate paths are tried, is the pure lookup
+-- policy below, shared by every provider, so an editor serving unsaved
+-- buffers resolves exactly like a build.
+--
+-- Providers here: the file system, and an in-memory map for tests and
+-- overlays. The embedded standard library plugs in as a provider that
+-- answers for paths under the standard-library root from the compiler's
+-- embedded texts (and delegates everything else); the package catalog plugs
+-- in by supplying `native_package_roots` and, for source packages, candidate
+-- rules added to `import_candidates`. The walker never changes for either.
+import:
+	path: dirname, join, normalize
+	row_kinds:
+		ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest),
+		ModuleOriginKind(PackageModule, StdlibModule, UserModule),
+	system: file_exists, read_file
+
+
+---
+The file extension of a Blorp source; an import request names a module
+without it.
+---
+SOURCE_FILE_EXTENSION: String = ".brp"
+
+
+---
+The text a provider read, or that it could not read a source it reported
+as existing.
+---
+union SourceRead:
+	SourceText(String)
+	SourceUnreadable
+
+
+trait SourceProvider:
+	func source_exists(self: Self, path: String) -> Bool
+	func read_source(self: Self, path: String) -> SourceRead
+
+
+---
+The directories the lookup policy searches.
+---
+record SourceLookupRoots {
+	standard_library_root: String,
+	native_package_roots: List[String]
+}
+
+
+---
+A module's package, when it has one; its name is the package's first path
+part.
+---
+union PackageMembership:
+	InNativePackage(String)
+	NotInPackage
+
+
+---
+The module an import request comes from: its canonical path, origin and
+package decide where the request may resolve.
+---
+record ImportRequester {
+	canonical_path: String,
+	origin: ModuleOriginKind,
+	package: PackageMembership
+}
+
+
+---
+An import request in structured form: its syntax kind, the text written,
+and its path parts (without `./` and `../` prefixes).
+---
+record ImportRequest {
+	kind: ImportRequestKind,
+	text: String,
+	parts: List[String],
+	requester: ImportRequester
+}
+
+
+---
+A path an import request may resolve to, with the origin and package the
+module there would have.
+---
+record SourceCandidate {
+	path: String,
+	origin: ModuleOriginKind,
+	package: PackageMembership
+}
+
+
+private pure func module_file(module_path: String) -> String:
+	module_path + SOURCE_FILE_EXTENSION
+
+
+private pure func standard_library_candidate(
+	roots: SourceLookupRoots,
+	module_path: String,
+) -> SourceCandidate:
+	{
+		path = normalize(join(roots.standard_library_root, module_file(module_path))),
+		origin = StdlibModule,
+		package = NotInPackage
+	}
+
+
+---
+Candidate paths for `request`, in the order they are tried; the first that
+exists wins. The order is language behavior:
+
+- a native package request (`pkg/<package>/...`) resolves under each native
+  package root, and only from user modules;
+- a relative request resolves beside its importer and keeps the importer's
+  origin and package;
+- a bare request from a standard-library module resolves only in the
+  standard library; from a package module in the standard library; from a
+  user module in the standard library first, then beside the importer.
+---
+pure func import_candidates(
+	roots: SourceLookupRoots,
+	request: ImportRequest,
+) -> List[SourceCandidate]:
+	importer_directory: String = dirname(request.requester.canonical_path)
+
+	match request.kind:
+		NativePackageRequest:
+			match request.requester.origin:
+				UserModule:
+					package_parts: List[String] = request.parts.drop(1)
+					package_name: String = package_parts
+						.get(0)
+						.get_or("")
+					package_path: String = module_file(package_parts.join("/"))
+					roots.native_package_roots.map(pure func(root): {
+							path = normalize(join(root, package_path)),
+							origin = PackageModule,
+							package = InNativePackage(package_name)
+						})
+				_:
+					[]
+		RelativeModuleRequest:
+			[
+				{
+					path = normalize(join(importer_directory, module_file(request.text))),
+					origin = request.requester.origin,
+					package = request.requester.package
+				},
+			]
+		BareModuleRequest:
+			module_path: String = request.parts.join("/")
+
+			match request.requester.origin:
+				UserModule:
+					[
+						standard_library_candidate(roots, module_path),
+						{
+							path = normalize(join(importer_directory, module_file(module_path))),
+							origin = UserModule,
+							package = NotInPackage
+						},
+					]
+				_:
+					[standard_library_candidate(roots, module_path)]
+
+
+---
+The candidate for a root: the path as given, normalized, as a user module.
+---
+pure func root_candidate(root_path: String) -> SourceCandidate:
+	{
+		path = normalize(root_path),
+		origin = UserModule,
+		package = NotInPackage
+	}
+
+
+---
+Sources on the file system, with paths relative to the working directory.
+---
+record FileSystemSourceProvider {
+	description: String
+}
+
+
+FILE_SYSTEM_SOURCE_PROVIDER: FileSystemSourceProvider = {description = "file system"}
+
+
+implements SourceProvider for FileSystemSourceProvider:
+	func source_exists(self: FileSystemSourceProvider, path: String) -> Bool:
+		file_exists(path)
+
+	func read_source(self: FileSystemSourceProvider, path: String) -> SourceRead:
+		match read_file(path):
+			Ok(text):
+				SourceText(text)
+			Err(_):
+				SourceUnreadable
+
+
+---
+Sources held in memory, keyed by path: for tests and editor overlays.
+---
+record InMemorySourceProvider {
+	sources: Dict[String, String]
+}
+
+
+implements SourceProvider for InMemorySourceProvider:
+	func source_exists(self: InMemorySourceProvider, path: String) -> Bool:
+		self.sources.contains(path)
+
+	func read_source(self: InMemorySourceProvider, path: String) -> SourceRead:
+		match self.sources.get(path):
+			Some(text):
+				SourceText(text)
+			None:
+				SourceUnreadable

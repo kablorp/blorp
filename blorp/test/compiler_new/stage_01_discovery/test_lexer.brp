@@ -1,0 +1,277 @@
+-- Lexer tests. The `.tokens` fixtures were produced by the existing
+-- compiler's lexer on the same `.brp` inputs (rendered in the discovery dump
+-- format, with its `#` and name pair written as the one `DimensionNameToken`
+-- the new lexer emits, and an interpolated string written as the text pieces
+-- and holes the existing compiler's interpolation splitter makes of it), so
+-- each fixture test pins token-for-token parity with it; the `.diagnostics`
+-- fixture pins the codes and spans of the new diagnostic rows,
+-- in the order the existing lexer reports the same problems.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiscoveryBuilder,
+		SourceId,
+		empty_discovery_builder,
+		find_name_id,
+		name_id_index,
+		next_source_id,
+	../../../src/compiler_new/stage_01_discovery/discovery_diagnostic_code:
+		DiscoveryDiagnosticCode(UnknownEscapeDiagnostic),
+	../../../src/compiler_new/stage_01_discovery/lexer: lex_source
+	../../../src/compiler_new/stage_01_discovery/name_vocabulary:
+		ALL_SEEDED_NAME_SPELLINGS,
+		SEEDED_NAME_SPELLINGS,
+	../../../src/compiler_new/stage_01_discovery/source_admission: admit_source
+	../../../src/compiler_new/stage_01_discovery/token:
+		FIRST_KEYWORD_NAME_INDEX,
+		KEYWORD_KINDS_IN_SEEDED_ORDER,
+		TokenKind(DimensionNameToken, EndOfFileToken, HashSymbol, IdentifierToken),
+		fixed_token_spelling,
+	../support/token_dump: diagnostic_dump, token_dump
+	system: read_file
+	test: TestSuite
+
+
+FIXTURE_DIRECTORY: String = "blorp/test/compiler_new/stage_01_discovery/fixtures/lexer/"
+
+
+---
+A builder holding one admitted source, lexed.
+---
+pure func lexed(path: String, text: String) -> DiscoveryBuilder:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	source: SourceId = next_source_id(builder)
+	builder = admit_source(builder, path, text)
+	builder = lex_source(builder, source)
+	builder
+
+
+func fixture_text(name: String) -> String:
+	match read_file(FIXTURE_DIRECTORY + name):
+		Ok(text):
+			text
+		Err(_):
+			"missing fixture ${name}"
+
+
+---
+Whether lexing fixture `stem.brp` reproduces `stem.tokens` exactly, and its
+diagnostics are `stem.diagnostics` (none when that file is absent).
+---
+func matches_fixture(stem: String) -> Bool:
+	builder: DiscoveryBuilder = lexed(stem + ".brp", fixture_text(stem + ".brp"))
+	expected_tokens: String = fixture_text(stem + ".tokens").trim_right()
+
+	expected_diagnostics: String = match read_file(FIXTURE_DIRECTORY + stem + ".diagnostics"):
+		Ok(text):
+			text.trim_right()
+		Err(_):
+			""
+
+	tokens_match: Bool = token_dump(builder) == expected_tokens
+	diagnostics_match: Bool = diagnostic_dump(builder, 0) == expected_diagnostics
+
+	if not tokens_match:
+		print("token dump for ${stem}:\n${token_dump(builder)}")
+
+	if not diagnostics_match:
+		print("diagnostics for ${stem}:\n${diagnostic_dump(builder, 0)}")
+
+	tokens_match and diagnostics_match
+
+
+func test_indentation_and_comments_match_the_existing_lexer() -> Bool:
+	matches_fixture("indentation")
+
+
+func test_lambda_bodies_inside_brackets_match_the_existing_lexer() -> Bool:
+	matches_fixture("lambda_bodies")
+
+
+func test_strings_escapes_and_interpolation_match_the_existing_lexer() -> Bool:
+	matches_fixture("strings")
+
+
+func test_pipe_strings_match_the_existing_lexer() -> Bool:
+	matches_fixture("pipe_strings")
+
+
+func test_numbers_and_symbols_match_the_existing_lexer() -> Bool:
+	matches_fixture("numbers_and_symbols")
+
+
+func test_docstrings_match_the_existing_lexer() -> Bool:
+	matches_fixture("docstrings")
+
+
+func test_dimension_names_match_the_existing_lexer() -> Bool:
+	matches_fixture("dimensions")
+
+
+func test_char_literals_match_the_existing_lexer() -> Bool:
+	matches_fixture("char_literals")
+
+
+func test_malformed_input_is_reported_as_coded_rows() -> Bool:
+	matches_fixture("errors")
+
+
+pure func test_keyword_kinds_follow_the_seeded_vocabulary() -> Bool:
+	var aligned: Bool = True
+	var position: Int = 0
+
+	for kind in KEYWORD_KINDS_IN_SEEDED_ORDER:
+		seeded: String = SEEDED_NAME_SPELLINGS
+			.get(FIRST_KEYWORD_NAME_INDEX + position)
+			.get_or("")
+
+		if fixed_token_spelling(kind) != Some(seeded):
+			aligned = False
+
+		position += 1
+
+	aligned
+
+
+pure func test_name_directly_after_hash_is_one_dimension_token() -> Bool:
+	builder: DiscoveryBuilder = lexed("dims.brp", "x: Float[#Rows]\n")
+	rows_is_a_name: Bool = find_name_id(builder, "Rows").is_some()
+	no_hash_spelling: Bool = find_name_id(builder, "#Rows").is_none()
+	one_dimension_token: Bool = builder.tokens.any(
+		pure func(token): token.kind == DimensionNameToken,
+	)
+	no_hash_symbol: Bool = builder.tokens.all(pure func(token): token.kind != HashSymbol)
+	rows_is_a_name and no_hash_spelling and one_dimension_token and no_hash_symbol
+
+
+pure func test_hash_before_blank_digit_or_line_end_stays_a_symbol() -> Bool:
+	builder: DiscoveryBuilder = lexed("hashes.brp", "a = # N\nb = #5\nc = #\n")
+	hash_count: Int = builder.tokens.count(pure func(token): token.kind == HashSymbol)
+	hash_count == 3 and builder.tokens.all(pure func(token): token.kind != DimensionNameToken)
+
+
+func test_hash_forms_match_the_existing_lexer() -> Bool:
+	matches_fixture("hash_forms")
+
+
+pure func test_keyword_spelling_is_not_an_identifier() -> Bool:
+	builder: DiscoveryBuilder = lexed("keyword.brp", "match")
+	(
+		builder.tokens.length() == 2
+		and builder.tokens.all(pure func(token): token.kind != IdentifierToken)
+	)
+
+
+pure func test_seeded_name_is_reused_not_appended() -> Bool:
+	builder: DiscoveryBuilder = lexed("seeded.brp", "main")
+	names_before: Int = ALL_SEEDED_NAME_SPELLINGS.length()
+
+	match builder.tokens.get(0):
+		Some(token):
+			(
+				token.kind == IdentifierToken
+				and Some(token.payload) == SEEDED_NAME_SPELLINGS.index_of("main")
+				and builder.name_spellings.length() == names_before
+			)
+		None:
+			False
+
+
+pure func test_lexing_a_second_source_replaces_the_tokens_and_shares_names() -> Bool:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	first: SourceId = next_source_id(builder)
+	builder = admit_source(builder, "first.brp", "alpha beta\n")
+	builder = lex_source(builder, first)
+
+	alpha_id: Int = match find_name_id(builder, "alpha"):
+		Some(id):
+			name_id_index(id)
+		None:
+			-1
+
+	second: SourceId = next_source_id(builder)
+	builder = admit_source(builder, "second.brp", "alpha")
+	builder = lex_source(builder, second)
+
+	match builder.tokens.get(0):
+		Some(token):
+			builder.tokens.length() == 2 and token.payload == alpha_id
+		None:
+			False
+
+
+pure func test_empty_source_lexes_to_end_of_file_only() -> Bool:
+	builder: DiscoveryBuilder = lexed("empty.brp", "")
+
+	match builder.tokens.get(0):
+		Some(token):
+			builder.tokens.length() == 1 and token.kind == EndOfFileToken
+		None:
+			False
+
+
+pure func test_unknown_escape_records_the_escaped_byte() -> Bool:
+	builder: DiscoveryBuilder = lexed("escape.brp", "\"a\\qb\"")
+
+	match builder.diagnostics.get(0):
+		Some(diagnostic):
+			(
+				diagnostic.code == UnknownEscapeDiagnostic
+				and diagnostic.arguments.count == 1
+				and builder.diagnostic_arguments.get(
+					diagnostic.arguments.first,
+				) == Some(to_int('q'))
+			)
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Discovery lexer",
+	tests = [
+		(
+			"indentation and comments match the existing lexer",
+			test_indentation_and_comments_match_the_existing_lexer,
+		),
+		(
+			"lambda bodies inside brackets match the existing lexer",
+			test_lambda_bodies_inside_brackets_match_the_existing_lexer,
+		),
+		(
+			"strings, escapes and interpolation match the existing lexer",
+			test_strings_escapes_and_interpolation_match_the_existing_lexer,
+		),
+		("pipe strings match the existing lexer", test_pipe_strings_match_the_existing_lexer),
+		(
+			"numbers and symbols match the existing lexer",
+			test_numbers_and_symbols_match_the_existing_lexer,
+		),
+		("docstrings match the existing lexer", test_docstrings_match_the_existing_lexer),
+		("dimension names match the existing lexer", test_dimension_names_match_the_existing_lexer),
+		("char literals match the existing lexer", test_char_literals_match_the_existing_lexer),
+		(
+			"malformed input is reported as coded rows",
+			test_malformed_input_is_reported_as_coded_rows,
+		),
+		(
+			"keyword kinds follow the seeded vocabulary",
+			test_keyword_kinds_follow_the_seeded_vocabulary,
+		),
+		(
+			"name directly after hash is one dimension token",
+			test_name_directly_after_hash_is_one_dimension_token,
+		),
+		(
+			"hash before blank, digit or line end stays a symbol",
+			test_hash_before_blank_digit_or_line_end_stays_a_symbol,
+		),
+		("hash forms match the existing lexer", test_hash_forms_match_the_existing_lexer),
+		("keyword spelling is not an identifier", test_keyword_spelling_is_not_an_identifier),
+		("seeded name is reused, not appended", test_seeded_name_is_reused_not_appended),
+		(
+			"lexing a second source replaces the tokens and shares names",
+			test_lexing_a_second_source_replaces_the_tokens_and_shares_names,
+		),
+		("empty source lexes to end of file only", test_empty_source_lexes_to_end_of_file_only),
+		("unknown escape records the escaped byte", test_unknown_escape_records_the_escaped_byte),
+	]
+}

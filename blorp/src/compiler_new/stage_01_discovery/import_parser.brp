@@ -1,0 +1,615 @@
+-- Import blocks, parsed into import, path part, item, variant and alias
+-- rows.
+import:
+	discovery_builder:
+		DiscoveryBuilder,
+		EMPTY_ROW_RANGE,
+		ImportId,
+		ImportItemId,
+		ModuleId,
+		PathId,
+		advance_token,
+		append_import,
+		append_import_alias,
+		append_import_item,
+		append_import_item_alias,
+		append_import_item_variant,
+		append_import_path_part,
+		move_token_cursor,
+		next_import_id,
+		next_import_item_id,
+		next_import_item_variant_row,
+		next_import_path_part_row,
+		replace_import_item_row,
+		replace_import_row,
+	discovery_diagnostic_code:
+		DiscoveryDiagnosticCode(
+			ExpectedAliasNameDiagnostic,
+			ExpectedClosingParenAfterConstructorsDiagnostic,
+			ExpectedColonAfterImportDiagnostic,
+			ExpectedCommaBetweenImportSymbolsDiagnostic,
+			ExpectedConstructorNameDiagnostic,
+			ExpectedDedentDiagnostic,
+			ExpectedImportSymbolDiagnostic,
+			ExpectedImportSymbolsAfterColonDiagnostic,
+			ExpectedIndentedImportsDiagnostic,
+			ExpectedModulePathDiagnostic,
+			ExpectedNewlineAfterImportHeaderDiagnostic,
+		),
+	parser_cursor:
+		at_block_end,
+		current_kind,
+		current_name,
+		current_span,
+		current_token,
+		is_soft_keyword,
+		keyword_name_index,
+		peek_kind,
+		previous_span,
+		report_at_current,
+		skip_newlines,
+		skip_rest_of_line,
+		token_kind_at,
+	row_kinds: ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest)
+	source_admission: intern_path, interned_path_id
+	span: Span, span_covering, span_end, span_source_index, span_start
+	token:
+		Token,
+		TokenKind(
+			AsKeyword,
+			ColonSymbol,
+			CommaSymbol,
+			DedentToken,
+			DotDotSymbol,
+			DotSymbol,
+			IdentifierToken,
+			IndentToken,
+			LeftParenSymbol,
+			NewlineToken,
+			RightParenSymbol,
+			SlashSymbol,
+		),
+
+
+---
+Tokens in one module path prefix: `.` or `..`, then `/`.
+---
+private PATH_PREFIX_TOKENS: Int = 2
+
+---
+The first path part that makes an import request a native package request
+(`pkg/...`): a rule of the import syntax, compared by spelling equality.
+---
+private NATIVE_PACKAGE_PATH_ROOT: String = "pkg"
+
+
+-- Imports.
+---
+`import:` then an indented block of import items.
+---
+pure func parse_import_block(builder: DiscoveryBuilder, module: ModuleId) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = advance_token(builder)
+
+	if current_kind(out) == ColonSymbol:
+		out = advance_token(out)
+	else:
+		out = report_at_current(out, ExpectedColonAfterImportDiagnostic)
+
+	if current_kind(out) == NewlineToken:
+		out = advance_token(out)
+	else:
+		out = report_at_current(out, ExpectedNewlineAfterImportHeaderDiagnostic)
+
+	if current_kind(out) == IndentToken:
+		out = advance_token(out)
+	else:
+		out = report_at_current(out, ExpectedIndentedImportsDiagnostic)
+
+	-- As in the existing parser, the items are parsed even when the block is
+	-- not indented, up to the end of the enclosing block.
+	out = skip_newlines(out)
+
+	while not at_block_end(out):
+		before: Int = out.token_cursor
+		out = parse_import_item(out, module)
+		out = skip_newlines(out)
+
+		if out.token_cursor == before and not at_block_end(out):
+			out = advance_token(out)
+
+	if current_kind(out) == DedentToken:
+		out = advance_token(out)
+	else:
+		out = report_at_current(out, ExpectedDedentDiagnostic)
+
+	out
+
+
+---
+The request kind a module path's leading tokens give it.
+---
+private pure func request_kind_at(builder: DiscoveryBuilder) -> ImportRequestKind:
+	kind: TokenKind = current_kind(builder)
+
+	if (kind == DotSymbol or kind == DotDotSymbol) and peek_kind(builder, 1) == SlashSymbol:
+		RelativeModuleRequest
+	else if (
+		current_spelling_is(builder, NATIVE_PACKAGE_PATH_ROOT)
+		and peek_kind(builder, 1) == SlashSymbol
+	):
+		NativePackageRequest
+	else:
+		BareModuleRequest
+
+
+private pure func current_spelling_is(builder: DiscoveryBuilder, spelling: String) -> Bool:
+	token: Token = current_token(builder)
+	token.kind == IdentifierToken and builder.name_spellings.get(token.payload) == Some(spelling)
+
+
+---
+The source text of the tokens from `first` up to the cursor, token by token:
+a module path as written, without any blanks between its tokens.
+---
+private pure func token_text_since(builder: DiscoveryBuilder, first: Int) -> String:
+	token: Token = current_token(builder)
+	source_text: String = builder.source_texts
+		.get(span_source_index(token.span))
+		.get_or("")
+	var text: String = ""
+
+	for index in first..builder.token_cursor:
+		match builder.tokens.get(index):
+			Some(part):
+				text += source_text.substring(
+					span_start(part.span),
+					span_end(part.span) - span_start(part.span),
+				)
+			None:
+				void
+
+	text
+
+
+---
+One import item: a module path, an optional `as` alias, and optional
+selected symbols on the same line or in an indented block.
+---
+pure func parse_import_item(builder: DiscoveryBuilder, module: ModuleId) -> DiscoveryBuilder:
+	if module_path_starts_at_cursor(builder):
+		parse_import_item_with_path(builder, module)
+	else:
+		reported: DiscoveryBuilder = report_at_current(builder, ExpectedModulePathDiagnostic)
+		skip_rest_of_line(reported)
+
+
+---
+Whether a module path starts at the cursor: optional `./` or `../` pairs,
+then a name.
+---
+private pure func module_path_starts_at_cursor(builder: DiscoveryBuilder) -> Bool:
+	var ahead: Int = 0
+
+	if peek_kind(builder, 0) == DotSymbol and peek_kind(builder, 1) == SlashSymbol:
+		ahead = 2
+	else:
+		ahead = 2 * leading_parent_steps(builder)
+
+	match builder.tokens.get(builder.token_cursor + ahead):
+		Some(token):
+			token.kind == IdentifierToken or is_soft_keyword(token.kind)
+		None:
+			False
+
+
+---
+An import item whose module path starts at the cursor.
+---
+private pure func parse_import_item_with_path(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+) -> DiscoveryBuilder:
+	import_id: ImportId = next_import_id(builder)
+	request_kind: ImportRequestKind = request_kind_at(builder)
+	path_start: Span = current_span(builder)
+	path_first_token: Int = builder.token_cursor
+	parent_steps: Int = leading_parent_steps(builder)
+	parts_first: Int = next_import_path_part_row(builder)
+	var out: DiscoveryBuilder = parse_module_path(builder)
+	parts_count: Int = next_import_path_part_row(out) - parts_first
+	path_text: String = token_text_since(out, path_first_token)
+	request_path: PathId = interned_path_id(out, path_text)
+	out = intern_path(out, path_text)
+	out = append_import(
+		out,
+		{
+			importer = module,
+			request_kind = request_kind,
+			request_path = request_path,
+			parent_steps = parent_steps,
+			path_parts = {
+				first = parts_first,
+				count = parts_count
+			},
+			items = EMPTY_ROW_RANGE,
+			span = path_start
+		},
+	)
+
+	if current_kind(out) == AsKeyword:
+		out = advance_token(out)
+
+		match current_name(out):
+			Some(alias_name):
+				out = advance_token(out)
+				out = append_import_alias(
+					out,
+					{
+						owner_import = import_id,
+						alias_name = alias_name
+					},
+				)
+			None:
+				out = report_missing_alias(out)
+
+	items_first: Int = out.import_items.length()
+
+	if current_kind(out) == ColonSymbol:
+		out = advance_token(out)
+
+		if current_kind(out) == NewlineToken:
+			out = skip_newlines(out)
+
+			if current_kind(out) == IndentToken:
+				out = parse_import_symbol_block(out, import_id)
+			else:
+				out = report_at_current(out, ExpectedImportSymbolsAfterColonDiagnostic)
+		else:
+			out = parse_import_symbol_line(out, import_id)
+
+	items_count: Int = out.import_items.length() - items_first
+	item_span: Span = span_covering(path_start, previous_span(out))
+	out = replace_import_row(
+		out,
+		import_id,
+		{
+			importer = module,
+			request_kind = request_kind,
+			request_path = request_path,
+			parent_steps = parent_steps,
+			path_parts = {
+				first = parts_first,
+				count = parts_count
+			},
+			items = {
+				first = items_first,
+				count = items_count
+			},
+			span = item_span
+		},
+	)
+	out
+
+
+---
+The number of `../` pairs starting at the cursor.
+---
+private pure func leading_parent_steps(builder: DiscoveryBuilder) -> Int:
+	var steps: Int = 0
+
+	while (
+		peek_kind(builder, 2 * steps) == DotDotSymbol
+		and peek_kind(builder, 2 * steps + 1) == SlashSymbol
+	):
+		steps += 1
+
+	steps
+
+
+---
+`./` or `../`* prefixes, then parts separated by `/`; each part is appended
+to `import_path_parts`.
+---
+pure func parse_module_path(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	-- Scanned, then consumed in one update (builder threading rule 1).
+	prefix_end: Int = module_path_prefix_end(builder)
+	var out: DiscoveryBuilder = move_token_cursor(builder, prefix_end)
+
+	match current_name(out):
+		Some(first_part):
+			out = advance_token(out)
+			out = append_import_path_part(out, first_part)
+
+			while current_kind(out) == SlashSymbol:
+				out = advance_token(out)
+
+				match current_name(out):
+					Some(part):
+						out = advance_token(out)
+						out = append_import_path_part(out, part)
+					None:
+						out = report_at_current(out, ExpectedModulePathDiagnostic)
+		None:
+			out = report_at_current(out, ExpectedModulePathDiagnostic)
+
+	out
+
+
+---
+The index of the first token after a module path's `./` or `../` prefixes.
+---
+private pure func module_path_prefix_end(builder: DiscoveryBuilder) -> Int:
+	var index: Int = builder.token_cursor
+
+	if (
+		token_kind_at(builder, index) == DotSymbol
+		and token_kind_at(builder, index + 1) == SlashSymbol
+	):
+		index += PATH_PREFIX_TOKENS
+	else:
+		while (
+			token_kind_at(builder, index) == DotDotSymbol
+			and token_kind_at(builder, index + 1) == SlashSymbol
+		):
+			index += PATH_PREFIX_TOKENS
+
+	index
+
+
+---
+Reports a missing alias name; a reserved keyword written as the alias is
+consumed with the report, so the rest of the line parses normally.
+---
+private pure func report_missing_alias(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	kind: TokenKind = current_kind(builder)
+	var out: DiscoveryBuilder = report_at_current(builder, ExpectedAliasNameDiagnostic)
+
+	if keyword_name_index(kind).is_some():
+		out = advance_token(out)
+
+	out
+
+
+---
+Symbols up to the end of the line, separated by commas.
+---
+pure func parse_import_symbol_line(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+) -> DiscoveryBuilder:
+	if at_import_symbol_line_end(builder):
+		builder
+	else:
+		parse_import_symbols_to_line_end(builder, import_id)
+
+
+private pure func at_import_symbol_line_end(builder: DiscoveryBuilder) -> Bool:
+	current_kind(builder) == NewlineToken or at_block_end(builder)
+
+
+---
+The symbols of a line that has at least one; the first is parsed before the
+loop (builder threading rule 1).
+---
+private pure func parse_import_symbols_to_line_end(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_import_symbol_and_separator(builder, import_id)
+
+	while not at_import_symbol_line_end(out):
+		out = parse_import_symbol_and_separator(out, import_id)
+
+	out
+
+
+---
+One symbol and the comma after it; the cursor always moves unless the line
+has ended.
+---
+private pure func parse_import_symbol_and_separator(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+) -> DiscoveryBuilder:
+	before: Int = builder.token_cursor
+	var out: DiscoveryBuilder = parse_import_symbol(builder, import_id)
+
+	if current_kind(out) == CommaSymbol:
+		out = advance_token(out)
+	else if not at_import_symbol_line_end(out):
+		out = report_at_current(out, ExpectedCommaBetweenImportSymbolsDiagnostic)
+
+	if out.token_cursor == before and not at_import_symbol_line_end(out):
+		out = advance_token(out)
+
+	out
+
+
+---
+An indented block of symbol lines.
+---
+pure func parse_import_symbol_block(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = advance_token(builder)
+	out = skip_newlines(out)
+
+	while not at_block_end(out):
+		before: Int = out.token_cursor
+		out = parse_import_symbol_line(out, import_id)
+		out = skip_newlines(out)
+
+		if out.token_cursor == before and not at_block_end(out):
+			out = advance_token(out)
+
+	if current_kind(out) == DedentToken:
+		out = advance_token(out)
+
+	out
+
+
+---
+One selected symbol: a name, optionally `name(Constructor, ...)`, optionally
+`as alias`.
+---
+pure func parse_import_symbol(builder: DiscoveryBuilder, import_id: ImportId) -> DiscoveryBuilder:
+	item: ImportItemId = next_import_item_id(builder)
+	start: Span = current_span(builder)
+
+	match current_name(builder):
+		Some(name):
+			var out: DiscoveryBuilder = advance_token(builder)
+			out = append_import_item(
+				out,
+				{
+					owner_import = import_id,
+					name = name,
+					variants = EMPTY_ROW_RANGE,
+					span = start
+				},
+			)
+			variants_first: Int = next_import_item_variant_row(out)
+
+			if current_kind(out) == LeftParenSymbol:
+				out = advance_token(out)
+				out = parse_import_constructors(out, item)
+
+			variants_count: Int = next_import_item_variant_row(out) - variants_first
+
+			if current_kind(out) == AsKeyword:
+				out = advance_token(out)
+
+				match current_name(out):
+					Some(alias_name):
+						out = advance_token(out)
+						out = append_import_item_alias(
+							out,
+							{
+								item = item,
+								alias_name = alias_name
+							},
+						)
+					None:
+						out = report_missing_alias(out)
+
+			item_span: Span = span_covering(start, previous_span(out))
+			out = replace_import_item_row(
+				out,
+				item,
+				{
+					owner_import = import_id,
+					name = name,
+					variants = {
+						first = variants_first,
+						count = variants_count
+					},
+					span = item_span
+				},
+			)
+			out
+		None:
+			report_at_current(builder, ExpectedImportSymbolDiagnostic)
+
+
+---
+The constructors of a `name(...)` selection, after its `(`, through `)`.
+---
+pure func parse_import_constructors(
+	builder: DiscoveryBuilder,
+	item: ImportItemId,
+) -> DiscoveryBuilder:
+	variants_before: Int = next_import_item_variant_row(builder)
+	var out: DiscoveryBuilder = parse_import_constructor_names(builder, item)
+
+	if next_import_item_variant_row(out) == variants_before:
+		out = report_at_current(out, ExpectedConstructorNameDiagnostic)
+
+	if current_kind(out) == RightParenSymbol:
+		out = advance_token(out)
+	else:
+		out = report_at_current(out, ExpectedClosingParenAfterConstructorsDiagnostic)
+
+	out
+
+
+private pure func at_import_constructors_end(builder: DiscoveryBuilder) -> Bool:
+	(
+		current_kind(builder) == RightParenSymbol
+		or current_kind(builder) == NewlineToken
+		or at_block_end(builder)
+	)
+
+
+---
+The constructor names up to the `)` or the end of the line.
+---
+private pure func parse_import_constructor_names(
+	builder: DiscoveryBuilder,
+	item: ImportItemId,
+) -> DiscoveryBuilder:
+	if at_import_constructors_end(builder):
+		builder
+	else:
+		parse_import_constructor_name_list(builder, item)
+
+
+---
+Constructor names when there is at least one token before the end; the first
+is parsed before the loop (builder threading rule 1).
+---
+private pure func parse_import_constructor_name_list(
+	builder: DiscoveryBuilder,
+	item: ImportItemId,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = parse_import_constructor_name(builder, item)
+
+	while not at_import_constructors_end(out):
+		out = parse_import_constructor_name(out, item)
+
+	out
+
+
+---
+One constructor name (or a report and a skipped token) and the comma after
+it.
+---
+private pure func parse_import_constructor_name(
+	builder: DiscoveryBuilder,
+	item: ImportItemId,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = consume_constructor_name(builder, item)
+
+	if current_kind(out) == CommaSymbol:
+		out = advance_token(out)
+
+	out
+
+
+---
+Consumes one constructor name into a variant row, or reports and skips the
+token that stands in its place.
+---
+private pure func consume_constructor_name(
+	builder: DiscoveryBuilder,
+	item: ImportItemId,
+) -> DiscoveryBuilder:
+	span: Span = current_span(builder)
+
+	match current_name(builder):
+		Some(constructor):
+			advanced: DiscoveryBuilder = advance_token(builder)
+			append_import_item_variant(
+				advanced,
+				{
+					item = item,
+					name = constructor,
+					span = span
+				},
+			)
+		None:
+			reported: DiscoveryBuilder = report_at_current(
+				builder,
+				ExpectedConstructorNameDiagnostic,
+			)
+			advance_token(reported)

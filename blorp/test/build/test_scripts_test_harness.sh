@@ -52,9 +52,9 @@ for root in "${required_core_sanitize_roots[@]}"; do
 	fi
 done
 
-expected_default_gates='default_gates=(compiler_blorp runtime leak doctest cli)'
+expected_default_gates='default_gates=(compiler_blorp compiler_new runtime leak doctest cli)'
 if ! grep -Fq "$expected_default_gates" scripts/test; then
-	echo "FAIL: scripts/test defaults should exercise only Blorp-owned compiler suites"
+	echo "FAIL: scripts/test defaults should exercise the Blorp-owned compiler suites and the rewritten stages"
 	exit 1
 fi
 if ! grep -Fq 'bin/blorp test $blorp_test_artifact_flags --doc --std-dir "$std_root"' scripts/test || \

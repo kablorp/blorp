@@ -1,0 +1,132 @@
+-- Allocation budgets that guard the builder threading rules (see
+-- `discovery_builder.brp`). A routine that breaks a rule copies the builder
+-- and then every table it appends to, once per call: thousands of
+-- allocations where table growth alone needs a few hundred. Each budget sits
+-- well above growth and well below one copy per statement or row.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiscoveryBuilder,
+		append_definition,
+		append_leaf_node,
+		empty_discovery_builder,
+		module_id_at_row,
+		name_id_at_row,
+	../../../src/compiler_new/stage_01_discovery/module_walker: load_module
+	../../../src/compiler_new/stage_01_discovery/row_kinds:
+		DefinitionKind(FunctionDefinition),
+		ModuleOriginKind(UserModule),
+		ModuleReach(RootModule),
+		NodeKind(BreakNode),
+		Visibility(PublicVisibility),
+	../../../src/compiler_new/stage_01_discovery/source_provider: PackageMembership(NotInPackage)
+	../../../src/compiler_new/stage_01_discovery/span: pack_span
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+---
+Statements or rows per measured run.
+---
+REPEATS: Int = 2000
+
+---
+The most allocations a run may make: table growth and per-module setup stay
+under it, while one copy per statement or row would exceed it several times.
+---
+ALLOCATION_BUDGET: Int = 500
+
+
+---
+A module whose one function repeats `statement` `REPEATS` times; the names
+and literals it uses are interned by its first copy.
+---
+pure func repeated_body(statement: String) -> String:
+	var text: String = "func f(a, b, c, x):\n"
+	var index: Int = 0
+
+	while index < REPEATS:
+		text += statement
+		index += 1
+
+	text
+
+
+func allocations_to_parse(text: String) -> Int:
+	reset_mem_stats()
+	builder: DiscoveryBuilder = load_module(
+		empty_discovery_builder(),
+		{
+			path = "budget.brp",
+			origin = UserModule,
+			package = NotInPackage
+		},
+		RootModule,
+		text,
+	)
+	stats: MemStats = get_mem_stats()
+
+	-- A parse that lost its statements would pass the budget vacuously.
+	if builder.nodes.length() > REPEATS:
+		stats.total_allocations
+	else:
+		ALLOCATION_BUDGET
+
+
+---
+Whether `allocations` shows the counters ran and stayed within budget.
+---
+pure func within_budget(allocations: Int) -> Bool:
+	allocations > 0 and allocations < ALLOCATION_BUDGET
+
+
+func test_parsing_repeated_expression_statements_copies_no_table() -> Bool:
+	within_budget(allocations_to_parse(repeated_body("\tx = a + b * c\n")))
+
+
+func test_parsing_repeated_blocks_and_calls_copies_no_table() -> Bool:
+	within_budget(
+		allocations_to_parse(repeated_body("\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n")),
+	)
+
+
+func test_appending_rows_copies_no_table() -> Bool:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	reset_mem_stats()
+	var index: Int = 0
+
+	while index < REPEATS:
+		builder = append_definition(
+			builder,
+			{
+				module = module_id_at_row(0),
+				kind = FunctionDefinition,
+				name = name_id_at_row(0),
+				name_span = pack_span(0, 0, 0),
+				visibility = PublicVisibility,
+				span = pack_span(0, 0, 0)
+			},
+		)
+		builder = append_leaf_node(
+			builder,
+			BreakNode,
+			pack_span(0, 0, 0),
+		)
+		index += 1
+
+	within_budget(get_mem_stats().total_allocations)
+
+
+tests: TestSuite = {
+	description = "Discovery allocation budgets",
+	tests = [
+		(
+			"parsing repeated expression statements copies no table",
+			test_parsing_repeated_expression_statements_copies_no_table,
+		),
+		(
+			"parsing repeated blocks and calls copies no table",
+			test_parsing_repeated_blocks_and_calls_copies_no_table,
+		),
+		("appending rows copies no table", test_appending_rows_copies_no_table),
+	]
+}

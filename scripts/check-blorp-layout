@@ -96,6 +96,81 @@ def validate_test_names(
 			errors.append(f"test module must start with test_: {relative}")
 
 
+def validate_isolated_test_imports(
+	source_root: Path,
+	test_root: Path,
+	isolated_test_owners: set[str],
+	fixture_directories: set[str],
+	errors: list[str],
+) -> None:
+	"""Tests of an isolated owner import only that owner, lib and their own tree.
+
+	Bare imports that resolve to no repository file are standard-library
+	modules (such as `test`) and are allowed.
+	"""
+	for owner in sorted(isolated_test_owners):
+		owner_test_root = test_root / owner
+		if not owner_test_root.is_dir():
+			continue
+		allowed_source_roots = [
+			(source_root / owner).resolve(),
+			(source_root / "lib").resolve(),
+		]
+		for test in sorted(owner_test_root.rglob("*.brp")):
+			relative = test.relative_to(test_root)
+			if fixture_directories.intersection(relative.parts[:-1]):
+				continue
+			for module in source_imports(test):
+				target = resolve_import(test, module, source_root)
+				if target is None:
+					if module.startswith("."):
+						errors.append(f"unresolved relative import {module}: {relative}")
+					continue
+				if is_within(target, owner_test_root.resolve()):
+					continue
+				if any(is_within(target, allowed) for allowed in allowed_source_roots):
+					continue
+				errors.append(
+					f"isolated test owner {owner} may import only {owner}, lib and its own tests: "
+					f"{relative} imports {module}"
+				)
+
+
+def validate_isolated_reachability(
+	source_root: Path,
+	test_root: Path,
+	isolated_test_owners: set[str],
+	owner_sources: dict[str, set[Path]],
+	graph: dict[Path, set[Path]],
+	errors: list[str],
+) -> None:
+	"""An isolated owner reaches only itself and lib, also through lib.
+
+	`lib` may import `compiler`, so a direct-import check alone would let an
+	isolated owner depend on another owner through a shared module. The
+	owner's sources and the lib modules its tests import are followed
+	transitively.
+	"""
+	lib_root = (source_root / "lib").resolve()
+	for owner in sorted(isolated_test_owners):
+		owner_root = (source_root / owner).resolve()
+		starts = set(owner_sources.get(owner, set()))
+		owner_test_root = test_root / owner
+		if owner_test_root.is_dir():
+			for test in sorted(owner_test_root.rglob("*.brp")):
+				for module in source_imports(test):
+					target = resolve_import(test, module, source_root)
+					if target is not None and is_within(target, lib_root):
+						starts.add(target)
+		for path in sorted(reachable(graph, starts)):
+			if is_within(path, owner_root) or is_within(path, lib_root):
+				continue
+			errors.append(
+				f"isolated owner {owner} reaches another owner through lib: "
+				f"{path.relative_to(source_root)}"
+			)
+
+
 def reachable(graph: dict[Path, set[Path]], starts: set[Path]) -> set[Path]:
 	seen: set[Path] = set()
 	pending = list(starts)
@@ -155,6 +230,11 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 	test_support_paths = set(
 		str(path) for path in manifest.get("test_support_paths", [])
 	)
+	isolated_test_owners = set(
+		str(owner) for owner in manifest.get("isolated_test_owners", [])
+	)
+	for owner in sorted(isolated_test_owners - owners):
+		errors.append(f"isolated test owner is not a registered owner: {owner}")
 
 	if not source_root.is_dir():
 		return [f"source root does not exist: {source_root}"]
@@ -275,7 +355,22 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 			):
 				errors.append(f"declared consumer {consumer} cannot reach {module}")
 
+	validate_isolated_reachability(
+		source_root,
+		test_root,
+		isolated_test_owners,
+		owner_sources,
+		graph,
+		errors,
+	)
 	validate_test_names(test_root, fixture_directories, test_support_paths, errors)
+	validate_isolated_test_imports(
+		source_root,
+		test_root,
+		isolated_test_owners,
+		fixture_directories,
+		errors,
+	)
 	return errors
 
 

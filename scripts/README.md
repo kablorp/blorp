@@ -66,6 +66,11 @@ without building, running tests, creating logs, or writing generated files. A
 plan that selects nothing is a no-op explanation, not a passing validation; use
 the task-specific build, docs, or release checks for those changes.
 
+Sources under `blorp/src/compiler_new` and suites under
+`blorp/test/compiler_new` (the rewritten compiler stages, not linked into
+`bin/blorp` yet) are outside this manifest: `--changed` selects nothing for
+them and names their gate, `scripts/test compiler-new`.
+
 The command prints the selected sources, suites, and special checks before it
 prepares the compiler once. Suites then use `bin/blorp test`, and registered gate
 checks use `scripts/test --no-build --log-dir`. Passing runs remove their
@@ -78,6 +83,7 @@ merging.
 scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
 scripts/test compiler-tools     # formatter/purify/lint fixtures + backend/identity tool guards
+scripts/test compiler-new       # rewritten compiler stages (blorp/src/compiler_new) TestSuites
 scripts/test std-check          # broad standard-library source typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
@@ -106,6 +112,15 @@ per-gate timing, total wall-clock time, and setup timing; failures print focused
 excerpts and can save full logs with `--log-dir`.
 The default gate exercises the production-owned compiler implementation through
 `compiler-blorp`.
+The `compiler-new` gate runs the TestSuites registered in
+`blorp/test/compiler_new/compiler_new_test_ownership.json`, after checking that
+every `test_*.brp` under `blorp/test/compiler_new` is registered and that its
+tools and support modules type check. It is a default gate, part of the
+premerge gate and of the compiler CI lane. The layout check keeps that tree isolated:
+`compiler_new` sources import only `compiler_new` and `lib`, nothing else
+imports them, and its tests import only `compiler_new`, `lib`, their own tree
+and the standard library (`isolated_test_owners` in
+`blorp/source_ownership.json`).
 The `compiler-blorp` gate also runs every fixture explicitly marked
 `RUN-BLORP-CHECK` through a small Blorp-only runner after the generated suite;
 the expected fixture count is pinned in `scripts/test` and in the runner.
@@ -329,6 +344,7 @@ compiler-blorp
 compiler-tools
 compiler-core-sanitize
 compiler-blorp-sanitize
+compiler-new
 std-check
 runtime
 leak + doctest + cli + lsp
@@ -377,7 +393,7 @@ cutting preview builds. It composes:
 
 - clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
-- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp`
+- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new`
 - the direct generated-C audit in `blorp/test/compiler/pipeline/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs

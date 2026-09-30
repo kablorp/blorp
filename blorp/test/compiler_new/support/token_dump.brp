@@ -1,0 +1,134 @@
+-- Renders the discovery token table as text: one line per token, giving its
+-- byte range, kind and (for identifiers and literals) its text. Tests compare
+-- these dumps with pinned fixtures, and the corpus parity check compares them
+-- with the same rendering of the existing lexer's tokens.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiscoveryBuilder,
+		InterpolationPart(HolePart, TextPart),
+		InterpolationPartRow,
+		RowRange,
+		interpolation_part_at,
+		interpolation_parts_of,
+		interpolation_text_at,
+		literal_id_index,
+	../../../src/compiler_new/stage_01_discovery/discovery_diagnostic_code: diagnostic_code_name
+	../../../src/compiler_new/stage_01_discovery/span: span_end, span_source_index, span_start
+	../../../src/compiler_new/stage_01_discovery/token:
+		Token,
+		TokenKind(
+			CharLiteralToken,
+			DimensionNameToken,
+			DocStringToken,
+			FloatLiteralToken,
+			IdentifierToken,
+			IntLiteralToken,
+			InterpolatedPipeStringToken,
+			InterpolatedStringToken,
+			NormalStringToken,
+			PipeStringToken,
+			RawPipeStringToken,
+			RawStringToken,
+		),
+		token_kind_name,
+
+
+---
+`text` on one line: backslash, newline, tab and carriage return escaped.
+---
+pure func escaped_dump_text(text: String) -> String:
+	text
+		.replace("\\", "\\\\")
+		.replace("\n", "\\n")
+		.replace("\t", "\\t")
+		.replace("\r", "\\r")
+
+
+---
+The text a token's payload names, or its codepoint, for the dump.
+---
+pure func token_payload_text(builder: DiscoveryBuilder, token: Token) -> String:
+	match token.kind:
+		IdentifierToken | DimensionNameToken:
+			" " + escaped_dump_text(
+				builder.name_spellings
+					.get(token.payload)
+					.get_or("?"),
+			)
+		InterpolatedStringToken | InterpolatedPipeStringToken:
+			interpolation_parts_text(builder, token)
+		IntLiteralToken | FloatLiteralToken | NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken | DocStringToken:
+			" " + escaped_dump_text(
+				builder.literals
+					.get(token.payload)
+					.get_or("?"),
+			)
+		CharLiteralToken:
+			" " + token.payload.to_string()
+		_:
+			""
+
+
+---
+An interpolated string's parts: ` text[...]` for each decoded text piece and
+` hole[...]` for each hole's source text.
+---
+pure func interpolation_parts_text(builder: DiscoveryBuilder, token: Token) -> String:
+	parts: RowRange = interpolation_parts_of(builder, token.payload)
+	source: String = builder.source_texts
+		.get(span_source_index(token.span))
+		.get_or("")
+	var text: String = ""
+
+	for index in parts.first..parts.first + parts.count:
+		part: InterpolationPartRow = interpolation_part_at(builder, index)
+
+		match part.part:
+			TextPart:
+				decoded: String = builder.literals
+					.get(literal_id_index(interpolation_text_at(builder, part.text.first)))
+					.get_or("?")
+				text += " text[" + escaped_dump_text(decoded) + "]"
+			HolePart:
+				text += " hole[" + escaped_dump_text(
+					source.substring(
+						part.start,
+						part.end - part.start,
+					),
+				) + "]"
+
+	text
+
+
+pure func token_dump_line(builder: DiscoveryBuilder, token: Token) -> String:
+	"${span_start(token.span)} ${span_end(token.span)} ${token_kind_name(token.kind)}${token_payload_text(builder, token)}"
+
+
+---
+Every token of the builder's token table, one per line.
+---
+pure func token_dump(builder: DiscoveryBuilder) -> String:
+	var lines: List[String] = []
+
+	for token in builder.tokens:
+		lines = lines.append(token_dump_line(builder, token))
+
+	lines.join("\n")
+
+
+---
+The diagnostics appended since row `first`, one `start end code` per line.
+---
+pure func diagnostic_dump(builder: DiscoveryBuilder, first: Int) -> String:
+	var lines: List[String] = []
+	var row: Int = 0
+
+	for diagnostic in builder.diagnostics:
+		if row >= first:
+			lines = lines.append(
+				"${span_start(diagnostic.span)} ${span_end(diagnostic.span)} ${diagnostic_code_name(diagnostic.code)}",
+			)
+
+		row += 1
+
+	lines.join("\n")

@@ -1,0 +1,239 @@
+-- Renders frozen discovery tables as text for tests and the dump tool: roots,
+-- modules (with their import rows and targets) and diagnostics, by id. Two
+-- discoveries of the same inputs must render identically.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiagnosticRow,
+		ImportItemId,
+		ImportRow,
+		ModuleId,
+		ModuleRow,
+		RowRange,
+		import_id_at_row,
+		import_item_id_at_row,
+		module_id_at_row,
+		module_id_index,
+		root_id_at_row,
+		root_id_index,
+		source_id_index,
+	../../../src/compiler_new/stage_01_discovery/discovery_diagnostic_code: diagnostic_code_name
+	../../../src/compiler_new/stage_01_discovery/frontend_tables:
+		FrontendTables,
+		diagnostic_argument,
+		diagnostic_count,
+		diagnostic_row_at,
+		import_alias,
+		import_item_alias,
+		import_item_row_at,
+		import_item_variant_row_at,
+		import_path_part,
+		import_row,
+		import_target,
+		module_count,
+		module_package,
+		module_row,
+		name_spelling,
+		path_text,
+		resolution_diagnostic_count,
+		resolution_diagnostic_row_at,
+		root_count,
+		root_diagnostic_argument,
+		root_diagnostic_count,
+		root_diagnostic_row_at,
+		root_row,
+		root_target,
+		table_row_counts,
+	../../../src/compiler_new/stage_01_discovery/row_kinds:
+		ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest),
+		ModuleOriginKind(PackageModule, StdlibModule, UserModule),
+		ModuleReach(ImportedModule, RootModule),
+	../../../src/compiler_new/stage_01_discovery/span: span_end, span_source_index, span_start
+
+
+pure func range_text(range: RowRange) -> String:
+	"${range.first}+${range.count}"
+
+
+pure func origin_text(row: ModuleRow) -> String:
+	match row.origin:
+		StdlibModule:
+			"stdlib"
+		PackageModule:
+			"package"
+		UserModule:
+			"user"
+
+
+pure func reach_text(row: ModuleRow) -> String:
+	match row.reach:
+		RootModule:
+			"root"
+		ImportedModule:
+			"imported"
+
+
+pure func request_kind_text(row: ImportRow) -> String:
+	match row.request_kind:
+		BareModuleRequest:
+			"bare"
+		RelativeModuleRequest:
+			"relative"
+		NativePackageRequest:
+			"native-package"
+
+
+pure func module_label(tables: FrontendTables, module: ModuleId) -> String:
+	"m${module_id_index(module)}:${path_text(tables, module_row(tables, module).canonical_path)}"
+
+
+pure func import_line(tables: FrontendTables, index: Int) -> String:
+	import_id = import_id_at_row(index)
+	row: ImportRow = import_row(tables, import_id)
+	var parts: List[String] = []
+
+	for ordinal in 0..row.path_parts.count:
+		match import_path_part(tables, row, ordinal):
+			Some(part):
+				parts = parts.append(name_spelling(tables, part))
+			None:
+				parts = parts.append("?")
+
+	alias_text: String = match import_alias(tables, import_id):
+		Some(alias_name):
+			" as ${name_spelling(tables, alias_name)}"
+		None:
+			""
+
+	var items: List[String] = []
+
+	for item_index in row.items.first..row.items.first + row.items.count:
+		item_id: ImportItemId = import_item_id_at_row(item_index)
+
+		match import_item_row_at(tables, item_id):
+			Some(item):
+				var variants: List[String] = []
+
+				for variant_index in item.variants.first..item.variants.first + item.variants.count:
+					match import_item_variant_row_at(tables, variant_index):
+						Some(variant):
+							variants = variants.append(name_spelling(tables, variant.name))
+						None:
+							void
+
+				variant_text: String = if variants.is_empty():
+					""
+				else:
+					"(${variants.join(", ")})"
+
+				item_alias_text: String = match import_item_alias(tables, item_id):
+					Some(alias_name):
+						" as ${name_spelling(tables, alias_name)}"
+					None:
+						""
+
+				items = items.append(
+					name_spelling(tables, item.name) + variant_text + item_alias_text,
+				)
+			None:
+				void
+
+	target_text: String = match import_target(tables, import_id):
+		Some(target):
+			module_label(tables, target)
+		None:
+			"unresolved"
+
+	"  import i${index} ${request_kind_text(row)} ${path_text(tables, row.request_path)} parents=${row.parent_steps} parts=${parts.join("/")}${alias_text} items=[${items.join(", ")}] -> ${target_text}"
+
+
+pure func diagnostic_line(tables: FrontendTables, row: DiagnosticRow, label: String) -> String:
+	argument_text: String = match diagnostic_argument(tables, row, 0):
+		Some(argument):
+			if row.arguments.count > 0:
+				" ${argument}"
+			else:
+				""
+		None:
+			""
+
+	"  ${label} ${diagnostic_code_name(row.code)} s${span_source_index(row.span)}@${span_start(row.span)}-${span_end(row.span)}${argument_text}"
+
+
+---
+Roots, modules with their imports, and diagnostics, one fact per line.
+---
+pure func tables_dump(tables: FrontendTables) -> String:
+	var lines: List[String] = []
+
+	for root_index in 0..root_count(tables):
+		root = root_id_at_row(root_index)
+
+		target_text: String = match root_target(tables, root):
+			Some(target):
+				module_label(tables, target)
+			None:
+				"unloaded"
+
+		lines = lines.append(
+			"root r${root_index} ${path_text(tables, root_row(tables, root).request_path)} -> ${target_text}",
+		)
+
+	for root_diagnostic_index in 0..root_diagnostic_count(tables):
+		match root_diagnostic_row_at(tables, root_diagnostic_index):
+			Some(row):
+				argument_text: String = match root_diagnostic_argument(tables, row, 0):
+					Some(argument):
+						if row.arguments.count > 0:
+							" ${argument}"
+						else:
+							""
+					None:
+						""
+
+				lines = lines.append(
+					"root diagnostic r${root_id_index(row.root)} ${diagnostic_code_name(row.code)}${argument_text}",
+				)
+			None:
+				void
+
+	for module_index in 0..module_count(tables):
+		module = module_id_at_row(module_index)
+		row: ModuleRow = module_row(tables, module)
+
+		package_text: String = match module_package(tables, module):
+			Some(package):
+				" package=${name_spelling(tables, package.name)}"
+			None:
+				""
+
+		lines = lines.append(
+			"module ${module_label(tables, module)} source=s${source_id_index(row.source)} ${origin_text(row)} ${reach_text(row)}${package_text} imports=${range_text(row.imports)} diagnostics=${range_text(row.diagnostics)}",
+		)
+
+		for import_index in row.imports.first..row.imports.first + row.imports.count:
+			lines = lines.append(import_line(tables, import_index))
+
+	for diagnostic_index in 0..diagnostic_count(tables):
+		match diagnostic_row_at(tables, diagnostic_index):
+			Some(row):
+				lines = lines.append(diagnostic_line(tables, row, "diagnostic"))
+			None:
+				void
+
+	for resolution_index in 0..resolution_diagnostic_count(tables):
+		match resolution_diagnostic_row_at(tables, resolution_index):
+			Some(row):
+				lines = lines.append(diagnostic_line(tables, row, "resolution diagnostic"))
+			None:
+				void
+
+	lines.join("\n")
+
+
+---
+`name=count` for every table.
+---
+pure func table_counts_line(tables: FrontendTables) -> String:
+	table_row_counts(tables)
+		.map(pure func(entry): "${entry[0]}=${entry[1]}")
+		.join(" ")

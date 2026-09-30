@@ -68,6 +68,11 @@ class MiniCompilerCheckRepository:
 		full_path.parent.mkdir(parents=True, exist_ok=True)
 		full_path.write_text(content, encoding="utf-8")
 
+	def write_suite_path(self, path: str) -> None:
+		full_path = self.root / path
+		full_path.parent.mkdir(parents=True, exist_ok=True)
+		self.write_suite(path)
+
 	def write_suite(self, path: str) -> None:
 		(self.root / path).write_text("tests : TestSuite = test_suite(\"mini\")\n", encoding="utf-8")
 
@@ -302,6 +307,21 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			result = repo.run("blorp/test/compiler/missing.brp", "--plan")
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("unknown suite", result.stderr)
+
+	def test_separately_gated_owner_selects_nothing_and_names_its_gate(self) -> None:
+		with MiniCompilerCheckRepository() as repo:
+			repo.write_source("blorp/src/compiler_new/stage_01_discovery/walker.brp")
+			repo.write_suite_path("blorp/test/compiler_new/stage_01_discovery/test_walker.brp")
+
+			result = repo.run("--changed", "--plan")
+			self.assert_success(result)
+
+			self.assertIn("Selected 0 production sources, 0 suites, 0 special checks.", result.stdout)
+			self.assertIn("run scripts/test compiler-new", result.stdout)
+			self.assertFalse(repo.marker.exists())
+
+			validation = repo.run("--validate-manifest")
+			self.assert_success(validation)
 
 	def test_plan_json_matches_human_selection(self) -> None:
 		with MiniCompilerCheckRepository() as repo:

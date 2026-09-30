@@ -1,0 +1,257 @@
+-- Declaration parser tests: each parses one module from source and compares
+-- its declaration tables, rendered by `declarations_dump`, and its
+-- diagnostics with the expected lines.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiscoveryBuilder,
+		empty_discovery_builder,
+	../../../src/compiler_new/stage_01_discovery/discovery_diagnostic_code: diagnostic_code_name
+	../../../src/compiler_new/stage_01_discovery/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		freeze,
+	../../../src/compiler_new/stage_01_discovery/module_walker: load_module
+	../../../src/compiler_new/stage_01_discovery/row_kinds:
+		ModuleOriginKind(UserModule),
+		ModuleReach(RootModule),
+	../../../src/compiler_new/stage_01_discovery/source_provider: PackageMembership(NotInPackage)
+	../../../src/compiler_new/stage_01_discovery/span: span_start
+	../support/declarations_dump: declarations_dump
+	test: TestSuite
+
+
+---
+One module parsed from `text`.
+---
+pure func parsed(text: String) -> DiscoveryBuilder:
+	load_module(
+		empty_discovery_builder(),
+		{
+			path = "main.brp",
+			origin = UserModule,
+			package = NotInPackage
+		},
+		RootModule,
+		text,
+	)
+
+
+---
+Whether parsing `text` renders exactly `expected` (the declaration dump, then
+one `diagnostic Code@offset` line per diagnostic) and its tables satisfy the
+table invariants.
+---
+pure func dumps_as(text: String, expected: List[String]) -> Bool:
+	builder: DiscoveryBuilder = parsed(text)
+	var lines: List[String] = [declarations_dump(builder)]
+
+	for row in builder.diagnostics:
+		lines = lines.append("diagnostic ${diagnostic_code_name(row.code)}@${span_start(row.span)}")
+
+	actual: String = lines.join("\n")
+	actual == expected.join("\n") and freezes_with_invariants(builder)
+
+
+---
+Whether the parsed tables satisfy every table invariant.
+---
+pure func freezes_with_invariants(builder: DiscoveryBuilder) -> Bool:
+	match freeze(builder):
+		FrozenTables(_):
+			True
+		TableInvariantsViolated(_):
+			False
+
+
+pure func test_function_signatures_type_parameters_and_constraints() -> Bool:
+	dumps_as(
+		"---\nAdds.\n---\npure func add[T: Addable + Hash, #N](a: T, b: T, _, _: Int, (x, y): (Int, Int)) -> T where #N == #N + 1:\n\ta + b\n\n@tail_recursive\nfunc loop(n) -> Int: n\n\nprivate func forward(x: Int) -> Int\n\nfunc no_return():\n\t0\n",
+		[
+			"func add[T: Addable + Hash, #N] pure (a: Named(T), b: Named(T), _, _: Named(Int), (x, y): Tuple(Named(Int), Named(Int))) : Named(T) {doc=\"Adds.\" where Dim(N) == (Dim(N) + Dim(1))} @0-125",
+			"func loop (n) : Named(Int) {@tail_recursive} @127-165",
+			"private func forward (x: Named(Int)) : Named(Int) @167-202",
+			"func no_return () @204-224",
+		],
+	)
+
+
+pure func test_written_types_become_type_nodes() -> Bool:
+	dumps_as(
+		"a: List[Int] = x\nb: M.Map[String, T: Eq + Hash] = x\nc: Float[#3] = x\nd: Float[#Rows, #Cols] = x\ne: Int[#N][#2] = x\nf: () = x\ng: () -> Int = x\nh: (Int, String) -> Bool = x\ni: pure (Int) -> Int = x\nj: (Int) = x\nk: (Int, Bool) = x\nl: ..#N = x\nm: Tensor[Float, #Ds...] = x\nn: Float[#_, #_...] = x\no: Self = x\np: Float[(#N * 2) / #4 - 1] = x\n",
+		[
+			"constant a : Named(List)[Named(Int)] @0-16",
+			"constant b : Qualified(M, Named(String), Bounded(T: Eq + Hash).Map) @17-51",
+			"constant c : Array(Named(Float); Dim(3)) @52-68",
+			"constant d : Array(Named(Float); Dim(Rows), Dim(Cols)) @69-95",
+			"constant e : Array(Array(Named(Int); Dim(N)); Dim(2)) @96-114",
+			"constant f : Named(Void) @115-124",
+			"constant g : Func(Named(Int)) @125-141",
+			"constant h : Func(Named(Int), Named(String), Named(Bool)) @142-170",
+			"constant i : PureFunc(Named(Int), Named(Int)) @171-195",
+			"constant j : Named(Int) @196-208",
+			"constant k : Tuple(Named(Int), Named(Bool)) @209-227",
+			"constant l : Range(Dim(N)) @228-239",
+			"constant m : Named(Tensor)[Named(Float), Dim(Ds...)] @240-268",
+			"constant n : Array(Named(Float); Dim(_), Dim(_...)) @269-292",
+			"constant o : Named(Self) @293-304",
+			(
+				"constant p : Array(Named(Float); (((Dim(N) * Dim(2)) / Dim(4)) - Dim(1))) @305-"
+				+ "336"
+			),
+		],
+	)
+
+
+pure func test_records_structs_and_their_fields() -> Bool:
+	dumps_as(
+		"record Pair[A, B] {first: A, second: B}\nstruct Point {x: Float, y: Float,}\n",
+		[
+			"record Pair[A, B] @0-39",
+			"  field first : Named(A) @19-27",
+			"  field second : Named(B) @29-38",
+			"struct Point @40-74",
+			"  field x : Named(Float) @54-62",
+			"  field y : Named(Float) @64-72",
+		],
+	)
+
+
+pure func test_unions_enums_and_variant_payloads() -> Bool:
+	dumps_as(
+		"union Shape[T]:\n\tCircle(Float)\n\tRect(Float, Float)\n\tEmpty\nenum Color:\n\tRed\n\tGreen\nenum Flag:\n\tTrue\n\tFalse\n",
+		[
+			"union Shape[T] @0-58",
+			"  variant Circle {payload=Named(Float)} @17-30",
+			"  variant Rect {payload=Named(Float) payload=Named(Float)} @32-50",
+			"  variant Empty @52-57",
+			"enum Color @58-82",
+			"  variant Red @71-74",
+			"  variant Green @76-81",
+			"enum Flag @82-106",
+			"  variant True @94-98",
+			"  variant False @100-105",
+		],
+	)
+
+
+pure func test_builtin_resource_alias_and_opaque_types() -> Bool:
+	dumps_as(
+		"type Handle = builtin\nresource type File = builtin(\"close_file\")\ntype alias Names = List[String]\nopaque type Email = String\n",
+		[
+			"builtin-type Handle @0-21",
+			"resource-type File {cleanup=\"close_file\"} @22-64",
+			"alias Names : Named(List)[Named(String)] @65-96",
+			"opaque Email : Named(String) @97-123",
+		],
+	)
+
+
+pure func test_globals_and_private_declarations() -> Bool:
+	dumps_as(
+		"limit: Int = 10\nprivate var counter: Int = 0\nprivate pure func helper() -> Int: 1\ntable =\n\tbuild()\n",
+		[
+			"constant limit : Named(Int) @0-15",
+			"private var counter : Named(Int) @16-44",
+			"private func helper pure () : Named(Int) @45-81",
+			"constant table @82-98",
+		],
+	)
+
+
+pure func test_traits_with_methods_and_supertraits() -> Bool:
+	dumps_as(
+		"trait Show[T]:\n\tfunc show(value: T) -> String\n\tpure func show_twice(value: T) -> String:\n\t\tshow(value) + show(value)\ntrait Ordered: Show + Equatable\ntrait Both: Show:\n\tfunc both(x: Self) -> Bool\n",
+		[
+			"trait Show[T] @0-117",
+			"  trait-method show (value: Named(T)) : Named(String) @16-45",
+			"  trait-method show_twice pure (value: Named(T)) : Named(String) @47-116",
+			"trait Ordered {super=Show super=Equatable} @117-148",
+			"trait Both {super=Show} @149-195",
+			"  trait-method both (x: Named(Self)) : Named(Bool) @168-194",
+		],
+	)
+
+
+pure func test_impls_and_their_methods() -> Bool:
+	dumps_as(
+		"implements Show for Point:\n\t@no_copy\n\tpure func show(value: Point) -> String:\n\t\t\"point\"\n\tfunc helper[U](x: U) -> U: x\n",
+		[
+			"impl Show : Named(Point) @0-118",
+			"  impl-method show pure (value: Named(Point)) : Named(String) {@no_copy} @28-87",
+			"  impl-method helper[U] (x: Named(U)) : Named(U) @89-117",
+		],
+	)
+
+
+pure func test_foreign_blocks_bindings_and_c_names() -> Bool:
+	dumps_as(
+		"foreign(include: \"math.h\", link: \"-lm\"):\n\tpure func c_sqrt(x: Float) -> Float = \"sqrt\"\n\tprivate @no_copy func raw(p: Ptr) -> Int\nforeign:\n\tfunc plain() -> Void\n",
+		[
+			"foreign-func c_sqrt pure (x: Named(Float)) : Named(Float) {block=0 c_name=\"sqrt\"} @42-86",
+			"private foreign-func raw (p: Named(Ptr)) : Named(Int) {@no_copy block=0} @88-128",
+			"foreign-func plain () : Named(Void) {block=1} @139-159",
+			"foreign-block 0 (include=\"math.h\", link=\"-lm\") @0-129",
+			"foreign-block 1 () @129-160",
+		],
+	)
+
+
+pure func test_malformed_declarations_are_reported_and_recovered() -> Bool:
+	dumps_as(
+		"func (x) -> Int: x\nrecord {a: Int}\nfunc f(type: Int) -> Int: 0\n@unknown_one\nfunc g() -> Int: 0\n@no_copy\nx: Int = 1\nforeign func h() -> Int\nstruct S {a Int}\nunion U:\n\tA(Int\n123\n",
+		[
+			"func  (x) : Named(Int) @0-18",
+			"record  @19-34",
+			"  field a : Named(Int) @27-33",
+			"func f (type: Named(Int)) : Named(Int) @35-62",
+			"func g () : Named(Int) @63-94",
+			"constant x : Named(Int) @95-114",
+			"constant h @128-131",
+			"constant Int @135-145",
+			"constant S @146-150",
+			"constant Int @151-155",
+			"union U @156-176",
+			"  variant A {payload=Named(Int)} @166-167",
+			"  variant  @172-175",
+			"diagnostic ExpectedNameDiagnostic@5",
+			"diagnostic ExpectedNameDiagnostic@26",
+			"diagnostic ExpectedLeftBraceDiagnostic@27",
+			"diagnostic ReservedKeywordAsNameDiagnostic@42",
+			"diagnostic UnknownAnnotationDiagnostic@64",
+			"diagnostic AnnotationWithoutFunctionDiagnostic@104",
+			"diagnostic ForeignFunctionOutsideBlockDiagnostic@115",
+			"diagnostic ExpectedEqualDiagnostic@129",
+			"diagnostic ExpectedDeclarationDiagnostic@132",
+			"diagnostic ExpectedEqualDiagnostic@139",
+			"diagnostic ExpectedIndentDiagnostic@139",
+			"diagnostic ExpectedExpressionDiagnostic@139",
+			"diagnostic ExpectedEqualDiagnostic@148",
+			"diagnostic ExpectedRightBraceDiagnostic@151",
+			"diagnostic ExpectedEqualDiagnostic@154",
+			"diagnostic ExpectedExpressionDiagnostic@154",
+			"diagnostic ExpectedRightParenDiagnostic@172",
+			"diagnostic ExpectedNameDiagnostic@172",
+		],
+	)
+
+
+tests: TestSuite = {
+	description = "Discovery declaration parser",
+	tests = [
+		(
+			"function signatures type parameters and constraints",
+			test_function_signatures_type_parameters_and_constraints,
+		),
+		("written types become type nodes", test_written_types_become_type_nodes),
+		("records structs and their fields", test_records_structs_and_their_fields),
+		("unions enums and variant payloads", test_unions_enums_and_variant_payloads),
+		("builtin resource alias and opaque types", test_builtin_resource_alias_and_opaque_types),
+		("globals and private declarations", test_globals_and_private_declarations),
+		("traits with methods and supertraits", test_traits_with_methods_and_supertraits),
+		("impls and their methods", test_impls_and_their_methods),
+		("foreign blocks bindings and c names", test_foreign_blocks_bindings_and_c_names),
+		(
+			"malformed declarations are reported and recovered",
+			test_malformed_declarations_are_reported_and_recovered,
+		),
+	]
+}
