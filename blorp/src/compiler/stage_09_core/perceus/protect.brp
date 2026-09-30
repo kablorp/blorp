@@ -747,6 +747,165 @@ private pure func protect_repeated_consumes_impl(
 	expr: CoreExpr,
 	in_repeated_context: Bool,
 ) -> CoreExpr:
+	-- Most calls land on operands rather than spines, so only spine heads pay
+	-- for the explicit stack.
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			protect_repeated_spine(env, target, target_type, expr, in_repeated_context)
+		BorrowLetExpr(variable, typ, rhs, body):
+			protect_repeated_spine(env, target, target_type, expr, in_repeated_context)
+		SeqExpr(first, second):
+			protect_repeated_spine(env, target, target_type, expr, in_repeated_context)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			protect_repeated_spine(env, target, target_type, expr, in_repeated_context)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			protect_repeated_spine(env, target, target_type, expr, in_repeated_context)
+		_:
+			protect_repeated_node(env, target, target_type, expr, in_repeated_context)
+
+
+--- Binding, sequence, and ownership-marker spines are right-associated and
+--- grow with the length of a straight-line body, so this walk descends them
+--- iteratively instead of recursing once per binding: a body with a thousand
+--- consecutive lets otherwise overflows the native stack. Each spine node's
+--- own operands (a let RHS, a sequence's first expression) still recurse, and
+--- are bounded by expression nesting rather than body length.
+--- A let or dup of `target` itself ends the descent: the name is shadowed or
+--- already accounted for below it, so its trailing body is kept as is.
+private pure func protect_repeated_spine(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	expr: CoreExpr,
+	in_repeated_context: Bool,
+) -> CoreExpr:
+	var spine: List[CoreExpr] = []
+	var current: CoreExpr = expr
+	var trailing_is_shadowed: Bool = False
+	var descending: Bool = True
+
+	while descending:
+		match current:
+			LetExpr(variable, is_mutable, typ, rhs, body):
+				spine = spine.append(current)
+				trailing_is_shadowed = variable.name == target.name
+				descending = not trailing_is_shadowed
+				current = body
+			BorrowLetExpr(variable, typ, rhs, body):
+				spine = spine.append(current)
+				trailing_is_shadowed = variable.name == target.name
+				descending = not trailing_is_shadowed
+				current = body
+			SeqExpr(first, second):
+				spine = spine.append(current)
+				current = second
+			DupExpr(variable, value_type, retain_policy, body, typ, loc):
+				if variable.name == target.name:
+					-- The dup of `target` is kept whole, so it is the leaf.
+					trailing_is_shadowed = True
+					descending = False
+				else:
+					spine = spine.append(current)
+					current = body
+			DropExpr(variable, value_type, release_policy, body, typ, loc):
+				spine = spine.append(current)
+				current = body
+			_:
+				descending = False
+
+	var result: CoreExpr = if trailing_is_shadowed:
+		current
+	else:
+		protect_repeated_node(env, target, target_type, current, in_repeated_context)
+	var index: Int = spine.length() - 1
+
+	while index >= 0:
+		match spine.get(index):
+			Some(source):
+				result = protect_repeated_spine_node(
+					env,
+					target,
+					target_type,
+					source,
+					result,
+					in_repeated_context,
+				)
+			None:
+				void
+
+		index -= 1
+
+	result
+
+
+--- Rebuild one spine node around its already-protected trailing child. Lets
+--- and sequences reuse the source node when nothing under it changed.
+private pure func protect_repeated_spine_node(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	source: CoreExpr,
+	trailing: CoreExpr,
+	in_repeated_context: Bool,
+) -> CoreExpr:
+	match source:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			protected_rhs: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				rhs,
+				in_repeated_context,
+			)
+
+			if same_object(protected_rhs, rhs) and same_object(trailing, body):
+				source
+			else:
+				LetExpr(variable, is_mutable, typ, protected_rhs, trailing)
+		BorrowLetExpr(variable, typ, rhs, body):
+			protected_rhs: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				rhs,
+				in_repeated_context,
+			)
+
+			if same_object(protected_rhs, rhs) and same_object(trailing, body):
+				source
+			else:
+				BorrowLetExpr(variable, typ, protected_rhs, trailing)
+		SeqExpr(first, second):
+			protected_first: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				first,
+				in_repeated_context,
+			)
+
+			if same_object(protected_first, first) and same_object(trailing, second):
+				source
+			else:
+				SeqExpr(protected_first, trailing)
+		DupExpr(variable, value_type, retain_policy, body, typ, loc):
+			DupExpr(variable, value_type, retain_policy, trailing, typ, loc)
+		DropExpr(variable, value_type, release_policy, body, typ, loc):
+			DropExpr(variable, value_type, release_policy, trailing, typ, loc)
+		_:
+			-- The descent pushes only the five forms above.
+			source
+
+
+--- Every form the spine descent in `protect_repeated_spine` does not
+--- consume.
+private pure func protect_repeated_node(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	expr: CoreExpr,
+	in_repeated_context: Bool,
+) -> CoreExpr:
 	match expr:
 		CallExpr(kind, callee, args, typ, loc):
 			protected_callee: CoreExpr = protect_repeated_consumes(
@@ -1081,62 +1240,6 @@ private pure func protect_repeated_consumes_impl(
 				typ,
 				loc,
 			)
-		LetExpr(variable, is_mutable, typ, rhs, body):
-			protected_body: CoreExpr = if variable.name == target.name:
-				body
-			else:
-				protect_repeated_consumes(env, target, target_type, body, in_repeated_context)
-
-			protected_rhs: CoreExpr = protect_repeated_consumes(
-				env,
-				target,
-				target_type,
-				rhs,
-				in_repeated_context,
-			)
-
-			if same_object(protected_rhs, rhs) and same_object(protected_body, body):
-				expr
-			else:
-				LetExpr(variable, is_mutable, typ, protected_rhs, protected_body)
-		BorrowLetExpr(variable, typ, rhs, body):
-			protected_body: CoreExpr = if variable.name == target.name:
-				body
-			else:
-				protect_repeated_consumes(env, target, target_type, body, in_repeated_context)
-
-			protected_rhs: CoreExpr = protect_repeated_consumes(
-				env,
-				target,
-				target_type,
-				rhs,
-				in_repeated_context,
-			)
-
-			if same_object(protected_rhs, rhs) and same_object(protected_body, body):
-				expr
-			else:
-				BorrowLetExpr(variable, typ, protected_rhs, protected_body)
-		SeqExpr(first, second):
-			protected_first: CoreExpr = protect_repeated_consumes(
-				env,
-				target,
-				target_type,
-				first,
-				in_repeated_context,
-			)
-			protected_second: CoreExpr = protect_repeated_consumes(
-				env,
-				target,
-				target_type,
-				second,
-				in_repeated_context,
-			)
-
-			if same_object(protected_first, first) and same_object(protected_second, second):
-				expr
-			else:
-				SeqExpr(protected_first, protected_second)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
 			protected_cond: CoreExpr = protect_repeated_consumes(
 				env,
@@ -1422,27 +1525,6 @@ private pure func protect_repeated_consumes_impl(
 					typ,
 					loc,
 				)
-		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			if variable.name == target.name:
-				expr
-			else:
-				DupExpr(
-					variable,
-					value_type,
-					retain_policy,
-					protect_repeated_consumes(env, target, target_type, body, in_repeated_context),
-					typ,
-					loc,
-				)
-		DropExpr(variable, value_type, release_policy, body, typ, loc):
-			DropExpr(
-				variable,
-				value_type,
-				release_policy,
-				protect_repeated_consumes(env, target, target_type, body, in_repeated_context),
-				typ,
-				loc,
-			)
 		ResourceScopeExpr(scope, typ, loc):
 			ResourceScopeExpr(
 				{ scope |

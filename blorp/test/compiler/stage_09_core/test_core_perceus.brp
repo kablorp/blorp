@@ -281,6 +281,20 @@ DEEP_CONSUMING_CALL_DEF_ID: Int = 70000
 
 DEEP_LOGICAL_EXPR_COUNT: Int = 2048
 
+--- Every binding in the threaded chain protects the whole remaining chain, so
+--- its cost is quadratic in the count; this size keeps the sanitizer gate inside
+--- its per-artifact budget. The single-walk protection test below carries the
+--- stack-depth regression at a much larger size.
+DEEP_THREADED_BINDING_COUNT: Int = 512
+
+--- One repeated-consume protection walk is linear, so it can afford a spine far
+--- deeper than any native stack could recurse through.
+DEEP_PROTECTED_SPINE_LENGTH: Int = 20000
+
+DEEP_THREADED_BINDING_DEF_ID_BASE: Int = 80000
+
+DEEP_THREADING_CALL_DEF_ID: Int = 90000
+
 
 -- The owners the borrowed-result fixtures name, in the order they are numbered:
 -- an owner's fixture id is its 1-based position, so ids are small, stable and
@@ -7383,6 +7397,236 @@ pure func test_deep_call_consumed_managed_let_chain_transfers_without_stack_grow
 				valid = False
 
 	valid and complete and binding_count == DEEP_MANAGED_BINDING_COUNT
+
+
+pure func deep_threaded_binding_var(index: Int) -> CoreVar:
+	{
+		name = "deep_threaded_${index}",
+		id = index + 1,
+		def_id = Some(DEEP_THREADED_BINDING_DEF_ID_BASE + index),
+		origin = AuthoredBinder
+	}
+
+
+--- Each binding's RHS consumes the previous binding, the shape a
+--- straight-line chain of record updates lowers to. Unlike the independent
+--- chains above, every managed let here is rebuilt with repeated-consume
+--- protection over the whole remaining chain.
+pure func test_deep_threaded_managed_let_chain_keeps_transfers_without_stack_growth() -> Bool:
+	var expr: CoreExpr = VarExpr(
+		deep_threaded_binding_var(DEEP_THREADED_BINDING_COUNT - 1),
+		list_int_type(),
+		synthetic_core_source_loc(),
+	)
+	var index: Int = DEEP_THREADED_BINDING_COUNT - 1
+
+	while index > 0:
+		expr = LetExpr(
+			deep_threaded_binding_var(index),
+			False,
+			list_int_type(),
+			user_call_expr(
+				"extend",
+				Some(DEEP_THREADING_CALL_DEF_ID),
+				[0],
+				[VarExpr(deep_threaded_binding_var(index - 1), list_int_type(), synthetic_core_source_loc())],
+				list_int_type(),
+			),
+			expr,
+		)
+		index -= 1
+
+	expr = LetExpr(
+		deep_threaded_binding_var(0),
+		False,
+		list_int_type(),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		expr,
+	)
+
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+	var current: CoreExpr = rewritten
+	var binding_count: Int = 0
+	var valid: Bool = True
+	var complete: Bool = False
+
+	-- Every binding transfers into the next call, so the rewrite keeps the
+	-- chain exactly as written: no dup or drop appears anywhere on the spine.
+	while valid and not complete:
+		match current:
+			LetExpr(variable, False, NamedType("List", [NamedType("Int", [])]), rhs, body):
+				valid = exact_core_var_equal(variable, deep_threaded_binding_var(binding_count))
+
+				if binding_count > 0:
+					match rhs:
+						CallExpr(UserCall("extend", _, [0]), _, [VarExpr(consumed, _, _)], _, _):
+							valid = valid and exact_core_var_equal(
+								consumed,
+								deep_threaded_binding_var(binding_count - 1),
+							)
+						_:
+							valid = False
+
+				binding_count += 1
+				current = body
+			VarExpr(result, _, _):
+				valid = exact_core_var_equal(
+					result,
+					deep_threaded_binding_var(DEEP_THREADED_BINDING_COUNT - 1),
+				)
+				complete = True
+			_:
+				valid = False
+
+	valid and complete and binding_count == DEEP_THREADED_BINDING_COUNT
+
+
+--- A let/sequence spine of `DEEP_PROTECTED_SPINE_LENGTH` nodes over `tail`,
+--- alternating the two spine forms so both descend.
+pure func deep_protected_spine(tail: CoreExpr) -> CoreExpr:
+	var expr: CoreExpr = tail
+	var index: Int = DEEP_PROTECTED_SPINE_LENGTH - 1
+
+	while index >= 0:
+		expr = if index % 2 == 0:
+			LetExpr(
+				deep_threaded_binding_var(index),
+				False,
+				int_type(),
+				int_expr(index),
+				expr,
+			)
+		else:
+			SeqExpr(int_expr(index), expr)
+		index -= 1
+
+	expr
+
+
+--- Repeated-consume protection used to recurse once per spine node and
+--- overflowed the native stack a few hundred bindings into a straight-line
+--- body. An unchanged spine must come back as the same object; a changed tail
+--- must rebuild every spine node around it while keeping each operand.
+pure func test_protect_repeated_consumes_walks_deep_spine_without_stack_growth() -> Bool:
+	unchanged_spine: CoreExpr = deep_protected_spine(int_expr(DEEP_PROTECTED_SPINE_LENGTH))
+	unchanged_protected: CoreExpr = protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		unchanged_spine,
+		False,
+	)
+	-- AssignExpr is always rebuilt by protection, so it forces every spine
+	-- node above it to be rebuilt as well.
+	tail_rhs: CoreExpr = int_expr(DEEP_PROTECTED_SPINE_LENGTH)
+	changed_spine: CoreExpr = deep_protected_spine(
+		AssignExpr(named_var("other"), tail_rhs, void_type(), synthetic_core_source_loc()),
+	)
+	var current: CoreExpr = protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		changed_spine,
+		False,
+	)
+	var source: CoreExpr = changed_spine
+	var spine_length: Int = 0
+	var valid: Bool = True
+	var complete: Bool = False
+
+	while valid and not complete:
+		match (current, source):
+			(LetExpr(variable, _, _, rhs, body), LetExpr(_, _, _, source_rhs, source_body)):
+				valid = (
+					not same_object(current, source)
+					and exact_core_var_equal(variable, deep_threaded_binding_var(spine_length))
+					and same_object(rhs, source_rhs)
+				)
+				spine_length += 1
+				current = body
+				source = source_body
+			(SeqExpr(first, second), SeqExpr(source_first, source_second)):
+				valid = not same_object(current, source) and same_object(first, source_first)
+				spine_length += 1
+				current = second
+				source = source_second
+			(AssignExpr(variable, rhs, _, _), AssignExpr(_, _, _, _)):
+				valid = variable.name == "other" and same_object(rhs, tail_rhs)
+				complete = True
+			_:
+				valid = False
+
+	(
+		same_object(unchanged_protected, unchanged_spine)
+		and valid
+		and complete
+		and spine_length == DEEP_PROTECTED_SPINE_LENGTH
+	)
+
+
+--- A spine node that binds or dups the protected name ends the spine descent:
+--- everything below it must come back as the same object even when it holds
+--- a form protection would otherwise rebuild, while the node above it is
+--- rebuilt around its changed RHS.
+pure func protect_spine_stops_at_target_for_test(target_node: CoreExpr) -> Bool:
+	upper_assign_rhs: CoreExpr = int_expr(1)
+	expr: CoreExpr = LetExpr(
+		named_var("upper"),
+		False,
+		void_type(),
+		AssignExpr(named_var("other"), upper_assign_rhs, void_type(), synthetic_core_source_loc()),
+		target_node,
+	)
+	protected: CoreExpr = protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		named_var("slot"),
+		list_int_type(),
+		expr,
+		False,
+	)
+
+	match protected:
+		LetExpr(variable, _, _, AssignExpr(_, rhs, _, _), body):
+			(
+				not same_object(protected, expr)
+				and variable.name == "upper"
+				and same_object(rhs, upper_assign_rhs)
+				and same_object(body, target_node)
+			)
+		_:
+			False
+
+
+pure func test_protect_spine_stops_at_target_binding_and_dup() -> Bool:
+	shadowed_tail: CoreExpr = AssignExpr(
+		named_var("other"),
+		int_expr(2),
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	shadowing_let: CoreExpr = LetExpr(
+		named_var("slot"),
+		False,
+		list_int_type(),
+		int_expr(3),
+		shadowed_tail,
+	)
+	target_dup: CoreExpr = DupExpr(
+		named_var("slot"),
+		list_int_type(),
+		ArcRetainPolicy,
+		shadowed_tail,
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+
+	(
+		protect_spine_stops_at_target_for_test(shadowing_let)
+		and protect_spine_stops_at_target_for_test(target_dup)
+	)
 
 
 pure func test_deep_sequence_collects_distinct_resolved_values_without_quadratic_growth() -> Bool:
@@ -19693,6 +19937,18 @@ tests: TestSuite = {
 		(
 			"deep call-consumed managed let chain transfers without stack growth",
 			test_deep_call_consumed_managed_let_chain_transfers_without_stack_growth,
+		),
+		(
+			"deep threaded managed let chain keeps transfers without stack growth",
+			test_deep_threaded_managed_let_chain_keeps_transfers_without_stack_growth,
+		),
+		(
+			"protect repeated consumes walks deep spine without stack growth",
+			test_protect_repeated_consumes_walks_deep_spine_without_stack_growth,
+		),
+		(
+			"protect spine stops at target binding and dup",
+			test_protect_spine_stops_at_target_binding_and_dup,
 		),
 		(
 			"deep sequence collects distinct resolved values without quadratic growth",
