@@ -63,9 +63,6 @@ module inventory lives in
 - [`TYPECHECK_OPTIMIZATION_ISSUES.md`](TYPECHECK_OPTIMIZATION_ISSUES.md) — five worker-ready typecheck issues (T-A..T-E) with anchors, fast loop, acceptance numbers.
 - [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) — compiler-wide ID-first migration from discovery through typecheck, Core, and emission; normalized logical tables, literate worker handoffs, A-stage/D-delivery/C-cut sequencing, typed identity domains, oracles, and stop rules.
 - [`PERCEUS_CLEANUP_ISSUES.md`](PERCEUS_CLEANUP_ISSUES.md) — worker-ready Perceus cleanup issues P0-P6 from the split observations; allocation floor rules.
-- [Compact Parser Migration](COMPACT_PARSER_MIGRATION.md) defines the staged
-  schema, ownership, compatibility, and measurement contract for replacing
-  per-expression parser trees without creating a second permanent parser.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 
