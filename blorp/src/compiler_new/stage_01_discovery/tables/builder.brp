@@ -60,7 +60,7 @@
 -- contiguous block of a child table addressed by a `RowRange`.
 import:
 	debug as dbg
-	diagnostic_code: DiscoveryDiagnosticCode
+	diagnostic_code: PlainSyntaxCode, ResolutionDiagnostic, SyntaxDiagnostic(Plain)
 	ids:
 		BoundId,
 		DefinitionId,
@@ -119,7 +119,6 @@ import:
 		ConcurrencyCountRow,
 		DefinitionRow,
 		DefinitionTypeRow,
-		DiagnosticRow,
 		DimensionConstraintRow,
 		DimensionNameRow,
 		DocumentationRow,
@@ -152,6 +151,7 @@ import:
 		ParameterRow,
 		ParameterTypeRow,
 		PendingAnnotationRow,
+		ResolutionDiagnosticRow,
 		ResourceCleanupRow,
 		RootDiagnosticRow,
 		RootRow,
@@ -161,6 +161,7 @@ import:
 		SourceRow,
 		SupertraitQualifierRow,
 		SupertraitRow,
+		SyntaxDiagnosticRow,
 		TypeParameterRow,
 		VariantPayloadRow,
 	span: Span
@@ -186,17 +187,20 @@ uniqueness check a copy-on-write update has to pass.
 contiguous block; `resolution_diagnostics` holds the module graph's: imports that
 loaded no module, and sources that could not be admitted.
 
-The fields after `diagnostic_arguments` are transient: the tokens of the
+The fields after `resolution_diagnostics` are transient: the tokens of the
 one module being parsed (and of its interpolation holes, appended after its
 end-of-file token), the index of the parser's next token, the docstrings and
 annotations read before their declaration's row exists, the parts of the
 module's interpolated strings, the roots of the child nodes a parent
 node has not yet claimed, and the loop context of the body being parsed.
-`without_transient_tables` empties them; lexing a module starts from it and
-`freeze` drops them with it. They live here because lexing interns names and
-literals into this builder while it produces tokens, and parsing appends
-rows while it consumes them; the builder is the only value threaded through
-that work.
+`without_transient_tables` empties them when a module's lexing starts. They
+live here because lexing interns names and literals into this builder while it
+produces tokens, and parsing appends rows while it consumes them; the builder
+is the only value threaded through that work.
+
+`freeze` moves the tables into a `DiscoveryTables` (see `discovery_tables`) and
+drops the transient fields and the four intern indexes with the builder, so
+nothing that reads frozen tables can see them.
 ---
 record DiscoveryBuilder {
 	name_spellings: List[String],
@@ -255,9 +259,8 @@ record DiscoveryBuilder {
 	dimension_names: List[DimensionNameRow],
 	literals: List[String],
 	literal_slots: List[Int],
-	diagnostics: List[DiagnosticRow],
-	resolution_diagnostics: List[DiagnosticRow],
-	diagnostic_arguments: List[Int],
+	diagnostics: List[SyntaxDiagnosticRow],
+	resolution_diagnostics: List[ResolutionDiagnosticRow],
 	tokens: List[Token],
 	token_cursor: Int,
 	pending_docstrings: List[LiteralId],
@@ -335,7 +338,6 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		literal_slots = empty_slots(INITIAL_SLOT_COUNT),
 		diagnostics = [],
 		resolution_diagnostics = [],
-		diagnostic_arguments = [],
 		tokens = [],
 		token_cursor = 0,
 		pending_docstrings = [],
@@ -922,13 +924,6 @@ pure func append_resource_cleanup(
 	{ builder | resource_cleanups = builder.resource_cleanups.append(row) }
 
 
-pure func append_resolution_diagnostic(
-	builder: DiscoveryBuilder,
-	row: DiagnosticRow,
-) -> DiscoveryBuilder:
-	{ builder | resolution_diagnostics = builder.resolution_diagnostics.append(row) }
-
-
 ---
 Reports a lookup that cannot miss: an id the table issued, or an index inside a
 range the caller read from the same table. A debug build stops with the
@@ -942,114 +937,34 @@ pure func report_unreachable_lookup(table: String, index: Int, guarantee: String
 
 
 -- Diagnostics.
-pure func next_diagnostic_argument_row(builder: DiscoveryBuilder) -> Int:
-	builder.diagnostic_arguments.length()
-
-
-pure func append_diagnostic_argument(builder: DiscoveryBuilder, argument: Int) -> DiscoveryBuilder:
-	{ builder | diagnostic_arguments = builder.diagnostic_arguments.append(argument) }
-
-
-pure func append_diagnostic(builder: DiscoveryBuilder, row: DiagnosticRow) -> DiscoveryBuilder:
-	{ builder | diagnostics = builder.diagnostics.append(row) }
-
-
 ---
-Which diagnostic table a coded diagnostic goes to: the one the lexer and
-parsers fill, or the one the module graph fills (an import that loaded no
-module, a source that could not be admitted). Both read one shared table of
-integer arguments.
----
-private enum DiagnosticDestination:
-	LexAndParseDiagnostics
-	ModuleGraphDiagnostics
-
-
----
-The integer argument a coded diagnostic carries, whose meaning its code fixes
-(`diagnostic_argument_kinds`), if any.
----
-private union DiagnosticArgument:
-	NoArgument
-	OneArgument(Int)
-
-
-private pure func append_coded_diagnostic(
-	builder: DiscoveryBuilder,
-	destination: DiagnosticDestination,
-	code: DiscoveryDiagnosticCode,
-	span: Span,
-	argument: DiagnosticArgument,
-) -> DiscoveryBuilder:
-	arguments_first: Int = builder.diagnostic_arguments.length()
-
-	match argument:
-		NoArgument:
-			builder.append_diagnostic_to(
-				destination,
-				{
-					code = code,
-					span = span,
-					arguments = {
-						first = arguments_first,
-						count = 0
-					}
-				},
-			)
-		OneArgument(value):
-			with_argument: DiscoveryBuilder = builder.append_diagnostic_argument(value)
-			with_argument.append_diagnostic_to(
-				destination,
-				{
-					code = code,
-					span = span,
-					arguments = {
-						first = arguments_first,
-						count = 1
-					}
-				},
-			)
-
-
-private pure func append_diagnostic_to(
-	builder: DiscoveryBuilder,
-	destination: DiagnosticDestination,
-	row: DiagnosticRow,
-) -> DiscoveryBuilder:
-	match destination:
-		LexAndParseDiagnostics:
-			builder.append_diagnostic(row)
-		ModuleGraphDiagnostics:
-			builder.append_resolution_diagnostic(row)
-
-
----
-Appends a diagnostic with no arguments.
+Appends a lexer or parser diagnostic that has no argument.
 ---
 pure func append_plain_diagnostic(
 	builder: DiscoveryBuilder,
-	code: DiscoveryDiagnosticCode,
+	code: PlainSyntaxCode,
 	span: Span,
 ) -> DiscoveryBuilder:
-	builder.append_coded_diagnostic(LexAndParseDiagnostics, code, span, NoArgument)
+	builder.append_syntax_diagnostic(span, Plain(code))
 
 
 ---
-Appends a diagnostic with one integer argument, whose meaning `code` fixes.
+Appends a lexer or parser diagnostic at `span`.
 ---
-pure func append_diagnostic_with_argument(
+pure func append_syntax_diagnostic(
 	builder: DiscoveryBuilder,
-	code: DiscoveryDiagnosticCode,
 	span: Span,
-	argument: Int,
+	diagnostic: SyntaxDiagnostic,
 ) -> DiscoveryBuilder:
-	builder.append_coded_diagnostic(LexAndParseDiagnostics, code, span, OneArgument(argument))
+	{ builder | diagnostics = builder.diagnostics.append({
+			span = span,
+			diagnostic = diagnostic,
+		}) }
 
 
 -- Transient tables of the module being lexed and parsed.
 ---
-`builder` with its transient tables empty: how a module's lexing starts and
-how `freeze` seals the tables.
+`builder` with its transient tables empty: how a module's lexing starts.
 ---
 pure func without_transient_tables(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	{ builder |
@@ -1244,27 +1159,18 @@ pure func advance_token(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 
 
 ---
-Appends a module graph diagnostic (an import that loaded no module, a source that
-could not be admitted) with one integer argument, whose meaning `code` fixes.
+Appends a module graph diagnostic (an import that loaded no module, a source
+that could not be admitted) at `span`.
 ---
-pure func append_resolution_diagnostic_with_argument(
+pure func append_resolution_diagnostic_at(
 	builder: DiscoveryBuilder,
-	code: DiscoveryDiagnosticCode,
 	span: Span,
-	argument: Int,
+	diagnostic: ResolutionDiagnostic,
 ) -> DiscoveryBuilder:
-	builder.append_coded_diagnostic(ModuleGraphDiagnostics, code, span, OneArgument(argument))
-
-
----
-Appends a module graph diagnostic with no arguments.
----
-pure func append_plain_resolution_diagnostic(
-	builder: DiscoveryBuilder,
-	code: DiscoveryDiagnosticCode,
-	span: Span,
-) -> DiscoveryBuilder:
-	builder.append_coded_diagnostic(ModuleGraphDiagnostics, code, span, NoArgument)
+	{ builder | resolution_diagnostics = builder.resolution_diagnostics.append({
+			span = span,
+			diagnostic = diagnostic,
+		}) }
 
 
 ---

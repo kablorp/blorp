@@ -193,11 +193,11 @@ struct ModulePackageRow {module: ModuleId, package: PackageId}
 
 struct RootRow {request_path: PathId}
 struct RootTargetRow {root: RootId, target: ModuleId}
-struct RootDiagnosticRow {root: RootId, code: DiscoveryDiagnosticCode, arguments: RowRange}
+record RootDiagnosticRow {root: RootId, diagnostic: RootDiagnostic}
 
 struct ImplicitRequestRow {request_path: PathId}
 struct ImplicitTargetRow {request: ImplicitRequestId, target: ModuleId}
-struct ImplicitDiagnosticRow {request: ImplicitRequestId, code: DiscoveryDiagnosticCode, arguments: RowRange}
+record ImplicitDiagnosticRow {request: ImplicitRequestId, diagnostic: ImplicitDiagnostic}
 ```
 
 `ModuleReach` replaces the sketch's `is_root: Bool`. Each module's rows in
@@ -475,18 +475,50 @@ rejected with `InterpolatedStringPatternDiagnostic`.
 ### Diagnostics
 
 ```blorp
-struct DiagnosticRow {code: DiscoveryDiagnosticCode, span: Span, arguments: RowRange}
--- diagnostic_arguments: List[Int] (ids or counts, by code)
+record SyntaxDiagnosticRow {span: Span, diagnostic: SyntaxDiagnostic}
+record ResolutionDiagnosticRow {span: Span, diagnostic: ResolutionDiagnostic}
+-- RootDiagnosticRow and ImplicitDiagnosticRow: see the request tables above.
+
+union SyntaxDiagnostic:
+	Plain(PlainSyntaxCode)
+	ExpectedToken(ExpectedTokenDiagnostic)
+	UnknownEscape(Char)
+	IntegerLiteralOverflow(LiteralId)
+	...
+
+union ResolutionDiagnostic:
+	UnresolvedImport(ImportId)
+	ImportCaseMismatch(ImportId, PathId)
+	...
+	ImportTooManySources
 ```
 
 `diagnostics` holds each module's lex and parse diagnostics in the module's
 contiguous block; `resolution_diagnostics` holds the module graph's (imports that
-loaded nothing, sources that could not be admitted). The code catalogue is
-`tables/diagnostic_code.brp`: 105 codes, each documented with the meaning
-of its arguments, and `diagnostic_code_name` gives the stable names dumps
-and fixtures use. Messages are rendered from the code and arguments at the
-boundary that shows them, so the text lives in one place and can be tested
+loaded nothing, sources that could not be admitted). Each of the four diagnostic
+tables stores the union of its own table (`SyntaxDiagnostic`,
+`ResolutionDiagnostic`, `RootDiagnostic`, `ImplicitDiagnostic`), so a table
+cannot hold a code that belongs to another, and its appender takes only that
+union. The code catalogue is `tables/diagnostic_code.brp` (and
+`tables/expected_token.brp` for the missing-token codes): each variant is a code
+whose fields are its arguments, typed as what they are (an `ImportId`, a
+`PathId`, a `LiteralId`, a `NameId`, a `Char`). A syntax code with no argument is
+a `PlainSyntaxCode`. A rejection that exists in three tables (a source too large
+for a span, too many sources) is a variant of each (`ImportSourceTooLarge`,
+`RootSourceTooLarge`, `ImplicitSourceTooLarge`: variant names are module-wide),
+and `*_diagnostic_name` gives all of them one stable spelling, `<Variant>Diagnostic`,
+for dumps and fixtures. `SourceTooLarge` carries the byte length because the
+rejected source is never admitted, so no row holds it. A limit that is a
+constant (`MAX_INTERPOLATION_DEPTH`, `MAX_UNION_VARIANT_FIELDS`, in
+`tables/limits.brp`) is not carried: the renderer reads it. The rows are
+`record`s because a struct field cannot hold a union; each costs one allocation,
+which a program that compiles never pays. Messages are rendered from the value
+at the boundary that shows it, so the text lives in one place and can be tested
 exactly.
+
+What the types do not guarantee: that every id a diagnostic carries has a row
+(`freeze` checks it: `DanglingReference`), and that a `Char` argument is the
+byte the lexer saw (it is whatever the lexer put there).
 
 ### Diagnostic text
 
@@ -494,34 +526,29 @@ exactly.
 
 ```blorp
 record RenderedDiagnostic {message: String, help: Option[String]}
-pure func render_diagnostic(tables: FrontendTables, row: DiagnosticRow) -> RenderedDiagnostic
+pure func render_diagnostic(tables: FrontendTables, row: SyntaxDiagnosticRow) -> RenderedDiagnostic
+pure func render_resolution_diagnostic(tables: FrontendTables, row: ResolutionDiagnosticRow) -> RenderedDiagnostic
 pure func render_root_diagnostic(tables: FrontendTables, row: RootDiagnosticRow) -> RenderedDiagnostic
-pure func diagnostic_display(tables: FrontendTables, row: DiagnosticRow) -> String
+pure func render_implicit_diagnostic(tables: FrontendTables, row: ImplicitDiagnosticRow) -> RenderedDiagnostic
+pure func diagnostic_display(tables: FrontendTables, row: SyntaxDiagnosticRow) -> String
+pure func resolution_diagnostic_display(tables: FrontendTables, row: ResolutionDiagnosticRow) -> String
 ```
 
 `diagnostic_display` prints `path:line:column: error: message` and, on its own
 line, `help: ...`: the shape the existing compiler prints, with the same column
-convention (bytes, a tab advancing to the next multiple of four). One `match`
-over the code supplies the text, so a code without text does not compile, and
-every code has a help line (a test walks the code list). Arguments are
+convention (bytes, a tab advancing to the next multiple of four). A `match` over
+each union supplies the text, with no catch-all arm, so a code without text does
+not compile, and every code has a help line (a test walks every code). Arguments are
 spelled from the frozen tables: an import's text, a literal's digits, the
 stored name of a differently-cased file, and the names a parser interned (a
 reserved keyword written as a name, an unknown annotation, a concurrency
 parameter). Only `UnexpectedCharacter`, which has no token to name, reads the
 source text under its span.
 
-Each code documents its arguments as data: `diagnostic_argument_kinds(code)`
-in `diagnostic_code.brp` lists their kinds (a construct, an import, a path, a
-literal, a name, a number). `freeze` rejects a row with another number of
-arguments (`ArgumentCountMismatch`) or an invalid one, a construct that
-decodes to none or an id with no row (`ArgumentOutOfRange`), so rendering
-reads exactly what the code documents and has no missing-argument case. The 14
-`Expected...` codes can be reported only with a construct: a parser that
-reports one through the plain `report_at_current` or `expect_token` helpers
-(which store no argument) produces a row `freeze` rejects, so the mistake
-fails every fixture and gate at once. (Splitting the code type so the plain
-helpers cannot accept them would duplicate every other code's name; the
-freeze check is the smallest explicit option.)
+A row cannot hold too few, too many or the wrong kind of argument, so rendering
+has no missing-argument case. `freeze` still checks that the import, path,
+literal or name a diagnostic carries has a row (`DanglingReference`), listing
+every variant of each union so one that gains an id must be given its check.
 
 The text is copied from the existing compiler, not referenced, and is pinned
 twice. Every `should_fail` fixture that pins a first diagnostic also pins the
@@ -535,14 +562,16 @@ the first diagnostic of every file both front ends reject the same way, with
 the differences below as a reasoned allow-list.
 
 The 14 `Expected...` codes for a missing token (`ExpectedColon`,
-`ExpectedRightParen`, `ExpectedName`, ...) carry one argument, the
-`ParsedConstruct` the parser was in (`row_kinds.brp`: `IfCondition`,
-`Subscript`, `FunctionParameters`, ...), so `render.brp` can say `expected `:`
-after if condition` and not only that a colon is missing. A construct is
-meaningful only with the codes that report it; any other combination, or a
-row without the argument, reads as the code's general text (`expected `:``).
-`UnionVariantTooManyFields` carries its limit the same way, so the number
-lives only in the parser.
+`ExpectedRightParen`, `ExpectedName`, ...) each carry an enum of the constructs
+the parser reports that code in (`tables/expected_token.brp`: `ColonInIfCondition`,
+`RightBracketInSubscript`, `LeftParenInFunctionName`, ...), so `render.brp` can
+say `expected `:` after if condition` and not only that a colon is missing.
+Each enum lists exactly the pairs a parser call site reports (variant names are
+module-wide, so a variant is `<Code>In<Construct>`), so a value that
+type-checks is one the parser can produce and the renderer matches it with an
+arm of its own; adding a call site for a new pair means adding the variant and
+the arm. `UnionVariantTooManyFields` carries nothing: its limit lives in
+`tables/limits.brp`.
 
 Of the 94 codes the fixtures pin, 36 print exactly the existing compiler's
 text (message and help); 52 print the existing message and add a help line; 6
@@ -636,8 +665,9 @@ chance to break a threading rule. The transient fields are:
 - `child_stack`, `child_stack_depth`: node roots a parent has not yet
   claimed.
 
-`without_transient_tables` empties them; lexing a module starts from it, and
-`freeze` drops them with it.
+`without_transient_tables` empties them when lexing a module starts; `freeze`
+moves only the output lists into `DiscoveryTables`, so the parse state is not
+in the frozen tables.
 
 ### Post-order nodes through the child stack
 
@@ -891,7 +921,7 @@ and no sentinel precedence.
 When the last module is loaded, the builder is sealed:
 
 ```blorp
-opaque type FrontendTables = DiscoveryBuilder
+opaque type FrontendTables = DiscoveryTables
 
 union FreezeOutcome:
 	FrozenTables(FrontendTables)
@@ -899,6 +929,23 @@ union FreezeOutcome:
 
 pure func freeze(builder: DiscoveryBuilder) -> FreezeOutcome
 ```
+
+`DiscoveryTables` (`tables/discovery_tables.brp`) holds the output lists only:
+`freeze` moves each list out of the builder into it and drops the parse state
+and the intern indexes with the builder, so a reader of the frozen tables
+cannot see a token or a cursor. The move is a record literal that names the
+fields one by one; four of them are `List[String]` (names, paths, source
+texts, literals), so a swap would type-check, and
+`test_freeze_keeps_each_text_table_in_its_own_field` freezes a builder with a
+different number of distinct entries in each and reads them back.
+
+Next step, blocked on a compiler fix: let `DiscoveryBuilder` hold a
+`DiscoveryTables` field and the parse state beside it, so `freeze` is one move
+of that field and the mapping cannot be wrong (audit entry G1, with G3). Today
+a nested record field is not updated in place, so every append would copy the
+tables; the fix for nested in-place record updates is in progress on another
+branch, and the same family of copies is described in
+`docs/issues/record-update-same-field-read-copies.md`.
 
 `freeze` always checks the invariants (`tables/invariants.brp`); there is no
 trusted mode. The check reads each row a bounded number of times and

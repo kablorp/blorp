@@ -223,7 +223,7 @@ more. Each numbered item is one change.
    and `blorp.toml` aliases as candidate rules in the lookup policy; the
    differential also runs under both (criterion 4).
 6. **Rendered diagnostics and first-diagnostic parity (M). Landed.** One rendering
-   table from `DiscoveryDiagnosticCode` and its arguments to message and
+   table from the diagnostic unions (a code with its typed arguments) to message and
    help, owned by the stage, so the old parser's teaching messages survive.
    The corpus parity gate then compares, for every file both front ends
    reject, the first diagnostic's position and rendered text (criterion 3).

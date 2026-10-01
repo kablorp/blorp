@@ -1,13 +1,16 @@
 import:
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
 	../../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DiscoveryBuilder,
 		append_bound,
 		append_bound_qualifier,
 		append_definition,
-		append_diagnostic_with_argument,
+		append_resolution_diagnostic_at,
+		append_syntax_diagnostic,
 		append_implicit_request,
 		append_import,
 		append_module,
+		append_literal,
 		append_name,
 		append_path,
 		append_plain_diagnostic,
@@ -26,14 +29,24 @@ import:
 		next_source_id,
 		replace_module_row,
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
-		DiscoveryDiagnosticCode(
-			ExpectedColonDiagnostic, UnexpectedCharacterDiagnostic, UnknownAnnotationDiagnostic,
-		),
+		ResolutionDiagnostic(ImportCaseMismatch, UnresolvedImport),
+		SyntaxDiagnostic(ExpectedToken, IntegerLiteralOverflow, UnknownAnnotation),
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ColonConstruct(ColonInIfCondition),
+		ExpectedTokenDiagnostic(ExpectedColon),
 	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
 		FreezeOutcome(FrozenTables, TableInvariantsViolated),
 		freeze,
+		literal_count,
+		literal_text,
+		name_count,
+		name_spelling,
+		path_count,
+		path_text,
+		source_text,
 	../../../../src/compiler_new/stage_01_discovery/tables/ids:
 		DefinitionId,
+		LiteralId,
 		ModuleId,
 		NameId,
 		NodeId,
@@ -41,6 +54,8 @@ import:
 		SourceId,
 		bound_id_at_row,
 		definition_id_at_row,
+		import_id_at_row,
+		literal_id_at_row,
 		name_id_at_row,
 		node_id_at_row,
 		path_id_at_row,
@@ -52,19 +67,19 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/invariants/violation:
 		DiscoveryTable(
 			BodyTable, BoundQualifierTable, ConcurrencyCountTable, DefinitionTable, DiagnosticTable,
+			ResolutionDiagnosticTable,
 			DimensionNameTable, ElseKeywordTable, ImportTable, ModuleTable, NameTable,
 			NodeNameSpanTable, NodeTable, SourceTable, SupertraitQualifierTable, SupertraitTable,
 		),
 		TableInvariantKind(
-			ArgumentCountMismatch, ArgumentOutOfRange, BodyRootOutsideModule,
-			ConcurrencyCountMismatch, DanglingReference, DimensionSigilNameMissing,
-			DuplicateSideRow, ElseKeywordMismatch, ImplicitOutcomeMismatch, InternIndexMismatch,
-			LocalFunctionNodeMismatch, ModuleRangesOverlap, NameSpanOnWrongNodeKind,
-			NameSpanOutsideItsSpan, NodeArityMismatch, NodeChildNotBeforeParent,
-			NodeNameSpanMissing, NodeReferencedTwice, ParallelTableMismatch, PayloadOutOfRange,
-			QualifierOutsideReference, RangeOutOfBounds, RootOutcomeMismatch, SeededNameMoved,
-			SideTableUnsorted, SigilSpellingMismatch, SignatureCountMismatch, SpanOutsideSources,
-			SpanPastSourceEnd, UnreferencedNode,
+			BodyRootOutsideModule, ConcurrencyCountMismatch, DanglingReference,
+			DimensionSigilNameMissing, DuplicateSideRow, ElseKeywordMismatch,
+			ImplicitOutcomeMismatch, InternIndexMismatch, LocalFunctionNodeMismatch,
+			ModuleRangesOverlap, NameSpanOnWrongNodeKind, NameSpanOutsideItsSpan, NodeArityMismatch,
+			NodeChildNotBeforeParent, NodeNameSpanMissing, NodeReferencedTwice,
+			ParallelTableMismatch, PayloadOutOfRange, QualifierOutsideReference, RangeOutOfBounds,
+			RootOutcomeMismatch, SeededNameMoved, SideTableUnsorted, SigilSpellingMismatch,
+			SignatureCountMismatch, SpanOutsideSources, SpanPastSourceEnd, UnreferencedNode,
 		),
 		TableInvariantViolation,
 	../../../../src/compiler_new/stage_01_discovery/tables/invariants: check_table_invariants
@@ -96,10 +111,8 @@ import:
 			RecordFieldNode, SelectReceiveArmNode, SubtractAssignNode, TypedBindingNode,
 			VarDeclarationNode, WithBindingNode, WithErrorMapNode, WithTryBindingNode,
 		),
-		ParsedConstruct(IfCondition),
 		Purity(ImpureFunction),
 		Visibility(PublicVisibility),
-		parsed_construct_argument,
 	../../../../src/compiler_new/stage_01_discovery/tables/rows:
 		BoundQualifierRow,
 		ConcurrencyCountRow,
@@ -285,6 +298,53 @@ pure func violations_of(builder: DiscoveryBuilder) -> List[TableInvariantViolati
 
 pure func test_well_formed_builder_has_no_violations() -> Bool:
 	violations_of(well_formed_builder()).is_empty()
+
+
+---
+`freeze` moves each list of the builder into the field of the same name, and
+four fields hold the same type, so a swap would still type-check. A builder
+with a different number of distinct entries in each text table, frozen, must
+read each entry back through its own accessor.
+---
+pure func test_freeze_keeps_each_text_table_in_its_own_field() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder()
+	name: NameId = builder.next_name_id()
+	builder = builder.append_name("freeze_probe_name")
+	literal: LiteralId = literal_id_at_row(builder.literals.length())
+	builder = builder.append_literal("freeze_probe_literal")
+	builder = builder.append_literal("freeze_probe_literal_two")
+	builder = builder.append_literal("freeze_probe_literal_three")
+	builder = builder.append_literal("freeze_probe_literal_four")
+	path: PathId = builder.next_path_id()
+	builder = builder.append_path("freeze/probe/path.brp")
+	source: SourceId = builder.next_source_id()
+	builder = builder.admit_source("freeze/probe/source.brp", "freeze probe source text")
+
+	match builder.freeze():
+		FrozenTables(tables):
+			counts: List[Int] = [
+				tables.name_count(),
+				tables.path_count(),
+				tables.literal_count(),
+				tables.source_count(),
+			]
+			distinct: Bool = counts.all(
+				pure func(count): counts.filter(pure func(other): other == count).length() == 1,
+			)
+
+			(
+				distinct
+				and tables.name_spelling(name) == "freeze_probe_name"
+				and tables.literal_text(literal) == "freeze_probe_literal"
+				and tables.path_text(path) == "freeze/probe/path.brp"
+				and tables.source_text(source) == "freeze probe source text"
+				and tables.name_count() == builder.name_spellings.length()
+				and tables.path_count() == builder.paths.length()
+				and tables.literal_count() == builder.literals.length()
+				and tables.source_count() == builder.sources.length()
+			)
+		TableInvariantsViolated(_):
+			False
 
 
 pure func test_empty_builder_has_no_violations() -> Bool:
@@ -662,69 +722,59 @@ pure func test_side_table_out_of_owner_order_is_reported() -> Bool:
 	has_violation(builder.violations_of(), SideTableUnsorted, RootTargetTable)
 
 
--- Diagnostic arguments.
-pure func with_diagnostic_argument(
-	code: DiscoveryDiagnosticCode,
-	argument: Int,
-) -> DiscoveryBuilder:
-	well_formed_builder().append_diagnostic_with_argument(code, sample_span(), argument)
+-- Diagnostic references.
+pure func with_syntax_diagnostic(diagnostic: SyntaxDiagnostic) -> DiscoveryBuilder:
+	well_formed_builder().append_syntax_diagnostic(sample_span(), diagnostic)
 
 
-pure func test_a_construct_diagnostic_with_a_construct_has_no_violation() -> Bool:
-	violations_of(
-		with_diagnostic_argument(
-			ExpectedColonDiagnostic,
-			parsed_construct_argument(IfCondition),
-		),
-	).is_empty()
+pure func with_resolution_diagnostic(diagnostic: ResolutionDiagnostic) -> DiscoveryBuilder:
+	well_formed_builder().append_resolution_diagnostic_at(sample_span(), diagnostic)
 
 
-pure func test_a_construct_diagnostic_reported_without_its_construct_is_reported() -> Bool:
-	-- What a parser gets by calling the plain helpers with an `Expected...` code.
+pure func test_a_construct_diagnostic_has_no_violation() -> Bool:
+	violations_of(with_syntax_diagnostic(ExpectedToken(ExpectedColon(ColonInIfCondition)))).is_empty()
+
+
+pure func test_a_diagnostic_naming_no_name_is_reported() -> Bool:
+	has_violation(
+		violations_of(with_syntax_diagnostic(UnknownAnnotation(name_id_at_row(MISSING_ROW)))),
+		DanglingReference,
+		DiagnosticTable,
+	)
+
+
+pure func test_a_diagnostic_naming_a_name_is_accepted() -> Bool:
+	violations_of(with_syntax_diagnostic(UnknownAnnotation(main_name()))).is_empty()
+
+
+pure func test_a_diagnostic_naming_no_import_is_reported() -> Bool:
+	has_violation(
+		violations_of(with_resolution_diagnostic(UnresolvedImport(import_id_at_row(MISSING_ROW)))),
+		DanglingReference,
+		ResolutionDiagnosticTable,
+	)
+
+
+pure func test_a_diagnostic_naming_no_stored_path_is_reported() -> Bool:
 	has_violation(
 		violations_of(
-			well_formed_builder().append_plain_diagnostic(
-				ExpectedColonDiagnostic,
-				sample_span(),
+			with_resolution_diagnostic(
+				ImportCaseMismatch(import_id_at_row(0), path_id_at_row(MISSING_ROW)),
 			),
 		),
-		ArgumentCountMismatch,
-		DiagnosticTable,
+		DanglingReference,
+		ResolutionDiagnosticTable,
 	)
 
 
-pure func test_a_diagnostic_with_an_argument_its_code_does_not_document_is_reported() -> Bool:
+pure func test_a_diagnostic_naming_no_literal_is_reported() -> Bool:
 	has_violation(
-		violations_of(with_diagnostic_argument(UnexpectedCharacterDiagnostic, 1)),
-		ArgumentCountMismatch,
-		DiagnosticTable,
-	)
-
-
-pure func test_an_argument_that_names_no_construct_is_reported() -> Bool:
-	has_violation(
-		violations_of(with_diagnostic_argument(ExpectedColonDiagnostic, MISSING_ROW)),
-		ArgumentOutOfRange,
-		DiagnosticTable,
-	)
-
-
-pure func test_an_argument_that_names_no_name_is_reported() -> Bool:
-	has_violation(
-		violations_of(with_diagnostic_argument(UnknownAnnotationDiagnostic, MISSING_ROW)),
-		ArgumentOutOfRange,
-		DiagnosticTable,
-	)
-
-
-pure func test_an_argument_that_names_a_name_is_accepted() -> Bool:
-	violations_of(
-		with_diagnostic_argument(
-			UnknownAnnotationDiagnostic,
-			main_name().name_id_index(),
+		violations_of(
+			with_syntax_diagnostic(IntegerLiteralOverflow(literal_id_at_row(MISSING_ROW))),
 		),
-	).is_empty()
-
+		DanglingReference,
+		DiagnosticTable,
+	)
 
 
 ---
@@ -1332,28 +1382,23 @@ tests: TestSuite = {
 			test_side_table_out_of_owner_order_is_reported,
 		),
 		(
-			"a construct diagnostic with a construct has no violation",
-			test_a_construct_diagnostic_with_a_construct_has_no_violation,
+			"freeze keeps each text table in its own field",
+			test_freeze_keeps_each_text_table_in_its_own_field,
+		),
+		("a construct diagnostic has no violation", test_a_construct_diagnostic_has_no_violation),
+		("a diagnostic naming no name is reported", test_a_diagnostic_naming_no_name_is_reported),
+		("a diagnostic naming a name is accepted", test_a_diagnostic_naming_a_name_is_accepted),
+		(
+			"a diagnostic naming no import is reported",
+			test_a_diagnostic_naming_no_import_is_reported,
 		),
 		(
-			"a construct diagnostic reported without its construct is reported",
-			test_a_construct_diagnostic_reported_without_its_construct_is_reported,
+			"a diagnostic naming no stored path is reported",
+			test_a_diagnostic_naming_no_stored_path_is_reported,
 		),
 		(
-			"a diagnostic with an undocumented argument is reported",
-			test_a_diagnostic_with_an_argument_its_code_does_not_document_is_reported,
-		),
-		(
-			"an argument that names no construct is reported",
-			test_an_argument_that_names_no_construct_is_reported,
-		),
-		(
-			"an argument that names no name is reported",
-			test_an_argument_that_names_no_name_is_reported,
-		),
-		(
-			"an argument that names a name is accepted",
-			test_an_argument_that_names_a_name_is_accepted,
+			"a diagnostic naming no literal is reported",
+			test_a_diagnostic_naming_no_literal_is_reported,
 		),
 	]
 }

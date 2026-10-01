@@ -10,7 +10,6 @@ import:
 		DiscoveryBuilder,
 		advance_token,
 		append_definition_type,
-		append_diagnostic_with_argument,
 		append_foreign_argument,
 		append_foreign_binding,
 		append_foreign_block,
@@ -21,6 +20,7 @@ import:
 		append_pending_docstring,
 		append_plain_diagnostic,
 		append_resource_cleanup,
+		append_syntax_diagnostic,
 		append_variant_payload,
 		move_token_cursor,
 		next_definition_id,
@@ -29,17 +29,48 @@ import:
 		pending_docstring_count,
 		replace_foreign_block_row,
 	../tables/diagnostic_code:
-		DiscoveryDiagnosticCode(
-			AnnotationWithoutFunctionDiagnostic, BuiltinTypeArgumentsDiagnostic,
-			DocstringBeforeImportBlockDiagnostic, ExpectedArrowDiagnostic,
-			ExpectedCleanupBuiltinNameDiagnostic, ExpectedColonDiagnostic, ExpectedCommaDiagnostic,
-			ExpectedDeclarationDiagnostic, ExpectedEqualDiagnostic,
+		PlainSyntaxCode(
+			UnionVariantTooManyFieldsDiagnostic, AnnotationWithoutFunctionDiagnostic,
+			BuiltinTypeArgumentsDiagnostic, DocstringBeforeImportBlockDiagnostic,
+			ExpectedCleanupBuiltinNameDiagnostic, ExpectedDeclarationDiagnostic,
 			ExpectedForeignArgumentDiagnostic, ExpectedForeignArgumentValueDiagnostic,
 			ExpectedForeignCNameDiagnostic, ExpectedForeignFunctionDiagnostic,
-			ExpectedImplMethodDiagnostic, ExpectedIndentDiagnostic, ExpectedKeywordDiagnostic,
-			ExpectedLeftBraceDiagnostic, ExpectedNewlineDiagnostic, ExpectedRightBraceDiagnostic,
-			ExpectedRightParenDiagnostic, ExpectedSupertraitOrMethodsDiagnostic,
-			ForeignFunctionOutsideBlockDiagnostic, UnionVariantTooManyFieldsDiagnostic,
+			ExpectedImplMethodDiagnostic, ExpectedSupertraitOrMethodsDiagnostic,
+			ForeignFunctionOutsideBlockDiagnostic,
+		),
+	../tables/expected_token:
+		ArrowConstruct(ArrowInForeignFunctionReturnType),
+		ColonConstruct(
+			ColonInFieldName, ColonInForeignBlockArgumentName, ColonInForeignHeader,
+			ColonInImplementationMethods, ColonInTraitName, ColonInUnionVariants,
+		),
+		CommaConstruct(CommaInForeignBlockArguments),
+		EqualConstruct(EqualInBuiltinTypeMarker, EqualInTopLevelVariable, EqualInTypeAliasTarget),
+		ExpectedTokenDiagnostic(ExpectedArrow, ExpectedComma, ExpectedRightParen),
+		IndentConstruct(
+			IndentInForeignBlock, IndentInImplementationMethods, IndentInTraitMethods,
+			IndentInUnionVariants,
+		),
+		KeywordConstruct(
+			KeywordInBuiltinTypeDeclaration, KeywordInBuiltinTypeMarker, KeywordInForeignBlockItem,
+			KeywordInImplementationTrait, KeywordInOpaqueType, KeywordInTraitMethodName,
+			KeywordInTypeAliasKeyword,
+		),
+		LeftBraceConstruct(LeftBraceInRecordFields, LeftBraceInStructFields),
+		LeftParenConstruct(LeftParenInForeignFunctionName, LeftParenInTraitMethodName),
+		NameConstruct(
+			NameInFieldName, NameInForeignBlockArgumentName, NameInForeignFunctionName,
+			NameInTraitMethodName, NameInTraitName, NameInTypeAliasName, NameInTypeName,
+			NameInVariableName, NameInVariantName,
+		),
+		NewlineConstruct(
+			NewlineInForeignHeader, NewlineInImplementationMethods, NewlineInTraitMethods,
+			NewlineInUnionVariants,
+		),
+		RightBraceConstruct(RightBraceInRecordFields, RightBraceInStructFields),
+		RightParenConstruct(
+			RightParenInForeignBlockArguments, RightParenInResourceCleanupBuiltinName,
+			RightParenInVariantFields,
 		),
 	../tables/ids:
 		DefinitionId,
@@ -49,6 +80,7 @@ import:
 		NameId,
 		NodeId,
 		literal_id_at_row,
+	../tables/limits: MAX_UNION_VARIANT_FIELDS
 	../tables/node_builder: last_node_id
 	../tables/row_kinds:
 		DefinitionKind(
@@ -57,14 +89,6 @@ import:
 			MutableGlobalDefinition, OpaqueTypeDefinition, RecordDefinition, ResourceTypeDefinition,
 			StructDefinition, TraitDefinition, TraitMethodDefinition, TypeAliasDefinition,
 			UnionDefinition, VariantDefinition,
-		),
-		ParsedConstruct(
-			BuiltinTypeDeclaration, BuiltinTypeMarker, FieldName, ForeignBlock,
-			ForeignBlockArgumentName, ForeignBlockArguments, ForeignBlockItem, ForeignFunctionName,
-			ForeignFunctionReturnType, ForeignHeader, ImplementationMethods, ImplementationTrait,
-			OpaqueType, RecordFields, ResourceCleanupBuiltinName, StructFields, TopLevelVariable,
-			TraitMethodName, TraitMethods, TraitName, TypeAliasKeyword, TypeAliasName,
-			TypeAliasTarget, TypeName, UnionVariants, VariableName, VariantFields, VariantName,
 		),
 		Purity(ImpureFunction, PureFunction),
 		Visibility(PrivateVisibility, PublicVisibility),
@@ -103,8 +127,15 @@ import:
 		current_span,
 		current_token,
 		declared_name_at_cursor,
+		expect_colon,
+		expect_equal,
+		expect_indent,
+		expect_keyword_token,
+		expect_left_brace,
+		expect_newline,
+		expect_right_brace,
+		expect_right_paren,
 		expect_token,
-		expect_token_in,
 		keyword_name_index,
 		peek_kind,
 		previous_content_span,
@@ -112,7 +143,7 @@ import:
 		referenced_name_at_cursor,
 		report_and_recover,
 		report_at_current,
-		report_at_current_in,
+		report_expected,
 		run_end_after,
 		skip_newlines,
 		skip_optional_token,
@@ -382,7 +413,7 @@ private pure func parse_global(
 	name_span: Span = builder.current_span()
 	name: NameId = builder.binder_name_at_cursor()
 	var out: DiscoveryBuilder = builder
-		.consume_binder_name(VariableName)
+		.consume_binder_name(NameInVariableName)
 		.open_definition(header, kind, name, name_span)
 
 	if out.at(ColonSymbol):
@@ -396,7 +427,7 @@ private pure func parse_global(
 
 	-- The value is parsed even when the `=` is missing, as the existing
 	-- parser does.
-	out = out.expect_token_in(EqualSymbol, ExpectedEqualDiagnostic, TopLevelVariable)
+	out = out.expect_equal(EqualInTopLevelVariable)
 	out = out.parse_global_value(definition, header.start)
 	end: Span = out.node_span(out.last_node_id())
 	out.close_definition(definition, header, kind, name, name_span, end)
@@ -415,18 +446,23 @@ private pure func parse_record(
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
-	out = out.consume_declared_name(TypeName)
+	out = out.consume_declared_name(NameInTypeName)
 	out = out.open_definition(header, kind, name, name_span)
 
-	fields: ParsedConstruct = if kind == RecordDefinition:
-		RecordFields
+	opening: LeftBraceConstruct = if kind == RecordDefinition:
+		LeftBraceInRecordFields
 	else:
-		StructFields
+		LeftBraceInStructFields
+
+	closing: RightBraceConstruct = if kind == RecordDefinition:
+		RightBraceInRecordFields
+	else:
+		RightBraceInStructFields
 
 	if kind == RecordDefinition:
 		out = out.parse_type_parameters(definition)
 
-	out = out.expect_token_in(LeftBraceSymbol, ExpectedLeftBraceDiagnostic, fields)
+	out = out.expect_left_brace(opening)
 	var ordinal: Int = 0
 
 	if not out.at(RightBraceSymbol):
@@ -445,7 +481,7 @@ private pure func parse_record(
 				parsing = False
 
 	end: Span = out.current_span()
-	out = out.expect_token_in(RightBraceSymbol, ExpectedRightBraceDiagnostic, fields)
+	out = out.expect_right_brace(closing)
 	out.close_definition(definition, header, kind, name, name_span, end)
 
 
@@ -460,14 +496,14 @@ private pure func parse_field(
 	name_span: Span = builder.current_span()
 	header: DeclarationHeader = module.plain_header(name_span, builder.pending_annotation_count())
 	var out: DiscoveryBuilder = builder
-		.consume_declared_name(FieldName)
+		.consume_declared_name(NameInFieldName)
 		.open_definition(header, FieldDefinition, name, name_span)
 		.append_member({
 			definition = field,
 			owner = owner,
 			ordinal = ordinal,
 		})
-		.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, FieldName)
+		.expect_colon(ColonInFieldName)
 		.parse_type()
 	field_type: NodeId = out.last_node_id()
 	out = out.append_definition_type({
@@ -480,14 +516,6 @@ private pure func parse_field(
 
 -- Unions and enums.
 ---
-The most payload fields a union variant declares (the existing parser's
-`MAX_UNION_VARIANT_FIELDS`): a variant's ownership bitmask has one bit per
-field, so a 65th field is rejected.
----
-private MAX_UNION_VARIANT_FIELDS: Int = 64
-
-
----
 `union Name[T]:` or `enum Name:` then an indented block of variants.
 ---
 private pure func parse_union(
@@ -499,15 +527,15 @@ private pure func parse_union(
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
-	out = out.consume_declared_name(TypeName)
+	out = out.consume_declared_name(NameInTypeName)
 	out = out.open_definition(header, kind, name, name_span)
 
 	if kind == UnionDefinition:
 		out = out.parse_type_parameters(definition)
 
-	out = out.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, UnionVariants)
-	out = out.expect_token_in(NewlineToken, ExpectedNewlineDiagnostic, UnionVariants)
-	out = out.expect_token_in(IndentToken, ExpectedIndentDiagnostic, UnionVariants)
+	out = out.expect_colon(ColonInUnionVariants)
+	out = out.expect_newline(NewlineInUnionVariants)
+	out = out.expect_indent(IndentInUnionVariants)
 	out = out.skip_newlines()
 	var ordinal: Int = 0
 
@@ -537,7 +565,7 @@ private pure func consume_variant_name(builder: DiscoveryBuilder) -> DiscoveryBu
 	if builder.at(TrueKeyword) or builder.at(FalseKeyword):
 		builder.advance_token()
 	else:
-		builder.consume_declared_name(VariantName)
+		builder.consume_declared_name(NameInVariantName)
 
 
 ---
@@ -582,10 +610,9 @@ private pure func parse_variant(
 
 				-- Reported once, at the field that passes the limit.
 				if payload_ordinal == MAX_UNION_VARIANT_FIELDS + 1:
-					out = out.append_diagnostic_with_argument(
+					out = out.append_plain_diagnostic(
 						UnionVariantTooManyFieldsDiagnostic,
 						name_span,
-						MAX_UNION_VARIANT_FIELDS,
 					)
 
 				if out.at(CommaSymbol):
@@ -600,7 +627,7 @@ private pure func parse_variant(
 			end = out.current_span()
 			out = out.advance_token()
 		else:
-			out = out.report_at_current_in(ExpectedRightParenDiagnostic, VariantFields)
+			out = out.report_expected(ExpectedRightParen(RightParenInVariantFields))
 
 	out.close_definition(variant, header, VariantDefinition, name, name_span, end)
 
@@ -616,15 +643,18 @@ private pure func parse_builtin_type(
 	kind: DefinitionKind,
 ) -> DiscoveryBuilder:
 	definition: DefinitionId = builder.next_definition_id()
-	var out: DiscoveryBuilder = builder.expect_keyword(TypeKeyword, BuiltinTypeDeclaration)
+	var out: DiscoveryBuilder = builder.expect_keyword_token(
+		TypeKeyword,
+		KeywordInBuiltinTypeDeclaration,
+	)
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
-	out = out.consume_declared_name(TypeName)
+	out = out.consume_declared_name(NameInTypeName)
 	out = out.open_definition(header, kind, name, name_span)
 	out = out.parse_type_parameters(definition)
-	out = out.expect_token_in(EqualSymbol, ExpectedEqualDiagnostic, BuiltinTypeMarker)
+	out = out.expect_equal(EqualInBuiltinTypeMarker)
 	var end: Span = out.current_span()
-	out = out.expect_keyword(BuiltinKeyword, BuiltinTypeMarker)
+	out = out.expect_keyword_token(BuiltinKeyword, KeywordInBuiltinTypeMarker)
 
 	if out.at(LeftParenSymbol):
 		if kind == ResourceTypeDefinition:
@@ -647,9 +677,8 @@ private pure func parse_builtin_type(
 				end = out.current_span()
 				out = out.advance_token()
 			else:
-				out = out.report_at_current_in(
-					ExpectedRightParenDiagnostic,
-					ResourceCleanupBuiltinName,
+				out = out.report_expected(
+					ExpectedRightParen(RightParenInResourceCleanupBuiltinName),
 				)
 		else:
 			out = out.report_at_current(BuiltinTypeArgumentsDiagnostic)
@@ -681,14 +710,6 @@ private pure func string_literal_at_cursor(builder: DiscoveryBuilder) -> Option[
 			None
 
 
-private pure func expect_keyword(
-	builder: DiscoveryBuilder,
-	kind: TokenKind,
-	construct: ParsedConstruct,
-) -> DiscoveryBuilder:
-	builder.expect_token_in(kind, ExpectedKeywordDiagnostic, construct)
-
-
 ---
 After `type` (consumed by the caller), `alias Name[T] = Target`; after
 `opaque`, `type Name[T] = Target`. `second_keyword` is the keyword expected
@@ -702,19 +723,19 @@ private pure func parse_type_alias(
 ) -> DiscoveryBuilder:
 	definition: DefinitionId = builder.next_definition_id()
 
-	second_construct: ParsedConstruct = if second_keyword == AliasKeyword:
-		TypeAliasKeyword
+	second_construct: KeywordConstruct = if second_keyword == AliasKeyword:
+		KeywordInTypeAliasKeyword
 	else:
-		OpaqueType
+		KeywordInOpaqueType
 
-	var out: DiscoveryBuilder = builder.expect_keyword(second_keyword, second_construct)
+	var out: DiscoveryBuilder = builder.expect_keyword_token(second_keyword, second_construct)
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
 	out = out
-		.consume_declared_name(TypeAliasName)
+		.consume_declared_name(NameInTypeAliasName)
 		.open_definition(header, kind, name, name_span)
 		.parse_type_parameters(definition)
-		.expect_token_in(EqualSymbol, ExpectedEqualDiagnostic, TypeAliasTarget)
+		.expect_equal(EqualInTypeAliasTarget)
 		.parse_type()
 	target: NodeId = out.last_node_id()
 	out = out.append_definition_type({
@@ -738,10 +759,10 @@ private pure func parse_trait(
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
-	out = out.consume_declared_name(TraitName)
+	out = out.consume_declared_name(NameInTraitName)
 	out = out.open_definition(header, TraitDefinition, name, name_span)
 	out = out.parse_type_parameters(definition)
-	out = out.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, TraitName)
+	out = out.expect_colon(ColonInTraitName)
 	var end: Span = name_span
 	var has_methods: Bool = False
 
@@ -768,8 +789,8 @@ private pure func parse_trait(
 			has_methods = True
 
 	if has_methods:
-		out = out.expect_token_in(NewlineToken, ExpectedNewlineDiagnostic, TraitMethods)
-		out = out.expect_token_in(IndentToken, ExpectedIndentDiagnostic, TraitMethods)
+		out = out.expect_newline(NewlineInTraitMethods)
+		out = out.expect_indent(IndentInTraitMethods)
 		out = out.skip_newlines()
 		var ordinal: Int = 0
 
@@ -810,10 +831,10 @@ private pure func parse_trait_method(
 
 	var out: DiscoveryBuilder = builder.skip_optional_token(PureKeyword)
 	keyword_span: Span = out.current_span()
-	out = out.expect_keyword(FuncKeyword, TraitMethodName)
+	out = out.expect_keyword_token(FuncKeyword, KeywordInTraitMethodName)
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
-	out = out.consume_declared_name(TraitMethodName)
+	out = out.consume_declared_name(NameInTraitMethodName)
 	header: DeclarationHeader = { module.plain_header(start, out.pending_annotation_count()) |
 		purity = purity
 	}
@@ -823,7 +844,7 @@ private pure func parse_trait_method(
 		owner = owner,
 		ordinal = ordinal,
 	})
-	out = out.parse_signature(method, purity, keyword_span, TraitMethodName)
+	out = out.parse_signature(method, purity, keyword_span, LeftParenInTraitMethodName)
 	var end: Span = name_span
 
 	if out.at(ArrowSymbol):
@@ -857,9 +878,9 @@ private pure func parse_impl(
 	var out: DiscoveryBuilder = builder.advance_token()
 	trait_name: NameId = out.referenced_name_at_cursor()
 	trait_span: Span = out.current_span()
-	out = out.consume_referenced_name(TraitName)
+	out = out.consume_referenced_name(NameInTraitName)
 	out = out.open_definition(header, ImplDefinition, trait_name, trait_span)
-	out = out.expect_keyword(ForKeyword, ImplementationTrait)
+	out = out.expect_keyword_token(ForKeyword, KeywordInImplementationTrait)
 	out = out.parse_type()
 	receiver: NodeId = out.last_node_id()
 	out = out.append_definition_type({
@@ -867,9 +888,9 @@ private pure func parse_impl(
 		type_root = receiver,
 	})
 	var end: Span = out.node_span(receiver)
-	out = out.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, ImplementationMethods)
-	out = out.expect_token_in(NewlineToken, ExpectedNewlineDiagnostic, ImplementationMethods)
-	out = out.expect_token_in(IndentToken, ExpectedIndentDiagnostic, ImplementationMethods)
+	out = out.expect_colon(ColonInImplementationMethods)
+	out = out.expect_newline(NewlineInImplementationMethods)
+	out = out.expect_indent(IndentInImplementationMethods)
 	out = out.skip_newlines()
 	var ordinal: Int = 0
 
@@ -998,16 +1019,12 @@ private pure func parse_foreign_block(
 		if out.at(LeftParenSymbol):
 			out = out.advance_token()
 			out = out.parse_foreign_arguments()
-			out = out.expect_token_in(
-				RightParenSymbol,
-				ExpectedRightParenDiagnostic,
-				ForeignBlockArguments,
-			)
+			out = out.expect_right_paren(RightParenInForeignBlockArguments)
 
 		arguments_count: Int = out.foreign_arguments.length() - arguments_first
-		out = out.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, ForeignHeader)
-		out = out.expect_token_in(NewlineToken, ExpectedNewlineDiagnostic, ForeignHeader)
-		out = out.expect_token_in(IndentToken, ExpectedIndentDiagnostic, ForeignBlock)
+		out = out.expect_colon(ColonInForeignHeader)
+		out = out.expect_newline(NewlineInForeignHeader)
+		out = out.expect_indent(IndentInForeignBlock)
 		out = out.skip_newlines()
 
 		while not out.at_block_end():
@@ -1081,8 +1098,8 @@ private pure func parse_foreign_argument(builder: DiscoveryBuilder) -> Discovery
 	name: NameId = builder.referenced_name_at_cursor()
 	name_span: Span = builder.current_span()
 	var out: DiscoveryBuilder = builder
-		.consume_referenced_name(ForeignBlockArgumentName)
-		.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, ForeignBlockArgumentName)
+		.consume_referenced_name(NameInForeignBlockArgumentName)
+		.expect_colon(ColonInForeignBlockArgumentName)
 
 	match out.string_literal_at_cursor():
 		Some(value):
@@ -1100,7 +1117,7 @@ private pure func parse_foreign_argument(builder: DiscoveryBuilder) -> Discovery
 	if out.at(CommaSymbol):
 		out = out.advance_token()
 	else if not out.at(RightParenSymbol):
-		out = out.report_at_current_in(ExpectedCommaDiagnostic, ForeignBlockArguments)
+		out = out.report_expected(ExpectedComma(CommaInForeignBlockArguments))
 
 	if out.token_cursor == before and not out.at(RightParenSymbol):
 		out = out.advance_token()
@@ -1135,10 +1152,10 @@ private pure func parse_foreign_function(
 		out = out.advance_token()
 
 	keyword_span: Span = out.current_span()
-	out = out.expect_keyword(FuncKeyword, ForeignBlockItem)
+	out = out.expect_keyword_token(FuncKeyword, KeywordInForeignBlockItem)
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
-	out = out.consume_declared_name(ForeignFunctionName)
+	out = out.consume_declared_name(NameInForeignFunctionName)
 	header: DeclarationHeader = { module.plain_header(start, annotations.first) |
 		visibility = visibility,
 		purity = purity,
@@ -1149,7 +1166,7 @@ private pure func parse_foreign_function(
 		definition = definition,
 		block = block,
 	})
-	out = out.parse_signature(definition, purity, keyword_span, ForeignFunctionName)
+	out = out.parse_signature(definition, purity, keyword_span, LeftParenInForeignFunctionName)
 	var end: Span = name_span
 
 	if out.at(ArrowSymbol):
@@ -1163,7 +1180,7 @@ private pure func parse_foreign_function(
 		end = out.node_span(return_type)
 	else:
 		end = out.span_before_current()
-		out = out.report_at_current_in(ExpectedArrowDiagnostic, ForeignFunctionReturnType)
+		out = out.report_expected(ExpectedArrow(ArrowInForeignFunctionReturnType))
 
 	if out.at(EqualSymbol):
 		out = out.advance_token()

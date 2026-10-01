@@ -18,7 +18,6 @@
 import:
 	../tables/builder:
 		DiscoveryBuilder,
-		append_diagnostic_argument,
 		append_implicit_diagnostic,
 		append_implicit_request,
 		append_implicit_target,
@@ -26,28 +25,29 @@ import:
 		append_module_package,
 		append_name,
 		append_package,
-		append_plain_resolution_diagnostic,
-		append_resolution_diagnostic,
-		append_resolution_diagnostic_with_argument,
+		append_resolution_diagnostic_at,
 		append_root,
 		append_root_diagnostic,
 		append_root_target,
 		find_module_by_path,
 		find_name_id,
 		find_path_id,
-		next_diagnostic_argument_row,
 		next_implicit_request_id,
 		next_name_id,
 		next_package_id,
 		next_root_id,
 	../tables/diagnostic_code:
-		DiscoveryDiagnosticCode(
-			ImportCaseMismatchDiagnostic, MissingImplicitModuleDiagnostic,
-			RootCaseMismatchDiagnostic, SourceTooLargeDiagnostic, TooManySourcesDiagnostic,
-			UnreadableImplicitSourceDiagnostic, UnreadableRootSourceDiagnostic,
-			UnreadableSourceDiagnostic, UnresolvedImportDiagnostic, UnresolvedRootDiagnostic,
-			UnverifiableImplicitSpellingDiagnostic, UnverifiableRootSpellingDiagnostic,
-			UnverifiableSpellingDiagnostic,
+		ImplicitDiagnostic(
+			ImplicitSourceTooLarge, ImplicitTooManySources, MissingImplicitModule,
+			UnreadableImplicitSource, UnverifiableImplicitSpelling,
+		),
+		ResolutionDiagnostic(
+			ImportCaseMismatch, ImportSourceTooLarge, ImportTooManySources, UnreadableSource,
+			UnresolvedImport, UnverifiableSpelling,
+		),
+		RootDiagnostic(
+			RootCaseMismatch, RootSourceTooLarge, RootTooManySources, UnreadableRootSource,
+			UnresolvedRoot, UnverifiableRootSpelling,
 		),
 	../tables/ids:
 		ImplicitRequestId,
@@ -347,18 +347,19 @@ pure func report_failure(
 		SourceMissing:
 			match requester:
 				RequestedByRoot(root):
-					builder.report_root(root, UnresolvedRootDiagnostic)
+					builder.report_root(root, UnresolvedRoot)
 				RequestedImplicitly(request):
-					builder.report_implicit(request, MissingImplicitModuleDiagnostic)
+					builder.report_implicit(request, MissingImplicitModule)
 				RequestedByImport(import_id):
-					builder.report_import(import_id, UnresolvedImportDiagnostic)
+					builder.report_import(import_id, UnresolvedImport(import_id))
 		SpellingUnknown:
-			builder.report_requester(
-				requester,
-				UnverifiableRootSpellingDiagnostic,
-				UnverifiableImplicitSpellingDiagnostic,
-				UnverifiableSpellingDiagnostic,
-			)
+			match requester:
+				RequestedByRoot(root):
+					builder.report_root(root, UnverifiableRootSpelling)
+				RequestedImplicitly(request):
+					builder.report_implicit(request, UnverifiableImplicitSpelling)
+				RequestedByImport(import_id):
+					builder.report_import(import_id, UnverifiableSpelling(import_id))
 		SpelledWithOtherCase(stored_names):
 			match requester:
 				RequestedByRoot(root):
@@ -366,16 +367,17 @@ pure func report_failure(
 				RequestedImplicitly(request):
 					-- The name is the compiler's own constant, so the stored spelling
 					-- teaches nothing: the module is simply not there.
-					builder.report_implicit(request, MissingImplicitModuleDiagnostic)
+					builder.report_implicit(request, MissingImplicitModule)
 				RequestedByImport(import_id):
 					builder.report_import_case_mismatch(import_id, stored_names)
 		ReadFailed:
-			builder.report_requester(
-				requester,
-				UnreadableRootSourceDiagnostic,
-				UnreadableImplicitSourceDiagnostic,
-				UnreadableSourceDiagnostic,
-			)
+			match requester:
+				RequestedByRoot(root):
+					builder.report_root(root, UnreadableRootSource)
+				RequestedImplicitly(request):
+					builder.report_implicit(request, UnreadableImplicitSource)
+				RequestedByImport(import_id):
+					builder.report_import(import_id, UnreadableSource(import_id))
 		SourceOverLimit(rejection, byte_length):
 			match requester:
 				RequestedByRoot(root):
@@ -384,22 +386,6 @@ pure func report_failure(
 					builder.report_rejected_implicit(request, rejection, byte_length)
 				RequestedByImport(import_id):
 					builder.report_rejected_import(import_id, rejection, byte_length)
-
-
-private pure func report_requester(
-	builder: DiscoveryBuilder,
-	requester: ModuleRequester,
-	root_code: DiscoveryDiagnosticCode,
-	implicit_code: DiscoveryDiagnosticCode,
-	import_code: DiscoveryDiagnosticCode,
-) -> DiscoveryBuilder:
-	match requester:
-		RequestedByRoot(root):
-			builder.report_root(root, root_code)
-		RequestedImplicitly(request):
-			builder.report_implicit(request, implicit_code)
-		RequestedByImport(import_id):
-			builder.report_import(import_id, import_code)
 
 
 ---
@@ -705,15 +691,15 @@ private pure func import_span(builder: DiscoveryBuilder, import_id: ImportId) ->
 
 
 ---
-Reports that `import_id` loaded no module, with its id as the argument.
+Reports that `import_id` loaded no module, as `diagnostic`.
 ---
 private pure func report_import(
 	builder: DiscoveryBuilder,
 	import_id: ImportId,
-	code: DiscoveryDiagnosticCode,
+	diagnostic: ResolutionDiagnostic,
 ) -> DiscoveryBuilder:
 	span: Span = builder.import_span(import_id)
-	builder.append_resolution_diagnostic_with_argument(code, span, import_id.import_id_index())
+	builder.append_resolution_diagnostic_at(span, diagnostic)
 
 
 ---
@@ -728,19 +714,12 @@ private pure func report_import_case_mismatch(
 	stored_path: String = stored_names.join("/")
 	stored_path_id: PathId = builder.interned_path_id(stored_path)
 	span: Span = builder.import_span(import_id)
-	arguments_first: Int = builder.next_diagnostic_argument_row()
 	builder
 		.intern_path(stored_path)
-		.append_diagnostic_argument(import_id.import_id_index())
-		.append_diagnostic_argument(stored_path_id.path_id_index())
-		.append_resolution_diagnostic({
-			code = ImportCaseMismatchDiagnostic,
-			span = span,
-			arguments = {
-				first = arguments_first,
-				count = 2
-			},
-		})
+		.append_resolution_diagnostic_at(
+			span,
+			ImportCaseMismatch(import_id, stored_path_id),
+		)
 
 
 private pure func report_rejected_import(
@@ -753,28 +732,19 @@ private pure func report_rejected_import(
 
 	match rejection:
 		SourceTooLargeToSpan:
-			builder.append_resolution_diagnostic_with_argument(
-				SourceTooLargeDiagnostic,
-				span,
-				byte_length,
-			)
+			builder.append_resolution_diagnostic_at(span, ImportSourceTooLarge(byte_length))
 		TooManySourcesToSpan:
-			builder.append_plain_resolution_diagnostic(TooManySourcesDiagnostic, span)
+			builder.append_resolution_diagnostic_at(span, ImportTooManySources)
 
 
 private pure func report_root(
 	builder: DiscoveryBuilder,
 	root: RootId,
-	code: DiscoveryDiagnosticCode,
+	diagnostic: RootDiagnostic,
 ) -> DiscoveryBuilder:
-	arguments_first: Int = builder.next_diagnostic_argument_row()
 	builder.append_root_diagnostic({
 		root = root,
-		code = code,
-		arguments = {
-			first = arguments_first,
-			count = 0
-		},
+		diagnostic = diagnostic,
 	})
 
 
@@ -789,17 +759,11 @@ private pure func report_root_case_mismatch(
 ) -> DiscoveryBuilder:
 	stored_path: String = stored_names.join("/")
 	stored_path_id: PathId = builder.interned_path_id(stored_path)
-	arguments_first: Int = builder.next_diagnostic_argument_row()
 	builder
 		.intern_path(stored_path)
-		.append_diagnostic_argument(stored_path_id.path_id_index())
 		.append_root_diagnostic({
 			root = root,
-			code = RootCaseMismatchDiagnostic,
-			arguments = {
-				first = arguments_first,
-				count = 1
-			},
+			diagnostic = RootCaseMismatch(stored_path_id),
 		})
 
 
@@ -811,37 +775,22 @@ private pure func report_rejected_root(
 ) -> DiscoveryBuilder:
 	match rejection:
 		SourceTooLargeToSpan:
-			arguments_first: Int = builder.next_diagnostic_argument_row()
-			var out: DiscoveryBuilder = builder.append_diagnostic_argument(byte_length)
-			out = out.append_root_diagnostic({
-				root = root,
-				code = SourceTooLargeDiagnostic,
-				arguments = {
-					first = arguments_first,
-					count = 1
-				},
-			})
-			out
+			builder.report_root(root, RootSourceTooLarge(byte_length))
 		TooManySourcesToSpan:
-			builder.report_root(root, TooManySourcesDiagnostic)
+			builder.report_root(root, RootTooManySources)
 
 
 ---
-Reports that implicit module `request` loaded no module, with no arguments.
+Reports that implicit module `request` loaded no module, as `diagnostic`.
 ---
 private pure func report_implicit(
 	builder: DiscoveryBuilder,
 	request: ImplicitRequestId,
-	code: DiscoveryDiagnosticCode,
+	diagnostic: ImplicitDiagnostic,
 ) -> DiscoveryBuilder:
-	arguments_first: Int = builder.next_diagnostic_argument_row()
 	builder.append_implicit_diagnostic({
 		request = request,
-		code = code,
-		arguments = {
-			first = arguments_first,
-			count = 0
-		},
+		diagnostic = diagnostic,
 	})
 
 
@@ -853,16 +802,6 @@ private pure func report_rejected_implicit(
 ) -> DiscoveryBuilder:
 	match rejection:
 		SourceTooLargeToSpan:
-			arguments_first: Int = builder.next_diagnostic_argument_row()
-			var out: DiscoveryBuilder = builder.append_diagnostic_argument(byte_length)
-			out = out.append_implicit_diagnostic({
-				request = request,
-				code = SourceTooLargeDiagnostic,
-				arguments = {
-					first = arguments_first,
-					count = 1
-				},
-			})
-			out
+			builder.report_implicit(request, ImplicitSourceTooLarge(byte_length))
 		TooManySourcesToSpan:
-			builder.report_implicit(request, TooManySourcesDiagnostic)
+			builder.report_implicit(request, ImplicitTooManySources)

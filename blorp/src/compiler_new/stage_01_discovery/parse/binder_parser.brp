@@ -11,10 +11,14 @@ import:
 		append_plain_diagnostic,
 		next_binder_name_row,
 		next_parameter_id,
-	../tables/diagnostic_code:
-		DiscoveryDiagnosticCode(
-			ExpectedCommaDiagnostic, ExpectedNameDiagnostic, ExpectedRightParenDiagnostic,
-			TupleArityDiagnostic,
+	../tables/diagnostic_code: PlainSyntaxCode(TupleArityDiagnostic)
+	../tables/expected_token:
+		CommaConstruct(CommaInTupleLoopVariables),
+		ExpectedTokenDiagnostic(ExpectedComma, ExpectedName),
+		NameConstruct(NameInLambdaParameter, NameInParameterName, NameInTupleBinderName),
+		RightParenConstruct(
+			RightParenInFunctionParameters, RightParenInLambdaParameters,
+			RightParenInTupleLoopVariables, RightParenInTupleParameterNames,
 		),
 	../tables/ids: DefinitionId, NameId, NodeId, ParameterId, name_id_at_row
 	../tables/name_vocabulary: DISCARD_NAME_INDEX
@@ -31,10 +35,6 @@ import:
 	../tables/row_kinds:
 		NodeKind(LambdaParameterNode, LoopBinderNode, TupleLoopBinderNode),
 		ParameterBinder(NamedParameterBinder, TupleParameterBinder, WildcardParameterBinder),
-		ParsedConstruct(
-			FunctionParameters, LambdaParameter, LambdaParameters, ParameterName, TupleBinderName,
-			TupleLoopVariables, TupleParameterNames,
-		),
 	../tables/span: Span, span_covering
 	../tables/token:
 		TokenKind(
@@ -48,9 +48,9 @@ import:
 		consume_declared_name,
 		current_span,
 		declared_name_at_cursor,
-		expect_token_in,
+		expect_right_paren,
 		peek_kind,
-		report_at_current_in,
+		report_expected,
 		skip_newlines,
 		token_at,
 		token_kind_at,
@@ -104,7 +104,7 @@ pure func parse_parameters(builder: DiscoveryBuilder, owner: DefinitionId) -> Di
 		out = out.advance_token()
 		out = out.skip_newlines()
 
-	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, FunctionParameters)
+	out.expect_right_paren(RightParenInFunctionParameters)
 
 
 ---
@@ -207,7 +207,7 @@ private pure func parse_binder_name(builder: DiscoveryBuilder) -> DiscoveryBuild
 	name: NameId = builder.declared_name_at_cursor()
 	name_span: Span = builder.current_span()
 	builder
-		.consume_declared_name(ParameterName)
+		.consume_declared_name(NameInParameterName)
 		.append_binder_name({
 			name = name,
 			span = name_span,
@@ -230,7 +230,7 @@ private pure func parse_tuple_binder_names(builder: DiscoveryBuilder) -> Discove
 		else:
 			parsing = False
 
-	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, TupleParameterNames)
+	out.expect_right_paren(RightParenInTupleParameterNames)
 
 
 ---
@@ -266,7 +266,8 @@ pure func parse_tuple_binder(
 	builder: DiscoveryBuilder,
 	start: Span,
 	kind: NodeKind,
-	construct: ParsedConstruct,
+	comma: CommaConstruct,
+	closing: RightParenConstruct,
 ) -> DiscoveryBuilder:
 	mark: ChildMark = builder.mark_children()
 	var out: DiscoveryBuilder = builder.push_binder_leaf(kind)
@@ -278,7 +279,7 @@ pure func parse_tuple_binder(
 
 		while parsing and not out.at(EndOfFileToken):
 			if out.at(RightParenSymbol):
-				out = out.report_at_current_in(ExpectedNameDiagnostic, TupleBinderName)
+				out = out.report_expected(ExpectedName(NameInTupleBinderName))
 				parsing = False
 			else:
 				out = out.push_binder_leaf(kind)
@@ -292,12 +293,12 @@ pure func parse_tuple_binder(
 				else:
 					parsing = False
 	else:
-		out = out.report_at_current_in(ExpectedCommaDiagnostic, construct)
+		out = out.report_expected(ExpectedComma(comma))
 
 	if out.at(RightParenSymbol):
 		end = out.current_span()
 
-	out = out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, construct)
+	out = out.expect_right_paren(closing)
 	count: Int = out.child_count_since(mark)
 
 	if count < MIN_TUPLE_BINDER_NAMES or count > MAX_TUPLE_BINDER_NAMES:
@@ -316,7 +317,7 @@ private pure func push_binder_leaf(builder: DiscoveryBuilder, kind: NodeKind) ->
 	name: NameId = builder.binder_name_at_cursor()
 	span: Span = builder.current_span()
 	builder
-		.consume_binder_name(TupleBinderName)
+		.consume_binder_name(NameInTupleBinderName)
 		.append_name_leaf_node(kind, span, name)
 		.push_last_node()
 
@@ -336,7 +337,12 @@ private pure func parse_tuple_loop_binder(builder: DiscoveryBuilder) -> Discover
 	mark: ChildMark = builder.mark_children()
 	names: DiscoveryBuilder = builder
 		.advance_token()
-		.parse_tuple_binder(start, LoopBinderNode, TupleLoopVariables)
+		.parse_tuple_binder(
+			start,
+			LoopBinderNode,
+			CommaInTupleLoopVariables,
+			RightParenInTupleLoopVariables,
+		)
 	span: Span = start.span_covering(names.token_at(names.token_cursor - 1).span)
 	names
 		.append_parent_node_since(mark, TupleLoopBinderNode, span)
@@ -382,7 +388,7 @@ pure func parse_lambda_parameters(builder: DiscoveryBuilder) -> DiscoveryBuilder
 		out = out.advance_token()
 		out = out.skip_newlines()
 
-	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, LambdaParameters)
+	out.expect_right_paren(RightParenInLambdaParameters)
 
 
 private pure func parse_lambda_parameter(builder: DiscoveryBuilder) -> DiscoveryBuilder:
@@ -390,7 +396,7 @@ private pure func parse_lambda_parameter(builder: DiscoveryBuilder) -> Discovery
 	name_span: Span = builder.current_span()
 	mark: ChildMark = builder.mark_children()
 	annotated: DiscoveryBuilder = builder
-		.consume_binder_name(LambdaParameter)
+		.consume_binder_name(NameInLambdaParameter)
 		.parse_optional_type_annotation()
 	count: Int = annotated.child_count_since(mark)
 

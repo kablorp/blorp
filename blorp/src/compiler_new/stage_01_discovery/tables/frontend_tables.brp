@@ -8,7 +8,8 @@
 -- (`report_unreachable_lookup`) and returns the documented `UNREACHABLE_...`
 -- row, which no id read from frozen tables reaches.
 import:
-	builder: DiscoveryBuilder, report_unreachable_lookup, without_transient_tables
+	builder: DiscoveryBuilder, report_unreachable_lookup
+	discovery_tables: DiscoveryTables
 	ids:
 		BoundId,
 		DefinitionId,
@@ -60,7 +61,6 @@ import:
 		BoundRow,
 		DefinitionRow,
 		DefinitionTypeRow,
-		DiagnosticRow,
 		DimensionConstraintRow,
 		DimensionNameRow,
 		DocumentationRow,
@@ -86,6 +86,7 @@ import:
 		PackageRow,
 		ParameterRow,
 		ParameterTypeRow,
+		ResolutionDiagnosticRow,
 		ResourceCleanupRow,
 		RootDiagnosticRow,
 		RootRow,
@@ -94,16 +95,17 @@ import:
 		SourceRow,
 		SupertraitQualifierRow,
 		SupertraitRow,
+		SyntaxDiagnosticRow,
 		TypeParameterRow,
 		VariantPayloadRow,
-	source_position: LineColumn, span_start_position
+	source_position: LineColumn, line_column_in_sources
 	span: Span, pack_span
 
 
 ---
 The sealed discovery output. Only `freeze` makes one.
 ---
-opaque type FrontendTables = DiscoveryBuilder
+opaque type FrontendTables = DiscoveryTables
 
 
 union FreezeOutcome:
@@ -112,24 +114,86 @@ union FreezeOutcome:
 
 
 ---
-Seals `builder`, dropping its transient tables. A builder that breaks an
-invariant is reported with every violation instead of being sealed; the
-check reads each row a bounded number of times.
+Seals `builder`: its tables move into a `DiscoveryTables`, and its parse state
+and intern indexes are dropped with it. A builder that breaks an invariant is
+reported with every violation instead of being sealed; the check reads each
+row a bounded number of times.
 ---
 pure func freeze(builder: DiscoveryBuilder) -> FreezeOutcome:
-	-- The transient tables are not part of the frozen output.
-	sealed_tables: DiscoveryBuilder = builder.without_transient_tables()
-	violations: List[TableInvariantViolation] = sealed_tables.check_table_invariants(
+	violations: List[TableInvariantViolation] = builder.check_table_invariants(
 		ALL_SEEDED_NAME_SPELLINGS,
 	)
 
 	if violations.is_empty():
-		FrozenTables(into_opaque FrontendTables(sealed_tables))
+		FrozenTables(into_opaque FrontendTables(builder.sealed_tables()))
 	else:
 		TableInvariantsViolated(violations)
 
 
-private pure func tables_of(tables: FrontendTables) -> DiscoveryBuilder:
+---
+The output tables of `builder`, each list moved, not copied: `builder` is not
+read after this.
+---
+private pure func sealed_tables(builder: DiscoveryBuilder) -> DiscoveryTables:
+	{
+		name_spellings = builder.name_spellings,
+		paths = builder.paths,
+		source_texts = builder.source_texts,
+		sources = builder.sources,
+		line_starts = builder.line_starts,
+		packages = builder.packages,
+		modules = builder.modules,
+		module_packages = builder.module_packages,
+		roots = builder.roots,
+		root_targets = builder.root_targets,
+		root_diagnostics = builder.root_diagnostics,
+		implicit_requests = builder.implicit_requests,
+		implicit_targets = builder.implicit_targets,
+		implicit_diagnostics = builder.implicit_diagnostics,
+		imports = builder.imports,
+		import_path_parts = builder.import_path_parts,
+		import_items = builder.import_items,
+		import_item_variants = builder.import_item_variants,
+		import_targets = builder.import_targets,
+		import_aliases = builder.import_aliases,
+		import_item_aliases = builder.import_item_aliases,
+		import_blocks = builder.import_blocks,
+		definitions = builder.definitions,
+		members = builder.members,
+		documentation = builder.documentation,
+		module_documentation = builder.module_documentation,
+		annotations = builder.annotations,
+		type_parameters = builder.type_parameters,
+		bounds = builder.bounds,
+		bound_qualifiers = builder.bound_qualifiers,
+		supertraits = builder.supertraits,
+		supertrait_qualifiers = builder.supertrait_qualifiers,
+		signatures = builder.signatures,
+		parameters = builder.parameters,
+		binder_names = builder.binder_names,
+		parameter_types = builder.parameter_types,
+		definition_types = builder.definition_types,
+		variant_payloads = builder.variant_payloads,
+		dimension_constraints = builder.dimension_constraints,
+		foreign_blocks = builder.foreign_blocks,
+		foreign_arguments = builder.foreign_arguments,
+		foreign_bindings = builder.foreign_bindings,
+		foreign_c_names = builder.foreign_c_names,
+		resource_cleanups = builder.resource_cleanups,
+		bodies = builder.bodies,
+		nodes = builder.nodes,
+		node_children = builder.node_children,
+		node_name_spans = builder.node_name_spans,
+		else_keywords = builder.else_keywords,
+		concurrency_counts = builder.concurrency_counts,
+		dimension_names = builder.dimension_names,
+		literals = builder.literals,
+		diagnostics = builder.diagnostics,
+		resolution_diagnostics = builder.resolution_diagnostics
+	}
+
+
+private pure func tables_of(tables: FrontendTables) -> DiscoveryTables:
 	from_opaque FrontendTables(tables)
 
 
@@ -344,7 +408,7 @@ The module implicit request `request` loaded or found already loaded, or
 `None` when it loaded none.
 ---
 pure func implicit_target(tables: FrontendTables, request: ImplicitRequestId) -> Option[ModuleId]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.implicit_targets.length(),
 		request.implicit_request_id_index(),
@@ -358,7 +422,7 @@ pure func implicit_target(tables: FrontendTables, request: ImplicitRequestId) ->
 			None
 
 
-private pure func implicit_target_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func implicit_target_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.implicit_targets.get(row):
 		Some(target):
 			target.request.implicit_request_id_index()
@@ -630,7 +694,7 @@ The span of the name `node` carries: its own span unless a row records a
 narrower one (see `NodeNameSpanRow`).
 ---
 pure func node_name_span(tables: FrontendTables, node: NodeId) -> Span:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.node_name_spans.length(),
 		node.node_id_index(),
@@ -686,7 +750,7 @@ The count the concurrency parameter node `parameter` wrote, or `None` when it
 has none (see `ConcurrencyCountRow`).
 ---
 pure func concurrency_count(tables: FrontendTables, parameter: NodeId) -> Option[Int]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.concurrency_counts.length(),
 		parameter.node_id_index(),
@@ -700,7 +764,7 @@ pure func concurrency_count(tables: FrontendTables, parameter: NodeId) -> Option
 			None
 
 
-private pure func concurrency_count_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func concurrency_count_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.concurrency_counts.get(row):
 		Some(count_row):
 			count_row.parameter.node_id_index()
@@ -713,7 +777,7 @@ The span of the `else` keyword of the `IfNode` `node`, or `None` when it has no
 else branch.
 ---
 pure func else_keyword_span(tables: FrontendTables, node: NodeId) -> Option[Span]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.else_keywords.length(),
 		node.node_id_index(),
@@ -727,7 +791,7 @@ pure func else_keyword_span(tables: FrontendTables, node: NodeId) -> Option[Span
 			None
 
 
-private pure func else_keyword_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func else_keyword_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.else_keywords.get(row):
 		Some(keyword_row):
 			keyword_row.node.node_id_index()
@@ -735,7 +799,7 @@ private pure func else_keyword_owner(builder: DiscoveryBuilder, row: Int) -> Int
 			NO_OWNER_ROW
 
 
-private pure func node_name_span_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func node_name_span_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.node_name_spans.get(row):
 		Some(name_row):
 			name_row.node.node_id_index()
@@ -806,7 +870,7 @@ are sorted by owner (an invariant), so this and the other side-table lookups
 are binary searches.
 ---
 pure func import_target(tables: FrontendTables, import_id: ImportId) -> Option[ModuleId]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.import_targets.length(),
 		import_id.import_id_index(),
@@ -820,7 +884,7 @@ pure func import_target(tables: FrontendTables, import_id: ImportId) -> Option[M
 			None
 
 
-private pure func import_target_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func import_target_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.import_targets.get(row):
 		Some(target):
 			target.owner_import.import_id_index()
@@ -832,7 +896,7 @@ private pure func import_target_owner(builder: DiscoveryBuilder, row: Int) -> In
 The module root `root` loaded, or `None` when it loaded none.
 ---
 pure func root_target(tables: FrontendTables, root: RootId) -> Option[ModuleId]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.root_targets.length(),
 		root.root_id_index(),
@@ -846,7 +910,7 @@ pure func root_target(tables: FrontendTables, root: RootId) -> Option[ModuleId]:
 			None
 
 
-private pure func root_target_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func root_target_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.root_targets.get(row):
 		Some(target):
 			target.root.root_id_index()
@@ -877,7 +941,7 @@ pure func import_path_part(tables: FrontendTables, row: ImportRow, ordinal: Int)
 The alias of `import_id` (`module as alias`), if it has one.
 ---
 pure func import_alias(tables: FrontendTables, import_id: ImportId) -> Option[ImportAliasRow]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.import_aliases.length(),
 		import_id.import_id_index(),
@@ -887,7 +951,7 @@ pure func import_alias(tables: FrontendTables, import_id: ImportId) -> Option[Im
 	builder.import_aliases.get(row)
 
 
-private pure func import_alias_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func import_alias_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.import_aliases.get(row):
 		Some(alias_row):
 			alias_row.owner_import.import_id_index()
@@ -902,7 +966,7 @@ pure func import_item_alias(
 	tables: FrontendTables,
 	item: ImportItemId,
 ) -> Option[ImportItemAliasRow]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.import_item_aliases.length(),
 		item.import_item_id_index(),
@@ -912,7 +976,7 @@ pure func import_item_alias(
 	builder.import_item_aliases.get(row)
 
 
-private pure func import_item_alias_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func import_item_alias_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.import_item_aliases.get(row):
 		Some(alias_row):
 			alias_row.item.import_item_id_index()
@@ -924,7 +988,7 @@ private pure func import_item_alias_owner(builder: DiscoveryBuilder, row: Int) -
 The module alias `bound` was written through (`T: alias.Trait`), if any.
 ---
 pure func bound_qualifier(tables: FrontendTables, bound: BoundId) -> Option[BoundQualifierRow]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.bound_qualifiers.length(),
 		bound.bound_id_index(),
@@ -934,7 +998,7 @@ pure func bound_qualifier(tables: FrontendTables, bound: BoundId) -> Option[Boun
 	builder.bound_qualifiers.get(row)
 
 
-private pure func bound_qualifier_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func bound_qualifier_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.bound_qualifiers.get(row):
 		Some(qualifier_row):
 			qualifier_row.bound.bound_id_index()
@@ -950,7 +1014,7 @@ pure func supertrait_qualifier(
 	tables: FrontendTables,
 	supertrait: SupertraitId,
 ) -> Option[SupertraitQualifierRow]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.supertrait_qualifiers.length(),
 		supertrait.supertrait_id_index(),
@@ -960,7 +1024,7 @@ pure func supertrait_qualifier(
 	builder.supertrait_qualifiers.get(row)
 
 
-private pure func supertrait_qualifier_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func supertrait_qualifier_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.supertrait_qualifiers.get(row):
 		Some(qualifier_row):
 			qualifier_row.supertrait.supertrait_id_index()
@@ -972,7 +1036,7 @@ private pure func supertrait_qualifier_owner(builder: DiscoveryBuilder, row: Int
 The package of `module`, if it belongs to one.
 ---
 pure func module_package(tables: FrontendTables, module: ModuleId) -> Option[PackageRow]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	row: Int = owner_row(
 		builder.module_packages.length(),
 		module.module_id_index(),
@@ -986,7 +1050,7 @@ pure func module_package(tables: FrontendTables, module: ModuleId) -> Option[Pac
 			None
 
 
-private pure func module_package_owner(builder: DiscoveryBuilder, row: Int) -> Int:
+private pure func module_package_owner(builder: DiscoveryTables, row: Int) -> Int:
 	match builder.module_packages.get(row):
 		Some(membership):
 			membership.module.module_id_index()
@@ -1039,27 +1103,11 @@ pure func implicit_diagnostic_row_at(
 	tables.tables_of().implicit_diagnostics.get(index)
 
 
-pure func implicit_diagnostic_argument(
-	tables: FrontendTables,
-	row: ImplicitDiagnosticRow,
-	ordinal: Int,
-) -> Option[Int]:
-	tables.argument_in(row.arguments, ordinal)
-
-
-pure func root_diagnostic_argument(
-	tables: FrontendTables,
-	row: RootDiagnosticRow,
-	ordinal: Int,
-) -> Option[Int]:
-	tables.argument_in(row.arguments, ordinal)
-
-
 ---
 Row counts of every table, by table name, for dumps and measurements.
 ---
 pure func table_row_counts(tables: FrontendTables) -> List[(String, Int)]:
-	builder: DiscoveryBuilder = tables.tables_of()
+	builder: DiscoveryTables = tables.tables_of()
 	[
 		("names", builder.name_spellings.length()),
 		("paths", builder.paths.length()),
@@ -1114,11 +1162,10 @@ pure func table_row_counts(tables: FrontendTables) -> List[(String, Int)]:
 		("literals", builder.literals.length()),
 		("diagnostics", builder.diagnostics.length()),
 		("resolution_diagnostics", builder.resolution_diagnostics.length()),
-		("diagnostic_arguments", builder.diagnostic_arguments.length()),
 	]
 
 
-pure func diagnostic_row_at(tables: FrontendTables, index: Int) -> Option[DiagnosticRow]:
+pure func diagnostic_row_at(tables: FrontendTables, index: Int) -> Option[SyntaxDiagnosticRow]:
 	tables.tables_of().diagnostics.get(index)
 
 
@@ -1131,50 +1178,11 @@ pure func resolution_diagnostic_count(tables: FrontendTables) -> Int:
 	tables.tables_of().resolution_diagnostics.length()
 
 
-pure func resolution_diagnostic_row_at(tables: FrontendTables, index: Int) -> Option[DiagnosticRow]:
-	tables.tables_of().resolution_diagnostics.get(index)
-
-
-pure func diagnostic_argument(
+pure func resolution_diagnostic_row_at(
 	tables: FrontendTables,
-	row: DiagnosticRow,
-	ordinal: Int,
-) -> Option[Int]:
-	tables.argument_in(row.arguments, ordinal)
-
-
----
-The arguments a diagnostic row of any of the three diagnostic tables stores,
-which `range` is a block of the one shared argument table. A row's range lies
-inside that table (`RangeOutOfBounds`), so each argument exists; one that does
-not is reported and read as 0.
----
-pure func diagnostic_arguments_of(tables: FrontendTables, range: RowRange) -> List[Int]:
-	var arguments: List[Int] = []
-
-	for ordinal in 0..range.count:
-		match tables.argument_in(range, ordinal):
-			Some(argument):
-				arguments = arguments.append(argument)
-			None:
-				report_unreachable_lookup(
-					"diagnostic argument",
-					range.first + ordinal,
-					"the freeze checks every diagnostic row's argument range",
-				)
-				arguments = arguments.append(UNREACHABLE_DIAGNOSTIC_ARGUMENT)
-
-	arguments
-
-
----
-The argument `diagnostic_arguments_of` reads for an argument row that is missing.
----
-private UNREACHABLE_DIAGNOSTIC_ARGUMENT: Int = 0
-
-
-private pure func argument_in(tables: FrontendTables, range: RowRange, ordinal: Int) -> Option[Int]:
-	tables.tables_of().diagnostic_arguments.get(range.first + ordinal)
+	index: Int,
+) -> Option[ResolutionDiagnosticRow]:
+	tables.tables_of().resolution_diagnostics.get(index)
 
 
 ---
@@ -1183,6 +1191,11 @@ The line (zero-based) and tab-expanded column (one-based, counting bytes) where
 tables.
 ---
 pure func span_line_column(tables: FrontendTables, span: Span) -> LineColumn:
-	tables
-		.tables_of()
-		.span_start_position(span)
+	sources: DiscoveryTables = tables.tables_of()
+	line_column_in_sources(
+		sources.sources,
+		sources.line_starts,
+		sources.source_texts,
+		span.span_source_index(),
+		span.span_start(),
+	)
