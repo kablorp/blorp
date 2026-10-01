@@ -2386,6 +2386,14 @@ Each `.brp` file is a module. Path determines module name:
 - `standard_library/src/option.brp` -> module `option`
 - `./utils.brp` -> module `./utils`
 
+Import paths and root files are case-sensitive on every platform: `./sub/helper` does
+not import `sub/Helper.brp`, even on a case-insensitive file system such as macOS.
+Only the components below the directory an import resolves against are compared (the
+importer's directory, the standard-library root, a package root; for a root file,
+its file name), and only a proven case difference is rejected. The compiler reports
+the file's real name (`import `./sub/helper` does not match the file's name
+`sub/Helper.brp``), so code that builds on macOS builds the same way on Linux.
+
 ### Import Block Syntax
 
 All imports use the `import:` block syntax. Each module may only be imported once per file. Standard-library modules use bare paths:

@@ -1,0 +1,285 @@
+import:
+	fs:
+		DirectoryListing(DirectoryListed, DirectoryUnreadable),
+		PathSpelling(ExactSpelling, SpellingUnverifiable, StoredSpelling),
+		SpellingStep(SpellingKnown, SpellingNeedsListing),
+		file_exists_with_exact_case,
+		file_exists_with_exact_case_below,
+		list_directory,
+		path_spelling_below,
+		spelling_below,
+		stored_spelling_below,
+	option: Option(Some, None)
+	path: basename
+	system: exec, file_exists, getcwd, mkdir, write_file
+	test: TestSuite
+
+
+-- The tree is written under a directory of the working directory so that
+-- relative paths exercise the leading `./` and `../` anchors. Every test must
+-- pass on a case-sensitive file system, where a path that differs only in case
+-- simply does not exist, and on a case-insensitive one, where it does.
+TREE: String = "__exact_case_paths_tree"
+
+
+func prepare_tree() -> Bool:
+	_ = exec("rm -rf " + TREE)
+	_ = mkdir(TREE)
+	_ = mkdir(TREE + "/Sub")
+	_ = write_file(TREE + "/Sub/Helper.brp", "x: Int = 1\n")
+	_ = write_file(TREE + "/top.brp", "y: Int = 2\n")
+	file_exists(TREE + "/Sub/Helper.brp") and file_exists(TREE + "/top.brp")
+
+
+func cleanup_tree() -> Bool:
+	exec("rm -rf " + TREE) == 0
+
+
+func with_tree(check: () -> Bool) -> Bool:
+	if prepare_tree():
+		result: Bool = check()
+		_ = cleanup_tree()
+		result
+	else:
+		False
+
+
+func test_exact_spelling_matches() -> Bool:
+	with_tree(func():
+		(
+			file_exists_with_exact_case(TREE + "/Sub/Helper.brp")
+			and file_exists_with_exact_case(TREE + "/top.brp")
+		)
+	)
+
+
+func test_mismatched_file_name_does_not_match() -> Bool:
+	with_tree(func():
+		(
+			not file_exists_with_exact_case(TREE + "/Sub/helper.brp")
+			and not file_exists_with_exact_case(TREE + "/Sub/HELPER.brp")
+		)
+	)
+
+
+func test_mismatched_directory_component_does_not_match() -> Bool:
+	with_tree(func(): not file_exists_with_exact_case(TREE + "/sub/Helper.brp"))
+
+
+func test_missing_file_does_not_match() -> Bool:
+	with_tree(func():
+		(
+			not file_exists_with_exact_case(TREE + "/Sub/Missing.brp")
+			and not file_exists_with_exact_case(TREE + "/Nowhere/Helper.brp")
+		)
+	)
+
+
+func test_leading_current_directory_anchor_is_not_checked() -> Bool:
+	with_tree(func():
+		(
+			file_exists_with_exact_case("./" + TREE + "/Sub/Helper.brp")
+			and not file_exists_with_exact_case("./" + TREE + "/Sub/helper.brp")
+		)
+	)
+
+
+func test_leading_parent_anchor_is_not_checked() -> Bool:
+	with_tree(func():
+		through_parent: String = "../" + basename(getcwd()) + "/" + TREE
+
+		(
+			file_exists_with_exact_case(through_parent + "/Sub/Helper.brp")
+			and not file_exists_with_exact_case(through_parent + "/sub/Helper.brp")
+		)
+	)
+
+
+func test_interior_parent_component_is_resolved_before_checking() -> Bool:
+	with_tree(func():
+		(
+			file_exists_with_exact_case(TREE + "/Sub/../Sub/Helper.brp")
+			and not file_exists_with_exact_case(TREE + "/Sub/../sub/Helper.brp")
+		)
+	)
+
+
+func test_trusted_directory_is_not_checked() -> Bool:
+	-- The trusted prefix is given in a different case than the file system
+	-- stores it; only the components below it are compared.
+	with_tree(func():
+		(
+			file_exists_with_exact_case_below(TREE, TREE + "/Sub/Helper.brp")
+			and not file_exists_with_exact_case_below(TREE, TREE + "/Sub/helper.brp")
+		)
+	)
+
+
+func test_absolute_path_below_the_working_directory_leaves_the_prefix_unchecked() -> Bool:
+	with_tree(func():
+		working_directory: String = getcwd()
+		absolute: String = working_directory + "/" + TREE + "/Sub/Helper.brp"
+
+		(
+			file_exists_with_exact_case_below(working_directory, absolute)
+			and not file_exists_with_exact_case_below(
+				working_directory,
+				working_directory + "/" + TREE + "/sub/Helper.brp",
+			)
+		)
+	)
+
+
+func test_a_normalization_difference_is_not_a_case_difference() -> Bool:
+	-- The file is stored decomposed (e + combining acute); the lookup spells it
+	-- precomposed. A file system that equates the two (macOS) answers
+	-- `file_exists`, and the walk cannot find the name in the listing. Only a
+	-- proven case difference is rejected, so the lookup still succeeds. Where
+	-- the file system does not equate them the file is simply missing.
+	with_tree(func():
+		decomposed: String = TREE + "/nf-é.brp"
+		precomposed: String = TREE + "/nf-é.brp"
+		_ = write_file(decomposed, "n: Int = 4\n")
+
+		if file_exists(precomposed):
+			file_exists_with_exact_case(precomposed)
+		else:
+			True
+	)
+
+
+func test_a_symlinked_directory_is_checked_through_its_target() -> Bool:
+	-- `Link -> Sub`: the parent lists `Link`, the user's spelling, and the
+	-- names below it come from the target.
+	with_tree(func():
+		_ = exec("ln -s Sub " + TREE + "/Link")
+
+		(
+			file_exists_with_exact_case(TREE + "/Link/Helper.brp")
+			and not file_exists_with_exact_case(TREE + "/link/Helper.brp")
+			and not file_exists_with_exact_case(TREE + "/Link/helper.brp")
+		)
+	)
+
+
+func test_an_unreadable_directory_is_unverifiable_not_exact() -> Bool:
+	with_tree(func():
+		_ = mkdir(TREE + "/Locked")
+		_ = write_file(TREE + "/Locked/inner.brp", "q: Int = 5\n")
+		_ = exec("chmod 000 " + TREE + "/Locked")
+
+		-- A superuser can still list it; then there is nothing to check.
+		listing_refused: Bool = match list_directory(TREE + "/Locked"):
+			DirectoryUnreadable:
+				True
+			_:
+				False
+
+		spelling: PathSpelling = path_spelling_below(".", TREE + "/Locked/inner.brp")
+		_ = exec("chmod 755 " + TREE + "/Locked")
+
+		match spelling:
+			SpellingUnverifiable(directory):
+				listing_refused and directory.ends_with("/Locked")
+			_:
+				not listing_refused
+	)
+
+
+func test_walk_over_supplied_listings_asks_for_each_directory_it_needs() -> Bool:
+	listings: Dict[String, DirectoryListing] = {
+		"." => DirectoryListed(["top"]),
+		"./top" => DirectoryListed(["Sub", "Zed.brp"]),
+	}
+
+	first: Bool = match spelling_below(listings, ".", "top/sub/helper.brp"):
+		SpellingNeedsListing(directory):
+			directory == "./top/Sub"
+		SpellingKnown(_):
+			False
+
+	complete: Dict[String, DirectoryListing] = listings.set(
+		"./top/Sub",
+		DirectoryListed(["Helper.brp"]),
+	)
+
+	second: Bool = match spelling_below(complete, ".", "top/sub/helper.brp"):
+		SpellingKnown(StoredSpelling(components, stored_path)):
+			components == ["top", "Sub", "Helper.brp"] and stored_path == "./top/Sub/Helper.brp"
+		_:
+			False
+
+	exact: Bool = match spelling_below(complete, "top", "top/Sub/Helper.brp"):
+		SpellingKnown(ExactSpelling):
+			True
+		_:
+			False
+
+	first and second and exact
+
+
+func test_stored_spelling_reports_the_real_names_or_nothing() -> Bool:
+	with_tree(func():
+		exact_is_none: Bool = stored_spelling_below(".", TREE + "/Sub/Helper.brp").is_none()
+		missing_is_none: Bool = stored_spelling_below(".", TREE + "/Sub/Nothing.brp").is_none()
+
+		-- On a case-sensitive file system the differently cased path is just
+		-- missing, so the file system decides whether a spelling is reported.
+		variant: Option[List[String]] = stored_spelling_below(".", TREE + "/sub/helper.brp")
+
+		variant_matches: Bool = match variant:
+			Some(components):
+				components == [TREE, "Sub", "Helper.brp"]
+			None:
+				not file_exists(TREE + "/sub/helper.brp")
+
+		exact_is_none and missing_is_none and variant_matches
+	)
+
+
+tests: TestSuite = {
+	description = "exact-case path checks",
+	tests = [
+		("exact spelling matches", test_exact_spelling_matches),
+		("mismatched file name does not match", test_mismatched_file_name_does_not_match),
+		(
+			"mismatched directory component does not match",
+			test_mismatched_directory_component_does_not_match,
+		),
+		("missing file does not match", test_missing_file_does_not_match),
+		(
+			"leading current-directory anchor is not checked",
+			test_leading_current_directory_anchor_is_not_checked,
+		),
+		("leading parent anchor is not checked", test_leading_parent_anchor_is_not_checked),
+		(
+			"interior parent component is resolved first",
+			test_interior_parent_component_is_resolved_before_checking,
+		),
+		("trusted directory is not checked", test_trusted_directory_is_not_checked),
+		(
+			"absolute path below the working directory",
+			test_absolute_path_below_the_working_directory_leaves_the_prefix_unchecked,
+		),
+		(
+			"a normalization difference is not a case difference",
+			test_a_normalization_difference_is_not_a_case_difference,
+		),
+		(
+			"a symlinked directory is checked through its target",
+			test_a_symlinked_directory_is_checked_through_its_target,
+		),
+		(
+			"an unreadable directory is unverifiable, not exact",
+			test_an_unreadable_directory_is_unverifiable_not_exact,
+		),
+		(
+			"walk over supplied listings asks for each directory it needs",
+			test_walk_over_supplied_listings_asks_for_each_directory_it_needs,
+		),
+		(
+			"stored spelling reports the real names or nothing",
+			test_stored_spelling_reports_the_real_names_or_nothing,
+		),
+	]
+}

@@ -13,7 +13,11 @@ import:
 		frontend_graph_modules,
 	../../../src/compiler/stage_04_modules/frontend_graph_service:
 		COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS,
-		FrontendDiscoveryError(FrontendDiscoveryIdentityConflict, FrontendDiscoveryProviderFailed),
+		FrontendDiscoveryError(
+			FrontendDiscoveryIdentityConflict,
+			FrontendDiscoveryImportCaseMismatch,
+			FrontendDiscoveryProviderFailed,
+		),
 		FrontendGraphServiceError(
 			DuplicateCompilerFrontendImportOutcome,
 			MissingCompilerFrontendImportOutcome,
@@ -22,9 +26,15 @@ import:
 		FrontendSourceCandidate,
 		FrontendSourceInput(RawFrontendSource),
 		FrontendSourceLocation,
-		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
+		FrontendSourceResolution(
+			FrontendSourceCaseMismatch,
+			FrontendSourceResolved,
+			FrontendSourceUnresolved,
+		),
+		frontend_discovery_error_message,
 		frontend_source_candidate_source,
 		frontend_source_location,
+		respelled_import_path,
 		validated_frontend_graph_for_modules,
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(UserModule),
@@ -409,6 +419,62 @@ func test_discovery_reports_the_first_provider_failure() -> Bool:
 			False
 
 
+private pure func resolve_case_mismatch(
+	_importer: FrontendSourceCandidate,
+	_requested_path: String,
+) -> Result[FrontendSourceResolution, String]:
+	Ok(FrontendSourceCaseMismatch(["sub", "Helper.brp"]))
+
+
+func test_discovery_reports_an_import_spelled_in_another_case() -> Bool:
+	app: FrontendSourceCandidate = {
+		identity = identity("app"),
+		input = RawFrontendSource(
+			source_file(
+				"/workspace/app.brp",
+				"app",
+				"import:\n\t./sub/helper\n\nVALUE = 1\n",
+			),
+		)
+	}
+
+	match frontend_graph_discover([app], [], resolve_case_mismatch, load_first_provider_failure):
+		Err(error):
+			match error:
+				FrontendDiscoveryImportCaseMismatch(importer, requested_path, stored_names):
+					(
+						resolved_module_identities_equal(importer, identity("app"))
+						and requested_path == "./sub/helper"
+						and stored_names == ["sub", "Helper.brp"]
+						and frontend_discovery_error_message(
+							error,
+						) == "import `./sub/helper` does not match the file's name `sub/Helper.brp`\nhelp: import paths are case-sensitive; write `./sub/Helper`"
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+func test_respelled_import_path_replaces_only_the_named_components() -> Bool:
+	respelled_import_path(
+		"./sub/helper",
+		["sub", "Helper.brp"],
+	) == "./sub/Helper" and respelled_import_path(
+		"../lib/util",
+		["lib", "Util.brp"],
+	) == "../lib/Util" and respelled_import_path(
+		"local",
+		["Local.brp"],
+	) == "Local" and respelled_import_path(
+		"pkg/net/http",
+		["net", "Http.brp"],
+	) == "pkg/net/Http" and respelled_import_path(
+		"./Main",
+		["Extra", "Main.brp"],
+	) == "./Main"
+
+
 func test_discovery_owns_parsing_resolution_edges_and_cycle_termination() -> Bool:
 	app = cycle_source("app", "dep")
 
@@ -553,6 +619,14 @@ tests: TestSuite = {
 			test_discovery_preserves_growing_worklist_order_across_graph_shapes,
 		),
 		("reports the first provider failure", test_discovery_reports_the_first_provider_failure),
+		(
+			"reports an import spelled in another case",
+			test_discovery_reports_an_import_spelled_in_another_case,
+		),
+		(
+			"respelled import path replaces only the named components",
+			test_respelled_import_path_replaces_only_the_named_components,
+		),
 		(
 			"reject identity conflict with different paths",
 			test_discovery_rejects_identity_conflict_with_different_paths,

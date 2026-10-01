@@ -24,13 +24,18 @@ import:
 		frontend_graph_root_modules,
 	../compiler/stage_04_modules/frontend_graph_service:
 		COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS,
-		FrontendDiscoveryError,
+		FrontendDiscoveryError(FrontendDiscoveryImportCaseMismatch),
 		FrontendSourceCandidate,
 		FrontendSourceInput(FinalizedFrontendSource, RawFrontendSource),
 		FrontendSourceLocation,
-		FrontendSourceResolution(FrontendSourceResolved, FrontendSourceUnresolved),
+		FrontendSourceResolution(
+			FrontendSourceCaseMismatch,
+			FrontendSourceResolved,
+			FrontendSourceUnresolved,
+		),
 		frontend_discovery_error_message,
 		frontend_graph_service_error_message,
+		frontend_source_candidate_source,
 		validated_frontend_graph_for_modules,
 	../compiler/stage_04_modules/frontend_import_plan:
 		FrontendImportLookup(
@@ -82,9 +87,17 @@ import:
 		CliParsedSourceFile,
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
+	diagnostic: cli_error_message
 	frontend_graph_identity: FrontendGraphSourceKey
-	fs: message, open_read, read_text, walk_files
-	path: dirname, join, normalize, stem
+	fs:
+		PathSpelling(ExactSpelling, SpellingUnverifiable, StoredSpelling),
+		message,
+		open_read,
+		path_spelling_below,
+		read_text,
+		stored_spelling_below,
+		walk_files
+	path: basename, dirname, join, normalize, stem
 	path_identity: canonical_existing_path
 	source: SourceFile, source_file
 	system: file_exists, getcwd, getenv, is_directory, temp_dir
@@ -127,7 +140,43 @@ func single_source_path_for_action(action: CliAction) -> Option[String]:
 			None
 
 
-private func expand_check_target(path: String) -> Result[CliCheckTargetExpansion, String]:
+---
+The error for a root whose spelling cannot be accepted: it is stored in
+different letter case, or a directory on the way to it could not be listed so
+its spelling cannot be checked. `None` when `path` is spelled as stored or
+names nothing. The directories the user wrote before the file name are not
+compared.
+---
+private func root_spelling_error(path: String) -> Option[String]:
+	match path_spelling_below(dirname(path), path):
+		StoredSpelling(stored_names, stored_path):
+			if file_exists(stored_path):
+				stored_name: String = stored_names
+					.last()
+					.get_or(path)
+				Some(
+					cli_error_message(
+						"source file `" + path + "` does not match the file's name `" + stored_name + "`\nhelp: file names are case-sensitive; write `" + path.remove_suffix(
+							basename(path),
+						) + stored_name + "`",
+					),
+				)
+			else:
+				None
+		SpellingUnverifiable(directory):
+			if file_exists(path):
+				Some(
+					cli_error_message(
+						"cannot verify the spelling of source file `" + path + "`: directory `" + directory + "` could not be listed",
+					),
+				)
+			else:
+				None
+		ExactSpelling:
+			None
+
+
+private func existing_check_target(path: String) -> Result[CliCheckTargetExpansion, String]:
 	if not file_exists(path):
 		Err("failed to read source file `" + path + "`: not found: " + path)
 	else if is_directory(path):
@@ -141,6 +190,14 @@ private func expand_check_target(path: String) -> Result[CliCheckTargetExpansion
 			targets = [CliSourceFileTarget(path)],
 			source_paths = [path],
 		})
+
+
+private func expand_check_target(path: String) -> Result[CliCheckTargetExpansion, String]:
+	match root_spelling_error(path):
+		Some(mismatch):
+			Err(mismatch)
+		None:
+			existing_check_target(path)
 
 
 func expand_check_targets(paths: List[String]) -> Result[CliCheckTargetExpansion, String]:
@@ -242,12 +299,67 @@ pure func parsed_cli_source_from_program(program: ParsedProgram) -> CliParsedSou
 --- Where an import resolved to, with no text read. `load_source_for_location`
 --- loads the text later, deciding embedded-vs-filesystem the same way this
 --- was resolved: by origin and `FrontendGraphContext.std_dir`, not by
---- anything carried here.
+--- anything carried here. `finding` is how the file's spelling compared with
+--- the import (`ExactImportFile` for an embedded source).
 record CliResolvedImportSource {
 	path: String,
+	finding: ImportFileFinding,
 	module_name: String,
 	origin: ModuleOrigin
 }
+
+
+--- How a filesystem import candidate is matched. Imports are case-sensitive on
+--- every platform, so a lookup first accepts only a file spelled exactly as
+--- stored. Only when every lookup has failed does a second pass accept a file
+--- stored under different letter case, to name it in a diagnostic instead of
+--- calling the import unresolved.
+private enum ImportSpellingSearch:
+	SearchExactSpelling
+	SearchDifferentCase
+
+
+--- What a lookup found at a path.
+--- - `ExactImportFile`: the file exists and no component below the resolving
+---   directory is known to be stored in different letter case.
+--- - `MisspelledImportFile(names)`: the file is stored under different letter
+---   case; `names` are the components below the resolving directory as stored.
+--- - `UnverifiableImportFile(directory)`: the file exists but `directory`, on
+---   the way to it, could not be listed, so its spelling is unknown.
+private union ImportFileFinding:
+	ExactImportFile
+	MisspelledImportFile(List[String])
+	UnverifiableImportFile(String)
+
+
+--- What `search` finds at `path`, or `None` for nothing. `trusted_directory` is
+--- the directory the import text is resolved against (the importer's
+--- directory, the standard-library or package root), so only the components
+--- the import text names are compared. The exact search stats the path first,
+--- so a miss never lists a directory.
+private func import_path_found(
+	search: ImportSpellingSearch,
+	trusted_directory: String,
+	path: String,
+) -> Option[ImportFileFinding]:
+	match search:
+		SearchExactSpelling:
+			if not file_exists(path):
+				None
+			else:
+				match path_spelling_below(trusted_directory, path):
+					ExactSpelling:
+						Some(ExactImportFile)
+					StoredSpelling(_, _):
+						None
+					SpellingUnverifiable(directory):
+						Some(UnverifiableImportFile(directory))
+		SearchDifferentCase:
+			match stored_spelling_below(trusted_directory, path):
+				Some(names):
+					Some(MisspelledImportFile(names))
+				None:
+					None
 
 
 private pure func action_std_dir(action: CliAction) -> Option[String]:
@@ -630,14 +742,29 @@ private func compiler_module_origin_for_path(
 
 private pure func filesystem_import_source(
 	path: String,
+	finding: ImportFileFinding,
 	module_name: String,
 	origin: ModuleOrigin,
 ) -> CliResolvedImportSource:
 	{
 		path = normalize(path),
+		finding = finding,
 		module_name = module_name,
 		origin = origin
 	}
+
+
+--- The source `import_path_found` finds at `path`, if any.
+private func import_source_if_found(
+	search: ImportSpellingSearch,
+	trusted_directory: String,
+	path: String,
+	module_name: String,
+	origin: ModuleOrigin,
+) -> Option[CliResolvedImportSource]:
+	import_path_found(search, trusted_directory, path).map(
+		func(finding): filesystem_import_source(path, finding, module_name, origin),
+	)
 
 
 --- Reports whether the embedded standard library carries `module_name`,
@@ -650,6 +777,7 @@ private pure func embedded_std_import_source(
 	if embedded_std_source(module_name).is_some():
 		Some({
 			path = "<embedded:${module_name}>",
+			finding = ExactImportFile,
 			module_name = module_name,
 			origin = StdlibModule,
 		})
@@ -668,6 +796,7 @@ private pure func source_package_layout(package: FrontendSourcePackage) -> Sourc
 
 private func resolve_source_package_alias_import(
 	context: FrontendGraphContext,
+	search: ImportSpellingSearch,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
 	var result: Option[CliResolvedImportSource] = None
@@ -682,14 +811,13 @@ private func resolve_source_package_alias_import(
 			Some(package_module):
 				path = source_package_path_for_module(layout.source_dir, package_module)
 
-				if file_exists(path):
-					result = Some(
-						filesystem_import_source(
-							path,
-							module_path,
-							SourcePackageModule(package.package_alias),
-						),
-					)
+				result = import_source_if_found(
+					search,
+					package.source_dir,
+					path,
+					module_path,
+					SourcePackageModule(package.package_alias),
+				)
 			None:
 				void
 
@@ -698,6 +826,7 @@ private func resolve_source_package_alias_import(
 
 private func resolve_source_package_internal_import(
 	package: FrontendSourcePackage,
+	search: ImportSpellingSearch,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
 	layout = source_package_layout(package)
@@ -705,22 +834,20 @@ private func resolve_source_package_internal_import(
 	if source_package_contains_internal_module(layout.package_name, module_path):
 		path = source_package_path_for_module(layout.source_dir, module_path)
 
-		if file_exists(path):
-			Some(
-				filesystem_import_source(
-					path,
-					module_path,
-					SourcePackageModule(package.package_alias),
-				),
-			)
-		else:
-			None
+		import_source_if_found(
+			search,
+			package.source_dir,
+			path,
+			module_path,
+			SourcePackageModule(package.package_alias),
+		)
 	else:
 		None
 
 
 private func resolve_native_package_import(
 	context: FrontendGraphContext,
+	search: ImportSpellingSearch,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
 	-- Request syntax: the import request `pkg/<id>/...` names a native package.
@@ -733,33 +860,30 @@ private func resolve_native_package_import(
 
 		candidate: String = join(package_root, module_source_filename(rest))
 
-		if file_exists(candidate):
-			package_id: String = split_module_ref(rest)
-				.map(func(parts): parts[0])
-				.get_or("pkg")
-			result = Some(
-				filesystem_import_source(
-					candidate,
-					module_path,
-					NativePackageModule(package_id),
-				),
-			)
+		package_id: String = split_module_ref(rest)
+			.map(func(parts): parts[0])
+			.get_or("pkg")
+		result = import_source_if_found(
+			search,
+			package_root,
+			candidate,
+			module_path,
+			NativePackageModule(package_id),
+		)
 
 	result
 
 
 private func resolve_standard_library_import(
 	context: FrontendGraphContext,
+	search: ImportSpellingSearch,
 	module_path: String,
 ) -> Option[CliResolvedImportSource]:
 	match context.std_dir:
 		Some(dir):
 			path: String = join(dir, module_source_filename(module_path))
 
-			if file_exists(path):
-				Some(filesystem_import_source(path, module_path, StdlibModule))
-			else:
-				None
+			import_source_if_found(search, dir, path, module_path, StdlibModule)
 		None:
 			embedded_std_import_source(module_path)
 
@@ -773,6 +897,8 @@ private pure func source_package_with_alias(
 
 private func resolve_path_import(
 	path: String,
+	importer_directory: String,
+	search: ImportSpellingSearch,
 	confinement_origin: Option[ModuleOrigin],
 	context: FrontendGraphContext,
 ) -> Option[CliResolvedImportSource]:
@@ -786,38 +912,51 @@ private func resolve_path_import(
 		_:
 			True
 
-	if allowed and file_exists(path):
-		origin: ModuleOrigin = confinement_origin.get_or(UserModule)
-		Some(filesystem_import_source(path, module_name_for_resolved_source_path(path), origin))
+	if allowed:
+		import_source_if_found(
+			search,
+			importer_directory,
+			path,
+			module_name_for_resolved_source_path(path),
+			confinement_origin.get_or(UserModule),
+		)
 	else:
 		None
 
 
 private func resolve_frontend_import_lookup(
 	context: FrontendGraphContext,
+	importer_directory: String,
+	search: ImportSpellingSearch,
 	lookup: FrontendImportLookup,
 ) -> Option[CliResolvedImportSource]:
 	match lookup:
 		FrontendNativePackageLookup(module_path):
-			resolve_native_package_import(context, module_path)
+			resolve_native_package_import(context, search, module_path)
 		FrontendStandardLibraryLookup(module_path):
-			resolve_standard_library_import(context, module_path)
+			resolve_standard_library_import(context, search, module_path)
 		FrontendRelativePathLookup(path, confinement_origin):
-			resolve_path_import(path, Some(confinement_origin), context)
+			resolve_path_import(
+				path,
+				importer_directory,
+				search,
+				Some(confinement_origin),
+				context,
+			)
 		FrontendSourcePackageAliasLookup(module_path):
-			resolve_source_package_alias_import(context, module_path)
+			resolve_source_package_alias_import(context, search, module_path)
 		FrontendSourcePackageInternalLookup(package_alias, module_path):
 			match source_package_with_alias(context, package_alias):
 				Some(package):
-					resolve_source_package_internal_import(package, module_path)
+					resolve_source_package_internal_import(package, search, module_path)
 				None:
 					None
 		FrontendLocalPathLookup(path):
-			resolve_path_import(path, None, context)
+			resolve_path_import(path, importer_directory, search, None, context)
 
 
 --- Reads the file a resolved location names. Every filesystem lookup already
---- passed a `file_exists` check on this exact path while it was resolved
+--- passed an exact-case existence check on this path while it was resolved
 --- (`resolve_path_import`, `resolve_source_package_alias_import`,
 --- `resolve_source_package_internal_import`, `resolve_native_package_import`,
 --- and the `std_dir`-set branch of `resolve_standard_library_import` each
@@ -1038,24 +1177,64 @@ private func resolve_frontend_source_candidate(
 	importer: FrontendSourceCandidate,
 	requested_path: String,
 ) -> Result[FrontendSourceResolution, String]:
+	importer_directory: String = dirname(frontend_source_candidate_source(importer).path)
+	lookups: List[FrontendImportLookup] = frontend_import_lookup_plan(importer, requested_path)
+
+	match first_import_source(context, importer_directory, SearchExactSpelling, lookups):
+		Some(source):
+			match source.finding:
+				UnverifiableImportFile(directory):
+					Err(
+						"cannot verify the spelling of the file this import names: directory `" + directory + "` could not be listed",
+					)
+				_:
+					Ok(FrontendSourceResolved({
+						identity = resolved_module_identity_from_resolver(
+							source.module_name,
+							source.origin,
+						),
+						path = source.path,
+						module_name = source.module_name,
+					}))
+		None:
+			-- Only now, with every lookup failed, search for a file stored under
+			-- different letter case, so an import that resolves never pays for it.
+			match first_import_source(context, importer_directory, SearchDifferentCase, lookups):
+				Some(source):
+					match source.finding:
+						MisspelledImportFile(stored_names):
+							Ok(FrontendSourceCaseMismatch(stored_names))
+						_:
+							Ok(FrontendSourceUnresolved)
+				None:
+					Ok(FrontendSourceUnresolved)
+
+
+--- The first lookup in `lookups` that finds a source for `search`.
+private func first_import_source(
+	context: FrontendGraphContext,
+	importer_directory: String,
+	search: ImportSpellingSearch,
+	lookups: List[FrontendImportLookup],
+) -> Option[CliResolvedImportSource]:
 	var resolved: Option[CliResolvedImportSource] = None
 
-	for lookup in frontend_import_lookup_plan(importer, requested_path):
+	for lookup in lookups:
 		if resolved.is_none():
-			resolved = resolve_frontend_import_lookup(context, lookup)
+			resolved = resolve_frontend_import_lookup(context, importer_directory, search, lookup)
 
-	match resolved:
-		None:
-			Ok(FrontendSourceUnresolved)
-		Some(source):
-			Ok(FrontendSourceResolved({
-				identity = resolved_module_identity_from_resolver(
-					source.module_name,
-					source.origin,
-				),
-				path = source.path,
-				module_name = source.module_name,
-			}))
+	resolved
+
+
+--- A discovery error as the CLI prints it: a case mismatch is a located-free
+--- diagnostic of its own, so it carries the `error:` severity prefix like other
+--- diagnostics; provider failures keep their `failed to resolve` wording.
+private pure func discovery_error_cli_message(error: FrontendDiscoveryError) -> String:
+	match error:
+		FrontendDiscoveryImportCaseMismatch(_, _, _):
+			cli_error_message(frontend_discovery_error_message(error))
+		_:
+			frontend_discovery_error_message(error)
 
 
 private func compiler_frontend_graph_for_roots(
@@ -1083,7 +1262,7 @@ private func compiler_frontend_graph_for_roots(
 			requested_path,
 		): resolve_frontend_source_candidate(context, importer, requested_path),
 		func(location): load_source_for_location(context, location),
-	).map_err(frontend_discovery_error_message)
+	).map_err(discovery_error_cli_message)
 
 
 func frontend_compilation_graph_for_roots(

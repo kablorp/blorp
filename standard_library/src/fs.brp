@@ -4,8 +4,9 @@
 -- capability traits. `with` owns handle cleanup; operation traits describe what
 -- a handle can do.
 import:
-	path: join
+	path: is_absolute, join
 	stream: FallibleStream, collect_result
+	system: file_exists
 
 
 ---
@@ -729,3 +730,298 @@ func walk_files(root: String) -> Result[List[String], IOError]:
 			Err(error)
 		None:
 			Ok(files.sort())
+
+
+-- ============================================================================
+-- Exact-case path checks
+-- ============================================================================
+-- Imports resolve case-sensitively on every platform, but a case-insensitive
+-- file system answers `file_exists("sub/helper.brp")` for `sub/Helper.brp`. The
+-- checks below compare each component of a path with its parent's directory
+-- listing. The walk itself is pure over listings the caller supplies, so a
+-- caller that checks many paths (a compiler's module discovery) keeps its own
+-- listing cache and lists each directory once.
+---
+What listing one directory gave.
+
+- `DirectoryListed(names)`: the entry names, sorted.
+- `DirectoryAbsent`: nothing to list: the directory is missing or is not a
+  directory (a path that vanished or changed kind since it was found).
+- `DirectoryUnreadable`: the directory exists but could not be listed
+  (permissions, for example), so spellings below it cannot be checked.
+---
+union DirectoryListing:
+	DirectoryListed(List[String])
+	DirectoryAbsent
+	DirectoryUnreadable
+
+
+---
+Lists `path` for the exact-case walk.
+
+A symbolic link to a directory is listed through its target (the walk asks
+the link's parent for the link's own name, so the target's name is not the
+user's spelling), which `read_directory` alone refuses.
+---
+func list_directory(path: String) -> DirectoryListing:
+	match read_directory(join(path, ".")):
+		Ok(entries):
+			DirectoryListed(entries.map(
+				func(entry): entry.name,
+			))
+		Err(NotFound(_)):
+			DirectoryAbsent
+		Err(InvalidInput(_)):
+			DirectoryAbsent
+		Err(_):
+			DirectoryUnreadable
+
+
+---
+How a path's checked components compare with the names the file system stores.
+
+- `ExactSpelling`: no checked component is known to be stored in different
+  letter case. This includes a component that is not listed at all: only a
+  proven case difference is reported, so a difference the walk cannot explain
+  (a Unicode normalization form, say) is left to the file system.
+- `StoredSpelling(components, stored_path)`: every checked component was found,
+  at least one under different letter case. `components` are the checked names
+  as stored and `stored_path` is the whole path as stored.
+- `SpellingUnverifiable(directory)`: `directory` could not be listed, so the
+  spelling below it is unknown.
+
+Letter case is folded with `String.lower` (Unicode lowercasing), not with the
+file system's own folding, so a case difference `lower` does not equate is not
+reported.
+---
+union PathSpelling:
+	ExactSpelling
+	StoredSpelling(List[String], String)
+	SpellingUnverifiable(String)
+
+
+---
+Where the walk stands: decided, or waiting for the listing of one directory.
+---
+union SpellingStep:
+	SpellingKnown(PathSpelling)
+	SpellingNeedsListing(String)
+
+
+---
+The components of the path with the leading `.`/`..`/root anchor kept apart
+from the ordinary names.
+---
+private record AnchoredPath {
+	anchor: String,
+	names: List[String]
+}
+
+
+private pure func anchored_path(path: String) -> AnchoredPath:
+	absolute: Bool = is_absolute(path)
+	var leading_parents: Int = 0
+	var names: List[String] = []
+
+	-- The same resolution as `normalize`: `.` and empty parts vanish, `..`
+	-- cancels the name before it, and a `..` with nothing to cancel stays a
+	-- leading parent of a relative path (above the root of an absolute path it
+	-- is dropped).
+	for part in path.split("/"):
+		if part.length() == 0 or part == ".":
+			void
+		else if part == "..":
+			if names.length() > 0:
+				names = names.take(names.length() - 1)
+			else if not absolute:
+				leading_parents += 1
+		else:
+			names = names.append(part)
+
+	var anchor: String = "."
+
+	if absolute:
+		anchor = "/"
+
+	for _ in 0..leading_parents:
+		anchor = join(anchor, "..")
+
+	{
+		anchor = anchor,
+		names = names
+	}
+
+
+---
+The path `names` below `anchor`, which is `anchor` alone when `names` is empty.
+---
+private pure func path_below_anchor(anchor: String, names: List[String]) -> String:
+	var result: String = anchor
+
+	for name in names:
+		result = join(result, name)
+
+	result
+
+
+---
+The stored name for `component` among `names`: its exact spelling if present,
+otherwise the first name (in the listing's sorted order, so the choice is
+deterministic) that differs only in letter case.
+
+The letter-case search runs only when no exact name exists, so an exact
+component never pays for lowering every name in its directory.
+
+The result is tracked in one `var` and returned bare: returning a `var` from
+one branch of a trailing `if` frees the string it holds (use-after-free under
+`--sanitize`).
+---
+private pure func stored_entry_name(names: List[String], component: String) -> Option[String]:
+	var found: Option[String] = None
+
+	if names.contains(component):
+		found = Some(component)
+	else:
+		folded: String = component.lower()
+
+		for name in names:
+			if found.is_none() and name.lower() == folded:
+				found = Some(name)
+
+	found
+
+
+---
+Walks the components of `path` that `trusted_directory` does not already name,
+comparing each with the listing of its parent in `listings`.
+
+`trusted_directory` names the part of `path` the caller did not get from the
+user, so its spelling is not checked: the walk starts after the leading
+components the two share. A leading `.`, `..` or `/` is never checked. Returns
+`SpellingNeedsListing(directory)` when `listings` lacks a directory the walk
+needs; add `list_directory(directory)` under that key and walk again.
+---
+pure func spelling_below(
+	listings: Dict[String, DirectoryListing],
+	trusted_directory: String,
+	path: String,
+) -> SpellingStep:
+	anchored: AnchoredPath = anchored_path(path)
+	trusted: AnchoredPath = anchored_path(trusted_directory)
+	var shared: Int = 0
+
+	if anchored.anchor == trusted.anchor:
+		while (
+			shared < anchored.names.length()
+			and shared < trusted.names.length()
+			and anchored.names.get(shared) == trusted.names.get(shared)
+		):
+			shared += 1
+
+	var directory: String = path_below_anchor(
+		anchored.anchor,
+		anchored.names.take(shared),
+	)
+	var stored_components: List[String] = []
+	var respelled: Bool = False
+	var step: Option[SpellingStep] = None
+
+	for component in anchored.names.drop(shared):
+		if step.is_none():
+			match listings.get(directory):
+				None:
+					step = Some(SpellingNeedsListing(directory))
+				Some(DirectoryAbsent):
+					step = Some(SpellingKnown(ExactSpelling))
+				Some(DirectoryUnreadable):
+					step = Some(SpellingKnown(SpellingUnverifiable(directory)))
+				Some(DirectoryListed(names)):
+					match stored_entry_name(names, component):
+						Some(stored):
+							if stored != component:
+								respelled = True
+
+							directory = join(directory, stored)
+							stored_components = stored_components.append(stored)
+						None:
+							step = Some(SpellingKnown(ExactSpelling))
+
+	match step:
+		Some(decided):
+			decided
+		None:
+			if respelled:
+				SpellingKnown(StoredSpelling(stored_components, directory))
+			else:
+				SpellingKnown(ExactSpelling)
+
+
+---
+Walks `path` below `trusted_directory` (see `spelling_below`), listing each
+directory it needs from the file system.
+
+Each call lists the directories it checks; a caller checking many paths keeps
+its own listings and uses `spelling_below` directly.
+---
+func path_spelling_below(trusted_directory: String, path: String) -> PathSpelling:
+	var listings: Dict[String, DirectoryListing] = {}
+	var spelling: Option[PathSpelling] = None
+
+	while spelling.is_none():
+		match spelling_below(listings, trusted_directory, path):
+			SpellingKnown(known):
+				spelling = Some(known)
+			SpellingNeedsListing(directory):
+				listings = listings.set(directory, list_directory(directory))
+
+	spelling.get_or(ExactSpelling)
+
+
+---
+True when `path` names an existing file and no component below
+`trusted_directory` is known to be stored in different letter case.
+
+On a case-insensitive file system `file_exists("sub/helper.brp")` is true for
+`sub/Helper.brp`; here it is not, so code that resolves on macOS resolves the
+same way on Linux. A directory that cannot be listed is not a proven
+difference, so it counts as exact; use `path_spelling_below` to see it.
+---
+func file_exists_with_exact_case_below(trusted_directory: String, path: String) -> Bool:
+	if not file_exists(path):
+		False
+	else:
+		match path_spelling_below(trusted_directory, path):
+			StoredSpelling(_, _):
+				False
+			_:
+				True
+
+
+---
+`file_exists_with_exact_case_below` with nothing trusted: every component after
+a leading `.`, `..` or `/` is checked. For an absolute path that lists every
+directory from the root down.
+---
+func file_exists_with_exact_case(path: String) -> Bool:
+	file_exists_with_exact_case_below(".", path)
+
+
+---
+The names, as the file system stores them, of the components of `path` below
+`trusted_directory`, when a file exists there only under different letter case.
+This is `None` for an exact match and for a missing file, on a case-sensitive
+file system as on a case-insensitive one, so a diagnostic built from it reads
+the same on both.
+
+For example, with `sub/Helper.brp` on disk,
+`stored_spelling_below(".", "sub/helper.brp")` is `Some(["sub", "Helper.brp"])`.
+---
+func stored_spelling_below(trusted_directory: String, path: String) -> Option[List[String]]:
+	match path_spelling_below(trusted_directory, path):
+		StoredSpelling(components, stored_path):
+			if file_exists(stored_path):
+				Some(components)
+			else:
+				None
+		_:
+			None

@@ -13,8 +13,15 @@ import:
 	../../../src/compiler_new/stage_01_discovery/source_provider:
 		InMemorySourceProvider,
 		SourceLookupRoots,
+		SourceProvider,
+		SourceRead,
+		directory_listing,
+		read_source,
+		respelled_import_text,
+		source_exists,
 	../../../src/compiler_new/stage_01_discovery/span: SPAN_OFFSET_LIMIT
 	../support/tables_dump: tables_dump
+	fs: DirectoryListing(DirectoryListed, DirectoryUnreadable)
 	test: TestSuite
 
 
@@ -189,6 +196,155 @@ func test_requests_resolve_by_kind_and_unresolved_imports_are_rows() -> Bool:
 	)
 
 
+func test_import_spelled_in_another_case_is_a_case_mismatch_not_a_second_module() -> Bool:
+	dumps_as(
+		{
+			"app/main.brp" => "import:\n\t./sub/Helper\n\t./sub/helper\n\t../lib/util\n\tlocal\n",
+			"app/sub/Helper.brp" => "",
+			"lib/Util.brp" => "",
+			"app/Local.brp" => "",
+		},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+4 diagnostics=0+0",
+			(
+				"  import i0 relative ./sub/Helper parents=0 parts=sub/Helper items=[] -> m1:app/"
+				+ "sub/Helper.brp"
+			),
+			(
+				"  import i1 relative ./sub/helper parents=0 parts=sub/helper items=[] -> "
+				+ "unresolved"
+			),
+			"  import i2 relative ../lib/util parents=1 parts=lib/util items=[] -> unresolved",
+			"  import i3 bare local parents=0 parts=local items=[] -> unresolved",
+			"module m1:app/sub/Helper.brp source=s1 user imported imports=4+0 diagnostics=0+0",
+			(
+				"  resolution diagnostic ImportCaseMismatchDiagnostic s0@23-35 1 stored=sub/"
+				+ "Helper.brp"
+			),
+			(
+				"  resolution diagnostic ImportCaseMismatchDiagnostic s0@37-48 2 stored=lib/Util."
+				+ "brp"
+			),
+			"  resolution diagnostic ImportCaseMismatchDiagnostic s0@50-55 3 stored=Local.brp",
+		],
+	)
+
+
+func test_an_exactly_spelled_source_wins_over_a_variant_and_a_miss_stays_unresolved() -> Bool:
+	dumps_as(
+		{"app/main.brp" => "import:\n\t./a\n\t./b\n", "app/a.brp" => "", "app/A.brp" => ""},
+		["app/main.brp"],
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+2 diagnostics=0+0",
+			"  import i0 relative ./a parents=0 parts=a items=[] -> m1:app/a.brp",
+			"  import i1 relative ./b parents=0 parts=b items=[] -> unresolved",
+			"module m1:app/a.brp source=s1 user imported imports=2+0 diagnostics=0+0",
+			"  resolution diagnostic UnresolvedImportDiagnostic s0@14-17 1",
+		],
+	)
+
+
+func test_a_root_spelled_in_another_case_is_a_root_case_mismatch() -> Bool:
+	dumps_as(
+		{"app/main.brp" => ""},
+		["app/Main.brp"],
+		[
+			"root r0 app/Main.brp -> unloaded",
+			"root diagnostic r0 RootCaseMismatchDiagnostic stored=main.brp",
+		],
+	)
+
+
+func test_respelled_import_text_replaces_the_components_the_provider_spelled_differently() -> Bool:
+	respelled_import_text(
+		"./sub/helper",
+		["sub", "Helper.brp"],
+	) == "./sub/Helper" and respelled_import_text(
+		"../lib/util",
+		["lib", "Util.brp"],
+	) == "../lib/Util" and respelled_import_text(
+		"local",
+		["Local.brp"],
+	) == "Local" and respelled_import_text(
+		"pkg/net/http",
+		["net", "Http.brp"],
+	) == "pkg/net/Http" and respelled_import_text(
+		"./Main",
+		["Extra", "Main.brp"],
+	) == "./Main"
+
+
+---
+An in-memory provider whose listing of one directory is replaced, to show how
+the walker treats listings it cannot trust.
+---
+record ListingOverrideProvider {
+	inner: InMemorySourceProvider,
+	directory: String,
+	listing: DirectoryListing
+}
+
+
+implements SourceProvider for ListingOverrideProvider:
+	func source_exists(self: ListingOverrideProvider, path: String) -> Bool:
+		self.inner.source_exists(path)
+
+	func directory_listing(self: ListingOverrideProvider, directory: String) -> DirectoryListing:
+		if directory == self.directory:
+			self.listing
+		else:
+			self.inner.directory_listing(directory)
+
+	func read_source(self: ListingOverrideProvider, path: String) -> SourceRead:
+		self.inner.read_source(path)
+
+
+---
+Discovery of `app/main.brp` over `sources` with the listing of `directory`
+replaced, rendered as the test dumps render it.
+---
+func dump_with_listing_override(directory: String, listing: DirectoryListing) -> Option[String]:
+	provider: ListingOverrideProvider = {
+		inner = {sources = {"app/main.brp" => "import:\n\t./sub/a\n", "app/sub/a.brp" => ""}},
+		directory = directory,
+		listing = listing
+	}
+
+	match discover(provider, LOOKUP_ROOTS, ["app/main.brp"]):
+		FrozenTables(tables):
+			Some(tables.tables_dump())
+		TableInvariantsViolated(_):
+			None
+
+
+func test_an_unlistable_directory_is_reported_not_trusted() -> Bool:
+	match dump_with_listing_override("./app/sub", DirectoryUnreadable):
+		Some(dump):
+			(
+				dump.contains(
+					"import i0 relative ./sub/a parents=0 parts=sub/a items=[] -> unresolved",
+				)
+				and dump.contains("resolution diagnostic UnverifiableSpellingDiagnostic s0@")
+			)
+		None:
+			False
+
+
+func test_a_component_the_listing_lacks_is_trusted_to_the_provider() -> Bool:
+	-- Only a proven case difference is rejected: a name the listing does not
+	-- hold (a normalization difference, say) is left to `source_exists`.
+	match dump_with_listing_override("./app/sub", DirectoryListed([])):
+		Some(dump):
+			dump.contains(
+				"import i0 relative ./sub/a parents=0 parts=sub/a items=[] -> m1:app/sub/a.brp",
+			)
+		None:
+			False
+
+
 func test_bare_request_prefers_the_standard_library_over_a_local_module() -> Bool:
 	dumps_as(
 		{"app/main.brp" => "import:\n\tshadow\n", "app/shadow.brp" => "", "std/shadow.brp" => ""},
@@ -342,6 +498,30 @@ tests: TestSuite = {
 		(
 			"requests resolve by kind and unresolved imports are rows",
 			test_requests_resolve_by_kind_and_unresolved_imports_are_rows,
+		),
+		(
+			"import spelled in another case is a case mismatch, not a second module",
+			test_import_spelled_in_another_case_is_a_case_mismatch_not_a_second_module,
+		),
+		(
+			"an exactly spelled source wins over a variant",
+			test_an_exactly_spelled_source_wins_over_a_variant_and_a_miss_stays_unresolved,
+		),
+		(
+			"a root spelled in another case is a root case mismatch",
+			test_a_root_spelled_in_another_case_is_a_root_case_mismatch,
+		),
+		(
+			"respelled import text replaces the differently spelled components",
+			test_respelled_import_text_replaces_the_components_the_provider_spelled_differently,
+		),
+		(
+			"an unlistable directory is reported, not trusted",
+			test_an_unlistable_directory_is_reported_not_trusted,
+		),
+		(
+			"a component the listing lacks is trusted to the provider",
+			test_a_component_the_listing_lacks_is_trusted_to_the_provider,
 		),
 		(
 			"bare request prefers the standard library over a local module",

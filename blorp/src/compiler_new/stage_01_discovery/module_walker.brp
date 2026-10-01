@@ -26,6 +26,7 @@ import:
 		append_name,
 		append_package,
 		append_plain_resolution_diagnostic,
+		append_resolution_diagnostic,
 		append_resolution_diagnostic_with_argument,
 		append_root,
 		append_root_diagnostic,
@@ -50,14 +51,23 @@ import:
 		replace_module_row,
 	discovery_diagnostic_code:
 		DiscoveryDiagnosticCode(
+			ImportCaseMismatchDiagnostic,
+			RootCaseMismatchDiagnostic,
 			SourceTooLargeDiagnostic,
 			TooManySourcesDiagnostic,
 			UnreadableSourceDiagnostic,
+			UnverifiableSpellingDiagnostic,
 			UnresolvedImportDiagnostic,
 			UnresolvedRootDiagnostic,
 		),
 	frontend_tables: FreezeOutcome, freeze
+	fs:
+		DirectoryListing,
+		PathSpelling(ExactSpelling, SpellingUnverifiable, StoredSpelling),
+		SpellingStep(SpellingKnown, SpellingNeedsListing),
+		spelling_below,
 	lexer: lex_source
+	path: normalize
 	row_kinds: ModuleReach(ImportedModule, RootModule), PackageKind(NativePackage)
 	source_admission:
 		SourceRejection(SourceTooLargeToSpan, TooManySourcesToSpan),
@@ -73,6 +83,7 @@ import:
 		SourceLookupRoots,
 		SourceProvider,
 		SourceRead(SourceText, SourceUnreadable),
+		directory_listing,
 		import_candidates,
 		read_source,
 		root_candidate,
@@ -101,13 +112,15 @@ private record LoadedModuleFacts {
 
 ---
 Discovers every module reachable from `roots` (source paths) through
-`provider`, then freezes the tables.
+`provider`, then freezes the tables. Directory listings the spelling checks
+need are read through the provider once each and kept for the whole walk.
 ---
 func discover[Provider:SourceProvider](
 	provider: Provider,
 	lookup: SourceLookupRoots,
 	roots: List[String],
 ) -> FreezeOutcome:
+	var listings: Dict[String, DirectoryListing] = {}
 	var builder: DiscoveryBuilder = empty_discovery_builder()
 	var pending: List[PendingImport] = []
 
@@ -118,25 +131,43 @@ func discover[Provider:SourceProvider](
 		builder = builder.intern_path(root_path)
 		builder = builder.append_root({request_path = request_path})
 
+		var root_lookup: CandidateLookup = CandidateFound(candidate)
+
 		if (
 			builder
 				.loaded_module_at(candidate.path)
-				.is_some()
-			or provider.source_exists(candidate.path)
+				.is_none()
 		):
-			modules_before: Int = builder.modules.length()
-			builder = load_or_reuse(provider, builder, candidate, RootModule, RequestedByRoot(root))
-			pending = pending.concat(builder.newly_loaded_imports(modules_before, candidate))
-		else:
-			builder = builder.report_root(root, UnresolvedRootDiagnostic)
+			(listed, looked_up) = look_up_candidates(provider, listings, [candidate])
+			listings = listed
+			root_lookup = looked_up
+
+		match root_lookup:
+			CandidateFound(found):
+				modules_before: Int = builder.modules.length()
+				builder = load_or_reuse(provider, builder, found, RootModule, RequestedByRoot(root))
+				pending = pending.concat(builder.newly_loaded_imports(modules_before, found))
+			CandidateSpelledDifferently(stored_names):
+				builder = builder.report_root_case_mismatch(root, stored_names)
+			CandidateSpellingUnverifiable:
+				builder = builder.report_root(root, UnverifiableSpellingDiagnostic)
+			CandidateNotFound:
+				builder = builder.report_root(root, UnresolvedRootDiagnostic)
 
 	var next_pending: Int = 0
 
 	while next_pending < pending.length():
 		match pending.get(next_pending):
 			Some(entry):
-				match resolve_import(provider, lookup, builder, entry.request):
-					Some(candidate):
+				(listed, looked_up) = look_up_candidates(
+					provider,
+					listings,
+					lookup.import_candidates(entry.request),
+				)
+				listings = listed
+
+				match looked_up:
+					CandidateFound(candidate):
 						modules_before: Int = builder.modules.length()
 						builder = load_or_reuse(
 							provider,
@@ -151,7 +182,14 @@ func discover[Provider:SourceProvider](
 								candidate,
 							),
 						)
-					None:
+					CandidateSpelledDifferently(stored_names):
+						builder = builder.report_import_case_mismatch(entry.import_id, stored_names)
+					CandidateSpellingUnverifiable:
+						builder = builder.report_import(
+							entry.import_id,
+							UnverifiableSpellingDiagnostic,
+						)
+					CandidateNotFound:
 						builder = builder.report_import(entry.import_id, UnresolvedImportDiagnostic)
 			None:
 				void
@@ -269,22 +307,97 @@ private pure func loaded_module_at(builder: DiscoveryBuilder, path: String) -> O
 
 
 ---
-The first candidate for `request` that `provider` has.
+What looking a request's candidates up found.
+
+- `CandidateFound(candidate)`: the first candidate, in lookup order, that exists
+  with no component below its trusted directory known to be stored in
+  different letter case.
+- `CandidateSpelledDifferently(names)`: no candidate exists exactly, but the
+  first candidate with a source under different letter case is stored as
+  `names` (the components below its trusted directory).
+- `CandidateSpellingUnverifiable`: a candidate exists but a directory on the way
+  to it could not be listed, so its spelling is unknown; discovery says so
+  rather than guess.
+- `CandidateNotFound`: no candidate exists under any spelling.
 ---
-private func resolve_import[Provider:SourceProvider](
+private union CandidateLookup:
+	CandidateFound(SourceCandidate)
+	CandidateSpelledDifferently(List[String])
+	CandidateSpellingUnverifiable
+	CandidateNotFound
+
+
+---
+The spelling of `candidate`'s path below its trusted directory, listing each
+directory the check needs that `listings` does not hold yet. Returns the
+listings to keep.
+---
+private func candidate_spelling[Provider:SourceProvider](
 	provider: Provider,
-	lookup: SourceLookupRoots,
-	builder: DiscoveryBuilder,
-	request: ImportRequest,
-) -> Option[SourceCandidate]:
-	var found: Option[SourceCandidate] = None
+	listings: Dict[String, DirectoryListing],
+	candidate: SourceCandidate,
+) -> (Dict[String, DirectoryListing], PathSpelling):
+	var kept: Dict[String, DirectoryListing] = listings
+	var spelling: Option[PathSpelling] = None
 
-	for candidate in lookup.import_candidates(request):
+	while spelling.is_none():
+		match spelling_below(kept, candidate.trusted_directory, candidate.path):
+			SpellingKnown(known):
+				spelling = Some(known)
+			SpellingNeedsListing(directory):
+				kept = kept.set(
+					directory,
+					provider.directory_listing(directory),
+				)
+
+	(kept, spelling.get_or(ExactSpelling))
+
+
+---
+Looks `candidates` up in `provider`. Near misses are only searched for once
+every candidate has failed, so a request that resolves never pays for the
+search (and a missing candidate is never listed for).
+---
+private func look_up_candidates[Provider:SourceProvider](
+	provider: Provider,
+	listings: Dict[String, DirectoryListing],
+	candidates: List[SourceCandidate],
+) -> (Dict[String, DirectoryListing], CandidateLookup):
+	var kept: Dict[String, DirectoryListing] = listings
+	var found: CandidateLookup = CandidateNotFound
+
+	for candidate in candidates:
 		if provider.source_exists(candidate.path):
-			found = Some(candidate)
-			break
+			(listed, spelling) = candidate_spelling(provider, kept, candidate)
+			kept = listed
 
-	found
+			match spelling:
+				ExactSpelling:
+					found = CandidateFound(candidate)
+					break
+				SpellingUnverifiable(_):
+					found = CandidateSpellingUnverifiable
+					break
+				StoredSpelling(_, _):
+					void
+
+	match found:
+		CandidateNotFound:
+			for candidate in candidates:
+				(listed, spelling) = candidate_spelling(provider, kept, candidate)
+				kept = listed
+
+				match spelling:
+					StoredSpelling(stored_names, stored_path):
+						if provider.source_exists(normalize(stored_path)):
+							found = CandidateSpelledDifferently(stored_names)
+							break
+					_:
+						void
+		_:
+			void
+
+	(kept, found)
 
 
 ---
@@ -535,6 +648,32 @@ private pure func report_import(
 	builder.append_resolution_diagnostic_with_argument(code, span, import_id.import_id_index())
 
 
+---
+Reports that `import_id` names a module stored under different letter case:
+its id, then the interned stored spelling (its names joined by `/`).
+---
+private pure func report_import_case_mismatch(
+	builder: DiscoveryBuilder,
+	import_id: ImportId,
+	stored_names: List[String],
+) -> DiscoveryBuilder:
+	stored_path: String = stored_names.join("/")
+	stored_path_id: PathId = builder.interned_path_id(stored_path)
+	span: Span = builder.import_span(import_id)
+	arguments_first: Int = builder.next_diagnostic_argument_row()
+	var out: DiscoveryBuilder = builder.intern_path(stored_path)
+	out = out.append_diagnostic_argument(import_id.import_id_index())
+	out = out.append_diagnostic_argument(stored_path_id.path_id_index())
+	out.append_resolution_diagnostic({
+		code = ImportCaseMismatchDiagnostic,
+		span = span,
+		arguments = {
+			first = arguments_first,
+			count = 2
+		},
+	})
+
+
 private pure func report_rejected_import(
 	builder: DiscoveryBuilder,
 	import_id: ImportId,
@@ -566,6 +705,30 @@ private pure func report_root(
 		arguments = {
 			first = arguments_first,
 			count = 0
+		},
+	})
+
+
+---
+Reports that `root` names a source stored under different letter case, with
+the interned stored spelling as the argument.
+---
+private pure func report_root_case_mismatch(
+	builder: DiscoveryBuilder,
+	root: RootId,
+	stored_names: List[String],
+) -> DiscoveryBuilder:
+	stored_path: String = stored_names.join("/")
+	stored_path_id: PathId = builder.interned_path_id(stored_path)
+	arguments_first: Int = builder.next_diagnostic_argument_row()
+	var out: DiscoveryBuilder = builder.intern_path(stored_path)
+	out = out.append_diagnostic_argument(stored_path_id.path_id_index())
+	out.append_root_diagnostic({
+		root = root,
+		code = RootCaseMismatchDiagnostic,
+		arguments = {
+			first = arguments_first,
+			count = 1
 		},
 	})
 

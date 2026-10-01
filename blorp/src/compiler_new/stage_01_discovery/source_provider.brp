@@ -1,8 +1,9 @@
 -- Where discovery's source texts come from.
 --
 -- Reading sources is discovery's only effect, and it sits behind
--- `SourceProvider`, which answers two questions about a path: does a source
--- exist there, and what is its text. Everything else, including the order in
+-- `SourceProvider`, which answers three questions: does a source exist at a
+-- path, what is its text, and what does a directory hold (so the walker can
+-- check the spelling of a path; see `SourceProvider`). Everything else, including the order in
 -- which an import request's candidate paths are tried, is the pure lookup
 -- policy below, shared by every provider, so an editor serving unsaved
 -- buffers resolves exactly like a build.
@@ -14,6 +15,7 @@
 -- in by supplying `native_package_roots` and, for source packages, candidate
 -- rules added to `import_candidates`. The walker never changes for either.
 import:
+	fs: DirectoryListing(DirectoryAbsent, DirectoryListed), list_directory
 	path: dirname, join, normalize
 	row_kinds:
 		ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest),
@@ -37,8 +39,25 @@ union SourceRead:
 	SourceUnreadable
 
 
+---
+Where sources and directory listings come from. The provider is stateless:
+the walker owns what it learns.
+
+Import paths are case-sensitive on every platform: a case-insensitive file
+system would otherwise resolve `./sub/helper` to `sub/Helper.brp`, load it as
+a second module beside `./sub/Helper`, and resolve nothing at all on a
+case-sensitive one. So the walker accepts an existing source only when no
+component below the candidate's `trusted_directory` is known to be stored in
+different letter case, comparing each with a `directory_listing` it keeps for
+the whole discovery (each directory is listed once).
+
+- `source_exists`: whether a source exists at `path`, however spelled.
+- `directory_listing`: the entry names of `directory`, as `fs.list_directory`.
+- `read_source`: the text of the source at `path`.
+---
 trait SourceProvider:
 	func source_exists(self: Self, path: String) -> Bool
+	func directory_listing(self: Self, directory: String) -> DirectoryListing
 	func read_source(self: Self, path: String) -> SourceRead
 
 
@@ -84,11 +103,50 @@ record ImportRequest {
 
 
 ---
+The import text to write instead of `request_text` when its source is stored
+as `stored_names` (an `ImportCaseMismatchDiagnostic`'s spelling): the trailing
+named components the provider spelled differently are replaced and the file
+extension dropped, so `./sub/helper` with `["sub", "Helper.brp"]` is
+`./sub/Helper`. The leading `.` and `..` are kept, and a provider spelling that reaches above
+the request's named components (a native package root's own directory, say)
+is cut to their number.
+---
+pure func respelled_import_text(request_text: String, stored_names: List[String]) -> String:
+	written: List[String] = request_text.split("/")
+	named: Int = written
+		.filter(pure func(part): part != "." and part != "..")
+		.length()
+	replaced: Int = stored_names
+		.length()
+		.min(named)
+	var stored_modules: List[String] = stored_names.drop(stored_names.length() - replaced)
+
+	match stored_modules.last():
+		Some(file_name):
+			stored_modules = stored_modules
+				.take(replaced - 1)
+				.append(file_name.remove_suffix(SOURCE_FILE_EXTENSION))
+		None:
+			void
+
+	written
+		.take(written.length() - replaced)
+		.concat(stored_modules)
+		.join("/")
+
+
+---
 A path an import request may resolve to, with the origin and package the
 module there would have.
+
+`trusted_directory` is the directory the request is resolved against: the
+importer's directory, the standard-library root, a native package root, or a
+root's own directory. Only the components of `path` below it come from the
+request's spelling, so only those are compared case-exactly.
 ---
 record SourceCandidate {
 	path: String,
+	trusted_directory: String,
 	origin: ModuleOriginKind,
 	package: PackageMembership
 }
@@ -104,6 +162,7 @@ private pure func standard_library_candidate(
 ) -> SourceCandidate:
 	{
 		path = normalize(join(roots.standard_library_root, module_file(module_path))),
+		trusted_directory = roots.standard_library_root,
 		origin = StdlibModule,
 		package = NotInPackage
 	}
@@ -138,6 +197,7 @@ pure func import_candidates(
 					package_path: String = module_file(package_parts.join("/"))
 					roots.native_package_roots.map(pure func(root): {
 							path = normalize(join(root, package_path)),
+							trusted_directory = root,
 							origin = PackageModule,
 							package = InNativePackage(package_name)
 						})
@@ -147,6 +207,7 @@ pure func import_candidates(
 			[
 				{
 					path = normalize(join(importer_directory, module_file(request.text))),
+					trusted_directory = importer_directory,
 					origin = request.requester.origin,
 					package = request.requester.package
 				},
@@ -160,6 +221,7 @@ pure func import_candidates(
 						roots.standard_library_candidate(module_path),
 						{
 							path = normalize(join(importer_directory, module_file(module_path))),
+							trusted_directory = importer_directory,
 							origin = UserModule,
 							package = NotInPackage
 						},
@@ -170,10 +232,14 @@ pure func import_candidates(
 
 ---
 The candidate for a root: the path as given, normalized, as a user module.
+A root's directory is as the user wrote it or the working directory supplied
+it, so only its file name is compared case-exactly.
 ---
 pure func root_candidate(root_path: String) -> SourceCandidate:
+	normalized: String = normalize(root_path)
 	{
-		path = normalize(root_path),
+		path = normalized,
+		trusted_directory = dirname(normalized),
 		origin = UserModule,
 		package = NotInPackage
 	}
@@ -194,6 +260,9 @@ implements SourceProvider for FileSystemSourceProvider:
 	func source_exists(self: FileSystemSourceProvider, path: String) -> Bool:
 		file_exists(path)
 
+	func directory_listing(self: FileSystemSourceProvider, directory: String) -> DirectoryListing:
+		list_directory(directory)
+
 	func read_source(self: FileSystemSourceProvider, path: String) -> SourceRead:
 		match read_file(path):
 			Ok(text):
@@ -210,9 +279,37 @@ record InMemorySourceProvider {
 }
 
 
+---
+The path parts of `directory`, normalized; empty for the working directory,
+which the walk spells `.`.
+---
+private pure func directory_parts(directory: String) -> List[String]:
+	normalize(directory)
+		.split("/")
+		.filter(pure func(part): part.length() > 0 and part != ".")
+
+
 implements SourceProvider for InMemorySourceProvider:
 	func source_exists(self: InMemorySourceProvider, path: String) -> Bool:
 		self.sources.contains(path)
+
+	func directory_listing(self: InMemorySourceProvider, directory: String) -> DirectoryListing:
+		parts: List[String] = directory_parts(directory)
+		var names: List[String] = []
+
+		for key in self.sources.keys():
+			key_parts: List[String] = key.split("/")
+
+			if key_parts.length() > parts.length() and key_parts.take(parts.length()) == parts:
+				name: String = key_parts.get_or(parts.length(), "")
+
+				if not names.contains(name):
+					names = names.append(name)
+
+		if names.length() == 0:
+			DirectoryAbsent
+		else:
+			DirectoryListed(names.sort())
 
 	func read_source(self: InMemorySourceProvider, path: String) -> SourceRead:
 		match self.sources.get(path):

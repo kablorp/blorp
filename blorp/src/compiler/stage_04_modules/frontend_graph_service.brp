@@ -73,13 +73,19 @@ record FrontendSourceLocation {
 --- callback, and only when the location's identity has not already been
 --- discovered through another import edge, so a provider never does the
 --- work of loading a candidate the walk goes on to discard.
+--- `FrontendSourceCaseMismatch` carries the names, below the directory the
+--- import was resolved against, of a source that exists only under different
+--- letter case than the import spells it. Imports are case-sensitive on every
+--- platform, so that is an error, not a resolution, and not merely unresolved.
 union FrontendSourceResolution:
 	FrontendSourceResolved(FrontendSourceLocation)
+	FrontendSourceCaseMismatch(List[String])
 	FrontendSourceUnresolved
 
 
 union FrontendDiscoveryError:
 	FrontendDiscoveryProviderFailed(ResolvedModuleIdentity, String, String)
+	FrontendDiscoveryImportCaseMismatch(ResolvedModuleIdentity, String, List[String])
 	FrontendDiscoveryIdentityConflict(FrontendSourceLocation, FrontendSourceLocation)
 	FrontendDiscoveryGraphFailed(List[FrontendGraphServiceError])
 
@@ -134,12 +140,51 @@ pure func frontend_graph_service_error_message(error: FrontendGraphServiceError)
 			) + "` has no corresponding source import"
 
 
+--- The import path to write instead of `requested_path` when its source is
+--- stored as `stored_names`: the named components are replaced and the `.brp`
+--- extension dropped, so `./sub/helper` with `["sub", "Helper.brp"]` is
+--- `./sub/Helper`. A leading `.` or `..` is kept, and names that reach above
+--- the request's named components (a package root's own directory) are cut to
+--- their number. The new compiler's discovery stage has its own copy of this helper
+--- (`respelled_import_text`, so it need not import this compiler); this one
+--- goes away with this front end.
+pure func respelled_import_path(requested_path: String, stored_names: List[String]) -> String:
+	written: List[String] = requested_path.split("/")
+	named: Int = written
+		.filter(pure func(part): part != "." and part != "..")
+		.length()
+	replaced: Int = stored_names
+		.length()
+		.min(named)
+	var stored_components: List[String] = stored_names.drop(stored_names.length() - replaced)
+
+	match stored_components.last():
+		Some(file_name):
+			stored_components = stored_components
+				.take(replaced - 1)
+				.append(file_name.remove_suffix(".brp"))
+		None:
+			void
+
+	written
+		.take(written.length() - replaced)
+		.concat(stored_components)
+		.join("/")
+
+
 pure func frontend_discovery_error_message(error: FrontendDiscoveryError) -> String:
 	match error:
 		FrontendDiscoveryProviderFailed(importer, requested_path, message):
 			"failed to resolve compiler frontend import `" + requested_path + "` from `" + resolved_module_canonical_path(
 				importer,
 			) + "`: " + message
+		FrontendDiscoveryImportCaseMismatch(_, requested_path, stored_names):
+			"import `" + requested_path + "` does not match the file's name `" + stored_names.join(
+				"/",
+			) + "`\nhelp: import paths are case-sensitive; write `" + respelled_import_path(
+				requested_path,
+				stored_names,
+			) + "`"
 		FrontendDiscoveryIdentityConflict(first, second):
 			"compiler frontend module identity `" + resolved_module_canonical_path(
 				first.identity,
