@@ -79,7 +79,14 @@ record ForeignLinkFlag {
 }
 
 
+---
+The `foreign:` block a foreign function was written in. `header_line` is the
+source line of the block's header: it identifies the block, so adjacent blocks
+with the same arguments stay separate, and it divides the comments written
+above the header from those written inside the block.
+---
 record ForeignMetadata {
+	header_line: Int,
 	includes: List[String],
 	link_flags: List[ForeignLinkFlag]
 }
@@ -177,7 +184,17 @@ record LocatedImport {
 union ProgramBodyItem:
 	BodyDeclaration(LocatedDeclaration)
 	BodyImportBlock(List[LocatedImport])
-	BodyForeignBlock(List[LocatedDeclaration])
+	BodyForeignBlock(ForeignMetadata, List[LocatedDeclaration])
+
+
+---
+The functions of one source `foreign:` block, gathered in order while the
+program's declarations are grouped into body items.
+---
+record ForeignBlockGroup {
+	metadata: ForeignMetadata,
+	functions: List[LocatedDeclaration]
+}
 
 
 record ProgramParts {
@@ -556,12 +573,14 @@ private pure func function_body_from_json(value: JsonValue) -> Result[FunctionBo
 					Ok(BuiltinFunctionBody(name))
 				"foreign":
 					foreign_name ?= value.string_field("foreign_name")
+					header_line ?= value.int_field("foreign_header_line")
 					includes ?= value.string_array_field_or_empty("foreign_includes")
 					link_flags ?= value.foreign_link_flags_field("foreign_link_flags")
 					Ok(
 						ForeignFunctionBody(
 							foreign_name,
 							{
+								header_line = header_line,
 								includes = includes,
 								link_flags = link_flags
 							},
@@ -2016,80 +2035,6 @@ private pure func foreign_block_header_document(metadata: ForeignMetadata) -> Do
 		("foreign(" + args.join(", ") + "):").text()
 
 
-private pure func option_string_equal(left: Option[String], right: Option[String]) -> Bool:
-	match left:
-		None:
-			match right:
-				None:
-					True
-				Some(_):
-					False
-		Some(left_value):
-			match right:
-				Some(right_value):
-					left_value == right_value
-				None:
-					False
-
-
-private pure func string_lists_equal(left: List[String], right: List[String]) -> Bool:
-	if left.length() != right.length():
-		False
-	else:
-		var same: Bool = True
-		var index: Int = 0
-
-		for left_value in left:
-			match right.get(index):
-				Some(right_value):
-					if left_value != right_value:
-						same = False
-						break
-				None:
-					same = False
-					break
-
-			index += 1
-
-		same
-
-
-private pure func foreign_link_flag_equal(left: ForeignLinkFlag, right: ForeignLinkFlag) -> Bool:
-	left.platform.option_string_equal(right.platform) and left.value == right.value
-
-
-private pure func foreign_link_flags_equal(
-	left: List[ForeignLinkFlag],
-	right: List[ForeignLinkFlag],
-) -> Bool:
-	if left.length() != right.length():
-		False
-	else:
-		var same: Bool = True
-		var index: Int = 0
-
-		for left_value in left:
-			match right.get(index):
-				Some(right_value):
-					if not left_value.foreign_link_flag_equal(right_value):
-						same = False
-						break
-				None:
-					same = False
-					break
-
-			index += 1
-
-		same
-
-
-private pure func foreign_metadata_equal(left: ForeignMetadata, right: ForeignMetadata) -> Bool:
-	(
-		left.includes.string_lists_equal(right.includes)
-		and left.link_flags.foreign_link_flags_equal(right.link_flags)
-	)
-
-
 private pure func declaration_foreign_metadata(decl: Declaration) -> Option[ForeignMetadata]:
 	match decl:
 		DocumentedDeclaration(_, inner):
@@ -2110,37 +2055,11 @@ private pure func located_declaration_foreign_metadata(
 	located.declaration.declaration_foreign_metadata()
 
 
-private pure func foreign_block_metadata(declarations: List[LocatedDeclaration]) -> ForeignMetadata:
-	match declarations.get(0):
-		Some(first):
-			match first.located_declaration_foreign_metadata():
-				Some(metadata):
-					metadata
-				None:
-					{
-						includes = [],
-						link_flags = []
-					}
-		None:
-			{
-				includes = [],
-				link_flags = []
-			}
-
-
 private pure func render_foreign_block_function(
 	located: LocatedDeclaration,
 	comments: List[FormatterComment],
-	skip_leading: Bool,
 ) -> RenderedDocument:
-	leading: CommentTake = if skip_leading:
-		{
-			taken = [],
-			remaining = comments
-		}
-	else:
-		comments.take_leading_comments(located.line)
-
+	leading: CommentTake = comments.take_leading_comments(located.line)
 	trailing: TrailingCommentTake = leading.remaining.take_trailing_comment(located.line)
 	leading_doc = leading.taken.comments_document()
 	function_doc = located.declaration.foreign_block_function_document()
@@ -2153,20 +2072,22 @@ private pure func render_foreign_block_function(
 	}
 
 
+---
+Render one source `foreign:` block. The comments written above its header have
+already been taken, so each comment left before a function sits inside the
+block and leads that function.
+---
 private pure func render_foreign_block(
+	metadata: ForeignMetadata,
 	declarations: List[LocatedDeclaration],
 	comments: List[FormatterComment],
 ) -> RenderedDocument:
 	var body_document: Doc = "".text()
 	var has_body_document: Bool = False
 	var remaining_comments: List[FormatterComment] = comments
-	var is_first: Bool = True
 
 	for located in declarations:
-		rendered: RenderedDocument = located.render_foreign_block_function(
-			remaining_comments,
-			is_first,
-		)
+		rendered: RenderedDocument = located.render_foreign_block_function(remaining_comments)
 
 		if has_body_document:
 			body_document = body_document
@@ -2177,11 +2098,9 @@ private pure func render_foreign_block(
 			has_body_document = True
 
 		remaining_comments = rendered.remaining_comments.copy_formatter_comments()
-		is_first = False
 
 	{
-		document = declarations
-			.foreign_block_metadata()
+		document = metadata
 			.foreign_block_header_document()
 			.cat(
 				Hardline
@@ -2194,12 +2113,13 @@ private pure func render_foreign_block(
 
 private pure func flush_foreign_body_item(
 	items: List[ProgramBodyItem],
-	foreign_group: List[LocatedDeclaration],
+	foreign_group: Option[ForeignBlockGroup],
 ) -> List[ProgramBodyItem]:
-	if foreign_group.length() == 0:
-		items
-	else:
-		items.append(BodyForeignBlock(foreign_group))
+	match foreign_group:
+		Some(group):
+			items.append(BodyForeignBlock(group.metadata, group.functions))
+		None:
+			items
 
 
 private pure func flush_import_body_item(
@@ -2229,15 +2149,13 @@ private pure func program_body_items(
 ) -> List[ProgramBodyItem]:
 	var items: List[ProgramBodyItem] = []
 	var import_group: List[LocatedImport] = []
-	var foreign_group: List[LocatedDeclaration] = []
-	var foreign_metadata: Option[ForeignMetadata] = None
+	var foreign_group: Option[ForeignBlockGroup] = None
 
 	for located in declarations:
 		match located.located_declaration_import():
 			Some(import_item):
 				items = items.flush_foreign_body_item(foreign_group)
-				foreign_group = []
-				foreign_metadata = None
+				foreign_group = None
 				import_group = import_group.append(import_item)
 			None:
 				items = items.flush_import_body_item(import_group)
@@ -2245,21 +2163,27 @@ private pure func program_body_items(
 
 				match located.located_declaration_foreign_metadata():
 					Some(metadata):
-						match foreign_metadata:
-							Some(current):
-								if current.foreign_metadata_equal(metadata):
-									foreign_group = foreign_group.append(located)
+						foreign_group = match foreign_group:
+							Some(group):
+								if group.metadata.header_line == metadata.header_line:
+									Some({
+										metadata = group.metadata,
+										functions = group.functions.append(located),
+									})
 								else:
-									items = items.flush_foreign_body_item(foreign_group)
-									foreign_group = [located]
-									foreign_metadata = Some(metadata)
+									items = items.flush_foreign_body_item(Some(group))
+									Some({
+										metadata = metadata,
+										functions = [located],
+									})
 							None:
-								foreign_group = [located]
-								foreign_metadata = Some(metadata)
+								Some({
+									metadata = metadata,
+									functions = [located],
+								})
 					None:
 						items = items.flush_foreign_body_item(foreign_group)
-						foreign_group = []
-						foreign_metadata = None
+						foreign_group = None
 						items = items.append(BodyDeclaration(located))
 
 	items
@@ -2273,7 +2197,7 @@ private pure func program_body_item_func_name(item: ProgramBodyItem) -> Option[S
 			located.declaration.declaration_function_name()
 		BodyImportBlock(_):
 			None
-		BodyForeignBlock(_):
+		BodyForeignBlock(_, _):
 			None
 
 
@@ -2283,7 +2207,7 @@ private pure func is_small_program_body_item(item: ProgramBodyItem) -> Bool:
 			located.declaration.is_small_declaration()
 		BodyImportBlock(_):
 			False
-		BodyForeignBlock(_):
+		BodyForeignBlock(_, _):
 			False
 
 
@@ -2343,20 +2267,21 @@ private pure func render_program_body_item(
 				document = rendered.document,
 				remaining_comments = rendered.remaining_comments.copy_formatter_comments()
 			}
-		BodyForeignBlock(declarations):
-			first_line: Int = match declarations.get(0):
-				Some(first):
-					first.line
-				None:
-					0
-
-			leading: CommentTake = comments.take_leading_comments(first_line)
-			rendered: RenderedDocument = declarations.render_foreign_block(
-				leading.remaining.copy_formatter_comments(),
+		BodyForeignBlock(metadata, declarations):
+			leading: CommentTake = comments.take_leading_comments(metadata.header_line)
+			header: TrailingCommentTake = leading.remaining.take_trailing_comment(metadata.header_line)
+			rendered: RenderedDocument = metadata.render_foreign_block(
+				declarations,
+				header.remaining.copy_formatter_comments(),
 			)
 			leading_doc = leading.taken.comments_document()
+			-- The comment ending the `foreign:` line is deferred to the end of the
+			-- rendered header, as for a declaration's first line.
+			header_comment = header.comment.trailing_comment_document()
 			{
-				document = leading_doc.cat(rendered.document),
+				document = leading_doc
+					.cat(header_comment)
+					.cat(rendered.document),
 				remaining_comments = rendered.remaining_comments.copy_formatter_comments()
 			}
 
