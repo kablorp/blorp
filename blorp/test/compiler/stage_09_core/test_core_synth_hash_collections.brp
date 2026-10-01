@@ -648,6 +648,61 @@ pure func test_dict_complete_synthesized_family() -> Bool:
 	])
 
 
+---
+True when `expr` holds a `SeqExpr` whose first half contains `operation` and
+whose second half is the erased-key-temp marker over `source`: the key
+temporary is released only after the insert that may retain it.
+---
+pure func marker_follows(expr: CoreExpr, operation: String, source: CoreVar) -> Bool:
+	match expr:
+		SeqExpr(first, CallExpr(IntrinsicCall(name), _, args, _, _)):
+			(
+				(
+					name == "release_erased_key_temp"
+					and contains_intrinsic(first, operation)
+					and args.any(func(arg): contains_var(arg, source))
+				)
+				or immediate_core_expr_children(expr).any(func(child): marker_follows(child, operation, source))
+			)
+		_:
+			immediate_core_expr_children(expr).any(func(child): marker_follows(child, operation, source))
+
+
+pure func test_key_temps_are_released_through_the_layout_marker() -> Bool:
+	dict_int: CoreType = dict_type(INT_TYPE, INT_TYPE)
+	set_int: CoreType = set_type(INT_TYPE)
+	dict_self: CoreParam = param("receiver", 91, 901, dict_int)
+	key: CoreParam = param("lookup", 92, 902, INT_TYPE)
+	set_self: CoreParam = param("elements", 93, 903, set_int)
+	element: CoreParam = param("element", 94, 904, INT_TYPE)
+	dict_set: CoreFunction = builtin_function(
+		"dict",
+		"set",
+		[dict_self, key, param("new_value", 95, 905, INT_TYPE)],
+		dict_int,
+	)
+	dict_contains: CoreFunction = builtin_function("dict", "contains", [dict_self, key], BOOL_TYPE)
+	set_add: CoreFunction = builtin_function("set", "add", [set_self, element], set_int)
+	set_contains: CoreFunction = builtin_function("set", "contains", [set_self, element], BOOL_TYPE)
+
+	match (
+		synthesized_body(dict_set),
+		synthesized_body(dict_contains),
+		synthesized_body(set_add),
+		synthesized_body(set_contains),
+	):
+		(Some(dict_set_body), Some(dict_contains_body), Some(set_add_body), Some(set_contains_body)):
+			(
+				marker_follows(dict_set_body, "dict_set_key_at", key.name)
+				and marker_follows(set_add_body, "set_alloc_entry", element.name)
+				and contains_intrinsic(dict_contains_body, "release_erased_key_temp")
+				and contains_intrinsic(set_contains_body, "release_erased_key_temp")
+				and not contains_intrinsic(dict_set_body, "release_hash_key_box")
+			)
+		_:
+			False
+
+
 pure func test_dict_probe_get_or_and_wide_value_ownership() -> Bool:
 	dict_int_wide: CoreType = dict_type(INT_TYPE, INT128_TYPE)
 	self: CoreParam = param("receiver", 81, 801, dict_int_wide)
@@ -1052,6 +1107,10 @@ tests: TestSuite = {
 	description = "Compiler Core hash collection synthesis",
 	tests = [
 		("Set complete synthesized family", test_set_complete_synthesized_family),
+		(
+			"key temps are released through the layout marker",
+			test_key_temps_are_released_through_the_layout_marker,
+		),
 		(
 			"Set immediate probe, COW, and parameter identity",
 			test_set_immediate_probe_cow_and_parameter_identity,

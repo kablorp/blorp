@@ -81,6 +81,7 @@ import:
 			StreamImmediateLayout,
 			StreamOwnedArcLayout,
 		),
+		boxed_storage_allocates,
 		boxed_storage_kind,
 		boxed_storage_slot_needs_release,
 		boxed_storage_unbox_kind,
@@ -97,6 +98,7 @@ import:
 		stream_element_layout_code,
 		tensor_type_info,
 		two_named_type_arguments,
+	erased_key_temps: RELEASE_HASH_KEY_BOX, is_erased_key_temp_marker
 	synth_nodes: core_var
 	type_policy: core_type_has_unresolved_mono_parameters, is_core_stream_type_name
 
@@ -139,6 +141,27 @@ private pure func intrinsic_call(
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
 	CallExpr(IntrinsicCall(name), void_expr(loc), args, result_type, loc)
+
+
+---
+Resolves a synthesized body's erased-key-temp marker (`erased_key_temps`) now
+that the key's runtime layout is known: a key boxed into a fresh allocation is
+released, and any other conversion needs no release. A malformed marker is
+left in place for the late invariant to report.
+---
+private pure func resolve_erased_key_temp_release(
+	layout: CoreSpecializeLayout,
+	args: List[CoreExpr],
+	loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match args:
+		[key_temp, source]:
+			if boxed_storage_allocates(layout, core_expr_type(source)):
+				Some(intrinsic_call(RELEASE_HASH_KEY_BOX, [key_temp], VoidType, loc))
+			else:
+				Some(void_expr(loc))
+		_:
+			None
 
 
 private pure func list_element_type(
@@ -1295,6 +1318,15 @@ pure func specialize_collection_expr(layout: CoreSpecializeLayout, expr: CoreExp
 			else:
 				canonical
 		CallExpr(kind, callee, args, result_type, loc):
+			erased_key_release: Option[CoreExpr] = match kind:
+				IntrinsicCall(name):
+					if is_erased_key_temp_marker(name):
+						resolve_erased_key_temp_release(layout, args, loc)
+					else:
+						None
+				_:
+					None
+
 			is_list_alloc: Bool = match kind:
 				IntrinsicCall("list_alloc"):
 					True
@@ -1303,33 +1335,37 @@ pure func specialize_collection_expr(layout: CoreSpecializeLayout, expr: CoreExp
 				_:
 					False
 
-			if is_list_alloc and args.length() == 1:
-				element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
-				ListAllocExpr(
-					{
-						layout = specialize_list_layout(layout, result_type),
-						capacity = args.get_or(0, void_expr(loc)),
-						elem_needs_release = specialize_list_element_needs_release(
-							layout,
-							element_type,
-						)
-					},
-					result_type,
-					loc,
-				)
-			else:
-				match kind:
-					BuiltinCall(name):
-						specialize_collection_call(
-							layout,
-							canonical,
-							name,
-							callee,
-							args,
+			match erased_key_release:
+				Some(release):
+					release
+				None:
+					if is_list_alloc and args.length() == 1:
+						element_type: CoreType = list_element_type(layout, result_type).get_or(POINTER_TYPE)
+						ListAllocExpr(
+							{
+								layout = specialize_list_layout(layout, result_type),
+								capacity = args.get_or(0, void_expr(loc)),
+								elem_needs_release = specialize_list_element_needs_release(
+									layout,
+									element_type,
+								)
+							},
 							result_type,
 							loc,
 						)
-					_:
-						canonical
+					else:
+						match kind:
+							BuiltinCall(name):
+								specialize_collection_call(
+									layout,
+									canonical,
+									name,
+									callee,
+									args,
+									result_type,
+									loc,
+								)
+							_:
+								canonical
 		_:
 			canonical

@@ -26,6 +26,7 @@ import:
 			SeqExpr,
 			TupleExpr,
 			UnboxExpr,
+			VarExpr,
 		),
 		CoreFunction,
 		CoreLiteral(IntLiteral),
@@ -33,6 +34,7 @@ import:
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
+		CoreVar,
 		CoreType(
 			BoxedResultType,
 			EnumType,
@@ -60,6 +62,7 @@ import:
 			UInt128Unbox,
 		),
 	mono: core_mono_type_equal
+	erased_key_temps: ERASED_KEY_TEMP_RELEASE_INTRINSIC
 	synth_context:
 		CoreSynthContext,
 		CoreSynthNamedTypeLayout(
@@ -137,6 +140,10 @@ union CoreHashPointerLayout:
 ---
 Keys and values need separate pointer layouts. In particular, the current
 runtime ABI casts value-record keys but boxes value-record dictionary values.
+A `BoxedHashPointer` release flag is meaningful only for
+`boxed_value_pointer_layout`: key temporaries are always released through
+the erased-key-temp marker, which specialization resolves with the key's
+final layout (`release_key_box`).
 ---
 record CoreHashTypeLayoutFacts {
 	probe_mode: CoreHashProbeMode,
@@ -248,13 +255,13 @@ private pure func classify_representation_type(
 			else if args.is_empty() and name == "Int128":
 				ExactHashTypeLayout({
 					probe_mode = DispatchedHashProbe,
-					hash_key_pointer_layout = BoxedHashPointer(Int128Box, Int128Unbox, True),
+					hash_key_pointer_layout = BoxedHashPointer(Int128Box, Int128Unbox, False),
 					boxed_value_pointer_layout = BoxedHashPointer(Int128Box, Int128Unbox, True),
 				})
 			else if args.is_empty() and name == "UInt128":
 				ExactHashTypeLayout({
 					probe_mode = DispatchedHashProbe,
-					hash_key_pointer_layout = BoxedHashPointer(UInt128Box, UInt128Unbox, True),
+					hash_key_pointer_layout = BoxedHashPointer(UInt128Box, UInt128Unbox, False),
 					boxed_value_pointer_layout = BoxedHashPointer(UInt128Box, UInt128Unbox, True),
 				})
 			else if args.is_empty() and name == "Float":
@@ -465,68 +472,54 @@ private pure func pointer_temp_needs_release(layout: CoreHashPointerLayout) -> B
 
 
 ---
-Drops an operation's own reference to a fresh key box after its last use.
+Drops an operation's own key temporary after its last use when converting
+`source` into erased key storage made a fresh box. Synthesis cannot tell: a
+`CastHashPointer` key (stack option, stack result, value struct) only becomes
+a box during specialization, so this is a marker that specialization resolves
+with the key's final layout (`erased_key_temps`). The temporary is always the
+operation's own: a table that keeps the key retains its own reference, and a
+lookup only borrows it.
 ---
-private pure func release_key_box(key_box: CoreExpr) -> CoreExpr:
-	intrinsic_call("release_hash_key_box", [key_box], VoidType)
+private pure func release_key_box(key_box: CoreExpr, source: CoreExpr) -> CoreExpr:
+	intrinsic_call(ERASED_KEY_TEMP_RELEASE_INTRINSIC, [key_box, source], VoidType)
 
 
 ---
-The key pointer an operation passes to the table. A key whose layout makes a
-fresh ARC box (Int128, UInt128) is read from `temp_name`, which
-`with_owned_key_box` binds and later releases; any other key is converted in
-place as before.
----
-private pure func key_pointer_operand(
-	layout: CoreHashPointerLayout,
-	temp_name: String,
-	key: CoreExpr,
-	key_type: CoreType,
-) -> CoreExpr:
-	if pointer_temp_needs_release(layout):
-		variable(temp_name, POINTER_TYPE)
-	else:
-		pointer_argument(layout, key, key_type)
-
-
----
-Binds the fresh key box for `body` and releases it once `body` is done. The box
-is this operation's own temporary: a table that keeps the key retains its own
-reference, and a lookup only borrows it, so the temporary's reference is always
-dropped here. Layouts that do not box return `body` unchanged.
+Binds the key `source` converted into erased storage as `temp_name` for
+`body`, then releases the temporary (see `release_key_box`). `body` reads the
+key as `variable(temp_name, POINTER_TYPE)`; a non-void result is bound first
+so the release runs after its last use.
 ---
 private pure func with_owned_key_box(
 	layout: CoreHashPointerLayout,
 	temp_name: String,
-	key: CoreExpr,
+	source: CoreVar,
 	key_type: CoreType,
 	body: CoreExpr,
 	result_type: CoreType,
 ) -> CoreExpr:
-	if pointer_temp_needs_release(layout):
-		key_box: CoreExpr = variable(temp_name, POINTER_TYPE)
-		result_name: String = temp_name + "_result"
-		released: CoreExpr = match result_type:
-			VoidType:
-				SeqExpr(body, release_key_box(key_box))
-			_:
-				let_expr(
-					result_name,
-					False,
-					result_type,
-					body,
-					SeqExpr(release_key_box(key_box), variable(result_name, result_type)),
-				)
+	source_value: CoreExpr = VarExpr(source, key_type, synthetic_core_source_loc())
+	key_box: CoreExpr = variable(temp_name, POINTER_TYPE)
+	result_name: String = temp_name + "_result"
+	released: CoreExpr = match result_type:
+		VoidType:
+			SeqExpr(body, release_key_box(key_box, source_value))
+		_:
+			let_expr(
+				result_name,
+				False,
+				result_type,
+				body,
+				SeqExpr(release_key_box(key_box, source_value), variable(result_name, result_type)),
+			)
 
-		let_expr(
-			temp_name,
-			False,
-			POINTER_TYPE,
-			pointer_argument(layout, key, key_type),
-			released,
-		)
-	else:
-		body
+	let_expr(
+		temp_name,
+		False,
+		POINTER_TYPE,
+		pointer_argument(layout, source_value, key_type),
+		released,
+	)
 
 
 private pure func hash_probe(
@@ -655,15 +648,16 @@ private pure func set_eq_call(
 
 private pure func synthesize_set_contains(
 	self: CoreExpr,
-	element: CoreExpr,
+	element: CoreVar,
 	element_type: CoreType,
 	layout: CoreHashTypeLayoutFacts,
 ) -> CoreExpr:
 	found: CoreExpr = variable("__found", BOOL_TYPE)
-	found_result: CoreExpr = if pointer_temp_needs_release(layout.hash_key_pointer_layout):
-		SeqExpr(release_key_box(variable("__elem", POINTER_TYPE)), found)
-	else:
-		found
+	element_value: CoreExpr = VarExpr(element, element_type, synthetic_core_source_loc())
+	found_result: CoreExpr = SeqExpr(
+		release_key_box(variable("__elem", POINTER_TYPE), element_value),
+		found,
+	)
 
 	let_expr(
 		"__elem",
@@ -671,7 +665,7 @@ private pure func synthesize_set_contains(
 		POINTER_TYPE,
 		pointer_argument(
 			layout.hash_key_pointer_layout,
-			element,
+			element_value,
 			element_type,
 		),
 		let_expr(
@@ -1043,7 +1037,7 @@ private pure func set_insert_retained(
 
 private pure func synthesize_set_add(
 	self: CoreExpr,
-	element: CoreExpr,
+	element: CoreVar,
 	set_type: CoreType,
 	element_type: CoreType,
 	layout: CoreHashTypeLayoutFacts,
@@ -1061,12 +1055,7 @@ private pure func synthesize_set_add(
 				element_type,
 				set_insert_retained(
 					variable("__result", set_type),
-					key_pointer_operand(
-						layout.hash_key_pointer_layout,
-						"__add_key",
-						element,
-						element_type,
-					),
+					variable("__add_key", POINTER_TYPE),
 					layout,
 				),
 				VoidType,
@@ -1313,16 +1302,11 @@ private pure func synthesize_set_map(
 				with_owned_key_box(
 					result_layout.hash_key_pointer_layout,
 					"__mapped_key",
-					variable("__mapped", result_element_type),
+					core_var("__mapped"),
 					result_element_type,
 					set_insert_retained(
 						result,
-						key_pointer_operand(
-							result_layout.hash_key_pointer_layout,
-							"__mapped_key",
-							variable("__mapped", result_element_type),
-							result_element_type,
-						),
+						variable("__mapped_key", POINTER_TYPE),
 						result_layout,
 					),
 					VoidType,
@@ -1839,7 +1823,7 @@ private pure func dict_find_slot(
 
 private pure func synthesize_dict_contains(
 	self: CoreExpr,
-	key: CoreExpr,
+	key: CoreVar,
 	key_type: CoreType,
 	layout: CoreHashTypeLayoutFacts,
 ) -> CoreExpr:
@@ -1913,10 +1897,8 @@ private pure func synthesize_dict_contains(
 		scan_one,
 	)
 
-	found_result: CoreExpr = if pointer_temp_needs_release(layout.hash_key_pointer_layout):
-		SeqExpr(release_key_box(lookup_key), found)
-	else:
-		found
+	key_value: CoreExpr = VarExpr(key, key_type, synthetic_core_source_loc())
+	found_result: CoreExpr = SeqExpr(release_key_box(lookup_key, key_value), found)
 
 	let_expr(
 		"__dict_contains_key",
@@ -1924,7 +1906,7 @@ private pure func synthesize_dict_contains(
 		POINTER_TYPE,
 		pointer_argument(
 			layout.hash_key_pointer_layout,
-			key,
+			key_value,
 			key_type,
 		),
 		let_expr(
@@ -1971,7 +1953,7 @@ private pure func synthesize_dict_contains(
 
 private pure func synthesize_dict_get_or(
 	self: CoreExpr,
-	key: CoreExpr,
+	key: CoreVar,
 	default_value: CoreExpr,
 	key_type: CoreType,
 	value_type: CoreType,
@@ -2037,12 +2019,7 @@ private pure func synthesize_dict_get_or(
 			key_type,
 			dict_find_slot(
 				self,
-				key_pointer_operand(
-					key_layout.hash_key_pointer_layout,
-					"__get_or_key",
-					key,
-					key_type,
-				),
+				variable("__get_or_key", POINTER_TYPE),
 				key_layout,
 			),
 			INT_TYPE,
@@ -2546,7 +2523,7 @@ private pure func dict_insert_retained(
 
 private pure func synthesize_dict_set(
 	self: CoreExpr,
-	key: CoreExpr,
+	key: CoreVar,
 	value: CoreExpr,
 	dict_type: CoreType,
 	key_type: CoreType,
@@ -2586,12 +2563,7 @@ private pure func synthesize_dict_set(
 					key_type,
 					dict_insert_retained(
 						result,
-						key_pointer_operand(
-							key_layout.hash_key_pointer_layout,
-							"__set_key",
-							key,
-							key_type,
-						),
+						variable("__set_key", POINTER_TYPE),
 						pointer_argument(value_pointer_layout, value, value_type),
 						key_layout,
 						pointer_temp_needs_release(value_pointer_layout),
@@ -2643,7 +2615,7 @@ private pure func synthesize_set_named_body(
 								Some(
 									synthesize_set_contains(
 										parameter_value(self),
-										parameter_value(element),
+										element.name,
 										element_type,
 										layout,
 									),
@@ -2669,7 +2641,7 @@ private pure func synthesize_set_named_body(
 								Some(
 									synthesize_set_add(
 										parameter_value(self),
-										parameter_value(element),
+										element.name,
 										self.typ,
 										element_type,
 										layout,
@@ -2929,7 +2901,7 @@ private pure func synthesize_dict_named_body(
 								Some(
 									synthesize_dict_contains(
 										parameter_value(self),
-										parameter_value(key),
+										key.name,
 										key_type,
 										key_layout,
 									),
@@ -2962,7 +2934,7 @@ private pure func synthesize_dict_named_body(
 								Some(
 									synthesize_dict_get_or(
 										parameter_value(self),
-										parameter_value(key),
+										key.name,
 										parameter_value(default_value),
 										key_type,
 										value_type,
@@ -2993,7 +2965,7 @@ private pure func synthesize_dict_named_body(
 								Some(
 									synthesize_dict_set(
 										parameter_value(self),
-										parameter_value(key),
+										key.name,
 										parameter_value(value),
 										self.typ,
 										key_type,

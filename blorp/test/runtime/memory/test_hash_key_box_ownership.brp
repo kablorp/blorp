@@ -1,0 +1,115 @@
+import:
+	dict as Dicts
+	set as Sets
+	test: TestSuite
+
+
+-- Keys stored as boxed copies (stack options, stack results, value structs)
+-- are boxed into a fresh temporary by every synthesized insert and lookup.
+-- An insert's container keeps its own reference and a lookup keeps none, so
+-- the temporary must be released on every path; this suite runs under the
+-- leak gate, so any leaked box fails it. Values are Int so only key boxes
+-- count. Result-keyed Sets and the builtin `get`/`remove` go through runtime
+-- calls rather than synthesized bodies; those paths still leak an owned
+-- Result key and are deliberately not exercised here.
+
+struct GridPoint {
+	x: Int,
+	y: Int
+}
+
+
+implements Equatable for GridPoint:
+	pure func equals(a: GridPoint, b: GridPoint) -> Bool:
+		a.x == b.x and a.y == b.y
+
+
+implements Hashable for GridPoint:
+	pure func hash(self: GridPoint) -> Int:
+		self.x * 31 + self.y
+
+
+pure func some_key(value: Int) -> Option[Int]:
+	Some(value)
+
+
+pure func ok_key(value: Int) -> Result[Int, String]:
+	Ok(value)
+
+
+pure func err_key(text: String) -> Result[Int, String]:
+	Err(text + "!")
+
+
+pure func point_key(x: Int, y: Int) -> GridPoint:
+	{ x = x, y = y }
+
+
+func test_option_dict_keys_release_boxes() -> Bool:
+	var dict: Dict[Option[Int], Int] = {}
+	dict = dict.set(some_key(1), 1)
+	dict = dict.set(None, 2)
+	dict = dict.set(some_key(1), 3)
+	dict = dict.set(None, 4)
+	found: Bool = Dicts.get_or(dict, some_key(1), 0) == 3 and dict.contains(None)
+	dict = dict.remove(some_key(1))
+	found and dict.length() == 1
+
+
+func test_result_dict_keys_release_boxes() -> Bool:
+	var dict: Dict[Result[Int, String], Int] = {}
+	dict = dict.set(ok_key(1), 1)
+	dict = dict.set(err_key("x"), 2)
+	dict = dict.set(err_key("x"), 3)
+	dict = dict.set(ok_key(1), 4)
+	found: Bool = Dicts.get_or(dict, err_key("x"), 0) == 3 and dict.contains(ok_key(1))
+	-- A named key: removing an owned Result temporary goes through the
+	-- builtin path, which still leaks it.
+	removed: Result[Int, String] = err_key("x")
+	dict = dict.remove(removed)
+	found and dict.length() == 1
+
+
+func test_struct_dict_keys_release_boxes() -> Bool:
+	var dict: Dict[GridPoint, Int] = Dicts.with_capacity(4)
+	dict = dict.set(point_key(1, 2), 1)
+	dict = dict.set(point_key(3, 4), 2)
+	dict = dict.set(point_key(1, 2), 3)
+	found: Bool = Dicts.get_or(dict, point_key(1, 2), 0) == 3 and not dict.contains(point_key(2, 1))
+	dict = dict.remove(point_key(3, 4))
+	found and dict.length() == 1
+
+
+func test_option_set_elements_release_boxes() -> Bool:
+	var set: Set[Option[Int]] = Sets.set()
+	set = set.add(some_key(1))
+	set = set.add(some_key(1))
+	set = set.add(None)
+	set = set.remove(some_key(1))
+	set.length() == 1 and set.contains(None) and not set.contains(some_key(1))
+
+
+func test_struct_set_elements_release_boxes() -> Bool:
+	var set: Set[GridPoint] = Sets.from_list([point_key(1, 2), point_key(1, 2), point_key(2, 1)])
+	set = set.add(point_key(2, 1))
+	set = set.remove(point_key(1, 2))
+	set.length() == 1 and set.contains(point_key(2, 1))
+
+
+func test_set_map_to_boxed_elements_releases_boxes() -> Bool:
+	numbers: Set[Int] = Sets.from_list([1, 2, 3, 4])
+	options: Set[Option[Int]] = Sets.map(numbers, pure func(n: Int) -> Option[Int]: Some(n % 2))
+	options.length() == 2 and options.contains(some_key(0))
+
+
+tests: TestSuite = {
+	description = "Boxed hash key ownership",
+	tests = [
+		("option dict keys release boxes", test_option_dict_keys_release_boxes),
+		("result dict keys release boxes", test_result_dict_keys_release_boxes),
+		("struct dict keys release boxes", test_struct_dict_keys_release_boxes),
+		("option set elements release boxes", test_option_set_elements_release_boxes),
+		("struct set elements release boxes", test_struct_set_elements_release_boxes),
+		("set map to boxed elements releases boxes", test_set_map_to_boxed_elements_releases_boxes),
+	]
+}
