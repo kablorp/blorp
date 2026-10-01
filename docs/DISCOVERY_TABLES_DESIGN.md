@@ -124,7 +124,6 @@ opaque type ImportItemId = Int
 opaque type DefinitionId = Int
 opaque type NodeId = Int
 opaque type LiteralId = Int
-opaque type DiagnosticId = Int
 opaque type ParameterId = Int
 opaque type ForeignBlockId = Int
 ```
@@ -385,12 +384,14 @@ struct NodeRow {kind: NodeKind, span: Span, payload: Int, children: RowRange}
 -- node_children: List[NodeId]; a node's children are one block of it.
 ```
 
-**`tables/row_kinds.brp` is the single source for the node kinds.** Its `NodeKind`
-docstring gives each kind's payload and child order, and
-`node_payload_reference(kind)` says which table the payload indexes:
-`NamePayload`, `LiteralPayload`, `CodepointPayload`, `DefinitionPayload` or
-`NoPayload` (which stores `NO_NODE_PAYLOAD`). This document does not repeat
-the list. There are 127 kinds in these families:
+**`tables/row_kinds.brp` is the single source for the node kinds.** Its
+`node_schema(kind)` declares each kind's shape once, with no wildcard arm, so a
+new kind does not compile until it is described: the table its payload indexes
+(`NamePayload`, `LiteralPayload`, `CodepointPayload`, `DefinitionPayload` or
+`NoPayload`, which stores `NO_NODE_PAYLOAD`), its `ChildArity` and its
+`NameSpanRule`. A comment beside each arm gives the child order. The freeze
+checks read the schema. This document does not repeat the list. There are 127
+kinds in these families:
 
 - literals and names: `IdentifierNode`, one kind per literal form (integer,
   float, string, raw, pipe, raw pipe, char, `True`, `False`), and the
@@ -903,8 +904,10 @@ The invariants, by violation kind:
 - `UnreferencedNode`, `NodeReferencedTwice`: every node is exactly one
   node's child or one row's root (body, parameter or definition type,
   variant payload, dimension constraint side).
+- `NodeArityMismatch`: each node has a child count its kind's `ChildArity`
+  allows.
 - `PayloadOutOfRange`: each node's payload is valid for its kind's
-  `node_payload_reference` (a scalar value for a codepoint, `NO_NODE_PAYLOAD`
+  `node_schema` payload (a scalar value for a codepoint, `NO_NODE_PAYLOAD`
   for `NoPayload`); references are checked by `DanglingReference`.
 - `LocalFunctionNodeMismatch`: a `LocalFunctionNode` names a local
   function definition.

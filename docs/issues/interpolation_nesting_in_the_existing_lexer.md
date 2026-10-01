@@ -1,4 +1,4 @@
-# The existing lexer cannot nest interpolation or keep braces in pipe strings
+# The existing lexer cannot nest interpolation, keep braces in pipe strings or read character literals in a hole
 
 Status: open. Blocks roadmap criteria 1 and 6 for these inputs only.
 
@@ -19,7 +19,15 @@ holes, to any depth (`docs/GUIDE.md`, `docs/GRAMMAR.md`). The existing lexer
   not write that way, so such a string is now a parse error (help: write the
   brace as `\{`) rather than a hole with another hole's location.
 
-The discovery stage reads both as the language says (a stack of code and string
+- **Character literals in a hole.** The lexer scans a hole's code for quotes
+  and braces without knowing character literals, so `"${'}'}"` is closed at the
+  `}` inside the literal and rejected, as are `'"'`, and a literal holding
+  `$` or `\` is not read as one. The discovery stage reads a character literal
+  in a hole as one token (`test_body_parser.brp` pins `}`, `"`, `$`, `\` and
+  `\u{7d}`); the existing lexer rejects the input, so it cannot be a parity
+  fixture, which compares accepted programs.
+
+The discovery stage reads these as the language says (a stack of code and string
 frames in `hole_scan`, `lex/lexer.brp`). Two inputs the existing lexer read
 wrongly in the first segment of a quoted interpolated string were fixed in the
 existing lexer when the adapter's differential found them: `\u{...}` after a

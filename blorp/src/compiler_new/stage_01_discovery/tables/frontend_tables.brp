@@ -3,9 +3,10 @@
 -- `freeze` seals a builder once discovery is done. It first runs
 -- `check_table_invariants` and refuses to freeze a builder that breaks them.
 -- Readers rely on those invariants: an id they were handed names a row, so
--- the row accessors below never need an absent case. The fallback rows they
--- carry for an index outside a table are unreachable for ids read from
--- frozen tables; they exist because a list read is total.
+-- the row accessors below never need an absent case. A list read is total, so
+-- each accessor has an arm for a miss: it reports the miss under `debug:`
+-- (`report_unreachable_lookup`) and returns the documented `UNREACHABLE_...`
+-- row, which no id read from frozen tables reaches.
 import:
 	builder:
 		AnnotationRow,
@@ -19,6 +20,7 @@ import:
 		DefinitionTypeRow,
 		DiagnosticRow,
 		DimensionConstraintRow,
+		DimensionNameRow,
 		DiscoveryBuilder,
 		DocumentationRow,
 		EMPTY_ROW_RANGE,
@@ -38,11 +40,11 @@ import:
 		ImportItemVariantRow,
 		ImportRow,
 		LiteralId,
-		DimensionNameRow,
 		MemberRow,
 		ModuleDocumentationRow,
 		ModuleId,
 		ModuleRow,
+		NO_SPAN,
 		NameId,
 		NodeId,
 		NodeNameSpanRow,
@@ -63,10 +65,10 @@ import:
 		SupertraitQualifierRow,
 		SupertraitRow,
 		TypeParameterRow,
+		UNREACHABLE_NODE_ROW,
 		VariantPayloadRow,
 		bound_id_index,
 		definition_id_index,
-		find_name_id,
 		implicit_request_id_index,
 		import_id_index,
 		import_item_id_index,
@@ -79,6 +81,7 @@ import:
 		package_id_index,
 		path_id_at_row,
 		path_id_index,
+		report_unreachable_lookup,
 		root_id_index,
 		source_id_at_row,
 		source_id_index,
@@ -130,14 +133,73 @@ private pure func tables_of(tables: FrontendTables) -> DiscoveryBuilder:
 	from_opaque FrontendTables(tables)
 
 
--- Unreachable fallback rows (see the module comment) are written inline in
--- each accessor's out-of-range arm because the backend cannot yet emit a
--- global struct constant whose initializer calls an opaque constructor
--- ("unsupported global initializer"); make them constants once it can.
 ---
 Text read for an index outside a text table; unreachable for frozen ids.
 ---
 private UNREACHABLE_TEXT_LITERAL: String = ""
+
+---
+The module row returned for a module id the tables did not issue.
+---
+private UNREACHABLE_MODULE_ROW: ModuleRow = {
+	source = source_id_at_row(0),
+	canonical_path = path_id_at_row(0),
+	origin = UserModule,
+	reach = ImportedModule,
+	definitions = EMPTY_ROW_RANGE,
+	imports = EMPTY_ROW_RANGE,
+	nodes = EMPTY_ROW_RANGE,
+	diagnostics = EMPTY_ROW_RANGE
+}
+
+---
+The definition row returned for a definition id the tables did not issue.
+---
+private UNREACHABLE_DEFINITION_ROW: DefinitionRow = {
+	module = module_id_at_row(0),
+	kind = FunctionDefinition,
+	name = name_id_at_row(0),
+	name_span = NO_SPAN,
+	visibility = PublicVisibility,
+	span = NO_SPAN
+}
+
+---
+The import row returned for an import id the tables did not issue.
+---
+private UNREACHABLE_IMPORT_ROW: ImportRow = {
+	importer = module_id_at_row(0),
+	request_kind = BareModuleRequest,
+	request_path = path_id_at_row(0),
+	parent_steps = 0,
+	path_parts = EMPTY_ROW_RANGE,
+	items = EMPTY_ROW_RANGE,
+	path_span = NO_SPAN,
+	span = NO_SPAN
+}
+
+---
+The source row returned for a source id the tables did not issue.
+---
+private UNREACHABLE_SOURCE_ROW: SourceRow = {
+	path = path_id_at_row(0),
+	line_starts = EMPTY_ROW_RANGE
+}
+
+---
+The root row returned for a root id the tables did not issue.
+---
+private UNREACHABLE_ROOT_ROW: RootRow = {request_path = path_id_at_row(0)}
+
+---
+The implicit request row returned for a request id the tables did not issue.
+---
+private UNREACHABLE_IMPLICIT_REQUEST_ROW: ImplicitRequestRow = {request_path = path_id_at_row(0)}
+
+---
+Why a row accessor's miss cannot happen: the id came from the frozen tables.
+---
+private FROZEN_ID_GUARANTEE: String = "the id was read from frozen tables, whose rows are checked complete"
 
 
 -- Counts.
@@ -151,10 +213,6 @@ pure func definition_count(tables: FrontendTables) -> Int:
 
 pure func node_count(tables: FrontendTables) -> Int:
 	tables.tables_of().nodes.length()
-
-
-pure func node_child_count(tables: FrontendTables) -> Int:
-	tables.tables_of().node_children.length()
 
 
 pure func name_count(tables: FrontendTables) -> Int:
@@ -203,16 +261,8 @@ pure func module_row(tables: FrontendTables, id: ModuleId) -> ModuleRow:
 		Some(row):
 			row
 		None:
-			{
-				source = source_id_at_row(0),
-				canonical_path = path_id_at_row(0),
-				origin = UserModule,
-				reach = ImportedModule,
-				definitions = EMPTY_ROW_RANGE,
-				imports = EMPTY_ROW_RANGE,
-				nodes = EMPTY_ROW_RANGE,
-				diagnostics = EMPTY_ROW_RANGE
-			}
+			report_unreachable_lookup("module", id.module_id_index(), FROZEN_ID_GUARANTEE)
+			UNREACHABLE_MODULE_ROW
 
 
 pure func definition_row(tables: FrontendTables, id: DefinitionId) -> DefinitionRow:
@@ -220,14 +270,8 @@ pure func definition_row(tables: FrontendTables, id: DefinitionId) -> Definition
 		Some(row):
 			row
 		None:
-			{
-				module = module_id_at_row(0),
-				kind = FunctionDefinition,
-				name = name_id_at_row(0),
-				name_span = pack_span(0, 0, 0),
-				visibility = PublicVisibility,
-				span = pack_span(0, 0, 0)
-			}
+			report_unreachable_lookup("definition", id.definition_id_index(), FROZEN_ID_GUARANTEE)
+			UNREACHABLE_DEFINITION_ROW
 
 
 pure func node_row(tables: FrontendTables, id: NodeId) -> NodeRow:
@@ -235,12 +279,8 @@ pure func node_row(tables: FrontendTables, id: NodeId) -> NodeRow:
 		Some(row):
 			row
 		None:
-			{
-				kind = MissingExpressionNode,
-				span = pack_span(0, 0, 0),
-				payload = 0,
-				children = EMPTY_ROW_RANGE
-			}
+			report_unreachable_lookup("node", id.node_id_index(), FROZEN_ID_GUARANTEE)
+			UNREACHABLE_NODE_ROW
 
 
 ---
@@ -264,16 +304,8 @@ pure func import_row(tables: FrontendTables, id: ImportId) -> ImportRow:
 		Some(row):
 			row
 		None:
-			{
-				importer = module_id_at_row(0),
-				request_kind = BareModuleRequest,
-				request_path = path_id_at_row(0),
-				parent_steps = 0,
-				path_parts = EMPTY_ROW_RANGE,
-				items = EMPTY_ROW_RANGE,
-				path_span = pack_span(0, 0, 0),
-				span = pack_span(0, 0, 0)
-			}
+			report_unreachable_lookup("import", id.import_id_index(), FROZEN_ID_GUARANTEE)
+			UNREACHABLE_IMPORT_ROW
 
 
 pure func source_row(tables: FrontendTables, id: SourceId) -> SourceRow:
@@ -281,10 +313,8 @@ pure func source_row(tables: FrontendTables, id: SourceId) -> SourceRow:
 		Some(row):
 			row
 		None:
-			{
-				path = path_id_at_row(0),
-				line_starts = EMPTY_ROW_RANGE
-			}
+			report_unreachable_lookup("source", id.source_id_index(), FROZEN_ID_GUARANTEE)
+			UNREACHABLE_SOURCE_ROW
 
 
 pure func root_row(tables: FrontendTables, id: RootId) -> RootRow:
@@ -292,7 +322,8 @@ pure func root_row(tables: FrontendTables, id: RootId) -> RootRow:
 		Some(row):
 			row
 		None:
-			{request_path = path_id_at_row(0)}
+			report_unreachable_lookup("root", id.root_id_index(), FROZEN_ID_GUARANTEE)
+			UNREACHABLE_ROOT_ROW
 
 
 pure func implicit_request_row(tables: FrontendTables, id: ImplicitRequestId) -> ImplicitRequestRow:
@@ -300,7 +331,12 @@ pure func implicit_request_row(tables: FrontendTables, id: ImplicitRequestId) ->
 		Some(row):
 			row
 		None:
-			{request_path = path_id_at_row(0)}
+			report_unreachable_lookup(
+				"implicit request",
+				id.implicit_request_id_index(),
+				FROZEN_ID_GUARANTEE,
+			)
+			UNREACHABLE_IMPLICIT_REQUEST_ROW
 
 
 ---
@@ -709,27 +745,31 @@ private pure func node_name_span_owner(builder: DiscoveryBuilder, row: Int) -> I
 
 -- Text.
 pure func name_spelling(tables: FrontendTables, id: NameId) -> String:
-	tables.tables_of().name_spellings
-		.get(id.name_id_index())
-		.get_or(UNREACHABLE_TEXT_LITERAL)
+	tables.tables_of().name_spellings.text_at("name", id.name_id_index())
 
 
 pure func path_text(tables: FrontendTables, id: PathId) -> String:
-	tables.tables_of().paths
-		.get(id.path_id_index())
-		.get_or(UNREACHABLE_TEXT_LITERAL)
+	tables.tables_of().paths.text_at("path", id.path_id_index())
 
 
 pure func literal_text(tables: FrontendTables, id: LiteralId) -> String:
-	tables.tables_of().literals
-		.get(id.literal_id_index())
-		.get_or(UNREACHABLE_TEXT_LITERAL)
+	tables.tables_of().literals.text_at("literal", id.literal_id_index())
 
 
 pure func source_text(tables: FrontendTables, id: SourceId) -> String:
-	tables.tables_of().source_texts
-		.get(id.source_id_index())
-		.get_or(UNREACHABLE_TEXT_LITERAL)
+	tables.tables_of().source_texts.text_at("source text", id.source_id_index())
+
+
+---
+Text `index` of `texts`, or `UNREACHABLE_TEXT_LITERAL` after a report. The bound
+is checked before `get_or`, which does not allocate an `Option` per read.
+---
+private pure func text_at(texts: List[String], table: String, index: Int) -> String:
+	if index >= 0 and index < texts.length():
+		texts.get_or(index, UNREACHABLE_TEXT_LITERAL)
+	else:
+		report_unreachable_lookup(table, index, FROZEN_ID_GUARANTEE)
+		UNREACHABLE_TEXT_LITERAL
 
 
 ---
@@ -757,13 +797,6 @@ Every spelling, in id order: the id of a spelling is its position.
 ---
 pure func name_spellings(tables: FrontendTables) -> List[String]:
 	tables.tables_of().name_spellings
-
-
----
-The id `spelling` has in these tables, if any row holds it.
----
-pure func lookup_name_id(tables: FrontendTables, spelling: String) -> Option[NameId]:
-	find_name_id(tables.tables_of(), spelling)
 
 
 -- Optional relationships (side tables).
@@ -819,23 +852,6 @@ private pure func root_target_owner(builder: DiscoveryBuilder, row: Int) -> Int:
 			target.root.root_id_index()
 		None:
 			NO_OWNER_ROW
-
-
----
-The module loaded from `canonical_path`, if any.
----
-pure func module_at_path(tables: FrontendTables, canonical_path: String) -> Option[ModuleId]:
-	builder: DiscoveryBuilder = tables.tables_of()
-
-	match builder.path_ids_by_text.get(canonical_path):
-		Some(path_index):
-			match builder.module_ids_by_path.get(path_index):
-				Some(module_index):
-					Some(module_id_at_row(module_index))
-				None:
-					None
-		None:
-			None
 
 
 -- Import details.
@@ -1028,7 +1044,7 @@ pure func implicit_diagnostic_argument(
 	row: ImplicitDiagnosticRow,
 	ordinal: Int,
 ) -> Option[Int]:
-	tables.tables_of().diagnostic_arguments.get(row.arguments.first + ordinal)
+	tables.argument_in(row.arguments, ordinal)
 
 
 pure func root_diagnostic_argument(
@@ -1036,7 +1052,7 @@ pure func root_diagnostic_argument(
 	row: RootDiagnosticRow,
 	ordinal: Int,
 ) -> Option[Int]:
-	tables.tables_of().diagnostic_arguments.get(row.arguments.first + ordinal)
+	tables.argument_in(row.arguments, ordinal)
 
 
 ---
@@ -1124,7 +1140,41 @@ pure func diagnostic_argument(
 	row: DiagnosticRow,
 	ordinal: Int,
 ) -> Option[Int]:
-	tables.tables_of().diagnostic_arguments.get(row.arguments.first + ordinal)
+	tables.argument_in(row.arguments, ordinal)
+
+
+---
+The arguments a diagnostic row of any of the three diagnostic tables stores,
+which `range` is a block of the one shared argument table. A row's range lies
+inside that table (`RangeOutOfBounds`), so each argument exists; one that does
+not is reported and read as 0.
+---
+pure func diagnostic_arguments_of(tables: FrontendTables, range: RowRange) -> List[Int]:
+	var arguments: List[Int] = []
+
+	for ordinal in 0..range.count:
+		match tables.argument_in(range, ordinal):
+			Some(argument):
+				arguments = arguments.append(argument)
+			None:
+				report_unreachable_lookup(
+					"diagnostic argument",
+					range.first + ordinal,
+					"the freeze checks every diagnostic row's argument range",
+				)
+				arguments = arguments.append(UNREACHABLE_DIAGNOSTIC_ARGUMENT)
+
+	arguments
+
+
+---
+The argument `diagnostic_arguments_of` reads for an argument row that is missing.
+---
+private UNREACHABLE_DIAGNOSTIC_ARGUMENT: Int = 0
+
+
+private pure func argument_in(tables: FrontendTables, range: RowRange, ordinal: Int) -> Option[Int]:
+	tables.tables_of().diagnostic_arguments.get(range.first + ordinal)
 
 
 ---

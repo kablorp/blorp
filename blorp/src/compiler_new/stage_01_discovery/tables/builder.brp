@@ -61,6 +61,8 @@ import:
 		Purity,
 		TypeParameterKind,
 		Visibility,
+		arity_admits,
+		node_schema,
 	span: Span, pack_span
 	token: Token
 
@@ -123,8 +125,6 @@ opaque type NodeId = Int
 One interned literal text (string or number spelling, or foreign C text).
 ---
 opaque type LiteralId = Int
-
-opaque type DiagnosticId = Int
 
 ---
 One parameter of a function, method or foreign function.
@@ -942,10 +942,6 @@ pure func literal_id_index(id: LiteralId) -> Int:
 	from_opaque LiteralId(id)
 
 
-pure func diagnostic_id_index(id: DiagnosticId) -> Int:
-	from_opaque DiagnosticId(id)
-
-
 pure func parameter_id_index(id: ParameterId) -> Int:
 	from_opaque ParameterId(id)
 
@@ -964,10 +960,6 @@ pure func module_ids_equal(left: ModuleId, right: ModuleId) -> Bool:
 
 pure func definition_ids_equal(left: DefinitionId, right: DefinitionId) -> Bool:
 	left.definition_id_index() == right.definition_id_index()
-
-
-pure func node_ids_equal(left: NodeId, right: NodeId) -> Bool:
-	left.node_id_index() == right.node_id_index()
 
 
 ---
@@ -1029,18 +1021,6 @@ pure func node_id_at_row(index: Int) -> NodeId:
 
 pure func literal_id_at_row(index: Int) -> LiteralId:
 	into_opaque LiteralId(index)
-
-
-pure func diagnostic_id_at_row(index: Int) -> DiagnosticId:
-	into_opaque DiagnosticId(index)
-
-
-pure func parameter_id_at_row(index: Int) -> ParameterId:
-	into_opaque ParameterId(index)
-
-
-pure func foreign_block_id_at_row(index: Int) -> ForeignBlockId:
-	into_opaque ForeignBlockId(index)
 
 
 -- Names, paths and literals: interned text.
@@ -1150,19 +1130,6 @@ pure func append_path(builder: DiscoveryBuilder, text: String) -> DiscoveryBuild
 		paths = builder.paths.append(text),
 		path_ids_by_text = builder.path_ids_by_text.set(text, index)
 	}
-
-
-pure func find_literal_id(builder: DiscoveryBuilder, text: String) -> Option[LiteralId]:
-	index: Int = builder.interned_literal_index(text)
-
-	if index == NOT_INTERNED:
-		None
-	else:
-		Some(into_opaque LiteralId(index))
-
-
-pure func next_literal_id(builder: DiscoveryBuilder) -> LiteralId:
-	into_opaque LiteralId(builder.literals.length())
 
 
 ---
@@ -1652,7 +1619,10 @@ pure func append_node(builder: DiscoveryBuilder, row: NodeRow) -> DiscoveryBuild
 	{ builder | nodes = builder.nodes.append(row) }
 
 
-pure func append_dimension_name(builder: DiscoveryBuilder, row: DimensionNameRow) -> DiscoveryBuilder:
+pure func append_dimension_name(
+	builder: DiscoveryBuilder,
+	row: DimensionNameRow,
+) -> DiscoveryBuilder:
 	{ builder | dimension_names = builder.dimension_names.append(row) }
 
 
@@ -1727,23 +1697,56 @@ pure func last_node_id(builder: DiscoveryBuilder) -> NodeId:
 
 
 ---
-The row of `node`. Parse routines read only nodes they appended, so the
-fallback (an empty missing-expression row) is unreachable.
+Reports a lookup that cannot miss: an id the table issued, or an index inside a
+range the caller read from the same table. A debug build stops with the
+message, so the broken caller is found where it read; a release build returns
+the documented `UNREACHABLE_...` row and goes on, since a language-level
+operation must not crash. `guarantee` says why the row exists.
 ---
-pure func node_row_at(builder: DiscoveryBuilder, node: NodeId) -> NodeRow:
+pure func report_unreachable_lookup(table: String, index: Int, guarantee: String):
+	debug:
+		dbg.error("${table} row ${index} does not exist, but ${guarantee}")
+
+
+---
+The span of a row that has none to hold: no source and no extent. Fallback
+rows carry it; they are returned only after `report_unreachable_lookup`, never
+for a row a table holds.
+---
+NO_SPAN: Span = pack_span(0, 0, 0)
+
+
+---
+The payload of a node whose kind has none.
+---
+NO_NODE_PAYLOAD: Int = 0
+
+---
+The node row `node_row` returns for a node the table does not hold.
+---
+UNREACHABLE_NODE_ROW: NodeRow = {
+	kind = MissingExpressionNode,
+	span = NO_SPAN,
+	payload = NO_NODE_PAYLOAD,
+	children = EMPTY_ROW_RANGE
+}
+
+
+---
+The row of `node`. Parse routines read only nodes they appended, so a miss
+is a defect in the routine: it is reported and `UNREACHABLE_NODE_ROW` returned.
+---
+pure func node_row(builder: DiscoveryBuilder, node: NodeId) -> NodeRow:
 	match builder.nodes.get(node.node_id_index()):
 		Some(row):
 			row
 		None:
-			{
-				kind = MissingExpressionNode,
-				span = pack_span(0, 0, 0),
-				payload = NO_NODE_PAYLOAD,
-				children = {
-					first = 0,
-					count = 0
-				}
-			}
+			report_unreachable_lookup(
+				"node",
+				node.node_id_index(),
+				"parse routines read only nodes they appended",
+			)
+			UNREACHABLE_NODE_ROW
 
 
 ---
@@ -1751,7 +1754,7 @@ Child `position` of `node`, or `None` when the node has fewer children (a
 node in recovery may).
 ---
 pure func node_child_at(builder: DiscoveryBuilder, node: NodeId, position: Int) -> Option[NodeId]:
-	row: NodeRow = builder.node_row_at(node)
+	row: NodeRow = builder.node_row(node)
 
 	if position < row.children.count:
 		builder.node_children.get(row.children.first + position)
@@ -1862,10 +1865,6 @@ pure func append_node_child(builder: DiscoveryBuilder, child: NodeId) -> Discove
 
 
 -- Diagnostics.
-pure func next_diagnostic_id(builder: DiscoveryBuilder) -> DiagnosticId:
-	into_opaque DiagnosticId(builder.diagnostics.length())
-
-
 pure func next_diagnostic_argument_row(builder: DiscoveryBuilder) -> Int:
 	builder.diagnostic_arguments.length()
 
@@ -1879,6 +1878,75 @@ pure func append_diagnostic(builder: DiscoveryBuilder, row: DiagnosticRow) -> Di
 
 
 ---
+Which diagnostic table a coded diagnostic goes to: the one the lexer and
+parsers fill, or the one the module graph fills (an import that loaded no
+module, a source that could not be admitted). Both read one shared table of
+integer arguments.
+---
+private enum DiagnosticDestination:
+	LexAndParseDiagnostics
+	ModuleGraphDiagnostics
+
+
+---
+The integer argument a coded diagnostic carries, whose meaning its code fixes
+(`diagnostic_argument_kinds`), if any.
+---
+private union DiagnosticArgument:
+	NoArgument
+	OneArgument(Int)
+
+
+private pure func append_coded_diagnostic(
+	builder: DiscoveryBuilder,
+	destination: DiagnosticDestination,
+	code: DiscoveryDiagnosticCode,
+	span: Span,
+	argument: DiagnosticArgument,
+) -> DiscoveryBuilder:
+	arguments_first: Int = builder.diagnostic_arguments.length()
+
+	match argument:
+		NoArgument:
+			builder.append_diagnostic_to(
+				destination,
+				{
+					code = code,
+					span = span,
+					arguments = {
+						first = arguments_first,
+						count = 0
+					}
+				},
+			)
+		OneArgument(value):
+			with_argument: DiscoveryBuilder = builder.append_diagnostic_argument(value)
+			with_argument.append_diagnostic_to(
+				destination,
+				{
+					code = code,
+					span = span,
+					arguments = {
+						first = arguments_first,
+						count = 1
+					}
+				},
+			)
+
+
+private pure func append_diagnostic_to(
+	builder: DiscoveryBuilder,
+	destination: DiagnosticDestination,
+	row: DiagnosticRow,
+) -> DiscoveryBuilder:
+	match destination:
+		LexAndParseDiagnostics:
+			builder.append_diagnostic(row)
+		ModuleGraphDiagnostics:
+			builder.append_resolution_diagnostic(row)
+
+
+---
 Appends a diagnostic with no arguments.
 ---
 pure func append_plain_diagnostic(
@@ -1886,15 +1954,7 @@ pure func append_plain_diagnostic(
 	code: DiscoveryDiagnosticCode,
 	span: Span,
 ) -> DiscoveryBuilder:
-	arguments_first: Int = builder.diagnostic_arguments.length()
-	builder.append_diagnostic({
-		code = code,
-		span = span,
-		arguments = {
-			first = arguments_first,
-			count = 0
-		},
-	})
+	builder.append_coded_diagnostic(LexAndParseDiagnostics, code, span, NoArgument)
 
 
 ---
@@ -1906,17 +1966,7 @@ pure func append_diagnostic_with_argument(
 	span: Span,
 	argument: Int,
 ) -> DiscoveryBuilder:
-	arguments_first: Int = builder.diagnostic_arguments.length()
-	var out: DiscoveryBuilder = builder.append_diagnostic_argument(argument)
-	out = out.append_diagnostic({
-		code = code,
-		span = span,
-		arguments = {
-			first = arguments_first,
-			count = 1
-		},
-	})
-	out
+	builder.append_coded_diagnostic(LexAndParseDiagnostics, code, span, OneArgument(argument))
 
 
 -- Transient tables of the module being lexed and parsed.
@@ -1951,15 +2001,27 @@ pure func pending_docstring_count(builder: DiscoveryBuilder) -> Int:
 
 
 ---
+The literal an unreachable lookup of a literal id returns: the first row.
+---
+UNREACHABLE_LITERAL_ID: LiteralId = literal_id_at_row(0)
+
+
+---
 The pending docstring at `index`; callers pass an index inside a docstring
-range they read, so the fallback is unreachable.
+range they read from the pending docstrings, so a miss is a defect in the
+caller: it is reported and `UNREACHABLE_LITERAL_ID` returned.
 ---
 pure func pending_docstring_at(builder: DiscoveryBuilder, index: Int) -> LiteralId:
 	match builder.pending_docstrings.get(index):
 		Some(text):
 			text
 		None:
-			into_opaque LiteralId(0)
+			report_unreachable_lookup(
+				"pending docstring",
+				index,
+				"callers pass an index inside a docstring range they read",
+			)
+			UNREACHABLE_LITERAL_ID
 
 
 -- Interpolated strings.
@@ -1996,28 +2058,49 @@ pure func interpolation_parts_of(builder: DiscoveryBuilder, interpolation: Int) 
 
 
 ---
-Interpolation part `index`; callers pass an index inside a parts range, so
-the fallback is unreachable.
+The row `interpolation_part_at` returns for an index the table does not hold.
+---
+UNREACHABLE_INTERPOLATION_PART: InterpolationPartRow = {
+	part = HolePart,
+	start = 0,
+	end = 0,
+	text = EMPTY_ROW_RANGE
+}
+
+
+---
+Interpolation part `index`; callers pass an index inside a parts range they
+read, so a miss is a defect in the caller: it is reported and
+`UNREACHABLE_INTERPOLATION_PART` returned.
 ---
 pure func interpolation_part_at(builder: DiscoveryBuilder, index: Int) -> InterpolationPartRow:
 	match builder.interpolation_parts.get(index):
 		Some(row):
 			row
 		None:
-			{
-				part = HolePart,
-				start = 0,
-				end = 0,
-				text = EMPTY_ROW_RANGE
-			}
+			report_unreachable_lookup(
+				"interpolation part",
+				index,
+				"callers pass an index inside a parts range they read",
+			)
+			UNREACHABLE_INTERPOLATION_PART
 
 
+---
+Interpolation text `index`, a row of a parts range the caller read; a miss is
+reported and `UNREACHABLE_LITERAL_ID` returned.
+---
 pure func interpolation_text_at(builder: DiscoveryBuilder, index: Int) -> LiteralId:
 	match builder.interpolation_texts.get(index):
 		Some(text):
 			text
 		None:
-			into_opaque LiteralId(0)
+			report_unreachable_lookup(
+				"interpolation text",
+				index,
+				"callers pass an index inside a parts range they read",
+			)
+			UNREACHABLE_LITERAL_ID
 
 
 pure func append_pending_annotation(
@@ -2032,18 +2115,30 @@ pure func pending_annotation_count(builder: DiscoveryBuilder) -> Int:
 
 
 ---
+The row `pending_annotation_at` returns for an index the table does not hold.
+---
+UNREACHABLE_PENDING_ANNOTATION: PendingAnnotationRow = {
+	annotation = TailRecursiveAnnotation,
+	span = NO_SPAN
+}
+
+
+---
 The pending annotation at `index`. Callers pass an index inside a range they
-read from `pending_annotation_count`, so the fallback is unreachable.
+read from `pending_annotation_count`, so a miss is a defect in the caller: it is
+reported and `UNREACHABLE_PENDING_ANNOTATION` returned.
 ---
 pure func pending_annotation_at(builder: DiscoveryBuilder, index: Int) -> PendingAnnotationRow:
 	match builder.pending_annotations.get(index):
 		Some(row):
 			row
 		None:
-			{
-				annotation = TailRecursiveAnnotation,
-				span = pack_span(0, 0, 0)
-			}
+			report_unreachable_lookup(
+				"pending annotation",
+				index,
+				"callers pass an index inside a range they read",
+			)
+			UNREACHABLE_PENDING_ANNOTATION
 
 
 ---
@@ -2107,17 +2202,7 @@ pure func append_resolution_diagnostic_with_argument(
 	span: Span,
 	argument: Int,
 ) -> DiscoveryBuilder:
-	arguments_first: Int = builder.diagnostic_arguments.length()
-	var out: DiscoveryBuilder = builder.append_diagnostic_argument(argument)
-	out = out.append_resolution_diagnostic({
-		code = code,
-		span = span,
-		arguments = {
-			first = arguments_first,
-			count = 1
-		},
-	})
-	out
+	builder.append_coded_diagnostic(ModuleGraphDiagnostics, code, span, OneArgument(argument))
 
 
 ---
@@ -2128,21 +2213,7 @@ pure func append_plain_resolution_diagnostic(
 	code: DiscoveryDiagnosticCode,
 	span: Span,
 ) -> DiscoveryBuilder:
-	arguments_first: Int = builder.diagnostic_arguments.length()
-	builder.append_resolution_diagnostic({
-		code = code,
-		span = span,
-		arguments = {
-			first = arguments_first,
-			count = 0
-		},
-	})
-
-
----
-The payload of a node whose kind has none.
----
-NO_NODE_PAYLOAD: Int = 0
+	builder.append_coded_diagnostic(ModuleGraphDiagnostics, code, span, NoArgument)
 
 
 ---
@@ -2287,6 +2358,18 @@ private pure func append_parent_node_from_stack_with_payload(
 ) -> DiscoveryBuilder:
 	first_child: Int = builder.node_children.length()
 	depth: Int = builder.child_stack_depth
+
+	-- The freeze reports a child count the kind forbids (`NodeArityMismatch`)
+	-- long after the parser that miscounted has returned; failing here names
+	-- the parser's call. A count above the stack's depth would claim children
+	-- that belong to an enclosing node.
+	debug:
+		if not kind.node_schema().arity.arity_admits(count):
+			dbg.error("a node was appended with a child count its kind does not allow")
+
+		if count > depth:
+			dbg.error("a node claimed more children than the child stack holds")
+
 	var out: DiscoveryBuilder = builder.claim_stack_children(depth - count, depth)
 	out = out.with_child_stack_depth(depth - count)
 	out = out.append_node({
@@ -2334,15 +2417,27 @@ private pure func claim_stack_child_run(
 
 
 ---
-Child stack entry `index`; callers pass an index below the stack depth, so
-the fallback is unreachable.
+The node `stack_entry` returns for an index the child stack does not hold.
+---
+UNREACHABLE_NODE_ID: NodeId = node_id_at_row(0)
+
+
+---
+Child stack entry `index`; callers pass an index below the stack depth, so a
+miss is a defect in the caller: it is reported and `UNREACHABLE_NODE_ID`
+returned.
 ---
 private pure func stack_entry(builder: DiscoveryBuilder, index: Int) -> NodeId:
 	match builder.child_stack.get(index):
 		Some(node):
 			node
 		None:
-			into_opaque NodeId(0)
+			report_unreachable_lookup(
+				"child stack",
+				index,
+				"callers pass an index below the stack depth",
+			)
+			UNREACHABLE_NODE_ID
 
 
 ---
