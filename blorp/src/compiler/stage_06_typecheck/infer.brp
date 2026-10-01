@@ -310,6 +310,7 @@ import:
 		fresh_meta_with_origin,
 		resolve_type_metas,
 		unify_symmetric,
+		unify_symmetric_with_rigid_vars,
 		zonk_type,
 	type_system/dim_solver:
 		DimSolveResult(DimBindMeta, DimBindVar, DimContradiction, DimSolved, DimStuck),
@@ -8285,26 +8286,59 @@ private pure func argument_mismatch_error(
 
 
 private pure func type_contains_type_var(typ: SemanticType) -> Bool:
+	free_type_var_names(typ).length() > 0
+
+
+---
+Type variable names in `typ`, in traversal order and possibly repeated: type
+variables and legacy single-letter named type parameters.
+---
+private pure func free_type_var_names(typ: SemanticType) -> List[String]:
 	match typ:
-		SemanticTypeVar(_, _):
-			True
+		SemanticTypeVar(name, _):
+			[name]
 		SemanticNamedType(name, args):
 			if args.length() == 0:
-				is_legacy_single_letter_type_param(name)
+				if is_legacy_single_letter_type_param(name):
+					[name]
+				else:
+					[]
 			else:
-				args.any(type_contains_type_var)
+				args.flat_map(free_type_var_names)
 		SemanticArrayType(element, dims):
-			type_contains_type_var(element) or dims.any(type_contains_type_var)
+			free_type_var_names(element).concat(dims.flat_map(free_type_var_names))
 		SemanticFunctionType(_, params, return_type):
-			params.any(type_contains_type_var) or type_contains_type_var(return_type)
+			params.flat_map(free_type_var_names).concat(free_type_var_names(return_type))
 		SemanticTupleType(elements):
-			elements.any(type_contains_type_var)
+			elements.flat_map(free_type_var_names)
 		SemanticRangeType(inner):
-			type_contains_type_var(inner)
+			free_type_var_names(inner)
 		SemanticDimOpType(_, left, right):
-			type_contains_type_var(left) or type_contains_type_var(right)
+			free_type_var_names(left).concat(free_type_var_names(right))
 		_:
-			False
+			[]
+
+
+---
+The type parameters a call to a callee without declared ones (a function
+value) may instantiate: the type variables in its signature, except the
+enclosing declaration's own type parameters. Those are rigid in this body, so
+an argument must match them rather than instantiate them; binding one would
+leave an argument's unsolved meta unbound. The names are listed explicitly
+because an empty list means "any type variable" to the substitution binders.
+Type variables are identified by name, so a function value's own variable that
+shares a name with an enclosing parameter is also treated as rigid.
+---
+private pure func undeclared_call_type_param_names(
+	context: InferContext,
+	params: List[SemanticType],
+	return_type: SemanticType,
+) -> List[String]:
+	enclosing_type_params = env_get_type_params(context.state.env)
+	params
+		.flat_map(free_type_var_names)
+		.concat(free_type_var_names(return_type))
+		.filter(func(name): not enclosing_type_params.contains(name))
 
 
 private pure func type_contains_self(typ: SemanticType) -> Bool:
@@ -10857,11 +10891,18 @@ private pure func infer_call_with_callee_result(
 			)
 			call_params = signature.params
 			call_return_type = signature.return_type
-			type_param_names: List[String] = signature.bound_params.map(func(param): param.name)
+			type_param_names: List[String] = if signature.bound_params.length() > 0:
+				signature.bound_params.map(func(param): param.name)
+			else:
+				undeclared_call_type_param_names(
+					self_resolution.context,
+					call_params,
+					call_return_type,
+				)
+
 			can_skip_call_subst = (
 				signature.bound_params.length() == 0
-				and not call_params.any(type_contains_type_var)
-				and not type_contains_type_var(call_return_type)
+				and type_param_names.length() == 0
 			)
 
 			if call_params.length() != args.length():
@@ -14682,11 +14723,12 @@ private pure func list_element_mismatch_error(
 	expected: SemanticType,
 	got: SemanticType,
 ) -> InferContext:
+	-- Zonk so a meta solved by an earlier element prints as its solution.
+	expected_text = type_to_string(zonk_type(context.state.context, expected))
+	got_text = type_to_string(zonk_type(context.state.context, got))
 	infer_error(
 		context,
-		"List element " + (index + 1).to_string() + " expected " + type_to_string(
-			expected,
-		) + ", got " + type_to_string(got),
+		"List element " + (index + 1).to_string() + " expected " + expected_text + ", got " + got_text,
 	)
 
 
@@ -14800,19 +14842,22 @@ private pure func infer_list_tail_items(
 				typed_item = typed_expr_with_slot(item_result.expr, item_slot)
 				item_type = typed_expr_value_type(typed_item)
 
-				next_context = if types_compatible_for_inference(
+				-- Unifying lets an earlier element's open type argument, such as
+				-- the T of a generic call, be solved by this element.
+				next_context = match assignable_context(
 					item_result.context,
 					element_type,
 					item_type,
 				):
-					item_result.context
-				else:
-					list_element_mismatch_error(
-						item_result.context,
-						index,
-						element_type,
-						item_candidate_type,
-					)
+					Some(assignable):
+						assignable
+					None:
+						list_element_mismatch_error(
+							item_result.context,
+							index,
+							element_type,
+							item_candidate_type,
+						)
 
 				next_context = check_resource_capability_storage(
 					next_context,
@@ -20427,10 +20472,23 @@ private pure func assignable_context(
 	resolved_found = infer_resolve_alias(context, found)
 	type_params = env_get_type_params(context.state.env)
 
-	if types_compatible_with_params(type_params, resolved_expected, resolved_found):
-		Some(context)
-	else if type_contains_meta(resolved_expected) or type_contains_meta(resolved_found):
-		match unify_symmetric(context.state.context, resolved_expected, resolved_found):
+	-- Unify before the type-parameter compatibility check, treating the
+	-- enclosing type parameters as rigid: that check accepts anything in a
+	-- type-parameter slot, so an unsolved meta checked against one would pass
+	-- without being bound, leaving its call's type argument unsolved until Core.
+	-- The fallback keeps that leniency for types the rigid unify rejects, so a
+	-- meta beside a mismatched type parameter, as in `(U, List[?m])` against
+	-- `(Int, List[String])`, is still accepted unbound.
+	unified_context = if (
+		type_contains_meta(resolved_expected)
+		or type_contains_meta(resolved_found)
+	):
+		match unify_symmetric_with_rigid_vars(
+			context.state.context,
+			type_params,
+			resolved_expected,
+			resolved_found,
+		):
 			Some(step):
 				next_state = { context.state | context = step.context }
 				Some(infer_context_with_state(context, next_state))
@@ -20438,6 +20496,15 @@ private pure func assignable_context(
 				None
 	else:
 		None
+
+	match unified_context:
+		Some(_):
+			unified_context
+		None:
+			if types_compatible_with_params(type_params, resolved_expected, resolved_found):
+				Some(context)
+			else:
+				None
 
 
 private pure func infer_discard_assign_expr(
