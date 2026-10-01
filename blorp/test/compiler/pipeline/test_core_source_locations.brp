@@ -1,0 +1,174 @@
+import:
+	../../../src/compiler/pipeline:
+		CompiledTypedGraph(CompiledTypedGraphReady),
+		FrontendCompilePolicy,
+		compile_frontend_graph,
+	../../../src/compiler/stage_09_core/ir:
+		CoreCallKind(SelectedDirectCall, UserCall),
+		CoreDecl(FunctionDecl),
+		CoreExpr(CallExpr),
+		CoreProgram,
+		CoreSourceLoc,
+		core_source_loc_row_unresolved,
+		perceus_temporary_binder_id,
+	../../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
+	../../../src/lib/cli_plan: CliRunPlan(CliRunCompile)
+	../../../src/main: run_cli
+	io: print_error
+	system: remove_file, temp_dir, write_file
+	test: TestSuite
+
+
+private pure func function_def_id(program: CoreProgram, name: String) -> Option[Int]:
+	program.decls
+		.filter_map(func(decl):
+			match decl:
+				FunctionDecl(function_info):
+					if function_info.name == name:
+						Some(function_info.def_id)
+					else:
+						None
+				_:
+					None
+		)
+		.get(0)
+
+
+private pure func call_locs_targeting(expr: CoreExpr, target_def_id: Int) -> List[CoreSourceLoc]:
+	no_locs: List[CoreSourceLoc] = []
+	own: List[CoreSourceLoc] = match expr:
+		CallExpr(SelectedDirectCall(def_id), _, _, _, loc):
+			if def_id == target_def_id:
+				[loc]
+			else:
+				no_locs
+		CallExpr(UserCall(_, Some(def_id), _), _, _, _, loc):
+			if def_id == target_def_id:
+				[loc]
+			else:
+				no_locs
+		_:
+			no_locs
+
+	own.concat(
+		immediate_core_expr_children(expr).flat_map(
+			func(child): call_locs_targeting(child, target_def_id),
+		),
+	)
+
+
+private pure func program_call_locs_targeting(
+	program: CoreProgram,
+	target_def_id: Int,
+) -> List[CoreSourceLoc]:
+	no_locs: List[CoreSourceLoc] = []
+	program.decls.flat_map(func(decl):
+		match decl:
+			FunctionDecl(function_info):
+				function_info.body
+					.map(func(body): call_locs_targeting(body, target_def_id))
+					.get_or(no_locs)
+			_:
+				no_locs
+	)
+
+
+---
+Perceus names every temporary it creates at a node from that node's packed
+location (`perceus_temporary_binder_id`), so graph lowering must resolve real
+source spans. Codegen admission used to blank `TypedProgram.source.text`, which
+lowering needs to turn byte offsets into line/column; every node then packed to
+line 1 column 1 and the two `rows_of` calls below shared their temporaries'
+C names, failing C compilation with a redefinition.
+---
+func test_graph_lowering_gives_distinct_calls_distinct_temporary_ids() -> Bool:
+	path: String = temp_dir() + "/blorp_core_source_locations_interpolated_calls.brp"
+	_ = remove_file(path)
+	-- Built by concatenation so this file's own literal does not interpolate.
+	hole: String = "$" + "{"
+	source: String = (
+		"pure func rows_of(xs: List[Int], k: Int) -> List[Int]:\n"
+		+ "\txs.append(k)\n"
+		+ "\n\n"
+		+ "func main(args: List[String]):\n"
+		+ "\txs: List[Int] = [1, 2]\n"
+		+ "\tprint(\""
+		+ hole
+		+ "rows_of(xs, 1).to_string()} "
+		+ hole
+		+ "rows_of(xs, 2).to_string()}\")\n"
+	)
+
+	if write_file(path, source).is_err():
+		print_error("could not write " + path)
+		False
+	else:
+		plan = run_cli(["compile", "--no-format", path])
+		_ = remove_file(path)
+
+		match plan:
+			CliRunCompile(compile_plan):
+				policy: FrontendCompilePolicy = {
+					allow_debug_only_calls = False,
+					retain_debug_blocks = False,
+					include_typed_summary = False
+				}
+
+				match compile_frontend_graph(
+					compile_plan.graph,
+					policy,
+					pure func(errors): errors,
+					True,
+					False,
+					[],
+					None,
+				):
+					Ok(CompiledTypedGraphReady(compilation, _, _, _)):
+						program: CoreProgram = compilation.program
+
+						match function_def_id(program, "rows_of"):
+							Some(rows_of_def_id):
+								locs = program_call_locs_targeting(program, rows_of_def_id)
+
+								match locs:
+									[first, second]:
+										first_row = core_source_loc_row_unresolved(first)
+										second_row = core_source_loc_row_unresolved(second)
+										-- Both calls sit on source line 7, at columns 14 and 44.
+										(
+											first_row.start_line == 7
+											and first_row.start_column == 14
+											and second_row.start_line == 7
+											and second_row.start_column == 44
+											and perceus_temporary_binder_id(first)
+												!= perceus_temporary_binder_id(second)
+										)
+									_:
+										print_error(
+											"expected two rows_of calls, found "
+											+ locs.length().to_string(),
+										)
+										False
+							None:
+								print_error("lowered Core has no rows_of function")
+								False
+					Err(errors):
+						print_error("frontend compile failed:\n" + errors.join("\n"))
+						False
+					Ok(_):
+						print_error("frontend compile did not reach Core")
+						False
+			_:
+				print_error("run_cli did not produce a compile plan")
+				False
+
+
+tests: TestSuite = {
+	description = "Core source locations from graph lowering",
+	tests = [
+		(
+			"graph lowering gives distinct calls distinct temporary ids",
+			test_graph_lowering_gives_distinct_calls_distinct_temporary_ids,
+		),
+	]
+}

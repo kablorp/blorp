@@ -51,3 +51,15 @@ allocator and live-object transition above is the direct signal accepted here.
 Generated C for the compiler itself is not byte-identical because this workload
 compiles the changed compiler sources. Focused runtime tests and the codegen
 audit are the semantic/output guard instead.
+
+## Addendum — 2026-09-30: source text is retained again
+
+Core lowering now receives each module's source text. Since the compact
+source locations change (2026-09-20), lowering turns byte offsets into
+line/column through that text; with it cleared, every Core node packed to
+line 1 column 1. Perceus temporaries named from those locations collided, and
+two calls in one expression failed C compilation with a redefinition. The
+clearing was removed, so the request above can reach source text again. That
+adds at most the compiled sources' text (about 13 MB for `blorp/src/main.brp`
+with the standard library) to live state through Core lowering. Peak RSS is
+still set by late Core and backend data.
