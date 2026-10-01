@@ -963,6 +963,10 @@ private pure func boxed_kind_for_type(typ: CoreType) -> CoreBoxKind:
 				Float32Box
 			else if name == "Float16" and args.length() == 0:
 				Float16Box
+			else if name == "Int128" and args.length() == 0:
+				Int128Box
+			else if name == "UInt128" and args.length() == 0:
+				UInt128Box
 			else if primitive_box_type(typ):
 				PrimBox
 			else:
@@ -1086,6 +1090,31 @@ private pure func boxed_storage_value_for_expr(expr: CoreExpr) -> CoreBoxedStora
 		needs_release = boxed_storage_value_needs_release(expr, kind),
 		transfers_ownership = False
 	}
+
+
+---
+Whether emission mints a fresh ARC box for a value of this kind. Int128 and
+UInt128 do not fit in a pointer slot, so emission boxes the scalar into a new
+object that nothing else references; a container that stores it must take over
+that reference rather than retain a second one.
+---
+private pure func box_kind_mints_fresh_owner(kind: CoreBoxKind) -> Bool:
+	match kind:
+		Int128Box | UInt128Box:
+			True
+		_:
+			False
+
+
+---
+Marks a value whose box is minted by emission as transferred into its container,
+so the container's retain is balanced by releasing the fresh box after the store.
+---
+private pure func transfer_fresh_box_owner(value: CoreBoxedStorageValue) -> CoreBoxedStorageValue:
+	if box_kind_mints_fresh_owner(value.kind):
+		{ value | transfers_ownership = True }
+	else:
+		value
 
 
 private pure func boxed_storage_values_for_exprs(
@@ -1252,7 +1281,7 @@ private pure func prepare_list_storage_value(
 					transfers_ownership = True
 				}
 			else:
-				value
+				transfer_fresh_box_owner(value)
 
 
 ---
@@ -3083,7 +3112,7 @@ private pure func prepare_vector_expr(
 							else:
 								boxed_values: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
 									flattened_items.elements,
-								)
+								).map(transfer_fresh_box_owner)
 								TensorBoxedLiteralExpr(
 									{
 										shape = literal_shape,
@@ -3108,7 +3137,7 @@ private pure func prepare_vector_expr(
 						_:
 							boxed_values: List[CoreBoxedStorageValue] = boxed_storage_values_for_exprs(
 								flattened_items.elements,
-							)
+							).map(transfer_fresh_box_owner)
 							TensorBoxedLiteralExpr(
 								{
 									shape = literal_shape,
@@ -3189,8 +3218,8 @@ private pure func dict_literal_value_storage_value(expr: CoreExpr) -> CoreBoxedS
 
 private pure func box_dict_literal_entry(entry: CoreDictLiteralEntry) -> CoreDictEntry:
 	{
-		key = boxed_storage_value_for_expr(entry.key),
-		value = dict_literal_value_storage_value(entry.value)
+		key = transfer_fresh_box_owner(boxed_storage_value_for_expr(entry.key)),
+		value = transfer_fresh_box_owner(dict_literal_value_storage_value(entry.value))
 	}
 
 

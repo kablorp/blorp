@@ -443,6 +443,71 @@ private pure func pointer_temp_needs_release(layout: CoreHashPointerLayout) -> B
 			False
 
 
+---
+Drops an operation's own reference to a fresh key box after its last use.
+---
+private pure func release_key_box(key_box: CoreExpr) -> CoreExpr:
+	intrinsic_call("release_hash_key_box", [key_box], VoidType)
+
+
+---
+The key pointer an operation passes to the table. A key whose layout makes a
+fresh ARC box (Int128, UInt128) is read from `temp_name`, which
+`with_owned_key_box` binds and later releases; any other key is converted in
+place as before.
+---
+private pure func key_pointer_operand(
+	layout: CoreHashPointerLayout,
+	temp_name: String,
+	key: CoreExpr,
+	key_type: CoreType,
+) -> CoreExpr:
+	if pointer_temp_needs_release(layout):
+		variable(temp_name, POINTER_TYPE)
+	else:
+		pointer_argument(layout, key, key_type)
+
+
+---
+Binds the fresh key box for `body` and releases it once `body` is done. The box
+is this operation's own temporary: a table that keeps the key retains its own
+reference, and a lookup only borrows it, so the temporary's reference is always
+dropped here. Layouts that do not box return `body` unchanged.
+---
+private pure func with_owned_key_box(
+	layout: CoreHashPointerLayout,
+	temp_name: String,
+	key: CoreExpr,
+	key_type: CoreType,
+	body: CoreExpr,
+	result_type: CoreType,
+) -> CoreExpr:
+	if pointer_temp_needs_release(layout):
+		key_box: CoreExpr = variable(temp_name, POINTER_TYPE)
+		result_name: String = temp_name + "_result"
+		released: CoreExpr = match result_type:
+			VoidType:
+				SeqExpr(body, release_key_box(key_box))
+			_:
+				let_expr(
+					result_name,
+					False,
+					result_type,
+					body,
+					SeqExpr(release_key_box(key_box), variable(result_name, result_type)),
+				)
+
+		let_expr(
+			temp_name,
+			False,
+			POINTER_TYPE,
+			pointer_argument(layout, key, key_type),
+			released,
+		)
+	else:
+		body
+
+
 private pure func hash_probe(
 	mode: CoreHashProbeMode,
 	prefix: String,
@@ -573,6 +638,12 @@ private pure func synthesize_set_contains(
 	element_type: CoreType,
 	layout: CoreHashTypeLayoutFacts,
 ) -> CoreExpr:
+	found: CoreExpr = variable("__found", BOOL_TYPE)
+	found_result: CoreExpr = if pointer_temp_needs_release(layout.hash_key_pointer_layout):
+		SeqExpr(release_key_box(variable("__elem", POINTER_TYPE)), found)
+	else:
+		found
+
 	let_expr(
 		"__elem",
 		False,
@@ -643,7 +714,7 @@ private pure func synthesize_set_contains(
 									VoidType,
 								),
 							),
-							variable("__found", BOOL_TYPE),
+							found_result,
 						),
 					),
 				),
@@ -962,10 +1033,22 @@ private pure func synthesize_set_add(
 		set_type,
 		intrinsic_call("set_cow", [self], set_type),
 		SeqExpr(
-			set_insert_retained(
-				variable("__result", set_type),
-				pointer_argument(layout.hash_key_pointer_layout, element, element_type),
-				layout,
+			with_owned_key_box(
+				layout.hash_key_pointer_layout,
+				"__add_key",
+				element,
+				element_type,
+				set_insert_retained(
+					variable("__result", set_type),
+					key_pointer_operand(
+						layout.hash_key_pointer_layout,
+						"__add_key",
+						element,
+						element_type,
+					),
+					layout,
+				),
+				VoidType,
 			),
 			variable("__result", set_type),
 		),
@@ -1206,14 +1289,22 @@ private pure func synthesize_set_map(
 			result_element_type,
 			closure_call(callback, [element], result_element_type),
 			SeqExpr(
-				set_insert_retained(
-					result,
-					pointer_argument(
-						result_layout.hash_key_pointer_layout,
-						variable("__mapped", result_element_type),
-						result_element_type,
+				with_owned_key_box(
+					result_layout.hash_key_pointer_layout,
+					"__mapped_key",
+					variable("__mapped", result_element_type),
+					result_element_type,
+					set_insert_retained(
+						result,
+						key_pointer_operand(
+							result_layout.hash_key_pointer_layout,
+							"__mapped_key",
+							variable("__mapped", result_element_type),
+							result_element_type,
+						),
+						result_layout,
 					),
-					result_layout,
+					VoidType,
 				),
 				assignment(
 					"__entry",
@@ -1801,6 +1892,11 @@ private pure func synthesize_dict_contains(
 		scan_one,
 	)
 
+	found_result: CoreExpr = if pointer_temp_needs_release(layout.hash_key_pointer_layout):
+		SeqExpr(release_key_box(lookup_key), found)
+	else:
+		found
+
 	let_expr(
 		"__dict_contains_key",
 		False,
@@ -1843,7 +1939,7 @@ private pure func synthesize_dict_contains(
 							True,
 							BOOL_TYPE,
 							bool_literal(False),
-							SeqExpr(scan, found),
+							SeqExpr(scan, found_result),
 						),
 					),
 				),
@@ -1913,10 +2009,22 @@ private pure func synthesize_dict_get_or(
 		"__dict_get_or_slot",
 		False,
 		INT_TYPE,
-		dict_find_slot(
-			self,
-			pointer_argument(key_layout.hash_key_pointer_layout, key, key_type),
-			key_layout,
+		with_owned_key_box(
+			key_layout.hash_key_pointer_layout,
+			"__get_or_key",
+			key,
+			key_type,
+			dict_find_slot(
+				self,
+				key_pointer_operand(
+					key_layout.hash_key_pointer_layout,
+					"__get_or_key",
+					key,
+					key_type,
+				),
+				key_layout,
+			),
+			INT_TYPE,
 		),
 		if_expr(
 			binary(GreaterEqualOp, slot, int_literal(0), BOOL_TYPE),
@@ -2450,12 +2558,24 @@ private pure func synthesize_dict_set(
 		SeqExpr(
 			compact_order_holes_if_full,
 			SeqExpr(
-				dict_insert_retained(
-					result,
-					pointer_argument(key_layout.hash_key_pointer_layout, key, key_type),
-					pointer_argument(value_pointer_layout, value, value_type),
-					key_layout,
-					pointer_temp_needs_release(value_pointer_layout),
+				with_owned_key_box(
+					key_layout.hash_key_pointer_layout,
+					"__set_key",
+					key,
+					key_type,
+					dict_insert_retained(
+						result,
+						key_pointer_operand(
+							key_layout.hash_key_pointer_layout,
+							"__set_key",
+							key,
+							key_type,
+						),
+						pointer_argument(value_pointer_layout, value, value_type),
+						key_layout,
+						pointer_temp_needs_release(value_pointer_layout),
+					),
+					VoidType,
 				),
 				result,
 			),

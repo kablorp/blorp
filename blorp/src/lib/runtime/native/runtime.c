@@ -21448,6 +21448,21 @@ static bool blorp_dict_key_eq_float(void* a, void* b) {
     return ua.d == ub.d;
 }
 
+// Int128 and UInt128 keys do not fit in a slot, so each key is an ARC box made
+// by [blorp_box_int128] / [blorp_box_uint128], and every operation boxes its
+// key argument afresh. These hash and compare the 16-byte payload instead of
+// the box pointer. Both signednesses share them: a table only ever holds keys
+// of one type, two 128-bit integers of the same type are equal exactly when
+// their bits are equal, and the box layout is the same for both.
+static unsigned long blorp_dict_hash_int128(void* key) {
+    unsigned __int128 bits = blorp_unbox_uint128(key);
+    return (unsigned long)__wyhash_mix((uint64_t)bits ^ __blorp_hash_seed, (uint64_t)(bits >> 64));
+}
+
+static bool blorp_dict_key_eq_int128(void* a, void* b) {
+    return blorp_unbox_uint128(a) == blorp_unbox_uint128(b);
+}
+
 // ---------------------------------------------------------------------------
 // Hashable trait wrappers
 // ---------------------------------------------------------------------------
@@ -21795,6 +21810,21 @@ void blorp_dict_init_key_string(blorp_Dict* dict) {
     dict->hash_fn = blorp_dict_hash_string;
     dict->eq_fn = blorp_dict_key_eq_string;
     dict->key_release = blorp_elem_release_fn;
+}
+
+// Only called on a freshly allocated, empty dict, so no stored key needs the
+// retain that switching on key_release would otherwise require.
+static void blorp_dict_init_key_int128(blorp_Dict* dict) {
+    dict->hash_fn = blorp_dict_hash_int128;
+    dict->eq_fn = blorp_dict_key_eq_int128;
+    dict->key_release = blorp_elem_release_fn;
+}
+
+// Dict keyed by Int128 or UInt128; the dict owns one reference to each key box.
+blorp_Dict* blorp_dict_new_int128(void) {
+    blorp_Dict* dict = blorp_dict_new();
+    blorp_dict_init_key_int128(dict);
+    return dict;
 }
 
 // ---------------------------------------------------------------------------
@@ -22227,6 +22257,16 @@ blorp_Set* blorp_set_new_float(void) {
     return set;
 }
 
+// Set of Int128 or UInt128; see [blorp_dict_hash_int128]. The set owns one
+// reference to each element box.
+blorp_Set* blorp_set_new_int128(void) {
+    blorp_Set* set = blorp_set_new();
+    set->hash_fn = blorp_dict_hash_int128;
+    set->eq_fn = blorp_dict_key_eq_int128;
+    set->key_release = blorp_elem_release_fn;
+    return set;
+}
+
 // Custom Set constructor for user types with source-level Hashable +
 // Equatable impls. See [blorp_dict_new_custom] for the ABI rationale.
 blorp_Set* blorp_set_new_custom(
@@ -22555,6 +22595,12 @@ blorp_Dict* blorp_dict_with_capacity_string(long expected_len) {
 blorp_Dict* blorp_dict_with_capacity_float(long expected_len) {
     blorp_Dict* dict = blorp_dict_with_capacity(expected_len);
     blorp_dict_init_key_float(dict);
+    return dict;
+}
+
+blorp_Dict* blorp_dict_with_capacity_int128(long expected_len) {
+    blorp_Dict* dict = blorp_dict_with_capacity(expected_len);
+    blorp_dict_init_key_int128(dict);
     return dict;
 }
 

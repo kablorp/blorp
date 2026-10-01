@@ -1,0 +1,316 @@
+-- Dict and Set keyed by Int128 or UInt128 compare keys by value.
+--
+-- A 128-bit key does not fit in a table slot, so each key is stored in a heap
+-- box. Every call boxes its key argument afresh, so a table that hashed or
+-- compared the box pointers would never find a key again. These cases use keys
+-- above 2^64, negative keys, and pairs of keys that share their low 64 bits so
+-- that hashing or comparing only one word of the payload also fails.
+import:
+	dict as D
+	int: INT_MAX
+	set as S
+	test: TestSuite
+
+
+private TWO_TO_32: Int = 4294967296
+
+
+private pure func two_to_64_signed() -> Int128:
+	to_int128(TWO_TO_32) * to_int128(TWO_TO_32)
+
+
+private pure func two_to_64_unsigned() -> UInt128:
+	to_uint128(TWO_TO_32) * to_uint128(TWO_TO_32)
+
+
+private pure func big_signed() -> Int128:
+	to_int128(INT_MAX) * to_int128(4)
+
+
+private pure func big_unsigned() -> UInt128:
+	to_uint128(INT_MAX) * to_uint128(4)
+
+
+-- ============================================================================
+-- Dict[Int128, V]
+-- ============================================================================
+pure func test_int128_dict_get_finds_key_built_separately() -> Bool:
+	empty: Dict[Int128, String] = {}
+	stored = empty.set(big_signed(), "big")
+	stored.get_or(big_signed(), "missing") == "big" and stored.contains(big_signed())
+
+
+pure func test_int128_dict_keys_sharing_low_word_stay_distinct() -> Bool:
+	low: Int128 = to_int128(7)
+	high: Int128 = to_int128(7) + two_to_64_signed()
+	empty: Dict[Int128, String] = {}
+	stored = empty.set(low, "low").set(high, "high")
+	(
+		stored.length() == 2
+		and stored.get_or(low, "") == "low"
+		and stored.get_or(high, "") == "high"
+	)
+
+
+pure func test_int128_dict_negative_key() -> Bool:
+	negative: Int128 = to_int128(0) - big_signed()
+	empty: Dict[Int128, Int] = {}
+	stored = empty.set(negative, 3)
+	stored.get_or(negative, 0) == 3 and not stored.contains(big_signed())
+
+
+pure func test_int128_dict_overwrite_keeps_one_entry() -> Bool:
+	empty: Dict[Int128, String] = {}
+	stored = empty.set(big_signed(), "first").set(big_signed(), "second")
+	stored.length() == 1 and stored.get_or(big_signed(), "") == "second"
+
+
+pure func test_int128_dict_remove() -> Bool:
+	empty: Dict[Int128, String] = {}
+	stored = empty.set(big_signed(), "big").set(to_int128(1), "one")
+	removed = stored.remove(big_signed())
+	(
+		removed.length() == 1
+		and not removed.contains(big_signed())
+		and removed.contains(to_int128(1))
+		and stored.contains(big_signed())
+	)
+
+
+pure func test_int128_dict_get_returns_some() -> Bool:
+	empty: Dict[Int128, Int] = {}
+	stored = empty.set(big_signed(), 42)
+
+	match stored.get(big_signed()):
+		Some(value):
+			value == 42
+		None:
+			False
+
+
+pure func test_int128_dict_literal() -> Bool:
+	high: Int128 = to_int128(7) + two_to_64_signed()
+	stored: Dict[Int128, String] = {big_signed() => "big", to_int128(7) => "low", high => "high"}
+	(
+		stored.length() == 3
+		and stored.get_or(big_signed(), "") == "big"
+		and stored.get_or(to_int128(7), "") == "low"
+		and stored.get_or(high, "") == "high"
+	)
+
+
+-- `entries()` is not covered here: a tuple holding an Int128 cannot yet be
+-- stored in a List, independent of how the dict hashes its keys.
+pure func test_int128_dict_keys_and_values() -> Bool:
+	high: Int128 = to_int128(7) + two_to_64_signed()
+	empty: Dict[Int128, Int] = {}
+	stored = empty.set(big_signed(), 1).set(high, 2)
+	keys: List[Int128] = stored.keys()
+	values: List[Int] = stored.values()
+	(
+		keys.length() == 2
+		and keys.get(0) == Some(big_signed())
+		and keys.get(1) == Some(high)
+		and values.get(1) == Some(2)
+		and stored.get_or(keys.get(1).get_or(to_int128(0)), 0) == 2
+	)
+
+
+pure func test_int128_dict_with_capacity() -> Bool:
+	var stored: Dict[Int128, Int] = D.with_capacity(64)
+
+	for i in 0..40:
+		stored = stored.set(to_int128(i) * two_to_64_signed(), i)
+
+	stored.length() == 40 and stored.get_or(to_int128(39) * two_to_64_signed(), -1) == 39
+
+
+pure func test_int128_dict_growth_rehashes_by_value() -> Bool:
+	var stored: Dict[Int128, Int] = D.dict()
+
+	for i in 0..200:
+		stored = stored.set(big_signed() + to_int128(i), i)
+
+	var all_found: Bool = True
+
+	for i in 0..200:
+		if stored.get_or(big_signed() + to_int128(i), -1) != i:
+			all_found = False
+
+	stored.length() == 200 and all_found
+
+
+pure func test_int128_dict_for_loop_binds_key_values() -> Bool:
+	high: Int128 = to_int128(7) + two_to_64_signed()
+	empty: Dict[Int128, Int] = {}
+	stored = empty.set(big_signed(), 1).set(high, 2)
+	var total: Int128 = to_int128(0)
+
+	for key in stored:
+		total = total + key
+
+	total == big_signed() + high
+
+
+pure func test_float_dict_for_loop_binds_key_values() -> Bool:
+	empty: Dict[Float, Int] = {}
+	stored = empty.set(2.5, 1).set(-1.25, 2)
+	var total: Float = 0.0
+
+	for key in stored:
+		total = total + key
+
+	total == 1.25
+
+
+-- ============================================================================
+-- Dict[UInt128, V]
+-- ============================================================================
+pure func test_uint128_dict_get_finds_key_built_separately() -> Bool:
+	empty: Dict[UInt128, String] = {}
+	stored = empty.set(big_unsigned(), "big")
+	stored.get_or(big_unsigned(), "missing") == "big" and stored.contains(big_unsigned())
+
+
+pure func test_uint128_dict_keys_sharing_low_word_stay_distinct() -> Bool:
+	low: UInt128 = to_uint128(7)
+	high: UInt128 = to_uint128(7) + two_to_64_unsigned()
+	empty: Dict[UInt128, String] = {}
+	stored = empty.set(low, "low").set(high, "high")
+	(
+		stored.length() == 2
+		and stored.get_or(low, "") == "low"
+		and stored.get_or(high, "") == "high"
+	)
+
+
+pure func test_uint128_dict_remove() -> Bool:
+	empty: Dict[UInt128, String] = {}
+	stored = empty.set(big_unsigned(), "big").set(to_uint128(1), "one")
+	removed = stored.remove(big_unsigned())
+	removed.length() == 1 and not removed.contains(big_unsigned()) and removed.contains(to_uint128(1))
+
+
+pure func test_uint128_dict_literal() -> Bool:
+	stored: Dict[UInt128, Int] = {big_unsigned() => 1, two_to_64_unsigned() => 2}
+	(
+		stored.length() == 2
+		and stored.get_or(big_unsigned(), 0) == 1
+		and stored.get_or(two_to_64_unsigned(), 0) == 2
+	)
+
+
+pure func test_uint128_dict_keys_and_values() -> Bool:
+	empty: Dict[UInt128, Int] = {}
+	stored = empty.set(big_unsigned(), 1).set(two_to_64_unsigned(), 2)
+	keys: List[UInt128] = stored.keys()
+	(
+		keys.length() == 2
+		and keys.get(0) == Some(big_unsigned())
+		and keys.get(1) == Some(two_to_64_unsigned())
+		and stored.get_or(keys.get(0).get_or(to_uint128(0)), 0) == 1
+	)
+
+
+-- ============================================================================
+-- Set[Int128] and Set[UInt128]
+-- ============================================================================
+pure func test_int128_set_add_contains_remove() -> Bool:
+	high: Int128 = to_int128(7) + two_to_64_signed()
+	var values: Set[Int128] = S.set()
+	values = values.add(big_signed())
+	values = values.add(to_int128(7))
+	values = values.add(high)
+	values = values.add(big_signed())
+	removed = values.remove(to_int128(7))
+	(
+		values.length() == 3
+		and values.contains(big_signed())
+		and values.contains(high)
+		and removed.length() == 2
+		and not removed.contains(to_int128(7))
+		and removed.contains(high)
+	)
+
+
+pure func test_int128_set_from_list_and_to_list() -> Bool:
+	values: Set[Int128] = S.from_list([big_signed(), to_int128(0) - big_signed()])
+	items: List[Int128] = values.to_list()
+	(
+		values.length() == 2
+		and values.contains(to_int128(0) - big_signed())
+		and items.length() == 2
+		and items.get(0) == Some(big_signed())
+	)
+
+
+pure func test_int128_set_operations() -> Bool:
+	left: Set[Int128] = S.from_list([big_signed(), to_int128(1), to_int128(2)])
+	right: Set[Int128] = S.from_list([big_signed(), to_int128(2), to_int128(3)])
+	shifted: Set[Int128] = left.map(func(value: Int128): value + two_to_64_signed())
+	positive: Set[Int128] = left.filter(func(value: Int128): value > to_int128(1))
+	(
+		S.intersect(left, right).length() == 2
+		and S.difference(left, right).contains(to_int128(1))
+		and S.combine(left, right).length() == 4
+		and shifted.contains(big_signed() + two_to_64_signed())
+		and positive.contains(big_signed())
+		and not positive.contains(to_int128(1))
+		and S.is_subset(S.intersect(left, right), left)
+	)
+
+
+pure func test_uint128_set_for_loop_binds_element_values() -> Bool:
+	values: Set[UInt128] = S.from_list([big_unsigned(), two_to_64_unsigned()])
+	var total: UInt128 = to_uint128(0)
+
+	for value in values:
+		total = total + value
+
+	total == big_unsigned() + two_to_64_unsigned()
+
+
+pure func test_uint128_set_add_contains_remove() -> Bool:
+	high: UInt128 = to_uint128(7) + two_to_64_unsigned()
+	var values: Set[UInt128] = S.set()
+	values = values.add(big_unsigned())
+	values = values.add(to_uint128(7))
+	values = values.add(high)
+	values = values.add(big_unsigned())
+	removed = values.remove(to_uint128(7))
+	(
+		values.length() == 3
+		and values.contains(big_unsigned())
+		and values.contains(high)
+		and removed.length() == 2
+		and not removed.contains(to_uint128(7))
+	)
+
+
+tests: TestSuite = {
+	description = "Int128 and UInt128 hash keys",
+	tests = [
+		("int128 dict get finds key built separately", test_int128_dict_get_finds_key_built_separately),
+		("int128 dict keys sharing low word stay distinct", test_int128_dict_keys_sharing_low_word_stay_distinct),
+		("int128 dict negative key", test_int128_dict_negative_key),
+		("int128 dict overwrite keeps one entry", test_int128_dict_overwrite_keeps_one_entry),
+		("int128 dict remove", test_int128_dict_remove),
+		("int128 dict get returns some", test_int128_dict_get_returns_some),
+		("int128 dict literal", test_int128_dict_literal),
+		("int128 dict keys and values", test_int128_dict_keys_and_values),
+		("int128 dict with capacity", test_int128_dict_with_capacity),
+		("int128 dict growth rehashes by value", test_int128_dict_growth_rehashes_by_value),
+		("int128 dict for loop binds key values", test_int128_dict_for_loop_binds_key_values),
+		("float dict for loop binds key values", test_float_dict_for_loop_binds_key_values),
+		("uint128 dict get finds key built separately", test_uint128_dict_get_finds_key_built_separately),
+		("uint128 dict keys sharing low word stay distinct", test_uint128_dict_keys_sharing_low_word_stay_distinct),
+		("uint128 dict remove", test_uint128_dict_remove),
+		("uint128 dict literal", test_uint128_dict_literal),
+		("uint128 dict keys and values", test_uint128_dict_keys_and_values),
+		("int128 set add contains remove", test_int128_set_add_contains_remove),
+		("int128 set from_list and to_list", test_int128_set_from_list_and_to_list),
+		("int128 set operations", test_int128_set_operations),
+		("uint128 set add contains remove", test_uint128_set_add_contains_remove),
+		("uint128 set for loop binds element values", test_uint128_set_for_loop_binds_element_values)
+	]
+}

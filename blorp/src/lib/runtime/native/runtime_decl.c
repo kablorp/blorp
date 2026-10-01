@@ -2009,6 +2009,7 @@ void blorp_io_reactor_shutdown(void);
 blorp_Dict* blorp_dict_new(void);
 blorp_Dict* blorp_dict_new_string(void);
 blorp_Dict* blorp_dict_new_float(void);
+blorp_Dict* blorp_dict_new_int128(void);
 blorp_Dict* blorp_dict_new_custom(
     unsigned long (*hash_fn)(void*),
     bool (*eq_fn)(void*, void*),
@@ -2017,6 +2018,7 @@ blorp_Dict* blorp_dict_new_custom(
 blorp_Dict* blorp_dict_with_capacity(long expected_len);
 blorp_Dict* blorp_dict_with_capacity_string(long expected_len);
 blorp_Dict* blorp_dict_with_capacity_float(long expected_len);
+blorp_Dict* blorp_dict_with_capacity_int128(long expected_len);
 blorp_Dict* blorp_dict_with_capacity_custom(
     long expected_len,
     unsigned long (*hash_fn)(void*),
@@ -2052,6 +2054,7 @@ blorp_List* blorp_dict_entries(blorp_Dict* dict);
 blorp_Set* blorp_set_new(void);
 blorp_Set* blorp_set_new_string(void);
 blorp_Set* blorp_set_new_float(void);
+blorp_Set* blorp_set_new_int128(void);
 blorp_Set* blorp_set_new_custom(
     unsigned long (*hash_fn)(void*),
     bool (*eq_fn)(void*, void*),

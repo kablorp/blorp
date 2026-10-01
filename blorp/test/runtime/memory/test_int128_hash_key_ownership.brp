@@ -1,0 +1,184 @@
+-- Dict and Set own their Int128 and UInt128 key boxes.
+--
+-- A 128-bit key is stored in a heap box. Each operation boxes its key argument
+-- into a temporary; the table retains the box it keeps and releases it when
+-- the entry is overwritten, removed, or the table is freed, and the operation
+-- releases its own temporary. Lookups that only probe must release their
+-- temporary too. Runs under the strict leak gate, so a leaked or doubly
+-- released box fails the suite.
+import:
+	dict as D
+	set as S
+	test: TestSuite
+
+
+private TWO_TO_32: Int = 4294967296
+
+
+private pure func signed_key(offset: Int) -> Int128:
+	to_int128(TWO_TO_32) * to_int128(TWO_TO_32) + to_int128(offset)
+
+
+private pure func unsigned_key(offset: Int) -> UInt128:
+	to_uint128(TWO_TO_32) * to_uint128(TWO_TO_32) + to_uint128(offset)
+
+
+func test_int128_dict_set_get_overwrite_remove() -> Bool:
+	var stored: Dict[Int128, String] = D.dict()
+
+	for i in 0..50:
+		stored = stored.set(signed_key(i), "v" + i.to_string())
+
+	stored = stored.set(signed_key(3), "replaced")
+	found: Bool = stored.get_or(signed_key(3), "") == "replaced" and stored.contains(signed_key(49))
+	got: Bool = match stored.get(signed_key(10)):
+		Some(value):
+			value == "v10"
+		None:
+			False
+	shared: Dict[Int128, String] = stored
+	removed = stored.remove(signed_key(10)).remove(signed_key(999))
+	found and got and removed.length() == 49 and shared.length() == 50
+
+
+func test_int128_dict_literal_and_keys() -> Bool:
+	stored: Dict[Int128, Int] = {signed_key(1) => 1, signed_key(2) => 2, signed_key(1) => 3}
+	keys: List[Int128] = stored.keys()
+	(
+		stored.length() == 2
+		and stored.get_or(signed_key(1), 0) == 3
+		and keys.length() == 2
+		and keys.get(1) == Some(signed_key(2))
+	)
+
+
+func test_int128_dict_with_capacity() -> Bool:
+	var stored: Dict[Int128, Int] = D.with_capacity(8)
+
+	for i in 0..30:
+		stored = stored.set(signed_key(i), i)
+
+	stored.get_or(signed_key(29), -1) == 29
+
+
+func test_uint128_dict_set_get_overwrite_remove() -> Bool:
+	var stored: Dict[UInt128, String] = D.dict()
+
+	for i in 0..50:
+		stored = stored.set(unsigned_key(i), "v" + i.to_string())
+
+	stored = stored.set(unsigned_key(3), "replaced")
+	removed = stored.remove(unsigned_key(10))
+	(
+		stored.get_or(unsigned_key(3), "") == "replaced"
+		and removed.length() == 49
+		and not removed.contains(unsigned_key(10))
+	)
+
+
+func test_uint128_dict_literal_and_keys() -> Bool:
+	stored: Dict[UInt128, String] = {unsigned_key(1) => "a", unsigned_key(2) => "b"}
+	keys: List[UInt128] = stored.keys()
+	keys.length() == 2 and stored.get_or(unsigned_key(2), "") == "b"
+
+
+func test_int128_set_add_contains_remove() -> Bool:
+	var values: Set[Int128] = S.set()
+
+	for i in 0..50:
+		values = values.add(signed_key(i % 25))
+
+	shared: Set[Int128] = values
+	removed = values.remove(signed_key(4)).remove(signed_key(999))
+	items: List[Int128] = values.to_list()
+	(
+		values.length() == 25
+		and values.contains(signed_key(24))
+		and removed.length() == 24
+		and shared.length() == 25
+		and items.length() == 25
+	)
+
+
+func test_int128_set_operations() -> Bool:
+	left: Set[Int128] = S.from_list([signed_key(1), signed_key(2), signed_key(3)])
+	right: Set[Int128] = S.from_list([signed_key(2), signed_key(3), signed_key(4)])
+	mapped: Set[Int128] = left.map(func(value: Int128): value + to_int128(10))
+	filtered: Set[Int128] = left.filter(func(value: Int128): value > signed_key(1))
+	(
+		S.intersect(left, right).length() == 2
+		and S.difference(left, right).length() == 1
+		and S.combine(left, right).length() == 4
+		and mapped.contains(signed_key(11))
+		and filtered.length() == 2
+		and S.is_subset(filtered, left)
+	)
+
+
+func test_int128_dict_and_set_for_loops() -> Bool:
+	var stored: Dict[Int128, String] = D.dict()
+	var values: Set[UInt128] = S.set()
+
+	for i in 0..10:
+		stored = stored.set(signed_key(i), "v" + i.to_string())
+		values = values.add(unsigned_key(i))
+
+	var key_count: Int = 0
+
+	for key in stored:
+		if stored.contains(key):
+			key_count = key_count + 1
+
+	var element_count: Int = 0
+
+	for value in values:
+		if values.contains(value):
+			element_count = element_count + 1
+
+	key_count == 10 and element_count == 10
+
+
+-- A 128-bit tensor literal element is boxed by emission, so the tensor takes
+-- over the fresh box instead of retaining a second reference. Element reads
+-- are not checked here: reading an Int128 tensor element does not unbox yet.
+func test_int128_tensor_literal_owns_boxes() -> Bool:
+	values: Int128[#2] = {signed_key(1), signed_key(2)}
+	values.to_list().length() == 2
+
+
+func test_int128_result_payload() -> Bool:
+	wrapped: Result[Int128, String] = Ok(signed_key(3))
+
+	match wrapped:
+		Ok(value):
+			value == signed_key(3)
+		Err(_):
+			False
+
+
+func test_uint128_set_add_contains_remove() -> Bool:
+	var values: Set[UInt128] = S.set()
+
+	for i in 0..50:
+		values = values.add(unsigned_key(i % 25))
+
+	removed = values.remove(unsigned_key(4))
+	values.length() == 25 and values.contains(unsigned_key(24)) and removed.length() == 24
+
+
+tests: TestSuite = {
+	description = "Int128 and UInt128 hash key ownership",
+	tests = [
+		("int128 dict set get overwrite remove", test_int128_dict_set_get_overwrite_remove),
+		("int128 dict literal and keys", test_int128_dict_literal_and_keys),
+		("int128 dict with capacity", test_int128_dict_with_capacity),
+		("uint128 dict set get overwrite remove", test_uint128_dict_set_get_overwrite_remove),
+		("uint128 dict literal and keys", test_uint128_dict_literal_and_keys),
+		("int128 set add contains remove", test_int128_set_add_contains_remove),
+		("int128 set operations", test_int128_set_operations),
+		("uint128 set add contains remove", test_uint128_set_add_contains_remove),
+		("int128 dict and set for loops", test_int128_dict_and_set_for_loops),
+		("int128 tensor literal owns boxes", test_int128_tensor_literal_owns_boxes),
+		("int128 result payload", test_int128_result_payload)
+	]
+}
