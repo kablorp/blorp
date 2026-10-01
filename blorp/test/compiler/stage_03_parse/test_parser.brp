@@ -3101,6 +3101,156 @@ func test_parse_with_multi_binding_reports_error() -> Bool:
 	parsed_program_has_errors(program) and diagnostic_text.contains("Multiple resource bindings")
 
 
+func parser_diagnostic_has_message_help_and_span_text(
+	program_source: String,
+	message: String,
+	help: String,
+	span_text: String,
+) -> Bool:
+	program = parse_compiler_source(source(program_source))
+
+	match program.diagnostics.get(0):
+		Some(diagnostic):
+			(
+				program.diagnostics.length() == 1
+				and diagnostic.message == message
+				and diagnostic.help == Some(help)
+				and source_span_text(source(program_source), diagnostic.span) == span_text
+			)
+		None:
+			False
+
+
+func test_parse_question_bind_in_loop_bodies_is_rejected_at_the_operator() -> Bool:
+	message = "`?=` cannot be used inside a loop body"
+	help = "bind it before the loop, or use `match` inside the loop"
+
+	(
+		parser_diagnostic_has_message_help_and_span_text(
+			"func f(xs: List[Int]):\n\twhile ready:\n\t\tv ?= xs.get(0)\n\t\tv",
+			message,
+			help,
+			"?=",
+		)
+		and parser_diagnostic_has_message_help_and_span_text(
+			"func f(xs: List[Int]):\n\tfor x in xs:\n\t\tif x > 0:\n\t\t\tv ?= xs.get(0)\n\t\t\tv",
+			message,
+			help,
+			"?=",
+		)
+		and parser_diagnostic_has_message_help_and_span_text(
+			"func f(xs: List[Int]):\n\tfor x in xs concurrently(limit: 2):\n\t\tv ?= xs.get(0)\n\t\tv",
+			message,
+			help,
+			"?=",
+		)
+	)
+
+
+func test_parse_question_bind_outside_loops_and_in_function_bodies_is_accepted() -> Bool:
+	before_loop = parse_compiler_source(
+		source("func f(xs: List[Int]):\n\tv ?= xs.get(0)\n\tfor x in xs:\n\t\tx"),
+	)
+	after_loop = parse_compiler_source(
+		source("func f(xs: List[Int]):\n\tfor x in xs:\n\t\tx\n\tv ?= xs.get(0)\n\tv"),
+	)
+	nested_function = parse_compiler_source(
+		source(
+			"func f(xs: List[Int]):\n\twhile ready:\n\t\tfunc g():\n\t\t\tv ?= xs.get(0)\n\t\t\tv\n\t\tg()",
+		),
+	)
+
+	(
+		before_loop.diagnostics.is_empty()
+		and after_loop.diagnostics.is_empty()
+		and nested_function.diagnostics.is_empty()
+	)
+
+
+func test_parse_break_and_continue_outside_loops_are_rejected_at_the_keyword() -> Bool:
+	break_help = "move `break` into a `while` or `for` body, or remove it"
+	continue_help = "move `continue` into a `while` or `for` body, or remove it"
+
+	(
+		parser_diagnostic_has_message_help_and_span_text(
+			"func f():\n\tbreak",
+			"`break` can only be used inside a loop",
+			break_help,
+			"break",
+		)
+		and parser_diagnostic_has_message_help_and_span_text(
+			"func f(flag: Bool):\n\tif flag:\n\t\tcontinue",
+			"`continue` can only be used inside a loop",
+			continue_help,
+			"continue",
+		)
+		and parser_diagnostic_has_message_help_and_span_text(
+			"func f(xs: List[Int]):\n\tfor x in xs:\n\t\tx\n\tbreak",
+			"`break` can only be used inside a loop",
+			break_help,
+			"break",
+		)
+		and parser_diagnostic_has_message_help_and_span_text(
+			"func f(xs: List[Int]):\n\twhile ready:\n\t\tfunc g():\n\t\t\tbreak\n\t\tg()",
+			"`break` can only be used inside a loop",
+			break_help,
+			"break",
+		)
+	)
+
+
+func test_parse_break_and_continue_inside_loops_are_accepted() -> Bool:
+	program = parse_compiler_source(
+		source(
+			"func f(xs: List[Int]):\n\twhile ready:\n\t\tif stop:\n\t\t\tbreak\n\t\tcontinue\n\tfor x in xs concurrently(limit: 2):\n\t\tbreak\n\tfor x in xs:\n\t\tcontinue",
+		),
+	)
+
+	program.diagnostics.is_empty()
+
+
+func test_parse_lambda_and_concurrent_task_bodies_start_outside_every_loop() -> Bool:
+	lambda_break = parser_diagnostic_has_message_help_and_span_text(
+		"func f(xs: List[Int]):\n\tfor x in xs:\n\t\tg = func(y: Int) -> Int:\n\t\t\tbreak\n\t\t\ty\n\t\tg(x)",
+		"`break` can only be used inside a loop",
+		"move `break` into a `while` or `for` body, or remove it",
+		"break",
+	)
+	task_continue = parser_diagnostic_has_message_help_and_span_text(
+		"func f():\n\twhile ready:\n\t\tconcurrent:\n\t\t\ta = continue",
+		"`continue` can only be used inside a loop",
+		"move `continue` into a `while` or `for` body, or remove it",
+		"continue",
+	)
+	lambda_bind = parse_compiler_source(
+		source(
+			"func f(xs: List[Int]):\n\tfor x in xs:\n\t\tg = func(y: Option[Int]) -> Option[Int]:\n\t\t\tv ?= y\n\t\t\tSome(v)\n\t\tg(Some(x))",
+		),
+	)
+	lambda_inner_loop = parse_compiler_source(
+		source(
+			"func f(xs: List[Int]):\n\tfor x in xs:\n\t\tg = func(ys: List[Int]):\n\t\t\tfor y in ys:\n\t\t\t\tbreak\n\t\tg(xs)\n\t\tcontinue",
+		),
+	)
+
+	(
+		lambda_break
+		and task_continue
+		and lambda_bind.diagnostics.is_empty()
+		and lambda_inner_loop.diagnostics.is_empty()
+	)
+
+
+func test_parse_question_bind_in_a_concurrent_task_inside_a_loop_is_not_a_loop_error() -> Bool:
+	program = parse_compiler_source(
+		source(
+			"func f(xs: List[Int]):\n\tfor x in xs:\n\t\tconcurrent:\n\t\t\ta = if x > 0:\n\t\t\t\tv ?= Some(x)\n\t\t\t\tSome(v)\n\t\t\telse:\n\t\t\t\tNone",
+		),
+	)
+
+	program.diagnostics.is_empty()
+
+
 func test_parse_break_continue_and_void_primitives() -> Bool:
 	program_source: String = "func control(xs: List[Int]):\n\twhile ready:\n\t\tbreak\n\tfor x in xs:\n\t\tcontinue\n\tvoid\n\t()\n\t_"
 	program = parse_compiler_source(source(program_source))
@@ -5203,6 +5353,27 @@ tests: TestSuite = {
 			test_parse_with_typed_try_error_map_expression,
 		),
 		("parse with multi binding reports error", test_parse_with_multi_binding_reports_error),
+		(
+			"parse question bind in loop bodies is rejected at the operator",
+			test_parse_question_bind_in_loop_bodies_is_rejected_at_the_operator,
+		),
+		(
+			"parse question bind outside loops and in function bodies is accepted",
+			test_parse_question_bind_outside_loops_and_in_function_bodies_is_accepted,
+		),
+		(
+			"parse lambda and concurrent task bodies start outside every loop",
+			test_parse_lambda_and_concurrent_task_bodies_start_outside_every_loop,
+		),
+		(
+			"parse question bind in a concurrent task inside a loop is not a loop error",
+			test_parse_question_bind_in_a_concurrent_task_inside_a_loop_is_not_a_loop_error,
+		),
+		(
+			"parse break and continue outside loops are rejected at the keyword",
+			test_parse_break_and_continue_outside_loops_are_rejected_at_the_keyword,
+		),
+		("parse break and continue inside loops are accepted", test_parse_break_and_continue_inside_loops_are_accepted),
 		("parse break continue and void primitives", test_parse_break_continue_and_void_primitives),
 		("parse match expression cases", test_parse_match_expression_cases),
 		("parse nested inline match case body", test_parse_nested_inline_match_case_body),

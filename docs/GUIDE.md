@@ -1887,6 +1887,7 @@ Rules for `?=`:
 - `None` or `Err(error)` is returned from the enclosing carrier-returning function.
 - Success values are not auto-wrapped; write `Some(value)` or `Ok(value)` explicitly.
 - `?=` is rejected inside loop bodies, including `for ... concurrently(...)` bodies. Move the `?=` before the loop, use an explicit `match` in the loop, or use Option/Result combinators when failure should stay local to one iteration.
+- A lambda or `concurrent:` body starts fresh: `?=` inside a lambda is allowed even within a loop, because it returns from the lambda, and `break` and `continue` cannot cross a lambda or task boundary.
 - Direct `?=` cannot unwrap a resource acquisition such as `open_read(path)`;
   use `with reader ?= open_read(path):` so cleanup ownership is installed.
 - There is no bare postfix `?` operator.

@@ -546,6 +546,17 @@ struct DiagnosticRow {
 
 
 ---
+Whether the statement being parsed is inside a loop body. A function body
+starts a new context (`NotInLoop`), and so does a lambda or `concurrent:` task
+body: its `break` cannot leave the enclosing loop, and its `?=` returns from
+the lambda or task, not the loop.
+---
+enum LoopContext:
+	NotInLoop
+	InLoopBody
+
+
+---
 Every discovery table. Flat on purpose: each level of nesting is one more
 uniqueness check a copy-on-write update has to pass.
 
@@ -557,9 +568,10 @@ The fields after `diagnostic_arguments` are transient: the tokens of the
 one module being parsed (and of its interpolation holes, appended after its
 end-of-file token), the index of the parser's next token, the docstrings and
 annotations read before their declaration's row exists, the parts of the
-module's interpolated strings, and the roots of the child nodes a parent
-node has not yet claimed. `without_transient_tables` empties them; lexing a
-module starts from it and `freeze` drops them with it. They live here because lexing interns names and
+module's interpolated strings, the roots of the child nodes a parent
+node has not yet claimed, and the loop context of the body being parsed.
+`without_transient_tables` empties them; lexing a module starts from it and
+`freeze` drops them with it. They live here because lexing interns names and
 literals into this builder while it produces tokens, and parsing appends
 rows while it consumes them; the builder is the only value threaded through
 that work.
@@ -622,7 +634,8 @@ record DiscoveryBuilder {
 	interpolation_parts: List[InterpolationPartRow],
 	interpolation_texts: List[LiteralId],
 	child_stack: List[NodeId],
-	child_stack_depth: Int
+	child_stack_depth: Int,
+	loop_context: LoopContext
 }
 
 
@@ -689,7 +702,8 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		interpolation_parts = [],
 		interpolation_texts = [],
 		child_stack = [],
-		child_stack_depth = 0
+		child_stack_depth = 0,
+		loop_context = NotInLoop
 	}
 
 
@@ -1533,7 +1547,8 @@ pure func without_transient_tables(builder: DiscoveryBuilder) -> DiscoveryBuilde
 		interpolation_parts = [],
 		interpolation_texts = [],
 		child_stack = [],
-		child_stack_depth = 0
+		child_stack_depth = 0,
+		loop_context = NotInLoop
 	}
 
 
@@ -1917,6 +1932,16 @@ private pure func stack_entry(builder: DiscoveryBuilder, index: Int) -> NodeId:
 			node
 		None:
 			into_opaque NodeId(0)
+
+
+---
+`builder` parsing statements in `context`. A routine that parses a nested body
+reads `loop_context` into a local first, enters the body's context with this,
+and restores the local afterwards, so the save and restore are scalar reads
+and updates, not chained builder calls.
+---
+pure func with_loop_context(builder: DiscoveryBuilder, context: LoopContext) -> DiscoveryBuilder:
+	{ builder | loop_context = context }
 
 
 private pure func with_child_stack_depth(builder: DiscoveryBuilder, depth: Int) -> DiscoveryBuilder:

@@ -809,7 +809,6 @@ private union InferExpectation:
 record InferContext {
 	state: InferSession,
 	expectation: InferExpectation,
-	in_loop: Bool,
 	in_debug: Bool,
 	suppress_debug_only_reference: Bool
 }
@@ -1044,7 +1043,6 @@ pure func infer_context(state: TypecheckState) -> InferContext:
 	{
 		state = infer_session_from_typecheck_state(state),
 		expectation = NoExpectedValue,
-		in_loop = False,
 		in_debug = False,
 		suppress_debug_only_reference = False
 	}
@@ -1125,7 +1123,6 @@ pure func infer_without_expected(context: InferContext) -> InferContext:
 			{
 				state = context.state,
 				expectation = NoExpectedValue,
-				in_loop = context.in_loop,
 				in_debug = context.in_debug,
 				suppress_debug_only_reference = context.suppress_debug_only_reference
 			}
@@ -1138,17 +1135,6 @@ private pure func infer_context_with_state(
 	{
 		state = state,
 		expectation = context.expectation,
-		in_loop = context.in_loop,
-		in_debug = context.in_debug,
-		suppress_debug_only_reference = context.suppress_debug_only_reference
-	}
-
-
-private pure func infer_loop_body_context(context: InferContext) -> InferContext:
-	{
-		state = context.state,
-		expectation = NoExpectedValue,
-		in_loop = True,
 		in_debug = context.in_debug,
 		suppress_debug_only_reference = context.suppress_debug_only_reference
 	}
@@ -19745,7 +19731,7 @@ private pure func infer_while_expr(
 	else:
 		condition_error(condition_result.context, "While", condition_type)
 
-	body_result = infer_expr(infer_loop_body_context(condition_context), body)
+	body_result = infer_expr(infer_without_expected(condition_context), body)
 	result_context = infer_context_with_state(context, body_result.context.state)
 	typed = TypedWhileExpr(
 		condition_result.expr,
@@ -19758,31 +19744,21 @@ private pure func infer_while_expr(
 
 
 private pure func infer_break_expr(context: InferContext, span: SourceLocation) -> InferResult:
-	next_context = if context.in_loop:
-		context
-	else:
-		infer_error(context, "'break' can only be used inside a loop")
-
 	typed = TypedBreakExpr(
 		span,
-		inferred_info(next_context, TYPE_VOID),
+		inferred_info(context, TYPE_VOID),
 	)
 
-	infer_result(next_context, typed)
+	infer_result(context, typed)
 
 
 private pure func infer_continue_expr(context: InferContext, span: SourceLocation) -> InferResult:
-	next_context = if context.in_loop:
-		context
-	else:
-		infer_error(context, "'continue' can only be used inside a loop")
-
 	typed = TypedContinueExpr(
 		span,
-		inferred_info(next_context, TYPE_VOID),
+		inferred_info(context, TYPE_VOID),
 	)
 
-	infer_result(next_context, typed)
+	infer_result(context, typed)
 
 
 private pure func array_loop_element_type(
@@ -20368,7 +20344,7 @@ private pure func infer_for_expr(
 				)
 
 			loop_state = { checked_context.state | env = bound_env }
-			loop_context = infer_loop_body_context(
+			body_context = infer_without_expected(
 				infer_context_with_state(
 					checked_context,
 					loop_state,
@@ -20384,7 +20360,7 @@ private pure func infer_for_expr(
 					),
 				)
 			else:
-				infer_expr(loop_context, body)
+				infer_expr(body_context, body)
 
 			outer_env = env_pop_scope(body_result.context.state.env)
 			outer_state = { body_result.context.state | env = outer_env }
@@ -20452,7 +20428,7 @@ private pure func infer_for_expr(
 			loop_env = env_push_scope(checked_context.state.env)
 			bound_env = add_tuple_for_bindings(loop_env, names, tuple_elements.elements)
 			loop_state = { checked_context.state | env = bound_env }
-			loop_context = infer_loop_body_context(
+			body_context = infer_without_expected(
 				infer_context_with_state(
 					checked_context,
 					loop_state,
@@ -20462,7 +20438,7 @@ private pure func infer_for_expr(
 			body_result = if is_fallible_stream:
 				fallible_stream_for_iterable_error_result(checked_context, span)
 			else:
-				infer_expr(loop_context, body)
+				infer_expr(body_context, body)
 
 			outer_env = env_pop_scope(body_result.context.state.env)
 			outer_state = { body_result.context.state | env = outer_env }
@@ -21066,20 +21042,35 @@ private pure func infer_question_bind_statement(
 	value_context = infer_context_with_state(context, value_result.context.state)
 	value_type = typed_expr_value_type(value_result.expr)
 
-	if context.in_loop:
-		next = infer_error(value_context, "?= cannot be used inside loop bodies")
-		question_bind_error_result(next, name, annotation_type, value_result.expr, span)
-	else:
-		expected_carrier = match infer_context_expected_type(context):
-			Some(expected_type):
-				question_bind_carrier(context, expected_type)
-			None:
-				QuestionBindNonCarrier
+	expected_carrier = match infer_context_expected_type(context):
+		Some(expected_type):
+			question_bind_carrier(context, expected_type)
+		None:
+			QuestionBindNonCarrier
 
-		value_carrier = question_bind_carrier(value_context, value_type)
+	value_carrier = question_bind_carrier(value_context, value_type)
 
-		match (expected_carrier, value_carrier):
-			(QuestionBindOptionCarrier(_), QuestionBindOptionCarrier(inner_type)):
+	match (expected_carrier, value_carrier):
+		(QuestionBindOptionCarrier(_), QuestionBindOptionCarrier(inner_type)):
+			validate_question_bind(
+				value_context,
+				name,
+				annotation_type,
+				value_result.expr,
+				inner_type,
+				span,
+			)
+		(QuestionBindOptionCarrier(_), QuestionBindResultCarrier(_, _)):
+			next = infer_error(
+				value_context,
+				(
+					"Cannot use Result ?= in a block returning Option. Convert the Result to Option "
+					+ "or return Result from the enclosing function"
+				),
+			)
+			question_bind_error_result(next, name, annotation_type, value_result.expr, span)
+		(QuestionBindResultCarrier(_, expected_error_type), QuestionBindResultCarrier(inner_type, actual_error_type)):
+			if types_equal(expected_error_type, actual_error_type):
 				validate_question_bind(
 					value_context,
 					name,
@@ -21088,86 +21079,67 @@ private pure func infer_question_bind_statement(
 					inner_type,
 					span,
 				)
-			(QuestionBindOptionCarrier(_), QuestionBindResultCarrier(_, _)):
+			else:
 				next = infer_error(
 					value_context,
-					(
-						"Cannot use Result ?= in a block returning Option. Convert the Result to Option "
-						+ "or return Result from the enclosing function"
-					),
+					"Incompatible error type for ?=: enclosing block returns Result[..., " + type_to_string(
+						expected_error_type,
+					) + "], but expression returns Result[..., " + type_to_string(
+						actual_error_type,
+					) + "]",
 				)
 				question_bind_error_result(next, name, annotation_type, value_result.expr, span)
-			(QuestionBindResultCarrier(_, expected_error_type), QuestionBindResultCarrier(inner_type, actual_error_type)):
-				if types_equal(expected_error_type, actual_error_type):
-					validate_question_bind(
+		(QuestionBindResultCarrier(_, _), QuestionBindOptionCarrier(_)):
+			next = infer_error(
+				value_context,
+				(
+					"Cannot use Option ?= in a block returning Result. Convert the Option to Result "
+					+ "with to_result(...) or return Option from the enclosing function"
+				),
+			)
+			question_bind_error_result(next, name, annotation_type, value_result.expr, span)
+		(QuestionBindNonCarrier, QuestionBindOptionCarrier(_)):
+			next = match infer_context_expected_type(context):
+				Some(expected_type):
+					infer_error(
 						value_context,
-						name,
-						annotation_type,
-						value_result.expr,
-						inner_type,
-						span,
+						(
+							"?= requires the enclosing block to return the same carrier as the expression; "
+							+ "enclosing block returns "
+						) + type_to_string(expected_type),
 					)
-				else:
-					next = infer_error(
+				None:
+					infer_error(
 						value_context,
-						"Incompatible error type for ?=: enclosing block returns Result[..., " + type_to_string(
-							expected_error_type,
-						) + "], but expression returns Result[..., " + type_to_string(
-							actual_error_type,
-						) + "]",
+						"?= requires an enclosing block returning Option[T] or Result[T, E]",
 					)
-					question_bind_error_result(next, name, annotation_type, value_result.expr, span)
-			(QuestionBindResultCarrier(_, _), QuestionBindOptionCarrier(_)):
-				next = infer_error(
-					value_context,
-					(
-						"Cannot use Option ?= in a block returning Result. Convert the Option to Result "
-						+ "with to_result(...) or return Option from the enclosing function"
-					),
-				)
-				question_bind_error_result(next, name, annotation_type, value_result.expr, span)
-			(QuestionBindNonCarrier, QuestionBindOptionCarrier(_)):
-				next = match infer_context_expected_type(context):
-					Some(expected_type):
-						infer_error(
-							value_context,
-							(
-								"?= requires the enclosing block to return the same carrier as the expression; "
-								+ "enclosing block returns "
-							) + type_to_string(expected_type),
-						)
-					None:
-						infer_error(
-							value_context,
-							"?= requires an enclosing block returning Option[T] or Result[T, E]",
-						)
 
-				question_bind_error_result(next, name, annotation_type, value_result.expr, span)
-			(QuestionBindNonCarrier, QuestionBindResultCarrier(_, _)):
-				next = match infer_context_expected_type(context):
-					Some(expected_type):
-						infer_error(
-							value_context,
-							(
-								"?= requires the enclosing block to return the same carrier as the expression; "
-								+ "enclosing block returns "
-							) + type_to_string(expected_type),
-						)
-					None:
-						infer_error(
-							value_context,
-							"?= requires an enclosing block returning Option[T] or Result[T, E]",
-						)
+			question_bind_error_result(next, name, annotation_type, value_result.expr, span)
+		(QuestionBindNonCarrier, QuestionBindResultCarrier(_, _)):
+			next = match infer_context_expected_type(context):
+				Some(expected_type):
+					infer_error(
+						value_context,
+						(
+							"?= requires the enclosing block to return the same carrier as the expression; "
+							+ "enclosing block returns "
+						) + type_to_string(expected_type),
+					)
+				None:
+					infer_error(
+						value_context,
+						"?= requires an enclosing block returning Option[T] or Result[T, E]",
+					)
 
-				question_bind_error_result(next, name, annotation_type, value_result.expr, span)
-			(_, QuestionBindNonCarrier):
-				next = infer_error(
-					value_context,
-					"Cannot use `?=` on type `" + type_to_string(
-						value_type,
-					) + "` — only Option and Result support ?= bindings",
-				)
-				question_bind_error_result(next, name, annotation_type, value_result.expr, span)
+			question_bind_error_result(next, name, annotation_type, value_result.expr, span)
+		(_, QuestionBindNonCarrier):
+			next = infer_error(
+				value_context,
+				"Cannot use `?=` on type `" + type_to_string(
+					value_type,
+				) + "` — only Option and Result support ?= bindings",
+			)
+			question_bind_error_result(next, name, annotation_type, value_result.expr, span)
 
 
 private pure func question_bind_final_result(
@@ -22538,8 +22510,8 @@ private pure func infer_concurrent_for_body(
 		)
 
 	loop_state = { context.state | env = bound_env }
-	loop_context = infer_loop_body_context(infer_context_with_state(context, loop_state))
-	body_result = infer_expr(infer_without_expected(loop_context), body)
+	body_context = infer_without_expected(infer_context_with_state(context, loop_state))
+	body_result = infer_expr(body_context, body)
 	outer_env = env_pop_scope(body_result.context.state.env)
 	outer_state = { body_result.context.state | env = outer_env }
 	result_context = infer_context_with_state(context, outer_state)

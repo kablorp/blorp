@@ -365,7 +365,8 @@ private record ParserInput {
 	end_lines: List[Int],
 	end_columns: List[Int],
 	texts: List[String],
-	names: NameTable
+	names: NameTable,
+	loop_context: LoopContext
 }
 
 
@@ -763,6 +764,17 @@ private struct ParseSymbolStep {
 }
 
 
+---
+Whether the statement being parsed is inside a loop body. A function body
+starts a new context (`NotInLoop`), and so does a lambda or `concurrent:` task
+body: its `break` cannot leave the enclosing loop, and its `?=` returns from
+the lambda or task, not the loop.
+---
+private enum LoopContext:
+	NotInLoop
+	InLoopBody
+
+
 private enum TupleBinderIdentifierMode:
 	TupleBinderNamesOnly
 	TupleBinderNamesOrUnderscore
@@ -846,7 +858,8 @@ private pure func initial_state(
 		end_lines = end_lines,
 		end_columns = end_columns,
 		texts = texts,
-		names = names
+		names = names,
+		loop_context = NotInLoop
 	}
 
 
@@ -3315,6 +3328,55 @@ private pure func current_compound_assign_op(
 			None
 
 
+---
+Reports a `break` or `continue` written outside every loop body. The span is
+the keyword. Typechecking cannot see this any better than the parser: loop
+nesting is syntax.
+---
+private pure func loop_keyword_diagnostics(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	keyword_span: SourceLocation,
+	keyword: String,
+) -> List[ParseDiagnostic]:
+	match state.loop_context:
+		InLoopBody:
+			diagnostics
+		NotInLoop:
+			add_expected_error(
+				state,
+				diagnostics,
+				keyword_span,
+				"`" + keyword + "` can only be used inside a loop",
+				[],
+				Some("move `" + keyword + "` into a `while` or `for` body, or remove it"),
+			)
+
+
+---
+Reports a `?=` inside a loop body. The span is the `?=` token at `index`.
+Each iteration would have to return from the enclosing function, which a loop
+cannot express; the carrier checks that need types stay in typechecking.
+---
+private pure func question_bind_loop_diagnostics(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+) -> List[ParseDiagnostic]:
+	match state.loop_context:
+		InLoopBody:
+			add_expected_error(
+				state,
+				diagnostics,
+				current_location(state, index),
+				"`?=` cannot be used inside a loop body",
+				[],
+				Some("bind it before the loop, or use `match` inside the loop"),
+			)
+		NotInLoop:
+			diagnostics
+
+
 private pure func current_can_start_assignment_tail(state: ParserInput, index: Int) -> Bool:
 	(
 		current_is_symbol(state, index, EqualSymbol)
@@ -5345,7 +5407,7 @@ private pure func parse_concurrent_block_expr(
 		"expected `:` after concurrent",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
-		state,
+		{ state | loop_context = NotInLoop },
 		colon_step.index,
 		colon_step_diagnostics,
 		start_span,
@@ -5412,7 +5474,7 @@ private pure func parse_concurrent_for_tail(
 		"expected `:` after concurrently parameters",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
-		state,
+		{ state | loop_context = InLoopBody },
 		colon_step.index,
 		colon_step_diagnostics,
 		header_span,
@@ -5621,7 +5683,7 @@ private pure func parse_while_expr(
 		"expected `:` after while condition",
 	)
 	body_step: ParseExprStep = parse_block_after_colon(
-		state,
+		{ state | loop_context = InLoopBody },
 		colon_step.index,
 		colon_step_diagnostics,
 		start_span,
@@ -5703,7 +5765,7 @@ private pure func parse_for_expr_with_header_span(
 			"expected `:` after for loop iterable",
 		)
 		body_step: ParseExprStep = parse_block_after_colon(
-			state,
+			{ state | loop_context = InLoopBody },
 			colon_step.index,
 			colon_step_diagnostics,
 			header_span,
@@ -5811,7 +5873,7 @@ private pure func parse_named_assignment_tail(
 		value_step: ParseExprStep = parse_assignment_value_expr(
 			state,
 			advance_parser(state, index),
-			diagnostics,
+			question_bind_loop_diagnostics(state, index, diagnostics),
 			name.span,
 		)
 
@@ -6237,15 +6299,17 @@ private pure func parse_lambda_body(
 	body_intro_start_line: Int,
 	block_anchor_span: SourceLocation,
 ) -> ParseExprStep:
-	if current_is_newline(state, index):
-		parse_block_after_colon(state, index, diagnostics, block_anchor_span)
+	body_state: ParserInput = { state | loop_context = NotInLoop }
+
+	if current_is_newline(body_state, index):
+		parse_block_after_colon(body_state, index, diagnostics, block_anchor_span)
 	else if (
-		state.start_lines.get_or(index, 0) > body_intro_start_line
-		and current_token_is_indented_past(state, index, block_anchor_span)
+		body_state.start_lines.get_or(index, 0) > body_intro_start_line
+		and current_token_is_indented_past(body_state, index, block_anchor_span)
 	):
-		parse_indented_block_body(state, index, diagnostics, block_anchor_span)
+		parse_indented_block_body(body_state, index, diagnostics, block_anchor_span)
 	else:
-		parse_expression(state, index, diagnostics, PREC_LOWEST)
+		parse_expression(body_state, index, diagnostics, PREC_LOWEST)
 
 
 private pure func parse_lambda_expr_with_header_span(
@@ -7138,13 +7202,13 @@ private pure func parse_primary_expr(
 				BreakKeyword:
 					{
 						index = advance_parser(state, index),
-						diagnostics = diagnostics,
+						diagnostics = loop_keyword_diagnostics(state, diagnostics, span, "break"),
 						value = ParsedBreakExpr(span)
 					}
 				ContinueKeyword:
 					{
 						index = advance_parser(state, index),
-						diagnostics = diagnostics,
+						diagnostics = loop_keyword_diagnostics(state, diagnostics, span, "continue"),
 						value = ParsedContinueExpr(span)
 					}
 				VoidKeyword:
@@ -7690,8 +7754,15 @@ private pure func parse_function_body(
 	diagnostics: List[ParseDiagnostic],
 	start_span: SourceLocation,
 ) -> ParseBodyStep:
-	if current_is_newline(state, index):
-		block_step: ParseExprStep = parse_block_after_colon(state, index, diagnostics, start_span)
+	body_state: ParserInput = { state | loop_context = NotInLoop }
+
+	if current_is_newline(body_state, index):
+		block_step: ParseExprStep = parse_block_after_colon(
+			body_state,
+			index,
+			diagnostics,
+			start_span,
+		)
 
 		{
 			index = block_step.index,
@@ -7699,7 +7770,7 @@ private pure func parse_function_body(
 			body = Some(block_step.value)
 		}
 	else:
-		expr_step: ParseExprStep = parse_expression(state, index, diagnostics, PREC_LOWEST)
+		expr_step: ParseExprStep = parse_expression(body_state, index, diagnostics, PREC_LOWEST)
 
 		{
 			index = expr_step.index,

@@ -22,6 +22,7 @@ import:
 		DefinitionId,
 		DiscoveryBuilder,
 		InterpolationPart(HolePart, TextPart),
+		LoopContext(InLoopBody, NotInLoop),
 		InterpolationPartRow,
 		LiteralId,
 		ModuleId,
@@ -70,9 +71,12 @@ import:
 		rollback_to,
 		source_id_at_row,
 		token_count,
+		with_loop_context,
 	discovery_diagnostic_code:
 		DiscoveryDiagnosticCode(
+			BreakOutsideLoopDiagnostic,
 			ConcurrentForTupleBinderDiagnostic,
+			ContinueOutsideLoopDiagnostic,
 			DiscardedQuestionBindDiagnostic,
 			ExpectedAssignmentOperatorDiagnostic,
 			ExpectedBuiltinNameDiagnostic,
@@ -92,6 +96,7 @@ import:
 			ExpectedRightParenDiagnostic,
 			FieldAssignmentDiagnostic,
 			InterpolationHoleNotExpressionDiagnostic,
+			QuestionBindInLoopDiagnostic,
 			RemovedFromConversionDiagnostic,
 			RemovedIntoConversionDiagnostic,
 			TupleArityDiagnostic,
@@ -420,13 +425,45 @@ pure func parse_function_body(
 	definition: DefinitionId,
 	anchor: Span,
 ) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder.parse_body_expression(anchor)
+	var out: DiscoveryBuilder = builder.parse_function_body_expression(anchor)
 	root: NodeId = out.last_node_id()
 	out = out.append_body({
 		definition = definition,
 		root = root,
 	})
 	out
+
+
+---
+A function body's expression, parsed outside every loop: a `break` in it cannot
+leave a loop the function is declared in. The caller's loop context is saved
+and restored as scalar reads and updates (builder threading rules 1 and 3).
+---
+private pure func parse_function_body_expression(
+	builder: DiscoveryBuilder,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	saved: LoopContext = builder.loop_context
+	entered: DiscoveryBuilder = builder.with_loop_context(NotInLoop)
+	parsed: DiscoveryBuilder = entered.parse_body_expression(anchor)
+	parsed.with_loop_context(saved)
+
+
+---
+A block after a `:`, parsed in `context`: `InLoopBody` for a loop's body,
+`NotInLoop` for a `concurrent:` task body, whose tasks run apart from the loop
+so their `break` cannot leave it and their `?=` returns from the task. The
+caller's loop context is saved and restored as in `parse_function_body_expression`.
+---
+private pure func parse_block_in_loop_context(
+	builder: DiscoveryBuilder,
+	context: LoopContext,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	saved: LoopContext = builder.loop_context
+	entered: DiscoveryBuilder = builder.with_loop_context(context)
+	parsed: DiscoveryBuilder = entered.parse_block_after_colon(anchor)
+	parsed.with_loop_context(saved)
 
 
 private pure func parse_body_expression(
@@ -1293,9 +1330,25 @@ private pure func parse_question_bind_value(
 	name_span: Span,
 	depth_before: Int,
 ) -> DiscoveryBuilder:
-	advanced: DiscoveryBuilder = builder.advance_token()
+	reported: DiscoveryBuilder = builder.report_question_bind_in_loop()
+	advanced: DiscoveryBuilder = reported.advance_token()
 	valued: DiscoveryBuilder = advanced.parse_assignment_value(name_span)
 	valued.finish_question_bind(name, name_span, depth_before)
+
+
+---
+Reports the `?=` at the cursor when it is inside a loop body: each iteration
+would have to return from the enclosing function. The carrier checks that need
+types stay in typechecking.
+---
+private pure func report_question_bind_in_loop(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	operator_span: Span = builder.current_span()
+
+	match builder.loop_context:
+		InLoopBody:
+			builder.append_plain_diagnostic(QuestionBindInLoopDiagnostic, operator_span)
+		NotInLoop:
+			builder
 
 
 ---
@@ -1556,7 +1609,7 @@ private pure func parse_while(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	parsed: DiscoveryBuilder = advanced.parse_expression()
 	var out: DiscoveryBuilder = parsed.push_last_node()
 	out = out.expect_token(ColonSymbol, ExpectedColonDiagnostic)
-	out = out.parse_block_after_colon(start)
+	out = out.parse_block_in_loop_context(InLoopBody, start)
 	out = out.finish_with_body(WhileNode, start, 2)
 	out
 
@@ -1898,12 +1951,12 @@ private pure func parse_for(builder: DiscoveryBuilder, anchor: Span) -> Discover
 		out = out.advance_token()
 		out = out.parse_concurrent_parameters_after_concurrently()
 		out = out.expect_token(ColonSymbol, ExpectedColonDiagnostic)
-		out = out.parse_block_after_colon(anchor)
+		out = out.parse_block_in_loop_context(InLoopBody, anchor)
 		count: Int = out.child_stack_depth() + 1 - depth_before
 		out = out.finish_with_body(ConcurrentForNode, start, count)
 	else:
 		out = out.expect_token(ColonSymbol, ExpectedColonDiagnostic)
-		out = out.parse_block_after_colon(anchor)
+		out = out.parse_block_in_loop_context(InLoopBody, anchor)
 		count: Int = out.child_stack_depth() + 1 - depth_before
 		out = out.finish_with_body(ForNode, start, count)
 
@@ -2018,7 +2071,7 @@ private pure func parse_concurrent_block(builder: DiscoveryBuilder) -> Discovery
 		out = out.parse_concurrent_parameter_list()
 
 	out = out.expect_token(ColonSymbol, ExpectedColonDiagnostic)
-	out = out.parse_block_after_colon(start)
+	out = out.parse_block_in_loop_context(NotInLoop, start)
 	count: Int = out.child_stack_depth() + 1 - depth_before
 	out = out.finish_with_body(ConcurrentBlockNode, start, count)
 	out
@@ -2168,7 +2221,23 @@ private pure func parse_lambda(builder: DiscoveryBuilder, anchor: Span) -> Disco
 	out
 
 
+---
+A lambda's body, parsed outside every loop: its `break` cannot leave the
+enclosing loop, and its `?=` returns from the lambda. The caller's loop context
+is saved and restored as in `parse_function_body_expression`.
+---
 private pure func parse_lambda_body(
+	builder: DiscoveryBuilder,
+	colon_line: Int,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	saved: LoopContext = builder.loop_context
+	entered: DiscoveryBuilder = builder.with_loop_context(NotInLoop)
+	parsed: DiscoveryBuilder = entered.parse_lambda_body_expression(colon_line, anchor)
+	parsed.with_loop_context(saved)
+
+
+private pure func parse_lambda_body_expression(
 	builder: DiscoveryBuilder,
 	colon_line: Int,
 	anchor: Span,
@@ -2752,9 +2821,9 @@ private pure func parse_primary(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 		FalseKeyword:
 			builder.keyword_leaf(FalseLiteralNode)
 		BreakKeyword:
-			builder.keyword_leaf(BreakNode)
+			builder.loop_keyword_leaf(BreakNode, BreakOutsideLoopDiagnostic)
 		ContinueKeyword:
-			builder.keyword_leaf(ContinueNode)
+			builder.loop_keyword_leaf(ContinueNode, ContinueOutsideLoopDiagnostic)
 		VoidKeyword | UnderscoreSymbol:
 			builder.keyword_leaf(VoidNode)
 		AfterKeyword | SealedKeyword:
@@ -2823,6 +2892,25 @@ private pure func keyword_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> Dis
 	span: Span = builder.current_span()
 	advanced: DiscoveryBuilder = builder.advance_token()
 	advanced.append_leaf_node(kind, span)
+
+
+---
+A `break` or `continue` leaf, reported with `outside_loop` when it is not
+inside a loop body.
+---
+private pure func loop_keyword_leaf(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	outside_loop: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	keyword_span: Span = builder.current_span()
+
+	match builder.loop_context:
+		InLoopBody:
+			builder.keyword_leaf(kind)
+		NotInLoop:
+			reported: DiscoveryBuilder = builder.append_plain_diagnostic(outside_loop, keyword_span)
+			reported.keyword_leaf(kind)
 
 
 ---
