@@ -23,25 +23,34 @@ work and says what "accepted" means.
   the source-package lookup rules, with the module-order differential
   also run on the embedded library and on source-package and native-package
   fixture projects, identical in modules, order and origins (item 5); and the
-  declaration half of the legacy adapter, `legacy_frontend_graph` in
+  legacy adapter, `legacy_frontend_graph` in
   `blorp/src/compiler/discovery_adapter.brp`, which rebuilds every module's
-  declarations, imports, docstrings and surface from the tables and equals the
-  existing parser's over the corpus under a declaration-level differential
-  (item 3).
-- **Measured on the self-compile inputs:** 0.65 s user CPU against 1.3 s for
-  the existing discovery; 4.3 G instructions against 8.6 G; about 500 k
-  allocations against 7.9 M.
+  declarations, bodies, imports, docstrings and surface from the tables and
+  equals the existing parser's, spans included, over the corpus under a
+  full-AST differential (items 3 and 4).
+- **Measured on the self-compile inputs:** 0.22 s user CPU against 0.51 s for
+  the existing discovery; 4.0 G instructions against 10.1 G; about 520 k
+  allocations against 8.5 M. With the whole adapter and typecheck's
+  finalization the stage costs 8.7 G instructions, 14% under the existing
+  discovery (`benchmarks/results/discovery_adapter_bodies_2026-10-01.md`).
 - **Verified:** token parity and accept/reject parity with the existing front
   end over every tracked file, about 45 constructs compared by hand, and one
   pinned fixture per diagnostic code.
-- **Not verified:** that the trees are the same below the declarations. The
-  declaration-level differential (item 3) found the declarations, types,
-  imports and docstrings equal, spans included, for every corpus module both
-  parsers accept; bodies are compared by whether they exist only. Accept/reject
-  agreement says nothing about precedence, attachment, spans or diagnostics
-  after the first, and it only covers constructs the corpus happens to use (a
-  probe found the old parser accepting `./a/../a/b` imports that the grammar
-  forbids).
+- **Verified:** that the trees are the same, bodies included. The full-AST
+  differential (items 3 and 4) finds every module both parsers accept equal,
+  spans included, over 3,174 corpus modules and the root runs; targeted
+  programs, one per construct group, check the corners the corpus does not
+  reach. It found interpolated-string inputs the existing lexer reads wrongly.
+  Two were fixed in the existing lexer (a `\u{...}` escape after the first hole,
+  and braces or backslashes before it). Two remain, listed in
+  `ADAPTER_DIFFERENCES` and in
+  `docs/issues/interpolation_nesting_in_the_existing_lexer.md`: interpolation
+  nested three levels deep and braces in an interpolated pipe string. The stage
+  reads them as `docs/GUIDE.md` and `docs/GRAMMAR.md` say; no corpus source but
+  one fixture holds them.
+- **Not verified:** that diagnostics after the first, and the constructs the
+  corpus and the targeted programs do not use, agree (a probe found the old
+  parser accepting `./a/../a/b` imports that the grammar forbids).
 
 ## What "accepted" means
 
@@ -50,6 +59,11 @@ We connect the stage by default when all of these hold:
 1. **Same program.** For every corpus file, the adapter's rebuilt parsed AST
    equals the existing parser's, compared through the existing parsed-AST
    JSON encoder, with every deliberate difference listed and justified.
+   **Open for two listed differences** (item 4): the corpus is equal except
+   one fixture, `fixtures/known_differences/interpolation_nesting.brp`, whose
+   two differences are in `ADAPTER_DIFFERENCES` with a reason each and tracked
+   in `docs/issues/interpolation_nesting_in_the_existing_lexer.md`. It is met
+   when that issue is closed or the old front end is deleted.
 2. **Same compiler output.** With the new stage switched on, every default and
    premerge gate passes, and the self-compile produces the same C. Ids are
    internal identity, not stable across compiles or front ends; if the C
@@ -66,10 +80,13 @@ We connect the stage by default when all of these hold:
 5. **Faster.** New discovery plus the adapter costs fewer instructions than
    the existing discovery on the self-compile, and the stage's allocation
    budget test holds. Measured from the first adapter increment on, not only
-   at the end: the stage's margin (about 0.65 s) is what the adapter may
-   spend.
+   at the end: the stage's margin (about 6 G instructions) is what the adapter
+   may spend. Met with the whole adapter: 8.74 G against 10.13 G, with 23% of
+   the margin left.
 6. **One syntax.** Every rule that can be decided from syntax alone is in the
-   parser, and the two parsers agree on it for as long as both exist.
+   parser, and the two parsers agree on it for as long as both exist. **Open
+   for the same issue:** the existing lexer does not nest interpolation past two
+   levels or keep braces in interpolated pipe strings, which the stage does.
 
 Other users of the old front end (the formatter, which needs comments, the
 linter, and the LSP's per-keystroke analysis) are out of scope for
@@ -169,9 +186,25 @@ more. Each numbered item is one change.
    (`benchmarks/results/discovery_adapter_declarations_2026-10-01.md`); the
    declaration half is 26% of the margin, and the body half is not in that
    number.
-4. **Adapter, bodies (L).** Expressions, statements and patterns, with spans;
-   the differential compares the full AST JSON for every corpus module
-   (criterion 1).
+4. **Adapter, bodies (L). Landed.** `legacy_module_bodies` rebuilds every
+   function, method and global body from the post-order node table in one
+   forward pass per module, with no recursion over a body, and the differential
+   (`discovery_adapter_differential.brp`, run by `compiler-new-parity`) compares
+   the full AST JSON, spans included, with the existing side's interpolation
+   holes parsed: no difference over 3,174 corpus modules (47,027 declarations)
+   and over the 396, 62, 39 and 41 modules of the root runs, with the standard
+   library on disk and embedded, except the two listed in
+   `ADAPTER_DIFFERENCES` for one fixture (criterion 1 is open for them, see
+   above). The placeholder body and the declaration-only comparison
+   are deleted. Closing it took these stage gaps: the span of a name inside a
+   wider body node (a field, a binding or assignment target, a binder, a
+   pattern's constructor or spread), the span of an `else` keyword (and the JSON
+   encoder printing it), the form a string pattern was written in, a
+   parenthesized name keeping its own span, and an unknown escape after a hole
+   keeping its pair as text. The stage plus the adapter and typecheck's
+   finalization costs 8.74 G instructions against the existing discovery's
+   10.13 G, 14% under it, with 4.69 G of the 6.08 G margin spent
+   (`benchmarks/results/discovery_adapter_bodies_2026-10-01.md`).
 5. **Embedded standard library and source packages (M). Landed.** A provider that
    answers for the standard-library root from the compiler's embedded texts,
    and `blorp.toml` aliases as candidate rules in the lookup policy; the

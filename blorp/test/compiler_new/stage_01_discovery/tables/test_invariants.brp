@@ -10,6 +10,8 @@ import:
 		NodeId,
 		PathId,
 		SourceId,
+		ConcurrencyCountRow,
+		ElseKeywordRow,
 		NodeNameSpanRow,
 		SupertraitQualifierRow,
 		append_body,
@@ -24,6 +26,8 @@ import:
 		append_node,
 		append_node_child,
 		append_dimension_name,
+		append_concurrency_count,
+		append_else_keyword,
 		append_node_name_span,
 		next_name_id,
 		append_path,
@@ -72,6 +76,8 @@ import:
 			ModuleTable,
 			NameTable,
 			DimensionNameTable,
+			ConcurrencyCountTable,
+			ElseKeywordTable,
 			NodeNameSpanTable,
 			NodeTable,
 			BodyTable,
@@ -105,6 +111,8 @@ import:
 			NameSpanOutsideItsSpan,
 			NameSpanOnWrongNodeKind,
 			DimensionSigilNameMissing,
+			ConcurrencyCountMismatch,
+			ElseKeywordMismatch,
 			NodeNameSpanMissing,
 			SigilSpellingMismatch,
 		),
@@ -122,7 +130,28 @@ import:
 			CallNode,
 			CharLiteralNode,
 			DimensionNameTypeNode,
+			AddAssignNode,
+			AssignmentNode,
+			ConcurrentParameterNode,
+			ConstructorPatternNode,
+			DivideAssignNode,
+			FieldAccessNode,
+			IfNode,
+			LambdaParameterNode,
+			ListSpreadNameNode,
+			ListSpreadWildcardNode,
+			MultiplyAssignNode,
 			NamedTypeNode,
+			QualifiedConstructorPatternNode,
+			QuestionBindNode,
+			RecordFieldNode,
+			SelectReceiveArmNode,
+			SubtractAssignNode,
+			TypedBindingNode,
+			VarDeclarationNode,
+			WithBindingNode,
+			WithErrorMapNode,
+			WithTryBindingNode,
 			IdentifierNode,
 			IntegerLiteralNode,
 			LocalFunctionNode,
@@ -970,10 +999,227 @@ pure func test_a_named_type_with_arguments_needs_a_name_span() -> Bool:
 	)
 
 
+---
+`builder` with `count` identifier leaves and an `IfNode` over them: two are the
+condition and the then block, a third is an else branch.
+---
+pure func with_if_over(builder: DiscoveryBuilder, count: Int) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+	var leaves: List[NodeId] = []
+
+	for position in 0..count:
+		leaves = leaves.append(out.next_node_id())
+		out = out.append_node({
+			kind = IdentifierNode,
+			span = sample_span(),
+			payload = main_name().name_id_index(),
+			children = EMPTY_ROW_RANGE,
+		})
+
+	first_child: Int = out.next_node_child_row()
+
+	for leaf in leaves:
+		out = out.append_node_child(leaf)
+
+	out.append_node({
+		kind = IfNode,
+		span = sample_span(),
+		payload = 0,
+		children = {
+			first = first_child,
+			count = count
+		},
+	})
+
+
+pure func test_an_if_with_an_else_branch_needs_its_else_keyword() -> Bool:
+	without_row: DiscoveryBuilder = with_if_over(well_formed_builder(), 3)
+	if_node: NodeId = without_row.last_node_id()
+	with_row: DiscoveryBuilder = without_row.append_else_keyword({
+		node = if_node,
+		keyword_span = sample_span(),
+	})
+	(
+		has_violation(without_row.violations_of(), ElseKeywordMismatch, NodeTable)
+		and not has_violation(with_row.violations_of(), ElseKeywordMismatch, NodeTable)
+		and not has_violation(with_row.violations_of(), ElseKeywordMismatch, ElseKeywordTable)
+	)
+
+
+pure func test_an_else_keyword_belongs_to_an_if_with_an_else_branch() -> Bool:
+	-- An `IfNode` with only a condition and a then block has no else keyword,
+	-- and neither has a node of another kind.
+	without_else: DiscoveryBuilder = with_if_over(well_formed_builder(), 2)
+	on_if: DiscoveryBuilder = without_else.append_else_keyword({
+		node = without_else.last_node_id(),
+		keyword_span = sample_span(),
+	})
+	on_leaf: DiscoveryBuilder = well_formed_builder().append_else_keyword({
+		node = node_id_at_row(0),
+		keyword_span = sample_span(),
+	})
+	(
+		has_violation(on_if.violations_of(), ElseKeywordMismatch, ElseKeywordTable)
+		and has_violation(on_leaf.violations_of(), ElseKeywordMismatch, ElseKeywordTable)
+	)
+
+
+pure func test_an_else_keyword_of_a_missing_node_is_a_dangling_reference() -> Bool:
+	builder: DiscoveryBuilder = well_formed_builder().append_else_keyword({
+		node = node_id_at_row(MISSING_ROW),
+		keyword_span = sample_span(),
+	})
+	has_violation(builder.violations_of(), DanglingReference, ElseKeywordTable)
+
+
+pure func test_else_keywords_of_one_node_twice_are_reported() -> Bool:
+	with_if: DiscoveryBuilder = with_if_over(well_formed_builder(), 3)
+
+	row: ElseKeywordRow = {
+		node = with_if.last_node_id(),
+		keyword_span = sample_span(),
+	}
+	builder: DiscoveryBuilder = with_if
+		.append_else_keyword(row)
+		.append_else_keyword(row)
+	has_violation(builder.violations_of(), SideTableUnsorted, ElseKeywordTable)
+
+
+---
+Whether a childless node of `kind` needs a name span row: `NodeNameSpanMissing`
+is there without one and gone with one.
+---
+pure func name_span_row_is_required(kind: NodeKind) -> Bool:
+	without_row: DiscoveryBuilder = well_formed_builder().append_node({
+		kind = kind,
+		span = sample_span(),
+		payload = main_name().name_id_index(),
+		children = EMPTY_ROW_RANGE,
+	})
+	with_row: DiscoveryBuilder = without_row.append_node_name_span({
+		node = without_row.last_node_id(),
+		name_span = sample_span(),
+	})
+	(
+		has_violation(without_row.violations_of(), NodeNameSpanMissing, NodeTable)
+		and not has_violation(with_row.violations_of(), NodeNameSpanMissing, NodeTable)
+	)
+
+
+pure func test_a_body_node_with_a_name_always_narrower_than_it_needs_a_name_span() -> Bool:
+	[
+		FieldAccessNode,
+		RecordFieldNode,
+		SelectReceiveArmNode,
+		WithBindingNode,
+		WithTryBindingNode,
+		WithErrorMapNode,
+		ConcurrentParameterNode,
+		VarDeclarationNode,
+		TypedBindingNode,
+		AssignmentNode,
+		QuestionBindNode,
+		AddAssignNode,
+		SubtractAssignNode,
+		MultiplyAssignNode,
+		DivideAssignNode,
+		ConstructorPatternNode,
+		QualifiedConstructorPatternNode,
+		ListSpreadNameNode,
+		ListSpreadWildcardNode,
+	].all(name_span_row_is_required)
+
+
+pure func test_an_untyped_lambda_parameter_is_its_name_alone() -> Bool:
+	-- Without a child the name is the whole node and has no row; a typed
+	-- parameter (one child) needs one.
+	untyped: DiscoveryBuilder = well_formed_builder().append_node({
+		kind = LambdaParameterNode,
+		span = sample_span(),
+		payload = main_name().name_id_index(),
+		children = EMPTY_ROW_RANGE,
+	})
+	typed: DiscoveryBuilder = untyped.append_node({
+		kind = LambdaParameterNode,
+		span = sample_span(),
+		payload = main_name().name_id_index(),
+		children = {
+			first = 0,
+			count = 1
+		},
+	})
+	stray: DiscoveryBuilder = untyped.append_node_name_span({
+		node = untyped.last_node_id(),
+		name_span = sample_span(),
+	})
+	(
+		not has_violation(untyped.violations_of(), NodeNameSpanMissing, NodeTable)
+		and has_violation(typed.violations_of(), NodeNameSpanMissing, NodeTable)
+		and has_violation(stray.violations_of(), NameSpanOnWrongNodeKind, NodeNameSpanTable)
+	)
+
+
+pure func test_a_concurrency_count_belongs_to_a_parameter_and_is_positive() -> Bool:
+	with_parameter: DiscoveryBuilder = well_formed_builder().append_node({
+		kind = ConcurrentParameterNode,
+		span = sample_span(),
+		payload = main_name().name_id_index(),
+		children = EMPTY_ROW_RANGE,
+	})
+	parameter: NodeId = with_parameter.last_node_id()
+	good: DiscoveryBuilder = with_parameter.append_concurrency_count({
+		parameter = parameter,
+		count = 4,
+	})
+	not_positive: DiscoveryBuilder = with_parameter.append_concurrency_count({
+		parameter = parameter,
+		count = 0,
+	})
+	on_leaf: DiscoveryBuilder = well_formed_builder().append_concurrency_count({
+		parameter = node_id_at_row(0),
+		count = 4,
+	})
+	missing: DiscoveryBuilder = well_formed_builder().append_concurrency_count({
+		parameter = node_id_at_row(MISSING_ROW),
+		count = 4,
+	})
+	(
+		not has_violation(good.violations_of(), ConcurrencyCountMismatch, ConcurrencyCountTable)
+		and has_violation(not_positive.violations_of(), ConcurrencyCountMismatch, ConcurrencyCountTable)
+		and has_violation(on_leaf.violations_of(), ConcurrencyCountMismatch, ConcurrencyCountTable)
+		and has_violation(missing.violations_of(), DanglingReference, ConcurrencyCountTable)
+	)
+
+
 tests: TestSuite = {
 	description = "Discovery table invariants",
 	tests = [
 		("well-formed builder has no violations", test_well_formed_builder_has_no_violations),
+		(
+			"a body node with a name always narrower than it needs a name span",
+			test_a_body_node_with_a_name_always_narrower_than_it_needs_a_name_span,
+		),
+		(
+			"a concurrency count belongs to a parameter and is positive",
+			test_a_concurrency_count_belongs_to_a_parameter_and_is_positive,
+		),
+		("an untyped lambda parameter is its name alone", test_an_untyped_lambda_parameter_is_its_name_alone),
+		(
+			"an if with an else branch needs its else keyword",
+			test_an_if_with_an_else_branch_needs_its_else_keyword,
+		),
+		(
+			"an else keyword belongs to an if with an else branch",
+			test_an_else_keyword_belongs_to_an_if_with_an_else_branch,
+		),
+		(
+			"an else keyword of a missing node is a dangling reference",
+			test_an_else_keyword_of_a_missing_node_is_a_dangling_reference,
+		),
+		(
+			"else keywords of one node twice are reported",
+			test_else_keywords_of_one_node_twice_are_reported,
+		),
 		(
 			"a bound name outside its reference is reported",
 			test_bound_name_outside_its_reference_is_reported,

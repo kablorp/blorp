@@ -820,11 +820,18 @@ what went wrong. Its text pieces and holes are read from the source by
 private pure func scan_interpolated_string_tail(text: String, offset: Int) -> LiteralScan:
 	length: Int = text.length()
 	var position: Int = offset
-	var brace_depth: Int = 1
-	var in_string: Bool = False
 	var failure: Option[PendingDiagnostic] = None
+	var closed: Bool = False
 
-	while failure.is_none():
+	-- `offset` is past the first `${`, so the first hole is read first.
+	match hole_scan(text, position, length):
+		HoleClosed(close):
+			position = close + 1
+		HoleFailed(failed_hole):
+			failure = Some(hole_failure(failed_hole))
+			position = hole_failure_end(failed_hole)
+
+	while failure.is_none() and not closed:
 		position = plain_interpolation_run_end(text, position)
 
 		if position >= length:
@@ -834,39 +841,14 @@ private pure func scan_interpolated_string_tail(text: String, offset: Int) -> Li
 
 			if c == '\"':
 				position += 1
-
-				if brace_depth > 0:
-					in_string = not in_string
-				else:
-					break
-			else if c == '$':
-				if text_at(text, position, INTERPOLATION_OPENER):
-					if not in_string:
-						brace_depth += 1
-
-						if brace_depth > MAX_INTERPOLATION_DEPTH:
-							failure = Some(
-								pending_with_argument(
-									InterpolationTooDeepDiagnostic,
-									position,
-									MAX_INTERPOLATION_DEPTH,
-								),
-							)
-
-					if failure.is_none():
-						position += 2
-				else:
-					position += 1
-			else if c == '{':
-				if not in_string and brace_depth > 0:
-					brace_depth += 1
-
-				position += 1
-			else if c == '}':
-				if not in_string and brace_depth > 0:
-					brace_depth -= 1
-
-				position += 1
+				closed = True
+			else if c == '$' and text_at(text, position, INTERPOLATION_OPENER):
+				match hole_scan(text, position + 2, length):
+					HoleClosed(close):
+						position = close + 1
+					HoleFailed(failed_hole):
+						failure = Some(hole_failure(failed_hole))
+						position = hole_failure_end(failed_hole)
 			else if c == '\\':
 				position += 1
 
@@ -874,9 +856,11 @@ private pure func scan_interpolated_string_tail(text: String, offset: Int) -> Li
 					failure = Some(pending(InterpolatedEscapeAtEndDiagnostic, position, position))
 				else:
 					position += 1
-			else:
-				-- A newline: the only byte the run stops at that is left.
+			else if c == '\n':
 				failure = Some(pending(MultilineInterpolatedStringDiagnostic, position, position))
+				position += 1
+			else:
+				-- A `$` that opens no hole, or a brace outside one: text.
 				position += 1
 
 	match failure:
@@ -889,6 +873,136 @@ private pure func scan_interpolated_string_tail(text: String, offset: Int) -> Li
 				diagnostics = [],
 				ended_with_newline = False
 			}
+
+
+---
+How reading a hole's code ended: at the `}` that closes it, or why it did not.
+`position` is where the problem is.
+---
+private union HoleScan:
+	HoleClosed(Int)
+	HoleFailed(HoleFailure)
+
+
+---
+Why reading a hole's code failed, and where.
+---
+private union HoleFailure:
+	HoleUnterminated(Int)
+	HoleCrossesLine(Int)
+	HoleTooDeep(Int)
+
+
+---
+Where scanning resumes after a failed hole, as the existing lexer resumes: at the
+problem, past a line break.
+---
+private pure func hole_failure_end(failed: HoleFailure) -> Int:
+	match failed:
+		HoleCrossesLine(position):
+			position + 1
+		HoleUnterminated(position):
+			position
+		HoleTooDeep(position):
+			position
+
+
+private pure func hole_failure(failed: HoleFailure) -> PendingDiagnostic:
+	match failed:
+		HoleUnterminated(position):
+			pending(UnterminatedInterpolatedStringDiagnostic, position, position)
+		HoleCrossesLine(position):
+			pending(MultilineInterpolatedStringDiagnostic, position, position)
+		HoleTooDeep(position):
+			pending_with_argument(InterpolationTooDeepDiagnostic, position, MAX_INTERPOLATION_DEPTH)
+
+
+---
+What a frame of `hole_scan`'s stack holds for a string literal inside a hole;
+a frame of code holds its count of open braces, at least one.
+---
+private STRING_FRAME: Int = -1
+
+---
+Reads the code of a hole from `start` (past its `${`) up to `end`. Holes and
+strings nest to any depth while no more than `MAX_INTERPOLATION_DEPTH` braces
+and holes are open: a stack of
+frames says whether the scan is in code or in a string literal, so a quote
+opens or closes the string it belongs to, and a `}` inside a string closes
+nothing. A backslash skips the byte after it, in code and in strings.
+---
+private pure func hole_scan(text: String, start: Int, end: Int) -> HoleScan:
+	var frames: List[Int] = [1]
+	var open_braces: Int = 1
+	var position: Int = start
+	var result: Option[HoleScan] = None
+
+	while result.is_none():
+		if position >= end:
+			result = Some(HoleFailed(HoleUnterminated(position)))
+		else:
+			c: Char = byte_at(text, position)
+
+			-- The stack empties only when the hole closes, which ends the scan, so a
+			-- frame is always there; without one the hole did not close.
+			match frames.get(frames.length() - 1):
+				None:
+					result = Some(HoleFailed(HoleUnterminated(position)))
+				Some(top):
+					if c == '\n':
+						result = Some(HoleFailed(HoleCrossesLine(position)))
+					else if c == '\\':
+						position += 2
+					else if top == STRING_FRAME:
+						if c == '\"':
+							frames = frames.drop_last()
+							position += 1
+						else if c == '$' and text_at(text, position, INTERPOLATION_OPENER):
+							frames = frames.append(1)
+							open_braces += 1
+
+							if open_braces > MAX_INTERPOLATION_DEPTH:
+								result = Some(HoleFailed(HoleTooDeep(position)))
+
+							position += 2
+						else:
+							position += 1
+					else if c == '\"':
+						frames = frames.append(STRING_FRAME)
+						position += 1
+					else if c == '$' and text_at(text, position, INTERPOLATION_OPENER):
+						-- A `${` in code opens a brace, as the existing lexer counts it.
+						frames = frames.set(frames.length() - 1, top + 1)
+						open_braces += 1
+
+						if open_braces > MAX_INTERPOLATION_DEPTH:
+							result = Some(HoleFailed(HoleTooDeep(position)))
+
+						position += 2
+					else if c == '{':
+						frames = frames.set(frames.length() - 1, top + 1)
+						open_braces += 1
+						position += 1
+					else if c == '}':
+						open_braces -= 1
+
+						if top == 1:
+							frames = frames.drop_last()
+
+							if frames.is_empty():
+								result = Some(HoleClosed(position))
+						else:
+							frames = frames.set(frames.length() - 1, top - 1)
+
+						position += 1
+					else:
+						position += 1
+
+	match result:
+		Some(scanned):
+			scanned
+		None:
+			HoleFailed(HoleUnterminated(position))
 
 
 -- Interpolated string parts.
@@ -1188,9 +1302,10 @@ private record EscapeDecode {
 
 
 ---
-Decodes the escape at `position` (a backslash) as the existing compiler's
-interpolation splitter does: the named escapes, braces and `\u{...}`; an
-unknown escape keeps its backslash and the next byte is read as text.
+Decodes the escape at `position` (a backslash): the named escapes, braces and
+`\u{...}`. An unknown escape keeps its backslash and the byte after it as text
+(as the existing compiler's lexer keeps the pair), so `\$` before a `{` does
+not open a hole.
 ---
 private pure func decoded_escape(text: String, position: Int, end: Int) -> EscapeDecode:
 	if text_at(text, position, "\\u{"):
@@ -1216,8 +1331,8 @@ private pure func decoded_escape(text: String, position: Int, end: Int) -> Escap
 				}
 			None:
 				{
-					text = "\\",
-					end = position + 1
+					text = "\\" + text.substring(position + 1, 1),
+					end = position + 2
 				}
 	else:
 		{
@@ -1227,38 +1342,15 @@ private pure func decoded_escape(text: String, position: Int, end: Int) -> Escap
 
 
 ---
-The offset of the `}` closing a hole whose text starts at `start`, found as
-the existing compiler finds it: braces are counted outside string literals,
-and a backslash skips the byte after it.
+The offset of the `}` closing a hole whose text starts at `start`, or `end` when
+the hole does not close before it (the string's scan reports that).
 ---
 private pure func hole_close(text: String, start: Int, end: Int) -> Int:
-	var position: Int = start
-	var depth: Int = 1
-	var in_string: Bool = False
-	var close: Int = end
-
-	while position < end and depth > 0:
-		c: Char = byte_at(text, position)
-
-		if c == '\\':
-			position += 2
-		else if c == '\"':
-			in_string = not in_string
-			position += 1
-		else if not in_string and c == '{':
-			depth += 1
-			position += 1
-		else if not in_string and c == '}':
-			depth -= 1
-
-			if depth == 0:
-				close = position
-
-			position += 1
-		else:
-			position += 1
-
-	close
+	match hole_scan(text, start, end):
+		HoleClosed(close):
+			close
+		_:
+			end
 
 
 ---

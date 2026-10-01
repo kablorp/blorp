@@ -962,13 +962,52 @@ private pure func scan_raw_string_literal(source: SourceFile, cursor: Cursor) ->
 		}
 
 
+---
+`text` with the backslashes and braces the interpolation splitter would read as
+escapes or holes written as escapes, so it reads them back as themselves.
+---
+private pure func escaped_for_splitter(text: String) -> String:
+	text
+		.replace("\\", "\\\\")
+		.replace("{", "\\{")
+		.replace("}", "\\}")
+
+
+---
+Where the `{...}` of a `\u{...}` escape that starts at `cursor` (its `{`) ends:
+after its `}`, or where a quote or line end stops it.
+---
+private pure func unicode_escape_body_end(source: SourceFile, cursor: Cursor) -> Cursor:
+	var cur: Cursor = cursor
+	var done: Bool = False
+
+	while not done:
+		match source_peek(source, cur):
+			Some('}'):
+				cur = source_advance(source, cur)
+				done = True
+			Some('\"'):
+				done = True
+			Some('\n'):
+				done = True
+			Some(_):
+				cur = source_advance(source, cur)
+			None:
+				done = True
+
+	cur
+
+
 private pure func scan_interpolated_string_tail(
 	source: SourceFile,
 	cursor: Cursor,
 	prefix: String,
 ) -> LiteralScan:
 	var cur: Cursor = cursor
-	var text: String = prefix + "{"
+
+	-- The prefix is already decoded, and the splitter decodes the whole text again,
+	-- so a backslash or brace the prefix holds is escaped for it to read back.
+	var text: String = escaped_for_splitter(prefix) + "{"
 	var brace_depth: Int = 1
 	var in_string: Bool = False
 	var has_error: Bool = False
@@ -1038,6 +1077,17 @@ private pure func scan_interpolated_string_tail(
 					Some(escaped):
 						text = text.append_char(escaped)
 						cur = source_advance(source, cur)
+
+						-- A `\u{...}` outside a hole reaches the splitter as written,
+						-- braces included, so that it decodes the escape.
+						if (
+							escaped == 'u'
+							and brace_depth == 0
+							and text_starts_with(source, cur, "{")
+						):
+							body_end: Cursor = unicode_escape_body_end(source, cur)
+							text = append_source_segment(text, source, cur, body_end)
+							cur = body_end
 					None:
 						has_error = True
 						diagnostics = diagnostics.append(

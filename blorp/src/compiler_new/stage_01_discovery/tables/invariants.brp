@@ -11,6 +11,7 @@ import:
 	builder:
 		DiscoveryBuilder,
 		NO_NODE_PAYLOAD,
+		NodeNameSpanRow,
 		NodeRow,
 		RowRange,
 		bound_id_index,
@@ -23,6 +24,7 @@ import:
 		literal_id_index,
 		module_id_index,
 		name_id_index,
+		node_id_at_row,
 		node_id_index,
 		package_id_index,
 		parameter_id_index,
@@ -53,13 +55,34 @@ import:
 			TraitMethodDefinition,
 		),
 		NodeKind(
+			AddAssignNode,
+			AssignmentNode,
 			BoundedTypeNode,
+			ConcurrentParameterNode,
+			ConstructorPatternNode,
 			DimensionNameTypeNode,
+			DivideAssignNode,
+			FieldAccessNode,
+			IfNode,
+			LambdaParameterNode,
+			ListSpreadNameNode,
+			ListSpreadWildcardNode,
+			MultiplyAssignNode,
 			NamedTypeNode,
+			QualifiedConstructorPatternNode,
 			QualifiedTypeBoundNode,
 			QualifiedTypeNode,
+			QuestionBindNode,
+			RecordFieldNode,
+			SelectReceiveArmNode,
+			SubtractAssignNode,
+			TypedBindingNode,
+			VarDeclarationNode,
 			VariadicDimensionNameTypeNode,
 			VariadicDimensionWildcardTypeNode,
+			WithBindingNode,
+			WithErrorMapNode,
+			WithTryBindingNode,
 		),
 		NodePayloadReference(
 			CodepointPayload,
@@ -71,7 +94,7 @@ import:
 		TypeParameterKind(DimensionParameter),
 		node_payload_reference,
 		parsed_construct_at_argument,
-	span: Span, span_end, span_source_index, span_start
+	span: Span, pack_span, span_end, span_source_index, span_start
 	token: is_unicode_scalar
 
 
@@ -127,6 +150,8 @@ enum DiscoveryTable:
 	NodeTable
 	NodeChildTable
 	NodeNameSpanTable
+	ElseKeywordTable
+	ConcurrencyCountTable
 	DimensionNameTable
 	LiteralTable
 	DiagnosticTable
@@ -235,6 +260,10 @@ pure func discovery_table_name(table: DiscoveryTable) -> String:
 			"NodeChildTable"
 		NodeNameSpanTable:
 			"NodeNameSpanTable"
+		ElseKeywordTable:
+			"ElseKeywordTable"
+		ConcurrencyCountTable:
+			"ConcurrencyCountTable"
 		DimensionNameTable:
 			"DimensionNameTable"
 		LiteralTable:
@@ -276,7 +305,9 @@ What a violation breaks. The meaning of `TableInvariantViolation.value` and
 - `NameSpanOnWrongNodeKind`: A `NodeNameSpanRow` names a node of a kind that has no separate name span; `value` is the node's index.
 - `DimensionSigilNameMissing`: A dimension name has no `DimensionNameRow`; `value` is the plain name's index.
 - `SigilSpellingMismatch`: A dimension name row's sigil name is not `#` followed by the plain name's spelling; `value` is the sigil name's index.
-- `NodeNameSpanMissing`: A node of a kind whose name is narrower than the node has no `NodeNameSpanRow`; the row is the node.
+- `NodeNameSpanMissing`: A node of a kind whose name is narrower than the node (`needs_name_span_row`) has no `NodeNameSpanRow`; the row is the node.
+- `ElseKeywordMismatch`: An `ElseKeywordRow` does not belong to an `IfNode` that has an else branch (a third child), an `IfNode` with an else branch has none, or the keyword lies outside its node; the row is the keyword row or, for a missing one, the node, and `value` is the node's index.
+- `ConcurrencyCountMismatch`: A `ConcurrencyCountRow` does not belong to a concurrency parameter node, or its count is not positive; the row is the count row and `value` the node's index.
 - `LocalFunctionNodeMismatch`: A `LocalFunctionNode` names a definition that is not a local function; `value` is the definition's index.
 ---
 enum TableInvariantKind:
@@ -307,6 +338,8 @@ enum TableInvariantKind:
 	DimensionSigilNameMissing
 	SigilSpellingMismatch
 	NodeNameSpanMissing
+	ElseKeywordMismatch
+	ConcurrencyCountMismatch
 
 
 struct TableInvariantViolation {
@@ -407,6 +440,8 @@ pure func check_table_invariants(
 		.concat(builder.check_name_spans())
 		.concat(builder.check_dimension_names())
 		.concat(builder.check_node_name_rows())
+		.concat(builder.check_else_keywords())
+		.concat(builder.check_concurrency_counts())
 
 
 private pure func check_seeded_names(
@@ -2272,48 +2307,28 @@ private pure func check_name_spans(builder: DiscoveryBuilder) -> List[TableInvar
 
 		row += 1
 
-	row = 0
-
-	for name_row in builder.node_name_spans:
-		node: Int = name_row.node.node_id_index()
-
-		match builder.nodes.get(node):
-			Some(node_row):
-				found = check_name_within(
-					found,
-					NodeNameSpanTable,
-					row,
-					name_row.name_span,
-					node_row.span,
-				)
-
-				if not node_row.kind.has_separate_name_span():
-					found = found.append(
-						violation(NameSpanOnWrongNodeKind, NodeNameSpanTable, row, NodeTable, node),
-					)
-			None:
-				found = found.append(
-					violation(DanglingReference, NodeNameSpanTable, row, NodeTable, node),
-				)
-
-		row += 1
-
-	sorted_by_owner(
-		found,
-		NodeNameSpanTable,
-		builder.node_name_spans.map(pure func(row): row.node.node_id_index()),
-	)
+	found
 
 
 ---
 Whether a node of this kind can have a `NodeNameSpanRow`: its name can be
 narrower than the node.
 ---
-private pure func has_separate_name_span(kind: NodeKind) -> Bool:
+private pure func has_separate_name_span(kind: NodeKind, child_count: Int) -> Bool:
 	match kind:
 		NamedTypeNode | QualifiedTypeNode | BoundedTypeNode | QualifiedTypeBoundNode:
 			True
 		VariadicDimensionNameTypeNode | VariadicDimensionWildcardTypeNode:
+			True
+		FieldAccessNode | RecordFieldNode | SelectReceiveArmNode | WithBindingNode | WithTryBindingNode | WithErrorMapNode:
+			True
+		ConcurrentParameterNode | VarDeclarationNode | TypedBindingNode | AssignmentNode | QuestionBindNode:
+			True
+		LambdaParameterNode:
+			child_count > 0
+		AddAssignNode | SubtractAssignNode | MultiplyAssignNode | DivideAssignNode:
+			True
+		ConstructorPatternNode | QualifiedConstructorPatternNode | ListSpreadNameNode | ListSpreadWildcardNode:
 			True
 		_:
 			False
@@ -2423,55 +2438,275 @@ private pure func check_dimension_names(
 
 
 ---
-A `NodeNameSpanMissing` for each node whose kind has a name narrower than the
-node but no row: a module-qualified type, a bounded type, a trait bound written
-through a module alias, a variadic dimension, and a named type with type
-arguments. Node name span rows are sorted by node (checked apart), so one walk
-over the nodes finds each node's row.
+Else keyword rows: sorted by node, each naming an `IfNode` with an else branch
+(a third child) and lying inside it, and every such `IfNode` having one. Rows
+are sorted (checked here), so one walk over the nodes finds each node's row.
 ---
-private pure func check_node_name_rows(
-	builder: DiscoveryBuilder,
-) -> List[TableInvariantViolation]:
+private pure func check_else_keywords(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
 	var found: List[TableInvariantViolation] = []
-	var next_row: Int = 0
 	var row: Int = 0
 
+	for keyword_row in builder.else_keywords:
+		node: Int = keyword_row.node.node_id_index()
+
+		match builder.nodes.get(node):
+			Some(node_row):
+				if node_row.kind != IfNode or node_row.children.count <= ELSE_BRANCH_ORDINAL:
+					found = found.append(
+						violation(
+							ElseKeywordMismatch,
+							ElseKeywordTable,
+							row,
+							NodeTable,
+							node,
+						),
+					)
+				else:
+					found = check_name_within(
+						found,
+						ElseKeywordTable,
+						row,
+						keyword_row.keyword_span,
+						node_row.span,
+					)
+			None:
+				found = found.append(
+					violation(
+						DanglingReference,
+						ElseKeywordTable,
+						row,
+						NodeTable,
+						node,
+					),
+				)
+
+		row += 1
+
+	found = sorted_by_owner(
+		found,
+		ElseKeywordTable,
+		builder.else_keywords.map(pure func(keyword_row): keyword_row.node.node_id_index()),
+	)
+
+	var next_row: Int = 0
+	var node_index: Int = 0
+
 	for node in builder.nodes:
-		if node.kind.needs_name_span_row(node.children.count):
-			has_row: Bool = match builder.node_name_spans.get(next_row):
-				Some(name_row):
-					name_row.node.node_id_index() == row
+		if node.kind == IfNode and node.children.count > ELSE_BRANCH_ORDINAL:
+			has_row: Bool = match builder.else_keywords.get(next_row):
+				Some(keyword_row):
+					keyword_row.node.node_id_index() == node_index
 				None:
 					False
 
 			if has_row:
 				next_row += 1
 			else:
-				found = found.append(violation(NodeNameSpanMissing, NodeTable, row, NodeNameSpanTable, row))
-		else:
-			match builder.node_name_spans.get(next_row):
-				Some(name_row):
-					if name_row.node.node_id_index() == row:
-						next_row += 1
-				None:
-					void
+				found = found.append(
+					violation(
+						ElseKeywordMismatch,
+						NodeTable,
+						node_index,
+						ElseKeywordTable,
+						node_index,
+					),
+				)
 
+		node_index += 1
+
+	found
+
+
+---
+Concurrency count rows: sorted by node, each naming a `ConcurrentParameterNode`
+and positive.
+---
+private pure func check_concurrency_counts(
+	builder: DiscoveryBuilder,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var previous: Int = NO_NODE_ROW
+	var row: Int = 0
+
+	for count_row in builder.concurrency_counts:
+		owner: Int = count_row.parameter.node_id_index()
+
+		match builder.nodes.get(owner):
+			Some(node):
+				if node.kind != ConcurrentParameterNode or count_row.count <= 0:
+					found = found.append(
+						violation(
+							ConcurrencyCountMismatch,
+							ConcurrencyCountTable,
+							row,
+							NodeTable,
+							owner,
+						),
+					)
+			None:
+				found = found.append(
+					violation(DanglingReference, ConcurrencyCountTable, row, NodeTable, owner),
+				)
+
+		if owner <= previous:
+			found = found.append(
+				violation(
+					SideTableUnsorted,
+					ConcurrencyCountTable,
+					row,
+					ConcurrencyCountTable,
+					owner,
+				),
+			)
+
+		previous = owner
 		row += 1
 
 	found
 
 
 ---
-Whether a node of this kind with `child_count` children must have a
-`NodeNameSpanRow`: its name is always narrower than the node.
+The child ordinal of an `IfNode`'s else branch: after the condition and the
+then block.
 ---
-private pure func needs_name_span_row(kind: NodeKind, child_count: Int) -> Bool:
+private ELSE_BRANCH_ORDINAL: Int = 2
+
+
+---
+The node name span rows. They are sorted by node (`SideTableUnsorted`), so one
+walk over the nodes meets each node's row in turn: a row on a node whose kind has
+no separate name span is a `NameSpanOnWrongNodeKind`, a name outside its node's
+span a `NameSpanOutsideItsSpan`, and a node whose kind has a name always narrower
+than the node but no row a `NodeNameSpanMissing`. A row naming no node is a
+`DanglingReference`; a row the walk does not reach (a node's second row) is the
+unsorted table already reported.
+---
+private pure func check_node_name_rows(
+	builder: DiscoveryBuilder,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var next_row: Int = 0
+	var next_row_node: Int = builder.name_span_row_node(0)
+	var row: Int = 0
+
+	for node in builder.nodes:
+		if next_row_node == row:
+			name_span: Span = builder.node_name_spans.get_or(next_row, NO_NAME_SPAN_ROW).name_span
+			found = check_name_within(found, NodeNameSpanTable, next_row, name_span, node.span)
+
+			if not node.kind.has_separate_name_span(node.children.count):
+				found = found.append(
+					violation(
+						NameSpanOnWrongNodeKind,
+						NodeNameSpanTable,
+						next_row,
+						NodeTable,
+						row,
+					),
+				)
+
+			next_row += 1
+			next_row_node = builder.name_span_row_node(next_row)
+		else if node.kind.needs_name_span_row(node.children.count):
+			found = found.append(
+				violation(
+					NodeNameSpanMissing,
+					NodeTable,
+					row,
+					NodeNameSpanTable,
+					row,
+				),
+			)
+
+		row += 1
+
+	row = 0
+	node_count: Int = builder.nodes.length()
+	var previous: Int = NO_NODE_ROW
+
+	-- The sorted check is `sorted_by_owner`'s, written as a loop over the rows:
+	-- mapping the 100k rows to their owners first allocates for each one.
+	for name_row in builder.node_name_spans:
+		owner: Int = name_row.node.node_id_index()
+
+		if owner >= node_count:
+			found = found.append(
+				violation(
+					DanglingReference,
+					NodeNameSpanTable,
+					row,
+					NodeTable,
+					owner,
+				),
+			)
+
+		if owner <= previous:
+			found = found.append(
+				violation(
+					SideTableUnsorted,
+					NodeNameSpanTable,
+					row,
+					NodeNameSpanTable,
+					owner,
+				),
+			)
+
+		previous = owner
+		row += 1
+
+	found
+
+
+---
+The node name span row `row` belongs to, or `NO_NODE_ROW` when there is no such
+row: read once per row, so the walk over the nodes compares integers.
+---
+private pure func name_span_row_node(builder: DiscoveryBuilder, row: Int) -> Int:
+	builder.node_name_spans.get_or(row, NO_NAME_SPAN_ROW).node.node_id_index()
+
+
+---
+Stands for the node of a side table row past the table's end: no node has it.
+---
+private NO_NODE_ROW: Int = -1
+
+
+---
+Stands for a node name span row past the table's end. `get_or` reads it where a
+`get` would allocate an `Option` for every row it finds.
+---
+private NO_NAME_SPAN_ROW: NodeNameSpanRow = {
+	node = node_id_at_row(NO_NODE_ROW),
+	name_span = pack_span(0, 0, 0)
+}
+
+
+---
+Whether a node of this kind with `child_count` children must have a
+`NodeNameSpanRow`: its name is always narrower than the node, or the parser
+records the row whether or not it is. A body node's name is narrower because
+something always comes with it: a receiver before a field, a value after a
+binding target, a binder's header, a constructor's parentheses or qualifier, the
+dots of a spread. Only an untyped lambda parameter is its name alone, and it has
+no row.
+---
+pure func needs_name_span_row(kind: NodeKind, child_count: Int) -> Bool:
 	match kind:
 		QualifiedTypeNode | BoundedTypeNode | QualifiedTypeBoundNode:
 			True
 		VariadicDimensionNameTypeNode | VariadicDimensionWildcardTypeNode:
 			True
 		NamedTypeNode:
+			child_count > 0
+		FieldAccessNode | RecordFieldNode | SelectReceiveArmNode | WithBindingNode | WithTryBindingNode | WithErrorMapNode:
+			True
+		ConcurrentParameterNode | VarDeclarationNode | TypedBindingNode | AssignmentNode | QuestionBindNode:
+			True
+		AddAssignNode | SubtractAssignNode | MultiplyAssignNode | DivideAssignNode:
+			True
+		ConstructorPatternNode | QualifiedConstructorPatternNode | ListSpreadNameNode | ListSpreadWildcardNode:
+			True
+		LambdaParameterNode:
 			child_count > 0
 		_:
 			False
@@ -2723,6 +2958,12 @@ private pure func check_spans(builder: DiscoveryBuilder) -> List[TableInvariantV
 
 	for name_row in builder.node_name_spans:
 		found = check_span(found, NodeNameSpanTable, row, name_row.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for keyword_row in builder.else_keywords:
+		found = check_span(found, ElseKeywordTable, row, keyword_row.keyword_span, sources)
 		row += 1
 
 	row = 0

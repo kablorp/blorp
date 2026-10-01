@@ -1,8 +1,10 @@
 -- The spans of names that do not span the whole of what they name, as the
 -- legacy adapter reads them from the frozen tables: type parameters, bounds,
--- supertraits, imports and their aliases, foreign block arguments, and the
--- name of a written type node. Each test parses one module and reads the text
--- the span covers.
+-- supertraits, imports and their aliases, foreign block arguments, the name of
+-- a written type node, the names bodies bind or select (a field, an
+-- assignment target, a pattern's constructor), the `else` keyword of an `if`
+-- and the span a parenthesized expression has. Each test parses one module and
+-- reads the text the span covers.
 import:
 	../../../../src/compiler_new/stage_01_discovery/pipeline: load_module
 	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
@@ -26,6 +28,7 @@ import:
 		bound_row_at,
 		dimension_name_count,
 		dimension_name_row_at,
+		else_keyword_span,
 		foreign_argument_row_at,
 		freeze,
 		import_alias,
@@ -43,13 +46,33 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
 		ModuleReach(RootModule),
 		NodeKind(
+			AddAssignNode,
+			AssignmentNode,
 			BoundedTypeNode,
+			ConcurrentParameterNode,
+			ConstructorPatternNode,
+			AddNode,
 			DimensionNameTypeNode,
+			FieldAccessNode,
+			IdentifierNode,
+			IfNode,
+			LambdaParameterNode,
+			ListSpreadNameNode,
+			ListSpreadWildcardNode,
 			NamedTypeNode,
+			QualifiedConstructorPatternNode,
 			QualifiedTypeBoundNode,
 			QualifiedTypeNode,
+			QuestionBindNode,
+			RecordFieldNode,
+			SelectReceiveArmNode,
+			TypedBindingNode,
+			VarDeclarationNode,
 			VariadicDimensionNameTypeNode,
 			VariadicDimensionWildcardTypeNode,
+			WithBindingNode,
+			WithErrorMapNode,
+			WithTryBindingNode,
 		),
 	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
 	test: TestSuite
@@ -352,6 +375,153 @@ pure func test_a_dimension_name_has_its_hash_spelling() -> Bool:
 			False
 
 
+---
+Whether the first `kind` node of the body `text` names `expected` inside the
+`whole` text it covers.
+---
+pure func body_node_names(
+	text: String,
+	kind: NodeKind,
+	expected: String,
+	whole: String,
+) -> Bool:
+	match frozen("func f(x):\n\t" + text + "\n"):
+		Some(tables):
+			node_names(tables, kind, expected, whole)
+		None:
+			False
+
+
+pure func test_a_field_names_itself_after_its_receiver() -> Bool:
+	(
+		body_node_names("x.field", FieldAccessNode, "field", "x.field")
+		and body_node_names("{name = 1}", RecordFieldNode, "name", "name = 1")
+	)
+
+
+pure func test_a_binding_or_assignment_names_its_target_before_its_value() -> Bool:
+	(
+		body_node_names("var total = 1", VarDeclarationNode, "total", "var total = 1")
+		and body_node_names("limit: Int = 1", TypedBindingNode, "limit", "limit: Int = 1")
+		and body_node_names("total = 1", AssignmentNode, "total", "total = 1")
+		and body_node_names("total += 1", AddAssignNode, "total", "total += 1")
+		and body_node_names("item ?= x.first()", QuestionBindNode, "item", "item ?= x.first()")
+		and body_node_names("f(count = 1)", AssignmentNode, "count", "count = 1")
+	)
+
+
+pure func test_a_with_or_select_binder_names_itself_before_its_value() -> Bool:
+	(
+		body_node_names("with file = open(x):\n\t\tfile", WithBindingNode, "file", "file = open(x)")
+		and body_node_names(
+			"with file ?= open(x) on e => wrap(e):\n\t\tfile",
+			WithTryBindingNode,
+			"file",
+			"file ?= open(x) on e => wrap(e)",
+		)
+		and body_node_names(
+			"with file ?= open(x) on e => wrap(e):\n\t\tfile",
+			WithErrorMapNode,
+			"e",
+			"e => wrap(e)",
+		)
+		and body_node_names(
+			"select:\n\t\tmsg from ch:\n\t\t\tmsg",
+			SelectReceiveArmNode,
+			"msg",
+			"msg from ch:\n\t\t\tmsg",
+		)
+		and body_node_names(
+			"concurrent(max_threads: 2):\n\t\twork()",
+			ConcurrentParameterNode,
+			"max_threads",
+			"max_threads: 2",
+		)
+	)
+
+
+pure func test_a_typed_lambda_parameter_names_itself_before_its_type() -> Bool:
+	(
+		body_node_names("func(item: Int): item", LambdaParameterNode, "item", "item: Int")
+		and body_node_names("func(item): item", LambdaParameterNode, "item", "item")
+	)
+
+
+pure func test_a_pattern_names_its_constructor_and_spread_inside_the_pattern() -> Bool:
+	(
+		body_node_names(
+			"match x:\n\t\tSome(value):\n\t\t\tvalue",
+			ConstructorPatternNode,
+			"Some",
+			"Some(value)",
+		)
+		and body_node_names(
+			"match x:\n\t\tShape.Circle(radius):\n\t\t\tradius",
+			QualifiedConstructorPatternNode,
+			"Circle",
+			"Shape.Circle(radius)",
+		)
+		and body_node_names(
+			"match x:\n\t\t[first, ...rest]:\n\t\t\tfirst",
+			ListSpreadNameNode,
+			"rest",
+			"...rest",
+		)
+		and body_node_names(
+			"match x:\n\t\t[first, ..._]:\n\t\t\tfirst",
+			ListSpreadWildcardNode,
+			"_",
+			"..._",
+		)
+	)
+
+
+pure func test_an_else_keyword_has_its_own_span_even_after_a_comment() -> Bool:
+	match frozen(
+		"func f(x):\n\tif x:\n\t\t1\n\t-- between\n\telse if x:\n\t\t2\n\telse:\n\t\t3\n\tif x:\n\t\t4\n",
+	):
+		Some(tables):
+			-- Post-order: the nested `else if` finishes first, then its parent, then
+			-- the `if` without an else.
+			ifs: List[NodeId] = nodes_of(tables, IfNode)
+
+			match (ifs.get(0), ifs.get(1), ifs.get(2)):
+				(Some(nested), Some(outer), Some(plain)):
+					match (else_keyword_span(tables, nested), else_keyword_span(tables, outer)):
+						(Some(inner_keyword), Some(outer_keyword)):
+							(
+								covered(tables, inner_keyword) == "else"
+								and covered(tables, outer_keyword) == "else"
+								and span_start(outer_keyword) < span_start(inner_keyword)
+								and else_keyword_span(tables, plain).is_none()
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_parentheses_widen_an_expression_but_not_a_name() -> Bool:
+	match frozen("func f(a, b):\n\tc = (a)\n\td = (a + b)\n\te = ((a)) + b\n"):
+		Some(tables):
+			names: List[NodeId] = nodes_of(tables, IdentifierNode)
+			sums: List[NodeId] = nodes_of(tables, AddNode)
+
+			match (names.get(0), sums.get(0), sums.get(1)):
+				(Some(grouped_name), Some(grouped_sum), Some(spliced)):
+					(
+						covered(tables, node_row(tables, grouped_name).span) == "a"
+						and covered(tables, node_row(tables, grouped_sum).span) == "(a + b)"
+						and covered(tables, node_row(tables, spliced).span) == "a)) + b"
+					)
+				_:
+					False
+		None:
+			False
+
+
 tests: TestSuite = {
 	description = "Discovery name spans",
 	tests = [
@@ -396,5 +566,30 @@ tests: TestSuite = {
 			test_a_variadic_dimension_names_itself_before_its_dots,
 		),
 		("a dimension name has its hash spelling", test_a_dimension_name_has_its_hash_spelling),
+		("a field names itself after its receiver", test_a_field_names_itself_after_its_receiver),
+		(
+			"a binding or assignment names its target before its value",
+			test_a_binding_or_assignment_names_its_target_before_its_value,
+		),
+		(
+			"a with or select binder names itself before its value",
+			test_a_with_or_select_binder_names_itself_before_its_value,
+		),
+		(
+			"a typed lambda parameter names itself before its type",
+			test_a_typed_lambda_parameter_names_itself_before_its_type,
+		),
+		(
+			"a pattern names its constructor and spread inside the pattern",
+			test_a_pattern_names_its_constructor_and_spread_inside_the_pattern,
+		),
+		(
+			"an else keyword has its own span even after a comment",
+			test_an_else_keyword_has_its_own_span_even_after_a_comment,
+		),
+		(
+			"parentheses widen an expression but not a name",
+			test_parentheses_widen_an_expression_but_not_a_name,
+		),
 	]
 }

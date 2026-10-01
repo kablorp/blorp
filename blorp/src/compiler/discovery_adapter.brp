@@ -9,10 +9,14 @@ in the stage, not here.
 It shrinks as typecheck is rewritten to read the tables, and it is deleted
 when typecheck takes `FrontendTables` directly.
 
-Declarations only so far: signatures, types, imports, foreign blocks and
-docstrings are rebuilt, and every function or method body and every global's
-value is the placeholder `DECLARATION_ONLY_BODY` until the body half lands
-(`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`, item 4).
+The whole parsed program is rebuilt: signatures, types, imports, foreign blocks
+and docstrings from the declaration tables, and every function, method and
+global body from the node table, spans included. The existing parser parses an
+interpolated string's holes in a second step over the file
+(`finalize_interpolation_program`); the stage parses them with the file, so the
+adapter hands over strings in the form that step produces
+(`ParsedStringInterpolationPartsExpr`), and the differential compares against
+the existing parser's program after it.
 
 A row the tables should hold and do not is a `LegacyAdapterError`, never a
 default: no placeholder value flows into the rebuilt AST. The freeze
@@ -53,6 +57,7 @@ import:
 		module_id_index,
 		name_id_at_row,
 		name_id_index as table_name_index,
+		node_id_at_row,
 		node_id_index,
 		parameter_id_index,
 		root_id_at_row,
@@ -69,6 +74,7 @@ import:
 			DimensionConstraintTable,
 			DimensionNameTable,
 			DocumentationTable,
+			ElseKeywordTable,
 			ForeignArgumentTable,
 			ForeignBindingTable,
 			ForeignBlockTable,
@@ -82,6 +88,7 @@ import:
 			ModulePackageTable,
 			ModuleTable,
 			NodeChildTable,
+			NodeNameSpanTable,
 			NodeTable,
 			ParameterTable,
 			ParameterTypeTable,
@@ -92,12 +99,16 @@ import:
 			VariantPayloadTable,
 		),
 		discovery_table_name,
+		needs_name_span_row,
+	../compiler_new/stage_01_discovery/tables/name_vocabulary:
+		LIMIT_NAME_INDEX,
+		MAX_THREADS_NAME_INDEX,
+		TIMEOUT_NAME_INDEX,
 	../compiler_new/stage_01_discovery/tables/row_kinds as Kinds
 	../compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
 	../lib/source:
 		SourceFile,
 		SourceLocation,
-		compiler_prelude_source_location,
 		singleton_source_file_id,
 		source_file,
 		source_location_from_offsets,
@@ -106,7 +117,28 @@ import:
 	stage_01_generated_inputs/embedded_std: embedded_std_module_names, embedded_std_source
 	stage_02_lex/name_table: NameTable, name_id_from_interned_index, name_table_from_parts
 	stage_03_parse/parsed_ast:
+		ConcurrentForLimit(WrittenLimit),
+		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
+		ParsedBinaryOp(
+			ParsedAddOp,
+			ParsedDivideOp,
+			ParsedEqualOp,
+			ParsedGreaterEqualOp,
+			ParsedGreaterOp,
+			ParsedLessEqualOp,
+			ParsedLessOp,
+			ParsedModuloOp,
+			ParsedMultiplyOp,
+			ParsedNotEqualOp,
+			ParsedSubtractOp,
+		),
 		ParsedBuiltinTypeDecl,
+		ParsedCompoundAssignOp(
+			ParsedAssignAddOp,
+			ParsedAssignDivideOp,
+			ParsedAssignMultiplyOp,
+			ParsedAssignSubtractOp,
+		),
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
 			ForeignBlockParsedDecl,
@@ -120,6 +152,7 @@ import:
 			UnionParsedDecl,
 			VarParsedDecl,
 		),
+		ParsedDictEntry,
 		ParsedDimBinaryOp(
 			ParsedDimAddOp,
 			ParsedDimDivideOp,
@@ -127,8 +160,57 @@ import:
 			ParsedDimSubtractOp,
 		),
 		ParsedDimConstraint,
-		ParsedExpr(ParsedVoidExpr),
+		ParsedElseBranch,
+		ParsedExpr(
+			ParsedAssignExpr,
+			ParsedBinaryExpr,
+			ParsedBlockExpr,
+			ParsedBoolLiteralExpr,
+			ParsedBreakExpr,
+			ParsedBuiltinExpr,
+			ParsedCallExpr,
+			ParsedCharLiteralExpr,
+			ParsedCompoundAssignExpr,
+			ParsedConcurrentBlockExpr,
+			ParsedConcurrentForExpr,
+			ParsedContinueExpr,
+			ParsedDebugBlockExpr,
+			ParsedDetachExpr,
+			ParsedDictExpr,
+			ParsedFieldAccessExpr,
+			ParsedFloatLiteralExpr,
+			ParsedForExpr,
+			ParsedFunctionDeclExpr,
+			ParsedIfExpr,
+			ParsedIntLiteralExpr,
+			ParsedLambdaExpr,
+			ParsedListExpr,
+			ParsedLogicalExpr,
+			ParsedMatchExpr,
+			ParsedMissingExpr,
+			ParsedNameExpr,
+			ParsedOpaqueFromExpr,
+			ParsedOpaqueIntoExpr,
+			ParsedQuestionBindExpr,
+			ParsedRangeExpr,
+			ParsedRecordExpr,
+			ParsedRecordUpdateExpr,
+			ParsedSelectExpr,
+			ParsedStringInterpolationPartsExpr,
+			ParsedStringLiteralExpr,
+			ParsedSubscriptAssignExpr,
+			ParsedSubscriptExpr,
+			ParsedTupleDestructExpr,
+			ParsedTupleExpr,
+			ParsedUnaryExpr,
+			ParsedVarDeclExpr,
+			ParsedVectorExpr,
+			ParsedVoidExpr,
+			ParsedWhileExpr,
+			ParsedWithExpr,
+		),
 		ParsedFieldDecl,
+		ParsedForBinder(ParsedForNameBinder, ParsedForTupleBinder),
 		ParsedForeignBlockArg,
 		ParsedForeignFunctionDecl,
 		ParsedFunctionAnnotation(
@@ -142,12 +224,41 @@ import:
 		ParsedImplDecl,
 		ParsedImportDecl,
 		ParsedImportSymbol,
+		ParsedLambdaParam,
+		ParsedListPatternSpread(ParsedListSpreadName, ParsedListSpreadWildcard),
+		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
+		ParsedMatchCase,
 		ParsedModuleDoc,
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
+		ParsedPattern(
+			ParsedBoolPattern,
+			ParsedCharPattern,
+			ParsedConstructorPattern,
+			ParsedFloatPattern,
+			ParsedIntPattern,
+			ParsedListPattern,
+			ParsedMissingPattern,
+			ParsedNamePattern,
+			ParsedOrPattern,
+			ParsedQualifiedConstructorPattern,
+			ParsedStringPattern,
+			ParsedTuplePattern,
+			ParsedWildcardPattern,
+		),
 		ParsedProgram,
 		ParsedRecordDecl,
+		ParsedRecordExprField,
 		ParsedResourceCleanup,
+		ParsedSelectArm,
+		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
+		ParsedStringInterpolationPart(ParsedInterpolationExpr, ParsedInterpolationLiteral),
+		ParsedStringLiteralForm(
+			ParsedPipeStringLiteral,
+			ParsedPlainStringLiteral,
+			ParsedRawPipeStringLiteral,
+			ParsedRawStringLiteral,
+		),
 		ParsedTraitDecl,
 		ParsedTraitMethodDecl,
 		ParsedTraitReference,
@@ -167,9 +278,13 @@ import:
 		),
 		ParsedTypeParamDecl,
 		ParsedTypeParamKind(ParsedDimensionParameter, ParsedTypeParameter),
+		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		ParsedUnionDecl,
 		ParsedVarDecl,
 		ParsedVariantDecl,
+		ParsedWithBinding,
+		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
+		ParsedWithErrorMap,
 		parsed_identifier,
 	stage_03_parse/source_ast_finalize:
 		finalized_typecheck_program_ast,
@@ -186,12 +301,9 @@ import:
 
 
 ---
-Stands where a function or method body, or a global's value, will be until the
-body half of the adapter lands. Both sides of the declaration-level
-differential use this one value, so a body is compared only by whether the
-declaration has one.
+The sign the existing parser prefixes to a negative numeric pattern's digits.
 ---
-DECLARATION_ONLY_BODY: ParsedExpr = ParsedVoidExpr(compiler_prelude_source_location())
+private NEGATIVE_SIGN: String = "-"
 
 ---
 Stands for a by-key index entry whose key has no row.
@@ -211,6 +323,10 @@ Why the tables could not be rebuilt as the existing front end's AST.
 - `MissingTableRow(table, index)`: a row the tables should hold is not there.
 - `NotAWrittenType(node)`: a node in a type position has a kind no written type
   has.
+- `MalformedNode(node, kind)`: a body node's children are not the kinds, or not
+  as many, as its kind documents (`NodeKind` in the stage's row kinds).
+- `BodyRootNotAnExpression(node)`: the node a body row names as its root is not
+  an expression.
 - `ModuleWithoutRequest(module)`: a module no root, implicit request or import
   loaded, so it has no name.
 - `GraphRejected(errors)`: the existing graph validation refused the rebuilt
@@ -219,6 +335,8 @@ Why the tables could not be rebuilt as the existing front end's AST.
 union LegacyAdapterError:
 	MissingTableRow(DiscoveryTable, Int)
 	NotAWrittenType(Int)
+	MalformedNode(Int, Kinds.NodeKind)
+	BodyRootNotAnExpression(Int)
 	ModuleWithoutRequest(Int)
 	GraphRejected(List[FrontendGraphServiceError])
 
@@ -232,6 +350,10 @@ pure func legacy_adapter_error_message(error: LegacyAdapterError) -> String:
 			"the tables hold no row ${index} of ${discovery_table_name(table)}"
 		NotAWrittenType(node):
 			"node ${node} is in a type position but is not a written type"
+		BodyRootNotAnExpression(node):
+			"node ${node} is the root of a body but is not an expression"
+		MalformedNode(node, kind):
+			"node ${node} (${Kinds.node_kind_name(kind)}) does not have the children its kind documents"
 		ModuleWithoutRequest(module):
 			"module ${module} was loaded by no root, implicit request or import"
 		GraphRejected(errors):
@@ -1561,24 +1683,1366 @@ private pure func signature_of_definition(
 
 
 ---
-The body of `definition`: the placeholder when it has one.
+The body of `definition` when it has one.
 ---
 private pure func legacy_body(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	definition: Int,
 ) -> Result[Option[ParsedExpr], LegacyAdapterError]:
 	body_row ?= optional_row(reader.body_of, definition, BodyTable)
 
 	match body_row:
-		Some(_):
-			Ok(Some(DECLARATION_ONLY_BODY))
+		Some(row):
+			root ?= body_expression(reader, bodies, row)
+			Ok(Some(root))
 		None:
 			Ok(None)
+
+
+---
+The expression rooted at body row `body_row`'s root.
+---
+private pure func body_expression(
+	reader: DeclarationReader,
+	bodies: ModuleBodies,
+	body_row: Int,
+) -> Result[ParsedExpr, LegacyAdapterError]:
+	body ?= present(
+		Tables.body_row_at(reader.tables, body_row),
+		BodyTable,
+		body_row,
+	)
+	root: Int = node_id_index(body.root)
+	value ?= present(
+		bodies.built.get(root - bodies.first_node),
+		NodeTable,
+		root,
+	)
+
+	match value:
+		BuiltExpression(expression):
+			Ok(expression)
+		_:
+			Err(BodyRootNotAnExpression(root))
+
+
+-- Bodies.
+---
+What the pass over a module's nodes holds for one node. A parent takes its
+children's values by kind, so each kind a parent can take is one variant;
+`legacy_expression_child` and its siblings turn a child of another variant
+into `MalformedNode`. A written type is not rebuilt in the pass: its parent
+reads it with `legacy_type` when it needs it, so `BuiltTypeNode` only says
+that the child is one.
+---
+private union BuiltNode:
+	BuiltExpression(ParsedExpr)
+	BuiltPattern(ParsedPattern)
+	BuiltTypeNode
+	BuiltInterpolationText(String)
+	BuiltRecordField(ParsedRecordExprField)
+	BuiltDictEntry(ParsedDictEntry)
+	BuiltMatchCase(ParsedMatchCase)
+	BuiltSelectArm(ParsedSelectArm)
+	BuiltLambdaParameter(ParsedLambdaParam)
+	BuiltBinder(ParsedIdentifier)
+	BuiltTupleBinder(List[ParsedIdentifier], SourceLocation)
+	BuiltConcurrentParameter(ConcurrentParameterValue)
+	BuiltWithBinding(ParsedWithBinding)
+	BuiltWithErrorMap(ParsedWithErrorMap)
+	BuiltQualifier(ParsedIdentifier)
+	BuiltListSpread(ParsedListPatternSpread)
+	NotYetBuilt
+
+
+---
+A `name: value` parameter of a `concurrent` block or `concurrently(...)`; `name`
+is compared with the vocabulary's `max_threads`, `limit` and `timeout`, and
+`count` is the integer the stage read from a `max_threads` or `limit` literal.
+---
+private record ConcurrentParameterValue {
+	name: TableNameId,
+	value: ParsedExpr,
+	count: Option[Int]
+}
+
+
+---
+The rebuilt nodes of one module: `built[i]` is the value of node `first_node + i`.
+---
+private record ModuleBodies {
+	first_node: Int,
+	built: List[BuiltNode]
+}
+
+
+---
+The node being rebuilt, as its pass sees it: its position in the table, its
+row, the position of the module's first node, its span as a location, and the
+span of the name it carries (its own span unless a `NodeNameSpanRow` says the
+name is narrower).
+---
+private struct NodeView {
+	index: Int,
+	first_node: Int,
+	row: NodeRow,
+	location: SourceLocation,
+	name_span: Span
+}
+
+
+---
+Rebuilds the nodes of `module_row` in table order. The table is post-order,
+so each node's children are rebuilt before it is and the pass is one forward
+walk: no routine recurses over a body, and a body nested as deep as the
+source allows costs the same as a flat one. Values are kept by node position
+rather than on a stack because a local function's signature and body roots sit
+between the siblings of the statements around it, which a stack would have to
+skip.
+---
+private pure func legacy_module_bodies(
+	reader: DeclarationReader,
+	module_row: ModuleRow,
+) -> Result[ModuleBodies, LegacyAdapterError]:
+	first_node: Int = module_row.nodes.first
+	count: Int = module_row.nodes.count
+	var built: List[BuiltNode] = repeat(NotYetBuilt, count)
+	var position: Int = 0
+	var failure: Option[LegacyAdapterError] = None
+	var name_row: Int = first_name_span_row(reader, first_node)
+	var name_node: Int = Tables.node_name_span_row_node(reader.tables, name_row)
+
+	while failure.is_none() and position < count:
+		index: Int = first_node + position
+		row: NodeRow = Tables.node_row(reader.tables, node_id_at_row(index))
+		var name_span: Span = row.span
+
+		if name_node == index:
+			match Tables.node_name_span_row_span(reader.tables, name_row):
+				Some(written):
+					name_span = written
+				None:
+					failure = Some(MissingTableRow(NodeNameSpanTable, name_row))
+
+			name_row += 1
+			name_node = Tables.node_name_span_row_node(reader.tables, name_row)
+		else if needs_name_span_row(row.kind, row.children.count):
+			-- The node's name is narrower than the node, so its span is a row's.
+			failure = Some(MissingTableRow(NodeNameSpanTable, index))
+
+		view: NodeView = {
+			index = index,
+			first_node = first_node,
+			row = row,
+			location = legacy_location(row.span),
+			name_span = name_span
+		}
+
+		match legacy_node(reader, built, view):
+			Ok(value):
+				built = built.set(position, value)
+			Err(error):
+				failure = Some(error)
+
+		position += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				first_node = first_node,
+				built = built,
+			})
+
+
+---
+The first name span row that belongs to a node at or after `first_node`: a binary
+search over the rows, which are sorted by node.
+---
+private pure func first_name_span_row(reader: DeclarationReader, first_node: Int) -> Int:
+	var low: Int = 0
+	var high: Int = Tables.node_name_span_count(reader.tables)
+
+	while low < high:
+		middle: Int = (low + high) / 2
+
+		if Tables.node_name_span_row_node(reader.tables, middle) < first_node:
+			low = middle + 1
+		else:
+			high = middle
+
+	low
+
+
+private pure func malformed(view: NodeView) -> LegacyAdapterError:
+	MalformedNode(view.index, view.row.kind)
+
+
+---
+The id of child `ordinal` of the node.
+---
+private pure func child_id(
+	reader: DeclarationReader,
+	view: NodeView,
+	ordinal: Int,
+) -> Result[NodeId, LegacyAdapterError]:
+	if ordinal < 0 or ordinal >= view.row.children.count:
+		Err(malformed(view))
+	else:
+		slot: Int = view.row.children.first + ordinal
+		present(
+			Tables.node_child_row_at(reader.tables, slot),
+			NodeChildTable,
+			slot,
+		)
+
+
+---
+The value of child `ordinal` of the node. Total: a child that has no row, or
+that the pass has not reached, is `NotYetBuilt`, which no parent takes, so the
+parent reports `MalformedNode`. The freeze invariants rule both out for a table
+the stage froze (a child's edge is in range and the child precedes its parent),
+and a lookup that cannot fail does not need a `Result` per child.
+---
+private pure func child_value(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	ordinal: Int,
+) -> BuiltNode:
+	if ordinal < 0 or ordinal >= view.row.children.count:
+		NotYetBuilt
+	else:
+		match Tables.node_child_row_at(reader.tables, view.row.children.first + ordinal):
+			Some(child):
+				built.get_or(node_id_index(child) - view.first_node, NotYetBuilt)
+			None:
+				NotYetBuilt
+
+
+private pure func child_expression(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	ordinal: Int,
+) -> Result[ParsedExpr, LegacyAdapterError]:
+	match child_value(reader, built, view, ordinal):
+		BuiltExpression(expression):
+			Ok(expression)
+		_:
+			Err(malformed(view))
+
+
+private pure func child_pattern(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	ordinal: Int,
+) -> Result[ParsedPattern, LegacyAdapterError]:
+	match child_value(reader, built, view, ordinal):
+		BuiltPattern(pattern):
+			Ok(pattern)
+		_:
+			Err(malformed(view))
+
+
+---
+The written type of child `ordinal`.
+---
+private pure func child_written_type(
+	reader: DeclarationReader,
+	view: NodeView,
+	ordinal: Int,
+) -> Result[ParsedTypeExpr, LegacyAdapterError]:
+	child ?= child_id(reader, view, ordinal)
+	legacy_type(reader, child)
+
+
+---
+Whether child `ordinal` is a written type.
+---
+private pure func child_is_type(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	ordinal: Int,
+) -> Result[Bool, LegacyAdapterError]:
+	match child_value(reader, built, view, ordinal):
+		BuiltTypeNode:
+			Ok(True)
+		_:
+			Ok(False)
+
+
+---
+The values of children `first_ordinal` up to (not including) `end_ordinal` that
+`extract` takes; a child it does not take is `MalformedNode`. A loop with a
+failure variable, not `?=`, which a loop body may not use.
+---
+private pure func collected_children[T](
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	first_ordinal: Int,
+	end_ordinal: Int,
+	extract: pure (BuiltNode) -> Option[T],
+) -> Result[List[T], LegacyAdapterError]:
+	var items: List[T] = []
+	var failure: Option[LegacyAdapterError] = None
+	var ordinal: Int = first_ordinal
+
+	while failure.is_none() and ordinal < end_ordinal:
+		match extract(child_value(reader, built, view, ordinal)):
+			Some(item):
+				items = items.append(item)
+			None:
+				failure = Some(malformed(view))
+
+		ordinal += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(items)
+
+
+private pure func as_expression(value: BuiltNode) -> Option[ParsedExpr]:
+	match value:
+		BuiltExpression(expression):
+			Some(expression)
+		_:
+			None
+
+
+private pure func as_pattern(value: BuiltNode) -> Option[ParsedPattern]:
+	match value:
+		BuiltPattern(found):
+			Some(found)
+		_:
+			None
+
+
+private pure func as_interpolation_part(value: BuiltNode) -> Option[ParsedStringInterpolationPart]:
+	match value:
+		BuiltInterpolationText(text):
+			Some(ParsedInterpolationLiteral(text))
+		BuiltExpression(hole):
+			Some(ParsedInterpolationExpr(hole))
+		_:
+			None
+
+
+private pure func as_record_field(value: BuiltNode) -> Option[ParsedRecordExprField]:
+	match value:
+		BuiltRecordField(field):
+			Some(field)
+		_:
+			None
+
+
+private pure func as_dict_entry(value: BuiltNode) -> Option[ParsedDictEntry]:
+	match value:
+		BuiltDictEntry(entry):
+			Some(entry)
+		_:
+			None
+
+
+private pure func as_match_case(value: BuiltNode) -> Option[ParsedMatchCase]:
+	match value:
+		BuiltMatchCase(found):
+			Some(found)
+		_:
+			None
+
+
+private pure func as_select_arm(value: BuiltNode) -> Option[ParsedSelectArm]:
+	match value:
+		BuiltSelectArm(arm):
+			Some(arm)
+		_:
+			None
+
+
+private pure func as_lambda_parameter(value: BuiltNode) -> Option[ParsedLambdaParam]:
+	match value:
+		BuiltLambdaParameter(parameter):
+			Some(parameter)
+		_:
+			None
+
+
+private pure func as_binder(value: BuiltNode) -> Option[ParsedIdentifier]:
+	match value:
+		BuiltBinder(identifier):
+			Some(identifier)
+		_:
+			None
+
+
+private pure func as_concurrent_parameter(value: BuiltNode) -> Option[ConcurrentParameterValue]:
+	match value:
+		BuiltConcurrentParameter(parameter):
+			Some(parameter)
+		_:
+			None
+
+
+private pure func child_expressions(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	first_ordinal: Int,
+	end_ordinal: Int,
+) -> Result[List[ParsedExpr], LegacyAdapterError]:
+	collected_children(reader, built, view, first_ordinal, end_ordinal, as_expression)
+
+
+---
+The span of the name a node carries (see `NodeNameSpanRow`) as a location.
+---
+private pure func node_name_location(view: NodeView) -> SourceLocation:
+	legacy_location(view.name_span)
+
+
+---
+The identifier a node names: its payload, spelled over the node's name span.
+---
+private pure func node_identifier(reader: DeclarationReader, view: NodeView) -> ParsedIdentifier:
+	legacy_identifier(reader, name_id_at_row(view.row.payload), view.name_span)
+
+
+---
+The identifier a node names when the node is the name alone.
+---
+private pure func whole_node_identifier(
+	reader: DeclarationReader,
+	view: NodeView,
+) -> ParsedIdentifier:
+	legacy_identifier(reader, name_id_at_row(view.row.payload), view.row.span)
+
+
+private pure func node_literal(reader: DeclarationReader, view: NodeView) -> String:
+	literal_string(reader, literal_id_at_row(view.row.payload))
+
+
+private pure func expression(value: ParsedExpr) -> Result[BuiltNode, LegacyAdapterError]:
+	Ok(BuiltExpression(value))
+
+
+private pure func pattern(value: ParsedPattern) -> Result[BuiltNode, LegacyAdapterError]:
+	Ok(BuiltPattern(value))
+
+
+---
+The value of one node, from the values of its children.
+---
+private pure func legacy_node(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	location: SourceLocation = view.location
+
+	match view.row.kind:
+		Kinds.IdentifierNode:
+			expression(ParsedNameExpr(whole_node_identifier(reader, view)))
+		Kinds.IntegerLiteralNode:
+			expression(ParsedIntLiteralExpr(node_literal(reader, view), location))
+		Kinds.FloatLiteralNode:
+			expression(ParsedFloatLiteralExpr(node_literal(reader, view), location))
+		Kinds.StringLiteralNode:
+			expression(
+				ParsedStringLiteralExpr(
+					node_literal(reader, view),
+					ParsedPlainStringLiteral,
+					location,
+				),
+			)
+		Kinds.RawStringLiteralNode:
+			expression(
+				ParsedStringLiteralExpr(
+					node_literal(reader, view),
+					ParsedRawStringLiteral,
+					location,
+				),
+			)
+		Kinds.PipeStringLiteralNode:
+			expression(
+				ParsedStringLiteralExpr(
+					node_literal(reader, view),
+					ParsedPipeStringLiteral,
+					location,
+				),
+			)
+		Kinds.RawPipeStringLiteralNode:
+			expression(
+				ParsedStringLiteralExpr(
+					node_literal(reader, view),
+					ParsedRawPipeStringLiteral,
+					location,
+				),
+			)
+		Kinds.InterpolatedStringNode:
+			legacy_interpolated_string(reader, built, view, False)
+		Kinds.InterpolatedPipeStringNode:
+			legacy_interpolated_string(reader, built, view, True)
+		Kinds.InterpolationTextNode:
+			Ok(BuiltInterpolationText(node_literal(reader, view)))
+		Kinds.TrueLiteralNode:
+			expression(ParsedBoolLiteralExpr(True, location))
+		Kinds.FalseLiteralNode:
+			expression(ParsedBoolLiteralExpr(False, location))
+		Kinds.CharLiteralNode:
+			expression(ParsedCharLiteralExpr(view.row.payload, location))
+		Kinds.NegateNode:
+			operand ?= child_expression(reader, built, view, 0)
+			expression(ParsedUnaryExpr(ParsedNegateOp, operand, location))
+		Kinds.NotNode:
+			operand ?= child_expression(reader, built, view, 0)
+			expression(ParsedUnaryExpr(ParsedNotOp, operand, location))
+		Kinds.DetachNode:
+			operand ?= child_expression(reader, built, view, 0)
+			expression(ParsedDetachExpr(operand, location))
+		Kinds.AddNode:
+			legacy_binary(reader, built, view, ParsedAddOp)
+		Kinds.SubtractNode:
+			legacy_binary(reader, built, view, ParsedSubtractOp)
+		Kinds.MultiplyNode:
+			legacy_binary(reader, built, view, ParsedMultiplyOp)
+		Kinds.DivideNode:
+			legacy_binary(reader, built, view, ParsedDivideOp)
+		Kinds.ModuloNode:
+			legacy_binary(reader, built, view, ParsedModuloOp)
+		Kinds.EqualNode:
+			legacy_binary(reader, built, view, ParsedEqualOp)
+		Kinds.NotEqualNode:
+			legacy_binary(reader, built, view, ParsedNotEqualOp)
+		Kinds.LessNode:
+			legacy_binary(reader, built, view, ParsedLessOp)
+		Kinds.LessEqualNode:
+			legacy_binary(reader, built, view, ParsedLessEqualOp)
+		Kinds.GreaterNode:
+			legacy_binary(reader, built, view, ParsedGreaterOp)
+		Kinds.GreaterEqualNode:
+			legacy_binary(reader, built, view, ParsedGreaterEqualOp)
+		Kinds.AndNode:
+			legacy_logical(reader, built, view, ParsedAndOp)
+		Kinds.OrNode:
+			legacy_logical(reader, built, view, ParsedOrOp)
+		Kinds.RangeNode:
+			left ?= child_expression(reader, built, view, 0)
+			right ?= child_expression(reader, built, view, 1)
+			expression(ParsedRangeExpr(left, right, location))
+		Kinds.CallNode:
+			callee ?= child_expression(reader, built, view, 0)
+			arguments ?= child_expressions(reader, built, view, 1, view.row.children.count)
+			expression(ParsedCallExpr(callee, arguments, location))
+		Kinds.FieldAccessNode:
+			receiver ?= child_expression(reader, built, view, 0)
+			expression(ParsedFieldAccessExpr(receiver, node_identifier(reader, view), location))
+		Kinds.SubscriptNode:
+			target ?= child_expression(reader, built, view, 0)
+			indices ?= child_expressions(reader, built, view, 1, view.row.children.count)
+			expression(ParsedSubscriptExpr(target, indices, location))
+		Kinds.ListLiteralNode:
+			items ?= child_expressions(reader, built, view, 0, view.row.children.count)
+			expression(ParsedListExpr(items, location))
+		Kinds.TupleNode:
+			items ?= child_expressions(reader, built, view, 0, view.row.children.count)
+			expression(ParsedTupleExpr(items, location))
+		Kinds.VectorLiteralNode:
+			items ?= child_expressions(reader, built, view, 0, view.row.children.count)
+			expression(ParsedVectorExpr(items, location))
+		Kinds.RecordLiteralNode:
+			fields ?= legacy_record_fields(reader, built, view, 0)
+			expression(ParsedRecordExpr(fields, location))
+		Kinds.RecordUpdateNode:
+			base ?= child_expression(reader, built, view, 0)
+			fields ?= legacy_record_fields(reader, built, view, 1)
+			expression(ParsedRecordUpdateExpr(base, fields, location))
+		Kinds.RecordFieldNode:
+			value ?= child_expression(reader, built, view, 0)
+			Ok(BuiltRecordField({
+				name = node_identifier(reader, view),
+				value = value,
+				span = location,
+			}))
+		Kinds.DictLiteralNode:
+			entries ?= collected_children(
+				reader,
+				built,
+				view,
+				0,
+				view.row.children.count,
+				as_dict_entry,
+			)
+			expression(ParsedDictExpr(entries, location))
+		Kinds.DictEntryNode:
+			key ?= child_expression(reader, built, view, 0)
+			value ?= child_expression(reader, built, view, 1)
+			Ok(BuiltDictEntry({
+				key = key,
+				value = value,
+				span = location,
+			}))
+		Kinds.IntoOpaqueNode:
+			written ?= child_written_type(reader, view, 0)
+			value ?= child_expression(reader, built, view, 1)
+			expression(ParsedOpaqueIntoExpr(written, value, location))
+		Kinds.FromOpaqueNode:
+			written ?= child_written_type(reader, view, 0)
+			value ?= child_expression(reader, built, view, 1)
+			expression(ParsedOpaqueFromExpr(written, value, location))
+		Kinds.BlockNode:
+			items ?= child_expressions(reader, built, view, 0, view.row.children.count)
+			expression(ParsedBlockExpr(items, location))
+		Kinds.IfNode:
+			legacy_if(reader, built, view)
+		Kinds.MatchNode:
+			scrutinee ?= child_expression(reader, built, view, 0)
+			cases ?= collected_children(
+				reader,
+				built,
+				view,
+				1,
+				view.row.children.count,
+				as_match_case,
+			)
+			expression(ParsedMatchExpr(scrutinee, cases, location))
+		Kinds.MatchCaseNode:
+			case_pattern ?= child_pattern(reader, built, view, 0)
+			body ?= child_expression(reader, built, view, 1)
+			Ok(BuiltMatchCase({
+				pattern = case_pattern,
+				body = body,
+				span = location,
+			}))
+		Kinds.SelectNode:
+			arms ?= collected_children(
+				reader,
+				built,
+				view,
+				0,
+				view.row.children.count,
+				as_select_arm,
+			)
+			expression(ParsedSelectExpr(arms, location))
+		Kinds.SelectReceiveArmNode:
+			channel ?= child_expression(reader, built, view, 0)
+			body ?= child_expression(reader, built, view, 1)
+			Ok(BuiltSelectArm({
+				kind = ParsedSelectReceiveArm(
+					node_identifier(reader, view),
+					channel,
+				),
+				body = body,
+				span = location,
+			}))
+		Kinds.SelectSealedArmNode:
+			channel ?= child_expression(reader, built, view, 0)
+			body ?= child_expression(reader, built, view, 1)
+			Ok(BuiltSelectArm({
+				kind = ParsedSelectSealedArm(channel),
+				body = body,
+				span = location,
+			}))
+		Kinds.SelectAfterArmNode:
+			timeout ?= child_expression(reader, built, view, 0)
+			body ?= child_expression(reader, built, view, 1)
+			Ok(BuiltSelectArm({
+				kind = ParsedSelectAfterArm(timeout),
+				body = body,
+				span = location,
+			}))
+		Kinds.WithNode:
+			body ?= child_expression(reader, built, view, 1)
+
+			match child_value(reader, built, view, 0):
+				BuiltWithBinding(binding):
+					expression(ParsedWithExpr(binding, body, location))
+				_:
+					Err(malformed(view))
+		Kinds.WithBindingNode:
+			legacy_with_binding(reader, built, view, ParsedWithPlainBinding)
+		Kinds.WithTryBindingNode:
+			legacy_with_binding(reader, built, view, ParsedWithTryBinding)
+		Kinds.WithErrorMapNode:
+			value ?= child_expression(reader, built, view, 0)
+			Ok(BuiltWithErrorMap({
+				name = node_identifier(reader, view),
+				value = value,
+				span = location,
+			}))
+		Kinds.DebugBlockNode:
+			body ?= child_expression(reader, built, view, 0)
+			expression(ParsedDebugBlockExpr(body, location))
+		Kinds.LambdaNode:
+			legacy_lambda(reader, built, view, False)
+		Kinds.PureLambdaNode:
+			legacy_lambda(reader, built, view, True)
+		Kinds.LambdaParameterNode:
+			legacy_lambda_parameter(reader, view)
+		Kinds.LocalFunctionNode:
+			legacy_local_function(reader, built, view)
+		Kinds.WhileNode:
+			condition ?= child_expression(reader, built, view, 0)
+			body ?= child_expression(reader, built, view, 1)
+			expression(ParsedWhileExpr(condition, body, location))
+		Kinds.ForNode:
+			legacy_for(reader, built, view)
+		Kinds.LoopBinderNode:
+			Ok(BuiltBinder(whole_node_identifier(reader, view)))
+		Kinds.TupleLoopBinderNode:
+			names ?= legacy_binder_names(reader, built, view, view.row.children.count)
+			Ok(BuiltTupleBinder(names, location))
+		Kinds.ConcurrentForNode:
+			legacy_concurrent_for(reader, built, view)
+		Kinds.ConcurrentBlockNode:
+			legacy_concurrent_block(reader, built, view)
+		Kinds.ConcurrentParameterNode:
+			value ?= child_expression(reader, built, view, 0)
+			Ok(BuiltConcurrentParameter({
+				name = name_id_at_row(view.row.payload),
+				value = value,
+				count = Tables.concurrency_count(reader.tables, node_id_at_row(view.index)),
+			}))
+		Kinds.BreakNode:
+			expression(ParsedBreakExpr(location))
+		Kinds.ContinueNode:
+			expression(ParsedContinueExpr(location))
+		Kinds.VoidNode:
+			expression(ParsedVoidExpr(location))
+		Kinds.BuiltinNode:
+			expression(ParsedBuiltinExpr(None, location))
+		Kinds.NamedBuiltinNode:
+			expression(ParsedBuiltinExpr(Some(node_literal(reader, view)), location))
+		Kinds.MissingExpressionNode:
+			expression(ParsedMissingExpr(location))
+		Kinds.VarDeclarationNode:
+			legacy_binding(reader, built, view, True)
+		Kinds.TypedBindingNode:
+			legacy_binding(reader, built, view, False)
+		Kinds.AssignmentNode:
+			value ?= child_expression(reader, built, view, 0)
+			expression(ParsedAssignExpr(node_identifier(reader, view), value, location))
+		Kinds.QuestionBindNode:
+			legacy_question_bind(reader, built, view)
+		Kinds.AddAssignNode:
+			legacy_compound_assignment(reader, built, view, ParsedAssignAddOp)
+		Kinds.SubtractAssignNode:
+			legacy_compound_assignment(reader, built, view, ParsedAssignSubtractOp)
+		Kinds.MultiplyAssignNode:
+			legacy_compound_assignment(reader, built, view, ParsedAssignMultiplyOp)
+		Kinds.DivideAssignNode:
+			legacy_compound_assignment(reader, built, view, ParsedAssignDivideOp)
+		Kinds.SubscriptAssignmentNode:
+			legacy_subscript_assignment(reader, built, view)
+		Kinds.TupleDestructureNode:
+			value_ordinal: Int = view.row.children.count - 1
+			names ?= legacy_binder_names(reader, built, view, value_ordinal)
+			value ?= child_expression(reader, built, view, value_ordinal)
+			expression(ParsedTupleDestructExpr(names, value, location))
+		Kinds.DestructureBinderNode:
+			Ok(BuiltBinder(whole_node_identifier(reader, view)))
+		Kinds.WildcardPatternNode:
+			pattern(ParsedWildcardPattern(location))
+		Kinds.NamePatternNode:
+			pattern(ParsedNamePattern(whole_node_identifier(reader, view)))
+		Kinds.IntegerPatternNode:
+			pattern(ParsedIntPattern(node_literal(reader, view), location))
+		Kinds.NegativeIntegerPatternNode:
+			pattern(ParsedIntPattern(NEGATIVE_SIGN + node_literal(reader, view), location))
+		Kinds.FloatPatternNode:
+			pattern(ParsedFloatPattern(node_literal(reader, view), location))
+		Kinds.NegativeFloatPatternNode:
+			pattern(ParsedFloatPattern(NEGATIVE_SIGN + node_literal(reader, view), location))
+		Kinds.StringPatternNode:
+			pattern(
+				ParsedStringPattern(
+					node_literal(reader, view),
+					ParsedPlainStringLiteral,
+					location,
+				),
+			)
+		Kinds.RawStringPatternNode:
+			pattern(
+				ParsedStringPattern(
+					node_literal(reader, view),
+					ParsedRawStringLiteral,
+					location,
+				),
+			)
+		Kinds.PipeStringPatternNode:
+			pattern(
+				ParsedStringPattern(
+					node_literal(reader, view),
+					ParsedPipeStringLiteral,
+					location,
+				),
+			)
+		Kinds.RawPipeStringPatternNode:
+			pattern(
+				ParsedStringPattern(
+					node_literal(reader, view),
+					ParsedRawPipeStringLiteral,
+					location,
+				),
+			)
+		Kinds.CharPatternNode:
+			pattern(ParsedCharPattern(view.row.payload, location))
+		Kinds.TruePatternNode:
+			pattern(ParsedBoolPattern(True, location))
+		Kinds.FalsePatternNode:
+			pattern(ParsedBoolPattern(False, location))
+		Kinds.ConstructorPatternNode:
+			arguments ?= legacy_patterns(reader, built, view, 0)
+			pattern(ParsedConstructorPattern(node_identifier(reader, view), arguments, location))
+		Kinds.QualifiedConstructorPatternNode:
+			arguments ?= legacy_patterns(reader, built, view, 1)
+
+			match child_value(reader, built, view, 0):
+				BuiltQualifier(qualifier):
+					pattern(
+						ParsedQualifiedConstructorPattern(
+							qualifier,
+							node_identifier(reader, view),
+							arguments,
+							location,
+						),
+					)
+				_:
+					Err(malformed(view))
+		Kinds.PatternQualifierNode:
+			Ok(BuiltQualifier(whole_node_identifier(reader, view)))
+		Kinds.TuplePatternNode:
+			elements ?= legacy_patterns(reader, built, view, 0)
+			pattern(ParsedTuplePattern(elements, location))
+		Kinds.ListPatternNode:
+			legacy_list_pattern(reader, built, view)
+		Kinds.ListSpreadNameNode:
+			Ok(BuiltListSpread(ParsedListSpreadName(node_identifier(reader, view))))
+		Kinds.ListSpreadWildcardNode:
+			Ok(BuiltListSpread(ParsedListSpreadWildcard(node_name_location(view))))
+		Kinds.OrPatternNode:
+			alternatives ?= legacy_patterns(reader, built, view, 0)
+			pattern(ParsedOrPattern(alternatives, location))
+		Kinds.MissingPatternNode:
+			pattern(ParsedMissingPattern(location))
+		Kinds.NamedTypeNode | Kinds.QualifiedTypeNode | Kinds.TypeQualifierNode | Kinds.BoundedTypeNode | Kinds.TypeBoundNode | Kinds.QualifiedTypeBoundNode | Kinds.DimensionNameTypeNode | Kinds.VariadicDimensionNameTypeNode | Kinds.DimensionWildcardTypeNode | Kinds.VariadicDimensionWildcardTypeNode | Kinds.DimensionLiteralTypeNode | Kinds.DimensionAddTypeNode | Kinds.DimensionSubtractTypeNode | Kinds.DimensionMultiplyTypeNode | Kinds.DimensionDivideTypeNode | Kinds.RangeTypeNode | Kinds.TupleTypeNode | Kinds.FunctionTypeNode | Kinds.PureFunctionTypeNode | Kinds.ArrayTypeNode | Kinds.MissingTypeNode:
+			Ok(BuiltTypeNode)
+
+
+-- Rebuilding constructs from their children.
+private pure func legacy_binary(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	operator: ParsedBinaryOp,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	left ?= child_expression(reader, built, view, 0)
+	right ?= child_expression(reader, built, view, 1)
+	expression(ParsedBinaryExpr(operator, left, right, view.location))
+
+
+private pure func legacy_logical(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	operator: ParsedLogicalOp,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	left ?= child_expression(reader, built, view, 0)
+	right ?= child_expression(reader, built, view, 1)
+	expression(ParsedLogicalExpr(operator, left, right, view.location))
+
+
+---
+The parts of an interpolated string: its text pieces and its holes in source
+order, as the existing parser has them once the holes are parsed (the finalized
+form, `ParsedStringInterpolationPartsExpr`).
+---
+private pure func legacy_interpolated_string(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	is_multiline: Bool,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	parts ?= collected_children(
+		reader,
+		built,
+		view,
+		0,
+		view.row.children.count,
+		as_interpolation_part,
+	)
+	expression(ParsedStringInterpolationPartsExpr(parts, is_multiline, view.location))
+
+
+private pure func legacy_record_fields(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	first_ordinal: Int,
+) -> Result[List[ParsedRecordExprField], LegacyAdapterError]:
+	collected_children(reader, built, view, first_ordinal, view.row.children.count, as_record_field)
+
+
+private pure func legacy_patterns(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	first_ordinal: Int,
+) -> Result[List[ParsedPattern], LegacyAdapterError]:
+	collected_children(reader, built, view, first_ordinal, view.row.children.count, as_pattern)
+
+
+---
+`[p, ...]`, with its spread when the last child is one.
+---
+private pure func legacy_list_pattern(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	count: Int = view.row.children.count
+
+	match child_value(reader, built, view, count - 1):
+		BuiltListSpread(spread):
+			elements ?= collected_children(reader, built, view, 0, count - 1, as_pattern)
+			pattern(ParsedListPattern(elements, Some(spread), view.location))
+		_:
+			elements ?= collected_children(reader, built, view, 0, count, as_pattern)
+			pattern(ParsedListPattern(elements, None, view.location))
+
+
+---
+`if condition: then [else ...]`: the else branch, when written, is the third
+child, with the `else` keyword's span from the node's keyword row.
+---
+private pure func legacy_if(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	condition ?= child_expression(reader, built, view, 0)
+	then_branch ?= child_expression(reader, built, view, 1)
+	else_branch ?= legacy_else_branch(reader, built, view)
+	expression(ParsedIfExpr(condition, then_branch, else_branch, view.location))
+
+
+private pure func legacy_else_branch(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[Option[ParsedElseBranch], LegacyAdapterError]:
+	if view.row.children.count > 2:
+		body ?= child_expression(reader, built, view, 2)
+		keyword ?= present(
+			Tables.else_keyword_span(reader.tables, node_id_at_row(view.index)),
+			ElseKeywordTable,
+			view.index,
+		)
+		Ok(Some({
+			keyword = legacy_location(keyword),
+			body = body,
+		}))
+	else:
+		Ok(None)
+
+
+---
+`with name [: T] = value` or `with name [: T] ?= value [on e => mapped]`: the
+type when written, the value, then the error map when written. The type is
+told from the value by the child's kind, as the node table documents.
+---
+private pure func legacy_with_binding(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	kind: ParsedWithBindingKind,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	typed ?= child_is_type(reader, built, view, 0)
+
+	value_ordinal: Int = if typed:
+		1
+	else:
+		0
+
+	type_expr ?= optional_child_type(reader, view, typed)
+	value ?= child_expression(reader, built, view, value_ordinal)
+	error_map ?= legacy_error_map(reader, built, view, value_ordinal + 1)
+	Ok(BuiltWithBinding({
+		name = node_identifier(reader, view),
+		type_expr = type_expr,
+		value = value,
+		kind = kind,
+		error_map = error_map,
+		span = view.location,
+	}))
+
+
+private pure func legacy_error_map(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	ordinal: Int,
+) -> Result[Option[ParsedWithErrorMap], LegacyAdapterError]:
+	if ordinal < view.row.children.count:
+		match child_value(reader, built, view, ordinal):
+			BuiltWithErrorMap(written):
+				Ok(Some(written))
+			_:
+				Err(malformed(view))
+	else:
+		Ok(None)
+
+
+---
+The type child 0 when `typed`, which the caller read from the child's kind.
+---
+private pure func optional_child_type(
+	reader: DeclarationReader,
+	view: NodeView,
+	typed: Bool,
+) -> Result[Option[ParsedTypeExpr], LegacyAdapterError]:
+	if typed:
+		written ?= child_written_type(reader, view, 0)
+		Ok(Some(written))
+	else:
+		Ok(None)
+
+
+---
+`func(params) [-> R]: body`: the parameters, the return type when written, then
+the body. The return type is the child before the body when it is a written
+type; a parameter is never one.
+---
+private pure func legacy_lambda(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	is_pure: Bool,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	count: Int = view.row.children.count
+	body_ordinal: Int = count - 1
+	typed ?= lambda_has_return_type(reader, built, view)
+
+	parameter_end: Int = if typed:
+		body_ordinal - 1
+	else:
+		body_ordinal
+
+	parameters ?= collected_children(reader, built, view, 0, parameter_end, as_lambda_parameter)
+	return_type ?= optional_return_type(reader, view, typed, body_ordinal - 1)
+	body ?= child_expression(reader, built, view, body_ordinal)
+	expression(ParsedLambdaExpr(is_pure, parameters, return_type, body, view.location))
+
+
+private pure func lambda_has_return_type(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[Bool, LegacyAdapterError]:
+	count: Int = view.row.children.count
+
+	if count < 2:
+		Ok(False)
+	else:
+		child_is_type(reader, built, view, count - 2)
+
+
+private pure func optional_return_type(
+	reader: DeclarationReader,
+	view: NodeView,
+	typed: Bool,
+	ordinal: Int,
+) -> Result[Option[ParsedTypeExpr], LegacyAdapterError]:
+	if typed:
+		written ?= child_written_type(reader, view, ordinal)
+		Ok(Some(written))
+	else:
+		Ok(None)
+
+
+private pure func legacy_lambda_parameter(
+	reader: DeclarationReader,
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	type_expr ?= optional_child_type(reader, view, view.row.children.count > 0)
+	Ok(BuiltLambdaParameter({
+		name = node_identifier(reader, view),
+		type_expr = type_expr,
+		span = view.location,
+	}))
+
+
+---
+A function declared in a body. Its signature, type parameters and body are the
+definition's rows; its body root precedes this node, so it is already rebuilt.
+---
+private pure func legacy_local_function(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	definition: Int = definition_id_index(definition_id_at_row(view.row.payload))
+	definition_row ?= definition_at(reader, definition)
+	rebuilt: ModuleBodies = {
+		first_node = view.first_node,
+		built = built
+	}
+	function_decl ?= legacy_function(reader, rebuilt, definition, definition_row)
+	expression(ParsedFunctionDeclExpr(function_decl))
+
+
+---
+The names of a tuple binder: the identifiers among children `0` up to `end_ordinal`.
+---
+private pure func legacy_binder_names(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	end_ordinal: Int,
+) -> Result[List[ParsedIdentifier], LegacyAdapterError]:
+	collected_children(reader, built, view, 0, end_ordinal, as_binder)
+
+
+private pure func legacy_for_binder(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[ParsedForBinder, LegacyAdapterError]:
+	match child_value(reader, built, view, 0):
+		BuiltBinder(identifier):
+			Ok(ParsedForNameBinder(identifier))
+		BuiltTupleBinder(names, location):
+			Ok(ParsedForTupleBinder(names, location))
+		_:
+			Err(malformed(view))
+
+
+private pure func legacy_for(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	binder ?= legacy_for_binder(reader, built, view)
+	iterable ?= child_expression(reader, built, view, 1)
+	body ?= child_expression(reader, built, view, 2)
+	expression(ParsedForExpr(binder, iterable, body, view.location))
+
+
+---
+The parameter named `name_index`, or `None` when none is written.
+---
+private pure func concurrent_parameter(
+	parameters: List[ConcurrentParameterValue],
+	name_index: Int,
+) -> Option[ConcurrentParameterValue]:
+	parameters.find(pure func(parameter): table_name_index(parameter.name) == name_index)
+
+
+---
+The value of the parameter named `name_index`, or `None` when none is written.
+---
+private pure func concurrent_parameter_value(
+	parameters: List[ConcurrentParameterValue],
+	name_index: Int,
+) -> Option[ParsedExpr]:
+	concurrent_parameter(parameters, name_index).map(pure func(parameter): parameter.value)
+
+
+---
+The thread limit of a `concurrent(max_threads: n)` block: `n`, or the default
+when none is written.
+---
+private pure func legacy_thread_limit(
+	view: NodeView,
+	parameters: List[ConcurrentParameterValue],
+) -> Result[ConcurrentThreadLimit, LegacyAdapterError]:
+	match concurrent_parameter(parameters, MAX_THREADS_NAME_INDEX):
+		Some(parameter):
+			match parameter.count:
+				Some(count):
+					Ok(ThreadLimit(count))
+				None:
+					Err(malformed(view))
+		None:
+			Ok(DefaultThreadLimit)
+
+
+---
+The width of a `concurrently(limit: n)` loop. The parser rejects a loop without
+one, so a loop in an accepted module has it.
+---
+private pure func legacy_for_limit(
+	view: NodeView,
+	parameters: List[ConcurrentParameterValue],
+) -> Result[ConcurrentForLimit, LegacyAdapterError]:
+	match concurrent_parameter(parameters, LIMIT_NAME_INDEX):
+		Some(parameter):
+			match parameter.count:
+				Some(count):
+					Ok(WrittenLimit(count))
+				None:
+					Err(malformed(view))
+		None:
+			Err(malformed(view))
+
+
+private pure func legacy_concurrent_block(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	body_ordinal: Int = view.row.children.count - 1
+	parameters ?= collected_children(reader, built, view, 0, body_ordinal, as_concurrent_parameter)
+	body ?= child_expression(reader, built, view, body_ordinal)
+	max_threads ?= legacy_thread_limit(view, parameters)
+	expression(
+		ParsedConcurrentBlockExpr(
+			{
+				max_threads = max_threads,
+				timeout = concurrent_parameter_value(parameters, TIMEOUT_NAME_INDEX)
+			},
+			body,
+			view.location,
+		),
+	)
+
+
+---
+`for x in xs concurrently(limit: n, ...): body`: the binder, the iterable, the
+parameters, then the body. The existing AST has no tuple binder here; the
+parser rejects one.
+---
+private pure func legacy_concurrent_for(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	body_ordinal: Int = view.row.children.count - 1
+	iterable ?= child_expression(reader, built, view, 1)
+	parameters ?= collected_children(reader, built, view, 2, body_ordinal, as_concurrent_parameter)
+	body ?= child_expression(reader, built, view, body_ordinal)
+	limit ?= legacy_for_limit(view, parameters)
+
+	match child_value(reader, built, view, 0):
+		BuiltBinder(name):
+			expression(
+				ParsedConcurrentForExpr(
+					name,
+					iterable,
+					{
+						limit = limit,
+						timeout = concurrent_parameter_value(parameters, TIMEOUT_NAME_INDEX)
+					},
+					body,
+					view.location,
+				),
+			)
+		_:
+			Err(malformed(view))
+
+
+---
+The written type, when there is one, and the value of a `name [: T] = value`
+form: the type is the first child of two.
+---
+private pure func legacy_typed_value(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[(Option[ParsedTypeExpr], ParsedExpr), LegacyAdapterError]:
+	typed: Bool = view.row.children.count > 1
+
+	value_ordinal: Int = if typed:
+		1
+	else:
+		0
+
+	type_expr ?= optional_child_type(reader, view, typed)
+	value ?= child_expression(reader, built, view, value_ordinal)
+	Ok((type_expr, value))
+
+
+private pure func legacy_binding(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	is_mutable: Bool,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	typed_value ?= legacy_typed_value(reader, built, view)
+	expression(
+		ParsedVarDeclExpr(
+			node_identifier(reader, view),
+			typed_value[0],
+			typed_value[1],
+			is_mutable,
+			view.location,
+		),
+	)
+
+
+private pure func legacy_question_bind(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	typed_value ?= legacy_typed_value(reader, built, view)
+	expression(
+		ParsedQuestionBindExpr(
+			node_identifier(reader, view),
+			typed_value[0],
+			typed_value[1],
+			view.location,
+		),
+	)
+
+
+private pure func legacy_compound_assignment(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+	operator: ParsedCompoundAssignOp,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	value ?= child_expression(reader, built, view, 0)
+	expression(
+		ParsedCompoundAssignExpr(
+			node_identifier(reader, view),
+			operator,
+			value,
+			view.location,
+		),
+	)
+
+
+---
+`target[indices] = value`: the target's subscript is the first child, rebuilt as
+a subscript read, which this takes apart.
+---
+private pure func legacy_subscript_assignment(
+	reader: DeclarationReader,
+	built: List[BuiltNode],
+	view: NodeView,
+) -> Result[BuiltNode, LegacyAdapterError]:
+	subscript ?= child_expression(reader, built, view, 0)
+	value ?= child_expression(reader, built, view, 1)
+
+	match subscript:
+		ParsedSubscriptExpr(target, indices, _):
+			expression(ParsedSubscriptAssignExpr(target, indices, value, view.location))
+		_:
+			Err(malformed(view))
 
 
 -- Declarations.
 private pure func legacy_function(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	definition: Int,
 	row: DefinitionRow,
 ) -> Result[ParsedFunctionDecl, LegacyAdapterError]:
@@ -1590,7 +3054,7 @@ private pure func legacy_function(
 	dim_constraints ?= collected(constraint_rows.map(
 		pure func(constraint_row): legacy_dimension_constraint(reader, constraint_row),
 	))
-	body ?= legacy_body(reader, definition)
+	body ?= legacy_body(reader, bodies, definition)
 	annotations ?= legacy_annotations(reader, definition)
 	doc ?= legacy_documentation(reader, definition)
 
@@ -1798,6 +3262,7 @@ private pure func legacy_type_alias(
 
 private pure func legacy_trait(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	definition: Int,
 	row: DefinitionRow,
 ) -> Result[ParsedTraitDecl, LegacyAdapterError]:
@@ -1808,7 +3273,7 @@ private pure func legacy_trait(
 	))
 	members ?= legacy_members(reader, definition)
 	methods ?= collected(members.map(
-		pure func(method): legacy_trait_method(reader, method),
+		pure func(method): legacy_trait_method(reader, bodies, method),
 	))
 	doc ?= legacy_documentation(reader, definition)
 
@@ -1824,13 +3289,14 @@ private pure func legacy_trait(
 
 private pure func legacy_trait_method(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	method: Int,
 ) -> Result[ParsedTraitMethodDecl, LegacyAdapterError]:
 	row ?= definition_at(reader, method)
 	signature ?= signature_of_definition(reader, method)
 	params ?= legacy_params(reader, method)
 	return_type ?= legacy_definition_type(reader, method)
-	body ?= legacy_body(reader, method)
+	body ?= legacy_body(reader, bodies, method)
 	Ok({
 		name = legacy_identifier(reader, row.name, row.name_span),
 		params = params,
@@ -1843,13 +3309,14 @@ private pure func legacy_trait_method(
 
 private pure func legacy_impl(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	definition: Int,
 	row: DefinitionRow,
 ) -> Result[ParsedImplDecl, LegacyAdapterError]:
 	for_type ?= legacy_required_type(reader, definition)
 	members ?= legacy_members(reader, definition)
 	methods ?= collected(members.map(
-		pure func(method): legacy_impl_method(reader, method),
+		pure func(method): legacy_impl_method(reader, bodies, method),
 	))
 	doc ?= legacy_documentation(reader, definition)
 
@@ -1864,24 +3331,28 @@ private pure func legacy_impl(
 
 private pure func legacy_impl_method(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	method: Int,
 ) -> Result[ParsedFunctionDecl, LegacyAdapterError]:
 	row ?= definition_at(reader, method)
-	legacy_function(reader, method, row)
+	legacy_function(reader, bodies, method, row)
 
 
 private pure func legacy_global(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	definition: Int,
 	row: DefinitionRow,
 ) -> Result[ParsedVarDecl, LegacyAdapterError]:
 	type_expr ?= legacy_definition_type(reader, definition)
 	doc ?= legacy_documentation(reader, definition)
+	value_row ?= required_row(reader.body_of, definition, BodyTable)
+	value ?= body_expression(reader, bodies, value_row)
 
 	Ok({
 		name = legacy_identifier(reader, row.name, row.name_span),
 		type_expr = type_expr,
-		value = DECLARATION_ONLY_BODY,
+		value = value,
 		is_mutable = row.kind == Kinds.MutableGlobalDefinition,
 		doc = doc,
 		span = legacy_location(row.span),
@@ -1895,10 +3366,11 @@ block) or a local function (part of a body).
 ---
 private pure func legacy_declaration(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	definition: Int,
 ) -> Result[Option[ParsedDecl], LegacyAdapterError]:
 	row ?= definition_at(reader, definition)
-	inner ?= legacy_unwrapped_declaration(reader, definition, row)
+	inner ?= legacy_unwrapped_declaration(reader, bodies, definition, row)
 
 	match (inner, row.visibility):
 		(Some(declaration), Kinds.PrivateVisibility):
@@ -1912,18 +3384,19 @@ The declaration `definition` is, without the `private` wrapper.
 ---
 private pure func legacy_unwrapped_declaration(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	definition: Int,
 	row: DefinitionRow,
 ) -> Result[Option[ParsedDecl], LegacyAdapterError]:
 	match row.kind:
 		Kinds.FunctionDefinition:
-			function_decl ?= legacy_function(reader, definition, row)
+			function_decl ?= legacy_function(reader, bodies, definition, row)
 			Ok(Some(FunctionParsedDecl(function_decl)))
 		Kinds.ConstantDefinition:
-			global ?= legacy_global(reader, definition, row)
+			global ?= legacy_global(reader, bodies, definition, row)
 			Ok(Some(VarParsedDecl(global)))
 		Kinds.MutableGlobalDefinition:
-			global ?= legacy_global(reader, definition, row)
+			global ?= legacy_global(reader, bodies, definition, row)
 			Ok(Some(VarParsedDecl(global)))
 		Kinds.RecordDefinition:
 			record_decl ?= legacy_record(reader, definition, row)
@@ -1950,10 +3423,10 @@ private pure func legacy_unwrapped_declaration(
 			alias_decl ?= legacy_type_alias(reader, definition, row)
 			Ok(Some(TypeAliasParsedDecl(alias_decl)))
 		Kinds.TraitDefinition:
-			trait_decl ?= legacy_trait(reader, definition, row)
+			trait_decl ?= legacy_trait(reader, bodies, definition, row)
 			Ok(Some(TraitParsedDecl(trait_decl)))
 		Kinds.ImplDefinition:
-			impl_decl ?= legacy_impl(reader, definition, row)
+			impl_decl ?= legacy_impl(reader, bodies, definition, row)
 			Ok(Some(ImplParsedDecl(impl_decl)))
 		Kinds.ForeignFunctionDefinition:
 			Ok(None)
@@ -2158,12 +3631,12 @@ private pure func legacy_c_name(
 
 -- Modules.
 ---
-One module's declarations as the existing parser would have produced them,
-bodies left as `DECLARATION_ONLY_BODY`: its docstring, then its import blocks,
-foreign blocks and definitions in source order. The program carries no
+One module's parsed program as the existing parser would have produced it, with
+interpolation holes parsed: its docstring, then its import blocks, foreign blocks
+and definitions in source order, each with its body. The program carries no
 diagnostics; a module the stage rejected has none to translate.
 ---
-pure func legacy_parsed_declarations(
+pure func legacy_parsed_program(
 	reader: DeclarationReader,
 	module: ModuleId,
 ) -> Result[ParsedProgram, LegacyAdapterError]:
@@ -2176,7 +3649,8 @@ pure func legacy_parsed_declarations(
 		ModuleDocumentationTable,
 	)
 	module_doc ?= legacy_module_doc(reader, documentation_row)
-	decls ?= legacy_module_items(reader, index, row)
+	bodies ?= legacy_module_bodies(reader, row)
+	decls ?= legacy_module_items(reader, bodies, index, row)
 
 	Ok({
 		source = source,
@@ -2266,6 +3740,7 @@ so it ends its list; reading it reports `MissingTableRow`.
 ---
 private pure func legacy_module_items(
 	reader: DeclarationReader,
+	bodies: ModuleBodies,
 	module: Int,
 	row: ModuleRow,
 ) -> Result[List[ParsedDecl], LegacyAdapterError]:
@@ -2322,7 +3797,7 @@ private pure func legacy_module_items(
 
 			next_foreign += 1
 		else:
-			match legacy_declaration(reader, definition):
+			match legacy_declaration(reader, bodies, definition):
 				Ok(Some(declaration)):
 					items = items.append(declaration)
 				Ok(None):
@@ -2464,9 +3939,8 @@ discovery does, the roots, the import edges, and the name table, validated by
 the same service. `context` and `naming` are what the caller knew about the
 file system; the tables hold no policy of their own.
 
-Declarations only: every body is `DECLARATION_ONLY_BODY`, so the rebuilt graph
-is not yet a graph typecheck can accept. Nothing in a compile calls this yet
-(roadmap item 7); the differential and the cost measurement do.
+Nothing in a compile calls this yet (roadmap item 7); the differential and the
+cost measurement do.
 ---
 pure func legacy_frontend_graph(
 	tables: Tables.FrontendTables,
@@ -2520,7 +3994,7 @@ private pure func legacy_module_parts(
 	reader: DeclarationReader,
 	module: Int,
 ) -> Result[LegacyModuleParts, LegacyAdapterError]:
-	declarations ?= legacy_parsed_declarations(reader, module_id_at_row(module))
+	declarations ?= legacy_parsed_program(reader, module_id_at_row(module))
 	identity ?= legacy_module_identity(reader, module)
 	edges ?= legacy_import_edges(reader, module)
 	Ok({

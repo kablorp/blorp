@@ -41,6 +41,7 @@ import:
 		append_leaf_node,
 		append_literal_leaf_node,
 		append_name_leaf_node,
+		append_name_only_parent_node_from_stack,
 		append_named_parent_node_from_stack,
 		append_parameter,
 		append_parameter_type,
@@ -67,6 +68,8 @@ import:
 		parse_checkpoint,
 		pending_annotation_count,
 		push_last_node,
+		record_concurrency_count_of_last_node,
+		record_else_keyword_of_last_node,
 		replace_last_node_span,
 		rollback_to,
 		source_id_at_row,
@@ -1161,6 +1164,7 @@ private pure func parse_var_declaration(builder: DiscoveryBuilder) -> DiscoveryB
 	depth_before: Int = builder.child_stack_depth()
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: NameId = out.binder_name_at_cursor()
+	name_span: Span = out.current_span()
 	out = out.consume_binder_name(VariableName)
 	out = out.parse_optional_type_annotation()
 	out = out.expect_token_in(EqualSymbol, ExpectedEqualDiagnostic, VariableDeclaration)
@@ -1172,6 +1176,7 @@ private pure func parse_var_declaration(builder: DiscoveryBuilder) -> DiscoveryB
 		VarDeclarationNode,
 		start.span_covering(value_span),
 		name,
+		name_span,
 		count,
 	)
 	out
@@ -1447,6 +1452,7 @@ private pure func finish_named_statement(
 		kind,
 		name_span.span_covering(value_span),
 		name,
+		name_span,
 		count,
 	)
 	out
@@ -1730,8 +1736,10 @@ private pure func parse_if(builder: DiscoveryBuilder, anchor: Span) -> Discovery
 	out = out.parse_block_after_colon(anchor)
 	var end: Span = out.node_span(out.last_node_id())
 	out = out.push_last_node()
+	has_else: Bool = out.at(ElseKeyword)
+	else_keyword: Span = out.current_span()
 
-	if out.at(ElseKeyword):
+	if has_else:
 		out = out.parse_else_branch()
 		end = out.node_span(out.last_node_id())
 		out = out.push_last_node()
@@ -1742,6 +1750,10 @@ private pure func parse_if(builder: DiscoveryBuilder, anchor: Span) -> Discovery
 		start.span_covering(end),
 		count,
 	)
+
+	if has_else:
+		out = out.record_else_keyword_of_last_node(else_keyword)
+
 	out
 
 
@@ -2000,6 +2012,7 @@ private pure func parse_select_receive_arm(builder: DiscoveryBuilder) -> Discove
 		SelectReceiveArmNode,
 		start.span_covering(body_span),
 		binder,
+		start,
 		2,
 	)
 	out
@@ -2262,7 +2275,12 @@ private pure func check_concurrent_parameter(
 				name_span,
 				name_id.name_id_index(),
 			)
-		else if name == count and not builder.is_positive_integer_literal(value):
+		else if (
+			name == count
+			and builder
+				.positive_literal_count(value)
+				.is_none()
+		):
 			code: DiscoveryDiagnosticCode = match owner:
 				ConcurrentBlockOwner:
 					ConcurrentMaxThreadsNotPositiveLiteralDiagnostic
@@ -2295,12 +2313,12 @@ private pure func check_concurrent_parameter(
 
 
 ---
-True when `value` is an integer literal node that is positive. `2 + 2`, `-1`
-and calls are other node kinds. Like the existing parser it accepts a
-literal above `Int`'s range, which `parse_int` saturates; rejecting those is
-a general typecheck rule, not a check here.
+The count `value` writes when it is an integer literal node that is positive,
+else `None`. `2 + 2`, `-1` and calls are other node kinds. Like the existing
+parser it accepts a literal above `Int`'s range, which `parse_int` saturates;
+rejecting those is a general typecheck rule, not a check here.
 ---
-private pure func is_positive_integer_literal(builder: DiscoveryBuilder, value: NodeId) -> Bool:
+private pure func positive_literal_count(builder: DiscoveryBuilder, value: NodeId) -> Option[Int]:
 	row: NodeRow = builder.node_row_at(value)
 
 	match row.kind:
@@ -2309,13 +2327,32 @@ private pure func is_positive_integer_literal(builder: DiscoveryBuilder, value: 
 				Some(text):
 					match text.parse_int():
 						Some(number):
-							number > 0
+							if number > 0:
+								Some(number)
+							else:
+								None
 						None:
-							False
+							None
 				None:
-					False
+					None
 		_:
-			False
+			None
+
+
+---
+`builder` with the concurrency count `written` recorded for the node appended
+last, when there is one. The branch is here so each arm calls on the builder
+parameter (builder threading rule 1).
+---
+private pure func with_concurrency_count(
+	builder: DiscoveryBuilder,
+	written: Option[Int],
+) -> DiscoveryBuilder:
+	match written:
+		Some(count):
+			builder.record_concurrency_count_of_last_node(count)
+		None:
+			builder
 
 
 ---
@@ -2337,14 +2374,23 @@ private pure func parse_concurrent_parameter(
 	out = out.parse_expression()
 	value: NodeId = out.last_node_id()
 	value_span: Span = out.node_span(value)
+
+	-- The count a `max_threads` or `limit` parameter writes, kept as an integer.
+	written: Option[Int] = if parameter == owner.concurrent_count_parameter():
+		out.positive_literal_count(value)
+	else:
+		None
+
 	out = out.check_concurrent_parameter(owner, parameter, name, seen, name_span, value)
 	out = out.push_last_node()
 	out = out.append_named_parent_node_from_stack(
 		ConcurrentParameterNode,
 		name_span.span_covering(value_span),
 		name,
+		name_span,
 		1,
 	)
+	out = out.with_concurrency_count(written)
 	out = out.push_last_node()
 
 	if out.at(CommaSymbol):
@@ -2462,6 +2508,7 @@ private pure func parse_with_binding(builder: DiscoveryBuilder) -> DiscoveryBuil
 		kind,
 		name_span.span_covering(end),
 		name,
+		name_span,
 		count,
 	)
 	out
@@ -2483,6 +2530,7 @@ private pure func parse_with_error_map(builder: DiscoveryBuilder) -> DiscoveryBu
 		WithErrorMapNode,
 		name_span.span_covering(value_span),
 		name,
+		name_span,
 		1,
 	)
 	out
@@ -2613,8 +2661,32 @@ private pure func parse_lambda_parameter(builder: DiscoveryBuilder) -> Discovery
 	else:
 		name_span
 
-	out = out.append_named_parent_node_from_stack(LambdaParameterNode, span, name, count)
+	out = out.append_lambda_parameter_node(span, name, name_span, count)
 	out
+
+
+---
+The lambda parameter node over its `count` written children (its type, or
+none). A typed parameter's name is narrower than the node and has a name span
+row; an untyped one is its name alone.
+---
+private pure func append_lambda_parameter_node(
+	builder: DiscoveryBuilder,
+	span: Span,
+	name: NameId,
+	name_span: Span,
+	count: Int,
+) -> DiscoveryBuilder:
+	if count > 0:
+		builder.append_named_parent_node_from_stack(
+			LambdaParameterNode,
+			span,
+			name,
+			name_span,
+			count,
+		)
+	else:
+		builder.append_name_only_parent_node_from_stack(LambdaParameterNode, span, name, count)
 
 
 -- Expressions.
@@ -3001,6 +3073,7 @@ private pure func parse_field_access(builder: DiscoveryBuilder) -> DiscoveryBuil
 		FieldAccessNode,
 		receiver_span.span_covering(field_span),
 		field,
+		field_span,
 		1,
 	)
 	out
@@ -3453,10 +3526,28 @@ private pure func parse_grouping_or_tuple(
 		builder.parse_tuple_rest(start)
 	else if builder.at(RightParenSymbol):
 		close: Span = builder.current_span()
+		grouped: NodeKind = builder.node_row_at(builder.last_node_id()).kind
 		advanced: DiscoveryBuilder = builder.advance_token()
-		advanced.replace_last_node_span(start.span_covering(close))
+
+		if grouped.keeps_token_span():
+			advanced
+		else:
+			advanced.replace_last_node_span(start.span_covering(close))
 	else:
 		builder.report_at_current_in(ExpectedRightParenDiagnostic, GroupedExpression)
+
+
+---
+Whether a grouped expression of this kind keeps its own span when parentheses
+surround it: a name and a local function, whose spans rename and reference
+tooling edits, as the existing parser keeps them.
+---
+private pure func keeps_token_span(kind: NodeKind) -> Bool:
+	match kind:
+		IdentifierNode | LocalFunctionNode:
+			True
+		_:
+			False
 
 
 ---
@@ -3614,6 +3705,7 @@ private pure func parse_record_field(builder: DiscoveryBuilder) -> DiscoveryBuil
 		RecordFieldNode,
 		name_span.span_covering(value_span),
 		name,
+		name_span,
 		1,
 	)
 	out

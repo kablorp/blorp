@@ -86,6 +86,12 @@ IDENT                = (letter | "_") { letter | digit | "_" }
 DOCSTRING            = "---" newline { line } "---"
 ```
 
+A hole `${ expr }` holds any expression, including a string with holes of its
+own, to any depth (the compiler limits it to 64 open braces and holes together). Braces are text
+outside a hole, and a `}` inside a string in a hole closes nothing. In
+`STRING_INTERP` and an interpolated `PIPE_STRING` a `{` or `}` outside a hole
+is a literal brace; `raw` strings have no holes.
+
 `aligned_pipe_line` is indentation followed by `|` and line content. All lines
 in the same pipe string must use the same `|` column. Use `||` for a literal
 leading pipe in the content.

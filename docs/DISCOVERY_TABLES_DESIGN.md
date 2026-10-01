@@ -74,13 +74,13 @@ compiler CI):
   testing, loaded after the roots as the existing front end seeds them;
 - the declaration, type, pattern and body parsers, with accept/reject parity
   against the existing parser over the corpus;
-- the declaration half of the legacy adapter (section 10), proved by a
-  declaration-level differential over the corpus.
+- the legacy adapter (section 10), declarations and bodies, proved by a
+  full-AST differential over the corpus.
 
 **Pending:**
 
-- **The body half of the legacy adapter** (section 10). Nothing in a compile
-  reads the tables yet.
+- **The switch** (roadmap items 7 and 8). Nothing in a compile reads the
+  tables yet.
 
 ## 1. Principles
 
@@ -324,13 +324,21 @@ struct SupertraitQualifierRow {supertrait: SupertraitId, qualifier: NameId, span
 struct DimensionConstraintRow {owner: DefinitionId, left: NodeId, right: NodeId, span: Span}
 ```
 
-A written type whose name is narrower than its node (`List[T]`, `m.Type`,
-`T: Eq`, `#Ds...`, a trait bound through a module alias) has a
-`NodeNameSpanRow {node, name_span}`, at most one per node, in node order;
-`node_name_span` reads a node's name span, which is the node's own span when it
-has no row. The same idea gives the rows that carry names their own spans:
-the existing parsed AST has an identifier, with a span, where the tables have
-a name, and the adapter may not reconstruct a span the tables lack.
+A node whose name is narrower than the node has a
+`NodeNameSpanRow {node, name_span}`, at most one per node, in node order:
+for a written type, `List[T]`, `m.Type`, `T: Eq`, `#Ds...` and a trait bound
+through a module alias; for a body, the field of `x.field` and of a record
+field, the target a binding, assignment, `?=` or compound assignment binds, a
+`with` or `on` binder, a select arm's binder, a concurrency parameter, a typed
+lambda parameter, the constructor of `Name(p)` and `Type.Name(p)`, and the
+target of a list pattern's spread (`...rest`, `..._`). `node_name_span` reads
+a node's name span, which is the node's own span when it has no row. The
+existing parsed AST has an identifier, with a span, where the tables have a
+name, and the adapter may not reconstruct a span the tables lack. The
+`else` keyword of an `if` is the one other span a node cannot give: neither
+branch covers it and the formatter places comments around it, so an `IfNode`
+with an else branch (a third child) has an `ElseKeywordRow {node,
+keyword_span}`, at most one per node, in node order.
 
 A `DefinitionTypeRow`'s role is fixed by the definition's kind: a
 function's return type, a global's declared type, an alias's or opaque
@@ -382,7 +390,7 @@ docstring gives each kind's payload and child order, and
 `node_payload_reference(kind)` says which table the payload indexes:
 `NamePayload`, `LiteralPayload`, `CodepointPayload`, `DefinitionPayload` or
 `NoPayload` (which stores `NO_NODE_PAYLOAD`). This document does not repeat
-the list. There are 123 kinds in these families:
+the list. There are 127 kinds in these families:
 
 - literals and names: `IdentifierNode`, one kind per literal form (integer,
   float, string, raw, pipe, raw pipe, char, `True`, `False`), and the
@@ -398,7 +406,8 @@ the list. There are 123 kinds in these families:
 - statements: `var`, typed binding, assignment, `?=`, the four compound
   assignments, subscript assignment, tuple destructuring;
 - patterns: `...PatternNode` kinds, which appear only where a pattern was
-  written;
+  written; a string pattern has one kind per form (plain, raw, pipe, raw
+  pipe), as a string literal does, because the existing AST records the form;
 - written types: `...TypeNode` kinds, including dimension names, literals,
   wildcards and arithmetic, which appear only where a type was written;
 - recovery: `MissingExpressionNode`, `MissingPatternNode`,
@@ -416,7 +425,10 @@ The sketch's kinds that were removed:
   pattern and a body.
 
 A child documented as "when written" (an optional type, an `else` branch) is
-recognized by its kind, never by position alone. A compound assignment
+recognized by its kind, never by position alone. Grouping parentheses add no
+node: they widen the enclosed expression's span to the delimiters, except for a
+name and a local function, whose spans stay token-exact because rename and
+reference tooling edits those tokens (the existing parser does the same). A compound assignment
 (`x += 1`) has only the value child: it has no written type.
 
 **Named arguments.** `f(a = 1)` parses as a `CallNode` whose argument is an
@@ -907,7 +919,14 @@ The invariants, by violation kind:
   ends within its text.
 - `NameSpanOutsideItsSpan`, `NameSpanOnWrongNodeKind`: a name's span lies
   inside the span of what it names a part of, and a node name span row names a
-  node of a kind that has one.
+  node of a kind that has one. `NodeNameSpanMissing` requires a row for a kind whose
+  name is always narrower than the node (`needs_name_span_row`): types as above,
+  and for bodies fields, binding and assignment targets, binders, constructor
+  patterns and spreads. The parser records the row for every such node, so
+  recovery cannot leave one out; only an untyped lambda parameter, which is its
+  name alone, has none;
+- `ElseKeywordMismatch`: an `ElseKeywordRow` belongs to an `IfNode` with an else
+  branch and lies inside it, and every such `IfNode` has one.
 - `DimensionSigilNameMissing`: every dimension name has its `#` spelling.
 - `SeededNameMoved`: the seeded vocabulary sits at its pinned ids.
 - `InternIndexMismatch`, `ParallelTableMismatch`: the intern indexes agree
@@ -926,15 +945,37 @@ The adapter is `blorp/src/compiler/discovery_adapter.brp`, the one module in
 reads. It belongs to neither side: the new stage never imports the old
 compiler, and typecheck keeps its current input.
 
-**Implemented: the declaration half.** `legacy_declaration_reader(tables,
-naming)` builds the indexes the adapter reads by owner, once; then
-`legacy_parsed_declarations(reader, module)` rebuilds one module's
-`ParsedProgram` (its source file, module docstring, import blocks, foreign
-blocks and declarations, in source order, with every body the placeholder
-`DECLARATION_ONLY_BODY`) and `legacy_frontend_graph(tables, naming, context)`
-assembles the modules, roots, import edges and name table and validates them
-with the service the existing discovery uses, so finalization, module
-surfaces and validation are the existing code, not a copy.
+**Implemented.** `legacy_declaration_reader(tables, naming)` builds the
+indexes the adapter reads by owner, once; then `legacy_parsed_program(reader,
+module)` rebuilds one module's `ParsedProgram` (its source file, module
+docstring, import blocks, foreign blocks and declarations, in source order, each
+with its body) and `legacy_frontend_graph(tables, naming, context)` assembles
+the modules, roots, import edges and name table and validates them with the
+service the existing discovery uses, so finalization, module surfaces and
+validation are the existing code, not a copy.
+
+**Bodies.** `legacy_module_bodies` walks a module's node block once, in table
+order. The table is post-order, so a node's children are rebuilt before it is;
+each node's value (an expression, a pattern, a match case, a record field, ...,
+one variant of the private `BuiltNode` union) is kept at the node's position
+and a parent takes its children's by position. Nothing recurses over a body:
+the cost of a body nested as deep as the source allows is that of a flat one
+(the test builds a 6,000-operand chain). Values are kept by position and not on
+a stack because a local function's signature and body roots sit between the
+siblings of the statements around it. A parent that finds a child of another
+kind, or a count its kind does not document, reports `MalformedNode(node,
+kind)`: a `concurrently` loop without a `limit`, which the parser reports,
+is one, and the adapter does not invent a limit. A name's span is read from the
+name span rows as the walk reaches the node (they are sorted by node), and a
+written type child is rebuilt on demand by the declaration half's `legacy_type`.
+
+The adapter hands over interpolated strings in the form the existing front end's
+second step produces (`ParsedStringInterpolationPartsExpr`): the existing
+parser parses holes after the file, the stage with it, so there is no
+unparsed form to rebuild, and the differential compares against the existing
+program after `finalize_interpolation_program`. Typecheck's own finalization
+(hoisting local functions, rewriting subscript reads) runs on the adapter's
+output in `legacy_frontend_graph`, as it does on the existing parser's.
 
 ```blorp
 ---
@@ -966,13 +1007,21 @@ by module, source order within a module, `ModuleRangesOverlap`), so the first
 import row that targets a module is the request that loaded it.
 `LegacyModuleNaming` carries the one thing the tables do not hold, the name a
 root takes, which the existing front end's callers choose per command: a
-function of the root's request path.
+function of the root's request path. The body half closed these stage gaps:
+the span of a name inside a wider body node (a field, a binding target, a
+binder, a pattern's constructor or spread), the span of an `else` keyword, the
+form a string pattern was written in, and a parenthesized name keeping its own
+span.
 
 A row the tables should hold and do not is a `LegacyAdapterError`
-(`MissingTableRow(table, index)`, `NotAWrittenType`, `ModuleWithoutRequest`,
-`GraphRejected`) propagated through `legacy_declaration_reader`,
-`legacy_parsed_declarations` and `legacy_frontend_graph`; no placeholder flows
-into the AST, and the differential fails on an error.
+(`MissingTableRow(table, index)`, `NotAWrittenType`, `MalformedNode`,
+`BodyRootNotAnExpression`, `ModuleWithoutRequest`, `GraphRejected`) propagated
+through `legacy_declaration_reader`, `legacy_parsed_program` and
+`legacy_frontend_graph`; no placeholder flows into the AST, and the differential
+fails on an error. A read the freeze invariants make total (a node of a module's
+block, a child edge in range and before its parent) does not return a `Result`:
+a child that is missing or not yet built is `NotYetBuilt`, which no parent takes,
+and the parent reports `MalformedNode`.
 
 The first version serves compilation (`check`, `compile`, `run`, `test`); the
 formatter, which needs comments the stage drops, and the LSP are decided
@@ -988,27 +1037,53 @@ parser and the new discovery plus the adapter over the self-compile root, a
 `blorp test` root, each with the standard library on disk and embedded, the
 native-package and source-package fixture projects (the module-order check's
 options, `module_order_options.brp`), and every tracked `.brp` file (as roots
-of one discovery), and compares each module's parsed AST through the existing JSON encoder
-(`parsed_ast_json.brp`), so no separate renderer is written; the existing
-side's bodies are replaced by the same placeholder (`declarations_only`, in
-`discovery_adapter_comparison.brp`). A mismatch names the module, the
-declaration and the field. For a root it also builds the existing front end's
+of one discovery), and compares each module's full parsed AST, bodies and spans
+included, through the existing JSON encoder (`parsed_ast_json.brp`), so no
+separate renderer is written; the existing side's program is the one its
+second step leaves, with the interpolation holes parsed (`with_holes_parsed`,
+in `discovery_adapter_comparison.brp`). The encoder gained the `else` keyword's
+span, which it did not print. A mismatch names the module, the declaration and
+the field. For a root it also builds the existing front end's
 graph and compares each module's name, origin and source path, since the
 program comparison uses the adapter's own names on both sides. A module the
 existing parser rejects is skipped; the parity gate requires the skipped set to
 equal the files the existing parser rejects. `scripts/compiler-new-parity` runs it
 (`ADAPTER_DIFFERENCES` lists deliberate differences with a reason each; there
-are none) and `blorp/test/compiler/stage_04_modules/test_discovery_adapter.brp`
-covers one construct per test. The tool lives under `blorp/test/compiler`
-because it imports the existing compiler, which `compiler_new`'s tests may not.
-The body half extends the same comparison to expressions, statements and
-patterns. Once it is clean on the whole corpus, the new stage becomes the
-default and the old discovery leaves the compile path later (roadmap items 3
-to 8). The same generated C for the self-compile and the test corpus
-confirms the rest; ids are internal identity, so the adapter passes the
-stage's name table through instead of imitating the old numbering, and C
-that differs only in id-derived names is compared after normalizing them.
-The known intended difference is `# N`, rejected by the new lexer.
+are two, for one fixture) and `blorp/test/compiler/stage_04_modules/test_discovery_adapter.brp`
+covers one construct group per test, with the corners the differential could
+not otherwise be trusted on (brace forms, leading-dot chains after lambdas,
+anchored `if` and `match` values, comments between `if` and `else`, minimum
+`Int` literals, interpolation escapes and nested strings, docstring
+attachment). The tool lives under `blorp/test/compiler` because it imports the
+existing compiler, which `compiler_new`'s tests may not. The full comparison
+is clean over 3,174 modules and 47,027 declarations in the corpus run, and over
+396, 62, 39 and 41 modules in the root runs, with the standard library on disk
+and embedded. The same generated C for the self-compile and the test corpus
+confirms the rest (roadmap criterion 2); ids are internal identity, so the
+adapter passes the stage's name table through instead of imitating the old
+numbering, and C that differs only in id-derived names is compared after
+normalizing them.
+
+**Where the stage differs from the existing parser.** The language rule is in
+`docs/GUIDE.md` and `docs/GRAMMAR.md`: a hole holds any expression, strings
+with holes nest to any depth (64 open braces and holes at most), and braces outside a hole are
+text. Targeted inputs found four places the existing lexer breaks it:
+
+- a `\u{...}` escape after an interpolated string's first hole stayed as
+  written, and a brace or backslash before the first hole was read again by the
+  splitter (so `"{kept} ${d}"` made `kept` a hole): fixed in the existing lexer,
+  and `test_discovery_adapter.brp` now asserts agreement;
+- interpolation nested three levels deep (the existing lexer pairs a nested
+  string's quotes with one flag, so the innermost hole becomes text), and braces
+  in an interpolated pipe string (every brace is a hole): not fixed, because both
+  need the lexer's tail scan rewritten as the stage's frame stack
+  (`hole_scan`). They are listed in `ADAPTER_DIFFERENCES` through
+  `fixtures/known_differences/interpolation_nesting.brp`, tracked in
+  `docs/issues/interpolation_nesting_in_the_existing_lexer.md`, and open under
+  roadmap criteria 1 and 6.
+
+`# N`, rejected by the new lexer, remains the one intended difference in the
+accepted language.
 
 ## 11. What changes for later stages
 
@@ -1058,6 +1133,27 @@ First adapter measurement (declaration half only, same input, `-O2`, median of
 The declaration half costs 1.62G instructions, 26% of the stage's margin (it
 was 1.06G before every row read became a `Result`); the body half is not in
 these numbers.
+
+With the body half (same input and method, `-O2`, median of 3, 2026-10-01;
+`benchmarks/results/discovery_adapter_bodies_2026-10-01.md`), the stage plus the
+whole adapter and the existing finalization costs fewer instructions than the
+existing discovery. `programs` is the adapter alone, before typecheck's
+finalization of each module:
+
+| | Existing discovery | Stage, tables | Stage plus programs | Stage plus graph |
+| --- | --- | --- | --- | --- |
+| Allocations | 8.47M | 0.53M | 5.15M | 7.13M |
+| Instructions | 10.13G | 4.05G | 7.24G | 8.74G |
+| User time | 0.51 s | 0.22 s | 0.39 s | 0.48 s |
+| Peak RSS | 198 MB | 189 MB | 206 MB | 373 MB |
+
+The whole adapter (declarations, bodies and the finalization and surface passes
+over them) costs 4.69G instructions, 77% of the stage's 6.08G margin: the
+stage plus the adapter is 14% under the existing discovery in instructions, 16%
+in allocations and 6% in user time, and the margin is no longer wide. The graph
+mode holds every module's program at once, as the existing graph does, and its
+peak RSS is 1.9 times the existing discovery's. The adapter is deleted as typecheck
+reads the tables, so this cost is temporary.
 
 ## 13. Deliberately out of scope
 

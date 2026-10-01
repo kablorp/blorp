@@ -3,7 +3,7 @@
 -- against the existing discovery and the stage alone, each in its own binary
 -- (retired instructions and user time come from `/usr/bin/time -l` around it).
 --
--- Usage: discovery_adapter_cost.brp <old|tables|graph> <compile|test> <root.brp> [--embedded-std] [--package <spec>]...
+-- Usage: discovery_adapter_cost.brp <old|tables|programs|graph> <compile|test> <root.brp> [--embedded-std] [--package <spec>]...
 --
 -- After the measurement mode, the command line is the module-order dumpers'
 -- (`module_order_options`).
@@ -11,6 +11,8 @@
 --   old     the existing discovery, to a `FrontendGraph`, including the parse
 --           of the root the CLI does first;
 --   tables  the discovery stage, to frozen tables;
+--   programs the discovery stage, then the adapter's parsed program of every
+--           module (the adapter alone, before typecheck's finalization);
 --   graph   the discovery stage, then `legacy_frontend_graph`.
 --
 -- Allocation counters read zero unless the program is built with
@@ -23,7 +25,9 @@ import:
 		COMPILER_EMBEDDED_TEXTS,
 		CompilerEmbeddedTexts,
 		LegacyModuleNaming,
+		legacy_declaration_reader,
 		legacy_frontend_graph,
+		legacy_parsed_program,
 	../../../src/compiler/frontend_request: FrontendGraphContext, FrontendSourcePackage
 	../../../src/compiler/stage_04_modules/frontend_graph: frontend_graph_modules
 	../../../src/compiler_new/stage_01_discovery/pipeline:
@@ -40,8 +44,10 @@ import:
 		SourceLookupRoots,
 		SourcePackageRoot,
 		SourceProvider,
+	../../../src/compiler_new/stage_01_discovery/tables/builder: module_id_at_row
 	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
 		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
 		module_count,
 	../../../src/lib/cli_plan: CliParsedSourceFile
 	../../../src/lib/source_graph:
@@ -65,6 +71,8 @@ FIRST_OPTION_ARGUMENT: Int = 2
 OLD_MODE: String = "old"
 
 TABLES_MODE: String = "tables"
+
+PROGRAMS_MODE: String = "programs"
 
 GRAPH_MODE: String = "graph"
 
@@ -148,10 +156,19 @@ func existing_module_count(options: ModuleOrderOptions) -> Option[Int]:
 
 
 ---
-The stage's module count for the options' root, also building the legacy graph
-when `with_graph`; `None` when either fails.
+How far past the discovery stage a run goes.
 ---
-func staged_module_count(options: ModuleOrderOptions, with_graph: Bool) -> Option[Int]:
+enum StagedMeasure:
+	StageOnly
+	AdapterPrograms
+	AdapterGraph
+
+
+---
+The stage's module count for the options' root, also running the adapter as far
+as `measure` says; `None` when the stage or the adapter fails.
+---
+func staged_module_count(options: ModuleOrderOptions, measure: StagedMeasure) -> Option[Int]:
 	source_packages: List[SourcePackageRoot] = options.source_packages.map(source_package_root)
 
 	match options.standard_library:
@@ -161,21 +178,21 @@ func staged_module_count(options: ModuleOrderOptions, with_graph: Bool) -> Optio
 				native_package_roots = [NATIVE_PACKAGE_ROOT],
 				source_packages = source_packages
 			}
-			discovered_count(FILE_SYSTEM_SOURCE_PROVIDER, roots, options, with_graph)
+			discovered_count(FILE_SYSTEM_SOURCE_PROVIDER, roots, options, measure)
 		StandardLibraryEmbedded:
 			roots: SourceLookupRoots = embedded_lookup_roots([NATIVE_PACKAGE_ROOT], source_packages)
 			provider: EmbeddedStandardLibraryProvider[CompilerEmbeddedTexts, FileSystemSourceProvider] = {
 				texts = COMPILER_EMBEDDED_TEXTS,
 				inner = FILE_SYSTEM_SOURCE_PROVIDER
 			}
-			discovered_count(provider, roots, options, with_graph)
+			discovered_count(provider, roots, options, measure)
 
 
 func discovered_count[Provider:SourceProvider](
 	provider: Provider,
 	roots: SourceLookupRoots,
 	options: ModuleOrderOptions,
-	with_graph: Bool,
+	measure: StagedMeasure,
 ) -> Option[Int]:
 	implicit: ImplicitModules = if options.mode == TestMode:
 		test_implicit_modules()
@@ -184,15 +201,43 @@ func discovered_count[Provider:SourceProvider](
 
 	match discover(provider, roots, [options.root], implicit):
 		FrozenTables(tables):
-			if with_graph:
-				match legacy_frontend_graph(tables, NAMING, graph_context(options)):
-					Ok(graph):
-						Some(frontend_graph_modules(graph.graph).length())
-					Err(_):
-						None
-			else:
-				Some(module_count(tables))
+			match measure:
+				AdapterGraph:
+					match legacy_frontend_graph(tables, NAMING, graph_context(options)):
+						Ok(graph):
+							Some(frontend_graph_modules(graph.graph).length())
+						Err(_):
+							None
+				AdapterPrograms:
+					adapted_program_count(tables)
+				StageOnly:
+					Some(module_count(tables))
 		TableInvariantsViolated(_):
+			None
+
+
+---
+The module count when the adapter rebuilds every module's parsed program, and
+`None` when it cannot.
+---
+func adapted_program_count(tables: FrontendTables) -> Option[Int]:
+	match legacy_declaration_reader(tables, NAMING):
+		Ok(reader):
+			var rebuilt: Int = 0
+			var failed: Bool = False
+
+			for module in 0..module_count(tables):
+				match legacy_parsed_program(reader, module_id_at_row(module)):
+					Ok(_):
+						rebuilt += 1
+					Err(_):
+						failed = True
+
+			if failed:
+				None
+			else:
+				Some(rebuilt)
+		Err(_):
 			None
 
 
@@ -206,9 +251,13 @@ func main(args: List[String]) -> Int:
 	if (
 		measure != OLD_MODE
 		and measure != TABLES_MODE
+		and measure != PROGRAMS_MODE
 		and measure != GRAPH_MODE
 	):
-		print("usage: discovery_adapter_cost.brp <old|tables|graph> <module-order options>")
+		print((
+				"usage: discovery_adapter_cost.brp <old|tables|programs|graph> <module-order "
+				+ "options>"
+			))
 		EXIT_USAGE
 	else:
 		match parse_module_order_options(option_arguments):
@@ -219,13 +268,22 @@ func main(args: List[String]) -> Int:
 				EXIT_USAGE
 
 
+func staged_measure(measure: String) -> StagedMeasure:
+	if measure == GRAPH_MODE:
+		AdapterGraph
+	else if measure == PROGRAMS_MODE:
+		AdapterPrograms
+	else:
+		StageOnly
+
+
 func report(measure: String, options: ModuleOrderOptions) -> Int:
 	before: MemStats = get_mem_stats()
 
 	modules: Option[Int] = if measure == OLD_MODE:
 		existing_module_count(options)
 	else:
-		staged_module_count(options, measure == GRAPH_MODE)
+		staged_module_count(options, staged_measure(measure))
 
 	delta: MemStats = mem_delta(before, get_mem_stats())
 

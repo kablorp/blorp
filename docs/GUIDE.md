@@ -350,6 +350,11 @@ list: String = "Items: ${[1, 2, 3]}"
 -- Literal braces work without escaping
 json: String = "{\"key\": \"value\"}"
 
+-- A hole holds any expression, including another interpolated string, to any
+-- depth (up to 64 open braces and holes together)
+nested: String = "outer ${"inner ${name}"}"
+literal_brace: String = "{kept} ${name}"
+
 -- Escape sequences: \n \t \\ \" \' \0 \r \u{XXXX}
 escaped: String = "line1\nline2\ttabbed"
 unicode: String = "Hello \u{1F600}"   -- Unicode escape (1-6 hex digits)

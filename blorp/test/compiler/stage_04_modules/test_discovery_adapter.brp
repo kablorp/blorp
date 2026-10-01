@@ -1,23 +1,23 @@
--- The legacy discovery adapter over small programs: each declaration construct
--- is rebuilt from the stage's tables and compared with the existing parser's
--- program through the same declaration-level comparison the corpus differential
--- (`tools/discovery_adapter_differential.brp`) runs, plus the adapter's own
--- module naming and graph assembly.
+-- The legacy discovery adapter over small programs: each declaration and each
+-- body construct is rebuilt from the stage's tables and compared with the
+-- existing parser's program through the same full comparison, spans included,
+-- that the corpus differential (`tools/discovery_adapter_differential.brp`)
+-- runs, plus the adapter's own module naming and graph assembly.
 import:
 	../../../src/compiler/discovery_adapter:
 		DeclarationReader,
-		LegacyAdapterError(MissingTableRow),
+		LegacyAdapterError(MalformedNode, MissingTableRow),
 		LegacyModuleNaming,
 		legacy_adapter_error_message,
 		legacy_declaration_reader,
 		legacy_frontend_graph,
-		legacy_parsed_declarations,
+		legacy_parsed_program,
 	../../../src/compiler/frontend_request: FrontendGraphContext
 	../../../src/compiler/stage_02_lex/name_table: name_spelling, name_table_synthesized_spellings
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
-		ParsedDecl(FunctionParsedDecl, VarParsedDecl),
-		ParsedExpr(ParsedVoidExpr),
+		ParsedDecl(FunctionParsedDecl),
+		ParsedExpr(ParsedBinaryExpr, ParsedBlockExpr),
 		ParsedProgram,
 	../../../src/compiler/stage_03_parse/parsed_ast_json: parsed_program_to_json
 	../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
@@ -39,8 +39,9 @@ import:
 	../../../src/compiler_new/stage_01_discovery/tables/invariants:
 		DiscoveryTable(DimensionNameTable),
 	../../../src/compiler_new/stage_01_discovery/tables/name_vocabulary: SEEDED_NAME_SPELLINGS
+	../../../src/compiler_new/stage_01_discovery/tables/row_kinds: NodeKind(ConcurrentForNode)
 	../../../src/lib/source: source_file
-	../tools/discovery_adapter_comparison: JsonDifference, declarations_only, program_differences
+	../tools/discovery_adapter_comparison: JsonDifference, program_differences, with_holes_parsed
 	test: TestSuite
 
 
@@ -99,7 +100,7 @@ The program the adapter rebuilds for the first module of `tables`, or `None`
 func adapted_first_module(tables: FrontendTables) -> Option[ParsedProgram]:
 	match reader_of(tables):
 		Some(reader):
-			match legacy_parsed_declarations(reader, module_id_at_row(0)):
+			match legacy_parsed_program(reader, module_id_at_row(0)):
 				Ok(adapted):
 					Some(adapted)
 				Err(error):
@@ -110,8 +111,8 @@ func adapted_first_module(tables: FrontendTables) -> Option[ParsedProgram]:
 
 
 ---
-The differences between the existing parser's declaration-level program for
-`source` and the adapter's, or `None` when either front end rejects it.
+The differences between the existing parser's program (with interpolation holes
+parsed) for `source` and the adapter's, or `None` when either front end rejects it.
 ---
 func adapter_differences(source: String) -> Option[(Int, List[JsonDifference])]:
 	match discovered({ROOT_PATH => source}):
@@ -131,7 +132,7 @@ func adapter_differences(source: String) -> Option[(Int, List[JsonDifference])]:
 							(
 								adapted.decls.length(),
 								program_differences(
-									parsed_program_to_json(declarations_only(existing)),
+									parsed_program_to_json(with_holes_parsed(existing)),
 									parsed_program_to_json(adapted),
 								),
 							),
@@ -274,28 +275,530 @@ func test_non_ascii_text_spans_match() -> Bool:
 	)
 
 
-private pure func is_placeholder(body: Option[ParsedExpr]) -> Bool:
-	match body:
-		Some(ParsedVoidExpr(_)):
-			True
-		_:
+-- Bodies. Each source is a raw pipe string, so its tabs, quotes and `${` are
+-- the program's own.
+EXPRESSION_SOURCE: String = raw
+	|func operators(a: Int, b: Int, c: Int, xs: List[Int], name: String) -> Int:
+	|	sum = a + b * c - a / b % c
+	|	flags = a == b and b != c or not (a < b) and b <= c or a > c and b >= c
+	|	negated = -a + -(b)
+	|	span = a..b
+	|	item = xs[0]
+	|	cell = xs[a, b]
+	|	size = name.length().to_string().length()
+	|	call = max(a, b, c)
+	|	named = configure(retries = 3, xs)
+	|	grouped = (a + b) * (c)
+	|	tuple = (a, (b, c))
+	|	list = [1, 2.5, 'x', True, False, "s"]
+	|	nothing = ()
+	|	void
+	|
+	|func literals() -> Int:
+	|	lowest = -9223372036854775808
+	|	highest = 9223372036854775807
+	|	small = -5
+	|	real = 1.5e10
+	|	letter = '\u{1F600}'
+	|	tab = '\t'
+	|	size = - 5
+	|	lowest
+
+GROUPED_NAME_SOURCE: String = raw
+	|func grouped(a, b):
+	|	c = (a) + b
+	|	d = ((a)) + b
+	|	e = f((a), (b + 1))
+	|	g = (a).field
+	|	h = (a)[0]
+	|	i = -(a)
+	|	j = (a)..(b)
+	|	k = not (a)
+	|	a
+
+STRING_SOURCE: String = raw
+	|func strings(name: String, count: Int) -> String:
+	|	plain = "plain \n \t \u{1F600} \" \\ ünï"
+	|	raw_text = raw"raw \n ${not} a hole"
+	|	pipe =
+	|		|first line
+	|		||second line
+	|	raw_pipe = raw
+	|		|raw \n pipe
+	|		|second ${x}
+	|	interpolated = "hello ${name}, ${count + 1} and ${"nested ${name} here"} done"
+	|	pipe_interpolated =
+	|		|value ${name}
+	|		|next ${count}
+	|	deep = "a ${f("b ${g}")} d"
+	|	only_hole = "${name}"
+	|	brace_text = "kept ${name} \{ \} } {"
+	|	empty = ""
+	|	unicode = "héllo ${name} wörld ünï"
+	|	after_hole = "${name} \n \t \\ \" \q \${count} end"
+	|	plain
+
+BRACE_SOURCE: String = raw
+	|record Point {
+	|	x: Int,
+	|	y: Int
+	|}
+	|
+	|func braces(x: Int, r: Point) -> Int:
+	|	record_literal = {x = 1}
+	|	empty = {}
+	|	vector = {x}
+	|	vectors = {1, 2, 3,}
+	|	dict = {"a" => 1}
+	|	dicts = {"a" => 1, "b" => 2,}
+	|	updated = {r | x = 1}
+	|	updates = {r | x = 1, y = 2}
+	|	nested = {{}}
+	|	keyed = {(1, 2) => {3}}
+	|	fields = {
+	|		x = 1,
+	|		y = 2,
+	|	}
+	|	entries = {
+	|		"a" => 1,
+	|		"b" => 2,
+	|	}
+	|	x
+
+CHAIN_SOURCE: String = raw
+	|func chains(xs: List[Int], name: String) -> Int:
+	|	xs
+	|		.map(func(x): x + 1)
+	|		.filter(func(x): x > 1)
+	|		.length()
+	|	ys = xs
+	|		.map(func(item): item * 2)
+	|	f(func(): 1)
+	|		.g()
+	|	total = xs.fold(0, func(acc, x):
+	|		next = acc + x
+	|		next
+	|	)
+	|	name.length().to_string().length()
+
+ANCHORED_SOURCE: String = raw
+	|func anchored(n: Int, items: List[Int]) -> Int:
+	|	pick = if n > 0:
+	|		"positive"
+	|	else:
+	|		"other"
+	|	kind = match n:
+	|		0: "zero"
+	|		_: if n > 10:
+	|			"big"
+	|		else:
+	|			"small"
+	|	total = items.fold(0, func(acc, x):
+	|		if x > 0:
+	|			acc + x
+	|		else:
+	|			acc
+	|	)
+	|	if n > 1:
+	|		1
+	|	-- a comment between the branches
+	|	else if n > 2:
+	|		2
+	|	-- and another
+	|	else:
+	|		3
+
+CONTROL_SOURCE: String = raw
+	|func control(n: Int, xs: List[Int], pair: (Int, Int)) -> Int:
+	|	var total = 0
+	|	while total < n:
+	|		total += 1
+	|		if total == 3:
+	|			continue
+	|		if total > 5:
+	|			break
+	|	for item in xs:
+	|		total += item
+	|	for (left, right) in pairs:
+	|		total += left * right
+	|	for i in 0..n:
+	|		total -= i
+	|	match n:
+	|		0 | 1:
+	|			"small"
+	|		-1:
+	|			"negative"
+	|		Shape.Circle(r):
+	|			r
+	|		Some([first, second, ...rest]):
+	|			first
+	|		Some([_, ..._]):
+	|			1
+	|		None:
+	|			2
+	|		(a, -1.5):
+	|			a
+	|		_:
+	|			"other"
+	|	total
+
+PATTERN_SOURCE: String = raw
+	|func patterns(text: String, number: Int, real: Float, letter: Char, flag: Bool) -> Int:
+	|	match text:
+	|		"plain":
+	|			1
+	|		raw"raw\n":
+	|			2
+	|		_:
+	|			3
+	|	match number:
+	|		-5:
+	|			1
+	|		-9223372036854775808:
+	|			2
+	|		0 | 1 | 2:
+	|			3
+	|		_:
+	|			4
+	|	match real:
+	|		-1.5:
+	|			1
+	|		2.0:
+	|			2
+	|		_:
+	|			3
+	|	match letter:
+	|		'a':
+	|			1
+	|		'\n':
+	|			2
+	|		_:
+	|			3
+	|	match flag:
+	|		True:
+	|			1
+	|		False:
+	|			2
+
+STATEMENT_SOURCE: String = raw
+	|func statements(xs: List[Int], pair: (Int, Int)) -> Int:
+	|	var total: Int = 0
+	|	limit: Int = 10
+	|	var untyped = 5
+	|	total += 1
+	|	total -= 2
+	|	total *= 3
+	|	total /= 4
+	|	untyped = 7
+	|	item ?= xs.first()
+	|	typed: Int ?= xs.last()
+	|	xs[0] = 5
+	|	grid[1, 2] = 6
+	|	(a, _) = pair
+	|	(b, c, d) = triple
+	|	var later =
+	|		compute()
+	|	o = into_opaque Email(total)
+	|	p = from_opaque Email(o)
+	|	grid: Float[#3, #4] = zeros()
+	|	box: Wrapper[Int, #N] = make()
+	|	void
+	|
+	|func builtins() -> Int: builtin("helper")
+	|
+	|func bare(): builtin
+	|
+	|limit: Int = 3 + 4
+	|
+	|var counter: Int = 0
+
+LAMBDA_SOURCE: String = raw
+	|func lambdas(xs: List[Int]) -> Int:
+	|	a = func(): 1
+	|	b = func(x): x + 1
+	|	c = func(x: Int, y: Int) -> Int: x + y
+	|	d = pure func(x: Int) -> Int: x
+	|	e = func(x, y):
+	|		z = x + y
+	|		z
+	|	pure func local(x: Int) -> Int:
+	|		x * 2
+	|	func other(y):
+	|		y
+	|	func outer[T](m: T) -> T where #N == 3:
+	|		func inner(k: Int) -> Int:
+	|			k
+	|		m
+	|	xs.map(func(v): v + 1).filter(pure func(v: Int) -> Bool: v > 0)[0]
+	|	local(1) + other(2)
+
+CONCURRENCY_SOURCE: String = raw
+	|func concurrency(xs: List[Int], ch: Channel[Int]) -> Int:
+	|	for item in xs concurrently(limit: 4):
+	|		work(item)
+	|	for item in xs concurrently(limit: 2, timeout: 5):
+	|		work(item)
+	|	concurrent(max_threads: 2, timeout: 10):
+	|		work()
+	|	concurrent:
+	|		work()
+	|	concurrent(timeout: 3):
+	|		work()
+	|	concurrent(max_threads: 007):
+	|		work()
+	|	for item in xs concurrently(limit: 99999999999999999999):
+	|		work(item)
+	|	select:
+	|		msg from ch:
+	|			msg
+	|		sealed ch:
+	|			0
+	|		_ after 5:
+	|			1
+	|	with file ?= open("x") on e => wrap(e):
+	|		file.read()
+	|	with handle: Handle = open("y"):
+	|		handle.read()
+	|	with other ?= open("z"):
+	|		other.read()
+	|	debug:
+	|		log(1)
+	|	detach work()
+	|	0
+
+MEMBER_SOURCE: String = raw
+	|---
+	|A module.
+	|---
+	|import:
+	|	./a
+	|
+	|---
+	|A documented function.
+	|---
+	|func documented() -> Int:
+	|	1
+	|
+	|-- not a docstring
+	|func undocumented() -> Int:
+	|	2
+	|
+	|---
+	|A documented, annotated function.
+	|---
+	|@tail_recursive
+	|func annotated(n: Int) -> Int:
+	|	n
+	|
+	|---
+	|A docstring, then a comment.
+	|---
+	|-- the comment
+	|func commented() -> Int:
+	|	4
+	|
+	|---
+	|A private documented function.
+	|---
+	|private pure func quiet() -> Int:
+	|	5
+	|
+	|record Point {x: Int}
+	|
+	|trait Shape[T]:
+	|	pure func area(self: T) -> Float
+	|	func describe(self: T) -> String:
+	|		"shape"
+	|
+	|implements Shape for Point:
+	|	pure func area(self: Point) -> Float:
+	|		self.x
+	|
+	|	@tail_recursive
+	|	func describe(self: Point) -> String:
+	|		"point"
+	|
+	|private func hidden() -> Int:
+	|	3
+	|
+	|private limit: Int = 4
+
+
+func test_operators_calls_and_literals_match() -> Bool:
+	rebuilds(EXPRESSION_SOURCE, 2)
+
+
+func test_a_parenthesized_name_keeps_its_own_span() -> Bool:
+	rebuilds(GROUPED_NAME_SOURCE, 1)
+
+
+func test_strings_and_interpolation_match() -> Bool:
+	rebuilds(STRING_SOURCE, 1)
+
+
+func test_brace_forms_match() -> Bool:
+	rebuilds(BRACE_SOURCE, 2)
+
+
+func test_leading_dot_chains_after_lambdas_match() -> Bool:
+	rebuilds(CHAIN_SOURCE, 1)
+
+
+func test_anchored_if_and_match_values_and_comments_between_branches_match() -> Bool:
+	rebuilds(ANCHORED_SOURCE, 1)
+
+
+func test_loops_and_match_cases_match() -> Bool:
+	rebuilds(CONTROL_SOURCE, 1)
+
+
+func test_every_pattern_kind_matches() -> Bool:
+	rebuilds(PATTERN_SOURCE, 1)
+
+
+func test_bindings_assignments_conversions_builtins_and_globals_match() -> Bool:
+	rebuilds(STATEMENT_SOURCE, 5)
+
+
+func test_lambdas_and_local_functions_match() -> Bool:
+	rebuilds(LAMBDA_SOURCE, 1)
+
+
+func test_concurrency_select_with_and_debug_forms_match() -> Bool:
+	rebuilds(CONCURRENCY_SOURCE, 1)
+
+
+func test_bodies_of_documented_traits_impls_and_private_members_match() -> Bool:
+	rebuilds(MEMBER_SOURCE, 11)
+
+
+ESCAPE_SOURCE: String = raw
+	|func escapes(d: Int) -> String:
+	|	after_hole = "${d} \u{41} \u{1F600}x"
+	|	before_hole = "x\u{41}{y}${d}"
+	|	around = "\u{41} ${d} \u{42}"
+	|	braces_first = "{kept} ${d}"
+	|	braces_after = "kept ${d} \{ \} } {"
+	|	backslashes = "\\n ${d} \\{ \\}"
+	|	unknown = "${d} \q \$ \${d}"
+	|	after_hole
+
+
+func test_escapes_and_braces_around_holes_match() -> Bool:
+	rebuilds(ESCAPE_SOURCE, 1)
+
+
+---
+Interpolation nested three levels deep is interpolated at every level here. The
+existing lexer leaves the innermost string a plain literal (`"c {h}"`), a known
+difference (`docs/issues/interpolation_nesting_in_the_existing_lexer.md`, listed
+in `ADAPTER_DIFFERENCES` through the `known_differences` fixture).
+---
+func test_interpolation_three_levels_deep_is_interpolated_at_every_level() -> Bool:
+	source: String = "func f(h: Int) -> String:\n\t\"a " + HOLE_OPENER + "f(\"b " + HOLE_OPENER + "g(\"c " + HOLE_OPENER + "h}\")}\")} d\"\n"
+
+	match adapter_differences(source):
+		Some((_, differences)):
+			differences.any(
+				pure func(
+					difference,
+				): (
+					difference.path.ends_with(".kind")
+					and difference.old_text == "\"string_literal\""
+					and difference.new_text == "\"string_interp\""
+				),
+			)
+		None:
 			False
 
 
-func test_a_declaration_with_a_body_gets_the_placeholder_body() -> Bool:
+---
+A chain of `DEEP_OPERANDS` operands nests that many levels deep, and a body the
+adapter rebuilds does not recurse over them.
+---
+func test_a_deeply_nested_body_is_rebuilt_without_recursion() -> Bool:
+	var chain: String = "1"
+
+	for operand in 0..DEEP_OPERANDS:
+		chain += " + ${operand}"
+
+	match discovered({ROOT_PATH => "func deep() -> Int:\n\t${chain}\n"}):
+		Some(tables):
+			match reader_of(tables):
+				Some(reader):
+					match legacy_parsed_program(reader, module_id_at_row(0)):
+						Ok(program):
+							(
+								program.decls.length() == 1
+								and first_body_spine_length(program) == DEEP_OPERANDS
+							)
+						Err(_):
+							False
+				None:
+					False
+		None:
+			False
+
+
+---
+How many binary operations the left spine of the first function's body holds:
+the chain's depth, followed one level at a time.
+---
+func first_body_spine_length(program: ParsedProgram) -> Int:
+	var spine: Int = 0
+
+	match program.decls.get(0):
+		Some(FunctionParsedDecl(function_decl)):
+			var current: Option[ParsedExpr] = function_decl.body
+
+			-- The body is a block of one expression.
+			match current:
+				Some(ParsedBlockExpr(items, _)):
+					current = items.get(0)
+				_:
+					void
+
+			var following: Bool = True
+
+			while following:
+				match current:
+					Some(ParsedBinaryExpr(_, left, _, _)):
+						spine += 1
+						current = Some(left)
+					_:
+						following = False
+		_:
+			void
+
+	spine
+
+
+DEEP_OPERANDS: Int = 6000
+
+---
+`$` then `{`: spelled apart so a test source can hold an interpolation hole
+without opening one here.
+---
+HOLE_OPENER: String = "$" + "{"
+
+
+---
+A `concurrently` loop with no `limit` is something the parser reports, and the
+tables then hold a loop without the parameter the existing AST requires: the
+adapter reports the node, and does not invent a limit.
+---
+func test_a_concurrently_loop_without_a_limit_is_a_malformed_node() -> Bool:
 	match discovered(
-		{ROOT_PATH => "func f() -> Int:\n\t1\n\nfunc g() -> Int\n\nanswer: Int = 4\n"},
+		{
+			ROOT_PATH => "func f(xs: List[Int]) -> Int:\n\tfor x in xs concurrently():\n\t\tx\n\t0\n",
+		},
 	):
 		Some(tables):
-			match adapted_first_module(tables):
-				Some(adapted):
-					match (adapted.decls.get(0), adapted.decls.get(1), adapted.decls.get(2)):
-						(Some(FunctionParsedDecl(with_body)), Some(FunctionParsedDecl(without_body)), Some(VarParsedDecl(global))):
-							(
-								is_placeholder(with_body.body)
-								and without_body.body.is_none()
-								and is_placeholder(Some(global.value))
-							)
+			match reader_of(tables):
+				Some(reader):
+					match legacy_parsed_program(reader, module_id_at_row(0)):
+						Err(MalformedNode(_, ConcurrentForNode)):
+							True
 						_:
 							False
 				None:
@@ -315,7 +818,7 @@ func test_the_comparison_reports_a_changed_field() -> Bool:
 	)
 	changed: ParsedProgram = { existing | decls = existing.decls.drop(1) }
 	differences: List[JsonDifference] = program_differences(
-		parsed_program_to_json(declarations_only(existing)),
+		parsed_program_to_json(with_holes_parsed(existing)),
 		parsed_program_to_json(changed),
 	)
 
@@ -363,7 +866,7 @@ func test_a_table_the_parser_left_incomplete_is_an_error_not_a_default() -> Bool
 		Some(tables):
 			match reader_of(tables):
 				Some(reader):
-					match legacy_parsed_declarations(reader, module_id_at_row(0)):
+					match legacy_parsed_program(reader, module_id_at_row(0)):
 						Err(MissingTableRow(DimensionNameTable, _)):
 							True
 						_:
@@ -455,7 +958,7 @@ func test_the_stages_seed_names_equal_the_existing_vocabulary() -> Bool:
 
 
 tests: TestSuite = {
-	description = "Legacy discovery adapter, declarations",
+	description = "Legacy discovery adapter",
 	tests = [
 		("generic functions and bounds match", test_functions_with_generics_and_bounds_match),
 		("qualified bounds and supertraits match", test_qualified_bounds_and_supertraits_match),
@@ -481,7 +984,43 @@ tests: TestSuite = {
 		("annotated functions match", test_annotated_functions_match),
 		("parameter binders match", test_parameter_binders_match),
 		("spans after non-ASCII text match", test_non_ascii_text_spans_match),
-		("a body is the placeholder", test_a_declaration_with_a_body_gets_the_placeholder_body),
+		("operators, calls and literals match", test_operators_calls_and_literals_match),
+		("a parenthesized name keeps its own span", test_a_parenthesized_name_keeps_its_own_span),
+		("strings and interpolation match", test_strings_and_interpolation_match),
+		("brace forms match", test_brace_forms_match),
+		("leading dot chains after lambdas match", test_leading_dot_chains_after_lambdas_match),
+		(
+			"anchored if and match values and comments between branches match",
+			test_anchored_if_and_match_values_and_comments_between_branches_match,
+		),
+		("loops and match cases match", test_loops_and_match_cases_match),
+		("every pattern kind matches", test_every_pattern_kind_matches),
+		(
+			"bindings, assignments, conversions, builtins and globals match",
+			test_bindings_assignments_conversions_builtins_and_globals_match,
+		),
+		("lambdas and local functions match", test_lambdas_and_local_functions_match),
+		(
+			"concurrency, select, with and debug forms match",
+			test_concurrency_select_with_and_debug_forms_match,
+		),
+		(
+			"bodies of documented traits, impls and private members match",
+			test_bodies_of_documented_traits_impls_and_private_members_match,
+		),
+		("escapes and braces around holes match", test_escapes_and_braces_around_holes_match),
+		(
+			"interpolation three levels deep is interpolated at every level",
+			test_interpolation_three_levels_deep_is_interpolated_at_every_level,
+		),
+		(
+			"a deeply nested body is rebuilt without recursion",
+			test_a_deeply_nested_body_is_rebuilt_without_recursion,
+		),
+		(
+			"a concurrently loop without a limit is a malformed node",
+			test_a_concurrently_loop_without_a_limit_is_a_malformed_node,
+		),
 		("the comparison reports a changed field", test_the_comparison_reports_a_changed_field),
 		(
 			"modules are named as the existing front end names them",
