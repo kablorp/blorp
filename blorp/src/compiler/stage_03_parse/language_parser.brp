@@ -134,6 +134,8 @@ import:
 		unpacked_string_literal_text_id,
 	list: list
 	parsed_ast:
+		ConcurrentForLimit(MissingLimit, WrittenLimit),
+		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
 		MAX_UNION_VARIANT_FIELDS,
 		ParsedBinaryOp(
 			ParsedAddOp,
@@ -154,7 +156,8 @@ import:
 			ParsedAssignMultiplyOp,
 			ParsedAssignSubtractOp,
 		),
-		ParsedConcurrentParam,
+		ParsedConcurrentBlockOptions,
+		ParsedConcurrentForOptions,
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
 			ForeignBlockParsedDecl,
@@ -645,17 +648,28 @@ private record ParseExprListStep {
 }
 
 
+---
+One `name: value` pair as written, before the parser checks it against the
+names its construct accepts.
+---
+private record ConcurrentParameterSyntax {
+	name: ParsedIdentifier,
+	value: ParsedExpr,
+	span: SourceLocation
+}
+
+
 private record ParseConcurrentParamStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	value: ParsedConcurrentParam
+	value: ConcurrentParameterSyntax
 }
 
 
 private record ParseConcurrentParamListStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	values: List[ParsedConcurrentParam]
+	values: List[ConcurrentParameterSyntax]
 }
 
 
@@ -5274,6 +5288,241 @@ private pure func parse_with_expr(
 	}
 
 
+private CONCURRENT_PARAM_MAX_THREADS: String = "max_threads"
+
+private CONCURRENT_PARAM_TIMEOUT: String = "timeout"
+
+private CONCURRENT_PARAM_LIMIT: String = "limit"
+
+---
+Which construct owns a parenthesized concurrency parameter list. The two
+constructs accept different names, so validation needs to know the owner.
+---
+private enum ConcurrentParamOwner:
+	ConcurrentBlockParams
+	ConcurrentForParams
+
+
+---
+What a parameter list holds after the parser has checked it: the first valid
+count (`max_threads` or `limit`) and the first `timeout`.
+---
+private record ConcurrentParameterScan {
+	diagnostics: List[ParseDiagnostic],
+	count: Option[Int],
+	timeout: Option[ParsedExpr]
+}
+
+
+---
+The positive integer a literal writes, or None for any other expression,
+zero or a negative number. Negation is a separate expression node, so `-1`
+is not a literal here. `parse_int` saturates a literal above `Int`'s range
+and this accepts the saturated value; rejecting oversized literals is a
+general rule for typecheck (a literal must fit its type), not a check here.
+---
+private pure func positive_int_literal_value(value: ParsedExpr) -> Option[Int]:
+	match value:
+		ParsedIntLiteralExpr(text, _):
+			match text.parse_int():
+				Some(number):
+					if number > 0:
+						Some(number)
+					else:
+						None
+				None:
+					None
+		_:
+			None
+
+
+private pure func add_concurrent_param_error(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	span: SourceLocation,
+	message: String,
+	help: String,
+) -> List[ParseDiagnostic]:
+	add_expected_error(state, diagnostics, span, message, [], Some(help))
+
+
+---
+Checks a parenthesized concurrency parameter list against its owner's rules
+and returns what it holds. `concurrent(...)` takes optional `max_threads` (a
+positive integer literal) and `timeout`; `for ... concurrently(...)` requires
+`limit` (a positive integer literal) and takes optional `timeout`; each name
+appears at most once. `close_span` locates the missing-`limit` diagnostic.
+---
+private pure func scan_concurrent_params(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	owner: ConcurrentParamOwner,
+	params: List[ConcurrentParameterSyntax],
+	close_span: SourceLocation,
+) -> ConcurrentParameterScan:
+	var next_diag: List[ParseDiagnostic] = diagnostics
+	var count: Option[Int] = None
+	var timeout: Option[ParsedExpr] = None
+	var seen: List[String] = []
+	var count_named: Bool = False
+	count_name: String = match owner:
+		ConcurrentBlockParams:
+			CONCURRENT_PARAM_MAX_THREADS
+		ConcurrentForParams:
+			CONCURRENT_PARAM_LIMIT
+	count_example: String = match owner:
+		ConcurrentBlockParams:
+			"concurrent(max_threads: 4):"
+		ConcurrentForParams:
+			"concurrently(limit: 4)"
+
+	for param in params:
+		name: String = param.name.text
+
+		if name == count_name:
+			count_named = True
+
+		if name == count_name or name == CONCURRENT_PARAM_TIMEOUT:
+			if seen.contains(name):
+				next_diag = add_concurrent_param_error(
+					state,
+					next_diag,
+					param.name.span,
+					"duplicate `${name}` parameter",
+					"remove the second `${name}`",
+				)
+			else:
+				seen = seen.append(name)
+
+				if name == CONCURRENT_PARAM_TIMEOUT:
+					timeout = Some(param.value)
+				else:
+					count = positive_int_literal_value(param.value)
+
+					if count.is_none():
+						next_diag = add_concurrent_param_error(
+							state,
+							next_diag,
+							parsed_expr_location(param.value),
+							"`${name}` must be a positive integer literal",
+							"write `${count_example}`",
+						)
+		else:
+			match owner:
+				ConcurrentBlockParams:
+					next_diag = add_concurrent_param_error(
+						state,
+						next_diag,
+						param.name.span,
+						"unknown concurrent parameter `${name}` (expected `max_threads` or `timeout`)",
+						"remove `${name}`; `concurrent(...)` accepts `max_threads` and `timeout`",
+					)
+				ConcurrentForParams:
+					if name == CONCURRENT_PARAM_MAX_THREADS:
+						next_diag = add_concurrent_param_error(
+							state,
+							next_diag,
+							param.name.span,
+							"unknown concurrently parameter `max_threads` (expected `limit` or `timeout`)",
+							"use `limit: N` in `concurrently(...)`; `max_threads` is only valid on `concurrent(...)` blocks",
+						)
+					else:
+						next_diag = add_concurrent_param_error(
+							state,
+							next_diag,
+							param.name.span,
+							"unknown concurrently parameter `${name}` (expected `limit` or `timeout`)",
+							"remove `${name}`; `concurrently(...)` accepts `limit` and `timeout`",
+						)
+
+	match owner:
+		ConcurrentForParams:
+			if not count_named and params.length() > 0:
+				next_diag = add_concurrent_param_error(
+					state,
+					next_diag,
+					close_span,
+					"`for ... concurrently(...)` requires `limit: N`",
+					"write `concurrently(limit: 4)`; `limit` is the maximum number of items in flight",
+				)
+		ConcurrentBlockParams:
+			void
+
+	{
+		diagnostics = next_diag,
+		count = count,
+		timeout = timeout
+	}
+
+
+private record ConcurrentBlockOptionsStep {
+	diagnostics: List[ParseDiagnostic],
+	options: ParsedConcurrentBlockOptions
+}
+
+
+private record ConcurrentForOptionsStep {
+	diagnostics: List[ParseDiagnostic],
+	options: ParsedConcurrentForOptions
+}
+
+
+private pure func concurrent_block_options(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	params: List[ConcurrentParameterSyntax],
+	close_span: SourceLocation,
+) -> ConcurrentBlockOptionsStep:
+	scan: ConcurrentParameterScan = scan_concurrent_params(
+		state,
+		diagnostics,
+		ConcurrentBlockParams,
+		params,
+		close_span,
+	)
+	max_threads: ConcurrentThreadLimit = match scan.count:
+		Some(count):
+			ThreadLimit(count)
+		None:
+			DefaultThreadLimit
+
+	{
+		diagnostics = scan.diagnostics,
+		options = {
+			max_threads = max_threads,
+			timeout = scan.timeout
+		}
+	}
+
+
+private pure func concurrent_for_options(
+	state: ParserInput,
+	diagnostics: List[ParseDiagnostic],
+	params: List[ConcurrentParameterSyntax],
+	close_span: SourceLocation,
+) -> ConcurrentForOptionsStep:
+	scan: ConcurrentParameterScan = scan_concurrent_params(
+		state,
+		diagnostics,
+		ConcurrentForParams,
+		params,
+		close_span,
+	)
+	limit: ConcurrentForLimit = match scan.count:
+		Some(count):
+			WrittenLimit(count)
+		None:
+			MissingLimit
+
+	{
+		diagnostics = scan.diagnostics,
+		options = {
+			limit = limit,
+			timeout = scan.timeout
+		}
+	}
+
+
 private pure func parse_concurrent_param(
 	state: ParserInput,
 	index: Int,
@@ -5321,7 +5570,7 @@ private pure func parse_concurrent_param_list_after_left_paren(
 ) -> ParseConcurrentParamListStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	var values: List[ParsedConcurrentParam] = []
+	var values: List[ConcurrentParameterSyntax] = []
 
 	if current_is_symbol(state, st, RightParenSymbol):
 		st_diag = add_expected_error(
@@ -5377,7 +5626,10 @@ private pure func parse_concurrent_block_expr(
 	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	var params: List[ParsedConcurrentParam] = []
+	var options: ParsedConcurrentBlockOptions = {
+		max_threads = DefaultThreadLimit,
+		timeout = None
+	}
 
 	if current_is_symbol(state, st, LeftParenSymbol):
 		params_step: ParseConcurrentParamListStep = parse_concurrent_param_list_after_left_paren(
@@ -5386,11 +5638,17 @@ private pure func parse_concurrent_block_expr(
 			st_diag,
 			"omit the parentheses for a concurrent block with no parameters",
 		)
-		params = params_step.values
+		options_step: ConcurrentBlockOptionsStep = concurrent_block_options(
+			state,
+			params_step.diagnostics,
+			params_step.values,
+			current_location(state, params_step.index),
+		)
+		options = options_step.options
 		right_step: ParseSymbolStep = expect_symbol(state, params_step.index, RightParenSymbol)
 		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			params_step.diagnostics,
+			options_step.diagnostics,
 			right_step,
 			RightParenSymbol,
 			"expected `)` after concurrent parameters",
@@ -5417,7 +5675,7 @@ private pure func parse_concurrent_block_expr(
 		index = body_step.index,
 		diagnostics = body_step.diagnostics,
 		value = ParsedConcurrentBlockExpr(
-			params,
+			options,
 			body_step.value,
 			location_cover(start_span, parsed_expr_location(body_step.value)),
 		)
@@ -5435,7 +5693,10 @@ private pure func parse_concurrent_for_tail(
 ) -> ParseExprStep:
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	var params: List[ParsedConcurrentParam] = []
+	var options: ParsedConcurrentForOptions = {
+		limit = MissingLimit,
+		timeout = None
+	}
 
 	if current_is_symbol(state, st, LeftParenSymbol):
 		params_step: ParseConcurrentParamListStep = parse_concurrent_param_list_after_left_paren(
@@ -5444,11 +5705,17 @@ private pure func parse_concurrent_for_tail(
 			st_diag,
 			"write at least `limit: N` inside concurrently(...)",
 		)
-		params = params_step.values
+		options_step: ConcurrentForOptionsStep = concurrent_for_options(
+			state,
+			params_step.diagnostics,
+			params_step.values,
+			current_location(state, params_step.index),
+		)
+		options = options_step.options
 		right_step: ParseSymbolStep = expect_symbol(state, params_step.index, RightParenSymbol)
 		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 			state,
-			params_step.diagnostics,
+			options_step.diagnostics,
 			right_step,
 			RightParenSymbol,
 			"expected `)` after concurrently parameters",
@@ -5486,7 +5753,7 @@ private pure func parse_concurrent_for_tail(
 		value = ParsedConcurrentForExpr(
 			binder,
 			iterable,
-			params,
+			options,
 			body_step.value,
 			location_cover(start_span, parsed_expr_location(body_step.value)),
 		)

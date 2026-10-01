@@ -27,7 +27,6 @@ import:
 	memory: same_object
 	parsed_ast:
 		ParsedBinaryOp,
-		ParsedConcurrentParam,
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
 			ForeignBlockParsedDecl,
@@ -232,8 +231,8 @@ record SelectArmsResult {
 }
 
 
-record ConcurrentParamsResult {
-	params: List[ParsedConcurrentParam],
+record ConcurrentTimeoutResult {
+	timeout: Option[ParsedExpr],
 	diagnostics: List[ParseDiagnostic],
 	names: NameTable
 }
@@ -905,16 +904,15 @@ private pure func collect_free_with_error_map(
 			[]
 
 
-private pure func collect_free_concurrent_params(
+private pure func collect_free_concurrent_timeout(
 	bound: List[String],
-	params: List[ParsedConcurrentParam],
+	timeout: Option[ParsedExpr],
 ) -> List[IdentifierReference]:
-	var references: List[IdentifierReference] = []
-
-	for param in params:
-		references = references.concat(collect_free_identifiers(bound, param.value))
-
-	references
+	match timeout:
+		Some(expr):
+			collect_free_identifiers(bound, expr)
+		None:
+			[]
 
 
 private pure func collect_free_interpolation_parts(
@@ -1019,14 +1017,14 @@ private pure func collect_free_identifiers(
 				bound,
 				iterable,
 			).concat(collect_free_identifiers(for_binder_bound_names(binder).concat(bound), body))
-		ParsedConcurrentBlockExpr(params, body, _):
-			collect_free_concurrent_params(
+		ParsedConcurrentBlockExpr(options, body, _):
+			collect_free_concurrent_timeout(
 				bound,
-				params,
+				options.timeout,
 			).concat(collect_free_concurrent_block_body(bound, body))
-		ParsedConcurrentForExpr(name, iterable, params, body, _):
+		ParsedConcurrentForExpr(name, iterable, options, body, _):
 			collect_free_identifiers(bound, iterable)
-				.concat(collect_free_concurrent_params(bound, params))
+				.concat(collect_free_concurrent_timeout(bound, options.timeout))
 				.concat(collect_free_identifiers([name.text].concat(bound), body))
 		ParsedDetachExpr(body, _):
 			collect_free_identifiers(bound, body)
@@ -1201,16 +1199,15 @@ private pure func rewrite_identifier_with_binding(
 	}
 
 
-private pure func rewrite_identifier_concurrent_params(
+private pure func rewrite_identifier_concurrent_timeout(
 	rewrites: List[NameRewrite],
-	params: List[ParsedConcurrentParam],
-) -> List[ParsedConcurrentParam]:
-	var values: List[ParsedConcurrentParam] = []
-
-	for param in params:
-		values = values.append({ param | value = rewrite_identifier_expr(rewrites, param.value) })
-
-	values
+	timeout: Option[ParsedExpr],
+) -> Option[ParsedExpr]:
+	match timeout:
+		Some(expr):
+			Some(rewrite_identifier_expr(rewrites, expr))
+		None:
+			None
 
 
 private pure func rewrite_identifier_interpolation_parts(
@@ -1388,17 +1385,17 @@ private pure func rewrite_identifier_expr(
 				rewrite_identifier_expr(rewrites, body),
 				span,
 			)
-		ParsedConcurrentBlockExpr(params, body, span):
+		ParsedConcurrentBlockExpr(options, body, span):
 			ParsedConcurrentBlockExpr(
-				rewrite_identifier_concurrent_params(rewrites, params),
+				{ options | timeout = rewrite_identifier_concurrent_timeout(rewrites, options.timeout) },
 				rewrite_identifier_expr(rewrites, body),
 				span,
 			)
-		ParsedConcurrentForExpr(name, iterable, params, body, span):
+		ParsedConcurrentForExpr(name, iterable, options, body, span):
 			ParsedConcurrentForExpr(
 				name,
 				rewrite_identifier_expr(rewrites, iterable),
-				rewrite_identifier_concurrent_params(rewrites, params),
+				{ options | timeout = rewrite_identifier_concurrent_timeout(rewrites, options.timeout) },
 				rewrite_identifier_expr(rewrites, body),
 				span,
 			)
@@ -1887,21 +1884,19 @@ private pure func rewrite_subscript_read_match_cases(
 	rewritten
 
 
-private pure func rewrite_subscript_read_concurrent_params(
-	params: List[ParsedConcurrentParam],
-) -> List[ParsedConcurrentParam]:
-	var rewritten: List[ParsedConcurrentParam] = params
-	var index: Int = 0
+private pure func rewrite_subscript_read_concurrent_timeout(
+	timeout: Option[ParsedExpr],
+) -> Option[ParsedExpr]:
+	match timeout:
+		Some(expr):
+			rewritten = rewrite_subscript_read_expr(expr)
 
-	for param in params:
-		value = rewrite_subscript_read_expr(param.value)
-
-		if not same_object(value, param.value):
-			rewritten = rewritten.set(index, { param | value = value })
-
-		index += 1
-
-	rewritten
+			if same_object(rewritten, expr):
+				timeout
+			else:
+				Some(rewritten)
+		None:
+			None
 
 
 private pure func rewrite_subscript_read_select_arm_kind(
@@ -2251,22 +2246,26 @@ private pure func rewrite_subscript_read_expr(expr: ParsedExpr) -> ParsedExpr:
 				expr
 			else:
 				ParsedForExpr(binder, rewritten_iterable, rewritten_body, span)
-		ParsedConcurrentBlockExpr(params, body, span):
-			rewritten_params = rewrite_subscript_read_concurrent_params(params)
+		ParsedConcurrentBlockExpr(options, body, span):
+			rewritten_timeout = rewrite_subscript_read_concurrent_timeout(options.timeout)
 			rewritten_body = rewrite_subscript_read_expr(body)
 
-			if same_object(rewritten_params, params) and same_object(rewritten_body, body):
+			if same_object(rewritten_timeout, options.timeout) and same_object(rewritten_body, body):
 				expr
 			else:
-				ParsedConcurrentBlockExpr(rewritten_params, rewritten_body, span)
-		ParsedConcurrentForExpr(name, iterable, params, body, span):
+				ParsedConcurrentBlockExpr(
+					{ options | timeout = rewritten_timeout },
+					rewritten_body,
+					span,
+				)
+		ParsedConcurrentForExpr(name, iterable, options, body, span):
 			rewritten_iterable = rewrite_subscript_read_expr(iterable)
-			rewritten_params = rewrite_subscript_read_concurrent_params(params)
+			rewritten_timeout = rewrite_subscript_read_concurrent_timeout(options.timeout)
 			rewritten_body = rewrite_subscript_read_expr(body)
 
 			if (
 				same_object(rewritten_iterable, iterable)
-				and same_object(rewritten_params, params)
+				and same_object(rewritten_timeout, options.timeout)
 				and same_object(rewritten_body, body)
 			):
 				expr
@@ -2274,7 +2273,7 @@ private pure func rewrite_subscript_read_expr(expr: ParsedExpr) -> ParsedExpr:
 				ParsedConcurrentForExpr(
 					name,
 					rewritten_iterable,
-					rewritten_params,
+					{ options | timeout = rewritten_timeout },
 					rewritten_body,
 					span,
 				)
@@ -2672,27 +2671,26 @@ private pure func finalize_select_arms(
 	}
 
 
-private pure func finalize_concurrent_params(
+private pure func finalize_concurrent_timeout(
 	table: SourceTable,
 	module_name: String,
 	compilation_names: NameTable,
-	items: List[ParsedConcurrentParam],
-) -> ConcurrentParamsResult:
-	var values: List[ParsedConcurrentParam] = []
-	var diagnostics: List[ParseDiagnostic] = []
-	var running_names: NameTable = compilation_names
-
-	for item in items:
-		value = finalize_interpolation_expr(table, module_name, running_names, item.value)
-		running_names = value.names
-		values = values.append({ item | value = value.value })
-		diagnostics = diagnostics.concat(value.diagnostics)
-
-	{
-		params = values,
-		diagnostics = diagnostics,
-		names = running_names
-	}
+	timeout: Option[ParsedExpr],
+) -> ConcurrentTimeoutResult:
+	match timeout:
+		Some(expr):
+			value = finalize_interpolation_expr(table, module_name, compilation_names, expr)
+			{
+				timeout = Some(value.value),
+				diagnostics = value.diagnostics,
+				names = value.names
+			}
+		None:
+			{
+				timeout = None,
+				diagnostics = [],
+				names = compilation_names
+			}
 
 
 private pure func finalize_with_error_map(
@@ -3204,38 +3202,42 @@ private pure func finalize_interpolation_expr(
 				diagnostics = iter_result.diagnostics.concat(body_result.diagnostics),
 				names = body_result.names
 			}
-		ParsedConcurrentBlockExpr(params, body, span):
-			params_result = finalize_concurrent_params(
+		ParsedConcurrentBlockExpr(options, body, span):
+			params_result = finalize_concurrent_timeout(
 				table,
 				module_name,
 				compilation_names,
-				params,
+				options.timeout,
 			)
 			body_result = finalize_interpolation_expr(table, module_name, params_result.names, body)
 			{
-				value = ParsedConcurrentBlockExpr(params_result.params, body_result.value, span),
+				value = ParsedConcurrentBlockExpr(
+					{ options | timeout = params_result.timeout },
+					body_result.value,
+					span,
+				),
 				diagnostics = params_result.diagnostics.concat(body_result.diagnostics),
 				names = body_result.names
 			}
-		ParsedConcurrentForExpr(name, iterable, params, body, span):
+		ParsedConcurrentForExpr(name, iterable, options, body, span):
 			iter_result = finalize_interpolation_expr(
 				table,
 				module_name,
 				compilation_names,
 				iterable,
 			)
-			params_result = finalize_concurrent_params(
+			params_result = finalize_concurrent_timeout(
 				table,
 				module_name,
 				iter_result.names,
-				params,
+				options.timeout,
 			)
 			body_result = finalize_interpolation_expr(table, module_name, params_result.names, body)
 			{
 				value = ParsedConcurrentForExpr(
 					name,
 					iter_result.value,
-					params_result.params,
+					{ options | timeout = params_result.timeout },
 					body_result.value,
 					span,
 				),

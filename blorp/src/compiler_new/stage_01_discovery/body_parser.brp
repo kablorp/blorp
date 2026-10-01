@@ -77,6 +77,13 @@ import:
 			BreakOutsideLoopDiagnostic,
 			ConcurrentForTupleBinderDiagnostic,
 			ContinueOutsideLoopDiagnostic,
+			ConcurrentDuplicateParameterDiagnostic,
+			ConcurrentForMaxThreadsDiagnostic,
+			ConcurrentForMissingLimitDiagnostic,
+			ConcurrentForUnknownParameterDiagnostic,
+			ConcurrentLimitNotPositiveLiteralDiagnostic,
+			ConcurrentMaxThreadsNotPositiveLiteralDiagnostic,
+			ConcurrentUnknownParameterDiagnostic,
 			DiscardedQuestionBindDiagnostic,
 			ExpectedAssignmentOperatorDiagnostic,
 			ExpectedBuiltinNameDiagnostic,
@@ -103,7 +110,12 @@ import:
 			WithMultipleBindingsDiagnostic,
 		),
 	lexer: lex_interpolation_hole
-	name_vocabulary: DISCARD_NAME_INDEX, REMOVED_INTO_NAME_INDEX
+	name_vocabulary:
+		DISCARD_NAME_INDEX,
+		LIMIT_NAME_INDEX,
+		MAX_THREADS_NAME_INDEX,
+		REMOVED_INTO_NAME_INDEX,
+		TIMEOUT_NAME_INDEX
 	parser_cursor:
 		at,
 		at_block_end,
@@ -1986,6 +1998,37 @@ private pure func parse_tuple_loop_binder(builder: DiscoveryBuilder) -> Discover
 
 
 ---
+Which construct owns a concurrency parameter list; the two accept different
+names (`max_threads` versus `limit`).
+---
+private enum ConcurrentParameterOwner:
+	ConcurrentBlockOwner
+	ConcurrentForOwner
+
+
+---
+Which parameter a name is, for the concurrency parameter rules. The spelling
+is matched once, in `concurrent_parameter_name`.
+---
+private enum ConcurrentParameterName:
+	MaxThreadsParameter
+	LimitParameter
+	TimeoutParameter
+	UnknownParameter
+
+
+---
+The builder after a parameter list, plus the parameters seen so far (for
+duplicate and missing-`limit` checks).
+---
+private record ConcurrentParameterRun {
+	builder: DiscoveryBuilder,
+	seen: List[ConcurrentParameterName],
+	count_named: Bool
+}
+
+
+---
 The `(name: value, ...)` after `concurrently`, each parameter pushed; a
 missing `(` is reported.
 ---
@@ -1994,50 +2037,202 @@ private pure func parse_concurrent_parameters_after_concurrently(
 ) -> DiscoveryBuilder:
 	if builder.at(LeftParenSymbol):
 		advanced: DiscoveryBuilder = builder.advance_token()
-		advanced.parse_concurrent_parameter_list()
+		advanced.parse_concurrent_parameter_list(ConcurrentForOwner)
 	else:
 		builder.report_at_current(ExpectedLeftParenDiagnostic)
 
 
 ---
-Concurrent parameters after `(`, through the `)`; at least one.
+Concurrent parameters after `(`, through the `)`; at least one. The rules
+match the existing parser: `concurrent` takes optional `max_threads` and
+`timeout`; `concurrently` requires `limit` and takes optional `timeout`; a
+count is a positive integer literal and every name appears once.
 ---
-private pure func parse_concurrent_parameter_list(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder.parse_concurrent_parameters()
+private pure func parse_concurrent_parameter_list(
+	builder: DiscoveryBuilder,
+	owner: ConcurrentParameterOwner,
+) -> DiscoveryBuilder:
+	run: ConcurrentParameterRun = builder.parse_concurrent_parameters(owner)
+	var out: DiscoveryBuilder = run.builder
+
+	if (
+		owner == ConcurrentForOwner
+		and run.seen.length() > 0
+		and not run.count_named
+	):
+		out = out.report_at_current(ConcurrentForMissingLimitDiagnostic)
+
 	out = out.expect_token(RightParenSymbol, ExpectedRightParenDiagnostic)
 	out
 
 
-private pure func parse_concurrent_parameters(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+private pure func parse_concurrent_parameters(
+	builder: DiscoveryBuilder,
+	owner: ConcurrentParameterOwner,
+) -> ConcurrentParameterRun:
 	if builder.at(RightParenSymbol):
-		builder.report_at_current(ExpectedConcurrentParameterDiagnostic)
+		{
+			builder = builder.report_at_current(ExpectedConcurrentParameterDiagnostic),
+			seen = [],
+			count_named = False
+		}
 	else if builder.at(EndOfFileToken):
-		builder
+		{
+			builder = builder,
+			seen = [],
+			count_named = False
+		}
 	else:
-		builder.parse_concurrent_parameter_run()
+		builder.parse_concurrent_parameter_run(owner)
 
 
-private pure func parse_concurrent_parameter_run(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder.parse_concurrent_parameter()
+private pure func parse_concurrent_parameter_run(
+	builder: DiscoveryBuilder,
+	owner: ConcurrentParameterOwner,
+) -> ConcurrentParameterRun:
+	var out: DiscoveryBuilder = builder
+	var seen: List[ConcurrentParameterName] = []
 
 	while not out.at(RightParenSymbol) and not out.at(EndOfFileToken):
-		out = out.parse_concurrent_parameter()
+		name: ConcurrentParameterName = out.concurrent_parameter_name()
+		out = out.parse_concurrent_parameter(owner, name, seen)
+		seen = seen.append(name)
 
-	out
+	{
+		builder = out,
+		seen = seen,
+		count_named = seen.concurrent_parameter_seen(owner.concurrent_count_parameter())
+	}
+
+
+private pure func concurrent_parameter_seen(
+	seen: List[ConcurrentParameterName],
+	name: ConcurrentParameterName,
+) -> Bool:
+	var found: Bool = False
+
+	for earlier in seen:
+		if earlier == name:
+			found = True
+
+	found
 
 
 ---
-`name: value` and the comma after it, pushed. It always moves the cursor
-unless the cursor is at the `)`, so the list above ends.
+The count parameter `owner` requires or allows: `max_threads` for
+`concurrent`, `limit` for `concurrently`.
 ---
-private pure func parse_concurrent_parameter(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+private pure func concurrent_count_parameter(
+	owner: ConcurrentParameterOwner,
+) -> ConcurrentParameterName:
+	match owner:
+		ConcurrentBlockOwner:
+			MaxThreadsParameter
+		ConcurrentForOwner:
+			LimitParameter
+
+
+---
+Which parameter the token at the cursor names; anything that is not one of
+the three known identifiers is `UnknownParameter`.
+---
+private pure func concurrent_parameter_name(builder: DiscoveryBuilder) -> ConcurrentParameterName:
+	if not builder.at(IdentifierToken):
+		UnknownParameter
+	else if builder.current_token().payload == MAX_THREADS_NAME_INDEX:
+		MaxThreadsParameter
+	else if builder.current_token().payload == LIMIT_NAME_INDEX:
+		LimitParameter
+	else if builder.current_token().payload == TIMEOUT_NAME_INDEX:
+		TimeoutParameter
+	else:
+		UnknownParameter
+
+
+---
+Reports a parameter whose name `owner` does not accept, that repeats an
+earlier name, or whose count is not a positive integer literal. Like the
+existing parser, only the first occurrence of a name has its value checked.
+`value` is the parameter's parsed value node.
+---
+private pure func check_concurrent_parameter(
+	builder: DiscoveryBuilder,
+	owner: ConcurrentParameterOwner,
+	name: ConcurrentParameterName,
+	seen: List[ConcurrentParameterName],
+	name_span: Span,
+	value: NodeId,
+) -> DiscoveryBuilder:
+	count: ConcurrentParameterName = owner.concurrent_count_parameter()
+
+	if name == count or name == TimeoutParameter:
+		if seen.concurrent_parameter_seen(name):
+			builder.append_plain_diagnostic(ConcurrentDuplicateParameterDiagnostic, name_span)
+		else if name == count and not builder.is_positive_integer_literal(value):
+			code: DiscoveryDiagnosticCode = match owner:
+				ConcurrentBlockOwner:
+					ConcurrentMaxThreadsNotPositiveLiteralDiagnostic
+				ConcurrentForOwner:
+					ConcurrentLimitNotPositiveLiteralDiagnostic
+			builder.append_plain_diagnostic(code, builder.node_span(value))
+		else:
+			builder
+	else:
+		code: DiscoveryDiagnosticCode = match owner:
+			ConcurrentBlockOwner:
+				ConcurrentUnknownParameterDiagnostic
+			ConcurrentForOwner:
+				if name == MaxThreadsParameter:
+					ConcurrentForMaxThreadsDiagnostic
+				else:
+					ConcurrentForUnknownParameterDiagnostic
+		builder.append_plain_diagnostic(code, name_span)
+
+
+---
+True when `value` is an integer literal node that is positive. `2 + 2`, `-1`
+and calls are other node kinds. Like the existing parser it accepts a
+literal above `Int`'s range, which `parse_int` saturates; rejecting those is
+a general typecheck rule, not a check here.
+---
+private pure func is_positive_integer_literal(builder: DiscoveryBuilder, value: NodeId) -> Bool:
+	row: NodeRow = builder.node_row_at(value)
+
+	match row.kind:
+		IntegerLiteralNode:
+			match builder.literals.get(row.payload):
+				Some(text):
+					match text.parse_int():
+						Some(number):
+							number > 0
+						None:
+							False
+				None:
+					False
+		_:
+			False
+
+
+---
+`name: value` and the comma after it, pushed, checked against `owner`'s
+rules. It always moves the cursor unless the cursor is at the `)`, so the
+list above ends.
+---
+private pure func parse_concurrent_parameter(
+	builder: DiscoveryBuilder,
+	owner: ConcurrentParameterOwner,
+	parameter: ConcurrentParameterName,
+	seen: List[ConcurrentParameterName],
+) -> DiscoveryBuilder:
 	before: Int = builder.token_cursor
 	name: NameId = builder.referenced_name_at_cursor()
 	name_span: Span = builder.current_span()
 	var out: DiscoveryBuilder = builder.consume_referenced_name()
 	out = out.expect_token(ColonSymbol, ExpectedColonDiagnostic)
 	out = out.parse_expression()
-	value_span: Span = out.node_span(out.last_node_id())
+	value: NodeId = out.last_node_id()
+	value_span: Span = out.node_span(value)
+	out = out.check_concurrent_parameter(owner, parameter, seen, name_span, value)
 	out = out.push_last_node()
 	out = out.append_named_parent_node_from_stack(
 		ConcurrentParameterNode,
@@ -2068,7 +2263,7 @@ private pure func parse_concurrent_block(builder: DiscoveryBuilder) -> Discovery
 
 	if out.at(LeftParenSymbol):
 		out = out.advance_token()
-		out = out.parse_concurrent_parameter_list()
+		out = out.parse_concurrent_parameter_list(ConcurrentBlockOwner)
 
 	out = out.expect_token(ColonSymbol, ExpectedColonDiagnostic)
 	out = out.parse_block_in_loop_context(NotInLoop, start)

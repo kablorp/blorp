@@ -2669,6 +2669,12 @@ func main(args: List[String]) -> Int:
     0
 ```
 
+`limit` is required and must be a positive integer literal; `timeout` is
+optional. Each name may appear once and no other names are accepted, so
+`concurrently(limit: 0)`, `concurrently(limit: n)` and `concurrently(timeout: 5)`
+without a `limit` are parse errors. (`max_threads` belongs to `concurrent(...)`
+blocks, not loops.)
+
 Loop-wide timeouts accept either raw integer milliseconds or typed `Duration`
 values:
 
@@ -2858,7 +2864,7 @@ func pool_example() -> Int:
 -- bin/blorp run program.brp --threads 4
 ```
 
-The thread pool is lazily initialized on first concurrent operation. Global OS-worker capacity comes from `BLORP_THREADS`, `--threads`, or the platform default. The `max_threads` parameter must be a positive integer literal and limits only that `concurrent:` block's active child tasks; it does not resize the process-wide worker pool.
+The thread pool is lazily initialized on first concurrent operation. Global OS-worker capacity comes from `BLORP_THREADS`, `--threads`, or the platform default. The `max_threads` parameter is optional on `concurrent(...)`, must be a positive integer literal (`0`, negative numbers and expressions are parse errors), may appear once, and limits only that `concurrent:` block's active child tasks; it does not resize the process-wide worker pool. `concurrent(...)` accepts only `max_threads` and `timeout`; `for ... concurrently(...)` uses `limit` instead and requires it.
 
 ### Virtual Threads (Fibers)
 

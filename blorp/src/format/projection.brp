@@ -12,6 +12,8 @@ import:
 	../compiler/stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_diagnostic_to_string
 	../compiler/stage_03_parse/language_parser: parse_compiler_source
 	../compiler/stage_03_parse/parsed_ast:
+		ConcurrentForLimit(MissingLimit, WrittenLimit),
+		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
 		ParsedBinaryOp(
 			ParsedAddOp,
 			ParsedDivideOp,
@@ -32,7 +34,8 @@ import:
 			ParsedAssignMultiplyOp,
 			ParsedAssignSubtractOp,
 		),
-		ParsedConcurrentParam,
+		ParsedConcurrentBlockOptions,
+		ParsedConcurrentForOptions,
 		ParsedDecl(
 			BuiltinTypeParsedDecl,
 			ForeignBlockParsedDecl,
@@ -1499,10 +1502,10 @@ private pure func project_expr_with_comments(
 						project_expr_with_comments(table, iterable, comments),
 						project_expr_with_comments(table, body, comments),
 					)
-		ParsedConcurrentBlockExpr(params, body, _):
-			project_concurrent_expr(table, params, body, comments)
-		ParsedConcurrentForExpr(name, iterable, params, body, _):
-			project_concurrently_loop_expr(table, name.text, iterable, params, body, comments)
+		ParsedConcurrentBlockExpr(options, body, _):
+			project_concurrent_expr(table, options, body, comments)
+		ParsedConcurrentForExpr(name, iterable, options, body, _):
+			project_concurrently_loop_expr(table, name.text, iterable, options, body, comments)
 		ParsedDetachExpr(body, _):
 			DetachExpression(project_expr_with_comments(table, body, comments))
 		ParsedBreakExpr(_):
@@ -1622,48 +1625,30 @@ private pure func project_with_expr(
 	)
 
 
-private pure func concurrent_param_expr(
+private pure func concurrent_timeout_expr(
 	table: SourceTable,
-	params: List[ParsedConcurrentParam],
-	name: String,
+	timeout: Option[ParsedExpr],
 	comments: List[FormatterComment],
 ) -> Option[Expression]:
-	var result: Option[Expression] = None
-
-	for param in params:
-		if result.is_none() and param.name.text == name:
-			result = Some(project_expr_with_comments(table, param.value, comments))
-
-	result
-
-
-private pure func concurrent_param_int(
-	params: List[ParsedConcurrentParam],
-	name: String,
-) -> Option[Int]:
-	var result: Option[Int] = None
-
-	for param in params:
-		if result.is_none() and param.name.text == name:
-			match param.value:
-				ParsedIntLiteralExpr(value, _):
-					result = value.parse_int()
-				_:
-					result = None
-
-	result
+	timeout.map(func(expr): project_expr_with_comments(table, expr, comments))
 
 
 private pure func project_concurrent_expr(
 	table: SourceTable,
-	params: List[ParsedConcurrentParam],
+	options: ParsedConcurrentBlockOptions,
 	body: ParsedExpr,
 	comments: List[FormatterComment],
 ) -> Expression:
+	max_threads: Option[Int] = match options.max_threads:
+		DefaultThreadLimit:
+			None
+		ThreadLimit(count):
+			Some(count)
+
 	ConcurrentExpression(
 		block_exprs_for_concurrent(table, body, comments),
-		concurrent_param_expr(table, params, "timeout", comments),
-		concurrent_param_int(params, "max_threads"),
+		concurrent_timeout_expr(table, options.timeout, comments),
+		max_threads,
 	)
 
 
@@ -1671,16 +1656,24 @@ private pure func project_concurrently_loop_expr(
 	table: SourceTable,
 	name: String,
 	iterable: ParsedExpr,
-	params: List[ParsedConcurrentParam],
+	options: ParsedConcurrentForOptions,
 	body: ParsedExpr,
 	comments: List[FormatterComment],
 ) -> Expression:
+	-- The formatter refuses buffers with parse errors, so `MissingLimit` (a
+	-- header the parser rejected) never reaches here; 0 only keeps the match total.
+	limit: Int = match options.limit:
+		WrittenLimit(count):
+			count
+		MissingLimit:
+			0
+
 	ConcurrentlyLoopExpression(
 		name,
 		project_expr_with_comments(table, iterable, comments),
 		project_expr_with_comments(table, body, comments),
-		concurrent_param_expr(table, params, "timeout", comments),
-		ConcurrentlyLoopLimit(concurrent_param_int(params, "limit").get_or(0)),
+		concurrent_timeout_expr(table, options.timeout, comments),
+		ConcurrentlyLoopLimit(limit),
 	)
 
 

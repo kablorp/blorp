@@ -496,8 +496,9 @@ debug_block = "debug" ":" NEWLINE INDENT stmt_list DEDENT ;
 concurrent_expr = "concurrent" [ "(" concurrent_params ")" ] ":" NEWLINE INDENT stmt_list DEDENT
                 | "for" IDENT "in" expr "concurrently" "(" concurrently_params ")" ":" NEWLINE INDENT stmt_list DEDENT ;
 
-concurrent_params = concurrent_param [ "," concurrent_param ] ;
-concurrent_param  = IDENT ":" expr ;
+concurrent_params = concurrent_param { "," concurrent_param } ;
+concurrent_param  = "max_threads" ":" INT
+                  | "timeout" ":" expr ;
 
 concurrently_params = concurrently_param { "," concurrently_param } ;
 concurrently_param  = "limit" ":" INT
@@ -505,6 +506,14 @@ concurrently_param  = "limit" ":" INT
 
 detach_expr = "detach" unary_expr ;
 ```
+
+`INT` in `concurrent_param` and `concurrently_param` is a positive integer
+literal; `0`, negative numbers and expressions such as `2 + 2` are parse errors.
+Each name appears at most once, `concurrent(...)` accepts no name but
+`max_threads` and `timeout`, and `for ... concurrently(...)` requires `limit`
+and accepts no name but `limit` and `timeout`. The parser rejects all of these,
+so the typechecker only checks that `timeout` is `Int` milliseconds or
+`Duration`.
 
 `debug_block` returns `Void`. Normal builds erase the body after Core lowering;
 `--debug` builds and `blorp test` retain it.

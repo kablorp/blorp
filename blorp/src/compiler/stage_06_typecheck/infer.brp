@@ -30,6 +30,8 @@ import:
 		name_table_find_id,
 		tuple_field_name_id,
 	../stage_03_parse/parsed_ast:
+		ConcurrentForLimit(MissingLimit, WrittenLimit),
+		ConcurrentThreadLimit,
 		ParsedBinaryOp(
 			ParsedAddOp,
 			ParsedDivideOp,
@@ -49,7 +51,8 @@ import:
 			ParsedAssignMultiplyOp,
 			ParsedAssignSubtractOp,
 		),
-		ParsedConcurrentParam,
+		ParsedConcurrentBlockOptions,
+		ParsedConcurrentForOptions,
 		ParsedDictEntry,
 		ParsedExpr(
 			ParsedAscriptionExpr,
@@ -519,11 +522,7 @@ import:
 	types: type_from_parsed_type_expr
 
 
-CONCURRENT_PARAM_MAX_THREADS: String = "max_threads"
-
 CONCURRENT_PARAM_TIMEOUT: String = "timeout"
-
-CONCURRENT_FOR_PARAM_LIMIT: String = "limit"
 
 
 union ExprTypeOrigin:
@@ -694,11 +693,42 @@ record TypedAssignTarget {
 }
 
 
-record TypedConcurrentParam {
-	name: ParsedIdentifier,
-	value: TypedExpr,
-	span: SourceLocation
+---
+Typed options of a `concurrent(...)` block; see `ParsedConcurrentBlockOptions`.
+---
+record TypedConcurrentBlockOptions {
+	max_threads: ConcurrentThreadLimit,
+	timeout: Option[TypedExpr]
 }
+
+
+---
+Typed options of `for x in xs concurrently(...)`; see `ParsedConcurrentForOptions`.
+---
+record TypedConcurrentForOptions {
+	limit: Int,
+	timeout: Option[TypedExpr]
+}
+
+
+---
+The expressions a `concurrent(...)` block's options hold, for the passes that
+only walk sub-expressions.
+---
+pure func typed_concurrent_block_option_exprs(options: TypedConcurrentBlockOptions) -> List[TypedExpr]:
+	match options.timeout:
+		Some(timeout):
+			[timeout]
+		None:
+			[]
+
+
+pure func typed_concurrent_for_option_exprs(options: TypedConcurrentForOptions) -> List[TypedExpr]:
+	match options.timeout:
+		Some(timeout):
+			[timeout]
+		None:
+			[]
 
 
 record TypedConcurrentBinding {
@@ -777,8 +807,8 @@ union TypedExpr:
 	TypedSelectExpr(List[TypedSelectArm], SourceLocation, TypedExprInfo)
 	TypedWhileExpr(TypedExpr, TypedExpr, SourceLocation, TypedExprInfo)
 	TypedForExpr(ParsedForBinder, TypedExpr, Option[TypedLoopView], TypedExpr, SourceLocation, TypedExprInfo)
-	TypedConcurrentBlockExpr(List[TypedConcurrentParam], List[TypedConcurrentBinding], SourceLocation, TypedExprInfo)
-	TypedConcurrentForExpr(ParsedIdentifier, TypedExpr, List[TypedConcurrentParam], TypedExpr, SourceLocation, TypedExprInfo)
+	TypedConcurrentBlockExpr(TypedConcurrentBlockOptions, List[TypedConcurrentBinding], SourceLocation, TypedExprInfo)
+	TypedConcurrentForExpr(ParsedIdentifier, TypedExpr, TypedConcurrentForOptions, TypedExpr, SourceLocation, TypedExprInfo)
 	TypedDetachExpr(TypedExpr, SourceLocation, TypedExprInfo)
 	TypedAscriptionExpr(TypedExpr, SemanticType, SourceLocation, TypedExprInfo)
 	TypedBlockExpr(List[TypedExpr], SourceLocation, TypedExprInfo)
@@ -887,9 +917,15 @@ private record InferCallArgsResult {
 }
 
 
-private record InferConcurrentParamsResult {
+private record InferConcurrentBlockOptionsResult {
 	context: InferContext,
-	params: List[TypedConcurrentParam]
+	options: TypedConcurrentBlockOptions
+}
+
+
+private record InferConcurrentForOptionsResult {
+	context: InferContext,
+	options: TypedConcurrentForOptions
 }
 
 
@@ -2040,10 +2076,10 @@ private pure func typed_expr_with_info(expr: TypedExpr, info: TypedExprInfo) -> 
 			TypedWhileExpr(condition, body, span, info)
 		TypedForExpr(binder, iterable, loop_view, body, span, _):
 			TypedForExpr(binder, iterable, loop_view, body, span, info)
-		TypedConcurrentBlockExpr(params, bindings, span, _):
-			TypedConcurrentBlockExpr(params, bindings, span, info)
-		TypedConcurrentForExpr(name, iterable, params, body, span, _):
-			TypedConcurrentForExpr(name, iterable, params, body, span, info)
+		TypedConcurrentBlockExpr(options, bindings, span, _):
+			TypedConcurrentBlockExpr(options, bindings, span, info)
+		TypedConcurrentForExpr(name, iterable, options, body, span, _):
+			TypedConcurrentForExpr(name, iterable, options, body, span, info)
 		TypedDetachExpr(body, span, _):
 			TypedDetachExpr(body, span, info)
 		TypedAscriptionExpr(inner, source_type, span, _):
@@ -2539,17 +2575,17 @@ private pure func typed_select_arms_type_error(arms: List[TypedSelectArm]) -> Op
 	result
 
 
-private pure func typed_concurrent_params_type_error(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_type_error(
+	exprs: List[TypedExpr],
 ) -> Option[String]:
 	var result: Option[String] = None
 
-	for param in params:
+	for expr in exprs:
 		match result:
 			Some(_):
 				break
 			None:
-				result = typed_expr_type_error(param.value)
+				result = typed_expr_type_error(expr)
 
 	result
 
@@ -2713,18 +2749,18 @@ pure func typed_expr_type_error(expr: TypedExpr) -> Option[String]:
 							Some(message)
 						None:
 							typed_expr_type_error(body)
-				TypedConcurrentBlockExpr(params, bindings, _, _):
-					match typed_concurrent_params_type_error(params):
+				TypedConcurrentBlockExpr(options, bindings, _, _):
+					match typed_concurrent_option_exprs_type_error(typed_concurrent_block_option_exprs(options)):
 						Some(message):
 							Some(message)
 						None:
 							typed_concurrent_bindings_type_error(bindings)
-				TypedConcurrentForExpr(_, iterable, params, body, _, _):
+				TypedConcurrentForExpr(_, iterable, options, body, _, _):
 					match typed_expr_type_error(iterable):
 						Some(message):
 							Some(message)
 						None:
-							match typed_concurrent_params_type_error(params):
+							match typed_concurrent_option_exprs_type_error(typed_concurrent_for_option_exprs(options)):
 								Some(message):
 									Some(message)
 								None:
@@ -2948,9 +2984,9 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 				typed_expr_contains_meta(condition) or typed_expr_contains_meta(body)
 			TypedForExpr(_, iterable, _, body, _, _):
 				typed_expr_contains_meta(iterable) or typed_expr_contains_meta(body)
-			TypedConcurrentBlockExpr(params, bindings, _, _):
+			TypedConcurrentBlockExpr(options, bindings, _, _):
 				(
-					params.any(func(param): typed_expr_contains_meta(param.value))
+					typed_concurrent_block_option_exprs(options).any(func(expr): typed_expr_contains_meta(expr))
 					or bindings.any(
 						func(
 							binding,
@@ -2960,10 +2996,10 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 						),
 					)
 				)
-			TypedConcurrentForExpr(_, iterable, params, body, _, _):
+			TypedConcurrentForExpr(_, iterable, options, body, _, _):
 				(
 					typed_expr_contains_meta(iterable)
-					or params.any(func(param): typed_expr_contains_meta(param.value))
+					or typed_concurrent_for_option_exprs(options).any(func(expr): typed_expr_contains_meta(expr))
 					or typed_expr_contains_meta(body)
 				)
 			TypedDetachExpr(body, _, _):
@@ -3226,15 +3262,11 @@ private pure func zonk_typed_select_arm(context: Context, arm: TypedSelectArm) -
 	}
 
 
-private pure func zonk_typed_concurrent_param(
+private pure func zonk_typed_concurrent_timeout(
 	context: Context,
-	param: TypedConcurrentParam,
-) -> TypedConcurrentParam:
-	{
-		name = param.name,
-		value = zonk_typed_expr(context, param.value),
-		span = param.span
-	}
+	timeout: Option[TypedExpr],
+) -> Option[TypedExpr]:
+	timeout.map(func(expr): zonk_typed_expr(context, expr))
 
 
 private pure func zonk_typed_concurrent_binding(
@@ -3504,22 +3536,20 @@ pure func zonk_typed_expr(context: Context, expr: TypedExpr) -> TypedExpr:
 				span,
 				info,
 			)
-		TypedConcurrentBlockExpr(params, bindings, span, _):
+		TypedConcurrentBlockExpr(options, bindings, span, _):
 			TypedConcurrentBlockExpr(
-				params.map(
-					func(param): zonk_typed_concurrent_param(context, param),
-				),
+				{ options | timeout = zonk_typed_concurrent_timeout(context, options.timeout) },
 				bindings.map(func(binding):
 					zonk_typed_concurrent_binding(context, binding)
 				),
 				span,
 				info,
 			)
-		TypedConcurrentForExpr(name, iterable, params, body, span, _):
+		TypedConcurrentForExpr(name, iterable, options, body, span, _):
 			TypedConcurrentForExpr(
 				name,
 				zonk_typed_expr(context, iterable),
-				params.map(func(param): zonk_typed_concurrent_param(context, param)),
+				{ options | timeout = zonk_typed_concurrent_timeout(context, options.timeout) },
 				zonk_typed_expr(context, body),
 				span,
 				info,
@@ -3930,13 +3960,13 @@ private pure func typed_record_fields_purity_requirements(
 	result
 
 
-private pure func typed_concurrent_params_purity_requirements(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_purity_requirements(
+	exprs: List[TypedExpr],
 ) -> List[PurityRequirement]:
 	var result: List[PurityRequirement] = []
 
-	for param in params:
-		result = append_purity_requirements(result, typed_expr_purity_requirements(param.value))
+	for expr in exprs:
+		result = append_purity_requirements(result, typed_expr_purity_requirements(expr))
 
 	result
 
@@ -4142,22 +4172,22 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 				typed_expr_purity_requirements(iterable),
 			)
 			append_purity_requirements(with_iterable, typed_expr_purity_requirements(body))
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			append_purity_requirements(
 				[PuritySyntaxRequirement("concurrent")],
 				append_purity_requirements(
-					typed_concurrent_params_purity_requirements(params),
+					typed_concurrent_option_exprs_purity_requirements(typed_concurrent_block_option_exprs(options)),
 					typed_concurrent_bindings_purity_requirements(bindings),
 				),
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			with_iterable = append_purity_requirements(
 				[PuritySyntaxRequirement("for ... concurrently")],
 				typed_expr_purity_requirements(iterable),
 			)
 			with_params = append_purity_requirements(
 				with_iterable,
-				typed_concurrent_params_purity_requirements(params),
+				typed_concurrent_option_exprs_purity_requirements(typed_concurrent_for_option_exprs(options)),
 			)
 			append_purity_requirements(with_params, typed_expr_purity_requirements(body))
 		TypedDetachExpr(body, _, _):
@@ -4246,13 +4276,13 @@ private pure func typed_record_fields_module_assign_names(
 	result
 
 
-private pure func typed_concurrent_params_module_assign_names(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_module_assign_names(
+	exprs: List[TypedExpr],
 ) -> List[String]:
 	var result: List[String] = []
 
-	for param in params:
-		result = append_module_assign_names(result, typed_expr_module_assign_names(param.value))
+	for expr in exprs:
+		result = append_module_assign_names(result, typed_expr_module_assign_names(expr))
 
 	result
 
@@ -4437,16 +4467,16 @@ pure func typed_expr_module_assign_names(expr: TypedExpr) -> List[String]:
 				typed_expr_module_assign_names(iterable),
 				typed_expr_module_assign_names(body),
 			)
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			append_module_assign_names(
-				typed_concurrent_params_module_assign_names(params),
+				typed_concurrent_option_exprs_module_assign_names(typed_concurrent_block_option_exprs(options)),
 				typed_concurrent_bindings_module_assign_names(bindings),
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			with_iterable = typed_expr_module_assign_names(iterable)
 			with_params = append_module_assign_names(
 				with_iterable,
-				typed_concurrent_params_module_assign_names(params),
+				typed_concurrent_option_exprs_module_assign_names(typed_concurrent_for_option_exprs(options)),
 			)
 			append_module_assign_names(with_params, typed_expr_module_assign_names(body))
 		TypedDetachExpr(body, _, _):
@@ -4587,13 +4617,13 @@ private pure func typed_record_fields_startup_work_scan(
 	result
 
 
-private pure func typed_concurrent_params_startup_work_scan(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_startup_work_scan(
+	exprs: List[TypedExpr],
 ) -> TypedStartupWorkScan:
 	var result = STARTUP_WORK_SCAN_EMPTY
 
-	for param in params:
-		result = append_startup_work_scan(result, typed_expr_startup_work_scan(param.value))
+	for expr in exprs:
+		result = append_startup_work_scan(result, typed_expr_startup_work_scan(expr))
 
 	result
 
@@ -4764,16 +4794,16 @@ pure func typed_expr_startup_work_scan(expr: TypedExpr) -> TypedStartupWorkScan:
 				typed_expr_startup_work_scan(iterable),
 				typed_expr_startup_work_scan(body),
 			)
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			append_startup_work_scan(
-				typed_concurrent_params_startup_work_scan(params),
+				typed_concurrent_option_exprs_startup_work_scan(typed_concurrent_block_option_exprs(options)),
 				typed_concurrent_bindings_startup_work_scan(bindings),
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			with_iterable = typed_expr_startup_work_scan(iterable)
 			with_params = append_startup_work_scan(
 				with_iterable,
-				typed_concurrent_params_startup_work_scan(params),
+				typed_concurrent_option_exprs_startup_work_scan(typed_concurrent_for_option_exprs(options)),
 			)
 			append_startup_work_scan(with_params, typed_expr_startup_work_scan(body))
 		TypedDetachExpr(body, _, _):
@@ -4848,14 +4878,14 @@ private pure func typed_record_fields_have_non_tail_recursive_call(
 	found
 
 
-private pure func typed_concurrent_params_have_non_tail_recursive_call(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_have_non_tail_recursive_call(
+	exprs: List[TypedExpr],
 	function_name: String,
 ) -> Bool:
 	var found: Bool = False
 
-	for param in params:
-		if typed_expr_has_non_tail_recursive_call_inner(param.value, function_name, False):
+	for expr in exprs:
+		if typed_expr_has_non_tail_recursive_call_inner(expr, function_name, False):
 			found = True
 			break
 
@@ -5099,15 +5129,15 @@ private pure func typed_expr_has_non_tail_recursive_call_inner(
 				typed_expr_has_non_tail_recursive_call_inner(iterable, function_name, False)
 				or typed_expr_has_non_tail_recursive_call_inner(body, function_name, False)
 			)
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			(
-				typed_concurrent_params_have_non_tail_recursive_call(params, function_name)
+				typed_concurrent_option_exprs_have_non_tail_recursive_call(typed_concurrent_block_option_exprs(options), function_name)
 				or typed_concurrent_bindings_have_non_tail_recursive_call(bindings, function_name)
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			(
 				typed_expr_has_non_tail_recursive_call_inner(iterable, function_name, False)
-				or typed_concurrent_params_have_non_tail_recursive_call(params, function_name)
+				or typed_concurrent_option_exprs_have_non_tail_recursive_call(typed_concurrent_for_option_exprs(options), function_name)
 				or typed_expr_has_non_tail_recursive_call_inner(body, function_name, False)
 			)
 		TypedDetachExpr(body, _, _):
@@ -5184,15 +5214,15 @@ private pure func typed_record_fields_pure_lambda_impure_call_names(
 	result
 
 
-private pure func typed_concurrent_params_pure_lambda_impure_call_names(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_pure_lambda_impure_call_names(
+	exprs: List[TypedExpr],
 ) -> List[String]:
 	var result: List[String] = []
 
-	for param in params:
+	for expr in exprs:
 		result = append_impure_call_names(
 			result,
-			typed_expr_pure_lambda_impure_call_names(param.value),
+			typed_expr_pure_lambda_impure_call_names(expr),
 		)
 
 	result
@@ -5379,16 +5409,16 @@ pure func typed_expr_pure_lambda_impure_call_names(expr: TypedExpr) -> List[Stri
 				typed_expr_pure_lambda_impure_call_names(iterable),
 				typed_expr_pure_lambda_impure_call_names(body),
 			)
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			append_impure_call_names(
-				typed_concurrent_params_pure_lambda_impure_call_names(params),
+				typed_concurrent_option_exprs_pure_lambda_impure_call_names(typed_concurrent_block_option_exprs(options)),
 				typed_concurrent_bindings_pure_lambda_impure_call_names(bindings),
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			with_iterable = typed_expr_pure_lambda_impure_call_names(iterable)
 			with_params = append_impure_call_names(
 				with_iterable,
-				typed_concurrent_params_pure_lambda_impure_call_names(params),
+				typed_concurrent_option_exprs_pure_lambda_impure_call_names(typed_concurrent_for_option_exprs(options)),
 			)
 			append_impure_call_names(with_params, typed_expr_pure_lambda_impure_call_names(body))
 		TypedDetachExpr(body, _, _):
@@ -5461,15 +5491,15 @@ private pure func typed_record_fields_debug_block_impure_call_names(
 	result
 
 
-private pure func typed_concurrent_params_debug_block_impure_call_names(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_debug_block_impure_call_names(
+	exprs: List[TypedExpr],
 ) -> List[String]:
 	var result: List[String] = []
 
-	for param in params:
+	for expr in exprs:
 		result = append_impure_call_names(
 			result,
-			typed_expr_debug_block_impure_call_names(param.value),
+			typed_expr_debug_block_impure_call_names(expr),
 		)
 
 	result
@@ -5635,16 +5665,16 @@ pure func typed_expr_debug_block_impure_call_names(expr: TypedExpr) -> List[Stri
 				typed_expr_debug_block_impure_call_names(iterable),
 				typed_expr_debug_block_impure_call_names(body),
 			)
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			append_impure_call_names(
-				typed_concurrent_params_debug_block_impure_call_names(params),
+				typed_concurrent_option_exprs_debug_block_impure_call_names(typed_concurrent_block_option_exprs(options)),
 				typed_concurrent_bindings_debug_block_impure_call_names(bindings),
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			with_iterable = typed_expr_debug_block_impure_call_names(iterable)
 			with_params = append_impure_call_names(
 				with_iterable,
-				typed_concurrent_params_debug_block_impure_call_names(params),
+				typed_concurrent_option_exprs_debug_block_impure_call_names(typed_concurrent_for_option_exprs(options)),
 			)
 			append_impure_call_names(with_params, typed_expr_debug_block_impure_call_names(body))
 		TypedDetachExpr(body, _, _):
@@ -5775,15 +5805,15 @@ private pure func typed_expr_has_assignment_inside_debug_block(expr: TypedExpr) 
 				typed_expr_has_assignment_inside_debug_block(iterable)
 				or typed_expr_has_assignment_inside_debug_block(body)
 			)
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			(
-				typed_concurrent_params_have_assignment_inside_debug_block(params)
+				typed_concurrent_option_exprs_have_assignment_inside_debug_block(typed_concurrent_block_option_exprs(options))
 				or typed_concurrent_bindings_have_assignment_inside_debug_block(bindings)
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			(
 				typed_expr_has_assignment_inside_debug_block(iterable)
-				or typed_concurrent_params_have_assignment_inside_debug_block(params)
+				or typed_concurrent_option_exprs_have_assignment_inside_debug_block(typed_concurrent_for_option_exprs(options))
 				or typed_expr_has_assignment_inside_debug_block(body)
 			)
 		TypedWithExpr(binding, body, _, _):
@@ -5839,13 +5869,13 @@ private pure func typed_record_fields_have_assignment_inside_debug_block(
 	found
 
 
-private pure func typed_concurrent_params_have_assignment_inside_debug_block(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_have_assignment_inside_debug_block(
+	exprs: List[TypedExpr],
 ) -> Bool:
 	var found: Bool = False
 
-	for param in params:
-		if typed_expr_has_assignment_inside_debug_block(param.value):
+	for expr in exprs:
+		if typed_expr_has_assignment_inside_debug_block(expr):
 			found = True
 			break
 
@@ -5944,15 +5974,15 @@ pure func typed_expr_has_debug_block_assignment(expr: TypedExpr) -> Bool:
 			typed_expr_has_debug_block_assignment(body)
 		TypedBlockExpr(items, _, _):
 			typed_expr_list_has_debug_block_assignment(items)
-		TypedConcurrentBlockExpr(params, bindings, _, _):
+		TypedConcurrentBlockExpr(options, bindings, _, _):
 			(
-				typed_concurrent_params_have_debug_block_assignment(params)
+				typed_concurrent_option_exprs_have_debug_block_assignment(typed_concurrent_block_option_exprs(options))
 				or typed_concurrent_bindings_have_debug_block_assignment(bindings)
 			)
-		TypedConcurrentForExpr(_, iterable, params, body, _, _):
+		TypedConcurrentForExpr(_, iterable, options, body, _, _):
 			(
 				typed_expr_has_debug_block_assignment(iterable)
-				or typed_concurrent_params_have_debug_block_assignment(params)
+				or typed_concurrent_option_exprs_have_debug_block_assignment(typed_concurrent_for_option_exprs(options))
 				or typed_expr_has_debug_block_assignment(body)
 			)
 		TypedWithExpr(binding, body, _, _):
@@ -6034,13 +6064,13 @@ private pure func typed_select_arms_have_debug_block_assignment(arms: List[Typed
 	found
 
 
-private pure func typed_concurrent_params_have_debug_block_assignment(
-	params: List[TypedConcurrentParam],
+private pure func typed_concurrent_option_exprs_have_debug_block_assignment(
+	exprs: List[TypedExpr],
 ) -> Bool:
 	var found: Bool = False
 
-	for param in params:
-		if typed_expr_has_debug_block_assignment(param.value):
+	for expr in exprs:
+		if typed_expr_has_debug_block_assignment(expr):
 			found = True
 			break
 
@@ -12491,20 +12521,16 @@ private pure func free_var_refs_in_match_cases(
 	result
 
 
-private pure func free_var_refs_in_concurrent_params(
+private pure func free_var_refs_in_concurrent_timeout(
 	env: FreeVarFacts,
 	bound: List[String],
-	params: List[ParsedConcurrentParam],
+	timeout: Option[ParsedExpr],
 ) -> List[String]:
-	var result: List[String] = []
-
-	for param in params:
-		result = name_lists_concat_unique(
-			result,
-			free_var_refs_in_expr(env, bound, param.value),
-		)
-
-	result
+	match timeout:
+		Some(expr):
+			free_var_refs_in_expr(env, bound, expr)
+		None:
+			[]
 
 
 private pure func free_var_refs_in_select_arms(
@@ -12762,17 +12788,17 @@ private pure func free_var_refs_in_expr(
 				free_var_refs_in_with_binding(env, bound, binding),
 				free_var_refs_in_expr(env, body_bound, body),
 			)
-		ParsedConcurrentBlockExpr(params, body, _):
+		ParsedConcurrentBlockExpr(options, body, _):
 			name_lists_concat_unique(
-				free_var_refs_in_concurrent_params(env, bound, params),
+				free_var_refs_in_concurrent_timeout(env, bound, options.timeout),
 				free_var_refs_in_concurrent_block_body(env, bound, body),
 			)
-		ParsedConcurrentForExpr(name, iterable, params, body, _):
+		ParsedConcurrentForExpr(name, iterable, options, body, _):
 			body_bound = name_list_add_unique(bound, name.text)
 			name_lists_concat_unique(
 				name_lists_concat_unique(
 					free_var_refs_in_expr(env, bound, iterable),
-					free_var_refs_in_concurrent_params(env, bound, params),
+					free_var_refs_in_concurrent_timeout(env, bound, options.timeout),
 				),
 				free_var_refs_in_expr(env, body_bound, body),
 			)
@@ -21277,54 +21303,33 @@ private pure func infer_debug_block_expr(
 	infer_result(result_context, typed)
 
 
-private pure func check_concurrent_param_names(
+private pure func infer_concurrent_block_options(
 	context: InferContext,
-	params: List[ParsedConcurrentParam],
-) -> InferContext:
-	var next_context = context
-	var seen: List[String] = []
-
-	for param in params:
-		name = param.name.text
-
-		if not (name == CONCURRENT_PARAM_MAX_THREADS or name == CONCURRENT_PARAM_TIMEOUT):
-			next_context = infer_error(next_context, "Unknown concurrent parameter `" + name + "`")
-		else if seen.contains(name):
-			next_context = infer_error(
-				next_context,
-				"Duplicate concurrent parameter `" + name + "`",
+	options: ParsedConcurrentBlockOptions,
+) -> InferConcurrentBlockOptionsResult:
+	match options.timeout:
+		Some(timeout):
+			timeout_context = infer_with_canonical_expected_value_slot(
+				infer_without_expected(context),
+				TYPE_INT,
+				ExpectedArgumentSlot,
 			)
-		else:
-			seen = seen.append(name)
-
-	next_context
-
-
-private pure func infer_concurrent_params(
-	context: InferContext,
-	params: List[ParsedConcurrentParam],
-) -> InferConcurrentParamsResult:
-	var next_context = check_concurrent_param_names(context, params)
-	var typed_params: List[TypedConcurrentParam] = []
-
-	for param in params:
-		param_context = infer_with_canonical_expected_value_slot(
-			infer_without_expected(next_context),
-			TYPE_INT,
-			ExpectedArgumentSlot,
-		)
-		value_result = infer_expr(param_context, param.value)
-		typed_params = typed_params.append({
-			name = param.name,
-			value = value_result.expr,
-			span = param.span,
-		})
-		next_context = infer_context_with_state(next_context, value_result.context.state)
-
-	{
-		context = next_context,
-		params = typed_params
-	}
+			timeout_result = infer_expr(timeout_context, timeout)
+			{
+				context = infer_context_with_state(context, timeout_result.context.state),
+				options = {
+					max_threads = options.max_threads,
+					timeout = Some(timeout_result.expr)
+				}
+			}
+		None:
+			{
+				context = context,
+				options = {
+					max_threads = options.max_threads,
+					timeout = None
+				}
+			}
 
 
 private pure func check_concurrent_body_shape(
@@ -21735,15 +21740,15 @@ private pure func infer_concurrent_block_bindings(
 
 private pure func infer_concurrent_block_expr(
 	context: InferContext,
-	params: List[ParsedConcurrentParam],
+	options: ParsedConcurrentBlockOptions,
 	body: ParsedExpr,
 	span: SourceLocation,
 ) -> InferResult:
-	params_result = infer_concurrent_params(infer_without_expected(context), params)
-	checked_context = check_concurrent_body_shape(params_result.context, body)
+	options_result = infer_concurrent_block_options(infer_without_expected(context), options)
+	checked_context = check_concurrent_body_shape(options_result.context, body)
 	task_context = check_concurrent_block_task_rules(checked_context, body)
 
-	bindings_result = if task_context.state.errors.length() > params_result.context.state.errors.length():
+	bindings_result = if task_context.state.errors.length() > options_result.context.state.errors.length():
 		{
 			context = task_context,
 			bindings = []
@@ -21753,7 +21758,7 @@ private pure func infer_concurrent_block_expr(
 
 	result_context = infer_context_with_state(context, bindings_result.context.state)
 	typed = TypedConcurrentBlockExpr(
-		params_result.params,
+		options_result.options,
 		bindings_result.bindings,
 		span,
 		inferred_info(result_context, TYPE_VOID),
@@ -22397,80 +22402,42 @@ private pure func timeout_type_ok(timeout_type: SemanticType) -> Bool:
 				False
 
 
-private pure func check_concurrent_for_param_names(
+---
+The parser already guarantees `limit` is a positive integer literal and that
+only `limit` and `timeout` appear, so only `timeout` needs a type check. A
+loop whose parsed limit is `MissingLimit` never gets here; see
+`infer_expr`.
+---
+private pure func infer_concurrent_for_options(
 	context: InferContext,
-	params: List[ParsedConcurrentParam],
-) -> InferContext:
-	var next_context = context
-	var seen: List[String] = []
-
-	for param in params:
-		name = param.name.text
-
-		if not (name == CONCURRENT_FOR_PARAM_LIMIT or name == CONCURRENT_PARAM_TIMEOUT):
-			next_context = infer_error(
-				next_context,
-				"Unknown `for ... concurrently` parameter `" + name + "`",
-			)
-		else if seen.contains(name):
-			next_context = infer_error(
-				next_context,
-				"Duplicate `for ... concurrently` parameter `" + name + "`",
-			)
-		else:
-			seen = seen.append(name)
-
-	next_context
-
-
-private pure func check_concurrent_for_param_type(
-	context: InferContext,
-	name: String,
-	value_type: SemanticType,
-) -> InferContext:
-	if name == CONCURRENT_FOR_PARAM_LIMIT:
-		if int_type_ok(value_type):
-			context
-		else:
-			infer_error(context, "`for ... concurrently(...)` limit must be Int")
-	else if name == CONCURRENT_PARAM_TIMEOUT:
-		if timeout_type_ok(value_type):
-			context
-		else:
-			infer_error(
-				context,
-				"`for ... concurrently(...)` timeout must be Int milliseconds or Duration",
-			)
-	else:
-		context
-
-
-private pure func infer_concurrent_for_params(
-	context: InferContext,
-	params: List[ParsedConcurrentParam],
-) -> InferConcurrentParamsResult:
-	var next_context = check_concurrent_for_param_names(context, params)
-	var typed_params: List[TypedConcurrentParam] = []
-
-	for param in params:
-		value_result = infer_expr(infer_without_expected(next_context), param.value)
-		value_type = typed_expr_value_type(value_result.expr)
-		checked_context = check_concurrent_for_param_type(
-			value_result.context,
-			param.name.text,
-			value_type,
-		)
-		typed_params = typed_params.append({
-			name = param.name,
-			value = value_result.expr,
-			span = param.span,
-		})
-		next_context = infer_context_with_state(next_context, checked_context.state)
-
-	{
-		context = next_context,
-		params = typed_params
-	}
+	limit: Int,
+	timeout: Option[ParsedExpr],
+) -> InferConcurrentForOptionsResult:
+	match timeout:
+		Some(timeout_expr):
+			timeout_result = infer_expr(infer_without_expected(context), timeout_expr)
+			checked_context = if timeout_type_ok(typed_expr_value_type(timeout_result.expr)):
+				timeout_result.context
+			else:
+				infer_error(
+					timeout_result.context,
+					"`for ... concurrently(...)` timeout must be Int milliseconds or Duration",
+				)
+			{
+				context = infer_context_with_state(context, checked_context.state),
+				options = {
+					limit = limit,
+					timeout = Some(timeout_result.expr)
+				}
+			}
+		None:
+			{
+				context = context,
+				options = {
+					limit = limit,
+					timeout = None
+				}
+			}
 
 
 private pure func check_concurrent_for_statement_context(context: InferContext) -> InferContext:
@@ -22523,13 +22490,18 @@ private pure func infer_concurrent_for_expr(
 	context: InferContext,
 	name: ParsedIdentifier,
 	iterable: ParsedExpr,
-	params: List[ParsedConcurrentParam],
+	limit: Int,
+	timeout: Option[ParsedExpr],
 	body: ParsedExpr,
 	span: SourceLocation,
 ) -> InferResult:
 	statement_context = check_concurrent_for_statement_context(context)
-	params_result = infer_concurrent_for_params(infer_without_expected(statement_context), params)
-	iterable_result = infer_expr(infer_without_expected(params_result.context), iterable)
+	options_result = infer_concurrent_for_options(
+		infer_without_expected(statement_context),
+		limit,
+		timeout,
+	)
+	iterable_result = infer_expr(infer_without_expected(options_result.context), iterable)
 	iterable_type = typed_expr_semantic_type(iterable_result.expr)
 	var iterable_context = iterable_result.context
 	var element_type: Option[SemanticType] = None
@@ -22610,7 +22582,7 @@ private pure func infer_concurrent_for_expr(
 	typed = TypedConcurrentForExpr(
 		lowered_name,
 		iterable_result.expr,
-		params_result.params,
+		options_result.options,
 		lowered_body,
 		span,
 		inferred_info(result_context, TYPE_VOID),
@@ -22986,10 +22958,31 @@ private pure func infer_expr_inner(context: InferContext, expr: ParsedExpr) -> I
 			infer_with_expr(context, binding, body, span)
 		ParsedDebugBlockExpr(body, span):
 			infer_debug_block_expr(context, body, span)
-		ParsedConcurrentBlockExpr(params, body, span):
-			infer_concurrent_block_expr(context, params, body, span)
-		ParsedConcurrentForExpr(name, iterable, params, body, span):
-			infer_concurrent_for_expr(context, name, iterable, params, body, span)
+		ParsedConcurrentBlockExpr(options, body, span):
+			infer_concurrent_block_expr(context, options, body, span)
+		ParsedConcurrentForExpr(name, iterable, options, body, span):
+			match options.limit:
+				WrittenLimit(limit):
+					infer_concurrent_for_expr(
+						context,
+						name,
+						iterable,
+						limit,
+						options.timeout,
+						body,
+						span,
+					)
+				MissingLimit:
+					-- The parser already rejected this header; like `ParsedMissingExpr`
+					-- it infers to a missing node, so no loop node with an invented
+					-- width exists. The internal error marks that it reached typecheck.
+					infer_result(
+						infer_error(
+							context,
+							"internal error: `for ... concurrently(...)` reached typecheck without a `limit` the parser accepted",
+						),
+						TypedMissingExpr(span, inferred_info(context, TYPE_VOID)),
+					)
 		ParsedDetachExpr(body, span):
 			infer_detach_expr(context, body, span)
 		ParsedVoidExpr(span):
