@@ -2374,6 +2374,11 @@ its file name), and only a proven case difference is rejected. The compiler repo
 the file's real name (`import `./sub/helper` does not match the file's name
 `sub/Helper.brp``), so code that builds on macOS builds the same way on Linux.
 
+A relative path starts with `./` or with one or more `../`, and names modules
+from there on: `../shared/json` is valid, but `./sub/../shared/json` and
+`./sub/./json` are rejected because `.` and `..` may only begin a path. `./`
+and `../` do not combine: write `../shared/json`, not `./../shared/json`.
+
 ### Import Block Syntax
 
 All imports use the `import:` block syntax. Each module may only be imported once per file. Standard-library modules use bare paths:

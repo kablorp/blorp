@@ -632,6 +632,12 @@ private record ParseModulePathStep {
 }
 
 
+private record ModulePathDotSegmentHelp {
+	segment: String,
+	help: String
+}
+
+
 private record ParseExprStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
@@ -8439,31 +8445,116 @@ private pure func parse_module_path(
 			else:
 				parsing_parent_prefix = False
 
-	first_step: ParseIdentifierStep = parse_identifier_expected(state, st, st_diag, "module path")
+	-- With no `./` or `../` prefix consumed, the first part must be a plain
+	-- name; a `.` or `..` there is not a segment that follows a `/`.
+	first_step: ParseModulePathStep = if prefix.length() == 0:
+		parse_module_path_name(state, st, st_diag)
+	else:
+		parse_module_path_part(state, st, st_diag)
+
 	st = first_step.index
 	st_diag = first_step.diagnostics
-	var path: String = prefix + first_step.value.text
-	var end_span: SourceLocation = first_step.value.span
+	var path: String = prefix + first_step.value
+	var end_span: SourceLocation = first_step.span
 
 	while current_is_symbol(state, st, SlashSymbol):
-		st = advance_parser(state, st)
-		part_step: ParseIdentifierStep = parse_identifier_expected(
+		part_step: ParseModulePathStep = parse_module_path_part(
 			state,
-			st,
+			advance_parser(state, st),
 			st_diag,
-			"module path",
 		)
-		part_text: String = part_step.value.text
+		part_text: String = part_step.value
 		path = "${path}/${part_text}"
 		st = part_step.index
 		st_diag = part_step.diagnostics
-		end_span = part_step.value.span
+		end_span = part_step.span
 
 	{
 		index = st,
 		diagnostics = st_diag,
 		value = path,
 		span = location_cover(start_span, end_span)
+	}
+
+
+---
+One module path part after a `/`. The grammar lets `./` and `../` only begin
+a path, so a `.` or `..` here (`./sub/../sub/Helper`) is reported at that
+token, where discovery's import parser also stops. The segment is consumed
+and kept in the path text so the rest of the path parses without a second
+diagnostic.
+---
+private pure func parse_module_path_part(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+) -> ParseModulePathStep:
+	span: SourceLocation = current_location(state, index)
+
+	match module_path_dot_segment_help(state, index):
+		Some(segment_help):
+			{
+				index = advance_parser(state, index),
+				diagnostics = add_expected_error(
+					state,
+					diagnostics,
+					span,
+					"`${segment_help.segment}` may only begin an import path",
+					[],
+					Some(segment_help.help),
+				),
+				value = segment_help.segment,
+				span = span
+			}
+		None:
+			parse_module_path_name(state, index, diagnostics)
+
+
+---
+The spelling of a `.` or `..` token at `index` and how to rewrite a path
+that uses it past the start.
+---
+private pure func module_path_dot_segment_help(
+	state: ParserInput,
+	index: Int,
+) -> Option[ModulePathDotSegmentHelp]:
+	if current_is_symbol(state, index, DotDotSymbol):
+		Some({
+			segment = "..",
+			help = (
+				"`../` may only repeat at the start of a path; write `./shared/Helper`, not "
+				+ "`./sub/../shared/Helper`"
+			),
+		})
+	else if current_is_symbol(state, index, DotSymbol):
+		Some({
+			segment = ".",
+			help = "`./` may only start a path; write `./sub/Helper`, not `./sub/./Helper`",
+		})
+	else:
+		None
+
+
+---
+One module path part that must be a name, as a path-text step.
+---
+private pure func parse_module_path_name(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+) -> ParseModulePathStep:
+	name_step: ParseIdentifierStep = parse_identifier_expected(
+		state,
+		index,
+		diagnostics,
+		"module path",
+	)
+
+	{
+		index = name_step.index,
+		diagnostics = name_step.diagnostics,
+		value = name_step.value.text,
+		span = name_step.value.span
 	}
 
 
