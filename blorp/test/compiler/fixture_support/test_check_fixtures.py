@@ -280,7 +280,7 @@ class BlorpCheckFixtureRunnerTests(unittest.TestCase):
             compiler = root / "bin" / "blorp"
             compiler.parent.mkdir(parents=True, exist_ok=True)
             compiler.write_text(
-                "#!/bin/sh\nprintf '%s\\n' 'error: pinned.brp:4:9: error: wanted'\nexit 1\n",
+                "#!/bin/sh\nprintf '%s\\n' 'pinned.brp:4:9: error: wanted'\nexit 1\n",
                 encoding="utf-8",
             )
             compiler.chmod(0o755)
