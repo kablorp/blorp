@@ -38,7 +38,7 @@
 -- contiguous block of a child table addressed by a `RowRange`.
 import:
 	debug as dbg
-	discovery_diagnostic_code: DiscoveryDiagnosticCode
+	diagnostic_code: DiscoveryDiagnosticCode
 	intern_index:
 		INITIAL_SLOT_COUNT,
 		NO_ROW,
@@ -71,7 +71,7 @@ A spelling identity: two names with the same spelling share one id.
 opaque type NameId = Int
 
 ---
-One source text read by the walker.
+One source text read by discovery.
 ---
 opaque type SourceId = Int
 
@@ -85,7 +85,7 @@ opaque type PackageId = Int
 opaque type ModuleId = Int
 
 ---
-One root request given to the walker, in the order given.
+One root request given to discovery, in the order given.
 ---
 opaque type RootId = Int
 
@@ -182,7 +182,7 @@ struct ModulePackageRow {
 
 
 ---
-A root given to the walker: a source path, as given.
+A root given to discovery: a source path, as given.
 ---
 struct RootRow {
 	request_path: PathId
@@ -561,7 +561,7 @@ Every discovery table. Flat on purpose: each level of nesting is one more
 uniqueness check a copy-on-write update has to pass.
 
 `diagnostics` holds each module's lex and parse diagnostics, in the module's
-contiguous block; `resolution_diagnostics` holds the walker's: imports that
+contiguous block; `resolution_diagnostics` holds the module graph's: imports that
 loaded no module, and sources that could not be admitted.
 
 The fields after `diagnostic_arguments` are transient: the tokens of the
@@ -1032,7 +1032,7 @@ pure func find_module_by_path(
 
 ---
 Appends a module row and indexes it by its canonical path. Its ranges are
-replaced by the walker once its parse ends.
+closed by `close_module_row` once its parse ends.
 ---
 pure func append_module(builder: DiscoveryBuilder, row: ModuleRow) -> DiscoveryBuilder:
 	index: Int = builder.modules.length()
@@ -1044,8 +1044,8 @@ pure func append_module(builder: DiscoveryBuilder, row: ModuleRow) -> DiscoveryB
 
 
 ---
-Replaces a module's row; the walker appends a module with empty ranges and
-replaces the row with the closed ranges at the end of its parse.
+Replaces a module's row; a module is appended with empty ranges and its row
+replaced with the closed ranges at the end of its parse.
 ---
 pure func replace_module_row(
 	builder: DiscoveryBuilder,
@@ -1054,6 +1054,72 @@ pure func replace_module_row(
 ) -> DiscoveryBuilder:
 	index: Int = module.module_id_index()
 	{ builder | modules = builder.modules.set(index, row) }
+
+
+---
+The row of the module about to be loaded, before any of its rows exist: each
+range starts at the end of its table now and is empty. Append it with
+`append_module` before lexing, and close it with `close_module_row` once the
+parse ends.
+---
+pure func module_row_start(
+	builder: DiscoveryBuilder,
+	canonical_path: PathId,
+	origin: ModuleOriginKind,
+	reach: ModuleReach,
+) -> ModuleRow:
+	{
+		source = builder.next_source_id(),
+		canonical_path = canonical_path,
+		origin = origin,
+		reach = reach,
+		definitions = {
+			first = builder.definitions.length(),
+			count = 0
+		},
+		imports = {
+			first = builder.imports.length(),
+			count = 0
+		},
+		nodes = {
+			first = builder.nodes.length(),
+			count = 0
+		},
+		diagnostics = {
+			first = builder.diagnostics.length(),
+			count = 0
+		}
+	}
+
+
+---
+Replaces `module`'s row with `opening` (the row `module_row_start` returned)
+with every range closed over the rows appended since.
+---
+pure func close_module_row(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	opening: ModuleRow,
+) -> DiscoveryBuilder:
+	closed: ModuleRow = { opening |
+		definitions = {
+			first = opening.definitions.first,
+			count = builder.definitions.length() - opening.definitions.first
+		},
+		imports = {
+			first = opening.imports.first,
+			count = builder.imports.length() - opening.imports.first
+		},
+		nodes = {
+			first = opening.nodes.first,
+			count = builder.nodes.length() - opening.nodes.first
+		},
+		diagnostics = {
+			first = opening.diagnostics.first,
+			count = builder.diagnostics.length() - opening.diagnostics.first
+		}
+	}
+	builder.replace_module_row(module, closed)
 
 
 pure func append_module_package(
@@ -1711,7 +1777,7 @@ pure func advance_token(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 
 
 ---
-Appends a walker diagnostic (an import that loaded no module, a source that
+Appends a module graph diagnostic (an import that loaded no module, a source that
 could not be admitted) with one integer argument, whose meaning `code` fixes.
 ---
 pure func append_resolution_diagnostic_with_argument(
@@ -1734,7 +1800,7 @@ pure func append_resolution_diagnostic_with_argument(
 
 
 ---
-Appends a walker diagnostic with no arguments.
+Appends a module graph diagnostic with no arguments.
 ---
 pure func append_plain_resolution_diagnostic(
 	builder: DiscoveryBuilder,

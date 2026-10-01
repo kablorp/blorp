@@ -1,27 +1,32 @@
--- The module walker: discovery's only loop over modules.
+-- The module graph: how discovery turns a request for a module (a root, or an
+-- import of a loaded module) into what to do about it.
 --
--- Roots are loaded in the order given, then every import in the order its
--- module was loaded and, within a module, in source order (breadth first).
--- A module is loaded once per canonical path, whichever request reaches it
--- first, so ids depend only on the roots and the sources, never on the order
--- in which a provider happens to answer. An import that resolves to no source
--- is recorded as a diagnostic row and discovery goes on.
+-- `resolve_root` and `resolve_import` look a request's candidates up through
+-- the provider and answer with a `RequestResolution`: load this source, reuse
+-- the module already loaded from that path, or why nothing can be loaded.
+-- `pipeline` carries the answer out (it owns loading a module) and records it
+-- with `record_target` or `report_failure`. A module is loaded once per
+-- canonical path, whichever request reaches it first, so ids depend only on
+-- the roots and the sources, never on the order in which a provider happens
+-- to answer. A request that resolves to no source is recorded as a diagnostic
+-- row and discovery goes on.
+--
+-- The state discovery keeps while resolving (directory listings read so far,
+-- and the `ImportQueue`) is handed in and returned as values of its own and
+-- never holds the builder, so the builder threading rules in `tables/builder`
+-- stay with the builder.
 import:
-	declaration_parser: parse_module_declarations
-	discovery_builder:
+	../tables/builder:
 		DiscoveryBuilder,
 		ImportId,
 		ImportRow,
 		ModuleId,
-		ModuleRow,
 		NameId,
 		PackageId,
 		PathId,
 		RootId,
-		SourceId,
 		append_diagnostic_argument,
 		append_import_target,
-		append_module,
 		append_module_package,
 		append_name,
 		append_package,
@@ -31,7 +36,6 @@ import:
 		append_root,
 		append_root_diagnostic,
 		append_root_target,
-		empty_discovery_builder,
 		find_module_by_path,
 		find_name_id,
 		find_path_id,
@@ -41,15 +45,12 @@ import:
 		module_id_index,
 		name_id_index,
 		next_diagnostic_argument_row,
-		next_module_id,
 		next_name_id,
 		next_package_id,
 		next_root_id,
-		next_source_id,
 		package_id_at_row,
 		path_id_index,
-		replace_module_row,
-	discovery_diagnostic_code:
+	../tables/diagnostic_code:
 		DiscoveryDiagnosticCode(
 			ImportCaseMismatchDiagnostic,
 			RootCaseMismatchDiagnostic,
@@ -60,18 +61,16 @@ import:
 			UnresolvedImportDiagnostic,
 			UnresolvedRootDiagnostic,
 		),
-	frontend_tables: FreezeOutcome, freeze
+	../tables/row_kinds: ModuleReach(ImportedModule, RootModule), PackageKind(NativePackage)
+	../tables/span: Span, pack_span
 	fs:
 		DirectoryListing,
 		PathSpelling(ExactSpelling, SpellingUnverifiable, StoredSpelling),
 		SpellingStep(SpellingKnown, SpellingNeedsListing),
 		spelling_below,
-	lexer: lex_source
 	path: normalize
-	row_kinds: ModuleReach(ImportedModule, RootModule), PackageKind(NativePackage)
 	source_admission:
 		SourceRejection(SourceTooLargeToSpan, TooManySourcesToSpan),
-		admit_source,
 		intern_path,
 		interned_path_id,
 		source_rejection,
@@ -88,171 +87,189 @@ import:
 		read_source,
 		root_candidate,
 		source_exists,
-	span: Span, pack_span
 
 
 ---
 An import waiting to be resolved, with the facts of the module it came
 from.
 ---
-private record PendingImport {
+record PendingImport {
 	import_id: ImportId,
 	request: ImportRequest
 }
 
 
 ---
-Where a module came from, for its module row and for resolving its imports.
+The imports of loaded modules that are waiting to be resolved, in the order
+they were found, and how many of them have been taken. The queue never holds
+the builder.
 ---
-private record LoadedModuleFacts {
-	candidate: SourceCandidate,
-	reach: ModuleReach
+record ImportQueue {
+	pending: List[PendingImport],
+	taken: Int
 }
 
 
 ---
-Discovers every module reachable from `roots` (source paths) through
-`provider`, then freezes the tables. Directory listings the spelling checks
-need are read through the provider once each and kept for the whole walk.
+A queue with nothing waiting.
 ---
-func discover[Provider:SourceProvider](
-	provider: Provider,
-	lookup: SourceLookupRoots,
-	roots: List[String],
-) -> FreezeOutcome:
-	var listings: Dict[String, DirectoryListing] = {}
-	var builder: DiscoveryBuilder = empty_discovery_builder()
-	var pending: List[PendingImport] = []
-
-	for root_path in roots:
-		root: RootId = builder.next_root_id()
-		candidate: SourceCandidate = root_candidate(root_path)
-		request_path: PathId = builder.interned_path_id(root_path)
-		builder = builder.intern_path(root_path)
-		builder = builder.append_root({request_path = request_path})
-
-		var root_lookup: CandidateLookup = CandidateFound(candidate)
-
-		if (
-			builder
-				.loaded_module_at(candidate.path)
-				.is_none()
-		):
-			(listed, looked_up) = look_up_candidates(provider, listings, [candidate])
-			listings = listed
-			root_lookup = looked_up
-
-		match root_lookup:
-			CandidateFound(found):
-				modules_before: Int = builder.modules.length()
-				builder = load_or_reuse(provider, builder, found, RootModule, RequestedByRoot(root))
-				pending = pending.concat(builder.newly_loaded_imports(modules_before, found))
-			CandidateSpelledDifferently(stored_names):
-				builder = builder.report_root_case_mismatch(root, stored_names)
-			CandidateSpellingUnverifiable:
-				builder = builder.report_root(root, UnverifiableSpellingDiagnostic)
-			CandidateNotFound:
-				builder = builder.report_root(root, UnresolvedRootDiagnostic)
-
-	var next_pending: Int = 0
-
-	while next_pending < pending.length():
-		match pending.get(next_pending):
-			Some(entry):
-				(listed, looked_up) = look_up_candidates(
-					provider,
-					listings,
-					lookup.import_candidates(entry.request),
-				)
-				listings = listed
-
-				match looked_up:
-					CandidateFound(candidate):
-						modules_before: Int = builder.modules.length()
-						builder = load_or_reuse(
-							provider,
-							builder,
-							candidate,
-							ImportedModule,
-							RequestedByImport(entry.import_id),
-						)
-						pending = pending.concat(
-							builder.newly_loaded_imports(
-								modules_before,
-								candidate,
-							),
-						)
-					CandidateSpelledDifferently(stored_names):
-						builder = builder.report_import_case_mismatch(entry.import_id, stored_names)
-					CandidateSpellingUnverifiable:
-						builder = builder.report_import(
-							entry.import_id,
-							UnverifiableSpellingDiagnostic,
-						)
-					CandidateNotFound:
-						builder = builder.report_import(entry.import_id, UnresolvedImportDiagnostic)
-			None:
-				void
-
-		next_pending += 1
-
-	builder.freeze()
+pure func empty_import_queue() -> ImportQueue:
+	{
+		pending = [],
+		taken = 0
+	}
 
 
 ---
 What asked for a module: a root or an import. Its target or diagnostic
 row is recorded against it.
 ---
-private union ModuleRequester:
+union ModuleRequester:
 	RequestedByRoot(RootId)
 	RequestedByImport(ImportId)
 
 
 ---
-Loads `candidate` for `requester` unless a module was already loaded from
-its path, and records the module as the requester's target; a source that
-cannot be read or admitted is reported against the requester instead.
+What a request for a module came to.
+
+- `LoadSource(candidate, text)`: a source that exists, was read and fits the
+  tables, and no module has been loaded from its path yet.
+- `ModuleAlreadyLoaded(module)`: the request's source is a module already
+  loaded.
+- `SourceMissing`: no candidate exists under any spelling.
+- `SpellingUnknown`: a candidate exists but a directory on the way to it could
+  not be listed, so its spelling is unknown; discovery says so rather than
+  guess.
+- `SpelledWithOtherCase(names)`: no candidate exists exactly, but one exists
+  under different letter case, stored as `names` (the components below its
+  trusted directory).
+- `ReadFailed`: a candidate exists but its text could not be read.
+- `SourceOverLimit(rejection, byte_length)`: the source cannot be admitted.
 ---
-private func load_or_reuse[Provider:SourceProvider](
+union RequestResolution:
+	LoadSource(SourceCandidate, String)
+	ModuleAlreadyLoaded(ModuleId)
+	SourceMissing
+	SpellingUnknown
+	SpelledWithOtherCase(List[String])
+	ReadFailed
+	SourceOverLimit(SourceRejection, Int)
+
+
+---
+Interns the request text of a root and appends its row; read the root's id
+first with `next_root_id`.
+---
+pure func record_root_request(builder: DiscoveryBuilder, root_path: String) -> DiscoveryBuilder:
+	request_path: PathId = builder.interned_path_id(root_path)
+	var out: DiscoveryBuilder = builder.intern_path(root_path)
+	out = out.append_root({request_path = request_path})
+	out
+
+
+---
+Resolves the root `root_path`. Directory listings the spelling checks need
+are read through the provider once each: `listings` holds those read so far
+and the listings to keep are returned with the resolution.
+---
+func resolve_root[Provider:SourceProvider](
 	provider: Provider,
 	builder: DiscoveryBuilder,
-	candidate: SourceCandidate,
-	reach: ModuleReach,
-	requester: ModuleRequester,
-) -> DiscoveryBuilder:
+	listings: Dict[String, DirectoryListing],
+	root_path: String,
+) -> (Dict[String, DirectoryListing], RequestResolution):
+	candidate: SourceCandidate = root_candidate(root_path)
+
 	match builder.loaded_module_at(candidate.path):
 		Some(module):
-			builder.record_target(requester, module)
+			(listings, ModuleAlreadyLoaded(module))
 		None:
-			match provider.read_source(candidate.path):
-				SourceText(text):
-					match builder.source_rejection(text.length()):
-						Some(rejection):
-							builder.report_rejected(requester, rejection, text.length())
-						None:
-							module: ModuleId = builder.next_module_id()
-							loaded: DiscoveryBuilder = builder.load_module(candidate, reach, text)
-							loaded.record_target(requester, module)
-				SourceUnreadable:
-					builder.report_requester(requester, UnreadableSourceDiagnostic)
+			look_up_candidates(provider, builder, listings, [candidate])
 
 
 ---
-The import requests of the module `load_or_reuse` loaded, if it loaded one
-(the module count grew past `modules_before`).
+Resolves the import `entry` through `lookup`; `listings` as for
+`resolve_root`.
 ---
-private pure func newly_loaded_imports(
+func resolve_import[Provider:SourceProvider](
+	provider: Provider,
+	lookup: SourceLookupRoots,
 	builder: DiscoveryBuilder,
-	modules_before: Int,
-	candidate: SourceCandidate,
-) -> List[PendingImport]:
-	if builder.modules.length() > modules_before:
-		builder.module_import_requests(module_id_at_row(modules_before), candidate)
-	else:
-		[]
+	listings: Dict[String, DirectoryListing],
+	entry: PendingImport,
+) -> (Dict[String, DirectoryListing], RequestResolution):
+	look_up_candidates(
+		provider,
+		builder,
+		listings,
+		lookup.import_candidates(entry.request),
+	)
 
 
-private pure func record_target(
+---
+Whether an import is waiting to be resolved.
+---
+pure func has_pending_import(queue: ImportQueue) -> Bool:
+	queue.taken < queue.pending.length()
+
+
+---
+The next waiting import, in the order the imports were found; `advance` moves
+the queue past it.
+---
+pure func next_pending_import(queue: ImportQueue) -> Option[PendingImport]:
+	queue.pending.get(queue.taken)
+
+
+---
+`queue` past the import `next_pending_import` returned.
+---
+pure func advance(queue: ImportQueue) -> ImportQueue:
+	{ queue | taken = queue.taken + 1 }
+
+
+---
+Queues the import requests of the module `resolution` loaded. Only a
+`LoadSource` resolution loads a module, and it is the one whose id was
+`builder.next_module_id()` before the resolution was settled; read that id
+first and pass it as `loaded_module_id`. Any other resolution loads nothing.
+---
+pure func enqueue_imports_of_loaded_module(
+	queue: ImportQueue,
+	builder: DiscoveryBuilder,
+	loaded_module_id: ModuleId,
+	resolution: RequestResolution,
+) -> ImportQueue:
+	match resolution:
+		LoadSource(candidate, _):
+			{ queue |
+				pending = queue.pending.concat(
+					builder.module_import_requests(
+						loaded_module_id,
+						candidate,
+					),
+				)
+			}
+		_:
+			queue
+
+
+---
+The reach a module requested by `requester` has: roots are reached as roots
+and imports as imports, so the two cannot disagree.
+---
+pure func reach_of(requester: ModuleRequester) -> ModuleReach:
+	match requester:
+		RequestedByRoot(_):
+			RootModule
+		RequestedByImport(_):
+			ImportedModule
+
+
+---
+Records `module` as the target of `requester`.
+---
+pure func record_target(
 	builder: DiscoveryBuilder,
 	requester: ModuleRequester,
 	module: ModuleId,
@@ -270,6 +287,44 @@ private pure func record_target(
 			})
 
 
+---
+Reports against `requester` why `resolution` loaded no module. A resolution
+that names a module is not a failure.
+---
+pure func report_failure(
+	builder: DiscoveryBuilder,
+	requester: ModuleRequester,
+	resolution: RequestResolution,
+) -> DiscoveryBuilder:
+	match resolution:
+		SourceMissing:
+			match requester:
+				RequestedByRoot(root):
+					builder.report_root(root, UnresolvedRootDiagnostic)
+				RequestedByImport(import_id):
+					builder.report_import(import_id, UnresolvedImportDiagnostic)
+		SpellingUnknown:
+			builder.report_requester(requester, UnverifiableSpellingDiagnostic)
+		SpelledWithOtherCase(stored_names):
+			match requester:
+				RequestedByRoot(root):
+					builder.report_root_case_mismatch(root, stored_names)
+				RequestedByImport(import_id):
+					builder.report_import_case_mismatch(import_id, stored_names)
+		ReadFailed:
+			builder.report_requester(requester, UnreadableSourceDiagnostic)
+		SourceOverLimit(rejection, byte_length):
+			match requester:
+				RequestedByRoot(root):
+					builder.report_rejected_root(root, rejection, byte_length)
+				RequestedByImport(import_id):
+					builder.report_rejected_import(import_id, rejection, byte_length)
+		LoadSource(_, _):
+			builder
+		ModuleAlreadyLoaded(_):
+			builder
+
+
 private pure func report_requester(
 	builder: DiscoveryBuilder,
 	requester: ModuleRequester,
@@ -282,19 +337,6 @@ private pure func report_requester(
 			builder.report_import(import_id, code)
 
 
-private pure func report_rejected(
-	builder: DiscoveryBuilder,
-	requester: ModuleRequester,
-	rejection: SourceRejection,
-	byte_length: Int,
-) -> DiscoveryBuilder:
-	match requester:
-		RequestedByRoot(root):
-			builder.report_rejected_root(root, rejection, byte_length)
-		RequestedByImport(import_id):
-			builder.report_rejected_import(import_id, rejection, byte_length)
-
-
 ---
 The module already loaded from `path`, if any.
 ---
@@ -304,27 +346,6 @@ private pure func loaded_module_at(builder: DiscoveryBuilder, path: String) -> O
 			builder.find_module_by_path(path_id)
 		None:
 			None
-
-
----
-What looking a request's candidates up found.
-
-- `CandidateFound(candidate)`: the first candidate, in lookup order, that exists
-  with no component below its trusted directory known to be stored in
-  different letter case.
-- `CandidateSpelledDifferently(names)`: no candidate exists exactly, but the
-  first candidate with a source under different letter case is stored as
-  `names` (the components below its trusted directory).
-- `CandidateSpellingUnverifiable`: a candidate exists but a directory on the way
-  to it could not be listed, so its spelling is unknown; discovery says so
-  rather than guess.
-- `CandidateNotFound`: no candidate exists under any spelling.
----
-private union CandidateLookup:
-	CandidateFound(SourceCandidate)
-	CandidateSpelledDifferently(List[String])
-	CandidateSpellingUnverifiable
-	CandidateNotFound
 
 
 ---
@@ -354,17 +375,20 @@ private func candidate_spelling[Provider:SourceProvider](
 
 
 ---
-Looks `candidates` up in `provider`. Near misses are only searched for once
-every candidate has failed, so a request that resolves never pays for the
-search (and a missing candidate is never listed for).
+Looks `candidates` up in `provider`: the first, in lookup order, that exists
+with no component below its trusted directory known to be stored in different
+letter case, read and checked against the tables' limits. Near misses are
+only searched for once every candidate has failed, so a request that resolves
+never pays for the search (and a missing candidate is never listed for).
 ---
 private func look_up_candidates[Provider:SourceProvider](
 	provider: Provider,
+	builder: DiscoveryBuilder,
 	listings: Dict[String, DirectoryListing],
 	candidates: List[SourceCandidate],
-) -> (Dict[String, DirectoryListing], CandidateLookup):
+) -> (Dict[String, DirectoryListing], RequestResolution):
 	var kept: Dict[String, DirectoryListing] = listings
-	var found: CandidateLookup = CandidateNotFound
+	var found: RequestResolution = SourceMissing
 
 	for candidate in candidates:
 		if provider.source_exists(candidate.path):
@@ -373,16 +397,16 @@ private func look_up_candidates[Provider:SourceProvider](
 
 			match spelling:
 				ExactSpelling:
-					found = CandidateFound(candidate)
+					found = resolution_of_existing_source(provider, builder, candidate)
 					break
 				SpellingUnverifiable(_):
-					found = CandidateSpellingUnverifiable
+					found = SpellingUnknown
 					break
 				StoredSpelling(_, _):
 					void
 
 	match found:
-		CandidateNotFound:
+		SourceMissing:
 			for candidate in candidates:
 				(listed, spelling) = candidate_spelling(provider, kept, candidate)
 				kept = listed
@@ -390,7 +414,7 @@ private func look_up_candidates[Provider:SourceProvider](
 				match spelling:
 					StoredSpelling(stored_names, stored_path):
 						if provider.source_exists(normalize(stored_path)):
-							found = CandidateSpelledDifferently(stored_names)
+							found = SpelledWithOtherCase(stored_names)
 							break
 					_:
 						void
@@ -401,80 +425,35 @@ private func look_up_candidates[Provider:SourceProvider](
 
 
 ---
-Admits `text` as a new module at `candidate`, lexes it and parses it, and
-closes its row's ranges over the rows its parse appended.
+What an existing source at `candidate` means for the request: the module
+already loaded from its path, or a source that is read and checked against the
+tables' limits.
 ---
-pure func load_module(
+private func resolution_of_existing_source[Provider:SourceProvider](
+	provider: Provider,
 	builder: DiscoveryBuilder,
 	candidate: SourceCandidate,
-	reach: ModuleReach,
-	text: String,
-) -> DiscoveryBuilder:
-	module: ModuleId = builder.next_module_id()
-	source: SourceId = builder.next_source_id()
-	canonical_path: PathId = builder.interned_path_id(candidate.path)
-	definitions_first: Int = builder.definitions.length()
-	imports_first: Int = builder.imports.length()
-	nodes_first: Int = builder.nodes.length()
-	diagnostics_first: Int = builder.diagnostics.length()
-	var out: DiscoveryBuilder = builder.admit_source(candidate.path, text)
-	open_row: ModuleRow = {
-		source = source,
-		canonical_path = canonical_path,
-		origin = candidate.origin,
-		reach = reach,
-		definitions = {
-			first = definitions_first,
-			count = 0
-		},
-		imports = {
-			first = imports_first,
-			count = 0
-		},
-		nodes = {
-			first = nodes_first,
-			count = 0
-		},
-		diagnostics = {
-			first = diagnostics_first,
-			count = 0
-		}
-	}
-	out = out.append_module(open_row)
-	out = out.record_module_package(module, candidate.package)
-	out = out.lex_source(source)
-	out = out.parse_module_declarations(module)
-	definitions_end: Int = out.definitions.length()
-	imports_end: Int = out.imports.length()
-	nodes_end: Int = out.nodes.length()
-	diagnostics_end: Int = out.diagnostics.length()
-	closed_row: ModuleRow = { open_row |
-		definitions = {
-			first = definitions_first,
-			count = definitions_end - definitions_first
-		},
-		imports = {
-			first = imports_first,
-			count = imports_end - imports_first
-		},
-		nodes = {
-			first = nodes_first,
-			count = nodes_end - nodes_first
-		},
-		diagnostics = {
-			first = diagnostics_first,
-			count = diagnostics_end - diagnostics_first
-		}
-	}
-	out = out.replace_module_row(module, closed_row)
-	out
+) -> RequestResolution:
+	match builder.loaded_module_at(candidate.path):
+		Some(module):
+			ModuleAlreadyLoaded(module)
+		None:
+			match provider.read_source(candidate.path):
+				SourceText(text):
+					match builder.source_rejection(text.length()):
+						Some(rejection):
+							SourceOverLimit(rejection, text.length())
+						None:
+							LoadSource(candidate, text)
+				SourceUnreadable:
+					ReadFailed
 
 
 ---
 Records `module`'s package, adding the package row the first time a module
 of that package is loaded.
 ---
-private pure func record_module_package(
+pure func record_module_package(
 	builder: DiscoveryBuilder,
 	module: ModuleId,
 	package: PackageMembership,

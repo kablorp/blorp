@@ -10,7 +10,7 @@ document only orders the work and says what "accepted" means.
 ## Where we are (2026-09-30)
 
 - **Landed:** the stage itself (tables, builder, invariants, lexer, module
-  walker, declaration, type, pattern and body parsers), UFCS style, and the
+  graph, declaration, type, pattern and body parsers), UFCS style, and the
   `compiler-new` gate.
 - **Measured on the self-compile inputs:** 0.65 s user CPU against 1.3 s for
   the existing discovery; 4.3 G instructions against 8.6 G; 435 k
@@ -64,8 +64,11 @@ more.
   fixtures), `as` removal, the concurrency parameter rules, `?=` and
   `break`/`continue` placement in the parser, exact-case import paths, and
   `..` only at the start of import paths.
-- **A2.** After A1, reorganize the stage into `pipeline.brp`, `tables/`, `sources/`, `lex/` and
-  `parse/`, proved by an identical discovery dump and allocation count.
+- **A2.** Landed: the stage is organized into `pipeline.brp`, `tables/`,
+  `sources/`, `lex/` and `parse/` (see the design document's Layout section),
+  proved by an identical discovery dump. Allocations went down by 1,764 (one
+  per reused import) because a reused import no longer allocates a
+  `SourceCandidate`; nothing else changed.
 
 ### B. Prove the trees, not just the verdicts (M–L)
 

@@ -24,6 +24,32 @@ Three decisions were made up front: function bodies live in a flat node
 table; `DefinitionId` is minted here, in discovery; spans are packed
 integers.
 
+## Layout
+
+Read `pipeline.brp` first: it is the stage's order of work (roots, imports
+breadth first, freeze) and `load_module`, one named step per call, and says
+which folder owns each step's mechanics.
+
+```
+stage_01_discovery/
+  pipeline.brp     discover and load_module: the order of work
+  tables/          the data model every other part writes and reads
+    builder.brp  diagnostic_code.brp  frontend_tables.brp  intern_index.brp
+    invariants.brp  name_vocabulary.brp  row_kinds.brp  source_position.brp
+    span.brp  token.brp
+  sources/         which files make up the program
+    module_graph.brp  source_admission.brp  source_provider.brp
+  lex/lexer.brp
+  parse/           parser_cursor, declaration_header, declaration_parser,
+                   import_parser, type_parser, pattern_parser, body_parser
+```
+
+The tests mirror the folders under `blorp/test/compiler_new/stage_01_discovery/`
+(`tables/`, `sources/`, `lex/`, `parse/`, with `lex/fixtures` and
+`parse/fixtures`); `tools/` and `support/` sit beside them. `tables/` imports no other
+folder; `sources/` and `lex/` import only `tables/`; `parse/` imports those
+three; only `pipeline.brp` ties the steps together.
+
 ## Status
 
 **Implemented** under `blorp/src/compiler_new/stage_01_discovery/`, isolated
@@ -36,7 +62,7 @@ compiler CI):
   checks;
 - the lexer, with token parity against the existing lexer over the whole
   corpus;
-- the module walker and the source providers (file system and in-memory);
+- the module graph (resolving requests) and the source providers (file system and in-memory);
 - the declaration, type, pattern and body parsers, with accept/reject parity
   against the existing parser over the corpus.
 
@@ -45,11 +71,11 @@ compiler CI):
 - **The legacy adapter** (section 10) and its differential check. Nothing
   outside `compiler_new` reads the tables yet.
 - **The prelude.** The existing compiler loads 16 prelude modules into every
-  compilation; the walker loads only what the roots import. Owner: the
+  compilation; discovery loads only what the roots import. Owner: the
   stage (roadmap C1 and C2); needed before the adapter's differential check
   can pass.
 - **The embedded standard-library provider and the package catalog.** Both
-  plug into the provider seam (section 5) without walker changes.
+  plug into the provider seam (section 5) without changes to the module graph.
 
 ## 1. Principles
 
@@ -79,7 +105,7 @@ discovery's.
 ## 2. Identities
 
 Every table has its own opaque id over `Int`, so ids from different tables
-cannot be mixed up. The constructors are private to `discovery_builder.brp`.
+cannot be mixed up. The constructors are private to `tables/builder.brp`.
 
 ```blorp
 opaque type NameId = Int
@@ -99,7 +125,7 @@ opaque type ForeignBlockId = Int
 ```
 
 A span is one integer: the source index, then the start offset, then the
-length (`span.brp`). There is no `NO_SPAN`: every row that has a span has a
+length (`tables/span.brp`). There is no `NO_SPAN`: every row that has a span has a
 real one, and compiler-synthesized rows point at the syntax that caused
 them.
 
@@ -109,16 +135,16 @@ them.
 | start offset | 24 | 16 MiB per source |
 | length | 24 | 16 MiB |
 
-15 + 24 + 24 = 63 bits, so a span is a non-negative `Int`. The walker admits
-a source only when its index and byte length fit (`source_admission.brp`);
+15 + 24 + 24 = 63 bits, so a span is a non-negative `Int`. Discovery admits
+a source only when its index and byte length fit (`sources/source_admission.brp`);
 a source that does not fit is reported with `SourceTooLargeDiagnostic` or
 `TooManySourcesDiagnostic` and not parsed, so packing never loses
 information.
 
 ## 3. Rows
 
-Each table is a list of one struct type (`discovery_builder.brp`); the
-payload-free enums the rows store are in `row_kinds.brp`.
+Each table is a list of one struct type (`tables/builder.brp`); the
+payload-free enums the rows store are in `tables/row_kinds.brp`.
 
 ### Sources, packages, modules and roots
 
@@ -230,7 +256,7 @@ whose payload is the definition's id, and its signature and body are
 ordinary signature and body rows.
 
 What comes before a declaration's keyword is read into a
-`DeclarationHeader` (`declaration_header.brp`), a plain struct, so a header
+`DeclarationHeader` (`parse/declaration_header.brp`), a plain struct, so a header
 costs no allocation:
 
 ```blorp
@@ -314,7 +340,7 @@ struct NodeRow {kind: NodeKind, span: Span, payload: Int, children: RowRange}
 -- node_children: List[NodeId]; a node's children are one block of it.
 ```
 
-**`row_kinds.brp` is the single source for the node kinds.** Its `NodeKind`
+**`tables/row_kinds.brp` is the single source for the node kinds.** Its `NodeKind`
 docstring gives each kind's payload and child order, and
 `node_payload_reference(kind)` says which table the payload indexes:
 `NamePayload`, `LiteralPayload`, `CodepointPayload`, `DefinitionPayload` or
@@ -383,9 +409,9 @@ struct DiagnosticRow {code: DiscoveryDiagnosticCode, span: Span, arguments: RowR
 ```
 
 `diagnostics` holds each module's lex and parse diagnostics in the module's
-contiguous block; `resolution_diagnostics` holds the walker's (imports that
+contiguous block; `resolution_diagnostics` holds the module graph's (imports that
 loaded nothing, sources that could not be admitted). The code catalogue is
-`discovery_diagnostic_code.brp`: 100 codes, each documented with the meaning
+`tables/diagnostic_code.brp`: 100 codes, each documented with the meaning
 of its arguments, and `diagnostic_code_name` gives the stable names dumps
 and fixtures use. Messages are rendered from the code and arguments at the
 boundary that shows them, so the text lives in one place and can be tested
@@ -418,14 +444,14 @@ place. When the compiler cannot see that a builder is handed on at its last
 use, it keeps a second reference, and the next update copies the builder and
 every table appended to while the old one lives: an O(n) copy per append.
 The canonical statement of the seven rules that avoid this is the header of
-`discovery_builder.brp`; each site that depends on one cites it by number.
+`tables/builder.brp`; each site that depends on one cites it by number.
 In short: the first update of a builder parameter is unconditional; no tail
 call on a reassigned `var`; the builder is not read in another argument of
 the call it is handed to; no `f(g(b))`; in loops `out = f(out)`, never
 through temporaries; a record update's field value reads only that field;
 no aliasing, storing or capturing.
 
-`test_allocation_budget.brp` in the compiler-new gate parses a repeated
+`tables/test_allocation_budget.brp` in the compiler-new gate parses a repeated
 source and fails when allocations exceed a fixed budget, so breaking a rule
 fails the gate rather than only slowing the compiler.
 
@@ -488,7 +514,7 @@ reports an error at rollback if either changed.
 ### Interning
 
 Names and literals are interned through an open-addressing slot table
-(`intern_index.brp`): one `List[Int]` of (row, hash) entries, at least twice
+(`tables/intern_index.brp`): one `List[Int]` of (row, hash) entries, at least twice
 as many slots as rows, searchable by a slice of the source text without
 allocating the slice. An identifier that is already interned costs no string
 at all. The hash is FNV-style mixing finished with MurmurHash3's 64-bit
@@ -496,7 +522,7 @@ finalizer; over the self-compile the average probe length is 1.44 for names
 and 1.26 for literals. Frozen tables keep the indexes, so readers can look a
 spelling up.
 
-Every name table starts with the seeded vocabulary (`name_vocabulary.brp`)
+Every name table starts with the seeded vocabulary (`tables/name_vocabulary.brp`)
 at pinned ids: a copy of the existing compiler's synthesized vocabulary, in
 the same order so the adapter's ids agree, followed by the spellings only
 discovery compares (`tail_recursive`, `no_copy`, `debug_only`,
@@ -522,7 +548,7 @@ bulk) was not needed.
 ## 5. The source provider
 
 Reading files is discovery's only effect. It sits behind one two-call trait
-(`source_provider.brp`), so the rest of the phase is pure and an editor can
+(`sources/source_provider.brp`), so the rest of the phase is pure and an editor can
 serve unsaved buffers:
 
 ```blorp
@@ -548,11 +574,11 @@ Implemented providers: `FileSystemSourceProvider` and
 `InMemorySourceProvider` (tests and overlays). The embedded standard library
 becomes a provider that answers for paths under the standard-library root,
 and the package catalog supplies `native_package_roots` and candidate rules;
-neither changes the walker.
+neither changes the module graph.
 
-## 6. The module walker
+## 6. The pipeline and the module graph
 
-The walker (`module_walker.brp`) is the phase's only loop over modules:
+`pipeline.brp` is the stage's only loop over modules:
 
 ```blorp
 func discover[Provider: SourceProvider](
@@ -565,12 +591,25 @@ func discover[Provider: SourceProvider](
 Roots are loaded in the order given, then every import in the order its
 module was loaded and, within a module, in source order (breadth first). A
 module is loaded once per canonical path, whichever request reaches it
-first, so ids depend only on the roots and the sources. Roots and imports go
-through one `load_or_reuse` routine: reuse the loaded module, or admit the
-source, lex it, parse its declarations and close its ranges. Each root gets
-a target or a root diagnostic (`UnresolvedRootDiagnostic`,
+first, so ids depend only on the roots and the sources.
+
+Roots and imports go through the same two steps. `sources/module_graph.brp`
+resolves the request: `resolve_root` or `resolve_import` looks its candidates
+up through the provider and answers with a `RequestResolution` (load this
+source, reuse the module already loaded from that path, or why nothing can
+be loaded). `pipeline.brp` carries the answer out: `load_module` admits the
+source, opens the module's row, lexes, parses its declarations and closes the
+row's ranges over the rows that were appended, then `record_target` or
+`report_failure` records the outcome against the root or import. Each root
+gets a target or a root diagnostic (`UnresolvedRootDiagnostic`,
 `UnreadableSourceDiagnostic`); each import a target or an
 `UnresolvedImportDiagnostic` resolution row. Discovery always goes on.
+
+The loop's state besides the builder is two values of its own: the directory
+listings the spelling checks have read (each directory is listed once per
+discovery) and the `ImportQueue` of imports waiting to be resolved. Neither
+holds the builder, so the builder threading rules (section 4) stay with the
+builder.
 
 ## 7. Lexing
 
@@ -582,7 +621,7 @@ dropped when the next module's lexing starts.
 struct Token {kind: TokenKind, span: Span, payload: Int}
 ```
 
-`token.brp` documents each kind's payload. Two differ from the existing
+`tables/token.brp` documents each kind's payload. Two differ from the existing
 lexer:
 
 - **`DimensionNameToken`.** An identifier written directly after `#` (as in
@@ -630,7 +669,7 @@ and no sentinel precedence.
 
 ## 9. Freezing
 
-When the walker is done, the builder is sealed:
+When the last module is loaded, the builder is sealed:
 
 ```blorp
 opaque type FrontendTables = DiscoveryBuilder
@@ -642,10 +681,10 @@ union FreezeOutcome:
 pure func freeze(builder: DiscoveryBuilder) -> FreezeOutcome
 ```
 
-`freeze` always checks the invariants (`table_invariants.brp`); there is no
+`freeze` always checks the invariants (`tables/invariants.brp`); there is no
 trusted mode. The check reads each row a bounded number of times and
 reports every violation as a `TableInvariantViolation {kind, table, row,
-related_table, value}`, not only the first. `frontend_tables.brp` exposes
+related_table, value}`, not only the first. `tables/frontend_tables.brp` exposes
 read-only accessors; side tables read by owner are found by binary search,
 which the sorted-by-owner invariant makes valid, and import items are
 addressed by `ImportItemId`.
@@ -680,7 +719,7 @@ The invariants, by violation kind:
 - `InternIndexMismatch`, `ParallelTableMismatch`: the intern indexes agree
   with their tables, and parallel tables have equal lengths.
 
-`test_table_invariants.brp` has a negative test per kind and per node
+`tables/test_invariants.brp` has a negative test per kind and per node
 payload class.
 
 ## 10. The legacy adapter

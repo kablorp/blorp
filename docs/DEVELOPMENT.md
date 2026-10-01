@@ -503,7 +503,7 @@ A module selector is the logical module path (the source path relative to the
 working directory, without `.brp`), the file path with or without `.brp`
 (absolute, or relative to the working directory, the entry file's directory, or
 a parent of either), or the tail of exactly one module's logical path such as
-`compiler_new/stage_01_discovery/lexer`. A selector naming no module in the
+`compiler_new/stage_01_discovery/lex/lexer`. A selector naming no module in the
 program fails before code generation and lists these forms. `blorp test` does
 not resolve alternate spellings yet; give it the logical path.
 

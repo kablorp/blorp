@@ -1,0 +1,142 @@
+-- The discovery stage, in order:
+--
+--   1. roots, in the order given;
+--   2. imports, breadth first: every import of a module in the order the
+--      module was loaded and, within a module, in source order; each module
+--      is loaded once per canonical path;
+--   3. freeze, behind the table invariants.
+--
+-- Each module is admitted, lexed and parsed into the builder as it is loaded.
+-- Where a step's mechanics live: `sources/module_graph` (resolving requests
+-- and the walk state), `sources/source_admission`, `lex/lexer`,
+-- `parse/declaration_parser`, `tables/builder` (the rows) and
+-- `tables/invariants` (checked by `freeze`).
+--
+-- The builder is handed on from each step to the next and never travels
+-- inside the import queue or any other value (see the builder threading rules
+-- in `tables/builder`).
+import:
+	fs: DirectoryListing
+	lex/lexer: lex_source
+	parse/declaration_parser: parse_module_declarations
+	sources/module_graph:
+		ImportQueue,
+		ModuleRequester(RequestedByImport, RequestedByRoot),
+		RequestResolution(LoadSource, ModuleAlreadyLoaded),
+		advance,
+		empty_import_queue,
+		enqueue_imports_of_loaded_module,
+		has_pending_import,
+		next_pending_import,
+		reach_of,
+		record_module_package,
+		record_root_request,
+		record_target,
+		report_failure,
+		resolve_import,
+		resolve_root,
+	sources/source_admission: admit_source, interned_path_id
+	sources/source_provider: SourceCandidate, SourceLookupRoots, SourceProvider
+	tables/builder:
+		DiscoveryBuilder,
+		ModuleId,
+		ModuleRow,
+		PathId,
+		RootId,
+		append_module,
+		close_module_row,
+		empty_discovery_builder,
+		module_row_start,
+		next_module_id,
+		next_root_id,
+	tables/frontend_tables: FreezeOutcome, freeze
+	tables/row_kinds: ModuleReach
+
+
+---
+Discovers every module reachable from `roots` (source paths) through
+`provider`, then freezes the tables.
+---
+func discover[Provider:SourceProvider](
+	provider: Provider,
+	lookup: SourceLookupRoots,
+	roots: List[String],
+) -> FreezeOutcome:
+	var builder: DiscoveryBuilder = empty_discovery_builder()
+	var listings: Dict[String, DirectoryListing] = {}
+	var queue: ImportQueue = empty_import_queue()
+
+	for root_path in roots:
+		root: RootId = builder.next_root_id()
+		builder = builder.record_root_request(root_path)
+		(listed, resolution) = provider.resolve_root(builder, listings, root_path)
+		listings = listed
+		loaded: ModuleId = builder.next_module_id()
+		builder = builder.settle_request(RequestedByRoot(root), loaded, resolution)
+		queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
+
+	while queue.has_pending_import():
+		match queue.next_pending_import():
+			Some(entry):
+				(listed, resolution) = provider.resolve_import(lookup, builder, listings, entry)
+				listings = listed
+				loaded: ModuleId = builder.next_module_id()
+				builder = builder.settle_request(
+					RequestedByImport(entry.import_id),
+					loaded,
+					resolution,
+				)
+				queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
+			None:
+				void
+
+		queue = queue.advance()
+
+	builder.freeze()
+
+
+---
+Carries out what a request's resolution says: loads the source as module
+`loaded` (the id `next_module_id` gave before this call), or records the
+module already loaded as the request's target, or reports why none was found.
+---
+private pure func settle_request(
+	builder: DiscoveryBuilder,
+	requester: ModuleRequester,
+	loaded: ModuleId,
+	resolution: RequestResolution,
+) -> DiscoveryBuilder:
+	match resolution:
+		LoadSource(candidate, text):
+			with_module: DiscoveryBuilder = builder.load_module(
+				candidate,
+				requester.reach_of(),
+				text,
+			)
+			with_module.record_target(requester, loaded)
+		ModuleAlreadyLoaded(module):
+			builder.record_target(requester, module)
+		_:
+			builder.report_failure(requester, resolution)
+
+
+---
+One module: admit its source, open its row, lex, parse, and close the row's
+ranges over the rows that lexing and parsing appended.
+---
+pure func load_module(
+	builder: DiscoveryBuilder,
+	candidate: SourceCandidate,
+	reach: ModuleReach,
+	text: String,
+) -> DiscoveryBuilder:
+	canonical_path: PathId = builder.interned_path_id(candidate.path)
+	opening: ModuleRow = builder.module_row_start(canonical_path, candidate.origin, reach)
+	module: ModuleId = builder.next_module_id()
+	var out: DiscoveryBuilder = builder.admit_source(candidate.path, text)
+	out = out.append_module(opening)
+	out = out.record_module_package(module, candidate.package)
+	out = out.lex_source(opening.source)
+	out = out.parse_module_declarations(module)
+	out = out.close_module_row(module, opening)
+	out
