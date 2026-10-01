@@ -71,11 +71,18 @@ union Pattern:
 	OrPattern(List[Pattern])
 
 
+---
+A function parameter. `CommentedParam` is a parameter written with comments:
+those above it and ending its line, then the whole-line comments after it
+before the closing `)`, which only the last parameter has. A parameter list
+with one renders a parameter per line.
+---
 union FunctionParameter:
 	NameParam(String)
 	TypedNameParam(String, TypeExpression)
 	PatternParam(Pattern)
 	TypedPatternParam(Pattern, TypeExpression)
+	CommentedParam(FunctionParameter, MemberComments, List[String])
 
 
 union StringInterpolationPart:
@@ -88,8 +95,64 @@ union BlockItem:
 	BlockExpressionItem(Bool, Expression, Option[String])
 
 
+---
+Comments kept with one member of a body the formatter lays out itself, such as
+a match case. The member owns them because no enclosing block or declaration
+claims comments written among its members. `leading` holds the whole-line
+comments directly above the member, in source order; `trailing` is the comment
+that ends the member's first line.
+---
+record MemberComments {
+	leading: List[String],
+	trailing: Option[String]
+}
+
+
+--- A collection item with the comments written around it.
+record CommentedItem[T] {
+	item: T,
+	comments: MemberComments
+}
+
+
+---
+A call, subscript or collection literal written with comments among its items. Each
+variant mirrors the plain expression of the same shape (a call's callee, a
+record update's base) with commented items.
+---
+union CommentedCollection:
+	CommentedCall(Expression, List[CommentedItem[Expression]])
+	CommentedSubscript(Expression, List[CommentedItem[Expression]])
+	CommentedList(List[CommentedItem[Expression]])
+	CommentedTuple(List[CommentedItem[Expression]])
+	CommentedVector(List[CommentedItem[Expression]])
+	CommentedRecord(List[CommentedItem[(String, Expression)]])
+	CommentedRecordUpdate(Expression, List[CommentedItem[(String, Expression)]])
+	CommentedDictionary(List[CommentedItem[(Expression, Expression)]])
+
+
+---
+Whether the last item of a broken collection takes a comma: records keep
+their last field bare, as the plain record layouts do.
+---
+enum LastItemComma:
+	CommaAfterLastItem
+	NoCommaAfterLastItem
+
+
+---
+The comments a match keeps outside its cases: `header_trailing` ends the
+`match ...:` line, and `closing` holds the whole-line comments after the last
+case, at case indentation.
+---
+record MatchComments {
+	header_trailing: Option[String],
+	closing: List[String]
+}
+
+
 union MatchCase:
-	MatchCaseData(Pattern, Expression, Option[String])
+	MatchCaseData(Pattern, Expression, MemberComments)
 
 
 union SelectArm:
@@ -98,6 +161,17 @@ union SelectArm:
 	SelectSealedArm(Expression, Expression)
 
 
+---
+A formatter expression. `if`, `while` and `for` carry the comment ending their
+header line as an `Option[String]` after their parts; `IfElseExpression` also
+carries the comments of its `else` keyword: the whole-line comments above it
+and the comment ending an `else:` line. `CommentedCollectionExpression` is a
+call or collection written with comments among its items; its list holds the
+whole-line comments after the last item. It always renders one item per line,
+so each comment keeps its place. `CommentedLogicalExpression` is an `and` or
+`or` chain written with comments among its terms; it always renders one term
+per line inside parentheses.
+---
 union Expression:
 	IdentifierExpression(String)
 	LiteralExpression(Literal)
@@ -133,13 +207,13 @@ union Expression:
 	BlockExpression(List[Expression])
 	SpacedBlockExpression(List[(Bool, Expression)])
 	ItemBlockExpression(List[BlockItem])
-	IfExpression(Expression, Expression)
-	IfElseExpression(Expression, Expression, Expression)
-	MatchExpression(Expression, List[MatchCase])
+	IfExpression(Expression, Expression, Option[String])
+	IfElseExpression(Expression, Expression, Expression, Option[String], MemberComments)
+	MatchExpression(Expression, List[MatchCase], MatchComments)
 	SelectExpression(List[SelectArm])
-	WhileExpression(Expression, Expression)
-	ForExpression(String, Expression, Expression)
-	TupleForExpression(List[String], Expression, Expression)
+	WhileExpression(Expression, Expression, Option[String])
+	ForExpression(String, Expression, Expression, Option[String])
+	TupleForExpression(List[String], Expression, Expression, Option[String])
 	LambdaExpression(Bool, List[FunctionParameter], Expression)
 	TypedLambdaExpression(Bool, List[FunctionParameter], TypeExpression, Expression)
 	FunctionDeclarationExpression(String, Bool, List[String], List[FunctionParameter], List[TypeConstraint], Expression)
@@ -151,6 +225,8 @@ union Expression:
 	DetachExpression(Expression)
 	ConcurrentlyLoopExpression(String, Expression, Expression, Option[Expression], ConcurrentlyLoopWidth)
 	WithExpression(String, Option[TypeExpression], Bool, Expression, Option[String], Option[Expression], Expression)
+	CommentedCollectionExpression(CommentedCollection, List[String])
+	CommentedLogicalExpression(LogicalOp, List[CommentedItem[Expression]])
 
 
 union ConcurrentlyLoopWidth:
@@ -702,17 +778,17 @@ private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
 			True
 		DebugBlockExpression(_):
 			True
-		ForExpression(_, _, _):
+		ForExpression(_, _, _, _):
 			True
-		TupleForExpression(_, _, _):
+		TupleForExpression(_, _, _, _):
 			True
-		IfExpression(_, _):
+		IfExpression(_, _, _):
 			True
-		IfElseExpression(_, _, _):
+		IfElseExpression(_, _, _, _, _):
 			True
 		LogicalExpression(_, _, _):
 			True
-		MatchExpression(_, _):
+		MatchExpression(_, _, _):
 			True
 		SelectExpression(_):
 			True
@@ -722,7 +798,7 @@ private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
 			True
 		WithExpression(_, _, _, _, _, _, _):
 			True
-		WhileExpression(_, _):
+		WhileExpression(_, _, _):
 			True
 		_:
 			False
@@ -1103,11 +1179,42 @@ pure func string_interpolation_part_from_json(
 			Err("unknown string interpolation part JSON tag: " + tag)
 
 
+private pure func optional_string_array_field(
+	value: JsonValue,
+	key: String,
+) -> Result[List[String], String]:
+	match value.get_field(key):
+		None:
+			Ok([])
+		Some(_):
+			value.string_array_field(key)
+
+
+--- Read a member's `{"leading": [...], "trailing": "..."}` comments; absent means none.
+private pure func member_comments_field(
+	value: JsonValue,
+	key: String,
+) -> Result[MemberComments, String]:
+	match value.get_field(key):
+		None:
+			Ok({
+				leading = [],
+				trailing = None,
+			})
+		Some(comments):
+			leading ?= comments.optional_string_array_field("leading")
+			trailing ?= comments.optional_string_field("trailing")
+			Ok({
+				leading = leading,
+				trailing = trailing,
+			})
+
+
 private pure func match_case_from_json(value: JsonValue) -> Result[MatchCase, String]:
 	pattern ?= value.pattern_field("pattern")
 	body ?= value.expression_field("body")
-	trailing ?= value.optional_string_field("trailing")
-	Ok(MatchCaseData(pattern, body, trailing))
+	comments ?= value.member_comments_field("comments")
+	Ok(MatchCaseData(pattern, body, comments))
 
 
 private pure func match_cases(value: JsonValue, key: String) -> Result[List[MatchCase], String]:
@@ -1282,33 +1389,50 @@ pure func expression_from_json(value: JsonValue) -> Result[Expression, String]:
 			cond ?= value.expression_field("cond")
 			then_expr ?= value.expression_field("then")
 
+			header_comment ?= value.optional_string_field("header_comment")
+
 			match value.get_field("else"):
 				None:
-					Ok(IfExpression(cond, then_expr))
+					Ok(IfExpression(cond, then_expr, header_comment))
 				Some(else_value):
 					else_expr ?= else_value.expression_from_json()
-					Ok(IfElseExpression(cond, then_expr, else_expr))
+					else_comments ?= value.member_comments_field("else_comments")
+					Ok(IfElseExpression(cond, then_expr, else_expr, header_comment, else_comments))
 		"Match":
 			scrutinee ?= value.expression_field("scrutinee")
 			cases ?= value.match_cases("cases")
-			Ok(MatchExpression(scrutinee, cases))
+			header_trailing ?= value.optional_string_field("header_comment")
+			closing ?= value.optional_string_array_field("closing_comments")
+			Ok(
+				MatchExpression(
+					scrutinee,
+					cases,
+					{
+						header_trailing = header_trailing,
+						closing = closing
+					},
+				),
+			)
 		"Select":
 			arms ?= value.select_arms("arms")
 			Ok(SelectExpression(arms))
 		"While":
 			cond ?= value.expression_field("cond")
 			body ?= value.expression_field("body")
-			Ok(WhileExpression(cond, body))
+			header_comment ?= value.optional_string_field("header_comment")
+			Ok(WhileExpression(cond, body, header_comment))
 		"For":
 			name ?= value.string_field("name")
 			iter ?= value.expression_field("iter")
 			body ?= value.expression_field("body")
-			Ok(ForExpression(name, iter, body))
+			header_comment ?= value.optional_string_field("header_comment")
+			Ok(ForExpression(name, iter, body, header_comment))
 		"ForTuple":
 			names ?= value.string_array_field("names")
 			iter ?= value.expression_field("iter")
 			body ?= value.expression_field("body")
-			Ok(TupleForExpression(names, iter, body))
+			header_comment ?= value.optional_string_field("header_comment")
+			Ok(TupleForExpression(names, iter, body, header_comment))
 		"With":
 			name ?= value.string_field("name")
 			type_expression ?= value.optional_type_expression_field("type")
@@ -1668,6 +1792,8 @@ private pure func logical_term_prefers_multiline_value(expr: Expression) -> Bool
 			expr
 				.logical_chain_terms(op)
 				.logical_terms_prefer_multiline_value()
+		CommentedLogicalExpression(_, _):
+			True
 		OpaqueIntoExpression(_, inner):
 			inner.logical_term_prefers_multiline_value()
 		OpaqueFromExpression(_, inner):
@@ -1724,6 +1850,37 @@ private pure func logical_expression_document(expr: Expression, op: LogicalOp) -
 					.logical_expression_broken_document(op)
 					.if_break(terms.logical_expression_flat_document(op))
 					.group()
+
+
+---
+A logical chain with comments among its terms, one term per line inside
+parentheses, the layout of a broken chain in a value or a block header.
+---
+private pure func commented_logical_expression_document(
+	op: LogicalOp,
+	terms: List[CommentedItem[Expression]],
+) -> Doc:
+	var lines: List[Doc] = []
+	var index: Int = 0
+
+	for term in terms:
+		term_document: Doc = term.item.logical_term_document(op)
+
+		operator_document: Doc = if index == 0:
+			term_document
+		else:
+			op
+				.logical_text()
+				.text()
+				.cat(" ".text())
+				.cat(term_document)
+
+		lines = lines.append(commented_member_document(operator_document, "".text(), term.comments))
+		index += 1
+
+	lines
+		.hardlines()
+		.parenthesized_multiline_block_header_document()
 
 
 private pure func parenthesized_multiline_block_header_document(header: Doc) -> Doc:
@@ -1859,6 +2016,8 @@ private pure func block_header_terms_prefer_multiline(terms: List[Expression]) -
 
 private pure func block_header_expression_document(expr: Expression) -> Doc:
 	match expr:
+		CommentedLogicalExpression(op, terms):
+			commented_logical_expression_document(op, terms)
 		LogicalExpression(op, _, _):
 			terms: List[Expression] = expr.logical_chain_terms(op)
 
@@ -2095,19 +2254,19 @@ private pure func expression_renders_with_block_syntax(expr: Expression) -> Bool
 			True
 		ItemBlockExpression(_):
 			True
-		IfExpression(_, _):
+		IfExpression(_, _, _):
 			True
-		IfElseExpression(_, _, _):
+		IfElseExpression(_, _, _, _, _):
 			True
-		MatchExpression(_, _):
+		MatchExpression(_, _, _):
 			True
 		SelectExpression(_):
 			True
-		WhileExpression(_, _):
+		WhileExpression(_, _, _):
 			True
-		ForExpression(_, _, _):
+		ForExpression(_, _, _, _):
 			True
-		TupleForExpression(_, _, _):
+		TupleForExpression(_, _, _, _):
 			True
 		WithExpression(_, _, _, _, _, _, _):
 			True
@@ -2316,6 +2475,10 @@ private pure func expression_has_block(expr: Expression) -> Bool:
 		True
 	else:
 		match expr:
+			CommentedCollectionExpression(_, _):
+				True
+			CommentedLogicalExpression(_, _):
+				True
 			CallExpression(_, args):
 				call_expression_has_block_or_forced_multiline(expr, args)
 			TupleExpression(elems):
@@ -3229,6 +3392,144 @@ private pure func inline_lambda_call_document(callee: Expression, args: List[Exp
 			.group()
 
 
+---
+A collection broken one item per line: each item after its leading comments,
+followed by its comma and the comment ending its line, then the whole-line
+comments after the last item.
+---
+private pure func commented_items_document[T](
+	open_text: String,
+	close_text: String,
+	items: List[CommentedItem[T]],
+	item_document: pure (T) -> Doc,
+	last_item_comma: LastItemComma,
+	closing: List[String],
+) -> Doc:
+	var lines: List[Doc] = []
+	last_index: Int = items.length() - 1
+	var index: Int = 0
+
+	for commented in items:
+		comma: Doc = if index < last_index or last_item_comma == CommaAfterLastItem:
+			",".text()
+		else:
+			"".text()
+
+		lines = lines.append(
+			commented_member_document(
+				item_document(commented.item),
+				comma,
+				commented.comments,
+			),
+		)
+		index += 1
+
+	for comment in closing:
+		lines = lines.append(comment.text())
+
+	open_text
+		.text()
+		.cat(
+			Hardline
+				.cat(lines.hardlines())
+				.indent(),
+		)
+		.cat(Hardline)
+		.cat(close_text.text())
+
+
+private pure func commented_collection_document(
+	collection: CommentedCollection,
+	closing: List[String],
+) -> Doc:
+	match collection:
+		CommentedCall(callee, args):
+			callee
+				.expression_document()
+				.cat(
+					commented_items_document(
+						"(",
+						")",
+						args,
+						func(arg): arg.expression_document(),
+						CommaAfterLastItem,
+						closing,
+					),
+				)
+		CommentedSubscript(target, indices):
+			target
+				.expression_document()
+				.cat(
+					commented_items_document(
+						"[",
+						"]",
+						indices,
+						func(index): index.expression_document(),
+						CommaAfterLastItem,
+						closing,
+					),
+				)
+		CommentedList(elems):
+			commented_items_document(
+				"[",
+				"]",
+				elems,
+				func(elem): elem.expression_document(),
+				CommaAfterLastItem,
+				closing,
+			)
+		CommentedTuple(elems):
+			commented_items_document(
+				"(",
+				")",
+				elems,
+				func(elem): elem.expression_document(),
+				CommaAfterLastItem,
+				closing,
+			)
+		CommentedVector(elems):
+			commented_items_document(
+				"{",
+				"}",
+				elems,
+				func(elem): elem.expression_document(),
+				CommaAfterLastItem,
+				closing,
+			)
+		CommentedRecord(fields):
+			commented_items_document(
+				"{",
+				"}",
+				fields,
+				func(field_value): field_value.record_field_document(),
+				NoCommaAfterLastItem,
+				closing,
+			)
+		CommentedRecordUpdate(base, fields):
+			"{ "
+				.text()
+				.cat(base.expression_document())
+				.cat(
+					commented_items_document(
+						" |",
+						"}",
+						fields,
+						func(field_value): field_value.record_field_document(),
+						NoCommaAfterLastItem,
+						closing,
+					),
+				)
+		CommentedDictionary(entries):
+			commented_items_document(
+				"{",
+				"}",
+				entries,
+				func(entry): entry.dictionary_entry_document(),
+				CommaAfterLastItem,
+				closing,
+			)
+
+
 private pure func record_field_document(field_value: (String, Expression)) -> Doc:
 	field_value[0]
 		.text()
@@ -3510,17 +3811,17 @@ pure func is_block_expression(expr: Expression) -> Bool:
 
 private pure func is_paragraph_control_expression(expr: Expression) -> Bool:
 	match expr:
-		IfExpression(_, _):
+		IfExpression(_, _, _):
 			True
-		IfElseExpression(_, _, _):
+		IfElseExpression(_, _, _, _, _):
 			True
-		MatchExpression(_, _):
+		MatchExpression(_, _, _):
 			True
-		WhileExpression(_, _):
+		WhileExpression(_, _, _):
 			True
-		ForExpression(_, _, _):
+		ForExpression(_, _, _, _):
 			True
-		TupleForExpression(_, _, _):
+		TupleForExpression(_, _, _, _):
 			True
 		WithExpression(_, _, _, _, _, _, _):
 			True
@@ -3750,20 +4051,65 @@ pure func block_body_document(expr: Expression) -> Doc:
 			expr.expression_document()
 
 
+--- Whole-line comments, each followed by a line break.
+private pure func comment_lines_document(comments: List[String]) -> Doc:
+	var result: Doc = "".text()
+
+	for comment in comments:
+		result = result
+			.cat(comment.text())
+			.cat(Hardline)
+
+	result
+
+
+---
+A control-flow header after its keyword prefix, such as `if cond:`, with the
+comment ending the header line, and its indented body.
+---
+private pure func headed_block_document(
+	prefix: Doc,
+	header: Expression,
+	header_comment: Option[String],
+	body: Expression,
+) -> Doc:
+	prefix
+		.cat(header.block_header_expression_document())
+		.cat(":".text())
+		.cat(header_comment.trailing_text_document())
+		.cat(
+			Hardline
+				.cat(body.block_body_document())
+				.indent(),
+		)
+
+
+---
+Wrap a member with its comments: each leading comment on its own line above
+it, and the trailing comment deferred to the end of the member's first line.
+---
+private pure func commented_member_document(
+	member_head: Doc,
+	member_rest: Doc,
+	comments: MemberComments,
+) -> Doc:
+	comments.leading
+		.comment_lines_document()
+		.cat(member_head)
+		.cat(comments.trailing.trailing_text_document())
+		.cat(member_rest)
+
+
 private pure func match_case_document(case_value: MatchCase) -> Doc:
 	match case_value:
-		MatchCaseData(pattern, body, trailing):
+		MatchCaseData(pattern, body, comments):
 			head: Doc = pattern
 				.pattern_document()
 				.cat(":".text())
-			body_document: Doc = body
-				.block_body_document()
-				.cat(trailing.trailing_text_document())
-			head.cat(
-				Hardline
-					.cat(body_document)
-					.indent(),
-			)
+			body_document: Doc = Hardline
+				.cat(body.block_body_document())
+				.indent()
+			commented_member_document(head, body_document, comments)
 
 
 private pure func match_case_documents(cases: List[MatchCase]) -> List[Doc]:
@@ -3835,6 +4181,8 @@ pure func function_parameter_document(param: FunctionParameter) -> Doc:
 				.pattern_document()
 				.cat(": ".text())
 				.cat(type_expression.type_document())
+		CommentedParam(inner, _, _):
+			inner.function_parameter_document()
 
 
 pure func function_parameter_documents(params: List[FunctionParameter]) -> List[Doc]:
@@ -3852,11 +4200,24 @@ private pure func function_parameter_documents_with_commas(
 	var documents: List[Doc] = []
 
 	for param in params:
-		documents = documents.append(
-			param
-				.function_parameter_document()
-				.cat(",".text()),
-		)
+		match param:
+			CommentedParam(inner, comments, after):
+				documents = documents.append(
+					commented_member_document(
+						inner.function_parameter_document(),
+						",".text(),
+						comments,
+					),
+				)
+
+				for comment in after:
+					documents = documents.append(comment.text())
+			_:
+				documents = documents.append(
+					param
+						.function_parameter_document()
+						.cat(",".text()),
+				)
 
 	documents
 
@@ -3874,6 +4235,8 @@ private pure func function_parameter_contains_function_type(param: FunctionParam
 			type_expression.type_expression_contains_function()
 		TypedPatternParam(_, type_expression):
 			type_expression.type_expression_contains_function()
+		CommentedParam(inner, _, _):
+			inner.function_parameter_contains_function_type()
 		_:
 			False
 
@@ -3891,8 +4254,24 @@ private pure func function_parameters_contain_function_type(
 	contains
 
 
+private pure func function_parameters_have_comments(params: List[FunctionParameter]) -> Bool:
+	var found: Bool = False
+
+	for param in params:
+		match param:
+			CommentedParam(_, _, _):
+				found = True
+				break
+			_:
+				void
+
+	found
+
+
 private pure func should_force_multiline_parameters(params: List[FunctionParameter]) -> Bool:
-	if params.length() > 1 and params.function_parameters_contain_function_type():
+	if params.function_parameters_have_comments():
+		True
+	else if params.length() > 1 and params.function_parameters_contain_function_type():
 		True
 	else if params.length() <= 3:
 		False
@@ -4457,6 +4836,8 @@ pure func expression_document(expr: Expression) -> Doc:
 						.cat(right_document)
 		LogicalExpression(op, _, _):
 			expr.logical_expression_document(op)
+		CommentedLogicalExpression(op, terms):
+			commented_logical_expression_document(op, terms)
 		TupleExpression(elems):
 			elems.tuple_expression_document()
 		ListExpression(elems):
@@ -4529,52 +4910,49 @@ pure func expression_document(expr: Expression) -> Doc:
 			items.spaced_block_expressions_document()
 		ItemBlockExpression(items):
 			items.block_items_document()
-		IfExpression(cond, then_expr):
+		IfExpression(cond, then_expr, header_comment):
 			"if "
 				.text()
-				.cat(cond.block_header_expression_document())
-				.cat(":".text())
-				.cat(
-					Hardline
-						.cat(then_expr.block_body_document())
-						.indent(),
-				)
-		IfElseExpression(cond, then_expr, else_expr):
-			if_document: Doc = "if "
-				.text()
-				.cat(cond.block_header_expression_document())
-				.cat(":".text())
-				.cat(
-					Hardline
-						.cat(then_expr.block_body_document())
-						.indent(),
-				)
-
-			match else_expr:
-				IfExpression(_, _):
-					if_document
-						.cat(Hardline)
-						.cat("else ".text())
+				.headed_block_document(cond, header_comment, then_expr)
+		IfElseExpression(cond, then_expr, else_expr, header_comment, else_comments):
+			else_document: Doc = match else_expr:
+				IfExpression(_, _, _):
+					"else "
+						.text()
 						.cat(else_expr.expression_document())
-				IfElseExpression(_, _, _):
-					if_document
-						.cat(Hardline)
-						.cat("else ".text())
+				IfElseExpression(_, _, _, _, _):
+					"else "
+						.text()
 						.cat(else_expr.expression_document())
 				_:
-					if_document
-						.cat(Hardline)
-						.cat("else:".text())
+					"else:"
+						.text()
+						.cat(else_comments.trailing.trailing_text_document())
 						.cat(
 							Hardline
 								.cat(else_expr.block_body_document())
 								.indent(),
 						)
-		MatchExpression(scrutinee, cases):
+
+			"if "
+				.text()
+				.headed_block_document(cond, header_comment, then_expr)
+				.cat(Hardline)
+				.cat(else_comments.leading.comment_lines_document())
+				.cat(else_document)
+		MatchExpression(scrutinee, cases, comments):
+			var closing: Doc = "".text()
+
+			for comment in comments.closing:
+				closing = closing
+					.cat(Hardline)
+					.cat(comment.text())
+
 			"match "
 				.text()
 				.cat(scrutinee.block_header_expression_document())
 				.cat(":".text())
+				.cat(comments.header_trailing.trailing_text_document())
 				.cat(
 					Hardline
 						.cat(
@@ -4582,6 +4960,7 @@ pure func expression_document(expr: Expression) -> Doc:
 								.match_case_documents()
 								.hardlines(),
 						)
+						.cat(closing)
 						.indent(),
 				)
 		SelectExpression(arms):
@@ -4596,29 +4975,17 @@ pure func expression_document(expr: Expression) -> Doc:
 						)
 						.indent(),
 				)
-		WhileExpression(cond, body):
+		WhileExpression(cond, body, header_comment):
 			"while "
 				.text()
-				.cat(cond.block_header_expression_document())
-				.cat(":".text())
-				.cat(
-					Hardline
-						.cat(body.block_body_document())
-						.indent(),
-				)
-		ForExpression(name, iter, body):
+				.headed_block_document(cond, header_comment, body)
+		ForExpression(name, iter, body, header_comment):
 			"for "
 				.text()
 				.cat(name.text())
 				.cat(" in ".text())
-				.cat(iter.block_header_expression_document())
-				.cat(":".text())
-				.cat(
-					Hardline
-						.cat(body.block_body_document())
-						.indent(),
-				)
-		TupleForExpression(names, iter, body):
+				.headed_block_document(iter, header_comment, body)
+		TupleForExpression(names, iter, body, header_comment):
 			"for ("
 				.text()
 				.cat(
@@ -4627,13 +4994,9 @@ pure func expression_document(expr: Expression) -> Doc:
 						.comma_sep(),
 				)
 				.cat(") in ".text())
-				.cat(iter.block_header_expression_document())
-				.cat(":".text())
-				.cat(
-					Hardline
-						.cat(body.block_body_document())
-						.indent(),
-				)
+				.headed_block_document(iter, header_comment, body)
+		CommentedCollectionExpression(collection, closing):
+			collection.commented_collection_document(closing)
 		WithExpression(name, type_expression, is_try, value, error_name, error_value, body):
 			with_expression_document(
 				name,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -26,7 +27,7 @@ from run_blorp_check_fixtures import expectation_failures, parse_expectations
 
 DEFAULT_FIXTURE_ROOT = Path("blorp/test")
 DEFAULT_STDLIB_CASE = Path("standard_library/src/crypto_random.brp")
-EXPECTED_TOOL_FIXTURE_COUNT = 112
+EXPECTED_TOOL_FIXTURE_COUNT = 124
 
 
 class FixtureKind(Enum):
@@ -109,11 +110,56 @@ def rewrite_expectation_failures(original: Path, rewritten: str) -> list[str]:
     return failures
 
 
+def line_comment_text(line: str) -> str | None:
+    """Return the `--` comment ending a source line, or None.
+
+    Skips `--` inside double-quoted and character literals on the same line.
+    Fixture comments are simple enough for this scan; it is not a lexer, so
+    fixtures must not put `--` inside multiline pipe strings.
+    """
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is not None:
+            if char == "\\":
+                index += 1
+            elif char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif line.startswith("--", index):
+            return line[index:].rstrip()
+        index += 1
+    return None
+
+
+def source_comment_texts(source: str) -> Counter[str]:
+    comments = (line_comment_text(line) for line in source.splitlines())
+    return Counter(comment for comment in comments if comment is not None)
+
+
+def comment_preservation_failures(original: str, formatted: str) -> list[str]:
+    """Require formatting to keep every comment exactly once."""
+    before = source_comment_texts(original)
+    after = source_comment_texts(formatted)
+    failures = [
+        f"formatter dropped comment: {comment}"
+        for comment in sorted((before - after).elements())
+    ]
+    failures.extend(
+        f"formatter duplicated or invented comment: {comment}"
+        for comment in sorted((after - before).elements())
+    )
+    return failures
+
+
 def formatted_fixpoint_failures(compiler: Path, fixture: Path, timeout: int) -> list[str]:
     """Format a copy of a should_fail fixture and require the result to be a fixpoint.
 
     The formatter must accept its own output unchanged; otherwise `format --check`
-    cannot serve as a gate over freshly formatted trees.
+    cannot serve as a gate over freshly formatted trees. It must also keep every
+    comment: a layout change that silently deletes a comment is a failure.
     """
     with tempfile.TemporaryDirectory(prefix="blorp-format-fixpoint-") as temp_dir:
         formatted_path = Path(temp_dir) / fixture.name
@@ -123,14 +169,17 @@ def formatted_fixpoint_failures(compiler: Path, fixture: Path, timeout: int) -> 
             return ["formatter failed to rewrite the source"] + output_details(
                 write, "formatter"
             )
+        failures = comment_preservation_failures(
+            fixture.read_text(encoding="utf-8"),
+            formatted_path.read_text(encoding="utf-8"),
+        )
         recheck = run_command(
             [str(compiler), "format", "--diff", str(formatted_path)], timeout
         )
-    if recheck.returncode == 0:
-        return []
-    return ["formatted output is not a fixpoint"] + output_details(
-        recheck, "formatter recheck"
-    )
+    if recheck.returncode != 0:
+        failures.append("formatted output is not a fixpoint")
+        failures.extend(output_details(recheck, "formatter recheck"))
+    return failures
 
 
 def run_fixture(compiler: Path, fixture: Fixture, timeout: int) -> list[str]:

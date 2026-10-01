@@ -58,6 +58,7 @@ import:
 			ParsedDimSubtractOp,
 		),
 		ParsedDimConstraint,
+		ParsedElseBranch,
 		ParsedExpr(
 			ParsedAssignExpr,
 			ParsedBinaryExpr,
@@ -172,7 +173,10 @@ import:
 		ParsedVariantDecl,
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
+		parsed_decl_location,
 		parsed_expr_location,
+		parsed_pattern_location,
+		parsed_type_expr_location,
 	../lib/source:
 		SourceFile,
 		SourceLocation,
@@ -216,6 +220,17 @@ import:
 	engine/expression_documents:
 		BinaryOp(AddOp, DivOp, EqOp, GeOp, GtOp, LeOp, LtOp, ModOp, MulOp, NeOp, SubOp),
 		BlockItem(BlockCommentItem, BlockExpressionItem),
+		CommentedCollection(
+			CommentedCall,
+			CommentedDictionary,
+			CommentedList,
+			CommentedRecord,
+			CommentedRecordUpdate,
+			CommentedSubscript,
+			CommentedTuple,
+			CommentedVector,
+		),
+		CommentedItem,
 		ConcurrentlyLoopWidth(ConcurrentlyLoopLimit),
 		Expression(
 			AssignmentExpression,
@@ -225,6 +240,8 @@ import:
 			BuiltinExpression,
 			BuiltinRuntimeExpression,
 			CallExpression,
+			CommentedCollectionExpression,
+			CommentedLogicalExpression,
 			CompoundAssignmentExpression,
 			ConcurrentBindExpression,
 			ConcurrentExpression,
@@ -271,10 +288,18 @@ import:
 			WhileExpression,
 			WithExpression,
 		),
-		FunctionParameter(NameParam, PatternParam, TypedNameParam, TypedPatternParam),
+		FunctionParameter(
+			CommentedParam,
+			NameParam,
+			PatternParam,
+			TypedNameParam,
+			TypedPatternParam,
+		),
 		Literal(BoolLiteral, CharLiteral, FloatLiteral, Int128Literal, IntLiteral, StringLiteral),
 		LogicalOp(AndOp, OrOp),
 		MatchCase(MatchCaseData),
+		MatchComments,
+		MemberComments,
 		Pattern(
 			ConstructorPattern,
 			ListPattern,
@@ -618,6 +643,105 @@ private pure func project_params(params: List[ParsedParam]) -> List[FunctionPara
 	params.map(func(param): project_param(param))
 
 
+---
+The last line before a function's closing `)` that can hold a comment of its
+parameter list. The parser does not locate the `)`, so the bound comes from
+what follows it: the return type starts on the `)` line or after it, and a
+body block claims the comments directly above its first statement. Without a
+return type, a comment after `):` that a blank line separates from the first
+statement falls in the parameter list; no block claims it.
+---
+private pure func parameter_comments_end_line(
+	table: SourceTable,
+	comments: List[FormatterComment],
+	last_param_end_line: Int,
+	return_type: Option[ParsedTypeExpr],
+	body: Option[ParsedExpr],
+) -> Int:
+	match (return_type, body):
+		(Some(type_expr), _):
+			source_location_span(table, parsed_type_expr_location(type_expr)).start_line - 1
+		(None, Some(ParsedBlockExpr(items, span))):
+			initial_block_previous_end(
+				table,
+				items,
+				comments,
+				block_comment_column(table, items),
+				source_location_span(table, span).start_line,
+			)
+		_:
+			last_param_end_line
+
+
+---
+Project a function's parameters with the comments written among them (see
+`collection_item_comments`). A top-level declaration's renderer keeps the
+comment ending its `func` line (see `project_decls`); a method's or nested
+function's `func`-line comment goes to its parameters. Without a return type
+the `)` line is not located (see `parameter_comments_end_line`), so a comment
+ending a `):` line attaches to the last parameter.
+---
+private pure func project_function_params(
+	table: SourceTable,
+	comments: List[FormatterComment],
+	name: ParsedIdentifier,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	body: Option[ParsedExpr],
+) -> List[FunctionParameter]:
+	if comments.length() == 0:
+		project_params(params)
+	else:
+		project_commented_function_params(table, comments, name, params, return_type, body)
+
+
+private pure func project_commented_function_params(
+	table: SourceTable,
+	comments: List[FormatterComment],
+	name: ParsedIdentifier,
+	params: List[ParsedParam],
+	return_type: Option[ParsedTypeExpr],
+	body: Option[ParsedExpr],
+) -> List[FunctionParameter]:
+	open_line: Int = source_location_span(table, name.span).start_line
+
+	last_param_end_line: Int = match params.last():
+		Some(param):
+			span_end_line(table, param.span)
+		None:
+			open_line
+
+	commented: CommentedItems[FunctionParameter] = collection_item_comments(
+		table,
+		comments,
+		open_line,
+		parameter_comments_end_line(table, comments, last_param_end_line, return_type, body) + 1,
+		params.map(func(param): located_item(project_param(param), param_item_extent(param))),
+	)
+	var result: List[FunctionParameter] = []
+	last_index: Int = commented.items.length() - 1
+	var index: Int = 0
+
+	for param in commented.items:
+		after: List[String] = if index == last_index:
+			commented.closing
+		else:
+			[]
+
+		if (
+			param.comments.leading.length() > 0
+			or param.comments.trailing.is_some()
+			or after.length() > 0
+		):
+			result = result.append(CommentedParam(param.item, param.comments, after))
+		else:
+			result = result.append(param.item)
+
+		index += 1
+
+	result
+
+
 private pure func project_lambda_param(param: ParsedLambdaParam) -> FunctionParameter:
 	match param.type_expr:
 		Some(type_expr):
@@ -680,15 +804,27 @@ private pure func trailing_comment_on_line(
 	result
 
 
+---
+The comment ending a statement's last line, when the statement owns it: a
+statement on one line, or one whose last line does not end inside a nested
+block (see `parsed_expr_ends_inside_block`), which claims that comment itself.
+---
 private pure func trailing_comment_for_expr(
 	table: SourceTable,
 	comments: List[FormatterComment],
-	span: SourceLocation,
+	expr: ParsedExpr,
 ) -> Option[String]:
-	resolved: SourceSpan = source_location_span(table, span)
+	resolved: SourceSpan = source_location_span(table, parsed_expr_location(expr))
 
-	if resolved.start_line == resolved.end_line:
+	if comments.length() == 0:
+		None
+	else if resolved.start_line == resolved.end_line:
 		trailing_comment_on_line(comments, resolved.end_line)
+	else if not parsed_expr_ends_inside_block(table, expr):
+		trailing_comment_on_line(
+			comments,
+			span_end_line(table, parsed_expr_location(expr)),
+		)
 	else:
 		None
 
@@ -722,7 +858,7 @@ private pure func block_item_trailing_comment(
 		ParsedConcurrentForExpr(_, _, _, _, _):
 			None
 		_:
-			trailing_comment_for_expr(table, comments, parsed_expr_location(expr))
+			trailing_comment_for_expr(table, comments, expr)
 
 
 private pure func block_has_comments(
@@ -929,49 +1065,973 @@ private pure func block_exprs_for_concurrent(
 			[project_expr_with_comments(table, body, comments)]
 
 
-private pure func project_record_expr_fields(
+---
+Where one item of a call, collection, logical chain or parameter list sits:
+its span; the statement column of a block ending it (see `PrecedingBody`);
+and whether its last line ends inside a nested block, which claims the
+comment ending that line (see `parsed_expr_ends_inside_block`).
+---
+record ParsedItemExtent {
+	span: SourceLocation,
+	ending_block_column: Option[Int],
+	ends_inside_block: Bool
+}
+
+
+---
+Whether an expression's last line ends inside a nested block: a block-bodied
+construct (`if`, `match`, a loop, a block lambda...) reached through the
+expression's rightmost parts. That block's last statement claims the comment
+ending the line, so the expression must not. A call or collection reaches its
+last item only when that item ends on the closing bracket's line. Any other
+expression owns the comment ending its last line.
+---
+private pure func parsed_expr_ends_inside_block(table: SourceTable, expr: ParsedExpr) -> Bool:
+	match expr:
+		ParsedBlockExpr(_, _):
+			True
+		ParsedIfExpr(_, _, _, _):
+			True
+		ParsedMatchExpr(_, _, _):
+			True
+		ParsedSelectExpr(_, _):
+			True
+		ParsedWithExpr(_, _, _):
+			True
+		ParsedDebugBlockExpr(_, _):
+			True
+		ParsedFunctionDeclExpr(_):
+			True
+		ParsedWhileExpr(_, _, _):
+			True
+		ParsedForExpr(_, _, _, _):
+			True
+		ParsedConcurrentBlockExpr(_, _, _):
+			True
+		ParsedConcurrentForExpr(_, _, _, _, _):
+			True
+		ParsedLambdaExpr(_, _, _, body, _):
+			parsed_expr_ends_inside_block(table, body)
+		ParsedDetachExpr(body, _):
+			parsed_expr_ends_inside_block(table, body)
+		ParsedUnaryExpr(_, inner, _):
+			parsed_expr_ends_inside_block(table, inner)
+		ParsedBinaryExpr(_, _, right, _):
+			parsed_expr_ends_inside_block(table, right)
+		ParsedRangeExpr(_, right, _):
+			parsed_expr_ends_inside_block(table, right)
+		ParsedLogicalExpr(_, _, right, _):
+			parsed_expr_ends_inside_block(table, right)
+		ParsedFieldAccessExpr(target, _, _):
+			parsed_expr_ends_inside_block(table, target)
+		ParsedOpaqueIntoExpr(_, inner, _):
+			parsed_expr_ends_inside_block(table, inner)
+		ParsedOpaqueFromExpr(_, inner, _):
+			parsed_expr_ends_inside_block(table, inner)
+		ParsedAssignExpr(_, value, _):
+			parsed_expr_ends_inside_block(table, value)
+		ParsedVarDeclExpr(_, _, value, _, _):
+			parsed_expr_ends_inside_block(table, value)
+		ParsedCompoundAssignExpr(_, _, value, _):
+			parsed_expr_ends_inside_block(table, value)
+		ParsedQuestionBindExpr(_, _, value, _):
+			parsed_expr_ends_inside_block(table, value)
+		ParsedTupleDestructExpr(_, value, _):
+			parsed_expr_ends_inside_block(table, value)
+		ParsedSubscriptAssignExpr(_, _, value, _):
+			parsed_expr_ends_inside_block(table, value)
+		ParsedCallExpr(_, args, span):
+			last_item_ends_inside_block(table, args.last(), span)
+		ParsedSubscriptExpr(_, indices, span):
+			last_item_ends_inside_block(table, indices.last(), span)
+		ParsedListExpr(items, span):
+			last_item_ends_inside_block(table, items.last(), span)
+		ParsedTupleExpr(items, span):
+			last_item_ends_inside_block(table, items.last(), span)
+		ParsedVectorExpr(items, span):
+			last_item_ends_inside_block(table, items.last(), span)
+		ParsedRecordExpr(fields, span):
+			last_item_ends_inside_block(
+				table,
+				fields.last().map(
+					func(field): field.value,
+				),
+				span,
+			)
+		ParsedRecordUpdateExpr(_, fields, span):
+			last_item_ends_inside_block(
+				table,
+				fields.last().map(
+					func(field): field.value,
+				),
+				span,
+			)
+		ParsedDictExpr(entries, span):
+			last_item_ends_inside_block(
+				table,
+				entries.last().map(
+					func(entry): entry.value,
+				),
+				span,
+			)
+		_:
+			False
+
+
+---
+The last line holding an expression's own text. A match's span runs to the
+line that dedents it, which may hold an enclosing call's `)`, so its text ends
+with its last case instead; blocks, lambdas and bindings end with their last
+part.
+---
+private pure func parsed_expr_text_end_line(table: SourceTable, expr: ParsedExpr) -> Int:
+	match expr:
+		ParsedMatchExpr(_, cases, _):
+			match cases.last():
+				Some(last_case):
+					parsed_expr_text_end_line(table, last_case.body)
+				None:
+					expr_end_line(table, expr)
+		ParsedBlockExpr(items, _):
+			match items.last():
+				Some(last_item):
+					parsed_expr_text_end_line(table, last_item)
+				None:
+					expr_end_line(table, expr)
+		ParsedLambdaExpr(_, _, _, body, _):
+			parsed_expr_text_end_line(table, body)
+		ParsedAssignExpr(_, value, _):
+			parsed_expr_text_end_line(table, value)
+		ParsedVarDeclExpr(_, _, value, _, _):
+			parsed_expr_text_end_line(table, value)
+		_:
+			expr_end_line(table, expr)
+
+
+--- Whether a bracketed expression's last item ends inside a block on its closing line.
+private pure func last_item_ends_inside_block(
 	table: SourceTable,
-	fields: List[ParsedRecordExprField],
-) -> List[(String, Expression)]:
-	var projected: List[(String, Expression)] = []
+	last_item: Option[ParsedExpr],
+	span: SourceLocation,
+) -> Bool:
+	match last_item:
+		Some(item):
+			(
+				parsed_expr_text_end_line(table, item) == span_end_line(table, span)
+				and parsed_expr_ends_inside_block(table, item)
+			)
+		None:
+			False
 
-	for field in fields:
-		projected = projected.append((field.name.text, project_expr(table, field.value)))
 
-	projected
+private pure func expr_item_extent(table: SourceTable, expr: ParsedExpr) -> ParsedItemExtent:
+	{
+		span = parsed_expr_location(expr),
+		ending_block_column = ending_block_column(table, expr),
+		ends_inside_block = parsed_expr_ends_inside_block(table, expr)
+	}
 
 
-private pure func project_dict_entries(
+private pure func value_item_extent(
 	table: SourceTable,
-	entries: List[ParsedDictEntry],
-) -> List[(Expression, Expression)]:
-	var projected: List[(Expression, Expression)] = []
+	span: SourceLocation,
+	value: ParsedExpr,
+) -> ParsedItemExtent:
+	{
+		span = span,
+		ending_block_column = ending_block_column(table, value),
+		ends_inside_block = parsed_expr_ends_inside_block(table, value)
+	}
 
-	for entry in entries:
-		projected = projected.append(
-			(project_expr(table, entry.key), project_expr(table, entry.value)),
+
+private pure func param_item_extent(param: ParsedParam) -> ParsedItemExtent:
+	{
+		span = param.span,
+		ending_block_column = None,
+		ends_inside_block = False
+	}
+
+
+--- A projected item paired with where its parsed form sits.
+record LocatedItem[T] {
+	item: T,
+	extent: ParsedItemExtent
+}
+
+
+-- A typed constructor: a generic record literal inside a lambda fails to
+-- typecheck ("matched record type has no field metadata").
+private pure func located_item[T](item: T, extent: ParsedItemExtent) -> LocatedItem[T]:
+	{
+		item = item,
+		extent = extent
+	}
+
+
+--- Commented items and the whole-line comments after the last one.
+record CommentedItems[T] {
+	items: List[CommentedItem[T]],
+	closing: List[String]
+}
+
+
+private pure func commented_items_have_comments[T](commented: CommentedItems[T]) -> Bool:
+	var found: Bool = commented.closing.length() > 0
+
+	for item in commented.items:
+		if item.comments.leading.length() > 0 or item.comments.trailing.is_some():
+			found = True
+			break
+
+	found
+
+
+private pure func plain_items[T](commented: CommentedItems[T]) -> List[T]:
+	commented.items.map(func(item): item.item)
+
+
+---
+Claim the comments written among a call's or collection's items by position.
+An item owns the whole-line comments after the previous item (or after
+`open_line`, the line of the opening bracket) and above it. It also owns the
+comment ending its last line when no other item starts on that line and the
+line does not end inside a nested block (see `parsed_expr_ends_inside_block`).
+The first item also owns the comment ending the opening bracket's line when it
+starts on a later line, so no nested item shares that line; that comment moves
+to its own line above the item. The closing comments are the whole-line comments after the
+last item above `close_line`, the closing bracket's line; the comment ending
+that line belongs to whatever encloses the collection. Every comment kept here
+is re-indented to the item column.
+---
+private pure func collection_item_comments[T](
+	table: SourceTable,
+	comments: List[FormatterComment],
+	open_line: Int,
+	close_line: Int,
+	items: List[LocatedItem[T]],
+) -> CommentedItems[T]:
+	var commented: List[CommentedItem[T]] = []
+	var preceding: PrecedingBody = line_as_preceding_body(open_line)
+	var index: Int = 0
+
+	for located in items:
+		span: SourceSpan = source_location_span(table, located.extent.span)
+		end_line: Int = span_end_line(table, located.extent.span)
+
+		next_start_line: Int = match items.get(index + 1):
+			Some(next):
+				source_location_span(table, next.extent.span).start_line
+			None:
+				close_line
+
+		claims_trailing: Bool = not located.extent.ends_inside_block and end_line < next_start_line
+
+		trailing: Option[String] = if claims_trailing:
+			trailing_comment_on_line(comments, end_line)
+		else:
+			None
+
+		var leading: List[String] = whole_line_comments_after(
+			comments,
+			preceding,
+			span.start_line - 1,
+			0,
 		)
 
-	projected
+		if index == 0 and span.start_line > open_line:
+			match trailing_comment_on_line(comments, open_line):
+				Some(comment):
+					leading = [comment].concat(leading)
+				None:
+					void
+
+		commented = commented.append({
+			item = located.item,
+			comments = {
+				leading = leading,
+				trailing = trailing
+			},
+		})
+		preceding = {
+			end_line = end_line,
+			block_column = located.extent.ending_block_column
+		}
+		index += 1
+
+	{
+		items = commented,
+		closing = whole_line_comments_after(comments, preceding, close_line - 1, 0)
+	}
 
 
+---
+Project items without claiming comments, for a declaration that has none:
+locating items costs span lookups per item, which most declarations never need.
+---
+private pure func plain_exprs(table: SourceTable, exprs: List[ParsedExpr]) -> List[Expression]:
+	exprs.map(func(expr): project_expr(table, expr))
+
+
+private pure func plain_record_field(
+	table: SourceTable,
+	field: ParsedRecordExprField,
+) -> (String, Expression):
+	(field.name.text, project_expr(table, field.value))
+
+
+private pure func plain_dict_entry(
+	table: SourceTable,
+	entry: ParsedDictEntry,
+) -> (Expression, Expression):
+	(project_expr(table, entry.key), project_expr(table, entry.value))
+
+
+private pure func located_exprs(
+	table: SourceTable,
+	exprs: List[ParsedExpr],
+	comments: List[FormatterComment],
+) -> List[LocatedItem[Expression]]:
+	exprs.map(func(expr): located_item(
+			project_expr_with_comments(table, expr, comments),
+			expr_item_extent(table, expr),
+		))
+
+
+private pure func located_record_fields(
+	table: SourceTable,
+	fields: List[ParsedRecordExprField],
+	comments: List[FormatterComment],
+) -> List[LocatedItem[(String, Expression)]]:
+	fields.map(func(field): located_item(
+			(field.name.text, project_expr_with_comments(table, field.value, comments)),
+			value_item_extent(table, field.span, field.value),
+		))
+
+
+private pure func located_dict_entries(
+	table: SourceTable,
+	entries: List[ParsedDictEntry],
+	comments: List[FormatterComment],
+) -> List[LocatedItem[(Expression, Expression)]]:
+	entries.map(func(entry): located_item(
+			(
+				project_expr_with_comments(table, entry.key, comments),
+				project_expr_with_comments(table, entry.value, comments),
+			),
+			value_item_extent(table, entry.span, entry.value),
+		))
+
+
+private pure func same_parsed_logical_op(left: ParsedLogicalOp, right: ParsedLogicalOp) -> Bool:
+	match (left, right):
+		(ParsedAndOp, ParsedAndOp):
+			True
+		(ParsedOrOp, ParsedOrOp):
+			True
+		_:
+			False
+
+
+--- The terms of a chain of one logical operator, as the renderer flattens them.
+private pure func parsed_logical_chain_terms(
+	expr: ParsedExpr,
+	op: ParsedLogicalOp,
+) -> List[ParsedExpr]:
+	match expr:
+		ParsedLogicalExpr(inner_op, left, right, _):
+			if same_parsed_logical_op(inner_op, op):
+				parsed_logical_chain_terms(left, op).concat(parsed_logical_chain_terms(right, op))
+			else:
+				[expr]
+		_:
+			[expr]
+
+
+--- Fold chain terms back into a logical expression; the renderer flattens it again.
+private pure func logical_chain_of(op: LogicalOp, terms: List[Expression]) -> Expression:
+	match terms:
+		[first, ...rest]:
+			var chain: Expression = first
+
+			for term in rest:
+				chain = LogicalExpression(op, chain, term)
+
+			chain
+		[]:
+			-- A chain has at least two terms.
+			VoidExpression
+
+
+---
+Project an `and` or `or` chain with the comments written among its terms (see
+`collection_item_comments`). A term claims the whole-line comments above it
+and the comment ending its line when the next term starts on a later line. The
+chain starts on its first term's line, so no comment claimed on the opening
+line precedes it. The first term's leading comments and the last term's
+trailing comment fall outside the chain's span: a block header or statement
+owns the last line, and the parentheses around a broken chain are not in the
+parsed tree.
+---
+private pure func project_logical_chain(
+	table: SourceTable,
+	parsed_op: ParsedLogicalOp,
+	expr: ParsedExpr,
+	comments: List[FormatterComment],
+) -> Expression:
+	op: LogicalOp = project_logical_op(parsed_op)
+	parsed_terms: List[ParsedExpr] = parsed_logical_chain_terms(expr, parsed_op)
+
+	if comments.length() == 0:
+		logical_chain_of(
+			op,
+			plain_exprs(table, parsed_terms),
+		)
+	else:
+		terms: CommentedItems[Expression] = collection_item_comments(
+			table,
+			comments,
+			source_location_span(table, parsed_expr_location(expr)).start_line,
+			expr_end_line(table, expr),
+			located_exprs(table, parsed_terms, comments),
+		)
+
+		if terms.commented_items_have_comments():
+			CommentedLogicalExpression(op, terms.items)
+		else:
+			logical_chain_of(op, terms.plain_items())
+
+
+private pure func project_call_expr(
+	table: SourceTable,
+	callee: ParsedExpr,
+	args: List[ParsedExpr],
+	comments: List[FormatterComment],
+	span: SourceLocation,
+) -> Expression:
+	projected_callee: Expression = project_expr_with_comments(table, callee, comments)
+
+	if comments.length() == 0:
+		CallExpression(
+			projected_callee,
+			plain_exprs(table, args),
+		)
+	else:
+		commented: CommentedItems[Expression] = collection_item_comments(
+			table,
+			comments,
+			expr_end_line(table, callee),
+			span_end_line(table, span),
+			located_exprs(table, args, comments),
+		)
+
+		if commented.commented_items_have_comments():
+			CommentedCollectionExpression(
+				CommentedCall(projected_callee, commented.items),
+				commented.closing,
+			)
+		else:
+			CallExpression(projected_callee, commented.plain_items())
+
+
+private pure func project_subscript_expr(
+	table: SourceTable,
+	target: ParsedExpr,
+	indices: List[ParsedExpr],
+	comments: List[FormatterComment],
+	span: SourceLocation,
+) -> Expression:
+	projected_target: Expression = project_expr_with_comments(table, target, comments)
+
+	if comments.length() == 0:
+		match plain_exprs(table, indices):
+			[index]:
+				SubscriptExpression(projected_target, index)
+			projected:
+				MultiSubscriptExpression(projected_target, projected)
+	else:
+		commented: CommentedItems[Expression] = collection_item_comments(
+			table,
+			comments,
+			expr_end_line(table, target),
+			span_end_line(table, span),
+			located_exprs(table, indices, comments),
+		)
+
+		if commented.commented_items_have_comments():
+			CommentedCollectionExpression(
+				CommentedSubscript(projected_target, commented.items),
+				commented.closing,
+			)
+		else:
+			match commented.plain_items():
+				[index]:
+					SubscriptExpression(projected_target, index)
+				projected:
+					MultiSubscriptExpression(projected_target, projected)
+
+
+--- The shapes of collection literals whose items are plain expressions.
+enum ExpressionCollectionShape:
+	ListShape
+	TupleShape
+	VectorShape
+
+
+private pure func project_expression_collection(
+	table: SourceTable,
+	shape: ExpressionCollectionShape,
+	items: List[ParsedExpr],
+	comments: List[FormatterComment],
+	span: SourceLocation,
+) -> Expression:
+	if comments.length() == 0:
+		match shape:
+			ListShape:
+				ListExpression(plain_exprs(table, items))
+			TupleShape:
+				TupleExpression(plain_exprs(table, items))
+			VectorShape:
+				VectorExpression(plain_exprs(table, items))
+	else:
+		commented: CommentedItems[Expression] = collection_item_comments(
+			table,
+			comments,
+			source_location_span(table, span).start_line,
+			span_end_line(table, span),
+			located_exprs(table, items, comments),
+		)
+
+		if commented.commented_items_have_comments():
+			collection: CommentedCollection = match shape:
+				ListShape:
+					CommentedList(commented.items)
+				TupleShape:
+					CommentedTuple(commented.items)
+				VectorShape:
+					CommentedVector(commented.items)
+
+			CommentedCollectionExpression(collection, commented.closing)
+		else:
+			projected: List[Expression] = commented.plain_items()
+
+			match shape:
+				ListShape:
+					ListExpression(projected)
+				TupleShape:
+					TupleExpression(projected)
+				VectorShape:
+					VectorExpression(projected)
+
+
+private pure func project_record_expr(
+	table: SourceTable,
+	fields: List[ParsedRecordExprField],
+	comments: List[FormatterComment],
+	span: SourceLocation,
+) -> Expression:
+	if comments.length() == 0:
+		RecordExpression(fields.map(
+			func(field): plain_record_field(table, field),
+		))
+	else:
+		commented: CommentedItems[(String, Expression)] = collection_item_comments(
+			table,
+			comments,
+			source_location_span(table, span).start_line,
+			span_end_line(table, span),
+			located_record_fields(table, fields, comments),
+		)
+
+		if commented.commented_items_have_comments():
+			CommentedCollectionExpression(CommentedRecord(commented.items), commented.closing)
+		else:
+			RecordExpression(commented.plain_items())
+
+
+private pure func project_record_update_expr(
+	table: SourceTable,
+	base: ParsedExpr,
+	fields: List[ParsedRecordExprField],
+	comments: List[FormatterComment],
+	span: SourceLocation,
+) -> Expression:
+	projected_base: Expression = project_expr_with_comments(table, base, comments)
+
+	if comments.length() == 0:
+		RecordUpdateExpression(
+			projected_base,
+			fields.map(func(field): plain_record_field(table, field)),
+		)
+	else:
+		commented: CommentedItems[(String, Expression)] = collection_item_comments(
+			table,
+			comments,
+			expr_end_line(table, base),
+			span_end_line(table, span),
+			located_record_fields(table, fields, comments),
+		)
+
+		if commented.commented_items_have_comments():
+			CommentedCollectionExpression(
+				CommentedRecordUpdate(projected_base, commented.items),
+				commented.closing,
+			)
+		else:
+			RecordUpdateExpression(projected_base, commented.plain_items())
+
+
+private pure func project_dict_expr(
+	table: SourceTable,
+	entries: List[ParsedDictEntry],
+	comments: List[FormatterComment],
+	span: SourceLocation,
+) -> Expression:
+	if comments.length() == 0:
+		DictionaryExpression(entries.map(
+			func(entry): plain_dict_entry(table, entry),
+		))
+	else:
+		commented: CommentedItems[(Expression, Expression)] = collection_item_comments(
+			table,
+			comments,
+			source_location_span(table, span).start_line,
+			span_end_line(table, span),
+			located_dict_entries(table, entries, comments),
+		)
+
+		if commented.commented_items_have_comments():
+			CommentedCollectionExpression(CommentedDictionary(commented.items), commented.closing)
+		else:
+			DictionaryExpression(commented.plain_items())
+
+
+---
+The body before a group of comments that a match case, an `else` or a
+collection item claims: the previous case body, the `then` block, the previous
+item, or none at a header or opening bracket. Usually no
+whole-line comment can sit on its last line (`end_line`). The exception is a
+body ending with a nested match, whose span runs to the line that dedents it,
+which may be a comment line. A body block claims a comment on that line at or
+right of its statements (`block_column`), because a block claims comments up
+to its last line; a comment left of them belongs to what follows the body.
+---
+record PrecedingBody {
+	end_line: Int,
+	block_column: Option[Int]
+}
+
+
+---
+A line holding a header or an opening bracket, as the body before the first
+member. No whole-line comment shares it and no block claims one there.
+---
+private pure func line_as_preceding_body(header_line: Int) -> PrecedingBody:
+	{
+		end_line = header_line,
+		block_column = None
+	}
+
+
+--- The statement column of the block that ends `expr`, directly or as a lambda body.
+private pure func ending_block_column(table: SourceTable, expr: ParsedExpr) -> Option[Int]:
+	match expr:
+		ParsedBlockExpr(items, _):
+			Some(block_comment_column(table, items))
+		ParsedLambdaExpr(_, _, _, body, _):
+			ending_block_column(table, body)
+		_:
+			None
+
+
+private pure func preceding_body(
+	table: SourceTable,
+	body: ParsedExpr,
+	end_line: Int,
+) -> PrecedingBody:
+	{
+		end_line = end_line,
+		block_column = ending_block_column(table, body)
+	}
+
+
+private pure func follows_preceding_body(
+	preceding: PrecedingBody,
+	comment: FormatterComment,
+) -> Bool:
+	if comment.line > preceding.end_line:
+		True
+	else if comment.line == preceding.end_line:
+		match preceding.block_column:
+			Some(column):
+				comment.column < column
+			None:
+				True
+	else:
+		False
+
+
+---
+The whole-line comments at or right of `min_column` after `preceding` up to
+and including `last_line`, in source order.
+---
+private pure func whole_line_comments_after(
+	comments: List[FormatterComment],
+	preceding: PrecedingBody,
+	last_line: Int,
+	min_column: Int,
+) -> List[String]:
+	var texts: List[String] = []
+
+	for comment in comments:
+		if (
+			not comment.trailing
+			and comment.line <= last_line
+			and comment.column >= min_column
+			and preceding.follows_preceding_body(comment)
+		):
+			texts = texts.append(comment.text_value)
+
+	texts
+
+
+---
+The comment ending a control-flow header (`if cond:`, `while cond:`, `for x in
+xs:`): the first trailing comment from the header expression's last line to
+the line above the body block, since a closing parenthesis may sit on a line
+of its own. The parser requires these bodies to start on a later line.
+---
+private pure func header_trailing_comment(
+	table: SourceTable,
+	header: ParsedExpr,
+	body: ParsedExpr,
+	comments: List[FormatterComment],
+) -> Option[String]:
+	match body:
+		ParsedBlockExpr(_, span):
+			header_end_line: Int = expr_end_line(table, header)
+			body_start_line: Int = source_location_span(table, span).start_line
+			var found: Option[String] = None
+
+			for comment in comments:
+				if (
+					found.is_none()
+					and comment.trailing
+					and comment.line >= header_end_line
+					and comment.line < body_start_line
+				):
+					found = Some(comment.text_value)
+
+			found
+		_:
+			None
+
+
+---
+Project a match case body. A body on the pattern's line (`Some(v): v -- note`)
+is not a block, so no block item claims the comment ending that line; the case
+keeps it on the body, which the renderer moves below the pattern. A nested
+`match` or `if` claims its own header comment.
+---
+private pure func project_match_case_body(
+	table: SourceTable,
+	body: ParsedExpr,
+	comments: List[FormatterComment],
+) -> Expression:
+	projected: Expression = project_expr_with_comments(table, body, comments)
+
+	match body:
+		ParsedBlockExpr(_, _):
+			projected
+		ParsedMatchExpr(_, _, _):
+			projected
+		ParsedIfExpr(_, _, _, _):
+			projected
+		_:
+			match trailing_comment_for_expr(table, comments, body):
+				Some(comment):
+					ItemBlockExpression([BlockExpressionItem(False, projected, Some(comment))])
+				None:
+					projected
+
+
+---
+The comment ending a case's `pattern:` line, when the case owns it: only a
+case whose body starts on a later line. A body on the same line claims that
+comment itself.
+---
+private pure func match_case_pattern_trailing_comment(
+	table: SourceTable,
+	case_value: ParsedMatchCase,
+	comments: List[FormatterComment],
+) -> Option[String]:
+	match case_value.body:
+		ParsedBlockExpr(_, _):
+			trailing_comment_on_line(
+				comments,
+				span_end_line(table, parsed_pattern_location(case_value.pattern)),
+			)
+		_:
+			None
+
+
+---
+A match's projected cases and the comments after its last case.
+---
+record ProjectedMatchCases {
+	cases: List[MatchCase],
+	closing_comments: List[String]
+}
+
+
+---
+Project a match's cases with the comments written among them. No enclosing
+block claims these: a block claims only comments between its own statements,
+and the match span covers every line up to the first one indented left of its
+cases, comment lines included. A case owns the whole-line comments at or right
+of the case column from the end of the previous case (or the header line) to
+its pattern (see `PrecedingBody` for the line where the previous case ends). A
+body block's span ends at its last statement, so a comment after that
+statement, even at the body's indentation, falls in the next case's region, or
+in the closing comments after the last case, and is re-indented to the case
+column. The column bound keeps a nested match from claiming comments that sit
+left of its own cases, which belong to an enclosing match or block.
+---
 private pure func project_match_cases(
 	table: SourceTable,
 	cases: List[ParsedMatchCase],
 	comments: List[FormatterComment],
-) -> List[MatchCase]:
+	header_line: Int,
+	match_end_line: Int,
+) -> ProjectedMatchCases:
+	case_column: Int = match cases.get(0):
+		Some(first):
+			source_location_span(table, first.span).start_column
+		None:
+			0
+
 	var projected: List[MatchCase] = []
+	var preceding: PrecedingBody = line_as_preceding_body(header_line)
 
 	for case_value in cases:
+		span: SourceSpan = source_location_span(table, case_value.span)
+		case_comments: MemberComments = {
+			leading = whole_line_comments_after(
+				comments,
+				preceding,
+				span.start_line - 1,
+				case_column,
+			),
+			trailing = match_case_pattern_trailing_comment(table, case_value, comments)
+		}
 		projected = projected.append(
 			MatchCaseData(
 				project_pattern(case_value.pattern),
-				project_expr_with_comments(table, case_value.body, comments),
-				None,
+				project_match_case_body(table, case_value.body, comments),
+				case_comments,
 			),
 		)
+		preceding = preceding_body(
+			table,
+			case_value.body,
+			span_end_line(table, case_value.span),
+		)
 
-	projected
+	{
+		cases = projected,
+		closing_comments = whole_line_comments_after(
+			comments,
+			preceding,
+			match_end_line,
+			case_column,
+		)
+	}
+
+
+---
+The comments of an `else` keyword: the whole-line comments at or right of it
+after the `then` block (see `PrecedingBody`), and the comment ending an
+`else:` line. After `else if` the nested `if` claims its header comment.
+---
+private pure func else_keyword_comments(
+	table: SourceTable,
+	then_expr: ParsedExpr,
+	branch: ParsedElseBranch,
+	comments: List[FormatterComment],
+) -> MemberComments:
+	keyword: SourceSpan = source_location_span(table, branch.keyword)
+
+	trailing: Option[String] = match branch.body:
+		ParsedBlockExpr(_, _):
+			trailing_comment_on_line(comments, keyword.start_line)
+		_:
+			None
+
+	{
+		leading = whole_line_comments_after(
+			comments,
+			preceding_body(
+				table,
+				then_expr,
+				expr_end_line(table, then_expr),
+			),
+			keyword.start_line - 1,
+			keyword.start_column,
+		),
+		trailing = trailing
+	}
+
+
+private pure func project_if_expr(
+	table: SourceTable,
+	cond: ParsedExpr,
+	then_expr: ParsedExpr,
+	else_expr: Option[ParsedElseBranch],
+	comments: List[FormatterComment],
+) -> Expression:
+	projected_cond: Expression = project_expr_with_comments(table, cond, comments)
+	projected_then: Expression = project_expr_with_comments(table, then_expr, comments)
+	header_comment: Option[String] = header_trailing_comment(table, cond, then_expr, comments)
+
+	match else_expr:
+		Some(branch):
+			IfElseExpression(
+				projected_cond,
+				projected_then,
+				project_expr_with_comments(table, branch.body, comments),
+				header_comment,
+				else_keyword_comments(table, then_expr, branch, comments),
+			)
+		None:
+			IfExpression(projected_cond, projected_then, header_comment)
+
+
+private pure func project_match_expr(
+	table: SourceTable,
+	value: ParsedExpr,
+	cases: List[ParsedMatchCase],
+	comments: List[FormatterComment],
+	span: SourceLocation,
+) -> Expression:
+	header_line: Int = expr_end_line(table, value)
+	projected: ProjectedMatchCases = project_match_cases(
+		table,
+		cases,
+		comments,
+		header_line,
+		span_end_line(table, span),
+	)
+	MatchExpression(
+		project_expr_with_comments(
+			table,
+			value,
+			comments,
+		),
+		projected.cases,
+		{
+			header_trailing = trailing_comment_on_line(comments, header_line),
+			closing = projected.closing_comments
+		},
+	)
 
 
 private pure func project_select_arm(
@@ -1073,7 +2133,14 @@ private pure func project_function_declaration_expr(
 		None:
 			VoidExpression
 
-	params: List[FunctionParameter] = project_params(decl.params)
+	params: List[FunctionParameter] = project_function_params(
+		table,
+		comments,
+		decl.name,
+		decl.params,
+		decl.return_type,
+		decl.body,
+	)
 	type_params: List[String] = type_param_names(decl.type_params)
 	where_constraints: List[TypeConstraint] = project_dim_constraints(decl.dim_constraints)
 
@@ -1346,79 +2413,34 @@ private pure func project_expr_with_comments(
 				project_expr_with_comments(table, left, comments),
 				project_expr_with_comments(table, right, comments),
 			)
-		ParsedLogicalExpr(op, left, right, _):
-			LogicalExpression(
-				project_logical_op(op),
-				project_expr_with_comments(table, left, comments),
-				project_expr_with_comments(table, right, comments),
-			)
+		ParsedLogicalExpr(op, _, _, _):
+			project_logical_chain(table, op, expr, comments)
 		ParsedRangeExpr(start, finish, _):
 			RangeExpression(
 				project_expr_with_comments(table, start, comments),
 				project_expr_with_comments(table, finish, comments),
 			)
-		ParsedCallExpr(callee, args, _):
-			var projected_args: List[Expression] = []
-
-			for arg in args:
-				projected_args = projected_args.append(
-					project_expr_with_comments(
-						table,
-						arg,
-						comments,
-					),
-				)
-
-			CallExpression(
-				project_expr_with_comments(table, callee, comments),
-				projected_args,
-			)
+		ParsedCallExpr(callee, args, span):
+			project_call_expr(table, callee, args, comments, span)
 		ParsedFieldAccessExpr(target, field_name, _):
 			FieldAccessExpression(
 				project_expr_with_comments(table, target, comments),
 				field_name.text,
 			)
-		ParsedSubscriptExpr(target, indices, _):
-			if indices.length() == 1:
-				SubscriptExpression(
-					project_expr_with_comments(table, target, comments),
-					project_expr_with_comments(
-						table,
-						indices.get_or(0, ParsedVoidExpr(parsed_expr_location(target))),
-						comments,
-					),
-				)
-			else:
-				var projected_indices: List[Expression] = []
-
-				for index in indices:
-					projected_indices = projected_indices.append(
-						project_expr_with_comments(
-							table,
-							index,
-							comments,
-						),
-					)
-
-				MultiSubscriptExpression(
-					project_expr_with_comments(table, target, comments),
-					projected_indices,
-				)
-		ParsedListExpr(items, _):
-			ListExpression(parsed_block_items(table, items))
-		ParsedTupleExpr(items, _):
-			TupleExpression(parsed_block_items(table, items))
-		ParsedRecordExpr(fields, _):
-			RecordExpression(project_record_expr_fields(table, fields))
-		ParsedRecordUpdateExpr(base, fields, _):
-			RecordUpdateExpression(
-				project_expr_with_comments(table, base, comments),
-				project_record_expr_fields(table, fields),
-			)
-		ParsedDictExpr(entries, _):
-			DictionaryExpression(project_dict_entries(table, entries))
-		ParsedVectorExpr(items, _):
-			VectorExpression(parsed_block_items(table, items))
+		ParsedSubscriptExpr(target, indices, span):
+			project_subscript_expr(table, target, indices, comments, span)
+		ParsedListExpr(items, span):
+			project_expression_collection(table, ListShape, items, comments, span)
+		ParsedTupleExpr(items, span):
+			project_expression_collection(table, TupleShape, items, comments, span)
+		ParsedRecordExpr(fields, span):
+			project_record_expr(table, fields, comments, span)
+		ParsedRecordUpdateExpr(base, fields, span):
+			project_record_update_expr(table, base, fields, comments, span)
+		ParsedDictExpr(entries, span):
+			project_dict_expr(table, entries, comments, span)
+		ParsedVectorExpr(items, span):
+			project_expression_collection(table, VectorShape, items, comments, span)
 		ParsedOpaqueIntoExpr(type_expr, inner, _):
 			OpaqueIntoExpression(
 				project_type_expr(type_expr),
@@ -1432,23 +2454,9 @@ private pure func project_expr_with_comments(
 		ParsedBlockExpr(items, span):
 			commented_block_expr(table, items, comments, span)
 		ParsedIfExpr(cond, then_expr, else_expr, _):
-			match else_expr:
-				Some(value):
-					IfElseExpression(
-						project_expr_with_comments(table, cond, comments),
-						project_expr_with_comments(table, then_expr, comments),
-						project_expr_with_comments(table, value, comments),
-					)
-				None:
-					IfExpression(
-						project_expr_with_comments(table, cond, comments),
-						project_expr_with_comments(table, then_expr, comments),
-					)
-		ParsedMatchExpr(value, cases, _):
-			MatchExpression(
-				project_expr_with_comments(table, value, comments),
-				project_match_cases(table, cases, comments),
-			)
+			project_if_expr(table, cond, then_expr, else_expr, comments)
+		ParsedMatchExpr(value, cases, span):
+			project_match_expr(table, value, cases, comments, span)
 		ParsedSelectExpr(arms, _):
 			SelectExpression(project_select_arms(table, arms, comments))
 		ParsedWithExpr(binding, body, _):
@@ -1480,20 +2488,30 @@ private pure func project_expr_with_comments(
 			WhileExpression(
 				project_expr_with_comments(table, cond, comments),
 				project_expr_with_comments(table, body, comments),
+				header_trailing_comment(table, cond, body, comments),
 			)
 		ParsedForExpr(binder, iterable, body, _):
+			header_comment: Option[String] = header_trailing_comment(
+				table,
+				iterable,
+				body,
+				comments,
+			)
+
 			match project_for_binder_name(binder):
 				Some(name):
 					ForExpression(
 						name,
 						project_expr_with_comments(table, iterable, comments),
 						project_expr_with_comments(table, body, comments),
+						header_comment,
 					)
 				None:
 					TupleForExpression(
 						project_for_binder_names(binder),
 						project_expr_with_comments(table, iterable, comments),
 						project_expr_with_comments(table, body, comments),
+						header_comment,
 					)
 		ParsedConcurrentBlockExpr(options, body, _):
 			project_concurrent_expr(table, options, body, comments)
@@ -1769,7 +2787,14 @@ private pure func project_function_decl(
 			annotation_present(decl.annotations, ParsedNoCopyAnnotation),
 			annotation_present(decl.annotations, ParsedResourceResultOrdinaryAnnotation),
 			type_param_names(decl.type_params),
-			project_params(decl.params),
+			project_function_params(
+				table,
+				comments,
+				decl.name,
+				decl.params,
+				decl.return_type,
+				decl.body,
+			),
 			option_type_expr(decl.return_type),
 			project_dim_constraints(decl.dim_constraints),
 			function_body(table, decl.body, comments),
@@ -1785,7 +2810,14 @@ private pure func project_trait_method(
 	{
 		name = method.name.text,
 		is_pure = method.is_pure,
-		params = project_params(method.params),
+		params = project_function_params(
+			table,
+			comments,
+			method.name,
+			method.params,
+			method.return_type,
+			method.body,
+		),
 		return_type = option_type_expr(method.return_type),
 		body = method.body.map(func(expr): project_expr_with_comments(table, expr, comments))
 	}
@@ -1875,7 +2907,14 @@ private pure func project_impl_method(
 			ParsedResourceResultOrdinaryAnnotation,
 		),
 		type_params = type_param_names(method.type_params),
-		params = project_params(method.params),
+		params = project_function_params(
+			table,
+			comments,
+			method.name,
+			method.params,
+			method.return_type,
+			method.body,
+		),
 		return_type = option_type_expr(method.return_type),
 		where_constraints = project_dim_constraints(method.dim_constraints),
 		body = function_body(table, method.body, comments)
@@ -2074,6 +3113,16 @@ private pure func project_decl_to_located(
 				)]
 
 
+---
+Project each declaration with only the comments between its first line and
+the next declaration's first line. Every comment a declaration claims lies in
+that range: a construct ending at a dedent spans at most to the next
+declaration's line. Comments arrive in source order, so one sweep slices them,
+and each claim scans its declaration's comments rather than the whole file's.
+The program renderer keeps the comment ending a declaration's first line
+(`take_trailing_comment`), so the slice leaves it out and no claimer inside
+the declaration can take it a second time.
+---
 private pure func project_decls(
 	table: SourceTable,
 	names: NameTable,
@@ -2081,10 +3130,40 @@ private pure func project_decls(
 	comments: List[FormatterComment],
 ) -> List[LocatedDeclaration]:
 	var located: List[LocatedDeclaration] = []
+	var next_comment: Int = 0
+	var index: Int = 0
 
 	for decl in decls:
-		for item in project_decl_to_located(table, names, decl, False, comments):
+		decl_line: Int = source_location_span(table, parsed_decl_location(decl)).start_line
+		next_decl_line: Option[Int] = decls
+			.get(index + 1)
+			.map(func(next): source_location_span(table, parsed_decl_location(next)).start_line)
+		var own_comments: List[FormatterComment] = []
+		var collecting: Bool = True
+
+		while collecting:
+			match comments.get(next_comment):
+				Some(comment):
+					before_next: Bool = match next_decl_line:
+						Some(line):
+							comment.line < line
+						None:
+							True
+
+					if before_next:
+						if not (comment.trailing and comment.line == decl_line):
+							own_comments = own_comments.append(comment)
+
+						next_comment += 1
+					else:
+						collecting = False
+				None:
+					collecting = False
+
+		for item in project_decl_to_located(table, names, decl, False, own_comments):
 			located = located.append(item)
+
+		index += 1
 
 	located
 

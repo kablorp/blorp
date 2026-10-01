@@ -186,6 +186,67 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
             self.assertIn("missing exact diagnostic: error: wanted diagnostic", result.stdout)
             self.assertIn("status=FAIL passed=0 failed=1 tests=1", result.stdout)
 
+    def test_format_fail_fixture_rejects_dropped_comment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture_root = root / "test_compiler"
+            fixture = fixture_root / "format/should_fail/comments.brp"
+            fixture.parent.mkdir(parents=True)
+            fixture.write_text(
+                'func main() -> Int:\n'
+                '    -- kept\n'
+                '    x = "not -- a comment"\n'
+                '    -- dropped\n'
+                '    0\n',
+                encoding="utf-8",
+            )
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    from pathlib import Path
+                    import sys
+
+                    path = Path(sys.argv[-1])
+                    source = path.read_text(encoding="utf-8")
+                    if "-- dropped" not in source:
+                        raise SystemExit(0)
+                    if "--check" in sys.argv or "--diff" in sys.argv:
+                        print("needs formatting")
+                        raise SystemExit(1)
+                    path.write_text(source.replace("    -- dropped\\n", ""), encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(RUNNER),
+                    "--blorp-bin",
+                    str(compiler),
+                    "--fixture-root",
+                    str(fixture_root),
+                    "--no-stdlib-case",
+                    "--expected-count",
+                    "1",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("formatter dropped comment: -- dropped", result.stdout)
+            self.assertNotIn("-- kept", result.stdout)
+            self.assertNotIn("not -- a comment", result.stdout)
+
     def test_rejects_empty_custom_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
