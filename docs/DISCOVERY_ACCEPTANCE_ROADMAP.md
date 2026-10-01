@@ -15,7 +15,8 @@ work and says what "accepted" means.
   `compiler-new` gate; the corpus parity gate (premerge) with curated and
   per-code fixtures; and the syntax rules both parsers now share (`?=` and
   `break`/`continue` placement, concurrency parameters, no `as` ascription,
-  exact-case import paths, no string patterns with holes); and the implicit
+  exact-case import paths, no string patterns with holes); rendered
+  diagnostics with first-diagnostic parity (item 6); and the implicit
   modules (`prelude`, `tuple`, and `test` when testing), loaded after the
   roots so the self-compile's module list equals the existing graph's in
   count and order (item 1).
@@ -144,11 +145,19 @@ more. Each numbered item is one change.
    answers for the standard-library root from the compiler's embedded texts,
    and `blorp.toml` aliases as candidate rules in the lookup policy; the
    differential also runs under both (criterion 4).
-6. **Rendered diagnostics and first-diagnostic parity (M).** One rendering
+6. **Rendered diagnostics and first-diagnostic parity (M). Landed.** One rendering
    table from `DiscoveryDiagnosticCode` and its arguments to message and
    help, owned by the stage, so the old parser's teaching messages survive.
    The corpus parity gate then compares, for every file both front ends
    reject, the first diagnostic's position and rendered text (criterion 3).
+   `diagnostics/render.brp` renders every code from its
+   arguments (which `freeze` checks), with the per-construct messages of the
+   existing parser; the parser fixtures pin the existing text and position
+   and the stage's text must equal them. The corpus gate compares the first
+   diagnostic of every file both front ends reject. Every difference is
+   listed in the design document ("Diagnostic text"): 52 codes add a help
+   line, 6 word a message differently on purpose, and two positions differ
+   (see Decisions).
 7. **One switch point (M).** The CLI entry points that parse today reach the
    old front end through `lib/source_graph.brp` (`main.brp`, `test/plan.brp`,
    `purify/command.brp`, `package/check.brp`) or call `parse_compiler_source`
@@ -207,6 +216,14 @@ items run whenever a worker is free.
 ## Decisions
 
 - **Qualified trait bounds are legal** (item 2).
+- **Two first-diagnostic positions stay different from the old parser**
+  (criterion 3). `import_constructors_unclosed`: the old parser reports the
+  unclosed constructor list at its last constructor, the stage at the token
+  after the list. `interpolation_hole_two_expressions`: the old parser
+  re-parses the hole on its own and reports a position inside it, the stage
+  the second expression. Both are named with their reasons in
+  `scripts/compiler-new-parity` and in the fixtures; every other corpus file
+  and fixture agrees with the old position.
 - **Freeze keeps the full invariant check** in release builds too.
 - **Ids are internal identity**, not stable across compiles or between the old
   and new front ends; nothing imitates the old numbering.

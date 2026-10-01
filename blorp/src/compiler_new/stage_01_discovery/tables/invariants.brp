@@ -27,6 +27,17 @@ import:
 		path_id_index,
 		root_id_index,
 		source_id_index,
+	diagnostic_code:
+		DiagnosticArgumentKind(
+			ConstructArgument,
+			ImportArgument,
+			LiteralArgument,
+			NameArgument,
+			NumberArgument,
+			PathArgument,
+		),
+		DiscoveryDiagnosticCode,
+		diagnostic_argument_kinds,
 	intern_index: find_slice, occupied_slot_count, text_hash
 	list: repeat
 	row_kinds:
@@ -45,6 +56,7 @@ import:
 			NoPayload,
 		),
 		node_payload_reference,
+		parsed_construct_at_argument,
 	span: Span, span_end, span_source_index
 	token: is_unicode_scalar
 
@@ -126,6 +138,8 @@ What a violation breaks. The meaning of `TableInvariantViolation.value` and
 - `PayloadOutOfRange`: A node's payload is outside what its kind allows: a codepoint that is no Unicode scalar value, or a payload on a kind that has none; `value` is the payload.
 - `UnreferencedNode`: A node is neither any node's child nor a root a row names (a body, a parameter or definition type, a variant payload, a dimension constraint side); the row is the node.
 - `NodeReferencedTwice`: A node is a child or root more than once; `value` is how many times.
+- `ArgumentCountMismatch`: A diagnostic row stores another number of arguments than its code documents (`diagnostic_argument_kinds`); the table is the row's, `value` its argument count.
+- `ArgumentOutOfRange`: A diagnostic argument is not what its code documents: a construct that decodes to none, or an id with no row in its table; `value` is the argument.
 - `LocalFunctionNodeMismatch`: A `LocalFunctionNode` names a definition that is not a local function; `value` is the definition's index.
 ---
 enum TableInvariantKind:
@@ -148,6 +162,8 @@ enum TableInvariantKind:
 	UnreferencedNode
 	NodeReferencedTwice
 	PayloadOutOfRange
+	ArgumentCountMismatch
+	ArgumentOutOfRange
 
 
 struct TableInvariantViolation {
@@ -628,6 +644,13 @@ private pure func check_root_rows(builder: DiscoveryBuilder) -> List[TableInvari
 			root_diagnostic.arguments,
 			argument_count,
 		)
+		found = builder.check_row_arguments(
+			found,
+			RootDiagnosticTable,
+			diagnostic_row,
+			root_diagnostic.code,
+			root_diagnostic.arguments,
+		)
 		diagnostic_row += 1
 
 	found
@@ -691,6 +714,13 @@ private pure func check_implicit_rows(builder: DiscoveryBuilder) -> List[TableIn
 			DiagnosticArgumentTable,
 			implicit_diagnostic.arguments,
 			argument_count,
+		)
+		found = builder.check_row_arguments(
+			found,
+			ImplicitDiagnosticTable,
+			diagnostic_row,
+			implicit_diagnostic.code,
+			implicit_diagnostic.arguments,
 		)
 		diagnostic_row += 1
 
@@ -1809,6 +1839,80 @@ private pure func check_body_rows(builder: DiscoveryBuilder) -> List[TableInvari
 	found
 
 
+---
+Whether `argument` is a valid `kind` of argument: a construct that decodes,
+or an id of a row that exists.
+---
+private pure func argument_is_valid(
+	builder: DiscoveryBuilder,
+	kind: DiagnosticArgumentKind,
+	argument: Int,
+) -> Bool:
+	match kind:
+		ConstructArgument:
+			parsed_construct_at_argument(argument).is_some()
+		ImportArgument:
+			index_in(argument, builder.imports.length())
+		PathArgument:
+			index_in(argument, builder.paths.length())
+		LiteralArgument:
+			index_in(argument, builder.literals.length())
+		NameArgument:
+			index_in(argument, builder.name_spellings.length())
+		NumberArgument:
+			True
+
+
+---
+A diagnostic row stores the arguments its code documents, each valid. A
+row whose range runs outside the argument table is reported by
+`check_range`, not here.
+---
+private pure func check_row_arguments(
+	builder: DiscoveryBuilder,
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	row: Int,
+	code: DiscoveryDiagnosticCode,
+	arguments: RowRange,
+) -> List[TableInvariantViolation]:
+	kinds: List[DiagnosticArgumentKind] = diagnostic_argument_kinds(code)
+
+	if arguments.count != kinds.length():
+		found.append(
+			violation(
+				ArgumentCountMismatch,
+				table,
+				row,
+				DiagnosticArgumentTable,
+				arguments.count,
+			),
+		)
+	else:
+		var out: List[TableInvariantViolation] = found
+		var ordinal: Int = 0
+
+		for kind in kinds:
+			match builder.diagnostic_arguments.get(arguments.first + ordinal):
+				Some(argument):
+					if not builder.argument_is_valid(kind, argument):
+						out = out.append(
+							violation(
+								ArgumentOutOfRange,
+								table,
+								row,
+								DiagnosticArgumentTable,
+								argument,
+							),
+						)
+				None:
+					void
+
+			ordinal += 1
+
+		out
+
+
 private pure func check_diagnostic_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
 	var found: List[TableInvariantViolation] = []
 	argument_count: Int = builder.diagnostic_arguments.length()
@@ -1823,6 +1927,13 @@ private pure func check_diagnostic_rows(builder: DiscoveryBuilder) -> List[Table
 			diagnostic.arguments,
 			argument_count,
 		)
+		found = builder.check_row_arguments(
+			found,
+			DiagnosticTable,
+			row,
+			diagnostic.code,
+			diagnostic.arguments,
+		)
 		row += 1
 
 	row = 0
@@ -1835,6 +1946,13 @@ private pure func check_diagnostic_rows(builder: DiscoveryBuilder) -> List[Table
 			DiagnosticArgumentTable,
 			diagnostic.arguments,
 			argument_count,
+		)
+		found = builder.check_row_arguments(
+			found,
+			ResolutionDiagnosticTable,
+			row,
+			diagnostic.code,
+			diagnostic.arguments,
 		)
 		row += 1
 

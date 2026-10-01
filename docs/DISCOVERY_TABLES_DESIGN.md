@@ -40,6 +40,7 @@ stage_01_discovery/
   sources/         which files make up the program
     module_graph.brp  source_admission.brp  source_provider.brp
   lex/lexer.brp
+  diagnostics/render.brp   the message and help of each diagnostic code
   parse/           parser_cursor, declaration_header, declaration_parser,
                    import_parser, type_parser, pattern_parser, body_parser
 ```
@@ -48,7 +49,10 @@ The tests mirror the folders under `blorp/test/compiler_new/stage_01_discovery/`
 (`tables/`, `sources/`, `lex/`, `parse/`, with `lex/fixtures` and
 `parse/fixtures`); `tools/` and `support/` sit beside them. `tables/` imports no other
 folder; `sources/` and `lex/` import only `tables/`; `parse/` imports those
-three; only `pipeline.brp` ties the steps together.
+three; only `pipeline.brp` ties the steps together. `diagnostics/` imports
+`tables/` and `sources/` (the text of an import that differs only in letter
+case reuses the provider's respelling) and nothing imports it: it is read by
+whatever shows diagnostics.
 
 ## Status
 
@@ -417,11 +421,94 @@ struct DiagnosticRow {code: DiscoveryDiagnosticCode, span: Span, arguments: RowR
 `diagnostics` holds each module's lex and parse diagnostics in the module's
 contiguous block; `resolution_diagnostics` holds the module graph's (imports that
 loaded nothing, sources that could not be admitted). The code catalogue is
-`tables/diagnostic_code.brp`: 100 codes, each documented with the meaning
+`tables/diagnostic_code.brp`: 105 codes, each documented with the meaning
 of its arguments, and `diagnostic_code_name` gives the stable names dumps
 and fixtures use. Messages are rendered from the code and arguments at the
 boundary that shows them, so the text lives in one place and can be tested
 exactly.
+
+### Diagnostic text
+
+`diagnostics/render.brp` is that one place:
+
+```blorp
+record RenderedDiagnostic {message: String, help: Option[String]}
+pure func render_diagnostic(tables: FrontendTables, row: DiagnosticRow) -> RenderedDiagnostic
+pure func render_root_diagnostic(tables: FrontendTables, row: RootDiagnosticRow) -> RenderedDiagnostic
+pure func diagnostic_display(tables: FrontendTables, row: DiagnosticRow) -> String
+```
+
+`diagnostic_display` prints `path:line:column: error: message` and, on its own
+line, `help: ...`: the shape the existing compiler prints, with the same column
+convention (bytes, a tab advancing to the next multiple of four). One `match`
+over the code supplies the text, so a code without text does not compile, and
+every code has a help line (a test walks the code list). Arguments are
+spelled from the frozen tables: an import's text, a literal's digits, the
+stored name of a differently-cased file, and the names a parser interned (a
+reserved keyword written as a name, an unknown annotation, a concurrency
+parameter). Only `UnexpectedCharacter`, which has no token to name, reads the
+source text under its span.
+
+Each code documents its arguments as data: `diagnostic_argument_kinds(code)`
+in `diagnostic_code.brp` lists their kinds (a construct, an import, a path, a
+literal, a name, a number). `freeze` rejects a row with another number of
+arguments (`ArgumentCountMismatch`) or an invalid one, a construct that
+decodes to none or an id with no row (`ArgumentOutOfRange`), so rendering
+reads exactly what the code documents and has no missing-argument case. The 14
+`Expected...` codes can be reported only with a construct: a parser that
+reports one through the plain `report_at_current` or `expect_token` helpers
+(which store no argument) produces a row `freeze` rejects, so the mistake
+fails every fixture and gate at once. (Splitting the code type so the plain
+helpers cannot accept them would duplicate every other code's name; the
+freeze check is the smallest explicit option.)
+
+The text is copied from the existing compiler, not referenced, and is pinned
+twice. Every `should_fail` fixture that pins a first diagnostic also pins the
+existing compiler's text (`-- EXPECT-BLORP:` lines, run by the existing
+compiler's fixture runner) and position (`-- EXPECT-BLORP-CONTAINS:`), and the
+fixture suite requires the stage to display exactly that. Where the stage
+words a diagnostic differently on purpose the fixture says so in
+`-- EXPECT-DISCOVERY-TEXT:` lines (and `-- DISCOVERY-POSITION-DIFFERS:` for a
+position), which fail once they stop differing. The corpus parity gate compares
+the first diagnostic of every file both front ends reject the same way, with
+the differences below as a reasoned allow-list.
+
+The 14 `Expected...` codes for a missing token (`ExpectedColon`,
+`ExpectedRightParen`, `ExpectedName`, ...) carry one argument, the
+`ParsedConstruct` the parser was in (`row_kinds.brp`: `IfCondition`,
+`Subscript`, `FunctionParameters`, ...), so `render.brp` can say `expected `:`
+after if condition` and not only that a colon is missing. A construct is
+meaningful only with the codes that report it; any other combination, or a
+row without the argument, reads as the code's general text (`expected `:``).
+`UnionVariantTooManyFields` carries its limit the same way, so the number
+lives only in the parser.
+
+Of the 94 codes the fixtures pin, 36 print exactly the existing compiler's
+text (message and help); 52 print the existing message and add a help line; 6
+word the message differently on purpose. `ImportCaseMismatch` (no
+single-module fixture can reach it) also prints exactly the existing text,
+pinned in `test_render.brp`. The other 10 codes had no existing diagnostic worth
+copying.
+
+| Class | Codes | Existing text | Stage text | Why |
+| --- | --- | --- | --- | --- |
+| Help added (52) | `ExpectedAliasName`, `ExpectedArrow`, `ExpectedAssignmentOperator`, `ExpectedClosingParenAfterConstructors`, `ExpectedColon`, `ExpectedColonAfterImport`, `ExpectedComma`, `ExpectedCommaBetweenImportSymbols`, `ExpectedConstructorName`, `ExpectedDimension`, `ExpectedEqual`, `ExpectedEqualEqual`, `ExpectedExpression`, `ExpectedFatArrow`, `ExpectedHash`, `ExpectedImportSymbol`, `ExpectedImportSymbolsAfterColon`, `ExpectedKeyword`, `ExpectedLeftBrace`, `ExpectedModulePath`, `ExpectedName`, `ExpectedNewline`, `ExpectedNewlineAfterImportHeader`, `ExpectedNumberAfterMinus`, `ExpectedPattern`, `ExpectedRightBrace`, `ExpectedRightBracket`, `ExpectedRightParen`, `ExpectedSpreadTarget`, `ExpectedSupertraitOrMethods`, `ExpectedType`, `InconsistentIndentation`, `IntegerLiteralOverflow`, `InterpolatedEscapeAtEnd`, `InterpolationTooDeep`, `InvalidCharLiteral`, `MultilineInterpolatedString`, `MultilineRawString`, `MultilineString`, `TupleArity`, `UnexpectedCharacter`, `UnicodeCodepointOutOfRange`, `UnicodeEscapeDigitCount`, `UnicodeEscapeNonHex`, `UnknownEscape`, `UnterminatedCharLiteral`, `UnterminatedDocstring`, `UnterminatedEscape`, `UnterminatedInterpolatedString`, `UnterminatedRawString`, `UnterminatedString`, `UnterminatedUnicodeEscape` | the message, no help line (the 14 construct codes: the construct-specific message) | the same message and a help line | every error teaches (rule 6 of `AGENTS.md`) |
+| Advice moved to help (3) | `ReservedKeywordAsName`, `DiscardedQuestionBind`, `FieldAssignment` | the advice follows the problem in the message (`...; choose another identifier such as `from_name``) | the problem in the message, the advice in the help line | one idea per line; the same words |
+| Poor existing text (3) | `ExpectedIndentedImports`, `ExpectedIndent` (a union's variants), `InterpolationHoleNotExpression` | `expected indented function body` for a bare `import:` and for a union with unindented variants; `Parse error in interpolated expression: expected `=` after top-level variable declaration` | `expected indented imports after `import:``, `expected indented variants`; `an interpolation hole must hold exactly one expression` | the existing text names the wrong construct, or an internal parse step |
+| No existing equivalent (10) | `UnresolvedImport`, `UnresolvedRoot`, `RootCaseMismatch`, `UnverifiableSpelling`, `UnverifiableRootSpelling`, `UnreadableSource`, `UnreadableRootSource`, `SourceTooLarge`, `TooManySources`, `UnexpectedByte` | `module 'x' is not loaded for import registration` for an unresolved import; an invalid byte was printed raw; the others were not diagnosed this way | new text with help; the argument is rendered (the import's text, the file's path, the byte as `0xFF`, the length) | the existing text is an internal step or absent |
+
+Where the existing parser had one text for several constructs, the stage has
+a general one: a missing indent after any block header reads `expected an
+indented block` (the existing `expected indented function body` is right only
+for functions), and the `Expected...` codes keep the existing `, ` (comma and
+space) token spelling of `expected `, ` between ...`. `UnexpectedCharacter`
+also spells a character a quote would hide as `U+XXXX` (the existing compiler
+printed a carriage return or a zero-width space raw).
+
+Positions agree with the existing compiler for every fixture and every corpus
+file except two, listed with their reasons in `scripts/compiler-new-parity`
+and in the fixtures (`import_constructors_unclosed`,
+`interpolation_hole_two_expressions`).
 
 ## 4. The builder
 

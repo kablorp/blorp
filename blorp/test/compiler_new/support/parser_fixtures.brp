@@ -21,10 +21,32 @@
 -- `pending-spec-decision` marks a fixture whose expected behaviour is
 -- undecided; the suite names it and checks nothing else.
 --
+-- Every pinned should_fail fixture also pins the text of its first diagnostic,
+-- the existing compiler's, so both front ends answer to the same words:
+--
+--     -- RUN-BLORP-CHECK
+--     -- EXPECT-BLORP: error: expected `:` after if condition
+--     -- EXPECT-BLORP: help: ...
+--     -- EXPECT-BLORP-CONTAINS: :7:9: error:
+--
+-- The existing compiler's fixture runner checks those lines against its own
+-- output (the message and help exactly, the position as a substring), and
+-- `rendered_text_failures` checks that the discovery stage prints the same
+-- `path:line:column: error: message` and help line. Where the stage words a
+-- diagnostic differently on purpose, the fixture says so in lines of its own
+-- (and `docs/DISCOVERY_TABLES_DESIGN.md` says why):
+--
+--     -- EXPECT-DISCOVERY-TEXT: error: expected `:`
+--     -- EXPECT-DISCOVERY-TEXT: help: ...
+--     -- DISCOVERY-POSITION-DIFFERS: <why the stage reports another position>
+--
+-- A difference line that no longer differs fails, so the list cannot go stale.
+--
 -- Only `load_module` runs, not `discover`: a fixture is parsed as one
 -- module and its imports are never resolved, so resolution diagnostics
 -- (unresolved imports, unreadable sources) cannot appear.
 import:
+	../../../src/compiler_new/stage_01_discovery/diagnostics/render: RenderedDiagnostic
 	../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DiscoveryBuilder,
 		empty_discovery_builder,
@@ -40,6 +62,13 @@ import:
 		LineColumn,
 		span_start_position,
 	../../../src/compiler_new/stage_01_discovery/sources/source_provider: PackageMembership(NotInPackage)
+	./first_diagnostic:
+		FrozenDiagnostic,
+		diagnostic_column,
+		diagnostic_line,
+		diagnostic_shown,
+		first_diagnostic_display,
+		first_frozen_diagnostic,
 	fs: message, read_directory
 	system: read_file
 
@@ -67,6 +96,37 @@ GAP_PIN_PREFIX: String = "discovery-gap "
 The pin of a fixture whose expected behaviour is undecided.
 ---
 PENDING_PIN_WORD: String = "pending-spec-decision"
+
+
+---
+The line that makes the existing compiler's fixture runner check a fixture.
+---
+RUN_MARKER_LINE: String = "-- RUN-BLORP-CHECK"
+
+---
+Prefixes of the lines that pin the first diagnostic's text: the existing
+compiler's message and help (`error: ...`, `help: ...`), its position (a
+substring of its output), and the stage's own text where it differs.
+---
+BLORP_TEXT_PREFIX: String = "-- EXPECT-BLORP: "
+
+BLORP_POSITION_PREFIX: String = "-- EXPECT-BLORP-CONTAINS: "
+
+DISCOVERY_TEXT_PREFIX: String = "-- EXPECT-DISCOVERY-TEXT: "
+
+POSITION_DIFFERS_PREFIX: String = "-- DISCOVERY-POSITION-DIFFERS: "
+
+ERROR_LINE_PREFIX: String = "error: "
+
+HELP_LINE_PREFIX: String = "help: "
+
+---
+The position substring of a pinned existing-compiler position, around the
+`line:column`: `:7:9: error:`.
+---
+POSITION_FRAME_START: String = ":"
+
+POSITION_FRAME_END: String = ": error:"
 
 
 ---
@@ -317,7 +377,7 @@ The failures of the should_fail fixture file at `path`.
 func should_fail_file_failures(path: String) -> List[String]:
 	match read_file(path):
 		Ok(text):
-			should_fail_failures(path, text)
+			should_fail_failures(path, text).concat(rendered_text_failures(path, text))
 		Err(message):
 			["${path}: unreadable: ${message}"]
 
@@ -331,3 +391,189 @@ func fixture_file_pin(path: String) -> FixturePin:
 			text.fixture_pin()
 		Err(_):
 			NoPin
+
+
+---
+The text pinned by the lines starting `prefix`: the first `error: ` line is the
+message and the first `help: ` line the help; `None` when there is no
+message line.
+---
+pure func pinned_text(text: String, prefix: String) -> Option[RenderedDiagnostic]:
+	pinned: List[String] = text
+		.lines()
+		.filter(pure func(line): line.starts_with(prefix))
+		.map(pure func(line): line.drop_left(prefix.length()))
+
+	messages: List[String] = pinned
+		.filter(pure func(line): line.starts_with(ERROR_LINE_PREFIX))
+		.map(pure func(line): line.drop_left(ERROR_LINE_PREFIX.length()))
+
+	helps: List[String] = pinned
+		.filter(pure func(line): line.starts_with(HELP_LINE_PREFIX))
+		.map(pure func(line): line.drop_left(HELP_LINE_PREFIX.length()))
+
+	match messages.get(0):
+		Some(message):
+			Some({
+				message = message,
+				help = helps.get(0)
+			})
+		None:
+			None
+
+
+---
+The line and column the existing compiler is pinned to report, from the
+`-- EXPECT-BLORP-CONTAINS: :line:column: error:` line.
+---
+pure func pinned_existing_position(text: String) -> Option[(Int, Int)]:
+	frames: List[String] = text
+		.lines()
+		.filter(pure func(line): line.starts_with(BLORP_POSITION_PREFIX))
+		.map(pure func(line): line.drop_left(BLORP_POSITION_PREFIX.length()).trim())
+		.filter(
+			pure func(frame): frame.starts_with(POSITION_FRAME_START) and frame.ends_with(POSITION_FRAME_END),
+		)
+
+	match frames.get(0):
+		Some(frame):
+			numbers: List[String] = frame
+				.drop_left(POSITION_FRAME_START.length())
+				.remove_suffix(POSITION_FRAME_END)
+				.split(":")
+
+			match numbers.get_or(0, "").parse_int():
+				Some(line):
+					match numbers.get_or(1, "").parse_int():
+						Some(column):
+							Some((line, column))
+						None:
+							None
+				None:
+					None
+		None:
+			None
+
+
+pure func has_line(text: String, line: String) -> Bool:
+	text
+		.lines()
+		.any(pure func(candidate): candidate.trim() == line)
+
+
+pure func has_line_starting(text: String, prefix: String) -> Bool:
+	text
+		.lines()
+		.any(pure func(candidate): candidate.starts_with(prefix))
+
+
+---
+`path:line:column: error: message`, then `help: ...`, the way the stage
+displays a diagnostic.
+---
+pure func expected_display(
+	path: String,
+	line: Int,
+	column: Int,
+	text: RenderedDiagnostic,
+) -> String:
+	first_line: String = path + ":" + line.to_string() + ":" + column.to_string() + ": error: " + text.message
+
+	match text.help:
+		Some(help):
+			first_line + "\nhelp: " + help
+		None:
+			first_line
+
+
+---
+The failures of a should_fail fixture whose pin names its first diagnostic:
+the fixture must be run by the existing compiler's runner with its text and
+position pinned, and the stage must display its first diagnostic as that
+text (or as the fixture's own `EXPECT-DISCOVERY-TEXT` lines, which must
+differ) at that position (or the pinned discovery position when the fixture
+says the positions differ on purpose). Empty for other pins.
+---
+pure func rendered_text_failures(path: String, text: String) -> List[String]:
+	match text.fixture_pin():
+		ExpectsFirstDiagnostic(label):
+			text.pinned_display_failures(path, label)
+		_:
+			[]
+
+
+private pure func pinned_display_failures(text: String, path: String, label: String) -> List[String]:
+	builder: DiscoveryBuilder = parsed_fixture(path, text)
+	existing_text: Option[RenderedDiagnostic] = text.pinned_text(BLORP_TEXT_PREFIX)
+	existing_position: Option[(Int, Int)] = text.pinned_existing_position()
+	own_text: Option[RenderedDiagnostic] = text.pinned_text(DISCOVERY_TEXT_PREFIX)
+	var failures: List[String] = []
+
+	if not text.has_line(RUN_MARKER_LINE):
+		failures = failures.append(
+			"${path}: add `${RUN_MARKER_LINE}` so the existing compiler's runner checks the pinned text too",
+		)
+
+	match (builder.first_frozen_diagnostic(), existing_text, existing_position):
+		(Some(found), Some(existing), Some(position)):
+			failures = failures.concat(text.display_failures(path, found, existing, position, own_text))
+		(None, _, _):
+			-- The pin check reports that there is no diagnostic.
+			void
+		(_, None, _):
+			failures = failures.append(
+				"${path}: no `${BLORP_TEXT_PREFIX}${ERROR_LINE_PREFIX}` line. Add the existing compiler's first message (and `${BLORP_TEXT_PREFIX}${HELP_LINE_PREFIX}` line, when it prints help) from `bin/blorp check --no-format ${path}`",
+			)
+		(_, _, None):
+			failures = failures.append(
+				"${path}: no `${BLORP_POSITION_PREFIX}${POSITION_FRAME_START}line:column${POSITION_FRAME_END}` line. Add the position the existing compiler reports for the first diagnostic",
+			)
+
+	failures
+
+
+private pure func display_failures(
+	text: String,
+	path: String,
+	found: FrozenDiagnostic,
+	existing: RenderedDiagnostic,
+	existing_position: (Int, Int),
+	own_text: Option[RenderedDiagnostic],
+) -> List[String]:
+	var failures: List[String] = []
+	own_position: (Int, Int) = (found.diagnostic_line(), found.diagnostic_column())
+	positions_differ: Bool = own_position[0] != existing_position[0] or own_position[1] != existing_position[1]
+	says_positions_differ: Bool = text.has_line_starting(POSITION_DIFFERS_PREFIX)
+
+	if positions_differ and not says_positions_differ:
+		failures = failures.append(
+			"${path}: the stage reports ${own_position[0]}:${own_position[1]} but the existing compiler reports ${existing_position[0]}:${existing_position[1]}. Fix the parser, or say why with `${POSITION_DIFFERS_PREFIX}<reason>`",
+		)
+	else if says_positions_differ and not positions_differ:
+		failures = failures.append(
+			"${path}: `${POSITION_DIFFERS_PREFIX}` is stale: both front ends report ${own_position[0]}:${own_position[1]}. Remove the line",
+		)
+
+	-- The text compared is the existing compiler's unless the fixture names
+	-- the stage's own; a named difference must still differ.
+	wanted: RenderedDiagnostic = own_text.get_or(existing)
+
+	match own_text:
+		Some(own):
+			if own.message == existing.message and own.help == existing.help:
+				failures = failures.append(
+					"${path}: `${DISCOVERY_TEXT_PREFIX}` lines equal the existing compiler's text. Remove them",
+				)
+		None:
+			void
+
+	expected: String = expected_display(path, own_position[0], own_position[1], wanted)
+
+	actual: String = found.diagnostic_shown()
+
+	if actual != expected:
+		failures = failures.append(
+			"${path}: the stage displays\n${actual}\nbut the fixture pins\n${expected}\n(the existing compiler prints ${existing.message}). Change the stage's text, or pin the difference with `${DISCOVERY_TEXT_PREFIX}` lines and list it in docs/DISCOVERY_TABLES_DESIGN.md",
+		)
+
+	failures

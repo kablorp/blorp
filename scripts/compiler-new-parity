@@ -9,7 +9,11 @@ per file that they agree on
     by a name is one `DimensionNameToken` in the new lexer, so that pair is
     merged before comparing),
   * whether the lexer reported a diagnostic, and
-  * whether the parser rejected the file (the accept/reject verdict).
+  * whether the parser rejected the file (the accept/reject verdict), and,
+    for a file both reject, the first diagnostic: its `line:column` must be
+    the same, and its message and help must be the same except where a
+    `WORDING_DIFFERENCES` or `HELP_DIFFERENCES` entry names the difference
+    and its reason.
 
 Each side is one dumper program, compiled to a binary once and run once,
 sequentially, over the whole file list:
@@ -35,6 +39,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -69,6 +74,11 @@ FILE_HEADER_PREFIX = "== "
 UNREADABLE_PREFIX = "unreadable "
 LEXER_COUNT_PREFIX = "lexer_diagnostics "
 PARSE_COUNT_PREFIX = "parse_diagnostics "
+FIRST_DIAGNOSTIC_PREFIX = "first_diagnostic "
+FIRST_HELP_PREFIX = "first_help "
+UNLISTED_PAIR_PREFIX = "unlisted_construct_pair "
+ROW_KINDS_SOURCE = "blorp/src/compiler_new/stage_01_discovery/tables/row_kinds.brp"
+CONSTRUCT_ENUM_HEADER = "enum ParsedConstruct:\n"
 
 HASH_SYMBOL_KIND = "HashSymbol"
 IDENTIFIER_KIND = "IdentifierToken"
@@ -84,6 +94,96 @@ TOKEN_FIELDS_WITH_TEXT = 4
 # (so the entry is removed when the stage is fixed or the fixture deleted) and
 # must still be in the corpus. Every other disagreement fails the gate.
 KNOWN_DIVERGENCES: dict[str, str] = {}
+
+# Files whose first parse diagnostic is reported at a different position by the
+# two front ends, with why. Same discipline as `KNOWN_DIVERGENCES`: a file
+# listed here must still differ and must still be in the corpus.
+KNOWN_POSITION_DIVERGENCES: dict[str, str] = {
+    "blorp/test/compiler_new/stage_01_discovery/parse/fixtures/should_fail/"
+    "import_constructors_unclosed.brp": (
+        "the existing parser reports the unclosed constructor list at the last "
+        "constructor; discovery reports it at the token after the list"
+    ),
+    "blorp/test/compiler_new/stage_01_discovery/parse/fixtures/should_fail/"
+    "interpolation_hole_two_expressions.brp": (
+        "the existing parser re-parses the hole text on its own and reports a "
+        "position inside the hole; discovery reports the second expression"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class WordingDifference:
+    """A first-diagnostic wording the two front ends deliberately disagree on.
+
+    `legacy` is a regular expression the whole existing text must match;
+    `discovery` is the text discovery must print, with `{name}` replaced by
+    the expression's named group of that name. An entry that no file uses is an error, so
+    the list cannot outlive the difference it names.
+    """
+
+    legacy: str
+    discovery: str
+    reason: str
+
+    def allows(self, legacy_text: str, discovery_text: str) -> bool:
+        found = re.fullmatch(self.legacy, legacy_text)
+        if found is None:
+            return False
+        expected = self.discovery
+        for name, text in found.groupdict().items():
+            expected = expected.replace("{" + name + "}", text)
+        return expected == discovery_text
+
+
+# Why a message differs. Positions must still agree whatever the wording.
+ADVICE_MOVED_TO_HELP = (
+    "the existing message embeds its advice; discovery states the problem in "
+    "the message and the advice in the help line"
+)
+POOR_EXISTING_TEXT = "the existing text names the wrong construct or an internal parse step"
+
+WORDING_DIFFERENCES: tuple[WordingDifference, ...] = (
+    WordingDifference(
+        r"expected indented function body",
+        "expected indented imports after `import:`",
+        POOR_EXISTING_TEXT + " (a bare `import:` is not a function)",
+    ),
+    WordingDifference(
+        r"expected indented function body",
+        "expected indented variants",
+        POOR_EXISTING_TEXT + " (a union's variants are not a function body)",
+    ),
+    WordingDifference(
+        r"`(?P<keyword>\w+)` is a reserved keyword and cannot be used as a name; "
+        r"choose another identifier such as `(?P=keyword)_name`",
+        "`{keyword}` is a reserved keyword and cannot be used as a name",
+        ADVICE_MOVED_TO_HELP,
+    ),
+    WordingDifference(
+        r"`\?=` cannot bind to `_`; use a name for the unwrapped value",
+        "`?=` cannot bind to `_`",
+        ADVICE_MOVED_TO_HELP,
+    ),
+    WordingDifference(
+        r"Field assignment is not supported\. Use record update syntax: \{ record \| field = value \}",
+        "field assignment is not supported",
+        ADVICE_MOVED_TO_HELP,
+    ),
+    WordingDifference(
+        r"Parse error in interpolated expression: expected `=` after top-level variable declaration",
+        "an interpolation hole must hold exactly one expression",
+        POOR_EXISTING_TEXT + " (the hole text is re-parsed as a declaration)",
+    ),
+)
+
+# A help line the two front ends deliberately word differently, as
+# `WORDING_DIFFERENCES` does for messages.
+HELP_DIFFERENCES: tuple[WordingDifference, ...] = ()
+
+# Where the existing parser prints no help line, discovery may add one: every
+# error teaches, so the added line is the improvement, not a divergence.
+HELP_ADDED = "discovery teaches a correction where the existing parser prints none"
 
 # The dumpers print one line per token; keep mismatch excerpts readable.
 EXCERPT_LIMIT = 200
@@ -111,6 +211,14 @@ class FileDump:
     tokens: list[str] = field(default_factory=list)
     lexer_diagnostics: int = 0
     parse_diagnostics: int = 0
+    # The first parse diagnostic of a rejected file: `line:column`, message
+    # and help (None when it has none or the file is accepted).
+    first_position: str | None = None
+    first_message: str | None = None
+    first_help: str | None = None
+    # `Code construct-index` for each Expected diagnostic whose (code,
+    # construct) pair `CONSTRUCT_MESSAGES` does not list.
+    unlisted_pairs: list[str] = field(default_factory=list)
     complete: bool = False
 
 
@@ -133,6 +241,14 @@ def parse_dump(text: str) -> dict[str, FileDump]:
         elif line.startswith(PARSE_COUNT_PREFIX):
             current.parse_diagnostics = int(line[len(PARSE_COUNT_PREFIX):])
             current.complete = True
+        elif line.startswith(FIRST_DIAGNOSTIC_PREFIX):
+            position, _, message = line[len(FIRST_DIAGNOSTIC_PREFIX):].partition(" ")
+            current.first_position = position
+            current.first_message = message
+        elif line.startswith(UNLISTED_PAIR_PREFIX):
+            current.unlisted_pairs.append(line[len(UNLISTED_PAIR_PREFIX):])
+        elif line.startswith(FIRST_HELP_PREFIX):
+            current.first_help = line[len(FIRST_HELP_PREFIX):]
         else:
             current.tokens.append(line)
     return files
@@ -165,6 +281,22 @@ def merge_dimension_names(tokens: list[str]) -> list[str]:
     return merged
 
 
+def construct_names() -> list[str]:
+    """The `ParsedConstruct` variants in declaration order (an argument is an index)."""
+    text = (REPO_ROOT / ROW_KINDS_SOURCE).read_text(encoding="utf-8")
+    block = text.split(CONSTRUCT_ENUM_HEADER, 1)[1].split("\n\n", 1)[0]
+    return [line.strip() for line in block.split("\n") if line.startswith("\t")]
+
+
+def unlisted_pair_text(pair: str) -> str:
+    """`Code construct-index` as `Code in ConstructName`."""
+    code, _, index = pair.partition(" ")
+    names = construct_names()
+    position = int(index) if index.lstrip("-").isdigit() else -1
+    construct = names[position] if 0 <= position < len(names) else f"construct #{index}"
+    return f"{code} in {construct}"
+
+
 def excerpt(token_line: str) -> str:
     return token_line[:EXCERPT_LIMIT]
 
@@ -192,6 +324,12 @@ def file_mismatches(path: str, legacy: FileDump | None, discovery: FileDump | No
                 f"{path}: token count differs: existing {len(legacy_tokens)}, "
                 f"discovery {len(discovery.tokens)}"
             )
+    for pair in discovery.unlisted_pairs:
+        problems.append(
+            f"{path}: discovery reports {unlisted_pair_text(pair)}, a pair "
+            "CONSTRUCT_MESSAGES (blorp/test/compiler_new/support/construct_messages.brp) "
+            "does not list: add it there with the message it renders, and to render.brp"
+        )
     if (legacy.lexer_diagnostics > 0) != (discovery.lexer_diagnostics > 0):
         problems.append(
             f"{path}: lexer diagnostics differ: existing {legacy.lexer_diagnostics}, "
@@ -208,6 +346,118 @@ def file_mismatches(path: str, legacy: FileDump | None, discovery: FileDump | No
 
 
 @dataclass
+class FirstDiagnosticTally:
+    """What the first-diagnostic comparison saw, before any allowance."""
+
+    compared: int = 0
+    position_differences: int = 0
+    message_differences: int = 0
+    help_differences: int = 0
+    helps_added: int = 0
+    known_positions_used: set[str] = field(default_factory=set)
+    wording_used: set[WordingDifference] = field(default_factory=set)
+    help_wording_used: set[WordingDifference] = field(default_factory=set)
+
+
+def allowed_wording(
+    entries: tuple[WordingDifference, ...], legacy_text: str, discovery_text: str
+) -> WordingDifference | None:
+    for entry in entries:
+        if entry.allows(legacy_text, discovery_text):
+            return entry
+    return None
+
+
+def describe_first_diagnostic(dump: FileDump) -> str:
+    help_text = f" / help: {dump.first_help}" if dump.first_help is not None else ""
+    return f"{dump.first_position} {dump.first_message}{help_text}"
+
+
+def first_diagnostic_problems(
+    path: str,
+    legacy: FileDump,
+    discovery: FileDump,
+    tally: FirstDiagnosticTally,
+    known_positions: dict[str, str],
+    wording: tuple[WordingDifference, ...],
+    help_wording: tuple[WordingDifference, ...],
+) -> list[str]:
+    """The disagreements on the first diagnostic of a file both front ends reject.
+
+    Position must agree unless the file is in `known_positions`; the message
+    and help must agree unless an entry of `wording` or `help_wording` names
+    the difference, or the existing parser printed no help.
+    """
+    if legacy.first_position is None and discovery.first_position is None:
+        return []
+    tally.compared += 1
+    problems: list[str] = []
+    excerpts = (
+        f"    existing:  {describe_first_diagnostic(legacy)}\n"
+        f"    discovery: {describe_first_diagnostic(discovery)}"
+    )
+    if legacy.first_position != discovery.first_position:
+        tally.position_differences += 1
+        if path in known_positions:
+            tally.known_positions_used.add(path)
+        else:
+            problems.append(f"{path}: first diagnostic position differs\n{excerpts}")
+    if legacy.first_message != discovery.first_message:
+        tally.message_differences += 1
+        entry = allowed_wording(wording, legacy.first_message or "", discovery.first_message or "")
+        if entry is None:
+            problems.append(f"{path}: first diagnostic message differs\n{excerpts}")
+        else:
+            tally.wording_used.add(entry)
+    if legacy.first_help != discovery.first_help:
+        tally.help_differences += 1
+        if legacy.first_help is None and discovery.first_help is not None:
+            tally.helps_added += 1
+        else:
+            entry = allowed_wording(
+                help_wording, legacy.first_help or "", discovery.first_help or ""
+            )
+            if entry is None:
+                problems.append(f"{path}: first diagnostic help differs\n{excerpts}")
+            else:
+                tally.help_wording_used.add(entry)
+    return problems
+
+
+def stale_allowance_problems(
+    tally: FirstDiagnosticTally,
+    known_positions: dict[str, str],
+    wording: tuple[WordingDifference, ...],
+    help_wording: tuple[WordingDifference, ...],
+    corpus: set[str],
+) -> list[str]:
+    """Allowances over the whole corpus that no file needs any more."""
+    problems: list[str] = []
+    for path, reason in sorted(known_positions.items()):
+        if path not in corpus:
+            problems.append(
+                f"{path}: listed in KNOWN_POSITION_DIVERGENCES ({reason}) but is not in the "
+                "corpus; remove the entry"
+            )
+        elif path not in tally.known_positions_used:
+            problems.append(
+                f"{path}: listed in KNOWN_POSITION_DIVERGENCES ({reason}) but the first "
+                "diagnostic positions now agree; remove the entry"
+            )
+    for name, entries, used in (
+        ("WORDING_DIFFERENCES", wording, tally.wording_used),
+        ("HELP_DIFFERENCES", help_wording, tally.help_wording_used),
+    ):
+        for entry in entries:
+            if entry not in used:
+                problems.append(
+                    f"{name} entry no file needs any more ({entry.legacy!r} -> "
+                    f"{entry.discovery!r}); remove it"
+                )
+    return problems
+
+
+@dataclass
 class Comparison:
     files: int
     tokens: int
@@ -217,14 +467,22 @@ class Comparison:
     lexer_diagnostic_files: int
     problems: list[str]
     notes: list[str]
+    first_diagnostics: FirstDiagnosticTally = field(default_factory=FirstDiagnosticTally)
 
 
 def compare_dumps(
     legacy: dict[str, FileDump],
     discovery: dict[str, FileDump],
     known_divergences: dict[str, str] | None = None,
+    known_positions: dict[str, str] | None = None,
+    wording: tuple[WordingDifference, ...] | None = None,
+    help_wording: tuple[WordingDifference, ...] | None = None,
 ) -> Comparison:
     known = KNOWN_DIVERGENCES if known_divergences is None else known_divergences
+    positions = KNOWN_POSITION_DIVERGENCES if known_positions is None else known_positions
+    messages = WORDING_DIFFERENCES if wording is None else wording
+    helps = HELP_DIFFERENCES if help_wording is None else help_wording
+    tally = FirstDiagnosticTally()
     paths = sorted(set(legacy) | set(discovery))
     problems: list[str] = []
     notes: list[str] = []
@@ -237,6 +495,9 @@ def compare_dumps(
         old = legacy.get(path)
         new = discovery.get(path)
         found = file_mismatches(path, old, new)
+        if not found and old is not None and new is not None:
+            if old.parse_diagnostics > 0 and new.parse_diagnostics > 0:
+                found = first_diagnostic_problems(path, old, new, tally, positions, messages, helps)
         if path in known and found:
             known_count += 1
             notes.append(f"known divergence {path}: {known[path]}")
@@ -268,6 +529,7 @@ def compare_dumps(
         lexer_diagnostic_files=lexer_diagnostic_files,
         problems=problems,
         notes=notes,
+        first_diagnostics=tally,
     )
 
 
@@ -364,11 +626,26 @@ def check_module_orders(work: Path) -> tuple[list[str], list[str]]:
     return notes, problems
 
 
+def with_stale_allowances(comparison: Comparison, corpus: set[str]) -> Comparison:
+    """`comparison` plus a problem for each allowance no corpus file needs."""
+    stale = stale_allowance_problems(
+        comparison.first_diagnostics,
+        KNOWN_POSITION_DIVERGENCES,
+        WORDING_DIFFERENCES,
+        HELP_DIFFERENCES,
+        corpus,
+    )
+    comparison.problems.extend(stale)
+    comparison.mismatched_files += len(stale)
+    return comparison
+
+
 def report(comparison: Comparison, seconds: float) -> int:
     for note in comparison.notes:
         print(note)
     for problem in comparison.problems:
         print(problem)
+    tally = comparison.first_diagnostics
     agreeing = comparison.files - comparison.mismatched_files
     status = "PASS" if comparison.mismatched_files == 0 else "FAIL"
     print(
@@ -376,6 +653,11 @@ def report(comparison: Comparison, seconds: float) -> int:
         f"rejected_by_both={comparison.rejected_by_both} "
         f"files_with_lexer_diagnostics={comparison.lexer_diagnostic_files} "
         f"known_divergences={comparison.known_divergences} "
+        f"first_diagnostics={tally.compared} "
+        f"position_differences={tally.position_differences} "
+        f"message_differences={tally.message_differences} "
+        f"help_differences={tally.help_differences} "
+        f"helps_added={tally.helps_added} "
         f"mismatched_files={comparison.mismatched_files} seconds={seconds:.1f}"
     )
     print(
@@ -402,7 +684,11 @@ def main() -> int:
             Path(name).read_text(encoding="utf-8", errors="surrogateescape")
             for name in args.compare
         )
-        comparison = compare_dumps(parse_dump(legacy_text), parse_dump(discovery_text))
+        legacy_files = parse_dump(legacy_text)
+        discovery_files = parse_dump(discovery_text)
+        comparison = with_stale_allowances(
+            compare_dumps(legacy_files, discovery_files), set(legacy_files) | set(discovery_files)
+        )
         return report(comparison, time.monotonic() - started)
 
     files = corpus_files()
@@ -424,7 +710,9 @@ def main() -> int:
                 (work / name).write_text(dump, encoding="utf-8", errors="surrogateescape")
         legacy_files = parse_dump(legacy_dump)
         discovery_files = parse_dump(discovery_dump)
-        comparison = compare_dumps(legacy_files, discovery_files)
+        comparison = with_stale_allowances(
+            compare_dumps(legacy_files, discovery_files), set(files)
+        )
         order_notes, order_problems = check_module_orders(work)
         comparison.notes.extend(order_notes)
         comparison.problems.extend(order_problems)

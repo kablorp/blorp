@@ -13,6 +13,13 @@ from process_supervisor import CAPTURE_LIMIT_EXIT, PROCESS_TIMEOUT_EXIT, run_com
 
 MARKER = "-- RUN-BLORP-CHECK"
 
+# The existing compiler's fixtures and the rewritten stages' fixtures, which pin
+# the same diagnostic text so both front ends answer to the same words. A
+# stage-only should_fail fixture marked `RUN-BLORP-CHECK` therefore also runs on
+# the old side: the existing compiler must reject it with the text it pins in
+# its `EXPECT-BLORP` lines.
+DEFAULT_ROOTS = (Path("blorp/test/compiler"), Path("blorp/test/compiler_new"))
+
 
 @dataclass
 class Expectations:
@@ -144,7 +151,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     compiler = Path(args.blorp_bin).resolve()
-    roots = [Path(root) for root in args.root] or [Path("blorp/test/compiler")]
+    roots = [Path(root) for root in args.root] or list(DEFAULT_ROOTS)
     fixtures = discover_fixtures(roots)
     # scripts/test owns the expected production count and passes it explicitly;
     # a standalone run checks only that some fixture was found.

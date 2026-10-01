@@ -9,12 +9,14 @@ import:
 		DiscoveryBuilder,
 		NameId,
 		advance_token,
+		append_diagnostic_with_argument,
 		append_plain_diagnostic,
 		move_token_cursor,
 		name_id_at_row,
 	../tables/diagnostic_code:
 		DiscoveryDiagnosticCode(ExpectedNameDiagnostic, ReservedKeywordAsNameDiagnostic),
 	../tables/name_vocabulary: DISCARD_NAME_INDEX
+	../tables/row_kinds: ParsedConstruct, parsed_construct_argument
 	../tables/span: Span, pack_span, span_source_index, span_start
 	../tables/token:
 		FIRST_KEYWORD_NAME_INDEX,
@@ -248,6 +250,32 @@ pure func report_at_current(
 
 
 ---
+Reports `code` at the current token, saying which `construct` was being
+parsed (the argument of the `Expected...` codes).
+---
+pure func report_at_current_in(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
+	span: Span = builder.span_before_current()
+	builder.append_diagnostic_with_argument(code, span, parsed_construct_argument(construct))
+
+
+---
+Reports `code` at the current token with one integer `argument`, whose
+meaning the code's catalogue entry fixes.
+---
+pure func report_at_current_with_argument(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+	argument: Int,
+) -> DiscoveryBuilder:
+	span: Span = builder.span_before_current()
+	builder.append_diagnostic_with_argument(code, span, argument)
+
+
+---
 Advances past a `kind` token, or reports `code` there without advancing.
 ---
 pure func expect_token(
@@ -262,6 +290,22 @@ pure func expect_token(
 
 
 ---
+Advances past a `kind` token, or reports `code` in `construct` there without
+advancing.
+---
+pure func expect_token_in(
+	builder: DiscoveryBuilder,
+	kind: TokenKind,
+	code: DiscoveryDiagnosticCode,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
+	if builder.current_kind() == kind:
+		builder.advance_token()
+	else:
+		builder.report_at_current_in(code, construct)
+
+
+---
 Reports `code` and, unless the cursor is at a soft boundary, skips the
 offending token: the shared recovery for a missing required item.
 ---
@@ -271,6 +315,23 @@ pure func report_and_recover(
 ) -> DiscoveryBuilder:
 	boundary: Bool = builder.at_soft_boundary()
 	var out: DiscoveryBuilder = builder.report_at_current(code)
+
+	if not boundary:
+		out = out.advance_token()
+
+	out
+
+
+---
+`report_and_recover` for a code that names its `construct`.
+---
+pure func report_and_recover_in(
+	builder: DiscoveryBuilder,
+	code: DiscoveryDiagnosticCode,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
+	boundary: Bool = builder.at_soft_boundary()
+	var out: DiscoveryBuilder = builder.report_at_current_in(code, construct)
 
 	if not boundary:
 		out = out.advance_token()
@@ -344,23 +405,31 @@ pure func declared_name_at_cursor(builder: DiscoveryBuilder) -> NameId:
 
 
 ---
-Consumes a name that introduces a new binding or declaration. A reserved
+Consumes a name that introduces a new binding or declaration, as `construct` (the thing named: a function, a field, ...). A reserved
 keyword there is reported and consumed as if it were the name; anything else
 that is not a name is reported and skipped unless it is a soft boundary.
 Read the name first with `declared_name_at_cursor`.
 ---
-pure func consume_declared_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+pure func consume_declared_name(
+	builder: DiscoveryBuilder,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
 	if (
 		builder
 			.current_name()
 			.is_some()
 	):
 		builder.advance_token()
-	else if keyword_name_index(builder.current_kind()).is_some():
-		reported: DiscoveryBuilder = builder.report_at_current(ReservedKeywordAsNameDiagnostic)
-		reported.advance_token()
 	else:
-		builder.report_and_recover(ExpectedNameDiagnostic)
+		match keyword_name_index(builder.current_kind()):
+			Some(keyword):
+				reported: DiscoveryBuilder = builder.report_at_current_with_argument(
+					ReservedKeywordAsNameDiagnostic,
+					keyword,
+				)
+				reported.advance_token()
+			None:
+				builder.report_and_recover_in(ExpectedNameDiagnostic, construct)
 
 
 ---
@@ -380,7 +449,10 @@ Consumes a name in a reference position (a trait, bound or supertrait name):
 anything that is not a name, keywords included, is reported and skipped
 unless it is a soft boundary.
 ---
-pure func consume_referenced_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+pure func consume_referenced_name(
+	builder: DiscoveryBuilder,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
 	if (
 		builder
 			.current_name()
@@ -388,7 +460,7 @@ pure func consume_referenced_name(builder: DiscoveryBuilder) -> DiscoveryBuilder
 	):
 		builder.advance_token()
 	else:
-		builder.report_and_recover(ExpectedNameDiagnostic)
+		builder.report_and_recover_in(ExpectedNameDiagnostic, construct)
 
 
 ---
@@ -404,8 +476,11 @@ pure func binder_name_at_cursor(builder: DiscoveryBuilder) -> NameId:
 ---
 Consumes a binder: `_`, or a declared name (see `consume_declared_name`).
 ---
-pure func consume_binder_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+pure func consume_binder_name(
+	builder: DiscoveryBuilder,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
 	if builder.at(UnderscoreSymbol):
 		builder.advance_token()
 	else:
-		builder.consume_declared_name()
+		builder.consume_declared_name(construct)
