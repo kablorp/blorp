@@ -1,0 +1,302 @@
+-- The declaration-level comparison of the legacy adapter's parsed program with
+-- the existing parser's, shared by the differential tool
+-- (`discovery_adapter_differential.brp`) and the adapter's own tests
+-- (`test_discovery_adapter.brp`).
+--
+-- The existing parser's program, with every function and method body and every
+-- global's value replaced by the adapter's placeholder (`declarations_only`) and
+-- its diagnostics dropped, is encoded with `parsed_program_to_json`, as is the
+-- adapter's program; `program_differences` lists every field that differs.
+import:
+	../../../src/compiler/discovery_adapter: DECLARATION_ONLY_BODY
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			ParsedErrorDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedExpr,
+		ParsedFunctionDecl,
+		ParsedProgram,
+		ParsedTraitMethodDecl,
+	json: JsonValue(JsonNull, JsonObject, JsonString, JsonVector)
+
+
+---
+The longest value text kept for a differing field.
+---
+MAX_VALUE_TEXT: Int = 160
+
+---
+What separates the fields of a `difference` line, and how a value that holds it
+is written (`scripts/compiler-new-parity` reads both).
+---
+FIELD_SEPARATOR: String = " | "
+
+ESCAPED_FIELD_SEPARATOR: String = " \\| "
+
+
+-- The existing parser's program at declaration level.
+pure func placeholder_body(body: Option[ParsedExpr]) -> Option[ParsedExpr]:
+	match body:
+		Some(_):
+			Some(DECLARATION_ONLY_BODY)
+		None:
+			None
+
+
+pure func declarations_only_function(function_decl: ParsedFunctionDecl) -> ParsedFunctionDecl:
+	{ function_decl | body = placeholder_body(function_decl.body) }
+
+
+pure func declarations_only_trait_method(method: ParsedTraitMethodDecl) -> ParsedTraitMethodDecl:
+	{ method | body = placeholder_body(method.body) }
+
+
+---
+`decl` with every expression position replaced by the adapter's placeholder:
+a function, method or trait method body that exists, and a global's value.
+---
+pure func declarations_only_decl(decl: ParsedDecl) -> ParsedDecl:
+	match decl:
+		FunctionParsedDecl(function_decl):
+			FunctionParsedDecl(declarations_only_function(function_decl))
+		VarParsedDecl(var_decl):
+			VarParsedDecl({ var_decl | value = DECLARATION_ONLY_BODY })
+		TraitParsedDecl(trait_decl):
+			TraitParsedDecl(
+				{ trait_decl | methods = trait_decl.methods.map(declarations_only_trait_method) },
+			)
+		ImplParsedDecl(impl_decl):
+			ImplParsedDecl(
+				{ impl_decl | methods = impl_decl.methods.map(declarations_only_function) },
+			)
+		PrivateParsedDecl(inner, span):
+			PrivateParsedDecl(declarations_only_decl(inner), span)
+		ImportBlockParsedDecl(_, _):
+			decl
+		ForeignBlockParsedDecl(_, _, _):
+			decl
+		RecordParsedDecl(_):
+			decl
+		UnionParsedDecl(_):
+			decl
+		BuiltinTypeParsedDecl(_):
+			decl
+		TypeAliasParsedDecl(_):
+			decl
+		ParsedErrorDecl(_):
+			decl
+
+
+pure func declarations_only(program: ParsedProgram) -> ParsedProgram:
+	{ program |
+		decls = program.decls.map(declarations_only_decl),
+		diagnostics = []
+	}
+
+
+-- Differences between two encoded programs.
+record JsonDifference {
+	declaration: String,
+	path: String,
+	old_text: String,
+	new_text: String
+}
+
+
+---
+`text` as one field of a `difference` line: shortened, and with the separator
+the line is split on written as `\\|`, so a value never reads as two fields.
+---
+pure func shortened(text: String) -> String:
+	kept: String = if text.length() > MAX_VALUE_TEXT:
+		text.substring(0, MAX_VALUE_TEXT) + "..."
+	else:
+		text
+
+	kept.replace(FIELD_SEPARATOR, ESCAPED_FIELD_SEPARATOR)
+
+
+pure func field_value(value: JsonValue, key: String) -> JsonValue:
+	match value:
+		JsonObject(fields):
+			match fields.find(pure func(field): field[0] == key):
+				Some(field):
+					field[1]
+				None:
+					JsonNull
+		_:
+			JsonNull
+
+
+---
+The name a declaration's JSON carries, or its kind for an import or foreign
+block, which have none.
+---
+pure func declaration_label(decl: JsonValue) -> String:
+	match field_value(decl, "name"):
+		JsonString(name):
+			name
+		_:
+			match field_value(decl, "kind"):
+				JsonString(kind):
+					kind
+				_:
+					"?"
+
+
+pure func value_differences(
+	declaration: String,
+	path: String,
+	old_value: JsonValue,
+	new_value: JsonValue,
+) -> List[JsonDifference]:
+	match (old_value, new_value):
+		(JsonObject(old_fields), JsonObject(new_fields)):
+			object_differences(declaration, path, old_fields, new_fields)
+		(JsonVector(old_items), JsonVector(new_items)):
+			vector_differences(declaration, path, old_items, new_items)
+		_:
+			if old_value == new_value:
+				[]
+			else:
+				[
+					{
+						declaration = declaration,
+						path = path,
+						old_text = shortened(old_value.to_string()),
+						new_text = shortened(new_value.to_string())
+					},
+				]
+
+
+pure func has_key(fields: List[(String, JsonValue)], key: String) -> Bool:
+	fields.any(pure func(field): field[0] == key)
+
+
+pure func object_differences(
+	declaration: String,
+	path: String,
+	old_fields: List[(String, JsonValue)],
+	new_fields: List[(String, JsonValue)],
+) -> List[JsonDifference]:
+	var found: List[JsonDifference] = []
+
+	for field in old_fields:
+		found = found.concat(
+			value_differences(
+				declaration,
+				path + "." + field[0],
+				field[1],
+				field_value(JsonObject(new_fields), field[0]),
+			),
+		)
+
+	for field in new_fields:
+		if not has_key(old_fields, field[0]):
+			found = found.append({
+				declaration = declaration,
+				path = path + "." + field[0],
+				old_text = "(absent)",
+				new_text = shortened(field[1].to_string()),
+			})
+
+	found
+
+
+pure func vector_differences(
+	declaration: String,
+	path: String,
+	old_items: List[JsonValue],
+	new_items: List[JsonValue],
+) -> List[JsonDifference]:
+	var found: List[JsonDifference] = []
+
+	if old_items.length() != new_items.length():
+		found = found.append({
+			declaration = declaration,
+			path = path + ".length",
+			old_text = "${old_items.length()}",
+			new_text = "${new_items.length()}",
+		})
+
+	shared: Int = old_items
+		.length()
+		.min(new_items.length())
+
+	for index in 0..shared:
+		found = found.concat(
+			value_differences(
+				declaration,
+				path + "[${index}]",
+				old_items.get_or(index, JsonNull),
+				new_items.get_or(index, JsonNull),
+			),
+		)
+
+	found
+
+
+---
+Every field that differs between the encoded programs: the source, the module
+doc, then each declaration, labelled with its name.
+---
+pure func program_differences(old_json: JsonValue, new_json: JsonValue) -> List[JsonDifference]:
+	var found: List[JsonDifference] = []
+
+	for field in ["source", "module_doc"]:
+		found = found.concat(
+			value_differences(
+				"",
+				field,
+				field_value(old_json, field),
+				field_value(new_json, field),
+			),
+		)
+
+	old_decls: List[JsonValue] = match field_value(old_json, "decls"):
+		JsonVector(items):
+			items
+		_:
+			[]
+
+	new_decls: List[JsonValue] = match field_value(new_json, "decls"):
+		JsonVector(items):
+			items
+		_:
+			[]
+
+	if old_decls.length() != new_decls.length():
+		found = found.append({
+			declaration = "",
+			path = "decls.length",
+			old_text = "${old_decls.length()}",
+			new_text = "${new_decls.length()}",
+		})
+
+	shared: Int = old_decls
+		.length()
+		.min(new_decls.length())
+
+	for index in 0..shared:
+		old_decl: JsonValue = old_decls.get_or(index, JsonNull)
+		found = found.concat(
+			value_differences(
+				declaration_label(old_decl),
+				"decls[${index}]",
+				old_decl,
+				new_decls.get_or(index, JsonNull),
+			),
+		)
+
+	found

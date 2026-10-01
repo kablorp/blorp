@@ -1,0 +1,2545 @@
+---
+Rebuilds the existing typecheck's input from the new discovery stage's tables.
+This is the only module that knows both shapes: it reads the stage's frozen
+tables and builds the parsed AST, module identities, surfaces and graph the
+existing front end's typecheck consumes. It is a transformation only: it lexes,
+parses, resolves and checks nothing, and a fact the tables lack is a gap to fix
+in the stage, not here.
+
+It shrinks as typecheck is rewritten to read the tables, and it is deleted
+when typecheck takes `FrontendTables` directly.
+
+Declarations only so far: signatures, types, imports, foreign blocks and
+docstrings are rebuilt, and every function or method body and every global's
+value is the placeholder `DECLARATION_ONLY_BODY` until the body half lands
+(`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`, item 4).
+
+A row the tables should hold and do not is a `LegacyAdapterError`, never a
+default: no placeholder value flows into the rebuilt AST. The freeze
+invariants make such a row unreachable for tables a stage run froze, so an
+error means the stage or the adapter is wrong, and the differential fails on it.
+Reads of text by an id the invariants checked (a name, a literal, a path) use
+the stage's total accessors, whose fallbacks are unreachable for the same
+reason.
+---
+import:
+	../compiler_new/stage_01_discovery/sources/embedded_standard_library:
+		EmbeddedStandardLibraryTexts,
+		embedded_module_name,
+	../compiler_new/stage_01_discovery/sources/source_provider: SOURCE_FILE_EXTENSION
+	../compiler_new/stage_01_discovery/tables/builder:
+		DefinitionRow,
+		ImportId,
+		ImportItemId,
+		ImportRow,
+		LiteralId,
+		ModuleId,
+		ModuleRow,
+		NameId as TableNameId,
+		NodeId,
+		NodeRow,
+		PackageRow,
+		RowRange,
+		SignatureRow,
+		bound_id_at_row,
+		definition_id_at_row,
+		definition_id_index,
+		foreign_block_id_index,
+		implicit_request_id_at_row,
+		import_id_at_row,
+		import_item_id_at_row,
+		literal_id_at_row,
+		module_id_at_row,
+		module_id_index,
+		name_id_at_row,
+		name_id_index as table_name_index,
+		node_id_index,
+		parameter_id_index,
+		root_id_at_row,
+		supertrait_id_at_row,
+	../compiler_new/stage_01_discovery/tables/frontend_tables as Tables
+	../compiler_new/stage_01_discovery/tables/invariants:
+		DiscoveryTable(
+			AnnotationTable,
+			BinderNameTable,
+			BodyTable,
+			BoundTable,
+			DefinitionTable,
+			DefinitionTypeTable,
+			DimensionConstraintTable,
+			DimensionNameTable,
+			DocumentationTable,
+			ForeignArgumentTable,
+			ForeignBindingTable,
+			ForeignBlockTable,
+			ForeignCNameTable,
+			ImportBlockTable,
+			ImportItemTable,
+			ImportItemVariantTable,
+			ImportTable,
+			MemberTable,
+			ModuleDocumentationTable,
+			ModulePackageTable,
+			ModuleTable,
+			NodeChildTable,
+			NodeTable,
+			ParameterTable,
+			ParameterTypeTable,
+			ResourceCleanupTable,
+			SignatureTable,
+			SupertraitTable,
+			TypeParameterTable,
+			VariantPayloadTable,
+		),
+		discovery_table_name,
+	../compiler_new/stage_01_discovery/tables/row_kinds as Kinds
+	../compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
+	../lib/source:
+		SourceFile,
+		SourceLocation,
+		compiler_prelude_source_location,
+		singleton_source_file_id,
+		source_file,
+		source_location_from_offsets,
+	frontend_request: FrontendCompilationGraph, FrontendGraphContext
+	list: range, repeat
+	stage_01_generated_inputs/embedded_std: embedded_std_module_names, embedded_std_source
+	stage_02_lex/name_table: NameTable, name_id_from_interned_index, name_table_from_parts
+	stage_03_parse/parsed_ast:
+		ParsedBuiltinTypeDecl,
+		ParsedDecl(
+			BuiltinTypeParsedDecl,
+			ForeignBlockParsedDecl,
+			FunctionParsedDecl,
+			ImplParsedDecl,
+			ImportBlockParsedDecl,
+			PrivateParsedDecl,
+			RecordParsedDecl,
+			TraitParsedDecl,
+			TypeAliasParsedDecl,
+			UnionParsedDecl,
+			VarParsedDecl,
+		),
+		ParsedDimBinaryOp(
+			ParsedDimAddOp,
+			ParsedDimDivideOp,
+			ParsedDimMultiplyOp,
+			ParsedDimSubtractOp,
+		),
+		ParsedDimConstraint,
+		ParsedExpr(ParsedVoidExpr),
+		ParsedFieldDecl,
+		ParsedForeignBlockArg,
+		ParsedForeignFunctionDecl,
+		ParsedFunctionAnnotation(
+			ParsedDebugOnlyAnnotation,
+			ParsedNoCopyAnnotation,
+			ParsedResourceResultOrdinaryAnnotation,
+			ParsedTailRecursiveAnnotation,
+		),
+		ParsedFunctionDecl,
+		ParsedIdentifier,
+		ParsedImplDecl,
+		ParsedImportDecl,
+		ParsedImportSymbol,
+		ParsedModuleDoc,
+		ParsedParam,
+		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
+		ParsedProgram,
+		ParsedRecordDecl,
+		ParsedResourceCleanup,
+		ParsedTraitDecl,
+		ParsedTraitMethodDecl,
+		ParsedTraitReference,
+		ParsedTypeAliasDecl,
+		ParsedTypeExpr(
+			ParsedArrayType,
+			ParsedBoundedType,
+			ParsedDimBinaryType,
+			ParsedDimLiteralType,
+			ParsedDimNameType,
+			ParsedFunctionType,
+			ParsedMissingType,
+			ParsedNamedType,
+			ParsedQualifiedNamedType,
+			ParsedRangeType,
+			ParsedTupleType,
+		),
+		ParsedTypeParamDecl,
+		ParsedTypeParamKind(ParsedDimensionParameter, ParsedTypeParameter),
+		ParsedUnionDecl,
+		ParsedVarDecl,
+		ParsedVariantDecl,
+		parsed_identifier,
+	stage_03_parse/source_ast_finalize:
+		finalized_typecheck_program_ast,
+		finalized_typecheck_program_with_names,
+	stage_04_modules/frontend_graph: FrontendImportEdge, FrontendImportResolution, FrontendModule
+	stage_04_modules/frontend_graph_service:
+		FrontendGraphServiceError,
+		validated_frontend_graph_for_modules,
+	stage_04_modules/loaded_module:
+		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
+		ResolvedModuleIdentity,
+		resolved_module_identity_from_resolver,
+	stage_04_modules/module_surface: module_surface_for_program
+
+
+---
+Stands where a function or method body, or a global's value, will be until the
+body half of the adapter lands. Both sides of the declaration-level
+differential use this one value, so a body is compared only by whether the
+declaration has one.
+---
+DECLARATION_ONLY_BODY: ParsedExpr = ParsedVoidExpr(compiler_prelude_source_location())
+
+---
+Stands for a by-key index entry whose key has no row.
+---
+private ABSENT_ROW: Int = -1
+
+---
+Stands for the start of an item list that has no more items, so merging by
+start picks another list.
+---
+private NO_MORE_ITEMS: Int = 9223372036854775807
+
+
+---
+Why the tables could not be rebuilt as the existing front end's AST.
+
+- `MissingTableRow(table, index)`: a row the tables should hold is not there.
+- `NotAWrittenType(node)`: a node in a type position has a kind no written type
+  has.
+- `ModuleWithoutRequest(module)`: a module no root, implicit request or import
+  loaded, so it has no name.
+- `GraphRejected(errors)`: the existing graph validation refused the rebuilt
+  modules.
+---
+union LegacyAdapterError:
+	MissingTableRow(DiscoveryTable, Int)
+	NotAWrittenType(Int)
+	ModuleWithoutRequest(Int)
+	GraphRejected(List[FrontendGraphServiceError])
+
+
+---
+The error as a line of text.
+---
+pure func legacy_adapter_error_message(error: LegacyAdapterError) -> String:
+	match error:
+		MissingTableRow(table, index):
+			"the tables hold no row ${index} of ${discovery_table_name(table)}"
+		NotAWrittenType(node):
+			"node ${node} is in a type position but is not a written type"
+		ModuleWithoutRequest(module):
+			"module ${module} was loaded by no root, implicit request or import"
+		GraphRejected(errors):
+			"the existing graph validation refused the rebuilt modules: ${errors.length()} errors"
+
+
+---
+How the existing front end names the modules the stage loaded. A module's name
+comes from how it was reached, which the tables hold: a module imported by a
+bare, native-package or source-package request is named by the request's text,
+one imported by a relative request, or from user code, by its path without
+`.brp`, an implicit module by its request's name. The one thing they do not
+hold is the name a root takes: the existing front end's callers choose it per
+command, so it is an input, a function of the root's request path as it was
+given to discovery.
+---
+record LegacyModuleNaming {
+	root_module_name: pure (String) -> String
+}
+
+
+---
+The rows of a table that belong to each owner, in table order: a counting-sort
+index, so the rows of one owner need not be adjacent in the table. `starts`
+has one entry per owner plus one; the rows of owner `k` are
+`rows[starts[k] .. starts[k + 1]]`, each a row position in the indexed table.
+---
+record OwnerRows {
+	starts: List[Int],
+	rows: List[Int]
+}
+
+
+---
+Everything the declaration half reads from the frozen tables, plus the indexes
+derived from them. Derived from one `FrontendTables`, built once by
+`legacy_declaration_reader`, read-only afterwards; no fact is stored here that
+the tables do not hold.
+---
+record DeclarationReader {
+	tables: Tables.FrontendTables,
+	module_names: List[String],
+	members: OwnerRows,
+	annotations: OwnerRows,
+	type_parameters: OwnerRows,
+	bounds: OwnerRows,
+	supertraits: OwnerRows,
+	variant_payloads: OwnerRows,
+	dimension_constraints: OwnerRows,
+	import_blocks: OwnerRows,
+	foreign_blocks: OwnerRows,
+	foreign_block_functions: OwnerRows,
+	documentation_of: List[Int],
+	signature_of: List[Int],
+	definition_type_of: List[Int],
+	parameter_type_of: List[Int],
+	body_of: List[Int],
+	foreign_c_name_of: List[Int],
+	resource_cleanup_of: List[Int],
+	foreign_binding_of: List[Int],
+	module_documentation_of: List[Int],
+	sigil_name_of: List[Int]
+}
+
+
+---
+The standard library embedded in the compiler (`embedded_std`, generated by the
+build), as the stage's embedded provider asks for it. The composition belongs
+here because the stage must not import the compiler's generated inputs.
+---
+record CompilerEmbeddedTexts {
+	description: String
+}
+
+
+COMPILER_EMBEDDED_TEXTS: CompilerEmbeddedTexts = {description = "embedded standard library"}
+
+
+implements EmbeddedStandardLibraryTexts for CompilerEmbeddedTexts:
+	pure func module_names(self: CompilerEmbeddedTexts) -> List[String]:
+		embedded_std_module_names()
+
+	pure func module_source(self: CompilerEmbeddedTexts, module_name: String) -> Option[String]:
+		embedded_std_source(module_name)
+
+
+---
+The existing front end's name for the path of an embedded module,
+`embedded_std_import_source` in `lib/source_graph`.
+---
+pure func legacy_embedded_path(module_name: String) -> String:
+	"<embedded:" + module_name + ">"
+
+
+-- Results.
+private pure func present[T](
+	row: Option[T],
+	table: DiscoveryTable,
+	index: Int,
+) -> Result[T, LegacyAdapterError]:
+	match row:
+		Some(found):
+			Ok(found)
+		None:
+			Err(MissingTableRow(table, index))
+
+
+---
+The values of `items` if every one is `Ok`, else the first error.
+---
+private pure func collected[T](
+	items: List[Result[T, LegacyAdapterError]],
+) -> Result[List[T], LegacyAdapterError]:
+	var values: List[T] = []
+	var failure: Option[LegacyAdapterError] = None
+
+	for item in items:
+		match item:
+			Ok(value):
+				values = values.append(value)
+			Err(error):
+				if failure.is_none():
+					failure = Some(error)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(values)
+
+
+-- Indexes.
+---
+The index of `owner_count` owners over a table whose row `i` belongs to owner
+`owners[i]`.
+---
+private pure func group_by_owner(owner_count: Int, owners: List[Int]) -> OwnerRows:
+	var starts: List[Int] = repeat(0, owner_count + 1)
+
+	for owner in owners:
+		starts = starts.set(owner + 1, starts.get_or(owner + 1, 0) + 1)
+
+	for owner in 0..owner_count:
+		starts = starts.set(owner + 1, starts.get_or(owner + 1, 0) + starts.get_or(owner, 0))
+
+	var next_slot: List[Int] = starts
+	var rows: List[Int] = repeat(0, owners.length())
+	var row: Int = 0
+
+	for owner in owners:
+		slot: Int = next_slot.get_or(owner, 0)
+		rows = rows.set(slot, row)
+		next_slot = next_slot.set(owner, slot + 1)
+		row += 1
+
+	{
+		starts = starts,
+		rows = rows
+	}
+
+
+---
+The row position of each key's row in a table whose row `i` has key `keys[i]`;
+`ABSENT_ROW` for a key with none. A key with several rows takes the last.
+---
+private pure func row_by_key(key_count: Int, keys: List[Int]) -> List[Int]:
+	var rows: List[Int] = repeat(ABSENT_ROW, key_count)
+	var row: Int = 0
+
+	for key in keys:
+		rows = rows.set(key, row)
+		row += 1
+
+	rows
+
+
+---
+The row positions of `owner`'s rows in the indexed `table`.
+---
+private pure func rows_of(
+	index: OwnerRows,
+	owner: Int,
+	table: DiscoveryTable,
+) -> Result[List[Int], LegacyAdapterError]:
+	first ?= present(
+		index.starts.get(owner),
+		table,
+		owner,
+	)
+	end ?= present(
+		index.starts.get(owner + 1),
+		table,
+		owner + 1,
+	)
+	slots: List[Result[Int, LegacyAdapterError]] = range(first, end).map(pure func(slot): present(
+			index.rows.get(slot),
+			table,
+			slot,
+		))
+	collected(slots)
+
+
+---
+The row of `table` that `rows` records for `key`, or `None` when the key has
+none; an error when the key is outside the index.
+---
+private pure func optional_row(
+	rows: List[Int],
+	key: Int,
+	table: DiscoveryTable,
+) -> Result[Option[Int], LegacyAdapterError]:
+	row ?= present(
+		rows.get(key),
+		table,
+		key,
+	)
+
+	if row == ABSENT_ROW:
+		Ok(None)
+	else:
+		Ok(Some(row))
+
+
+---
+The row of `table` that `rows` records for `key`; an error when it has none.
+---
+private pure func required_row(
+	rows: List[Int],
+	key: Int,
+	table: DiscoveryTable,
+) -> Result[Int, LegacyAdapterError]:
+	found ?= optional_row(rows, key, table)
+	present(found, table, key)
+
+
+private pure func keys_of(
+	count: Int,
+	key_at: pure (Int) -> Int,
+) -> List[Int]:
+	range(0, count).map(key_at)
+
+
+-- Module names.
+---
+The existing front end's name for each module, in module order: see
+`LegacyModuleNaming`.
+---
+private pure func legacy_module_names(
+	tables: Tables.FrontendTables,
+	naming: LegacyModuleNaming,
+) -> Result[List[String], LegacyAdapterError]:
+	modules: Int = Tables.module_count(tables)
+	root_requests: List[Int] = first_requests(
+		modules,
+		range(
+			0,
+			Tables.root_count(tables),
+		).map(pure func(root): root_target_index(tables, root)),
+	)
+	implicit_requests: List[Int] = first_requests(
+		modules,
+		range(
+			0,
+			Tables.implicit_request_count(tables),
+		).map(pure func(request): implicit_target_index(tables, request)),
+	)
+	import_requests: List[Int] = first_requests(
+		modules,
+		range(
+			0,
+			Tables.import_count(tables),
+		).map(pure func(import_row): import_target_index(tables, import_row)),
+	)
+
+	collected(range(0, modules).map(
+		pure func(
+			module,
+		): legacy_module_name(
+			tables,
+			naming,
+			module,
+			root_requests,
+			implicit_requests,
+			import_requests,
+		),
+	))
+
+
+---
+For each module, the first request (by request position) that loaded it, from
+`targets[request]`, the module a request loaded or `ABSENT_ROW`.
+
+"First by position" is "first loaded" only because of an order the stage
+guarantees: the import rows are appended module by module in load order and, in
+a module, in source order (`ModuleRangesOverlap` checks that each module's
+import block starts at or after the previous one's end), and discovery resolves
+imports in that same order, so the first import row naming a module as its
+target is the one that loaded it. The existing front end names a module by the
+request that loaded it.
+---
+private pure func first_requests(module_count: Int, targets: List[Int]) -> List[Int]:
+	var first: List[Int] = repeat(ABSENT_ROW, module_count)
+	var request: Int = 0
+
+	for target in targets:
+		if target != ABSENT_ROW and first.get_or(target, 0) == ABSENT_ROW:
+			first = first.set(target, request)
+
+		request += 1
+
+	first
+
+
+private pure func root_target_index(tables: Tables.FrontendTables, root: Int) -> Int:
+	match Tables.root_target(tables, root_id_at_row(root)):
+		Some(target):
+			module_id_index(target)
+		None:
+			ABSENT_ROW
+
+
+private pure func implicit_target_index(tables: Tables.FrontendTables, request: Int) -> Int:
+	match Tables.implicit_target(tables, implicit_request_id_at_row(request)):
+		Some(target):
+			module_id_index(target)
+		None:
+			ABSENT_ROW
+
+
+private pure func import_target_index(tables: Tables.FrontendTables, import_row: Int) -> Int:
+	match Tables.import_target(tables, import_id_at_row(import_row)):
+		Some(target):
+			module_id_index(target)
+		None:
+			ABSENT_ROW
+
+
+private pure func legacy_module_name(
+	tables: Tables.FrontendTables,
+	naming: LegacyModuleNaming,
+	module: Int,
+	root_requests: List[Int],
+	implicit_requests: List[Int],
+	import_requests: List[Int],
+) -> Result[String, LegacyAdapterError]:
+	row: ModuleRow = Tables.module_row(tables, module_id_at_row(module))
+
+	match row.reach:
+		Kinds.RootModule:
+			root ?= requested(root_requests, module)
+			request_path: String = Tables.path_text(
+				tables,
+				Tables.root_row(tables, root_id_at_row(root)).request_path,
+			)
+			Ok(naming.root_module_name(request_path))
+		Kinds.ImplicitModule:
+			request ?= requested(implicit_requests, module)
+			Ok(
+				Tables.path_text(
+					tables,
+					Tables.implicit_request_row(
+						tables,
+						implicit_request_id_at_row(request),
+					).request_path,
+				),
+			)
+		Kinds.ImportedModule:
+			import_row ?= requested(import_requests, module)
+			imported ?= present(
+				Tables.import_row_at(tables, import_row),
+				ImportTable,
+				import_row,
+			)
+			Ok(imported_module_name(tables, row, imported))
+
+
+---
+The request that loaded `module`, or `ModuleWithoutRequest`.
+---
+private pure func requested(requests: List[Int], module: Int) -> Result[Int, LegacyAdapterError]:
+	match requests.get(module):
+		Some(request):
+			if request == ABSENT_ROW:
+				Err(ModuleWithoutRequest(module))
+			else:
+				Ok(request)
+		None:
+			Err(ModuleWithoutRequest(module))
+
+
+---
+The name of a module an import loaded: the request's text, except for a
+relative request or a user module, which the existing front end names by the
+file's path.
+---
+private pure func imported_module_name(
+	tables: Tables.FrontendTables,
+	module: ModuleRow,
+	request: ImportRow,
+) -> String:
+	path_name: String = Tables
+		.path_text(tables, module.canonical_path)
+		.remove_suffix(SOURCE_FILE_EXTENSION)
+
+	match request.request_kind:
+		Kinds.RelativeModuleRequest:
+			path_name
+		_:
+			match module.origin:
+				Kinds.UserModule:
+					path_name
+				_:
+					Tables.path_text(tables, request.request_path)
+
+
+---
+A source file's path in the existing front end's spelling: the stage's path, or
+for an embedded module `<embedded:name>`.
+---
+private pure func legacy_source_path(path: String) -> String:
+	match embedded_module_name(path):
+		Some(module_name):
+			legacy_embedded_path(module_name)
+		None:
+			path
+
+
+---
+The reader over `tables`: its indexes, built in one pass over each table.
+---
+pure func legacy_declaration_reader(
+	tables: Tables.FrontendTables,
+	naming: LegacyModuleNaming,
+) -> Result[DeclarationReader, LegacyAdapterError]:
+	definitions: Int = Tables.definition_count(tables)
+	modules: Int = Tables.module_count(tables)
+	parameters: Int = Tables.parameter_count(tables)
+	foreign_blocks: Int = Tables.foreign_block_count(tables)
+	module_names ?= legacy_module_names(tables, naming)
+
+	Ok({
+		tables = tables,
+		module_names = module_names,
+		members = group_by_owner(
+			definitions,
+			keys_of(Tables.member_count(tables), pure func(row): member_owner(tables, row)),
+		),
+		annotations = group_by_owner(
+			definitions,
+			keys_of(Tables.annotation_count(tables), pure func(row): annotation_owner(tables, row)),
+		),
+		type_parameters = group_by_owner(
+			definitions,
+			keys_of(
+				Tables.type_parameter_count(tables),
+				pure func(row): type_parameter_owner(tables, row),
+			),
+		),
+		bounds = group_by_owner(
+			definitions,
+			keys_of(Tables.bound_count(tables), pure func(row): bound_owner(tables, row)),
+		),
+		supertraits = group_by_owner(
+			definitions,
+			keys_of(Tables.supertrait_count(tables), pure func(row): supertrait_owner(tables, row)),
+		),
+		variant_payloads = group_by_owner(
+			definitions,
+			keys_of(
+				Tables.variant_payload_count(tables),
+				pure func(row): variant_payload_owner(tables, row),
+			),
+		),
+		dimension_constraints = group_by_owner(
+			definitions,
+			keys_of(
+				Tables.dimension_constraint_count(tables),
+				pure func(row): dimension_constraint_owner(tables, row),
+			),
+		),
+		import_blocks = group_by_owner(
+			modules,
+			keys_of(
+				Tables.import_block_count(tables),
+				pure func(row): import_block_owner(tables, row),
+			),
+		),
+		foreign_blocks = group_by_owner(
+			modules,
+			keys_of(
+				Tables.foreign_block_count(tables),
+				pure func(row): foreign_block_owner(tables, row),
+			),
+		),
+		foreign_block_functions = group_by_owner(
+			foreign_blocks,
+			keys_of(
+				Tables.foreign_binding_count(tables),
+				pure func(row): foreign_binding_block(tables, row),
+			),
+		),
+		documentation_of = row_by_key(
+			definitions,
+			keys_of(
+				Tables.documentation_count(tables),
+				pure func(row): documentation_definition(tables, row),
+			),
+		),
+		signature_of = row_by_key(
+			definitions,
+			keys_of(
+				Tables.signature_count(tables),
+				pure func(row): signature_definition(tables, row),
+			),
+		),
+		definition_type_of = row_by_key(
+			definitions,
+			keys_of(
+				Tables.definition_type_count(tables),
+				pure func(row): definition_type_definition(tables, row),
+			),
+		),
+		parameter_type_of = row_by_key(
+			parameters,
+			keys_of(
+				Tables.parameter_type_count(tables),
+				pure func(row): parameter_type_parameter(tables, row),
+			),
+		),
+		body_of = row_by_key(
+			definitions,
+			keys_of(Tables.body_count(tables), pure func(row): body_definition(tables, row)),
+		),
+		foreign_c_name_of = row_by_key(
+			definitions,
+			keys_of(
+				Tables.foreign_c_name_count(tables),
+				pure func(row): foreign_c_name_definition(tables, row),
+			),
+		),
+		resource_cleanup_of = row_by_key(
+			definitions,
+			keys_of(
+				Tables.resource_cleanup_count(tables),
+				pure func(row): resource_cleanup_definition(tables, row),
+			),
+		),
+		foreign_binding_of = row_by_key(
+			definitions,
+			keys_of(
+				Tables.foreign_binding_count(tables),
+				pure func(row): foreign_binding_definition(tables, row),
+			),
+		),
+		module_documentation_of = row_by_key(
+			modules,
+			keys_of(
+				Tables.module_documentation_count(tables),
+				pure func(row): module_documentation_module(tables, row),
+			),
+		),
+		sigil_name_of = row_by_key(
+			Tables.name_count(tables),
+			keys_of(
+				Tables.dimension_name_count(tables),
+				pure func(row): dimension_plain_name(tables, row),
+			),
+		),
+	})
+
+
+-- The key each table's row `row` is indexed under. `row` is below the table's
+-- count, so the row exists; the key 0 for one that does not is unreachable.
+private pure func member_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.member_row_at(tables, row):
+		Some(member):
+			definition_id_index(member.owner)
+		None:
+			0
+
+
+private pure func annotation_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.annotation_row_at(tables, row):
+		Some(annotation):
+			definition_id_index(annotation.definition)
+		None:
+			0
+
+
+private pure func type_parameter_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.type_parameter_row_at(tables, row):
+		Some(parameter):
+			definition_id_index(parameter.owner)
+		None:
+			0
+
+
+private pure func bound_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.bound_row_at(tables, row):
+		Some(bound):
+			definition_id_index(bound.owner)
+		None:
+			0
+
+
+private pure func supertrait_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.supertrait_row_at(tables, row):
+		Some(supertrait):
+			definition_id_index(supertrait.trait_definition)
+		None:
+			0
+
+
+private pure func variant_payload_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.variant_payload_row_at(tables, row):
+		Some(payload):
+			definition_id_index(payload.variant)
+		None:
+			0
+
+
+private pure func dimension_constraint_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.dimension_constraint_row_at(tables, row):
+		Some(constraint):
+			definition_id_index(constraint.owner)
+		None:
+			0
+
+
+private pure func import_block_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.import_block_row_at(tables, row):
+		Some(block):
+			module_id_index(block.module)
+		None:
+			0
+
+
+private pure func foreign_block_owner(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.foreign_block_row_at(tables, row):
+		Some(block):
+			module_id_index(block.module)
+		None:
+			0
+
+
+private pure func foreign_binding_block(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.foreign_binding_row_at(tables, row):
+		Some(binding):
+			foreign_block_id_index(binding.block)
+		None:
+			0
+
+
+private pure func documentation_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.documentation_row_at(tables, row):
+		Some(documentation):
+			definition_id_index(documentation.definition)
+		None:
+			0
+
+
+private pure func signature_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.signature_row_at(tables, row):
+		Some(signature):
+			definition_id_index(signature.definition)
+		None:
+			0
+
+
+private pure func definition_type_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.definition_type_row_at(tables, row):
+		Some(declared):
+			definition_id_index(declared.definition)
+		None:
+			0
+
+
+private pure func parameter_type_parameter(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.parameter_type_row_at(tables, row):
+		Some(declared):
+			parameter_id_index(declared.parameter)
+		None:
+			0
+
+
+private pure func body_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.body_row_at(tables, row):
+		Some(body):
+			definition_id_index(body.definition)
+		None:
+			0
+
+
+private pure func foreign_c_name_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.foreign_c_name_row_at(tables, row):
+		Some(c_name):
+			definition_id_index(c_name.definition)
+		None:
+			0
+
+
+private pure func resource_cleanup_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.resource_cleanup_row_at(tables, row):
+		Some(cleanup):
+			definition_id_index(cleanup.definition)
+		None:
+			0
+
+
+private pure func foreign_binding_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.foreign_binding_row_at(tables, row):
+		Some(binding):
+			definition_id_index(binding.definition)
+		None:
+			0
+
+
+private pure func module_documentation_module(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.module_documentation_row_at(tables, row):
+		Some(documentation):
+			module_id_index(documentation.module)
+		None:
+			0
+
+
+private pure func dimension_plain_name(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.dimension_name_row_at(tables, row):
+		Some(pair):
+			table_name_index(pair.name)
+		None:
+			0
+
+
+-- Names, locations and text.
+private pure func legacy_location(span: Span) -> SourceLocation:
+	source_location_from_offsets(singleton_source_file_id(), span_start(span), span_end(span))
+
+
+---
+An identifier of the existing parsed AST: the stage's name id and spelling, so
+the two agree by construction.
+---
+private pure func legacy_identifier(
+	reader: DeclarationReader,
+	name: TableNameId,
+	span: Span,
+) -> ParsedIdentifier:
+	parsed_identifier(
+		name_id_from_interned_index(table_name_index(name)),
+		Tables.name_spelling(reader.tables, name),
+		legacy_location(span),
+	)
+
+
+private pure func literal_string(reader: DeclarationReader, literal: LiteralId) -> String:
+	Tables.literal_text(reader.tables, literal)
+
+
+---
+A dimension name as the existing AST spells it: with its `#`, the name the
+dimension name rows pair with the plain one.
+---
+private pure func legacy_dimension_identifier(
+	reader: DeclarationReader,
+	name: TableNameId,
+	span: Span,
+) -> Result[ParsedIdentifier, LegacyAdapterError]:
+	key: Int = table_name_index(name)
+	row ?= required_row(reader.sigil_name_of, key, DimensionNameTable)
+	pair ?= present(
+		Tables.dimension_name_row_at(reader.tables, row),
+		DimensionNameTable,
+		row,
+	)
+	Ok(legacy_identifier(reader, pair.sigil_name, span))
+
+
+private pure func legacy_wildcard_dimension_identifier(
+	reader: DeclarationReader,
+	span: Span,
+) -> ParsedIdentifier:
+	legacy_identifier(reader, Tables.wildcard_dimension_name(), span)
+
+
+-- Rows by id.
+private pure func definition_at(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[DefinitionRow, LegacyAdapterError]:
+	present(
+		Tables.definition_row_at(reader.tables, definition),
+		DefinitionTable,
+		definition,
+	)
+
+
+private pure func node_at(
+	reader: DeclarationReader,
+	node: NodeId,
+) -> Result[NodeRow, LegacyAdapterError]:
+	index: Int = node_id_index(node)
+	present(
+		Tables.node_row_at(reader.tables, index),
+		NodeTable,
+		index,
+	)
+
+
+---
+Child `ordinal` of `node`.
+---
+private pure func child_node(
+	reader: DeclarationReader,
+	node: NodeId,
+	ordinal: Int,
+) -> Result[NodeId, LegacyAdapterError]:
+	present(
+		Tables.node_child(reader.tables, node, ordinal),
+		NodeChildTable,
+		node_id_index(node),
+	)
+
+
+-- Types.
+---
+The written type rooted at `node`. `MissingTypeNode` is what the parser records
+where a type was required and absent (a diagnostic reports it); any other kind
+that is not a written type is an error.
+---
+private pure func legacy_type(
+	reader: DeclarationReader,
+	node: NodeId,
+) -> Result[ParsedTypeExpr, LegacyAdapterError]:
+	row ?= node_at(reader, node)
+	location: SourceLocation = legacy_location(row.span)
+	name: TableNameId = name_id_at_row(row.payload)
+	name_span: Span = Tables.node_name_span(reader.tables, node)
+
+	match row.kind:
+		Kinds.NamedTypeNode:
+			arguments ?= legacy_children(reader, node, 0)
+			Ok(ParsedNamedType(legacy_identifier(reader, name, name_span), arguments, location))
+		Kinds.QualifiedTypeNode:
+			qualifier_node ?= child_node(reader, node, 0)
+			qualifier ?= node_at(reader, qualifier_node)
+			arguments ?= legacy_children(reader, node, 1)
+			Ok(
+				ParsedQualifiedNamedType(
+					legacy_identifier(reader, name_id_at_row(qualifier.payload), qualifier.span),
+					legacy_identifier(reader, name, name_span),
+					arguments,
+					location,
+				),
+			)
+		Kinds.BoundedTypeNode:
+			bounds ?= collected(range(0, row.children.count).map(
+				pure func(ordinal): legacy_inline_bound(reader, node, ordinal),
+			))
+			Ok(ParsedBoundedType(legacy_identifier(reader, name, name_span), bounds, location))
+		Kinds.DimensionNameTypeNode:
+			identifier ?= legacy_dimension_identifier(reader, name, row.span)
+			Ok(ParsedDimNameType(identifier, False, location))
+		Kinds.VariadicDimensionNameTypeNode:
+			identifier ?= legacy_dimension_identifier(reader, name, name_span)
+			Ok(ParsedDimNameType(identifier, True, location))
+		Kinds.DimensionWildcardTypeNode:
+			Ok(
+				ParsedDimNameType(
+					legacy_wildcard_dimension_identifier(reader, row.span),
+					False,
+					location,
+				),
+			)
+		Kinds.VariadicDimensionWildcardTypeNode:
+			Ok(
+				ParsedDimNameType(
+					legacy_wildcard_dimension_identifier(reader, name_span),
+					True,
+					location,
+				),
+			)
+		Kinds.DimensionLiteralTypeNode:
+			Ok(
+				ParsedDimLiteralType(
+					literal_string(reader, literal_id_at_row(row.payload)),
+					location,
+				),
+			)
+		Kinds.DimensionAddTypeNode:
+			legacy_dimension_binary(reader, ParsedDimAddOp, node)
+		Kinds.DimensionSubtractTypeNode:
+			legacy_dimension_binary(reader, ParsedDimSubtractOp, node)
+		Kinds.DimensionMultiplyTypeNode:
+			legacy_dimension_binary(reader, ParsedDimMultiplyOp, node)
+		Kinds.DimensionDivideTypeNode:
+			legacy_dimension_binary(reader, ParsedDimDivideOp, node)
+		Kinds.RangeTypeNode:
+			element ?= legacy_child_type(reader, node, 0)
+			Ok(ParsedRangeType(element, location))
+		Kinds.TupleTypeNode:
+			elements ?= legacy_children(reader, node, 0)
+			Ok(ParsedTupleType(elements, location))
+		Kinds.FunctionTypeNode:
+			legacy_function_type(reader, False, node)
+		Kinds.PureFunctionTypeNode:
+			legacy_function_type(reader, True, node)
+		Kinds.ArrayTypeNode:
+			element ?= legacy_child_type(reader, node, 0)
+			dimensions ?= legacy_children(reader, node, 1)
+			Ok(ParsedArrayType(element, dimensions, location))
+		Kinds.MissingTypeNode:
+			Ok(ParsedMissingType(location))
+		_:
+			Err(NotAWrittenType(node_id_index(node)))
+
+
+private pure func legacy_child_type(
+	reader: DeclarationReader,
+	node: NodeId,
+	ordinal: Int,
+) -> Result[ParsedTypeExpr, LegacyAdapterError]:
+	child ?= child_node(reader, node, ordinal)
+	legacy_type(reader, child)
+
+
+---
+The types of the children of `node` from `first_ordinal` on.
+---
+private pure func legacy_children(
+	reader: DeclarationReader,
+	node: NodeId,
+	first_ordinal: Int,
+) -> Result[List[ParsedTypeExpr], LegacyAdapterError]:
+	row ?= node_at(reader, node)
+	collected(range(first_ordinal, row.children.count).map(
+		pure func(ordinal): legacy_child_type(reader, node, ordinal),
+	))
+
+
+private pure func legacy_dimension_binary(
+	reader: DeclarationReader,
+	operator: ParsedDimBinaryOp,
+	node: NodeId,
+) -> Result[ParsedTypeExpr, LegacyAdapterError]:
+	row ?= node_at(reader, node)
+	left ?= legacy_child_type(reader, node, 0)
+	right ?= legacy_child_type(reader, node, 1)
+	Ok(ParsedDimBinaryType(operator, left, right, legacy_location(row.span)))
+
+
+private pure func legacy_function_type(
+	reader: DeclarationReader,
+	is_pure: Bool,
+	node: NodeId,
+) -> Result[ParsedTypeExpr, LegacyAdapterError]:
+	row ?= node_at(reader, node)
+	parameter_count: Int = row.children.count - 1
+	parameters ?= collected(range(0, parameter_count).map(
+		pure func(ordinal): legacy_child_type(reader, node, ordinal),
+	))
+	return_type ?= legacy_child_type(reader, node, parameter_count)
+	Ok(ParsedFunctionType(is_pure, parameters, return_type, legacy_location(row.span)))
+
+
+---
+Bound `ordinal` of a bounded type: a `TypeBoundNode`, or a `QualifiedTypeBoundNode`
+over its qualifier.
+---
+private pure func legacy_inline_bound(
+	reader: DeclarationReader,
+	bounded: NodeId,
+	ordinal: Int,
+) -> Result[ParsedTraitReference, LegacyAdapterError]:
+	node ?= child_node(reader, bounded, ordinal)
+	row ?= node_at(reader, node)
+	trait_name: TableNameId = name_id_at_row(row.payload)
+
+	match row.kind:
+		Kinds.QualifiedTypeBoundNode:
+			qualifier_node ?= child_node(reader, node, 0)
+			qualifier ?= node_at(reader, qualifier_node)
+			Ok({
+				qualifier = Some(
+					legacy_identifier(
+						reader,
+						name_id_at_row(qualifier.payload),
+						qualifier.span,
+					),
+				),
+				name = legacy_identifier(
+					reader,
+					trait_name,
+					Tables.node_name_span(reader.tables, node),
+				),
+				span = legacy_location(row.span),
+			})
+		Kinds.TypeBoundNode:
+			Ok({
+				qualifier = None,
+				name = legacy_identifier(reader, trait_name, row.span),
+				span = legacy_location(row.span),
+			})
+		_:
+			Err(NotAWrittenType(node_id_index(node)))
+
+
+-- Type parameters, bounds and parameters.
+private pure func legacy_trait_reference(
+	reader: DeclarationReader,
+	name: TableNameId,
+	name_span: Span,
+	qualifier: Option[(TableNameId, Span)],
+	span: Span,
+) -> ParsedTraitReference:
+	{
+		qualifier = qualifier.map(
+			pure func(written): legacy_identifier(reader, written[0], written[1]),
+		),
+		name = legacy_identifier(reader, name, name_span),
+		span = legacy_location(span)
+	}
+
+
+private pure func legacy_bound(
+	reader: DeclarationReader,
+	bound_row: Int,
+) -> Result[ParsedTraitReference, LegacyAdapterError]:
+	bound ?= present(
+		Tables.bound_row_at(reader.tables, bound_row),
+		BoundTable,
+		bound_row,
+	)
+
+	qualifier: Option[(TableNameId, Span)] = match Tables.bound_qualifier(
+		reader.tables,
+		bound_id_at_row(bound_row),
+	):
+		Some(written):
+			Some((written.qualifier, written.span))
+		None:
+			None
+
+	Ok(legacy_trait_reference(reader, bound.trait_name, bound.name_span, qualifier, bound.span))
+
+
+private pure func legacy_supertrait(
+	reader: DeclarationReader,
+	supertrait_row: Int,
+) -> Result[ParsedTraitReference, LegacyAdapterError]:
+	supertrait ?= present(
+		Tables.supertrait_row_at(reader.tables, supertrait_row),
+		SupertraitTable,
+		supertrait_row,
+	)
+
+	qualifier: Option[(TableNameId, Span)] = match Tables.supertrait_qualifier(
+		reader.tables,
+		supertrait_id_at_row(supertrait_row),
+	):
+		Some(written):
+			Some((written.qualifier, written.span))
+		None:
+			None
+
+	Ok(
+		legacy_trait_reference(
+			reader,
+			supertrait.name,
+			supertrait.name_span,
+			qualifier,
+			supertrait.span,
+		),
+	)
+
+
+private pure func legacy_type_parameters(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[List[ParsedTypeParamDecl], LegacyAdapterError]:
+	rows ?= rows_of(reader.type_parameters, definition, TypeParameterTable)
+	bound_rows ?= rows_of(reader.bounds, definition, BoundTable)
+	collected(rows.map(
+		pure func(row): legacy_type_parameter(reader, bound_rows, row),
+	))
+
+
+private pure func legacy_type_parameter(
+	reader: DeclarationReader,
+	bound_rows: List[Int],
+	row: Int,
+) -> Result[ParsedTypeParamDecl, LegacyAdapterError]:
+	parameter ?= present(
+		Tables.type_parameter_row_at(reader.tables, row),
+		TypeParameterTable,
+		row,
+	)
+	name ?= legacy_type_parameter_name(reader, parameter.name, parameter.kind, parameter.name_span)
+	bounds ?= collected(bound_rows.filter(
+		pure func(bound_row): bound_is_on_parameter(reader, bound_row, parameter.ordinal),
+	).map(
+		pure func(bound_row): legacy_bound(reader, bound_row),
+	))
+
+	kind: ParsedTypeParamKind = match parameter.kind:
+		Kinds.TypeParameter:
+			ParsedTypeParameter
+		_:
+			ParsedDimensionParameter
+
+	Ok({
+		name = name,
+		kind = kind,
+		bounds = bounds,
+		span = legacy_location(parameter.span),
+	})
+
+
+private pure func legacy_type_parameter_name(
+	reader: DeclarationReader,
+	name: TableNameId,
+	kind: Kinds.TypeParameterKind,
+	span: Span,
+) -> Result[ParsedIdentifier, LegacyAdapterError]:
+	match kind:
+		Kinds.TypeParameter:
+			Ok(legacy_identifier(reader, name, span))
+		Kinds.DimensionParameter:
+			legacy_dimension_identifier(reader, name, span)
+		Kinds.WildcardDimensionParameter:
+			Ok(legacy_wildcard_dimension_identifier(reader, span))
+
+
+private pure func bound_is_on_parameter(
+	reader: DeclarationReader,
+	bound_row: Int,
+	ordinal: Int,
+) -> Bool:
+	match Tables.bound_row_at(reader.tables, bound_row):
+		Some(bound):
+			bound.parameter_ordinal == ordinal
+		None:
+			False
+
+
+private pure func legacy_params(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[List[ParsedParam], LegacyAdapterError]:
+	signature ?= signature_of_definition(reader, definition)
+	collected(range(
+		signature.parameters.first,
+		signature.parameters.first + signature.parameters.count,
+	).map(
+		pure func(parameter_row): legacy_param(reader, parameter_row),
+	))
+
+
+private pure func legacy_param(
+	reader: DeclarationReader,
+	parameter_row: Int,
+) -> Result[ParsedParam, LegacyAdapterError]:
+	parameter ?= present(
+		Tables.parameter_row_at(reader.tables, parameter_row),
+		ParameterTable,
+		parameter_row,
+	)
+	names ?= collected(range(
+		parameter.binder_names.first,
+		parameter.binder_names.first + parameter.binder_names.count,
+	).map(
+		pure func(name_row): legacy_binder_name(reader, name_row),
+	))
+	binder ?= legacy_binder(parameter.binder, names, parameter_row, parameter.binder_span)
+	type_row ?= optional_row(reader.parameter_type_of, parameter_row, ParameterTypeTable)
+	type_expr ?= legacy_parameter_type(reader, type_row)
+
+	Ok({
+		binder = binder,
+		type_expr = type_expr,
+		span = legacy_location(parameter.span),
+	})
+
+
+private pure func legacy_binder(
+	binder: Kinds.ParameterBinder,
+	names: List[ParsedIdentifier],
+	parameter_row: Int,
+	binder_span: Span,
+) -> Result[ParsedParamBinder, LegacyAdapterError]:
+	match binder:
+		Kinds.NamedParameterBinder:
+			name ?= present(
+				names.get(0),
+				BinderNameTable,
+				parameter_row,
+			)
+			Ok(ParsedParamNameBinder(name))
+		Kinds.WildcardParameterBinder:
+			Ok(ParsedParamWildcardBinder(legacy_location(binder_span)))
+		Kinds.TupleParameterBinder:
+			Ok(ParsedParamTupleBinder(names, legacy_location(binder_span)))
+
+
+private pure func legacy_parameter_type(
+	reader: DeclarationReader,
+	type_row: Option[Int],
+) -> Result[Option[ParsedTypeExpr], LegacyAdapterError]:
+	match type_row:
+		Some(row):
+			declared ?= present(
+				Tables.parameter_type_row_at(reader.tables, row),
+				ParameterTypeTable,
+				row,
+			)
+			written ?= legacy_type(reader, declared.type_root)
+			Ok(Some(written))
+		None:
+			Ok(None)
+
+
+private pure func legacy_binder_name(
+	reader: DeclarationReader,
+	name_row: Int,
+) -> Result[ParsedIdentifier, LegacyAdapterError]:
+	binder ?= present(
+		Tables.binder_name_row_at(reader.tables, name_row),
+		BinderNameTable,
+		name_row,
+	)
+	Ok(legacy_identifier(reader, binder.name, binder.span))
+
+
+---
+The definition's one written type, if it has one.
+---
+private pure func legacy_definition_type(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[Option[ParsedTypeExpr], LegacyAdapterError]:
+	type_row ?= optional_row(reader.definition_type_of, definition, DefinitionTypeTable)
+
+	match type_row:
+		Some(row):
+			declared ?= present(
+				Tables.definition_type_row_at(reader.tables, row),
+				DefinitionTypeTable,
+				row,
+			)
+			written ?= legacy_type(reader, declared.type_root)
+			Ok(Some(written))
+		None:
+			Ok(None)
+
+
+---
+The definition's written type where the language requires one: the parser
+appends a (possibly missing) type node there, so a definition without a row is
+an error.
+---
+private pure func legacy_required_type(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[ParsedTypeExpr, LegacyAdapterError]:
+	declared ?= legacy_definition_type(reader, definition)
+	present(declared, DefinitionTypeTable, definition)
+
+
+private pure func legacy_documentation(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[Option[String], LegacyAdapterError]:
+	documentation_row ?= optional_row(reader.documentation_of, definition, DocumentationTable)
+
+	match documentation_row:
+		Some(row):
+			documentation ?= present(
+				Tables.documentation_row_at(reader.tables, row),
+				DocumentationTable,
+				row,
+			)
+			Ok(Some(literal_string(reader, documentation.text)))
+		None:
+			Ok(None)
+
+
+private pure func legacy_annotations(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[List[ParsedFunctionAnnotation], LegacyAdapterError]:
+	rows ?= rows_of(reader.annotations, definition, AnnotationTable)
+	collected(rows.map(
+		pure func(row): legacy_annotation(reader, row),
+	))
+
+
+private pure func legacy_annotation(
+	reader: DeclarationReader,
+	row: Int,
+) -> Result[ParsedFunctionAnnotation, LegacyAdapterError]:
+	annotation ?= present(
+		Tables.annotation_row_at(reader.tables, row),
+		AnnotationTable,
+		row,
+	)
+
+	match annotation.annotation:
+		Kinds.TailRecursiveAnnotation:
+			Ok(ParsedTailRecursiveAnnotation)
+		Kinds.NoCopyAnnotation:
+			Ok(ParsedNoCopyAnnotation)
+		Kinds.DebugOnlyAnnotation:
+			Ok(ParsedDebugOnlyAnnotation)
+		Kinds.ResourceResultOrdinaryAnnotation:
+			Ok(ParsedResourceResultOrdinaryAnnotation)
+
+
+private pure func signature_of_definition(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[SignatureRow, LegacyAdapterError]:
+	signature_row ?= required_row(reader.signature_of, definition, SignatureTable)
+	present(
+		Tables.signature_row_at(reader.tables, signature_row),
+		SignatureTable,
+		signature_row,
+	)
+
+
+---
+The body of `definition`: the placeholder when it has one.
+---
+private pure func legacy_body(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[Option[ParsedExpr], LegacyAdapterError]:
+	body_row ?= optional_row(reader.body_of, definition, BodyTable)
+
+	match body_row:
+		Some(_):
+			Ok(Some(DECLARATION_ONLY_BODY))
+		None:
+			Ok(None)
+
+
+-- Declarations.
+private pure func legacy_function(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedFunctionDecl, LegacyAdapterError]:
+	signature ?= signature_of_definition(reader, definition)
+	type_params ?= legacy_type_parameters(reader, definition)
+	params ?= legacy_params(reader, definition)
+	return_type ?= legacy_definition_type(reader, definition)
+	constraint_rows ?= rows_of(reader.dimension_constraints, definition, DimensionConstraintTable)
+	dim_constraints ?= collected(constraint_rows.map(
+		pure func(constraint_row): legacy_dimension_constraint(reader, constraint_row),
+	))
+	body ?= legacy_body(reader, definition)
+	annotations ?= legacy_annotations(reader, definition)
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		keyword_span = Some(legacy_location(signature.keyword_span)),
+		type_params = type_params,
+		params = params,
+		return_type = return_type,
+		dim_constraints = dim_constraints,
+		body = body,
+		is_pure = signature.purity == Kinds.PureFunction,
+		annotations = annotations,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_dimension_constraint(
+	reader: DeclarationReader,
+	constraint_row: Int,
+) -> Result[ParsedDimConstraint, LegacyAdapterError]:
+	constraint ?= present(
+		Tables.dimension_constraint_row_at(reader.tables, constraint_row),
+		DimensionConstraintTable,
+		constraint_row,
+	)
+	left ?= legacy_type(reader, constraint.left)
+	right ?= legacy_type(reader, constraint.right)
+	Ok({
+		left = left,
+		right = right,
+		span = legacy_location(constraint.span),
+	})
+
+
+---
+The definitions that are members of `owner`, in written order.
+---
+private pure func legacy_members(
+	reader: DeclarationReader,
+	owner: Int,
+) -> Result[List[Int], LegacyAdapterError]:
+	rows ?= rows_of(reader.members, owner, MemberTable)
+	collected(rows.map(
+		pure func(member_row): member_definition(reader, member_row),
+	))
+
+
+private pure func member_definition(
+	reader: DeclarationReader,
+	member_row: Int,
+) -> Result[Int, LegacyAdapterError]:
+	member ?= present(
+		Tables.member_row_at(reader.tables, member_row),
+		MemberTable,
+		member_row,
+	)
+	Ok(definition_id_index(member.definition))
+
+
+private pure func legacy_record(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedRecordDecl, LegacyAdapterError]:
+	type_params ?= legacy_type_parameters(reader, definition)
+	members ?= legacy_members(reader, definition)
+	fields ?= collected(members.map(
+		pure func(field): legacy_field(reader, field),
+	))
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		type_params = type_params,
+		fields = fields,
+		is_struct = row.kind == Kinds.StructDefinition,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_field(
+	reader: DeclarationReader,
+	field: Int,
+) -> Result[ParsedFieldDecl, LegacyAdapterError]:
+	row ?= definition_at(reader, field)
+	type_expr ?= legacy_required_type(reader, field)
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		type_expr = type_expr,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_union(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedUnionDecl, LegacyAdapterError]:
+	type_params ?= legacy_type_parameters(reader, definition)
+	members ?= legacy_members(reader, definition)
+	variants ?= collected(members.map(
+		pure func(variant): legacy_variant(reader, variant),
+	))
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		type_params = type_params,
+		variants = variants,
+		is_enum = row.kind == Kinds.EnumDefinition,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_variant(
+	reader: DeclarationReader,
+	variant: Int,
+) -> Result[ParsedVariantDecl, LegacyAdapterError]:
+	row ?= definition_at(reader, variant)
+	payload_rows ?= rows_of(reader.variant_payloads, variant, VariantPayloadTable)
+	fields ?= collected(payload_rows.map(
+		pure func(payload_row): legacy_variant_payload(reader, payload_row),
+	))
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		fields = fields,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_variant_payload(
+	reader: DeclarationReader,
+	payload_row: Int,
+) -> Result[ParsedTypeExpr, LegacyAdapterError]:
+	payload ?= present(
+		Tables.variant_payload_row_at(reader.tables, payload_row),
+		VariantPayloadTable,
+		payload_row,
+	)
+	legacy_type(reader, payload.type_root)
+
+
+private pure func legacy_builtin_type(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedBuiltinTypeDecl, LegacyAdapterError]:
+	type_params ?= legacy_type_parameters(reader, definition)
+	cleanup ?= legacy_resource_cleanup(reader, definition)
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		type_params = type_params,
+		is_resource = row.kind == Kinds.ResourceTypeDefinition,
+		cleanup = cleanup,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_resource_cleanup(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[Option[ParsedResourceCleanup], LegacyAdapterError]:
+	cleanup_row ?= optional_row(reader.resource_cleanup_of, definition, ResourceCleanupTable)
+
+	match cleanup_row:
+		Some(row):
+			cleanup ?= present(
+				Tables.resource_cleanup_row_at(reader.tables, row),
+				ResourceCleanupTable,
+				row,
+			)
+			Ok(Some({
+				builtin_name = literal_string(reader, cleanup.builtin_name),
+				span = legacy_location(cleanup.span),
+			}))
+		None:
+			Ok(None)
+
+
+private pure func legacy_type_alias(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedTypeAliasDecl, LegacyAdapterError]:
+	type_params ?= legacy_type_parameters(reader, definition)
+	target ?= legacy_required_type(reader, definition)
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		type_params = type_params,
+		target = target,
+		is_opaque = row.kind == Kinds.OpaqueTypeDefinition,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_trait(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedTraitDecl, LegacyAdapterError]:
+	type_params ?= legacy_type_parameters(reader, definition)
+	supertrait_rows ?= rows_of(reader.supertraits, definition, SupertraitTable)
+	supertraits ?= collected(supertrait_rows.map(
+		pure func(supertrait_row): legacy_supertrait(reader, supertrait_row),
+	))
+	members ?= legacy_members(reader, definition)
+	methods ?= collected(members.map(
+		pure func(method): legacy_trait_method(reader, method),
+	))
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		type_params = type_params,
+		supertraits = supertraits,
+		methods = methods,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_trait_method(
+	reader: DeclarationReader,
+	method: Int,
+) -> Result[ParsedTraitMethodDecl, LegacyAdapterError]:
+	row ?= definition_at(reader, method)
+	signature ?= signature_of_definition(reader, method)
+	params ?= legacy_params(reader, method)
+	return_type ?= legacy_definition_type(reader, method)
+	body ?= legacy_body(reader, method)
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		params = params,
+		return_type = return_type,
+		body = body,
+		is_pure = signature.purity == Kinds.PureFunction,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_impl(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedImplDecl, LegacyAdapterError]:
+	for_type ?= legacy_required_type(reader, definition)
+	members ?= legacy_members(reader, definition)
+	methods ?= collected(members.map(
+		pure func(method): legacy_impl_method(reader, method),
+	))
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		trait_name = legacy_identifier(reader, row.name, row.name_span),
+		for_type = for_type,
+		methods = methods,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_impl_method(
+	reader: DeclarationReader,
+	method: Int,
+) -> Result[ParsedFunctionDecl, LegacyAdapterError]:
+	row ?= definition_at(reader, method)
+	legacy_function(reader, method, row)
+
+
+private pure func legacy_global(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[ParsedVarDecl, LegacyAdapterError]:
+	type_expr ?= legacy_definition_type(reader, definition)
+	doc ?= legacy_documentation(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		type_expr = type_expr,
+		value = DECLARATION_ONLY_BODY,
+		is_mutable = row.kind == Kinds.MutableGlobalDefinition,
+		doc = doc,
+		span = legacy_location(row.span),
+	})
+
+
+---
+The top-level declaration `definition` is, or `None` for a definition that is
+not one: a member (rebuilt through its owner), a foreign function (through its
+block) or a local function (part of a body).
+---
+private pure func legacy_declaration(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[Option[ParsedDecl], LegacyAdapterError]:
+	row ?= definition_at(reader, definition)
+	inner ?= legacy_unwrapped_declaration(reader, definition, row)
+
+	match (inner, row.visibility):
+		(Some(declaration), Kinds.PrivateVisibility):
+			Ok(Some(PrivateParsedDecl(declaration, legacy_location(row.span))))
+		_:
+			Ok(inner)
+
+
+---
+The declaration `definition` is, without the `private` wrapper.
+---
+private pure func legacy_unwrapped_declaration(
+	reader: DeclarationReader,
+	definition: Int,
+	row: DefinitionRow,
+) -> Result[Option[ParsedDecl], LegacyAdapterError]:
+	match row.kind:
+		Kinds.FunctionDefinition:
+			function_decl ?= legacy_function(reader, definition, row)
+			Ok(Some(FunctionParsedDecl(function_decl)))
+		Kinds.ConstantDefinition:
+			global ?= legacy_global(reader, definition, row)
+			Ok(Some(VarParsedDecl(global)))
+		Kinds.MutableGlobalDefinition:
+			global ?= legacy_global(reader, definition, row)
+			Ok(Some(VarParsedDecl(global)))
+		Kinds.RecordDefinition:
+			record_decl ?= legacy_record(reader, definition, row)
+			Ok(Some(RecordParsedDecl(record_decl)))
+		Kinds.StructDefinition:
+			record_decl ?= legacy_record(reader, definition, row)
+			Ok(Some(RecordParsedDecl(record_decl)))
+		Kinds.UnionDefinition:
+			union_decl ?= legacy_union(reader, definition, row)
+			Ok(Some(UnionParsedDecl(union_decl)))
+		Kinds.EnumDefinition:
+			union_decl ?= legacy_union(reader, definition, row)
+			Ok(Some(UnionParsedDecl(union_decl)))
+		Kinds.BuiltinTypeDefinition:
+			builtin_decl ?= legacy_builtin_type(reader, definition, row)
+			Ok(Some(BuiltinTypeParsedDecl(builtin_decl)))
+		Kinds.ResourceTypeDefinition:
+			builtin_decl ?= legacy_builtin_type(reader, definition, row)
+			Ok(Some(BuiltinTypeParsedDecl(builtin_decl)))
+		Kinds.TypeAliasDefinition:
+			alias_decl ?= legacy_type_alias(reader, definition, row)
+			Ok(Some(TypeAliasParsedDecl(alias_decl)))
+		Kinds.OpaqueTypeDefinition:
+			alias_decl ?= legacy_type_alias(reader, definition, row)
+			Ok(Some(TypeAliasParsedDecl(alias_decl)))
+		Kinds.TraitDefinition:
+			trait_decl ?= legacy_trait(reader, definition, row)
+			Ok(Some(TraitParsedDecl(trait_decl)))
+		Kinds.ImplDefinition:
+			impl_decl ?= legacy_impl(reader, definition, row)
+			Ok(Some(ImplParsedDecl(impl_decl)))
+		Kinds.ForeignFunctionDefinition:
+			Ok(None)
+		Kinds.FieldDefinition:
+			Ok(None)
+		Kinds.VariantDefinition:
+			Ok(None)
+		Kinds.TraitMethodDefinition:
+			Ok(None)
+		Kinds.ImplMethodDefinition:
+			Ok(None)
+		Kinds.LocalFunctionDefinition:
+			Ok(None)
+
+
+-- Imports and foreign blocks.
+private pure func legacy_import_block(
+	reader: DeclarationReader,
+	block_row: Int,
+) -> Result[ParsedDecl, LegacyAdapterError]:
+	block ?= present(
+		Tables.import_block_row_at(reader.tables, block_row),
+		ImportBlockTable,
+		block_row,
+	)
+	imports ?= collected(range(block.imports.first, block.imports.first + block.imports.count).map(
+		pure func(import_row): legacy_import(reader, import_row),
+	))
+	Ok(ImportBlockParsedDecl(imports, legacy_location(block.span)))
+
+
+private pure func legacy_import(
+	reader: DeclarationReader,
+	import_row: Int,
+) -> Result[ParsedImportDecl, LegacyAdapterError]:
+	import_id: ImportId = import_id_at_row(import_row)
+	row ?= present(
+		Tables.import_row_at(reader.tables, import_row),
+		ImportTable,
+		import_row,
+	)
+
+	module_alias: Option[ParsedIdentifier] = match Tables.import_alias(reader.tables, import_id):
+		Some(alias_row):
+			Some(legacy_identifier(reader, alias_row.alias_name, alias_row.span))
+		None:
+			None
+
+	-- An item-less import is `import: path`; the parser reports `path:` with no
+	-- selection, so no accepted module has an empty selection.
+	symbols ?= legacy_import_symbols(reader, row.items)
+
+	Ok({
+		module_path = Tables.path_text(reader.tables, row.request_path),
+		module_path_span = legacy_location(row.path_span),
+		module_alias = module_alias,
+		symbols = symbols,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_import_symbols(
+	reader: DeclarationReader,
+	items: RowRange,
+) -> Result[Option[List[ParsedImportSymbol]], LegacyAdapterError]:
+	if items.count == 0:
+		Ok(None)
+	else:
+		symbols ?= collected(range(items.first, items.first + items.count).map(
+			pure func(item_row): legacy_import_symbol(reader, item_row),
+		))
+		Ok(Some(symbols))
+
+
+private pure func legacy_import_symbol(
+	reader: DeclarationReader,
+	item_row: Int,
+) -> Result[ParsedImportSymbol, LegacyAdapterError]:
+	item_id: ImportItemId = import_item_id_at_row(item_row)
+	item ?= present(
+		Tables.import_item_row_at(reader.tables, item_id),
+		ImportItemTable,
+		item_row,
+	)
+	constructors ?= collected(range(
+		item.variants.first,
+		item.variants.first + item.variants.count,
+	).map(
+		pure func(variant_row): legacy_import_constructor(reader, variant_row),
+	))
+
+	symbol_alias: Option[ParsedIdentifier] = match Tables.import_item_alias(reader.tables, item_id):
+		Some(alias_row):
+			Some(legacy_identifier(reader, alias_row.alias_name, alias_row.span))
+		None:
+			None
+
+	Ok({
+		name = legacy_identifier(reader, item.name, item.name_span),
+		symbol_alias = symbol_alias,
+		constructors = constructors,
+		span = legacy_location(item.span),
+	})
+
+
+private pure func legacy_import_constructor(
+	reader: DeclarationReader,
+	variant_row: Int,
+) -> Result[ParsedIdentifier, LegacyAdapterError]:
+	variant ?= present(
+		Tables.import_item_variant_row_at(reader.tables, variant_row),
+		ImportItemVariantTable,
+		variant_row,
+	)
+	Ok(legacy_identifier(reader, variant.name, variant.span))
+
+
+private pure func legacy_foreign_block(
+	reader: DeclarationReader,
+	block_row: Int,
+) -> Result[ParsedDecl, LegacyAdapterError]:
+	block ?= present(
+		Tables.foreign_block_row_at(reader.tables, block_row),
+		ForeignBlockTable,
+		block_row,
+	)
+	arguments ?= collected(range(
+		block.arguments.first,
+		block.arguments.first + block.arguments.count,
+	).map(
+		pure func(argument_row): legacy_foreign_argument(reader, argument_row),
+	))
+	binding_rows ?= rows_of(reader.foreign_block_functions, block_row, ForeignBindingTable)
+	functions ?= collected(binding_rows.map(
+		pure func(binding_row): legacy_foreign_function(reader, binding_row),
+	))
+	Ok(ForeignBlockParsedDecl(arguments, functions, legacy_location(block.span)))
+
+
+private pure func legacy_foreign_argument(
+	reader: DeclarationReader,
+	argument_row: Int,
+) -> Result[ParsedForeignBlockArg, LegacyAdapterError]:
+	argument ?= present(
+		Tables.foreign_argument_row_at(reader.tables, argument_row),
+		ForeignArgumentTable,
+		argument_row,
+	)
+	Ok({
+		name = legacy_identifier(reader, argument.name, argument.name_span),
+		value = literal_string(reader, argument.value),
+		span = legacy_location(argument.span),
+	})
+
+
+private pure func legacy_foreign_function(
+	reader: DeclarationReader,
+	binding_row: Int,
+) -> Result[ParsedForeignFunctionDecl, LegacyAdapterError]:
+	binding ?= present(
+		Tables.foreign_binding_row_at(reader.tables, binding_row),
+		ForeignBindingTable,
+		binding_row,
+	)
+	definition: Int = definition_id_index(binding.definition)
+	row ?= definition_at(reader, definition)
+	signature ?= signature_of_definition(reader, definition)
+	params ?= legacy_params(reader, definition)
+	return_type ?= legacy_required_type(reader, definition)
+	c_name ?= legacy_c_name(reader, definition)
+	annotations ?= legacy_annotations(reader, definition)
+
+	Ok({
+		name = legacy_identifier(reader, row.name, row.name_span),
+		params = params,
+		return_type = return_type,
+		c_name = c_name,
+		is_pure = signature.purity == Kinds.PureFunction,
+		is_private = row.visibility == Kinds.PrivateVisibility,
+		annotations = annotations,
+		span = legacy_location(row.span),
+	})
+
+
+private pure func legacy_c_name(
+	reader: DeclarationReader,
+	definition: Int,
+) -> Result[Option[String], LegacyAdapterError]:
+	c_name_row ?= optional_row(reader.foreign_c_name_of, definition, ForeignCNameTable)
+
+	match c_name_row:
+		Some(row):
+			c_name ?= present(
+				Tables.foreign_c_name_row_at(reader.tables, row),
+				ForeignCNameTable,
+				row,
+			)
+			Ok(Some(literal_string(reader, c_name.c_name)))
+		None:
+			Ok(None)
+
+
+-- Modules.
+---
+One module's declarations as the existing parser would have produced them,
+bodies left as `DECLARATION_ONLY_BODY`: its docstring, then its import blocks,
+foreign blocks and definitions in source order. The program carries no
+diagnostics; a module the stage rejected has none to translate.
+---
+pure func legacy_parsed_declarations(
+	reader: DeclarationReader,
+	module: ModuleId,
+) -> Result[ParsedProgram, LegacyAdapterError]:
+	index: Int = module_id_index(module)
+	row: ModuleRow = Tables.module_row(reader.tables, module)
+	source ?= legacy_source_file(reader, module)
+	documentation_row ?= optional_row(
+		reader.module_documentation_of,
+		index,
+		ModuleDocumentationTable,
+	)
+	module_doc ?= legacy_module_doc(reader, documentation_row)
+	decls ?= legacy_module_items(reader, index, row)
+
+	Ok({
+		source = source,
+		module_doc = module_doc,
+		decls = decls,
+		diagnostics = [],
+	})
+
+
+---
+The source file of `module` as the existing front end holds it: its path in the
+existing spelling, its name from how it was reached, and its text.
+---
+pure func legacy_source_file(
+	reader: DeclarationReader,
+	module: ModuleId,
+) -> Result[SourceFile, LegacyAdapterError]:
+	index: Int = module_id_index(module)
+	row: ModuleRow = Tables.module_row(reader.tables, module)
+	module_name ?= present(
+		reader.module_names.get(index),
+		ModuleTable,
+		index,
+	)
+	Ok(
+		source_file(
+			legacy_source_path(
+				Tables.path_text(
+					reader.tables,
+					Tables.source_row(reader.tables, row.source).path,
+				),
+			),
+			module_name,
+			Tables.source_text(reader.tables, row.source),
+		),
+	)
+
+
+private pure func legacy_module_doc(
+	reader: DeclarationReader,
+	documentation_row: Option[Int],
+) -> Result[Option[ParsedModuleDoc], LegacyAdapterError]:
+	match documentation_row:
+		Some(row):
+			documentation ?= present(
+				Tables.module_documentation_row_at(reader.tables, row),
+				ModuleDocumentationTable,
+				row,
+			)
+			Ok(Some({
+				text = literal_string(reader, documentation.text),
+				span = legacy_location(documentation.span),
+			}))
+		None:
+			Ok(None)
+
+
+private pure func import_block_start(reader: DeclarationReader, block_row: Int) -> Int:
+	match Tables.import_block_row_at(reader.tables, block_row):
+		Some(block):
+			span_start(block.span)
+		None:
+			NO_MORE_ITEMS
+
+
+private pure func foreign_block_start(reader: DeclarationReader, block_row: Int) -> Int:
+	match Tables.foreign_block_row_at(reader.tables, block_row):
+		Some(block):
+			span_start(block.span)
+		None:
+			NO_MORE_ITEMS
+
+
+private pure func definition_start(reader: DeclarationReader, definition: Int) -> Int:
+	match Tables.definition_row_at(reader.tables, definition):
+		Some(row):
+			span_start(row.span)
+		None:
+			NO_MORE_ITEMS
+
+
+---
+The module's top-level items in source order: its definitions, import blocks
+and foreign blocks, each already in source order within its table, merged by
+the start of their spans. A row that does not exist starts at `NO_MORE_ITEMS`,
+so it ends its list; reading it reports `MissingTableRow`.
+---
+private pure func legacy_module_items(
+	reader: DeclarationReader,
+	module: Int,
+	row: ModuleRow,
+) -> Result[List[ParsedDecl], LegacyAdapterError]:
+	import_rows ?= rows_of(reader.import_blocks, module, ImportBlockTable)
+	foreign_rows ?= rows_of(reader.foreign_blocks, module, ForeignBlockTable)
+	definition_end: Int = row.definitions.first + row.definitions.count
+	var definition: Int = row.definitions.first
+	var next_import: Int = 0
+	var next_foreign: Int = 0
+	var items: List[ParsedDecl] = []
+	var failure: Option[LegacyAdapterError] = None
+
+	while (
+		failure.is_none()
+		and ((
+			definition < definition_end
+			or next_import < import_rows.length()
+			or next_foreign < foreign_rows.length()
+		))
+	):
+		next_definition_start: Int = if definition < definition_end:
+			definition_start(reader, definition)
+		else:
+			NO_MORE_ITEMS
+
+		next_import_row: Int = import_rows.get_or(next_import, ABSENT_ROW)
+
+		next_import_start: Int = if next_import < import_rows.length():
+			import_block_start(reader, next_import_row)
+		else:
+			NO_MORE_ITEMS
+
+		next_foreign_row: Int = foreign_rows.get_or(next_foreign, ABSENT_ROW)
+
+		next_foreign_start: Int = if next_foreign < foreign_rows.length():
+			foreign_block_start(reader, next_foreign_row)
+		else:
+			NO_MORE_ITEMS
+
+		if next_import_start <= next_definition_start and next_import_start <= next_foreign_start:
+			match legacy_import_block(reader, next_import_row):
+				Ok(block):
+					items = items.append(block)
+				Err(error):
+					failure = Some(error)
+
+			next_import += 1
+		else if next_foreign_start <= next_definition_start:
+			match legacy_foreign_block(reader, next_foreign_row):
+				Ok(block):
+					items = items.append(block)
+				Err(error):
+					failure = Some(error)
+
+			next_foreign += 1
+		else:
+			match legacy_declaration(reader, definition):
+				Ok(Some(declaration)):
+					items = items.append(declaration)
+				Ok(None):
+					void
+				Err(error):
+					failure = Some(error)
+
+			definition += 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(items)
+
+
+-- The graph.
+---
+The existing front end's name table over the stage's: the same spellings at the
+same ids, plus the by-spelling dictionary that table carries. Nothing is
+re-interned, so every id the rebuilt AST holds indexes this table.
+---
+private pure func legacy_name_table(tables: Tables.FrontendTables) -> NameTable:
+	spellings: List[String] = Tables.name_spellings(tables)
+	var ids_by_spelling: Dict[String, Int] = {}
+	var id: Int = 0
+
+	for spelling in spellings:
+		ids_by_spelling = ids_by_spelling.set(spelling, id)
+		id += 1
+
+	name_table_from_parts(spellings, ids_by_spelling)
+
+
+---
+The origin the existing front end gives `module`, from its origin and package
+row.
+---
+private pure func legacy_module_origin(
+	tables: Tables.FrontendTables,
+	module: ModuleId,
+	row: ModuleRow,
+) -> Result[ModuleOrigin, LegacyAdapterError]:
+	match row.origin:
+		Kinds.StdlibModule:
+			Ok(StdlibModule)
+		Kinds.UserModule:
+			Ok(UserModule)
+		Kinds.PackageModule:
+			package ?= package_of(tables, module)
+			Ok(NativePackageModule(Tables.name_spelling(tables, package.name)))
+		Kinds.SourcePackageModule:
+			package ?= package_of(tables, module)
+			Ok(SourcePackageModule(Tables.name_spelling(tables, package.name)))
+
+
+private pure func package_of(
+	tables: Tables.FrontendTables,
+	module: ModuleId,
+) -> Result[PackageRow, LegacyAdapterError]:
+	present(
+		Tables.module_package(tables, module),
+		ModulePackageTable,
+		module_id_index(module),
+	)
+
+
+private pure func legacy_module_identity(
+	reader: DeclarationReader,
+	module: Int,
+) -> Result[ResolvedModuleIdentity, LegacyAdapterError]:
+	id: ModuleId = module_id_at_row(module)
+	name ?= present(
+		reader.module_names.get(module),
+		ModuleTable,
+		module,
+	)
+	origin ?= legacy_module_origin(
+		reader.tables,
+		id,
+		Tables.module_row(reader.tables, id),
+	)
+	Ok(resolved_module_identity_from_resolver(name, origin))
+
+
+---
+The import edges of module `module`: one per import written, in source order,
+resolved to the module the stage loaded for it, or unresolved when it loaded
+none.
+---
+private pure func legacy_import_edges(
+	reader: DeclarationReader,
+	module: Int,
+) -> Result[List[FrontendImportEdge], LegacyAdapterError]:
+	row: ModuleRow = Tables.module_row(reader.tables, module_id_at_row(module))
+	importer ?= legacy_module_identity(reader, module)
+
+	collected(range(row.imports.first, row.imports.first + row.imports.count).map(
+		pure func(import_row): legacy_import_edge(reader, importer, import_row),
+	))
+
+
+private pure func legacy_import_edge(
+	reader: DeclarationReader,
+	importer: ResolvedModuleIdentity,
+	import_row: Int,
+) -> Result[FrontendImportEdge, LegacyAdapterError]:
+	import_id: ImportId = import_id_at_row(import_row)
+	row ?= present(
+		Tables.import_row_at(reader.tables, import_row),
+		ImportTable,
+		import_row,
+	)
+	resolution ?= legacy_import_resolution(reader, import_id)
+
+	Ok({
+		importer = importer,
+		requested_path = Tables.path_text(reader.tables, row.request_path),
+		resolution = resolution,
+	})
+
+
+private pure func legacy_import_resolution(
+	reader: DeclarationReader,
+	import_id: ImportId,
+) -> Result[FrontendImportResolution, LegacyAdapterError]:
+	match Tables.import_target(reader.tables, import_id):
+		Some(target):
+			identity ?= legacy_module_identity(reader, module_id_index(target))
+			Ok(FrontendResolvedImport(identity))
+		None:
+			Ok(FrontendUnresolvedImport)
+
+
+---
+Rebuilds the graph the existing discovery would have built from the same
+sources: each module's declarations finalized and summarized as the existing
+discovery does, the roots, the import edges, and the name table, validated by
+the same service. `context` and `naming` are what the caller knew about the
+file system; the tables hold no policy of their own.
+
+Declarations only: every body is `DECLARATION_ONLY_BODY`, so the rebuilt graph
+is not yet a graph typecheck can accept. Nothing in a compile calls this yet
+(roadmap item 7); the differential and the cost measurement do.
+---
+pure func legacy_frontend_graph(
+	tables: Tables.FrontendTables,
+	naming: LegacyModuleNaming,
+	context: FrontendGraphContext,
+) -> Result[FrontendCompilationGraph, LegacyAdapterError]:
+	reader ?= legacy_declaration_reader(tables, naming)
+	parts ?= collected(range(
+		0,
+		Tables.module_count(tables),
+	).map(
+		pure func(module): legacy_module_parts(reader, module),
+	))
+	roots ?= legacy_root_identities(reader)
+	var names: NameTable = legacy_name_table(tables)
+	var modules: List[FrontendModule] = []
+	var edges: List[FrontendImportEdge] = []
+
+	for part in parts:
+		(program, extended_names) = finalized_typecheck_program_with_names(part.declarations, names)
+		names = extended_names
+		modules = modules.append({
+			identity = part.identity,
+			program = program,
+			surface = module_surface_for_program(finalized_typecheck_program_ast(program)),
+		})
+		edges = edges.concat(part.edges)
+
+	match validated_frontend_graph_for_modules(modules, roots, edges, names):
+		Ok(graph):
+			Ok({
+				context = context,
+				graph = graph,
+				diagnostics = [],
+			})
+		Err(errors):
+			Err(GraphRejected(errors))
+
+
+---
+What the graph needs of one module before finalization.
+---
+record LegacyModuleParts {
+	identity: ResolvedModuleIdentity,
+	declarations: ParsedProgram,
+	edges: List[FrontendImportEdge]
+}
+
+
+private pure func legacy_module_parts(
+	reader: DeclarationReader,
+	module: Int,
+) -> Result[LegacyModuleParts, LegacyAdapterError]:
+	declarations ?= legacy_parsed_declarations(reader, module_id_at_row(module))
+	identity ?= legacy_module_identity(reader, module)
+	edges ?= legacy_import_edges(reader, module)
+	Ok({
+		identity = identity,
+		declarations = declarations,
+		edges = edges,
+	})
+
+
+private pure func legacy_root_identities(
+	reader: DeclarationReader,
+) -> Result[List[ResolvedModuleIdentity], LegacyAdapterError]:
+	loaded: List[Int] = range(
+		0,
+		Tables.root_count(reader.tables),
+	)
+		.map(pure func(root): root_target_index(reader.tables, root))
+		.filter(pure func(target): target != ABSENT_ROW)
+
+	collected(loaded.map(
+		pure func(target): legacy_module_identity(reader, target),
+	))

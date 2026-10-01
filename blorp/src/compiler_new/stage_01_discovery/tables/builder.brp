@@ -260,7 +260,8 @@ One import item of a module's import block. `request_path` is the import
 syntax, kept as text on purpose (for diagnostics and the legacy adapter);
 resolution reads the structured form: `parent_steps` leading `../` (0 for
 `./` and for non-relative requests), then the path parts, a block of
-`import_path_parts`. `items` is a block of `import_items`.
+`import_path_parts`. `items` is a block of `import_items`. `path_span` covers
+the module path, `span` the path through its aliases and selections.
 ---
 struct ImportRow {
 	importer: ModuleId,
@@ -269,18 +270,21 @@ struct ImportRow {
 	parent_steps: Int,
 	path_parts: RowRange,
 	items: RowRange,
+	path_span: Span,
 	span: Span
 }
 
 
 ---
 One selected symbol; `variants` is a block of `import_item_variants` for
-`name(Variant, ...)` selections.
+`name(Variant, ...)` selections. `name_span` covers the name alone, `span` the
+whole selection.
 ---
 struct ImportItemRow {
 	owner_import: ImportId,
 	name: NameId,
 	variants: RowRange,
+	name_span: Span,
 	span: Span
 }
 
@@ -301,15 +305,24 @@ struct ImportTargetRow {
 }
 
 
+---
+The alias of an import (`module as alias`); `span` covers the alias name.
+---
 struct ImportAliasRow {
 	owner_import: ImportId,
-	alias_name: NameId
+	alias_name: NameId,
+	span: Span
 }
 
 
+---
+The alias of an imported symbol (`name as alias`); `span` covers the alias
+name.
+---
 struct ImportItemAliasRow {
 	item: ImportItemId,
-	alias_name: NameId
+	alias_name: NameId,
+	span: Span
 }
 
 
@@ -402,11 +415,16 @@ struct AnnotationRow {
 }
 
 
+---
+A declared type or dimension parameter. `name_span` covers the name (with its
+`#` for a dimension), `span` the name and its bounds.
+---
 struct TypeParameterRow {
 	owner: DefinitionId,
 	ordinal: Int,
 	name: NameId,
 	kind: TypeParameterKind,
+	name_span: Span,
 	span: Span
 }
 
@@ -415,12 +433,13 @@ struct TypeParameterRow {
 A written trait bound on the type parameter at `parameter_ordinal`,
 unresolved; typecheck turns `trait_name` into a trait. `span` covers the whole
 written reference, `module.Trait` included; the module alias, when written, is
-the bound's `BoundQualifierRow`.
+the bound's `BoundQualifierRow`; `name_span` covers the trait's name alone.
 ---
 struct BoundRow {
 	owner: DefinitionId,
 	parameter_ordinal: Int,
 	trait_name: NameId,
+	name_span: Span,
 	span: Span
 }
 
@@ -438,12 +457,13 @@ struct BoundQualifierRow {
 
 ---
 A supertrait a trait names, in written order. `span` covers the whole written
-reference, as for `BoundRow`.
+reference, as for `BoundRow`; `name_span` covers the supertrait's name alone.
 ---
 struct SupertraitRow {
 	trait_definition: DefinitionId,
 	ordinal: Int,
 	name: NameId,
+	name_span: Span,
 	span: Span
 }
 
@@ -557,10 +577,12 @@ struct ForeignBlockRow {
 
 ---
 One `name: "value"` argument of a foreign block, such as `include`.
+`name_span` covers the name, `span` the name through the value.
 ---
 struct ForeignArgumentRow {
 	name: NameId,
 	value: LiteralId,
+	name_span: Span,
 	span: Span
 }
 
@@ -613,6 +635,31 @@ struct NodeRow {
 	span: Span,
 	payload: Int,
 	children: RowRange
+}
+
+
+---
+A dimension name and the spelling it has with its sigil: `N` and `#N`. The
+lexer interns both when it joins a `#` to a name, and writes one row per
+distinct dimension name, so a reader that needs the sigil spelling (the legacy
+adapter) reads this row instead of building a spelling and looking it up.
+---
+struct DimensionNameRow {
+	name: NameId,
+	sigil_name: NameId
+}
+
+
+---
+The span of the name a type node carries, for a node whose name does not span
+the whole node: a generic or module-qualified named type (`List[T]`,
+`m.Type`), a bounded type (`T: Eq`), a trait bound written through a module
+alias, and a variadic dimension (`#Ds...`). A node whose name is the whole
+node has no row. At most one row per node, in node order.
+---
+struct NodeNameSpanRow {
+	node: NodeId,
+	name_span: Span
 }
 
 
@@ -709,6 +756,8 @@ record DiscoveryBuilder {
 	bodies: List[BodyRow],
 	nodes: List[NodeRow],
 	node_children: List[NodeId],
+	node_name_spans: List[NodeNameSpanRow],
+	dimension_names: List[DimensionNameRow],
 	literals: List[String],
 	literal_slots: List[Int],
 	diagnostics: List[DiagnosticRow],
@@ -783,6 +832,8 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		bodies = [],
 		nodes = [],
 		node_children = [],
+		node_name_spans = [],
+		dimension_names = [],
 		literals = [],
 		literal_slots = empty_slots(INITIAL_SLOT_COUNT),
 		diagnostics = [],
@@ -1566,6 +1617,32 @@ pure func next_node_id(builder: DiscoveryBuilder) -> NodeId:
 
 pure func append_node(builder: DiscoveryBuilder, row: NodeRow) -> DiscoveryBuilder:
 	{ builder | nodes = builder.nodes.append(row) }
+
+
+pure func append_dimension_name(builder: DiscoveryBuilder, row: DimensionNameRow) -> DiscoveryBuilder:
+	{ builder | dimension_names = builder.dimension_names.append(row) }
+
+
+pure func append_node_name_span(
+	builder: DiscoveryBuilder,
+	row: NodeNameSpanRow,
+) -> DiscoveryBuilder:
+	{ builder | node_name_spans = builder.node_name_spans.append(row) }
+
+
+---
+Records the span of the name of the node appended most recently, for a node
+whose name does not span the whole node (see `NodeNameSpanRow`).
+---
+pure func record_name_span_of_last_node(
+	builder: DiscoveryBuilder,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	node: NodeId = builder.last_node_id()
+	builder.append_node_name_span({
+		node = node,
+		name_span = name_span,
+	})
 
 
 ---

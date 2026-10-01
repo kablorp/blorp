@@ -73,12 +73,14 @@ compiler CI):
 - the implicit modules (section 6): `prelude` and `tuple`, and `test` when
   testing, loaded after the roots as the existing front end seeds them;
 - the declaration, type, pattern and body parsers, with accept/reject parity
-  against the existing parser over the corpus.
+  against the existing parser over the corpus;
+- the declaration half of the legacy adapter (section 10), proved by a
+  declaration-level differential over the corpus.
 
 **Pending:**
 
-- **The legacy adapter** (section 10) and its differential check. Nothing
-  outside `compiler_new` reads the tables yet.
+- **The body half of the legacy adapter** (section 10). Nothing in a compile
+  reads the tables yet.
 
 ## 1. Principles
 
@@ -203,17 +205,18 @@ struct ImportRow {
 	parent_steps: Int,          -- leading `../` (0 for `./` and non-relative)
 	path_parts: RowRange,       -- into import_path_parts: List[NameId]
 	items: RowRange,            -- into import_items
-	span: Span
+	path_span: Span,            -- the module path alone
+	span: Span                  -- through the last selected symbol, else the alias or path
 }
 
-struct ImportItemRow {owner_import: ImportId, name: NameId, variants: RowRange, span: Span}
+struct ImportItemRow {owner_import: ImportId, name: NameId, variants: RowRange, name_span: Span, span: Span}
 struct ImportItemVariantRow {item: ImportItemId, name: NameId, span: Span}
 struct ImportBlockRow {module: ModuleId, imports: RowRange, span: Span}
 
 -- Optional relationships: at most one row per owner.
 struct ImportTargetRow {owner_import: ImportId, target: ModuleId}
-struct ImportAliasRow {owner_import: ImportId, alias_name: NameId}
-struct ImportItemAliasRow {item: ImportItemId, alias_name: NameId}
+struct ImportAliasRow {owner_import: ImportId, alias_name: NameId, span: Span}
+struct ImportItemAliasRow {item: ImportItemId, alias_name: NameId, span: Span}
 -- The docstring that opens a module, directly before its first `import:` block.
 struct ModuleDocumentationRow {module: ModuleId, text: LiteralId, span: Span}
 ```
@@ -306,11 +309,13 @@ struct ParameterTypeRow {parameter: ParameterId, type_root: NodeId}
 struct DefinitionTypeRow {definition: DefinitionId, type_root: NodeId}
 struct VariantPayloadRow {variant: DefinitionId, ordinal: Int, type_root: NodeId}
 
-struct TypeParameterRow {owner: DefinitionId, ordinal: Int, name: NameId, kind: TypeParameterKind, span: Span}
+struct TypeParameterRow {owner: DefinitionId, ordinal: Int, name: NameId, kind: TypeParameterKind, name_span: Span, span: Span}
 -- TypeParameterKind: TypeParameter | DimensionParameter | WildcardDimensionParameter
 
-struct BoundRow {owner: DefinitionId, parameter_ordinal: Int, trait_name: NameId, span: Span}
-struct SupertraitRow {trait_definition: DefinitionId, ordinal: Int, name: NameId, span: Span}
+-- `name_span` covers the name alone, `span` the whole row (the type parameter
+-- with its bounds; the reference with its module alias).
+struct BoundRow {owner: DefinitionId, parameter_ordinal: Int, trait_name: NameId, name_span: Span, span: Span}
+struct SupertraitRow {trait_definition: DefinitionId, ordinal: Int, name: NameId, name_span: Span, span: Span}
 -- Optional relationships (one row per bound or supertrait id, at most): the
 -- `alias` of `alias.Trait`. The bound's or supertrait's own span covers the
 -- whole reference; the qualifier row's span covers the alias.
@@ -318,6 +323,14 @@ struct BoundQualifierRow {bound: BoundId, qualifier: NameId, span: Span}
 struct SupertraitQualifierRow {supertrait: SupertraitId, qualifier: NameId, span: Span}
 struct DimensionConstraintRow {owner: DefinitionId, left: NodeId, right: NodeId, span: Span}
 ```
+
+A written type whose name is narrower than its node (`List[T]`, `m.Type`,
+`T: Eq`, `#Ds...`, a trait bound through a module alias) has a
+`NodeNameSpanRow {node, name_span}`, at most one per node, in node order;
+`node_name_span` reads a node's name span, which is the node's own span when it
+has no row. The same idea gives the rows that carry names their own spans:
+the existing parsed AST has an identifier, with a span, where the tables have
+a name, and the adapter may not reconstruct a span the tables lack.
 
 A `DefinitionTypeRow`'s role is fixed by the definition's kind: a
 function's return type, a global's declared type, an alias's or opaque
@@ -341,7 +354,7 @@ struct AnnotationRow {definition: DefinitionId, annotation: FunctionAnnotation, 
 -- FunctionAnnotation: TailRecursive | NoCopy | DebugOnly | ResourceResultOrdinary
 
 struct ForeignBlockRow {module: ModuleId, arguments: RowRange, span: Span}
-struct ForeignArgumentRow {name: NameId, value: LiteralId, span: Span}   -- `include: "x.h"`, ...
+struct ForeignArgumentRow {name: NameId, value: LiteralId, name_span: Span, span: Span}   -- `include: "x.h"`, ...
 struct ForeignBindingRow {definition: DefinitionId, block: ForeignBlockId}
 struct ForeignCNameRow {definition: DefinitionId, c_name: LiteralId, span: Span}
 struct ResourceCleanupRow {definition: DefinitionId, builtin_name: LiteralId, span: Span}
@@ -631,10 +644,16 @@ spelling up.
 
 Every name table starts with the seeded vocabulary (`tables/name_vocabulary.brp`)
 at pinned ids: a copy of the existing compiler's synthesized vocabulary, in
-the same order so the adapter's ids agree, followed by the spellings only
-discovery compares (`tail_recursive`, `no_copy`, `debug_only`,
-`resource_result_ordinary`, `into`). The parser compares annotation names
-and the removed conversion by `NameId`, never by spelling.
+the same order, all 236 of them, so the adapter hands the existing compiler's
+later phases a table whose ids agree with the `NAME_ID_*` constants they
+compare against; then the spellings only discovery compares (`tail_recursive`,
+`no_copy`, `debug_only`, `resource_result_ordinary`, `into`, `max_threads`).
+The parser compares annotation names and the removed conversion by `NameId`,
+never by spelling. The lexer also interns `#N` beside the plain `N` it
+records for a dimension name, as the existing lexer does, and writes a
+`DimensionNameRow {name, sigil_name}` pairing them; `freeze` checks the pairing
+spells `#` and the name (`SigilSpellingMismatch`) and that every dimension name
+has a row (`DimensionSigilNameMissing`).
 
 ### The probe that came first
 
@@ -798,8 +817,9 @@ lexer:
   adjacency is a lexer fact rather than a parser check on token positions.
   A `#` followed by anything else is a `HashSymbol`. This makes `# N` (with
   a blank) a syntax error; the existing parser accepted it, and nothing in
-  the corpus uses it. The adapter mints the old `#N` spelling when it
-  rebuilds the existing compiler's identifiers.
+  the corpus uses it. The adapter reads the old `#N` spelling from the
+  dimension name row the lexer wrote beside `N` when it rebuilds the
+  existing compiler's identifiers.
 - **`InterpolatedStringToken`.** The payload is the string's row in the
   transient `interpolations` table, a block of `interpolation_parts`:
 
@@ -885,6 +905,10 @@ The invariants, by violation kind:
   owner.
 - `SpanOutsideSources`, `SpanPastSourceEnd`: every span names a source and
   ends within its text.
+- `NameSpanOutsideItsSpan`, `NameSpanOnWrongNodeKind`: a name's span lies
+  inside the span of what it names a part of, and a node name span row names a
+  node of a kind that has one.
+- `DimensionSigilNameMissing`: every dimension name has its `#` spelling.
 - `SeededNameMoved`: the seeded vocabulary sits at its pinned ids.
 - `InternIndexMismatch`, `ParallelTableMismatch`: the intern indexes agree
   with their tables, and parallel tables have equal lengths.
@@ -894,13 +918,23 @@ payload class.
 
 ## 10. The legacy adapter
 
-Not implemented yet; `docs/DISCOVERY_ACCEPTANCE_ROADMAP.md` orders the work.
-The adapter is a plain transformation from `FrontendTables` to the
-`FrontendCompilationGraph` the existing typecheck reads. It belongs to
-neither side: the new stage never imports the old compiler, and typecheck
-keeps its current input. It sits in the compiler's top-level pipeline
-(`blorp/src/compiler/pipeline.brp` or a module beside it), the one module the
-layout check will allow to import both.
+The adapter is `blorp/src/compiler/discovery_adapter.brp`, the one module in
+`compiler` allowed to import `compiler_new` (named in
+`temporary_cross_owner_imports` of `blorp/source_ownership.json`, which
+`scripts/check-blorp-layout` enforces). It is a plain transformation from
+`FrontendTables` to the `FrontendCompilationGraph` the existing typecheck
+reads. It belongs to neither side: the new stage never imports the old
+compiler, and typecheck keeps its current input.
+
+**Implemented: the declaration half.** `legacy_declaration_reader(tables,
+naming)` builds the indexes the adapter reads by owner, once; then
+`legacy_parsed_declarations(reader, module)` rebuilds one module's
+`ParsedProgram` (its source file, module docstring, import blocks, foreign
+blocks and declarations, in source order, with every body the placeholder
+`DECLARATION_ONLY_BODY`) and `legacy_frontend_graph(tables, naming, context)`
+assembles the modules, roots, import edges and name table and validates them
+with the service the existing discovery uses, so finalization, module
+surfaces and validation are the existing code, not a copy.
 
 ```blorp
 ---
@@ -908,28 +942,67 @@ Rebuilds the existing typecheck's input from the tables. It shrinks as
 typecheck is rewritten to read the tables and is deleted when typecheck
 takes `FrontendTables` directly.
 ---
-pure func legacy_frontend_graph(tables: FrontendTables) -> FrontendCompilationGraph
+pure func legacy_frontend_graph(
+	tables: FrontendTables,
+	naming: LegacyModuleNaming,
+	context: FrontendGraphContext,
+) -> Result[FrontendCompilationGraph, List[FrontendGraphServiceError]]
 ```
 
-It rebuilds each module's parsed program from its definitions and nodes,
-spells identifiers from the name table (minting `#N` for dimension names),
-renders locations from packed spans and line starts, and derives module
-surfaces and import references. It does no parsing, resolution or checking
-of its own; anything missing is a gap in the tables. The first version
-serves compilation (`check`, `compile`, `run`, `test`); the formatter, which
-needs comments the stage drops, and the LSP are decided after acceptance.
-The stage already loads the implicit modules (section 6), so the adapter
-receives every module the existing graph has, in the same order; nothing in
-the adapter loads or orders modules.
+It does no parsing, resolution or checking of its own; anything missing is a
+gap in the tables, and the declaration half found and closed these: the name
+spans in section 3, the full vocabulary in section 4, the sigil names, and the
+end of an import and of an import block. Ids pass through: the name table is
+the stage's spellings at the stage's ids; module ids need no mapping because
+the order matches the existing graph; definition ids are dropped because the
+parsed AST has none. Module names come from the tables: the existing front
+end names a module by how it was reached, so an imported module takes its
+import request's text (bare, native-package and source-package requests) or
+its path without `.brp` (relative requests and user code), an implicit module
+its request's name; origins come from the module's origin and package row, and
+an embedded standard-library module's path is spelled `<embedded:name>`.
+The adapter relies on a stage guarantee: import rows are in load order (module
+by module, source order within a module, `ModuleRangesOverlap`), so the first
+import row that targets a module is the request that loaded it.
+`LegacyModuleNaming` carries the one thing the tables do not hold, the name a
+root takes, which the existing front end's callers choose per command: a
+function of the root's request path.
+
+A row the tables should hold and do not is a `LegacyAdapterError`
+(`MissingTableRow(table, index)`, `NotAWrittenType`, `ModuleWithoutRequest`,
+`GraphRejected`) propagated through `legacy_declaration_reader`,
+`legacy_parsed_declarations` and `legacy_frontend_graph`; no placeholder flows
+into the AST, and the differential fails on an error.
+
+The first version serves compilation (`check`, `compile`, `run`, `test`); the
+formatter, which needs comments the stage drops, and the LSP are decided
+after acceptance. The stage loads the implicit modules (section 6), so the
+adapter receives every module the existing graph has, in the same order;
+nothing in the adapter loads or orders modules. Nothing in a compile calls the
+adapter yet (roadmap item 7).
 
 ### Proving the adapter
 
-A differential check runs the old parser and the new discovery plus the
-adapter over every source we have (the compiler, the standard library, and
-every test and fixture program) and compares each module's parsed AST
-through the existing JSON encoder (`parsed_ast_json.brp`), so no separate
-renderer is written. A mismatch names the module, the declaration and the
-field. Once it is clean on the whole corpus, the new stage becomes the
+`blorp/test/compiler/tools/discovery_adapter_differential.brp` runs the old
+parser and the new discovery plus the adapter over the self-compile root, a
+`blorp test` root, each with the standard library on disk and embedded, the
+native-package and source-package fixture projects (the module-order check's
+options, `module_order_options.brp`), and every tracked `.brp` file (as roots
+of one discovery), and compares each module's parsed AST through the existing JSON encoder
+(`parsed_ast_json.brp`), so no separate renderer is written; the existing
+side's bodies are replaced by the same placeholder (`declarations_only`, in
+`discovery_adapter_comparison.brp`). A mismatch names the module, the
+declaration and the field. For a root it also builds the existing front end's
+graph and compares each module's name, origin and source path, since the
+program comparison uses the adapter's own names on both sides. A module the
+existing parser rejects is skipped; the parity gate requires the skipped set to
+equal the files the existing parser rejects. `scripts/compiler-new-parity` runs it
+(`ADAPTER_DIFFERENCES` lists deliberate differences with a reason each; there
+are none) and `blorp/test/compiler/stage_04_modules/test_discovery_adapter.brp`
+covers one construct per test. The tool lives under `blorp/test/compiler`
+because it imports the existing compiler, which `compiler_new`'s tests may not.
+The body half extends the same comparison to expressions, statements and
+patterns. Once it is clean on the whole corpus, the new stage becomes the
 default and the old discovery leaves the compile path later (roadmap items 3
 to 8). The same generated C for the self-compile and the test corpus
 confirms the rest; ids are internal identity, so the adapter passes the
@@ -972,6 +1045,19 @@ today: it builds the tables and then the legacy output. Acceptance
 still requires the stage plus the adapter to cost fewer instructions than the
 existing discovery (roadmap criterion 5); the stage's own end-to-end numbers
 are measured again when the adapter is deleted.
+
+First adapter measurement (declaration half only, same input, `-O2`, median of
+3, 2026-10-01, after the rebase onto the embedded provider; `benchmarks/results/discovery_adapter_declarations_2026-10-01.md`):
+
+| | Existing discovery | Stage, tables | Stage plus adapter |
+| --- | --- | --- | --- |
+| Allocations | 8.47M | 0.53M | 3.02M |
+| Instructions | 10.20G | 4.05G | 5.68G |
+| User time | 0.63 s | 0.27 s | 0.38 s |
+
+The declaration half costs 1.62G instructions, 26% of the stage's margin (it
+was 1.06G before every row read became a `Result`); the body half is not in
+these numbers.
 
 ## 13. Deliberately out of scope
 

@@ -1,0 +1,240 @@
+-- Runs one discovery of one root and prints how many modules it found and its
+-- managed allocations, so the cost of the legacy adapter can be measured
+-- against the existing discovery and the stage alone, each in its own binary
+-- (retired instructions and user time come from `/usr/bin/time -l` around it).
+--
+-- Usage: discovery_adapter_cost.brp <old|tables|graph> <compile|test> <root.brp> [--embedded-std] [--package <spec>]...
+--
+-- After the measurement mode, the command line is the module-order dumpers'
+-- (`module_order_options`).
+--
+--   old     the existing discovery, to a `FrontendGraph`, including the parse
+--           of the root the CLI does first;
+--   tables  the discovery stage, to frozen tables;
+--   graph   the discovery stage, then `legacy_frontend_graph`.
+--
+-- Allocation counters read zero unless the program is built with
+-- `-DBLORP_MEMORY_DIAGNOSTICS=1` and run with `BLORP_MEMORY_STATS=1`.
+--
+-- This tool imports the existing compiler and the discovery stage, so it lives
+-- beside the existing front end's tools, outside `compiler_new`.
+import:
+	../../../src/compiler/discovery_adapter:
+		COMPILER_EMBEDDED_TEXTS,
+		CompilerEmbeddedTexts,
+		LegacyModuleNaming,
+		legacy_frontend_graph,
+	../../../src/compiler/frontend_request: FrontendGraphContext, FrontendSourcePackage
+	../../../src/compiler/stage_04_modules/frontend_graph: frontend_graph_modules
+	../../../src/compiler_new/stage_01_discovery/pipeline:
+		ImplicitModules,
+		compiler_implicit_modules,
+		discover,
+		test_implicit_modules,
+	../../../src/compiler_new/stage_01_discovery/sources/embedded_standard_library:
+		EmbeddedStandardLibraryProvider,
+		embedded_lookup_roots,
+	../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		FILE_SYSTEM_SOURCE_PROVIDER,
+		FileSystemSourceProvider,
+		SourceLookupRoots,
+		SourcePackageRoot,
+		SourceProvider,
+	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		module_count,
+	../../../src/lib/cli_plan: CliParsedSourceFile
+	../../../src/lib/source_graph:
+		CliSourceGraphSetup,
+		frontend_compilation_graph_for_roots_with_setup_and_test_runtime,
+		parse_cli_source_with_setup,
+	memory: MemStats, get_mem_stats, mem_delta
+	module_order_options:
+		ModuleOrderMode(TestMode),
+		ModuleOrderOptions,
+		SourcePackageSpec,
+		StandardLibrarySource(StandardLibraryEmbedded, StandardLibraryOnDisk),
+		parse_module_order_options,
+	system: read_file
+
+
+MEASURE_ARGUMENT: Int = 1
+
+FIRST_OPTION_ARGUMENT: Int = 2
+
+OLD_MODE: String = "old"
+
+TABLES_MODE: String = "tables"
+
+GRAPH_MODE: String = "graph"
+
+ROOT_MODULE_NAME: String = "main"
+
+STANDARD_LIBRARY_ROOT: String = "standard_library/src"
+
+NATIVE_PACKAGE_ROOT: String = "pkg"
+
+EXIT_USAGE: Int = 2
+
+EXIT_FAILED: Int = 1
+
+NAMING: LegacyModuleNaming = {root_module_name = pure func(request_path): ROOT_MODULE_NAME}
+
+
+func source_package_root(spec: SourcePackageSpec) -> SourcePackageRoot:
+	{
+		package_alias = spec.package_alias,
+		package_name = spec.package_name,
+		source_dir = spec.source_dir,
+		exports = spec.exports
+	}
+
+
+func frontend_source_package(spec: SourcePackageSpec) -> FrontendSourcePackage:
+	{
+		package_alias = spec.package_alias,
+		package_name = spec.package_name,
+		package_root = spec.source_dir,
+		source_dir = spec.source_dir,
+		exports = spec.exports
+	}
+
+
+func graph_context(options: ModuleOrderOptions) -> FrontendGraphContext:
+	std_dir: Option[String] = match options.standard_library:
+		StandardLibraryOnDisk:
+			Some(STANDARD_LIBRARY_ROOT)
+		StandardLibraryEmbedded:
+			None
+
+	{
+		std_dir = std_dir,
+		source_packages = options.source_packages.map(frontend_source_package),
+		package_roots = [NATIVE_PACKAGE_ROOT]
+	}
+
+
+---
+The existing discovery's module count for the options' root, or `None` when it
+fails.
+---
+func existing_module_count(options: ModuleOrderOptions) -> Option[Int]:
+	match read_file(options.root):
+		Ok(text):
+			setup: CliSourceGraphSetup = {
+				context = graph_context(options),
+				diagnostics = []
+			}
+			parsed: CliParsedSourceFile = parse_cli_source_with_setup(
+				setup,
+				{
+					path = options.root,
+					module_name = ROOT_MODULE_NAME,
+					source_text = text
+				},
+			)
+
+			match frontend_compilation_graph_for_roots_with_setup_and_test_runtime(
+				setup,
+				[parsed],
+				options.mode == TestMode,
+			):
+				Ok(graph):
+					Some(frontend_graph_modules(graph.graph).length())
+				Err(_):
+					None
+		Err(_):
+			None
+
+
+---
+The stage's module count for the options' root, also building the legacy graph
+when `with_graph`; `None` when either fails.
+---
+func staged_module_count(options: ModuleOrderOptions, with_graph: Bool) -> Option[Int]:
+	source_packages: List[SourcePackageRoot] = options.source_packages.map(source_package_root)
+
+	match options.standard_library:
+		StandardLibraryOnDisk:
+			roots: SourceLookupRoots = {
+				standard_library_root = STANDARD_LIBRARY_ROOT,
+				native_package_roots = [NATIVE_PACKAGE_ROOT],
+				source_packages = source_packages
+			}
+			discovered_count(FILE_SYSTEM_SOURCE_PROVIDER, roots, options, with_graph)
+		StandardLibraryEmbedded:
+			roots: SourceLookupRoots = embedded_lookup_roots([NATIVE_PACKAGE_ROOT], source_packages)
+			provider: EmbeddedStandardLibraryProvider[CompilerEmbeddedTexts, FileSystemSourceProvider] = {
+				texts = COMPILER_EMBEDDED_TEXTS,
+				inner = FILE_SYSTEM_SOURCE_PROVIDER
+			}
+			discovered_count(provider, roots, options, with_graph)
+
+
+func discovered_count[Provider:SourceProvider](
+	provider: Provider,
+	roots: SourceLookupRoots,
+	options: ModuleOrderOptions,
+	with_graph: Bool,
+) -> Option[Int]:
+	implicit: ImplicitModules = if options.mode == TestMode:
+		test_implicit_modules()
+	else:
+		compiler_implicit_modules()
+
+	match discover(provider, roots, [options.root], implicit):
+		FrozenTables(tables):
+			if with_graph:
+				match legacy_frontend_graph(tables, NAMING, graph_context(options)):
+					Ok(graph):
+						Some(frontend_graph_modules(graph.graph).length())
+					Err(_):
+						None
+			else:
+				Some(module_count(tables))
+		TableInvariantsViolated(_):
+			None
+
+
+func main(args: List[String]) -> Int:
+	measure: String = args.get_or(MEASURE_ARGUMENT, "")
+
+	-- The options parse the arguments after the measurement mode, in the
+	-- dumpers' positions.
+	option_arguments: List[String] = [args.get_or(0, "")].concat(args.drop(FIRST_OPTION_ARGUMENT))
+
+	if (
+		measure != OLD_MODE
+		and measure != TABLES_MODE
+		and measure != GRAPH_MODE
+	):
+		print("usage: discovery_adapter_cost.brp <old|tables|graph> <module-order options>")
+		EXIT_USAGE
+	else:
+		match parse_module_order_options(option_arguments):
+			Ok(options):
+				report(measure, options)
+			Err(usage):
+				print(usage)
+				EXIT_USAGE
+
+
+func report(measure: String, options: ModuleOrderOptions) -> Int:
+	before: MemStats = get_mem_stats()
+
+	modules: Option[Int] = if measure == OLD_MODE:
+		existing_module_count(options)
+	else:
+		staged_module_count(options, measure == GRAPH_MODE)
+
+	delta: MemStats = mem_delta(before, get_mem_stats())
+
+	match modules:
+		Some(count):
+			print(
+				"mode=${measure} modules=${count} allocations=${delta.total_allocations} releases=${delta.total_releases} counters_active=${delta.memory_stats_active}",
+			)
+			0
+		None:
+			print("discovery failed")
+			EXIT_FAILED

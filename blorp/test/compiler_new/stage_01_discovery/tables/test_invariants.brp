@@ -10,6 +10,7 @@ import:
 		NodeId,
 		PathId,
 		SourceId,
+		NodeNameSpanRow,
 		SupertraitQualifierRow,
 		append_body,
 		append_bound,
@@ -19,8 +20,12 @@ import:
 		append_diagnostic_with_argument,
 		append_import,
 		append_module,
+		append_name,
 		append_node,
 		append_node_child,
+		append_dimension_name,
+		append_node_name_span,
+		next_name_id,
 		append_path,
 		append_plain_diagnostic,
 		append_root,
@@ -66,6 +71,8 @@ import:
 			ImportTable,
 			ModuleTable,
 			NameTable,
+			DimensionNameTable,
+			NodeNameSpanTable,
 			NodeTable,
 			BodyTable,
 			SourceTable,
@@ -95,6 +102,11 @@ import:
 			ImplicitOutcomeMismatch,
 			DuplicateSideRow,
 			QualifierOutsideReference,
+			NameSpanOutsideItsSpan,
+			NameSpanOnWrongNodeKind,
+			DimensionSigilNameMissing,
+			NodeNameSpanMissing,
+			SigilSpellingMismatch,
 		),
 		TableInvariantViolation,
 		check_table_invariants,
@@ -109,6 +121,8 @@ import:
 			BreakNode,
 			CallNode,
 			CharLiteralNode,
+			DimensionNameTypeNode,
+			NamedTypeNode,
 			IdentifierNode,
 			IntegerLiteralNode,
 			LocalFunctionNode,
@@ -328,6 +342,7 @@ pure func test_import_items_past_the_item_table_are_out_of_bounds() -> Bool:
 			first = 0,
 			count = 5
 		},
+		path_span = sample_span(),
 		span = sample_span(),
 	})
 	has_violation(builder.violations_of(), RangeOutOfBounds, ImportTable)
@@ -721,6 +736,7 @@ pure func with_bound(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 		owner = definition_id_at_row(0),
 		parameter_ordinal = 0,
 		trait_name = main_name(),
+		name_span = sample_span(),
 		span = sample_span(),
 	})
 
@@ -733,6 +749,7 @@ pure func with_supertrait(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 		trait_definition = definition_id_at_row(0),
 		ordinal = 0,
 		name = main_name(),
+		name_span = sample_span(),
 		span = sample_span(),
 	})
 
@@ -829,10 +846,170 @@ pure func test_qualifier_inside_its_bound_is_accepted() -> Bool:
 	builder.violations_of().is_empty()
 
 
+pure func test_bound_name_outside_its_reference_is_reported() -> Bool:
+	-- The bound spans bytes 0 to 1; its name span claims 1 to 2.
+	builder: DiscoveryBuilder = well_formed_builder().append_bound({
+		owner = definition_id_at_row(0),
+		parameter_ordinal = 0,
+		trait_name = main_name(),
+		name_span = pack_span(0, 1, 2),
+		span = sample_span(),
+	})
+	has_violation(builder.violations_of(), NameSpanOutsideItsSpan, BoundTable)
+
+
+pure func test_name_inside_its_reference_is_accepted() -> Bool:
+	well_formed_builder().with_bound().with_supertrait().violations_of().is_empty()
+
+
+pure func test_import_path_outside_its_import_is_reported() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder()
+	path: PathId = builder.next_path_id()
+	builder = builder.append_path("heap")
+	builder = builder.append_import({
+		importer = builder.first_module_of(),
+		request_kind = BareModuleRequest,
+		request_path = path,
+		parent_steps = 0,
+		path_parts = EMPTY_ROW_RANGE,
+		items = EMPTY_ROW_RANGE,
+		path_span = pack_span(0, 1, 2),
+		span = sample_span(),
+	})
+	has_violation(builder.violations_of(), NameSpanOutsideItsSpan, ImportTable)
+
+
+pure func test_name_span_of_a_missing_node_is_a_dangling_reference() -> Bool:
+	builder: DiscoveryBuilder = well_formed_builder().append_node_name_span({
+		node = node_id_at_row(MISSING_ROW),
+		name_span = sample_span(),
+	})
+	has_violation(builder.violations_of(), DanglingReference, NodeNameSpanTable)
+
+
+pure func test_name_span_on_a_node_without_a_separate_name_is_reported() -> Bool:
+	-- Node 0 is an identifier leaf, whose name is the whole node.
+	builder: DiscoveryBuilder = well_formed_builder().append_node_name_span({
+		node = node_id_at_row(0),
+		name_span = sample_span(),
+	})
+	has_violation(builder.violations_of(), NameSpanOnWrongNodeKind, NodeNameSpanTable)
+
+
+pure func test_name_spans_of_one_node_twice_are_reported() -> Bool:
+	row: NodeNameSpanRow = {
+		node = node_id_at_row(0),
+		name_span = sample_span(),
+	}
+	builder: DiscoveryBuilder = well_formed_builder()
+		.append_node_name_span(row)
+		.append_node_name_span(row)
+	has_violation(builder.violations_of(), SideTableUnsorted, NodeNameSpanTable)
+
+
+pure func test_a_dimension_name_needs_its_hash_spelling() -> Bool:
+	missing: DiscoveryBuilder = well_formed_builder().append_node({
+		kind = DimensionNameTypeNode,
+		span = sample_span(),
+		payload = main_name().name_id_index(),
+		children = EMPTY_ROW_RANGE,
+	})
+	sigil: NameId = missing.next_name_id()
+	spelled: DiscoveryBuilder = missing
+		.append_name("#main")
+		.append_dimension_name({
+			name = main_name(),
+			sigil_name = sigil,
+		})
+	(
+		has_violation(missing.violations_of(), DimensionSigilNameMissing, NodeTable)
+		and not has_violation(spelled.violations_of(), DimensionSigilNameMissing, NodeTable)
+	)
+
+
+pure func test_a_dimension_name_row_must_spell_the_sigil_and_the_name() -> Bool:
+	sigil: NameId = well_formed_builder().next_name_id()
+	builder: DiscoveryBuilder = well_formed_builder()
+		.append_name("#other")
+		.append_dimension_name({
+			name = main_name(),
+			sigil_name = sigil,
+		})
+	has_violation(builder.violations_of(), SigilSpellingMismatch, DimensionNameTable)
+
+
+pure func test_a_named_type_with_arguments_needs_a_name_span() -> Bool:
+	-- A leaf argument, then `Name[argument]` over it, without a name span row.
+	var builder: DiscoveryBuilder = well_formed_builder()
+	argument: NodeId = builder.next_node_id()
+	builder = builder.append_node({
+		kind = NamedTypeNode,
+		span = sample_span(),
+		payload = main_name().name_id_index(),
+		children = EMPTY_ROW_RANGE,
+	})
+	first_child: Int = builder.next_node_child_row()
+	builder = builder.append_node_child(argument)
+	builder = builder.append_node({
+		kind = NamedTypeNode,
+		span = sample_span(),
+		payload = main_name().name_id_index(),
+		children = {
+			first = first_child,
+			count = 1
+		},
+	})
+	generic: NodeId = builder.last_node_id()
+	with_row: DiscoveryBuilder = builder.append_node_name_span({
+		node = generic,
+		name_span = sample_span(),
+	})
+	(
+		has_violation(builder.violations_of(), NodeNameSpanMissing, NodeTable)
+		and not has_violation(with_row.violations_of(), NodeNameSpanMissing, NodeTable)
+	)
+
+
 tests: TestSuite = {
 	description = "Discovery table invariants",
 	tests = [
 		("well-formed builder has no violations", test_well_formed_builder_has_no_violations),
+		(
+			"a bound name outside its reference is reported",
+			test_bound_name_outside_its_reference_is_reported,
+		),
+		(
+			"a name inside its reference is accepted",
+			test_name_inside_its_reference_is_accepted,
+		),
+		(
+			"an import path outside its import is reported",
+			test_import_path_outside_its_import_is_reported,
+		),
+		(
+			"a name span of a missing node is a dangling reference",
+			test_name_span_of_a_missing_node_is_a_dangling_reference,
+		),
+		(
+			"a name span on a node without a separate name is reported",
+			test_name_span_on_a_node_without_a_separate_name_is_reported,
+		),
+		(
+			"name spans of one node twice are reported",
+			test_name_spans_of_one_node_twice_are_reported,
+		),
+		(
+			"a dimension name needs its hash spelling",
+			test_a_dimension_name_needs_its_hash_spelling,
+		),
+		(
+			"a dimension name row must spell the sigil and the name",
+			test_a_dimension_name_row_must_spell_the_sigil_and_the_name,
+		),
+		(
+			"a named type with arguments needs a name span",
+			test_a_named_type_with_arguments_needs_a_name_span,
+		),
 		(
 			"qualifier of a missing bound is a dangling reference",
 			test_qualifier_of_a_missing_bound_is_a_dangling_reference,

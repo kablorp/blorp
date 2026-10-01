@@ -1,0 +1,544 @@
+-- Compares the legacy adapter's declaration-level parsed AST with the
+-- existing parser's, module by module, for every module the discovery stage
+-- loads, for the adapter check of `scripts/compiler-new-parity`.
+--
+-- Usage: discovery_adapter_differential.brp <compile|test> <root.brp> [--embedded-std] [--package <spec>]...
+--        discovery_adapter_differential.brp files <file listing one source path per line>
+--
+-- The first form takes the command line both module-order dumpers take
+-- (`module_order_options`): `compile` loads the implicit modules a compile or
+-- check loads, `test` also the test runtime; `--embedded-std` reads the standard
+-- library from the compiler's embedded texts; `--package` adds a source package.
+-- The root module is named `main`. `files` makes every listed file a root of one
+-- discovery (named by its path without `.brp`) and loads the implicit modules a
+-- compile loads, so one run covers files no import reaches, fixtures included.
+--
+-- For each module the existing parser's program, with every function and
+-- method body and every global's value replaced by the adapter's placeholder
+-- (`declarations_only`) and its diagnostics dropped, is encoded with
+-- `parsed_program_to_json`, as is the adapter's program; every field that
+-- differs is one `difference` line:
+--
+--   difference <module path> | <declaration> | <json path> | old=<value> | new=<value>
+--
+-- A module the existing parser rejects is not compared (the parity gate
+-- compares the verdicts) and prints `skipped`; a module the adapter could not
+-- rebuild prints `adapter-error` and the run exits with status 4.
+--
+-- The first form also builds the existing front end's graph for the same root
+-- and compares, module by module in graph order, the identity the adapter
+-- gives (name and origin) and the source path, as `identity` differences:
+-- the program comparison uses the adapter's own module names on both sides, so
+-- this is what proves the adapter names modules as the existing front end does.
+-- The last line is the summary:
+--
+--   summary modules=<n> compared=<n> skipped=<n> declarations=<n> differences=<n>
+--
+-- This tool imports the existing compiler and the discovery stage, so it
+-- lives beside the existing front end's tools, outside `compiler_new`, whose
+-- sources and tests must not import the existing compiler.
+import:
+	../../../src/compiler/discovery_adapter:
+		COMPILER_EMBEDDED_TEXTS,
+		CompilerEmbeddedTexts,
+		DeclarationReader,
+		LegacyAdapterError,
+		LegacyModuleNaming,
+		legacy_adapter_error_message,
+		legacy_declaration_reader,
+		legacy_embedded_path,
+		legacy_frontend_graph,
+		legacy_parsed_declarations,
+		legacy_source_file,
+	../../../src/compiler/frontend_request: FrontendGraphContext, FrontendSourcePackage
+	../../../src/compiler/stage_01_generated_inputs/embedded_std: embedded_std_source
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
+	../../../src/compiler/stage_03_parse/parsed_ast_json: parsed_program_to_json
+	../../../src/compiler/stage_03_parse/source_ast_finalize:
+		finalize_interpolation_program,
+		finalized_typecheck_program_ast,
+	../../../src/compiler/stage_04_modules/frontend_graph: FrontendModule, frontend_graph_modules
+	../../../src/compiler/stage_04_modules/loaded_module:
+		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
+		resolved_module_canonical_path,
+		resolved_module_origin,
+	../../../src/compiler_new/stage_01_discovery/pipeline:
+		ImplicitModules,
+		compiler_implicit_modules,
+		discover,
+		test_implicit_modules,
+	../../../src/compiler_new/stage_01_discovery/sources/embedded_standard_library:
+		EmbeddedStandardLibraryProvider,
+		embedded_lookup_roots,
+	../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		FILE_SYSTEM_SOURCE_PROVIDER,
+		FileSystemSourceProvider,
+		SourceLookupRoots,
+		SourcePackageRoot,
+		SourceProvider,
+	../../../src/compiler_new/stage_01_discovery/tables/builder: ModuleRow, module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
+		module_count,
+		module_row,
+		path_text,
+		source_row,
+	../../../src/lib/cli_plan: CliParsedSourceFile
+	../../../src/lib/source: SourceFile, source_file
+	../../../src/lib/source_graph:
+		CliSourceGraphSetup,
+		frontend_compilation_graph_for_roots_with_setup_and_test_runtime,
+		parse_cli_source_with_setup,
+	discovery_adapter_comparison: JsonDifference, declarations_only, program_differences
+	module_order_options:
+		ModuleOrderMode(TestMode),
+		ModuleOrderOptions,
+		SourcePackageSpec,
+		StandardLibrarySource(StandardLibraryEmbedded, StandardLibraryOnDisk),
+		parse_module_order_options,
+	system: read_file
+
+
+STANDARD_LIBRARY_ROOT: String = "standard_library/src"
+
+NATIVE_PACKAGE_ROOT: String = "pkg"
+
+FILES_MODE: String = "files"
+
+FILES_ARGUMENT: Int = 2
+
+SOURCE_FILE_SUFFIX: String = ".brp"
+
+ROOT_MODULE_NAME: String = "main"
+
+EXIT_USAGE: Int = 2
+
+EXIT_INVARIANT_VIOLATION: Int = 3
+
+EXIT_ADAPTER_ERROR: Int = 4
+
+---
+The most differing fields reported for one module; a module that differs
+everywhere is one problem, not hundreds of lines.
+---
+MAX_DIFFERENCES_PER_MODULE: Int = 40
+
+
+-- The comparison of one module.
+union ModuleComparison:
+	ModuleCompared(Int, List[JsonDifference])
+	ModuleSkipped(String)
+	ModuleNotRebuilt(String)
+
+
+---
+The text of the source of a module as the existing front end reads it: an
+embedded module from the embedded texts by its module name, any other from the
+file system.
+---
+func existing_source_text(source: SourceFile) -> Result[String, String]:
+	if source.path == legacy_embedded_path(source.module_name):
+		match embedded_std_source(source.module_name):
+			Some(text):
+				Ok(text)
+			None:
+				Err("the embedded standard library has no ${source.module_name}")
+	else:
+		read_file(source.path)
+
+
+---
+One module: the existing parser over its source, against the adapter's program
+from the tables. A module the existing parser rejects is skipped before the
+adapter runs, since the adapter rebuilds only what the parser accepted.
+---
+func compare_module(reader: DeclarationReader, module: Int, row: ModuleRow) -> ModuleComparison:
+	match legacy_source_file(reader, module_id_at_row(module)):
+		Ok(source):
+			match existing_source_text(source):
+				Ok(text):
+					existing: ParsedProgram = parse_compiler_source(
+						source_file(
+							source.path,
+							source.module_name,
+							text,
+						),
+					)
+
+					-- The verdict is the one `compiler-new-parity` compares: parse, then
+					-- finalize the interpolation holes, which can reject a file the raw
+					-- parse accepts.
+					if not finalize_interpolation_program(existing).diagnostics.is_empty():
+						ModuleSkipped("rejected by the existing parser")
+					else:
+						compare_accepted(reader, module, row, existing, text)
+				Err(message):
+					ModuleSkipped("unreadable: ${message}")
+		Err(error):
+			ModuleNotRebuilt(legacy_adapter_error_message(error))
+
+
+func compare_accepted(
+	reader: DeclarationReader,
+	module: Int,
+	row: ModuleRow,
+	existing: ParsedProgram,
+	text: String,
+) -> ModuleComparison:
+	match legacy_parsed_declarations(reader, module_id_at_row(module)):
+		Ok(adapted):
+			if row.diagnostics.count > 0:
+				ModuleCompared(
+					0,
+					[
+						{
+							declaration = "",
+							path = "diagnostics",
+							old_text = "0",
+							new_text = "${row.diagnostics.count}"
+						},
+					],
+				)
+			else:
+				differences: List[JsonDifference] = program_differences(
+					parsed_program_to_json(declarations_only(existing)),
+					parsed_program_to_json(adapted),
+				)
+
+				text_differences: List[JsonDifference] = if adapted.source.text == text:
+					[]
+				else:
+					[
+						{
+							declaration = "",
+							path = "source.text",
+							old_text = "${text.length()} bytes",
+							new_text = "${adapted.source.text.length()} bytes"
+						},
+					]
+
+				ModuleCompared(
+					adapted.decls.length(),
+					text_differences.concat(differences),
+				)
+		Err(error):
+			ModuleNotRebuilt(legacy_adapter_error_message(error))
+
+
+---
+A run: the roots to discover, how the existing front end names them, the
+implicit modules, where the standard library comes from and the source packages.
+---
+record DifferentialRun {
+	paths: List[String],
+	root_module_name: pure (String) -> String,
+	implicit: ImplicitModules,
+	standard_library: StandardLibrarySource,
+	source_packages: List[SourcePackageSpec],
+	graph_root: Option[String]
+}
+
+
+func run_from_options(options: ModuleOrderOptions) -> DifferentialRun:
+	implicit: ImplicitModules = if options.mode == TestMode:
+		test_implicit_modules()
+	else:
+		compiler_implicit_modules()
+
+	{
+		paths = [options.root],
+		root_module_name = pure func(request_path): ROOT_MODULE_NAME,
+		implicit = implicit,
+		standard_library = options.standard_library,
+		source_packages = options.source_packages,
+		graph_root = Some(options.root)
+	}
+
+
+---
+Every file of the listing at `listing_path` as a root, or `None` when it cannot
+be read.
+---
+func run_over_files(listing_path: String) -> Option[DifferentialRun]:
+	match read_file(listing_path):
+		Ok(listing):
+			Some({
+				paths = listing
+					.split("\n")
+					.filter(pure func(line): line != ""),
+				root_module_name = pure func(
+					request_path,
+				): request_path.remove_suffix(SOURCE_FILE_SUFFIX),
+				implicit = compiler_implicit_modules(),
+				standard_library = StandardLibraryOnDisk,
+				source_packages = [],
+				graph_root = None,
+			})
+		Err(_):
+			None
+
+
+func source_package_root(spec: SourcePackageSpec) -> SourcePackageRoot:
+	{
+		package_alias = spec.package_alias,
+		package_name = spec.package_name,
+		source_dir = spec.source_dir,
+		exports = spec.exports
+	}
+
+
+func main(args: List[String]) -> Int:
+	if args.get_or(1, "") == FILES_MODE:
+		match run_over_files(args.get_or(FILES_ARGUMENT, "")):
+			Some(run):
+				execute(run)
+			None:
+				print("usage: discovery_adapter_differential.brp files <listing>")
+				EXIT_USAGE
+	else:
+		match parse_module_order_options(args):
+			Ok(options):
+				execute(run_from_options(options))
+			Err(usage):
+				print(usage)
+				EXIT_USAGE
+
+
+---
+Discovers the run's roots with the provider its standard library needs, then
+compares every module.
+---
+func execute(run: DifferentialRun) -> Int:
+	source_packages: List[SourcePackageRoot] = run.source_packages.map(source_package_root)
+
+	match run.standard_library:
+		StandardLibraryOnDisk:
+			roots: SourceLookupRoots = {
+				standard_library_root = STANDARD_LIBRARY_ROOT,
+				native_package_roots = [NATIVE_PACKAGE_ROOT],
+				source_packages = source_packages
+			}
+			compare_discovered(FILE_SYSTEM_SOURCE_PROVIDER, roots, run)
+		StandardLibraryEmbedded:
+			roots: SourceLookupRoots = embedded_lookup_roots([NATIVE_PACKAGE_ROOT], source_packages)
+			provider: EmbeddedStandardLibraryProvider[CompilerEmbeddedTexts, FileSystemSourceProvider] = {
+				texts = COMPILER_EMBEDDED_TEXTS,
+				inner = FILE_SYSTEM_SOURCE_PROVIDER
+			}
+			compare_discovered(provider, roots, run)
+
+
+func compare_discovered[Provider:SourceProvider](
+	provider: Provider,
+	roots: SourceLookupRoots,
+	run: DifferentialRun,
+) -> Int:
+	match discover(provider, roots, run.paths, run.implicit):
+		FrozenTables(tables):
+			naming: LegacyModuleNaming = {root_module_name = run.root_module_name}
+
+			match legacy_declaration_reader(tables, naming):
+				Ok(reader):
+					print_comparison(tables, reader, naming, run)
+				Err(error):
+					print("adapter-error | ${legacy_adapter_error_message(error)}")
+					EXIT_ADAPTER_ERROR
+		TableInvariantsViolated(violations):
+			print("table invariants violated: ${violations.length()}")
+			EXIT_INVARIANT_VIOLATION
+
+
+func print_comparison(
+	tables: FrontendTables,
+	reader: DeclarationReader,
+	naming: LegacyModuleNaming,
+	run: DifferentialRun,
+) -> Int:
+	var compared: Int = 0
+	var skipped: Int = 0
+	var not_rebuilt: Int = 0
+	var declarations: Int = 0
+	var differing: Int = 0
+
+	for module in 0..module_count(tables):
+		row: ModuleRow = module_row(tables, module_id_at_row(module))
+		path: String = path_text(tables, source_row(tables, row.source).path)
+
+		match compare_module(reader, module, row):
+			ModuleCompared(count, differences):
+				compared += 1
+				declarations += count
+
+				for difference in differences.take(MAX_DIFFERENCES_PER_MODULE):
+					differing += 1
+					print(
+						"difference ${path} | ${difference.declaration} | ${difference.path} | old=${difference.old_text} | new=${difference.new_text}",
+					)
+			ModuleSkipped(reason):
+				skipped += 1
+				print("skipped ${path} | ${reason}")
+			ModuleNotRebuilt(message):
+				not_rebuilt += 1
+				print("adapter-error ${path} | ${message}")
+
+	for line in identity_lines(tables, naming, run):
+		if line.starts_with("adapter-error"):
+			not_rebuilt += 1
+		else:
+			differing += 1
+
+		print(line)
+
+	print(
+		"summary modules=${module_count(tables)} compared=${compared} skipped=${skipped} declarations=${declarations} differences=${differing}",
+	)
+
+	if not_rebuilt > 0:
+		EXIT_ADAPTER_ERROR
+	else:
+		0
+
+
+-- Module identities.
+func origin_text(origin: ModuleOrigin) -> String:
+	match origin:
+		StdlibModule:
+			"stdlib"
+		UserModule:
+			"user"
+		NativePackageModule(package_id):
+			"native-package:${package_id}"
+		SourcePackageModule(package_alias):
+			"source-package:${package_alias}"
+
+
+func frontend_source_package(spec: SourcePackageSpec) -> FrontendSourcePackage:
+	{
+		package_alias = spec.package_alias,
+		package_name = spec.package_name,
+		package_root = spec.source_dir,
+		source_dir = spec.source_dir,
+		exports = spec.exports
+	}
+
+
+func graph_context(run: DifferentialRun) -> FrontendGraphContext:
+	std_dir: Option[String] = match run.standard_library:
+		StandardLibraryOnDisk:
+			Some(STANDARD_LIBRARY_ROOT)
+		StandardLibraryEmbedded:
+			None
+
+	{
+		std_dir = std_dir,
+		source_packages = run.source_packages.map(frontend_source_package),
+		package_roots = [NATIVE_PACKAGE_ROOT]
+	}
+
+
+---
+The existing front end's modules for `root`, in graph order, or `None` when its
+discovery fails.
+---
+func existing_modules(root: String, run: DifferentialRun) -> Option[List[FrontendModule]]:
+	match read_file(root):
+		Ok(text):
+			setup: CliSourceGraphSetup = {
+				context = graph_context(run),
+				diagnostics = []
+			}
+			parsed: CliParsedSourceFile = parse_cli_source_with_setup(
+				setup,
+				{
+					path = root,
+					module_name = ROOT_MODULE_NAME,
+					source_text = text
+				},
+			)
+			with_test_runtime: Bool = run.implicit.module_names.length() > compiler_implicit_modules().module_names.length()
+
+			match frontend_compilation_graph_for_roots_with_setup_and_test_runtime(
+				setup,
+				[parsed],
+				with_test_runtime,
+			):
+				Ok(graph):
+					Some(frontend_graph_modules(graph.graph))
+				Err(_):
+					None
+		Err(_):
+			None
+
+
+---
+The name, origin and source path of a module as one text.
+---
+func identity_text(module: FrontendModule) -> String:
+	program: ParsedProgram = finalized_typecheck_program_ast(module.program)
+	"${resolved_module_canonical_path(module.identity)} ${origin_text(resolved_module_origin(module.identity))} ${program.source.path}"
+
+
+func identity_text_at(modules: List[FrontendModule], index: Int) -> String:
+	match modules.get(index):
+		Some(module):
+			identity_text(module)
+		None:
+			""
+
+
+---
+One `difference` line for each module whose identity or source path the adapter
+rebuilds differently from the existing front end's graph, in graph order; none
+for a run without a graph root.
+---
+func identity_lines(
+	tables: FrontendTables,
+	naming: LegacyModuleNaming,
+	run: DifferentialRun,
+) -> List[String]:
+	match run.graph_root:
+		Some(root):
+			match (
+				existing_modules(root, run),
+				legacy_frontend_graph(tables, naming, graph_context(run)),
+			):
+				(Some(existing), Ok(adapted)):
+					identity_differences(root, existing, frontend_graph_modules(adapted.graph))
+				(None, _):
+					[
+						"difference ${root} |  | identity | old=(the existing discovery failed) | new=",
+					]
+				(_, Err(error)):
+					["adapter-error ${root} | ${legacy_adapter_error_message(error)}"]
+		None:
+			[]
+
+
+func identity_differences(
+	root: String,
+	existing: List[FrontendModule],
+	rebuilt: List[FrontendModule],
+) -> List[String]:
+	var lines: List[String] = []
+
+	if existing.length() != rebuilt.length():
+		lines = lines.append(
+			"difference ${root} |  | identity.length | old=${existing.length()} | new=${rebuilt.length()}",
+		)
+
+	shared: Int = existing
+		.length()
+		.min(rebuilt.length())
+
+	for index in 0..shared:
+		old_text: String = identity_text_at(existing, index)
+		new_text: String = identity_text_at(rebuilt, index)
+
+		if old_text != new_text:
+			lines = lines.append(
+				"difference ${root} |  | identity[${index}] | old=${old_text} | new=${new_text}",
+			)
+
+	lines

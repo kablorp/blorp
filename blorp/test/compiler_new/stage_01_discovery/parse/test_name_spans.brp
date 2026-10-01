@@ -1,0 +1,400 @@
+-- The spans of names that do not span the whole of what they name, as the
+-- legacy adapter reads them from the frozen tables: type parameters, bounds,
+-- supertraits, imports and their aliases, foreign block arguments, and the
+-- name of a written type node. Each test parses one module and reads the text
+-- the span covers.
+import:
+	../../../../src/compiler_new/stage_01_discovery/pipeline: load_module
+	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		ModulePlacement(InUserCode),
+	../../../../src/compiler_new/stage_01_discovery/tables/builder:
+		DiscoveryBuilder,
+		NameId,
+		NodeId,
+		bound_id_at_row,
+		empty_discovery_builder,
+		import_id_at_row,
+		import_item_id_at_row,
+		name_id_at_row,
+		name_id_index,
+		node_id_at_row,
+		source_id_at_row,
+	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
+		bound_qualifier,
+		bound_row_at,
+		dimension_name_count,
+		dimension_name_row_at,
+		foreign_argument_row_at,
+		freeze,
+		import_alias,
+		import_block_row_at,
+		import_item_alias,
+		import_item_row_at,
+		import_row,
+		name_spelling,
+		node_count,
+		node_name_span,
+		node_row,
+		source_text,
+		supertrait_row_at,
+		type_parameter_row_at,
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
+		ModuleReach(RootModule),
+		NodeKind(
+			BoundedTypeNode,
+			DimensionNameTypeNode,
+			NamedTypeNode,
+			QualifiedTypeBoundNode,
+			QualifiedTypeNode,
+			VariadicDimensionNameTypeNode,
+			VariadicDimensionWildcardTypeNode,
+		),
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
+	test: TestSuite
+
+
+---
+The frozen tables of one module parsed from `text`, or `None` when they break
+an invariant.
+---
+pure func frozen(text: String) -> Option[FrontendTables]:
+	builder: DiscoveryBuilder = load_module(
+		empty_discovery_builder(),
+		{
+			path = "main.brp",
+			trusted_directory = ".",
+			placement = InUserCode
+		},
+		RootModule,
+		text,
+	)
+
+	match builder.freeze():
+		FrozenTables(tables):
+			Some(tables)
+		TableInvariantsViolated(_):
+			None
+
+
+---
+The source text `span` covers.
+---
+pure func covered(tables: FrontendTables, span: Span) -> String:
+	source_text(
+		tables,
+		source_id_at_row(0),
+	).substring(span_start(span), span_end(span) - span_start(span))
+
+
+---
+Every node of `kind`, in node order.
+---
+pure func nodes_of(tables: FrontendTables, kind: NodeKind) -> List[NodeId]:
+	var found: List[NodeId] = []
+
+	for index in 0..node_count(tables):
+		node: NodeId = node_id_at_row(index)
+
+		if node_row(tables, node).kind == kind:
+			found = found.append(node)
+
+	found
+
+
+---
+The first node of `kind`, if the tables have one.
+---
+pure func first_node(tables: FrontendTables, kind: NodeKind) -> Option[NodeId]:
+	nodes_of(tables, kind).get(0)
+
+
+---
+The name a node carries as its payload.
+---
+pure func node_name_of(tables: FrontendTables, node: NodeId) -> NameId:
+	name_id_at_row(node_row(tables, node).payload)
+
+
+---
+Whether the name span of the first node of `kind` covers `expected` while the
+node covers `whole`.
+---
+pure func node_names(
+	tables: FrontendTables,
+	kind: NodeKind,
+	expected: String,
+	whole: String,
+) -> Bool:
+	match first_node(tables, kind):
+		Some(node):
+			covered(
+				tables,
+				node_name_span(tables, node),
+			) == expected and covered(tables, node_row(tables, node).span) == whole
+		None:
+			False
+
+
+pure func test_a_type_parameter_name_is_narrower_than_its_bounds() -> Bool:
+	match frozen("func f[T: mm.Shape + Eq, #N, #_](x: T) -> T: x\n"):
+		Some(tables):
+			match (
+				type_parameter_row_at(tables, 0),
+				type_parameter_row_at(tables, 1),
+				type_parameter_row_at(tables, 2),
+			):
+				(Some(bounded), Some(dimension), Some(wildcard)):
+					(
+						covered(tables, bounded.name_span) == "T"
+						and covered(tables, bounded.span) == "T: mm.Shape + Eq"
+						and covered(tables, dimension.name_span) == "#N"
+						and covered(tables, wildcard.name_span) == "#_"
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_a_bound_names_its_trait_inside_the_qualified_reference() -> Bool:
+	match frozen("func f[T: mm.Shape + Eq](x: T) -> T: x\n"):
+		Some(tables):
+			match (
+				bound_row_at(tables, 0),
+				bound_row_at(tables, 1),
+				bound_qualifier(tables, bound_id_at_row(0)),
+			):
+				(Some(qualified), Some(plain), Some(written)):
+					(
+						covered(tables, qualified.name_span) == "Shape"
+						and covered(tables, qualified.span) == "mm.Shape"
+						and covered(tables, written.span) == "mm"
+						and covered(tables, plain.name_span) == "Eq"
+						and covered(tables, plain.span) == "Eq"
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_a_supertrait_names_its_trait_inside_the_qualified_reference() -> Bool:
+	match frozen("trait Sorted: mm.Ordered + Eq\n"):
+		Some(tables):
+			match supertrait_row_at(tables, 0):
+				Some(qualified):
+					(
+						covered(tables, qualified.name_span) == "Ordered"
+						and covered(tables, qualified.span) == "mm.Ordered"
+					)
+				None:
+					False
+		None:
+			False
+
+
+pure func test_an_import_names_its_path_alias_and_symbols() -> Bool:
+	match frozen(
+		"import:\n\t../a/b as ab\n\tc: Thing, other as renamed, Union(One, Two)\n\nx: Int = 1\n",
+	):
+		Some(tables):
+			match (
+				import_alias(tables, import_id_at_row(0)),
+				import_item_row_at(tables, import_item_id_at_row(1)),
+				import_item_alias(tables, import_item_id_at_row(1)),
+			):
+				(Some(module_alias), Some(renamed), Some(symbol_alias)):
+					(
+						covered(
+							tables,
+							import_row(tables, import_id_at_row(0)).path_span,
+						) == "../a/b"
+						and covered(
+							tables,
+							import_row(tables, import_id_at_row(0)).span,
+						) == "../a/b as ab"
+						and covered(tables, module_alias.span) == "ab"
+						and covered(tables, renamed.name_span) == "other"
+						and covered(tables, renamed.span) == "other as renamed"
+						and covered(tables, symbol_alias.span) == "renamed"
+						and covered(
+							tables,
+							import_row(
+								tables,
+								import_id_at_row(
+									1,
+								),
+							).span,
+						) == "c: Thing, other as renamed, Union(One, Two)"
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_an_import_block_ends_at_its_closing_dedent() -> Bool:
+	text: String = "import:\n\ta\n\tb\n\nx: Int = 1\n"
+
+	match frozen(text):
+		Some(tables):
+			match import_block_row_at(tables, 0):
+				Some(block):
+					-- Through the dedent before `x`, as the existing parser's span runs.
+					covered(tables, block.span) == "import:\n\ta\n\tb\n\n"
+				None:
+					False
+		None:
+			False
+
+
+pure func test_a_foreign_argument_names_itself_inside_its_value() -> Bool:
+	match frozen("foreign(include: \"stdio.h\", link: \"m\"):\n\tfunc puts(s: String) -> Int\n"):
+		Some(tables):
+			match foreign_argument_row_at(tables, 0):
+				Some(argument):
+					(
+						covered(tables, argument.name_span) == "include"
+						and covered(tables, argument.span) == "include: \"stdio.h\""
+					)
+				None:
+					False
+		None:
+			False
+
+
+pure func test_a_generic_named_type_names_itself_inside_its_arguments() -> Bool:
+	match frozen("a: List[Int] = x\n"):
+		Some(tables):
+			named: List[NodeId] = nodes_of(tables, NamedTypeNode)
+
+			-- The argument comes first (post-order); a name that is the whole node
+			-- needs no row and reads as the node's own span.
+			match (named.get(0), named.get(1)):
+				(Some(argument), Some(generic)):
+					covered(
+						tables,
+						node_name_span(tables, argument),
+					) == "Int" and covered(
+						tables,
+						node_name_span(tables, generic),
+					) == "List" and covered(tables, node_row(tables, generic).span) == "List[Int]"
+				_:
+					False
+		None:
+			False
+
+
+pure func test_a_qualified_type_names_itself_after_its_module() -> Bool:
+	match frozen("a: mm.Map[String, Int] = x\n"):
+		Some(tables):
+			node_names(tables, QualifiedTypeNode, "Map", "mm.Map[String, Int]")
+		None:
+			False
+
+
+pure func test_a_bounded_type_names_its_parameter_before_its_bounds() -> Bool:
+	match frozen("a: Map[String, T: mm.Eq + Hash] = x\n"):
+		Some(tables):
+			(
+				node_names(tables, BoundedTypeNode, "T", "T: mm.Eq + Hash")
+				and node_names(tables, QualifiedTypeBoundNode, "Eq", "mm.Eq")
+			)
+		None:
+			False
+
+
+pure func test_a_variadic_dimension_names_itself_before_its_dots() -> Bool:
+	match frozen("a: Tensor[Float, #Ds...] = x\nb: Tensor[Float, #_...] = x\n"):
+		Some(tables):
+			(
+				node_names(tables, VariadicDimensionNameTypeNode, "#Ds", "#Ds...")
+				and node_names(tables, VariadicDimensionWildcardTypeNode, "#_", "#_...")
+			)
+		None:
+			False
+
+
+---
+The spelling of the sigil name the dimension name rows pair with `name`, or the
+empty text when no row does.
+---
+pure func sigil_spelling(tables: FrontendTables, name: NameId) -> String:
+	var found: String = ""
+
+	for index in 0..dimension_name_count(tables):
+		match dimension_name_row_at(tables, index):
+			Some(pair):
+				if name_id_index(pair.name) == name_id_index(name):
+					found = name_spelling(tables, pair.sigil_name)
+			None:
+				void
+
+	found
+
+
+pure func test_a_dimension_name_has_its_hash_spelling() -> Bool:
+	match frozen("func f[#Rows](x: Float[#Rows, #Cols]) -> Int: 0\n"):
+		Some(tables):
+			match (type_parameter_row_at(tables, 0), first_node(tables, DimensionNameTypeNode)):
+				(Some(parameter), Some(node)):
+					declared: String = sigil_spelling(tables, parameter.name)
+					used: String = sigil_spelling(
+						tables,
+						node_name_of(tables, node),
+					)
+					declared == "#Rows" and used == "#Rows"
+				_:
+					False
+		None:
+			False
+
+
+tests: TestSuite = {
+	description = "Discovery name spans",
+	tests = [
+		(
+			"a type parameter name is narrower than its bounds",
+			test_a_type_parameter_name_is_narrower_than_its_bounds,
+		),
+		(
+			"a bound names its trait inside the qualified reference",
+			test_a_bound_names_its_trait_inside_the_qualified_reference,
+		),
+		(
+			"a supertrait names its trait inside the qualified reference",
+			test_a_supertrait_names_its_trait_inside_the_qualified_reference,
+		),
+		(
+			"an import names its path, alias and symbols",
+			test_an_import_names_its_path_alias_and_symbols,
+		),
+		(
+			"an import block ends at its closing dedent",
+			test_an_import_block_ends_at_its_closing_dedent,
+		),
+		(
+			"a foreign argument names itself inside its value",
+			test_a_foreign_argument_names_itself_inside_its_value,
+		),
+		(
+			"a generic named type names itself inside its arguments",
+			test_a_generic_named_type_names_itself_inside_its_arguments,
+		),
+		(
+			"a qualified type names itself after its module",
+			test_a_qualified_type_names_itself_after_its_module,
+		),
+		(
+			"a bounded type names its parameter before its bounds",
+			test_a_bounded_type_names_its_parameter_before_its_bounds,
+		),
+		(
+			"a variadic dimension names itself before its dots",
+			test_a_variadic_dimension_names_itself_before_its_dots,
+		),
+		("a dimension name has its hash spelling", test_a_dimension_name_has_its_hash_spelling),
+	]
+}

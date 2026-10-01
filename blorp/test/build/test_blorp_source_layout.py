@@ -40,21 +40,24 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		temporary_cross_owner_imports: dict[str, list[str]] | None = None,
 		forbidden_top_level_paths: list[str] | None = None,
 		isolated_test_owners: list[str] | None = None,
+		owner_roots: list[str] | None = None,
 	) -> None:
-		(root / "blorp/src/compiler").mkdir(parents=True)
-		(root / "blorp/src/run").mkdir(parents=True)
-		(root / "blorp/src/format").mkdir(parents=True)
-		(root / "blorp/src/test").mkdir(parents=True)
-		(root / "blorp/src/lib").mkdir(parents=True)
-		(root / "blorp/test/compiler").mkdir(parents=True)
-		(root / "blorp/test/test").mkdir(parents=True)
+		for owner in owner_roots or []:
+			(root / "blorp/src" / owner).mkdir(parents=True, exist_ok=True)
+		(root / "blorp/src/compiler").mkdir(parents=True, exist_ok=True)
+		(root / "blorp/src/run").mkdir(parents=True, exist_ok=True)
+		(root / "blorp/src/format").mkdir(parents=True, exist_ok=True)
+		(root / "blorp/src/test").mkdir(parents=True, exist_ok=True)
+		(root / "blorp/src/lib").mkdir(parents=True, exist_ok=True)
+		(root / "blorp/test/compiler").mkdir(parents=True, exist_ok=True)
+		(root / "blorp/test/test").mkdir(parents=True, exist_ok=True)
 		(root / "blorp/source_ownership.json").write_text(
 			json.dumps(
 				{
 					"version": 1,
 					"source_root": "blorp/src",
 					"test_root": "blorp/test",
-					"owner_roots": ["compiler", "run", "format", "test"],
+					"owner_roots": ["compiler", "run", "format", "test", *(owner_roots or [])],
 					"composition_roots": ["main.brp"],
 					"legacy_source_roots": [],
 					"forbidden_top_level_paths": forbidden_top_level_paths or [],
@@ -92,6 +95,94 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("cross-owner import", result.stderr)
+
+	def test_rejects_cross_owner_import_written_as_a_module_alias(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root)
+			(root / "blorp/src/compiler/command.brp").write_text(
+				"import:\n\t../run/command as command\n",
+				encoding="utf-8",
+			)
+			(root / "blorp/src/run/command.brp").write_text("", encoding="utf-8")
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("cross-owner import", result.stderr)
+
+	def test_rejects_cross_owner_import_without_symbols(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root)
+			(root / "blorp/src/compiler/command.brp").write_text(
+				"import:\n\t../run/command\n",
+				encoding="utf-8",
+			)
+			(root / "blorp/src/run/command.brp").write_text("", encoding="utf-8")
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("cross-owner import", result.stderr)
+
+	def test_symbols_below_an_import_are_not_taken_for_modules(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(root)
+			# `main` is a symbol of `./sibling`; read as a module it would resolve to
+			# the source root's `main.brp`, which no compiler module may import.
+			(root / "blorp/src/compiler/command.brp").write_text(
+				"import:\n\t./sibling:\n\t\tmain\n",
+				encoding="utf-8",
+			)
+			(root / "blorp/src/compiler/sibling.brp").write_text("", encoding="utf-8")
+			(root / "blorp/src/main.brp").write_text("", encoding="utf-8")
+
+			result = self.run_checker(root)
+
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def write_compiler_new_importers(self, root: Path, importer: str) -> None:
+		self.write_layout(
+			root,
+			owner_roots=["compiler_new"],
+			temporary_cross_owner_imports={
+				"compiler/discovery_adapter.brp": ["compiler_new/tables.brp"],
+			},
+		)
+		(root / "blorp/src/compiler_new/tables.brp").write_text("", encoding="utf-8")
+		(root / "blorp/src/compiler/discovery_adapter.brp").write_text(
+			"import:\n\t../compiler_new/tables as Tables\n",
+			encoding="utf-8",
+		)
+		(root / f"blorp/src/compiler/{importer}.brp").write_text(
+			"import:\n\t../compiler_new/tables as Tables\n",
+			encoding="utf-8",
+		)
+
+	def test_only_the_registered_adapter_may_import_compiler_new(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_compiler_new_importers(root, "pipeline")
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn(
+				"cross-owner import compiler -> compiler_new: compiler/pipeline.brp",
+				result.stderr,
+			)
+			self.assertNotIn("compiler/discovery_adapter.brp imports", result.stderr)
+
+	def test_the_adapter_alone_imports_compiler_new_in_the_repository_manifest(self) -> None:
+		manifest = json.loads((ROOT / "blorp/source_ownership.json").read_text(encoding="utf-8"))
+		importers = {
+			importer
+			for importer, targets in manifest["temporary_cross_owner_imports"].items()
+			if any(target.startswith("compiler_new/") for target in targets)
+		}
+		self.assertEqual(importers, {"compiler/discovery_adapter.brp"})
 
 	def test_accepts_one_registered_temporary_cross_owner_import(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:

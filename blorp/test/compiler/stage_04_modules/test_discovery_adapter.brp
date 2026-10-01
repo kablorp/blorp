@@ -1,0 +1,511 @@
+-- The legacy discovery adapter over small programs: each declaration construct
+-- is rebuilt from the stage's tables and compared with the existing parser's
+-- program through the same declaration-level comparison the corpus differential
+-- (`tools/discovery_adapter_differential.brp`) runs, plus the adapter's own
+-- module naming and graph assembly.
+import:
+	../../../src/compiler/discovery_adapter:
+		DeclarationReader,
+		LegacyAdapterError(MissingTableRow),
+		LegacyModuleNaming,
+		legacy_adapter_error_message,
+		legacy_declaration_reader,
+		legacy_frontend_graph,
+		legacy_parsed_declarations,
+	../../../src/compiler/frontend_request: FrontendGraphContext
+	../../../src/compiler/stage_02_lex/name_table: name_spelling, name_table_synthesized_spellings
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDecl(FunctionParsedDecl, VarParsedDecl),
+		ParsedExpr(ParsedVoidExpr),
+		ParsedProgram,
+	../../../src/compiler/stage_03_parse/parsed_ast_json: parsed_program_to_json
+	../../../src/compiler/stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	../../../src/compiler/stage_04_modules/frontend_graph:
+		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
+		frontend_graph_import_edges,
+		frontend_graph_modules,
+		frontend_graph_name_table,
+		frontend_graph_root_modules,
+	../../../src/compiler/stage_04_modules/loaded_module: resolved_module_canonical_path
+	../../../src/compiler_new/stage_01_discovery/pipeline: ImplicitModules, discover
+	../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		InMemorySourceProvider,
+		SourceLookupRoots,
+	../../../src/compiler_new/stage_01_discovery/tables/builder: module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
+	../../../src/compiler_new/stage_01_discovery/tables/invariants:
+		DiscoveryTable(DimensionNameTable),
+	../../../src/compiler_new/stage_01_discovery/tables/name_vocabulary: SEEDED_NAME_SPELLINGS
+	../../../src/lib/source: source_file
+	../tools/discovery_adapter_comparison: JsonDifference, declarations_only, program_differences
+	test: TestSuite
+
+
+LOOKUP_ROOTS: SourceLookupRoots = {
+	standard_library_root = "std",
+	native_package_roots = ["pkg"],
+	source_packages = []
+}
+
+NO_IMPLICIT_MODULES: ImplicitModules = {module_names = []}
+
+ROOT_PATH: String = "app/main.brp"
+
+ROOT_MODULE_NAME: String = "main"
+
+NAMING: LegacyModuleNaming = {root_module_name = pure func(request_path): ROOT_MODULE_NAME}
+
+CONTEXT: FrontendGraphContext = {
+	std_dir = Some("std"),
+	source_packages = [],
+	package_roots = ["pkg"]
+}
+
+
+---
+The tables discovery builds for `sources`'s root `app/main.brp`, or `None`
+(with the violations printed) when they break an invariant.
+---
+func discovered(sources: Dict[String, String]) -> Option[FrontendTables]:
+	provider: InMemorySourceProvider = {sources = sources}
+
+	match discover(provider, LOOKUP_ROOTS, [ROOT_PATH], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			Some(tables)
+		TableInvariantsViolated(violations):
+			print("invariant violations: ${violations.length()}")
+			None
+
+
+---
+The reader over `tables`, or `None` (with the error printed).
+---
+func reader_of(tables: FrontendTables) -> Option[DeclarationReader]:
+	match legacy_declaration_reader(tables, NAMING):
+		Ok(reader):
+			Some(reader)
+		Err(error):
+			print(legacy_adapter_error_message(error))
+			None
+
+
+---
+The program the adapter rebuilds for the first module of `tables`, or `None`
+(with the error printed).
+---
+func adapted_first_module(tables: FrontendTables) -> Option[ParsedProgram]:
+	match reader_of(tables):
+		Some(reader):
+			match legacy_parsed_declarations(reader, module_id_at_row(0)):
+				Ok(adapted):
+					Some(adapted)
+				Err(error):
+					print(legacy_adapter_error_message(error))
+					None
+		None:
+			None
+
+
+---
+The differences between the existing parser's declaration-level program for
+`source` and the adapter's, or `None` when either front end rejects it.
+---
+func adapter_differences(source: String) -> Option[(Int, List[JsonDifference])]:
+	match discovered({ROOT_PATH => source}):
+		Some(tables):
+			existing: ParsedProgram = parse_compiler_source(
+				source_file(
+					ROOT_PATH,
+					ROOT_MODULE_NAME,
+					source,
+				),
+			)
+
+			match adapted_first_module(tables):
+				Some(adapted):
+					if existing.diagnostics.is_empty():
+						Some(
+							(
+								adapted.decls.length(),
+								program_differences(
+									parsed_program_to_json(declarations_only(existing)),
+									parsed_program_to_json(adapted),
+								),
+							),
+						)
+					else:
+						for diagnostic in existing.diagnostics.take(1):
+							print(
+								"the existing parser rejects the program: ${diagnostic.span.start_line}:${diagnostic.span.start_column} ${diagnostic.message}",
+							)
+
+						None
+				None:
+					None
+		None:
+			None
+
+
+---
+Whether the adapter rebuilds exactly `declarations` top-level declarations of
+`source`, and every field of them equals the existing parser's.
+---
+func rebuilds(source: String, declarations: Int) -> Bool:
+	match adapter_differences(source):
+		Some((count, differences)):
+			for difference in differences:
+				print(
+					"${difference.declaration} ${difference.path}: old=${difference.old_text} new=${difference.new_text}",
+				)
+
+			if count != declarations:
+				print("expected ${declarations} declarations, rebuilt ${count}")
+
+			differences.is_empty() and count == declarations
+		None:
+			False
+
+
+func test_functions_with_generics_and_bounds_match() -> Bool:
+	rebuilds(
+		"func largest[T: Orderable + Hashable, U](first: T, second: T, other: U) -> T:\n\tfirst\n\npure func apply[T: Equatable](value: T, step: pure (T) -> T) -> T:\n\tstep(value)\n",
+		2,
+	)
+
+
+func test_qualified_bounds_and_supertraits_match() -> Bool:
+	rebuilds(
+		"import:\n\t./shapes as shapes\n\nfunc area[T: shapes.Shape + Printable](item: T) -> Int:\n\t0\n\ntrait Solid: shapes.Shape + Printable\n\ntrait Layered[T: shapes.Shape]: shapes.Shape:\n\tpure func layers(self: T) -> Int\n",
+		4,
+	)
+
+
+func test_dimensions_ranges_and_constraints_match() -> Bool:
+	rebuilds(
+		"func dot[#N](left: Float[#N], right: Float[#N]) -> Float:\n\t0.0\n\nfunc shape[T, #Ds](tensor: Tensor[T, #Ds...]) -> Int:\n\t0\n\nfunc any_row[#_](row: Float[#_...]) -> Int:\n\t0\n\nfunc at[#N](index: ..#N, grid: Float[#N, 3]) -> Int:\n\t0\n\nfunc sum[#N, #M](left: Float[#N], right: Float[#M]) -> Float[(#N + #M)] where #N == #M, (#N * 2) == #M:\n\t0.0\n",
+		5,
+	)
+
+
+func test_function_and_tuple_types_match() -> Bool:
+	rebuilds(
+		"func apply(step: (Int, Int) -> Int, pair: (Int, Float), later: pure (Int) -> Int, nothing: ()) -> (Int, (Int, Float)):\n\t(1, (2, 3.0))\n\nfunc grouped(point: (Int)) -> Int:\n\t0\n",
+		2,
+	)
+
+
+func test_impls_and_traits_with_methods_match() -> Bool:
+	rebuilds(
+		"record Point {x: Float, y: Float}\n\ntrait Shape[T]:\n\tpure func area(self: T) -> Float\n\tfunc describe(self: T) -> String:\n\t\t\"shape\"\n\nimplements Shape for Point:\n\tpure func area(self: Point) -> Float:\n\t\tself.x\n\n\t@tail_recursive\n\tfunc describe(self: Point) -> String:\n\t\t\"point\"\n\nimplements Stringable for List[Int]:\n\tpure func to_string(self: List[Int]) -> String:\n\t\t\"list\"\n",
+		4,
+	)
+
+
+func test_unions_enums_and_variant_payloads_match() -> Bool:
+	rebuilds(
+		"union Shape[T]:\n\tCircle(Float)\n\tRect(Float, Float)\n\tLabelled(String, List[T])\n\tEmpty\n\nenum Color:\n\tRed\n\tGreen\n\nunion Either[L, R]:\n\tLeft(L)\n\tRight(R)\n",
+		3,
+	)
+
+
+func test_records_and_structs_match() -> Bool:
+	rebuilds(
+		"record Point {x: Float, y: Float}\n\nrecord Box[T: Equatable] {value: T, items: List[T]}\n\nstruct Pair {first: Int, second: Int}\n\nrecord Empty {}\n",
+		4,
+	)
+
+
+func test_foreign_blocks_match() -> Bool:
+	rebuilds(
+		"foreign(include: \"stdio.h\", link: \"m\"):\n\tfunc puts(text: String) -> Int = \"c_puts\"\n\tpure func fabs(value: Float) -> Float\n\tprivate func hidden(value: Int) -> Int\n\nforeign:\n\t@debug_only func other() -> Int\n",
+		2,
+	)
+
+
+func test_private_declarations_match() -> Bool:
+	rebuilds(
+		"private func helper() -> Int:\n\t1\n\nprivate pure func quiet(value: Int) -> Int:\n\tvalue\n\nprivate limit: Int = 3\n\nprivate var counter: Int = 0\n\nprivate record Hidden {value: Int}\n\npublic_value: Int = 7\n",
+		6,
+	)
+
+
+func test_docstrings_and_the_module_docstring_match() -> Bool:
+	rebuilds(
+		"---\nWhat this module is.\n---\nimport:\n\t./a\n\n---\nWhat f does.\n---\nfunc f() -> Int:\n\t0\n\n---\nA record.\n---\nrecord Point {x: Int}\n\n---\nA trait.\n---\ntrait Shape[T]:\n\tpure func area(self: T) -> Float\n",
+		4,
+	)
+
+
+func test_imports_with_aliases_selections_and_variants_match() -> Bool:
+	rebuilds(
+		"import:\n\t./a as alpha\n\t../b: Thing, other as renamed\n\tlib/c: Option(Some, None), Result(Ok, Err)\n\tpkg/native/thing: Handle\n\tplain\n\nimport:\n\t./again\n",
+		2,
+	)
+
+
+func test_aliases_builtin_resource_and_global_declarations_match() -> Bool:
+	rebuilds(
+		"type alias Index = Int\n\ntype alias Pair[T] = (T, T)\n\nopaque type Token = String\n\ntype Bytes[T] = builtin\n\nresource type Handle = builtin(\"close_handle\")\n\nanswer: Int = 42\n\nvar total: Int = 0\n\nname = \"blorp\"\n",
+		8,
+	)
+
+
+func test_annotated_functions_match() -> Bool:
+	rebuilds(
+		"@tail_recursive\n@no_copy\nfunc loop(count: Int) -> Int:\n\tcount\n\n@debug_only\nfunc trace() -> Int:\n\t0\n",
+		2,
+	)
+
+
+func test_parameter_binders_match() -> Bool:
+	rebuilds(
+		"func binders(_: Int, (left, right): (Int, Int), named: String, _ignored, (a, b, c): (Int, Int, Int)) -> Int:\n\t0\n",
+		1,
+	)
+
+
+func test_non_ascii_text_spans_match() -> Bool:
+	rebuilds(
+		"-- café ☃\n---\nDocumentation with über and ☃.\n---\nfunc plain(value: Int) -> Int:\n\t0\n\n-- 日本語\nrecord Point {x: Int}\n",
+		2,
+	)
+
+
+private pure func is_placeholder(body: Option[ParsedExpr]) -> Bool:
+	match body:
+		Some(ParsedVoidExpr(_)):
+			True
+		_:
+			False
+
+
+func test_a_declaration_with_a_body_gets_the_placeholder_body() -> Bool:
+	match discovered(
+		{ROOT_PATH => "func f() -> Int:\n\t1\n\nfunc g() -> Int\n\nanswer: Int = 4\n"},
+	):
+		Some(tables):
+			match adapted_first_module(tables):
+				Some(adapted):
+					match (adapted.decls.get(0), adapted.decls.get(1), adapted.decls.get(2)):
+						(Some(FunctionParsedDecl(with_body)), Some(FunctionParsedDecl(without_body)), Some(VarParsedDecl(global))):
+							(
+								is_placeholder(with_body.body)
+								and without_body.body.is_none()
+								and is_placeholder(Some(global.value))
+							)
+						_:
+							False
+				None:
+					False
+		None:
+			False
+
+
+func test_the_comparison_reports_a_changed_field() -> Bool:
+	source: String = "func f(value: Int) -> Int:\n\tvalue\n"
+	existing: ParsedProgram = parse_compiler_source(
+		source_file(
+			ROOT_PATH,
+			ROOT_MODULE_NAME,
+			source,
+		),
+	)
+	changed: ParsedProgram = { existing | decls = existing.decls.drop(1) }
+	differences: List[JsonDifference] = program_differences(
+		parsed_program_to_json(declarations_only(existing)),
+		parsed_program_to_json(changed),
+	)
+
+	(
+		differences.length() == 1
+		and differences.any(pure func(difference): difference.path == "decls.length")
+	)
+
+
+func test_the_adapter_names_modules_as_the_existing_front_end_does() -> Bool:
+	match discovered({
+		ROOT_PATH => "import:\n\t./helper\n\tstd_item\n",
+		"app/helper.brp" => "x: Int = 1\n",
+		"std/std_item.brp" => "y: Int = 2\n",
+	}):
+		Some(tables):
+			match reader_of(tables):
+				Some(reader):
+					reader.module_names == ["main", "app/helper", "std_item"]
+				None:
+					False
+		None:
+			False
+
+
+func test_a_native_package_module_is_named_by_its_request() -> Bool:
+	match discovered({
+		ROOT_PATH => "import:\n\tpkg/toolkit/format\n",
+		"pkg/toolkit/format.brp" => "y: Int = 2\n",
+	}):
+		Some(tables):
+			match reader_of(tables):
+				Some(reader):
+					reader.module_names == ["main", "pkg/toolkit/format"]
+				None:
+					False
+		None:
+			False
+
+
+func test_a_table_the_parser_left_incomplete_is_an_error_not_a_default() -> Bool:
+	-- A `#` with no name after it: the parser reports it and records a dimension
+	-- parameter with no name, which has no sigil name row to read.
+	match discovered({ROOT_PATH => "func f[#](x: Int) -> Int: x\n"}):
+		Some(tables):
+			match reader_of(tables):
+				Some(reader):
+					match legacy_parsed_declarations(reader, module_id_at_row(0)):
+						Err(MissingTableRow(DimensionNameTable, _)):
+							True
+						_:
+							False
+				None:
+					False
+		None:
+			False
+
+
+func test_the_graph_has_the_modules_roots_and_edges_of_the_sources() -> Bool:
+	match discovered({
+		ROOT_PATH => "import:\n\t./helper\n\tstd_item\n\tmissing_module\n",
+		"app/helper.brp" => "import:\n\tstd_item\n\nx: Int = 1\n",
+		"std/std_item.brp" => "y: Int = 2\n",
+	}):
+		Some(tables):
+			match legacy_frontend_graph(tables, NAMING, CONTEXT):
+				Ok(compilation):
+					paths: List[String] = frontend_graph_modules(
+						compilation.graph,
+					).map(
+						pure func(module): resolved_module_canonical_path(module.identity),
+					)
+					roots: List[String] = frontend_graph_root_modules(
+						compilation.graph,
+					).map(
+						pure func(module): resolved_module_canonical_path(module.identity),
+					)
+					edges: List[String] = frontend_graph_import_edges(
+						compilation.graph,
+					).map(
+						pure func(edge): edge_text(edge.requested_path, edge.resolution),
+					)
+					(
+						paths == ["main", "app/helper", "std_item"]
+						and roots == ["main"]
+						and edges == [
+							"./helper -> app/helper",
+							"std_item -> std_item",
+							"missing_module -> unresolved",
+							"std_item -> std_item",
+						]
+					)
+				Err(_):
+					False
+		None:
+			False
+
+
+private pure func edge_text(requested_path: String, resolution: FrontendImportResolution) -> String:
+	match resolution:
+		FrontendResolvedImport(target):
+			"${requested_path} -> ${resolved_module_canonical_path(target)}"
+		FrontendUnresolvedImport:
+			"${requested_path} -> unresolved"
+
+
+func test_graph_identifiers_are_spelled_by_the_stages_name_table() -> Bool:
+	match discovered({ROOT_PATH => "func spelled(value: Int) -> Int:\n\tvalue\n"}):
+		Some(tables):
+			match legacy_frontend_graph(tables, NAMING, CONTEXT):
+				Ok(compilation):
+					names = frontend_graph_name_table(compilation.graph)
+
+					match frontend_graph_root_modules(compilation.graph).get(0):
+						Some(module):
+							match finalized_typecheck_program_ast(module.program).decls.get(0):
+								Some(FunctionParsedDecl(function_decl)):
+									(
+										name_spelling(
+											names,
+											function_decl.name.name,
+										) == Some("spelled")
+										and function_decl.name.text == "spelled"
+									)
+								_:
+									False
+						None:
+							False
+				Err(_):
+					False
+		None:
+			False
+
+
+func test_the_stages_seed_names_equal_the_existing_vocabulary() -> Bool:
+	SEEDED_NAME_SPELLINGS == name_table_synthesized_spellings()
+
+
+tests: TestSuite = {
+	description = "Legacy discovery adapter, declarations",
+	tests = [
+		("generic functions and bounds match", test_functions_with_generics_and_bounds_match),
+		("qualified bounds and supertraits match", test_qualified_bounds_and_supertraits_match),
+		("dimensions, ranges and constraints match", test_dimensions_ranges_and_constraints_match),
+		("function and tuple types match", test_function_and_tuple_types_match),
+		("impls and traits with methods match", test_impls_and_traits_with_methods_match),
+		("unions, enums and variant payloads match", test_unions_enums_and_variant_payloads_match),
+		("records and structs match", test_records_and_structs_match),
+		("foreign blocks match", test_foreign_blocks_match),
+		("private declarations match", test_private_declarations_match),
+		(
+			"docstrings and the module docstring match",
+			test_docstrings_and_the_module_docstring_match,
+		),
+		(
+			"imports with aliases, selections and variants match",
+			test_imports_with_aliases_selections_and_variants_match,
+		),
+		(
+			"aliases, builtin and resource types and globals match",
+			test_aliases_builtin_resource_and_global_declarations_match,
+		),
+		("annotated functions match", test_annotated_functions_match),
+		("parameter binders match", test_parameter_binders_match),
+		("spans after non-ASCII text match", test_non_ascii_text_spans_match),
+		("a body is the placeholder", test_a_declaration_with_a_body_gets_the_placeholder_body),
+		("the comparison reports a changed field", test_the_comparison_reports_a_changed_field),
+		(
+			"modules are named as the existing front end names them",
+			test_the_adapter_names_modules_as_the_existing_front_end_does,
+		),
+		(
+			"a native package module is named by its request",
+			test_a_native_package_module_is_named_by_its_request,
+		),
+		(
+			"a table the parser left incomplete is an error, not a default",
+			test_a_table_the_parser_left_incomplete_is_an_error_not_a_default,
+		),
+		(
+			"the graph has the modules, roots and edges of the sources",
+			test_the_graph_has_the_modules_roots_and_edges_of_the_sources,
+		),
+		(
+			"graph identifiers are spelled by the stage's name table",
+			test_graph_identifiers_are_spelled_by_the_stages_name_table,
+		),
+		(
+			"the stage's seed names equal the existing vocabulary",
+			test_the_stages_seed_names_equal_the_existing_vocabulary,
+		),
+	]
+}

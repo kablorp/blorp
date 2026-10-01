@@ -7,7 +7,7 @@ old lexer, parser and module loader stop being part of a compile. The design
 lives in `docs/DISCOVERY_TABLES_DESIGN.md`; this document only orders the
 work and says what "accepted" means.
 
-## Where we are (2026-09-30)
+## Where we are (2026-10-01)
 
 - **Landed:** the stage itself (tables, builder, invariants, lexer, module
   graph, declaration, type, pattern and body parsers) organized as
@@ -22,17 +22,26 @@ work and says what "accepted" means.
   count and order (item 1); the embedded standard-library provider and
   the source-package lookup rules, with the module-order differential
   also run on the embedded library and on source-package and native-package
-  fixture projects, identical in modules, order and origins (item 5).
+  fixture projects, identical in modules, order and origins (item 5); and the
+  declaration half of the legacy adapter, `legacy_frontend_graph` in
+  `blorp/src/compiler/discovery_adapter.brp`, which rebuilds every module's
+  declarations, imports, docstrings and surface from the tables and equals the
+  existing parser's over the corpus under a declaration-level differential
+  (item 3).
 - **Measured on the self-compile inputs:** 0.65 s user CPU against 1.3 s for
   the existing discovery; 4.3 G instructions against 8.6 G; about 500 k
   allocations against 7.9 M.
 - **Verified:** token parity and accept/reject parity with the existing front
   end over every tracked file, about 45 constructs compared by hand, and one
   pinned fixture per diagnostic code.
-- **Not verified:** that the trees are the same. Accept/reject agreement says
-  nothing about precedence, attachment, spans or diagnostics after the first,
-  and it only covers constructs the corpus happens to use (a probe found the
-  old parser accepting `./a/../a/b` imports that the grammar forbids).
+- **Not verified:** that the trees are the same below the declarations. The
+  declaration-level differential (item 3) found the declarations, types,
+  imports and docstrings equal, spans included, for every corpus module both
+  parsers accept; bodies are compared by whether they exist only. Accept/reject
+  agreement says nothing about precedence, attachment, spans or diagnostics
+  after the first, and it only covers constructs the corpus happens to use (a
+  probe found the old parser accepting `./a/../a/b` imports that the grammar
+  forbids).
 
 ## What "accepted" means
 
@@ -138,12 +147,28 @@ more. Each numbered item is one change.
    side-table row (`BoundQualifierRow`, `SupertraitQualifierRow`). Not done:
    `implements module.Trait for X`, which needs typecheck to carry the
    implemented trait's identity instead of its name.
-3. **Adapter, declarations (M).** `legacy_frontend_graph` rebuilds each
+3. **Adapter, declarations (M). Landed.** `legacy_frontend_graph` rebuilds each
    module's declarations, signatures, types, imports and surfaces, with
    bodies left empty, plus the source table that spans render through and
    the docstrings declarations carry; the differential compares
    declaration-level AST JSON over the corpus. The first cost measurement
    (criterion 5) happens here.
+   The differential (`blorp/test/compiler/tools/discovery_adapter_differential.brp`,
+   run by `compiler-new-parity` over every module-order root, with the standard
+   library on disk and embedded and on the native-package and source-package
+   fixtures, and over every corpus file as a root) finds no difference over 3,170
+   modules and 46,731 declarations in the corpus run, and the existing graph's
+   module names, origins and paths equal the adapter's on every root, so
+   `ADAPTER_DIFFERENCES` is empty. Making it so closed these stage gaps: the
+   name spans of type parameters, bounds, supertraits, imports, aliases and
+   foreign arguments; a name span side table for written types; the `#N`
+   spelling beside `N`; the end of an import and of an import block; and the
+   vocabulary, which seeded 158 of the existing compiler's 236 names so every
+   later id differed from its `NAME_ID_*` constant. The stage plus the adapter
+   costs 5.68 G instructions against the existing discovery's 10.20 G
+   (`benchmarks/results/discovery_adapter_declarations_2026-10-01.md`); the
+   declaration half is 26% of the margin, and the body half is not in that
+   number.
 4. **Adapter, bodies (L).** Expressions, statements and patterns, with spans;
    the differential compares the full AST JSON for every corpus module
    (criterion 1).

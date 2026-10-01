@@ -59,30 +59,27 @@ def compare_first(old: str, new: str, **allowances):
 
 
 class CompilerNewParityTests(unittest.TestCase):
-	def test_module_order_agrees_after_normalizing_discovery_paths(self) -> None:
-		problems = parity.module_order_problems(
-			"compile",
-			"blorp/src/main.brp",
-			["main", "prelude", "tuple", "blorp/src/a", "option"],
-			[
-				"blorp/src/main.brp",
-				"standard_library/src/prelude.brp",
-				"standard_library/src/tuple.brp",
-				"blorp/src/a.brp",
-				"standard_library/src/option.brp",
-			],
-		)
-		self.assertEqual(problems, [])
+	def test_module_order_agrees_when_both_dumpers_print_the_same_lines(self) -> None:
+		check = parity.OrderCheck("compile root", "compile", "blorp/src/main.brp", 3)
+		lines = [
+			"user blorp/src/main.brp",
+			"stdlib standard_library/src/prelude.brp",
+			"stdlib standard_library/src/tuple.brp",
+		]
+		self.assertEqual(parity.module_order_problems(check, lines, list(lines)), [])
 
 	def test_module_order_names_the_first_difference(self) -> None:
+		check = parity.OrderCheck("test root", "test", "blorp/src/main.brp", 1)
 		problems = parity.module_order_problems(
-			"test",
-			"blorp/src/main.brp",
-			["main", "prelude", "tuple", "test"],
-			["blorp/src/main.brp", "standard_library/src/prelude.brp", "standard_library/src/tuple.brp"],
+			check,
+			["user blorp/src/main.brp", "stdlib standard_library/src/prelude.brp", "stdlib standard_library/src/test.brp"],
+			["user blorp/src/main.brp", "stdlib standard_library/src/prelude.brp"],
 		)
 		self.assertTrue(problems[0].startswith("module order differs for test root"))
-		self.assertIn("position 3: existing test, discovery (none)", problems[1])
+		self.assertIn(
+			"position 2: existing stdlib standard_library/src/test.brp, discovery (none)",
+			problems[1],
+		)
 
 	def test_hash_and_adjacent_name_merge_into_a_dimension_name(self) -> None:
 		merged = parity.merge_dimension_names(
@@ -271,6 +268,109 @@ class CompilerNewParityTests(unittest.TestCase):
 		corpus = set(parity.corpus_files())
 		for path in parity.KNOWN_DIVERGENCES:
 			self.assertIn(path, corpus)
+
+	def adapter_output(self, *lines: str) -> str:
+		return "\n".join(lines) + "\n"
+
+	def adapter_problems(self, output: str, allowances=(), used=None, expected_skipped=None) -> list[str]:
+		return parity.adapter_problems(
+			"adapter differential, test root",
+			parity.parse_adapter_output(output),
+			allowances,
+			set() if used is None else used,
+			set() if expected_skipped is None else expected_skipped,
+		)
+
+	def test_a_clean_adapter_run_has_no_problems(self) -> None:
+		output = self.adapter_output(
+			"skipped a.brp | rejected by the existing parser",
+			"summary modules=3 compared=2 skipped=1 declarations=40 differences=0",
+		)
+		report = parity.parse_adapter_output(output)
+		self.assertEqual((report.modules, report.compared, report.skipped, report.declarations), (3, 2, 1, 40))
+		self.assertEqual(report.skipped_paths, ["a.brp"])
+		self.assertEqual(self.adapter_problems(output, expected_skipped={"a.brp"}), [])
+
+	def test_a_module_skipped_without_being_rejected_fails_the_adapter_run(self) -> None:
+		output = self.adapter_output(
+			"skipped a.brp | rejected by the existing parser",
+			"summary modules=3 compared=2 skipped=1 declarations=40 differences=0",
+		)
+		joined = "\n".join(self.adapter_problems(output, expected_skipped=set()))
+		self.assertIn("skipped without being rejected", joined)
+
+	def test_a_rejected_module_that_is_not_skipped_fails_the_adapter_run(self) -> None:
+		output = self.adapter_output("summary modules=3 compared=3 skipped=0 declarations=40 differences=0")
+		joined = "\n".join(self.adapter_problems(output, expected_skipped={"b.brp"}))
+		self.assertIn("rejected but not skipped", joined)
+
+	def test_an_adapter_error_line_is_a_problem(self) -> None:
+		output = self.adapter_output(
+			"adapter-error a.brp | the tables hold no row 3 of DefinitionTable",
+			"summary modules=1 compared=0 skipped=0 declarations=0 differences=0",
+		)
+		self.assertIn("could not rebuild a module", "\n".join(self.adapter_problems(output)))
+
+	def test_an_unlisted_adapter_difference_names_module_declaration_and_field(self) -> None:
+		output = self.adapter_output(
+			"difference app/a.brp | helper | decls[1].function.span.end_column | old=7 | new=9",
+			"summary modules=1 compared=1 skipped=0 declarations=2 differences=1",
+		)
+		joined = "\n".join(self.adapter_problems(output))
+		self.assertIn("app/a.brp | helper | decls[1].function.span.end_column", joined)
+		self.assertIn("existing parser: 7", joined)
+		self.assertIn("adapter:         9", joined)
+
+	def test_an_adapter_difference_value_may_contain_the_separators(self) -> None:
+		output = self.adapter_output(
+			"difference a.brp | f | decls[0].doc | old=\"a \\| b\" | new=\"a \\| new=c\"",
+			"summary modules=1 compared=1 skipped=0 declarations=1 differences=1",
+		)
+		report = parity.parse_adapter_output(output)
+		self.assertEqual(report.problems, [])
+		self.assertEqual((report.differences[0].old, report.differences[0].new), ('"a | b"', '"a | new=c"'))
+
+	def test_a_listed_adapter_difference_is_allowed_and_marked_used(self) -> None:
+		output = self.adapter_output(
+			"difference app/a.brp | helper | decls[1].function.doc | old=null | new=\"x\"",
+			"summary modules=1 compared=1 skipped=0 declarations=2 differences=1",
+		)
+		entry = parity.AdapterDifference(r"decls\[\d+\]\.function\.doc", "a reason", declaration="helper")
+		used: set = set()
+		self.assertEqual(self.adapter_problems(output, (entry,), used), [])
+		self.assertEqual(used, {entry})
+		self.assertEqual(parity.stale_adapter_allowances((entry,), used), [])
+
+	def test_an_adapter_allowance_for_another_declaration_does_not_apply(self) -> None:
+		output = self.adapter_output(
+			"difference app/a.brp | helper | decls[1].function.doc | old=null | new=\"x\"",
+			"summary modules=1 compared=1 skipped=0 declarations=2 differences=1",
+		)
+		entry = parity.AdapterDifference(r".*", "a reason", declaration="other")
+		self.assertTrue(self.adapter_problems(output, (entry,)))
+
+	def test_an_unused_adapter_allowance_is_stale(self) -> None:
+		entry = parity.AdapterDifference(r"decls\[0\]", "a reason")
+		problems = parity.stale_adapter_allowances((entry,), set())
+		self.assertIn("ADAPTER_DIFFERENCES entry no module needs any more", problems[0])
+
+	def test_an_adapter_run_that_printed_no_summary_fails(self) -> None:
+		self.assertIn("printed no summary", "\n".join(self.adapter_problems("")))
+
+	def test_an_adapter_run_that_compared_nothing_fails(self) -> None:
+		output = self.adapter_output("summary modules=2 compared=0 skipped=2 declarations=0 differences=0")
+		self.assertIn("no module was compared", "\n".join(self.adapter_problems(output)))
+
+	def test_unknown_adapter_output_fails(self) -> None:
+		output = self.adapter_output(
+			"table invariants violated: 3",
+			"summary modules=1 compared=1 skipped=0 declarations=1 differences=0",
+		)
+		self.assertIn("unexpected adapter differential output", "\n".join(self.adapter_problems(output)))
+
+	def test_the_repository_lists_no_unexplained_adapter_difference(self) -> None:
+		for entry in parity.ADAPTER_DIFFERENCES:
+			self.assertTrue(entry.reason.strip())
 
 
 if __name__ == "__main__":

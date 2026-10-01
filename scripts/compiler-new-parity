@@ -21,6 +21,14 @@ sequentially, over the whole file list:
   * `blorp/test/compiler/tools/legacy_front_end_dump.brp` (existing compiler),
   * `blorp/test/compiler_new/tools/corpus_dump.brp` (discovery stage).
 
+It also runs the legacy adapter's differential
+(`discovery_adapter_differential.brp`): for the same two roots, and once over
+every corpus file as a root of one discovery, each module's declarations
+rebuilt from the discovery stage's tables by `discovery_adapter.brp` must equal
+the existing parser's, field for field and span for span, with bodies replaced
+by the adapter's placeholder on both sides. A deliberate difference needs an
+`ADAPTER_DIFFERENCES` entry naming it and its reason.
+
 It also checks module order: for one compile root and one `blorp test` root,
 the existing front end's module graph (`legacy_module_order_dump.brp`) and the
 discovery stage's (`discovery_module_order_dump.brp`) must list the same modules,
@@ -61,6 +69,7 @@ LEGACY_DUMPER = "blorp/test/compiler/tools/legacy_front_end_dump.brp"
 DISCOVERY_DUMPER = "blorp/test/compiler_new/tools/corpus_dump.brp"
 LEGACY_ORDER_DUMPER = "blorp/test/compiler/tools/legacy_module_order_dump.brp"
 DISCOVERY_ORDER_DUMPER = "blorp/test/compiler/tools/discovery_module_order_dump.brp"
+ADAPTER_DIFFERENTIAL = "blorp/test/compiler/tools/discovery_adapter_differential.brp"
 
 # The dumpers' command line (see `module_order_options.brp`): the standard
 # library from the compiler's embedded texts, and one source package.
@@ -152,6 +161,26 @@ ORDER_CHECKS = (
     ),
 )
 
+# The adapter differential runs over the order checks' roots, and over every
+# corpus file as a root of one discovery (`files` mode), which reaches files no
+# import does, fixtures included.
+ADAPTER_FILES_MODE = "files"
+
+MAX_REPORTED_ADAPTER_DIFFERENCES = 20
+
+DIFFERENCE_PREFIX = "difference "
+SKIPPED_PREFIX = "skipped "
+ADAPTER_ERROR_PREFIX = "adapter-error"
+# The differential's exit status when the adapter could not rebuild a module;
+# its output then names the module, so the run is a reported failure.
+ADAPTER_ERROR_STATUS = 4
+SKIPPED_REASON_SEPARATOR = " | "
+SUMMARY_PREFIX = "summary "
+DIFFERENCE_FIELD_SEPARATOR = " | "
+ESCAPED_FIELD_SEPARATOR = " \\| "
+NEW_VALUE_MARKER = " | new="
+OLD_VALUE_PREFIX = "old="
+
 FILE_HEADER_PREFIX = "== "
 UNREADABLE_PREFIX = "unreadable "
 LEXER_COUNT_PREFIX = "lexer_diagnostics "
@@ -216,6 +245,36 @@ class WordingDifference:
         for name, text in found.groupdict().items():
             expected = expected.replace("{" + name + "}", text)
         return expected == discovery_text
+
+
+@dataclass(frozen=True)
+class AdapterDifference:
+    """A field the legacy adapter and the existing parser deliberately disagree on.
+
+    `path` is a regular expression the whole JSON path of the differing field
+    must match (`decls[3].function.params[0].span.end_column`); `declaration`
+    and `module` restrict the entry to a declaration name or a module path when
+    they are not `None`. An entry no difference uses is an error, so the list
+    cannot outlive the difference it names.
+    """
+
+    path: str
+    reason: str
+    declaration: str | None = None
+    module: str | None = None
+
+    def allows(self, difference: "AdapterFieldDifference") -> bool:
+        return (
+            re.fullmatch(self.path, difference.path) is not None
+            and (self.declaration is None or self.declaration == difference.declaration)
+            and (self.module is None or self.module == difference.module)
+        )
+
+
+# Fields on which the adapter's parsed AST differs from the existing parser's
+# on purpose, each with why. There are none: the adapter rebuilds the existing
+# parser's declarations exactly. A difference that is not listed fails the gate.
+ADAPTER_DIFFERENCES: tuple[AdapterDifference, ...] = ()
 
 
 # Why a message differs. Positions must still agree whatever the wording.
@@ -625,6 +684,175 @@ def compare_dumps(
     )
 
 
+@dataclass(frozen=True)
+class AdapterFieldDifference:
+    """One field `discovery_adapter_differential.brp` found to differ."""
+
+    module: str
+    declaration: str
+    path: str
+    old: str
+    new: str
+
+
+@dataclass
+class AdapterReport:
+    """What one run of the adapter differential printed."""
+
+    modules: int
+    compared: int
+    skipped: int
+    skipped_paths: list[str]
+    declarations: int
+    differences: list[AdapterFieldDifference]
+    problems: list[str]
+
+
+def parse_adapter_output(text: str) -> AdapterReport:
+    """The differences and totals in the differential's output.
+
+    A run that printed no summary, or printed lines this does not know, is a
+    problem: the check must not pass because the tool died or changed format.
+    """
+    differences: list[AdapterFieldDifference] = []
+    skipped_paths: list[str] = []
+    problems: list[str] = []
+    summary: dict[str, int] | None = None
+    for line in text.splitlines():
+        if line.startswith(DIFFERENCE_PREFIX):
+            body = line[len(DIFFERENCE_PREFIX):]
+            head, marker, new_value = body.rpartition(NEW_VALUE_MARKER)
+            fields = head.split(DIFFERENCE_FIELD_SEPARATOR, 3)
+            if not marker or len(fields) != 4 or not fields[3].startswith(OLD_VALUE_PREFIX):
+                problems.append(f"unreadable adapter difference line: {line}")
+                continue
+            differences.append(
+                AdapterFieldDifference(
+                    module=fields[0],
+                    declaration=fields[1],
+                    path=fields[2],
+                    old=fields[3][len(OLD_VALUE_PREFIX):].replace(
+                        ESCAPED_FIELD_SEPARATOR, DIFFERENCE_FIELD_SEPARATOR
+                    ),
+                    new=new_value.replace(ESCAPED_FIELD_SEPARATOR, DIFFERENCE_FIELD_SEPARATOR),
+                )
+            )
+        elif line.startswith(SKIPPED_PREFIX):
+            skipped_paths.append(line[len(SKIPPED_PREFIX):].split(SKIPPED_REASON_SEPARATOR, 1)[0])
+        elif line.startswith(ADAPTER_ERROR_PREFIX):
+            problems.append(f"the adapter could not rebuild a module: {line}")
+        elif line.startswith(SUMMARY_PREFIX):
+            summary = {
+                name: int(value)
+                for name, _, value in (item.partition("=") for item in line[len(SUMMARY_PREFIX):].split())
+            }
+        elif line.strip():
+            problems.append(f"unexpected adapter differential output: {line}")
+    if summary is None:
+        problems.append("the adapter differential printed no summary")
+        summary = {}
+    return AdapterReport(
+        modules=summary.get("modules", 0),
+        compared=summary.get("compared", 0),
+        skipped=summary.get("skipped", 0),
+        skipped_paths=skipped_paths,
+        declarations=summary.get("declarations", 0),
+        differences=differences,
+        problems=problems,
+    )
+
+
+def adapter_problems(
+    description: str,
+    report: AdapterReport,
+    allowances: tuple[AdapterDifference, ...],
+    used: set[AdapterDifference],
+    expected_skipped: set[str],
+) -> list[str]:
+    """Why a differential run fails: unlisted differences, an unreadable run, a
+    run that compared nothing, or a skipped set that is not `expected_skipped`
+    (the modules the existing parser is known to reject), so a module that
+    silently stops being compared fails the gate. Allowances it needs are added
+    to `used`."""
+    problems = [f"{description}: {problem}" for problem in report.problems]
+    skipped = set(report.skipped_paths)
+    if skipped != expected_skipped and not report.problems:
+        extra = sorted(skipped - expected_skipped)
+        missing = sorted(expected_skipped - skipped)
+        problems.append(
+            f"{description}: skipped modules differ from the ones the existing parser rejects: "
+            f"{len(extra)} skipped without being rejected (for example {extra[:1]}), "
+            f"{len(missing)} rejected but not skipped (for example {missing[:1]})"
+        )
+    unlisted: list[AdapterFieldDifference] = []
+    for difference in report.differences:
+        entry = next((entry for entry in allowances if entry.allows(difference)), None)
+        if entry is None:
+            unlisted.append(difference)
+        else:
+            used.add(entry)
+    for difference in unlisted[:MAX_REPORTED_ADAPTER_DIFFERENCES]:
+        label = difference.declaration or "(module)"
+        problems.append(
+            f"{description}: {difference.module} | {label} | {difference.path}\n"
+            f"    existing parser: {difference.old}\n"
+            f"    adapter:         {difference.new}"
+        )
+    if len(unlisted) > MAX_REPORTED_ADAPTER_DIFFERENCES:
+        problems.append(
+            f"{description}: {len(unlisted) - MAX_REPORTED_ADAPTER_DIFFERENCES} more differences not shown"
+        )
+    if report.compared == 0 and not report.problems:
+        problems.append(f"{description}: no module was compared")
+    return problems
+
+
+def stale_adapter_allowances(
+    allowances: tuple[AdapterDifference, ...], used: set[AdapterDifference]
+) -> list[str]:
+    """Allowances no run needs any more."""
+    return [
+        f"ADAPTER_DIFFERENCES entry no module needs any more ({entry.path!r}: {entry.reason}); remove it"
+        for entry in allowances
+        if entry not in used
+    ]
+
+
+def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tuple[list[str], list[str], int]:
+    """Run the adapter differential over each `ORDER_CHECKS` root, with the same
+    options the module-order check runs it with, and over the corpus listed in
+    `file_list`: (notes, problems, failed checks). The root runs skip nothing;
+    the corpus run skips exactly `rejected_files`. Each run is a check, and so is
+    the list of allowances."""
+    binary = build_dumper(ADAPTER_DIFFERENTIAL, work)
+    notes: list[str] = []
+    problems: list[str] = []
+    failed = 0
+    used: set[AdapterDifference] = set()
+    runs = [
+        (check.description, (check.mode, check.root, *check.options), set())
+        for check in ORDER_CHECKS
+    ]
+    runs.append(("every corpus file as a root", (ADAPTER_FILES_MODE, str(file_list)), rejected_files))
+    for description, arguments, expected_skipped in runs:
+        report = parse_adapter_output(run_dumper(binary, *arguments, allowed_statuses=(0, ADAPTER_ERROR_STATUS)))
+        found = adapter_problems(
+            f"adapter differential, {description}", report, ADAPTER_DIFFERENCES, used, expected_skipped
+        )
+        problems.extend(found)
+        failed += bool(found)
+        if not found:
+            notes.append(
+                f"adapter agrees with the existing parser for {description}: "
+                f"{report.compared} modules compared, {report.skipped} rejected by the existing "
+                f"parser, {report.declarations} declarations"
+            )
+    stale = stale_adapter_allowances(ADAPTER_DIFFERENCES, used)
+    problems.extend(stale)
+    failed += bool(stale)
+    return notes, problems, failed
+
+
 def corpus_files() -> list[str]:
     """Tracked `.brp` files under the corpus roots, in a fixed order."""
     listing = subprocess.run(
@@ -662,14 +890,14 @@ def build_dumper(source: str, work: Path) -> Path:
     return binary
 
 
-def run_dumper(binary: Path, *arguments: str | Path) -> str:
+def run_dumper(binary: Path, *arguments: str | Path, allowed_statuses: tuple[int, ...] = (0,)) -> str:
     result = subprocess.run(
         [str(binary), *(str(argument) for argument in arguments)],
         cwd=REPO_ROOT,
         capture_output=True,
         check=False,
     )
-    if result.returncode != 0:
+    if result.returncode not in allowed_statuses:
         sys.stdout.write(f"FAIL: {binary.name} exited with status {result.returncode}\n")
         sys.stdout.write(result.stderr.decode("utf-8", "replace"))
         raise SystemExit(1)
@@ -824,6 +1052,13 @@ def main() -> int:
         # Each root is one more check, failing when its module order differs.
         comparison.files += len(ORDER_CHECKS)
         comparison.mismatched_files += sum(1 for line in order_problems if line.startswith("module order "))
+        rejected = {path for path, dump in legacy_files.items() if dump.parse_diagnostics > 0}
+        adapter_notes, adapter_problem_lines, adapter_failures = check_adapter(work, file_list, rejected)
+        comparison.notes.extend(adapter_notes)
+        comparison.problems.extend(adapter_problem_lines)
+        # Each adapter run, and the allowance list, is one more check.
+        comparison.files += len(ORDER_CHECKS) + 2
+        comparison.mismatched_files += adapter_failures
         missing = set(files) - (set(legacy_files) & set(discovery_files))
         if missing:
             comparison.problems.append(f"dumps omit {len(missing)} corpus files, for example {sorted(missing)[0]}")
