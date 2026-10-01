@@ -191,6 +191,13 @@ shared, it retains only inherited values needed by the result, moves the
 replacements into one new record, releases the consumed source owner, and leaves
 all other source owners unchanged.
 
+`record_update_ownership` decides which updates take their source's owner:
+the target of `x = { x | ... }`, a consuming clone's owned parameter in the
+clone's result, and an immutable record binding updated where nothing reads
+it afterwards on straight-line control flow within the binding's block (SSA
+renaming gives an unconditional `x = { x | ... }` exactly that form). Every
+other update builds a fresh record.
+
 Field release must honor `NoReleasePolicy`, `ArcReleasePolicy`,
 `ArcReleaseOnlyPolicy`, and `StackResultReleasePolicy`; managed does not imply
 ordinary `blorp_release`. Before ownership lowering, `RecordUpdateExpr` contains

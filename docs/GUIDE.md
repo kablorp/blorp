@@ -1130,7 +1130,8 @@ name: String = p.name
 p2: Person = {p | age = 31}
 p3: Person = {p | name = "Bob", age = 25}
 
--- An eligible self-update may reuse storage when the old value is unique.
+-- A self-update, or an update of a binding not used afterwards, may reuse
+-- storage when the old value is unique.
 var player: Person = {name = "Alice", age = 30}
 player = { player | age = player.age + 1 }
 ```

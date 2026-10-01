@@ -95,6 +95,68 @@ pure func tail_call_reading_var_in_another_argument(t: Tables, also_other: Bool)
 	append_row(out, out.rows.length())
 
 
+pure func update_after_call(t: Tables, v: Int) -> Tables:
+	var out: Tables = forward(t, v)
+	out = { out | other = out.other.append(v) }
+	out
+
+
+pure func update_of_call_result(t: Tables, v: Int) -> Tables:
+	out: Tables = forward(t, v)
+	{ out | other = out.other.append(v) }
+
+
+---
+Each of these holds the call result somewhere before updating it, then reads
+what it held: a lambda capture, an alias, a list element, a union payload.
+The update takes the binding over, so the holder's reference must make it
+copy.
+---
+pure func update_after_closure_capture(t: Tables, v: Int) -> List[List[Int]]:
+	s: Tables = forward(t, v)
+	read_rows = pure func() -> List[Int]: s.rows
+	updated: Tables = { s | rows = s.rows.append(v + 1) }
+	[read_rows(), updated.rows]
+
+
+pure func update_after_alias(t: Tables, v: Int) -> List[List[Int]]:
+	s: Tables = forward(t, v)
+	same: Tables = s
+	updated: Tables = { s | rows = s.rows.append(v + 1) }
+	[same.rows, updated.rows]
+
+
+pure func update_after_list_element(t: Tables, v: Int) -> List[List[Int]]:
+	s: Tables = forward(t, v)
+	held: List[Tables] = [s]
+	updated: Tables = { s | rows = s.rows.append(v + 1) }
+	held_rows: List[Int] = held.get(0).map(func(kept): kept.rows).get_or([])
+	[held_rows, updated.rows]
+
+
+pure func update_after_union_payload(t: Tables, v: Int) -> List[List[Int]]:
+	s: Tables = forward(t, v)
+	holder: Holder = Holding(s)
+	updated: Tables = { s | rows = s.rows.append(v + 1) }
+
+	held_rows: List[Int] = match holder:
+		Holding(kept):
+			kept.rows
+		Empty:
+			[]
+
+	[held_rows, updated.rows]
+
+
+---
+The call result is read after its update, so the update must copy it.
+---
+pure func update_of_call_result_read_afterwards(t: Tables, v: Int) -> List[Tables]:
+	out: Tables = forward(t, v)
+	updated: Tables = { out | other = out.other.append(v) }
+	[out, updated]
+
+
 pure func append_unless(t: Tables, v: Int, skip: Bool) -> Tables:
 	if skip:
 		t
@@ -282,6 +344,49 @@ func test_tail_call_argument_reads_var_before_hand_off() -> Bool:
 	saved.rows == [4, 5] and t.rows == [4, 5, 2, 3] and t.other == [0]
 
 
+func test_saved_binding_keeps_old_value_through_update_after_call() -> Bool:
+	var t: Tables = empty_tables()
+	saved: Tables = t
+	t = update_after_call(t, 2)
+	after_first: Tables = t
+	t = update_of_call_result(t, 3)
+
+	(
+		saved.rows == [1]
+		and saved.other.is_empty()
+		and after_first.rows == [1, 2]
+		and after_first.other == [2]
+		and t.rows == [1, 2, 3]
+		and t.other == [2, 3]
+	)
+
+
+func test_call_result_read_after_its_update_keeps_old_value() -> Bool:
+	var t: Tables = empty_tables()
+	pair: List[Tables] = update_of_call_result_read_afterwards(t, 2)
+	before_update: Tables = pair.get(0).get_or(t)
+	after_update: Tables = pair.get(1).get_or(t)
+
+	(
+		t.rows == [1]
+		and before_update.rows == [1, 2]
+		and before_update.other.is_empty()
+		and after_update.rows == [1, 2]
+		and after_update.other == [2]
+	)
+
+
+func test_call_result_held_before_its_update_keeps_old_value() -> Bool:
+	expected: List[List[Int]] = [[1, 2], [1, 2, 3]]
+
+	(
+		update_after_closure_capture(empty_tables(), 2) == expected
+		and update_after_alias(empty_tables(), 2) == expected
+		and update_after_list_element(empty_tables(), 2) == expected
+		and update_after_union_payload(empty_tables(), 2) == expected
+	)
+
+
 func test_union_payload_keeps_old_value() -> Bool:
 	var t: Tables = empty_tables()
 	holder: Holder = Holding(t)
@@ -453,6 +558,18 @@ tests: TestSuite = {
 		(
 			"tail call argument reads var before hand-off",
 			test_tail_call_argument_reads_var_before_hand_off,
+		),
+		(
+			"saved binding keeps old value through update after call",
+			test_saved_binding_keeps_old_value_through_update_after_call,
+		),
+		(
+			"call result read after its update keeps old value",
+			test_call_result_read_after_its_update_keeps_old_value,
+		),
+		(
+			"call result held before its update keeps old value",
+			test_call_result_held_before_its_update_keeps_old_value,
 		),
 		("union payload keeps old value", test_union_payload_keeps_old_value),
 		("nested record keeps old value", test_nested_record_keeps_old_value),

@@ -1234,6 +1234,246 @@ pure func test_record_result_without_owned_parameter_builds_fresh_record() -> Bo
 	)
 
 
+---
+A `CounterBox` update `{ fresh | count = 11 }` in the carrier form the
+frontend lowers record updates to.
+---
+pure func counter_box_update_of(source: CoreVar) -> CoreExpr:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	carrier_var: CoreVar = {
+		name = "__record_update_${source.name}",
+		id = source.id + 100,
+		def_id = None,
+		origin = AuthoredBinder
+	}
+	carrier_ref: CoreExpr = VarExpr(carrier_var, box_type, synthetic_core_source_loc())
+
+	LetExpr(
+		carrier_var,
+		False,
+		box_type,
+		VarExpr(source, box_type, synthetic_core_source_loc()),
+		RecordUpdateExpr(
+			carrier_ref,
+			[
+				{
+					ref = core_field_ref(0),name = "count",
+					value = LiteralExpr(IntLiteral(11), int_type(), synthetic_core_source_loc())
+				},
+				{
+					ref = core_field_ref(2),name = "limit",
+					value = FieldExpr(carrier_ref, "limit", core_field_ref(2), int_type(), synthetic_core_source_loc())
+				},
+			],
+			box_type,
+			synthetic_core_source_loc(),
+		),
+	)
+
+
+pure func local_box_var(name: String, id: Int) -> CoreVar:
+	{
+		name = name,
+		id = id,
+		def_id = None,
+		origin = AuthoredBinder
+	}
+
+
+---
+`rebuild_box()` binds a call result to `fresh`, binds `updated = { fresh |
+count = 11 }` (the shape SSA renaming gives `var out = make_box(); out = {
+out | count = 11 }`), and ends in `tail`.
+---
+pure func owned_local_update_program(tail: CoreExpr) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	fresh_var: CoreVar = local_box_var("fresh", 1)
+	make_box: CoreExpr = CallExpr(
+		UserCall("make_box", Some(7), []),
+		VarExpr(
+			local_box_var("make_box", 0),
+			FunctionType(True, [], box_type),
+			synthetic_core_source_loc(),
+		),
+		[],
+		box_type,
+		synthetic_core_source_loc(),
+	)
+	body: CoreExpr = LetExpr(
+		fresh_var,
+		False,
+		box_type,
+		make_box,
+		LetExpr(local_box_var("updated", 2), False, box_type, counter_box_update_of(fresh_var), tail),
+	)
+
+	{
+		decls = [
+			counter_box_decl(),
+			FunctionDecl({
+				name = "rebuild_box",
+				source_module = None,
+				type_params = [],
+				params = [],
+				return_type = box_type,
+				body = Some(body),
+				is_pure = True,
+				origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+				module = FIXTURE_NO_SOURCE_MODULE,
+				function_kind = UserFunction,
+				def_id = 8,
+				loc = synthetic_core_source_loc(),
+			}),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func lowered_program_json(program: CoreProgram) -> String:
+	core_program_to_json(lower_record_updates_for_ownership(program)).to_string()
+
+
+---
+An update of a let-bound record that nothing reads afterwards ends that
+record's life, as `x = { x | ... }` does, so it updates in place.
+---
+pure func test_update_of_owned_local_at_last_use_transfers_owner() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	json: String = lowered_program_json(
+		owned_local_update_program(VarExpr(local_box_var("updated", 2), box_type, synthetic_core_source_loc())),
+	)
+
+	json.contains("\"kind\":\"record_cow_update\"") and not json.contains("\"kind\":\"record\"")
+
+
+---
+A binding still read after its update keeps its value: the update builds a
+fresh record.
+---
+pure func test_update_of_owned_local_read_afterwards_builds_fresh_record() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	read_after: CoreExpr = SeqExpr(
+		FieldExpr(
+			VarExpr(local_box_var("fresh", 1), box_type, synthetic_core_source_loc()),
+			"count",
+			core_field_ref(0),
+			int_type(),
+			synthetic_core_source_loc(),
+		),
+		VarExpr(local_box_var("updated", 2), box_type, synthetic_core_source_loc()),
+	)
+	json: String = lowered_program_json(owned_local_update_program(read_after))
+
+	json.contains("\"kind\":\"record\"") and not json.contains("\"kind\":\"record_cow_update\"")
+
+
+---
+A branch is a block of its own: a binding made and updated inside one arm is
+still taken over there.
+---
+pure func test_update_of_owned_local_inside_branch_transfers_owner() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	program: CoreProgram = owned_local_update_program(
+		VarExpr(local_box_var("updated", 2), box_type, synthetic_core_source_loc()),
+	)
+	branching: CoreProgram = match program.decls:
+		[record_decl, FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(block):
+					{ program |
+						decls = [
+							record_decl,
+							FunctionDecl(
+								{ function_info |
+									body = Some(
+										IfExpr(
+											LiteralExpr(BoolLiteral(True), bool_type(), synthetic_core_source_loc()),
+											block,
+											block,
+											box_type,
+											synthetic_core_source_loc(),
+										),
+									)
+								},
+							),
+						]
+					}
+				None:
+					program
+		_:
+			program
+	json: String = lowered_program_json(branching)
+
+	json.contains("\"kind\":\"record_cow_update\"") and not json.contains("\"kind\":\"record\"")
+
+
+---
+An update inside a loop of a binding made before the loop runs once per
+iteration, so it is never the binding's last use.
+---
+pure func test_update_of_owned_local_inside_loop_builds_fresh_record() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	fresh_var: CoreVar = local_box_var("fresh", 1)
+	loop_body: CoreExpr = LetExpr(
+		local_box_var("updated", 2),
+		False,
+		box_type,
+		counter_box_update_of(fresh_var),
+		VoidExpr(VoidType, synthetic_core_source_loc()),
+	)
+	program: CoreProgram = owned_local_update_program(
+		VarExpr(local_box_var("updated", 2), box_type, synthetic_core_source_loc()),
+	)
+	looping: CoreProgram = match program.decls:
+		[record_decl, FunctionDecl(function_info)]:
+			{ program |
+				decls = [
+					record_decl,
+					FunctionDecl(
+						{ function_info |
+							body = Some(
+								LetExpr(
+									fresh_var,
+									False,
+									box_type,
+									RecordConstructExpr(
+										"CounterBox",
+										[
+											{
+												ref = core_field_ref(0),name = "count",
+												value = LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())
+											},
+											{
+												ref = core_field_ref(2),name = "limit",
+												value = LiteralExpr(IntLiteral(2), int_type(), synthetic_core_source_loc())
+											},
+										],
+										box_type,
+										synthetic_core_source_loc(),
+									),
+									SeqExpr(
+										WhileExpr(
+											LiteralExpr(BoolLiteral(False), bool_type(), synthetic_core_source_loc()),
+											loop_body,
+											VoidType,
+											synthetic_core_source_loc(),
+										),
+										VarExpr(fresh_var, box_type, synthetic_core_source_loc()),
+									),
+								),
+							)
+						},
+					),
+				]
+			}
+		_:
+			program
+	json: String = lowered_program_json(looping)
+
+	json.contains("\"kind\":\"record\"") and not json.contains("\"kind\":\"record_cow_update\"")
+
+
 pure func consuming_record_update_loop_program() -> CoreProgram:
 	box_type: CoreType = HeapRecordType("CounterBox")
 	box_var: CoreVar = {
@@ -3065,6 +3305,22 @@ tests: TestSuite = {
 		(
 			"record result without owned parameter builds fresh record",
 			test_record_result_without_owned_parameter_builds_fresh_record,
+		),
+		(
+			"update of owned local at last use transfers owner",
+			test_update_of_owned_local_at_last_use_transfers_owner,
+		),
+		(
+			"update of owned local read afterwards builds fresh record",
+			test_update_of_owned_local_read_afterwards_builds_fresh_record,
+		),
+		(
+			"update of owned local inside branch transfers owner",
+			test_update_of_owned_local_inside_branch_transfers_owner,
+		),
+		(
+			"update of owned local inside loop builds fresh record",
+			test_update_of_owned_local_inside_loop_builds_fresh_record,
 		),
 		(
 			"preceding field read keeps consumed record reuse",
