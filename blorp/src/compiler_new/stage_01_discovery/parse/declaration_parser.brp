@@ -31,6 +31,7 @@ import:
 		append_foreign_c_name,
 		append_import_block,
 		append_member,
+		append_module_documentation,
 		append_pending_docstring,
 		append_plain_diagnostic,
 		append_resource_cleanup,
@@ -47,6 +48,7 @@ import:
 	../tables/diagnostic_code:
 		DiscoveryDiagnosticCode(
 			AnnotationWithoutFunctionDiagnostic,
+			DocstringBeforeImportBlockDiagnostic,
 			BuiltinTypeArgumentsDiagnostic,
 			ExpectedArrowDiagnostic,
 			ExpectedCleanupBuiltinNameDiagnostic,
@@ -92,6 +94,7 @@ import:
 		skip_newlines,
 		skip_optional_token,
 		span_before_current,
+		token_kind_at,
 	../tables/row_kinds:
 		DefinitionKind(
 			BuiltinTypeDefinition,
@@ -173,6 +176,7 @@ pure func parse_module_declarations(
 	module: ModuleId,
 ) -> DiscoveryBuilder:
 	var out: DiscoveryBuilder = builder.skip_newlines()
+	out = out.parse_module_documentation(module)
 
 	while not out.at(EndOfFileToken):
 		before: Int = out.token_cursor
@@ -183,6 +187,37 @@ pure func parse_module_declarations(
 			out = out.advance_token()
 
 	out
+
+
+---
+The module docstring: a docstring that opens the module and is followed
+directly by `import:`. It is recorded in `module_documentation`; any other
+leading docstring belongs to the declaration after it.
+---
+private pure func parse_module_documentation(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+) -> DiscoveryBuilder:
+	if builder.at(DocStringToken) and builder.docstring_opens_import_block():
+		span: Span = builder.current_span()
+		text: LiteralId = literal_id_at_row(builder.current_token().payload)
+		after: Int = builder.run_end_after(builder.token_cursor + 1, NewlineToken)
+		moved: DiscoveryBuilder = builder.move_token_cursor(after)
+		moved.append_module_documentation({
+			module = module,
+			text = text,
+			span = span,
+		})
+	else:
+		builder
+
+
+---
+Whether the docstring at the cursor is followed, past its newlines, by `import`.
+---
+private pure func docstring_opens_import_block(builder: DiscoveryBuilder) -> Bool:
+	after: Int = builder.run_end_after(builder.token_cursor + 1, NewlineToken)
+	builder.token_kind_at(after) == ImportKeyword
 
 
 ---
@@ -197,6 +232,7 @@ pure func parse_declaration(builder: DiscoveryBuilder, module: ModuleId) -> Disc
 		count = out.pending_docstring_count() - docstring_first
 	}
 	documented: Bool = docstring.count > 0
+	docstring_span: Span = start
 
 	annotation_start: Span = out.current_span()
 	annotations_first: Int = out.pending_annotation_count()
@@ -218,6 +254,10 @@ pure func parse_declaration(builder: DiscoveryBuilder, module: ModuleId) -> Disc
 
 	if annotations.count > 0 and not out.at(FuncKeyword):
 		out = out.report_at_current(AnnotationWithoutFunctionDiagnostic)
+
+	-- After the annotation report, like the old parser: both are reported.
+	if documented and out.at(ImportKeyword):
+		out = out.append_plain_diagnostic(DocstringBeforeImportBlockDiagnostic, docstring_span)
 
 	header: DeclarationHeader = {
 		module = module,

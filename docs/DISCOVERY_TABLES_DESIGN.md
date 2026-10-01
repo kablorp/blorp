@@ -205,6 +205,8 @@ struct ImportBlockRow {module: ModuleId, imports: RowRange, span: Span}
 struct ImportTargetRow {owner_import: ImportId, target: ModuleId}
 struct ImportAliasRow {owner_import: ImportId, alias_name: NameId}
 struct ImportItemAliasRow {item: ImportItemId, alias_name: NameId}
+-- The docstring that opens a module, directly before its first `import:` block.
+struct ModuleDocumentationRow {module: ModuleId, text: LiteralId, span: Span}
 ```
 
 The sketch's "stdlib request" became `BareModuleRequest`: the syntax does

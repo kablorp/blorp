@@ -7,11 +7,18 @@ import:
 		PackageMembership(NotInPackage),
 	../../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DiscoveryBuilder,
+		append_module_documentation,
 		empty_discovery_builder,
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: diagnostic_code_name
 	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
 		FreezeOutcome(FrozenTables, TableInvariantsViolated),
 		freeze,
+	../../../../src/compiler_new/stage_01_discovery/tables/invariants:
+		DiscoveryTable(ModuleDocumentationTable),
+		TableInvariantKind(DuplicateSideRow),
+		check_table_invariants,
+	../../../../src/compiler_new/stage_01_discovery/tables/name_vocabulary:
+		ALL_SEEDED_NAME_SPELLINGS,
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
 		ModuleOriginKind(UserModule),
 		ModuleReach(RootModule),
@@ -238,6 +245,91 @@ pure func test_malformed_declarations_are_reported_and_recovered() -> Bool:
 	)
 
 
+MODULE_DOCSTRING_SOURCE: String = (
+	"---\nModule summary.\n---\nimport:\n\tlist: List\n\n\nfunc main() -> Int:\n\t0\n"
+)
+
+
+pure func test_docstring_before_the_first_import_block_is_the_module_documentation() -> Bool:
+	builder: DiscoveryBuilder = parsed(MODULE_DOCSTRING_SOURCE)
+	rows_ok: Bool = match builder.module_documentation.get(0):
+		Some(row):
+			text: String = builder.literals
+				.get(row.text.literal_id_index())
+				.get_or("")
+			text.contains("Module summary.") and row.span.span_start() == 0
+		None:
+			False
+
+	(
+		rows_ok
+		and builder.module_documentation.length() == 1
+		and builder.documentation.is_empty()
+		and builder.import_blocks.length() == 1
+		and builder.diagnostics.is_empty()
+		and builder.freezes_with_invariants()
+	)
+
+
+pure func test_docstring_before_a_later_import_block_is_reported_at_the_docstring() -> Bool:
+	text: String = "import:\n\tlist: List\n\n---\nStray.\n---\nimport:\n\toption: Option\n"
+	builder: DiscoveryBuilder = parsed(text)
+	reported: Bool = match builder.diagnostics.get(0):
+		Some(row):
+			is_code: Bool = row.code.diagnostic_code_name() == "DocstringBeforeImportBlockDiagnostic"
+			is_code and row.span.span_start() == 21
+		None:
+			False
+
+	reported and builder.module_documentation.is_empty() and builder.import_blocks.length() == 2
+
+
+pure func diagnostic_labels(text: String) -> List[String]:
+	parsed(text).diagnostics.map(
+		pure func(row): "${row.code.diagnostic_code_name()}@${row.span.span_start()}",
+	)
+
+
+pure func test_docstring_and_annotation_before_an_import_block_report_both() -> Bool:
+	-- Same order and positions as `bin/blorp check` (8:1 then 4:1).
+	text: String = "import:\n\tlist: List\n\n---\nStray.\n---\n@tail_recursive\nimport:\n\toption: Option\n"
+	diagnostic_labels(text) == [
+		"AnnotationWithoutFunctionDiagnostic@52",
+		"DocstringBeforeImportBlockDiagnostic@21",
+	]
+
+
+pure func test_docstring_before_pure_import_block_is_reported_at_the_docstring() -> Bool:
+	text: String = "import:\n\tlist: List\n\n---\nStray.\n---\npure import:\n\toption: Option\n"
+	diagnostic_labels(text) == ["DocstringBeforeImportBlockDiagnostic@21"]
+
+
+pure func test_docstring_before_a_function_is_not_module_documentation() -> Bool:
+	builder: DiscoveryBuilder = parsed("---\nAbout main.\n---\nfunc main() -> Int:\n\t0\n")
+	(
+		builder.module_documentation.is_empty()
+		and builder.documentation.length() == 1
+		and builder.diagnostics.is_empty()
+	)
+
+
+pure func test_a_second_module_documentation_row_for_a_module_is_reported() -> Bool:
+	builder: DiscoveryBuilder = parsed(MODULE_DOCSTRING_SOURCE)
+	duplicate: DiscoveryBuilder = match builder.module_documentation.get(0):
+		Some(row):
+			builder.append_module_documentation(row)
+		None:
+			builder
+
+	duplicate
+		.check_table_invariants(ALL_SEEDED_NAME_SPELLINGS)
+		.any(
+			pure func(found): (
+				found.kind == DuplicateSideRow and found.table == ModuleDocumentationTable
+			),
+		)
+
+
 tests: TestSuite = {
 	description = "Discovery declaration parser",
 	tests = [
@@ -253,6 +345,30 @@ tests: TestSuite = {
 		("traits with methods and supertraits", test_traits_with_methods_and_supertraits),
 		("impls and their methods", test_impls_and_their_methods),
 		("foreign blocks bindings and c names", test_foreign_blocks_bindings_and_c_names),
+		(
+			"docstring before the first import block is the module documentation",
+			test_docstring_before_the_first_import_block_is_the_module_documentation,
+		),
+		(
+			"docstring before a later import block is reported at the docstring",
+			test_docstring_before_a_later_import_block_is_reported_at_the_docstring,
+		),
+		(
+			"docstring and annotation before an import block report both",
+			test_docstring_and_annotation_before_an_import_block_report_both,
+		),
+		(
+			"docstring before pure import block is reported at the docstring",
+			test_docstring_before_pure_import_block_is_reported_at_the_docstring,
+		),
+		(
+			"docstring before a function is not module documentation",
+			test_docstring_before_a_function_is_not_module_documentation,
+		),
+		(
+			"a second module documentation row for a module is reported",
+			test_a_second_module_documentation_row_for_a_module_is_reported,
+		),
 		(
 			"malformed declarations are reported and recovered",
 			test_malformed_declarations_are_reported_and_recovered,
