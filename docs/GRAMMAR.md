@@ -258,8 +258,7 @@ variant      = variant_name [ "(" type_expr { "," type_expr } [ "," ] ")" ] ;
 variant_name = IDENT | "True" | "False" ;
 (* A variant declares at most 64 payload fields; the parser rejects more. *)
 
-record_decl = "record" IDENT [ type_params ] "{" field_list "}"
-            | "record" IDENT [ type_params ] "{" "builtin" "}" ;
+record_decl = "record" IDENT [ type_params ] "{" field_list "}" ;
 struct_decl = "struct" IDENT "{" field_list "}" ;
 
 field_list = [ field_decl { "," field_decl } [ "," ] ] ;
@@ -548,6 +547,7 @@ simple_pattern = "_"                                    (* wildcard *)
                | INT | BIGINT | "-" INT                 (* integer literal *)
                | FLOAT | "-" FLOAT                      (* float literal *)
                | STRING | RAW_STRING
+               | PIPE_STRING | RAW_PIPE_STRING
                | CHAR                                   (* char literal *)
                | "True" | "False"                       (* bool literal *)
                | IDENT "(" [ pattern_list ] ")"         (* constructor *)
@@ -564,6 +564,10 @@ list_pattern = "[" "]"                                  (* empty list *)
 
 spread_target = IDENT | "_" ;
 ```
+
+A pipe-string pattern runs to the end of its line, so the `:` that ends a match
+case cannot follow it on that line; write it inside parentheses, as in
+`Some(` newline `|text` newline `):`.
 
 ### Lambda Expressions
 
