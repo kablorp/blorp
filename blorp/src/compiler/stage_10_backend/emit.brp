@@ -2400,6 +2400,8 @@ private pure func compact_temp_stem(prefix: String) -> String:
 		"set_iterable": "__t1f"
 		"resource_source_iterable": "__t1g"
 		"stream_iterable": "__t1h"
+		"range_start_value": "__t1i"
+		"range_end_value": "__t1j"
 		_:
 			NO_COMPACT_TEMP_STEM
 
@@ -16190,16 +16192,24 @@ private pure func emit_for_range(
 	next_temp: Int,
 	emission_context: FunctionEmissionContext,
 ) -> Option[FunctionBodyC]:
-	start_c ?= emit_simple_expr(start, emission_context)
-	end_c ?= emit_simple_expr(end_value, emission_context)
+	-- A bound may be any expression (`0..xs.length().min(3)`), so each is
+	-- emitted as a scoped value like a `for` iterable, evaluated once before
+	-- the loop. A leaf bound has no statements and keeps its temp index, so
+	-- its C is unchanged. A bound that returns early or has no value still
+	-- fails emission, as it did when bounds had to be simple.
+	start_body ?= emit_scoped_expr_value("range_start_value", start, next_temp, emission_context)
+	start_c ?= required_body_value(start_body)
+	end_body ?= emit_scoped_expr_value("range_end_value", end_value, start_body.next_temp, emission_context)
+	end_c ?= required_body_value(end_body)
+	temp_index: Int = end_body.next_temp
 	inner_context: FunctionEmissionContext = nested_emission_context(emission_context)
 	inner_indent: String = inner_context.indent
-	body_c ?= emit_function_body(body, next_temp + 1, inner_context)
-	start_tmp: String = temp_name("range_start", next_temp, emission_context.compact)
-	end_tmp: String = temp_name("range_end", next_temp, emission_context.compact)
-	step_tmp: String = temp_name("range_step", next_temp, emission_context.compact)
+	body_c ?= emit_function_body(body, temp_index + 1, inner_context)
+	start_tmp: String = temp_name("range_start", temp_index, emission_context.compact)
+	end_tmp: String = temp_name("range_end", temp_index, emission_context.compact)
+	step_tmp: String = temp_name("range_step", temp_index, emission_context.compact)
 	loop_type: String = TypeLayout.c_type_name(binder.typ, selected_type_symbol_lookup(emission_context.symbol_authority))
-	prefix: String = emission_context.indent + loop_type + " " + start_tmp + " = " + start_c + ";\n" + emission_context.indent + loop_type + " " + end_tmp + " = " + end_c + ";\n"
+	prefix: String = start_body.statements + end_body.statements + emission_context.indent + loop_type + " " + start_tmp + " = " + start_c + ";\n" + emission_context.indent + loop_type + " " + end_tmp + " = " + end_c + ";\n"
 
 	if range_is_forward_proven(binder.range_direction, start, end_value):
 		Some({

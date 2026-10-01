@@ -8189,6 +8189,89 @@ pure func forward_range_sum_function() -> CoreFunction:
 	}
 
 
+pure func limit_for_call(args: List[CoreExpr]) -> CoreExpr:
+	limit_name: String = "limit_for"
+	limit_def_id: Int = 30
+
+	CallExpr(
+		UserCall(
+			limit_name,
+			Some(limit_def_id),
+			[],
+		),
+		VarExpr(
+			{
+				name = limit_name,
+				id = 0,
+				def_id = Some(limit_def_id),
+				origin = AuthoredBinder
+			},
+			closure_type(),
+			synthetic_core_source_loc(),
+		),
+		args,
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+---
+A range loop whose end bound is a two-argument call whose first argument is
+itself a call, the shape `0..xs.length().min(3)` lowers to. The outer call
+evaluates its arguments into ordered temporaries first, so the bound needs
+statements and cannot be spelled as one C expression in the loop header.
+---
+pure func computed_end_range_sum_function() -> CoreFunction:
+	end_bound: CoreExpr = limit_for_call([
+		limit_for_call([VarExpr(local_counter(), int_type(), synthetic_core_source_loc())]),
+		LiteralExpr(IntLiteral(3), int_type(), synthetic_core_source_loc()),
+	])
+
+	{
+		name = "sum_computed_end_range",
+		source_module = None,
+		type_params = [],
+		params = [],
+		return_type = int_type(),
+		body = Some(
+			LetExpr(
+				local_counter(),
+				True,
+				int_type(),
+				LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc()),
+				SeqExpr(
+					ForRangeExpr(
+						range_loop_binder(),
+						LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc()),
+						end_bound,
+						AssignExpr(
+							local_counter(),
+							BinaryExpr(
+								AddOp,
+								VarExpr(local_counter(), int_type(), synthetic_core_source_loc()),
+								VarExpr(range_index_var(), int_type(), synthetic_core_source_loc()),
+								int_type(),
+								synthetic_core_source_loc(),
+							),
+							VoidType,
+							synthetic_core_source_loc(),
+						),
+						VoidType,
+						synthetic_core_source_loc(),
+					),
+					VarExpr(local_counter(), int_type(), synthetic_core_source_loc()),
+				),
+			),
+		),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 29,
+		loc = synthetic_core_source_loc()
+	}
+
+
 pure func range_value_sum_function() -> CoreFunction:
 	range_var: CoreVar = named_var("range")
 	range_expr: CoreExpr = VarExpr(range_var, range_value_type(), synthetic_core_source_loc())
@@ -12761,6 +12844,28 @@ pure func test_emit_forward_only_range_for_loop() -> Bool:
 		and artifact.c_code.contains("blorp_cooperative_checkpoint();")
 		and not artifact.c_code.contains("__range_step_0")
 		and artifact.c_code.contains("return counter;")
+	)
+
+
+pure func test_emit_range_for_loop_with_statement_end_bound() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(computed_end_range_sum_function())],
+		foreign_includes = [],
+		source_files = []
+	}
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+
+	(
+		artifact.c_code.contains("long sum_computed_end_range(void)")
+		and not artifact.c_code.contains("could not emit function body")
+		and artifact.c_code.contains("long __range_end_value_2;")
+		and artifact.c_code.contains("long __call_arg_0 = limit_for(counter);")
+		and artifact.c_code.contains("__range_end_value_2 = limit_for(__call_arg_0, __call_arg_1);")
+		and artifact.c_code.contains("long __range_start_3 = 0;")
+		and artifact.c_code.contains("long __range_end_3 = __range_end_value_2;")
+		and artifact.c_code.contains(
+			"for (long brp_v_2 = __range_start_3; brp_v_2 != __range_end_3; brp_v_2 += __range_step_3) {",
+		)
 	)
 
 
@@ -28386,6 +28491,10 @@ tests: TestSuite = {
 		("emit tailrec list-spread loop", test_emit_tailrec_list_spread_loop),
 		("emit range for loop with dynamic step", test_emit_range_for_loop_with_dynamic_step),
 		("emit forward only range for loop", test_emit_forward_only_range_for_loop),
+		(
+			"emit range for loop with statement end bound",
+			test_emit_range_for_loop_with_statement_end_bound,
+		),
 		(
 			"emit unsupported function diagnostic names failing child",
 			test_emit_unsupported_function_diagnostic_names_failing_child,
