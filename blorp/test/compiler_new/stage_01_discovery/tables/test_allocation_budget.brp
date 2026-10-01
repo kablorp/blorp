@@ -31,28 +31,33 @@ Statements or rows per measured run.
 REPEATS: Int = 2000
 
 ---
-The most allocations a run may make: table growth and per-module setup stay
-under it, while one copy per statement or row would exceed it several times.
+The allocations a run may make when its construct allocates nothing of its
+own: table growth and per-module setup stay under it, while one copy per
+statement or row would exceed it several times.
 ---
 ALLOCATION_BUDGET: Int = 500
 
 
 ---
-A module whose one function repeats `statement` `REPEATS` times; the names
-and literals it uses are interned by its first copy.
+A module that is `prefix` followed by `item` repeated `REPEATS` times; the
+names and literals it uses are interned by its first copy.
 ---
-pure func repeated_body(statement: String) -> String:
-	var text: String = "func f(a, b, c, x):\n"
+pure func repeated_text(prefix: String, item: String) -> String:
+	var text: String = prefix
 	var index: Int = 0
 
 	while index < REPEATS:
-		text += statement
+		text += item
 		index += 1
 
 	text
 
 
-func allocations_to_parse(text: String) -> Int:
+---
+The allocations parsing `text` as a module made, or `None` when the parse
+rejected it or lost its repeated items: either would pass a budget vacuously.
+---
+func parse_allocations(text: String) -> Option[Int]:
 	reset_mem_stats()
 	builder: DiscoveryBuilder = load_module(
 		empty_discovery_builder(),
@@ -66,27 +71,208 @@ func allocations_to_parse(text: String) -> Int:
 	)
 	stats: MemStats = get_mem_stats()
 
-	-- A parse that lost its statements would pass the budget vacuously.
-	if builder.nodes.length() > REPEATS:
-		stats.total_allocations
+	if builder.diagnostics.length() == 0 and builder.tokens.length() > REPEATS:
+		Some(stats.total_allocations)
 	else:
-		ALLOCATION_BUDGET
+		None
 
 
 ---
-Whether `allocations` shows the counters ran and stayed within budget.
+Whether `allocations` shows the counters ran and stayed within the budget.
 ---
 pure func within_budget(allocations: Int) -> Bool:
 	allocations > 0 and allocations < ALLOCATION_BUDGET
 
 
+---
+How far from its pinned count a run of a per-use-allocating family may be.
+A builder or table copy per use adds at least one allocation per repeat,
+`REPEATS` in all, far above this.
+---
+EXACT_TOLERANCE: Int = 100
+
+
+---
+Whether parsing `item` after `prefix`, `REPEATS` times, allocates nothing
+beyond table growth: the sharpest guard, for constructs with no per-use
+allocation of their own.
+---
+func family_within_budget(prefix: String, item: String) -> Bool:
+	match parse_allocations(repeated_text(prefix, item)):
+		Some(allocations):
+			within_budget(allocations)
+		None:
+			False
+
+
+---
+Whether parsing `item` after `prefix`, `REPEATS` times, allocates within
+`EXACT_TOLERANCE` of `expected_allocations`, both ways. For the few families
+whose construct allocates values of its own per use. The count is measured,
+not derived: a drop is as worth noticing as a rise, so tighten the pin when
+an allocation goes away.
+---
+func family_allocates(prefix: String, item: String, expected_allocations: Int) -> Bool:
+	match parse_allocations(repeated_text(prefix, item)):
+		Some(allocations):
+			(
+				allocations > expected_allocations - EXACT_TOLERANCE
+				and allocations < expected_allocations + EXACT_TOLERANCE
+			)
+		None:
+			False
+
+
+---
+Whether parsing `statement` repeated in one function body stays within budget.
+---
+func statement_family_within_budget(statement: String) -> Bool:
+	family_within_budget("func f(a, b, c, x):\n", statement)
+
+
+---
+As `family_allocates`, for statements in one function body.
+---
+func statement_family_allocates(statement: String, expected_allocations: Int) -> Bool:
+	family_allocates("func f(a, b, c, x):\n", statement, expected_allocations)
+
+
 func test_parsing_repeated_expression_statements_copies_no_table() -> Bool:
-	within_budget(allocations_to_parse(repeated_body("\tx = a + b * c\n")))
+	statement_family_within_budget("\tx = a + b * c\n")
 
 
 func test_parsing_repeated_blocks_and_calls_copies_no_table() -> Bool:
-	within_budget(
-		allocations_to_parse(repeated_body("\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n")),
+	statement_family_within_budget("\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n")
+
+
+func test_parsing_repeated_matches_and_patterns_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\tx = match a:\n\t\tSome(v) | Other(v): v\n\t\t(l, 1): l\n\t\t[h, ...t]: h\n\t\t_: b\n",
+	)
+
+
+func test_parsing_repeated_selects_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\tselect:\n\t\tv from a:\n\t\t\tv\n\t\tsealed b:\n\t\t\tx\n\t\t_ after 5:\n\t\t\tc\n",
+	)
+
+
+-- Pinned to the measured 4123 allocations: about 2 per repeat. A concurrent block and a concurrently loop allocate a couple of values of their own per use. Where they come from has not been investigated.
+func test_parsing_repeated_concurrent_blocks_copies_no_table() -> Bool:
+	statement_family_allocates(
+		"\tconcurrent(timeout: 100, max_threads: 2):\n\t\tl = f(a)\n\t\tr = f(b)\n\tfor p in a concurrently(limit: 4):\n\t\tf(p)\n",
+		4123,
+	)
+
+
+func test_parsing_repeated_lambdas_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\ty = func(p, q: Int) -> Int: p + q\n\tz = pure func(p):\n\t\tw = p\n\t\tw\n",
+	)
+
+
+-- Pinned to the measured 58131 allocations: about 29 per repeat. An interpolated string with two holes allocates for its pieces and holes. Where they come from has not been investigated.
+func test_parsing_repeated_interpolations_copies_no_table() -> Bool:
+	-- The `${` is split across two literals so this file does not interpolate it.
+	statement_family_allocates("\ty = \"a $" + "{a} b $" + "{b + c}\"\n", 58131)
+
+
+func test_parsing_repeated_record_literals_and_updates_copies_no_table() -> Bool:
+	statement_family_within_budget("\ty = {k = a, m = b}\n\tz = {y | k = c, m = a}\n")
+
+
+func test_parsing_repeated_loops_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\tfor i in 0..a:\n\t\tf(i)\n\twhile a > b:\n\t\tbreak\n\tfor (k, v) in c:\n\t\tcontinue\n",
+	)
+
+
+func test_parsing_repeated_question_binds_copies_no_table() -> Bool:
+	statement_family_within_budget("\tv ?= f(a)\n\tvar w = v\n\tw += 1\n")
+
+
+-- Pinned to the measured 22212 allocations: about 11 per repeat. A documented generic function with a dimension constraint allocates for its parts. Where they come from has not been investigated.
+func test_parsing_repeated_function_declarations_copies_no_table() -> Bool:
+	family_allocates(
+		"",
+		"---\nAdds.\n---\npure func g[T: Orderable](p: T, q: Int[#N]) -> List[T] where #N == 3:\n\tp\n\n\n",
+		22212,
+	)
+
+
+func test_parsing_repeated_type_declarations_copies_no_table() -> Bool:
+	family_within_budget(
+		"",
+		"record R {\n\tfirst: Int,\n\tsecond: Int\n}\n\n\nunion U:\n\tA(Int)\n\tB\n\n\nenum E:\n\tX\n\tY\n\n\ntype alias Al = Int\n\n\n",
+	)
+
+
+func test_parsing_repeated_trait_and_impl_declarations_copies_no_table() -> Bool:
+	family_within_budget(
+		"",
+		"trait Shape:\n\tpure func area(value: Self) -> Int\n\n\nimplements Shape for R:\n\tpure func area(r: R) -> Int:\n\t\t1\n\n\n",
+	)
+
+
+-- Pinned to the measured 8102 allocations: about 4 per repeat. An import block with two items allocates for its items. Where they come from has not been investigated.
+func test_parsing_repeated_imports_copies_no_table() -> Bool:
+	family_allocates("import:\n", "\tmath: sin, cos\n\tlist as L: List(Cons, Nil)\n", 8102)
+
+
+func test_parsing_repeated_collection_literals_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\ty = {1 => 2, 3 => 4}\n\tz = {a, b}\n\tw = (a, b, c)\n\tv = [a, b]\n\tu = ()\n\tt = (a)\n",
+	)
+
+
+func test_parsing_repeated_tuple_list_and_qualified_patterns_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\tx = match a:\n\t\t(l, r): l\n\t\tOption.Some(v): v\n\t\tOption.None: b\n\t\t[]: c\n\t\t[h, ...t]: h\n\t\tSome(Some(v)) | Other(v): v\n\t\t-1: a\n\t\t\"s\": b\n\t\t_: c\n",
+	)
+
+
+func test_parsing_repeated_with_scopes_copies_no_table() -> Bool:
+	statement_family_within_budget("\twith r = f(a):\n\t\tr\n\twith t ?= f(b) on e => e:\n\t\tt\n")
+
+
+func test_parsing_repeated_conversions_and_builtins_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\tz = builtin(\"x\")\n\tq = into_opaque T(a)\n\tp = from_opaque T(b)\n\tr = builtin\n",
+	)
+
+
+func test_parsing_repeated_bindings_and_local_functions_copies_no_table() -> Bool:
+	statement_family_within_budget("\t(p, q) = a\n\tn: Int = a\n\tfunc g(u):\n\t\tu\n\ta[b] = c\n")
+
+
+func test_parsing_repeated_postfix_chains_and_unary_operators_copies_no_table() -> Bool:
+	statement_family_within_budget(
+		"\tx = a.b(c)[d]\n\ty = a\n\t\t.b()\n\t\t.c()\n\tz = not a\n\tw = -a\n\tdetach f(a)\n",
+	)
+
+
+-- Pinned to the measured 44202 allocations: about 22 per repeat. The seven written types in the item allocate for their parts. Where they come from has not been investigated.
+func test_parsing_repeated_written_types_copies_no_table() -> Bool:
+	family_allocates(
+		"",
+		"func g[V: Orderable + Equatable](p: Dict[String, List[Int]], f: pure (Int) -> Int, t: (Int, Int), m: Int[#N, #M], k: a.B[C], n: Int[#_...], v: V) -> void:\n\tp\n\n\n",
+		44202,
+	)
+
+
+func test_parsing_repeated_foreign_blocks_copies_no_table() -> Bool:
+	family_within_budget(
+		"",
+		"foreign(include: \"a.h\", link: \"-lm\"):\n\tpure func c_sin(x: Float) -> Float = \"sin\"\n\tfunc c_puts(s: String) -> Int\n\n\n",
+	)
+
+
+-- Pinned to the measured 2180 allocations: about 1 per repeat. A trait with a supertrait allocates for the supertrait reference. Where they come from has not been investigated.
+func test_parsing_repeated_supertraits_copies_no_table() -> Bool:
+	family_allocates(
+		"",
+		"trait Base:\n\tpure func one(value: Self) -> Int\n\n\ntrait Wide: Base:\n\tpure func two(value: Self) -> Int\n\tfunc three(value: Self) -> Int:\n\t\t3\n\n\n",
+		2180,
 	)
 
 
@@ -123,6 +309,78 @@ tests: TestSuite = {
 		(
 			"parsing repeated blocks and calls copies no table",
 			test_parsing_repeated_blocks_and_calls_copies_no_table,
+		),
+		(
+			"parsing repeated matches and patterns copies no table",
+			test_parsing_repeated_matches_and_patterns_copies_no_table,
+		),
+		("parsing repeated selects copies no table", test_parsing_repeated_selects_copies_no_table),
+		(
+			"parsing repeated concurrent blocks copies no table",
+			test_parsing_repeated_concurrent_blocks_copies_no_table,
+		),
+		("parsing repeated lambdas copies no table", test_parsing_repeated_lambdas_copies_no_table),
+		(
+			"parsing repeated interpolations copies no table",
+			test_parsing_repeated_interpolations_copies_no_table,
+		),
+		(
+			"parsing repeated record literals and updates copies no table",
+			test_parsing_repeated_record_literals_and_updates_copies_no_table,
+		),
+		("parsing repeated loops copies no table", test_parsing_repeated_loops_copies_no_table),
+		(
+			"parsing repeated question binds copies no table",
+			test_parsing_repeated_question_binds_copies_no_table,
+		),
+		(
+			"parsing repeated function declarations copies no table",
+			test_parsing_repeated_function_declarations_copies_no_table,
+		),
+		(
+			"parsing repeated type declarations copies no table",
+			test_parsing_repeated_type_declarations_copies_no_table,
+		),
+		(
+			"parsing repeated trait and impl declarations copies no table",
+			test_parsing_repeated_trait_and_impl_declarations_copies_no_table,
+		),
+		("parsing repeated imports copies no table", test_parsing_repeated_imports_copies_no_table),
+		(
+			"parsing repeated collection literals copies no table",
+			test_parsing_repeated_collection_literals_copies_no_table,
+		),
+		(
+			"parsing repeated tuple list and qualified patterns copies no table",
+			test_parsing_repeated_tuple_list_and_qualified_patterns_copies_no_table,
+		),
+		(
+			"parsing repeated with scopes copies no table",
+			test_parsing_repeated_with_scopes_copies_no_table,
+		),
+		(
+			"parsing repeated conversions and builtins copies no table",
+			test_parsing_repeated_conversions_and_builtins_copies_no_table,
+		),
+		(
+			"parsing repeated bindings and local functions copies no table",
+			test_parsing_repeated_bindings_and_local_functions_copies_no_table,
+		),
+		(
+			"parsing repeated postfix chains and unary operators copies no table",
+			test_parsing_repeated_postfix_chains_and_unary_operators_copies_no_table,
+		),
+		(
+			"parsing repeated written types copies no table",
+			test_parsing_repeated_written_types_copies_no_table,
+		),
+		(
+			"parsing repeated foreign blocks copies no table",
+			test_parsing_repeated_foreign_blocks_copies_no_table,
+		),
+		(
+			"parsing repeated supertraits copies no table",
+			test_parsing_repeated_supertraits_copies_no_table,
 		),
 		("appending rows copies no table", test_appending_rows_copies_no_table),
 	]

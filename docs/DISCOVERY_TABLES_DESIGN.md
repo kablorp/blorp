@@ -576,20 +576,29 @@ builder = append_definition(builder, row)
 ### Threading rules
 
 Every table must stay uniquely referenced so each append grows its list in
-place. When the compiler cannot see that a builder is handed on at its last
-use, it keeps a second reference, and the next update copies the builder and
-every table appended to while the old one lives: an O(n) copy per append.
-The canonical statement of the seven rules that avoid this is the header of
-`tables/builder.brp`; each site that depends on one cites it by number.
-In short: the first update of a builder parameter is unconditional; no tail
-call on a reassigned `var`; the builder is not read in another argument of
-the call it is handed to; no `f(g(b))`; in loops `out = f(out)`, never
-through temporaries; a record update's field value reads only that field;
-no aliasing, storing or capturing.
+place. The compiler hands a builder on without a copy in the ordinary shapes,
+so routines are written plainly: updates are chained or returned as the tail
+call, and a builder bound to a new name and used once costs nothing. When the
+compiler cannot see that a builder is handed on at its last use it keeps a
+second reference, and the next update copies the builder and every table
+appended to while the old one lives: an O(n) copy per append. The shapes that
+still do are listed in the header of `tables/builder.brp`, with a before and
+after for each, and each site that depends on one cites it by number. In
+short: read the builder before it is handed on; do not chain, return a
+conditional of calls, or bind a call result on a `var` that is also reassigned
+under a branch or loop; declare such a `var` before the branch; a record
+update's field value reads only that field; do not capture the builder in a
+closure or store it in a record. `tools/builder_rule_probe.brp` measures each
+shape against a flat control.
 
-`tables/test_allocation_budget.brp` in the compiler-new gate parses a repeated
-source and fails when allocations exceed a fixed budget, so breaking a rule
-fails the gate rather than only slowing the compiler.
+`tables/test_allocation_budget.brp` in the compiler-new gate parses each
+construct family (statements, blocks, match, select, concurrency, lambdas,
+interpolation, record literals, collections, patterns, `with`, declarations,
+imports, types and foreign blocks) repeated 2,000 times and fails when
+allocations exceed a fixed budget, so breaking a rule fails the gate rather
+than only slowing the compiler. A family whose construct allocates a value
+of its own per use has a pinned allowance per repeat; a builder copy per use
+adds at least one more.
 
 ### Transient builder state
 
@@ -634,18 +643,6 @@ a payload is always what its kind says:
 | `append_literal_leaf_node` | `LiteralId` |
 | `append_codepoint_leaf_node` | a Unicode scalar value |
 | `append_definition_leaf_node` | `DefinitionId` |
-
-### Speculative parses
-
-One construct needs a speculative parse: `into Type(...)`, the removed
-spelling of `into_opaque Type(...)`, is reported with a migration diagnostic
-only when it parses as that form, since `into` is otherwise an ordinary
-name. `parse_checkpoint`
-records the token cursor, the node, edge, diagnostic and diagnostic-argument
-table lengths, and the child stack depth in a `ParseCheckpoint`;
-`rollback_to` truncates back to them. A speculative parse must not intern:
-the checkpoint also records the name and literal counts, and a debug build
-reports an error at rollback if either changed.
 
 ### Interning
 
@@ -858,9 +855,8 @@ lexer:
 The parser reads tokens and writes rows directly; there is no intermediate
 syntax tree. `parse_module_declarations(builder, module)` parses
 declarations, import blocks and foreign blocks; the type, pattern and body
-parsers write node trees. Every routine follows the threading rules, so a
-routine that branches before its first update does so in a helper whose
-arms each call on the parameter.
+parsers write node trees. Routines hand the builder on directly and avoid
+the few shapes that still copy (the threading rules in `tables/builder.brp`).
 
 What was a separate finalization pass is part of parsing: interpolation
 holes are parsed where they appear; subscripts and compiler-owned import

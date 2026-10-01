@@ -3,10 +3,11 @@
 -- Patterns are appended post-order like every node: each routine appends its
 -- root last. A routine collecting a variable number of child patterns pushes
 -- each child's root on the builder's child stack and claims them with
--- `append_parent_node_from_stack`; the number of children is the stack depth
--- gained. Shapes, recovery and accepted forms follow the existing parser.
+-- `append_parent_node_since`; the number of children is the children pushed
+-- since a `ChildMark`. Shapes, recovery and accepted forms follow the existing parser.
 import:
 	../tables/builder:
+		ChildMark,
 		DiscoveryBuilder,
 		NameId,
 		advance_token,
@@ -14,12 +15,13 @@ import:
 		append_leaf_node,
 		append_literal_leaf_node,
 		append_name_leaf_node,
-		append_named_parent_node_from_stack,
-		append_parent_node_from_stack,
+		append_named_parent_node_since,
+		append_parent_node_since,
 		append_plain_diagnostic,
-		child_stack_depth,
+		child_count_since,
 		last_node_id,
 		literal_id_at_row,
+		mark_children,
 		name_id_at_row,
 		push_last_node,
 		record_name_span_of_last_node,
@@ -125,12 +127,12 @@ private MAX_TUPLE_PATTERN_ITEMS: Int = 4
 A pattern: a simple pattern, or simple patterns separated by `|`.
 ---
 pure func parse_pattern(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder.parse_simple_pattern()
+	first: DiscoveryBuilder = builder.parse_simple_pattern()
 
-	if out.at(PipeSymbol):
-		out = out.parse_or_pattern_alternatives()
-
-	out
+	if first.at(PipeSymbol):
+		first.parse_or_pattern_alternatives()
+	else:
+		first
 
 
 ---
@@ -138,7 +140,7 @@ The alternatives after the first of an or-pattern, which the caller parsed.
 ---
 private pure func parse_or_pattern_alternatives(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	first_span: Span = builder.node_span(builder.last_node_id())
-	depth_before: Int = builder.child_stack_depth()
+	mark: ChildMark = builder.mark_children()
 	var out: DiscoveryBuilder = builder.push_last_node()
 	var end: Span = first_span
 
@@ -148,13 +150,11 @@ private pure func parse_or_pattern_alternatives(builder: DiscoveryBuilder) -> Di
 		end = out.node_span(out.last_node_id())
 		out = out.push_last_node()
 
-	count: Int = out.child_stack_depth() - depth_before
-	out = out.append_parent_node_from_stack(
+	out.append_parent_node_since(
+		mark,
 		OrPatternNode,
 		first_span.span_covering(end),
-		count,
 	)
-	out
 
 
 ---
@@ -167,14 +167,17 @@ private pure func parse_simple_pattern(builder: DiscoveryBuilder) -> DiscoveryBu
 		IdentifierToken:
 			builder.parse_named_pattern()
 		TrueKeyword:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_leaf_node(TruePatternNode, token.span)
+			builder
+				.advance_token()
+				.append_leaf_node(TruePatternNode, token.span)
 		FalseKeyword:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_leaf_node(FalsePatternNode, token.span)
+			builder
+				.advance_token()
+				.append_leaf_node(FalsePatternNode, token.span)
 		UnderscoreSymbol:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_leaf_node(WildcardPatternNode, token.span)
+			builder
+				.advance_token()
+				.append_leaf_node(WildcardPatternNode, token.span)
 		LeftParenSymbol:
 			builder.parse_tuple_pattern()
 		LeftBracketSymbol:
@@ -182,36 +185,39 @@ private pure func parse_simple_pattern(builder: DiscoveryBuilder) -> DiscoveryBu
 		MinusSymbol:
 			builder.parse_negative_number_pattern()
 		IntLiteralToken:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_literal_leaf_node(
-				IntegerPatternNode,
-				token.span,
-				literal_id_at_row(token.payload),
-			)
+			builder
+				.advance_token()
+				.append_literal_leaf_node(
+					IntegerPatternNode,
+					token.span,
+					literal_id_at_row(token.payload),
+				)
 		FloatLiteralToken:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_literal_leaf_node(
-				FloatPatternNode,
-				token.span,
-				literal_id_at_row(token.payload),
-			)
+			builder
+				.advance_token()
+				.append_literal_leaf_node(
+					FloatPatternNode,
+					token.span,
+					literal_id_at_row(token.payload),
+				)
 		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_literal_leaf_node(
-				string_pattern_kind(token.kind),
-				token.span,
-				literal_id_at_row(token.payload),
-			)
+			builder
+				.advance_token()
+				.append_literal_leaf_node(
+					string_pattern_kind(token.kind),
+					token.span,
+					literal_id_at_row(token.payload),
+				)
 		InterpolatedStringToken | InterpolatedPipeStringToken:
 			-- A pattern compares with a fixed string; holes have no value there.
-			reported: DiscoveryBuilder = builder.report_at_current(
-				InterpolatedStringPatternDiagnostic,
-			)
-			advanced: DiscoveryBuilder = reported.advance_token()
-			advanced.append_leaf_node(MissingPatternNode, token.span)
+			builder
+				.report_at_current(InterpolatedStringPatternDiagnostic)
+				.advance_token()
+				.append_leaf_node(MissingPatternNode, token.span)
 		CharLiteralToken:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_codepoint_leaf_node(CharPatternNode, token.span, token.payload)
+			builder
+				.advance_token()
+				.append_codepoint_leaf_node(CharPatternNode, token.span, token.payload)
 		_:
 			builder.parse_keyword_or_missing_pattern()
 
@@ -241,26 +247,20 @@ private pure func parse_keyword_or_missing_pattern(builder: DiscoveryBuilder) ->
 
 	match builder.current_name():
 		Some(name):
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_name_leaf_node(NamePatternNode, token.span, name)
+			builder
+				.advance_token()
+				.append_name_leaf_node(NamePatternNode, token.span, name)
 		None:
 			match token.kind.keyword_name_index():
 				Some(index):
-					reported: DiscoveryBuilder = builder.report_at_current_with_argument(
-						ReservedKeywordAsNameDiagnostic,
-						index,
-					)
-					advanced: DiscoveryBuilder = reported.advance_token()
-					advanced.append_name_leaf_node(
-						NamePatternNode,
-						token.span,
-						name_id_at_row(index),
-					)
+					builder
+						.report_at_current_with_argument(ReservedKeywordAsNameDiagnostic, index)
+						.advance_token()
+						.append_name_leaf_node(NamePatternNode, token.span, name_id_at_row(index))
 				None:
-					recovered: DiscoveryBuilder = builder.report_and_recover(
-						ExpectedPatternDiagnostic,
-					)
-					recovered.append_leaf_node(MissingPatternNode, token.span)
+					builder
+						.report_and_recover(ExpectedPatternDiagnostic)
+						.append_leaf_node(MissingPatternNode, token.span)
 
 
 ---
@@ -275,12 +275,9 @@ private pure func parse_named_pattern(builder: DiscoveryBuilder) -> DiscoveryBui
 		LeftParenSymbol:
 			builder.parse_constructor_pattern()
 		_:
-			advanced: DiscoveryBuilder = builder.advance_token()
-			advanced.append_name_leaf_node(
-				NamePatternNode,
-				token.span,
-				name_id_at_row(token.payload),
-			)
+			builder
+				.advance_token()
+				.append_name_leaf_node(NamePatternNode, token.span, name_id_at_row(token.payload))
 
 
 ---
@@ -288,20 +285,20 @@ private pure func parse_named_pattern(builder: DiscoveryBuilder) -> DiscoveryBui
 ---
 private pure func parse_constructor_pattern(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	token: Token = builder.current_token()
-	depth_before: Int = builder.child_stack_depth()
-	advanced: DiscoveryBuilder = builder.advance_token()
-	var out: DiscoveryBuilder = advanced.parse_pattern_arguments()
-	count: Int = out.child_stack_depth() - depth_before
-	end: Span = out.closing_span_or(RightParenSymbol, token.span)
-	out = out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, ConstructorPattern)
-	out = out.append_named_parent_node_from_stack(
-		ConstructorPatternNode,
-		token.span.span_covering(end),
-		name_id_at_row(token.payload),
-		token.span,
-		count,
-	)
-	out
+	mark: ChildMark = builder.mark_children()
+	arguments: DiscoveryBuilder = builder
+		.advance_token()
+		.parse_pattern_arguments()
+	end: Span = arguments.closing_span_or(RightParenSymbol, token.span)
+	arguments
+		.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, ConstructorPattern)
+		.append_named_parent_node_since(
+			mark,
+			ConstructorPatternNode,
+			token.span.span_covering(end),
+			name_id_at_row(token.payload),
+			token.span,
+		)
 
 
 ---
@@ -312,39 +309,37 @@ private pure func parse_qualified_constructor_pattern(
 	builder: DiscoveryBuilder,
 ) -> DiscoveryBuilder:
 	token: Token = builder.current_token()
-	depth_before: Int = builder.child_stack_depth()
-	var out: DiscoveryBuilder = builder.append_name_leaf_node(
-		PatternQualifierNode,
-		token.span,
-		name_id_at_row(token.payload),
-	)
-	out = out.push_last_node()
+	mark: ChildMark = builder.mark_children()
 	-- The type name, then the `.`.
-	out = out.advance_token()
-	out = out.advance_token()
-	constructor: NameId = out.referenced_name_at_cursor()
-	constructor_span: Span = out.current_span()
-	out = out.consume_referenced_name(ConstructorName)
-	var end: Span = constructor_span
+	qualified: DiscoveryBuilder = builder
+		.append_name_leaf_node(PatternQualifierNode, token.span, name_id_at_row(token.payload))
+		.push_last_node()
+		.advance_token()
+		.advance_token()
+	constructor: NameId = qualified.referenced_name_at_cursor()
+	constructor_span: Span = qualified.current_span()
+	named: DiscoveryBuilder = qualified.consume_referenced_name(ConstructorName)
 
-	if out.at(LeftParenSymbol):
-		out = out.parse_pattern_arguments()
-		end = out.closing_span_or(RightParenSymbol, constructor_span)
-		out = out.expect_token_in(
-			RightParenSymbol,
-			ExpectedRightParenDiagnostic,
-			ConstructorPattern,
+	if named.at(LeftParenSymbol):
+		arguments: DiscoveryBuilder = named.parse_pattern_arguments()
+		end: Span = arguments.closing_span_or(RightParenSymbol, constructor_span)
+		arguments
+			.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, ConstructorPattern)
+			.append_named_parent_node_since(
+				mark,
+				QualifiedConstructorPatternNode,
+				token.span.span_covering(end),
+				constructor,
+				constructor_span,
+			)
+	else:
+		named.append_named_parent_node_since(
+			mark,
+			QualifiedConstructorPatternNode,
+			token.span.span_covering(constructor_span),
+			constructor,
+			constructor_span,
 		)
-
-	count: Int = out.child_stack_depth() - depth_before
-	out = out.append_named_parent_node_from_stack(
-		QualifiedConstructorPatternNode,
-		token.span.span_covering(end),
-		constructor,
-		constructor_span,
-		count,
-	)
-	out
 
 
 ---
@@ -352,8 +347,9 @@ The argument patterns after a constructor's `(`, which this consumes, each
 pushed on the child stack; the `)` is left for the caller.
 ---
 private pure func parse_pattern_arguments(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	advanced: DiscoveryBuilder = builder.advance_token()
-	advanced.parse_pattern_list_until(RightParenSymbol)
+	builder
+		.advance_token()
+		.parse_pattern_list_until(RightParenSymbol)
 
 
 ---
@@ -364,29 +360,16 @@ private pure func parse_pattern_list_until(
 	builder: DiscoveryBuilder,
 	end: TokenKind,
 ) -> DiscoveryBuilder:
-	if builder.at(end):
-		builder
-	else:
-		builder.parse_pattern_items(end)
-
-
-private pure func parse_pattern_items(
-	builder: DiscoveryBuilder,
-	end: TokenKind,
-) -> DiscoveryBuilder:
-	parsed: DiscoveryBuilder = builder.parse_pattern()
-	var out: DiscoveryBuilder = parsed.push_last_node()
-	var parsing: Bool = True
+	var out: DiscoveryBuilder = builder
+	var parsing: Bool = not out.at(end)
 
 	while parsing:
+		out = out.parse_pattern()
+		out = out.push_last_node()
+
 		if out.at(CommaSymbol):
 			out = out.advance_token()
-
-			if out.at(end) or out.at(EndOfFileToken):
-				parsing = False
-			else:
-				out = out.parse_pattern()
-				out = out.push_last_node()
+			parsing = not (out.at(end) or out.at(EndOfFileToken))
 		else:
 			parsing = False
 
@@ -413,19 +396,20 @@ private pure func closing_span_or(
 ---
 private pure func parse_tuple_pattern(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	start: Span = builder.current_span()
-	depth_before: Int = builder.child_stack_depth()
-	advanced: DiscoveryBuilder = builder.advance_token()
-	var out: DiscoveryBuilder = advanced.parse_pattern()
+	mark: ChildMark = builder.mark_children()
+	var out: DiscoveryBuilder = builder
+		.advance_token()
+		.parse_pattern()
 	var end: Span = out.node_span(out.last_node_id())
 	out = out.push_last_node()
 
 	if out.at(CommaSymbol):
 		comma_span: Span = out.current_span()
-		depth_before_rest: Int = out.child_stack_depth()
+		rest_mark: ChildMark = out.mark_children()
 		out = out.advance_token()
 		out = out.parse_pattern_list_until(RightParenSymbol)
 
-		end = if out.child_stack_depth() > depth_before_rest:
+		end = if out.child_count_since(rest_mark) > 0:
 			out.node_span(out.last_node_id())
 		else:
 			comma_span
@@ -436,14 +420,13 @@ private pure func parse_tuple_pattern(builder: DiscoveryBuilder) -> DiscoveryBui
 		end = out.current_span()
 
 	out = out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, TuplePattern)
-	count: Int = out.child_stack_depth() - depth_before
+	count: Int = out.child_count_since(mark)
 	span: Span = start.span_covering(end)
 
 	if count < MIN_TUPLE_PATTERN_ITEMS or count > MAX_TUPLE_PATTERN_ITEMS:
 		out = out.append_plain_diagnostic(TupleArityDiagnostic, span)
 
-	out = out.append_parent_node_from_stack(TuplePatternNode, span, count)
-	out
+	out.append_parent_node_since(mark, TuplePatternNode, span)
 
 
 ---
@@ -451,7 +434,7 @@ private pure func parse_tuple_pattern(builder: DiscoveryBuilder) -> DiscoveryBui
 ---
 private pure func parse_list_pattern(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	start: Span = builder.current_span()
-	depth_before: Int = builder.child_stack_depth()
+	mark: ChildMark = builder.mark_children()
 	var out: DiscoveryBuilder = builder.advance_token()
 	var end: Span = start
 
@@ -482,13 +465,11 @@ private pure func parse_list_pattern(builder: DiscoveryBuilder) -> DiscoveryBuil
 		end = out.current_span()
 
 	out = out.expect_token_in(RightBracketSymbol, ExpectedRightBracketDiagnostic, ListPattern)
-	count: Int = out.child_stack_depth() - depth_before
-	out = out.append_parent_node_from_stack(
+	out.append_parent_node_since(
+		mark,
 		ListPatternNode,
 		start.span_covering(end),
-		count,
 	)
-	out
 
 
 ---

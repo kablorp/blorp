@@ -13,7 +13,9 @@
 -- Where a step's mechanics live: `sources/module_graph` (resolving requests
 -- and the walk state), `sources/source_admission`, `lex/lexer`,
 -- `parse/declaration_parser`, `tables/builder` (the rows) and
--- `tables/invariants` (checked by `freeze`).
+-- `tables/invariants` (checked by `freeze`). The result is the
+-- `tables/frontend_tables` value `freeze` returns; `diagnostics/render` turns
+-- the diagnostic rows in it into text.
 --
 -- The builder is handed on from each step to the next and never travels
 -- inside the import queue or any other value (see the builder threading rules
@@ -25,11 +27,10 @@ import:
 	sources/module_graph:
 		ImportQueue,
 		ModuleRequester(RequestedByImport, RequestedByRoot, RequestedImplicitly),
-		RequestResolution(LoadSource, ModuleAlreadyLoaded),
+		RequestResolution(LoadSource, ModuleAlreadyLoaded, Unresolved),
 		advance,
 		empty_import_queue,
 		enqueue_imports_of_loaded_module,
-		has_pending_import,
 		next_pending_import,
 		reach_of,
 		record_implicit_request,
@@ -118,7 +119,12 @@ func discover[Provider:SourceProvider](
 	roots: List[String],
 	implicit: ImplicitModules,
 ) -> FreezeOutcome:
-	discover_placed_roots(provider, lookup, roots.map(pure func(path): user_root(path)), implicit)
+	discover_placed_roots(
+		provider,
+		lookup,
+		roots.map(pure func(path): user_root(path)),
+		implicit,
+	)
 
 
 ---
@@ -154,7 +160,7 @@ func discover_placed_roots[Provider:SourceProvider](
 		builder = builder.settle_request(RequestedImplicitly(request), loaded, resolution)
 		queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
 
-	while queue.has_pending_import():
+	while True:
 		match queue.next_pending_import():
 			Some(entry):
 				(listed, resolution) = provider.resolve_import(lookup, builder, listings, entry)
@@ -166,10 +172,10 @@ func discover_placed_roots[Provider:SourceProvider](
 					resolution,
 				)
 				queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
+				queue = queue.advance()
 			None:
-				void
-
-		queue = queue.advance()
+				-- The queue is drained: every import found has been resolved.
+				break
 
 	builder.freeze()
 
@@ -187,16 +193,13 @@ private pure func settle_request(
 ) -> DiscoveryBuilder:
 	match resolution:
 		LoadSource(candidate, text):
-			with_module: DiscoveryBuilder = builder.load_module(
-				candidate,
-				requester.reach_of(),
-				text,
-			)
-			with_module.record_target(requester, loaded)
+			builder
+				.load_module(candidate, requester.reach_of(), text)
+				.record_target(requester, loaded)
 		ModuleAlreadyLoaded(module):
 			builder.record_target(requester, module)
-		_:
-			builder.report_failure(requester, resolution)
+		Unresolved(failure):
+			builder.report_failure(requester, failure)
 
 
 ---
@@ -209,17 +212,17 @@ pure func load_module(
 	reach: ModuleReach,
 	text: String,
 ) -> DiscoveryBuilder:
+	module: ModuleId = builder.next_module_id()
 	canonical_path: PathId = builder.interned_path_id(candidate.path)
 	opening: ModuleRow = builder.module_row_start(
 		canonical_path,
 		candidate.placement.origin_kind(),
 		reach,
 	)
-	module: ModuleId = builder.next_module_id()
-	var out: DiscoveryBuilder = builder.admit_source(candidate.path, text)
-	out = out.append_module(opening)
-	out = out.record_module_package(module, candidate.placement)
-	out = out.lex_source(opening.source)
-	out = out.parse_module_declarations(module)
-	out = out.close_module_row(module, opening)
-	out
+	builder
+		.admit_source(candidate.path, text)
+		.append_module(opening)
+		.record_module_package(module, candidate.placement)
+		.lex_source(opening.source)
+		.parse_module_declarations(module)
+		.close_module_row(module, opening)

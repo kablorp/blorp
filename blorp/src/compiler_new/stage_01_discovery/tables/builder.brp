@@ -4,34 +4,54 @@
 -- the only way to mint an id is to read `next_*_id` before the matching
 -- `append_*`.
 --
--- Builder threading rules. Every table must stay uniquely referenced so each
--- append grows its list in place; when the compiler cannot see that a builder
--- is handed on at its last use, it keeps a second reference, and the next
--- update copies the builder record and then every table appended to while the
--- old record lives: an O(n) copy per append. The current compiler hands a
--- builder on only in these shapes, so every routine follows them (sites cite
--- the rule by number):
+-- Builder threading. Every table must stay uniquely referenced so each
+-- append grows its list in place. The compiler hands a builder on without a
+-- copy in the ordinary shapes (`b.f()`, `b.f().g()`, `out = out.f()`,
+-- `out.f()` as a tail, a builder bound to a new name and used once), so
+-- routines are written plainly. When it cannot see that a builder is handed
+-- on at its last use it keeps a second reference, and the next update copies
+-- the builder record and then every table appended to while the old record
+-- lives: an O(n) copy per append. These shapes still do that, so routines
+-- avoid them (`tools/builder_rule_probe.brp`
+-- has one process per shape and a flat control for each):
 --
--- 1. The first update of a builder parameter (or of a `var` bound to it) is
---    unconditional. Branch in a helper whose arms each call on the parameter
---    (`if b.at(K): b.advance_token() else: b`), scan ahead and move the cursor
---    once, or parse the first item before a loop.
--- 2. A `var` builder reassigned under an `if` or a loop is not passed to a
---    call in tail position; assign the call's result and return the `var`.
--- 3. The builder is not read in another argument of the call it is handed
---    to; read what the call needs into a local first.
--- 4. A builder-returning call is not the receiver or argument of another
---    call (`b.f().g()`, `f(b.g())`); bind it to a named local first.
--- 5. Inside a loop, update the loop's `var` directly (`out = out.f()`), never
---    through a temporary (`t = f(out); out = g(t)`).
--- 6. A record update's new field value reads only that field of the record;
+-- 1. Read the builder before handing it on. A read after the builder went
+--    into a call keeps the old record alive, whether it is a later statement
+--    or the condition of an `if` after `var out = b`.
+--    Issues: `docs/issues/read-after-builder-handoff-copies.md`,
+--    `docs/issues/alias-move-blocked-by-condition-read.md`.
+--        copies:  handed = b.append_node(row)   then   n = b.nodes.length()
+--        flat:    n = b.nodes.length()   then   handed = b.append_node(row)
+--
+-- 2. Do not chain, return an `if` or `match` of calls, or bind a call result
+--    (`x = out.f()`) on a `var` builder that is also reassigned under an
+--    `if`, a `match` or a loop. Keep one call per statement and end with a
+--    single tail call; chain from a parameter or from a binding that is never
+--    reassigned.
+--    Issue: `docs/issues/chain-on-reassigned-builder-var-copies.md`.
+--        copies:  out = out.f().g()      (in an arm, `out` used afterwards)
+--        flat:    out = out.f()   then   out = out.g()
+--
+-- 3. Declare a `var` builder before a branch, not inside an `if` or `match`
+--    arm whose other arm hands the builder on directly.
+--    Issue: `docs/issues/read-after-builder-handoff-copies.md`.
+--        copies:  if c: b.f()   else: var out = b   then a loop of updates
+--        flat:    var out = b   then branch on `out`
+--
+-- 4. A record update's new field value reads only that field of the record;
 --    no other field of it, or list held from it, stays live across the
 --    update. Read single values into locals first.
--- 7. The builder is not bound to a second name, stored in another value, or
---    captured in a closure.
+--    Issue: `docs/issues/record-update-same-field-read-copies.md`.
+--        copies:  { b | nodes = b.nodes.append(row(b.nodes.length())) }
+--        flat:    n = b.nodes.length()   then   { b | nodes = b.nodes.append(row(n)) }
+--
+-- 5. The builder is not captured by a closure or stored in a record or any
+--    other value.
+--    Issue: `docs/issues/builder-captured-or-stored-copies.md`.
 --
 -- `tools/builder_append_probe.brp` and `tools/discovery_dump.brp` measure the
--- effect, and the compiler-new gate fails when appends start copying tables.
+-- effect, and the compiler-new gate (`tables/test_allocation_budget.brp`)
+-- fails when parsing a construct starts copying tables.
 --
 -- Text lives only in the names, paths, source texts and literals tables. An
 -- optional relationship is a row in a side table; variable-length data is a
@@ -1095,13 +1115,13 @@ pure func next_name_id(builder: DiscoveryBuilder) -> NameId:
 
 ---
 Appends a spelling that is not interned yet; callers check
-`interned_name_index` or `interned_name_slice_index` first. It is
-unconditional on purpose (builder threading rule 1).
+`interned_name_index` or `interned_name_slice_index` first.
 ---
 pure func append_name(builder: DiscoveryBuilder, spelling: String) -> DiscoveryBuilder:
 	row: Int = builder.name_spellings.length()
 	hash: Int = text_hash(spelling)
-	-- One record update (builder threading rule 6).
+	-- One record update that reads only the fields it replaces (see the threading
+	-- rules at the top of this file).
 	{ builder |
 		name_slots = slots_with_row(builder.name_slots, row, hash, row + 1),
 		name_spellings = builder.name_spellings.append(spelling)
@@ -1802,58 +1822,6 @@ pure func push_last_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 
 
 ---
-The table lengths and cursor a speculative parse can roll back to: the node,
-edge and diagnostic tables and the child stack. A speculative parse must not
-intern names or literals; `names` and `literals` are recorded so a debug
-build can check that at rollback.
----
-struct ParseCheckpoint {
-	token_cursor: Int,
-	nodes: Int,
-	node_children: Int,
-	child_stack_depth: Int,
-	diagnostics: Int,
-	diagnostic_arguments: Int,
-	names: Int,
-	literals: Int
-}
-
-
-pure func parse_checkpoint(builder: DiscoveryBuilder) -> ParseCheckpoint:
-	{
-		token_cursor = builder.token_cursor,
-		nodes = builder.nodes.length(),
-		node_children = builder.node_children.length(),
-		child_stack_depth = builder.child_stack_depth,
-		diagnostics = builder.diagnostics.length(),
-		diagnostic_arguments = builder.diagnostic_arguments.length(),
-		names = builder.name_spellings.length(),
-		literals = builder.literals.length()
-	}
-
-
----
-Undoes everything a speculative parse appended since `checkpoint`.
----
-pure func rollback_to(builder: DiscoveryBuilder, checkpoint: ParseCheckpoint) -> DiscoveryBuilder:
-	debug:
-		if (
-			builder.name_spellings.length() != checkpoint.names
-			or builder.literals.length() != checkpoint.literals
-		):
-			dbg.error("a speculative parse interned a name or literal; rollback cannot undo it")
-
-	{ builder |
-		token_cursor = checkpoint.token_cursor,
-		nodes = builder.nodes.take(checkpoint.nodes),
-		node_children = builder.node_children.take(checkpoint.node_children),
-		child_stack_depth = checkpoint.child_stack_depth,
-		diagnostics = builder.diagnostics.take(checkpoint.diagnostics),
-		diagnostic_arguments = builder.diagnostic_arguments.take(checkpoint.diagnostic_arguments)
-	}
-
-
----
 Where the next block of node children will start.
 ---
 pure func next_node_child_row(builder: DiscoveryBuilder) -> Int:
@@ -2163,8 +2131,72 @@ private pure func stack_with_entry(stack: List[NodeId], depth: Int, node: NodeId
 		stack.append(node)
 
 
-pure func child_stack_depth(builder: DiscoveryBuilder) -> Int:
-	builder.child_stack_depth
+---
+A place in the child stack, taken with `mark_children` before a node's
+children are parsed. The children are what was pushed since: read their count
+with `child_count_since`, or append the parent over them with
+`append_parent_node_since`. A mark is not an `Int`, so it cannot be mistaken
+for a count or subtracted by hand.
+---
+opaque type ChildMark = Int
+
+
+pure func mark_children(builder: DiscoveryBuilder) -> ChildMark:
+	into_opaque ChildMark(builder.child_stack_depth)
+
+
+---
+The first child pushed since `mark`, or `None` when there are none.
+---
+pure func first_child_since(builder: DiscoveryBuilder, mark: ChildMark) -> Option[NodeId]:
+	if builder.child_count_since(mark) == 0:
+		None
+	else:
+		builder.child_stack.get(from_opaque ChildMark(mark))
+
+
+---
+How many children were pushed since `mark` and not yet claimed by a parent.
+---
+pure func child_count_since(builder: DiscoveryBuilder, mark: ChildMark) -> Int:
+	builder.child_stack_depth - from_opaque ChildMark(mark)
+
+
+---
+Appends a node over every child pushed since `mark`, claiming them.
+---
+pure func append_parent_node_since(
+	builder: DiscoveryBuilder,
+	mark: ChildMark,
+	kind: NodeKind,
+	span: Span,
+) -> DiscoveryBuilder:
+	builder.append_parent_node_from_stack(
+		kind,
+		span,
+		builder.child_count_since(mark),
+	)
+
+
+---
+`append_parent_node_since` for a kind whose payload is a name, with its name
+span row, as `append_named_parent_node_from_stack`.
+---
+pure func append_named_parent_node_since(
+	builder: DiscoveryBuilder,
+	mark: ChildMark,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	builder.append_named_parent_node_from_stack(
+		kind,
+		span,
+		name,
+		name_span,
+		builder.child_count_since(mark),
+	)
 
 
 pure func append_token(builder: DiscoveryBuilder, token: Token) -> DiscoveryBuilder:
@@ -2265,7 +2297,7 @@ private pure func append_parent_node_with_payload(
 
 ---
 Appends `children` to the edge table in one update of the builder; the loop
-runs over the edge list alone (builder threading rule 1).
+runs over the edge list alone.
 ---
 private pure func append_node_children(
 	builder: DiscoveryBuilder,
@@ -2275,8 +2307,8 @@ private pure func append_node_children(
 
 
 ---
-`edges` followed by `children`. The first append is unconditional, as rule 1
-requires of lists too.
+`edges` followed by `children`. The first append is unconditional and the
+rest are in a loop, so the list is updated in place.
 ---
 private pure func with_node_children(edges: List[NodeId], children: List[NodeId]) -> List[NodeId]:
 	match children.get(0):
@@ -2385,32 +2417,18 @@ private pure func append_parent_node_from_stack_with_payload(
 
 
 ---
-Copies child stack entries `first_index .. end_index` to the edge table,
-reading each entry into a local before its append (builder threading rule 6).
+Copies child stack entries `first_index .. end_index` to the edge table.
 ---
 private pure func claim_stack_children(
 	builder: DiscoveryBuilder,
 	first_index: Int,
 	end_index: Int,
 ) -> DiscoveryBuilder:
-	if first_index >= end_index:
-		builder
-	else:
-		builder.claim_stack_child_run(first_index, end_index)
-
-
-private pure func claim_stack_child_run(
-	builder: DiscoveryBuilder,
-	first_index: Int,
-	end_index: Int,
-) -> DiscoveryBuilder:
-	first: NodeId = builder.stack_entry(first_index)
-	var out: DiscoveryBuilder = builder.append_node_child(first)
-	var index: Int = first_index + 1
+	var out: DiscoveryBuilder = builder
+	var index: Int = first_index
 
 	while index < end_index:
-		child: NodeId = out.stack_entry(index)
-		out = out.append_node_child(child)
+		out = out.append_node_child(out.stack_entry(index))
 		index += 1
 
 	out
@@ -2443,8 +2461,7 @@ private pure func stack_entry(builder: DiscoveryBuilder, index: Int) -> NodeId:
 ---
 `builder` parsing statements in `context`. A routine that parses a nested body
 reads `loop_context` into a local first, enters the body's context with this,
-and restores the local afterwards, so the save and restore are scalar reads
-and updates, not chained builder calls.
+and restores the local afterwards.
 ---
 pure func with_loop_context(builder: DiscoveryBuilder, context: LoopContext) -> DiscoveryBuilder:
 	{ builder | loop_context = context }

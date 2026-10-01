@@ -151,6 +151,18 @@ What a request for a module came to.
   tables, and no module has been loaded from its path yet.
 - `ModuleAlreadyLoaded(module)`: the request's source is a module already
   loaded.
+- `Unresolved(failure)`: no module results; `failure` says why.
+---
+union RequestResolution:
+	LoadSource(SourceCandidate, String)
+	ModuleAlreadyLoaded(ModuleId)
+	Unresolved(ResolutionFailure)
+
+
+---
+Why a request resolved to no module. Each failure is reported against the
+requester by `report_failure`.
+
 - `SourceMissing`: no candidate exists under any spelling.
 - `SpellingUnknown`: a candidate exists but a directory on the way to it could
   not be listed, so its spelling is unknown; discovery says so rather than
@@ -161,9 +173,7 @@ What a request for a module came to.
 - `ReadFailed`: a candidate exists but its text could not be read.
 - `SourceOverLimit(rejection, byte_length)`: the source cannot be admitted.
 ---
-union RequestResolution:
-	LoadSource(SourceCandidate, String)
-	ModuleAlreadyLoaded(ModuleId)
+union ResolutionFailure:
 	SourceMissing
 	SpellingUnknown
 	SpelledWithOtherCase(List[String])
@@ -177,9 +187,9 @@ first with `next_root_id`.
 ---
 pure func record_root_request(builder: DiscoveryBuilder, root_path: String) -> DiscoveryBuilder:
 	request_path: PathId = builder.interned_path_id(root_path)
-	var out: DiscoveryBuilder = builder.intern_path(root_path)
-	out = out.append_root({request_path = request_path})
-	out
+	builder
+		.intern_path(root_path)
+		.append_root({request_path = request_path})
 
 
 ---
@@ -211,9 +221,9 @@ pure func record_implicit_request(
 	module_name: String,
 ) -> DiscoveryBuilder:
 	request_path: PathId = builder.interned_path_id(module_name)
-	var out: DiscoveryBuilder = builder.intern_path(module_name)
-	out = out.append_implicit_request({request_path = request_path})
-	out
+	builder
+		.intern_path(module_name)
+		.append_implicit_request({request_path = request_path})
 
 
 ---
@@ -248,13 +258,6 @@ func resolve_import[Provider:SourceProvider](
 		listings,
 		lookup.import_candidates(entry.request),
 	)
-
-
----
-Whether an import is waiting to be resolved.
----
-pure func has_pending_import(queue: ImportQueue) -> Bool:
-	queue.taken < queue.pending.length()
 
 
 ---
@@ -294,7 +297,7 @@ pure func enqueue_imports_of_loaded_module(
 					),
 				)
 			}
-		_:
+		ModuleAlreadyLoaded(_) | Unresolved(_):
 			queue
 
 
@@ -339,15 +342,14 @@ pure func record_target(
 
 
 ---
-Reports against `requester` why `resolution` loaded no module. A resolution
-that names a module is not a failure.
+Reports against `requester` why its request loaded no module.
 ---
 pure func report_failure(
 	builder: DiscoveryBuilder,
 	requester: ModuleRequester,
-	resolution: RequestResolution,
+	failure: ResolutionFailure,
 ) -> DiscoveryBuilder:
-	match resolution:
+	match failure:
 		SourceMissing:
 			match requester:
 				RequestedByRoot(root):
@@ -388,10 +390,6 @@ pure func report_failure(
 					builder.report_rejected_implicit(request, rejection, byte_length)
 				RequestedByImport(import_id):
 					builder.report_rejected_import(import_id, rejection, byte_length)
-		LoadSource(_, _):
-			builder
-		ModuleAlreadyLoaded(_):
-			builder
 
 
 private pure func report_requester(
@@ -448,6 +446,14 @@ private func candidate_spelling[Provider:SourceProvider](
 
 
 ---
+The resolution of a request none of whose candidates exists. Built once: a
+union with a payload is allocated each time it is written, and every import
+starts its look-up from this value.
+---
+private NO_CANDIDATE_FOUND: RequestResolution = Unresolved(SourceMissing)
+
+
+---
 Looks `candidates` up in `provider`: the first, in lookup order, that exists
 with no component below its trusted directory known to be stored in different
 letter case, read and checked against the tables' limits. Near misses are
@@ -461,7 +467,7 @@ private func look_up_candidates[Provider:SourceProvider](
 	candidates: List[SourceCandidate],
 ) -> (Dict[String, DirectoryListing], RequestResolution):
 	var kept: Dict[String, DirectoryListing] = listings
-	var found: RequestResolution = SourceMissing
+	var found: RequestResolution = NO_CANDIDATE_FOUND
 
 	for candidate in candidates:
 		if provider.source_exists(candidate.path):
@@ -473,13 +479,13 @@ private func look_up_candidates[Provider:SourceProvider](
 					found = resolution_of_existing_source(provider, builder, candidate)
 					break
 				SpellingUnverifiable(_):
-					found = SpellingUnknown
+					found = Unresolved(SpellingUnknown)
 					break
 				StoredSpelling(_, _):
 					void
 
 	match found:
-		SourceMissing:
+		Unresolved(SourceMissing):
 			for candidate in candidates:
 				(listed, spelling) = candidate_spelling(provider, kept, candidate)
 				kept = listed
@@ -487,7 +493,7 @@ private func look_up_candidates[Provider:SourceProvider](
 				match spelling:
 					StoredSpelling(stored_names, stored_path):
 						if provider.source_exists(normalize(stored_path)):
-							found = SpelledWithOtherCase(stored_names)
+							found = Unresolved(SpelledWithOtherCase(stored_names))
 							break
 					_:
 						void
@@ -515,11 +521,11 @@ private func resolution_of_existing_source[Provider:SourceProvider](
 				SourceText(text):
 					match builder.source_rejection(text.length()):
 						Some(rejection):
-							SourceOverLimit(rejection, text.length())
+							Unresolved(SourceOverLimit(rejection, text.length()))
 						None:
 							LoadSource(candidate, text)
 				SourceUnreadable:
-					ReadFailed
+					Unresolved(ReadFailed)
 
 
 ---
@@ -544,9 +550,8 @@ pure func record_module_package(
 
 
 ---
-Records that `module` belongs to the package of `kind` named `name`. Each
-step is a helper that returns its builder unchanged when there is nothing to
-add (builder threading rule 1).
+Records that `module` belongs to the package of `kind` named `name`, adding
+the package row first when it is the first module of that package.
 ---
 private pure func record_module_in_package(
 	builder: DiscoveryBuilder,
@@ -560,11 +565,12 @@ private pure func record_module_in_package(
 		None:
 			builder.next_package_id()
 
-	with_package: DiscoveryBuilder = builder.ensure_package(kind, name)
-	with_package.append_module_package({
-		module = module,
-		package = package,
-	})
+	builder
+		.ensure_package(kind, name)
+		.append_module_package({
+			module = module,
+			package = package,
+		})
 
 
 ---
@@ -590,11 +596,12 @@ private pure func ensure_package(
 			None:
 				builder.next_name_id()
 
-		with_name: DiscoveryBuilder = builder.ensure_name(name)
-		with_name.append_package({
-			name = package_name,
-			kind = kind,
-		})
+		builder
+			.ensure_name(name)
+			.append_package({
+				name = package_name,
+				kind = kind,
+			})
 
 
 ---
@@ -728,17 +735,18 @@ private pure func report_import_case_mismatch(
 	stored_path_id: PathId = builder.interned_path_id(stored_path)
 	span: Span = builder.import_span(import_id)
 	arguments_first: Int = builder.next_diagnostic_argument_row()
-	var out: DiscoveryBuilder = builder.intern_path(stored_path)
-	out = out.append_diagnostic_argument(import_id.import_id_index())
-	out = out.append_diagnostic_argument(stored_path_id.path_id_index())
-	out.append_resolution_diagnostic({
-		code = ImportCaseMismatchDiagnostic,
-		span = span,
-		arguments = {
-			first = arguments_first,
-			count = 2
-		},
-	})
+	builder
+		.intern_path(stored_path)
+		.append_diagnostic_argument(import_id.import_id_index())
+		.append_diagnostic_argument(stored_path_id.path_id_index())
+		.append_resolution_diagnostic({
+			code = ImportCaseMismatchDiagnostic,
+			span = span,
+			arguments = {
+				first = arguments_first,
+				count = 2
+			},
+		})
 
 
 private pure func report_rejected_import(
@@ -788,16 +796,17 @@ private pure func report_root_case_mismatch(
 	stored_path: String = stored_names.join("/")
 	stored_path_id: PathId = builder.interned_path_id(stored_path)
 	arguments_first: Int = builder.next_diagnostic_argument_row()
-	var out: DiscoveryBuilder = builder.intern_path(stored_path)
-	out = out.append_diagnostic_argument(stored_path_id.path_id_index())
-	out.append_root_diagnostic({
-		root = root,
-		code = RootCaseMismatchDiagnostic,
-		arguments = {
-			first = arguments_first,
-			count = 1
-		},
-	})
+	builder
+		.intern_path(stored_path)
+		.append_diagnostic_argument(stored_path_id.path_id_index())
+		.append_root_diagnostic({
+			root = root,
+			code = RootCaseMismatchDiagnostic,
+			arguments = {
+				first = arguments_first,
+				count = 1
+			},
+		})
 
 
 private pure func report_rejected_root(
