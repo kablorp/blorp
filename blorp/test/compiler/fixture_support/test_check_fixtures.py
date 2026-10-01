@@ -263,6 +263,85 @@ class BlorpCheckFixtureRunnerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("expected 2 RUN-BLORP-CHECK fixtures, found 1", result.stdout)
 
+    def test_discovery_pin_lines_are_not_expectations(self) -> None:
+        """`-- EXPECT-DISCOVERY:` pins belong to the compiler_new discovery
+        suites; the check runner must neither read them as expectations nor
+        let them replace the `-- EXPECT:` lines beside them."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fail_dir = root / "should_fail"
+            fail_dir.mkdir()
+            (fail_dir / "pinned.brp").write_text(
+                "-- EXPECT: error: wanted\n"
+                "-- EXPECT-DISCOVERY: ExpectedColonDiagnostic 4:9\n"
+                "-- RUN-BLORP-CHECK\n",
+                encoding="utf-8",
+            )
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'error: pinned.brp:4:9: error: wanted'\nexit 1\n",
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(RUNNER),
+                    "--blorp-bin",
+                    str(compiler),
+                    "--root",
+                    str(root),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("status=PASS passed=1 failed=0 tests=1", result.stdout)
+
+    def test_discovery_pin_line_alone_adds_no_expectation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fail_dir = root / "should_fail"
+            fail_dir.mkdir()
+            (fail_dir / "only_pin.brp").write_text(
+                "-- EXPECT-DISCOVERY: accepted-by-discovery typecheck rejects it\n"
+                "-- RUN-BLORP-CHECK\n",
+                encoding="utf-8",
+            )
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'error: anything'\nexit 1\n",
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(RUNNER),
+                    "--blorp-bin",
+                    str(compiler),
+                    "--root",
+                    str(root),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            # No real expectation was written, so nothing can fail: the pin is
+            # not read as one.
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

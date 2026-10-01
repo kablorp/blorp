@@ -1,0 +1,332 @@
+-- Runs parser fixtures through the discovery stage's per-module lex and parse
+-- and compares what it reports with the expectation pinned in the fixture.
+--
+-- A should_fail fixture pins its first diagnostic in a line of its own:
+--
+--     -- EXPECT-DISCOVERY: ExpectedColonDiagnostic 4:12
+--
+-- (the code's name, then the one-based line and tab-expanded column where its
+-- span starts), or one of three explicit forms for a fixture discovery does
+-- not reject:
+--
+--     -- EXPECT-DISCOVERY: accepted-by-discovery <why the old compiler rejects it later>
+--     -- EXPECT-DISCOVERY: discovery-gap <what the old parser reports that discovery does not>
+--     -- EXPECT-DISCOVERY: pending-spec-decision
+--
+-- `accepted-by-discovery` is for a fixture the existing compiler rejects only
+-- after parsing (type checking, say), so discovery rightly reports nothing.
+-- `discovery-gap` records a check the old parser makes and discovery lacks:
+-- the suite still requires discovery to report nothing, so closing the gap
+-- fails the fixture until its pin is replaced by a real one.
+-- `pending-spec-decision` marks a fixture whose expected behaviour is
+-- undecided; the suite names it and checks nothing else.
+--
+-- Only `load_module` runs, not the module walker: a fixture is parsed as one
+-- module and its imports are never resolved, so resolution diagnostics
+-- (unresolved imports, unreadable sources) cannot appear.
+import:
+	../../../src/compiler_new/stage_01_discovery/discovery_builder:
+		DiscoveryBuilder,
+		empty_discovery_builder,
+	../../../src/compiler_new/stage_01_discovery/discovery_diagnostic_code: diagnostic_code_name
+	../../../src/compiler_new/stage_01_discovery/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		freeze,
+	../../../src/compiler_new/stage_01_discovery/module_walker: load_module
+	../../../src/compiler_new/stage_01_discovery/row_kinds:
+		ModuleOriginKind(UserModule),
+		ModuleReach(RootModule),
+	../../../src/compiler_new/stage_01_discovery/source_position:
+		LineColumn,
+		span_start_position,
+	../../../src/compiler_new/stage_01_discovery/source_provider: PackageMembership(NotInPackage)
+	fs: message, read_directory
+	system: read_file
+
+
+---
+The prefix of the line that pins a should_fail fixture's discovery expectation.
+---
+PIN_LINE_PREFIX: String = "-- EXPECT-DISCOVERY: "
+
+---
+The pin's first word when discovery accepts a fixture that a later stage of the
+existing compiler rejects; the rest of the line is the reason.
+---
+ACCEPTED_PIN_PREFIX: String = "accepted-by-discovery "
+
+
+---
+The pin's first word when the old parser rejects a fixture that discovery
+accepts because it lacks that check; the rest of the line says what the old
+parser reports.
+---
+GAP_PIN_PREFIX: String = "discovery-gap "
+
+---
+The pin of a fixture whose expected behaviour is undecided.
+---
+PENDING_PIN_WORD: String = "pending-spec-decision"
+
+
+---
+What a should_fail fixture pins about discovery's behaviour.
+`ExpectsFirstDiagnostic` holds the label `diagnostic_label` renders;
+`AcceptedByDiscovery` and `KnownDiscoveryGap` hold their explanation.
+`NoPin` and `ConflictingPins` (the number of pin lines) are not valid
+expectations and fail the suite.
+---
+union FixturePin:
+	ExpectsFirstDiagnostic(String)
+	AcceptedByDiscovery(String)
+	KnownDiscoveryGap(String)
+	PendingSpecDecision
+	NoPin
+	ConflictingPins(Int)
+
+
+---
+The pin of a fixture's source text.
+---
+pure func fixture_pin(text: String) -> FixturePin:
+	pin_texts: List[String] = text
+		.lines()
+		.filter(pure func(line): line.starts_with(PIN_LINE_PREFIX))
+		.map(pure func(line): line.drop_left(PIN_LINE_PREFIX.length()).trim())
+
+	match pin_texts.length():
+		0:
+			NoPin
+		1:
+			pin_text: String = pin_texts.get_or(0, "")
+
+			if pin_text.starts_with(ACCEPTED_PIN_PREFIX):
+				AcceptedByDiscovery(pin_text.drop_left(ACCEPTED_PIN_PREFIX.length()))
+			else if pin_text.starts_with(GAP_PIN_PREFIX):
+				KnownDiscoveryGap(pin_text.drop_left(GAP_PIN_PREFIX.length()))
+			else if pin_text == PENDING_PIN_WORD:
+				PendingSpecDecision
+			else:
+				ExpectsFirstDiagnostic(pin_text)
+		count:
+			ConflictingPins(count)
+
+
+---
+One discovery diagnostic of a parsed fixture: its code's name and the
+one-based line and column where its span starts.
+---
+record ReportedDiagnostic {
+	code_name: String,
+	line: Int,
+	column: Int
+}
+
+
+---
+`CodeName line:column`, the form a pin is written in.
+---
+pure func diagnostic_label(reported: ReportedDiagnostic) -> String:
+	"${reported.code_name} ${reported.line}:${reported.column}"
+
+
+---
+The module `text` parsed alone, as the discovery stage parses a root.
+---
+pure func parsed_fixture(path: String, text: String) -> DiscoveryBuilder:
+	empty_discovery_builder().load_module(
+		{
+			path = path,
+			origin = UserModule,
+			package = NotInPackage
+		},
+		RootModule,
+		text,
+	)
+
+
+---
+Every diagnostic of a builder holding one parsed module, in report order.
+---
+pure func reported_diagnostics(builder: DiscoveryBuilder) -> List[ReportedDiagnostic]:
+	var reported: List[ReportedDiagnostic] = []
+
+	for row in builder.diagnostics:
+		position: LineColumn = builder.span_start_position(row.span)
+		reported = reported.append({
+			code_name = row.code.diagnostic_code_name(),
+			line = position.line + 1,
+			column = position.column
+		})
+
+	reported
+
+
+---
+The diagnostics as one label per line, or `(none)`.
+---
+pure func diagnostics_listing(reported: List[ReportedDiagnostic]) -> String:
+	if reported.is_empty():
+		"(none)"
+	else:
+		reported
+			.map(diagnostic_label)
+			.join("\n")
+
+
+---
+Whether the tables satisfy every table invariant, and so freeze.
+---
+pure func freezes_with_invariants(builder: DiscoveryBuilder) -> Bool:
+	match builder.freeze():
+		FrozenTables(_):
+			True
+		TableInvariantsViolated(_):
+			False
+
+
+---
+Fixture paths (`directory` plus each `.brp` file name) in name order, or a
+message naming the directory that could not be read.
+---
+func fixture_paths(directory: String) -> Result[List[String], String]:
+	match read_directory(directory):
+		Ok(entries):
+			Ok(
+				entries
+					.filter(pure func(entry): entry.name.ends_with(".brp"))
+					.map(pure func(entry): directory + entry.name),
+			)
+		Err(error):
+			Err("cannot list fixture directory ${directory}: ${error.message()}")
+
+
+---
+The text of the file at `path`, or an empty string when it cannot be read
+(an unreadable fixture then fails its expectations and is named).
+---
+func fixture_text(path: String) -> String:
+	match read_file(path):
+		Ok(text):
+			text
+		Err(_):
+			""
+
+
+---
+The failures of a should_pass fixture's source `text`: any diagnostic, or
+tables that do not freeze. Empty when it passes.
+---
+pure func should_pass_failures(path: String, text: String) -> List[String]:
+	builder: DiscoveryBuilder = parsed_fixture(path, text)
+	reported: List[ReportedDiagnostic] = builder.reported_diagnostics()
+	var failures: List[String] = []
+
+	if not reported.is_empty():
+		failures = failures.append(
+			"${path}: expected no diagnostics, discovery reported:\n${reported.diagnostics_listing()}",
+		)
+
+	if not builder.freezes_with_invariants():
+		failures = failures.append("${path}: the parsed tables violate a table invariant")
+
+	failures
+
+
+---
+The failures of a should_fail fixture's source `text` against its pin. Empty
+when it passes.
+---
+pure func should_fail_failures(path: String, text: String) -> List[String]:
+	builder: DiscoveryBuilder = parsed_fixture(path, text)
+	reported: List[ReportedDiagnostic] = builder.reported_diagnostics()
+	actual_listing: String = reported.diagnostics_listing()
+	var failures: List[String] = []
+
+	match text.fixture_pin():
+		NoPin:
+			suggestion: String = reported
+				.get(0)
+				.map(diagnostic_label)
+				.get_or("accepted-by-discovery <why the existing compiler rejects it later>")
+
+			failures = failures.append(
+				"${path}: no `${PIN_LINE_PREFIX}` line. Add `${PIN_LINE_PREFIX}${suggestion}` after checking it against the existing compiler's diagnostic; discovery reported:\n${actual_listing}",
+			)
+		ConflictingPins(count):
+			failures = failures.append(
+				"${path}: ${count} `${PIN_LINE_PREFIX}` lines; a fixture pins exactly one",
+			)
+		PendingSpecDecision:
+			void
+		AcceptedByDiscovery(reason):
+			failures = failures.concat(unreported_failures(path, reason, "accepted-by-discovery", reported))
+		KnownDiscoveryGap(reason):
+			failures = failures.concat(unreported_failures(path, reason, "discovery-gap", reported))
+		ExpectsFirstDiagnostic(expected):
+			actual: String = reported
+				.get(0)
+				.map(diagnostic_label)
+				.get_or("(none)")
+
+			if actual != expected:
+				failures = failures.append(
+					"${path}: expected first diagnostic ${expected}, got ${actual}; all diagnostics:\n${actual_listing}",
+				)
+
+	if not builder.freezes_with_invariants():
+		failures = failures.append("${path}: the parsed tables violate a table invariant")
+
+	failures
+
+
+---
+The failures of a pin that says discovery reports nothing: diagnostics after
+all. (A pin's reason is non-empty by construction: the text is trimmed and the
+pin's first word includes a space.)
+---
+pure func unreported_failures(
+	path: String,
+	reason: String,
+	pin_word: String,
+	reported: List[ReportedDiagnostic],
+) -> List[String]:
+	if reported.is_empty():
+		[]
+	else:
+		[
+			"${path}: pinned ${pin_word} (${reason}), but discovery reported:\n${reported.diagnostics_listing()}. Replace the pin with the first diagnostic.",
+		]
+
+
+---
+The failures of the should_pass fixture file at `path`.
+---
+func should_pass_file_failures(path: String) -> List[String]:
+	match read_file(path):
+		Ok(text):
+			should_pass_failures(path, text)
+		Err(message):
+			["${path}: unreadable: ${message}"]
+
+
+---
+The failures of the should_fail fixture file at `path`.
+---
+func should_fail_file_failures(path: String) -> List[String]:
+	match read_file(path):
+		Ok(text):
+			should_fail_failures(path, text)
+		Err(message):
+			["${path}: unreadable: ${message}"]
+
+
+---
+The pin of the fixture file at `path`; `NoPin` when it cannot be read.
+---
+func fixture_file_pin(path: String) -> FixturePin:
+	match read_file(path):
+		Ok(text):
+			text.fixture_pin()
+		Err(_):
+			NoPin

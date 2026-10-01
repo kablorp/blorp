@@ -42,7 +42,6 @@ import:
 			InterpolatedEscapeAtEndDiagnostic,
 			InterpolationTooDeepDiagnostic,
 			InvalidCharLiteralDiagnostic,
-			MissingPipeMarkerDiagnostic,
 			MultilineInterpolatedStringDiagnostic,
 			MultilineRawStringDiagnostic,
 			MultilineStringDiagnostic,
@@ -1407,70 +1406,51 @@ private pure func scan_pipe_block(
 	var saw_interpolation: Bool = False
 	var first_line: Bool = True
 	var ended_with_newline: Bool = False
-	var failure: Option[PendingDiagnostic] = None
+	var continuing: Bool = True
 
-	while failure.is_none():
+	while continuing:
 		if not first_line:
 			body = body.append_char('\n')
 
+		-- The scan starts at a `|` marker and goes on only at a marker at the
+		-- margin (below), so a marker is always here.
 		if not raw and text_at(text, position, "||"):
 			body = body.append_char('|')
 			position += 2
-		else if byte_at(text, position) == '|' and position < text.length():
-			position += 1
 		else:
-			failure = Some(
-				pending_with_argument(
-					MissingPipeMarkerDiagnostic,
-					position,
-					margin_column,
-				),
-			)
+			position += 1
 
-		if failure.is_none():
-			(content, line) = pipe_line_content(text, position, raw)
-			body += content
-			saw_interpolation = saw_interpolation or line.saw_interpolation
-			position = line.end
-			ended_with_newline = line.ended_with_newline
+		(content, line) = pipe_line_content(text, position, raw)
+		body += content
+		saw_interpolation = saw_interpolation or line.saw_interpolation
+		position = line.end
+		ended_with_newline = line.ended_with_newline
+		marker: Int = after_blanks(text, position)
 
-			if ended_with_newline:
-				marker: Int = after_blanks(text, position)
+		if (
+			ended_with_newline
+			and indent_width(text, position) == margin_column - 1
+			and byte_at(text, marker) == '|'
+			and marker < text.length()
+		):
+			position = marker
+			first_line = False
+		else:
+			continuing = False
 
-				if (
-					indent_width(text, position) == margin_column - 1
-					and byte_at(text, marker) == '|'
-					and marker < text.length()
-				):
-					position = marker
-					first_line = False
-				else:
-					break
-			else:
-				break
+	literal: ScannedLiteral = if raw:
+		TextLiteral(RawPipeStringToken, body)
+	else if saw_interpolation:
+		InterpolatedLiteral(InterpolatedPipeStringToken)
+	else:
+		TextLiteral(PipeStringToken, body)
 
-	match failure:
-		Some(diagnostic):
-			{
-				end = position,
-				literal = NoLiteral,
-				diagnostics = [diagnostic],
-				ended_with_newline = ended_with_newline
-			}
-		None:
-			literal: ScannedLiteral = if raw:
-				TextLiteral(RawPipeStringToken, body)
-			else if saw_interpolation:
-				InterpolatedLiteral(InterpolatedPipeStringToken)
-			else:
-				TextLiteral(PipeStringToken, body)
-
-			{
-				end = position,
-				literal = literal,
-				diagnostics = [],
-				ended_with_newline = ended_with_newline
-			}
+	{
+		end = position,
+		literal = literal,
+		diagnostics = [],
+		ended_with_newline = ended_with_newline
+	}
 
 
 ---

@@ -1,0 +1,509 @@
+-- The parser fixtures, run through the discovery stage's per-module lex and
+-- parse so the new front end answers to the existing parser's expectations:
+--
+-- - the curated legacy fixtures under
+--   `blorp/test/compiler/stage_03_parse/fixtures/parser` (also run against the
+--   existing compiler by the `RUN-BLORP-CHECK` runner),
+-- - this stage's own fixtures under `fixtures/should_pass` and
+--   `fixtures/should_fail`, and
+-- - a check that every discovery diagnostic code is pinned as the first
+--   diagnostic of at least one should_fail fixture, or is named in
+--   `UNCOVERABLE_CODES` with the reason no single-module fixture can report it.
+--
+-- Every `should_pass` fixture must parse without a diagnostic and freeze;
+-- every `should_fail` fixture pins its first diagnostic in a
+-- `-- EXPECT-DISCOVERY:` line (see `support/parser_fixtures`). The directories
+-- are listed at test time, so a new fixture is picked up, and a new
+-- `should_fail` fixture without a pin fails with instructions.
+--
+-- Each fixture is parsed alone with `load_module`, not the module walker: its
+-- imports are never resolved, so walker resolution diagnostics cannot appear
+-- and only the parser's own diagnostic range is compared.
+--
+-- The codes come from the `enum DiscoveryDiagnosticCode:` block of the source
+-- file rather than a second list here: the block is one variant per line, and
+-- a variant added there is a code the suite demands a fixture for.
+import:
+	../support/parser_fixtures:
+		FixturePin(AcceptedByDiscovery, ExpectsFirstDiagnostic, KnownDiscoveryGap, PendingSpecDecision),
+		fixture_file_pin,
+		fixture_paths,
+		should_fail_failures,
+		should_fail_file_failures,
+		should_pass_failures,
+		should_pass_file_failures,
+	bytes: Bytes, bytes
+	string: to_bytes
+	system: mkstemp_path, read_file, remove_file, write_bytes
+	test: TestSuite
+
+
+LEGACY_FIXTURES: String = "blorp/test/compiler/stage_03_parse/fixtures/parser/"
+
+OWN_FIXTURES: String = "blorp/test/compiler_new/stage_01_discovery/fixtures/"
+
+CODE_SOURCE: String = "blorp/src/compiler_new/stage_01_discovery/discovery_diagnostic_code.brp"
+
+ENUM_HEADER: String = "enum DiscoveryDiagnosticCode:\n"
+
+---
+Starts each catalogue entry of the source file's doc comment.
+---
+CATALOGUE_BULLET: String = "- `"
+
+---
+What a code's name is indented by in the enum block.
+---
+ENUM_VARIANT_INDENT: String = "\t"
+
+---
+Legacy fixtures that other branches are still rewriting: their names start with
+one of these, and the suite does not run them. Remove an entry once its branch
+has landed and its fixtures carry pins.
+---
+IN_FLIGHT_FIXTURE_PREFIXES: List[String] = ["concurrent_", "concurrently_", "expression_ascription"]
+
+
+pure func contains_all(text: String, fragments: List[String]) -> Bool:
+	fragments.all(pure func(fragment): text.contains(fragment))
+
+
+---
+Prints every failure and returns whether there were none.
+---
+func report_failures(failures: List[String]) -> Bool:
+	for failure in failures:
+		print(failure)
+
+	failures.is_empty()
+
+
+---
+The `.brp` fixture paths of `directory`, in name order, less the files whose
+names start with an in-flight prefix when `skip_in_flight`; a directory that
+cannot be read is a failure naming it.
+---
+func listed_fixtures(directory: String, skip_in_flight: Bool) -> Result[List[String], String]:
+	match fixture_paths(directory):
+		Ok(paths):
+			Ok(
+				paths.filter(
+					pure func(path): not skip_in_flight or not is_in_flight(path, directory),
+				),
+			)
+		Err(message):
+			print(message)
+			Err(message)
+
+
+pure func is_in_flight(path: String, directory: String) -> Bool:
+	name: String = path.drop_left(directory.length())
+	IN_FLIGHT_FIXTURE_PREFIXES.any(pure func(prefix): name.starts_with(prefix))
+
+
+---
+Runs `check` over every fixture of each directory; true when every directory
+was listed and there were no failures.
+---
+func directories_pass(directories: List[String], skip_in_flight: Bool, check: (String) -> List[String]) -> Bool:
+	var failures: List[String] = []
+	var listed: Int = 0
+
+	for directory in directories:
+		match listed_fixtures(directory, skip_in_flight):
+			Ok(paths):
+				listed += paths.length()
+
+				for path in paths:
+					failures = failures.concat(check(path))
+			Err(message):
+				failures = failures.append(message)
+
+	print("fixtures run: ${listed}")
+	report_failures(failures) and listed > 0
+
+
+func test_every_should_pass_fixture_parses_without_diagnostics() -> Bool:
+	directories_pass(
+		[LEGACY_FIXTURES + "should_pass/", OWN_FIXTURES + "should_pass/"],
+		True,
+		should_pass_file_failures,
+	)
+
+
+func test_every_should_fail_fixture_matches_its_pin() -> Bool:
+	directories_pass(
+		[LEGACY_FIXTURES + "should_fail/", OWN_FIXTURES + "should_fail/"],
+		True,
+		should_fail_file_failures,
+	)
+
+
+pure func test_should_pass_failure_names_the_fixture_and_lists_the_diagnostics() -> Bool:
+	failures: List[String] = should_pass_failures("broken.brp", "func f() -> Int:\n\tif True\n\t\t1\n")
+	failures.length() >= 1 and contains_all(
+		failures.get_or(0, ""),
+		["broken.brp: expected no diagnostics", "ExpectedColonDiagnostic 3:9"],
+	)
+
+
+pure func test_should_fail_without_a_pin_says_how_to_add_one() -> Bool:
+	failures: List[String] = should_fail_failures("bad.brp", "func f() -> Int:\n\tif True\n\t\t1\n")
+	failures.length() == 1 and contains_all(
+		failures.get_or(0, ""),
+		[
+			"bad.brp: no `-- EXPECT-DISCOVERY: ` line",
+			"Add `-- EXPECT-DISCOVERY: ExpectedColonDiagnostic 3:9`",
+			"discovery reported:\nExpectedColonDiagnostic 3:9",
+		],
+	)
+
+
+pure func test_should_fail_pin_mismatch_shows_expected_and_actual() -> Bool:
+	failures: List[String] = should_fail_failures(
+		"bad.brp",
+		"-- EXPECT-DISCOVERY: ExpectedColonDiagnostic 2:10\nfunc f() -> Int:\n\tif True\n\t\t1\n",
+	)
+
+	-- The pin line is line 1, so the block the colon is missing before starts
+	-- on line 4, column 9; the pinned position is wrong.
+	failures.length() == 1 and contains_all(
+		failures.get_or(0, ""),
+		[
+			"bad.brp: expected first diagnostic ExpectedColonDiagnostic 2:10, got ExpectedColonDiagnostic 4:9",
+			"all diagnostics:\nExpectedColonDiagnostic 4:9",
+		],
+	)
+
+
+pure func test_should_fail_pin_that_matches_passes() -> Bool:
+	should_fail_failures(
+		"bad.brp",
+		"-- EXPECT-DISCOVERY: ExpectedColonDiagnostic 4:9\nfunc f() -> Int:\n\tif True\n\t\t1\n",
+	).is_empty()
+
+
+pure func test_accepted_pin_fails_when_discovery_reports_a_diagnostic() -> Bool:
+	failures: List[String] = should_fail_failures(
+		"bad.brp",
+		"-- EXPECT-DISCOVERY: accepted-by-discovery typecheck rejects it\nfunc f() -> Int:\n\tif True\n\t\t1\n",
+	)
+
+	failures.length() == 1 and contains_all(
+		failures.get_or(0, ""),
+		["pinned accepted-by-discovery (typecheck rejects it)", "ExpectedColonDiagnostic 4:9"],
+	)
+
+
+pure func test_accepted_pin_holds_when_discovery_reports_nothing() -> Bool:
+	should_fail_failures(
+		"ok.brp",
+		"-- EXPECT-DISCOVERY: accepted-by-discovery typecheck rejects it\nfunc f() -> Int:\n\t1\n",
+	).is_empty()
+
+
+pure func test_accepted_pin_without_a_reason_is_an_unknown_code() -> Bool:
+	failures: List[String] = should_fail_failures(
+		"ok.brp",
+		"-- EXPECT-DISCOVERY: accepted-by-discovery \nfunc f() -> Int:\n\t1\n",
+	)
+
+	-- The empty reason is trimmed away, so the line is an (unknown) code label.
+	failures.length() == 1 and contains_all(
+		failures.get_or(0, ""),
+		["expected first diagnostic accepted-by-discovery, got (none)"],
+	)
+
+
+pure func test_discovery_gap_pin_fails_once_discovery_reports_the_problem() -> Bool:
+	failures: List[String] = should_fail_failures(
+		"bad.brp",
+		"-- EXPECT-DISCOVERY: discovery-gap old parser rejects it\nfunc f() -> Int:\n\tif True\n\t\t1\n",
+	)
+
+	failures.length() == 1 and contains_all(
+		failures.get_or(0, ""),
+		["pinned discovery-gap (old parser rejects it)", "Replace the pin with the first diagnostic"],
+	)
+
+
+pure func test_pending_spec_decision_pin_is_a_named_skip() -> Bool:
+	should_fail_failures(
+		"pending.brp",
+		"-- EXPECT-DISCOVERY: pending-spec-decision\nfunc f() -> Int:\n\t1\n",
+	).is_empty()
+
+
+pure func test_two_pins_conflict() -> Bool:
+	failures: List[String] = should_fail_failures(
+		"two.brp",
+		"-- EXPECT-DISCOVERY: ExpectedColonDiagnostic 3:9\n-- EXPECT-DISCOVERY: ExpectedColonDiagnostic 3:9\nfunc f() -> Int:\n\t1\n",
+	)
+
+	failures.length() == 1 and failures
+		.get_or(0, "")
+		.contains("2 `-- EXPECT-DISCOVERY: ` lines; a fixture pins exactly one")
+
+
+---
+A diagnostic code that no single-module fixture can report as its first
+diagnostic, and why.
+---
+record UncoverableCode {
+	code_name: String,
+	reason: String
+}
+
+
+UNCOVERABLE_CODES: List[UncoverableCode] = [
+	{
+		code_name = "UnexpectedByteDiagnostic",
+		reason = "invalid UTF-8 cannot be stored in a text fixture (repository tools read fixtures as UTF-8); test_invalid_utf8_byte_is_pinned_like_a_fixture writes one at test time"
+	},
+	{
+		code_name = "UnresolvedImportDiagnostic",
+		reason = "import resolution belongs to the module walker (test_module_walker), not to parsing one module"
+	},
+	{
+		code_name = "UnresolvedRootDiagnostic",
+		reason = "a root request is resolved by the module walker (test_module_walker)"
+	},
+	{
+		code_name = "UnreadableSourceDiagnostic",
+		reason = "a source the provider located but could not read needs a failing provider; no suite covers it yet"
+	},
+	{
+		code_name = "SourceTooLargeDiagnostic",
+		reason = "needs a source beyond the packed-span limit; covered with an oversized in-memory source in test_module_walker"
+	},
+	{
+		code_name = "TooManySourcesDiagnostic",
+		reason = "needs more sources than a span can number; no suite covers it yet"
+	},
+]
+
+
+---
+The codes of the enum block in the source file, in declaration order; empty
+when the source cannot be read or has no block.
+---
+func declared_code_names() -> List[String]:
+	match read_file(CODE_SOURCE):
+		Ok(text):
+			match text.split_once(ENUM_HEADER):
+				Some(split):
+					block: String = split[1]
+						.split_once("\n\n")
+						.map(pure func(parts): parts[0])
+						.get_or("")
+
+					block
+						.lines()
+						.filter(pure func(line): line.starts_with(ENUM_VARIANT_INDENT))
+						.map(pure func(line): line.trim())
+				None:
+					[]
+		Err(_):
+			[]
+
+
+---
+The code names in the doc-comment catalogue of the source file: the
+`` - `NameDiagnostic`: `` bullets, in order.
+---
+func catalogue_code_names() -> List[String]:
+	match read_file(CODE_SOURCE):
+		Ok(text):
+			text
+				.lines()
+				.filter(pure func(line): line.starts_with(CATALOGUE_BULLET))
+				.map(pure func(line): line.drop_left(CATALOGUE_BULLET.length()).take_left(line.drop_left(CATALOGUE_BULLET.length()).index_of("`").get_or(0)))
+		Err(_):
+			[]
+
+
+---
+The code names pinned as the first diagnostic by the `should_fail` fixtures
+in `directory`.
+---
+func pinned_code_names(directory: String) -> List[String]:
+	var names: List[String] = []
+
+	-- A directory that cannot be read is reported by the fixture tests.
+	for path in fixture_paths(directory).get_or([]):
+		match fixture_file_pin(path):
+			ExpectsFirstDiagnostic(label):
+				names = names.append(label.split(" ").get_or(0, ""))
+			_:
+				void
+
+	names
+
+
+---
+The fixture for an invalid UTF-8 byte, written to a temporary file and read
+back as a fixture file would be: the pin line, then a line ending in the
+byte 0xFF.
+---
+func test_invalid_utf8_byte_is_pinned_like_a_fixture() -> Bool:
+	invalid_byte: Bytes = bytes(1).set_index(0, 255)
+
+	source: Bytes = "-- EXPECT-DISCOVERY: UnexpectedByteDiagnostic 2:12\nx: Int = 1 "
+		.to_bytes()
+		.append(invalid_byte)
+		.append("\n".to_bytes())
+
+	match mkstemp_path("discovery_invalid_utf8"):
+		Ok(path):
+			written: Bool = match write_bytes(path, source):
+				Ok(_):
+					True
+				Err(_):
+					False
+
+			failures: List[String] = match read_file(path):
+				Ok(text):
+					should_fail_failures(path, text)
+				Err(message):
+					["${path}: unreadable: ${message}"]
+
+			remove_file(path)
+
+			for failure in failures:
+				print(failure)
+
+			written and failures.is_empty()
+		Err(message):
+			print("no temporary file: ${message}")
+			False
+
+
+---
+The enum block read above ends at the first blank line, and Blorp has no enum
+reflection, so a blank line inside the enum would silently drop later codes.
+The doc-comment catalogue names every code independently: the two must agree.
+---
+func test_the_enum_block_matches_the_catalogue() -> Bool:
+	declared: List[String] = declared_code_names()
+	catalogued: List[String] = catalogue_code_names()
+	missing_from_enum: List[String] = catalogued.filter(pure func(name): not declared.contains(name))
+	missing_from_catalogue: List[String] = declared.filter(pure func(name): not catalogued.contains(name))
+
+	for name in missing_from_enum:
+		print("${name} is in the catalogue but was not read from the enum block (a blank line inside the enum?)")
+
+	for name in missing_from_catalogue:
+		print("${name} is in the enum block but has no catalogue entry")
+
+	missing_from_enum.is_empty() and missing_from_catalogue.is_empty() and not declared.is_empty()
+
+
+func test_the_enum_block_is_read() -> Bool:
+	names: List[String] = declared_code_names()
+	print("discovery diagnostic codes: ${names.length()}")
+	names.contains("UnresolvedImportDiagnostic") and names.contains("InterpolatedStringPatternDiagnostic")
+
+
+func test_every_diagnostic_code_has_a_fixture_or_a_reason() -> Bool:
+	legacy: List[String] = pinned_code_names(LEGACY_FIXTURES + "should_fail/")
+	own: List[String] = pinned_code_names(OWN_FIXTURES + "should_fail/")
+	uncoverable: List[String] = UNCOVERABLE_CODES.map(pure func(entry): entry.code_name)
+	var uncovered: List[String] = []
+	var legacy_count: Int = 0
+	var own_only_count: Int = 0
+
+	for name in declared_code_names():
+		if legacy.contains(name):
+			legacy_count += 1
+		else if own.contains(name):
+			own_only_count += 1
+		else if not uncoverable.contains(name):
+			uncovered = uncovered.append(name)
+
+	print("codes pinned by legacy fixtures: ${legacy_count}; by new fixtures only: ${own_only_count}; uncoverable: ${uncoverable.length()}")
+
+	for name in uncovered:
+		print("no should_fail fixture pins ${name} as its first diagnostic: add one under ${OWN_FIXTURES}should_fail/ (or, if no single-module input can reach it, name it with the reason in UNCOVERABLE_CODES)")
+
+	uncovered.is_empty()
+
+
+func test_uncoverable_codes_are_codes_and_not_covered() -> Bool:
+	declared: List[String] = declared_code_names()
+	covered: List[String] = pinned_code_names(LEGACY_FIXTURES + "should_fail/").concat(
+		pinned_code_names(OWN_FIXTURES + "should_fail/"),
+	)
+	var stale: List[String] = []
+
+	for entry in UNCOVERABLE_CODES:
+		if not declared.contains(entry.code_name):
+			stale = stale.append("${entry.code_name} is not a discovery diagnostic code")
+		else if covered.contains(entry.code_name):
+			stale = stale.append("${entry.code_name} has a fixture now: remove it from UNCOVERABLE_CODES")
+
+	for message in stale:
+		print(message)
+
+	stale.is_empty()
+
+
+
+
+tests: TestSuite = {
+	description = "Parser fixtures through discovery",
+	tests = [
+		(
+			"every should_pass fixture parses without diagnostics",
+			test_every_should_pass_fixture_parses_without_diagnostics,
+		),
+		(
+			"every should_fail fixture matches its pin",
+			test_every_should_fail_fixture_matches_its_pin,
+		),
+		(
+			"should_pass failure names the fixture and lists the diagnostics",
+			test_should_pass_failure_names_the_fixture_and_lists_the_diagnostics,
+		),
+		(
+			"should_fail without a pin says how to add one",
+			test_should_fail_without_a_pin_says_how_to_add_one,
+		),
+		(
+			"should_fail pin mismatch shows expected and actual",
+			test_should_fail_pin_mismatch_shows_expected_and_actual,
+		),
+		("should_fail pin that matches passes", test_should_fail_pin_that_matches_passes),
+		(
+			"accepted pin fails when discovery reports a diagnostic",
+			test_accepted_pin_fails_when_discovery_reports_a_diagnostic,
+		),
+		(
+			"accepted pin holds when discovery reports nothing",
+			test_accepted_pin_holds_when_discovery_reports_nothing,
+		),
+		(
+			"accepted pin without a reason is an unknown code",
+			test_accepted_pin_without_a_reason_is_an_unknown_code,
+		),
+		(
+			"discovery gap pin fails once discovery reports the problem",
+			test_discovery_gap_pin_fails_once_discovery_reports_the_problem,
+		),
+		("pending spec decision pin is a named skip", test_pending_spec_decision_pin_is_a_named_skip),
+		("two pins conflict", test_two_pins_conflict),
+		(
+			"invalid utf8 byte is pinned like a fixture",
+			test_invalid_utf8_byte_is_pinned_like_a_fixture,
+		),
+		("the enum block is read", test_the_enum_block_is_read),
+		("the enum block matches the catalogue", test_the_enum_block_matches_the_catalogue),
+		(
+			"every diagnostic code has a fixture or a reason",
+			test_every_diagnostic_code_has_a_fixture_or_a_reason,
+		),
+		(
+			"uncoverable codes are codes and not covered",
+			test_uncoverable_codes_are_codes_and_not_covered,
+		),
+	]
+}

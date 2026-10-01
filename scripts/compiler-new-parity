@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Compare the new discovery stage with the existing front end over the corpus.
+
+For every tracked `.brp` file under `blorp/src`, `standard_library/src` and
+`blorp/test`, both front ends lex and parse the file, and this script checks
+per file that they agree on
+
+  * every token: byte range, kind and text (the existing lexer's `#` followed
+    by a name is one `DimensionNameToken` in the new lexer, so that pair is
+    merged before comparing),
+  * whether the lexer reported a diagnostic, and
+  * whether the parser rejected the file (the accept/reject verdict).
+
+Each side is one dumper program, compiled to a binary once and run once,
+sequentially, over the whole file list:
+
+  * `blorp/test/compiler/tools/legacy_front_end_dump.brp` (existing compiler),
+  * `blorp/test/compiler_new/tools/corpus_dump.brp` (discovery stage).
+
+A mismatch is printed with its file and, for tokens, the first differing
+token. Exit status 0 means every file agrees.
+
+Usage: scripts/compiler-new-parity [--keep DIR] [--compare OLD_DUMP NEW_DUMP]
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+CORPUS_ROOTS = ("blorp/src", "standard_library/src", "blorp/test")
+CORPUS_SUFFIX = ".brp"
+
+LEGACY_DUMPER = "blorp/test/compiler/tools/legacy_front_end_dump.brp"
+DISCOVERY_DUMPER = "blorp/test/compiler_new/tools/corpus_dump.brp"
+
+FILE_HEADER_PREFIX = "== "
+UNREADABLE_PREFIX = "unreadable "
+LEXER_COUNT_PREFIX = "lexer_diagnostics "
+PARSE_COUNT_PREFIX = "parse_diagnostics "
+
+HASH_SYMBOL_KIND = "HashSymbol"
+IDENTIFIER_KIND = "IdentifierToken"
+DIMENSION_NAME_KIND = "DimensionNameToken"
+
+# A token line is `start end Kind text`; the text is absent for kinds with
+# none and never contains a raw newline (the dumpers escape it).
+TOKEN_FIELDS_WITHOUT_TEXT = 3
+TOKEN_FIELDS_WITH_TEXT = 4
+
+# Files on which the two front ends are known to disagree, with why. Each is a
+# fixture that pins the disagreement; a file listed here must still disagree
+# (so the entry is removed when the stage is fixed or the fixture deleted) and
+# must still be in the corpus. Every other disagreement fails the gate.
+KNOWN_DIVERGENCES: dict[str, str] = {}
+
+# The dumpers print one line per token; keep mismatch excerpts readable.
+EXCERPT_LIMIT = 200
+
+# Flags of the host C compile of a dumper: optimized enough that the corpus
+# runs in seconds, with the wrapping integer semantics the runtime assumes.
+C_COMPILE_FLAGS = ("-O1", "-fwrapv", "-w")
+C_LINK_FLAGS = ("-lm", "-lpthread")
+DEFAULT_C_COMPILER = "clang"
+C_COMPILER_VARIABLE = "BLORP_CC"
+
+
+@dataclass
+class FileDump:
+    """What one front end reported for one file."""
+
+    tokens: list[str] = field(default_factory=list)
+    lexer_diagnostics: int = 0
+    parse_diagnostics: int = 0
+    complete: bool = False
+
+
+def parse_dump(text: str) -> dict[str, FileDump]:
+    """Read a dumper's output: `== path`, token lines, then the two counts."""
+    files: dict[str, FileDump] = {}
+    current: FileDump | None = None
+    for line in text.split("\n"):
+        if line.startswith(FILE_HEADER_PREFIX):
+            current = FileDump()
+            files[line[len(FILE_HEADER_PREFIX):]] = current
+        elif line.startswith(UNREADABLE_PREFIX):
+            # Reported by a dumper that could not read a file: never complete.
+            files[line[len(UNREADABLE_PREFIX):].split(":", 1)[0]] = FileDump()
+            current = None
+        elif current is None or not line:
+            continue
+        elif line.startswith(LEXER_COUNT_PREFIX):
+            current.lexer_diagnostics = int(line[len(LEXER_COUNT_PREFIX):])
+        elif line.startswith(PARSE_COUNT_PREFIX):
+            current.parse_diagnostics = int(line[len(PARSE_COUNT_PREFIX):])
+            current.complete = True
+        else:
+            current.tokens.append(line)
+    return files
+
+
+def merge_dimension_names(tokens: list[str]) -> list[str]:
+    """Write the existing lexer's `#` and name pair as the one token the new
+    lexer emits: a hash symbol directly followed (no gap) by an identifier."""
+    merged: list[str] = []
+    index = 0
+    while index < len(tokens):
+        hash_fields = tokens[index].split(" ", 2)
+        if (
+            hash_fields[2:] == [HASH_SYMBOL_KIND]
+            and index + 1 < len(tokens)
+        ):
+            name_fields = tokens[index + 1].split(" ", TOKEN_FIELDS_WITH_TEXT - 1)
+            if (
+                len(name_fields) == TOKEN_FIELDS_WITH_TEXT
+                and name_fields[2] == IDENTIFIER_KIND
+                and name_fields[0] == hash_fields[1]
+            ):
+                merged.append(
+                    f"{hash_fields[0]} {name_fields[1]} {DIMENSION_NAME_KIND} {name_fields[3]}"
+                )
+                index += 2
+                continue
+        merged.append(tokens[index])
+        index += 1
+    return merged
+
+
+def excerpt(token_line: str) -> str:
+    return token_line[:EXCERPT_LIMIT]
+
+
+def file_mismatches(path: str, legacy: FileDump | None, discovery: FileDump | None) -> list[str]:
+    """The disagreements between the two front ends on one file."""
+    if legacy is None or not legacy.complete:
+        return [f"{path}: the existing front end produced no dump"]
+    if discovery is None or not discovery.complete:
+        return [f"{path}: the discovery stage produced no dump"]
+
+    problems: list[str] = []
+    legacy_tokens = merge_dimension_names(legacy.tokens)
+    if legacy_tokens != discovery.tokens:
+        for position, (old, new) in enumerate(zip(legacy_tokens, discovery.tokens)):
+            if old != new:
+                problems.append(
+                    f"{path}: first differing token #{position}\n"
+                    f"    existing:  {excerpt(old)}\n"
+                    f"    discovery: {excerpt(new)}"
+                )
+                break
+        else:
+            problems.append(
+                f"{path}: token count differs: existing {len(legacy_tokens)}, "
+                f"discovery {len(discovery.tokens)}"
+            )
+    if (legacy.lexer_diagnostics > 0) != (discovery.lexer_diagnostics > 0):
+        problems.append(
+            f"{path}: lexer diagnostics differ: existing {legacy.lexer_diagnostics}, "
+            f"discovery {discovery.lexer_diagnostics}"
+        )
+    if (legacy.parse_diagnostics > 0) != (discovery.parse_diagnostics > 0):
+        verdict = lambda count: "reject" if count > 0 else "accept"
+        problems.append(
+            f"{path}: verdict differs: existing {verdict(legacy.parse_diagnostics)} "
+            f"({legacy.parse_diagnostics} diagnostics), discovery "
+            f"{verdict(discovery.parse_diagnostics)} ({discovery.parse_diagnostics} diagnostics)"
+        )
+    return problems
+
+
+@dataclass
+class Comparison:
+    files: int
+    tokens: int
+    mismatched_files: int
+    known_divergences: int
+    rejected_by_both: int
+    lexer_diagnostic_files: int
+    problems: list[str]
+    notes: list[str]
+
+
+def compare_dumps(
+    legacy: dict[str, FileDump],
+    discovery: dict[str, FileDump],
+    known_divergences: dict[str, str] | None = None,
+) -> Comparison:
+    known = KNOWN_DIVERGENCES if known_divergences is None else known_divergences
+    paths = sorted(set(legacy) | set(discovery))
+    problems: list[str] = []
+    notes: list[str] = []
+    mismatched_files = 0
+    known_count = 0
+    tokens = 0
+    rejected_by_both = 0
+    lexer_diagnostic_files = 0
+    for path in paths:
+        old = legacy.get(path)
+        new = discovery.get(path)
+        found = file_mismatches(path, old, new)
+        if path in known and found:
+            known_count += 1
+            notes.append(f"known divergence {path}: {known[path]}")
+        elif found:
+            mismatched_files += 1
+            problems.extend(found)
+        elif path in known:
+            mismatched_files += 1
+            problems.append(
+                f"{path}: listed in KNOWN_DIVERGENCES ({known[path]}) but the front ends "
+                "now agree; remove the entry"
+            )
+        elif old is not None:
+            tokens += len(new.tokens)
+            rejected_by_both += old.parse_diagnostics > 0
+            lexer_diagnostic_files += old.lexer_diagnostics > 0
+    for path in sorted(set(known) - set(paths)):
+        mismatched_files += 1
+        problems.append(
+            f"{path}: listed in KNOWN_DIVERGENCES ({known[path]}) but is not in the corpus; "
+            "remove the entry"
+        )
+    return Comparison(
+        files=len(paths),
+        tokens=tokens,
+        mismatched_files=mismatched_files,
+        known_divergences=known_count,
+        rejected_by_both=rejected_by_both,
+        lexer_diagnostic_files=lexer_diagnostic_files,
+        problems=problems,
+        notes=notes,
+    )
+
+
+def corpus_files() -> list[str]:
+    """Tracked `.brp` files under the corpus roots, in a fixed order."""
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "--", *CORPUS_ROOTS],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout.decode("utf-8")
+    return sorted(
+        name for name in listing.split("\0") if name.endswith(CORPUS_SUFFIX)
+    )
+
+
+def run_checked(command: list[str], description: str) -> None:
+    result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.stdout.write(f"FAIL: {description}\n{result.stdout}{result.stderr}")
+        raise SystemExit(1)
+
+
+def build_dumper(source: str, work: Path) -> Path:
+    """Compile a dumper to a host binary: Blorp to C, then the C compiler."""
+    stem = Path(source).stem
+    c_file = work / f"{stem}.c"
+    binary = work / stem
+    compiler = os.environ.get(C_COMPILER_VARIABLE, DEFAULT_C_COMPILER)
+    run_checked(
+        ["bin/blorp", "compile", "--no-format", "-o", str(c_file), source],
+        f"compile {source} to C",
+    )
+    run_checked(
+        [compiler, "-x", "c", str(c_file), *C_COMPILE_FLAGS, *C_LINK_FLAGS, "-o", str(binary)],
+        f"compile {c_file} with {compiler}",
+    )
+    return binary
+
+
+def run_dumper(binary: Path, file_list: Path) -> str:
+    result = subprocess.run(
+        [str(binary), str(file_list)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stdout.write(f"FAIL: {binary.name} exited with status {result.returncode}\n")
+        sys.stdout.write(result.stderr.decode("utf-8", "replace"))
+        raise SystemExit(1)
+    return result.stdout.decode("utf-8", "surrogateescape")
+
+
+def report(comparison: Comparison, seconds: float) -> int:
+    for note in comparison.notes:
+        print(note)
+    for problem in comparison.problems:
+        print(problem)
+    agreeing = comparison.files - comparison.mismatched_files
+    status = "PASS" if comparison.mismatched_files == 0 else "FAIL"
+    print(
+        f"compiler-new parity: files={comparison.files} tokens={comparison.tokens} "
+        f"rejected_by_both={comparison.rejected_by_both} "
+        f"files_with_lexer_diagnostics={comparison.lexer_diagnostic_files} "
+        f"known_divergences={comparison.known_divergences} "
+        f"mismatched_files={comparison.mismatched_files} seconds={seconds:.1f}"
+    )
+    print(
+        f"BLORP_GATE_RESULT gate=compiler_new_parity status={status} "
+        f"passed={agreeing} failed={comparison.mismatched_files} tests={comparison.files}"
+    )
+    return 0 if comparison.mismatched_files == 0 else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--keep", type=Path, help="keep dumpers and dumps in this directory")
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        metavar=("LEGACY_DUMP", "DISCOVERY_DUMP"),
+        help="compare two existing dump files instead of building and running the dumpers",
+    )
+    args = parser.parse_args()
+    started = time.monotonic()
+
+    if args.compare:
+        legacy_text, discovery_text = (
+            Path(name).read_text(encoding="utf-8", errors="surrogateescape")
+            for name in args.compare
+        )
+        comparison = compare_dumps(parse_dump(legacy_text), parse_dump(discovery_text))
+        return report(comparison, time.monotonic() - started)
+
+    files = corpus_files()
+    if not files:
+        print("FAIL: no corpus files found (is this a git checkout?)")
+        return 1
+
+    work = args.keep if args.keep else Path(tempfile.mkdtemp(prefix="compiler_new_parity."))
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        file_list = work / "corpus.txt"
+        file_list.write_text("\n".join(files) + "\n", encoding="utf-8")
+        legacy_binary = build_dumper(LEGACY_DUMPER, work)
+        discovery_binary = build_dumper(DISCOVERY_DUMPER, work)
+        legacy_dump = run_dumper(legacy_binary, file_list)
+        discovery_dump = run_dumper(discovery_binary, file_list)
+        if args.keep:
+            for name, dump in (("legacy.dump", legacy_dump), ("discovery.dump", discovery_dump)):
+                (work / name).write_text(dump, encoding="utf-8", errors="surrogateescape")
+        legacy_files = parse_dump(legacy_dump)
+        discovery_files = parse_dump(discovery_dump)
+        comparison = compare_dumps(legacy_files, discovery_files)
+        missing = set(files) - (set(legacy_files) & set(discovery_files))
+        if missing:
+            comparison.problems.append(f"dumps omit {len(missing)} corpus files, for example {sorted(missing)[0]}")
+            comparison.mismatched_files += len(missing)
+        return report(comparison, time.monotonic() - started)
+    finally:
+        if not args.keep:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

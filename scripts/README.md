@@ -84,6 +84,7 @@ scripts/test                    # Blorp compiler, runtime, leak, doctest, CLI
 scripts/test compiler-blorp     # Blorp TestSuites + marked production check fixtures
 scripts/test compiler-tools     # formatter/purify/lint fixtures + backend/identity tool guards
 scripts/test compiler-new       # rewritten compiler stages (blorp/src/compiler_new) TestSuites
+scripts/test compiler-new-parity # discovery stage vs the existing front end over the corpus
 scripts/test std-check          # broad standard-library source typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
@@ -121,6 +122,19 @@ premerge gate and of the compiler CI lane. The layout check keeps that tree isol
 imports them, and its tests import only `compiler_new`, `lib`, their own tree
 and the standard library (`isolated_test_owners` in
 `blorp/source_ownership.json`).
+The `compiler-new-parity` gate (`scripts/compiler-new-parity`) holds the
+discovery stage to the existing front end across every tracked `.brp` file
+under `blorp/src`, `standard_library/src` and `blorp/test`: it compiles
+`blorp/test/compiler/tools/legacy_front_end_dump.brp` and
+`blorp/test/compiler_new/tools/corpus_dump.brp` once each, runs them
+sequentially over the file list, and compares every token (kind, byte range,
+text; the old `#` plus name is one `DimensionNameToken`), the set of files with
+lexer diagnostics and each file's accept/reject verdict. A mismatch prints the
+file and the first differing token. There are no known divergences today;
+`KNOWN_DIVERGENCES` stays so one can be added, with a reason (an entry that stops
+disagreeing fails the gate until it is removed). The gate
+takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not a
+default gate; it is part of the premerge gate.
 The `compiler-blorp` gate also runs every fixture explicitly marked
 `RUN-BLORP-CHECK` through a small Blorp-only runner after the generated suite;
 the expected fixture count is pinned in `scripts/test` and in the runner.
@@ -345,6 +359,7 @@ compiler-tools
 compiler-core-sanitize
 compiler-blorp-sanitize
 compiler-new
+compiler-new-parity
 std-check
 runtime
 leak + doctest + cli + lsp
@@ -393,7 +408,7 @@ cutting preview builds. It composes:
 
 - clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
-- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new`
+- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity`
 - the direct generated-C audit in `blorp/test/compiler/pipeline/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs
