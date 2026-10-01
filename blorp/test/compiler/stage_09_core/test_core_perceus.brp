@@ -20142,6 +20142,65 @@ pure func test_mutable_slot_moves_into_tail_call_before_other_release() -> Bool:
 
 
 ---
+When the arms disagree, the slot keeps its owner to scope exit, so every arm
+that returns the slot must retain it. Here one arm returns the slot through
+the drop temporary Perceus adds for an arm-local binding, and the other hands
+it to a consuming tail call:
+
+    if update_first:
+        scratch = spare
+        out = consume_box_reading(out, scratch)
+        out                       -- Perceus: let r = (...; out); DROP scratch; r
+    else:
+        consume_box(out)
+
+Without the retain on the forwarded `out`, the scope-exit release frees the
+record the function returns.
+---
+pure func test_mutable_slot_returned_through_drop_temporary_keeps_retain() -> Bool:
+	box_type: CoreType = HeapRecordType("Box")
+	scratch_update_then_return: CoreExpr = LetExpr(
+		named_var("scratch"),
+		False,
+		box_type,
+		var_expr("spare", box_type),
+		SeqExpr(
+			AssignExpr(
+				named_var("out"),
+				user_call_expr(
+					"consume_box_reading",
+					Some(92),
+					[],
+					[var_expr("out", box_type), var_expr("scratch", box_type)],
+					box_type,
+				),
+				VoidType,
+				synthetic_core_source_loc(),
+			),
+			var_expr("out", box_type),
+		),
+	)
+	tail: CoreExpr = IfExpr(
+		var_expr("update_first", bool_type()),
+		scratch_update_then_return,
+		consume_out_call(),
+		box_type,
+		synthetic_core_source_loc(),
+	)
+	rewritten: CoreProgram = insert_drops_program(conditionally_updated_slot_program(tail))
+
+	match function_body(rewritten, "forward_box__consume_arg0"):
+		Some(body):
+			(
+				dup_count_for("out", body) == 2
+				and drop_count_for("out", body) == 1
+				and drop_count_for("scratch", body) == 1
+			)
+		None:
+			False
+
+
+---
 A `var` alias is a move like an immutable one: the slot takes the parameter's
 reference, so its first update, conditional or not, sees the record uniquely
 owned.
@@ -21824,6 +21883,10 @@ tests: TestSuite = {
 		(
 			"mutable slot moves into tail call before other release",
 			test_mutable_slot_moves_into_tail_call_before_other_release,
+		),
+		(
+			"mutable slot returned through drop temporary keeps retain",
+			test_mutable_slot_returned_through_drop_temporary_keeps_retain,
 		),
 	]
 }

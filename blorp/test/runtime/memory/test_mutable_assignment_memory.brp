@@ -1070,6 +1070,81 @@ func test_mutable_union_return_after_loop_stays_owned() -> Bool:
 			False
 
 
+record ThreadedBuilder {
+	items: List[Int],
+	cursor: Int
+}
+
+
+pure func advance_builder(builder: ThreadedBuilder) -> ThreadedBuilder:
+	{ builder | cursor = builder.cursor + 1 }
+
+
+pure func append_builder_items(builder: ThreadedBuilder, items: List[Int]) -> ThreadedBuilder:
+	{ builder | items = builder.items.concat(items) }
+
+
+pure func append_builder_suffix(builder: ThreadedBuilder) -> ThreadedBuilder:
+	if builder.cursor % 3 == 1:
+		{ builder | items = builder.items.append(-1) }
+	else:
+		builder
+
+
+---
+One arm reassigns the slot and returns it after a managed local; Perceus
+forwards that arm's value through a drop temporary for the local, so the
+returned slot must still be retained before the slot's scope-exit release.
+The other arm hands the slot to a consuming tail call.
+---
+pure func thread_builder_through_mixed_arms(
+	builder: ThreadedBuilder,
+	append_local: Bool,
+) -> ThreadedBuilder:
+	var out: ThreadedBuilder = builder.advance_builder()
+
+	if append_local:
+		local_items: List[Int] = [out.cursor]
+		out = out.append_builder_items(local_items)
+		out
+	else:
+		out.append_builder_suffix()
+
+
+func test_mixed_arm_slot_return_after_local_release_stays_owned() -> Bool:
+	reset_mem_stats()
+	var builder: ThreadedBuilder = {
+		items = [],
+		cursor = 0
+	}
+
+	for step in 0..300:
+		builder = thread_builder_through_mixed_arms(builder, step % 2 == 0)
+
+	var expected_sum: Int = 0
+
+	for step in 0..300:
+		cursor: Int = step + 1
+
+		if step % 2 == 0:
+			expected_sum += cursor
+		else if cursor % 3 == 1:
+			expected_sum -= 1
+
+	var item_sum: Int = 0
+
+	for item in builder.items:
+		item_sum += item
+
+	stats: MemStats = get_mem_stats()
+	(
+		builder.cursor == 300
+		and builder.items.length() == 200
+		and item_sum == expected_sum
+		and stats.current_objects < 20
+	)
+
+
 tests: TestSuite = {
 	description = "Mutable Assignment Memory",
 	tests = [
@@ -1213,6 +1288,10 @@ tests: TestSuite = {
 		(
 			"literal match arms in loop do not double release consumed table",
 			test_literal_match_arms_in_loop_do_not_double_release_consumed_table,
+		),
+		(
+			"mixed-arm slot return after local release stays owned",
+			test_mixed_arm_slot_return_after_local_release_stays_owned,
 		),
 	]
 }
