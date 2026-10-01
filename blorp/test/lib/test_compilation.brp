@@ -11,7 +11,9 @@ import:
 			RuntimeProjectionPhase,
 			TypedFrontendPhase,
 		),
+		CompiledTypedGraph(CompiledTypedGraphReady),
 		FrontendCompilePolicy,
+		compile_frontend_graph,
 		compiler_phase_label,
 	../../src/compiler/stage_09_core/early_pipeline:
 		CoreEarlyPipelineConfiguration,
@@ -31,12 +33,7 @@ import:
 	../../src/compiler/stage_04_modules/module_table: module_table_count
 	../../src/compiler/stage_09_core/traverse: immediate_core_expr_children
 	../../src/lib/cli_plan: CliCompilePlan, CliRunPlan(CliRunCompile)
-	../../src/lib/compilation:
-		CompileExecution(CompileStopped),
-		CompilePreparation(CompilePreparationReady),
-		execute_compile_plan,
-		prepare_compile_plan_with_frontend_policy,
-		prepare_compile_plan_with_typed_validation,
+	../../src/lib/compilation: CompileExecution(CompileStopped)
 	../../src/lib/compilation_timing: CompileTiming
 	../../src/lib/compile_plan_execute:
 		TimedCompileExecution,
@@ -78,6 +75,23 @@ private func execute_compile_plan_timed(
 	record_timings: Bool,
 ) -> TimedCompileExecution:
 	execute_prepared_compile_plan_timed(prepare_compile_plan_timed(plan, record_timings))
+
+
+-- Runs the frontend through runtime projection under an explicit policy, which
+-- the CLI would otherwise derive from `--debug`.
+private func compile_plan_frontend_with_policy(
+	plan: CliCompilePlan,
+	policy: FrontendCompilePolicy,
+) -> Result[CompiledTypedGraph, List[String]]:
+	compile_frontend_graph(
+		plan.graph,
+		policy,
+		pure func(errors): errors,
+		True,
+		False,
+		[],
+		None,
+	)
 
 
 private pure func successful_phase_labels() -> List[String]:
@@ -179,47 +193,14 @@ func test_compile_frontend_policy_erases_debug_blocks() -> Bool:
 					include_typed_summary = False
 				}
 
-				match prepare_compile_plan_with_frontend_policy(compile_plan, policy):
-					Ok(CompilePreparationReady(prepared)):
-						not main_calls_debug_policy_marker(prepared.compilation.program)
+				match compile_plan_frontend_with_policy(compile_plan, policy):
+					Ok(CompiledTypedGraphReady(compilation, _, _, _)):
+						not main_calls_debug_policy_marker(compilation.program)
 					Err(errors):
 						print_error(
 							"policy-aware compile preparation failed:\n" + errors.join("\n"),
 						)
 						False
-					Ok(_):
-						False
-			_:
-				False
-
-
-func test_compile_typed_validation_stops_before_core_preparation() -> Bool:
-	path: String = temp_dir() + "/blorp_cli_execute_typed_validation.brp"
-	_ = remove_file(path)
-
-	if not write_source(path, "func main(args: List[String]) -> Int:\n\t0\n"):
-		False
-	else:
-		plan = run_cli(["compile", "--no-format", path])
-		_ = remove_file(path)
-
-		match plan:
-			CliRunCompile(compile_plan):
-				policy: FrontendCompilePolicy = {
-					allow_debug_only_calls = False,
-					retain_debug_blocks = False,
-					include_typed_summary = False
-				}
-
-				match (
-					prepare_compile_plan_with_typed_validation(
-						compile_plan,
-						policy,
-						pure func(_): ["typed validation sentinel"],
-					)
-				):
-					Err(errors):
-						errors == ["typed validation sentinel"]
 					Ok(_):
 						False
 			_:
@@ -251,7 +232,7 @@ func test_early_stop_returns_requested_core_snapshot() -> Bool:
 
 		match plan:
 			CliRunCompile(compile_plan):
-				match execute_compile_plan(compile_plan):
+				match execute_compile_plan_timed(compile_plan, False).execution:
 					CompileStopped(target_path, stage_name, rendered, observations):
 						(
 							target_path == path
@@ -495,9 +476,8 @@ func test_real_compile_threads_a_populated_module_table_to_late_core() -> Bool:
 					include_typed_summary = False
 				}
 
-				match prepare_compile_plan_with_frontend_policy(compile_plan, policy):
-					Ok(CompilePreparationReady(prepared)):
-						compilation = prepared.compilation
+				match compile_plan_frontend_with_policy(compile_plan, policy):
+					Ok(CompiledTypedGraphReady(compilation, _, _, early_observations)):
 						has_list: Bool = core_standard_module_id(
 							core_standard_modules(compilation.modules),
 							ListModule,
@@ -509,8 +489,8 @@ func test_real_compile_threads_a_populated_module_table_to_late_core() -> Bool:
 							compilation.next_binder_id,
 							compilation.names,
 							compilation.modules,
-							prepared.early_observations,
-							prepared.late_stages,
+							early_observations,
+							[],
 							False,
 							False,
 						):
@@ -539,10 +519,6 @@ tests: TestSuite = {
 		(
 			"frontend policy permits debug calls while erasing debug blocks",
 			test_compile_frontend_policy_erases_debug_blocks,
-		),
-		(
-			"typed validation stops before Core preparation",
-			test_compile_typed_validation_stops_before_core_preparation,
 		),
 		(
 			"early stop returns the requested Core snapshot",

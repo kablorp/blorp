@@ -947,16 +947,31 @@ func compile_frontend_graph(
 	early_observations: List[CoreEarlyPipelineStage],
 	early_stop: Option[CoreEarlyPipelineStage],
 ) -> Result[CompiledTypedGraph, List[String]]:
-	compile_frontend_graph_with_typed_validation(
+	typed ?= run_typed_frontend_compilation(
 		graph,
 		policy,
-		pure func(_): [],
 		render_typecheck_diagnostics,
 		require_main,
 		check_invariants,
 		early_observations,
 		early_stop,
 	)
+	request ?= prepare_core_lowering_request(typed)
+	lowered ?= lower_prepared_core_request(request)
+
+	match run_early_core_compilation(lowered, False):
+		EarlyCorePhaseFailed(errors):
+			Err(errors)
+		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
+			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
+		EarlyCorePhaseReady(early, _):
+			match project_runtime_compilation(early, False):
+				RuntimeProjectionPhaseFailed(errors):
+					Err(errors)
+				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
+					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
+				RuntimeProjectionPhaseReady(projected, _):
+					Ok(compiled_typed_graph_ready(projected))
 
 
 private func name_identity_mode() -> Option[String]:
@@ -1012,7 +1027,6 @@ private func check_typed_name_identity(typechecked: TypecheckedGraph) -> List[St
 func run_typed_frontend_compilation(
 	graph: FrontendCompilationGraph,
 	policy: FrontendCompilePolicy,
-	validate: pure (TypecheckedGraph) -> List[String],
 	render_typecheck_diagnostics: pure (List[String]) -> List[String],
 	require_main: Bool,
 	check_invariants: Bool,
@@ -1025,7 +1039,6 @@ func run_typed_frontend_compilation(
 		typecheck_parsed_frontend_compilation(
 			graph,
 			policy,
-			validate,
 			render_typecheck_diagnostics,
 			require_main,
 			check_invariants,
@@ -1043,7 +1056,6 @@ whose modules all parsed cleanly.
 private func typecheck_parsed_frontend_compilation(
 	graph: FrontendCompilationGraph,
 	policy: FrontendCompilePolicy,
-	validate: pure (TypecheckedGraph) -> List[String],
 	render_typecheck_diagnostics: pure (List[String]) -> List[String],
 	require_main: Bool,
 	check_invariants: Bool,
@@ -1075,9 +1087,7 @@ private func typecheck_parsed_frontend_compilation(
 					if errors.length() != 0:
 						Err(errors)
 					else:
-						validation_errors: List[String] = validate(typechecked).concat(
-							check_typed_name_identity(typechecked),
-						)
+						validation_errors: List[String] = check_typed_name_identity(typechecked)
 
 						if validation_errors.length() != 0:
 							Err(validation_errors)
@@ -1109,44 +1119,6 @@ private func typecheck_parsed_frontend_compilation(
 									}))
 		_:
 			Err(["source compilation requires exactly one root module"])
-
-
-func compile_frontend_graph_with_typed_validation(
-	graph: FrontendCompilationGraph,
-	policy: FrontendCompilePolicy,
-	validate: pure (TypecheckedGraph) -> List[String],
-	render_typecheck_diagnostics: pure (List[String]) -> List[String],
-	require_main: Bool,
-	check_invariants: Bool,
-	early_observations: List[CoreEarlyPipelineStage],
-	early_stop: Option[CoreEarlyPipelineStage],
-) -> Result[CompiledTypedGraph, List[String]]:
-	typed ?= run_typed_frontend_compilation(
-		graph,
-		policy,
-		validate,
-		render_typecheck_diagnostics,
-		require_main,
-		check_invariants,
-		early_observations,
-		early_stop,
-	)
-	request ?= prepare_core_lowering_request(typed)
-	lowered ?= lower_prepared_core_request(request)
-
-	match run_early_core_compilation(lowered, False):
-		EarlyCorePhaseFailed(errors):
-			Err(errors)
-		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
-			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-		EarlyCorePhaseReady(early, _):
-			match project_runtime_compilation(early, False):
-				RuntimeProjectionPhaseFailed(errors):
-					Err(errors)
-				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
-					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-				RuntimeProjectionPhaseReady(projected, _):
-					Ok(compiled_typed_graph_ready(projected))
 
 
 private pure func early_observation(observation: CoreEarlyPipelineObservation) -> CoreObservation:
@@ -1421,42 +1393,6 @@ pure func compiled_typed_graph_ready(projected: RuntimeProjectedCompilation) -> 
 		runtime_projected_include_dirs(projected),
 		runtime_projected_observations(projected),
 	)
-
-
-func compile_typechecked_graph(
-	typechecked: TypecheckedGraph,
-	policy: CoreCompilePolicy,
-	typed_summary: Option[String],
-	require_main: Bool,
-	check_invariants: Bool,
-	early_observations: List[CoreEarlyPipelineStage],
-	early_stop: Option[CoreEarlyPipelineStage],
-) -> Result[CompiledTypedGraph, List[String]]:
-	typed: TypedFrontendCompilation = into_opaque TypedFrontendCompilation({
-			typechecked = typechecked,
-			policy = policy,
-			typed_summary = typed_summary,
-			require_main = require_main,
-			check_invariants = check_invariants,
-			early_observations = early_observations,
-			early_stop = early_stop
-		})
-	request ?= prepare_core_lowering_request(typed)
-	lowered ?= lower_prepared_core_request(request)
-
-	match run_early_core_compilation(lowered, False):
-		EarlyCorePhaseFailed(errors):
-			Err(errors)
-		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
-			Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-		EarlyCorePhaseReady(early, _):
-			match project_runtime_compilation(early, False):
-				RuntimeProjectionPhaseFailed(errors):
-					Err(errors)
-				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
-					Ok(CompiledTypedGraphStopped(target_path, stage_name, rendered, observations))
-				RuntimeProjectionPhaseReady(projected, _):
-					Ok(compiled_typed_graph_ready(projected))
 
 
 private pure func observes_late_stage(action: LateCoreStageAction) -> Bool:

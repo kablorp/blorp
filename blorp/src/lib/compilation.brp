@@ -15,7 +15,7 @@ import:
 		CoreCompilation,
 		CoreObservation,
 		EarlyCoreCompilation,
-		EarlyCorePhaseExecution(EarlyCorePhaseFailed, EarlyCorePhaseReady, EarlyCorePhaseStopped),
+		EarlyCorePhaseExecution,
 		FinishedCompilerPipeline(
 			CompilerPipelineArtifactFailed,
 			CompilerPipelineArtifactReady,
@@ -29,14 +29,9 @@ import:
 		LoweredCoreCompilation,
 		PreparedCoreLoweringRequest,
 		RuntimeProjectedCompilation,
-		RuntimeProjectionPhaseExecution(
-			RuntimeProjectionPhaseFailed,
-			RuntimeProjectionPhaseReady,
-			RuntimeProjectionPhaseStopped,
-		),
+		RuntimeProjectionPhaseExecution,
 		TypedFrontendCompilation,
 		compile_frontend_graph,
-		compile_frontend_graph_with_typed_validation,
 		construct_backend_artifact,
 		emit_backend_c,
 		execute_late_core_stages,
@@ -50,10 +45,9 @@ import:
 		runtime_projected_include_dirs,
 		runtime_projected_observations,
 		runtime_projected_typed_summary,
-	../compiler/stage_06_typecheck/bridge: TypecheckedGraph
-	../compiler/stage_09_core/allocation_analysis: CoreAllocationAnalysis, analyze_core_allocations
+	../compiler/stage_09_core/allocation_analysis: CoreAllocationAnalysis
 	../compiler/stage_09_core/pass_runner: CorePassTiming
-	../compiler/stage_09_core/pipeline: PreparedCoreProgram, prepared_core_program_value
+	../compiler/stage_09_core/pipeline: PreparedCoreProgram
 	../lib/build_artifact:
 		BuildArtifact,
 		BuildArtifactConfiguration,
@@ -391,34 +385,6 @@ pure func construct_artifact_compile_execution(
 			CompileBuildArtifactFailed(message)
 
 
-func finish_prepared_compile_execution(prepared: PreparedCompileExecution) -> CompileExecution:
-	match run_late_core_compile_execution(prepared, False):
-		LateCoreCompilePhaseStopped(stage_name, rendered, stopped_observations, _):
-			CompileStopped(
-				prepared.compilation.target_path,
-				stage_name,
-				rendered,
-				compile_observations(stopped_observations),
-			)
-		LateCoreCompilePhaseInvariantFailed(stage_name, detail, _):
-			CompileCoreInvariantFailed("${stage_name}: ${detail}")
-		LateCoreCompilePhaseReady(late, _):
-			match late.allocation_report:
-				Some(_):
-					CompileAllocationReport(
-						late.configuration.source.path,
-						analyze_core_allocations(prepared_core_program_value(late.prepared_core)),
-						compile_observations(late.observations),
-						late.typed_program_summary,
-					)
-				None:
-					match emit_backend_compile_execution(late):
-						BackendEmissionCompilePhaseReady(emitted):
-							construct_artifact_compile_execution(emitted)
-						BackendEmissionCompilePhaseFailed(message):
-							CompileEmitFailed(message)
-
-
 func finish_prepared_run_artifact_execution(
 	prepared: PreparedCompileExecution,
 ) -> RunArtifactExecution:
@@ -443,68 +409,6 @@ func finish_prepared_run_artifact_execution(
 			RunArtifactFailed("internal C emission failure: ${message}")
 		CompilerPipelineArtifactFailed(message):
 			RunArtifactFailed("build artifact failure: ${message}")
-
-
-private pure func compile_preparation_from_frontend(
-	plan: CliCompilePlan,
-	stage_requests: CompileStageRequests,
-	frontend: CompiledTypedGraph,
-) -> CompilePreparation:
-	match frontend:
-		CompiledTypedGraphStopped(target_path, stage_name, rendered, observations):
-			CompilePreparationStopped(target_path, stage_name, rendered, observations)
-		CompiledTypedGraphReady(compilation, typed_program_summary, include_dirs, early_observations):
-			CompilePreparationReady({
-				compilation = compilation,
-				configuration = artifact_configuration(
-					compilation,
-					graph_native_features(plan.graph.graph),
-					include_dirs,
-					compile_runtime_requirement(plan.options),
-					compile_translation_units(plan),
-					plan.options.profile,
-					compile_compatibility(plan.options),
-					plan.options.no_format,
-				),
-				late_stages = stage_requests.late_stages,
-				typed_program_summary = typed_program_summary,
-				early_observations = early_observations,
-				allocation_report = plan.options.allocation_report,
-			})
-
-
-func prepare_compile_plan_with_typed_validation(
-	plan: CliCompilePlan,
-	frontend_policy: FrontendCompilePolicy,
-	validate: pure (TypecheckedGraph) -> List[String],
-) -> Result[CompilePreparation, List[String]]:
-	stage_requests: CompileStageRequests = compile_stage_requests(
-		plan.options.dump_core_after,
-		plan.options.stop_after,
-	)
-	frontend ?= compile_frontend_graph_with_typed_validation(
-		plan.graph,
-		frontend_policy,
-		validate,
-		cli_error_messages,
-		True,
-		plan.options.check_invariants,
-		stage_requests.early_observations,
-		stage_requests.early_stop,
-	)
-
-	Ok(compile_preparation_from_frontend(plan, stage_requests, frontend))
-
-
-func prepare_compile_plan_with_frontend_policy(
-	plan: CliCompilePlan,
-	frontend_policy: FrontendCompilePolicy,
-) -> Result[CompilePreparation, List[String]]:
-	prepare_compile_plan_with_typed_validation(
-		plan,
-		frontend_policy,
-		pure func(_): [],
-	)
 
 
 private pure func compile_plan_frontend_policy(plan: CliCompilePlan) -> FrontendCompilePolicy:
@@ -541,7 +445,6 @@ func typed_compile_preparation(
 	typed ?= run_typed_frontend_compilation(
 		plan.graph,
 		compile_plan_frontend_policy(plan),
-		pure func(_): [],
 		cli_error_messages,
 		True,
 		plan.options.check_invariants,
@@ -642,40 +545,6 @@ pure func prepared_compile_execution_from_projected(
 	}
 
 
-func prepare_compile_plan(plan: CliCompilePlan) -> Result[CompilePreparation, List[String]]:
-	typed ?= typed_compile_preparation(plan)
-	prepared_core ?= prepare_core_compile_preparation(typed)
-	lowered ?= lower_compile_preparation(prepared_core)
-
-	match run_early_core_compile_preparation(lowered, False):
-		EarlyCorePhaseFailed(errors):
-			Err(errors)
-		EarlyCorePhaseStopped(target_path, stage_name, rendered, observations, _):
-			Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations))
-		EarlyCorePhaseReady(early, _):
-			early_preparation: EarlyCoreCompilePreparation = early_core_compile_preparation_ready(
-				lowered,
-				early,
-			)
-
-			match project_runtime_compile_preparation(early_preparation, False):
-				RuntimeProjectionPhaseFailed(errors):
-					Err(errors)
-				RuntimeProjectionPhaseStopped(target_path, stage_name, rendered, observations, _):
-					Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations))
-				RuntimeProjectionPhaseReady(projected, _):
-					Ok(
-						CompilePreparationReady(
-							prepared_compile_execution_from_projected(
-								runtime_projected_compile_preparation_ready(
-									early_preparation,
-									projected,
-								),
-							),
-						),
-					)
-
-
 func prepare_run_plan(plan: CliRunSourcePlan) -> Result[CompilePreparation, List[String]]:
 	frontend ?= compile_frontend_graph(
 		plan.graph,
@@ -712,13 +581,3 @@ func prepare_run_plan(plan: CliRunSourcePlan) -> Result[CompilePreparation, List
 				early_observations = early_observations,
 				allocation_report = None,
 			}))
-
-
-func execute_compile_plan(plan: CliCompilePlan) -> CompileExecution:
-	match prepare_compile_plan(plan):
-		Ok(CompilePreparationReady(prepared)):
-			finish_prepared_compile_execution(prepared)
-		Ok(CompilePreparationStopped(target_path, stage_name, rendered, observations)):
-			CompileStopped(target_path, stage_name, rendered, compile_observations(observations))
-		Err(errors):
-			CompileFrontendFailed(errors)
