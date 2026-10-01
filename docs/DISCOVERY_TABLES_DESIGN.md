@@ -439,10 +439,13 @@ orphaned; the invariants check that every node is referenced exactly once.
 **Interpolation.** An interpolated string is an `InterpolatedStringNode` (or
 `InterpolatedPipeStringNode`) whose children are, in source order,
 `InterpolationTextNode` pieces (payload: the `LiteralId` of the decoded
-text) and the hole expressions. A text piece is present before, between and
-after holes when it is non-empty. The lexer finds the pieces and hole byte
-ranges once, while lexing the string (section 7); the parser never rescans
-the string. Text pieces hold decoded text (escapes applied, as in a plain
+text) and `InterpolationHoleNode` holes, each spanning its `$` through its
+`}` with the hole's expression as its one child. The hole node gives the
+hole an extent of its own, apart from its expression's: Core lowering uses
+it as the node id of the call that converts the value to text. A text
+piece is present before, between and after holes when it is non-empty. The
+lexer finds the pieces and hole byte ranges once, while lexing the string
+(section 7); the parser never rescans the string. Text pieces hold decoded text (escapes applied, as in a plain
 string literal) and never hole source text. The existing compiler encodes
 an interpolated string in-band as one literal with `{...}` marking holes and
 does not escape braces in the text before the first hole, so
@@ -1142,9 +1145,12 @@ text. Targeted inputs found four places the existing lexer breaks it:
   string's quotes with one flag, so the innermost hole becomes text), and braces
   in an interpolated pipe string (every brace is a hole): not fixed, because both
   need the lexer's tail scan rewritten as the stage's frame stack
-  (`hole_scan`). They are listed in `ADAPTER_DIFFERENCES` through
-  `fixtures/known_differences/interpolation_nesting.brp`, tracked in
-  `docs/issues/interpolation_nesting_in_the_existing_lexer.md`, and open under
+  (`hole_scan`). Nesting is listed in `ADAPTER_DIFFERENCES` through
+  `fixtures/known_differences/interpolation_nesting.brp`; the existing parser
+  now rejects the pipe-string braces
+  (`fixtures/known_differences/interpolation_pipe_braces.brp`, in
+  `KNOWN_DIVERGENCES`). Both are tracked in
+  `docs/issues/interpolation_nesting_in_the_existing_lexer.md` and open under
   roadmap criteria 1 and 6.
 
 `# N`, rejected by the new lexer, remains the one intended difference in the

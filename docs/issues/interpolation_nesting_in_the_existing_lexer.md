@@ -14,7 +14,10 @@ holes, to any depth (`docs/GUIDE.md`, `docs/GRAMMAR.md`). The existing lexer
   string (`"p ${f("q ${g("}")} r")} s"`), is rejected.
 - **Pipe strings.** Every `${` of an interpolated pipe string is read as `{`,
   and the splitter then reads every `{` as a hole, so `{kept}` in a pipe string
-  that also holds a hole becomes a hole.
+  that also holds a hole is read as a hole. Finalization takes each hole's
+  location from its `${...}` in the source and rejects a hole the source does
+  not write that way, so such a string is now a parse error (help: write the
+  brace as `\{`) rather than a hole with another hole's location.
 
 The discovery stage reads both as the language says (a stack of code and string
 frames in `hole_scan`, `lex/lexer.brp`). Two inputs the existing lexer read
@@ -26,8 +29,11 @@ hole, and braces and backslashes before the first hole.
 
 - `blorp/test/compiler/tools/fixtures/known_differences/interpolation_nesting.brp`
   is in the corpus; the adapter differential reports it, and
-  `ADAPTER_DIFFERENCES` in `scripts/compiler-new-parity` lists both
-  differences with this reason.
+  `ADAPTER_DIFFERENCES` in `scripts/compiler-new-parity` lists the difference
+  with this reason.
+- `blorp/test/compiler/tools/fixtures/known_differences/interpolation_pipe_braces.brp`
+  is in the corpus; the existing parser rejects it and the stage accepts it, and
+  `KNOWN_DIVERGENCES` in `scripts/compiler-new-parity` lists it.
 - `test_body_parser.brp` pins the stage's reading to four levels and to a brace
   in a nested string.
 
@@ -36,4 +42,5 @@ hole, and braces and backslashes before the first hole.
 Replace the flag in `scan_interpolated_string_tail` with the frame stack the
 stage uses: only a `${` outside every string becomes `{` in the token text, a
 nested `${` stays as written, and a pipe line is scanned the same way. Then
-delete the two `ADAPTER_DIFFERENCES` entries and the fixture's reason.
+delete the `ADAPTER_DIFFERENCES` entry and both fixtures' `KNOWN_DIVERGENCES`
+reasons.

@@ -69,9 +69,11 @@ We connect the stage by default when all of these hold:
    equals the existing parser's, compared through the existing parsed-AST
    JSON encoder, with every deliberate difference listed and justified.
    **Open for two listed differences** (item 4): the corpus is equal except
-   one fixture, `fixtures/known_differences/interpolation_nesting.brp`, whose
-   two differences are in `ADAPTER_DIFFERENCES` with a reason each and tracked
-   in `docs/issues/interpolation_nesting_in_the_existing_lexer.md`. It is met
+   two fixtures under `fixtures/known_differences/`. The difference in
+   `interpolation_nesting.brp` is in `ADAPTER_DIFFERENCES`, and the existing
+   parser rejects `interpolation_pipe_braces.brp`, which is in
+   `KNOWN_DIVERGENCES`; both are tracked in
+   `docs/issues/interpolation_nesting_in_the_existing_lexer.md`. It is met
    when that issue is closed or the old front end is deleted.
 2. **Same compiler output. Met** (item 8): with the new stage switched on, every
    default and premerge gate passes, and the self-compile produces the same C,

@@ -6,10 +6,13 @@
 import:
 	../../lib/source:
 		SourceFile,
+		SourceFileId,
 		SourceLocation,
 		SourceTable,
 		source_file,
 		source_location_end_offset,
+		source_location_file_id,
+		source_location_from_offsets,
 		source_location_span,
 		source_location_start_offset,
 		source_table_source,
@@ -22,7 +25,7 @@ import:
 		SYNTHESIZED_NAME_TABLE,
 		name_id_pending_dynamic_intern,
 		name_table_find_id,
-	../stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_error
+	../stage_02_lex/parse_diagnostic: ParseDiagnostic, parse_error, parse_error_expected
 	language_parser: parse_compiler_source, parse_interpolation_hole_source
 	memory: same_object
 	parsed_ast:
@@ -139,12 +142,20 @@ record FinalizedImportPathRewrite {
 }
 
 
+---
+One piece of an interpolated string's token text. A hole carries its
+expression text and its authored `${...}` extent (see
+`interpolation_hole_extents`).
+---
 union StringInterpolationRawPart:
 	InterpolationLiteralText(String)
-	InterpolationExprText(String, Int)
+	InterpolationExprText(String, SourceLocation)
 
 
 private INTERPOLATION_WRAPPER_PREFIX: String = "x="
+
+-- The width of the `${` that opens a hole in the authored source.
+private INTERPOLATION_HOLE_OPENER_WIDTH: Int = 2
 
 
 record UnicodeEscapeResult {
@@ -560,15 +571,20 @@ private pure func plain_expr_run_end(text: String, start: Int, in_string: Bool) 
 
 ---
 The lexer removes the `$` that introduces an interpolation hole. Recover
-each hole's authored expression offset from the original source so the
-synthetic wrapper parser can retain locations owned by that source file.
+each hole's authored extent, from its `$` through its closing `}`, from the
+original source: the expression inside starts `INTERPOLATION_HOLE_OPENER_WIDTH`
+bytes in, so the synthetic wrapper parser can retain locations owned by that
+source file, and the extent itself is the hole's own location. No other node
+covers exactly those bytes, so Core lowering uses it as the identity of the
+call that converts the hole's value to text.
 ---
-private pure func interpolation_hole_start_offsets(
+private pure func interpolation_hole_extents(
 	table: SourceTable,
 	span: SourceLocation,
-) -> List[Int]:
+) -> List[SourceLocation]:
 	source: SourceFile = source_table_source(table)
-	var starts: List[Int] = []
+	file_id: SourceFileId = source_location_file_id(span)
+	var extents: List[SourceLocation] = []
 	var offset: Int = source_location_start_offset(span)
 	end_offset: Int = source_location_end_offset(span)
 
@@ -578,8 +594,8 @@ private pure func interpolation_hole_start_offsets(
 		if current == '\\':
 			offset += 2
 		else if current == '$' and source.text.get_or(offset + 1, '\0') == '{':
-			starts = starts.append(offset + 2)
-			offset += 2
+			hole_start: Int = offset
+			offset += INTERPOLATION_HOLE_OPENER_WIDTH
 			var depth: Int = 1
 			var in_string: Bool = False
 			var in_char: Bool = False
@@ -611,10 +627,18 @@ private pure func interpolation_hole_start_offsets(
 					offset += 1
 				else:
 					offset += 1
+
+			-- An unclosed hole's escape skip can step past the string; the
+			-- extent never does.
+			hole_end: Int = if offset < end_offset:
+				offset
+			else:
+				end_offset
+			extents = extents.append(source_location_from_offsets(file_id, hole_start, hole_end))
 		else:
 			offset += 1
 
-	starts
+	extents
 
 
 pure func split_interpolated_string(
@@ -625,7 +649,7 @@ pure func split_interpolated_string(
 	var parts: List[StringInterpolationRawPart] = []
 	var literal: String = string(64)
 	var index: Int = 0
-	hole_starts: List[Int] = interpolation_hole_start_offsets(table, span)
+	hole_extents: List[SourceLocation] = interpolation_hole_extents(table, span)
 	var hole_index: Int = 0
 	var error: Option[ParseDiagnostic] = None
 
@@ -682,7 +706,7 @@ pure func split_interpolated_string(
 						literal = literal.append_char(ch)
 						index += 1
 		else if ch == '{':
-			hole_start: Int = hole_starts.get_or(hole_index, source_location_start_offset(span))
+			hole_extent: Option[SourceLocation] = hole_extents.get(hole_index)
 			hole_index += 1
 			parts = append_lit_part(parts, literal)
 			literal = ""
@@ -730,17 +754,41 @@ pure func split_interpolated_string(
 					),
 				)
 			else:
-				parts = parts.append(InterpolationExprText(expr_text, hole_start))
+				match hole_extent:
+					Some(extent):
+						parts = parts.append(InterpolationExprText(expr_text, extent))
+					None:
+						error = Some(unmatched_interpolation_holes(table, span))
 		else:
 			run_end: Int = plain_literal_run_end(text, index)
 			literal += text.substring(index, run_end - index)
 			index = run_end
+
+	if error.is_none() and hole_index != hole_extents.length():
+		error = Some(unmatched_interpolation_holes(table, span))
 
 	match error:
 		Some(diagnostic):
 			Err(diagnostic)
 		None:
 			Ok(append_lit_part(parts, literal))
+
+
+---
+The token text and the authored source disagree on how many holes a string has.
+Holes are paired with their `${...}` extents in order, so the pairing holds only
+when the counts agree; falling back to the string's own span would give a hole
+a location it does not have and an identity another node shares. They disagree
+when this lexer reads a plain brace as a hole, as it does in an interpolated
+pipe string (docs/issues/interpolation_nesting_in_the_existing_lexer.md).
+---
+private pure func unmatched_interpolation_holes(table: SourceTable, span: SourceLocation) -> ParseDiagnostic:
+	parse_error_expected(
+		source_location_span(table, span),
+		"A brace in this interpolated string is read as a hole, but only `" + "$" + "{...}` opens one",
+		[],
+		Some("write a literal brace in an interpolated string as `\\{` or `\\}`"),
+	)
 
 
 private pure func collect_name_reference(
@@ -930,7 +978,7 @@ private pure func collect_free_interpolation_parts(
 
 	for part in parts:
 		match part:
-			ParsedInterpolationExpr(expr):
+			ParsedInterpolationExpr(expr, _):
 				references = references.concat(collect_free_identifiers(bound, expr))
 			ParsedInterpolationLiteral(_):
 				void
@@ -1219,9 +1267,9 @@ private pure func rewrite_identifier_interpolation_parts(
 
 	for part in parts:
 		match part:
-			ParsedInterpolationExpr(expr):
+			ParsedInterpolationExpr(expr, hole):
 				values = values.append(
-					ParsedInterpolationExpr(rewrite_identifier_expr(rewrites, expr)),
+					ParsedInterpolationExpr(rewrite_identifier_expr(rewrites, expr), hole),
 				)
 			ParsedInterpolationLiteral(_):
 				values = values.append(part)
@@ -1824,11 +1872,11 @@ private pure func rewrite_subscript_read_interpolation_parts(
 
 	for part in parts:
 		match part:
-			ParsedInterpolationExpr(expr):
+			ParsedInterpolationExpr(expr, hole):
 				mapped = rewrite_subscript_read_expr(expr)
 
 				if not same_object(mapped, expr):
-					rewritten = rewritten.set(index, ParsedInterpolationExpr(mapped))
+					rewritten = rewritten.set(index, ParsedInterpolationExpr(mapped, hole))
 			ParsedInterpolationLiteral(_):
 				void
 
@@ -2471,21 +2519,21 @@ private pure func finalize_interpolation_parts(
 		match part:
 			InterpolationLiteralText(value):
 				parts = parts.append(ParsedInterpolationLiteral(value))
-			InterpolationExprText(text, source_start_offset):
+			InterpolationExprText(text, hole_extent):
 				parsed_expr = parse_interpolation_expr(
 					table,
 					module_name,
 					running_names,
 					span,
 					text,
-					source_start_offset,
+					source_location_start_offset(hole_extent) + INTERPOLATION_HOLE_OPENER_WIDTH,
 				)
 				running_names = parsed_expr.names
 				diagnostics = diagnostics.concat(parsed_expr.diagnostics)
 
 				match parsed_expr.value:
 					Some(expr):
-						parts = parts.append(ParsedInterpolationExpr(expr))
+						parts = parts.append(ParsedInterpolationExpr(expr, hole_extent))
 					None:
 						void
 

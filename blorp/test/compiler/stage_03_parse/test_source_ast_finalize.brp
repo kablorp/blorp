@@ -56,6 +56,15 @@ pure func source(text: String) -> SourceFile:
 	source_file("demo.brp", "demo", text)
 
 
+---
+A source holding one authored interpolated string, quotes included, for the
+token text `split_interpolated_string` reads: the split takes each hole's
+extent from these bytes.
+---
+pure func authored_string_source(body: String) -> SourceFile:
+	source("\"" + body + "\"")
+
+
 pure func full_span(src: SourceFile) -> SourceLocation:
 	source_location_for_file(
 		src,
@@ -185,7 +194,7 @@ pure func interpolation_expr_name_at(
 	index: Int,
 ) -> String:
 	match parts.get(index):
-		Some(ParsedInterpolationExpr(ParsedNameExpr(name))):
+		Some(ParsedInterpolationExpr(ParsedNameExpr(name), _)):
 			name.text
 		_:
 			""
@@ -200,7 +209,7 @@ pure func diagnostic_string_at(program: ParsedProgram, index: Int) -> String:
 
 
 func test_split_interpolated_string_splits_literal_and_expr() -> Bool:
-	src: SourceFile = source("demo")
+	src: SourceFile = authored_string_source("Hello " + "$" + "{name}!")
 
 	match split_interpolated_string(source_table_for_file(src), full_span(src), "Hello {name}!"):
 		Ok(parts):
@@ -215,7 +224,7 @@ func test_split_interpolated_string_splits_literal_and_expr() -> Bool:
 
 
 func test_split_interpolated_string_unescapes_literal_braces() -> Bool:
-	src: SourceFile = source("demo")
+	src: SourceFile = authored_string_source("Hello \\{name\\} " + "$" + "{value}")
 
 	match split_interpolated_string(
 		source_table_for_file(src),
@@ -238,7 +247,7 @@ func test_split_interpolated_string_unescapes_literal_braces() -> Bool:
 -- literal parts and the expression source handed back to the lexer.
 func test_split_interpolated_string_preserves_multibyte_literals() -> Bool:
 	dash: String = "—"
-	src: SourceFile = source("demo")
+	src: SourceFile = authored_string_source("café " + dash + " " + "$" + "{name} ünd")
 
 	match split_interpolated_string(
 		source_table_for_file(src),
@@ -257,7 +266,7 @@ func test_split_interpolated_string_preserves_multibyte_literals() -> Bool:
 
 
 func test_split_interpolated_string_preserves_multibyte_expr_text() -> Bool:
-	src: SourceFile = source("demo")
+	src: SourceFile = authored_string_source("a " + "$" + "{\"é\".length()} b")
 
 	match split_interpolated_string(
 		source_table_for_file(src),
@@ -276,13 +285,26 @@ func test_split_interpolated_string_preserves_multibyte_expr_text() -> Bool:
 
 
 func test_split_interpolated_string_reports_unclosed_expr() -> Bool:
-	src: SourceFile = source("demo")
+	src: SourceFile = authored_string_source("Hello " + "$" + "{name")
 
 	match split_interpolated_string(source_table_for_file(src), full_span(src), "Hello {name"):
 		Ok(_):
 			False
 		Err(diagnostic):
 			diagnostic.message.contains("Unclosed")
+
+
+func test_split_interpolated_string_reports_a_hole_missing_from_the_source() -> Bool:
+	src: SourceFile = authored_string_source("Hello name!")
+
+	match split_interpolated_string(source_table_for_file(src), full_span(src), "Hello {name}!"):
+		Ok(_):
+			False
+		Err(diagnostic):
+			(
+				diagnostic.message == "A brace in this interpolated string is read as a hole, but only `" + "$" + "{...}` opens one"
+				and diagnostic.help == Some("write a literal brace in an interpolated string as `\\{` or `\\}`")
+			)
 
 
 func test_finalize_interpolation_hole_ids_extend_compilation_table() -> Bool:
@@ -301,7 +323,7 @@ func test_finalize_interpolation_hole_ids_extend_compilation_table() -> Bool:
 	):
 		(Some(ParsedStringInterpolationPartsExpr(parts, _, _)), Some(name_id), Some(missing_id), None):
 			match (parts.get(0), parts.get(2)):
-				(Some(ParsedInterpolationExpr(ParsedNameExpr(known))), Some(ParsedInterpolationExpr(ParsedNameExpr(unknown)))):
+				(Some(ParsedInterpolationExpr(ParsedNameExpr(known), _)), Some(ParsedInterpolationExpr(ParsedNameExpr(unknown), _))):
 					(
 						name_ids_equal(known.name, name_id)
 						and name_ids_equal(unknown.name, missing_id)
@@ -325,9 +347,9 @@ func test_finalize_interpolation_holes_share_one_id_for_a_new_spelling() -> Bool
 		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
 			match (parts.get(0), parts.get(2), parts.get(4)):
 				(
-					Some(ParsedInterpolationExpr(ParsedNameExpr(first))),
-					Some(ParsedInterpolationExpr(ParsedNameExpr(again))),
-					Some(ParsedInterpolationExpr(ParsedNameExpr(second))),
+					Some(ParsedInterpolationExpr(ParsedNameExpr(first), _)),
+					Some(ParsedInterpolationExpr(ParsedNameExpr(again), _)),
+					Some(ParsedInterpolationExpr(ParsedNameExpr(second), _)),
 				):
 					(
 						name_ids_equal(first.name, again.name)
@@ -388,7 +410,7 @@ func test_finalize_interpolation_rebases_nested_locations_to_authored_source() -
 	match first_function_body(program):
 		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
 			match parts.get(1):
-				Some(ParsedInterpolationExpr(ParsedNameExpr(name))):
+				Some(ParsedInterpolationExpr(ParsedNameExpr(name), _)):
 					span = source_location_span(source_table_for_file(program.source), name.span)
 					(
 						span.path == "demo.brp"
@@ -397,6 +419,44 @@ func test_finalize_interpolation_rebases_nested_locations_to_authored_source() -
 					)
 				_:
 					False
+		_:
+			False
+
+
+pure func interpolation_hole_text_at(
+	program: ParsedProgram,
+	parts: List[ParsedStringInterpolationPart],
+	index: Int,
+) -> String:
+	match parts.get(index):
+		Some(ParsedInterpolationExpr(_, hole)):
+			source_span_text(program.source, source_location_span(source_table_for_file(program.source), hole))
+		_:
+			""
+
+
+func test_finalize_interpolation_hole_extent_covers_its_delimiters() -> Bool:
+	nested: String = "$" + "{\"in " + "$" + "{name}\"}"
+	program_source: String = "func message(name: String): \"" + "$" + "{name}" + "$" + "{ name }" + nested + "\""
+	program: ParsedProgram = finalize_interpolation_program(
+		parse_compiler_source(source(program_source)),
+	)
+
+	match first_function_body(program):
+		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
+			inner_holes_are_exact: Bool = match parts.get(2):
+				Some(ParsedInterpolationExpr(ParsedStringInterpolationPartsExpr(inner, _, _), _)):
+					inner.length() == 2 and interpolation_hole_text_at(program, inner, 1) == "$" + "{name}"
+				_:
+					False
+			(
+				parts.length() == 3
+				and interpolation_hole_text_at(program, parts, 0) == "$" + "{name}"
+				and interpolation_hole_text_at(program, parts, 1) == "$" + "{ name }"
+				and interpolation_hole_text_at(program, parts, 2) == nested
+				and inner_holes_are_exact
+				and program.diagnostics.length() == 0
+			)
 		_:
 			False
 
@@ -760,7 +820,7 @@ func test_finalize_interpolation_program_handles_deep_logical_chain() -> Bool:
 						current = left
 					ParsedBinaryExpr(_, ParsedStringInterpolationPartsExpr(parts, _, _), _, _):
 						valid = match parts:
-							[ParsedInterpolationExpr(_)]:
+							[ParsedInterpolationExpr(_, _)]:
 								True
 							_:
 								False
@@ -850,7 +910,7 @@ func test_finalize_subscript_read_in_interpolation_keeps_authored_span() -> Bool
 	match first_function_body(program):
 		Some(ParsedStringInterpolationPartsExpr(parts, _, _)):
 			match parts.get(1):
-				Some(ParsedInterpolationExpr(expr)):
+				Some(ParsedInterpolationExpr(expr, _)):
 					match expr:
 						ParsedCallExpr(_, _, span):
 							(
@@ -924,6 +984,10 @@ tests: TestSuite = {
 			test_split_interpolated_string_preserves_multibyte_expr_text,
 		),
 		(
+			"split interpolated string reports a hole missing from the source",
+			test_split_interpolated_string_reports_a_hole_missing_from_the_source,
+		),
+		(
 			"finalize interpolation hole ids extend compilation table",
 			test_finalize_interpolation_hole_ids_extend_compilation_table,
 		),
@@ -942,6 +1006,10 @@ tests: TestSuite = {
 		(
 			"finalize interpolation rebases nested locations to authored source",
 			test_finalize_interpolation_rebases_nested_locations_to_authored_source,
+		),
+		(
+			"finalize interpolation hole extent covers its delimiters",
+			test_finalize_interpolation_hole_extent_covers_its_delimiters,
 		),
 		(
 			"finalize interpolation program preserves duplicate hole order",
