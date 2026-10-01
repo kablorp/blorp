@@ -1,0 +1,231 @@
+-- Resolves `--profile-module` / `--profile-function` module spellings to the
+-- logical module names Core carries.
+--
+-- The backend matches a selector against a module's logical name, which is its
+-- source path relative to the working directory without `.brp`. Users type
+-- other spellings, so the CLI resolves them against the discovered source graph
+-- here and rejects a spelling that names no module before any code generation.
+import:
+	frontend_request: FrontendCompilationGraph
+	stage_03_parse/source_ast_finalize: finalized_typecheck_program_ast
+	stage_04_modules/frontend_graph: frontend_graph_modules
+	../lib/function_profile:
+		FunctionProfileConfiguration(
+			FunctionProfileCalls,
+			FunctionProfileExact,
+			FunctionProfileOff,
+		),
+		FunctionProfileSelector(ProfileFunction, ProfileModule),
+	path: basename, dirname, is_absolute, join, normalize
+	../lib/path_identity: canonical_existing_path
+	system: getcwd
+
+
+private SOURCE_FILE_EXTENSION: String = ".brp"
+
+-- Separates the segments of a logical module path.
+private LOGICAL_PATH_SEPARATOR: String = "/"
+
+-- Bound on how many same-named modules the error lists as suggestions.
+private MAX_MODULE_SUGGESTIONS: Int = 5
+
+
+private record ProfileGraphModule {
+	logical_name: String,
+	source_path: String
+}
+
+
+-- Graph source paths may be relative to the working directory or, for embedded
+-- modules, not files at all, so identities are compared in one canonical
+-- absolute form.
+private func source_file_identity(cwd: String, path: String) -> String:
+	absolute: String = if is_absolute(path):
+		normalize(path)
+	else:
+		normalize(join(cwd, path))
+
+	canonical_existing_path(absolute).get_or(absolute)
+
+
+private func profile_graph_modules(
+	graph: FrontendCompilationGraph,
+	cwd: String,
+) -> List[ProfileGraphModule]:
+	frontend_graph_modules(graph.graph).map(func(module):
+		source = finalized_typecheck_program_ast(module.program).source
+		{
+			logical_name = source.module_name,
+			source_path = source_file_identity(cwd, source.path)
+		}
+	)
+
+
+private pure func without_source_extension(spelling: String) -> String:
+	if spelling.ends_with(SOURCE_FILE_EXTENSION):
+		spelling.substring(0, spelling.length() - SOURCE_FILE_EXTENSION.length())
+	else:
+		spelling
+
+
+private pure func directory_and_ancestors(directory: String) -> List[String]:
+	parent: String = dirname(directory)
+
+	if parent == directory or parent.is_empty():
+		[directory]
+	else:
+		[directory].concat(directory_and_ancestors(parent))
+
+
+-- Directories a relative spelling is tried against, nearest first: the working
+-- directory (the logical-name base), then the entry file's directory and its
+-- parents, then the working directory's parents. Parents let a spelling be
+-- written relative to the repository root or a source root such as `src`.
+private pure func spelling_anchor_directories(cwd: String, entry_path: String) -> List[String]:
+	[cwd]
+		.concat(directory_and_ancestors(dirname(entry_path)))
+		.concat(directory_and_ancestors(cwd))
+
+
+private func resolve_module_spelling(
+	spelling: String,
+	modules: List[ProfileGraphModule],
+	anchors: List[String],
+	cwd: String,
+) -> Result[String, String]:
+	module_stem: String = without_source_extension(spelling)
+
+	var resolved: Option[String] = modules.find(func(module):
+		module.logical_name == spelling or module.logical_name == module_stem
+	).map(func(module): module.logical_name)
+
+	candidates: List[String] = if is_absolute(spelling):
+		[normalize(module_stem + SOURCE_FILE_EXTENSION)]
+	else:
+		anchors.map(func(anchor): normalize(join(anchor, module_stem) + SOURCE_FILE_EXTENSION))
+
+	for candidate in candidates:
+		if resolved.is_none():
+			candidate_identity: String = source_file_identity(cwd, candidate)
+			resolved = modules.find(func(module): module.source_path == candidate_identity).map(
+				func(module): module.logical_name,
+			)
+
+	-- Last resort: the spelling is a trailing part of exactly one module's
+	-- logical name, as when it is written relative to a source root. This is a
+	-- textual heuristic; it is safe only because the separator anchors the tail
+	-- to a whole path segment and more than one match is an error. Path forms
+	-- above win over it, and an earlier anchor wins over a later one.
+	suffix_matches: List[ProfileGraphModule] = modules.filter(func(module):
+		module.logical_name.ends_with(LOGICAL_PATH_SEPARATOR + module_stem)
+	)
+
+	match resolved:
+		Some(logical_name):
+			Ok(logical_name)
+		None:
+			match suffix_matches:
+				[only]:
+					Ok(only.logical_name)
+				[]:
+					Err(unknown_module_message(spelling, module_stem, modules))
+				_:
+					Err(ambiguous_module_message(spelling, suffix_matches))
+
+
+private pure func ambiguous_module_message(
+	spelling: String,
+	matches: List[ProfileGraphModule],
+) -> String:
+	names: String = matches.map(func(module): "`${module.logical_name}`").join(", ")
+
+	"ambiguous profile module `${spelling}`; it ends the logical paths of several modules: ${names}. Write more of the path to choose one."
+
+
+private pure func unknown_module_message(
+	spelling: String,
+	module_stem: String,
+	modules: List[ProfileGraphModule],
+) -> String:
+	suggestions: List[String] = modules
+		.filter(func(module): basename(module.logical_name) == basename(module_stem))
+		.map(func(module): "`${module.logical_name}`")
+		.take(MAX_MODULE_SUGGESTIONS)
+
+	hint: String = if suggestions.is_empty():
+		""
+	else:
+		"\nmodules with the same name in this program: ${suggestions.join(", ")}"
+
+	"unknown profile module `${spelling}`; it names no module in this program.\nAccepted forms:\n  - the logical module path: the file path relative to the current directory, without `.brp` (e.g. `blorp/src/lib/cli_plan`)\n  - a file path with or without `.brp`: absolute, or relative to the current directory, to the entry file's directory, or to any parent of either\n  - the tail of exactly one module's logical path (e.g. `compiler_new/stage_01_discovery/lexer` for `blorp/src/compiler_new/stage_01_discovery/lexer`)" + hint
+
+
+private func resolve_selector(
+	selector: FunctionProfileSelector,
+	modules: List[ProfileGraphModule],
+	anchors: List[String],
+	cwd: String,
+) -> Result[FunctionProfileSelector, String]:
+	match selector:
+		ProfileModule(spelling):
+			logical_name ?= resolve_module_spelling(spelling, modules, anchors, cwd)
+			Ok(ProfileModule(logical_name))
+		ProfileFunction(spelling, function_name):
+			logical_name ?= resolve_module_spelling(spelling, modules, anchors, cwd)
+			Ok(ProfileFunction(logical_name, function_name))
+
+
+private func resolve_selectors(
+	selectors: List[FunctionProfileSelector],
+	graph: FrontendCompilationGraph,
+	entry_path: String,
+) -> Result[List[FunctionProfileSelector], String]:
+	if selectors.is_empty():
+		Ok(selectors)
+	else:
+		cwd: String = normalize(getcwd())
+		modules: List[ProfileGraphModule] = profile_graph_modules(graph, cwd)
+		absolute_entry: String = if is_absolute(entry_path):
+			normalize(entry_path)
+		else:
+			normalize(join(cwd, entry_path))
+		anchors: List[String] = spelling_anchor_directories(
+			cwd,
+			canonical_existing_path(absolute_entry).get_or(absolute_entry),
+		)
+
+		var resolved: List[FunctionProfileSelector] = []
+		var failure: Option[String] = None
+
+		for selector in selectors:
+			if failure.is_none():
+				match resolve_selector(selector, modules, anchors, cwd):
+					Ok(resolved_selector):
+						resolved = resolved.append(resolved_selector)
+					Err(message):
+						failure = Some(message)
+
+		match failure:
+			Some(message):
+				Err(message)
+			None:
+				Ok(resolved)
+
+
+--- Rewrites every module spelling in `profile` to the logical module name the
+--- backend matches, or explains the accepted spellings when one names no module
+--- of `graph`. `entry_path` is the program's entry source file.
+func resolve_profile_module_spellings(
+	profile: FunctionProfileConfiguration,
+	graph: FrontendCompilationGraph,
+	entry_path: String,
+) -> Result[FunctionProfileConfiguration, String]:
+	match profile:
+		FunctionProfileOff:
+			Ok(FunctionProfileOff)
+		FunctionProfileCalls(selectors):
+			resolved ?= resolve_selectors(selectors, graph, entry_path)
+			Ok(FunctionProfileCalls(resolved))
+		FunctionProfileExact(selectors):
+			resolved ?= resolve_selectors(selectors, graph, entry_path)
+			Ok(FunctionProfileExact(resolved))

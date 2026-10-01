@@ -493,11 +493,19 @@ Profile a Blorp program or compiler benchmark:
 
 ```bash
 bin/blorp run --profile --no-format program.brp 2>/tmp/blorp-profile.txt
-bin/blorp run --profile-mode calls --profile-module compiler/stage_06_typecheck/infer program.brp
-bin/blorp run --profile-mode exact --profile-function compiler/stage_06_typecheck/type_system/env::scope_add_symbol program.brp
+bin/blorp run --profile-mode calls --profile-module blorp/src/compiler/stage_06_typecheck/infer program.brp
+bin/blorp run --profile-mode exact --profile-function blorp/src/compiler/stage_06_typecheck/type_system/env::scope_add_symbol program.brp
 benchmarks/compiler_typecheck_profile 2 2 64 128 \
   2>/tmp/compiler-typecheck-profile.txt
 ```
+
+A module selector is the logical module path (the source path relative to the
+working directory, without `.brp`), the file path with or without `.brp`
+(absolute, or relative to the working directory, the entry file's directory, or
+a parent of either), or the tail of exactly one module's logical path such as
+`compiler_new/stage_01_discovery/lexer`. A selector naming no module in the
+program fails before code generation and lists these forms. `blorp test` does
+not resolve alternate spellings yet; give it the logical path.
 
 `calls` counts invocations; `exact` records inclusive and self active time.
 Module and function selectors may repeat; an empty selector set includes all

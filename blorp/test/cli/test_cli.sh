@@ -1608,6 +1608,74 @@ if grep -qF '#define BLORP_PROFILE_EXACT_TIMING 1' "$compiled_c"; then
 else
 	record_pass "plain compile omits exact scheduler hooks"
 fi
+# --profile-module accepts more than the cwd-relative logical path; the fixture
+# lives outside the working directory, so its logical names are absolute.
+profile_module_dir="$TMPDIR_CLI/profile_module_spellings"
+mkdir -p "$profile_module_dir/sub"
+cat > "$profile_module_dir/sub/helper.brp" <<'BRP'
+pure func twice(value: Int) -> Int:
+	value * 2
+BRP
+cat > "$profile_module_dir/main.brp" <<'BRP'
+import:
+	sub/helper: twice
+
+
+func main(args: List[String]) -> Int:
+	twice(4)
+BRP
+profile_module_entry_c="$profile_module_dir/entry_relative.c"
+profile_module_absolute_c="$profile_module_dir/absolute.c"
+profile_module_tail_c="$profile_module_dir/tail.c"
+expect_exit "profile module accepts a path relative to the entry file" 0 \
+	"$BLORP_BIN" compile --profile-mode calls --profile-module sub/helper --no-format \
+	-o "$profile_module_entry_c" "$profile_module_dir/main.brp"
+expect_exit "profile module accepts an absolute file path with extension" 0 \
+	"$BLORP_BIN" compile --profile-mode calls --profile-module "$profile_module_dir/sub/helper.brp" \
+	--no-format -o "$profile_module_absolute_c" "$profile_module_dir/main.brp"
+expect_exit "profile function accepts the tail of a logical module path" 0 \
+	"$BLORP_BIN" compile --profile-mode calls --profile-function helper::twice --no-format \
+	-o "$profile_module_tail_c" "$profile_module_dir/main.brp"
+for profile_module_c in "$profile_module_entry_c" "$profile_module_absolute_c" "$profile_module_tail_c"; do
+	TOTAL=$((TOTAL + 1))
+	if grep -qF 'sub_helper__twice' "$profile_module_c" \
+		&& grep -qF "/sub/helper\", " "$profile_module_c" \
+		&& ! grep -qF "/main\", " "$profile_module_c"; then
+		record_pass "profile module alternate spelling selects the module: ${profile_module_c##*/}"
+	else
+		record_fail "profile module alternate spelling selects the module: ${profile_module_c##*/}" \
+			"module sub/helper was not instrumented in $profile_module_c"
+	fi
+done
+mkdir -p "$profile_module_dir/other"
+cp "$profile_module_dir/sub/helper.brp" "$profile_module_dir/other/helper.brp"
+cat > "$profile_module_dir/both.brp" <<'BRP'
+import:
+	sub/helper: twice
+	other/helper: twice as other_twice
+
+func main(args: List[String]) -> Int:
+	twice(4) + other_twice(1)
+BRP
+expect_output_contains "profile module rejects an ambiguous path tail" 1 \
+	"ambiguous profile module \`helper\`" \
+	"$BLORP_BIN" compile --profile-mode calls --profile-module helper --no-format \
+	-o "$profile_module_dir/ambiguous.c" "$profile_module_dir/both.brp"
+expect_output_contains "profile module reports the first unknown selector among several" 1 \
+	"unknown profile module \`nope/second\`" \
+	"$BLORP_BIN" compile --profile-mode exact --profile-module sub/helper \
+	--profile-module nope/second --no-format \
+	-o "$profile_module_dir/second.c" "$profile_module_dir/main.brp"
+expect_output_contains "profile module rejects an unknown module before emission" 1 \
+	"unknown profile module \`nope/missing\`" \
+	"$BLORP_BIN" compile --profile-mode calls --profile-module nope/missing --no-format \
+	-o "$profile_module_dir/missing.c" "$profile_module_dir/main.brp"
+expect_output_contains "profile module error lists the accepted forms" 1 \
+	"Accepted forms:" \
+	"$BLORP_BIN" run --profile-mode calls --profile-module nope/missing "$profile_module_dir/main.brp"
+expect_output_excludes "profile module error is not an emission failure" 1 \
+	"internal C emission failure" \
+	"$BLORP_BIN" run --profile-mode calls --profile-module nope/missing "$profile_module_dir/main.brp"
 expect_exit "compile profile window probe" 0 \
 	"$BLORP_BIN" compile --profile --no-format -o "$profile_window_c" "$profile_window_prog"
 expect_exit "link profile window probe" 0 \
