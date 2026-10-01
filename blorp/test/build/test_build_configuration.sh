@@ -698,16 +698,17 @@ if grep -Fq 'benchmarks/split_generated_c.py' <<<"$cli_build_plan" || [ -f bench
 	exit 1
 fi
 
-if ! grep -Fxq 'hygiene-check: build-blorp-cli' Makefile; then
-	echo "FAIL: hygiene checks must inspect generated C from the current CLI build" >&2
+if ! grep -Fxq 'tooling-check: build-blorp-cli' Makefile; then
+	echo "FAIL: tooling checks must inspect generated C from the current CLI build" >&2
 	exit 1
 fi
 
-projection_check=scripts/check-c-symbol-projection-boundary
-if grep -Eq '(^|[[:space:]])rg([[:space:]]|$)' "$projection_check"; then
-	echo "FAIL: C symbol projection checks must not depend on optional ripgrep tooling" >&2
-	exit 1
-fi
+for projection_check in scripts/check-c-symbol-projection-boundary scripts/check-c-symbol-projection-self-compile; do
+	if grep -Eq '(^|[[:space:]])rg([[:space:]]|$)' "$projection_check"; then
+		echo "FAIL: C symbol projection checks must not depend on optional ripgrep tooling" >&2
+		exit 1
+	fi
+done
 
 install_plan=$(make -n install)
 if ! grep -Fq "$direct_bootstrap_compile" <<<"$install_plan" || \

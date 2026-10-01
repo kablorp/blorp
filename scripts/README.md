@@ -726,11 +726,13 @@ plugin's required editor integration registrations in place. `make
 hygiene-check` runs it automatically.
 
 `make hygiene-check` is the seconds-long static set (layout, editor drift,
-C-symbol boundary, manifest, std builtins, magic spellings, stray generated
-artifacts) and runs on every `scripts/land`. `make tooling-check` holds the
+C-symbol boundary, manifest, std builtins, magic spellings) and runs on every
+`scripts/land`. `make tooling-check` holds the stage-2 self-compile C-symbol
+leak check (`scripts/check-c-symbol-projection-self-compile`), the
 benchmark-worker `check` runs and the Python/shell suites that test the
-scripts, build, runtime harnesses and audits; `make quality` and
-`scripts/premerge-gate` run both.
+scripts, build, runtime harnesses and audits. `make quality` runs both, then
+`artifact-scan` for stray generated files the suites left behind;
+`scripts/premerge-gate` runs them too.
 
 `scripts/check-intellij-plugin` verifies the built IntelliJ plugin zip contains
 the native Blorp file type, token lexer/parser, TextMate highlighter bridge, LSP

@@ -507,15 +507,16 @@ quality:
 
 quality-full: quality
 
-# Seconds-long static checks; `scripts/land` runs this on every landing.
-hygiene-check: build-blorp-cli
+# Seconds-long static checks over the sources; `scripts/land` runs this on
+# every landing. `artifact-scan` is not here: builds and test suites leave the
+# stray files it looks for, so `quality` runs it after the suites.
+hygiene-check:
 	@scripts/check-blorp-layout
 	@scripts/check-editor-drift
 	@scripts/check-c-symbol-projection-boundary
 	@scripts/compiler-check --validate-manifest
 	@scripts/check-std-builtins
 	@python3 scripts/check-magic-spellings
-	@$(MAKE) --no-print-directory artifact-scan
 
 # Stray generated files left by builds or tests.
 artifact-scan:
@@ -535,6 +536,7 @@ artifact-scan:
 # compiler, runtime and script sources, so run them in `quality` and the
 # premerge gate rather than per landing.
 tooling-check: build-blorp-cli
+	@scripts/check-c-symbol-projection-self-compile
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
@@ -542,7 +544,7 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_borrowed_boundary_child_modes.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_cleanup_coverage_ledger.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test/test_session_benchmark.py
-	@PYTHONDWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_typecheck_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/fixture_support/test_check_fixtures.py
