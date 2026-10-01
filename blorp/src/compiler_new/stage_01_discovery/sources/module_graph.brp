@@ -18,24 +18,18 @@
 import:
 	../tables/builder:
 		DiscoveryBuilder,
-		append_implicit_diagnostic,
 		append_implicit_request,
-		append_implicit_target,
 		append_import_target,
 		append_module_package,
 		append_name,
 		append_package,
 		append_resolution_diagnostic_at,
 		append_root,
-		append_root_diagnostic,
-		append_root_target,
 		find_module_by_path,
 		find_name_id,
 		find_path_id,
-		next_implicit_request_id,
 		next_name_id,
 		next_package_id,
-		next_root_id,
 	../tables/diagnostic_code:
 		ImplicitDiagnostic(
 			ImplicitSourceTooLarge, ImplicitTooManySources, MissingImplicitModule,
@@ -50,13 +44,11 @@ import:
 			UnresolvedRoot, UnverifiableRootSpelling,
 		),
 	../tables/ids:
-		ImplicitRequestId,
 		ImportId,
 		ModuleId,
 		NameId,
 		PackageId,
 		PathId,
-		RootId,
 		import_id_at_row,
 		import_id_index,
 		module_id_at_row,
@@ -67,7 +59,10 @@ import:
 	../tables/row_kinds:
 		ModuleReach(ImplicitModule, ImportedModule, RootModule),
 		PackageKind(NativePackage, SourcePackage),
-	../tables/rows: ImportRow
+	../tables/rows:
+		ImplicitOutcome(ImplicitLoaded, ImplicitRejected),
+		ImportRow,
+		RootOutcome(RootLoaded, RootRejected),
 	../tables/span: Span, pack_span
 	fs:
 		DirectoryListing,
@@ -133,8 +128,8 @@ What asked for a module: a root, an implicit module request or an import. Its
 target or diagnostic row is recorded against it.
 ---
 union ModuleRequester:
-	RequestedByRoot(RootId)
-	RequestedImplicitly(ImplicitRequestId)
+	RequestedByRoot(PathId)
+	RequestedImplicitly(PathId)
 	RequestedByImport(ImportId)
 
 
@@ -176,17 +171,6 @@ union ResolutionFailure:
 
 
 ---
-Interns the request text of a root and appends its row; read the root's id
-first with `next_root_id`.
----
-pure func record_root_request(builder: DiscoveryBuilder, root_path: String) -> DiscoveryBuilder:
-	request_path: PathId = builder.interned_path_id(root_path)
-	builder
-		.intern_path(root_path)
-		.append_root({request_path = request_path})
-
-
----
 Resolves `root`. Directory listings the spelling checks need
 are read through the provider once each: `listings` holds those read so far
 and the listings to keep are returned with the resolution.
@@ -204,20 +188,6 @@ func resolve_root[Provider:SourceProvider](
 			(listings, ModuleAlreadyLoaded(module))
 		None:
 			look_up_candidates(provider, builder, listings, [candidate])
-
-
----
-Interns the name of an implicit module and appends its request row; read the
-request's id first with `next_implicit_request_id`.
----
-pure func record_implicit_request(
-	builder: DiscoveryBuilder,
-	module_name: String,
-) -> DiscoveryBuilder:
-	request_path: PathId = builder.interned_path_id(module_name)
-	builder
-		.intern_path(module_name)
-		.append_implicit_request({request_path = request_path})
 
 
 ---
@@ -310,7 +280,8 @@ pure func reach_of(requester: ModuleRequester) -> ModuleReach:
 
 
 ---
-Records `module` as the target of `requester`.
+Records `module` as the target of `requester`: a root or implicit request is
+appended with it as its outcome.
 ---
 pure func record_target(
 	builder: DiscoveryBuilder,
@@ -318,15 +289,15 @@ pure func record_target(
 	module: ModuleId,
 ) -> DiscoveryBuilder:
 	match requester:
-		RequestedByRoot(root):
-			builder.append_root_target({
-				root = root,
-				target = module,
+		RequestedByRoot(request_path):
+			builder.append_root({
+				request_path = request_path,
+				outcome = RootLoaded(module),
 			})
-		RequestedImplicitly(request):
-			builder.append_implicit_target({
-				request = request,
-				target = module,
+		RequestedImplicitly(request_path):
+			builder.append_implicit_request({
+				request_path = request_path,
+				outcome = ImplicitLoaded(module),
 			})
 		RequestedByImport(import_id):
 			builder.append_import_target({
@@ -346,44 +317,44 @@ pure func report_failure(
 	match failure:
 		SourceMissing:
 			match requester:
-				RequestedByRoot(root):
-					builder.report_root(root, UnresolvedRoot)
-				RequestedImplicitly(request):
-					builder.report_implicit(request, MissingImplicitModule)
+				RequestedByRoot(request_path):
+					builder.report_root(request_path, UnresolvedRoot)
+				RequestedImplicitly(request_path):
+					builder.report_implicit(request_path, MissingImplicitModule)
 				RequestedByImport(import_id):
 					builder.report_import(import_id, UnresolvedImport(import_id))
 		SpellingUnknown:
 			match requester:
-				RequestedByRoot(root):
-					builder.report_root(root, UnverifiableRootSpelling)
-				RequestedImplicitly(request):
-					builder.report_implicit(request, UnverifiableImplicitSpelling)
+				RequestedByRoot(request_path):
+					builder.report_root(request_path, UnverifiableRootSpelling)
+				RequestedImplicitly(request_path):
+					builder.report_implicit(request_path, UnverifiableImplicitSpelling)
 				RequestedByImport(import_id):
 					builder.report_import(import_id, UnverifiableSpelling(import_id))
 		SpelledWithOtherCase(stored_names):
 			match requester:
-				RequestedByRoot(root):
-					builder.report_root_case_mismatch(root, stored_names)
-				RequestedImplicitly(request):
+				RequestedByRoot(request_path):
+					builder.report_root_case_mismatch(request_path, stored_names)
+				RequestedImplicitly(request_path):
 					-- The name is the compiler's own constant, so the stored spelling
 					-- teaches nothing: the module is simply not there.
-					builder.report_implicit(request, MissingImplicitModule)
+					builder.report_implicit(request_path, MissingImplicitModule)
 				RequestedByImport(import_id):
 					builder.report_import_case_mismatch(import_id, stored_names)
 		ReadFailed:
 			match requester:
-				RequestedByRoot(root):
-					builder.report_root(root, UnreadableRootSource)
-				RequestedImplicitly(request):
-					builder.report_implicit(request, UnreadableImplicitSource)
+				RequestedByRoot(request_path):
+					builder.report_root(request_path, UnreadableRootSource)
+				RequestedImplicitly(request_path):
+					builder.report_implicit(request_path, UnreadableImplicitSource)
 				RequestedByImport(import_id):
 					builder.report_import(import_id, UnreadableSource(import_id))
 		SourceOverLimit(rejection, byte_length):
 			match requester:
-				RequestedByRoot(root):
-					builder.report_rejected_root(root, rejection, byte_length)
-				RequestedImplicitly(request):
-					builder.report_rejected_implicit(request, rejection, byte_length)
+				RequestedByRoot(request_path):
+					builder.report_rejected_root(request_path, rejection, byte_length)
+				RequestedImplicitly(request_path):
+					builder.report_rejected_implicit(request_path, rejection, byte_length)
 				RequestedByImport(import_id):
 					builder.report_rejected_import(import_id, rejection, byte_length)
 
@@ -739,69 +710,69 @@ private pure func report_rejected_import(
 
 private pure func report_root(
 	builder: DiscoveryBuilder,
-	root: RootId,
+	request_path: PathId,
 	diagnostic: RootDiagnostic,
 ) -> DiscoveryBuilder:
-	builder.append_root_diagnostic({
-		root = root,
-		diagnostic = diagnostic,
+	builder.append_root({
+		request_path = request_path,
+		outcome = RootRejected(diagnostic),
 	})
 
 
 ---
-Reports that `root` names a source stored under different letter case, with
+Reports that the root `request_path` names a source stored under different letter case, with
 the interned stored spelling as the argument.
 ---
 private pure func report_root_case_mismatch(
 	builder: DiscoveryBuilder,
-	root: RootId,
+	request_path: PathId,
 	stored_names: List[String],
 ) -> DiscoveryBuilder:
 	stored_path: String = stored_names.join("/")
 	stored_path_id: PathId = builder.interned_path_id(stored_path)
 	builder
 		.intern_path(stored_path)
-		.append_root_diagnostic({
-			root = root,
-			diagnostic = RootCaseMismatch(stored_path_id),
+		.append_root({
+			request_path = request_path,
+			outcome = RootRejected(RootCaseMismatch(stored_path_id)),
 		})
 
 
 private pure func report_rejected_root(
 	builder: DiscoveryBuilder,
-	root: RootId,
+	request_path: PathId,
 	rejection: SourceRejection,
 	byte_length: Int,
 ) -> DiscoveryBuilder:
 	match rejection:
 		SourceTooLargeToSpan:
-			builder.report_root(root, RootSourceTooLarge(byte_length))
+			builder.report_root(request_path, RootSourceTooLarge(byte_length))
 		TooManySourcesToSpan:
-			builder.report_root(root, RootTooManySources)
+			builder.report_root(request_path, RootTooManySources)
 
 
 ---
-Reports that implicit module `request` loaded no module, as `diagnostic`.
+Reports that implicit module `request_path` loaded no module, as `diagnostic`.
 ---
 private pure func report_implicit(
 	builder: DiscoveryBuilder,
-	request: ImplicitRequestId,
+	request_path: PathId,
 	diagnostic: ImplicitDiagnostic,
 ) -> DiscoveryBuilder:
-	builder.append_implicit_diagnostic({
-		request = request,
-		diagnostic = diagnostic,
+	builder.append_implicit_request({
+		request_path = request_path,
+		outcome = ImplicitRejected(diagnostic),
 	})
 
 
 private pure func report_rejected_implicit(
 	builder: DiscoveryBuilder,
-	request: ImplicitRequestId,
+	request_path: PathId,
 	rejection: SourceRejection,
 	byte_length: Int,
 ) -> DiscoveryBuilder:
 	match rejection:
 		SourceTooLargeToSpan:
-			builder.report_implicit(request, ImplicitSourceTooLarge(byte_length))
+			builder.report_implicit(request_path, ImplicitSourceTooLarge(byte_length))
 		TooManySourcesToSpan:
-			builder.report_implicit(request, ImplicitTooManySources)
+			builder.report_implicit(request_path, ImplicitTooManySources)

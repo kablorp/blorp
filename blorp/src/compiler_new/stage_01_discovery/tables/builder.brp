@@ -65,7 +65,6 @@ import:
 		BoundId,
 		DefinitionId,
 		ForeignBlockId,
-		ImplicitRequestId,
 		ImportId,
 		ImportItemId,
 		LiteralId,
@@ -75,7 +74,6 @@ import:
 		PackageId,
 		ParameterId,
 		PathId,
-		RootId,
 		SourceId,
 		SupertraitId,
 		bound_id_at_row,
@@ -83,7 +81,6 @@ import:
 		definition_id_index,
 		foreign_block_id_at_row,
 		foreign_block_id_index,
-		implicit_request_id_at_row,
 		import_id_at_row,
 		import_id_index,
 		import_item_id_at_row,
@@ -96,7 +93,6 @@ import:
 		parameter_id_at_row,
 		path_id_at_row,
 		path_id_index,
-		root_id_at_row,
 		source_id_at_row,
 		supertrait_id_at_row,
 	intern_index:
@@ -109,7 +105,11 @@ import:
 		slots_with_row,
 		text_hash,
 	name_vocabulary: ALL_SEEDED_NAME_SPELLINGS
-	row_kinds: FunctionAnnotation(TailRecursiveAnnotation), ModuleOriginKind, ModuleReach
+	row_kinds:
+		FunctionAnnotation(TailRecursiveAnnotation),
+		ImportRequestKind,
+		ModuleOriginKind,
+		ModuleReach,
 	rows:
 		AnnotationRow,
 		BinderNameRow,
@@ -128,9 +128,7 @@ import:
 		ForeignBindingRow,
 		ForeignBlockRow,
 		ForeignCNameRow,
-		ImplicitDiagnosticRow,
 		ImplicitRequestRow,
-		ImplicitTargetRow,
 		ImportAliasRow,
 		ImportBlockRow,
 		ImportItemAliasRow,
@@ -153,9 +151,7 @@ import:
 		PendingAnnotationRow,
 		ResolutionDiagnosticRow,
 		ResourceCleanupRow,
-		RootDiagnosticRow,
 		RootRow,
-		RootTargetRow,
 		RowRange,
 		SignatureRow,
 		SourceRow,
@@ -164,7 +160,7 @@ import:
 		SyntaxDiagnosticRow,
 		TypeParameterRow,
 		VariantPayloadRow,
-	span: Span
+	span: Span, span_covering
 	token: Token
 
 
@@ -215,11 +211,7 @@ record DiscoveryBuilder {
 	module_packages: List[ModulePackageRow],
 	module_ids_by_path: Dict[Int, Int],
 	roots: List[RootRow],
-	root_targets: List[RootTargetRow],
-	root_diagnostics: List[RootDiagnosticRow],
 	implicit_requests: List[ImplicitRequestRow],
-	implicit_targets: List[ImplicitTargetRow],
-	implicit_diagnostics: List[ImplicitDiagnosticRow],
 	imports: List[ImportRow],
 	import_path_parts: List[NameId],
 	import_items: List[ImportItemRow],
@@ -270,7 +262,8 @@ record DiscoveryBuilder {
 	interpolation_texts: List[LiteralId],
 	child_stack: List[NodeId],
 	child_stack_depth: Int,
-	loop_context: LoopContext
+	loop_context: LoopContext,
+	module_being_parsed: Option[ModuleId]
 }
 
 
@@ -292,11 +285,7 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		module_packages = [],
 		module_ids_by_path = {},
 		roots = [],
-		root_targets = [],
-		root_diagnostics = [],
 		implicit_requests = [],
-		implicit_targets = [],
-		implicit_diagnostics = [],
 		imports = [],
 		import_path_parts = [],
 		import_items = [],
@@ -347,7 +336,8 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		interpolation_texts = [],
 		child_stack = [],
 		child_stack_depth = 0,
-		loop_context = NotInLoop
+		loop_context = NotInLoop,
+		module_being_parsed = None
 	}
 
 
@@ -528,95 +518,187 @@ pure func find_module_by_path(
 
 
 ---
-Appends a module row and indexes it by its canonical path. Its ranges are
-closed by `close_module_row` once its parse ends.
+What `open_module` knows about a module when its parse begins: its identity
+(the module id and the source admitted for it), and where each block of rows
+that its parse appends starts. A plain struct, so an opening costs no
+allocation.
 ---
-pure func append_module(builder: DiscoveryBuilder, row: ModuleRow) -> DiscoveryBuilder:
-	index: Int = builder.modules.length()
-	path_index: Int = row.canonical_path.path_id_index()
-	{ builder |
-		modules = builder.modules.append(row),
-		module_ids_by_path = builder.module_ids_by_path.set(path_index, index)
-	}
-
-
----
-Replaces a module's row; a module is appended with empty ranges and its row
-replaced with the closed ranges at the end of its parse.
----
-pure func replace_module_row(
-	builder: DiscoveryBuilder,
+private struct ModuleOpeningFields {
 	module: ModuleId,
-	row: ModuleRow,
-) -> DiscoveryBuilder:
-	index: Int = module.module_id_index()
-	{ builder | modules = builder.modules.set(index, row) }
+	source: SourceId,
+	canonical_path: PathId,
+	origin: ModuleOriginKind,
+	reach: ModuleReach,
+	definitions_first: Int,
+	imports_first: Int,
+	nodes_first: Int,
+	diagnostics_first: Int
+}
 
 
 ---
-The row of the module about to be loaded, before any of its rows exist: each
-range starts at the end of its table now and is empty. Append it with
-`append_module` before lexing, and close it with `close_module_row` once the
-parse ends.
+A module whose source is admitted and whose parse is under way. No row of it
+is in the `modules` table yet: `close_module` appends the one complete row,
+with its four row blocks ended where the parse left the tables, and it is the
+only way a module row or the by-path index gains an entry. Only `open_module`
+makes an opening, so the module, its source and where its blocks start
+cannot be written by hand.
 ---
-pure func module_row_start(
+opaque type ModuleOpening = ModuleOpeningFields
+
+
+---
+Opens the module whose source `admit_source` appended last: each block of rows
+the module's parse appends starts at the end of its table now. Modules load
+one at a time, so the opening's module id is the next one, and nothing but this
+module's own parse appends rows between `open_module` and `close_module`.
+---
+pure func open_module(
 	builder: DiscoveryBuilder,
 	canonical_path: PathId,
 	origin: ModuleOriginKind,
 	reach: ModuleReach,
-) -> ModuleRow:
-	{
-		source = builder.next_source_id(),
+) -> ModuleOpening:
+	check_module_opens_in_turn(builder.sources.length(), builder.modules.length())
+	fields: ModuleOpeningFields = {
+		module = module_id_at_row(builder.modules.length()),
+		source = source_id_at_row(builder.sources.length() - 1),
 		canonical_path = canonical_path,
 		origin = origin,
 		reach = reach,
-		definitions = {
-			first = builder.definitions.length(),
-			count = 0
-		},
-		imports = {
-			first = builder.imports.length(),
-			count = 0
-		},
-		nodes = {
-			first = builder.nodes.length(),
-			count = 0
-		},
-		diagnostics = {
-			first = builder.diagnostics.length(),
-			count = 0
-		}
+		definitions_first = builder.definitions.length(),
+		imports_first = builder.imports.length(),
+		nodes_first = builder.nodes.length(),
+		diagnostics_first = builder.diagnostics.length()
 	}
+	into_opaque ModuleOpening(fields)
 
 
 ---
-Replaces `module`'s row with `opening` (the row `module_row_start` returned)
-with every range closed over the rows appended since.
+Makes `opening`'s module the one being parsed, from its opening, so the parse
+routines that need the module (a local function's header) read it from the
+builder and nothing predicts it. `close_module` clears it. Not cleared by
+`without_transient_tables`: lexing the module starts from that and parses
+after it.
 ---
-pure func close_module_row(
-	builder: DiscoveryBuilder,
-	module: ModuleId,
-	opening: ModuleRow,
-) -> DiscoveryBuilder:
-	closed: ModuleRow = { opening |
+pure func begin_module_parse(builder: DiscoveryBuilder, opening: ModuleOpening) -> DiscoveryBuilder:
+	{ builder | module_being_parsed = Some(from_opaque ModuleOpening(opening).module) }
+
+
+---
+The module being parsed. Parse routines run only between `begin_module_parse`
+and `close_module`, so a miss is a defect in the caller: it is reported and
+the first module returned.
+---
+pure func parsed_module(builder: DiscoveryBuilder) -> ModuleId:
+	match builder.module_being_parsed:
+		Some(module):
+			module
+		None:
+			report_unreachable_lookup(
+				"module being parsed",
+				0,
+				"parse routines run between begin_module_parse and close_module",
+			)
+			module_id_at_row(0)
+
+
+---
+The id the opened module has.
+---
+pure func opened_module(opening: ModuleOpening) -> ModuleId:
+	from_opaque ModuleOpening(opening).module
+
+
+---
+The source admitted for the opened module.
+---
+pure func opened_source(opening: ModuleOpening) -> SourceId:
+	from_opaque ModuleOpening(opening).source
+
+
+---
+Modules load one at a time, each right after its source is admitted, so a
+module opens when the sources outnumber the closed modules by exactly one. Any
+other count means a module was opened twice, opened without its source, or
+left open: a defect in the caller. A debug build stops with the message. A
+function of two numbers, so the check holds no table.
+---
+private pure func check_module_opens_in_turn(source_count: Int, module_count: Int):
+	debug:
+		if source_count != module_count + 1:
+			dbg.error(
+				"a module was opened out of turn: its source is not the only one without a module",
+			)
+
+
+---
+The number of rows a closing block holds, `block_end - block_first`, after a
+debug-build guard of the one-close-per-opening rule: a row closes at the end of
+its table, as the row its opening was made for (`next_row` is the table's length
+now and `opened_as` the opening's id). Closed twice, or against a builder that
+is not the one it was opened on, it does not, and the message says so. A
+function of numbers that returns the count, because a bare guard call
+statement in a close, even an empty one, made its record update copy.
+---
+private pure func block_count_closing_in_turn(
+	block_end: Int,
+	block_first: Int,
+	next_row: Int,
+	opened_as: Int,
+) -> Int:
+	debug:
+		if next_row != opened_as:
+			dbg.error("an opening was closed out of turn or twice")
+
+	block_end - block_first
+
+
+---
+Appends the row of `opening`'s module, with every block ended over the rows
+appended since it opened, and indexes it by its canonical path.
+---
+pure func close_module(builder: DiscoveryBuilder, opening: ModuleOpening) -> DiscoveryBuilder:
+	fields: ModuleOpeningFields = from_opaque ModuleOpening(opening)
+	index: Int = builder.modules.length()
+	definitions_count: Int = block_count_closing_in_turn(
+		builder.definitions.length(),
+		fields.definitions_first,
+		index,
+		fields.module.module_id_index(),
+	)
+	imports_count: Int = builder.imports.length() - fields.imports_first
+	nodes_count: Int = builder.nodes.length() - fields.nodes_first
+	diagnostics_count: Int = builder.diagnostics.length() - fields.diagnostics_first
+	path_index: Int = fields.canonical_path.path_id_index()
+
+	row: ModuleRow = {
+		source = fields.source,
+		canonical_path = fields.canonical_path,
+		origin = fields.origin,
+		reach = fields.reach,
 		definitions = {
-			first = opening.definitions.first,
-			count = builder.definitions.length() - opening.definitions.first
+			first = fields.definitions_first,
+			count = definitions_count
 		},
 		imports = {
-			first = opening.imports.first,
-			count = builder.imports.length() - opening.imports.first
+			first = fields.imports_first,
+			count = imports_count
 		},
 		nodes = {
-			first = opening.nodes.first,
-			count = builder.nodes.length() - opening.nodes.first
+			first = fields.nodes_first,
+			count = nodes_count
 		},
 		diagnostics = {
-			first = opening.diagnostics.first,
-			count = builder.diagnostics.length() - opening.diagnostics.first
+			first = fields.diagnostics_first,
+			count = diagnostics_count
 		}
 	}
-	builder.replace_module_row(module, closed)
+	{ builder |
+		modules = builder.modules.append(row),
+		module_ids_by_path = builder.module_ids_by_path.set(path_index, index),
+		module_being_parsed = None
+	}
 
 
 pure func append_module_package(
@@ -627,29 +709,17 @@ pure func append_module_package(
 
 
 -- Roots and imports.
-pure func next_root_id(builder: DiscoveryBuilder) -> RootId:
-	root_id_at_row(builder.roots.length())
-
-
+---
+Appends a root with the outcome of resolving it. Written once, when the outcome
+is known, so a root has its target or its rejection from the moment it exists.
+---
 pure func append_root(builder: DiscoveryBuilder, row: RootRow) -> DiscoveryBuilder:
 	{ builder | roots = builder.roots.append(row) }
 
 
-pure func append_root_target(builder: DiscoveryBuilder, row: RootTargetRow) -> DiscoveryBuilder:
-	{ builder | root_targets = builder.root_targets.append(row) }
-
-
-pure func append_root_diagnostic(
-	builder: DiscoveryBuilder,
-	row: RootDiagnosticRow,
-) -> DiscoveryBuilder:
-	{ builder | root_diagnostics = builder.root_diagnostics.append(row) }
-
-
-pure func next_implicit_request_id(builder: DiscoveryBuilder) -> ImplicitRequestId:
-	implicit_request_id_at_row(builder.implicit_requests.length())
-
-
+---
+Appends an implicit request with the outcome of resolving it, as `append_root`.
+---
 pure func append_implicit_request(
 	builder: DiscoveryBuilder,
 	row: ImplicitRequestRow,
@@ -657,39 +727,103 @@ pure func append_implicit_request(
 	{ builder | implicit_requests = builder.implicit_requests.append(row) }
 
 
-pure func append_implicit_target(
-	builder: DiscoveryBuilder,
-	row: ImplicitTargetRow,
-) -> DiscoveryBuilder:
-	{ builder | implicit_targets = builder.implicit_targets.append(row) }
-
-
-pure func append_implicit_diagnostic(
-	builder: DiscoveryBuilder,
-	row: ImplicitDiagnosticRow,
-) -> DiscoveryBuilder:
-	{ builder | implicit_diagnostics = builder.implicit_diagnostics.append(row) }
-
-
-pure func next_import_id(builder: DiscoveryBuilder) -> ImportId:
-	import_id_at_row(builder.imports.length())
-
-
-pure func append_import(builder: DiscoveryBuilder, row: ImportRow) -> DiscoveryBuilder:
-	{ builder | imports = builder.imports.append(row) }
-
-
 ---
-Replaces an import's row; the parser appends an import before its items and
-closes its item range afterwards.
+What `open_import` knows about an import that has begun: who imports, how it is
+requested, and where its path parts and items start. Its path text, path span
+and end are known only when its parse ends.
 ---
-pure func replace_import_row(
-	builder: DiscoveryBuilder,
+private struct ImportOpeningFields {
 	import_id: ImportId,
-	row: ImportRow,
+	importer: ModuleId,
+	request_kind: ImportRequestKind,
+	parent_steps: Int,
+	path_parts_first: Int,
+	items_first: Int,
+	start: Span
+}
+
+
+---
+An import whose path, alias and items are being parsed. No row of it is in
+`imports` yet: `close_import` appends the one complete row, so a row never
+holds a range or an end that is still to be decided. Only `open_import` makes
+an opening, so the id and where the blocks start cannot be forged. Blorp has no
+linear types, so closing an opening once is the caller's obligation; a debug
+build reports a second close or a close against another builder state.
+---
+opaque type ImportOpening = ImportOpeningFields
+
+
+---
+Opens the import that starts at `start`. Its path parts and items start at the
+end of `import_path_parts` and `import_items` now; the table is read here, so
+no caller names where a block starts. Imports do not nest, so the opening's id
+is the next row.
+---
+pure func open_import(
+	builder: DiscoveryBuilder,
+	importer: ModuleId,
+	request_kind: ImportRequestKind,
+	parent_steps: Int,
+	start: Span,
+) -> ImportOpening:
+	fields: ImportOpeningFields = {
+		import_id = import_id_at_row(builder.imports.length()),
+		importer = importer,
+		request_kind = request_kind,
+		parent_steps = parent_steps,
+		path_parts_first = builder.import_path_parts.length(),
+		items_first = builder.import_items.length(),
+		start = start
+	}
+	into_opaque ImportOpening(fields)
+
+
+---
+The id the opened import has: its alias and items name it before its row exists.
+---
+pure func opened_import(opening: ImportOpening) -> ImportId:
+	from_opaque ImportOpening(opening).import_id
+
+
+---
+Appends the row of `opening`'s import. Its path parts and items are the rows
+appended to `import_path_parts` and `import_items` since it opened; `request_path`
+is the interned text of the path and `path_span` its span. It spans from its
+start to `end`.
+---
+pure func close_import(
+	builder: DiscoveryBuilder,
+	opening: ImportOpening,
+	request_path: PathId,
+	path_span: Span,
+	end: Span,
 ) -> DiscoveryBuilder:
-	index: Int = import_id.import_id_index()
-	{ builder | imports = builder.imports.set(index, row) }
+	fields: ImportOpeningFields = from_opaque ImportOpening(opening)
+	parts_count: Int = builder.import_path_parts.length() - fields.path_parts_first
+	items_count: Int = block_count_closing_in_turn(
+		builder.import_items.length(),
+		fields.items_first,
+		builder.imports.length(),
+		fields.import_id.import_id_index(),
+	)
+	row: ImportRow = {
+		importer = fields.importer,
+		request_kind = fields.request_kind,
+		request_path = request_path,
+		parent_steps = fields.parent_steps,
+		path_parts = {
+			first = fields.path_parts_first,
+			count = parts_count
+		},
+		items = {
+			first = fields.items_first,
+			count = items_count
+		},
+		path_span = path_span,
+		span = fields.start.span_covering(end)
+	}
+	{ builder | imports = builder.imports.append(row) }
 
 
 pure func next_import_path_part_row(builder: DiscoveryBuilder) -> Int:
@@ -700,21 +834,83 @@ pure func append_import_path_part(builder: DiscoveryBuilder, part: NameId) -> Di
 	{ builder | import_path_parts = builder.import_path_parts.append(part) }
 
 
-pure func next_import_item_id(builder: DiscoveryBuilder) -> ImportItemId:
-	import_item_id_at_row(builder.import_items.length())
-
-
-pure func append_import_item(builder: DiscoveryBuilder, row: ImportItemRow) -> DiscoveryBuilder:
-	{ builder | import_items = builder.import_items.append(row) }
-
-
-pure func replace_import_item_row(
-	builder: DiscoveryBuilder,
+---
+What `open_import_item` knows about a selected symbol whose name is read: the
+row's columns but its variants and its end.
+---
+private struct ImportItemOpeningFields {
 	item: ImportItemId,
-	row: ImportItemRow,
+	owner_import: ImportId,
+	name: NameId,
+	variants_first: Int,
+	start: Span
+}
+
+
+---
+A selected symbol whose constructors and alias are being parsed. No row of it
+is in `import_items` yet: `close_import_item` appends the one complete row.
+---
+opaque type ImportItemOpening = ImportItemOpeningFields
+
+
+---
+Opens the item `name` of `owner_import`, read at `start`; its variants start at
+the end of `import_item_variants` now. Items do not nest, so the opening's id is
+the next one.
+---
+pure func open_import_item(
+	builder: DiscoveryBuilder,
+	owner_import: ImportId,
+	name: NameId,
+	start: Span,
+) -> ImportItemOpening:
+	fields: ImportItemOpeningFields = {
+		item = import_item_id_at_row(builder.import_items.length()),
+		owner_import = owner_import,
+		name = name,
+		variants_first = builder.import_item_variants.length(),
+		start = start
+	}
+	into_opaque ImportItemOpening(fields)
+
+
+---
+The id the opened item has: its variants and alias name it before its row
+exists.
+---
+pure func opened_import_item(opening: ImportItemOpening) -> ImportItemId:
+	from_opaque ImportItemOpening(opening).item
+
+
+---
+Appends the row of `opening`'s item: its variants are the rows appended to
+`import_item_variants` since it opened, its name span is where it started, and it
+spans through `end`.
+---
+pure func close_import_item(
+	builder: DiscoveryBuilder,
+	opening: ImportItemOpening,
+	end: Span,
 ) -> DiscoveryBuilder:
-	index: Int = item.import_item_id_index()
-	{ builder | import_items = builder.import_items.set(index, row) }
+	fields: ImportItemOpeningFields = from_opaque ImportItemOpening(opening)
+	variants_count: Int = block_count_closing_in_turn(
+		builder.import_item_variants.length(),
+		fields.variants_first,
+		builder.import_items.length(),
+		fields.item.import_item_id_index(),
+	)
+	row: ImportItemRow = {
+		owner_import = fields.owner_import,
+		name = fields.name,
+		variants = {
+			first = fields.variants_first,
+			count = variants_count
+		},
+		name_span = fields.start,
+		span = fields.start.span_covering(end)
+	}
+	{ builder | import_items = builder.import_items.append(row) }
 
 
 pure func next_import_item_variant_row(builder: DiscoveryBuilder) -> Int:
@@ -800,16 +996,21 @@ pure func append_module_documentation(
 
 
 ---
-Replaces a definition's row; declarations whose span ends after their
-members are appended first and closed afterwards.
+Closes the span of `definition`'s row. `opened` is the row as it was
+appended, so the closing writes that row back with its span ended: no other
+column can change, and the table is not read (reading a struct row out of a
+list as an `Option` allocates on this per-definition path). This assumes the
+closing is the only writer of the row between its opening and now: nothing else
+replaces a definition row, and `opened` is that opening's own row.
 ---
-pure func replace_definition_row(
+pure func set_definition_span(
 	builder: DiscoveryBuilder,
 	definition: DefinitionId,
-	row: DefinitionRow,
+	opened: DefinitionRow,
+	span: Span,
 ) -> DiscoveryBuilder:
 	index: Int = definition.definition_id_index()
-	{ builder | definitions = builder.definitions.set(index, row) }
+	{ builder | definitions = builder.definitions.set(index, { opened | span = span }) }
 
 
 pure func append_documentation(
@@ -886,21 +1087,76 @@ pure func append_dimension_constraint(
 	{ builder | dimension_constraints = builder.dimension_constraints.append(row) }
 
 
-pure func next_foreign_block_id(builder: DiscoveryBuilder) -> ForeignBlockId:
-	foreign_block_id_at_row(builder.foreign_blocks.length())
-
-
-pure func append_foreign_block(builder: DiscoveryBuilder, row: ForeignBlockRow) -> DiscoveryBuilder:
-	{ builder | foreign_blocks = builder.foreign_blocks.append(row) }
-
-
-pure func replace_foreign_block_row(
-	builder: DiscoveryBuilder,
+---
+What `open_foreign_block` knows about a `foreign:` block that has begun.
+---
+private struct ForeignBlockOpeningFields {
 	block: ForeignBlockId,
-	row: ForeignBlockRow,
+	module: ModuleId,
+	arguments_first: Int,
+	start: Span
+}
+
+
+---
+A `foreign:` block whose arguments and functions are being parsed. No row of
+it is in `foreign_blocks` yet: `close_foreign_block` appends the one complete
+row.
+---
+opaque type ForeignBlockOpening = ForeignBlockOpeningFields
+
+
+---
+Opens the block of `module` that starts at `start`; its arguments start at the
+end of `foreign_arguments` now. Blocks do not nest, so the opening's id is the
+next one.
+---
+pure func open_foreign_block(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	start: Span,
+) -> ForeignBlockOpening:
+	fields: ForeignBlockOpeningFields = {
+		block = foreign_block_id_at_row(builder.foreign_blocks.length()),
+		module = module,
+		arguments_first = builder.foreign_arguments.length(),
+		start = start
+	}
+	into_opaque ForeignBlockOpening(fields)
+
+
+---
+The id the opened block has: its functions name it before its row exists.
+---
+pure func opened_foreign_block(opening: ForeignBlockOpening) -> ForeignBlockId:
+	from_opaque ForeignBlockOpening(opening).block
+
+
+---
+Appends the row of `opening`'s block: its arguments are the rows appended to
+`foreign_arguments` since it opened, and it spans from its start to `end`.
+---
+pure func close_foreign_block(
+	builder: DiscoveryBuilder,
+	opening: ForeignBlockOpening,
+	end: Span,
 ) -> DiscoveryBuilder:
-	index: Int = block.foreign_block_id_index()
-	{ builder | foreign_blocks = builder.foreign_blocks.set(index, row) }
+	fields: ForeignBlockOpeningFields = from_opaque ForeignBlockOpening(opening)
+	arguments_count: Int = block_count_closing_in_turn(
+		builder.foreign_arguments.length(),
+		fields.arguments_first,
+		builder.foreign_blocks.length(),
+		fields.block.foreign_block_id_index(),
+	)
+	row: ForeignBlockRow = {
+		module = fields.module,
+		arguments = {
+			first = fields.arguments_first,
+			count = arguments_count
+		},
+		span = fields.start.span_covering(end)
+	}
+	{ builder | foreign_blocks = builder.foreign_blocks.append(row) }
 
 
 pure func append_foreign_argument(

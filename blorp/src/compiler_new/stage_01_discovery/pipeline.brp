@@ -37,15 +37,13 @@ import:
 		enqueue_imports_of_loaded_module,
 		next_pending_import,
 		reach_of,
-		record_implicit_request,
 		record_module_package,
-		record_root_request,
 		record_target,
 		report_failure,
 		resolve_implicit,
 		resolve_import,
 		resolve_root,
-	sources/source_admission: admit_source, interned_path_id
+	sources/source_admission: admit_source, intern_path, interned_path_id
 	sources/source_provider:
 		RootRequest,
 		SourceCandidate,
@@ -55,17 +53,17 @@ import:
 		user_root,
 	tables/builder:
 		DiscoveryBuilder,
-		append_module,
-		close_module_row,
+		ModuleOpening,
+		begin_module_parse,
+		close_module,
 		empty_discovery_builder,
-		module_row_start,
-		next_implicit_request_id,
 		next_module_id,
-		next_root_id,
+		open_module,
+		opened_module,
+		opened_source,
 	tables/frontend_tables: FreezeOutcome, freeze
-	tables/ids: ImplicitRequestId, ModuleId, PathId, RootId
+	tables/ids: ModuleId, PathId
 	tables/row_kinds: ModuleReach
-	tables/rows: ModuleRow
 
 
 ---
@@ -144,21 +142,21 @@ func discover_placed_roots[Provider:SourceProvider](
 	var queue: ImportQueue = empty_import_queue()
 
 	for root_request in roots:
-		root: RootId = builder.next_root_id()
-		builder = builder.record_root_request(root_request.path)
+		request_path: PathId = builder.interned_path_id(root_request.path)
+		builder = builder.intern_path(root_request.path)
 		(listed, resolution) = provider.resolve_root(builder, listings, root_request)
 		listings = listed
 		loaded: ModuleId = builder.next_module_id()
-		builder = builder.settle_request(RequestedByRoot(root), loaded, resolution)
+		builder = builder.settle_request(RequestedByRoot(request_path), loaded, resolution)
 		queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
 
 	for module_name in implicit.module_names:
-		request: ImplicitRequestId = builder.next_implicit_request_id()
-		builder = builder.record_implicit_request(module_name)
+		request_path: PathId = builder.interned_path_id(module_name)
+		builder = builder.intern_path(module_name)
 		(listed, resolution) = provider.resolve_implicit(lookup, builder, listings, module_name)
 		listings = listed
 		loaded: ModuleId = builder.next_module_id()
-		builder = builder.settle_request(RequestedImplicitly(request), loaded, resolution)
+		builder = builder.settle_request(RequestedImplicitly(request_path), loaded, resolution)
 		queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
 
 	while True:
@@ -204,8 +202,9 @@ private pure func settle_request(
 
 
 ---
-One module: admit its source, open its row, lex, parse, and close the row's
-ranges over the rows that lexing and parsing appended.
+One module: admit its source, open the module, lex, parse, and close it, which
+appends the module's row with its blocks ended over the rows that lexing and
+parsing appended.
 ---
 pure func load_module(
 	builder: DiscoveryBuilder,
@@ -213,17 +212,17 @@ pure func load_module(
 	reach: ModuleReach,
 	text: String,
 ) -> DiscoveryBuilder:
-	module: ModuleId = builder.next_module_id()
 	canonical_path: PathId = builder.interned_path_id(candidate.path)
-	opening: ModuleRow = builder.module_row_start(
+	admitted: DiscoveryBuilder = builder.admit_source(candidate.path, text)
+	opening: ModuleOpening = admitted.open_module(
 		canonical_path,
 		candidate.placement.origin_kind(),
 		reach,
 	)
-	builder
-		.admit_source(candidate.path, text)
-		.append_module(opening)
+	module: ModuleId = opening.opened_module()
+	admitted
 		.record_module_package(module, candidate.placement)
-		.lex_source(opening.source)
+		.begin_module_parse(opening)
+		.lex_source(opening.opened_source())
 		.parse_module_declarations(module)
-		.close_module_row(module, opening)
+		.close_module(opening)

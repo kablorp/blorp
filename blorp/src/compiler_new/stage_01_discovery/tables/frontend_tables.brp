@@ -9,6 +9,7 @@
 -- row, which no id read from frozen tables reaches.
 import:
 	builder: DiscoveryBuilder, report_unreachable_lookup
+	diagnostic_code: ImplicitDiagnostic, RootDiagnostic
 	discovery_tables: DiscoveryTables
 	ids:
 		BoundId,
@@ -69,7 +70,7 @@ import:
 		ForeignBindingRow,
 		ForeignBlockRow,
 		ForeignCNameRow,
-		ImplicitDiagnosticRow,
+		ImplicitOutcome(ImplicitLoaded, ImplicitRejected),
 		ImplicitRequestRow,
 		ImportAliasRow,
 		ImportBlockRow,
@@ -88,7 +89,7 @@ import:
 		ParameterTypeRow,
 		ResolutionDiagnosticRow,
 		ResourceCleanupRow,
-		RootDiagnosticRow,
+		RootOutcome(RootLoaded, RootRejected),
 		RootRow,
 		RowRange,
 		SignatureRow,
@@ -145,11 +146,7 @@ private pure func sealed_tables(builder: DiscoveryBuilder) -> DiscoveryTables:
 		modules = builder.modules,
 		module_packages = builder.module_packages,
 		roots = builder.roots,
-		root_targets = builder.root_targets,
-		root_diagnostics = builder.root_diagnostics,
 		implicit_requests = builder.implicit_requests,
-		implicit_targets = builder.implicit_targets,
-		implicit_diagnostics = builder.implicit_diagnostics,
 		imports = builder.imports,
 		import_path_parts = builder.import_path_parts,
 		import_items = builder.import_items,
@@ -253,12 +250,18 @@ private UNREACHABLE_SOURCE_ROW: SourceRow = {
 ---
 The root row returned for a root id the tables did not issue.
 ---
-private UNREACHABLE_ROOT_ROW: RootRow = {request_path = path_id_at_row(0)}
+private UNREACHABLE_ROOT_ROW: RootRow = {
+	request_path = path_id_at_row(0),
+	outcome = RootLoaded(module_id_at_row(0))
+}
 
 ---
 The implicit request row returned for a request id the tables did not issue.
 ---
-private UNREACHABLE_IMPLICIT_REQUEST_ROW: ImplicitRequestRow = {request_path = path_id_at_row(0)}
+private UNREACHABLE_IMPLICIT_REQUEST_ROW: ImplicitRequestRow = {
+	request_path = path_id_at_row(0),
+	outcome = ImplicitLoaded(module_id_at_row(0))
+}
 
 ---
 Why a row accessor's miss cannot happen: the id came from the frozen tables.
@@ -303,20 +306,12 @@ pure func implicit_request_count(tables: FrontendTables) -> Int:
 	tables.tables_of().implicit_requests.length()
 
 
-pure func implicit_diagnostic_count(tables: FrontendTables) -> Int:
-	tables.tables_of().implicit_diagnostics.length()
-
-
 pure func import_count(tables: FrontendTables) -> Int:
 	tables.tables_of().imports.length()
 
 
 pure func diagnostic_count(tables: FrontendTables) -> Int:
 	tables.tables_of().diagnostics.length()
-
-
-pure func root_diagnostic_count(tables: FrontendTables) -> Int:
-	tables.tables_of().root_diagnostics.length()
 
 
 -- Rows by id.
@@ -408,26 +403,34 @@ The module implicit request `request` loaded or found already loaded, or
 `None` when it loaded none.
 ---
 pure func implicit_target(tables: FrontendTables, request: ImplicitRequestId) -> Option[ModuleId]:
-	builder: DiscoveryTables = tables.tables_of()
-	row: Int = owner_row(
-		builder.implicit_targets.length(),
-		request.implicit_request_id_index(),
-		pure func(index): builder.implicit_target_owner(index),
-	)
-
-	match builder.implicit_targets.get(row):
-		Some(target):
-			Some(target.target)
+	match tables.tables_of().implicit_requests.get(request.implicit_request_id_index()):
+		Some(row):
+			match row.outcome:
+				ImplicitLoaded(module):
+					Some(module)
+				ImplicitRejected(_):
+					None
 		None:
 			None
 
 
-private pure func implicit_target_owner(builder: DiscoveryTables, row: Int) -> Int:
-	match builder.implicit_targets.get(row):
-		Some(target):
-			target.request.implicit_request_id_index()
+---
+Why implicit module request `request` loaded no module, or `None` when it loaded
+one.
+---
+pure func implicit_rejection(
+	tables: FrontendTables,
+	request: ImplicitRequestId,
+) -> Option[ImplicitDiagnostic]:
+	match tables.tables_of().implicit_requests.get(request.implicit_request_id_index()):
+		Some(row):
+			match row.outcome:
+				ImplicitLoaded(_):
+					None
+				ImplicitRejected(diagnostic):
+					Some(diagnostic)
 		None:
-			NO_OWNER_ROW
+			None
 
 
 ---
@@ -896,26 +899,45 @@ private pure func import_target_owner(builder: DiscoveryTables, row: Int) -> Int
 The module root `root` loaded, or `None` when it loaded none.
 ---
 pure func root_target(tables: FrontendTables, root: RootId) -> Option[ModuleId]:
-	builder: DiscoveryTables = tables.tables_of()
-	row: Int = owner_row(
-		builder.root_targets.length(),
-		root.root_id_index(),
-		pure func(index): builder.root_target_owner(index),
-	)
-
-	match builder.root_targets.get(row):
-		Some(target):
-			Some(target.target)
+	match tables.tables_of().roots.get(root.root_id_index()):
+		Some(row):
+			match row.outcome:
+				RootLoaded(module):
+					Some(module)
+				RootRejected(_):
+					None
 		None:
 			None
 
 
-private pure func root_target_owner(builder: DiscoveryTables, row: Int) -> Int:
-	match builder.root_targets.get(row):
-		Some(target):
-			target.root.root_id_index()
+---
+How many roots loaded no module.
+---
+pure func rejected_root_count(tables: FrontendTables) -> Int:
+	tables.tables_of().roots.count(pure func(row): row.outcome.is_rejected_root())
+
+
+private pure func is_rejected_root(outcome: RootOutcome) -> Bool:
+	match outcome:
+		RootLoaded(_):
+			False
+		RootRejected(_):
+			True
+
+
+---
+Why root `root` loaded no module, or `None` when it loaded one.
+---
+pure func root_rejection(tables: FrontendTables, root: RootId) -> Option[RootDiagnostic]:
+	match tables.tables_of().roots.get(root.root_id_index()):
+		Some(row):
+			match row.outcome:
+				RootLoaded(_):
+					None
+				RootRejected(diagnostic):
+					Some(diagnostic)
 		None:
-			NO_OWNER_ROW
+			None
 
 
 -- Import details.
@@ -1091,18 +1113,6 @@ private pure func owner_row(
 		NO_OWNER_ROW
 
 
--- Diagnostics.
-pure func root_diagnostic_row_at(tables: FrontendTables, index: Int) -> Option[RootDiagnosticRow]:
-	tables.tables_of().root_diagnostics.get(index)
-
-
-pure func implicit_diagnostic_row_at(
-	tables: FrontendTables,
-	index: Int,
-) -> Option[ImplicitDiagnosticRow]:
-	tables.tables_of().implicit_diagnostics.get(index)
-
-
 ---
 Row counts of every table, by table name, for dumps and measurements.
 ---
@@ -1117,11 +1127,7 @@ pure func table_row_counts(tables: FrontendTables) -> List[(String, Int)]:
 		("modules", builder.modules.length()),
 		("module_packages", builder.module_packages.length()),
 		("roots", builder.roots.length()),
-		("root_targets", builder.root_targets.length()),
-		("root_diagnostics", builder.root_diagnostics.length()),
 		("implicit_requests", builder.implicit_requests.length()),
-		("implicit_targets", builder.implicit_targets.length()),
-		("implicit_diagnostics", builder.implicit_diagnostics.length()),
 		("imports", builder.imports.length()),
 		("import_path_parts", builder.import_path_parts.length()),
 		("import_items", builder.import_items.length()),

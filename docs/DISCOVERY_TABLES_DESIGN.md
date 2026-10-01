@@ -191,21 +191,47 @@ struct ModuleRow {
 
 struct ModulePackageRow {module: ModuleId, package: PackageId}
 
-struct RootRow {request_path: PathId}
-struct RootTargetRow {root: RootId, target: ModuleId}
-record RootDiagnosticRow {root: RootId, diagnostic: RootDiagnostic}
+union RootOutcome:
+	RootLoaded(ModuleId)
+	RootRejected(RootDiagnostic)
 
-struct ImplicitRequestRow {request_path: PathId}
-struct ImplicitTargetRow {request: ImplicitRequestId, target: ModuleId}
-record ImplicitDiagnosticRow {request: ImplicitRequestId, diagnostic: ImplicitDiagnostic}
+union ImplicitOutcome:
+	ImplicitLoaded(ModuleId)
+	ImplicitRejected(ImplicitDiagnostic)
+
+-- Records, not structs: a struct field cannot hold a union yet.
+record RootRow {request_path: PathId, outcome: RootOutcome}
+record ImplicitRequestRow {request_path: PathId, outcome: ImplicitOutcome}
 ```
 
 `ModuleReach` replaces the sketch's `is_root: Bool`. Each module's rows in
 the definitions, imports, nodes and diagnostics tables are contiguous blocks,
-closed when its parse ends. Every root has exactly one outcome: a
-`RootTargetRow` or a `RootDiagnosticRow`. The implicit module requests (section
-6) are a table of their own, not roots, with the same one-outcome rule
-(`ImplicitTargetRow` or `ImplicitDiagnosticRow`).
+closed when its parse ends. Every root has exactly one outcome, held in its
+own row (`RootLoaded` or `RootRejected`) and appended once, when the request is settled,
+so a root cannot have both or neither. The implicit module requests (section 6)
+are a table of their own, not roots, with the same row shape.
+
+Rows with a block of children (a module, an import, an import item, a foreign
+block) are likewise appended once, at close, from an opaque opening that holds
+what was known at the start; a definition is appended when its name is read,
+because its members name it, and its close changes only its span. Blorp has no
+linear types, so closing an opening once is the caller's obligation, checked in
+debug builds.
+
+Known debt in this shape, until a call can return `(builder, id)`: ids are
+read from table lengths before the row exists (`next_definition_id` in the
+local-function and impl-method parsers, `next_module_id` in the pipeline, and
+`*_id_at_row(length())` in each opening). Accessors that miss return an
+`UNREACHABLE_*` row, which for a root or implicit request invents
+`Loaded(module 0)`.
+
+Two more entries:
+
+- `module_being_parsed: Option[ModuleId]` is transient parse state. Its `None`
+  is unreachable, and `parsed_module` falls back to module 0 after reporting
+  the miss. It is to be replaced when the module id travels in parse state.
+- One close per opening is a caller obligation, checked only in debug builds,
+  because Blorp has no linear types.
 
 ### Imports
 
@@ -477,7 +503,8 @@ rejected with `InterpolatedStringPatternDiagnostic`.
 ```blorp
 record SyntaxDiagnosticRow {span: Span, diagnostic: SyntaxDiagnostic}
 record ResolutionDiagnosticRow {span: Span, diagnostic: ResolutionDiagnostic}
--- RootDiagnosticRow and ImplicitDiagnosticRow: see the request tables above.
+-- A root's or implicit request's diagnostic is in its row's outcome: see the
+-- request tables above.
 
 union SyntaxDiagnostic:
 	Plain(PlainSyntaxCode)
@@ -528,8 +555,8 @@ byte the lexer saw (it is whatever the lexer put there).
 record RenderedDiagnostic {message: String, help: Option[String]}
 pure func render_diagnostic(tables: FrontendTables, row: SyntaxDiagnosticRow) -> RenderedDiagnostic
 pure func render_resolution_diagnostic(tables: FrontendTables, row: ResolutionDiagnosticRow) -> RenderedDiagnostic
-pure func render_root_diagnostic(tables: FrontendTables, row: RootDiagnosticRow) -> RenderedDiagnostic
-pure func render_implicit_diagnostic(tables: FrontendTables, row: ImplicitDiagnosticRow) -> RenderedDiagnostic
+pure func render_root_diagnostic(tables: FrontendTables, root: RootId, diagnostic: RootDiagnostic) -> RenderedDiagnostic
+pure func render_implicit_diagnostic(tables: FrontendTables, request: ImplicitRequestId, diagnostic: ImplicitDiagnostic) -> RenderedDiagnostic
 pure func diagnostic_display(tables: FrontendTables, row: SyntaxDiagnosticRow) -> String
 pure func resolution_diagnostic_display(tables: FrontendTables, row: ResolutionDiagnosticRow) -> String
 ```
@@ -847,10 +874,10 @@ resolves the request: `resolve_root` or `resolve_import` looks its candidates
 up through the provider and answers with a `RequestResolution` (load this
 source, reuse the module already loaded from that path, or why nothing can
 be loaded). `pipeline.brp` carries the answer out: `load_module` admits the
-source, opens the module's row, lexes, parses its declarations and closes the
-row's ranges over the rows that were appended, then `record_target` or
+source, opens the module, lexes, parses its declarations and closes it (the
+row, with its ranges, is appended then), then `record_target` or
 `report_failure` records the outcome against the root or import. Each root
-gets a target or a root diagnostic (`UnresolvedRootDiagnostic`,
+is appended with a target or a rejection (`UnresolvedRootDiagnostic`,
 `UnreadableSourceDiagnostic`); each import a target or an
 `UnresolvedImportDiagnostic` resolution row. Discovery always goes on.
 
@@ -959,8 +986,6 @@ The invariants, by violation kind:
 
 - `DanglingReference`, `RangeOutOfBounds`: every stored id names an
   existing row of the right table; every range lies inside its table.
-- `ModuleRangesOverlap`: each module's blocks are disjoint from other
-  modules'.
 - `NodeChildNotBeforeParent`: every child was appended before its parent.
 - `UnreferencedNode`, `NodeReferencedTwice`: every node is exactly one
   node's child or one row's root (body, parameter or definition type,
@@ -973,11 +998,8 @@ The invariants, by violation kind:
 - `LocalFunctionNodeMismatch`: a `LocalFunctionNode` names a local
   function definition.
 - `BodyRootOutsideModule`: a body's root lies in its module's node block.
-- `DuplicateSideRow`: at most one import target, import alias, root target,
-  module package, definition type, body, bound qualifier or supertrait
+- `DuplicateSideRow`: at most one import target, import alias, module package, definition type, body, bound qualifier or supertrait
   qualifier per owner.
-- `RootOutcomeMismatch`: each root has exactly one of a target and a root
-  diagnostic.
 - `SignatureCountMismatch`: exactly one signature per function-like
   definition and none for others.
 - `SideTableUnsorted`: side tables read by owner are strictly sorted by
@@ -1070,7 +1092,8 @@ its path without `.brp` (relative requests and user code), an implicit module
 its request's name; origins come from the module's origin and package row, and
 an embedded standard-library module's path is spelled `<embedded:name>`.
 The adapter relies on a stage guarantee: import rows are in load order (module
-by module, source order within a module, `ModuleRangesOverlap`), so the first
+by module, source order within a module; `close_module` ends each module's
+blocks where its parse left the tables), so the first
 import row that targets a module is the request that loaded it.
 `LegacyModuleNaming` carries the one thing the tables do not hold, the name a
 root takes, which the existing front end's callers choose per command: a

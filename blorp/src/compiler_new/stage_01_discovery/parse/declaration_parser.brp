@@ -8,11 +8,11 @@
 import:
 	../tables/builder:
 		DiscoveryBuilder,
+		ForeignBlockOpening,
 		advance_token,
 		append_definition_type,
 		append_foreign_argument,
 		append_foreign_binding,
-		append_foreign_block,
 		append_foreign_c_name,
 		append_import_block,
 		append_member,
@@ -22,12 +22,13 @@ import:
 		append_resource_cleanup,
 		append_syntax_diagnostic,
 		append_variant_payload,
+		close_foreign_block,
 		move_token_cursor,
 		next_definition_id,
-		next_foreign_block_id,
+		open_foreign_block,
+		opened_foreign_block,
 		pending_annotation_count,
 		pending_docstring_count,
-		replace_foreign_block_row,
 	../tables/diagnostic_code:
 		PlainSyntaxCode(
 			UnionVariantTooManyFieldsDiagnostic, AnnotationWithoutFunctionDiagnostic,
@@ -109,10 +110,13 @@ import:
 	body_parser: parse_function, parse_function_body, parse_global_value
 	declaration_header:
 		DeclarationHeader,
+		DefinitionOpening,
 		annotations_since,
 		close_definition,
 		consume_annotations,
+		definition_opening,
 		open_definition,
+		opened_definition,
 		plain_header,
 	function_parser: parse_signature
 	import_parser: parse_import_block
@@ -409,12 +413,12 @@ private pure func parse_global(
 	header: DeclarationHeader,
 	kind: DefinitionKind,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
 	name_span: Span = builder.current_span()
 	name: NameId = builder.binder_name_at_cursor()
-	var out: DiscoveryBuilder = builder
-		.consume_binder_name(NameInVariableName)
-		.open_definition(header, kind, name, name_span)
+	var out: DiscoveryBuilder = builder.consume_binder_name(NameInVariableName)
+	opening: DefinitionOpening = out.definition_opening(header, kind, name, name_span)
+	out = out.open_definition(opening)
+	definition: DefinitionId = opening.opened_definition()
 
 	if out.at(ColonSymbol):
 		out = out.advance_token()
@@ -430,7 +434,7 @@ private pure func parse_global(
 	out = out.expect_equal(EqualInTopLevelVariable)
 	out = out.parse_global_value(definition, header.start)
 	end: Span = out.node_span(out.last_node_id())
-	out.close_definition(definition, header, kind, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 -- Records and structs.
@@ -442,14 +446,15 @@ private pure func parse_record(
 	header: DeclarationHeader,
 	kind: DefinitionKind,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
 	out = out.consume_declared_name(NameInTypeName)
-	out = out.open_definition(header, kind, name, name_span)
+	opening: DefinitionOpening = out.definition_opening(header, kind, name, name_span)
+	out = out.open_definition(opening)
+	definition: DefinitionId = opening.opened_definition()
 
-	opening: LeftBraceConstruct = if kind == RecordDefinition:
+	left_brace: LeftBraceConstruct = if kind == RecordDefinition:
 		LeftBraceInRecordFields
 	else:
 		LeftBraceInStructFields
@@ -462,7 +467,7 @@ private pure func parse_record(
 	if kind == RecordDefinition:
 		out = out.parse_type_parameters(definition)
 
-	out = out.expect_left_brace(opening)
+	out = out.expect_left_brace(left_brace)
 	var ordinal: Int = 0
 
 	if not out.at(RightBraceSymbol):
@@ -482,7 +487,7 @@ private pure func parse_record(
 
 	end: Span = out.current_span()
 	out = out.expect_right_brace(closing)
-	out.close_definition(definition, header, kind, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 private pure func parse_field(
@@ -491,13 +496,19 @@ private pure func parse_field(
 	owner: DefinitionId,
 	ordinal: Int,
 ) -> DiscoveryBuilder:
-	field: DefinitionId = builder.next_definition_id()
 	name: NameId = builder.declared_name_at_cursor()
 	name_span: Span = builder.current_span()
 	header: DeclarationHeader = module.plain_header(name_span, builder.pending_annotation_count())
+	opening: DefinitionOpening = builder.definition_opening(
+		header,
+		FieldDefinition,
+		name,
+		name_span,
+	)
+	field: DefinitionId = opening.opened_definition()
 	var out: DiscoveryBuilder = builder
 		.consume_declared_name(NameInFieldName)
-		.open_definition(header, FieldDefinition, name, name_span)
+		.open_definition(opening)
 		.append_member({
 			definition = field,
 			owner = owner,
@@ -511,7 +522,7 @@ private pure func parse_field(
 		type_root = field_type,
 	})
 	end: Span = out.node_span(field_type)
-	out.close_definition(field, header, FieldDefinition, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 -- Unions and enums.
@@ -523,12 +534,13 @@ private pure func parse_union(
 	header: DeclarationHeader,
 	kind: DefinitionKind,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
 	out = out.consume_declared_name(NameInTypeName)
-	out = out.open_definition(header, kind, name, name_span)
+	opening: DefinitionOpening = out.definition_opening(header, kind, name, name_span)
+	out = out.open_definition(opening)
+	definition: DefinitionId = opening.opened_definition()
 
 	if kind == UnionDefinition:
 		out = out.parse_type_parameters(definition)
@@ -555,7 +567,7 @@ private pure func parse_union(
 
 	-- A dedent is missing here only after an earlier diagnostic has reported it.
 	out = out.skip_optional_token(DedentToken)
-	out.close_definition(definition, header, kind, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 ---
@@ -577,13 +589,19 @@ private pure func parse_variant(
 	owner: DefinitionId,
 	ordinal: Int,
 ) -> DiscoveryBuilder:
-	variant: DefinitionId = builder.next_definition_id()
 	name_span: Span = builder.current_span()
 	name: NameId = builder.declared_name_at_cursor()
 	header: DeclarationHeader = module.plain_header(name_span, builder.pending_annotation_count())
+	opening: DefinitionOpening = builder.definition_opening(
+		header,
+		VariantDefinition,
+		name,
+		name_span,
+	)
+	variant: DefinitionId = opening.opened_definition()
 	var out: DiscoveryBuilder = builder
 		.consume_variant_name()
-		.open_definition(header, VariantDefinition, name, name_span)
+		.open_definition(opening)
 		.append_member({
 			definition = variant,
 			owner = owner,
@@ -629,7 +647,7 @@ private pure func parse_variant(
 		else:
 			out = out.report_expected(ExpectedRightParen(RightParenInVariantFields))
 
-	out.close_definition(variant, header, VariantDefinition, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 -- Builtin types and aliases.
@@ -642,7 +660,6 @@ private pure func parse_builtin_type(
 	header: DeclarationHeader,
 	kind: DefinitionKind,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
 	var out: DiscoveryBuilder = builder.expect_keyword_token(
 		TypeKeyword,
 		KeywordInBuiltinTypeDeclaration,
@@ -650,7 +667,9 @@ private pure func parse_builtin_type(
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
 	out = out.consume_declared_name(NameInTypeName)
-	out = out.open_definition(header, kind, name, name_span)
+	opening: DefinitionOpening = out.definition_opening(header, kind, name, name_span)
+	out = out.open_definition(opening)
+	definition: DefinitionId = opening.opened_definition()
 	out = out.parse_type_parameters(definition)
 	out = out.expect_equal(EqualInBuiltinTypeMarker)
 	var end: Span = out.current_span()
@@ -694,7 +713,7 @@ private pure func parse_builtin_type(
 			if out.at(RightParenSymbol):
 				out = out.advance_token()
 
-	out.close_definition(definition, header, kind, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 ---
@@ -721,8 +740,6 @@ private pure func parse_type_alias(
 	kind: DefinitionKind,
 	second_keyword: TokenKind,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
-
 	second_construct: KeywordConstruct = if second_keyword == AliasKeyword:
 		KeywordInTypeAliasKeyword
 	else:
@@ -731,9 +748,11 @@ private pure func parse_type_alias(
 	var out: DiscoveryBuilder = builder.expect_keyword_token(second_keyword, second_construct)
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
+	out = out.consume_declared_name(NameInTypeAliasName)
+	opening: DefinitionOpening = out.definition_opening(header, kind, name, name_span)
+	definition: DefinitionId = opening.opened_definition()
 	out = out
-		.consume_declared_name(NameInTypeAliasName)
-		.open_definition(header, kind, name, name_span)
+		.open_definition(opening)
 		.parse_type_parameters(definition)
 		.expect_equal(EqualInTypeAliasTarget)
 		.parse_type()
@@ -743,7 +762,7 @@ private pure func parse_type_alias(
 		type_root = target,
 	})
 	end: Span = out.node_span(target)
-	out.close_definition(definition, header, kind, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 -- Traits and impls.
@@ -755,12 +774,13 @@ private pure func parse_trait(
 	builder: DiscoveryBuilder,
 	header: DeclarationHeader,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: NameId = out.declared_name_at_cursor()
 	name_span: Span = out.current_span()
 	out = out.consume_declared_name(NameInTraitName)
-	out = out.open_definition(header, TraitDefinition, name, name_span)
+	opening: DefinitionOpening = out.definition_opening(header, TraitDefinition, name, name_span)
+	out = out.open_definition(opening)
+	definition: DefinitionId = opening.opened_definition()
 	out = out.parse_type_parameters(definition)
 	out = out.expect_colon(ColonInTraitName)
 	var end: Span = name_span
@@ -809,7 +829,7 @@ private pure func parse_trait(
 		-- A dedent is missing here only after an earlier diagnostic has reported it.
 		out = out.skip_optional_token(DedentToken)
 
-	out.close_definition(definition, header, TraitDefinition, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 ---
@@ -821,7 +841,6 @@ private pure func parse_trait_method(
 	owner: DefinitionId,
 	ordinal: Int,
 ) -> DiscoveryBuilder:
-	method: DefinitionId = builder.next_definition_id()
 	start: Span = builder.current_span()
 
 	purity: Purity = if builder.at(PureKeyword):
@@ -838,7 +857,14 @@ private pure func parse_trait_method(
 	header: DeclarationHeader = { module.plain_header(start, out.pending_annotation_count()) |
 		purity = purity
 	}
-	out = out.open_definition(header, TraitMethodDefinition, name, name_span)
+	opening: DefinitionOpening = out.definition_opening(
+		header,
+		TraitMethodDefinition,
+		name,
+		name_span,
+	)
+	out = out.open_definition(opening)
+	method: DefinitionId = opening.opened_definition()
 	out = out.append_member({
 		definition = method,
 		owner = owner,
@@ -864,7 +890,7 @@ private pure func parse_trait_method(
 		out = out.parse_function_body(method, start)
 		end = out.node_span(out.last_node_id())
 
-	out.close_definition(method, header, TraitMethodDefinition, name, name_span, end)
+	out.close_definition(opening, end)
 
 
 ---
@@ -874,12 +900,18 @@ private pure func parse_impl(
 	builder: DiscoveryBuilder,
 	header: DeclarationHeader,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
 	var out: DiscoveryBuilder = builder.advance_token()
 	trait_name: NameId = out.referenced_name_at_cursor()
 	trait_span: Span = out.current_span()
 	out = out.consume_referenced_name(NameInTraitName)
-	out = out.open_definition(header, ImplDefinition, trait_name, trait_span)
+	opening: DefinitionOpening = out.definition_opening(
+		header,
+		ImplDefinition,
+		trait_name,
+		trait_span,
+	)
+	out = out.open_definition(opening)
+	definition: DefinitionId = opening.opened_definition()
 	out = out.expect_keyword_token(ForKeyword, KeywordInImplementationTrait)
 	out = out.parse_type()
 	receiver: NodeId = out.last_node_id()
@@ -908,7 +940,7 @@ private pure func parse_impl(
 
 	-- A dedent is missing here only after an earlier diagnostic has reported it.
 	out = out.skip_optional_token(DedentToken)
-	out.close_definition(definition, header, ImplDefinition, trait_name, trait_span, end)
+	out.close_definition(opening, end)
 
 
 ---
@@ -998,6 +1030,9 @@ private pure func parse_foreign_block(
 	module: ModuleId,
 	start: Span,
 ) -> DiscoveryBuilder:
+	-- Read before the builder is handed on: the block opens where the `foreign`
+	-- keyword is, and the keyword appends no row.
+	opening: ForeignBlockOpening = builder.open_foreign_block(module, start)
 	var out: DiscoveryBuilder = builder.advance_token()
 
 	if out.at(PureKeyword) or out.at(FuncKeyword):
@@ -1005,23 +1040,13 @@ private pure func parse_foreign_block(
 		out = out.advance_token()
 		out
 	else:
-		block: ForeignBlockId = out.next_foreign_block_id()
-		arguments_first: Int = out.foreign_arguments.length()
-		out = out.append_foreign_block({
-			module = module,
-			arguments = {
-				first = arguments_first,
-				count = 0
-			},
-			span = start,
-		})
+		block: ForeignBlockId = opening.opened_foreign_block()
 
 		if out.at(LeftParenSymbol):
 			out = out.advance_token()
 			out = out.parse_foreign_arguments()
 			out = out.expect_right_paren(RightParenInForeignBlockArguments)
 
-		arguments_count: Int = out.foreign_arguments.length() - arguments_first
 		out = out.expect_colon(ColonInForeignHeader)
 		out = out.expect_newline(NewlineInForeignHeader)
 		out = out.expect_indent(IndentInForeignBlock)
@@ -1052,17 +1077,7 @@ private pure func parse_foreign_block(
 
 		-- A dedent is missing here only after an earlier diagnostic has reported it.
 		out = out.skip_optional_token(DedentToken)
-		out = out.replace_foreign_block_row(
-			block,
-			{
-				module = module,
-				arguments = {
-					first = arguments_first,
-					count = arguments_count
-				},
-				span = start.span_covering(end)
-			},
-		)
+		out = out.close_foreign_block(opening, end)
 		out
 
 
@@ -1133,7 +1148,6 @@ private pure func parse_foreign_function(
 	module: ModuleId,
 	block: ForeignBlockId,
 ) -> DiscoveryBuilder:
-	definition: DefinitionId = builder.next_definition_id()
 	start: Span = builder.current_span()
 
 	visibility: Visibility = if builder.at(PrivateKeyword):
@@ -1161,7 +1175,14 @@ private pure func parse_foreign_function(
 		purity = purity,
 		annotations = annotations
 	}
-	out = out.open_definition(header, ForeignFunctionDefinition, name, name_span)
+	opening: DefinitionOpening = out.definition_opening(
+		header,
+		ForeignFunctionDefinition,
+		name,
+		name_span,
+	)
+	out = out.open_definition(opening)
+	definition: DefinitionId = opening.opened_definition()
 	out = out.append_foreign_binding({
 		definition = definition,
 		block = block,
@@ -1198,4 +1219,4 @@ private pure func parse_foreign_function(
 			None:
 				out = out.report_and_recover(ExpectedForeignCNameDiagnostic)
 
-	out.close_definition(definition, header, ForeignFunctionDefinition, name, name_span, end)
+	out.close_definition(opening, end)

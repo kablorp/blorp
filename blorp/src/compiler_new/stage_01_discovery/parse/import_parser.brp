@@ -4,20 +4,22 @@ import:
 	../sources/source_admission: intern_path, interned_path_id
 	../tables/builder:
 		DiscoveryBuilder,
+		ImportItemOpening,
+		ImportOpening,
 		advance_token,
-		append_import,
 		append_import_alias,
-		append_import_item,
 		append_import_item_alias,
 		append_import_item_variant,
 		append_import_path_part,
+		close_import,
+		close_import_item,
 		move_token_cursor,
-		next_import_id,
-		next_import_item_id,
 		next_import_item_variant_row,
 		next_import_path_part_row,
-		replace_import_item_row,
-		replace_import_row,
+		open_import,
+		open_import_item,
+		opened_import,
+		opened_import_item,
 	../tables/diagnostic_code:
 		PlainSyntaxCode(
 			ExpectedAliasNameDiagnostic, ExpectedClosingParenAfterConstructorsDiagnostic,
@@ -30,7 +32,6 @@ import:
 	../tables/ids: ImportId, ImportItemId, ModuleId, PathId
 	../tables/row_kinds:
 		ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest),
-	../tables/rows: EMPTY_ROW_RANGE
 	../tables/span: Span, span_covering, span_end, span_source_index, span_start
 	../tables/token:
 		Token,
@@ -204,31 +205,33 @@ private pure func parse_import_item_with_path(
 	builder: DiscoveryBuilder,
 	module: ModuleId,
 ) -> DiscoveryBuilder:
-	import_id: ImportId = builder.next_import_id()
 	request_kind: ImportRequestKind = builder.request_kind_at()
 	path_start: Span = builder.current_span()
 	path_first_token: Int = builder.token_cursor
 	parent_steps: Int = builder.leading_parent_steps()
-	parts_first: Int = builder.next_import_path_part_row()
-	var out: DiscoveryBuilder = builder.parse_module_path()
-	parts_count: Int = out.next_import_path_part_row() - parts_first
-	path_span: Span = path_start.span_covering(out.previous_span())
-	path_text: String = out.token_text_since(path_first_token)
-	request_path: PathId = out.interned_path_id(path_text)
-	out = out.intern_path(path_text)
-	out = out.append_import({
-		importer = module,
-		request_kind = request_kind,
-		request_path = request_path,
-		parent_steps = parent_steps,
-		path_parts = {
-			first = parts_first,
-			count = parts_count
-		},
-		items = EMPTY_ROW_RANGE,
-		path_span = path_span,
-		span = path_start,
-	})
+	opening: ImportOpening = builder.open_import(module, request_kind, parent_steps, path_start)
+	parsed: DiscoveryBuilder = builder.parse_module_path()
+	path_span: Span = path_start.span_covering(parsed.previous_span())
+	path_text: String = parsed.token_text_since(path_first_token)
+	request_path: PathId = parsed.interned_path_id(path_text)
+	interned: DiscoveryBuilder = parsed.intern_path(path_text)
+	interned.parse_import_alias_and_items(opening, request_path, path_span)
+
+
+---
+The rest of an import after its path: an optional `as` alias, then optional
+selected symbols on the same line or in an indented block, and the close of
+its row. A routine of its own so the builder is a parameter, not a variable
+reassigned under branches next to the opening that was read from it.
+---
+private pure func parse_import_alias_and_items(
+	builder: DiscoveryBuilder,
+	opening: ImportOpening,
+	request_path: PathId,
+	path_span: Span,
+) -> DiscoveryBuilder:
+	import_id: ImportId = opening.opened_import()
+	var out: DiscoveryBuilder = builder
 
 	var end_span: Span = path_span
 
@@ -274,26 +277,7 @@ private pure func parse_import_item_with_path(
 			None:
 				void
 
-	item_span: Span = path_start.span_covering(end_span)
-	out.replace_import_row(
-		import_id,
-		{
-			importer = module,
-			request_kind = request_kind,
-			request_path = request_path,
-			parent_steps = parent_steps,
-			path_parts = {
-				first = parts_first,
-				count = parts_count
-			},
-			items = {
-				first = items_first,
-				count = items_count
-			},
-			path_span = path_span,
-			span = item_span
-		},
-	)
+	out.close_import(opening, request_path, path_span, end_span)
 
 
 ---
@@ -463,26 +447,17 @@ One selected symbol: a name, optionally `name(Constructor, ...)`, optionally
 `as alias`.
 ---
 pure func parse_import_symbol(builder: DiscoveryBuilder, import_id: ImportId) -> DiscoveryBuilder:
-	item: ImportItemId = builder.next_import_item_id()
 	start: Span = builder.current_span()
 
 	match builder.current_name():
 		Some(name):
+			opening: ImportItemOpening = builder.open_import_item(import_id, name, start)
+			item: ImportItemId = opening.opened_import_item()
 			var out: DiscoveryBuilder = builder.advance_token()
-			out = out.append_import_item({
-				owner_import = import_id,
-				name = name,
-				variants = EMPTY_ROW_RANGE,
-				name_span = start,
-				span = start,
-			})
-			variants_first: Int = out.next_import_item_variant_row()
 
 			if out.current_kind() == LeftParenSymbol:
 				out = out.advance_token()
 				out = out.parse_import_constructors(item)
-
-			variants_count: Int = out.next_import_item_variant_row() - variants_first
 
 			if out.current_kind() == AsKeyword:
 				out = out.advance_token()
@@ -499,21 +474,8 @@ pure func parse_import_symbol(builder: DiscoveryBuilder, import_id: ImportId) ->
 					None:
 						out = out.report_missing_alias()
 
-			item_span: Span = start.span_covering(out.previous_span())
-			out = out.replace_import_item_row(
-				item,
-				{
-					owner_import = import_id,
-					name = name,
-					variants = {
-						first = variants_first,
-						count = variants_count
-					},
-					name_span = start,
-					span = item_span
-				},
-			)
-			out
+			item_end: Span = out.previous_span()
+			out.close_import_item(opening, item_end)
 		None:
 			builder.report_at_current(ExpectedImportSymbolDiagnostic)
 

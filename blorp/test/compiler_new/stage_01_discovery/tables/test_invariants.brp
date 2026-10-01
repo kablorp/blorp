@@ -2,34 +2,37 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
 	../../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DiscoveryBuilder,
+		ImportOpening,
+		ModuleOpening,
 		append_bound,
 		append_bound_qualifier,
 		append_definition,
-		append_resolution_diagnostic_at,
-		append_syntax_diagnostic,
 		append_implicit_request,
-		append_import,
-		append_module,
 		append_literal,
 		append_name,
 		append_path,
 		append_plain_diagnostic,
+		append_resolution_diagnostic_at,
 		append_root,
-		append_root_target,
 		append_signature,
 		append_source,
 		append_supertrait,
 		append_supertrait_qualifier,
+		append_syntax_diagnostic,
 		append_token,
+		close_import,
+		close_module,
 		empty_discovery_builder,
 		next_definition_id,
 		next_module_id,
 		next_name_id,
 		next_path_id,
-		next_source_id,
-		replace_module_row,
+		open_import,
+		open_module,
+		opened_module,
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
 		ResolutionDiagnostic(ImportCaseMismatch, UnresolvedImport),
+		RootDiagnostic(RootCaseMismatch),
 		SyntaxDiagnostic(ExpectedToken, IntegerLiteralOverflow, UnknownAnnotation),
 	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
 		ColonConstruct(ColonInIfCondition),
@@ -56,10 +59,10 @@ import:
 		definition_id_at_row,
 		import_id_at_row,
 		literal_id_at_row,
+		module_id_at_row,
 		name_id_at_row,
 		node_id_at_row,
 		path_id_at_row,
-		root_id_at_row,
 		supertrait_id_at_row,
 	../../../../src/compiler_new/stage_01_discovery/tables/intern_index:
 		INITIAL_SLOT_COUNT,
@@ -67,19 +70,18 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/invariants/violation:
 		DiscoveryTable(
 			BodyTable, BoundQualifierTable, ConcurrencyCountTable, DefinitionTable, DiagnosticTable,
-			ResolutionDiagnosticTable,
-			DimensionNameTable, ElseKeywordTable, ImportTable, ModuleTable, NameTable,
-			NodeNameSpanTable, NodeTable, SourceTable, SupertraitQualifierTable, SupertraitTable,
+			ResolutionDiagnosticTable, DimensionNameTable, ElseKeywordTable, ImportTable,
+			ModuleTable, NameTable, NodeNameSpanTable, NodeTable, RootTable, SourceTable,
+			SupertraitQualifierTable, SupertraitTable,
 		),
 		TableInvariantKind(
 			BodyRootOutsideModule, ConcurrencyCountMismatch, DanglingReference,
-			DimensionSigilNameMissing, DuplicateSideRow, ElseKeywordMismatch,
-			ImplicitOutcomeMismatch, InternIndexMismatch, LocalFunctionNodeMismatch,
-			ModuleRangesOverlap, NameSpanOnWrongNodeKind, NameSpanOutsideItsSpan, NodeArityMismatch,
-			NodeChildNotBeforeParent, NodeNameSpanMissing, NodeReferencedTwice,
+			DimensionSigilNameMissing, DuplicateSideRow, ElseKeywordMismatch, InternIndexMismatch,
+			LocalFunctionNodeMismatch, NameSpanOnWrongNodeKind, NameSpanOutsideItsSpan,
+			NodeArityMismatch, NodeChildNotBeforeParent, NodeNameSpanMissing, NodeReferencedTwice,
 			ParallelTableMismatch, PayloadOutOfRange, QualifierOutsideReference, RangeOutOfBounds,
-			RootOutcomeMismatch, SeededNameMoved, SideTableUnsorted, SigilSpellingMismatch,
-			SignatureCountMismatch, SpanOutsideSources, SpanPastSourceEnd, UnreferencedNode,
+			SeededNameMoved, SideTableUnsorted, SigilSpellingMismatch, SignatureCountMismatch,
+			SpanOutsideSources, SpanPastSourceEnd, UnreferencedNode,
 		),
 		TableInvariantViolation,
 	../../../../src/compiler_new/stage_01_discovery/tables/invariants: check_table_invariants
@@ -118,8 +120,8 @@ import:
 		ConcurrencyCountRow,
 		EMPTY_ROW_RANGE,
 		ElseKeywordRow,
-		ModuleRow,
 		NodeNameSpanRow,
+		RootOutcome(RootLoaded, RootRejected),
 		SupertraitQualifierRow,
 	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, pack_span
 	../../../../src/compiler_new/stage_01_discovery/tables/token:
@@ -144,11 +146,13 @@ SAMPLE_SOURCE_TEXT: String = "f(x)\n"
 
 
 ---
-Appends one source and one open module over it at `path_text`.
+Appends one source over `path_text` and opens the module over it.
 ---
-pure func add_module(builder: DiscoveryBuilder, path_text: String) -> DiscoveryBuilder:
+pure func open_module_over_source(
+	builder: DiscoveryBuilder,
+	path_text: String,
+) -> (DiscoveryBuilder, ModuleOpening):
 	path: PathId = builder.next_path_id()
-	source: SourceId = builder.next_source_id()
 	var out: DiscoveryBuilder = builder.append_path(path_text)
 	out = out.append_source(
 		SAMPLE_SOURCE_TEXT,
@@ -157,17 +161,7 @@ pure func add_module(builder: DiscoveryBuilder, path_text: String) -> DiscoveryB
 			line_starts = EMPTY_ROW_RANGE
 		},
 	)
-	out = out.append_module({
-		source = source,
-		canonical_path = path,
-		origin = UserModule,
-		reach = RootModule,
-		definitions = EMPTY_ROW_RANGE,
-		imports = EMPTY_ROW_RANGE,
-		nodes = EMPTY_ROW_RANGE,
-		diagnostics = EMPTY_ROW_RANGE,
-	})
-	out
+	(out, out.open_module(path, UserModule, RootModule))
 
 
 ---
@@ -225,43 +219,17 @@ pure func add_function_with_body(builder: DiscoveryBuilder, module: ModuleId) ->
 
 
 ---
-Closes `module`'s ranges over everything appended since `row` was opened.
+A module at `path_text` holding one function whose body is `f(x)`, closed.
 ---
-pure func close_module_ranges(
+pure func add_module_with_function(
 	builder: DiscoveryBuilder,
-	module: ModuleId,
-	row: ModuleRow,
-	definitions_first: Int,
-	nodes_first: Int,
+	path_text: String,
 ) -> DiscoveryBuilder:
-	definitions_end: Int = builder.definitions.length()
-	nodes_end: Int = builder.nodes.length()
-	builder.replace_module_row(
-		module,
-		{ row |
-			definitions = {
-				first = definitions_first,
-				count = definitions_end - definitions_first
-			},
-			nodes = {
-				first = nodes_first,
-				count = nodes_end - nodes_first
-			}
-		},
-	)
-
-
-pure func open_module_row(source: SourceId, path: PathId) -> ModuleRow:
-	{
-		source = source,
-		canonical_path = path,
-		origin = UserModule,
-		reach = RootModule,
-		definitions = EMPTY_ROW_RANGE,
-		imports = EMPTY_ROW_RANGE,
-		nodes = EMPTY_ROW_RANGE,
-		diagnostics = EMPTY_ROW_RANGE
-	}
+	(opened, opening) = builder.open_module_over_source(path_text)
+	module: ModuleId = opening.opened_module()
+	opened
+		.add_function_with_body(module)
+		.close_module(opening)
 
 
 ---
@@ -269,19 +237,7 @@ One module holding one function with a three-node body: every invariant
 holds.
 ---
 pure func well_formed_builder() -> DiscoveryBuilder:
-	var builder: DiscoveryBuilder = empty_discovery_builder()
-	module: ModuleId = builder.next_module_id()
-	path: PathId = builder.next_path_id()
-	source: SourceId = builder.next_source_id()
-	builder = builder.add_module("main.brp")
-	builder = builder.add_function_with_body(module)
-	builder = builder.close_module_ranges(
-		module,
-		source.open_module_row(path),
-		0,
-		0,
-	)
-	builder
+	empty_discovery_builder().add_module_with_function("main.brp")
 
 
 pure func has_violation(
@@ -328,9 +284,9 @@ pure func test_freeze_keeps_each_text_table_in_its_own_field() -> Bool:
 				tables.literal_count(),
 				tables.source_count(),
 			]
-			distinct: Bool = counts.all(
-				pure func(count): counts.filter(pure func(other): other == count).length() == 1,
-			)
+			distinct: Bool = counts.all(pure func(count): counts
+					.filter(pure func(other): other == count)
+					.length() == 1)
 
 			(
 				distinct
@@ -365,49 +321,12 @@ pure func test_definition_naming_a_missing_module_is_a_dangling_reference() -> B
 	has_violation(builder.violations_of(), DanglingReference, DefinitionTable)
 
 
-pure func test_import_items_past_the_item_table_are_out_of_bounds() -> Bool:
-	var builder: DiscoveryBuilder = well_formed_builder()
-	path: PathId = builder.next_path_id()
-	builder = builder.append_path("heap")
-	builder = builder.append_import({
-		importer = builder.first_module_of(),
-		request_kind = BareModuleRequest,
-		request_path = path,
-		parent_steps = 0,
-		path_parts = EMPTY_ROW_RANGE,
-		items = {
-			first = 0,
-			count = 5
-		},
-		path_span = sample_span(),
-		span = sample_span(),
-	})
-	has_violation(builder.violations_of(), RangeOutOfBounds, ImportTable)
-
-
 pure func first_module_of(builder: DiscoveryBuilder) -> ModuleId:
 	match builder.definitions.get(0):
 		Some(definition):
 			definition.module
 		None:
 			builder.next_module_id()
-
-
-pure func test_overlapping_module_blocks_are_reported() -> Bool:
-	var builder: DiscoveryBuilder = well_formed_builder()
-	second: ModuleId = builder.next_module_id()
-	path: PathId = builder.next_path_id()
-	source: SourceId = builder.next_source_id()
-	builder = builder.add_module("second.brp")
-	-- Claim the first module's definition as the second module's too.
-	builder = builder.replace_module_row(
-		second,
-		{ source.open_module_row(path) | definitions = {
-				first = 0,
-				count = 1
-			} },
-	)
-	has_violation(builder.violations_of(), ModuleRangesOverlap, ModuleTable)
 
 
 pure func test_node_whose_child_is_not_appended_first_is_reported() -> Bool:
@@ -430,19 +349,7 @@ pure func test_node_whose_child_is_not_appended_first_is_reported() -> Bool:
 
 pure func test_body_root_in_another_module_is_reported() -> Bool:
 	var builder: DiscoveryBuilder = well_formed_builder()
-	second: ModuleId = builder.next_module_id()
-	path: PathId = builder.next_path_id()
-	source: SourceId = builder.next_source_id()
-	definitions_first: Int = builder.definitions.length()
-	nodes_first: Int = builder.nodes.length()
-	builder = builder.add_module("second.brp")
-	builder = builder.add_function_with_body(second)
-	builder = builder.close_module_ranges(
-		second,
-		source.open_module_row(path),
-		definitions_first,
-		nodes_first,
-	)
+	builder = builder.add_module_with_function("second.brp")
 	-- A body of the first module's function whose root is the second
 	-- module's call node.
 	root: NodeId = builder.last_node_id()
@@ -631,7 +538,11 @@ pure func test_a_node_with_a_child_count_its_kind_forbids_is_reported() -> Bool:
 	})
 	(
 		not has_violation(violations_of(well_formed_builder()), NodeArityMismatch, NodeTable)
-		and has_violation(violations_of(with_payload_node(CallNode, 0)), NodeArityMismatch, NodeTable)
+		and has_violation(
+			violations_of(with_payload_node(CallNode, 0)),
+			NodeArityMismatch,
+			NodeTable,
+		)
 		and has_violation(violations_of(with_child), NodeArityMismatch, NodeTable)
 	)
 
@@ -667,16 +578,22 @@ pure func test_second_body_for_a_definition_is_reported() -> Bool:
 	has_violation(builder.violations_of(), DuplicateSideRow, BodyTable)
 
 
-pure func test_root_without_target_or_diagnostic_is_reported() -> Bool:
+pure func test_root_loading_a_missing_module_is_a_dangling_reference() -> Bool:
 	var builder: DiscoveryBuilder = well_formed_builder()
-	builder = builder.append_root({request_path = path_id_at_row(0)})
-	has_violation(builder.violations_of(), RootOutcomeMismatch, RootTable)
+	builder = builder.append_root({
+		request_path = path_id_at_row(0),
+		outcome = RootLoaded(module_id_at_row(99)),
+	})
+	has_violation(builder.violations_of(), DanglingReference, RootTable)
 
 
-pure func test_implicit_request_without_target_or_diagnostic_is_reported() -> Bool:
+pure func test_a_rejected_root_naming_a_missing_path_is_a_dangling_reference() -> Bool:
 	var builder: DiscoveryBuilder = well_formed_builder()
-	builder = builder.append_implicit_request({request_path = path_id_at_row(0)})
-	has_violation(builder.violations_of(), ImplicitOutcomeMismatch, ImplicitRequestTable)
+	builder = builder.append_root({
+		request_path = path_id_at_row(0),
+		outcome = RootRejected(RootCaseMismatch(path_id_at_row(99))),
+	})
+	has_violation(builder.violations_of(), DanglingReference, RootTable)
 
 
 pure func test_function_without_signature_is_reported() -> Bool:
@@ -705,23 +622,6 @@ pure func test_span_past_the_end_of_its_source_is_reported() -> Bool:
 	has_violation(builder.violations_of(), SpanPastSourceEnd, DefinitionTable)
 
 
-pure func test_side_table_out_of_owner_order_is_reported() -> Bool:
-	var builder: DiscoveryBuilder = well_formed_builder()
-	module: ModuleId = builder.first_module_of()
-	builder = builder.append_root({request_path = path_id_at_row(0)})
-	builder = builder.append_root({request_path = path_id_at_row(0)})
-	-- Targets for root 1 then root 0: each root has one, out of owner order.
-	builder = builder.append_root_target({
-		root = root_id_at_row(1),
-		target = module,
-	})
-	builder = builder.append_root_target({
-		root = root_id_at_row(0),
-		target = module,
-	})
-	has_violation(builder.violations_of(), SideTableUnsorted, RootTargetTable)
-
-
 -- Diagnostic references.
 pure func with_syntax_diagnostic(diagnostic: SyntaxDiagnostic) -> DiscoveryBuilder:
 	well_formed_builder().append_syntax_diagnostic(sample_span(), diagnostic)
@@ -732,7 +632,9 @@ pure func with_resolution_diagnostic(diagnostic: ResolutionDiagnostic) -> Discov
 
 
 pure func test_a_construct_diagnostic_has_no_violation() -> Bool:
-	violations_of(with_syntax_diagnostic(ExpectedToken(ExpectedColon(ColonInIfCondition)))).is_empty()
+	violations_of(
+		with_syntax_diagnostic(ExpectedToken(ExpectedColon(ColonInIfCondition))),
+	).is_empty()
 
 
 pure func test_a_diagnostic_naming_no_name_is_reported() -> Bool:
@@ -759,7 +661,10 @@ pure func test_a_diagnostic_naming_no_stored_path_is_reported() -> Bool:
 	has_violation(
 		violations_of(
 			with_resolution_diagnostic(
-				ImportCaseMismatch(import_id_at_row(0), path_id_at_row(MISSING_ROW)),
+				ImportCaseMismatch(
+					import_id_at_row(0),
+					path_id_at_row(MISSING_ROW),
+				),
 			),
 		),
 		DanglingReference,
@@ -818,14 +723,18 @@ pure func test_bound_with_two_qualifiers_is_reported() -> Bool:
 	row: BoundQualifierRow = {
 		bound = bound_id_at_row(0),
 		qualifier = main_name(),
-		span = sample_span(),
+		span = sample_span()
 	}
-	builder = builder.append_bound_qualifier(row).append_bound_qualifier(row)
+	builder = builder
+		.append_bound_qualifier(row)
+		.append_bound_qualifier(row)
 	has_violation(builder.violations_of(), DuplicateSideRow, BoundQualifierTable)
 
 
 pure func test_bound_qualifiers_out_of_bound_order_are_reported() -> Bool:
-	var builder: DiscoveryBuilder = well_formed_builder().with_bound().with_bound()
+	var builder: DiscoveryBuilder = well_formed_builder()
+		.with_bound()
+		.with_bound()
 	builder = builder.append_bound_qualifier({
 		bound = bound_id_at_row(1),
 		qualifier = main_name(),
@@ -844,9 +753,11 @@ pure func test_supertrait_with_two_qualifiers_is_reported() -> Bool:
 	row: SupertraitQualifierRow = {
 		supertrait = supertrait_id_at_row(0),
 		qualifier = main_name(),
-		span = sample_span(),
+		span = sample_span()
 	}
-	builder = builder.append_supertrait_qualifier(row).append_supertrait_qualifier(row)
+	builder = builder
+		.append_supertrait_qualifier(row)
+		.append_supertrait_qualifier(row)
 	has_violation(builder.violations_of(), DuplicateSideRow, SupertraitQualifierTable)
 
 
@@ -878,11 +789,7 @@ pure func test_supertrait_qualifier_outside_its_supertrait_is_reported() -> Bool
 		qualifier = main_name(),
 		span = pack_span(0, 1, 2),
 	})
-	has_violation(
-		builder.violations_of(),
-		QualifierOutsideReference,
-		SupertraitQualifierTable,
-	)
+	has_violation(builder.violations_of(), QualifierOutsideReference, SupertraitQualifierTable)
 
 
 pure func test_qualifier_inside_its_bound_is_accepted() -> Bool:
@@ -892,7 +799,9 @@ pure func test_qualifier_inside_its_bound_is_accepted() -> Bool:
 		qualifier = main_name(),
 		span = sample_span(),
 	})
-	builder.violations_of().is_empty()
+	builder
+		.violations_of()
+		.is_empty()
 
 
 pure func test_bound_name_outside_its_reference_is_reported() -> Bool:
@@ -908,23 +817,29 @@ pure func test_bound_name_outside_its_reference_is_reported() -> Bool:
 
 
 pure func test_name_inside_its_reference_is_accepted() -> Bool:
-	well_formed_builder().with_bound().with_supertrait().violations_of().is_empty()
+	well_formed_builder()
+		.with_bound()
+		.with_supertrait()
+		.violations_of()
+		.is_empty()
 
 
 pure func test_import_path_outside_its_import_is_reported() -> Bool:
 	var builder: DiscoveryBuilder = well_formed_builder()
 	path: PathId = builder.next_path_id()
 	builder = builder.append_path("heap")
-	builder = builder.append_import({
-		importer = builder.first_module_of(),
-		request_kind = BareModuleRequest,
-		request_path = path,
-		parent_steps = 0,
-		path_parts = EMPTY_ROW_RANGE,
-		items = EMPTY_ROW_RANGE,
-		path_span = pack_span(0, 1, 2),
-		span = sample_span(),
-	})
+	opening: ImportOpening = builder.open_import(
+		builder.first_module_of(),
+		BareModuleRequest,
+		0,
+		sample_span(),
+	)
+	builder = builder.close_import(
+		opening,
+		path,
+		pack_span(0, 1, 2),
+		sample_span(),
+	)
 	has_violation(builder.violations_of(), NameSpanOutsideItsSpan, ImportTable)
 
 
@@ -948,7 +863,7 @@ pure func test_name_span_on_a_node_without_a_separate_name_is_reported() -> Bool
 pure func test_name_spans_of_one_node_twice_are_reported() -> Bool:
 	row: NodeNameSpanRow = {
 		node = node_id_at_row(0),
-		name_span = sample_span(),
+		name_span = sample_span()
 	}
 	builder: DiscoveryBuilder = well_formed_builder()
 		.append_node_name_span(row)
@@ -1097,7 +1012,7 @@ pure func test_else_keywords_of_one_node_twice_are_reported() -> Bool:
 
 	row: ElseKeywordRow = {
 		node = with_if.last_node_id(),
-		keyword_span = sample_span(),
+		keyword_span = sample_span()
 	}
 	builder: DiscoveryBuilder = with_if
 		.append_else_keyword(row)
@@ -1205,7 +1120,11 @@ pure func test_a_concurrency_count_belongs_to_a_parameter_and_is_positive() -> B
 	})
 	(
 		not has_violation(good.violations_of(), ConcurrencyCountMismatch, ConcurrencyCountTable)
-		and has_violation(not_positive.violations_of(), ConcurrencyCountMismatch, ConcurrencyCountTable)
+		and has_violation(
+			not_positive.violations_of(),
+			ConcurrencyCountMismatch,
+			ConcurrencyCountTable,
+		)
 		and has_violation(on_leaf.violations_of(), ConcurrencyCountMismatch, ConcurrencyCountTable)
 		and has_violation(missing.violations_of(), DanglingReference, ConcurrencyCountTable)
 	)
@@ -1223,7 +1142,10 @@ tests: TestSuite = {
 			"a concurrency count belongs to a parameter and is positive",
 			test_a_concurrency_count_belongs_to_a_parameter_and_is_positive,
 		),
-		("an untyped lambda parameter is its name alone", test_an_untyped_lambda_parameter_is_its_name_alone),
+		(
+			"an untyped lambda parameter is its name alone",
+			test_an_untyped_lambda_parameter_is_its_name_alone,
+		),
 		(
 			"an if with an else branch needs its else keyword",
 			test_an_if_with_an_else_branch_needs_its_else_keyword,
@@ -1244,10 +1166,7 @@ tests: TestSuite = {
 			"a bound name outside its reference is reported",
 			test_bound_name_outside_its_reference_is_reported,
 		),
-		(
-			"a name inside its reference is accepted",
-			test_name_inside_its_reference_is_accepted,
-		),
+		("a name inside its reference is accepted", test_name_inside_its_reference_is_accepted),
 		(
 			"an import path outside its import is reported",
 			test_import_path_outside_its_import_is_reported,
@@ -1264,10 +1183,7 @@ tests: TestSuite = {
 			"name spans of one node twice are reported",
 			test_name_spans_of_one_node_twice_are_reported,
 		),
-		(
-			"a dimension name needs its hash spelling",
-			test_a_dimension_name_needs_its_hash_spelling,
-		),
+		("a dimension name needs its hash spelling", test_a_dimension_name_needs_its_hash_spelling),
 		(
 			"a dimension name row must spell the sigil and the name",
 			test_a_dimension_name_row_must_spell_the_sigil_and_the_name,
@@ -1307,11 +1223,6 @@ tests: TestSuite = {
 			"definition naming a missing module is a dangling reference",
 			test_definition_naming_a_missing_module_is_a_dangling_reference,
 		),
-		(
-			"import items past the item table are out of bounds",
-			test_import_items_past_the_item_table_are_out_of_bounds,
-		),
-		("overlapping module blocks are reported", test_overlapping_module_blocks_are_reported),
 		(
 			"node whose child is not appended first is reported",
 			test_node_whose_child_is_not_appended_first_is_reported,
@@ -1365,21 +1276,17 @@ tests: TestSuite = {
 		("node that is two nodes child is reported", test_node_that_is_two_nodes_child_is_reported),
 		("second body for a definition is reported", test_second_body_for_a_definition_is_reported),
 		(
-			"root without target or diagnostic is reported",
-			test_root_without_target_or_diagnostic_is_reported,
+			"root loading a missing module is a dangling reference",
+			test_root_loading_a_missing_module_is_a_dangling_reference,
 		),
 		(
-			"implicit request without target or diagnostic is reported",
-			test_implicit_request_without_target_or_diagnostic_is_reported,
+			"a rejected root naming a missing path is a dangling reference",
+			test_a_rejected_root_naming_a_missing_path_is_a_dangling_reference,
 		),
 		("function without signature is reported", test_function_without_signature_is_reported),
 		(
 			"span past the end of its source is reported",
 			test_span_past_the_end_of_its_source_is_reported,
-		),
-		(
-			"side table out of owner order is reported",
-			test_side_table_out_of_owner_order_is_reported,
 		),
 		(
 			"freeze keeps each text table in its own field",
