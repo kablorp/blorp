@@ -202,6 +202,7 @@ import:
 		match_bindings_shadow,
 		max_int,
 		summarize_constructor_length_branch_uses,
+		summarize_linear_call,
 		summarize_linear_ownership_uses,
 		summarize_match_ownership_uses,
 	results_and_loops:
@@ -4509,6 +4510,8 @@ pure func rewrite_mutable_let_body(
 	-- A mutable slot owns its current value until assignment replaces it or the
 	-- scope exits. Preserve that owner across outward transfers; this gives the
 	-- assignment rewriter one stable invariant instead of path-dependent moves.
+	-- The two exceptions end the body on every path: returning the slot, and
+	-- handing it to a consuming call in tail position.
 	target_param: CoreParam = {
 		name = target,
 		typ = target_type,
@@ -4522,18 +4525,124 @@ pure func rewrite_mutable_let_body(
 		-- handoff for later reuse/codegen passes.
 		rewrite_mutable_assignments(env, target, target_type, transfer_safe_body, 0, False).expr
 	else:
-		result_safe_body: CoreExpr = retain_borrowed_param_result(
-			env,
-			target_param,
-			transfer_safe_body,
-		)
-		rewritten_body: CoreExpr = rewrite_mutable_assignments(
-			env,
-			target,
-			target_type,
-			result_safe_body,
-			0,
-			False,
-		).expr
+		match slot_handed_to_tail_call(env, target, transfer_safe_body):
+			Some(handed_off_body):
+				rewrite_mutable_assignments(env, target, target_type, handed_off_body, 0, False).expr
+			None:
+				rewrite_mutable_let_body_keeping_slot(env, target, target_param, transfer_safe_body)
 
-		drop_after_body(1, target, target_type, rewritten_body)
+
+---
+The body of a mutable let whose slot keeps its owner to the end of the scope:
+every outward transfer is retained, and the scope exit releases the slot.
+---
+private pure func rewrite_mutable_let_body_keeping_slot(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_param: CoreParam,
+	transfer_safe_body: CoreExpr,
+) -> CoreExpr:
+	target_type: CoreType = target_param.typ
+	result_safe_body: CoreExpr = retain_borrowed_param_result(
+		env,
+		target_param,
+		transfer_safe_body,
+	)
+	rewritten_body: CoreExpr = rewrite_mutable_assignments(
+		env,
+		target,
+		target_type,
+		result_safe_body,
+		0,
+		False,
+	).expr
+
+	drop_after_body(1, target, target_type, rewritten_body)
+
+
+---
+Hands the slot's final owner to a consuming call in tail position.
+
+Repeated-consume protection retains the slot for every call that consumes
+it, and the scope exit releases it. When the body ends, through bindings,
+sequences and releases of other variables only, in `DUP slot; f(..., slot,
+...)` where the call consumes the slot and mentions it nowhere else, nothing
+reads the slot after the call, so that retain and the scope-exit release
+cancel: the call receives the slot's own reference, as a directly returned
+slot does. Any other mention of the slot in the call keeps the retain, since
+the callee may update the consumed record in place while another argument
+still refers to it or to one of its fields. A retain of another variable
+between the slot's retain and the call is not looked through.
+
+Returns the body without that retain, or `None` when it does not end so.
+---
+private pure func slot_handed_to_tail_call(
+	env: PerceusEnv,
+	target: CoreVar,
+	expr: CoreExpr,
+) -> Option[CoreExpr]:
+	match expr:
+		SeqExpr(first, second):
+			slot_handed_to_tail_call(env, target, second).map(
+				func(handed_off): SeqExpr(first, handed_off),
+			)
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			if variable.name == target.name:
+				None
+			else if returns_binding_after_other_releases(variable, target, body):
+				-- `let result = <tail>; DROP other; result`: an inner binding's
+				-- release runs after the call, which does not read the slot.
+				slot_handed_to_tail_call(env, target, rhs).map(
+					func(handed_off): LetExpr(variable, is_mutable, typ, handed_off, body),
+				)
+			else:
+				slot_handed_to_tail_call(env, target, body).map(
+					func(handed_off): LetExpr(variable, is_mutable, typ, rhs, handed_off),
+				)
+		BorrowLetExpr(variable, typ, rhs, body):
+			if variable.name == target.name:
+				None
+			else:
+				slot_handed_to_tail_call(env, target, body).map(
+					func(handed_off): BorrowLetExpr(variable, typ, rhs, handed_off),
+				)
+		DupExpr(variable, _, _, CallExpr(kind, callee, args, typ, loc), _, _):
+			call: CoreExpr = CallExpr(kind, callee, args, typ, loc)
+
+			if (
+				variable.name == target.name
+				and args.any(func(arg): is_var_named(target.name, arg))
+				and count_uses(target.name, call) == 1
+				and summarize_linear_call(env, target.name, typ, kind, callee, args).consumed_refs == 1
+			):
+				Some(call)
+			else:
+				None
+		_:
+			None
+
+
+private pure func is_var_named(name: String, expr: CoreExpr) -> Bool:
+	match expr:
+		VarExpr(variable, _, _):
+			variable.name == name
+		_:
+			False
+
+
+---
+Whether `body` yields `binding` after releasing only variables other than
+`target`.
+---
+private pure func returns_binding_after_other_releases(
+	binding: CoreVar,
+	target: CoreVar,
+	body: CoreExpr,
+) -> Bool:
+	match body:
+		VarExpr(variable, _, _):
+			variable.name == binding.name
+		DropExpr(variable, _, _, drop_body, _, _):
+			variable.name != target.name and returns_binding_after_other_releases(binding, target, drop_body)
+		_:
+			False

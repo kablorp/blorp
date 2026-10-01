@@ -137,7 +137,10 @@ Storage places own managed values unless the place is explicitly borrowed.
 
 - Immutable local initialization transfers the expression owner into the local.
 - Mutable assignment releases or consumes the previous place owner before
-  installing the new owner.
+  installing the new owner. A mutable local keeps its owner until the scope
+  exits, and a consuming use retains it, except where the local's last use
+  ends the scope on every path: returning it, or passing it as the only
+  mention in a consuming call in tail position, transfers the place owner.
 - Aggregate construction transfers field or element owners into the aggregate.
 - Global initialization gives the generated global root ownership until
   shutdown or reassignment.

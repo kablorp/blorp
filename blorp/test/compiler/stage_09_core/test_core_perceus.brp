@@ -8758,8 +8758,14 @@ pure func test_mutable_alias_binding_retains_source_owner() -> Bool:
 	dup_count_for("source", rewritten) == 1 and drop_count_for("slot", rewritten) == 1
 
 
-pure func test_mutable_consuming_call_preserves_slot_owner() -> Bool:
-	result: CoreExpr = user_call_expr(
+---
+A consuming call that is not the body's last expression gets its own retain
+of the slot, which still owns its value until the scope exits. (A consuming
+call in tail position takes the slot's reference instead; see
+`test_mutable_slot_moves_into_consuming_tail_call`.)
+---
+pure func test_mutable_consuming_call_before_result_preserves_slot_owner() -> Bool:
+	consume_call: CoreExpr = user_call_expr(
 		"consume",
 		Some(72),
 		[0],
@@ -8773,7 +8779,7 @@ pure func test_mutable_consuming_call_preserves_slot_owner() -> Bool:
 			True,
 			list_int_type(),
 			var_expr("source", list_int_type()),
-			result,
+			LetExpr(named_var("consumed"), False, list_int_type(), consume_call, int_expr(0)),
 		),
 	)
 
@@ -19385,12 +19391,12 @@ pure func test_consumed_parameter_alias_move_requires_arc_policies() -> Bool:
 
 
 ---
-`forward_box__consume_arg0(box, skip)` binds its owned parameter to a `var`
-whose first update runs only when `skip` holds, then updates it again
-unconditionally and returns it:
+`forward_box__consume_arg0(box, update_first, spare)` binds its owned
+parameter to a `var` whose first update runs only when `update_first` holds,
+then updates it again unconditionally and returns it:
 
     var out = box
-    if skip: out = consume_box(out)
+    if update_first: out = consume_box(out)
     out = consume_box(out)
     out
 
@@ -19398,23 +19404,48 @@ The branch keeps `out` a mutable slot, so SSA renaming leaves it alone.
 ---
 pure func conditionally_updated_parameter_alias_program() -> CoreProgram:
 	box_type: CoreType = HeapRecordType("Box")
-	consume_out: CoreExpr = user_call_expr(
+	unconditional_update: CoreExpr = AssignExpr(
+		named_var("out"),
+		consume_out_call(),
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+
+	conditionally_updated_slot_program(
+		SeqExpr(unconditional_update, var_expr("out", box_type)),
+	)
+
+
+pure func consume_out_call() -> CoreExpr:
+	box_type: CoreType = HeapRecordType("Box")
+
+	user_call_expr(
 		"consume_box",
 		Some(90),
 		[],
 		[var_expr("out", box_type)],
 		box_type,
 	)
+
+
+---
+`forward_box__consume_arg0(box, update_first, spare)` with `var out = box`,
+a conditional `out = consume_box(out)`, and then `tail`:
+
+    var out = box
+    if update_first: out = consume_box(out)
+    <tail>
+
+`consume_box` and `consume_box_reading` are consuming clones; the second
+also takes a borrowed `Box`. `spare` is a borrowed `Box` for tails that need
+a second record.
+---
+pure func conditionally_updated_slot_program(tail: CoreExpr) -> CoreProgram:
+	box_type: CoreType = HeapRecordType("Box")
 	conditional_update: CoreExpr = IfExpr(
-		var_expr("skip", bool_type()),
-		AssignExpr(named_var("out"), consume_out, VoidType, synthetic_core_source_loc()),
+		var_expr("update_first", bool_type()),
+		AssignExpr(named_var("out"), consume_out_call(), VoidType, synthetic_core_source_loc()),
 		VoidExpr(VoidType, synthetic_core_source_loc()),
-		VoidType,
-		synthetic_core_source_loc(),
-	)
-	unconditional_update: CoreExpr = AssignExpr(
-		named_var("out"),
-		consume_out,
 		VoidType,
 		synthetic_core_source_loc(),
 	)
@@ -19439,19 +19470,29 @@ pure func conditionally_updated_parameter_alias_program() -> CoreProgram:
 			),
 			as_consuming_clone(
 				function_decl(
+					"consume_box_reading",
+					92,
+					[core_param("box", box_type), core_param("other", box_type)],
+					box_type,
+					var_expr("box", box_type),
+				),
+			),
+			as_consuming_clone(
+				function_decl(
 					"forward_box__consume_arg0",
 					91,
-					[core_param("box", box_type), core_param("skip", bool_type())],
+					[
+						core_param("box", box_type),
+						core_param("update_first", bool_type()),
+						core_param("spare", box_type),
+					],
 					box_type,
 					LetExpr(
 						named_var("out"),
 						True,
 						box_type,
 						var_expr("box", box_type),
-						SeqExpr(
-							conditional_update,
-							SeqExpr(unconditional_update, var_expr("out", box_type)),
-						),
+						SeqExpr(conditional_update, tail),
 					),
 				),
 			),
@@ -19459,6 +19500,83 @@ pure func conditionally_updated_parameter_alias_program() -> CoreProgram:
 		foreign_includes = [],
 		source_files = []
 	}
+
+
+---
+A `var` whose last use is a consuming call in tail position hands that call
+its own reference: no retain for the call and no release at scope exit.
+---
+pure func test_mutable_slot_moves_into_consuming_tail_call() -> Bool:
+	rewritten: CoreProgram = insert_drops_program(conditionally_updated_slot_program(consume_out_call()))
+
+	match function_body(rewritten, "forward_box__consume_arg0"):
+		Some(body):
+			(
+				dup_count_for("out", body) == 0
+				and drop_count_for("out", body) == 0
+				and dup_count_for("box", body) == 0
+				and drop_count_for("box", body) == 0
+			)
+		None:
+			False
+
+
+---
+When another argument of the tail call also reads the slot, the slot keeps
+its reference across the call: the callee may update the consumed record in
+place while the other argument still refers to it.
+---
+pure func test_mutable_slot_read_by_another_tail_call_argument_keeps_retain() -> Bool:
+	box_type: CoreType = HeapRecordType("Box")
+	tail: CoreExpr = user_call_expr(
+		"consume_box_reading",
+		Some(92),
+		[],
+		[var_expr("out", box_type), var_expr("out", box_type)],
+		box_type,
+	)
+	rewritten: CoreProgram = insert_drops_program(conditionally_updated_slot_program(tail))
+
+	match function_body(rewritten, "forward_box__consume_arg0"):
+		Some(body):
+			dup_count_for("out", body) >= 1 and drop_count_for("out", body) == 1
+		None:
+			False
+
+
+---
+A binding made before the tail call and released after it does not read the
+slot, so the slot still moves into the call:
+
+    scratch = spare
+    consume_box_reading(out, scratch)    -- Perceus: let r = ...; DROP scratch; r
+---
+pure func test_mutable_slot_moves_into_tail_call_before_other_release() -> Bool:
+	box_type: CoreType = HeapRecordType("Box")
+	tail: CoreExpr = LetExpr(
+		named_var("scratch"),
+		False,
+		box_type,
+		var_expr("spare", box_type),
+		user_call_expr(
+			"consume_box_reading",
+			Some(92),
+			[],
+			[var_expr("out", box_type), var_expr("scratch", box_type)],
+			box_type,
+		),
+	)
+	rewritten: CoreProgram = insert_drops_program(conditionally_updated_slot_program(tail))
+
+	match function_body(rewritten, "forward_box__consume_arg0"):
+		Some(body):
+			(
+				dup_count_for("out", body) == 0
+				and drop_count_for("out", body) == 0
+				and drop_count_for("scratch", body) == 1
+			)
+		None:
+			False
 
 
 ---
@@ -20073,8 +20191,8 @@ tests: TestSuite = {
 			test_mutable_alias_binding_retains_source_owner,
 		),
 		(
-			"mutable consuming call preserves slot owner",
-			test_mutable_consuming_call_preserves_slot_owner,
+			"mutable consuming call before result preserves slot owner",
+			test_mutable_consuming_call_before_result_preserves_slot_owner,
 		),
 		(
 			"protect call preserves unchanged argument list identity",
@@ -21071,6 +21189,18 @@ tests: TestSuite = {
 		(
 			"consumed parameter mutable alias moves into slot",
 			test_consumed_parameter_mutable_alias_moves_into_slot,
+		),
+		(
+			"mutable slot moves into consuming tail call",
+			test_mutable_slot_moves_into_consuming_tail_call,
+		),
+		(
+			"mutable slot read by another tail call argument keeps retain",
+			test_mutable_slot_read_by_another_tail_call_argument_keeps_retain,
+		),
+		(
+			"mutable slot moves into tail call before other release",
+			test_mutable_slot_moves_into_tail_call_before_other_release,
 		),
 	]
 }
