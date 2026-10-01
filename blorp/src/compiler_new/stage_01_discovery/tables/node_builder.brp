@@ -1,0 +1,599 @@
+-- The body-node part of the builder: appending node rows, the child stack that
+-- collects a parent's children before the parent is appended, and `ChildMark`,
+-- which names a position in it. Every routine takes and returns the
+-- `DiscoveryBuilder` and follows its threading rules; the record and the
+-- other tables are in `builder`.
+import:
+	builder: DiscoveryBuilder, report_unreachable_lookup
+	debug as dbg
+	ids:
+		DefinitionId,
+		LiteralId,
+		NameId,
+		NodeId,
+		definition_id_index,
+		literal_id_index,
+		name_id_index,
+		node_id_at_row,
+		node_id_index,
+	row_kinds: NodeKind(MissingExpressionNode), arity_admits, node_schema
+	rows:
+		BodyRow,
+		ConcurrencyCountRow,
+		DimensionNameRow,
+		EMPTY_ROW_RANGE,
+		ElseKeywordRow,
+		NO_SPAN,
+		NodeNameSpanRow,
+		NodeRow,
+	span: Span
+
+
+pure func append_body(builder: DiscoveryBuilder, row: BodyRow) -> DiscoveryBuilder:
+	{ builder | bodies = builder.bodies.append(row) }
+
+
+-- Body nodes.
+---
+The id the next appended node will receive.
+---
+pure func next_node_id(builder: DiscoveryBuilder) -> NodeId:
+	node_id_at_row(builder.nodes.length())
+
+
+pure func append_node(builder: DiscoveryBuilder, row: NodeRow) -> DiscoveryBuilder:
+	{ builder | nodes = builder.nodes.append(row) }
+
+
+pure func append_dimension_name(
+	builder: DiscoveryBuilder,
+	row: DimensionNameRow,
+) -> DiscoveryBuilder:
+	{ builder | dimension_names = builder.dimension_names.append(row) }
+
+
+pure func append_node_name_span(
+	builder: DiscoveryBuilder,
+	row: NodeNameSpanRow,
+) -> DiscoveryBuilder:
+	{ builder | node_name_spans = builder.node_name_spans.append(row) }
+
+
+pure func append_concurrency_count(
+	builder: DiscoveryBuilder,
+	row: ConcurrencyCountRow,
+) -> DiscoveryBuilder:
+	{ builder | concurrency_counts = builder.concurrency_counts.append(row) }
+
+
+---
+Records the `count` the concurrency parameter node appended most recently wrote.
+---
+pure func record_concurrency_count_of_last_node(
+	builder: DiscoveryBuilder,
+	count: Int,
+) -> DiscoveryBuilder:
+	parameter: NodeId = builder.last_node_id()
+	builder.append_concurrency_count({
+		parameter = parameter,
+		count = count,
+	})
+
+
+pure func append_else_keyword(builder: DiscoveryBuilder, row: ElseKeywordRow) -> DiscoveryBuilder:
+	{ builder | else_keywords = builder.else_keywords.append(row) }
+
+
+---
+Records the span of the `else` keyword of the `IfNode` appended most recently.
+---
+pure func record_else_keyword_of_last_node(
+	builder: DiscoveryBuilder,
+	keyword_span: Span,
+) -> DiscoveryBuilder:
+	node: NodeId = builder.last_node_id()
+	builder.append_else_keyword({
+		node = node,
+		keyword_span = keyword_span,
+	})
+
+
+---
+Records the span of the name of the node appended most recently, for a node
+whose name does not span the whole node (see `NodeNameSpanRow`).
+---
+pure func record_name_span_of_last_node(
+	builder: DiscoveryBuilder,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	node: NodeId = builder.last_node_id()
+	builder.append_node_name_span({
+		node = node,
+		name_span = name_span,
+	})
+
+
+---
+The node appended most recently. Parse routines append a construct's root
+node last, so a caller reads the root it just parsed here; it names a real
+node whenever the caller has appended one.
+---
+pure func last_node_id(builder: DiscoveryBuilder) -> NodeId:
+	node_id_at_row(builder.nodes.length() - 1)
+
+
+---
+The payload of a node whose kind has none.
+---
+NO_NODE_PAYLOAD: Int = 0
+
+---
+The node row `node_row` returns for a node the table does not hold.
+---
+UNREACHABLE_NODE_ROW: NodeRow = {
+	kind = MissingExpressionNode,
+	span = NO_SPAN,
+	payload = NO_NODE_PAYLOAD,
+	children = EMPTY_ROW_RANGE
+}
+
+
+---
+The row of `node`. Parse routines read only nodes they appended, so a miss
+is a defect in the routine: it is reported and `UNREACHABLE_NODE_ROW` returned.
+---
+pure func node_row(builder: DiscoveryBuilder, node: NodeId) -> NodeRow:
+	match builder.nodes.get(node.node_id_index()):
+		Some(row):
+			row
+		None:
+			report_unreachable_lookup(
+				"node",
+				node.node_id_index(),
+				"parse routines read only nodes they appended",
+			)
+			UNREACHABLE_NODE_ROW
+
+
+---
+Child `position` of `node`, or `None` when the node has fewer children (a
+node in recovery may).
+---
+pure func node_child_at(builder: DiscoveryBuilder, node: NodeId, position: Int) -> Option[NodeId]:
+	row: NodeRow = builder.node_row(node)
+
+	if position < row.children.count:
+		builder.node_children.get(row.children.first + position)
+	else:
+		None
+
+
+---
+Removes the node appended last, which must be a leaf no row or stack entry
+references yet: how an identifier that turns out to be the name of a named
+argument (`f(name = value)`) is replaced by the assignment that records the
+name itself.
+---
+pure func discard_last_leaf_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	{ builder | nodes = builder.nodes.drop_last() }
+
+
+---
+Widens the span of the node appended last: how grouping parentheses, which
+add no node, extend the enclosed expression's span to both delimiters.
+---
+pure func replace_last_node_span(builder: DiscoveryBuilder, span: Span) -> DiscoveryBuilder:
+	index: Int = builder.nodes.length() - 1
+	{ builder | nodes = with_node_span(builder.nodes, index, span) }
+
+
+private pure func with_node_span(nodes: List[NodeRow], index: Int, span: Span) -> List[NodeRow]:
+	match nodes.get(index):
+		Some(row):
+			nodes.set(index, { row | span = span })
+		None:
+			nodes
+
+
+---
+Pushes the node appended last onto the child stack (see `push_child`).
+---
+pure func push_last_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	depth: Int = builder.child_stack_depth
+	last: NodeId = node_id_at_row(builder.nodes.length() - 1)
+	{ builder |
+		child_stack = stack_with_entry(builder.child_stack, depth, last),
+		child_stack_depth = depth + 1
+	}
+
+
+---
+Where the next block of node children will start.
+---
+pure func next_node_child_row(builder: DiscoveryBuilder) -> Int:
+	builder.node_children.length()
+
+
+pure func append_node_child(builder: DiscoveryBuilder, child: NodeId) -> DiscoveryBuilder:
+	{ builder | node_children = builder.node_children.append(child) }
+
+
+---
+Pushes `node` as the next child of the parent node being parsed. A parse
+routine pushes each child's root as it finishes the child, then appends the
+parent with `append_parent_node_from_stack`, which claims them: no list of
+child ids is built per parent. The stack is a list with an explicit depth
+so that popping keeps its storage for the next push.
+---
+pure func push_child(builder: DiscoveryBuilder, node: NodeId) -> DiscoveryBuilder:
+	depth: Int = builder.child_stack_depth
+	{ builder |
+		child_stack = stack_with_entry(builder.child_stack, depth, node),
+		child_stack_depth = depth + 1
+	}
+
+
+private pure func stack_with_entry(stack: List[NodeId], depth: Int, node: NodeId) -> List[NodeId]:
+	if depth < stack.length():
+		stack.set(depth, node)
+	else:
+		stack.append(node)
+
+
+---
+A place in the child stack, taken with `mark_children` before a node's
+children are parsed. The children are what was pushed since: read their count
+with `child_count_since`, or append the parent over them with
+`append_parent_node_since`. A mark is not an `Int`, so it cannot be mistaken
+for a count or subtracted by hand.
+---
+opaque type ChildMark = Int
+
+
+pure func mark_children(builder: DiscoveryBuilder) -> ChildMark:
+	into_opaque ChildMark(builder.child_stack_depth)
+
+
+---
+The first child pushed since `mark`, or `None` when there are none.
+---
+pure func first_child_since(builder: DiscoveryBuilder, mark: ChildMark) -> Option[NodeId]:
+	if builder.child_count_since(mark) == 0:
+		None
+	else:
+		builder.child_stack.get(from_opaque ChildMark(mark))
+
+
+---
+How many children were pushed since `mark` and not yet claimed by a parent.
+---
+pure func child_count_since(builder: DiscoveryBuilder, mark: ChildMark) -> Int:
+	builder.child_stack_depth - from_opaque ChildMark(mark)
+
+
+---
+Appends a node over every child pushed since `mark`, claiming them.
+---
+pure func append_parent_node_since(
+	builder: DiscoveryBuilder,
+	mark: ChildMark,
+	kind: NodeKind,
+	span: Span,
+) -> DiscoveryBuilder:
+	builder.append_parent_node_from_stack(
+		kind,
+		span,
+		builder.child_count_since(mark),
+	)
+
+
+---
+`append_parent_node_since` for a kind whose payload is a name, with its name
+span row, as `append_named_parent_node_from_stack`.
+---
+pure func append_named_parent_node_since(
+	builder: DiscoveryBuilder,
+	mark: ChildMark,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	builder.append_named_parent_node_from_stack(
+		kind,
+		span,
+		name,
+		name_span,
+		builder.child_count_since(mark),
+	)
+
+
+---
+Appends `children` as one block of the edge table, then the node over them:
+the post-order write every parent node takes. Read the new node's id first
+with `next_node_id`, or afterwards with `last_node_id`.
+---
+pure func append_parent_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	builder.append_parent_node_with_payload(kind, span, NO_NODE_PAYLOAD, children)
+
+
+---
+`append_parent_node` for a kind whose payload is a name.
+---
+pure func append_named_parent_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	builder.append_parent_node_with_payload(kind, span, name.name_id_index(), children)
+
+
+private pure func append_parent_node_with_payload(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	payload: Int,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	first_child: Int = builder.node_children.length()
+	with_children: DiscoveryBuilder = builder.append_node_children(children)
+	with_children.append_node({
+		kind = kind,
+		span = span,
+		payload = payload,
+		children = {
+			first = first_child,
+			count = children.length()
+		},
+	})
+
+
+---
+Appends `children` to the edge table in one update of the builder; the loop
+runs over the edge list alone.
+---
+private pure func append_node_children(
+	builder: DiscoveryBuilder,
+	children: List[NodeId],
+) -> DiscoveryBuilder:
+	{ builder | node_children = with_node_children(builder.node_children, children) }
+
+
+---
+`edges` followed by `children`. The first append is unconditional and the
+rest are in a loop, so the list is updated in place.
+---
+private pure func with_node_children(edges: List[NodeId], children: List[NodeId]) -> List[NodeId]:
+	match children.get(0):
+		Some(first):
+			var out: List[NodeId] = edges.append(first)
+			var index: Int = 1
+
+			while index < children.length():
+				match children.get(index):
+					Some(child):
+						out = out.append(child)
+					None:
+						void
+
+				index += 1
+
+			out
+		None:
+			edges
+
+
+---
+Appends a node over the last `count` children pushed with `push_child`,
+claiming them from the stack: the edges are copied into `node_children` and
+the node row is appended after them in one update each.
+---
+pure func append_parent_node_from_stack(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	count: Int,
+) -> DiscoveryBuilder:
+	builder.append_parent_node_from_stack_with_payload(kind, span, NO_NODE_PAYLOAD, count)
+
+
+---
+`append_parent_node_from_stack` for a kind whose payload is a name, followed by
+the node's `NodeNameSpanRow` for `name_span`, which the invariants require of
+every such kind (`needs_name_span_row`). A name that is the whole node has
+`append_name_only_parent_node_from_stack`.
+---
+pure func append_named_parent_node_from_stack(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+	name_span: Span,
+	count: Int,
+) -> DiscoveryBuilder:
+	appended: DiscoveryBuilder = builder.append_parent_node_from_stack_with_payload(
+		kind,
+		span,
+		name.name_id_index(),
+		count,
+	)
+	appended.record_name_span_of_last_node(name_span)
+
+
+---
+`append_parent_node_from_stack` for a kind whose payload is a name and whose
+name is the whole node, so it has no name span row: an untyped lambda parameter.
+---
+pure func append_name_only_parent_node_from_stack(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+	count: Int,
+) -> DiscoveryBuilder:
+	builder.append_parent_node_from_stack_with_payload(kind, span, name.name_id_index(), count)
+
+
+private pure func append_parent_node_from_stack_with_payload(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	payload: Int,
+	count: Int,
+) -> DiscoveryBuilder:
+	first_child: Int = builder.node_children.length()
+	depth: Int = builder.child_stack_depth
+
+	-- The freeze reports a child count the kind forbids (`NodeArityMismatch`)
+	-- long after the parser that miscounted has returned; failing here names
+	-- the parser's call. A count above the stack's depth would claim children
+	-- that belong to an enclosing node.
+	debug:
+		if not kind.node_schema().arity.arity_admits(count):
+			dbg.error("a node was appended with a child count its kind does not allow")
+
+		if count > depth:
+			dbg.error("a node claimed more children than the child stack holds")
+
+	var out: DiscoveryBuilder = builder.claim_stack_children(depth - count, depth)
+	out = out.with_child_stack_depth(depth - count)
+	out = out.append_node({
+		kind = kind,
+		span = span,
+		payload = payload,
+		children = {
+			first = first_child,
+			count = count
+		},
+	})
+	out
+
+
+---
+Copies child stack entries `first_index .. end_index` to the edge table.
+---
+private pure func claim_stack_children(
+	builder: DiscoveryBuilder,
+	first_index: Int,
+	end_index: Int,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+	var index: Int = first_index
+
+	while index < end_index:
+		out = out.append_node_child(out.stack_entry(index))
+		index += 1
+
+	out
+
+
+---
+The node `stack_entry` returns for an index the child stack does not hold.
+---
+UNREACHABLE_NODE_ID: NodeId = node_id_at_row(0)
+
+
+---
+Child stack entry `index`; callers pass an index below the stack depth, so a
+miss is a defect in the caller: it is reported and `UNREACHABLE_NODE_ID`
+returned.
+---
+private pure func stack_entry(builder: DiscoveryBuilder, index: Int) -> NodeId:
+	match builder.child_stack.get(index):
+		Some(node):
+			node
+		None:
+			report_unreachable_lookup(
+				"child stack",
+				index,
+				"callers pass an index below the stack depth",
+			)
+			UNREACHABLE_NODE_ID
+
+
+private pure func with_child_stack_depth(builder: DiscoveryBuilder, depth: Int) -> DiscoveryBuilder:
+	{ builder | child_stack_depth = depth }
+
+
+---
+Appends a node with no children.
+---
+pure func append_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+) -> DiscoveryBuilder:
+	builder.append_leaf_node_with_payload(kind, span, NO_NODE_PAYLOAD)
+
+
+---
+A leaf whose payload is a name (see `node_payload_reference`).
+---
+pure func append_name_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	name: NameId,
+) -> DiscoveryBuilder:
+	builder.append_leaf_node_with_payload(kind, span, name.name_id_index())
+
+
+---
+A leaf whose payload is a literal.
+---
+pure func append_literal_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	literal: LiteralId,
+) -> DiscoveryBuilder:
+	builder.append_leaf_node_with_payload(kind, span, literal.literal_id_index())
+
+
+---
+A leaf whose payload is a character's codepoint.
+---
+pure func append_codepoint_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	codepoint: Int,
+) -> DiscoveryBuilder:
+	builder.append_leaf_node_with_payload(kind, span, codepoint)
+
+
+---
+A leaf whose payload is a definition.
+---
+pure func append_definition_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	definition: DefinitionId,
+) -> DiscoveryBuilder:
+	builder.append_leaf_node_with_payload(kind, span, definition.definition_id_index())
+
+
+private pure func append_leaf_node_with_payload(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	span: Span,
+	payload: Int,
+) -> DiscoveryBuilder:
+	first_child: Int = builder.node_children.length()
+	builder.append_node({
+		kind = kind,
+		span = span,
+		payload = payload,
+		children = {
+			first = first_child,
+			count = 0
+		},
+	})

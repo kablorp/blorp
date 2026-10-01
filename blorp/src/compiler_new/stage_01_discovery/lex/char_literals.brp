@@ -1,0 +1,267 @@
+-- Escapes and character literals: the `\u{...}` and single-character escape
+-- grammar and `scan_char_literal`. Strings, interpolated text and holes all
+-- scan escapes the same way, and a hole skips a character literal as a unit,
+-- so this sits below both `string_literals` and `interpolation`.
+import:
+	../tables/diagnostic_code:
+		DiscoveryDiagnosticCode(
+			InvalidCharLiteralDiagnostic, UnicodeCodepointOutOfRangeDiagnostic,
+			UnicodeEscapeDigitCountDiagnostic, UnicodeEscapeNonHexDiagnostic,
+			UnknownEscapeDiagnostic, UnterminatedCharLiteralDiagnostic,
+			UnterminatedUnicodeEscapeDiagnostic,
+		),
+	../tables/token: is_unicode_scalar
+	scan_support:
+		LiteralScan,
+		PendingDiagnostic,
+		ScannedLiteral(CodepointLiteral),
+		byte_at,
+		failed_scan,
+		is_digit_byte,
+		pending,
+		pending_with_argument,
+		text_at,
+
+
+---
+The most hex digits a `\u{...}` escape may hold.
+---
+private MAX_UNICODE_ESCAPE_DIGITS: Int = 6
+
+
+record UnicodeEscapeScan {
+	end: Int,
+	codepoint: Option[Int],
+	diagnostics: List[PendingDiagnostic]
+}
+
+
+private pure func is_hex_byte(c: Char) -> Bool:
+	is_digit_byte(c) or c >= 'a' and c <= 'f' or c >= 'A' and c <= 'F'
+
+
+private pure func hex_value(c: Char) -> Int:
+	if c >= '0' and c <= '9':
+		to_int(c) - to_int('0')
+	else if c >= 'a' and c <= 'f':
+		10 + to_int(c) - to_int('a')
+	else:
+		10 + to_int(c) - to_int('A')
+
+
+-- Escapes.
+pure func escaped_char(c: Char) -> Option[Char]:
+	match c:
+		'n':
+			Some('\n')
+		't':
+			Some('\t')
+		'r':
+			Some('\r')
+		'\\':
+			Some('\\')
+		'\"':
+			Some('\"')
+		'\'':
+			Some('\'')
+		'0':
+			Some(to_char(0))
+		'{':
+			Some('{')
+		'}':
+			Some('}')
+		_:
+			None
+
+
+---
+Scans `\u{...}` at `offset` (the backslash), reading no byte at or after
+`range_end`, the exclusive end of the range being lexed. On success `end` is past
+the closing brace; on failure it is where scanning stopped, as in the existing
+lexer, so the enclosing literal keeps scanning from there.
+---
+pure func scan_unicode_escape(text: String, offset: Int, range_end: Int) -> UnicodeEscapeScan:
+	var position: Int = offset + 3
+	var codepoint: Int = 0
+	var digits: Int = 0
+	var failure: Option[PendingDiagnostic] = None
+
+	while failure.is_none():
+		if position >= range_end:
+			failure = Some(pending(UnterminatedUnicodeEscapeDiagnostic, position, position))
+		else:
+			c: Char = byte_at(text, position)
+
+			if c == '}':
+				break
+			else if is_hex_byte(c):
+				digits += 1
+
+				if digits > MAX_UNICODE_ESCAPE_DIGITS:
+					failure = Some(pending(UnicodeEscapeDigitCountDiagnostic, position, position))
+				else:
+					codepoint = codepoint * 16 + hex_value(c)
+					position += 1
+			else:
+				failure = Some(pending(UnicodeEscapeNonHexDiagnostic, position, position))
+
+	match failure:
+		Some(diagnostic):
+			{
+				end = position,
+				codepoint = None,
+				diagnostics = [diagnostic]
+			}
+		None:
+			if digits == 0:
+				{
+					end = position,
+					codepoint = None,
+					diagnostics = [pending(UnicodeEscapeDigitCountDiagnostic, position, position)]
+				}
+			else:
+				after_close: Int = position + 1
+
+				if not is_unicode_scalar(codepoint):
+					{
+						end = after_close,
+						codepoint = None,
+						diagnostics = [
+							pending(
+								UnicodeCodepointOutOfRangeDiagnostic,
+								after_close,
+								after_close,
+							),
+						]
+					}
+				else:
+					{
+						end = after_close,
+						codepoint = Some(codepoint),
+						diagnostics = []
+					}
+
+
+---
+The offset after the next `'` on this line, or where the line or `range_end`
+ends: where a failed character literal resumes scanning.
+---
+private pure func after_closing_quote(text: String, offset: Int, range_end: Int) -> Int:
+	var position: Int = offset
+
+	while position < range_end:
+		c: Char = byte_at(text, position)
+
+		if c == '\'':
+			position += 1
+			break
+		else if c == '\n':
+			break
+
+		position += 1
+
+	position
+
+
+---
+Scans the character literal at `offset` (its opening `'`). `range_end` is the
+exclusive end of the range being lexed, the close of an interpolation hole or
+the text's end: no byte at or after it is read, so a literal cannot run past
+the hole it is in. `hole_scan` finds a literal's end with this same scan, so
+the two agree on where it stops.
+---
+pure func scan_char_literal(text: String, offset: Int, range_end: Int) -> LiteralScan:
+	var position: Int = offset + 1
+	var codepoint: Int = 0
+	var has_value: Bool = False
+	var diagnostics: List[PendingDiagnostic] = []
+
+	if position >= range_end:
+		diagnostics = diagnostics.append(
+			pending(
+				UnterminatedCharLiteralDiagnostic,
+				position,
+				position,
+			),
+		)
+	else:
+		c: Char = byte_at(text, position)
+
+		if c == '\\':
+			if text_at(text, position, "\\u{"):
+				escape: UnicodeEscapeScan = scan_unicode_escape(text, position, range_end)
+				position = escape.end
+				diagnostics = diagnostics.concat(escape.diagnostics)
+
+				match escape.codepoint:
+					Some(value):
+						codepoint = value
+						has_value = True
+					None:
+						void
+			else:
+				escape_start: Int = position
+				position += 1
+
+				if position >= range_end:
+					diagnostics = diagnostics.append(
+						pending(
+							UnterminatedCharLiteralDiagnostic,
+							escape_start,
+							escape_start,
+						),
+					)
+				else:
+					escaped: Char = byte_at(text, position)
+
+					match escaped_char(escaped):
+						Some(value):
+							codepoint = to_int(value)
+							has_value = True
+							position += 1
+						None:
+							diagnostics = diagnostics.append(
+								pending_with_argument(
+									UnknownEscapeDiagnostic,
+									escape_start,
+									to_int(escaped),
+								),
+							)
+							position += 1
+		else if c == '\n':
+			diagnostics = diagnostics.append(
+				pending(
+					InvalidCharLiteralDiagnostic,
+					position,
+					position,
+				),
+			)
+		else:
+			codepoint = to_int(c)
+			has_value = True
+			position += 1
+
+	if diagnostics.is_empty():
+		if position < range_end and byte_at(text, position) == '\'':
+			position += 1
+		else:
+			diagnostics = diagnostics.append(
+				pending(
+					InvalidCharLiteralDiagnostic,
+					position,
+					position,
+				),
+			)
+
+	if diagnostics.is_empty() and has_value:
+		{
+			end = position,
+			literal = CodepointLiteral(codepoint),
+			diagnostics = [],
+			ended_with_newline = False
+		}
+	else:
+		failed_scan(
+			after_closing_quote(text, position, range_end),
+			diagnostics,
+		)

@@ -1,0 +1,251 @@
+-- Layout of indented blocks and continuation lines: where a block starts and
+-- ends, what its items are, and when a newline or dedent belongs to the
+-- construct being parsed rather than to the block around it. These decide
+-- positions only; no node is appended here, so they sit below `body_parser`.
+import:
+	../tables/builder: DiscoveryBuilder, move_token_cursor
+	../tables/diagnostic_code: DiscoveryDiagnosticCode(ExpectedIndentDiagnostic)
+	../tables/ids: NodeId
+	../tables/node_builder: ChildMark, first_child_since, last_node_id, node_child_at, node_row
+	../tables/row_kinds:
+		NodeKind(CallNode, FieldAccessNode, SubscriptNode),
+		ParsedConstruct(Block),
+		is_binary_operator_node,
+	../tables/rows: NodeRow
+	../tables/source_position: LineColumn, span_end_line, span_start_position
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(DedentToken, DotSymbol, EndOfFileToken, IndentToken, NewlineToken)
+	parser_cursor: at, current_span, report_at_current_in, run_end, token_at, token_kind_at
+	type_parser: node_span
+
+
+-- Layout.
+---
+The line and column of the token at `index`.
+---
+private pure func token_position(builder: DiscoveryBuilder, index: Int) -> LineColumn:
+	builder.span_start_position(builder.token_at(index).span)
+
+
+---
+Whether the token at `index` belongs to a block anchored at `anchor`: it is
+not the end of a block and sits on a later line in a later column.
+---
+pure func indented_past(builder: DiscoveryBuilder, index: Int, anchor: LineColumn) -> Bool:
+	kind: TokenKind = builder.token_kind_at(index)
+
+	if kind == EndOfFileToken or kind == DedentToken:
+		False
+	else:
+		position: LineColumn = builder.token_position(index)
+		position.line > anchor.line and position.column > anchor.column
+
+
+---
+The span of a block's statements: from the first statement to the last, or
+the anchor when the block is empty. The first statement's root is the first
+child pushed since `mark`.
+---
+pure func block_span(builder: DiscoveryBuilder, mark: ChildMark, anchor: Span) -> Span:
+	match builder.first_child_since(mark):
+		Some(first):
+			span_covering(
+				builder.node_span(first),
+				builder.node_span(builder.last_node_id()),
+			)
+		None:
+			anchor
+
+
+---
+Consumes a block's indent: skips newlines, then an indent token, or nothing
+when the first token already sits past the anchor; otherwise reports the
+missing indent.
+---
+pure func consume_block_indent(builder: DiscoveryBuilder, anchor: LineColumn) -> DiscoveryBuilder:
+	start: Int = builder.run_end(NewlineToken)
+
+	if builder.token_kind_at(start) == IndentToken:
+		builder.move_token_cursor(start + 1)
+	else if builder.indented_past(start, anchor):
+		builder.move_token_cursor(start)
+	else:
+		builder
+			.move_token_cursor(start)
+			.report_at_current_in(ExpectedIndentDiagnostic, Block)
+
+
+---
+What the lines of an indented block are: the statements of a body, the cases
+of a `match`, the arms of a `select`.
+---
+enum BlockItem:
+	StatementItem
+	MatchCaseItem
+	SelectArmItem
+
+
+---
+After a statement: when the tokens that follow are newlines and a dedent,
+and the statement is a binary expression whose left side continued onto a
+later line with a leading `.`, the dedent belongs to that continuation and
+is consumed here.
+---
+pure func consume_continuation_dedent(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	after: Int = builder.run_end(NewlineToken)
+
+	if (
+		builder.token_kind_at(after) == DedentToken
+		and builder.needs_continuation_dedent(builder.last_node_id())
+	):
+		builder.move_token_cursor(after + 1)
+	else:
+		builder
+
+
+---
+Whether `node` is a binary expression whose left side holds
+a leading-dot continuation, or whose right side needs one.
+---
+private pure func needs_continuation_dedent(builder: DiscoveryBuilder, node: NodeId) -> Bool:
+	row: NodeRow = builder.node_row(node)
+
+	if row.kind.is_binary_operator_node():
+		(
+			builder.child_has_leading_dot_continuation(node, 0)
+			or builder.child_needs_continuation_dedent(node, 1)
+		)
+	else:
+		False
+
+
+private pure func child_needs_continuation_dedent(
+	builder: DiscoveryBuilder,
+	node: NodeId,
+	position: Int,
+) -> Bool:
+	match builder.node_child_at(node, position):
+		Some(child):
+			builder.needs_continuation_dedent(child)
+		None:
+			False
+
+
+private pure func child_has_leading_dot_continuation(
+	builder: DiscoveryBuilder,
+	node: NodeId,
+	position: Int,
+) -> Bool:
+	match builder.node_child_at(node, position):
+		Some(child):
+			builder.has_leading_dot_continuation(child)
+		None:
+			False
+
+
+---
+Whether `node` holds a field access whose field sits on a later line than
+its receiver ends: a `.field` that continued the expression onto a new line.
+---
+private pure func has_leading_dot_continuation(builder: DiscoveryBuilder, node: NodeId) -> Bool:
+	row: NodeRow = builder.node_row(node)
+
+	match row.kind:
+		FieldAccessNode:
+			match builder.node_child_at(node, 0):
+				Some(receiver):
+					(
+						builder.span_end_line(
+							row.span,
+						) > builder.span_end_line(builder.node_span(receiver))
+						or builder.has_leading_dot_continuation(receiver)
+					)
+				None:
+					False
+		CallNode | SubscriptNode:
+			builder.any_child_has_leading_dot_continuation(row)
+		_:
+			if row.kind.is_binary_operator_node():
+				builder.any_child_has_leading_dot_continuation(row)
+			else:
+				False
+
+
+private pure func any_child_has_leading_dot_continuation(
+	builder: DiscoveryBuilder,
+	row: NodeRow,
+) -> Bool:
+	var found: Bool = False
+	var position: Int = 0
+
+	while not found and position < row.children.count:
+		match builder.node_children.get(row.children.first + position):
+			Some(child):
+				found = builder.has_leading_dot_continuation(child)
+			None:
+				void
+
+		position += 1
+
+	found
+
+
+---
+Where a match or select ends: its closing dedent, or its keyword when the
+arms end some other way.
+---
+pure func arms_end_span(builder: DiscoveryBuilder, start: Span) -> Span:
+	if builder.at(DedentToken):
+		builder.current_span()
+	else:
+		start
+
+
+---
+Where a postfix chain continues after a newline: the `.` on the next line
+(after an indent, which the chain then owns), or the cursor itself when no
+`.` continues it.
+---
+pure func continuation_start(builder: DiscoveryBuilder) -> Int:
+	cursor: Int = builder.token_cursor
+
+	if builder.token_kind_at(cursor) != NewlineToken:
+		cursor
+	else if builder.token_kind_at(cursor + 1) == IndentToken:
+		if builder.token_kind_at(cursor + 2) == DotSymbol:
+			cursor + 2
+		else:
+			cursor
+	else if builder.token_kind_at(cursor + 1) == DotSymbol:
+		cursor + 1
+	else:
+		cursor
+
+
+---
+The span of the closing `kind` token at the cursor, or `fallback` when the
+cursor is not at one (the caller then reports it).
+---
+pure func closing_span_or(builder: DiscoveryBuilder, kind: TokenKind, fallback: Span) -> Span:
+	if builder.at(kind):
+		builder.current_span()
+	else:
+		fallback
+
+
+---
+Consumes newlines and dedents when they lead only to `end`.
+---
+pure func consume_layout_before(builder: DiscoveryBuilder, end: TokenKind) -> DiscoveryBuilder:
+	var index: Int = builder.token_cursor
+
+	while (
+		builder.token_kind_at(index) == NewlineToken
+		or builder.token_kind_at(index) == DedentToken
+	):
+		index += 1
+
+	if builder.token_kind_at(index) == end:
+		builder.move_token_cursor(index)
+	else:
+		builder

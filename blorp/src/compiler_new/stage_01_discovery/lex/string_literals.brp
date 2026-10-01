@@ -1,0 +1,434 @@
+-- Quoted, raw, pipe and docstring literals: where each ends, its text and its
+-- diagnostics. Escapes come from `char_literals`; the tail of a string that
+-- holds `${` hands over to `interpolation`.
+import:
+	../tables/diagnostic_code:
+		DiscoveryDiagnosticCode(
+			MultilineRawStringDiagnostic, MultilineStringDiagnostic, UnknownEscapeDiagnostic,
+			UnterminatedDocstringDiagnostic, UnterminatedEscapeDiagnostic,
+			UnterminatedRawStringDiagnostic, UnterminatedStringDiagnostic,
+		),
+	../tables/token:
+		TokenKind(
+			DocStringToken, InterpolatedPipeStringToken, NormalStringToken, PipeStringToken,
+			RawPipeStringToken, RawStringToken,
+		),
+	char_literals: UnicodeEscapeScan, escaped_char, scan_unicode_escape
+	interpolation: INTERPOLATION_OPENER, scan_interpolated_string_tail
+	scan_support:
+		LiteralScan,
+		PendingDiagnostic,
+		ScannedLiteral(InterpolatedLiteral, TextLiteral),
+		after_blanks,
+		byte_at,
+		failed_scan,
+		indent_width,
+		is_identifier_continue,
+		line_end,
+		pending,
+		pending_with_argument,
+		rest_of_line_is_blank,
+		text_at,
+		with_source_segment,
+	string: string
+
+
+private struct PipeLineScan {
+	end: Int,
+	saw_interpolation: Bool,
+	ended_with_newline: Bool
+}
+
+
+---
+A docstring fence: `---` followed by nothing but blanks on its line.
+---
+pure func docstring_fence_at(text: String, offset: Int) -> Bool:
+	text_at(text, offset, "---") and rest_of_line_is_blank(text, offset + 3)
+
+
+---
+Whether `raw` at `offset` is a whole word (a raw string or raw pipe
+introducer) rather than the start of a longer identifier.
+---
+pure func raw_word_at(text: String, offset: Int) -> Bool:
+	text_at(text, offset, "raw") and not is_identifier_continue(byte_at(text, offset + 3))
+
+
+---
+The offset after the line containing `offset`, past its newline.
+---
+private pure func after_line(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length and byte_at(text, position) != '\n':
+		position += 1
+
+	if position < length:
+		position + 1
+	else:
+		position
+
+
+-- Literal scanners. Each starts at the literal's first byte.
+---
+A `---` docstring: the lines between the opening and closing fences, joined
+by newlines. The token ends past the closing fence's line.
+---
+pure func scan_docstring(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	var position: Int = after_line(text, offset)
+	var body: String = string(128)
+	var first_line: Bool = True
+	var failure: Option[PendingDiagnostic] = None
+
+	while failure.is_none():
+		if docstring_fence_at(text, position):
+			position = after_line(text, position)
+			break
+		else if position >= length:
+			failure = Some(pending(UnterminatedDocstringDiagnostic, position, position))
+		else:
+			end: Int = line_end(text, position)
+			line: String = text.substring(position, end - position)
+
+			if first_line:
+				body = line
+				first_line = False
+			else:
+				body = body + "\n" + line
+
+			position = if end < length:
+				end + 1
+			else:
+				end
+
+	match failure:
+		Some(diagnostic):
+			failed_scan(position, [diagnostic])
+		None:
+			{
+				end = position,
+				literal = TextLiteral(DocStringToken, body),
+				diagnostics = [],
+				ended_with_newline = False
+			}
+
+
+---
+What `plain_string_close` returns for a string that is not plain.
+---
+NO_PLAIN_STRING_CLOSE: Int = -1
+
+
+---
+The offset of the closing quote of the string opening at `offset`, when its
+body holds no escape, no `${` hole and no line break (so its text is its
+bytes); otherwise `NO_PLAIN_STRING_CLOSE`.
+---
+pure func plain_string_close(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset + 1
+	var close: Int = NO_PLAIN_STRING_CLOSE
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if c == '\"':
+			close = position
+			break
+		else if (
+			c == '\\'
+			or c == '\n'
+			or c == '$' and byte_at(text, position + 1) == '{'
+		):
+			break
+
+		position += 1
+
+	close
+
+
+---
+The offset where the verbatim run inside a string body ends: the closing
+quote, a newline, an escape, an interpolation marker or the end.
+---
+private pure func plain_string_run_end(text: String, offset: Int) -> Int:
+	length: Int = text.length()
+	var position: Int = offset
+
+	while position < length:
+		c: Char = byte_at(text, position)
+
+		if (
+			c == '\"'
+			or c == '\n'
+			or c == '\\'
+			or c == '$'
+		):
+			break
+
+		position += 1
+
+	position
+
+
+pure func scan_string_literal(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	var position: Int = offset + 1
+	var segment_start: Int = position
+	var body: String = string(32)
+	var failed: Bool = False
+	var interpolated: Bool = False
+	var diagnostics: List[PendingDiagnostic] = []
+
+	while True:
+		position = plain_string_run_end(text, position)
+
+		if position >= length:
+			failed = True
+			diagnostics = diagnostics.append(
+				pending(
+					UnterminatedStringDiagnostic,
+					position,
+					position,
+				),
+			)
+			break
+
+		c: Char = byte_at(text, position)
+
+		if c == '\"':
+			body = with_source_segment(body, text, segment_start, position)
+			position += 1
+			break
+		else if c == '\n':
+			failed = True
+			diagnostics = diagnostics.append(pending(MultilineStringDiagnostic, position, position))
+			position += 1
+			break
+		else if c == '\\':
+			body = with_source_segment(body, text, segment_start, position)
+
+			if text_at(text, position, "\\u{"):
+				escape: UnicodeEscapeScan = scan_unicode_escape(text, position, length)
+				position = escape.end
+				diagnostics = diagnostics.concat(escape.diagnostics)
+
+				match escape.codepoint:
+					Some(value):
+						body = body.append_char(to_char(value))
+						segment_start = position
+					None:
+						failed = True
+			else:
+				escape_start: Int = position
+				position += 1
+
+				if position >= length:
+					failed = True
+					diagnostics = diagnostics.append(
+						pending(
+							UnterminatedEscapeDiagnostic,
+							escape_start,
+							escape_start,
+						),
+					)
+					break
+
+				escaped: Char = byte_at(text, position)
+
+				match escaped_char(escaped):
+					Some(value):
+						body = body.append_char(value)
+						position += 1
+						segment_start = position
+					None:
+						failed = True
+						diagnostics = diagnostics.append(
+							pending_with_argument(
+								UnknownEscapeDiagnostic,
+								escape_start,
+								to_int(escaped),
+							),
+						)
+						position += 1
+		else if text_at(text, position, INTERPOLATION_OPENER):
+			body = with_source_segment(body, text, segment_start, position)
+			interpolated = True
+			position += 2
+			break
+		else:
+			position += 1
+
+	if failed:
+		failed_scan(position, diagnostics)
+	else if interpolated:
+		scan_interpolated_string_tail(text, position)
+	else:
+		{
+			end = position,
+			literal = TextLiteral(NormalStringToken, body),
+			diagnostics = diagnostics,
+			ended_with_newline = False
+		}
+
+
+---
+`raw"..."`: the body as written, on one line.
+---
+pure func scan_raw_string_literal(text: String, offset: Int) -> LiteralScan:
+	length: Int = text.length()
+	body_start: Int = offset + 4
+	var position: Int = body_start
+
+	while (
+		position < length
+		and byte_at(text, position) != '\"'
+		and byte_at(text, position) != '\n'
+	):
+		position += 1
+
+	body: String = text.substring(body_start, position - body_start)
+
+	if position >= length:
+		failed_scan(position, [pending(UnterminatedRawStringDiagnostic, position, position)])
+	else if byte_at(text, position) == '\n':
+		failed_scan(position + 1, [pending(MultilineRawStringDiagnostic, position, position)])
+	else:
+		{
+			end = position + 1,
+			literal = TextLiteral(RawStringToken, body),
+			diagnostics = [],
+			ended_with_newline = False
+		}
+
+
+---
+The content of one pipe-string line after its marker, appended to `body`
+by the caller from the returned end; `$` introduces a hole unless `raw`.
+---
+private pure func pipe_line_content(text: String, offset: Int, raw: Bool) -> (String, PipeLineScan):
+	length: Int = text.length()
+	var position: Int = offset
+	var content: String = string(64)
+	var saw_interpolation: Bool = False
+	var ended_with_newline: Bool = False
+
+	while True:
+		run_start: Int = position
+
+		while (
+			position < length
+			and byte_at(text, position) != '\n'
+			and byte_at(text, position) != '$'
+		):
+			position += 1
+
+		content = with_source_segment(content, text, run_start, position)
+
+		if position >= length:
+			break
+
+		c: Char = byte_at(text, position)
+
+		if c == '\n':
+			position += 1
+			ended_with_newline = True
+			break
+		else if not raw and text_at(text, position, INTERPOLATION_OPENER):
+			content = content.append_char('{')
+			saw_interpolation = True
+			position += 2
+		else:
+			content = content.append_char('$')
+			position += 1
+
+	(content, {
+			end = position,
+			saw_interpolation = saw_interpolation,
+			ended_with_newline = ended_with_newline
+		})
+
+
+---
+A block of pipe-string lines whose markers sit at `margin_column`, starting
+at the first marker at `offset`.
+---
+pure func scan_pipe_block(
+	text: String,
+	offset: Int,
+	margin_column: Int,
+	raw: Bool,
+) -> LiteralScan:
+	var position: Int = offset
+	var body: String = string(128)
+	var saw_interpolation: Bool = False
+	var first_line: Bool = True
+	var ended_with_newline: Bool = False
+	var continuing: Bool = True
+
+	while continuing:
+		if not first_line:
+			body = body.append_char('\n')
+
+		-- The scan starts at a `|` marker and goes on only at a marker at the
+		-- margin (below), so a marker is always here.
+		if not raw and text_at(text, position, "||"):
+			body = body.append_char('|')
+			position += 2
+		else:
+			position += 1
+
+		(content, line) = pipe_line_content(text, position, raw)
+		body += content
+		saw_interpolation = saw_interpolation or line.saw_interpolation
+		position = line.end
+		ended_with_newline = line.ended_with_newline
+		marker: Int = after_blanks(text, position)
+
+		if (
+			ended_with_newline
+			and indent_width(text, position) == margin_column - 1
+			and byte_at(text, marker) == '|'
+			and marker < text.length()
+		):
+			position = marker
+			first_line = False
+		else:
+			continuing = False
+
+	literal: ScannedLiteral = if raw:
+		TextLiteral(RawPipeStringToken, body)
+	else if saw_interpolation:
+		InterpolatedLiteral(InterpolatedPipeStringToken)
+	else:
+		TextLiteral(PipeStringToken, body)
+
+	{
+		end = position,
+		literal = literal,
+		diagnostics = [],
+		ended_with_newline = ended_with_newline
+	}
+
+
+---
+`raw` then blanks, a newline, and a line whose first non-blank byte is the
+`|` marker: that marker's offset, with its column as the block's margin.
+---
+pure func raw_pipe_marker_after(text: String, offset: Int) -> Option[(Int, Int)]:
+	after_raw: Int = offset + 3
+	blanks_end: Int = after_blanks(text, after_raw)
+
+	if blanks_end < text.length() and byte_at(text, blanks_end) == '\n':
+		next_line: Int = blanks_end + 1
+		marker: Int = after_blanks(text, next_line)
+
+		if marker < text.length() and byte_at(text, marker) == '|':
+			Some((marker, indent_width(text, next_line) + 1))
+		else:
+			None
+	else:
+		None

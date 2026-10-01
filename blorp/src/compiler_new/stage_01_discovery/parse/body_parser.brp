@@ -10,7 +10,14 @@
 --
 -- Function declarations live here, not in the declaration parser, because a
 -- body may declare a local function: the two recurse into each other, and a
--- module cannot import a module that imports it.
+-- module cannot import a module that imports it. For the same reason
+-- expressions, statements and blocks stay together: an `if` is an expression
+-- whose branches are blocks of statements, which hold expressions. This module
+-- is that recursive core; what does not recurse sits below it in
+-- `function_parser` (signatures and parameters), `binder_parser`,
+-- `block_layout` (where blocks and continuations start and end),
+-- `statement_forms` (which statement starts here, finishing a binding),
+-- `concurrent_parameters`, `expression_atoms` (leaves) and `binary_operators`.
 --
 -- The grammar, its layout rules and its recovery follow the existing parser
 -- (`language_parser.brp`) so that the same sources are accepted. Layout
@@ -20,146 +27,152 @@
 import:
 	../lex/lexer: lex_interpolation_hole
 	../tables/builder:
-		ChildMark,
-		DefinitionId,
 		DiscoveryBuilder,
-		InterpolationPart(HolePart, TextPart),
-		InterpolationPartRow,
-		LiteralId,
 		LoopContext(InLoopBody, NotInLoop),
-		ModuleId,
-		NameId,
-		NodeId,
-		NodeRow,
-		ParameterId,
-		RowRange,
 		advance_token,
-		append_binder_name,
-		append_body,
-		append_codepoint_leaf_node,
-		append_definition_leaf_node,
 		append_definition_type,
-		append_leaf_node,
-		append_literal_leaf_node,
-		append_name_leaf_node,
-		append_name_only_parent_node_from_stack,
-		append_named_parent_node_from_stack,
-		append_named_parent_node_since,
-		append_parameter,
-		append_parameter_type,
-		append_parent_node_from_stack,
-		append_parent_node_since,
 		append_plain_diagnostic,
-		append_signature,
-		child_count_since,
-		definition_id_index,
-		discard_last_leaf_node,
-		first_child_since,
 		interpolation_part_at,
 		interpolation_parts_of,
 		interpolation_text_at,
-		last_node_id,
-		literal_id_at_row,
-		mark_children,
-		module_id_at_row,
 		move_token_cursor,
-		name_id_at_row,
-		name_id_index,
-		next_binder_name_row,
 		next_definition_id,
-		next_parameter_id,
-		node_child_at,
-		node_row,
 		pending_annotation_count,
-		push_last_node,
-		record_concurrency_count_of_last_node,
-		record_else_keyword_of_last_node,
-		replace_last_node_span,
-		source_id_at_row,
 		token_count,
 		with_loop_context,
 	../tables/diagnostic_code:
 		DiscoveryDiagnosticCode(
-			BreakOutsideLoopDiagnostic, ConcurrentForTupleBinderDiagnostic,
-			ContinueOutsideLoopDiagnostic, ConcurrentDuplicateParameterDiagnostic,
-			ConcurrentForMaxThreadsDiagnostic, ConcurrentForMissingLimitDiagnostic,
-			ConcurrentForUnknownParameterDiagnostic, ConcurrentLimitNotPositiveLiteralDiagnostic,
-			ConcurrentMaxThreadsNotPositiveLiteralDiagnostic, ConcurrentUnknownParameterDiagnostic,
-			DiscardedQuestionBindDiagnostic, ExpectedAssignmentOperatorDiagnostic,
-			ExpectedBuiltinNameDiagnostic, ExpectedColonDiagnostic, ExpectedCommaDiagnostic,
+			BreakOutsideLoopDiagnostic, ConcurrentForMissingLimitDiagnostic,
+			ConcurrentForTupleBinderDiagnostic, ContinueOutsideLoopDiagnostic,
+			ExpectedAssignmentOperatorDiagnostic, ExpectedColonDiagnostic, ExpectedCommaDiagnostic,
 			ExpectedConcurrentParameterDiagnostic, ExpectedEqualDiagnostic,
-			ExpectedExpressionDiagnostic, ExpectedFatArrowDiagnostic, ExpectedIndentDiagnostic,
-			ExpectedKeywordDiagnostic, ExpectedLeftParenDiagnostic, ExpectedNameDiagnostic,
-			ExpectedNewlineDiagnostic, ExpectedRightBraceDiagnostic, ExpectedRightBracketDiagnostic,
-			ExpectedRightParenDiagnostic, FieldAssignmentDiagnostic,
-			InterpolationHoleNotExpressionDiagnostic, QuestionBindInLoopDiagnostic,
-			RemovedTypeAscriptionDiagnostic, TupleArityDiagnostic, WithMultipleBindingsDiagnostic,
+			ExpectedFatArrowDiagnostic, ExpectedIndentDiagnostic, ExpectedKeywordDiagnostic,
+			ExpectedLeftParenDiagnostic, ExpectedNewlineDiagnostic, ExpectedRightBraceDiagnostic,
+			ExpectedRightBracketDiagnostic, ExpectedRightParenDiagnostic, FieldAssignmentDiagnostic,
+			InterpolationHoleNotExpressionDiagnostic, TupleArityDiagnostic,
+			WithMultipleBindingsDiagnostic,
 		),
-	../tables/name_vocabulary:
-		DISCARD_NAME_INDEX,
-		LIMIT_NAME_INDEX,
-		MAX_THREADS_NAME_INDEX,
-		TIMEOUT_NAME_INDEX,
+	../tables/ids: DefinitionId, LiteralId, NameId, NodeId, name_id_at_row, source_id_at_row
+	../tables/node_builder:
+		ChildMark,
+		append_body,
+		append_definition_leaf_node,
+		append_leaf_node,
+		append_literal_leaf_node,
+		append_named_parent_node_from_stack,
+		append_named_parent_node_since,
+		append_parent_node_from_stack,
+		append_parent_node_since,
+		child_count_since,
+		discard_last_leaf_node,
+		last_node_id,
+		mark_children,
+		node_row,
+		push_last_node,
+		record_else_keyword_of_last_node,
+		replace_last_node_span,
 	../tables/row_kinds:
 		DefinitionKind(LocalFunctionDefinition),
 		NodeKind(
-			AddAssignNode, AddNode, AndNode, AssignmentNode, BlockNode, BreakNode, BuiltinNode,
-			CallNode, CharLiteralNode, ConcurrentBlockNode, ConcurrentForNode,
-			ConcurrentParameterNode, ContinueNode, DebugBlockNode, DestructureBinderNode,
-			DetachNode, DictEntryNode, DictLiteralNode, DivideAssignNode, DivideNode, EqualNode,
+			AddAssignNode, AssignmentNode, BlockNode, BreakNode, CallNode, ConcurrentBlockNode,
+			ConcurrentForNode, ConcurrentParameterNode, ContinueNode, DebugBlockNode,
+			DestructureBinderNode, DetachNode, DictEntryNode, DictLiteralNode, DivideAssignNode,
 			FalseLiteralNode, FieldAccessNode, FloatLiteralNode, ForNode, FromOpaqueNode,
-			GreaterEqualNode, GreaterNode, IdentifierNode, IfNode, IntegerLiteralNode,
-			InterpolatedPipeStringNode, InterpolatedStringNode, InterpolationHoleNode,
-			InterpolationTextNode, IntoOpaqueNode, LambdaNode, LambdaParameterNode, LessEqualNode,
-			LessNode, ListLiteralNode, LocalFunctionNode, LoopBinderNode, MatchCaseNode, MatchNode,
-			MissingExpressionNode, ModuloNode, MultiplyAssignNode, MultiplyNode, NamedBuiltinNode,
-			NegateNode, NotEqualNode, NotNode, OrNode, PipeStringLiteralNode, PureLambdaNode,
-			QuestionBindNode, RangeNode, RawPipeStringLiteralNode, RawStringLiteralNode,
-			RecordFieldNode, RecordLiteralNode, RecordUpdateNode, SelectAfterArmNode, SelectNode,
+			IdentifierNode, IfNode, IntegerLiteralNode, InterpolatedPipeStringNode,
+			InterpolatedStringNode, InterpolationHoleNode, InterpolationTextNode, IntoOpaqueNode,
+			LambdaNode, ListLiteralNode, LocalFunctionNode, MatchCaseNode, MatchNode,
+			MissingExpressionNode, MultiplyAssignNode, NegateNode, NotNode, PipeStringLiteralNode,
+			PureLambdaNode, RawPipeStringLiteralNode, RawStringLiteralNode, RecordFieldNode,
+			RecordLiteralNode, RecordUpdateNode, SelectAfterArmNode, SelectNode,
 			SelectReceiveArmNode, SelectSealedArmNode, StringLiteralNode, SubscriptAssignmentNode,
-			SubscriptNode, SubtractAssignNode, SubtractNode, TrueLiteralNode, TupleDestructureNode,
-			TupleLoopBinderNode, TupleNode, TypedBindingNode, VarDeclarationNode, VectorLiteralNode,
-			VoidNode, WhileNode, WithBindingNode, WithErrorMapNode, WithNode, WithTryBindingNode,
+			SubscriptNode, SubtractAssignNode, TrueLiteralNode, TupleDestructureNode, TupleNode,
+			TypedBindingNode, VarDeclarationNode, VectorLiteralNode, VoidNode, WhileNode,
+			WithBindingNode, WithErrorMapNode, WithNode, WithTryBindingNode,
 		),
-		ParameterBinder(NamedParameterBinder, TupleParameterBinder, WildcardParameterBinder),
 		ParsedConstruct(
-			AssignmentValue, Block, BuiltinName, CallArguments, ConcurrentBlock,
-			ConcurrentNamedParameter, ConcurrentParameters, ConcurrentlyHeader,
-			ConcurrentlyParameters, DebugBlock, DictEntry, DictLiteral, ElseBranch, FieldName,
-			ForIterable, ForLoopVariable, FunctionBody, FunctionName, FunctionParameters,
-			GroupedExpression, IfCondition, IndentedBlock, LambdaBody, LambdaFunc, LambdaParameter,
-			LambdaParameters, ListLiteral, MatchCases, MatchExpression, MatchPattern,
-			OpaqueConversionType, OpaqueConversionValue, ParameterName, RecordFieldName,
-			RecordLiteral, RecordUpdate, SealedSelectChannel, SelectArms, SelectHeader,
-			SelectReceiveBinding, SelectReceiveChannel, SelectTimeout, StatementName, Subscript,
-			TupleBinderName, TupleDestructuring, TupleDestructuringNames, TupleExpression,
-			TupleLoopVariables, TupleParameterNames, VariableDeclaration, VariableName,
-			VectorLiteral, WhileCondition, WithBinding, WithBindingName, WithErrorName,
+			AssignmentValue, CallArguments, ConcurrentBlock, ConcurrentNamedParameter,
+			ConcurrentParameters, ConcurrentlyHeader, ConcurrentlyParameters, DebugBlock, DictEntry,
+			DictLiteral, ElseBranch, ForIterable, ForLoopVariable, FunctionBody, FunctionName,
+			GroupedExpression, IfCondition, IndentedBlock, LambdaBody, LambdaFunc, ListLiteral,
+			MatchCases, MatchExpression, MatchPattern, OpaqueConversionType, OpaqueConversionValue,
+			RecordFieldName, RecordLiteral, RecordUpdate, SealedSelectChannel, SelectArms,
+			SelectHeader, SelectReceiveBinding, SelectReceiveChannel, SelectTimeout, StatementName,
+			Subscript, TupleDestructuring, TupleDestructuringNames, TupleExpression,
+			VariableDeclaration, VariableName, VectorLiteral, WhileCondition, WithBinding,
+			WithBindingName, WithErrorName,
 		),
-		Purity(ImpureFunction, PureFunction),
-		is_binary_operator_node,
-	../tables/source_position: LineColumn, span_end_line, span_start_line, span_start_position
+	../tables/rows: InterpolationPart(HolePart, TextPart), InterpolationPartRow, NodeRow, RowRange
+	../tables/source_position: LineColumn, span_start_line, span_start_position
 	../tables/span: Span, pack_span, span_covering, span_source_index, spans_equal
 	../tables/token:
 		Token,
 		TokenKind(
-			AfterKeyword, AndKeyword, ArrowSymbol, AsKeyword, BreakKeyword, BuiltinKeyword,
-			CharLiteralToken, ColonSymbol, CommaSymbol, ConcurrentKeyword, ConcurrentlyKeyword,
-			ContinueKeyword, DebugKeyword, DedentToken, DetachKeyword, DotSymbol, ElseKeyword,
-			EndOfFileToken, EqualEqualSymbol, EqualSymbol, FalseKeyword, FatArrowSymbol,
-			FloatLiteralToken, ForKeyword, FromKeyword, FromOpaqueKeyword, FuncKeyword,
-			GreaterEqualSymbol, GreaterSymbol, IdentifierToken, IfKeyword, InKeyword, IndentToken,
-			InterpolatedPipeStringToken, InterpolatedStringToken, IntLiteralToken,
-			IntoOpaqueKeyword, LeftBraceSymbol, LeftBracketSymbol, LeftParenSymbol, LessEqualSymbol,
-			LessSymbol, MatchKeyword, MinusEqualSymbol, MinusSymbol, NewlineToken,
-			NormalStringToken, NotEqualSymbol, NotKeyword, OnKeyword, OrKeyword, PercentSymbol,
-			PipeStringToken, PipeSymbol, PlusEqualSymbol, PlusSymbol, PureKeyword,
-			QuestionEqualsSymbol, RawPipeStringToken, RawStringToken, RightBraceSymbol,
-			RightBracketSymbol, RightParenSymbol, SealedKeyword, SelectKeyword, SlashEqualSymbol,
-			SlashSymbol, StarEqualSymbol, StarSymbol, TrueKeyword, UnderscoreSymbol, VarKeyword,
-			VoidKeyword, WhileKeyword, WithKeyword, DotDotSymbol,
+			AfterKeyword, ArrowSymbol, AsKeyword, BreakKeyword, BuiltinKeyword, CharLiteralToken,
+			ColonSymbol, CommaSymbol, ConcurrentKeyword, ConcurrentlyKeyword, ContinueKeyword,
+			DebugKeyword, DedentToken, DetachKeyword, DotSymbol, ElseKeyword, EndOfFileToken,
+			EqualSymbol, FalseKeyword, FatArrowSymbol, FloatLiteralToken, ForKeyword, FromKeyword,
+			FromOpaqueKeyword, FuncKeyword, IdentifierToken, IfKeyword, InKeyword, IndentToken,
+			IntLiteralToken, InterpolatedPipeStringToken, InterpolatedStringToken,
+			IntoOpaqueKeyword, LeftBraceSymbol, LeftBracketSymbol, LeftParenSymbol, MatchKeyword,
+			MinusEqualSymbol, MinusSymbol, NewlineToken, NormalStringToken, NotKeyword, OnKeyword,
+			PipeStringToken, PipeSymbol, PlusEqualSymbol, PureKeyword, QuestionEqualsSymbol,
+			RawPipeStringToken, RawStringToken, RightBraceSymbol, RightBracketSymbol,
+			RightParenSymbol, SealedKeyword, SelectKeyword, SlashEqualSymbol, StarEqualSymbol,
+			TrueKeyword, UnderscoreSymbol, VarKeyword, VoidKeyword, WhileKeyword, WithKeyword,
 		),
+	binary_operators:
+		BinaryOperator,
+		LOWEST_PRECEDENCE,
+		binary_operator,
+		operator_node_kind,
+		operator_precedence,
+	binder_parser:
+		parse_lambda_parameters,
+		parse_loop_binder,
+		parse_optional_type_annotation,
+		parse_tuple_binder,
+	block_layout:
+		BlockItem(MatchCaseItem, SelectArmItem, StatementItem),
+		arms_end_span,
+		block_span,
+		closing_span_or,
+		consume_block_indent,
+		consume_continuation_dedent,
+		consume_layout_before,
+		continuation_start,
+		indented_past,
+	concurrent_parameters:
+		ConcurrentParameterName,
+		ConcurrentParameterOwner(ConcurrentBlockOwner, ConcurrentForOwner),
+		check_concurrent_parameter,
+		concurrent_count_parameter,
+		concurrent_parameter_name,
+		concurrent_parameter_seen,
+		positive_literal_count,
+		with_concurrency_count,
 	declaration_header: DeclarationHeader, close_definition, open_definition, plain_header
+	expression_atoms:
+		char_leaf,
+		keeps_token_span,
+		keyword_leaf,
+		keyword_name_leaf,
+		literal_leaf,
+		loop_keyword_leaf,
+		missing_expression,
+		parse_builtin,
+		parse_field_access,
+		parse_identifier_expression,
+		report_removed_ascription,
+		starts_record_field,
+	function_parser:
+		constraint_end,
+		definition_span,
+		function_body_follows,
+		local_function_purity,
+		module_being_parsed,
+		parse_signature,
+		skip_pure_keyword,
+		starts_local_function,
 	parser_cursor:
 		at,
 		at_block_end,
@@ -168,54 +181,39 @@ import:
 		consume_declared_name,
 		consume_referenced_name,
 		current_kind,
-		current_name,
 		current_span,
 		current_token,
 		declared_name_at_cursor,
-		expect_token,
 		expect_token_in,
-		is_soft_keyword,
-		keyword_name_index,
 		peek_kind,
 		referenced_name_at_cursor,
-		report_and_recover,
 		report_at_current,
 		report_at_current_in,
 		run_end,
 		skip_newlines,
 		skip_optional_token,
-		token_at,
 		token_kind_at,
 	pattern_parser: parse_pattern
+	statement_forms:
+		can_start_named_statement,
+		colon_starts_typed_assignment,
+		consume_receive_binder,
+		finish_named_statement,
+		finish_question_bind,
+		finish_with_body,
+		missing_statement,
+		receive_binder_at_cursor,
+		report_question_bind_in_loop,
+		skip_to_header_colon,
+		starts_assignment_tail,
+		starts_tuple_destructure,
 	type_parser: node_span, parse_dimension_constraints, parse_type, parse_type_parameters
 
 
--- Precedence levels of the binary operators, loosest first. A stray `as` is
--- reported only at the loosest level, so `a + b as T` reports once from the
--- outer loop instead of inside the tighter right operand.
-private LOWEST_PRECEDENCE: Int = 0
-
-private OR_PRECEDENCE: Int = 1
-
-private AND_PRECEDENCE: Int = 2
-
-private COMPARISON_PRECEDENCE: Int = 3
-
-private RANGE_PRECEDENCE: Int = 4
-
-private ADDITIVE_PRECEDENCE: Int = 5
-
-private MULTIPLICATIVE_PRECEDENCE: Int = 6
-
 ---
-The most elements a tuple expression may have; the fewest and most names a
-tuple binder may have.
+The most elements a tuple expression may have.
 ---
 private MAX_TUPLE_ITEMS: Int = 4
-
-private MIN_TUPLE_BINDER_NAMES: Int = 2
-
-private MAX_TUPLE_BINDER_NAMES: Int = 4
 
 ---
 The widths of the `${` that opens an interpolation hole and the `}` that
@@ -281,31 +279,6 @@ pure func parse_function(
 		end = keyword_span
 
 	out.close_definition(definition, header, kind, name, name_span, end)
-
-
----
-The span a function's last dimension constraint ends with.
----
-private pure func constraint_end(builder: DiscoveryBuilder) -> Span:
-	match builder.dimension_constraints.get(builder.dimension_constraints.length() - 1):
-		Some(constraint):
-			constraint.span
-		None:
-			builder.current_span()
-
-
----
-Whether a body follows a function's `:`: not at the end of a block, not a
-new line without an indented block (a declaration without a body), and not
-a token on a later line (which belongs to what follows).
----
-private pure func function_body_follows(builder: DiscoveryBuilder, colon_line: Int) -> Bool:
-	if builder.at_block_end():
-		False
-	else if builder.at(NewlineToken):
-		builder.peek_kind(1) == IndentToken
-	else:
-		builder.span_start_line(builder.current_span()) <= colon_line
 
 
 ---
@@ -388,251 +361,6 @@ pure func parse_global_value(
 
 
 ---
-`(params)` of `definition` and its signature row.
----
-pure func parse_signature(
-	builder: DiscoveryBuilder,
-	definition: DefinitionId,
-	purity: Purity,
-	keyword_span: Span,
-	construct: ParsedConstruct,
-) -> DiscoveryBuilder:
-	parameters_first: Int = builder.parameters.length()
-	out: DiscoveryBuilder = builder.parse_parenthesized_parameters(definition, construct)
-	parameters_count: Int = out.parameters.length() - parameters_first
-	out.append_signature({
-		definition = definition,
-		purity = purity,
-		keyword_span = keyword_span,
-		parameters = {
-			first = parameters_first,
-			count = parameters_count
-		},
-	})
-
-
----
-`(params)`, or a report that the `(` is missing.
----
-pure func parse_parenthesized_parameters(
-	builder: DiscoveryBuilder,
-	owner: DefinitionId,
-	construct: ParsedConstruct,
-) -> DiscoveryBuilder:
-	if builder.at(LeftParenSymbol):
-		builder
-			.advance_token()
-			.parse_parameters(owner)
-	else:
-		builder.report_at_current_in(ExpectedLeftParenDiagnostic, construct)
-
-
----
-Parameters after `(`, through `)`; they may continue on indented lines.
----
-private pure func parse_parameters(
-	builder: DiscoveryBuilder,
-	owner: DefinitionId,
-) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder.skip_newlines()
-	var opened_indent: Bool = False
-	var ordinal: Int = 0
-
-	if out.at(IndentToken):
-		opened_indent = True
-		out = out.advance_token()
-		out = out.skip_newlines()
-
-	if not out.at(RightParenSymbol):
-		var parsing: Bool = True
-
-		while parsing and not out.at(EndOfFileToken):
-			out = out.parse_parameter(owner, ordinal)
-			ordinal += 1
-
-			if out.at(CommaSymbol):
-				out = out.advance_token()
-				out = out.skip_newlines()
-
-				if opened_indent and out.at(DedentToken):
-					out = out.advance_token()
-					out = out.skip_newlines()
-
-				if out.at(RightParenSymbol):
-					parsing = False
-			else:
-				parsing = False
-
-	out = out.skip_newlines()
-
-	if opened_indent and out.at(DedentToken):
-		out = out.advance_token()
-		out = out.skip_newlines()
-
-	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, FunctionParameters)
-
-
----
-One parameter: `name`, `name: T`, `_`, `_: T`, or `(a, b): T`.
----
-private pure func parse_parameter(
-	builder: DiscoveryBuilder,
-	owner: DefinitionId,
-	ordinal: Int,
-) -> DiscoveryBuilder:
-	parameter: ParameterId = builder.next_parameter_id()
-	names_first: Int = builder.next_binder_name_row()
-	binder_start: Span = builder.current_span()
-	binder: ParameterBinder = builder.parameter_binder_at_cursor()
-	var out: DiscoveryBuilder = builder.parse_parameter_binder(binder)
-	names_count: Int = out.next_binder_name_row() - names_first
-
-	binder_span: Span = if binder == TupleParameterBinder:
-		binder_start.span_covering(out.tuple_binder_close_span())
-	else:
-		binder_start
-
-	if (
-		binder == TupleParameterBinder
-		and (names_count < MIN_TUPLE_BINDER_NAMES or names_count > MAX_TUPLE_BINDER_NAMES)
-	):
-		out = out.append_plain_diagnostic(TupleArityDiagnostic, binder_span)
-
-	var span: Span = binder_span
-
-	if out.at(ColonSymbol):
-		out = out.advance_token()
-		out = out.parse_type()
-		parameter_type: NodeId = out.last_node_id()
-		out = out.append_parameter_type({
-			parameter = parameter,
-			type_root = parameter_type,
-		})
-		span = binder_span.span_covering(out.node_span(parameter_type))
-
-	out.append_parameter({
-		owner = owner,
-		ordinal = ordinal,
-		binder = binder,
-		binder_names = {
-			first = names_first,
-			count = names_count
-		},
-		binder_span = binder_span,
-		span = span,
-	})
-
-
----
-The binder form of the parameter at the cursor: `(a, b)` is a tuple, a lone
-`_` a wildcard, and a name or `_: T` a named binder (`_` binds the discard
-name).
----
-private pure func parameter_binder_at_cursor(builder: DiscoveryBuilder) -> ParameterBinder:
-	if builder.at(LeftParenSymbol):
-		TupleParameterBinder
-	else if builder.at(UnderscoreSymbol) and builder.peek_kind(1) != ColonSymbol:
-		WildcardParameterBinder
-	else:
-		NamedParameterBinder
-
-
----
-Consumes a parameter's binder and appends its binder names.
----
-private pure func parse_parameter_binder(
-	builder: DiscoveryBuilder,
-	binder: ParameterBinder,
-) -> DiscoveryBuilder:
-	binder_start: Span = builder.current_span()
-
-	match binder:
-		TupleParameterBinder:
-			builder
-				.advance_token()
-				.parse_tuple_binder_names()
-		WildcardParameterBinder:
-			builder.advance_token()
-		NamedParameterBinder:
-			if builder.at(UnderscoreSymbol):
-				builder
-					.advance_token()
-					.append_binder_name({
-						name = name_id_at_row(DISCARD_NAME_INDEX),
-						span = binder_start,
-					})
-			else:
-				builder.parse_binder_name()
-
-
----
-One binder name, appended with its span.
----
-private pure func parse_binder_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	name: NameId = builder.declared_name_at_cursor()
-	name_span: Span = builder.current_span()
-	builder
-		.consume_declared_name(ParameterName)
-		.append_binder_name({
-			name = name,
-			span = name_span,
-		})
-
-
----
-The names of a tuple binder after its `(`, through the `)`.
----
-private pure func parse_tuple_binder_names(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder
-	var parsing: Bool = not out.at(EndOfFileToken)
-
-	while parsing:
-		out = out.parse_binder_name()
-
-		if out.at(CommaSymbol):
-			out = out.advance_token()
-			parsing = not (out.at(RightParenSymbol) or out.at(EndOfFileToken))
-		else:
-			parsing = False
-
-	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, TupleParameterNames)
-
-
----
-The token a tuple binder's span ends at: its `)` when `parse_tuple_binder_names`
-consumed one, else the token that stood in its place. The names never consume
-a `)` (it is a soft boundary), so a `)` just before the cursor is the close.
----
-private pure func tuple_binder_close_span(builder: DiscoveryBuilder) -> Span:
-	if builder.token_kind_at(builder.token_cursor - 1) == RightParenSymbol:
-		builder.token_at(builder.token_cursor - 1).span
-	else:
-		builder.current_span()
-
-
--- Layout.
----
-The line and column of the token at `index`.
----
-private pure func token_position(builder: DiscoveryBuilder, index: Int) -> LineColumn:
-	builder.span_start_position(builder.token_at(index).span)
-
-
----
-Whether the token at `index` belongs to a block anchored at `anchor`: it is
-not the end of a block and sits on a later line in a later column.
----
-private pure func indented_past(builder: DiscoveryBuilder, index: Int, anchor: LineColumn) -> Bool:
-	kind: TokenKind = builder.token_kind_at(index)
-
-	if kind == EndOfFileToken or kind == DedentToken:
-		False
-	else:
-		position: LineColumn = builder.token_position(index)
-		position.line > anchor.line and position.column > anchor.column
-
-
----
 A block after a `:`: a new line, then the indented statements.
 ---
 private pure func parse_block_after_colon(
@@ -661,53 +389,6 @@ private pure func parse_indented_block(builder: DiscoveryBuilder, anchor: Span) 
 	statements
 		.skip_optional_token(DedentToken)
 		.append_parent_node_since(mark, BlockNode, span)
-
-
----
-The span of a block's statements: from the first statement to the last, or
-the anchor when the block is empty. The first statement's root is the first
-child pushed since `mark`.
----
-private pure func block_span(builder: DiscoveryBuilder, mark: ChildMark, anchor: Span) -> Span:
-	match builder.first_child_since(mark):
-		Some(first):
-			span_covering(
-				builder.node_span(first),
-				builder.node_span(builder.last_node_id()),
-			)
-		None:
-			anchor
-
-
----
-Consumes a block's indent: skips newlines, then an indent token, or nothing
-when the first token already sits past the anchor; otherwise reports the
-missing indent.
----
-private pure func consume_block_indent(
-	builder: DiscoveryBuilder,
-	anchor: LineColumn,
-) -> DiscoveryBuilder:
-	start: Int = builder.run_end(NewlineToken)
-
-	if builder.token_kind_at(start) == IndentToken:
-		builder.move_token_cursor(start + 1)
-	else if builder.indented_past(start, anchor):
-		builder.move_token_cursor(start)
-	else:
-		builder
-			.move_token_cursor(start)
-			.report_at_current_in(ExpectedIndentDiagnostic, Block)
-
-
----
-What the lines of an indented block are: the statements of a body, the cases
-of a `match`, the arms of a `select`.
----
-private enum BlockItem:
-	StatementItem
-	MatchCaseItem
-	SelectArmItem
 
 
 ---
@@ -800,122 +481,6 @@ private pure func parse_for_statement(builder: DiscoveryBuilder) -> DiscoveryBui
 
 
 ---
-After a statement: when the tokens that follow are newlines and a dedent,
-and the statement is a binary expression whose left side continued onto a
-later line with a leading `.`, the dedent belongs to that continuation and
-is consumed here.
----
-private pure func consume_continuation_dedent(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	after: Int = builder.run_end(NewlineToken)
-
-	if (
-		builder.token_kind_at(after) == DedentToken
-		and builder.needs_continuation_dedent(builder.last_node_id())
-	):
-		builder.move_token_cursor(after + 1)
-	else:
-		builder
-
-
----
-Whether `node` is a binary expression whose left side holds
-a leading-dot continuation, or whose right side needs one.
----
-private pure func needs_continuation_dedent(builder: DiscoveryBuilder, node: NodeId) -> Bool:
-	row: NodeRow = builder.node_row(node)
-
-	if row.kind.is_binary_operator_node():
-		(
-			builder.child_has_leading_dot_continuation(node, 0)
-			or builder.child_needs_continuation_dedent(node, 1)
-		)
-	else:
-		False
-
-
-private pure func child_needs_continuation_dedent(
-	builder: DiscoveryBuilder,
-	node: NodeId,
-	position: Int,
-) -> Bool:
-	match builder.node_child_at(node, position):
-		Some(child):
-			builder.needs_continuation_dedent(child)
-		None:
-			False
-
-
-private pure func child_has_leading_dot_continuation(
-	builder: DiscoveryBuilder,
-	node: NodeId,
-	position: Int,
-) -> Bool:
-	match builder.node_child_at(node, position):
-		Some(child):
-			builder.has_leading_dot_continuation(child)
-		None:
-			False
-
-
----
-Whether `node` holds a field access whose field sits on a later line than
-its receiver ends: a `.field` that continued the expression onto a new line.
----
-private pure func has_leading_dot_continuation(builder: DiscoveryBuilder, node: NodeId) -> Bool:
-	row: NodeRow = builder.node_row(node)
-
-	match row.kind:
-		FieldAccessNode:
-			match builder.node_child_at(node, 0):
-				Some(receiver):
-					(
-						builder.span_end_line(
-							row.span,
-						) > builder.span_end_line(builder.node_span(receiver))
-						or builder.has_leading_dot_continuation(receiver)
-					)
-				None:
-					False
-		CallNode | SubscriptNode:
-			builder.any_child_has_leading_dot_continuation(row)
-		_:
-			if row.kind.is_binary_operator_node():
-				builder.any_child_has_leading_dot_continuation(row)
-			else:
-				False
-
-
-private pure func any_child_has_leading_dot_continuation(
-	builder: DiscoveryBuilder,
-	row: NodeRow,
-) -> Bool:
-	var found: Bool = False
-	var position: Int = 0
-
-	while not found and position < row.children.count:
-		match builder.node_children.get(row.children.first + position):
-			Some(child):
-				found = builder.has_leading_dot_continuation(child)
-			None:
-				void
-
-		position += 1
-
-	found
-
-
----
-`func name(...)` or `pure func name(...)` in a body: a local function, as
-opposed to a lambda (`func(...)`).
----
-private pure func starts_local_function(builder: DiscoveryBuilder) -> Bool:
-	if builder.at(FuncKeyword):
-		builder.peek_kind(1) != LeftParenSymbol
-	else:
-		builder.peek_kind(1) == FuncKeyword and builder.peek_kind(2) != LeftParenSymbol
-
-
----
 A local function declaration and its `LocalFunctionNode`.
 ---
 private pure func parse_local_function(builder: DiscoveryBuilder) -> DiscoveryBuilder:
@@ -933,38 +498,6 @@ private pure func parse_local_function(builder: DiscoveryBuilder) -> DiscoveryBu
 		.parse_function(header, LocalFunctionDefinition)
 	span: Span = out.definition_span(definition)
 	out.append_definition_leaf_node(LocalFunctionNode, span, definition)
-
-
-private pure func local_function_purity(builder: DiscoveryBuilder) -> Purity:
-	if builder.at(PureKeyword):
-		PureFunction
-	else:
-		ImpureFunction
-
-
-private pure func skip_pure_keyword(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	if builder.at(PureKeyword):
-		builder.advance_token()
-	else:
-		builder
-
-
-private pure func definition_span(builder: DiscoveryBuilder, definition: DefinitionId) -> Span:
-	match builder.definitions.get(definition.definition_id_index()):
-		Some(row):
-			row.span
-		None:
-			builder.current_span()
-
-
----
-The module whose body is being parsed. `load_module` appends a module's row
-before it lexes and parses the module's tokens, so it is the last module row;
-this saves threading the module through every expression routine for the
-one that needs it.
----
-private pure func module_being_parsed(builder: DiscoveryBuilder) -> ModuleId:
-	module_id_at_row(builder.modules.length() - 1)
 
 
 ---
@@ -991,19 +524,6 @@ private pure func parse_var_declaration(builder: DiscoveryBuilder) -> DiscoveryB
 			name,
 			name_span,
 		)
-
-
----
-`: T` when written, its root pushed on the child stack.
----
-private pure func parse_optional_type_annotation(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	if builder.at(ColonSymbol):
-		builder
-			.advance_token()
-			.parse_type()
-			.push_last_node()
-	else:
-		builder
 
 
 ---
@@ -1068,80 +588,6 @@ private pure func parse_named_statement_or_expression(
 		builder
 			.parse_expression()
 			.assignment_after_expression()
-
-
----
-Whether the token at the cursor can name a binding: a name, or a reserved
-keyword followed by a binding tail (which is then reported once as a
-reserved name).
----
-private pure func can_start_named_statement(builder: DiscoveryBuilder) -> Bool:
-	if (
-		builder
-			.current_name()
-			.is_some()
-	):
-		True
-	else if keyword_name_index(builder.current_kind()).is_some():
-		after_name: Int = builder.token_cursor + 1
-		(
-			starts_assignment_tail(builder.token_kind_at(after_name))
-			or (
-				builder.token_kind_at(after_name) == ColonSymbol
-				and builder.colon_starts_typed_assignment(after_name)
-			)
-		)
-	else:
-		False
-
-
-private pure func starts_assignment_tail(kind: TokenKind) -> Bool:
-	match kind:
-		EqualSymbol | QuestionEqualsSymbol | PlusEqualSymbol | MinusEqualSymbol | StarEqualSymbol | SlashEqualSymbol:
-			True
-		_:
-			False
-
-
----
-Whether the `:` at `colon` starts a type annotation of a binding: an `=` or
-`?=` follows at bracket depth zero before the end of the line, a `,`, a `:`
-or an unmatched closing bracket.
----
-private pure func colon_starts_typed_assignment(builder: DiscoveryBuilder, colon: Int) -> Bool:
-	var index: Int = colon + 1
-	var depth: Int = 0
-	var found: Bool = False
-	var scanning: Bool = True
-
-	while scanning:
-		match builder.token_kind_at(index):
-			EndOfFileToken | NewlineToken | DedentToken:
-				scanning = False
-			EqualSymbol | QuestionEqualsSymbol:
-				if depth == 0:
-					found = True
-					scanning = False
-				else:
-					index += 1
-			LeftParenSymbol | LeftBracketSymbol | LeftBraceSymbol:
-				depth += 1
-				index += 1
-			RightParenSymbol | RightBracketSymbol | RightBraceSymbol:
-				if depth == 0:
-					scanning = False
-				else:
-					depth -= 1
-					index += 1
-			CommaSymbol | ColonSymbol:
-				if depth == 0:
-					scanning = False
-				else:
-					index += 1
-			_:
-				index += 1
-
-	found
 
 
 ---
@@ -1234,73 +680,6 @@ private pure func parse_question_bind_value(
 
 
 ---
-Reports the `?=` at the cursor when it is inside a loop body: each iteration
-would have to return from the enclosing function. The carrier checks that need
-types stay in typechecking.
----
-private pure func report_question_bind_in_loop(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	operator_span: Span = builder.current_span()
-
-	match builder.loop_context:
-		InLoopBody:
-			builder.append_plain_diagnostic(QuestionBindInLoopDiagnostic, operator_span)
-		NotInLoop:
-			builder
-
-
----
-Appends a named statement over the children pushed since `mark`
-and the value just parsed.
----
-private pure func finish_named_statement(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	name: NameId,
-	name_span: Span,
-	mark: ChildMark,
-) -> DiscoveryBuilder:
-	value_span: Span = builder.node_span(builder.last_node_id())
-	builder
-		.push_last_node()
-		.append_named_parent_node_since(
-			mark,
-			kind,
-			name_span.span_covering(value_span),
-			name,
-			name_span,
-		)
-
-
----
-`name ?= value`; `_ ?= value` is reported, since the unwrapped value needs a
-name.
----
-private pure func finish_question_bind(
-	builder: DiscoveryBuilder,
-	name: NameId,
-	name_span: Span,
-	mark: ChildMark,
-) -> DiscoveryBuilder:
-	if name.name_id_index() == DISCARD_NAME_INDEX:
-		builder
-			.append_plain_diagnostic(DiscardedQuestionBindDiagnostic, name_span)
-			.finish_named_statement(QuestionBindNode, name, name_span, mark)
-	else:
-		builder.finish_named_statement(QuestionBindNode, name, name_span, mark)
-
-
----
-A statement that could not be parsed, over the children pushed since `mark`.
----
-private pure func missing_statement(
-	builder: DiscoveryBuilder,
-	span: Span,
-	mark: ChildMark,
-) -> DiscoveryBuilder:
-	builder.append_parent_node_since(mark, MissingExpressionNode, span)
-
-
----
 An `=` after a parsed expression: an assignment to a name, a subscript
 assignment, or a reported field assignment. Any other expression is left as
 it is and the `=` unconsumed.
@@ -1362,56 +741,6 @@ private pure func finish_target_assignment(
 
 
 ---
-Whether `(` starts a tuple destructuring assignment: two or more binder
-names (names, `_`, or reserved keywords, which are then reported) separated
-by commas, a `)`, and `=`.
----
-private pure func starts_tuple_destructure(builder: DiscoveryBuilder) -> Bool:
-	var index: Int = builder.token_cursor + 1
-	var saw_comma: Bool = False
-	var expecting_name: Bool = True
-	var closed: Bool = False
-	var valid: Bool = True
-
-	while valid and not closed:
-		kind: TokenKind = builder.token_kind_at(index)
-
-		if expecting_name:
-			if (
-				kind == IdentifierToken
-				or kind == UnderscoreSymbol
-				or kind.is_reserved_keyword()
-			):
-				index += 1
-				expecting_name = False
-			else:
-				valid = False
-		else if kind == CommaSymbol:
-			saw_comma = True
-			index += 1
-
-			if builder.token_kind_at(index) == RightParenSymbol:
-				closed = True
-			else:
-				expecting_name = True
-		else if kind == RightParenSymbol:
-			closed = True
-		else:
-			valid = False
-
-	valid and closed and saw_comma and builder.token_kind_at(index + 1) == EqualSymbol
-
-
-private pure func is_reserved_keyword(kind: TokenKind) -> Bool:
-	(
-		kind
-			.keyword_name_index()
-			.is_some()
-		and not kind.is_soft_keyword()
-	)
-
-
----
 `(a, b) = value`.
 ---
 private pure func parse_tuple_destructure(builder: DiscoveryBuilder) -> DiscoveryBuilder:
@@ -1432,69 +761,6 @@ private pure func parse_tuple_destructure(builder: DiscoveryBuilder) -> Discover
 		)
 
 
----
-The names of a tuple binder after its `(`, through the `)`, each a `kind`
-leaf pushed on the child stack; `_` is allowed. Two to four names.
----
-private pure func parse_tuple_binder(
-	builder: DiscoveryBuilder,
-	start: Span,
-	kind: NodeKind,
-	construct: ParsedConstruct,
-) -> DiscoveryBuilder:
-	mark: ChildMark = builder.mark_children()
-	var out: DiscoveryBuilder = builder.push_binder_leaf(kind)
-	var end: Span = out.node_span(out.last_node_id())
-
-	if out.at(CommaSymbol):
-		out = out.advance_token()
-		var parsing: Bool = True
-
-		while parsing and not out.at(EndOfFileToken):
-			if out.at(RightParenSymbol):
-				out = out.report_at_current_in(ExpectedNameDiagnostic, TupleBinderName)
-				parsing = False
-			else:
-				out = out.push_binder_leaf(kind)
-				end = out.node_span(out.last_node_id())
-
-				if out.at(CommaSymbol):
-					out = out.advance_token()
-
-					if out.at(RightParenSymbol):
-						parsing = False
-				else:
-					parsing = False
-	else:
-		out = out.report_at_current_in(ExpectedCommaDiagnostic, construct)
-
-	if out.at(RightParenSymbol):
-		end = out.current_span()
-
-	out = out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, construct)
-	count: Int = out.child_count_since(mark)
-
-	if count < MIN_TUPLE_BINDER_NAMES or count > MAX_TUPLE_BINDER_NAMES:
-		out = out.append_plain_diagnostic(
-			TupleArityDiagnostic,
-			start.span_covering(end),
-		)
-
-	out
-
-
----
-A binder name (`_` allowed) as a `kind` leaf, pushed on the child stack.
----
-private pure func push_binder_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
-	name: NameId = builder.binder_name_at_cursor()
-	span: Span = builder.current_span()
-	builder
-		.consume_binder_name(TupleBinderName)
-		.append_name_leaf_node(kind, span, name)
-		.push_last_node()
-
-
 -- Control flow.
 ---
 `while condition: body`.
@@ -1509,27 +775,6 @@ private pure func parse_while(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 		.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, WhileCondition)
 		.parse_block_in_loop_context(InLoopBody, start)
 		.finish_with_body(WhileNode, start, mark)
-
-
----
-Appends a `kind` node over the children pushed since `mark`, the last of which
-is the body just parsed (and not yet pushed), spanning from `start` to the
-body.
----
-private pure func finish_with_body(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	start: Span,
-	mark: ChildMark,
-) -> DiscoveryBuilder:
-	body_span: Span = builder.node_span(builder.last_node_id())
-	builder
-		.push_last_node()
-		.append_parent_node_since(
-			mark,
-			kind,
-			start.span_covering(body_span),
-		)
 
 
 ---
@@ -1620,17 +865,6 @@ private pure func parse_arms_and_finish(
 			kind,
 			start.span_covering(end),
 		)
-
-
----
-Where a match or select ends: its closing dedent, or its keyword when the
-arms end some other way.
----
-private pure func arms_end_span(builder: DiscoveryBuilder, start: Span) -> Span:
-	if builder.at(DedentToken):
-		builder.current_span()
-	else:
-		start
 
 
 ---
@@ -1745,24 +979,6 @@ private pure func parse_select_receive_arm(builder: DiscoveryBuilder) -> Discove
 		)
 
 
-private pure func receive_binder_at_cursor(builder: DiscoveryBuilder) -> NameId:
-	if builder.at(FromKeyword):
-		match keyword_name_index(FromKeyword):
-			Some(index):
-				name_id_at_row(index)
-			None:
-				builder.binder_name_at_cursor()
-	else:
-		builder.binder_name_at_cursor()
-
-
-private pure func consume_receive_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	if builder.at(FromKeyword):
-		builder.advance_token()
-	else:
-		builder.consume_binder_name(SelectReceiveBinding)
-
-
 ---
 `for binder in iterable: body`, or `for x in xs concurrently(...): body`.
 ---
@@ -1818,48 +1034,6 @@ private pure func parse_concurrently_header(
 
 
 ---
-A loop variable, or `(a, b)` loop variables, pushed on the child stack.
----
-private pure func parse_loop_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	if builder.at(LeftParenSymbol):
-		builder.parse_tuple_loop_binder()
-	else:
-		builder.push_binder_leaf(LoopBinderNode)
-
-
-private pure func parse_tuple_loop_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	start: Span = builder.current_span()
-	mark: ChildMark = builder.mark_children()
-	names: DiscoveryBuilder = builder
-		.advance_token()
-		.parse_tuple_binder(start, LoopBinderNode, TupleLoopVariables)
-	span: Span = start.span_covering(names.token_at(names.token_cursor - 1).span)
-	names
-		.append_parent_node_since(mark, TupleLoopBinderNode, span)
-		.push_last_node()
-
-
----
-Which construct owns a concurrency parameter list; the two accept different
-names (`max_threads` versus `limit`).
----
-private enum ConcurrentParameterOwner:
-	ConcurrentBlockOwner
-	ConcurrentForOwner
-
-
----
-Which parameter a name is, for the concurrency parameter rules. The spelling
-is matched once, in `concurrent_parameter_name`.
----
-private enum ConcurrentParameterName:
-	MaxThreadsParameter
-	LimitParameter
-	TimeoutParameter
-	UnknownParameter
-
-
----
 The `(name: value, ...)` after `concurrently`, each parameter pushed; a
 missing `(` is reported.
 ---
@@ -1910,153 +1084,6 @@ private pure func parse_concurrent_parameter_list(
 		ConcurrentParameters
 
 	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, construct)
-
-
-private pure func concurrent_parameter_seen(
-	seen: List[ConcurrentParameterName],
-	name: ConcurrentParameterName,
-) -> Bool:
-	var found: Bool = False
-
-	for earlier in seen:
-		if earlier == name:
-			found = True
-
-	found
-
-
----
-The count parameter `owner` requires or allows: `max_threads` for
-`concurrent`, `limit` for `concurrently`.
----
-private pure func concurrent_count_parameter(
-	owner: ConcurrentParameterOwner,
-) -> ConcurrentParameterName:
-	match owner:
-		ConcurrentBlockOwner:
-			MaxThreadsParameter
-		ConcurrentForOwner:
-			LimitParameter
-
-
----
-Which parameter the token at the cursor names; anything that is not one of
-the three known identifiers is `UnknownParameter`.
----
-private pure func concurrent_parameter_name(builder: DiscoveryBuilder) -> ConcurrentParameterName:
-	if not builder.at(IdentifierToken):
-		UnknownParameter
-	else if builder.current_token().payload == MAX_THREADS_NAME_INDEX:
-		MaxThreadsParameter
-	else if builder.current_token().payload == LIMIT_NAME_INDEX:
-		LimitParameter
-	else if builder.current_token().payload == TIMEOUT_NAME_INDEX:
-		TimeoutParameter
-	else:
-		UnknownParameter
-
-
----
-Reports a parameter whose name `owner` does not accept, that repeats an
-earlier name, or whose count is not a positive integer literal. Like the
-existing parser, only the first occurrence of a name has its value checked.
-`value` is the parameter's parsed value node.
----
-private pure func check_concurrent_parameter(
-	builder: DiscoveryBuilder,
-	owner: ConcurrentParameterOwner,
-	name: ConcurrentParameterName,
-	name_id: NameId,
-	seen: List[ConcurrentParameterName],
-	name_span: Span,
-	value: NodeId,
-) -> DiscoveryBuilder:
-	count: ConcurrentParameterName = owner.concurrent_count_parameter()
-
-	if name == count or name == TimeoutParameter:
-		if seen.concurrent_parameter_seen(name):
-			builder.append_diagnostic_with_argument(
-				ConcurrentDuplicateParameterDiagnostic,
-				name_span,
-				name_id.name_id_index(),
-			)
-		else if (
-			name == count
-			and builder
-				.positive_literal_count(value)
-				.is_none()
-		):
-			code: DiscoveryDiagnosticCode = match owner:
-				ConcurrentBlockOwner:
-					ConcurrentMaxThreadsNotPositiveLiteralDiagnostic
-				ConcurrentForOwner:
-					ConcurrentLimitNotPositiveLiteralDiagnostic
-
-			builder.append_plain_diagnostic(
-				code,
-				builder.node_span(value),
-			)
-		else:
-			builder
-	else:
-		match owner:
-			ConcurrentBlockOwner:
-				builder.append_diagnostic_with_argument(
-					ConcurrentUnknownParameterDiagnostic,
-					name_span,
-					name_id.name_id_index(),
-				)
-			ConcurrentForOwner:
-				if name == MaxThreadsParameter:
-					builder.append_plain_diagnostic(ConcurrentForMaxThreadsDiagnostic, name_span)
-				else:
-					builder.append_diagnostic_with_argument(
-						ConcurrentForUnknownParameterDiagnostic,
-						name_span,
-						name_id.name_id_index(),
-					)
-
-
----
-The count `value` writes when it is an integer literal node that is positive,
-else `None`. `2 + 2`, `-1` and calls are other node kinds. Like the existing
-parser it accepts a literal above `Int`'s range, which `parse_int` saturates;
-rejecting those is a general typecheck rule, not a check here.
----
-private pure func positive_literal_count(builder: DiscoveryBuilder, value: NodeId) -> Option[Int]:
-	row: NodeRow = builder.node_row(value)
-
-	match row.kind:
-		IntegerLiteralNode:
-			match builder.literals.get(row.payload):
-				Some(text):
-					match text.parse_int():
-						Some(number):
-							if number > 0:
-								Some(number)
-							else:
-								None
-						None:
-							None
-				None:
-					None
-		_:
-			None
-
-
----
-`builder` with the concurrency count `written` recorded for the node appended
-last, when there is one.
----
-private pure func with_concurrency_count(
-	builder: DiscoveryBuilder,
-	written: Option[Int],
-) -> DiscoveryBuilder:
-	match written:
-		Some(count):
-			builder.record_concurrency_count_of_last_node(count)
-		None:
-			builder
 
 
 ---
@@ -2165,23 +1192,6 @@ private pure func parse_with(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	out = out.expect_token_in(ColonSymbol, ExpectedColonDiagnostic, WithBinding)
 	out = out.parse_block_after_colon(start)
 	out.finish_with_body(WithNode, start, mark)
-
-
----
-Skips the extra bindings of a reported multi-binding `with` header, up to
-its `:` or the end of its line.
----
-private pure func skip_to_header_colon(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var index: Int = builder.token_cursor
-
-	while (
-		builder.token_kind_at(index) != EndOfFileToken
-		and builder.token_kind_at(index) != NewlineToken
-		and builder.token_kind_at(index) != ColonSymbol
-	):
-		index += 1
-
-	builder.move_token_cursor(index)
 
 
 private pure func parse_with_binding(builder: DiscoveryBuilder) -> DiscoveryBuilder:
@@ -2327,89 +1337,6 @@ private pure func parse_lambda_body_expression(
 		builder.parse_expression()
 
 
----
-Lambda parameters after `(`, through `)`, each pushed; they may continue on
-indented lines.
----
-private pure func parse_lambda_parameters(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder.skip_newlines()
-	var opened_indent: Bool = False
-
-	if out.at(IndentToken):
-		opened_indent = True
-		out = out.advance_token()
-		out = out.skip_newlines()
-
-	if not out.at(RightParenSymbol):
-		var parsing: Bool = True
-
-		while parsing and not out.at(EndOfFileToken):
-			out = out.parse_lambda_parameter()
-			out = out.push_last_node()
-
-			if out.at(CommaSymbol):
-				out = out.advance_token()
-				out = out.skip_newlines()
-
-				if opened_indent and out.at(DedentToken):
-					out = out.advance_token()
-					out = out.skip_newlines()
-
-				if out.at(RightParenSymbol):
-					parsing = False
-			else:
-				parsing = False
-
-	out = out.skip_newlines()
-
-	if opened_indent and out.at(DedentToken):
-		out = out.advance_token()
-		out = out.skip_newlines()
-
-	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, LambdaParameters)
-
-
-private pure func parse_lambda_parameter(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	name: NameId = builder.binder_name_at_cursor()
-	name_span: Span = builder.current_span()
-	mark: ChildMark = builder.mark_children()
-	annotated: DiscoveryBuilder = builder
-		.consume_binder_name(LambdaParameter)
-		.parse_optional_type_annotation()
-	count: Int = annotated.child_count_since(mark)
-
-	span: Span = if count > 0:
-		name_span.span_covering(annotated.node_span(annotated.last_node_id()))
-	else:
-		name_span
-
-	annotated.append_lambda_parameter_node(span, name, name_span, count)
-
-
----
-The lambda parameter node over its `count` written children (its type, or
-none). A typed parameter's name is narrower than the node and has a name span
-row; an untyped one is its name alone.
----
-private pure func append_lambda_parameter_node(
-	builder: DiscoveryBuilder,
-	span: Span,
-	name: NameId,
-	name_span: Span,
-	count: Int,
-) -> DiscoveryBuilder:
-	if count > 0:
-		builder.append_named_parent_node_from_stack(
-			LambdaParameterNode,
-			span,
-			name,
-			name_span,
-			count,
-		)
-	else:
-		builder.append_name_only_parent_node_from_stack(LambdaParameterNode, span, name, count)
-
-
 -- Expressions.
 ---
 An expression at the lowest precedence, anchored at its own start.
@@ -2479,61 +1406,6 @@ private pure func parse_expression_at(
 
 
 ---
-Reports the removed `value as T` and skips `as T` without adding a node, so
-the value stays the expression. The type is skipped by tokens, not parsed,
-because a parsed type would leave nodes no parent refers to.
-
-The old front end parses the type, so the two differ in diagnostic count only
-where the type's end matters: `x as Int + 1` and `x as Int as Int` report one
-diagnostic here, which skips to the end of the line, and more there.
----
-private pure func report_removed_ascription(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	advanced: DiscoveryBuilder = builder
-		.append_plain_diagnostic(RemovedTypeAscriptionDiagnostic, builder.current_span())
-		.advance_token()
-	var index: Int = advanced.token_cursor
-	var open_delimiters: Int = 0
-
-	while (
-		open_delimiters > 0
-		or not advanced
-			.token_kind_at(index)
-			.ends_ascribed_type()
-	):
-		kind: TokenKind = advanced.token_kind_at(index)
-
-		if (
-			kind == LeftBracketSymbol
-			or kind == LeftParenSymbol
-			or kind == LeftBraceSymbol
-		):
-			open_delimiters += 1
-		else if (
-			kind == RightBracketSymbol
-			or kind == RightParenSymbol
-			or kind == RightBraceSymbol
-		):
-			open_delimiters -= 1
-
-		index += 1
-
-	advanced.move_token_cursor(index)
-
-
----
-Whether `kind` ends the type of a removed ascription when no delimiter the
-type opened is still open: the end of a line or block, or a delimiter that
-closes or separates the enclosing construct.
----
-private pure func ends_ascribed_type(kind: TokenKind) -> Bool:
-	match kind:
-		EndOfFileToken | NewlineToken | DedentToken | ColonSymbol | CommaSymbol | RightBracketSymbol | RightParenSymbol | RightBraceSymbol:
-			True
-		_:
-			False
-
-
----
 `left op right`, the left operand parsed; the right operand binds tighter.
 ---
 private pure func parse_binary(
@@ -2556,110 +1428,6 @@ private pure func parse_binary(
 			left_span.span_covering(right_span),
 			2,
 		)
-
-
----
-The binary operators. `binary_operator` reads one from its token, and
-`operator_precedence` and `operator_node_kind` give its precedence and the
-node it makes: each is one exhaustive match over this enum.
----
-private enum BinaryOperator:
-	OrOperator
-	AndOperator
-	EqualOperator
-	NotEqualOperator
-	LessOperator
-	LessEqualOperator
-	GreaterOperator
-	GreaterEqualOperator
-	RangeOperator
-	AddOperator
-	SubtractOperator
-	MultiplyOperator
-	DivideOperator
-	ModuloOperator
-
-
-private pure func binary_operator(kind: TokenKind) -> Option[BinaryOperator]:
-	match kind:
-		OrKeyword:
-			Some(OrOperator)
-		AndKeyword:
-			Some(AndOperator)
-		EqualEqualSymbol:
-			Some(EqualOperator)
-		NotEqualSymbol:
-			Some(NotEqualOperator)
-		LessSymbol:
-			Some(LessOperator)
-		LessEqualSymbol:
-			Some(LessEqualOperator)
-		GreaterSymbol:
-			Some(GreaterOperator)
-		GreaterEqualSymbol:
-			Some(GreaterEqualOperator)
-		DotDotSymbol:
-			Some(RangeOperator)
-		PlusSymbol:
-			Some(AddOperator)
-		MinusSymbol:
-			Some(SubtractOperator)
-		StarSymbol:
-			Some(MultiplyOperator)
-		SlashSymbol:
-			Some(DivideOperator)
-		PercentSymbol:
-			Some(ModuloOperator)
-		_:
-			None
-
-
-private pure func operator_precedence(operator: BinaryOperator) -> Int:
-	match operator:
-		OrOperator:
-			OR_PRECEDENCE
-		AndOperator:
-			AND_PRECEDENCE
-		EqualOperator | NotEqualOperator | LessOperator | LessEqualOperator | GreaterOperator | GreaterEqualOperator:
-			COMPARISON_PRECEDENCE
-		RangeOperator:
-			RANGE_PRECEDENCE
-		AddOperator | SubtractOperator:
-			ADDITIVE_PRECEDENCE
-		MultiplyOperator | DivideOperator | ModuloOperator:
-			MULTIPLICATIVE_PRECEDENCE
-
-
-private pure func operator_node_kind(operator: BinaryOperator) -> NodeKind:
-	match operator:
-		OrOperator:
-			OrNode
-		AndOperator:
-			AndNode
-		EqualOperator:
-			EqualNode
-		NotEqualOperator:
-			NotEqualNode
-		LessOperator:
-			LessNode
-		LessEqualOperator:
-			LessEqualNode
-		GreaterOperator:
-			GreaterNode
-		GreaterEqualOperator:
-			GreaterEqualNode
-		RangeOperator:
-			RangeNode
-		AddOperator:
-			AddNode
-		SubtractOperator:
-			SubtractNode
-		MultiplyOperator:
-			MultiplyNode
-		DivideOperator:
-			DivideNode
-		ModuloOperator:
-			ModuloNode
 
 
 ---
@@ -2759,48 +1527,6 @@ private pure func parse_postfix(builder: DiscoveryBuilder, anchor: Span) -> Disc
 
 
 ---
-Where a postfix chain continues after a newline: the `.` on the next line
-(after an indent, which the chain then owns), or the cursor itself when no
-`.` continues it.
----
-private pure func continuation_start(builder: DiscoveryBuilder) -> Int:
-	cursor: Int = builder.token_cursor
-
-	if builder.token_kind_at(cursor) != NewlineToken:
-		cursor
-	else if builder.token_kind_at(cursor + 1) == IndentToken:
-		if builder.token_kind_at(cursor + 2) == DotSymbol:
-			cursor + 2
-		else:
-			cursor
-	else if builder.token_kind_at(cursor + 1) == DotSymbol:
-		cursor + 1
-	else:
-		cursor
-
-
----
-`.field` after a receiver.
----
-private pure func parse_field_access(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	receiver_span: Span = builder.node_span(builder.last_node_id())
-	out: DiscoveryBuilder = builder
-		.push_last_node()
-		.advance_token()
-	field: NameId = out.referenced_name_at_cursor()
-	field_span: Span = out.current_span()
-	out
-		.consume_referenced_name(FieldName)
-		.append_named_parent_node_from_stack(
-			FieldAccessNode,
-			receiver_span.span_covering(field_span),
-			field,
-			field_span,
-			1,
-		)
-
-
----
 `(arguments)` after a callee.
 ---
 private pure func parse_call(builder: DiscoveryBuilder, anchor: Span) -> DiscoveryBuilder:
@@ -2841,21 +1567,6 @@ private pure func parse_subscript(builder: DiscoveryBuilder, anchor: Span) -> Di
 
 
 ---
-The span of the closing `kind` token at the cursor, or `fallback` when the
-cursor is not at one (the caller then reports it).
----
-private pure func closing_span_or(
-	builder: DiscoveryBuilder,
-	kind: TokenKind,
-	fallback: Span,
-) -> Span:
-	if builder.at(kind):
-		builder.current_span()
-	else:
-		fallback
-
-
----
 Expressions separated by commas up to `end` (not consumed), each pushed;
 with `allow_empty` there may be none. After a comma, newlines and dedents
 that lead only to `end` are consumed.
@@ -2886,27 +1597,6 @@ private pure func parse_expression_list(
 			parsing = False
 
 	out
-
-
----
-Consumes newlines and dedents when they lead only to `end`.
----
-private pure func consume_layout_before(
-	builder: DiscoveryBuilder,
-	end: TokenKind,
-) -> DiscoveryBuilder:
-	var index: Int = builder.token_cursor
-
-	while (
-		builder.token_kind_at(index) == NewlineToken
-		or builder.token_kind_at(index) == DedentToken
-	):
-		index += 1
-
-	if builder.token_kind_at(index) == end:
-		builder.move_token_cursor(index)
-	else:
-		builder
 
 
 -- Primary expressions.
@@ -2986,84 +1676,6 @@ private pure func parse_primary(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 
 
 ---
-Reports a missing expression and appends a `MissingExpressionNode`; the
-offending token is skipped unless it is a soft boundary.
----
-private pure func missing_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	span: Span = builder.current_span()
-	builder
-		.report_and_recover(ExpectedExpressionDiagnostic)
-		.append_leaf_node(MissingExpressionNode, span)
-
-
-private pure func literal_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
-	token: Token = builder.current_token()
-	builder
-		.advance_token()
-		.append_literal_leaf_node(kind, token.span, literal_id_at_row(token.payload))
-
-
-private pure func char_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	token: Token = builder.current_token()
-	builder
-		.advance_token()
-		.append_codepoint_leaf_node(CharLiteralNode, token.span, token.payload)
-
-
-private pure func keyword_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
-	span: Span = builder.current_span()
-	builder
-		.advance_token()
-		.append_leaf_node(kind, span)
-
-
----
-A `break` or `continue` leaf, reported with `outside_loop` when it is not
-inside a loop body.
----
-private pure func loop_keyword_leaf(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	outside_loop: DiscoveryDiagnosticCode,
-) -> DiscoveryBuilder:
-	keyword_span: Span = builder.current_span()
-
-	match builder.loop_context:
-		InLoopBody:
-			builder.keyword_leaf(kind)
-		NotInLoop:
-			builder
-				.append_plain_diagnostic(outside_loop, keyword_span)
-				.keyword_leaf(kind)
-
-
----
-A keyword used as a name (`after`, `sealed`, `from`, `debug`): an identifier
-spelled as the keyword.
----
-private pure func keyword_name_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	token: Token = builder.current_token()
-
-	match token.kind.keyword_name_index():
-		Some(index):
-			builder
-				.advance_token()
-				.append_name_leaf_node(IdentifierNode, token.span, name_id_at_row(index))
-		None:
-			builder.missing_expression()
-
-
----
-A name.
----
-private pure func parse_identifier_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	token: Token = builder.current_token()
-	builder
-		.advance_token()
-		.append_name_leaf_node(IdentifierNode, token.span, name_id_at_row(token.payload))
-
-
----
 `into_opaque T(value)` or `from_opaque T(value)`.
 ---
 private pure func parse_opaque_conversion(
@@ -3092,61 +1704,6 @@ private pure func parse_opaque_conversion(
 			start.span_covering(end),
 			2,
 		)
-
-
----
-`builtin` or `builtin("name")`.
----
-private pure func parse_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	if builder.peek_kind(1) == LeftParenSymbol:
-		builder.parse_named_builtin()
-	else:
-		builder.keyword_leaf(BuiltinNode)
-
-
-private pure func parse_named_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	start: Span = builder.current_span()
-	opened: DiscoveryBuilder = builder
-		.advance_token()
-		.advance_token()
-	name: Token = opened.current_token()
-	named: Bool = name.kind.is_literal_string_token()
-
-	argument: DiscoveryBuilder = if named:
-		opened.advance_token()
-	else:
-		opened.report_and_recover(ExpectedBuiltinNameDiagnostic)
-
-	end: Span = argument.closing_span_or(RightParenSymbol, name.span)
-	closed: DiscoveryBuilder = argument.expect_token_in(
-		RightParenSymbol,
-		ExpectedRightParenDiagnostic,
-		BuiltinName,
-	)
-
-	if named:
-		closed.append_literal_leaf_node(
-			NamedBuiltinNode,
-			start.span_covering(end),
-			literal_id_at_row(name.payload),
-		)
-	else:
-		closed.append_leaf_node(
-			BuiltinNode,
-			start.span_covering(end),
-		)
-
-
----
-A string token whose payload is its text: any string but an interpolated
-one, whose text is split around its holes.
----
-private pure func is_literal_string_token(kind: TokenKind) -> Bool:
-	match kind:
-		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
-			True
-		_:
-			False
 
 
 ---
@@ -3188,19 +1745,6 @@ private pure func parse_grouping_or_tuple(
 			advanced.replace_last_node_span(start.span_covering(close))
 	else:
 		builder.report_at_current_in(ExpectedRightParenDiagnostic, GroupedExpression)
-
-
----
-Whether a grouped expression of this kind keeps its own span when parentheses
-surround it: a name and a local function, whose spans rename and reference
-tooling edits, as the existing parser keeps them.
----
-private pure func keeps_token_span(kind: NodeKind) -> Bool:
-	match kind:
-		IdentifierNode | LocalFunctionNode:
-			True
-		_:
-			False
 
 
 ---
@@ -3269,15 +1813,6 @@ private pure func parse_braced(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 		out
 			.parse_expression()
 			.parse_braced_after_first(start)
-
-
-private pure func starts_record_field(builder: DiscoveryBuilder) -> Bool:
-	(
-		builder
-			.current_name()
-			.is_some()
-		and builder.peek_kind(1) == EqualSymbol
-	)
 
 
 private pure func parse_braced_after_first(

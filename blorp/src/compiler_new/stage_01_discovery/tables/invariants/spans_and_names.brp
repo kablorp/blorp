@@ -1,0 +1,1005 @@
+-- Invariants on spans and names: the seeded names and intern indexes, the
+-- span of every row nesting inside its parent's, the name-span side table, the
+-- node schema (child counts and payloads by kind) and the dimension names.
+import:
+	../builder: DiscoveryBuilder
+	../ids:
+		bound_id_index,
+		import_id_index,
+		import_item_id_index,
+		name_id_index,
+		node_id_at_row,
+		node_id_index,
+		supertrait_id_index,
+	../intern_index: find_slice, occupied_slot_count, text_hash
+	../name_vocabulary: DIMENSION_SIGIL, EMPTY_NAME_INDEX
+	../node_builder: NO_NODE_PAYLOAD
+	../row_kinds:
+		DefinitionKind(LocalFunctionDefinition),
+		NameSpanRule(NameSpanRowRequired, NameSpanRowWhenItHasChildren, NoNameSpanRow),
+		NodeKind(IfNode),
+		NodePayloadReference(
+			CodepointPayload, DefinitionPayload, LiteralPayload, NamePayload, NoPayload,
+		),
+		NodeSchema,
+		TypeParameterKind(DimensionParameter),
+		arity_admits,
+		names_a_dimension,
+		node_schema,
+	../rows: NO_SPAN, NodeNameSpanRow, NodeRow
+	../span: Span, span_end, span_source_index, span_start
+	../token: is_unicode_scalar
+	cardinalities: sorted_by_owner
+	violation:
+		DiscoveryTable(
+			AnnotationTable, BinderNameTable, BoundQualifierTable, BoundTable, DefinitionTable,
+			DiagnosticTable, DimensionConstraintTable, DimensionNameTable, ElseKeywordTable,
+			ForeignArgumentTable, ForeignBlockTable, ForeignCNameTable, ImportAliasTable,
+			ImportBlockTable, ImportItemAliasTable, ImportItemTable, ImportItemVariantTable,
+			ImportTable, LiteralTable, ModuleDocumentationTable, NameTable, NodeChildTable,
+			NodeNameSpanTable, NodeTable, ParameterTable, PathTable, ResolutionDiagnosticTable,
+			ResourceCleanupTable, SignatureTable, SourceTable, SupertraitQualifierTable,
+			SupertraitTable, TypeParameterTable,
+		),
+		TableInvariantKind(
+			DanglingReference, DimensionSigilNameMissing, ElseKeywordMismatch, InternIndexMismatch,
+			LocalFunctionNodeMismatch, NameSpanOnWrongNodeKind, NameSpanOutsideItsSpan,
+			NodeArityMismatch, NodeChildNotBeforeParent, NodeNameSpanMissing, PayloadOutOfRange,
+			QualifierOutsideReference, RangeOutOfBounds, SeededNameMoved, SideTableUnsorted,
+			SigilSpellingMismatch, SpanOutsideSources, SpanPastSourceEnd,
+		),
+		TableInvariantViolation,
+		check_reference,
+		index_in,
+		range_end,
+		range_in,
+		violation,
+
+
+pure func check_seeded_names(
+	builder: DiscoveryBuilder,
+	seeded_spellings: List[String],
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var pinned: Int = 0
+
+	for seeded in seeded_spellings:
+		matches: Bool = match builder.name_spellings.get(pinned):
+			Some(spelling):
+				spelling == seeded
+			None:
+				False
+
+		if not matches:
+			found = found.append(violation(SeededNameMoved, NameTable, pinned, NameTable, pinned))
+
+		pinned += 1
+
+	found
+
+
+---
+Checks that each intern index maps every row's text back to that row and
+holds no other entries.
+---
+pure func check_intern_indexes(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	check_slot_intern_index(builder.name_spellings, builder.name_slots, NameTable)
+		.concat(check_text_intern_index(builder.paths, builder.path_ids_by_text, PathTable))
+		.concat(check_slot_intern_index(builder.literals, builder.literal_slots, LiteralTable))
+
+
+---
+The slot table finds every text at its own row and holds nothing else.
+---
+private pure func check_slot_intern_index(
+	texts: List[String],
+	slots: List[Int],
+	table: DiscoveryTable,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for text in texts:
+		located: Int = find_slice(texts, slots, text, 0, text.length(), text_hash(text))
+
+		if located != row:
+			found = found.append(violation(InternIndexMismatch, table, row, table, located))
+
+		row += 1
+
+	occupied: Int = occupied_slot_count(slots)
+
+	if occupied != texts.length():
+		found = found.append(violation(InternIndexMismatch, table, texts.length(), table, occupied))
+
+	found
+
+
+private pure func check_text_intern_index(
+	texts: List[String],
+	ids_by_text: Dict[String, Int],
+	table: DiscoveryTable,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for text in texts:
+		match ids_by_text.get(text):
+			Some(index):
+				if index != row:
+					found = found.append(violation(InternIndexMismatch, table, row, table, index))
+			None:
+				found = found.append(violation(InternIndexMismatch, table, row, table, row))
+
+		row += 1
+
+	if ids_by_text.length() != texts.length():
+		found = found.append(
+			violation(
+				InternIndexMismatch,
+				table,
+				texts.length(),
+				table,
+				ids_by_text.length(),
+			),
+		)
+
+	found
+
+
+---
+Every node's child block lies inside the edge table, every child is an
+existing node appended before its parent (post-order), the child count is one
+its kind allows, the payload is what its kind names, and the node has a name
+span row exactly when its kind asks for one. The kind's `node_schema` is read
+once per node, in this single walk over the nodes: freezing checks 950,000
+nodes of the compiler itself, so a second walk or a second schema read per node
+is measurable.
+
+The name span rows are sorted by node (`SideTableUnsorted`), so the walk meets
+each node's row in turn: a row on a node whose kind has no name span row
+(`name_span_row_expected`) is a `NameSpanOnWrongNodeKind`, a name outside its
+node's span a `NameSpanOutsideItsSpan`, and a node whose kind has a name narrower
+than the node but no row a `NodeNameSpanMissing`. A row naming no node is a
+`DanglingReference`; a row the walk does not reach (a node's second row) is the
+unsorted table `check_node_name_row_order` already reports.
+---
+pure func check_node_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	node_count: Int = builder.nodes.length()
+	edge_count: Int = builder.node_children.length()
+	var next_name_row: Int = 0
+	var next_name_row_node: Int = builder.name_span_row_node(0)
+	var row: Int = 0
+
+	for node in builder.nodes:
+		if node.children.range_in(edge_count):
+			for edge in node.children.first..range_end(node.children):
+				match builder.node_children.get(edge):
+					Some(child):
+						child_index: Int = child.node_id_index()
+
+						if not index_in(child_index, node_count):
+							found = found.append(
+								violation(
+									DanglingReference,
+									NodeTable,
+									row,
+									NodeTable,
+									child_index,
+								),
+							)
+						else if child_index >= row:
+							found = found.append(
+								violation(
+									NodeChildNotBeforeParent,
+									NodeTable,
+									row,
+									NodeTable,
+									child_index,
+								),
+							)
+					None:
+						found = found.append(
+							violation(
+								RangeOutOfBounds,
+								NodeTable,
+								row,
+								NodeChildTable,
+								edge,
+							),
+						)
+		else:
+			found = found.append(
+				violation(
+					RangeOutOfBounds,
+					NodeTable,
+					row,
+					NodeChildTable,
+					node.children.range_end(),
+				),
+			)
+
+		schema: NodeSchema = node.kind.node_schema()
+
+		if not schema.arity.arity_admits(node.children.count):
+			found = found.append(
+				violation(
+					NodeArityMismatch,
+					NodeTable,
+					row,
+					NodeTable,
+					node.children.count,
+				),
+			)
+
+		found = check_node_payload(found, builder, row, node, schema.payload)
+		expects_name_row: Bool = schema.name_span.name_span_row_expected(node.children.count)
+
+		if next_name_row_node == row:
+			name_span: Span = builder.node_name_spans.get_or(
+				next_name_row,
+				NO_NAME_SPAN_ROW,
+			).name_span
+			found = check_name_within(found, NodeNameSpanTable, next_name_row, name_span, node.span)
+
+			if not expects_name_row:
+				found = found.append(
+					violation(
+						NameSpanOnWrongNodeKind,
+						NodeNameSpanTable,
+						next_name_row,
+						NodeTable,
+						row,
+					),
+				)
+
+			next_name_row += 1
+			next_name_row_node = builder.name_span_row_node(next_name_row)
+		else if expects_name_row:
+			found = found.append(
+				violation(
+					NodeNameSpanMissing,
+					NodeTable,
+					row,
+					NodeNameSpanTable,
+					row,
+				),
+			)
+
+		row += 1
+
+	found
+
+
+---
+A node's payload indexes the table its kind names (`NodeSchema.payload`):
+a name, a literal, a Unicode scalar value, a local function's definition, or
+nothing (`NO_NODE_PAYLOAD`).
+---
+private pure func check_node_payload(
+	found: List[TableInvariantViolation],
+	builder: DiscoveryBuilder,
+	row: Int,
+	node: NodeRow,
+	payload: NodePayloadReference,
+) -> List[TableInvariantViolation]:
+	match payload:
+		NamePayload:
+			check_reference(
+				found,
+				NodeTable,
+				row,
+				NameTable,
+				node.payload,
+				builder.name_spellings.length(),
+			)
+		LiteralPayload:
+			check_reference(
+				found,
+				NodeTable,
+				row,
+				LiteralTable,
+				node.payload,
+				builder.literals.length(),
+			)
+		CodepointPayload:
+			if is_unicode_scalar(node.payload):
+				found
+			else:
+				found.append(violation(PayloadOutOfRange, NodeTable, row, NodeTable, node.payload))
+		DefinitionPayload:
+			check_local_function_node(found, builder, row, node.payload)
+		NoPayload:
+			if node.payload == NO_NODE_PAYLOAD:
+				found
+			else:
+				found.append(violation(PayloadOutOfRange, NodeTable, row, NodeTable, node.payload))
+
+
+---
+A `LocalFunctionNode` at `row` names an existing `LocalFunctionDefinition`.
+---
+private pure func check_local_function_node(
+	found: List[TableInvariantViolation],
+	builder: DiscoveryBuilder,
+	row: Int,
+	definition_index: Int,
+) -> List[TableInvariantViolation]:
+	match builder.definitions.get(definition_index):
+		Some(definition):
+			if definition.kind == LocalFunctionDefinition:
+				found
+			else:
+				found.append(
+					violation(
+						LocalFunctionNodeMismatch,
+						NodeTable,
+						row,
+						DefinitionTable,
+						definition_index,
+					),
+				)
+		None:
+			found.append(
+				violation(
+					DanglingReference,
+					NodeTable,
+					row,
+					DefinitionTable,
+					definition_index,
+				),
+			)
+
+
+---
+A `NameSpanOutsideItsSpan` for each name span that is not inside the span of
+what it names a part of; and, for the node name span table, a dangling node, an
+unsorted or repeated node, and a node of a kind with no separate name span.
+---
+pure func check_name_spans(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for parameter in builder.type_parameters:
+		found = check_name_within(
+			found,
+			TypeParameterTable,
+			row,
+			parameter.name_span,
+			parameter.span,
+		)
+		row += 1
+
+	row = 0
+
+	for bound in builder.bounds:
+		found = check_name_within(found, BoundTable, row, bound.name_span, bound.span)
+		row += 1
+
+	row = 0
+
+	for supertrait in builder.supertraits:
+		found = check_name_within(
+			found,
+			SupertraitTable,
+			row,
+			supertrait.name_span,
+			supertrait.span,
+		)
+		row += 1
+
+	row = 0
+
+	for item in builder.import_items:
+		found = check_name_within(found, ImportItemTable, row, item.name_span, item.span)
+		row += 1
+
+	row = 0
+
+	for argument in builder.foreign_arguments:
+		found = check_name_within(
+			found,
+			ForeignArgumentTable,
+			row,
+			argument.name_span,
+			argument.span,
+		)
+		row += 1
+
+	row = 0
+
+	for import_row in builder.imports:
+		found = check_name_within(found, ImportTable, row, import_row.path_span, import_row.span)
+		row += 1
+
+	row = 0
+
+	for alias_row in builder.import_aliases:
+		match builder.imports.get(alias_row.owner_import.import_id_index()):
+			Some(import_row):
+				found = check_name_within(
+					found,
+					ImportAliasTable,
+					row,
+					alias_row.span,
+					import_row.span,
+				)
+			None:
+				void
+
+		row += 1
+
+	row = 0
+
+	for alias_row in builder.import_item_aliases:
+		match builder.import_items.get(alias_row.item.import_item_id_index()):
+			Some(item):
+				found = check_name_within(
+					found,
+					ImportItemAliasTable,
+					row,
+					alias_row.span,
+					item.span,
+				)
+			None:
+				void
+
+		row += 1
+
+	found
+
+
+---
+Appends a `NameSpanOutsideItsSpan` unless `name` is inside `whole`.
+---
+private pure func check_name_within(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	row: Int,
+	name: Span,
+	whole: Span,
+) -> List[TableInvariantViolation]:
+	if name.span_within(whole):
+		found
+	else:
+		found.append(violation(NameSpanOutsideItsSpan, table, row, table, name.span_start()))
+
+
+---
+The dimension name rows and the names that need them. A `DanglingReference` for
+a row naming no name; a `SigilSpellingMismatch` for a row whose sigil name is not
+`#` and its plain name's spelling; a `DimensionSigilNameMissing` for each
+dimension name, in a type or a type parameter, with no row (a parameter whose
+name recovery left empty is reported by the parser instead).
+---
+pure func check_dimension_names(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	name_count: Int = builder.name_spellings.length()
+	var paired: Set[Int] = {}
+	var row: Int = 0
+
+	for pair in builder.dimension_names:
+		found = check_reference(
+			found,
+			DimensionNameTable,
+			row,
+			NameTable,
+			pair.name.name_id_index(),
+			name_count,
+		)
+		found = check_reference(
+			found,
+			DimensionNameTable,
+			row,
+			NameTable,
+			pair.sigil_name.name_id_index(),
+			name_count,
+		)
+		paired = paired.add(pair.name.name_id_index())
+
+		match (
+			builder.name_spellings.get(pair.name.name_id_index()),
+			builder.name_spellings.get(pair.sigil_name.name_id_index()),
+		):
+			(Some(plain), Some(sigiled)):
+				if sigiled != DIMENSION_SIGIL + plain:
+					found = found.append(
+						violation(
+							SigilSpellingMismatch,
+							DimensionNameTable,
+							row,
+							NameTable,
+							pair.sigil_name.name_id_index(),
+						),
+					)
+			_:
+				void
+
+		row += 1
+
+	row = 0
+
+	for node in builder.nodes:
+		if node.kind.names_a_dimension():
+			if not paired.contains(node.payload):
+				found = found.append(
+					violation(
+						DimensionSigilNameMissing,
+						NodeTable,
+						row,
+						NameTable,
+						node.payload,
+					),
+				)
+
+		row += 1
+
+	row = 0
+
+	for parameter in builder.type_parameters:
+		name: Int = parameter.name.name_id_index()
+
+		if (
+			parameter.kind == DimensionParameter
+			and name != EMPTY_NAME_INDEX
+			and not paired.contains(name)
+		):
+			found = found.append(
+				violation(
+					DimensionSigilNameMissing,
+					TypeParameterTable,
+					row,
+					NameTable,
+					name,
+				),
+			)
+
+		row += 1
+
+	found
+
+
+---
+Else keyword rows: sorted by node, each naming an `IfNode` with an else branch
+(a third child) and lying inside it, and every such `IfNode` having one. Rows
+are sorted (checked here), so one walk over the nodes finds each node's row.
+---
+pure func check_else_keywords(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for keyword_row in builder.else_keywords:
+		node: Int = keyword_row.node.node_id_index()
+
+		match builder.nodes.get(node):
+			Some(node_row):
+				if node_row.kind != IfNode or node_row.children.count <= ELSE_BRANCH_ORDINAL:
+					found = found.append(
+						violation(
+							ElseKeywordMismatch,
+							ElseKeywordTable,
+							row,
+							NodeTable,
+							node,
+						),
+					)
+				else:
+					found = check_name_within(
+						found,
+						ElseKeywordTable,
+						row,
+						keyword_row.keyword_span,
+						node_row.span,
+					)
+			None:
+				found = found.append(
+					violation(
+						DanglingReference,
+						ElseKeywordTable,
+						row,
+						NodeTable,
+						node,
+					),
+				)
+
+		row += 1
+
+	found = sorted_by_owner(
+		found,
+		ElseKeywordTable,
+		builder.else_keywords.map(pure func(keyword_row): keyword_row.node.node_id_index()),
+	)
+
+	var next_row: Int = 0
+	var node_index: Int = 0
+
+	for node in builder.nodes:
+		if node.kind == IfNode and node.children.count > ELSE_BRANCH_ORDINAL:
+			has_row: Bool = match builder.else_keywords.get(next_row):
+				Some(keyword_row):
+					keyword_row.node.node_id_index() == node_index
+				None:
+					False
+
+			if has_row:
+				next_row += 1
+			else:
+				found = found.append(
+					violation(
+						ElseKeywordMismatch,
+						NodeTable,
+						node_index,
+						ElseKeywordTable,
+						node_index,
+					),
+				)
+
+		node_index += 1
+
+	found
+
+
+---
+The child ordinal of an `IfNode`'s else branch: after the condition and the
+then block.
+---
+private ELSE_BRANCH_ORDINAL: Int = 2
+
+
+---
+The node name span rows are sorted by node, strictly increasing, and each names
+a node. The per-node checks against the node's kind are `check_node_rows`'s.
+---
+pure func check_node_name_row_order(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+	node_count: Int = builder.nodes.length()
+	var previous: Int = NO_NODE_ROW
+
+	-- The sorted check is `sorted_by_owner`'s, written as a loop over the rows:
+	-- mapping the 100k rows to their owners first allocates for each one.
+	for name_row in builder.node_name_spans:
+		owner: Int = name_row.node.node_id_index()
+
+		if owner >= node_count:
+			found = found.append(
+				violation(
+					DanglingReference,
+					NodeNameSpanTable,
+					row,
+					NodeTable,
+					owner,
+				),
+			)
+
+		if owner <= previous:
+			found = found.append(
+				violation(
+					SideTableUnsorted,
+					NodeNameSpanTable,
+					row,
+					NodeNameSpanTable,
+					owner,
+				),
+			)
+
+		previous = owner
+		row += 1
+
+	found
+
+
+---
+The node name span row `row` belongs to, or `NO_NODE_ROW` when there is no such
+row: read once per row, so the walk over the nodes compares integers.
+---
+private pure func name_span_row_node(builder: DiscoveryBuilder, row: Int) -> Int:
+	builder.node_name_spans.get_or(row, NO_NAME_SPAN_ROW).node.node_id_index()
+
+
+---
+Stands for the node of a side table row past the table's end: no node has it.
+---
+private NO_NODE_ROW: Int = -1
+
+---
+Stands for a node name span row past the table's end. `get_or` reads it where a
+`get` would allocate an `Option` for every row it finds.
+---
+private NO_NAME_SPAN_ROW: NodeNameSpanRow = {
+	node = node_id_at_row(NO_NODE_ROW),
+	name_span = NO_SPAN
+}
+
+
+---
+Whether a node of this kind with `child_count` children has a
+`NodeNameSpanRow`, as `node_schema` declares: its name is narrower than the
+node. A body node's name is narrower because something always comes with it: a
+receiver before a field, a value after a binding target, a binder's header, a
+constructor's parentheses or qualifier, the dots of a spread. A name that is the
+whole node, an untyped lambda parameter or a type with no arguments, has no row.
+---
+pure func needs_name_span_row(kind: NodeKind, child_count: Int) -> Bool:
+	kind.node_schema().name_span.name_span_row_expected(child_count)
+
+
+---
+Whether a node with `child_count` children has a name span row under `rule`.
+---
+pure func name_span_row_expected(rule: NameSpanRule, child_count: Int) -> Bool:
+	match rule:
+		NoNameSpanRow:
+			False
+		NameSpanRowRequired:
+			True
+		NameSpanRowWhenItHasChildren:
+			child_count > 0
+
+
+---
+A `QualifierOutsideReference` for each bound or supertrait qualifier whose span
+is not inside its parent's. A qualifier naming no parent is a dangling
+reference the row checks already report.
+---
+pure func check_qualifier_spans(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for qualifier in builder.bound_qualifiers:
+		parent: Int = qualifier.bound.bound_id_index()
+
+		match builder.bounds.get(parent):
+			Some(bound):
+				if not qualifier.span.span_within(bound.span):
+					found = found.append(
+						violation(
+							QualifierOutsideReference,
+							BoundQualifierTable,
+							row,
+							BoundTable,
+							parent,
+						),
+					)
+			None:
+				void
+
+		row += 1
+
+	row = 0
+
+	for qualifier in builder.supertrait_qualifiers:
+		parent: Int = qualifier.supertrait.supertrait_id_index()
+
+		match builder.supertraits.get(parent):
+			Some(supertrait):
+				if not qualifier.span.span_within(supertrait.span):
+					found = found.append(
+						violation(
+							QualifierOutsideReference,
+							SupertraitQualifierTable,
+							row,
+							SupertraitTable,
+							parent,
+						),
+					)
+			None:
+				void
+
+		row += 1
+
+	found
+
+
+---
+Whether `inner` lies inside `outer`: the same source, starting no earlier and
+ending no later.
+---
+private pure func span_within(inner: Span, outer: Span) -> Bool:
+	(
+		inner.span_source_index() == outer.span_source_index()
+		and inner.span_start() >= outer.span_start()
+		and inner.span_end() <= outer.span_end()
+	)
+
+
+---
+Appends a `SpanOutsideSources` violation unless `span` names a source.
+---
+private pure func check_span(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	row: Int,
+	span: Span,
+	source_lengths: List[Int],
+) -> List[TableInvariantViolation]:
+	source_index: Int = span.span_source_index()
+
+	match source_lengths.get(source_index):
+		Some(length):
+			if span.span_end() <= length:
+				found
+			else:
+				found.append(violation(SpanPastSourceEnd, table, row, SourceTable, span.span_end()))
+		None:
+			found.append(violation(SpanOutsideSources, table, row, SourceTable, source_index))
+
+
+---
+Every span stored in a row names a source and ends within its text.
+---
+pure func check_spans(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	sources: List[Int] = builder.source_texts.map(pure func(text): text.length())
+	var row: Int = 0
+
+	for import_row in builder.imports:
+		found = check_span(found, ImportTable, row, import_row.span, sources)
+		found = check_span(found, ImportTable, row, import_row.path_span, sources)
+		row += 1
+
+	row = 0
+
+	for item in builder.import_items:
+		found = check_span(found, ImportItemTable, row, item.span, sources)
+		found = check_span(found, ImportItemTable, row, item.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for alias_row in builder.import_aliases:
+		found = check_span(found, ImportAliasTable, row, alias_row.span, sources)
+		row += 1
+
+	row = 0
+
+	for alias_row in builder.import_item_aliases:
+		found = check_span(found, ImportItemAliasTable, row, alias_row.span, sources)
+		row += 1
+
+	row = 0
+
+	for variant in builder.import_item_variants:
+		found = check_span(found, ImportItemVariantTable, row, variant.span, sources)
+		row += 1
+
+	row = 0
+
+	for block in builder.import_blocks:
+		found = check_span(found, ImportBlockTable, row, block.span, sources)
+		row += 1
+
+	row = 0
+
+	for definition in builder.definitions:
+		found = check_span(found, DefinitionTable, row, definition.span, sources)
+		found = check_span(found, DefinitionTable, row, definition.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for documentation in builder.module_documentation:
+		found = check_span(found, ModuleDocumentationTable, row, documentation.span, sources)
+		row += 1
+
+	row = 0
+
+	for annotation in builder.annotations:
+		found = check_span(found, AnnotationTable, row, annotation.span, sources)
+		row += 1
+
+	row = 0
+
+	for parameter in builder.type_parameters:
+		found = check_span(found, TypeParameterTable, row, parameter.span, sources)
+		found = check_span(found, TypeParameterTable, row, parameter.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for bound in builder.bounds:
+		found = check_span(found, BoundTable, row, bound.span, sources)
+		found = check_span(found, BoundTable, row, bound.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for qualifier in builder.bound_qualifiers:
+		found = check_span(found, BoundQualifierTable, row, qualifier.span, sources)
+		row += 1
+
+	row = 0
+
+	for supertrait in builder.supertraits:
+		found = check_span(found, SupertraitTable, row, supertrait.span, sources)
+		found = check_span(found, SupertraitTable, row, supertrait.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for qualifier in builder.supertrait_qualifiers:
+		found = check_span(found, SupertraitQualifierTable, row, qualifier.span, sources)
+		row += 1
+
+	row = 0
+
+	for signature in builder.signatures:
+		found = check_span(found, SignatureTable, row, signature.keyword_span, sources)
+		row += 1
+
+	row = 0
+
+	for parameter in builder.parameters:
+		found = check_span(found, ParameterTable, row, parameter.binder_span, sources)
+		found = check_span(found, ParameterTable, row, parameter.span, sources)
+		row += 1
+
+	row = 0
+
+	for binder_name in builder.binder_names:
+		found = check_span(found, BinderNameTable, row, binder_name.span, sources)
+		row += 1
+
+	row = 0
+
+	for constraint in builder.dimension_constraints:
+		found = check_span(found, DimensionConstraintTable, row, constraint.span, sources)
+		row += 1
+
+	row = 0
+
+	for block in builder.foreign_blocks:
+		found = check_span(found, ForeignBlockTable, row, block.span, sources)
+		row += 1
+
+	row = 0
+
+	for argument in builder.foreign_arguments:
+		found = check_span(found, ForeignArgumentTable, row, argument.span, sources)
+		found = check_span(found, ForeignArgumentTable, row, argument.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for c_name in builder.foreign_c_names:
+		found = check_span(found, ForeignCNameTable, row, c_name.span, sources)
+		row += 1
+
+	row = 0
+
+	for cleanup in builder.resource_cleanups:
+		found = check_span(found, ResourceCleanupTable, row, cleanup.span, sources)
+		row += 1
+
+	row = 0
+
+	for node in builder.nodes:
+		found = check_span(found, NodeTable, row, node.span, sources)
+		row += 1
+
+	row = 0
+
+	for name_row in builder.node_name_spans:
+		found = check_span(found, NodeNameSpanTable, row, name_row.name_span, sources)
+		row += 1
+
+	row = 0
+
+	for keyword_row in builder.else_keywords:
+		found = check_span(found, ElseKeywordTable, row, keyword_row.keyword_span, sources)
+		row += 1
+
+	row = 0
+
+	for diagnostic in builder.diagnostics:
+		found = check_span(found, DiagnosticTable, row, diagnostic.span, sources)
+		row += 1
+
+	row = 0
+
+	for diagnostic in builder.resolution_diagnostics:
+		found = check_span(found, ResolutionDiagnosticTable, row, diagnostic.span, sources)
+		row += 1
+
+	found

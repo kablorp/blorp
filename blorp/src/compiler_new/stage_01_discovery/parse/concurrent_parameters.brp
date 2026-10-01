@@ -1,0 +1,186 @@
+-- The parameters of a `concurrent` or `concurrently` header (`count = n`,
+-- `limit = n`, ...): which parameter names exist, which owner accepts which,
+-- and the checks on a literal count. The expressions the parameters hold are
+-- parsed by `body_parser`; this module only validates what was parsed.
+import:
+	../tables/builder: DiscoveryBuilder, append_plain_diagnostic
+	../tables/diagnostic_code:
+		DiscoveryDiagnosticCode(
+			ConcurrentDuplicateParameterDiagnostic, ConcurrentForMaxThreadsDiagnostic,
+			ConcurrentForUnknownParameterDiagnostic, ConcurrentLimitNotPositiveLiteralDiagnostic,
+			ConcurrentMaxThreadsNotPositiveLiteralDiagnostic, ConcurrentUnknownParameterDiagnostic,
+		),
+	../tables/ids: NameId, NodeId, name_id_index
+	../tables/name_vocabulary: LIMIT_NAME_INDEX, MAX_THREADS_NAME_INDEX, TIMEOUT_NAME_INDEX
+	../tables/node_builder: node_row, record_concurrency_count_of_last_node
+	../tables/row_kinds: NodeKind(IntegerLiteralNode)
+	../tables/rows: NodeRow
+	../tables/span: Span
+	../tables/token: TokenKind(IdentifierToken)
+	parser_cursor: at, current_token
+	type_parser: node_span
+
+
+---
+Which construct owns a concurrency parameter list; the two accept different
+names (`max_threads` versus `limit`).
+---
+enum ConcurrentParameterOwner:
+	ConcurrentBlockOwner
+	ConcurrentForOwner
+
+
+---
+Which parameter a name is, for the concurrency parameter rules. The spelling
+is matched once, in `concurrent_parameter_name`.
+---
+enum ConcurrentParameterName:
+	MaxThreadsParameter
+	LimitParameter
+	TimeoutParameter
+	UnknownParameter
+
+
+pure func concurrent_parameter_seen(
+	seen: List[ConcurrentParameterName],
+	name: ConcurrentParameterName,
+) -> Bool:
+	var found: Bool = False
+
+	for earlier in seen:
+		if earlier == name:
+			found = True
+
+	found
+
+
+---
+The count parameter `owner` requires or allows: `max_threads` for
+`concurrent`, `limit` for `concurrently`.
+---
+pure func concurrent_count_parameter(owner: ConcurrentParameterOwner) -> ConcurrentParameterName:
+	match owner:
+		ConcurrentBlockOwner:
+			MaxThreadsParameter
+		ConcurrentForOwner:
+			LimitParameter
+
+
+---
+Which parameter the token at the cursor names; anything that is not one of
+the three known identifiers is `UnknownParameter`.
+---
+pure func concurrent_parameter_name(builder: DiscoveryBuilder) -> ConcurrentParameterName:
+	if not builder.at(IdentifierToken):
+		UnknownParameter
+	else if builder.current_token().payload == MAX_THREADS_NAME_INDEX:
+		MaxThreadsParameter
+	else if builder.current_token().payload == LIMIT_NAME_INDEX:
+		LimitParameter
+	else if builder.current_token().payload == TIMEOUT_NAME_INDEX:
+		TimeoutParameter
+	else:
+		UnknownParameter
+
+
+---
+Reports a parameter whose name `owner` does not accept, that repeats an
+earlier name, or whose count is not a positive integer literal. Like the
+existing parser, only the first occurrence of a name has its value checked.
+`value` is the parameter's parsed value node.
+---
+pure func check_concurrent_parameter(
+	builder: DiscoveryBuilder,
+	owner: ConcurrentParameterOwner,
+	name: ConcurrentParameterName,
+	name_id: NameId,
+	seen: List[ConcurrentParameterName],
+	name_span: Span,
+	value: NodeId,
+) -> DiscoveryBuilder:
+	count: ConcurrentParameterName = owner.concurrent_count_parameter()
+
+	if name == count or name == TimeoutParameter:
+		if seen.concurrent_parameter_seen(name):
+			builder.append_diagnostic_with_argument(
+				ConcurrentDuplicateParameterDiagnostic,
+				name_span,
+				name_id.name_id_index(),
+			)
+		else if (
+			name == count
+			and builder
+				.positive_literal_count(value)
+				.is_none()
+		):
+			code: DiscoveryDiagnosticCode = match owner:
+				ConcurrentBlockOwner:
+					ConcurrentMaxThreadsNotPositiveLiteralDiagnostic
+				ConcurrentForOwner:
+					ConcurrentLimitNotPositiveLiteralDiagnostic
+
+			builder.append_plain_diagnostic(
+				code,
+				builder.node_span(value),
+			)
+		else:
+			builder
+	else:
+		match owner:
+			ConcurrentBlockOwner:
+				builder.append_diagnostic_with_argument(
+					ConcurrentUnknownParameterDiagnostic,
+					name_span,
+					name_id.name_id_index(),
+				)
+			ConcurrentForOwner:
+				if name == MaxThreadsParameter:
+					builder.append_plain_diagnostic(ConcurrentForMaxThreadsDiagnostic, name_span)
+				else:
+					builder.append_diagnostic_with_argument(
+						ConcurrentForUnknownParameterDiagnostic,
+						name_span,
+						name_id.name_id_index(),
+					)
+
+
+---
+The count `value` writes when it is an integer literal node that is positive,
+else `None`. `2 + 2`, `-1` and calls are other node kinds. Like the existing
+parser it accepts a literal above `Int`'s range, which `parse_int` saturates;
+rejecting those is a general typecheck rule, not a check here.
+---
+pure func positive_literal_count(builder: DiscoveryBuilder, value: NodeId) -> Option[Int]:
+	row: NodeRow = builder.node_row(value)
+
+	match row.kind:
+		IntegerLiteralNode:
+			match builder.literals.get(row.payload):
+				Some(text):
+					match text.parse_int():
+						Some(number):
+							if number > 0:
+								Some(number)
+							else:
+								None
+						None:
+							None
+				None:
+					None
+		_:
+			None
+
+
+---
+`builder` with the concurrency count `written` recorded for the node appended
+last, when there is one.
+---
+pure func with_concurrency_count(
+	builder: DiscoveryBuilder,
+	written: Option[Int],
+) -> DiscoveryBuilder:
+	match written:
+		Some(count):
+			builder.record_concurrency_count_of_last_node(count)
+		None:
+			builder

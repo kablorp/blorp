@@ -1,0 +1,426 @@
+-- Names that bind: parameters, lambda parameters, tuple binders (in parameters,
+-- destructuring statements and `for` headers) and optional type annotations.
+-- None of them re-enters the expression grammar, so they sit below `body_parser`.
+import:
+	../tables/builder:
+		DiscoveryBuilder,
+		advance_token,
+		append_binder_name,
+		append_parameter,
+		append_parameter_type,
+		append_plain_diagnostic,
+		next_binder_name_row,
+		next_parameter_id,
+	../tables/diagnostic_code:
+		DiscoveryDiagnosticCode(
+			ExpectedCommaDiagnostic, ExpectedNameDiagnostic, ExpectedRightParenDiagnostic,
+			TupleArityDiagnostic,
+		),
+	../tables/ids: DefinitionId, NameId, NodeId, ParameterId, name_id_at_row
+	../tables/name_vocabulary: DISCARD_NAME_INDEX
+	../tables/node_builder:
+		ChildMark,
+		append_name_leaf_node,
+		append_name_only_parent_node_from_stack,
+		append_named_parent_node_from_stack,
+		append_parent_node_since,
+		child_count_since,
+		last_node_id,
+		mark_children,
+		push_last_node,
+	../tables/row_kinds:
+		NodeKind(LambdaParameterNode, LoopBinderNode, TupleLoopBinderNode),
+		ParameterBinder(NamedParameterBinder, TupleParameterBinder, WildcardParameterBinder),
+		ParsedConstruct(
+			FunctionParameters, LambdaParameter, LambdaParameters, ParameterName, TupleBinderName,
+			TupleLoopVariables, TupleParameterNames,
+		),
+	../tables/span: Span, span_covering
+	../tables/token:
+		TokenKind(
+			ColonSymbol, CommaSymbol, DedentToken, EndOfFileToken, IndentToken, LeftParenSymbol,
+			RightParenSymbol, UnderscoreSymbol,
+		),
+	parser_cursor:
+		at,
+		binder_name_at_cursor,
+		consume_binder_name,
+		consume_declared_name,
+		current_span,
+		declared_name_at_cursor,
+		expect_token_in,
+		peek_kind,
+		report_at_current_in,
+		skip_newlines,
+		token_at,
+		token_kind_at,
+	type_parser: node_span, parse_type
+
+
+---
+The fewest and most names a tuple binder may have.
+---
+private MIN_TUPLE_BINDER_NAMES: Int = 2
+
+private MAX_TUPLE_BINDER_NAMES: Int = 4
+
+
+---
+Parameters after `(`, through `)`; they may continue on indented lines.
+---
+pure func parse_parameters(builder: DiscoveryBuilder, owner: DefinitionId) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder.skip_newlines()
+	var opened_indent: Bool = False
+	var ordinal: Int = 0
+
+	if out.at(IndentToken):
+		opened_indent = True
+		out = out.advance_token()
+		out = out.skip_newlines()
+
+	if not out.at(RightParenSymbol):
+		var parsing: Bool = True
+
+		while parsing and not out.at(EndOfFileToken):
+			out = out.parse_parameter(owner, ordinal)
+			ordinal += 1
+
+			if out.at(CommaSymbol):
+				out = out.advance_token()
+				out = out.skip_newlines()
+
+				if opened_indent and out.at(DedentToken):
+					out = out.advance_token()
+					out = out.skip_newlines()
+
+				if out.at(RightParenSymbol):
+					parsing = False
+			else:
+				parsing = False
+
+	out = out.skip_newlines()
+
+	if opened_indent and out.at(DedentToken):
+		out = out.advance_token()
+		out = out.skip_newlines()
+
+	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, FunctionParameters)
+
+
+---
+One parameter: `name`, `name: T`, `_`, `_: T`, or `(a, b): T`.
+---
+private pure func parse_parameter(
+	builder: DiscoveryBuilder,
+	owner: DefinitionId,
+	ordinal: Int,
+) -> DiscoveryBuilder:
+	parameter: ParameterId = builder.next_parameter_id()
+	names_first: Int = builder.next_binder_name_row()
+	binder_start: Span = builder.current_span()
+	binder: ParameterBinder = builder.parameter_binder_at_cursor()
+	var out: DiscoveryBuilder = builder.parse_parameter_binder(binder)
+	names_count: Int = out.next_binder_name_row() - names_first
+
+	binder_span: Span = if binder == TupleParameterBinder:
+		binder_start.span_covering(out.tuple_binder_close_span())
+	else:
+		binder_start
+
+	if (
+		binder == TupleParameterBinder
+		and (names_count < MIN_TUPLE_BINDER_NAMES or names_count > MAX_TUPLE_BINDER_NAMES)
+	):
+		out = out.append_plain_diagnostic(TupleArityDiagnostic, binder_span)
+
+	var span: Span = binder_span
+
+	if out.at(ColonSymbol):
+		out = out.advance_token()
+		out = out.parse_type()
+		parameter_type: NodeId = out.last_node_id()
+		out = out.append_parameter_type({
+			parameter = parameter,
+			type_root = parameter_type,
+		})
+		span = binder_span.span_covering(out.node_span(parameter_type))
+
+	out.append_parameter({
+		owner = owner,
+		ordinal = ordinal,
+		binder = binder,
+		binder_names = {
+			first = names_first,
+			count = names_count
+		},
+		binder_span = binder_span,
+		span = span,
+	})
+
+
+---
+The binder form of the parameter at the cursor: `(a, b)` is a tuple, a lone
+`_` a wildcard, and a name or `_: T` a named binder (`_` binds the discard
+name).
+---
+private pure func parameter_binder_at_cursor(builder: DiscoveryBuilder) -> ParameterBinder:
+	if builder.at(LeftParenSymbol):
+		TupleParameterBinder
+	else if builder.at(UnderscoreSymbol) and builder.peek_kind(1) != ColonSymbol:
+		WildcardParameterBinder
+	else:
+		NamedParameterBinder
+
+
+---
+Consumes a parameter's binder and appends its binder names.
+---
+private pure func parse_parameter_binder(
+	builder: DiscoveryBuilder,
+	binder: ParameterBinder,
+) -> DiscoveryBuilder:
+	binder_start: Span = builder.current_span()
+
+	match binder:
+		TupleParameterBinder:
+			builder
+				.advance_token()
+				.parse_tuple_binder_names()
+		WildcardParameterBinder:
+			builder.advance_token()
+		NamedParameterBinder:
+			if builder.at(UnderscoreSymbol):
+				builder
+					.advance_token()
+					.append_binder_name({
+						name = name_id_at_row(DISCARD_NAME_INDEX),
+						span = binder_start,
+					})
+			else:
+				builder.parse_binder_name()
+
+
+---
+One binder name, appended with its span.
+---
+private pure func parse_binder_name(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = builder.declared_name_at_cursor()
+	name_span: Span = builder.current_span()
+	builder
+		.consume_declared_name(ParameterName)
+		.append_binder_name({
+			name = name,
+			span = name_span,
+		})
+
+
+---
+The names of a tuple binder after its `(`, through the `)`.
+---
+private pure func parse_tuple_binder_names(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+	var parsing: Bool = not out.at(EndOfFileToken)
+
+	while parsing:
+		out = out.parse_binder_name()
+
+		if out.at(CommaSymbol):
+			out = out.advance_token()
+			parsing = not (out.at(RightParenSymbol) or out.at(EndOfFileToken))
+		else:
+			parsing = False
+
+	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, TupleParameterNames)
+
+
+---
+The token a tuple binder's span ends at: its `)` when `parse_tuple_binder_names`
+consumed one, else the token that stood in its place. The names never consume
+a `)` (it is a soft boundary), so a `)` just before the cursor is the close.
+---
+private pure func tuple_binder_close_span(builder: DiscoveryBuilder) -> Span:
+	if builder.token_kind_at(builder.token_cursor - 1) == RightParenSymbol:
+		builder.token_at(builder.token_cursor - 1).span
+	else:
+		builder.current_span()
+
+
+---
+`: T` when written, its root pushed on the child stack.
+---
+pure func parse_optional_type_annotation(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if builder.at(ColonSymbol):
+		builder
+			.advance_token()
+			.parse_type()
+			.push_last_node()
+	else:
+		builder
+
+
+---
+The names of a tuple binder after its `(`, through the `)`, each a `kind`
+leaf pushed on the child stack; `_` is allowed. Two to four names.
+---
+pure func parse_tuple_binder(
+	builder: DiscoveryBuilder,
+	start: Span,
+	kind: NodeKind,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
+	mark: ChildMark = builder.mark_children()
+	var out: DiscoveryBuilder = builder.push_binder_leaf(kind)
+	var end: Span = out.node_span(out.last_node_id())
+
+	if out.at(CommaSymbol):
+		out = out.advance_token()
+		var parsing: Bool = True
+
+		while parsing and not out.at(EndOfFileToken):
+			if out.at(RightParenSymbol):
+				out = out.report_at_current_in(ExpectedNameDiagnostic, TupleBinderName)
+				parsing = False
+			else:
+				out = out.push_binder_leaf(kind)
+				end = out.node_span(out.last_node_id())
+
+				if out.at(CommaSymbol):
+					out = out.advance_token()
+
+					if out.at(RightParenSymbol):
+						parsing = False
+				else:
+					parsing = False
+	else:
+		out = out.report_at_current_in(ExpectedCommaDiagnostic, construct)
+
+	if out.at(RightParenSymbol):
+		end = out.current_span()
+
+	out = out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, construct)
+	count: Int = out.child_count_since(mark)
+
+	if count < MIN_TUPLE_BINDER_NAMES or count > MAX_TUPLE_BINDER_NAMES:
+		out = out.append_plain_diagnostic(
+			TupleArityDiagnostic,
+			start.span_covering(end),
+		)
+
+	out
+
+
+---
+A binder name (`_` allowed) as a `kind` leaf, pushed on the child stack.
+---
+private pure func push_binder_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+	name: NameId = builder.binder_name_at_cursor()
+	span: Span = builder.current_span()
+	builder
+		.consume_binder_name(TupleBinderName)
+		.append_name_leaf_node(kind, span, name)
+		.push_last_node()
+
+
+---
+A loop variable, or `(a, b)` loop variables, pushed on the child stack.
+---
+pure func parse_loop_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if builder.at(LeftParenSymbol):
+		builder.parse_tuple_loop_binder()
+	else:
+		builder.push_binder_leaf(LoopBinderNode)
+
+
+private pure func parse_tuple_loop_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = builder.current_span()
+	mark: ChildMark = builder.mark_children()
+	names: DiscoveryBuilder = builder
+		.advance_token()
+		.parse_tuple_binder(start, LoopBinderNode, TupleLoopVariables)
+	span: Span = start.span_covering(names.token_at(names.token_cursor - 1).span)
+	names
+		.append_parent_node_since(mark, TupleLoopBinderNode, span)
+		.push_last_node()
+
+
+---
+Lambda parameters after `(`, through `)`, each pushed; they may continue on
+indented lines.
+---
+pure func parse_lambda_parameters(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder.skip_newlines()
+	var opened_indent: Bool = False
+
+	if out.at(IndentToken):
+		opened_indent = True
+		out = out.advance_token()
+		out = out.skip_newlines()
+
+	if not out.at(RightParenSymbol):
+		var parsing: Bool = True
+
+		while parsing and not out.at(EndOfFileToken):
+			out = out.parse_lambda_parameter()
+			out = out.push_last_node()
+
+			if out.at(CommaSymbol):
+				out = out.advance_token()
+				out = out.skip_newlines()
+
+				if opened_indent and out.at(DedentToken):
+					out = out.advance_token()
+					out = out.skip_newlines()
+
+				if out.at(RightParenSymbol):
+					parsing = False
+			else:
+				parsing = False
+
+	out = out.skip_newlines()
+
+	if opened_indent and out.at(DedentToken):
+		out = out.advance_token()
+		out = out.skip_newlines()
+
+	out.expect_token_in(RightParenSymbol, ExpectedRightParenDiagnostic, LambdaParameters)
+
+
+private pure func parse_lambda_parameter(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	name: NameId = builder.binder_name_at_cursor()
+	name_span: Span = builder.current_span()
+	mark: ChildMark = builder.mark_children()
+	annotated: DiscoveryBuilder = builder
+		.consume_binder_name(LambdaParameter)
+		.parse_optional_type_annotation()
+	count: Int = annotated.child_count_since(mark)
+
+	span: Span = if count > 0:
+		name_span.span_covering(annotated.node_span(annotated.last_node_id()))
+	else:
+		name_span
+
+	annotated.append_lambda_parameter_node(span, name, name_span, count)
+
+
+---
+The lambda parameter node over its `count` written children (its type, or
+none). A typed parameter's name is narrower than the node and has a name span
+row; an untyped one is its name alone.
+---
+private pure func append_lambda_parameter_node(
+	builder: DiscoveryBuilder,
+	span: Span,
+	name: NameId,
+	name_span: Span,
+	count: Int,
+) -> DiscoveryBuilder:
+	if count > 0:
+		builder.append_named_parent_node_from_stack(
+			LambdaParameterNode,
+			span,
+			name,
+			name_span,
+			count,
+		)
+	else:
+		builder.append_name_only_parent_node_from_stack(LambdaParameterNode, span, name, count)

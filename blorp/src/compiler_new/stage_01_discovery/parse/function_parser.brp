@@ -1,0 +1,124 @@
+-- The parts of a function declaration that do not re-enter the body grammar: the
+-- signature and its parameters, the purity keyword, and the lookahead that
+-- tells a local function from a lambda. `parse_function` itself stays in
+-- `body_parser`: a body may declare a local function, so a function and the
+-- statements inside it recurse into each other, and a module cannot import a
+-- module that imports it.
+import:
+	../tables/builder: DiscoveryBuilder, advance_token, append_signature
+	../tables/diagnostic_code: DiscoveryDiagnosticCode(ExpectedLeftParenDiagnostic)
+	../tables/ids: DefinitionId, ModuleId, definition_id_index, module_id_at_row
+	../tables/row_kinds: ParsedConstruct, Purity(ImpureFunction, PureFunction)
+	../tables/source_position: span_start_line
+	../tables/span: Span
+	../tables/token: TokenKind(FuncKeyword, IndentToken, LeftParenSymbol, NewlineToken, PureKeyword)
+	binder_parser: parse_parameters
+	parser_cursor: at, at_block_end, current_span, peek_kind, report_at_current_in
+
+
+---
+The span a function's last dimension constraint ends with.
+---
+pure func constraint_end(builder: DiscoveryBuilder) -> Span:
+	match builder.dimension_constraints.get(builder.dimension_constraints.length() - 1):
+		Some(constraint):
+			constraint.span
+		None:
+			builder.current_span()
+
+
+---
+Whether a body follows a function's `:`: not at the end of a block, not a
+new line without an indented block (a declaration without a body), and not
+a token on a later line (which belongs to what follows).
+---
+pure func function_body_follows(builder: DiscoveryBuilder, colon_line: Int) -> Bool:
+	if builder.at_block_end():
+		False
+	else if builder.at(NewlineToken):
+		builder.peek_kind(1) == IndentToken
+	else:
+		builder.span_start_line(builder.current_span()) <= colon_line
+
+
+---
+`(params)` of `definition` and its signature row.
+---
+pure func parse_signature(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	purity: Purity,
+	keyword_span: Span,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
+	parameters_first: Int = builder.parameters.length()
+	out: DiscoveryBuilder = builder.parse_parenthesized_parameters(definition, construct)
+	parameters_count: Int = out.parameters.length() - parameters_first
+	out.append_signature({
+		definition = definition,
+		purity = purity,
+		keyword_span = keyword_span,
+		parameters = {
+			first = parameters_first,
+			count = parameters_count
+		},
+	})
+
+
+---
+`(params)`, or a report that the `(` is missing.
+---
+pure func parse_parenthesized_parameters(
+	builder: DiscoveryBuilder,
+	owner: DefinitionId,
+	construct: ParsedConstruct,
+) -> DiscoveryBuilder:
+	if builder.at(LeftParenSymbol):
+		builder
+			.advance_token()
+			.parse_parameters(owner)
+	else:
+		builder.report_at_current_in(ExpectedLeftParenDiagnostic, construct)
+
+
+---
+`func name(...)` or `pure func name(...)` in a body: a local function, as
+opposed to a lambda (`func(...)`).
+---
+pure func starts_local_function(builder: DiscoveryBuilder) -> Bool:
+	if builder.at(FuncKeyword):
+		builder.peek_kind(1) != LeftParenSymbol
+	else:
+		builder.peek_kind(1) == FuncKeyword and builder.peek_kind(2) != LeftParenSymbol
+
+
+pure func local_function_purity(builder: DiscoveryBuilder) -> Purity:
+	if builder.at(PureKeyword):
+		PureFunction
+	else:
+		ImpureFunction
+
+
+pure func skip_pure_keyword(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if builder.at(PureKeyword):
+		builder.advance_token()
+	else:
+		builder
+
+
+pure func definition_span(builder: DiscoveryBuilder, definition: DefinitionId) -> Span:
+	match builder.definitions.get(definition.definition_id_index()):
+		Some(row):
+			row.span
+		None:
+			builder.current_span()
+
+
+---
+The module whose body is being parsed. `load_module` appends a module's row
+before it lexes and parses the module's tokens, so it is the last module row;
+this saves threading the module through every expression routine for the
+one that needs it.
+---
+pure func module_being_parsed(builder: DiscoveryBuilder) -> ModuleId:
+	module_id_at_row(builder.modules.length() - 1)

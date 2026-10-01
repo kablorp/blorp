@@ -1,0 +1,284 @@
+-- The leaves of the expression grammar that hold no sub-expression: literals,
+-- keyword and name leaves, builtins, field access, and the lookahead that
+-- recognizes a record field or a removed ascription. The recursive grammar
+-- (operators, calls, lists, `if`, lambdas) stays in `body_parser`.
+import:
+	../tables/builder:
+		DiscoveryBuilder,
+		LoopContext(InLoopBody, NotInLoop),
+		advance_token,
+		append_plain_diagnostic,
+		move_token_cursor,
+	../tables/diagnostic_code:
+		DiscoveryDiagnosticCode(
+			ExpectedBuiltinNameDiagnostic, ExpectedExpressionDiagnostic,
+			ExpectedRightParenDiagnostic, RemovedTypeAscriptionDiagnostic,
+		),
+	../tables/ids: NameId, literal_id_at_row, name_id_at_row
+	../tables/node_builder:
+		append_codepoint_leaf_node,
+		append_leaf_node,
+		append_literal_leaf_node,
+		append_name_leaf_node,
+		append_named_parent_node_from_stack,
+		last_node_id,
+		push_last_node,
+	../tables/row_kinds:
+		NodeKind(
+			BuiltinNode, CharLiteralNode, FieldAccessNode, IdentifierNode, LocalFunctionNode,
+			MissingExpressionNode, NamedBuiltinNode,
+		),
+		ParsedConstruct(BuiltinName, FieldName),
+	../tables/span: Span, span_covering
+	../tables/token:
+		Token,
+		TokenKind(
+			ColonSymbol, CommaSymbol, DedentToken, EndOfFileToken, EqualSymbol, LeftBraceSymbol,
+			LeftBracketSymbol, LeftParenSymbol, NewlineToken, NormalStringToken, PipeStringToken,
+			RawPipeStringToken, RawStringToken, RightBraceSymbol, RightBracketSymbol,
+			RightParenSymbol,
+		),
+	block_layout: closing_span_or
+	parser_cursor:
+		consume_referenced_name,
+		current_name,
+		current_span,
+		current_token,
+		expect_token_in,
+		keyword_name_index,
+		peek_kind,
+		referenced_name_at_cursor,
+		report_and_recover,
+		token_kind_at,
+	type_parser: node_span
+
+
+---
+Reports the removed `value as T` and skips `as T` without adding a node, so
+the value stays the expression. The type is skipped by tokens, not parsed,
+because a parsed type would leave nodes no parent refers to.
+
+The old front end parses the type, so the two differ in diagnostic count only
+where the type's end matters: `x as Int + 1` and `x as Int as Int` report one
+diagnostic here, which skips to the end of the line, and more there.
+---
+pure func report_removed_ascription(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	advanced: DiscoveryBuilder = builder
+		.append_plain_diagnostic(RemovedTypeAscriptionDiagnostic, builder.current_span())
+		.advance_token()
+	var index: Int = advanced.token_cursor
+	var open_delimiters: Int = 0
+
+	while (
+		open_delimiters > 0
+		or not advanced
+			.token_kind_at(index)
+			.ends_ascribed_type()
+	):
+		kind: TokenKind = advanced.token_kind_at(index)
+
+		if (
+			kind == LeftBracketSymbol
+			or kind == LeftParenSymbol
+			or kind == LeftBraceSymbol
+		):
+			open_delimiters += 1
+		else if (
+			kind == RightBracketSymbol
+			or kind == RightParenSymbol
+			or kind == RightBraceSymbol
+		):
+			open_delimiters -= 1
+
+		index += 1
+
+	advanced.move_token_cursor(index)
+
+
+---
+Whether `kind` ends the type of a removed ascription when no delimiter the
+type opened is still open: the end of a line or block, or a delimiter that
+closes or separates the enclosing construct.
+---
+private pure func ends_ascribed_type(kind: TokenKind) -> Bool:
+	match kind:
+		EndOfFileToken | NewlineToken | DedentToken | ColonSymbol | CommaSymbol | RightBracketSymbol | RightParenSymbol | RightBraceSymbol:
+			True
+		_:
+			False
+
+
+---
+`.field` after a receiver.
+---
+pure func parse_field_access(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	receiver_span: Span = builder.node_span(builder.last_node_id())
+	out: DiscoveryBuilder = builder
+		.push_last_node()
+		.advance_token()
+	field: NameId = out.referenced_name_at_cursor()
+	field_span: Span = out.current_span()
+	out
+		.consume_referenced_name(FieldName)
+		.append_named_parent_node_from_stack(
+			FieldAccessNode,
+			receiver_span.span_covering(field_span),
+			field,
+			field_span,
+			1,
+		)
+
+
+---
+Reports a missing expression and appends a `MissingExpressionNode`; the
+offending token is skipped unless it is a soft boundary.
+---
+pure func missing_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	span: Span = builder.current_span()
+	builder
+		.report_and_recover(ExpectedExpressionDiagnostic)
+		.append_leaf_node(MissingExpressionNode, span)
+
+
+pure func literal_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+	token: Token = builder.current_token()
+	builder
+		.advance_token()
+		.append_literal_leaf_node(kind, token.span, literal_id_at_row(token.payload))
+
+
+pure func char_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	token: Token = builder.current_token()
+	builder
+		.advance_token()
+		.append_codepoint_leaf_node(CharLiteralNode, token.span, token.payload)
+
+
+pure func keyword_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+	span: Span = builder.current_span()
+	builder
+		.advance_token()
+		.append_leaf_node(kind, span)
+
+
+---
+A `break` or `continue` leaf, reported with `outside_loop` when it is not
+inside a loop body.
+---
+pure func loop_keyword_leaf(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	outside_loop: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	keyword_span: Span = builder.current_span()
+
+	match builder.loop_context:
+		InLoopBody:
+			builder.keyword_leaf(kind)
+		NotInLoop:
+			builder
+				.append_plain_diagnostic(outside_loop, keyword_span)
+				.keyword_leaf(kind)
+
+
+---
+A keyword used as a name (`after`, `sealed`, `from`, `debug`): an identifier
+spelled as the keyword.
+---
+pure func keyword_name_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	token: Token = builder.current_token()
+
+	match token.kind.keyword_name_index():
+		Some(index):
+			builder
+				.advance_token()
+				.append_name_leaf_node(IdentifierNode, token.span, name_id_at_row(index))
+		None:
+			builder.missing_expression()
+
+
+---
+A name.
+---
+pure func parse_identifier_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	token: Token = builder.current_token()
+	builder
+		.advance_token()
+		.append_name_leaf_node(IdentifierNode, token.span, name_id_at_row(token.payload))
+
+
+---
+`builtin` or `builtin("name")`.
+---
+pure func parse_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if builder.peek_kind(1) == LeftParenSymbol:
+		builder.parse_named_builtin()
+	else:
+		builder.keyword_leaf(BuiltinNode)
+
+
+private pure func parse_named_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	start: Span = builder.current_span()
+	opened: DiscoveryBuilder = builder
+		.advance_token()
+		.advance_token()
+	name: Token = opened.current_token()
+	named: Bool = name.kind.is_literal_string_token()
+
+	argument: DiscoveryBuilder = if named:
+		opened.advance_token()
+	else:
+		opened.report_and_recover(ExpectedBuiltinNameDiagnostic)
+
+	end: Span = argument.closing_span_or(RightParenSymbol, name.span)
+	closed: DiscoveryBuilder = argument.expect_token_in(
+		RightParenSymbol,
+		ExpectedRightParenDiagnostic,
+		BuiltinName,
+	)
+
+	if named:
+		closed.append_literal_leaf_node(
+			NamedBuiltinNode,
+			start.span_covering(end),
+			literal_id_at_row(name.payload),
+		)
+	else:
+		closed.append_leaf_node(
+			BuiltinNode,
+			start.span_covering(end),
+		)
+
+
+---
+A string token whose payload is its text: any string but an interpolated
+one, whose text is split around its holes.
+---
+private pure func is_literal_string_token(kind: TokenKind) -> Bool:
+	match kind:
+		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+			True
+		_:
+			False
+
+
+---
+Whether a grouped expression of this kind keeps its own span when parentheses
+surround it: a name and a local function, whose spans rename and reference
+tooling edits, as the existing parser keeps them.
+---
+pure func keeps_token_span(kind: NodeKind) -> Bool:
+	match kind:
+		IdentifierNode | LocalFunctionNode:
+			True
+		_:
+			False
+
+
+pure func starts_record_field(builder: DiscoveryBuilder) -> Bool:
+	(
+		builder
+			.current_name()
+			.is_some()
+		and builder.peek_kind(1) == EqualSymbol
+	)

@@ -34,17 +34,35 @@ which folder owns each step's mechanics.
 stage_01_discovery/
   pipeline.brp     discover and load_module: the order of work
   tables/          the data model every other part writes and reads
-    builder.brp  diagnostic_code.brp  frontend_tables.brp  intern_index.brp
-    invariants.brp  name_vocabulary.brp  row_kinds.brp  source_position.brp
-    span.brp  token.brp
+    ids.brp  rows.brp  builder.brp  node_builder.brp
+                 the opaque ids; the row structs; the builder record and
+                 its table appenders; body nodes and the child stack
+    invariants.brp   runs the checks `freeze` requires; the checks live in
+                     invariants/ (violation, references, cardinalities,
+                     spans_and_names)
+    diagnostic_code.brp  frontend_tables.brp  intern_index.brp
+    name_vocabulary.brp  row_kinds.brp  source_position.brp  span.brp
+    token.brp
   sources/         which files make up the program
     embedded_standard_library.brp  module_graph.brp  source_admission.brp
     source_provider.brp
-  lex/lexer.brp
+  lex/             lexer (the scan loop, symbols, numbers), layout (indent and
+                   lambda-body rules), string_literals, interpolation,
+                   char_literals (escapes), scan_support (shared scanning types)
   diagnostics/render.brp   the message and help of each diagnostic code
   parse/           parser_cursor, declaration_header, declaration_parser,
-                   import_parser, type_parser, pattern_parser, body_parser
+                   import_parser, type_parser, pattern_parser, and the body
+                   parser: body_parser (the recursive core: expressions,
+                   statements and blocks call each other, so they share one
+                   module) over function_parser, binder_parser, block_layout,
+                   statement_forms, concurrent_parameters, expression_atoms
+                   and binary_operators (the parts that do not recurse)
 ```
+
+`tables/invariants/` is the one subfolder in `tables/`: the table invariants are
+about 2,700 lines in three families (references, cardinalities, spans and
+names) over a shared violation type, so they get a folder while the rest of
+`tables/` stays flat.
 
 The tests mirror the folders under `blorp/test/compiler_new/stage_01_discovery/`
 (`tables/`, `sources/`, `lex/`, `parse/`, with `lex/fixtures` and
@@ -110,7 +128,7 @@ discovery's.
 ## 2. Identities
 
 Every table has its own opaque id over `Int`, so ids from different tables
-cannot be mixed up. The constructors are private to `tables/builder.brp`.
+cannot be mixed up. The constructors are private to `tables/ids.brp`.
 
 ```blorp
 opaque type NameId = Int
@@ -147,7 +165,7 @@ information.
 
 ## 3. Rows
 
-Each table is a list of one struct type (`tables/builder.brp`); the
+Each table is a list of one struct type (`tables/rows.brp`); the
 payload-free enums the rows store are in `tables/row_kinds.brp`.
 
 ### Sources, packages, modules and roots

@@ -1,0 +1,444 @@
+-- Indentation and lambda-body layout: the stacks of enclosing indentation
+-- levels and open lambda bodies, and the rules that decide when a newline is
+-- significant, when a line opens or closes a block, and when a dedent lands
+-- between levels. Separate from `lexer` so the rules are readable without the
+-- token loop around them.
+import:
+	../tables/builder: DiscoveryBuilder, append_plain_diagnostic, append_token
+	../tables/diagnostic_code: DiscoveryDiagnosticCode(InconsistentIndentationDiagnostic)
+	../tables/span: pack_span
+	../tables/token: NO_TOKEN_PAYLOAD, TokenKind(DedentToken, IndentToken, NewlineToken)
+
+
+---
+The indentation of a line outside every block.
+---
+TOP_LEVEL_INDENT: Int = 0
+
+
+---
+The lexer's layout stacks: the enclosing indentation levels (the first is
+the top level) and the open lambda bodies, each opened inside brackets at
+`lambda_groups[i]` bracket depth by a line indented `lambda_bases[i]`.
+Newlines inside a lambda body are significant again. Each stack is a list
+and a depth, so pushing and popping reuse the list instead of allocating.
+---
+record LayoutStacks {
+	indent_levels: List[Int],
+	indent_depth: Int,
+	lambda_groups: List[Int],
+	lambda_bases: List[Int],
+	lambda_count: Int
+}
+
+
+---
+What a layout query returns when no dedent is due: never an indentation,
+which is never negative.
+---
+private NO_DEDENT: Int = -1
+
+
+-- Indentation and lambda bodies.
+pure func initial_layout() -> LayoutStacks:
+	{
+		indent_levels = [TOP_LEVEL_INDENT],
+		indent_depth = 1,
+		lambda_groups = [],
+		lambda_bases = [],
+		lambda_count = 0
+	}
+
+
+pure func top_indent(layout: LayoutStacks) -> Int:
+	layout.indent_levels.get_or(layout.indent_depth - 1, TOP_LEVEL_INDENT)
+
+
+private pure func with_indent_pushed(layout: LayoutStacks, indent: Int) -> LayoutStacks:
+	depth: Int = layout.indent_depth
+
+	if depth < layout.indent_levels.length():
+		{ layout |
+			indent_levels = layout.indent_levels.set(depth, indent),
+			indent_depth = depth + 1
+		}
+	else:
+		{ layout |
+			indent_levels = layout.indent_levels.append(indent),
+			indent_depth = depth + 1
+		}
+
+
+pure func with_indent_popped(layout: LayoutStacks) -> LayoutStacks:
+	depth: Int = layout.indent_depth - 1
+	{ layout | indent_depth = depth }
+
+
+---
+Opens a lambda body at `group_depth`. The layout helpers read fields rather
+than passing the record to a function before updating it (the builder
+threading rules in `tables/builder.brp` hold for any record).
+---
+pure func with_lambda_opened(layout: LayoutStacks, group_depth: Int) -> LayoutStacks:
+	count: Int = layout.lambda_count
+	base: Int = layout.indent_levels.get_or(layout.indent_depth - 1, TOP_LEVEL_INDENT)
+
+	if count < layout.lambda_groups.length():
+		{ layout |
+			lambda_groups = layout.lambda_groups.set(count, group_depth),
+			lambda_bases = layout.lambda_bases.set(count, base),
+			lambda_count = count + 1
+		}
+	else:
+		{ layout |
+			lambda_groups = layout.lambda_groups.append(group_depth),
+			lambda_bases = layout.lambda_bases.append(base),
+			lambda_count = count + 1
+		}
+
+
+---
+The bracket depth and base indentation of the innermost open lambda body;
+only read when `lambda_count > 0`.
+---
+private pure func top_lambda_group(layout: LayoutStacks) -> Int:
+	layout.lambda_groups.get_or(layout.lambda_count - 1, 0)
+
+
+private pure func top_lambda_base(layout: LayoutStacks) -> Int:
+	layout.lambda_bases.get_or(layout.lambda_count - 1, TOP_LEVEL_INDENT)
+
+
+---
+Whether a newline at bracket depth `group_depth` is insignificant: inside
+brackets and not directly inside a lambda body opened at this depth.
+---
+pure func newline_is_insignificant(layout: LayoutStacks, group_depth: Int) -> Bool:
+	if group_depth <= 0:
+		False
+	else if layout.lambda_count == 0:
+		True
+	else:
+		group: Int = layout.top_lambda_group()
+		group_depth < group or group_depth > group
+
+
+---
+A newline after a `:` inside brackets opens a lambda body, unless the
+innermost open body is at this depth or deeper.
+---
+pure func opens_lambda_body(layout: LayoutStacks, group_depth: Int, after_colon: Bool) -> Bool:
+	if group_depth <= 0 or not after_colon:
+		False
+	else if layout.lambda_count == 0:
+		True
+	else:
+		group_depth > layout.top_lambda_group()
+
+
+---
+The number of lambda bodies still open after a dedent to `indent`: those
+whose base indentation `indent` still exceeds.
+---
+private pure func lambdas_open_after_dedent(bases: List[Int], count: Int, indent: Int) -> Int:
+	var remaining: Int = count
+
+	while remaining > 0 and indent <= bases.get_or(remaining - 1, TOP_LEVEL_INDENT):
+		remaining -= 1
+
+	remaining
+
+
+---
+Closes the lambda bodies whose base indentation the current indentation no
+longer exceeds.
+---
+private pure func with_lambdas_closed_after_dedent(layout: LayoutStacks) -> LayoutStacks:
+	indent: Int = layout.indent_levels.get_or(layout.indent_depth - 1, TOP_LEVEL_INDENT)
+	remaining: Int = lambdas_open_after_dedent(layout.lambda_bases, layout.lambda_count, indent)
+	{ layout | lambda_count = remaining }
+
+
+---
+Whether dedenting to `indent` would land between two enclosing levels.
+---
+private pure func dedent_lands_between_levels(layout: LayoutStacks, indent: Int) -> Bool:
+	var index: Int = layout.indent_depth - 1
+	var between: Bool = False
+
+	while index >= 0:
+		level: Int = layout.indent_levels.get_or(index, TOP_LEVEL_INDENT)
+
+		if indent >= level:
+			break
+
+		enclosing: Int = layout.indent_levels.get_or(index - 1, TOP_LEVEL_INDENT)
+
+		if indent > enclosing:
+			between = True
+			break
+
+		index -= 1
+
+	between
+
+
+---
+A line indented between a lambda body's base and the body's own level, at
+the bracket depth the body opened at, closes the body: the indentation to
+dedent to (the body's base), or `NO_DEDENT`.
+---
+private pure func lambda_body_close_target(
+	layout: LayoutStacks,
+	group_depth: Int,
+	indent: Int,
+) -> Int:
+	if layout.lambda_count == 0:
+		NO_DEDENT
+	else:
+		base: Int = layout.top_lambda_base()
+
+		if (
+			group_depth == layout.top_lambda_group()
+			and indent > base
+			and indent < layout.top_indent()
+			and layout.dedent_lands_between_levels(indent)
+		):
+			base
+		else:
+			NO_DEDENT
+
+
+---
+What a dedent did to the indentation levels.
+---
+enum DedentOutcome:
+	NoDedent
+	DedentedToLevel
+	DedentedBetweenLevels
+
+
+---
+What the start of a line does, decided from the layout alone: the layout
+tokens it appends, how it moves the layout stacks, and what the lexer loop's
+own state becomes. `plan_line_start` makes the plan; the lexer appends its
+tokens with `append_line_start_tokens` and moves the stacks with
+`with_line_start_applied`, so the decision is here and the builder is only
+ever threaded through one call.
+
+`dedent_count` levels are popped. `DedentedBetweenLevels` means the new
+indentation matches no enclosing level: the dedents are still appended, with
+an inconsistent-indentation diagnostic after them, and the lambda bodies stay
+open. `pending_newline`, `at_line_start` and `previous_kind` are the loop's
+values after the line start.
+---
+struct LineStartPlan {
+	emits_newline: Bool,
+	opens_indent: Bool,
+	indent: Int,
+	dedent: DedentOutcome,
+	dedent_count: Int,
+	pending_newline: Bool,
+	at_line_start: Bool,
+	previous_kind: TokenKind
+}
+
+
+---
+How many enclosing levels, from the innermost out, are indented deeper than
+`target`: the levels a dedent to `target` pops.
+---
+private pure func levels_deeper_than(layout: LayoutStacks, target: Int) -> Int:
+	var count: Int = 0
+
+	while (
+		layout.indent_depth - count > 0
+		and layout.indent_levels.get_or(layout.indent_depth - 1 - count, TOP_LEVEL_INDENT) > target
+	):
+		count += 1
+
+	count
+
+
+---
+A plan that appends nothing and moves no stacks: the loop state is whatever
+the caller passes. `indent` is only read when a plan opens an indent.
+---
+private pure func nothing_appended(
+	indent: Int,
+	pending_newline: Bool,
+	at_line_start: Bool,
+	previous_kind: TokenKind,
+) -> LineStartPlan:
+	{
+		emits_newline = False,
+		opens_indent = False,
+		indent = indent,
+		dedent = NoDedent,
+		dedent_count = 0,
+		pending_newline = pending_newline,
+		at_line_start = at_line_start,
+		previous_kind = previous_kind
+	}
+
+
+---
+Plans a dedent to `target`: pops every deeper level, and lands either on
+`target` or between two levels.
+---
+private pure func dedent_plan(
+	layout: LayoutStacks,
+	target: Int,
+	previous_kind: TokenKind,
+) -> LineStartPlan:
+	count: Int = levels_deeper_than(layout, target)
+	landing: Int = layout.indent_levels.get_or(layout.indent_depth - 1 - count, TOP_LEVEL_INDENT)
+
+	outcome: DedentOutcome = if landing == target:
+		DedentedToLevel
+	else:
+		DedentedBetweenLevels
+
+	last_kind: TokenKind = if count > 0:
+		DedentToken
+	else:
+		previous_kind
+
+	{
+		emits_newline = False,
+		opens_indent = False,
+		indent = target,
+		dedent = outcome,
+		dedent_count = count,
+		pending_newline = False,
+		at_line_start = False,
+		previous_kind = last_kind
+	}
+
+
+---
+Plans the start of a line indented `indent` at bracket depth `group_depth`.
+Inside brackets (and outside a lambda body) the line break is insignificant
+and nothing is appended. A line with no content (blank, or the end of the
+range) appends nothing and leaves the scan at a line start. A content line
+appends the newline the previous line owes, then an indent when it is
+indented deeper than the innermost level, nothing more when it matches it,
+and dedents when it is shallower or closes a lambda body.
+---
+pure func plan_line_start(
+	layout: LayoutStacks,
+	group_depth: Int,
+	indent: Int,
+	has_content: Bool,
+	pending_newline: Bool,
+	previous_kind: TokenKind,
+) -> LineStartPlan:
+	current_indent: Int = layout.top_indent()
+	close_target: Int = layout.lambda_body_close_target(group_depth, indent)
+
+	if layout.newline_is_insignificant(group_depth):
+		nothing_appended(indent, False, False, previous_kind)
+	else if not has_content:
+		nothing_appended(indent, pending_newline, True, previous_kind)
+	else if close_target != NO_DEDENT:
+		dedent_plan(layout, close_target, previous_kind)
+	else if indent > current_indent:
+		{
+			emits_newline = pending_newline,
+			opens_indent = True,
+			indent = indent,
+			dedent = NoDedent,
+			dedent_count = 0,
+			pending_newline = False,
+			at_line_start = False,
+			previous_kind = IndentToken
+		}
+	else if indent == current_indent:
+		last_kind: TokenKind = if pending_newline:
+			NewlineToken
+		else:
+			previous_kind
+
+		{
+			emits_newline = pending_newline,
+			opens_indent = False,
+			indent = indent,
+			dedent = NoDedent,
+			dedent_count = 0,
+			pending_newline = False,
+			at_line_start = False,
+			previous_kind = last_kind
+		}
+	else:
+		dedent_plan(layout, indent, previous_kind)
+
+
+---
+Appends the tokens of a line start plan: the owed newline, then the indent
+(spanning the indentation, `indent_start` to `offset`) or the dedents, then
+the inconsistent-indentation diagnostic when a dedent matched no level. The
+newline, dedents and diagnostic sit at `offset`, the first content byte.
+---
+pure func append_line_start_tokens(
+	builder: DiscoveryBuilder,
+	source_index: Int,
+	plan: LineStartPlan,
+	indent_start: Int,
+	offset: Int,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+
+	if plan.emits_newline:
+		out = out.append_token({
+			kind = NewlineToken,
+			span = pack_span(source_index, offset, offset),
+			payload = NO_TOKEN_PAYLOAD,
+		})
+
+	if plan.opens_indent:
+		out = out.append_token({
+			kind = IndentToken,
+			span = pack_span(source_index, indent_start, offset),
+			payload = NO_TOKEN_PAYLOAD,
+		})
+
+	var remaining: Int = plan.dedent_count
+
+	while remaining > 0:
+		out = out.append_token({
+			kind = DedentToken,
+			span = pack_span(source_index, offset, offset),
+			payload = NO_TOKEN_PAYLOAD,
+		})
+		remaining -= 1
+
+	if plan.dedent == DedentedBetweenLevels:
+		out = out.append_plain_diagnostic(
+			InconsistentIndentationDiagnostic,
+			pack_span(source_index, offset, offset),
+		)
+
+	out
+
+
+---
+Moves the layout stacks as the plan says: pushes the opened indentation,
+or pops the dedented levels and, when the dedent landed on a level, closes the
+lambda bodies the new indentation no longer exceeds.
+---
+pure func with_line_start_applied(layout: LayoutStacks, plan: LineStartPlan) -> LayoutStacks:
+	var out: LayoutStacks = layout
+
+	if plan.opens_indent:
+		out = out.with_indent_pushed(plan.indent)
+
+	var remaining: Int = plan.dedent_count
+
+	while remaining > 0:
+		out = out.with_indent_popped()
+		remaining -= 1
+
+	if plan.dedent == DedentedToLevel:
+		out = out.with_lambdas_closed_after_dedent()
+
+	out

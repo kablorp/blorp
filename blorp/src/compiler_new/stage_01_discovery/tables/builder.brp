@@ -2,7 +2,9 @@
 --
 -- Each table is a `List` of struct rows, and an id is the index of its row, so
 -- the only way to mint an id is to read `next_*_id` before the matching
--- `append_*`.
+-- `append_*`. The ids are in `ids`, the row shapes in `rows`, and the body
+-- nodes and child stack in `node_builder`; this module holds the record, the
+-- appenders of every other table, interning, and diagnostics.
 --
 -- Builder threading. Every table must stay uniquely referenced so each
 -- append grows its list in place. The compiler hands a builder on without a
@@ -59,6 +61,44 @@
 import:
 	debug as dbg
 	diagnostic_code: DiscoveryDiagnosticCode
+	ids:
+		BoundId,
+		DefinitionId,
+		ForeignBlockId,
+		ImplicitRequestId,
+		ImportId,
+		ImportItemId,
+		LiteralId,
+		ModuleId,
+		NameId,
+		NodeId,
+		PackageId,
+		ParameterId,
+		PathId,
+		RootId,
+		SourceId,
+		SupertraitId,
+		bound_id_at_row,
+		definition_id_at_row,
+		definition_id_index,
+		foreign_block_id_at_row,
+		foreign_block_id_index,
+		implicit_request_id_at_row,
+		import_id_at_row,
+		import_id_index,
+		import_item_id_at_row,
+		import_item_id_index,
+		literal_id_at_row,
+		module_id_at_row,
+		module_id_index,
+		name_id_at_row,
+		package_id_at_row,
+		parameter_id_at_row,
+		path_id_at_row,
+		path_id_index,
+		root_id_at_row,
+		source_id_at_row,
+		supertrait_id_at_row,
 	intern_index:
 		INITIAL_SLOT_COUNT,
 		NO_ROW,
@@ -69,658 +109,62 @@ import:
 		slots_with_row,
 		text_hash,
 	name_vocabulary: ALL_SEEDED_NAME_SPELLINGS
-	row_kinds:
-		DefinitionKind,
-		FunctionAnnotation(TailRecursiveAnnotation),
-		ImportRequestKind,
-		ModuleOriginKind,
-		ModuleReach,
-		NodeKind(MissingExpressionNode),
-		PackageKind,
-		ParameterBinder,
-		Purity,
-		TypeParameterKind,
-		Visibility,
-		arity_admits,
-		node_schema,
-	span: Span, pack_span
+	row_kinds: FunctionAnnotation(TailRecursiveAnnotation), ModuleOriginKind, ModuleReach
+	rows:
+		AnnotationRow,
+		BinderNameRow,
+		BodyRow,
+		BoundQualifierRow,
+		BoundRow,
+		ConcurrencyCountRow,
+		DefinitionRow,
+		DefinitionTypeRow,
+		DiagnosticRow,
+		DimensionConstraintRow,
+		DimensionNameRow,
+		DocumentationRow,
+		EMPTY_ROW_RANGE,
+		ElseKeywordRow,
+		ForeignArgumentRow,
+		ForeignBindingRow,
+		ForeignBlockRow,
+		ForeignCNameRow,
+		ImplicitDiagnosticRow,
+		ImplicitRequestRow,
+		ImplicitTargetRow,
+		ImportAliasRow,
+		ImportBlockRow,
+		ImportItemAliasRow,
+		ImportItemRow,
+		ImportItemVariantRow,
+		ImportRow,
+		ImportTargetRow,
+		InterpolationPart(HolePart),
+		InterpolationPartRow,
+		MemberRow,
+		ModuleDocumentationRow,
+		ModulePackageRow,
+		ModuleRow,
+		NO_SPAN,
+		NodeNameSpanRow,
+		NodeRow,
+		PackageRow,
+		ParameterRow,
+		ParameterTypeRow,
+		PendingAnnotationRow,
+		ResourceCleanupRow,
+		RootDiagnosticRow,
+		RootRow,
+		RootTargetRow,
+		RowRange,
+		SignatureRow,
+		SourceRow,
+		SupertraitQualifierRow,
+		SupertraitRow,
+		TypeParameterRow,
+		VariantPayloadRow,
+	span: Span
 	token: Token
-
-
----
-A spelling identity: two names with the same spelling share one id.
----
-opaque type NameId = Int
-
----
-One source text read by discovery.
----
-opaque type SourceId = Int
-
----
-One interned path: a canonical module path or an import request's text.
----
-opaque type PathId = Int
-
-opaque type PackageId = Int
-
-opaque type ModuleId = Int
-
----
-One root request given to discovery, in the order given.
----
-opaque type RootId = Int
-
----
-One implicit module request: a standard-library module every compilation
-loads without an import (see `ImplicitModules` in `pipeline`).
----
-opaque type ImplicitRequestId = Int
-
-opaque type ImportId = Int
-
-opaque type ImportItemId = Int
-
----
-One written trait bound: a row of `bounds`, by its position.
----
-opaque type BoundId = Int
-
----
-One written supertrait: a row of `supertraits`, by its position.
----
-opaque type SupertraitId = Int
-
----
-A declared thing (function, type, member, ...), minted in discovery.
----
-opaque type DefinitionId = Int
-
----
-One syntax node of a function body in the flat node table.
----
-opaque type NodeId = Int
-
----
-One interned literal text (string or number spelling, or foreign C text).
----
-opaque type LiteralId = Int
-
----
-One parameter of a function, method or foreign function.
----
-opaque type ParameterId = Int
-
----
-One `foreign:` block, whose arguments apply to every function it declares.
----
-opaque type ForeignBlockId = Int
-
-
----
-A contiguous block of rows in a child table: rows `first .. first + count`.
----
-struct RowRange {
-	first: Int,
-	count: Int
-}
-
-
----
-The range with no rows, used for a parent row appended before its children
-are known; the builder closes it once they are.
----
-EMPTY_ROW_RANGE: RowRange = {
-	first = 0,
-	count = 0
-}
-
-
----
-The line starts of a source are rows `line_starts` of the `line_starts`
-table; the text itself is `source_texts[source]`.
----
-struct SourceRow {
-	path: PathId,
-	line_starts: RowRange
-}
-
-
-struct PackageRow {
-	name: NameId,
-	kind: PackageKind
-}
-
-
----
-One module. Its rows in the definitions, imports, nodes and diagnostics
-tables are the contiguous blocks named here, closed when its parse ends.
----
-struct ModuleRow {
-	source: SourceId,
-	canonical_path: PathId,
-	origin: ModuleOriginKind,
-	reach: ModuleReach,
-	definitions: RowRange,
-	imports: RowRange,
-	nodes: RowRange,
-	diagnostics: RowRange
-}
-
-
----
-A package module's package; most modules have none.
----
-struct ModulePackageRow {
-	module: ModuleId,
-	package: PackageId
-}
-
-
----
-A root given to discovery: a source path, as given.
----
-struct RootRow {
-	request_path: PathId
-}
-
-
----
-The module a root request loaded; absent when it loaded none.
----
-struct RootTargetRow {
-	root: RootId,
-	target: ModuleId
-}
-
-
----
-A root request that loaded no module, with the reason as a code and its
-arguments (a block of `diagnostic_arguments`).
----
-struct RootDiagnosticRow {
-	root: RootId,
-	code: DiscoveryDiagnosticCode,
-	arguments: RowRange
-}
-
-
----
-An implicit module request: the module's name as given (`prelude`), interned
-as a path like an import request's text.
----
-struct ImplicitRequestRow {
-	request_path: PathId
-}
-
-
----
-The module an implicit request loaded or found already loaded; absent when
-it loaded none.
----
-struct ImplicitTargetRow {
-	request: ImplicitRequestId,
-	target: ModuleId
-}
-
-
----
-An implicit request that loaded no module, with the reason as a code and its
-arguments (a block of `diagnostic_arguments`).
----
-struct ImplicitDiagnosticRow {
-	request: ImplicitRequestId,
-	code: DiscoveryDiagnosticCode,
-	arguments: RowRange
-}
-
-
----
-One import item of a module's import block. `request_path` is the import
-syntax, kept as text on purpose (for diagnostics and the legacy adapter);
-resolution reads the structured form: `parent_steps` leading `../` (0 for
-`./` and for non-relative requests), then the path parts, a block of
-`import_path_parts`. `items` is a block of `import_items`. `path_span` covers
-the module path, `span` the path through its aliases and selections.
----
-struct ImportRow {
-	importer: ModuleId,
-	request_kind: ImportRequestKind,
-	request_path: PathId,
-	parent_steps: Int,
-	path_parts: RowRange,
-	items: RowRange,
-	path_span: Span,
-	span: Span
-}
-
-
----
-One selected symbol; `variants` is a block of `import_item_variants` for
-`name(Variant, ...)` selections. `name_span` covers the name alone, `span` the
-whole selection.
----
-struct ImportItemRow {
-	owner_import: ImportId,
-	name: NameId,
-	variants: RowRange,
-	name_span: Span,
-	span: Span
-}
-
-
-struct ImportItemVariantRow {
-	item: ImportItemId,
-	name: NameId,
-	span: Span
-}
-
-
----
-The module an import loaded; absent when it loaded none.
----
-struct ImportTargetRow {
-	owner_import: ImportId,
-	target: ModuleId
-}
-
-
----
-The alias of an import (`module as alias`); `span` covers the alias name.
----
-struct ImportAliasRow {
-	owner_import: ImportId,
-	alias_name: NameId,
-	span: Span
-}
-
-
----
-The alias of an imported symbol (`name as alias`); `span` covers the alias
-name.
----
-struct ImportItemAliasRow {
-	item: ImportItemId,
-	alias_name: NameId,
-	span: Span
-}
-
-
----
-One row per declared thing, including members. `span` covers the whole
-declaration (from its docstring, annotations or `pure`, when present);
-`name_span` covers the name. Impls have no name of their own, so their name
-columns hold the implemented trait's name.
----
-struct DefinitionRow {
-	module: ModuleId,
-	kind: DefinitionKind,
-	name: NameId,
-	name_span: Span,
-	visibility: Visibility,
-	span: Span
-}
-
-
----
-A field, variant or method, with its owner and declaration order.
----
-struct MemberRow {
-	definition: DefinitionId,
-	owner: DefinitionId,
-	ordinal: Int
-}
-
-
----
-A declaration's docstring; most declarations have none.
----
-struct DocumentationRow {
-	definition: DefinitionId,
-	text: LiteralId
-}
-
-
----
-A module's docstring: the one that opens the file directly before its first
-`import:` block. At most one row per module; most modules have none.
----
-struct ModuleDocumentationRow {
-	module: ModuleId,
-	text: LiteralId,
-	span: Span
-}
-
-
----
-The two kinds of piece an interpolated string is made of.
----
-enum InterpolationPart:
-	TextPart
-	HolePart
-
-
----
-One piece of an interpolated string, in source order. `start .. end` are its
-source bytes: the text as written, or a hole's expression between `${` and
-its `}`. `text` is one row of `interpolation_texts` holding the decoded text
-for a `TextPart`, and empty for a `HolePart`.
----
-struct InterpolationPartRow {
-	part: InterpolationPart,
-	start: Int,
-	end: Int,
-	text: RowRange
-}
-
-
----
-An annotation read before the declaration it belongs to has a row: a
-transient row the declaration copies into `annotations` once its
-`DefinitionId` is known.
----
-struct PendingAnnotationRow {
-	annotation: FunctionAnnotation,
-	span: Span
-}
-
-
----
-One `@annotation` of a function, in written order.
----
-struct AnnotationRow {
-	definition: DefinitionId,
-	annotation: FunctionAnnotation,
-	span: Span
-}
-
-
----
-A declared type or dimension parameter. `name_span` covers the name (with its
-`#` for a dimension), `span` the name and its bounds.
----
-struct TypeParameterRow {
-	owner: DefinitionId,
-	ordinal: Int,
-	name: NameId,
-	kind: TypeParameterKind,
-	name_span: Span,
-	span: Span
-}
-
-
----
-A written trait bound on the type parameter at `parameter_ordinal`,
-unresolved; typecheck turns `trait_name` into a trait. `span` covers the whole
-written reference, `module.Trait` included; the module alias, when written, is
-the bound's `BoundQualifierRow`; `name_span` covers the trait's name alone.
----
-struct BoundRow {
-	owner: DefinitionId,
-	parameter_ordinal: Int,
-	trait_name: NameId,
-	name_span: Span,
-	span: Span
-}
-
-
----
-The module alias of a bound written `alias.Trait`; absent for `Trait`.
-`span` covers the alias alone.
----
-struct BoundQualifierRow {
-	bound: BoundId,
-	qualifier: NameId,
-	span: Span
-}
-
-
----
-A supertrait a trait names, in written order. `span` covers the whole written
-reference, as for `BoundRow`; `name_span` covers the supertrait's name alone.
----
-struct SupertraitRow {
-	trait_definition: DefinitionId,
-	ordinal: Int,
-	name: NameId,
-	name_span: Span,
-	span: Span
-}
-
-
----
-The module alias of a supertrait written `alias.Trait`; absent for `Trait`.
-`span` covers the alias alone.
----
-struct SupertraitQualifierRow {
-	supertrait: SupertraitId,
-	qualifier: NameId,
-	span: Span
-}
-
-
----
-The signature of a function, method or foreign function: its purity, the
-span of its `func` keyword, and its parameters, a block of `parameters`.
-Every function-like definition has exactly one.
----
-struct SignatureRow {
-	definition: DefinitionId,
-	purity: Purity,
-	keyword_span: Span,
-	parameters: RowRange
-}
-
-
----
-One parameter. `binder_names` is a block of `binder_names`: one name for a
-named binder (`_` for a typed discard), none for a wildcard, two to four for
-a tuple binder. `binder_span` covers the binder, `span` the whole parameter.
----
-struct ParameterRow {
-	owner: DefinitionId,
-	ordinal: Int,
-	binder: ParameterBinder,
-	binder_names: RowRange,
-	binder_span: Span,
-	span: Span
-}
-
-
-struct BinderNameRow {
-	name: NameId,
-	span: Span
-}
-
-
----
-A parameter's written type; absent when the type is inferred.
----
-struct ParameterTypeRow {
-	parameter: ParameterId,
-	type_root: NodeId
-}
-
-
----
-The one type a definition declares, whose role its kind fixes: a
-function's, method's or foreign function's return type, a global's declared
-type, an alias's or opaque type's target, an impl's receiver type, a field's
-type. Absent when not written.
----
-struct DefinitionTypeRow {
-	definition: DefinitionId,
-	type_root: NodeId
-}
-
-
----
-One payload type of a variant, in written order.
----
-struct VariantPayloadRow {
-	variant: DefinitionId,
-	ordinal: Int,
-	type_root: NodeId
-}
-
-
----
-One `where left == right` dimension constraint of a function.
----
-struct DimensionConstraintRow {
-	owner: DefinitionId,
-	left: NodeId,
-	right: NodeId,
-	span: Span
-}
-
-
----
-One `import:` block; `imports` is its block of `imports`.
----
-struct ImportBlockRow {
-	module: ModuleId,
-	imports: RowRange,
-	span: Span
-}
-
-
----
-One `foreign:` block; `arguments` is its block of `foreign_arguments`.
----
-struct ForeignBlockRow {
-	module: ModuleId,
-	arguments: RowRange,
-	span: Span
-}
-
-
----
-One `name: "value"` argument of a foreign block, such as `include`.
-`name_span` covers the name, `span` the name through the value.
----
-struct ForeignArgumentRow {
-	name: NameId,
-	value: LiteralId,
-	name_span: Span,
-	span: Span
-}
-
-
----
-The foreign block a foreign function belongs to.
----
-struct ForeignBindingRow {
-	definition: DefinitionId,
-	block: ForeignBlockId
-}
-
-
----
-A foreign function's explicit C name (`= "c_name"`); absent when the C name
-is the Blorp name.
----
-struct ForeignCNameRow {
-	definition: DefinitionId,
-	c_name: LiteralId,
-	span: Span
-}
-
-
----
-A resource type's cleanup builtin (`= builtin("cleanup")`).
----
-struct ResourceCleanupRow {
-	definition: DefinitionId,
-	builtin_name: LiteralId,
-	span: Span
-}
-
-
----
-A function's, method's or global's body: the root of its nodes.
----
-struct BodyRow {
-	definition: DefinitionId,
-	root: NodeId
-}
-
-
----
-One body node. `payload` is fixed by `kind`; `children` addresses a block of
-the `node_children` edge table.
----
-struct NodeRow {
-	kind: NodeKind,
-	span: Span,
-	payload: Int,
-	children: RowRange
-}
-
-
----
-A dimension name and the spelling it has with its sigil: `N` and `#N`. The
-lexer interns both when it joins a `#` to a name, and writes one row per
-distinct dimension name, so a reader that needs the sigil spelling (the legacy
-adapter) reads this row instead of building a spelling and looking it up.
----
-struct DimensionNameRow {
-	name: NameId,
-	sigil_name: NameId
-}
-
-
----
-The span of the name a node carries, for a node whose name does not span the
-whole node. Types: a generic or module-qualified named type (`List[T]`,
-`m.Type`), a bounded type (`T: Eq`), a trait bound written through a module
-alias, and a variadic dimension (`#Ds...`). Bodies: the field of a field access
-and of a record field, the name a binding, assignment, `?=`, `with`, `on`,
-select arm, concurrency parameter or typed lambda parameter binds, the
-constructor of a constructor pattern, and the target of a list pattern's spread
-(`...rest`, `..._`). A node whose name is the whole node has no row. At most one
-row per node, in node order.
----
-struct NodeNameSpanRow {
-	node: NodeId,
-	name_span: Span
-}
-
-
----
-The count a `concurrent(max_threads: n)` or `concurrently(limit: n)` parameter
-wrote, as the checked integer the parser read from the literal (a positive
-`Int`; a literal above its range saturates, as `parse_int` does). One row per
-such parameter node, in node order; a parameter whose value is not a positive
-integer literal (a diagnostic reports it) has none, and neither has `timeout`.
----
-struct ConcurrencyCountRow {
-	parameter: NodeId,
-	count: Int
-}
-
-
----
-The span of the `else` keyword of an `IfNode` that has an else branch (its third
-child). Neither branch's span covers the keyword, which the formatter places
-comments around and the existing AST records. One row per such node, in node
-order; an `IfNode` without an else branch has none.
----
-struct ElseKeywordRow {
-	node: NodeId,
-	keyword_span: Span
-}
-
-
----
-A diagnostic at a source span; `arguments` is a block of
-`diagnostic_arguments`, interpreted by `code`.
----
-struct DiagnosticRow {
-	code: DiscoveryDiagnosticCode,
-	span: Span,
-	arguments: RowRange
-}
 
 
 ---
@@ -905,144 +349,6 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 	}
 
 
--- Id readers. Every id is the index of its row.
-pure func name_id_index(id: NameId) -> Int:
-	from_opaque NameId(id)
-
-
-pure func source_id_index(id: SourceId) -> Int:
-	from_opaque SourceId(id)
-
-
-pure func path_id_index(id: PathId) -> Int:
-	from_opaque PathId(id)
-
-
-pure func package_id_index(id: PackageId) -> Int:
-	from_opaque PackageId(id)
-
-
-pure func module_id_index(id: ModuleId) -> Int:
-	from_opaque ModuleId(id)
-
-
-pure func root_id_index(id: RootId) -> Int:
-	from_opaque RootId(id)
-
-
-pure func implicit_request_id_index(id: ImplicitRequestId) -> Int:
-	from_opaque ImplicitRequestId(id)
-
-
-pure func import_id_index(id: ImportId) -> Int:
-	from_opaque ImportId(id)
-
-
-pure func import_item_id_index(id: ImportItemId) -> Int:
-	from_opaque ImportItemId(id)
-
-
-pure func bound_id_index(id: BoundId) -> Int:
-	from_opaque BoundId(id)
-
-
-pure func supertrait_id_index(id: SupertraitId) -> Int:
-	from_opaque SupertraitId(id)
-
-
-pure func definition_id_index(id: DefinitionId) -> Int:
-	from_opaque DefinitionId(id)
-
-
-pure func node_id_index(id: NodeId) -> Int:
-	from_opaque NodeId(id)
-
-
-pure func literal_id_index(id: LiteralId) -> Int:
-	from_opaque LiteralId(id)
-
-
-pure func parameter_id_index(id: ParameterId) -> Int:
-	from_opaque ParameterId(id)
-
-
-pure func foreign_block_id_index(id: ForeignBlockId) -> Int:
-	from_opaque ForeignBlockId(id)
-
-
-pure func name_ids_equal(left: NameId, right: NameId) -> Bool:
-	left.name_id_index() == right.name_id_index()
-
-
-pure func module_ids_equal(left: ModuleId, right: ModuleId) -> Bool:
-	left.module_id_index() == right.module_id_index()
-
-
-pure func definition_ids_equal(left: DefinitionId, right: DefinitionId) -> Bool:
-	left.definition_id_index() == right.definition_id_index()
-
-
----
-Row-position conversions for readers walking a table or a `RowRange` that
-freezing has validated. They are the read side of "an id is its row's
-index"; only `next_*_id` mints an id for a row that does not exist yet.
----
-pure func name_id_at_row(index: Int) -> NameId:
-	into_opaque NameId(index)
-
-
-pure func source_id_at_row(index: Int) -> SourceId:
-	into_opaque SourceId(index)
-
-
-pure func path_id_at_row(index: Int) -> PathId:
-	into_opaque PathId(index)
-
-
-pure func package_id_at_row(index: Int) -> PackageId:
-	into_opaque PackageId(index)
-
-
-pure func module_id_at_row(index: Int) -> ModuleId:
-	into_opaque ModuleId(index)
-
-
-pure func root_id_at_row(index: Int) -> RootId:
-	into_opaque RootId(index)
-
-
-pure func implicit_request_id_at_row(index: Int) -> ImplicitRequestId:
-	into_opaque ImplicitRequestId(index)
-
-
-pure func import_id_at_row(index: Int) -> ImportId:
-	into_opaque ImportId(index)
-
-
-pure func import_item_id_at_row(index: Int) -> ImportItemId:
-	into_opaque ImportItemId(index)
-
-
-pure func bound_id_at_row(index: Int) -> BoundId:
-	into_opaque BoundId(index)
-
-
-pure func supertrait_id_at_row(index: Int) -> SupertraitId:
-	into_opaque SupertraitId(index)
-
-
-pure func definition_id_at_row(index: Int) -> DefinitionId:
-	into_opaque DefinitionId(index)
-
-
-pure func node_id_at_row(index: Int) -> NodeId:
-	into_opaque NodeId(index)
-
-
-pure func literal_id_at_row(index: Int) -> LiteralId:
-	into_opaque LiteralId(index)
-
-
 -- Names, paths and literals: interned text.
 ---
 What the `interned_*_index` lookups return for text that is not interned:
@@ -1103,14 +409,14 @@ pure func find_name_id(builder: DiscoveryBuilder, spelling: String) -> Option[Na
 	if index == NOT_INTERNED:
 		None
 	else:
-		Some(into_opaque NameId(index))
+		Some(name_id_at_row(index))
 
 
 ---
 The id the next appended name will receive.
 ---
 pure func next_name_id(builder: DiscoveryBuilder) -> NameId:
-	into_opaque NameId(builder.name_spellings.length())
+	name_id_at_row(builder.name_spellings.length())
 
 
 ---
@@ -1131,13 +437,13 @@ pure func append_name(builder: DiscoveryBuilder, spelling: String) -> DiscoveryB
 pure func find_path_id(builder: DiscoveryBuilder, text: String) -> Option[PathId]:
 	match builder.path_ids_by_text.get(text):
 		Some(index):
-			Some(into_opaque PathId(index))
+			Some(path_id_at_row(index))
 		None:
 			None
 
 
 pure func next_path_id(builder: DiscoveryBuilder) -> PathId:
-	into_opaque PathId(builder.paths.length())
+	path_id_at_row(builder.paths.length())
 
 
 ---
@@ -1167,7 +473,7 @@ pure func append_literal(builder: DiscoveryBuilder, text: String) -> DiscoveryBu
 
 -- Sources, packages and modules.
 pure func next_source_id(builder: DiscoveryBuilder) -> SourceId:
-	into_opaque SourceId(builder.sources.length())
+	source_id_at_row(builder.sources.length())
 
 
 pure func next_line_start_row(builder: DiscoveryBuilder) -> Int:
@@ -1194,7 +500,7 @@ pure func append_source(
 
 
 pure func next_package_id(builder: DiscoveryBuilder) -> PackageId:
-	into_opaque PackageId(builder.packages.length())
+	package_id_at_row(builder.packages.length())
 
 
 pure func append_package(builder: DiscoveryBuilder, row: PackageRow) -> DiscoveryBuilder:
@@ -1202,7 +508,7 @@ pure func append_package(builder: DiscoveryBuilder, row: PackageRow) -> Discover
 
 
 pure func next_module_id(builder: DiscoveryBuilder) -> ModuleId:
-	into_opaque ModuleId(builder.modules.length())
+	module_id_at_row(builder.modules.length())
 
 
 ---
@@ -1214,7 +520,7 @@ pure func find_module_by_path(
 ) -> Option[ModuleId]:
 	match builder.module_ids_by_path.get(canonical_path.path_id_index()):
 		Some(index):
-			Some(into_opaque ModuleId(index))
+			Some(module_id_at_row(index))
 		None:
 			None
 
@@ -1320,7 +626,7 @@ pure func append_module_package(
 
 -- Roots and imports.
 pure func next_root_id(builder: DiscoveryBuilder) -> RootId:
-	into_opaque RootId(builder.roots.length())
+	root_id_at_row(builder.roots.length())
 
 
 pure func append_root(builder: DiscoveryBuilder, row: RootRow) -> DiscoveryBuilder:
@@ -1339,7 +645,7 @@ pure func append_root_diagnostic(
 
 
 pure func next_implicit_request_id(builder: DiscoveryBuilder) -> ImplicitRequestId:
-	into_opaque ImplicitRequestId(builder.implicit_requests.length())
+	implicit_request_id_at_row(builder.implicit_requests.length())
 
 
 pure func append_implicit_request(
@@ -1364,7 +670,7 @@ pure func append_implicit_diagnostic(
 
 
 pure func next_import_id(builder: DiscoveryBuilder) -> ImportId:
-	into_opaque ImportId(builder.imports.length())
+	import_id_at_row(builder.imports.length())
 
 
 pure func append_import(builder: DiscoveryBuilder, row: ImportRow) -> DiscoveryBuilder:
@@ -1393,7 +699,7 @@ pure func append_import_path_part(builder: DiscoveryBuilder, part: NameId) -> Di
 
 
 pure func next_import_item_id(builder: DiscoveryBuilder) -> ImportItemId:
-	into_opaque ImportItemId(builder.import_items.length())
+	import_item_id_at_row(builder.import_items.length())
 
 
 pure func append_import_item(builder: DiscoveryBuilder, row: ImportItemRow) -> DiscoveryBuilder:
@@ -1440,7 +746,7 @@ pure func append_import_item_alias(
 The id the next appended definition will receive.
 ---
 pure func next_definition_id(builder: DiscoveryBuilder) -> DefinitionId:
-	into_opaque DefinitionId(builder.definitions.length())
+	definition_id_at_row(builder.definitions.length())
 
 
 pure func append_definition(builder: DiscoveryBuilder, row: DefinitionRow) -> DiscoveryBuilder:
@@ -1459,7 +765,7 @@ pure func append_type_parameter(
 
 
 pure func next_bound_id(builder: DiscoveryBuilder) -> BoundId:
-	into_opaque BoundId(builder.bounds.length())
+	bound_id_at_row(builder.bounds.length())
 
 
 pure func append_bound(builder: DiscoveryBuilder, row: BoundRow) -> DiscoveryBuilder:
@@ -1516,7 +822,7 @@ pure func append_annotation(builder: DiscoveryBuilder, row: AnnotationRow) -> Di
 
 
 pure func next_supertrait_id(builder: DiscoveryBuilder) -> SupertraitId:
-	into_opaque SupertraitId(builder.supertraits.length())
+	supertrait_id_at_row(builder.supertraits.length())
 
 
 pure func append_supertrait(builder: DiscoveryBuilder, row: SupertraitRow) -> DiscoveryBuilder:
@@ -1535,7 +841,7 @@ pure func append_signature(builder: DiscoveryBuilder, row: SignatureRow) -> Disc
 
 
 pure func next_parameter_id(builder: DiscoveryBuilder) -> ParameterId:
-	into_opaque ParameterId(builder.parameters.length())
+	parameter_id_at_row(builder.parameters.length())
 
 
 pure func append_parameter(builder: DiscoveryBuilder, row: ParameterRow) -> DiscoveryBuilder:
@@ -1579,7 +885,7 @@ pure func append_dimension_constraint(
 
 
 pure func next_foreign_block_id(builder: DiscoveryBuilder) -> ForeignBlockId:
-	into_opaque ForeignBlockId(builder.foreign_blocks.length())
+	foreign_block_id_at_row(builder.foreign_blocks.length())
 
 
 pure func append_foreign_block(builder: DiscoveryBuilder, row: ForeignBlockRow) -> DiscoveryBuilder:
@@ -1623,99 +929,6 @@ pure func append_resolution_diagnostic(
 	{ builder | resolution_diagnostics = builder.resolution_diagnostics.append(row) }
 
 
-pure func append_body(builder: DiscoveryBuilder, row: BodyRow) -> DiscoveryBuilder:
-	{ builder | bodies = builder.bodies.append(row) }
-
-
--- Body nodes.
----
-The id the next appended node will receive.
----
-pure func next_node_id(builder: DiscoveryBuilder) -> NodeId:
-	into_opaque NodeId(builder.nodes.length())
-
-
-pure func append_node(builder: DiscoveryBuilder, row: NodeRow) -> DiscoveryBuilder:
-	{ builder | nodes = builder.nodes.append(row) }
-
-
-pure func append_dimension_name(
-	builder: DiscoveryBuilder,
-	row: DimensionNameRow,
-) -> DiscoveryBuilder:
-	{ builder | dimension_names = builder.dimension_names.append(row) }
-
-
-pure func append_node_name_span(
-	builder: DiscoveryBuilder,
-	row: NodeNameSpanRow,
-) -> DiscoveryBuilder:
-	{ builder | node_name_spans = builder.node_name_spans.append(row) }
-
-
-pure func append_concurrency_count(
-	builder: DiscoveryBuilder,
-	row: ConcurrencyCountRow,
-) -> DiscoveryBuilder:
-	{ builder | concurrency_counts = builder.concurrency_counts.append(row) }
-
-
----
-Records the `count` the concurrency parameter node appended most recently wrote.
----
-pure func record_concurrency_count_of_last_node(
-	builder: DiscoveryBuilder,
-	count: Int,
-) -> DiscoveryBuilder:
-	parameter: NodeId = builder.last_node_id()
-	builder.append_concurrency_count({
-		parameter = parameter,
-		count = count,
-	})
-
-
-pure func append_else_keyword(builder: DiscoveryBuilder, row: ElseKeywordRow) -> DiscoveryBuilder:
-	{ builder | else_keywords = builder.else_keywords.append(row) }
-
-
----
-Records the span of the `else` keyword of the `IfNode` appended most recently.
----
-pure func record_else_keyword_of_last_node(
-	builder: DiscoveryBuilder,
-	keyword_span: Span,
-) -> DiscoveryBuilder:
-	node: NodeId = builder.last_node_id()
-	builder.append_else_keyword({
-		node = node,
-		keyword_span = keyword_span,
-	})
-
-
----
-Records the span of the name of the node appended most recently, for a node
-whose name does not span the whole node (see `NodeNameSpanRow`).
----
-pure func record_name_span_of_last_node(
-	builder: DiscoveryBuilder,
-	name_span: Span,
-) -> DiscoveryBuilder:
-	node: NodeId = builder.last_node_id()
-	builder.append_node_name_span({
-		node = node,
-		name_span = name_span,
-	})
-
-
----
-The node appended most recently. Parse routines append a construct's root
-node last, so a caller reads the root it just parsed here; it names a real
-node whenever the caller has appended one.
----
-pure func last_node_id(builder: DiscoveryBuilder) -> NodeId:
-	into_opaque NodeId(builder.nodes.length() - 1)
-
-
 ---
 Reports a lookup that cannot miss: an id the table issued, or an index inside a
 range the caller read from the same table. A debug build stops with the
@@ -1726,109 +939,6 @@ operation must not crash. `guarantee` says why the row exists.
 pure func report_unreachable_lookup(table: String, index: Int, guarantee: String):
 	debug:
 		dbg.error("${table} row ${index} does not exist, but ${guarantee}")
-
-
----
-The span of a row that has none to hold: no source and no extent. Fallback
-rows carry it; they are returned only after `report_unreachable_lookup`, never
-for a row a table holds.
----
-NO_SPAN: Span = pack_span(0, 0, 0)
-
----
-The payload of a node whose kind has none.
----
-NO_NODE_PAYLOAD: Int = 0
-
----
-The node row `node_row` returns for a node the table does not hold.
----
-UNREACHABLE_NODE_ROW: NodeRow = {
-	kind = MissingExpressionNode,
-	span = NO_SPAN,
-	payload = NO_NODE_PAYLOAD,
-	children = EMPTY_ROW_RANGE
-}
-
-
----
-The row of `node`. Parse routines read only nodes they appended, so a miss
-is a defect in the routine: it is reported and `UNREACHABLE_NODE_ROW` returned.
----
-pure func node_row(builder: DiscoveryBuilder, node: NodeId) -> NodeRow:
-	match builder.nodes.get(node.node_id_index()):
-		Some(row):
-			row
-		None:
-			report_unreachable_lookup(
-				"node",
-				node.node_id_index(),
-				"parse routines read only nodes they appended",
-			)
-			UNREACHABLE_NODE_ROW
-
-
----
-Child `position` of `node`, or `None` when the node has fewer children (a
-node in recovery may).
----
-pure func node_child_at(builder: DiscoveryBuilder, node: NodeId, position: Int) -> Option[NodeId]:
-	row: NodeRow = builder.node_row(node)
-
-	if position < row.children.count:
-		builder.node_children.get(row.children.first + position)
-	else:
-		None
-
-
----
-Removes the node appended last, which must be a leaf no row or stack entry
-references yet: how an identifier that turns out to be the name of a named
-argument (`f(name = value)`) is replaced by the assignment that records the
-name itself.
----
-pure func discard_last_leaf_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	{ builder | nodes = builder.nodes.drop_last() }
-
-
----
-Widens the span of the node appended last: how grouping parentheses, which
-add no node, extend the enclosed expression's span to both delimiters.
----
-pure func replace_last_node_span(builder: DiscoveryBuilder, span: Span) -> DiscoveryBuilder:
-	index: Int = builder.nodes.length() - 1
-	{ builder | nodes = with_node_span(builder.nodes, index, span) }
-
-
-private pure func with_node_span(nodes: List[NodeRow], index: Int, span: Span) -> List[NodeRow]:
-	match nodes.get(index):
-		Some(row):
-			nodes.set(index, { row | span = span })
-		None:
-			nodes
-
-
----
-Pushes the node appended last onto the child stack (see `push_child`).
----
-pure func push_last_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	depth: Int = builder.child_stack_depth
-	last: NodeId = into_opaque NodeId(builder.nodes.length() - 1)
-	{ builder |
-		child_stack = stack_with_entry(builder.child_stack, depth, last),
-		child_stack_depth = depth + 1
-	}
-
-
----
-Where the next block of node children will start.
----
-pure func next_node_child_row(builder: DiscoveryBuilder) -> Int:
-	builder.node_children.length()
-
-
-pure func append_node_child(builder: DiscoveryBuilder, child: NodeId) -> DiscoveryBuilder:
-	{ builder | node_children = builder.node_children.append(child) }
 
 
 -- Diagnostics.
@@ -2108,96 +1218,6 @@ pure func pending_annotation_at(builder: DiscoveryBuilder, index: Int) -> Pendin
 			UNREACHABLE_PENDING_ANNOTATION
 
 
----
-Pushes `node` as the next child of the parent node being parsed. A parse
-routine pushes each child's root as it finishes the child, then appends the
-parent with `append_parent_node_from_stack`, which claims them: no list of
-child ids is built per parent. The stack is a list with an explicit depth
-so that popping keeps its storage for the next push.
----
-pure func push_child(builder: DiscoveryBuilder, node: NodeId) -> DiscoveryBuilder:
-	depth: Int = builder.child_stack_depth
-	{ builder |
-		child_stack = stack_with_entry(builder.child_stack, depth, node),
-		child_stack_depth = depth + 1
-	}
-
-
-private pure func stack_with_entry(stack: List[NodeId], depth: Int, node: NodeId) -> List[NodeId]:
-	if depth < stack.length():
-		stack.set(depth, node)
-	else:
-		stack.append(node)
-
-
----
-A place in the child stack, taken with `mark_children` before a node's
-children are parsed. The children are what was pushed since: read their count
-with `child_count_since`, or append the parent over them with
-`append_parent_node_since`. A mark is not an `Int`, so it cannot be mistaken
-for a count or subtracted by hand.
----
-opaque type ChildMark = Int
-
-
-pure func mark_children(builder: DiscoveryBuilder) -> ChildMark:
-	into_opaque ChildMark(builder.child_stack_depth)
-
-
----
-The first child pushed since `mark`, or `None` when there are none.
----
-pure func first_child_since(builder: DiscoveryBuilder, mark: ChildMark) -> Option[NodeId]:
-	if builder.child_count_since(mark) == 0:
-		None
-	else:
-		builder.child_stack.get(from_opaque ChildMark(mark))
-
-
----
-How many children were pushed since `mark` and not yet claimed by a parent.
----
-pure func child_count_since(builder: DiscoveryBuilder, mark: ChildMark) -> Int:
-	builder.child_stack_depth - from_opaque ChildMark(mark)
-
-
----
-Appends a node over every child pushed since `mark`, claiming them.
----
-pure func append_parent_node_since(
-	builder: DiscoveryBuilder,
-	mark: ChildMark,
-	kind: NodeKind,
-	span: Span,
-) -> DiscoveryBuilder:
-	builder.append_parent_node_from_stack(
-		kind,
-		span,
-		builder.child_count_since(mark),
-	)
-
-
----
-`append_parent_node_since` for a kind whose payload is a name, with its name
-span row, as `append_named_parent_node_from_stack`.
----
-pure func append_named_parent_node_since(
-	builder: DiscoveryBuilder,
-	mark: ChildMark,
-	kind: NodeKind,
-	span: Span,
-	name: NameId,
-	name_span: Span,
-) -> DiscoveryBuilder:
-	builder.append_named_parent_node_from_stack(
-		kind,
-		span,
-		name,
-		name_span,
-		builder.child_count_since(mark),
-	)
-
-
 pure func append_token(builder: DiscoveryBuilder, token: Token) -> DiscoveryBuilder:
 	{ builder | tokens = builder.tokens.append(token) }
 
@@ -2248,300 +1268,9 @@ pure func append_plain_resolution_diagnostic(
 
 
 ---
-Appends `children` as one block of the edge table, then the node over them:
-the post-order write every parent node takes. Read the new node's id first
-with `next_node_id`, or afterwards with `last_node_id`.
----
-pure func append_parent_node(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	children: List[NodeId],
-) -> DiscoveryBuilder:
-	builder.append_parent_node_with_payload(kind, span, NO_NODE_PAYLOAD, children)
-
-
----
-`append_parent_node` for a kind whose payload is a name.
----
-pure func append_named_parent_node(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	name: NameId,
-	children: List[NodeId],
-) -> DiscoveryBuilder:
-	builder.append_parent_node_with_payload(kind, span, name.name_id_index(), children)
-
-
-private pure func append_parent_node_with_payload(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	payload: Int,
-	children: List[NodeId],
-) -> DiscoveryBuilder:
-	first_child: Int = builder.node_children.length()
-	with_children: DiscoveryBuilder = builder.append_node_children(children)
-	with_children.append_node({
-		kind = kind,
-		span = span,
-		payload = payload,
-		children = {
-			first = first_child,
-			count = children.length()
-		},
-	})
-
-
----
-Appends `children` to the edge table in one update of the builder; the loop
-runs over the edge list alone.
----
-private pure func append_node_children(
-	builder: DiscoveryBuilder,
-	children: List[NodeId],
-) -> DiscoveryBuilder:
-	{ builder | node_children = with_node_children(builder.node_children, children) }
-
-
----
-`edges` followed by `children`. The first append is unconditional and the
-rest are in a loop, so the list is updated in place.
----
-private pure func with_node_children(edges: List[NodeId], children: List[NodeId]) -> List[NodeId]:
-	match children.get(0):
-		Some(first):
-			var out: List[NodeId] = edges.append(first)
-			var index: Int = 1
-
-			while index < children.length():
-				match children.get(index):
-					Some(child):
-						out = out.append(child)
-					None:
-						void
-
-				index += 1
-
-			out
-		None:
-			edges
-
-
----
-Appends a node over the last `count` children pushed with `push_child`,
-claiming them from the stack: the edges are copied into `node_children` and
-the node row is appended after them in one update each.
----
-pure func append_parent_node_from_stack(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	count: Int,
-) -> DiscoveryBuilder:
-	builder.append_parent_node_from_stack_with_payload(kind, span, NO_NODE_PAYLOAD, count)
-
-
----
-`append_parent_node_from_stack` for a kind whose payload is a name, followed by
-the node's `NodeNameSpanRow` for `name_span`, which the invariants require of
-every such kind (`needs_name_span_row`). A name that is the whole node has
-`append_name_only_parent_node_from_stack`.
----
-pure func append_named_parent_node_from_stack(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	name: NameId,
-	name_span: Span,
-	count: Int,
-) -> DiscoveryBuilder:
-	appended: DiscoveryBuilder = builder.append_parent_node_from_stack_with_payload(
-		kind,
-		span,
-		name.name_id_index(),
-		count,
-	)
-	appended.record_name_span_of_last_node(name_span)
-
-
----
-`append_parent_node_from_stack` for a kind whose payload is a name and whose
-name is the whole node, so it has no name span row: an untyped lambda parameter.
----
-pure func append_name_only_parent_node_from_stack(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	name: NameId,
-	count: Int,
-) -> DiscoveryBuilder:
-	builder.append_parent_node_from_stack_with_payload(kind, span, name.name_id_index(), count)
-
-
-private pure func append_parent_node_from_stack_with_payload(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	payload: Int,
-	count: Int,
-) -> DiscoveryBuilder:
-	first_child: Int = builder.node_children.length()
-	depth: Int = builder.child_stack_depth
-
-	-- The freeze reports a child count the kind forbids (`NodeArityMismatch`)
-	-- long after the parser that miscounted has returned; failing here names
-	-- the parser's call. A count above the stack's depth would claim children
-	-- that belong to an enclosing node.
-	debug:
-		if not kind.node_schema().arity.arity_admits(count):
-			dbg.error("a node was appended with a child count its kind does not allow")
-
-		if count > depth:
-			dbg.error("a node claimed more children than the child stack holds")
-
-	var out: DiscoveryBuilder = builder.claim_stack_children(depth - count, depth)
-	out = out.with_child_stack_depth(depth - count)
-	out = out.append_node({
-		kind = kind,
-		span = span,
-		payload = payload,
-		children = {
-			first = first_child,
-			count = count
-		},
-	})
-	out
-
-
----
-Copies child stack entries `first_index .. end_index` to the edge table.
----
-private pure func claim_stack_children(
-	builder: DiscoveryBuilder,
-	first_index: Int,
-	end_index: Int,
-) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder
-	var index: Int = first_index
-
-	while index < end_index:
-		out = out.append_node_child(out.stack_entry(index))
-		index += 1
-
-	out
-
-
----
-The node `stack_entry` returns for an index the child stack does not hold.
----
-UNREACHABLE_NODE_ID: NodeId = node_id_at_row(0)
-
-
----
-Child stack entry `index`; callers pass an index below the stack depth, so a
-miss is a defect in the caller: it is reported and `UNREACHABLE_NODE_ID`
-returned.
----
-private pure func stack_entry(builder: DiscoveryBuilder, index: Int) -> NodeId:
-	match builder.child_stack.get(index):
-		Some(node):
-			node
-		None:
-			report_unreachable_lookup(
-				"child stack",
-				index,
-				"callers pass an index below the stack depth",
-			)
-			UNREACHABLE_NODE_ID
-
-
----
 `builder` parsing statements in `context`. A routine that parses a nested body
 reads `loop_context` into a local first, enters the body's context with this,
 and restores the local afterwards.
 ---
 pure func with_loop_context(builder: DiscoveryBuilder, context: LoopContext) -> DiscoveryBuilder:
 	{ builder | loop_context = context }
-
-
-private pure func with_child_stack_depth(builder: DiscoveryBuilder, depth: Int) -> DiscoveryBuilder:
-	{ builder | child_stack_depth = depth }
-
-
----
-Appends a node with no children.
----
-pure func append_leaf_node(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, NO_NODE_PAYLOAD)
-
-
----
-A leaf whose payload is a name (see `node_payload_reference`).
----
-pure func append_name_leaf_node(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	name: NameId,
-) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, name.name_id_index())
-
-
----
-A leaf whose payload is a literal.
----
-pure func append_literal_leaf_node(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	literal: LiteralId,
-) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, literal.literal_id_index())
-
-
----
-A leaf whose payload is a character's codepoint.
----
-pure func append_codepoint_leaf_node(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	codepoint: Int,
-) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, codepoint)
-
-
----
-A leaf whose payload is a definition.
----
-pure func append_definition_leaf_node(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	definition: DefinitionId,
-) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, definition.definition_id_index())
-
-
-private pure func append_leaf_node_with_payload(
-	builder: DiscoveryBuilder,
-	kind: NodeKind,
-	span: Span,
-	payload: Int,
-) -> DiscoveryBuilder:
-	first_child: Int = builder.node_children.length()
-	builder.append_node({
-		kind = kind,
-		span = span,
-		payload = payload,
-		children = {
-			first = first_child,
-			count = 0
-		},
-	})

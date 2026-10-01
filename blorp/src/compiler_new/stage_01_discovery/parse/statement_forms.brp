@@ -1,0 +1,292 @@
+-- The non-recursive parts of statements: lookahead that tells which statement
+-- starts at the cursor (named binding, typed binding, tuple destructure), and the
+-- routines that finish a binding or `?=` once its value is parsed. The
+-- statement grammar proper stays in `body_parser`, where statements, blocks
+-- and expressions recurse into each other.
+import:
+	../tables/builder:
+		DiscoveryBuilder,
+		LoopContext(InLoopBody, NotInLoop),
+		advance_token,
+		append_plain_diagnostic,
+		move_token_cursor,
+	../tables/diagnostic_code:
+		DiscoveryDiagnosticCode(DiscardedQuestionBindDiagnostic, QuestionBindInLoopDiagnostic),
+	../tables/ids: NameId, name_id_at_row, name_id_index
+	../tables/name_vocabulary: DISCARD_NAME_INDEX
+	../tables/node_builder:
+		ChildMark,
+		append_named_parent_node_since,
+		append_parent_node_since,
+		last_node_id,
+		push_last_node,
+	../tables/row_kinds:
+		NodeKind(MissingExpressionNode, QuestionBindNode),
+		ParsedConstruct(SelectReceiveBinding),
+	../tables/span: Span, span_covering
+	../tables/token:
+		TokenKind(
+			ColonSymbol, CommaSymbol, DedentToken, EndOfFileToken, EqualSymbol, FromKeyword,
+			IdentifierToken, LeftBraceSymbol, LeftBracketSymbol, LeftParenSymbol, MinusEqualSymbol,
+			NewlineToken, PlusEqualSymbol, QuestionEqualsSymbol, RightBraceSymbol,
+			RightBracketSymbol, RightParenSymbol, SlashEqualSymbol, StarEqualSymbol,
+			UnderscoreSymbol,
+		),
+	parser_cursor:
+		at,
+		binder_name_at_cursor,
+		consume_binder_name,
+		current_kind,
+		current_name,
+		current_span,
+		is_soft_keyword,
+		keyword_name_index,
+		token_kind_at,
+	type_parser: node_span
+
+
+---
+Whether the token at the cursor can name a binding: a name, or a reserved
+keyword followed by a binding tail (which is then reported once as a
+reserved name).
+---
+pure func can_start_named_statement(builder: DiscoveryBuilder) -> Bool:
+	if (
+		builder
+			.current_name()
+			.is_some()
+	):
+		True
+	else if keyword_name_index(builder.current_kind()).is_some():
+		after_name: Int = builder.token_cursor + 1
+		(
+			starts_assignment_tail(builder.token_kind_at(after_name))
+			or (
+				builder.token_kind_at(after_name) == ColonSymbol
+				and builder.colon_starts_typed_assignment(after_name)
+			)
+		)
+	else:
+		False
+
+
+pure func starts_assignment_tail(kind: TokenKind) -> Bool:
+	match kind:
+		EqualSymbol | QuestionEqualsSymbol | PlusEqualSymbol | MinusEqualSymbol | StarEqualSymbol | SlashEqualSymbol:
+			True
+		_:
+			False
+
+
+---
+Whether the `:` at `colon` starts a type annotation of a binding: an `=` or
+`?=` follows at bracket depth zero before the end of the line, a `,`, a `:`
+or an unmatched closing bracket.
+---
+pure func colon_starts_typed_assignment(builder: DiscoveryBuilder, colon: Int) -> Bool:
+	var index: Int = colon + 1
+	var depth: Int = 0
+	var found: Bool = False
+	var scanning: Bool = True
+
+	while scanning:
+		match builder.token_kind_at(index):
+			EndOfFileToken | NewlineToken | DedentToken:
+				scanning = False
+			EqualSymbol | QuestionEqualsSymbol:
+				if depth == 0:
+					found = True
+					scanning = False
+				else:
+					index += 1
+			LeftParenSymbol | LeftBracketSymbol | LeftBraceSymbol:
+				depth += 1
+				index += 1
+			RightParenSymbol | RightBracketSymbol | RightBraceSymbol:
+				if depth == 0:
+					scanning = False
+				else:
+					depth -= 1
+					index += 1
+			CommaSymbol | ColonSymbol:
+				if depth == 0:
+					scanning = False
+				else:
+					index += 1
+			_:
+				index += 1
+
+	found
+
+
+---
+Reports the `?=` at the cursor when it is inside a loop body: each iteration
+would have to return from the enclosing function. The carrier checks that need
+types stay in typechecking.
+---
+pure func report_question_bind_in_loop(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	operator_span: Span = builder.current_span()
+
+	match builder.loop_context:
+		InLoopBody:
+			builder.append_plain_diagnostic(QuestionBindInLoopDiagnostic, operator_span)
+		NotInLoop:
+			builder
+
+
+---
+Appends a named statement over the children pushed since `mark`
+and the value just parsed.
+---
+pure func finish_named_statement(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	name: NameId,
+	name_span: Span,
+	mark: ChildMark,
+) -> DiscoveryBuilder:
+	value_span: Span = builder.node_span(builder.last_node_id())
+	builder
+		.push_last_node()
+		.append_named_parent_node_since(
+			mark,
+			kind,
+			name_span.span_covering(value_span),
+			name,
+			name_span,
+		)
+
+
+---
+`name ?= value`; `_ ?= value` is reported, since the unwrapped value needs a
+name.
+---
+pure func finish_question_bind(
+	builder: DiscoveryBuilder,
+	name: NameId,
+	name_span: Span,
+	mark: ChildMark,
+) -> DiscoveryBuilder:
+	if name.name_id_index() == DISCARD_NAME_INDEX:
+		builder
+			.append_plain_diagnostic(DiscardedQuestionBindDiagnostic, name_span)
+			.finish_named_statement(QuestionBindNode, name, name_span, mark)
+	else:
+		builder.finish_named_statement(QuestionBindNode, name, name_span, mark)
+
+
+---
+A statement that could not be parsed, over the children pushed since `mark`.
+---
+pure func missing_statement(
+	builder: DiscoveryBuilder,
+	span: Span,
+	mark: ChildMark,
+) -> DiscoveryBuilder:
+	builder.append_parent_node_since(mark, MissingExpressionNode, span)
+
+
+---
+Whether `(` starts a tuple destructuring assignment: two or more binder
+names (names, `_`, or reserved keywords, which are then reported) separated
+by commas, a `)`, and `=`.
+---
+pure func starts_tuple_destructure(builder: DiscoveryBuilder) -> Bool:
+	var index: Int = builder.token_cursor + 1
+	var saw_comma: Bool = False
+	var expecting_name: Bool = True
+	var closed: Bool = False
+	var valid: Bool = True
+
+	while valid and not closed:
+		kind: TokenKind = builder.token_kind_at(index)
+
+		if expecting_name:
+			if (
+				kind == IdentifierToken
+				or kind == UnderscoreSymbol
+				or kind.is_reserved_keyword()
+			):
+				index += 1
+				expecting_name = False
+			else:
+				valid = False
+		else if kind == CommaSymbol:
+			saw_comma = True
+			index += 1
+
+			if builder.token_kind_at(index) == RightParenSymbol:
+				closed = True
+			else:
+				expecting_name = True
+		else if kind == RightParenSymbol:
+			closed = True
+		else:
+			valid = False
+
+	valid and closed and saw_comma and builder.token_kind_at(index + 1) == EqualSymbol
+
+
+private pure func is_reserved_keyword(kind: TokenKind) -> Bool:
+	(
+		kind
+			.keyword_name_index()
+			.is_some()
+		and not kind.is_soft_keyword()
+	)
+
+
+---
+Appends a `kind` node over the children pushed since `mark`, the last of which
+is the body just parsed (and not yet pushed), spanning from `start` to the
+body.
+---
+pure func finish_with_body(
+	builder: DiscoveryBuilder,
+	kind: NodeKind,
+	start: Span,
+	mark: ChildMark,
+) -> DiscoveryBuilder:
+	body_span: Span = builder.node_span(builder.last_node_id())
+	builder
+		.push_last_node()
+		.append_parent_node_since(
+			mark,
+			kind,
+			start.span_covering(body_span),
+		)
+
+
+pure func receive_binder_at_cursor(builder: DiscoveryBuilder) -> NameId:
+	if builder.at(FromKeyword):
+		match keyword_name_index(FromKeyword):
+			Some(index):
+				name_id_at_row(index)
+			None:
+				builder.binder_name_at_cursor()
+	else:
+		builder.binder_name_at_cursor()
+
+
+pure func consume_receive_binder(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	if builder.at(FromKeyword):
+		builder.advance_token()
+	else:
+		builder.consume_binder_name(SelectReceiveBinding)
+
+
+---
+Skips the extra bindings of a reported multi-binding `with` header, up to
+its `:` or the end of its line.
+---
+pure func skip_to_header_colon(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	var index: Int = builder.token_cursor
+
+	while (
+		builder.token_kind_at(index) != EndOfFileToken
+		and builder.token_kind_at(index) != NewlineToken
+		and builder.token_kind_at(index) != ColonSymbol
+	):
+		index += 1
+
+	builder.move_token_cursor(index)

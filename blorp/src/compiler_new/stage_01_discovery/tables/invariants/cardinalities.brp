@@ -1,0 +1,525 @@
+-- Invariants on how many rows there are and in what order: every module's
+-- blocks are contiguous and disjoint, rows sit in owner order, and an owner has
+-- at most (or exactly) the rows its kind allows.
+import:
+	../builder: DiscoveryBuilder
+	../ids:
+		bound_id_index,
+		definition_id_index,
+		implicit_request_id_index,
+		import_id_index,
+		import_item_id_index,
+		module_id_index,
+		node_id_index,
+		root_id_index,
+		supertrait_id_index,
+	../row_kinds:
+		DefinitionKind(
+			BuiltinTypeDefinition, ConstantDefinition, EnumDefinition, FieldDefinition,
+			ForeignFunctionDefinition, FunctionDefinition, ImplDefinition, ImplMethodDefinition,
+			LocalFunctionDefinition, MutableGlobalDefinition, OpaqueTypeDefinition,
+			RecordDefinition, ResourceTypeDefinition, StructDefinition, TraitDefinition,
+			TraitMethodDefinition, TypeAliasDefinition, UnionDefinition, VariantDefinition,
+		),
+		NodeKind(ConcurrentParameterNode),
+	list: repeat
+	violation:
+		DiscoveryTable(
+			BodyTable, BoundQualifierTable, BoundTable, ConcurrencyCountTable, DefinitionTable,
+			DefinitionTypeTable, DiagnosticTable, ImplicitRequestTable, ImplicitTargetTable,
+			ImportAliasTable, ImportItemAliasTable, ImportTable, ImportTargetTable,
+			ModuleDocumentationTable, ModulePackageTable, ModuleTable, NodeTable, RootTable,
+			RootTargetTable, SignatureTable, SupertraitQualifierTable, SupertraitTable,
+		),
+		TableInvariantKind(
+			ConcurrencyCountMismatch, DanglingReference, DuplicateSideRow, ImplicitOutcomeMismatch,
+			ModuleRangesOverlap, NodeReferencedTwice, RootOutcomeMismatch, SideTableUnsorted,
+			SignatureCountMismatch, UnreferencedNode,
+		),
+		TableInvariantViolation,
+		check_range,
+		range_end,
+		violation,
+
+
+---
+Each module's blocks lie inside their tables and start at or after the end
+of the previous module's blocks: modules are parsed one after another, so
+their blocks are disjoint and in module order.
+---
+pure func check_module_ranges(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	definition_count: Int = builder.definitions.length()
+	import_count: Int = builder.imports.length()
+	node_count: Int = builder.nodes.length()
+	diagnostic_count: Int = builder.diagnostics.length()
+	var previous_definitions_end: Int = 0
+	var previous_imports_end: Int = 0
+	var previous_nodes_end: Int = 0
+	var previous_diagnostics_end: Int = 0
+	var row: Int = 0
+
+	for module in builder.modules:
+		previous: Int = row - 1
+		found = check_range(
+			found,
+			ModuleTable,
+			row,
+			DefinitionTable,
+			module.definitions,
+			definition_count,
+		)
+		found = check_range(found, ModuleTable, row, ImportTable, module.imports, import_count)
+		found = check_range(found, ModuleTable, row, NodeTable, module.nodes, node_count)
+		found = check_range(
+			found,
+			ModuleTable,
+			row,
+			DiagnosticTable,
+			module.diagnostics,
+			diagnostic_count,
+		)
+
+		if module.definitions.first < previous_definitions_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					DefinitionTable,
+					previous,
+				),
+			)
+
+		if module.imports.first < previous_imports_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					ImportTable,
+					previous,
+				),
+			)
+
+		if module.nodes.first < previous_nodes_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					NodeTable,
+					previous,
+				),
+			)
+
+		if module.diagnostics.first < previous_diagnostics_end:
+			found = found.append(
+				violation(
+					ModuleRangesOverlap,
+					ModuleTable,
+					row,
+					DiagnosticTable,
+					previous,
+				),
+			)
+
+		previous_definitions_end = module.definitions.range_end()
+		previous_imports_end = module.imports.range_end()
+		previous_nodes_end = module.nodes.range_end()
+		previous_diagnostics_end = module.diagnostics.range_end()
+		row += 1
+
+	found
+
+
+---
+Every node is referenced exactly once: as one node's child, or as a root a
+row names (a body root, a parameter or definition type, a variant payload,
+either side of a dimension constraint). One pass counts the references.
+---
+pure func check_node_references(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	node_count: Int = builder.nodes.length()
+	var references: List[Int] = repeat(0, node_count)
+
+	for child in builder.node_children:
+		references = counted(references, child.node_id_index())
+
+	for body in builder.bodies:
+		references = counted(references, body.root.node_id_index())
+
+	for parameter_type in builder.parameter_types:
+		references = counted(references, parameter_type.type_root.node_id_index())
+
+	for definition_type in builder.definition_types:
+		references = counted(references, definition_type.type_root.node_id_index())
+
+	for payload in builder.variant_payloads:
+		references = counted(references, payload.type_root.node_id_index())
+
+	for constraint in builder.dimension_constraints:
+		references = counted(references, constraint.left.node_id_index())
+		references = counted(references, constraint.right.node_id_index())
+
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for count in references:
+		if count == 0:
+			found = found.append(violation(UnreferencedNode, NodeTable, row, NodeTable, row))
+		else if count > 1:
+			found = found.append(violation(NodeReferencedTwice, NodeTable, row, NodeTable, count))
+
+		row += 1
+
+	found
+
+
+---
+Side tables that hold at most one row per owner do (including a bound's or
+supertrait's module qualifier); each root has exactly
+one outcome (a target or a root diagnostic); each function-like definition
+has exactly one signature and no other definition has one.
+---
+pure func check_cardinalities(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	imports: Int = builder.imports.length()
+	roots: Int = builder.roots.length()
+	definitions: Int = builder.definitions.length()
+	root_targets: List[Int] = owner_counts(
+		roots,
+		builder.root_targets.map(pure func(row): row.root.root_id_index()),
+	)
+	root_diagnostics: List[Int] = owner_counts(
+		roots,
+		builder.root_diagnostics.map(pure func(row): row.root.root_id_index()),
+	)
+	implicit_requests: Int = builder.implicit_requests.length()
+	implicit_targets: List[Int] = owner_counts(
+		implicit_requests,
+		builder.implicit_targets.map(pure func(row): row.request.implicit_request_id_index()),
+	)
+	implicit_diagnostics: List[Int] = owner_counts(
+		implicit_requests,
+		builder.implicit_diagnostics.map(pure func(row): row.request.implicit_request_id_index()),
+	)
+	signatures: List[Int] = owner_counts(
+		definitions,
+		builder.signatures.map(pure func(row): row.definition.definition_id_index()),
+	)
+	var found: List[TableInvariantViolation] = at_most_one(
+		[],
+		ImportTargetTable,
+		ImportTable,
+		owner_counts(
+			imports,
+			builder.import_targets.map(pure func(row): row.owner_import.import_id_index()),
+		),
+	)
+	found = at_most_one(
+		found,
+		ImportAliasTable,
+		ImportTable,
+		owner_counts(
+			imports,
+			builder.import_aliases.map(pure func(row): row.owner_import.import_id_index()),
+		),
+	)
+	found = at_most_one(
+		found,
+		BoundQualifierTable,
+		BoundTable,
+		owner_counts(
+			builder.bounds.length(),
+			builder.bound_qualifiers.map(pure func(row): row.bound.bound_id_index()),
+		),
+	)
+	found = at_most_one(
+		found,
+		SupertraitQualifierTable,
+		SupertraitTable,
+		owner_counts(
+			builder.supertraits.length(),
+			builder.supertrait_qualifiers.map(pure func(row): row.supertrait.supertrait_id_index()),
+		),
+	)
+	found = at_most_one(found, RootTargetTable, RootTable, root_targets)
+	found = at_most_one(found, ImplicitTargetTable, ImplicitRequestTable, implicit_targets)
+	found = sorted_by_owner(
+		found,
+		ImplicitTargetTable,
+		builder.implicit_targets.map(pure func(row): row.request.implicit_request_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		ImportTargetTable,
+		builder.import_targets.map(pure func(row): row.owner_import.import_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		ImportAliasTable,
+		builder.import_aliases.map(pure func(row): row.owner_import.import_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		ImportItemAliasTable,
+		builder.import_item_aliases.map(pure func(row): row.item.import_item_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		BoundQualifierTable,
+		builder.bound_qualifiers.map(pure func(row): row.bound.bound_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		SupertraitQualifierTable,
+		builder.supertrait_qualifiers.map(pure func(row): row.supertrait.supertrait_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		RootTargetTable,
+		builder.root_targets.map(pure func(row): row.root.root_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		ModulePackageTable,
+		builder.module_packages.map(pure func(row): row.module.module_id_index()),
+	)
+	found = at_most_one(
+		found,
+		ModulePackageTable,
+		ModuleTable,
+		owner_counts(
+			builder.modules.length(),
+			builder.module_packages.map(pure func(row): row.module.module_id_index()),
+		),
+	)
+	found = at_most_one(
+		found,
+		DefinitionTypeTable,
+		DefinitionTable,
+		owner_counts(
+			definitions,
+			builder.definition_types.map(pure func(row): row.definition.definition_id_index()),
+		),
+	)
+	found = at_most_one(
+		found,
+		ModuleDocumentationTable,
+		ModuleTable,
+		owner_counts(
+			builder.modules.length(),
+			builder.module_documentation.map(pure func(row): row.module.module_id_index()),
+		),
+	)
+	found = at_most_one(
+		found,
+		BodyTable,
+		DefinitionTable,
+		owner_counts(
+			definitions,
+			builder.bodies.map(pure func(row): row.definition.definition_id_index()),
+		),
+	)
+	var root: Int = 0
+
+	while root < roots:
+		outcomes: Int = root_targets.get_or(root, 0) + root_diagnostics.get_or(root, 0)
+
+		if outcomes != 1:
+			found = found.append(
+				violation(
+					RootOutcomeMismatch,
+					RootTable,
+					root,
+					RootTargetTable,
+					outcomes,
+				),
+			)
+
+		root += 1
+
+	var request: Int = 0
+
+	while request < implicit_requests:
+		outcomes: Int = implicit_targets.get_or(
+			request,
+			0,
+		) + implicit_diagnostics.get_or(request, 0)
+
+		if outcomes != 1:
+			found = found.append(
+				violation(
+					ImplicitOutcomeMismatch,
+					ImplicitRequestTable,
+					request,
+					ImplicitTargetTable,
+					outcomes,
+				),
+			)
+
+		request += 1
+
+	var row: Int = 0
+
+	for definition in builder.definitions:
+		expected: Int = if definition.kind.has_signature():
+			1
+		else:
+			0
+
+		count: Int = signatures.get_or(row, 0)
+
+		if count != expected:
+			found = found.append(
+				violation(
+					SignatureCountMismatch,
+					DefinitionTable,
+					row,
+					SignatureTable,
+					count,
+				),
+			)
+
+		row += 1
+
+	found
+
+
+---
+Whether a definition of `kind` has a signature row.
+---
+private pure func has_signature(kind: DefinitionKind) -> Bool:
+	match kind:
+		FunctionDefinition | TraitMethodDefinition | ImplMethodDefinition | ForeignFunctionDefinition | LocalFunctionDefinition:
+			True
+		RecordDefinition | StructDefinition | UnionDefinition | EnumDefinition | BuiltinTypeDefinition | ResourceTypeDefinition | TypeAliasDefinition | OpaqueTypeDefinition | TraitDefinition | ImplDefinition | ConstantDefinition | MutableGlobalDefinition | FieldDefinition | VariantDefinition:
+			False
+
+
+---
+How many rows name each of `owner_count` owners, from the owner index of
+each row; an index outside the owners is a dangling reference the row
+checks report.
+---
+private pure func owner_counts(owner_count: Int, owners: List[Int]) -> List[Int]:
+	var counts: List[Int] = repeat(0, owner_count)
+
+	for owner in owners:
+		counts = counted(counts, owner)
+
+	counts
+
+
+---
+The owner before every owner: what the previous row's owner is for the first
+row of a side table, so no first owner is out of order.
+---
+private BEFORE_THE_FIRST_OWNER: Int = -1
+
+
+---
+A `SideTableUnsorted` for each row whose owner is not greater than the
+previous row's: the frozen tables find a side row by binary search.
+---
+pure func sorted_by_owner(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	owners: List[Int],
+) -> List[TableInvariantViolation]:
+	var out: List[TableInvariantViolation] = found
+	var previous: Int = BEFORE_THE_FIRST_OWNER
+	var row: Int = 0
+
+	for owner in owners:
+		if owner <= previous:
+			out = out.append(violation(SideTableUnsorted, table, row, table, owner))
+
+		previous = owner
+		row += 1
+
+	out
+
+
+---
+A `DuplicateSideRow` for each owner `counts` gives more than one row.
+---
+private pure func at_most_one(
+	found: List[TableInvariantViolation],
+	table: DiscoveryTable,
+	owner_table: DiscoveryTable,
+	counts: List[Int],
+) -> List[TableInvariantViolation]:
+	var out: List[TableInvariantViolation] = found
+	var owner: Int = 0
+
+	for count in counts:
+		if count > 1:
+			out = out.append(violation(DuplicateSideRow, table, owner, owner_table, count))
+
+		owner += 1
+
+	out
+
+
+---
+`references` with the count at `index` raised by one; an index outside the
+node table is a dangling reference, which the row checks report.
+---
+private pure func counted(references: List[Int], index: Int) -> List[Int]:
+	match references.get(index):
+		Some(count):
+			references.set(index, count + 1)
+		None:
+			references
+
+
+---
+Concurrency count rows: sorted by node, each naming a `ConcurrentParameterNode`
+and positive.
+---
+pure func check_concurrency_counts(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var previous: Int = BEFORE_THE_FIRST_OWNER
+	var row: Int = 0
+
+	for count_row in builder.concurrency_counts:
+		owner: Int = count_row.parameter.node_id_index()
+
+		match builder.nodes.get(owner):
+			Some(node):
+				if node.kind != ConcurrentParameterNode or count_row.count <= 0:
+					found = found.append(
+						violation(
+							ConcurrencyCountMismatch,
+							ConcurrencyCountTable,
+							row,
+							NodeTable,
+							owner,
+						),
+					)
+			None:
+				found = found.append(
+					violation(
+						DanglingReference,
+						ConcurrencyCountTable,
+						row,
+						NodeTable,
+						owner,
+					),
+				)
+
+		if owner <= previous:
+			found = found.append(
+				violation(
+					SideTableUnsorted,
+					ConcurrencyCountTable,
+					row,
+					ConcurrencyCountTable,
+					owner,
+				),
+			)
+
+		previous = owner
+		row += 1
+
+	found
