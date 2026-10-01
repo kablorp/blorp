@@ -319,13 +319,13 @@ docstring gives each kind's payload and child order, and
 `node_payload_reference(kind)` says which table the payload indexes:
 `NamePayload`, `LiteralPayload`, `CodepointPayload`, `DefinitionPayload` or
 `NoPayload` (which stores `NO_NODE_PAYLOAD`). This document does not repeat
-the list. There are 124 kinds in these families:
+the list. There are 123 kinds in these families:
 
 - literals and names: `IdentifierNode`, one kind per literal form (integer,
   float, string, raw, pipe, raw pipe, char, `True`, `False`), and the
   interpolated forms below;
 - operators: one kind per unary and binary operator (`AddNode`,
-  `LessEqualNode`, `AndNode`, ...), plus `RangeNode` and `AscriptionNode`;
+  `LessEqualNode`, `AndNode`, ...), plus `RangeNode`;
 - calls and access: `CallNode`, `FieldAccessNode`, `SubscriptNode`;
 - aggregates: list, tuple, vector, record literal and update, record field,
   dict literal and entry, `into_opaque` and `from_opaque`;
@@ -385,7 +385,7 @@ struct DiagnosticRow {code: DiscoveryDiagnosticCode, span: Span, arguments: RowR
 `diagnostics` holds each module's lex and parse diagnostics in the module's
 contiguous block; `resolution_diagnostics` holds the walker's (imports that
 loaded nothing, sources that could not be admitted). The code catalogue is
-`discovery_diagnostic_code.brp`: 99 codes, each documented with the meaning
+`discovery_diagnostic_code.brp`: 100 codes, each documented with the meaning
 of its arguments, and `diagnostic_code_name` gives the stable names dumps
 and fixtures use. Messages are rendered from the code and arguments at the
 boundary that shows them, so the text lives in one place and can be tested

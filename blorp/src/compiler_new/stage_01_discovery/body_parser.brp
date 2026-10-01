@@ -106,6 +106,7 @@ import:
 			QuestionBindInLoopDiagnostic,
 			RemovedFromConversionDiagnostic,
 			RemovedIntoConversionDiagnostic,
+			RemovedTypeAscriptionDiagnostic,
 			TupleArityDiagnostic,
 			WithMultipleBindingsDiagnostic,
 		),
@@ -146,7 +147,6 @@ import:
 			AddAssignNode,
 			AddNode,
 			AndNode,
-			AscriptionNode,
 			AssignmentNode,
 			BlockNode,
 			BreakNode,
@@ -316,11 +316,10 @@ import:
 	type_parser: node_span, parse_dimension_constraints, parse_type, parse_type_parameters
 
 
--- Precedence levels of the binary operators, loosest first; `as` binds at the
--- loosest level and applies only there.
+-- Precedence levels of the binary operators, loosest first. A stray `as` is
+-- reported only at the loosest level, so `a + b as T` reports once from the
+-- outer loop instead of inside the tighter right operand.
 private LOWEST_PRECEDENCE: Int = 0
-
-private ASCRIPTION_PRECEDENCE: Int = 0
 
 private OR_PRECEDENCE: Int = 1
 
@@ -940,7 +939,7 @@ private pure func consume_continuation_dedent(builder: DiscoveryBuilder) -> Disc
 
 
 ---
-Whether `node` is a binary expression (or ascription) whose left side holds
+Whether `node` is a binary expression whose left side holds
 a leading-dot continuation, or whose right side needs one.
 ---
 private pure func needs_continuation_dedent(builder: DiscoveryBuilder, node: NodeId) -> Bool:
@@ -952,8 +951,6 @@ private pure func needs_continuation_dedent(builder: DiscoveryBuilder, node: Nod
 				builder.child_has_leading_dot_continuation(node, 0)
 				or builder.child_needs_continuation_dedent(node, 1)
 			)
-		AscriptionNode:
-			builder.child_has_leading_dot_continuation(node, 0)
 		_:
 			False
 
@@ -1003,8 +1000,6 @@ private pure func has_leading_dot_continuation(builder: DiscoveryBuilder, node: 
 					False
 		CallNode | SubscriptNode | AddNode | SubtractNode | MultiplyNode | DivideNode | ModuloNode | EqualNode | NotEqualNode | LessNode | LessEqualNode | GreaterNode | GreaterEqualNode | AndNode | OrNode:
 			builder.any_child_has_leading_dot_continuation(row)
-		AscriptionNode:
-			builder.child_has_leading_dot_continuation(node, 0)
 		_:
 			False
 
@@ -2556,10 +2551,10 @@ private pure func parse_expression_at(
 		kind: TokenKind = out.current_kind()
 
 		if kind == AsKeyword:
-			if ASCRIPTION_PRECEDENCE < min_precedence:
+			if LOWEST_PRECEDENCE < min_precedence:
 				parsing = False
 			else:
-				out = out.parse_ascription()
+				out = out.report_removed_ascription()
 		else:
 			match kind.binary_operator():
 				Some(operator):
@@ -2577,21 +2572,47 @@ private pure func parse_expression_at(
 
 
 ---
-`value as T`, the value parsed.
+Reports the removed `value as T` and skips `as T` without adding a node, so
+the value stays the expression. The type is skipped by tokens, not parsed,
+because a parsed type would leave nodes no parent refers to.
+
+The old front end parses the type, so the two differ in diagnostic count only
+where the type's end matters: `x as Int + 1` and `x as Int as Int` report one
+diagnostic here, which skips to the end of the line, and more there.
 ---
-private pure func parse_ascription(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	value_span: Span = builder.node_span(builder.last_node_id())
-	pushed: DiscoveryBuilder = builder.push_last_node()
-	advanced: DiscoveryBuilder = pushed.advance_token()
-	var out: DiscoveryBuilder = advanced.parse_type()
-	type_span: Span = out.node_span(out.last_node_id())
-	out = out.push_last_node()
-	out = out.append_parent_node_from_stack(
-		AscriptionNode,
-		value_span.span_covering(type_span),
-		2,
+private pure func report_removed_ascription(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	reported: DiscoveryBuilder = builder.append_plain_diagnostic(
+		RemovedTypeAscriptionDiagnostic,
+		builder.current_span(),
 	)
-	out
+	advanced: DiscoveryBuilder = reported.advance_token()
+	var index: Int = advanced.token_cursor
+	var open_delimiters: Int = 0
+
+	while open_delimiters > 0 or not advanced.token_kind_at(index).ends_ascribed_type():
+		kind: TokenKind = advanced.token_kind_at(index)
+
+		if kind == LeftBracketSymbol or kind == LeftParenSymbol or kind == LeftBraceSymbol:
+			open_delimiters += 1
+		else if kind == RightBracketSymbol or kind == RightParenSymbol or kind == RightBraceSymbol:
+			open_delimiters -= 1
+
+		index += 1
+
+	advanced.move_token_cursor(index)
+
+
+---
+Whether `kind` ends the type of a removed ascription when no delimiter the
+type opened is still open: the end of a line or block, or a delimiter that
+closes or separates the enclosing construct.
+---
+private pure func ends_ascribed_type(kind: TokenKind) -> Bool:
+	match kind:
+		EndOfFileToken | NewlineToken | DedentToken | ColonSymbol | CommaSymbol | RightBracketSymbol | RightParenSymbol | RightBraceSymbol:
+			True
+		_:
+			False
 
 
 ---

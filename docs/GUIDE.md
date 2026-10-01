@@ -1511,59 +1511,23 @@ state the refinement: `n: #3 = 3`. A `var` with no annotation holds the base
 `Int` of its initializer (`var z = n` is an `Int`); `var z: #3 = n` keeps the
 refinement.
 
-### Expression Type Ascription
+### Expected Types From Context
 
-Use `expr as Type` when an expression needs an inline expected type. This is
-the same kind of checked guidance as an annotated binding, not an unchecked
-runtime cast.
-
-```blorp
-func accepts_float32(x: Float32) -> Bool:
-    True
-
-func accepts_names(names: List[String]) -> Bool:
-    names.length() >= 0
-
-ok1: Bool = accepts_float32(123.45 as Float32)
-ok2: Bool = accepts_names([] as List[String])
-ok3: Option[String] = None as Option[String]
-
-bad1: Int = "hello" as Int           -- type error
-bad2: List[String] = [1] as List[String]  -- type error
-```
-
-Ascription can appear anywhere an expression is valid, including function
-arguments, collection literals, match arms, and nested expressions. It gives
-the inner expression an expected type during inference, so literals and empty
-collections get the same contextual treatment they would get from an annotated
-assignment.
-
-Annotated bindings provide contextual literal narrowing:
+Annotated bindings and typed parameter slots provide the expected type for
+literals and empty collections:
 
 ```blorp
 x: Float32 = 1.0
+names: List[String] = []
+nothing: Option[String] = None
 ```
 
-Function and constructor arguments do not implicitly narrow literals to sized
-numeric targets. Use `as` when the callee expects a specific sized type:
+Only a bare literal takes the slot type: `1 + 2` in an `Int32` slot is an
+`Int` and must be converted, for example with `to_int32(1 + 2)`.
 
-```blorp
-ok: Bool = accepts_float32(1.0 as Float32)
-value: Wide = WideValue(1 as Int128)
-```
-
-`as` binds lower than arithmetic, comparison, and logical operators, but higher
-than comma and argument separation:
-
-```blorp
-value: Int32 = 1 + 2 as Int32          -- (1 + 2) as Int32
-sum: Int32 = (1 as Int32) + (2 as Int32)
-```
-
-For actual value conversion, use the standard conversion functions such as
-`to_int32` or `to_float32`.
-
-Note that we may gradually remove type ascription as our inference matures.
+There is no inline `expr as Type` form; writing one is a parse error that
+points at the binding annotation. For actual value conversion, use the
+standard conversion functions such as `to_int32` or `to_float32`.
 
 ---
 
@@ -1972,9 +1936,8 @@ A non-positive explicit chunk size or window size is reported as
 `Err(InvalidInput(...))` by the terminal operation. Streams are one-shot cursors,
 so they cannot be bound globally or stored in ordinary aggregates such as
 tuples, lists, dicts, records, structs, or unions, and they cannot be hidden
-inside ordinary carrier type aliases/ascriptions such as
-`type alias MaybeStream = Option[Stream[T]]` or
-`None as Option[Stream[T]]`. Ordinary local bindings such as
+inside ordinary carrier type aliases such as
+`type alias MaybeStream = Option[Stream[T]]`. Ordinary local bindings such as
 `maybe: Option[Stream[T]] = None` and ordinary function signatures containing
 stream carriers such as `Option[Stream[T]]` are rejected too. Function values
 may directly produce streams, such as `() -> Stream[T]`, but their parameters
@@ -2009,8 +1972,7 @@ consume it with a terminal operation such as `collect_result()` instead.
 owned resources one at a time, such as TCP listener connections or database
 pool checkouts. It is not usable as an ordinary collection: records, unions,
 type aliases that hide it inside ordinary carriers, ordinary local bindings
-such as `Option[ResourceSource[...]]`, ordinary carrier type ascriptions such
-as `None as Option[ResourceSource[...]]`, globals, and ordinary source function
+such as `Option[ResourceSource[...]]`, globals, and ordinary source function
 parameters or returns cannot contain it. Function values may directly produce
 resource sources, such as `() -> ResourceSource[R, E]`, but their parameters
 and return values cannot hide resource sources in ordinary carriers such as

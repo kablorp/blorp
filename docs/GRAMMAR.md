@@ -388,9 +388,7 @@ expr = assign_expr ;
 
 assign_expr = postfix_expr "=" assign_expr              (* assignment / destruct *)
             | IDENT ("+=" | "-=" | "*=" | "/=") assign_expr
-            | ascription_expr ;
-
-ascription_expr = or_expr [ "as" type_expr ] ;
+            | or_expr ;
 
 or_expr  = or_expr "or" { NEWLINE } and_expr | and_expr ;
 and_expr = and_expr "and" { NEWLINE } cmp_expr | cmp_expr ;
@@ -415,11 +413,9 @@ postfix_expr = postfix_expr "." identifier                  (* field access *)
 expr_list = expr { "," expr } [ "," ] ;
 ```
 
-`as` is expression type ascription, not a cast. It binds lower than
-`or`, `and`, comparisons, ranges, arithmetic, unary operators, and postfix
-calls/field access, but higher than comma and argument separation. Therefore
-`1 + 2 as Int32` parses as `(1 + 2) as Int32`; use parentheses for
-operand-level ascription such as `(1 as Int32) + (2 as Int32)`.
+`as` only appears in import aliases. An expression followed by `as` is a
+parse error: type ascription was removed, so annotate the binding
+(`x: Int32 = 1 + 2`) or rely on the parameter type.
 
 ### Primary Expressions
 
