@@ -72,8 +72,8 @@ compiler CI):
   outside `compiler_new` reads the tables yet.
 - **The prelude.** The existing compiler loads 16 prelude modules into every
   compilation; discovery loads only what the roots import. Owner: the
-  stage (roadmap C1 and C2); needed before the adapter's differential check
-  can pass.
+  stage (roadmap item 1, which also seeds the test runtime for `blorp test`);
+  needed before the adapter's differential check can pass.
 - **The embedded standard-library provider and the package catalog.** Both
   plug into the provider seam (section 5) without changes to the module graph.
 
@@ -732,7 +732,7 @@ The adapter is a plain transformation from `FrontendTables` to the
 neither side: the new stage never imports the old compiler, and typecheck
 keeps its current input. It sits in the compiler's top-level pipeline
 (`blorp/src/compiler/pipeline.brp` or a module beside it), the one module the
-layout check will allow to import both (roadmap F1).
+layout check will allow to import both.
 
 ```blorp
 ---
@@ -754,15 +754,18 @@ Loading the prelude belongs to the stage (see Status), not the adapter.
 
 ### Proving the adapter
 
-A differential check runs the old discovery and the new discovery plus the
+A differential check runs the old parser and the new discovery plus the
 adapter over every source we have (the compiler, the standard library, and
-every test and fixture program) and compares the legacy structures field by
-field. A mismatch names the module, the declaration and the field. Once it
-is clean on the whole corpus, the new stage becomes the default (roadmap F5)
-and the old discovery leaves the compile path later (roadmap G);
-byte-identical generated C for the self-compile and the test corpus
-confirms the rest. The known intended difference is `# N`, rejected by the
-new lexer.
+every test and fixture program) and compares each module's parsed AST
+through the existing JSON encoder (`parsed_ast_json.brp`), so no separate
+renderer is written. A mismatch names the module, the declaration and the
+field. Once it is clean on the whole corpus, the new stage becomes the
+default and the old discovery leaves the compile path later (roadmap items 3
+to 8). The same generated C for the self-compile and the test corpus
+confirms the rest; ids are internal identity, so the adapter passes the
+stage's name table through instead of imitating the old numbering, and C
+that differs only in id-derived names is compared after normalizing them.
+The known intended difference is `# N`, rejected by the new lexer.
 
 ## 11. What changes for later stages
 
