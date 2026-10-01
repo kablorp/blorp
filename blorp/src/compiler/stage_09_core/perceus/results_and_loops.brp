@@ -169,6 +169,8 @@ import:
 		CoreRecordFieldValue,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy),
 		CoreRetainPolicy(ArcRetainPolicy, StackResultRetainPolicy),
+		CoreSelectArm,
+		CoreSelectArmKind(SelectRecvArm),
 		CoreSourceLoc,
 		CoreType(
 			BoxedResultType,
@@ -5523,6 +5525,48 @@ private pure func insert_drops_for_loop_expr(env: PerceusEnv, expr: CoreExpr) ->
 			expr
 
 
+--- The select emitter owns a received value and releases it after its arm,
+--- so a receive arm only borrows its binder, as a channel loop body borrows
+--- its element (`rewrite_loop_body`). Retain the binder wherever the arm
+--- consumes or stores it; without this a consuming use freed the value and the
+--- emitter's release freed it again. Returns `arms` itself when nothing changed.
+private pure func retain_borrowed_select_binders(
+	env: PerceusEnv,
+	arms: List[CoreSelectArm],
+) -> List[CoreSelectArm]:
+	var retained: List[CoreSelectArm] = []
+	var changed: Bool = False
+
+	for arm in arms:
+		body: CoreExpr = match arm.kind:
+			SelectRecvArm(recv):
+				if is_managed_type(env, recv.elem_type):
+					retain_borrowed_owned_uses(
+						env,
+						{
+							name = recv.binder,
+							typ = recv.elem_type,
+							loc = synthetic_core_source_loc()
+						},
+						arm.body,
+					)
+				else:
+					arm.body
+			_:
+				arm.body
+
+		if same_object(body, arm.body):
+			retained = retained.append(arm)
+		else:
+			retained = retained.append({ arm | body = body })
+			changed = True
+
+	if changed:
+		retained
+	else:
+		arms
+
+
 pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LetExpr(variable, is_mutable, bind_type, rhs, body):
@@ -5708,5 +5752,13 @@ pure func insert_drops_normalized_expr(env: PerceusEnv, expr: CoreExpr) -> CoreE
 				typ,
 				loc,
 			)
+		SelectExpr(arms, typ, loc):
+			retained_arms: List[CoreSelectArm] = retain_borrowed_select_binders(env, arms)
+			retained: CoreExpr = if same_object(retained_arms, arms):
+				expr
+			else:
+				SelectExpr(retained_arms, typ, loc)
+
+			CoreTraverse.map_core_expr_children_with_context(retained, env, insert_drops_expr_inner)
 		_:
 			CoreTraverse.map_core_expr_children_with_context(expr, env, insert_drops_expr_inner)

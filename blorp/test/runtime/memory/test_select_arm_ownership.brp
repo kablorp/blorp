@@ -1,0 +1,79 @@
+import:
+	test: TestSuite
+
+
+func payload(label: String) -> String:
+	label + "-payload"
+
+
+--- The select emitter owns a received value and releases it after the arm,
+--- so the arm only borrows its binder. Interpolation consumes its operands;
+--- without a retain the arm freed the binder and the emitter released it again.
+func test_select_binder_consumed_in_arm_stays_owned_by_select() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, payload("hello"))
+	var got: String = ""
+	select:
+		value from ch:
+			got = "got ${value}"
+		_ after 100:
+			got = "timeout"
+	got == "got hello-payload"
+
+
+--- Assigning a mutable local inside a select arm must release the value it
+--- replaces, as the same assignment does in a match arm.
+func test_select_arm_assignment_releases_replaced_value() -> Bool:
+	ch: Channel[String] = channel(1)
+	_ = send(ch, payload("hello"))
+	var got: String = payload("initial")
+	select:
+		value from ch:
+			got = value
+		_ after 100:
+			got = payload("timeout")
+	got == "hello-payload"
+
+
+func extend(items: List[String], item: String) -> List[String]:
+	items.append(item)
+
+
+--- A select arm inside a loop may run on every iteration, so an outer local
+--- it consumes must be retained each time, as in a loop's match arm.
+func test_select_arm_in_loop_retains_consumed_locals() -> Bool:
+	ch: Channel[Int] = channel(2)
+	_ = send(ch, 1)
+	_ = send(ch, 2)
+	seal(ch)
+	base: List[String] = [payload("base")]
+	var seen: List[String] = [payload("seen")]
+	var total: Int = 0
+	var running: Bool = True
+
+	while running:
+		select:
+			value from ch:
+				from_base: List[String] = extend(base, payload("item"))
+				from_seen: List[String] = extend(seen, payload("item"))
+				total = total + value + from_base.length() + from_seen.length()
+			sealed ch:
+				running = False
+
+	total == 11 and base.length() == 1 and seen.length() == 1
+
+
+tests: TestSuite = {
+	description = "select arm ownership",
+	tests = [
+		(
+			"binder consumed in arm stays owned by select",
+			test_select_binder_consumed_in_arm_stays_owned_by_select,
+		),
+		(
+			"arm assignment releases replaced value",
+			test_select_arm_assignment_releases_replaced_value,
+		),
+		("arm in loop retains consumed locals", test_select_arm_in_loop_retains_consumed_locals),
+	]
+}

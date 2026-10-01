@@ -1503,6 +1503,15 @@ pure func drop_count_for(name: String, expr: CoreExpr) -> Int:
 				name,
 				scrutinee,
 			) + drop_count_in_constructor_length_match(name, match_expr)
+		SelectExpr(arms, typ, loc):
+			var total: Int = 0
+
+			for arm in arms:
+				total += drop_count_for(name, arm.body)
+
+			total
+		PreClosureConcurrentExpr(block, typ, loc):
+			drop_count_for(name, block.body)
 		_:
 			0
 
@@ -1750,6 +1759,15 @@ pure func dup_count_for(name: String, expr: CoreExpr) -> Int:
 			) + dup_count_in_constructor_literal_match(name, match_expr)
 		LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
 			dup_count_for(name, scrutinee) + dup_count_in_constructor_length_match(name, match_expr)
+		SelectExpr(arms, typ, loc):
+			var total: Int = 0
+
+			for arm in arms:
+				total += dup_count_for(name, arm.body)
+
+			total
+		PreClosureConcurrentExpr(block, typ, loc):
+			dup_count_for(name, block.body)
 		_:
 			0
 
@@ -2243,6 +2261,10 @@ pure func has_drop_before_assign_for(name: String, expr: CoreExpr) -> Bool:
 				has_drop_before_assign_for(name, scrutinee)
 				or constructor_match_has_drop_before_assign(name, cases, fallback)
 			)
+		SelectExpr(arms, typ, loc):
+			arms.any(pure func(arm: CoreSelectArm): has_drop_before_assign_for(name, arm.body))
+		PreClosureConcurrentExpr(block, typ, loc):
+			has_drop_before_assign_for(name, block.body)
 		_:
 			False
 
@@ -11342,6 +11364,82 @@ pure func test_consuming_match_branch_in_loop_retains_owner_for_each_iteration()
 	)
 
 
+--- A select arm in a loop may run on every iteration, so an outer local it
+--- consumes is retained before each consume, as in a loop's match branch.
+pure func test_consuming_select_arm_in_loop_retains_owner_for_each_iteration() -> Bool:
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	after_arm: CoreSelectArm = {
+		kind = SelectAfterArm(int_expr(0)),
+		body = LetExpr(
+			named_var("updated"),
+			False,
+			list_int_type(),
+			consume,
+			VoidExpr(void_type(), synthetic_core_source_loc()),
+		),
+		loc = synthetic_core_source_loc()
+	}
+	select_expr: CoreExpr = SelectExpr([after_arm], void_type(), synthetic_core_source_loc())
+	loop: CoreExpr = WhileExpr(bool_expr(True), select_expr, void_type(), synthetic_core_source_loc())
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), synthetic_core_source_loc()),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 1
+
+
+--- Inside a loop, the statements after a concurrent block run on every
+--- iteration, so an outer local they consume is retained before each consume.
+pure func test_consume_after_concurrent_block_in_loop_retains_owner_for_each_iteration() -> Bool:
+	consume: CoreExpr = intrinsic_expr(
+		"list_ensure_unique",
+		[var_expr("xs", list_int_type())],
+		list_int_type(),
+	)
+	continuation: CoreExpr = concurrent_continuation(
+		LetExpr(
+			named_var("updated"),
+			False,
+			list_int_type(),
+			consume,
+			VoidExpr(void_type(), synthetic_core_source_loc()),
+		),
+		void_type(),
+	)
+	loop: CoreExpr = WhileExpr(bool_expr(True), continuation, void_type(), synthetic_core_source_loc())
+	expr: CoreExpr = LetExpr(
+		named_var("xs"),
+		False,
+		list_int_type(),
+		var_expr("source", list_int_type()),
+		SeqExpr(
+			loop,
+			VoidExpr(void_type(), synthetic_core_source_loc()),
+		),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		expr,
+	)
+
+	drop_count_for("xs", rewritten) == 1 and dup_count_for("xs", rewritten) == 1
+
+
 pure func test_match_binding_shadow_only_retains_borrowed_payload() -> Bool:
 	consume_shadow: CoreExpr = intrinsic_expr(
 		"list_ensure_unique",
@@ -11571,6 +11669,86 @@ pure func test_borrowed_for_list_item_is_retained_for_consuming_match_call() -> 
 	)
 
 	dup_count_for("item", rewritten) == 1
+
+
+--- The select emitter releases a received value after its arm, so the arm
+--- borrows its binder and a consuming use must retain it first.
+pure func test_select_receive_binder_is_retained_for_consuming_call() -> Bool:
+	item_type: CoreType = list_int_type()
+	recv_arm: CoreSelectArm = {
+		kind = SelectRecvArm({
+			binder = named_var("item"),
+			elem_type = item_type,
+			channel = var_expr("ch", NamedType("Channel", [item_type])),
+		}),
+		body = SeqExpr(
+			intrinsic_expr("list_ensure_unique", [var_expr("item", item_type)], item_type),
+			VoidExpr(void_type(), synthetic_core_source_loc()),
+		),
+		loc = synthetic_core_source_loc()
+	}
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		SelectExpr([recv_arm], void_type(), synthetic_core_source_loc()),
+	)
+
+	dup_count_for("item", rewritten) == 1
+
+
+--- Assigning a mutable local inside a select arm releases the value it
+--- replaces, as the same assignment does inside an `if` branch.
+pure func test_select_arm_assignment_releases_replaced_mutable_value() -> Bool:
+	after_arm: CoreSelectArm = {
+		kind = SelectAfterArm(int_expr(0)),
+		body = AssignExpr(
+			named_var("xs"),
+			call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+			void_type(),
+			synthetic_core_source_loc(),
+		),
+		loc = synthetic_core_source_loc()
+	}
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("xs"),
+			True,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			SeqExpr(
+				SelectExpr([after_arm], void_type(), synthetic_core_source_loc()),
+				var_expr("xs", list_int_type()),
+			),
+		),
+	)
+
+	has_drop_before_assign_for("xs", rewritten)
+
+
+--- Lowering places the statements after a `concurrent:` block in its body,
+--- so an assignment there releases the value it replaces like any other.
+pure func test_assignment_after_concurrent_block_releases_replaced_mutable_value() -> Bool:
+	assign: CoreExpr = AssignExpr(
+		named_var("xs"),
+		call_expr("blorp_list_new", [int_expr(0)], list_int_type()),
+		void_type(),
+		synthetic_core_source_loc(),
+	)
+	rewritten: CoreExpr = insert_drops_expr(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		LetExpr(
+			named_var("xs"),
+			True,
+			list_int_type(),
+			var_expr("source", list_int_type()),
+			concurrent_continuation(
+				SeqExpr(assign, var_expr("xs", list_int_type())),
+				list_int_type(),
+			),
+		),
+	)
+
+	has_drop_before_assign_for("xs", rewritten)
 
 
 pure func test_borrowed_intrinsic_drops_after_call() -> Bool:
@@ -18209,6 +18387,132 @@ pure func test_borrowed_match_binding_in_resource_scope_is_retained() -> Bool:
 			False
 
 
+--- Lowering places the statements after a `concurrent:` block in its body,
+--- wrapping them in a concurrent node with one task binding.
+pure func concurrent_continuation(body: CoreExpr, typ: CoreType) -> CoreExpr:
+	PreClosureConcurrentExpr(
+		{
+			bindings = [
+				{
+					variable = named_var("doubled"),
+					typ = int_type(),
+					rhs = int_expr(2)
+				},
+			],
+			body = body,
+			timeout = None,
+			max_threads = None
+		},
+		typ,
+		synthetic_core_source_loc(),
+	)
+
+
+pure func test_borrowed_match_binding_returned_after_concurrent_block_is_retained() -> Bool:
+	payload_type: CoreType = list_int_type()
+	match_body: CoreExpr = constructor_match_expr(
+		[constructor_case(
+				"Some",
+				[match_binding("payload", payload_type)],
+				concurrent_continuation(var_expr("payload", payload_type), payload_type),
+			)],
+		intrinsic_expr("list_alloc", [int_expr(0)], payload_type),
+		payload_type,
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [function_decl("payload_after_concurrent", 218, [], payload_type, match_body)],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	match function_body(program, "payload_after_concurrent"):
+		Some(rewritten):
+			dup_count_for("payload", rewritten) == 1
+		None:
+			False
+
+
+--- A parameter returned on only one path after a concurrent block stays
+--- borrowed, and that path retains it.
+pure func test_parameter_returned_on_one_path_after_concurrent_block_stays_borrowed() -> Bool:
+	items_type: CoreType = list_int_type()
+	body: CoreExpr = concurrent_continuation(
+		IfExpr(
+			var_expr("keep", bool_type()),
+			var_expr("items", items_type),
+			intrinsic_expr("list_alloc", [int_expr(0)], items_type),
+			items_type,
+			synthetic_core_source_loc(),
+		),
+		items_type,
+	)
+	decl: CoreDecl = function_decl(
+		"items_or_empty_after_concurrent",
+		219,
+		[core_param("items", items_type), core_param("keep", bool_type())],
+		items_type,
+		body,
+	)
+	program: CoreProgram = {
+		decls = [decl],
+		foreign_includes = [],
+		source_files = []
+	}
+	facts = infer_ownership_contracts(program)
+	rewritten: CoreProgram = insert_drops_program(program)
+	retained: Bool = match function_body(rewritten, "items_or_empty_after_concurrent"):
+		Some(rewritten_body):
+			dup_count_for("items", rewritten_body) == 1 and drop_count_for("items", rewritten_body) == 0
+		None:
+			False
+
+	-- A local that shadows a parameter sends the function to the scalar
+	-- contract analysis, which must agree.
+	shadowing_body: CoreExpr = concurrent_continuation(
+		IfExpr(
+			var_expr("keep", bool_type()),
+			var_expr("items", items_type),
+			LetExpr(
+				named_var("spare"),
+				False,
+				items_type,
+				intrinsic_expr("list_alloc", [int_expr(0)], items_type),
+				var_expr("spare", items_type),
+			),
+			items_type,
+			synthetic_core_source_loc(),
+		),
+		items_type,
+	)
+	shadowing_decl: CoreDecl = function_decl(
+		"items_or_spare_after_concurrent",
+		220,
+		[
+			core_param("items", items_type),
+			core_param("keep", bool_type()),
+			core_param("spare", items_type),
+		],
+		items_type,
+		shadowing_body,
+	)
+	shadowing_facts = infer_ownership_contracts({
+		decls = [shadowing_decl],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	(
+		inferred_contract_has_consumed_indices(facts.env, "items_or_empty_after_concurrent", 219, [])
+		and retained
+		and inferred_contract_has_consumed_indices(
+			shadowing_facts.env,
+			"items_or_spare_after_concurrent",
+			220,
+			[],
+		)
+	)
+
+
 pure func test_resource_scope_binder_shadows_unresolved_borrowed_param() -> Bool:
 	resource_type: CoreType = string_type()
 	returned: CoreParam = core_param("returned", resource_type)
@@ -20738,6 +21042,14 @@ tests: TestSuite = {
 			test_consuming_match_branch_in_loop_retains_owner_for_each_iteration,
 		),
 		(
+			"consuming select arm in loop retains owner for each iteration",
+			test_consuming_select_arm_in_loop_retains_owner_for_each_iteration,
+		),
+		(
+			"consume after concurrent block in loop retains owner for each iteration",
+			test_consume_after_concurrent_block_in_loop_retains_owner_for_each_iteration,
+		),
+		(
 			"match binding shadow only retains borrowed payload",
 			test_match_binding_shadow_only_retains_borrowed_payload,
 		),
@@ -20760,6 +21072,18 @@ tests: TestSuite = {
 		(
 			"borrowed for-list item is retained for consuming match call",
 			test_borrowed_for_list_item_is_retained_for_consuming_match_call,
+		),
+		(
+			"select receive binder is retained for consuming call",
+			test_select_receive_binder_is_retained_for_consuming_call,
+		),
+		(
+			"select arm assignment releases replaced mutable value",
+			test_select_arm_assignment_releases_replaced_mutable_value,
+		),
+		(
+			"assignment after concurrent block releases replaced mutable value",
+			test_assignment_after_concurrent_block_releases_replaced_mutable_value,
 		),
 		("borrowed intrinsic drops after call", test_borrowed_intrinsic_drops_after_call),
 		(
@@ -21344,6 +21668,14 @@ tests: TestSuite = {
 		(
 			"borrowed match binding in resource scope is retained",
 			test_borrowed_match_binding_in_resource_scope_is_retained,
+		),
+		(
+			"borrowed match binding returned after concurrent block is retained",
+			test_borrowed_match_binding_returned_after_concurrent_block_is_retained,
+		),
+		(
+			"parameter returned on one path after concurrent block stays borrowed",
+			test_parameter_returned_on_one_path_after_concurrent_block_stays_borrowed,
 		),
 		(
 			"resource scope binder shadows unresolved borrowed param",

@@ -2436,6 +2436,27 @@ private pure func count_loop_uses(
 		count_uses(name, body)
 
 
+--- Uses of `name` by a concurrent block before its body runs: the timeout,
+--- then each binding's task, which borrows what it captures. The body is left
+--- to the caller because lowering places the statements after the block there,
+--- so it may be the enclosing result.
+pure func summarize_concurrent_block_task_uses(
+	env: PerceusEnv,
+	name: String,
+	timeout: Option[CoreExpr],
+	task_bodies: List[CoreExpr],
+) -> OwnershipUseSummary:
+	var task_summaries: List[OwnershipUseSummary] = []
+
+	for task_body in task_bodies:
+		task_summaries = task_summaries.append(task_capture_ownership_use(name, task_body))
+
+	seq_ownership_uses(
+		summarize_optional_ownership_use(env, name, timeout),
+		sum_ownership_uses(task_summaries),
+	)
+
+
 private pure func task_capture_ownership_use(name: String, body: CoreExpr) -> OwnershipUseSummary:
 	if count_uses(name, body) > 0:
 		BORROW_OWNERSHIP_USE
@@ -3104,30 +3125,20 @@ private pure func summarize_linear_ownership_uses_non_binding(
 				expr,
 			)
 		PreClosureConcurrentExpr(block, typ, loc) | ConcurrentExpr(block, typ, loc):
-			var task_summaries: List[OwnershipUseSummary] = []
-			var shadowed: Bool = False
-
-			for binding in block.bindings:
-				task_summaries = task_summaries.append(
-					task_capture_ownership_use(
-						name,
-						binding.rhs,
-					),
-				)
-
-				if binding.variable.name == name:
-					shadowed = True
-				else:
-					void
-
+			shadowed: Bool = block.bindings.any(func(binding): binding.variable.name == name)
 			body_uses: OwnershipUseSummary = if shadowed:
 				NO_OWNERSHIP_USES
 			else:
 				summarize_linear_ownership_uses(env, name, block.body)
 
 			seq_ownership_uses(
-				summarize_optional_ownership_use(env, name, block.timeout),
-				seq_ownership_uses(sum_ownership_uses(task_summaries), body_uses),
+				summarize_concurrent_block_task_uses(
+					env,
+					name,
+					block.timeout,
+					block.bindings.map(func(binding): binding.rhs),
+				),
+				body_uses,
 			)
 		PreClosureConcurrentlyLoopExpr(loop, typ, loc) | ConcurrentlyLoopExpr(loop, typ, loc):
 			iter_uses: OwnershipUseSummary = summarize_linear_borrow(env, name, loop.iterable)

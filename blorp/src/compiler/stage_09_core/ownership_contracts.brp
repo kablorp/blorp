@@ -242,6 +242,7 @@ import:
 		branch_ownership_uses_pair,
 		count_uses,
 		seq_ownership_uses,
+		summarize_concurrent_block_task_uses,
 		summarize_linear_borrow,
 		summarize_match_ownership_uses,
 		direct_aliases_name,
@@ -2168,25 +2169,18 @@ private pure func schedule_contract_linear(
 					loop.limit,
 				)
 			}
-		PreClosureConcurrentExpr(block, typ, loc):
+		PreClosureConcurrentExpr(block, typ, loc) | ConcurrentExpr(block, typ, loc):
 			with_timeout: ContractCollectionTaskStack = push_optional_contract_expr(
 				pending,
 				ConsumeContractResult,
 				block.timeout,
 			)
+			-- Lowering places the statements after a `concurrent:` block in its
+			-- body, so the body inherits the block's own demand: in return
+			-- position it is the function's result, not a consumed value.
 			{
 				state = state,
-				pending = push_contract_task(with_timeout, ConsumeContractResult, block.body)
-			}
-		ConcurrentExpr(block, typ, loc):
-			with_timeout: ContractCollectionTaskStack = push_optional_contract_expr(
-				pending,
-				ConsumeContractResult,
-				block.timeout,
-			)
-			{
-				state = state,
-				pending = push_contract_task(with_timeout, ConsumeContractResult, block.body)
+				pending = push_contract_task(with_timeout, demand, block.body)
 			}
 		SelectExpr(select_expr, typ, loc):
 			var next: ContractCollectionTaskStack = pending
@@ -2549,6 +2543,18 @@ private pure func collect_function_contract_equation(
 											scope.body,
 										)
 									}
+								PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _):
+									-- The body holds the statements after the block, so it
+									-- keeps the return demand.
+									schedule_contract_linear(
+										env,
+										parameter_index,
+										callable_id,
+										demand,
+										expr,
+										state,
+										pending,
+									)
 								VarExpr(_, _, _) | FieldExpr(_, _, _, _, _) | CastExpr(_, _, _) | UnboxExpr(_, _, _, _):
 									if is_managed_type(env, return_type):
 										match expr:
@@ -2917,6 +2923,24 @@ private pure func summarize_function_return_ownership_uses(
 			seq_ownership_uses(
 				summarize_linear_ownership_uses(env, name, scope.acquire),
 				summarize_function_return_ownership_uses(env, name, return_type, scope.body),
+			)
+		PreClosureConcurrentExpr(block, typ, loc) | ConcurrentExpr(block, typ, loc):
+			-- Lowering places the statements after a `concurrent:` block in its
+			-- body, so the body is the function's return position.
+			shadowed: Bool = block.bindings.any(func(binding): binding.variable.name == name)
+			body_uses: OwnershipUseSummary = if shadowed:
+				NO_OWNERSHIP_USES
+			else:
+				summarize_function_return_ownership_uses(env, name, return_type, block.body)
+
+			seq_ownership_uses(
+				summarize_concurrent_block_task_uses(
+					env,
+					name,
+					block.timeout,
+					block.bindings.map(func(binding): binding.rhs),
+				),
+				body_uses,
 			)
 		_:
 			aliases_managed_result: Bool = match expr:

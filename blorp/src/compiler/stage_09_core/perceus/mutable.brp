@@ -2977,6 +2977,161 @@ private pure func rewrite_mutable_assignment_node(
 		}
 
 
+private record MutableConcurrentBlockRewrite {
+	timeout: Option[CoreExpr],
+	body: CoreExpr,
+	next_temp: Int
+}
+
+
+--- A concurrent block evaluates its timeout, runs its task bindings, then its
+--- body, which lowering fills with the statements after the block. Tasks are
+--- closures, which cannot capture a mutable local, so only the timeout and the
+--- body can assign the target. A binding with the target's name hides it from
+--- the body.
+private pure func rewrite_mutable_concurrent_block(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	bindings_shadow_target: Bool,
+	timeout: Option[CoreExpr],
+	body: CoreExpr,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableConcurrentBlockRewrite:
+	match timeout:
+		Some(value):
+			timeout_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				value,
+				temp_index,
+				skip_old_release,
+			)
+			body_result: MutableAssignmentRewrite = rewrite_mutable_concurrent_body(
+				env,
+				target,
+				target_type,
+				bindings_shadow_target,
+				body,
+				timeout_result.next_temp,
+				skip_old_release_after_expr(env, target, skip_old_release, value),
+			)
+			{
+				timeout = Some(timeout_result.expr),
+				body = body_result.expr,
+				next_temp = body_result.next_temp
+			}
+		None:
+			body_result: MutableAssignmentRewrite = rewrite_mutable_concurrent_body(
+				env,
+				target,
+				target_type,
+				bindings_shadow_target,
+				body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				timeout = None,
+				body = body_result.expr,
+				next_temp = body_result.next_temp
+			}
+
+
+private pure func rewrite_mutable_concurrent_body(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	bindings_shadow_target: Bool,
+	body: CoreExpr,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	if bindings_shadow_target:
+		{
+			expr = body,
+			next_temp = temp_index
+		}
+	else:
+		rewrite_mutable_assignments(env, target, target_type, body, temp_index, skip_old_release)
+
+
+--- A select evaluates every arm's wait operand, then runs exactly one arm, so
+--- the wait operands are a sequence and the arm bodies are alternatives, like
+--- the branches of an `if`. A receive binder that shadows the target hides it
+--- from that arm's body.
+private pure func rewrite_mutable_select_arms(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	arms: List[CoreSelectArm],
+	typ: CoreType,
+	loc: CoreSourceLoc,
+	temp_index: Int,
+	skip_old_release: Bool,
+) -> MutableAssignmentRewrite:
+	var next_temp: Int = temp_index
+	var arms_skip_old_release: Bool = skip_old_release
+	var waited: List[CoreSelectArm] = []
+
+	for arm in arms:
+		wait: CoreExpr = match arm.kind:
+			SelectRecvArm(recv):
+				recv.channel
+			SelectSealedArm(channel):
+				channel
+			SelectAfterArm(timeout):
+				timeout
+		wait_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+			env,
+			target,
+			target_type,
+			wait,
+			next_temp,
+			arms_skip_old_release,
+		)
+		next_temp = wait_result.next_temp
+		arms_skip_old_release = skip_old_release_after_expr(env, target, arms_skip_old_release, wait)
+		kind: CoreSelectArmKind = match arm.kind:
+			SelectRecvArm(recv):
+				SelectRecvArm({ recv | channel = wait_result.expr })
+			SelectSealedArm(_):
+				SelectSealedArm(wait_result.expr)
+			SelectAfterArm(_):
+				SelectAfterArm(wait_result.expr)
+		waited = waited.append({ arm | kind = kind })
+
+	var rewritten: List[CoreSelectArm] = []
+
+	for arm in waited:
+		shadows_target: Bool = match arm.kind:
+			SelectRecvArm(recv):
+				recv.binder.name == target.name
+			_:
+				False
+
+		if shadows_target:
+			rewritten = rewritten.append(arm)
+		else:
+			body_result: MutableAssignmentRewrite = rewrite_mutable_assignments(
+				env,
+				target,
+				target_type,
+				arm.body,
+				next_temp,
+				arms_skip_old_release,
+			)
+			next_temp = body_result.next_temp
+			rewritten = rewritten.append({ arm | body = body_result.expr })
+
+	{
+		expr = SelectExpr(rewritten, typ, loc),
+		next_temp = next_temp
+	}
+
+
 private pure func rewrite_mutable_assignments(
 	env: PerceusEnv,
 	target: CoreVar,
@@ -4460,6 +4615,46 @@ private pure func rewrite_mutable_assignments(
 			{
 				expr = DropExpr(variable, value_type, release_policy, body_result.expr, typ, loc),
 				next_temp = body_result.next_temp
+			}
+		SelectExpr(arms, typ, loc):
+			rewrite_mutable_select_arms(env, target, target_type, arms, typ, loc, temp_index, skip_old_release)
+		PreClosureConcurrentExpr(block, typ, loc):
+			parts: MutableConcurrentBlockRewrite = rewrite_mutable_concurrent_block(
+				env,
+				target,
+				target_type,
+				block.bindings.any(func(binding): binding.variable.name == target.name),
+				block.timeout,
+				block.body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = PreClosureConcurrentExpr(
+					{ block | timeout = parts.timeout, body = parts.body },
+					typ,
+					loc,
+				),
+				next_temp = parts.next_temp
+			}
+		ConcurrentExpr(block, typ, loc):
+			parts: MutableConcurrentBlockRewrite = rewrite_mutable_concurrent_block(
+				env,
+				target,
+				target_type,
+				block.bindings.any(func(binding): binding.variable.name == target.name),
+				block.timeout,
+				block.body,
+				temp_index,
+				skip_old_release,
+			)
+			{
+				expr = ConcurrentExpr(
+					{ block | timeout = parts.timeout, body = parts.body },
+					typ,
+					loc,
+				),
+				next_temp = parts.next_temp
 			}
 		_:
 			{

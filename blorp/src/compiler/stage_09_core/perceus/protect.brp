@@ -119,6 +119,8 @@ import:
 		),
 		CoreMatchBinding,
 		CoreRecordFieldValue,
+		CoreSelectArm,
+		CoreSelectArmKind(SelectAfterArm, SelectRecvArm, SelectSealedArm),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType,
@@ -897,6 +899,109 @@ private pure func protect_repeated_spine_node(
 			source
 
 
+--- Returns `expr` itself when nothing changed.
+private pure func protect_repeated_optional(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	expr: Option[CoreExpr],
+	in_repeated_context: Bool,
+) -> Option[CoreExpr]:
+	match expr:
+		Some(value):
+			protected: CoreExpr = protect_repeated_consumes(
+				env,
+				target,
+				target_type,
+				value,
+				in_repeated_context,
+			)
+
+			if same_object(protected, value):
+				expr
+			else:
+				Some(protected)
+		None:
+			expr
+
+
+--- A select's wait operands and its one chosen arm both run in the select's
+--- own context: a select inside a loop runs an arm on every iteration. A
+--- receive binder that shadows `target` hides it from that arm's body.
+--- Returns `arms` itself when nothing changed.
+private pure func protect_repeated_select_arms(
+	env: PerceusEnv,
+	target: CoreVar,
+	target_type: CoreType,
+	arms: List[CoreSelectArm],
+	in_repeated_context: Bool,
+) -> List[CoreSelectArm]:
+	var protected: List[CoreSelectArm] = []
+	var changed: Bool = False
+
+	for arm in arms:
+		kind: CoreSelectArmKind = match arm.kind:
+			SelectRecvArm(recv):
+				channel: CoreExpr = protect_repeated_consumes(
+					env,
+					target,
+					target_type,
+					recv.channel,
+					in_repeated_context,
+				)
+
+				if same_object(channel, recv.channel):
+					arm.kind
+				else:
+					SelectRecvArm({ recv | channel = channel })
+			SelectSealedArm(channel):
+				protected_channel: CoreExpr = protect_repeated_consumes(
+					env,
+					target,
+					target_type,
+					channel,
+					in_repeated_context,
+				)
+
+				if same_object(protected_channel, channel):
+					arm.kind
+				else:
+					SelectSealedArm(protected_channel)
+			SelectAfterArm(timeout):
+				protected_timeout: CoreExpr = protect_repeated_consumes(
+					env,
+					target,
+					target_type,
+					timeout,
+					in_repeated_context,
+				)
+
+				if same_object(protected_timeout, timeout):
+					arm.kind
+				else:
+					SelectAfterArm(protected_timeout)
+		shadows_target: Bool = match arm.kind:
+			SelectRecvArm(recv):
+				recv.binder.name == target.name
+			_:
+				False
+		body: CoreExpr = if shadows_target:
+			arm.body
+		else:
+			protect_repeated_consumes(env, target, target_type, arm.body, in_repeated_context)
+
+		if same_object(kind, arm.kind) and same_object(body, arm.body):
+			protected = protected.append(arm)
+		else:
+			protected = protected.append({ arm | kind = kind, body = body })
+			changed = True
+
+	if changed:
+		protected
+	else:
+		arms
+
+
 --- Every form the spine descent in `protect_repeated_spine` does not
 --- consume.
 private pure func protect_repeated_node(
@@ -1553,5 +1658,62 @@ private pure func protect_repeated_node(
 				typ,
 				loc,
 			)
+		SelectExpr(arms, typ, loc):
+			protected_arms: List[CoreSelectArm] = protect_repeated_select_arms(
+				env,
+				target,
+				target_type,
+				arms,
+				in_repeated_context,
+			)
+
+			if same_object(protected_arms, arms):
+				expr
+			else:
+				SelectExpr(protected_arms, typ, loc)
+		PreClosureConcurrentExpr(block, typ, loc):
+			-- Lowering places the statements after a `concurrent:` block in its
+			-- body. Task bindings only borrow what they capture.
+			protected_timeout: Option[CoreExpr] = protect_repeated_optional(
+				env,
+				target,
+				target_type,
+				block.timeout,
+				in_repeated_context,
+			)
+			protected_body: CoreExpr = if block.bindings.any(func(binding): binding.variable.name == target.name):
+				block.body
+			else:
+				protect_repeated_consumes(env, target, target_type, block.body, in_repeated_context)
+
+			if same_object(protected_timeout, block.timeout) and same_object(protected_body, block.body):
+				expr
+			else:
+				PreClosureConcurrentExpr(
+					{ block | timeout = protected_timeout, body = protected_body },
+					typ,
+					loc,
+				)
+		ConcurrentExpr(block, typ, loc):
+			protected_timeout: Option[CoreExpr] = protect_repeated_optional(
+				env,
+				target,
+				target_type,
+				block.timeout,
+				in_repeated_context,
+			)
+			protected_body: CoreExpr = if block.bindings.any(func(binding): binding.variable.name == target.name):
+				block.body
+			else:
+				protect_repeated_consumes(env, target, target_type, block.body, in_repeated_context)
+
+			if same_object(protected_timeout, block.timeout) and same_object(protected_body, block.body):
+				expr
+			else:
+				ConcurrentExpr(
+					{ block | timeout = protected_timeout, body = protected_body },
+					typ,
+					loc,
+				)
 		_:
 			expr
