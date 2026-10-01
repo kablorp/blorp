@@ -19,7 +19,7 @@ import:
 	../tables/row_kinds:
 		ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest),
 		ModuleOriginKind(PackageModule, SourcePackageModule, StdlibModule, UserModule),
-	fs: DirectoryListing(DirectoryAbsent, DirectoryListed), list_directory
+	fs: DirectoryListing(DirectoryAbsent, DirectoryListed, DirectoryUnreadable), list_directory
 	path: dirname, join, normalize
 	system: file_exists, read_file
 
@@ -439,16 +439,40 @@ pure func import_candidates(
 
 
 ---
-The candidate for a root: the path as given, normalized, as a user module.
-A root's directory is as the user wrote it or the working directory supplied
-it, so only its file name is compared case-exactly.
+A root of a compilation: the source path as the caller gives it, and where the
+module there lives. Placement is the caller's to say because it depends on the
+file system the caller knows (a root under the standard-library directory or a
+package's source directory is a module of that library or package, and its own
+imports resolve as such); the stage records it and applies the lookup rules
+for it, as it does for every other module.
 ---
-pure func root_candidate(root_path: String) -> SourceCandidate:
-	normalized: String = normalize(root_path)
+record RootRequest {
+	path: String,
+	placement: ModulePlacement
+}
+
+
+---
+The root of a user module at `path`, the usual root.
+---
+pure func user_root(path: String) -> RootRequest:
+	{
+		path = path,
+		placement = InUserCode
+	}
+
+
+---
+The candidate for a root: the path as given, normalized, with the placement the
+caller gave it. A root's directory is as the user wrote it or the working
+directory supplied it, so only its file name is compared case-exactly.
+---
+pure func root_candidate(root: RootRequest) -> SourceCandidate:
+	normalized: String = normalize(root.path)
 	{
 		path = normalized,
 		trusted_directory = dirname(normalized),
-		placement = InUserCode
+		placement = root.placement
 	}
 
 
@@ -524,3 +548,73 @@ implements SourceProvider for InMemorySourceProvider:
 				SourceText(text)
 			None:
 				SourceUnreadable
+
+
+---
+Sources held in memory that take precedence over a provider: the text a
+caller already holds for a path (an edited buffer, a generated module, a file
+the command already read), over `inner` for everything else. `overlay` is keyed
+by normalized path, as a root candidate's path is.
+
+A directory lists what `inner` lists plus the overlay's files directly in it,
+so an overlay file that is not on disk still passes the exact-case spelling
+check beside its siblings. A directory `inner` cannot list stays unlistable.
+---
+record OverlaySourceProvider[Inner:SourceProvider] {
+	overlay: Dict[String, String],
+	inner: Inner
+}
+
+
+---
+The names of the overlay files whose parent directory is `directory`.
+---
+private pure func overlay_names_in(overlay: Dict[String, String], directory: String) -> List[String]:
+	wanted: String = normalize(directory)
+
+	overlay
+		.keys()
+		.filter(pure func(path): normalize(dirname(path)) == wanted)
+		.map(pure func(path): path.split("/").last().get_or(path))
+
+
+---
+`names` and `added`, sorted, each name once.
+---
+private pure func merged_sorted_names(names: List[String], added: List[String]) -> List[String]:
+	var merged: List[String] = []
+
+	for name in names.concat(added).sort():
+		if merged.last() != Some(name):
+			merged = merged.append(name)
+
+	merged
+
+
+implements SourceProvider for OverlaySourceProvider[Inner:SourceProvider]:
+	func source_exists(self: OverlaySourceProvider[Inner], path: String) -> Bool:
+		self.overlay.contains(path) or self.inner.source_exists(path)
+
+	func directory_listing(
+		self: OverlaySourceProvider[Inner],
+		directory: String,
+	) -> DirectoryListing:
+		added: List[String] = self.overlay.overlay_names_in(directory)
+
+		match self.inner.directory_listing(directory):
+			DirectoryListed(names):
+				DirectoryListed(merged_sorted_names(names, added))
+			DirectoryAbsent:
+				if added.is_empty():
+					DirectoryAbsent
+				else:
+					DirectoryListed(merged_sorted_names([], added))
+			DirectoryUnreadable:
+				DirectoryUnreadable
+
+	func read_source(self: OverlaySourceProvider[Inner], path: String) -> SourceRead:
+		match self.overlay.get(path):
+			Some(text):
+				SourceText(text)
+			None:
+				self.inner.read_source(path)

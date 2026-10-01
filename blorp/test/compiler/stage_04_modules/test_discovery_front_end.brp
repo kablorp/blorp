@@ -1,0 +1,138 @@
+-- The discovery stage as the CLI's front end: which diagnostics stop it, in
+-- what order they are reported, and how an internal error reads.
+import:
+	../../../src/compiler/discovery_front_end: discovery_diagnostic_texts, invariants_violated_message
+	../../../src/compiler_new/stage_01_discovery/pipeline: ImplicitModules, discover
+	../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		InMemorySourceProvider,
+		SourceLookupRoots,
+	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated)
+	../../../src/compiler_new/stage_01_discovery/tables/invariants:
+		DiscoveryTable(ModuleTable),
+		TableInvariantKind(DanglingReference),
+		TableInvariantViolation
+	test: TestSuite
+
+
+LOOKUP_ROOTS: SourceLookupRoots = {
+	standard_library_root = "std",
+	native_package_roots = [],
+	source_packages = []
+}
+
+NO_IMPLICIT_MODULES: ImplicitModules = {module_names = []}
+
+
+---
+What the CLI reports for `root` over `sources`, in order.
+---
+func reported(sources: Dict[String, String], root: String) -> List[String]:
+	provider: InMemorySourceProvider = {sources = sources}
+
+	match discover(provider, LOOKUP_ROOTS, [root], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			discovery_diagnostic_texts(tables)
+		TableInvariantsViolated(_):
+			["tables did not freeze"]
+
+
+func test_an_unresolved_import_does_not_stop_discovery() -> Bool:
+	reported({"app/main.brp" => "import:\n\tno_such_module\n"}, "app/main.brp").is_empty()
+
+
+func test_a_parse_error_stops_discovery_and_prints_before_an_import_problem() -> Bool:
+	texts: List[String] = reported(
+		{
+			"app/main.brp" => "import:\n\tno_such_module\n\t./Helper\n\nfunc f(:\n",
+			"app/helper.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	first: String = texts.get_or(0, "")
+	last: String = texts.get_or(texts.length() - 1, "")
+
+	(
+		texts.length() > 1
+		and first.starts_with("app/main.brp:5:")
+		and last.starts_with("app/main.brp:3:")
+		and last.contains("does not match the file's name `helper.brp`")
+		and not texts.any(func(text): text.contains("no_such_module"))
+	)
+
+
+func test_a_syntax_error_in_an_import_follows_the_roots_in_module_order() -> Bool:
+	texts: List[String] = reported(
+		{
+			"app/main.brp" => "import:\n\t./b\n\t./c\n\nfunc f(:\n",
+			"app/b.brp" => "func g(:\n",
+			"app/c.brp" => "func h(:\n",
+		},
+		"app/main.brp",
+	)
+
+	var files: List[String] = []
+
+	for text in texts:
+		file: String = text.split(":").get_or(0, "")
+
+		if files.last() != Some(file):
+			files = files.append(file)
+
+	files == ["app/main.brp", "app/b.brp", "app/c.brp"]
+
+
+func test_a_root_that_loaded_nothing_is_reported_first_without_a_position() -> Bool:
+	texts: List[String] = reported({}, "app/missing.brp")
+
+	match texts:
+		[only]:
+			only.starts_with("error: ")
+		_:
+			False
+
+
+func test_an_internal_error_names_the_table_row_and_kind() -> Bool:
+	violation: TableInvariantViolation = {
+		kind = DanglingReference,
+		table = ModuleTable,
+		row = 3,
+		related_table = ModuleTable,
+		value = 9
+	}
+	message: String = invariants_violated_message([violation])
+
+	(
+		message.starts_with("internal compiler error:")
+		and message.contains("1 invariants")
+		and message.contains("DanglingReference in ModuleTable row 3")
+		and message.contains("value 9")
+	)
+
+
+tests: TestSuite = {
+	description = "Discovery stage as the CLI front end",
+	tests = [
+		(
+			"an unresolved import does not stop discovery",
+			test_an_unresolved_import_does_not_stop_discovery,
+		),
+		(
+			"a parse error stops discovery and prints before an import problem",
+			test_a_parse_error_stops_discovery_and_prints_before_an_import_problem,
+		),
+		(
+			"a syntax error in an import follows the root's in module order",
+			test_a_syntax_error_in_an_import_follows_the_roots_in_module_order,
+		),
+		(
+			"a root that loaded nothing is reported first without a position",
+			test_a_root_that_loaded_nothing_is_reported_first_without_a_position,
+		),
+		(
+			"an internal error names the table, row and kind",
+			test_an_internal_error_names_the_table_row_and_kind,
+		),
+	]
+}

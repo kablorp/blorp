@@ -48,6 +48,10 @@ work and says what "accepted" means.
   nested three levels deep and braces in an interpolated pipe string. The stage
   reads them as `docs/GUIDE.md` and `docs/GRAMMAR.md` say; no corpus source but
   one fixture holds them.
+- **Connected behind a switch (item 7):** `BLORP_FRONT_END=stage` runs the
+  stage and the adapter for every command that builds the graph, through one
+  seam in `lib/source_graph.brp`; the default is still the existing discovery.
+  The self-compile with it on emits the same C as the default.
 - **Not verified:** that diagnostics after the first, and the constructs the
   corpus and the targeted programs do not use, agree (a probe found the old
   parser accepting `./a/../a/b` imports that the grammar forbids).
@@ -222,13 +226,23 @@ more. Each numbered item is one change.
    listed in the design document ("Diagnostic text"): 52 codes add a help
    line, 6 word a message differently on purpose, and two positions differ
    (see Decisions).
-7. **One switch point (M).** The CLI entry points that parse today reach the
-   old front end through `lib/source_graph.brp` (`main.brp`, `test/plan.brp`,
-   `purify/command.brp`, `package/check.brp`) or call `parse_compiler_source`
-   directly (`test/doctest.brp`, `test/discovery.brp`). Route them all
-   through one seam in `lib/source_graph.brp` and put the switch there, with
-   the existing discovery as default. The CLI parses the root file before
-   discovery today; the new stage replaces that too.
+7. **One switch point (M). Landed.** Every command that builds the graph
+   (`main.brp` for check, compile, run and lint, `test/plan.brp`,
+   `purify/command.brp`, `package/check.brp`) gets it from
+   `frontend_compilation_graph_for_root_paths` in `lib/source_graph.brp`, which
+   takes the sources the command read and parses them itself (except test roots
+   that test discovery already parsed), and switches on
+   `BLORP_FRONT_END` (`existing`, the default, or `stage`; read once per
+   setup; an unknown value is an error). The superseded entry points
+   (`frontend_compilation_graph_for_roots` and its `_with_setup` and
+   `_with_setup_and_test_runtime` forms) are deleted. `test/discovery.brp` and
+   `test/doctest.brp` stay on the existing parser as tools: they parse each
+   candidate to decide which files are test roots and to generate the doctest
+   roots, before any graph exists. With the stage on, `check`, `compile`, `test`,
+   `purify` and `package check` work, the `cli` and `package` gates pass apart
+   from the three parse-diagnostic fixtures that pin the absence of the help
+   line, and the self-compile emits byte-identical C. What a user can see
+   differently is in the design document ("Running the stage from the CLI").
 8. **Switch on, then flip the default (M).** With the switch on, every gate
    passes and the self-compile C matches (criterion 2), and the cost
    measurement holds (criterion 5). Then flip the default, keeping the old

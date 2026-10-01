@@ -1027,8 +1027,59 @@ The first version serves compilation (`check`, `compile`, `run`, `test`); the
 formatter, which needs comments the stage drops, and the LSP are decided
 after acceptance. The stage loads the implicit modules (section 6), so the
 adapter receives every module the existing graph has, in the same order;
-nothing in the adapter loads or orders modules. Nothing in a compile calls the
-adapter yet (roadmap item 7).
+nothing in the adapter loads or orders modules.
+
+### Running the stage from the CLI
+
+The CLI reaches the stage through one seam, `frontend_compilation_graph_for_root_paths`
+in `blorp/src/lib/source_graph.brp`: every command that builds the graph hands it
+the sources it already read (a path, the name the command chose, the text) and
+the seam owns parsing (the one exception: a test root that test discovery
+already parsed is reused by the existing path, and ignored by the stage). `BLORP_FRONT_END` (`existing`,
+the default, or `stage`; anything else is an error) is read once per setup
+(each command makes one) and the seam matches on it: `existing` parses the roots and runs the existing
+discovery; `stage` runs `compiler/discovery_front_end.brp`, which composes the stage's
+inputs from the same setup (the roots' own text as an overlay over the file
+system, the standard-library directory or the embedded texts, native package
+roots, source packages, the prelude set and for `blorp test` the test runtime),
+renders what the stage rejected, and gives the rest to `legacy_frontend_graph`.
+A root's placement (standard library, native package, source package, user code)
+is the caller's input (`RootRequest`), taken from the existing front end's
+origin rule, because it depends on the file system the caller knows.
+
+What a user can see with the stage, beyond the listed help lines above:
+
+- **Stops the stage adds or keeps.** A lexing or parsing error, an import that
+  differs from its file only in letter case, an unreadable or oversized source,
+  and a missing implicit module stop the front end with the stage's rendered
+  diagnostics (`error:`, `path:line:column`, message, `help:`), all of them in
+  one report: roots and implicit modules first, then each module's syntax
+  errors in module order, then the import problems. An import that resolves to no
+  module does not stop it: as today the graph keeps an unresolved edge and each
+  command reports it in its own words.
+- **Located case mismatch.** An import spelled in another case prints at the
+  import (`path:line:column: error: ...`) with the existing message and help; the
+  existing front end prints the message alone.
+- **Stricter implicit modules.** A standard-library directory without `prelude`,
+  `tuple` or (for `blorp test`) `test` is an error (`cannot find implicit
+  module`); the existing loader skips a missing one.
+- **Library roots.** The configured standard-library directory is made absolute
+  and normalized where the setup reads it, and a root inside it is spelled
+  absolutely too, so a relative `--std-dir` with a root inside it has one identity
+  in both front ends (it used to be a duplicate-identity error).
+- **Roots.** A root's path is printed as the caller gave it (`T//x.brp` stays
+  so); imported modules print normalized paths, as today. A root already loaded
+  as another module's import is one module (by canonical path), where the
+  existing front end could hold it twice.
+- **Internal errors.** A table invariant violation or an adapter error
+  (`LegacyAdapterError`) is reported as `internal compiler error: ...` with the
+  table, row and kind: it is a defect of the stage or the adapter, never the
+  program's.
+
+Superseded: `blorp test` discovery (`test/discovery.brp`) and doctest extraction
+(`test/doctest.brp`) still parse with the existing parser as tools, like the
+formatter: they need the parsed program of each candidate file to decide which
+files are test roots and to generate the doctest roots before any graph exists.
 
 ### Proving the adapter
 

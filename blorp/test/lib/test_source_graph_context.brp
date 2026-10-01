@@ -9,6 +9,7 @@ import:
 	../../src/compiler/stage_02_lex/name_table: NameTable, name_spelling, name_table_find_id
 	../../src/compiler/stage_03_parse/parsed_ast: ParsedDecl(FunctionParsedDecl)
 	../../src/compiler/stage_04_modules/frontend_graph:
+		frontend_graph_modules,
 		frontend_graph_name_table,
 		frontend_graph_root_modules,
 	../../src/compiler/stage_04_modules/frontend_graph_service:
@@ -19,11 +20,18 @@ import:
 		ModuleOrigin(UserModule),
 		resolved_module_canonical_path,
 		resolved_module_identity_from_resolver,
+	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/lib/cli_args: CliAction(CliCheck)
-	../../src/lib/cli_plan: CliParsedSourceFile
+	../../src/lib/cli_plan:
+		CliRootSource(CliUnparsedRoot),
+		CliSourceFile,
+		FrontEnd(DiscoveryStage, ExistingDiscovery),
+		FrontEndSelection(SelectedFrontEnd, UnknownFrontEnd),
+		FrontendRuntimeModules(CompilerOnly),
 	../../src/lib/source: source_file
 	../../src/lib/source_graph:
-		frontend_compilation_graph_for_roots_with_setup,
+		front_end_selection,
+		frontend_compilation_graph_for_root_paths,
 		source_graph_setup_for_paths,
 	fs: create_directories, message, remove_directory_tree, write_text_atomic
 	io: print_error
@@ -132,38 +140,93 @@ func test_finalized_root_retains_rewritten_import_path() -> Bool:
 					False
 
 
---- The finalized program is the sole source of a finalized candidate's
---- metadata. CLI fields are only retained for planning and may not reintroduce
---- a stale identity after a compiler-owned transformation.
-func test_finalized_root_identity_comes_from_program_source() -> Bool:
-	program_source = source_file("/workspace/program_root.brp", "program_root", "VALUE = 1\n")
-	(finalized, finalized_names) = finalized_typecheck_program_with_single_file_names(
-		parse_compiler_source(program_source),
-	)
-	stale_root: CliParsedSourceFile = {
-		path = "/workspace/stale_root.brp",
-		module_name = "stale_root",
-		source_text = "STALE = 0\n",
-		typecheck_program = finalized,
-		typecheck_names = finalized_names
-	}
-	setup = source_graph_setup_for_paths(check_action(stale_root.path), [stale_root.path])
-
-	match frontend_compilation_graph_for_roots_with_setup(setup, [stale_root]):
-		Err(_):
+--- The front end setting is read as a closed set of spellings: unset or blank is
+--- the default, and anything else that is not a front end is reported, not
+--- defaulted.
+func test_front_end_selection_accepts_only_its_spellings() -> Bool:
+	defaults: Bool = match (
+		front_end_selection(None),
+		front_end_selection(Some("")),
+		front_end_selection(Some("existing")),
+	):
+		(
+			SelectedFrontEnd(ExistingDiscovery),
+			SelectedFrontEnd(ExistingDiscovery),
+			SelectedFrontEnd(ExistingDiscovery),
+		):
+			True
+		_:
 			False
-		Ok(compilation):
-			match frontend_graph_root_modules(compilation.graph):
-				[root]:
-					program = finalized_typecheck_program_ast(root.program)
-					(
-						resolved_module_canonical_path(root.identity) == "program_root"
-						and program.source.path == program_source.path
-						and program.source.module_name == program_source.module_name
-						and program.source.text == program_source.text
-					)
-				_:
-					False
+
+	others: Bool = match (front_end_selection(Some(" stage\n")), front_end_selection(Some("Stage"))):
+		(SelectedFrontEnd(DiscoveryStage), UnknownFrontEnd("Stage")):
+			True
+		_:
+			False
+
+	defaults and others
+
+
+--- An unknown front end spelling stops the graph seam with an error that names
+--- the variable and what it accepts, before any source is read.
+func test_unknown_front_end_is_rejected_at_the_seam() -> Bool:
+	setup = source_graph_setup_for_paths(check_action("/workspace/root.brp"), ["/workspace/root.brp"])
+	rejecting = { setup | front_end = UnknownFrontEnd("bogus") }
+	root: CliSourceFile = {
+		path = "/workspace/root.brp",
+		module_name = "root",
+		source_text = "VALUE = 1\n"
+	}
+
+	match frontend_compilation_graph_for_root_paths(
+		rejecting,
+		[CliUnparsedRoot(root)],
+		CompilerOnly,
+	):
+		Err(message):
+			(
+				message.contains("BLORP_FRONT_END")
+				and message.contains("`bogus`")
+				and message.contains("help: use `existing` or `stage`")
+			)
+		Ok(_):
+			False
+
+
+--- Both front ends build the same graph for the same root: the module names,
+--- origins and paths, in the same order, and the same declarations.
+func test_both_front_ends_build_the_same_graph_for_a_root() -> Bool:
+	-- The doubled separator is how a temporary directory path often arrives; the
+	-- existing front end reports a root's path as given.
+	setup = source_graph_setup_for_paths(check_action("/workspace//root.brp"), ["/workspace//root.brp"])
+	root: CliSourceFile = {
+		path = "/workspace//root.brp",
+		module_name = "root",
+		source_text = "func answer() -> Int:\n\t42\n"
+	}
+	existing = frontend_compilation_graph_for_root_paths(
+		{ setup | front_end = SelectedFrontEnd(ExistingDiscovery) },
+		[CliUnparsedRoot(root)],
+		CompilerOnly,
+	)
+	staged = frontend_compilation_graph_for_root_paths(
+		{ setup | front_end = SelectedFrontEnd(DiscoveryStage) },
+		[CliUnparsedRoot(root)],
+		CompilerOnly,
+	)
+
+	match (existing, staged):
+		(Ok(old), Ok(new)):
+			module_lines(old) == module_lines(new)
+		_:
+			False
+
+
+private func module_lines(compilation: FrontendCompilationGraph) -> List[String]:
+	frontend_graph_modules(compilation.graph).map(func(module):
+		program = finalized_typecheck_program_ast(module.program)
+		"${resolved_module_canonical_path(module.identity)} ${program.source.path} ${program.decls.length()}"
+	)
 
 
 --- A finalized root arrives with the table it was finalized against, so
@@ -285,6 +348,18 @@ tests: TestSuite = {
 			test_source_graph_setup_rejects_conflicting_project_contexts,
 		),
 		(
+			"accepts only the front end spellings",
+			test_front_end_selection_accepts_only_its_spellings,
+		),
+		(
+			"rejects an unknown front end at the seam",
+			test_unknown_front_end_is_rejected_at_the_seam,
+		),
+		(
+			"builds the same graph with either front end",
+			test_both_front_ends_build_the_same_graph_for_a_root,
+		),
+		(
 			"retains finalized root import rewrites",
 			test_finalized_root_retains_rewritten_import_path,
 		),
@@ -303,10 +378,6 @@ tests: TestSuite = {
 		(
 			"indexes every finalized root's identifiers into the graph name table",
 			finalized_roots_identifiers_index_graph_table,
-		),
-		(
-			"derives finalized root identity from program source",
-			test_finalized_root_identity_comes_from_program_source,
 		),
 	]
 }

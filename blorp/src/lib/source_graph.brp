@@ -4,6 +4,7 @@ import:
 		FrontendCompilationGraph,
 		FrontendGraphContext,
 		FrontendSourcePackage,
+	../compiler/discovery_front_end: StageRoot, stage_frontend_graph
 	../compiler/pipeline: frontend_graph_discover
 	../compiler/stage_01_generated_inputs/embedded_std: embedded_std_source
 	../compiler/stage_02_lex/name_table: NameTable
@@ -85,8 +86,12 @@ import:
 		CliGeneratedModule,
 		CliGeneratedModuleImport,
 		CliParsedSourceFile,
+		CliRootSource(CliParsedRoot, CliUnparsedRoot),
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
+		FrontEnd(DiscoveryStage, ExistingDiscovery),
+		FrontEndSelection(SelectedFrontEnd, UnknownFrontEnd),
+		FrontendRuntimeModules(CompilerOnly, WithTestRuntime),
 	diagnostic: cli_error_message
 	frontend_graph_identity: FrontendGraphSourceKey
 	fs:
@@ -494,8 +499,56 @@ private pure func module_source_filename(module_path: String) -> String:
 		module_path + ".brp"
 
 
+---
+The environment variable that selects the front end, and the spellings it
+accepts. Unset or blank selects the default, `ExistingDiscovery`; any other
+value is rejected, never defaulted.
+---
+FRONT_END_ENVIRONMENT_VARIABLE: String = "BLORP_FRONT_END"
+
+EXISTING_DISCOVERY_SPELLING: String = "existing"
+
+DISCOVERY_STAGE_SPELLING: String = "stage"
+
+
+---
+The front end a setting of `FRONT_END_ENVIRONMENT_VARIABLE` selects.
+---
+pure func front_end_selection(setting: Option[String]) -> FrontEndSelection:
+	match setting:
+		None:
+			SelectedFrontEnd(ExistingDiscovery)
+		Some(spelling):
+			trimmed: String = spelling.trim()
+
+			if trimmed == "" or trimmed == EXISTING_DISCOVERY_SPELLING:
+				SelectedFrontEnd(ExistingDiscovery)
+			else if trimmed == DISCOVERY_STAGE_SPELLING:
+				SelectedFrontEnd(DiscoveryStage)
+			else:
+				UnknownFrontEnd(trimmed)
+
+
+---
+The front end the environment asks for. Each command reads it once, when it
+makes its setup.
+---
+func front_end_selection_from_environment() -> FrontEndSelection:
+	front_end_selection(getenv(FRONT_END_ENVIRONMENT_VARIABLE))
+
+
+---
+The error for a front end spelling that names none.
+---
+pure func unknown_front_end_message(spelling: String) -> String:
+	cli_error_message(
+		"${FRONT_END_ENVIRONMENT_VARIABLE} is `${spelling}`, which names no front end.\nhelp: use `${EXISTING_DISCOVERY_SPELLING}` or `${DISCOVERY_STAGE_SPELLING}`, or unset it for the default (`${EXISTING_DISCOVERY_SPELLING}`).",
+	)
+
+
 record CliSourceGraphSetup {
 	context: FrontendGraphContext,
+	front_end: FrontEndSelection,
 	diagnostics: List[String]
 }
 
@@ -556,8 +609,10 @@ func source_graph_setup_for_paths(
 	std_dir: Option[String] = match catalog.std_provider:
 		ProjectEmbeddedStd:
 			None
+		-- Absolute and normalized once, here, so a root given by a relative or an
+		-- absolute path inside the directory has one identity in every front end.
 		ProjectFilesystemStd(path):
-			Some(path)
+			Some(absolute_path(path))
 
 	{
 		context = {
@@ -565,18 +620,9 @@ func source_graph_setup_for_paths(
 			source_packages = catalog.source_packages.map(cli_source_package),
 			package_roots = catalog.native_package_roots
 		},
+		front_end = front_end_selection_from_environment(),
 		diagnostics = catalog.issues.map(project_source_catalog_issue_diagnostic)
 	}
-
-
-private func source_graph_setup_for_sources(
-	action: CliAction,
-	roots: List[CliParsedSourceFile],
-) -> CliSourceGraphSetup:
-	source_graph_setup_for_paths(
-		action,
-		roots.map(func(root): root.path),
-	)
 
 
 private pure func split_module_ref(module_path: String) -> Option[(String, String)]:
@@ -647,74 +693,76 @@ private func configured_std_module_name(
 			None
 
 
-private pure func parsed_source_with_module_name(
-	source: CliParsedSourceFile,
-	module_name: String,
-) -> CliParsedSourceFile:
-	(typecheck_program, typecheck_names) = finalized_program_for_source(
-		source.path,
-		module_name,
-		source.source_text,
-	)
-	{ source |
-		module_name = module_name,
-		typecheck_program = typecheck_program,
-		typecheck_names = typecheck_names
-	}
+---
+The text, path and name of a root, whichever form it arrived in.
+---
+private pure func root_source_file(root: CliRootSource) -> CliSourceFile:
+	match root:
+		CliUnparsedRoot(source):
+			source
+		CliParsedRoot(parsed):
+			{
+				path = parsed.path,
+				module_name = parsed.module_name,
+				source_text = parsed.source_text
+			}
 
 
-private func parse_cli_source_with_context(
+---
+`root` named as the existing front end names it: a root under the configured
+standard-library directory takes its standard-library module name, any other
+keeps the name its command gave it. A library root is also spelled with its
+absolute, normalized path, the spelling the directory's own modules have, so one
+file has one identity however the command wrote it. A parsed root is parsed
+again only when its name or path changes, because both are part of the parse.
+---
+private func root_with_configured_std_name(
+	context: FrontendGraphContext,
+	root: CliRootSource,
+) -> CliRootSource:
+	match root:
+		CliUnparsedRoot(source):
+			CliUnparsedRoot(source_with_configured_std_name(context, source))
+		CliParsedRoot(parsed):
+			match configured_std_module_name(context, parsed.path):
+				Some(module_name):
+					library_path: String = absolute_path(parsed.path)
+
+					if module_name == parsed.module_name and library_path == parsed.path:
+						root
+					else:
+						(typecheck_program, typecheck_names) = finalized_program_for_source(
+							library_path,
+							module_name,
+							parsed.source_text,
+						)
+						CliParsedRoot({ parsed |
+							path = library_path,
+							module_name = module_name,
+							typecheck_program = typecheck_program,
+							typecheck_names = typecheck_names
+						})
+				None:
+					root
+
+
+---
+`source` named as the existing front end names it: a root under the configured
+standard-library directory takes its standard-library module name, any other
+keeps the name its command gave it.
+---
+private func source_with_configured_std_name(
 	context: FrontendGraphContext,
 	source: CliSourceFile,
-) -> CliParsedSourceFile:
+) -> CliSourceFile:
 	match configured_std_module_name(context, source.path):
 		Some(module_name):
-			if module_name == source.module_name:
-				parse_cli_source(source)
-			else:
-				parse_cli_source({ source | module_name = module_name })
-		None:
-			parse_cli_source(source)
-
-
-func parse_cli_source_with_setup(
-	setup: CliSourceGraphSetup,
-	source: CliSourceFile,
-) -> CliParsedSourceFile:
-	parse_cli_source_with_context(setup.context, source)
-
-
-func parse_cli_sources_with_setup(
-	setup: CliSourceGraphSetup,
-	sources: List[CliSourceFile],
-) -> List[CliParsedSourceFile]:
-	var parsed_sources: List[CliParsedSourceFile] = []
-
-	for source in sources:
-		parsed_sources = parsed_sources.append(parse_cli_source_with_context(setup.context, source))
-
-	parsed_sources
-
-
-private func normalize_root_module_name(
-	context: FrontendGraphContext,
-	source: CliParsedSourceFile,
-) -> CliParsedSourceFile:
-	match configured_std_module_name(context, source.path):
-		Some(module_name):
-			if module_name == source.module_name:
-				source
-			else:
-				parsed_source_with_module_name(source, module_name)
+			{ source |
+				path = absolute_path(source.path),
+				module_name = module_name
+			}
 		None:
 			source
-
-
-private func normalize_root_module_names(
-	context: FrontendGraphContext,
-	roots: List[CliParsedSourceFile],
-) -> List[CliParsedSourceFile]:
-	roots.map(func(source): normalize_root_module_name(context, source))
 
 
 private func compiler_module_origin_for_path(
@@ -1265,51 +1313,81 @@ private func compiler_frontend_graph_for_roots(
 	).map_err(discovery_error_cli_message)
 
 
-func frontend_compilation_graph_for_roots(
-	action: CliAction,
-	roots: List[CliParsedSourceFile],
-) -> Result[FrontendCompilationGraph, String]:
-	setup: CliSourceGraphSetup = source_graph_setup_for_sources(action, roots)
+---
+`root` as a parsed source: parsed now, or as test discovery parsed it.
+---
+private pure func parsed_root(root: CliRootSource) -> CliParsedSourceFile:
+	match root:
+		CliUnparsedRoot(source):
+			parse_cli_source(source)
+		CliParsedRoot(parsed):
+			parsed
 
-	include_test_runtime: Bool = match action:
-		CliTest(_):
-			True
-		_:
+
+---
+The existing discovery's graph for `roots`, which it parses first.
+---
+private func existing_discovery_graph(
+	setup: CliSourceGraphSetup,
+	roots: List[CliRootSource],
+	runtime: FrontendRuntimeModules,
+) -> Result[FrontendCompilationGraph, String]:
+	include_test_runtime: Bool = match runtime:
+		CompilerOnly:
 			False
+		WithTestRuntime:
+			True
 
-	frontend_compilation_graph_for_roots_with_setup_and_test_runtime(
-		setup,
-		roots,
-		include_test_runtime,
-	)
-
-
-func frontend_compilation_graph_for_roots_with_setup(
-	setup: CliSourceGraphSetup,
-	roots: List[CliParsedSourceFile],
-) -> Result[FrontendCompilationGraph, String]:
-	frontend_compilation_graph_for_roots_with_setup_and_test_runtime(setup, roots, False)
-
-
-func frontend_compilation_graph_for_roots_with_setup_and_test_runtime(
-	setup: CliSourceGraphSetup,
-	roots: List[CliParsedSourceFile],
-	include_test_runtime: Bool,
-) -> Result[FrontendCompilationGraph, String]:
-	context: FrontendGraphContext = setup.context
-	normalized_roots: List[CliParsedSourceFile] = normalize_root_module_names(context, roots)
 	graph ?= compiler_frontend_graph_for_roots(
-		context,
-		normalized_roots,
+		setup.context,
+		roots.map(parsed_root),
 		True,
 		include_test_runtime,
 	)
 
 	Ok({
-		context = context,
+		context = setup.context,
 		graph = graph,
 		diagnostics = setup.diagnostics,
 	})
+
+
+---
+The compiler's front end for `roots`: every CLI command that compiles,
+checks, tests, purifies or package-checks sources gets its graph here, so the
+choice between the existing discovery and the discovery stage is made in one
+place. A root is a source the command has already read, with the name the
+command chose for it; the front end parses it, except a test root that test
+discovery already parsed (`CliParsedRoot`), which the existing path reuses.
+---
+func frontend_compilation_graph_for_root_paths(
+	setup: CliSourceGraphSetup,
+	roots: List[CliRootSource],
+	runtime: FrontendRuntimeModules,
+) -> Result[FrontendCompilationGraph, String]:
+	named_roots: List[CliRootSource] = roots.map(func(root):
+		root_with_configured_std_name(setup.context, root)
+	)
+
+	match setup.front_end:
+		UnknownFrontEnd(spelling):
+			Err(unknown_front_end_message(spelling))
+		SelectedFrontEnd(ExistingDiscovery):
+			existing_discovery_graph(setup, named_roots, runtime)
+		SelectedFrontEnd(DiscoveryStage):
+			stage_roots: List[StageRoot] = named_roots.map(func(root):
+				source: CliSourceFile = root_source_file(root)
+				{
+					source = source,
+					origin = compiler_module_origin_for_path(
+						setup.context,
+						source.path,
+						source.module_name,
+					)
+				}
+			)
+			graph ?= stage_frontend_graph(setup.context, stage_roots, runtime)
+			Ok({ graph | diagnostics = setup.diagnostics })
 
 
 private pure func frontend_graph_keys_contain(

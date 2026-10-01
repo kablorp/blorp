@@ -1,0 +1,157 @@
+-- The overlay provider: text the caller already holds wins over the wrapped
+-- provider, and an overlay file that is not on disk is listed beside its
+-- siblings so the exact-case spelling check accepts it.
+import:
+	../../../../src/compiler_new/stage_01_discovery/pipeline: ImplicitModules, discover
+	../../../../src/compiler_new/stage_01_discovery/diagnostics/render: diagnostic_display
+	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		InMemorySourceProvider,
+		OverlaySourceProvider,
+		SourceLookupRoots,
+		SourceRead(SourceText, SourceUnreadable),
+		directory_listing,
+		read_source,
+		source_exists,
+	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		diagnostic_count,
+		diagnostic_row_at,
+		module_count,
+		path_text,
+		resolution_diagnostic_count,
+		root_diagnostic_count,
+	fs: DirectoryListing(DirectoryAbsent, DirectoryListed, DirectoryUnreadable)
+	test: TestSuite
+
+
+ON_DISK: InMemorySourceProvider = {
+	sources = {"app/main.brp" => "-- on disk\n", "app/helper.brp" => "x: Int = 1\n"},
+}
+
+PROVIDER: OverlaySourceProvider[InMemorySourceProvider] = {
+	overlay = {"app/main.brp" => "-- edited\n", "app/generated.brp" => "y: Int = 2\n"},
+	inner = ON_DISK
+}
+
+NO_IMPLICIT_MODULES: ImplicitModules = {module_names = []}
+
+NO_LOOKUP_ROOTS: SourceLookupRoots = {
+	standard_library_root = "std",
+	native_package_roots = [],
+	source_packages = []
+}
+
+
+func test_the_overlay_text_wins_over_the_wrapped_provider() -> Bool:
+	match (
+		PROVIDER.read_source("app/main.brp"),
+		PROVIDER.read_source("app/helper.brp"),
+		PROVIDER.read_source("app/missing.brp"),
+	):
+		(SourceText(edited), SourceText(helper), SourceUnreadable):
+			edited == "-- edited\n" and helper == "x: Int = 1\n"
+		_:
+			False
+
+
+func test_an_overlay_file_exists_without_being_on_disk() -> Bool:
+	(
+		PROVIDER.source_exists("app/generated.brp")
+		and PROVIDER.source_exists("app/helper.brp")
+		and not PROVIDER.source_exists("app/missing.brp")
+	)
+
+
+func test_a_directory_lists_the_wrapped_names_and_the_overlay_files_once_each() -> Bool:
+	match PROVIDER.directory_listing("app"):
+		DirectoryListed(names):
+			names == ["generated.brp", "helper.brp", "main.brp"]
+		_:
+			False
+
+
+func test_a_directory_only_the_overlay_holds_is_listed() -> Bool:
+	provider: OverlaySourceProvider[InMemorySourceProvider] = {
+		overlay = {"fresh/only.brp" => ""},
+		inner = {sources = {}}
+	}
+
+	match (provider.directory_listing("fresh"), provider.directory_listing("elsewhere")):
+		(DirectoryListed(names), DirectoryAbsent):
+			names == ["only.brp"]
+		_:
+			False
+
+
+func test_discovery_reads_a_root_that_is_only_in_the_overlay() -> Bool:
+	match discover(PROVIDER, NO_LOOKUP_ROOTS, ["app/generated.brp"], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			(
+				module_count(tables) == 1
+				and tables.root_diagnostic_count() == 0
+				and tables.diagnostic_count() == 0
+			)
+		TableInvariantsViolated(_):
+			False
+
+
+func test_a_root_spelled_in_another_case_is_still_a_case_mismatch() -> Bool:
+	match discover(PROVIDER, NO_LOOKUP_ROOTS, ["app/Generated.brp"], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			module_count(tables) == 0 and tables.root_diagnostic_count() == 1
+		TableInvariantsViolated(_):
+			False
+
+
+func test_a_diagnostic_in_a_root_names_the_path_the_caller_gave() -> Bool:
+	provider: OverlaySourceProvider[InMemorySourceProvider] = {
+		overlay = {"app/broken.brp" => "func f(:\n"},
+		inner = {sources = {}}
+	}
+
+	match discover(provider, NO_LOOKUP_ROOTS, ["app//broken.brp"], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			match tables.diagnostic_row_at(0):
+				Some(row):
+					tables
+						.diagnostic_display(row)
+						.starts_with("app//broken.brp:1:")
+				None:
+					False
+		TableInvariantsViolated(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Overlay source provider",
+	tests = [
+		(
+			"the overlay text wins over the wrapped provider",
+			test_the_overlay_text_wins_over_the_wrapped_provider,
+		),
+		(
+			"an overlay file exists without being on disk",
+			test_an_overlay_file_exists_without_being_on_disk,
+		),
+		(
+			"a directory lists the wrapped names and the overlay files once each",
+			test_a_directory_lists_the_wrapped_names_and_the_overlay_files_once_each,
+		),
+		(
+			"a directory only the overlay holds is listed",
+			test_a_directory_only_the_overlay_holds_is_listed,
+		),
+		(
+			"discovery reads a root that is only in the overlay",
+			test_discovery_reads_a_root_that_is_only_in_the_overlay,
+		),
+		(
+			"a diagnostic in a root names the path the caller gave",
+			test_a_diagnostic_in_a_root_names_the_path_the_caller_gave,
+		),
+		(
+			"a root spelled in another case is still a case mismatch",
+			test_a_root_spelled_in_another_case_is_still_a_case_mismatch,
+		),
+	]
+}

@@ -563,6 +563,60 @@ func test_leak_baseline_materializes_direct_program_and_retains_repeat() -> Bool
 							False
 
 
+private func root_identity_case() -> Result[Bool, String]:
+	with directory ?= temporary_directory(
+		getcwd(),
+		"blorp_cli_root_identity_",
+	) on error => message(error):
+		root: String = resource_path(directory)
+		path: String = root.join("executable.brp")
+		_written ?= write_text_atomic(path, main_doctest_source()).map_err(message)
+
+		match plan_blorp_tests(test_plan(mixed_test_args(path))):
+			CliBlorpTestPlanningFailed(detail):
+				Err(detail)
+			CliBlorpTestReady(plan):
+				batch ?= build_blorp_test_batch(plan, plan.candidate_paths)
+
+				value ?= match batch:
+					Some(value):
+						Ok(value)
+					None:
+						Err("doctest fixture produced no runnable batch")
+
+				_removed: Bool = remove_file(path)
+
+				match plan.candidate_paths:
+					[candidate]:
+						roots = frontend_graph_root_modules(value.graph.graph).map(func(module):
+							finalized_typecheck_program_ast(module.program).source
+						)
+						-- The test source and its generated doctest module are the two roots.
+						Ok(
+							roots.length() == 2
+							and roots.any(func(source):
+								(
+									source.path == candidate.canonical_path
+									and source.module_name == candidate.module_name
+								)
+							),
+						)
+					_:
+						Err("expected one candidate path")
+
+
+--- The graph's root is the canonical path and module name test discovery chose,
+--- whichever front end builds the graph: the plan, not the seam, owns a test
+--- root's identity.
+func test_graph_root_has_the_canonical_path_and_name_discovery_chose() -> Bool:
+	match root_identity_case():
+		Ok(result):
+			result
+		Err(error):
+			print_error(error)
+			False
+
+
 tests: TestSuite = {
 	description = "Compiler CLI Test Plan Tests",
 	tests = [
@@ -575,6 +629,10 @@ tests: TestSuite = {
 			test_invocation_plan_retains_paths_until_batch_parsing,
 		),
 		("main module retains doctest plan", test_main_module_retains_doctest_plan),
+		(
+			"graph root has the canonical path and name discovery chose",
+			test_graph_root_has_the_canonical_path_and_name_discovery_chose,
+		),
 		(
 			"wrong-typed tests binding reaches typechecker",
 			test_wrong_typed_tests_binding_reaches_typechecker,

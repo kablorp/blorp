@@ -229,6 +229,27 @@ Use `bin/blorp <command> --help` for current flags and environment controls.
 portable substitute. `lint` typechecks the import graph but reports only for
 selected files and does not rewrite source. See [Lint](LINT.md) for rule IDs.
 
+### Running With The Discovery Stage
+
+Every command that builds the compiler's front-end graph (`check`, `compile`,
+`run`, `test`, `purify`, `lint`, `package check`) gets it from one function,
+`frontend_compilation_graph_for_root_paths` in `blorp/src/lib/source_graph.brp`.
+It runs the existing lexer, parser and module loader by default. Set
+`BLORP_FRONT_END=stage` to run the new discovery stage and its legacy adapter
+instead; `BLORP_FRONT_END=existing`, unset or blank is the default, and any other
+value is an error that names the accepted ones. The variable is read once per
+setup (each command makes one), so every gate takes it without editing a script:
+
+```bash
+BLORP_FRONT_END=stage bin/blorp check --no-format program.brp
+BLORP_FRONT_END=stage scripts/test --no-build cli
+BLORP_FRONT_END=stage bin/blorp compile --no-format -o /tmp/stage.c blorp/src/main.brp
+```
+
+The graph is the same, and so is the generated C. Differences a user can see
+are in `docs/DISCOVERY_TABLES_DESIGN.md` ("Running the stage from the CLI").
+The formatter, the linter's own parse and the LSP do not use the stage.
+
 ## Test Placement
 
 Put a test at the boundary whose behavior it proves:

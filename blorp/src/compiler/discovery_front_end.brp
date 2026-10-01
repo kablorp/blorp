@@ -1,0 +1,297 @@
+-- The CLI's front end when it runs the discovery stage instead of the existing
+-- lexer, parser and module loader (`FrontEnd.DiscoveryStage` in `source_graph`).
+--
+-- It composes what the stage asks of its caller from the same setup the
+-- existing discovery reads (the standard-library directory or the embedded
+-- texts, native package roots, source packages), runs the stage, prints what
+-- the stage rejected the way the CLI prints diagnostics, and hands everything
+-- else to the legacy adapter, which rebuilds the graph the existing typecheck
+-- reads. `source_graph` owns the choice between the two front ends; this module
+-- only runs the stage.
+--
+-- Layout: with `discovery_adapter` this is the only compiler module that imports
+-- `compiler_new`, which is why `blorp/source_ownership.json` lists it under
+-- `temporary_cross_owner_imports`. It sits here, not in `lib`, because `lib` may not
+-- import `compiler_new`, and it goes away with the adapter when typecheck reads
+-- the tables directly.
+import:
+	discovery_adapter:
+		COMPILER_EMBEDDED_TEXTS,
+		CompilerEmbeddedTexts,
+		LegacyModuleNaming,
+		legacy_adapter_error_message,
+		legacy_frontend_graph,
+	frontend_request:
+		FrontendCompilationGraph,
+		FrontendGraphContext,
+		FrontendSourcePackage,
+	../compiler_new/stage_01_discovery/diagnostics/render:
+		RenderedDiagnostic,
+		diagnostic_display,
+		render_implicit_diagnostic,
+		render_root_diagnostic,
+	stage_04_modules/loaded_module:
+		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
+	../compiler_new/stage_01_discovery/pipeline:
+		ImplicitModules,
+		compiler_implicit_modules,
+		discover_placed_roots,
+		test_implicit_modules,
+	../compiler_new/stage_01_discovery/sources/embedded_standard_library:
+		EmbeddedStandardLibraryProvider,
+		embedded_lookup_roots,
+	../compiler_new/stage_01_discovery/sources/source_provider:
+		FILE_SYSTEM_SOURCE_PROVIDER,
+		FileSystemSourceProvider,
+		ModulePlacement(InNativePackage, InSourcePackage, InStandardLibrary, InUserCode),
+		OverlaySourceProvider,
+		RootRequest,
+		SourceLookupRoots,
+		SourcePackageRoot,
+	../compiler_new/stage_01_discovery/tables/diagnostic_code:
+		DiscoveryDiagnosticCode(UnresolvedImportDiagnostic),
+	../compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
+		diagnostic_count,
+		diagnostic_row_at,
+		implicit_diagnostic_count,
+		implicit_diagnostic_row_at,
+		resolution_diagnostic_count,
+		resolution_diagnostic_row_at,
+		root_diagnostic_count,
+		root_diagnostic_row_at,
+	../compiler_new/stage_01_discovery/tables/invariants:
+		TableInvariantViolation,
+		discovery_table_name,
+		table_invariant_kind_name,
+	../lib/cli_plan: CliSourceFile, FrontendRuntimeModules(CompilerOnly, WithTestRuntime)
+	path: normalize, stem
+
+
+---
+The modules the stage loads after the roots: the prelude set, and for
+`blorp test` the test runtime.
+---
+private pure func stage_implicit_modules(runtime: FrontendRuntimeModules) -> ImplicitModules:
+	match runtime:
+		CompilerOnly:
+			compiler_implicit_modules()
+		WithTestRuntime:
+			test_implicit_modules()
+
+
+---
+A root the command read, and where its module lives.
+---
+record StageRoot {
+	source: CliSourceFile,
+	origin: ModuleOrigin
+}
+
+
+---
+The placement the stage resolves a root's imports under for a module of
+`origin`, as the existing front end's origin of a root says.
+---
+private pure func root_placement(origin: ModuleOrigin) -> ModulePlacement:
+	match origin:
+		StdlibModule:
+			InStandardLibrary
+		NativePackageModule(package_id):
+			InNativePackage(package_id)
+		SourcePackageModule(package_alias):
+			InSourcePackage(package_alias)
+		UserModule:
+			InUserCode
+
+
+private pure func source_package_root(package: FrontendSourcePackage) -> SourcePackageRoot:
+	{
+		package_alias = package.package_alias,
+		package_name = package.package_name,
+		source_dir = package.source_dir,
+		exports = package.exports
+	}
+
+
+---
+The text each root already holds, keyed by the normalized path the stage looks
+a root up under, so the stage reads exactly the text the command read (an
+edited payload, a generated module) and never the file again.
+---
+private pure func root_texts(roots: List[StageRoot]) -> Dict[String, String]:
+	var texts: Dict[String, String] = {}
+
+	for root in roots:
+		texts = texts.set(normalize(root.source.path), root.source.source_text)
+
+	texts
+
+
+---
+How the existing front end names each root: the name the command gave it.
+---
+private pure func root_naming(roots: List[StageRoot]) -> LegacyModuleNaming:
+	{
+		-- The stage only asks for a path it was given as a root, so the stem is
+		-- never read; it is the name `read_cli_source_file` gives a file.
+		root_module_name = pure func(request_path): roots
+			.find(pure func(root): root.source.path == request_path)
+			.map(pure func(root): root.source.module_name)
+			.get_or(stem(request_path))
+	}
+
+
+private pure func rendered_lines(rendered: RenderedDiagnostic) -> String:
+	match rendered.help:
+		Some(help):
+			"error: ${rendered.message}\nhelp: ${help}"
+		None:
+			"error: ${rendered.message}"
+
+
+---
+Whether the front end stops at a resolution diagnostic of `code`. An import that
+resolves to no module is not an error of discovery: the graph keeps it as an
+unresolved edge and each consumer reports it in its own words (typecheck's
+message, the package check's `must resolve under src/`, the cache hint
+`blorp package fetch` the catalog's diagnostics carry), as the existing front
+end does. Every other code stops the front end at once, so a code added later
+rejects until someone decides otherwise.
+---
+private pure func resolution_diagnostic_stops_discovery(code: DiscoveryDiagnosticCode) -> Bool:
+	match code:
+		UnresolvedImportDiagnostic:
+			False
+		_:
+			True
+
+
+---
+Every diagnostic the stage reported that stops the front end, as the CLI prints
+them, in a fixed order: roots and implicit modules that loaded nothing, then each
+module's lexing and parsing diagnostics in module order, then the imports whose
+source could not be used (see `resolution_diagnostic_stops_discovery`). A
+parse error therefore prints before the import problem beside it, as the
+existing front end reports a module's syntax before its imports. Located
+diagnostics use `diagnostic_display`; a root or implicit module has no span and
+prints without a position.
+---
+pure func discovery_diagnostic_texts(tables: FrontendTables) -> List[String]:
+	var texts: List[String] = []
+
+	for index in 0..tables.root_diagnostic_count():
+		match tables.root_diagnostic_row_at(index):
+			Some(row):
+				texts = texts.append(rendered_lines(tables.render_root_diagnostic(row)))
+			None:
+				void
+
+	for index in 0..tables.implicit_diagnostic_count():
+		match tables.implicit_diagnostic_row_at(index):
+			Some(row):
+				texts = texts.append(rendered_lines(tables.render_implicit_diagnostic(row)))
+			None:
+				void
+
+	for index in 0..tables.diagnostic_count():
+		match tables.diagnostic_row_at(index):
+			Some(row):
+				texts = texts.append(tables.diagnostic_display(row))
+			None:
+				void
+
+	for index in 0..tables.resolution_diagnostic_count():
+		match tables.resolution_diagnostic_row_at(index):
+			Some(row):
+				if resolution_diagnostic_stops_discovery(row.code):
+					texts = texts.append(tables.diagnostic_display(row))
+			None:
+				void
+
+	texts
+
+
+---
+A table invariant violation is a defect in the stage, not in the user's
+program: `freeze` refuses tables that break one, so reaching here means the
+stage built bad tables.
+---
+pure func invariants_violated_message(violations: List[TableInvariantViolation]) -> String:
+	first: String = match violations.get(0):
+		Some(violation):
+			"${table_invariant_kind_name(violation.kind)} in ${discovery_table_name(violation.table)} row ${violation.row} (related ${discovery_table_name(violation.related_table)}, value ${violation.value})"
+		None:
+			"no violation recorded"
+
+	"internal compiler error: the discovery stage's tables broke ${violations.length()} invariants; the first is ${first}"
+
+
+private pure func graph_from_outcome(
+	outcome: FreezeOutcome,
+	roots: List[StageRoot],
+	context: FrontendGraphContext,
+) -> Result[FrontendCompilationGraph, String]:
+	match outcome:
+		TableInvariantsViolated(violations):
+			Err(invariants_violated_message(violations))
+		FrozenTables(tables):
+			rejected: List[String] = discovery_diagnostic_texts(tables)
+
+			if not rejected.is_empty():
+				Err(rejected.join("\n"))
+			else:
+				match legacy_frontend_graph(tables, root_naming(roots), context):
+					Ok(graph):
+						Ok(graph)
+					Err(error):
+						Err(
+							"internal compiler error: the discovery stage's tables could not be rebuilt for typecheck: ${legacy_adapter_error_message(error)}",
+						)
+
+
+---
+The graph of `roots` found by the discovery stage: sources come from the roots'
+own text, the standard-library directory (or the compiler's embedded texts when
+`context` names none), native package roots and source packages, as the
+existing discovery reads them. Each root's `module_name` is the name the
+command chose for it, standard-library root naming included, and its origin the
+module's place in the standard library, a package or user code.
+---
+func stage_frontend_graph(
+	context: FrontendGraphContext,
+	roots: List[StageRoot],
+	runtime: FrontendRuntimeModules,
+) -> Result[FrontendCompilationGraph, String]:
+	overlay: OverlaySourceProvider[FileSystemSourceProvider] = {
+		overlay = root_texts(roots),
+		inner = FILE_SYSTEM_SOURCE_PROVIDER
+	}
+	root_requests: List[RootRequest] = roots.map(func(root): {
+		path = root.source.path,
+		placement = root_placement(root.origin)
+	})
+	source_packages: List[SourcePackageRoot] = context.source_packages.map(source_package_root)
+
+	outcome: FreezeOutcome = match context.std_dir:
+		Some(std_dir):
+			lookup: SourceLookupRoots = {
+				standard_library_root = std_dir,
+				native_package_roots = context.package_roots,
+				source_packages = source_packages
+			}
+			discover_placed_roots(overlay, lookup, root_requests, stage_implicit_modules(runtime))
+		None:
+			embedded: EmbeddedStandardLibraryProvider[CompilerEmbeddedTexts, OverlaySourceProvider[FileSystemSourceProvider]] = {
+				texts = COMPILER_EMBEDDED_TEXTS,
+				inner = overlay
+			}
+			discover_placed_roots(
+				embedded,
+				embedded_lookup_roots(context.package_roots, source_packages),
+				root_requests,
+				stage_implicit_modules(runtime),
+			)
+
+	graph_from_outcome(outcome, roots, context)

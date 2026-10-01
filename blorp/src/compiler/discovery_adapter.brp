@@ -292,6 +292,7 @@ import:
 	stage_04_modules/frontend_graph: FrontendImportEdge, FrontendImportResolution, FrontendModule
 	stage_04_modules/frontend_graph_service:
 		FrontendGraphServiceError,
+		frontend_graph_service_error_message,
 		validated_frontend_graph_for_modules,
 	stage_04_modules/loaded_module:
 		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
@@ -357,7 +358,7 @@ pure func legacy_adapter_error_message(error: LegacyAdapterError) -> String:
 		ModuleWithoutRequest(module):
 			"module ${module} was loaded by no root, implicit request or import"
 		GraphRejected(errors):
-			"the existing graph validation refused the rebuilt modules: ${errors.length()} errors"
+			"the existing graph validation refused the rebuilt modules: ${errors.map(frontend_graph_service_error_message).join("; ")}"
 
 
 ---
@@ -396,6 +397,7 @@ the tables do not hold.
 record DeclarationReader {
 	tables: Tables.FrontendTables,
 	module_names: List[String],
+	source_paths: List[String],
 	members: OwnerRows,
 	annotations: OwnerRows,
 	type_parameters: OwnerRows,
@@ -782,6 +784,39 @@ private pure func legacy_source_path(path: String) -> String:
 
 
 ---
+Each module's source path in the existing front end's spelling: the stage's
+canonical (normalized) path, or `<embedded:name>` for an embedded module, except
+for a module a root loaded, which the existing front end keeps as the caller
+wrote it (the request's text), so a path with a doubled separator or a leading
+`./` is reported as given.
+---
+private pure func legacy_source_paths(tables: Tables.FrontendTables) -> List[String]:
+	modules: Int = Tables.module_count(tables)
+	root_requests: List[Int] = first_requests(
+		modules,
+		range(
+			0,
+			Tables.root_count(tables),
+		).map(pure func(root): root_target_index(tables, root)),
+	)
+
+	range(0, modules).map(pure func(module):
+		row: ModuleRow = Tables.module_row(tables, module_id_at_row(module))
+
+		match (row.reach, root_requests.get(module)):
+			(Kinds.RootModule, Some(root)):
+				Tables.path_text(
+					tables,
+					Tables.root_row(tables, root_id_at_row(root)).request_path,
+				)
+			_:
+				legacy_source_path(
+					Tables.path_text(tables, Tables.source_row(tables, row.source).path),
+				)
+	)
+
+
+---
 The reader over `tables`: its indexes, built in one pass over each table.
 ---
 pure func legacy_declaration_reader(
@@ -793,10 +828,12 @@ pure func legacy_declaration_reader(
 	parameters: Int = Tables.parameter_count(tables)
 	foreign_blocks: Int = Tables.foreign_block_count(tables)
 	module_names ?= legacy_module_names(tables, naming)
+	source_paths: List[String] = legacy_source_paths(tables)
 
 	Ok({
 		tables = tables,
 		module_names = module_names,
+		source_paths = source_paths,
 		members = group_by_owner(
 			definitions,
 			keys_of(Tables.member_count(tables), pure func(row): member_owner(tables, row)),
@@ -3675,18 +3712,8 @@ pure func legacy_source_file(
 		ModuleTable,
 		index,
 	)
-	Ok(
-		source_file(
-			legacy_source_path(
-				Tables.path_text(
-					reader.tables,
-					Tables.source_row(reader.tables, row.source).path,
-				),
-			),
-			module_name,
-			Tables.source_text(reader.tables, row.source),
-		),
-	)
+	source_path ?= present(reader.source_paths.get(index), ModuleTable, index)
+	Ok(source_file(source_path, module_name, Tables.source_text(reader.tables, row.source)))
 
 
 private pure func legacy_module_doc(
@@ -3939,8 +3966,10 @@ discovery does, the roots, the import edges, and the name table, validated by
 the same service. `context` and `naming` are what the caller knew about the
 file system; the tables hold no policy of their own.
 
-Nothing in a compile calls this yet (roadmap item 7); the differential and the
-cost measurement do.
+A compile reaches it only through the CLI's graph seam
+(`frontend_compilation_graph_for_root_paths` in `lib/source_graph`, behind
+`BLORP_FRONT_END=stage`, which composes the inputs in `compiler/discovery_front_end`);
+the differential and the cost measurement call it directly.
 ---
 pure func legacy_frontend_graph(
 	tables: Tables.FrontendTables,

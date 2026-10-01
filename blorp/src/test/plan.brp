@@ -10,15 +10,17 @@ import:
 		CliTestMode(CliTestAll, CliTestDocOnly, CliTestSuiteOnly),
 	../lib/cli_plan:
 		CliParsedSourceFile,
+		CliRootSource(CliParsedRoot, CliUnparsedRoot),
 		CliRunSourcePlan,
+		CliSourceFile,
 		CliTestRunCommand(CliTestExecute),
 		CliTestRunPlan,
+		FrontendRuntimeModules(WithTestRuntime),
 	../lib/frontend_graph_identity: FrontendGraphSourceKey
 	../lib/source_graph:
 		frontend_compilation_graph_for_retained_roots,
-		frontend_compilation_graph_for_roots,
+		frontend_compilation_graph_for_root_paths,
 		frontend_compilation_graph_with_generated_root,
-		parse_cli_source,
 		parsed_cli_source_from_program,
 		source_graph_setup_for_paths,
 	discovery:
@@ -71,7 +73,7 @@ record CliBlorpTestSourcePlan {
 private record CliPreparedBlorpTestSource {
 	source: CliDiscoveredTestSource,
 	source_root: CliParsedSourceFile,
-	doctest_root: Option[CliParsedSourceFile],
+	doctest_root: Option[CliSourceFile],
 	doctest_diagnostic_context: List[String]
 }
 
@@ -195,7 +197,7 @@ private func prepare_blorp_doctest_root(
 	mode: CliTestMode,
 	source: CliDiscoveredTestSource,
 	emit_artifact_result: Bool,
-) -> Result[Option[CliParsedSourceFile], String]:
+) -> Result[Option[CliSourceFile], String]:
 	if mode != CliTestSuiteOnly and source.features.has_doctests:
 		canonical_program = { source.program |
 			source = { source.program.source | path = source.canonical_path }
@@ -208,8 +210,7 @@ private func prepare_blorp_doctest_root(
 		generated = { generated_source |
 			path = normalize(join(dirname(source.canonical_path), basename(generated_source.path)))
 		}
-		parsed = parse_cli_source(generated)
-		Ok(Some(parsed))
+		Ok(Some(generated))
 	else:
 		Ok(None)
 
@@ -263,23 +264,38 @@ private func prepare_blorp_test_sources(
 
 private pure func prepared_test_roots(
 	prepared: List[CliPreparedBlorpTestSource],
-) -> List[CliParsedSourceFile]:
-	var roots: List[CliParsedSourceFile] = []
+) -> List[CliRootSource]:
+	var roots: List[CliRootSource] = []
 
 	for source in prepared:
-		roots = roots.append(source.source_root)
+		roots = roots.append(CliParsedRoot(source.source_root))
 
 		match source.doctest_root:
 			Some(root):
-				roots = roots.append(root)
+				roots = roots.append(CliUnparsedRoot(root))
 			None:
 				void
 
 	roots
 
 
+private pure func prepared_root_paths(prepared: List[CliPreparedBlorpTestSource]) -> List[String]:
+	var paths: List[String] = []
+
+	for source in prepared:
+		paths = paths.append(source.source_root.path)
+
+		match source.doctest_root:
+			Some(root):
+				paths = paths.append(root.path)
+			None:
+				void
+
+	paths
+
+
 private pure func planned_doctest_target(
-	doctest_root: Option[CliParsedSourceFile],
+	doctest_root: Option[CliSourceFile],
 	graph: FrontendCompilationGraph,
 ) -> Result[Option[GeneratedTestSuiteTarget], String]:
 	match doctest_root:
@@ -382,10 +398,12 @@ func build_blorp_test_batch(
 				requested_sources,
 				plan.emit_artifact_result,
 			)
-			graph ?= frontend_compilation_graph_for_roots(
+			roots: List[CliRootSource] = prepared_test_roots(prepared)
+			setup = source_graph_setup_for_paths(
 				CliTest(plan.test_args),
-				prepared_test_roots(prepared),
+				prepared_root_paths(prepared),
 			)
+			graph ?= frontend_compilation_graph_for_root_paths(setup, roots, WithTestRuntime)
 			runnable_sources ?= planned_test_sources(prepared, graph)
 
 			if runnable_sources.length() == 0:

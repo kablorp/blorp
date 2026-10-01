@@ -4,9 +4,14 @@
 -- how a native package module resolves. The precedence rules are the existing
 -- front end's `frontend_import_lookup_plan`.
 import:
-	../../../../src/compiler_new/stage_01_discovery/pipeline: ImplicitModules, discover
+	../../../../src/compiler_new/stage_01_discovery/pipeline:
+		ImplicitModules,
+		discover,
+		discover_placed_roots,
 	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
 		InMemorySourceProvider,
+		ModulePlacement(InNativePackage, InSourcePackage, InStandardLibrary),
+		RootRequest,
 		SourceLookupRoots,
 		SourcePackageRoot,
 	../../../../src/compiler_new/stage_01_discovery/tables/builder: module_id_at_row
@@ -63,7 +68,23 @@ resolved nowhere adds no module.
 func modules_found(sources: Dict[String, String], root: String) -> List[String]:
 	provider: InMemorySourceProvider = {sources = sources}
 
-	match discover(provider, LOOKUP_ROOTS, [root], NO_IMPLICIT_MODULES):
+	modules_from(discover(provider, LOOKUP_ROOTS, [root], NO_IMPLICIT_MODULES))
+
+
+---
+`modules_found` for a root the caller places in a library or package.
+---
+func modules_found_from_placed_root(
+	sources: Dict[String, String],
+	root: RootRequest,
+) -> List[String]:
+	provider: InMemorySourceProvider = {sources = sources}
+
+	modules_from(discover_placed_roots(provider, LOOKUP_ROOTS, [root], NO_IMPLICIT_MODULES))
+
+
+private func modules_from(outcome: FreezeOutcome) -> List[String]:
+	match outcome:
 		FrozenTables(tables):
 			var lines: List[String] = []
 
@@ -324,9 +345,71 @@ func test_a_native_and_a_source_package_with_one_name_are_two_packages() -> Bool
 			False
 
 
+func test_a_root_placed_in_a_source_package_imports_like_a_package_module() -> Bool:
+	-- Placed as user code, `format` would not be found beside the package's
+	-- sources; placed in the package it is one of the package's own modules.
+	found: List[String] = modules_found_from_placed_root(
+		{
+			"vendor/toolkit/toolkit.brp" => "import:\n\ttoolkit/format\n\t./helper\n",
+			"vendor/toolkit/toolkit/format.brp" => "",
+			"vendor/toolkit/helper.brp" => "",
+		},
+		{
+			path = "vendor/toolkit/toolkit.brp",
+			placement = InSourcePackage("tools")
+		},
+	)
+
+	found == [
+		"source-package vendor/toolkit/toolkit.brp package=tools",
+		"source-package vendor/toolkit/toolkit/format.brp package=tools",
+		"source-package vendor/toolkit/helper.brp package=tools",
+	]
+
+
+func test_a_root_placed_in_the_standard_library_resolves_only_there() -> Bool:
+	found: List[String] = modules_found_from_placed_root(
+		{
+			"std/option.brp" => "import:\n\tresult\n\tpkg/net/dns\n",
+			"std/result.brp" => "",
+			"pkg/net/dns.brp" => "",
+		},
+		{
+			path = "std/option.brp",
+			placement = InStandardLibrary
+		},
+	)
+
+	found == ["stdlib std/option.brp", "stdlib std/result.brp"]
+
+
+func test_a_root_placed_in_a_native_package_is_that_package() -> Bool:
+	found: List[String] = modules_found_from_placed_root(
+		{"pkg/net/dns.brp" => ""},
+		{
+			path = "pkg/net/dns.brp",
+			placement = InNativePackage("net")
+		},
+	)
+
+	found == ["package pkg/net/dns.brp package=net"]
+
+
 tests: TestSuite = {
 	description = "Source package lookup",
 	tests = [
+		(
+			"a root placed in a source package imports like a package module",
+			test_a_root_placed_in_a_source_package_imports_like_a_package_module,
+		),
+		(
+			"a root placed in the standard library resolves only there",
+			test_a_root_placed_in_the_standard_library_resolves_only_there,
+		),
+		(
+			"a root placed in a native package is that package",
+			test_a_root_placed_in_a_native_package_is_that_package,
+		),
 		(
 			"an alias resolves to an exported package module",
 			test_an_alias_resolves_to_an_exported_package_module,

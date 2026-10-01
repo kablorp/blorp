@@ -49,17 +49,18 @@ import:
 			CliRunSource,
 			CliRunTest,
 		),
+		CliRootSource(CliUnparsedRoot),
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 		CliTestRunCommand(CliTestExecute, CliTestWarmup),
+		FrontendRuntimeModules(CompilerOnly),
 	../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileExact)
 	../../src/lib/source: source_file
 	../../src/lib/source_graph:
 		expand_check_targets,
-		frontend_compilation_graph_for_roots,
+		frontend_compilation_graph_for_root_paths,
 		frontend_compilation_graph_with_generated_root,
 		parse_cli_source,
-		parse_cli_source_with_setup,
 		source_graph_setup_for_paths,
 	../../src/main: run_cli
 	fs: message, resource_path, temporary_directory
@@ -342,29 +343,42 @@ func test_cli_source_models_represent_targets_and_files() -> Bool:
 	)
 
 
+---
+The graph the front end builds for `roots` under `action`'s setup, as a check
+command builds it.
+---
+private func graph_for_check_roots(
+	action: CliAction,
+	roots: List[CliSourceFile],
+) -> Result[FrontendCompilationGraph, String]:
+	setup = source_graph_setup_for_paths(action, roots.map(func(root): root.path))
+	frontend_compilation_graph_for_root_paths(
+		setup,
+		roots.map(func(root): CliUnparsedRoot(root)),
+		CompilerOnly,
+	)
+
+
 private func configured_std_origin_case(std_dir: String) -> Bool:
 	std_path: String = std_dir + "/bool.brp"
 	user_path: String = temp_dir() + "/blorp_cli_user/bool.brp"
-	std_source: CliParsedSourceFile = parse_cli_source({
+	std_source: CliSourceFile = {
 		path = std_path,
 		module_name = "bool",
 		source_text = ""
-	})
-	user_source: CliParsedSourceFile = parse_cli_source({
+	}
+	user_source: CliSourceFile = {
 		path = user_path,
 		module_name = "bool",
 		source_text = ""
-	})
+	}
 	std_action: CliAction = source_graph_test_check_action_with_std(std_path, std_dir)
 	user_action: CliAction = source_graph_test_check_action_with_std(user_path, std_dir)
 
 	if not write_text_ok(std_path, ""):
 		False
 	else:
-		configured_std_ok: Bool = match frontend_compilation_graph_for_roots(
-			std_action,
-			[std_source],
-		):
+		configured_std_ok: Bool = match graph_for_check_roots(std_action, [std_source]):
 			Ok(graph):
 				match graph_root_at(graph, 0):
 					Some(root):
@@ -374,10 +388,7 @@ private func configured_std_origin_case(std_dir: String) -> Bool:
 			Err(_):
 				False
 
-		reserved_user_path_rejected: Bool = match frontend_compilation_graph_for_roots(
-			user_action,
-			[user_source],
-		):
+		reserved_user_path_rejected: Bool = match graph_for_check_roots(user_action, [user_source]):
 			Ok(_):
 				False
 			Err(message):
@@ -400,53 +411,55 @@ func test_frontend_graph_uses_configured_std_origin() -> Bool:
 	configured_std_origin_resource_case().get_or(False)
 
 
-private func parse_cli_source_with_configured_std_case(std_dir: String) -> Bool:
+private func graph_names_configured_std_root_case(std_dir: String) -> Bool:
 	std_path: String = std_dir + "/constants.brp"
 	action: CliAction = source_graph_test_check_action_with_std(std_path, std_dir)
-	setup = source_graph_setup_for_paths(action, [std_path])
 
 	if not write_text_ok(std_path, "ANSWER: Int = 42"):
 		False
 	else:
-		source = parse_cli_source_with_setup(
-			setup,
-			{
-				path = std_path,
-				module_name = "constants",
-				source_text = "ANSWER: Int = 42"
-			},
-		)
+		match graph_for_check_roots(
+			action,
+			[
+				{
+					path = std_path,
+					module_name = "stale_name",
+					source_text = "ANSWER: Int = 42"
+				},
+			],
+		):
+			Ok(graph):
+				match graph_root_at(graph, 0):
+					Some(root):
+						graph_module_name(root) == "constants"
+					None:
+						False
+			Err(_):
+				False
 
-		(
-			source.module_name == "constants"
-			and finalized_typecheck_program_ast(
-				source.typecheck_program,
-			).source.module_name == "constants"
-		)
 
-
-private func parse_cli_source_with_configured_std_resource_case() -> Result[Bool, String]:
+private func graph_names_configured_std_root_resource_case() -> Result[Bool, String]:
 	with directory ?= temporary_directory(
 		temp_dir(),
 		"blorp_cli_parse_configured_library_",
 	) on error => message(error):
-		Ok(parse_cli_source_with_configured_std_case(resource_path(directory)))
+		Ok(graph_names_configured_std_root_case(resource_path(directory)))
 
 
-func test_parse_cli_source_with_setup_uses_configured_std_identity() -> Bool:
-	parse_cli_source_with_configured_std_resource_case().get_or(False)
+func test_graph_names_a_configured_std_root_by_its_std_path() -> Bool:
+	graph_names_configured_std_root_resource_case().get_or(False)
 
 
 func test_frontend_graph_uses_embedded_std_without_override() -> Bool:
 	root_path: String = temp_dir() + "/blorp_cli_embedded_std_main.brp"
 	previous_std: Option[String] = getenv("BLORP_STD")
-	root: CliParsedSourceFile = parse_cli_source({
+	root: CliSourceFile = {
 		path = root_path,
 		module_name = "blorp_cli_embedded_std_main",
 		source_text = ""
-	})
+	}
 	_ = setenv("BLORP_STD", "")
-	result: Result[FrontendCompilationGraph, String] = frontend_compilation_graph_for_roots(
+	result: Result[FrontendCompilationGraph, String] = graph_for_check_roots(
 		source_graph_test_check_action(root_path),
 		[root],
 	)
@@ -2501,7 +2514,7 @@ tests: TestSuite = {
 		),
 		(
 			"parse CLI source with setup uses configured std identity",
-			test_parse_cli_source_with_setup_uses_configured_std_identity,
+			test_graph_names_a_configured_std_root_by_its_std_path,
 		),
 		(
 			"frontend graph uses embedded std without override",

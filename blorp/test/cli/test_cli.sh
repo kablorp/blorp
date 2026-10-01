@@ -1531,6 +1531,149 @@ expect_output_contains "compiler runtime is not importable from std" 1 \
 	"module 'compiler_runtime' is not loaded for import registration" \
 	"$BLORP_BIN" check --no-format "$compiler_runtime_import"
 expect_exit "check missing file arg" 1 "$BLORP_BIN" check
+
+# The front end behind the graph seam is chosen by BLORP_FRONT_END: the existing
+# lexer, parser and module loader (the default), or the discovery stage with its
+# adapter. Each command gives the same result with either.
+expect_front_end_same() {
+    local name="$1"
+    shift
+    local default_output default_code
+
+    TOTAL=$((TOTAL + 1))
+    run_capture "" env -u BLORP_FRONT_END "$@"
+    default_output="$RUN_OUTPUT"
+    default_code="$RUN_CODE"
+    run_capture "" env BLORP_FRONT_END=stage "$@"
+
+    if [ "$default_code" -ne "$RUN_CODE" ]; then
+        record_fail "$name" "exit $default_code by default, $RUN_CODE with the stage
+default:
+$default_output
+stage:
+$RUN_OUTPUT"
+    elif [ "$default_output" = "$RUN_OUTPUT" ]; then
+        record_pass "$name"
+    else
+        record_fail "$name" "output differs
+default:
+$default_output
+stage:
+$RUN_OUTPUT"
+    fi
+}
+
+# The stage's teaching diagnostics add a `help:` line the existing parser does not
+# print (docs/DISCOVERY_TABLES_DESIGN.md, "Diagnostic text"); everything else,
+# the position and the message, is the same.
+expect_front_end_same_but_help() {
+    local name="$1"
+    shift
+    local default_output default_code stage_output
+
+    TOTAL=$((TOTAL + 1))
+    run_capture "" env -u BLORP_FRONT_END "$@"
+    default_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" | grep -v '^$')
+    default_code="$RUN_CODE"
+    run_capture "" env BLORP_FRONT_END=stage "$@"
+    stage_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" | grep -v '^$')
+
+    if [ "$default_code" -ne "$RUN_CODE" ]; then
+        record_fail "$name" "exit $default_code by default, $RUN_CODE with the stage
+$RUN_OUTPUT"
+    elif [ "$default_output" = "$stage_output" ]; then
+        record_pass "$name"
+    else
+        record_fail "$name" "output differs apart from help lines
+default:
+$default_output
+stage:
+$stage_output"
+    fi
+}
+
+front_end_dir="$TMPDIR_CLI/front_end"
+mkdir -p "$front_end_dir"
+printf 'func double(x: Int) -> Int:\n\tx * 2\n\nfunc main(args: List[String]) -> Int:\n\tprint("value ${double(21)}")\n\t0\n' \
+    > "$front_end_dir/ok.brp"
+printf 'import:\n\tno_such_module\n\nfunc main(args: List[String]) -> Int:\n\t0\n' \
+    > "$front_end_dir/unresolved_import.brp"
+printf 'import:\n\t./Helper\n\nfunc main(args: List[String]) -> Int:\n\t0\n' \
+    > "$front_end_dir/case_import.brp"
+printf 'VALUE: Int = 1\n' > "$front_end_dir/helper.brp"
+
+expect_front_end_same "front end stage: check success" \
+    "$BLORP_BIN" check --no-format "$front_end_dir/ok.brp"
+expect_front_end_same "front end stage: check type failure" \
+    "$BLORP_BIN" check --no-format "$invalid_prog"
+expect_front_end_same_but_help "front end stage: check parse failure" \
+    "$BLORP_BIN" check --no-format "$parse_missing_colon_prog"
+expect_front_end_same_but_help "front end stage: check parse failures in a root and an import" \
+    "$BLORP_BIN" check --no-format "$parse_two_modules_dir/main.brp"
+expect_front_end_same "front end stage: check unresolved import" \
+    "$BLORP_BIN" check --no-format "$front_end_dir/unresolved_import.brp"
+# The stage points at the import; the existing front end prints the message alone.
+expect_output_contains "front end stage: check case-mismatched import" 1 \
+    "$front_end_dir/case_import.brp:2:5: error: import \`./Helper\` does not match the file's name \`helper.brp\`" \
+    env BLORP_FRONT_END=stage "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
+expect_output_contains "front end existing: check case-mismatched import" 1 \
+    "error: import \`./Helper\` does not match the file's name \`helper.brp\`" \
+    env -u BLORP_FRONT_END "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
+# The existing loader skips an implicit module its standard-library directory
+# lacks; the stage reports it.
+mkdir -p "$front_end_dir/empty_std"
+expect_output_contains "front end stage: a missing implicit module is reported" 1 \
+    "error: cannot find implicit module \`prelude\`" \
+    env BLORP_FRONT_END=stage "$BLORP_BIN" check --no-format \
+    --std-dir "$front_end_dir/empty_std" "$front_end_dir/ok.brp"
+expect_output_contains "front end stage: unknown value is rejected" 1 \
+    "BLORP_FRONT_END is \`bogus\`, which names no front end." \
+    env BLORP_FRONT_END=bogus "$BLORP_BIN" check --no-format "$front_end_dir/ok.brp"
+expect_output_contains "front end stage: unknown value names the accepted values" 1 \
+    "help: use \`existing\` or \`stage\`" \
+    env BLORP_FRONT_END=bogus "$BLORP_BIN" compile --no-format -o "$front_end_dir/never.c" "$front_end_dir/ok.brp"
+expect_output_contains "front end stage: a blank value is the default" 0 \
+    "Type checking succeeded." \
+    env BLORP_FRONT_END= "$BLORP_BIN" check --no-format "$front_end_dir/ok.brp"
+mkdir -p "$front_end_dir/chain"
+printf 'import:\n\t./middle\n\nfunc main(args: List[String]) -> Int:\n\tmiddle_value()\n' \
+    > "$front_end_dir/chain/top.brp"
+printf 'import:\n\t./leaf\n\nfunc middle_value() -> Int:\n\tleaf_value() + 1\n' \
+    > "$front_end_dir/chain/middle.brp"
+printf 'func leaf_value() -> Int:\n\t41\n' > "$front_end_dir/chain/leaf.brp"
+printf 'import:\n\t./middle\n\nfunc main(args: List[String]) -> Int:\n\tmiddle_value() + "x"\n' \
+    > "$front_end_dir/chain/top_type_error.brp"
+expect_front_end_same "front end stage: check a module chain" \
+    "$BLORP_BIN" check --no-format "$front_end_dir/chain/top.brp"
+expect_front_end_same "front end stage: check a type error across a module chain" \
+    "$BLORP_BIN" check --no-format "$front_end_dir/chain/top_type_error.brp"
+expect_front_end_same "front end stage: check a root in a configured standard-library directory" \
+    "$BLORP_BIN" check --no-format --std-dir "$PWD/standard_library/src" \
+    "$PWD/standard_library/src/bool.brp"
+expect_front_end_same "front end stage: check a root inside a relative standard-library directory" \
+    "$BLORP_BIN" check --no-format --std-dir standard_library/src standard_library/src/bool.brp
+expect_front_end_same "front end stage: check a root inside a relative standard-library directory, spelled absolutely" \
+    "$BLORP_BIN" check --no-format --std-dir standard_library/src "$PWD/standard_library/src/bool.brp"
+expect_front_end_same "front end stage: check a user root with a relative standard-library directory" \
+    "$BLORP_BIN" check --no-format --std-dir standard_library/src "$front_end_dir/ok.brp"
+expect_front_end_same "front end stage: test a source with doctests" \
+    "$BLORP_BIN" test --doc --timeout 60 standard_library/src/option.brp
+expect_front_end_same "front end stage: purify dry run" \
+    "$BLORP_BIN" purify --dry-run "$front_end_dir/ok.brp"
+expect_front_end_same "front end stage: test" \
+    "$BLORP_BIN" test --suite --timeout 20 blorp/test/runtime/types/test_bool.brp
+
+TOTAL=$((TOTAL + 1))
+run_capture "" env -u BLORP_FRONT_END "$BLORP_BIN" compile --no-format -o "$front_end_dir/default.c" "$front_end_dir/ok.brp"
+default_compile_code="$RUN_CODE"
+run_capture "" env BLORP_FRONT_END=stage "$BLORP_BIN" compile --no-format -o "$front_end_dir/stage.c" "$front_end_dir/ok.brp"
+if [ "$default_compile_code" -eq 0 ] && [ "$RUN_CODE" -eq 0 ] \
+    && cmp -s "$front_end_dir/default.c" "$front_end_dir/stage.c"; then
+    record_pass "front end stage: compile emits the same C"
+else
+    record_fail "front end stage: compile emits the same C" "exit $default_compile_code by default, $RUN_CODE with the stage
+$RUN_OUTPUT"
+fi
 if $run_deep_checks; then
 	expect_output_contains "check multi-file success" 0 "Checking " \
 		"$BLORP_BIN" check --no-format "$check_dir_ok/root.brp" "$check_dir_ok/nested/child.brp"
