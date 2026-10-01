@@ -11,13 +11,14 @@ change.
 
 The plan it serves:
 
-1. Rewrite discovery. An adapter at its end rebuilds today's `FrontendGraph`,
-   so typecheck, the formatter, LSP and lint are unchanged.
-2. Pass the new tables on beside that legacy output. Later stages adopt the
-   tables one reader at a time; every remaining use of the old output goes
-   through a single field named `legacy`.
-3. Shrink the legacy footprint until nothing reads it, then delete the adapter.
-4. Rewrite typecheck the same way, with its own output specified as tables.
+1. Rewrite discovery. An adapter between it and typecheck, in the
+   compiler's pipeline, rebuilds today's `FrontendCompilationGraph` from the tables, so
+   typecheck is unchanged.
+2. Connect it: compilation runs the new stage and the adapter by default
+   (`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md` says when).
+3. Rewrite typecheck to read the tables piece by piece, deleting the matching
+   part of the adapter each time, until the adapter is gone.
+4. Specify typecheck's own output as tables, and repeat for the next stage.
 
 Three decisions were made up front: function bodies live in a flat node
 table; `DefinitionId` is minted here, in discovery; spans are packed
@@ -45,9 +46,8 @@ compiler CI):
   outside `compiler_new` reads the tables yet.
 - **The prelude.** The existing compiler loads 16 prelude modules into every
   compilation; the walker loads only what the roots import. Owner: the
-  adapter task, which must load them as implicit roots (or through an
-  embedded-standard-library provider) before its differential check can
-  pass.
+  stage (roadmap C1 and C2); needed before the adapter's differential check
+  can pass.
 - **The embedded standard-library provider and the package catalog.** Both
   plug into the provider seam (section 5) without walker changes.
 
@@ -73,7 +73,8 @@ shaped like a tree refers to rows by id.
 
 **Deterministic order.** Ids follow discovery order: roots first, then
 imports breadth first in source order. Stable ids are what make the output
-reproducible and the legacy output byte-identical.
+reproducible, which is what lets the adapter's output match the existing
+discovery's.
 
 ## 2. Identities
 
@@ -684,29 +685,31 @@ payload class.
 
 ## 10. The legacy adapter
 
-Not implemented yet. The adapter renders `FrontendTables` into today's
-`FrontendGraph`, so every consumer keeps working while it moves over. It
-lives in its own module and is deleted when nothing reads its output.
+Not implemented yet; `docs/DISCOVERY_ACCEPTANCE_ROADMAP.md` orders the work.
+The adapter is a plain transformation from `FrontendTables` to the
+`FrontendCompilationGraph` the existing typecheck reads. It belongs to
+neither side: the new stage never imports the old compiler, and typecheck
+keeps its current input. It sits in the compiler's top-level pipeline
+(`blorp/src/compiler/pipeline.brp` or a module beside it), the one module the
+layout check will allow to import both (roadmap F1).
 
 ```blorp
-record FrontendResult {
-	tables: FrontendTables,
-	---
-	The old contract, rebuilt from the tables. Every remaining read of this
-	field is migration work; hygiene counts the reads and the count may only
-	go down.
-	---
-	legacy: LegacyFrontendGraph
-}
+---
+Rebuilds the existing typecheck's input from the tables. It shrinks as
+typecheck is rewritten to read the tables and is deleted when typecheck
+takes `FrontendTables` directly.
+---
+pure func legacy_frontend_graph(tables: FrontendTables) -> FrontendCompilationGraph
 ```
 
 It rebuilds each module's parsed program from its definitions and nodes,
 spells identifiers from the name table (minting `#N` for dimension names),
-renders locations from packed spans and line starts, renders diagnostics
-from their codes, and derives module surfaces and import references. It
-serves typecheck, the formatter, LSP and lint, so the old parser and module
-loader are deleted in the same step that introduces it. It also owns
-loading the prelude (see Status).
+renders locations from packed spans and line starts, and derives module
+surfaces and import references. It does no parsing, resolution or checking
+of its own; anything missing is a gap in the tables. The first version
+serves compilation (`check`, `compile`, `run`, `test`); the formatter, which
+needs comments the stage drops, and the LSP are decided after acceptance.
+Loading the prelude belongs to the stage (see Status), not the adapter.
 
 ### Proving the adapter
 
@@ -714,7 +717,8 @@ A differential check runs the old discovery and the new discovery plus the
 adapter over every source we have (the compiler, the standard library, and
 every test and fixture program) and compares the legacy structures field by
 field. A mismatch names the module, the declaration and the field. Once it
-is clean on the whole corpus, the old discovery is deleted, and
+is clean on the whole corpus, the new stage becomes the default (roadmap F5)
+and the old discovery leaves the compile path later (roadmap G);
 byte-identical generated C for the self-compile and the test corpus
 confirms the rest. The known intended difference is `# N`, rejected by the
 new lexer.
@@ -729,8 +733,9 @@ Later stages key everything they learn by these ids, in their own tables:
 - lowering: Core built from nodes, with `DefinitionId` and `NodeId` as the
   identities Core already wants.
 
-Moving a reader from `legacy` to the tables is the unit of migration. When
-the count of legacy reads reaches zero, the adapter goes, and typecheck's own
+Rewriting a part of typecheck to read the tables, and deleting the part of
+the adapter that fed it, is the unit of migration. When typecheck reads
+nothing the adapter builds, the adapter is deleted, and typecheck's own
 output is specified the same way.
 
 ## 12. Cost
@@ -747,8 +752,10 @@ on 2026-09-30 (median of 3; load average 5 to 7):
 
 The invariant check in `freeze` costs about 8% of the new side's
 instructions. While the adapter exists, discovery does more work than
-today: it builds the tables and then the legacy output. Its end-to-end
-numbers are measured when the adapter is deleted.
+today: it builds the tables and then the legacy output. Acceptance
+still requires the stage plus the adapter to cost fewer instructions than the
+existing discovery (roadmap criterion 5); the stage's own end-to-end numbers
+are measured again when the adapter is deleted.
 
 ## 13. Deliberately out of scope
 
