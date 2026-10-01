@@ -163,7 +163,9 @@ type_param = IDENT                              (* T *)
            | "#" "_"                            (* #_ — wildcard dim *)
            | IDENT ":" bounds ;                 (* T: Equatable + Orderable *)
 
-bounds = IDENT { "+" IDENT } ;
+bounds = trait_ref { "+" trait_ref } ;
+
+trait_ref = IDENT [ "." IDENT ] ;               (* Trait, or alias.Trait through an import alias *)
 ```
 
 Type parameter names must start with a capital ASCII letter and contain only
@@ -322,7 +324,7 @@ trait_decl = "trait" IDENT [ type_params ] ":" NEWLINE INDENT trait_methods DEDE
            | "trait" IDENT ":" supertrait_list NEWLINE
            | "trait" IDENT [ type_params ] ":" supertrait_list ":" NEWLINE INDENT trait_methods DEDENT ;
 
-supertrait_list = IDENT { "+" IDENT } ;
+supertrait_list = trait_ref { "+" trait_ref } ;   (* trait_ref as in bounds *)
 
 trait_methods = trait_method { NEWLINE trait_method } ;
 

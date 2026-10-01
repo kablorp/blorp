@@ -310,14 +310,27 @@ struct TypeParameterRow {owner: DefinitionId, ordinal: Int, name: NameId, kind: 
 
 struct BoundRow {owner: DefinitionId, parameter_ordinal: Int, trait_name: NameId, span: Span}
 struct SupertraitRow {trait_definition: DefinitionId, ordinal: Int, name: NameId, span: Span}
+-- Optional relationships (one row per bound or supertrait id, at most): the
+-- `alias` of `alias.Trait`. The bound's or supertrait's own span covers the
+-- whole reference; the qualifier row's span covers the alias.
+struct BoundQualifierRow {bound: BoundId, qualifier: NameId, span: Span}
+struct SupertraitQualifierRow {supertrait: SupertraitId, qualifier: NameId, span: Span}
 struct DimensionConstraintRow {owner: DefinitionId, left: NodeId, right: NodeId, span: Span}
 ```
 
 A `DefinitionTypeRow`'s role is fixed by the definition's kind: a
 function's return type, a global's declared type, an alias's or opaque
-type's target, an impl's receiver, a field's type. A bound is a single
-trait name (`BoundRow.trait_name`); the sketch's dotted bound paths do not
-exist in the language. Typecheck resolves bound and supertrait names.
+type's target, an impl's receiver, a field's type. A bound is one trait
+name (`BoundRow.trait_name`) with an optional module alias: `T: alias.Trait` is
+legal, and the alias is the bound's `BoundQualifierRow`, the way an optional
+relation is a side table, rather than a sentinel `NameId` in the bound row. The
+same holds for supertraits. A bound inside a written type (`Box[T: alias.Trait]`)
+is a node: `TypeBoundNode`, or `QualifiedTypeBoundNode` over a
+`TypeQualifierNode`, as a qualified type has. The two differ because rows use
+side tables for optional relations, while a written type is a node tree whose
+qualified forms are sibling node kinds with a qualifier child. Typecheck resolves the alias as a
+qualified type's qualifier and then finds the trait among that module's
+declarations.
 
 ### Documentation, annotations and foreign declarations
 
@@ -828,7 +841,8 @@ The invariants, by violation kind:
   function definition.
 - `BodyRootOutsideModule`: a body's root lies in its module's node block.
 - `DuplicateSideRow`: at most one import target, import alias, root target,
-  module package, definition type or body per owner.
+  module package, definition type, body, bound qualifier or supertrait
+  qualifier per owner.
 - `RootOutcomeMismatch`: each root has exactly one of a target and a root
   diagnostic.
 - `SignatureCountMismatch`: exactly one signature per function-like

@@ -18,6 +18,7 @@ import:
 		ParsedIdentifier,
 		ParsedParam,
 		ParsedTypeExpr,
+		ParsedTraitReference,
 		ParsedTypeParamDecl,
 		ParsedTypeParamKind(ParsedDimensionParameter),
 		ParsedVarDecl,
@@ -54,7 +55,11 @@ import:
 		trait_ids_equal,
 	dict as D
 	trait_headers: TraitTopologyGraph, trait_topology_graph_type_headers
-	trait_reference_resolution: resolve_visible_trait_id
+	trait_reference_resolution:
+		TraitReferenceRole(BoundRole),
+		TraitReferenceFailure,
+		resolve_trait_reference,
+		trait_reference_failure_text,
 	type_header_graph:
 		CallableTypeParameterId,
 		CallableTypeResolutionContext,
@@ -163,7 +168,7 @@ union CallableHeaderGraphError:
 	CallableOwnerModuleMissing(String, String, SourceLocation)
 	GlobalOwnerModuleMissing(String, String, SourceLocation)
 	CallableDuplicateTypeParameter(String, ParsedIdentifier)
-	CallableTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
+	CallableTypeParameterUnknownBound(String, ParsedIdentifier, ParsedTraitReference, TraitReferenceFailure)
 	CallableMissingParameterType(String, Int, SourceLocation)
 	CallableTypeResolutionError(TypeShapeResolutionError)
 	GlobalTypeResolutionError(TypeShapeResolutionError)
@@ -491,16 +496,17 @@ private pure func resolve_callable_type_parameters(
 			names = names.append(parsed.name.text)
 
 		for bound in parsed.bounds:
-			match resolve_visible_trait_id(declaration_graph, bound_graph, module, bound.text):
-				None:
+			match resolve_trait_reference(declaration_graph, bound_graph, module, bound):
+				Err(failure):
 					errors = errors.append(
 						CallableTypeParameterUnknownBound(
 							owner_name,
 							parsed.name,
 							bound,
+							failure,
 						),
 					)
-				Some(trait_id):
+				Ok(trait_id):
 					if not bounds.any(func(existing): trait_ids_equal(existing, trait_id)):
 						bounds = bounds.append(trait_id)
 
@@ -983,8 +989,12 @@ pure func callable_header_graph_error_message(error: CallableHeaderGraphError) -
 			"global '" + name + "' has no bound owner module '" + module_path + "'"
 		CallableDuplicateTypeParameter(owner_name, name):
 			"callable '" + owner_name + "' declares type parameter '" + name.text + "' more than once"
-		CallableTypeParameterUnknownBound(owner_name, parameter, bound):
-			"callable '" + owner_name + "' type parameter '" + parameter.text + "' has unknown bound '" + bound.text + "'"
+		CallableTypeParameterUnknownBound(owner_name, parameter, bound, failure):
+			"callable '" + owner_name + "' type parameter '" + parameter.text + "' has " + trait_reference_failure_text(
+				BoundRole,
+				bound,
+				failure,
+			)
 		CallableMissingParameterType(owner_name, parameter_index, _):
 			"callable '" + owner_name + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
 		CallableTypeResolutionError(resolution_error) | GlobalTypeResolutionError(resolution_error):
@@ -1001,7 +1011,7 @@ pure func callable_header_graph_error_span(
 			Some(span)
 		CallableDuplicateTypeParameter(_, name):
 			Some(name.span)
-		CallableTypeParameterUnknownBound(_, _, bound):
+		CallableTypeParameterUnknownBound(_, _, bound, _):
 			Some(bound.span)
 		CallableMissingParameterType(_, _, span):
 			Some(span)

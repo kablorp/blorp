@@ -1,6 +1,7 @@
 import:
 	../../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DefinitionId,
+		BoundQualifierRow,
 		DiscoveryBuilder,
 		EMPTY_ROW_RANGE,
 		ModuleId,
@@ -9,7 +10,10 @@ import:
 		NodeId,
 		PathId,
 		SourceId,
+		SupertraitQualifierRow,
 		append_body,
+		append_bound,
+		append_bound_qualifier,
 		append_definition,
 		append_implicit_request,
 		append_diagnostic_with_argument,
@@ -23,7 +27,10 @@ import:
 		append_root_target,
 		append_signature,
 		append_source,
+		append_supertrait,
+		append_supertrait_qualifier,
 		append_token,
+		bound_id_at_row,
 		definition_id_at_row,
 		empty_discovery_builder,
 		last_node_id,
@@ -38,6 +45,7 @@ import:
 		path_id_at_row,
 		replace_module_row,
 		root_id_at_row,
+		supertrait_id_at_row,
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
 		DiscoveryDiagnosticCode(
 			ExpectedColonDiagnostic,
@@ -53,6 +61,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/invariants:
 		DiscoveryTable(
 			DiagnosticTable,
+			BoundQualifierTable,
 			DefinitionTable,
 			ImportTable,
 			ModuleTable,
@@ -60,6 +69,8 @@ import:
 			NodeTable,
 			BodyTable,
 			SourceTable,
+			SupertraitQualifierTable,
+			SupertraitTable,
 		),
 		TableInvariantKind(
 			ArgumentCountMismatch,
@@ -83,6 +94,7 @@ import:
 			RootOutcomeMismatch,
 			ImplicitOutcomeMismatch,
 			DuplicateSideRow,
+			QualifierOutsideReference,
 		),
 		TableInvariantViolation,
 		check_table_invariants,
@@ -700,10 +712,153 @@ pure func test_an_argument_that_names_a_name_is_accepted() -> Bool:
 	).is_empty()
 
 
+
+---
+A bound on the first definition's first type parameter, named `main`.
+---
+pure func with_bound(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	builder.append_bound({
+		owner = definition_id_at_row(0),
+		parameter_ordinal = 0,
+		trait_name = main_name(),
+		span = sample_span(),
+	})
+
+
+---
+A supertrait of the first definition, named `main`.
+---
+pure func with_supertrait(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	builder.append_supertrait({
+		trait_definition = definition_id_at_row(0),
+		ordinal = 0,
+		name = main_name(),
+		span = sample_span(),
+	})
+
+
+pure func test_qualifier_of_a_missing_bound_is_a_dangling_reference() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder().with_bound()
+	builder = builder.append_bound_qualifier({
+		bound = bound_id_at_row(1),
+		qualifier = main_name(),
+		span = sample_span(),
+	})
+	has_violation(builder.violations_of(), DanglingReference, BoundQualifierTable)
+
+
+pure func test_bound_with_two_qualifiers_is_reported() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder().with_bound()
+	row: BoundQualifierRow = {
+		bound = bound_id_at_row(0),
+		qualifier = main_name(),
+		span = sample_span(),
+	}
+	builder = builder.append_bound_qualifier(row).append_bound_qualifier(row)
+	has_violation(builder.violations_of(), DuplicateSideRow, BoundQualifierTable)
+
+
+pure func test_bound_qualifiers_out_of_bound_order_are_reported() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder().with_bound().with_bound()
+	builder = builder.append_bound_qualifier({
+		bound = bound_id_at_row(1),
+		qualifier = main_name(),
+		span = sample_span(),
+	})
+	builder = builder.append_bound_qualifier({
+		bound = bound_id_at_row(0),
+		qualifier = main_name(),
+		span = sample_span(),
+	})
+	has_violation(builder.violations_of(), SideTableUnsorted, BoundQualifierTable)
+
+
+pure func test_supertrait_with_two_qualifiers_is_reported() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder().with_supertrait()
+	row: SupertraitQualifierRow = {
+		supertrait = supertrait_id_at_row(0),
+		qualifier = main_name(),
+		span = sample_span(),
+	}
+	builder = builder.append_supertrait_qualifier(row).append_supertrait_qualifier(row)
+	has_violation(builder.violations_of(), DuplicateSideRow, SupertraitQualifierTable)
+
+
+pure func test_qualifier_span_past_the_end_of_its_source_is_reported() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder().with_bound()
+	builder = builder.append_bound_qualifier({
+		bound = bound_id_at_row(0),
+		qualifier = main_name(),
+		span = pack_span(0, 0, 100),
+	})
+	has_violation(builder.violations_of(), SpanPastSourceEnd, BoundQualifierTable)
+
+
+pure func test_bound_qualifier_outside_its_bound_is_reported() -> Bool:
+	-- The bound spans bytes 0 to 1; the qualifier spans 1 to 2.
+	var builder: DiscoveryBuilder = well_formed_builder().with_bound()
+	builder = builder.append_bound_qualifier({
+		bound = bound_id_at_row(0),
+		qualifier = main_name(),
+		span = pack_span(0, 1, 2),
+	})
+	has_violation(builder.violations_of(), QualifierOutsideReference, BoundQualifierTable)
+
+
+pure func test_supertrait_qualifier_outside_its_supertrait_is_reported() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder().with_supertrait()
+	builder = builder.append_supertrait_qualifier({
+		supertrait = supertrait_id_at_row(0),
+		qualifier = main_name(),
+		span = pack_span(0, 1, 2),
+	})
+	has_violation(
+		builder.violations_of(),
+		QualifierOutsideReference,
+		SupertraitQualifierTable,
+	)
+
+
+pure func test_qualifier_inside_its_bound_is_accepted() -> Bool:
+	var builder: DiscoveryBuilder = well_formed_builder().with_bound()
+	builder = builder.append_bound_qualifier({
+		bound = bound_id_at_row(0),
+		qualifier = main_name(),
+		span = sample_span(),
+	})
+	builder.violations_of().is_empty()
+
+
 tests: TestSuite = {
 	description = "Discovery table invariants",
 	tests = [
 		("well-formed builder has no violations", test_well_formed_builder_has_no_violations),
+		(
+			"qualifier of a missing bound is a dangling reference",
+			test_qualifier_of_a_missing_bound_is_a_dangling_reference,
+		),
+		("bound with two qualifiers is reported", test_bound_with_two_qualifiers_is_reported),
+		(
+			"bound qualifiers out of bound order are reported",
+			test_bound_qualifiers_out_of_bound_order_are_reported,
+		),
+		(
+			"supertrait with two qualifiers is reported",
+			test_supertrait_with_two_qualifiers_is_reported,
+		),
+		(
+			"bound qualifier outside its bound is reported",
+			test_bound_qualifier_outside_its_bound_is_reported,
+		),
+		(
+			"supertrait qualifier outside its supertrait is reported",
+			test_supertrait_qualifier_outside_its_supertrait_is_reported,
+		),
+		("qualifier inside its bound is accepted", test_qualifier_inside_its_bound_is_accepted),
+		(
+			"qualifier span past the end of its source is reported",
+			test_qualifier_span_past_the_end_of_its_source_is_reported,
+		),
 		("empty builder has no violations", test_empty_builder_has_no_violations),
 		(
 			"definition naming a missing module is a dangling reference",

@@ -14,6 +14,7 @@ import:
 		ParsedParam,
 		ParsedTraitMethodDecl,
 		ParsedTypeExpr,
+		ParsedTraitReference,
 		ParsedTypeParamDecl,
 		ParsedTypeParamKind(ParsedDimensionParameter),
 	../graph/definition_index: DefinitionTable
@@ -67,7 +68,12 @@ import:
 		trait_topology_graph_transitive_supertraits,
 		trait_topology_graph_type_headers,
 		trait_topology_header_methods,
-	trait_reference_resolution: resolve_visible_trait_id
+	trait_reference_resolution:
+		TraitReferenceRole(BoundRole),
+		TraitReferenceFailure,
+		resolve_trait_reference,
+		resolve_visible_trait_id,
+		trait_reference_failure_text_spelled,
 	type_header_graph:
 		CallableTypeParameterId,
 		ImplementationTypeParameterId,
@@ -182,10 +188,10 @@ union ImplementationHeaderGraphError:
 	ImplementationOwnerModuleMissing(String, String, SourceLocation)
 	ImplementationUnknownTrait(String, ParsedIdentifier)
 	ImplementationDuplicateTypeParameter(String, ParsedIdentifier)
-	ImplementationTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
+	ImplementationTypeParameterUnknownBound(String, ParsedIdentifier, ParsedTraitReference, TraitReferenceFailure)
 	ImplementationMethodDuplicateTypeParameter(String, ParsedIdentifier)
 	ImplementationMethodShadowsImplementationTypeParameter(String, ParsedIdentifier)
-	ImplementationMethodTypeParameterUnknownBound(String, ParsedIdentifier, ParsedIdentifier)
+	ImplementationMethodTypeParameterUnknownBound(String, ParsedIdentifier, ParsedTraitReference, TraitReferenceFailure)
 	ImplementationMethodMissingParameterType(String, Int, SourceLocation)
 	ImplementationDefaultMethodMissing(String, String, SourceLocation)
 	ImplementationMissingRequiredMethod(String, String, SourceLocation)
@@ -444,16 +450,17 @@ private pure func resolve_implementation_parameters(
 			names = names.set(parameter.name.text, True)
 
 		for bound in parameter.bounds:
-			match resolve_visible_trait_id(declaration_graph, bound_graph, module, bound.text):
-				None:
+			match resolve_trait_reference(declaration_graph, bound_graph, module, bound):
+				Err(failure):
 					errors = errors.append(
 						ImplementationTypeParameterUnknownBound(
 							skeleton.source.trait_name.text,
 							parameter.name,
 							bound,
+							failure,
 						),
 					)
-				Some(trait_id):
+				Ok(trait_id):
 					if not bounds.any(func(existing): trait_ids_equal(existing, trait_id)):
 						bounds = bounds.append(trait_id)
 
@@ -628,16 +635,17 @@ private pure func resolve_method_type_parameters(
 			)
 
 		for bound in parameter.bounds:
-			match resolve_visible_trait_id(declaration_graph, bound_graph, module, bound.text):
-				Some(trait_id):
+			match resolve_trait_reference(declaration_graph, bound_graph, module, bound):
+				Ok(trait_id):
 					if not bounds.any(func(existing): trait_ids_equal(existing, trait_id)):
 						bounds = bounds.append(trait_id)
-				None:
+				Err(failure):
 					errors = errors.append(
 						ImplementationMethodTypeParameterUnknownBound(
 							decl.name.text,
 							parameter.name,
 							bound,
+							failure,
 						),
 					)
 
@@ -1276,8 +1284,8 @@ pure func implementation_header_graph_error_message(
 			"implementation '" + name + "' refers to unknown trait '" + header_identifier_text(names, trait_name) + "'"
 		ImplementationDuplicateTypeParameter(name, parameter):
 			"implementation of '" + name + "' declares type parameter '" + header_identifier_text(names, parameter) + "' more than once"
-		ImplementationTypeParameterUnknownBound(name, parameter, bound):
-			"implementation of '" + name + "' type parameter '" + header_identifier_text(names, parameter) + "' has unknown bound '" + header_identifier_text(names, bound) + "'"
+		ImplementationTypeParameterUnknownBound(name, parameter, bound, failure):
+			"implementation of '" + name + "' type parameter '" + header_identifier_text(names, parameter) + "' has " + trait_reference_failure_text_spelled(BoundRole, names, bound, failure)
 		ImplementationMethodDuplicateTypeParameter(name, parameter):
 			"implementation method '" + name + "' declares type parameter '" + header_identifier_text(names, parameter) + "' more than once"
 		ImplementationMethodShadowsImplementationTypeParameter(name, parameter):
@@ -1285,8 +1293,8 @@ pure func implementation_header_graph_error_message(
 				"'; remove it from the method's type parameter list because implementation "
 				+ "parameters are already in scope"
 			))
-		ImplementationMethodTypeParameterUnknownBound(name, parameter, bound):
-			"implementation method '" + name + "' type parameter '" + header_identifier_text(names, parameter) + "' has unknown bound '" + header_identifier_text(names, bound) + "'"
+		ImplementationMethodTypeParameterUnknownBound(name, parameter, bound, failure):
+			"implementation method '" + name + "' type parameter '" + header_identifier_text(names, parameter) + "' has " + trait_reference_failure_text_spelled(BoundRole, names, bound, failure)
 		ImplementationMethodMissingParameterType(name, parameter_index, _):
 			"implementation method '" + name + "' parameter " + (parameter_index + 1).to_string() + " must have an explicit type"
 		ImplementationDefaultMethodMissing(name, method_name, _):
@@ -1307,13 +1315,13 @@ pure func implementation_header_graph_error_span(
 			trait_name.span
 		ImplementationDuplicateTypeParameter(_, parameter):
 			parameter.span
-		ImplementationTypeParameterUnknownBound(_, _, bound):
+		ImplementationTypeParameterUnknownBound(_, _, bound, _):
 			bound.span
 		ImplementationMethodDuplicateTypeParameter(_, parameter):
 			parameter.span
 		ImplementationMethodShadowsImplementationTypeParameter(_, parameter):
 			parameter.span
-		ImplementationMethodTypeParameterUnknownBound(_, _, bound):
+		ImplementationMethodTypeParameterUnknownBound(_, _, bound, _):
 			bound.span
 		ImplementationMethodMissingParameterType(_, _, span):
 			span

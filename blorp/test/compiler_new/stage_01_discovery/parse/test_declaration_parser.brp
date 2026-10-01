@@ -8,11 +8,18 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DiscoveryBuilder,
 		append_module_documentation,
+		bound_id_at_row,
+		bound_id_index,
 		empty_discovery_builder,
+		name_id_index,
+		supertrait_id_at_row,
+		supertrait_id_index,
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: diagnostic_code_name
 	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
 		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		bound_qualifier,
 		freeze,
+		supertrait_qualifier,
 	../../../../src/compiler_new/stage_01_discovery/tables/invariants:
 		DiscoveryTable(ModuleDocumentationTable),
 		TableInvariantKind(DuplicateSideRow),
@@ -22,8 +29,8 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
 		ModuleOriginKind(UserModule),
 		ModuleReach(RootModule),
-	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start
-	../../support/declarations_dump: declarations_dump
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_end, span_start
+	../../support/declarations_dump: declarations_dump, spelling
 	test: TestSuite
 
 
@@ -330,6 +337,101 @@ pure func test_a_second_module_documentation_row_for_a_module_is_reported() -> B
 		)
 
 
+pure func test_qualified_trait_bounds_and_supertraits_render_with_their_qualifier() -> Bool:
+	dumps_as(
+		"pure func f[T: mm.Shape + Equatable, U: Eq](x: T) -> Int: 0\ntrait Sorted: mm.Ordered + Stringable\nimplements Show for Box[T: mm.Shape + Eq]:\n\tfunc show(b: Box[T]) -> String: 0\n",
+		[
+			"func f[T: mm.Shape + Equatable, U: Eq] pure (x: Named(T)) : Named(Int) @0-59",
+			"trait Sorted {super=mm.Ordered super=Stringable} @60-97",
+			"impl Show : Named(Box)[Bounded(T: mm.Shape + Eq)] @98-176",
+			"  impl-method show (b: Named(Box)[Named(T)]) : Named(String) @142-175",
+		],
+	)
+
+
+---
+A qualifier is an optional relation of its bound or supertrait, so it is a row
+in a side table keyed by the bound's or supertrait's id, and the bound's own
+span covers the whole written reference.
+---
+pure func test_qualified_bounds_and_supertraits_have_qualifier_side_rows() -> Bool:
+	builder: DiscoveryBuilder = parsed(
+		"pure func f[T: mm.Shape + Equatable](x: T) -> Int: 0\ntrait Sorted: Ordered + mm.Stringable\n",
+	)
+
+	bounds_ok: Bool = match (builder.bounds.get(0), builder.bounds.get(1)):
+		(Some(qualified), Some(plain)):
+			(
+				builder.spelling(qualified.trait_name.name_id_index()) == "Shape"
+				and qualified.span.span_start() == 15
+				and qualified.span.span_end() == 23
+				and builder.spelling(plain.trait_name.name_id_index()) == "Equatable"
+				and plain.span.span_start() == 26
+			)
+		_:
+			False
+
+	bound_qualifier_ok: Bool = match builder.bound_qualifiers.get(0):
+		Some(row):
+			(
+				builder.bound_qualifiers.length() == 1
+				and row.bound.bound_id_index() == 0
+				and builder.spelling(row.qualifier.name_id_index()) == "mm"
+				and row.span.span_start() == 15
+				and row.span.span_end() == 17
+			)
+		None:
+			False
+
+	supertrait_qualifier_ok: Bool = match builder.supertrait_qualifiers.get(0):
+		Some(row):
+			(
+				builder.supertrait_qualifiers.length() == 1
+				and row.supertrait.supertrait_id_index() == 1
+				and builder.spelling(row.qualifier.name_id_index()) == "mm"
+			)
+		None:
+			False
+
+	(
+		bounds_ok
+		and bound_qualifier_ok
+		and supertrait_qualifier_ok
+		and builder.diagnostics.is_empty()
+		and builder.freezes_with_invariants()
+	)
+
+
+pure func test_frozen_tables_read_the_qualifier_of_a_bound_or_supertrait() -> Bool:
+	builder: DiscoveryBuilder = parsed(
+		"pure func f[T: mm.Shape + Equatable](x: T) -> Int: 0\ntrait Sorted: Ordered + mm.Stringable\n",
+	)
+
+	match builder.freeze():
+		FrozenTables(tables):
+			qualified_bound: Option[String] = tables
+				.bound_qualifier(bound_id_at_row(0))
+				.map(pure func(name): builder.spelling(name.name_id_index()))
+
+			qualified_supertrait: Option[String] = tables
+				.supertrait_qualifier(supertrait_id_at_row(1))
+				.map(pure func(name): builder.spelling(name.name_id_index()))
+
+			(
+				qualified_bound == Some("mm")
+				and tables.bound_qualifier(bound_id_at_row(1)).is_none()
+				and qualified_supertrait == Some("mm")
+				and tables.supertrait_qualifier(supertrait_id_at_row(0)).is_none()
+			)
+		TableInvariantsViolated(_):
+			False
+
+
+pure func test_qualified_trait_reference_without_a_name_is_reported() -> Bool:
+	builder: DiscoveryBuilder = parsed("pure func f[T: mm.](x: T) -> Int: 0\n")
+	builder.diagnostics.length() > 0
+
+
 tests: TestSuite = {
 	description = "Discovery declaration parser",
 	tests = [
@@ -344,6 +446,22 @@ tests: TestSuite = {
 		("globals and private declarations", test_globals_and_private_declarations),
 		("traits with methods and supertraits", test_traits_with_methods_and_supertraits),
 		("impls and their methods", test_impls_and_their_methods),
+		(
+			"qualified trait bounds and supertraits render with their qualifier",
+			test_qualified_trait_bounds_and_supertraits_render_with_their_qualifier,
+		),
+		(
+			"qualified bounds and supertraits have qualifier side rows",
+			test_qualified_bounds_and_supertraits_have_qualifier_side_rows,
+		),
+		(
+			"frozen tables read the qualifier of a bound or supertrait",
+			test_frozen_tables_read_the_qualifier_of_a_bound_or_supertrait,
+		),
+		(
+			"qualified trait reference without a name is reported",
+			test_qualified_trait_reference_without_a_name_is_reported,
+		),
 		("foreign blocks bindings and c names", test_foreign_blocks_bindings_and_c_names),
 		(
 			"docstring before the first import block is the module documentation",

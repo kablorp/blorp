@@ -2333,6 +2333,26 @@ one: a user `Addable` is not the prelude `Addable`, so bounding a type parameter
 by it does not make `+` available. Use the prelude trait, or implement it for the
 type.
 
+A bound or supertrait names a trait from another module through that module's
+import alias, the same way a qualified type does:
+
+```blorp
+import:
+    geometry as shapes: area    -- `shapes` is the alias; `area` is imported by name
+
+func total_area[T: shapes.Shape](first: T, second: T) -> Int:
+    area(first) + area(second)
+
+trait Measured: shapes.Shape:
+    func name(self: Self) -> String
+```
+
+The alias must come from an `as` import of a module that declares the trait and
+does not mark it `private`; otherwise the compiler reports an unknown bound and says
+what to import or spell. The trait's methods still come from the functions you
+import (`area` above), as for an unqualified trait.
+`implements` still takes an unqualified trait name; `implements alias.Trait for X` is not supported yet.
+
 ### Standard Traits
 
 | Trait | Required Functions | Description |

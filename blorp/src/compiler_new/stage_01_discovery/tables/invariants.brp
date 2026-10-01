@@ -13,6 +13,7 @@ import:
 		NO_NODE_PAYLOAD,
 		NodeRow,
 		RowRange,
+		bound_id_index,
 		definition_id_index,
 		foreign_block_id_index,
 		implicit_request_id_index,
@@ -27,6 +28,7 @@ import:
 		path_id_index,
 		root_id_index,
 		source_id_index,
+		supertrait_id_index,
 	diagnostic_code:
 		DiagnosticArgumentKind(
 			ConstructArgument,
@@ -57,7 +59,7 @@ import:
 		),
 		node_payload_reference,
 		parsed_construct_at_argument,
-	span: Span, span_end, span_source_index
+	span: Span, span_end, span_source_index, span_start
 	token: is_unicode_scalar
 
 
@@ -94,7 +96,9 @@ enum DiscoveryTable:
 	AnnotationTable
 	TypeParameterTable
 	BoundTable
+	BoundQualifierTable
 	SupertraitTable
+	SupertraitQualifierTable
 	SignatureTable
 	ParameterTable
 	BinderNameTable
@@ -127,6 +131,7 @@ What a violation breaks. The meaning of `TableInvariantViolation.value` and
 - `BodyRootOutsideModule`: A body's root node lies outside its definition's module's node block; `value` is the root's index.
 - `SeededNameMoved`: The name at a pinned id is not the seeded spelling; the row is the id.
 - `InternIndexMismatch`: An intern index disagrees with its table: the dictionary maps a row's text to another row, or has an entry with no row. `value` is the index the dictionary holds.
+- `QualifierOutsideReference`: A bound's or supertrait's module qualifier span does not lie inside the span of the bound or supertrait it qualifies, which covers the whole written reference; `value` is the qualified row's index in `related_table`.
 - `SpanOutsideSources`: A span names no source; `value` is the span's source index.
 - `DuplicateSideRow`: A side table holds more than one row for an owner that may have at most one; the row is the owner's index in `related_table` and `value` the row count.
 - `RootOutcomeMismatch`: A root has not exactly one of a target and a root diagnostic; `value` is how many it has.
@@ -152,6 +157,7 @@ enum TableInvariantKind:
 	InternIndexMismatch
 	ParallelTableMismatch
 	SpanOutsideSources
+	QualifierOutsideReference
 	SpanPastSourceEnd
 	DuplicateSideRow
 	RootOutcomeMismatch
@@ -260,6 +266,7 @@ pure func check_table_invariants(
 		.concat(builder.check_body_rows())
 		.concat(builder.check_diagnostic_rows())
 		.concat(builder.check_spans())
+		.concat(builder.check_qualifier_spans())
 
 
 private pure func check_seeded_names(
@@ -1064,6 +1071,27 @@ private pure func check_declaration_rows(
 
 	row = 0
 
+	for qualifier in builder.bound_qualifiers:
+		found = check_reference(
+			found,
+			BoundQualifierTable,
+			row,
+			BoundTable,
+			qualifier.bound.bound_id_index(),
+			builder.bounds.length(),
+		)
+		found = check_reference(
+			found,
+			BoundQualifierTable,
+			row,
+			NameTable,
+			qualifier.qualifier.name_id_index(),
+			name_count,
+		)
+		row += 1
+
+	row = 0
+
 	for supertrait in builder.supertraits:
 		found = check_reference(
 			found,
@@ -1079,6 +1107,27 @@ private pure func check_declaration_rows(
 			row,
 			NameTable,
 			supertrait.name.name_id_index(),
+			name_count,
+		)
+		row += 1
+
+	row = 0
+
+	for qualifier in builder.supertrait_qualifiers:
+		found = check_reference(
+			found,
+			SupertraitQualifierTable,
+			row,
+			SupertraitTable,
+			qualifier.supertrait.supertrait_id_index(),
+			builder.supertraits.length(),
+		)
+		found = check_reference(
+			found,
+			SupertraitQualifierTable,
+			row,
+			NameTable,
+			qualifier.qualifier.name_id_index(),
 			name_count,
 		)
 		row += 1
@@ -1446,7 +1495,8 @@ private pure func check_node_references(builder: DiscoveryBuilder) -> List[Table
 
 
 ---
-Side tables that hold at most one row per owner do; each root has exactly
+Side tables that hold at most one row per owner do (including a bound's or
+supertrait's module qualifier); each root has exactly
 one outcome (a target or a root diagnostic); each function-like definition
 has exactly one signature and no other definition has one.
 ---
@@ -1493,6 +1543,24 @@ private pure func check_cardinalities(builder: DiscoveryBuilder) -> List[TableIn
 			builder.import_aliases.map(pure func(row): row.owner_import.import_id_index()),
 		),
 	)
+	found = at_most_one(
+		found,
+		BoundQualifierTable,
+		BoundTable,
+		owner_counts(
+			builder.bounds.length(),
+			builder.bound_qualifiers.map(pure func(row): row.bound.bound_id_index()),
+		),
+	)
+	found = at_most_one(
+		found,
+		SupertraitQualifierTable,
+		SupertraitTable,
+		owner_counts(
+			builder.supertraits.length(),
+			builder.supertrait_qualifiers.map(pure func(row): row.supertrait.supertrait_id_index()),
+		),
+	)
 	found = at_most_one(found, RootTargetTable, RootTable, root_targets)
 	found = at_most_one(found, ImplicitTargetTable, ImplicitRequestTable, implicit_targets)
 	found = sorted_by_owner(
@@ -1514,6 +1582,16 @@ private pure func check_cardinalities(builder: DiscoveryBuilder) -> List[TableIn
 		found,
 		ImportItemAliasTable,
 		builder.import_item_aliases.map(pure func(row): row.item.import_item_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		BoundQualifierTable,
+		builder.bound_qualifiers.map(pure func(row): row.bound.bound_id_index()),
+	)
+	found = sorted_by_owner(
+		found,
+		SupertraitQualifierTable,
+		builder.supertrait_qualifiers.map(pure func(row): row.supertrait.supertrait_id_index()),
 	)
 	found = sorted_by_owner(
 		found,
@@ -1960,6 +2038,74 @@ private pure func check_diagnostic_rows(builder: DiscoveryBuilder) -> List[Table
 
 
 ---
+A `QualifierOutsideReference` for each bound or supertrait qualifier whose span
+is not inside its parent's. A qualifier naming no parent is a dangling
+reference the row checks already report.
+---
+private pure func check_qualifier_spans(
+	builder: DiscoveryBuilder,
+) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	var row: Int = 0
+
+	for qualifier in builder.bound_qualifiers:
+		parent: Int = qualifier.bound.bound_id_index()
+
+		match builder.bounds.get(parent):
+			Some(bound):
+				if not qualifier.span.span_within(bound.span):
+					found = found.append(
+						violation(
+							QualifierOutsideReference,
+							BoundQualifierTable,
+							row,
+							BoundTable,
+							parent,
+						),
+					)
+			None:
+				void
+
+		row += 1
+
+	row = 0
+
+	for qualifier in builder.supertrait_qualifiers:
+		parent: Int = qualifier.supertrait.supertrait_id_index()
+
+		match builder.supertraits.get(parent):
+			Some(supertrait):
+				if not qualifier.span.span_within(supertrait.span):
+					found = found.append(
+						violation(
+							QualifierOutsideReference,
+							SupertraitQualifierTable,
+							row,
+							SupertraitTable,
+							parent,
+						),
+					)
+			None:
+				void
+
+		row += 1
+
+	found
+
+
+---
+Whether `inner` lies inside `outer`: the same source, starting no earlier and
+ending no later.
+---
+private pure func span_within(inner: Span, outer: Span) -> Bool:
+	(
+		inner.span_source_index() == outer.span_source_index()
+		and inner.span_start() >= outer.span_start()
+		and inner.span_end() <= outer.span_end()
+	)
+
+
+---
 Appends a `SpanOutsideSources` violation unless `span` names a source.
 ---
 private pure func check_span(
@@ -2044,8 +2190,20 @@ private pure func check_spans(builder: DiscoveryBuilder) -> List[TableInvariantV
 
 	row = 0
 
+	for qualifier in builder.bound_qualifiers:
+		found = check_span(found, BoundQualifierTable, row, qualifier.span, sources)
+		row += 1
+
+	row = 0
+
 	for supertrait in builder.supertraits:
 		found = check_span(found, SupertraitTable, row, supertrait.span, sources)
+		row += 1
+
+	row = 0
+
+	for qualifier in builder.supertrait_qualifiers:
+		found = check_span(found, SupertraitQualifierTable, row, qualifier.span, sources)
 		row += 1
 
 	row = 0

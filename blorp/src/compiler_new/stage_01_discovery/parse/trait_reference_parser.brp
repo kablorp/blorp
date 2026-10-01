@@ -1,0 +1,157 @@
+-- A trait named in a type parameter's bound list, in a trait's supertrait
+-- list or in the bound list of a bounded type argument: `Trait`, or
+-- `module.Trait` through an import alias. The lists read the same grammar, so
+-- one routine reads the reference and records it where the sink says.
+import:
+	../tables/builder:
+		DefinitionId,
+		DiscoveryBuilder,
+		NameId,
+		NodeId,
+		advance_token,
+		append_bound,
+		append_bound_qualifier,
+		append_name_leaf_node,
+		append_named_parent_node,
+		append_supertrait,
+		append_supertrait_qualifier,
+		next_bound_id,
+		next_node_id,
+		next_supertrait_id,
+	../tables/row_kinds:
+		NodeKind(QualifiedTypeBoundNode, TypeBoundNode, TypeQualifierNode),
+		ParsedConstruct(TraitName, TypeName),
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(DotSymbol)
+	parser_cursor:
+		at,
+		consume_referenced_name,
+		current_span,
+		referenced_name_at_cursor,
+
+
+---
+The module alias written before the dot of `alias.Trait`, and its span.
+---
+struct WrittenQualifier {
+	name: NameId,
+	span: Span
+}
+
+
+---
+Where a written trait reference is recorded: as a bound on the type parameter
+at an ordinal of its owner, as the supertrait at an ordinal of a trait, or as
+a bound node of a bounded type argument (`Box[T: Eq]`).
+---
+union TraitReferenceSink:
+	BoundSink(DefinitionId, Int)
+	SupertraitSink(DefinitionId, Int)
+	InlineBoundSink
+
+
+---
+What the diagnostics name as being parsed while `sink` reads a reference: bounds
+and supertraits are traits; an inline bound keeps the type-argument wording it
+had.
+---
+private pure func construct(sink: TraitReferenceSink) -> ParsedConstruct:
+	match sink:
+		BoundSink(_, _) | SupertraitSink(_, _):
+			TraitName
+		InlineBoundSink:
+			TypeName
+
+
+---
+Consumes one trait reference at the cursor and records it in `sink`. The bound
+or supertrait row, or the bound node, names the trait and spans the whole
+reference; a written `module.` becomes a qualifier row for that bound or
+supertrait, or the qualifier child of a `QualifiedTypeBoundNode`, as a
+qualified type has. A dot takes a trait name next, as in a qualified type. An
+inline bound is the last node appended, so `last_node_id` reads it.
+---
+pure func parse_trait_reference(
+	builder: DiscoveryBuilder,
+	sink: TraitReferenceSink,
+) -> DiscoveryBuilder:
+	first_name: NameId = builder.referenced_name_at_cursor()
+	first_span: Span = builder.current_span()
+	after_first: DiscoveryBuilder = builder.consume_referenced_name(sink.construct())
+
+	if after_first.at(DotSymbol):
+		dotted: DiscoveryBuilder = after_first.advance_token()
+		trait_name: NameId = dotted.referenced_name_at_cursor()
+		trait_span: Span = dotted.current_span()
+		out: DiscoveryBuilder = dotted.consume_referenced_name(sink.construct())
+		out.append_trait_reference(
+			sink,
+			trait_name,
+			first_span.span_covering(trait_span),
+			Some({ name = first_name, span = first_span }),
+		)
+	else:
+		after_first.append_trait_reference(sink, first_name, first_span, None)
+
+
+private pure func append_trait_reference(
+	builder: DiscoveryBuilder,
+	sink: TraitReferenceSink,
+	trait_name: NameId,
+	span: Span,
+	qualifier: Option[WrittenQualifier],
+) -> DiscoveryBuilder:
+	match sink:
+		BoundSink(owner, parameter_ordinal):
+			bound = builder.next_bound_id()
+			recorded = builder.append_bound({
+				owner = owner,
+				parameter_ordinal = parameter_ordinal,
+				trait_name = trait_name,
+				span = span,
+			})
+
+			match qualifier:
+				Some(written_qualifier):
+					recorded.append_bound_qualifier({
+						bound = bound,
+						qualifier = written_qualifier.name,
+						span = written_qualifier.span,
+					})
+				None:
+					recorded
+		SupertraitSink(trait_definition, ordinal):
+			supertrait = builder.next_supertrait_id()
+			recorded = builder.append_supertrait({
+				trait_definition = trait_definition,
+				ordinal = ordinal,
+				name = trait_name,
+				span = span,
+			})
+
+			match qualifier:
+				Some(written_qualifier):
+					recorded.append_supertrait_qualifier({
+						supertrait = supertrait,
+						qualifier = written_qualifier.name,
+						span = written_qualifier.span,
+					})
+				None:
+					recorded
+		InlineBoundSink:
+			match qualifier:
+				Some(written_qualifier):
+					qualifier_node: NodeId = builder.next_node_id()
+					with_qualifier = builder.append_name_leaf_node(
+						TypeQualifierNode,
+						written_qualifier.span,
+						written_qualifier.name,
+					)
+					with_qualifier.append_named_parent_node(
+						QualifiedTypeBoundNode,
+						span,
+						trait_name,
+						[qualifier_node],
+					)
+				None:
+					builder.append_name_leaf_node(TypeBoundNode, span, trait_name)

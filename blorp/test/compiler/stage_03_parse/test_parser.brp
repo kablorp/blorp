@@ -102,6 +102,7 @@ import:
 			ParsedRangeType,
 			ParsedTupleType,
 		),
+		ParsedTraitReference,
 		ParsedTypeParamDecl,
 		ParsedTypeParamKind(ParsedDimensionParameter, ParsedTypeParameter),
 		ParsedWithBinding,
@@ -386,6 +387,23 @@ pure func type_param_at_matches(
 			False
 
 
+pure func trait_reference_matches(
+	reference: ParsedTraitReference,
+	qualifier_text: Option[String],
+	name_text: String,
+	start_offset: Int,
+	end_offset: Int,
+) -> Bool:
+	written_qualifier: Option[String] = reference.qualifier.map(pure func(qualifier): qualifier.text)
+
+	(
+		written_qualifier == qualifier_text
+		and reference.name.text == name_text
+		and source_location_start_offset(reference.span) == start_offset
+		and source_location_end_offset(reference.span) == end_offset
+	)
+
+
 pure func type_param_first_bound_matches(
 	params: List[ParsedTypeParamDecl],
 	index: Int,
@@ -396,7 +414,7 @@ pure func type_param_first_bound_matches(
 		Some(param):
 			match param.bounds.get(0):
 				Some(bound):
-					param.name.text == name_text and bound.text == bound_text
+					param.name.text == name_text and bound.name.text == bound_text
 				None:
 					False
 		None:
@@ -4769,6 +4787,117 @@ func test_parse_supertrait_only_declaration() -> Bool:
 			False
 
 
+func test_parse_qualified_type_parameter_bounds() -> Bool:
+	program_source: String = "pure func f[T: mm.Shape + Eq](x: T) -> Int:\n\t0"
+	program = parse_compiler_source(source(program_source))
+
+	match program.decls.get(0):
+		Some(FunctionParsedDecl(function_decl)):
+			match function_decl.type_params.get(0):
+				Some(param):
+					first_ok: Bool = match param.bounds.get(0):
+						Some(bound):
+							trait_reference_matches(bound, Some("mm"), "Shape", 15, 23)
+						None:
+							False
+
+					second_ok: Bool = match param.bounds.get(1):
+						Some(bound):
+							trait_reference_matches(bound, None, "Eq", 26, 28)
+						None:
+							False
+
+					(
+						parsed_program_ok(program)
+						and param.bounds.length() == 2
+						and first_ok
+						and second_ok
+						and source_location_end_offset(param.span) == 28
+					)
+				None:
+					False
+		_:
+			False
+
+
+func test_parse_qualified_impl_inline_bound() -> Bool:
+	program_source: String = "implements Showable for Box[T: mm.Shape + Equatable]:\n\tpure func show(b: Box[T]) -> String:\n\t\t\"box\""
+	program = parse_compiler_source(source(program_source))
+
+	match program.decls.get(0):
+		Some(ImplParsedDecl(impl_decl)):
+			match impl_decl.for_type:
+				ParsedNamedType(_, args, _):
+					match args.get(0):
+						Some(ParsedBoundedType(parameter, bounds, bounded_span)):
+							first_ok: Bool = match bounds.get(0):
+								Some(bound):
+									trait_reference_matches(bound, Some("mm"), "Shape", 31, 39)
+								None:
+									False
+
+							second_ok: Bool = match bounds.get(1):
+								Some(bound):
+									trait_reference_matches(bound, None, "Equatable", 42, 51)
+								None:
+									False
+
+							(
+								parsed_program_ok(program)
+								and parameter.text == "T"
+								and bounds.length() == 2
+								and first_ok
+								and second_ok
+								and source_location_end_offset(bounded_span) == 51
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+func test_parse_qualified_supertrait() -> Bool:
+	program_source: String = "trait Sorted: mm.Ordered + Stringable"
+	program = parse_compiler_source(source(program_source))
+
+	match program.decls.get(0):
+		Some(TraitParsedDecl(trait_decl)):
+			first_ok: Bool = match trait_decl.supertraits.get(0):
+				Some(supertrait):
+					trait_reference_matches(supertrait, Some("mm"), "Ordered", 14, 24)
+				None:
+					False
+
+			second_ok: Bool = match trait_decl.supertraits.get(1):
+				Some(supertrait):
+					trait_reference_matches(supertrait, None, "Stringable", 27, 37)
+				None:
+					False
+
+			parsed_program_ok(program) and trait_decl.supertraits.length() == 2 and first_ok and second_ok
+		_:
+			False
+
+
+func test_parse_qualified_bound_without_trait_name_reports_error() -> Bool:
+	program = parse_compiler_source(source("pure func f[T: mm.](x: T) -> Int:\n\t0"))
+
+	parsed_program_has_errors(program)
+
+
+func test_qualified_bound_json_names_qualifier() -> Bool:
+	program = parse_compiler_source(source("pure func f[T: mm.Shape](x: T) -> Int:\n\t0"))
+	text: String = parsed_program_to_json(program).to_string()
+
+	(
+		text.contains("\"kind\":\"trait_reference\"")
+		and text.contains("\"qualifier\":{\"text\":\"mm\"")
+		and text.contains("\"name\":{\"text\":\"Shape\"")
+	)
+
+
 func test_parse_empty_trait_reports_error() -> Bool:
 	program_source: String = "trait Empty:"
 	program = parse_compiler_source(source(program_source))
@@ -5571,6 +5700,14 @@ tests: TestSuite = {
 		),
 		("parse trait declaration", test_parse_trait_declaration),
 		("parse supertrait only declaration", test_parse_supertrait_only_declaration),
+		("parse qualified type parameter bounds", test_parse_qualified_type_parameter_bounds),
+		("parse qualified impl inline bound", test_parse_qualified_impl_inline_bound),
+		("parse qualified supertrait", test_parse_qualified_supertrait),
+		(
+			"parse qualified bound without trait name reports error",
+			test_parse_qualified_bound_without_trait_name_reports_error,
+		),
+		("qualified bound json names qualifier", test_qualified_bound_json_names_qualifier),
 		("parse empty trait reports error", test_parse_empty_trait_reports_error),
 		("parse impl declaration", test_parse_impl_declaration),
 		(

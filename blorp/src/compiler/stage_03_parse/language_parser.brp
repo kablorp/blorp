@@ -286,6 +286,7 @@ import:
 			ParsedRangeType,
 			ParsedTupleType,
 		),
+		ParsedTraitReference,
 		ParsedTypeParamDecl,
 		ParsedTypeParamKind(ParsedDimensionParameter, ParsedTypeParameter),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
@@ -487,6 +488,13 @@ private record ParseLambdaParamsStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	values: List[ParsedLambdaParam]
+}
+
+
+private record ParseTraitReferenceListStep {
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	values: List[ParsedTraitReference]
 }
 
 
@@ -1773,8 +1781,8 @@ private pure func parsed_type_exprs_all_dim(items: List[ParsedTypeExpr]) -> Bool
 	all_dim
 
 
-private pure func last_identifier_span(
-	items: List[ParsedIdentifier],
+private pure func last_trait_reference_span(
+	items: List[ParsedTraitReference],
 	fallback: SourceLocation,
 ) -> SourceLocation:
 	var span: SourceLocation = fallback
@@ -1785,22 +1793,75 @@ private pure func last_identifier_span(
 	span
 
 
-private pure func parse_plus_separated_identifier_list(
+---
+One trait name in a bound or supertrait list: `Trait` or `alias.Trait`. A
+dot after the first identifier takes a trait name next, as in a qualified type.
+---
+private record ParseTraitReferenceStep {
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	value: ParsedTraitReference
+}
+
+
+private pure func parse_trait_reference_expected(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	expected: String,
-) -> ParseIdentifierListStep:
+) -> ParseTraitReferenceStep:
+	first_step: ParseIdentifierStep = parse_identifier_expected(state, index, diagnostics, expected)
+
+	if current_is_symbol(state, first_step.index, DotSymbol):
+		name_step: ParseIdentifierStep = parse_identifier_expected(
+			state,
+			advance_parser(state, first_step.index),
+			first_step.diagnostics,
+			expected,
+		)
+
+		{
+			index = name_step.index,
+			diagnostics = name_step.diagnostics,
+			value = {
+				qualifier = Some(first_step.value),
+				name = name_step.value,
+				span = location_cover(first_step.value.span, name_step.value.span)
+			}
+		}
+	else:
+		{
+			index = first_step.index,
+			diagnostics = first_step.diagnostics,
+			value = {
+				qualifier = None,
+				name = first_step.value,
+				span = first_step.value.span
+			}
+		}
+
+
+private pure func parse_plus_separated_trait_reference_list(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	expected: String,
+) -> ParseTraitReferenceListStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	var values: List[ParsedIdentifier] = []
+	var values: List[ParsedTraitReference] = []
 	var parsing_values: Bool = True
 
 	while parsing_values and not current_is_eof(state, st):
-		name_step: ParseIdentifierStep = parse_identifier_expected(state, st, st_diag, expected)
-		values = values.append(name_step.value)
-		st = name_step.index
-		st_diag = name_step.diagnostics
+		reference_step: ParseTraitReferenceStep = parse_trait_reference_expected(
+			state,
+			st,
+			st_diag,
+			expected,
+		)
+		values = values.append(reference_step.value)
+		st = reference_step.index
+		st_diag = reference_step.diagnostics
 
 		if current_is_symbol(state, st, PlusSymbol):
 			st = advance_parser(state, st)
@@ -2301,7 +2362,7 @@ private pure func parse_named_type_expr_with_bounds(
 	var end_span: SourceLocation = first_name_step.value.span
 
 	if allow_bounds and current_is_symbol(state, st, ColonSymbol):
-		bounds_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
+		bounds_step: ParseTraitReferenceListStep = parse_plus_separated_trait_reference_list(
 			state,
 			advance_parser(state, st),
 			st_diag,
@@ -2316,7 +2377,7 @@ private pure func parse_named_type_expr_with_bounds(
 				bounds_step.values,
 				location_cover(
 					type_name.span,
-					last_identifier_span(bounds_step.values, type_name.span),
+					last_trait_reference_span(bounds_step.values, type_name.span),
 				),
 			)
 		}
@@ -3076,11 +3137,11 @@ private pure func parse_type_param_decl(
 
 	var st: Int = name_step.index
 	var st_diag: List[ParseDiagnostic] = name_step.diagnostics
-	var bounds: List[ParsedIdentifier] = []
+	var bounds: List[ParsedTraitReference] = []
 	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, ColonSymbol):
-		bounds_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
+		bounds_step: ParseTraitReferenceListStep = parse_plus_separated_trait_reference_list(
 			state,
 			advance_parser(state, st),
 			st_diag,
@@ -3089,7 +3150,7 @@ private pure func parse_type_param_decl(
 		bounds = bounds_step.values
 		st = bounds_step.index
 		st_diag = bounds_step.diagnostics
-		end_span = last_identifier_span(bounds, end_span)
+		end_span = last_trait_reference_span(bounds, end_span)
 
 	{
 		index = st,
@@ -9853,7 +9914,7 @@ private pure func parse_trait_decl(
 	)
 	st = colon_step.index
 	st_diag = colon_step_diagnostics
-	var supertraits: List[ParsedIdentifier] = []
+	var supertraits: List[ParsedTraitReference] = []
 	var methods: List[ParsedTraitMethodDecl] = []
 	var has_method_block: Bool = False
 	var end_span: SourceLocation = name_step.value.span
@@ -9873,7 +9934,7 @@ private pure func parse_trait_decl(
 			None,
 		)
 	else:
-		supertraits_step: ParseIdentifierListStep = parse_plus_separated_identifier_list(
+		supertraits_step: ParseTraitReferenceListStep = parse_plus_separated_trait_reference_list(
 			state,
 			st,
 			st_diag,
@@ -9882,7 +9943,7 @@ private pure func parse_trait_decl(
 		supertraits = supertraits_step.values
 		st = supertraits_step.index
 		st_diag = supertraits_step.diagnostics
-		end_span = last_identifier_span(supertraits, end_span)
+		end_span = last_trait_reference_span(supertraits, end_span)
 
 		if current_is_symbol(state, st, ColonSymbol):
 			second_colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)

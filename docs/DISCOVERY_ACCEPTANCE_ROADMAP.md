@@ -130,8 +130,11 @@ more. Each numbered item is one change.
    sequence with the stage's for the self-compile root and a `blorp test`
    root (identical order), so the stage's restated seed
    names cannot drift from the old constants.
-2. **Qualified trait bounds (S).** `T: module.Trait` is legal: `BoundRow`
-   records a path, not a single name. Both parsers and the grammar agree.
+2. **Qualified trait bounds (S). Done for bounds and supertraits.**
+   `T: module.Trait` is legal in both parsers and the grammar; the alias is a
+   side-table row (`BoundQualifierRow`, `SupertraitQualifierRow`). Not done:
+   `implements module.Trait for X`, which needs typecheck to carry the
+   implemented trait's identity instead of its name.
 3. **Adapter, declarations (M).** `legacy_frontend_graph` rebuilds each
    module's declarations, signatures, types, imports and surfaces, with
    bodies left empty, plus the source table that spans render through and

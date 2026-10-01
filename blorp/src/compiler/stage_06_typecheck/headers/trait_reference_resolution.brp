@@ -5,22 +5,35 @@
 -- names and the canonical std traits module, so unrelated short-name matches
 -- cannot become semantic identities.
 import:
-	../graph/indexed_graph: prepared_module_scope_id
+	../graph/indexed_graph: prepared_module_scope_id, prepared_module_scopes_select_same_module
 	../graph/definition_table_storage: definition_table_prelude_traits_module_id
 	../../stage_04_modules/module_table: module_ids_equal
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
 		bound_module_canonical_path,
+		bound_module_graph_canonical_path_for_id,
 		bound_module_graph_find_canonical_path,
+		bound_module_graph_find_for_id,
+		bound_module_graph_module_table,
 		bound_module_graph_modules,
 		bound_module_graph_target,
 		bound_module_program,
 		bound_module_scope,
 		bound_module_view,
-	../modules/module_view: module_view_find_imported_name, module_view_find_local_name
+	../modules/module_view:
+		module_view_find_graph_module_alias,
+		module_view_find_imported_name,
+		module_view_find_local_name,
+		module_view_find_standalone_module_alias,
+	../../stage_02_lex/name_table: IdentifierSpellings, identifier_spelling
+	../../stage_03_parse/parsed_ast:
+		ParsedTraitReference,
+		parsed_trait_reference_spelling,
+		parsed_trait_reference_text
 	declaration_skeleton:
 		DeclarationSkeletonGraph,
+		DeclarationVisibility(PrivateDeclaration),
 		declaration_skeleton_graph_definition_table,
 		builtin_trait_id,
 		declaration_skeleton_graph_find_trait,
@@ -131,3 +144,191 @@ pure func resolve_visible_trait_id(
 								None
 					None:
 						prelude_trait_id(declaration_graph, bound_graph, name)
+
+
+---
+Where a trait was named, for diagnostics: a bound on a type parameter (the
+headers word it "bound", the type header "trait bound") or a supertrait.
+---
+enum TraitReferenceRole:
+	BoundRole
+	TraitBoundRole
+	SupertraitRole
+
+
+private pure func trait_reference_role_text(role: TraitReferenceRole) -> String:
+	match role:
+		BoundRole:
+			"bound"
+		TraitBoundRole:
+			"trait bound"
+		SupertraitRole:
+			"supertrait"
+
+
+---
+Why a written trait reference named no trait. Unqualified names fail one way;
+a qualified `alias.Trait` can fail at the alias, at the module the alias
+names, or at the trait's visibility, and each has its own diagnostic.
+---
+union TraitReferenceFailure:
+	TraitNameNotVisible
+	TraitQualifierNotImported(String)
+	TraitQualifierModuleMissing(String)
+	TraitNotDeclaredInModule(String)
+	TraitIsPrivateInModule(String)
+
+
+---
+Resolves a trait named in a bound or supertrait list to its declaration. An
+unqualified name follows `resolve_visible_trait_id`. A qualified `alias.Trait`
+resolves `alias` the way a qualified type's qualifier resolves (an import alias
+of a module in the graph), then looks `Trait` up among that module's own
+declarations: an alias names a module, so neither the module's imports nor the
+prelude are searched, and a private trait of another module is rejected.
+---
+pure func resolve_trait_reference(
+	declaration_graph: DeclarationSkeletonGraph,
+	bound_graph: BoundModuleGraph,
+	module: BoundModule,
+	reference: ParsedTraitReference,
+) -> Result[TraitId, TraitReferenceFailure]:
+	match reference.qualifier:
+		None:
+			match resolve_visible_trait_id(
+				declaration_graph,
+				bound_graph,
+				module,
+				reference.name.text,
+			):
+				Some(id):
+					Ok(id)
+				None:
+					Err(TraitNameNotVisible)
+		Some(qualifier):
+			match qualified_trait_module(bound_graph, module, qualifier.text):
+				Err(failure):
+					Err(failure)
+				Ok(owner):
+					trait_in_alias_module(
+						declaration_graph,
+						module,
+						owner,
+						qualifier.text,
+						reference.name.text,
+					)
+
+
+private pure func qualified_trait_module(
+	bound_graph: BoundModuleGraph,
+	module: BoundModule,
+	qualifier: String,
+) -> Result[BoundModule, TraitReferenceFailure]:
+	view = bound_module_view(module)
+
+	match module_view_find_graph_module_alias(view, qualifier):
+		Some(module_id):
+			match bound_module_graph_find_for_id(
+				bound_graph,
+				bound_module_graph_module_table(bound_graph),
+				module_id,
+			):
+				Some(owner):
+					Ok(owner)
+				None:
+					Err(
+						TraitQualifierModuleMissing(
+							bound_module_graph_canonical_path_for_id(
+								bound_graph,
+								bound_module_graph_module_table(bound_graph),
+								module_id,
+							).get_or(qualifier),
+						),
+					)
+		None:
+			match module_view_find_standalone_module_alias(view, qualifier):
+				Some(module_path):
+					match bound_module_graph_find_canonical_path(bound_graph, module_path):
+						Some(owner):
+							Ok(owner)
+						None:
+							Err(TraitQualifierModuleMissing(module_path))
+				None:
+					Err(TraitQualifierNotImported(qualifier))
+
+
+private pure func trait_in_alias_module(
+	declaration_graph: DeclarationSkeletonGraph,
+	module: BoundModule,
+	owner: BoundModule,
+	alias_name: String,
+	name: String,
+) -> Result[TraitId, TraitReferenceFailure]:
+	match declaration_skeleton_graph_find_trait(
+		declaration_graph,
+		bound_module_scope(owner),
+		name,
+	):
+		None:
+			Err(TraitNotDeclaredInModule(alias_name))
+		Some(info):
+			if (
+				info.visibility == PrivateDeclaration
+				and not prepared_module_scopes_select_same_module(
+					bound_module_scope(module),
+					bound_module_scope(owner),
+				)
+			):
+				Err(TraitIsPrivateInModule(alias_name))
+			else:
+				Ok(info.id)
+
+
+---
+The tail of an unknown-bound or unknown-supertrait diagnostic for `reference`;
+a qualified reference also says why it failed, with a help line that names the
+fix.
+---
+pure func trait_reference_failure_text(
+	role: TraitReferenceRole,
+	reference: ParsedTraitReference,
+	failure: TraitReferenceFailure,
+) -> String:
+	failure_tail(role, parsed_trait_reference_text(reference), reference.name.text, failure)
+
+
+---
+`trait_reference_failure_text` for a phase that renders identifiers by id
+through `spellings`.
+---
+pure func trait_reference_failure_text_spelled(
+	role: TraitReferenceRole,
+	spellings: IdentifierSpellings,
+	reference: ParsedTraitReference,
+	failure: TraitReferenceFailure,
+) -> String:
+	failure_tail(
+		role,
+		parsed_trait_reference_spelling(spellings, reference),
+		identifier_spelling(spellings, reference.name.name, reference.name.text),
+		failure,
+	)
+
+
+private pure func failure_tail(
+	role: TraitReferenceRole,
+	written: String,
+	trait_name: String,
+	failure: TraitReferenceFailure,
+) -> String:
+	match failure:
+		TraitNameNotVisible:
+			"unknown " + trait_reference_role_text(role) + " '" + written + "'"
+		TraitQualifierNotImported(qualifier):
+			"unknown " + trait_reference_role_text(role) + " '" + written + "': no module is imported as '" + qualifier + "'\nhelp: import the module under that name, for example `my_module as " + qualifier + "` in an `import:` block"
+		TraitQualifierModuleMissing(module_path):
+			"unknown " + trait_reference_role_text(role) + " '" + written + "': the module '" + module_path + "' is not part of this program\nhelp: check the module path in the import"
+		TraitNotDeclaredInModule(alias_name):
+			"unknown " + trait_reference_role_text(role) + " '" + written + "': the module imported as '" + alias_name + "' declares no trait named '" + trait_name + "'\nhelp: check the spelling, or declare `trait " + trait_name + "` in that module"
+		TraitIsPrivateInModule(alias_name):
+			"unknown " + trait_reference_role_text(role) + " '" + written + "': trait '" + trait_name + "' is private to the module imported as '" + alias_name + "'\nhelp: remove `private` from the trait declaration to use it from other modules"
