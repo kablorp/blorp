@@ -23964,6 +23964,229 @@ pure func cancelling_let_bytes_alias_return_function() -> CoreFunction:
 	}
 
 
+---
+The moved-reference fixtures are source-shaped Core: the emit helper runs
+Perceus, which adds the `DUP`s and `DROP`s. `payload` is an owned String
+local, `peek` borrows a String after the cancellation point to keep `payload`
+live, and `Picked` takes its operand over.
+---
+pure func moved_reference_string_var(name: String) -> CoreExpr:
+	VarExpr(named_var(name), string_type(), synthetic_core_source_loc())
+
+
+pure func moved_reference_owned_payload_let(body: CoreExpr) -> CoreExpr:
+	LetExpr(named_var("payload"), False, string_type(), moved_reference_string_var("input"), body)
+
+
+--- A cancellation point, then `rest`.
+pure func moved_reference_sleep_then(rest: CoreExpr) -> CoreExpr:
+	SeqExpr(
+		CallExpr(
+			direct_runtime_call_kind("blorp_sleep"),
+			VarExpr(named_var("blorp_sleep"), closure_type(), synthetic_core_source_loc()),
+			[LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc())],
+			VoidType,
+			synthetic_core_source_loc(),
+		),
+		rest,
+	)
+
+
+--- `peek(payload)`, then `rest`.
+pure func moved_reference_peek_payload_then(rest: CoreExpr) -> CoreExpr:
+	SeqExpr(
+		CallExpr(
+			UserCall("moved_reference_peek", Some(1424), []),
+			VarExpr(named_var("moved_reference_peek"), closure_type(), synthetic_core_source_loc()),
+			[moved_reference_string_var("payload")],
+			int_type(),
+			synthetic_core_source_loc(),
+		),
+		rest,
+	)
+
+
+pure func moved_reference_peek_function() -> CoreFunction:
+	{
+		name = "moved_reference_peek",
+		source_module = None,
+		type_params = [],
+		params = [string_param("text")],
+		return_type = int_type(),
+		body = Some(LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc())),
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 1424,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func moved_reference_picked_payload() -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = "Choice__mono_String",
+			constructor_name = "Picked",
+			variant = VariantById(144),
+			representation = GenericUnionRepresentation,
+			payload_storage = TypedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			-- Source-shaped Core hands the operand to the constructor, as a
+			-- constructor call does before lowering.
+			args = [
+				{
+					kind = PointerBox,
+					value = moved_reference_string_var("payload"),
+					needs_release = True,
+					transfers_ownership = True
+				},
+			]
+		},
+		choice_string_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+pure func moved_reference_let(name: String, typ: CoreType, rhs: CoreExpr, body: CoreExpr) -> CoreExpr:
+	LetExpr(named_var(name), False, typ, rhs, body)
+
+
+pure func moved_reference_function(
+	name: String,
+	def_id: Int,
+	return_type: CoreType,
+	body: CoreExpr,
+) -> CoreFunction:
+	{
+		name = name,
+		source_module = None,
+		type_params = [],
+		params = [string_param("input")],
+		return_type = return_type,
+		body = Some(body),
+		is_pure = False,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = def_id,
+		loc = synthetic_core_source_loc()
+	}
+
+
+---
+`alias` takes a reference to `payload` while `payload` stays live across the
+cancellation point:
+
+    payload = input
+    alias = payload
+    sleep(0)
+    peek(payload)
+    alias
+---
+pure func moved_reference_dup_alias_function() -> CoreFunction:
+	moved_reference_function(
+		"moved_reference_dup_alias",
+		1420,
+		string_type(),
+		moved_reference_owned_payload_let(
+			moved_reference_let(
+				"alias",
+				string_type(),
+				moved_reference_string_var("payload"),
+				moved_reference_sleep_then(
+					moved_reference_peek_payload_then(moved_reference_string_var("alias")),
+				),
+			),
+		),
+	)
+
+
+---
+`alias` takes `payload`'s own reference after an earlier cancellation point,
+so `payload`'s cleanup slot is armed when the reference moves:
+
+    payload = input
+    sleep(0)
+    alias = payload
+    sleep(0)
+    alias
+---
+pure func moved_reference_alias_after_suspension_function() -> CoreFunction:
+	moved_reference_function(
+		"moved_reference_alias_after_suspension",
+		1421,
+		string_type(),
+		moved_reference_owned_payload_let(
+			moved_reference_sleep_then(
+				moved_reference_let(
+					"alias",
+					string_type(),
+					moved_reference_string_var("payload"),
+					moved_reference_sleep_then(moved_reference_string_var("alias")),
+				),
+			),
+		),
+	)
+
+
+---
+A constructor takes a reference to `payload` while `payload` stays live
+across the cancellation point:
+
+    payload = input
+    held = Picked(payload)
+    sleep(0)
+    peek(payload)
+    held
+---
+pure func moved_reference_constructor_kept_function() -> CoreFunction:
+	moved_reference_function(
+		"moved_reference_constructor_kept",
+		1422,
+		choice_string_type(),
+		moved_reference_owned_payload_let(
+			moved_reference_let(
+				"held",
+				choice_string_type(),
+				moved_reference_picked_payload(),
+				moved_reference_sleep_then(
+					moved_reference_peek_payload_then(
+						VarExpr(named_var("held"), choice_string_type(), synthetic_core_source_loc()),
+					),
+				),
+			),
+		),
+	)
+
+
+---
+A constructor takes `payload`'s own reference before any cancellation point:
+
+    payload = input
+    held = Picked(payload)
+    sleep(0)
+    held
+---
+pure func moved_reference_constructor_before_suspension_function() -> CoreFunction:
+	moved_reference_function(
+		"moved_reference_constructor_before_suspension",
+		1423,
+		choice_string_type(),
+		moved_reference_owned_payload_let(
+			moved_reference_let(
+				"held",
+				choice_string_type(),
+				moved_reference_picked_payload(),
+				moved_reference_sleep_then(
+					VarExpr(named_var("held"), choice_string_type(), synthetic_core_source_loc()),
+				),
+			),
+		),
+	)
+
+
 pure func consume_bytes_function() -> CoreFunction:
 	payload_param: CoreParam = bytes_param("payload")
 	payload_var: CoreVar = named_var("payload")
@@ -26410,6 +26633,130 @@ pure func test_emit_cancelling_let_alias_return_tracks_only_the_alias() -> Bool:
 		and not artifact.c_code.contains("__blorp_cleanup_payload")
 		and not artifact.c_code.contains("blorp_retain(payload);")
 		and not artifact.c_code.contains("blorp_release(payload);")
+	)
+
+
+pure func emitted_in_order(c_code: String, earlier: String, later: String) -> Bool:
+	match (c_code.index_of(earlier), c_code.index_of(later)):
+		(Some(earlier_index), Some(later_index)):
+			earlier_index < later_index
+		_:
+			False
+
+
+pure func emit_moved_reference_program(function_info: CoreFunction) -> CArtifact:
+	emit_source_spelled_c_artifact({
+		decls = [
+			UnionDecl(choice_string_union_decl()),
+			FunctionDecl(moved_reference_peek_function()),
+			FunctionDecl(function_info),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+
+---
+`let alias = DUP payload; payload` across a cancellation point. The `DUP`
+counts the copy against `payload`'s slot, and `alias` gets a slot of its own,
+so `payload`'s slot must give that unit back where `alias` takes it. Without
+the pop, cancellation releases the copy through both slots: one reference,
+three releases. The slot balances: one push and one duplicate, two pops.
+---
+pure func test_emit_moved_reference_dup_alias_gives_back_source_unit() -> Bool:
+	artifact: CArtifact = emit_moved_reference_program(moved_reference_dup_alias_function())
+	code: String = artifact.c_code
+	payload_pop: String = "blorp_task_cleanup_pop_slot_with_task(&payload, __blorp_task);"
+
+	(
+		code.count("blorp_task_cleanup_push_with_task(&__blorp_cleanup_payload, &payload,") == 1
+		and code.count("blorp_task_cleanup_duplicate_slot_with_task(&payload, __blorp_task);") == 1
+		and code.count(payload_pop) == 2
+		and emitted_in_order(
+			code,
+			"blorp_task_cleanup_duplicate_slot_with_task(&payload, __blorp_task);",
+			payload_pop,
+		)
+		and emitted_in_order(
+			code,
+			payload_pop,
+			"blorp_task_cleanup_push_with_task(&__blorp_cleanup_alias, &alias,",
+		)
+		and emitted_in_order(
+			code,
+			"blorp_task_cleanup_push_with_task(&__blorp_cleanup_alias, &alias,",
+			"blorp_sleep(0)",
+		)
+	)
+
+
+---
+`let alias = payload` after a cancellation point moves `payload`'s own
+reference while its slot is armed; the slot is popped before `alias` pushes.
+---
+pure func test_emit_moved_reference_alias_after_suspension_pops_source() -> Bool:
+	artifact: CArtifact = emit_moved_reference_program(
+		moved_reference_alias_after_suspension_function(),
+	)
+	code: String = artifact.c_code
+	payload_pop: String = "blorp_task_cleanup_pop_slot_with_task(&payload, __blorp_task);"
+
+	(
+		code.count("blorp_task_cleanup_push_with_task(&__blorp_cleanup_payload, &payload,") == 1
+		and code.count(payload_pop) == 1
+		and code.contains("blorp_String* alias = payload;")
+		and emitted_in_order(code, "blorp_String* alias = payload;", payload_pop)
+		and emitted_in_order(
+			code,
+			payload_pop,
+			"blorp_task_cleanup_push_with_task(&__blorp_cleanup_alias, &alias,",
+		)
+	)
+
+
+---
+`Picked(payload)` stores `payload` without a retain, so the constructed value
+owns that reference. `payload`'s slot gives it up right after construction,
+before `held` pushes its own slot; otherwise cancellation releases it once
+through `payload` and again through `held`. The slot balances: one push and
+one duplicate, two pops (after construction and at the final release).
+---
+pure func test_emit_moved_reference_constructor_pops_source_after_building() -> Bool:
+	artifact: CArtifact = emit_moved_reference_program(
+		moved_reference_constructor_kept_function(),
+	)
+	code: String = artifact.c_code
+	payload_pop: String = "blorp_task_cleanup_pop_slot_with_task(&payload, __blorp_task);"
+
+	(
+		code.count("blorp_task_cleanup_push_with_task(&__blorp_cleanup_payload, &payload,") == 1
+		and code.count("blorp_task_cleanup_duplicate_slot_with_task(&payload, __blorp_task);") == 1
+		and code.count(payload_pop) == 2
+		and emitted_in_order(code, "__moved_construct = __def_144_Picked(payload);", payload_pop)
+		and emitted_in_order(
+			code,
+			payload_pop,
+			"blorp_task_cleanup_push_with_task(&__blorp_cleanup_held, &held,",
+		)
+	)
+
+
+---
+A constructor that takes `payload`'s own reference before any cancellation
+point ends `payload`'s ownership there, so `payload` needs no slot at all and
+only `held` is tracked across the sleep.
+---
+pure func test_emit_moved_reference_constructor_before_suspension_tracks_only_result() -> Bool:
+	artifact: CArtifact = emit_moved_reference_program(
+		moved_reference_constructor_before_suspension_function(),
+	)
+	code: String = artifact.c_code
+
+	(
+		not code.contains("__blorp_cleanup_payload")
+		and not code.contains("blorp_task_cleanup_pop_slot_with_task(&payload,")
+		and not code.contains("__moved_construct")
+		and code.contains("blorp_task_cleanup_push_with_task(&__blorp_cleanup_held, &held,")
 	)
 
 
@@ -28950,6 +29297,22 @@ tests: TestSuite = {
 		(
 			"emit cancelling let alias return tracks only the alias",
 			test_emit_cancelling_let_alias_return_tracks_only_the_alias,
+		),
+		(
+			"emit moved reference dup alias gives back the source unit",
+			test_emit_moved_reference_dup_alias_gives_back_source_unit,
+		),
+		(
+			"emit moved reference alias after suspension pops the source",
+			test_emit_moved_reference_alias_after_suspension_pops_source,
+		),
+		(
+			"emit moved reference constructor pops the source after building",
+			test_emit_moved_reference_constructor_pops_source_after_building,
+		),
+		(
+			"emit moved reference constructor before suspension tracks only the result",
+			test_emit_moved_reference_constructor_before_suspension_tracks_only_result,
 		),
 		("emit let user call transfers owned bytes", test_emit_let_user_call_transfers_owned_bytes),
 		(

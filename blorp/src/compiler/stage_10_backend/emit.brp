@@ -48,8 +48,10 @@ import:
 		cancellation_backend_temporary_candidate,
 		cancellation_call_consumed_arg_indices,
 		cancellation_cleanup_action_for_release_policy,
+		cancellation_construct_transferred_operands,
 		cancellation_let_protection,
 		cancellation_match_scrutinee_protection,
+		cancellation_moved_operand_var,
 		cancellation_plan_requires_local_owner_protection,
 		cancellation_variable_push_is_recorded,
 		cancellation_variable_requires_protection,
@@ -13652,6 +13654,124 @@ pure func variable_has_cleanup_slot(variable: CoreVar) -> Bool:
 	variable.def_id.is_none()
 
 
+---
+Pops one unit from a tracked variable's cleanup slot where a moving position
+takes one of its references: a `let` whose right-hand side is the variable
+(or `DUP v; v`), or an operand a constructor takes over. Without it the slot
+and the new owner would both release that reference on cancellation. The pop
+is unconditional on the receiver: a mutable `var x = v` has no slot of its
+own, but leaving the unit on `v` would release it again after `x` has
+consumed or replaced it. `cancellation_variable_requires_protection` already
+answers False when the activation protects no locals, and
+`owned_temp_cleanup_pop_statement` emits nothing for a type without a
+cleanup release function, as in `call_arg_requires_transfer_cleanup_pop`.
+---
+private pure func moved_operand_cleanup_pop_statement(
+	operand: CoreExpr,
+	emission_context: FunctionEmissionContext,
+) -> String:
+	match cancellation_moved_operand_var(operand):
+		Some(variable):
+			policy: CoreReleasePolicy = CoreTypePolicy.cleanup_release_policy_for_type(
+				core_expr_type(operand),
+			)
+
+			if (
+				variable_has_cleanup_slot(variable)
+				and cancellation_variable_requires_protection(
+					emission_context.cleanup_plan,
+					variable,
+				)
+			):
+				owned_temp_cleanup_pop_statement(
+					emission_context.indent,
+					c_var_name(variable),
+					policy,
+				)
+			else:
+				""
+		None:
+			""
+
+
+---
+The pops for the operands a construction or record update takes over (see
+`cancellation_construct_transferred_operands`). They run after the
+constructor: until it runs the operands are still being evaluated and each
+variable still owns its reference, and building the value cannot suspend, so
+no cancellation falls between the move and the pop.
+---
+private pure func construct_transfer_cleanup_pop_statements(
+	expr: CoreExpr,
+	emission_context: FunctionEmissionContext,
+) -> String:
+	if not activation_requires_local_owner_protection(emission_context):
+		""
+	else:
+		var statements: String = ""
+
+		for operand in cancellation_construct_transferred_operands(expr):
+			statements += moved_operand_cleanup_pop_statement(operand, emission_context)
+
+		statements
+
+
+private CONSTRUCT_TRANSFER_RESULT: String = "__moved_construct"
+
+
+--- Expression form of `construct_body_with_transfer_cleanup_pops`.
+private pure func construct_value_with_transfer_cleanup_pops(
+	expr: CoreExpr,
+	value_c: String,
+	emission_context: FunctionEmissionContext,
+) -> String:
+	pops: String = construct_transfer_cleanup_pop_statements(expr, emission_context)
+
+	if pops == "":
+		value_c
+	else:
+		c_type: String = TypeLayout.c_type_name(
+			core_expr_type(expr),
+			selected_type_symbol_lookup(emission_context.symbol_authority),
+		)
+		"({ " + c_type + " " + CONSTRUCT_TRANSFER_RESULT + " = " + value_c + ";\n" + pops + emission_context.indent + CONSTRUCT_TRANSFER_RESULT + "; })"
+
+
+private pure func construct_body_with_transfer_cleanup_pops(
+	expr: CoreExpr,
+	body: FunctionBodyC,
+	emission_context: FunctionEmissionContext,
+) -> FunctionBodyC:
+	pops: String = construct_transfer_cleanup_pop_statements(expr, emission_context)
+
+	if pops == "" or body.returns:
+		body
+	else:
+		result_name: String = temp_name(
+			"moved_construct",
+			body.next_temp,
+			emission_context.compact,
+		)
+		var statements: String = body.statements
+		statements += emission_context.indent
+		statements += TypeLayout.c_type_name(
+			core_expr_type(expr),
+			selected_type_symbol_lookup(emission_context.symbol_authority),
+		)
+		statements += " "
+		statements += result_name
+		statements += " = "
+		statements += body.value
+		statements += ";\n"
+		statements += pops
+		{
+			statements = statements,
+			value = result_name,
+			next_temp = body.next_temp + 1,
+			returns = False
+		}
+
+
 private pure func call_arg_transfer_cleanup_pop_statement(
 	arg: CoreExpr,
 	emission_context: FunctionEmissionContext,
@@ -14555,11 +14675,14 @@ private pure func emit_simple_expr_leaf(
 		RecordCowUpdateExpr(source, fields, typ, loc):
 			None
 		RecordConstructExpr(type_name, fields, typ, loc):
-			emit_record_construct(type_name, fields, emission_context)
+			value ?= emit_record_construct(type_name, fields, emission_context)
+			Some(construct_value_with_transfer_cleanup_pops(expr, value, emission_context))
 		UnionConstructExpr(construct, typ, loc):
-			emit_union_construct(construct, emission_context)
+			value ?= emit_union_construct(construct, emission_context)
+			Some(construct_value_with_transfer_cleanup_pops(expr, value, emission_context))
 		UnionReuseConstructExpr(construct, typ, loc):
-			emit_union_reuse_construct(construct, emission_context)
+			value ?= emit_union_reuse_construct(construct, emission_context)
+			Some(construct_value_with_transfer_cleanup_pops(expr, value, emission_context))
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			body_c ?= emit_simple_expr(body, emission_context)
 			dup_statement ?= emit_dup_statement(
@@ -14794,7 +14917,10 @@ private pure func emit_tailrec_tail(
 						emission_context.indent + TypeLayout.c_type_name(
 							typ,
 							selected_type_symbol_lookup(emission_context.symbol_authority),
-						) + " " + c_var_name(name) + " = " + rhs_c + ";\n" + body_c.statements,
+						) + " " + c_var_name(name) + " = " + rhs_c + ";\n" + moved_operand_cleanup_pop_statement(
+							rhs,
+							emission_context,
+						) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -15691,7 +15817,10 @@ private pure func emit_tailrec_list_spread_tail(
 				body_c ?= emit_tailrec_list_spread_tail(loop, body, next_temp, emission_context)
 				Some(
 					terminal_body(
-						emission_context.indent + decl + ";\n" + body_c.statements,
+						emission_context.indent + decl + ";\n" + moved_operand_cleanup_pop_statement(
+							rhs,
+							emission_context,
+						) + body_c.statements,
 						body_c.next_temp,
 					),
 				)
@@ -22086,6 +22215,10 @@ private pure func emit_bound_let_body(
 	else:
 		""
 
+	-- `let x = v` and `let x = DUP v; v` move a reference out of `v`; its slot
+	-- gives it up before `x` takes it over.
+	alias_pop: String = moved_operand_cleanup_pop_statement(rhs, emission_context)
+
 	cleaned_body: FunctionBodyC = apply_let_cleanup_to_body(
 		emission_context.indent,
 		body,
@@ -22101,7 +22234,7 @@ private pure func emit_bound_let_body(
 			selected_type_symbol_lookup(emission_context.symbol_authority),
 		) + " " + c_var_name(
 			name,
-		) + " = " + rendered_rhs + ";\n" + cleanup_push + cleaned_body.statements,
+		) + " = " + rendered_rhs + ";\n" + alias_pop + cleanup_push + cleaned_body.statements,
 		value = cleaned_body.value,
 		next_temp = cleaned_body.next_temp,
 		returns = cleaned_body.returns,
@@ -22627,30 +22760,38 @@ private pure func emit_function_body(
 		RecordUpdateExpr(base, fields, typ, loc):
 			None
 		RecordReuseExpr(source, fields, typ, loc):
-			emit_record_reuse_body(source, fields, typ, next_temp, emission_context)
+			body ?= emit_record_reuse_body(source, fields, typ, next_temp, emission_context)
+			Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		RecordCowUpdateExpr(source, fields, typ, loc):
-			emit_record_cow_update_body(source, fields, typ, next_temp, emission_context)
+			body ?= emit_record_cow_update_body(source, fields, typ, next_temp, emission_context)
+			Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		RecordConstructExpr(type_name, fields, typ, loc):
+			-- The simple form already carries its transfer pops; only the
+			-- statement fallbacks add them here.
 			match emit_simple_expr(expr, emission_context):
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
-					emit_record_construct_body(type_name, fields, typ, next_temp, emission_context)
+					body ?= emit_record_construct_body(type_name, fields, typ, next_temp, emission_context)
+					Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		UnionConstructExpr(construct, typ, loc):
 			if construct.args.length() > 1:
-				emit_union_construct_body(construct, next_temp, emission_context)
+				body ?= emit_union_construct_body(construct, next_temp, emission_context)
+				Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 			else:
 				match emit_simple_expr(expr, emission_context):
 					Some(value):
 						Some(body_value(value, next_temp))
 					None:
-						emit_union_construct_body(construct, next_temp, emission_context)
+						body ?= emit_union_construct_body(construct, next_temp, emission_context)
+						Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		UnionReuseConstructExpr(construct, typ, loc):
 			match emit_simple_expr(expr, emission_context):
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
-					emit_union_reuse_construct_body(construct, next_temp, emission_context)
+					body ?= emit_union_reuse_construct_body(construct, next_temp, emission_context)
+					Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
 			retain_statement ?= emit_dup_statement(variable, retain_policy, emission_context)
 			body_c ?= emit_function_body(body, next_temp, emission_context)

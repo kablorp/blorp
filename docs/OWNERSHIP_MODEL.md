@@ -161,6 +161,24 @@ Storage places own managed values unless the place is explicitly borrowed.
 An emitter-created managed temporary is still an owner. The backend must close
 its lifetime explicitly or reject the unsupported shape.
 
+### Cancellation Cleanup Slots
+
+A managed local that may be live when its task is cancelled gets a cleanup
+slot (`blorp_task_cleanup_push`) holding a count of references to release if
+cancellation unwinds past it. A `DUP` of the local adds one
+(`blorp_task_cleanup_duplicate_slot`), and every place that takes one of the
+local's references away pops one (`blorp_task_cleanup_pop_slot`): its `DROP`,
+a consuming call argument, a `let` or `var` whose right-hand side is the
+local (or `DUP v; v`), an operand that a union or record constructor takes
+over, and the source or a replacement of a record update or reuse
+construction. The pop runs before the new owner pushes its own slot, so each
+reference is counted by exactly one slot, and it runs even when the new owner
+is an untracked `var`: a unit left behind would be released again after the
+`var` has consumed or replaced the reference. The planner (`stage_09_core/cancellation_plan.brp`)
+gives a local no slot at all when its own reference is handed on before any
+cancellation point; a move under a `DUP` of the same local does not count,
+because the local keeps its own reference.
+
 ## COW ABI
 
 COW update operations consume one receiver owner and return one result owner:

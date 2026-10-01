@@ -50,6 +50,108 @@ func cancelled_task_with_managed_locals() -> Int:
 	values.length()
 
 
+-- Shapes that move a managed local's reference to a new owner and are then
+-- cancelled while parked. Each reference must be released exactly once by
+-- cancellation cleanup: the moved-from local's cleanup slot gives up the
+-- reference where the new owner takes it. Under ASan a second release is a
+-- heap-use-after-free; the leak counters cannot see it.
+record MovedTables {
+	rows: List[Int],
+	other: List[Int]
+}
+
+
+record MovedWrapper {
+	inner: MovedTables,
+	tag: Int
+}
+
+
+union MovedHolder:
+	MovedHolding(MovedTables)
+	MovedEmpty
+
+
+pure func moved_tables(seed: Int) -> MovedTables:
+	{
+		rows = [seed],
+		other = [seed + 1]
+	}
+
+
+pure func moved_holder_rows(holder: MovedHolder) -> Int:
+	match holder:
+		MovedHolding(inner):
+			inner.rows.length()
+		MovedEmpty:
+			0
+
+
+-- A second name keeps the reference while the first is read again later.
+func alias_kept_across_cancelled_sleep(seed: Int) -> Int:
+	made: MovedTables = moved_tables(seed)
+	same: MovedTables = made
+	sleep(10000)
+	same.rows.length() + made.other.length()
+
+
+-- The alias is taken after an earlier suspension, so the first name's
+-- cleanup slot is still armed when the reference moves.
+func alias_after_sleep_then_cancelled(seed: Int) -> Int:
+	made: MovedTables = moved_tables(seed)
+	sleep(1)
+	same: MovedTables = made
+	sleep(10000)
+	same.rows.length()
+
+
+-- A constructor takes the reference while the local stays readable.
+func constructor_kept_across_cancelled_sleep(seed: Int) -> Int:
+	base: MovedTables = moved_tables(seed)
+	held: MovedHolder = MovedHolding(base)
+	sleep(10000)
+	moved_holder_rows(held) + base.rows.length()
+
+
+func sleep_then_holder_rows(holder: MovedHolder) -> Int:
+	sleep(10000)
+	moved_holder_rows(holder)
+
+
+-- The constructor consumes the local and the callee is cancelled.
+func constructor_into_cancelled_call(seed: Int) -> Int:
+	base: MovedTables = moved_tables(seed)
+	sleep_then_holder_rows(MovedHolding(base))
+
+
+-- A mutable local takes the reference while the first name stays readable.
+func var_alias_kept_across_cancelled_sleep(seed: Int) -> Int:
+	made: MovedTables = moved_tables(seed)
+	var slot: MovedTables = made
+	sleep(10000)
+	slot.rows.length() + made.rows.length()
+
+
+-- The mutable local replaces the moved reference before the suspension.
+func var_alias_replaced_before_cancelled_sleep(seed: Int) -> Int:
+	made: MovedTables = moved_tables(seed)
+	var slot: MovedTables = made
+	slot = { slot | rows = slot.rows.append(seed) }
+	sleep(10000)
+	slot.rows.length() + made.rows.length()
+
+
+-- A record field takes the reference while the local stays readable.
+func record_field_kept_across_cancelled_sleep(seed: Int) -> Int:
+	base: MovedTables = moved_tables(seed)
+	wrapped: MovedWrapper = {
+		inner = base,
+		tag = seed
+	}
+	sleep(10000)
+	wrapped.inner.rows.length() + base.rows.length()
+
+
 func count_infinite_stream() -> Int:
 	count(repeat(1))
 
@@ -316,6 +418,32 @@ func test_timeout_releases_cancelled_locals() -> Bool:
 	timed_out and stats.current_objects < 12
 
 
+func test_timeout_releases_moved_references_once() -> Bool:
+	reset_mem_stats()
+
+	concurrent(timeout: 10):
+		alias_kept = alias_kept_across_cancelled_sleep(1)
+		alias_after = alias_after_sleep_then_cancelled(2)
+		constructor_kept = constructor_kept_across_cancelled_sleep(3)
+		constructor_call = constructor_into_cancelled_call(4)
+		record_field = record_field_kept_across_cancelled_sleep(5)
+		var_alias = var_alias_kept_across_cancelled_sleep(6)
+		var_replaced = var_alias_replaced_before_cancelled_sleep(7)
+
+	all_timed_out: Bool = [
+		alias_kept.is_err(),
+		alias_after.is_err(),
+		constructor_kept.is_err(),
+		constructor_call.is_err(),
+		record_field.is_err(),
+		var_alias.is_err(),
+		var_replaced.is_err(),
+	].all(func(timed_out): timed_out)
+
+	stats: MemStats = get_mem_stats()
+	all_timed_out and stats.current_objects == 0
+
+
 func test_timeout_cancels_stream_count() -> Bool:
 	start: Int = now_microseconds()
 
@@ -433,6 +561,10 @@ tests: TestSuite = {
 		("fast and slow tasks", test_fast_and_slow),
 		("timeout cancels late side effect", test_timeout_cancels_late_side_effect),
 		("timeout releases cancelled locals", test_timeout_releases_cancelled_locals),
+		(
+			"timeout releases moved references once",
+			test_timeout_releases_moved_references_once,
+		),
 		("timeout cancels stream count", test_timeout_cancels_stream_count),
 		("timeout cancels yield loop", test_timeout_cancels_yield_loop),
 		(
