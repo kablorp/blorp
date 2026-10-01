@@ -37,6 +37,7 @@ import:
 			CliPackageRunPack,
 			CliPackageRunVendorTarget,
 		),
+		CliHandledResult,
 		CliParsedSourceFile,
 		CliRunPlan(
 			CliRunCheck,
@@ -74,6 +75,61 @@ pure func graph_source_decl_count(source: FrontendModule) -> Int:
 
 pure func graph_source_diagnostic_count(source: FrontendModule) -> Int:
 	finalized_typecheck_program_ast(source.program).diagnostics.length()
+
+
+---
+Whether the discovery stage is the front end these tests run under
+(`BLORP_FRONT_END=stage`). The two front ends report a parse failure in
+different places: the existing parser leaves the diagnostics in the failing
+module of the graph, and the stage rejects the compilation before any graph
+exists, so the command prints them and is handled.
+---
+func stage_front_end_selected() -> Bool:
+	getenv("BLORP_FRONT_END") == Some("stage")
+
+
+---
+Whether root `index` of `graph` is the module at `path` named `module_name` and
+holds parse diagnostics: how the existing parser reports a parse failure.
+---
+func graph_root_holds_parse_failure(
+	graph: FrontendCompilationGraph,
+	index: Int,
+	path: String,
+	module_name: String,
+) -> Bool:
+	match frontend_graph_root_modules(graph.graph).get(index):
+		Some(source):
+			(
+				graph_module_path(source) == path
+				and graph_module_name(source) == module_name
+				and graph_source_diagnostic_count(source) > 0
+			)
+		None:
+			False
+
+
+---
+Whether a command the stage rejected failed and printed an error located in the
+file at `path`: how the discovery stage reports a parse failure, before any
+graph exists.
+---
+func handled_result_prints_parse_failure(result: CliHandledResult, path: String) -> Bool:
+	(
+		result.status != 0
+		and (result.stdout + result.stderr).contains("${path}:")
+		and (result.stdout + result.stderr).contains("error:")
+	)
+
+
+---
+Writes the modules every compilation loads from the standard library (the
+implicit modules the stage requires), empty, into `std_dir`: a configured
+standard-library directory that lacks them is a broken installation, which the
+stage reports and the existing discovery tolerated.
+---
+func write_implicit_std_modules(std_dir: String) -> Bool:
+	write_text_ok(std_dir + "/prelude.brp", "") and write_text_ok(std_dir + "/tuple.brp", "")
 
 
 pure func graph_module_path(source: FrontendModule) -> String:
@@ -375,7 +431,7 @@ private func configured_std_origin_case(std_dir: String) -> Bool:
 	std_action: CliAction = source_graph_test_check_action_with_std(std_path, std_dir)
 	user_action: CliAction = source_graph_test_check_action_with_std(user_path, std_dir)
 
-	if not write_text_ok(std_path, ""):
+	if not (write_text_ok(std_path, "") and write_implicit_std_modules(std_dir)):
 		False
 	else:
 		configured_std_ok: Bool = match graph_for_check_roots(std_action, [std_source]):
@@ -415,7 +471,7 @@ private func graph_names_configured_std_root_case(std_dir: String) -> Bool:
 	std_path: String = std_dir + "/constants.brp"
 	action: CliAction = source_graph_test_check_action_with_std(std_path, std_dir)
 
-	if not write_text_ok(std_path, "ANSWER: Int = 42"):
+	if not (write_text_ok(std_path, "ANSWER: Int = 42") and write_implicit_std_modules(std_dir)):
 		False
 	else:
 		match graph_for_check_roots(
@@ -886,19 +942,14 @@ func test_run_cli_frontend_graph_preserves_parse_diagnostics() -> Bool:
 
 				roots = frontend_graph_root_modules(graph.graph)
 
-				failing_source_ok: Bool = match roots.get(1):
-					Some(source):
-						(
-							graph_module_path(source) == second_path
-							and graph_module_name(source) == "blorp_cli_check_diag_b"
-							and graph_source_diagnostic_count(source) > 0
-						)
-					None:
-						False
-
-				roots.length() == 2 and failing_source_ok
-			CliRunHandled(_):
-				False
+				not stage_front_end_selected() and roots.length() == 2 and graph_root_holds_parse_failure(
+					graph,
+					1,
+					second_path,
+					"blorp_cli_check_diag_b",
+				)
+			CliRunHandled(result):
+				stage_front_end_selected() and handled_result_prints_parse_failure(result, second_path)
 			CliRunTest(_):
 				False
 			CliRunPurify(_):
@@ -2028,6 +2079,8 @@ func test_run_cli_discovers_pkg_root_source_graph() -> Bool:
 func cleanup_std_context_graph_project(root: String) -> Void:
 	_ = remove_file(root + "/app/main.brp")
 	_ = remove_file(root + "/blorp.toml")
+	_ = remove_file(root + "/custom_std/prelude.brp")
+	_ = remove_file(root + "/custom_std/tuple.brp")
 	_ = remove_dir(root + "/custom_std")
 	_ = remove_dir(root + "/app")
 	_ = remove_dir(root)
@@ -2052,6 +2105,7 @@ func test_run_cli_carries_config_std_context() -> Bool:
 		mkdir(root)
 		and mkdir(app_dir)
 		and mkdir(std_dir)
+		and write_implicit_std_modules(std_dir)
 		and write_text_ok(root + "/blorp.toml", config)
 		and write_text_ok(main_path, source)
 	)):
@@ -2224,23 +2278,14 @@ func test_run_cli_compile_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 
 		match plan:
 			CliRunCompile(compile_plan):
-				graph = compile_plan.graph
-
-				roots = frontend_graph_root_modules(graph.graph)
-
-				source_ok: Bool = match roots.get(0):
-					Some(source):
-						(
-							graph_module_path(source) == path
-							and graph_module_name(source) == "blorp_cli_compile_diag"
-							and graph_source_diagnostic_count(source) > 0
-						)
-					None:
-						False
-
-				roots.length() == 1 and source_ok
-			CliRunHandled(_):
-				False
+				not stage_front_end_selected() and graph_root_holds_parse_failure(
+					compile_plan.graph,
+					0,
+					path,
+					"blorp_cli_compile_diag",
+				)
+			CliRunHandled(result):
+				stage_front_end_selected() and handled_result_prints_parse_failure(result, path)
 			CliRunTest(_):
 				False
 			CliRunPurify(_):
@@ -2267,23 +2312,14 @@ func test_run_cli_run_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 
 		match plan:
 			CliRunSource(run_plan):
-				graph = run_plan.graph
-
-				roots = frontend_graph_root_modules(graph.graph)
-
-				source_ok: Bool = match roots.get(0):
-					Some(source):
-						(
-							graph_module_path(source) == path
-							and graph_module_name(source) == "blorp_cli_run_diag"
-							and graph_source_diagnostic_count(source) > 0
-						)
-					None:
-						False
-
-				roots.length() == 1 and source_ok
-			CliRunHandled(_):
-				False
+				not stage_front_end_selected() and graph_root_holds_parse_failure(
+					run_plan.graph,
+					0,
+					path,
+					"blorp_cli_run_diag",
+				)
+			CliRunHandled(result):
+				stage_front_end_selected() and handled_result_prints_parse_failure(result, path)
 			CliRunTest(_):
 				False
 			CliRunPurify(_):

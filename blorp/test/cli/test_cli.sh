@@ -261,11 +261,19 @@ $RUN_OUTPUT"
     fi
 }
 
-expect_output_exact() {
+# A parse-failure check that holds under both front ends. With the existing front
+# end the whole output must equal `expected_output` exactly. With the stage on
+# (`BLORP_FRONT_END=stage`) the diagnostic lines, `help:` lines dropped, must equal
+# it, and the `help:` lines themselves must equal `expected_stage_help` (one per
+# diagnostic): the stage's teaching help is a user-facing feature, so it is pinned
+# here, not ignored (docs/DISCOVERY_TABLES_DESIGN.md, "Diagnostic text").
+expect_diagnostics_exact() {
     local name="$1"
     local expected_code="$2"
     local expected_output="$3"
-    shift 3
+    local expected_stage_help="$4"
+    local actual_output actual_help
+    shift 4
 
     TOTAL=$((TOTAL + 1))
     run_capture "" "$@"
@@ -273,13 +281,28 @@ expect_output_exact() {
     if [ "$RUN_CODE" -ne "$expected_code" ]; then
         record_fail "$name" "expected exit $expected_code, got $RUN_CODE
 $RUN_OUTPUT"
-    elif [ "$RUN_OUTPUT" = "$expected_output" ]; then
-        record_pass "$name"
-    else
-        record_fail "$name" "expected output:
+    elif [ "${BLORP_FRONT_END:-}" != "stage" ]; then
+        if [ "$RUN_OUTPUT" = "$expected_output" ]; then
+            record_pass "$name"
+        else
+            record_fail "$name" "expected output:
 $expected_output
 actual output:
 $RUN_OUTPUT"
+        fi
+    else
+        actual_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" || true)
+        actual_help=$(grep '^help: ' <<<"$RUN_OUTPUT" || true)
+        if [ "$actual_output" = "$expected_output" ] && [ "$actual_help" = "$expected_stage_help" ]; then
+            record_pass "$name"
+        else
+            record_fail "$name" "expected diagnostics:
+$expected_output
+expected help:
+$expected_stage_help
+actual output:
+$RUN_OUTPUT"
+        fi
     fi
 }
 
@@ -1512,20 +1535,27 @@ expect_exit "check directory failure" 1 "$BLORP_BIN" check --no-format "$check_d
 expect_output_contains "check empty directory" 1 "no .brp files found" \
     "$BLORP_BIN" check --no-format "$check_dir_empty"
 expect_exit "check type failure" 1 "$BLORP_BIN" check --no-format "$invalid_prog"
+missing_colon_help='help: a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`'
 # A parse error prints once, as `<location>: error: <message>`, with no
 # duplicated severity, no expected-token suffix, and no typechecker follow-on.
-expect_output_exact "check parse failure prints one diagnostic" 1 \
+# The stage adds a `help:` line per diagnostic, the existing parser none; both are pinned.
+expect_diagnostics_exact "check parse failure prints one diagnostic" 1 \
     "$parse_missing_colon_prog:3:9: error: expected \`:\` after if condition" \
+    "$missing_colon_help" \
     "$BLORP_BIN" check --no-format "$parse_missing_colon_prog"
 # The import graph spells a dependency path with "//" collapsed to "/".
 parse_two_modules_import_dir="$(printf '%s' "$parse_two_modules_dir" | sed 's#//#/#g')"
-expect_output_exact "check reports parse failures from the root and an import" 1 \
+expect_diagnostics_exact "check reports parse failures from the root and an import" 1 \
     "$parse_two_modules_dir/main.brp:6:9: error: expected \`:\` after if condition
 $parse_two_modules_import_dir/helper.brp:3:9: error: expected \`:\` after if condition" \
+    "$missing_colon_help
+$missing_colon_help" \
     "$BLORP_BIN" check --no-format "$parse_two_modules_dir/main.brp"
-expect_output_exact "check reports every independent parse failure" 1 \
+expect_diagnostics_exact "check reports every independent parse failure" 1 \
     "$parse_two_errors_prog:3:9: error: expected \`:\` after if condition
 $parse_two_errors_prog:8:9: error: expected \`:\` after if condition" \
+    "$missing_colon_help
+$missing_colon_help" \
     "$BLORP_BIN" check --no-format "$parse_two_errors_prog"
 expect_output_contains "compiler runtime is not importable from std" 1 \
 	"module 'compiler_runtime' is not loaded for import registration" \
@@ -1643,6 +1673,12 @@ printf 'import:\n\t./leaf\n\nfunc middle_value() -> Int:\n\tleaf_value() + 1\n' 
 printf 'func leaf_value() -> Int:\n\t41\n' > "$front_end_dir/chain/leaf.brp"
 printf 'import:\n\t./middle\n\nfunc main(args: List[String]) -> Int:\n\tmiddle_value() + "x"\n' \
     > "$front_end_dir/chain/top_type_error.brp"
+# A file named like a standard-library module is the user's mistake, reported as
+# the graph validation words it; it is not a defect of the stage's tables.
+mkdir -p "$front_end_dir/reserved"
+printf 'func main(args: List[String]) -> Int:\n\t0\n' > "$front_end_dir/reserved/debug.brp"
+expect_front_end_same "front end stage: a root named like a standard-library module is rejected the same way" \
+    "$BLORP_BIN" check --no-format "$front_end_dir/reserved/debug.brp"
 expect_front_end_same "front end stage: check a module chain" \
     "$BLORP_BIN" check --no-format "$front_end_dir/chain/top.brp"
 expect_front_end_same "front end stage: check a type error across a module chain" \
@@ -2120,8 +2156,9 @@ expect_output_contains "run cross-module program from a non-identifier path" 0 \
 if $run_deep_checks; then
 	expect_output_contains "compile parse failure" 1 'expected `)` after function parameters' \
 		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_invalid.c" "$parse_invalid_prog"
-	expect_output_exact "compile parse failure prints one diagnostic" 1 \
+	expect_diagnostics_exact "compile parse failure prints one diagnostic" 1 \
 		"$parse_missing_colon_prog:3:9: error: expected \`:\` after if condition" \
+		"$missing_colon_help" \
 		"$BLORP_BIN" compile --no-format -o "$TMPDIR_CLI/parse_missing_colon.c" "$parse_missing_colon_prog"
 	expect_exit "run type failure" 1 "$BLORP_BIN" run --no-format --timeout 5 "$invalid_prog"
 	expect_output_contains "run parse failure" 1 'expected `)` after function parameters' \

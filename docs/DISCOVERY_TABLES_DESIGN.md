@@ -1074,7 +1074,21 @@ What a user can see with the stage, beyond the listed help lines above:
 - **Internal errors.** A table invariant violation or an adapter error
   (`LegacyAdapterError`) is reported as `internal compiler error: ...` with the
   table, row and kind: it is a defect of the stage or the adapter, never the
-  program's.
+  program's. The one adapter outcome that is the program's, the graph
+  validation refusing it (a root named like a standard-library module, two
+  modules with one path), prints as the existing front end prints it, without
+  that prefix.
+- **Names from the working directory.** A module named by its path, a relative
+  import or a user module, takes the path from the working directory when the
+  file is under it, however the file was reached (`blorp test` names its roots
+  absolutely). Later passes key builtin modules on that spelling
+  (`blorp_src_lsp_lsp_stdio_transport__...`), so the front end passes the
+  convention to the adapter as `LegacyModuleNaming.path_module_name`.
+- **Fixtures under the stage.** `run_blorp_check_fixtures.py` checks a
+  should_fail fixture against its `EXPECT-DISCOVERY-TEXT` lines and the
+  position in its `EXPECT-DISCOVERY` pin when `BLORP_FRONT_END=stage`, and
+  against its `EXPECT-BLORP` lines otherwise; the CLI parse-failure checks
+  compare the diagnostic lines without the `help:` line.
 
 Superseded: `blorp test` discovery (`test/discovery.brp`) and doctest extraction
 (`test/doctest.brp`) still parse with the existing parser as tools, like the

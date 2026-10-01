@@ -342,6 +342,134 @@ class BlorpCheckFixtureRunnerTests(unittest.TestCase):
             # not read as one.
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def run_pinned_fixture(self, front_end: str | None, compiler_output: str) -> subprocess.CompletedProcess:
+        """Run one should_fail fixture that pins both front ends' wording."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fail_dir = root / "should_fail"
+            fail_dir.mkdir()
+            (fail_dir / "pinned.brp").write_text(
+                "-- RUN-BLORP-CHECK\n"
+                "-- EXPECT-BLORP: error: wanted; so fix it\n"
+                "-- EXPECT-BLORP-CONTAINS: :9:25: error:\n"
+                "-- EXPECT-BLORP-NOT-CONTAINS: unwanted\n"
+                "-- EXPECT-DISCOVERY: ExpectedColonDiagnostic 10:1\n"
+                "-- EXPECT-DISCOVERY-TEXT: error: wanted\n"
+                "-- EXPECT-DISCOVERY-TEXT: help: so fix it\n",
+                encoding="utf-8",
+            )
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                "#!/bin/sh\ncat <<'EOF'\n" + compiler_output + "\nEOF\nexit 1\n",
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+            env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            env.pop("BLORP_FRONT_END", None)
+            if front_end is not None:
+                env["BLORP_FRONT_END"] = front_end
+            return subprocess.run(
+                ["python3", str(RUNNER), "--blorp-bin", str(compiler), "--root", str(root)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+                check=False,
+            )
+
+    def test_stage_front_end_checks_the_pinned_discovery_text_and_position(self) -> None:
+        """With BLORP_FRONT_END=stage the stage's own pins (text and position)
+        replace the existing parser's `EXPECT-BLORP` lines, which describe the
+        other front end's wording and position."""
+        result = self.run_pinned_fixture(
+            "stage", "pinned.brp:10:1: error: wanted\nhelp: so fix it"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_stage_front_end_rejects_the_existing_wording(self) -> None:
+        result = self.run_pinned_fixture(
+            "stage", "pinned.brp:9:25: error: wanted; so fix it"
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("missing exact diagnostic: error: wanted", result.stdout)
+        self.assertIn("missing output substring: :10:1: error:", result.stdout)
+
+    def test_existing_front_end_still_checks_its_own_wording(self) -> None:
+        passing = self.run_pinned_fixture(
+            None, "pinned.brp:9:25: error: wanted; so fix it"
+        )
+        self.assertEqual(passing.returncode, 0, passing.stdout)
+        failing = self.run_pinned_fixture(
+            None, "pinned.brp:10:1: error: wanted\nhelp: so fix it"
+        )
+        self.assertEqual(failing.returncode, 1, failing.stdout)
+
+    def test_stage_front_end_keeps_not_contains_checks(self) -> None:
+        result = self.run_pinned_fixture(
+            "stage", "pinned.brp:10:1: error: wanted\nhelp: so fix it\nunwanted"
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("unexpected output substring: unwanted", result.stdout)
+
+    def test_stage_front_end_fails_a_fixture_whose_pin_has_no_position(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fail_dir = root / "should_fail"
+            fail_dir.mkdir()
+            (fail_dir / "unpositioned.brp").write_text(
+                "-- RUN-BLORP-CHECK\n"
+                "-- EXPECT-BLORP: error: wanted\n"
+                "-- EXPECT-DISCOVERY: rejected-by-the-stage\n"
+                "-- EXPECT-DISCOVERY-TEXT: error: wanted\n",
+                encoding="utf-8",
+            )
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'unpositioned.brp:1:1: error: wanted'\nexit 1\n",
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+            env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "BLORP_FRONT_END": "stage"}
+            result = subprocess.run(
+                ["python3", str(RUNNER), "--blorp-bin", str(compiler), "--root", str(root)],
+                cwd=REPO_ROOT, capture_output=True, text=True, timeout=10, env=env, check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("no `line:column`", result.stdout)
+
+    def test_stage_front_end_reports_how_many_fixtures_fall_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fail_dir = root / "should_fail"
+            fail_dir.mkdir()
+            (fail_dir / "pinned.brp").write_text(
+                "-- RUN-BLORP-CHECK\n-- EXPECT-DISCOVERY: X 1:1\n-- EXPECT-DISCOVERY-TEXT: error: wanted\n",
+                encoding="utf-8",
+            )
+            (fail_dir / "fallback.brp").write_text(
+                "-- RUN-BLORP-CHECK\n-- EXPECT: error: wanted\n", encoding="utf-8"
+            )
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True, exist_ok=True)
+            compiler.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'f.brp:1:1: error: wanted'\nexit 1\n", encoding="utf-8"
+            )
+            compiler.chmod(0o755)
+            env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "BLORP_FRONT_END": "stage"}
+            result = subprocess.run(
+                ["python3", str(RUNNER), "--blorp-bin", str(compiler), "--root", str(root)],
+                cwd=REPO_ROOT, capture_output=True, text=True, timeout=10, env=env, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(
+                "1 of 2 should_fail fixtures check the stage's pinned text and position; "
+                "1 fall back",
+                result.stdout,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

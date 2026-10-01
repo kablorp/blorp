@@ -35,8 +35,8 @@ import:
 		source_graph_setup_for_paths,
 	fs: create_directories, message, remove_directory_tree, write_text_atomic
 	io: print_error
-	path: join
-	system: now_microseconds, temp_dir
+	path: join, normalize
+	system: getcwd, now_microseconds, temp_dir
 	test: TestSuite
 
 
@@ -222,6 +222,98 @@ func test_both_front_ends_build_the_same_graph_for_a_root() -> Bool:
 			False
 
 
+--- The module names each front end gives the graph of a root at `root_path`
+--- whose text is `source_text`, existing front end first: `None` when either
+--- front end rejects it.
+private func module_names_of_both_front_ends(
+	root_path: String,
+	source_text: String,
+) -> Option[(List[String], List[String])]:
+	setup = source_graph_setup_for_paths(check_action(root_path), [root_path])
+	root: CliSourceFile = {
+		path = root_path,
+		module_name = "named_root",
+		source_text = source_text
+	}
+	existing = frontend_compilation_graph_for_root_paths(
+		{ setup | front_end = SelectedFrontEnd(ExistingDiscovery) },
+		[CliUnparsedRoot(root)],
+		CompilerOnly,
+	)
+	staged = frontend_compilation_graph_for_root_paths(
+		{ setup | front_end = SelectedFrontEnd(DiscoveryStage) },
+		[CliUnparsedRoot(root)],
+		CompilerOnly,
+	)
+
+	match (existing, staged):
+		(Ok(old), Ok(new)):
+			Some((module_names(old), module_names(new)))
+		_:
+			None
+
+
+private func names_agree_and_contain(
+	names: Option[(List[String], List[String])],
+	expected: String,
+) -> Bool:
+	match names:
+		Some((old, new)):
+			old == new and new.contains(expected)
+		None:
+			False
+
+
+--- A root named by an absolute path (as `blorp test` names its roots) imports a
+--- file by a relative path. Both front ends name that file by its path from the
+--- working directory, not by the absolute path: names such as
+--- `blorp_src_lsp_lsp_stdio_transport` are the spelling later passes key on.
+func test_both_front_ends_name_a_relatively_imported_module_by_its_working_directory_path() -> Bool:
+	root_path: String = getcwd() + "/blorp/test/lsp/server/test_lsp_stdio_transport.brp"
+	names_agree_and_contain(
+		module_names_of_both_front_ends(root_path, RELATIVE_IMPORT_SOURCE),
+		"blorp/src/lsp/lsp_stdio_transport",
+	)
+
+
+--- The same root named by a relative path gives the same names.
+func test_both_front_ends_name_a_relatively_imported_module_from_a_relative_root() -> Bool:
+	names_agree_and_contain(
+		module_names_of_both_front_ends(
+			"blorp/test/lsp/server/test_lsp_stdio_transport.brp",
+			RELATIVE_IMPORT_SOURCE,
+		),
+		"blorp/src/lsp/lsp_stdio_transport",
+	)
+
+
+--- A root outside the working directory keeps its absolute path as its name,
+--- with either front end.
+func outside_root_case() -> Result[Bool, String]:
+	directory: String = temp_dir().join("blorp_graph_naming_" + now_microseconds().to_string())
+	_created ?= create_directories(directory).map_err(func(error): message(error))
+	helper_path: String = directory.join("helper.brp")
+	root_path: String = directory.join("outside_root.brp")
+	_helper ?= write_text_atomic(helper_path, "func helper() -> Int:\n\t1\n").map_err(func(error): message(error))
+	_root ?= write_text_atomic(root_path, "import:\n\t./helper: helper\n").map_err(func(error): message(error))
+	names = module_names_of_both_front_ends(root_path, "import:\n\t./helper: helper\n")
+	_ = remove_directory_tree(directory)
+	Ok(names_agree_and_contain(names, normalize(helper_path).remove_suffix(".brp")))
+
+
+func test_both_front_ends_keep_the_absolute_name_of_a_module_outside_the_working_directory() -> Bool:
+	outside_root_case().get_or(False)
+
+
+RELATIVE_IMPORT_SOURCE: String = "import:\n\t../../../src/lsp/lsp_stdio_transport: compiler_stdout_write_all\n"
+
+
+private func module_names(compilation: FrontendCompilationGraph) -> List[String]:
+	frontend_graph_modules(compilation.graph).map(func(module):
+		finalized_typecheck_program_ast(module.program).source.module_name
+	)
+
+
 private func module_lines(compilation: FrontendCompilationGraph) -> List[String]:
 	frontend_graph_modules(compilation.graph).map(func(module):
 		program = finalized_typecheck_program_ast(module.program)
@@ -358,6 +450,18 @@ tests: TestSuite = {
 		(
 			"builds the same graph with either front end",
 			test_both_front_ends_build_the_same_graph_for_a_root,
+		),
+		(
+			"names a relatively imported module by its working-directory path with either front end",
+			test_both_front_ends_name_a_relatively_imported_module_by_its_working_directory_path,
+		),
+		(
+			"names a relatively imported module the same from a relative root",
+			test_both_front_ends_name_a_relatively_imported_module_from_a_relative_root,
+		),
+		(
+			"keeps the absolute name of a module outside the working directory",
+			test_both_front_ends_keep_the_absolute_name_of_a_module_outside_the_working_directory,
 		),
 		(
 			"retains finalized root import rewrites",

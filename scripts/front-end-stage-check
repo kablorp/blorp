@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Keep the discovery stage's compile path green until it becomes the default.
+
+Runs a fast, meaningful slice of the default gates with `BLORP_FRONT_END=stage`,
+so a change cannot break the stage path silently before the default flips. Each
+step is one test of the gate:
+
+  * the CLI smoke checks (`blorp/test/cli/test_cli.sh --smoke`),
+  * the package lifecycle (`blorp/test/package/test_package.sh`),
+  * the parser fixtures, whose diagnostics reach the user through the CLI
+    (`run_blorp_check_fixtures.py` over `blorp/test/compiler/stage_03_parse`),
+  * the suites that own the seam and the CLI wrapper, and
+  * the self-compile: the C the compiler emits for itself with the stage on
+    must equal the C it emits with the existing front end (criterion 2 of
+    `docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`).
+
+The full default and premerge gates run under the stage with
+`BLORP_FRONT_END=stage scripts/test <gate>`; this script is the part that is
+kept in the premerge set. It needs `bin/blorp` built from the current tree
+(`make`), as every gate does.
+
+Usage: scripts/front-end-stage-check [--timeout SECONDS]
+"""
+
+from __future__ import annotations
+
+import argparse
+import filecmp
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BLORP = "bin/blorp"
+FRONT_END_VARIABLE = "BLORP_FRONT_END"
+SELF_COMPILE_ROOT = "blorp/src/main.brp"
+PARSER_FIXTURE_ROOT = "blorp/test/compiler/stage_03_parse"
+SEAM_SUITES = (
+    "blorp/test/lib/test_source_graph_context.brp",
+    "blorp/test/cli/test_main.brp",
+    "blorp/test/compiler/stage_04_modules/test_discovery_adapter.brp",
+)
+GATE_NAME = "front_end_stage"
+DEFAULT_TIMEOUT_SECONDS = 120
+
+
+def environment(front_end: str | None) -> dict[str, str]:
+    """The environment of a step: the front end selected, or the default."""
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    env.pop(FRONT_END_VARIABLE, None)
+    if front_end is not None:
+        env[FRONT_END_VARIABLE] = front_end
+    return env
+
+
+def run_step(name: str, command: list[str], front_end: str | None = "stage") -> bool:
+    print(f"\n=== {name}", flush=True)
+    print("+ " + " ".join(command), flush=True)
+    result = subprocess.run(command, cwd=REPO_ROOT, env=environment(front_end), check=False)
+    print(f"{'PASS' if result.returncode == 0 else 'FAIL'}: {name}", flush=True)
+    return result.returncode == 0
+
+
+def self_compile_c_is_identical(timeout: int) -> bool:
+    """Whether the compiler's own C is the same with either front end."""
+    name = "self-compile emits identical C with the stage"
+    print(f"\n=== {name}", flush=True)
+    with tempfile.TemporaryDirectory(prefix="blorp-front-end-stage.") as directory:
+        outputs: dict[str, Path] = {}
+        for label, front_end in (("existing", None), ("stage", "stage")):
+            output = Path(directory) / f"{label}.c"
+            command = [BLORP, "compile", "--no-format", "-o", str(output), SELF_COMPILE_ROOT]
+            print("+ " + " ".join(command) + f"  # {FRONT_END_VARIABLE}={front_end or 'unset'}", flush=True)
+            result = subprocess.run(
+                command,
+                cwd=REPO_ROOT,
+                env=environment(front_end),
+                timeout=timeout * 5,
+                check=False,
+            )
+            if result.returncode != 0:
+                print(f"FAIL: {name}: the {label} compile exited {result.returncode}", flush=True)
+                return False
+            outputs[label] = output
+        identical = filecmp.cmp(outputs["existing"], outputs["stage"], shallow=False)
+    print(f"{'PASS' if identical else 'FAIL'}: {name}", flush=True)
+    return identical
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    args = parser.parse_args()
+    timeout = str(args.timeout)
+
+    results = [
+        run_step(
+            "cli smoke with the stage",
+            ["blorp/test/cli/test_cli.sh", "--smoke", "--timeout", timeout, "--gate-name", "front_end_stage_cli"],
+        ),
+        run_step(
+            "package lifecycle with the stage",
+            ["blorp/test/package/test_package.sh", "--timeout", timeout, "--gate-name", "front_end_stage_package"],
+        ),
+        run_step(
+            "parser fixtures with the stage",
+            [
+                sys.executable,
+                "blorp/test/lib/run_blorp_check_fixtures.py",
+                "--blorp-bin",
+                BLORP,
+                "--root",
+                PARSER_FIXTURE_ROOT,
+                "--timeout",
+                timeout,
+                "--gate-name",
+                "front_end_stage_fixtures",
+            ],
+        ),
+        run_step(
+            "seam and CLI wrapper suites with the stage",
+            [BLORP, "test", "--suite", "--timeout", timeout, *SEAM_SUITES],
+        ),
+        self_compile_c_is_identical(args.timeout),
+    ]
+
+    passed = sum(results)
+    failed = len(results) - passed
+    status = "PASS" if failed == 0 else "FAIL"
+    print(f"BLORP_GATE_RESULT gate={GATE_NAME} status={status} passed={passed} failed={failed} tests={len(results)}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

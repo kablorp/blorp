@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import re
 import sys
 
 from process_supervisor import CAPTURE_LIMIT_EXIT, PROCESS_TIMEOUT_EXIT, run_command
@@ -26,12 +28,71 @@ class Expectations:
     exact: list[str] = field(default_factory=list)
     contains: list[str] = field(default_factory=list)
     not_contains: list[str] = field(default_factory=list)
+    # A fixture whose own pins cannot be used (see `stage_expectations`) fails
+    # with these rather than silently losing a check.
+    pin_errors: list[str] = field(default_factory=list)
+    # Whether the checks are the stage's own pins rather than the fixture's
+    # `EXPECT`/`EXPECT-BLORP` lines.
+    stage_pinned: bool = False
 
     def has_checks(self) -> bool:
         return bool(self.exact or self.contains or self.not_contains)
 
 
-def parse_expectations(source: str) -> Expectations:
+# The environment variable that selects the compiler's front end, and the value
+# that selects the discovery stage (`blorp/src/lib/source_graph.brp`). The
+# runner reads it to know whose wording a fixture should be checked against.
+FRONT_END_VARIABLE = "BLORP_FRONT_END"
+STAGE_FRONT_END = "stage"
+
+DISCOVERY_POSITION = re.compile(r"\s(\d+):(\d+)\s*$")
+
+
+def stage_expectations(source: str, fallback: Expectations) -> Expectations:
+    """Expectations for a fixture checked with the discovery stage switched on.
+
+    A should_fail fixture pins the stage's own rendered diagnostic in
+    `-- EXPECT-DISCOVERY-TEXT:` lines and its position in the `line:column` that
+    ends `-- EXPECT-DISCOVERY:`; the `compiler-new` gates already hold those
+    true. Under the stage they replace the existing parser's `EXPECT-BLORP`
+    wording and position, which describe the other front end. The
+    `NOT-CONTAINS` checks are about what must not appear and stay as they are.
+    A fixture with no `EXPECT-DISCOVERY-TEXT` has nothing stage-specific to say
+    and FALLS BACK to its `EXPECT`/`EXPECT-BLORP` checks, which the existing
+    front end's wording also satisfies: those fixtures are not stage-specific
+    coverage (`main` reports how many there are). A fixture that has the text
+    pins but no `line:column` on its `EXPECT-DISCOVERY` line is a malformed
+    fixture and fails, instead of silently losing its position check.
+    """
+    texts: list[str] = []
+    positions: list[str] = []
+    for line in source.splitlines():
+        if line.startswith("-- EXPECT-DISCOVERY-TEXT:"):
+            texts.append(line[len("-- EXPECT-DISCOVERY-TEXT:") :].strip())
+        elif line.startswith("-- EXPECT-DISCOVERY:"):
+            match = DISCOVERY_POSITION.search(line)
+            if match:
+                positions.append(f":{match.group(1)}:{match.group(2)}: error:")
+    if not texts:
+        return fallback
+    pin_errors = (
+        []
+        if positions
+        else [
+            "has EXPECT-DISCOVERY-TEXT but no `line:column` on its "
+            "EXPECT-DISCOVERY line, so the stage's position cannot be checked"
+        ]
+    )
+    return Expectations(
+        exact=texts,
+        contains=positions,
+        not_contains=fallback.not_contains,
+        pin_errors=pin_errors,
+        stage_pinned=True,
+    )
+
+
+def parse_expectations(source: str, front_end: str | None = None) -> Expectations:
     generic = Expectations()
     blorp = Expectations()
     prefixes = (
@@ -48,7 +109,10 @@ def parse_expectations(source: str) -> Expectations:
                 expected = line[len(prefix) :]
                 destination.append(expected.strip() if trim else expected)
                 break
-    return blorp if blorp.has_checks() else generic
+    expectations = blorp if blorp.has_checks() else generic
+    if front_end == STAGE_FRONT_END:
+        return stage_expectations(source, expectations)
+    return expectations
 
 
 SEVERITY_MARKERS = ((": error: ", "error: "), (": warning: ", "warning: "))
@@ -77,7 +141,8 @@ def normalized_diagnostics(output: str) -> list[str]:
 
 def expectation_failures(expectations: Expectations, output: str) -> list[str]:
     diagnostics = normalized_diagnostics(output)
-    failures = [
+    failures = list(expectations.pin_errors)
+    failures += [
         f"missing exact diagnostic: {expected}"
         for expected in expectations.exact
         if expected and expected not in diagnostics
@@ -105,7 +170,9 @@ def discover_fixtures(roots: list[Path]) -> list[Path]:
     return sorted(set(fixtures))
 
 
-def run_fixture(compiler: Path, fixture: Path, timeout: int) -> tuple[bool, list[str]]:
+def run_fixture(
+    compiler: Path, fixture: Path, timeout: int, front_end: str | None
+) -> tuple[bool, list[str]]:
     result = run_command(
         [str(compiler), "check", "--no-format", str(fixture)], timeout
     )
@@ -127,11 +194,30 @@ def run_fixture(compiler: Path, fixture: Path, timeout: int) -> tuple[bool, list
         return False, [f"compiler infrastructure exit {result.returncode}", output.strip()]
 
     failures = expectation_failures(
-        parse_expectations(fixture.read_text(encoding="utf-8")), output
+        parse_expectations(fixture.read_text(encoding="utf-8"), front_end), output
     )
     if failures:
         failures.append("actual output: " + (output.strip() or "(empty)"))
     return not failures, failures
+
+
+def print_stage_coverage(fixtures: list[Path]) -> None:
+    """Say how many should_fail fixtures check the stage's own pins.
+
+    The rest fall back to their `EXPECT`/`EXPECT-BLORP` lines, so they show the
+    stage agrees with the existing wording, not that its text is pinned.
+    """
+    failing = [path for path in fixtures if "should_fail" in path.parts]
+    pinned = sum(
+        1
+        for path in failing
+        if parse_expectations(path.read_text(encoding="utf-8"), STAGE_FRONT_END).stage_pinned
+    )
+    print(
+        f"stage front end: {pinned} of {len(failing)} should_fail fixtures check the "
+        f"stage's pinned text and position; {len(failing) - pinned} fall back to their "
+        "EXPECT/EXPECT-BLORP checks"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,10 +260,13 @@ def main() -> int:
         )
         return 1
 
+    front_end = os.environ.get(FRONT_END_VARIABLE)
+    if front_end == STAGE_FRONT_END:
+        print_stage_coverage(fixtures)
     passed = 0
     failed = 0
     for fixture in fixtures:
-        succeeded, details = run_fixture(compiler, fixture, args.timeout)
+        succeeded, details = run_fixture(compiler, fixture, args.timeout, front_end)
         if succeeded:
             passed += 1
             if args.verbose:

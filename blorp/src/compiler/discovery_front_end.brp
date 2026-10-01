@@ -18,9 +18,11 @@ import:
 	discovery_adapter:
 		COMPILER_EMBEDDED_TEXTS,
 		CompilerEmbeddedTexts,
+		LegacyAdapterError(GraphRejected),
 		LegacyModuleNaming,
 		legacy_adapter_error_message,
 		legacy_frontend_graph,
+	stage_04_modules/frontend_graph_service: frontend_graph_service_error_message
 	frontend_request:
 		FrontendCompilationGraph,
 		FrontendGraphContext,
@@ -130,10 +132,15 @@ private pure func root_texts(roots: List[StageRoot]) -> Dict[String, String]:
 
 
 ---
-How the existing front end names each root: the name the command gave it.
+How the existing front end names each root, the name the command gave it, and
+the modules it names by their paths (`path_module_name`, from the caller).
 ---
-private pure func root_naming(roots: List[StageRoot]) -> LegacyModuleNaming:
+private pure func root_naming(
+	roots: List[StageRoot],
+	path_module_name: pure (String) -> String,
+) -> LegacyModuleNaming:
 	{
+		path_module_name = path_module_name,
 		-- The stage only asks for a path it was given as a root, so the stem is
 		-- never read; it is the name `read_cli_source_file` gives a file.
 		root_module_name = pure func(request_path): roots
@@ -232,6 +239,7 @@ private pure func graph_from_outcome(
 	outcome: FreezeOutcome,
 	roots: List[StageRoot],
 	context: FrontendGraphContext,
+	path_module_name: pure (String) -> String,
 ) -> Result[FrontendCompilationGraph, String]:
 	match outcome:
 		TableInvariantsViolated(violations):
@@ -242,9 +250,14 @@ private pure func graph_from_outcome(
 			if not rejected.is_empty():
 				Err(rejected.join("\n"))
 			else:
-				match legacy_frontend_graph(tables, root_naming(roots), context):
+				match legacy_frontend_graph(tables, root_naming(roots, path_module_name), context):
 					Ok(graph):
 						Ok(graph)
+					Err(GraphRejected(errors)):
+						-- The graph validation refused the program, not the stage's
+						-- tables: the user's modules clash, as the existing front end
+						-- reports them.
+						Err(errors.map(frontend_graph_service_error_message).join("\n"))
 					Err(error):
 						Err(
 							"internal compiler error: the discovery stage's tables could not be rebuilt for typecheck: ${legacy_adapter_error_message(error)}",
@@ -258,11 +271,14 @@ own text, the standard-library directory (or the compiler's embedded texts when
 existing discovery reads them. Each root's `module_name` is the name the
 command chose for it, standard-library root naming included, and its origin the
 module's place in the standard library, a package or user code.
+`path_module_name` spells the path of a module named by its path, as the
+existing front end does (see `LegacyModuleNaming`).
 ---
 func stage_frontend_graph(
 	context: FrontendGraphContext,
 	roots: List[StageRoot],
 	runtime: FrontendRuntimeModules,
+	path_module_name: pure (String) -> String,
 ) -> Result[FrontendCompilationGraph, String]:
 	overlay: OverlaySourceProvider[FileSystemSourceProvider] = {
 		overlay = root_texts(roots),
@@ -294,4 +310,4 @@ func stage_frontend_graph(
 				stage_implicit_modules(runtime),
 			)
 
-	graph_from_outcome(outcome, roots, context)
+	graph_from_outcome(outcome, roots, context, path_module_name)

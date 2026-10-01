@@ -175,14 +175,17 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			)
 			self.assertNotIn("compiler/discovery_adapter.brp imports", result.stderr)
 
-	def test_the_adapter_alone_imports_compiler_new_in_the_repository_manifest(self) -> None:
+	def test_the_adapter_and_the_front_end_alone_import_compiler_new_in_the_repository_manifest(self) -> None:
 		manifest = json.loads((ROOT / "blorp/source_ownership.json").read_text(encoding="utf-8"))
 		importers = {
 			importer
 			for importer, targets in manifest["temporary_cross_owner_imports"].items()
 			if any(target.startswith("compiler_new/") for target in targets)
 		}
-		self.assertEqual(importers, {"compiler/discovery_adapter.brp"})
+		self.assertEqual(
+			importers,
+			{"compiler/discovery_adapter.brp", "compiler/discovery_front_end.brp"},
+		)
 
 	def test_accepts_one_registered_temporary_cross_owner_import(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:

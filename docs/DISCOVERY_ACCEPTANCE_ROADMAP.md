@@ -52,6 +52,11 @@ work and says what "accepted" means.
   stage and the adapter for every command that builds the graph, through one
   seam in `lib/source_graph.brp`; the default is still the existing discovery.
   The self-compile with it on emits the same C as the default.
+- **Switched on (item 8, first half):** every default and premerge gate passes
+  with `BLORP_FRONT_END=stage` and without it, the self-compile C is identical,
+  and the stage costs 11% fewer instructions than the existing discovery with
+  the whole adapter (`benchmarks/results/discovery_stage_switched_on_2026-10-01.md`).
+  The `front-end-stage` gate keeps that path green in the premerge set.
 - **Not verified:** that diagnostics after the first, and the constructs the
   corpus and the targeted programs do not use, agree (a probe found the old
   parser accepting `./a/../a/b` imports that the grammar forbids).
@@ -68,8 +73,10 @@ We connect the stage by default when all of these hold:
    two differences are in `ADAPTER_DIFFERENCES` with a reason each and tracked
    in `docs/issues/interpolation_nesting_in_the_existing_lexer.md`. It is met
    when that issue is closed or the old front end is deleted.
-2. **Same compiler output.** With the new stage switched on, every default and
-   premerge gate passes, and the self-compile produces the same C. Ids are
+2. **Same compiler output. Met** (item 8): with the new stage switched on, every
+   default and premerge gate passes, and the self-compile produces the same C,
+   from `bin/blorp` and from a stage-2 `-O2` compiler (cmp equal, 76,956,462
+   bytes). Ids are
    internal identity, not stable across compiles or front ends; if the C
    differs only in names derived from ids, it is compared after normalizing
    them.
@@ -243,11 +250,23 @@ more. Each numbered item is one change.
    from the three parse-diagnostic fixtures that pin the absence of the help
    line, and the self-compile emits byte-identical C. What a user can see
    differently is in the design document ("Running the stage from the CLI").
-8. **Switch on, then flip the default (M).** With the switch on, every gate
-   passes and the self-compile C matches (criterion 2), and the cost
-   measurement holds (criterion 5). Then flip the default, keeping the old
-   path behind the switch until the next bootstrap rotation has run on the
-   new default.
+8. **Switch on, then flip the default (M).**
+   - **Switch on. Done.** With the switch on, every default and premerge gate
+     passes and the self-compile C matches (criterion 2), and the cost
+     measurement holds (criterion 5, 11% fewer instructions than the existing
+     discovery with the whole adapter). Fixes the gates needed: the CLI
+     wrapper tests and parse-failure fixtures hold under both front ends, the
+     check runner compares a fixture's pinned stage text and position when the
+     stage is on, a module reached by an absolute path is named from the working
+     directory as the existing front end names it (the backend keys builtin
+     modules on that spelling), and a graph the validation refuses is reported
+     as the user's error, not as a defect of the tables. The `front-end-stage`
+     gate runs the cli smoke, package, parser fixtures, seam suites and the
+     self-compile identity with the stage on in every premerge run.
+   - **Flip the default (M), open.** Flip it, keeping the old path behind the
+     switch until the next bootstrap rotation has run on the new default.
+     The owner decides when; criteria 1 and 6 stay open for the interpolation
+     nesting issue.
 
 Hardening, alongside but not on the critical path:
 

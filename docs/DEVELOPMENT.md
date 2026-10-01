@@ -246,6 +246,11 @@ BLORP_FRONT_END=stage scripts/test --no-build cli
 BLORP_FRONT_END=stage bin/blorp compile --no-format -o /tmp/stage.c blorp/src/main.brp
 ```
 
+`scripts/test front-end-stage` runs a fast slice of this on every premerge run (the
+CLI smoke checks, the package lifecycle, the parser fixtures, the seam suites and
+the self-compile C identity), so the stage path cannot break silently before it
+becomes the default. A syntax change lands in both parsers until then.
+
 The graph is the same, and so is the generated C. Differences a user can see
 are in `docs/DISCOVERY_TABLES_DESIGN.md` ("Running the stage from the CLI").
 The formatter, the linter's own parse and the LSP do not use the stage.
