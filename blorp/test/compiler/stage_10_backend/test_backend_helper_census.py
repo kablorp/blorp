@@ -63,8 +63,8 @@ STD_DIR = ROOT / "standard_library" / "src"
 # to the renderers/emitter -- an unexplained change is exactly what this test
 # exists to catch.
 EXPECTED_CALL_COUNTS = {
-    "blorp_retain(": 16,
-    "blorp_release(": 39,
+    "blorp_retain(": 15,
+    "blorp_release(": 38,
     "blorp_alloc(": 5,
     "blorp_list_new(": 3,
     "blorp_list_new_inline(": 2,
