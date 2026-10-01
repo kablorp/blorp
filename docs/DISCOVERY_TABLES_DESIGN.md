@@ -38,7 +38,8 @@ stage_01_discovery/
     invariants.brp  name_vocabulary.brp  row_kinds.brp  source_position.brp
     span.brp  token.brp
   sources/         which files make up the program
-    module_graph.brp  source_admission.brp  source_provider.brp
+    embedded_standard_library.brp  module_graph.brp  source_admission.brp
+    source_provider.brp
   lex/lexer.brp
   diagnostics/render.brp   the message and help of each diagnostic code
   parse/           parser_cursor, declaration_header, declaration_parser,
@@ -66,7 +67,9 @@ compiler CI):
   checks;
 - the lexer, with token parity against the existing lexer over the whole
   corpus;
-- the module graph (resolving requests) and the source providers (file system and in-memory);
+- the module graph (resolving requests) and the source providers (file
+  system, in-memory and the embedded standard library), with the native and
+  source package lookup rules;
 - the implicit modules (section 6): `prelude` and `tuple`, and `test` when
   testing, loaded after the roots as the existing front end seeds them;
 - the declaration, type, pattern and body parsers, with accept/reject parity
@@ -76,8 +79,6 @@ compiler CI):
 
 - **The legacy adapter** (section 10) and its differential check. Nothing
   outside `compiler_new` reads the tables yet.
-- **The embedded standard-library provider and the package catalog.** Both
-  plug into the provider seam (section 5) without changes to the module graph.
 
 ## 1. Principles
 
@@ -161,7 +162,7 @@ struct PackageRow {name: NameId, kind: PackageKind}   -- NativePackage | SourceP
 struct ModuleRow {
 	source: SourceId,
 	canonical_path: PathId,
-	origin: ModuleOriginKind,   -- StdlibModule | PackageModule | UserModule
+	origin: ModuleOriginKind,   -- StdlibModule | PackageModule | SourcePackageModule | UserModule
 	reach: ModuleReach,         -- RootModule | ImplicitModule | ImportedModule
 	definitions: RowRange,
 	imports: RowRange,
@@ -669,18 +670,49 @@ trait SourceProvider:
 
 Everything else is a pure lookup policy shared by every provider:
 `import_candidates` lists the paths an `ImportRequest` may resolve to, in
-the order they are tried, each with the origin and package the module there
-would have; the first that exists wins. The order is language behavior
-(native packages only from user modules; relative requests keep the
-importer's origin; bare requests from the standard library resolve only in
-the standard library). Keeping the policy out of the provider is what makes
-an editor resolve exactly like a build.
+the order they are tried, each with the `ModulePlacement` the module there
+would have (standard library, native package, source package or user code;
+the origin and the package row both come from it); the first that exists wins.
+The order is language behavior and is the existing front end's
+`frontend_import_lookup_plan`: a bare request from user code or a native
+package module tries a source package alias (exported modules only), then
+the standard library, then the importer's directory; from a source package
+module its own modules, then the standard library; from the standard library
+only the standard library. Relative requests keep the importer's placement,
+and a source package module's stay under the package's `source_dir`. `pkg/`
+requests resolve from user code and native package modules, not from the
+standard library or a source package. Keeping the policy out of the provider
+is what makes an editor resolve exactly like a build.
 
 Implemented providers: `FileSystemSourceProvider` and
-`InMemorySourceProvider` (tests and overlays). The embedded standard library
-becomes a provider that answers for paths under the standard-library root,
-and the package catalog supplies `native_package_roots` and candidate rules;
-neither changes the module graph.
+`InMemorySourceProvider` (tests and overlays), and
+`EmbeddedStandardLibraryProvider` (`sources/embedded_standard_library.brp`),
+which answers for paths under `EMBEDDED_STANDARD_LIBRARY_ROOT` from the texts
+embedded in the compiler and leaves every other path to the provider it wraps.
+It lists directories from the embedded module names, so the exact-case check
+works below the root. The embedded texts are a build input generated into
+`compiler/stage_01_generated_inputs/embedded_std`, which the stage must not
+import, so the provider asks for them through the
+`EmbeddedStandardLibraryTexts` trait and the composition outside the stage
+(the legacy adapter, the parity tools) implements it over
+`embedded_std_module_names` and `embedded_std_source`. The stage's paths for
+embedded modules are `<embedded-std>/<name>.brp`; the existing front end's
+`<embedded:name>` is `embedded_module_name` plus a spelling, derived by the
+consumer rather than stored twice. The package catalog supplies
+`native_package_roots` and `source_packages` (`SourcePackageRoot`: alias,
+package name, source directory and exports) in `SourceLookupRoots`; neither
+changes the module graph.
+
+The existing front end names a module by how it was requested, so one source
+package file reached both by its bare internal name and by a relative path is
+two modules there and one here (the stage identifies a module by its path).
+The parity fixtures avoid reaching a file both ways; the adapter must not
+assume the old duplicates.
+
+A native package module resolves bare and `pkg/` requests like user code, as
+the existing front end does (a module it finds beside itself is user code,
+not package code). The Guide's "bare imports resolve local or standard-library
+modules" agrees, and no module under `pkg/` relies on anything else today.
 
 ## 6. The pipeline and the module graph
 
@@ -720,8 +752,10 @@ is a `MissingImplicitModuleDiagnostic` row.
 
 `scripts/compiler-new-parity` keeps the restated names honest: for the
 self-compile root and for a `blorp test` root it compares the existing graph's
-module sequence (`legacy_module_order_dump.brp`) with the stage's
-(`module_order_dump.brp`), so a change to the old constants fails the gate.
+module sequence and origins (`legacy_module_order_dump.brp`) with the stage's
+(`discovery_module_order_dump.brp`), so a change to the old constants fails
+the gate. The same roots run with the standard library read from the embedded
+texts, and a fixture project runs with two source packages and a native one.
 
 Follow-up: roots and implicit requests have parallel request, target and
 diagnostic tables and near-identical failure reporting in `module_graph`;

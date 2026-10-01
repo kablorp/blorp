@@ -1,0 +1,205 @@
+-- The embedded standard-library provider: it answers for the embedded root
+-- from the texts it is given, lists directories from the module names (so the
+-- exact-case check works below the root), and leaves every other path to the
+-- provider it wraps.
+import:
+	../../../../src/compiler_new/stage_01_discovery/pipeline: ImplicitModules, discover
+	../../../../src/compiler_new/stage_01_discovery/sources/embedded_standard_library:
+		EMBEDDED_STANDARD_LIBRARY_ROOT,
+		EmbeddedStandardLibraryProvider,
+		EmbeddedStandardLibraryTexts,
+		embedded_lookup_roots,
+		embedded_module_name,
+	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		InMemorySourceProvider,
+		SourceRead(SourceText, SourceUnreadable),
+		directory_listing,
+		read_source,
+		source_exists,
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		module_count,
+		module_row,
+		path_text,
+		resolution_diagnostic_count,
+	../../support/tables_dump: origin_text
+	fs: DirectoryListing(DirectoryAbsent, DirectoryListed)
+	test: TestSuite
+
+
+---
+A small embedded standard library for the tests: two top-level modules and a
+nested directory, so a listing has both files and a subdirectory with several
+modules.
+---
+record FakeEmbeddedTexts {
+	modules: Dict[String, String]
+}
+
+
+implements EmbeddedStandardLibraryTexts for FakeEmbeddedTexts:
+	pure func module_names(self: FakeEmbeddedTexts) -> List[String]:
+		self.modules.keys()
+
+	pure func module_source(self: FakeEmbeddedTexts, module_name: String) -> Option[String]:
+		self.modules.get(module_name)
+
+
+EMBEDDED_TEXTS: FakeEmbeddedTexts = {
+	modules = {
+		"option" => "-- option\n",
+		"prelude" => "import:\n\toption\n",
+		"net/url" => "x: Int = 1\n",
+		"net/http" => "import:\n\t./url\n",
+		"net/tls/session" => "",
+	},
+}
+
+USER_FILES: InMemorySourceProvider = {
+	sources = {"app/main.brp" => "import:\n\toption\n\tnet/http\n", "app/option.brp" => ""},
+}
+
+PROVIDER: EmbeddedStandardLibraryProvider[FakeEmbeddedTexts, InMemorySourceProvider] = {
+	texts = EMBEDDED_TEXTS,
+	inner = USER_FILES
+}
+
+NO_IMPLICIT_MODULES: ImplicitModules = {module_names = []}
+
+
+func test_embedded_modules_exist_and_read_under_the_embedded_root() -> Bool:
+	prefix: String = EMBEDDED_STANDARD_LIBRARY_ROOT + "/"
+	read: SourceRead = PROVIDER.read_source(prefix + "option.brp")
+
+	match read:
+		SourceText(text):
+			(
+				text == "-- option\n"
+				and PROVIDER.source_exists(prefix + "net/url.brp")
+				and not PROVIDER.source_exists(prefix + "net/missing.brp")
+				and not PROVIDER.source_exists(prefix + "option")
+			)
+		SourceUnreadable:
+			False
+
+
+func test_other_paths_are_the_wrapped_providers() -> Bool:
+	match PROVIDER.read_source("app/option.brp"):
+		SourceText(text):
+			(
+				text == ""
+				and PROVIDER.source_exists("app/main.brp")
+				and not PROVIDER.source_exists("option.brp")
+			)
+		SourceUnreadable:
+			False
+
+
+func test_a_directory_lists_its_files_and_subdirectories_sorted_once_each() -> Bool:
+	root: DirectoryListing = PROVIDER.directory_listing(EMBEDDED_STANDARD_LIBRARY_ROOT)
+	net: DirectoryListing = PROVIDER.directory_listing(EMBEDDED_STANDARD_LIBRARY_ROOT + "/net")
+
+	match (root, net):
+		(DirectoryListed(root_names), DirectoryListed(net_names)):
+			(
+				root_names == ["net", "option.brp", "prelude.brp"]
+				and net_names == ["http.brp", "tls", "url.brp"]
+			)
+		_:
+			False
+
+
+func test_a_directory_the_library_does_not_hold_is_absent_and_others_are_delegated() -> Bool:
+	missing: DirectoryListing = PROVIDER.directory_listing(
+		EMBEDDED_STANDARD_LIBRARY_ROOT + "/collections",
+	)
+	user: DirectoryListing = PROVIDER.directory_listing("app")
+
+	match (missing, user):
+		(DirectoryAbsent, DirectoryListed(names)):
+			names == ["main.brp", "option.brp"]
+		_:
+			False
+
+
+func test_a_module_name_is_recovered_from_its_path_under_the_root() -> Bool:
+	prefix: String = EMBEDDED_STANDARD_LIBRARY_ROOT + "/"
+
+	(
+		embedded_module_name(prefix + "net/url.brp") == Some("net/url")
+		and embedded_module_name(prefix + "option.brp") == Some("option")
+		and embedded_module_name("std/option.brp") == None
+		and embedded_module_name(prefix + "option") == None
+	)
+
+
+func test_discovery_loads_the_standard_library_from_the_embedded_texts() -> Bool:
+	roots = embedded_lookup_roots(["pkg"], [])
+
+	match discover(PROVIDER, roots, ["app/main.brp"], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			var lines: List[String] = []
+
+			for index in 0..module_count(tables):
+				row = tables.module_row(module_id_at_row(index))
+				lines = lines.append("${row.origin_text()} ${tables.path_text(row.canonical_path)}")
+
+			lines == [
+				"user app/main.brp",
+				"stdlib ${EMBEDDED_STANDARD_LIBRARY_ROOT}/option.brp",
+				"stdlib ${EMBEDDED_STANDARD_LIBRARY_ROOT}/net/http.brp",
+				"stdlib ${EMBEDDED_STANDARD_LIBRARY_ROOT}/net/url.brp",
+			]
+		TableInvariantsViolated(_):
+			False
+
+
+func test_an_embedded_import_spelled_in_another_case_is_a_case_mismatch() -> Bool:
+	provider: EmbeddedStandardLibraryProvider[FakeEmbeddedTexts, InMemorySourceProvider] = {
+		texts = EMBEDDED_TEXTS,
+		inner = {sources = {"app/main.brp" => "import:\n\tnet/URL\n\tOption\n"}}
+	}
+
+	match discover(
+		provider,
+		embedded_lookup_roots([], []),
+		["app/main.brp"],
+		NO_IMPLICIT_MODULES,
+	):
+		FrozenTables(tables):
+			module_count(tables) == 1 and tables.resolution_diagnostic_count() == 2
+		TableInvariantsViolated(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Embedded standard library provider",
+	tests = [
+		(
+			"embedded modules exist and read under the embedded root",
+			test_embedded_modules_exist_and_read_under_the_embedded_root,
+		),
+		("other paths are the wrapped provider's", test_other_paths_are_the_wrapped_providers),
+		(
+			"a directory lists its files and subdirectories sorted, once each",
+			test_a_directory_lists_its_files_and_subdirectories_sorted_once_each,
+		),
+		(
+			"a directory the library does not hold is absent, and others are delegated",
+			test_a_directory_the_library_does_not_hold_is_absent_and_others_are_delegated,
+		),
+		(
+			"a module name is recovered from its path under the root",
+			test_a_module_name_is_recovered_from_its_path_under_the_root,
+		),
+		(
+			"discovery loads the standard library from the embedded texts",
+			test_discovery_loads_the_standard_library_from_the_embedded_texts,
+		),
+		(
+			"an embedded import spelled in another case is a case mismatch",
+			test_an_embedded_import_spelled_in_another_case_is_a_case_mismatch,
+		),
+	]
+}

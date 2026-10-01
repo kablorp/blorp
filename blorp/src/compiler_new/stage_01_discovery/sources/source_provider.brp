@@ -9,15 +9,16 @@
 -- buffers resolves exactly like a build.
 --
 -- Providers here: the file system, and an in-memory map for tests and
--- overlays. The embedded standard library plugs in as a provider that
--- answers for paths under the standard-library root from the compiler's
--- embedded texts (and delegates everything else); the package catalog plugs
--- in by supplying `native_package_roots` and, for source packages, candidate
--- rules added to `import_candidates`. The module graph never changes for either.
+-- overlays; `embedded_standard_library` adds the provider that answers for
+-- the standard-library root from the compiler's embedded texts and delegates
+-- everything else. The package catalog plugs in through `SourceLookupRoots`:
+-- `native_package_roots` and `source_packages` (the `blorp.toml` source
+-- packages), whose lookup rules are in `import_candidates`. The module graph
+-- never changes for either.
 import:
 	../tables/row_kinds:
 		ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest),
-		ModuleOriginKind(PackageModule, StdlibModule, UserModule),
+		ModuleOriginKind(PackageModule, SourcePackageModule, StdlibModule, UserModule),
 	fs: DirectoryListing(DirectoryAbsent, DirectoryListed), list_directory
 	path: dirname, join, normalize
 	system: file_exists, read_file
@@ -62,31 +63,73 @@ trait SourceProvider:
 
 
 ---
-The directories the lookup policy searches.
+A source package of the project catalog (`blorp.toml`), as the lookup policy
+sees it.
+
+- `package_alias`: the name importers write before the first `/` of a request.
+- `package_name`: the package's own name, the first part of every module path
+  it exports and of its internal imports.
+- `source_dir`: the directory its modules are stored under, with the same
+  spelling the caller gives every other path (a package module's path is
+  `source_dir` joined with its module path).
+- `exports`: the module paths other code may import through the alias, each
+  `package_name` or `package_name/<module>`.
 ---
-record SourceLookupRoots {
-	standard_library_root: String,
-	native_package_roots: List[String]
+record SourcePackageRoot {
+	package_alias: String,
+	package_name: String,
+	source_dir: String,
+	exports: List[String]
 }
 
 
 ---
-A module's package, when it has one; its name is the package's first path
-part.
+The directories and packages the lookup policy searches.
 ---
-union PackageMembership:
+record SourceLookupRoots {
+	standard_library_root: String,
+	native_package_roots: List[String],
+	source_packages: List[SourcePackageRoot]
+}
+
+
+---
+Where a module lives, which decides where its own import requests may
+resolve and what origin and package its row records. A native package's name
+is its first path part after `pkg/`; a source package is named by its alias.
+There is one source for both facts: `origin_kind` and the package row come
+from this value, so a module cannot have a package without the matching
+origin.
+---
+union ModulePlacement:
+	InStandardLibrary
 	InNativePackage(String)
-	NotInPackage
+	InSourcePackage(String)
+	InUserCode
 
 
 ---
-The module an import request comes from: its canonical path, origin and
-package decide where the request may resolve.
+The origin a module in `placement` is recorded with.
+---
+pure func origin_kind(placement: ModulePlacement) -> ModuleOriginKind:
+	match placement:
+		InStandardLibrary:
+			StdlibModule
+		InNativePackage(_):
+			PackageModule
+		InSourcePackage(_):
+			SourcePackageModule
+		InUserCode:
+			UserModule
+
+
+---
+The module an import request comes from: its canonical path and placement
+decide where the request may resolve.
 ---
 record ImportRequester {
 	canonical_path: String,
-	origin: ModuleOriginKind,
-	package: PackageMembership
+	placement: ModulePlacement
 }
 
 
@@ -136,8 +179,8 @@ pure func respelled_import_text(request_text: String, stored_names: List[String]
 
 
 ---
-A path an import request may resolve to, with the origin and package the
-module there would have.
+A path an import request may resolve to, with the placement the module there
+would have.
 
 `trusted_directory` is the directory the request is resolved against: the
 importer's directory, the standard-library root, a native package root, or a
@@ -147,8 +190,7 @@ request's spelling, so only those are compared case-exactly.
 record SourceCandidate {
 	path: String,
 	trusted_directory: String,
-	origin: ModuleOriginKind,
-	package: PackageMembership
+	placement: ModulePlacement
 }
 
 
@@ -163,8 +205,7 @@ private pure func standard_library_candidate(
 	{
 		path = normalize(join(roots.standard_library_root, module_file(module_path))),
 		trusted_directory = roots.standard_library_root,
-		origin = StdlibModule,
-		package = NotInPackage
+		placement = InStandardLibrary
 	}
 
 
@@ -180,16 +221,168 @@ pure func implicit_module_candidate(
 
 
 ---
+The package of `source_packages` named `package_alias`, if any.
+---
+private pure func source_package_with_alias(
+	roots: SourceLookupRoots,
+	package_alias: String,
+) -> Option[SourcePackageRoot]:
+	roots.source_packages.find(pure func(package): package.package_alias == package_alias)
+
+
+private pure func source_package_candidate(
+	package: SourcePackageRoot,
+	module_path: String,
+) -> SourceCandidate:
+	{
+		path = normalize(join(package.source_dir, module_file(module_path))),
+		trusted_directory = package.source_dir,
+		placement = InSourcePackage(package.package_alias)
+	}
+
+
+---
+The module path `package` exports for the request `module_path`, if there is
+one: `<alias>` is the package's own module, `<alias>/<rest>` its module
+`<package_name>/<rest>`, and only a module the package lists in `exports`
+resolves. This is `source_package_export_for_alias` in
+`compiler/stage_04_modules/source_package_layout`, restated because the stage
+must not import the existing compiler; the two must agree for as long as both
+front ends exist.
+---
+private pure func exported_module_for_alias(
+	package: SourcePackageRoot,
+	module_path: String,
+) -> Option[String]:
+	match module_path.split("/"):
+		[head, ...rest]:
+			exported: String = if rest.length() == 0:
+				package.package_name
+			else:
+				package.package_name + "/" + rest.join("/")
+
+			if head == package.package_alias and package.exports.contains(exported):
+				Some(exported)
+			else:
+				None
+		[]:
+			None
+
+
+---
+The source packages' exported modules that the request `module_path` names
+through an alias, in catalog order.
+---
+private pure func alias_export_candidates(
+	roots: SourceLookupRoots,
+	module_path: String,
+) -> List[SourceCandidate]:
+	var found: List[SourceCandidate] = []
+
+	for package in roots.source_packages:
+		match package.exported_module_for_alias(module_path):
+			Some(exported):
+				found = found.append(package.source_package_candidate(exported))
+			None:
+				void
+
+	found
+
+
+---
+Whether `module_path` is one of the package's own modules, which it may
+import by bare name without exporting it (`source_package_contains_internal_module`
+in the existing compiler; see `exported_module_for_alias`).
+---
+private pure func is_internal_module(package: SourcePackageRoot, module_path: String) -> Bool:
+	module_path == package.package_name or module_path.starts_with(package.package_name + "/")
+
+
+---
+Whether a request from a module in `placement` may name a path outside its
+own package. Only a source package module is confined: its relative imports
+stay under the package's `source_dir`. A source package module whose alias is
+not in `roots` is confined to nothing (`False`), as in the existing front end.
+---
+private pure func relative_request_stays_in_package(
+	roots: SourceLookupRoots,
+	placement: ModulePlacement,
+	path: String,
+) -> Bool:
+	match placement:
+		InSourcePackage(package_alias):
+			match roots.source_package_with_alias(package_alias):
+				Some(package):
+					source_dir: String = normalize(package.source_dir)
+					path == source_dir or path.starts_with(source_dir + "/")
+				None:
+					False
+		InStandardLibrary:
+			True
+		InNativePackage(_):
+			True
+		InUserCode:
+			True
+
+
+---
+The candidates of a `pkg/<package>/...` request: the module under each native
+package root.
+---
+private pure func native_package_candidates(
+	roots: SourceLookupRoots,
+	request: ImportRequest,
+) -> List[SourceCandidate]:
+	package_parts: List[String] = request.parts.drop(1)
+	package_name: String = package_parts
+		.get(0)
+		.get_or("")
+	package_path: String = module_file(package_parts.join("/"))
+	roots.native_package_roots.map(pure func(root): {
+			path = normalize(join(root, package_path)),
+			trusted_directory = root,
+			placement = InNativePackage(package_name)
+		})
+
+
+---
+The candidates of a bare request from code that resolves like user code (user
+modules and native package modules): a source package alias, then the
+standard library, then beside the importer as user code.
+---
+private pure func user_code_bare_candidates(
+	roots: SourceLookupRoots,
+	module_path: String,
+	importer_directory: String,
+) -> List[SourceCandidate]:
+	roots
+		.alias_export_candidates(module_path)
+		.append(roots.standard_library_candidate(module_path))
+		.append({
+			path = normalize(join(importer_directory, module_file(module_path))),
+			trusted_directory = importer_directory,
+			placement = InUserCode,
+		})
+
+
+---
 Candidate paths for `request`, in the order they are tried; the first that
-exists wins. The order is language behavior:
+exists wins. The order is language behavior, and it is the existing front
+end's `frontend_import_lookup_plan` (`compiler/stage_04_modules/
+frontend_import_plan`):
 
 - a native package request (`pkg/<package>/...`) resolves under each native
-  package root, and only from user modules;
+  package root, from user modules and native package modules only (never
+  from the standard library or a source package);
 - a relative request resolves beside its importer and keeps the importer's
-  origin and package;
+  placement, but a source package module's must stay under its package's
+  `source_dir`;
 - a bare request from a standard-library module resolves only in the
-  standard library; from a package module in the standard library; from a
-  user module in the standard library first, then beside the importer.
+  standard library; from a source package module, first as one of its own
+  modules (internal imports), then in the standard library; from user code
+  or a native package module, first through a source package alias (only
+  modules the package exports), then in the standard library, then beside
+  the importer as user code.
 ---
 pure func import_candidates(
 	roots: SourceLookupRoots,
@@ -199,46 +392,50 @@ pure func import_candidates(
 
 	match request.kind:
 		NativePackageRequest:
-			match request.requester.origin:
-				UserModule:
-					package_parts: List[String] = request.parts.drop(1)
-					package_name: String = package_parts
-						.get(0)
-						.get_or("")
-					package_path: String = module_file(package_parts.join("/"))
-					roots.native_package_roots.map(pure func(root): {
-							path = normalize(join(root, package_path)),
-							trusted_directory = root,
-							origin = PackageModule,
-							package = InNativePackage(package_name)
-						})
-				_:
+			match request.requester.placement:
+				InStandardLibrary:
 					[]
+				InSourcePackage(_):
+					[]
+				InNativePackage(_):
+					roots.native_package_candidates(request)
+				InUserCode:
+					roots.native_package_candidates(request)
 		RelativeModuleRequest:
-			[
-				{
-					path = normalize(join(importer_directory, module_file(request.text))),
-					trusted_directory = importer_directory,
-					origin = request.requester.origin,
-					package = request.requester.package
-				},
-			]
+			path: String = normalize(join(importer_directory, module_file(request.text)))
+
+			if roots.relative_request_stays_in_package(request.requester.placement, path):
+				[
+					{
+						path = path,
+						trusted_directory = importer_directory,
+						placement = request.requester.placement
+					},
+				]
+			else:
+				[]
 		BareModuleRequest:
 			module_path: String = request.parts.join("/")
 
-			match request.requester.origin:
-				UserModule:
-					[
-						roots.standard_library_candidate(module_path),
-						{
-							path = normalize(join(importer_directory, module_file(module_path))),
-							trusted_directory = importer_directory,
-							origin = UserModule,
-							package = NotInPackage
-						},
-					]
-				_:
+			match request.requester.placement:
+				InStandardLibrary:
 					[roots.standard_library_candidate(module_path)]
+				InSourcePackage(package_alias):
+					match roots.source_package_with_alias(package_alias):
+						Some(package):
+							if package.is_internal_module(module_path):
+								[
+									package.source_package_candidate(module_path),
+									roots.standard_library_candidate(module_path),
+								]
+							else:
+								[roots.standard_library_candidate(module_path)]
+						None:
+							[roots.standard_library_candidate(module_path)]
+				InUserCode:
+					roots.user_code_bare_candidates(module_path, importer_directory)
+				InNativePackage(_):
+					roots.user_code_bare_candidates(module_path, importer_directory)
 
 
 ---
@@ -251,8 +448,7 @@ pure func root_candidate(root_path: String) -> SourceCandidate:
 	{
 		path = normalized,
 		trusted_directory = dirname(normalized),
-		origin = UserModule,
-		package = NotInPackage
+		placement = InUserCode
 	}
 
 

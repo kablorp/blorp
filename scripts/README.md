@@ -132,9 +132,11 @@ text; the old `#` plus name is one `DimensionNameToken`), the set of files with
 lexer diagnostics and each file's accept/reject verdict. A mismatch prints the
 file and the first differing token. It also compares module order: for the
 self-compile root and for a `blorp test` root, the existing graph's module
-sequence (`legacy_module_order_dump.brp`) must equal the stage's
-(`module_order_dump.brp`), which catches the stage's implicit module names
-drifting from the existing front end's. There are no known divergences today;
+sequence and origins (`legacy_module_order_dump.brp`) must equal the stage's
+(`discovery_module_order_dump.brp`), which catches the stage's implicit module
+names drifting from the existing front end's. The same roots run with the
+standard library read from the compiler's embedded texts, and fixture projects
+run with `blorp.toml` source packages and a native package. There are no known divergences today;
 `KNOWN_DIVERGENCES` stays so one can be added, with a reason (an entry that stops
 disagreeing fails the gate until it is removed). The gate
 takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not a

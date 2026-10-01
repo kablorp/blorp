@@ -73,7 +73,7 @@ import:
 		),
 	../tables/row_kinds:
 		ModuleReach(ImplicitModule, ImportedModule, RootModule),
-		PackageKind(NativePackage),
+		PackageKind(NativePackage, SourcePackage),
 	../tables/span: Span, pack_span
 	fs:
 		DirectoryListing,
@@ -89,7 +89,7 @@ import:
 	source_provider:
 		ImportRequest,
 		ImportRequester,
-		PackageMembership(InNativePackage, NotInPackage),
+		ModulePlacement(InNativePackage, InSourcePackage, InStandardLibrary, InUserCode),
 		SourceCandidate,
 		SourceLookupRoots,
 		SourceProvider,
@@ -523,37 +523,43 @@ private func resolution_of_existing_source[Provider:SourceProvider](
 
 ---
 Records `module`'s package, adding the package row the first time a module
-of that package is loaded.
+of that package is loaded. A module in the standard library or in user code
+has none.
 ---
 pure func record_module_package(
 	builder: DiscoveryBuilder,
 	module: ModuleId,
-	package: PackageMembership,
+	placement: ModulePlacement,
 ) -> DiscoveryBuilder:
-	match package:
+	match placement:
 		InNativePackage(name):
-			builder.record_native_module_package(module, name)
-		NotInPackage:
+			builder.record_module_in_package(module, NativePackage, name)
+		InSourcePackage(package_alias):
+			builder.record_module_in_package(module, SourcePackage, package_alias)
+		InStandardLibrary:
+			builder
+		InUserCode:
 			builder
 
 
 ---
-Records that `module` belongs to the native package `name`. Each step is a
-helper that returns its builder unchanged when there is nothing to add
-(builder threading rule 1).
+Records that `module` belongs to the package of `kind` named `name`. Each
+step is a helper that returns its builder unchanged when there is nothing to
+add (builder threading rule 1).
 ---
-private pure func record_native_module_package(
+private pure func record_module_in_package(
 	builder: DiscoveryBuilder,
 	module: ModuleId,
+	kind: PackageKind,
 	name: String,
 ) -> DiscoveryBuilder:
-	package: PackageId = match builder.existing_package(name):
+	package: PackageId = match builder.existing_package(kind, name):
 		Some(existing):
 			existing
 		None:
 			builder.next_package_id()
 
-	with_package: DiscoveryBuilder = builder.ensure_native_package(name)
+	with_package: DiscoveryBuilder = builder.ensure_package(kind, name)
 	with_package.append_module_package({
 		module = module,
 		package = package,
@@ -561,15 +567,18 @@ private pure func record_native_module_package(
 
 
 ---
-Adds the package row for `name` unless one exists.
+Adds the package row for `name` unless a package of `kind` with that name
+exists. A native package and a source package may share a spelling; they are
+different packages.
 ---
-private pure func ensure_native_package(
+private pure func ensure_package(
 	builder: DiscoveryBuilder,
+	kind: PackageKind,
 	name: String,
 ) -> DiscoveryBuilder:
 	if (
 		builder
-			.existing_package(name)
+			.existing_package(kind, name)
 			.is_some()
 	):
 		builder
@@ -583,7 +592,7 @@ private pure func ensure_native_package(
 		with_name: DiscoveryBuilder = builder.ensure_name(name)
 		with_name.append_package({
 			name = package_name,
-			kind = NativePackage,
+			kind = kind,
 		})
 
 
@@ -602,14 +611,21 @@ private pure func ensure_name(builder: DiscoveryBuilder, name: String) -> Discov
 
 
 ---
-The package already recorded under `name`, if any.
+The package of `kind` already recorded under `name`, if any.
 ---
-private pure func existing_package(builder: DiscoveryBuilder, name: String) -> Option[PackageId]:
+private pure func existing_package(
+	builder: DiscoveryBuilder,
+	kind: PackageKind,
+	name: String,
+) -> Option[PackageId]:
 	var found: Option[PackageId] = None
 	var row: Int = 0
 
 	for package in builder.packages:
-		if builder.name_spellings.get(package.name.name_id_index()) == Some(name):
+		if (
+			package.kind == kind
+			and builder.name_spellings.get(package.name.name_id_index()) == Some(name)
+		):
 			found = Some(package_id_at_row(row))
 			break
 
@@ -632,8 +648,7 @@ private pure func module_import_requests(
 		Some(module_row):
 			requester: ImportRequester = {
 				canonical_path = candidate.path,
-				origin = candidate.origin,
-				package = candidate.package
+				placement = candidate.placement
 			}
 
 			for index in module_row.imports.first..module_row.imports.first + module_row.imports.count:

@@ -1,0 +1,387 @@
+-- The lookup policy for `blorp.toml` source packages (`import_candidates`),
+-- checked end to end by discovering in-memory projects: alias exports, a
+-- package's internal imports, confinement of a package's relative imports, and
+-- how a native package module resolves. The precedence rules are the existing
+-- front end's `frontend_import_lookup_plan`.
+import:
+	../../../../src/compiler_new/stage_01_discovery/pipeline: ImplicitModules, discover
+	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		InMemorySourceProvider,
+		SourceLookupRoots,
+		SourcePackageRoot,
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		FrontendTables,
+		module_count,
+		module_package,
+		module_row,
+		name_spelling,
+		path_text,
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
+		PackageKind(NativePackage, SourcePackage),
+	../../support/tables_dump: origin_text
+	test: TestSuite
+
+
+---
+One package, aliased `tools`, named `toolkit`, stored under `vendor/toolkit`. It
+exports its own module and `toolkit/format`; `toolkit/internal` is not exported.
+---
+TOOLS_PACKAGE: SourcePackageRoot = {
+	package_alias = "tools",
+	package_name = "toolkit",
+	source_dir = "vendor/toolkit",
+	exports = ["toolkit", "toolkit/format"]
+}
+
+---
+A second package whose name starts with `toolkit`: `toolkitx/...` must not count
+as one of `toolkit`'s own modules.
+---
+TOOLKITX_PACKAGE: SourcePackageRoot = {
+	package_alias = "extra",
+	package_name = "toolkitx",
+	source_dir = "vendor/toolkitx",
+	exports = ["toolkitx/thing"]
+}
+
+LOOKUP_ROOTS: SourceLookupRoots = {
+	standard_library_root = "std",
+	native_package_roots = ["pkg"],
+	source_packages = [TOOLS_PACKAGE, TOOLKITX_PACKAGE]
+}
+
+NO_IMPLICIT_MODULES: ImplicitModules = {module_names = []}
+
+
+---
+The modules discovered from `root` over `sources`, in order, each as
+`<origin> <path>` with ` package=<name>` when it has one. An import that
+resolved nowhere adds no module.
+---
+func modules_found(sources: Dict[String, String], root: String) -> List[String]:
+	provider: InMemorySourceProvider = {sources = sources}
+
+	match discover(provider, LOOKUP_ROOTS, [root], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			var lines: List[String] = []
+
+			for index in 0..module_count(tables):
+				module = module_id_at_row(index)
+				row = tables.module_row(module)
+
+				package_text: String = match tables.module_package(module):
+					Some(package):
+						" package=${tables.name_spelling(package.name)}"
+					None:
+						""
+
+				lines = lines.append(
+					"${row.origin_text()} ${tables.path_text(row.canonical_path)}${package_text}",
+				)
+
+			lines
+		TableInvariantsViolated(violations):
+			["invariant violations: ${violations.length()}"]
+
+
+func test_an_alias_resolves_to_an_exported_package_module() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools\n\ttools/format\n",
+			"vendor/toolkit/toolkit.brp" => "",
+			"vendor/toolkit/toolkit/format.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == [
+		"user app/main.brp",
+		"source-package vendor/toolkit/toolkit.brp package=tools",
+		"source-package vendor/toolkit/toolkit/format.brp package=tools",
+	]
+
+
+func test_a_module_the_package_does_not_export_does_not_resolve_through_its_alias() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools/internal\n\ttoolkit/format\n",
+			"vendor/toolkit/toolkit/internal.brp" => "",
+			"vendor/toolkit/toolkit/format.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp"]
+
+
+func test_an_alias_wins_over_the_standard_library_and_a_local_module() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools/format\n",
+			"app/tools/format.brp" => "",
+			"std/tools/format.brp" => "",
+			"vendor/toolkit/toolkit/format.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp", "source-package vendor/toolkit/toolkit/format.brp package=tools"]
+
+
+func test_a_request_no_alias_names_falls_back_to_the_standard_library_then_local() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\tshadow\n\tlocal_only\n\ttools/missing\n",
+			"app/shadow.brp" => "",
+			"std/shadow.brp" => "",
+			"app/local_only.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp", "stdlib std/shadow.brp", "user app/local_only.brp"]
+
+
+func test_a_package_imports_its_own_modules_by_bare_name_before_the_standard_library() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools\n",
+			"vendor/toolkit/toolkit.brp" => "import:\n\ttoolkit/internal\n\toption\n",
+			"vendor/toolkit/toolkit/internal.brp" => "",
+			"std/toolkit/internal.brp" => "",
+			"std/option.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == [
+		"user app/main.brp",
+		"source-package vendor/toolkit/toolkit.brp package=tools",
+		"source-package vendor/toolkit/toolkit/internal.brp package=tools",
+		"stdlib std/option.brp",
+	]
+
+
+func test_a_package_cannot_import_a_module_beside_it_that_is_not_its_own() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools\n",
+			"vendor/toolkit/toolkit.brp" => "import:\n\thelper\n\ttools/format\n",
+			"vendor/toolkit/helper.brp" => "",
+			"vendor/toolkit/toolkit/format.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp", "source-package vendor/toolkit/toolkit.brp package=tools"]
+
+
+func test_a_package_relative_import_stays_inside_the_package_and_keeps_its_origin() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools\n",
+			"vendor/toolkit/toolkit.brp" => "import:\n\t./toolkit/internal\n\t../outside\n\t../../app/sibling\n",
+			"vendor/toolkit/toolkit/internal.brp" => "",
+			"vendor/outside.brp" => "",
+			"app/sibling.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == [
+		"user app/main.brp",
+		"source-package vendor/toolkit/toolkit.brp package=tools",
+		"source-package vendor/toolkit/toolkit/internal.brp package=tools",
+	]
+
+
+func test_a_user_relative_import_is_not_confined_to_a_package() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\t../vendor/toolkit/toolkit\n",
+			"vendor/toolkit/toolkit.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp", "user vendor/toolkit/toolkit.brp"]
+
+
+func test_a_source_package_module_cannot_import_a_native_package() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools\n",
+			"vendor/toolkit/toolkit.brp" => "import:\n\tpkg/net/http\n",
+			"pkg/net/http.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp", "source-package vendor/toolkit/toolkit.brp package=tools"]
+
+
+func test_a_standard_library_module_cannot_import_a_native_package() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\tlist_tools\n",
+			"std/list_tools.brp" => "import:\n\tpkg/net/http\n",
+			"pkg/net/http.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp", "stdlib std/list_tools.brp"]
+
+
+func test_a_package_name_that_only_starts_like_another_is_not_internal_to_it() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\ttools\n",
+			"vendor/toolkit/toolkit.brp" => "import:\n\ttoolkitx/thing\n",
+			"vendor/toolkit/toolkitx/thing.brp" => "",
+			"vendor/toolkitx/toolkitx/thing.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == ["user app/main.brp", "source-package vendor/toolkit/toolkit.brp package=tools"]
+
+
+func test_a_native_package_relative_import_keeps_the_native_package() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\tpkg/net/http\n",
+			"pkg/net/http.brp" => "import:\n\t./codec\n",
+			"pkg/net/codec.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == [
+		"user app/main.brp",
+		"package pkg/net/http.brp package=net",
+		"package pkg/net/codec.brp package=net",
+	]
+
+
+func test_a_native_package_module_resolves_bare_requests_like_user_code() -> Bool:
+	found: List[String] = modules_found(
+		{
+			"app/main.brp" => "import:\n\tpkg/net/http\n",
+			"pkg/net/http.brp" => "import:\n\ttools/format\n\tbytes\n\tsibling\n\tpkg/net/codec\n",
+			"pkg/net/sibling.brp" => "",
+			"pkg/net/codec.brp" => "",
+			"std/bytes.brp" => "",
+			"vendor/toolkit/toolkit/format.brp" => "",
+		},
+		"app/main.brp",
+	)
+
+	found == [
+		"user app/main.brp",
+		"package pkg/net/http.brp package=net",
+		"source-package vendor/toolkit/toolkit/format.brp package=tools",
+		"stdlib std/bytes.brp",
+		"user pkg/net/sibling.brp",
+		"package pkg/net/codec.brp package=net",
+	]
+
+
+func test_a_native_and_a_source_package_with_one_name_are_two_packages() -> Bool:
+	roots: SourceLookupRoots = {
+		standard_library_root = "std",
+		native_package_roots = ["pkg"],
+		source_packages = [
+			{
+				package_alias = "net",
+				package_name = "netkit",
+				source_dir = "vendor/netkit",
+				exports = ["netkit"]
+			},
+		]
+	}
+	provider: InMemorySourceProvider = {
+		sources = {
+			"app/main.brp" => "import:\n\tpkg/net/http\n\tnet\n",
+			"pkg/net/http.brp" => "",
+			"vendor/netkit/netkit.brp" => "",
+		},
+	}
+
+	match discover(provider, roots, ["app/main.brp"], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			native_kind: Option[PackageKind] = tables
+				.module_package(module_id_at_row(1))
+				.map(func(package): package.kind)
+			source_kind: Option[PackageKind] = tables
+				.module_package(module_id_at_row(2))
+				.map(func(package): package.kind)
+
+			native_kind == Some(NativePackage) and source_kind == Some(SourcePackage)
+		TableInvariantsViolated(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Source package lookup",
+	tests = [
+		(
+			"an alias resolves to an exported package module",
+			test_an_alias_resolves_to_an_exported_package_module,
+		),
+		(
+			"a module the package does not export does not resolve through its alias",
+			test_a_module_the_package_does_not_export_does_not_resolve_through_its_alias,
+		),
+		(
+			"an alias wins over the standard library and a local module",
+			test_an_alias_wins_over_the_standard_library_and_a_local_module,
+		),
+		(
+			"a request no alias names falls back to the standard library, then local",
+			test_a_request_no_alias_names_falls_back_to_the_standard_library_then_local,
+		),
+		(
+			"a package imports its own modules by bare name before the standard library",
+			test_a_package_imports_its_own_modules_by_bare_name_before_the_standard_library,
+		),
+		(
+			"a package cannot import a module beside it that is not its own",
+			test_a_package_cannot_import_a_module_beside_it_that_is_not_its_own,
+		),
+		(
+			"a package relative import stays inside the package and keeps its origin",
+			test_a_package_relative_import_stays_inside_the_package_and_keeps_its_origin,
+		),
+		(
+			"a user relative import is not confined to a package",
+			test_a_user_relative_import_is_not_confined_to_a_package,
+		),
+		(
+			"a source package module cannot import a native package",
+			test_a_source_package_module_cannot_import_a_native_package,
+		),
+		(
+			"a standard library module cannot import a native package",
+			test_a_standard_library_module_cannot_import_a_native_package,
+		),
+		(
+			"a package name that only starts like another is not internal to it",
+			test_a_package_name_that_only_starts_like_another_is_not_internal_to_it,
+		),
+		(
+			"a native package relative import keeps the native package",
+			test_a_native_package_relative_import_keeps_the_native_package,
+		),
+		(
+			"a native package module resolves bare requests like user code",
+			test_a_native_package_module_resolves_bare_requests_like_user_code,
+		),
+		(
+			"a native and a source package with one name are two packages",
+			test_a_native_and_a_source_package_with_one_name_are_two_packages,
+		),
+	]
+}

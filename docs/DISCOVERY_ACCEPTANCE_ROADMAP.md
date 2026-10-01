@@ -19,7 +19,10 @@ work and says what "accepted" means.
   diagnostics with first-diagnostic parity (item 6); and the implicit
   modules (`prelude`, `tuple`, and `test` when testing), loaded after the
   roots so the self-compile's module list equals the existing graph's in
-  count and order (item 1).
+  count and order (item 1); the embedded standard-library provider and
+  the source-package lookup rules, with the module-order differential
+  also run on the embedded library and on source-package and native-package
+  fixture projects, identical in modules, order and origins (item 5).
 - **Measured on the self-compile inputs:** 0.65 s user CPU against 1.3 s for
   the existing discovery; 4.3 G instructions against 8.6 G; about 500 k
   allocations against 7.9 M.
@@ -144,7 +147,7 @@ more. Each numbered item is one change.
 4. **Adapter, bodies (L).** Expressions, statements and patterns, with spans;
    the differential compares the full AST JSON for every corpus module
    (criterion 1).
-5. **Embedded standard library and source packages (M).** A provider that
+5. **Embedded standard library and source packages (M). Landed.** A provider that
    answers for the standard-library root from the compiler's embedded texts,
    and `blorp.toml` aliases as candidate rules in the lookup policy; the
    differential also runs under both (criterion 4).

@@ -1,0 +1,194 @@
+-- The standard library as the compiler carries it: sources embedded in the
+-- compiler, not files on disk. The released compiler runs this way when no
+-- standard-library directory is configured.
+--
+-- The embedded texts are a compiler build input, generated into
+-- `compiler/stage_01_generated_inputs/embedded_std`, which this stage must not
+-- import. The stage therefore asks for them through `EmbeddedStandardLibraryTexts`,
+-- and whoever composes the stage with the compiler (the legacy adapter, the
+-- parity tools) implements it over `embedded_std_module_names` and
+-- `embedded_std_source`. `standard_library/src` stays free of native and foreign
+-- code; nothing here touches it.
+import:
+	fs: DirectoryListing(DirectoryAbsent, DirectoryListed)
+	path: normalize
+	source_provider:
+		SOURCE_FILE_EXTENSION,
+		SourceLookupRoots,
+		SourcePackageRoot,
+		SourceProvider,
+		SourceRead(SourceText, SourceUnreadable),
+		directory_listing,
+		read_source,
+		source_exists,
+
+
+---
+The root the embedded standard library's paths are under. It names no
+directory; no file system holds a path below it. The existing front end
+records the same modules as `<embedded:name>`; `embedded_module_name` turns
+a path under this root back into the name, so a consumer that wants that
+spelling derives it instead of the stage's tables carrying two paths.
+---
+EMBEDDED_STANDARD_LIBRARY_ROOT: String = "<embedded-std>"
+
+
+---
+The texts of the standard library embedded in the compiler.
+
+- `module_names`: every embedded module, as its import path without the file
+  extension (`option`, `net/url`), in any order.
+- `module_source`: the text of `module_name`, or `None` for a module that is
+  not embedded.
+---
+trait EmbeddedStandardLibraryTexts:
+	pure func module_names(self: Self) -> List[String]
+	pure func module_source(self: Self, module_name: String) -> Option[String]
+
+
+---
+Answers for the standard library from `texts`, for paths under
+`EMBEDDED_STANDARD_LIBRARY_ROOT`, and for everything else from `inner`. Used
+when no standard-library directory is configured, which is how the released
+compiler runs.
+---
+record EmbeddedStandardLibraryProvider[Texts:EmbeddedStandardLibraryTexts, Inner:SourceProvider] {
+	texts: Texts,
+	inner: Inner
+}
+
+
+---
+The lookup roots for a compilation that reads the standard library from the
+embedded texts.
+---
+pure func embedded_lookup_roots(
+	native_package_roots: List[String],
+	source_packages: List[SourcePackageRoot],
+) -> SourceLookupRoots:
+	{
+		standard_library_root = EMBEDDED_STANDARD_LIBRARY_ROOT,
+		native_package_roots = native_package_roots,
+		source_packages = source_packages
+	}
+
+
+---
+The path components of `path` below the embedded root (the root is the first
+component), or `None` for a path elsewhere.
+---
+private pure func components_below_embedded_root(path: String) -> Option[List[String]]:
+	components: List[String] = normalize(path)
+		.split("/")
+		.filter(pure func(part): part != "")
+
+	if components.get(0) == Some(EMBEDDED_STANDARD_LIBRARY_ROOT):
+		Some(components.drop(1))
+	else:
+		None
+
+
+---
+The embedded module a path under the embedded root names, without its file
+extension: `<embedded-std>/net/url.brp` is `net/url`. `None` for a path
+elsewhere or without the source extension.
+---
+pure func embedded_module_name(path: String) -> Option[String]:
+	match components_below_embedded_root(path):
+		Some(components):
+			joined: String = components.join("/")
+
+			if components.length() > 0 and joined.ends_with(SOURCE_FILE_EXTENSION):
+				Some(joined.remove_suffix(SOURCE_FILE_EXTENSION))
+			else:
+				None
+		None:
+			None
+
+
+---
+The names `directory` holds when it is the embedded root or below it, one per
+child (a module's file name, or a subdirectory), sorted; `None` for a
+directory elsewhere.
+---
+private pure func embedded_directory_names[Texts:EmbeddedStandardLibraryTexts](
+	texts: Texts,
+	directory: String,
+) -> Option[List[String]]:
+	match components_below_embedded_root(directory):
+		None:
+			None
+		Some(directory_parts):
+			var children: List[String] = []
+
+			for module_name in texts.module_names():
+				parts: List[String] = module_name.split("/")
+
+				if (
+					parts.length() > directory_parts.length()
+					and parts.take(directory_parts.length()) == directory_parts
+				):
+					child: String = parts.get_or(directory_parts.length(), "")
+
+					if parts.length() == directory_parts.length() + 1:
+						children = children.append(child + SOURCE_FILE_EXTENSION)
+					else:
+						children = children.append(child)
+
+			Some(
+				children
+					.sort()
+					.dedupe_sorted(),
+			)
+
+
+---
+`names` without adjacent repeats, for a sorted list: a subdirectory is one
+child however many modules it holds.
+---
+private pure func dedupe_sorted(names: List[String]) -> List[String]:
+	var kept: List[String] = []
+
+	for name in names:
+		if kept.last() != Some(name):
+			kept = kept.append(name)
+
+	kept
+
+
+implements SourceProvider for EmbeddedStandardLibraryProvider[Texts:EmbeddedStandardLibraryTexts, Inner:SourceProvider]:
+	func source_exists(self: EmbeddedStandardLibraryProvider[Texts, Inner], path: String) -> Bool:
+		match embedded_module_name(path):
+			Some(module_name):
+				self.texts
+					.module_source(module_name)
+					.is_some()
+			None:
+				self.inner.source_exists(path)
+
+	func directory_listing(
+		self: EmbeddedStandardLibraryProvider[Texts, Inner],
+		directory: String,
+	) -> DirectoryListing:
+		match self.texts.embedded_directory_names(directory):
+			Some(names):
+				if names.length() == 0:
+					DirectoryAbsent
+				else:
+					DirectoryListed(names)
+			None:
+				self.inner.directory_listing(directory)
+
+	func read_source(
+		self: EmbeddedStandardLibraryProvider[Texts, Inner],
+		path: String,
+	) -> SourceRead:
+		match embedded_module_name(path):
+			Some(module_name):
+				match self.texts.module_source(module_name):
+					Some(text):
+						SourceText(text)
+					None:
+						SourceUnreadable
+			None:
+				self.inner.read_source(path)
