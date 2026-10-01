@@ -243,6 +243,7 @@ import:
 		ParsedListPatternSpread(ParsedListSpreadName, ParsedListSpreadWildcard),
 		ParsedLogicalOp(ParsedAndOp, ParsedOrOp),
 		ParsedMatchCase,
+		ParsedModuleDoc,
 		ParsedParam,
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedPattern(
@@ -389,6 +390,12 @@ private record ParseDeclStep {
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	value: ParsedDecl
+}
+
+
+private record ParseModuleDocStep {
+	index: Int,
+	value: Option[ParsedModuleDoc]
 }
 
 
@@ -10210,7 +10217,23 @@ private pure func parse_decl(
 	if current_is_keyword(state, st, PrivateKeyword):
 		parse_private_decl(state, st, st_diag, doc, start_span)
 	else if current_is_keyword(state, st, ImportKeyword):
-		parse_import_block_decl(state, st, st_diag, start_span)
+		import_diagnostics: List[ParseDiagnostic] = match doc:
+			Some(_):
+				add_expected_error(
+					state,
+					st_diag,
+					start_span,
+					"a docstring cannot document an import block",
+					[],
+					Some((
+							"a module docstring must be the first thing in the file, directly before its "
+							+ "first `import:` block; move it there or remove it"
+						)),
+				)
+			None:
+				st_diag
+
+		parse_import_block_decl(state, st, import_diagnostics, start_span)
 	else if current_is_keyword(state, st, ForeignKeyword):
 		parse_foreign_block_decl(state, st, st_diag, start_span)
 	else if current_is_keyword(state, st, FuncKeyword):
@@ -10280,6 +10303,37 @@ private pure func parse_error_decl(
 
 
 ---
+Reads the module docstring: a block docstring that opens the file and is
+followed directly by `import:`. Any other leading docstring belongs to the
+declaration after it, so it is left for `parse_decl`.
+---
+private pure func parse_module_doc(state: ParserInput, index: Int) -> ParseModuleDocStep:
+	after_doc: Int = skip_newlines(
+		state,
+		advance_parser(state, index),
+	)
+	opens_module_doc: Bool = match current_tag(state, index):
+		DocStringTag:
+			current_is_keyword(state, after_doc, ImportKeyword)
+		_:
+			False
+
+	if opens_module_doc:
+		{
+			index = after_doc,
+			value = Some({
+				text = current_text(state, index),
+				span = current_location(state, index),
+			})
+		}
+	else:
+		{
+			index = index,
+			value = None
+		}
+
+
+---
 Parse a synthetic source while storing its authored locations at a caller-
 supplied offset in the owning source file. Parser control and diagnostics
 remain local to `source`; only retained AST locations are rebased.
@@ -10304,7 +10358,11 @@ pure func parse_compiler_source_rebased_with_names(
 		lex_result.module_name,
 		location_offset_delta,
 	)
-	var index: Int = skip_newlines(state, 0)
+	module_doc_step: ParseModuleDocStep = parse_module_doc(
+		state,
+		skip_newlines(state, 0),
+	)
+	var index: Int = module_doc_step.index
 	var diagnostics: List[ParseDiagnostic] = lex_result.diagnostics
 	var decls: List[ParsedDecl] = []
 
@@ -10320,6 +10378,7 @@ pure func parse_compiler_source_rebased_with_names(
 
 	({
 			source = source,
+			module_doc = module_doc_step.value,
 			decls = decls,
 			diagnostics = diagnostics
 		}, lex_result.names)

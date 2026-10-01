@@ -101,7 +101,12 @@ comment = "--" { any_char_except_newline }
 ### Program
 
 ```ebnf
-program = { NEWLINE } decl_list EOF ;
+program = { NEWLINE } [ module_doc ] decl_list EOF ;
+
+(* A module docstring opens the file and must be followed, after newlines, by
+   an import block, which decl_list then parses. Elsewhere a docstring belongs
+   to the `decl` after it; one before a later import block is rejected. *)
+module_doc = docstring { NEWLINE } (* followed by "import" *) ;
 
 decl_list = { decl { NEWLINE } | import_block { NEWLINE } | foreign_block { NEWLINE } } ;
 ```

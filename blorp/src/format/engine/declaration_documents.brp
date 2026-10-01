@@ -141,7 +141,20 @@ record LocatedDeclaration {
 }
 
 
+---
+The module docstring rendered above the leading import block. It is not a
+declaration's doc, so it lives on the program; `line` is where its opening
+`---` sits, which separates comments written above it from comments between
+it and the imports.
+---
+record ModuleDoc {
+	text_value: String,
+	line: Int
+}
+
+
 record Program {
+	module_doc: Option[ModuleDoc],
 	declarations: List[LocatedDeclaration],
 	comments: List[FormatterComment]
 }
@@ -2345,20 +2358,44 @@ private pure func program_first_decl_line(declarations: List[LocatedDeclaration]
 			2147483647
 
 
+---
+Renders the comments above the leading import block, with the module
+docstring (when present) between the comments written above it and those
+written between it and the imports.
+---
+private pure func import_header_document(program: Program) -> RenderedDocument:
+	first_decl_line: Int = program.declarations.program_first_decl_line()
+
+	match program.module_doc:
+		Some(module_doc):
+			above_doc: CommentTake = program.comments.take_leading_comments(module_doc.line)
+			below_doc: CommentTake = above_doc.remaining.take_leading_comments(first_decl_line)
+			{
+				document = above_doc.taken
+					.comments_document()
+					.cat(PlainDeclarationDoc(module_doc.text_value).docstring_document())
+					.cat(below_doc.taken.comments_document()),
+				remaining_comments = below_doc.remaining.copy_formatter_comments()
+			}
+		None:
+			header_comments: CommentTake = program.comments.take_leading_comments(first_decl_line)
+			{
+				document = header_comments.taken.comments_document(),
+				remaining_comments = header_comments.remaining.copy_formatter_comments()
+			}
+
+
 pure func program_document(program: Program) -> Doc:
 	parts: ProgramParts = program.declarations.split_leading_imports()
 
 	if parts.imports.length() == 0:
 		parts.body.program_body_document(program.comments)
 	else:
-		header_comments: CommentTake = program.comments.take_leading_comments(
-			program.declarations.program_first_decl_line(),
-		)
+		header: RenderedDocument = program.import_header_document()
 		import_render: RenderedImportBlock = parts.imports.render_import_block(
-			header_comments.remaining.copy_formatter_comments(),
+			header.remaining_comments.copy_formatter_comments(),
 		)
-		header_doc = header_comments.taken.comments_document()
-		import_document: Doc = header_doc.cat(import_render.document)
+		import_document: Doc = header.document.cat(import_render.document)
 		body_document: Doc = parts.body.program_body_document(
 			import_render.remaining_comments.copy_formatter_comments(),
 		)
@@ -2401,10 +2438,28 @@ private pure func located_declaration_from_json(
 			})
 
 
+private pure func module_doc_field(
+	value: JsonValue,
+	key: String,
+) -> Result[Option[ModuleDoc], String]:
+	match value.get_field(key):
+		None:
+			Ok(None)
+		Some(child):
+			text_value ?= child.string_field("text")
+			line ?= child.int_field("line")
+			Ok(Some({
+				text_value = text_value,
+				line = line,
+			}))
+
+
 pure func program_from_json(value: JsonValue) -> Result[Program, String]:
 	declarations ?= value.parsed_array_field("program", located_declaration_from_json)
 	comments ?= value.formatter_comments_field("comments")
+	module_doc ?= value.module_doc_field("module_doc")
 	Ok({
+		module_doc = module_doc,
 		declarations = declarations,
 		comments = comments,
 	})

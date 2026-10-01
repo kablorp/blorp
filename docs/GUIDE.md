@@ -2388,6 +2388,18 @@ integrations under `pkg/` and keep the standard library portable.
 Wildcard imports are not supported; list the symbols you need or import the
 module with an alias for qualified access.
 
+A `---` docstring that opens the file, directly before its first `import:`
+block, documents the module. Imports themselves cannot carry a docstring, so a
+docstring above any later import block is a parse error:
+
+```blorp
+---
+Parses configuration files into typed settings.
+---
+import:
+    list: List
+```
+
 The compiler rejects imports that are not used in the same file when that file
 is checked, compiled, or run explicitly. Imported user modules are checked too;
 compiler-injected prelude imports are not reported. `standard_library/src/prelude.brp` is also
