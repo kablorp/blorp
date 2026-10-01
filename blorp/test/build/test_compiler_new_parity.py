@@ -34,6 +34,31 @@ def dump(path: str, tokens: list[str], lexer: int = 0, parse: int = 0) -> str:
 
 
 class CompilerNewParityTests(unittest.TestCase):
+	def test_module_order_agrees_after_normalizing_discovery_paths(self) -> None:
+		problems = parity.module_order_problems(
+			"compile",
+			"blorp/src/main.brp",
+			["main", "prelude", "tuple", "blorp/src/a", "option"],
+			[
+				"blorp/src/main.brp",
+				"standard_library/src/prelude.brp",
+				"standard_library/src/tuple.brp",
+				"blorp/src/a.brp",
+				"standard_library/src/option.brp",
+			],
+		)
+		self.assertEqual(problems, [])
+
+	def test_module_order_names_the_first_difference(self) -> None:
+		problems = parity.module_order_problems(
+			"test",
+			"blorp/src/main.brp",
+			["main", "prelude", "tuple", "test"],
+			["blorp/src/main.brp", "standard_library/src/prelude.brp", "standard_library/src/tuple.brp"],
+		)
+		self.assertTrue(problems[0].startswith("module order differs for test root"))
+		self.assertIn("position 3: existing test, discovery (none)", problems[1])
+
 	def test_hash_and_adjacent_name_merge_into_a_dimension_name(self) -> None:
 		merged = parity.merge_dimension_names(
 			["0 1 HashSymbol", "1 3 IdentifierToken Ds", "4 5 HashSymbol", "6 7 IdentifierToken x"]

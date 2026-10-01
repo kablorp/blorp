@@ -15,6 +15,7 @@ import:
 		RowRange,
 		definition_id_index,
 		foreign_block_id_index,
+		implicit_request_id_index,
 		import_id_index,
 		import_item_id_index,
 		literal_id_index,
@@ -63,6 +64,9 @@ enum DiscoveryTable:
 	RootTable
 	RootTargetTable
 	RootDiagnosticTable
+	ImplicitRequestTable
+	ImplicitTargetTable
+	ImplicitDiagnosticTable
 	ImportTable
 	ImportPathPartTable
 	ImportItemTable
@@ -114,6 +118,7 @@ What a violation breaks. The meaning of `TableInvariantViolation.value` and
 - `SpanOutsideSources`: A span names no source; `value` is the span's source index.
 - `DuplicateSideRow`: A side table holds more than one row for an owner that may have at most one; the row is the owner's index in `related_table` and `value` the row count.
 - `RootOutcomeMismatch`: A root has not exactly one of a target and a root diagnostic; `value` is how many it has.
+- `ImplicitOutcomeMismatch`: An implicit module request has not exactly one of a target and an implicit diagnostic; `value` is how many it has.
 - `SignatureCountMismatch`: A function-like definition has not exactly one signature row, or another definition has one; the row is the definition and `value` its signature count.
 - `SideTableUnsorted`: A side table read by owner is not sorted by strictly increasing owner; `value` is the row's owner.
 - `SpanPastSourceEnd`: A span ends past its source's text; `value` is the span's end.
@@ -136,6 +141,7 @@ enum TableInvariantKind:
 	SpanPastSourceEnd
 	DuplicateSideRow
 	RootOutcomeMismatch
+	ImplicitOutcomeMismatch
 	SignatureCountMismatch
 	SideTableUnsorted
 	LocalFunctionNodeMismatch
@@ -229,6 +235,7 @@ pure func check_table_invariants(
 		.concat(builder.check_module_rows())
 		.concat(builder.check_module_ranges())
 		.concat(builder.check_root_rows())
+		.concat(builder.check_implicit_rows())
 		.concat(builder.check_import_rows())
 		.concat(builder.check_declaration_rows())
 		.concat(builder.check_node_rows())
@@ -619,6 +626,70 @@ private pure func check_root_rows(builder: DiscoveryBuilder) -> List[TableInvari
 			diagnostic_row,
 			DiagnosticArgumentTable,
 			root_diagnostic.arguments,
+			argument_count,
+		)
+		diagnostic_row += 1
+
+	found
+
+
+private pure func check_implicit_rows(builder: DiscoveryBuilder) -> List[TableInvariantViolation]:
+	var found: List[TableInvariantViolation] = []
+	request_count: Int = builder.implicit_requests.length()
+	module_count: Int = builder.modules.length()
+	path_count: Int = builder.paths.length()
+	argument_count: Int = builder.diagnostic_arguments.length()
+	var row: Int = 0
+
+	for request in builder.implicit_requests:
+		found = check_reference(
+			found,
+			ImplicitRequestTable,
+			row,
+			PathTable,
+			request.request_path.path_id_index(),
+			path_count,
+		)
+		row += 1
+
+	var target_row: Int = 0
+
+	for target in builder.implicit_targets:
+		found = check_reference(
+			found,
+			ImplicitTargetTable,
+			target_row,
+			ImplicitRequestTable,
+			target.request.implicit_request_id_index(),
+			request_count,
+		)
+		found = check_reference(
+			found,
+			ImplicitTargetTable,
+			target_row,
+			ModuleTable,
+			target.target.module_id_index(),
+			module_count,
+		)
+		target_row += 1
+
+	var diagnostic_row: Int = 0
+
+	for implicit_diagnostic in builder.implicit_diagnostics:
+		found = check_reference(
+			found,
+			ImplicitDiagnosticTable,
+			diagnostic_row,
+			ImplicitRequestTable,
+			implicit_diagnostic.request.implicit_request_id_index(),
+			request_count,
+		)
+		found = check_range(
+			found,
+			ImplicitDiagnosticTable,
+			diagnostic_row,
+			DiagnosticArgumentTable,
+			implicit_diagnostic.arguments,
 			argument_count,
 		)
 		diagnostic_row += 1
@@ -1361,6 +1432,15 @@ private pure func check_cardinalities(builder: DiscoveryBuilder) -> List[TableIn
 		roots,
 		builder.root_diagnostics.map(pure func(row): row.root.root_id_index()),
 	)
+	implicit_requests: Int = builder.implicit_requests.length()
+	implicit_targets: List[Int] = owner_counts(
+		implicit_requests,
+		builder.implicit_targets.map(pure func(row): row.request.implicit_request_id_index()),
+	)
+	implicit_diagnostics: List[Int] = owner_counts(
+		implicit_requests,
+		builder.implicit_diagnostics.map(pure func(row): row.request.implicit_request_id_index()),
+	)
 	signatures: List[Int] = owner_counts(
 		definitions,
 		builder.signatures.map(pure func(row): row.definition.definition_id_index()),
@@ -1384,6 +1464,12 @@ private pure func check_cardinalities(builder: DiscoveryBuilder) -> List[TableIn
 		),
 	)
 	found = at_most_one(found, RootTargetTable, RootTable, root_targets)
+	found = at_most_one(found, ImplicitTargetTable, ImplicitRequestTable, implicit_targets)
+	found = sorted_by_owner(
+		found,
+		ImplicitTargetTable,
+		builder.implicit_targets.map(pure func(row): row.request.implicit_request_id_index()),
+	)
 	found = sorted_by_owner(
 		found,
 		ImportTargetTable,
@@ -1462,6 +1548,27 @@ private pure func check_cardinalities(builder: DiscoveryBuilder) -> List[TableIn
 			)
 
 		root += 1
+
+	var request: Int = 0
+
+	while request < implicit_requests:
+		outcomes: Int = implicit_targets.get_or(
+			request,
+			0,
+		) + implicit_diagnostics.get_or(request, 0)
+
+		if outcomes != 1:
+			found = found.append(
+				violation(
+					ImplicitOutcomeMismatch,
+					ImplicitRequestTable,
+					request,
+					ImplicitTargetTable,
+					outcomes,
+				),
+			)
+
+		request += 1
 
 	var row: Int = 0
 

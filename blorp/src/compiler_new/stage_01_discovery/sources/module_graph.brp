@@ -18,6 +18,7 @@
 import:
 	../tables/builder:
 		DiscoveryBuilder,
+		ImplicitRequestId,
 		ImportId,
 		ImportRow,
 		ModuleId,
@@ -26,6 +27,9 @@ import:
 		PathId,
 		RootId,
 		append_diagnostic_argument,
+		append_implicit_diagnostic,
+		append_implicit_request,
+		append_implicit_target,
 		append_import_target,
 		append_module_package,
 		append_name,
@@ -45,6 +49,7 @@ import:
 		module_id_index,
 		name_id_index,
 		next_diagnostic_argument_row,
+		next_implicit_request_id,
 		next_name_id,
 		next_package_id,
 		next_root_id,
@@ -53,6 +58,7 @@ import:
 	../tables/diagnostic_code:
 		DiscoveryDiagnosticCode(
 			ImportCaseMismatchDiagnostic,
+			MissingImplicitModuleDiagnostic,
 			RootCaseMismatchDiagnostic,
 			SourceTooLargeDiagnostic,
 			TooManySourcesDiagnostic,
@@ -61,7 +67,9 @@ import:
 			UnresolvedImportDiagnostic,
 			UnresolvedRootDiagnostic,
 		),
-	../tables/row_kinds: ModuleReach(ImportedModule, RootModule), PackageKind(NativePackage)
+	../tables/row_kinds:
+		ModuleReach(ImplicitModule, ImportedModule, RootModule),
+		PackageKind(NativePackage),
 	../tables/span: Span, pack_span
 	fs:
 		DirectoryListing,
@@ -83,6 +91,7 @@ import:
 		SourceProvider,
 		SourceRead(SourceText, SourceUnreadable),
 		directory_listing,
+		implicit_module_candidate,
 		import_candidates,
 		read_source,
 		root_candidate,
@@ -121,11 +130,12 @@ pure func empty_import_queue() -> ImportQueue:
 
 
 ---
-What asked for a module: a root or an import. Its target or diagnostic
-row is recorded against it.
+What asked for a module: a root, an implicit module request or an import. Its
+target or diagnostic row is recorded against it.
 ---
 union ModuleRequester:
 	RequestedByRoot(RootId)
+	RequestedImplicitly(ImplicitRequestId)
 	RequestedByImport(ImportId)
 
 
@@ -185,6 +195,35 @@ func resolve_root[Provider:SourceProvider](
 			(listings, ModuleAlreadyLoaded(module))
 		None:
 			look_up_candidates(provider, builder, listings, [candidate])
+
+
+---
+Interns the name of an implicit module and appends its request row; read the
+request's id first with `next_implicit_request_id`.
+---
+pure func record_implicit_request(
+	builder: DiscoveryBuilder,
+	module_name: String,
+) -> DiscoveryBuilder:
+	request_path: PathId = builder.interned_path_id(module_name)
+	var out: DiscoveryBuilder = builder.intern_path(module_name)
+	out = out.append_implicit_request({request_path = request_path})
+	out
+
+
+---
+Resolves the implicit module `module_name`, a standard-library module. A
+source already loaded from its path (a root that is that very module, or an
+earlier implicit request) is reused; `listings` as for `resolve_root`.
+---
+func resolve_implicit[Provider:SourceProvider](
+	provider: Provider,
+	lookup: SourceLookupRoots,
+	builder: DiscoveryBuilder,
+	listings: Dict[String, DirectoryListing],
+	module_name: String,
+) -> (Dict[String, DirectoryListing], RequestResolution):
+	look_up_candidates(provider, builder, listings, [lookup.implicit_module_candidate(module_name)])
 
 
 ---
@@ -262,6 +301,8 @@ pure func reach_of(requester: ModuleRequester) -> ModuleReach:
 	match requester:
 		RequestedByRoot(_):
 			RootModule
+		RequestedImplicitly(_):
+			ImplicitModule
 		RequestedByImport(_):
 			ImportedModule
 
@@ -278,6 +319,11 @@ pure func record_target(
 		RequestedByRoot(root):
 			builder.append_root_target({
 				root = root,
+				target = module,
+			})
+		RequestedImplicitly(request):
+			builder.append_implicit_target({
+				request = request,
 				target = module,
 			})
 		RequestedByImport(import_id):
@@ -301,6 +347,8 @@ pure func report_failure(
 			match requester:
 				RequestedByRoot(root):
 					builder.report_root(root, UnresolvedRootDiagnostic)
+				RequestedImplicitly(request):
+					builder.report_implicit(request, MissingImplicitModuleDiagnostic)
 				RequestedByImport(import_id):
 					builder.report_import(import_id, UnresolvedImportDiagnostic)
 		SpellingUnknown:
@@ -309,6 +357,10 @@ pure func report_failure(
 			match requester:
 				RequestedByRoot(root):
 					builder.report_root_case_mismatch(root, stored_names)
+				RequestedImplicitly(request):
+					-- The name is the compiler's own constant, so the stored spelling
+					-- teaches nothing: the module is simply not there.
+					builder.report_implicit(request, MissingImplicitModuleDiagnostic)
 				RequestedByImport(import_id):
 					builder.report_import_case_mismatch(import_id, stored_names)
 		ReadFailed:
@@ -317,6 +369,8 @@ pure func report_failure(
 			match requester:
 				RequestedByRoot(root):
 					builder.report_rejected_root(root, rejection, byte_length)
+				RequestedImplicitly(request):
+					builder.report_rejected_implicit(request, rejection, byte_length)
 				RequestedByImport(import_id):
 					builder.report_rejected_import(import_id, rejection, byte_length)
 		LoadSource(_, _):
@@ -333,6 +387,8 @@ private pure func report_requester(
 	match requester:
 		RequestedByRoot(root):
 			builder.report_root(root, code)
+		RequestedImplicitly(request):
+			builder.report_implicit(request, code)
 		RequestedByImport(import_id):
 			builder.report_import(import_id, code)
 
@@ -733,3 +789,45 @@ private pure func report_rejected_root(
 			out
 		TooManySourcesToSpan:
 			builder.report_root(root, TooManySourcesDiagnostic)
+
+
+---
+Reports that implicit module `request` loaded no module, with no arguments.
+---
+private pure func report_implicit(
+	builder: DiscoveryBuilder,
+	request: ImplicitRequestId,
+	code: DiscoveryDiagnosticCode,
+) -> DiscoveryBuilder:
+	arguments_first: Int = builder.next_diagnostic_argument_row()
+	builder.append_implicit_diagnostic({
+		request = request,
+		code = code,
+		arguments = {
+			first = arguments_first,
+			count = 0
+		},
+	})
+
+
+private pure func report_rejected_implicit(
+	builder: DiscoveryBuilder,
+	request: ImplicitRequestId,
+	rejection: SourceRejection,
+	byte_length: Int,
+) -> DiscoveryBuilder:
+	match rejection:
+		SourceTooLargeToSpan:
+			arguments_first: Int = builder.next_diagnostic_argument_row()
+			var out: DiscoveryBuilder = builder.append_diagnostic_argument(byte_length)
+			out = out.append_implicit_diagnostic({
+				request = request,
+				code = SourceTooLargeDiagnostic,
+				arguments = {
+					first = arguments_first,
+					count = 1
+				},
+			})
+			out
+		TooManySourcesToSpan:
+			builder.report_implicit(request, TooManySourcesDiagnostic)

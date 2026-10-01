@@ -17,6 +17,13 @@ sequentially, over the whole file list:
   * `blorp/test/compiler/tools/legacy_front_end_dump.brp` (existing compiler),
   * `blorp/test/compiler_new/tools/corpus_dump.brp` (discovery stage).
 
+It also checks module order: for one compile root and one `blorp test` root,
+the existing front end's module graph (`legacy_module_order_dump.brp`) and the
+discovery stage's (`module_order_dump.brp`) must list the same modules in the
+same order (roots, then the implicit modules, then imports). This is what
+catches the stage's implicit module names drifting from the existing
+front end's constants.
+
 A mismatch is printed with its file and, for tokens, the first differing
 token. Exit status 0 means every file agrees.
 
@@ -43,6 +50,20 @@ CORPUS_SUFFIX = ".brp"
 
 LEGACY_DUMPER = "blorp/test/compiler/tools/legacy_front_end_dump.brp"
 DISCOVERY_DUMPER = "blorp/test/compiler_new/tools/corpus_dump.brp"
+LEGACY_ORDER_DUMPER = "blorp/test/compiler/tools/legacy_module_order_dump.brp"
+DISCOVERY_ORDER_DUMPER = "blorp/test/compiler_new/tools/module_order_dump.brp"
+
+# The roots whose module graphs are compared, with the dumpers' mode for each:
+# a compile root, and a test root (which also seeds the test runtime).
+ORDER_CHECKS = (
+    ("compile", "blorp/src/main.brp"),
+    ("test", "blorp/test/compiler_new/stage_01_discovery/test_pipeline.brp"),
+)
+
+# The existing front end names the root module `main`, a standard-library
+# module by its bare module name and any other module by its path.
+LEGACY_ROOT_MODULE_NAME = "main"
+STANDARD_LIBRARY_ROOT = "standard_library/src/"
 
 FILE_HEADER_PREFIX = "== "
 UNREADABLE_PREFIX = "unreadable "
@@ -70,6 +91,14 @@ EXCERPT_LIMIT = 200
 # Flags of the host C compile of a dumper: optimized enough that the corpus
 # runs in seconds, with the wrapping integer semantics the runtime assumes.
 C_COMPILE_FLAGS = ("-O1", "-fwrapv", "-w")
+# Native headers (`*_ffi.h`) the existing compiler's foreign declarations
+# include, found beside the declaring module; only the order dumper builds the
+# whole compiler, but every dumper is given the directories.
+C_INCLUDE_FLAGS = tuple(
+    flag
+    for directory in sorted({str(path.parent) for path in REPO_ROOT.glob("blorp/src/**/*_ffi.h")})
+    for flag in ("-I", directory)
+)
 C_LINK_FLAGS = ("-lm", "-lpthread")
 DEFAULT_C_COMPILER = "clang"
 C_COMPILER_VARIABLE = "BLORP_CC"
@@ -273,15 +302,15 @@ def build_dumper(source: str, work: Path) -> Path:
         f"compile {source} to C",
     )
     run_checked(
-        [compiler, "-x", "c", str(c_file), *C_COMPILE_FLAGS, *C_LINK_FLAGS, "-o", str(binary)],
+        [compiler, "-x", "c", str(c_file), *C_COMPILE_FLAGS, *C_INCLUDE_FLAGS, *C_LINK_FLAGS, "-o", str(binary)],
         f"compile {c_file} with {compiler}",
     )
     return binary
 
 
-def run_dumper(binary: Path, file_list: Path) -> str:
+def run_dumper(binary: Path, *arguments: str | Path) -> str:
     result = subprocess.run(
-        [str(binary), str(file_list)],
+        [str(binary), *(str(argument) for argument in arguments)],
         cwd=REPO_ROOT,
         capture_output=True,
         check=False,
@@ -291,6 +320,48 @@ def run_dumper(binary: Path, file_list: Path) -> str:
         sys.stdout.write(result.stderr.decode("utf-8", "replace"))
         raise SystemExit(1)
     return result.stdout.decode("utf-8", "surrogateescape")
+
+
+def normalized_new_module(path: str, root: str) -> str:
+    """The discovery stage's module path spelled as the existing graph spells it."""
+    if path == root:
+        return LEGACY_ROOT_MODULE_NAME
+    name = path.removesuffix(".brp")
+    return name.removeprefix(STANDARD_LIBRARY_ROOT)
+
+
+def module_order_problems(mode: str, root: str, legacy: list[str], discovery: list[str]) -> list[str]:
+    """Why the two module sequences differ, or nothing when they are equal."""
+    new = [normalized_new_module(path, root) for path in discovery]
+    if legacy == new:
+        return []
+    problems = [
+        f"module order differs for {mode} root {root}: existing {len(legacy)} modules, "
+        f"discovery {len(new)}"
+    ]
+    for position in range(max(len(legacy), len(new))):
+        old_name = legacy[position] if position < len(legacy) else "(none)"
+        new_name = new[position] if position < len(new) else "(none)"
+        if old_name != new_name:
+            problems.append(f"  first difference at position {position}: existing {old_name}, discovery {new_name}")
+            break
+    return problems
+
+
+def check_module_orders(work: Path) -> tuple[list[str], list[str]]:
+    """Run both order dumpers for every `ORDER_CHECKS` root: (notes, problems)."""
+    legacy_binary = build_dumper(LEGACY_ORDER_DUMPER, work)
+    discovery_binary = build_dumper(DISCOVERY_ORDER_DUMPER, work)
+    notes: list[str] = []
+    problems: list[str] = []
+    for mode, root in ORDER_CHECKS:
+        legacy = run_dumper(legacy_binary, mode, root).splitlines()
+        discovery = run_dumper(discovery_binary, mode, root).splitlines()
+        found = module_order_problems(mode, root, legacy, discovery)
+        problems.extend(found)
+        if not found:
+            notes.append(f"module order agrees for {mode} root {root}: {len(legacy)} modules")
+    return notes, problems
 
 
 def report(comparison: Comparison, seconds: float) -> int:
@@ -354,6 +425,12 @@ def main() -> int:
         legacy_files = parse_dump(legacy_dump)
         discovery_files = parse_dump(discovery_dump)
         comparison = compare_dumps(legacy_files, discovery_files)
+        order_notes, order_problems = check_module_orders(work)
+        comparison.notes.extend(order_notes)
+        comparison.problems.extend(order_problems)
+        # Each root is one more check, failing when its module order differs.
+        comparison.files += len(ORDER_CHECKS)
+        comparison.mismatched_files += sum(1 for line in order_problems if line.startswith("module order differs"))
         missing = set(files) - (set(legacy_files) & set(discovery_files))
         if missing:
             comparison.problems.append(f"dumps omit {len(missing)} corpus files, for example {sorted(missing)[0]}")

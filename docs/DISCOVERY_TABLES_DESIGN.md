@@ -63,6 +63,8 @@ compiler CI):
 - the lexer, with token parity against the existing lexer over the whole
   corpus;
 - the module graph (resolving requests) and the source providers (file system and in-memory);
+- the implicit modules (section 6): `prelude` and `tuple`, and `test` when
+  testing, loaded after the roots as the existing front end seeds them;
 - the declaration, type, pattern and body parsers, with accept/reject parity
   against the existing parser over the corpus.
 
@@ -70,10 +72,6 @@ compiler CI):
 
 - **The legacy adapter** (section 10) and its differential check. Nothing
   outside `compiler_new` reads the tables yet.
-- **The prelude.** The existing compiler loads 16 prelude modules into every
-  compilation; discovery loads only what the roots import. Owner: the
-  stage (roadmap item 1, which also seeds the test runtime for `blorp test`);
-  needed before the adapter's differential check can pass.
 - **The embedded standard-library provider and the package catalog.** Both
   plug into the provider seam (section 5) without changes to the module graph.
 
@@ -160,7 +158,7 @@ struct ModuleRow {
 	source: SourceId,
 	canonical_path: PathId,
 	origin: ModuleOriginKind,   -- StdlibModule | PackageModule | UserModule
-	reach: ModuleReach,         -- RootModule | ImportedModule
+	reach: ModuleReach,         -- RootModule | ImplicitModule | ImportedModule
 	definitions: RowRange,
 	imports: RowRange,
 	nodes: RowRange,
@@ -172,12 +170,18 @@ struct ModulePackageRow {module: ModuleId, package: PackageId}
 struct RootRow {request_path: PathId}
 struct RootTargetRow {root: RootId, target: ModuleId}
 struct RootDiagnosticRow {root: RootId, code: DiscoveryDiagnosticCode, arguments: RowRange}
+
+struct ImplicitRequestRow {request_path: PathId}
+struct ImplicitTargetRow {request: ImplicitRequestId, target: ModuleId}
+struct ImplicitDiagnosticRow {request: ImplicitRequestId, code: DiscoveryDiagnosticCode, arguments: RowRange}
 ```
 
 `ModuleReach` replaces the sketch's `is_root: Bool`. Each module's rows in
 the definitions, imports, nodes and diagnostics tables are contiguous blocks,
 closed when its parse ends. Every root has exactly one outcome: a
-`RootTargetRow` or a `RootDiagnosticRow`.
+`RootTargetRow` or a `RootDiagnosticRow`. The implicit module requests (section
+6) are a table of their own, not roots, with the same one-outcome rule
+(`ImplicitTargetRow` or `ImplicitDiagnosticRow`).
 
 ### Imports
 
@@ -587,13 +591,42 @@ func discover[Provider: SourceProvider](
 	provider: Provider,
 	lookup: SourceLookupRoots,
 	roots: List[String],
+	implicit: ImplicitModules,
 ) -> FreezeOutcome
 ```
 
-Roots are loaded in the order given, then every import in the order its
-module was loaded and, within a module, in source order (breadth first). A
-module is loaded once per canonical path, whichever request reaches it
-first, so ids depend only on the roots and the sources.
+Roots are loaded in the order given, then the implicit modules in the order
+given, then every import in the order its module was loaded and, within a
+module, in source order (breadth first). A module is loaded once per
+canonical path, whichever request reaches it first, so ids depend only on the
+roots, the implicit modules and the sources.
+
+The implicit modules are the standard-library modules every compilation loads
+without an import. The existing front end seeds `prelude` and `tuple`
+(`COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS`) and, for `blorp test`, `test`
+(`TEST_RUNTIME_MODULE`), right after the roots, so the stage does the same, in
+the same position, and module order equals the existing graph's (checked on the
+self-compile: same modules, identical order). Everything else the prelude uses
+(`option`, `result`, `range`, ...) arrives through these modules' own imports.
+`pipeline` restates the names as `compiler_implicit_modules` and
+`test_implicit_modules` because the stage must not import the old compiler.
+A seed is a request of its own (`RequestedImplicitly`), not a root, with its
+own request, target and diagnostic rows, and a module it loads has reach
+`ImplicitModule` so later stages can tell it was not imported. It resolves as a
+standard-library module under `lookup.standard_library_root`. A root that is
+already that module (by canonical path) is the module the request targets, as
+in the existing front end, and keeps reach `RootModule`; a seed with no source
+is a `MissingImplicitModuleDiagnostic` row.
+
+`scripts/compiler-new-parity` keeps the restated names honest: for the
+self-compile root and for a `blorp test` root it compares the existing graph's
+module sequence (`legacy_module_order_dump.brp`) with the stage's
+(`module_order_dump.brp`), so a change to the old constants fails the gate.
+
+Follow-up: roots and implicit requests have parallel request, target and
+diagnostic tables and near-identical failure reporting in `module_graph`;
+unify them into one requests table keyed by what asked (root or implicit) when
+a third kind of request appears or the adapter reads them.
 
 Roots and imports go through the same two steps. `sources/module_graph.brp`
 resolves the request: `resolve_root` or `resolve_import` looks its candidates
@@ -750,7 +783,9 @@ surfaces and import references. It does no parsing, resolution or checking
 of its own; anything missing is a gap in the tables. The first version
 serves compilation (`check`, `compile`, `run`, `test`); the formatter, which
 needs comments the stage drops, and the LSP are decided after acceptance.
-Loading the prelude belongs to the stage (see Status), not the adapter.
+The stage already loads the implicit modules (section 6), so the adapter
+receives every module the existing graph has, in the same order; nothing in
+the adapter loads or orders modules.
 
 ### Proving the adapter
 
@@ -785,7 +820,9 @@ output is specified the same way.
 ## 12. Cost
 
 Discovery of the compiler's own sources (from `blorp/src/main.brp`, 373
-modules, without the prelude), each side in its own `-O2` binary, measured
+modules at the time, before the implicit modules were loaded; with them the
+stage loads the existing graph's module count, which cost +1.1% allocations and
++0.3% instructions), each side in its own `-O2` binary, measured
 on 2026-09-30 (median of 3; load average 5 to 7):
 
 | | Existing discovery | New discovery | New, without the `freeze` check |

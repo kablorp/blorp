@@ -1,10 +1,13 @@
 -- The discovery stage, in order:
 --
 --   1. roots, in the order given;
---   2. imports, breadth first: every import of a module in the order the
+--   2. implicit modules, in the order given (the prelude set, and for tests
+--      the test runtime), as the existing front end seeds them after the
+--      roots;
+--   3. imports, breadth first: every import of a module in the order the
 --      module was loaded and, within a module, in source order; each module
 --      is loaded once per canonical path;
---   3. freeze, behind the table invariants.
+--   4. freeze, behind the table invariants.
 --
 -- Each module is admitted, lexed and parsed into the builder as it is loaded.
 -- Where a step's mechanics live: `sources/module_graph` (resolving requests
@@ -21,7 +24,7 @@ import:
 	parse/declaration_parser: parse_module_declarations
 	sources/module_graph:
 		ImportQueue,
-		ModuleRequester(RequestedByImport, RequestedByRoot),
+		ModuleRequester(RequestedByImport, RequestedByRoot, RequestedImplicitly),
 		RequestResolution(LoadSource, ModuleAlreadyLoaded),
 		advance,
 		empty_import_queue,
@@ -29,16 +32,19 @@ import:
 		has_pending_import,
 		next_pending_import,
 		reach_of,
+		record_implicit_request,
 		record_module_package,
 		record_root_request,
 		record_target,
 		report_failure,
+		resolve_implicit,
 		resolve_import,
 		resolve_root,
 	sources/source_admission: admit_source, interned_path_id
 	sources/source_provider: SourceCandidate, SourceLookupRoots, SourceProvider
 	tables/builder:
 		DiscoveryBuilder,
+		ImplicitRequestId,
 		ModuleId,
 		ModuleRow,
 		PathId,
@@ -47,6 +53,7 @@ import:
 		close_module_row,
 		empty_discovery_builder,
 		module_row_start,
+		next_implicit_request_id,
 		next_module_id,
 		next_root_id,
 	tables/frontend_tables: FreezeOutcome, freeze
@@ -54,13 +61,56 @@ import:
 
 
 ---
-Discovers every module reachable from `roots` (source paths) through
-`provider`, then freezes the tables.
+The modules every compilation loads without an import.
+
+The existing front end seeds `COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS`
+(`prelude` and `tuple`, in `stage_04_modules/frontend_graph_service`), and for
+`blorp test` also `TEST_RUNTIME_MODULE` (`test`). This stage must not import
+the old compiler, so `compiler_implicit_modules` and `test_implicit_modules`
+restate them; the two must agree for as long as both front ends exist. Each is
+a standard-library module name, loaded right after the roots and before any
+import so module order matches the existing front end. Everything else the
+prelude needs (`option`, `result`, ...) arrives through these modules' own
+imports.
+---
+record ImplicitModules {
+	module_names: List[String]
+}
+
+
+PRELUDE_MODULE_NAME: String = "prelude"
+
+TUPLE_MODULE_NAME: String = "tuple"
+
+TEST_RUNTIME_MODULE_NAME: String = "test"
+
+
+---
+The implicit modules of compiling or checking a program.
+---
+pure func compiler_implicit_modules() -> ImplicitModules:
+	{module_names = [PRELUDE_MODULE_NAME, TUPLE_MODULE_NAME]}
+
+
+---
+The implicit modules of building a program's tests: the compiler's, then the
+test runtime.
+---
+pure func test_implicit_modules() -> ImplicitModules:
+	{module_names = [PRELUDE_MODULE_NAME, TUPLE_MODULE_NAME, TEST_RUNTIME_MODULE_NAME]}
+
+
+---
+Discovers every module reachable from `roots` (source paths) and from the
+`implicit` modules through `provider`, then freezes the tables. An implicit
+module that a root already is, or that an earlier request loaded, is not
+loaded twice.
 ---
 func discover[Provider:SourceProvider](
 	provider: Provider,
 	lookup: SourceLookupRoots,
 	roots: List[String],
+	implicit: ImplicitModules,
 ) -> FreezeOutcome:
 	var builder: DiscoveryBuilder = empty_discovery_builder()
 	var listings: Dict[String, DirectoryListing] = {}
@@ -73,6 +123,15 @@ func discover[Provider:SourceProvider](
 		listings = listed
 		loaded: ModuleId = builder.next_module_id()
 		builder = builder.settle_request(RequestedByRoot(root), loaded, resolution)
+		queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
+
+	for module_name in implicit.module_names:
+		request: ImplicitRequestId = builder.next_implicit_request_id()
+		builder = builder.record_implicit_request(module_name)
+		(listed, resolution) = provider.resolve_implicit(lookup, builder, listings, module_name)
+		listings = listed
+		loaded: ModuleId = builder.next_module_id()
+		builder = builder.settle_request(RequestedImplicitly(request), loaded, resolution)
 		queue = queue.enqueue_imports_of_loaded_module(builder, loaded, resolution)
 
 	while queue.has_pending_import():

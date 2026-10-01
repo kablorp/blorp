@@ -2,24 +2,36 @@
 -- freezes with the table invariants checked, so each test also shows the
 -- discovery's output satisfies them.
 import:
-	../../../src/compiler_new/stage_01_discovery/pipeline: discover
+	../../../src/compiler_new/stage_01_discovery/pipeline:
+		ImplicitModules,
+		compiler_implicit_modules,
+		discover,
+		test_implicit_modules,
 	../../../src/compiler_new/stage_01_discovery/sources/source_provider:
 		InMemorySourceProvider,
 		SourceLookupRoots,
 		SourceProvider,
-		SourceRead,
+		SourceRead(SourceText, SourceUnreadable),
 		directory_listing,
 		read_source,
 		respelled_import_text,
 		source_exists,
-	../../../src/compiler_new/stage_01_discovery/tables/builder: RowRange, module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/tables/builder:
+		RowRange,
+		module_id_at_row,
+		root_id_index,
+	../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
+		DiscoveryDiagnosticCode(TooManySourcesDiagnostic),
 	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
 		FreezeOutcome(FrozenTables, TableInvariantsViolated),
 		FrontendTables,
 		import_count,
 		module_count,
 		module_row,
-	../../../src/compiler_new/stage_01_discovery/tables/span: SPAN_OFFSET_LIMIT
+		root_count,
+		root_diagnostic_count,
+		root_diagnostic_row_at,
+	../../../src/compiler_new/stage_01_discovery/tables/span: SPAN_OFFSET_LIMIT, SPAN_SOURCE_LIMIT
 	../support/tables_dump: tables_dump
 	fs: DirectoryListing(DirectoryListed, DirectoryUnreadable)
 	test: TestSuite
@@ -30,15 +42,29 @@ LOOKUP_ROOTS: SourceLookupRoots = {
 	native_package_roots = ["pkg"]
 }
 
+NO_IMPLICIT_MODULES: ImplicitModules = {module_names = []}
+
 
 ---
-Discovers `roots` over `sources`, or `None` (with the violations printed)
+Discovers `roots` over `sources` with no implicit modules, or `None` (with the violations printed)
 when the result breaks a table invariant.
 ---
 func discovered(sources: Dict[String, String], roots: List[String]) -> Option[FrontendTables]:
+	discovered_with(sources, roots, NO_IMPLICIT_MODULES)
+
+
+---
+Discovers `roots` and the `implicit` modules over `sources`, or `None` (with the
+violations printed) when the result breaks a table invariant.
+---
+func discovered_with(
+	sources: Dict[String, String],
+	roots: List[String],
+	implicit: ImplicitModules,
+) -> Option[FrontendTables]:
 	provider: InMemorySourceProvider = {sources = sources}
 
-	match discover(provider, LOOKUP_ROOTS, roots):
+	match discover(provider, LOOKUP_ROOTS, roots, implicit):
 		FrozenTables(tables):
 			Some(tables)
 		TableInvariantsViolated(violations):
@@ -50,7 +76,20 @@ func discovered(sources: Dict[String, String], roots: List[String]) -> Option[Fr
 Whether discovering `roots` over `sources` renders exactly `expected`.
 ---
 func dumps_as(sources: Dict[String, String], roots: List[String], expected: List[String]) -> Bool:
-	match discovered(sources, roots):
+	dumps_as_with(sources, roots, NO_IMPLICIT_MODULES, expected)
+
+
+---
+Whether discovering `roots` and the `implicit` modules over `sources` renders
+exactly `expected`.
+---
+func dumps_as_with(
+	sources: Dict[String, String],
+	roots: List[String],
+	implicit: ImplicitModules,
+	expected: List[String],
+) -> Bool:
+	match discovered_with(sources, roots, implicit):
 		Some(tables):
 			actual: String = tables.tables_dump()
 			matches: Bool = actual == expected.join("\n")
@@ -338,7 +377,7 @@ func dump_with_listing_override(directory: String, listing: DirectoryListing) ->
 		listing = listing
 	}
 
-	match discover(provider, LOOKUP_ROOTS, ["app/main.brp"]):
+	match discover(provider, LOOKUP_ROOTS, ["app/main.brp"], NO_IMPLICIT_MODULES):
 		FrozenTables(tables):
 			Some(tables.tables_dump())
 		TableInvariantsViolated(_):
@@ -508,6 +547,208 @@ func test_source_too_large_to_span_is_rejected_with_a_row() -> Bool:
 	)
 
 
+PRELUDE_SOURCES: Dict[String, String] = {
+	"app/main.brp" => "import:\n\t./a\n",
+	"app/a.brp" => "",
+	"std/prelude.brp" => "import:\n\toption\n",
+	"std/tuple.brp" => "import:\n\tresult\n",
+	"std/option.brp" => "",
+	"std/result.brp" => "",
+	"std/test.brp" => "import:\n\toption\n",
+}
+
+
+func test_implicit_modules_load_after_the_roots_and_before_any_import() -> Bool:
+	dumps_as_with(
+		PRELUDE_SOURCES,
+		["app/main.brp"],
+		compiler_implicit_modules(),
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"implicit i0 prelude -> m1:std/prelude.brp",
+			"implicit i1 tuple -> m2:std/tuple.brp",
+			"module m0:app/main.brp source=s0 user root imports=0+1 diagnostics=0+0",
+			"  import i0 relative ./a parents=0 parts=a items=[] -> m3:app/a.brp",
+			"module m1:std/prelude.brp source=s1 stdlib implicit imports=1+1 diagnostics=0+0",
+			"  import i1 bare option parents=0 parts=option items=[] -> m4:std/option.brp",
+			"module m2:std/tuple.brp source=s2 stdlib implicit imports=2+1 diagnostics=0+0",
+			"  import i2 bare result parents=0 parts=result items=[] -> m5:std/result.brp",
+			"module m3:app/a.brp source=s3 user imported imports=3+0 diagnostics=0+0",
+			"module m4:std/option.brp source=s4 stdlib imported imports=3+0 diagnostics=0+0",
+			"module m5:std/result.brp source=s5 stdlib imported imports=3+0 diagnostics=0+0",
+		],
+	)
+
+
+func test_a_root_that_is_an_implicit_module_is_not_loaded_twice() -> Bool:
+	dumps_as_with(
+		PRELUDE_SOURCES,
+		["std/prelude.brp"],
+		compiler_implicit_modules(),
+		[
+			"root r0 std/prelude.brp -> m0:std/prelude.brp",
+			"implicit i0 prelude -> m0:std/prelude.brp",
+			"implicit i1 tuple -> m1:std/tuple.brp",
+			"module m0:std/prelude.brp source=s0 user root imports=0+1 diagnostics=0+0",
+			"  import i0 bare option parents=0 parts=option items=[] -> m2:std/option.brp",
+			"module m1:std/tuple.brp source=s1 stdlib implicit imports=1+1 diagnostics=0+0",
+			"  import i1 bare result parents=0 parts=result items=[] -> m3:std/result.brp",
+			"module m2:std/option.brp source=s2 stdlib imported imports=2+0 diagnostics=0+0",
+			"module m3:std/result.brp source=s3 stdlib imported imports=2+0 diagnostics=0+0",
+		],
+	)
+
+
+func test_a_missing_implicit_module_is_a_diagnostic_row() -> Bool:
+	dumps_as_with(
+		{"app/main.brp" => "", "std/prelude.brp" => ""},
+		["app/main.brp"],
+		compiler_implicit_modules(),
+		[
+			"root r0 app/main.brp -> m0:app/main.brp",
+			"implicit i0 prelude -> m1:std/prelude.brp",
+			"implicit i1 tuple -> unloaded",
+			"implicit diagnostic i1 MissingImplicitModuleDiagnostic",
+			"module m0:app/main.brp source=s0 user root imports=0+0 diagnostics=0+0",
+			"module m1:std/prelude.brp source=s1 stdlib implicit imports=0+0 diagnostics=0+0",
+		],
+	)
+
+
+func test_the_test_runtime_is_an_implicit_module_when_testing() -> Bool:
+	dumps_as_with(
+		PRELUDE_SOURCES,
+		["app/a.brp"],
+		test_implicit_modules(),
+		[
+			"root r0 app/a.brp -> m0:app/a.brp",
+			"implicit i0 prelude -> m1:std/prelude.brp",
+			"implicit i1 tuple -> m2:std/tuple.brp",
+			"implicit i2 test -> m3:std/test.brp",
+			"module m0:app/a.brp source=s0 user root imports=0+0 diagnostics=0+0",
+			"module m1:std/prelude.brp source=s1 stdlib implicit imports=0+1 diagnostics=0+0",
+			"  import i0 bare option parents=0 parts=option items=[] -> m4:std/option.brp",
+			"module m2:std/tuple.brp source=s2 stdlib implicit imports=1+1 diagnostics=0+0",
+			"  import i1 bare result parents=0 parts=result items=[] -> m5:std/result.brp",
+			"module m3:std/test.brp source=s3 stdlib implicit imports=2+1 diagnostics=0+0",
+			"  import i2 bare option parents=0 parts=option items=[] -> m4:std/option.brp",
+			"module m4:std/option.brp source=s4 stdlib imported imports=3+0 diagnostics=0+0",
+			"module m5:std/result.brp source=s5 stdlib imported imports=3+0 diagnostics=0+0",
+		],
+	)
+
+
+---
+A provider that finds every source but reads none: the located file cannot be
+read (a permission error, a file removed after listing).
+---
+record UnreadableSourceProvider {
+	inner: InMemorySourceProvider
+}
+
+
+implements SourceProvider for UnreadableSourceProvider:
+	func source_exists(self: UnreadableSourceProvider, path: String) -> Bool:
+		self.inner.source_exists(path)
+
+	func directory_listing(self: UnreadableSourceProvider, directory: String) -> DirectoryListing:
+		self.inner.directory_listing(directory)
+
+	func read_source(self: UnreadableSourceProvider, path: String) -> SourceRead:
+		SourceUnreadable
+
+
+func test_a_source_that_exists_but_cannot_be_read_is_an_unreadable_diagnostic() -> Bool:
+	provider: UnreadableSourceProvider = {
+		inner = {sources = {"app/main.brp" => "import:\n\t./a\n", "app/a.brp" => ""}},
+	}
+
+	match discover(provider, LOOKUP_ROOTS, ["app/main.brp"], NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			tables.tables_dump() == [
+				"root r0 app/main.brp -> unloaded",
+				"root diagnostic r0 UnreadableSourceDiagnostic",
+			].join("\n")
+		TableInvariantsViolated(_):
+			False
+
+
+---
+A provider holding an empty source under every `.brp` path, so a test can ask
+for more sources than a span can number without building them as a map.
+---
+record EverySourceProvider {
+	nothing: Bool
+}
+
+
+implements SourceProvider for EverySourceProvider:
+	func source_exists(self: EverySourceProvider, path: String) -> Bool:
+		path.ends_with(".brp")
+
+	func directory_listing(self: EverySourceProvider, directory: String) -> DirectoryListing:
+		DirectoryListed([])
+
+	func read_source(self: EverySourceProvider, path: String) -> SourceRead:
+		SourceText("")
+
+
+func test_more_sources_than_a_span_can_number_report_too_many_sources() -> Bool:
+	var roots: List[String] = []
+
+	for number in 0..SPAN_SOURCE_LIMIT + 1:
+		roots = roots.append("s${number}.brp")
+
+	provider: EverySourceProvider = {nothing = True}
+
+	match discover(provider, LOOKUP_ROOTS, roots, NO_IMPLICIT_MODULES):
+		FrozenTables(tables):
+			-- The first SPAN_SOURCE_LIMIT sources load; the next root is rejected,
+			-- and it is the only rejection.
+			rejection_is_the_last_root: Bool = match tables.root_diagnostic_row_at(0):
+				Some(row):
+					(
+						row.code == TooManySourcesDiagnostic
+						and row.root.root_id_index() == SPAN_SOURCE_LIMIT
+					)
+				None:
+					False
+
+			(
+				tables.module_count() == SPAN_SOURCE_LIMIT
+				and tables.root_count() == SPAN_SOURCE_LIMIT + 1
+				and tables.root_diagnostic_count() == 1
+				and rejection_is_the_last_root
+			)
+		TableInvariantsViolated(_):
+			False
+
+
+func test_a_seed_spelled_in_another_case_is_a_missing_implicit_module() -> Bool:
+	dumps_as_with(
+		{"std/Prelude.brp" => ""},
+		[],
+		{module_names = ["prelude"]},
+		[
+			"implicit i0 prelude -> unloaded",
+			"implicit diagnostic i0 MissingImplicitModuleDiagnostic",
+		],
+	)
+
+
+func test_an_unreadable_seed_is_an_unreadable_diagnostic() -> Bool:
+	provider: UnreadableSourceProvider = {inner = {sources = {"std/prelude.brp" => ""}}}
+
+	match discover(provider, LOOKUP_ROOTS, [], {module_names = ["prelude"]}):
+		FrozenTables(tables):
+			tables.tables_dump() == [
+				"implicit i0 prelude -> unloaded",
+				"implicit diagnostic i0 UnreadableSourceDiagnostic",
+			].join("\n")
+		TableInvariantsViolated(_):
+			False
+
+
 tests: TestSuite = {
 	description = "Discovery module graph",
 	tests = [
@@ -579,6 +820,38 @@ tests: TestSuite = {
 		(
 			"source too large to span is rejected with a row",
 			test_source_too_large_to_span_is_rejected_with_a_row,
+		),
+		(
+			"implicit modules load after the roots and before any import",
+			test_implicit_modules_load_after_the_roots_and_before_any_import,
+		),
+		(
+			"a root that is an implicit module is not loaded twice",
+			test_a_root_that_is_an_implicit_module_is_not_loaded_twice,
+		),
+		(
+			"a missing implicit module is a diagnostic row",
+			test_a_missing_implicit_module_is_a_diagnostic_row,
+		),
+		(
+			"the test runtime is an implicit module when testing",
+			test_the_test_runtime_is_an_implicit_module_when_testing,
+		),
+		(
+			"a source that exists but cannot be read is an unreadable diagnostic",
+			test_a_source_that_exists_but_cannot_be_read_is_an_unreadable_diagnostic,
+		),
+		(
+			"more sources than a span can number report too many sources",
+			test_more_sources_than_a_span_can_number_report_too_many_sources,
+		),
+		(
+			"a seed spelled in another case is a missing implicit module",
+			test_a_seed_spelled_in_another_case_is_a_missing_implicit_module,
+		),
+		(
+			"an unreadable seed is an unreadable diagnostic",
+			test_an_unreadable_seed_is_an_unreadable_diagnostic,
 		),
 	]
 }

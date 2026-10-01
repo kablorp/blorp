@@ -15,7 +15,10 @@ work and says what "accepted" means.
   `compiler-new` gate; the corpus parity gate (premerge) with curated and
   per-code fixtures; and the syntax rules both parsers now share (`?=` and
   `break`/`continue` placement, concurrency parameters, no `as` ascription,
-  exact-case import paths, no string patterns with holes).
+  exact-case import paths, no string patterns with holes); and the implicit
+  modules (`prelude`, `tuple`, and `test` when testing), loaded after the
+  roots so the self-compile's module list equals the existing graph's in
+  count and order (item 1).
 - **Measured on the self-compile inputs:** 0.65 s user CPU against 1.3 s for
   the existing discovery; 4.3 G instructions against 8.6 G; about 500 k
   allocations against 7.9 M.
@@ -118,11 +121,14 @@ reads the old shapes.
 Sizes are rough: S is under a day of worker time, M a few days, L a week or
 more. Each numbered item is one change.
 
-1. **Implicit modules and untested codes (M).** The stage loads the implicit
+1. **Implicit modules and untested codes (M). Landed.** The stage loads the implicit
    modules the old discovery seeds after the roots: the prelude set, and for
    `blorp test` the test runtime. It also gains tests for
-   `UnreadableSourceDiagnostic` and `TooManySourcesDiagnostic`, which no
-   suite covers yet.
+   `UnreadableSourceDiagnostic` and `TooManySourcesDiagnostic`, now covered
+   in `test_pipeline`. The parity gate also compares the old graph's module
+   sequence with the stage's for the self-compile root and a `blorp test`
+   root (identical order), so the stage's restated seed
+   names cannot drift from the old constants.
 2. **Qualified trait bounds (S).** `T: module.Trait` is legal: `BoundRow`
    records a path, not a single name. Both parsers and the grammar agree.
 3. **Adapter, declarations (M).** `legacy_frontend_graph` rebuilds each

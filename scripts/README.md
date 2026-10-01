@@ -130,7 +130,11 @@ under `blorp/src`, `standard_library/src` and `blorp/test`: it compiles
 sequentially over the file list, and compares every token (kind, byte range,
 text; the old `#` plus name is one `DimensionNameToken`), the set of files with
 lexer diagnostics and each file's accept/reject verdict. A mismatch prints the
-file and the first differing token. There are no known divergences today;
+file and the first differing token. It also compares module order: for the
+self-compile root and for a `blorp test` root, the existing graph's module
+sequence (`legacy_module_order_dump.brp`) must equal the stage's
+(`module_order_dump.brp`), which catches the stage's implicit module names
+drifting from the existing front end's. There are no known divergences today;
 `KNOWN_DIVERGENCES` stays so one can be added, with a reason (an entry that stops
 disagreeing fails the gate until it is removed). The gate
 takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not a
