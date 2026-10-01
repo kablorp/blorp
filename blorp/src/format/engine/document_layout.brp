@@ -12,6 +12,7 @@ union Doc:
 	Concat(Doc, Doc)
 	IfBreak(Doc, Doc)
 	LineSuffix(String)
+	Fill(List[Doc])
 
 
 union LayoutMode:
@@ -114,6 +115,40 @@ pure func intersperse(separator: Doc, documents: List[Doc]) -> Doc:
 
 pure func comma_sep(documents: List[Doc]) -> Doc:
 	text(", ").intersperse(documents)
+
+
+---
+A layout node that packs `items` onto as few lines as the width allows. When
+the enclosing layout breaks, each item stays on the current line if it fits
+there after a single space, otherwise it starts a new line at the current
+indent. Each item must carry its own trailing separator so the fit check counts
+it. Flat layout joins the items with single spaces. Order is never changed.
+The first item is never wrapped, so a caller that wants every item below an
+opening token starts the `Fill` on a fresh line (the import constructor list
+puts a `Softline` before it).
+---
+pure func fill(items: List[Doc]) -> Doc:
+	Fill(items)
+
+
+---
+`documents` separated by commas and packed with `fill`. Like `comma_sep_break`,
+every comma is kept when broken, including the last, and the last one is
+dropped when flat.
+---
+pure func comma_fill(documents: List[Doc]) -> Doc:
+	var items: List[Doc] = []
+	var remaining: Int = documents.length()
+
+	for document in documents:
+		remaining -= 1
+
+		if remaining == 0:
+			items = items.append(document.cat(text(",").if_break(Nil)))
+		else:
+			items = items.append(document.cat(text(",")))
+
+	items.fill()
 
 
 pure func comma_sep_break(documents: List[Doc]) -> Doc:
@@ -244,6 +279,12 @@ pure func fits(remaining: Int, work: List[Command]) -> Bool:
 									).push1(rest)
 						LineSuffix(_):
 							current_work = rest
+						Fill(items):
+							current_work = command(
+								command_value.indent,
+								command_value.mode,
+								fill_items_joined(items),
+							).push1(rest)
 
 	result
 
@@ -278,6 +319,65 @@ pure func enqueue_line_suffix(state: RenderState, suffix: String) -> RenderState
 
 
 pure func render_loop(width: Int, state: RenderState, work: List[Command]) -> RenderState:
+	width
+		.render_work(state, work)
+		.flush_line_suffixes()
+
+
+---
+The items of a `Fill` joined by single breakable spaces, which is its layout
+when the enclosing group stays flat and the shape `fits` measures.
+---
+pure func fill_items_joined(items: List[Doc]) -> Doc:
+	SoftlineSpace.intersperse(items)
+
+
+---
+Lays out the items of a `Fill` that is in break mode. The first item stays on
+the current line. Every later item joins the line after one space when the item
+(which carries its own trailing separator) still fits within `width`, and
+otherwise starts a new line at `indent`. Items are measured one at a time, not
+with what follows them, because a `Fill` item boundary is always a legal break.
+An item that left a line comment pending also ends the line, so the comment
+stays beside the item it belongs to instead of trailing a later one.
+---
+pure func render_fill(
+	width: Int,
+	state: RenderState,
+	indent: Int,
+	items: List[Doc],
+) -> RenderState:
+	var current_state: RenderState = state
+	var at_first_item: Bool = True
+
+	for item in items:
+		item_command: Command = command(indent, BreakMode, item)
+
+		if at_first_item:
+			at_first_item = False
+		else if (
+			current_state.suffixes.is_empty()
+			and (width - current_state.column - 1).fits([item_command])
+		):
+			current_state = render_state(
+				current_state.output + " ",
+				current_state.column + 1,
+				current_state.suffixes,
+			)
+		else:
+			current_state = current_state.emit_newline(indent)
+
+		current_state = width.render_work(current_state, [item_command])
+
+	current_state
+
+
+---
+Runs `work` to completion without flushing pending line suffixes, so a nested
+layout (a `Fill` item) leaves a suffix attached to the line it belongs to.
+`render_loop` is the entry point that flushes at the end.
+---
+pure func render_work(width: Int, state: RenderState, work: List[Command]) -> RenderState:
 	var current_state: RenderState = state
 	var current_work: List[Command] = work
 	var done: Bool = False
@@ -285,7 +385,6 @@ pure func render_loop(width: Int, state: RenderState, work: List[Command]) -> Re
 	while not done:
 		match current_work:
 			[]:
-				current_state = current_state.flush_line_suffixes()
 				done = True
 			[command_value, ...rest]:
 				match command_value.document:
@@ -359,6 +458,21 @@ pure func render_loop(width: Int, state: RenderState, work: List[Command]) -> Re
 					LineSuffix(source):
 						current_state = current_state.enqueue_line_suffix(source)
 						current_work = rest
+					Fill(items):
+						match command_value.mode:
+							FlatMode:
+								current_work = command(
+									command_value.indent,
+									FlatMode,
+									fill_items_joined(items),
+								).push1(rest)
+							BreakMode:
+								current_state = width.render_fill(
+									current_state,
+									command_value.indent,
+									items,
+								)
+								current_work = rest
 
 	current_state
 
@@ -450,6 +564,8 @@ pure func render_flat(document: Doc) -> String:
 						work = [flat_document].concat(rest)
 					LineSuffix(_):
 						work = rest
+					Fill(items):
+						work = [fill_items_joined(items)].concat(rest)
 
 	output
 
