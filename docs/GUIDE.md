@@ -1032,9 +1032,26 @@ implements Hashable for Point:
         hash_combine(self.x.hash(), self.y.hash())
 ```
 
-An `opaque type` needs its own implementations too. When its representation is
-an integer, float or `String`, Dict and Set compare its keys by that
-representation, so its `equals` must agree with equality of the representation.
+An `opaque type` needs its own implementations too, and Dict and Set use them
+whatever the representation is. An opaque key may be coarser than its
+representation, for example case-insensitive over `String`:
+
+```blorp
+opaque type Tag = String
+
+implements Equatable for Tag:
+    pure func equals(left: Tag, right: Tag) -> Bool:
+        from_opaque Tag(left).lower() == from_opaque Tag(right).lower()
+
+implements Hashable for Tag:
+    pure func hash(self: Tag) -> Int:
+        from_opaque Tag(self).lower().hash()
+```
+
+A `Dict[Tag, Int]` then treats `"Blorp"` and `"BLORP"` as one key. Hashing
+through the impls costs a call per probe; a key type that needs only its
+representation's equality can use the representation (or a `type alias` of it)
+instead.
 
 Generic code that builds or looks up a Dict or Set declares the bound itself:
 

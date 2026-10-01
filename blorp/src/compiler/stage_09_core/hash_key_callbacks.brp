@@ -9,18 +9,24 @@
 -- trait-hashed key type (origin `HashKeySlotAdapter(impl_def)`): it takes the
 -- slot as `Ptr`, unboxes it with the key's boxed-storage layout, and calls the
 -- impl. Backend projection then binds every trait-hashed constructor with
--- `bound_hash_container_constructor`. Minting only scans declarations, and
--- DCE drops the adapters of key types no container uses.
+-- `bound_hash_container_constructor`, and every constructor runtime projection
+-- pinned to an opaque key's impls with `bound_pinned_hash_container_constructor`.
+-- Minting only scans declarations, and DCE drops the adapters of key types no
+-- container uses.
 import:
 	ir:
 		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl),
-		CoreDeclaredOrigin(HashKeySlotAdapter),
+		CoreDeclaredOrigin(HashKeySlotAdapter, ProjectedImplMethod),
 		CoreExpr(CallExpr, UnboxExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreFunctionOrigin(Declared),
-		CoreHashContainerConstructor(CustomHashContainerConstructor, TraitHashContainerConstructor),
+		CoreHashContainerConstructor(
+			CustomHashContainerConstructor,
+			ImplHashContainerConstructor,
+			TraitHashContainerConstructor,
+		),
 		CoreModuleOrigin(NoSourceModule),
 		CoreParam,
 		CoreProgram,
@@ -218,9 +224,29 @@ private pure func adapter_function(
 
 
 ---
+Whether a projected impl method targets a type runtime projection erased: an
+opaque type, whose name no longer resolves to `key_type`, the representation
+its parameter now has. Only a container pinned to the impl
+(`ImplHashContainerConstructor`) reaches its adapters.
+---
+private pure func impl_targets_erased_type(
+	layout: CoreSpecializeLayout,
+	impl: CoreFunction,
+	key_type: CoreType,
+) -> Bool:
+	match core_function_declared_origin(impl.origin):
+		ProjectedImplMethod(_, _, for_type, _):
+			resolve_specialize_type(layout, for_type) != key_type
+		_:
+			False
+
+
+---
 Appends a slot adapter for the Hashable and Equatable impl methods of every
-trait-hashed key type that has both. Keys the runtime hashes itself (words,
-strings, floats) never get adapters. Only declarations are scanned.
+key type that has both and needs them: a trait-hashed key, or an opaque key
+whose representation the runtime would otherwise hash itself. An impl on a
+runtime-hashed type (words, strings, floats) gets none. Only declarations
+are scanned.
 ---
 pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> HashKeyCallbackResult:
 	layout: CoreSpecializeLayout = build_specialize_layout(program)
@@ -235,34 +261,36 @@ pure func mint_hash_key_callbacks(program: CoreProgram, next_def_id: Int) -> Has
 				match (hash_impl.params, functions.get(equals_def)):
 					([key_param], Some(equals_impl)):
 						key_type: CoreType = resolve_specialize_type(layout, key_param.typ)
-
-						match hash_key_strategy(layout, key_type):
+						needs_adapters: Bool = match hash_key_strategy(layout, key_type):
 							TraitHashKeys:
-								adapters = adapters.concat([
-									FunctionDecl(
-										adapter_function(
-											layout,
-											hash_impl,
-											key_type,
-											HASH_KEY_HASH_ADAPTER_NAME,
-											[KEY_PARAM_NAME],
-											next_id,
-										),
-									),
-									FunctionDecl(
-										adapter_function(
-											layout,
-											equals_impl,
-											key_type,
-											HASH_KEY_EQUALS_ADAPTER_NAME,
-											[LEFT_PARAM_NAME, RIGHT_PARAM_NAME],
-											next_id + 1,
-										),
-									),
-								])
-								next_id += 2
+								True
 							WordHashKeys | StringHashKeys | FloatHashKeys | Int128HashKeys:
-								void
+								impl_targets_erased_type(layout, hash_impl, key_type)
+
+						if needs_adapters:
+							adapters = adapters.concat([
+								FunctionDecl(
+									adapter_function(
+										layout,
+										hash_impl,
+										key_type,
+										HASH_KEY_HASH_ADAPTER_NAME,
+										[KEY_PARAM_NAME],
+										next_id,
+									),
+								),
+								FunctionDecl(
+									adapter_function(
+										layout,
+										equals_impl,
+										key_type,
+										HASH_KEY_EQUALS_ADAPTER_NAME,
+										[LEFT_PARAM_NAME, RIGHT_PARAM_NAME],
+										next_id + 1,
+									),
+								),
+							])
+							next_id += 2
 					_:
 						void
 			_:
@@ -321,4 +349,32 @@ pure func bound_hash_container_constructor(
 				_:
 					TraitHashContainerConstructor(key)
 		constructor:
+			constructor
+
+
+---
+The constructor for a container runtime projection pinned to its key's impl
+methods (`ImplHashContainerConstructor`), bound to those impls' slot
+adapters. `key_type` is the container's key after projection, which is the
+opaque key's representation: the layout the adapters unbox and the
+container's key slots store. Other constructors are returned unchanged.
+---
+pure func bound_pinned_hash_container_constructor(
+	layout: CoreSpecializeLayout,
+	table: HashKeyAdapterTable,
+	constructor: CoreHashContainerConstructor,
+	key_type: CoreType,
+) -> CoreHashContainerConstructor:
+	match constructor:
+		ImplHashContainerConstructor(hash_impl_def, equals_impl_def):
+			match (table.adapters.get(hash_impl_def), table.adapters.get(equals_impl_def)):
+				(Some(hash_adapter), Some(equals_adapter)):
+					CustomHashContainerConstructor(
+						hash_adapter.def_id,
+						equals_adapter.def_id,
+						boxed_storage_slot_needs_release(layout, key_type),
+					)
+				_:
+					constructor
+		_:
 			constructor

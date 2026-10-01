@@ -15,14 +15,15 @@ import:
 			UnionDecl,
 			ValueRecordDecl,
 		),
-		CoreExpr(RecordExpr, VarExpr, VoidExpr),
+		CoreExpr(DictExpr, RecordExpr, SetAllocExpr, VarExpr, VoidExpr),
 		CoreFunction,
 		CoreFunctionKind(UnresolvedBuiltinFunction, UserFunction),
 		CoreFunctionOrigin(Declared),
 		CoreImplMethodRole(RuntimeCallbackMethod),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
-		CoreRuntimeCallbackRole(HashableHashCallback),
+		CoreHashContainerConstructor(ImplHashContainerConstructor),
+		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(
@@ -307,6 +308,81 @@ pure func test_projecting_an_already_projected_program_keeps_its_names() -> Bool
 				Ok(twice):
 					twice.decls.map(boundary_decl_name) == once.decls.map(boundary_decl_name)
 				Err(_):
+					False
+		Err(_):
+			False
+
+
+private TAG_HASH_DEF_ID: Int = 7
+
+private TAG_EQUALS_DEF_ID: Int = 8
+
+
+--- One runtime-callback impl on `opaque type Tag = String`.
+pure func tag_impl(trait_name: String, def_id: Int, role: CoreRuntimeCallbackRole) -> CoreDecl:
+	method: CoreFunction = { boundary_function("method", [], True) |
+		def_id = def_id,
+		origin = Declared(
+			ImplMethod(synthesized_name_id("_"), synthesized_name_id("_"), RuntimeCallbackMethod(role)),
+		)
+	}
+
+	ImplDecl({
+		trait_name = trait_name,
+		for_type = NamedType("Tag", []),
+		type_params = [],
+		methods = [method],
+		loc = synthetic_core_source_loc(),
+	})
+
+
+pure func test_pins_opaque_key_constructor_before_erasing_its_type() -> Bool:
+	-- After projection `Set[Tag]` reads `Set[String]`; the constructor must
+	-- already name Tag's impls, or the string hasher would ignore them.
+	tag_set_type: CoreType = NamedType("Set", [NamedType("Tag", [])])
+	source: CoreProgram = {
+		decls = [
+			TypeAliasDecl({
+				abi_type = None,
+				name = "Tag",
+				type_params = [],
+				target = NamedType("String", []),
+				is_opaque = True,
+				loc = synthetic_core_source_loc(),
+			}),
+			tag_impl("Hashable", TAG_HASH_DEF_ID, HashableHashCallback),
+			tag_impl("Equatable", TAG_EQUALS_DEF_ID, EquatableEqualsCallback),
+			GlobalDecl({
+				name = {
+					name = "tags",
+					id = 0,
+					def_id = Some(2),
+					origin = AuthoredBinder
+				},
+				source_module = None,
+				typ = tag_set_type,
+				init = DictExpr([], tag_set_type, synthetic_core_source_loc()),
+				is_mutable = False,
+				is_const = True,
+				is_private = False,
+				def_id = 2,
+				loc = synthetic_core_source_loc(),
+			}),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match project_runtime_program(source):
+		Ok(projected):
+			match projected.decls:
+				[FunctionDecl(_), FunctionDecl(_), GlobalDecl(global)]:
+					match global.init:
+						SetAllocExpr(ImplHashContainerConstructor(hash_impl, equals_impl), NamedType("Set", [NamedType("String", [])]), _):
+							hash_impl == TAG_HASH_DEF_ID and equals_impl == TAG_EQUALS_DEF_ID
+						_:
+							False
+				_:
 					False
 		Err(_):
 			False
@@ -663,6 +739,10 @@ tests: TestSuite = {
 		(
 			"projecting an already projected program keeps its names",
 			test_projecting_an_already_projected_program_keeps_its_names,
+		),
+		(
+			"pins opaque key constructor before erasing its type",
+			test_pins_opaque_key_constructor_before_erasing_its_type,
 		),
 		("rejects malformed runtime ABI templates", test_rejects_malformed_runtime_abi_templates),
 		(

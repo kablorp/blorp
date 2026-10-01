@@ -320,7 +320,11 @@ constructor (and lowers trait-keyed Dict literals) to those adapters by
 definition id, DCE drops adapters no container uses, and Perceus sees the adapters'
 borrowed unboxing. Typecheck requires `K: Hashable` of every Dict and Set key,
 so there is no identity-hashing fallback: a trait-hashed key left without
-adapters is an internal error at C symbol projection. Perceus ingress runs consume
+adapters is an internal error at C symbol projection. Runtime projection, which
+resolves every opaque type to its representation, first pins each Dict and Set
+constructor whose key names an opaque type to that key's own impl methods
+(`opaque_hash_keys.brp`), since after erasure the key would hash as its
+representation; backend projection binds those pins to the impls' adapters. Perceus ingress runs consume
 specialization, lowers record updates to ownership-visible forms, and prepares
 dictionary literals so every transferred entry is explicit. These operations
 are not emitter cleanup and must not be reordered or omitted from ownership

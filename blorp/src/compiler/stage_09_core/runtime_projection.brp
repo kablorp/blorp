@@ -43,6 +43,11 @@ import:
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage),
 		CoreUnionVariant,
 	list: list
+	opaque_hash_keys:
+		OpaqueHashKeyPinning,
+		opaque_hash_key_pin,
+		opaque_hash_key_pinning,
+		with_pinned_hash_constructor,
 	result_layout:
 		CoreResultRuntimeRepresentation(BoxedResultRepresentation, StackResultRepresentation),
 		result_runtime_representation,
@@ -314,42 +319,64 @@ private pure func canonical_type(layout: CoreSpecializeLayout, typ: CoreType) ->
 			resolved
 
 
-private pure func canonical_expr(layout: CoreSpecializeLayout, expr: CoreExpr) -> CoreExpr:
+---
+What canonicalizing expressions reads: the layout that resolves aliases, and
+the pinning that must see a Dict or Set constructor before its key type is
+resolved (see `opaque_hash_keys`).
+---
+private record CanonicalExprContext {
+	layout: CoreSpecializeLayout,
+	hash_keys: OpaqueHashKeyPinning
+}
+
+
+--- `canonical_type` in the shape the traversal's type mapper takes.
+private pure func canonical_context_type(context: CanonicalExprContext, typ: CoreType) -> CoreType:
+	canonical_type(context.layout, typ)
+
+
+private pure func canonical_expr(context: CanonicalExprContext, expr: CoreExpr) -> CoreExpr:
 	match expr:
 		SeqExpr(_, _):
 			spine = CoreTraverse.split_core_sequence(expr)
 			CoreTraverse.rebuild_core_sequence({
 				preceding_items = spine.preceding_items.map(
-					func(item): canonical_expr(layout, item),
+					func(item): canonical_expr(context, item),
 				),
-				final_item = canonical_expr(layout, spine.final_item),
+				final_item = canonical_expr(context, spine.final_item),
 			})
 		_:
-			CoreTraverse.map_core_expr_children_and_types_with_context(
+			canonical: CoreExpr = CoreTraverse.map_core_expr_children_and_types_with_context(
 				expr,
-				layout,
+				context,
 				canonical_expr,
-				canonical_type,
+				canonical_context_type,
 			)
+
+			match opaque_hash_key_pin(context.hash_keys, expr):
+				Some(pin):
+					with_pinned_hash_constructor(context.layout, pin, canonical)
+				None:
+					canonical
 
 
 private pure func canonical_function(
-	layout: CoreSpecializeLayout,
+	context: CanonicalExprContext,
 	function_info: CoreFunction,
 ) -> CoreFunction:
 	{ function_info |
 		params = function_info.params.map(
-			func(param): { param | typ = canonical_type(layout, param.typ) },
+			func(param): { param | typ = canonical_type(context.layout, param.typ) },
 		),
-		return_type = canonical_type(layout, function_info.return_type),
-		body = function_info.body.map(func(body): canonical_expr(layout, body))
+		return_type = canonical_type(context.layout, function_info.return_type),
+		body = function_info.body.map(func(body): canonical_expr(context, body))
 	}
 
 
-private pure func canonical_global(layout: CoreSpecializeLayout, global: CoreGlobal) -> CoreGlobal:
+private pure func canonical_global(context: CanonicalExprContext, global: CoreGlobal) -> CoreGlobal:
 	{ global |
-		typ = canonical_type(layout, global.typ),
-		init = canonical_expr(layout, global.init)
+		typ = canonical_type(context.layout, global.typ),
+		init = canonical_expr(context, global.init)
 	}
 
 
@@ -384,12 +411,14 @@ private pure func canonical_heap_record_field(
 	}
 
 
-private pure func canonical_decl(layout: CoreSpecializeLayout, decl: CoreDecl) -> CoreDecl:
+private pure func canonical_decl(context: CanonicalExprContext, decl: CoreDecl) -> CoreDecl:
+	layout: CoreSpecializeLayout = context.layout
+
 	match decl:
 		FunctionDecl(function_info):
-			FunctionDecl(canonical_function(layout, function_info))
+			FunctionDecl(canonical_function(context, function_info))
 		GlobalDecl(global):
-			GlobalDecl(canonical_global(layout, global))
+			GlobalDecl(canonical_global(context, global))
 		UnionDecl(union_decl):
 			UnionDecl(
 				{ union_decl |
@@ -438,8 +467,15 @@ pure func project_runtime_program(
 		Some(error):
 			Err(error)
 		None:
+			-- Pinning reads the projected impl methods, before canonicalizing
+			-- resolves the opaque types their targets and the keys name.
+			context: CanonicalExprContext = {
+				layout = layout,
+				hash_keys = opaque_hash_key_pinning(layout, { program | decls = decls })
+			}
+
 			Ok({
-				decls = decls.map(func(decl): canonical_decl(layout, decl)),
+				decls = decls.map(func(decl): canonical_decl(context, decl)),
 				foreign_includes = program.foreign_includes,
 				source_files = program.source_files
 			})

@@ -49,7 +49,7 @@ import:
 		),
 		CoreDictLiteralEntry,
 		CoreFunction,
-		CoreHashContainerConstructor,
+		CoreHashContainerConstructor(ImplHashContainerConstructor),
 		CoreListAccessBounds(CheckedListAccess, ProvenListAccess),
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
 		CoreLogicalOp,
@@ -87,7 +87,11 @@ import:
 		CoreRuntimeCallbackTable,
 		build_runtime_callback_table,
 		find_runtime_callback,
-	hash_key_callbacks: HashKeyAdapterTable, bound_hash_container_constructor, build_hash_key_adapter_table
+	hash_key_callbacks:
+		HashKeyAdapterTable,
+		bound_hash_container_constructor,
+		bound_pinned_hash_container_constructor,
+		build_hash_key_adapter_table,
 	prepare: lower_trait_keyed_dict_literal
 	specialize_layout:
 		CoreHashKeyStrategy(FloatHashKeys, Int128HashKeys, StringHashKeys, TraitHashKeys, WordHashKeys),
@@ -413,6 +417,36 @@ private pure func set_constructor(
 		None
 
 	Some(bound_hash_container_constructor(layout, hash_keys, element_type))
+
+
+---
+A constructor runtime projection pinned to an opaque key's impls, bound to
+their slot adapters; `container_type` is the Dict or Set it builds. Pinning
+read the unerased key; here the key is already its representation, which is
+what the adapters unbox, so a plain resolved lookup is the right one.
+---
+private pure func bound_pinned_constructor(
+	layout: CoreSpecializeLayout,
+	hash_keys: HashKeyAdapterTable,
+	constructor: CoreHashContainerConstructor,
+	container_type: CoreType,
+) -> CoreHashContainerConstructor:
+	key_type: Option[CoreType] = match dict_key_type(layout, container_type):
+		Some(key):
+			Some(key)
+		None:
+			single_named_type_argument(layout, container_type, "Set")
+
+	match key_type:
+		Some(key):
+			bound_pinned_hash_container_constructor(
+				layout,
+				hash_keys,
+				constructor,
+				resolve_specialize_type(layout, key),
+			)
+		None:
+			constructor
 
 
 private pure func custom_dict_call_kind(
@@ -1083,6 +1117,52 @@ pure func project_current_expr(
 							result_type,
 							loc,
 						)
+		DictConstructExpr(construct, typ, loc):
+			match construct.constructor:
+				ImplHashContainerConstructor(_, _):
+					DictConstructExpr(
+						{ construct |
+							constructor = bound_pinned_constructor(
+								context.layout,
+								context.hash_keys,
+								construct.constructor,
+								typ,
+							)
+						},
+						typ,
+						loc,
+					)
+				_:
+					children_projected
+		SetAllocExpr(constructor, typ, loc):
+			match constructor:
+				ImplHashContainerConstructor(_, _):
+					SetAllocExpr(
+						bound_pinned_constructor(context.layout, context.hash_keys, constructor, typ),
+						typ,
+						loc,
+					)
+				_:
+					children_projected
+		CallExpr(DictWithCapacityCall(constructor), callee, args, result_type, loc):
+			match constructor:
+				ImplHashContainerConstructor(_, _):
+					CallExpr(
+						DictWithCapacityCall(
+							bound_pinned_constructor(
+								context.layout,
+								context.hash_keys,
+								constructor,
+								result_type,
+							),
+						),
+						callee,
+						args,
+						result_type,
+						loc,
+					)
+				_:
+					children_projected
 		DictExpr(entries, typ, loc):
 			empty_set: Option[CoreExpr] = if entries.is_empty():
 				project_empty_set(context.layout, context.hash_keys, typ, loc)

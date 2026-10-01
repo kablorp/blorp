@@ -222,17 +222,36 @@ private pure func canonical_declared_type(
 					NamedType(name, args)
 
 
+---
+Which aliases a layout resolution expands. Storage questions expand every
+alias to its representation; trait-impl questions keep opaque aliases,
+because an opaque type's impls may disagree with its representation's.
+---
+enum CoreAliasExpansion:
+	ExpandEveryAlias
+	KeepOpaqueAliases
+
+
+private pure func expands_alias(expansion: CoreAliasExpansion, alias_decl: CoreTypeAliasDecl) -> Bool:
+	match expansion:
+		ExpandEveryAlias:
+			True
+		KeepOpaqueAliases:
+			not alias_decl.is_opaque
+
+
 private pure func resolve_types(
 	index: CoreLayoutTypeIndex,
 	types: List[CoreType],
 	seen_aliases: List[String],
+	expansion: CoreAliasExpansion,
 ) -> List[CoreType]:
 	var result: List[CoreType] = []
 	var changed: Bool = False
 	var pos: Int = 0
 
 	for typ in types:
-		resolved: CoreType = resolve_type(index, typ, seen_aliases)
+		resolved: CoreType = resolve_type(index, typ, seen_aliases, expansion)
 
 		if changed:
 			result = result.append(resolved)
@@ -252,10 +271,11 @@ private pure func resolve_type(
 	index: CoreLayoutTypeIndex,
 	typ: CoreType,
 	seen_aliases: List[String],
+	expansion: CoreAliasExpansion,
 ) -> CoreType:
 	match typ:
 		NamedType(name, args):
-			resolved_args: List[CoreType] = resolve_types(index, args, seen_aliases)
+			resolved_args: List[CoreType] = resolve_types(index, args, seen_aliases, expansion)
 			args_unchanged: Bool = same_core_types(resolved_args, args)
 
 			if seen_aliases.contains(name):
@@ -263,7 +283,10 @@ private pure func resolve_type(
 			else:
 				alias_expansion: Option[CoreType] = match index.aliases.get(name):
 					Some(alias_decl):
-						if alias_decl.type_params.length() == resolved_args.length():
+						if (
+							alias_decl.type_params.length() == resolved_args.length()
+							and expands_alias(expansion, alias_decl)
+						):
 							Some(
 								substitute_alias_type(
 									alias_decl.target,
@@ -282,42 +305,43 @@ private pure func resolve_type(
 							index,
 							target,
 							seen_aliases.append(name),
+							expansion,
 						)
 					None:
 						canonical_declared_type(index, typ, name, resolved_args, args_unchanged)
 		StackResultType(ok_type, err_type):
-			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases)
-			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases)
+			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases, expansion)
+			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases, expansion)
 
 			if same_core_type(resolved_ok, ok_type) and same_core_type(resolved_err, err_type):
 				typ
 			else:
 				StackResultType(resolved_ok, resolved_err)
 		BoxedResultType(ok_type, err_type):
-			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases)
-			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases)
+			resolved_ok: CoreType = resolve_type(index, ok_type, seen_aliases, expansion)
+			resolved_err: CoreType = resolve_type(index, err_type, seen_aliases, expansion)
 
 			if same_core_type(resolved_ok, ok_type) and same_core_type(resolved_err, err_type):
 				typ
 			else:
 				BoxedResultType(resolved_ok, resolved_err)
 		FunctionType(is_pure, params, return_type):
-			resolved_params: List[CoreType] = resolve_types(index, params, seen_aliases)
-			resolved_return: CoreType = resolve_type(index, return_type, seen_aliases)
+			resolved_params: List[CoreType] = resolve_types(index, params, seen_aliases, expansion)
+			resolved_return: CoreType = resolve_type(index, return_type, seen_aliases, expansion)
 
 			if same_core_types(resolved_params, params) and same_core_type(resolved_return, return_type):
 				typ
 			else:
 				FunctionType(is_pure, resolved_params, resolved_return)
 		TensorType(info):
-			resolved_element: CoreType = resolve_type(index, info.element_type, seen_aliases)
+			resolved_element: CoreType = resolve_type(index, info.element_type, seen_aliases, expansion)
 
 			if same_core_type(resolved_element, info.element_type):
 				typ
 			else:
 				TensorType({ info | element_type = resolved_element })
 		TupleType(items):
-			resolved_items: List[CoreType] = resolve_types(index, items, seen_aliases)
+			resolved_items: List[CoreType] = resolve_types(index, items, seen_aliases, expansion)
 
 			if same_core_types(resolved_items, items):
 				typ
@@ -328,7 +352,60 @@ private pure func resolve_type(
 
 
 pure func resolve_layout_type_with_index(index: CoreLayoutTypeIndex, typ: CoreType) -> CoreType:
-	resolve_type(index, typ, [])
+	resolve_type(index, typ, [], ExpandEveryAlias)
+
+
+---
+Resolves `typ` like `resolve_layout_type_with_index` but leaves every opaque
+alias named, at the top and inside type arguments. An opaque type's trait
+impls are its own, not its representation's, so a question about which impl
+applies must see the opaque name; a question about storage must not.
+---
+pure func resolve_layout_type_keeping_opaque_aliases(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+) -> CoreType:
+	resolve_type(index, typ, [], KeepOpaqueAliases)
+
+
+---
+Resolves `typ` until its outermost type is not an alias, opaque or not,
+while its type arguments keep their opaque aliases. A container question
+("is this a Dict, and what is its key?") must see through an opaque
+container such as `opaque type Store = Dict[Key, Entry]`, but the key it
+finds must still name `Key` if `Key` is opaque.
+---
+pure func resolve_layout_type_head_keeping_opaque_arguments(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+) -> CoreType:
+	resolve_opaque_head(index, resolve_layout_type_keeping_opaque_aliases(index, typ), [])
+
+
+private pure func resolve_opaque_head(
+	index: CoreLayoutTypeIndex,
+	typ: CoreType,
+	seen_aliases: List[String],
+) -> CoreType:
+	match typ:
+		NamedType(name, args):
+			match index.aliases.get(name):
+				Some(alias_decl):
+					if seen_aliases.contains(name) or alias_decl.type_params.length() != args.length():
+						typ
+					else:
+						resolve_opaque_head(
+							index,
+							resolve_layout_type_keeping_opaque_aliases(
+								index,
+								substitute_alias_type(alias_decl.target, alias_decl.type_params, args),
+							),
+							seen_aliases.append(name),
+						)
+				None:
+					typ
+		_:
+			typ
 
 
 private pure func list_element_type(index: CoreLayoutTypeIndex, typ: CoreType) -> Option[CoreType]:

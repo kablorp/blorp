@@ -5,6 +5,7 @@ import:
 		HashKeyAdapterTable,
 		HashKeyCallbackResult,
 		bound_hash_container_constructor,
+		bound_pinned_hash_container_constructor,
 		build_hash_key_adapter_table,
 		mint_hash_key_callbacks,
 	../../../src/compiler/stage_09_core/runtime_callbacks: build_runtime_callback_table
@@ -18,14 +19,18 @@ import:
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreFunctionOrigin(Declared),
-		CoreHashContainerConstructor(CustomHashContainerConstructor, TraitHashContainerConstructor),
+		CoreHashContainerConstructor(
+			CustomHashContainerConstructor,
+			ImplHashContainerConstructor,
+			TraitHashContainerConstructor,
+		),
 		CoreImplMethodRole(RuntimeCallbackMethod),
 		CoreLiteral(IntLiteral),
 		CoreParam,
 		CoreProgram,
 		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
 		CoreType(HeapRecordType, NamedType, ValueRecordType),
-		CoreUnboxKind(PointerUnbox, StructUnbox),
+		CoreUnboxKind(PointerUnbox, PrimUnbox, StructUnbox),
 		CoreVar,
 		core_function_declared_origin,
 		synthetic_core_source_loc,
@@ -217,8 +222,80 @@ pure func test_needs_both_impls_to_mint() -> Bool:
 
 
 pure func test_mints_nothing_for_runtime_hashed_keys() -> Bool:
+	-- An impl on Int itself: Int keys use the runtime's word hash.
 	result: HashKeyCallbackResult = minted([hash_impl(INT_TYPE), equals_impl(INT_TYPE)])
 	result.next_def_id == FIRST_FREE_DEF_ID
+
+
+---
+Projection leaves an impl on `opaque type UserId = Int` with an `Int`
+parameter and `UserId` only in its origin. Its adapters unbox the word the
+key slot stores; a container pinned to the impls reaches them.
+---
+pure func opaque_int_impl(
+	def_id: Int,
+	role: CoreRuntimeCallbackRole,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreDecl:
+	impl_method(def_id, NamedType("UserId", []), role, params, return_type)
+
+
+pure func opaque_int_impls() -> List[CoreDecl]:
+	[
+		opaque_int_impl(HASH_IMPL_DEF_ID, HashableHashCallback, [param("self", INT_TYPE)], INT_TYPE),
+		opaque_int_impl(
+			EQUALS_IMPL_DEF_ID,
+			EquatableEqualsCallback,
+			[param("a", INT_TYPE), param("b", INT_TYPE)],
+			BOOL_TYPE,
+		),
+	]
+
+
+pure func test_mints_word_slot_adapters_for_impls_on_erased_opaque_types() -> Bool:
+	result: HashKeyCallbackResult = minted(opaque_int_impls())
+
+	match adapter_for(result.program, HASH_IMPL_DEF_ID):
+		Some(adapter):
+			match adapter.body:
+				Some(CallExpr(_, _, [UnboxExpr(PrimUnbox, _, NamedType("Int", []), _)], _, _)):
+					result.next_def_id == FIRST_FREE_DEF_ID + 2
+				_:
+					False
+		None:
+			False
+
+
+pure func test_binds_pinned_constructor_to_impl_adapters() -> Bool:
+	result: HashKeyCallbackResult = minted(opaque_int_impls())
+
+	match bound_pinned_hash_container_constructor(
+		build_specialize_layout(result.program),
+		adapter_table(result.program),
+		ImplHashContainerConstructor(HASH_IMPL_DEF_ID, EQUALS_IMPL_DEF_ID),
+		INT_TYPE,
+	):
+		-- A word slot owns nothing, so the container releases no key.
+		CustomHashContainerConstructor(hash_fn, equals_fn, needs_release):
+			hash_fn == FIRST_FREE_DEF_ID and equals_fn == FIRST_FREE_DEF_ID + 1 and not needs_release
+		_:
+			False
+
+
+pure func test_leaves_pinned_constructor_without_adapters_unbound() -> Bool:
+	program: CoreProgram = program_with([])
+
+	match bound_pinned_hash_container_constructor(
+		build_specialize_layout(program),
+		adapter_table(program),
+		ImplHashContainerConstructor(HASH_IMPL_DEF_ID, EQUALS_IMPL_DEF_ID),
+		INT_TYPE,
+	):
+		ImplHashContainerConstructor(HASH_IMPL_DEF_ID, EQUALS_IMPL_DEF_ID):
+			True
+		_:
+			False
 
 
 pure func test_unboxes_heap_record_slot_as_pointer() -> Bool:
@@ -300,6 +377,15 @@ tests: TestSuite = {
 		("mints nothing without hash impls", test_mints_nothing_without_hash_impls),
 		("needs both impls to mint", test_needs_both_impls_to_mint),
 		("mints nothing for runtime-hashed keys", test_mints_nothing_for_runtime_hashed_keys),
+		(
+			"mints word slot adapters for impls on erased opaque types",
+			test_mints_word_slot_adapters_for_impls_on_erased_opaque_types,
+		),
+		("binds pinned constructor to impl adapters", test_binds_pinned_constructor_to_impl_adapters),
+		(
+			"leaves pinned constructor without adapters unbound",
+			test_leaves_pinned_constructor_without_adapters_unbound,
+		),
 		("unboxes heap record slot as pointer", test_unboxes_heap_record_slot_as_pointer),
 		("binds value record key to minted adapters", test_binds_value_record_key_to_minted_adapters),
 		("leaves boxed key without adapters unbound", test_leaves_boxed_key_without_adapters_unbound),

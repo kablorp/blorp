@@ -1,0 +1,266 @@
+import:
+	../../../src/compiler/stage_02_lex/name_table: synthesized_name_id
+	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/opaque_hash_keys:
+		opaque_hash_key_pin,
+		opaque_hash_key_pinning,
+		with_pinned_hash_constructor,
+	../../../src/compiler/stage_09_core/specialize_layout: CoreSpecializeLayout, build_specialize_layout
+	../../../src/compiler/stage_09_core/ir:
+		CoreBinderOrigin(AuthoredBinder),
+		CoreCallKind(BuiltinCall, DictWithCapacityCall),
+		CoreDecl(FunctionDecl, TypeAliasDecl),
+		CoreDeclaredOrigin(ProjectedImplMethod),
+		CoreExpr(CallExpr, DictConstructExpr, DictExpr, LiteralExpr, SetAllocExpr, VarExpr),
+		CoreFunction,
+		CoreFunctionKind(UserFunction),
+		CoreFunctionOrigin(Declared),
+		CoreHashContainerConstructor(ImplHashContainerConstructor, TraitHashContainerConstructor),
+		CoreImplMethodRole(RuntimeCallbackMethod),
+		CoreLiteral(IntLiteral),
+		CoreParam,
+		CoreProgram,
+		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
+		CoreType(FunctionType, NamedType),
+		CoreVar,
+		synthetic_core_source_loc,
+	test: TestSuite
+
+
+-- Runtime projection pins a Dict or Set constructor to its key's impls only
+-- when the key names an opaque type; everything else is left for the later
+-- passes, which choose hashing from the resolved key.
+
+private STRING_TYPE: CoreType = NamedType("String", [])
+
+private INT_TYPE: CoreType = NamedType("Int", [])
+
+private BOOL_TYPE: CoreType = NamedType("Bool", [])
+
+private TAG_TYPE: CoreType = NamedType("Tag", [])
+
+private HASH_IMPL_DEF_ID: Int = 2
+
+private EQUALS_IMPL_DEF_ID: Int = 3
+
+
+pure func core_var(name: String) -> CoreVar:
+	{
+		name = name,
+		id = 0,
+		def_id = None,
+		origin = AuthoredBinder
+	}
+
+
+pure func param(name: String, typ: CoreType) -> CoreParam:
+	{
+		name = core_var(name),
+		typ = typ,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func int_literal(value: Int) -> CoreExpr:
+	LiteralExpr(IntLiteral(value), INT_TYPE, synthetic_core_source_loc())
+
+
+pure func type_alias(name: String, target: CoreType, is_opaque: Bool) -> CoreDecl:
+	TypeAliasDecl({
+		abi_type = None,
+		name = name,
+		type_params = [],
+		target = target,
+		is_opaque = is_opaque,
+		loc = synthetic_core_source_loc()
+	})
+
+
+--- An impl method on `Tag` as projection leaves it, before types are erased.
+pure func tag_impl(
+	def_id: Int,
+	role: CoreRuntimeCallbackRole,
+	params: List[CoreParam],
+	return_type: CoreType,
+) -> CoreDecl:
+	info: CoreFunction = {
+		name = "impl",
+		source_module = None,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		type_params = [],
+		params = params,
+		return_type = return_type,
+		body = Some(int_literal(0)),
+		is_pure = True,
+		function_kind = UserFunction,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		def_id = def_id,
+		loc = synthetic_core_source_loc()
+	}
+
+	FunctionDecl({ info |
+		origin = Declared(
+			ProjectedImplMethod(
+				synthesized_name_id("_"),
+				synthesized_name_id("_"),
+				TAG_TYPE,
+				RuntimeCallbackMethod(role),
+			),
+		)
+	})
+
+
+pure func tag_impls() -> List[CoreDecl]:
+	[
+		tag_impl(HASH_IMPL_DEF_ID, HashableHashCallback, [param("self", TAG_TYPE)], INT_TYPE),
+		tag_impl(
+			EQUALS_IMPL_DEF_ID,
+			EquatableEqualsCallback,
+			[param("a", TAG_TYPE), param("b", TAG_TYPE)],
+			BOOL_TYPE,
+		),
+	]
+
+
+pure func program_with(decls: List[CoreDecl]) -> CoreProgram:
+	{
+		decls = decls,
+		foreign_includes = [],
+		source_files = []
+	}
+
+
+pure func opaque_tag_program() -> CoreProgram:
+	program_with([type_alias("Tag", STRING_TYPE, True)].concat(tag_impls()))
+
+
+---
+`expr` as runtime projection leaves it. The fixtures' types have no alias
+the rebuild would need resolved, so rebuilding the node itself stands in for
+rebuilding its canonical form.
+---
+pure func pinned(program: CoreProgram, expr: CoreExpr) -> Option[CoreExpr]:
+	layout: CoreSpecializeLayout = build_specialize_layout(program)
+	pin ?= opaque_hash_key_pin(opaque_hash_key_pinning(layout, program), expr)
+	Some(with_pinned_hash_constructor(layout, pin, expr))
+
+
+pure func builtin_call(name: String, args: List[CoreExpr], result_type: CoreType) -> CoreExpr:
+	loc = synthetic_core_source_loc()
+	callee_type: CoreType = FunctionType(True, args.map(func(_arg): INT_TYPE), result_type)
+	CallExpr(BuiltinCall(name), VarExpr(core_var(name), callee_type, loc), args, result_type, loc)
+
+
+pure func set_of(element: CoreType) -> CoreType:
+	NamedType("Set", [element])
+
+
+pure func dict_of(key: CoreType) -> CoreType:
+	NamedType("Dict", [key, INT_TYPE])
+
+
+pure func test_pins_empty_set_of_opaque_key_to_its_impls() -> Bool:
+	match pinned(opaque_tag_program(), builtin_call("blorp_set_new", [], set_of(TAG_TYPE))):
+		Some(SetAllocExpr(ImplHashContainerConstructor(hash_impl, equals_impl), NamedType("Set", [NamedType("Tag", [])]), _)):
+			hash_impl == HASH_IMPL_DEF_ID and equals_impl == EQUALS_IMPL_DEF_ID
+		_:
+			False
+
+
+pure func test_pins_empty_dict_and_capacity_dict_of_opaque_key() -> Bool:
+	empty: Bool = match pinned(opaque_tag_program(), builtin_call("blorp_dict_new", [], dict_of(TAG_TYPE))):
+		Some(DictConstructExpr(construct, _, _)):
+			match construct.constructor:
+				ImplHashContainerConstructor(hash_impl, equals_impl):
+					hash_impl == HASH_IMPL_DEF_ID and equals_impl == EQUALS_IMPL_DEF_ID and construct.entries.is_empty()
+				_:
+					False
+		_:
+			False
+
+	sized: Bool = match pinned(
+		opaque_tag_program(),
+		builtin_call("blorp_dict_with_capacity", [int_literal(8)], dict_of(TAG_TYPE)),
+	):
+		Some(CallExpr(DictWithCapacityCall(ImplHashContainerConstructor(_, _)), _, [_], _, _)):
+			True
+		_:
+			False
+
+	empty and sized
+
+
+pure func test_pins_empty_dict_literal_of_opaque_key() -> Bool:
+	match pinned(opaque_tag_program(), DictExpr([], dict_of(TAG_TYPE), synthetic_core_source_loc())):
+		Some(DictConstructExpr(construct, _, _)):
+			match construct.constructor:
+				ImplHashContainerConstructor(_, _):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_pins_through_an_opaque_container() -> Bool:
+	-- `opaque type Store = Dict[Tag, Int]`: the container resolves through its
+	-- own opaque alias, while its key keeps naming Tag.
+	program: CoreProgram = program_with(
+		[type_alias("Tag", STRING_TYPE, True), type_alias("Store", dict_of(TAG_TYPE), True)].concat(tag_impls()),
+	)
+
+	match pinned(program, builtin_call("blorp_dict_new", [], NamedType("Store", []))):
+		Some(DictConstructExpr(construct, NamedType("Store", []), _)):
+			match construct.constructor:
+				ImplHashContainerConstructor(_, _):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_leaves_representation_keys_unpinned() -> Bool:
+	pinned(opaque_tag_program(), builtin_call("blorp_set_new", [], set_of(STRING_TYPE))).is_none()
+
+
+pure func test_leaves_opaque_values_unpinned() -> Bool:
+	-- Only the key decides hashing; `Dict[Int, Tag]` hashes Int words.
+	dict_with_opaque_values: CoreType = NamedType("Dict", [INT_TYPE, TAG_TYPE])
+	pinned(opaque_tag_program(), builtin_call("blorp_dict_new", [], dict_with_opaque_values)).is_none()
+
+
+pure func test_leaves_transparent_alias_keys_unpinned() -> Bool:
+	-- A transparent alias is its target, including the target's hashing.
+	program: CoreProgram = program_with([type_alias("Name", STRING_TYPE, False)])
+	pinned(program, builtin_call("blorp_set_new", [], set_of(NamedType("Name", [])))).is_none()
+
+
+pure func test_keeps_opaque_key_without_impls_as_unbound_trait_constructor() -> Bool:
+	-- The later internal error names the opaque key rather than hashing its
+	-- representation.
+	program: CoreProgram = program_with([type_alias("Tag", STRING_TYPE, True)])
+
+	match pinned(program, builtin_call("blorp_set_new", [], set_of(TAG_TYPE))):
+		Some(SetAllocExpr(TraitHashContainerConstructor(NamedType("Tag", [])), _, _)):
+			True
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Core opaque hash-key constructor pinning",
+	tests = [
+		("pins empty set of opaque key to its impls", test_pins_empty_set_of_opaque_key_to_its_impls),
+		("pins empty dict and capacity dict of opaque key", test_pins_empty_dict_and_capacity_dict_of_opaque_key),
+		("pins empty dict literal of opaque key", test_pins_empty_dict_literal_of_opaque_key),
+		("pins through an opaque container", test_pins_through_an_opaque_container),
+		("leaves representation keys unpinned", test_leaves_representation_keys_unpinned),
+		("leaves opaque values unpinned", test_leaves_opaque_values_unpinned),
+		("leaves transparent alias keys unpinned", test_leaves_transparent_alias_keys_unpinned),
+		(
+			"keeps opaque key without impls as unbound trait constructor",
+			test_keeps_opaque_key_without_impls_as_unbound_trait_constructor,
+		),
+	]
+}
