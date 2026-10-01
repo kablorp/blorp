@@ -531,6 +531,186 @@ func test_tail_call_beside_bound_field_keeps_old_rows() -> Bool:
 	lists.get(0).get_or([]) == [1, 2, 99] and lists.get(1).get_or([]) == [1, 2]
 
 
+pure func append_row_then_other(t: Tables, v: Int) -> Tables:
+	t.append_row(v).append_other(v)
+
+
+pure func same_tables(t: Tables) -> Tables:
+	t
+
+
+pure func inner_of(outer: Outer) -> Tables:
+	outer.inner
+
+
+---
+A builder-returning call as the receiver of another call: the inner result
+is handed to the outer call's consuming clone, and the caller's saved value
+stays unchanged.
+---
+func test_chained_call_keeps_old_value() -> Bool:
+	var t: Tables = empty_tables()
+	saved: Tables = t
+	t = append_row_then_other(t, 2)
+	t = append_other(append_row(t, 3), 3)
+
+	saved.rows == [1] and saved.other.is_empty() and t.rows == [1, 2, 3] and t.other == [2, 3]
+
+
+---
+A call result handed to a consuming clone is an owned reference, not
+necessarily a unique one: one that returns its parameter or a field of a
+kept record shares it, so the clone must copy.
+---
+func test_shared_call_result_handed_to_clone_keeps_old_value() -> Bool:
+	t: Tables = empty_tables()
+	from_parameter: Tables = append_row(same_tables(t), 2)
+	outer: Outer = {inner = empty_tables(), count = 0}
+	from_field: Tables = append_row(inner_of(outer), 3)
+
+	(
+		t.rows == [1]
+		and from_parameter.rows == [1, 2]
+		and outer.inner.rows == [1]
+		and from_field.rows == [1, 3]
+	)
+
+
+---
+A local made by one call, handed to the next while a later argument reads
+it, directly and through a field: each read runs before the call, so it
+sees the value before the append.
+---
+pure func append_rows_at_own_length(t: Tables) -> Tables:
+	appended: Tables = append_other(t, 0)
+	counted: Tables = appended.append_row(appended.rows.length())
+	append_row(counted, last_row(counted))
+
+
+pure func last_row(t: Tables) -> Int:
+	t.rows.get_or(t.rows.length() - 1, -1)
+
+
+func test_later_argument_reads_local_before_hand_off() -> Bool:
+	t: Tables = {rows = [4, 5], other = []}
+	result: Tables = append_rows_at_own_length(t)
+
+	t.rows == [4, 5] and t.other.is_empty() and result.rows == [4, 5, 2, 2] and result.other == [0]
+
+
+---
+The callee appends to its second list and then reads its first; the caller
+passes one list as both, or appends to it in the second argument. The
+borrowed first argument must keep the value from before the append.
+---
+pure func grow_then_measure(first: List[Int], second: List[Int]) -> List[Int]:
+	grown: List[Int] = second.append(9)
+	grown.append(first.length())
+
+
+pure func numbers_below(count: Int) -> List[Int]:
+	var out: List[Int] = []
+
+	for i in 0..count:
+		out = out.append(i)
+
+	out
+
+
+pure func measure_with(first: List[Int], grown: List[Int]) -> List[Int]:
+	grown.append(first.length())
+
+
+func test_borrowed_argument_keeps_old_value_beside_consumed_argument() -> Bool:
+	numbers: List[Int] = numbers_below(3)
+
+	grow_then_measure(numbers, numbers) == [0, 1, 2, 9, 3]
+
+
+---
+Each list here is at its last use, so the call itself decides whether the
+borrowed first argument still needs its own reference.
+---
+func test_borrowed_argument_keeps_old_value_beside_appending_argument() -> Bool:
+	numbers: List[Int] = numbers_below(3)
+
+	measure_with(numbers, numbers.append(9)) == [0, 1, 2, 9, 3]
+
+
+---
+A loop variable updated through a temporary: the temporary is forwarded into
+the variable, so both calls update it in place.
+---
+pure func append_through_temporary(t: Tables, count: Int) -> Tables:
+	var out: Tables = t
+
+	for i in 0..count:
+		appended: Tables = out.append_row(i)
+		out = appended.append_other(i)
+
+	out
+
+
+---
+The temporary is read again after the assignment, so it keeps its own value.
+---
+pure func append_through_kept_temporary(t: Tables, count: Int) -> List[List[Int]]:
+	var out: Tables = t
+	var kept_lengths: List[Int] = []
+
+	for i in 0..count:
+		appended: Tables = out.append_row(i)
+		out = appended.append_other(i)
+		kept_lengths = kept_lengths.append(appended.other.length())
+
+	[out.rows, out.other, kept_lengths]
+
+
+func test_loop_through_temporary_keeps_old_value() -> Bool:
+	t: Tables = empty_tables()
+	appended: Tables = append_through_temporary(t, 3)
+	kept: List[List[Int]] = append_through_kept_temporary(t, 2)
+
+	(
+		t.rows == [1]
+		and t.other.is_empty()
+		and appended.rows == [1, 0, 1, 2]
+		and appended.other == [0, 1, 2]
+		and kept == [[1, 0, 1], [0, 1], [0, 1]]
+	)
+
+
+---
+A second name taken while the first is dead moves the value; a second name
+taken while the first is still read must leave the first unchanged.
+---
+pure func append_through_second_name(t: Tables, v: Int) -> Tables:
+	made: Tables = append_other(t, v)
+	same: Tables = made
+	append_row(same, v)
+
+
+pure func append_through_second_name_keeping_first(t: Tables, v: Int) -> List[List[Int]]:
+	made: Tables = append_other(t, v)
+	same: Tables = made
+	appended: Tables = append_row(same, v)
+	[made.rows, appended.rows]
+
+
+func test_second_name_keeps_old_value() -> Bool:
+	t: Tables = empty_tables()
+	moved: Tables = append_through_second_name(t, 2)
+	kept: List[List[Int]] = append_through_second_name_keeping_first(t, 3)
+
+	(
+		t.rows == [1]
+		and t.other.is_empty()
+		and moved.rows == [1, 2]
+		and moved.other == [2]
+		and kept == [[1], [1, 3]]
+	)
+
+
 tests: TestSuite = {
 	description = "Consuming clone value semantics",
 	tests = [
@@ -598,5 +778,27 @@ tests: TestSuite = {
 			"tail call beside bound field keeps old rows",
 			test_tail_call_beside_bound_field_keeps_old_rows,
 		),
+		("chained call keeps old value", test_chained_call_keeps_old_value),
+		(
+			"shared call result handed to clone keeps old value",
+			test_shared_call_result_handed_to_clone_keeps_old_value,
+		),
+		(
+			"later argument reads local before hand-off",
+			test_later_argument_reads_local_before_hand_off,
+		),
+		(
+			"borrowed argument keeps old value beside consumed argument",
+			test_borrowed_argument_keeps_old_value_beside_consumed_argument,
+		),
+		(
+			"borrowed argument keeps old value beside appending argument",
+			test_borrowed_argument_keeps_old_value_beside_appending_argument,
+		),
+		(
+			"loop through temporary keeps old value",
+			test_loop_through_temporary_keeps_old_value,
+		),
+		("second name keeps old value", test_second_name_keeps_old_value),
 	]
 }

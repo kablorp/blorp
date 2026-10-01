@@ -927,6 +927,40 @@ pure func summarize_linear_call(
 		result
 
 
+---
+Whether `arg` is `name` itself, so a consuming slot takes `name`'s reference
+when the callee starts rather than while the argument is evaluated.
+---
+private pure func passes_name_directly(name: String, arg: CoreExpr) -> Bool:
+	match arg:
+		VarExpr(variable, _, _):
+			variable.name == name
+		CastExpr(inner, _, _):
+			passes_name_directly(name, inner)
+		_:
+			False
+
+
+---
+Whether a borrowing argument's uses of a name are over once the argument
+is evaluated. A call result that does not alias the name holds no borrow of
+it: user calls return owned values, and builtin contracts say when a result
+aliases an argument. An operator's result is a new value (a number, a
+`Bool`, a built string) that never aliases an operand. A variable, field or
+other path, and every form not listed, stays borrowed while the callee runs.
+---
+private pure func borrow_ends_before_call(arg: CoreExpr, arg_uses: OwnershipUseSummary) -> Bool:
+	match arg:
+		CallExpr(_, _, _, _, _):
+			not arg_uses.returns_alias
+		BinaryExpr(_, _, _, _, _) | UnaryExpr(_, _, _, _) | LogicalExpr(_, _, _, _, _):
+			True
+		CastExpr(inner, _, _):
+			borrow_ends_before_call(inner, arg_uses)
+		_:
+			False
+
+
 private pure func summarize_linear_call_impl(
 	env: PerceusEnv,
 	name: String,
@@ -940,9 +974,21 @@ private pure func summarize_linear_call_impl(
 			-- The call's result mode replaces the aggregate alias flag. Only
 			-- ReturnAliasOfArg needs one argument's alias bit, so retain that
 			-- scalar while folding instead of allocating a list of summaries.
+			--
+			-- Arguments are evaluated left to right and the callee runs after
+			-- the last one (the emitter materializes arguments in this order
+			-- whenever one can execute code). The fold below counts the
+			-- references argument evaluation needs. When the callee starts,
+			-- each name passed directly to a consuming slot takes one more
+			-- reference, and any borrow still held through the call shares
+			-- one. A name passed directly is only read during evaluation, so a
+			-- borrow that ends during evaluation, such as `f(b, g(b))` with
+			-- `g` returning an unrelated value, needs no second reference.
 			var arg_required_refs: Int = 0
 			var arg_consumed_refs: Int = 0
 			var arg_touched: Bool = False
+			var call_transfers: Int = 0
+			var borrow_held_through_call: Bool = False
 			var target_arg_summary_present: Bool = False
 			var target_arg_returns_alias: Bool = False
 			var index: Int = 0
@@ -955,12 +1001,26 @@ private pure func summarize_linear_call_impl(
 			for arg in args:
 				match contract.args.get(index):
 					Some(mode):
-						arg_uses: OwnershipUseSummary = summarize_linear_call_arg(
-							env,
-							name,
-							mode,
-							arg,
+						transfers_target: Bool = (
+							arg_consumes_caller(mode)
+							and passes_name_directly(name, arg)
 						)
+						arg_uses: OwnershipUseSummary = if transfers_target:
+							BORROW_OWNERSHIP_USE
+						else:
+							summarize_linear_call_arg(env, name, mode, arg)
+
+						if transfers_target:
+							call_transfers += 1
+						else if (
+							arg_uses.touched
+							and not arg_consumes_caller(mode)
+							and not borrow_ends_before_call(arg, arg_uses)
+						):
+							borrow_held_through_call = True
+						else:
+							void
+
 						arg_required_refs = max_int(
 							arg_required_refs,
 							arg_consumed_refs + arg_uses.required_refs,
@@ -997,12 +1057,21 @@ private pure func summarize_linear_call_impl(
 				_:
 					NO_OWNERSHIP_USES
 
+			held_borrow_refs: Int = if borrow_held_through_call:
+				1
+			else:
+				0
+			call_required_refs: Int = max_int(
+				arg_required_refs,
+				arg_consumed_refs + call_transfers + held_borrow_refs,
+			)
+
 			{
 				required_refs = max_int(
 					callee_uses.required_refs,
-					callee_uses.consumed_refs + arg_required_refs,
+					callee_uses.consumed_refs + call_required_refs,
 				),
-				consumed_refs = callee_uses.consumed_refs + arg_consumed_refs,
+				consumed_refs = callee_uses.consumed_refs + arg_consumed_refs + call_transfers,
 				touched = callee_uses.touched or arg_touched,
 				returns_alias = call_result_aliases_target(
 					env,

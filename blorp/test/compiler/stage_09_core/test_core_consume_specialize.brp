@@ -17,8 +17,10 @@ import:
 		CoreEnumDecl,
 		CoreExpr(
 			AssignExpr,
+			BreakExpr,
 			CallExpr,
 			ConstructorMatchExpr,
+			ContinueExpr,
 			DropExpr,
 			IfExpr,
 			LambdaExpr,
@@ -1247,6 +1249,248 @@ pure func test_retargets_branch_call_at_last_use() -> Bool:
 
 
 ---
+A chained call, `rewrite_expr(rewrite_expr(expr, 1), 2)`: the inner call's
+result is an owned temporary whose only use is the outer argument, so the
+outer call takes it in both the helper and its clone. Only the clone hands
+its parameter to the inner call.
+---
+pure func test_retargets_chained_call_temporary() -> Bool:
+	body: CoreExpr = rewrite_call_on(rewrite_call_on(var_expr("expr", expr_type()), 1), 2)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
+
+	(
+		function_calls_are(
+			rewritten,
+			"forward__consume_arg0",
+			["rewrite_expr__consume_arg0", "rewrite_expr__consume_arg0"],
+		)
+		and function_calls_are(rewritten, "forward", ["rewrite_expr", "rewrite_expr__consume_arg0"])
+	)
+
+
+---
+An owned variable at its last use takes precedence over a call temporary in
+a later record slot: `multi_rewrite(expr, rewrite_expr(other, 1), 2)` uses
+the clone owning argument 0. The inner call takes `Lit(3)` the same way.
+---
+pure func test_owned_variable_precedes_call_temporary() -> Bool:
+	body: CoreExpr = user_call(
+		"multi_rewrite",
+		30,
+		[
+			var_expr("expr", expr_type()),
+			rewrite_call_on(lit_expr(3), 1),
+			int_expr(2),
+		],
+		expr_type(),
+	)
+	rewritten: CoreProgram = rewritten_forward_program(update_in_place(7), body)
+
+	(
+		function_calls_are(
+			rewritten,
+			"forward__consume_arg0",
+			["Lit", "rewrite_expr__consume_arg0", "multi_rewrite__consume_arg0"],
+		)
+		and function_calls_are(
+			rewritten,
+			"forward",
+			["Lit", "rewrite_expr__consume_arg0", "multi_rewrite__consume_arg1"],
+		)
+	)
+
+
+---
+`expr = multi_rewrite(rewrite_expr(Lit(3), 1), expr, 2)`: the assignment
+target in the second record slot is handed on ahead of the call temporary in
+the first, so the call takes the clone owning argument 1.
+---
+pure func test_assignment_target_precedes_call_temporary() -> Bool:
+	expr_var: CoreVar = named_var("expr")
+	body: CoreExpr = LetExpr(
+		expr_var,
+		True,
+		expr_type(),
+		lit_expr(0),
+		SeqExpr(
+			assignment_expr_for_call(
+				expr_var,
+				"multi_rewrite",
+				30,
+				[
+					rewrite_call_on(lit_expr(3), 1),
+					var_expr("expr", expr_type()),
+					int_expr(2),
+				],
+				expr_type(),
+			),
+			var_expr("expr", expr_type()),
+		),
+	)
+	rewritten: CoreProgram = rewrite_program_for_test({
+		decls = [
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
+			FunctionDecl(multi_rewrite_function(multi_update_in_place())),
+			FunctionDecl({ run_function() | body = Some(body) }),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	function_calls_are(
+		rewritten,
+		"run",
+		["Lit", "Lit", "rewrite_expr__consume_arg0", "multi_rewrite__consume_arg1"],
+	)
+
+
+---
+`run` with `var expr = Lit(0); temp = rewrite_expr(expr, 1); expr = <second>;
+<after>; expr`, where `second` and `after` may use `temp`.
+---
+pure func run_through_temporary(second: CoreExpr, after: CoreExpr) -> CoreProgram:
+	temp: CoreVar = named_var("temp")
+	expr_var: CoreVar = named_var("expr")
+	body: CoreExpr = LetExpr(
+		expr_var,
+		True,
+		expr_type(),
+		lit_expr(0),
+		SeqExpr(
+			LetExpr(
+				temp,
+				False,
+				expr_type(),
+				rewrite_call_on(var_expr("expr", expr_type()), 1),
+				SeqExpr(
+					AssignExpr(expr_var, second, VoidType, synthetic_core_source_loc()),
+					after,
+				),
+			),
+			var_expr("expr", expr_type()),
+		),
+	)
+
+	rewrite_program_for_test({
+		decls = [
+			expr_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
+			FunctionDecl(multi_rewrite_function(multi_update_in_place())),
+			FunctionDecl({ run_function() | body = Some(body) }),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+
+pure func void_expr() -> CoreExpr:
+	VoidExpr(VoidType, synthetic_core_source_loc())
+
+
+---
+`temp = rewrite_expr(expr, 1); expr = rewrite_expr(temp, 2)` becomes two
+`expr = rewrite_expr(expr, ...)` assignments, each handing `expr` on.
+---
+pure func test_forwards_temporary_into_assigned_variable() -> Bool:
+	rewritten: CoreProgram = run_through_temporary(
+		rewrite_call_on(var_expr("temp", expr_type()), 2),
+		void_expr(),
+	)
+
+	(
+		function_calls_are(
+			rewritten,
+			"run",
+			["Lit", "rewrite_expr__consume_arg0", "rewrite_expr__consume_arg0"],
+		)
+		and function_body(rewritten, "run").map(func(body): count_lets_named(body, "temp")).get_or(-1) == 0
+	)
+
+
+---
+A temporary read after the assignment keeps its binding: forwarding it would
+read the reassigned variable instead.
+---
+pure func test_keeps_temporary_read_after_assignment() -> Bool:
+	rewritten: CoreProgram = run_through_temporary(
+		rewrite_call_on(var_expr("temp", expr_type()), 2),
+		add_expr(var_expr("temp", expr_type()), lit_expr(1)),
+	)
+
+	function_body(rewritten, "run").map(func(body): count_lets_named(body, "temp")).get_or(-1) == 1
+
+
+---
+An assigned call that also reads the variable keeps the temporary: the read
+must see the value from before the first call.
+---
+pure func test_keeps_temporary_when_assigned_call_reads_variable() -> Bool:
+	rewritten: CoreProgram = run_through_temporary(
+		user_call(
+			"multi_rewrite",
+			30,
+			[var_expr("temp", expr_type()), var_expr("expr", expr_type()), int_expr(2)],
+			expr_type(),
+		),
+		void_expr(),
+	)
+
+	function_body(rewritten, "run").map(func(body): count_lets_named(body, "temp")).get_or(-1) == 1
+
+
+---
+`expr = rewrite_expr(temp, <exit; 2>)`: evaluating the assigned call may leave
+the loop iteration before the assignment, so `expr` must keep its old value
+there; forwarding would leave it holding the first call's result.
+---
+pure func assigned_call_leaving_through(exit: CoreExpr) -> CoreExpr:
+	rewrite_call_on_with_pass(
+		var_expr("temp", expr_type()),
+		SeqExpr(exit, int_expr(2)),
+	)
+
+
+pure func rewrite_call_on_with_pass(argument: CoreExpr, pass: CoreExpr) -> CoreExpr:
+	user_call("rewrite_expr", 10, [argument, pass], expr_type())
+
+
+pure func test_keeps_temporary_when_assigned_call_can_break() -> Bool:
+	rewritten: CoreProgram = run_through_temporary(
+		assigned_call_leaving_through(BreakExpr(VoidType, synthetic_core_source_loc())),
+		void_expr(),
+	)
+
+	function_body(rewritten, "run").map(func(body): count_lets_named(body, "temp")).get_or(-1) == 1
+
+
+pure func test_keeps_temporary_when_assigned_call_can_continue() -> Bool:
+	rewritten: CoreProgram = run_through_temporary(
+		assigned_call_leaving_through(ContinueExpr(VoidType, synthetic_core_source_loc())),
+		void_expr(),
+	)
+
+	function_body(rewritten, "run").map(func(body): count_lets_named(body, "temp")).get_or(-1) == 1
+
+
+pure func count_lets_named(expr: CoreExpr, name: String) -> Int:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			own: Int = if variable.name == name:
+				1
+			else:
+				0
+
+			own + count_lets_named(rhs, name) + count_lets_named(body, name)
+		SeqExpr(first, second):
+			count_lets_named(first, name) + count_lets_named(second, name)
+		AssignExpr(variable, rhs, typ, loc):
+			count_lets_named(rhs, name)
+		_:
+			0
+
+
+---
 The parameter is read after the call, so the call keeps borrowing it.
 ---
 pure func test_keeps_call_when_argument_is_read_after() -> Bool:
@@ -1598,6 +1842,29 @@ tests: TestSuite = {
 		),
 		("retargets let-bound calls at last use", test_retargets_let_bound_calls_at_last_use),
 		("retargets branch call at last use", test_retargets_branch_call_at_last_use),
+		("retargets chained call temporary", test_retargets_chained_call_temporary),
+		("owned variable precedes call temporary", test_owned_variable_precedes_call_temporary),
+		(
+			"assignment target precedes call temporary",
+			test_assignment_target_precedes_call_temporary,
+		),
+		(
+			"forwards temporary into assigned variable",
+			test_forwards_temporary_into_assigned_variable,
+		),
+		("keeps temporary read after assignment", test_keeps_temporary_read_after_assignment),
+		(
+			"keeps temporary when assigned call reads variable",
+			test_keeps_temporary_when_assigned_call_reads_variable,
+		),
+		(
+			"keeps temporary when assigned call can break",
+			test_keeps_temporary_when_assigned_call_can_break,
+		),
+		(
+			"keeps temporary when assigned call can continue",
+			test_keeps_temporary_when_assigned_call_can_continue,
+		),
 		(
 			"keeps call when argument is read after",
 			test_keeps_call_when_argument_is_read_after,

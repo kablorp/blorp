@@ -23807,6 +23807,58 @@ pure func let_bytes_alias_return_function() -> CoreFunction:
 	}
 
 
+---
+`payload = input; result = payload; scratch = sleep(0); result`: the second
+name takes `payload`'s reference before a cancellation point.
+---
+pure func cancelling_let_bytes_alias_return_function() -> CoreFunction:
+	input_param: CoreParam = bytes_param("input")
+	payload_var: CoreVar = named_var("payload")
+	result_var: CoreVar = named_var("result")
+	scratch_var: CoreVar = named_var("scratch")
+
+	{
+		name = "cancelling_let_bytes_alias_return",
+		source_module = None,
+		type_params = [],
+		params = [input_param],
+		return_type = bytes_type(),
+		body = Some(
+			LetExpr(
+				payload_var,
+				False,
+				bytes_type(),
+				param_var_expr(input_param),
+				LetExpr(
+					result_var,
+					False,
+					bytes_type(),
+					VarExpr(payload_var, bytes_type(), synthetic_core_source_loc()),
+					LetExpr(
+						scratch_var,
+						False,
+						bytes_type(),
+						CallExpr(
+							direct_runtime_call_kind("blorp_sleep"),
+							VarExpr(named_var("blorp_sleep"), closure_type(), synthetic_core_source_loc()),
+							[LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc())],
+							bytes_type(),
+							synthetic_core_source_loc(),
+						),
+						VarExpr(result_var, bytes_type(), synthetic_core_source_loc()),
+					),
+				),
+			),
+		),
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 1398,
+		loc = synthetic_core_source_loc()
+	}
+
+
 pure func consume_bytes_function() -> CoreFunction:
 	payload_param: CoreParam = bytes_param("payload")
 	payload_var: CoreVar = named_var("payload")
@@ -26215,18 +26267,44 @@ pure func test_emit_noncancelling_let_alias_return_omits_source_cleanup() -> Boo
 	}
 	artifact: CArtifact = emit_source_spelled_c_artifact(program)
 
+	-- `result` is `payload`'s only use, so it takes `payload`'s reference
+	-- instead of a retain paired with a later release.
 	(
 		artifact.c_code.contains("blorp_Bytes* payload = ({")
 		and artifact.c_code.contains("blorp_retain(input);")
 		and not artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_payload;")
-		and artifact.c_code.contains("blorp_Bytes* result = ({")
-		and artifact.c_code.contains("blorp_retain(payload);")
+		and artifact.c_code.contains("blorp_Bytes* result = payload;")
+		and not artifact.c_code.contains("blorp_retain(payload);")
 		and artifact.c_code.contains("blorp_Bytes* brp_vd_zpayload_d0 = ({")
-		and artifact.c_code.contains("blorp_release(payload);")
+		and not artifact.c_code.contains("blorp_release(payload);")
 		and artifact.c_code.contains("return brp_vd_zpayload_d0;")
 		and not artifact.c_code.contains(
 			"blorp_task_cleanup_pop_slot_with_task(&payload, __blorp_task);",
 		)
+	)
+
+
+---
+The cancelling counterpart: `result` takes `payload`'s reference, so only
+`result` is tracked for cancellation cleanup across the sleep. A cleanup slot
+still armed for `payload` would release the same reference a second time.
+---
+pure func test_emit_cancelling_let_alias_return_tracks_only_the_alias() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(cancelling_let_bytes_alias_return_function())],
+		foreign_includes = [],
+		source_files = []
+	}
+	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+
+	(
+		artifact.c_code.contains("blorp_Bytes* result = payload;")
+		and artifact.c_code.contains(
+			"blorp_task_cleanup_push_with_task(&__blorp_cleanup_result, &result,",
+		)
+		and not artifact.c_code.contains("__blorp_cleanup_payload")
+		and not artifact.c_code.contains("blorp_retain(payload);")
+		and not artifact.c_code.contains("blorp_release(payload);")
 	)
 
 
@@ -28759,6 +28837,10 @@ tests: TestSuite = {
 		(
 			"emit noncancelling let alias return without source cleanup",
 			test_emit_noncancelling_let_alias_return_omits_source_cleanup,
+		),
+		(
+			"emit cancelling let alias return tracks only the alias",
+			test_emit_cancelling_let_alias_return_tracks_only_the_alias,
 		),
 		("emit let user call transfers owned bytes", test_emit_let_user_call_transfers_owned_bytes),
 		(

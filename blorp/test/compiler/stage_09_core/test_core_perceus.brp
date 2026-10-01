@@ -188,7 +188,7 @@ import:
 	../../../src/compiler/stage_09_core/perceus/short_circuit:
 		balance_short_circuit_operands,
 		consumed_parameter_balancing_is_identity,
-		move_consumed_parameter_alias,
+		move_only_owner_alias,
 	../../../src/compiler/stage_09_core/perceus/results_and_loops:
 		call_ownership_normalization_reuses_source,
 	../../../src/compiler/stage_09_core/perceus/uses:
@@ -212,7 +212,8 @@ import:
 		perceus_env_for_managed_types,
 		result_mode_for_type,
 	../../../src/compiler/stage_09_core/perceus/shadow_catalog:
-		build_match_shadow_catalog,
+		build_perceus_body_catalogs,
+		let_alias_source_catalog_admits,
 		freshen_shadowed_match_bindings_if_catalog_admits,
 		match_shadow_catalog_admits,
 	../../../src/compiler/stage_09_core/perceus/index:
@@ -3716,6 +3717,233 @@ pure func test_consumed_user_call_contract_transfers_declared_args() -> Bool:
 		[TransferArg, BorrowArg, TransferArg],
 		ReturnOwned,
 	)
+
+
+private COUNT_ROWS_DEF_ID: Int = 91
+
+
+---
+`rows = make_rows(); <call>` in a function `step`, Perceus-rewritten.
+`take_first` and `take_second` name no def id, so each takes its contract
+from its consumed-argument list: it transfers one list argument and borrows
+the other. `count_rows` is declared, so its contract is inferred: it borrows
+its list and returns an `Int`.
+---
+pure func owned_rows_call_body(call: CoreExpr) -> Option[CoreExpr]:
+	rows_type: CoreType = list_int_type()
+	body: CoreExpr = LetExpr(
+		named_var("rows"),
+		False,
+		rows_type,
+		user_call_expr("make_rows", None, [], [], rows_type),
+		call,
+	)
+	count_rows: CoreDecl = function_decl(
+		"count_rows",
+		COUNT_ROWS_DEF_ID,
+		[core_param("counted", rows_type)],
+		int_type(),
+		LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc()),
+	)
+	program: CoreProgram = insert_drops_program({
+		decls = [count_rows, function_decl("step", 90, [], rows_type, body)],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	function_body(program, "step")
+
+
+pure func rows_var() -> CoreExpr:
+	var_expr("rows", list_int_type())
+
+
+pure func count_rows_call() -> CoreExpr:
+	user_call_expr("count_rows", Some(COUNT_ROWS_DEF_ID), [], [rows_var()], int_type())
+
+
+---
+`take_first(rows, count_rows(rows))`: the borrow inside the second argument
+ends before the call starts, so the owner transfers without a retain.
+---
+pure func test_borrow_ending_in_later_argument_does_not_retain_transferred_owner() -> Bool:
+	call: CoreExpr = user_call_expr(
+		"take_first",
+		None,
+		[0],
+		[rows_var(), count_rows_call()],
+		list_int_type(),
+	)
+
+	match owned_rows_call_body(call):
+		Some(body):
+			dup_count_for("rows", body) == 0 and drop_count_for("rows", body) == 0
+		None:
+			False
+
+
+---
+`take_first(rows, count_rows(rows) + 1)`: an operator's result is a new
+value, so the borrow inside it ends before the call too.
+---
+pure func test_borrow_ending_in_later_operator_does_not_retain_transferred_owner() -> Bool:
+	one: CoreExpr = LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())
+	next_index: CoreExpr = BinaryExpr(
+		AddOp,
+		count_rows_call(),
+		one,
+		int_type(),
+		synthetic_core_source_loc(),
+	)
+	call: CoreExpr = user_call_expr(
+		"take_first",
+		None,
+		[0],
+		[rows_var(), next_index],
+		list_int_type(),
+	)
+
+	match owned_rows_call_body(call):
+		Some(body):
+			dup_count_for("rows", body) == 0 and drop_count_for("rows", body) == 0
+		None:
+			False
+
+
+---
+`take_first(rows, slice_source(rows))`: the later argument is a call, but its
+contract returns an alias of `rows`, so the borrow is still held while the
+callee owns `rows`; the owner is retained and released after.
+---
+pure func test_alias_returned_by_later_argument_retains_transferred_owner() -> Bool:
+	call: CoreExpr = user_call_expr(
+		"take_first",
+		None,
+		[0],
+		[rows_var(), intrinsic_expr("slice_source", [rows_var()], list_int_type())],
+		list_int_type(),
+	)
+
+	match owned_rows_call_body(call):
+		Some(body):
+			dup_count_for("rows", body) == 1 and drop_count_for("rows", body) == 1
+		None:
+			False
+
+
+---
+`take_first(rows, rows)`: the borrowed second argument is still read while
+the callee owns the first, so the owner is retained and released after.
+---
+pure func test_borrow_held_through_call_retains_transferred_owner() -> Bool:
+	call: CoreExpr = user_call_expr(
+		"take_first",
+		None,
+		[0],
+		[rows_var(), rows_var()],
+		list_int_type(),
+	)
+
+	match owned_rows_call_body(call):
+		Some(body):
+			dup_count_for("rows", body) == 1 and drop_count_for("rows", body) == 1
+		None:
+			False
+
+
+---
+`take_second(rows, rows)`: a borrow in an earlier argument is held through
+the call just the same, so the transfer in the later argument needs its own
+reference.
+---
+pure func test_borrow_before_transfer_retains_owner() -> Bool:
+	call: CoreExpr = user_call_expr(
+		"take_second",
+		None,
+		[1],
+		[rows_var(), rows_var()],
+		list_int_type(),
+	)
+
+	match owned_rows_call_body(call):
+		Some(body):
+			dup_count_for("rows", body) == 1 and drop_count_for("rows", body) == 1
+		None:
+			False
+
+
+---
+`take_third(rows, rows, rows)`: two borrows held through the call share one
+reference, and the transfer needs one more, so the call needs two references
+at once and consumes one. A borrowed match binding is balanced from these
+numbers with no extra retains, so a count per borrow would over-release it.
+---
+pure func test_borrows_held_through_call_share_one_reference() -> Bool:
+	env: PerceusEnv = perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES)
+	uses = summarize_linear_call(
+		env,
+		"rows",
+		list_int_type(),
+		UserCall("take_third", None, [2]),
+		var_expr("take_third", NamedType("Function", [])),
+		[rows_var(), rows_var(), rows_var()],
+	)
+
+	uses.required_refs == 2 and uses.consumed_refs == 1
+
+
+---
+`rows = make_rows(); same = rows; take_first(same, <count>)`: the second
+name is the local's only use, so it takes the local's reference.
+---
+pure func test_only_alias_of_let_binding_moves_reference() -> Bool:
+	same: CoreVar = named_var("same")
+	call: CoreExpr = LetExpr(
+		same,
+		False,
+		list_int_type(),
+		rows_var(),
+		user_call_expr(
+			"take_first",
+			None,
+			[0],
+			[var_expr("same", list_int_type()), LiteralExpr(IntLiteral(0), int_type(), synthetic_core_source_loc())],
+			list_int_type(),
+		),
+	)
+
+	match owned_rows_call_body(call):
+		Some(body):
+			dup_count_for("rows", body) == 0 and drop_count_for("rows", body) == 0
+		None:
+			False
+
+
+---
+`rows = make_rows(); same = rows; take_first(same, count_rows(rows))`: the
+local is read again, so the second name keeps its own retained reference.
+---
+pure func test_alias_of_let_binding_read_again_is_retained() -> Bool:
+	same: CoreVar = named_var("same")
+	call: CoreExpr = LetExpr(
+		same,
+		False,
+		list_int_type(),
+		rows_var(),
+		user_call_expr(
+			"take_first",
+			None,
+			[0],
+			[var_expr("same", list_int_type()), count_rows_call()],
+			list_int_type(),
+		),
+	)
+
+	match owned_rows_call_body(call):
+		Some(body):
+			dup_count_for("rows", body) == 1 and drop_count_for("rows", body) == 1
+		None:
+			False
 
 
 pure func test_borrowed_managed_parameter_return_is_retained() -> Bool:
@@ -10414,7 +10642,7 @@ pure func test_match_shadow_catalog_negative_gate_preserves_identity() -> Bool:
 		var_expr("fallback", string_type()),
 		string_type(),
 	)
-	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	catalog: MatchShadowCatalog = build_perceus_body_catalogs(body).match_shadows
 	rewritten: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
 		catalog,
 		named_var("value"),
@@ -10434,7 +10662,7 @@ pure func test_match_shadow_catalog_direct_case_admits_and_freshens() -> Bool:
 		var_expr("fallback", string_type()),
 		string_type(),
 	)
-	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	catalog: MatchShadowCatalog = build_perceus_body_catalogs(body).match_shadows
 	rewritten: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
 		catalog,
 		named_var("value"),
@@ -10459,7 +10687,7 @@ pure func test_match_shadow_catalog_fallback_admits_and_freshens() -> Bool:
 		),
 		string_type(),
 	)
-	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	catalog: MatchShadowCatalog = build_perceus_body_catalogs(body).match_shadows
 	rewritten: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
 		catalog,
 		named_var("value"),
@@ -10492,7 +10720,7 @@ pure func test_match_shadow_catalog_finds_nested_constructor_match() -> Bool:
 		string_type(),
 		synthetic_core_source_loc(),
 	)
-	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	catalog: MatchShadowCatalog = build_perceus_body_catalogs(body).match_shadows
 
 	match_shadow_catalog_admits(catalog, "nested")
 
@@ -10522,7 +10750,7 @@ pure func test_match_shadow_catalog_finds_nested_match_in_literal_body() -> Bool
 		var_expr("outer_fallback", string_type()),
 		string_type(),
 	)
-	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	catalog: MatchShadowCatalog = build_perceus_body_catalogs(body).match_shadows
 
 	match_shadow_catalog_admits(catalog, "literal_nested")
 
@@ -10560,8 +10788,38 @@ pure func match_shadow_catalog_covers(
 	covers
 
 
+---
+`let same = rows; take_first(same, count_rows(other))`: only a variable that
+is a `let`'s whole right-hand side is a candidate for the alias move.
+---
+pure func test_let_alias_source_catalog_names_only_let_right_hand_variables() -> Bool:
+	body: CoreExpr = LetExpr(
+		named_var("same"),
+		False,
+		list_int_type(),
+		rows_var(),
+		user_call_expr(
+			"take_first",
+			None,
+			[0],
+			[
+				var_expr("same", list_int_type()),
+				user_call_expr("count_rows", None, [], [var_expr("other", list_int_type())], int_type()),
+			],
+			list_int_type(),
+		),
+	)
+	catalog = build_perceus_body_catalogs(body).let_alias_sources
+
+	(
+		let_alias_source_catalog_admits(catalog, "rows")
+		and not let_alias_source_catalog_admits(catalog, "same")
+		and not let_alias_source_catalog_admits(catalog, "other")
+	)
+
+
 pure func test_match_shadow_catalog_coverage_rejects_new_post_name() -> Bool:
-	pre_insertion: MatchShadowCatalog = build_match_shadow_catalog(
+	pre_insertion: MatchShadowCatalog = build_perceus_body_catalogs(
 		constructor_match_expr(
 			[constructor_case(
 					"Before",
@@ -10571,8 +10829,8 @@ pure func test_match_shadow_catalog_coverage_rejects_new_post_name() -> Bool:
 			var_expr("fallback", string_type()),
 			string_type(),
 		),
-	)
-	post_insertion: MatchShadowCatalog = build_match_shadow_catalog(
+	).match_shadows
+	post_insertion: MatchShadowCatalog = build_perceus_body_catalogs(
 		constructor_match_expr(
 			[constructor_case(
 					"After",
@@ -10582,7 +10840,7 @@ pure func test_match_shadow_catalog_coverage_rejects_new_post_name() -> Bool:
 			var_expr("fallback", string_type()),
 			string_type(),
 		),
-	)
+	).match_shadows
 
 	not match_shadow_catalog_covers(pre_insertion, post_insertion)
 
@@ -10653,11 +10911,11 @@ func test_match_shadow_catalog_gate_matches_freshener_after_real_insertion() -> 
 
 	match normalized:
 		LetExpr(normalized_target, _, _, _, normalized_body):
-			catalog: MatchShadowCatalog = build_match_shadow_catalog(normalized)
+			catalog: MatchShadowCatalog = build_perceus_body_catalogs(normalized).match_shadows
 			rewritten_body: CoreExpr = insert_drops_expr(env, normalized_body)
-			post_insertion_catalog: MatchShadowCatalog = build_match_shadow_catalog(
+			post_insertion_catalog: MatchShadowCatalog = build_perceus_body_catalogs(
 				rewritten_body,
-			)
+			).match_shadows
 			gated: CoreExpr = freshen_shadowed_match_bindings_if_catalog_admits(
 				catalog,
 				normalized_target,
@@ -10734,8 +10992,8 @@ pure func test_match_shadow_catalogs_do_not_leak_across_bodies() -> Bool:
 			string_type(),
 		),
 	)
-	first_catalog: MatchShadowCatalog = build_match_shadow_catalog(first_body)
-	second_catalog: MatchShadowCatalog = build_match_shadow_catalog(second_body)
+	first_catalog: MatchShadowCatalog = build_perceus_body_catalogs(first_body).match_shadows
+	second_catalog: MatchShadowCatalog = build_perceus_body_catalogs(second_body).match_shadows
 
 	(
 		match_shadow_catalog_admits(first_catalog, "value")
@@ -10755,7 +11013,7 @@ pure func test_match_shadow_catalog_ignores_non_match_lexical_binders() -> Bool:
 		var_expr("source", string_type()),
 		var_expr("lexical", string_type()),
 	)
-	catalog: MatchShadowCatalog = build_match_shadow_catalog(body)
+	catalog: MatchShadowCatalog = build_perceus_body_catalogs(body).match_shadows
 
 	not match_shadow_catalog_admits(catalog, "lexical")
 
@@ -19373,11 +19631,11 @@ Only a reference-count retain and release pair is a move; a stack-result
 copy pair does more than move one reference and is left alone.
 ---
 pure func test_consumed_parameter_alias_move_requires_arc_policies() -> Bool:
-	arc_moved: CoreExpr = move_consumed_parameter_alias(
+	arc_moved: CoreExpr = move_only_owner_alias(
 		named_var("box"),
 		consumed_parameter_alias_pair(ArcRetainPolicy, ArcReleasePolicy),
 	)
-	stack_result_kept: CoreExpr = move_consumed_parameter_alias(
+	stack_result_kept: CoreExpr = move_only_owner_alias(
 		named_var("box"),
 		consumed_parameter_alias_pair(StackResultRetainPolicy, StackResultReleasePolicy),
 	)
@@ -19654,7 +19912,7 @@ pure func test_consumed_parameter_mutable_alias_read_after_keeps_retain() -> Boo
 			),
 		),
 	)
-	kept: CoreExpr = move_consumed_parameter_alias(named_var("box"), body)
+	kept: CoreExpr = move_only_owner_alias(named_var("box"), body)
 
 	dup_count_for("box", kept) == 1 and drop_count_for("box", kept) == 1
 
@@ -19691,6 +19949,39 @@ tests: TestSuite = {
 		(
 			"consumed user call contract transfers declared args",
 			test_consumed_user_call_contract_transfers_declared_args,
+		),
+		(
+			"borrow ending in later argument does not retain transferred owner",
+			test_borrow_ending_in_later_argument_does_not_retain_transferred_owner,
+		),
+		(
+			"borrow ending in later operator does not retain transferred owner",
+			test_borrow_ending_in_later_operator_does_not_retain_transferred_owner,
+		),
+		(
+			"alias returned by later argument retains transferred owner",
+			test_alias_returned_by_later_argument_retains_transferred_owner,
+		),
+		(
+			"borrow held through call retains transferred owner",
+			test_borrow_held_through_call_retains_transferred_owner,
+		),
+		("borrow before transfer retains owner", test_borrow_before_transfer_retains_owner),
+		(
+			"let alias source catalog names only let right-hand variables",
+			test_let_alias_source_catalog_names_only_let_right_hand_variables,
+		),
+		(
+			"only alias of let binding moves reference",
+			test_only_alias_of_let_binding_moves_reference,
+		),
+		(
+			"alias of let binding read again is retained",
+			test_alias_of_let_binding_read_again_is_retained,
+		),
+		(
+			"borrows held through call share one reference",
+			test_borrows_held_through_call_share_one_reference,
 		),
 		(
 			"borrowed managed parameter return is retained",

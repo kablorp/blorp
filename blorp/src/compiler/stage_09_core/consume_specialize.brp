@@ -2,7 +2,8 @@
 --
 -- A call hands an owned record to a consuming clone of its callee where the
 -- record is at its last use: the owned parameter of a clone, a `let`-bound
--- local, or the target of `x = f(x)`. The clone keeps the original body and
+-- local, the target of `x = f(x)`, or the result of another user call passed
+-- straight in (`b.f().g()`). The clone keeps the original body and
 -- declares the parameter owned through its `ConsumingClone` origin; ownership
 -- inference takes that declaration as the clone's contract floor, so Perceus
 -- transfers the parameter where the body returns or stores it and releases it
@@ -17,6 +18,12 @@
 -- clones without that benefit go back to the original function. Only record
 -- parameters are candidates, because only a record can be updated in place.
 --
+-- Before a binding is walked, `t = f(out, ...); out = g(t, ...)` with `t`
+-- used only there, and neither call able to `break` or `continue` out, is
+-- rewritten to `out = f(out, ...); out = g(out, ...)`
+-- (destination forwarding), so a loop variable updated through a temporary
+-- reaches both clones by the `x = f(x)` rule.
+--
 -- Last-use liveness is precise through bindings, sequences, branches, match
 -- results and call arguments and conservative everywhere else; a retargeted
 -- argument that is still live gets a retain from Perceus, so imprecision costs
@@ -30,9 +37,11 @@ import:
 			AssignExpr,
 			BorrowLetExpr,
 			BoxExpr,
+			BreakExpr,
 			CallExpr,
 			CastExpr,
 			ConstructorMatchExpr,
+			ContinueExpr,
 			DropExpr,
 			DupExpr,
 			IfExpr,
@@ -42,8 +51,11 @@ import:
 			LiteralMatchExpr,
 			LogicalExpr,
 			RecordUpdateExpr,
+			ResourceCleanupExitExpr,
 			SeqExpr,
 			StaticStringLiteralExpr,
+			TailrecListSpreadRecurExpr,
+			TailrecRecurExpr,
 			UnboxExpr,
 			VarExpr,
 			VoidExpr,
@@ -62,6 +74,7 @@ import:
 		CoreGlobal,
 		CoreMatchBinding,
 		CoreProgram,
+		CoreSourceLoc,
 		CoreType(HeapRecordType),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
@@ -721,12 +734,29 @@ private pure func direct_arg_count(args: List[CoreExpr], variable: CoreVar) -> I
 
 
 ---
-The clone a call can hand an owned argument to: the first argument that is
-an owned variable passed once among the call's direct arguments, not read
-after the call, and accepted by a clone. Uses of the same variable inside
-other arguments run before the call, so they do not keep it live past it.
-`assigned` is the target of `x = f(..., x, ...)`: the assignment ends its
-old value, so it needs no liveness check and is tried first.
+Whether `arg` is the result of a user call of a candidate record type. A
+user function returns an owned reference (see the source function boundary
+in `docs/OWNERSHIP_MODEL.md`) that nothing else names, so the argument slot
+is that temporary's only and last use: it can be handed to a consuming clone
+without a liveness check. `b.f().g()` and `g(f(b))` hand the record on this
+way. Other calls may return a borrowed alias, so only user calls qualify.
+---
+private pure func is_owned_call_temporary(state: ConsumeSpecializeState, arg: CoreExpr) -> Bool:
+	match arg:
+		CallExpr(UserCall(_, _, _), _, _, typ, _):
+			owned_candidate_type(state, typ)
+		_:
+			False
+
+
+---
+The clone a call can hand an owned argument to, tried in this order:
+`assigned`, the target of `x = f(..., x, ...)`, whose old value the
+assignment ends, so it needs no liveness check; then the first owned
+variable passed once among the call's direct arguments and not read after
+the call; then the first argument that is an owned call temporary. Uses of
+the same variable inside other arguments run before the call, so they do
+not keep it live past it. A candidate must also be accepted by a clone.
 ---
 private pure func last_use_clone_target(
 	walk: LastUseWalk,
@@ -739,26 +769,35 @@ private pure func last_use_clone_target(
 		UserCall(name, Some(def_id), _):
 			var assigned_target: Option[CloneTarget] = None
 			var other_target: Option[CloneTarget] = None
+			var temporary_target: Option[CloneTarget] = None
 			var index: Int = 0
 
 			for arg in args:
-				match direct_var(arg):
-					Some(variable):
-						if var_list_contains(walk.owned, variable) and direct_arg_count(args, variable) == 1:
-							is_assigned: Bool = assigned
-								.map(func(target): core_var_equal(target, variable))
-								.get_or(False)
+				if is_owned_call_temporary(walk.state, arg):
+					if temporary_target.is_none():
+						temporary_target = find_clone_target(walk.state, name, def_id, index, result_type)
+					else:
+						void
+				else if walk.owned.length() > 0:
+					match direct_var(arg):
+						Some(variable):
+							if var_list_contains(walk.owned, variable) and direct_arg_count(args, variable) == 1:
+								is_assigned: Bool = assigned
+									.map(func(target): core_var_equal(target, variable))
+									.get_or(False)
 
-							if is_assigned:
-								assigned_target = find_clone_target(walk.state, name, def_id, index, result_type)
-							else if other_target.is_none() and not read_after(variable, walk.after):
-								other_target = find_clone_target(walk.state, name, def_id, index, result_type)
+								if is_assigned:
+									assigned_target = find_clone_target(walk.state, name, def_id, index, result_type)
+								else if other_target.is_none() and not read_after(variable, walk.after):
+									other_target = find_clone_target(walk.state, name, def_id, index, result_type)
+								else:
+									void
 							else:
 								void
-						else:
+						None:
 							void
-					None:
-						void
+				else:
+					void
 
 				index += 1
 
@@ -766,7 +805,11 @@ private pure func last_use_clone_target(
 				Some(target_clone):
 					Some(target_clone)
 				None:
-					other_target
+					match other_target:
+						Some(target_clone):
+							Some(target_clone)
+						None:
+							temporary_target
 		_:
 			None
 
@@ -834,10 +877,7 @@ private pure func rewrite_last_use_call(
 				callee
 			else:
 				rewrite_last_use(conservative_walk(walk), callee)
-			target: Option[CloneTarget] = if walk.owned.length() == 0:
-				None
-			else:
-				last_use_clone_target(walk, assigned, kind, args, typ)
+			target: Option[CloneTarget] = last_use_clone_target(walk, assigned, kind, args, typ)
 
 			match target:
 				Some(target_clone):
@@ -861,6 +901,152 @@ private pure func rewrite_last_use_call(
 			rewrite_last_use(walk, expr)
 
 
+private pure func is_var_expr_of(expr: CoreExpr, variable: CoreVar) -> Bool:
+	match expr:
+		VarExpr(found, _, _):
+			core_var_equal(found, variable)
+		_:
+			False
+
+
+private pure func call_passes_var(call: CoreExpr, variable: CoreVar) -> Bool:
+	match call:
+		CallExpr(_, _, args, _, _):
+			args.any(func(arg): is_var_expr_of(arg, variable))
+		_:
+			False
+
+
+---
+Whether `variable` is passed to the call as exactly one direct argument and
+mentioned nowhere else in it.
+---
+private pure func passes_only_once(callee: CoreExpr, args: List[CoreExpr], variable: CoreVar) -> Bool:
+	(
+		args.filter(func(arg): is_var_expr_of(arg, variable)).length() == 1
+		and not args.any(func(arg): not is_var_expr_of(arg, variable) and expr_mentions_var(arg, variable))
+		and not expr_mentions_var(callee, variable)
+	)
+
+
+---
+Whether evaluating `expr` may leave it without producing a value: a
+`break`, `continue`, resource cleanup exit or tail-recursion jump anywhere
+inside. Conservative: an exit that targets a loop nested inside `expr`
+counts too. Core has no `return`, and `?=` is rejected in loop bodies.
+---
+private pure func may_exit_early(expr: CoreExpr) -> Bool:
+	match expr:
+		BreakExpr(_, _) | ContinueExpr(_, _) | ResourceCleanupExitExpr(_, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadRecurExpr(_, _, _, _):
+			True
+		_:
+			CoreTraverse.immediate_core_expr_children(expr).any(may_exit_early)
+
+
+private pure func replaced_var_arg(arg: CoreExpr, variable: CoreVar, replacement: CoreExpr) -> CoreExpr:
+	if is_var_expr_of(arg, variable):
+		replacement
+	else:
+		arg
+
+
+---
+`out = f(out, ...); out = g(out, ...)` for `t = f(out, ...); out = g(t, ...)`,
+or `None` when the forwarding does not apply. See `forwarded_assignment`.
+---
+private pure func forwarded_assignment_pair(
+	temporary: CoreVar,
+	temporary_type: CoreType,
+	temporary_rhs: CoreExpr,
+	target: CoreVar,
+	assigned: CoreExpr,
+	assign_type: CoreType,
+	assign_loc: CoreSourceLoc,
+) -> Option[CoreExpr]:
+	match assigned:
+		CallExpr(kind, callee, args, assigned_type, call_loc):
+			if (
+				same_heap_record_type(temporary_type, assigned_type)
+				and call_passes_var(temporary_rhs, target)
+				and passes_only_once(callee, args, temporary)
+				and not expr_mentions_var(assigned, target)
+				and not may_exit_early(temporary_rhs)
+				and not may_exit_early(assigned)
+			):
+				target_read: CoreExpr = VarExpr(target, temporary_type, call_loc)
+				forwarded_args: List[CoreExpr] = args.map(
+					func(arg): replaced_var_arg(arg, temporary, target_read),
+				)
+
+				Some(SeqExpr(
+					AssignExpr(target, temporary_rhs, assign_type, assign_loc),
+					AssignExpr(
+						target,
+						CallExpr(kind, callee, forwarded_args, assigned_type, call_loc),
+						assign_type,
+						assign_loc,
+					),
+				))
+			else:
+				None
+		_:
+			None
+
+
+---
+Destination forwarding (the idea of Rust MIR's destination propagation):
+`t = f(out, ...); out = g(t, ...)`, with `t` an immutable record local used
+only as one direct argument of the call assigned to `out`, is rewritten to
+`out = f(out, ...); out = g(out, ...)`. Each statement is then the
+`x = f(x)` form, whose assignment ends the old value, so both calls take
+consuming clones even inside a loop, where the last-use walk does not track
+variables. The meaning is unchanged when the second call does not mention
+`out`, `t` is not used after it, and neither call can leave early: a
+`break` or `continue` while evaluating the second call would otherwise leave
+`out` holding the first call's result instead of its old value. Closures
+cannot capture a mutable variable, so nothing else observes `out` between
+the two assignments; a cancellation ends the function, and its cleanup
+releases whichever owned value `out` holds.
+---
+private pure func forwarded_assignment(
+	state: ConsumeSpecializeState,
+	temporary: CoreVar,
+	is_mutable: Bool,
+	temporary_type: CoreType,
+	temporary_rhs: CoreExpr,
+	body: CoreExpr,
+) -> Option[CoreExpr]:
+	if is_mutable or not owned_candidate_type(state, temporary_type):
+		None
+	else:
+		match body:
+			AssignExpr(target, assigned, assign_type, assign_loc):
+				forwarded_assignment_pair(
+					temporary,
+					temporary_type,
+					temporary_rhs,
+					target,
+					assigned,
+					assign_type,
+					assign_loc,
+				)
+			SeqExpr(AssignExpr(target, assigned, assign_type, assign_loc), rest):
+				if expr_mentions_var(rest, temporary):
+					None
+				else:
+					forwarded_assignment_pair(
+						temporary,
+						temporary_type,
+						temporary_rhs,
+						target,
+						assigned,
+						assign_type,
+						assign_loc,
+					).map(func(pair): SeqExpr(pair, rest))
+			_:
+				None
+
+
 ---
 Retargets every call that hands an owned record on at its last use to the
 consuming clone for that argument, rebuilding only the nodes above a change.
@@ -879,17 +1065,21 @@ private pure func rewrite_last_use(walk: LastUseWalk, expr: CoreExpr) -> CoreExp
 		SeqExpr(_, _):
 			rewrite_last_use_sequence(walk, expr)
 		LetExpr(variable, is_mutable, typ, rhs, body):
-			body_walk: LastUseWalk = if owned_candidate_type(walk.state, typ):
-				walk_owning(walk, variable)
-			else:
-				walk_without(walk, variable)
-			rewritten_body: CoreExpr = rewrite_last_use(body_walk, body)
-			rewritten_rhs: CoreExpr = rewrite_last_use(walk_before(walk, body), rhs)
+			match forwarded_assignment(walk.state, variable, is_mutable, typ, rhs, body):
+				Some(forwarded):
+					rewrite_last_use(walk, forwarded)
+				None:
+					body_walk: LastUseWalk = if owned_candidate_type(walk.state, typ):
+						walk_owning(walk, variable)
+					else:
+						walk_without(walk, variable)
+					rewritten_body: CoreExpr = rewrite_last_use(body_walk, body)
+					rewritten_rhs: CoreExpr = rewrite_last_use(walk_before(walk, body), rhs)
 
-			if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
-				expr
-			else:
-				LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
+					if same_core_expr(rewritten_rhs, rhs) and same_core_expr(rewritten_body, body):
+						expr
+					else:
+						LetExpr(variable, is_mutable, typ, rewritten_rhs, rewritten_body)
 		BorrowLetExpr(variable, typ, rhs, body):
 			rewritten_body: CoreExpr = rewrite_last_use(walk_without(walk, variable), body)
 			rewritten_rhs: CoreExpr = rewrite_last_use(walk_before(walk, body), rhs)

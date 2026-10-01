@@ -13,6 +13,9 @@ MAP_FIXTURE=blorp/test/runtime/fixture/alloc_oracle_map.brp
 PROBE_FIXTURE=blorp/test/runtime/fixture/memory_stats_probe.brp
 CONSUME_UPDATE_FIXTURE=blorp/test/runtime/fixture/consume_owned_update_shapes.brp
 CONSUME_BUILDER_FIXTURE=blorp/test/runtime/fixture/consume_owned_builder_shapes.brp
+CONSUME_THREADING_FIXTURE=blorp/test/runtime/fixture/consume_owned_threading_shapes.brp
+# Every shape the threading fixture reports; each must print `PASS <shape>`.
+CONSUME_THREADING_SHAPES="named_local chained_receiver nested_argument read_in_later_argument field_read_in_later_argument loop_through_temporary alias_then_update alias_of_local"
 PASS=0
 FAIL=0
 
@@ -111,6 +114,23 @@ if grep -q "^PASS" <<< "$consume_builder_output"; then
 else
     echo "FAIL"
     echo "  Got: $consume_builder_output"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "Test 9: plain builder threading shapes update in place... "
+threading_output=$($BLORP run --memory-stats "$CONSUME_THREADING_FIXTURE" 2>&1 || true)
+threading_failed=""
+for shape in $CONSUME_THREADING_SHAPES; do
+    if ! grep -qx "PASS $shape" <<< "$threading_output"; then
+        threading_failed="$threading_failed $shape"
+    fi
+done
+if [ -z "$threading_failed" ]; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (shapes:$threading_failed)"
+    echo "  Got: $threading_output"
     FAIL=$((FAIL + 1))
 fi
 

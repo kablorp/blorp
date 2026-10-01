@@ -104,6 +104,16 @@ Each managed argument slot has an explicit mode:
 | Consume | Transfer an existing owner | Own the transferred value |
 | COW consume | Transfer a receiver owner | Reuse if unique or copy and release the old owner |
 
+Arguments are evaluated left to right, and the callee runs after the last
+one; the emitter materializes arguments in that order whenever one can
+execute code. A variable passed directly to a consuming slot is only read
+while the arguments are evaluated and is transferred when the callee starts,
+so a borrow of it that ends during evaluation (`f(b, g(b))`, with `g`
+returning an operator result or an owned value that does not alias `b`)
+needs no extra reference. A borrow still held when the callee starts, such
+as `b` or `b.field` in a borrowing slot, does: all such borrows share one
+reference beside the transferred one.
+
 Each managed result similarly states whether it is newly owned, transferred,
 borrowed, or aliases an input. Public read-only operations must not secretly
 consume receivers. COW consumption is an internal ABI or an explicitly
@@ -303,8 +313,15 @@ ARC balancing, but it is not their only producer.
 its owned parameter in its `ConsumingClone` origin; ownership inference treats
 that parameter as consumed, and Perceus balances the unchanged body. The pass
 retargets a call to a clone where an owned record (a clone's owned parameter,
-a `let`-bound local, or the target of `x = f(x)`) is passed at its last use;
-clones are created transitively as clone bodies hand their parameter on. A
+a `let`-bound local, the target of `x = f(x)`, or the result of another user
+call passed straight in, as in `b.f().g()`) is passed at its last use;
+clones are created transitively as clone bodies hand their parameter on.
+`t = f(out, ...); out = g(t, ...)`, with the immutable `t` used only as one
+direct argument of that call, the call not reading `out`, and neither call
+able to leave early (`break`, `continue`, a cleanup exit or a tail-recursion
+jump), is first rewritten to `out = f(out, ...); out = g(out, ...)`, so a
+loop variable
+updated through a temporary is handed on by the `x = f(x)` rule. A
 clone is kept only when the record reaches an in-place update: a record
 update of the parameter or an alias in the clone, or a last-use hand-off to
 another clone that has one (a least fixpoint over the clones built). Calls to
@@ -312,10 +329,10 @@ the other clones go back to the original function. Liveness is conservative
 inside loops, lambdas, logical operators and other constructs the pass does
 not model. Perceus is the safety net: a retargeted argument that is still
 live gets a retain, so imprecision costs a copy, never correctness. Perceus
-turns the reference-count retain/release pair of a consumed parameter's only
-alias (`let x = p` or `var x = p`, with no other use of `p`) into a move, so
-the alias reaches the next clone uniquely owned even when its first update
-sits under a branch or loop.
+turns the reference-count retain/release pair of a consumed parameter's or an
+immutable managed `let` binding's only alias (`let x = p` or `var x = p`,
+with no other use of `p`) into a move, so the alias reaches the next clone
+uniquely owned even when its first update sits under a branch or loop.
 
 Only record parameters are candidates. Union parameters used to get clones
 for `x = f(x)` over a match source, which let `reuse` rebuild the union in the

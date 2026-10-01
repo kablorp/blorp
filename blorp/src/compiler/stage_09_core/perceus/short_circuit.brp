@@ -3,8 +3,8 @@
 -- parameters can share the function's implicit final drop instead of a
 -- per-parameter drop (simple_consumed_parameter_catalog/prove_simple_
 -- consumed_parameter_balance walk the whole body once to prove it safe);
--- move_consumed_parameter_alias then turns the retain/release pair of a
--- consumed parameter's only alias (immutable or `var`) into a move;
+-- move_only_owner_alias then turns the retain/release pair of a consumed
+-- parameter's (or an immutable managed let's) only alias into a move;
 -- balance_short_circuit_operands protects a short-circuited `and`/`or`
 -- operand's reads so a value the left operand consumed cannot be read again
 -- if the right operand is skipped.
@@ -168,16 +168,16 @@ private pure func balance_consumed_param_body(
 		protected,
 	)
 
-	move_consumed_parameter_alias(variable, prepend_dups(owned_refs - 1, variable, value_type, balanced))
+	move_only_owner_alias(variable, prepend_dups(owned_refs - 1, variable, value_type, balanced))
 
 
 ---
-Occurrences of one consumed parameter in a balanced body. `alias_on_spine`
+Occurrences of one owning variable in a balanced body. `alias_on_spine`
 and `drop_on_spine` count the alias retain (`let x = DUP p; p`) and the
 release found on the straight-line spine; the other counts cover the whole
 body.
 ---
-private record ConsumedParameterAliasCensus {
+private record OwnerAliasCensus {
 	dups: Int,
 	drops: Int,
 	other_references: Int,
@@ -209,15 +209,15 @@ plain reference-count release is a move of one reference; any other policy (a
 stack-result copy, a copy-on-write field take) does more than that and is
 left alone.
 ---
-private pure func is_parameter_alias_retain(parameter: CoreVar, expr: CoreExpr) -> Bool:
+private pure func is_owner_alias_retain(owner: CoreVar, expr: CoreExpr) -> Bool:
 	match expr:
 		DupExpr(variable, _, retain_policy, body, _, _):
 			(
-				core_var_equal(variable, parameter)
+				core_var_equal(variable, owner)
 				and is_arc_retain(retain_policy)
 				and match body:
 					VarExpr(referenced, _, _):
-						core_var_equal(referenced, parameter)
+						core_var_equal(referenced, owner)
 					_:
 						False
 			)
@@ -225,27 +225,29 @@ private pure func is_parameter_alias_retain(parameter: CoreVar, expr: CoreExpr) 
 			False
 
 
-private pure func count_parameter_occurrences(
-	parameter: CoreVar,
+private pure func count_owner_occurrences(
+	owner: CoreVar,
 	body: CoreExpr,
-) -> ConsumedParameterAliasCensus:
+) -> OwnerAliasCensus:
 	var dups: Int = 0
 	var drops: Int = 0
 	var other_references: Int = 0
 	var pending: List[CoreExpr] = [body]
 	var index: Int = 0
 
-	while index < pending.length():
+	-- A second retain or release, or any other reference, already rules the
+	-- move out, so the walk stops there instead of covering the whole body.
+	while index < pending.length() and dups <= 1 and drops <= 1 and other_references == 0:
 		match pending.get(index):
 			Some(current):
 				var visit_children: Bool = True
 
 				match current:
 					DupExpr(variable, _, _, _, _, _):
-						if core_var_equal(variable, parameter):
+						if core_var_equal(variable, owner):
 							dups += 1
 
-							if is_parameter_alias_retain(parameter, current):
+							if is_owner_alias_retain(owner, current):
 								-- The alias's own `p` reference is part of the retain.
 								visit_children = False
 							else:
@@ -253,7 +255,7 @@ private pure func count_parameter_occurrences(
 						else:
 							void
 					DropExpr(variable, _, release_policy, _, _, _):
-						if core_var_equal(variable, parameter):
+						if core_var_equal(variable, owner):
 							if is_arc_release(release_policy):
 								drops += 1
 							else:
@@ -261,17 +263,17 @@ private pure func count_parameter_occurrences(
 						else:
 							void
 					VarExpr(variable, _, _):
-						if core_var_equal(variable, parameter):
+						if core_var_equal(variable, owner):
 							other_references += 1
 						else:
 							void
 					AssignExpr(variable, _, _, _):
-						if core_var_equal(variable, parameter):
+						if core_var_equal(variable, owner):
 							other_references += 1
 						else:
 							void
 					ListHandoffExpr(handoff, _, _):
-						if core_var_equal(handoff.source_var, parameter):
+						if core_var_equal(handoff.source_var, owner):
 							other_references += 1
 						else:
 							void
@@ -298,15 +300,15 @@ private pure func count_parameter_occurrences(
 
 
 ---
-Counts the alias retains and releases of `parameter` that run exactly once
+Counts the alias retains and releases of `owner` that run exactly once
 on every path: those reached from the root through bindings, sequences and
 other retains or releases only, never through a branch, loop or lambda.
 ---
 private pure func count_spine_alias_and_drop(
-	parameter: CoreVar,
+	owner: CoreVar,
 	body: CoreExpr,
-	census: ConsumedParameterAliasCensus,
-) -> ConsumedParameterAliasCensus:
+	census: OwnerAliasCensus,
+) -> OwnerAliasCensus:
 	var alias_on_spine: Int = 0
 	var drop_on_spine: Int = 0
 	var pending: List[CoreExpr] = [body]
@@ -317,7 +319,7 @@ private pure func count_spine_alias_and_drop(
 			Some(current):
 				match current:
 					LetExpr(_, _, _, rhs, let_body):
-						if is_parameter_alias_retain(parameter, rhs):
+						if is_owner_alias_retain(owner, rhs):
 							alias_on_spine += 1
 						else:
 							pending = pending.append(rhs)
@@ -332,7 +334,7 @@ private pure func count_spine_alias_and_drop(
 					DupExpr(_, _, _, dup_body, _, _):
 						pending = pending.append(dup_body)
 					DropExpr(variable, _, release_policy, drop_body, _, _):
-						if core_var_equal(variable, parameter) and is_arc_release(release_policy):
+						if core_var_equal(variable, owner) and is_arc_release(release_policy):
 							drop_on_spine += 1
 						else:
 							void
@@ -351,13 +353,13 @@ private pure func count_spine_alias_and_drop(
 	}
 
 
-private pure func remove_parameter_alias_retain_and_drop(
-	parameter: CoreVar,
+private pure func remove_owner_alias_retain_and_drop(
+	owner: CoreVar,
 	expr: CoreExpr,
 ) -> CoreExpr:
 	stripped: CoreExpr = match expr:
 		LetExpr(variable, is_mutable, typ, rhs, body):
-			if is_parameter_alias_retain(parameter, rhs):
+			if is_owner_alias_retain(owner, rhs):
 				match rhs:
 					DupExpr(_, _, _, alias_reference, _, _):
 						LetExpr(variable, is_mutable, typ, alias_reference, body)
@@ -366,7 +368,7 @@ private pure func remove_parameter_alias_retain_and_drop(
 			else:
 				expr
 		DropExpr(variable, _, release_policy, drop_body, _, _):
-			if core_var_equal(variable, parameter) and is_arc_release(release_policy):
+			if core_var_equal(variable, owner) and is_arc_release(release_policy):
 				drop_body
 			else:
 				expr
@@ -377,34 +379,35 @@ private pure func remove_parameter_alias_retain_and_drop(
 		LetExpr(_, _, _, _, _) | BorrowLetExpr(_, _, _, _) | SeqExpr(_, _) | DupExpr(_, _, _, _, _, _) | DropExpr(_, _, _, _, _, _):
 			CoreTraverse.map_core_expr_children(
 				stripped,
-				func(child): remove_parameter_alias_retain_and_drop(parameter, child),
+				func(child): remove_owner_alias_retain_and_drop(owner, child),
 			)
 		_:
 			stripped
 
 
 ---
-Consumed-parameter alias move: `let x = p` binds a copy of the reference, so
-Perceus retains `p` for `x` and later releases `p` itself. When that alias
-and that release are the only occurrences of the consumed parameter `p`, and
-both run exactly once on every path, the retain/release pair only moves the
-reference into `x`. Removing both hands `x` the parameter's reference
-directly, so a callee that takes `x` sees it uniquely owned and can update
-it in place. A `var x = p` slot is the same move: the slot owns its current
-value and releases it when an assignment replaces it or the scope ends, so
-it may start from the parameter's reference even when its first update sits
-under a branch or loop that does not run.
+Alias move for a variable that owns one reference: a consumed parameter or
+an immutable managed `let` binding. `let x = p` binds a copy of the
+reference, so Perceus retains `p` for `x` and later releases `p` itself.
+When that alias and that release are the only occurrences of `p`, and both
+run exactly once on every path, the retain/release pair only moves the
+reference into `x`. Removing both hands `x` the owner's reference directly,
+so a callee that takes `x` sees it uniquely owned and can update it in
+place. A `var x = p` slot is the same move: the slot owns its current value
+and releases it when an assignment replaces it or the scope ends, so it may
+start from the owner's reference even when its first update sits under a
+branch or loop that does not run.
 ---
-pure func move_consumed_parameter_alias(parameter: CoreVar, body: CoreExpr) -> CoreExpr:
-	census: ConsumedParameterAliasCensus = count_parameter_occurrences(parameter, body)
+pure func move_only_owner_alias(owner: CoreVar, body: CoreExpr) -> CoreExpr:
+	census: OwnerAliasCensus = count_owner_occurrences(owner, body)
 
 	if census.dups != 1 or census.drops != 1 or census.other_references != 0:
 		body
 	else:
-		spine: ConsumedParameterAliasCensus = count_spine_alias_and_drop(parameter, body, census)
+		spine: OwnerAliasCensus = count_spine_alias_and_drop(owner, body, census)
 
 		if spine.alias_on_spine == 1 and spine.drop_on_spine == 1:
-			remove_parameter_alias_retain_and_drop(parameter, body)
+			remove_owner_alias_retain_and_drop(owner, body)
 		else:
 			body
 

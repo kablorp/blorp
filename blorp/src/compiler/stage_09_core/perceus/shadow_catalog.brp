@@ -1,11 +1,13 @@
--- A function/global-scoped negative index for constructor-match shadow names.
+-- Function/global-scoped negative indexes built in one walk at the exact body
+-- boundary entering drop insertion.
 --
 -- `freshen_shadowed_match_bindings` must recursively inspect a managed let's
 -- whole body when a constructor-match payload might reuse the let variable's
--- source name. Most names are absent. Build that fact once at the exact body
--- boundary entering drop insertion, then use a missing catalog entry to skip
--- the identity-only traversal. Presence is deliberately conservative: lexical
--- scope is not encoded here, so false positives still take the old path.
+-- source name, and `move_only_owner_alias` must census a managed let's whole
+-- body when a second name (`let x = v`) might take its reference. Most names
+-- are absent from both. A missing catalog entry skips the traversal. Presence
+-- is deliberately conservative: lexical scope is not encoded here, so false
+-- positives still take the full path.
 import:
 	../ir:
 		CoreConstructorMatchFallback(
@@ -13,9 +15,9 @@ import:
 			ConstructorMatchFallbackBody,
 			ConstructorMatchFallbackFail,
 		),
-		CoreExpr(ConstructorMatchExpr),
+		CoreExpr(ConstructorMatchExpr, LetExpr, VarExpr),
 		CoreVar,
-	env: MatchShadowCatalog
+	env: LetAliasSourceCatalog, MatchShadowCatalog
 	balance: freshen_shadowed_match_bindings
 	work_counters:
 		perceus_work_match_shadow_catalogs_built,
@@ -28,20 +30,31 @@ import:
 
 
 ---
+The negative indexes of one function body or global initializer.
+---
+record PerceusBodyCatalogs {
+	match_shadows: MatchShadowCatalog,
+	let_alias_sources: LetAliasSourceCatalog
+}
+
+
+---
 Collect only the binding family that the freshener can rename: direct case
 bindings and direct fallback bindings of `ConstructorMatchExpr`. The generic
 child traversal still finds nested constructor matches, including matches
-inside constructor-body literal/length result expressions.
+inside constructor-body literal/length result expressions. In the same walk,
+collect the variable named by each `let x = v` right-hand side.
 
-The dictionary and worklist have one local owner for the whole build. Nothing
-threads a growing builder record through recursion, and the immutable catalog
-is published only after the walk is complete.
+The dictionaries and worklist have one local owner for the whole build.
+Nothing threads a growing builder record through recursion, and the
+immutable catalogs are published only after the walk is complete.
 ---
-pure func build_match_shadow_catalog(body: CoreExpr) -> MatchShadowCatalog:
+pure func build_perceus_body_catalogs(body: CoreExpr) -> PerceusBodyCatalogs:
 	debug:
 		perceus_work_match_shadow_catalogs_built()
 
 	var names: Dict[String, Bool] = {}
+	var let_alias_sources: Dict[String, Bool] = {}
 	var pending: List[CoreExpr] = [body]
 	var index: Int = 0
 
@@ -49,6 +62,8 @@ pure func build_match_shadow_catalog(body: CoreExpr) -> MatchShadowCatalog:
 		match pending.get(index):
 			Some(current):
 				match current:
+					LetExpr(_, _, _, VarExpr(source, _, _), _):
+						let_alias_sources = let_alias_sources.set(source.name, True)
 					ConstructorMatchExpr(_, _, cases, fallback, _, _):
 						for match_case in cases:
 							for binding in match_case.bindings:
@@ -94,7 +109,14 @@ pure func build_match_shadow_catalog(body: CoreExpr) -> MatchShadowCatalog:
 	else:
 		void
 
-	{ names = names }
+	{
+		match_shadows = { names = names },
+		let_alias_sources = { names = let_alias_sources }
+	}
+
+
+pure func let_alias_source_catalog_admits(catalog: LetAliasSourceCatalog, name: String) -> Bool:
+	catalog.names.contains(name)
 
 
 pure func match_shadow_catalog_admits(catalog: MatchShadowCatalog, name: String) -> Bool:

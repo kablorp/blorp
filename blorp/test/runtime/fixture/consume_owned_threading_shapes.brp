@@ -1,0 +1,201 @@
+-- Allocation fixture for the plain ways of threading a builder record through
+-- helper calls: each shape is a `step(b, i)` called as `b = step(b, i)` in a
+-- loop. When the builder is handed on at its last use in every shape, both
+-- lists grow in place and the allocations grow only with their capacity
+-- doublings; a shape that keeps a second reference copies the builder on
+-- every step, and its allocations grow with the row count.
+-- Prints one `PASS <shape>` or `FAIL <shape> ...` line per shape.
+-- Run in its own process with --memory-stats
+-- (see test_alloc_oracle_blorp_level.sh).
+import:
+	memory: MemStats, get_mem_stats, mem_delta
+
+
+record Builder {
+	nodes: List[Int],
+	children: List[Int]
+}
+
+
+-- The builder is made before the measured region; inside it each of the two
+-- lists reallocates once per capacity doubling (at most ceil(log2(N)) + 1
+-- times), plus a small constant for the first buffers.
+private CONSTANT_ALLOCATION_ALLOWANCE: Int = 4
+
+private LISTS_PER_BUILDER: Int = 2
+
+private SMALL_ROW_COUNT: Int = 1000
+
+private LARGE_ROW_COUNT: Int = 10000
+
+
+pure func append_node(b: Builder, kind: Int) -> Builder:
+	{ b | nodes = b.nodes.append(kind) }
+
+
+pure func append_child(b: Builder, child: Int) -> Builder:
+	{ b | children = b.children.append(child) }
+
+
+-- The control: the intermediate builder is bound to a name first.
+pure func step_named_local(b: Builder, i: Int) -> Builder:
+	appended: Builder = b.append_node(i)
+	appended.append_child(i)
+
+
+-- A builder-returning call as the receiver of another call.
+pure func step_chained_receiver(b: Builder, i: Int) -> Builder:
+	b
+		.append_node(i)
+		.append_child(i)
+
+
+-- The same call written as a nested argument.
+pure func step_nested_argument(b: Builder, i: Int) -> Builder:
+	append_child(
+		append_node(b, i),
+		i,
+	)
+
+
+pure func last_node(b: Builder) -> Int:
+	b.nodes.length() - 1
+
+
+-- The builder read in a later argument of the call it is handed to.
+pure func step_read_in_later_argument(b: Builder, i: Int) -> Builder:
+	appended: Builder = b.append_node(i)
+	appended.append_child(appended.last_node())
+
+
+-- The same read through a field of the builder.
+pure func step_field_read_in_later_argument(b: Builder, i: Int) -> Builder:
+	appended: Builder = b.append_node(i)
+	appended.append_child(appended.nodes.length() - 1)
+
+
+-- A loop variable updated through a temporary.
+pure func step_loop_through_temporary(b: Builder, i: Int) -> Builder:
+	var out: Builder = b
+
+	for _ in 0..1:
+		appended: Builder = out.append_node(i)
+		out = appended.append_child(i)
+
+	out
+
+
+-- A second name for the builder, updated after the first name is dead.
+pure func step_alias_then_update(b: Builder, i: Int) -> Builder:
+	var out: Builder = b
+	second_name: Builder = out
+	out = second_name.append_node(i)
+	out = out.append_child(i)
+	out
+
+
+-- A second name for a local made by a call.
+pure func step_alias_of_local(b: Builder, i: Int) -> Builder:
+	appended: Builder = b.append_node(i)
+	same: Builder = appended
+	same.append_child(i)
+
+
+pure func step(shape: String, b: Builder, i: Int) -> Builder:
+	match shape:
+		"named_local":
+			step_named_local(b, i)
+		"chained_receiver":
+			step_chained_receiver(b, i)
+		"nested_argument":
+			step_nested_argument(b, i)
+		"read_in_later_argument":
+			step_read_in_later_argument(b, i)
+		"field_read_in_later_argument":
+			step_field_read_in_later_argument(b, i)
+		"loop_through_temporary":
+			step_loop_through_temporary(b, i)
+		"alias_then_update":
+			step_alias_then_update(b, i)
+		"alias_of_local":
+			step_alias_of_local(b, i)
+		_:
+			b
+
+
+pure func ceil_log2(value: Int) -> Int:
+	var bits: Int = 0
+	var capacity: Int = 1
+
+	while capacity < value:
+		capacity *= 2
+		bits += 1
+
+	bits
+
+
+pure func growth_allowance(rows: Int) -> Int:
+	LISTS_PER_BUILDER * (ceil_log2(rows) + 1) + CONSTANT_ALLOCATION_ALLOWANCE
+
+
+---
+The managed allocations between two snapshots, or -1 when counting was off
+(without `--memory-stats` every count reads 0, which would pass vacuously).
+---
+func counted_allocations(before: MemStats, after: MemStats) -> Int:
+	if before.memory_stats_active == 1 and after.memory_stats_active == 1:
+		mem_delta(before, after).total_allocations
+	else:
+		-1
+
+
+---
+The allocations of `rows` steps of `shape`, or -1 when the built lists are
+wrong or counting was off. Every shape appends one node and one child per
+step.
+---
+func shape_allocations(shape: String, rows: Int) -> Int:
+	var b: Builder = {
+		nodes = [],
+		children = []
+	}
+	before: MemStats = get_mem_stats()
+
+	for i in 0..rows:
+		b = step(shape, b, i)
+
+	after: MemStats = get_mem_stats()
+
+	if (
+		b.nodes.length() == rows
+		and b.children.length() == rows
+		and b.nodes.get_or(rows - 1, -1) == rows - 1
+	):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+pure func within(allocations: Int, rows: Int) -> Bool:
+	allocations >= 0 and allocations <= growth_allowance(rows)
+
+
+func report(shape: String):
+	small: Int = shape_allocations(shape, SMALL_ROW_COUNT)
+	large: Int = shape_allocations(shape, LARGE_ROW_COUNT)
+
+	if within(small, SMALL_ROW_COUNT) and within(large, LARGE_ROW_COUNT):
+		print("PASS ${shape}")
+	else:
+		print("FAIL ${shape}: ${small}/${large} allocations")
+
+
+func main(args: List[String]):
+	report("named_local")
+	report("chained_receiver")
+	report("nested_argument")
+	report("read_in_later_argument")
+	report("field_read_in_later_argument")
+	report("loop_through_temporary")
+	report("alias_then_update")
+	report("alias_of_local")
