@@ -116,6 +116,7 @@ if "${BLORP_CC:-clang}" --version 2>/dev/null | grep -qi clang; then
         "${CC_SYNTAX_ONLY_FLAGS[@]}"
         -Werror=unsequenced
         -Werror=incompatible-pointer-types
+        -Werror=implicitly-unsigned-literal
         -Wno-parentheses-equality
     )
 else

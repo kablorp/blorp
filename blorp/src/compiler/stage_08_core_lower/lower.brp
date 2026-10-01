@@ -2160,6 +2160,40 @@ private pure func core_literal_int(text: String) -> CoreLiteral:
 		WideIntLiteral(text)
 
 
+---
+Int's minimum has no positive literal, so source writes it as the negation of
+9223372036854775808. Folding that negation keeps the out-of-range magnitude out
+of Core: the value becomes an ordinary `IntLiteral`, whose C spelling avoids a
+signed literal too large for `long`. Literals whose magnitude fits Int stay a
+`NegateOp` over the literal. The only magnitude that fails to fit Int while its
+negation fits is 2^63, so the fold produces Int's minimum and nothing else. It
+does not consult the literal's type: every signed type that can hold the value
+(Int, Int128) reads the same constant, UInt64 negation is a type error, and a
+narrower type cannot hold it at all.
+---
+private pure func negated_int_literal_beyond_int_max(
+	op: ParsedUnaryOp,
+	operand: TypedExpr,
+) -> Option[CoreLiteral]:
+	match op:
+		ParsedNegateOp:
+			match operand:
+				TypedIntLiteralExpr(text, _, _):
+					match core_literal_int(text):
+						WideIntLiteral(magnitude):
+							match core_literal_int("-" + magnitude):
+								IntLiteral(value):
+									Some(IntLiteral(value))
+								_:
+									None
+						_:
+							None
+				_:
+					None
+		ParsedNotOp:
+			None
+
+
 private pure func core_literal_float(text: String) -> CoreLiteral:
 	if text == "inf":
 		FloatInfinityLiteral
@@ -5355,8 +5389,12 @@ private pure func lower_typed_expr_as_type_impl(
 			lowered_value ?= lower_typed_expr_with_context(context, value)
 			Ok(AssignExpr(core_local_var_use(context, name.text, None), lowered_value, typ, loc))
 		TypedUnaryExpr(op, inner, _, _):
-			lowered_inner ?= lower_typed_expr_with_context(context, inner)
-			Ok(UnaryExpr(core_unary_op(op), lowered_inner, typ, loc))
+			match negated_int_literal_beyond_int_max(op, inner):
+				Some(literal):
+					Ok(LiteralExpr(literal, typ, loc))
+				None:
+					lowered_inner ?= lower_typed_expr_with_context(context, inner)
+					Ok(UnaryExpr(core_unary_op(op), lowered_inner, typ, loc))
 		TypedBinaryExpr(op, left, right, _, _):
 			lowered_left ?= lower_typed_expr_with_context(context, left)
 			lowered_right ?= lower_typed_expr_with_context(context, right)
