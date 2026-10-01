@@ -76,6 +76,7 @@ import:
 			ParsedTuplePattern, ParsedWildcardPattern,
 		),
 		ParsedProgram,
+		ParsedRecordDecl,
 		ParsedRecordExprField,
 		ParsedSelectArm,
 		ParsedSelectArmKind(ParsedSelectAfterArm, ParsedSelectReceiveArm, ParsedSelectSealedArm),
@@ -92,6 +93,7 @@ import:
 		),
 		ParsedTypeParamDecl,
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
+		ParsedUnionDecl,
 		ParsedVariantDecl,
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
@@ -2599,7 +2601,26 @@ private pure func located_decl(
 	}
 
 
-private pure func project_type_variant(variant: ParsedVariantDecl) -> TypeVariant:
+private pure func no_member_comments() -> MemberComments:
+	{
+		leading = [],
+		trailing = None
+	}
+
+
+--- A declaration member's extent: it never ends inside a nested block.
+private pure func declaration_member_extent(span: SourceLocation) -> ParsedItemExtent:
+	{
+		span = span,
+		ending_block_column = None,
+		ends_inside_block = False
+	}
+
+
+private pure func project_type_variant(
+	variant: ParsedVariantDecl,
+	comments: MemberComments,
+) -> TypeVariant:
 	var fields: List[TypeExpression] = []
 
 	for field in variant.fields:
@@ -2607,15 +2628,124 @@ private pure func project_type_variant(variant: ParsedVariantDecl) -> TypeVarian
 
 	{
 		name = variant.name.text,
-		fields = fields
+		fields = fields,
+		comments = comments
 	}
 
 
-private pure func project_field_decl(field: ParsedFieldDecl) -> DeclarationField:
+private pure func project_field_decl(
+	field: ParsedFieldDecl,
+	comments: MemberComments,
+) -> DeclarationField:
 	{
 		name = field.name.text,
-		field_type = project_type_expr(field.type_expr)
+		field_type = project_type_expr(field.type_expr),
+		comments = comments
 	}
+
+
+---
+A record or struct body's fields with the comments written among them (see
+`collection_item_comments`; the opening line is the header's, the closing line
+the `}` that ends the declaration), and the whole-line comments after the last
+field. A file without comments skips locating the fields.
+---
+private pure func project_record_fields(
+	table: SourceTable,
+	comments: List[FormatterComment],
+	record_decl: ParsedRecordDecl,
+) -> (List[DeclarationField], List[String]):
+	if comments.length() == 0:
+		(record_decl.fields.map(func(field): project_field_decl(field, no_member_comments())), [])
+	else:
+		located: List[LocatedItem[ParsedFieldDecl]] = record_decl.fields.map(
+			func(field): located_item(field, declaration_member_extent(field.span)),
+		)
+		commented: CommentedItems[ParsedFieldDecl] = collection_item_comments(
+			table,
+			comments,
+			source_location_span(table, record_decl.name.span).start_line,
+			span_end_line(table, record_decl.span),
+			located,
+		)
+		(
+			commented.items.map(func(item): project_field_decl(item.item, item.comments)),
+			commented.closing,
+		)
+
+
+---
+A union or enum body's variants with the comments written among them (see
+`collection_item_comments`), and the whole-line comments after the last variant.
+The body has no closing line, so its closing comments are those indented at the
+variants' column that follow the last variant: `comments` ends at the next
+declaration, and a comment at the declaration's own column belongs to what
+follows it. A file without comments skips locating the variants.
+---
+private pure func project_type_variants(
+	table: SourceTable,
+	comments: List[FormatterComment],
+	union_decl: ParsedUnionDecl,
+) -> (List[TypeVariant], List[String]):
+	match union_decl.variants:
+		[]:
+			([], [])
+		[first_variant, ..._]:
+			if comments.length() == 0:
+				(
+					union_decl.variants.map(
+						func(variant): project_type_variant(variant, no_member_comments()),
+					),
+					[],
+				)
+			else:
+				commented_type_variants(table, comments, union_decl, first_variant)
+
+
+---
+`project_type_variants` for a union with at least one variant in a file with
+comments. The first variant's column is the body's indent, which the closing
+comments must share.
+---
+private pure func commented_type_variants(
+	table: SourceTable,
+	comments: List[FormatterComment],
+	union_decl: ParsedUnionDecl,
+	first_variant: ParsedVariantDecl,
+) -> (List[TypeVariant], List[String]):
+	located: List[LocatedItem[ParsedVariantDecl]] = union_decl.variants.map(
+		func(variant): located_item(variant, declaration_member_extent(variant.span)),
+	)
+
+	last_variant_end_line: Int = match union_decl.variants.last():
+		Some(variant):
+			span_end_line(table, variant.span)
+		None:
+			source_location_span(table, union_decl.name.span).start_line
+
+	variant_column: Int = source_location_span(table, first_variant.span).start_column
+
+	commented: CommentedItems[ParsedVariantDecl] = collection_item_comments(
+		table,
+		comments,
+		source_location_span(table, union_decl.name.span).start_line,
+		last_variant_end_line + 1,
+		located,
+	)
+
+	last_comment_line: Int = match comments.last():
+		Some(comment):
+			comment.line
+		None:
+			last_variant_end_line
+
+	closing: List[String] = whole_line_comments_after(
+		comments,
+		line_as_preceding_body(last_variant_end_line),
+		last_comment_line,
+		variant_column,
+	)
+	(commented.items.map(func(item): project_type_variant(item.item, item.comments)), closing)
 
 
 private pure func project_function_decl(
@@ -2840,6 +2970,8 @@ private pure func project_decl_to_located(
 
 			located
 		RecordParsedDecl(record_decl):
+			(record_fields, closing_comments) = project_record_fields(table, comments, record_decl)
+
 			[located_decl(
 					table,
 					record_decl.span,
@@ -2855,11 +2987,14 @@ private pure func project_decl_to_located(
 							type_param_names(record_decl.type_params),
 							record_decl.is_struct,
 							False,
-							record_decl.fields.map(func(field): project_field_decl(field)),
+							record_fields,
+							closing_comments,
 						),
 					),
 				)]
 		UnionParsedDecl(union_decl):
+			(variants, closing_comments) = project_type_variants(table, comments, union_decl)
+
 			[located_decl(
 					table,
 					union_decl.span,
@@ -2873,7 +3008,8 @@ private pure func project_decl_to_located(
 							False,
 							False,
 							None,
-							union_decl.variants.map(func(variant): project_type_variant(variant)),
+							variants,
+							closing_comments,
 						),
 					),
 				)]
@@ -2891,6 +3027,7 @@ private pure func project_decl_to_located(
 							True,
 							type_decl.is_resource,
 							type_decl.cleanup.map(func(cleanup): cleanup.builtin_name),
+							[],
 							[],
 						),
 					),

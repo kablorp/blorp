@@ -3,7 +3,6 @@ import:
 		Doc(Hardline, Softline, SoftlineSpace),
 		blank_lines,
 		comma_fill,
-		comma_hardline_documents,
 		comma_sep,
 		comma_sep_break,
 		hardlines,
@@ -14,13 +13,16 @@ import:
 	./expression_documents:
 		Expression,
 		FunctionParameter,
+		MemberComments,
 		Pattern,
 		assignment_value_document,
 		block_body_document,
+		commented_member_document,
 		escape_string_value,
 		expression_from_json,
 		function_parameter_from_json,
 		function_parameters_document,
+		member_comments_field,
 		pattern_from_json,
 	./json_fields: array_field, bool_field, field, int_field, parsed_array_field, string_field
 	./type_documents:
@@ -46,15 +48,19 @@ record ImportItem {
 }
 
 
+--- A union or enum variant with the comments written above and on its line.
 record TypeVariant {
 	name: String,
-	fields: List[TypeExpression]
+	fields: List[TypeExpression],
+	comments: MemberComments
 }
 
 
+--- A record or struct field with the comments written above and on its line.
 record DeclarationField {
 	name: String,
-	field_type: TypeExpression
+	field_type: TypeExpression,
+	comments: MemberComments
 }
 
 
@@ -119,8 +125,8 @@ union Declaration:
 	ImportDeclaration(ImportItem)
 	VariableDeclaration(Bool, Option[String], Option[Pattern], Bool, Option[TypeExpression], Expression)
 	FunctionDeclaration(Bool, String, Bool, Bool, Bool, Bool, Bool, List[String], List[FunctionParameter], Option[TypeExpression], List[TypeConstraint], FunctionBody)
-	TypeDeclaration(Bool, String, List[String], Bool, Bool, Bool, Option[String], List[TypeVariant])
-	RecordDeclaration(Bool, String, List[String], Bool, Bool, List[DeclarationField])
+	TypeDeclaration(Bool, String, List[String], Bool, Bool, Bool, Option[String], List[TypeVariant], List[String])
+	RecordDeclaration(Bool, String, List[String], Bool, Bool, List[DeclarationField], List[String])
 	TypeAliasDeclaration(Bool, Bool, String, List[String], TypeExpression)
 	TraitDeclaration(Bool, String, List[String], List[String], List[TraitMethod])
 	ImplementationDeclaration(Bool, String, TypeExpression, List[ImplementationMethod])
@@ -445,9 +451,11 @@ private pure func foreign_link_flags_field(
 private pure func type_variant_from_json(value: JsonValue) -> Result[TypeVariant, String]:
 	name ?= value.string_field("name")
 	fields ?= value.type_expression_array_field("fields")
+	comments ?= value.member_comments_field("comments")
 	Ok({
 		name = name,
 		fields = fields,
+		comments = comments,
 	})
 
 
@@ -461,9 +469,11 @@ private pure func type_variant_array_field(
 private pure func declaration_field_from_json(value: JsonValue) -> Result[DeclarationField, String]:
 	name ?= value.string_field("name")
 	field_type ?= value.type_expression_field("type")
+	comments ?= value.member_comments_field("comments")
 	Ok({
 		name = name,
 		field_type = field_type,
+		comments = comments,
 	})
 
 
@@ -666,6 +676,8 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 			is_resource ?= value.bool_field("resource")
 			resource_cleanup ?= value.optional_string_field("resource_cleanup_builtin")
 			variants ?= value.type_variant_array_field("variants")
+			optional_closing_comments ?= value.optional_string_array_field("closing_comments")
+			closing_comments: List[String] = optional_closing_comments.get_or([])
 			Ok(
 				TypeDeclaration(
 					is_private,
@@ -676,6 +688,7 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 					is_resource,
 					resource_cleanup,
 					variants,
+					closing_comments,
 				),
 			)
 		"Record":
@@ -685,7 +698,19 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 			is_value ?= value.bool_field("value")
 			is_builtin ?= value.bool_field("builtin")
 			fields ?= value.declaration_field_array_field("fields")
-			Ok(RecordDeclaration(is_private, name, type_params, is_value, is_builtin, fields))
+			optional_closing_comments ?= value.optional_string_array_field("closing_comments")
+			closing_comments: List[String] = optional_closing_comments.get_or([])
+			Ok(
+				RecordDeclaration(
+					is_private,
+					name,
+					type_params,
+					is_value,
+					is_builtin,
+					fields,
+					closing_comments,
+				),
+			)
 		"TypeAlias":
 			is_private ?= value.bool_field("private")
 			opaque_flag ?= value.optional_bool_field("opaque")
@@ -1467,7 +1492,7 @@ private pure func single_foreign_declaration_document(decl: Declaration) -> Doc:
 
 
 private pure func type_variant_document(variant: TypeVariant) -> Doc:
-	if variant.fields.length() == 0:
+	head: Doc = if variant.fields.length() == 0:
 		variant.name.text()
 	else:
 		variant.name
@@ -1480,14 +1505,23 @@ private pure func type_variant_document(variant: TypeVariant) -> Doc:
 			)
 			.cat(")".text())
 
+	commented_member_document(head, "".text(), variant.comments)
 
-private pure func type_variant_documents(variants: List[TypeVariant]) -> List[Doc]:
-	var documents: List[Doc] = []
+
+--- The variants of a union body, one per line, then the comments after the last.
+private pure func type_variant_lines(
+	variants: List[TypeVariant],
+	closing_comments: List[String],
+) -> List[Doc]:
+	var lines: List[Doc] = []
 
 	for variant in variants:
-		documents = documents.append(variant.type_variant_document())
+		lines = lines.append(variant.type_variant_document())
 
-	documents
+	for comment in closing_comments:
+		lines = lines.append(comment.text())
+
+	lines
 
 
 private pure func type_declaration_document(
@@ -1499,6 +1533,7 @@ private pure func type_declaration_document(
 	is_resource: Bool,
 	resource_cleanup: Option[String],
 	variants: List[TypeVariant],
+	closing_comments: List[String],
 ) -> Doc:
 	if is_builtin:
 		keyword: String = if is_resource:
@@ -1542,31 +1577,59 @@ private pure func type_declaration_document(
 				Hardline
 					.cat(
 						variants
-							.type_variant_documents()
+							.type_variant_lines(closing_comments)
 							.hardlines(),
 					)
 					.indent(),
 			)
 
 
-private pure func declaration_field_document(field_value: DeclarationField) -> Doc:
+private pure func declaration_field_head_document(field_value: DeclarationField) -> Doc:
 	field_value.name
 		.text()
 		.cat(": ".text())
 		.cat(field_value.field_type.type_document())
 
 
-private pure func declaration_field_documents(fields: List[DeclarationField]) -> List[Doc]:
-	var documents: List[Doc] = []
+---
+The fields of a record body, one per line: each field after its leading
+comments, then its comma (none after the last field) and the comment ending its
+line, then the whole-line comments after the last field.
+---
+private pure func declaration_field_lines(
+	fields: List[DeclarationField],
+	closing_comments: List[String],
+) -> List[Doc]:
+	var lines: List[Doc] = []
+	last_index: Int = fields.length() - 1
+	var index: Int = 0
 
 	for field_value in fields:
-		documents = documents.append(field_value.declaration_field_document())
+		comma: Doc = if index < last_index:
+			",".text()
+		else:
+			"".text()
 
-	documents
+		lines = lines.append(
+			commented_member_document(
+				field_value.declaration_field_head_document(),
+				comma,
+				field_value.comments,
+			),
+		)
+		index += 1
+
+	for comment in closing_comments:
+		lines = lines.append(comment.text())
+
+	lines
 
 
-private pure func record_fields_prefer_multiline(fields: List[DeclarationField]) -> Bool:
-	fields.length() > 0
+private pure func record_fields_prefer_multiline(
+	fields: List[DeclarationField],
+	closing_comments: List[String],
+) -> Bool:
+	fields.length() > 0 or closing_comments.length() > 0
 
 
 private pure func record_declaration_document(
@@ -1576,6 +1639,7 @@ private pure func record_declaration_document(
 	is_value: Bool,
 	is_builtin: Bool,
 	fields: List[DeclarationField],
+	closing_comments: List[String],
 ) -> Doc:
 	keyword: String = if is_value:
 		"struct "
@@ -1597,33 +1661,22 @@ private pure func record_declaration_document(
 			.cat(type_params.type_params_document())
 			.cat(" {".text())
 
-		if fields.record_fields_prefer_multiline():
+		if fields.record_fields_prefer_multiline(closing_comments):
 			header
 				.cat(
 					Hardline
 						.cat(
 							fields
-								.declaration_field_documents()
-								.comma_hardline_documents(),
+								.declaration_field_lines(closing_comments)
+								.hardlines(),
 						)
 						.indent(),
 				)
 				.cat(Hardline)
 				.cat("}".text())
 		else:
-			header
-				.cat(
-					Softline
-						.cat(
-							fields
-								.declaration_field_documents()
-								.comma_sep_break(),
-						)
-						.indent()
-						.cat(Softline)
-						.group(),
-				)
-				.cat("}".text())
+			-- No fields and no comments: the empty body `{}`.
+			header.cat("}".text())
 
 
 private pure func type_alias_declaration_document(
@@ -1838,7 +1891,7 @@ pure func declaration_document(decl: Declaration) -> Doc:
 					where_constraints,
 					body,
 				)
-		TypeDeclaration(is_private, name, type_params, is_enum, is_builtin, is_resource, resource_cleanup, variants):
+		TypeDeclaration(is_private, name, type_params, is_enum, is_builtin, is_resource, resource_cleanup, variants, closing_comments):
 			type_declaration_document(
 				is_private,
 				name,
@@ -1848,9 +1901,18 @@ pure func declaration_document(decl: Declaration) -> Doc:
 				is_resource,
 				resource_cleanup,
 				variants,
+				closing_comments,
 			)
-		RecordDeclaration(is_private, name, type_params, is_value, is_builtin, fields):
-			record_declaration_document(is_private, name, type_params, is_value, is_builtin, fields)
+		RecordDeclaration(is_private, name, type_params, is_value, is_builtin, fields, closing_comments):
+			record_declaration_document(
+				is_private,
+				name,
+				type_params,
+				is_value,
+				is_builtin,
+				fields,
+				closing_comments,
+			)
 		TypeAliasDeclaration(is_private, is_opaque, name, type_params, target):
 			type_alias_declaration_document(is_private, is_opaque, name, type_params, target)
 		TraitDeclaration(is_private, name, type_params, supertraits, methods):
