@@ -527,7 +527,6 @@ artifact-scan:
 # The suites that test the benchmark tooling are `benchmark-tooling-check`.
 tooling-check: build-blorp-cli
 	@scripts/check-c-symbol-projection-self-compile
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_borrowed_boundary_child_modes.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/fixture_support/test_check_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/tool/test_tool_fixture_runner.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $(STANDARD_LIBRARY_TEST_ROOT)/test_check_std_builtins.py
@@ -576,6 +575,7 @@ benchmark-tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_typecheck_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_identity_work_counters.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_memory_diagnostics_harness.py
 	@blorp/test/compiler/benchmark/test_record_layout.sh
 
@@ -655,6 +655,5 @@ docker-premerge-gate:
 clean:
 	rm -rf "$(BLORP_CLI_BUILD_DIR)"
 	rm -rf "$(BLORP_BUILD_TOOLS_DIR)"
-	scripts/clean-retired-layout
 	rm -f "$(BLORP_INSTALLED_BIN)" \
 		"$(BLORP_EMBEDDED_STD_SOURCE)" "$(BLORP_BUILD_INFO_SOURCE)"

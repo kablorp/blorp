@@ -233,6 +233,14 @@ printf 'legacy compiler\n' >"$legacy_bootstrap_dir/blorp"
 chmod +x "$legacy_bootstrap_dir/blorp"
 
 write_bootstrap_manifest single
+if [ "$("$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-tag)" != "$bootstrap_tag" ]; then
+	fail "the bootstrap wrapper must read its default tag from bootstrap.env"
+fi
+overridden_tag=$(BLORP_COMPILER_BOOTSTRAP_TAG=dev-000000000000 \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-tag)
+if [ "$overridden_tag" != "$bootstrap_tag" ]; then
+	fail "an ambient environment variable must not override the bootstrap manifest"
+fi
 single_bootstrap_dir="$bootstrap_cache/$bootstrap_tag/single/$release_target/$bootstrap_sha"
 mkdir -p "$single_bootstrap_dir"
 cp "$fake_bin/blorp" "$single_bootstrap_dir/blorp"

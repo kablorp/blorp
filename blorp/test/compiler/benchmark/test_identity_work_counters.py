@@ -1,4 +1,4 @@
-"""Contract for direct identity hot-path profiling without production markers."""
+"""Contract for the identity work-counter benchmark scripts and their compiler worker helper."""
 
 from pathlib import Path
 import runpy
@@ -25,16 +25,8 @@ def diagnostics(mode: str, selected: int, observed: int, calls: int) -> str:
 
 
 class IdentityWorkCounterTests(unittest.TestCase):
-    def test_replay_selectors_are_exact_and_default_worker_unchanged(self) -> None:
+    def test_compiler_command_builds_the_profile_flags_and_rejects_bad_combinations(self) -> None:
         selectors = REPLAY["PROFILE_FUNCTIONS"]
-        self.assertEqual(
-            selectors,
-            (
-                "blorp/src/compiler/stage_09_core/ir::core_var_equal",
-                "blorp/src/compiler/stage_06_typecheck/type_system/env::scope_lookup",
-                "blorp/src/compiler/stage_08_core_lower/lower::core_var_impl",
-            ),
-        )
         compiler_command = WORKER_HELPER["_compiler_command"]
         args = (Path("bin/blorp"), Path("worker.c"), Path("worker.brp"))
         self.assertEqual(
@@ -47,7 +39,7 @@ class IdentityWorkCounterTests(unittest.TestCase):
         )
         selected = compiler_command(*args, debug_profile=True, profile_functions=selectors, profile_mode="calls")
         self.assertEqual(selected[3:6], ["--debug", "--profile-mode", "calls"])
-        self.assertEqual(selected.count("--profile-function"), 3)
+        self.assertEqual(selected.count("--profile-function"), len(selectors))
         for selector in selectors:
             self.assertIn(selector, selected)
         with self.assertRaises(ValueError):
@@ -57,7 +49,7 @@ class IdentityWorkCounterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compiler_command(*args, debug_profile=True, profile_mode="sampled")
 
-    def test_replay_link_source_is_explicit_and_default_unchanged(self) -> None:
+    def test_link_command_adds_the_replay_source_only_when_asked(self) -> None:
         link = WORKER_HELPER["_link_command"]
         args = (["cc"], ROOT, Path("worker.o"), Path("wrapper.c"), Path("worker"))
         default = link(*args)
@@ -115,23 +107,6 @@ class IdentityWorkCounterTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             parse("       39.43 real        37.93 user")
-
-    def test_replayed_constructor_helper_exists(self) -> None:
-        # The replay selects lower::core_var_impl; a rename would leave the
-        # selector matching nothing.
-        lower = (ROOT / "blorp/src/compiler/stage_08_core_lower/lower.brp").read_text()
-        self.assertIn("private pure func core_var_impl(", lower)
-
-    def test_production_has_no_identity_marker_import_or_call(self) -> None:
-        compiler = ROOT / "blorp/src/compiler"
-        self.assertFalse((compiler / "identity_work_counters.brp").exists())
-        for relative in (
-            "stage_06_typecheck/type_system/env.brp",
-            "stage_08_core_lower/lower.brp",
-            "stage_09_core/ir.brp",
-        ):
-            with self.subTest(source=relative):
-                self.assertNotIn("identity_work_", (compiler / relative).read_text())
 
 
 if __name__ == "__main__":

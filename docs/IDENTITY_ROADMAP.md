@@ -1123,10 +1123,7 @@ each behind a capability gate:
   generated C and the allocation fixture because retaining a table inside the admission is a new
   managed field that may erase the win (if it does, stop and require a compiler borrow
   capability). The cut then keeps the admission as the loop's single owner, threads only
-  registration decisions and cold-path diagnostics, and updates `module_view` once; update
-  `blorp/test/compiler/stage_06_typecheck/support/test_declaration_boundary.py` to require a
-  module-binding-local admission owner and reject per-import successful state publication, and
-  preserve the conflict and reentry cases in `test_typecheck_state.brp`. Add a deterministic
+  registration decisions and cold-path diagnostics, and updates `module_view` once; preserve the conflict and reentry cases in `test_typecheck_state.brp`. Add a deterministic
   counter for successful admission mutations and whole-state publications. Accept only if each
   nonempty graph import block has one admission construction and one final publication,
   diagnostics and accepted binding order are byte-identical, allocations and releases fall by at

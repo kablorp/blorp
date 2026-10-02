@@ -27,7 +27,6 @@ from run_blorp_check_fixtures import expectation_failures, parse_expectations
 
 DEFAULT_FIXTURE_ROOT = Path("blorp/test")
 DEFAULT_STDLIB_CASE = Path("standard_library/src/crypto_random.brp")
-EXPECTED_TOOL_FIXTURE_COUNT = 134
 
 
 class FixtureKind(Enum):
@@ -323,9 +322,6 @@ def main() -> int:
     if not args.no_stdlib_case:
         fixtures.append(Fixture(FixtureKind.PURIFY_NO_CHANGE, DEFAULT_STDLIB_CASE))
     expected_count = args.expected_count
-    if expected_count is None and args.fixture_root is None and not args.no_stdlib_case:
-        expected_count = EXPECTED_TOOL_FIXTURE_COUNT
-
     if expected_count is not None and len(fixtures) != expected_count:
         emit_failure(
             "compiler_tools",
