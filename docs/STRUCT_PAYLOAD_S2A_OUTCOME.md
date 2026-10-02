@@ -50,7 +50,7 @@ The candidate command, run from the S2a worktree, was:
 
 ```sh
 BLORP_CLI_C_OPTIMIZATION=-O2 benchmarks/self_compile_measure measure \
-  --input-dir /var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4 \
+  --input-dir <tmp>/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4 \
   --program self --samples 3 --stage2 \
   --baseline /tmp/blorp-struct-integrated-pre-s2a-stage2-O2.json \
   --output /tmp/blorp-struct-s2a-stage2-O2-final.json \
@@ -61,7 +61,7 @@ The baseline JSON and C are `/tmp/blorp-struct-integrated-pre-s2a-stage2-O2.json
 and `/tmp/blorp-struct-integrated-pre-s2a-stage2-O2.c`; the candidate artifacts
 are `/tmp/blorp-struct-s2a-stage2-O2-final.json` and
 `/tmp/blorp-struct-s2a-stage2-O2-final.c`. macOS canonicalized the input path
-in JSON to `/private/var/folders/...`; `input_rev` remains the exact frozen
+in JSON to `<tmp>/...`; `input_rev` remains the exact frozen
 revision above. Candidate JSON records `compiler_stage=2`, `samples=3`,
 `c_optimization=-O2`, `compiler_rev=2bb45f3f5196a2cf3d30716f67919b5fde3ee2a0`,
 and `compiler_dirty=true`.

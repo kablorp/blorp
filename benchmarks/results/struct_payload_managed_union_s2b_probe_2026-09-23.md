@@ -61,7 +61,7 @@ in both worktrees: `2e81b163a0c4c52ab43a63d1977b4a6d84b423911a58f038fff25d0809eb
 | `--version` identity | `compiled_by=self-a1fb8e6a`, O2/O2 | `compiled_by=self-a1fb8e6a`, O2/O2, dirty |
 
 Frozen input: revision `d5fe8d9d8288165e6dbe55868c11e060d62b6db4`, directory
-`/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4`.
+`<tmp>/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4`.
 Each measurement used `program=self`, one sample, and `BLORP_CLI_C_OPTIMIZATION=-O2`.
 Stage-2 build logs are `/tmp/blorp-s2b-s2a-stage2-build-O2-lease4.log` and
 `/tmp/blorp-s2b-s2b-stage2-build-O2-lease4.log`.
@@ -129,7 +129,7 @@ stage-2 job appeared. `/tmp/blorp-s2b-s2a-stage2-O2-lease3.log` is retained but
 contains no accepted measurement artifact. The earlier `self_compile_measure
 lock` helper was found to be a no-op; final builds and samples were run while
 holding `scripts/with-compiler-contention-lease --mode exclusive` on
-`/private/tmp/blorp-compiler-contention-501/blorp-compiler-evidence-v1.lock`.
+`<tmp>/blorp-compiler-contention-501/blorp-compiler-evidence-v1.lock`.
 Official shared-gate contenders waited behind that lease. Process scans before
 each measurement showed no direct compiler/build job beyond the persistent
 `clangd`; uncoordinated direct work cannot be prevented by the advisory lease,

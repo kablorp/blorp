@@ -1,7 +1,7 @@
 # Generated C byte census, 2026-09-27
 
 This is a lexical size census of the local `blorp-cli` build artifact at
-`/Users/keithphilpott/CLionProjects/blorp/blorp/build/_build/blorp-cli/blorp_cli_main.c`.
+`<repo>/blorp/build/_build/blorp-cli/blorp_cli_main.c`.
 Its 2026-09-27 12:32:24 PDT modification time and the checkout's
 `18d682384d125209582d3a5ed78f19fb7ae7b3bb` revision are context, not
 proof that this C file was emitted by a particular compiler binary. This is
@@ -9,12 +9,12 @@ not a frozen stage-2 self-compile measurement.
 
 ```sh
 benchmarks/c_emission_bytes \
-  /Users/keithphilpott/CLionProjects/blorp/blorp/build/_build/blorp-cli/blorp_cli_main.c \
+  <repo>/blorp/build/_build/blorp-cli/blorp_cli_main.c \
   --top 25 --json
 shasum -a 256 \
-  /Users/keithphilpott/CLionProjects/blorp/blorp/build/_build/blorp-cli/blorp_cli_main.c
+  <repo>/blorp/build/_build/blorp-cli/blorp_cli_main.c
 wc -c \
-  /Users/keithphilpott/CLionProjects/blorp/blorp/build/_build/blorp-cli/blorp_cli_main.c
+  <repo>/blorp/build/_build/blorp-cli/blorp_cli_main.c
 python3 -m unittest benchmarks/test_c_emission_bytes.py
 ```
 
@@ -89,13 +89,13 @@ samples; it supplies no compiler-performance comparison.
 ```sh
 BLORP_CLI_C_OPTIMIZATION=-O2 benchmarks/self_compile_measure lock -- \
   benchmarks/self_compile_measure \
-  --compiler /Users/keithphilpott/CLionProjects/blorp/bin/blorp \
+  --compiler <repo>/bin/blorp \
   --input-rev 18d682384d125209582d3a5ed78f19fb7ae7b3bb \
   --program self --samples 0 --label c-emission-bytes-main \
-  --output /private/tmp/c-emission-bytes-main.json \
-  --keep-output /private/tmp/c-emission-bytes-main.c
-benchmarks/c_emission_bytes /private/tmp/c-emission-bytes-main.c \
-  --measurement /private/tmp/c-emission-bytes-main.json --top 25 --json
+  --output <tmp>/c-emission-bytes-main.json \
+  --keep-output <tmp>/c-emission-bytes-main.c
+benchmarks/c_emission_bytes <tmp>/c-emission-bytes-main.c \
+  --measurement <tmp>/c-emission-bytes-main.json --top 25 --json
 ```
 
 The compiler was `FRESH` at `18d682384d125209582d3a5ed78f19fb7ae7b3bb`,

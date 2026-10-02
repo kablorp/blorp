@@ -24,7 +24,7 @@ allocation result, not a broader speed claim.
   commit `41592efda88e2f83ae0994fe638b0b6d1ca4910c` and test/coverage commit
   `f9a47fdcd365bb48f50fb58df9163cac941d2c6e`.
 - Frozen input: revision `d5fe8d9d8288165e6dbe55868c11e060d62b6db4`, at
-  `/var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4`.
+  `<tmp>/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4`.
 - Host/toolchain: arm64 macOS, Apple clang 21.0.0
   (`clang-2100.3.34.2`); stage-1 and stage-2 compilers used CLI/runtime O2,
   split count 8.
@@ -68,7 +68,7 @@ env BLORP_CLI_C_OPTIMIZATION=-O2 \
   benchmarks/self_compile_measure measure \
   --compiler /tmp/blorp-s3-main-b72-f9a47fdc/baseline-stage2 \
   --skip-build-check \
-  --input-dir /var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4 \
+  --input-dir <tmp>/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4 \
   --program self --samples 1 --label s3-b72-B1 \
   --output /tmp/blorp-s3-main-b72-f9a47fdc/B1.json \
   --keep-output /tmp/blorp-s3-main-b72-f9a47fdc/B1.c
@@ -124,7 +124,7 @@ The baseline and candidate commands differed only in the compiler executable:
 
 ```sh
 <stage2-compiler> run --release --timeout 180 \
-  --std-dir /var/folders/m7/zszgqft538nfx_qr1kmc7dlc0000gn/T/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4/standard_library/src \
+  --std-dir <tmp>/blorp-perf-input/d5fe8d9d8288165e6dbe55868c11e060d62b6db4/standard_library/src \
   benchmarks/blorp/struct_payload_closure_capture.brp
 ```
 

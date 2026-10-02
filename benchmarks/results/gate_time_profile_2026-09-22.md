@@ -80,7 +80,7 @@ below for the counts these rest on. Not implemented.
 
 ## How this was measured
 
-Worktree: `/Users/keithphilpott/CLionProjects/blorp-gate-profile` (branch
+Worktree: `<home>/CLionProjects/blorp-gate-profile` (branch
 `perf/gate-profile`, `origin/main` at `a246909f95b5`, clean).
 
 Build stamp (`bin/blorp --version`):
@@ -100,7 +100,7 @@ cc: Apple clang version 21.0.0 (clang-2100.3.34.2)
 Commands, exactly as run:
 
 ```bash
-cd /Users/keithphilpott/CLionProjects/blorp-gate-profile
+cd <home>/CLionProjects/blorp-gate-profile
 BLORP_CLI_C_OPTIMIZATION=-O2 make          # build the -O2 gate compiler once
 mkdir -p /tmp/gate-profile-logs
 benchmarks/self_compile_measure lock -- \
