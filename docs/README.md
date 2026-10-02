@@ -43,6 +43,8 @@ module inventory lives in
 
 ## Plan Current Work
 
+- [Diagnostic Gaps](DIAGNOSTIC_GAPS.md) is the living ledger of weak compiler
+  diagnostics ranked by return on investment; add an entry when you meet one.
 - [Compiler Priorities](COMPILER_PRIORITIES.md) is the short cross-cutting
   outcomes map.
 - [Compiler Speed Roadmap](COMPILER_SPEED_ROADMAP.md) is the task-level
