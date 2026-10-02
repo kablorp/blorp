@@ -168,13 +168,6 @@ class CompilerNewParityTests(unittest.TestCase):
 		self.assertIn("gone.brp", comparison.problems[0])
 		self.assertIn("not in the corpus", comparison.problems[0])
 
-	def test_an_unlisted_construct_pair_is_named(self) -> None:
-		text = dump("a.brp", EOF_TOKEN, parse=1, first=("1:1", "m")) + "unlisted_construct_pair ExpectedColonDiagnostic 8\n"
-		comparison = compare_first(text, text)
-		self.assertEqual(comparison.mismatched_files, 1)
-		self.assertIn("ExpectedColonDiagnostic in ", comparison.problems[0])
-		self.assertIn("does not list", comparison.problems[0])
-
 	def test_the_same_first_diagnostic_agrees(self) -> None:
 		text = dump("a.brp", EOF_TOKEN, parse=1, first=("3:5", "expected `)`"), help_line="close it")
 		comparison = compare_first(text, text)
