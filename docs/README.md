@@ -17,6 +17,8 @@ results, not in maintained docs.
 - [Worker Checklist](WORKER_CHECKLIST.md) is the one page to read before
   starting a compiler or compiler-performance task: setup, fast feedback
   loop, measurement, and landing rules.
+- [Code Shape](CODE_STYLE.md) says what a function takes, when a function or
+  binding earns its place, and how long names should be.
 - [Developer Guide](DEVELOPMENT.md) is the practical workflow for building,
   testing, diagnosing, profiling, and changing Blorp and its compiler.
 - [Lint](LINT.md) documents typed source findings and stable rule IDs.

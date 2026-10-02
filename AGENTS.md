@@ -179,6 +179,8 @@ How we work on blorp. These apply to every change — features, bug fixes, refac
 
 ### Naming
 
+Function, parameter and binding shape follow [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md).
+
 Names are part of the design. Files, modules, functions, datatypes, variants, fields, variables,
 compiler passes, helper utilities, tests, and documentation examples should use names that are
 meaningful, clear, and proportional to their scope.
