@@ -177,6 +177,22 @@ When choosing implementation strategies:
 
 How we work on blorp. These apply to every change — features, bug fixes, refactors.
 
+### Make it work, make it right, make it fast
+
+We usually work in that order, and a change must be right before it merges to
+main. Review (rule 12) checks this.
+
+- **Work**: the behavior is correct and covered by tests.
+- **Right**: the code follows [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md) and
+  rule 15, and its data model makes illegal states unrepresentable.
+- **Fast**: optimize afterward, guided by measurement.
+
+Do not bend a design to avoid a cost the compiler imposes today. Measure the
+cost instead (allocations and retired instructions, per rule 9). Record it in
+the change's design document or in `benchmarks/results/`, so that compiler
+work can remove it. A change still stays within any cost ceiling its spec
+sets.
+
 ### Naming
 
 Function, parameter and binding shape follow [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md).
