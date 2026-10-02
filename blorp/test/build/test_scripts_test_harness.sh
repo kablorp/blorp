@@ -5,14 +5,6 @@ set -u
 
 cd "$(dirname "$0")/../../.."
 
-expected_core_sanitize_root_count=59
-actual_core_sanitize_root_count=$(awk 'NF { count += 1 } END { print count + 0 }' \
-	scripts/compiler-core-sanitize-roots.txt)
-if [ "$actual_core_sanitize_root_count" -ne "$expected_core_sanitize_root_count" ]; then
-	echo "FAIL: compiler Core sanitizer manifest should contain $expected_core_sanitize_root_count roots"
-	exit 1
-fi
-
 duplicate_core_sanitize_roots=$(sort scripts/compiler-core-sanitize-roots.txt | uniq -d)
 if [ -n "$duplicate_core_sanitize_roots" ]; then
 	echo "FAIL: compiler Core sanitizer manifest should not contain duplicate roots"

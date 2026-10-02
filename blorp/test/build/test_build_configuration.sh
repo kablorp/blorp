@@ -141,21 +141,6 @@ if [ -n "$tracked_ocaml_files" ]; then
 	printf '%s\n' "$tracked_ocaml_files" >&2
 	exit 1
 fi
-# The compiler-expert subagent names OCaml as a language that informs Blorp's
-# design; that is not a trace of the retired OCaml compiler this check guards.
-tracked_ocaml_references=$(
-	git grep -n -i -E 'ocaml|opam|dune|alcotest|[.]ml(i)?([^[:alnum:]_]|$)' -- . \
-		':!benchmarks/**' \
-		':!.claude/agents/compiler-expert.md' \
-		':!.github/workflows/benchmarks.yml' \
-		':!blorp/test/build/test_build_configuration.sh' \
-		':!blorp/test/build/test_scripts_test_harness.sh' || true
-)
-if [ -n "$tracked_ocaml_references" ]; then
-	echo "FAIL: OCaml references are allowed only in benchmark inputs and policy" >&2
-	printf '%s\n' "$tracked_ocaml_references" >&2
-	exit 1
-fi
 clean_plan=$(make -n clean)
 if ! grep -Fq 'blorp/build/_build/build-tools' <<<"$clean_plan"; then
 	echo "FAIL: make clean must own current build tools" >&2

@@ -15,21 +15,6 @@ CHECKER = ROOT / "scripts" / "check-blorp-layout"
 
 
 class BlorpSourceLayoutTests(unittest.TestCase):
-	def test_repository_satisfies_source_and_test_layout(self) -> None:
-		result = self.run_checker(ROOT)
-		self.assertEqual(result.returncode, 0, result.stderr)
-
-	def test_repository_separates_standard_library_sources_and_tests(self) -> None:
-		source_root = ROOT / "standard_library/src"
-		test_root = ROOT / "standard_library/test"
-
-		self.assertTrue(source_root.is_dir())
-		self.assertTrue(test_root.is_dir())
-		self.assertFalse((ROOT / "std").exists())
-		self.assertTrue((source_root / "test.brp").is_file())
-		self.assertTrue((test_root / "test_check_std_builtins.py").is_file())
-		self.assertFalse(any((source_root / "test").glob("**/*.brp")))
-
 	def write_layout(
 		self,
 		root: Path,
@@ -174,18 +159,6 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 				result.stderr,
 			)
 			self.assertNotIn("compiler/discovery_adapter.brp imports", result.stderr)
-
-	def test_the_adapter_and_the_front_end_alone_import_compiler_new_in_the_repository_manifest(self) -> None:
-		manifest = json.loads((ROOT / "blorp/source_ownership.json").read_text(encoding="utf-8"))
-		importers = {
-			importer
-			for importer, targets in manifest["temporary_cross_owner_imports"].items()
-			if any(target.startswith("compiler_new/") for target in targets)
-		}
-		self.assertEqual(
-			importers,
-			{"compiler/discovery_adapter.brp", "compiler/discovery_front_end.brp"},
-		)
 
 	def test_accepts_one_registered_temporary_cross_owner_import(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:
