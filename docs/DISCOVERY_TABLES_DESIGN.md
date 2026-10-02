@@ -1163,8 +1163,8 @@ The CLI reaches the stage through one seam, `frontend_compilation_graph_for_root
 in `blorp/src/lib/source_graph.brp`: every command that builds the graph hands it
 the sources it already read (a path, the name the command chose, the text) and
 the seam owns parsing (the one exception: a test root that test discovery
-already parsed is reused by the existing path, and ignored by the stage). `BLORP_FRONT_END` (`existing`,
-the default, or `stage`; anything else is an error) is read once per setup
+already parsed is reused by the existing path, and ignored by the stage). `BLORP_FRONT_END` (`stage`,
+the default, or `existing`; anything else is an error) is read once per setup
 (each command makes one) and the seam matches on it: `existing` parses the roots and runs the existing
 discovery; `stage` runs `compiler/discovery_front_end.brp`, which composes the stage's
 inputs from the same setup (the roots' own text as an overlay over the file
@@ -1175,7 +1175,7 @@ A root's placement (standard library, native package, source package, user code)
 is the caller's input (`RootRequest`), taken from the existing front end's
 origin rule, because it depends on the file system the caller knows.
 
-What a user can see with the stage, beyond the listed help lines above:
+What a user sees by default, with the stage, beyond the listed help lines above:
 
 - **Stops the stage adds or keeps.** A lexing or parsing error, an import that
   differs from its file only in letter case, an unreadable or oversized source,
@@ -1214,8 +1214,8 @@ What a user can see with the stage, beyond the listed help lines above:
   convention to the adapter as `LegacyModuleNaming.path_module_name`.
 - **Fixtures under the stage.** `run_blorp_check_fixtures.py` checks a
   should_fail fixture against its `EXPECT-DISCOVERY-TEXT` lines and the
-  position in its `EXPECT-DISCOVERY` pin when `BLORP_FRONT_END=stage`, and
-  against its `EXPECT-BLORP` lines otherwise; the CLI parse-failure checks
+  position in its `EXPECT-DISCOVERY` pin by default or with `BLORP_FRONT_END=stage`,
+  and against its `EXPECT-BLORP` lines with `BLORP_FRONT_END=existing`; the CLI parse-failure checks
   compare the diagnostic lines without the `help:` line.
 
 Superseded: `blorp test` discovery (`test/discovery.brp`) and doctest extraction

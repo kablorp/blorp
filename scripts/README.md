@@ -85,7 +85,7 @@ scripts/test compiler-blorp     # Blorp TestSuites + marked production check fix
 scripts/test compiler-tools     # formatter/purify/lint fixtures + backend/identity tool guards
 scripts/test compiler-new       # rewritten compiler stages (blorp/src/compiler_new) TestSuites
 scripts/test compiler-new-parity # discovery stage vs the existing front end over the corpus
-scripts/test front-end-stage    # fast slice of the gates run with BLORP_FRONT_END=stage
+scripts/test front-end-existing    # fast slice of the gates run with BLORP_FRONT_END=existing
 scripts/test std-check          # broad standard-library source typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
@@ -123,16 +123,17 @@ premerge gate and of the compiler CI lane. The layout check keeps that tree isol
 imports them, and its tests import only `compiler_new`, `lib`, their own tree
 and the standard library (`isolated_test_owners` in
 `blorp/source_ownership.json`).
-The `front-end-stage` gate (`scripts/front-end-stage-check`) keeps the discovery
-stage's compile path green while the existing front end is still the default. It
-runs, with `BLORP_FRONT_END=stage`, the CLI smoke checks, the package lifecycle,
-the parser fixtures, the suites that own the front-end seam and the CLI wrapper,
-and the self-compile, whose generated C must equal the existing front end's. It
-takes about three minutes. The full gates run under the stage by exporting the
-variable, for example `BLORP_FRONT_END=stage scripts/test --no-build cli`; every
-gate passes it to the compiler unchanged. A syntax change lands in both parsers
-until the default flips (`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`, "Rules for the
-interim"), and this gate is what shows the stage path breaking.
+The `front-end-existing` gate (`scripts/front-end-existing-check`) keeps the
+existing front end's compile path green until it is removed; the discovery stage
+is the default. It runs, with `BLORP_FRONT_END=existing`, the CLI smoke checks,
+the package lifecycle, the parser fixtures, the suites that own the front-end
+seam and the CLI wrapper, and the self-compile, whose generated C must equal the
+default's. It takes about three minutes. The full gates run under the old path by
+exporting the variable, for example `BLORP_FRONT_END=existing scripts/test
+--no-build cli`; every gate passes it to the compiler unchanged. A syntax change
+lands in both parsers until the old path is removed
+(`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`, "Rules for the interim"), and this gate
+is what shows the old path breaking.
 
 The `compiler-new-parity` gate (`scripts/compiler-new-parity`) holds the
 discovery stage to the existing front end across every tracked `.brp` file
@@ -378,7 +379,7 @@ compiler-core-sanitize
 compiler-blorp-sanitize
 compiler-new
 compiler-new-parity
-front-end-stage
+front-end-existing
 std-check
 runtime
 leak + doctest + cli + lsp
@@ -427,7 +428,7 @@ cutting preview builds. It composes:
 
 - clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
-- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity front-end-stage`
+- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity front-end-existing`
 - the direct generated-C audit in `blorp/test/compiler/pipeline/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs

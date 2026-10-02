@@ -261,9 +261,18 @@ $RUN_OUTPUT"
     fi
 }
 
+# The front end the commands under test use: unset or blank is the discovery
+# stage, the default (DEFAULT_FRONT_END in blorp/src/lib/source_graph.brp);
+# `existing` is the old path, kept until it is removed.
+selected_front_end() {
+    local setting="${BLORP_FRONT_END:-}"
+    setting="${setting//[[:space:]]/}"
+    printf '%s' "${setting:-stage}"
+}
+
 # A parse-failure check that holds under both front ends. With the existing front
-# end the whole output must equal `expected_output` exactly. With the stage on
-# (`BLORP_FRONT_END=stage`) the diagnostic lines, `help:` lines dropped, must equal
+# end the whole output must equal `expected_output` exactly. With the stage (the
+# default, or `BLORP_FRONT_END=stage`) the diagnostic lines, `help:` lines dropped, must equal
 # it, and the `help:` lines themselves must equal `expected_stage_help` (one per
 # diagnostic): the stage's teaching help is a user-facing feature, so it is pinned
 # here, not ignored (docs/DISCOVERY_TABLES_DESIGN.md, "Diagnostic text").
@@ -281,7 +290,7 @@ expect_diagnostics_exact() {
     if [ "$RUN_CODE" -ne "$expected_code" ]; then
         record_fail "$name" "expected exit $expected_code, got $RUN_CODE
 $RUN_OUTPUT"
-    elif [ "${BLORP_FRONT_END:-}" != "stage" ]; then
+    elif [ "$(selected_front_end)" != "stage" ]; then
         if [ "$RUN_OUTPUT" = "$expected_output" ]; then
             record_pass "$name"
         else
@@ -1562,32 +1571,33 @@ expect_output_contains "compiler runtime is not importable from std" 1 \
 	"$BLORP_BIN" check --no-format "$compiler_runtime_import"
 expect_exit "check missing file arg" 1 "$BLORP_BIN" check
 
-# The front end behind the graph seam is chosen by BLORP_FRONT_END: the existing
-# lexer, parser and module loader (the default), or the discovery stage with its
-# adapter. Each command gives the same result with either.
+# The front end behind the graph seam is chosen by BLORP_FRONT_END: the discovery
+# stage with its adapter (the default), or `existing`, the old lexer, parser and
+# module loader. Each command gives the same result with either, and an unset
+# variable is the stage.
 expect_front_end_same() {
     local name="$1"
     shift
-    local default_output default_code
+    local existing_output existing_code
 
     TOTAL=$((TOTAL + 1))
-    run_capture "" env -u BLORP_FRONT_END "$@"
-    default_output="$RUN_OUTPUT"
-    default_code="$RUN_CODE"
+    run_capture "" env BLORP_FRONT_END=existing "$@"
+    existing_output="$RUN_OUTPUT"
+    existing_code="$RUN_CODE"
     run_capture "" env BLORP_FRONT_END=stage "$@"
 
-    if [ "$default_code" -ne "$RUN_CODE" ]; then
-        record_fail "$name" "exit $default_code by default, $RUN_CODE with the stage
-default:
-$default_output
+    if [ "$existing_code" -ne "$RUN_CODE" ]; then
+        record_fail "$name" "exit $existing_code with the existing front end, $RUN_CODE with the stage
+existing:
+$existing_output
 stage:
 $RUN_OUTPUT"
-    elif [ "$default_output" = "$RUN_OUTPUT" ]; then
+    elif [ "$existing_output" = "$RUN_OUTPUT" ]; then
         record_pass "$name"
     else
         record_fail "$name" "output differs
-default:
-$default_output
+existing:
+$existing_output
 stage:
 $RUN_OUTPUT"
     fi
@@ -1599,24 +1609,24 @@ $RUN_OUTPUT"
 expect_front_end_same_but_help() {
     local name="$1"
     shift
-    local default_output default_code stage_output
+    local existing_output existing_code stage_output
 
     TOTAL=$((TOTAL + 1))
-    run_capture "" env -u BLORP_FRONT_END "$@"
-    default_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" | grep -v '^$')
-    default_code="$RUN_CODE"
+    run_capture "" env BLORP_FRONT_END=existing "$@"
+    existing_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" | grep -v '^$')
+    existing_code="$RUN_CODE"
     run_capture "" env BLORP_FRONT_END=stage "$@"
     stage_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" | grep -v '^$')
 
-    if [ "$default_code" -ne "$RUN_CODE" ]; then
-        record_fail "$name" "exit $default_code by default, $RUN_CODE with the stage
+    if [ "$existing_code" -ne "$RUN_CODE" ]; then
+        record_fail "$name" "exit $existing_code with the existing front end, $RUN_CODE with the stage
 $RUN_OUTPUT"
-    elif [ "$default_output" = "$stage_output" ]; then
+    elif [ "$existing_output" = "$stage_output" ]; then
         record_pass "$name"
     else
         record_fail "$name" "output differs apart from help lines
-default:
-$default_output
+existing:
+$existing_output
 stage:
 $stage_output"
     fi
@@ -1648,7 +1658,7 @@ expect_output_contains "front end stage: check case-mismatched import" 1 \
     env BLORP_FRONT_END=stage "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
 expect_output_contains "front end existing: check case-mismatched import" 1 \
     "error: import \`./Helper\` does not match the file's name \`helper.brp\`" \
-    env -u BLORP_FRONT_END "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
+    env BLORP_FRONT_END=existing "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
 # The existing loader skips an implicit module its standard-library directory
 # lacks; the stage reports it.
 mkdir -p "$front_end_dir/empty_std"
@@ -1700,14 +1710,38 @@ expect_front_end_same "front end stage: test" \
     "$BLORP_BIN" test --suite --timeout 20 blorp/test/runtime/types/test_bool.brp
 
 TOTAL=$((TOTAL + 1))
-run_capture "" env -u BLORP_FRONT_END "$BLORP_BIN" compile --no-format -o "$front_end_dir/default.c" "$front_end_dir/ok.brp"
-default_compile_code="$RUN_CODE"
+run_capture "" env BLORP_FRONT_END=existing "$BLORP_BIN" compile --no-format -o "$front_end_dir/existing.c" "$front_end_dir/ok.brp"
+existing_compile_code="$RUN_CODE"
 run_capture "" env BLORP_FRONT_END=stage "$BLORP_BIN" compile --no-format -o "$front_end_dir/stage.c" "$front_end_dir/ok.brp"
-if [ "$default_compile_code" -eq 0 ] && [ "$RUN_CODE" -eq 0 ] \
-    && cmp -s "$front_end_dir/default.c" "$front_end_dir/stage.c"; then
+if [ "$existing_compile_code" -eq 0 ] && [ "$RUN_CODE" -eq 0 ] \
+    && cmp -s "$front_end_dir/existing.c" "$front_end_dir/stage.c"; then
     record_pass "front end stage: compile emits the same C"
 else
-    record_fail "front end stage: compile emits the same C" "exit $default_compile_code by default, $RUN_CODE with the stage
+    record_fail "front end stage: compile emits the same C" "exit $existing_compile_code with the existing front end, $RUN_CODE with the stage
+$RUN_OUTPUT"
+fi
+
+# An unset variable is the stage: the default compile emits the stage's C and a
+# parse failure prints the stage's diagnostics, `help:` lines included.
+TOTAL=$((TOTAL + 1))
+run_capture "" env -u BLORP_FRONT_END "$BLORP_BIN" compile --no-format -o "$front_end_dir/unset.c" "$front_end_dir/ok.brp"
+unset_compile_code="$RUN_CODE"
+if [ "$unset_compile_code" -eq 0 ] && cmp -s "$front_end_dir/unset.c" "$front_end_dir/stage.c"; then
+    record_pass "front end default: an unset variable compiles like the stage"
+else
+    record_fail "front end default: an unset variable compiles like the stage" "exit $unset_compile_code
+$RUN_OUTPUT"
+fi
+TOTAL=$((TOTAL + 1))
+run_capture "" env -u BLORP_FRONT_END "$BLORP_BIN" check --no-format "$parse_missing_colon_prog"
+unset_parse_output="$RUN_OUTPUT"
+run_capture "" env BLORP_FRONT_END=stage "$BLORP_BIN" check --no-format "$parse_missing_colon_prog"
+if [ "$unset_parse_output" = "$RUN_OUTPUT" ] && grep -q '^help: ' <<<"$unset_parse_output"; then
+    record_pass "front end default: an unset variable reports parse failures like the stage"
+else
+    record_fail "front end default: an unset variable reports parse failures like the stage" "unset:
+$unset_parse_output
+stage:
 $RUN_OUTPUT"
 fi
 if $run_deep_checks; then

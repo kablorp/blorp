@@ -44,6 +44,19 @@ class Expectations:
 # runner reads it to know whose wording a fixture should be checked against.
 FRONT_END_VARIABLE = "BLORP_FRONT_END"
 STAGE_FRONT_END = "stage"
+EXISTING_FRONT_END = "existing"
+# The front end an unset or blank variable selects; mirrors `DEFAULT_FRONT_END`
+# in blorp/src/lib/source_graph.brp.
+DEFAULT_FRONT_END = STAGE_FRONT_END
+
+
+def selected_front_end(environment: dict[str, str]) -> str:
+    """The front end the compiler will use under `environment`, as it spells it.
+
+    Unset or blank selects the default; any other spelling is returned as is
+    (the compiler rejects an unknown one, which fails every fixture loudly).
+    """
+    return environment.get(FRONT_END_VARIABLE, "").strip() or DEFAULT_FRONT_END
 
 DISCOVERY_POSITION = re.compile(r"\s(\d+):(\d+)\s*$")
 
@@ -171,7 +184,7 @@ def discover_fixtures(roots: list[Path]) -> list[Path]:
 
 
 def run_fixture(
-    compiler: Path, fixture: Path, timeout: int, front_end: str | None
+    compiler: Path, fixture: Path, timeout: int, front_end: str
 ) -> tuple[bool, list[str]]:
     result = run_command(
         [str(compiler), "check", "--no-format", str(fixture)], timeout
@@ -260,7 +273,7 @@ def main() -> int:
         )
         return 1
 
-    front_end = os.environ.get(FRONT_END_VARIABLE)
+    front_end = selected_front_end(dict(os.environ))
     if front_end == STAGE_FRONT_END:
         print_stage_coverage(fixtures)
     passed = 0

@@ -396,13 +396,24 @@ class BlorpCheckFixtureRunnerTests(unittest.TestCase):
         self.assertIn("missing exact diagnostic: error: wanted", result.stdout)
         self.assertIn("missing output substring: :10:1: error:", result.stdout)
 
-    def test_existing_front_end_still_checks_its_own_wording(self) -> None:
+    def test_unset_front_end_is_the_stage(self) -> None:
+        """The stage is the default: an unset variable checks the stage's pins."""
         passing = self.run_pinned_fixture(
-            None, "pinned.brp:9:25: error: wanted; so fix it"
+            None, "pinned.brp:10:1: error: wanted\nhelp: so fix it"
         )
         self.assertEqual(passing.returncode, 0, passing.stdout)
         failing = self.run_pinned_fixture(
-            None, "pinned.brp:10:1: error: wanted\nhelp: so fix it"
+            None, "pinned.brp:9:25: error: wanted; so fix it"
+        )
+        self.assertEqual(failing.returncode, 1, failing.stdout)
+
+    def test_existing_front_end_still_checks_its_own_wording(self) -> None:
+        passing = self.run_pinned_fixture(
+            "existing", "pinned.brp:9:25: error: wanted; so fix it"
+        )
+        self.assertEqual(passing.returncode, 0, passing.stdout)
+        failing = self.run_pinned_fixture(
+            "existing", "pinned.brp:10:1: error: wanted\nhelp: so fix it"
         )
         self.assertEqual(failing.returncode, 1, failing.stdout)
 

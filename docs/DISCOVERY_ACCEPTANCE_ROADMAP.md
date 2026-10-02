@@ -50,13 +50,21 @@ work and says what "accepted" means.
   one fixture holds them.
 - **Connected behind a switch (item 7):** `BLORP_FRONT_END=stage` runs the
   stage and the adapter for every command that builds the graph, through one
-  seam in `lib/source_graph.brp`; the default is still the existing discovery.
-  The self-compile with it on emits the same C as the default.
+  seam in `lib/source_graph.brp`. The self-compile with it on emits the same C
+  as the existing discovery.
 - **Switched on (item 8, first half):** every default and premerge gate passes
   with `BLORP_FRONT_END=stage` and without it, the self-compile C is identical,
   and the stage costs 11% fewer instructions than the existing discovery with
   the whole adapter (`benchmarks/results/discovery_stage_switched_on_2026-10-01.md`).
-  The `front-end-stage` gate keeps that path green in the premerge set.
+  The `front-end-stage` gate kept that path green in the premerge set.
+- **Default flipped (item 8, second half):** the discovery stage is the default
+  front end; `BLORP_FRONT_END=existing` reaches the old path. The
+  `front-end-existing` gate (the renamed `front-end-stage` gate) keeps the old
+  path green in the premerge set, and the self-compile C from the default equals
+  the existing front end's. What remains: the old path is deleted after the
+  next bootstrap rotation has run on the new default (see "Removing the old
+  front end"). Criteria 1 and 6 hold for everything except the listed
+  interpolation differences, which are now the language's behavior.
 - **Not verified:** that diagnostics after the first, and the constructs the
   corpus and the targeted programs do not use, agree (a probe found the old
   parser accepting `./a/../a/b` imports that the grammar forbids).
@@ -241,7 +249,7 @@ more. Each numbered item is one change.
    `frontend_compilation_graph_for_root_paths` in `lib/source_graph.brp`, which
    takes the sources the command read and parses them itself (except test roots
    that test discovery already parsed), and switches on
-   `BLORP_FRONT_END` (`existing`, the default, or `stage`; read once per
+   `BLORP_FRONT_END` (`stage`, the default since item 8, or `existing`; read once per
    setup; an unknown value is an error). The superseded entry points
    (`frontend_compilation_graph_for_roots` and its `_with_setup` and
    `_with_setup_and_test_runtime` forms) are deleted. `test/discovery.brp` and
@@ -262,13 +270,17 @@ more. Each numbered item is one change.
      stage is on, a module reached by an absolute path is named from the working
      directory as the existing front end names it (the backend keys builtin
      modules on that spelling), and a graph the validation refuses is reported
-     as the user's error, not as a defect of the tables. The `front-end-stage`
-     gate runs the cli smoke, package, parser fixtures, seam suites and the
-     self-compile identity with the stage on in every premerge run.
-   - **Flip the default (M), open.** Flip it, keeping the old path behind the
-     switch until the next bootstrap rotation has run on the new default.
-     The owner decides when; criteria 1 and 6 stay open for the interpolation
-     nesting issue.
+     as the user's error, not as a defect of the tables.
+   - **Flip the default. Done.** Unset or blank `BLORP_FRONT_END` selects the
+     stage (`DEFAULT_FRONT_END` in `lib/source_graph.brp`); the old path stays
+     behind `existing` until the next bootstrap rotation has run on the new
+     default. The `front-end-existing` gate runs the cli smoke, package, parser
+     fixtures, seam suites and the self-compile identity with `existing` in
+     every premerge run. The default fixtures now pin the stage's output: parse
+     errors carry a `help:` line, a case-mismatched import carries
+     `path:line:col:`, a missing implicit module is an error, and one report
+     lists the stop-worthy diagnostics. Criteria 1 and 6 hold except for the two
+     interpolation differences, which are the language's behavior now.
 
 Hardening, alongside but not on the critical path:
 
@@ -305,12 +317,30 @@ items run whenever a worker is free.
 
 ## Rules for the interim
 
+The default is flipped; the rules below hold until the old path is removed.
+
 - **Syntax is frozen until the switch.** Non-urgent syntax and diagnostic
   changes wait until the new stage is the default, so they are made once and
   the differential compares against a fixed target. An urgent one lands in
   both parsers, with the parity gate and pinned fixtures proving they agree.
 - **Rules decidable from syntax go into the parsers**, not typecheck.
 - **Fixtures are run or deleted.** No fixture exists that no gate runs.
+
+## Removing the old front end
+
+After the next bootstrap rotation has run on the new default, in this order:
+
+1. Delete the switch: `BLORP_FRONT_END`, `FrontEnd`, `FrontEndSelection` and
+   `front_end_selection*` in `lib/source_graph.brp` and `lib/cli_plan.brp`; the
+   seam always builds the graph from the stage and the adapter.
+2. Remove the existing discovery (lexer, parser and module loader) from the
+   compile path, and the `ExistingDiscovery` arm of the seam.
+3. Delete the `front-end-existing` gate: `scripts/front-end-existing-check`, its
+   entries in `scripts/test` and `scripts/premerge-gate`, and the `existing`
+   comparisons in `test_cli.sh` and `test_package.sh`.
+4. Delete the old parser itself only once the formatter, test discovery,
+   doctest generation and the LSP no longer use it (see "Open decision"); the
+   corpus parity gate and the two-parser rule end with it.
 
 ## Decisions
 
