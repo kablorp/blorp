@@ -474,7 +474,7 @@ Modes:
 - `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
 - Each gate builds the compiler inside its container, which takes several GB,
   so `scripts/docker-gate` waits until fewer than `BLORP_DOCKER_GATE_MAX_CONCURRENT`
-  (default 3) gate containers are running before it starts one.
+  (default 2) gate containers are running before it starts one.
 
 ## Landing a Branch
 
