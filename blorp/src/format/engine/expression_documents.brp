@@ -141,6 +141,19 @@ enum LastItemComma:
 
 
 ---
+How an expression renders as the operand of a postfix form: a field access
+receiver, a call callee, a subscript target, or the receiver of a method chain.
+An expression that binds looser than the postfix form needs parentheses, and
+one that renders as an indented suite also needs its closing parenthesis on a
+line of its own, because a `)` after the suite's last line does not parse.
+---
+enum PostfixOperandForm:
+	BarePostfixOperand
+	InlineParenthesizedPostfixOperand
+	SuiteParenthesizedPostfixOperand
+
+
+---
 The comments a match keeps outside its cases: `header_trailing` ends the
 `match ...:` line, and `closing` holds the whole-line comments after the last
 case, at case indentation.
@@ -775,65 +788,77 @@ private pure func expression_precedence(expr: Expression) -> Int:
 			100
 
 
--- A postfix operator (`.field`, call, subscript) binds tighter than any
--- prefix, infix or block form, so such an operand must keep its parentheses.
--- A lambda or `detach` body extends to the end of the expression, so it would
--- absorb the postfix operator too.
-private pure func needs_field_receiver_parens(expr: Expression) -> Bool:
+private pure func postfix_operand_form(expr: Expression) -> PostfixOperandForm:
 	match expr:
-		BlockExpression(_):
-			True
-		SpacedBlockExpression(_):
-			True
-		ItemBlockExpression(_):
-			True
 		BinaryExpression(_, _, _):
-			True
-		ConcurrentExpression(_, _, _):
-			True
-		ConcurrentlyLoopExpression(_, _, _, _, _):
-			True
-		DebugBlockExpression(_):
-			True
-		ForExpression(_, _, _, _):
-			True
-		TupleForExpression(_, _, _, _):
-			True
-		IfExpression(_, _, _):
-			True
-		IfElseExpression(_, _, _, _, _):
-			True
+			InlineParenthesizedPostfixOperand
 		LogicalExpression(_, _, _):
-			True
-		MatchExpression(_, _, _):
-			True
-		SelectExpression(_):
-			True
+			InlineParenthesizedPostfixOperand
 		RangeExpression(_, _):
-			True
+			InlineParenthesizedPostfixOperand
 		UnaryExpression(_, _):
-			True
+			InlineParenthesizedPostfixOperand
+		BlockExpression(_):
+			SuiteParenthesizedPostfixOperand
+		SpacedBlockExpression(_):
+			SuiteParenthesizedPostfixOperand
+		ItemBlockExpression(_):
+			SuiteParenthesizedPostfixOperand
+		ConcurrentExpression(_, _, _):
+			SuiteParenthesizedPostfixOperand
+		ConcurrentlyLoopExpression(_, _, _, _, _):
+			SuiteParenthesizedPostfixOperand
+		DebugBlockExpression(_):
+			SuiteParenthesizedPostfixOperand
+		ForExpression(_, _, _, _):
+			SuiteParenthesizedPostfixOperand
+		TupleForExpression(_, _, _, _):
+			SuiteParenthesizedPostfixOperand
+		IfExpression(_, _, _):
+			SuiteParenthesizedPostfixOperand
+		IfElseExpression(_, _, _, _, _):
+			SuiteParenthesizedPostfixOperand
+		MatchExpression(_, _, _):
+			SuiteParenthesizedPostfixOperand
+		SelectExpression(_):
+			SuiteParenthesizedPostfixOperand
 		WithExpression(_, _, _, _, _, _, _):
-			True
+			SuiteParenthesizedPostfixOperand
 		WhileExpression(_, _, _):
-			True
-		LambdaExpression(_, _, _):
-			True
-		TypedLambdaExpression(_, _, _, _):
-			True
-		DetachExpression(_):
-			True
+			SuiteParenthesizedPostfixOperand
+		LambdaExpression(_, _, body):
+			body.trailing_body_postfix_operand_form()
+		TypedLambdaExpression(_, _, _, body):
+			body.trailing_body_postfix_operand_form()
+		DetachExpression(body):
+			body.trailing_body_postfix_operand_form()
 		_:
-			False
+			BarePostfixOperand
 
 
--- Renders the receiver of a field access, the callee of a call or the target
--- of a subscript, parenthesized when it binds looser than the postfix operator.
-private pure func postfix_receiver_document(receiver: Expression) -> Doc:
-	if receiver.needs_field_receiver_parens():
-		receiver.parenthesized_expression_document()
-	else:
-		receiver.expression_document()
+---
+A lambda or `detach` operand ends with its body, which would swallow the postfix
+form, so it always needs parentheses; it ends on an indented line when its body
+does.
+---
+private pure func trailing_body_postfix_operand_form(body: Expression) -> PostfixOperandForm:
+	match body.postfix_operand_form():
+		SuiteParenthesizedPostfixOperand:
+			SuiteParenthesizedPostfixOperand
+		_:
+			InlineParenthesizedPostfixOperand
+
+
+private pure func postfix_operand_document(expr: Expression) -> Doc:
+	match expr.postfix_operand_form():
+		BarePostfixOperand:
+			expr.expression_document()
+		InlineParenthesizedPostfixOperand:
+			expr.parenthesized_expression_document()
+		SuiteParenthesizedPostfixOperand:
+			expr
+				.expression_document()
+				.parenthesized_indented_document()
 
 
 private pure func needs_detach_body_parens(expr: Expression) -> Bool:
@@ -1901,15 +1926,16 @@ private pure func commented_logical_expression_document(
 
 	lines
 		.hardlines()
-		.parenthesized_multiline_block_header_document()
+		.parenthesized_indented_document()
 
 
-private pure func parenthesized_multiline_block_header_document(header: Doc) -> Doc:
+--- `(`, then the document indented on its own lines, then `)` on a line of its own.
+private pure func parenthesized_indented_document(document: Doc) -> Doc:
 	"("
 		.text()
 		.cat(
 			Hardline
-				.cat(header)
+				.cat(document)
 				.indent(),
 		)
 		.cat(Hardline)
@@ -1923,7 +1949,7 @@ private pure func logical_block_header_expression_document(
 	terms
 		.logical_condition_term_documents(op)
 		.hardlines()
-		.parenthesized_multiline_block_header_document()
+		.parenthesized_indented_document()
 
 
 private pure func expression_pair_prefers_multiline_block_header(
@@ -2050,7 +2076,7 @@ private pure func block_header_expression_document(expr: Expression) -> Doc:
 			if expr.expression_prefers_multiline_block_header():
 				expr
 					.expression_document()
-					.parenthesized_multiline_block_header_document()
+					.parenthesized_indented_document()
 			else:
 				expr.expression_document()
 
@@ -3377,7 +3403,7 @@ private pure func ufcs_chain_document(callee: Expression, args: List[Expression]
 			if chain.steps.length() >= 2:
 				Some(
 					chain.receiver
-						.expression_document()
+						.postfix_operand_document()
 						.cat(
 							chain.steps
 								.ufcs_steps_document()
@@ -3393,11 +3419,11 @@ private pure func ufcs_chain_document(callee: Expression, args: List[Expression]
 private pure func inline_lambda_call_document(callee: Expression, args: List[Expression]) -> Doc:
 	if args.expression_list_should_use_block_call_arguments():
 		callee
-			.postfix_receiver_document()
+			.postfix_operand_document()
 			.cat(args.block_call_arguments_document())
 	else:
 		callee
-			.postfix_receiver_document()
+			.postfix_operand_document()
 			.cat("(".text())
 			.cat(
 				Softline
@@ -3466,7 +3492,7 @@ private pure func commented_collection_document(
 	match collection:
 		CommentedCall(callee, args):
 			callee
-				.postfix_receiver_document()
+				.postfix_operand_document()
 				.cat(
 					commented_items_document(
 						"(",
@@ -3479,7 +3505,7 @@ private pure func commented_collection_document(
 				)
 		CommentedSubscript(target, indices):
 			target
-				.expression_document()
+				.postfix_operand_document()
 				.cat(
 					commented_items_document(
 						"[",
@@ -4744,7 +4770,7 @@ pure func expression_document(expr: Expression) -> Doc:
 		BuiltinRuntimeExpression(name):
 			("builtin(\"" + name.escape_string_value() + "\")").text()
 		FieldAccessExpression(receiver, field_name):
-			receiver_document: Doc = receiver.postfix_receiver_document()
+			receiver_document: Doc = receiver.postfix_operand_document()
 
 			if field_name.is_tuple_index_field():
 				receiver_document
@@ -4764,7 +4790,7 @@ pure func expression_document(expr: Expression) -> Doc:
 						callee.inline_lambda_call_document(args)
 					else:
 						callee
-							.postfix_receiver_document()
+							.postfix_operand_document()
 							.cat(args.call_arguments_document())
 		OpaqueIntoExpression(type_expression, inner):
 			type_doc = type_expression.type_document()
@@ -4867,13 +4893,13 @@ pure func expression_document(expr: Expression) -> Doc:
 				.cat(right.expression_document())
 		SubscriptExpression(target, index):
 			target
-				.postfix_receiver_document()
+				.postfix_operand_document()
 				.cat("[".text())
 				.cat(index.expression_document())
 				.cat("]".text())
 		MultiSubscriptExpression(target, indices):
 			target
-				.postfix_receiver_document()
+				.postfix_operand_document()
 				.cat("[".text())
 				.cat(
 					indices
