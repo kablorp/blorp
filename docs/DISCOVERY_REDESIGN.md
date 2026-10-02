@@ -99,8 +99,11 @@ Appendix A: node census. Appendix B: allocation probes.
    the root that wires the stages together, and the only code that may
    import both `compiler` and `compiler_new`.
 10. **The default flips only within a hard ceiling** on retired instructions,
-    peak RSS and wall time, measured on today's compiler. The design does not
-    count on the tuple hand-off landing first.
+    peak RSS and wall time. The ceiling is not loosened for any compiler
+    change. Since 2026-10-02 the flip (M6) waits on the compiler work of
+    [`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md): its increments 1 to 4, and
+    increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5
+    do not wait (section 10, Q6).
 
 ## 1. Goals, principles, non-goals, and what the redesign replaces
 
@@ -3187,7 +3190,7 @@ including peak RSS and wall time, before anything lands.
 | Cost on today's compiler | Estimate | Compiler work that would recover it |
 | --- | ---: | --- |
 | Tree nodes. Each node is a record (1); most also box their form (1); a struct in the form adds a box (`NameUse`: 1); record payloads and non-empty lists add 1 each. Identifiers, named types and field accesses are 3 each; calls about 4.5; blocks and statements about 5.5 with the `Statement` wrappers. | about 3.9 M allocations (0.955 M nodes plus about 0.2 M statements) | **Value unions in a record field (G1)**: the form stored inline in `Expression`, so node plus form is one allocation. **Struct payloads unboxed** (`STRUCT_PAYLOAD_ROADMAP` S2, parked at +0.1% on the self-compile; this workload is the case it was missing). **A variant whose only payload is a record shares the variant's box** (OCaml's inline records). Together these take trees to about 1.5 M. |
-| Parse calls returning `(ParseState, T)`, and the mint's `(IdMint, node)` returns inside them: about 2.4 M value-returning calls (about 2.5 per node, from the precedence levels of recursive descent), each about 3 | about 7 M allocations | **G2, cheap multi-value return**: a destructured tuple's components moved, not shared, and a small tuple returned in registers (the parked tuple-return hand-off). The flip does not count on it (section 7.4). |
+| Parse calls returning `(ParseState, T)`, and the mint's `(IdMint, node)` returns inside them: about 2.4 M value-returning calls (about 2.5 per node, from the precedence levels of recursive descent), each about 3 | about 7 M allocations | **G2, cheap multi-value return**: a destructured tuple's components moved, not shared, and a small tuple returned in registers, designed in `VALUE_TUPLES_AND_STATE_HANDOFF.md`. M6 waits on it (section 7.4). |
 | `intern_slice` returning a tuple, once per identifier token | about 0.5 M (inside the 7 M line if counted there) | G2 |
 | Literal values not interned; `DecimalFloat` strings | +10,000 to 20,000 allocations | None needed |
 | Allocation and release work | about 11 M allocations × 60 to 80 instructions = 0.7 to 0.9 G | G2 and inline payloads (above); later, **arena allocation for syntax trees**, since all of a compilation's trees die together (rustc's arenas), which turns allocation into a bump and skips per-node release |
@@ -3235,7 +3238,12 @@ stage-2 `-O2` compiler and today's compiler, against main:
   of each side. A median of 3 back to back moves by about 0.8% between
   sessions with no change, which is most of a 1% ceiling.
 
-These ceilings are decided (section 10). They do not assume G2 or any other compiler change. If they are missed,
+These ceilings are decided (section 10) and are not loosened for any compiler
+change. M0 measured that today's compiler misses them (+1.45% for the tree
+stage alone), so M6 waits on the compiler work of
+[`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md) (its increments 1 to 4, and 5 if
+M0 re-measured after increment 4 still needs it), and is then measured against
+these same ceilings (section 10, Q6, 2026-10-02). If they are still missed,
 M6 waits. The tree path is then made cheaper without changing the design: a
 slimmer `ParseState`, fewer return levels in the expression parser (one
 precedence-climbing loop), and fewer wrapper records where a form is
@@ -3284,7 +3292,7 @@ Ordering and parallelism:
 - M1 also waits for the opaque-type import-cycle fix, in progress separately.
 - M1 and M2 are independent of each other.
 - M3 needs M1 and M2, M4 needs M3, and M5 needs M4.
-- G2 (tuple hand-off) can proceed in parallel, but nothing waits on it.
+- G2 (tuple hand-off, `VALUE_TUPLES_AND_STATE_HANDOFF.md`) proceeds in parallel. M1 to M5 do not wait on it; M6 does (its increments 1 to 4, and 5 if the re-measured M0 still needs it).
 
 Syntax stays frozen from M1 through M4, so the differential compares against
 a fixed target.
@@ -3329,6 +3337,7 @@ Keith's answers to the first version's questions, and where each is applied:
 | Q4, declare-or-refer names | `x = v` and name patterns stay `NameUse`s that resolution decides; resolution stores binding form and mutability itself | 3.12, E5 |
 | Q5, forms only typecheck rejects | The parser rejects them. `=` in expression positions is fixed first, by its own change; the rest is M-1. | 3.9, 3.11, 3.12, 3.19, 8 |
 | Q6, flip timing | Only within a hard ceiling, not counting on the tuple hand-off: +1% retired instructions, +5% peak RSS, +1% wall time on the median of at least 5 interleaved runs | 7.4, M6 |
+| Q6, revised 2026-10-02 | The ceilings are unchanged. After M0 measured the tree stage at +1.45% on today's compiler, M6 waits on the compiler work of `VALUE_TUPLES_AND_STATE_HANDOFF.md` (its question 7): increments 1 to 4, and increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5 proceed in parallel. | 0, 7.2, 7.4, 8 |
 | Q7, glue root | `blorp/src/compile/`: `compile/pipeline.brp` and `compile/legacy_discovery_adapter.brp` | 6.1 |
 | Q8, literals | Discovery does not intern literal texts (the backend pools strings); the tree stores checked values | 5.2 |
 | Downstream reads | Typecheck and Core lowering reads come later; E1 to E21 cover resolution | 1, 4.7 |
