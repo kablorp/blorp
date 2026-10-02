@@ -41,6 +41,7 @@ import:
 		token_count,
 	../tables/diagnostic_code:
 		PlainSyntaxCode(
+			AssignmentInConditionDiagnostic, AssignmentInExpressionDiagnostic,
 			BreakOutsideLoopDiagnostic, ConcurrentForMissingLimitDiagnostic,
 			ConcurrentForTupleBinderDiagnostic, ContinueOutsideLoopDiagnostic,
 			ExpectedAssignmentOperatorDiagnostic, ExpectedConcurrentParameterDiagnostic,
@@ -96,7 +97,6 @@ import:
 		NameId,
 		NodeId,
 		SourceId,
-		name_id_at_row,
 	../tables/node_builder:
 		ChildMark,
 		append_literal_leaf_node,
@@ -108,7 +108,6 @@ import:
 		append_plain_parent_node_from_stack,
 		append_plain_parent_node_since,
 		child_count_since,
-		discard_last_leaf_node,
 		last_node_id,
 		mark_children,
 		node_row,
@@ -141,7 +140,7 @@ import:
 	../tables/row_kinds:
 		DefinitionKind(LocalFunctionDefinition),
 		NodeKind(
-			FieldAccessNode, IdentifierNode, InterpolationHoleNode, InterpolationTextNode,
+			FieldAccessNode, InterpolationHoleNode, InterpolationTextNode,
 			LocalFunctionNode, SubscriptAssignmentNode, SubscriptNode,
 		),
 	../tables/rows: InterpolationPart(HolePart, TextPart), InterpolationPartRow, NodeRow, RowRange
@@ -677,18 +676,14 @@ private pure func parse_named_statement_or_expression(
 		else if starts_assignment_tail(builder.token_kind_at(after_name)):
 			builder.parse_named_statement(scope)
 		else:
-			builder
-				.parse_expression(scope)
-				.assignment_after_expression(scope)
+			builder.parse_expression_statement(scope)
 	else if builder.at(UnderscoreSymbol):
 		if starts_assignment_tail(builder.peek_kind(1)):
 			builder.parse_named_statement(scope)
 		else:
 			builder.parse_expression(scope)
 	else:
-		builder
-			.parse_expression(scope)
-			.assignment_after_expression(scope)
+		builder.parse_expression_statement(scope)
 
 
 ---
@@ -788,64 +783,94 @@ private pure func parse_question_bind_value(
 
 
 ---
-An `=` after a parsed expression: an assignment to a name, a subscript
-assignment, or a reported field assignment. Any other expression is left as
-it is and the `=` unconsumed.
+A statement that is an expression, or a subscript assignment
+(`xs[i] = value`) or a reported field assignment (`p.x = value`) when an `=`
+follows the target. A name's own statement form parses its assignment itself;
+anywhere else an assignment operator is rejected by `reject_assignment`. Any
+other expression is left as it is and the `=` unconsumed.
 ---
-private pure func assignment_after_expression(
+private pure func parse_expression_statement(
 	builder: DiscoveryBuilder,
 	scope: BodyScope,
 ) -> DiscoveryBuilder:
-	if builder.at(EqualSymbol):
-		target: NodeRow = builder.node_row(builder.last_node_id())
+	anchor: Span = builder.current_span()
+	parsed: DiscoveryBuilder = builder.parse_operators_at(scope, LOWEST_PRECEDENCE, anchor)
+
+	if parsed.at(EqualSymbol):
+		target: NodeRow = parsed.node_row(parsed.last_node_id())
 
 		match target.kind:
-			IdentifierNode:
-				-- A named argument (`f(name = value)`): the assignment records the
-				-- name itself, so the identifier node is discarded, not orphaned.
-				mark: ChildMark = builder.mark_children()
-				builder
-					.discard_last_leaf_node()
-					.advance_token()
-					.parse_assignment_value(scope, target.span)
-					.finish_named_statement(
-						AssignmentParent,
-						name_id_at_row(target.payload),
-						target.span,
-						mark,
-					)
 			SubscriptNode:
-				builder
+				parsed
 					.push_last_node()
 					.finish_target_assignment(scope, SubscriptAssignment, target.span)
 			FieldAccessNode:
-				diagnostic: DiagnosticId = builder.next_diagnostic_id()
-				builder
+				diagnostic: DiagnosticId = parsed.next_diagnostic_id()
+				parsed
 					.push_last_node()
 					.append_plain_diagnostic(FieldAssignmentDiagnostic, target.span)
 					.finish_target_assignment(
 						scope,
-						RejectedFieldAssignment(diagnostic),
+						RejectedAssignment(diagnostic),
 						target.span,
 					)
 			_:
-				builder
+				parsed
+	else:
+		parsed
+
+
+---
+Where an expression is parsed that an assignment operator after it must not
+continue. A condition gets the advice for a mistyped comparison.
+---
+private enum AssignmentSite:
+	ConditionSite
+	ExpressionSite
+
+
+---
+An assignment operator after an expression that is not in statement
+position: `if a = 1:`, `[a = 1]`, `f(xs[0] = 1)`, `(a = 1) + 2`. An assignment
+is a statement, so it is reported at the operator and recovered as a missing
+expression over the target and the value, as a rejected field assignment is.
+Only an `=` in a condition is advised as a mistyped comparison.
+---
+private pure func reject_assignment(
+	builder: DiscoveryBuilder,
+	scope: BodyScope,
+	site: AssignmentSite,
+) -> DiscoveryBuilder:
+	if starts_assignment_tail(builder.current_kind()):
+		target: NodeRow = builder.node_row(builder.last_node_id())
+		diagnostic: DiagnosticId = builder.next_diagnostic_id()
+
+		code: PlainSyntaxCode = if site == ConditionSite and builder.at(EqualSymbol):
+			AssignmentInConditionDiagnostic
+		else:
+			AssignmentInExpressionDiagnostic
+
+		builder
+			.push_last_node()
+			.append_plain_diagnostic(code, builder.current_span())
+			.finish_target_assignment(scope, RejectedAssignment(diagnostic), target.span)
 	else:
 		builder
 
 
 ---
-What an `=` after a target that is not a name makes of the statement.
+What an `=` after a target that is not a name makes of the statement: a
+subscript assignment, or a rejected assignment whose diagnostic is linked.
 ---
 private union TargetAssignment:
 	SubscriptAssignment
-	RejectedFieldAssignment(DiagnosticId)
+	RejectedAssignment(DiagnosticId)
 
 
 ---
 The value after an `=` whose target the caller pushed, and the node over
-both: a `SubscriptAssignmentNode`, or the recovery node of a field assignment,
-linked to the diagnostic that rejected it.
+both: a `SubscriptAssignmentNode`, or the recovery node of a rejected
+assignment, linked to the diagnostic that rejected it.
 ---
 private pure func finish_target_assignment(
 	builder: DiscoveryBuilder,
@@ -863,7 +888,7 @@ private pure func finish_target_assignment(
 	match assignment:
 		SubscriptAssignment:
 			pushed.append_plain_parent_node_from_stack(SubscriptAssignmentParent, span, 2)
-		RejectedFieldAssignment(diagnostic):
+		RejectedAssignment(diagnostic):
 			pushed.append_missing_parent_node_from_stack(span, diagnostic, 2)
 
 
@@ -905,7 +930,7 @@ private pure func parse_while(builder: DiscoveryBuilder, scope: BodyScope) -> Di
 	mark: ChildMark = builder.mark_children()
 	builder
 		.advance_token()
-		.parse_expression(scope)
+		.parse_condition(scope)
 		.push_last_node()
 		.expect_colon(ColonInWhileCondition)
 		.parse_block_after_colon(scope.in_loop_body(), start)
@@ -924,7 +949,7 @@ private pure func parse_if(
 	mark: ChildMark = builder.mark_children()
 	then_branch: DiscoveryBuilder = builder
 		.advance_token()
-		.parse_expression(scope)
+		.parse_condition(scope)
 		.push_last_node()
 		.expect_colon(ColonInIfCondition)
 		.parse_block_after_colon(scope, anchor)
@@ -1504,7 +1529,18 @@ An expression at the lowest precedence, anchored at its own start.
 ---
 pure func parse_expression(builder: DiscoveryBuilder, scope: BodyScope) -> DiscoveryBuilder:
 	anchor: Span = builder.current_span()
-	builder.parse_expression_at(scope, LOWEST_PRECEDENCE, anchor)
+	builder.parse_expression_at(scope, anchor)
+
+
+---
+The condition of an `if` or `while`: an expression, where an `=` is advised
+as a mistyped comparison.
+---
+private pure func parse_condition(builder: DiscoveryBuilder, scope: BodyScope) -> DiscoveryBuilder:
+	anchor: Span = builder.current_span()
+	builder
+		.parse_operators_at(scope, LOWEST_PRECEDENCE, anchor)
+		.reject_assignment(scope, ConditionSite)
 
 
 ---
@@ -1528,14 +1564,29 @@ private pure func parse_anchored_expression(
 		FuncKeyword | PureKeyword:
 			builder.parse_lambda(scope, anchor)
 		_:
-			builder.parse_expression_at(scope, LOWEST_PRECEDENCE, anchor)
+			builder.parse_expression_at(scope, anchor)
 
 
 ---
-Binary operators of at least `min_precedence` over prefix expressions; at
-the lowest precedence, also an assignment after the expression.
+An expression at the lowest precedence, anchored at `anchor`. An assignment
+operator after it is rejected: assignment is a statement, never a value.
 ---
 private pure func parse_expression_at(
+	builder: DiscoveryBuilder,
+	scope: BodyScope,
+	anchor: Span,
+) -> DiscoveryBuilder:
+	builder
+		.parse_operators_at(scope, LOWEST_PRECEDENCE, anchor)
+		.reject_assignment(scope, ExpressionSite)
+
+
+---
+Binary operators of at least `min_precedence` over prefix expressions. It
+leaves an assignment operator after the expression unconsumed, for the
+caller to parse (a statement) or reject.
+---
+private pure func parse_operators_at(
 	builder: DiscoveryBuilder,
 	scope: BodyScope,
 	min_precedence: Int,
@@ -1562,9 +1613,6 @@ private pure func parse_expression_at(
 				None:
 					parsing = False
 
-	if min_precedence <= LOWEST_PRECEDENCE:
-		out = out.assignment_after_expression(scope)
-
 	out
 
 
@@ -1583,7 +1631,7 @@ private pure func parse_binary(
 		.push_last_node()
 		.advance_token()
 		.skip_newlines()
-		.parse_expression_at(scope, precedence + 1, anchor)
+		.parse_operators_at(scope, precedence + 1, anchor)
 	right_span: Span = out.node_span(out.last_node_id())
 	out
 		.push_last_node()
@@ -1918,7 +1966,7 @@ private pure func parse_parenthesized(
 			)
 	else:
 		out
-			.parse_expression_at(scope, LOWEST_PRECEDENCE, start)
+			.parse_expression_at(scope, start)
 			.parse_grouping_or_tuple(scope, start)
 
 
@@ -1962,7 +2010,7 @@ private pure func parse_tuple_rest(
 			if out.at(RightParenSymbol):
 				parsing = False
 			else:
-				out = out.parse_expression_at(scope, LOWEST_PRECEDENCE, start)
+				out = out.parse_expression_at(scope, start)
 				out = out.push_last_node()
 		else:
 			parsing = False

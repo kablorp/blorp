@@ -203,6 +203,8 @@ tuple_param = "(" IDENT "," IDENT [ "," IDENT [ "," IDENT ] ] [ "," ] ")" ;
 ```ebnf
 stmt = var_decl
      | IDENT "=" expr                           (* assignment *)
+     | IDENT ("+=" | "-=" | "*=" | "/=") expr   (* compound assignment *)
+     | postfix_expr "[" expr_list "]" "=" expr  (* subscript assignment *)
      | "while" expr ":" NEWLINE INDENT stmt_list DEDENT
      | "for" IDENT "in" expr ":" NEWLINE INDENT stmt_list DEDENT
      | "for" "_" "in" expr ":" NEWLINE INDENT stmt_list DEDENT
@@ -396,11 +398,7 @@ dim_atom = "#" IDENT | "#" INT | INT | "(" dim_expr ")" ;
 ### Expressions
 
 ```ebnf
-expr = assign_expr ;
-
-assign_expr = postfix_expr "=" assign_expr              (* assignment / destruct *)
-            | IDENT ("+=" | "-=" | "*=" | "/=") assign_expr
-            | or_expr ;
+expr = or_expr ;
 
 or_expr  = or_expr "or" { NEWLINE } and_expr | and_expr ;
 and_expr = and_expr "and" { NEWLINE } cmp_expr | cmp_expr ;
@@ -424,6 +422,16 @@ postfix_expr = postfix_expr "." identifier                  (* field access *)
 
 expr_list = expr { "," expr } [ "," ] ;
 ```
+
+Assignment, compound assignment, `?=` and binding with `=` are statements
+(`stmt`), never expressions: they are accepted only as a statement in a block
+or as the body of a match case, and an `=` or compound operator after any other
+expression (an `if` or `while` condition, a list element, a call argument, an
+operand, a parenthesized expression) is a parse error. Blorp has no named
+arguments: `f(name = value)` is such an assignment. The `=` of a record field
+(`field_init`) and a record update is part of that construct, not an
+assignment. To use the value of an
+assignment, assign on its own line first and then use the name.
 
 `as` only appears in import aliases. An expression followed by `as` is a
 parse error: type ascription was removed, so annotate the binding
@@ -486,7 +494,7 @@ else_clause = "else" ":" NEWLINE INDENT stmt_list DEDENT
 match_expr = "match" expr ":" NEWLINE INDENT match_cases DEDENT ;
 
 match_cases = match_case { NEWLINE match_case } ;
-match_case  = pattern ":" ( expr | NEWLINE INDENT stmt_list DEDENT ) ;
+match_case  = pattern ":" ( stmt | NEWLINE INDENT stmt_list DEDENT ) ;
 
 select_expr = "select" ":" NEWLINE INDENT select_arms DEDENT ;
 

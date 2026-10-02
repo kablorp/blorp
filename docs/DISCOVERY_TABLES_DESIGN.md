@@ -514,10 +514,13 @@ name and a local function, whose spans stay token-exact because rename and
 reference tooling edits those tokens (the existing parser does the same). A compound assignment
 (`x += 1`) has only the value child: it has no written type.
 
-**Named arguments.** `f(a = 1)` parses as a `CallNode` whose argument is an
-`AssignmentNode` with the parameter's name as its payload. The identifier
-leaf parsed before the parser sees `=` is discarded, so no node is
-orphaned; the invariants check that every node is referenced exactly once.
+**Assignment is a statement.** An assignment operator after an expression
+that is not in statement position (a condition, a list element, an argument
+that is not `name = value`, an operand) is rejected at the operator
+(`AssignmentInConditionDiagnostic` for `=` in an `if` or `while` condition,
+`AssignmentInExpressionDiagnostic` otherwise) and recovered as a
+`MissingExpressionNode` over the target and the value, as a rejected field
+assignment is.
 
 **Interpolation.** An interpolated string is an `InterpolatedStringNode` (or
 `InterpolatedPipeStringNode`) whose children are, in source order,
@@ -973,8 +976,7 @@ the few shapes that still copy (the threading rules in `tables/builder.brp`).
 
 What was a separate finalization pass is part of parsing: interpolation
 holes are parsed where they appear; subscripts and compiler-owned import
-forms are written in their final form; a named argument is an
-`AssignmentNode` child of its call.
+forms are written in their final form.
 
 Binary operators have one source of truth: `binary_operator(token)` maps a
 token to a `BinaryOperator` (or none), and `operator_precedence` and

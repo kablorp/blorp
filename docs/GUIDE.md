@@ -153,6 +153,15 @@ func variable_examples() -> Int:
     0
 ```
 
+Assignment (`=`), compound assignment (`+=`), `?=` and bindings are statements,
+not expressions: write them on a line of their own, or as a match case body.
+They cannot appear inside a condition, a list, a call argument or an operand,
+so a mistyped `if count = 1:` is a syntax error that suggests `==`. To use the
+assigned value, assign first and use the name afterwards. Blorp has no named
+arguments, so `f(name = value)` is such an assignment and is rejected. The `=`
+in a record literal `{ x = 1 }` and a record update `{ p | x = 1 }` is part of
+that syntax and is not an assignment.
+
 A tuple destructuring is always a declaration, never an assignment. Writing it
 with a name that already belongs to a `var` in an enclosing scope, such as
 `(total, _) = step(total)` inside a loop over `var total`, is a compile error

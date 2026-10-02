@@ -173,6 +173,16 @@ private EXPECTED_CONCURRENT_PARAM: String = "concurrent parameter"
 
 private PREC_LOWEST: Int = 0
 
+private ASSIGNMENT_IN_CONDITION_MESSAGE: String = (
+	"A condition cannot be an assignment. Use `==` to compare, or assign on its own line before "
+	+ "the condition"
+)
+
+private ASSIGNMENT_IN_EXPRESSION_MESSAGE: String = (
+	"An assignment is a statement, not an expression. Assign on its own line first, then use the "
+	+ "name where the value is needed"
+)
+
 private REMOVED_TYPE_ASCRIPTION_MESSAGE: String = "type ascription with `as` was removed"
 
 private REMOVED_TYPE_ASCRIPTION_HELP: String = (
@@ -663,6 +673,15 @@ the lambda or task, not the loop.
 private enum LoopContext:
 	NotInLoop
 	InLoopBody
+
+
+---
+Where an expression is parsed that an assignment operator after it must not
+continue. A condition gets the advice for a mistyped comparison.
+---
+private enum AssignmentSite:
+	ConditionSite
+	ExpressionSite
 
 
 private enum TupleBinderIdentifierMode:
@@ -4503,12 +4522,7 @@ private pure func parse_if_expr_with_header_span(
 	header_span: SourceLocation,
 ) -> ParseExprStep:
 	start_span: SourceLocation = current_location(state, index)
-	cond_step: ParseExprStep = parse_expression(
-		state,
-		advance_parser(state, index),
-		diagnostics,
-		PREC_LOWEST,
-	)
+	cond_step: ParseExprStep = parse_condition(state, advance_parser(state, index), diagnostics)
 	colon_step: ParseSymbolStep = expect_symbol(state, cond_step.index, ColonSymbol)
 	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
@@ -5878,12 +5892,7 @@ private pure func parse_while_expr(
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
 	start_span: SourceLocation = current_location(state, index)
-	cond_step: ParseExprStep = parse_expression(
-		state,
-		advance_parser(state, index),
-		diagnostics,
-		PREC_LOWEST,
-	)
+	cond_step: ParseExprStep = parse_condition(state, advance_parser(state, index), diagnostics)
 	colon_step: ParseSymbolStep = expect_symbol(state, cond_step.index, ColonSymbol)
 	colon_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
 		state,
@@ -6300,29 +6309,28 @@ private pure func parse_nested_function_decl_expr(
 	}
 
 
-private pure func parse_assignment_after_expression(
+---
+A statement that is an expression, or a subscript assignment
+(`xs[i] = value`) or a reported field assignment (`p.x = value`) when an `=`
+follows the target. A name's own statement form parses its assignment itself;
+anywhere else an assignment operator is rejected by `reject_assignment`. Any
+other expression is left as it is and the `=` unconsumed.
+---
+private pure func parse_expression_statement(
 	state: ParserInput,
-	expr_step: ParseExprStep,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
 ) -> ParseExprStep:
+	expr_step: ParseExprStep = parse_operator_expression_with_header_span(
+		state,
+		index,
+		diagnostics,
+		PREC_LOWEST,
+		current_location(state, index),
+	)
+
 	if current_is_symbol(state, expr_step.index, EqualSymbol):
 		match expr_step.value:
-			ParsedNameExpr(name):
-				value_step: ParseExprStep = parse_assignment_value_expr(
-					state,
-					advance_parser(state, expr_step.index),
-					expr_step.diagnostics,
-					name.span,
-				)
-
-				{
-					index = value_step.index,
-					diagnostics = value_step.diagnostics,
-					value = ParsedAssignExpr(
-						name,
-						value_step.value,
-						location_cover(name.span, parsed_expr_location(value_step.value)),
-					)
-				}
 			ParsedSubscriptExpr(target, indices, left_span):
 				value_step: ParseExprStep = parse_assignment_value_expr(
 					state,
@@ -6368,6 +6376,51 @@ private pure func parse_assignment_after_expression(
 				}
 			_:
 				expr_step
+	else:
+		expr_step
+
+
+---
+An assignment operator (`=`, `?=` or a compound assignment) after an expression
+that is not in statement position: `if a = 1:`, `[a = 1]`, `f(xs[0] = 1)`,
+`(a = 1) + 2`. An assignment is a statement, so it is reported at the operator
+and its value is parsed and dropped. Only an `=` in a condition is advised as a
+mistyped comparison.
+---
+private pure func reject_assignment(
+	state: ParserInput,
+	expr_step: ParseExprStep,
+	site: AssignmentSite,
+) -> ParseExprStep:
+	if current_can_start_assignment_tail(state, expr_step.index):
+		operator_span: SourceLocation = current_location(state, expr_step.index)
+
+		message: String = if site == ConditionSite and current_is_symbol(
+			state,
+			expr_step.index,
+			EqualSymbol,
+		):
+			ASSIGNMENT_IN_CONDITION_MESSAGE
+		else:
+			ASSIGNMENT_IN_EXPRESSION_MESSAGE
+
+		value_step: ParseExprStep = parse_assignment_value_expr(
+			state,
+			advance_parser(state, expr_step.index),
+			add_expected_error(state, expr_step.diagnostics, operator_span, message, [], None),
+			parsed_expr_location(expr_step.value),
+		)
+
+		{
+			index = value_step.index,
+			diagnostics = value_step.diagnostics,
+			value = ParsedMissingExpr(
+				location_cover(
+					parsed_expr_location(expr_step.value),
+					parsed_expr_location(value_step.value),
+				),
+			)
+		}
 	else:
 		expr_step
 
@@ -6440,10 +6493,7 @@ private pure func parse_named_statement_or_expression(
 		else if current_can_start_assignment_tail(state, st):
 			parse_named_assignment_tail(state, st, st_diag, name_step.value, None)
 		else:
-			parse_assignment_after_expression(
-				state,
-				parse_expression(state, index, diagnostics, PREC_LOWEST),
-			)
+			parse_expression_statement(state, index, diagnostics)
 	else:
 		is_underscore: Bool = match current_tag(state, index):
 			SymbolTag:
@@ -6466,10 +6516,7 @@ private pure func parse_named_statement_or_expression(
 			else:
 				parse_expression(state, index, diagnostics, PREC_LOWEST)
 		else:
-			parse_assignment_after_expression(
-				state,
-				parse_expression(state, index, diagnostics, PREC_LOWEST),
-			)
+			parse_expression_statement(state, index, diagnostics)
 
 
 private pure func parse_statement(
@@ -7759,7 +7806,12 @@ private pure func parse_prefix_expr_with_header_span(
 			)
 
 
-private pure func parse_expression_with_header_span(
+---
+Binary operators of at least `min_precedence` over prefix expressions. An
+assignment operator after the expression is left unconsumed, for the caller
+to parse (a statement) or reject.
+---
+private pure func parse_operator_expression_with_header_span(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
@@ -7813,7 +7865,7 @@ private pure func parse_expression_with_header_span(
 					else:
 						st = advance_parser(state, st)
 						st = skip_newlines(state, st)
-						right_step: ParseExprStep = parse_expression_with_header_span(
+						right_step: ParseExprStep = parse_operator_expression_with_header_span(
 							state,
 							st,
 							st_diag,
@@ -7826,16 +7878,58 @@ private pure func parse_expression_with_header_span(
 				None:
 					parsing_infix = False
 
-	result: ParseExprStep = {
+	{
 		index = st,
 		diagnostics = st_diag,
 		value = left
 	}
 
+
+---
+An expression: operators over prefix expressions, where an assignment operator
+after it at the lowest precedence is rejected (assignment is a statement).
+---
+private pure func parse_expression_with_header_span(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	min_precedence: Int,
+	header_span: SourceLocation,
+) -> ParseExprStep:
+	result: ParseExprStep = parse_operator_expression_with_header_span(
+		state,
+		index,
+		diagnostics,
+		min_precedence,
+		header_span,
+	)
+
 	if min_precedence <= PREC_LOWEST:
-		parse_assignment_after_expression(state, result)
+		reject_assignment(state, result, ExpressionSite)
 	else:
 		result
+
+
+---
+The condition of an `if` or `while`: an expression, where an `=` is advised as
+a mistyped comparison.
+---
+private pure func parse_condition(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+) -> ParseExprStep:
+	reject_assignment(
+		state,
+		parse_operator_expression_with_header_span(
+			state,
+			index,
+			diagnostics,
+			PREC_LOWEST,
+			current_location(state, index),
+		),
+		ConditionSite,
+	)
 
 
 private pure func parse_expression(
