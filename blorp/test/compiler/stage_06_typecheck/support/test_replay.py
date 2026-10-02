@@ -17,15 +17,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[5]
 SCRIPT = ROOT / "benchmarks" / "compiler_typecheck_replay"
-RETENTION_SLICE_MODULES = [
-    "string",
-    "parser",
-    "float",
-    "json",
-    "blorp/src/compiler/stage_09_core/ir",
-    "blorp/src/compiler/stage_09_core/c_type_layout",
-    "closure",
-]
 
 
 def load_replay_module():
@@ -39,6 +30,12 @@ def load_replay_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+# The slice is the replay script's own list. This suite checks that
+# `--retention-slice` selects exactly that list and nothing else, not what the
+# list contains, so retuning the slice does not break it.
+RETENTION_SLICE_MODULES = list(load_replay_module().COMPILER_CLI_RETENTION_SLICE)
 
 
 def request_json(action: str = "typecheck_graph") -> dict[str, object]:
@@ -527,6 +524,8 @@ class CompilerTypecheckReplayTests(unittest.TestCase):
             result = json.loads(completed.stdout)
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertGreater(len(RETENTION_SLICE_MODULES), 0)
+        self.assertNotIn("unselected", RETENTION_SLICE_MODULES)
         self.assertEqual(result["module_targets"], RETENTION_SLICE_MODULES)
         self.assertEqual(result["artifacts"], len(RETENTION_SLICE_MODULES) + 1)
 

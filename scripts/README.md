@@ -493,7 +493,15 @@ with the given title and body. Titles starting with `Merge` or containing an
 `#<digits>` issue reference are refused so main's history stays standalone
 and readable. After `make`, it prints the `bin/blorp --version` build stamp,
 then runs `make hygiene-check`, `make tooling-check`, `scripts/compiler-check --changed --base origin/main` and any
-`--gate` gates directly. The two `make` targets must exit 0; every other one
+`--gate` gates directly. It also runs `make benchmark-tooling-check`, but only
+when the squashed commit (compared with `--no-renames`) touches an input those
+suites read: `benchmarks/` (other than `benchmarks/results/`), `blorp/benchmark/`,
+`scripts/bench-*`, `scripts/with-build-lock`, `scripts/with-compiler-contention-lease`,
+`blorp/src/test/`, the compiler and library modules the benchmark workers
+import, the repository paths the benchmark policy fingerprints, or one of the
+test files that target runs. `touches_benchmark_tooling` in `scripts/land` is the
+authoritative list. Otherwise it prints that the phase was skipped. The
+`make` targets must exit 0; every other one
 must end in a `BLORP_GATE_RESULT ... status=PASS` line (a compiler-check run
 with no selected work counts).
 Only if all of that passes, and `origin/main` is still an ancestor of the new
@@ -503,8 +511,8 @@ turns: `scripts/land` holds `land.lock` in the shared git directory from its
 first fetch until it exits (waiting with `queued behind: <pid> <ref> <time>`
 while another landing runs; a dead holder's lock is taken over), so each
 landing gates against the main it pushes onto. It prints `LAND_PHASE <name>
-<seconds>` after each phase (queue, build, hygiene, tooling, compiler-check,
-each gate, push). Set `LAND_LOCK_POLL_SECONDS` (default 30) to change the wait
+<seconds>` after each phase (queue, build, hygiene, tooling, benchmark-tooling,
+compiler-check, each gate, push). Set `LAND_LOCK_POLL_SECONDS` (default 30) to change the wait
 interval; remove a stuck lock by hand with `rm "$(git rev-parse
 --path-format=absolute --git-common-dir)/land.lock"`.
 `--dry-run` runs the same sequence, including the lock and the commit,
@@ -728,12 +736,15 @@ hygiene-check` runs it automatically.
 
 `make hygiene-check` is the seconds-long static set (layout, editor drift,
 C-symbol boundary, manifest, std builtins, magic spellings). `make tooling-check` holds the stage-2 self-compile C-symbol
-leak check (`scripts/check-c-symbol-projection-self-compile`), the
-benchmark-worker `check` runs and the Python/shell suites that test the
-scripts, build, runtime harnesses and audits. Every `scripts/land` runs both.
-`make quality` runs both, then
+leak check (`scripts/check-c-symbol-projection-self-compile`) and the
+Python/shell suites that test the scripts, build, runtime harnesses and
+audits. Every `scripts/land` runs both. `make benchmark-tooling-check` holds
+the benchmark-worker `check` runs and the suites that test the benchmark and
+measurement scripts; they protect those scripts rather than the compiler and
+take minutes, so `scripts/land` runs them only when a landing touches an input they read
+(see Landing a Branch). `make quality` runs all three, then
 `artifact-scan` for stray generated files the suites left behind;
-`scripts/premerge-gate` runs them too.
+`scripts/premerge-gate` runs them too, and so does CI's Quality lane.
 
 `scripts/check-intellij-plugin` verifies the built IntelliJ plugin zip contains
 the native Blorp file type, token lexer/parser, TextMate highlighter bridge, LSP

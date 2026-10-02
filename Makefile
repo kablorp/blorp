@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check tooling-check artifact-scan quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check tooling-check benchmark-tooling-check artifact-scan quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -502,6 +502,7 @@ smoke: all
 quality:
 	$(MAKE) hygiene-check
 	$(MAKE) tooling-check
+	$(MAKE) benchmark-tooling-check
 	$(MAKE) artifact-scan
 	$(MAKE) c-static-analysis
 
@@ -532,20 +533,12 @@ artifact-scan:
 		exit 1; \
 	fi
 
-# The benchmark-worker checks and the Python/shell tooling suites. They audit
-# compiler, runtime and script sources, so `quality`, the premerge gate and
-# every `scripts/land` run them.
+# The Python/shell tooling suites. They audit compiler, runtime and script
+# sources, so `quality`, the premerge gate and every `scripts/land` run them.
+# The suites that test the benchmark tooling are `benchmark-tooling-check`.
 tooling-check: build-blorp-cli
 	@scripts/check-c-symbol-projection-self-compile
-	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
-	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_perceus_memory.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_09_core/support/test_borrowed_boundary_child_modes.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test/test_session_benchmark.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_typecheck_memory.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/fixture_support/test_check_fixtures.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/tool/test_tool_fixture_runner.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest $(STANDARD_LIBRARY_TEST_ROOT)/test_check_std_builtins.py
@@ -570,11 +563,9 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_build_status.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_new_parity.py
-	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_memory_diagnostics_harness.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/cli/test_memory_compiler_setup.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_complexity_check.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_record_validation.py
-	@blorp/test/compiler/benchmark/test_record_layout.sh
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_nested_match_allocations
 	@blorp/test/build/test_build_configuration.sh
@@ -583,6 +574,25 @@ tooling-check: build-blorp-cli
 	@blorp/test/build/test_scripts_test_harness.sh
 	@blorp/test/build/test_land_lock.sh
 	@blorp/test/build/test_split_translation_units.sh
+
+# The benchmark-worker checks and the suites that test benchmark and
+# measurement tooling (benchmarks/, blorp/benchmark/, scripts/bench-*). They
+# protect the scripts used to judge performance changes, not the compiler, and
+# take minutes, so `scripts/land` runs them only when a landing touches an
+# input they read (`touches_benchmark_tooling` in scripts/land lists them;
+# add a new input there). `quality`, and so CI and the premerge gate, always
+# run them.
+benchmark-tooling-check: build-blorp-cli
+	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
+	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_perceus_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/test/test_session_benchmark.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_worker.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_typecheck_memory.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/stage_06_typecheck/support/test_replay.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_memory_diagnostics_harness.py
+	@blorp/test/compiler/benchmark/test_record_layout.sh
 
 # `clang --analyze` exits 0 even when it reports findings. -analyzer-werror
 # makes every finding an error, and `set -e` fails the target at the first

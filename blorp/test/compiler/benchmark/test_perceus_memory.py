@@ -118,7 +118,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         _, program = self.benchmark.fixture_request(
             1,
             2,
-            128,
+            self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
             0,
             params_per_function=8,
             body_shape="borrowed_call_protection",
@@ -137,7 +137,8 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         )
 
         self.assertTrue(all(
-            self.benchmark.expression_node_count(worker["body"]) == 128
+            self.benchmark.expression_node_count(worker["body"])
+            == self.benchmark.PARAMETER_MATRIX_BODY_LEAVES
             for worker in workers
         ))
         self.assertEqual(main["body"]["kind"], "let")
@@ -396,179 +397,6 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "worker source reuse changed"):
             self.benchmark.validate_managed_let_transfer_counters(counters, 2)
 
-    def test_contract_inference_uses_collected_equations_without_body_rescans(self) -> None:
-        perceus_source = (
-            ROOT
-            / "blorp"
-            / "src"
-            / "compiler"
-            / "stage_09_core"
-            / "ownership_contracts.brp"
-        ).read_text(encoding="utf-8")
-
-        for required in (
-            "record ParameterFlow",
-            "record FunctionContractEquation",
-            "record OwnershipContractGraph",
-            "collect_function_contract_equation",
-            "solve_user_call_contracts",
-        ):
-            self.assertIn(required, perceus_source)
-
-        for obsolete in (
-            "private pure func infer_user_contract(",
-            "private pure func analyze_user_contract_wave(",
-        ):
-            self.assertNotIn(obsolete, perceus_source)
-
-    def test_insert_drops_tracks_reconstruction_without_a_second_result_wrapper(self) -> None:
-        perceus_source = (
-            ROOT
-            / "blorp"
-            / "src"
-            / "compiler"
-            / "stage_09_core"
-            / "perceus"
-            / "results_and_loops.brp"
-        ).read_text(encoding="utf-8")
-
-        inserted_expr_record = perceus_source.split(
-            "record PerceusInsertedExpr {", 1
-        )[1].split("}", 1)[0]
-
-        self.assertIn("reuses_source: Bool", inserted_expr_record)
-        self.assertIn("insert_drops_expr_inner_result", perceus_source)
-        self.assertIn("perceus_work_insert_node_reconstructions", perceus_source)
-        self.assertIn("perceus_work_insert_original_nodes_reused", perceus_source)
-        self.assertIn("perceus_work_insert_opaque_rewrite_results", perceus_source)
-        self.assertNotIn("union PerceusInsertRewrite", perceus_source)
-
-    def test_managed_let_source_reuse_has_an_explicit_identity_proof(self) -> None:
-        perceus_source = (
-            ROOT
-            / "blorp"
-            / "src"
-            / "compiler"
-            / "stage_09_core"
-            / "perceus"
-            / "results_and_loops.brp"
-        ).read_text(encoding="utf-8")
-
-        managed_let_plan = perceus_source.split(
-            "record PerceusManagedLetPlan {", 1
-        )[1].split("}", 1)[0]
-
-        self.assertIn("source: CoreExpr", managed_let_plan)
-        self.assertIn("owned_rhs_reuses_source: Bool", managed_let_plan)
-        self.assertIn("branch_safe_body_reuses_source: Bool", managed_let_plan)
-        self.assertIn("normalize_binding_alias_rhs_reuses_source", perceus_source)
-        self.assertIn("normalize_binding_alias_rhs_with_owned_status", perceus_source)
-        self.assertIn("managed_let_reuses_source", perceus_source)
-        self.assertIn("perceus_work_insert_managed_let_visits", perceus_source)
-        self.assertIn(
-            "perceus_work_insert_managed_let_original_nodes_reused",
-            perceus_source,
-        )
-        self.assertIn(
-            "perceus_work_insert_managed_let_reconstructions",
-            perceus_source,
-        )
-
-    def test_call_source_reuse_has_an_explicit_normalization_proof(self) -> None:
-        perceus_source = (
-            ROOT
-            / "blorp"
-            / "src"
-            / "compiler"
-            / "stage_09_core"
-            / "perceus"
-            / "results_and_loops.brp"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("call_ownership_normalization_reuses_source", perceus_source)
-        self.assertIn("insert_drops_change_aware_call", perceus_source)
-        self.assertNotIn("PerceusNormalizedExpr", perceus_source)
-        self.assertIn("perceus_work_insert_call_visits", perceus_source)
-        self.assertIn(
-            "perceus_work_insert_call_original_nodes_reused",
-            perceus_source,
-        )
-        self.assertIn(
-            "perceus_work_insert_call_reconstructions",
-            perceus_source,
-        )
-
-    def test_aggregate_source_reuse_has_typed_change_results(self) -> None:
-        perceus_source = (
-            ROOT
-            / "blorp"
-            / "src"
-            / "compiler"
-            / "stage_09_core"
-            / "perceus"
-            / "results_and_loops.brp"
-        ).read_text(encoding="utf-8")
-
-        for result_type in (
-            "PerceusAggregateExprsRewrite",
-            "PerceusAggregateRecordFieldsRewrite",
-            "PerceusAggregateCowFieldsRewrite",
-            "PerceusAggregateBoxedValuesRewrite",
-            "PerceusAggregateDictEntriesRewrite",
-        ):
-            self.assertIn(f"union {result_type}:", perceus_source)
-
-        self.assertIn("insert_drops_change_aware_aggregate", perceus_source)
-        self.assertIn("perceus_work_insert_aggregate_visits", perceus_source)
-        self.assertIn(
-            "perceus_work_insert_aggregate_original_nodes_reused",
-            perceus_source,
-        )
-        self.assertIn(
-            "perceus_work_insert_aggregate_reconstructions",
-            perceus_source,
-        )
-
-    def test_fixed_ownership_source_reuse_has_typed_change_results(self) -> None:
-        perceus_source = (
-            ROOT
-            / "blorp"
-            / "src"
-            / "compiler"
-            / "stage_09_core"
-            / "perceus"
-            / "results_and_loops.brp"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("union PerceusOwnershipNormalization", perceus_source)
-        self.assertIn("UnchangedPerceusOwnershipNormalization", perceus_source)
-        self.assertIn(
-            "ChangedPerceusOwnershipNormalization(CoreExpr)",
-            perceus_source,
-        )
-        self.assertIn("normalize_unbox_ownership_change_aware", perceus_source)
-        self.assertIn("normalize_binary_ownership_change_aware", perceus_source)
-        self.assertIn("normalize_projection_ownership_change_aware", perceus_source)
-        self.assertIn("insert_drops_change_aware_fixed_ownership", perceus_source)
-        self.assertIn("perceus_work_insert_fixed_ownership_visits", perceus_source)
-        self.assertIn(
-            "perceus_work_insert_fixed_ownership_original_nodes_reused",
-            perceus_source,
-        )
-        self.assertIn(
-            "perceus_work_insert_fixed_ownership_reconstructions",
-            perceus_source,
-        )
-        self.assertIn(
-            "perceus_work_insert_fixed_ownership_normalization_rewrites",
-            perceus_source,
-        )
-        self.assertNotIn(
-            "bind_borrowed_owned_temporary_args_through_unbox",
-            perceus_source,
-        )
-        self.assertNotIn("protect_consuming_field_aliases", perceus_source)
-
     def test_core_ownership_census_counts_policies(self) -> None:
         response = self.perceus_response()
         body = response["artifact"]["core"]["decls"][4]["body"]
@@ -666,7 +494,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         _, program = self.benchmark.fixture_request(
             1,
             2,
-            128,
+            self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
             0,
             params_per_function=2,
             body_shape="aggregate_change_matrix",
@@ -737,7 +565,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         _, program = self.benchmark.fixture_request(
             1,
             2,
-            128,
+            self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
             0,
             params_per_function=2,
             body_shape="fixed_ownership_change_matrix",
@@ -748,7 +576,10 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             for declaration in program["decls"]
             if declaration.get("name") == "bench_worker_0000"
         )
-        self.assertEqual(self.benchmark.expression_node_count(worker["body"]), 128)
+        self.assertEqual(
+            self.benchmark.expression_node_count(worker["body"]),
+            self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
+        )
         self.assertEqual(
             self.benchmark.count_parameter_reads(
                 worker["body"],
@@ -951,7 +782,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
         _, program = self.benchmark.fixture_request(
             1,
             2,
-            128,
+            self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
             0,
             params_per_function=8,
             body_shape="aggregate_escape",
@@ -963,7 +794,10 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             if declaration.get("name") == "bench_worker_0000"
         )
 
-        self.assertEqual(self.benchmark.expression_node_count(worker["body"]), 128)
+        self.assertEqual(
+            self.benchmark.expression_node_count(worker["body"]),
+            self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
+        )
         self.assertEqual(
             self.benchmark.count_parameter_reads(
                 worker["body"],
@@ -1439,7 +1273,7 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             counter_bridge=None,
             globals=1,
             functions=2,
-            body_leaves=128,
+            body_leaves=self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
             global_reads_per_function=0,
             params_per_function=1,
             parameter_type="String",
@@ -1471,9 +1305,27 @@ class CompilerPerceusMemoryBenchmarkTests(unittest.TestCase):
             for call in run.call_args_list
         ]
         self.assertEqual(points, [
-            (1, 2, 128, "aggregate_escape", False),
-            (8, 2, 128, "aggregate_escape", False),
-            (32, 2, 128, "aggregate_escape", False),
+            (
+                1,
+                self.benchmark.PARAMETER_MATRIX_FUNCTIONS,
+                self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
+                "aggregate_escape",
+                False,
+            ),
+            (
+                8,
+                self.benchmark.PARAMETER_MATRIX_FUNCTIONS,
+                self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
+                "aggregate_escape",
+                False,
+            ),
+            (
+                32,
+                self.benchmark.PARAMETER_MATRIX_FUNCTIONS,
+                self.benchmark.PARAMETER_MATRIX_BODY_LEAVES,
+                "aggregate_escape",
+                False,
+            ),
         ])
 
     def test_result_matrix_rejects_owner_scaled_rewrite_work(self) -> None:

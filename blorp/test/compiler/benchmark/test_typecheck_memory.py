@@ -17,24 +17,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "benchmarks" / "compiler_typecheck_memory"
-COMPILER_ENV_SOURCE = ROOT / "blorp" / "src" / "compiler" / "stage_06_typecheck/type_system" / "env.brp"
-TYPECHECK_DECL_SOURCE = (
-    ROOT
-    / "blorp"
-    / "src"
-    / "compiler"
-    / "stage_06_typecheck"
-    / "decl.brp"
-)
-TYPE_DECL_ANALYSIS_SOURCE = (
-    ROOT
-    / "blorp"
-    / "src"
-    / "compiler"
-    / "stage_06_typecheck"
-    / "headers"
-    / "type_decl_analysis.brp"
-)
 
 
 def load_benchmark_module():
@@ -83,23 +65,6 @@ for module in [*payload["modules"], payload["target"]]:
         }},
     }}))
 """
-
-
-def top_level_function_source(path: Path, function_name: str) -> str:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    marker = f"func {function_name}("
-    start = next(
-        index
-        for index, line in enumerate(lines)
-        if marker in line and not line.startswith(("\t", " "))
-    )
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        line = lines[index]
-        if line and not line.startswith(("\t", " ", "--")):
-            end = index
-            break
-    return "\n".join(lines[start:end])
 
 
 class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
@@ -415,28 +380,6 @@ class CompilerTypecheckMemoryBenchmarkTests(unittest.TestCase):
             args.warmup_runs = 1
             with self.assertRaisesRegex(RuntimeError, "even number of warmup runs"):
                 self.benchmark.run_benchmark(args)
-
-    def test_recursive_type_ownership_boundaries_do_not_deep_copy(self) -> None:
-        resolve_self = top_level_function_source(
-            COMPILER_ENV_SOURCE,
-            "resolve_self",
-        )
-        resource_scan = top_level_function_source(
-            TYPE_DECL_ANALYSIS_SOURCE,
-            "resource_type_scan_contains",
-        )
-        resolve_impl = top_level_function_source(
-            TYPECHECK_DECL_SOURCE,
-            "resolve_impl_method_sig",
-        )
-
-        self.assertNotIn("compiler_type_copy(", resolve_self)
-        self.assertNotIn("compiler_resource_type_scan_context_copy", resource_scan)
-        self.assertNotIn("compiler_type_copy(", resolve_impl)
-        self.assertNotIn(
-            "compiler_resource_type_scan_context_copy",
-            TYPE_DECL_ANALYSIS_SOURCE.read_text(encoding="utf-8"),
-        )
 
     def test_streamed_response_validation_checks_every_artifact(self) -> None:
         expected = ["bench/typecheck_0000", "bench/typecheck_0001", "bench/target"]

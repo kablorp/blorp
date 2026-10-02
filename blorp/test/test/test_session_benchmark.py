@@ -23,9 +23,6 @@ SCRIPT = ROOT / "scripts" / "bench-blorp-test-session"
 BUILD_LOCK_WRAPPER = ROOT / "scripts" / "with-build-lock"
 CONTENTION_WRAPPER = ROOT / "scripts" / "with-compiler-contention-lease"
 POLICY = ROOT / "benchmarks" / "blorp_test_session_policy.json"
-REGISTERED_WORKLOADS_CONTRACT_SHA256 = (
-    "853cb4fad4768424cb4121ef225d724e2980c31c51de609ecb87c6d994b22363"
-)
 COMPLETE_RESULT_FIELDS = frozenset(
     {
         "schema_version",
@@ -787,110 +784,79 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         self.assertLessEqual(first[0], -3.5)
         self.assertGreaterEqual(first[1], -3.5)
 
-    def test_committed_policy_registers_exact_workloads_and_thresholds(self) -> None:
+    def test_committed_policy_agrees_with_the_driver(self) -> None:
+        # load_benchmark_policy rejects a malformed policy (missing or extra
+        # fields, bad types, unknown kinds, escaping fingerprint paths). The
+        # values below are compared with the driver's own constants, not with
+        # copies of the policy file, so editing a threshold does not break this.
         policy = self.benchmark.load_benchmark_policy(POLICY)
 
-        self.assertEqual(policy["schema_version"], 3)
-        self.assertEqual(policy["minimum_measured_pairs"], 10)
-        self.assertEqual(policy["maximum_measured_pairs"], 30)
-        self.assertEqual(policy["minimum_bootstrap_samples"], 10_000)
         self.assertEqual(
-            policy["maximum_confidence_interval_width_percentage_points"],
-            10.0,
+            policy["schema_version"], self.benchmark.BENCHMARK_POLICY_SCHEMA_VERSION
         )
         self.assertEqual(
-            policy["contention"]["kind"],
-            "advisory_shared_gate_exclusive_benchmark",
+            policy["minimum_measured_pairs"],
+            self.benchmark.CHARACTERIZATION_MINIMUM_PAIRS,
         )
         self.assertEqual(
-            policy["contention"]["lease_name"],
-            "blorp-compiler-evidence-v1.lock",
+            policy["maximum_measured_pairs"], self.benchmark.MAXIMUM_MEASURED_PAIRS
+        )
+        self.assertLessEqual(
+            policy["minimum_measured_pairs"], policy["maximum_measured_pairs"]
+        )
+        # Registered comparisons need an even number of pairs, so the policy's
+        # own minimum must be a count the driver accepts.
+        self.assertEqual(policy["minimum_measured_pairs"] % 2, 0)
+        self.assertGreater(policy["minimum_bootstrap_samples"], 0)
+        self.assertGreater(
+            policy["maximum_confidence_interval_width_percentage_points"], 0
         )
         self.assertEqual(
-            self.benchmark.sha256_bytes(
-                self.benchmark.canonical_json_bytes(policy["workloads"])
-            ),
-            REGISTERED_WORKLOADS_CONTRACT_SHA256,
+            policy["contention"]["kind"], self.benchmark.CONTENTION_POLICY_KIND
         )
-        self.assertEqual(
-            set(policy["workloads"]),
-            {
-                "compiler-suite",
-                "compiler-suite-baseline",
-                "doctest",
-                "leak",
-                "many-tiny-compatible",
-                "mixed-isolation",
-                "oversized-plus-small",
-                "runtime-types",
-                "sanitizer",
-                "shared-import-fanout",
-                "std-dict",
-                "tiny-suite",
-            },
-        )
-        self.assertEqual(policy["workloads"]["tiny-suite"]["kind"], "comparison")
-        self.assertEqual(
-            policy["workloads"]["shared-import-fanout"]["kind"],
-            "characterization",
-        )
-        self.assertEqual(
-            policy["workloads"]["tiny-suite"]["command_arguments"],
-            [
-                "test",
-                "--timeout",
-                "30",
-                "blorp/test/runtime/types/test_bool.brp",
-            ],
-        )
-        self.assertEqual(
-            policy["workloads"]["tiny-suite"]["metric"],
-            "elapsed_paired_95_percent_ci",
-        )
-        self.assertEqual(
-            policy["workloads"]["compiler-suite"]["metric"],
-            "sampled_peak_rss_paired_95_percent_ci",
-        )
-        fanout = policy["workloads"]["shared-import-fanout"]
-        self.assertEqual(
-            fanout["command_arguments"][-8:],
-            [
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_01.brp",
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_02.brp",
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_03.brp",
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_04.brp",
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_05.brp",
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_06.brp",
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_07.brp",
-                "benchmarks/fixtures/blorp_test_session/shared_import_fanout/suite_08.brp",
-            ],
-        )
-        self.assertEqual(fanout["measured_pairs"], 3)
-        self.assertEqual(fanout["warmup_pairs"], 1)
-        self.assertEqual(fanout["cache_state"], "isolated-warm")
-        runtime_types = policy["workloads"]["runtime-types"]
-        self.assertEqual(
-            runtime_types["command_arguments"][-8:],
-            [
-                "blorp/test/runtime/types/test_alloc_safety.brp",
-                "blorp/test/runtime/types/test_option_result.brp",
-                "blorp/test/runtime/types/test_record_cow.brp",
-                "blorp/test/runtime/types/test_record_update.brp",
-                "blorp/test/runtime/types/test_result.brp",
-                "blorp/test/runtime/types/test_struct.brp",
-                "blorp/test/runtime/types/test_tuples_and_records.brp",
-                "blorp/test/runtime/types/test_variant_alloc.brp",
-            ],
-        )
-        self.assertEqual(
-            runtime_types["fingerprint_inputs"],
-            runtime_types["command_arguments"][-8:],
-        )
-        for workload in policy["workloads"].values():
-            if workload["kind"] != "characterization":
-                continue
-            for input_path in workload["fingerprint_inputs"]:
-                self.assertTrue((ROOT / input_path).exists(), input_path)
+
+    def test_every_registered_workload_is_runnable_and_self_consistent(self) -> None:
+        policy = self.benchmark.load_benchmark_policy(POLICY)
+        self.assertTrue(policy["workloads"])
+
+        for name, workload in policy["workloads"].items():
+            with self.subTest(workload=name):
+                self.assertTrue(name)
+                self.assertTrue(workload["command_arguments"])
+                kind = self.benchmark.RegisteredWorkloadKind(workload["kind"])
+                if kind is self.benchmark.RegisteredWorkloadKind.COMPARISON:
+                    self.assertIn(
+                        workload["metric"],
+                        self.benchmark.REGISTERED_COMPARISON_METRICS,
+                    )
+                    measured_pairs = policy["minimum_measured_pairs"]
+                    timeout_seconds = 0.0
+                    fingerprint_inputs: tuple[Path, ...] = ()
+                else:
+                    measured_pairs = workload["measured_pairs"]
+                    timeout_seconds = float(workload["timeout_seconds"])
+                    fingerprint_inputs = tuple(
+                        Path(path) for path in workload["fingerprint_inputs"]
+                    )
+                    for input_path in workload["fingerprint_inputs"]:
+                        self.assertTrue((ROOT / input_path).exists(), input_path)
+                # The driver accepts a run that uses exactly the registered
+                # command, cache state, warmups and inputs.
+                accepted_kind, accepted = self.benchmark.validate_registered_workload(
+                    policy,
+                    workload_name=name,
+                    candidate_present=kind
+                    is self.benchmark.RegisteredWorkloadKind.COMPARISON,
+                    command_arguments=tuple(workload["command_arguments"]),
+                    cache_state=workload["cache_state"],
+                    warmup_pairs=workload["warmup_pairs"],
+                    measured_pairs=measured_pairs,
+                    timeout_seconds=timeout_seconds,
+                    bootstrap_samples=policy["minimum_bootstrap_samples"],
+                    fingerprint_inputs=fingerprint_inputs,
+                )
+                self.assertEqual(accepted_kind, kind)
+                self.assertEqual(accepted, workload)
 
     def test_registered_characterization_validation_is_exact(self) -> None:
         policy = self.benchmark.load_benchmark_policy(POLICY)
@@ -963,16 +929,24 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
         )
 
     def test_compatible_characterization_workloads_run_as_one_harness(self) -> None:
+        policy = self.benchmark.load_benchmark_policy(POLICY)
         for workload_name in ("shared-import-fanout", "runtime-types"):
             with self.subTest(workload_name=workload_name):
                 counters = self.run_characterization_workload_once(workload_name)
-                self.assertEqual(counters["discovered_runnable_files"], 8)
-                self.assertEqual(counters["declared_test_suites"], 8)
+                suite_count = sum(
+                    argument.endswith(".brp")
+                    for argument in policy["workloads"][workload_name][
+                        "command_arguments"
+                    ]
+                )
+                self.assertGreater(suite_count, 1)
+                self.assertEqual(counters["discovered_runnable_files"], suite_count)
+                self.assertEqual(counters["declared_test_suites"], suite_count)
                 self.assertEqual(
                     counters["planned_aggregate_suite_harnesses"],
                     1,
                 )
-                self.assertEqual(counters["planned_combined_suite_files"], 8)
+                self.assertEqual(counters["planned_combined_suite_files"], suite_count)
                 self.assertEqual(
                     counters["planned_combined_native_executions"],
                     1,
@@ -982,17 +956,20 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
     def test_policy_schema_and_registered_workload_validation_fail_closed(self) -> None:
         policy = self.benchmark.load_benchmark_policy(POLICY)
         tiny = policy["workloads"]["tiny-suite"]
+        minimum_pairs = policy["minimum_measured_pairs"]
+        self.assertEqual(minimum_pairs % 2, 0)  # `minimum_pairs + 1` below must be odd
+        minimum_bootstrap_samples = policy["minimum_bootstrap_samples"]
 
         selected = self.benchmark.validate_registered_workload(
             policy,
             workload_name="tiny-suite",
             candidate_present=True,
             command_arguments=tuple(tiny["command_arguments"]),
-            cache_state="isolated-warm",
-            warmup_pairs=1,
-            measured_pairs=10,
+            cache_state=tiny["cache_state"],
+            warmup_pairs=tiny["warmup_pairs"],
+            measured_pairs=minimum_pairs,
             timeout_seconds=1800.0,
-            bootstrap_samples=10_000,
+            bootstrap_samples=minimum_bootstrap_samples,
             fingerprint_inputs=(),
         )
         self.assertEqual(selected[0].value, "comparison")
@@ -1003,19 +980,22 @@ class BlorpTestSessionBenchmarkTests(unittest.TestCase):
             ({"command_arguments": ("test", "different.brp")}, "command arguments"),
             ({"cache_state": "isolated-cold"}, "cache state"),
             ({"warmup_pairs": 0}, "warmup"),
-            ({"measured_pairs": 9}, "measured pairs"),
-            ({"measured_pairs": 11}, "even number"),
-            ({"bootstrap_samples": 9_999}, "bootstrap samples"),
+            ({"measured_pairs": minimum_pairs - 1}, "measured pairs"),
+            ({"measured_pairs": minimum_pairs + 1}, "even number"),
+            (
+                {"bootstrap_samples": minimum_bootstrap_samples - 1},
+                "bootstrap samples",
+            ),
         )
         valid = {
             "workload_name": "tiny-suite",
             "candidate_present": True,
             "command_arguments": tuple(tiny["command_arguments"]),
-            "cache_state": "isolated-warm",
-            "warmup_pairs": 1,
-            "measured_pairs": 10,
+            "cache_state": tiny["cache_state"],
+            "warmup_pairs": tiny["warmup_pairs"],
+            "measured_pairs": minimum_pairs,
             "timeout_seconds": 1800.0,
-            "bootstrap_samples": 10_000,
+            "bootstrap_samples": minimum_bootstrap_samples,
             "fingerprint_inputs": (),
         }
         for overrides, message in invalid_cases:

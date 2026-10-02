@@ -10,6 +10,72 @@ phase_start=$(date +%s)
 phase() { echo "LAND_PHASE $1 $(( $(date +%s) - phase_start ))s"; phase_start=$(date +%s); }
 verdict_status() { grep '^BLORP_GATE_RESULT ' | tail -1 | sed -n 's/.*status=\([A-Z]*\).*/\1/p'; }
 emit_verdict() { printf 'BLORP_GATE_RESULT gate=land status=%s passed=%s failed=%s tests=1\n' "$1" "$2" "$3"; }
+# Repository inputs that the benchmark policy fingerprints, one per line. The
+# benchmark-tooling suites check that each exists and run the compiler's test
+# session over some of them, so a change to one can break them. The whole
+# blorp/test/compiler suite is left out: only the compiler-suite baseline
+# fingerprints it, no benchmark-tooling suite runs it, and it cannot go
+# missing, but it changes in nearly every compiler landing.
+benchmark_policy_inputs() {
+    python3 -c '
+import json, sys
+policy = json.load(open(sys.argv[1], encoding="utf-8"))
+for workload in policy["workloads"].values():
+    for path in workload.get("fingerprint_inputs", []):
+        if path != "blorp/test/compiler":
+            print(path)
+' benchmarks/blorp_test_session_policy.json
+}
+
+# Reads changed paths on stdin and the policy inputs (newline-separated) as $1;
+# succeeds when any path is an input of `make benchmark-tooling-check`. Every
+# input those suites read must be listed here, so a landing that can turn CI's
+# Quality lane red on them runs them locally first:
+#   - the benchmark scripts and workers, and the wrappers the session
+#     benchmark tests drive (scripts/with-build-lock, with-compiler-contention-lease);
+#   - the compiler modules the benchmark workers and request generator import,
+#     the Core IR tags the Perceus benchmark vocabulary tracks, and the test
+#     session (blorp/src/test) that the session benchmark runs;
+#   - the benchmark policy's fingerprinted test and library inputs;
+#   - the test files themselves.
+# Recorded measurements under benchmarks/results/ are data, not tooling, so a
+# landing that only adds one does not count. The workers' C include directories
+# are only passed through to fixtures in temporary roots, so they are not inputs.
+touches_benchmark_tooling() {
+    local policy_inputs="$1" path input
+    while IFS= read -r path; do
+        case "$path" in
+            benchmarks/results/*) continue ;;
+            benchmarks/*|blorp/benchmark/*|scripts/bench-*) return 0 ;;
+            scripts/with-build-lock|scripts/with-compiler-contention-lease) return 0 ;;
+            blorp/src/test/*) return 0 ;;
+            blorp/src/compiler/bridge_protocol.brp|\
+            blorp/src/compiler/stage_06_typecheck/bridge.brp|\
+            blorp/src/compiler/stage_06_typecheck/trace.brp|\
+            blorp/src/compiler/stage_09_core/ir.brp|\
+            blorp/src/compiler/stage_09_core/function_origin_fixture.brp|\
+            blorp/src/compiler/stage_09_core/perceus.brp|\
+            blorp/src/compiler/stage_09_core/pipeline.brp|\
+            blorp/src/compiler/stage_10_backend/emit.brp|\
+            blorp/src/lib/build_artifact.brp|\
+            blorp/src/lib/function_profile.brp) return 0 ;;
+            blorp/test/compiler/benchmark/test_backend_memory.py|\
+            blorp/test/compiler/benchmark/test_perceus_memory.py|\
+            blorp/test/compiler/benchmark/test_typecheck_memory.py|\
+            blorp/test/compiler/benchmark/test_record_layout.sh|\
+            blorp/test/compiler/stage_06_typecheck/support/test_worker.py|\
+            blorp/test/compiler/stage_06_typecheck/support/test_replay.py|\
+            blorp/test/test/test_session_benchmark.py|\
+            blorp/test/build/test_memory_diagnostics_harness.py) return 0 ;;
+        esac
+        while IFS= read -r input; do
+            if [ -n "$input" ] && { [ "$path" = "$input" ] || [ "${path#"$input"/}" != "$path" ]; }; then
+                return 0
+            fi
+        done <<<"$policy_inputs"
+    done
+    return 1
+}
 usage() {
     echo "Usage: scripts/land <commit-or-branch> --title TITLE [--body TEXT]" >&2
     echo "  [--record JSON --record-name FILE] [--gate GATE]... [--dry-run]" >&2
@@ -127,7 +193,9 @@ phase build
 # reach main through a gate that does not select it. The tooling suites
 # (`make tooling-check`) run on every landing too: they audit compiler, runtime
 # and script sources, so a change anywhere can break them, and CI's Quality
-# lane runs them.
+# lane runs them. The suites that test benchmark tooling take minutes, so they
+# run only when the landing touches an input they read (see
+# touches_benchmark_tooling); CI's Quality lane runs them on every push.
 overall="PASS"
 if ! make hygiene-check; then
     echo "hygiene-check failed" >&2
@@ -140,6 +208,22 @@ if ! make tooling-check; then
     overall="FAIL"
 fi
 phase tooling
+
+# Read the file list into a variable first: the function returns at the first
+# match, and under pipefail a closed pipe would fail a pipeline spuriously.
+# --no-renames lists both sides of a move, so moving a file out of an input
+# directory counts as touching it.
+landed_paths="$(git diff --name-only --no-renames origin/main HEAD)"
+policy_inputs="$(benchmark_policy_inputs)"
+if touches_benchmark_tooling "$policy_inputs" <<<"$landed_paths"; then
+    if ! make benchmark-tooling-check; then
+        echo "benchmark-tooling-check failed" >&2
+        overall="FAIL"
+    fi
+else
+    echo "benchmark-tooling-check skipped: no input of the benchmark tooling suites changed"
+fi
+phase benchmark-tooling
 
 result="$(scripts/compiler-check --changed --base origin/main | tee /dev/stderr || true)"
 [ "$(printf '%s\n' "$result" | verdict_status)" = "PASS" ] || overall="FAIL"
