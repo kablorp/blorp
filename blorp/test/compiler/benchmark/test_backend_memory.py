@@ -107,14 +107,17 @@ child_pid = os.fork()
 if child_pid == 0:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, survive_sigterm)
+    # Record the pid before announcing the start: a test that sees `started`
+    # may stop the process group at once, before the parent could write it.
+    # The rename keeps readers from seeing a partly written pid.
+    child_pid_path = Path(os.environ["BLORP_FAKE_BRIDGE_CHILD_PID"])
+    partial_pid_path = child_pid_path.with_name(child_pid_path.name + ".partial")
+    partial_pid_path.write_text(str(os.getpid()), encoding="utf-8")
+    os.replace(partial_pid_path, child_pid_path)
     started.write_text("started", encoding="utf-8")
     time.sleep(5)
     os._exit(0)
 
-Path(os.environ["BLORP_FAKE_BRIDGE_CHILD_PID"]).write_text(
-    str(child_pid),
-    encoding="utf-8",
-)
 while not started.exists():
     time.sleep(0.01)
 if os.environ.get("BLORP_FAKE_BRIDGE_PARENT_EXIT") == "1":
