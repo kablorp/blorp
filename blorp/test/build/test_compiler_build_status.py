@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -188,6 +189,8 @@ class CompilerBuildStatusTests(unittest.TestCase):
 	def detect_bootstrap_target(self) -> str:
 		if sys.platform == "darwin":
 			return "aarch64-apple-darwin"
+		if platform.machine() in {"aarch64", "arm64"}:
+			return "aarch64-unknown-linux-gnu"
 		return "x86_64-unknown-linux-gnu"
 
 	def recipe_hash(self, start: str, end: str) -> str:
