@@ -3,7 +3,7 @@
 Date: 2026-09-28. Read-only catalog; no compiler source changes. It is the
 "after" view of
 [`name_text_inspection_census_2026-09-28.md`](name_text_inspection_census_2026-09-28.md)
-and feeds the tidy-up briefs for [`docs/CORE_ID_MIGRATION.md`](../../docs/CORE_ID_MIGRATION.md).
+and feeds the tidy-up briefs for the retired identity plan (see Git history).
 
 Base: `origin/main` `5e567133c`, which contains `b6928bb05` (compilation
 `NameTable`), `0b17137aa` (`ParsedIdentifier.name`), `c6add3a92`
@@ -92,7 +92,7 @@ The dead code is in **data fields and derived strings**, not helper functions.
 | D6 | `CoreUnionVariant.c_name` / `tag_c_name`, `CoreEnumVariant.c_name`, `CoreUnionConstruct.constructor_c_name`, `reuse_constructor_c_name`, `CoreOperationErrorCase.constructor_c_name` (164 `constructor_name` references), `TAG_<type>_<variant>` (3 producers: `lower.brp:6318`, `flatten.brp:3343`, `mono_data.brp:858`; a fourth spelling at `emit.brp:25088`). | Variants projected through `c_symbol_projection` like callables. Each variant already has a `def_id`. Not in flight. |
 | D7 | `dim_var_name_without_sigil` (`decl.brp:2707`, `infer.brp:8031`), `is_dim_var_name` (44 uses in stage 06, `mono.brp:367 starts_with("#")`, `type_policy`). | `SemanticTypeVar` gains an explicit kind (its own doc comment names this). |
 | D8 | `ParsedIdentifier.text` (675 readers in stages 03/04/06, 103 more in 07/08). | Typecheck and lowering read through the table (`typecheck/source-name-table-view` is the first consumer); diagnostics and the formatter render via `name_spelling(table, id)`. |
-| D9 | Core type identity as `String` (`NamedType`, `HeapRecordType`, `UnionType`, `EnumType`, `ValueRecordType`, `TypeParameterType`: 1,000+ constructor/pattern sites) and the `Dict[String, CoreHeapRecordDecl]` family (30 + 20 + 20 + ...). | Type interning (`docs/TYPE_INTERNING_ROADMAP.md`). Not a name-id tidy-up; listed so nobody starts it here. |
+| D9 | Core type identity as `String` (`NamedType`, `HeapRecordType`, `UnionType`, `EnumType`, `ValueRecordType`, `TypeParameterType`: 1,000+ constructor/pattern sites) and the `Dict[String, CoreHeapRecordDecl]` family (30 + 20 + 20 + ...). | Type interning (`docs/IDENTITY_ROADMAP.md`, "Type identity and interning"). Not a name-id tidy-up; listed so nobody starts it here. |
 
 ### Must stay (and why)
 

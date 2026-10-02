@@ -1,9 +1,9 @@
 # Name-text inspection census
 
 Date: 2026-09-28. Read-only measurement pass feeding
-[`docs/CORE_ID_MIGRATION.md`](../../docs/CORE_ID_MIGRATION.md) step A0/C0a
+the retired identity plan (see Git history) step A0/C0a
 (the identity-first migration) and grounded in
-[`docs/FRONTEND_FACTS_ROADMAP.md`](../../docs/FRONTEND_FACTS_ROADMAP.md) T3
+the retired identity plan (see Git history) T3
 (name interning at the lexer). No compiler source changes in this commit.
 
 Compiler commit: `8486ff7b2ae0` (`origin/main`, clean). `bin/blorp --version`:
@@ -152,21 +152,21 @@ Compiler commit: `8486ff7b2ae0` (`origin/main`, clean). `bin/blorp --version`:
   Slices 1-4 have no shared files and no shim dependency: they are
   semantics-preserving refactors that collapse today's ad hoc string
   surgery into one named accessor per concept, which is exactly the
-  "moving deletion frontier" `docs/CORE_ID_MIGRATION.md` describes and can
+  "moving deletion frontier" the retired identity plan (see Git history) describes and can
   land independently of when the id-carrying `ParsedIdentifier` change
   happens. Slice 5 needs slice 6 first. Slice 7 needs coordination with
   whoever touches `c_symbol_projection.brp` next (same file family as the
   landed short-symbol work). Slice 8 is the actual `CoreVar`/binder
-  representation change from `docs/CORE_ID_MIGRATION.md`'s C8 and should
+  representation change from the retired identity plan's C8 and should
   not start until the others reduce the surrounding parse-back surface.
 
 ## Method
 
 1. `make` (`-O0` CLI link); `bin/blorp --version` and
    `scripts/compiler-build-status` confirmed FRESH at `8486ff7b2ae0`.
-2. Read `docs/WORKER_CHECKLIST.md`, `docs/CORE_ID_MIGRATION.md` (full A0/A1
+2. Read `docs/WORKER_CHECKLIST.md`, the retired identity plan (see Git history) (full A0/A1
    sections and the identity vocabulary table), and
-   `docs/FRONTEND_FACTS_ROADMAP.md` T3's section and its 2026-09-24 status
+   the retired identity plan (see Git history) T3's section and its 2026-09-24 status
    row (`perf/lexer-token-struct`, "parked").
 3. Grepped `blorp/src/compiler` (by `stage_02_lex` .. `stage_10_backend`),
    `blorp/src/lsp`, `blorp/src/lib`, and `standard_library/src` per class;
@@ -178,7 +178,7 @@ Compiler commit: `8486ff7b2ae0` (`origin/main`, clean). `bin/blorp --version`:
    `__def_N_...`/`__mono_...` identifier text, not prefix-check call sites;
    the real `starts_with("__")` call-site count is 1).
 4. Cross-checked the `Dict[String`/`Set[String]` per-stage counts against
-   `docs/CORE_ID_MIGRATION.md`'s stated 2026-09 baseline (120/63/185/231 for
+   the retired identity plan's stated 2026-09 baseline (120/63/185/231 for
    typecheck/core-lowering/core/backend at `afc4dcfd`) to confirm the
    codebase has not drifted materially since that census (see table 1
    below — typecheck and core-lowering are unchanged, Core is +1, backend
@@ -244,7 +244,7 @@ the smaller, fully-classified counts (`== "main"` 4, `== "_"` 34, `==
 | 5 | `c_type_name` call sites | 140 | |
 | 5 | `c_identifier` call sites | 43 | |
 | 5 | `c_field_name` call sites | 15 | |
-| 6 | files mentioning `CoreVar` | 50 | matches `docs/CORE_ID_MIGRATION.md`'s stated count exactly — no drift |
+| 6 | files mentioning `CoreVar` | 50 | matches the retired identity plan's stated count exactly — no drift |
 | 7 | `EXPECT-C`-bearing fixtures | 214 | across `blorp/test/compiler` |
 
 ## 2. T3 (lexer name interning) landed vs. not landed
@@ -261,7 +261,7 @@ the smaller, fully-classified counts (`== "main"` 4, `== "_"` 34, `==
 Net: T3's *lexer* half is done and already paid its bug ("Perceus's
 `protect_repeated_consumes` had no `LiteralMatchExpr` arm" — a genuine
 compiler bug found in the same window, not a T3 defect, and fixed
-separately per `docs/FRONTEND_FACTS_ROADMAP.md`'s row). The *parser-onward*
+separately per the retired identity plan's row). The *parser-onward*
 half — the actual "every consumer keys on the id" conversion this migration
 needs — has not been attempted, so every class in this census still applies
 to the current source, not to a hypothetical pre-T3 state.

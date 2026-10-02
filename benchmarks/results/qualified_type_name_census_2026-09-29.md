@@ -2,8 +2,8 @@
 
 Base: `origin/main` c47e62f23. Docs only; nothing was built or measured.
 Supersedes the F12 paragraph of `magic_spelling_census_2026-09-28.md` for
-planning; the slice plan is the "M5.3 slices" section of
-`docs/NAME_MANGLING_REMOVAL_ROADMAP.md`.
+planning; the slice plan is the "Qualified type names" section of
+`docs/IDENTITY_ROADMAP.md`.
 
 Method: `grep -rnE '"[a-z_]+(::|__)[A-Z][A-Za-z]*"'` over `blorp/src` gives 95
 literal lines (the older census said 98 by also matching `net/tcp::` forms
@@ -129,7 +129,7 @@ Conclusions:
 2. No phase carries `DefinitionId` or `ModuleId` on a type reference, so
    "compare pinned type identities" needs a representation change first
    (slices Q3 and Q4), and that change is the named-types family of
-   `CORE_ID_MIGRATION.md` A10 (item 1, `TypeId`).
+   `docs/IDENTITY_ROADMAP.md` ("Nominal types and members", named types: `TypeId`).
 3. Pinned identities are not `DefinitionId` literals: `DefinitionId` is an
    artifact-local number. The pin is `(std module origin, NameId)`
    resolved to a `KnownStdlibType` once per declaration (a per-declaration

@@ -1,6 +1,6 @@
 # Perceus engine allocation attribution (2026-09-22)
 
-Issue P0 of `docs/PERCEUS_CLEANUP_ISSUES.md`: allocation-free, opt-in,
+Issue P0 of the Perceus cleanup issues (completed; `docs/PERCEUS_CLEANUP_ISSUES.md` now holds only the open ones): allocation-free, opt-in,
 C-side counters inside the Perceus drop-insertion engine, so the roughly
 59-60M allocations of `pass_perceus_complete` on the self-compile are
 attributed by Core node kind and by named helper instead of the 94%
@@ -18,7 +18,7 @@ Measurement only; no production code path changed (confirmed below with
   of the pass's 60,823,087 allocations. `PerceusResolvedValueIndex` is
   rebuilt (not just queried) 137,953 times. This does not clear P3's
   allocation-share gate on its own; P3's other starting condition (step 1 of
-  `CORE_ID_MIGRATION.md` landing, which would make `id` unique per binder)
+  the retired identity plan (see Git history) landing, which would make `id` unique per binder)
   is independent of this measurement and not evaluated here.
 - **P4 (frame constructions above 5%?).** No. `PerceusInsertBindingFrameStack`
   is pushed **269,077** times across the walk. Its own docstring's

@@ -36,10 +36,9 @@ changes.
    every one of the 16,920 distinct `brp_*` symbols in the file has exactly
    one `static ... brp_NNN(...);` prototype and exactly one `... brp_NNN(...)
    {` definition (confirmed: prototype count, unique symbol count, and
-   `{`/`}`-balanced definition count are all 16,920). Prior census reports
-   (`docs/PER_NODE_CODEGEN_ROADMAP.md`, main `fbd2cde37`, 97 MB / 1.42M lines
-   / 15,141 functions) used the same convention; the artifact has grown
-   ~16.9 MB / 157K lines / 1,779 functions since then.
+   `{`/`}`-balanced definition count are all 16,920). The earlier census
+   (main `fbd2cde37`, 97 MB / 1.42M lines / 15,141 functions) used the same convention;
+   the artifact has grown ~16.9 MB / 157K lines / 1,779 functions since then.
 
 Caveat on overlap: categories 1-5 and 8-9 are close to a mutually exclusive
 line partition (a line rarely matches two of them). Categories 6 (identifiers)
@@ -187,8 +186,7 @@ destructor's *shape*.
 | `break;` | 4,336 | ~47,700 |
 
 No `goto` anywhere in the artifact (`grep -c 'goto '` = 0) — every union
-match compiles to an `if`/`else if`/`else` chain (see the code sample in
-`docs/PER_NODE_CODEGEN_ROADMAP.md`'s Pattern C), not a jump table, and the
+match compiles to an `if`/`else if`/`else` chain (not a jump table), and the
 "labels" that showed up in an early grep pass turned out to be `default:`
 inside the 800 `switch` shells (used for literal/enum dispatch), not
 control-flow labels.

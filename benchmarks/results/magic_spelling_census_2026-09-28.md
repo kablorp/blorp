@@ -1,6 +1,6 @@
 # Magic-spelling census
 
-Date: 2026-09-28. Roadmap step A3.0 (`docs/NAME_ID_ROADMAP.md` on
+Date: 2026-09-28. Roadmap step A3.0 (the retired identity plan, see Git history on
 `docs/name-id-roadmap`). Read-only pass over `blorp/src` at `origin/main`
 `6c9f72c62`, refreshed after D6 (`c19c3392a`, variant symbols from definition ids); no compiler source changed. Line numbers are for that commit.
 Folds in `name_text_inspection_census_2026-09-28.md` and sections 2 and 5 of

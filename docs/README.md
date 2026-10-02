@@ -1,9 +1,9 @@
 # Blorp Documentation
 
 The references below describe the current language, toolchain, and
-implementation. The short priorities map and issue index describe future
-work. Completed implementation history belongs in Git history and benchmark
-results, not in maintained docs.
+implementation. The priorities map, the plans and the open issues describe
+future work and hold only what is still open. Completed implementation history
+belongs in Git history and benchmark results, not in maintained docs.
 
 ## Learn The Language
 
@@ -45,44 +45,63 @@ module inventory lives in
 
 - [Diagnostic Gaps](DIAGNOSTIC_GAPS.md) is the living ledger of weak compiler
   diagnostics ranked by return on investment; add an entry when you meet one.
+Plans hold only open work: completed steps, measurements and rejected
+experiments live in Git history and `benchmarks/results/`.
+
 - [Compiler Priorities](COMPILER_PRIORITIES.md) is the short cross-cutting
-  outcomes map.
-- [Compiler Speed Roadmap](COMPILER_SPEED_ROADMAP.md) is the task-level
-  plan for the next rounds of compiler speed work.
-- [Per-Node Codegen Roadmap](PER_NODE_CODEGEN_ROADMAP.md) is the task-level
-  plan for cutting the per-node cost of generated C (reference counting,
-  cleanup frames, runtime calls), with the stage-2 measurement rule.
+  outcomes map and the rules for the next round of speed work.
+- [`issues/`](issues/) holds the open issues, one file each: reproduction,
+  cause and the change that closes it.
+- [Compiler Speed Roadmap](COMPILER_SPEED_ROADMAP.md) lists the open
+  compiler-speed items (production invariant walks, late-Core walk fusion,
+  cancellation re-analysis) and the working rules for profiling them.
+- [Per-Node Codegen Roadmap](PER_NODE_CODEGEN_ROADMAP.md) lists the open work
+  on the per-node cost of generated C (reference counting, cleanup frames,
+  out-of-line runtime calls) and points at the stage-2 measurement rule.
+- [Identity And Tables Roadmap](IDENTITY_ROADMAP.md) is the one plan for names
+  to ids, retiring magic spellings, emission by id, value identity through the
+  front end and Core, type identity and interning, Core node tables and
+  frontend facts, with each step's oracle and the interim states still on main.
+- [Struct Payload Roadmap](STRUCT_PAYLOAD_ROADMAP.md) lists the open steps for
+  keeping struct values inline in unions, tuples and dictionaries, and
+  converting hot records to structs.
 - [Allocation Contract Roadmap](ALLOCATION_CONTRACT_ROADMAP.md) proposes
   allocation explanations and a compile-time `no_alloc` block, including
   runtime/cleanup coverage, Core analysis, and tooling enforcement.
-- [Frontend Facts Roadmap](FRONTEND_FACTS_ROADMAP.md) is the task-level
-  plan for publishing each stage's facts as id-keyed tables (module,
-  name, definition tables) and removing threaded state from typecheck.
-- [`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) — discovery rebuilt to produce normalized tables of struct rows (node table, definition ids minted in discovery, packed spans); implemented under `blorp/src/compiler_new/stage_01_discovery/`, with the declaration half of the legacy adapter (`blorp/src/compiler/discovery_adapter.brp`) proved by a corpus differential and its body half pending.
-- [`DISCOVERY_REDESIGN.md`](DISCOVERY_REDESIGN.md) — proposed, for review: discovery as independent per-module parses into typed syntax trees with parser-stamped (module, local) ids, one link step and no freeze checks; the output contract with resolution, the cost ledger and the migration plan.
-- [`DISCOVERY_ACCEPTANCE_ROADMAP.md`](DISCOVERY_ACCEPTANCE_ROADMAP.md) — what must hold before the new discovery stage replaces the existing front end in compilation, and the eight ordered items to get there (implicit modules, a legacy adapter proved by a parsed-AST differential, complete inputs, rendered diagnostics, one switch point, the switch), and the plan to remove the old front end now that the stage is the default.
-- [`NAME_ID_ROADMAP.md`](NAME_ID_ROADMAP.md) — names become ids: Lane A (identifier text to `NameId` then `Int`, identical C) and Lane B (emission spelled from definition and binder ids, smaller C); the one tracked plan for the name-to-id work, superseding the catalog's task order.
-- [`NAME_MANGLING_REMOVAL_ROADMAP.md`](NAME_MANGLING_REMOVAL_ROADMAP.md) — Lane A step A3 expanded: `CoreFunctionOrigin` beside the name, instantiation-specific definition ids, readers moved one census family at a time, producers deleted last; binders, types and emitter temporaries follow; progress measured by the `check-magic-spellings` allowlist.
-- [`CORE_NODE_TABLE_ROADMAP.md`](CORE_NODE_TABLE_ROADMAP.md) — Core expressions get node ids and facts move into published id-keyed tables; steps N1-N6 (compact locations first), each with ROI, risks, oracle.
-- [`TYPE_INTERNING_ROADMAP.md`](TYPE_INTERNING_ROADMAP.md) — one type table per compilation, identity equality, mono and trait keys by type id, names last; steps I1-I7; extends Frontend Facts T3/T5/T6.
-- [`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md) — plan of record: tuples as multi-values with no heap form except in storage, consuming clones extended to tuple results, releases at last use and moves out of record fields; measurements, soundness, tests, increments and the owner's decisions.
-- [`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) — struct values inline in union payloads and closures (typed payload storage for source unions), then hot records become structs; steps S0-S5.
-- [`SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md`](SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md) — lexer/parser/discovery cuts (Task 4 landed; rest deferred), with its profile in `benchmarks/results/`.
-- [`TYPECHECK_OPTIMIZATION_ISSUES.md`](TYPECHECK_OPTIMIZATION_ISSUES.md) — five worker-ready typecheck issues (T-A..T-E) with anchors, fast loop, acceptance numbers.
-- [`CORE_ID_MIGRATION.md`](CORE_ID_MIGRATION.md) — compiler-wide ID-first migration from discovery through typecheck, Core, and emission; normalized logical tables, literate worker handoffs, A-stage/D-delivery/C-cut sequencing, typed identity domains, oracles, and stop rules.
-- [`PERCEUS_CLEANUP_ISSUES.md`](PERCEUS_CLEANUP_ISSUES.md) — worker-ready Perceus cleanup issues P0-P6 from the split observations; allocation floor rules.
+- [Discovery Acceptance Roadmap](DISCOVERY_ACCEPTANCE_ROADMAP.md) lists what
+  remains after the discovery stage became the default front end: the two
+  known parser differences, hardening, the adapter's shrinkage and the plan to
+  remove the old front end.
+- [Discovery Tables Design](DISCOVERY_TABLES_DESIGN.md) describes the
+  implemented discovery schema (node table, definition ids minted in
+  discovery, packed spans) under `blorp/src/compiler_new/stage_01_discovery/`.
+- [Discovery Redesign](DISCOVERY_REDESIGN.md) is a design for review:
+  discovery as independent per-module parses into typed syntax trees with
+  parser-stamped ids, one link step and no freeze checks.
+- [Perceus Cleanup Issues](PERCEUS_CLEANUP_ISSUES.md) lists the open
+  worker-ready Perceus cleanups and the allocation floor rules.
+- [Typecheck Optimization Issues](TYPECHECK_OPTIMIZATION_ISSUES.md) holds the
+  open typecheck allocation issue (module environment preparation) and the
+  rules the rejected cuts taught.
+- [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md)
+  is the plan of record for tuples as multi-values with no heap form except
+  in storage, and consuming clones extended to tuple results.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 
 ## Maintenance Rules
 
 - Reference docs describe current behavior, not migration history.
-- Active implementation status, assignees, and discussion belong in GitHub
-  issues. This tree holds no issue documents; a handoff that needs durable
-  acceptance criteria records them in the GitHub issue and its measurement in
-  `benchmarks/results/`.
+- Open issues are files in [`issues/`](issues/), one per issue and named for
+  the symptom: `Status: open`, the reproduction, the cause and the change that
+  closes it. A fixture that pins a known failure names its issue file. GitHub
+  is read-only for this project; assignees and discussion do not belong in this
+  tree.
+- A plan for active work lives in this directory and holds only open work.
+  When a step lands, delete it from the plan in the same change (Git history
+  keeps it), and delete the plan when nothing is open.
 - Put raw performance evidence in `benchmarks/results/` and link it from the
-  issue or change that uses it.
+  issue or plan that uses it.
 - Prefer generated inventories and `--help` output over copied file, command,
   flag, keyword, or declaration lists.
 - When implementation, tests, and docs disagree, verify the implementation and

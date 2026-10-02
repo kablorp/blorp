@@ -1,6 +1,6 @@
 # Trait identity census
 
-Date: 2026-09-29. Lane A step A2b (`docs/NAME_ID_ROADMAP.md`). Read-only census at
+Date: 2026-09-29. Lane A step A2b (the retired identity plan, see Git history). Read-only census at
 `origin/main` `fe8069579`; the Core `CoreImplMethodRole` facts come from the
 unlanded branch `core/m2-3-trait-method-readers-by-origin` (`177aae3a3`). No
 compiler source changed.

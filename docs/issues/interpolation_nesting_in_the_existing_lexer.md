@@ -1,6 +1,8 @@
 # The existing lexer cannot nest interpolation, keep braces in pipe strings or read character literals in a hole
 
-Status: open. Blocks roadmap criteria 1 and 6 for these inputs only.
+Status: open. Blocks the discovery acceptance roadmap's same-program criterion (the
+adapter's rebuilt parsed AST equals the old parser's) and one-syntax criterion (both
+parsers agree on every rule decidable from syntax) for these inputs only.
 
 The language lets an interpolated string hold, in a hole, another string with
 holes, to any depth (`docs/GUIDE.md`, `docs/GRAMMAR.md`). The existing lexer

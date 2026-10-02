@@ -1,9 +1,11 @@
 # Source Discovery Self-Compile Profile — 2026-09-20
 
-This is the retained exploratory evidence for the six workstreams in
-[`docs/SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md`](../../docs/SOURCE_DISCOVERY_PERFORMANCE_ROADMAP.md).
-It ranks mechanisms within one discovery-only profile; it is not a statistical
-runtime comparison or an acceptance baseline.
+This is the retained exploratory evidence for the six workstreams of a
+source-discovery performance plan for the old lexer and parser. That plan was
+retired when the discovery stage became the default front end; it is in Git
+history. It ranks mechanisms within one
+discovery-only profile; it is not a statistical runtime comparison or an
+acceptance baseline.
 
 ## Provenance
 

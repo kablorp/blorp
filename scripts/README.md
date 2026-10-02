@@ -481,7 +481,7 @@ scripts/audit-compiler-blorp-dead-code --module-identity-graph-dot
 
 Findings require owner review before deletion; the script intentionally does
 not fail the quality gate merely because cleanup remains queued. Track accepted
-cleanup work in GitHub issues rather than copying point-in-time counts into a
+cleanup work in `docs/issues/` rather than copying point-in-time counts into a
 maintained document.
 
 ### Compiler identity migration census

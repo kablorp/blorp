@@ -2905,7 +2905,7 @@ void blorp_perceus_engine_let_binding_managed_c(void) {
 }
 
 // ----------------------------------------------------------------------
-// P8 duplicate-summary census: identity-keyed tracking of external calls
+// Perceus duplicate-summary census: identity-keyed tracking of external calls
 // to summarize_linear_ownership_uses (perceus/uses.brp), scoped per
 // rebuild_managed_let invocation. "External" means entered while no other
 // call to summarize_linear_ownership_uses was already on this dedicated
@@ -2947,12 +2947,13 @@ static long __blorp_perceus_summary_external_repeated_calls = 0;
 static long __blorp_perceus_summary_repeated_inclusive_allocations = 0;
 
 // ----------------------------------------------------------------------
-// N3 second-attempt measurement (docs/CORE_NODE_TABLE_ROADMAP.md N3,
+// Second-attempt measurement of the Perceus summary memo (docs/IDENTITY_ROADMAP.md,
+// "Perceus summaries by node id",
 // worktree core/n3b-summary-entry-memo): a second, wider-scoped duplicate
-// check alongside the P8 census above. The census above resets its "seen"
+// check alongside the census above. The census above resets its "seen"
 // list per `rebuild_managed_let` invocation and keys on raw pointer
 // identity of `name`/`expr`; it found only 2.60% of the walk's own
-// allocations come from those repeats. The N3 memo design keys on
+// allocations come from those repeats. The summary memo design keys on
 // `(node id, variable name)` and would sit at the entry of
 // `summarize_linear_ownership_uses` for the whole function body, a wider
 // scope that also catches a node revisited by a *different* caller
@@ -2964,7 +2965,7 @@ static long __blorp_perceus_summary_repeated_inclusive_allocations = 0;
 // (`perceus_engine_summary_function_begin_c`, called from perceus.brp's
 // `rewrite_function`/`rewrite_global`) using a generation stamp on each
 // slot rather than a physical clear, so growth is the only allocation
-// (never observed by the oracle -- see the note on the P8 table above).
+// (never observed by the oracle -- see the note on the duplicate-summary table above).
 // `node_id == 0` (the `LetExpr`/`BorrowLetExpr`/`SeqExpr` wrappers with no
 // id of their own, or a synthetic location) is never treated as a hit,
 // matching the memo design's own "never memoizable" rule.

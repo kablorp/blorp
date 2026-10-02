@@ -1,6 +1,6 @@
 # Typecheck body-checking per-helper allocation ranking
 
-Date: 2026-09-22 (Issue T-F, `docs/TYPECHECK_OPTIMIZATION_ISSUES.md`)
+Date: 2026-09-22 (Issue T-F of the typecheck optimization issues, completed; the open work is in `docs/TYPECHECK_OPTIMIZATION_ISSUES.md`)
 
 Compiler commit: `71fa20899730e50f7d7562cb5192e8f9bf9a4ac1` (dirty worktree
 `typecheck-tf-td`, cut 1's runtime.c self-allocations counter applied).
@@ -160,7 +160,7 @@ rebuilds builtin tables per session.
 - `infer.brp` and `type_system/env.brp`/`semantic_type.brp`/
   `accepted_alias_authority.brp` dominate, consistent with the doc's own note
   ("body checking is 72%... the next typecheck lever is `Scope.symbols_by_name`
-  and the `env_add_*` tail-call chain" from `FRONTEND_FACTS_ROADMAP.md`).
+  and the `env_add_*` tail-call chain" from the retired identity plan (see Git history)).
   `scope_add_symbol`, `env_push_scope`, `env_add_var_with_module_details`,
   `env_mint_def_id`, `env_add_symbol`, `env_add_trait_function` together are
   1,887,107 self allocations (6.8% of `module_bodies` alone) — the T-B

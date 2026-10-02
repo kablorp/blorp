@@ -1,6 +1,6 @@
 # Perceus allocation attribution (2026-09-22)
 
-Step 0 of `docs/CORE_ID_MIGRATION.md`: a per-helper allocation profile of the
+Step 0 of the retired identity plan (see Git history): a per-helper allocation profile of the
 Perceus pass on the real frozen self-compile, to size steps 3 and 5.
 Measurement only; no production code changed (confirmed below with
 `--require-identical`).
