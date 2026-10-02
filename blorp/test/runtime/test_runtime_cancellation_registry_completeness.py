@@ -320,12 +320,15 @@ def build_augmented_source(runtime_src: str) -> str:
 
 
 class RuntimeCancellationRegistryCompletenessTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.runtime_src = RUNTIME_C.read_text()
-        self.clean = build_augmented_source(self.runtime_src)
-        self.funcs = find_function_definitions(self.clean)
-        self.reach = compute_reachable_set(self.clean, self.funcs)
-        self.registry = load_registry(CANCELLATION_PLAN.read_text())
+    # Parsing runtime.c and computing reachability is the whole cost of the
+    # suite, and every test only reads the results, so do it once per class.
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.runtime_src = RUNTIME_C.read_text()
+        cls.clean = build_augmented_source(cls.runtime_src)
+        cls.funcs = find_function_definitions(cls.clean)
+        cls.reach = compute_reachable_set(cls.clean, cls.funcs)
+        cls.registry = load_registry(CANCELLATION_PLAN.read_text())
 
     def test_runtime_has_expected_sink_definitions(self) -> None:
         # Every sink except the external `mco_yield` must be a real runtime.c

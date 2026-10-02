@@ -644,4 +644,9 @@ PY
     expect_exit "check package alias project" 0 "$BLORP_BIN" check --no-format "$package_project/app/main.brp"
     expect_exit "check package renamed alias project" 0 "$BLORP_BIN" check --no-format "$package_alias_project/app/main.brp"
 
+# The bundled pkg/ examples are compiled by no other gate; check needs no native libraries.
+expect_exit "check example pkg_compress_crypto" 0 "$BLORP_BIN" check --no-format examples/pkg_compress_crypto.brp
+expect_exit "check example pkg_network" 0 "$BLORP_BIN" check --no-format examples/pkg_network.brp
+expect_exit "check example pkg_sqlite" 0 "$BLORP_BIN" check --no-format examples/pkg_sqlite.brp
+
 finish

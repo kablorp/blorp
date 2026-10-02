@@ -7,7 +7,7 @@ project(blorp LANGUAGES NONE)
 find_program(MAKE_EXECUTABLE NAMES gmake make REQUIRED)
 
 set(BLORP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
-set(BLORP_BINARY "${BLORP_SOURCE_DIR}/blorp")
+set(BLORP_BINARY "${BLORP_SOURCE_DIR}/bin/blorp")
 
 add_custom_target(blorp
         ALL

@@ -558,6 +558,7 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_compiler_only_metrics.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_cooperative_checkpoint_contract.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_profile_dense_ids.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/runtime/test_runtime_cancellation_registry_completeness.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_cli_embedded_manifest.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_build_status.py
