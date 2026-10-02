@@ -252,13 +252,12 @@ pure func test_malformed_declarations_are_reported_and_recovered() -> Bool:
 	)
 
 
-MODULE_DOCSTRING_SOURCE: String = (
-	"---\nModule summary.\n---\nimport:\n\tlist: List\n\n\nfunc main() -> Int:\n\t0\n"
-)
+MODULE_DOCSTRING_SOURCE: String = "---\nModule summary.\n---\nimport:\n\tlist: List\n\n\nfunc main() -> Int:\n\t0\n"
 
 
 pure func test_docstring_before_the_first_import_block_is_the_module_documentation() -> Bool:
 	builder: DiscoveryBuilder = parsed(MODULE_DOCSTRING_SOURCE)
+
 	rows_ok: Bool = match builder.module_documentation.get(0):
 		Some(row):
 			text: String = builder.literals
@@ -281,6 +280,7 @@ pure func test_docstring_before_the_first_import_block_is_the_module_documentati
 pure func test_docstring_before_a_later_import_block_is_reported_at_the_docstring() -> Bool:
 	text: String = "import:\n\tlist: List\n\n---\nStray.\n---\nimport:\n\toption: Option\n"
 	builder: DiscoveryBuilder = parsed(text)
+
 	reported: Bool = match builder.diagnostics.get(0):
 		Some(row):
 			is_code: Bool = row.diagnostic.syntax_diagnostic_name() == "DocstringBeforeImportBlockDiagnostic"
@@ -292,7 +292,9 @@ pure func test_docstring_before_a_later_import_block_is_reported_at_the_docstrin
 
 
 pure func diagnostic_labels(text: String) -> List[String]:
-	parsed(text).diagnostics.map(
+	parsed(
+		text,
+	).diagnostics.map(
 		pure func(row): "${row.diagnostic.syntax_diagnostic_name()}@${row.span.span_start()}",
 	)
 
@@ -300,10 +302,9 @@ pure func diagnostic_labels(text: String) -> List[String]:
 pure func test_docstring_and_annotation_before_an_import_block_report_both() -> Bool:
 	-- Same order and positions as `bin/blorp check` (8:1 then 4:1).
 	text: String = "import:\n\tlist: List\n\n---\nStray.\n---\n@tail_recursive\nimport:\n\toption: Option\n"
-	diagnostic_labels(text) == [
-		"AnnotationWithoutFunctionDiagnostic@52",
-		"DocstringBeforeImportBlockDiagnostic@21",
-	]
+	diagnostic_labels(
+		text,
+	) == ["AnnotationWithoutFunctionDiagnostic@52", "DocstringBeforeImportBlockDiagnostic@21"]
 
 
 pure func test_docstring_before_pure_import_block_is_reported_at_the_docstring() -> Bool:
@@ -322,6 +323,7 @@ pure func test_docstring_before_a_function_is_not_module_documentation() -> Bool
 
 pure func test_a_second_module_documentation_row_for_a_module_is_reported() -> Bool:
 	builder: DiscoveryBuilder = parsed(MODULE_DOCSTRING_SOURCE)
+
 	duplicate: DiscoveryBuilder = match builder.module_documentation.get(0):
 		Some(row):
 			builder.append_module_documentation(row)
@@ -331,9 +333,9 @@ pure func test_a_second_module_documentation_row_for_a_module_is_reported() -> B
 	duplicate
 		.check_table_invariants(ALL_SEEDED_NAME_SPELLINGS)
 		.any(
-			pure func(found): (
-				found.kind == DuplicateSideRow and found.table == ModuleDocumentationTable
-			),
+			pure func(
+				found,
+			): found.kind == DuplicateSideRow and found.table == ModuleDocumentationTable,
 		)
 
 
@@ -419,9 +421,13 @@ pure func test_frozen_tables_read_the_qualifier_of_a_bound_or_supertrait() -> Bo
 
 			(
 				qualified_bound == Some("mm")
-				and tables.bound_qualifier(bound_id_at_row(1)).is_none()
+				and tables
+					.bound_qualifier(bound_id_at_row(1))
+					.is_none()
 				and qualified_supertrait == Some("mm")
-				and tables.supertrait_qualifier(supertrait_id_at_row(0)).is_none()
+				and tables
+					.supertrait_qualifier(supertrait_id_at_row(0))
+					.is_none()
 			)
 		TableInvariantsViolated(_):
 			False
@@ -432,9 +438,52 @@ pure func test_qualified_trait_reference_without_a_name_is_reported() -> Bool:
 	builder.diagnostics.length() > 0
 
 
+---
+The number of binder names each parameter of `text` holds, in order.
+---
+pure func binder_name_counts(text: String) -> List[Int]:
+	parsed(text).parameters.map(pure func(parameter): parameter.binder_names.count)
+
+
+pure func test_a_parameter_holds_the_binder_names_its_form_has() -> Bool:
+	-- A named binder holds one name (`_: T` the discard name), a wildcard none,
+	-- and a tuple the names written, even when that is more than the language
+	-- allows, which is reported.
+	text: String = "func f(a, _, (x, y, z), _: Int, (p, q), (m)):\n\t0\n"
+	binder_name_counts(text) == [1, 0, 3, 1, 2, 1] and parsed(text).diagnostics.length() == 1
+
+
+pure func test_ordinals_count_each_owners_rows_from_zero() -> Bool:
+	builder: DiscoveryBuilder = parsed(
+		"struct P { a: Int, b: Int }\nunion U:\n\tX(Int, Int)\n\tY\nfunc f[T: Eq + Ord, V: Eq](a, b):\n\t0\ntrait Q: Eq + Ord:\n\tfunc m(x)\n",
+	)
+	member_ordinals: List[Int] = builder.members.map(pure func(row): row.ordinal)
+	payload_ordinals: List[Int] = builder.variant_payloads.map(pure func(row): row.ordinal)
+	type_parameter_ordinals: List[Int] = builder.type_parameters.map(pure func(row): row.ordinal)
+	bound_ordinals: List[Int] = builder.bounds.map(pure func(row): row.parameter_ordinal)
+	supertrait_ordinals: List[Int] = builder.supertraits.map(pure func(row): row.ordinal)
+	parameter_ordinals: List[Int] = builder.parameters.map(pure func(row): row.ordinal)
+	(
+		member_ordinals == [0, 1, 0, 1, 0]
+		and payload_ordinals == [0, 1]
+		and type_parameter_ordinals == [0, 1]
+		and bound_ordinals == [0, 0, 1]
+		and supertrait_ordinals == [0, 1]
+		and parameter_ordinals == [0, 1, 0]
+	)
+
+
 tests: TestSuite = {
 	description = "Discovery declaration parser",
 	tests = [
+		(
+			"ordinals count each owner's rows from zero",
+			test_ordinals_count_each_owners_rows_from_zero,
+		),
+		(
+			"a parameter holds the binder names its form has",
+			test_a_parameter_holds_the_binder_names_its_form_has,
+		),
 		(
 			"function signatures type parameters and constraints",
 			test_function_signatures_type_parameters_and_constraints,

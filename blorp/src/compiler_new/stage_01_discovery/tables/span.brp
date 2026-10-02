@@ -1,9 +1,10 @@
 -- Packed source spans.
 --
--- A span is one Int: the source index in the high bits, then the start byte
+-- A span is one Int: the source's row number in the high bits, then the start byte
 -- offset, then the length in bytes. Discovery admits a source only when every
 -- span inside it fits (`source_fits_span_limits`), and refuses to admit more
--- sources than the source field can number (`source_index_fits_span`), so
+-- sources than the source field can number (`source_index_fits_span`, which keeps
+-- the last index for `NO_SPAN`), so
 -- packing never loses information for an admitted source.
 --
 -- The widths differ from the design sketch (20/24/19): a length field
@@ -12,6 +13,10 @@
 -- of hundreds of KiB (the embedded standard library). Start and length share
 -- one width, so any span inside an admitted source fits; the source field
 -- takes what remains of the 63 non-negative bits.
+import:
+	ids: SourceId, source_id_at_row, source_id_index
+
+
 ---
 A packed `(source, start, length)` triple. Built only by `pack_span`.
 ---
@@ -63,11 +68,36 @@ pure func power_of_two(exponent: Int) -> Int:
 
 
 ---
+The source index no admitted source has: the last one the source field holds,
+reserved so `NO_SPAN` lies in no source.
+---
+NO_SOURCE_INDEX: Int = SPAN_SOURCE_LIMIT - 1
+
+---
+How many sources one discovery can admit: every index the source field holds
+except `NO_SOURCE_INDEX`.
+---
+MAX_SOURCE_COUNT: Int = NO_SOURCE_INDEX
+
+---
+The source of `NO_SPAN`: no source a discovery admits.
+---
+NO_SOURCE: SourceId = source_id_at_row(NO_SOURCE_INDEX)
+
+---
+The span a lookup that cannot miss returns when it does: empty, in `NO_SOURCE`,
+so it is never the span of any byte of an admitted source. A row that stores it
+fails the freeze check (`SpanOutsideSources`).
+---
+NO_SPAN: Span = pack_span(NO_SOURCE, 0, 0)
+
+
+---
 Whether a source with index `source_index` can be admitted: its index must
-fit in the span's source field.
+fit in the span's source field and not be the reserved `NO_SOURCE_INDEX`.
 ---
 pure func source_index_fits_span(source_index: Int) -> Bool:
-	source_index >= 0 and source_index < SPAN_SOURCE_LIMIT
+	source_index >= 0 and source_index < MAX_SOURCE_COUNT
 
 
 ---
@@ -89,10 +119,12 @@ enum SpanOverflow:
 
 
 ---
-Packs the byte range `start .. end` of source `source_index`, or reports the
-field it does not fit; a range never wraps into another field's bits.
+Packs the byte range `start .. end` of `source`, or reports the field it does
+not fit; a range never wraps into another field's bits.
 ---
-pure func pack_checked_span(source_index: Int, start: Int, end: Int) -> Result[Span, SpanOverflow]:
+pure func pack_checked_span(source: SourceId, start: Int, end: Int) -> Result[Span, SpanOverflow]:
+	source_index: Int = source.source_id_index()
+
 	if not source_index_fits_span(source_index):
 		Err(SourceIndexOverflow)
 	else if start < 0 or start >= SPAN_OFFSET_LIMIT:
@@ -116,8 +148,8 @@ bypassed admission from wrapping into another field's bits. Use
 `pack_checked_span` where the range is not known to lie in an admitted
 source.
 ---
-pure func pack_span(source_index: Int, start: Int, end: Int) -> Span:
-	bounded_source: Int = clamp_to_field(source_index, SPAN_SOURCE_LIMIT)
+pure func pack_span(source: SourceId, start: Int, end: Int) -> Span:
+	bounded_source: Int = clamp_to_field(source.source_id_index(), SPAN_SOURCE_LIMIT)
 	bounded_start: Int = clamp_to_field(start, SPAN_OFFSET_LIMIT)
 	bounded_length: Int = clamp_to_field(end - bounded_start, SPAN_LENGTH_LIMIT)
 	into_opaque Span(
@@ -134,8 +166,11 @@ private pure func clamp_to_field(value: Int, limit: Int) -> Int:
 		value
 
 
-pure func span_source_index(span: Span) -> Int:
-	from_opaque Span(span) / SPAN_LENGTH_LIMIT / SPAN_OFFSET_LIMIT
+---
+The source a span lies in.
+---
+pure func span_source(span: Span) -> SourceId:
+	source_id_at_row(from_opaque Span(span) / SPAN_LENGTH_LIMIT / SPAN_OFFSET_LIMIT)
 
 
 pure func span_start(span: Span) -> Int:
@@ -155,7 +190,7 @@ The span from the start of `first` to the end of `last`; both must lie in
 one source.
 ---
 pure func span_covering(first: Span, last: Span) -> Span:
-	pack_span(first.span_source_index(), first.span_start(), last.span_end())
+	pack_span(first.span_source(), first.span_start(), last.span_end())
 
 
 pure func spans_equal(left: Span, right: Span) -> Bool:

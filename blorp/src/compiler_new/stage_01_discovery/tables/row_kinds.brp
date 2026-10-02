@@ -1,4 +1,8 @@
 -- Payload-free enums stored in discovery rows.
+import:
+	debug as dbg
+
+
 enum PackageKind:
 	NativePackage
 	SourcePackage
@@ -38,6 +42,117 @@ enum ImportRequestKind:
 	BareModuleRequest
 	RelativeModuleRequest
 	NativePackageRequest
+
+
+---
+An import request's kind together with, for a relative request, how many `../`
+it climbs. One value, so a bare or native package request cannot carry parent
+steps: it is built only by `bare_request`, `native_package_request` and
+`relative_request`, and read by `request_kind` and `request_parent_steps`.
+Struct rows cannot hold a union, so the three shapes share one `Int`
+(`BARE_REQUEST_CODE`, `NATIVE_PACKAGE_REQUEST_CODE`, then
+`FIRST_RELATIVE_REQUEST_CODE + parent_steps`), which only these functions see.
+---
+opaque type ImportRequestShape = Int
+
+---
+The code of a bare request.
+---
+BARE_REQUEST_CODE: Int = 0
+
+---
+The code of a native package request.
+---
+NATIVE_PACKAGE_REQUEST_CODE: Int = 1
+
+---
+The code of a relative request that climbs no parents (`./`); one more per
+`../`.
+---
+FIRST_RELATIVE_REQUEST_CODE: Int = 2
+
+
+---
+A request that names a module by bare path.
+---
+pure func bare_request() -> ImportRequestShape:
+	into_opaque ImportRequestShape(BARE_REQUEST_CODE)
+
+
+---
+A `pkg/...` request.
+---
+pure func native_package_request() -> ImportRequestShape:
+	into_opaque ImportRequestShape(NATIVE_PACKAGE_REQUEST_CODE)
+
+
+---
+A request relative to the importer's directory: `./` for no parent steps, then
+`../` once per step. A negative count is a defect in the caller: a debug build
+stops with the message, and a release build takes it as no steps.
+---
+pure func relative_request(parent_steps: Int) -> ImportRequestShape:
+	into_opaque ImportRequestShape(FIRST_RELATIVE_REQUEST_CODE + checked_steps(parent_steps))
+
+
+---
+`parent_steps`, or zero after a debug-build stop when it is negative.
+---
+private pure func checked_steps(parent_steps: Int) -> Int:
+	debug:
+		if parent_steps < 0:
+			dbg.error("an import request cannot climb a negative number of parent directories")
+
+	if parent_steps < 0:
+		0
+	else:
+		parent_steps
+
+
+pure func request_kind(shape: ImportRequestShape) -> ImportRequestKind:
+	code: Int = from_opaque ImportRequestShape(shape)
+
+	if code == BARE_REQUEST_CODE:
+		BareModuleRequest
+	else if code == NATIVE_PACKAGE_REQUEST_CODE:
+		NativePackageRequest
+	else:
+		RelativeModuleRequest
+
+
+---
+How many `../` a relative request climbs; zero for every other request.
+---
+pure func request_parent_steps(shape: ImportRequestShape) -> Int:
+	code: Int = from_opaque ImportRequestShape(shape)
+
+	if code < FIRST_RELATIVE_REQUEST_CODE:
+		0
+	else:
+		code - FIRST_RELATIVE_REQUEST_CODE
+
+
+---
+The text an import request is written as, built from its shape and path parts:
+a relative request is `./` (no parent steps) or `../` once per step, then the
+parts joined by `/`; a bare or native package request is its parts joined by
+`/`.
+---
+pure func written_import_request(shape: ImportRequestShape, parts: List[String]) -> String:
+	joined: String = parts.join("/")
+
+	match shape.request_kind():
+		RelativeModuleRequest:
+			steps: Int = shape.request_parent_steps()
+
+			if steps == 0:
+				"./" + joined
+			else:
+				"../".repeat(steps) + joined
+		BareModuleRequest:
+			joined
+		NativePackageRequest:
+			joined
 
 
 ---
@@ -512,6 +627,30 @@ pure func node_kind_name(kind: NodeKind) -> String:
 
 
 ---
+The recovery nodes: what the parser records where it required an expression, a
+pattern or a type and found none. Each is linked to the diagnostic that
+reports it, so a module that holds one holds a diagnostic.
+---
+enum MissingNodeKind:
+	MissingExpression
+	MissingPattern
+	MissingType
+
+
+---
+The node kind that records `kind`.
+---
+pure func missing_node_kind(kind: MissingNodeKind) -> NodeKind:
+	match kind:
+		MissingExpression:
+			MissingExpressionNode
+		MissingPattern:
+			MissingPatternNode
+		MissingType:
+			MissingTypeNode
+
+
+---
 The table a node's payload indexes.
 ---
 enum NodePayloadReference:
@@ -519,6 +658,7 @@ enum NodePayloadReference:
 	LiteralPayload
 	CodepointPayload
 	DefinitionPayload
+	DiagnosticPayload
 	NoPayload
 
 
@@ -733,10 +873,11 @@ pure func node_schema(kind: NodeKind) -> NodeSchema:
 		-- `builtin("name")`. Payload: the `LiteralId` of the name.
 		NamedBuiltinNode:
 			shape(LiteralPayload, NoChildren)
-		-- Where an expression or statement could not be parsed; a diagnostic row
-		-- reports it. Children: the parts that did parse, if any.
+		-- Where an expression or statement could not be parsed. Payload: the
+		-- `DiagnosticId` of the row that reports it. Children: the parts that
+		-- did parse, if any.
 		MissingExpressionNode:
-			shape(NoPayload, AnyNumber)
+			shape(DiagnosticPayload, AnyNumber)
 		-- `var name [: T] = value` and `name [: T] ?= value`. Payload: the
 		-- `NameId`; children: the type when written, then the value.
 		VarDeclarationNode | QuestionBindNode:
@@ -758,8 +899,12 @@ pure func node_schema(kind: NodeKind) -> NodeSchema:
 		-- Payload: the `NameId`.
 		DestructureBinderNode:
 			shape(NamePayload, NoChildren)
-		WildcardPatternNode | TruePatternNode | FalsePatternNode | MissingPatternNode:
+		WildcardPatternNode | TruePatternNode | FalsePatternNode:
 			shape(NoPayload, NoChildren)
+		-- Where a pattern could not be parsed. Payload: the `DiagnosticId` of the
+		-- row that reports it.
+		MissingPatternNode:
+			shape(DiagnosticPayload, NoChildren)
 		-- Payload: the `NameId` bound or matched.
 		NamePatternNode:
 			shape(NamePayload, NoChildren)
@@ -848,8 +993,10 @@ pure func node_schema(kind: NodeKind) -> NodeSchema:
 		-- then the dimensions.
 		ArrayTypeNode:
 			shape(NoPayload, AtLeastOne)
+		-- Where a type could not be parsed. Payload: the `DiagnosticId` of the row
+		-- that reports it.
 		MissingTypeNode:
-			shape(NoPayload, NoChildren)
+			shape(DiagnosticPayload, NoChildren)
 
 
 ---
@@ -909,3 +1056,21 @@ pure func is_binary_operator_node(kind: NodeKind) -> Bool:
 			True
 		IdentifierNode | IntegerLiteralNode | FloatLiteralNode | StringLiteralNode | RawStringLiteralNode | PipeStringLiteralNode | RawPipeStringLiteralNode | InterpolatedStringNode | InterpolationTextNode | InterpolationHoleNode | InterpolatedPipeStringNode | TrueLiteralNode | FalseLiteralNode | CharLiteralNode | NegateNode | NotNode | DetachNode | RangeNode | CallNode | FieldAccessNode | SubscriptNode | ListLiteralNode | TupleNode | VectorLiteralNode | RecordLiteralNode | RecordUpdateNode | RecordFieldNode | DictLiteralNode | DictEntryNode | IntoOpaqueNode | FromOpaqueNode | BlockNode | IfNode | MatchNode | MatchCaseNode | SelectNode | SelectReceiveArmNode | SelectSealedArmNode | SelectAfterArmNode | WithNode | WithBindingNode | WithTryBindingNode | WithErrorMapNode | DebugBlockNode | LambdaNode | PureLambdaNode | LambdaParameterNode | LocalFunctionNode | WhileNode | ForNode | LoopBinderNode | TupleLoopBinderNode | ConcurrentForNode | ConcurrentBlockNode | ConcurrentParameterNode | BreakNode | ContinueNode | VoidNode | BuiltinNode | NamedBuiltinNode | MissingExpressionNode | VarDeclarationNode | TypedBindingNode | AssignmentNode | QuestionBindNode | AddAssignNode | SubtractAssignNode | MultiplyAssignNode | DivideAssignNode | SubscriptAssignmentNode | TupleDestructureNode | DestructureBinderNode | WildcardPatternNode | NamePatternNode | IntegerPatternNode | NegativeIntegerPatternNode | FloatPatternNode | NegativeFloatPatternNode | StringPatternNode | RawStringPatternNode | PipeStringPatternNode | RawPipeStringPatternNode | CharPatternNode | TruePatternNode | FalsePatternNode | ConstructorPatternNode | QualifiedConstructorPatternNode | PatternQualifierNode | TuplePatternNode | ListPatternNode | ListSpreadNameNode | ListSpreadWildcardNode | OrPatternNode | MissingPatternNode | NamedTypeNode | QualifiedTypeNode | TypeQualifierNode | BoundedTypeNode | TypeBoundNode | QualifiedTypeBoundNode | DimensionNameTypeNode | VariadicDimensionNameTypeNode | DimensionWildcardTypeNode | VariadicDimensionWildcardTypeNode | DimensionLiteralTypeNode | DimensionAddTypeNode | DimensionSubtractTypeNode | DimensionMultiplyTypeNode | DimensionDivideTypeNode | RangeTypeNode | TupleTypeNode | FunctionTypeNode | PureFunctionTypeNode | ArrayTypeNode | MissingTypeNode:
 			False
+
+
+---
+The count an integer literal's spelling writes when it is positive, else
+`None`. A literal above `Int`'s range saturates, as `parse_int` does; rejecting
+those is a general typecheck rule, not a check here. The one reading of a
+`max_threads` or `limit` count, so the parser's check and the frozen tables'
+`concurrency_count` agree.
+---
+pure func positive_count_of_literal(text: String) -> Option[Int]:
+	match text.parse_int():
+		Some(number):
+			if number > 0:
+				Some(number)
+			else:
+				None
+		None:
+			None

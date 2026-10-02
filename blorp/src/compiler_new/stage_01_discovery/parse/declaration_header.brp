@@ -6,13 +6,14 @@
 import:
 	../tables/builder:
 		DiscoveryBuilder,
+		OwnedRows,
 		advance_token,
 		append_annotation,
-		append_definition,
 		append_documentation,
 		append_pending_annotation,
 		append_plain_diagnostic,
 		next_definition_id,
+		owned_rows,
 		pending_annotation_at,
 		pending_annotation_count,
 		pending_docstring_at,
@@ -21,12 +22,12 @@ import:
 		PlainSyntaxCode(AnnotationArgumentsDiagnostic),
 		SyntaxDiagnostic(UnknownAnnotation),
 	../tables/expected_token: NameConstruct(NameInAnnotationName)
-	../tables/ids: DefinitionId, LiteralId, ModuleId, NameId, definition_id_index, name_id_index
+	../tables/ids: DefinitionId, LiteralId, ModuleId, NameId, definition_id_index, name_ids_equal
 	../tables/name_vocabulary:
-		DEBUG_ONLY_NAME_INDEX,
-		NO_COPY_NAME_INDEX,
-		RESOURCE_RESULT_ORDINARY_NAME_INDEX,
-		TAIL_RECURSIVE_NAME_INDEX,
+		DEBUG_ONLY_NAME,
+		NO_COPY_NAME,
+		RESOURCE_RESULT_ORDINARY_NAME,
+		TAIL_RECURSIVE_NAME,
 	../tables/row_kinds:
 		DefinitionKind(
 			ForeignFunctionDefinition, FunctionDefinition, ImplMethodDefinition,
@@ -93,18 +94,25 @@ pure func plain_header(module: ModuleId, start: Span, annotation_row: Int) -> De
 The annotation a name denotes, when the language defines one.
 ---
 pure func annotation_named(name: NameId) -> Option[FunctionAnnotation]:
-	index: Int = name.name_id_index()
-
-	if index == TAIL_RECURSIVE_NAME_INDEX:
+	if name.name_ids_equal(TAIL_RECURSIVE_NAME):
 		Some(TailRecursiveAnnotation)
-	else if index == NO_COPY_NAME_INDEX:
+	else if name.name_ids_equal(NO_COPY_NAME):
 		Some(NoCopyAnnotation)
-	else if index == DEBUG_ONLY_NAME_INDEX:
+	else if name.name_ids_equal(DEBUG_ONLY_NAME):
 		Some(DebugOnlyAnnotation)
-	else if index == RESOURCE_RESULT_ORDINARY_NAME_INDEX:
+	else if name.name_ids_equal(RESOURCE_RESULT_ORDINARY_NAME):
 		Some(ResourceResultOrdinaryAnnotation)
 	else:
 		None
+
+
+---
+What follows an annotation: its newlines are skipped, so the next annotation
+or the declaration may sit on the next line, or they are left for the caller.
+---
+enum AfterAnnotation:
+	SkipNewlines
+	LeaveNewlines
 
 
 ---
@@ -113,22 +121,25 @@ defines to the transient `pending_annotations` and reporting unknown names and
 argument lists. The annotations read are the pending rows from
 `pending_annotation_count` before the call to the count after it.
 ---
-pure func consume_annotations(builder: DiscoveryBuilder, allow_newlines: Bool) -> DiscoveryBuilder:
+pure func consume_annotations(
+	builder: DiscoveryBuilder,
+	after: AfterAnnotation,
+) -> DiscoveryBuilder:
 	var out: DiscoveryBuilder = builder
 
 	while out.at(AtSymbol):
-		out = out.consume_annotation(allow_newlines)
+		out = out.consume_annotation(after)
 
 	out
 
 
 ---
-One `@name`, any argument list, and with `allow_newlines` the newlines after
+One `@name`, any argument list, and with `SkipNewlines` the newlines after
 it.
 ---
 private pure func consume_annotation(
 	builder: DiscoveryBuilder,
-	allow_newlines: Bool,
+	after: AfterAnnotation,
 ) -> DiscoveryBuilder:
 	var out: DiscoveryBuilder = builder.advance_token()
 	name: Option[NameId] = out.current_name()
@@ -165,7 +176,7 @@ private pure func consume_annotation(
 		if out.at(RightParenSymbol):
 			out = out.advance_token()
 
-	if allow_newlines:
+	if after == SkipNewlines:
 		out = out.skip_newlines()
 
 	out
@@ -179,181 +190,3 @@ pure func annotations_since(builder: DiscoveryBuilder, first: Int) -> RowRange:
 		first = first,
 		count = builder.pending_annotation_count() - first
 	}
-
-
--- Definition rows.
----
-What `definition_opening` knows when a definition's name has been read: the
-row as it is appended at the opening (its kind, name, module and visibility are
-final; its span ends at the name for now), and what the header gives the
-closing (where the declaration starts, its docstring and its annotations). A
-plain struct, so an opening costs no allocation.
----
-private struct OpeningFields {
-	definition: DefinitionId,
-	row: DefinitionRow,
-	start: Span,
-	docstring: RowRange,
-	annotations: RowRange
-}
-
-
----
-A definition that is open: its row is in the table (so members, types and
-nested definitions can name it) but its span still ends at its name.
-`close_definition` changes the span only; the kind, name, module and
-visibility cannot differ between the two, because only `definition_opening`
-makes an opening (it cannot be forged) and the closing takes them from it.
-Blorp has no linear types, so one open and one close per opening is the
-caller's obligation; a debug build reports a second open.
----
-opaque type DefinitionOpening = OpeningFields
-
-
----
-The opening of the definition the next `open_definition` appends: `kind` and
-`name` are fixed here and never rewritten.
----
-pure func definition_opening(
-	builder: DiscoveryBuilder,
-	header: DeclarationHeader,
-	kind: DefinitionKind,
-	name: NameId,
-	name_span: Span,
-) -> DefinitionOpening:
-	fields: OpeningFields = {
-		definition = builder.next_definition_id(),
-		row = {
-			module = header.module,
-			kind = kind,
-			name = name,
-			name_span = name_span,
-			visibility = header.visibility,
-			span = header.start.span_covering(name_span)
-		},
-		start = header.start,
-		docstring = header.docstring,
-		annotations = header.annotations
-	}
-	into_opaque DefinitionOpening(fields)
-
-
----
-The id the opened definition has.
----
-pure func opened_definition(opening: DefinitionOpening) -> DefinitionId:
-	from_opaque DefinitionOpening(opening).definition
-
-
----
-Debug-build guard of the one-open-per-opening rule: the row appends where the
-opening was made for. Opened twice, or against a builder that is not the one the
-opening was made on, it does not. A function of two numbers, so it holds no
-table. Closing needs no guard of its own: it rewrites the opened row with the
-same columns and the span from the opening, so a second close changes nothing.
----
-private pure func check_definition_opens_in_turn(next_row: Int, opened_as: Int):
-	debug:
-		if next_row != opened_as:
-			dbg.error("a definition opening was opened out of turn or twice")
-
-
----
-Appends the row of `opening`, with the span known so far. Blorp has no linear
-types, so opening an opening once is the caller's obligation; a debug build
-reports a second open.
----
-pure func open_definition(
-	builder: DiscoveryBuilder,
-	opening: DefinitionOpening,
-) -> DiscoveryBuilder:
-	fields: OpeningFields = from_opaque DefinitionOpening(opening)
-	check_definition_opens_in_turn(
-		builder.definitions.length(),
-		fields.definition.definition_id_index(),
-	)
-	builder.append_definition(fields.row)
-
-
----
-Closes `opening` with the declaration's final span, from its start through
-`end`, and records the header's docstring and annotations. This changes the
-span only.
----
-pure func close_definition(
-	builder: DiscoveryBuilder,
-	opening: DefinitionOpening,
-	end: Span,
-) -> DiscoveryBuilder:
-	fields: OpeningFields = from_opaque DefinitionOpening(opening)
-	var out: DiscoveryBuilder = builder.set_definition_span(
-		fields.definition,
-		fields.row,
-		fields.start.span_covering(end),
-	)
-
-	if fields.docstring.count > 0:
-		text: LiteralId = out.pending_docstring_at(fields.docstring.first)
-		out = out.append_documentation({
-			definition = fields.definition,
-			text = text,
-		})
-
-	out.record_annotations(fields.definition, fields.annotations, fields.row.kind)
-
-
----
-Copies the header's pending annotations to `definition`. Only functions
-carry annotations; on any other declaration they were reported
-(`AnnotationWithoutFunctionDiagnostic`) and are dropped.
----
-private pure func record_annotations(
-	builder: DiscoveryBuilder,
-	definition: DefinitionId,
-	annotations: RowRange,
-	kind: DefinitionKind,
-) -> DiscoveryBuilder:
-	if annotations.count == 0 or not kind.takes_annotations():
-		builder
-	else:
-		builder.record_annotation_rows(definition, annotations)
-
-
----
-The annotation rows of a non-empty block.
----
-private pure func record_annotation_rows(
-	builder: DiscoveryBuilder,
-	definition: DefinitionId,
-	annotations: RowRange,
-) -> DiscoveryBuilder:
-	var out: DiscoveryBuilder = builder
-	var index: Int = annotations.first
-
-	while index < annotations.first + annotations.count:
-		row: AnnotationRow = out.annotation_row(definition, index)
-		out = out.append_annotation(row)
-		index += 1
-
-	out
-
-
-private pure func annotation_row(
-	builder: DiscoveryBuilder,
-	definition: DefinitionId,
-	pending_index: Int,
-) -> AnnotationRow:
-	pending: PendingAnnotationRow = builder.pending_annotation_at(pending_index)
-	{
-		definition = definition,
-		annotation = pending.annotation,
-		span = pending.span
-	}
-
-
-pure func takes_annotations(kind: DefinitionKind) -> Bool:
-	match kind:
-		FunctionDefinition | ImplMethodDefinition | ForeignFunctionDefinition | LocalFunctionDefinition:
-			True
-		_:
-			False

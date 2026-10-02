@@ -29,10 +29,9 @@ import:
 			ExpectedModulePathDiagnostic, ExpectedNewlineAfterImportHeaderDiagnostic,
 			ImportPathCurrentNotLeadingDiagnostic, ImportPathParentNotLeadingDiagnostic,
 		),
-	../tables/ids: ImportId, ImportItemId, ModuleId, PathId
-	../tables/row_kinds:
-		ImportRequestKind(BareModuleRequest, NativePackageRequest, RelativeModuleRequest),
-	../tables/span: Span, span_covering, span_end, span_source_index, span_start
+	../tables/ids: ImportId, ImportItemId, ModuleId, PathId, source_id_index
+	../tables/row_kinds: ImportRequestShape, bare_request, native_package_request, relative_request
+	../tables/span: Span, span_covering, span_end, span_source, span_start
 	../tables/token:
 		Token,
 		TokenKind(
@@ -109,49 +108,26 @@ pure func parse_import_block(builder: DiscoveryBuilder, module: ModuleId) -> Dis
 
 
 ---
-The request kind a module path's leading tokens give it.
+The request shape a module path's leading tokens give it: relative with its
+`../` count, native package, or bare.
 ---
-private pure func request_kind_at(builder: DiscoveryBuilder) -> ImportRequestKind:
+private pure func request_shape_at(builder: DiscoveryBuilder) -> ImportRequestShape:
 	kind: TokenKind = builder.current_kind()
 
 	if (kind == DotSymbol or kind == DotDotSymbol) and builder.peek_kind(1) == SlashSymbol:
-		RelativeModuleRequest
+		relative_request(builder.leading_parent_steps())
 	else if (
 		builder.current_spelling_is(NATIVE_PACKAGE_PATH_ROOT)
 		and builder.peek_kind(1) == SlashSymbol
 	):
-		NativePackageRequest
+		native_package_request()
 	else:
-		BareModuleRequest
+		bare_request()
 
 
 private pure func current_spelling_is(builder: DiscoveryBuilder, spelling: String) -> Bool:
 	token: Token = builder.current_token()
 	token.kind == IdentifierToken and builder.name_spellings.get(token.payload) == Some(spelling)
-
-
----
-The source text of the tokens from `first` up to the cursor, token by token:
-a module path as written, without any blanks between its tokens.
----
-private pure func token_text_since(builder: DiscoveryBuilder, first: Int) -> String:
-	token: Token = builder.current_token()
-	source_text: String = builder.source_texts
-		.get(token.span.span_source_index())
-		.get_or("")
-	var text: String = ""
-
-	for index in first..builder.token_cursor:
-		match builder.tokens.get(index):
-			Some(part):
-				text += source_text.substring(
-					part.span.span_start(),
-					part.span.span_end() - part.span.span_start(),
-				)
-			None:
-				void
-
-	text
 
 
 ---
@@ -205,29 +181,24 @@ private pure func parse_import_item_with_path(
 	builder: DiscoveryBuilder,
 	module: ModuleId,
 ) -> DiscoveryBuilder:
-	request_kind: ImportRequestKind = builder.request_kind_at()
+	request: ImportRequestShape = builder.request_shape_at()
 	path_start: Span = builder.current_span()
-	path_first_token: Int = builder.token_cursor
-	parent_steps: Int = builder.leading_parent_steps()
-	opening: ImportOpening = builder.open_import(module, request_kind, parent_steps, path_start)
+	opening: ImportOpening = builder.open_import(module, request, path_start)
 	parsed: DiscoveryBuilder = builder.parse_module_path()
 	path_span: Span = path_start.span_covering(parsed.previous_span())
-	path_text: String = parsed.token_text_since(path_first_token)
-	request_path: PathId = parsed.interned_path_id(path_text)
-	interned: DiscoveryBuilder = parsed.intern_path(path_text)
-	interned.parse_import_alias_and_items(opening, request_path, path_span)
+	parsed.parse_import_alias_and_items(opening, path_span)
 
 
 ---
 The rest of an import after its path: an optional `as` alias, then optional
 selected symbols on the same line or in an indented block, and the close of
 its row. A routine of its own so the builder is a parameter, not a variable
-reassigned under branches next to the opening that was read from it.
+reassigned under branches next to the opening that was read from it. The
+cursor is just past the module path, which began at `path_start`.
 ---
 private pure func parse_import_alias_and_items(
 	builder: DiscoveryBuilder,
 	opening: ImportOpening,
-	request_path: PathId,
 	path_span: Span,
 ) -> DiscoveryBuilder:
 	import_id: ImportId = opening.opened_import()
@@ -277,7 +248,7 @@ private pure func parse_import_alias_and_items(
 			None:
 				void
 
-	out.close_import(opening, request_path, path_span, end_span)
+	out.close_import(opening, path_span, end_span)
 
 
 ---

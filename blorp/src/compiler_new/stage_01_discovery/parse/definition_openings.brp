@@ -1,0 +1,1072 @@
+-- The definition rows every declaration opens and closes, one opening type per
+-- class of definition.
+--
+-- Which definitions may have a body, a written type or members is part of the
+-- type of their opening: `FunctionOpening`, `GlobalOpening`, `FieldOpening` and
+-- the rest are each minted only by their own opener, and the appenders for a
+-- body, a written type or a member take the opening of the class that has it.
+-- A record opening has no body appender, and a field opening cannot join a
+-- trait: the combination does not compile. Members are appended by the opener
+-- of the member, from the owner's opening, so a member's kind and its owner's
+-- class agree by construction. No freeze check holds them to account.
+--
+-- Shared by the declaration parser and the body parser, which declares local
+-- functions with the same routines.
+import:
+	../tables/builder:
+		DiscoveryBuilder,
+		OwnedRows,
+		append_annotation,
+		append_documentation,
+		next_definition_id,
+		owned_rows,
+		pending_annotation_at,
+		pending_docstring_at,
+		set_definition_span,
+	../tables/ids: DefinitionId, LiteralId, NameId, NodeId, definition_id_index
+	../tables/row_kinds:
+		DefinitionKind(
+			BuiltinTypeDefinition, ConstantDefinition, EnumDefinition, FieldDefinition,
+			ForeignFunctionDefinition, FunctionDefinition, ImplDefinition, ImplMethodDefinition,
+			LocalFunctionDefinition, MutableGlobalDefinition, OpaqueTypeDefinition,
+			RecordDefinition, ResourceTypeDefinition, StructDefinition, TraitDefinition,
+			TraitMethodDefinition, TypeAliasDefinition, UnionDefinition, VariantDefinition,
+		),
+	../tables/rows: AnnotationRow, DefinitionRow, ImplRow, MemberRow, PendingAnnotationRow, RowRange
+	../tables/span: Span, span_covering
+	debug as dbg
+	declaration_header: DeclarationHeader
+
+
+---
+What `definition_row` knows when a definition's name has been read: the row as
+it is appended at the opening (its kind, name, module and visibility are final;
+its span ends at the name for now), what the header gives the closing (where the
+declaration starts, its docstring and its annotations), and, for a member, the
+owner it joins. A plain struct, so an opening costs no allocation.
+---
+private struct OpeningFields {
+	definition: DefinitionId,
+	owned: OwnedRows,
+	member_of: OwnedRows,
+	row: DefinitionRow,
+	start: Span,
+	docstring: RowRange,
+	annotations: RowRange,
+	implemented_trait: NameId,
+	implemented_trait_span: Span
+}
+
+
+---
+The fields of an opening of a definition of `kind`. It is no member: it joins
+its own rows.
+---
+private pure func fields_of(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+	name: NameId,
+	name_span: Span,
+) -> OpeningFields:
+	definition: DefinitionId = builder.next_definition_id()
+	owned: OwnedRows = builder.owned_rows(definition)
+	fields_joining(definition, owned, owned, header, kind, name, name_span, name, name_span)
+
+
+---
+The fields of an opening of a member definition of `kind`, which joins `owner`.
+---
+private pure func fields_of_member(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	owner: OwnedRows,
+	kind: DefinitionKind,
+	name: NameId,
+	name_span: Span,
+) -> OpeningFields:
+	definition: DefinitionId = builder.next_definition_id()
+	owned: OwnedRows = builder.owned_rows(definition)
+	fields_joining(definition, owned, owner, header, kind, name, name_span, name, name_span)
+
+
+private pure func fields_joining(
+	definition: DefinitionId,
+	owned: OwnedRows,
+	member_of: OwnedRows,
+	header: DeclarationHeader,
+	kind: DefinitionKind,
+	name: NameId,
+	name_span: Span,
+	implemented_trait: NameId,
+	implemented_trait_span: Span,
+) -> OpeningFields:
+	{
+		definition = definition,
+		owned = owned,
+		member_of = member_of,
+		row = {
+			module = header.module,
+			kind = kind,
+			name = name,
+			name_span = name_span,
+			visibility = header.visibility,
+			span = header.start.span_covering(name_span)
+		},
+		start = header.start,
+		docstring = header.docstring,
+		annotations = header.annotations,
+		implemented_trait = implemented_trait,
+		implemented_trait_span = implemented_trait_span
+	}
+
+
+---
+Appends a definition row. Private: a definition row of any kind, with no opening,
+is not something production code can write.
+---
+private pure func append_definition(builder: DiscoveryBuilder, row: DefinitionRow) -> DiscoveryBuilder:
+	{ builder | definitions = builder.definitions.append(row) }
+
+
+---
+Appends the row of `fields`, with the span known so far.
+---
+private pure func open_fields(builder: DiscoveryBuilder, fields: OpeningFields) -> DiscoveryBuilder:
+	check_definition_opens_in_turn(
+		builder.definitions.length(),
+		fields.definition.definition_id_index(),
+	)
+	builder.append_definition(fields.row)
+
+
+---
+Debug-build guard of the one-open-per-opening rule: the row appends where the
+opening was made for. A function of two numbers, so it holds no table.
+---
+private pure func check_definition_opens_in_turn(next_row: Int, opened_as: Int):
+	debug:
+		if next_row != opened_as:
+			dbg.error("a definition opening was opened out of turn or twice")
+
+
+---
+Appends the row of `fields` and, joined to `fields.member_of`, its member row,
+numbered by the rows the owner's members table has gained since it opened.
+---
+private pure func open_fields_as_member(
+	builder: DiscoveryBuilder,
+	fields: OpeningFields,
+) -> DiscoveryBuilder:
+	ordinal: Int = builder.members.length() - fields.member_of.members_first
+	builder
+		.open_fields(fields)
+		.append_member_row({
+			definition = fields.definition,
+			owner = fields.member_of.definition,
+			ordinal = ordinal,
+		})
+
+
+private pure func append_member_row(builder: DiscoveryBuilder, row: MemberRow) -> DiscoveryBuilder:
+	{ builder | members = builder.members.append(row) }
+
+
+---
+Closes `fields` with the declaration's final span, from its start through `end`,
+and records the header's docstring and annotations. This changes the span only.
+---
+private pure func close_fields(
+	builder: DiscoveryBuilder,
+	fields: OpeningFields,
+	end: Span,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder.set_definition_span(
+		fields.definition,
+		fields.row,
+		fields.start.span_covering(end),
+	)
+
+	if fields.docstring.count > 0:
+		text: LiteralId = out.pending_docstring_at(fields.docstring.first)
+		out = out.append_documentation({
+			definition = fields.definition,
+			text = text,
+		})
+
+	out.record_annotations(fields.definition, fields.annotations, fields.row.kind)
+
+
+---
+An opening of a function, local function, trait method or impl method. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type FunctionOpening = OpeningFields
+
+
+---
+The id the opened function has.
+---
+pure func function_definition(opening: FunctionOpening) -> DefinitionId:
+	from_opaque FunctionOpening(opening).definition
+
+
+---
+The ordered rows the opened function owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func function_rows(opening: FunctionOpening) -> OwnedRows:
+	from_opaque FunctionOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_function(
+	builder: DiscoveryBuilder,
+	opening: FunctionOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque FunctionOpening(opening), end)
+
+
+---
+An opening of a foreign function. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type ForeignFunctionOpening = OpeningFields
+
+
+---
+The id the opened foreign function has.
+---
+pure func foreign_function_definition(opening: ForeignFunctionOpening) -> DefinitionId:
+	from_opaque ForeignFunctionOpening(opening).definition
+
+
+---
+The ordered rows the opened foreign function owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func foreign_function_rows(opening: ForeignFunctionOpening) -> OwnedRows:
+	from_opaque ForeignFunctionOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_foreign_function(
+	builder: DiscoveryBuilder,
+	opening: ForeignFunctionOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque ForeignFunctionOpening(opening), end)
+
+
+---
+An opening of a constant or mutable global. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type GlobalOpening = OpeningFields
+
+
+---
+The id the opened global has.
+---
+pure func global_definition(opening: GlobalOpening) -> DefinitionId:
+	from_opaque GlobalOpening(opening).definition
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_global(
+	builder: DiscoveryBuilder,
+	opening: GlobalOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque GlobalOpening(opening), end)
+
+
+---
+An opening of a record or struct. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type RecordOpening = OpeningFields
+
+
+---
+The id the opened record has.
+---
+pure func record_definition(opening: RecordOpening) -> DefinitionId:
+	from_opaque RecordOpening(opening).definition
+
+
+---
+The ordered rows the opened record owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func record_rows(opening: RecordOpening) -> OwnedRows:
+	from_opaque RecordOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_record(
+	builder: DiscoveryBuilder,
+	opening: RecordOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque RecordOpening(opening), end)
+
+
+---
+An opening of a record or struct field. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type FieldOpening = OpeningFields
+
+
+---
+The id the opened field has.
+---
+pure func field_definition(opening: FieldOpening) -> DefinitionId:
+	from_opaque FieldOpening(opening).definition
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_field(
+	builder: DiscoveryBuilder,
+	opening: FieldOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque FieldOpening(opening), end)
+
+
+---
+An opening of a union or enum. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type UnionOpening = OpeningFields
+
+
+---
+The id the opened union has.
+---
+pure func union_definition(opening: UnionOpening) -> DefinitionId:
+	from_opaque UnionOpening(opening).definition
+
+
+---
+The ordered rows the opened union owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func union_rows(opening: UnionOpening) -> OwnedRows:
+	from_opaque UnionOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_union(
+	builder: DiscoveryBuilder,
+	opening: UnionOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque UnionOpening(opening), end)
+
+
+---
+An opening of a union or enum variant. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type VariantOpening = OpeningFields
+
+
+---
+The id the opened variant has.
+---
+pure func variant_definition(opening: VariantOpening) -> DefinitionId:
+	from_opaque VariantOpening(opening).definition
+
+
+---
+The ordered rows the opened variant owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func variant_rows(opening: VariantOpening) -> OwnedRows:
+	from_opaque VariantOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_variant(
+	builder: DiscoveryBuilder,
+	opening: VariantOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque VariantOpening(opening), end)
+
+
+---
+An opening of a trait. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type TraitOpening = OpeningFields
+
+
+---
+The id the opened trait has.
+---
+pure func trait_definition(opening: TraitOpening) -> DefinitionId:
+	from_opaque TraitOpening(opening).definition
+
+
+---
+The ordered rows the opened trait owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func trait_rows(opening: TraitOpening) -> OwnedRows:
+	from_opaque TraitOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_trait(
+	builder: DiscoveryBuilder,
+	opening: TraitOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque TraitOpening(opening), end)
+
+
+---
+An opening of an impl, with the trait it implements. Minted only by
+`impl_opening`.
+---
+opaque type ImplOpening = OpeningFields
+
+
+---
+The id the opened impl has.
+---
+pure func impl_definition(opening: ImplOpening) -> DefinitionId:
+	from_opaque ImplOpening(opening).definition
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_impl(
+	builder: DiscoveryBuilder,
+	opening: ImplOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque ImplOpening(opening), end)
+
+
+---
+An opening of a type alias or opaque type. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type AliasOpening = OpeningFields
+
+
+---
+The id the opened alias has.
+---
+pure func alias_definition(opening: AliasOpening) -> DefinitionId:
+	from_opaque AliasOpening(opening).definition
+
+
+---
+The ordered rows the opened alias owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func alias_rows(opening: AliasOpening) -> OwnedRows:
+	from_opaque AliasOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_alias(
+	builder: DiscoveryBuilder,
+	opening: AliasOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque AliasOpening(opening), end)
+
+
+---
+An opening of a builtin or resource type. Minted only by its opener below; no other class's
+appender takes it.
+---
+opaque type BareTypeOpening = OpeningFields
+
+
+---
+The id the opened bare type has.
+---
+pure func bare_type_definition(opening: BareTypeOpening) -> DefinitionId:
+	from_opaque BareTypeOpening(opening).definition
+
+
+---
+The ordered rows the opened bare type owns, which the parse routines write into by
+passing this, never a count.
+---
+pure func bare_type_rows(opening: BareTypeOpening) -> OwnedRows:
+	from_opaque BareTypeOpening(opening).owned
+
+
+---
+Closes `opening` with its final span; the span is all this changes.
+---
+pure func close_bare_type(
+	builder: DiscoveryBuilder,
+	opening: BareTypeOpening,
+	end: Span,
+) -> DiscoveryBuilder:
+	builder.close_fields(from_opaque BareTypeOpening(opening), end)
+
+
+---
+Copies the header's pending annotations to `definition`. Only functions
+carry annotations; on any other declaration they were reported
+(`AnnotationWithoutFunctionDiagnostic`) and are dropped.
+---
+private pure func record_annotations(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	annotations: RowRange,
+	kind: DefinitionKind,
+) -> DiscoveryBuilder:
+	if annotations.count == 0 or not kind.takes_annotations():
+		builder
+	else:
+		builder.record_annotation_rows(definition, annotations)
+
+
+---
+The annotation rows of a non-empty block.
+---
+private pure func record_annotation_rows(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	annotations: RowRange,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+	var index: Int = annotations.first
+
+	while index < annotations.first + annotations.count:
+		row: AnnotationRow = out.annotation_row(definition, index)
+		out = out.append_annotation(row)
+		index += 1
+
+	out
+
+
+private pure func annotation_row(
+	builder: DiscoveryBuilder,
+	definition: DefinitionId,
+	pending_index: Int,
+) -> AnnotationRow:
+	pending: PendingAnnotationRow = builder.pending_annotation_at(pending_index)
+	{
+		definition = definition,
+		annotation = pending.annotation,
+		span = pending.span
+	}
+
+
+pure func takes_annotations(kind: DefinitionKind) -> Bool:
+	match kind:
+		FunctionDefinition | ImplMethodDefinition | ForeignFunctionDefinition | LocalFunctionDefinition:
+			True
+		_:
+			False
+
+
+-- Openers.
+---
+The form of a record-like type: `record` takes type parameters, `struct` does not.
+---
+enum RecordForm:
+	RecordType
+	StructType
+
+
+---
+The form of a union-like type.
+---
+enum UnionForm:
+	UnionType
+	EnumType
+
+
+---
+The form of a global.
+---
+enum GlobalForm:
+	ConstantGlobal
+	MutableGlobal
+
+
+---
+The form of a type that stands for another.
+---
+enum AliasForm:
+	AliasType
+	OpaqueType
+
+
+---
+The form of a type the runtime provides.
+---
+enum BareTypeForm:
+	BuiltinType
+	ResourceType
+
+
+pure func function_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	name: NameId,
+	name_span: Span,
+) -> FunctionOpening:
+	fields: OpeningFields = builder.fields_of(header, FunctionDefinition, name, name_span)
+	into_opaque FunctionOpening(fields)
+
+
+pure func local_function_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	name: NameId,
+	name_span: Span,
+) -> FunctionOpening:
+	fields: OpeningFields = builder.fields_of(header, LocalFunctionDefinition, name, name_span)
+	into_opaque FunctionOpening(fields)
+
+
+---
+The opening of a method of the trait `owner`, which joins it when opened.
+---
+pure func trait_method_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	owner: TraitOpening,
+	name: NameId,
+	name_span: Span,
+) -> FunctionOpening:
+	fields: OpeningFields = builder.fields_of_member(
+		header,
+		from_opaque TraitOpening(owner).owned,
+		TraitMethodDefinition,
+		name,
+		name_span,
+	)
+	into_opaque FunctionOpening(fields)
+
+
+---
+The opening of a method of the impl `owner`, which joins it when opened.
+---
+pure func impl_method_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	owner: ImplOpening,
+	name: NameId,
+	name_span: Span,
+) -> FunctionOpening:
+	fields: OpeningFields = builder.fields_of_member(
+		header,
+		from_opaque ImplOpening(owner).owned,
+		ImplMethodDefinition,
+		name,
+		name_span,
+	)
+	into_opaque FunctionOpening(fields)
+
+
+---
+Appends the row of `opening` (and, for a trait or impl method, its member row).
+---
+pure func open_function(builder: DiscoveryBuilder, opening: FunctionOpening) -> DiscoveryBuilder:
+	fields: OpeningFields = from_opaque FunctionOpening(opening)
+
+	match fields.row.kind:
+		TraitMethodDefinition | ImplMethodDefinition:
+			builder.open_fields_as_member(fields)
+		_:
+			builder.open_fields(fields)
+
+
+pure func foreign_function_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	name: NameId,
+	name_span: Span,
+) -> ForeignFunctionOpening:
+	fields: OpeningFields = builder.fields_of(header, ForeignFunctionDefinition, name, name_span)
+	into_opaque ForeignFunctionOpening(fields)
+
+
+pure func open_foreign_function(
+	builder: DiscoveryBuilder,
+	opening: ForeignFunctionOpening,
+) -> DiscoveryBuilder:
+	builder.open_fields(from_opaque ForeignFunctionOpening(opening))
+
+
+pure func global_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	form: GlobalForm,
+	name: NameId,
+	name_span: Span,
+) -> GlobalOpening:
+	kind: DefinitionKind = match form:
+		ConstantGlobal:
+			ConstantDefinition
+		MutableGlobal:
+			MutableGlobalDefinition
+
+	into_opaque GlobalOpening(builder.fields_of(header, kind, name, name_span))
+
+
+pure func open_global(builder: DiscoveryBuilder, opening: GlobalOpening) -> DiscoveryBuilder:
+	builder.open_fields(from_opaque GlobalOpening(opening))
+
+
+pure func record_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	form: RecordForm,
+	name: NameId,
+	name_span: Span,
+) -> RecordOpening:
+	kind: DefinitionKind = match form:
+		RecordType:
+			RecordDefinition
+		StructType:
+			StructDefinition
+
+	into_opaque RecordOpening(builder.fields_of(header, kind, name, name_span))
+
+
+pure func open_record(builder: DiscoveryBuilder, opening: RecordOpening) -> DiscoveryBuilder:
+	builder.open_fields(from_opaque RecordOpening(opening))
+
+
+---
+The opening of a field of the record or struct `owner`, which joins it when opened.
+---
+pure func field_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	owner: RecordOpening,
+	name: NameId,
+	name_span: Span,
+) -> FieldOpening:
+	fields: OpeningFields = builder.fields_of_member(
+		header,
+		from_opaque RecordOpening(owner).owned,
+		FieldDefinition,
+		name,
+		name_span,
+	)
+	into_opaque FieldOpening(fields)
+
+
+pure func open_field(builder: DiscoveryBuilder, opening: FieldOpening) -> DiscoveryBuilder:
+	builder.open_fields_as_member(from_opaque FieldOpening(opening))
+
+
+pure func union_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	form: UnionForm,
+	name: NameId,
+	name_span: Span,
+) -> UnionOpening:
+	kind: DefinitionKind = match form:
+		UnionType:
+			UnionDefinition
+		EnumType:
+			EnumDefinition
+
+	into_opaque UnionOpening(builder.fields_of(header, kind, name, name_span))
+
+
+pure func open_union(builder: DiscoveryBuilder, opening: UnionOpening) -> DiscoveryBuilder:
+	builder.open_fields(from_opaque UnionOpening(opening))
+
+
+---
+The opening of a variant of the union or enum `owner`, which joins it when opened.
+---
+pure func variant_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	owner: UnionOpening,
+	name: NameId,
+	name_span: Span,
+) -> VariantOpening:
+	fields: OpeningFields = builder.fields_of_member(
+		header,
+		from_opaque UnionOpening(owner).owned,
+		VariantDefinition,
+		name,
+		name_span,
+	)
+	into_opaque VariantOpening(fields)
+
+
+pure func open_variant(builder: DiscoveryBuilder, opening: VariantOpening) -> DiscoveryBuilder:
+	builder.open_fields_as_member(from_opaque VariantOpening(opening))
+
+
+pure func trait_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	name: NameId,
+	name_span: Span,
+) -> TraitOpening:
+	into_opaque TraitOpening(builder.fields_of(header, TraitDefinition, name, name_span))
+
+
+pure func open_trait(builder: DiscoveryBuilder, opening: TraitOpening) -> DiscoveryBuilder:
+	builder.open_fields(from_opaque TraitOpening(opening))
+
+
+---
+The opening of an impl of `trait_name`, written at `trait_span`, after the
+`implements` keyword at `keyword_span`. An impl has no name of its own: its
+definition row holds `IMPL_NAME`, and opening it also appends its `ImplRow`.
+---
+pure func impl_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	impl_name: NameId,
+	keyword_span: Span,
+	trait_name: NameId,
+	trait_span: Span,
+) -> ImplOpening:
+	definition: DefinitionId = builder.next_definition_id()
+	owned: OwnedRows = builder.owned_rows(definition)
+	fields: OpeningFields = fields_joining(
+		definition,
+		owned,
+		owned,
+		header,
+		ImplDefinition,
+		impl_name,
+		keyword_span,
+		trait_name,
+		trait_span,
+	)
+	into_opaque ImplOpening(fields)
+
+
+---
+Appends the definition row of `opening` and its `ImplRow`, the only way an impl
+row is written.
+---
+pure func open_impl(builder: DiscoveryBuilder, opening: ImplOpening) -> DiscoveryBuilder:
+	impl: OpeningFields = from_opaque ImplOpening(opening)
+	builder
+		.open_fields(impl)
+		.append_impl_row({
+			definition = impl.definition,
+			trait_name = impl.implemented_trait,
+			trait_span = impl.implemented_trait_span,
+		})
+
+
+private pure func append_impl_row(builder: DiscoveryBuilder, row: ImplRow) -> DiscoveryBuilder:
+	{ builder | impls = builder.impls.append(row) }
+
+
+pure func alias_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	form: AliasForm,
+	name: NameId,
+	name_span: Span,
+) -> AliasOpening:
+	kind: DefinitionKind = match form:
+		AliasType:
+			TypeAliasDefinition
+		OpaqueType:
+			OpaqueTypeDefinition
+
+	into_opaque AliasOpening(builder.fields_of(header, kind, name, name_span))
+
+
+pure func open_alias(builder: DiscoveryBuilder, opening: AliasOpening) -> DiscoveryBuilder:
+	builder.open_fields(from_opaque AliasOpening(opening))
+
+
+pure func bare_type_opening(
+	builder: DiscoveryBuilder,
+	header: DeclarationHeader,
+	form: BareTypeForm,
+	name: NameId,
+	name_span: Span,
+) -> BareTypeOpening:
+	kind: DefinitionKind = match form:
+		BuiltinType:
+			BuiltinTypeDefinition
+		ResourceType:
+			ResourceTypeDefinition
+
+	into_opaque BareTypeOpening(builder.fields_of(header, kind, name, name_span))
+
+
+pure func open_bare_type(builder: DiscoveryBuilder, opening: BareTypeOpening) -> DiscoveryBuilder:
+	builder.open_fields(from_opaque BareTypeOpening(opening))
+
+
+-- Appenders: what each class of definition may have.
+---
+Appends the body of the function `opening`, whose expression is `root`.
+---
+pure func append_function_body(
+	builder: DiscoveryBuilder,
+	opening: FunctionOpening,
+	root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque FunctionOpening(opening).definition
+	{ builder | bodies = builder.bodies.append({
+			definition = definition,
+			root = root,
+		}) }
+
+
+---
+Appends the written return type of the function `opening`.
+---
+pure func append_function_return_type(
+	builder: DiscoveryBuilder,
+	opening: FunctionOpening,
+	type_root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque FunctionOpening(opening).definition
+	{ builder | definition_types = builder.definition_types.append({
+			definition = definition,
+			type_root = type_root,
+		}) }
+
+
+---
+Appends the written return type of the foreign function `opening`.
+---
+pure func append_foreign_return_type(
+	builder: DiscoveryBuilder,
+	opening: ForeignFunctionOpening,
+	type_root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque ForeignFunctionOpening(opening).definition
+	{ builder | definition_types = builder.definition_types.append({
+			definition = definition,
+			type_root = type_root,
+		}) }
+
+
+---
+Appends the declared type of the global `opening`.
+---
+pure func append_global_type(
+	builder: DiscoveryBuilder,
+	opening: GlobalOpening,
+	type_root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque GlobalOpening(opening).definition
+	{ builder | definition_types = builder.definition_types.append({
+			definition = definition,
+			type_root = type_root,
+		}) }
+
+
+---
+Appends the value of the global `opening`, whose expression is `root`.
+---
+pure func append_global_value(
+	builder: DiscoveryBuilder,
+	opening: GlobalOpening,
+	root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque GlobalOpening(opening).definition
+	{ builder | bodies = builder.bodies.append({
+			definition = definition,
+			root = root,
+		}) }
+
+
+---
+Appends the declared type of the field `opening`.
+---
+pure func append_field_type(
+	builder: DiscoveryBuilder,
+	opening: FieldOpening,
+	type_root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque FieldOpening(opening).definition
+	{ builder | definition_types = builder.definition_types.append({
+			definition = definition,
+			type_root = type_root,
+		}) }
+
+
+---
+Appends the type the alias or opaque type `opening` stands for.
+---
+pure func append_alias_target(
+	builder: DiscoveryBuilder,
+	opening: AliasOpening,
+	type_root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque AliasOpening(opening).definition
+	{ builder | definition_types = builder.definition_types.append({
+			definition = definition,
+			type_root = type_root,
+		}) }
+
+
+---
+Appends the type the impl `opening` is for.
+---
+pure func append_receiver_type(
+	builder: DiscoveryBuilder,
+	opening: ImplOpening,
+	type_root: NodeId,
+) -> DiscoveryBuilder:
+	definition: DefinitionId = from_opaque ImplOpening(opening).definition
+	{ builder | definition_types = builder.definition_types.append({
+			definition = definition,
+			type_root = type_root,
+		}) }
+
+
+---
+Appends `type_root` as the next payload type of the variant `opening`, numbered
+by the payloads the table has gained since the variant opened.
+---
+pure func append_variant_payload(
+	builder: DiscoveryBuilder,
+	opening: VariantOpening,
+	type_root: NodeId,
+) -> DiscoveryBuilder:
+	fields: OpeningFields = from_opaque VariantOpening(opening)
+	ordinal: Int = builder.variant_payloads.length() - fields.owned.variant_payloads_first
+	{ builder | variant_payloads = builder.variant_payloads.append({
+			variant = fields.definition,
+			ordinal = ordinal,
+			type_root = type_root,
+		}) }

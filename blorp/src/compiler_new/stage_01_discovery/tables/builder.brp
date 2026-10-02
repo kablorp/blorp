@@ -64,6 +64,7 @@ import:
 	ids:
 		BoundId,
 		DefinitionId,
+		DiagnosticId,
 		ForeignBlockId,
 		ImportId,
 		ImportItemId,
@@ -79,6 +80,8 @@ import:
 		bound_id_at_row,
 		definition_id_at_row,
 		definition_id_index,
+		definition_ids_equal,
+		diagnostic_id_at_row,
 		foreign_block_id_at_row,
 		foreign_block_id_index,
 		import_id_at_row,
@@ -89,6 +92,7 @@ import:
 		module_id_at_row,
 		module_id_index,
 		name_id_at_row,
+		node_id_at_row,
 		package_id_at_row,
 		parameter_id_at_row,
 		path_id_at_row,
@@ -104,19 +108,21 @@ import:
 		slots_for_texts,
 		slots_with_row,
 		text_hash,
+	invariants/violation: DiscoveryTable(SourceTable), discovery_table_name
 	name_vocabulary: ALL_SEEDED_NAME_SPELLINGS
 	row_kinds:
 		FunctionAnnotation(TailRecursiveAnnotation),
-		ImportRequestKind,
+		ImportRequestShape,
 		ModuleOriginKind,
 		ModuleReach,
+		ParameterBinder(NamedParameterBinder, TupleParameterBinder, WildcardParameterBinder),
+		TypeParameterKind(TypeParameter),
 	rows:
 		AnnotationRow,
 		BinderNameRow,
 		BodyRow,
 		BoundQualifierRow,
 		BoundRow,
-		ConcurrencyCountRow,
 		DefinitionRow,
 		DefinitionTypeRow,
 		DimensionConstraintRow,
@@ -128,6 +134,7 @@ import:
 		ForeignBindingRow,
 		ForeignBlockRow,
 		ForeignCNameRow,
+		ImplRow,
 		ImplicitRequestRow,
 		ImportAliasRow,
 		ImportBlockRow,
@@ -142,7 +149,6 @@ import:
 		ModuleDocumentationRow,
 		ModulePackageRow,
 		ModuleRow,
-		NO_SPAN,
 		NodeNameSpanRow,
 		NodeRow,
 		PackageRow,
@@ -160,19 +166,8 @@ import:
 		SyntaxDiagnosticRow,
 		TypeParameterRow,
 		VariantPayloadRow,
-	span: Span, span_covering
+	span: NO_SPAN, Span, span_covering
 	token: Token
-
-
----
-Whether the statement being parsed is inside a loop body. A function body
-starts a new context (`NotInLoop`), and so does a lambda or `concurrent:` task
-body: its `break` cannot leave the enclosing loop, and its `?=` returns from
-the lambda or task, not the loop.
----
-enum LoopContext:
-	NotInLoop
-	InLoopBody
 
 
 ---
@@ -188,7 +183,7 @@ one module being parsed (and of its interpolation holes, appended after its
 end-of-file token), the index of the parser's next token, the docstrings and
 annotations read before their declaration's row exists, the parts of the
 module's interpolated strings, the roots of the child nodes a parent
-node has not yet claimed, and the loop context of the body being parsed.
+node has not yet claimed.
 `without_transient_tables` empties them when a module's lexing starts. They
 live here because lexing interns names and literals into this builder while it
 produces tokens, and parsing appends rows while it consumes them; the builder
@@ -230,6 +225,7 @@ record DiscoveryBuilder {
 	bound_qualifiers: List[BoundQualifierRow],
 	supertraits: List[SupertraitRow],
 	supertrait_qualifiers: List[SupertraitQualifierRow],
+	impls: List[ImplRow],
 	signatures: List[SignatureRow],
 	parameters: List[ParameterRow],
 	binder_names: List[BinderNameRow],
@@ -247,7 +243,6 @@ record DiscoveryBuilder {
 	node_children: List[NodeId],
 	node_name_spans: List[NodeNameSpanRow],
 	else_keywords: List[ElseKeywordRow],
-	concurrency_counts: List[ConcurrencyCountRow],
 	dimension_names: List[DimensionNameRow],
 	literals: List[String],
 	literal_slots: List[Int],
@@ -261,9 +256,7 @@ record DiscoveryBuilder {
 	interpolation_parts: List[InterpolationPartRow],
 	interpolation_texts: List[LiteralId],
 	child_stack: List[NodeId],
-	child_stack_depth: Int,
-	loop_context: LoopContext,
-	module_being_parsed: Option[ModuleId]
+	child_stack_depth: Int
 }
 
 
@@ -304,6 +297,7 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		bound_qualifiers = [],
 		supertraits = [],
 		supertrait_qualifiers = [],
+		impls = [],
 		signatures = [],
 		parameters = [],
 		binder_names = [],
@@ -321,7 +315,6 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		node_children = [],
 		node_name_spans = [],
 		else_keywords = [],
-		concurrency_counts = [],
 		dimension_names = [],
 		literals = [],
 		literal_slots = empty_slots(INITIAL_SLOT_COUNT),
@@ -335,9 +328,7 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		interpolation_parts = [],
 		interpolation_texts = [],
 		child_stack = [],
-		child_stack_depth = 0,
-		loop_context = NotInLoop,
-		module_being_parsed = None
+		child_stack_depth = 0
 	}
 
 
@@ -526,7 +517,7 @@ allocation.
 private struct ModuleOpeningFields {
 	module: ModuleId,
 	source: SourceId,
-	canonical_path: PathId,
+	path: PathId,
 	origin: ModuleOriginKind,
 	reach: ModuleReach,
 	definitions_first: Int,
@@ -548,22 +539,23 @@ opaque type ModuleOpening = ModuleOpeningFields
 
 
 ---
-Opens the module whose source `admit_source` appended last: each block of rows
+Opens the module whose source `admit_source` appended last, whose canonical
+path is that source's: each block of rows
 the module's parse appends starts at the end of its table now. Modules load
 one at a time, so the opening's module id is the next one, and nothing but this
 module's own parse appends rows between `open_module` and `close_module`.
 ---
 pure func open_module(
 	builder: DiscoveryBuilder,
-	canonical_path: PathId,
 	origin: ModuleOriginKind,
 	reach: ModuleReach,
 ) -> ModuleOpening:
 	check_module_opens_in_turn(builder.sources.length(), builder.modules.length())
+	source_index: Int = builder.sources.length() - 1
 	fields: ModuleOpeningFields = {
 		module = module_id_at_row(builder.modules.length()),
-		source = source_id_at_row(builder.sources.length() - 1),
-		canonical_path = canonical_path,
+		source = source_id_at_row(source_index),
+		path = builder.source_path_at(source_index),
 		origin = origin,
 		reach = reach,
 		definitions_first = builder.definitions.length(),
@@ -575,32 +567,21 @@ pure func open_module(
 
 
 ---
-Makes `opening`'s module the one being parsed, from its opening, so the parse
-routines that need the module (a local function's header) read it from the
-builder and nothing predicts it. `close_module` clears it. Not cleared by
-`without_transient_tables`: lexing the module starts from that and parses
-after it.
+The path of source row `source_index`, which an opening reads once, from the
+source it was opened over. The row exists: `check_module_opens_in_turn` has
+just required a source without a module.
 ---
-pure func begin_module_parse(builder: DiscoveryBuilder, opening: ModuleOpening) -> DiscoveryBuilder:
-	{ builder | module_being_parsed = Some(from_opaque ModuleOpening(opening).module) }
-
-
----
-The module being parsed. Parse routines run only between `begin_module_parse`
-and `close_module`, so a miss is a defect in the caller: it is reported and
-the first module returned.
----
-pure func parsed_module(builder: DiscoveryBuilder) -> ModuleId:
-	match builder.module_being_parsed:
-		Some(module):
-			module
+private pure func source_path_at(builder: DiscoveryBuilder, source_index: Int) -> PathId:
+	match builder.sources.get(source_index):
+		Some(row):
+			row.path
 		None:
 			report_unreachable_lookup(
-				"module being parsed",
-				0,
-				"parse routines run between begin_module_parse and close_module",
+				SourceTable,
+				source_index,
+				"a module opens over the source admitted for it",
 			)
-			module_id_at_row(0)
+			path_id_at_row(0)
 
 
 ---
@@ -656,7 +637,7 @@ private pure func block_count_closing_in_turn(
 
 ---
 Appends the row of `opening`'s module, with every block ended over the rows
-appended since it opened, and indexes it by its canonical path.
+appended since it opened, and indexes it by its canonical path, the path of its source.
 ---
 pure func close_module(builder: DiscoveryBuilder, opening: ModuleOpening) -> DiscoveryBuilder:
 	fields: ModuleOpeningFields = from_opaque ModuleOpening(opening)
@@ -670,11 +651,10 @@ pure func close_module(builder: DiscoveryBuilder, opening: ModuleOpening) -> Dis
 	imports_count: Int = builder.imports.length() - fields.imports_first
 	nodes_count: Int = builder.nodes.length() - fields.nodes_first
 	diagnostics_count: Int = builder.diagnostics.length() - fields.diagnostics_first
-	path_index: Int = fields.canonical_path.path_id_index()
+	path_index: Int = fields.path.path_id_index()
 
 	row: ModuleRow = {
 		source = fields.source,
-		canonical_path = fields.canonical_path,
 		origin = fields.origin,
 		reach = fields.reach,
 		definitions = {
@@ -696,8 +676,7 @@ pure func close_module(builder: DiscoveryBuilder, opening: ModuleOpening) -> Dis
 	}
 	{ builder |
 		modules = builder.modules.append(row),
-		module_ids_by_path = builder.module_ids_by_path.set(path_index, index),
-		module_being_parsed = None
+		module_ids_by_path = builder.module_ids_by_path.set(path_index, index)
 	}
 
 
@@ -729,14 +708,13 @@ pure func append_implicit_request(
 
 ---
 What `open_import` knows about an import that has begun: who imports, how it is
-requested, and where its path parts and items start. Its path text, path span
+requested, and where its path parts and items start. Its path span
 and end are known only when its parse ends.
 ---
 private struct ImportOpeningFields {
 	import_id: ImportId,
 	importer: ModuleId,
-	request_kind: ImportRequestKind,
-	parent_steps: Int,
+	request: ImportRequestShape,
 	path_parts_first: Int,
 	items_first: Int,
 	start: Span
@@ -763,15 +741,13 @@ is the next row.
 pure func open_import(
 	builder: DiscoveryBuilder,
 	importer: ModuleId,
-	request_kind: ImportRequestKind,
-	parent_steps: Int,
+	request: ImportRequestShape,
 	start: Span,
 ) -> ImportOpening:
 	fields: ImportOpeningFields = {
 		import_id = import_id_at_row(builder.imports.length()),
 		importer = importer,
-		request_kind = request_kind,
-		parent_steps = parent_steps,
+		request = request,
 		path_parts_first = builder.import_path_parts.length(),
 		items_first = builder.import_items.length(),
 		start = start
@@ -788,14 +764,12 @@ pure func opened_import(opening: ImportOpening) -> ImportId:
 
 ---
 Appends the row of `opening`'s import. Its path parts and items are the rows
-appended to `import_path_parts` and `import_items` since it opened; `request_path`
-is the interned text of the path and `path_span` its span. It spans from its
-start to `end`.
+appended to `import_path_parts` and `import_items` since it opened; `path_span`
+is the span of its path. It spans from its start to `end`.
 ---
 pure func close_import(
 	builder: DiscoveryBuilder,
 	opening: ImportOpening,
-	request_path: PathId,
 	path_span: Span,
 	end: Span,
 ) -> DiscoveryBuilder:
@@ -809,9 +783,7 @@ pure func close_import(
 	)
 	row: ImportRow = {
 		importer = fields.importer,
-		request_kind = fields.request_kind,
-		request_path = request_path,
-		parent_steps = fields.parent_steps,
+		request = fields.request,
 		path_parts = {
 			first = fields.path_parts_first,
 			count = parts_count
@@ -947,27 +919,111 @@ pure func next_definition_id(builder: DiscoveryBuilder) -> DefinitionId:
 	definition_id_at_row(builder.definitions.length())
 
 
-pure func append_definition(builder: DiscoveryBuilder, row: DefinitionRow) -> DiscoveryBuilder:
-	{ builder | definitions = builder.definitions.append(row) }
+---
+Where `type_parameters` stood when its owner opened: a bound is numbered by how
+many parameters the table has gained since. Its own type, not an `Int`, so a
+sink that carries it holds no struct.
+---
+opaque type TypeParametersStart = Int
+
+---
+Where `supertraits` stood when its trait opened.
+---
+opaque type SupertraitsStart = Int
 
 
-pure func append_member(builder: DiscoveryBuilder, row: MemberRow) -> DiscoveryBuilder:
-	{ builder | members = builder.members.append(row) }
+---
+A definition that owns ordered rows (members, type parameters, supertraits,
+variant payloads, parameters), with where each of those tables stood when it
+opened. Its rows are written while it is the one being parsed, so a row's
+ordinal is how many rows its table has gained since: the table's length less
+the start recorded here, never a count a caller keeps. Plain integers, so
+taking one allocates nothing.
+---
+struct OwnedRows {
+	definition: DefinitionId,
+	members_first: Int,
+	type_parameters_first: TypeParametersStart,
+	supertraits_first: SupertraitsStart,
+	variant_payloads_first: Int,
+	parameters_first: Int
+}
 
 
+---
+The `OwnedRows` of `definition`, taken as it opens: every table starts at its
+end now.
+---
+pure func owned_rows(builder: DiscoveryBuilder, definition: DefinitionId) -> OwnedRows:
+	{
+		definition = definition,
+		members_first = builder.members.length(),
+		type_parameters_first = into_opaque TypeParametersStart(builder.type_parameters.length()),
+		supertraits_first = into_opaque SupertraitsStart(builder.supertraits.length()),
+		variant_payloads_first = builder.variant_payloads.length(),
+		parameters_first = builder.parameters.length()
+	}
+
+
+---
+What a written type parameter holds apart from its owner and its place among
+the owner's parameters, which the table gives it.
+---
+struct WrittenTypeParameter {
+	name: NameId,
+	kind: TypeParameterKind,
+	name_span: Span,
+	span: Span
+}
+
+
+---
+Appends `parameter` as the next type parameter of `owner`.
+---
 pure func append_type_parameter(
 	builder: DiscoveryBuilder,
-	row: TypeParameterRow,
+	owner: OwnedRows,
+	parameter: WrittenTypeParameter,
 ) -> DiscoveryBuilder:
-	{ builder | type_parameters = builder.type_parameters.append(row) }
+	ordinal: Int = builder.type_parameters.length() - from_opaque TypeParametersStart(
+		owner.type_parameters_first
+	)
+	{ builder | type_parameters = builder.type_parameters.append({
+			owner = owner.definition,
+			ordinal = ordinal,
+			name = parameter.name,
+			kind = parameter.kind,
+			name_span = parameter.name_span,
+			span = parameter.span,
+		}) }
 
 
 pure func next_bound_id(builder: DiscoveryBuilder) -> BoundId:
 	bound_id_at_row(builder.bounds.length())
 
 
-pure func append_bound(builder: DiscoveryBuilder, row: BoundRow) -> DiscoveryBuilder:
-	{ builder | bounds = builder.bounds.append(row) }
+---
+Appends a bound on the type parameter of `owner` that is being parsed, the one
+the next `append_type_parameter` of `owner` will write.
+---
+pure func append_bound(
+	builder: DiscoveryBuilder,
+	owner: DefinitionId,
+	parameters_start: TypeParametersStart,
+	trait_name: NameId,
+	name_span: Span,
+	span: Span,
+) -> DiscoveryBuilder:
+	parameter_ordinal: Int = builder.type_parameters.length() - from_opaque TypeParametersStart(
+		parameters_start
+	)
+	{ builder | bounds = builder.bounds.append({
+			owner = owner,
+			parameter_ordinal = parameter_ordinal,
+			trait_name = trait_name,
+			name_span = name_span,
+			span = span,
+		}) }
 
 
 pure func append_bound_qualifier(
@@ -1028,8 +1084,25 @@ pure func next_supertrait_id(builder: DiscoveryBuilder) -> SupertraitId:
 	supertrait_id_at_row(builder.supertraits.length())
 
 
-pure func append_supertrait(builder: DiscoveryBuilder, row: SupertraitRow) -> DiscoveryBuilder:
-	{ builder | supertraits = builder.supertraits.append(row) }
+---
+Appends a supertrait of `trait_definition`, the next in its declaration order.
+---
+pure func append_supertrait(
+	builder: DiscoveryBuilder,
+	trait_definition: DefinitionId,
+	supertraits_start: SupertraitsStart,
+	trait_name: NameId,
+	name_span: Span,
+	span: Span,
+) -> DiscoveryBuilder:
+	ordinal: Int = builder.supertraits.length() - from_opaque SupertraitsStart(supertraits_start)
+	{ builder | supertraits = builder.supertraits.append({
+			trait_definition = trait_definition,
+			ordinal = ordinal,
+			name = trait_name,
+			name_span = name_span,
+			span = span,
+		}) }
 
 
 pure func append_supertrait_qualifier(
@@ -1047,16 +1120,91 @@ pure func next_parameter_id(builder: DiscoveryBuilder) -> ParameterId:
 	parameter_id_at_row(builder.parameters.length())
 
 
-pure func append_parameter(builder: DiscoveryBuilder, row: ParameterRow) -> DiscoveryBuilder:
-	{ builder | parameters = builder.parameters.append(row) }
+---
+Appends a parameter with the named binder `binder` (`_` binds the discard
+name): the one binder name and the row in one update, so the row's block is
+exactly that name.
+---
+pure func append_named_parameter(
+	builder: DiscoveryBuilder,
+	owner: OwnedRows,
+	binder: BinderNameRow,
+	binder_span: Span,
+	span: Span,
+) -> DiscoveryBuilder:
+	names_first: Int = builder.binder_names.length()
+	ordinal: Int = builder.parameters.length() - owner.parameters_first
+	{ builder |
+		binder_names = builder.binder_names.append(binder),
+		parameters = builder.parameters.append({
+			owner = owner.definition,
+			ordinal = ordinal,
+			binder = NamedParameterBinder,
+			binder_names = {
+				first = names_first,
+				count = 1
+			},
+			binder_span = binder_span,
+			span = span,
+		})
+	}
 
 
-pure func next_binder_name_row(builder: DiscoveryBuilder) -> Int:
-	builder.binder_names.length()
+---
+Appends a parameter with a wildcard binder: no binder names, so the row's block
+is empty.
+---
+pure func append_wildcard_parameter(
+	builder: DiscoveryBuilder,
+	owner: OwnedRows,
+	binder_span: Span,
+	span: Span,
+) -> DiscoveryBuilder:
+	names_first: Int = builder.binder_names.length()
+	ordinal: Int = builder.parameters.length() - owner.parameters_first
+	{ builder | parameters = builder.parameters.append({
+			owner = owner.definition,
+			ordinal = ordinal,
+			binder = WildcardParameterBinder,
+			binder_names = {
+				first = names_first,
+				count = 0
+			},
+			binder_span = binder_span,
+			span = span,
+		}) }
 
 
-pure func append_binder_name(builder: DiscoveryBuilder, row: BinderNameRow) -> DiscoveryBuilder:
-	{ builder | binder_names = builder.binder_names.append(row) }
+---
+Appends a parameter with a tuple binder over `names`, in the order written: the
+names and the row in one update, so the row's block is exactly them. A count
+outside two to four is the parser's diagnostic to report, not a state the
+tables rule out.
+---
+pure func append_tuple_parameter(
+	builder: DiscoveryBuilder,
+	owner: OwnedRows,
+	names: List[BinderNameRow],
+	binder_span: Span,
+	span: Span,
+) -> DiscoveryBuilder:
+	names_first: Int = builder.binder_names.length()
+	names_count: Int = names.length()
+	ordinal: Int = builder.parameters.length() - owner.parameters_first
+	{ builder |
+		binder_names = builder.binder_names.concat(names),
+		parameters = builder.parameters.append({
+			owner = owner.definition,
+			ordinal = ordinal,
+			binder = TupleParameterBinder,
+			binder_names = {
+				first = names_first,
+				count = names_count
+			},
+			binder_span = binder_span,
+			span = span,
+		})
+	}
 
 
 pure func append_parameter_type(
@@ -1064,20 +1212,6 @@ pure func append_parameter_type(
 	row: ParameterTypeRow,
 ) -> DiscoveryBuilder:
 	{ builder | parameter_types = builder.parameter_types.append(row) }
-
-
-pure func append_definition_type(
-	builder: DiscoveryBuilder,
-	row: DefinitionTypeRow,
-) -> DiscoveryBuilder:
-	{ builder | definition_types = builder.definition_types.append(row) }
-
-
-pure func append_variant_payload(
-	builder: DiscoveryBuilder,
-	row: VariantPayloadRow,
-) -> DiscoveryBuilder:
-	{ builder | variant_payloads = builder.variant_payloads.append(row) }
 
 
 pure func append_dimension_constraint(
@@ -1181,15 +1315,51 @@ pure func append_resource_cleanup(
 
 
 ---
+The tables of the module being parsed that no frozen row or violation names.
+---
+enum TransientTable:
+	PendingDocstringTable
+	PendingAnnotationTable
+	InterpolationPartTable
+	InterpolationTextTable
+	ChildStackTable
+
+
+---
+The name of a transient table in a report.
+---
+pure func transient_table_name(table: TransientTable) -> String:
+	match table:
+		PendingDocstringTable:
+			"PendingDocstringTable"
+		PendingAnnotationTable:
+			"PendingAnnotationTable"
+		InterpolationPartTable:
+			"InterpolationPartTable"
+		InterpolationTextTable:
+			"InterpolationTextTable"
+		ChildStackTable:
+			"ChildStackTable"
+
+
+---
+`report_unreachable_lookup` for a transient table of the module being parsed.
+---
+pure func report_unreachable_transient(table: TransientTable, index: Int, guarantee: String):
+	debug:
+		dbg.error("${table.transient_table_name()} row ${index} does not exist, but ${guarantee}")
+
+
+---
 Reports a lookup that cannot miss: an id the table issued, or an index inside a
 range the caller read from the same table. A debug build stops with the
 message, so the broken caller is found where it read; a release build returns
 the documented `UNREACHABLE_...` row and goes on, since a language-level
 operation must not crash. `guarantee` says why the row exists.
 ---
-pure func report_unreachable_lookup(table: String, index: Int, guarantee: String):
+pure func report_unreachable_lookup(table: DiscoveryTable, index: Int, guarantee: String):
 	debug:
-		dbg.error("${table} row ${index} does not exist, but ${guarantee}")
+		dbg.error("${table.discovery_table_name()} row ${index} does not exist, but ${guarantee}")
 
 
 -- Diagnostics.
@@ -1202,6 +1372,13 @@ pure func append_plain_diagnostic(
 	span: Span,
 ) -> DiscoveryBuilder:
 	builder.append_syntax_diagnostic(span, Plain(code))
+
+
+---
+The id the next appended diagnostic will receive.
+---
+pure func next_diagnostic_id(builder: DiscoveryBuilder) -> DiagnosticId:
+	diagnostic_id_at_row(builder.diagnostics.length())
 
 
 ---
@@ -1232,8 +1409,7 @@ pure func without_transient_tables(builder: DiscoveryBuilder) -> DiscoveryBuilde
 		interpolation_parts = [],
 		interpolation_texts = [],
 		child_stack = [],
-		child_stack_depth = 0,
-		loop_context = NotInLoop
+		child_stack_depth = 0
 	}
 
 
@@ -1264,8 +1440,8 @@ pure func pending_docstring_at(builder: DiscoveryBuilder, index: Int) -> Literal
 		Some(text):
 			text
 		None:
-			report_unreachable_lookup(
-				"pending docstring",
+			report_unreachable_transient(
+				PendingDocstringTable,
 				index,
 				"callers pass an index inside a docstring range they read",
 			)
@@ -1326,8 +1502,8 @@ pure func interpolation_part_at(builder: DiscoveryBuilder, index: Int) -> Interp
 		Some(row):
 			row
 		None:
-			report_unreachable_lookup(
-				"interpolation part",
+			report_unreachable_transient(
+				InterpolationPartTable,
 				index,
 				"callers pass an index inside a parts range they read",
 			)
@@ -1343,8 +1519,8 @@ pure func interpolation_text_at(builder: DiscoveryBuilder, index: Int) -> Litera
 		Some(text):
 			text
 		None:
-			report_unreachable_lookup(
-				"interpolation text",
+			report_unreachable_transient(
+				InterpolationTextTable,
 				index,
 				"callers pass an index inside a parts range they read",
 			)
@@ -1381,8 +1557,8 @@ pure func pending_annotation_at(builder: DiscoveryBuilder, index: Int) -> Pendin
 		Some(row):
 			row
 		None:
-			report_unreachable_lookup(
-				"pending annotation",
+			report_unreachable_transient(
+				PendingAnnotationTable,
 				index,
 				"callers pass an index inside a range they read",
 			)
@@ -1427,12 +1603,3 @@ pure func append_resolution_diagnostic_at(
 			span = span,
 			diagnostic = diagnostic,
 		}) }
-
-
----
-`builder` parsing statements in `context`. A routine that parses a nested body
-reads `loop_context` into a local first, enters the body's context with this,
-and restores the local afterwards.
----
-pure func with_loop_context(builder: DiscoveryBuilder, context: LoopContext) -> DiscoveryBuilder:
-	{ builder | loop_context = context }

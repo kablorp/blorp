@@ -26,6 +26,7 @@ import:
 	scan_support:
 		LiteralScan,
 		PendingDiagnostic,
+		ScanStop(StoppedAtToken),
 		ScannedLiteral(InterpolatedLiteral),
 		after_blanks,
 		byte_at,
@@ -126,7 +127,7 @@ pure func scan_interpolated_string_tail(text: String, offset: Int) -> LiteralSca
 				end = position,
 				literal = InterpolatedLiteral(InterpolatedStringToken),
 				diagnostics = [],
-				ended_with_newline = False
+				stop = StoppedAtToken
 			}
 
 
@@ -173,10 +174,12 @@ private pure func hole_failure(failed: HoleFailure) -> PendingDiagnostic:
 
 
 ---
-What a frame of `hole_scan`'s stack holds for a string literal inside a hole;
-a frame of code holds its count of open braces, at least one.
+One level of `hole_scan`'s stack: code, holding its count of open braces (at
+least one), or a string literal inside a hole.
 ---
-private STRING_FRAME: Int = -1
+private union ScanFrame:
+	CodeFrame(Int)
+	StringFrame
 
 
 ---
@@ -189,7 +192,7 @@ nothing. A character literal in code is opaque too, as a string is. A
 backslash skips the byte after it, in code and in strings.
 ---
 private pure func hole_scan(text: String, start: Int, end: Int) -> HoleScan:
-	var frames: List[Int] = [1]
+	var frames: List[ScanFrame] = [CodeFrame(1)]
 	var open_braces: Int = 1
 	var position: Int = start
 	var result: Option[HoleScan] = None
@@ -205,27 +208,31 @@ private pure func hole_scan(text: String, start: Int, end: Int) -> HoleScan:
 			match frames.get(frames.length() - 1):
 				None:
 					result = Some(HoleFailed(HoleUnterminated(position)))
-				Some(top):
+				Some(StringFrame):
 					if c == '\n':
 						result = Some(HoleFailed(HoleCrossesLine(position)))
 					else if c == '\\':
 						position += 2
-					else if top == STRING_FRAME:
-						if c == '\"':
-							frames = frames.drop_last()
-							position += 1
-						else if c == '$' and text_at(text, position, INTERPOLATION_OPENER):
-							frames = frames.append(1)
-							open_braces += 1
-
-							if open_braces > MAX_INTERPOLATION_DEPTH:
-								result = Some(HoleFailed(HoleTooDeep(position)))
-
-							position += 2
-						else:
-							position += 1
 					else if c == '\"':
-						frames = frames.append(STRING_FRAME)
+						frames = frames.drop_last()
+						position += 1
+					else if c == '$' and text_at(text, position, INTERPOLATION_OPENER):
+						frames = frames.append(CodeFrame(1))
+						open_braces += 1
+
+						if open_braces > MAX_INTERPOLATION_DEPTH:
+							result = Some(HoleFailed(HoleTooDeep(position)))
+
+						position += 2
+					else:
+						position += 1
+				Some(CodeFrame(braces)):
+					if c == '\n':
+						result = Some(HoleFailed(HoleCrossesLine(position)))
+					else if c == '\\':
+						position += 2
+					else if c == '\"':
+						frames = frames.append(StringFrame)
 						position += 1
 					else if c == '\'':
 						-- A character literal is one token of the hole's code, so a
@@ -234,7 +241,7 @@ private pure func hole_scan(text: String, start: Int, end: Int) -> HoleScan:
 						position = scan_char_literal(text, position, end).end
 					else if c == '$' and text_at(text, position, INTERPOLATION_OPENER):
 						-- A `${` in code opens a brace, as the existing lexer counts it.
-						frames = frames.set(frames.length() - 1, top + 1)
+						frames = frames.set(frames.length() - 1, CodeFrame(braces + 1))
 						open_braces += 1
 
 						if open_braces > MAX_INTERPOLATION_DEPTH:
@@ -242,19 +249,19 @@ private pure func hole_scan(text: String, start: Int, end: Int) -> HoleScan:
 
 						position += 2
 					else if c == '{':
-						frames = frames.set(frames.length() - 1, top + 1)
+						frames = frames.set(frames.length() - 1, CodeFrame(braces + 1))
 						open_braces += 1
 						position += 1
 					else if c == '}':
 						open_braces -= 1
 
-						if top == 1:
+						if braces == 1:
 							frames = frames.drop_last()
 
 							if frames.is_empty():
 								result = Some(HoleClosed(position))
 						else:
-							frames = frames.set(frames.length() - 1, top - 1)
+							frames = frames.set(frames.length() - 1, CodeFrame(braces - 1))
 
 						position += 1
 					else:
@@ -310,17 +317,11 @@ did.
 ---
 private record PieceScan {
 	parts: List[ScannedPart],
-	piece_start: Int,
+	piece_start: Option[Int],
 	run_start: Int,
 	decoded: String,
 	text: PieceText
 }
-
-
----
-What `PieceScan.piece_start` holds while no text piece is open.
----
-private NO_PIECE: Int = -1
 
 
 ---
@@ -397,7 +398,7 @@ pure func interpolation_parts(
 ) -> List[ScannedPart]:
 	var scan: PieceScan = {
 		parts = [],
-		piece_start = NO_PIECE,
+		piece_start = None,
 		run_start = 0,
 		decoded = "",
 		text = SourceBytes
@@ -467,7 +468,7 @@ private pure func scan_segment(
 			position += 1
 
 	-- A piece that continues on the next line cannot be one source slice.
-	if more_follow and scan.piece_start != NO_PIECE:
+	if more_follow and scan.piece_start.is_some():
 		scan = decoded_through(text, scan, segment.end)
 
 	scan
@@ -477,9 +478,9 @@ private pure func scan_segment(
 Opens a text piece at `position` unless one is open.
 ---
 private pure func open_piece(scan: PieceScan, position: Int) -> PieceScan:
-	if scan.piece_start == NO_PIECE:
+	if scan.piece_start.is_none():
 		{ scan |
-			piece_start = position,
+			piece_start = Some(position),
 			run_start = position,
 			decoded = "",
 			text = SourceBytes
@@ -528,26 +529,27 @@ private pure func decoded_through(text: String, scan: PieceScan, position: Int) 
 Closes the open piece, if any, at `position`, appending it to the parts.
 ---
 private pure func close_piece_into(text: String, scan: PieceScan, position: Int) -> PieceScan:
-	if scan.piece_start == NO_PIECE:
-		scan
-	else:
-		closed: PieceScan = if scan.text == DecodedText:
-			decoded_through(text, scan, position)
-		else:
+	match scan.piece_start:
+		None:
 			scan
+		Some(piece_start):
+			closed: PieceScan = if scan.text == DecodedText:
+				decoded_through(text, scan, position)
+			else:
+				scan
 
-		{ closed |
-			parts = closed.parts.append({
-				part = TextPart,
-				start = closed.piece_start,
-				end = position,
-				text = closed.text,
-				decoded = closed.decoded,
-			}),
-			piece_start = NO_PIECE,
-			decoded = "",
-			text = SourceBytes
-		}
+			{ closed |
+				parts = closed.parts.append({
+					part = TextPart,
+					start = piece_start,
+					end = position,
+					text = closed.text,
+					decoded = closed.decoded,
+				}),
+				piece_start = None,
+				decoded = "",
+				text = SourceBytes
+			}
 
 
 private pure func close_piece(text: String, scan: PieceScan, position: Int) -> List[ScannedPart]:

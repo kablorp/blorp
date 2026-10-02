@@ -4,33 +4,55 @@
 -- `DiscoveryBuilder` and follows its threading rules; the record and the
 -- other tables are in `builder`.
 import:
-	builder: DiscoveryBuilder, report_unreachable_lookup
+	builder:
+		DiscoveryBuilder,
+		TransientTable(ChildStackTable),
+		append_plain_diagnostic,
+		next_diagnostic_id,
+		report_unreachable_lookup,
+		report_unreachable_transient,
 	debug as dbg
+	diagnostic_code: PlainSyntaxCode
 	ids:
 		DefinitionId,
+		DiagnosticId,
 		LiteralId,
 		NameId,
 		NodeId,
 		definition_id_index,
+		diagnostic_id_index,
 		literal_id_index,
 		name_id_index,
 		node_id_at_row,
 		node_id_index,
-	row_kinds: NodeKind(MissingExpressionNode), arity_admits, node_schema
-	rows:
-		BodyRow,
-		ConcurrencyCountRow,
-		DimensionNameRow,
-		EMPTY_ROW_RANGE,
-		ElseKeywordRow,
-		NO_SPAN,
-		NodeNameSpanRow,
-		NodeRow,
-	span: Span
-
-
-pure func append_body(builder: DiscoveryBuilder, row: BodyRow) -> DiscoveryBuilder:
-	{ builder | bodies = builder.bodies.append(row) }
+	invariants/violation: DiscoveryTable(NodeTable)
+	node_kind_classes:
+		CodepointLeafKind,
+		LiteralLeafKind,
+		NameLeafKind,
+		NameOnlyParentKind,
+		NamedParentKind,
+		NamedSpannedLeafKind,
+		PlainLeafKind,
+		PlainParentKind,
+		SpannedLeafKind,
+		node_kind_of_codepoint_leaf,
+		node_kind_of_literal_leaf,
+		node_kind_of_name_leaf,
+		node_kind_of_name_only_parent,
+		node_kind_of_named_parent,
+		node_kind_of_named_spanned_leaf,
+		node_kind_of_plain_leaf,
+		node_kind_of_plain_parent,
+		node_kind_of_spanned_leaf,
+	row_kinds:
+		MissingNodeKind,
+		NodeKind(LocalFunctionNode, MissingExpressionNode),
+		arity_admits,
+		missing_node_kind,
+		node_schema,
+	rows: BodyRow, DimensionNameRow, EMPTY_ROW_RANGE, ElseKeywordRow, NodeNameSpanRow, NodeRow
+	span: NO_SPAN, Span
 
 
 -- Body nodes.
@@ -41,7 +63,7 @@ pure func next_node_id(builder: DiscoveryBuilder) -> NodeId:
 	node_id_at_row(builder.nodes.length())
 
 
-pure func append_node(builder: DiscoveryBuilder, row: NodeRow) -> DiscoveryBuilder:
+private pure func append_node(builder: DiscoveryBuilder, row: NodeRow) -> DiscoveryBuilder:
 	{ builder | nodes = builder.nodes.append(row) }
 
 
@@ -57,27 +79,6 @@ pure func append_node_name_span(
 	row: NodeNameSpanRow,
 ) -> DiscoveryBuilder:
 	{ builder | node_name_spans = builder.node_name_spans.append(row) }
-
-
-pure func append_concurrency_count(
-	builder: DiscoveryBuilder,
-	row: ConcurrencyCountRow,
-) -> DiscoveryBuilder:
-	{ builder | concurrency_counts = builder.concurrency_counts.append(row) }
-
-
----
-Records the `count` the concurrency parameter node appended most recently wrote.
----
-pure func record_concurrency_count_of_last_node(
-	builder: DiscoveryBuilder,
-	count: Int,
-) -> DiscoveryBuilder:
-	parameter: NodeId = builder.last_node_id()
-	builder.append_concurrency_count({
-		parameter = parameter,
-		count = count,
-	})
 
 
 pure func append_else_keyword(builder: DiscoveryBuilder, row: ElseKeywordRow) -> DiscoveryBuilder:
@@ -102,7 +103,7 @@ pure func record_else_keyword_of_last_node(
 Records the span of the name of the node appended most recently, for a node
 whose name does not span the whole node (see `NodeNameSpanRow`).
 ---
-pure func record_name_span_of_last_node(
+private pure func record_name_span_of_last_node(
 	builder: DiscoveryBuilder,
 	name_span: Span,
 ) -> DiscoveryBuilder:
@@ -148,7 +149,7 @@ pure func node_row(builder: DiscoveryBuilder, node: NodeId) -> NodeRow:
 			row
 		None:
 			report_unreachable_lookup(
-				"node",
+				NodeTable,
 				node.node_id_index(),
 				"parse routines read only nodes they appended",
 			)
@@ -210,11 +211,11 @@ pure func push_last_node(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 ---
 Where the next block of node children will start.
 ---
-pure func next_node_child_row(builder: DiscoveryBuilder) -> Int:
+private pure func next_node_child_row(builder: DiscoveryBuilder) -> Int:
 	builder.node_children.length()
 
 
-pure func append_node_child(builder: DiscoveryBuilder, child: NodeId) -> DiscoveryBuilder:
+private pure func append_node_child(builder: DiscoveryBuilder, child: NodeId) -> DiscoveryBuilder:
 	{ builder | node_children = builder.node_children.append(child) }
 
 
@@ -274,13 +275,13 @@ pure func child_count_since(builder: DiscoveryBuilder, mark: ChildMark) -> Int:
 ---
 Appends a node over every child pushed since `mark`, claiming them.
 ---
-pure func append_parent_node_since(
+pure func append_plain_parent_node_since(
 	builder: DiscoveryBuilder,
 	mark: ChildMark,
-	kind: NodeKind,
+	kind: PlainParentKind,
 	span: Span,
 ) -> DiscoveryBuilder:
-	builder.append_parent_node_from_stack(
+	builder.append_plain_parent_node_from_stack(
 		kind,
 		span,
 		builder.child_count_since(mark),
@@ -288,13 +289,13 @@ pure func append_parent_node_since(
 
 
 ---
-`append_parent_node_since` for a kind whose payload is a name, with its name
-span row, as `append_named_parent_node_from_stack`.
+`append_plain_parent_node_since` for a kind whose payload is a name, with its
+name span row, as `append_named_parent_node_from_stack`.
 ---
 pure func append_named_parent_node_since(
 	builder: DiscoveryBuilder,
 	mark: ChildMark,
-	kind: NodeKind,
+	kind: NamedParentKind,
 	span: Span,
 	name: NameId,
 	name_span: Span,
@@ -313,26 +314,39 @@ Appends `children` as one block of the edge table, then the node over them:
 the post-order write every parent node takes. Read the new node's id first
 with `next_node_id`, or afterwards with `last_node_id`.
 ---
-pure func append_parent_node(
+pure func append_plain_parent_node(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: PlainParentKind,
 	span: Span,
 	children: List[NodeId],
 ) -> DiscoveryBuilder:
-	builder.append_parent_node_with_payload(kind, span, NO_NODE_PAYLOAD, children)
+	builder.append_parent_node_with_payload(
+		kind.node_kind_of_plain_parent(),
+		span,
+		NO_NODE_PAYLOAD,
+		children,
+	)
 
 
 ---
-`append_parent_node` for a kind whose payload is a name.
+`append_plain_parent_node` for a kind whose payload is a name that is narrower than
+the node, followed by its `NodeNameSpanRow` for `name_span`.
 ---
 pure func append_named_parent_node(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: NamedParentKind,
 	span: Span,
 	name: NameId,
+	name_span: Span,
 	children: List[NodeId],
 ) -> DiscoveryBuilder:
-	builder.append_parent_node_with_payload(kind, span, name.name_id_index(), children)
+	appended: DiscoveryBuilder = builder.append_parent_node_with_payload(
+		kind.node_kind_of_named_parent(),
+		span,
+		name.name_id_index(),
+		children,
+	)
+	appended.record_name_span_of_last_node(name_span)
 
 
 private pure func append_parent_node_with_payload(
@@ -395,13 +409,18 @@ Appends a node over the last `count` children pushed with `push_child`,
 claiming them from the stack: the edges are copied into `node_children` and
 the node row is appended after them in one update each.
 ---
-pure func append_parent_node_from_stack(
+pure func append_plain_parent_node_from_stack(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: PlainParentKind,
 	span: Span,
 	count: Int,
 ) -> DiscoveryBuilder:
-	builder.append_parent_node_from_stack_with_payload(kind, span, NO_NODE_PAYLOAD, count)
+	builder.append_parent_node_from_stack_with_payload(
+		kind.node_kind_of_plain_parent(),
+		span,
+		NO_NODE_PAYLOAD,
+		count,
+	)
 
 
 ---
@@ -412,14 +431,14 @@ every such kind (`needs_name_span_row`). A name that is the whole node has
 ---
 pure func append_named_parent_node_from_stack(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: NamedParentKind,
 	span: Span,
 	name: NameId,
 	name_span: Span,
 	count: Int,
 ) -> DiscoveryBuilder:
 	appended: DiscoveryBuilder = builder.append_parent_node_from_stack_with_payload(
-		kind,
+		kind.node_kind_of_named_parent(),
 		span,
 		name.name_id_index(),
 		count,
@@ -433,12 +452,17 @@ name is the whole node, so it has no name span row: an untyped lambda parameter.
 ---
 pure func append_name_only_parent_node_from_stack(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: NameOnlyParentKind,
 	span: Span,
 	name: NameId,
 	count: Int,
 ) -> DiscoveryBuilder:
-	builder.append_parent_node_from_stack_with_payload(kind, span, name.name_id_index(), count)
+	builder.append_parent_node_from_stack_with_payload(
+		kind.node_kind_of_name_only_parent(),
+		span,
+		name.name_id_index(),
+		count,
+	)
 
 
 private pure func append_parent_node_from_stack_with_payload(
@@ -510,8 +534,8 @@ private pure func stack_entry(builder: DiscoveryBuilder, index: Int) -> NodeId:
 		Some(node):
 			node
 		None:
-			report_unreachable_lookup(
-				"child stack",
+			report_unreachable_transient(
+				ChildStackTable,
 				index,
 				"callers pass an index below the stack depth",
 			)
@@ -523,62 +547,162 @@ private pure func with_child_stack_depth(builder: DiscoveryBuilder, depth: Int) 
 
 
 ---
-Appends a node with no children.
+Appends a leaf with no payload.
 ---
-pure func append_leaf_node(
+pure func append_plain_leaf_node(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: PlainLeafKind,
 	span: Span,
 ) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, NO_NODE_PAYLOAD)
+	builder.append_leaf_node_with_payload(kind.node_kind_of_plain_leaf(), span, NO_NODE_PAYLOAD)
 
 
 ---
-A leaf whose payload is a name (see `node_payload_reference`).
+Appends a leaf with no payload whose name is narrower than the node, with its
+`NodeNameSpanRow`.
+---
+pure func append_spanned_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: SpannedLeafKind,
+	span: Span,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	appended: DiscoveryBuilder = builder.append_leaf_node_with_payload(
+		kind.node_kind_of_spanned_leaf(),
+		span,
+		NO_NODE_PAYLOAD,
+	)
+	appended.record_name_span_of_last_node(name_span)
+
+
+---
+A recovery leaf of `kind` over `span`, with the diagnostic `code` at
+`diagnostic_span` that reports it. The diagnostic is appended in this call and the
+node carries its id, so a recovery node names a diagnostic of the module that
+holds it, and no caller holds a diagnostic id to pair it with the wrong node.
+---
+pure func append_missing_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: MissingNodeKind,
+	span: Span,
+	code: PlainSyntaxCode,
+	diagnostic_span: Span,
+) -> DiscoveryBuilder:
+	diagnostic: DiagnosticId = builder.next_diagnostic_id()
+	reported: DiscoveryBuilder = builder.append_plain_diagnostic(code, diagnostic_span)
+	reported.append_leaf_node_with_payload(
+		kind.missing_node_kind(),
+		span,
+		diagnostic.diagnostic_id_index(),
+	)
+
+
+---
+A `MissingExpressionNode` over every child pushed since `mark`, with the
+diagnostic `code` at `diagnostic_span` that reports it, appended in this call.
+---
+pure func append_missing_parent_node_since(
+	builder: DiscoveryBuilder,
+	mark: ChildMark,
+	span: Span,
+	code: PlainSyntaxCode,
+	diagnostic_span: Span,
+) -> DiscoveryBuilder:
+	count: Int = builder.child_count_since(mark)
+	diagnostic: DiagnosticId = builder.next_diagnostic_id()
+	reported: DiscoveryBuilder = builder.append_plain_diagnostic(code, diagnostic_span)
+	reported.append_missing_parent_node_from_stack(span, diagnostic, count)
+
+
+---
+A `MissingExpressionNode` over the last `count` children pushed, linked to
+`diagnostic`, which the caller appended before the children it spans were parsed
+(a field assignment is rejected before its value is). The one recovery path that
+holds a diagnostic id: the freeze check `RecoveryDiagnosticOutsideModule` guards it.
+---
+pure func append_missing_parent_node_from_stack(
+	builder: DiscoveryBuilder,
+	span: Span,
+	diagnostic: DiagnosticId,
+	count: Int,
+) -> DiscoveryBuilder:
+	builder.append_parent_node_from_stack_with_payload(
+		MissingExpressionNode,
+		span,
+		diagnostic.diagnostic_id_index(),
+		count,
+	)
+
+
+---
+Appends a leaf whose payload is a name.
 ---
 pure func append_name_leaf_node(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: NameLeafKind,
 	span: Span,
 	name: NameId,
 ) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, name.name_id_index())
+	builder.append_leaf_node_with_payload(kind.node_kind_of_name_leaf(), span, name.name_id_index())
 
 
 ---
-A leaf whose payload is a literal.
+Appends a leaf whose payload is a name that is narrower than the node, with its
+`NodeNameSpanRow`.
+---
+pure func append_named_spanned_leaf_node(
+	builder: DiscoveryBuilder,
+	kind: NamedSpannedLeafKind,
+	span: Span,
+	name: NameId,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	appended: DiscoveryBuilder = builder.append_leaf_node_with_payload(
+		kind.node_kind_of_named_spanned_leaf(),
+		span,
+		name.name_id_index(),
+	)
+	appended.record_name_span_of_last_node(name_span)
+
+
+---
+Appends a leaf whose payload is a literal.
 ---
 pure func append_literal_leaf_node(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: LiteralLeafKind,
 	span: Span,
 	literal: LiteralId,
 ) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, literal.literal_id_index())
+	builder.append_leaf_node_with_payload(
+		kind.node_kind_of_literal_leaf(),
+		span,
+		literal.literal_id_index(),
+	)
 
 
 ---
-A leaf whose payload is a character's codepoint.
+Appends a leaf whose payload is a character's codepoint.
 ---
 pure func append_codepoint_leaf_node(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: CodepointLeafKind,
 	span: Span,
 	codepoint: Int,
 ) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, codepoint)
+	builder.append_leaf_node_with_payload(kind.node_kind_of_codepoint_leaf(), span, codepoint)
 
 
 ---
-A leaf whose payload is a definition.
+Appends the `LocalFunctionNode` of the local function `definition`: the only
+node whose payload is a definition.
 ---
-pure func append_definition_leaf_node(
+pure func append_local_function_node(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
 	span: Span,
 	definition: DefinitionId,
 ) -> DiscoveryBuilder:
-	builder.append_leaf_node_with_payload(kind, span, definition.definition_id_index())
+	builder.append_leaf_node_with_payload(LocalFunctionNode, span, definition.definition_id_index())
 
 
 private pure func append_leaf_node_with_payload(

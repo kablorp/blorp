@@ -3,12 +3,7 @@
 -- recognizes a record field or a removed ascription. The recursive grammar
 -- (operators, calls, lists, `if`, lambdas) stays in `body_parser`.
 import:
-	../tables/builder:
-		DiscoveryBuilder,
-		LoopContext(InLoopBody, NotInLoop),
-		advance_token,
-		append_plain_diagnostic,
-		move_token_cursor,
+	../tables/builder: DiscoveryBuilder, advance_token, append_plain_diagnostic, move_token_cursor
 	../tables/diagnostic_code:
 		PlainSyntaxCode(
 			ExpectedBuiltinNameDiagnostic, ExpectedExpressionDiagnostic,
@@ -20,16 +15,23 @@ import:
 	../tables/ids: NameId, literal_id_at_row, name_id_at_row
 	../tables/node_builder:
 		append_codepoint_leaf_node,
-		append_leaf_node,
 		append_literal_leaf_node,
 		append_name_leaf_node,
 		append_named_parent_node_from_stack,
+		append_plain_leaf_node,
 		last_node_id,
 		push_last_node,
+	../tables/node_kind_classes:
+		CodepointLeafKind(CharLiteralLeaf),
+		LiteralLeafKind(NamedBuiltinLeaf),
+		NameLeafKind(IdentifierLeaf),
+		NamedParentKind(FieldAccessParent),
+		PlainLeafKind(BuiltinLeaf),
 	../tables/row_kinds:
+		MissingNodeKind(MissingExpression),
 		NodeKind(
 			BuiltinNode, CharLiteralNode, FieldAccessNode, IdentifierNode, LocalFunctionNode,
-			MissingExpressionNode, NamedBuiltinNode,
+			NamedBuiltinNode,
 		),
 	../tables/span: Span, span_covering
 	../tables/token:
@@ -41,6 +43,7 @@ import:
 			RightParenSymbol,
 		),
 	block_layout: closing_span_or
+	body_scope: BodyScope, LoopContext(InLoopBody, NotInLoop)
 	parser_cursor:
 		consume_referenced_name,
 		current_name,
@@ -51,6 +54,7 @@ import:
 		peek_kind,
 		referenced_name_at_cursor,
 		report_and_recover,
+		report_missing_and_recover,
 		token_kind_at,
 	type_parser: node_span
 
@@ -123,7 +127,7 @@ pure func parse_field_access(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	out
 		.consume_referenced_name(NameInFieldName)
 		.append_named_parent_node_from_stack(
-			FieldAccessNode,
+			FieldAccessParent,
 			receiver_span.span_covering(field_span),
 			field,
 			field_span,
@@ -132,17 +136,14 @@ pure func parse_field_access(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 
 
 ---
-Reports a missing expression and appends a `MissingExpressionNode`; the
-offending token is skipped unless it is a soft boundary.
+Reports a missing expression and appends a `MissingExpressionNode` linked to
+that diagnostic; the offending token is skipped unless it is a soft boundary.
 ---
 pure func missing_expression(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	span: Span = builder.current_span()
-	builder
-		.report_and_recover(ExpectedExpressionDiagnostic)
-		.append_leaf_node(MissingExpressionNode, span)
+	builder.report_missing_and_recover(MissingExpression, ExpectedExpressionDiagnostic)
 
 
-pure func literal_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+pure func literal_leaf(builder: DiscoveryBuilder, kind: LiteralLeafKind) -> DiscoveryBuilder:
 	token: Token = builder.current_token()
 	builder
 		.advance_token()
@@ -153,14 +154,14 @@ pure func char_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	token: Token = builder.current_token()
 	builder
 		.advance_token()
-		.append_codepoint_leaf_node(CharLiteralNode, token.span, token.payload)
+		.append_codepoint_leaf_node(CharLiteralLeaf, token.span, token.payload)
 
 
-pure func keyword_leaf(builder: DiscoveryBuilder, kind: NodeKind) -> DiscoveryBuilder:
+pure func keyword_leaf(builder: DiscoveryBuilder, kind: PlainLeafKind) -> DiscoveryBuilder:
 	span: Span = builder.current_span()
 	builder
 		.advance_token()
-		.append_leaf_node(kind, span)
+		.append_plain_leaf_node(kind, span)
 
 
 ---
@@ -169,12 +170,13 @@ inside a loop body.
 ---
 pure func loop_keyword_leaf(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	scope: BodyScope,
+	kind: PlainLeafKind,
 	outside_loop: PlainSyntaxCode,
 ) -> DiscoveryBuilder:
 	keyword_span: Span = builder.current_span()
 
-	match builder.loop_context:
+	match scope.loop_context:
 		InLoopBody:
 			builder.keyword_leaf(kind)
 		NotInLoop:
@@ -194,7 +196,7 @@ pure func keyword_name_leaf(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 		Some(index):
 			builder
 				.advance_token()
-				.append_name_leaf_node(IdentifierNode, token.span, name_id_at_row(index))
+				.append_name_leaf_node(IdentifierLeaf, token.span, name_id_at_row(index))
 		None:
 			builder.missing_expression()
 
@@ -206,7 +208,7 @@ pure func parse_identifier_expression(builder: DiscoveryBuilder) -> DiscoveryBui
 	token: Token = builder.current_token()
 	builder
 		.advance_token()
-		.append_name_leaf_node(IdentifierNode, token.span, name_id_at_row(token.payload))
+		.append_name_leaf_node(IdentifierLeaf, token.span, name_id_at_row(token.payload))
 
 
 ---
@@ -216,7 +218,7 @@ pure func parse_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
 	if builder.peek_kind(1) == LeftParenSymbol:
 		builder.parse_named_builtin()
 	else:
-		builder.keyword_leaf(BuiltinNode)
+		builder.keyword_leaf(BuiltinLeaf)
 
 
 private pure func parse_named_builtin(builder: DiscoveryBuilder) -> DiscoveryBuilder:
@@ -237,13 +239,13 @@ private pure func parse_named_builtin(builder: DiscoveryBuilder) -> DiscoveryBui
 
 	if named:
 		closed.append_literal_leaf_node(
-			NamedBuiltinNode,
+			NamedBuiltinLeaf,
 			start.span_covering(end),
 			literal_id_at_row(name.payload),
 		)
 	else:
-		closed.append_leaf_node(
-			BuiltinNode,
+		closed.append_plain_leaf_node(
+			BuiltinLeaf,
 			start.span_covering(end),
 		)
 

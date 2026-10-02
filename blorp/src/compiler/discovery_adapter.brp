@@ -50,6 +50,7 @@ import:
 		module_id_index,
 		name_id_at_row,
 		name_id_index as table_name_index,
+		name_ids_equal as table_names_equal,
 		node_id_at_row,
 		node_id_index,
 		parameter_id_index,
@@ -61,7 +62,7 @@ import:
 			AnnotationTable, BinderNameTable, BodyTable, BoundTable, DefinitionTable,
 			DefinitionTypeTable, DimensionConstraintTable, DimensionNameTable, DocumentationTable,
 			ElseKeywordTable, ForeignArgumentTable, ForeignBindingTable, ForeignBlockTable,
-			ForeignCNameTable, ImportBlockTable, ImportItemTable, ImportItemVariantTable,
+			ForeignCNameTable, ImplTable, ImportBlockTable, ImportItemTable, ImportItemVariantTable,
 			ImportTable, MemberTable, ModuleDocumentationTable, ModulePackageTable, ModuleTable,
 			NodeChildTable, NodeNameSpanTable, NodeTable, ParameterTable, ParameterTypeTable,
 			ResourceCleanupTable, SignatureTable, SupertraitTable, TypeParameterTable,
@@ -69,9 +70,9 @@ import:
 		),
 		discovery_table_name,
 	../compiler_new/stage_01_discovery/tables/name_vocabulary:
-		LIMIT_NAME_INDEX,
-		MAX_THREADS_NAME_INDEX,
-		TIMEOUT_NAME_INDEX,
+		LIMIT_NAME,
+		MAX_THREADS_NAME,
+		TIMEOUT_NAME,
 	../compiler_new/stage_01_discovery/tables/row_kinds as Kinds
 	../compiler_new/stage_01_discovery/tables/rows:
 		DefinitionRow,
@@ -299,6 +300,7 @@ the tables do not hold.
 ---
 record DeclarationReader {
 	tables: Tables.FrontendTables,
+	import_texts: List[String],
 	module_names: List[String],
 	source_paths: List[String],
 	members: OwnerRows,
@@ -313,6 +315,7 @@ record DeclarationReader {
 	foreign_block_functions: OwnerRows,
 	documentation_of: List[Int],
 	signature_of: List[Int],
+	impl_of: List[Int],
 	definition_type_of: List[Int],
 	parameter_type_of: List[Int],
 	body_of: List[Int],
@@ -509,6 +512,7 @@ The existing front end's name for each module, in module order: see
 private pure func legacy_module_names(
 	tables: Tables.FrontendTables,
 	naming: LegacyModuleNaming,
+	import_texts: List[String],
 ) -> Result[List[String], LegacyAdapterError]:
 	modules: Int = Tables.module_count(tables)
 	root_requests: List[Int] = first_requests(
@@ -543,6 +547,7 @@ private pure func legacy_module_names(
 			root_requests,
 			implicit_requests,
 			import_requests,
+			import_texts,
 		),
 	))
 
@@ -603,6 +608,7 @@ private pure func legacy_module_name(
 	root_requests: List[Int],
 	implicit_requests: List[Int],
 	import_requests: List[Int],
+	import_texts: List[String],
 ) -> Result[String, LegacyAdapterError]:
 	row: ModuleRow = Tables.module_row(tables, module_id_at_row(module))
 
@@ -632,7 +638,15 @@ private pure func legacy_module_name(
 				ImportTable,
 				import_row,
 			)
-			Ok(imported_module_name(tables, naming, row, imported))
+			Ok(
+				imported_module_name(
+					tables,
+					naming,
+					row,
+					imported,
+					import_texts.get_or(import_row, ""),
+				),
+			)
 
 
 ---
@@ -659,10 +673,16 @@ private pure func imported_module_name(
 	naming: LegacyModuleNaming,
 	module: ModuleRow,
 	request: ImportRow,
+	request_text: String,
 ) -> String:
-	path_name: String = naming.path_module_name(Tables.path_text(tables, module.canonical_path))
+	path_name: String = naming.path_module_name(
+		Tables.path_text(
+			tables,
+			Tables.module_path(tables, module),
+		),
+	)
 
-	match request.request_kind:
+	match request.request.request_kind():
 		Kinds.RelativeModuleRequest:
 			path_name
 		_:
@@ -670,7 +690,7 @@ private pure func imported_module_name(
 				Kinds.UserModule:
 					path_name
 				_:
-					Tables.path_text(tables, request.request_path)
+					request_text
 
 
 ---
@@ -719,6 +739,25 @@ private pure func legacy_source_paths(tables: Tables.FrontendTables) -> List[Str
 
 
 ---
+The text each import row's request is written as, built once per row from its
+structure (`Tables.import_request_text`) and read by row afterwards.
+---
+private pure func legacy_import_texts(tables: Tables.FrontendTables) -> List[String]:
+	range(
+		0,
+		Tables.import_count(tables),
+	).map(pure func(import_row): import_text_at(tables, import_row))
+
+
+private pure func import_text_at(tables: Tables.FrontendTables, import_row: Int) -> String:
+	match Tables.import_row_at(tables, import_row):
+		Some(row):
+			Tables.import_request_text(tables, row)
+		None:
+			""
+
+
+---
 The reader over `tables`: its indexes, built in one pass over each table.
 ---
 pure func legacy_declaration_reader(
@@ -729,11 +768,13 @@ pure func legacy_declaration_reader(
 	modules: Int = Tables.module_count(tables)
 	parameters: Int = Tables.parameter_count(tables)
 	foreign_blocks: Int = Tables.foreign_block_count(tables)
-	module_names ?= legacy_module_names(tables, naming)
+	import_texts: List[String] = legacy_import_texts(tables)
+	module_names ?= legacy_module_names(tables, naming, import_texts)
 	source_paths: List[String] = legacy_source_paths(tables)
 
 	Ok({
 		tables = tables,
+		import_texts = import_texts,
 		module_names = module_names,
 		source_paths = source_paths,
 		members = group_by_owner(
@@ -807,6 +848,10 @@ pure func legacy_declaration_reader(
 				Tables.signature_count(tables),
 				pure func(row): signature_definition(tables, row),
 			),
+		),
+		impl_of = row_by_key(
+			definitions,
+			keys_of(Tables.impl_count(tables), pure func(row): impl_definition(tables, row)),
 		),
 		definition_type_of = row_by_key(
 			definitions,
@@ -958,6 +1003,14 @@ private pure func signature_definition(tables: Tables.FrontendTables, row: Int) 
 	match Tables.signature_row_at(tables, row):
 		Some(signature):
 			definition_id_index(signature.definition)
+		None:
+			0
+
+
+private pure func impl_definition(tables: Tables.FrontendTables, row: Int) -> Int:
+	match Tables.impl_row_at(tables, row):
+		Some(impl_row):
+			definition_id_index(impl_row.definition)
 		None:
 			0
 
@@ -1422,7 +1475,7 @@ private pure func legacy_type_parameter_name(
 		Kinds.DimensionParameter:
 			legacy_dimension_identifier(reader, name, span)
 		Kinds.WildcardDimensionParameter:
-			Ok(legacy_wildcard_dimension_identifier(reader, span))
+			Ok(legacy_identifier(reader, name, span))
 
 
 private pure func bound_is_on_parameter(
@@ -1750,15 +1803,18 @@ private pure func legacy_module_bodies(
 	var built: List[BuiltNode] = repeat(NotYetBuilt, count)
 	var position: Int = 0
 	var failure: Option[LegacyAdapterError] = None
+	name_row_count: Int = Tables.node_name_span_count(reader.tables)
 	var name_row: Int = first_name_span_row(reader, first_node)
-	var name_node: Int = Tables.node_name_span_row_node(reader.tables, name_row)
 
 	while failure.is_none() and position < count:
 		index: Int = first_node + position
 		row: NodeRow = Tables.node_row(reader.tables, node_id_at_row(index))
 		var name_span: Span = row.span
 
-		if name_node == index:
+		if (
+			name_row < name_row_count
+			and Tables.node_name_span_row_node(reader.tables, name_row) == index
+		):
 			match Tables.node_name_span_row_span(reader.tables, name_row):
 				Some(written):
 					name_span = written
@@ -1766,7 +1822,6 @@ private pure func legacy_module_bodies(
 					failure = Some(MissingTableRow(NodeNameSpanTable, name_row))
 
 			name_row += 1
-			name_node = Tables.node_name_span_row_node(reader.tables, name_row)
 		else if needs_name_span_row(row.kind, row.children.count):
 			-- The node's name is narrower than the node, so its span is a row's.
 			failure = Some(MissingTableRow(NodeNameSpanTable, index))
@@ -2779,23 +2834,23 @@ private pure func legacy_for(
 
 
 ---
-The parameter named `name_index`, or `None` when none is written.
+The parameter named `name`, or `None` when none is written.
 ---
 private pure func concurrent_parameter(
 	parameters: List[ConcurrentParameterValue],
-	name_index: Int,
+	name: TableNameId,
 ) -> Option[ConcurrentParameterValue]:
-	parameters.find(pure func(parameter): table_name_index(parameter.name) == name_index)
+	parameters.find(pure func(parameter): table_names_equal(parameter.name, name))
 
 
 ---
-The value of the parameter named `name_index`, or `None` when none is written.
+The value of the parameter named `name`, or `None` when none is written.
 ---
 private pure func concurrent_parameter_value(
 	parameters: List[ConcurrentParameterValue],
-	name_index: Int,
+	name: TableNameId,
 ) -> Option[ParsedExpr]:
-	concurrent_parameter(parameters, name_index).map(pure func(parameter): parameter.value)
+	concurrent_parameter(parameters, name).map(pure func(parameter): parameter.value)
 
 
 ---
@@ -2806,7 +2861,7 @@ private pure func legacy_thread_limit(
 	view: NodeView,
 	parameters: List[ConcurrentParameterValue],
 ) -> Result[ConcurrentThreadLimit, LegacyAdapterError]:
-	match concurrent_parameter(parameters, MAX_THREADS_NAME_INDEX):
+	match concurrent_parameter(parameters, MAX_THREADS_NAME):
 		Some(parameter):
 			match parameter.count:
 				Some(count):
@@ -2825,7 +2880,7 @@ private pure func legacy_for_limit(
 	view: NodeView,
 	parameters: List[ConcurrentParameterValue],
 ) -> Result[ConcurrentForLimit, LegacyAdapterError]:
-	match concurrent_parameter(parameters, LIMIT_NAME_INDEX):
+	match concurrent_parameter(parameters, LIMIT_NAME):
 		Some(parameter):
 			match parameter.count:
 				Some(count):
@@ -2849,7 +2904,7 @@ private pure func legacy_concurrent_block(
 		ParsedConcurrentBlockExpr(
 			{
 				max_threads = max_threads,
-				timeout = concurrent_parameter_value(parameters, TIMEOUT_NAME_INDEX)
+				timeout = concurrent_parameter_value(parameters, TIMEOUT_NAME)
 			},
 			body,
 			view.location,
@@ -2881,7 +2936,7 @@ private pure func legacy_concurrent_for(
 					iterable,
 					{
 						limit = limit,
-						timeout = concurrent_parameter_value(parameters, TIMEOUT_NAME_INDEX)
+						timeout = concurrent_parameter_value(parameters, TIMEOUT_NAME)
 					},
 					body,
 					view.location,
@@ -3256,6 +3311,12 @@ private pure func legacy_impl(
 	definition: Int,
 	row: DefinitionRow,
 ) -> Result[ParsedImplDecl, LegacyAdapterError]:
+	impl_index ?= required_row(reader.impl_of, definition, ImplTable)
+	impl_row ?= present(
+		Tables.impl_row_at(reader.tables, impl_index),
+		ImplTable,
+		impl_index,
+	)
 	for_type ?= legacy_required_type(reader, definition)
 	members ?= legacy_members(reader, definition)
 	methods ?= collected(members.map(
@@ -3264,7 +3325,7 @@ private pure func legacy_impl(
 	doc ?= legacy_documentation(reader, definition)
 
 	Ok({
-		trait_name = legacy_identifier(reader, row.name, row.name_span),
+		trait_name = legacy_identifier(reader, impl_row.trait_name, impl_row.trait_span),
 		for_type = for_type,
 		methods = methods,
 		doc = doc,
@@ -3423,7 +3484,7 @@ private pure func legacy_import(
 	symbols ?= legacy_import_symbols(reader, row.items)
 
 	Ok({
-		module_path = Tables.path_text(reader.tables, row.request_path),
+		module_path = reader.import_texts.get_or(import_row, ""),
 		module_path_span = legacy_location(row.path_span),
 		module_alias = module_alias,
 		symbols = symbols,
@@ -3852,7 +3913,7 @@ private pure func legacy_import_edge(
 
 	Ok({
 		importer = importer,
-		requested_path = Tables.path_text(reader.tables, row.request_path),
+		requested_path = reader.import_texts.get_or(import_row, ""),
 		resolution = resolution,
 	})
 

@@ -12,29 +12,29 @@ import:
 		node_id_index,
 		supertrait_id_index,
 	../intern_index: find_slice, occupied_slot_count, text_hash
-	../name_vocabulary: DIMENSION_SIGIL, EMPTY_NAME_INDEX
-	../node_builder: NO_NODE_PAYLOAD
+	../name_vocabulary: DIMENSION_SIGIL, EMPTY_NAME
 	../row_kinds:
 		DefinitionKind(LocalFunctionDefinition),
 		NameSpanRule(NameSpanRowRequired, NameSpanRowWhenItHasChildren, NoNameSpanRow),
 		NodeKind(IfNode),
 		NodePayloadReference(
-			CodepointPayload, DefinitionPayload, LiteralPayload, NamePayload, NoPayload,
+			CodepointPayload, DefinitionPayload, DiagnosticPayload, LiteralPayload, NamePayload,
+			NoPayload,
 		),
 		NodeSchema,
 		TypeParameterKind(DimensionParameter),
 		arity_admits,
 		names_a_dimension,
 		node_schema,
-	../rows: NO_SPAN, NodeNameSpanRow, NodeRow
-	../span: Span, span_end, span_source_index, span_start
+	../rows: NodeNameSpanRow, NodeRow
+	../span: NO_SPAN, Span, span_end, span_source, span_start
 	../token: is_unicode_scalar
 	cardinalities: sorted_by_owner
 	violation:
 		DiscoveryTable(
 			AnnotationTable, BinderNameTable, BoundQualifierTable, BoundTable, DefinitionTable,
 			DiagnosticTable, DimensionConstraintTable, DimensionNameTable, ElseKeywordTable,
-			ForeignArgumentTable, ForeignBlockTable, ForeignCNameTable, ImportAliasTable,
+			ForeignArgumentTable, ForeignBlockTable, ForeignCNameTable, ImplTable, ImportAliasTable,
 			ImportBlockTable, ImportItemAliasTable, ImportItemTable, ImportItemVariantTable,
 			ImportTable, LiteralTable, ModuleDocumentationTable, NameTable, NodeChildTable,
 			NodeNameSpanTable, NodeTable, ParameterTable, PathTable, ResolutionDiagnosticTable,
@@ -45,8 +45,9 @@ import:
 			DanglingReference, DimensionSigilNameMissing, ElseKeywordMismatch, InternIndexMismatch,
 			LocalFunctionNodeMismatch, NameSpanOnWrongNodeKind, NameSpanOutsideItsSpan,
 			NodeArityMismatch, NodeChildNotBeforeParent, NodeNameSpanMissing, PayloadOutOfRange,
-			QualifierOutsideReference, RangeOutOfBounds, SeededNameMoved, SideTableUnsorted,
-			SigilSpellingMismatch, SpanOutsideSources, SpanPastSourceEnd,
+			QualifierOutsideReference, RangeOutOfBounds, RecoveryDiagnosticOutsideModule,
+			SeededNameMoved, SideTableUnsorted, SigilSpellingMismatch, SpanOutsideSources,
+			SpanPastSourceEnd,
 		),
 		TableInvariantViolation,
 		check_reference,
@@ -168,8 +169,8 @@ pure func check_node_rows(builder: DiscoveryBuilder) -> List[TableInvariantViola
 	var found: List[TableInvariantViolation] = []
 	node_count: Int = builder.nodes.length()
 	edge_count: Int = builder.node_children.length()
+	name_row_count: Int = builder.node_name_spans.length()
 	var next_name_row: Int = 0
-	var next_name_row_node: Int = builder.name_span_row_node(0)
 	var row: Int = 0
 
 	for node in builder.nodes:
@@ -236,10 +237,10 @@ pure func check_node_rows(builder: DiscoveryBuilder) -> List[TableInvariantViola
 		found = check_node_payload(found, builder, row, node, schema.payload)
 		expects_name_row: Bool = schema.name_span.name_span_row_expected(node.children.count)
 
-		if next_name_row_node == row:
+		if next_name_row < name_row_count and builder.name_span_row_node(next_name_row) == row:
 			name_span: Span = builder.node_name_spans.get_or(
 				next_name_row,
-				NO_NAME_SPAN_ROW,
+				UNREACHABLE_NAME_SPAN_ROW,
 			).name_span
 			found = check_name_within(found, NodeNameSpanTable, next_name_row, name_span, node.span)
 
@@ -255,7 +256,6 @@ pure func check_node_rows(builder: DiscoveryBuilder) -> List[TableInvariantViola
 				)
 
 			next_name_row += 1
-			next_name_row_node = builder.name_span_row_node(next_name_row)
 		else if expects_name_row:
 			found = found.append(
 				violation(
@@ -274,8 +274,11 @@ pure func check_node_rows(builder: DiscoveryBuilder) -> List[TableInvariantViola
 
 ---
 A node's payload indexes the table its kind names (`NodeSchema.payload`):
-a name, a literal, a Unicode scalar value, a local function's definition, or
-nothing (`NO_NODE_PAYLOAD`).
+a name, a literal, a Unicode scalar value, a local function's definition or a
+diagnostic. That a kind has the payload class it has is a matter of types (an
+appender takes only the kinds of its class); what is checked here is the facts
+the types do not state: that the id exists, the codepoint is a scalar value, the
+definition is a local function, and the diagnostic is the module's own.
 ---
 private pure func check_node_payload(
 	found: List[TableInvariantViolation],
@@ -310,11 +313,69 @@ private pure func check_node_payload(
 				found.append(violation(PayloadOutOfRange, NodeTable, row, NodeTable, node.payload))
 		DefinitionPayload:
 			check_local_function_node(found, builder, row, node.payload)
+		DiagnosticPayload:
+			check_recovery_diagnostic(found, builder, row, node.payload)
 		NoPayload:
-			if node.payload == NO_NODE_PAYLOAD:
-				found
-			else:
-				found.append(violation(PayloadOutOfRange, NodeTable, row, NodeTable, node.payload))
+			found
+
+
+---
+A recovery node at `row` is linked to an existing diagnostic in the diagnostics
+block of the module that holds the node: a module with a recovery node has the
+diagnostic that reports it.
+---
+private pure func check_recovery_diagnostic(
+	found: List[TableInvariantViolation],
+	builder: DiscoveryBuilder,
+	row: Int,
+	diagnostic_index: Int,
+) -> List[TableInvariantViolation]:
+	if not index_in(diagnostic_index, builder.diagnostics.length()):
+		found.append(
+			violation(
+				DanglingReference,
+				NodeTable,
+				row,
+				DiagnosticTable,
+				diagnostic_index,
+			),
+		)
+	else if builder.node_module_reports(row, diagnostic_index):
+		found
+	else:
+		found.append(
+			violation(
+				RecoveryDiagnosticOutsideModule,
+				NodeTable,
+				row,
+				DiagnosticTable,
+				diagnostic_index,
+			),
+		)
+
+
+---
+Whether the module whose node block holds node `row` has diagnostic
+`diagnostic_index` in its diagnostics block. Only recovery nodes ask, so
+the scan of the modules is rare.
+---
+private pure func node_module_reports(
+	builder: DiscoveryBuilder,
+	row: Int,
+	diagnostic_index: Int,
+) -> Bool:
+	var reported: Bool = False
+
+	for module in builder.modules:
+		if (
+			row >= module.nodes.first
+			and row < module.nodes.first + module.nodes.count
+			and diagnostic_index >= module.diagnostics.first
+			and diagnostic_index < module.diagnostics.first + module.diagnostics.count
+		):
+			reported = True
+
+	reported
 
 
 ---
@@ -542,7 +603,7 @@ pure func check_dimension_names(builder: DiscoveryBuilder) -> List[TableInvarian
 
 		if (
 			parameter.kind == DimensionParameter
-			and name != EMPTY_NAME_INDEX
+			and name != EMPTY_NAME.name_id_index()
 			and not paired.contains(name)
 		):
 			found = found.append(
@@ -655,7 +716,7 @@ pure func check_node_name_row_order(builder: DiscoveryBuilder) -> List[TableInva
 	var found: List[TableInvariantViolation] = []
 	var row: Int = 0
 	node_count: Int = builder.nodes.length()
-	var previous: Int = NO_NODE_ROW
+	var previous: Int = 0
 
 	-- The sorted check is `sorted_by_owner`'s, written as a loop over the rows:
 	-- mapping the 100k rows to their owners first allocates for each one.
@@ -673,7 +734,8 @@ pure func check_node_name_row_order(builder: DiscoveryBuilder) -> List[TableInva
 				),
 			)
 
-		if owner <= previous:
+		-- The first row has no previous owner to be out of order with.
+		if row > 0 and owner <= previous:
 			found = found.append(
 				violation(
 					SideTableUnsorted,
@@ -691,24 +753,21 @@ pure func check_node_name_row_order(builder: DiscoveryBuilder) -> List[TableInva
 
 
 ---
-The node name span row `row` belongs to, or `NO_NODE_ROW` when there is no such
-row: read once per row, so the walk over the nodes compares integers.
+The node name span row `row` belongs to: read once per row, so the walk over
+the nodes compares integers. `row` is below the table's length (the caller
+checks), so the row exists.
 ---
 private pure func name_span_row_node(builder: DiscoveryBuilder, row: Int) -> Int:
-	builder.node_name_spans.get_or(row, NO_NAME_SPAN_ROW).node.node_id_index()
+	builder.node_name_spans.get_or(row, UNREACHABLE_NAME_SPAN_ROW).node.node_id_index()
 
 
 ---
-Stands for the node of a side table row past the table's end: no node has it.
+The node name span row `get_or` returns for a row past the table's end, which
+the walk never reads: it checks the row against the table's length first. `get_or`
+reads it where a `get` would allocate an `Option` for every row it finds.
 ---
-private NO_NODE_ROW: Int = -1
-
----
-Stands for a node name span row past the table's end. `get_or` reads it where a
-`get` would allocate an `Option` for every row it finds.
----
-private NO_NAME_SPAN_ROW: NodeNameSpanRow = {
-	node = node_id_at_row(NO_NODE_ROW),
+private UNREACHABLE_NAME_SPAN_ROW: NodeNameSpanRow = {
+	node = node_id_at_row(0),
 	name_span = NO_SPAN
 }
 
@@ -798,7 +857,9 @@ ending no later.
 ---
 private pure func span_within(inner: Span, outer: Span) -> Bool:
 	(
-		inner.span_source_index() == outer.span_source_index()
+		inner
+			.span_source()
+			.source_ids_equal(outer.span_source())
 		and inner.span_start() >= outer.span_start()
 		and inner.span_end() <= outer.span_end()
 	)
@@ -814,7 +875,9 @@ private pure func check_span(
 	span: Span,
 	source_lengths: List[Int],
 ) -> List[TableInvariantViolation]:
-	source_index: Int = span.span_source_index()
+	source_index: Int = span
+		.span_source()
+		.source_id_index()
 
 	match source_lengths.get(source_index):
 		Some(length):
@@ -920,6 +983,12 @@ pure func check_spans(builder: DiscoveryBuilder) -> List[TableInvariantViolation
 
 	for qualifier in builder.supertrait_qualifiers:
 		found = check_span(found, SupertraitQualifierTable, row, qualifier.span, sources)
+		row += 1
+
+	row = 0
+
+	for impl in builder.impls:
+		found = check_span(found, ImplTable, row, impl.trait_span, sources)
 		row += 1
 
 	row = 0

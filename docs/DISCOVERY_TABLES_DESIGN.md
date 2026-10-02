@@ -147,13 +147,15 @@ opaque type ForeignBlockId = Int
 ```
 
 A span is one integer: the source index, then the start offset, then the
-length (`tables/span.brp`). There is no `NO_SPAN`: every row that has a span has a
-real one, and compiler-synthesized rows point at the syntax that caused
-them.
+length (`tables/span.brp`). Every row that has a span has a real one, and
+compiler-synthesized rows point at the syntax that caused them. The one span in
+no real source is `NO_SPAN`, in the last source index (`NO_SOURCE`), which no
+discovery admits: the fallback rows of lookups that cannot miss carry it, and a
+frozen row that stores it fails `SpanOutsideSources`.
 
 | Field | Bits | Limit |
 | --- | --- | --- |
-| source index | 15 | 32,768 sources |
+| source index | 15 | 32,767 sources (the last index is `NO_SOURCE`) |
 | start offset | 24 | 16 MiB per source |
 | length | 24 | 16 MiB |
 
@@ -178,9 +180,9 @@ struct SourceRow {path: PathId, line_starts: RowRange}
 
 struct PackageRow {name: NameId, kind: PackageKind}   -- NativePackage | SourcePackage
 
+-- A module's canonical path is its source's (`SourceRow.path`), stored once there.
 struct ModuleRow {
 	source: SourceId,
-	canonical_path: PathId,
 	origin: ModuleOriginKind,   -- StdlibModule | PackageModule | SourcePackageModule | UserModule
 	reach: ModuleReach,         -- RootModule | ImplicitModule | ImportedModule
 	definitions: RowRange,
@@ -225,13 +227,46 @@ local-function and impl-method parsers, `next_module_id` in the pipeline, and
 `UNREACHABLE_*` row, which for a root or implicit request invents
 `Loaded(module 0)`.
 
-Two more entries:
+Remaining entries:
 
-- `module_being_parsed: Option[ModuleId]` is transient parse state. Its `None`
-  is unreachable, and `parsed_module` falls back to module 0 after reporting
-  the miss. It is to be replaced when the module id travels in parse state.
 - One close per opening is a caller obligation, checked only in debug builds,
   because Blorp has no linear types.
+- A function's end span reads the last dimension constraint by position
+  (`constraint_end`): returning the span from the routine that parsed it needs a
+  `(builder, Span)` return.
+- `DimensionNameRow.sigil_name` is a cache of the `#`-spelled name of `name`. The
+  frozen tables keep no spelling-to-id index, so deriving it costs a scan; the
+  legacy adapter is its only reader and indexes it once.
+- Four `-1` sentinels remain, each read per token or per line by the lexer:
+  `EMPTY_SLOT`, `NO_ROW` (`NOT_INTERNED`), `NO_DEDENT` and
+  `NO_PLAIN_STRING_CLOSE`. An `Option[Int]` allocates there; they go when a
+  scalar `Option` is unboxed.
+- `NO_SPAN` remains as the fallback row's span, in `NO_SOURCE`; the fallbacks go
+  when ids cannot be forged.
+- A missing name is recorded as `EMPTY_NAME`, a seeded name the diagnostic for
+  the missing name explains; it is not yet its own kind of row.
+- Recovery nodes are written only by the appenders that also append their
+  diagnostic, with one exception: a rejected field assignment reports before its
+  value is parsed, so its node is made with a diagnostic id taken earlier. The
+  freeze check `RecoveryDiagnosticOutsideModule` guards that one path.
+
+What the types now state, and what freeze still checks:
+
+- A definition's class is the type of its opening (`FunctionOpening`,
+  `RecordOpening`, `FieldOpening`, ...), minted only by that class's opener, and
+  the appenders for a body, a written type, a payload and a member take the opening
+  of the class that has them; a member joins its owner when opened. Nothing about
+  which definitions have bodies, types or members is checked at freeze.
+- A node's payload class and child form are the type of the kind an appender takes
+  (`PlainLeafKind`, `NameLeafKind`, `NamedParentKind`, ...), checked against
+  `node_schema` by `test_node_kind_classes`. Freeze checks the facts those types do
+  not state: that a stored id exists, a codepoint is a scalar value, a local function
+  node names a local function, a node's child count is one its kind allows, a name
+  span row exists exactly when the kind and child count ask for one, and the rows
+  that sort by owner are sorted.
+- Signature rows are still keyed by a bare `DefinitionId` (`SignatureCountMismatch`
+  is freeze-only), and the else keyword and name span rows are still attached to the
+  node appended last.
 
 ### Imports
 
@@ -241,11 +276,14 @@ enum ImportRequestKind:
 	RelativeModuleRequest   -- `./x`, `../x`
 	NativePackageRequest    -- `pkg/<package>/...`
 
+-- The kind and the `../` count are one value: bare, native package or
+-- relative(n), built only by those three functions. The text it was written as
+-- is built from it and the path parts (`written_import_request`), not stored.
+opaque type ImportRequestShape = Int
+
 struct ImportRow {
 	importer: ModuleId,
-	request_kind: ImportRequestKind,
-	request_path: PathId,       -- the import syntax, kept as text on purpose
-	parent_steps: Int,          -- leading `../` (0 for `./` and non-relative)
+	request: ImportRequestShape,
 	path_parts: RowRange,       -- into import_path_parts: List[NameId]
 	items: RowRange,            -- into import_items
 	path_span: Span,            -- the module path alone

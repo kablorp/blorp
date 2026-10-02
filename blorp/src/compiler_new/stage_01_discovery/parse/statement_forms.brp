@@ -6,22 +6,24 @@
 import:
 	../tables/builder:
 		DiscoveryBuilder,
-		LoopContext(InLoopBody, NotInLoop),
 		advance_token,
 		append_plain_diagnostic,
 		move_token_cursor,
+		next_diagnostic_id,
 	../tables/diagnostic_code:
 		PlainSyntaxCode(DiscardedQuestionBindDiagnostic, QuestionBindInLoopDiagnostic),
 	../tables/expected_token: NameConstruct(NameInSelectReceiveBinding)
-	../tables/ids: NameId, name_id_at_row, name_id_index
-	../tables/name_vocabulary: DISCARD_NAME_INDEX
+	../tables/ids: DiagnosticId, NameId, name_id_at_row, name_ids_equal
+	../tables/name_vocabulary: DISCARD_NAME
 	../tables/node_builder:
 		ChildMark,
+		append_missing_parent_node_since,
 		append_named_parent_node_since,
-		append_parent_node_since,
+		append_plain_parent_node_since,
 		last_node_id,
 		push_last_node,
-	../tables/row_kinds: NodeKind(MissingExpressionNode, QuestionBindNode)
+	../tables/node_kind_classes: NamedParentKind(QuestionBindParent), PlainParentKind
+	../tables/row_kinds: NodeKind(QuestionBindNode)
 	../tables/span: Span, span_covering
 	../tables/token:
 		TokenKind(
@@ -31,6 +33,7 @@ import:
 			RightBracketSymbol, RightParenSymbol, SlashEqualSymbol, StarEqualSymbol,
 			UnderscoreSymbol,
 		),
+	body_scope: BodyScope, LoopContext(InLoopBody, NotInLoop)
 	parser_cursor:
 		at,
 		binder_name_at_cursor,
@@ -40,6 +43,8 @@ import:
 		current_span,
 		is_soft_keyword,
 		keyword_name_index,
+		report_at_current,
+		span_before_current,
 		token_kind_at,
 	type_parser: node_span
 
@@ -123,10 +128,13 @@ Reports the `?=` at the cursor when it is inside a loop body: each iteration
 would have to return from the enclosing function. The carrier checks that need
 types stay in typechecking.
 ---
-pure func report_question_bind_in_loop(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+pure func report_question_bind_in_loop(
+	builder: DiscoveryBuilder,
+	scope: BodyScope,
+) -> DiscoveryBuilder:
 	operator_span: Span = builder.current_span()
 
-	match builder.loop_context:
+	match scope.loop_context:
 		InLoopBody:
 			builder.append_plain_diagnostic(QuestionBindInLoopDiagnostic, operator_span)
 		NotInLoop:
@@ -139,7 +147,7 @@ and the value just parsed.
 ---
 pure func finish_named_statement(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: NamedParentKind,
 	name: NameId,
 	name_span: Span,
 	mark: ChildMark,
@@ -166,23 +174,26 @@ pure func finish_question_bind(
 	name_span: Span,
 	mark: ChildMark,
 ) -> DiscoveryBuilder:
-	if name.name_id_index() == DISCARD_NAME_INDEX:
+	if name.name_ids_equal(DISCARD_NAME):
 		builder
 			.append_plain_diagnostic(DiscardedQuestionBindDiagnostic, name_span)
-			.finish_named_statement(QuestionBindNode, name, name_span, mark)
+			.finish_named_statement(QuestionBindParent, name, name_span, mark)
 	else:
-		builder.finish_named_statement(QuestionBindNode, name, name_span, mark)
+		builder.finish_named_statement(QuestionBindParent, name, name_span, mark)
 
 
 ---
-A statement that could not be parsed, over the children pushed since `mark`.
+A statement that could not be parsed, over the children pushed since `mark`,
+linked to the diagnostic `code` it reports at the current token.
 ---
 pure func missing_statement(
 	builder: DiscoveryBuilder,
 	span: Span,
 	mark: ChildMark,
+	code: PlainSyntaxCode,
 ) -> DiscoveryBuilder:
-	builder.append_parent_node_since(mark, MissingExpressionNode, span)
+	diagnostic_span: Span = builder.span_before_current()
+	builder.append_missing_parent_node_since(mark, span, code, diagnostic_span)
 
 
 ---
@@ -242,14 +253,14 @@ body.
 ---
 pure func finish_with_body(
 	builder: DiscoveryBuilder,
-	kind: NodeKind,
+	kind: PlainParentKind,
 	start: Span,
 	mark: ChildMark,
 ) -> DiscoveryBuilder:
 	body_span: Span = builder.node_span(builder.last_node_id())
 	builder
 		.push_last_node()
-		.append_parent_node_since(
+		.append_plain_parent_node_since(
 			mark,
 			kind,
 			start.span_covering(body_span),

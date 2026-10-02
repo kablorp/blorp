@@ -4,18 +4,27 @@
 -- every case it accepts is accepted here, and the malformed case reports the
 -- diagnostics it reports.
 import:
+	../../../../src/compiler_new/stage_01_discovery/pipeline: load_module
+	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		ModulePlacement(InUserCode),
 	../../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DiscoveryBuilder,
 		empty_discovery_builder,
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: syntax_diagnostic_name
 	../../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
 		FreezeOutcome(FrozenTables, TableInvariantsViolated),
+		concurrency_count,
 		freeze,
-	../../../../src/compiler_new/stage_01_discovery/pipeline: load_module
+		node_count,
+		node_row_at,
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_index, node_id_at_row
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
+		DefinitionKind(LocalFunctionDefinition),
 		ModuleOriginKind(UserModule),
-		ModuleReach(RootModule),
-	../../../../src/compiler_new/stage_01_discovery/sources/source_provider: ModulePlacement(InUserCode)
+		ModuleReach(ImportedModule, RootModule),
+		NodeKind(
+			ConcurrentParameterNode, MissingExpressionNode, MissingPatternNode, MissingTypeNode,
+		),
 	../../../../src/compiler_new/stage_01_discovery/tables/span: span_end, span_start
 	../../support/body_dump: bodies_dump
 	test: TestSuite
@@ -154,22 +163,42 @@ pure func test_interpolation_holes_are_parsed_as_nested_expressions() -> Bool:
 
 
 ---
-The counts the concurrency parameters of `text` wrote, in node order.
+The counts the concurrency parameters of `text` write, in node order, as the
+frozen tables read them from each parameter's value.
 ---
 pure func concurrency_counts_of(text: String) -> List[Int]:
-	parsed(text).concurrency_counts.map(pure func(row): row.count)
+	match parsed(text).freeze():
+		FrozenTables(tables):
+			var counts: List[Int] = []
+
+			for index in 0..tables.node_count():
+				match tables.node_row_at(index):
+					Some(row):
+						if row.kind == ConcurrentParameterNode:
+							match tables.concurrency_count(node_id_at_row(index)):
+								Some(count):
+									counts = counts.append(count)
+								None:
+									void
+					None:
+						void
+
+			counts
+		TableInvariantsViolated(_):
+			[]
 
 
 pure func test_concurrency_counts_are_kept_as_integers() -> Bool:
 	-- Decimal digits only: `0x4` and `1_000` are not integer literals in either
 	-- lexer. Leading zeros read as the number, and a literal above `Int` saturates
-	-- as `parse_int` does; `timeout` has no count.
+	-- as `parse_int` does. `timeout: 5` reads as 5 too: a parameter's count is the
+	-- integer its value writes, and only `max_threads` and `limit` are asked.
 	text: String = "func f(xs):\n\tconcurrent(max_threads: 007, timeout: 5):\n\t\twork()\n\tfor x in xs concurrently(limit: 99999999999999999999):\n\t\twork(x)\n"
 	counts: List[Int] = concurrency_counts_of(text)
-	counts == [7, 9223372036854775807] and parsed(text).diagnostics.is_empty()
+	counts == [7, 5, 9223372036854775807] and parsed(text).diagnostics.is_empty()
 
 
-pure func test_a_count_that_is_not_a_positive_literal_has_no_row() -> Bool:
+pure func test_a_count_that_is_not_a_positive_literal_is_none() -> Bool:
 	text: String = "func f():\n\tconcurrent(max_threads: 0):\n\t\twork()\n\tconcurrent(max_threads: 1 + 1):\n\t\twork()\n"
 	concurrency_counts_of(text).is_empty() and parsed(text).diagnostics.length() == 2
 
@@ -406,6 +435,116 @@ pure func test_lambda_and_concurrent_task_bodies_start_outside_every_loop() -> B
 	)
 
 
+pure func test_loop_context_belongs_to_the_enclosing_body_after_a_nested_body() -> Bool:
+	(
+		diagnostics_are(
+			"func f(xs):\n\tfor x in xs:\n\t\tconcurrent:\n\t\t\ta = 1\n\t\tg = func(y): y\n\t\tbreak\n",
+			[],
+		)
+		and diagnostics_are(
+			"func f(xs):\n\tfor x in xs:\n\t\tx\n\tg = func(y): y\n\tbreak\n",
+			["diagnostic BreakOutsideLoopDiagnostic@47"],
+		)
+	)
+
+
+pure func local_function_modules(builder: DiscoveryBuilder) -> List[Int]:
+	var modules: List[Int] = []
+
+	for row in builder.definitions:
+		match row.kind:
+			LocalFunctionDefinition:
+				modules = modules.append(row.module.module_id_index())
+			_:
+				modules = modules
+
+	modules
+
+
+pure func test_a_local_function_belongs_to_the_module_that_holds_it() -> Bool:
+	first: DiscoveryBuilder = parsed("func f():\n\tfunc g():\n\t\t0\n\tg()\n")
+	second: DiscoveryBuilder = load_module(
+		first,
+		{
+			path = "second.brp",
+			trusted_directory = ".",
+			placement = InUserCode
+		},
+		ImportedModule,
+		"func h(xs):\n\tfor x in xs:\n\t\tk = func(y):\n\t\t\tfunc m():\n\t\t\t\t1\n\t\t\tm()\n\t\tk(x)\n",
+	)
+
+	second.local_function_modules() == [0, 1]
+
+
+---
+The diagnostic names a recovery node of `kind` may be linked to: the codes the
+parser reports when it records that kind of node.
+---
+pure func recovery_diagnostic_names(kind: NodeKind) -> List[String]:
+	match kind:
+		MissingExpressionNode:
+			[
+				"ExpectedExpressionDiagnostic",
+				"ExpectedAssignmentOperatorDiagnostic",
+				"FieldAssignmentDiagnostic",
+			]
+		MissingPatternNode:
+			[
+				"ExpectedPatternDiagnostic",
+				"InterpolatedStringPatternDiagnostic",
+				"ExpectedNumberAfterMinusDiagnostic",
+			]
+		MissingTypeNode:
+			["ExpectedTypeDiagnostic", "ExpectedDimensionDiagnostic"]
+		_:
+			[]
+
+
+---
+Whether every recovery node of `text` is linked to a diagnostic of a code its
+kind is reported with, and every such diagnostic is linked once.
+---
+pure func recovery_nodes_link_to_their_diagnostics(text: String) -> Bool:
+	builder: DiscoveryBuilder = parsed(text)
+	var linked: List[Int] = []
+	var all_match: Bool = True
+
+	for node in builder.nodes:
+		allowed: List[String] = recovery_diagnostic_names(node.kind)
+
+		if not allowed.is_empty():
+			match builder.diagnostics.get(node.payload):
+				Some(row):
+					name: String = row.diagnostic.syntax_diagnostic_name()
+					all_match = all_match and allowed.contains(name)
+					linked = linked.append(node.payload)
+				None:
+					all_match = False
+
+	(
+		all_match
+		and not linked.is_empty()
+		and linked
+			.unique()
+			.length() == linked.length()
+	)
+
+
+pure func test_recovery_nodes_are_linked_to_their_diagnostics() -> Bool:
+	(
+		recovery_nodes_link_to_their_diagnostics(
+			"func f(x):\n\ta = )\n\t_ ?= x\n\tx.field = 1\n\tmatch x:\n\t\t-foo: 1\n",
+		)
+		and recovery_nodes_link_to_their_diagnostics(
+			"func f(x):\n\tmatch x:\n\t\t\"a " + INTERPOLATION_OPENER + "b}\": 1\n\t\t+: 2\n",
+		)
+		and recovery_nodes_link_to_their_diagnostics("func f(x: ):\n\t1\n")
+		and recovery_nodes_link_to_their_diagnostics("func f(x: Float[#+]):\n\t1\n")
+		and recovery_nodes_link_to_their_diagnostics("func f(x):\n\tx = \n")
+	)
+
+
 pure func test_question_bind_in_a_concurrent_task_inside_a_loop_is_not_a_loop_error() -> Bool:
 	diagnostics_are(
 		"func f(xs):\n\tfor x in xs:\n\t\tconcurrent:\n\t\t\ta = if x:\n\t\t\t\tv ?= x\n\t\t\t\tv\n\t\t\telse:\n\t\t\t\t0\n",
@@ -455,7 +594,9 @@ pure func first_diagnostic_range(text: String) -> String:
 
 pure func test_non_literal_count_diagnostic_covers_the_whole_value() -> Bool:
 	text: String = "func f(xs):\n\tfor x in xs concurrently(limit: xs.length()):\n\t\tx\n"
-	expected_start: Int = text.index_of("xs.length()").get_or(0)
+	expected_start: Int = text
+		.index_of("xs.length()")
+		.get_or(0)
 
 	first_diagnostic_range(text) == "${expected_start}-${expected_start + 11}"
 
@@ -464,28 +605,30 @@ pure func test_concurrent_block_parameter_rules() -> Bool:
 	(
 		concurrent_case("concurrent(max_threads: 4, timeout: 5)") == NO_DIAGNOSTICS
 		and concurrent_case("concurrent(timeout: 5)") == NO_DIAGNOSTICS
-		and concurrent_case("concurrent(max_threads: \"four\")") == [
+		and concurrent_case(
+			"concurrent(max_threads: \"four\")",
+		) == ["ConcurrentMaxThreadsNotPositiveLiteralDiagnostic"]
+		and concurrent_case(
+			"concurrent(max_threads: 2 + 2)",
+		) == ["ConcurrentMaxThreadsNotPositiveLiteralDiagnostic"]
+		and concurrent_case(
+			"concurrent(max_threads: 0)",
+		) == ["ConcurrentMaxThreadsNotPositiveLiteralDiagnostic"]
+		and concurrent_case(
+			"concurrent(max_threads: -2)",
+		) == ["ConcurrentMaxThreadsNotPositiveLiteralDiagnostic"]
+		and concurrent_case(
+			"concurrent(max_threads: 4, max_threads: 8)",
+		) == ["ConcurrentDuplicateParameterDiagnostic"]
+		and concurrent_case(
+			"concurrent(max_threads: 0, max_threads: 0)",
+		) == [
 			"ConcurrentMaxThreadsNotPositiveLiteralDiagnostic",
-		]
-		and concurrent_case("concurrent(max_threads: 2 + 2)") == [
-			"ConcurrentMaxThreadsNotPositiveLiteralDiagnostic",
-		]
-		and concurrent_case("concurrent(max_threads: 0)") == [
-			"ConcurrentMaxThreadsNotPositiveLiteralDiagnostic",
-		]
-		and concurrent_case("concurrent(max_threads: -2)") == [
-			"ConcurrentMaxThreadsNotPositiveLiteralDiagnostic",
-		]
-		and concurrent_case("concurrent(max_threads: 4, max_threads: 8)") == [
 			"ConcurrentDuplicateParameterDiagnostic",
 		]
-		and concurrent_case("concurrent(max_threads: 0, max_threads: 0)") == [
-			"ConcurrentMaxThreadsNotPositiveLiteralDiagnostic",
-			"ConcurrentDuplicateParameterDiagnostic",
-		]
-		and concurrent_case("concurrent(timeout: 1, timeout: 2)") == [
-			"ConcurrentDuplicateParameterDiagnostic",
-		]
+		and concurrent_case(
+			"concurrent(timeout: 1, timeout: 2)",
+		) == ["ConcurrentDuplicateParameterDiagnostic"]
 		and concurrent_case("concurrent(priority: 5)") == ["ConcurrentUnknownParameterDiagnostic"]
 		and concurrent_case("concurrent(limit: 5)") == ["ConcurrentUnknownParameterDiagnostic"]
 	)
@@ -495,48 +638,61 @@ pure func test_concurrently_loop_parameter_rules() -> Bool:
 	(
 		concurrently_case("concurrently(limit: 2)") == NO_DIAGNOSTICS
 		and concurrently_case("concurrently(limit: 2, timeout: 5)") == NO_DIAGNOSTICS
-		and concurrently_case("concurrently(timeout: 5)") == [
-			"ConcurrentForMissingLimitDiagnostic",
-		]
-		and concurrently_case("concurrently(limit: 0)") == [
-			"ConcurrentLimitNotPositiveLiteralDiagnostic",
-		]
-		and concurrently_case("concurrently(limit: \"two\")") == [
-			"ConcurrentLimitNotPositiveLiteralDiagnostic",
-		]
-		and concurrently_case("concurrently(limit: xs.length())") == [
-			"ConcurrentLimitNotPositiveLiteralDiagnostic",
-		]
-		and concurrently_case("concurrently(limit: 2, limit: 3)") == [
-			"ConcurrentDuplicateParameterDiagnostic",
-		]
-		and concurrently_case("concurrently(limit: 2, timeout: 1, timeout: 2)") == [
-			"ConcurrentDuplicateParameterDiagnostic",
-		]
-		and concurrently_case("concurrently(max_threads: 2)") == [
-			"ConcurrentForMaxThreadsDiagnostic",
-			"ConcurrentForMissingLimitDiagnostic",
-		]
-		and concurrently_case("concurrently(limit: 0, limit: xs)") == [
-			"ConcurrentLimitNotPositiveLiteralDiagnostic",
-			"ConcurrentDuplicateParameterDiagnostic",
-		]
-		and concurrently_case("concurrently(limit: 0, limit: 0)") == [
+		and concurrently_case("concurrently(timeout: 5)") == ["ConcurrentForMissingLimitDiagnostic"]
+		and concurrently_case(
+			"concurrently(limit: 0)",
+		) == ["ConcurrentLimitNotPositiveLiteralDiagnostic"]
+		and concurrently_case(
+			"concurrently(limit: \"two\")",
+		) == ["ConcurrentLimitNotPositiveLiteralDiagnostic"]
+		and concurrently_case(
+			"concurrently(limit: xs.length())",
+		) == ["ConcurrentLimitNotPositiveLiteralDiagnostic"]
+		and concurrently_case(
+			"concurrently(limit: 2, limit: 3)",
+		) == ["ConcurrentDuplicateParameterDiagnostic"]
+		and concurrently_case(
+			"concurrently(limit: 2, timeout: 1, timeout: 2)",
+		) == ["ConcurrentDuplicateParameterDiagnostic"]
+		and concurrently_case(
+			"concurrently(max_threads: 2)",
+		) == ["ConcurrentForMaxThreadsDiagnostic", "ConcurrentForMissingLimitDiagnostic"]
+		and concurrently_case(
+			"concurrently(limit: 0, limit: xs)",
+		) == [
 			"ConcurrentLimitNotPositiveLiteralDiagnostic",
 			"ConcurrentDuplicateParameterDiagnostic",
 		]
-		and concurrently_case("concurrently(limit: 2, timeout: 1, limit: 0)") == [
+		and concurrently_case(
+			"concurrently(limit: 0, limit: 0)",
+		) == [
+			"ConcurrentLimitNotPositiveLiteralDiagnostic",
 			"ConcurrentDuplicateParameterDiagnostic",
 		]
-		and concurrently_case("concurrently(limit: 2, item_timeout: 10)") == [
-			"ConcurrentForUnknownParameterDiagnostic",
-		]
+		and concurrently_case(
+			"concurrently(limit: 2, timeout: 1, limit: 0)",
+		) == ["ConcurrentDuplicateParameterDiagnostic"]
+		and concurrently_case(
+			"concurrently(limit: 2, item_timeout: 10)",
+		) == ["ConcurrentForUnknownParameterDiagnostic"]
 	)
 
 
 tests: TestSuite = {
 	description = "Discovery body parser",
 	tests = [
+		(
+			"loop context belongs to the enclosing body after a nested body",
+			test_loop_context_belongs_to_the_enclosing_body_after_a_nested_body,
+		),
+		(
+			"a local function belongs to the module that holds it",
+			test_a_local_function_belongs_to_the_module_that_holds_it,
+		),
+		(
+			"recovery nodes are linked to their diagnostics",
+			test_recovery_nodes_are_linked_to_their_diagnostics,
+		),
 		(
 			"question bind in a concurrent task inside a loop is not a loop error",
 			test_question_bind_in_a_concurrent_task_inside_a_loop_is_not_a_loop_error,
@@ -575,10 +731,7 @@ tests: TestSuite = {
 			"type ascription in braces and without a type reports once",
 			test_type_ascription_in_braces_and_without_a_type_reports_once,
 		),
-		(
-			"binary operators nest by precedence",
-			test_binary_operators_nest_by_precedence,
-		),
+		("binary operators nest by precedence", test_binary_operators_nest_by_precedence),
 		(
 			"postfix chains calls lambdas and leading dot continuations",
 			test_postfix_chains_calls_lambdas_and_leading_dot_continuations,
@@ -602,8 +755,8 @@ tests: TestSuite = {
 		),
 		("concurrency counts are kept as integers", test_concurrency_counts_are_kept_as_integers),
 		(
-			"a count that is not a positive literal has no row",
-			test_a_count_that_is_not_a_positive_literal_has_no_row,
+			"a count that is not a positive literal is none",
+			test_a_count_that_is_not_a_positive_literal_is_none,
 		),
 		(
 			"string patterns keep the form they were written in",
