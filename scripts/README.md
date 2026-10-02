@@ -492,9 +492,10 @@ a measurement file into `benchmarks/results/<name>` and stages it, and commits
 with the given title and body. Titles starting with `Merge` or containing an
 `#<digits>` issue reference are refused so main's history stays standalone
 and readable. After `make`, it prints the `bin/blorp --version` build stamp,
-then runs `make hygiene-check`, `scripts/compiler-check --changed --base origin/main` and any
-`--gate` gates directly; every one must end in a `BLORP_GATE_RESULT
-... status=PASS` line (a compiler-check run with no selected work counts).
+then runs `make hygiene-check`, `make tooling-check`, `scripts/compiler-check --changed --base origin/main` and any
+`--gate` gates directly. The two `make` targets must exit 0; every other one
+must end in a `BLORP_GATE_RESULT ... status=PASS` line (a compiler-check run
+with no selected work counts).
 Only if all of that passes, and `origin/main` is still an ancestor of the new
 commit, does it push with fast-forward semantics; otherwise it reports that
 `origin/main` moved and asks for a rerun. Landings from every worktree take
@@ -502,11 +503,10 @@ turns: `scripts/land` holds `land.lock` in the shared git directory from its
 first fetch until it exits (waiting with `queued behind: <pid> <ref> <time>`
 while another landing runs; a dead holder's lock is taken over), so each
 landing gates against the main it pushes onto. It prints `LAND_PHASE <name>
-<seconds>` after each phase (queue, build, hygiene, compiler-check, each gate,
-push). Set `LAND_LOCK_POLL_SECONDS` (default 30) to change the wait
+<seconds>` after each phase (queue, build, hygiene, tooling, compiler-check,
+each gate, push). Set `LAND_LOCK_POLL_SECONDS` (default 30) to change the wait
 interval; remove a stuck lock by hand with `rm "$(git rev-parse
---path-format=absolute --git-common-dir)/land.lock"`. The tooling suites no
-longer gate landings; they run in `make quality`, premerge and CI on main.
+--path-format=absolute --git-common-dir)/land.lock"`.
 `--dry-run` runs the same sequence, including the lock and the commit,
 but stops before the push. It finishes with its own
 `BLORP_GATE_RESULT gate=land ...` line and the landed commit SHA.
@@ -727,11 +727,11 @@ plugin's required editor integration registrations in place. `make
 hygiene-check` runs it automatically.
 
 `make hygiene-check` is the seconds-long static set (layout, editor drift,
-C-symbol boundary, manifest, std builtins, magic spellings) and runs on every
-`scripts/land`. `make tooling-check` holds the stage-2 self-compile C-symbol
+C-symbol boundary, manifest, std builtins, magic spellings). `make tooling-check` holds the stage-2 self-compile C-symbol
 leak check (`scripts/check-c-symbol-projection-self-compile`), the
 benchmark-worker `check` runs and the Python/shell suites that test the
-scripts, build, runtime harnesses and audits. `make quality` runs both, then
+scripts, build, runtime harnesses and audits. Every `scripts/land` runs both.
+`make quality` runs both, then
 `artifact-scan` for stray generated files the suites left behind;
 `scripts/premerge-gate` runs them too.
 

@@ -533,8 +533,8 @@ artifact-scan:
 	fi
 
 # The benchmark-worker checks and the Python/shell tooling suites. They audit
-# compiler, runtime and script sources, so run them in `quality` and the
-# premerge gate rather than per landing.
+# compiler, runtime and script sources, so `quality`, the premerge gate and
+# every `scripts/land` run them.
 tooling-check: build-blorp-cli
 	@scripts/check-c-symbol-projection-self-compile
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
