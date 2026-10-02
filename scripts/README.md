@@ -475,49 +475,29 @@ Modes:
 
 ## Landing a Branch
 
-`scripts/land` squash-merges one reviewed commit or branch onto `main` and
-gates it before pushing:
+Validate a branch first with the CI-equivalent gate, the same checks CI runs on
+Ubuntu x64: from the branch's checkout or worktree run
+`scripts/docker-gate --premerge-gate -- --no-sanitize` (a clean -O2 build,
+`make quality` and the full `scripts/test` in an Ubuntu container). Gates on
+different branches may run in parallel. Then land it:
 
 ```bash
-scripts/land <commit-or-branch> --title "<title>" [--body "<text>"] \
-    [--record <json> --record-name <file>] [--gate <scripts/test gate>]... \
-    [--dry-run]
+scripts/land <branch> --title "<title>" [--body "<text>"] \
+    [--record <file> --record-name <name>] [--dry-run]
 ```
 
-Run it from the integration worktree while sitting on a clean checkout of
-`main`; it refuses otherwise. It fast-forwards to `origin/main`, squash-merges
-the given commit or branch (keeping the current side's version of any
-conflicts under `benchmarks/results/` or a `harness` path), optionally copies
-a measurement file into `benchmarks/results/<name>` and stages it, and commits
-with the given title and body. Titles starting with `Merge` or containing an
-`#<digits>` issue reference are refused so main's history stays standalone
-and readable. After `make`, it prints the `bin/blorp --version` build stamp,
-then runs `make hygiene-check`, `make tooling-check`, `scripts/compiler-check --changed --base origin/main` and any
-`--gate` gates directly. It also runs `make benchmark-tooling-check`, but only
-when the squashed commit (compared with `--no-renames`) touches an input those
-suites read: `benchmarks/` (other than `benchmarks/results/`), `blorp/benchmark/`,
-`scripts/bench-*`, `scripts/with-build-lock`, `scripts/with-compiler-contention-lease`,
-`blorp/src/test/`, the compiler and library modules the benchmark workers
-import, the repository paths the benchmark policy fingerprints, or one of the
-test files that target runs. `touches_benchmark_tooling` in `scripts/land` is the
-authoritative list. Otherwise it prints that the phase was skipped. The
-`make` targets must exit 0; every other one
-must end in a `BLORP_GATE_RESULT ... status=PASS` line (a compiler-check run
-with no selected work counts).
-Only if all of that passes, and `origin/main` is still an ancestor of the new
-commit, does it push with fast-forward semantics; otherwise it reports that
-`origin/main` moved and asks for a rerun. Landings from every worktree take
-turns: `scripts/land` holds `land.lock` in the shared git directory from its
-first fetch until it exits (waiting with `queued behind: <pid> <ref> <time>`
-while another landing runs; a dead holder's lock is taken over), so each
-landing gates against the main it pushes onto. It prints `LAND_PHASE <name>
-<seconds>` after each phase (queue, build, hygiene, tooling, benchmark-tooling,
-compiler-check, each gate, push). Set `LAND_LOCK_POLL_SECONDS` (default 30) to change the wait
-interval; remove a stuck lock by hand with `rm "$(git rev-parse
---path-format=absolute --git-common-dir)/land.lock"`.
-`--dry-run` runs the same sequence, including the lock and the commit,
-but stops before the push. It finishes with its own
-`BLORP_GATE_RESULT gate=land ...` line and the landed commit SHA.
+`scripts/land` merges `origin/main` into the branch, in the branch's own
+worktree if it is checked out somewhere (that worktree must be clean) and in a
+temporary worktree otherwise; a merge conflict stops it, to be resolved on the
+branch. It then squash-merges the branch onto `origin/main` as one commit with
+the given title and body in a temporary detached worktree, optionally copies a
+measurement file into `benchmarks/results/<name>`, and pushes that commit to
+`origin main`. If `main` moved before the push, it merges again and retries;
+any other push failure stops it. The caller's checkout is never touched, and
+it runs no gates. Titles starting with `Merge` or containing an `#<digits>`
+issue reference are refused so main's history stays standalone and readable.
+`--dry-run` stops after the squash commit and prints its SHA; the branch still
+gets the merge from `origin/main`.
 
 ## Identifying A Binary
 
@@ -738,11 +718,9 @@ hygiene-check` runs it automatically.
 C-symbol boundary, manifest, std builtins, magic spellings). `make tooling-check` holds the stage-2 self-compile C-symbol
 leak check (`scripts/check-c-symbol-projection-self-compile`) and the
 Python/shell suites that test the scripts, build, runtime harnesses and
-audits. Every `scripts/land` runs both. `make benchmark-tooling-check` holds
-the benchmark-worker `check` runs and the suites that test the benchmark and
-measurement scripts; they protect those scripts rather than the compiler and
-take minutes, so `scripts/land` runs them only when a landing touches an input they read
-(see Landing a Branch). `make quality` runs all three, then
+audits. `make benchmark-tooling-check` holds the benchmark-worker `check` runs
+and the suites that test the benchmark and measurement scripts; they protect
+those scripts rather than the compiler. `make quality` runs all three, then
 `artifact-scan` for stray generated files the suites left behind;
 `scripts/premerge-gate` runs them too, and so does CI's Quality lane.
 

@@ -1,103 +1,45 @@
 #!/bin/bash
-# Squash-merge one commit/branch onto main, gate it, and push ff-only.
+# Land one branch on main as a single commit and push it.
 #
-#   scripts/land <commit-or-branch> --title "<title>" [--body "<text>"] \
-#       [--record <json> --record-name <file>] [--gate <scripts/test gate>]... \
-#       [--dry-run]
+#   scripts/land <branch> --title "<title>" [--body "<text>"] \
+#       [--record <file> --record-name <name>] [--dry-run]
+#
+# 1. Merge origin/main into the branch, so any conflict is resolved on the
+#    branch. This happens in the branch's own worktree when it is checked out
+#    somewhere (that worktree must be clean), otherwise in a temporary one, so
+#    the branch gets the merge commit even on a dry run.
+# 2. Squash-merge the branch onto origin/main as one commit with the given
+#    title, in a temporary detached worktree; the caller's checkout is untouched.
+# 3. Push that commit to origin main. If origin/main moved meanwhile, repeat
+#    from 1; any other push failure stops the landing.
+#
+# It runs no gates. Validate the branch first with the CI-equivalent Docker
+# gate: `scripts/docker-gate --premerge-gate -- --no-sanitize`.
 set -euo pipefail
 
-phase_start=$(date +%s)
-phase() { echo "LAND_PHASE $1 $(( $(date +%s) - phase_start ))s"; phase_start=$(date +%s); }
-verdict_status() { grep '^BLORP_GATE_RESULT ' | tail -1 | sed -n 's/.*status=\([A-Z]*\).*/\1/p'; }
-emit_verdict() { printf 'BLORP_GATE_RESULT gate=land status=%s passed=%s failed=%s tests=1\n' "$1" "$2" "$3"; }
-# Repository inputs that the benchmark policy fingerprints, one per line. The
-# benchmark-tooling suites check that each exists and run the compiler's test
-# session over some of them, so a change to one can break them. The whole
-# blorp/test/compiler suite is left out: only the compiler-suite baseline
-# fingerprints it, no benchmark-tooling suite runs it, and it cannot go
-# missing, but it changes in nearly every compiler landing.
-benchmark_policy_inputs() {
-    python3 -c '
-import json, sys
-policy = json.load(open(sys.argv[1], encoding="utf-8"))
-for workload in policy["workloads"].values():
-    for path in workload.get("fingerprint_inputs", []):
-        if path != "blorp/test/compiler":
-            print(path)
-' benchmarks/blorp_test_session_policy.json
-}
-
-# Reads changed paths on stdin and the policy inputs (newline-separated) as $1;
-# succeeds when any path is an input of `make benchmark-tooling-check`. Every
-# input those suites read must be listed here, so a landing that can turn CI's
-# Quality lane red on them runs them locally first:
-#   - the benchmark scripts and workers, and the wrappers the session
-#     benchmark tests drive (scripts/with-build-lock, with-compiler-contention-lease);
-#   - the compiler modules the benchmark workers and request generator import,
-#     the Core IR tags the Perceus benchmark vocabulary tracks, and the test
-#     session (blorp/src/test) that the session benchmark runs;
-#   - the benchmark policy's fingerprinted test and library inputs;
-#   - the test files themselves.
-# Recorded measurements under benchmarks/results/ are data, not tooling, so a
-# landing that only adds one does not count. The workers' C include directories
-# are only passed through to fixtures in temporary roots, so they are not inputs.
-touches_benchmark_tooling() {
-    local policy_inputs="$1" path input
-    while IFS= read -r path; do
-        case "$path" in
-            benchmarks/results/*) continue ;;
-            benchmarks/*|blorp/benchmark/*|scripts/bench-*) return 0 ;;
-            scripts/with-build-lock|scripts/with-compiler-contention-lease) return 0 ;;
-            blorp/src/test/*) return 0 ;;
-            blorp/src/compiler/bridge_protocol.brp|\
-            blorp/src/compiler/stage_06_typecheck/bridge.brp|\
-            blorp/src/compiler/stage_06_typecheck/trace.brp|\
-            blorp/src/compiler/stage_09_core/ir.brp|\
-            blorp/src/compiler/stage_09_core/function_origin_fixture.brp|\
-            blorp/src/compiler/stage_09_core/perceus.brp|\
-            blorp/src/compiler/stage_09_core/pipeline.brp|\
-            blorp/src/compiler/stage_10_backend/emit.brp|\
-            blorp/src/lib/build_artifact.brp|\
-            blorp/src/lib/function_profile.brp) return 0 ;;
-            blorp/test/compiler/benchmark/test_backend_memory.py|\
-            blorp/test/compiler/benchmark/test_perceus_memory.py|\
-            blorp/test/compiler/benchmark/test_typecheck_memory.py|\
-            blorp/test/compiler/benchmark/test_record_layout.sh|\
-            blorp/test/compiler/stage_06_typecheck/support/test_worker.py|\
-            blorp/test/compiler/stage_06_typecheck/support/test_replay.py|\
-            blorp/test/test/test_session_benchmark.py|\
-            blorp/test/build/test_memory_diagnostics_harness.py) return 0 ;;
-        esac
-        while IFS= read -r input; do
-            if [ -n "$input" ] && { [ "$path" = "$input" ] || [ "${path#"$input"/}" != "$path" ]; }; then
-                return 0
-            fi
-        done <<<"$policy_inputs"
-    done
-    return 1
-}
 usage() {
-    echo "Usage: scripts/land <commit-or-branch> --title TITLE [--body TEXT]" >&2
-    echo "  [--record JSON --record-name FILE] [--gate GATE]... [--dry-run]" >&2
+    echo "Usage: scripts/land <branch> --title TITLE [--body TEXT]" >&2
+    echo "  [--record FILE --record-name NAME] [--dry-run]" >&2
 }
 
-ref="" title="" body="" record="" record_name="" dry_run=0
-gates=()
+# How many times to re-merge and retry when origin/main moves between the
+# squash commit and the push.
+PUSH_ATTEMPTS=5
+
+branch="" title="" body="" record="" record_name="" dry_run=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --title) title="$2"; shift 2 ;;
         --body) body="$2"; shift 2 ;;
         --record) record="$2"; shift 2 ;;
         --record-name) record_name="$2"; shift 2 ;;
-        --gate) gates+=("$2"); shift 2 ;;
         --dry-run) dry_run=1; shift ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
-        *) [ -z "$ref" ] || { echo "Only one commit-or-branch may be given." >&2; exit 1; }; ref="$1"; shift ;;
+        *) [ -z "$branch" ] || { echo "Only one branch may be given." >&2; exit 1; }; branch="$1"; shift ;;
     esac
 done
-
-[ -n "$ref" ] || { echo "Missing commit-or-branch." >&2; usage; exit 1; }
+[ -n "$branch" ] || { echo "Missing branch." >&2; usage; exit 1; }
 [ -n "$title" ] || { echo "Missing --title." >&2; usage; exit 1; }
 case "$title" in
     Merge*) echo "Refusing title starting with 'Merge': $title" >&2; exit 1 ;;
@@ -108,156 +50,103 @@ if { [ -n "$record" ] && [ -z "$record_name" ]; } || { [ -z "$record" ] && [ -n 
     echo "--record and --record-name must be given together." >&2
     exit 1
 fi
-
-if [ -n "$(git status --porcelain)" ]; then
-    echo "Refusing: run scripts/land from a clean worktree." >&2
-    exit 1
+if [ -n "$record" ]; then
+    [ -f "$record" ] || { echo "No such record file: $record" >&2; exit 1; }
+    record="$(cd "$(dirname "$record")" && pwd -P)/$(basename "$record")"
 fi
+git show-ref --verify --quiet "refs/heads/$branch" ||
+    { echo "Not a local branch: $branch" >&2; exit 1; }
 
-# One landing at a time across all worktrees, from the first fetch until exit,
-# so a landing gates against exactly the main it pushes onto. The lock is a
-# symlink in the shared git directory whose target names the holder. Creating
-# it is atomic and records the owner in the same step, so a lock never exists
-# without one (macOS has no flock). A holder that died without releasing (a
-# hard kill) is taken over when its pid is gone. Two waiters taking over the
-# same dead holder can race; that is accepted, because takeover only follows a
-# hard kill. A stuck lock can be removed by hand: rm "<git-common-dir>/land.lock".
-# Dry runs take the lock too: they build and gate the same way, and one code
-# path is simpler than a bypass.
-land_lock="$(git rev-parse --path-format=absolute --git-common-dir)/land.lock"
-
-acquire_land_lock() {
-    my_owner="$$ $ref $(date +%H:%M)"
-    until ln -s "$my_owner" "$land_lock" 2>/dev/null; do
-        holder="$(readlink "$land_lock" 2>/dev/null || true)"
-        if [ -n "$holder" ] && ! kill -0 "${holder%% *}" 2>/dev/null; then
-            rm -f "$land_lock"
-            continue
-        fi
-        echo "queued behind: ${holder:-(lock just released)} (lock: $land_lock)"
-        sleep "${LAND_LOCK_POLL_SECONDS:-30}"
-    done
-    # Release only our own lock, even if it was taken over after a race.
-    trap '[ "$(readlink "$land_lock" 2>/dev/null)" = "$my_owner" ] && rm -f "$land_lock" || true' EXIT
-    trap 'exit 143' TERM INT
+# The worktree that has the branch checked out, if any.
+branch_worktree() {
+    git worktree list --porcelain | awk -v ref="branch refs/heads/$branch" '
+        /^worktree / { tree = substr($0, 10) }
+        $0 == ref { print tree }'
 }
 
-acquire_land_lock
-phase queue
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/blorp-land.XXXXXX")"
+temp_worktrees=()
+cleanup() {
+    for tree in ${temp_worktrees[@]+"${temp_worktrees[@]}"}; do
+        git worktree remove --force "$tree" >/dev/null 2>&1 || true
+    done
+    git worktree prune >/dev/null 2>&1 || true
+    rm -rf "$scratch"
+}
+trap cleanup EXIT
 
-git fetch origin
-git merge --ff-only origin/main
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-    echo "Refusing: HEAD must equal origin/main before landing (any branch name is fine)." >&2
-    exit 1
-fi
-
-squash_status=0
-git merge --squash "$ref" || squash_status=$?
-conflicts="$(git diff --name-only --diff-filter=U || true)"
-if [ "$squash_status" -ne 0 ] && [ -z "$conflicts" ]; then
-    echo "git merge --squash $ref failed." >&2
-    exit "$squash_status"
-fi
-for path in $conflicts; do
-    case "$path" in
-        benchmarks/results/*|*harness*) git checkout --ours -- "$path"; git add -- "$path" ;;
-    esac
-done
-remaining="$(git diff --name-only --diff-filter=U || true)"
-if [ -n "$remaining" ]; then
-    echo "Unresolved merge conflicts outside benchmarks/results and harness paths:" >&2
-    echo "$remaining" >&2
-    exit 1
-fi
-
-if [ -n "$record" ]; then
-    mkdir -p benchmarks/results
-    cp "$record" "benchmarks/results/$record_name"
-    git add "benchmarks/results/$record_name"
-fi
-
-if [ -n "$body" ]; then
-    git commit -m "$title" -m "$body"
-else
-    git commit -m "$title"
-fi
-
-make
-echo "Build stamp: $(bin/blorp --version)"
-scripts/compiler-build-status
-phase build
-
-# Static repository hygiene (layout, manifest, boundary checks) runs on every
-# landing, so a missing manifest entry or an unowned raw allocation site cannot
-# reach main through a gate that does not select it. The tooling suites
-# (`make tooling-check`) run on every landing too: they audit compiler, runtime
-# and script sources, so a change anywhere can break them, and CI's Quality
-# lane runs them. The suites that test benchmark tooling take minutes, so they
-# run only when the landing touches an input they read (see
-# touches_benchmark_tooling); CI's Quality lane runs them on every push.
-overall="PASS"
-if ! make hygiene-check; then
-    echo "hygiene-check failed" >&2
-    overall="FAIL"
-fi
-phase hygiene
-
-if ! make tooling-check; then
-    echo "tooling-check failed" >&2
-    overall="FAIL"
-fi
-phase tooling
-
-# Read the file list into a variable first: the function returns at the first
-# match, and under pipefail a closed pipe would fail a pipeline spuriously.
-# --no-renames lists both sides of a move, so moving a file out of an input
-# directory counts as touching it.
-landed_paths="$(git diff --name-only --no-renames origin/main HEAD)"
-policy_inputs="$(benchmark_policy_inputs)"
-if touches_benchmark_tooling "$policy_inputs" <<<"$landed_paths"; then
-    if ! make benchmark-tooling-check; then
-        echo "benchmark-tooling-check failed" >&2
-        overall="FAIL"
+merge_main_into_branch() {
+    local tree
+    tree="$(branch_worktree)"
+    if [ -n "$tree" ]; then
+        if [ -n "$(git -C "$tree" status --porcelain)" ]; then
+            echo "Refusing: $branch is checked out at $tree with uncommitted changes." >&2
+            exit 1
+        fi
+    else
+        tree="$scratch/branch"
+        git worktree add -q "$tree" "$branch"
+        temp_worktrees+=("$tree")
     fi
-else
-    echo "benchmark-tooling-check skipped: no input of the benchmark tooling suites changed"
-fi
-phase benchmark-tooling
+    git -C "$tree" merge-base --is-ancestor origin/main HEAD && return 0
+    if ! git -C "$tree" merge -q --no-edit origin/main; then
+        git -C "$tree" merge --abort 2>/dev/null || true
+        echo "Could not merge origin/main into $branch (see above); resolve it on the branch and rerun." >&2
+        exit 1
+    fi
+}
 
-result="$(scripts/compiler-check --changed --base origin/main | tee /dev/stderr || true)"
-[ "$(printf '%s\n' "$result" | verdict_status)" = "PASS" ] || overall="FAIL"
-phase compiler-check
-gate_count=${#gates[@]}
-i=0
-while [ "$i" -lt "$gate_count" ]; do
-    gate="${gates[$i]}"
-    result="$(scripts/test --no-build "$gate" | tee /dev/stderr || true)"
-    [ "$(printf '%s\n' "$result" | verdict_status)" = "PASS" ] || overall="FAIL"
-    phase "gate:$gate"
-    i=$((i + 1))
+attempt=1
+while :; do
+    git fetch -q origin
+    base="$(git rev-parse origin/main)"
+
+    # 1. Bring the branch up to date with main.
+    merge_main_into_branch
+
+    # 2. One squash commit on top of main, in a temporary detached worktree.
+    land_tree="$scratch/land-$attempt"
+    git worktree add -q --detach "$land_tree" "$base"
+    temp_worktrees+=("$land_tree")
+    if ! git -C "$land_tree" merge -q --squash "$branch"; then
+        echo "Squash-merging $branch onto origin/main failed unexpectedly after the branch was merged with it." >&2
+        exit 1
+    fi
+    if [ -n "$record" ]; then
+        mkdir -p "$land_tree/benchmarks/results"
+        cp "$record" "$land_tree/benchmarks/results/$record_name"
+        git -C "$land_tree" add "benchmarks/results/$record_name"
+    fi
+    if git -C "$land_tree" diff --cached --quiet; then
+        echo "$branch has no changes relative to origin/main." >&2
+        exit 1
+    fi
+    if [ -n "$body" ]; then
+        git -C "$land_tree" commit -q -m "$title" -m "$body"
+    else
+        git -C "$land_tree" commit -q -m "$title"
+    fi
+    landed_sha="$(git -C "$land_tree" rev-parse HEAD)"
+
+    if [ "$dry_run" -eq 1 ]; then
+        echo "Dry run: not pushed. Squash commit: $landed_sha"
+        exit 0
+    fi
+
+    # 3. Push. Retry only when the rejection is because origin/main moved.
+    if git -C "$land_tree" push -q origin HEAD:main; then
+        echo "Landed $landed_sha on main."
+        exit 0
+    fi
+    git fetch -q origin
+    if [ "$(git rev-parse origin/main)" = "$base" ]; then
+        echo "Push failed and origin/main did not move; not retrying." >&2
+        exit 1
+    fi
+    if [ "$attempt" -ge "$PUSH_ATTEMPTS" ]; then
+        echo "origin/main kept moving; gave up after $PUSH_ATTEMPTS attempts." >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    echo "origin/main moved; merging it into $branch and retrying ($attempt/$PUSH_ATTEMPTS)." >&2
 done
-
-landed_sha="$(git rev-parse HEAD)"
-if [ "$overall" != "PASS" ]; then
-    emit_verdict FAIL 0 1
-    exit 1
-fi
-
-if [ "$dry_run" -eq 1 ]; then
-    emit_verdict PASS 1 0
-    echo "Dry run: not pushed. Landed commit (local): $landed_sha"
-    exit 0
-fi
-
-git fetch origin
-if ! git merge-base --is-ancestor origin/main HEAD; then
-    emit_verdict FAIL 0 1
-    echo "origin/main moved; rerun." >&2
-    exit 1
-fi
-
-git push origin HEAD:main
-phase push
-emit_verdict PASS 1 0
-echo "Landed $landed_sha on main."

@@ -508,8 +508,7 @@ quality:
 
 quality-full: quality
 
-# Seconds-long static checks over the sources; `scripts/land` runs this on
-# every landing. `artifact-scan` is not here: builds and test suites leave the
+# Seconds-long static checks over the sources. `artifact-scan` is not here: builds and test suites leave the
 # stray files it looks for, so `quality` runs it after the suites.
 hygiene-check:
 	@scripts/check-blorp-layout
@@ -534,7 +533,7 @@ artifact-scan:
 	fi
 
 # The Python/shell tooling suites. They audit compiler, runtime and script
-# sources, so `quality`, the premerge gate and every `scripts/land` run them.
+# sources, so `quality` and the premerge gate run them.
 # The suites that test the benchmark tooling are `benchmark-tooling-check`.
 tooling-check: build-blorp-cli
 	@scripts/check-c-symbol-projection-self-compile
@@ -572,16 +571,12 @@ tooling-check: build-blorp-cli
 	@blorp/test/build/test_build_source_generator.sh
 	@blorp/test/build/test_release_toolchain.sh
 	@blorp/test/build/test_scripts_test_harness.sh
-	@blorp/test/build/test_land_lock.sh
 	@blorp/test/build/test_split_translation_units.sh
 
 # The benchmark-worker checks and the suites that test benchmark and
 # measurement tooling (benchmarks/, blorp/benchmark/, scripts/bench-*). They
-# protect the scripts used to judge performance changes, not the compiler, and
-# take minutes, so `scripts/land` runs them only when a landing touches an
-# input they read (`touches_benchmark_tooling` in scripts/land lists them;
-# add a new input there). `quality`, and so CI and the premerge gate, always
-# run them.
+# protect the scripts used to judge performance changes, not the compiler.
+# `quality`, and so CI and the premerge gate, run them.
 benchmark-tooling-check: build-blorp-cli
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
