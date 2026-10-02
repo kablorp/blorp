@@ -1217,6 +1217,181 @@ pure func test_owned_parameter_result_updates_beside_unchanged_branch() -> Bool:
 
 
 ---
+`consumed_record_result_program` with its body replaced by `body`.
+---
+pure func consumed_record_result_program_with_body(body: CoreExpr) -> CoreProgram:
+	consumed_record_result_program_with_origin_and_body(
+		ConsumingClone(0, core_function_declared_origin(FIXTURE_SOURCE_FUNCTION_ORIGIN)),
+		body,
+	)
+
+
+pure func consumed_record_result_program_with_origin_and_body(
+	origin: CoreFunctionOrigin,
+	body: CoreExpr,
+) -> CoreProgram:
+	program: CoreProgram = consumed_record_result_program_with_origin(origin)
+
+	match program.decls:
+		[record_decl, FunctionDecl(function_info)]:
+			{ program |
+				decls = [
+					record_decl,
+					FunctionDecl({ function_info | body = Some(body) }),
+				]
+			}
+		_:
+			program
+
+
+pure func lowered_json(program: CoreProgram) -> String:
+	core_program_to_json(lower_record_updates_for_ownership(program)).to_string()
+
+
+---
+`let rows = box` followed by a branch that returns `rows` or an update of it,
+the shape `rows = from_opaque Table(table)` and a `match` on a lookup lower
+to: `box` is not read again, so the alias holds the owner and its update is
+in place.
+---
+pure func test_update_of_alias_of_owned_parameter_transfers_owner() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	rows_alias: CoreVar = local_box_var("rows", 7)
+	json: String = lowered_json(
+		consumed_record_result_program_with_body(
+			LetExpr(
+				rows_alias,
+				False,
+				box_type,
+				VarExpr(box_var_for_preceding_binding(), box_type, synthetic_core_source_loc()),
+				IfExpr(
+					LiteralExpr(BoolLiteral(True), bool_type(), synthetic_core_source_loc()),
+					VarExpr(rows_alias, box_type, synthetic_core_source_loc()),
+					counter_box_update_of(rows_alias),
+					box_type,
+					synthetic_core_source_loc(),
+				),
+			),
+		),
+	)
+
+	json.contains("\"kind\":\"record_cow_update\",\"source\":{\"kind\":\"var\",\"var\":{\"name\":\"rows\"")
+
+
+---
+`grown = { box | ... }` returned as `grown`: the binding is the path's
+result, so the update is the result's update and stays in place.
+---
+pure func test_bound_update_returned_by_name_transfers_owner() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	grown: CoreVar = local_box_var("grown", 9)
+	json: String = lowered_json(
+		consumed_record_result_program_with_body(
+			LetExpr(
+				grown,
+				False,
+				box_type,
+				counter_box_update_of(box_var_for_preceding_binding()),
+				VarExpr(grown, box_type, synthetic_core_source_loc()),
+			),
+		),
+	)
+
+	json.contains("\"kind\":\"record_cow_update\",\"source\":{\"kind\":\"var\",\"var\":{\"name\":\"box\"")
+
+
+---
+`{ make_box() | count = 11 }`: the update's base is bound from a call, not a
+variable, and nothing else names the binding, so the update is its last use
+and is in place. The same holds for a base read from a field,
+`{ p.state | cursor = c }`, whose slot the enclosing update can take.
+---
+pure func test_update_of_base_bound_from_expression_transfers_owner() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	update: CoreExpr = counter_box_update_of(local_box_var("made", 10))
+	from_call: CoreExpr = match update:
+		LetExpr(base, is_mutable, binding_type, _, body):
+			LetExpr(
+				base,
+				is_mutable,
+				binding_type,
+				CallExpr(
+					UserCall("make_box", Some(9), []),
+					VoidExpr(VoidType, synthetic_core_source_loc()),
+					[],
+					box_type,
+					synthetic_core_source_loc(),
+				),
+				body,
+			)
+		_:
+			update
+	json: String = lowered_json(
+		consumed_record_result_program_with_origin_and_body(FIXTURE_SOURCE_FUNCTION_ORIGIN, from_call),
+	)
+
+	json.contains("\"kind\":\"record_cow_update\",\"source\":{\"kind\":\"var\",\"var\":{\"name\":\"__record_update_made\"")
+
+
+---
+`{ holder.inner | count = holder.inner.limit }`: the base is bound from the
+path `holder.inner`, and the replacement's read of that path goes through the
+base, so the enclosing update reads `holder.inner` only once.
+---
+pure func test_update_of_field_path_base_reads_path_through_base() -> Bool:
+	box_type: CoreType = HeapRecordType("CounterBox")
+	holder: CoreVar = local_box_var("holder", 11)
+	base: CoreVar = local_box_var("__record_update_inner", 12)
+	path: CoreExpr = FieldExpr(
+		VarExpr(holder, HeapRecordType("Holder"), synthetic_core_source_loc()),
+		"inner",
+		core_field_ref(5),
+		box_type,
+		synthetic_core_source_loc(),
+	)
+	base_ref: CoreExpr = VarExpr(base, box_type, synthetic_core_source_loc())
+	update: CoreExpr = LetExpr(
+		base,
+		False,
+		box_type,
+		path,
+		RecordUpdateExpr(
+			base_ref,
+			[
+				{
+					ref = core_field_ref(0),
+					name = "count",
+					value = FieldExpr(path, "limit", core_field_ref(2), int_type(), synthetic_core_source_loc())
+				},
+				{
+					ref = core_field_ref(2),
+					name = "limit",
+					value = FieldExpr(base_ref, "limit", core_field_ref(2), int_type(), synthetic_core_source_loc())
+				},
+			],
+			box_type,
+			synthetic_core_source_loc(),
+		),
+	)
+
+	match lower_record_updates_for_ownership(
+		consumed_record_result_program_with_origin_and_body(FIXTURE_SOURCE_FUNCTION_ORIGIN, update),
+	).decls:
+		[HeapRecordDecl(_), FunctionDecl(function_info)]:
+			match function_info.body:
+				Some(LetExpr(_, _, _, _, RecordCowUpdateExpr(VarExpr(source, _, _), [count_field, _], _, _))):
+					match count_field.replacement:
+						Some(FieldExpr(VarExpr(read_root, _, _), "limit", _, _, _)):
+							source.name == "__record_update_inner" and read_root.name == "__record_update_inner"
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+---
 The same function body without a `ConsumingClone` origin borrows `box`, so its
 record update must keep building a fresh record.
 ---
@@ -3305,6 +3480,22 @@ tests: TestSuite = {
 		(
 			"record result without owned parameter builds fresh record",
 			test_record_result_without_owned_parameter_builds_fresh_record,
+		),
+		(
+			"update of alias of owned parameter transfers owner",
+			test_update_of_alias_of_owned_parameter_transfers_owner,
+		),
+		(
+			"bound update returned by name transfers owner",
+			test_bound_update_returned_by_name_transfers_owner,
+		),
+		(
+			"update of base bound from expression transfers owner",
+			test_update_of_base_bound_from_expression_transfers_owner,
+		),
+		(
+			"update of field path base reads path through base",
+			test_update_of_field_path_base_reads_path_through_base,
 		),
 		(
 			"update of owned local at last use transfers owner",

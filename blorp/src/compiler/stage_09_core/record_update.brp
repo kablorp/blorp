@@ -46,6 +46,7 @@ import:
 		CoreVar,
 		PassTempKind(RecordUpdateTemp),
 		RECORD_UPDATE_TEMP_ORIGIN,
+		core_expr_source_loc,
 		core_expr_type,
 		core_field_refs_equal,
 		core_type_equal,
@@ -1123,6 +1124,36 @@ private pure func prepare_literal_match_reuse_value(
 				None
 
 
+private pure func core_expr_is_var_of(expr: CoreExpr, variable: CoreVar) -> Bool:
+	match expr:
+		VarExpr(found, _, _):
+			core_var_equal(found, variable)
+		_:
+			False
+
+
+---
+Whether `let <binding> = initial` in `body` only gives the target a second
+name: `initial` is the target itself, of the binding's record type, and
+`body` never mentions the target again, so the binding takes its owner over.
+---
+private pure func renames_target(
+	target: CoreVar,
+	binding_type: CoreType,
+	initial: CoreExpr,
+	body: CoreExpr,
+) -> Bool:
+	match initial:
+		VarExpr(source, source_type, _):
+			(
+				core_var_equal(source, target)
+				and same_heap_record_type(binding_type, source_type)
+				and not expr_touches_var(body, target)
+			)
+		_:
+			False
+
+
 private pure func prepare_immutable_let_reuse_value(
 	record_decls: Dict[String, CoreHeapRecordDecl],
 	target: CoreVar,
@@ -1151,10 +1182,36 @@ private pure func prepare_immutable_let_reuse_value(
 		Some(prepared):
 			Some(prepared)
 		None:
-			if (
-				core_var_equal(variable, target)
-				or not expr_reads_target_fields_only(initial, target)
-			):
+			if core_var_equal(variable, target):
+				None
+			else if renames_target(target, binding_type, initial, body):
+				-- `let rows = target` with `target` never mentioned again, the
+				-- form `rows = from_opaque Table(table)` lowers to: `rows` holds
+				-- the owner from here on, so its updates are the target's.
+				prepare_record_reuse_value(
+					record_decls,
+					variable,
+					unchanged_target,
+					body,
+				).map(
+					func(
+						prepared_body,
+					): LetExpr(variable, False, binding_type, initial, prepared_body),
+				)
+			else if core_expr_is_var_of(body, variable):
+				-- `grown = { target | ... }` returned as `grown`: the binding is
+				-- the path's result, so the update is the result's update.
+				prepare_record_reuse_value(
+					record_decls,
+					target,
+					unchanged_target,
+					initial,
+				).map(
+					func(
+						prepared_initial,
+					): LetExpr(variable, False, binding_type, prepared_initial, body),
+				)
+			else if not expr_reads_target_fields_only(initial, target):
 				None
 			else:
 				prepare_record_reuse_value(
@@ -1572,6 +1629,123 @@ private pure func prepare_sequence_in_scope(
 
 
 ---
+The in-place form of `{ <expr> | ... }` when its base is bound from an
+expression rather than a variable: `let base = make()` or `let base =
+p.state`, then an update of `base`. Nothing else names the binding and the
+update is its last use, so the update takes the binding's owner. A base read
+from a field is an owned alias Perceus retains; when the update is the
+replacement for that same field of an in-place update, the field take moves
+the slot into it and the inner update is in place too. A base bound from a
+variable is the canonical form, handled where that variable's ownership is
+known.
+---
+private pure func expression_bound_base_update(
+	record_decls: Dict[String, CoreHeapRecordDecl],
+	base: CoreVar,
+	is_mutable: Bool,
+	binding_type: CoreType,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> Option[CoreExpr]:
+	match rhs:
+		VarExpr(_, _, _):
+			None
+		_:
+			if is_mutable:
+				None
+			else:
+				prepare_canonical_record_reuse_value(
+					record_decls,
+					base,
+					base,
+					binding_type,
+					base,
+					binding_type,
+					core_expr_source_loc(rhs),
+					reads_of_path_through_base(body, rhs, base, binding_type),
+				)
+
+
+---
+The root variable of a field path `v.f.g`, or `None` when `expr` is not one.
+---
+private pure func field_path_root(expr: CoreExpr) -> Option[CoreVar]:
+	match expr:
+		VarExpr(variable, _, _):
+			Some(variable)
+		FieldExpr(inner, _, _, _, _):
+			field_path_root(inner)
+		_:
+			None
+
+
+private pure func same_field_path(left: CoreExpr, right: CoreExpr) -> Bool:
+	match (left, right):
+		(VarExpr(left_var, _, _), VarExpr(right_var, _, _)):
+			core_var_equal(left_var, right_var)
+		(FieldExpr(left_inner, _, left_ref, _, _), FieldExpr(right_inner, _, right_ref, _, _)):
+			core_field_refs_equal(left_ref, right_ref) and same_field_path(left_inner, right_inner)
+		_:
+			False
+
+
+private pure func replace_field_path(
+	expr: CoreExpr,
+	path: CoreExpr,
+	replacement: CoreExpr,
+) -> CoreExpr:
+	if same_field_path(expr, path):
+		replacement
+	else:
+		match expr:
+			SeqExpr(_, _):
+				CoreTraverse.map_core_sequence_items(
+					expr,
+					func(item): replace_field_path(item, path, replacement),
+				)
+			_:
+				CoreTraverse.map_core_expr_children(
+					expr,
+					func(child): replace_field_path(child, path, replacement),
+				)
+
+
+---
+`body`, the update of `base` bound from the field path `path` (`let base =
+p.state`), with the replacements' reads of that path made through `base`:
+`{ p.state | cursor = p.state.cursor + 1 }` reads `base.cursor`. Records are
+immutable and nothing in the update rebinds the path's root, so both name
+the same value; reading through `base` leaves the enclosing update a single
+read of `p.state`, the one its field take needs.
+---
+private pure func reads_of_path_through_base(
+	body: CoreExpr,
+	path: CoreExpr,
+	base: CoreVar,
+	base_type: CoreType,
+) -> CoreExpr:
+	match (field_path_root(path), path, body):
+		(Some(root), FieldExpr(_, _, _, _, _), RecordUpdateExpr(carrier, fields, typ, loc)):
+			if record_fields_assign_var(fields, root):
+				body
+			else:
+				base_read: CoreExpr = VarExpr(base, base_type, core_expr_source_loc(path))
+
+				RecordUpdateExpr(
+					carrier,
+					fields.map(
+						func(
+							field,
+						): { field | value = replace_field_path(field.value, path, base_read) },
+					),
+					typ,
+					loc,
+				)
+		_:
+			body
+
+
+---
 Prepares the record updates in `expr`, on the straight-line path of the
 bindings in `frames`: sequences and bindings extend the chain, and a record
 update of an owned binding at its last use takes the binding over.
@@ -1594,21 +1768,42 @@ private pure func prepare_record_updates_in_scope(
 						and declared_heap_record_type(record_decls, binding_type)
 					)
 
-					LetExpr(
+					match expression_bound_base_update(
+						record_decls,
 						variable,
 						is_mutable,
 						binding_type,
-						prepare_record_updates_in_scope(
-							record_decls,
-							frames_before(frames, body),
-							rhs,
-						),
-						prepare_record_updates_in_scope(
-							record_decls,
-							frames_binding(frames, variable, owned),
-							body,
-						),
-					)
+						rhs,
+						body,
+					):
+						Some(prepared_update):
+							LetExpr(
+								variable,
+								is_mutable,
+								binding_type,
+								prepare_record_updates_in_scope(
+									record_decls,
+									frames_before(frames, body),
+									rhs,
+								),
+								prepared_update,
+							)
+						None:
+							LetExpr(
+								variable,
+								is_mutable,
+								binding_type,
+								prepare_record_updates_in_scope(
+									record_decls,
+									frames_before(frames, body),
+									rhs,
+								),
+								prepare_record_updates_in_scope(
+									record_decls,
+									frames_binding(frames, variable, owned),
+									body,
+								),
+							)
 				BorrowLetExpr(variable, binding_type, rhs, body):
 					BorrowLetExpr(
 						variable,

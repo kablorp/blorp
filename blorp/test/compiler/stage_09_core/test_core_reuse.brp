@@ -141,6 +141,7 @@ import:
 		CoreListHandoffWriteOrder(ForwardCompactingHandoff),
 		CoreListStorageLayout(InlineListStorage, PointerListStorage),
 		CoreLiteral(BoolLiteral, IntLiteral),
+		CoreLiteralMatchFallback(LiteralMatchFallbackBody),
 		CoreLoopBinder,
 		CoreLoopRangeDirection(RangeForwardOnly),
 		CoreMatchBinding,
@@ -3008,6 +3009,52 @@ pure func test_takes_cow_field_after_preceding_binding() -> Bool:
 			False
 
 
+---
+The update can sit in a match arm under a binding, the shape a `match` on a
+computed value lowers to: the take still applies there.
+---
+pure func test_takes_cow_field_in_match_arm_under_binding() -> Bool:
+	scrutinee: CoreVar = named_var("scrutinee")
+	update: CoreExpr = state_cow_update(
+		state_var_expr(),
+		[
+			items_cow_field(Some(inlined_append(owned_items_read(ArcRetainPolicy)))),
+			top_cow_field(Some(int_expr(1))),
+		],
+	)
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		LetExpr(
+			scrutinee,
+			False,
+			int_type(),
+			state_field_read("top", int_type()),
+			LiteralMatchExpr(
+				VarExpr(scrutinee, int_type(), synthetic_core_source_loc()),
+				[
+					{
+						literal = IntLiteral(0),
+						bindings = [],
+						body = update
+					},
+				],
+				LiteralMatchFallbackBody(state_var_expr()),
+				state_type(),
+				synthetic_core_source_loc(),
+			),
+		),
+	)
+
+	match rewritten:
+		LetExpr(_, _, _, _, LiteralMatchExpr(_, cases, _, _, _)):
+			match cases.get(0):
+				Some(first_case):
+					takes_items_from_state(first_replacement_policy(first_case.body))
+				None:
+					False
+		_:
+			False
+
+
 pure func test_takes_self_consumed_record_reuse_field() -> Bool:
 	rewritten: CoreExpr = rewrite_post_perceus_expr(
 		RecordReuseExpr(
@@ -3054,6 +3101,81 @@ pure func test_keeps_retain_when_sibling_reads_same_field() -> Bool:
 	)
 
 	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
+---
+A replacement that can leave through `break` after the take would leave the
+taken slot empty in a record that outlives the update, so the take is
+refused: here a later argument of the consuming call breaks.
+---
+pure func test_keeps_retain_when_later_argument_may_break() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		state_cow_update(
+			state_var_expr(),
+			[
+				items_cow_field(
+					Some(
+						consuming_append([
+							owned_items_read(ArcRetainPolicy),
+							BreakExpr(int_type(), synthetic_core_source_loc()),
+						]),
+					),
+				),
+				top_cow_field(None),
+			],
+		),
+	)
+
+	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
+---
+Replacements all run before the source is consumed, so an exit in a later
+replacement runs after an earlier replacement's take: refused too.
+---
+pure func test_keeps_retain_when_later_replacement_may_continue() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		RecordReuseExpr(
+			state_var_expr(),
+			[
+				{
+					name = "items",
+					ref = test_field_ref("items"),
+					value = inlined_append(owned_items_read(ArcRetainPolicy))
+				},
+				{
+					name = "top",
+					ref = test_field_ref("top"),
+					value = ContinueExpr(int_type(), synthetic_core_source_loc())
+				},
+			],
+			state_type(),
+			synthetic_core_source_loc(),
+		),
+	)
+
+	keeps_arc_retain(first_replacement_policy(rewritten))
+
+
+---
+The hoisted form: the binding that takes the field can itself break after
+the take, before the update writes the slot back.
+---
+pure func test_keeps_hoisted_retain_when_binding_may_break() -> Bool:
+	rewritten: CoreExpr = rewrite_post_perceus_expr(
+		LetExpr(
+			hoisted_items_var(),
+			False,
+			list_int_type(),
+			consuming_append([
+				owned_items_read(ArcRetainPolicy),
+				BreakExpr(int_type(), synthetic_core_source_loc()),
+			]),
+			hoisted_items_cow_update(state_var_expr()),
+		),
+	)
+
+	keeps_arc_retain(first_dup_policy(rewritten))
 
 
 pure func test_keeps_retain_when_replacement_reads_whole_source() -> Bool:
@@ -3261,12 +3383,28 @@ tests: TestSuite = {
 		("takes self-consumed record reuse field", test_takes_self_consumed_record_reuse_field),
 		("takes cow field after preceding binding", test_takes_cow_field_after_preceding_binding),
 		(
+			"takes cow field in match arm under binding",
+			test_takes_cow_field_in_match_arm_under_binding,
+		),
+		(
 			"keeps retain when sibling reads same field",
 			test_keeps_retain_when_sibling_reads_same_field,
 		),
 		(
 			"keeps retain when replacement reads whole source",
 			test_keeps_retain_when_replacement_reads_whole_source,
+		),
+		(
+			"keeps retain when a later argument may break",
+			test_keeps_retain_when_later_argument_may_break,
+		),
+		(
+			"keeps retain when a later replacement may continue",
+			test_keeps_retain_when_later_replacement_may_continue,
+		),
+		(
+			"keeps hoisted retain when the binding may break",
+			test_keeps_hoisted_retain_when_binding_may_break,
 		),
 		(
 			"keeps retain when source is not a bare variable",

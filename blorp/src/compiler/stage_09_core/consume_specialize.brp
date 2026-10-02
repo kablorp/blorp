@@ -2,8 +2,10 @@
 --
 -- A call hands an owned record to a consuming clone of its callee where the
 -- record is at its last use: the owned parameter of a clone, a `let`-bound
--- local, the target of `x = f(x)`, or the result of another user call passed
--- straight in (`b.f().g()`). The clone keeps the original body and
+-- local, the target of `x = f(x)`, the result of another user call passed
+-- straight in (`b.f().g()`), or, inside a record update's replacement for a
+-- field, that field of the updated record (`{ b | nodes = b.nodes.f() }`),
+-- which the reuse pass takes out of a unique record. The clone keeps the original body and
 -- declares the parameter owned through its `ConsumingClone` origin; ownership
 -- inference takes that declaration as the clone's contract floor, so Perceus
 -- transfers the parameter where the body returns or stores it and releases it
@@ -34,12 +36,12 @@ import:
 		CoreCallKind(UserCall),
 		CoreDecl(FunctionDecl, GlobalDecl),
 		CoreExpr(
-			AccessorLiteralMatchExpr, AssignExpr, BorrowLetExpr, BoxExpr, BreakExpr, CallExpr,
-			CastExpr, ConstructorMatchExpr, ContinueExpr, DropExpr, DupExpr, IfExpr,
-			LengthMatchExpr, LetExpr, LiteralExpr, LiteralMatchExpr, LogicalExpr, RecordUpdateExpr,
-			ResourceCleanupExitExpr, SeqExpr, StaticStringLiteralExpr, TailrecListSpreadRecurExpr,
-			TailrecRecurExpr, UnboxExpr, VarExpr, VoidExpr,
+			AccessorLiteralMatchExpr, AssignExpr, BorrowLetExpr, BoxExpr, CallExpr, CastExpr,
+			ConstructorMatchExpr, DropExpr, DupExpr, FieldExpr, IfExpr, LengthMatchExpr, LetExpr,
+			LiteralExpr, LiteralMatchExpr, LogicalExpr, RecordUpdateExpr, SeqExpr,
+			StaticStringLiteralExpr, UnboxExpr, VarExpr, VoidExpr,
 		),
+		CoreFieldRef,
 		CoreFunction,
 		CoreFunctionKind(
 			BuiltinFunction, ClosureBodyFunction, ForeignFunction, ProgramEntrypointFunction,
@@ -49,9 +51,11 @@ import:
 		CoreGlobal,
 		CoreMatchBinding,
 		CoreProgram,
+		CoreRecordFieldValue,
 		CoreSourceLoc,
 		CoreType(HeapRecordType),
 		CoreVar,
+		core_field_refs_equal,
 		core_function_declared_origin,
 		core_var_equal,
 	set as Sets
@@ -376,7 +380,8 @@ private pure func make_consuming_clone(
 								{
 									state = state,
 									owned = [param.name],
-									after = NothingAfter
+									after = NothingAfter,
+									replacing = None
 								},
 								body,
 							),
@@ -559,6 +564,31 @@ private union LastUseContinuation:
 
 
 ---
+The slot `field` of the record a record update consumes, while the walk is
+inside the replacement for that field. `base` is the update's binding of the
+record and `bound` the variable that binding was made from (`let base = bound`
+in `{ bound | ... }`); a replacement reads the slot through either.
+
+A call in the replacement that reads the slot as an argument,
+`{ b | nodes = b.nodes.with_parent(k) }`, hands that argument to the callee's
+consuming clone. When the update owns a unique `b`, the reuse pass takes the
+field out of `b` for the call (`CowFieldTakeRetainPolicy`), so the clone
+receives the only reference and updates the field in place; this composes to
+any nesting depth, one clone per level. When the take is not proved the
+field stays shared, Perceus retains it, and the clone copies exactly as the
+borrowing original would have. The slot is only tracked through the
+positions `take_field_alias` in `reuse.brp` descends: call arguments and
+`let`, borrow-let and sequence frames. Anywhere else, retargeting could only
+add a clone without enabling the take.
+---
+private record ReplacedFieldSlot {
+	base: CoreVar,
+	bound: CoreVar,
+	field: CoreFieldRef
+}
+
+
+---
 What the last-use walk knows at the expression it is rewriting.
 
 `owned` holds the variables this body owns and may hand to a consuming clone:
@@ -571,6 +601,9 @@ that may run a child more than once or not at all, the walk starts over with
 no owned variables, so it only retargets where straight-line control flow
 proves the last use.
 
+`replacing` is the field slot whose replacement the walk is inside, on that
+replacement's straight-line spine; see `ReplacedFieldSlot`.
+
 Perceus is the safety net for this analysis: a variable handed to a clone
 while still live gets a retain, so imprecision here costs a copy, never
 correctness.
@@ -578,7 +611,8 @@ correctness.
 private record LastUseWalk {
 	state: ConsumeSpecializeState,
 	owned: List[CoreVar],
-	after: LastUseContinuation
+	after: LastUseContinuation,
+	replacing: Option[ReplacedFieldSlot]
 }
 
 
@@ -623,13 +657,26 @@ private pure func walk_before(walk: LastUseWalk, later: CoreExpr) -> LastUseWalk
 over inside it.
 ---
 private pure func conservative_walk(walk: LastUseWalk) -> LastUseWalk:
-	if walk.owned.length() == 0:
+	if walk.owned.length() == 0 and walk.replacing.is_none():
 		walk
 	else:
 		{ walk |
 			owned = NO_VARS,
-			after = NothingAfter
+			after = NothingAfter,
+			replacing = None
 		}
+
+
+---
+`walk` for a child that may not run, or run after a choice: a branch of an
+`if` or a match. The field-take proof does not descend there, so no
+replaced-field slot is handed on inside it.
+---
+private pure func walk_outside_replacement(walk: LastUseWalk) -> LastUseWalk:
+	if walk.replacing.is_none():
+		walk
+	else:
+		{ walk | replacing = None }
 
 
 private pure func walk_without(walk: LastUseWalk, variable: CoreVar) -> LastUseWalk:
@@ -730,13 +777,30 @@ private pure func is_owned_call_temporary(state: ConsumeSpecializeState, arg: Co
 
 
 ---
+Whether `arg` reads the slot the enclosing record update replaces, directly:
+`b.nodes` inside the replacement for `nodes` of `{ b | ... }`.
+---
+private pure func reads_replaced_field_slot(slot: ReplacedFieldSlot, arg: CoreExpr) -> Bool:
+	match arg:
+		FieldExpr(VarExpr(owner, _, _), _, field_ref, _, _):
+			(
+				core_field_refs_equal(field_ref, slot.field)
+				and (core_var_equal(owner, slot.base) or core_var_equal(owner, slot.bound))
+			)
+		_:
+			False
+
+
+---
 The clone a call can hand an owned argument to, tried in this order:
 `assigned`, the target of `x = f(..., x, ...)`, whose old value the
 assignment ends, so it needs no liveness check; then the first owned
 variable passed once among the call's direct arguments and not read after
-the call; then the first argument that is an owned call temporary. Uses of
-the same variable inside other arguments run before the call, so they do
-not keep it live past it. A candidate must also be accepted by a clone.
+the call; then the first argument that is an owned call temporary; then the
+first argument that reads the slot of the enclosing record update's
+replaced field (see `ReplacedFieldSlot`). Uses of the same variable inside
+other arguments run before the call, so they do not keep it live past it. A
+candidate must also be accepted by a clone.
 ---
 private pure func last_use_clone_target(
 	walk: LastUseWalk,
@@ -750,9 +814,25 @@ private pure func last_use_clone_target(
 			var assigned_target: Option[CloneTarget] = None
 			var other_target: Option[CloneTarget] = None
 			var temporary_target: Option[CloneTarget] = None
+			var field_slot_target: Option[CloneTarget] = None
 			var index: Int = 0
 
 			for arg in args:
+				match walk.replacing:
+					Some(slot):
+						if field_slot_target.is_none() and reads_replaced_field_slot(slot, arg):
+							field_slot_target = find_clone_target(
+								walk.state,
+								name,
+								def_id,
+								index,
+								result_type,
+							)
+						else:
+							void
+					None:
+						void
+
 				if is_owned_call_temporary(walk.state, arg):
 					if temporary_target.is_none():
 						temporary_target = find_clone_target(
@@ -813,7 +893,11 @@ private pure func last_use_clone_target(
 						Some(target_clone):
 							Some(target_clone)
 						None:
-							temporary_target
+							match temporary_target:
+								Some(target_clone):
+									Some(target_clone)
+								None:
+									field_slot_target
 		_:
 			None
 
@@ -945,22 +1029,6 @@ private pure func passes_only_once(
 	)
 
 
----
-Whether evaluating `expr` may leave it without producing a value: a
-`break`, `continue`, resource cleanup exit or tail-recursion jump anywhere
-inside. Conservative: an exit that targets a loop nested inside `expr`
-counts too. Core has no `return`, and `?=` is rejected in loop bodies.
----
-private pure func may_exit_early(expr: CoreExpr) -> Bool:
-	match expr:
-		BreakExpr(_, _) | ContinueExpr(_, _) | ResourceCleanupExitExpr(_, _, _) | TailrecRecurExpr(_, _, _) | TailrecListSpreadRecurExpr(_, _, _, _):
-			True
-		_:
-			CoreTraverse
-				.immediate_core_expr_children(expr)
-				.any(may_exit_early)
-
-
 private pure func replaced_var_arg(
 	arg: CoreExpr,
 	variable: CoreVar,
@@ -992,8 +1060,8 @@ private pure func forwarded_assignment_pair(
 				and call_passes_var(temporary_rhs, target)
 				and passes_only_once(callee, args, temporary)
 				and not expr_mentions_var(assigned, target)
-				and not may_exit_early(temporary_rhs)
-				and not may_exit_early(assigned)
+				and not CoreTraverse.core_expr_may_exit_early(temporary_rhs)
+				and not CoreTraverse.core_expr_may_exit_early(assigned)
 			):
 				target_read: CoreExpr = VarExpr(target, temporary_type, call_loc)
 				forwarded_args: List[CoreExpr] = args.map(
@@ -1074,6 +1142,96 @@ private pure func forwarded_assignment(
 
 
 ---
+The variable a record update's base binding was made from, when `body` is
+the update of that binding: `let base = bound` followed by
+`RecordUpdateExpr(base, ...)`, the form record-update lowering produces for
+`{ bound | ... }`.
+---
+private pure func record_update_bound_source(
+	base: CoreVar,
+	is_mutable: Bool,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> Option[CoreVar]:
+	if is_mutable:
+		None
+	else:
+		match (rhs, body):
+			(VarExpr(bound, _, _), RecordUpdateExpr(VarExpr(update_base, _, _), _, _, _)):
+				if core_var_equal(update_base, base):
+					Some(bound)
+				else:
+					None
+			_:
+				None
+
+
+---
+The variable a record update's base binding was made from, when the update
+can be in place: the variable is owned here (a clone's owned parameter or an
+owned local) or is the target `assigned` of `x = { x | ... }`. In a borrowing
+function the update always copies, so handing its replaced slot to a
+consuming clone would only add a clone.
+---
+private pure func owned_record_update_source(
+	walk: LastUseWalk,
+	assigned: Option[CoreVar],
+	base: CoreVar,
+	is_mutable: Bool,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> Option[CoreVar]:
+	match record_update_bound_source(base, is_mutable, rhs, body):
+		Some(bound):
+			is_assigned: Bool = assigned
+				.map(func(target): core_var_equal(target, bound))
+				.get_or(False)
+
+			if is_assigned or var_list_contains(walk.owned, bound):
+				Some(bound)
+			else:
+				None
+		None:
+			None
+
+
+---
+`update`, a record update of `base` (bound from `bound`), with each field's
+replacement walked as the replacement of that field's slot. The replacements
+are otherwise walked like any child the walk does not model: no owned
+variable is handed over inside them.
+---
+private pure func rewrite_record_update_replacements(
+	walk: LastUseWalk,
+	base: CoreVar,
+	bound: CoreVar,
+	update: CoreExpr,
+) -> CoreExpr:
+	match update:
+		RecordUpdateExpr(update_base, fields, typ, loc):
+			outer: LastUseWalk = conservative_walk(walk)
+			var changed: Bool = False
+			var rewritten_fields: List[CoreRecordFieldValue] = []
+
+			for field in fields:
+				field_walk: LastUseWalk = { outer | replacing = Some({
+						base = base,
+						bound = bound,
+						field = field.ref,
+					}) }
+				rewritten: CoreExpr = rewrite_last_use(field_walk, field.value)
+				changed = changed or not same_core_expr(rewritten, field.value)
+				rewritten_fields = rewritten_fields.append({ field | value = rewritten })
+
+			if changed:
+				RecordUpdateExpr(update_base, rewritten_fields, typ, loc)
+			else:
+				update
+		_:
+			rewrite_last_use(walk, update)
+
+
+---
 Retargets every call that hands an owned record on at its last use to the
 consuming clone for that argument, rebuilding only the nodes above a change.
 `x = f(x)` is the case where the assignment ends the old value's life: when
@@ -1100,7 +1258,19 @@ private pure func rewrite_last_use(walk: LastUseWalk, expr: CoreExpr) -> CoreExp
 					else:
 						walk_without(walk, variable)
 
-					rewritten_body: CoreExpr = rewrite_last_use(body_walk, body)
+					rewritten_body: CoreExpr = match owned_record_update_source(
+						walk,
+						None,
+						variable,
+						is_mutable,
+						rhs,
+						body,
+					):
+						Some(bound):
+							rewrite_record_update_replacements(body_walk, variable, bound, body)
+						None:
+							rewrite_last_use(body_walk, body)
+
 					rewritten_rhs: CoreExpr = rewrite_last_use(
 						walk_before(walk, body),
 						rhs,
@@ -1125,11 +1295,12 @@ private pure func rewrite_last_use(walk: LastUseWalk, expr: CoreExpr) -> CoreExp
 			else:
 				BorrowLetExpr(variable, typ, rewritten_rhs, rewritten_body)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			rewritten_then: CoreExpr = rewrite_last_use(walk, then_expr)
-			rewritten_else: CoreExpr = rewrite_last_use(walk, else_expr)
+			branch_walk: LastUseWalk = walk_outside_replacement(walk)
+			rewritten_then: CoreExpr = rewrite_last_use(branch_walk, then_expr)
+			rewritten_else: CoreExpr = rewrite_last_use(branch_walk, else_expr)
 			rewritten_cond: CoreExpr = rewrite_last_use(
 				walk_before(
-					walk_before(walk, else_expr),
+					walk_before(branch_walk, else_expr),
 					then_expr,
 				),
 				cond,
@@ -1151,6 +1322,41 @@ private pure func rewrite_last_use(walk: LastUseWalk, expr: CoreExpr) -> CoreExp
 						Some(target),
 						rhs,
 					)
+				LetExpr(base, is_mutable, _, base_rhs, base_body):
+					rhs_walk: LastUseWalk = walk_without(walk, target)
+
+					match owned_record_update_source(
+						walk,
+						Some(target),
+						base,
+						is_mutable,
+						base_rhs,
+						base_body,
+					):
+						Some(bound):
+							rewritten_update: CoreExpr = rewrite_record_update_replacements(
+								rhs_walk,
+								base,
+								bound,
+								base_body,
+							)
+
+							if same_core_expr(rewritten_update, base_body):
+								rhs
+							else:
+								match rhs:
+									LetExpr(_, _, base_type, _, _):
+										LetExpr(
+											base,
+											is_mutable,
+											base_type,
+											base_rhs,
+											rewritten_update,
+										)
+									_:
+										rhs
+						None:
+							rewrite_last_use(rhs_walk, rhs)
 				_:
 					rewrite_last_use(
 						walk_without(walk, target),
@@ -1168,7 +1374,7 @@ private pure func rewrite_last_use(walk: LastUseWalk, expr: CoreExpr) -> CoreExp
 			-- after the scrutinee; the scrutinee is left as is.
 			CoreTraverse.map_core_match_results_with_context(
 				expr,
-				walk,
+				walk_outside_replacement(walk),
 				rewrite_last_use_match_result,
 			)
 		LogicalExpr(_, _, _, _, _):
@@ -1252,7 +1458,8 @@ private pure func rewrite_decl_body(state: ConsumeSpecializeState, decl: CoreDec
 	start: LastUseWalk = {
 		state = state,
 		owned = NO_VARS,
-		after = NothingAfter
+		after = NothingAfter,
+		replacing = None
 	}
 
 	match decl:

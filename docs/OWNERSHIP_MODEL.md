@@ -223,8 +223,18 @@ all other source owners unchanged.
 the target of `x = { x | ... }`, a consuming clone's owned parameter in the
 clone's result, and an immutable record binding updated where nothing reads
 it afterwards on straight-line control flow within the binding's block (SSA
-renaming gives an unconditional `x = { x | ... }` exactly that form). Every
-other update builds a fresh record.
+renaming gives an unconditional `x = { x | ... }` exactly that form). On the
+first two paths, which follow branches and match arms, an immutable alias of
+the target that the rest of the body never mentions the target beside
+(`rows = from_opaque Table(table)`) carries the owner, and a binding of an
+update returned by name (`grown = { rows | ... }` then `grown`) is that
+update. An update whose base is an expression rather than a variable
+(`{ make() | ... }`, `{ p.state | ... }`) takes the owner of the binding that
+lowering gives the base, since nothing else names it; for a base read from a
+field path, the replacements' reads of that path go through the binding, so
+`{ p | state = { p.state | cursor = p.state.cursor + 1 } }` reads the `state`
+slot once and the enclosing update can take it. Every other update builds a
+fresh record.
 
 Field release must honor `NoReleasePolicy`, `ArcReleasePolicy`,
 `ArcReleaseOnlyPolicy`, and `StackResultReleasePolicy`; managed does not imply
@@ -254,12 +264,33 @@ cooperative checkpoint, conditional, loop, logical short-circuit, lambda, or
 nested field path, and it rejects any same-slot or whole-source observation
 before writeback.
 
+A record field is updated through its own update the same way, at any
+depth: in `{ b | nodes = b.nodes.with_parent(k) }` the replacement passes the
+slot it replaces to a user call, so consume specialization retargets the
+call to the callee's consuming clone. Perceus then reads the slot through the
+owned-alias shape for the consumed argument, the field take moves `nodes` out
+of a unique `b`, and the clone receives the only reference and updates the
+family in place before the result is written back. Each level is one clone,
+so a method chain on the slot, a three-level `{ d | builder =
+d.builder.append_parent(k) }` and a loop update `b = { b | nodes = ... }` all
+compose. Only a direct read of the replaced slot, through the update's
+binding or the variable it binds, in a call argument on the replacement's
+straight-line spine qualifies, and only when the update can be in place: the
+record is owned there (a clone's owned parameter or an owned local) or is
+the target of `x = { x | ... }`. A read under a branch, of another field, of
+another record, or in a function that only borrows the record keeps the
+original callee.
+
 The policy emits a runtime test on the source: a unique source gives up its
 slot (left null) so the alias is the sole owner; a shared source retains as
 before. The emptied slot is never observable: the replacement-local form
 evaluates every replacement before consuming the source, while the hoisted
 form proves that its linear window reaches the matching update without an
-intervening observation or cancellation point. The unique path overwrites the
+intervening observation or cancellation point. Neither form takes a field
+when the expression holding the take, or another replacement of the same
+update, can leave early (`break`, `continue`, a resource cleanup exit or a
+tail-recursion jump): the exit would skip the writeback and leave the slot
+empty in a record that outlives the update. The unique path overwrites the
 slot, and field release is null-safe on every path including cancellation
 cleanup. The rewrite must stay after Perceus and must not descend into any
 position that can evaluate more than once or conditionally.

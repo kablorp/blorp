@@ -1,0 +1,319 @@
+-- Value semantics of the nested field take: `{ b | nodes = b.nodes.f(..) }`
+-- moves `nodes` out of a uniquely owned `b`, hands it to `f`'s consuming
+-- clone, and writes the result back. Whenever the field or the record is
+-- still shared, the update must copy instead, and every other name must keep
+-- seeing the old value. Each test then keeps updating the now unique builder,
+-- so it also checks that the copy happens once, when the value is shared,
+-- and the later updates are in place.
+import:
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	test: TestSuite
+
+
+record NodeFamily {
+	rows: List[Int],
+	edges: List[Int]
+}
+
+
+record NestedBuilder {
+	nodes: NodeFamily,
+	definitions: List[Int]
+}
+
+
+record Driver {
+	builder: NestedBuilder,
+	steps: Int
+}
+
+
+record NameRows {
+	spellings: List[String],
+	index: Dict[String, Int]
+}
+
+
+opaque type NameTable = NameRows
+
+
+record InterningBuilder {
+	names: NameTable,
+	steps: Int
+}
+
+
+record ParseState {
+	tokens: List[Int],
+	cursor: Int
+}
+
+
+record Parsing {
+	builder: NestedBuilder,
+	state: ParseState
+}
+
+
+private ROUNDS: Int = 1000
+
+-- One copy of a shared family or builder, plus the amortized doubling of
+-- three lists from a few elements to about ROUNDS.
+private SHARED_THEN_UNIQUE_ALLOCATION_CEILING: Int = 48
+
+
+pure func with_parent(family: NodeFamily, kind: Int, child: Int) -> NodeFamily:
+	{ family |
+		rows = family.rows.append(kind),
+		edges = family.edges.append(child)
+	}
+
+
+pure func append_parent(b: NestedBuilder, kind: Int) -> NestedBuilder:
+	{ b | nodes = b.nodes.with_parent(kind, kind) }
+
+
+pure func step_driver(d: Driver, kind: Int) -> Driver:
+	{ d |
+		builder = d.builder.append_parent(kind),
+		steps = d.steps + 1
+	}
+
+
+pure func one_row_builder() -> NestedBuilder:
+	{
+		nodes = {
+			rows = [100],
+			edges = [100]
+		},
+		definitions = [7]
+	}
+
+
+pure func append_rounds(b: NestedBuilder, rounds: Int) -> NestedBuilder:
+	var out: NestedBuilder = b
+
+	for i in 0..rounds:
+		out = out.append_parent(i)
+
+	out
+
+
+pure func rows_are_one_then_rounds(family: NodeFamily, rounds: Int) -> Bool:
+	(
+		family.rows.length() == rounds + 1
+		and family.rows.get_or(0, -1) == 100
+		and family.rows.get_or(rounds, -1) == rounds - 1
+		and family.edges.length() == rounds + 1
+	)
+
+
+func test_kept_field_alias_keeps_its_rows() -> Bool:
+	b: NestedBuilder = one_row_builder()
+	kept: NodeFamily = b.nodes
+	reset_mem_stats()
+	updated: NestedBuilder = append_rounds(b, ROUNDS)
+	stats: MemStats = get_mem_stats()
+
+	(
+		kept.rows == [100]
+		and kept.edges == [100]
+		and rows_are_one_then_rounds(updated.nodes, ROUNDS)
+		and stats.total_allocations <= SHARED_THEN_UNIQUE_ALLOCATION_CEILING
+	)
+
+
+func test_shared_builder_keeps_its_family() -> Bool:
+	b: NestedBuilder = one_row_builder()
+	shared: NestedBuilder = b
+	reset_mem_stats()
+	updated: NestedBuilder = append_rounds(b, ROUNDS)
+	stats: MemStats = get_mem_stats()
+
+	(
+		shared.nodes.rows == [100]
+		and shared.nodes.edges == [100]
+		and shared.definitions == [7]
+		and rows_are_one_then_rounds(updated.nodes, ROUNDS)
+		and updated.definitions == [7]
+		and stats.total_allocations <= SHARED_THEN_UNIQUE_ALLOCATION_CEILING
+	)
+
+
+-- Three levels: a builder read out of the driver stays as it was while the
+-- driver's own builder grows.
+func test_kept_middle_record_keeps_its_family() -> Bool:
+	var d: Driver = {
+		builder = one_row_builder(),
+		steps = 0
+	}
+	kept: NestedBuilder = d.builder
+	reset_mem_stats()
+
+	for i in 0..ROUNDS:
+		d = step_driver(d, i)
+
+	stats: MemStats = get_mem_stats()
+
+	(
+		kept.nodes.rows == [100]
+		and d.steps == ROUNDS
+		and rows_are_one_then_rounds(d.builder.nodes, ROUNDS)
+		and stats.total_allocations <= SHARED_THEN_UNIQUE_ALLOCATION_CEILING
+	)
+
+
+-- A loop that leaves through `break` after some updates: the builder keeps
+-- every update made before the exit and no field is left taken.
+func test_break_after_updates_keeps_every_update() -> Bool:
+	var b: NestedBuilder = one_row_builder()
+	reset_mem_stats()
+
+	for i in 0..ROUNDS + 5:
+		if i == ROUNDS:
+			break
+
+		b = { b | nodes = b.nodes.with_parent(i, i) }
+
+	stats: MemStats = get_mem_stats()
+
+	(
+		rows_are_one_then_rounds(b.nodes, ROUNDS)
+		and stats.total_allocations <= SHARED_THEN_UNIQUE_ALLOCATION_CEILING
+	)
+
+
+-- `continue` skips some updates; the skipped ones leave the family intact.
+func test_continue_between_updates_keeps_the_family() -> Bool:
+	var b: NestedBuilder = one_row_builder()
+	reset_mem_stats()
+
+	for i in 0..2 * ROUNDS:
+		if i % 2 == 1:
+			continue
+
+		b = { b | nodes = b.nodes.with_parent(i / 2, i / 2) }
+
+	stats: MemStats = get_mem_stats()
+
+	(
+		rows_are_one_then_rounds(b.nodes, ROUNDS)
+		and stats.total_allocations <= SHARED_THEN_UNIQUE_ALLOCATION_CEILING
+	)
+
+
+-- The replacement reads the replaced field twice, so the field cannot be
+-- taken for the call; the values must still be right.
+pure func test_second_read_of_replaced_field_sees_the_old_family() -> Bool:
+	b: NestedBuilder = one_row_builder()
+	updated: NestedBuilder = { b | nodes = b.nodes.with_parent(b.nodes.rows.length(), 5) }
+
+	updated.nodes.rows == [100, 1] and updated.nodes.edges == [100, 5] and b.nodes.rows == [100]
+
+
+pure func interned(table: NameTable, spelling: String) -> NameTable:
+	rows: NameRows = from_opaque NameTable(table)
+
+	match rows.index.get(spelling):
+		Some(_):
+			into_opaque NameTable(rows)
+		None:
+			-- Read into a local first: a replacement that reads another
+			-- replaced slot copies it (record-update-same-field-read-copies).
+			row: Int = rows.spellings.length()
+			grown: NameRows = { rows |
+				index = rows.index.set(spelling, row),
+				spellings = rows.spellings.append(spelling)
+			}
+			into_opaque NameTable(grown)
+
+
+pure func spellings_of(table: NameTable) -> List[String]:
+	from_opaque NameTable(table).spellings
+
+
+-- A table read out of the builder keeps its spellings while the builder's
+-- own table is interned into.
+func test_kept_name_table_keeps_its_spellings() -> Bool:
+	var b: InterningBuilder = {
+		names = into_opaque NameTable({
+				spellings = ["first"],
+				index = {"first" => 0}
+			}),
+		steps = 0
+	}
+	kept: NameTable = b.names
+	var words: List[String] = []
+
+	for i in 0..ROUNDS:
+		words = words.append("w${i}")
+
+	reset_mem_stats()
+
+	for word in words:
+		b = { b |
+			names = b.names.interned(word),
+			steps = b.steps + 1
+		}
+
+	stats: MemStats = get_mem_stats()
+	grown: List[String] = b.names.spellings_of()
+
+	(
+		kept.spellings_of() == ["first"]
+		and grown.length() == ROUNDS + 1
+		and grown.get_or(ROUNDS, "") == "w${ROUNDS - 1}"
+		and stats.total_allocations <= SHARED_THEN_UNIQUE_ALLOCATION_CEILING
+	)
+
+
+-- A state read out of the parse record stays as it was while the record's
+-- own state is updated in place through `{ p.state | ... }`.
+func test_kept_state_keeps_its_cursor() -> Bool:
+	var p: Parsing = {
+		builder = one_row_builder(),
+		state = {
+			tokens = [4, 5],
+			cursor = 0
+		}
+	}
+	kept: ParseState = p.state
+	reset_mem_stats()
+
+	for i in 0..ROUNDS:
+		p = { p |
+			builder = p.builder.append_parent(i),
+			state = { p.state | cursor = p.state.cursor + 1 }
+		}
+
+	stats: MemStats = get_mem_stats()
+
+	(
+		kept.cursor == 0
+		and kept.tokens == [4, 5]
+		and p.state.cursor == ROUNDS
+		and p.state.tokens == [4, 5]
+		and rows_are_one_then_rounds(p.builder.nodes, ROUNDS)
+		and stats.total_allocations <= SHARED_THEN_UNIQUE_ALLOCATION_CEILING
+	)
+
+
+tests: TestSuite = {
+	description = "Nested Record Field Take Ownership",
+	tests = [
+		("kept field alias keeps its rows", test_kept_field_alias_keeps_its_rows),
+		("shared builder keeps its family", test_shared_builder_keeps_its_family),
+		("kept middle record keeps its family", test_kept_middle_record_keeps_its_family),
+		("break after updates keeps every update", test_break_after_updates_keeps_every_update),
+		(
+			"continue between updates keeps the family",
+			test_continue_between_updates_keeps_the_family,
+		),
+		("kept name table keeps its spellings", test_kept_name_table_keeps_its_spellings),
+		("kept state keeps its cursor", test_kept_state_keeps_its_cursor),
+		(
+			"second read of replaced field sees the old family",
+			test_second_read_of_replaced_field_sees_the_old_family,
+		),
+	]
+}

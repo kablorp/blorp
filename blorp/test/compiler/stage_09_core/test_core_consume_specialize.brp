@@ -22,10 +22,12 @@ import:
 			ConstructorMatchExpr,
 			ContinueExpr,
 			DropExpr,
+			FieldExpr,
 			IfExpr,
 			LambdaExpr,
 			LetExpr,
 			LiteralExpr,
+			RecordUpdateExpr,
 			SeqExpr,
 			VarExpr,
 			WhileExpr,
@@ -39,7 +41,7 @@ import:
 		CoreMatchBindingMode(MatchBorrowBindingMode, MatchOwnBindingMode),
 		CoreParam,
 		CoreProgram,
-		CoreReleasePolicy(NoReleasePolicy),
+		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(NamedType, UnionType, VoidType),
@@ -1164,6 +1166,13 @@ pure func user_call_names(expr: CoreExpr) -> List[String]:
 			user_call_names(body)
 		AssignExpr(variable, rhs, typ, loc):
 			user_call_names(rhs)
+		RecordUpdateExpr(base, fields, typ, loc):
+			var names: List[String] = user_call_names(base)
+
+			for field in fields:
+				names = names.concat(user_call_names(field.value))
+
+			names
 		_:
 			[]
 
@@ -1791,6 +1800,287 @@ pure func test_does_not_count_borrowed_position_as_hand_off() -> Bool:
 		and assignment_call_name_matches(rewritten, "forward")
 	)
 
+private HOLDER_DEF_ID: Int = 50
+
+private HOLDER_LEFT_FIELD: Int = 1
+
+private HOLDER_RIGHT_FIELD: Int = 2
+
+
+pure func holder_type() -> CoreType:
+	HeapRecordType("Holder")
+
+
+---
+`Holder { left: Expr, right: Expr }`: a record whose fields are records
+with consuming clones, the nested shape of a builder holding table families.
+---
+pure func holder_record_decl() -> CoreDecl:
+	HeapRecordDecl({
+		abi_type = None,
+		name = "Holder",
+		type_params = [],
+		fields = [
+			{
+				ref = core_field_ref(HOLDER_LEFT_FIELD),
+				name = "left",
+				typ = expr_type(),
+				release_policy = ArcReleasePolicy
+			},
+			{
+				ref = core_field_ref(HOLDER_RIGHT_FIELD),
+				name = "right",
+				typ = expr_type(),
+				release_policy = ArcReleasePolicy
+			},
+		],
+		loc = synthetic_core_source_loc(),
+	})
+
+
+pure func holder_field_read(owner: String, field_name: String, field_id: Int) -> CoreExpr:
+	FieldExpr(
+		var_expr(owner, holder_type()),
+		field_name,
+		core_field_ref(field_id),
+		expr_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+---
+`{ holder | left = replacement }` in its lowered form, with `right`
+inherited from the record-update temporary.
+---
+pure func update_holder_left(replacement: CoreExpr) -> CoreExpr:
+	base: CoreVar = named_var("__record_update_holder")
+
+	LetExpr(
+		base,
+		False,
+		holder_type(),
+		var_expr("holder", holder_type()),
+		RecordUpdateExpr(
+			VarExpr(base, holder_type(), synthetic_core_source_loc()),
+			[
+				{
+					ref = core_field_ref(HOLDER_LEFT_FIELD),
+					name = "left",
+					value = replacement
+				},
+				{
+					ref = core_field_ref(HOLDER_RIGHT_FIELD),
+					name = "right",
+					value = FieldExpr(
+						VarExpr(base, holder_type(), synthetic_core_source_loc()),
+						"right",
+						core_field_ref(HOLDER_RIGHT_FIELD),
+						expr_type(),
+						synthetic_core_source_loc(),
+					)
+				},
+			],
+			holder_type(),
+			synthetic_core_source_loc(),
+		),
+	)
+
+
+pure func update_holder_function(body: CoreExpr) -> CoreFunction:
+	{ rewrite_function(body) |
+		name = "update_holder",
+		params = [param("holder", holder_type()), param("pass", int_type())],
+		return_type = holder_type(),
+		def_id = HOLDER_DEF_ID
+	}
+
+
+---
+`run` threading a holder through `holder = update_holder(holder, 1)`.
+---
+pure func run_updating_holder() -> CoreFunction:
+	holder: CoreVar = named_var("holder")
+
+	{ run_function() |
+		return_type = holder_type(),
+		body = Some(
+			LetExpr(
+				holder,
+				True,
+				holder_type(),
+				var_expr("initial_holder", holder_type()),
+				SeqExpr(
+					assignment_expr_for_call(
+						holder,
+						"update_holder",
+						HOLDER_DEF_ID,
+						[var_expr("holder", holder_type()), int_expr(1)],
+						holder_type(),
+					),
+					var_expr("holder", holder_type()),
+				),
+			),
+		)
+	}
+
+
+---
+Rewrites a program whose `update_holder` updates `left` with `replacement`,
+next to `rewrite_expr`, which updates its `Expr` in place.
+---
+pure func rewritten_holder_program(replacement: CoreExpr) -> CoreProgram:
+	rewrite_program_for_test({
+		decls = [
+			expr_record_decl(),
+			holder_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
+			FunctionDecl(update_holder_function(update_holder_left(replacement))),
+			FunctionDecl(run_updating_holder()),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+
+---
+`{ holder | left = rewrite_expr(holder.left, 1) }`: the replacement reads the
+slot it replaces, so in the holder's clone, which owns the holder, the call
+takes the consuming clone and the reuse pass can move the field out of a
+unique holder for it. The borrowing original can never update its holder in
+place, so it keeps the original callee.
+---
+pure func test_retargets_replaced_field_slot_argument() -> Bool:
+	rewritten: CoreProgram = rewritten_holder_program(
+		rewrite_call_on(holder_field_read("holder", "left", HOLDER_LEFT_FIELD), 1),
+	)
+
+	(
+		function_calls_are(rewritten, "update_holder__consume_arg0", ["rewrite_expr__consume_arg0"])
+		and function_calls_are(rewritten, "update_holder", ["rewrite_expr"])
+		and assignment_call_name_matches(rewritten, "update_holder__consume_arg0")
+	)
+
+
+---
+`holder = { holder | left = rewrite_expr(holder.left, 1) }` in a loop: the
+assignment ends the old holder, so the update is in place and the replaced
+slot goes to the consuming clone even though the walk owns nothing there.
+---
+pure func test_retargets_replaced_field_slot_of_assignment_target() -> Bool:
+	holder: CoreVar = named_var("holder")
+	update: CoreExpr = update_holder_left(
+		rewrite_call_on(holder_field_read("holder", "left", HOLDER_LEFT_FIELD), 1),
+	)
+	loop_run: CoreFunction = { run_function() |
+		return_type = holder_type(),
+		body = Some(
+			LetExpr(
+				holder,
+				True,
+				holder_type(),
+				var_expr("initial_holder", holder_type()),
+				SeqExpr(
+					WhileExpr(
+						bool_expr(False),
+						AssignExpr(holder, update, VoidType, synthetic_core_source_loc()),
+						VoidType,
+						synthetic_core_source_loc(),
+					),
+					var_expr("holder", holder_type()),
+				),
+			),
+		)
+	}
+	rewritten: CoreProgram = rewrite_program_for_test({
+		decls = [
+			expr_record_decl(),
+			holder_record_decl(),
+			FunctionDecl(rewrite_function(update_in_place(7))),
+			FunctionDecl(loop_run),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+	function_calls_are(rewritten, "run", ["rewrite_expr__consume_arg0"])
+
+
+---
+The record-update temporary names the same record, so a read of the slot
+through it is the replaced slot too.
+---
+pure func test_retargets_replaced_field_slot_read_through_update_binding() -> Bool:
+	rewritten: CoreProgram = rewritten_holder_program(
+		rewrite_call_on(
+			holder_field_read("__record_update_holder", "left", HOLDER_LEFT_FIELD),
+			1,
+		),
+	)
+
+	function_calls_are(rewritten, "update_holder__consume_arg0", ["rewrite_expr__consume_arg0"])
+
+
+---
+A method chain on the replaced slot: the inner call reads the slot and the
+outer one takes the inner call's owned result.
+---
+pure func test_retargets_method_chain_on_replaced_field_slot() -> Bool:
+	rewritten: CoreProgram = rewritten_holder_program(
+		rewrite_call_on(
+			rewrite_call_on(holder_field_read("holder", "left", HOLDER_LEFT_FIELD), 1),
+			2,
+		),
+	)
+
+	function_calls_are(
+		rewritten,
+		"update_holder__consume_arg0",
+		["rewrite_expr__consume_arg0", "rewrite_expr__consume_arg0"],
+	)
+
+
+---
+A read of another field is not the replaced slot: handing it to a clone
+would only retain it, since the update keeps it in place.
+---
+pure func test_keeps_call_on_other_field_of_updated_record() -> Bool:
+	rewritten: CoreProgram = rewritten_holder_program(
+		rewrite_call_on(holder_field_read("holder", "right", HOLDER_RIGHT_FIELD), 1),
+	)
+
+	function_calls_are(rewritten, "update_holder__consume_arg0", ["rewrite_expr"])
+
+
+---
+The same field of a different record is not the replaced slot.
+---
+pure func test_keeps_call_on_same_field_of_other_record() -> Bool:
+	rewritten: CoreProgram = rewritten_holder_program(
+		rewrite_call_on(holder_field_read("other_holder", "left", HOLDER_LEFT_FIELD), 1),
+	)
+
+	function_calls_are(rewritten, "update_holder__consume_arg0", ["rewrite_expr"])
+
+
+---
+The field take does not reach into a branch of the replacement, so a call
+there keeps the original callee.
+---
+pure func test_keeps_call_on_replaced_field_slot_in_branch() -> Bool:
+	slot_read: CoreExpr = holder_field_read("holder", "left", HOLDER_LEFT_FIELD)
+	rewritten: CoreProgram = rewritten_holder_program(
+		IfExpr(
+			bool_expr(True),
+			rewrite_call_on(slot_read, 1),
+			slot_read,
+			expr_type(),
+			synthetic_core_source_loc(),
+		),
+	)
+
+	function_calls_are(rewritten, "update_holder__consume_arg0", ["rewrite_expr"])
+
+
 tests: TestSuite = {
 	description = "Blorp compiler Core consume specialize",
 	tests = [
@@ -1901,6 +2191,25 @@ tests: TestSuite = {
 		(
 			"keeps assignment target live in compound right-hand side",
 			test_keeps_assignment_target_live_in_compound_right_hand_side,
+		),
+		("retargets replaced field slot argument", test_retargets_replaced_field_slot_argument),
+		(
+			"retargets replaced field slot of assignment target",
+			test_retargets_replaced_field_slot_of_assignment_target,
+		),
+		(
+			"retargets replaced field slot read through update binding",
+			test_retargets_replaced_field_slot_read_through_update_binding,
+		),
+		(
+			"retargets method chain on replaced field slot",
+			test_retargets_method_chain_on_replaced_field_slot,
+		),
+		("keeps call on other field of updated record", test_keeps_call_on_other_field_of_updated_record),
+		("keeps call on same field of other record", test_keeps_call_on_same_field_of_other_record),
+		(
+			"keeps call on replaced field slot in branch",
+			test_keeps_call_on_replaced_field_slot_in_branch,
 		),
 	]
 }

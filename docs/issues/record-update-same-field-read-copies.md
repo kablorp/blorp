@@ -26,6 +26,11 @@ updating it in place. This is builder threading rule 6.
   (`nodes` before `node_children` in `DiscoveryBuilder`), so in both shapes
   the `b.nodes.length()` read runs after the take has emptied the slot.
 
+A nested update of a field reads its own base path through the binding
+lowering makes for the base, so `{ p | state = { p.state | cursor =
+p.state.cursor + 1 } }` no longer counts as a second read of `state`. Reads of
+a replaced slot in another replacement, as in the shapes above, still copy.
+
 ## Proposed split
 
 1. A pre-Perceus rewrite that evaluates a call's later arguments before its

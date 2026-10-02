@@ -1802,7 +1802,9 @@ observe the field slot across every replacement, the dup's policy becomes
 `CowFieldTakeRetainPolicy`, which keeps the runtime uniqueness test and the
 ordinary retain for shared sources. The source is read only after every
 replacement, so nothing can observe the emptied slot before the update writes
-it back.
+it back, provided every replacement runs to completion: a replacement that
+can `break` or `continue` out would leave the slot empty in a record that
+outlives the update, so no field of such an update is taken.
 ---
 private pure func take_self_consumed_record_fields(
 	source: CoreExpr,
@@ -1810,23 +1812,108 @@ private pure func take_self_consumed_record_fields(
 ) -> List[CoreRecordFieldValue]:
 	match source:
 		VarExpr(source_var, _, _):
-			fields.map(pure func(field) -> CoreRecordFieldValue:
-				var touches: Int = 0
+			taken: List[CoreRecordFieldValue] = take_record_fields_from(source_var, fields)
 
-				for other in fields:
-					touches += var_touch_count(source_var, field.ref, other.value)
-
-				if touches == 1:
-					match take_field_alias(source_var, field.name, field.ref, field.value):
-						Some(taken):
-							{ field | value = taken }
-						None:
-							field
-				else:
-					field
-			)
+			-- The exit check walks every replacement, so it runs only when a
+			-- field was taken.
+			if same_record_field_list(taken, fields):
+				fields
+			else if fields.any(func(field): CoreTraverse.core_expr_may_exit_early(field.value)):
+				fields
+			else:
+				taken
 		_:
 			fields
+
+
+---
+Whether no field of `taken` was rewritten: `take_*_fields_from` hands back
+each field it does not take as the same value.
+---
+private pure func same_record_field_list(
+	taken: List[CoreRecordFieldValue],
+	fields: List[CoreRecordFieldValue],
+) -> Bool:
+	var same: Bool = True
+	var index: Int = 0
+
+	for field in fields:
+		match taken.get(index):
+			Some(taken_field):
+				same = same and CoreTraverse.same_core_expr(field.value, taken_field.value)
+			None:
+				same = False
+
+		index += 1
+
+	same
+
+
+private pure func same_cow_field_list(
+	taken: List[CoreRecordCowField],
+	fields: List[CoreRecordCowField],
+) -> Bool:
+	var same: Bool = taken.length() == fields.length()
+	var index: Int = 0
+
+	for field in fields:
+		match taken.get(index):
+			Some(taken_field):
+				same = same and same_cow_replacement(field.replacement, taken_field.replacement)
+			None:
+				same = False
+
+		index += 1
+
+	same
+
+
+-- One constructor per match: the pinned bootstrap compiler binds the payload
+-- of a nested constructor in a tuple pattern without testing its tag.
+private pure func same_cow_replacement(original: Option[CoreExpr], taken: Option[CoreExpr]) -> Bool:
+	match original:
+		Some(original_value):
+			match taken:
+				Some(taken_value):
+					CoreTraverse.same_core_expr(original_value, taken_value)
+				None:
+					False
+		None:
+			taken.is_none()
+
+
+private pure func take_record_fields_from(
+	source_var: CoreVar,
+	fields: List[CoreRecordFieldValue],
+) -> List[CoreRecordFieldValue]:
+	fields.map(pure func(field) -> CoreRecordFieldValue:
+		var touches: Int = 0
+
+		for other in fields:
+			touches += var_touch_count(source_var, field.ref, other.value)
+
+		if touches == 1:
+			match take_field_alias(source_var, field.name, field.ref, field.value):
+				Some(taken):
+					{ field | value = taken }
+				None:
+					field
+		else:
+			field
+	)
+
+
+---
+Whether some replacement among `fields` can leave the update early.
+---
+private pure func cow_replacement_may_exit_early(fields: List[CoreRecordCowField]) -> Bool:
+	fields.any(pure func(field) -> Bool:
+		match field.replacement:
+			Some(replacement):
+				CoreTraverse.core_expr_may_exit_early(replacement)
+			None:
+				False
+	)
 
 
 ---
@@ -1839,40 +1926,56 @@ private pure func take_self_consumed_cow_fields(
 ) -> List[CoreRecordCowField]:
 	match source:
 		VarExpr(source_var, _, _):
-			fields.map(pure func(field) -> CoreRecordCowField:
-				match field.replacement:
-					Some(replacement):
-						var touches: Int = 0
+			taken: List[CoreRecordCowField] = take_cow_fields_from(source_var, fields)
 
-						for other in fields:
-							match other.replacement:
-								Some(other_replacement):
-									touches += var_touch_count(
-										source_var,
-										field.field.ref,
-										other_replacement,
-									)
-								None:
-									void
-
-						if touches == 1 and is_arc_release_policy(field.field.release_policy):
-							match take_field_alias(
-								source_var,
-								field.field.name,
-								field.field.ref,
-								replacement,
-							):
-								Some(taken):
-									{ field | replacement = Some(taken) }
-								None:
-									field
-						else:
-							field
-					None:
-						field
-			)
+			-- The exit check walks every replacement, so it runs only when a
+			-- field was taken.
+			if same_cow_field_list(taken, fields):
+				fields
+			else if cow_replacement_may_exit_early(fields):
+				fields
+			else:
+				taken
 		_:
 			fields
+
+
+private pure func take_cow_fields_from(
+	source_var: CoreVar,
+	fields: List[CoreRecordCowField],
+) -> List[CoreRecordCowField]:
+	fields.map(pure func(field) -> CoreRecordCowField:
+		match field.replacement:
+			Some(replacement):
+				var touches: Int = 0
+
+				for other in fields:
+					match other.replacement:
+						Some(other_replacement):
+							touches += var_touch_count(
+								source_var,
+								field.field.ref,
+								other_replacement,
+							)
+						None:
+							void
+
+				if touches == 1 and is_arc_release_policy(field.field.release_policy):
+					match take_field_alias(
+						source_var,
+						field.field.name,
+						field.field.ref,
+						replacement,
+					):
+						Some(taken):
+							{ field | replacement = Some(taken) }
+						None:
+							field
+				else:
+					field
+			None:
+				field
+	)
 
 
 ---
@@ -2348,6 +2451,7 @@ private pure func take_hoisted_field_alias(
 				if (
 					not core_var_equal(binding, field_alias.source_var)
 					and var_touch_count(field_alias.source_var, field_alias.field_ref, rhs) == 1
+					and not CoreTraverse.core_expr_may_exit_early(rhs)
 					and linear_body_transfers_hoisted_alias(binding, field_alias, body)
 				):
 					take_field_alias(
@@ -2923,26 +3027,35 @@ pure func rewrite_post_perceus_expr(expr: CoreExpr) -> CoreExpr:
 			rewrite_post_perceus_non_let(expr)
 
 
+---
+`LetExpr` rebuilt from rewritten children, or `expr` itself when neither
+changed: most bindings hold nothing this pass rewrites, and rebuilding every
+node above them would allocate a new tree for each function.
+---
+private pure func rebuilt_let(expr: CoreExpr, rhs: CoreExpr, body: CoreExpr) -> CoreExpr:
+	match expr:
+		LetExpr(variable, is_mutable, value_type, original_rhs, original_body):
+			rewritten_rhs: CoreExpr = rewrite_post_perceus_expr(rhs)
+			rewritten_body: CoreExpr = rewrite_post_perceus_expr(body)
+
+			if (
+				CoreTraverse.same_core_expr(original_rhs, rewritten_rhs)
+				and CoreTraverse.same_core_expr(original_body, rewritten_body)
+			):
+				expr
+			else:
+				LetExpr(variable, is_mutable, value_type, rewritten_rhs, rewritten_body)
+		_:
+			expr
+
+
 private pure func rewrite_post_perceus_non_let(expr: CoreExpr) -> CoreExpr:
 	match expr:
 		LetExpr(variable, is_mutable, value_type, rhs, body):
+			-- Both children are visited whatever the body is: the rewrites below
+			-- are local proofs, so an update in a match arm or any other position
+			-- under a binding is as eligible as one that is not under a binding.
 			match body:
-				RawMatchExpr(scrutinee, cases, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				SemanticMatchExpr(scrutinee, tree, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
 				DropExpr(dropped_var, dropped_type, release_policy, result, drop_type, drop_loc):
 					if core_expr_is_var(result, variable):
 						match consume_handoff_rhs(dropped_var, dropped_type, rhs):
@@ -2966,306 +3079,44 @@ private pure func rewrite_post_perceus_non_let(expr: CoreExpr) -> CoreExpr:
 											Some(rewritten_rhs):
 												rewrite_post_perceus_expr(rewritten_rhs)
 											None:
-												LetExpr(
-													variable,
-													is_mutable,
-													value_type,
-													rewrite_post_perceus_expr(rhs),
-													rewrite_post_perceus_expr(body),
-												)
+												rebuilt_let(expr, rhs, body)
 					else:
-						LetExpr(
-							variable,
-							is_mutable,
-							value_type,
-							rewrite_post_perceus_expr(rhs),
-							rewrite_post_perceus_expr(body),
-						)
-				LiteralExpr(literal, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				StaticStringLiteralExpr(id, value, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				VarExpr(body_var, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				VoidExpr(typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				DebugBlockExpr(debug_body, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				CooperativeCheckpointExpr(typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				CallExpr(kind, callee, args, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				BinaryExpr(op, left, right, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				UnaryExpr(op, inner, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				LogicalExpr(op, left, right, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				AssignExpr(assigned_var, assigned_rhs, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				CastExpr(inner, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				BoxExpr(box, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				UnboxExpr(unbox_kind, inner, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				FieldExpr(inner, field, _field_ref, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				TupleFieldExpr(inner, index, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				TupleExpr(items, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TupleConstructExpr(construct, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				VectorExpr(items, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ClosureCreateExpr(closure, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListConstructExpr(construct, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListAllocExpr(alloc, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListGetExpr(get, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListHandoffExpr(handoff, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListHandoffSetOwnedExpr(set, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListHandoffSetSourceSlotExpr(set, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				StringByteReadExpr(read, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				StringByteWriteExpr(write, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				StringByteCopyExpr(copy, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				StringSetLenExpr(set_len, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TensorLiteralExpr(literal, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TensorBoxedLiteralExpr(literal, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TensorPackedLiteralExpr(literal, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TensorRawFillExpr(fill, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TensorRawReadExpr(read, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TensorRawWriteExpr(write, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TensorRawViewLetExpr(binding, tensor_body, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				DictConstructExpr(construct, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				DictExpr(entries, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				SetAllocExpr(alloc, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListRetainExpr(retain, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListSetExpr(set, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ListSwapExpr(swap, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				RecordExpr(fields, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				RecordUpdateExpr(base, fields, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				RecordReuseExpr(source, fields, typ, loc) | RecordCowUpdateExpr(source, fields, typ, loc):
-					-- A binding evaluated before the update cannot observe the
-					-- reused record, so the field-take rewrite still applies to
-					-- an update that ends a `let`.
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				RecordConstructExpr(type_name, fields, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				UnionConstructExpr(construct, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				UnionReuseConstructExpr(construct, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				PreClosureDetachExpr(detached, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				DetachExpr(detached, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				DupExpr(dup_var, dup_type, retain_policy, dup_body, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				LetExpr(inner_var, inner_mutable, inner_type, inner_rhs, inner_body):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				BorrowLetExpr(inner_var, inner_type, inner_rhs, inner_body):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				SeqExpr(first, second):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
-				WhileExpr(cond, while_body, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				BreakExpr(typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ContinueExpr(typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ResourceScopeExpr(scope, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ResourceCleanupExitExpr(exit, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TailrecLoopExpr(params, return_type, tailrec_body, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TailrecRecurExpr(args, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TailrecListSpreadLoopExpr(loop, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				TailrecListSpreadRecurExpr(rebinds, spread_index, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForRangeExpr(binder, start, end, step, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForChannelExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForListExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForStringExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForDictExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForSetExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForStreamExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForResourceSourceExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ForTensorExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				PreClosureConcurrentlyLoopExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ConcurrentlyLoopExpr(loop, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				PreClosureConcurrentExpr(block, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ConcurrentExpr(block, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				SelectExpr(selection, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				RangeExpr(start, end, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				LiteralMatchExpr(scrutinee, cases, fallback, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				AccessorLiteralMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				LengthMatchExpr(scrutinee, release_policy, match_expr, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				ConstructorMatchExpr(scrutinee, release_policy, cases, fallback, typ, loc):
-					LetExpr(variable, is_mutable, value_type, rewrite_post_perceus_expr(rhs), body)
-				IfExpr(cond, then_expr, else_expr, typ, loc):
-					LetExpr(
-						variable,
-						is_mutable,
-						value_type,
-						rewrite_post_perceus_expr(rhs),
-						rewrite_post_perceus_expr(body),
-					)
+						rebuilt_let(expr, rhs, body)
+				_:
+					rebuilt_let(expr, rhs, body)
 		DropExpr(variable, value_type, release_policy, body, typ, loc):
 			match rewrite_drop_body(variable, value_type, body):
 				Some(rewritten):
 					rewritten
 				None:
-					DropExpr(
-						variable,
-						value_type,
-						release_policy,
-						rewrite_post_perceus_expr(body),
-						typ,
-						loc,
-					)
+					rewritten_body: CoreExpr = rewrite_post_perceus_expr(body)
+
+					if CoreTraverse.same_core_expr(body, rewritten_body):
+						expr
+					else:
+						DropExpr(variable, value_type, release_policy, rewritten_body, typ, loc)
 		BorrowLetExpr(variable, value_type, rhs, body):
-			BorrowLetExpr(
-				variable,
-				value_type,
-				rewrite_post_perceus_expr(rhs),
-				rewrite_post_perceus_expr(body),
-			)
+			rewritten_rhs: CoreExpr = rewrite_post_perceus_expr(rhs)
+			rewritten_body: CoreExpr = rewrite_post_perceus_expr(body)
+
+			if (
+				CoreTraverse.same_core_expr(rhs, rewritten_rhs)
+				and CoreTraverse.same_core_expr(body, rewritten_body)
+			):
+				expr
+			else:
+				BorrowLetExpr(variable, value_type, rewritten_rhs, rewritten_body)
 		SeqExpr(first, second):
-			SeqExpr(rewrite_post_perceus_expr(first), rewrite_post_perceus_expr(second))
+			rewritten_first: CoreExpr = rewrite_post_perceus_expr(first)
+			rewritten_second: CoreExpr = rewrite_post_perceus_expr(second)
+
+			if (
+				CoreTraverse.same_core_expr(first, rewritten_first)
+				and CoreTraverse.same_core_expr(second, rewritten_second)
+			):
+				expr
+			else:
+				SeqExpr(rewritten_first, rewritten_second)
 		RawMatchExpr(scrutinee, cases, typ, loc):
 			RawMatchExpr(
 				rewrite_post_perceus_expr(scrutinee),
@@ -3276,13 +3127,18 @@ private pure func rewrite_post_perceus_non_let(expr: CoreExpr) -> CoreExpr:
 		SemanticMatchExpr(scrutinee, tree, typ, loc):
 			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		IfExpr(cond, then_expr, else_expr, typ, loc):
-			IfExpr(
-				rewrite_post_perceus_expr(cond),
-				rewrite_post_perceus_expr(then_expr),
-				rewrite_post_perceus_expr(else_expr),
-				typ,
-				loc,
-			)
+			rewritten_cond: CoreExpr = rewrite_post_perceus_expr(cond)
+			rewritten_then: CoreExpr = rewrite_post_perceus_expr(then_expr)
+			rewritten_else: CoreExpr = rewrite_post_perceus_expr(else_expr)
+
+			if (
+				CoreTraverse.same_core_expr(cond, rewritten_cond)
+				and CoreTraverse.same_core_expr(then_expr, rewritten_then)
+				and CoreTraverse.same_core_expr(else_expr, rewritten_else)
+			):
+				expr
+			else:
+				IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc)
 		LiteralExpr(literal, typ, loc):
 			expr
 		StaticStringLiteralExpr(id, value, typ, loc):
@@ -3304,7 +3160,12 @@ private pure func rewrite_post_perceus_non_let(expr: CoreExpr) -> CoreExpr:
 		LogicalExpr(op, left, right, typ, loc):
 			expr
 		AssignExpr(variable, rhs, typ, loc):
-			AssignExpr(variable, rewrite_post_perceus_expr(rhs), typ, loc)
+			rewritten_rhs: CoreExpr = rewrite_post_perceus_expr(rhs)
+
+			if CoreTraverse.same_core_expr(rhs, rewritten_rhs):
+				expr
+			else:
+				AssignExpr(variable, rewritten_rhs, typ, loc)
 		CastExpr(inner, typ, loc):
 			expr
 		BoxExpr(box, typ, loc):
@@ -3400,9 +3261,23 @@ private pure func rewrite_post_perceus_non_let(expr: CoreExpr) -> CoreExpr:
 		DetachExpr(detached, typ, loc):
 			CoreTraverse.map_core_expr_children(expr, rewrite_post_perceus_expr)
 		DupExpr(variable, value_type, retain_policy, body, typ, loc):
-			DupExpr(variable, value_type, retain_policy, rewrite_post_perceus_expr(body), typ, loc)
+			rewritten_body: CoreExpr = rewrite_post_perceus_expr(body)
+
+			if CoreTraverse.same_core_expr(body, rewritten_body):
+				expr
+			else:
+				DupExpr(variable, value_type, retain_policy, rewritten_body, typ, loc)
 		WhileExpr(cond, body, typ, loc):
-			WhileExpr(rewrite_post_perceus_expr(cond), rewrite_post_perceus_expr(body), typ, loc)
+			rewritten_cond: CoreExpr = rewrite_post_perceus_expr(cond)
+			rewritten_body: CoreExpr = rewrite_post_perceus_expr(body)
+
+			if (
+				CoreTraverse.same_core_expr(cond, rewritten_cond)
+				and CoreTraverse.same_core_expr(body, rewritten_body)
+			):
+				expr
+			else:
+				WhileExpr(rewritten_cond, rewritten_body, typ, loc)
 		BreakExpr(typ, loc):
 			expr
 		ContinueExpr(typ, loc):

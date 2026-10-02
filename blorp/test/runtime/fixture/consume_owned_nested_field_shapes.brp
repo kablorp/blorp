@@ -1,0 +1,497 @@
+-- Allocation fixture for builders that hold their tables in sub-records: a
+-- table family (`NodeFamily`) is a field of the builder, and its smart
+-- constructor is called through a record update of the builder,
+-- `{ b | nodes = b.nodes.with_parent(..) }`. When the builder is uniquely
+-- owned, the update takes the family out of it, hands it uniquely to the
+-- family's consuming clone, and writes the result back, so every list grows
+-- in place and the allocations grow only with capacity doublings. A shape
+-- that copies the family on each step allocates per row instead.
+-- Prints one `PASS <shape>` or `FAIL <shape> ...` line per shape.
+-- Run in its own process with --memory-stats
+-- (see test_alloc_oracle_blorp_level.sh).
+import:
+	memory: MemStats, get_mem_stats, mem_delta
+
+
+struct Row {
+	kind: Int,
+	first: Int
+}
+
+
+-- A table family: a parent table and its child (edge) table.
+record NodeFamily {
+	rows: List[Row],
+	edges: List[Int]
+}
+
+
+record NestedBuilder {
+	nodes: NodeFamily,
+	definitions: List[Int]
+}
+
+
+-- Transient parse state kept beside the builder in one outer record.
+record ParseState {
+	tokens: List[Int],
+	cursor: Int
+}
+
+
+record Parsing {
+	builder: NestedBuilder,
+	state: ParseState
+}
+
+
+-- The rows of an interning table: spellings and the index derived from them,
+-- with the last interned id as a result register.
+record NameRows {
+	spellings: List[String],
+	index: Dict[String, Int],
+	last: Int
+}
+
+
+-- An interning table whose only mutators intern.
+opaque type NameTable = NameRows
+
+
+-- A builder holding an interning table beside a sub-record.
+record InterningBuilder {
+	names: NameTable,
+	definitions: List[Int]
+}
+
+
+-- A third level: the builder held by an outer record, as a parse driver
+-- holding its output tables.
+record Driver {
+	builder: NestedBuilder,
+	steps: Int
+}
+
+
+-- Read-only state passed beside the builder.
+record ReadOnlyState {
+	tokens: List[Int]
+}
+
+
+-- Allocations of the first buffers of the lists before they start doubling.
+private CONSTANT_ALLOCATION_ALLOWANCE: Int = 6
+
+-- The lists one step can grow: the family's two lists and the definitions.
+private LISTS_PER_BUILDER: Int = 3
+
+private SMALL_ROW_COUNT: Int = 1000
+
+private LARGE_ROW_COUNT: Int = 10000
+
+
+---
+Appends a parent over one child: the edge and the row covering it, in one
+update of the family.
+---
+pure func with_parent(family: NodeFamily, kind: Int, child: Int) -> NodeFamily:
+	first: Int = family.edges.length()
+	{ family |
+		edges = family.edges.append(child),
+		rows = family.rows.append({
+			kind = kind,
+			first = first,
+		})
+	}
+
+
+pure func append_parent(b: NestedBuilder, kind: Int, child: Int) -> NestedBuilder:
+	{ b | nodes = b.nodes.with_parent(kind, child) }
+
+
+pure func append_definition(b: NestedBuilder, value: Int) -> NestedBuilder:
+	{ b | definitions = b.definitions.append(value) }
+
+
+-- One family update through the builder.
+pure func step_nested_family(b: NestedBuilder, i: Int) -> NestedBuilder:
+	b.append_parent(i, i)
+
+
+-- Two sub-records updated in one chained statement.
+pure func step_nested_family_chain(b: NestedBuilder, i: Int) -> NestedBuilder:
+	b
+		.append_parent(i, i)
+		.append_definition(i)
+
+
+-- Another sub-record read into a local before the family update.
+pure func step_read_sibling(b: NestedBuilder, i: Int) -> NestedBuilder:
+	definitions: Int = b.definitions.length()
+	b.append_parent(i, definitions)
+
+
+-- A method chain on the replaced field: two family updates in one replacement.
+pure func step_method_chain_on_field(b: NestedBuilder, i: Int) -> NestedBuilder:
+	{ b | nodes = b.nodes
+			.with_parent(i, i)
+			.with_parent(i, i) }
+
+
+-- A `var` alias of the builder updated under an `if`, then again.
+pure func step_conditional(b: NestedBuilder, i: Int) -> NestedBuilder:
+	var out: NestedBuilder = b
+
+	if i >= 0:
+		out = out.append_parent(i, i)
+
+	out.append_definition(i)
+
+
+-- Read-only state passed beside the builder.
+pure func step_read_only_state(b: NestedBuilder, state: ReadOnlyState, i: Int) -> NestedBuilder:
+	token: Int = state.tokens.get_or(i % state.tokens.length(), 0)
+	b.append_parent(i, token)
+
+
+-- Three levels: the driver's builder's family.
+pure func step_driver(d: Driver, i: Int) -> Driver:
+	{ d |
+		builder = d.builder.append_parent(i, i),
+		steps = d.steps + 1
+	}
+
+
+pure func empty_names() -> NameTable:
+	rows: NameRows = {
+		spellings = [],
+		index = {},
+		last = 0
+	}
+	into_opaque NameTable(rows)
+
+
+---
+The id `spelling` has or will have once interned.
+---
+pure func id_for(table: NameTable, spelling: String) -> Int:
+	rows: NameRows = from_opaque NameTable(table)
+
+	match rows.index.get(spelling):
+		Some(row):
+			row
+		None:
+			rows.spellings.length()
+
+
+---
+Interns `spelling`: the table is taken out of its alias, updated in a match
+arm, and bound before it is returned.
+---
+pure func interned(table: NameTable, spelling: String) -> NameTable:
+	rows: NameRows = from_opaque NameTable(table)
+
+	match rows.index.get(spelling):
+		Some(_):
+			into_opaque NameTable(rows)
+		None:
+			row: Int = rows.spellings.length()
+			grown: NameRows = { rows |
+				index = rows.index.set(spelling, row),
+				spellings = rows.spellings.append(spelling)
+			}
+			into_opaque NameTable(grown)
+
+
+---
+Interns `spelling` and records its id in the table's result register.
+---
+pure func intern_registering(table: NameTable, spelling: String) -> NameTable:
+	rows: NameRows = from_opaque NameTable(table)
+
+	match rows.index.get(spelling):
+		Some(row):
+			into_opaque NameTable({ rows | last = row })
+		None:
+			row: Int = rows.spellings.length()
+			grown: NameRows = { rows |
+				index = rows.index.set(spelling, row),
+				spellings = rows.spellings.append(spelling),
+				last = row
+			}
+			into_opaque NameTable(grown)
+
+
+pure func last_interned(table: NameTable) -> Int:
+	from_opaque NameTable(table).last
+
+
+pure func name_count(table: NameTable) -> Int:
+	from_opaque NameTable(table).spellings.length()
+
+
+-- The id read first, then the table interned inside a builder update.
+func intern_two_calls_allocations(words: List[String]) -> Int:
+	var b: InterningBuilder = {
+		names = empty_names(),
+		definitions = []
+	}
+	var total: Int = 0
+	before: MemStats = get_mem_stats()
+
+	for word in words:
+		id: Int = b.names.id_for(word)
+		b = { b | names = b.names.interned(word) }
+		total += id
+
+	after: MemStats = get_mem_stats()
+
+	if b.names.name_count() * 2 == words.length() and total >= 0:
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+-- The id read back from the table's result register after the update.
+func intern_register_allocations(words: List[String]) -> Int:
+	var b: InterningBuilder = {
+		names = empty_names(),
+		definitions = []
+	}
+	var total: Int = 0
+	before: MemStats = get_mem_stats()
+
+	for word in words:
+		b = { b | names = b.names.intern_registering(word) }
+		total += b.names.last_interned()
+
+	after: MemStats = get_mem_stats()
+
+	if b.names.name_count() * 2 == words.length() and total >= 0:
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+-- The builder and the parse state as fields of one record, both updated: the
+-- state through a nested update of its own field.
+pure func step_pair_record(p: Parsing, i: Int) -> Parsing:
+	token: Int = p.state.tokens.get_or(p.state.cursor % p.state.tokens.length(), 0)
+	cursor: Int = p.state.cursor
+	{ p |
+		builder = p.builder.append_parent(i, token),
+		state = { p.state | cursor = cursor + 1 }
+	}
+
+
+func pair_record_allocations(rows: Int) -> Int:
+	var p: Parsing = {
+		builder = empty_builder(),
+		state = {
+			tokens = [0, 1, 2],
+			cursor = 0
+		}
+	}
+	before: MemStats = get_mem_stats()
+
+	for i in 0..rows:
+		p = step_pair_record(p, i)
+
+	after: MemStats = get_mem_stats()
+
+	if p.state.cursor == rows and builder_is_complete(p.builder, "pair_record", rows):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+-- Each spelling twice in a row: the first intern is new, the second finds it.
+pure func probe_words(rows: Int) -> List[String]:
+	var words: List[String] = []
+
+	for i in 0..rows:
+		words = words.append("w${i / 2}")
+
+	words
+
+
+pure func ceil_log2(value: Int) -> Int:
+	var bits: Int = 0
+	var capacity: Int = 1
+
+	while capacity < value:
+		capacity *= 2
+		bits += 1
+
+	bits
+
+
+-- Rows can reach twice the step count (the method chain), one more doubling.
+pure func growth_allowance(rows: Int) -> Int:
+	LISTS_PER_BUILDER * (ceil_log2(2 * rows) + 1) + CONSTANT_ALLOCATION_ALLOWANCE
+
+
+---
+The managed allocations between two snapshots, or -1 when counting was off
+(without `--memory-stats` every count reads 0, which would pass vacuously).
+---
+func counted_allocations(before: MemStats, after: MemStats) -> Int:
+	if before.memory_stats_active == 1 and after.memory_stats_active == 1:
+		mem_delta(before, after).total_allocations
+	else:
+		-1
+
+
+pure func empty_builder() -> NestedBuilder:
+	{
+		nodes = {
+			rows = [],
+			edges = []
+		},
+		definitions = []
+	}
+
+
+pure func rows_per_step(shape: String) -> Int:
+	match shape:
+		"method_chain_on_field":
+			2
+		_:
+			1
+
+
+pure func builder_step(
+	shape: String,
+	b: NestedBuilder,
+	state: ReadOnlyState,
+	i: Int,
+) -> NestedBuilder:
+	match shape:
+		"nested_family":
+			step_nested_family(b, i)
+		"nested_family_chain":
+			step_nested_family_chain(b, i)
+		"read_sibling":
+			step_read_sibling(b, i)
+		"method_chain_on_field":
+			step_method_chain_on_field(b, i)
+		"conditional":
+			step_conditional(b, i)
+		"read_only_state":
+			step_read_only_state(b, state, i)
+		_:
+			b
+
+
+---
+The built builder is checked so a shape that drops or duplicates a row
+fails rather than passing on a low count.
+---
+pure func builder_is_complete(b: NestedBuilder, shape: String, rows: Int) -> Bool:
+	expected: Int = rows * rows_per_step(shape)
+
+	last_row_kind: Int = match b.nodes.rows.get(expected - 1):
+		Some(row):
+			row.kind
+		None:
+			-1
+
+	(
+		b.nodes.rows.length() == expected
+		and b.nodes.edges.length() == expected
+		and last_row_kind == rows - 1
+	)
+
+
+func builder_shape_allocations(shape: String, rows: Int) -> Int:
+	state: ReadOnlyState = {tokens = [0, 1, 2]}
+	var b: NestedBuilder = empty_builder()
+	before: MemStats = get_mem_stats()
+
+	for i in 0..rows:
+		b = builder_step(shape, b, state, i)
+
+	after: MemStats = get_mem_stats()
+
+	if builder_is_complete(b, shape, rows):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+-- The family updated in place directly in a loop, with no helper call.
+func loop_update_allocations(rows: Int) -> Int:
+	var b: NestedBuilder = empty_builder()
+	before: MemStats = get_mem_stats()
+
+	for i in 0..rows:
+		b = { b | nodes = b.nodes.with_parent(i, i) }
+
+	after: MemStats = get_mem_stats()
+
+	if builder_is_complete(b, "loop_update", rows):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+func driver_allocations(rows: Int) -> Int:
+	var d: Driver = {
+		builder = empty_builder(),
+		steps = 0
+	}
+	before: MemStats = get_mem_stats()
+
+	for i in 0..rows:
+		d = step_driver(d, i)
+
+	after: MemStats = get_mem_stats()
+
+	if d.steps == rows and builder_is_complete(d.builder, "driver", rows):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+func shape_allocations(shape: String, rows: Int) -> Int:
+	match shape:
+		"pair_record":
+			pair_record_allocations(rows)
+		"intern_two_calls":
+			intern_two_calls_allocations(probe_words(rows))
+		"intern_register":
+			intern_register_allocations(probe_words(rows))
+		"loop_update":
+			loop_update_allocations(rows)
+		"driver_three_levels":
+			driver_allocations(rows)
+		_:
+			builder_shape_allocations(shape, rows)
+
+
+pure func within(allocations: Int, rows: Int) -> Bool:
+	allocations >= 0 and allocations <= growth_allowance(rows)
+
+
+func report(shape: String):
+	small: Int = shape_allocations(shape, SMALL_ROW_COUNT)
+	large: Int = shape_allocations(shape, LARGE_ROW_COUNT)
+
+	if within(small, SMALL_ROW_COUNT) and within(large, LARGE_ROW_COUNT):
+		print("PASS ${shape}")
+	else:
+		print("FAIL ${shape}: ${small}/${large} allocations")
+
+
+func main(args: List[String]):
+	report("nested_family")
+	report("nested_family_chain")
+	report("read_sibling")
+	report("method_chain_on_field")
+	report("conditional")
+	report("read_only_state")
+	report("loop_update")
+	report("driver_three_levels")
+	report("intern_two_calls")
+	report("intern_register")
+	report("pair_record")
