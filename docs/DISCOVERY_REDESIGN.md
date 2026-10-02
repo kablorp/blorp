@@ -107,7 +107,7 @@ Appendix A: node census. Appendix B: allocation probes.
     change. Since 2026-10-02 the flip (M6) waits on the compiler work of
     [`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md): its increments 1 to 4, and
     increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5
-    do not wait (section 10, Q6).
+    do not wait (section 10, flip timing).
 
 ## 1. Goals, principles, non-goals, and what the redesign replaces
 
@@ -3229,7 +3229,7 @@ change. M0 measured that today's compiler misses them (+1.45% for the tree
 stage alone), so M6 waits on the compiler work of
 [`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md) (its increments 1 to 4, and 5 if
 M0 re-measured after increment 4 still needs it), and is then measured against
-these same ceilings (section 10, Q6, 2026-10-02). If they are still missed,
+these same ceilings (section 10, flip timing, revised 2026-10-02). If they are still missed,
 M6 waits. The tree path is then made cheaper without changing the design: a
 slimmer `ParseState`, fewer return levels in the expression parser (one
 precedence-climbing loop), and fewer wrapper records where a form is
