@@ -351,9 +351,9 @@ README paragraph exists; baselines recorded.
 
 ## N1. Read the task pointer once per function
 
-**Context.** Pattern D. Owned by the cleanup-frames worker already running
-(branch `perf/cleanup-frames`) as its first cut; listed here for
-completeness and so no one duplicates it.
+**Context.** Pattern D. This is the first cut of the cleanup-frames work
+(N8 holds the later cuts), listed so the roadmap is complete and no one
+duplicates it.
 
 **Change.** In the backend's function prologue, when the function contains
 any cleanup operation, emit `void* const __blorp_task = __blorp_current_task;`
@@ -711,8 +711,8 @@ green; the full default `scripts/test` green at merge (coordinator).
 
 ## N8. Cleanup pops on exit paths and frame elision
 
-**Context.** Owned by the running cleanup-frames worker as its second and
-third cuts. Pops (67,597) outnumber pushes (29,852) because every exit path
+**Context.** The second and third cuts of the cleanup-frames work, after
+N1. Pops (67,597) outnumber pushes (29,852) because every exit path
 re-emits the pops for the frames still open. And a frame whose protected
 interval contains no reachable checkpoint is dead.
 

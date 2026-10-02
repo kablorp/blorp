@@ -32,7 +32,7 @@ Baseline stage-2 compiler SHA-256:
 baseline stage-2 compiler was built by bootstrap `bin/blorp` SHA-256
 `f17f07d2f2e1b9f92b4e481279a8db733b17adc5a1be822a5fdf5fee030c6b4e`.
 
-Candidate source revision: branch `codex/struct-payload-s2a`, HEAD
+Candidate source revision: the S2a candidate branch, HEAD
 `2bb45f3f5196a2cf3d30716f67919b5fde3ee2a0`, with the S2a worktree edits
 present (`compiler_dirty=true`). Candidate stage-2 compiler SHA-256:
 `1a524b366cbc2c49eda2658719e5dde9d890239ad668debeb0632235fa23704e`. It was

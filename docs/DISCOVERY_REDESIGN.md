@@ -18,8 +18,8 @@ bodies are given only where the shape matters.
   modules, prelude and tuple implicit modules) with a census tool over the
   current tables. Appendix A gives the census; Appendix B gives the
   allocation probes.
-- **Decisions:** revised after an independent review and Keith's answers to
-  the first version's open questions (section 10).
+- **Decisions:** revised after an independent review of the first version;
+  the decisions taken are in section 10.
 - **Precedence:** where this document and a later implementation disagree,
   the implementation and its tests win, and this document is fixed in the
   same change.
@@ -86,18 +86,22 @@ Appendix A: node census. Appendix B: allocation probes.
    the mint. An id census proves the minting discipline, as a corpus test and
    in debug builds at link.
 8. **Prerequisites in the language.**
-   - `=` in expression positions (`xs = [a = 1]`, `print(ys[0] = 3)`,
-     `if a = 1:`) is being made a parse error in both parsers now, by its own
-     change.
+   - Assignment is a statement only. `=` in an expression position
+     (`xs = [a = 1]`, `print(ys[0] = 3)`, `if a = 1:`) is a parse error in
+     both parsers, and the language has no named call arguments (landed in
+     `d460bac5f`).
    - A second syntax change, M-1, makes the parser reject the other forms
      that only typecheck rejects today.
 
    With both landed, the tree types need no form that exists only to be
    rejected.
 9. **The legacy adapter becomes a structural map from tree to old AST.** It
-   moves to `blorp/src/compile/legacy_discovery_adapter.brp`. `compile/` is
-   the root that wires the stages together, and the only code that may
-   import both `compiler` and `compiler_new`.
+   stays in `blorp/src/compiler/discovery_adapter.brp`, run by
+   `blorp/src/compiler/discovery_front_end.brp`; M3 to M6 rewrite both in
+   place over the trees, and they are deleted when typecheck reads the trees
+   directly. These two are the only compiler modules that import
+   `compiler_new`, as `temporary_cross_owner_imports` in
+   `blorp/source_ownership.json` lists.
 10. **The default flips only within a hard ceiling** on retired instructions,
     peak RSS and wall time. The ceiling is not loosened for any compiler
     change. Since 2026-10-02 the flip (M6) waits on the compiler work of
@@ -109,9 +113,9 @@ Appendix A: node census. Appendix B: allocation probes.
 
 ### Goals
 
-Keith's goal: *"produce tables that allow the following stages of the compiler
-to be straightforward and to not re-do work from earlier stages."* That breaks
-down into:
+The goal is output that lets the following stages of the compiler be
+straightforward and not re-do work from earlier stages. That breaks down
+into:
 
 1. **Clean, understandable, correct code**, in the stage and in its readers.
    The organization of the code and the data model comes first.
@@ -122,7 +126,8 @@ down into:
    Neither re-derives a fact that discovery had: no digits to re-parse, no
    arity to re-check, no parent to inspect.
 4. **The stage knows nothing about the old compiler.** Glue lives in
-   `blorp/src/compile/`, outside both compilers.
+   `blorp/src/compiler/discovery_front_end.brp` and `discovery_adapter.brp`,
+   the only compiler modules that import the stage.
 5. **Design first; cost second.** Where today's compiler makes a clean shape
    expensive, the cost and the compiler work that recovers it go into a ledger
    (section 7). The default still flips only within a hard ceiling.
@@ -153,7 +158,7 @@ down into:
   (section 3.15).
 - **A name says its role in its type.**
   - `NameUse` is a reference whose meaning a later stage decides: resolution
-    by scope, or typecheck by type (a field, a method, a named argument).
+    by scope, or typecheck by type (a field or a method).
   - `Binder` introduces a local value, and `TypeBinder` a type parameter.
   - `WrittenName` is a name that no later stage resolves: a declared name,
     a module alias, a path part.
@@ -736,8 +741,7 @@ keeps exactly one outcome per use:
   constructor, a dimension variable, an imported item, a name that either
   binds or refers (an assignment target, a name pattern);
 - by type (typecheck), after resolution records that it is not its own: the
-  member after a dot, the name of a named argument, a field name in a record
-  literal or update.
+  member after a dot, a field name in a record literal or update.
 ---
 struct NameUse {
 	name: WrittenName,
@@ -797,7 +801,7 @@ union BindingTarget:
   - a `Binder` declares;
   - a `WrittenName` is nobody's to decide.
 
-  Named-argument and record-field names are `NameUse`s, for the same reason
+  Record-field names are `NameUse`s, for the same reason
   as `x.f`: typecheck decides them by type, and its choice of parameter or
   field is keyed by the use's id (section 9, D3).
 
@@ -1577,7 +1581,7 @@ union ExpressionKind:
 	ShortCircuit(LogicalOperator, Expression, Expression)
 	RangeExpression(Expression, Expression)
 	-- Calls and access.
-	Call(Expression, List[Argument])
+	Call(Expression, List[Expression])
 	FieldAccess(Expression, NameUse)                     -- `x.f`: a field, a method, or a module member
 	Subscript(Expression, AtLeastOne[Expression])
 	-- Aggregates.
@@ -1635,18 +1639,9 @@ enum OpaqueDirection:
 
 
 ---
-A call argument: positional, or `name = value`. A named argument is its own
-form, so no reader decides from the parent that an assignment means a name.
----
-union Argument:
-	PositionalArgument(Expression)
-	NamedArgument(NamedValue)
-
-
----
-`name = value` in a call, a record literal or a record update. `name` is a
-use that typecheck decides against the callee's parameters or the record
-type's fields.
+`name = value` in a record literal or a record update. `name` is a use that
+typecheck decides against the record type's fields. A call takes only
+positional arguments: the language has no named arguments.
 ---
 record NamedValue {
 	name: NameUse,
@@ -1665,13 +1660,12 @@ record DictEntry {
 }
 ```
 
-**`=` in expressions** is a prerequisite fixed outside this design. Today
-the expression grammar has `postfix_expr "=" assign_expr` at every expression
-position, so `xs = [a = 1]`, `print(ys[0] = 3)` and `if a = 1:` all parse.
-The change being made now in both parsers makes `=` a parse error there,
-except as a statement, a named argument and a record field. With it,
-`Expression` needs no assignment form. A named argument and a record field
-are recognized by the two-token lookahead `name =` before anything is built.
+**`=` in expressions.** Assignment is a statement only. The grammar has no
+`=` at an expression position, so `xs = [a = 1]`, `print(ys[0] = 3)` and
+`if a = 1:` are parse errors in both parsers, and `f(name = value)` is the
+same error because there are no named arguments. `Expression` therefore has
+no assignment form. A record field `name = value` is recognized by the
+two-token lookahead `name =` before anything is built.
 
 **Grouping parentheses.** These add no node. They widen the enclosed
 expression's span to the delimiters, except for a name and a lambda, whose
@@ -1837,8 +1831,7 @@ statement records do not repeat it.
 `select`, `with`, `debug:`, `concurrent:` and lambdas as expressions,
 anywhere a primary expression may stand. It accepts `var`, bindings,
 destructuring, `while`, `for` and local functions only as statements. The
-split above follows that. Assignment is a statement only, once the `=`
-prerequisite lands.
+split above follows that. Assignment is a statement only.
 
 ### 3.13 Control flow, interpolation and concurrency
 
@@ -2244,18 +2237,15 @@ the bug.
 
 **The no-discard rule.** The parser decides by lookahead before it builds,
 and never drops a node it built in an accepted parse. Today's parser
-discards in three places, and each changes:
+discards in two places, and each changes:
 
-1. **Named arguments.** Today the parser builds the identifier leaf and
-   discards it when it sees `=`. Instead, the token pair `name =` (not `==`)
-   is recognized before the argument is parsed.
-2. **`xs[i] = v`.** The parser parses the collection and indices, then looks
+1. **`xs[i] = v`.** The parser parses the collection and indices, then looks
    at the next token. On `=` it mints a `SubscriptPlace` from them, parses
    the value, and builds the statement from the place and the value.
    Otherwise it mints the `Subscript` expression. The place is minted before
    the value is parsed, so post-order and contiguity hold, and the id order
    matches today's `SubscriptNode` before its value.
-3. **Record literals.** `{x = 1}` is already recognized by lookahead
+2. **Record literals.** `{x = 1}` is already recognized by lookahead
    (`starts_record_field`).
 
 A placeholder built after a diagnostic may be dropped: its module is
@@ -2401,7 +2391,7 @@ method in its trait's or implementation's `methods`.
 ### 3.19 Where every current node kind goes
 
 Every one of today's 128 `NodeKind`s (`tables/row_kinds.brp`) has a home,
-or is rejected by the `=` prerequisite or M-1. Counts are from the
+or is rejected by the assignment-statement rule or M-1. Counts are from the
 self-compile census (Appendix A).
 
 | Today's node kind(s) | Count | New home |
@@ -2419,7 +2409,7 @@ self-compile census (Appendix A).
 | `AddNode` ... `GreaterEqualNode` (11 kinds) | 18,515 | `Binary(BinaryOperator, ...)` |
 | `AndNode`, `OrNode` | 6,184 | `ShortCircuit(LogicalOperator, ...)` |
 | `RangeNode` | 94 | `RangeExpression(Expression, Expression)` |
-| `CallNode` | 97,175 | `Call(Expression, List[Argument])` |
+| `CallNode` | 97,175 | `Call(Expression, List[Expression])` |
 | `FieldAccessNode` | 59,010 | `FieldAccess(Expression, NameUse)` |
 | `SubscriptNode` | 724 | `Subscript(Expression, AtLeastOne[Expression])` |
 | `ListLiteralNode`, `TupleNode`, `VectorLiteralNode` | 9,915+ | `ListLiteral`, `TupleLiteral(SmallTuple[...])`, `VectorLiteral` |
@@ -2445,8 +2435,7 @@ self-compile census (Appendix A).
 | `VarDeclarationNode` | 6,506 | `VariableDeclaration(VariableStatement)` |
 | `TypedBindingNode` | 9,287 | `TypedBinding(TypedBindingStatement)` |
 | `AssignmentNode` as a statement | 13,983 | `Assignment(AssignmentStatement)` |
-| `AssignmentNode` as a call argument | (included above) | `NamedArgument(NamedValue)` |
-| `AssignmentNode` anywhere else (a list element, an argument such as `print(ys[0] = 3)`, a condition) | not counted | rejected by the `=` prerequisite |
+| `AssignmentNode` anywhere else (a list element, a call argument such as `print(ys[0] = 3)`, a condition) | not counted | rejected: assignment is a statement only |
 | `QuestionBindNode` | 4,766 | `QuestionBinding(QuestionBindingStatement)` |
 | `AddAssignNode` ... `DivideAssignNode` | 1,893 | `CompoundAssignment(...)`; `_ += v` rejected by M-1 |
 | `SubscriptAssignmentNode` | 5 | `SubscriptAssignment(SubscriptAssignmentStatement)` |
@@ -2509,8 +2498,7 @@ that the link step builds.** There is no flatten step.
 
 1. **Every consumer walks.**
    - Resolution walks bodies in scope order. Its design already needed an
-     explicit step stack, `child_at(row, n)` per kind, and a parent-dependent
-     rule for named arguments.
+     explicit step stack and `child_at(row, n)` per kind.
    - Typecheck walks bodies in evaluation order, and Core lowering walks
      them again.
    - The legacy adapter rebuilds a tree from the table with 25 derived owner
@@ -2786,8 +2774,7 @@ pinned by fixtures and not claimed by the types.
 ### 4.7 Effects on resolution
 
 These are the changes to what resolution reads, for the resolution design
-(`docs/RESOLUTION_STAGE_DESIGN.md` on `docs/resolution-stage-design`,
-`b54cc4dbc`). What typecheck and Core lowering read is specified when those
+(the resolution stage design, `b54cc4dbc`). What typecheck and Core lowering read is specified when those
 stages are designed (section 1, non-goals).
 
 **Input**
@@ -2806,10 +2793,10 @@ stages are designed (section 1, non-goals).
 - **E2.** Bodies are walked by exhaustive `match` over typed forms. The
   following go: `NodeKind`, `node_row`, `child_at(row, n)` with its
   totality argument from `NodeArityMismatch`, `name_role` per `NodeKind`,
-  and the "re-derived from the parent" rule for named arguments. A name's
+  and the rule that derives a name's role from its parent. A name's
   role is its type:
   - every `NameUse` gets exactly one outcome, including "decided by type"
-    for members, named arguments and record fields;
+    for members and record fields;
   - every `Binder` and `TypeBinder` declares;
   - a `WrittenName` is never resolution's.
 
@@ -3007,38 +2994,37 @@ and no digit string is stored in the stage for the old compiler's sake.
 
 ## 6. The legacy adapter and the parity gates
 
-### 6.1 Where it lives: `blorp/src/compile/`
+### 6.1 Where it lives: `blorp/src/compiler/`
 
-`blorp/src/compile/` is the root for compiling a program. It
-wires the stages together, and it is the only code that may import both the
-existing compiler and the new stages:
+Two modules in `blorp/src/compiler/` connect the stage to the existing
+compiler, and they are the only compiler modules that import `compiler_new`
+(`temporary_cross_owner_imports` in `blorp/source_ownership.json`):
 
 ```
-blorp/src/compile/
-  pipeline.brp                   the stages in order for a command: composes discovery's inputs
-                                 (provider, lookup roots, implicit modules), renders a
-                                 DiscoveryFailure, and hands a DiscoveredProgram to the adapter
-                                 and the existing typecheck (absorbs compiler/discovery_front_end.brp)
-  legacy_discovery_adapter.brp   DiscoveredProgram → FrontendCompilationGraph: modules, names,
-                                 roots, edges and validation; declarations, bodies, types and
-                                 patterns to the old AST; the legacy name table
+blorp/src/compiler/
+  discovery_front_end.brp   composes discovery's inputs (provider, lookup roots,
+                            implicit modules), renders what the stage rejected,
+                            and hands the program to the adapter
+  discovery_adapter.brp     the stage's output -> FrontendCompilationGraph: modules,
+                            names, roots, edges and validation; declarations,
+                            bodies, types and patterns to the old AST; the legacy
+                            name table
 ```
 
-The adapter may later split into a folder `compile/legacy_discovery_adapter/`
-if it grows past one readable module. Its expected size is 1,500 to 2,000
-lines.
+`blorp/src/lib/source_graph.brp` chooses between this path and the existing
+lexer, parser and module loader with `BLORP_FRONT_END`. The adapter may later
+split into a folder if it grows past one readable module. After the tree
+rewrite its expected size is 1,500 to 2,000 lines.
 
 **Layout rules**, enforced by `scripts/check-blorp-layout` and
 `blorp/source_ownership.json`:
 
-- `compile/` may import `compiler/` and `compiler_new/`.
-- Neither `compiler/` nor `compiler_new/` imports `compile/`.
-- `compiler/` no longer imports `compiler_new/` at all.
-  `temporary_cross_owner_imports` loses `compiler/discovery_adapter.brp`,
-  which is deleted.
-- The commands' composition (`lib/source_graph.brp`, `main.brp`, the test,
-  purify and package commands) calls `compile/pipeline.brp`. `compile/`
-  imports nothing from those callers.
+- `compiler_new/` imports nothing from `compiler/`.
+- `compiler/` imports `compiler_new/` only through the two modules above, and
+  only while the adapter exists. They are rewritten in place over the trees
+  (M3 to M6) and deleted when typecheck reads the trees directly.
+- `lib/` does not import `compiler_new/`; the commands reach the stage through
+  `lib/source_graph.brp`.
 
 ### 6.2 How it changes
 
@@ -3066,7 +3052,7 @@ private pure func legacy_expression(context: LegacyContext, expression: Expressi
 		Call(callee, arguments):
 			ParsedCallExpr(
 				context.legacy_expression(callee),
-				arguments.map(pure func(argument): context.legacy_argument(argument)),
+				arguments.map(pure func(argument): context.legacy_expression(argument)),
 				location,
 			)
 		IntegerLiteral(_):
@@ -3201,7 +3187,7 @@ including peak RSS and wall time, before anything lands.
 Memory is secondary but measured in M0. A tree node is larger than a flat row
 (a record header plus the form's box, against a 32-byte row and an 8-byte
 edge). The trees should cost on the order of +100 MB over today's tables.
-They live while the adapter runs: `compile/pipeline.brp` drops the program
+They live while the adapter runs: `discovery_front_end.brp` drops the program
 once the old AST is built. The whole compile's memory peak is expected later,
 in Core and C emission, after the trees are released, so the trees should
 raise discovery's own peak but not the whole compile's. M0 checks this with a
@@ -3270,8 +3256,8 @@ makes it unreachable, not later. `BLORP_FRONT_END=existing` (the old
 discovery) is unaffected and stays until the next bootstrap rotation, as the
 flip commit set out.
 
-**Prerequisite, in progress elsewhere:** `=` in expression positions becomes
-a parse error in both parsers, as its own change, before M1.
+**Prerequisite, landed:** `=` in expression positions is a parse error in
+both parsers (`d460bac5f`), ahead of M1.
 
 | # | Change | Proof | Deleted |
 | --- | --- | --- | --- |
@@ -3281,14 +3267,14 @@ a parse error in both parsers, as its own change, before M1.
 | **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. | Token parity test unchanged; `tables` dump identical; cost recorded (the bridge's cost is temporary) | the lexer's builder appenders; transient interpolation tables |
 | **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison (as the adapter's declaration half was first proved), tree path against the old parser; per-module declaration diagnostics equal to today's stage | none |
 | **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; every rendered diagnostic per module equals today's stage, except the listed broken-import case; the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, adapter and the old typecheck | none |
-| **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `compile/pipeline.brp` on the tree path, behind an internal selection, with `cli`, `package` and `front-end-stage`-style gates run on both paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against main | none |
-| **M6** | Flip the default to the tree path, within the ceiling of section 7.4, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp`; `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
+| **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal selection, with `cli`, `package` and `front-end-stage`-style gates run on both paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against main | none |
+| **M6** | Flip the default to the tree path, within the ceiling of section 7.4, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
 | **M7** | Documentation: `DISCOVERY_TABLES_DESIGN.md` is replaced by this document's settled form; `ARCHITECTURE.md`, `DISCOVERY_ACCEPTANCE_ROADMAP.md` and `docs/README.md` are updated; the resolution design takes section 4.7. | `git diff --check`; link check | the superseded design text |
 
 Ordering and parallelism:
 
-- The `=` prerequisite and M-1 land first; each is a language change and
-  stands on its own.
+- The `=` prerequisite has landed; M-1 lands before M1. Each is a language
+  change and stands on its own.
 - M1 also waits for the opaque-type import-cycle fix, in progress separately.
 - M1 and M2 are independent of each other.
 - M3 needs M1 and M2, M4 needs M3, and M5 needs M4.
@@ -3299,7 +3285,7 @@ a fixed target.
 
 ## 9. Remaining disagreements
 
-**D1. Floats keep their decimal digits (section 5.2).** Keith asked for a
+**D1. Floats keep their decimal digits (section 5.2).** The alternative is a
 `Float` that has passed the overflow check. This design stores an opaque
 `DecimalFloat` that only the lexer makes, after the same check, because a
 stored 64-bit `Float` would round a `Float32` literal twice. The lexer checks
@@ -3313,7 +3299,7 @@ peak RSS, and +1.0% wall time on the median of at least 5 interleaved runs,
 which keeps the measurement outside the about 0.8% pairing noise of a median
 of 3 back to back.
 
-**D3. Names decided by type are `NameUse`s.** Named-argument names, record
+**D3. Names decided by type are `NameUse`s.** Record
 field names and the member after a dot get a `NameUseId`, and resolution
 records "decided by type" for them. The alternative was a separate
 member-name family that resolution never sees. *Recommendation:* one
@@ -3327,19 +3313,17 @@ comparison if it does, rather than carrying legacy order in the stage.
 
 ## 10. Decisions taken
 
-Keith's answers to the first version's questions, and where each is applied:
-
-| Question | Decision | Applied in |
+| Topic | Decision | Applied in |
 | --- | --- | --- |
-| Q1, recovery | A module with a syntax error has no tree; discovery reports its diagnostics. The simplest output: a program, or a failure report. Not designed around today's LSP. | 2.3, 2.4, 3.17, 4.2, E1 |
-| Q2, ids | Packed (module, local) ids; a program-wide id is the module's base plus the local id. Ids are managed exclusively behind the opaque boundary. | 3.3, 3.15, 3.16, 4.4 |
-| Q3, names | Interned per module | 3.2, 5.1 |
-| Q4, declare-or-refer names | `x = v` and name patterns stay `NameUse`s that resolution decides; resolution stores binding form and mutability itself | 3.12, E5 |
-| Q5, forms only typecheck rejects | The parser rejects them. `=` in expression positions is fixed first, by its own change; the rest is M-1. | 3.9, 3.11, 3.12, 3.19, 8 |
-| Q6, flip timing | Only within a hard ceiling, not counting on the tuple hand-off: +1% retired instructions, +5% peak RSS, +1% wall time on the median of at least 5 interleaved runs | 7.4, M6 |
-| Q6, revised 2026-10-02 | The ceilings are unchanged. After M0 measured the tree stage at +1.45% on today's compiler, M6 waits on the compiler work of `VALUE_TUPLES_AND_STATE_HANDOFF.md` (its question 7): increments 1 to 4, and increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5 proceed in parallel. | 0, 7.2, 7.4, 8 |
-| Q7, glue root | `blorp/src/compile/`: `compile/pipeline.brp` and `compile/legacy_discovery_adapter.brp` | 6.1 |
-| Q8, literals | Discovery does not intern literal texts (the backend pools strings); the tree stores checked values | 5.2 |
+| Recovery | A module with a syntax error has no tree; discovery reports its diagnostics. The simplest output: a program, or a failure report. Not designed around today's LSP. | 2.3, 2.4, 3.17, 4.2, E1 |
+| Ids | Packed (module, local) ids; a program-wide id is the module's base plus the local id. Ids are managed exclusively behind the opaque boundary. | 3.3, 3.15, 3.16, 4.4 |
+| Names | Interned per module | 3.2, 5.1 |
+| Declare-or-refer names | `x = v` and name patterns stay `NameUse`s that resolution decides; resolution stores binding form and mutability itself | 3.12, E5 |
+| Forms only typecheck rejects | The parser rejects them. Assignment as a statement only landed first, as its own change; the rest is M-1. | 3.9, 3.11, 3.12, 3.19, 8 |
+| Flip timing | Only within a hard ceiling, not counting on the tuple hand-off: +1% retired instructions, +5% peak RSS, +1% wall time on the median of at least 5 interleaved runs | 7.4, M6 |
+| Flip timing, revised 2026-10-02 | The ceilings are unchanged. After M0 measured the tree stage at +1.45% on today's compiler, M6 waits on the compiler work of `VALUE_TUPLES_AND_STATE_HANDOFF.md` (its question 7): increments 1 to 4, and increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5 proceed in parallel. | 0, 7.2, 7.4, 8 |
+| Glue location | `compiler/discovery_front_end.brp` and `compiler/discovery_adapter.brp`, the only compiler modules importing `compiler_new`; rewritten in place over trees, deleted when typecheck reads trees directly | 6.1, M6 |
+| Literals | Discovery does not intern literal texts (the backend pools strings); the tree stores checked values | 5.2 |
 | Downstream reads | Typecheck and Core lowering reads come later; E1 to E21 cover resolution | 1, 4.7 |
 
 ## Appendix A. Node census

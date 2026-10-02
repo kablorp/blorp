@@ -1756,7 +1756,8 @@ locations handed to the C4 producer cuts.
 
 **Oracle.** C3a versions Core JSON with an explicit `identity_state`, so raw
 parent/candidate Core JSON is intentionally not byte-identical. C3a adds a
-tested `benchmarks/compare_core_identity_transition` tool. It projects the
+tested `benchmarks/compare_core_identity_transition` tool (planned; not yet
+built). It projects the
 candidate's legacy `CoreVar` fields, proves their paths/cardinality/content
 match the parent dump, and separately validates every candidate identity tag,
 pair, pending/resolved census, and candidate JSON round trip. It must reject a
@@ -2559,7 +2560,7 @@ ratchet only at the C1b and C3c endpoints of their atomic trains.
 | C2a | carrier representation probe, `type_system/env.brp`, one complete inference binder family, its existing typed payloads, and Stage 8 lowering | complete owner/domain/site identity reaches lowering without parallel typed variants, boxing, prewalk, or growing threaded state; one lowering lookup is deleted; other families remain explicit compatibility cases |
 | C2b | remaining straight/parameter family, then lambda, block, and loop binder environment/inference consumers | each binder mints at admission and its selected uses carry the same ID; mixed shadowing is exact; each family's legacy lowering row reaches zero |
 | C2c | match, question-bind, select, concurrent, and resource binder consumers | all remaining authored binders mint/carry IDs; the legacy-local lowering ratchet reaches zero; the transitional path is deleted; existing diagnostics remain exact |
-| C3a | `stage_09_core/ir.brp`, every current `CoreVar` constructor from the C0a census, Core JSON tests, and `benchmarks/compare_core_identity_transition` | tagged inline transition compiles; all constructors pending; tested parent/candidate projection and transitional JSON round-trip pass; no consumer switch |
+| C3a | `stage_09_core/ir.brp`, every current `CoreVar` constructor from the C0a census, Core JSON tests, and the new `benchmarks/compare_core_identity_transition` (not yet built) | tagged inline transition compiles; all constructors pending; tested parent/candidate projection and transitional JSON round-trip pass; no consumer switch |
 | C3b | typed binder/use records in `stage_06_typecheck/` | every successful local inference result exposes `ResolvedValueId` |
 | C3c | `stage_08_core_lower/lower.brp` and `graph_prepare.brp` | orchestration-owned builder; authored/definition sites resolved; recursive context remains a reader; lowering scope lookup deleted; only enumerated C4 producer sites pending |
 | C4a | `stage_09_core/pass_runner.brp`, pipeline handoffs, identity module | one persistent frontier; two-pass mint test green |
@@ -2647,6 +2648,7 @@ bin/blorp compile --stop-after=lower --dump-core-after=lower \
 cmp "$series_root/parent.core" "$series_root/candidate.core"
 
 # C3a-C3c intentionally add/version identity_state; do not use cmp.
+# Planned tool, not yet built.
 benchmarks/compare_core_identity_transition \
   --parent "$series_root/parent.core" \
   --candidate "$series_root/candidate.core"

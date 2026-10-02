@@ -114,7 +114,7 @@ make
 scripts/compiler-build-status
 bin/blorp format --check --diff path/to/changed.brp
 bin/blorp check --no-format path/to/changed.brp
-bin/blorp test --timeout 180 blorp/test/compiler/test_relevant_behavior.brp
+bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_match.brp
 scripts/compiler-check --changed
 git diff --check
 ```
@@ -701,7 +701,7 @@ Use the narrowest relevant instrumentation:
 bin/blorp run --leak-check --timeout 30 --no-format program.brp
 bin/blorp run --sanitize --timeout 30 --no-format program.brp
 bin/blorp run --sanitize=undefined --timeout 30 --no-format program.brp
-bin/blorp test --leak-check --timeout 180 blorp/test/compiler/test_relevant.brp
+bin/blorp test --leak-check --timeout 180 blorp/test/compiler/stage_09_core/test_core_match.brp
 scripts/test leak
 scripts/test compiler-core-sanitize
 scripts/test compiler-blorp-sanitize

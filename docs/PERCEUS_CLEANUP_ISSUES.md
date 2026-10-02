@@ -3,10 +3,9 @@
 Perceus is now ten modules under `blorp/src/compiler/stage_09_core/perceus/`
 plus a 661-line `perceus.brp` holding the per-declaration pipeline (split
 landed 2026-09-22 with byte-identical C). This document turns the
-observations made during that split into worker-ready issues. The strategy,
-set by Keith: clearer code and clearer responsibilities first; allocations
-are a floor that must not rise; improvements are taken when a clearer
-structure exposes them.
+observations made during that split into worker-ready issues. The strategy:
+clearer code and clearer responsibilities first; allocations are a floor that
+must not rise; improvements are taken when a clearer structure exposes them.
 
 Read [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md) first. Its rules apply.
 Anchors are against main after the second split commit; grep for names.

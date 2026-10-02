@@ -116,14 +116,19 @@ sequence and origins (`legacy_module_order_dump.brp`) must equal the stage's
 (`discovery_module_order_dump.brp`), which catches the stage's implicit module
 names drifting from the existing front end's. The same roots run with the
 standard library read from the compiler's embedded texts, and fixture projects
-run with `blorp.toml` source packages and a native package. There are no known divergences today;
-`KNOWN_DIVERGENCES` stays so one can be added, with a reason (an entry that stops
-disagreeing fails the gate until it is removed). The gate
+run with `blorp.toml` source packages and a native package. Known divergences are listed
+in the script with a reason: `KNOWN_DIVERGENCES` (today the two interpolation cases the
+existing lexer reads wrongly), `KNOWN_POSITION_DIVERGENCES` (parse diagnostics reported
+at a different position) and `WORDING_DIFFERENCES` (diagnostic text the stage deliberately
+words differently). An entry that stops disagreeing fails the gate until it is
+removed. The gate
 takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not a
 default gate; it is part of the premerge gate.
 The `compiler-blorp` gate also runs every fixture explicitly marked
-`RUN-BLORP-CHECK` through a small Blorp-only runner after the generated suite;
-the expected fixture count is pinned in `scripts/test` and in the runner.
+`RUN-BLORP-CHECK` through a small runner
+(`blorp/test/lib/run_blorp_check_fixtures.py`) after the TestSuites have run;
+`scripts/test` pins the expected fixture count (`expected_blorp_check_fixture_count`)
+and passes it to the runner.
 Runtime sources owned by the leak gate are excluded from the normal runtime corpus.
 The remaining roots compile and run together in one runtime test invocation.
 `--no-build` is for controlled CI or local workflows that have already run the
@@ -357,6 +362,17 @@ and prints the version block after a `FRESH` verdict.
 The resulting native tool generates build metadata, embedded runtime C, and the
 embedded standard library. Production build and CI routes use this tool directly.
 
+`scripts/split-generated-c <generated.c> <out_dir> -n N` splits the compiler's single
+generated C file into a shared header and N body translation units that the Makefile
+compiles in parallel (`BLORP_CLI_C_SPLIT`). It post-processes the C file and does not
+touch the emitter.
+
+`scripts/blorp-cli-embedded-manifest` records what an installed `bin/blorp` was built
+from. `write-inputs` hashes the paths listed on stdin into a sorted input manifest,
+`write-installed` prefixes that manifest with the compiler binary's SHA-256, and
+`verify-installed` reports whether the installed compiler still matches. The Makefile
+uses it to decide whether to reinstall `bin/blorp`.
+
 ## Build Lock
 
 `scripts/with-build-lock` serializes build/test gates per worktree. `scripts/test`
@@ -367,6 +383,10 @@ holds the shared canonical per-user host compiler contention lease. Registered
 a run while any participating build/test gate for that user is active. The
 owner-only lease namespace rejects symlinks and foreign ownership before a gate
 or benchmark starts.
+`scripts/with-compiler-contention-lease --mode shared|exclusive --policy <file> -- <command>`
+runs a command while holding that lease; the policy file names the lease. With
+`--nonblocking` it fails instead of waiting when the lease is held.
+`scripts/with-build-lock` calls it for the shared side.
 Named runs selected with `--workload` use the same exclusive lease. The
 registered workload kind requires a candidate for comparisons and forbids one
 for characterizations; both validate their command and cache policy, while
@@ -553,6 +573,23 @@ and the suites that test the benchmark and measurement scripts; they protect
 those scripts rather than the compiler. `make quality` runs all three, then
 `artifact-scan` for stray generated files the suites left behind;
 `scripts/premerge-gate` runs them too, and so does CI's Quality lane.
+
+`scripts/check-blorp-layout` validates `blorp/source_ownership.json` against
+`blorp/src` and `blorp/test`: owner roots, which owners may import which (including
+the listed temporary cross-owner imports), the isolated `compiler_new` test tree,
+forbidden top-level paths, and that test modules mirror the source layout and are
+named `test_*`. `make hygiene-check` runs it.
+
+`scripts/check-c-symbol-projection-boundary` fails when a `.brp` file other than the
+backend emitter and its renderer test uses the unprojected C emission APIs
+(`*_unprojected_*_for_tests`), so emitted C always goes through symbol projection.
+`make hygiene-check` runs it.
+
+`scripts/check-c-symbol-projection-self-compile` compiles `blorp/src/main.brp` with the
+built `bin/blorp` (a stage-2 self-compile) and fails if the emitted C still spells a
+type by its pre-projection qualified name (its `_make(` and `_destroy` functions, its
+`typedef struct`, a pointer cast to it, or a `blorp_StackOption_` payload built from
+it). It needs a built `bin/blorp`. `make tooling-check` runs it.
 
 `scripts/check-magic-spellings` fails when a reader or producer of a name's
 prefix, suffix or embedded number (`starts_with`, `parse_int`, `__mono_`

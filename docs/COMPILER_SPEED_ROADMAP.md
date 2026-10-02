@@ -606,12 +606,13 @@ task. No compiler change in this task.
 
 ## Follow-ups Found In Round Two
 
-- **Record-update codegen** (from the R2 negative result,
-  `benchmarks/results/hoisted_field_take_rejected_2026-09-16.md`): a fused
+- **Record-update codegen** (from the R2 negative result, measured
+  2026-09-16 on an unmerged branch): a fused
   `{ state | ... }` in a hot loop costs 13.7% more instructions than plain
   locals with no extra allocations. The generated C releases fields the take
   just nulled, tests uniqueness three times per update, and wraps COW
-  arguments in cancellation cleanup frames. Three cuts are proposed there;
+  arguments in cancellation cleanup frames. The three cuts that follow from these observations are proposed on that branch
+  (`git show perf/r2-hoisted-field-take:benchmarks/results/hoisted_field_take_rejected_2026-09-16.md`);
   owner: emit.brp and reuse.brp after B1 lands.
 - **Union constructors heap-allocate payload-free and scalar-payload
   variants** (from D1): `SymbolToken(LeftParenSymbol)` is one allocation, and

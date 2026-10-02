@@ -14,7 +14,7 @@ setup/measure/land loop before reading a roadmap.
 
 | Task | Start with | First feedback |
 | --- | --- | --- |
-| Syntax or diagnostic | `blorp/src/compiler/stage_03_parse/`, matching compiler fixture, [`GRAMMAR`](docs/GRAMMAR.md) | Exact fixture and expected message; `scripts/compiler-check --changed` |
+| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (default parser; also `blorp/src/compiler/stage_03_parse/` while it exists, since a syntax change lands in both), matching compiler fixture, [`GRAMMAR`](docs/GRAMMAR.md) | Exact fixture and expected message; `scripts/compiler-check --changed` |
 | Inference or typecheck | `blorp/src/compiler/stage_06_typecheck/`, matching compiler fixture | Exact suite; then `scripts/compiler-check --stage typecheck` |
 | Core/ownership | [`pipeline.brp`](blorp/src/compiler/stage_09_core/pipeline.brp), [`ARCHITECTURE`](docs/ARCHITECTURE.md), owning Core suite | Before/after Core, focused suite, relevant sanitizer |
 | Backend/runtime | `blorp/src/compiler/stage_10_backend/`, `blorp/src/lib/runtime/native/`, codegen audit | Focused emitter/runtime test and generated C |

@@ -60,9 +60,10 @@ Compiler source is organized by dependency direction:
 | `blorp/src/main.brp` | Sole executable composition root and command dispatch |
 | `blorp/src/lib/runtime_sources.brp` | Shared typed contract used to pass runtime source text from the composition root to compile, run, and test effects |
 | `stage_01_generated_inputs` | Generated embedded standard-library source and compiler build metadata |
-| `stage_02_lex` | Tokens, trivia, indentation, and lexical diagnostics |
-| `stage_03_parse` | Parsed AST, parser, traversal, and source-AST finalization |
-| `stage_04_modules` | Project and package discovery, module identity, import resolution, retained module surfaces, and validated graphs |
+| `blorp/src/compiler_new/stage_01_discovery` | The default front end: lexing, parsing, module discovery and import resolution into normalized tables; `compiler/discovery_front_end.brp` runs it and `compiler/discovery_adapter.brp` rebuilds the graph the typechecker reads |
+| `stage_02_lex` | Existing front end (`BLORP_FRONT_END=existing` and the tools that parse on their own): tokens, trivia, indentation, and lexical diagnostics |
+| `stage_03_parse` | Existing front end (`BLORP_FRONT_END=existing` and the tools that parse on their own): parsed AST, parser, traversal, and source-AST finalization |
+| `stage_04_modules` | Existing front end (`BLORP_FRONT_END=existing` and the tools that parse on their own): project and package discovery, module identity, import resolution, retained module surfaces, and validated graphs |
 | `stage_06_typecheck` | Semantic types, environments, contexts, builtins, refinements, dimensions, declaration identities and headers, inference, validation, and typed AST; foundational type-system modules live under `type_system/` |
 | `stage_07_ctfe` | Compile-time evaluation and materialization |
 | `stage_08_core_lower` | Typed frontend to Core lowering |
@@ -87,7 +88,26 @@ can construct them correctly, not in a generic utility module.
 
 ## Frontend
 
+### Selecting The Front End
+
+`frontend_compilation_graph_for_root_paths` in `blorp/src/lib/source_graph.brp`
+builds the front-end graph for every compiling command and chooses between two
+implementations with `BLORP_FRONT_END`. The default (`stage`, also unset or
+blank) runs the discovery stage in `blorp/src/compiler_new/stage_01_discovery/`
+through `blorp/src/compiler/discovery_front_end.brp`; its tables are rebuilt
+into the graph the existing typechecker reads by
+`blorp/src/compiler/discovery_adapter.brp`. `existing` runs the older lexer,
+parser and module loader described below. Both produce the same graph and the
+same generated C. The older path remains for that switch and for the
+tools that parse on their own (formatter, linter, purify, package checks, test
+discovery and doctests, LSP), which do not use the stage;
+the default front end owns its own lexer and parser, so a syntax change lands
+in both parsers while the older one exists
+([Developer Guide](DEVELOPMENT.md#running-with-the-discovery-stage-or-the-existing-front-end)).
+
 ### Lex And Parse
+
+The sections below describe the existing front end.
 
 `stage_02_lex/lexer.brp` converts source text into tokens with exact spans and
 trivia. Indentation and continuation are lexical facts. The parser in

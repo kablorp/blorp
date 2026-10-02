@@ -129,7 +129,7 @@ field. Two hot frontend types were flattened to `Int` specifically to dodge
 this: `SourceLocation` (`source.brp:37`: "a struct here is boxed by the
 backend") and `Token` (`token.brp:154`).
 
-**The SourceSpan lesson.** Converting `SourceSpan` to a struct (2026-09-16,
+**The SourceSpan lesson.** Converting `SourceSpan` to a struct (2026-09-16; the record is on an unmerged branch:
 `git show 45c81b41:benchmarks/results/source_span_struct_probe_2026-09-16.md`)
 cut discovery -5.5% but raised typed frontend +2.0%: 662 of 903 box sites in
 the candidate's C were spans entering union payloads, each a fresh copy of a

@@ -32,10 +32,7 @@ entry says otherwise.
   `global_plan` 6,701, `global_prepare` 5,201,772, `global_pending` 0,
   `global_annotated` 1,421,126 allocations. Preparation
   (`prepared_module_environments` in `stage_06_typecheck/decl.brp`) is 78.3%
-  of global completion. Identical C. Measurement in
-  `benchmarks/results/self_compile_typecheck_global_attribution_O2_2026-09-21.json`
-  once that worktree (`/Users/keithphilpott/.codex/worktrees/typecheck-t-d`)
-  is landed.
+  of global completion. Identical C.
 - **T-E blocked** and retired as written.
 
 What the wave taught, and what the live issues are built on:
@@ -246,11 +243,14 @@ This issue adds that.
    the program builds a deterministic synthetic module set the way the
    existing profile does, sized so one run is under ten seconds at `-O2`,
    and prints body count, diagnostic count, a hash of the typed JSON, then
-   the `MemStats` fields. `benchmarks/compiler_typecheck_body_helper_allocations`
-   wraps it exactly as the DCE wrapper does: identity lines must match,
-   `allocations` is capped, `BLORP_TYPECHECK_HELPERS_MEASURE_ONLY=1` lifts
-   the cap. This gives the gate. It does not give the ranking; the ranking
-   comes from cut 3 on the real input.
+   the `MemStats` fields. A wrapper script would wrap it exactly as the DCE
+   wrapper does: identity lines must match, `allocations` is capped, and a
+   measure-only variable lifts the cap. This gives the gate. It does not give
+   the ranking; the ranking comes from cut 3 on the real input. Status: the
+   probe and its wrapper were not built, so no such gate exists; cut 1
+   (`self_allocations` in the exact profiler) and the cut 3 results file
+   (`benchmarks/results/typecheck_body_helper_allocations_O2_2026-09-22.md`)
+   did land.
 3. The ranking. Run the profiled compiler from cut 1 on the frozen
    self-compile input with `--stop-after=lower`, restrict to
    `--profile-module` covering `stage_06_typecheck/infer` and

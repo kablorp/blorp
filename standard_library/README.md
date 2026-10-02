@@ -79,9 +79,10 @@
 | Module | Description |
 |--------|-------------|
 | `io` | Console I/O (print, print_error, read_line, input, EOF-aware helpers) |
-| `file` | Typed file API foundation (`IOError`; resource handle anchors; scoped handles in progress) |
+| `fs` | Typed filesystem API: scoped file and directory handles with explicit capability traits, and `IOError` |
 | `system` | File I/O, directory ops, exec |
 | `process` | Safe process spawning with output capture |
+| `process_session` | Scoped, streaming supervision of a live child process (separate from the blocking `process`) |
 | `path` | File path manipulation (pure string operations) |
 | `time` | Date/time (POSIX microseconds, calendar, formatting, arithmetic) |
 | `debug` | Debug logging with levels |
@@ -107,6 +108,10 @@
 | Module | Description |
 |--------|-------------|
 | `net/tcp` | Scoped TCP sockets (listen, accept, connect, typed read/write, connection source shape) |
+| `net/udp` | Scoped UDP sockets (bind, send and receive datagrams, datagram streams, local port) |
+| `net/tls` | Scoped TLS sessions layered over a scoped TCP stream (typed `Unsupported` errors without the OpenSSL runtime profile) |
+| `net/websocket` | Scoped WebSocket session resource foundation |
+| `net/dns` | Hostname resolution with typed `DnsError` |
 | `net/http` | Pure HTTP/1.1 request/response parsing |
 | `net/url` | URL parsing |
 | `net/mime` | MIME type detection |
