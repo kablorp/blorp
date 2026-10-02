@@ -1429,12 +1429,15 @@ class DeclarationBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(record_authority)
         self.assertNotIn("owner: ModuleIdentity", alias_authority.group(0))
         self.assertNotIn("owner: ModuleIdentity", record_authority.group(0))
+        # Views address records by plain table index. Localization follows the
+        # viewing module, not the record's owner, so no locator carries an
+        # ownership bit for lookups to branch on.
         self.assertIn(
-            "private type alias AcceptedRecordLocator = Int",
-            authority_sources["record"],
+            "visible_records_by_source_name: Dict[String, Int]",
+            record_authority.group(0),
         )
-        self.assertNotIn("struct AcceptedRecordLocator", authority_sources["record"])
-        self.assertIn("accepted_record_locator_owner_local", authority_sources["record"])
+        self.assertNotIn("AcceptedRecordLocator", authority_sources["record"])
+        self.assertNotIn("accepted_record_locator_owner_local", authority_sources["record"])
 
         for source in authority_sources.values():
             self.assertNotIn("_empty_module_view(owner", source)

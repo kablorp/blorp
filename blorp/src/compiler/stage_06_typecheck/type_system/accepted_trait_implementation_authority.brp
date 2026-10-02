@@ -81,9 +81,11 @@ import:
 		BoundTypeParam,
 		bound_trait_identities_equal,
 	list: repeat
+	memory: same_object
 	semantic_type:
 		SemanticType(SemanticArrayType, SemanticMetaType, SemanticNamedType, SemanticTypeVar),
 		localize_module_types,
+		localize_module_types_list,
 		types_equal,
 
 
@@ -1446,23 +1448,10 @@ pure func accepted_trait_matches_compiler_identity(
 
 
 private pure func implementation_type_label(
-	definition_table: DefinitionTable,
-	module_table: ModuleTable,
 	owner_module_path: String,
 	item: AcceptedImplementationTableRecord,
 ) -> String:
-	item_owner_module_path = implementation_owner_module_path(
-		definition_table,
-		module_table,
-		item,
-	).get_or(owner_module_path)
-
-	for_type = if item_owner_module_path == owner_module_path:
-		localize_module_types(item_owner_module_path, item.instance.for_type)
-	else:
-		item.instance.for_type
-
-	match for_type:
+	match localize_module_types(owner_module_path, item.instance.for_type):
 		SemanticNamedType(name, _):
 			name
 		_:
@@ -1860,8 +1849,6 @@ private pure func accepted_trait_implementation_authority_from_fields(
 							representation.definition_table,
 							item.trait_id,
 						) + "' for type '" + implementation_type_label(
-							representation.definition_table,
-							representation.module_table,
 							fields.owner_module_path,
 							item,
 						) + "'",
@@ -2062,43 +2049,58 @@ pure func accepted_trait_only_projection_from_visibility(
 			)
 
 
+---
+Trait and implementation payloads are localized to the viewing module, not
+to their owner: inside an import cycle a trait or implementation owned by
+another module can mention the viewer's own types. Each helper returns its
+input when nothing changes, which is every payload outside such a cycle.
+---
 private pure func localized_trait_method(
 	module_path: String,
 	method: TraitMethodSig,
 ) -> TraitMethodSig:
-	{ method |
-		params = method.params.map(func(parameter): localize_module_types(module_path, parameter)),
-		return_type = localize_module_types(module_path, method.return_type)
-	}
+	params = localize_module_types_list(module_path, method.params)
+	return_type = localize_module_types(module_path, method.return_type)
+
+	match params:
+		Some(localized_params):
+			{ method |
+				params = localized_params,
+				return_type = return_type
+			}
+		None:
+			if same_object(return_type, method.return_type):
+				method
+			else:
+				{ method | return_type = return_type }
 
 
 private pure func trait_for_owner(
-	table: AcceptedTraitImplementationTable,
 	owner_module_path: String,
 	item: AcceptedTraitTableRecord,
 ) -> TraitDef:
-	table_representation = table_rep(table)
-	resolved_owner_module_path = trait_owner_module_path(
-		table_representation.definition_table,
-		table_representation.module_table,
-		item,
-	).get_or(owner_module_path)
+	var methods = item.definition.methods
+	var index: Int = 0
 
-	if resolved_owner_module_path == owner_module_path:
-		{ item.definition |
-			methods = item.definition.methods.map(
-				func(method): localized_trait_method(resolved_owner_module_path, method),
-			)
-		}
-	else:
+	for method in item.definition.methods:
+		localized = localized_trait_method(owner_module_path, method)
+
+		if not same_object(localized, method):
+			methods = methods.set(index, localized)
+
+		index += 1
+
+	if same_object(methods, item.definition.methods):
 		item.definition
+	else:
+		{ item.definition | methods = methods }
 
 
 private pure func trait_for_authority(
 	authority: AcceptedTraitImplementationAuthorityRep,
 	item: AcceptedTraitTableRecord,
 ) -> TraitDef:
-	trait_for_owner(authority.table, authority.owner_module_path, item)
+	trait_for_owner(authority.owner_module_path, item)
 
 
 private pure func visible_trait_index_for_name(
@@ -2137,7 +2139,7 @@ pure func accepted_trait_only_projection_find(
 	index ?= table_find_trait_index(table_rep(fields.table), row.trait_id)
 	table_rep(fields.table).traits
 		.get(index)
-		.map(func(item): trait_for_owner(fields.table, fields.owner_module_path, item))
+		.map(func(item): trait_for_owner(fields.owner_module_path, item))
 
 
 pure func accepted_trait_contains(
@@ -2337,16 +2339,7 @@ private pure func table_find_trait_method_seen(
 			match item.method_ids.get(method_index):
 				Some(method_id):
 					if method.name == method_name:
-						owner_module_path = trait_owner_module_path(
-							table.definition_table,
-							table.module_table,
-							item,
-						).get_or(authority.owner_module_path)
-
-						signature = if owner_module_path == authority.owner_module_path:
-							localized_trait_method(owner_module_path, method)
-						else:
-							method
+						signature = localized_trait_method(authority.owner_module_path, method)
 
 						result = Some({
 							id = method_id,
@@ -2485,16 +2478,7 @@ private pure func table_find_trait_method_by_id(
 	if not trait_method_ids_equal(method_id, id):
 		None
 	else:
-		owner_module_path = trait_owner_module_path(
-			table.definition_table,
-			table.module_table,
-			item,
-		).get_or(authority.owner_module_path)
-
-		signature = if owner_module_path == authority.owner_module_path:
-			localized_trait_method(owner_module_path, method)
-		else:
-			method
+		signature = localized_trait_method(authority.owner_module_path, method)
 
 		Some({
 			id = id,
@@ -2521,39 +2505,57 @@ private pure func localized_implementation_method(
 	module_path: String,
 	method: ImplMethodInfo,
 ) -> ImplMethodInfo:
-	{ method |
-		func_type = localize_module_types(module_path, method.func_type),
-		dim_constraints = method.dim_constraints.map(
-			func(
-				constraint,
-			): (
-				localize_module_types(module_path, constraint[0]),
-				localize_module_types(module_path, constraint[1]),
-			),
-		)
-	}
+	func_type = localize_module_types(module_path, method.func_type)
+	var dim_constraints = method.dim_constraints
+	var index: Int = 0
+
+	for constraint in method.dim_constraints:
+		left = localize_module_types(module_path, constraint[0])
+		right = localize_module_types(module_path, constraint[1])
+
+		if not same_object(left, constraint[0]) or not same_object(right, constraint[1]):
+			dim_constraints = dim_constraints.set(index, (left, right))
+
+		index += 1
+
+	if (
+		same_object(func_type, method.func_type)
+		and same_object(dim_constraints, method.dim_constraints)
+	):
+		method
+	else:
+		{ method |
+			func_type = func_type,
+			dim_constraints = dim_constraints
+		}
 
 
 private pure func implementation_for_authority(
 	authority: AcceptedTraitImplementationAuthorityRep,
 	item: AcceptedImplementationTableRecord,
 ) -> ImplInstance:
-	table = table_rep(authority.table)
-	owner_module_path = implementation_owner_module_path(
-		table.definition_table,
-		table.module_table,
-		item,
-	).get_or(authority.owner_module_path)
+	for_type = localize_module_types(authority.owner_module_path, item.instance.for_type)
+	var methods = item.instance.methods
+	var index: Int = 0
 
-	if owner_module_path == authority.owner_module_path:
-		{ item.instance |
-			for_type = localize_module_types(owner_module_path, item.instance.for_type),
-			methods = item.instance.methods.map(
-				func(method): localized_implementation_method(owner_module_path, method),
-			)
-		}
-	else:
+	for method in item.instance.methods:
+		localized = localized_implementation_method(authority.owner_module_path, method)
+
+		if not same_object(localized, method):
+			methods = methods.set(index, localized)
+
+		index += 1
+
+	if (
+		same_object(for_type, item.instance.for_type)
+		and same_object(methods, item.instance.methods)
+	):
 		item.instance
+	else:
+		{ item.instance |
+			for_type = for_type,
+			methods = methods
+		}
 
 
 private pure func implementation_candidate_indices_for_trait(
@@ -2747,17 +2749,7 @@ private pure func accepted_implementation_matches_type(
 	typ: SemanticType,
 ) -> Bool:
 	representation = authority_rep(authority)
-	table = table_rep(representation.table)
-	owner_module_path = implementation_owner_module_path(
-		table.definition_table,
-		table.module_table,
-		item,
-	).get_or(representation.owner_module_path)
-
-	for_type = if owner_module_path == representation.owner_module_path:
-		localize_module_types(owner_module_path, item.instance.for_type)
-	else:
-		item.instance.for_type
+	for_type = localize_module_types(representation.owner_module_path, item.instance.for_type)
 
 	implementation_pattern_matches_with(
 		for_type,
@@ -3100,11 +3092,6 @@ private pure func accepted_find_impl_method_info_from_candidates(
 		match table.implementations.get(implementation_index):
 			Some(item):
 				if accepted_implementation_matches_type(authority, env, item, receiver_type):
-					owner_module_path = implementation_owner_module_path(
-						table.definition_table,
-						table.module_table,
-						item,
-					).get_or(representation.owner_module_path)
 					method_trait_ids = table.implementation_trait_method_ids.get_or(
 						implementation_index,
 						[],
@@ -3143,10 +3130,10 @@ private pure func accepted_find_impl_method_info_from_candidates(
 										False
 
 						if implements_requested_slot:
-							method = if owner_module_path == representation.owner_module_path:
-								localized_implementation_method(owner_module_path, indexed[1])
-							else:
-								indexed[1]
+							method = localized_implementation_method(
+								representation.owner_module_path,
+								indexed[1],
+							)
 
 							result = Some(method)
 							break
@@ -3295,12 +3282,6 @@ private pure func accepted_qualified_trait_method_info_for_implementation(
 
 	match table.implementations.get(implementation_index):
 		Some(item):
-			owner_module_path = implementation_owner_module_path(
-				table.definition_table,
-				table.module_table,
-				item,
-			).get_or(representation.owner_module_path)
-
 			match table_find_trait_index(table, item.trait_id):
 				Some(trait_index):
 					match table_find_trait_method_seen(
@@ -3355,13 +3336,10 @@ private pure func accepted_qualified_trait_method_info_for_implementation(
 											False
 
 									if implements_requested_slot:
-										implementation_method = if owner_module_path == representation.owner_module_path:
-											localized_implementation_method(
-												owner_module_path,
-												indexed[1],
-											)
-										else:
-											indexed[1]
+										implementation_method = localized_implementation_method(
+											representation.owner_module_path,
+											indexed[1],
+										)
 
 										result = Some(into_opaque AcceptedQualifiedTraitMethodInfo({
 													trait_id = trait_method_id_owner(requested.id),

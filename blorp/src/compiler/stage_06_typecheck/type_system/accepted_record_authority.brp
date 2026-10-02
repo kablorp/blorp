@@ -2,7 +2,8 @@
 --
 -- Canonical field payloads live once in the graph-owned table. Module views
 -- retain only established identities, source names, and field-shape lookup
--- names; owner-local field spellings are materialized only when queried.
+-- names; field spellings local to the viewing module are materialized only
+-- when queried.
 import:
 	../../stage_04_modules/module_table: ModuleId, module_ids_equal, module_table_canonical_path
 	../graph/definition_index:
@@ -22,6 +23,7 @@ import:
 		type_id_name,
 		type_ids_equal,
 	env: FieldDecl
+	memory: same_object
 	semantic_type: SemanticType, canonical_module_type_name, localize_module_types
 
 
@@ -86,30 +88,9 @@ record AcceptedVisibleRecordBinding {
 }
 
 
-private type alias AcceptedRecordLocator = Int
-
-
-private pure func accepted_record_locator_value(
-	record_index: Int,
-	owner_local: Bool,
-) -> AcceptedRecordLocator:
-	if owner_local:
-		record_index * 2 + 1
-	else:
-		record_index * 2
-
-
-private pure func accepted_record_locator_index(locator: AcceptedRecordLocator) -> Int:
-	locator / 2
-
-
-private pure func accepted_record_locator_owner_local(locator: AcceptedRecordLocator) -> Bool:
-	locator % 2 == 1
-
-
 private record AcceptedRecordModuleViewRep {
 	owner_module_path: Option[String],
-	visible_records_by_source_name: Dict[String, AcceptedRecordLocator],
+	visible_records_by_source_name: Dict[String, Int],
 	visible_names_by_field_key: Dict[String, List[String]]
 }
 
@@ -120,7 +101,7 @@ opaque type AcceptedRecordModuleView = AcceptedRecordModuleViewRep
 private record AcceptedRecordAuthorityRep {
 	table: AcceptedRecordTable,
 	owner_module_path: Option[String],
-	visible_records_by_source_name: Dict[String, AcceptedRecordLocator],
+	visible_records_by_source_name: Dict[String, Int],
 	visible_names_by_field_key: Dict[String, List[String]]
 }
 
@@ -377,7 +358,7 @@ pure func accepted_record_module_view(
 	bindings: List[AcceptedVisibleRecordBinding],
 ) -> Option[AcceptedRecordModuleView]:
 	representation = table_rep(table)
-	var visible_records_by_source_name: Dict[String, AcceptedRecordLocator] = {}
+	var visible_records_by_source_name: Dict[String, Int] = {}
 	var visible_names_by_field_key: Dict[String, List[String]] = {}
 	var valid: Bool = True
 
@@ -417,7 +398,7 @@ pure func accepted_record_module_view(
 				else:
 					visible_records_by_source_name = visible_records_by_source_name.set(
 						binding.source_name,
-						accepted_record_locator_value(index, binding.owner_local),
+						index,
 					)
 
 					if binding.infer_from_fields:
@@ -482,18 +463,16 @@ pure func accepted_record_authority_without_visible_names(
 		})
 
 
-private pure func accepted_record_locator(
+private pure func accepted_record_index(
 	representation: AcceptedRecordAuthorityRep,
 	table: AcceptedRecordTableRep,
 	name: String,
-) -> Option[AcceptedRecordLocator]:
+) -> Option[Int]:
 	match representation.visible_records_by_source_name.get(name):
-		Some(locator):
-			Some(locator)
+		Some(index):
+			Some(index)
 		None:
-			table.canonical_record_indices_by_name
-				.get(name)
-				.map(func(index): accepted_record_locator_value(index, False))
+			table.canonical_record_indices_by_name.get(name)
 
 
 private pure func accepted_record_entry_raw(
@@ -502,8 +481,8 @@ private pure func accepted_record_entry_raw(
 ) -> Option[AcceptedRecordEntry]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	locator ?= accepted_record_locator(representation, table, name)
-	table.records.get(accepted_record_locator_index(locator))
+	index ?= accepted_record_index(representation, table, name)
+	table.records.get(index)
 
 
 pure func accepted_record_find(
@@ -512,25 +491,42 @@ pure func accepted_record_find(
 ) -> Option[AcceptedRecordEntry]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	locator ?= accepted_record_locator(representation, table, name)
-	index = accepted_record_locator_index(locator)
+	index ?= accepted_record_index(representation, table, name)
 	payload ?= table.records.get(index)
 
-	if accepted_record_locator_owner_local(locator):
-		owner_path ?= representation.owner_module_path
-		Some(
-			{ payload |
-				fields = payload.fields.map(
-					func(
-						field,
-					): { field |
-						field_type = localize_module_types(owner_path, field.field_type)
-					},
-				)
-			},
-		)
-	else:
-		Some(payload)
+	match representation.owner_module_path:
+		Some(owner_path):
+			fields = localized_fields(owner_path, payload.fields)
+
+			if same_object(fields, payload.fields):
+				Some(payload)
+			else:
+				Some({ payload | fields = fields })
+		None:
+			Some(payload)
+
+
+---
+Field types in the viewing module's spelling. The same list comes back when
+no field mentions a type the viewer owns, which is every record outside an
+import cycle with the viewer.
+---
+private pure func localized_fields(
+	owner_path: String,
+	fields: List[AcceptedFieldRow],
+) -> List[AcceptedFieldRow]:
+	var localized = fields
+	var index: Int = 0
+
+	for field in fields:
+		field_type = localize_module_types(owner_path, field.field_type)
+
+		if not same_object(field_type, field.field_type):
+			localized = localized.set(index, { field | field_type = field_type })
+
+		index += 1
+
+	localized
 
 
 private pure func accepted_record_field_index(
@@ -570,8 +566,8 @@ pure func accepted_record_find_field_id(
 ) -> Option[FieldId]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	locator ?= accepted_record_locator(representation, table, record_name)
-	payload ?= table.records.get(accepted_record_locator_index(locator))
+	index ?= accepted_record_index(representation, table, record_name)
+	payload ?= table.records.get(index)
 	field_index ?= accepted_record_field_index(table.definition_table, payload.fields, field_name)
 	field ?= payload.fields.get(field_index)
 	Some(field.id)
@@ -616,20 +612,18 @@ pure func accepted_record_find_field_type_by_id(
 ) -> Option[SemanticType]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	locator ?= accepted_record_locator(representation, table, record_name)
-	record_id ?= table.record_ids.get(accepted_record_locator_index(locator))
+	index ?= accepted_record_index(representation, table, record_name)
+	record_id ?= table.record_ids.get(index)
 	field ?= accepted_record_table_field(table, id)
 
 	if not type_ids_equal(field.parent, record_id):
 		None
-	else if accepted_record_locator_owner_local(locator):
+	else:
 		match representation.owner_module_path:
 			Some(owner_path):
 				Some(localize_module_types(owner_path, field.field_type))
 			None:
-				None
-	else:
-		Some(field.field_type)
+				Some(field.field_type)
 
 
 pure func accepted_record_find_type_params(
@@ -638,15 +632,15 @@ pure func accepted_record_find_type_params(
 ) -> Option[List[String]]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	locator ?= accepted_record_locator(representation, table, record_name)
-	entry ?= table.records.get(accepted_record_locator_index(locator))
+	index ?= accepted_record_index(representation, table, record_name)
+	entry ?= table.records.get(index)
 	Some(entry.type_params)
 
 
 pure func accepted_record_contains(authority: AcceptedRecordAuthority, name: String) -> Bool:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	accepted_record_locator(representation, table, name).is_some()
+	accepted_record_index(representation, table, name).is_some()
 
 
 pure func accepted_record_is_value(

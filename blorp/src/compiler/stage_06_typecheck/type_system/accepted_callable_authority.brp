@@ -49,6 +49,7 @@ import:
 		),
 	env: OverloadEntry, overload_entry_first_param_matches, overload_entry_ufcs_selection_score
 	list: repeat
+	memory: same_object
 	semantic_type: SemanticType, localize_module_types
 
 
@@ -768,7 +769,84 @@ private pure func binding_at(
 	if is_owner:
 		table.owner_bindings.get(index)
 	else:
-		table.canonical_bindings.get(index)
+		viewer_binding_option(
+			authority,
+			table.canonical_bindings.get(index),
+		)
+
+
+---
+A callable owned by another module, in the viewing module's spelling. Its
+signature mentions the viewer's own types only when the two modules import
+each other, so outside a cycle this returns `binding` itself.
+---
+private pure func viewer_binding(
+	authority: AcceptedCallableAuthorityRep,
+	binding: AcceptedCallableBinding,
+) -> AcceptedCallableBinding:
+	viewer_path = match authority.owner_module_id:
+		Some(module_id):
+			module_table_canonical_path(table_rep(authority.table).module_table, module_id)
+		None:
+			None
+
+	match viewer_path:
+		Some(path):
+			func_type = localize_module_types(path, binding.entry.func_type)
+			dim_constraints = localized_dim_constraints(path, binding.entry.dim_constraints)
+
+			if (
+				same_object(func_type, binding.entry.func_type)
+				and same_object(dim_constraints, binding.entry.dim_constraints)
+			):
+				binding
+			else:
+				{ binding | entry = { binding.entry |
+						func_type = func_type,
+						dim_constraints = dim_constraints
+					} }
+		None:
+			binding
+
+
+---
+Callable lookups run on every call and UFCS candidate, so this is matched
+rather than mapped: a lambda would allocate per lookup, and an unchanged
+binding returns the table's own `Some`.
+---
+private pure func viewer_binding_option(
+	authority: AcceptedCallableAuthorityRep,
+	found: Option[AcceptedCallableBinding],
+) -> Option[AcceptedCallableBinding]:
+	match found:
+		Some(binding):
+			localized = viewer_binding(authority, binding)
+
+			if same_object(localized, binding):
+				found
+			else:
+				Some(localized)
+		None:
+			None
+
+
+private pure func localized_dim_constraints(
+	path: String,
+	constraints: List[(SemanticType, SemanticType)],
+) -> List[(SemanticType, SemanticType)]:
+	var localized = constraints
+	var index: Int = 0
+
+	for constraint in constraints:
+		left = localize_module_types(path, constraint[0])
+		right = localize_module_types(path, constraint[1])
+
+		if not same_object(left, constraint[0]) or not same_object(right, constraint[1]):
+			localized = localized.set(index, (left, right))
+
+		index += 1
+
+	localized
 
 
 private pure func append_module_ufcs_matches(
@@ -798,14 +876,13 @@ private pure func append_module_ufcs_matches(
 								slot.visibility == PublicDeclaration
 
 						if visible:
-							match entry_at(authority, range.start + offset):
-								Some(entry):
-									if overload_entry_first_param_matches(entry, first_arg_type):
-										match binding_at(authority, range.start + offset):
-											Some(binding):
-												matches = matches.append(binding)
-											None:
-												void
+							match binding_at(authority, range.start + offset):
+								Some(binding):
+									if overload_entry_first_param_matches(
+										binding.entry,
+										first_arg_type,
+									):
+										matches = matches.append(binding)
 								None:
 									void
 					None:
@@ -920,7 +997,10 @@ pure func accepted_callable_find_qualified(
 		match table.slots.get(name_range.start + offset):
 			Some(slot):
 				if slot.visibility == PublicDeclaration:
-					result = table.canonical_bindings.get(name_range.start + offset)
+					result = viewer_binding_option(
+						representation,
+						table.canonical_bindings.get(name_range.start + offset),
+					)
 			None:
 				void
 
@@ -1070,18 +1150,21 @@ pure func accepted_callable_lookup_qualified_ufcs(
 
 								match table.slots.get(name_range.start + offset):
 									Some(slot):
-										if (
-											slot.visibility == PublicDeclaration
-											and overload_entry_first_param_matches(
-												slot.entry,
-												first_arg_type,
-											)
-										):
+										if slot.visibility == PublicDeclaration:
 											match table.canonical_bindings.get(
 												name_range.start + offset,
 											):
-												Some(binding):
-													result = result.append(binding)
+												Some(canonical_binding):
+													binding = viewer_binding(
+														representation,
+														canonical_binding,
+													)
+
+													if overload_entry_first_param_matches(
+														binding.entry,
+														first_arg_type,
+													):
+														result = result.append(binding)
 												None:
 													void
 									None:

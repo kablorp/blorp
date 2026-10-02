@@ -48,6 +48,7 @@ import:
 			StandaloneSelectiveDefinitionBinding,
 		),
 	list: repeat
+	memory: same_object
 	semantic_type: SemanticType, localize_module_types
 
 
@@ -180,16 +181,56 @@ private pure func authority_rep(authority: AcceptedGlobalAuthority) -> AcceptedG
 	from_opaque AcceptedGlobalAuthority(authority)
 
 
+---
+The binding in `owner_module_path`'s spelling. Returns `binding` itself when
+no type changes, which is every global a non-owner sees outside an import
+cycle with its owner.
+---
 private pure func localize_binding(
 	owner_module_path: String,
 	binding: AcceptedGlobalBinding,
 ) -> AcceptedGlobalBinding:
-	{ binding |
-		binding_type = localize_module_types(owner_module_path, binding.binding_type),
-		source_type = binding.source_type.map(
-			func(typ): localize_module_types(owner_module_path, typ),
-		)
-	}
+	binding_type = localize_module_types(owner_module_path, binding.binding_type)
+
+	source_type = match binding.source_type:
+		Some(typ):
+			localized = localize_module_types(owner_module_path, typ)
+
+			if same_object(localized, typ):
+				binding.source_type
+			else:
+				Some(localized)
+		None:
+			binding.source_type
+
+	if (
+		same_object(binding_type, binding.binding_type)
+		and same_object(source_type, binding.source_type)
+	):
+		binding
+	else:
+		{ binding |
+			binding_type = binding_type,
+			source_type = source_type
+		}
+
+
+-- Matched rather than mapped so a lookup allocates nothing when the binding
+-- is unchanged: it returns the slot's own `Some`.
+private pure func localize_binding_option(
+	owner_module_path: String,
+	found: Option[AcceptedGlobalBinding],
+) -> Option[AcceptedGlobalBinding]:
+	match found:
+		Some(binding):
+			localized = localize_binding(owner_module_path, binding)
+
+			if same_object(localized, binding):
+				found
+			else:
+				Some(localized)
+		None:
+			None
 
 
 pure func accepted_global_table(input: AcceptedGlobalTableInput) -> Option[AcceptedGlobalTable]:
@@ -626,12 +667,10 @@ pure func accepted_global_authority_for_initializer(
 					match table_representation.slots.get(index):
 						Some(slot):
 							if global_ids_equal(slot.id, binding.id):
-								available = if authority_owns_global(representation, binding.id):
-									localize_binding(representation.owner_module_path, binding)
-								else:
-									binding
-
-								allowed = allowed.set(definition_id, available)
+								allowed = allowed.set(
+									definition_id,
+									localize_binding(representation.owner_module_path, binding),
+								)
 						None:
 							void
 				None:
@@ -666,19 +705,25 @@ private pure func available_binding(
 	definition_id: Int,
 	owner_local: Bool,
 ) -> Option[AcceptedGlobalBinding]:
+	-- Owner bindings are localized once when the table is built. A binding
+	-- owned by another module is localized here, because inside an import
+	-- cycle its type can mention the viewer's own types.
 	match representation.availability:
 		CompletedGlobalAvailability:
 			if owner_local:
 				slot.owner_completed_binding
 			else:
-				slot.completed_binding
+				localize_binding_option(representation.owner_module_path, slot.completed_binding)
 		InitializerGlobalAvailability(allowed):
 			match slot.declared_binding:
 				Some(_):
 					if owner_local:
 						slot.owner_declared_binding
 					else:
-						slot.declared_binding
+						localize_binding_option(
+							representation.owner_module_path,
+							slot.declared_binding,
+						)
 				None:
 					allowed.get(definition_id)
 

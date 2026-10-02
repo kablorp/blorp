@@ -35,7 +35,8 @@ import:
 		env_type_may_contain_one_shot_stream,
 		env_type_may_contain_resource_source,
 	list: repeat
-	semantic_type: SemanticType, localize_module_types, types_equal
+	memory: same_object
+	semantic_type: SemanticType, localize_module_types, localize_module_types_list, types_equal
 
 
 record AcceptedUnionVariantEntry {
@@ -79,8 +80,7 @@ struct AcceptedUnionConstructorLocator {
 
 
 struct AcceptedUnionLocator {
-	union_index: Int,
-	owner_local: Bool
+	union_index: Int
 }
 
 
@@ -669,10 +669,7 @@ pure func accepted_union_module_view(
 				else:
 					visible_unions = visible_unions.set(
 						binding.source_name,
-						{
-							union_index = found_index,
-							owner_local = binding.owner_local
-						},
+						{union_index = found_index},
 					)
 			None:
 				valid = False
@@ -854,32 +851,64 @@ private pure func union_locator_for_name(
 				None:
 					table.builtin_union_indices_by_name.get(name)
 
-			index.map(func(index): {
-					union_index = index,
-					owner_local = False
-				})
+			index.map(func(index): {union_index = index})
 
 
+---
+Variant payloads in the viewing module's spelling, whoever owns the union: a
+union imported from a cycle partner can carry the viewer's own types. The
+same entry comes back when no payload changes.
+---
 private pure func localized_entry(
 	table: AcceptedUnionTableRep,
 	index: Int,
 	owner_module_path: Option[String],
 ) -> Option[AcceptedUnionEntry]:
 	entry ?= table.unions.get(index)
-	owner_path ?= owner_module_path
-	Some(
-		{ entry |
-			variants = entry.variants.map(
-				func(
-					variant,
-				): { variant |
-					fields = variant.fields.map(
-						func(field): localize_module_types(owner_path, field),
-					)
-				},
-			)
-		},
-	)
+
+	match owner_module_path:
+		Some(owner_path):
+			var variants = entry.variants
+			var variant_index: Int = 0
+
+			for variant in entry.variants:
+				match localize_module_types_list(owner_path, variant.fields):
+					Some(fields):
+						variants = variants.set(variant_index, { variant | fields = fields })
+					None:
+						void
+
+				variant_index += 1
+
+			if same_object(variants, entry.variants):
+				Some(entry)
+			else:
+				Some({ entry | variants = variants })
+		None:
+			Some(entry)
+
+
+---
+A constructor symbol in the viewing module's spelling. Owner-local symbols
+are localized when the module view is built; this covers constructors owned
+by other modules, which mention the viewer's types only inside an import
+cycle.
+---
+private pure func localized_constructor_symbol(
+	owner_module_path: Option[String],
+	symbol: Symbol,
+) -> Symbol:
+	match (owner_module_path, symbol.kind):
+		(Some(owner_path), ConstructorSymbolKind(constructor)):
+			match localize_module_types_list(owner_path, constructor.field_types):
+				Some(field_types):
+					{ symbol |
+						kind = ConstructorSymbolKind({ constructor | field_types = field_types })
+					}
+				None:
+					symbol
+		_:
+			symbol
 
 
 ---
@@ -905,10 +934,7 @@ pure func accepted_union_find(
 	table = table_rep(representation.table)
 	locator ?= union_locator_for_name(representation, table, name)
 
-	if locator.owner_local:
-		localized_entry(table, locator.union_index, representation.owner_module_path)
-	else:
-		table.unions.get(locator.union_index)
+	localized_entry(table, locator.union_index, representation.owner_module_path)
 
 
 pure func accepted_union_contains(authority: AcceptedUnionAuthority, name: String) -> Bool:
@@ -919,26 +945,41 @@ pure func accepted_union_contains(authority: AcceptedUnionAuthority, name: Strin
 private pure func constructor_symbol_from_locator(
 	table: AcceptedUnionTableRep,
 	locator: AcceptedUnionConstructorLocator,
-	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]],
+	representation: AcceptedUnionAuthorityRep,
 ) -> Option[Symbol]:
 	match locator.owner_local:
 		True:
-			local_constructor_symbols_by_union_index
+			representation.local_constructor_symbols_by_union_index
 				.get(locator.union_index)
 				.and_then(func(symbols): symbols.get(locator.variant_index))
 		False:
-			table.canonical_constructor_symbols
+			found = table.canonical_constructor_symbols
 				.get(locator.union_index)
 				.and_then(func(symbols): symbols.get(locator.variant_index))
+
+			-- Matched rather than mapped so an unchanged symbol allocates nothing.
+			match found:
+				Some(symbol):
+					localized = localized_constructor_symbol(
+						representation.owner_module_path,
+						symbol,
+					)
+
+					if same_object(localized, symbol):
+						found
+					else:
+						Some(localized)
+				None:
+					None
 
 
 private pure func first_constructor_symbol(
 	table: AcceptedUnionTableRep,
 	locators: Option[List[AcceptedUnionConstructorLocator]],
-	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]],
+	representation: AcceptedUnionAuthorityRep,
 ) -> Option[Symbol]:
 	locator ?= locators.and_then(func(entries): entries.get(0))
-	constructor_symbol_from_locator(table, locator, local_constructor_symbols_by_union_index)
+	constructor_symbol_from_locator(table, locator, representation)
 
 
 pure func accepted_union_find_constructor_symbol(
@@ -951,7 +992,7 @@ pure func accepted_union_find_constructor_symbol(
 	match first_constructor_symbol(
 		table,
 		representation.visible_constructors_by_source_name.get(name),
-		representation.local_constructor_symbols_by_union_index,
+		representation,
 	):
 		Some(symbol):
 			Some(symbol)
@@ -959,7 +1000,7 @@ pure func accepted_union_find_constructor_symbol(
 			first_constructor_symbol(
 				table,
 				table.builtin_constructors_by_name.get(name),
-				{},
+				representation,
 			)
 
 
@@ -967,7 +1008,7 @@ private pure func constructor_symbol_for_parent(
 	table: AcceptedUnionTableRep,
 	locators: Option[List[AcceptedUnionConstructorLocator]],
 	parent_type: String,
-	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]],
+	representation: AcceptedUnionAuthorityRep,
 ) -> Option[Symbol]:
 	var result: Option[Symbol] = None
 
@@ -975,11 +1016,7 @@ private pure func constructor_symbol_for_parent(
 		Some(entries):
 			for locator in entries:
 				if result.is_none():
-					match constructor_symbol_from_locator(
-						table,
-						locator,
-						local_constructor_symbols_by_union_index,
-					):
+					match constructor_symbol_from_locator(table, locator, representation):
 						Some(symbol):
 							match symbol.kind:
 								ConstructorSymbolKind(constructor):
@@ -1008,7 +1045,7 @@ pure func accepted_union_find_constructor_symbol_for_parent(
 		table,
 		representation.visible_constructors_by_source_name.get(name),
 		resolved_parent,
-		representation.local_constructor_symbols_by_union_index,
+		representation,
 	):
 		Some(symbol):
 			Some(symbol)
@@ -1017,7 +1054,7 @@ pure func accepted_union_find_constructor_symbol_for_parent(
 				table,
 				table.builtin_constructors_by_name.get(name),
 				resolved_parent,
-				{},
+				representation,
 			)
 
 
@@ -1072,7 +1109,7 @@ private pure func accepted_union_find_module_constructor_symbol(
 	first_constructor_symbol(
 		table,
 		module_constructor_locators(table, module_path, name),
-		{},
+		representation,
 	)
 
 
