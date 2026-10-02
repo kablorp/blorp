@@ -578,6 +578,19 @@ echo "PASS: scripts/test compiles all selected runtime roots once"
 mkdir -p "$TMP_HARNESS/blorp/test/runtime/memory/leak_check_baselines"
 : > "$TMP_HARNESS/blorp/test/runtime/memory/leak_check_baselines/isolated_example.brp"
 
+# The leak gate's totals follow its isolated case list: one launch per case,
+# plus the combined suite and the diagnostics run. Read the list from
+# scripts/test so adding a case does not break these expectations.
+leak_isolated_case_count=$(sed -n '/^leak_isolated_dispatch_cases=(/,/^)/p' scripts/test \
+	| grep -cE '^[[:space:]]+[a-z0-9_]+$')
+if [ "$leak_isolated_case_count" -lt 1 ]; then
+	echo "FAIL: could not read leak_isolated_dispatch_cases from scripts/test"
+	exit 1
+fi
+leak_runs_beside_isolated_cases=2
+leak_check_total=$((leak_isolated_case_count + leak_runs_beside_isolated_cases))
+leak_check_passed_with_one_failure=$((leak_check_total - 1))
+
 leak_output_file="$TMP_HARNESS/leak-output.txt"
 (
 	cd "$TMP_HARNESS" || exit 1
@@ -629,14 +642,14 @@ fi
 echo "PASS: scripts/test leak links the isolated leak-baseline programs into one dispatch binary"
 
 if ! grep -Fxq 'Diagnostic results: 1 passed, 0 failed' "$leak_output_file" \
-	|| ! grep -Fxq 'Results: 22 passed, 0 failed (22 leak checks)' "$leak_output_file"
+	|| ! grep -Fxq "Results: ${leak_check_total} passed, 0 failed (${leak_check_total} leak checks)" "$leak_output_file"
 then
 	echo "FAIL: scripts/test leak should distinguish its diagnostic subtotal from the combined result"
 	cat "$leak_output_file"
 	exit 1
 fi
 
-if ! grep -Fq -- '-- Leak-Check Isolated Programs (one link, 20 launches) --' "$leak_output_file"; then
+if ! grep -Fq -- "-- Leak-Check Isolated Programs (one link, ${leak_isolated_case_count} launches) --" "$leak_output_file"; then
 	echo "FAIL: scripts/test leak should report the isolated dispatch launch count"
 	cat "$leak_output_file"
 	exit 1
@@ -654,7 +667,7 @@ missing_diag_output="$TMP_HARNESS/missing-diag-output.txt"
 ) > "$missing_diag_output" 2>&1
 missing_diag_status=$?
 if [ "$missing_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+21[[:space:]]+1[[:space:]]+22' \
+	|| ! grep -Eq "Leak-check[[:space:]]+FAIL[[:space:]]+${leak_check_passed_with_one_failure}[[:space:]]+1[[:space:]]+${leak_check_total}" \
 		"$missing_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject missing diagnostic verdicts"
@@ -675,7 +688,7 @@ malformed_diag_output="$TMP_HARNESS/malformed-diag-output.txt"
 ) > "$malformed_diag_output" 2>&1
 malformed_diag_status=$?
 if [ "$malformed_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+21[[:space:]]+1[[:space:]]+22' \
+	|| ! grep -Eq "Leak-check[[:space:]]+FAIL[[:space:]]+${leak_check_passed_with_one_failure}[[:space:]]+1[[:space:]]+${leak_check_total}" \
 		"$malformed_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject malformed diagnostic verdicts"
@@ -693,7 +706,7 @@ duplicate_diag_output="$TMP_HARNESS/duplicate-diag-output.txt"
 ) > "$duplicate_diag_output" 2>&1
 duplicate_diag_status=$?
 if [ "$duplicate_diag_status" -eq 0 ] \
-	|| ! grep -Eq 'Leak-check[[:space:]]+FAIL[[:space:]]+21[[:space:]]+1[[:space:]]+22' \
+	|| ! grep -Eq "Leak-check[[:space:]]+FAIL[[:space:]]+${leak_check_passed_with_one_failure}[[:space:]]+1[[:space:]]+${leak_check_total}" \
 		"$duplicate_diag_output"
 then
 	echo "FAIL: scripts/test leak should reject duplicate diagnostic verdicts"

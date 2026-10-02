@@ -21,28 +21,27 @@ class CancellationIdentityReuseTests(unittest.TestCase):
             source.count("identity_index(functions.map(function_identity))"),
             1,
         )
+        # The one index reaches every consumer: each function's facts, the
+        # function analysis (through those facts) and each global initializer.
         self.assertRegex(
             source,
             re.compile(
-                r"private\s+pure\s+func\s+analyze_function_cancellation\(\s*"
-                r"functions:\s*List\[CoreFunction\],\s*"
-                r"identities:\s*CancellationIdentityIndex,\s*"
-                r"\)\s*->\s*List\[CancellationFunctionSummary\]:"
+                r"facts:\s*List\[CancellationCallableFacts\]\s*=\s*functions\.map\(\s*"
+                r"func\(function_info\):\s*callable_facts\(function_info,\s*identities\),?\s*\)"
             ),
         )
         self.assertRegex(
             source,
             re.compile(
                 r"function_results:\s*List\[CancellationFunctionSummary\]\s*=\s*"
-                r"analyze_function_cancellation\(\s*"
-                r"functions,\s*identities,\s*\)"
+                r"analyze_function_cancellation\(\s*facts,?\s*\)"
             ),
         )
         self.assertRegex(
             source,
             re.compile(
-                r"global_initializer_summary\(\s*"
-                r"global,\s*identities,\s*summaries_by_def_id,\s*\)"
+                r"global_facts:\s*CancellationExprFacts\s*=\s*expression_cancellation_facts\(\s*"
+                r"global\.init,\s*identities,?\s*\)"
             ),
         )
 
