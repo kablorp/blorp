@@ -28,21 +28,28 @@ import:
 			CastExpr, VectorExpr, VarExpr, ConcurrentExpr, ConcurrentlyLoopExpr,
 			CooperativeCheckpointExpr, DetachExpr, ForChannelExpr, ForStreamExpr,
 			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, PreClosureDetachExpr,
-			SelectExpr,
+			SelectExpr, TailrecListSpreadRecurExpr, TailrecRecurExpr, TupleConstructExpr,
+			ListConstructExpr, TensorBoxedLiteralExpr, DictConstructExpr,
 		),
 		CoreFunction,
 		CoreGlobal,
+		CoreParam,
 		CoreProgram,
 		CoreRecordCowField,
 		CoreRecordFieldValue,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy, ArcReleasePolicy, NoReleasePolicy, StackResultReleasePolicy,
 		),
+		CoreTupleElement(
+			TupleFloat16Element, TupleFloat32Element, TupleFloatElement, TuplePointerElement,
+			TuplePrimElement, TupleStackResultElement, TupleStructElement, TupleVoidElement,
+		),
 		CoreType(NamedType),
 		CoreVar,
 		core_expr_type,
 		core_var_equal,
 	ownership: OwnershipCallContract, arg_consumes_caller, builtin_contract, intrinsic_contract
+	release_mask: release_mask_word_has_bit
 	traverse as CoreTraverse
 	type_policy as CoreTypePolicy
 
@@ -171,11 +178,66 @@ record CancellationMatchScrutineeProtection {
 }
 
 
+---
+How a function receives one parameter. A caller lends a borrowed parameter:
+it keeps the reference and the cleanup slot that counts it. A caller hands
+over an owned parameter (the call's `UserCall` consumed arguments): it gives
+up its slot for the argument at the call, so from entry the callee is the
+only owner and the only one that can release the reference if the task is
+cancelled. See `cancellation_function_parameters`.
+---
+union CancellationParameter:
+	BorrowedCancellationParameter(CoreParam)
+	OwnedCancellationParameter(CoreParam)
+
+
+--- The cleanup slot a function pushes for one of its parameters at entry.
+record CancellationEntrySlot {
+	owner_id: CancellationOwnerId,
+	slot_id: CancellationSlotId
+}
+
+
+---
+The planner's decision for one parameter of the function it plans. A lent
+parameter has no slot, so no `DUP`, `DROP` or move of it may duplicate or
+pop one. An owned parameter has an entry slot only under the rule for a
+`let`-bound owner: its type has a cleanup action, the function can still be
+cancelled while the parameter owns its reference, and no move hands the
+reference on before that. As for a `let`, the emitter renders the slot's
+release from the parameter's type.
+---
+union CancellationParameterProtection:
+	LentParameterProtection(CoreParam)
+	OwnedParameterProtection(CoreParam, Option[CancellationEntrySlot])
+
+
+pure func cancellation_protected_parameter(
+	protection: CancellationParameterProtection,
+) -> CoreParam:
+	match protection:
+		LentParameterProtection(param):
+			param
+		OwnedParameterProtection(param, _):
+			param
+
+
+pure func cancellation_parameter_entry_slot(
+	protection: CancellationParameterProtection,
+) -> Option[CancellationEntrySlot]:
+	match protection:
+		LentParameterProtection(_):
+			None
+		OwnedParameterProtection(_, entry_slot):
+			entry_slot
+
+
 record CancellationProtectionPlan {
 	activation: CancellationActivationIdentity,
 	effect: CoreCancellationEffect,
 	max_live_slots: Int,
 	let_protections_by_name: Dict[String, List[CancellationLetProtection]],
+	parameter_protections: List[CancellationParameterProtection],
 	match_scrutinee_protections: List[CancellationMatchScrutineeProtection],
 	match_scrutinee_protections_by_id: Option[Dict[Int, List[CancellationMatchScrutineeProtection]]],
 	planned_owner_count: Int,
@@ -245,7 +307,10 @@ private record CancellationPlanAnalysis {
 	match_scrutinee_protections: List[CancellationMatchScrutineeProtection],
 	max_live_slots: Int,
 	next_site: Int,
-	next_owner: Int
+	next_owner: Int,
+	-- Whether the subtree stores a new value into one of the planned
+	-- function's parameters (see `expr_rebinds_parameter`).
+	rebinds_parameter: Bool
 }
 
 
@@ -411,10 +476,18 @@ private pure func cancellation_call_argument_has_entry_handoff(
 ) -> Bool:
 	match kind:
 		UserCall(_, _, _):
-			-- Final Core does not yet retain the callee's parameter-ownership
-			-- contract, and the runtime cannot transfer a cleanup frame between
-			-- caller and callee slots. A consumed_args entry alone cannot prove
-			-- entry handoff.
+			-- The runtime cannot move a cleanup frame from the caller's slot to
+			-- the callee's. The caller keeps its argument's slot up to the call
+			-- and pops it there; a callee that can be cancelled while it owns the
+			-- parameter pushes its own slot at entry
+			-- (`plan_parameter_protections`). Follow-up
+			-- (docs/issues/caller-pushes-then-pops-handed-over-argument.md):
+			-- count a consumed `UserCall` argument as an entry hand-off, so a
+			-- local whose last use is that call before any cancellation point
+			-- gets no push-then-pop pair. Its precondition is that every
+			-- callee owning a handed-over parameter protects it from entry,
+			-- which the entry slots now do, and the late invariant that every
+			-- call of a callee hands over the same arguments.
 			False
 		_:
 			-- Non-user ownership contracts describe the runtime ABI itself, so a
@@ -466,7 +539,9 @@ constructor stores each operand without a retain (aggregate construction
 transfers field owners into the aggregate, and Perceus balanced the operands
 as constructor-call arguments before they were lowered to these nodes). A
 record update consumes its source and each replacement, and a reuse
-construction consumes the value whose allocation it reuses. Either way a
+construction consumes the value whose allocation it reuses. A tuple, list,
+tensor or dictionary literal takes over the elements it stores without a
+retain. Either way a
 variable operand hands a reference to the new value at the moment it is
 built. A tracked variable's cleanup slot must give up that reference there,
 or cancellation releases it once through the variable and again through the
@@ -493,8 +568,79 @@ pure func cancellation_construct_transferred_operands(expr: CoreExpr) -> List[Co
 						void
 
 			operands
+		TupleConstructExpr(construct, _, _):
+			tuple_transferred_operands(
+				construct.elements,
+				construct.release_mask,
+				construct.retain_mask,
+			)
+		ListConstructExpr(construct, _, _):
+			owned_boxed_storage_operands(construct.elements)
+		TensorBoxedLiteralExpr(literal, _, _):
+			owned_boxed_storage_operands(literal.elements)
+		DictConstructExpr(construct, _, _):
+			var operands: List[CoreExpr] = []
+
+			for entry in construct.entries:
+				operands = operands.concat(owned_boxed_storage_operands([entry.key, entry.value]))
+
+			operands
 		_:
 			[]
+
+
+---
+A prepared tuple owns the slots in its release mask and retains those in its
+retain mask (a value read out of another owner). A slot it owns without
+retaining took the operand's own reference.
+---
+private pure func tuple_transferred_operands(
+	elements: List[CoreTupleElement],
+	release_mask: Int,
+	retain_mask: Int,
+) -> List[CoreExpr]:
+	var operands: List[CoreExpr] = []
+	var index: Int = 0
+
+	for element in elements:
+		if (
+			release_mask_word_has_bit(release_mask, index)
+			and not release_mask_word_has_bit(retain_mask, index)
+		):
+			match tuple_element_value(element):
+				Some(value):
+					operands = operands.append(value)
+				None:
+					void
+
+		index += 1
+
+	operands
+
+
+private pure func tuple_element_value(element: CoreTupleElement) -> Option[CoreExpr]:
+	match element:
+		TuplePrimElement(value) | TuplePointerElement(value) | TupleStructElement(value, _) | TupleStackResultElement(value) | TupleFloatElement(value) | TupleFloat32Element(value) | TupleFloat16Element(value):
+			Some(value)
+		TupleVoidElement:
+			None
+
+
+---
+The values a list, tensor or dictionary literal takes over: it retains a
+value stored without `transfers_ownership`, and that operand keeps its own
+reference.
+---
+private pure func owned_boxed_storage_operands(
+	values: List[CoreBoxedStorageValue],
+) -> List[CoreExpr]:
+	var operands: List[CoreExpr] = []
+
+	for value in values:
+		if value.transfers_ownership:
+			operands = operands.append(value.value)
+
+	operands
 
 
 private pure func record_field_operands(fields: List[CoreRecordFieldValue]) -> List[CoreExpr]:
@@ -719,7 +865,7 @@ private pure func analyzed_consumed_vars(
 			collection_equality_vars(op, left, right)
 		TupleExpr(_, _, _) | VectorExpr(_, _, _) | DictExpr(_, _, _):
 			merge_child_vars(children, func(child): child.consumed)
-		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | RecordConstructExpr(_, _, _, _) | RecordExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _):
+		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | RecordConstructExpr(_, _, _, _) | RecordExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | TupleConstructExpr(_, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _):
 			merge_vars(
 				merge_child_vars(children, func(child): child.consumed),
 				construct_transferred_vars(expr),
@@ -749,7 +895,7 @@ private pure func analyzed_consumed_before_suspension_vars(
 			-- leave the variable untracked while it still owns a reference
 			-- across a later suspension.
 			remove_var(child_facts(children, 0).consumed_before_suspension, variable)
-		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | RecordConstructExpr(_, _, _, _) | RecordExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _):
+		UnionConstructExpr(_, _, _) | UnionReuseConstructExpr(_, _, _) | RecordConstructExpr(_, _, _, _) | RecordExpr(_, _, _) | RecordReuseExpr(_, _, _, _) | RecordCowUpdateExpr(_, _, _, _) | TupleConstructExpr(_, _, _) | ListConstructExpr(_, _, _) | TensorBoxedLiteralExpr(_, _, _) | DictConstructExpr(_, _, _):
 			-- Operands are evaluated first and the construction or update takes
 			-- them over last, so a variable operand moves before any suspension
 			-- only when no operand can suspend.
@@ -954,6 +1100,25 @@ private pure func match_expr_has_plannable_scrutinee(expr: CoreExpr) -> Bool:
 			False
 
 
+---
+Whether `expr` itself stores a new value into a parameter's C variable: a
+self-tail call lowered to a loop reassigns every parameter on each
+iteration, and an assignment can name a parameter. A cleanup frame records
+the value it was pushed with, so an entry slot would release the first
+value after the function had already handed it on. A function that rebinds
+a parameter keeps its owned parameters unprotected, as a `var` reassigned in
+a loop is today (docs/issues/cancelled-loop-var-record-leaks.md).
+---
+private pure func expr_rebinds_parameter(expr: CoreExpr, parameters: List[CoreVar]) -> Bool:
+	match expr:
+		TailrecRecurExpr(_, _, _) | TailrecListSpreadRecurExpr(_, _, _, _):
+			True
+		AssignExpr(variable, _, _, _):
+			vars_contain(parameters, variable)
+		_:
+			False
+
+
 private pure func analyze_current_behavior_expr(
 	expr: CoreExpr,
 	next_site: Int,
@@ -961,6 +1126,7 @@ private pure func analyze_current_behavior_expr(
 	activation: CancellationActivationIdentity,
 	mode: CancellationPlanningMode,
 	forced_match_scrutinees: List[CoreVar],
+	parameters: List[CoreVar],
 ) -> CancellationPlanAnalysis:
 	current_site: CancellationSiteId = cancellation_site_id(next_site)
 
@@ -987,6 +1153,7 @@ private pure func analyze_current_behavior_expr(
 	var body_live_slots: Int = 0
 	var match_branch_live_slots: Int = 0
 	var match_branch_may_cancel: Bool = False
+	var rebinds_parameter: Bool = expr_rebinds_parameter(expr, parameters)
 	var child_index: Int = 0
 
 	for child_expr in CoreTraverse.immediate_core_expr_children(expr):
@@ -997,8 +1164,10 @@ private pure func analyze_current_behavior_expr(
 			activation,
 			mode,
 			forced_match_scrutinees,
+			parameters,
 		)
 		children = children.append(child_analysis.facts)
+		rebinds_parameter = rebinds_parameter or child_analysis.rebinds_parameter
 		protections = append_child_results(protections, child_analysis.let_protections)
 
 		-- Most subtrees contain no managed match scrutinee. Avoid allocating an
@@ -1138,12 +1307,25 @@ private pure func analyze_current_behavior_expr(
 		match_scrutinee_protections = match_protections,
 		max_live_slots = max_live_slots,
 		next_site = child_site,
-		next_owner = child_owner
+		next_owner = child_owner,
+		rebinds_parameter = rebinds_parameter
 	}
 
 
+---
+The plan for code with no parameters, such as a global initializer: every
+local it can protect is bound inside `body`.
+---
 pure func build_current_behavior_cancellation_plan(
 	activation: CancellationActivationIdentity,
+	body: CoreExpr,
+) -> CancellationProtectionPlan:
+	build_current_behavior_function_cancellation_plan(activation, [], body)
+
+
+pure func build_current_behavior_function_cancellation_plan(
+	activation: CancellationActivationIdentity,
+	parameters: List[CancellationParameter],
 	body: CoreExpr,
 ) -> CancellationProtectionPlan:
 	analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(
@@ -1153,21 +1335,118 @@ pure func build_current_behavior_cancellation_plan(
 		activation,
 		CurrentBehaviorCancellationPlanning,
 		[],
+		cancellation_parameter_vars(parameters),
 	)
 
 	protection_plan_from_analysis(
 		activation,
 		MayCancelCurrentTask,
 		analysis,
+		plan_parameter_protections(CurrentBehaviorCancellationPlanning, parameters, analysis),
 		index_match_scrutinee_protections(analysis.match_scrutinee_protections),
 		analysis.next_site,
 	)
+
+
+private record CancellationParameterPlan {
+	protections: List[CancellationParameterProtection],
+	entry_slot_count: Int,
+	next_owner: Int
+}
+
+
+---
+The `let` rule from `analyze_current_behavior_expr`, with the whole function
+body as the `let` body: an owned parameter needs a slot when its type has a
+cleanup action and the function may be cancelled while the parameter still
+owns its reference, which a direct return or a hand-off before any
+cancellation point rules out.
+---
+private pure func owned_parameter_needs_entry_slot(
+	parameter: CoreParam,
+	body_facts: CancellationOwnershipFacts,
+	mode: CancellationPlanningMode,
+) -> Bool:
+	has_cleanup_action: Bool = cancellation_cleanup_action_for_release_policy(
+		CoreTypePolicy.cleanup_release_policy_for_type(parameter.typ),
+	).is_some()
+
+	handed_on: Bool = (
+		vars_contain(body_facts.direct_returns, parameter.name)
+		or vars_contain(body_facts.consumed_before_suspension, parameter.name)
+	)
+
+	crosses_cancellation: Bool = match mode:
+		CurrentBehaviorCancellationPlanning:
+			True
+		RegionSensitiveCancellationPlanning(_, _):
+			body_facts.may_cancel
+
+	has_cleanup_action and not handed_on and crosses_cancellation
+
+
+private pure func cancellation_parameter_vars(
+	parameters: List[CancellationParameter],
+) -> List[CoreVar]:
+	var variables: List[CoreVar] = []
+
+	for parameter in parameters:
+		match parameter:
+			BorrowedCancellationParameter(param):
+				variables = variables.append(param.name)
+			OwnedCancellationParameter(param):
+				variables = variables.append(param.name)
+
+	variables
+
+
+---
+Decides every parameter's entry slot after the body has been analyzed, so
+the slot owners are numbered after the body's and before any backend
+temporary's (`cancellation_backend_temporary_candidate` numbers from
+`planned_owner_count`).
+---
+private pure func plan_parameter_protections(
+	mode: CancellationPlanningMode,
+	parameters: List[CancellationParameter],
+	analysis: CancellationPlanAnalysis,
+) -> CancellationParameterPlan:
+	var protections: List[CancellationParameterProtection] = []
+	var entry_slot_count: Int = 0
+	var next_owner: Int = analysis.next_owner
+
+	for parameter in parameters:
+		match parameter:
+			BorrowedCancellationParameter(param):
+				protections = protections.append(LentParameterProtection(param))
+			OwnedCancellationParameter(param):
+				var entry_slot: Option[CancellationEntrySlot] = None
+
+				if (
+					not analysis.rebinds_parameter
+					and owned_parameter_needs_entry_slot(param, analysis.facts, mode)
+				):
+					entry_slot = Some({
+						owner_id = cancellation_owner_id(next_owner),
+						slot_id = cancellation_slot_id(next_owner),
+					})
+					next_owner += 1
+					entry_slot_count += 1
+
+				protections = protections.append(OwnedParameterProtection(param, entry_slot))
+
+	{
+		protections = protections,
+		entry_slot_count = entry_slot_count,
+		next_owner = next_owner
+	}
 
 
 private pure func protection_plan_from_analysis(
 	activation: CancellationActivationIdentity,
 	effect: CoreCancellationEffect,
 	analysis: CancellationPlanAnalysis,
+	parameter_plan: CancellationParameterPlan,
 	match_index: Option[Dict[Int, List[CancellationMatchScrutineeProtection]]],
 	expression_visits: Int,
 ) -> CancellationProtectionPlan:
@@ -1183,14 +1462,17 @@ private pure func protection_plan_from_analysis(
 			bucket.append(protection),
 		)
 
+	-- Entry slots stay pushed while the whole body runs, so they add to the
+	-- body's own peak.
 	{
 		activation = activation,
 		effect = effect,
-		max_live_slots = analysis.max_live_slots,
+		max_live_slots = analysis.max_live_slots + parameter_plan.entry_slot_count,
 		let_protections_by_name = protections_by_name,
+		parameter_protections = parameter_plan.protections,
 		match_scrutinee_protections = analysis.match_scrutinee_protections,
 		match_scrutinee_protections_by_id = match_index,
-		planned_owner_count = analysis.next_owner,
+		planned_owner_count = parameter_plan.next_owner,
 		expression_visits = expression_visits
 	}
 
@@ -1257,8 +1539,18 @@ pure func build_current_behavior_cancellation_plan_with_summary(
 	{ plan | effect = cancellation_summary_effect(summary) }
 
 
+--- The region-sensitive plan for code with no parameters, such as a global initializer.
 pure func build_region_sensitive_cancellation_plan(
 	activation: CancellationActivationIdentity,
+	body: CoreExpr,
+	program_summary: CancellationProgramSummary,
+) -> CancellationProtectionPlan:
+	build_region_sensitive_function_cancellation_plan(activation, [], body, program_summary)
+
+
+pure func build_region_sensitive_function_cancellation_plan(
+	activation: CancellationActivationIdentity,
+	parameters: List[CancellationParameter],
 	body: CoreExpr,
 	program_summary: CancellationProgramSummary,
 ) -> CancellationProtectionPlan:
@@ -1266,6 +1558,7 @@ pure func build_region_sensitive_cancellation_plan(
 		program_summary,
 		program_identity_index(program_summary),
 	)
+	parameter_vars: List[CoreVar] = cancellation_parameter_vars(parameters)
 	var analysis: CancellationPlanAnalysis = analyze_current_behavior_expr(
 		body,
 		0,
@@ -1273,6 +1566,7 @@ pure func build_region_sensitive_cancellation_plan(
 		activation,
 		mode,
 		[],
+		parameter_vars,
 	)
 	var match_index: Option[Dict[Int, List[CancellationMatchScrutineeProtection]]] = index_match_scrutinee_protections(
 		analysis.match_scrutinee_protections,
@@ -1295,6 +1589,7 @@ pure func build_region_sensitive_cancellation_plan(
 			activation,
 			mode,
 			forced_match_scrutinees,
+			parameter_vars,
 		)
 		match_index = index_match_scrutinee_protections(analysis.match_scrutinee_protections)
 		expression_visits += analysis.next_site
@@ -1315,6 +1610,7 @@ pure func build_region_sensitive_cancellation_plan(
 		activation,
 		cancellation_summary_effect(activation_summary),
 		analysis,
+		plan_parameter_protections(mode, parameters, analysis),
 		match_index,
 		expression_visits,
 	)
@@ -1354,6 +1650,46 @@ pure func cancellation_let_protection(
 			None
 
 
+---
+The decision for `variable` when it is one of the planned function's
+parameters. A function has few parameters, so a scan is cheaper than an index.
+---
+pure func cancellation_parameter_protection(
+	plan: CancellationProtectionPlan,
+	variable: CoreVar,
+) -> Option[CancellationParameterProtection]:
+	var found: Option[CancellationParameterProtection] = None
+
+	for protection in plan.parameter_protections:
+		if (
+			found.is_none()
+			and core_var_equal(cancellation_protected_parameter(protection).name, variable)
+		):
+			found = Some(protection)
+
+	found
+
+
+--- The parameters the planned function pushes an entry slot for, in order.
+pure func cancellation_parameters_with_entry_slots(
+	plan: CancellationProtectionPlan,
+) -> List[CoreParam]:
+	var parameters: List[CoreParam] = []
+
+	if cancellation_plan_requires_local_owner_protection(plan):
+		for protection in plan.parameter_protections:
+			if cancellation_parameter_entry_slot(protection).is_some():
+				parameters = parameters.append(cancellation_protected_parameter(protection))
+
+	parameters
+
+
+---
+Whether `variable` may hold a pushed cleanup slot, so a move, `DROP` or
+consuming use of it must pop one. A planned `let` or parameter answers from
+its decision. Any other local stays conservative and answers True: a
+backend-tracked closure capture, for one, is pushed by the emitter.
+---
 pure func cancellation_variable_requires_protection(
 	plan: CancellationProtectionPlan,
 	variable: CoreVar,
@@ -1365,19 +1701,23 @@ pure func cancellation_variable_requires_protection(
 			Some(protection):
 				protection.tracks_cleanup
 			None:
-				True
+				match cancellation_parameter_protection(plan, variable):
+					Some(protection):
+						cancellation_parameter_entry_slot(protection).is_some()
+					None:
+						True
 
 
 ---
 Whether the plan's own bookkeeping proves a push_with_task will be emitted
 somewhere in this function for this exact variable identity (id and
-def_id), via either the let-binding protection index or the
-match-scrutinee protection index -- the two places the planner records a
-push registration keyed by CoreVar identity. Unlike
+def_id), via the let-binding protection index, the parameter decisions, or
+the match-scrutinee protection index -- the three places the planner records
+a push registration keyed by CoreVar identity. Unlike
 `cancellation_variable_requires_protection`, an unmatched identity returns
 False here, not the conservative True: a Core-level `DupExpr.dup_var` can
-only ever be (a) a variable some LetExpr or match arm in this same function
-binds, in which case one of these two indexes has it, or (b) a variable
+only ever be (a) a parameter of this function or a variable some LetExpr or
+match arm in it binds, in which case one of these three has it, or (b) a variable
 invented solely to hold this DupExpr's own wrapped subexpression, used
 nowhere else in the tree, which by construction nothing can have pushed.
 Backend-invented rendering temporaries (borrowed call arguments, `__cdrop_`
@@ -1397,7 +1737,11 @@ pure func cancellation_variable_push_is_recorded(
 			Some(protection):
 				protection.tracks_cleanup
 			None:
-				False
+				match cancellation_parameter_protection(plan, variable):
+					Some(protection):
+						cancellation_parameter_entry_slot(protection).is_some()
+					None:
+						False
 
 		if let_tracked:
 			True
@@ -1555,26 +1899,44 @@ record CancellationGlobalInitializerSummary {
 }
 
 
+---
+`owned_parameter_indices_by_def_id` is derived, read-only, from the
+`UserCall` consumed arguments in the program: for each callee `def_id`, the
+parameter positions some call hands over. The ownership contracts pass writes
+those lists from each callee's solved contract, and the emitter pops the
+caller's cleanup slot for exactly those arguments, so reading them here makes
+a callee push a slot for a parameter exactly when its callers give theirs up.
+---
 record CancellationProgramSummary {
 	functions: List[CancellationFunctionSummary],
 	global_initializers: List[CancellationGlobalInitializerSummary],
 	functions_by_def_id: Dict[Int, CancellationFunctionSummary],
 	global_initializers_by_def_id: Dict[Int, CancellationGlobalInitializerSummary],
 	function_identities_by_def_id: Dict[Int, CoreDefinitionIdentity],
-	function_identity_collisions_by_def_id: Dict[Int, Bool]
+	function_identity_collisions_by_def_id: Dict[Int, Bool],
+	owned_parameter_indices_by_def_id: Dict[Int, List[Int]]
+}
+
+
+--- A resolved call that hands the arguments at `parameter_indices` to `callee`.
+private record CancellationParameterHandOff {
+	callee: CoreDefinitionIdentity,
+	parameter_indices: List[Int]
 }
 
 
 private record CancellationCallableFacts {
 	identity: CoreDefinitionIdentity,
 	local_summary: CancellationSummary,
-	callees: List[CoreDefinitionIdentity]
+	callees: List[CoreDefinitionIdentity],
+	hand_offs: List[CancellationParameterHandOff]
 }
 
 
 private record CancellationExprFacts {
 	local_summary: CancellationSummary,
-	callees: List[CoreDefinitionIdentity]
+	callees: List[CoreDefinitionIdentity],
+	hand_offs: List[CancellationParameterHandOff]
 }
 
 
@@ -2027,6 +2389,7 @@ private pure func expression_cancellation_facts(
 ) -> CancellationExprFacts:
 	var summary: CancellationSummary = NO_CANCELLATION
 	var callees: List[CoreDefinitionIdentity] = []
+	var hand_offs: List[CancellationParameterHandOff] = []
 	var pending: List[CoreExpr] = [root]
 	var cursor: Int = 0
 
@@ -2044,6 +2407,16 @@ private pure func expression_cancellation_facts(
 						summary = add_cancellation_reason(summary, reason)
 					CallableCall(identity):
 						callees = add_callee(callees, identity)
+
+						match kind:
+							UserCall(_, _, consumed_args):
+								if not consumed_args.is_empty():
+									hand_offs = hand_offs.append({
+										callee = identity,
+										parameter_indices = consumed_args,
+									})
+							_:
+								void
 			ForChannelExpr(_, _, _) | ForStreamExpr(_, _, _) | PreClosureConcurrentlyLoopExpr(_, _, _) | ConcurrentlyLoopExpr(_, _, _) | PreClosureConcurrentExpr(_, _, _) | ConcurrentExpr(_, _, _) | SelectExpr(_, _, _):
 				summary = add_cancellation_reason(summary, StructuredCancellationBoundary)
 			PreClosureDetachExpr(_, _, _) | DetachExpr(_, _, _):
@@ -2058,7 +2431,8 @@ private pure func expression_cancellation_facts(
 
 	{
 		local_summary = summary,
-		callees = callees
+		callees = callees,
+		hand_offs = hand_offs
 	}
 
 
@@ -2097,13 +2471,15 @@ private pure func callable_facts(
 			{
 				identity = identity,
 				local_summary = facts.local_summary,
-				callees = facts.callees
+				callees = facts.callees,
+				hand_offs = facts.hand_offs
 			}
 		None:
 			{
 				identity = identity,
 				local_summary = {reasons = [UnknownCallBoundary]},
-				callees = []
+				callees = [],
+				hand_offs = []
 			}
 
 
@@ -2131,12 +2507,8 @@ private pure func resolved_callable_summary(
 
 
 private pure func analyze_function_cancellation(
-	functions: List[CoreFunction],
-	identities: CancellationIdentityIndex,
+	facts: List[CancellationCallableFacts],
 ) -> List[CancellationFunctionSummary]:
-	facts: List[CancellationCallableFacts] = functions.map(
-		func(function_info): callable_facts(function_info, identities),
-	)
 	var summaries: Dict[Int, CancellationSummary] = {}
 	var callers_by_def_id: Dict[Int, List[CancellationCallableFacts]] = {}
 
@@ -2183,10 +2555,9 @@ private pure func analyze_function_cancellation(
 
 private pure func global_initializer_summary(
 	global: CoreGlobal,
-	identities: CancellationIdentityIndex,
+	facts: CancellationExprFacts,
 	function_summaries: Dict[Int, CancellationSummary],
 ) -> CancellationGlobalInitializerSummary:
-	facts: CancellationExprFacts = expression_cancellation_facts(global.init, identities)
 	var summary: CancellationSummary = facts.local_summary
 
 	for callee in facts.callees:
@@ -2203,13 +2574,49 @@ private pure func global_initializer_summary(
 	}
 
 
+---
+Adds one call's hand-offs to the per-callee index. The ownership contracts
+pass annotates every call of a callee from that callee's one contract, so
+the union is the contract. Calls that disagreed would mean a caller lending a
+parameter its callee consumes, an ownership error with or without
+cancellation.
+---
+private pure func add_parameter_hand_offs(
+	index: Dict[Int, List[Int]],
+	hand_offs: List[CancellationParameterHandOff],
+) -> Dict[Int, List[Int]]:
+	var result: Dict[Int, List[Int]] = index
+
+	for hand_off in hand_offs:
+		known: List[Int] = result.get_or(hand_off.callee.def_id, [])
+		var merged: List[Int] = known
+
+		for parameter_index in hand_off.parameter_indices:
+			if not merged.contains(parameter_index):
+				merged = merged.append(parameter_index)
+
+		if merged.length() != known.length():
+			result = result.set(hand_off.callee.def_id, merged)
+
+	result
+
+
 pure func analyze_program_cancellation(program: CoreProgram) -> CancellationProgramSummary:
 	functions: List[CoreFunction] = program_functions(program)
 	identities: CancellationIdentityIndex = identity_index(functions.map(function_identity))
-	function_results: List[CancellationFunctionSummary] = analyze_function_cancellation(
-		functions,
-		identities,
+	facts: List[CancellationCallableFacts] = functions.map(
+		func(function_info): callable_facts(function_info, identities),
 	)
+	function_results: List[CancellationFunctionSummary] = analyze_function_cancellation(facts)
+	var owned_parameter_indices_by_def_id: Dict[Int, List[Int]] = {}
+
+	for entry in facts:
+		if not entry.hand_offs.is_empty():
+			owned_parameter_indices_by_def_id = add_parameter_hand_offs(
+				owned_parameter_indices_by_def_id,
+				entry.hand_offs,
+			)
+
 	var summaries_by_def_id: Dict[Int, CancellationSummary] = {}
 	var function_results_by_def_id: Dict[Int, CancellationFunctionSummary] = {}
 
@@ -2223,9 +2630,20 @@ pure func analyze_program_cancellation(program: CoreProgram) -> CancellationProg
 	for decl in program.decls:
 		match decl:
 			GlobalDecl(global):
+				global_facts: CancellationExprFacts = expression_cancellation_facts(
+					global.init,
+					identities,
+				)
+
+				if not global_facts.hand_offs.is_empty():
+					owned_parameter_indices_by_def_id = add_parameter_hand_offs(
+						owned_parameter_indices_by_def_id,
+						global_facts.hand_offs,
+					)
+
 				result: CancellationGlobalInitializerSummary = global_initializer_summary(
 					global,
-					identities,
+					global_facts,
 					summaries_by_def_id,
 				)
 				global_results = global_results.append(result)
@@ -2242,8 +2660,37 @@ pure func analyze_program_cancellation(program: CoreProgram) -> CancellationProg
 		functions_by_def_id = function_results_by_def_id,
 		global_initializers_by_def_id = global_results_by_def_id,
 		function_identities_by_def_id = identities.by_def_id,
-		function_identity_collisions_by_def_id = identities.collisions_by_def_id
+		function_identity_collisions_by_def_id = identities.collisions_by_def_id,
+		owned_parameter_indices_by_def_id = owned_parameter_indices_by_def_id
 	}
+
+
+---
+How `function_info` receives each parameter: owned where some call in the
+program hands that argument over (see `CancellationProgramSummary`),
+borrowed otherwise.
+---
+pure func cancellation_function_parameters(
+	program_summary: CancellationProgramSummary,
+	function_info: CoreFunction,
+) -> List[CancellationParameter]:
+	owned_indices: List[Int] = program_summary.owned_parameter_indices_by_def_id.get_or(
+		function_info.def_id,
+		[],
+	)
+	var parameters: List[CancellationParameter] = []
+	var index: Int = 0
+
+	for param in function_info.params:
+		parameter: CancellationParameter = if owned_indices.contains(index):
+			OwnedCancellationParameter(param)
+		else:
+			BorrowedCancellationParameter(param)
+
+		parameters = parameters.append(parameter)
+		index += 1
+
+	parameters
 
 
 pure func cancellation_function_summary(

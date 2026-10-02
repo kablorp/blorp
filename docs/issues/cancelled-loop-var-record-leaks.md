@@ -31,9 +31,9 @@ func hold_then_sleep(seed: Int) -> Int:
 
 The same holds for a table threaded through a tuple-returning call
 (`(table, id) = table.intern(w)` in the loop): 4 objects leak. A record
-handed to an impure consuming callee that parks before returning also leaks
-when cancelled, but for a different reason: see
-`consuming-clone-owned-parameter-has-no-cleanup-slot.md`.
+handed to a consuming callee that parks before returning is a different
+case, fixed by giving the callee's owned parameter its own cleanup slot
+("Cancellation Cleanup Slots" in `docs/OWNERSHIP_MODEL.md`).
 
 ## Suspected cause
 

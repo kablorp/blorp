@@ -170,14 +170,34 @@ cancellation unwinds past it. A `DUP` of the local adds one
 local's references away pops one (`blorp_task_cleanup_pop_slot`): its `DROP`,
 a consuming call argument, a `let` or `var` whose right-hand side is the
 local (or `DUP v; v`), an operand that a union or record constructor takes
-over, and the source or a replacement of a record update or reuse
-construction. The pop runs before the new owner pushes its own slot, so each
+over, a tuple element or a list, tensor or dictionary literal element stored
+without a retain, and the source or a replacement of a record update or
+reuse construction. The pop runs before the new owner pushes its own slot, so each
 reference is counted by exactly one slot, and it runs even when the new owner
 is an untracked `var`: a unit left behind would be released again after the
 `var` has consumed or replaced the reference. The planner (`stage_09_core/cancellation_plan.brp`)
 gives a local no slot at all when its own reference is handed on before any
 cancellation point; a move under a `DUP` of the same local does not count,
 because the local keeps its own reference.
+
+Parameters follow the same rule, by how the caller passes them. A caller
+lends a borrowed parameter and keeps both the reference and the slot that
+counts it, so the callee never pushes, duplicates or pops a slot for it. A
+caller hands over an owned parameter (a consuming clone's, or any parameter
+ownership inference makes the callee consume) and pops its own slot for the
+argument at the call. The callee is then the only owner, so it gives the
+parameter a slot at entry under the rule above, with the whole body as the
+`let` body: it pushes one when the function can be cancelled, at a park or a
+cooperative loop checkpoint, before the parameter's reference is handed on.
+The runtime cannot move a frame from the caller's slot to the callee's; no
+cancellation point falls between the caller's pop and the callee's push, so
+each reference is still counted by one slot throughout. The planner reads
+which parameters are handed over from the program's `UserCall` consumed
+arguments, the lists the caller's pop is emitted from; a final-Core invariant
+(`DisagreeingUserCallContract`, under `--check-invariants`) requires every
+call of one function to hand over the same arguments. A function whose body
+rebinds its parameters (a self-tail call lowered to a loop) gets no entry
+slots, because a frame records the value it was pushed with.
 
 ## COW ABI
 

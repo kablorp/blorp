@@ -4,6 +4,7 @@
 -- recovery behavior. Final Core must be directly consumable by the backend;
 -- intermediate checks begin at the pass responsible for eliminating a form.
 import:
+	dict: Dict
 	erased_key_temps: is_erased_key_temp_marker
 	ir:
 		CoreCallKind(
@@ -84,6 +85,7 @@ union CoreLateInvariantViolation:
 	RawTensorViewKindMismatch(String, CoreSourceLoc)
 	CooperativeCheckpointMisplaced(CoreSourceLoc)
 	ManagedMatchScrutineeUnmaterialized(CoreSourceLoc)
+	DisagreeingUserCallContract(String, Int, List[Int], List[Int], CoreSourceLoc)
 
 
 pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> String:
@@ -142,6 +144,8 @@ pure func core_late_invariant_message(violation: CoreLateInvariantViolation) -> 
 			"cooperative checkpoint reached final Core outside a loop-entry position"
 		ManagedMatchScrutineeUnmaterialized(_):
 			"releasing match reached late Core without a named scrutinee owner"
+		DisagreeingUserCallContract(name, def_id, first, other, _):
+			"calls of `${name}` (definition ${def_id}) hand over arguments ${first} and ${other}; every call of a function must hand over the same arguments"
 
 
 private union DefinitionIdOwner:
@@ -1179,6 +1183,89 @@ private pure func checkpoint_program_violations(
 	violations
 
 
+private pure func int_lists_equal(left: List[Int], right: List[Int]) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var equal: Bool = True
+		var index: Int = 0
+
+		for value in left:
+			match right.get(index):
+				Some(other):
+					if other != value:
+						equal = False
+				None:
+					equal = False
+
+			index += 1
+
+		equal
+
+
+---
+Every `UserCall` of a function with a body carries that function's one
+ownership contract, as the ownership contracts pass writes it. The
+cancellation planner reads the handed-over parameters from these lists
+(`CancellationProgramSummary.owned_parameter_indices_by_def_id`), and the
+emitter pops each caller's cleanup slot from them, so two calls of one
+callee that disagree would leave a callee slot that some caller also keeps.
+---
+private pure func user_call_contract_violations(
+	program: CoreProgram,
+) -> List[CoreLateInvariantViolation]:
+	var bodied: Dict[Int, Bool] = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function):
+				if function.body.is_some():
+					bodied = bodied.set(function.def_id, True)
+			ImplDecl(impl):
+				for method in impl.methods:
+					if method.body.is_some():
+						bodied = bodied.set(method.def_id, True)
+			_:
+				void
+
+	var contracts: Dict[Int, List[Int]] = {}
+	var violations: List[CoreLateInvariantViolation] = []
+	var pending: List[CoreExpr] = program_expr_roots(program)
+	var index: Int = 0
+
+	while index < pending.length():
+		match pending.get(index):
+			Some(expr):
+				match expr:
+					CallExpr(UserCall(name, Some(def_id), consumed_args), _, _, _, loc):
+						if bodied.contains(def_id):
+							match contracts.get(def_id):
+								Some(first):
+									if not int_lists_equal(first, consumed_args):
+										violations = violations.append(
+											DisagreeingUserCallContract(
+												name,
+												def_id,
+												first,
+												consumed_args,
+												loc,
+											),
+										)
+								None:
+									contracts = contracts.set(def_id, consumed_args)
+					_:
+						void
+
+				for child in CoreTraverse.immediate_core_expr_children(expr):
+					pending = pending.append(child)
+			None:
+				break
+
+		index += 1
+
+	violations
+
+
 private pure func requires_materialized_record_updates(stage: CorePipelineStage) -> Bool:
 	match stage:
 		PerceusStage | PostDceTailStage | PostPerceusTailStage | PreClosureTailStage | ReuseStage | ClosureStage | PostClosureTailStage | PreDceTailStage | FinalStage:
@@ -1246,5 +1333,6 @@ pure func check_late_core_invariants(
 			)
 			.concat(raw_tensor_program_violations(program))
 			.concat(checkpoint_program_violations(program))
+			.concat(user_call_contract_violations(program))
 	else:
 		check_program_exprs(program, check_phase_expr)

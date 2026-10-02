@@ -31,6 +31,7 @@ import:
 			LetExpr,
 			LiteralExpr,
 			SeqExpr,
+			TailrecRecurExpr,
 			VarExpr,
 			VoidExpr,
 			WhileExpr,
@@ -42,6 +43,7 @@ import:
 		CoreHashContainerConstructor(GenericHashContainerConstructor),
 		CoreLiteral(BoolLiteral, StringLiteral),
 		CoreOperationResultLayoutPolicy(DefaultResultLayoutPolicy),
+		CoreParam,
 		CoreProgram,
 		CoreReleasePolicy(
 			ArcReleaseOnlyPolicy,
@@ -72,6 +74,7 @@ import:
 			RuntimeOwnedCancellationOwner,
 		),
 		CancellationOwnerIdentity(BackendTemporaryCancellationOwner),
+		CancellationParameter(OwnedCancellationParameter),
 		CancellationProgramSummary,
 		CancellationProtectionPlan,
 		CancellationReason(
@@ -89,18 +92,26 @@ import:
 		analyze_program_cancellation,
 		build_current_behavior_cancellation_plan,
 		build_current_behavior_cancellation_plan_with_summary,
+		build_current_behavior_function_cancellation_plan,
 		build_region_sensitive_cancellation_plan,
+		build_region_sensitive_function_cancellation_plan,
 		cancellation_backend_temporary_candidate,
 		cancellation_cleanup_action_for_release_policy,
 		cancellation_effect_may_cancel,
+		cancellation_function_parameters,
 		cancellation_function_summary,
 		cancellation_global_initializer_summary,
 		cancellation_let_protection,
 		cancellation_match_scrutinee_protection,
 		cancellation_owner_id_value,
+		cancellation_parameter_entry_slot,
+		cancellation_parameter_protection,
+		cancellation_parameters_with_entry_slots,
 		cancellation_plan_requires_local_owner_protection,
 		cancellation_site_id,
 		cancellation_site_id_value,
+		cancellation_variable_push_is_recorded,
+		cancellation_variable_requires_protection,
 		resource_cleanup_identity,
 		resource_cleanup_identity_value,
 		runtime_cleanup_identity,
@@ -1550,10 +1561,182 @@ pure func specialized_runtime_bridge_calls_fail_closed() -> Bool:
 	)
 
 
+private OWNED_PARAMETER_CALLEE_DEF_ID: Int = 310
+
+private OWNED_PARAMETER_CALLER_DEF_ID: Int = 311
+
+
+pure func owned_parameter_payload() -> CoreParam:
+	{
+		name = local_var("payload", 300),
+		typ = STRING_TYPE,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func drop_owned_parameter_then(rest: CoreExpr) -> CoreExpr:
+	DropExpr(
+		owned_parameter_payload().name,
+		STRING_TYPE,
+		ArcReleasePolicy,
+		rest,
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+
+
+---
+The plan for `keeper(payload)`, with `body`, in a program where `giver`
+calls it handing over the arguments at `consumed_args`.
+---
+pure func owned_parameter_plan(body: CoreExpr, consumed_args: List[Int]) -> CancellationProtectionPlan:
+	keeper: CoreFunction = { test_function("keeper", OWNED_PARAMETER_CALLEE_DEF_ID, body) |
+		params = [owned_parameter_payload()]
+	}
+	giver_body: CoreExpr = CallExpr(
+		UserCall("keeper", Some(OWNED_PARAMETER_CALLEE_DEF_ID), consumed_args),
+		VOID_EXPR,
+		[VarExpr(local_var("held", 301), STRING_TYPE, synthetic_core_source_loc())],
+		VoidType,
+		synthetic_core_source_loc(),
+	)
+	program: CoreProgram = program_with([
+		FunctionDecl(keeper),
+		function_decl("giver", OWNED_PARAMETER_CALLER_DEF_ID, giver_body),
+	])
+	summary: CancellationProgramSummary = analyze_program_cancellation(program)
+
+	build_region_sensitive_function_cancellation_plan(
+		FunctionCancellationActivation({
+			name = "keeper",
+			def_id = OWNED_PARAMETER_CALLEE_DEF_ID
+		}),
+		cancellation_function_parameters(summary, keeper),
+		body,
+		summary,
+	)
+
+
+pure func parameter_has_entry_slot(plan: CancellationProtectionPlan) -> Bool:
+	match cancellation_parameter_protection(plan, owned_parameter_payload().name):
+		Some(protection):
+			cancellation_parameter_entry_slot(protection).is_some()
+		None:
+			False
+
+
+---
+A caller hands `payload` over and the callee can be cancelled before it lets
+go of it, so the callee pushes an entry slot, numbered after the body's
+owners, and slot operations on `payload` are planned against it.
+---
+pure func region_plan_gives_handed_over_parameter_an_entry_slot() -> Bool:
+	plan: CancellationProtectionPlan = owned_parameter_plan(
+		SeqExpr(direct_runtime_call_expr("blorp_sleep"), drop_owned_parameter_then(VOID_EXPR)),
+		[0],
+	)
+	payload: CoreVar = owned_parameter_payload().name
+
+	(
+		parameter_has_entry_slot(plan)
+		and cancellation_parameters_with_entry_slots(plan).length() == 1
+		and cancellation_variable_requires_protection(plan, payload)
+		and cancellation_variable_push_is_recorded(plan, payload)
+		and plan.max_live_slots == 1
+		and plan.planned_owner_count == 1
+	)
+
+
+---
+A lent parameter's caller keeps its own slot, so the callee has none for it,
+and a slot operation on it is planned as absent instead of conservatively
+walking the cleanup stack.
+---
+pure func region_plan_gives_lent_parameter_no_slot() -> Bool:
+	plan: CancellationProtectionPlan = owned_parameter_plan(
+		SeqExpr(direct_runtime_call_expr("blorp_sleep"), VOID_EXPR),
+		[],
+	)
+	payload: CoreVar = owned_parameter_payload().name
+
+	(
+		plan.effect == MayCancelCurrentTask
+		and cancellation_parameter_protection(plan, payload).is_some()
+		and not parameter_has_entry_slot(plan)
+		and not cancellation_variable_requires_protection(plan, payload)
+		and not cancellation_variable_push_is_recorded(plan, payload)
+		and cancellation_parameters_with_entry_slots(plan).is_empty()
+	)
+
+
+--- A callee that cannot be cancelled needs no slot for what it owns.
+pure func region_plan_gives_owned_parameter_no_slot_without_cancellation_point() -> Bool:
+	plan: CancellationProtectionPlan = owned_parameter_plan(
+		drop_owned_parameter_then(direct_runtime_call_expr("blorp_string_concat")),
+		[0],
+	)
+
+	plan.effect == CannotCancelCurrentTask and not parameter_has_entry_slot(plan)
+
+
+--- A callee that lets go of its parameter before any cancellation point needs no slot.
+pure func region_plan_gives_owned_parameter_no_slot_when_released_first() -> Bool:
+	plan: CancellationProtectionPlan = owned_parameter_plan(
+		drop_owned_parameter_then(direct_runtime_call_expr("blorp_sleep")),
+		[0],
+	)
+
+	plan.effect == MayCancelCurrentTask and not parameter_has_entry_slot(plan)
+
+
+---
+A self-tail call lowered to a loop stores each iteration's arguments into
+the parameters, and a cleanup frame keeps the value it was pushed with, so a
+rebound parameter gets no entry slot.
+---
+pure func plan_gives_rebound_owned_parameter_no_slot() -> Bool:
+	payload: CoreParam = owned_parameter_payload()
+	body: CoreExpr = SeqExpr(
+		direct_runtime_call_expr("blorp_sleep"),
+		TailrecRecurExpr(
+			[VarExpr(payload.name, STRING_TYPE, synthetic_core_source_loc())],
+			VoidType,
+			synthetic_core_source_loc(),
+		),
+	)
+	plan: CancellationProtectionPlan = build_current_behavior_function_cancellation_plan(
+		FunctionCancellationActivation({
+			name = "rebinds",
+			def_id = 312
+		}),
+		[OwnedCancellationParameter(payload)],
+		body,
+	)
+
+	not parameter_has_entry_slot(plan)
+
+
 tests: TestSuite = {
 	description = "Cancellation cleanup planning",
 	tests = [
 		("release policies map to closed cleanup actions", release_policy_actions_are_closed),
+		(
+			"region plan gives handed-over parameter an entry slot",
+			region_plan_gives_handed_over_parameter_an_entry_slot,
+		),
+		("region plan gives lent parameter no slot", region_plan_gives_lent_parameter_no_slot),
+		(
+			"region plan gives owned parameter no slot without cancellation point",
+			region_plan_gives_owned_parameter_no_slot_without_cancellation_point,
+		),
+		(
+			"region plan gives owned parameter no slot when released first",
+			region_plan_gives_owned_parameter_no_slot_when_released_first,
+		),
+		(
+			"plan gives rebound owned parameter no slot",
+			plan_gives_rebound_owned_parameter_no_slot,
+		),
 		(
 			"backend temporary owners include stable site identity",
 			backend_temporary_owner_has_stable_site_identity,

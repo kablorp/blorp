@@ -1,0 +1,152 @@
+-- Consuming clones that own a cancellation cleanup slot for their record
+-- parameter, run to completion inside a task that is not cancelled.
+--
+-- Inside a task every cleanup push and pop runs for real, so these cases
+-- check that the slot a clone pushes at entry is given up wherever the record
+-- moves on: into a record update, a tuple, or another consuming call. A slot
+-- left armed is harmless on a normal return, but a missing or extra release
+-- would change a value or show up in this file's leak gate. The cancelled
+-- shapes are the `consuming_clone_*` programs in `leak_check_baselines/`.
+import:
+	test: TestSuite
+
+
+record Table {
+	items: List[Int],
+	count: Int
+}
+
+
+func park_then_grow(t: Table, x: Int) -> Table:
+	n: Int = t.count
+	sleep(1)
+	{ t |
+		items = t.items.append(x),
+		count = n + 1
+	}
+
+
+func park_then_intern(t: Table, x: Int) -> (Table, Int):
+	n: Int = t.count
+	sleep(1)
+	({ t |
+			items = t.items.append(x),
+			count = n + 1
+		}, n)
+
+
+func relay(t: Table, x: Int) -> Table:
+	marked: Table = { t | count = t.count + 1 }
+	marked.park_then_grow(x)
+
+
+--- Runs a bounded loop, so the compiler's cooperative checkpoints are polled
+--- while the clone owns the record.
+pure func count_then_grow(t: Table, x: Int) -> Table:
+	n: Int = t.count
+	var total: Int = 0
+
+	for i in 0..1000:
+		total += i
+
+	{ t |
+		items = t.items.append(x + total),
+		count = n + 1
+	}
+
+
+func seed_table(seed: Int) -> Table:
+	var table: Table = {
+		items = [seed],
+		count = 1
+	}
+	var spin: Int = 0
+
+	for i in 0..2:
+		spin += i
+
+	table
+
+
+func grow_in_task(seed: Int) -> Int:
+	var table: Table = seed_table(seed)
+	table = table.park_then_grow(5)
+	table.items.length() * 10 + table.count
+
+
+func intern_in_task(seed: Int) -> Int:
+	var table: Table = seed_table(seed)
+	(next, id) = table.park_then_intern(5)
+	table = next
+	table.items.length() * 100 + table.count * 10 + id
+
+
+func relay_in_task(seed: Int) -> Int:
+	var table: Table = seed_table(seed)
+	table = table.relay(5)
+	table.items.length() * 10 + table.count
+
+
+func count_in_task(seed: Int) -> Int:
+	var table: Table = seed_table(seed)
+	table = table.count_then_grow(5)
+	table.items.length() * 10 + table.count
+
+
+--- The task's value, or -1 when the task did not complete.
+pure func completed_value(result: Result[Int, ConcurrencyError]) -> Int:
+	match result:
+		Ok(value):
+			value
+		Err(_):
+			-1
+
+
+func test_parking_clone_returns_updated_record() -> Bool:
+	concurrent:
+		grown = grow_in_task(1)
+
+	completed_value(grown) == 22
+
+
+func test_parking_clone_returns_record_in_tuple() -> Bool:
+	concurrent:
+		interned = intern_in_task(1)
+
+	completed_value(interned) == 221
+
+
+func test_clone_hands_record_to_parking_clone() -> Bool:
+	concurrent:
+		relayed = relay_in_task(1)
+
+	completed_value(relayed) == 23
+
+
+func test_pure_clone_with_loop_checkpoints_returns_updated_record() -> Bool:
+	concurrent:
+		counted = count_in_task(1)
+
+	completed_value(counted) == 22
+
+
+func test_parking_clone_outside_a_task_returns_updated_record() -> Bool:
+	grow_in_task(1) == 22
+
+
+tests: TestSuite = {
+	description = "consuming clone task cleanup",
+	tests = [
+		("parking clone returns updated record", test_parking_clone_returns_updated_record),
+		("parking clone returns record in tuple", test_parking_clone_returns_record_in_tuple),
+		("clone hands record to parking clone", test_clone_hands_record_to_parking_clone),
+		(
+			"pure clone with loop checkpoints returns updated record",
+			test_pure_clone_with_loop_checkpoints_returns_updated_record,
+		),
+		(
+			"parking clone outside a task returns updated record",
+			test_parking_clone_outside_a_task_returns_updated_record,
+		),
+	]
+}

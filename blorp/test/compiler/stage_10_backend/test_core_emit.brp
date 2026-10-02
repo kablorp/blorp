@@ -12601,6 +12601,10 @@ pure func test_string_literal_dispatch_preserves_loop_break_target() -> Bool:
 	)
 
 
+---
+`choice` is a parameter no call hands over, so it has no cleanup slot: the
+match that releases it neither pushes a frame nor pops one.
+---
 pure func test_emit_releasing_match_without_cancellation_omits_cleanup_slot() -> Bool:
 	program: CoreProgram = {
 		decls = [UnionDecl(choice_union_decl()), FunctionDecl(releasing_match_break_function())],
@@ -12627,7 +12631,7 @@ pure func test_emit_releasing_match_without_cancellation_omits_cleanup_slot() ->
 		and not function_c.contains(
 			"blorp_task_cleanup_push_with_task(&__blorp_owned_cleanup_choice",
 		)
-		and function_c.count("blorp_task_cleanup_pop_slot_with_task(&choice, __blorp_task);") == 1
+		and not function_c.contains("blorp_task_cleanup_pop_slot_with_task(&choice, __blorp_task);")
 	)
 
 
@@ -24187,6 +24191,191 @@ pure func moved_reference_constructor_before_suspension_function() -> CoreFuncti
 	)
 
 
+--- `Picked(name)`, taking the String variable `name` over.
+pure func picked_string_var(name: String) -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = "Choice__mono_String",
+			constructor_name = "Picked",
+			variant = VariantById(144),
+			representation = GenericUnionRepresentation,
+			payload_storage = TypedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = [
+				{
+					kind = PointerBox,
+					value = moved_reference_string_var(name),
+					needs_release = True,
+					transfers_ownership = True
+				},
+			]
+		},
+		choice_string_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+---
+The owned-parameter fixtures are source-shaped Core, like the moved-reference
+ones: the emit helper runs ownership inference and Perceus. A callee that
+stores its parameter in a `Picked` is inferred to consume it, so its caller
+hands over an owned local and gives up that local's cleanup slot at the call.
+
+    owned_parameter_store_after_sleep(input):
+        sleep(0)
+        Picked(input)
+---
+pure func owned_parameter_store_after_sleep_function() -> CoreFunction:
+	moved_reference_function(
+		"owned_parameter_store_after_sleep",
+		1430,
+		choice_string_type(),
+		moved_reference_sleep_then(picked_string_var("input")),
+	)
+
+
+---
+    owned_parameter_store_now(input):
+        Picked(input)
+
+Nothing in the callee can cancel the task.
+---
+pure func owned_parameter_store_now_function() -> CoreFunction:
+	moved_reference_function(
+		"owned_parameter_store_now",
+		1431,
+		choice_string_type(),
+		picked_string_var("input"),
+	)
+
+
+---
+    owned_parameter_store_then_sleep(input):
+        held = Picked(input)
+        sleep(0)
+        held
+
+The parameter is handed on before the cancellation point; `held` owns it there.
+---
+pure func owned_parameter_store_then_sleep_function() -> CoreFunction:
+	moved_reference_function(
+		"owned_parameter_store_then_sleep",
+		1432,
+		choice_string_type(),
+		moved_reference_let(
+			"held",
+			choice_string_type(),
+			picked_string_var("input"),
+			moved_reference_sleep_then(
+				VarExpr(named_var("held"), choice_string_type(), synthetic_core_source_loc()),
+			),
+		),
+	)
+
+
+--- `(name, 1)`, a tuple that takes the String variable `name` over.
+pure func string_int_pair_of(name: String) -> CoreExpr:
+	TupleExpr(
+		[moved_reference_string_var(name), LiteralExpr(IntLiteral(1), int_type(), synthetic_core_source_loc())],
+		string_int_pair_type(),
+		synthetic_core_source_loc(),
+	)
+
+
+---
+    owned_parameter_pair_then_sleep(input):
+        held = (input, 1)
+        sleep(0)
+        held
+
+The tuple takes the owned parameter over before the cancellation point, so
+the parameter needs no slot and `held` owns the string across `sleep`.
+---
+pure func owned_parameter_pair_then_sleep_function() -> CoreFunction:
+	moved_reference_function(
+		"owned_parameter_pair_then_sleep",
+		1433,
+		string_int_pair_type(),
+		moved_reference_let(
+			"held",
+			string_int_pair_type(),
+			string_int_pair_of("input"),
+			moved_reference_sleep_then(
+				VarExpr(named_var("held"), string_int_pair_type(), synthetic_core_source_loc()),
+			),
+		),
+	)
+
+
+---
+    moved_reference_pair_between_sleeps(input):
+        payload = input
+        sleep(0)
+        held = (payload, 1)
+        sleep(0)
+        held
+
+`payload` is armed across the first `sleep`; the tuple then takes its
+reference, so its slot gives that reference up where the tuple is built,
+before the second `sleep`, and is not popped again at the end.
+---
+pure func moved_reference_pair_between_sleeps_function() -> CoreFunction:
+	moved_reference_function(
+		"moved_reference_pair_between_sleeps",
+		1425,
+		string_int_pair_type(),
+		moved_reference_owned_payload_let(
+			moved_reference_sleep_then(
+				moved_reference_let(
+					"held",
+					string_int_pair_type(),
+					string_int_pair_of("payload"),
+					moved_reference_sleep_then(
+						VarExpr(named_var("held"), string_int_pair_type(), synthetic_core_source_loc()),
+					),
+				),
+			),
+		),
+	)
+
+
+---
+    owned_parameter_hand_over_to_<callee>(input):
+        payload = input
+        <callee>(payload)
+
+`payload` is an owned local whose last use hands it to `callee`.
+---
+pure func owned_parameter_hand_over_function(callee: CoreFunction, def_id: Int) -> CoreFunction:
+	moved_reference_function(
+		"owned_parameter_hand_over_to_" + callee.name,
+		def_id,
+		choice_string_type(),
+		moved_reference_owned_payload_let(
+			CallExpr(
+				UserCall(callee.name, Some(callee.def_id), []),
+				VarExpr(named_var(callee.name), closure_type(), synthetic_core_source_loc()),
+				[moved_reference_string_var("payload")],
+				choice_string_type(),
+				synthetic_core_source_loc(),
+			),
+		),
+	)
+
+
+pure func emit_owned_parameter_program(callee: CoreFunction, caller_def_id: Int) -> CArtifact:
+	emit_source_spelled_c_artifact({
+		decls = [
+			UnionDecl(choice_string_union_decl()),
+			FunctionDecl(callee),
+			FunctionDecl(owned_parameter_hand_over_function(callee, caller_def_id)),
+		],
+		foreign_includes = [],
+		source_files = []
+	})
+
+
 pure func consume_bytes_function() -> CoreFunction:
 	payload_param: CoreParam = bytes_param("payload")
 	payload_var: CoreVar = named_var("payload")
@@ -26425,6 +26614,10 @@ pure func test_emit_set_add_builtin_call() -> Bool:
 	)
 
 
+---
+`cancelling_dup_arc` duplicates its borrowed `value` across a checkpoint. A
+borrowed parameter has no cleanup slot, so the `DUP` registers no duplicate.
+---
 pure func test_emit_drop_release_policies() -> Bool:
 	program: CoreProgram = {
 		decls = [
@@ -26470,9 +26663,9 @@ pure func test_emit_drop_release_policies() -> Bool:
 		and artifact.c_code.contains("long drop_none(long value)")
 		and artifact.c_code.contains("blorp_String* dup_arc(blorp_String* value)")
 		and artifact.c_code.contains("blorp_retain(value);")
-		and artifact.c_code.count(
+		and not artifact.c_code.contains(
 			"blorp_task_cleanup_duplicate_slot_with_task(&value, __blorp_task);",
-		) == 1
+		)
 		and artifact.c_code.contains("void* dup_stack_result(void* value)")
 		and artifact.c_code.contains("blorp_stack_result_retain(value);")
 		and artifact.c_code.contains("long dup_none(long value)")
@@ -26641,6 +26834,172 @@ pure func emitted_in_order(c_code: String, earlier: String, later: String) -> Bo
 		(Some(earlier_index), Some(later_index)):
 			earlier_index < later_index
 		_:
+			False
+
+
+--- The C definition that starts with `signature`, through its closing brace, or "".
+pure func emitted_function_definition(c_code: String, signature: String) -> String:
+	match c_code.index_of(signature + " {\n"):
+		Some(start):
+			rest: String = c_code.drop_left(start)
+
+			match rest.index_of("\n}\n"):
+				Some(end_index):
+					rest.take_left(end_index + 3)
+				None:
+					""
+		None:
+			""
+
+
+OWNED_PARAMETER_PUSH: String = "blorp_task_cleanup_push_with_task(&__blorp_cleanup_input, &input, (void*)input, blorp_cleanup_release_arc_only_value, __blorp_task);"
+
+OWNED_PARAMETER_POP: String = "blorp_task_cleanup_pop_slot_with_task(&input, __blorp_task);"
+
+OWNED_PARAMETER_DUPLICATE: String = "blorp_task_cleanup_duplicate_slot_with_task(&input, __blorp_task);"
+
+
+---
+A callee that owns its parameter and can be cancelled while it does pushes
+the parameter's cleanup slot at entry, before the cancellation point, and
+pops it where the constructor takes the parameter over. The caller popped
+its own slot for the argument at the call, so without the push nothing
+releases the string if the task is cancelled in `sleep`. The caller's
+`input` is borrowed, so it has no slot to duplicate or pop.
+---
+pure func test_emit_owned_parameter_slot_pushed_at_entry() -> Bool:
+	code: String = emit_owned_parameter_program(
+		owned_parameter_store_after_sleep_function(),
+		1440,
+	).c_code
+	callee: String = emitted_function_definition(
+		code,
+		"static Choice__mono_String* owned_parameter_store_after_sleep(blorp_String* input)",
+	)
+	caller: String = emitted_function_definition(
+		code,
+		"static Choice__mono_String* owned_parameter_hand_over_to_owned_parameter_store_after_sleep(blorp_String* input)",
+	)
+
+	(
+		callee.count(OWNED_PARAMETER_PUSH) == 1
+		and callee.count("BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(__blorp_cleanup_input, __blorp_task);") == 1
+		and callee.count(OWNED_PARAMETER_POP) == 1
+		and emitted_in_order(callee, OWNED_PARAMETER_PUSH, "blorp_sleep(0)")
+		and emitted_in_order(callee, "__def_144_Picked(input)", OWNED_PARAMETER_POP)
+		and caller.count("blorp_task_cleanup_pop_slot_with_task(&payload, __blorp_task);") == 1
+		and emitted_in_order(
+			caller,
+			"blorp_task_cleanup_pop_slot_with_task(&payload, __blorp_task);",
+			"owned_parameter_store_after_sleep(payload)",
+		)
+		and not caller.contains(OWNED_PARAMETER_DUPLICATE)
+		and not caller.contains(OWNED_PARAMETER_POP)
+	)
+
+
+--- A callee that cannot be cancelled gives its owned parameter no slot.
+pure func test_emit_owned_parameter_without_cancellation_point_has_no_slot() -> Bool:
+	code: String = emit_owned_parameter_program(owned_parameter_store_now_function(), 1441).c_code
+	callee: String = emitted_function_definition(
+		code,
+		"static Choice__mono_String* owned_parameter_store_now(blorp_String* input)",
+	)
+
+	(
+		callee.contains("__def_144_Picked(input)")
+		and not callee.contains("__blorp_cleanup_input")
+		and not callee.contains(OWNED_PARAMETER_POP)
+	)
+
+
+---
+A callee that hands its owned parameter on before any cancellation point
+gives it no slot: `held` owns the reference across `sleep` and has its own.
+---
+pure func test_emit_owned_parameter_handed_on_before_cancellation_has_no_slot() -> Bool:
+	code: String = emit_owned_parameter_program(
+		owned_parameter_store_then_sleep_function(),
+		1442,
+	).c_code
+	callee: String = emitted_function_definition(
+		code,
+		"static Choice__mono_String* owned_parameter_store_then_sleep(blorp_String* input)",
+	)
+
+	(
+		callee.contains("blorp_task_cleanup_push_with_task(&__blorp_cleanup_held, &held,")
+		and not callee.contains("__blorp_cleanup_input")
+		and not callee.contains(OWNED_PARAMETER_POP)
+	)
+
+
+---
+A borrowed parameter's caller keeps the reference and its slot, so the callee
+never duplicates or pops a slot for it. Each would walk the whole task
+cleanup stack looking for a frame that was never pushed.
+---
+pure func test_emit_borrowed_parameter_has_no_slot_operations() -> Bool:
+	code: String = emit_moved_reference_program(moved_reference_dup_alias_function()).c_code
+	function_c: String = emitted_function_definition(
+		code,
+		"static blorp_String* moved_reference_dup_alias(blorp_String* input)",
+	)
+
+	(
+		function_c.contains("blorp_retain(input);")
+		and not function_c.contains(OWNED_PARAMETER_DUPLICATE)
+		and not function_c.contains(OWNED_PARAMETER_POP)
+		and not function_c.contains("__blorp_cleanup_input")
+	)
+
+
+---
+A tuple that takes over an owned parameter before the cancellation point
+leaves the parameter without a slot: `held` alone counts the string.
+---
+pure func test_emit_owned_parameter_moved_into_tuple_has_no_slot() -> Bool:
+	code: String = emit_owned_parameter_program(
+		owned_parameter_pair_then_sleep_function(),
+		1443,
+	).c_code
+	callee: String = emitted_function_definition(
+		code,
+		"static blorp_Tuple* owned_parameter_pair_then_sleep(blorp_String* input)",
+	)
+
+	(
+		callee.contains("blorp_tuple_new(2, (void*)input,")
+		and callee.contains("blorp_task_cleanup_push_with_task(&__blorp_cleanup_held, &held,")
+		and not callee.contains("__blorp_cleanup_input")
+		and not callee.contains(OWNED_PARAMETER_POP)
+	)
+
+
+---
+A tuple takes an armed local's reference between two cancellation points.
+The local's slot pops exactly once, right after the tuple is built and
+before the second `sleep`, so cancellation there releases the string only
+through the tuple.
+---
+pure func test_emit_local_moved_into_tuple_pops_before_park() -> Bool:
+	code: String = emit_moved_reference_program(moved_reference_pair_between_sleeps_function()).c_code
+	function_c: String = emitted_function_definition(
+		code,
+		"static blorp_Tuple* moved_reference_pair_between_sleeps(blorp_String* input)",
+	)
+	payload_pop: String = "blorp_task_cleanup_pop_slot_with_task(&payload, __blorp_task);"
+
+	match function_c.index_of("blorp_tuple_new(2, (void*)payload,"):
+		Some(tuple_index):
+			after_tuple: String = function_c.drop_left(tuple_index)
+
+			(
+				function_c.count("blorp_task_cleanup_push_with_task(&__blorp_cleanup_payload, &payload,") == 1
+				and function_c.count(payload_pop) == 1
+				and emitted_in_order(after_tuple, payload_pop, "blorp_sleep(0)")
+			)
+		None:
 			False
 
 
@@ -29297,6 +29656,30 @@ tests: TestSuite = {
 		(
 			"emit cancelling let alias return tracks only the alias",
 			test_emit_cancelling_let_alias_return_tracks_only_the_alias,
+		),
+		(
+			"emit owned parameter slot pushed at entry",
+			test_emit_owned_parameter_slot_pushed_at_entry,
+		),
+		(
+			"emit owned parameter without cancellation point has no slot",
+			test_emit_owned_parameter_without_cancellation_point_has_no_slot,
+		),
+		(
+			"emit owned parameter handed on before cancellation has no slot",
+			test_emit_owned_parameter_handed_on_before_cancellation_has_no_slot,
+		),
+		(
+			"emit borrowed parameter has no slot operations",
+			test_emit_borrowed_parameter_has_no_slot_operations,
+		),
+		(
+			"emit owned parameter moved into tuple has no slot",
+			test_emit_owned_parameter_moved_into_tuple_has_no_slot,
+		),
+		(
+			"emit local moved into tuple pops before park",
+			test_emit_local_moved_into_tuple_pops_before_park,
 		),
 		(
 			"emit moved reference dup alias gives back the source unit",

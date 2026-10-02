@@ -39,6 +39,7 @@ import:
 		cancellation_let_protection,
 		cancellation_match_scrutinee_protection,
 		cancellation_moved_operand_var,
+		cancellation_parameters_with_entry_slots,
 		cancellation_plan_requires_local_owner_protection,
 		cancellation_variable_push_is_recorded,
 		cancellation_variable_requires_protection,
@@ -744,7 +745,6 @@ private record FunctionEmissionContext {
 	-- level (see the pattern-census whitespace finding: 16.55 MB of the
 	-- self-compile artifact is leading indentation and newlines).
 	compact: Bool,
-	parameter_variables: List[CoreVar],
 	-- Moved task captures (copied captures and resource items, whose env slot
 	-- the prelude clears) whose ownership the closure prelude registers in a
 	-- cancellation cleanup frame. The prelude push and the resource-scope
@@ -882,17 +882,12 @@ region-sensitive cancellation plan applied and build it at print time; that
 decision and the plan itself are now a fact recorded once before emission,
 so this reads a row instead.
 ---
-private pure func function_parameter_variables(func_info: CoreFunction) -> List[CoreVar]:
-	func_info.params.map(func(param: CoreParam) -> CoreVar: param.name)
-
-
 private pure func emission_context_from_plan(
 	plan: CancellationProtectionPlan,
 	specialize_layout: CoreSpecializeLayout,
 	record_members: CRecordLayoutRegistry,
 	profile_function_id: Option[ProfileFunctionId],
 	symbol_authority: CEmissionSymbolAuthority,
-	parameter_variables: List[CoreVar],
 	compact: Bool,
 ) -> FunctionEmissionContext:
 	initial_indent: String = if compact:
@@ -908,7 +903,6 @@ private pure func emission_context_from_plan(
 		record_members = record_members,
 		indent = initial_indent,
 		compact = compact,
-		parameter_variables = parameter_variables,
 		tracked_moved_captures = []
 	}
 
@@ -13584,7 +13578,6 @@ private pure func emit_closure_body_function(
 				record_members,
 				None,
 				symbol_authority,
-				function_parameter_variables(func_info),
 				compact,
 			)
 			emission_context: FunctionEmissionContext = { planned_context |
@@ -13615,7 +13608,9 @@ private pure func emit_closure_body_function(
 				func_info.return_type,
 				abi,
 				emitted_name,
-			) + " {\n" + env_prelude + param_decls
+			) + " {\n" + env_prelude + param_decls + parameter_entry_cleanup_push_statements(
+				emission_context,
+			)
 			suffix: String = closure_body_suffix(abi, emitted_name, internal_type_linkage)
 
 			if TypeLayout.is_void_type(func_info.return_type):
@@ -13946,6 +13941,29 @@ private pure func cancellation_cleanup_push_statement(
 			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + var_name + ", " + value_arg + ", " + release_fn + ", __blorp_task);\n"
 		None:
 			""
+
+
+---
+Pushes the entry slots the plan gives the function's owned parameters
+(`cancellation_parameters_with_entry_slots`) before the body runs. The caller
+gave up its own slot for each such argument at the call, so from here the
+callee's frame is the only one counting the reference. A move or `DROP` of
+the parameter pops it, and a frame still linked when the function returns is
+unlinked by its scope guard.
+---
+private pure func parameter_entry_cleanup_push_statements(
+	emission_context: FunctionEmissionContext,
+) -> String:
+	var statements: String = ""
+
+	for param in cancellation_parameters_with_entry_slots(emission_context.cleanup_plan):
+		statements += cancellation_cleanup_push_statement(
+			emission_context.indent,
+			param.name,
+			CoreTypePolicy.cleanup_release_policy_for_type(param.typ),
+		)
+
+	statements
 
 
 ---
@@ -14322,26 +14340,6 @@ private pure func apply_let_cleanup_to_body(
 		}
 
 
----
-A function parameter is never wrapped in a `LetExpr` or match-arm binding
-of its own, so it never appears in the plan's identity-keyed protection
-indexes even when an earlier pass (outside this planner's view) already
-arranged for the parameter itself to be protected. Only the parameter case
-is excluded here: any other unmatched identity is either a `let`/match
-binding this same plan already walked (and would have indexed) or a
-temporary invented solely to hold this `DupExpr`'s own wrapped
-subexpression, used nowhere else in the function, which nothing could have
-pushed.
----
-private pure func variable_is_function_parameter(
-	emission_context: FunctionEmissionContext,
-	variable: CoreVar,
-) -> Bool:
-	emission_context.parameter_variables.any(
-		func(param: CoreVar) -> Bool: core_var_equal(param, variable),
-	)
-
-
 private pure func emit_dup_statement(
 	variable: CoreVar,
 	retain_policy: CoreRetainPolicy,
@@ -14349,10 +14347,7 @@ private pure func emit_dup_statement(
 ) -> Option[String]:
 	duplicate_cleanup: String = if (
 		cancellation_variable_requires_protection(emission_context.cleanup_plan, variable)
-		and ((
-			cancellation_variable_push_is_recorded(emission_context.cleanup_plan, variable)
-			or variable_is_function_parameter(emission_context, variable)
-		))
+		and cancellation_variable_push_is_recorded(emission_context.cleanup_plan, variable)
 	):
 		"\n" + emission_context.indent + "blorp_task_cleanup_duplicate_slot_with_task(&" + c_var_name(
 			variable,
@@ -14982,7 +14977,8 @@ private pure func emit_simple_expr_leaf(
 		TupleExpr(items, typ, loc):
 			None
 		TupleConstructExpr(tuple_construct, typ, loc):
-			emit_tuple_construct(tuple_construct, emission_context)
+			value ?= emit_tuple_construct(tuple_construct, emission_context)
+			Some(construct_value_with_transfer_cleanup_pops(expr, value, emission_context))
 		VectorExpr(items, typ, loc):
 			None
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
@@ -14998,7 +14994,8 @@ private pure func emit_simple_expr_leaf(
 				type_symbol_lookup,
 			)
 		ListConstructExpr(construct, typ, loc):
-			emit_list_construct(construct, emission_context)
+			value ?= emit_list_construct(construct, emission_context)
+			Some(construct_value_with_transfer_cleanup_pops(expr, value, emission_context))
 		ListAllocExpr(alloc, typ, loc):
 			emit_list_alloc(alloc, emission_context)
 		ListGetExpr(get, typ, loc):
@@ -15034,7 +15031,8 @@ private pure func emit_simple_expr_leaf(
 			body_c ?= emit_simple_expr(body, emission_context)
 			Some(statement_expr(decl + ";", body_c))
 		DictConstructExpr(construct, typ, loc):
-			emit_dict_construct(construct, emission_context)
+			value ?= emit_dict_construct(construct, emission_context)
+			Some(construct_value_with_transfer_cleanup_pops(expr, value, emission_context))
 		DictExpr(entries, typ, loc):
 			None
 		SetAllocExpr(alloc, typ, loc):
@@ -23340,11 +23338,14 @@ private pure func emit_function_body(
 			value ?= emit_simple_expr(expr, emission_context)
 			Some(body_value(value, next_temp))
 		TupleConstructExpr(tuple_construct, typ, loc):
+			-- The simple form already carries its transfer pops; only the
+			-- statement fallback adds them here.
 			match emit_simple_expr(expr, emission_context):
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
-					emit_tuple_construct_body(tuple_construct, next_temp, emission_context)
+					body ?= emit_tuple_construct_body(tuple_construct, next_temp, emission_context)
+					Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		VectorExpr(items, typ, loc):
 			None
 		LambdaExpr(lambda_params, lambda_return_type, lambda_body, lambda_is_pure, typ, loc):
@@ -23357,7 +23358,8 @@ private pure func emit_function_body(
 				Some(value):
 					Some(body_value(value, next_temp))
 				None:
-					emit_list_construct_body(construct, next_temp, emission_context)
+					body ?= emit_list_construct_body(construct, next_temp, emission_context)
+					Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		ListAllocExpr(alloc, typ, loc):
 			value ?= emit_simple_expr(expr, emission_context)
 			Some(body_value(value, next_temp))
@@ -23394,7 +23396,8 @@ private pure func emit_function_body(
 		TensorLiteralExpr(literal, typ, loc):
 			emit_tensor_literal(literal, next_temp, emission_context)
 		TensorBoxedLiteralExpr(literal, typ, loc):
-			emit_tensor_boxed_literal(literal, next_temp, emission_context)
+			body ?= emit_tensor_boxed_literal(literal, next_temp, emission_context)
+			Some(construct_body_with_transfer_cleanup_pops(expr, body, emission_context))
 		TensorPackedLiteralExpr(literal, typ, loc):
 			emit_tensor_packed_literal(literal, next_temp, emission_context)
 		TensorRawFillExpr(fill, typ, loc):
@@ -24479,11 +24482,16 @@ private pure func emit_supported_user_function(
 				record_members,
 				profile_function_id,
 				symbol_authority,
-				function_parameter_variables(func_info),
 				compact,
 			)
 
-			if profile_function_id.is_some():
+			-- A channel-attempt function is one runtime call with no prologue
+			-- of its own, so one that owns a parameter slot takes the general
+			-- path, which pushes it.
+			if (
+				profile_function_id.is_some()
+				or not cancellation_parameters_with_entry_slots(plan).is_empty()
+			):
 				emit_general_supported_user_function(
 					profile_plan,
 					profile_function_id,
@@ -24537,7 +24545,7 @@ private pure func emit_general_supported_user_function(
 
 					body_prefix: String = prefix + profile_runtime_setup + global_init + body_prelude + emit_profile_start(
 						profile_function_id,
-					)
+					) + parameter_entry_cleanup_push_statements(emission_context)
 
 					if TypeLayout.is_void_type(func_info.return_type):
 						if is_entrypoint_function:
@@ -24651,7 +24659,6 @@ private pure func emit_function(
 									record_members,
 									profile_function_id,
 									symbol_authority,
-									function_parameter_variables(func_info),
 									compact,
 								),
 							)
@@ -24683,7 +24690,6 @@ private pure func emit_function(
 									record_members,
 									profile_function_id,
 									symbol_authority,
-									function_parameter_variables(func_info),
 									compact,
 								),
 							)
@@ -27046,7 +27052,6 @@ private pure func emit_global_runtime_init_body(
 		record_members,
 		None,
 		symbol_authority,
-		[],
 		compact,
 	)
 	init_body ?= emit_function_body(global.init, next_temp, emission_context)
