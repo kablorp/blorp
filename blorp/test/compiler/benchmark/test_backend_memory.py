@@ -25,6 +25,11 @@ SCRIPT = ROOT / "benchmarks" / "compiler_backend_memory"
 SYMBOL_PROJECTION_REQUEST = (
     ROOT / "blorp/benchmark/compiler/compiler_c_symbol_projection_request.brp"
 )
+# Bounds a hung process tree, not a slow one: the controller starts four Python
+# interpreters in sequence before the fake bridge forks, which takes about two
+# seconds under a landing's load. The wait ends as soon as the tree starts, and
+# a test's own worker timeout may stop a tree that has not started sooner.
+PROCESS_TREE_START_DEADLINE_SECONDS = 10
 
 
 def load_benchmark_module():
@@ -158,6 +163,12 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
             vmmap=False,
             json=True,
         )
+
+    def assert_process_tree_started(self, started_path: Path) -> None:
+        deadline = time.monotonic() + PROCESS_TREE_START_DEADLINE_SECONDS
+        while not started_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(started_path.exists())
 
     def assert_process_stopped(self, pid_path: Path) -> None:
         self.assertTrue(pid_path.exists())
@@ -304,10 +315,7 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
                 _pid: int,
                 _timeout_seconds: float,
             ) -> dict[str, object]:
-                deadline = time.monotonic() + 1
-                while not started_path.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(started_path.exists())
+                self.assert_process_tree_started(started_path)
                 raise RuntimeError("sampler failed")
 
             worker_args = [
@@ -384,10 +392,7 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            deadline = time.monotonic() + 5
-            while not started_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
-            self.assertTrue(started_path.exists())
+            self.assert_process_tree_started(started_path)
 
             worker.terminate()
             self.assertNotEqual(worker.wait(timeout=3), 0)
@@ -489,13 +494,7 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
                         stderr=subprocess.DEVNULL,
                         start_new_session=interrupt == "process_group_sigint",
                     )
-                    deadline = time.monotonic() + 2
-                    while (
-                        not started_path.exists()
-                        and time.monotonic() < deadline
-                    ):
-                        time.sleep(0.01)
-                    self.assertTrue(started_path.exists())
+                    self.assert_process_tree_started(started_path)
 
                     if interrupt == "sigterm":
                         controller.terminate()
