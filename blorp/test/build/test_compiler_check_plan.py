@@ -132,6 +132,9 @@ class MiniCompilerCheckRepository:
 	def run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
 		environment = os.environ.copy()
 		environment["PATH"] = f"{self.root}{os.pathsep}{environment['PATH']}"
+		# The plan's expected `--timeout` is compiler-check's default; a gate
+		# runner such as docker-gate must not change what this test sees.
+		environment.pop("BLORP_COMPILER_TEST_TIMEOUT", None)
 		return subprocess.run(
 			[sys.executable, str(self.script), *arguments],
 			cwd=self.root,

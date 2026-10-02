@@ -44,7 +44,9 @@ class RecordValidationTests(unittest.TestCase):
 		if timeout_seconds is not None:
 			recorder_command.extend(["--timeout", str(timeout_seconds)])
 		recorder_command.extend(["--", *command])
-		env = os.environ.copy()
+		# Start from no BLORP_ variables, so the recorded environment is exactly
+		# what this test sets, whatever a gate runner exported.
+		env = {key: value for key, value in os.environ.items() if not key.startswith("BLORP_")}
 		env.update(
 			{
 				"BLORP_COMPILER_TEST_TIMEOUT": "17",
