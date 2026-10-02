@@ -1,6 +1,6 @@
 # Blorp Compiler Makefile
 
-.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install warm warm-formatter clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check tooling-check benchmark-tooling-check artifact-scan quality quality-full docker-build docker-gate docker-gate-clean docker-shell docker-premerge-gate docker-premerge-gate-all force-generated-sources
+.PHONY: all build build-blorp-cli build-blorp-cli-diagnostic generate-blorp-cli-c prepare-blorp-cli-c prepare-blorp-cli-runtime prepare-blorp-cli-build-stamp compile-prepared-blorp-cli compile-blorp-cli install-prepared-blorp-cli compiler-build-source-generator install clean test smoke runtime-test test-asan compiler-blorp-test compiler-core-sanitize-test compiler-blorp-sanitize-test lsp-test package-test c-static-analysis security-check hygiene-check tooling-check benchmark-tooling-check artifact-scan quality docker-build docker-gate docker-premerge-gate force-generated-sources
 
 STANDARD_LIBRARY_SOURCE_ROOT := standard_library/src
 STANDARD_LIBRARY_TEST_ROOT := standard_library/test
@@ -123,15 +123,6 @@ install-prepared-blorp-cli:
 			--inputs "$(BLORP_CLI_INSTALL_INPUT_MANIFEST)" \
 			--output "$(BLORP_CLI_EMBEDDED_INPUT_MANIFEST)"; \
 	fi
-
-warm: warm-formatter
-
-warm-formatter: install
-	@tmp_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/blorp-format-warm.XXXXXX"); \
-	trap 'rm -rf "$$tmp_dir"' EXIT; \
-	tmp="$$tmp_dir/warm.brp"; \
-	printf 'func main(args: List[String]) -> Int:\n\t0\n' > "$$tmp"; \
-	$(BLORP_INSTALLED_BIN) format --check "$$tmp" >/dev/null
 
 # Generate the embedded std library consumed by the Blorp compiler.
 force-generated-sources:
@@ -506,9 +497,8 @@ quality:
 	$(MAKE) artifact-scan
 	$(MAKE) c-static-analysis
 
-quality-full: quality
-
-# Seconds-long static checks over the sources. `artifact-scan` is not here: builds and test suites leave the
+# Seconds-long static checks over the sources. `artifact-scan` is not here:
+# builds and test suites leave the
 # stray files it looks for, so `quality` runs it after the suites.
 hygiene-check:
 	@scripts/check-blorp-layout
@@ -658,17 +648,8 @@ docker-build:
 docker-gate:
 	scripts/docker-gate
 
-docker-gate-clean:
-	scripts/docker-gate --clean
-
-docker-shell:
-	scripts/docker-gate --shell
-
 docker-premerge-gate:
 	scripts/docker-gate --premerge-gate
-
-docker-premerge-gate-all:
-	scripts/docker-gate --premerge-gate --all-platforms
 
 # Clean build artifacts
 clean:
