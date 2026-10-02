@@ -159,6 +159,31 @@ docker_log_path() {
     echo "$DOCKER_LOG_DIR/$(platform_image_name "$platform").log"
 }
 
+# Each gate container builds the compiler, and generating its C takes several
+# GB, so too many at once exhaust the Docker VM's memory and the builds are
+# killed (exit 137). Wait until fewer than this many gate containers (any
+# `blorp-test-*` image, from any checkout) are running before starting one.
+# The check is not atomic: two gates starting together may both pass it.
+DOCKER_GATE_MAX_CONCURRENT="${BLORP_DOCKER_GATE_MAX_CONCURRENT:-2}"
+DOCKER_GATE_SLOT_POLL_SECONDS=15
+
+running_gate_containers() {
+    docker ps --format '{{.Image}}' | grep -c '^blorp-test-' || true
+}
+
+wait_for_gate_slot() {
+    local running announced=0
+    while :; do
+        running="$(running_gate_containers)"
+        [ "$running" -lt "$DOCKER_GATE_MAX_CONCURRENT" ] && return 0
+        if [ "$announced" -eq 0 ]; then
+            echo "Waiting: $running gate containers running (limit $DOCKER_GATE_MAX_CONCURRENT, BLORP_DOCKER_GATE_MAX_CONCURRENT)."
+            announced=1
+        fi
+        sleep "$DOCKER_GATE_SLOT_POLL_SECONDS"
+    done
+}
+
 run_cmd_logged() {
     local log_file="$1"
     shift
@@ -168,6 +193,7 @@ run_cmd_logged() {
     if [ "$DRY_RUN" -eq 1 ]; then
         return 0
     fi
+    wait_for_gate_slot
     "$@" | tee "$log_file"
 }
 

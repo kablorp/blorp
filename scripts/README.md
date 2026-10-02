@@ -472,6 +472,9 @@ Modes:
 - Default volume mode mounts the working tree into the container.
 - `--clean` copies source into the image for a more CI-like run.
 - `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
+- Each gate builds the compiler inside its container, which takes several GB,
+  so `scripts/docker-gate` waits until fewer than `BLORP_DOCKER_GATE_MAX_CONCURRENT`
+  (default 2) gate containers are running before it starts one.
 
 ## Landing a Branch
 
