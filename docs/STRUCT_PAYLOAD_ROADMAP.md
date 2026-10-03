@@ -125,7 +125,7 @@ Consider typed dictionary storage for struct keys and values only if the
 dynamic count and a stage-2 measurement justify it; otherwise park S5.
 
 Tuple storage layout belongs to
-[`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md#9-increments),
+[`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md#increment-7-stored-tuples),
 increment 7, including tuple fields, `List[(A, B)]`, `Option` payloads and
 `List.enumerate`. An experimental build counted 123 *static* tuple box sites;
 the older self-compile's dynamic tuple census (built at `9172b35e0`;

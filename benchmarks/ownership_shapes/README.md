@@ -1,14 +1,16 @@
 # Ownership shape probes
 
-Probe programs for [`docs/VALUE_TUPLES_AND_STATE_HANDOFF.md`](../../docs/VALUE_TUPLES_AND_STATE_HANDOFF.md)
-(appendix A). Each tuple or hand-off shape is paired with a control that does
+Probe programs for [`docs/VALUE_TUPLES_AND_STATE_HANDOFF.md`](../../docs/VALUE_TUPLES_AND_STATE_HANDOFF.md).
+Their original measurements are in
+[`value_tuple_design_baseline_2026-10-02.md`](../results/value_tuple_design_baseline_2026-10-02.md).
+Each tuple or hand-off shape is paired with a control that does
 the same work without the tuple or the second reference, so a measurement
 reads as the shape's cost over its control.
 
 | Probe | What it runs |
 | --- | --- |
 | `value_tuple_probe.brp <mode> <count>` | One shape per mode: `empty`, `pair_inline`, `pair_call`, `record_alone`, `record_pair`, `mint_control`, `mint_kept`, `descent`, `builder_alone`, `builder_pair`, `two_owned`, `two_owned_record`, and the increment 1 `match` subject `subject_or` with its control `subject_control` |
-| `intern_probe.brp` | Spelling interning (section 4.5): the given two-result shape, the no-tuple shape called both ways, and its variants, at 1,000 and 10,000 calls |
+| `intern_probe.brp` | Spelling interning (increment 4 in the plan): the given two-result shape, the no-tuple shape called both ways, and its variants, at 1,000 and 10,000 calls |
 | `nested_update_probe.brp` | Nested record updates three levels deep, directly and through local bindings |
 | `pair_probe.brp` | A list or a scalar two levels down in a record pair |
 | `last_use_probe.brp` | An alias read once, then the owner updated |
