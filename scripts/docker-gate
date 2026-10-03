@@ -101,6 +101,18 @@ done
 
 cd "$(dirname "$0")/.."
 
+# Logs, and so nested verdicts, are keyed by platform, so a repeated
+# `--platform` would otherwise be waiting for a verdict that cannot arrive.
+unique_platforms=()
+for platform in "${PLATFORMS[@]}"; do
+    already_listed=0
+    for listed in ${unique_platforms[@]+"${unique_platforms[@]}"}; do
+        [ "$listed" = "$platform" ] && already_listed=1
+    done
+    [ "$already_listed" -eq 1 ] || unique_platforms+=("$platform")
+done
+PLATFORMS=("${unique_platforms[@]}")
+
 if [ "$PREMERGE_GATE" -eq 1 ] && [ "$MODE" = "clean" ]; then
     echo "--premerge-gate requires volume mode so .git metadata is available for drift and security checks." >&2
     exit 1
@@ -108,6 +120,20 @@ fi
 
 if [ "$SHELL_MODE" -eq 1 ] && [ "${#PLATFORMS[@]}" -ne 1 ]; then
     echo "--shell requires exactly one platform." >&2
+    exit 1
+fi
+
+for setting in BLORP_DOCKER_GATE_MAX_CONCURRENT BLORP_DOCKER_GATE_BUILD_JOBS; do
+    value="${!setting:-}"
+    case "$value" in
+        *[!0-9]*)
+            echo "$setting must be a non-negative integer, got '$value'." >&2
+            exit 1
+            ;;
+    esac
+done
+if [ "${BLORP_DOCKER_GATE_BUILD_JOBS:-1}" -eq 0 ]; then
+    echo "BLORP_DOCKER_GATE_BUILD_JOBS must be at least 1." >&2
     exit 1
 fi
 
@@ -122,6 +148,44 @@ if [ "$DRY_RUN" -eq 0 ]; then
         exit 1
     fi
 fi
+
+# At most this many gates run at once (BLORP_DOCKER_GATE_MAX_CONCURRENT).
+# Sizing, measured in one gate container on an 8-CPU Docker VM (16.3 GiB) that
+# was running three other gates: the compiler build's cgroup memory peaks at
+# 4.8 GiB with 8 clang jobs (the generate-C step before it peaks at 2.1 GiB),
+# 3.0 GiB with 4 jobs and 2.0 GiB with 2; the clang step takes 124 s, 157 s and
+# 229 s respectively. Three gates at the default 2 jobs each (8 CPUs / 3 slots)
+# peak near 6 GiB in their builds, which fits the VM with room for the test
+# phases. Re-measure and resize when the VM changes. `10#` keeps a value such
+# as 08 from being read as octal.
+DEFAULT_MAX_CONCURRENT_GATES=3
+DOCKER_GATE_MAX_CONCURRENT=$((10#${BLORP_DOCKER_GATE_MAX_CONCURRENT:-$DEFAULT_MAX_CONCURRENT_GATES}))
+
+# The compiler build compiles an 8-way split in parallel, and each clang job
+# holds several hundred MB, so a gate's peak memory grows with the job count.
+# Default to the Docker VM's CPUs shared among the gate slots, so a full set of
+# gates together uses about as many jobs as the VM has CPUs.
+# BLORP_DOCKER_GATE_BUILD_JOBS overrides it.
+DEFAULT_DOCKER_VM_CPUS=4
+MIN_BUILD_JOBS=2
+
+docker_gate_build_jobs() {
+    local cpus slots jobs
+    if [ -n "${BLORP_DOCKER_GATE_BUILD_JOBS:-}" ]; then
+        echo $((10#$BLORP_DOCKER_GATE_BUILD_JOBS))
+        return 0
+    fi
+    cpus="$(docker info --format '{{.NCPU}}' 2>/dev/null || true)"
+    case "$cpus" in
+        ''|*[!0-9]*|0) cpus="$DEFAULT_DOCKER_VM_CPUS" ;;
+    esac
+    slots="$DOCKER_GATE_MAX_CONCURRENT"
+    [ "$slots" -ge 1 ] || slots=1
+    jobs=$((cpus / slots))
+    [ "$jobs" -ge "$MIN_BUILD_JOBS" ] || jobs="$MIN_BUILD_JOBS"
+    echo "$jobs"
+}
+DOCKER_GATE_BUILD_JOBS="$(docker_gate_build_jobs)"
 
 platform_image_name() {
     local platform="$1"
@@ -159,31 +223,167 @@ docker_log_path() {
     echo "$DOCKER_LOG_DIR/$(platform_image_name "$platform").log"
 }
 
-# Each gate container builds the compiler, and generating its C takes several
-# GB, so too many at once exhaust the Docker VM's memory and the builds are
-# killed (exit 137). Wait until fewer than this many gate containers (any
-# `blorp-test-*` image, from any checkout) are running before starting one.
-# The check is not atomic: two gates starting together may both pass it.
-DOCKER_GATE_MAX_CONCURRENT="${BLORP_DOCKER_GATE_MAX_CONCURRENT:-2}"
-DOCKER_GATE_SLOT_POLL_SECONDS=15
+# Each gate container builds the compiler, which peaks at several GB, so too
+# many at once exhaust the Docker VM's memory and the builds are killed (exit
+# 137). A gate therefore holds a slot for the length of its `docker run`; at
+# most BLORP_DOCKER_GATE_MAX_CONCURRENT slots exist, and waiting gates are
+# served in arrival order.
+#
+# Slots are directories made with `mkdir`, which is atomic, so two gates
+# starting together cannot both take the last one. They live under one directory
+# that every checkout of this user shares (BLORP_DOCKER_GATE_SLOT_DIR, default
+# a directory under TMPDIR), each with an `owner` file naming the holder's pid
+# and start time, so a slot left by a killed gate is reclaimed. The queue is a
+# directory of numbered tickets, made the same way; only the oldest live ticket
+# may take a slot. Only gates running this script are counted: containers
+# started by an older copy of it (a branch that has not merged main) are not.
+DOCKER_GATE_SLOT_POLL_SECONDS="${BLORP_DOCKER_GATE_SLOT_POLL_SECONDS:-5}"
+DOCKER_GATE_SLOT_ROOT="${BLORP_DOCKER_GATE_SLOT_DIR:-${TMPDIR:-/tmp}/blorp-docker-gate-slots}"
+DOCKER_GATE_QUEUE_DIR="$DOCKER_GATE_SLOT_ROOT/queue"
+# A slot or ticket directory is made before its owner file is written. One with
+# no owner file is a claimant mid-write unless it is older than this.
+OWNERLESS_GRACE_MINUTES=1
+HELD_SLOT_DIR=""
+WAITING_TICKET_DIR=""
 
-running_gate_containers() {
-    docker ps --format '{{.Image}}' | grep -c '^blorp-test-' || true
+# A pid is reused over time, so a holder is identified by pid and start time.
+# ps prints the start time in the caller's time zone and locale, and the writer
+# and the reader of an owner file may differ, so pin both.
+process_start_time() {
+    LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true
 }
 
-wait_for_gate_slot() {
-    local running announced=0
+write_owner() {
+    local started
+    started="$(process_start_time "$$")"
+    if [ -z "$started" ]; then
+        echo "Cannot read this process's start time with ps; needed for gate slots." >&2
+        exit 1
+    fi
+    printf '%s\n%s\n' "$$" "$started" > "$1/owner"
+}
+
+# Whether the slot or ticket directory is held by a running gate. An owner file
+# without a start time is not one write_owner made, so it is dead.
+owner_is_alive() {
+    local dir="$1" pid="" started=""
+    [ -d "$dir" ] || return 1
+    if [ ! -s "$dir/owner" ]; then
+        [ -z "$(find "$dir" -maxdepth 0 -mmin "+$OWNERLESS_GRACE_MINUTES" 2>/dev/null)" ]
+        return
+    fi
+    { read -r pid; read -r started; } < "$dir/owner" || true
+    [ -n "$pid" ] && [ -n "$started" ] && [ "$(process_start_time "$pid")" = "$started" ]
+}
+
+# Makes the directory, or reports that someone else already has. Any other
+# failure (a full disk, permissions) is an error, not a lost race.
+claim_directory() {
+    if mkdir "$1" 2>/dev/null; then
+        return 0
+    fi
+    if [ ! -d "$1" ]; then
+        echo "Cannot create $1 for the Docker gate slots." >&2
+        exit 1
+    fi
+    return 1
+}
+
+# Takes the next ticket number; `mkdir` fails if another gate took it first.
+enqueue_ticket() {
+    local last highest ticket
+    mkdir -p "$DOCKER_GATE_QUEUE_DIR"
     while :; do
-        running="$(running_gate_containers)"
-        [ "$running" -lt "$DOCKER_GATE_MAX_CONCURRENT" ] && return 0
+        last="$(ls "$DOCKER_GATE_QUEUE_DIR" | grep '^ticket-[0-9]*$' | sort | tail -1 || true)"
+        highest=0
+        [ -z "$last" ] || highest=$((10#${last#ticket-}))
+        ticket="$(printf '%s/ticket-%08d' "$DOCKER_GATE_QUEUE_DIR" $((highest + 1)))"
+        if claim_directory "$ticket"; then
+            WAITING_TICKET_DIR="$ticket"
+            write_owner "$ticket"
+            return 0
+        fi
+    done
+}
+
+# Prints the oldest ticket whose gate is alive, discarding dead ones.
+queue_head() {
+    local name
+    for name in $(ls "$DOCKER_GATE_QUEUE_DIR" | grep '^ticket-[0-9]*$' | sort); do
+        if owner_is_alive "$DOCKER_GATE_QUEUE_DIR/$name"; then
+            echo "$DOCKER_GATE_QUEUE_DIR/$name"
+            return 0
+        fi
+        rm -rf "${DOCKER_GATE_QUEUE_DIR:?}/$name"
+    done
+}
+
+# Only the queue head calls this, so reclaiming a dead holder's slot cannot
+# race another claimant.
+try_take_slot() {
+    local number=1 slot
+    while [ "$number" -le "$DOCKER_GATE_MAX_CONCURRENT" ]; do
+        slot="$DOCKER_GATE_SLOT_ROOT/slot-$number"
+        if [ -d "$slot" ] && ! owner_is_alive "$slot"; then
+            rm -rf "$slot"
+        fi
+        if claim_directory "$slot"; then
+            HELD_SLOT_DIR="$slot"
+            write_owner "$slot"
+            return 0
+        fi
+        number=$((number + 1))
+    done
+    return 1
+}
+
+acquire_gate_slot() {
+    local announced=0
+    mkdir -p "$DOCKER_GATE_SLOT_ROOT"
+    enqueue_ticket
+    while :; do
+        if [ ! -d "$WAITING_TICKET_DIR" ]; then
+            enqueue_ticket
+        fi
+        if [ "$(queue_head)" = "$WAITING_TICKET_DIR" ] && try_take_slot; then
+            remove_if_owned "$WAITING_TICKET_DIR"
+            WAITING_TICKET_DIR=""
+            return 0
+        fi
         if [ "$announced" -eq 0 ]; then
-            echo "Waiting: $running gate containers running (limit $DOCKER_GATE_MAX_CONCURRENT, BLORP_DOCKER_GATE_MAX_CONCURRENT)."
+            echo "Waiting: for one of $DOCKER_GATE_MAX_CONCURRENT gate slots, first come first served (BLORP_DOCKER_GATE_MAX_CONCURRENT)."
             announced=1
         fi
         sleep "$DOCKER_GATE_SLOT_POLL_SECONDS"
     done
 }
 
+# Removes a slot or ticket directory only if this process still owns it: after
+# a mistaken reclaim it may belong to another gate by now.
+remove_if_owned() {
+    if [ -d "$1" ] && [ "$(head -1 "$1/owner" 2>/dev/null)" = "$$" ]; then
+        rm -rf "$1"
+    fi
+}
+
+# Also called from the EXIT trap, so an interrupted gate frees its slot and
+# its place in the queue.
+release_gate_slot() {
+    if [ -n "$HELD_SLOT_DIR" ]; then
+        remove_if_owned "$HELD_SLOT_DIR"
+        HELD_SLOT_DIR=""
+    fi
+    if [ -n "$WAITING_TICKET_DIR" ]; then
+        remove_if_owned "$WAITING_TICKET_DIR"
+        WAITING_TICKET_DIR=""
+    fi
+}
+
+# Every gate `docker run` passes --init. The container's PID 1 would otherwise
+# be the entrypoint's bash, which ignores the TERM that the docker client
+# forwards, so interrupting this script would leave the gate running in its
+# container for the rest of its hour. With --init, a tiny init is PID 1 and
+# passes the signal on.
 run_cmd_logged() {
     local log_file="$1"
     shift
@@ -193,18 +393,101 @@ run_cmd_logged() {
     if [ "$DRY_RUN" -eq 1 ]; then
         return 0
     fi
-    wait_for_gate_slot
-    "$@" | tee "$log_file"
+    local status=0 took_slot=0
+    if [ -z "$HELD_SLOT_DIR" ]; then
+        acquire_gate_slot
+        took_slot=1
+    fi
+    "$@" | tee "$log_file" || status=$?
+    [ "$took_slot" -eq 0 ] || release_gate_slot
+    return "$status"
 }
+
+# Whether this run should end in a nested gate verdict per platform. The
+# premerge gate and a bare test run print one; a run of named test files
+# (`bin/blorp test`), a shell, a build-only run and a dry run do not.
+expects_nested_verdicts() {
+    [ "$DRY_RUN" -eq 0 ] && [ "$BUILD_ONLY" -eq 0 ] && [ "$SHELL_MODE" -eq 0 ] &&
+        { [ "$PREMERGE_GATE" -eq 1 ] || [ "${#PASS_ARGS[@]}" -eq 0 ]; }
+}
+
+# Stop every child of this script, leaf first: TERM each process tree, poll
+# briefly for it to exit, then KILL and reap what remains. Children only, never
+# a process group. scripts/docker-gate and scripts/premerge-gate each carry
+# this helper, and scripts/test has the same logic in terminate_running_gates;
+# the scripts share no library, so keep them in step.
+TERMINATION_GRACE_POLLS=10
+TERMINATION_POLL_SECONDS=0.1
+
+list_child_pids() {
+    local parent="$1"
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -P "$parent" 2>/dev/null || true
+    else
+        ps -o pid= -P "$parent" 2>/dev/null | tr -d ' ' || true
+    fi
+}
+
+terminate_process_tree() {
+    local pid="$1"
+    local signal="${2:-TERM}"
+    local child
+    [ -n "$pid" ] || return 0
+    for child in $(list_child_pids "$pid"); do
+        terminate_process_tree "$child" "$signal"
+    done
+    kill -"$signal" "$pid" 2>/dev/null || true
+}
+
+# Whether `ps` shows the process as alive; a zombie awaiting `wait` is not.
+process_is_running() {
+    local state
+    state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+    [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+}
+
+terminate_child_processes() {
+    local children pid poll still_running
+    children=$(list_child_pids "$$")
+    [ -n "$children" ] || return 0
+    for pid in $children; do
+        terminate_process_tree "$pid" TERM
+    done
+    for poll in $(seq 1 "$TERMINATION_GRACE_POLLS"); do
+        still_running=0
+        for pid in $children; do
+            process_is_running "$pid" && still_running=1
+        done
+        [ "$still_running" -eq 1 ] || break
+        sleep "$TERMINATION_POLL_SECONDS"
+    done
+    for pid in $children; do
+        terminate_process_tree "$pid" KILL
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+# Set to 1 as the script's last statement. The EXIT trap treats any earlier
+# exit as a failure: a fatal signal (bash runs the EXIT trap with `$?` still
+# holding the last command's status, often 0) or a `set -e` abort. No signal is
+# trapped, because bash defers a trap until the foreground command finishes,
+# which would hold a TERM for the whole `docker run`.
+gate_finished=0
 
 docker_gate_verdict() {
     local exit_code=$?
-    local total_passed=0 total_failed=0 total_tests=0
+    # An interrupted run's `docker run | tee` would otherwise carry on, hold its
+    # container, and print a nested verdict after ours. Free the slot only once
+    # the container's client is gone.
+    [ "$gate_finished" -eq 1 ] || terminate_child_processes
+    release_gate_slot
+    local total_passed=0 total_failed=0 total_tests=0 verdicts=0
     local f line status passed failed tests overall="PASS"
     for f in "$DOCKER_LOG_DIR"/*.log; do
         [ -f "$f" ] || continue
         line=$(grep '^BLORP_GATE_RESULT gate=' "$f" | tail -1 || true)
         if [ -n "$line" ]; then
+            verdicts=$((verdicts + 1))
             status=$(printf '%s\n' "$line" | sed -n 's/.*status=\([A-Z]*\).*/\1/p')
             passed=$(printf '%s\n' "$line" | sed -n 's/.*passed=\([0-9]*\).*/\1/p')
             failed=$(printf '%s\n' "$line" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')
@@ -216,9 +499,15 @@ docker_gate_verdict() {
         fi
     done
     rm -rf "$DOCKER_LOG_DIR"
-    if [ "$exit_code" -ne 0 ]; then
+    [ "$exit_code" -eq 0 ] || overall="FAIL"
+    [ "$gate_finished" -eq 1 ] || overall="FAIL"
+    # A gate that was interrupted, or whose container died, printed no verdict
+    # of its own; that is a failure too.
+    if expects_nested_verdicts && [ "$verdicts" -lt "${#PLATFORMS[@]}" ]; then
         overall="FAIL"
     fi
+    # The exit status must agree with the verdict.
+    [ "$overall" = "PASS" ] || [ "$exit_code" -ne 0 ] || exit_code=1
     printf 'BLORP_GATE_RESULT gate=docker-gate status=%s passed=%s failed=%s tests=%s\n' \
         "$overall" "$total_passed" "$total_failed" "$total_tests"
     exit "$exit_code"
@@ -293,16 +582,24 @@ run_clean_tests() (
     image="$(platform_image_name "$platform")"
     clean_image="${image}-clean-$$"
     clean_dockerfile=$(mktemp)
-    trap "rm -f '$clean_dockerfile'; if [ '$DRY_RUN' -eq 0 ]; then docker rmi '$clean_image' 2>/dev/null || true; fi" EXIT
+    # This function is a subshell, so the parent's EXIT trap cannot see the slot
+    # it takes; release it here. An interrupted parent stops this subshell's
+    # children and then the subshell, which runs this trap on its way out; the
+    # trap ignores further signals so a second one cannot cut the release short.
+    trap "trap '' HUP INT TERM; release_gate_slot; rm -f '$clean_dockerfile'; if [ '$DRY_RUN' -eq 0 ]; then docker rmi '$clean_image' 2>/dev/null || true; fi" EXIT
 
     cat > "$clean_dockerfile" <<DEOF
 FROM $image
 COPY --chown=blorp:blorp . /blorp
 ENV BLORP_CLI_C_OPTIMIZATION=-O2
 ENV BLORP_CC=${BLORP_CC:-clang}
+ENV BLORP_CLI_C_SPLIT_JOBS=$DOCKER_GATE_BUILD_JOBS
 RUN make
 DEOF
 
+    # The image's `RUN make` is the same memory-heavy build a gate runs, so the
+    # slot covers it as well as the `docker run` below.
+    [ "$DRY_RUN" -eq 1 ] || acquire_gate_slot
     echo "Building hermetic image (platform: $platform)..."
     run_cmd docker build \
         --platform "$platform" \
@@ -312,10 +609,11 @@ DEOF
 
     echo "Running tests (hermetic, platform: $platform)..."
     if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
-        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm \
+        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm --init \
             --platform "$platform" \
             -e "BLORP_CLI_C_OPTIMIZATION=-O2" \
             -e "BLORP_CC=${BLORP_CC:-clang}" \
+            -e "BLORP_CLI_C_SPLIT_JOBS=$DOCKER_GATE_BUILD_JOBS" \
             -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
             -e "BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
             -e "BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
@@ -323,10 +621,11 @@ DEOF
             "$clean_image" \
             bash scripts/docker/entrypoint "${PASS_ARGS[@]}"
     else
-        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm \
+        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm --init \
             --platform "$platform" \
             -e "BLORP_CLI_C_OPTIMIZATION=-O2" \
             -e "BLORP_CC=${BLORP_CC:-clang}" \
+            -e "BLORP_CLI_C_SPLIT_JOBS=$DOCKER_GATE_BUILD_JOBS" \
             -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
             -e "BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
             -e "BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
@@ -342,11 +641,12 @@ run_volume_tests() {
     image="$(platform_image_name "$platform")"
     echo "Running tests (volume mount, platform: $platform)..."
     if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
-        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm \
+        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm --init \
             --platform "$platform" \
             -e BLORP_VOLUME_MODE=1 \
             -e "BLORP_CLI_C_OPTIMIZATION=-O2" \
             -e "BLORP_CC=${BLORP_CC:-clang}" \
+            -e "BLORP_CLI_C_SPLIT_JOBS=$DOCKER_GATE_BUILD_JOBS" \
             -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
             -e "BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
             -e "BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
@@ -355,11 +655,12 @@ run_volume_tests() {
             "$image" \
             bash /blorp/scripts/docker/entrypoint "${PASS_ARGS[@]}"
     else
-        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm \
+        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm --init \
             --platform "$platform" \
             -e BLORP_VOLUME_MODE=1 \
             -e "BLORP_CLI_C_OPTIMIZATION=-O2" \
             -e "BLORP_CC=${BLORP_CC:-clang}" \
+            -e "BLORP_CLI_C_SPLIT_JOBS=$DOCKER_GATE_BUILD_JOBS" \
             -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
             -e "BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
             -e "BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
@@ -376,12 +677,13 @@ run_volume_premerge_gate() {
     image="$(platform_image_name "$platform")"
     echo "Running premerge gate (volume mount, platform: $platform)..."
     if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
-        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm \
+        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm --init \
             --platform "$platform" \
             -e BLORP_VOLUME_MODE=1 \
             -e BLORP_DOCKER_PREMERGE_GATE=1 \
             -e "BLORP_CLI_C_OPTIMIZATION=-O2" \
             -e "BLORP_CC=${BLORP_CC:-clang}" \
+            -e "BLORP_CLI_C_SPLIT_JOBS=$DOCKER_GATE_BUILD_JOBS" \
             -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
             -e "BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
             -e "BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
@@ -391,12 +693,13 @@ run_volume_premerge_gate() {
             "$image" \
             bash /blorp/scripts/docker/entrypoint "${PASS_ARGS[@]}"
     else
-        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm \
+        run_cmd_logged "$(docker_log_path "$platform")" docker run --rm --init \
             --platform "$platform" \
             -e BLORP_VOLUME_MODE=1 \
             -e BLORP_DOCKER_PREMERGE_GATE=1 \
             -e "BLORP_CLI_C_OPTIMIZATION=-O2" \
             -e "BLORP_CC=${BLORP_CC:-clang}" \
+            -e "BLORP_CLI_C_SPLIT_JOBS=$DOCKER_GATE_BUILD_JOBS" \
             -e "BLORP_TEST_TIMEOUT=${BLORP_TEST_TIMEOUT:-30}" \
             -e "BLORP_RUNTIME_TEST_TIMEOUT=${BLORP_RUNTIME_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
             -e "BLORP_LEAK_TEST_TIMEOUT=${BLORP_LEAK_TEST_TIMEOUT:-${BLORP_TEST_TIMEOUT:-60}}" \
@@ -432,3 +735,5 @@ run_for_platform() {
 for platform in "${PLATFORMS[@]}"; do
     run_for_platform "$platform"
 done
+
+gate_finished=1

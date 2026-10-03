@@ -32,8 +32,77 @@ example_timeout=10
 # own as the last line of stdout, however the script exits.
 PREMERGE_TEST_LOG=$(mktemp "${TMPDIR:-/tmp}/blorp-premerge-test.XXXXXX")
 
+# Stop every child of this script, leaf first: TERM each process tree, poll
+# briefly for it to exit, then KILL and reap what remains. Children only, never
+# a process group. scripts/docker-gate and scripts/premerge-gate each carry
+# this helper, and scripts/test has the same logic in terminate_running_gates;
+# the scripts share no library, so keep them in step.
+TERMINATION_GRACE_POLLS=10
+TERMINATION_POLL_SECONDS=0.1
+
+list_child_pids() {
+    local parent="$1"
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -P "$parent" 2>/dev/null || true
+    else
+        ps -o pid= -P "$parent" 2>/dev/null | tr -d ' ' || true
+    fi
+}
+
+terminate_process_tree() {
+    local pid="$1"
+    local signal="${2:-TERM}"
+    local child
+    [ -n "$pid" ] || return 0
+    for child in $(list_child_pids "$pid"); do
+        terminate_process_tree "$child" "$signal"
+    done
+    kill -"$signal" "$pid" 2>/dev/null || true
+}
+
+# Whether `ps` shows the process as alive; a zombie awaiting `wait` is not.
+process_is_running() {
+    local state
+    state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+    [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+}
+
+terminate_child_processes() {
+    local children pid poll still_running
+    children=$(list_child_pids "$$")
+    [ -n "$children" ] || return 0
+    for pid in $children; do
+        terminate_process_tree "$pid" TERM
+    done
+    for poll in $(seq 1 "$TERMINATION_GRACE_POLLS"); do
+        still_running=0
+        for pid in $children; do
+            process_is_running "$pid" && still_running=1
+        done
+        [ "$still_running" -eq 1 ] || break
+        sleep "$TERMINATION_POLL_SECONDS"
+    done
+    for pid in $children; do
+        terminate_process_tree "$pid" KILL
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+# Set to 1 as the script's last statement. The EXIT trap treats any earlier
+# exit as a failure: a fatal signal (bash runs the EXIT trap with `$?` still
+# holding the last command's status, often 0) or a `set -e` abort. No signal is
+# trapped, because bash defers a trap until the foreground command finishes,
+# which would hold a TERM for the whole `scripts/test | tee`.
+gate_finished=0
+# `--help` and `--dry-run` validate nothing, so they print no verdict (a failed
+# dry run still prints FAIL).
+print_passing_verdict=1
+
 premerge_gate_verdict() {
     local exit_code=$?
+    # An interrupted run's `scripts/test | tee` would otherwise carry on and
+    # print its own verdict after ours.
+    [ "$gate_finished" -eq 1 ] || terminate_child_processes
     local total_passed=0 total_failed=0 total_tests=0 overall="PASS"
     local line status
     line=$(grep '^BLORP_GATE_RESULT gate=' "$PREMERGE_TEST_LOG" 2>/dev/null | tail -1 || true)
@@ -45,8 +114,12 @@ premerge_gate_verdict() {
         total_tests=$(printf '%s\n' "$line" | sed -n 's/.*tests=\([0-9]*\).*/\1/p')
         [ "$status" = "FAIL" ] && overall="FAIL"
     fi
-    if [ "$exit_code" -ne 0 ]; then
-        overall="FAIL"
+    [ "$exit_code" -eq 0 ] || overall="FAIL"
+    [ "$gate_finished" -eq 1 ] || overall="FAIL"
+    # The exit status must agree with the verdict.
+    [ "$overall" = "PASS" ] || [ "$exit_code" -ne 0 ] || exit_code=1
+    if [ "$overall" = "PASS" ] && [ "$print_passing_verdict" -eq 0 ]; then
+        exit "$exit_code"
     fi
     printf 'BLORP_GATE_RESULT gate=premerge-gate status=%s passed=%s failed=%s tests=%s\n' \
         "$overall" "${total_passed:-0}" "${total_failed:-0}" "${total_tests:-0}"
@@ -173,10 +246,13 @@ while [ $# -gt 0 ]; do
             ;;
         --dry-run)
             dry_run=1
+            print_passing_verdict=0
             shift
             ;;
         -h|--help)
             usage
+            print_passing_verdict=0
+            gate_finished=1
             exit 0
             ;;
         *)
@@ -562,3 +638,5 @@ run_step_fn "Drift and hygiene" run_drift_checks
 
 echo ""
 echo "Premerge gate passed in $(elapsed_since "$gate_start")."
+
+gate_finished=1

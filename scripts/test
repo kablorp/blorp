@@ -57,6 +57,12 @@ format_seconds() {
     fi
 }
 
+# The verdict for a run that ended before the summary: a bad flag, a failed
+# build, an interruption. `--help` is the one exit that claims nothing.
+print_failed_verdict() {
+    printf 'BLORP_GATE_RESULT gate=test status=FAIL passed=0 failed=0 tests=0\n'
+}
+
 usage() {
     echo "Usage: $runner_label [options] [compiler-blorp] [compiler-tools] [compiler-core-sanitize] [compiler-blorp-sanitize] [compiler-new] [compiler-new-parity] [front-end-existing] [std-check] [runtime] [leak] [doctest] [cli] [cli-deep] [lsp] [package]"
     cat <<'EOF'
@@ -104,6 +110,7 @@ while [ $# -gt 0 ]; do
             if [ $# -eq 0 ]; then
                 echo "Error: --log-dir requires a directory path." >&2
                 usage
+                print_failed_verdict
                 exit 1
             fi
             log_dir="$1"
@@ -126,6 +133,7 @@ while [ $# -gt 0 ]; do
         *)
             echo "Unknown argument: $arg"
             usage
+            print_failed_verdict
             exit 1
             ;;
     esac
@@ -374,13 +382,6 @@ terminate_process_tree() {
     kill -"$signal" "$pid" 2>/dev/null || true
 }
 
-wait_for_tracked_pids() {
-    local pid
-    for pid in "$@"; do
-        [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
-    done
-}
-
 cleanup_gate_tmpdir() {
     if [ -n "$gate_tmpdir" ]; then
         rm -rf "$gate_tmpdir"
@@ -388,33 +389,62 @@ cleanup_gate_tmpdir() {
     fi
 }
 
-terminate_parallel_gates() {
-    local pid
-    if [ ${#gate_pids[@]} -gt 0 ]; then
-        for pid in "${gate_pids[@]}"; do
-            terminate_process_tree "$pid" TERM
+# Whether `ps` shows the process as alive; a zombie awaiting `wait` is not.
+process_is_running() {
+    local state
+    state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+    [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+}
+
+TERMINATION_GRACE_POLLS=10
+TERMINATION_POLL_SECONDS=0.1
+
+# Stop every gate still running under this script, in the foreground (serial
+# mode) or the background (parallel waves): TERM each process tree, give it a
+# moment, then KILL what remains.
+terminate_running_gates() {
+    local children pid poll still_running
+    children=$(list_child_pids "$$")
+    [ -n "$children" ] || return 0
+    echo "Terminating running test gates..." >&2
+    for pid in $children; do
+        terminate_process_tree "$pid" TERM
+    done
+    for poll in $(seq 1 "$TERMINATION_GRACE_POLLS"); do
+        still_running=0
+        for pid in $children; do
+            process_is_running "$pid" && still_running=1
         done
-        sleep 1
-        for pid in "${gate_pids[@]}"; do
-            terminate_process_tree "$pid" KILL
-        done
-        wait_for_tracked_pids "${gate_pids[@]}"
-        gate_pids=()
-        gate_names=()
+        [ "$still_running" -eq 1 ] || break
+        sleep "$TERMINATION_POLL_SECONDS"
+    done
+    for pid in $children; do
+        terminate_process_tree "$pid" KILL
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+# Set to 1 once the verdict line has printed. Any earlier exit (a fatal signal,
+# a failed build, an aborted gate) reports FAIL from the EXIT trap, so the
+# script never ends without a verdict that agrees with its exit status. No
+# signal is trapped: bash defers a trap until the foreground command finishes,
+# which in serial mode would hold a TERM for the length of a whole gate. Bash
+# does run the EXIT trap immediately when a fatal signal arrives, though `$?`
+# is then not reliable, hence this flag.
+gate_finished=0
+
+report_unfinished_gate() {
+    local exit_code=$?
+    trap - EXIT
+    if [ "$gate_finished" -eq 0 ]; then
+        terminate_running_gates
+        print_failed_verdict
+        [ "$exit_code" -ne 0 ] || exit_code=1
     fi
-}
-
-on_interrupt() {
-    echo "" >&2
-    echo "Interrupted; terminating test gates..." >&2
-    trap - INT TERM EXIT
-    terminate_parallel_gates
     cleanup_gate_tmpdir
-    exit 130
+    exit "$exit_code"
 }
-
-trap on_interrupt INT TERM
-trap cleanup_gate_tmpdir EXIT
+trap report_unfinished_gate EXIT
 
 if $release_compiler; then
     export BLORP_CLI_C_OPTIMIZATION=-O2
@@ -2181,6 +2211,7 @@ fi
 
 printf 'BLORP_GATE_RESULT gate=test status=%s passed=%s failed=%s tests=%s\n' \
     "$overall" "$total_passed" "$total_failed" "$total_tests"
+gate_finished=1
 
 if [ "$overall" = "FAIL" ]; then
     exit 1

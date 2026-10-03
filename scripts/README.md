@@ -156,6 +156,21 @@ counts are the aggregate across every gate that ran, matching the human
 this line instead of grepping prose; it is the same `BLORP_GATE_RESULT`
 format individual gates already emit for their own sub-results.
 
+`scripts/test`, `scripts/premerge-gate` and `scripts/docker-gate`, when
+interrupted (SIGTERM, SIGINT, SIGHUP) or aborted before they finish, print
+`status=FAIL` and exit nonzero, immediately. Each marks itself finished as its
+last statement and its EXIT trap reports FAIL otherwise; none traps a signal,
+because bash holds a trapped signal until the foreground command (a
+`docker run`, a gate) completes. `docker-gate` also reports FAIL when a
+premerge or bare test run produced no nested verdict. Before reporting FAIL,
+each of the three stops its own child processes (not a process group), so an
+interrupted run leaves nothing behind that could print a late verdict;
+`docker-gate` starts its containers with `--init` so the forwarded TERM
+stops the container too. `--help` prints no verdict, and neither does
+`premerge-gate --dry-run` (a verdict would claim a validation that did not
+run); a bad `scripts/test` flag prints FAIL.
+`blorp/test/build/test_gate_interrupt_verdicts.sh` covers this.
+
 ## Validation Evidence Packets
 
 Use `scripts/record-validation` when a reviewer needs a reproducible packet for
@@ -304,9 +319,32 @@ Modes:
 - Default volume mode mounts the working tree into the container.
 - `--clean` copies source into the image for a more CI-like run.
 - `--premerge-gate` runs `scripts/premerge-gate --no-docker` inside Docker.
-- Each gate builds the compiler inside its container, which takes several GB,
-  so `scripts/docker-gate` waits until fewer than `BLORP_DOCKER_GATE_MAX_CONCURRENT`
-  (default 2) gate containers are running before it starts one.
+- Each gate builds the compiler inside its container, which peaks at several
+  GB, so `scripts/docker-gate` limits both how many gates run and how hard each
+  builds:
+  - A gate holds one of `BLORP_DOCKER_GATE_MAX_CONCURRENT` (default 3) slots
+    for the length of its `docker run`; later gates wait in a queue and are
+    served in arrival order. Slots and queue tickets are directories made with
+    `mkdir` (atomic, so simultaneous gates cannot both take the last slot)
+    under `BLORP_DOCKER_GATE_SLOT_DIR` (default
+    `${TMPDIR:-/tmp}/blorp-docker-gate-slots`), shared by every checkout that
+    sees the same directory. Each has an owner file with the holder's pid and
+    start time; a slot left by a killed gate is reclaimed, and an interrupted
+    gate frees its slot on the way out. A `--clean` run holds its slot for the
+    image build (the memory-heavy `make`) as well as the container run. A
+    gate killed with SIGKILL leaves its slot to be reclaimed, and its
+    `docker run` container keeps running until it ends. A cap of 0 never
+    admits a gate; lowering the cap lets gates already holding a higher slot
+    finish, so briefly more than the new cap may run.
+  - Only gates running a `docker-gate` that has this mechanism are counted.
+    Containers started by an older copy (a branch that has not merged `main`)
+    cannot be governed, so merge `main` into a branch to get the limit. A
+    different `TMPDIR` is a different pool; set `BLORP_DOCKER_GATE_SLOT_DIR`
+    to share one.
+  - The build's parallel `clang` jobs (`BLORP_CLI_C_SPLIT_JOBS`) default to the
+    Docker VM's CPU count divided by the slot count, at least 2; set
+    `BLORP_DOCKER_GATE_BUILD_JOBS` to override. Fewer jobs lower a gate's peak
+    memory at some cost in build time.
 
 ## Landing a Branch
 
