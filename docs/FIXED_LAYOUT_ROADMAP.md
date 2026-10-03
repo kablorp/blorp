@@ -175,6 +175,13 @@ origin and records an explicit trivial inline-field ownership fact. This
 metadata does not yet admit managed fixed fields or change ownership/codegen;
 see the [R2 Core metadata checkpoint](../benchmarks/results/fixed_layout_r2_core_metadata_2026-10-03.md).
 
+Policy-authority checkpoint complete: Core can distinguish a declaration-tagged
+owned inline `String` field from existing managed values, but production
+ownership inference and all C-emitter entries reject that Core until
+field-wise copy/drop and erased-placement rules are implemented. The public
+managed-field restriction remains in force; this is not runtime owned-field
+support. See the [R2 inline policy checkpoint](../benchmarks/results/fixed_layout_r2_inline_policy_2026-10-03.md).
+
 Implement one vertical slice for a direct `String` or heap-record field in a
 non-generic fixed record, then expand to nested fixed records and other
 managed fields. A value has no ARC header of its own; its fields still have

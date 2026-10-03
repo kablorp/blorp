@@ -6,7 +6,9 @@ import:
 	../stage_06_typecheck/type_system/semantic_type: display_type_name
 	../stage_06_typecheck/type_system/type_name_metadata as TypeNameMetadata
 	ir:
-		CoreDecl(HeapRecordDecl, UnionDecl),
+		CoreDecl(HeapRecordDecl, UnionDecl, ValueRecordDecl),
+		CoreInlineFieldOwnership(OwnedArcInlineField, TrivialInlineField),
+		CoreValueRecordOrigin(FixedRecordOrigin, LegacyStructOrigin),
 		CoreDimOp(DimAdd, DimDivide, DimMultiply, DimSubtract),
 		CoreImplDecl,
 		CoreProgram,
@@ -46,6 +48,130 @@ private RESOURCE_SOURCE_CORE_TYPE_NAME: String = "stream__ResourceSource"
 private RECV_ATTEMPT_CORE_TYPE_NAME: String = "channel__RecvAttempt"
 
 opaque type ManagedTypeIndex = Set[String]
+
+
+---
+Declaration authority for owned inline values. The public fixed-record header
+still rejects owned fields; this index makes the future ownership distinction
+explicit without changing pointer-layout classification.
+---
+opaque type CoreInlineOwnershipIndex = Set[String]
+
+
+union CoreOwnershipKind:
+	TrivialValue
+	ExistingManagedValue
+	InlineOwnedValue(String)
+	StackResultValue
+
+
+union CoreInlineOwnershipError:
+	LegacyStructOwnedField(String, String)
+	ManagedInlineFieldMissingOwnership(String, String)
+	UnsupportedOwnedInlineField(String, String)
+	OwnedInlineFieldNotYetSupported(String)
+
+
+pure func core_inline_ownership_error_message(error: CoreInlineOwnershipError) -> String:
+	match error:
+		LegacyStructOwnedField(record_name, field_name):
+			"legacy struct `${record_name}` cannot own inline field `${field_name}`"
+		ManagedInlineFieldMissingOwnership(record_name, field_name):
+			"value record `${record_name}` has managed field `${field_name}` without inline ownership metadata"
+		UnsupportedOwnedInlineField(record_name, field_name):
+			"fixed record `${record_name}` has unsupported owned inline field `${field_name}`; only String is classified"
+		OwnedInlineFieldNotYetSupported(record_name):
+			"owned inline fixed record `${record_name}` is not supported by the current Core ownership/emission pipeline"
+
+
+pure func build_core_inline_ownership_index(
+	program: CoreProgram,
+) -> Result[CoreInlineOwnershipIndex, CoreInlineOwnershipError]:
+	var owned_names: Set[String] = Sets.set()
+	var failure: Option[CoreInlineOwnershipError] = None
+	managed_index: ManagedTypeIndex = managed_type_index(program)
+
+	for decl in program.decls:
+		match decl:
+			ValueRecordDecl(record_decl):
+				for field in record_decl.fields:
+					if failure.is_none():
+						match field.ownership:
+							TrivialInlineField:
+								if core_type_requires_ownership(managed_index, field.typ):
+									failure = Some(ManagedInlineFieldMissingOwnership(record_decl.name, field.name))
+							OwnedArcInlineField:
+								match record_decl.origin:
+									LegacyStructOrigin:
+										failure = Some(LegacyStructOwnedField(record_decl.name, field.name))
+									FixedRecordOrigin:
+										if field.typ != NamedType("String", []):
+											failure = Some(UnsupportedOwnedInlineField(record_decl.name, field.name))
+										else:
+											owned_names = Sets.add(owned_names, record_decl.name)
+			_:
+				void
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(into_opaque CoreInlineOwnershipIndex(owned_names))
+
+
+---
+`ExistingManagedValue` combines existing ownership-work authorities, not an
+ARC-pointer ABI or release policy. Some managed types use inline
+representations; later policy consumers must still consult their layout.
+---
+pure func core_ownership_kind(
+	inline_index: CoreInlineOwnershipIndex,
+	managed_index: ManagedTypeIndex,
+	typ: CoreType,
+) -> CoreOwnershipKind:
+	owned_names: Set[String] = from_opaque CoreInlineOwnershipIndex(inline_index)
+	match typ:
+		StackResultType(_, _):
+			StackResultValue
+		NamedType(name, args):
+			if args.is_empty() and Sets.contains(owned_names, name):
+				InlineOwnedValue(name)
+			else if core_type_requires_ownership(managed_index, typ):
+				ExistingManagedValue
+			else:
+				TrivialValue
+		ValueRecordType(name):
+			if Sets.contains(owned_names, name):
+				InlineOwnedValue(name)
+			else:
+				TrivialValue
+		_:
+			if core_type_requires_ownership(managed_index, typ):
+				ExistingManagedValue
+			else:
+				TrivialValue
+
+
+--- No owned-inline declaration may reach Perceus or any emitter entry yet. ---
+pure func validate_core_inline_ownership_for_current_pipeline(
+	program: CoreProgram,
+) -> Result[Void, CoreInlineOwnershipError]:
+	index ?= build_core_inline_ownership_index(program)
+	owned_names: Set[String] = from_opaque CoreInlineOwnershipIndex(index)
+	var failure: Option[CoreInlineOwnershipError] = None
+	for decl in program.decls:
+		if failure.is_none():
+			match decl:
+				ValueRecordDecl(record_decl):
+					if Sets.contains(owned_names, record_decl.name):
+						failure = Some(OwnedInlineFieldNotYetSupported(record_decl.name))
+				_:
+					void
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
 
 
 pure func core_named_type_has_structural_equality(name: String) -> Bool:
@@ -495,3 +621,21 @@ pure func release_policy_requires_release(policy: CoreReleasePolicy) -> Bool:
 			True
 		StackResultReleasePolicy:
 			True
+
+
+---
+Conservative ownership-work classification for today's Core value fields.
+The three existing authorities are not identical: nullable payload policy
+knows some flattened resource handle names omitted by the direct cleanup
+policy, while the managed index knows declared heap records. This does not
+select a release ABI for a future owned-inline field.
+---
+pure func core_type_requires_ownership(index: ManagedTypeIndex, typ: CoreType) -> Bool:
+	if is_managed_type(index, typ) or release_policy_requires_release(cleanup_release_policy_for_type(typ)):
+		True
+	else:
+		match nullable_managed_option_payload_release_policy(typ):
+			Some(policy):
+				release_policy_requires_release(policy)
+			None:
+				False
