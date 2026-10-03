@@ -38,7 +38,10 @@ closure, generic-call or foreign ABIs may need an explicit transport box;
 document and test each such boundary instead of silently weakening `fixed`.
 `fixed` and the numeric `Fixed` type are unrelated.
 
-The syntax target (not valid today) is:
+These examples mix current R1 syntax with future targets: `fixed record Point`
+(with unmanaged fields) and ordinary `record Box[T]` are valid today;
+`fixed union` and managed fixed fields are not. Parameterized fixed
+declarations remain errors:
 
 ```blorp
 fixed record Point {x: Float, y: Float}
@@ -83,16 +86,17 @@ Blorp's existing no-cyclic-values rule.
 
 ## Current starting point
 
-- The parser represents `record`/`struct` as one declaration with `is_struct`
-  and `union`/`enum` as one with `is_enum` in
-  `blorp/src/compiler/stage_03_parse/parsed_ast.brp`. The newer discovery
-  parser also distinguishes all four in
+- The parser represents `record`/`struct`/`fixed record` as one declaration
+  with `RecordDeclarationForm` variants, and `union`/`enum` as one with
+  `is_enum`, in `blorp/src/compiler/stage_03_parse/parsed_ast.brp`. The newer
+  discovery parser also distinguishes these declaration forms in
   `blorp/src/compiler_new/stage_01_discovery/parse/declaration_parser.brp`.
   `blorp/src/format/` has its own declaration representation. A syntax change
   must reach both parsers and the formatter while both front ends exist.
-- `stage_06_typecheck/headers/type_header_graph.brp` already validates
-  `ValueStruct` versus `HeapRecord`, `FieldlessEnum` versus `TaggedUnion`,
-  rejects struct type parameters, and detects infinitely sized inline cycles.
+- `stage_06_typecheck/headers/type_header_graph.brp` already distinguishes
+  `ValueStruct`, `FixedValueRecord`, and `HeapRecord`, alongside `FieldlessEnum`
+  and `TaggedUnion`; it rejects parameters on both value-record forms and
+  detects infinitely sized inline cycles.
   Extend that boundary rather than guessing from names in lowering.
 - `stage_09_core/ir.brp` currently distinguishes `ValueRecordType`,
   `HeapRecordType`, `EnumType`, `UnionType` and `TupleType`; the C type and

@@ -37,9 +37,10 @@ compile error; explicit state should be threaded through values instead.
 
 ### Inline Values
 
-Primitive scalars, enums, opaque scalar representations, and valid `struct`
-values are copied directly. A struct is unmanaged and therefore may contain
-only fields with valid inline unmanaged representation.
+Primitive scalars, enums, opaque scalar representations, and valid `fixed record`
+or legacy `struct` values are copied directly. Both value-record forms are
+currently unmanaged and may contain only fields with valid inline unmanaged
+representation.
 
 ### Managed Values
 
@@ -65,7 +66,7 @@ items = items.append(2)
 
 Ignoring the returned value leaves `items` unchanged at the source level.
 
-## Records And Structs
+## Records, Fixed Records, And Structs
 
 `record` values are managed heap values with COW behavior. Record update always
 creates a new logical value:
@@ -80,9 +81,11 @@ q: Point = { p | x = 10 }
 `p` remains `{x = 1, y = 2}` and `q` is `{x = 10, y = 2}`. The compiler may
 reuse `p`'s allocation when ownership proves no other live value can observe it.
 
-`struct` values are inline and unmanaged. They are appropriate for small value
-records whose complete field graph is inline. Field declaration order remains
-source order; ordinary C alignment and padding apply.
+`fixed record` values are inline and unmanaged in the current implementation.
+The legacy `struct` spelling has the same value layout and field restriction;
+use `fixed record` for new declarations. Both are appropriate for small values
+whose complete field graph is inline. Field declaration order remains source
+order; ordinary C alignment and padding apply.
 
 ## Option And Result
 
@@ -211,7 +214,7 @@ record Node {
 }
 ```
 
-An infinitely inline record/struct product is rejected during type-header
+An infinitely inline fixed-record/struct product is rejected during type-header
 validation. The absence of cycles is what lets ARC reclaim values without a
 cycle collector.
 
