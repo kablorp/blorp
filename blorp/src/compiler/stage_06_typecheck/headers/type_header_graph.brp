@@ -38,6 +38,7 @@ import:
 		NameId,
 		name_ids_equal,
 	../../stage_03_parse/parsed_ast:
+		RecordDeclarationForm(OrdinaryRecord, LegacyStruct, FixedRecord),
 		ParsedBuiltinTypeDecl,
 		ParsedDimBinaryOp(
 			ParsedDimAddOp, ParsedDimDivideOp, ParsedDimMultiplyOp, ParsedDimSubtractOp,
@@ -283,6 +284,14 @@ union TypeShapeResolutionError:
 enum RecordLayout:
 	HeapRecord
 	ValueStruct
+	FixedValueRecord
+
+
+--- Both value forms use the current unmanaged, by-value C layout in R1.
+pure func record_layout_is_value(layout: RecordLayout) -> Bool:
+	match layout:
+		HeapRecord: False
+		ValueStruct | FixedValueRecord: True
 
 
 enum UnionLayout:
@@ -497,8 +506,11 @@ union TypeHeaderError:
 	TypeHeaderFieldDefinitionMissing(TypeId, String, SourceLocation)
 	TypeHeaderInvalidEnumTypeParameters(TypeId)
 	TypeHeaderInvalidStructTypeParameters(TypeId)
+	TypeHeaderInvalidFixedRecordParameters(TypeId)
 	TypeHeaderEmptyStruct(TypeId)
+	TypeHeaderEmptyFixedRecord(TypeId)
 	TypeHeaderInvalidStructField(TypeId, String)
+	TypeHeaderInvalidFixedRecordField(TypeId, String)
 	TypeHeaderRecursiveValueLayout(TypeId, Bool)
 	TypeHeaderInlineStorageCycle(List[TypeId], List[String])
 
@@ -1915,21 +1927,31 @@ private pure func build_record_header(
 ) -> TypeHeaderBuildResult:
 	var errors: List[TypeHeaderError] = []
 
-	if decl.is_struct and not parameters.is_empty():
-		errors = errors.append(TypeHeaderInvalidStructTypeParameters(context.owner))
+	if not parameters.is_empty():
+		match decl.form:
+			OrdinaryRecord: void
+			LegacyStruct:
+				errors = errors.append(TypeHeaderInvalidStructTypeParameters(context.owner))
+			FixedRecord:
+				errors = errors.append(TypeHeaderInvalidFixedRecordParameters(context.owner))
 
-	if decl.is_struct and decl.fields.is_empty():
-		errors = errors.append(TypeHeaderEmptyStruct(context.owner))
+	if decl.fields.is_empty():
+		match decl.form:
+			OrdinaryRecord: void
+			LegacyStruct:
+				errors = errors.append(TypeHeaderEmptyStruct(context.owner))
+			FixedRecord:
+				errors = errors.append(TypeHeaderEmptyFixedRecord(context.owner))
 
 	match resolve_fields(context, decl.fields):
 		Err(field_errors):
 			TypeHeaderRejected(errors.concat(field_errors))
 		Ok(fields):
 			if errors.is_empty():
-				layout = if decl.is_struct:
-					ValueStruct
-				else:
-					HeapRecord
+				layout = match decl.form:
+					OrdinaryRecord: HeapRecord
+					LegacyStruct: ValueStruct
+					FixedRecord: FixedValueRecord
 
 				TypeHeaderReady({
 					id = context.owner,
@@ -2293,7 +2315,7 @@ private pure func resolved_shape_supports_stack_option(
 			match type_header_table_find(table, id):
 				Some(header):
 					match header.shape:
-						RecordTypeHeader(ValueStruct, _):
+						RecordTypeHeader(ValueStruct, _) | RecordTypeHeader(FixedValueRecord, _):
 							True
 						RecordTypeHeader(HeapRecord, _):
 							False
@@ -2350,7 +2372,7 @@ private pure func resolved_shape_inline_dependencies(
 			match type_header_table_find(table, id):
 				Some(header):
 					match header.shape:
-						RecordTypeHeader(ValueStruct, _):
+						RecordTypeHeader(ValueStruct, _) | RecordTypeHeader(FixedValueRecord, _):
 							[id]
 						RecordTypeHeader(HeapRecord, _):
 							[]
@@ -2420,7 +2442,7 @@ private pure func type_header_inline_dependencies(
 	header: TypeHeader,
 ) -> List[TypeId]:
 	match header.shape:
-		RecordTypeHeader(ValueStruct, fields):
+		RecordTypeHeader(ValueStruct, fields) | RecordTypeHeader(FixedValueRecord, fields):
 			resolved_shapes_inline_dependencies(
 				table,
 				fields.map(func(field): field.typ),
@@ -2606,7 +2628,7 @@ private pure func resolved_shape_is_valid_struct_field(
 							UnionTypeHeader(FieldlessEnum, _):
 								valid = args.is_empty()
 								complete = True
-							RecordTypeHeader(ValueStruct, _):
+							RecordTypeHeader(ValueStruct, _) | RecordTypeHeader(FixedValueRecord, _):
 								valid = args.is_empty()
 								complete = True
 							AliasTypeHeader(_, target):
@@ -2645,6 +2667,10 @@ private pure func invalid_struct_field_errors(table: TypeHeaderTable) -> List[Ty
 				for field in fields:
 					if not resolved_shape_is_valid_struct_field(table, field.typ, []):
 						errors = errors.append(TypeHeaderInvalidStructField(header.id, field.name))
+			RecordTypeHeader(FixedValueRecord, fields):
+				for field in fields:
+					if not resolved_shape_is_valid_struct_field(table, field.typ, []):
+						errors = errors.append(TypeHeaderInvalidFixedRecordField(header.id, field.name))
 			_:
 				void
 
@@ -3988,11 +4014,21 @@ pure func type_header_error_message(
 				definition_table,
 				id,
 			).get_or("<unknown type>") + "' cannot have type parameters"
+		TypeHeaderInvalidFixedRecordParameters(id):
+			"fixed record '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "' cannot have type or dimension parameters\n" + "help: use an ordinary record declaration when parameters are needed"
 		TypeHeaderEmptyStruct(id):
 			"Struct '" + type_id_name(
 				definition_table,
 				id,
 			).get_or("<unknown type>") + "' must have at least one field"
+		TypeHeaderEmptyFixedRecord(id):
+			"fixed record '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "' must have at least one field\n" + "help: add a field, or use an ordinary record for an empty value"
 		TypeHeaderInvalidStructField(id, field_name):
 			"Struct '" + type_id_name(
 				definition_table,
@@ -4000,6 +4036,11 @@ pure func type_header_error_message(
 			).get_or(
 				"<unknown type>",
 			) + "' field '" + field_name + ("' has invalid storage: struct fields must be scalar values, fieldless enums, " + "or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples")
+		TypeHeaderInvalidFixedRecordField(id, field_name):
+			"fixed record '" + type_id_name(
+				definition_table,
+				id,
+			).get_or("<unknown type>") + "' field '" + field_name + "' cannot contain a managed value yet: fixed layout is shallow, but owned fields are not supported yet\n" + "help: use an ordinary record until managed fixed fields are supported"
 		TypeHeaderRecursiveValueLayout(id, is_direct):
 			if is_direct:
 				"Type '" + type_id_name(
@@ -4027,7 +4068,7 @@ pure func type_header_error_span(
 	error: TypeHeaderError,
 ) -> Option[SourceLocation]:
 	match error:
-		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
+		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderInvalidFixedRecordParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderEmptyFixedRecord(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderInvalidFixedRecordField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
 			type_id_source_span(definition_table, id)
 		TypeHeaderFieldDefinitionMissing(_, _, span):
 			Some(span)

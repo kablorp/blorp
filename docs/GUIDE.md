@@ -1171,9 +1171,28 @@ Each field name appears once in a declaration, a record literal and a record upd
 `record P { x: Int, x: Int }` and `{ x = 1, x = 2 }` are rejected at the second `x`, and
 the message gives the position of the first.
 
-### Structs (Value Types)
+### Fixed Records (Value Types)
 
-Stack-allocated value types with no ARC overhead:
+`fixed record` gives a value a known shallow layout with no separate ARC header.
+For now, its fields must use the same unmanaged types accepted in `struct`:
+scalars, fieldless enums, and other fixed values. A `String`, collection,
+function, union with payload, heap record, or tuple field is rejected with a
+message explaining that managed fixed fields are not supported yet. An ordinary
+`record` is the current choice for those fields.
+
+```blorp
+fixed record Color {r: UInt8, g: UInt8, b: UInt8, a: UInt8}
+
+c: Color = {r = to_uint8(255), g = to_uint8(0), b = to_uint8(0), a = to_uint8(255)}
+red: UInt8 = c.r
+```
+
+Fixed records support the same update syntax as ordinary records. They cannot
+declare type or dimension parameters; use an ordinary `record` when parameters
+are needed.
+
+The old `struct` spelling remains accepted while the compiler bootstrap and
+source tree migrate. It currently has the same layout and field restrictions:
 
 ```blorp
 struct Color {r: UInt8, g: UInt8, b: UInt8, a: UInt8}
@@ -1182,7 +1201,7 @@ c: Color = {r = to_uint8(255), g = to_uint8(0), b = to_uint8(0), a = to_uint8(25
 red: UInt8 = c.r
 ```
 
-Structs support the same update syntax as records:
+Both spellings support record update syntax:
 
 ```blorp
 struct Vec2 {x: Float, y: Float}
@@ -1191,21 +1210,22 @@ v: Vec2 = {x = 1.0, y = 2.0}
 moved: Vec2 = { v | x = v.x + 10.0 }   -- stack copy, zero allocation
 ```
 
-Structs cannot have type parameters. Use a `record` when the data shape needs
-generic type parameters or dimension parameters such as `#N`.
+`struct` also cannot have type or dimension parameters.
 
-#### When to Use Struct vs Record
+#### When to Use Fixed Record vs Record
 
-**Default to `record`.** Use `struct` only when you need stack allocation for performance.
+**Default to `record`.** Use `fixed record` when a known by-value layout matters.
 
-| | `record` | `struct` |
+| | `record` | `fixed record` |
 |---|---|---|
-| **Allocation** | Heap (ARC + COW) | Stack (value copy) |
+| **Layout** | Heap-backed by default (ARC + COW) | By-value root; erased positions may require a box |
 | **Copying cost** | Cheap (bumps refcount) | Copies all fields |
-| **Best for** | General-purpose data, collections, anything with String/List fields | Small, fixed-size data with scalar, enum, or struct fields |
+| **Best for** | General-purpose data, collections, anything with String/List fields | Small unmanaged fields, including scalars, fieldless enums, and nested fixed records |
 | **Examples** | `Person`, `Config`, `HttpRequest` | `Color`, `Vec2`, `RGBA`, `FilterState` |
 
-Rule of thumb: if all fields are scalar values (Int, Float, Bool, sized numbers), enums, or other structs and there are fewer than ~8 fields, `struct` is a good fit. If any field is a String, collection, function, union, or record, use `record` - the ARC machinery is already needed for those fields anyway.
+The current implementation accepts unmanaged fields only. This is a temporary
+ownership restriction, not a promise that a fixed record can never contain an
+ARC-managed field.
 
 ### Union Types (Sum Types / ADTs)
 
@@ -3473,3 +3493,6 @@ not        True       False      void       break      continue   debug      for
 concurrent concurrently detach   select     from       after      sealed     with
 resource   where      into_opaque from_opaque
 ```
+
+`fixed` is contextual only before `record` at a declaration opening; it
+remains an ordinary identifier elsewhere.

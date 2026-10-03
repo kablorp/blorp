@@ -53,7 +53,9 @@ the keyword and suggests an alternative:
 error: `alias` is a reserved keyword and cannot be used as a name; choose another identifier such as `alias_name`
 ```
 
-The soft keywords listed under [Names](#names) are the only exceptions.
+The soft keywords listed under [Names](#names) are exceptions. `fixed` remains
+an identifier except when it immediately precedes `record` at a declaration
+opening.
 
 Declarations are public by default; `private` hides a declaration from
 importers. There is no `export` keyword.
@@ -125,6 +127,7 @@ decl = [ docstring ] ( func_decl
                       | type_decl
                       | enum_decl
                       | record_decl
+                      | fixed_record_decl
                       | struct_decl
                       | var_decl
                       | trait_decl
@@ -277,7 +280,9 @@ variant_name = IDENT | "True" | "False" ;
 (* A variant declares at most 64 payload fields; the parser rejects more. *)
 
 record_decl = "record" IDENT [ type_params ] "{" field_list "}" ;
+fixed_record_decl = "fixed" "record" IDENT "{" field_list "}" ;
 struct_decl = "struct" IDENT "{" field_list "}" ;
+(* A fixed record cannot declare type or dimension parameters. *)
 
 field_list = [ field_decl { "," field_decl } [ "," ] ] ;
 field_decl = identifier ":" type_expr ;

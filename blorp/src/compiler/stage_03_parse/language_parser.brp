@@ -20,6 +20,7 @@ import:
 		SYNTHESIZED_NAME_TABLE,
 		name_id_from_interned_index,
 		name_id_index,
+		NAME_ID_FIXED,
 		name_id_unseeded_spelling,
 		name_ids_equal,
 		name_table_dict,
@@ -60,6 +61,7 @@ import:
 		unpacked_string_literal_text_id,
 	list: list
 	parsed_ast:
+		RecordDeclarationForm(OrdinaryRecord, LegacyStruct, FixedRecord),
 		ConcurrentForLimit(MissingLimit, WrittenLimit),
 		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
 		MAX_UNION_VARIANT_FIELDS,
@@ -711,6 +713,7 @@ private enum TupleBinderIdentifierMode:
 private enum AggregateDeclarationSyntax:
 	RecordDeclarationSyntax
 	StructDeclarationSyntax
+	FixedRecordDeclarationSyntax
 
 
 private enum InfixOpTag:
@@ -1159,6 +1162,14 @@ private pure func next_is_keyword(state: ParserInput, index: Int, expected: Keyw
 	match tag_at(state, index + 1):
 		KeywordTag:
 			current_keyword(state, index + 1) == expected
+		_:
+			False
+
+
+private pure func current_starts_fixed_record(state: ParserInput, index: Int) -> Bool:
+	match current_tag(state, index):
+		IdentifierTag:
+			current_payload(state, index) == name_id_index(NAME_ID_FIXED) and next_is_keyword(state, index, RecordKeyword)
 		_:
 			False
 
@@ -9574,21 +9585,30 @@ private pure func parse_record_decl(
 	syntax: AggregateDeclarationSyntax,
 	start_span: SourceLocation,
 ) -> ParseDeclStep:
-	var st: Int = advance_parser(state, index)
+	var st: Int = if syntax == FixedRecordDeclarationSyntax:
+		advance_parser(state, advance_parser(state, index))
+	else:
+		advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	is_struct: Bool = syntax == StructDeclarationSyntax
 
-	name_expected: String = if is_struct:
+	name_expected: String = if syntax == FixedRecordDeclarationSyntax:
+		"fixed record name"
+	else if is_struct:
 		"struct name"
 	else:
 		"record name"
 
-	open_fields_message: String = if is_struct:
+	open_fields_message: String = if syntax == FixedRecordDeclarationSyntax:
+		"expected `{` before fixed record fields"
+	else if is_struct:
 		"expected `{` before struct fields"
 	else:
 		"expected `{` before record fields"
 
-	close_fields_message: String = if is_struct:
+	close_fields_message: String = if syntax == FixedRecordDeclarationSyntax:
+		"expected `}` after fixed record fields"
+	else if is_struct:
 		"expected `}` after struct fields"
 	else:
 		"expected `}` after record fields"
@@ -9596,8 +9616,12 @@ private pure func parse_record_decl(
 	name_step: ParseIdentifierStep = parse_declared_name_expected(state, st, st_diag, name_expected)
 	st = name_step.index
 	st_diag = name_step.diagnostics
+	fixed_parameters_written: Bool = (
+		syntax == FixedRecordDeclarationSyntax
+		and current_is_symbol(state, st, LeftBracketSymbol)
+	)
 
-	type_params_step: ParseTypeParamListStep = if is_struct:
+	var type_params_step: ParseTypeParamListStep = if is_struct:
 		{
 			index = st,
 			diagnostics = st_diag,
@@ -9605,6 +9629,17 @@ private pure func parse_record_decl(
 		}
 	else:
 		parse_type_params_opt(state, st, st_diag)
+
+	if fixed_parameters_written:
+		st_diag = add_expected_error(
+			state,
+			type_params_step.diagnostics,
+			current_location(state, st),
+			"fixed record '" + name_step.value.text + "' cannot have type or dimension parameters",
+			[],
+			Some("use an ordinary record declaration when parameters are needed"),
+		)
+		type_params_step = { type_params_step | diagnostics = st_diag }
 
 	st = type_params_step.index
 	st_diag = type_params_step.diagnostics
@@ -9629,6 +9664,12 @@ private pure func parse_record_decl(
 		RightBraceSymbol,
 		close_fields_message,
 	)
+	form: RecordDeclarationForm = if syntax == FixedRecordDeclarationSyntax:
+		FixedRecord
+	else if is_struct:
+		LegacyStruct
+	else:
+		OrdinaryRecord
 
 	{
 		index = right_step.index,
@@ -9637,7 +9678,7 @@ private pure func parse_record_decl(
 			name = name_step.value,
 			type_params = type_params_step.values,
 			fields = fields_step.values,
-			is_struct = is_struct,
+			form = form,
 			doc = doc,
 			span = location_cover(
 				start_span,
@@ -10597,6 +10638,8 @@ private pure func parse_private_decl(
 		parse_record_decl(state, st, st_diag, doc, RecordDeclarationSyntax, inner_start_span)
 	else if current_is_keyword(state, st, StructKeyword):
 		parse_record_decl(state, st, st_diag, doc, StructDeclarationSyntax, inner_start_span)
+	else if current_starts_fixed_record(state, st):
+		parse_record_decl(state, st, st_diag, doc, FixedRecordDeclarationSyntax, inner_start_span)
 	else if current_is_keyword(state, st, UnionKeyword):
 		parse_union_decl(state, st, st_diag, doc, False, inner_start_span)
 	else if current_is_keyword(state, st, EnumKeyword):
@@ -10718,6 +10761,8 @@ private pure func parse_decl(
 		parse_record_decl(state, st, st_diag, doc, RecordDeclarationSyntax, start_span)
 	else if current_is_keyword(state, st, StructKeyword):
 		parse_record_decl(state, st, st_diag, doc, StructDeclarationSyntax, start_span)
+	else if current_starts_fixed_record(state, st):
+		parse_record_decl(state, st, st_diag, doc, FixedRecordDeclarationSyntax, start_span)
 	else if current_is_keyword(state, st, UnionKeyword):
 		parse_union_decl(state, st, st_diag, doc, False, start_span)
 	else if current_is_keyword(state, st, EnumKeyword):

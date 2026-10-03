@@ -1,14 +1,16 @@
 # Fixed Layout Roadmap
 
-Status: design and implementation plan; no `fixed` syntax or layout change has
-landed. Implement the **record** slices first, measure them, and decide whether
-to proceed to unions. This is not a mandate to unify every aggregate under one
-IR type. When a slice lands, remove its instructions from this open-work plan
-and put measurements in `benchmarks/results/`.
+Status: R1 `fixed record` syntax is implemented with the existing unmanaged
+value layout; managed fixed fields and fixed unions remain open. R0 has a
+measured baseline checkpoint, but its dynamic placement census is incomplete,
+so R2/R3 go/no-go thresholds remain open. Implement the **record** slices
+first, measure them, and decide whether to proceed to unions. This is not a
+mandate to unify every aggregate under one IR type. Retain measurements for
+later slices in `benchmarks/results/`.
 
 Read [WORKER_CHECKLIST](WORKER_CHECKLIST.md) before implementation. The
 [Language Guide](GUIDE.md) and [Grammar](GRAMMAR.md) describe *current*
-behavior, not the proposed syntax below. The existing
+behavior; this roadmap also includes later proposed syntax below. The existing
 [Struct Payload Roadmap](STRUCT_PAYLOAD_ROADMAP.md) records narrower layout
 experiments and their negative results; the
 [Value Tuple and State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md) plan owns
@@ -151,31 +153,20 @@ compiler for any Core/backend change to affect the compiler's own execution.
 predeclared go/no-go threshold for R2 and R3 based on the reachable dynamic
 allocations and instruction-sample spread. No production change in this slice.
 
-### R1. Introduce `fixed record` as today's `struct`, without broad cleanup
+### R1. `fixed record` syntax and current value layout — implemented
 
-Parse `fixed record Name { ... }` in both parsers; maintain the exact field
-and diagnostic behavior of `struct`, including no declaration parameters,
-while the compiler source still uses the old syntax. Give the declaration an
-explicit fixed/ordinary variant or layout fact rather than adding another
-coupled boolean. Carry it through finalized syntax, type headers, accepted
-record authority, typed declarations and lowering. At first, map it to the
-existing value-record Core and C layout, with the existing **unmanaged-field
-restriction**. This deliberately changes syntax, not performance.
+Both parsers and the formatter accept contextual `fixed record Name { ... }`.
+Finalized declarations and type headers preserve its explicit form; R1 maps
+it to the existing unmanaged value-record Core/C layout. `struct` remains
+accepted for the coordinated bootstrap/source migration. Type or dimension
+parameters, empty declarations, managed fields, and by-value cycles have
+specific diagnostics; managed fixed fields remain R2 work.
 
-Update parser fixtures and the formatter together. The first-time-user error
-for `fixed record R[T]` should say that fixed record declarations cannot have
-parameters and suggest ordinary `record R[T]`; test its exact text. A fixed
-record with a record-valued field is rejected *for now* with a message that
-distinguishes the current implementation restriction from the final shallow
-layout contract. Keep old `struct` accepted only through the bootstrap/source
-migration described below, not as a permanent compatibility alias.
-
-**Exit:** equivalent old/new trivial programs have the same C value layout,
-construction and release behavior, and the same dynamic allocation and
-ownership counts. Generated C need not be byte-identical across differently
-spelled source files because source locations change. Dual-parser parity,
-formatter round-trip, layout-cycle diagnostics, and existing struct runtime
-tests pass.
+Evidence: dual-parser parity and formatter round-trip pass; trivial and nested
+fixed/struct cases have matching generated-C value layouts and zero root
+allocations/releases; direct and indirect layout cycles are rejected; the
+compiler reaches a stage-2/3 C fixpoint. This is a correctness and syntax
+slice, not a compiler performance claim.
 
 ### R2. Make fixed records with managed fields correct
 
