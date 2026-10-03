@@ -271,6 +271,29 @@ dynamic allocations, retired instructions and per-phase rows. If the
 production result does not clear R0's threshold, park broader record
 inlining even if the microfixture succeeds.
 
+#### R3 decision checkpoint (2026-10-03)
+
+Park the strict R3 implementation pilot on the [retained R0 diagnostic
+census](../benchmarks/results/fixed_layout_r0_2026-10-03.md#bounded-callsite-census-checkpoint).
+Its predeclared admission bar is at least **1,069,159 reachable removable
+child roots** (approximately 0.5% of 213,831,836 baseline allocations), with net savings
+of at least 80% of that reach. The one instrumented fresh nested site,
+[`PerceusGlobal.value: CoreParam`](../blorp/src/compiler/stage_09_core/perceus/env.brp),
+ran **3,178** times. Even all **295,205** measured `CoreParam_make` calls
+would reach only 0.138% of baseline if each removed one root; that is a broad
+upper bound for this child type, **not** an eligible-parent count or an
+all-parent census. The measured transport-box calls do not identify removable
+R3 child roots.
+
+The selected child is also used independently: `global.value` is copied into
+`BorrowedOwnerEntry.value` and returned as `Some(global.value)` on guarded
+paths in [`borrowed.brp`](../blorp/src/compiler/stage_09_core/perceus/borrowed.brp).
+Thus this parent's no-independent-use condition is not established. Reopen a
+strict pilot only after a newly identified parent passes constructor and
+escape closure and its frozen stage-2 diagnostic count demonstrates at least
+1,069,159 reachable removable child roots. This checkpoint neither completes
+R0's all-parent census nor closes R2's managed-fixed-record gate.
+
 ### Record decision gate
 
 Review R1-R3 together before opening union work. Keep the syntax
