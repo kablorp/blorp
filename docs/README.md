@@ -63,8 +63,9 @@ experiments live in Git history and `benchmarks/results/`.
   front end and Core, type identity and interning, Core node tables and
   frontend facts, with each step's oracle and the interim states still on main.
 - [Struct Payload Roadmap](STRUCT_PAYLOAD_ROADMAP.md) lists the open steps for
-  keeping struct values inline in unions, tuples and dictionaries, and
-  converting hot records to structs.
+  keeping struct values inline in unions and dictionary storage, and
+  converting hot records to structs. Stored tuple layout belongs to the
+  value-tuple plan below.
 - [Allocation Contract Roadmap](ALLOCATION_CONTRACT_ROADMAP.md) proposes
   allocation explanations and a compile-time `no_alloc` block, including
   runtime/cleanup coverage, Core analysis, and tooling enforcement.

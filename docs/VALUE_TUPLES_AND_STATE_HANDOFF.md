@@ -30,9 +30,9 @@ Section numbers of the discovery redesign always carry the word "redesign"
 means this document.
 
 Companions: [`OWNERSHIP_MODEL.md`](OWNERSHIP_MODEL.md) (the ABI this changes),
-[`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) (tuple storage, its
-step S5), [`MEMORY_MODEL.md`](MEMORY_MODEL.md), and the open copy issues in
-[`issues/`](issues/).
+[`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) (struct boxing in
+erased dictionary storage, its step S5), [`MEMORY_MODEL.md`](MEMORY_MODEL.md),
+and the open copy issues in [`issues/`](issues/).
 
 ## Contents
 
@@ -100,10 +100,12 @@ step S5), [`MEMORY_MODEL.md`](MEMORY_MODEL.md), and the open copy issues in
    the consumer as the last use. Nothing else is reordered; in particular no
    read is hoisted above an earlier statement. That second tier is deferred
    (section 5.3).
-7. **Out of scope here:** the allocator (mimalloc is a separate decision),
-   non-atomic reference counts for thread-local objects, inline tuple storage
-   in records, unions and lists (S5), an unboxed `Option` of a tuple, and
-   `List.enumerate` materializing tuples. Sections 6 and 9 place them.
+7. **Outside increments 1 to 5:** the allocator (mimalloc is a separate
+   decision), non-atomic reference counts for thread-local objects, and
+   stored tuple changes. Increment 7 owns inline tuple storage in records,
+   typed unions and lists, an unboxed `Option` of a tuple, and avoiding the
+   list of tuples materialized by `List.enumerate`. Sections 6 and 9 place
+   them.
 
 **Historical projection, not an achieved result.** With increments 1 to 4,
 and increment 5 if M0 re-measured after increment 4 still needs it
@@ -296,13 +298,13 @@ C. Attributing each allocation to its calling function in a stage-2 compiler
 built at `-O0` (appendix B) covers the 3,425,121 tuples made at sites with at
 least 500 allocations each; the other 21,664 come from smaller sites.
 
-| Where the tuple goes | Tuples | Share | After this design |
+| Where the tuple goes | Tuples | Share | Through increments 1 to 5 |
 | --- | ---: | ---: | --- |
 | A `match (a, b):` subject `tuple_sroa` leaves on the heap (or-patterns, literal patterns, three-element subjects) | 1,054,891 | 31% | gone |
 | A local tuple built by a `match` or `if` arm and destructured | 451,066 | 13% | gone |
 | Returned and destructured | 280,136 | 8% | gone |
-| Returned inside an `Option` | 214,133 | 6% | boxed (section 3.7) |
-| Stored in a list: association lists `List[(K, V)]` and `List.enumerate` | 1,052,834 | 31% | boxed (S5, section 9) |
+| Returned inside an `Option` | 214,133 | 6% | boxed; increment 7 examines this (section 9) |
+| Stored in a list: association lists `List[(K, V)]` and `List.enumerate` | 1,052,834 | 31% | boxed; increment 7 examines this (section 9) |
 | Not classified | 372,061 | 11% | |
 | A box rebuilt from another box's elements | 0 | | must stay 0 (section 3.1, counted) |
 
@@ -448,11 +450,12 @@ result's C struct reuses the emitter's struct machinery (a typedef, a compound
 literal) as transport only: it is never a Blorp value, never a Perceus
 variable, and never stored.
 
-**Relation to S5.** S5 in the struct payload roadmap is "tuple elements typed
-by monomorphized layout" in storage. This design removes the non-storage
-tuples S5 never addressed (section 2.3), and leaves S5 exactly the stored
-tuples: inline tuple fields in records and typed union payloads, and inline
-`List[(A, B)]` storage, measured on their own after this work (section 9).
+**Relation to S5.** This plan owns tuple layout: increments 1 and 2 address
+non-storage tuples, while increment 7 examines stored tuple fields, list
+elements and optional payloads after increment 2. S5 in the struct payload
+roadmap owns the separate cost of boxing struct keys and values in erased
+dictionary storage. A struct boxed as a tuple element is part of increment
+7's tuple-layout measurement, not a second S5 layout proposal.
 
 ### 3.3 Core representation
 
@@ -628,8 +631,8 @@ is done per element.
 
 | Boundary | Why it is boxed | Later |
 | --- | --- | --- |
-| `List`, `Set`, `Dict` elements, keys, values | the runtime's slots are `void*` | inline `List[(A, B)]` storage (S5) |
-| Record fields and typed union payloads of tuple type | kept as today to bound this change | flattened into fields (S5) |
+| `List`, `Set`, `Dict` elements, keys, values | the runtime's slots are `void*` | inline `List[(A, B)]` storage (increment 7); other erased containers need their own measurement |
+| Record fields and typed union payloads of tuple type | kept as today to bound this change | flattened into fields (increment 7) |
 | `Option[(A, B)]`, `Result[(A, B), E]` | the payload slot is a pointer | an unboxed option or result of a multi-value (a tagged struct, as `StackOption` is for scalars) |
 | Closure, task and channel signatures; lambda bodies | the closure ABI passes `void*` | typed closure environments (S3) and adapters |
 | Runtime helpers that make or take tuples (`zip`, `List.enumerate`, dictionary entries, process options) | their C signatures use `blorp_Tuple*` | `for (i, x) in xs.enumerate()` lowered without a list |
@@ -1781,7 +1784,7 @@ acceptance evidence.
 | 4 | **Place analysis and last-use releases for variables.** The analysis table with derived borrows and `var` writes; consume-specialization reads its liveness in place of its own walk; `last_use_release` after Perceus. | 3 | With increments 2 and 3: the rest of the `ParseFields` copies (about 1.2 M in all, −0.6 to −0.7 G); spelling interning's whole +1.06 M allocations and +1.7 G, causes (a) and (b) (section 4.5); `cell_pair`, `pushed` and `step` reached as clones from their `var` loops; `record_pair` to no allocation; builder in a tuple from quadratic to linear (77,931 to about 40 instructions per call at 100,000 rows); two owned records from quadratic to linear, one `Cell` copy per call remaining; the dead-alias probe from 40,001 to about 15; the variable shapes of section 5.1. Self-compile: fewer reference-count operations; measured, no estimate. | fixture rows; the `tables` stage; ASan derived-borrow test; the garbage-free invariant |
 | 5 | **Field places.** Moves out of field paths at any depth, re-initialization by update, demotion rules; `reuse.brp`'s take rules deleted. M0 is re-measured after increment 4 before this starts (section 1). | 4 | M0: the `MintState` copies, about −1.2 M allocations, −0.6 to −0.7 G, which needs a field-path move (`fields.mint`) to count for retargeting to `minted_expression`'s clone. Probes: three-level update 1 to 0 per call; list two levels down quadratic to flat; field moved into a loop variable flat; `record-update-same-field-read` (1,005 / 10,005 to flat), by simple reads first within one update applied to field places. | fixture rows, including one in which a taken field is passed to and retargeted to a clone; ASan cancellation tests |
 | 6 | **Deferred, not planned: simple reads hoisted across statements** (the deferred design of decision 5). Taken up only if a census of real sites shows it is needed. | 5 | Today's evidence is one issue, `read-after-builder-handoff-copies`, whose source fix is to read before handing off. | a census of sites first |
-| 7 | **Stored tuples** (not on the flip's path): inline tuple fields in records and typed unions, inline `List[(A, B)]` storage (S5), an unboxed `Option` of a multi-value, and `for (i, x) in xs.enumerate()` without a list. | 2 | Self-compile: the 1.05 M stored and 0.21 M optional tuples, measured per step. | per step |
+| 7 | **Stored tuples** (not on the flip's path): inline tuple fields in records and typed unions, inline `List[(A, B)]` storage, an unboxed `Option` of a multi-value, and `for (i, x) in xs.enumerate()` without a list. Count any struct boxes at tuple elements with this work; S5 owns struct key/value boxes in dictionaries. | 2 | Historical self-compile: 1.05 M stored-list and 0.21 M optional tuples on an older revision, not a current saving estimate. | Fresh dynamic census after increment 2, then each step's generated C, correctness gates and stage-2 cost measurement. |
 
 **What the flip can expect.** Of the M0 tree parse's 9.06 M plumbing
 allocations, about 6.8 M go: 3.3 M with increment 2, 1.2 M (`ParseFields`)

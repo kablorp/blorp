@@ -114,21 +114,34 @@ Oracle: byte-identical C for compiler-internal representation cuts unless the
 change names a layout change; exact diagnostic fixtures for any display-span
 carrier.
 
-### S5. Tuples and dictionaries
+### S5. Struct values in erased dictionary storage
 
-`blorp_Tuple` and `blorp_Dict` are erased and shared with the runtime's generic
-helpers. Most local tuples are removed by SROA, so the remaining boxes are few
-(a probe counted 123 static tuple box sites in an experimental build; the
-inspected dictionary C had none). Proceed only if a fresh census after S4 shows
-a measurable dynamic count: monomorphized tuple layouts (a per-shape C struct
-chosen in `specialize_layout.brp`), then typed dictionary storage for struct
-keys and values. Park it if the census says so.
+`blorp_Dict` uses erased key and value slots shared with the runtime's generic
+helpers. A struct key or value entering those slots needs a box. A prior
+inspection of generated dictionary C found no such boxes; that static
+observation does not establish the dynamic cost. After S4, count actual
+`blorp_box_struct` calls at dictionary boundaries on a current workload.
+Consider typed dictionary storage for struct keys and values only if the
+dynamic count and a stage-2 measurement justify it; otherwise park S5.
+
+Tuple storage layout belongs to
+[`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md#9-increments),
+increment 7, including tuple fields, `List[(A, B)]`, `Option` payloads and
+`List.enumerate`. An experimental build counted 123 *static* tuple box sites;
+the older self-compile's dynamic tuple census (built at `9172b35e0`;
+value-tuple plan, appendix B) attributed 1,052,834
+*executed allocations* to stored list tuples. These measure different things
+on different revisions, so neither substitutes for a census after increment
+1. Increment 1 removed local/match tuple boxes, not these stored tuples.
+Increment 7 needs a fresh dynamic census after increment 2 before choosing
+any layout change.
 
 ## Not in this roadmap
 
 Struct fields of non-scalar type (the language rule stays), generic structs,
-changing `List`, `Dict` or `Option` runtime representations beyond what S5
-names, and bootstrap rotation. Files this roadmap touches (`lower.brp`
+stored tuple layout (increment 7 of the value-tuple plan), changing `List` or
+`Option` runtime representations, changing `Dict` beyond S5's struct-key and
+struct-value storage, and bootstrap rotation. Files this roadmap touches (`lower.brp`
 `lower_union_payload_storage`, union emission in `emit.brp`,
 `match_projection.brp`, `specialize_layout.brp`, codegen fixtures) are disjoint
 from the identity roadmap's except `ir.brp`; merge main before every gate run.
