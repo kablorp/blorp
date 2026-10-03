@@ -26,6 +26,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		forbidden_top_level_paths: list[str] | None = None,
 		isolated_test_owners: list[str] | None = None,
 		owner_roots: list[str] | None = None,
+		fixture_directories: list[str] | None = None,
 	) -> None:
 		for owner in owner_roots or []:
 			(root / "blorp/src" / owner).mkdir(parents=True, exist_ok=True)
@@ -49,7 +50,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 					"legacy_owner_paths": legacy_owner_paths or [],
 					"legacy_owner_importers": legacy_owner_importers or {},
 					"temporary_cross_owner_imports": temporary_cross_owner_imports or {},
-					"fixture_directories": ["fixture", "should_pass", "should_fail"],
+					"fixture_directories": fixture_directories or ["fixture", "should_pass", "should_fail"],
 					"shared_module_consumers": shared_consumers or {},
 					"isolated_test_owners": isolated_test_owners or [],
 				}
@@ -288,6 +289,24 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("test module must start with test_", result.stderr)
 			self.assertNotIn(str(fixture.relative_to(root)), result.stderr)
+
+	def test_repository_manifest_treats_formatter_expected_output_as_fixture(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			manifest = json.loads((ROOT / "blorp/source_ownership.json").read_text(encoding="utf-8"))
+			self.write_layout(root, fixture_directories=manifest["fixture_directories"])
+			golden = root / "blorp/test/format/expected_output/formatted.brp"
+			golden.parent.mkdir(parents=True)
+			golden.write_text("func main() -> Int: 0\n", encoding="utf-8")
+
+			result = self.run_checker(root)
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+			(root / "blorp/test/format/helper.brp").write_text("", encoding="utf-8")
+			result = self.run_checker(root)
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("test module must start with test_: format/helper.brp", result.stderr)
+			self.assertNotIn("format/expected_output/formatted.brp", result.stderr)
 
 	def test_accepts_test_as_a_production_command_owner_with_mirrored_tests(self) -> None:
 		with tempfile.TemporaryDirectory() as directory:
