@@ -99,6 +99,12 @@ private ENUM_DECL_TAG: String = "enum"
 
 private VALUE_RECORD_DECL_TAG: String = "value_record"
 
+private LEGACY_STRUCT_ORIGIN_TAG: String = "legacy_struct"
+
+private FIXED_RECORD_ORIGIN_TAG: String = "fixed_record"
+
+private TRIVIAL_INLINE_OWNERSHIP_TAG: String = "trivial_inline"
+
 private HEAP_RECORD_DECL_TAG: String = "heap_record"
 
 private UNION_DECL_TAG: String = "union"
@@ -3832,15 +3838,28 @@ pure func core_field_refs_distinct(left: CoreFieldRef, right: CoreFieldRef) -> B
 CORE_FIELD_REF_RUNTIME_TAG: CoreFieldRef = into_opaque CoreFieldRef(CORE_FIELD_REF_UNRESOLVED)
 
 
+--- Source declaration provenance survives the shared R1 value layout.
+enum CoreValueRecordOrigin:
+	LegacyStructOrigin
+	FixedRecordOrigin
+
+
+--- R1 admits only unmanaged inline fields; R2 can add distinct managed cases.
+enum CoreInlineFieldOwnership:
+	TrivialInlineField
+
+
 record CoreValueRecordField {
 	name: String,
 	ref: CoreFieldRef,
-	typ: CoreType
+	typ: CoreType,
+	ownership: CoreInlineFieldOwnership
 }
 
 
 record CoreValueRecordDecl {
 	abi_type: Option[DeclaredAbiType],
+	origin: CoreValueRecordOrigin,
 	name: String,
 	type_params: List[String],
 	fields: List[CoreValueRecordField],
@@ -16514,10 +16533,13 @@ pure func decode_core_union_decl_json(
 
 
 pure func core_value_record_field_to_json(field: CoreValueRecordField) -> JsonValue:
+	ownership_tag: String = match field.ownership:
+		TrivialInlineField: TRIVIAL_INLINE_OWNERSHIP_TAG
 	JsonObject([
 		("name", JsonString(field.name)),
 		("field_ref", core_field_ref_to_json(field.ref)),
 		("type", core_type_to_json(field.typ)),
+		("ownership", JsonString(ownership_tag)),
 	])
 
 
@@ -16532,12 +16554,16 @@ pure func decode_core_value_record_field_json(
 		type_json,
 		path_field(path, "type"),
 	)
-
-	Ok({
-		name = name,
-		ref = ref,
-		typ = typ,
-	})
+	ownership_tag ?= string_field(value, path, "ownership")
+	if ownership_tag != TRIVIAL_INLINE_OWNERSHIP_TAG:
+		Err(CoreUnsupportedTag(path_field(path, "ownership"), ownership_tag))
+	else:
+		Ok({
+			name = name,
+			ref = ref,
+			typ = typ,
+			ownership = TrivialInlineField,
+		})
 
 
 private pure func decode_core_value_record_fields(
@@ -16647,9 +16673,13 @@ private pure func decode_core_heap_record_fields(
 
 
 pure func core_value_record_decl_to_json(record_decl: CoreValueRecordDecl) -> JsonValue:
+	origin_tag: String = match record_decl.origin:
+		LegacyStructOrigin: LEGACY_STRUCT_ORIGIN_TAG
+		FixedRecordOrigin: FIXED_RECORD_ORIGIN_TAG
 	JsonObject([
 		(KIND_FIELD, JsonString(VALUE_RECORD_DECL_TAG)),
 		("abi_type", optional_declared_abi_type_to_json(record_decl.abi_type)),
+		("origin", JsonString(origin_tag)),
 		("name", JsonString(record_decl.name)),
 		("type_params", strings_to_json(record_decl.type_params)),
 		("fields", JsonVector(record_decl.fields.map(core_value_record_field_to_json))),
@@ -16657,11 +16687,25 @@ pure func core_value_record_decl_to_json(record_decl: CoreValueRecordDecl) -> Js
 	])
 
 
+private pure func decode_core_value_record_origin_json(
+	tag: String,
+	path: String,
+) -> Result[CoreValueRecordOrigin, CoreJsonError]:
+	if tag == LEGACY_STRUCT_ORIGIN_TAG:
+		Ok(LegacyStructOrigin)
+	else if tag == FIXED_RECORD_ORIGIN_TAG:
+		Ok(FixedRecordOrigin)
+	else:
+		Err(CoreUnsupportedTag(path, tag))
+
+
 pure func decode_core_value_record_decl_json(
 	value: JsonValue,
 	path: String,
 ) -> Result[CoreValueRecordDecl, CoreJsonError]:
 	abi_type ?= decode_optional_declared_abi_type(value, path, "abi_type")
+	origin_tag ?= string_field(value, path, "origin")
+	origin ?= decode_core_value_record_origin_json(origin_tag, path_field(path, "origin"))
 	name ?= string_field(value, path, "name")
 	type_params ?= decode_string_list(value, path, "type_params")
 	fields ?= decode_core_value_record_fields(value, path, "fields")
@@ -16673,6 +16717,7 @@ pure func decode_core_value_record_decl_json(
 
 	Ok({
 		abi_type = abi_type,
+		origin = origin,
 		name = name,
 		type_params = type_params,
 		fields = fields,

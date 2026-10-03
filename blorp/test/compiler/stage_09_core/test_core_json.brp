@@ -294,6 +294,8 @@ import:
 		),
 		CoreValueRecordDecl,
 		CoreValueRecordField,
+		CoreValueRecordOrigin(LegacyStructOrigin, FixedRecordOrigin),
+		CoreInlineFieldOwnership(TrivialInlineField),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_constructor_match_test_to_json,
@@ -305,6 +307,8 @@ import:
 		core_module_origin_to_json,
 		core_function_to_json,
 		core_program_to_json,
+		core_value_record_decl_to_json,
+		core_value_record_field_to_json,
 		core_select_to_json,
 		core_set_alloc_to_json,
 		core_type_to_json,
@@ -318,6 +322,8 @@ import:
 		decode_core_module_origin_json,
 		decode_core_literal_json,
 		decode_core_program_json,
+		decode_core_value_record_decl_json,
+		decode_core_value_record_field_json,
 		decode_core_select_json,
 		decode_core_set_alloc_json,
 		decode_core_type_json,
@@ -741,13 +747,15 @@ pure func value_record_field(name: String, typ: CoreType) -> CoreValueRecordFiel
 	{
 		name = name,
 		ref = core_field_ref(0),
-		typ = typ
+		typ = typ,
+		ownership = TrivialInlineField
 	}
 
 
 pure func range_record_decl() -> CoreValueRecordDecl:
 	{
 		abi_type = Some(DeclaredAbiRange),
+		origin = LegacyStructOrigin,
 		name = "Range",
 		type_params = [],
 		fields = [value_record_field("start", int_type()), value_record_field("end", int_type())],
@@ -758,6 +766,7 @@ pure func range_record_decl() -> CoreValueRecordDecl:
 pure func point_record_decl() -> CoreValueRecordDecl:
 	{
 		abi_type = None,
+		origin = LegacyStructOrigin,
 		name = "Point",
 		type_params = [],
 		fields = [value_record_field("x", int_type()), value_record_field("y", int_type())],
@@ -788,9 +797,11 @@ pure func box_heap_record_decl() -> CoreHeapRecordDecl:
 	}
 
 
+-- Deliberately invalid ownership shape: only the record-reuse JSON rejection uses it.
 pure func box_value_record_decl() -> CoreValueRecordDecl:
 	{
 		abi_type = None,
+		origin = LegacyStructOrigin,
 		name = "Box",
 		type_params = [],
 		fields = [
@@ -3810,6 +3821,7 @@ pure func empty_record_update_program() -> CoreProgram:
 		decls = [
 			ValueRecordDecl({
 				abi_type = None,
+				origin = LegacyStructOrigin,
 				name = "Empty",
 				type_params = [],
 				fields = [],
@@ -5303,6 +5315,74 @@ pure func test_core_program_json_round_trips_value_record_range() -> Bool:
 	program_round_trips(value_record_range_program())
 
 
+pure func test_core_value_record_metadata_json_round_trips_and_fails_closed() -> Bool:
+	decl: CoreValueRecordDecl = { range_record_decl() | origin = FixedRecordOrigin }
+	encoded: JsonValue = core_value_record_decl_to_json(decl)
+	field_encoded: JsonValue = core_value_record_field_to_json(value_record_field("x", int_type()))
+	decl_round_trip: Bool = match decode_core_value_record_decl_json(encoded, "decl"):
+		Ok(decoded):
+			(
+				decoded.origin == FixedRecordOrigin
+				and core_value_record_decl_to_json(decoded).to_string() == encoded.to_string()
+			)
+		Err(_):
+			False
+	field_round_trip: Bool = match decode_core_value_record_field_json(field_encoded, "field"):
+		Ok(decoded):
+			decoded.ownership == TrivialInlineField
+		Err(_):
+			False
+	missing_origin: Bool = match encoded:
+		JsonObject(fields):
+			malformed: JsonValue = JsonObject(fields.filter(
+				pure func(field: (String, JsonValue)) -> Bool: field[0] != "origin",
+			))
+			match decode_core_value_record_decl_json(malformed, "decl"):
+				Err(error):
+					core_json_error_to_string(error) == "missing Core JSON field at decl: origin"
+				Ok(_):
+					False
+		_:
+			False
+	missing_ownership: Bool = match field_encoded:
+		JsonObject(fields):
+			malformed: JsonValue = JsonObject(fields.filter(
+				pure func(field: (String, JsonValue)) -> Bool: field[0] != "ownership",
+			))
+			match decode_core_value_record_field_json(malformed, "field"):
+				Err(error):
+					core_json_error_to_string(error) == "missing Core JSON field at field: ownership"
+				Ok(_):
+					False
+		_:
+			False
+	unknown_origin: Bool = match encoded:
+		JsonObject(fields):
+			malformed: JsonValue = JsonObject(fields.filter(
+				pure func(field: (String, JsonValue)) -> Bool: field[0] != "origin",
+			).append(("origin", JsonString("future_origin"))))
+			match decode_core_value_record_decl_json(malformed, "decl"):
+				Err(CoreUnsupportedTag(path, tag)):
+					path == "decl.origin" and tag == "future_origin"
+				_:
+					False
+		_:
+			False
+	unknown_ownership: Bool = match field_encoded:
+		JsonObject(fields):
+			malformed: JsonValue = JsonObject(fields.filter(
+				pure func(field: (String, JsonValue)) -> Bool: field[0] != "ownership",
+			).append(("ownership", JsonString("future_ownership"))))
+			match decode_core_value_record_field_json(malformed, "field"):
+				Err(CoreUnsupportedTag(path, tag)):
+					path == "field.ownership" and tag == "future_ownership"
+				_:
+					False
+		_:
+			False
+	decl_round_trip and field_round_trip and missing_origin and missing_ownership and unknown_origin and unknown_ownership
+
+
 pure func test_core_program_json_round_trips_value_record_construct() -> Bool:
 	program_round_trips(value_record_construct_program())
 
@@ -6528,6 +6608,10 @@ tests: TestSuite = {
 		(
 			"Core program JSON round trips value record range",
 			test_core_program_json_round_trips_value_record_range,
+		),
+		(
+			"Core value record metadata round trips and fails closed",
+			test_core_value_record_metadata_json_round_trips_and_fails_closed,
 		),
 		(
 			"Core program JSON round trips value record construct",

@@ -170,6 +170,11 @@ slice, not a compiler performance claim.
 
 ### R2. Make fixed records with managed fields correct
 
+Prerequisite complete: Core now preserves legacy-struct versus fixed-record
+origin and records an explicit trivial inline-field ownership fact. This
+metadata does not yet admit managed fixed fields or change ownership/codegen;
+see the [R2 Core metadata checkpoint](../benchmarks/results/fixed_layout_r2_core_metadata_2026-10-03.md).
+
 Implement one vertical slice for a direct `String` or heap-record field in a
 non-generic fixed record, then expand to nested fixed records and other
 managed fields. A value has no ARC header of its own; its fields still have
