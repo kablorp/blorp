@@ -150,8 +150,10 @@ interrupted (SIGTERM, SIGINT, SIGHUP) or aborted before they finish, print
 `status=FAIL` and exit nonzero, immediately. Each marks itself finished as its
 last statement and its EXIT trap reports FAIL otherwise; none traps a signal,
 because bash holds a trapped signal until the foreground command (a
-`docker run`, a gate) completes. `docker-gate` also reports FAIL when a
-premerge or bare test run produced no nested verdict. Before reporting FAIL,
+`docker run`, a gate) completes. `premerge-gate` reports FAIL unless its test
+run ends with exactly one valid `gate=test` aggregate. `docker-gate` also
+reports FAIL when a premerge or bare test run produced no nested verdict.
+Before reporting FAIL,
 each of the three stops its own child processes (not a process group), so an
 interrupted run leaves nothing behind that could print a late verdict;
 `docker-gate` starts its containers with `--init` so the forwarded TERM

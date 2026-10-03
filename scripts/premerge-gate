@@ -104,15 +104,41 @@ premerge_gate_verdict() {
     # print its own verdict after ours.
     [ "$gate_finished" -eq 1 ] || terminate_child_processes
     local total_passed=0 total_failed=0 total_tests=0 overall="PASS"
-    local line status
-    line=$(grep '^BLORP_GATE_RESULT gate=' "$PREMERGE_TEST_LOG" 2>/dev/null | tail -1 || true)
+    local line status verdict_pattern parsed_passed parsed_failed parsed_tests
+    local max_gate_count_digits=18
+    # scripts/test may print verdicts for its own sub-gates. Its aggregate
+    # must be the only gate=test result and the last line of its output.
+    line=$(awk '{ last = $0 }
+        $1 == "BLORP_GATE_RESULT" && $2 == "gate=test" {
+            count++
+            if (count == 1) result = $0
+        }
+        END { if (count == 1 && last == result) print result }' \
+        "$PREMERGE_TEST_LOG" 2>/dev/null || true)
     rm -f "$PREMERGE_TEST_LOG"
-    if [ -n "$line" ]; then
-        status=$(printf '%s\n' "$line" | sed -n 's/.*status=\([A-Z]*\).*/\1/p')
-        total_passed=$(printf '%s\n' "$line" | sed -n 's/.*passed=\([0-9]*\).*/\1/p')
-        total_failed=$(printf '%s\n' "$line" | sed -n 's/.*failed=\([0-9]*\).*/\1/p')
-        total_tests=$(printf '%s\n' "$line" | sed -n 's/.*tests=\([0-9]*\).*/\1/p')
-        [ "$status" = "FAIL" ] && overall="FAIL"
+    # Help and dry runs intentionally invoke no nested gate and print no PASS.
+    if [ "$print_passing_verdict" -eq 1 ]; then
+        # At most 18 digits per count keeps their sum within signed 64-bit
+        # arithmetic, so an overflowing result cannot appear consistent.
+        verdict_pattern="^BLORP_GATE_RESULT gate=test status=(PASS|FAIL) passed=([0-9]{1,$max_gate_count_digits}) failed=([0-9]{1,$max_gate_count_digits}) tests=([0-9]{1,$max_gate_count_digits})$"
+        if [[ "$line" =~ $verdict_pattern ]]; then
+            status=${BASH_REMATCH[1]}
+            parsed_passed=${BASH_REMATCH[2]}
+            parsed_failed=${BASH_REMATCH[3]}
+            parsed_tests=${BASH_REMATCH[4]}
+            if (( 10#$parsed_passed + 10#$parsed_failed != 10#$parsed_tests )) ||
+                { [ "$status" = "PASS" ] && (( 10#$parsed_failed != 0 )); } ||
+                { [ "$status" = "FAIL" ] && (( 10#$parsed_failed == 0 )); }; then
+                overall="FAIL"
+            else
+                total_passed=$parsed_passed
+                total_failed=$parsed_failed
+                total_tests=$parsed_tests
+                [ "$status" = "PASS" ] || overall="FAIL"
+            fi
+        else
+            overall="FAIL"
+        fi
     fi
     [ "$exit_code" -eq 0 ] || overall="FAIL"
     [ "$gate_finished" -eq 1 ] || overall="FAIL"
@@ -637,6 +663,6 @@ run_step_fn "Security scan" run_security_scan
 run_step_fn "Drift and hygiene" run_drift_checks
 
 echo ""
-echo "Premerge gate passed in $(elapsed_since "$gate_start")."
+echo "Premerge gate completed in $(elapsed_since "$gate_start")."
 
 gate_finished=1

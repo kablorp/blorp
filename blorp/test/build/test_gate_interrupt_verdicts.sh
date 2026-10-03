@@ -119,7 +119,8 @@ printf '#!/bin/bash\nexit 0\n' \
 	> "$SANDBOX/blorp/test/compiler/pipeline/codegen_audit/run_codegen_audit.sh"
 
 # The gate scripts/premerge-gate and scripts/test launch. FAKE_GATE_RUN=hang
-# blocks it; otherwise it prints a verdict.
+# blocks it; FAKE_GATE_VERDICT overrides the default verdict, including with
+# an empty string to simulate a successful gate that reports no result.
 cat > "$SANDBOX/scripts/fake-gate-body" <<SH
 if [ "\${FAKE_GATE_RUN:-}" = hang ]; then
 	echo "gate started"
@@ -136,7 +137,11 @@ SH
 cat > "$SANDBOX/scripts/test.fake" <<SH
 #!/bin/bash
 . "$SANDBOX/scripts/fake-gate-body"
-echo "BLORP_GATE_RESULT gate=test status=\${FAKE_GATE_STATUS:-PASS} passed=4 failed=0 tests=4"
+if [ "\${FAKE_GATE_VERDICT+x}" = x ]; then
+	[ -z "\$FAKE_GATE_VERDICT" ] || printf '%s\n' "\$FAKE_GATE_VERDICT"
+else
+	echo "BLORP_GATE_RESULT gate=test status=\${FAKE_GATE_STATUS:-PASS} passed=4 failed=0 tests=4"
+fi
 SH
 cat > "$SANDBOX/blorp/test/cli/test_cli.sh" <<SH
 #!/bin/bash
@@ -265,7 +270,7 @@ run_gate() {
 # expect_verdict NAME GATE STATUS EXIT_ZERO(yes|no)
 expect_verdict() {
 	local name="$1" gate="$2" status="$3" zero="$4"
-	local failures_before="$failures" verdict_count
+	local failures_before="$failures" verdict_count count_pattern
 	verdict_count=$(grep -c "^BLORP_GATE_RESULT gate=$gate " <<<"$run_output")
 	if [ "$verdict_count" -ne 1 ]; then
 		fail "$name: expected exactly one gate=$gate verdict line, found $verdict_count"
@@ -274,6 +279,16 @@ expect_verdict() {
 		"BLORP_GATE_RESULT gate=$gate status=$status "*) ;;
 		*) fail "$name: last line should be a gate=$gate status=$status verdict, got: $run_last_line" ;;
 	esac
+	if [ "$gate" = premerge-gate ]; then
+		count_pattern='^BLORP_GATE_RESULT gate=premerge-gate status=(PASS|FAIL) passed=([0-9]+) failed=([0-9]+) tests=([0-9]+)$'
+		if [[ "$run_last_line" =~ $count_pattern ]]; then
+			if (( 10#${BASH_REMATCH[2]} + 10#${BASH_REMATCH[3]} != 10#${BASH_REMATCH[4]} )); then
+				fail "$name: final premerge counts do not sum to tests: $run_last_line"
+			fi
+		else
+			fail "$name: final premerge verdict has malformed counts: $run_last_line"
+		fi
+	fi
 	if [ "$zero" = yes ] && [ "$run_status" -ne 0 ]; then
 		fail "$name: exit status should be 0, got $run_status"
 	fi
@@ -587,6 +602,37 @@ cp "$SANDBOX/scripts/test.fake" "$SANDBOX/scripts/test"
 
 run_gate premerge_pass none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
 expect_verdict "premerge-gate normal run" premerge-gate PASS yes
+
+FAKE_GATE_VERDICT=$'BLORP_GATE_RESULT gate=cli status=PASS passed=1 failed=0 tests=1\nBLORP_GATE_RESULT gate=test status=PASS passed=4 failed=0 tests=4' \
+	run_gate premerge_sub_gate none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate reads test aggregate after sub-gate" premerge-gate PASS yes
+
+FAKE_GATE_VERDICT="" run_gate premerge_missing_nested none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate missing nested verdict" premerge-gate FAIL no
+
+FAKE_GATE_VERDICT="BLORP_GATE_RESULT gate=cli status=PASS passed=4 failed=0 tests=4" \
+	run_gate premerge_wrong_nested none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate wrong nested verdict" premerge-gate FAIL no
+
+FAKE_GATE_VERDICT="BLORP_GATE_RESULT gate=test status=PASS passed=oops failed=0 tests=4" \
+	run_gate premerge_malformed_nested none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate malformed nested verdict" premerge-gate FAIL no
+
+FAKE_GATE_VERDICT="BLORP_GATE_RESULT gate=test status=PASS passed=3 failed=0 tests=4" \
+	run_gate premerge_wrong_counts none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate inconsistent nested counts" premerge-gate FAIL no
+
+FAKE_GATE_VERDICT="BLORP_GATE_RESULT gate=test status=PASS passed=18446744073709551616 failed=0 tests=0" \
+	run_gate premerge_overflow_counts none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate overflowing nested counts" premerge-gate FAIL no
+
+FAKE_GATE_VERDICT=$'BLORP_GATE_RESULT gate=test status=PASS passed=4 failed=0 tests=4\nBLORP_GATE_RESULT gate=test status=PASS passed=4 failed=0 tests=4' \
+	run_gate premerge_duplicate_nested none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate duplicate nested verdict" premerge-gate FAIL no
+
+FAKE_GATE_VERDICT=$'BLORP_GATE_RESULT gate=test status=PASS passed=4 failed=0 tests=4\nBLORP_GATE_RESULT gate=cli status=PASS passed=1 failed=0 tests=1' \
+	run_gate premerge_wrong_last_nested none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
+expect_verdict "premerge-gate wrong last nested verdict" premerge-gate FAIL no
 
 FAKE_GATE_STATUS=FAIL run_gate premerge_nested_fail none "" "$PREMERGE_GATE" "${PREMERGE_FLAGS[@]}"
 expect_verdict "premerge-gate nested FAIL" premerge-gate FAIL no
