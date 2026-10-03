@@ -4,8 +4,9 @@ Status (2026-10-02): increment 1 is implemented; increments 2-5 and 7 are
 open. This is the plan of record for non-storage tuple flattening, owned state
 through calls, and stored tuple layout. Read [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md)
 before implementing or measuring an increment. Current ownership rules are in
-[`OWNERSHIP_MODEL.md`](OWNERSHIP_MODEL.md); the separate struct-key/value
-dictionary problem belongs to [`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md#s5-struct-values-in-erased-dictionary-storage).
+[`OWNERSHIP_MODEL.md`](OWNERSHIP_MODEL.md); struct-key/value dictionary
+specialization is retired while [record simplification](FIXED_LAYOUT_ROADMAP.md)
+is the active product-layout path.
 
 The measured [increment 1 result](../benchmarks/results/tuple_flatten_increment1_2026-10-02.md)
 records its implementation boundary, source/binary provenance, allocation

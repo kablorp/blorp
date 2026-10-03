@@ -1235,9 +1235,9 @@ no longer exists should be deleted rather than re-verified.
   type table follows; dispatch keyed by type id follows it; named-type identity lands before the
   dispatch and semantic type steps and is the named-types family of the nominal step.
 - The Core node steps do not touch union layout; "Core types as type ids" waits for the Core type
-  table; blocks come last. The struct payload steps in
-  [`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) own `lower_union_payload_storage` and
-  union emission; the one shared seam is `ir.brp`, so merge main before every gate run.
+  table; blocks come last. The former struct-payload work is retired under
+  [record simplification](FIXED_LAYOUT_ROADMAP.md); any new union-emission
+  work needs its own owner and must coordinate the shared `ir.brp` seam.
 - Frontend facts steps own the typecheck state files and are independent of the rest.
 - Coordinate the discovery-authority step with the old front end's removal
   ([`DISCOVERY_ACCEPTANCE_ROADMAP.md`](DISCOVERY_ACCEPTANCE_ROADMAP.md)) so only one front end

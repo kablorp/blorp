@@ -116,9 +116,9 @@ Fieldless union variants, including `None`, are immortal static singletons.
 Every other constructor heap-allocates, including variants whose payload is a
 single scalar and Core's leaf node kinds. This is a representation decision for
 all unions; measure on Core node counts as well as tokens before proposing a
-layout. The struct-inline layouts in
-[`STRUCT_PAYLOAD_ROADMAP.md`](STRUCT_PAYLOAD_ROADMAP.md) cover struct payloads;
-this item is scalar payloads. Not re-verified against the current backend.
+layout. Earlier struct-payload experiments are
+[archived](STRUCT_PAYLOAD_ROADMAP.md); this item is scalar payloads. Not
+re-verified against the current backend.
 
 ### Smaller open leads
 

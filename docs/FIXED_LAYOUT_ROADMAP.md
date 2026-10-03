@@ -1,629 +1,244 @@
-# Fixed Layout Roadmap
+# Record Simplification Roadmap
 
-Status: R1 `fixed record` syntax is implemented with the existing unmanaged
-value layout; managed fixed fields and fixed unions remain open. R0 has a
-measured baseline checkpoint, but its dynamic placement census is incomplete,
-so R2/R3 go/no-go thresholds remain open. Implement the **record** slices
-first, measure them, and decide whether to proceed to unions. This is not a
-mandate to unify every aggregate under one IR type. Retain measurements for
-later slices in `benchmarks/results/`.
+Status: three bounded compiler migrations have passed review, but the
+language still gives
+`struct` and `fixed record` their old unmanaged inline layout. This plan
+changes direction: make ordinary `record` the canonical nominal product,
+migrate internal users in bounded cuts, and remove the distinct value-record
+pipeline once its ABI obligations have explicit homes. Regain inline placement
+later as an optimization of records, not as a prerequisite for a coherent
+source model. Do not change the Guide, Grammar, or memory-model description of
+*current* behavior before the corresponding implementation cut lands.
 
-Read [WORKER_CHECKLIST](WORKER_CHECKLIST.md) before implementation. The
-[Language Guide](GUIDE.md) and [Grammar](GRAMMAR.md) describe *current*
-behavior; this roadmap also includes later proposed syntax below. The existing
-[Struct Payload Roadmap](STRUCT_PAYLOAD_ROADMAP.md) records narrower layout
-experiments and their negative results; the
-[Value Tuple and State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md) plan owns
-the already-started multi-value tuple work. Neither should be silently
-replaced by this document.
+Read [WORKER_CHECKLIST](WORKER_CHECKLIST.md) before compiler work. The
+[Language Guide](GUIDE.md), [Grammar](GRAMMAR.md), and
+[Memory Model](MEMORY_MODEL.md) describe what the compiler accepts today.
+Retained experiments and rejected layout cuts are in `benchmarks/results/`
+and Git history; this file holds the open sequence.
 
-## Outcome and boundaries
+## Decision and evidence
 
-The language should have `record`/`fixed record` for named products and
-`union`/`fixed union` for named sums. A tuple is a structural product with
-ordinal fields, not another nominal declaration. A fieldless `fixed union`
-replaces `enum`. `fixed record` and `fixed union` **cannot declare type or
-dimension parameters**. Ordinary records and unions remain generic. The
-generic standard-library unions `Option[T]` and `Result[T, E]` keep their
-compiler-specialized representations; they may reuse product/tagged-aggregate
-layout operations without being declared generic fixed unions.
+`record` already supplies the desired value semantics: an immutable logical
+value, ARC/COW implementation, and ownership-aware reuse when sound. A
+separate `struct`/fixed-record semantic category makes type headers, Core,
+Perceus, C emission, boxing, and tests carry a second product representation.
+The special category is justified only where an actual ABI or measured inline
+benefit pays for it. It should not be retained merely because source text
+spells `struct` or `fixed record`.
 
-`fixed` promises a statically known **shallow** value layout and no separate
-ARC header for the value in a typed inline-capable position. It does not
-promise literal stack placement, no child allocation, or no ARC on a field.
-For example, a future `fixed record` with a `String` field has an inline root
-and an ARC-managed string child. Typed locals, direct parameters/results and
-typed fields are the target inline-capable positions. Erased collection,
-closure, generic-call or foreign ABIs may need an explicit transport box;
-document and test each such boundary instead of silently weakening `fixed`.
-`fixed` and the numeric `Fixed` type are unrelated.
+The [accepted-semantic-catalog pilot](../benchmarks/results/record_unification_catalog_counts_pilot_2026-10-03.md)
+converted one non-ABI, scalar-only compiler `struct` to `record`. Focused,
+compiler, leak, sanitizer, hygiene, and stage-2/3 fixpoint gates passed.
+For the same frozen self-compile input, both compilers emitted identical C.
+The first cross-worktree comparison showed +6,302 allocations, but an A/A
+control with the **same baseline binary from the candidate cwd** reproduced
++6,300 of them. The residual same-cwd candidate delta was **two
+typed-frontend allocations**; retired-instruction ranges overlapped. This
+proves the first
+conversion is viable, not that all 153 remaining production `struct`
+declarations are safe or cheap to convert.
+The [next scalar-only metric pair](../benchmarks/results/record_unification_metric_pair_2026-10-03.md)
+changed retaining-fixture Core/C but not the production stage-2 binary;
+its self-compile is **not exercised** evidence, not a zero-cost result.
+The [embedded type-header count cut](../benchmarks/results/record_unification_header_counts_2026-10-03.md)
+does execute in the self-compile: its one converted nested product adds
+exactly one typed-frontend allocation, with identical frozen-input C and
+overlapping retired-instruction ranges.
 
-These examples mix current R1 syntax with future targets: `fixed record Point`
-(with unmanaged fields) and ordinary `record Box[T]` are valid today;
-`fixed union` and managed fixed fields are not. Parameterized fixed
-declarations remain errors:
+The old R1 `fixed record` syntax and unmanaged layout are implemented.
+Managed fixed fields remain rejected; the attempted owned-inline policy was
+not admitted. The old R2 ownership-authority and R3 all-fresh nested-child
+pilots are no longer prerequisites to simplification. A bounded nested R3
+site fell far below the predeclared admission bar; no production candidate
+was selected. See [R0 evidence](../benchmarks/results/fixed_layout_r0_2026-10-03.md).
+Do not restart an inline-ownership backend project to make a source spelling
+useful before the product model is simplified.
+
+## Target model and non-goals
 
 ```blorp
-fixed record Point {x: Float, y: Float}
-
-record Box[T] {value: T}                  -- still generic and heap-backed by default
-
-fixed union Signal:
-    Ready
-    Value(Int)
-
-union OptionLike[T]:
-    Some(T)
-    None
-
-fixed record Header {name: String}       -- after managed inline fields land
-fixed union Reply:                      -- after managed inline payloads land
-    Empty
-    Data(String)
-
-fixed record GenericBox[T] {value: T}   -- error: fixed declarations have no parameters
-fixed union GenericChoice[T]:           -- the same error
-    Some(T)
-    None
+record Point {x: Int, y: Int}
+record Header {name: String, code: Int}
+record Box[T] {value: T}
 ```
 
-These are **different axes**:
+- A nominal product has one source-level value model and one general
+  typecheck/Core/backend representation. Generic records remain supported.
+  Record fields may own managed children; copy, update, drop, and cancellation
+  continue to obey the existing ARC/COW contracts.
+- During a coordinated transition, the old `struct` and `fixed record`
+  spellings may still parse. The intended semantic cut makes them behave like
+  records, with **no temporary promise of stack placement or no allocation**.
+  Since a permanent no-op `fixed` qualifier is misleading in a pre-0.1
+  language, decide whether to remove both old spellings after source and
+  bootstrap migration. Do not preserve them as indefinite compatibility
+  wrappers. Reintroducing an explicit layout promise later requires a proven
+  cross-boundary contract, not just a different keyword.
+- A tuple remains a structural product with ordinal access. Existing
+  local/match tuple scalar replacement and multi-value results must not turn
+  into heap records for conceptual uniformity. Share helpers only where two
+  real consumers benefit; [the tuple plan](VALUE_TUPLES_AND_STATE_HANDOFF.md)
+  owns stored-tuple work.
+- `union`, `enum`, `Option`, and `Result` retain their current sum
+  representations for this record phase. A fieldless enum's scalar C ABI and
+  `Option`/`Result` specializations are not ordinary record fields. Decide
+  fixed-union syntax and enum retirement only after the record gate below.
+- Ordinary-record nesting is an independent optimization. One parent
+  allocation for a fresh child requires a per-*type* layout decision, an
+  explicit borrow/materialization rule for extracted children, and an
+  ownership proof. Do not silently inline one constructor while another
+  uses a pointer field.
 
-| Type | Source identity | Declared layout contract | Ownership of contents |
-| --- | --- | --- | --- |
-| `record R` | nominal product | default heap object; compiler may eliminate its allocation when sound | ARC root and managed fields |
-| `fixed record R` | nominal product | by-value, known shallow layout | initially trivial fields; later field-wise ownership |
-| `(A, B)` | structural product | local/return multi-value where possible; stored representation depends on its sink | per element |
-| `union U` | nominal sum | ordinary boxed representation, with existing specializations | active payload and ARC root when boxed |
-| `fixed union U` | nominal sum | tag and inline active payload | initially trivial payloads; later active-variant ownership |
-| `Option[T]`, `Result[T, E]` | generic standard-library unions | selected per concrete instantiation/ABI, not one universal layout | active payload only |
+## Sequence
 
-Keep fixed layout separate from trivial ownership. Current `struct` is both
-inline and unmanaged; that coincidence must not become the permanent meaning
-of `fixed`. Reject by-value cycles through fixed records/unions at type-header
-validation. A reference-valued field can break a layout cycle, subject to
-Blorp's existing no-cyclic-values rule.
+Each cut is independently reviewable. Keep old and new semantics out of the
+same commit unless a vertical slice needs both to compile.
 
-## Current starting point
+### S1. Classify remaining products and freeze the cost baseline
 
-- The parser represents `record`/`struct`/`fixed record` as one declaration
-  with `RecordDeclarationForm` variants, and `union`/`enum` as one with
-  `is_enum`, in `blorp/src/compiler/stage_03_parse/parsed_ast.brp`. The newer
-  discovery parser also distinguishes these declaration forms in
-  `blorp/src/compiler_new/stage_01_discovery/parse/declaration_parser.brp`.
-  `blorp/src/format/` has its own declaration representation. A syntax change
-  must reach both parsers and the formatter while both front ends exist.
-- `stage_06_typecheck/headers/type_header_graph.brp` already distinguishes
-  `ValueStruct`, `FixedValueRecord`, and `HeapRecord`, alongside `FieldlessEnum`
-  and `TaggedUnion`; it rejects parameters on both value-record forms and
-  detects infinitely sized inline cycles.
-  Extend that boundary rather than guessing from names in lowering.
-- `stage_09_core/ir.brp` currently distinguishes `ValueRecordType`,
-  `HeapRecordType`, `EnumType`, `UnionType` and `TupleType`; the C type and
-  ownership policies in `stage_09_core/c_type_layout.brp`, lowering in
-  `stage_08_core_lower/lower.brp`, and backend emission consume those facts.
-  Do not collapse all five variants as a prerequisite to the first pilot.
-- The runtime has tagged stack `Option` values, a tagged stack `Result` with
-  overlapping variant storage, nullable managed `Option`, and boxed forms.
-  A logical `Result` has a tag and two *alternative* payloads, not three
-  simultaneously initialized ordinary record fields. Existing specialized
-  layouts remain until a candidate proves a better replacement.
-- Current `struct` values may be boxed at erased union/tuple/dictionary or
-  closure-call boundaries. A prior `SourceSpan`-as-struct pilot cut discovery
-  allocations but increased typed-frontend allocations because struct values
-  were boxed in union payloads. Count dynamic placements before converting a
-  hot declaration. See the Struct Payload Roadmap for that evidence.
-- Local/match tuple flattening is already implemented. On a matched
-  stage-2 self-compile it saved about 1.36 million total allocations (0.63%);
-  the instruction change was too small to claim a latency improvement.
-  A new product abstraction must preserve this path rather than turn tuples
-  back into heap records. See
-  `benchmarks/results/tuple_flatten_increment1_2026-10-02.md`.
-
-## Record-first implementation sequence
-
-Each numbered slice is independently reviewable. The record decision gate
-below precedes any production fixed-union or enum-removal implementation.
-
-### R0. Freeze the baseline and classify placements
-
-On a clean main-derived branch, record the exact base SHA, bootstrap pin,
-toolchain, optimization level and frozen input. Census the current `struct`
-declarations, their dynamic constructions, and every destination: local,
-record field, union payload, tuple, list, dictionary, closure, call/result,
-foreign boundary. Separately census freshly nested `record` constructions
-whose child never has an independent use. Static grep is only a candidate
-finder; generated C or an isolated allocation counter must confirm the
-dynamic number. Retain at least three small fixtures: trivial fixed value,
-managed-field fixed value, and fresh nested heap records with an escaping
-control. Do not assert a self-compile payoff from source counts.
-
-Suggested source census and fast probe loop:
+At the committed one-type pilot there were 151 production `struct` declarations
+across `blorp/src/`, `standard_library/src/`, and `pkg/`, and no production
+`fixed record` declarations (tests do contain fixed records). The two-metric
+and embedded-header-count cuts bring this count to 148 on this branch.
+Re-run the
+census on the integration base. Classify each declaration by use: internal
+typed value, nested field, `Option`/union/tuple/collection, closure, generic
+or erased call, foreign by-value parameter/result, native runtime mirror, or
+special compiler intrinsic. Search call sites and inspect final Core/C;
+declaration counts alone do not estimate dynamic cost. Record the owning
+tests and the exact ABI for every exception.
 
 ```bash
-rg -n '^\s*(struct|enum|record|union) ' blorp/src standard_library/src pkg
+rg -n '^\s*(private\s+)?(struct|fixed record)\s+[A-Za-z_][A-Za-z_0-9]*\s*\{' blorp/src standard_library/src pkg -g '*.brp'
+rg -n 'ValueRecordType|ValueStruct|FixedValueRecord|blorp_box_struct' blorp/src
 scripts/compiler-build-status
-bin/blorp compile --stop-after=lower --no-format /tmp/layout-probe.brp
-bin/blorp compile --dump-core-after=perceus --no-format -o /tmp/layout-probe.c /tmp/layout-probe.brp
 ```
 
-Confirm the `compile` flags against `bin/blorp compile --help` on the branch.
-Use a disposable input/output path; do not leave generated C beside a source
-fixture. Save the measured baseline, raw artifacts and commands under
-`benchmarks/results/` when the pilot begins. The baseline must be a stage-2
-compiler for any Core/backend change to affect the compiler's own execution.
-
-**Exit:** reproducible baseline counts, exact placement examples, and a
-predeclared go/no-go threshold for R2 and R3 based on the reachable dynamic
-allocations and instruction-sample spread. No production change in this slice.
-
-### R1. `fixed record` syntax and current value layout — implemented
-
-Both parsers and the formatter accept contextual `fixed record Name { ... }`.
-Finalized declarations and type headers preserve its explicit form; R1 maps
-it to the existing unmanaged value-record Core/C layout. `struct` remains
-accepted for the coordinated bootstrap/source migration. Type or dimension
-parameters, empty declarations, managed fields, and by-value cycles have
-specific diagnostics; managed fixed fields remain R2 work.
-
-Evidence: dual-parser parity and formatter round-trip pass; trivial and nested
-fixed/struct cases have matching generated-C value layouts and zero root
-allocations/releases; direct and indirect layout cycles are rejected; the
-compiler reaches a stage-2/3 C fixpoint. This is a correctness and syntax
-slice, not a compiler performance claim.
-
-### R2. Make fixed records with managed fields correct
-
-Prerequisite complete: Core now preserves legacy-struct versus fixed-record
-origin and records an explicit trivial inline-field ownership fact. This
-metadata does not yet admit managed fixed fields or change ownership/codegen;
-see the [R2 Core metadata checkpoint](../benchmarks/results/fixed_layout_r2_core_metadata_2026-10-03.md).
-
-Policy-authority checkpoint complete: Core can distinguish a declaration-tagged
-owned inline `String` field from existing managed values, but production
-ownership inference and all C-emitter entries reject that Core until
-field-wise copy/drop and erased-placement rules are implemented. The public
-managed-field restriction remains in force; this is not runtime owned-field
-support. See the [R2 inline policy checkpoint](../benchmarks/results/fixed_layout_r2_inline_policy_2026-10-03.md).
-
-**R2 decision checkpoint (2026-10-03).** R1 syntax and Core declaration
-metadata are landed. The accepted emitter callback-pairing and heap/typed-union
-destructor `Result` preparations preserve existing generated C; none admits a
-managed fixed field. A separate, unmerged Core policy experiment contains
-declaration-aware selectors intended to assign inline-owned retain/release
-policies to a synthetic direct local; its tests remain unverified because the
-new variants exposed nine backend/cancellation exhaustiveness sites. The
-backend also makes 21 cleanup-policy decisions from type alone, Perceus has
-widespread `is_managed_type` checks, and recursive function-body emission has
-91 call expressions across 61 owning helpers, most of which return `Option`.
-Those boundaries prevent a bounded, fail-closed negative-only cut. A preflight
-cannot make the remaining `String`/`Option` matches return a typed error, and an
-empty, ARC, or no-release arm would hide an ownership bug.
-
-Keep the public managed-field gate closed; do not merge the experimental policy
-variants or add placeholder emitter arms. The next architecture choice is a
-broader `Result`-bearing function emitter, or a prepared backend ownership
-action/slot authority built from the exact final Core program and projected C
-symbols. Prefer investigating the prepared authority first: it can resolve
-declaration identity, address-based helper/thunk calls, and backend-created
-temporary cleanup before a `String` renderer runs, without making a missing
-dictionary entry look like an ordinary policy. It is a substantial backend
-preparation change, not a small preflight or permission to open source
-admission. Stop if it cannot cover every generated cleanup site and both
-single- and split-unit emission paths.
-
-Before admission, require source diagnostics for unsupported erased, foreign,
-collection, nested-aggregate, global, capture, parameter, and result placements;
-verify direct-local copy, move, branch/drop, and cancellation behavior through
-Core and generated C. Then run native address/undefined sanitizers on a
-*dynamically allocated* `String` owner (not an immortal literal), asserting
-one allocation/one release/zero live after copy-and-drop, plus a two-owned-
-field case with two/two/zero. Keep a comparable heap-record control, verify
-ordinary-program generated-C identity and stage-2 compiler allocations and
-retired instructions, and do not claim a feature or performance win from the
-existing helper-only oracle or preparatory measurements.
-
-#### R2 preparatory consolidation audit (2026-10-03)
-
-Source census at `313f50fb8`: consolidate *ownership decisions*, not the
-different layouts of heap records, typed unions, and inline values. These
-existing seams make an owned-inline policy hard to introduce safely:
-
-| Seam | Current evidence | Risk for R2 |
-| --- | --- | --- |
-| Core ownership meaning | `type_policy.brp` defines `CoreOwnershipKind` and a declaration-derived, name-keyed `CoreInlineOwnershipIndex`, but `core_ownership_kind` has no production consumer. Perceus still asks `is_managed_type` across its body, while `cleanup_release_policy_for_type(ValueRecordType)` is `NoReleasePolicy`. | “Needs owned copy/drop,” “has an ARC root,” and “needs a cancellation action” are different questions. Globally making a fixed record “managed” would route inline bits through pointer operations; duplicate type names would make the current index ambiguous. |
-| Prepared-plan completeness | `prepare.brp` gives a missing cleanup row `NotACleanupType`; a missing union field plan can become `Ok("")` in `emit_union_destructor_cases`. `emit.brp` also substitutes an empty cancellation plan for a missing function row. | A stale row must not silently become no cleanup when a field owns a child. |
-| Emission sites | `emit.brp` has 21 type-only cleanup-policy reads. `FunctionBodyC.value` is plain C text, and `body_value_can_be_cleanup_slot` guesses whether it names a temporary from the spelling. | A final-Core preflight alone cannot identify every backend-created owner or its value-versus-address cleanup ABI. |
-| Failure and naming | `emit_function_body` returns `Option` through 91 call expressions in 61 helpers; `None` means an unsupported expression and can lead to generated error C. `c_emission_type_naming` falls back to a freshly derived name if its plan has no row. | Neither path is a typed ownership error; a new helper or missing action must fail before malformed C is rendered. |
-
-There is already useful sharing: `CleanupTypePlan` is built once from final
-Core, `emit_decls` feeds both single- and split-unit output, the cancellation
-planner has semantic owner/site/slot identities, and heap/union destructors
-share signature and cleanup-strategy helpers. Do **not** merge the two field
-release loops merely because both now return `Result`: typed union payloads,
-erased release masks, iterative cleanup, and heap COW destruction have
-different obligations. Nor should a new generic “managed” boolean replace
-the separate representation and ownership facts.
-
-Do these bounded preparations before introducing new production release-policy
-variants. Each is one reviewable change, keeps managed fixed fields rejected,
-and may be stopped independently if its measured cost or required scope grows.
-
-1. **Classify the questions at each ownership read.** Make a retained census
-   of the Perceus `is_managed_type` uses and the 21 backend type-only policy
-   reads, grouped by *owner existence*, *root representation*, *copy/drop
-   operation*, *cancellation action*, and *ABI placement*. Identify which
-   already consume a Core field policy or prepared cleanup row. Route one
-   owner-existence family at a time through the existing declaration-derived
-   `CoreOwnershipKind`; do not mechanically replace every `is_managed_type`
-   call or treat `StackResultValue` as an ARC pointer. First make a site-specific
-   behavior matrix for current types: for example, `LiteralString` has
-   ownership work but is absent from the old managed-name set, and
-   `StackResult[Int, Int]` has a distinct ownership kind while the old
-   managed-type query is false. Check unchanged Perceus Core and generated C
-   after each migrated family, and delete the superseded local decision in
-   the same cut.
-2. **Make prepared ownership facts fail closed.** `PreparedCoreProgram` and
-   its plan records are currently public, so matching row counts and variants
-   alone is insufficient: a same-shape row with `needs_release = False`,
-   `NoCleanup`, or an inert cancellation action could suppress a real owner.
-   Bind plans semantically to the exact final Core program with an opaque
-   smart constructor that builds them together, or compare all relevant
-   facts against canonical builders at a checked entry if public records must
-   remain constructible. Validate row count/kind, union variant/field shape,
-   cancellation rows *and their actions*. Build/validate once for both single
-   and split emission, not once per output unit. A missing, mistagged, or
-   same-shape corrupted plan must produce a typed diagnostic, never
-   `NotACleanupType`, an empty plan, or an empty release statement. Check the
-   cost of any extra validation against stage-2 allocations/instructions;
-   existing valid-program C remains byte-identical. Do not remove old
-   defensive fallbacks until all relevant entries use the checked view.
-3. **Give backend-created owners explicit slot provenance.** Replace the
-   `FunctionBodyC.value` spelling test with a tagged body value: absent,
-   ordinary rendered expression, or addressable temporary with its stable
-   site/role and slot spelling. Constructors must establish the tag/slot
-   pairing; readers obtain rendered text through one accessor. The C spelling
-   is for rendering only, never the proof that cleanup is needed. Inventory
-   `FunctionBodyC` constructors and readers as well as its 91 recursive call
-   sites, then pilot one match/if-result family and its cancellation push/pop
-   before migrating other body values. Preserve the exact C text and test a
-   non-slot expression that resembles a generated name. If that full fanout
-   makes stable identity a broad emitter rewrite, stop and redesign this
-   slice rather than adding an unsynchronized boolean beside the string.
-4. **Prepare one action/ABI authority.** From that exact final program, its
-   validated cleanup/cancellation plans, and the projected C-symbol plan,
-   publish the release action and whether its target is passed by value or
-   address for each supported owner/temporary site. Core value-record types
-   currently carry names, not type definition ids: first validate a unique
-   name-to-declaration-row mapping across all emitted value-record, heap-record,
-   union, and enum declarations, and reject missing, wrong-kind, or duplicate
-   entries. Do not infer identity from a spelling convention or add a second
-   unvalidated name map. Start with the *existing* ARC, ARC-only, and
-   stack-Result cases and require byte-identical single-
-   and split-unit C. Reserve and check future inline helper/thunk names in
-   symbol projection when there is a real consumer; a missing owned-inline
-   helper must not use `c_emission_type_naming`'s fallback. Only after the
-   existing cases are proved should an inline-owned action be added. The
-   renderer must not repeat a type-only policy lookup or choose a different
-   callback ABI for a migrated site.
-
-`Option[FunctionBodyC]` remains the existing unsupported-expression channel;
-do not convert 61 helpers to always-`Ok` `Result` wrappers as speculative
-preparation. The checked authority must reject unsupported owned-inline
-placements *before* entering those `String`/`Option` renderers. If a required
-action can only be discovered while rendering, stop at that concrete site and
-convert the smallest owning call chain to `Result[_, CoreEmitError]` instead
-of emitting a placeholder release, silently omitting cleanup, or generating
-error C. This is the decision test for the prepared-authority route versus a
-broader `Result` emitter.
-
-Fast loop for each code slice: a focused Core policy/cancellation or emitter
-fixture (`test_core_type_policy.brp`, `test_cancellation_plan.brp`,
-`test_core_emit.brp`, `test_split_emit.brp` under `blorp/test/compiler/`),
-then `scripts/compiler-check --changed`. Compare the same fixture's Core and
-single/split C before and after. Forge missing and same-shape no-release
-cleanup plans, missing helper symbols, and duplicate or wrong-kind type names;
-each must fail with a typed diagnostic on the relevant single/split entry.
-For a production cut, use the verification
-protocol below, including serial sanitizer/leak gates and a matched,
-same-cwd `-O2` stage-2 allocation/instruction comparison. No preparatory
-slice claims a runtime allocation win or opens the public managed-field gate.
-
-Implement one vertical slice for a direct `String` or heap-record field in a
-non-generic fixed record, then expand to nested fixed records and other
-managed fields. A value has no ARC header of its own; its fields still have
-ownership obligations. The semantic operations need explicit behavior:
-
-```blorp
-fixed record Header {name: String, code: Int}
-record Envelope {header: Header}
-
-first: Header = {name = "alpha", code = 1}
-second: Header = first                      -- retain the String for a second owner
-third: Header = {first | code = 2}         -- do not steal from `first`
-wrapped: Envelope = {header = third}       -- parent owns the inline Header fields
-```
-
-The constructor takes ownership of its fields. A by-value copy creates
-independent field ownership; a move transfers it; a drop releases it. A field
-read borrows from the aggregate until an independent value is required. A
-record update must evaluate replacements once in source order and must not
-release an old field before its last borrow. The same rules apply across
-branch joins, return, closure capture and cancellation cleanup. Encode
-trivial inline value, inline value with owned fields, and managed reference
-as distinct representation/ownership facts; the existing blanket
-`ValueRecordType => no release` rule cannot survive this slice.
-The destructor and COW-copy path of an ordinary heap record that embeds a
-managed fixed field must recursively copy/release that field's contents;
-releasing only ARC-pointer fields would leak `Envelope.header.name`.
-
-Do not immediately rewrite `List`, `Dict`, closure or generic-call storage.
-When their erased ABI requires a box, make that box and its destructor an
-explicit Core/backend boundary, with a codegen fixture and dynamic allocation
-count. Never treat a `memcpy` of managed fields as an owned copy. Check the
-foreign ABI separately; reject unsupported by-value exposure before C
-emission rather than guessing its calling convention.
-
-**Exit:** tests cover copy, move, partial update, nested fixed field,
-an ordinary heap record containing a managed fixed field (construct, copy,
-update and drop), branch/match, escape, each explicit boxing boundary,
-and leak/sanitizer
-behavior. The targeted fixture removes the fixed record's root allocation
-where a comparable heap record had one, without missing or duplicate
-retains/releases. Stage-2 self-compile phase allocations, retired
-instructions, peak RSS and C size are recorded; a static reduction of
-`blorp_box_struct` sites alone is not sufficient evidence.
-
-### R3. Pilot inlining an ordinary record inside its parent
-
-This is a separate optimization, not a new source promise. A C `Parent`
-type has **one field layout for every instance**: an individual constructor
-cannot choose inline `Child` storage while another constructor keeps a
-`Child*`. Start only with a closed, non-foreign parent type for which *every*
-construction supplies a fresh child that is not independently used:
-
-```blorp
-record Child {items: List[Int], count: Int}
-record Parent {child: Child, stamp: Int}
-
-pure func make_parent() -> Parent:
-    {child = {items = [], count = 0}, stamp = 1}
-```
-
-Publish an explicit per-type field-layout decision before ownership
-insertion; the backend and every construction, projection, copy and
-destructor consume that same decision. The first pilot rejects the candidate
-if *any* constructor supplies a separately owned child or an erased/foreign
-boundary requires the old field layout. It then flattens the child's body
-into the parent's allocation at every construction site. A
-`parent.child.count` read can borrow from the parent. Producing an
-independently owned `Child` must either transfer from a consumed parent or
-materialize/copy it; never return a pointer into a parent that may die. Test
-`child = parent.child` followed by parent release, child update, shared
-parent COW, nested managed fields, and a branch that conditionally escapes
-the child. Also test two `Parent` constructors, one with a fresh child and
-one with a separately owned child: this initial pilot must keep the ordinary
-pointer field for **both**. If the all-fresh restriction excludes the useful
-production sites, a later pilot may consider one uniform inline field with
-explicit conversion at separately owned inputs; measure that cost before
-expanding. Do not introduce a per-constructor representation or redesign the
-whole record ABI for the first experiment.
-
-**Exit:** the eligible nonescaping fixture uses exactly one aggregate
-allocation instead of two; the escaping fixture materializes only when
-needed; the mixed-construction fixture keeps one consistent layout and
-falls back safely; emitted C and ownership events explain all three. A
-paired stage-2 self-compile reports
-dynamic allocations, retired instructions and per-phase rows. If the
-production result does not clear R0's threshold, park broader record
-inlining even if the microfixture succeeds.
-
-#### R3 decision checkpoint (2026-10-03)
-
-Park the strict R3 implementation pilot on the [retained R0 diagnostic
-census](../benchmarks/results/fixed_layout_r0_2026-10-03.md#bounded-callsite-census-checkpoint).
-Its predeclared admission bar is at least **1,069,159 reachable removable
-child roots** (approximately 0.5% of 213,831,836 baseline allocations), with net savings
-of at least 80% of that reach. The one instrumented fresh nested site,
-[`PerceusGlobal.value: CoreParam`](../blorp/src/compiler/stage_09_core/perceus/env.brp),
-ran **3,178** times. Even all **295,205** measured `CoreParam_make` calls
-would reach only 0.138% of baseline if each removed one root; that is a broad
-upper bound for this child type, **not** an eligible-parent count or an
-all-parent census. The measured transport-box calls do not identify removable
-R3 child roots.
-
-The selected child is also used independently: `global.value` is copied into
-`BorrowedOwnerEntry.value` and returned as `Some(global.value)` on guarded
-paths in [`borrowed.brp`](../blorp/src/compiler/stage_09_core/perceus/borrowed.brp).
-Thus this parent's no-independent-use condition is not established. Reopen a
-strict pilot only after a newly identified parent passes constructor and
-escape closure and its frozen stage-2 diagnostic count demonstrates at least
-1,069,159 reachable removable child roots. This checkpoint neither completes
-R0's all-parent census nor closes R2's managed-fixed-record gate.
-
-### Record decision gate
-
-Review R1-R3 together before opening union work. Keep the syntax
-simplification if it is correct and understandable, but do not generalize
-record inlining on an unmeasured promise. Specifically decide from evidence:
-
-1. Which typed positions preserve a fixed value without boxing, and which
-   still require an explicit transport box?
-2. Does field-wise ownership lower allocations without shifting more cost
-   into retains, copies, retired instructions or cleanup frames?
-3. Does the R3 opportunity occur often enough in the compiler to justify the
-   parent-backed borrow/materialization complexity?
-4. Which small layout/ownership helpers were useful in both R2 and R3? Share
-   those; do not introduce a universal aggregate IR merely for symmetry.
-
-Record the accept/park/revise decision and raw metrics. A negative pilot is
-a valid result. Do not proceed to managed fixed unions on the assumption
-that the record experiment succeeded.
-
-## Conditional work after the record gate
-
-### U1. Fieldless and trivial-payload `fixed union`
-
-Add non-generic `fixed union` syntax in both parsers and the formatter. Type
-headers reject all declaration parameters and inline-layout cycles before
-inference. Preserve nominal variant identity, exhaustiveness and constructor
-imports. First admit nullary variants and current struct-compatible scalar
-or trivial fixed-record payloads. A union whose **every variant is nullary**
-keeps the existing scalar enum layout (normally a C `long`, except the
-explicit `Bool` ABI's `int`, with current record-field packing retained);
-it needs no payload struct. A union with any
-payload uses a tag plus overlapping active-variant storage. For that case,
-use the C compiler's `struct`/`union` layout for size and alignment, not a
-hand-computed largest-payload-plus-one-byte formula. Tag shrinking is a
-separate measured change. Carry the scalar-versus-payload layout as an
-explicit type fact through Core and C type selection, rather than inferring
-it from a name or using one representation at construction and another at
-parameter/return sites. No generic fixed declaration is needed for this.
-
-**Exit:** no allocation for typed local construction/match of a trivial
-fixed union; correct scalar fieldless and tagged-payload size/alignment;
-deterministic constructor order, exhaustive matches, no
-uninitialized-payload reads, and exact diagnostics for parameterized or
-infinitely sized declarations. Exercise both layouts across local,
-parameter/result, record field and foreign/runtime boundaries.
-
-### U2. Active-variant ownership for managed fixed unions
-
-After R2's inline owned-field rules are sound, allow concrete managed
-payloads such as `Data(String)`. Only the active variant is initialized,
-copied, moved or destroyed. Reuse the field-copy/drop primitives that proved
-useful for fixed records, but keep sum-specific tag and match logic. Include
-nested match borrows and cancellation cleanup in the ownership tests.
-Generic, erased and foreign boundaries still require explicit representation
-choices. Do not repeat the parked typed-source-union-payload change from the
-Struct Payload Roadmap as a standalone optimization: it reduced emitted C
-but regressed stage-2 allocations without material instruction gain.
-
-**Exit:** allocation and ownership oracle for `Data(String)` and a
-two-managed-payload union, ASan/leak and codegen audit, and paired stage-2
-self-compile with no unexplained phase regression.
-
-### U3. Retire `enum` only after equivalent fixed unions work
-
-Convert a fieldless enum declaration to a fieldless fixed union without
-changing constructor tags, equality/hash/to-string behavior, import
-visibility, matching or foreign/runtime ABI. `Bool` and other special
-runtime-facing names require explicit ABI facts, not spelling heuristics.
-Before deleting `EnumType`, make `UnionType`'s representation fact supply
-the same scalar C type and context-specific field storage at every use,
-including generated signatures and runtime helpers; a tagged C struct is
-not an ABI-equivalent substitute.
-Migrate compiler, standard library, packages, tests, examples and docs;
-then delete `enum` parsing, diagnostics and the distinct Core enum path.
-Count and inspect declaration users before a mechanical rewrite. Avoid a
-permanent `enum` compatibility shim in this pre-0.1 language.
-
-**Exit:** old `enum` syntax receives a useful migration diagnostic; all
-current sources use fixed unions; aggregate compiler/runtime, formatter,
-parity, leak and release gates pass; generated C changes are inspected and
-the stage-2/3 fixpoint holds.
-
-### P1. Tuples as structural products, without undoing multi-values
-
-Share ordinal field identity and product-type reasoning with records where
-that reduces duplicate logic. `(A, B)` stays structural; `record Pair` stays
-nominal, with no implicit conversion. `pair[0]` resolves to a constant
-ordinal, not a string-key lookup. Preserve the tuple plan's flattening of
-locals and results, and its distinct stored-tuple work. Do **not** turn a
-local tuple into a heap `record` to achieve conceptual unification.
-
-**Exit:** existing tuple allocation fixtures and stage-2 self-compile do
-not regress; each shared helper removes a real duplicate consumer. P1 is
-not a dependency of U1 or U2 and may be parked if it is only cosmetic.
-
-### O1. Optional `Option`/`Result` machinery reuse
-
-The standard-library unions remain generic. For a concrete instantiation, they may use a
-tag and payload area assembled by the same proven aggregate-layout helpers.
-`Option` may keep its nullable-pointer representation; `Result`'s Ok/Err
-payloads are alternatives in overlapping storage, not two ordinary live
-record fields. Only share layout, construction, projection or ownership
-helpers when doing so simplifies code or improves measured behavior. Do
-not force one physical shape on every `T`/`E` or lose a specialized fast
-path to make the model look uniform.
-
-**Exit:** no ABI or allocation regression for current stack, nullable and
-boxed cases; active-payload ownership tests, especially managed closures;
-explicit evidence before replacing any existing specialization.
-
-## Bootstrap and source migration
-
-The pinned bootstrap builds the compiler source. It cannot compile source
-spelled with `fixed record` or `fixed union` until it recognizes that syntax.
-Therefore:
-
-1. Land new syntax and equivalent lowering while compiler source still uses
-   `struct`/`enum`. Keep both parsers and formatter in sync, update the Guide
-   and Grammar with the code, and run `compiler-new-parity`.
-2. Build and validate a stage-2 compiler, establish a stage-2/3 generated-C
-   fixpoint for codegen changes, and prepare a multi-platform bootstrap pin
-   through the release process in [RELEASES](RELEASES.md). Do not assume a
-   local `make` proves the next bootstrap asset exists.
-3. Only after the pin can compile the new syntax, migrate compiler source
-   and the rest of the tree in bounded, behavior-preserving cuts. Keep old
-   spelling accepted temporarily for the transition.
-4. Once no current source needs it, remove old `struct`/`enum` support and
-   run the full release/preview gate. Record the pinned compiler provenance.
-
-No roadmap step authorizes an opportunistic bootstrap rotation, push or
-release; those are separate coordinated operations.
-
-## Verification protocol for every implementation slice
-
-Fast loop: one focused source fixture, an exact expected diagnostic if it
-should fail, Core before/after when ownership changes, and inspected C.
-`scripts/compiler-check --changed --plan` is only selection guidance;
-compiler-new source requires its own gate. Run the owning focused suites,
-`scripts/compiler-check --changed`, `scripts/test compiler-new
-compiler-new-parity compiler-blorp runtime leak`, codegen audit,
-`compiler-core-sanitize` and `compiler-blorp-sanitize` as relevant, and
-`make hygiene-check` before a production cut lands. For C-changing cuts,
-run `scripts/compiler-fixpoint`. Check `scripts/compiler-build-status` before
-direct `bin/blorp` tests. Keep compiled test runs serial on macOS.
-
-Measure a paired baseline/candidate using identical frozen source and
-toolchain, both `-O2`, and stage-2 compilers. The harness records exact
-allocations and phase rows, retired instructions, peak RSS and generated-C
-identity *within* each revision. A layout change is expected to alter C
-*between* revisions, so compare behavior and inspect the new C rather than
-requiring cross-revision byte identity. Retain raw output and C hashes.
-
-```bash
-export BLORP_CLI_C_OPTIMIZATION=-O2
-make
-scripts/compiler-build-status
-benchmarks/self_compile_measure --stage2 --input-rev <frozen-sha> \
-  --label fixed-layout-baseline --samples 5 --output /tmp/fixed-layout-baseline.json
-benchmarks/self_compile_measure --stage2 --input-rev <frozen-sha> \
-  --label fixed-layout-candidate --samples 5 \
-  --baseline /tmp/fixed-layout-baseline.json --output /tmp/fixed-layout-candidate.json
-scripts/compiler-fixpoint
-```
-
-Run the baseline in a separate clean baseline checkout; do not invoke both
-commands against one edited tree. Serialize measurements and compiled gates.
-The benchmark report must state input/compiler revisions, bootstrap pin,
-compiler build freshness, toolchain, optimization, dynamic allocation
-counts, instruction sample spread, per-phase allocations, C hashes,
-identity/correctness oracle, and any tradeoff. Wall-clock alone is not
-acceptance evidence. Never treat a static box-site count, a microbenchmark
-or a passing build as proof of a self-compile win.
-
-## Stop rules
-
-- Stop a syntax migration if the new and legacy parsers or formatter disagree;
-  do not shift a syntax distinction into typechecking for convenience.
-- Stop a managed-value slice at the first unexplained retain/release,
-  leak, use-after-free or cancellation difference. Isolate a minimal fixture
-  before expanding the supported field set.
-- Stop a layout pilot that merely moves allocations into boxing, copying or
-  cleanup work elsewhere. Compare *whole-pipeline* stage-2 numbers and the
-  targeted phase, not only its constructor count.
-- Stop at the record decision gate before scheduling union and tuple rewrites.
-  A shared representation helper is earned by at least two real consumers,
-  not by an aesthetic desire for one data model.
+**Exit:** a retained, reviewable classification with no unknown ABI cases and
+a matched same-cwd stage-2 baseline. If the ABI census is incomplete, keep
+working on safe internal types; do not switch all source forms globally.
+
+The 2026-10-03 source census is preliminary, not this exit gate: 148
+declarations remain (128 under `blorp/src/`, 20 under
+`standard_library/src/`, none under `pkg/`). Of the 128, 52 belong to the
+new discovery tables; 42 are row shapes in
+`compiler_new/stage_01_discovery/tables/rows.brp`. Most are held in inline
+`List` tables; allocation budgets protect representative discovery paths
+against per-row allocations
+(`blorp/test/compiler_new/stage_01_discovery/tables/test_allocation_budget.brp`).
+Audit each shape and sink before migration. The family needs a record-inline
+optimization contract or a different table design; it is not a mechanical
+rename. The old lexer token,
+compact source-location rows, and reusable Perceus frames also have
+deliberate inline storage.
+
+In the standard library, `MemStats` and `SchedulerStats` mirror native C
+return-by-value structs; `Range` has a dedicated Core/backend ABI path.
+These three are held for S3/S4. The other 17 include hot geometry/DSP
+values and JSON/parser state, so a source-only safety check is insufficient.
+The narrowest next internal pilot appears to be `AcceptedUnionLocator`
+(`stage_06_typecheck/type_system/accepted_union_authority.brp`), followed
+by `GlobalHeaderCompletionMetrics` (`stage_06_typecheck/decl.brp`); neither
+has a proven allocation cost yet. This census does not establish that
+downstream foreign declarations cannot use other value records by value.
+
+### S2. Migrate internal declarations in small families
+
+Convert only types with no external C layout obligation or value-only
+consumer. The embedded header-count cut is complete; keep hot
+per-expression/offset structs and Core work-profile types for separate cuts.
+A source migration uses
+ordinary `record` now; it does **not** change the language-wide meaning of
+`struct`.
+
+For every family, retain a failing-first representation test where useful,
+then its count/diagnostic oracle. Inspect final Core and C from a fixture
+that retains the type to confirm the expected inline-value to ARC-record
+change. Check separately whether the stage-2 production compiler retains or
+executes it; if not, label the self-compile result **not exercised**, never
+zero-cost proof. On identical frozen input, the baseline and candidate
+compilers should still emit byte-identical output C; a mismatch needs
+explanation. Measure allocations, retired-instruction spread, per-phase
+rows, memory, and C size with matched
+stage-2 compilers. Run an exact-binary A/A control when cwd, source path, or
+build metadata differ. A measured temporary cost is acceptable, but a
+large or unexplained cost stops expansion until its cause is known.
+
+**Exit per cut:** unchanged logical results and diagnostics, no ownership or
+sanitizer failure, inspected representation, and a retained measurement.
+Remove each converted declaration from the outstanding census. Do not mix
+hot and cold families in one commit.
+
+### S3. Isolate foreign and native by-value ABI
+
+`MemStats` and `SchedulerStats` mirror native C structs, and foreign
+signatures can take or return value records (including an `Option` payload)
+by value. A heap-record pointer is **not** ABI-equivalent to a C struct.
+Before the global semantic cut, choose an explicit boundary representation:
+for example, a narrow ABI-only C value type with generated copy-in/copy-out
+adapters, or verified native wrappers. The chosen representation must be
+declared at the foreign/runtime boundary; do not infer it from a name or
+silently change C signatures. Keep it out of general Blorp product
+ownership and lowering.
+
+**Exit:** native and foreign fixtures prove parameter, result, nested and
+`Option` cases; generated C signatures and layout match the C declarations;
+sanitizer/leak tests pass. Every remaining by-value use has an adapter or an
+explicitly retained ABI category before source semantics change.
+
+### S4. Converge semantic headers, Core, and emission
+
+Only after S2/S3 leave no unadapted value-record caller, make parsed
+`struct`/`fixed record` declarations feed the ordinary record header and
+owned-field validation. Keep exact source-form information only where a
+migration diagnostic needs it. Then remove `ValueStruct`/
+`FixedValueRecord` header categories, value-record-only Core declaration,
+type, boxing and release branches, and dead backend helpers one family at a
+time. A branch is dead only after a production/test/standalone-tool census;
+do not turn impossible states into silent fallbacks. This is a deletion
+sequence, not an invitation to build a universal aggregate IR.
+
+At the semantic cut, update both parsers, formatter, Guide, Grammar, Memory
+Model, Ownership Model, and the language-boundary note in `AGENTS.md` in the
+same change. Replace tests asserting inline `fixed record` layout with
+tests asserting record behavior; keep distinct ABI tests for S3. The pinned
+bootstrap must still parse any new source spelling until a separately
+validated bootstrap rotation; no phase here authorizes a release or push.
+
+**Exit:** source forms have one semantic product path; old Core/backend
+variants have no producers or consumers; compiler-new parity, formatter,
+runtime, leak, sanitizer, codegen audit, and stage-2/3 fixpoint pass.
+Inspect generated C differences at the representation cut instead of
+demanding byte identity across intentionally different layouts.
+
+### S5. Decide which layout optimizations are worth reintroducing
+
+After simplification is stable, profile actual record constructions and
+escapes. The compiler may scalar-replace a nonescaping record or fold a
+fresh nested record into one parent allocation while preserving ordinary
+record semantics. For parent inlining, all constructors of one type must
+share one field layout, and extracting an independent child may require
+materialization. Compare full-pipeline allocations, retired instructions,
+retains/releases, and C size with the simpler baseline. Reopen an explicit
+`fixed` promise only if it has a sound contract across typed, erased,
+collection, closure, generic, and foreign positions and a substantial
+measured benefit. Otherwise keep optimization implicit.
+
+**Exit:** a separate accept/park decision per optimization. No performance
+claim from static source counts, shorter C, or a microfixture alone.
+
+## Verification and record gate
+
+Use the smallest relevant fixture and `scripts/compiler-check --changed
+--plan` for selection, then run the owning suite and
+`scripts/compiler-check --changed`. Codegen/ownership cuts additionally
+need generated-C inspection, codegen audit, runtime/leak and relevant
+sanitizers; C-changing compiler cuts need `scripts/compiler-fixpoint`.
+Run compiled gates serially on macOS. Record full logs and raw benchmark
+JSON under `benchmarks/results/` or link a retained artifact from there.
+
+After S4, decide whether the remaining syntax is useful. Do not start
+`fixed union`, enum retirement, or shared tuple/union machinery merely
+because the record path simplified. A conditional union plan needs its own
+ABI and active-payload ownership gate; the old fixed-union proposal remains
+in Git history until that decision is made.
