@@ -29,16 +29,14 @@ declaration and every body) must equal the existing parser's with its
 interpolation holes parsed, field for field and span for span. A deliberate
 difference needs an `ADAPTER_DIFFERENCES` entry naming it and its reason.
 
-It also checks module order: for one compile root and one `blorp test` root,
-the existing front end's module graph (`legacy_module_order_dump.brp`) and the
-discovery stage's (`discovery_module_order_dump.brp`) must list the same modules,
-with the same origins, in the same order (roots, then the implicit modules,
-then imports). This is what catches the stage's implicit module names drifting
-from the existing front end's constants. The same roots run again with the
-standard library read from the compiler's embedded texts (no standard-library
-directory), and a fixture project runs with two `blorp.toml` source packages
-(an export, a module that is not exported, an internal import and a relative
-import that must stay in its package).
+It also checks the discovery stage's module graph (`discovery_module_order_dump.brp`)
+for one compile root and one `blorp test` root: it must load at least the
+expected number of modules, so a root or package that failed to resolve cannot
+pass, and a package fixture must contribute a module with its origin. The same
+roots run again with the standard library read from the compiler's embedded
+texts (no standard-library directory), and a fixture project runs with two
+`blorp.toml` source packages (an export, a module that is not exported, an
+internal import and a relative import that must stay in its package).
 
 A mismatch is printed with its file and, for tokens, the first differing
 token. Exit status 0 means every file agrees.
@@ -67,7 +65,6 @@ CORPUS_SUFFIX = ".brp"
 
 LEGACY_DUMPER = "blorp/test/compiler/tools/legacy_front_end_dump.brp"
 DISCOVERY_DUMPER = "blorp/test/compiler_new/tools/corpus_dump.brp"
-LEGACY_ORDER_DUMPER = "blorp/test/compiler/tools/legacy_module_order_dump.brp"
 DISCOVERY_ORDER_DUMPER = "blorp/test/compiler/tools/discovery_module_order_dump.brp"
 ADAPTER_DIFFERENTIAL = "blorp/test/compiler/tools/discovery_adapter_differential.brp"
 
@@ -90,15 +87,14 @@ NATIVE_PACKAGE_FIXTURE = "blorp/test/compiler/tools/fixtures/native_package"
 
 
 @dataclass(frozen=True)
-class OrderCheck:
-    """One root whose module graphs are compared, and how both dumpers run on it."""
+class RootCheck:
+    """One root whose discovery graph is checked, and how the dumpers run on it."""
 
     description: str
     mode: str
     root: str
     # A graph that loads fewer modules than this is degraded (a root or a
-    # package that failed to resolve): both dumpers could agree on it and the
-    # check would still pass, so it fails instead.
+    # package that failed to resolve), so it fails.
     minimum_modules: int
     options: tuple[str, ...] = ()
     # Origin prefix (`source-package:`, `native-package:`) at least one module
@@ -109,36 +105,36 @@ class OrderCheck:
 # A compile root and a test root (which also seeds the test runtime), each with
 # the standard library on disk and embedded, and the source-package fixture:
 # `tools` exports `toolkit` and `toolkit/format`, `more` exports `second`.
-ORDER_CHECKS = (
-    OrderCheck("compile root", "compile", "blorp/src/main.brp", COMPILE_ROOT_MINIMUM_MODULES),
-    OrderCheck(
+ROOT_CHECKS = (
+    RootCheck("compile root", "compile", "blorp/src/main.brp", COMPILE_ROOT_MINIMUM_MODULES),
+    RootCheck(
         "test root",
         "test",
         "blorp/test/compiler_new/stage_01_discovery/test_pipeline.brp",
         TEST_ROOT_MINIMUM_MODULES,
     ),
-    OrderCheck(
+    RootCheck(
         "compile root, embedded standard library",
         "compile",
         "blorp/src/main.brp",
         COMPILE_ROOT_MINIMUM_MODULES,
         (EMBEDDED_STANDARD_LIBRARY_FLAG,),
     ),
-    OrderCheck(
+    RootCheck(
         "test root, embedded standard library",
         "test",
         "blorp/test/compiler_new/stage_01_discovery/test_pipeline.brp",
         TEST_ROOT_MINIMUM_MODULES,
         (EMBEDDED_STANDARD_LIBRARY_FLAG,),
     ),
-    OrderCheck(
+    RootCheck(
         "native package",
         "compile",
         f"{NATIVE_PACKAGE_FIXTURE}/main.brp",
         PACKAGE_FIXTURE_MINIMUM_MODULES,
         required_origin_prefix=NATIVE_PACKAGE_ORIGIN_PREFIX,
     ),
-    OrderCheck(
+    RootCheck(
         "native package, embedded standard library",
         "compile",
         f"{NATIVE_PACKAGE_FIXTURE}/main.brp",
@@ -146,7 +142,7 @@ ORDER_CHECKS = (
         (EMBEDDED_STANDARD_LIBRARY_FLAG,),
         NATIVE_PACKAGE_ORIGIN_PREFIX,
     ),
-    OrderCheck(
+    RootCheck(
         "source packages",
         "compile",
         f"{SOURCE_PACKAGE_FIXTURE}/app/main.brp",
@@ -161,7 +157,7 @@ ORDER_CHECKS = (
     ),
 )
 
-# The adapter differential runs over the order checks' roots, and over every
+# The adapter differential runs over the root checks' roots, and over every
 # corpus file as a root of one discovery (`files` mode), which reaches files no
 # import does, fixtures included.
 ADAPTER_FILES_MODE = "files"
@@ -384,8 +380,8 @@ EXCERPT_LIMIT = 200
 # runs in seconds, with the wrapping integer semantics the runtime assumes.
 C_COMPILE_FLAGS = ("-O1", "-fwrapv", "-w")
 # Native headers (`*_ffi.h`) the existing compiler's foreign declarations
-# include, found beside the declaring module; only the order dumper builds the
-# whole compiler, but every dumper is given the directories.
+# include, found beside the declaring module; only the adapter differential builds
+# the whole compiler, but every dumper is given the directories.
 C_INCLUDE_FLAGS = tuple(
     flag
     for directory in sorted({str(path.parent) for path in REPO_ROOT.glob("blorp/src/**/*_ffi.h")})
@@ -833,8 +829,8 @@ def stale_adapter_allowances(
 
 
 def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tuple[list[str], list[str], int]:
-    """Run the adapter differential over each `ORDER_CHECKS` root, with the same
-    options the module-order check runs it with, and over the corpus listed in
+    """Run the adapter differential over each `ROOT_CHECKS` root, with the same
+    options the graph check runs it with, and over the corpus listed in
     `file_list`: (notes, problems, failed checks). The root runs skip nothing;
     the corpus run skips exactly `rejected_files`. Each run is a check, and so is
     the list of allowances."""
@@ -845,7 +841,7 @@ def check_adapter(work: Path, file_list: Path, rejected_files: set[str]) -> tupl
     used: set[AdapterDifference] = set()
     runs = [
         (check.description, (check.mode, check.root, *check.options), set())
-        for check in ORDER_CHECKS
+        for check in ROOT_CHECKS
     ]
     runs.append(("every corpus file as a root", (ADAPTER_FILES_MODE, str(file_list)), rejected_files))
     for description, arguments, expected_skipped in runs:
@@ -918,58 +914,35 @@ def run_dumper(binary: Path, *arguments: str | Path, allowed_statuses: tuple[int
     return result.stdout.decode("utf-8", "surrogateescape")
 
 
-def degraded_graph_problems(check: OrderCheck, modules: list[str]) -> list[str]:
-    """Why two agreeing graphs are still too small or lack the origin the check is for."""
+def degraded_graph_problems(check: RootCheck, modules: list[str]) -> list[str]:
+    """Why a graph is too small or lacks the origin the check is for."""
     problems = []
     if len(modules) < check.minimum_modules:
         problems.append(
-            f"module order for {check.description} ({check.root}) loaded {len(modules)} modules, "
+            f"discovery graph for {check.description} ({check.root}) loaded {len(modules)} modules, "
             f"fewer than the expected minimum {check.minimum_modules}"
         )
     if check.required_origin_prefix and not any(
         line.startswith(check.required_origin_prefix) for line in modules
     ):
         problems.append(
-            f"module order for {check.description} ({check.root}) has no module with origin "
+            f"discovery graph for {check.description} ({check.root}) has no module with origin "
             f"`{check.required_origin_prefix}...`"
         )
     return problems
 
 
-def module_order_problems(check: OrderCheck, legacy: list[str], discovery: list[str]) -> list[str]:
-    """Why the two module sequences differ, or nothing when they are equal.
-
-    Each line is `<origin> <path>`; the dumpers print the same spelling of both.
-    """
-    if legacy == discovery:
-        return degraded_graph_problems(check, discovery)
-    problems = [
-        f"module order differs for {check.description} ({check.root}): existing {len(legacy)} modules, "
-        f"discovery {len(discovery)}"
-    ]
-    for position in range(max(len(legacy), len(discovery))):
-        old_name = legacy[position] if position < len(legacy) else "(none)"
-        new_name = discovery[position] if position < len(discovery) else "(none)"
-        if old_name != new_name:
-            problems.append(f"  first difference at position {position}: existing {old_name}, discovery {new_name}")
-            break
-    return problems
-
-
-def check_module_orders(work: Path) -> tuple[list[str], list[str]]:
-    """Run both order dumpers for every `ORDER_CHECKS` root: (notes, problems)."""
-    legacy_binary = build_dumper(LEGACY_ORDER_DUMPER, work)
-    discovery_binary = build_dumper(DISCOVERY_ORDER_DUMPER, work)
+def check_discovery_graphs(work: Path) -> tuple[list[str], list[str]]:
+    """Run the discovery stage's order dumper for every `ROOT_CHECKS` root: (notes, problems)."""
+    binary = build_dumper(DISCOVERY_ORDER_DUMPER, work)
     notes: list[str] = []
     problems: list[str] = []
-    for check in ORDER_CHECKS:
-        arguments = (check.mode, check.root, *check.options)
-        legacy = run_dumper(legacy_binary, *arguments).splitlines()
-        discovery = run_dumper(discovery_binary, *arguments).splitlines()
-        found = module_order_problems(check, legacy, discovery)
+    for check in ROOT_CHECKS:
+        modules = run_dumper(binary, check.mode, check.root, *check.options).splitlines()
+        found = degraded_graph_problems(check, modules)
         problems.extend(found)
         if not found:
-            notes.append(f"module order agrees for {check.description} ({check.root}): {len(legacy)} modules")
+            notes.append(f"discovery graph is complete for {check.description} ({check.root}): {len(modules)} modules")
     return notes, problems
 
 
@@ -1060,18 +1033,18 @@ def main() -> int:
         comparison = with_stale_allowances(
             compare_dumps(legacy_files, discovery_files), set(files)
         )
-        order_notes, order_problems = check_module_orders(work)
-        comparison.notes.extend(order_notes)
-        comparison.problems.extend(order_problems)
-        # Each root is one more check, failing when its module order differs.
-        comparison.files += len(ORDER_CHECKS)
-        comparison.mismatched_files += sum(1 for line in order_problems if line.startswith("module order "))
+        graph_notes, graph_problems = check_discovery_graphs(work)
+        comparison.notes.extend(graph_notes)
+        comparison.problems.extend(graph_problems)
+        # Each root is one more check, failing when its discovery graph is degraded.
+        comparison.files += len(ROOT_CHECKS)
+        comparison.mismatched_files += sum(1 for line in graph_problems if line.startswith("discovery graph "))
         rejected = {path for path, dump in legacy_files.items() if dump.parse_diagnostics > 0}
         adapter_notes, adapter_problem_lines, adapter_failures = check_adapter(work, file_list, rejected)
         comparison.notes.extend(adapter_notes)
         comparison.problems.extend(adapter_problem_lines)
         # Each adapter run, and the allowance list, is one more check.
-        comparison.files += len(ORDER_CHECKS) + 2
+        comparison.files += len(ROOT_CHECKS) + 2
         comparison.mismatched_files += adapter_failures
         missing = set(files) - (set(legacy_files) & set(discovery_files))
         if missing:

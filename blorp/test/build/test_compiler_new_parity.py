@@ -59,27 +59,36 @@ def compare_first(old: str, new: str, **allowances):
 
 
 class CompilerNewParityTests(unittest.TestCase):
-	def test_module_order_agrees_when_both_dumpers_print_the_same_lines(self) -> None:
-		check = parity.OrderCheck("compile root", "compile", "blorp/src/main.brp", 3)
+	def test_a_discovery_graph_with_enough_modules_is_complete(self) -> None:
+		check = parity.RootCheck("compile root", "compile", "blorp/src/main.brp", 3)
 		lines = [
 			"user blorp/src/main.brp",
 			"stdlib standard_library/src/prelude.brp",
 			"stdlib standard_library/src/tuple.brp",
 		]
-		self.assertEqual(parity.module_order_problems(check, lines, list(lines)), [])
+		self.assertEqual(parity.degraded_graph_problems(check, lines), [])
 
-	def test_module_order_names_the_first_difference(self) -> None:
-		check = parity.OrderCheck("test root", "test", "blorp/src/main.brp", 1)
-		problems = parity.module_order_problems(
+	def test_a_discovery_graph_below_the_minimum_is_degraded(self) -> None:
+		check = parity.RootCheck("test root", "test", "blorp/src/main.brp", 3)
+		problems = parity.degraded_graph_problems(
 			check,
-			["user blorp/src/main.brp", "stdlib standard_library/src/prelude.brp", "stdlib standard_library/src/test.brp"],
 			["user blorp/src/main.brp", "stdlib standard_library/src/prelude.brp"],
 		)
-		self.assertTrue(problems[0].startswith("module order differs for test root"))
-		self.assertIn(
-			"position 2: existing stdlib standard_library/src/test.brp, discovery (none)",
-			problems[1],
+		self.assertEqual(len(problems), 1)
+		self.assertTrue(problems[0].startswith("discovery graph for test root"))
+		self.assertIn("fewer than the expected minimum 3", problems[0])
+
+	def test_a_package_check_needs_a_module_with_the_package_origin(self) -> None:
+		check = parity.RootCheck(
+			"source packages",
+			"compile",
+			"blorp/src/main.brp",
+			1,
+			required_origin_prefix=parity.SOURCE_PACKAGE_ORIGIN_PREFIX,
 		)
+		problems = parity.degraded_graph_problems(check, ["user blorp/src/main.brp"])
+		self.assertEqual(len(problems), 1)
+		self.assertIn("source-package:", problems[0])
 
 	def test_hash_and_adjacent_name_merge_into_a_dimension_name(self) -> None:
 		merged = parity.merge_dimension_names(

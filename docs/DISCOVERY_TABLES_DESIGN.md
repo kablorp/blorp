@@ -899,10 +899,9 @@ in the existing front end, and keeps reach `RootModule`; a seed with no source
 is a `MissingImplicitModuleDiagnostic` row.
 
 `scripts/compiler-new-parity` keeps the restated names honest: for the
-self-compile root and for a `blorp test` root it compares the existing graph's
-module sequence and origins (`legacy_module_order_dump.brp`) with the stage's
-(`discovery_module_order_dump.brp`), so a change to the old constants fails
-the gate. The same roots run with the standard library read from the embedded
+self-compile root and for a `blorp test` root it runs the stage's module dump
+(`discovery_module_order_dump.brp`) and fails when the graph is smaller than
+expected, so a name that stops resolving fails the gate. The same roots run with the standard library read from the embedded
 texts, and a fixture project runs with two source packages and a native one.
 
 Follow-up: roots and implicit requests have parallel request, target and
@@ -1164,12 +1163,9 @@ nothing in the adapter loads or orders modules.
 The CLI reaches the stage through one seam, `frontend_compilation_graph_for_root_paths`
 in `blorp/src/lib/source_graph.brp`: every command that builds the graph hands it
 the sources it already read (a path, the name the command chose, the text) and
-the seam owns parsing (the one exception: a test root that test discovery
-already parsed is reused by the existing path, and ignored by the stage). `BLORP_FRONT_END` (`stage`,
-the default, or `existing`; anything else is an error) is read once per setup
-(each command makes one) and the seam matches on it: `existing` parses the roots and runs the existing
-discovery; `stage` runs `compiler/discovery_front_end.brp`, which composes the stage's
-inputs from the same setup (the roots' own text as an overlay over the file
+the seam owns parsing (a test root that test discovery already parsed is read
+again from its text). The seam runs `compiler/discovery_front_end.brp`, which
+composes the stage's inputs from the setup (the roots' own text as an overlay over the file
 system, the standard-library directory or the embedded texts, native package
 roots, source packages, the prelude set and for `blorp test` the test runtime),
 renders what the stage rejected, and gives the rest to `legacy_frontend_graph`.
@@ -1216,9 +1212,8 @@ What a user sees by default, with the stage, beyond the listed help lines above:
   convention to the adapter as `LegacyModuleNaming.path_module_name`.
 - **Fixtures under the stage.** `run_blorp_check_fixtures.py` checks a
   should_fail fixture against its `EXPECT-DISCOVERY-TEXT` lines and the
-  position in its `EXPECT-DISCOVERY` pin by default or with `BLORP_FRONT_END=stage`,
-  and against its `EXPECT-BLORP` lines with `BLORP_FRONT_END=existing`; the CLI parse-failure checks
-  compare the diagnostic lines without the `help:` line.
+  position in its `EXPECT-DISCOVERY` pin; the CLI parse-failure checks compare
+  the diagnostic lines without the `help:` line.
 
 Superseded: `blorp test` discovery (`test/discovery.brp`) and doctest extraction
 (`test/doctest.brp`) still parse with the existing parser as tools, like the
@@ -1238,9 +1233,7 @@ separate renderer is written; the existing side's program is the one its
 second step leaves, with the interpolation holes parsed (`with_holes_parsed`,
 in `discovery_adapter_comparison.brp`). The encoder gained the `else` keyword's
 span, which it did not print. A mismatch names the module, the declaration and
-the field. For a root it also builds the existing front end's
-graph and compares each module's name, origin and source path, since the
-program comparison uses the adapter's own names on both sides. A module the
+the field. A module the
 existing parser rejects is skipped; the parity gate requires the skipped set to
 equal the files the existing parser rejects. `scripts/compiler-new-parity` runs it
 (`ADAPTER_DIFFERENCES` lists deliberate differences with a reason each; there

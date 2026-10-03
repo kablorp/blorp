@@ -25,10 +25,11 @@ Two kinds of entry live here:
   out to be a fault, move it to a CF entry and leave a one-line cross-reference
   under its old number.
 
-The default front end is the discovery stage,
+The front end is the discovery stage,
 `blorp/src/compiler_new/stage_01_discovery/` (lexer in `lex/`, parser in
 `parse/`, error text in `diagnostics/render.brp`); `compiler/stage_02_lex` and
-`stage_03_parse` run only with `BLORP_FRONT_END=existing`. Type checking is the old
+`stage_03_parse` serve only the formatter, the LSP, `blorp test` discovery and
+`compile --ast`. Type checking is the old
 `blorp/src/compiler/stage_06_typecheck/`, which the rewrite replaces.
 
 **How to find the owner of a message.** Take a fixed phrase from the output and

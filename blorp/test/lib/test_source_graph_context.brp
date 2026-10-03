@@ -1,13 +1,14 @@
 import:
+	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/compiler/pipeline: frontend_graph_discover
+	../../src/compiler/stage_02_lex/name_table: NameTable, name_spelling, name_table_find_id
 	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../src/compiler/stage_03_parse/parsed_ast: ParsedDecl(FunctionParsedDecl)
 	../../src/compiler/stage_03_parse/source_ast_finalize:
 		FinalizedImportPathRewrite,
-		finalized_typecheck_program_with_single_file_names,
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_rewrite_import_paths,
-	../../src/compiler/stage_02_lex/name_table: NameTable, name_spelling, name_table_find_id
-	../../src/compiler/stage_03_parse/parsed_ast: ParsedDecl(FunctionParsedDecl)
+		finalized_typecheck_program_with_single_file_names,
 	../../src/compiler/stage_04_modules/frontend_graph:
 		frontend_graph_modules,
 		frontend_graph_name_table,
@@ -18,19 +19,14 @@ import:
 		FrontendSourceResolution(FrontendSourceUnresolved),
 	../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(UserModule),
-		resolved_module_canonical_path,
 		resolved_module_identity_from_resolver,
-	../../src/compiler/frontend_request: FrontendCompilationGraph
 	../../src/lib/cli_args: CliAction(CliCheck)
 	../../src/lib/cli_plan:
 		CliRootSource(CliUnparsedRoot),
 		CliSourceFile,
-		FrontEnd(DiscoveryStage, ExistingDiscovery),
-		FrontEndSelection(SelectedFrontEnd, UnknownFrontEnd),
 		FrontendRuntimeModules(CompilerOnly),
 	../../src/lib/source: source_file
 	../../src/lib/source_graph:
-		front_end_selection,
 		frontend_compilation_graph_for_root_paths,
 		source_graph_setup_for_paths,
 	fs: create_directories, message, remove_directory_tree, write_text_atomic
@@ -140,152 +136,47 @@ func test_finalized_root_retains_rewritten_import_path() -> Bool:
 					False
 
 
---- The front end setting is read as a closed set of spellings: unset or blank is
---- the default (the stage), `existing` selects the old path, and anything else
---- that is not a front end is reported, not defaulted.
-func test_front_end_selection_accepts_only_its_spellings() -> Bool:
-	defaults: Bool = match (
-		front_end_selection(None),
-		front_end_selection(Some("")),
-		front_end_selection(Some("  ")),
-	):
-		(
-			SelectedFrontEnd(DiscoveryStage),
-			SelectedFrontEnd(DiscoveryStage),
-			SelectedFrontEnd(DiscoveryStage),
-		):
-			True
-		_:
-			False
-
-	existing: Bool = match front_end_selection(Some(" existing ")):
-		SelectedFrontEnd(ExistingDiscovery):
-			True
-		_:
-			False
-
-	others: Bool = match (front_end_selection(Some(" stage\n")), front_end_selection(Some("Stage"))):
-		(SelectedFrontEnd(DiscoveryStage), UnknownFrontEnd("Stage")):
-			True
-		_:
-			False
-
-	defaults and existing and others
-
-
---- An unknown front end spelling stops the graph seam with an error that names
---- the variable and what it accepts, before any source is read.
-func test_unknown_front_end_is_rejected_at_the_seam() -> Bool:
-	setup = source_graph_setup_for_paths(check_action("/workspace/root.brp"), ["/workspace/root.brp"])
-	rejecting = { setup | front_end = UnknownFrontEnd("bogus") }
-	root: CliSourceFile = {
-		path = "/workspace/root.brp",
-		module_name = "root",
-		source_text = "VALUE = 1\n"
-	}
-
-	match frontend_compilation_graph_for_root_paths(
-		rejecting,
-		[CliUnparsedRoot(root)],
-		CompilerOnly,
-	):
-		Err(message):
-			(
-				message.contains("BLORP_FRONT_END")
-				and message.contains("`bogus`")
-				and message.contains("help: use `existing` or `stage`, or unset it for the default (`stage`)")
-			)
-		Ok(_):
-			False
-
-
---- Both front ends build the same graph for the same root: the module names,
---- origins and paths, in the same order, and the same declarations.
-func test_both_front_ends_build_the_same_graph_for_a_root() -> Bool:
-	-- The doubled separator is how a temporary directory path often arrives; the
-	-- existing front end reports a root's path as given.
-	setup = source_graph_setup_for_paths(check_action("/workspace//root.brp"), ["/workspace//root.brp"])
-	root: CliSourceFile = {
-		path = "/workspace//root.brp",
-		module_name = "root",
-		source_text = "func answer() -> Int:\n\t42\n"
-	}
-	existing = frontend_compilation_graph_for_root_paths(
-		{ setup | front_end = SelectedFrontEnd(ExistingDiscovery) },
-		[CliUnparsedRoot(root)],
-		CompilerOnly,
-	)
-	staged = frontend_compilation_graph_for_root_paths(
-		{ setup | front_end = SelectedFrontEnd(DiscoveryStage) },
-		[CliUnparsedRoot(root)],
-		CompilerOnly,
-	)
-
-	match (existing, staged):
-		(Ok(old), Ok(new)):
-			module_lines(old) == module_lines(new)
-		_:
-			False
-
-
---- The module names each front end gives the graph of a root at `root_path`
---- whose text is `source_text`, existing front end first: `None` when either
---- front end rejects it.
-private func module_names_of_both_front_ends(
-	root_path: String,
-	source_text: String,
-) -> Option[(List[String], List[String])]:
+--- The module names the graph of a root at `root_path` whose text is
+--- `source_text` gives its modules: `None` when the front end rejects it.
+private func module_names_of_root(root_path: String, source_text: String) -> Option[List[String]]:
 	setup = source_graph_setup_for_paths(check_action(root_path), [root_path])
 	root: CliSourceFile = {
 		path = root_path,
 		module_name = "named_root",
 		source_text = source_text
 	}
-	existing = frontend_compilation_graph_for_root_paths(
-		{ setup | front_end = SelectedFrontEnd(ExistingDiscovery) },
-		[CliUnparsedRoot(root)],
-		CompilerOnly,
-	)
-	staged = frontend_compilation_graph_for_root_paths(
-		{ setup | front_end = SelectedFrontEnd(DiscoveryStage) },
-		[CliUnparsedRoot(root)],
-		CompilerOnly,
-	)
 
-	match (existing, staged):
-		(Ok(old), Ok(new)):
-			Some((module_names(old), module_names(new)))
-		_:
+	match frontend_compilation_graph_for_root_paths(setup, [CliUnparsedRoot(root)], CompilerOnly):
+		Ok(graph):
+			Some(module_names(graph))
+		Err(_):
 			None
 
 
-private func names_agree_and_contain(
-	names: Option[(List[String], List[String])],
-	expected: String,
-) -> Bool:
+private func names_contain(names: Option[List[String]], expected: String) -> Bool:
 	match names:
-		Some((old, new)):
-			old == new and new.contains(expected)
+		Some(found):
+			found.contains(expected)
 		None:
 			False
 
 
 --- A root named by an absolute path (as `blorp test` names its roots) imports a
---- file by a relative path. Both front ends name that file by its path from the
+--- file by a relative path. The front end names that file by its path from the
 --- working directory, not by the absolute path: names such as
 --- `blorp_src_lsp_lsp_stdio_transport` are the spelling later passes key on.
-func test_both_front_ends_name_a_relatively_imported_module_by_its_working_directory_path() -> Bool:
+func test_front_end_names_a_relatively_imported_module_by_its_working_directory_path() -> Bool:
 	root_path: String = getcwd() + "/blorp/test/lsp/server/test_lsp_stdio_transport.brp"
-	names_agree_and_contain(
-		module_names_of_both_front_ends(root_path, RELATIVE_IMPORT_SOURCE),
+	names_contain(
+		module_names_of_root(root_path, RELATIVE_IMPORT_SOURCE),
 		"blorp/src/lsp/lsp_stdio_transport",
 	)
 
 
 --- The same root named by a relative path gives the same names.
-func test_both_front_ends_name_a_relatively_imported_module_from_a_relative_root() -> Bool:
-	names_agree_and_contain(
-		module_names_of_both_front_ends(
+func test_front_end_names_a_relatively_imported_module_from_a_relative_root() -> Bool:
+	names_contain(
+		module_names_of_root(
 			"blorp/test/lsp/server/test_lsp_stdio_transport.brp",
 			RELATIVE_IMPORT_SOURCE,
 		),
@@ -293,21 +184,30 @@ func test_both_front_ends_name_a_relatively_imported_module_from_a_relative_root
 	)
 
 
---- A root outside the working directory keeps its absolute path as its name,
---- with either front end.
+--- A root outside the working directory keeps its absolute path as its name.
 func outside_root_case() -> Result[Bool, String]:
 	directory: String = temp_dir().join("blorp_graph_naming_" + now_microseconds().to_string())
 	_created ?= create_directories(directory).map_err(func(error): message(error))
 	helper_path: String = directory.join("helper.brp")
 	root_path: String = directory.join("outside_root.brp")
-	_helper ?= write_text_atomic(helper_path, "func helper() -> Int:\n\t1\n").map_err(func(error): message(error))
-	_root ?= write_text_atomic(root_path, "import:\n\t./helper: helper\n").map_err(func(error): message(error))
-	names = module_names_of_both_front_ends(root_path, "import:\n\t./helper: helper\n")
+	_helper ?= write_text_atomic(
+		helper_path,
+		"func helper() -> Int:\n\t1\n",
+	).map_err(
+		func(error): message(error),
+	)
+	_root ?= write_text_atomic(
+		root_path,
+		"import:\n\t./helper: helper\n",
+	).map_err(
+		func(error): message(error),
+	)
+	names = module_names_of_root(root_path, "import:\n\t./helper: helper\n")
 	_ = remove_directory_tree(directory)
-	Ok(names_agree_and_contain(names, normalize(helper_path).remove_suffix(".brp")))
+	Ok(names_contain(names, normalize(helper_path).remove_suffix(".brp")))
 
 
-func test_both_front_ends_keep_the_absolute_name_of_a_module_outside_the_working_directory() -> Bool:
+func test_front_end_keeps_the_absolute_name_of_a_module_outside_the_working_directory() -> Bool:
 	outside_root_case().get_or(False)
 
 
@@ -317,13 +217,6 @@ RELATIVE_IMPORT_SOURCE: String = "import:\n\t../../../src/lsp/lsp_stdio_transpor
 private func module_names(compilation: FrontendCompilationGraph) -> List[String]:
 	frontend_graph_modules(compilation.graph).map(func(module):
 		finalized_typecheck_program_ast(module.program).source.module_name
-	)
-
-
-private func module_lines(compilation: FrontendCompilationGraph) -> List[String]:
-	frontend_graph_modules(compilation.graph).map(func(module):
-		program = finalized_typecheck_program_ast(module.program)
-		"${resolved_module_canonical_path(module.identity)} ${program.source.path} ${program.decls.length()}"
 	)
 
 
@@ -355,15 +248,23 @@ func finalized_root_hole_spelling_is_published(preceding_texts: List[String]) ->
 		module_name = "preceding_" + index.to_string()
 		roots = roots.append({
 			identity = resolved_module_identity_from_resolver(module_name, UserModule),
-			input = RawFrontendSource(source_file("/workspace/" + module_name + ".brp", module_name, text))
+			input = RawFrontendSource(
+				source_file(
+					"/workspace/" + module_name + ".brp",
+					module_name,
+					text,
+				),
+			),
 		})
 		index += 1
 
-	match frontend_graph_discover(
-		roots.append(finalized_root),
-		[],
-		func(_importer, _requested_path): Ok(FrontendSourceUnresolved),
-		func(_location): Err("not reached"),
+	match (
+		frontend_graph_discover(
+			roots.append(finalized_root),
+			[],
+			func(_importer, _requested_path): Ok(FrontendSourceUnresolved),
+			func(_location): Err("not reached"),
+		)
 	):
 		Err(_):
 			False
@@ -381,8 +282,16 @@ func test_finalized_root_table_keeps_interpolation_hole_spellings() -> Bool:
 --- discovers them together, and reports whether every top-level function name
 --- of every root spells the same in the graph table as in its source.
 func finalized_roots_identifiers_index_graph_table() -> Bool:
-	first_source = source_file("/workspace/first_root.brp", "first_root", "func first_only() -> Int: 1\n")
-	second_source = source_file("/workspace/second_root.brp", "second_root", "func second_only() -> Int: 2\n")
+	first_source = source_file(
+		"/workspace/first_root.brp",
+		"first_root",
+		"func first_only() -> Int: 1\n",
+	)
+	second_source = source_file(
+		"/workspace/second_root.brp",
+		"second_root",
+		"func second_only() -> Int: 2\n",
+	)
 	(first_program, first_names) = finalized_typecheck_program_with_single_file_names(
 		parse_compiler_source(first_source),
 	)
@@ -390,20 +299,22 @@ func finalized_roots_identifiers_index_graph_table() -> Bool:
 		parse_compiler_source(second_source),
 	)
 
-	match frontend_graph_discover(
-		[
-			{
-				identity = resolved_module_identity_from_resolver("first_root", UserModule),
-				input = FinalizedFrontendSource(first_program, first_names)
-			},
-			{
-				identity = resolved_module_identity_from_resolver("second_root", UserModule),
-				input = FinalizedFrontendSource(second_program, second_names)
-			},
-		],
-		[],
-		func(_importer, _requested_path): Ok(FrontendSourceUnresolved),
-		func(_location): Err("not reached"),
+	match (
+		frontend_graph_discover(
+			[
+				{
+					identity = resolved_module_identity_from_resolver("first_root", UserModule),
+					input = FinalizedFrontendSource(first_program, first_names)
+				},
+				{
+					identity = resolved_module_identity_from_resolver("second_root", UserModule),
+					input = FinalizedFrontendSource(second_program, second_names)
+				},
+			],
+			[],
+			func(_importer, _requested_path): Ok(FrontendSourceUnresolved),
+			func(_location): Err("not reached"),
+		)
 	):
 		Err(_):
 			False
@@ -418,7 +329,10 @@ func finalized_roots_identifiers_index_graph_table() -> Bool:
 						FunctionParsedDecl(function_decl):
 							checked += 1
 
-							if name_spelling(table, function_decl.name.name) != Some(function_decl.name.text):
+							if name_spelling(
+								table,
+								function_decl.name.name,
+							) != Some(function_decl.name.text):
 								agreed = False
 						_:
 							void
@@ -446,28 +360,16 @@ tests: TestSuite = {
 			test_source_graph_setup_rejects_conflicting_project_contexts,
 		),
 		(
-			"accepts only the front end spellings",
-			test_front_end_selection_accepts_only_its_spellings,
-		),
-		(
-			"rejects an unknown front end at the seam",
-			test_unknown_front_end_is_rejected_at_the_seam,
-		),
-		(
-			"builds the same graph with either front end",
-			test_both_front_ends_build_the_same_graph_for_a_root,
-		),
-		(
-			"names a relatively imported module by its working-directory path with either front end",
-			test_both_front_ends_name_a_relatively_imported_module_by_its_working_directory_path,
+			"names a relatively imported module by its working-directory path",
+			test_front_end_names_a_relatively_imported_module_by_its_working_directory_path,
 		),
 		(
 			"names a relatively imported module the same from a relative root",
-			test_both_front_ends_name_a_relatively_imported_module_from_a_relative_root,
+			test_front_end_names_a_relatively_imported_module_from_a_relative_root,
 		),
 		(
 			"keeps the absolute name of a module outside the working directory",
-			test_both_front_ends_keep_the_absolute_name_of_a_module_outside_the_working_directory,
+			test_front_end_keeps_the_absolute_name_of_a_module_outside_the_working_directory,
 		),
 		(
 			"retains finalized root import rewrites",
@@ -477,10 +379,10 @@ tests: TestSuite = {
 			"keeps interpolation-hole spellings for a finalized root",
 			test_finalized_root_table_keeps_interpolation_hole_spellings,
 		),
-		(
-			"publishes a finalized root's hole spelling after a raw file without new spellings",
-			test_finalized_root_after_a_raw_file_without_new_spellings_is_published,
-		),
+		((
+				"publishes a finalized root's hole spelling after a raw file without new "
+				+ "spellings"
+			), test_finalized_root_after_a_raw_file_without_new_spellings_is_published),
 		(
 			"publishes a finalized root's hole spelling after a raw file with new spellings",
 			test_finalized_root_after_a_raw_file_with_new_spellings_is_published,

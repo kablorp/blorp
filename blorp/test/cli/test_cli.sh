@@ -261,26 +261,16 @@ $RUN_OUTPUT"
     fi
 }
 
-# The front end the commands under test use: unset or blank is the discovery
-# stage, the default (DEFAULT_FRONT_END in blorp/src/lib/source_graph.brp);
-# `existing` is the old path, kept until it is removed.
-selected_front_end() {
-    local setting="${BLORP_FRONT_END:-}"
-    setting="${setting//[[:space:]]/}"
-    printf '%s' "${setting:-stage}"
-}
-
-# A parse-failure check that holds under both front ends. With the existing front
-# end the whole output must equal `expected_output` exactly. With the stage (the
-# default, or `BLORP_FRONT_END=stage`) the diagnostic lines, `help:` lines dropped, must equal
-# it, and the `help:` lines themselves must equal `expected_stage_help` (one per
-# diagnostic): the stage's teaching help is a user-facing feature, so it is pinned
-# here, not ignored (docs/DISCOVERY_TABLES_DESIGN.md, "Diagnostic text").
+# A parse-failure check. The diagnostic lines, `help:` lines dropped, must equal
+# `expected_output`, and the `help:` lines themselves must equal
+# `expected_help` (one per diagnostic): the front end's teaching help is a
+# user-facing feature, so it is pinned here, not ignored
+# (docs/DISCOVERY_TABLES_DESIGN.md, "Diagnostic text").
 expect_diagnostics_exact() {
     local name="$1"
     local expected_code="$2"
     local expected_output="$3"
-    local expected_stage_help="$4"
+    local expected_help="$4"
     local actual_output actual_help
     shift 4
 
@@ -290,25 +280,16 @@ expect_diagnostics_exact() {
     if [ "$RUN_CODE" -ne "$expected_code" ]; then
         record_fail "$name" "expected exit $expected_code, got $RUN_CODE
 $RUN_OUTPUT"
-    elif [ "$(selected_front_end)" != "stage" ]; then
-        if [ "$RUN_OUTPUT" = "$expected_output" ]; then
-            record_pass "$name"
-        else
-            record_fail "$name" "expected output:
-$expected_output
-actual output:
-$RUN_OUTPUT"
-        fi
     else
         actual_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" || true)
         actual_help=$(grep '^help: ' <<<"$RUN_OUTPUT" || true)
-        if [ "$actual_output" = "$expected_output" ] && [ "$actual_help" = "$expected_stage_help" ]; then
+        if [ "$actual_output" = "$expected_output" ] && [ "$actual_help" = "$expected_help" ]; then
             record_pass "$name"
         else
             record_fail "$name" "expected diagnostics:
 $expected_output
 expected help:
-$expected_stage_help
+$expected_help
 actual output:
 $RUN_OUTPUT"
         fi
@@ -1547,7 +1528,7 @@ expect_exit "check type failure" 1 "$BLORP_BIN" check --no-format "$invalid_prog
 missing_colon_help='help: a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`'
 # A parse error prints once, as `<location>: error: <message>`, with no
 # duplicated severity, no expected-token suffix, and no typechecker follow-on.
-# The stage adds a `help:` line per diagnostic, the existing parser none; both are pinned.
+# Each diagnostic carries a `help:` line; the message and the help are both pinned.
 expect_diagnostics_exact "check parse failure prints one diagnostic" 1 \
     "$parse_missing_colon_prog:3:9: error: expected \`:\` after if condition" \
     "$missing_colon_help" \
@@ -1571,67 +1552,8 @@ expect_output_contains "compiler runtime is not importable from std" 1 \
 	"$BLORP_BIN" check --no-format "$compiler_runtime_import"
 expect_exit "check missing file arg" 1 "$BLORP_BIN" check
 
-# The front end behind the graph seam is chosen by BLORP_FRONT_END: the discovery
-# stage with its adapter (the default), or `existing`, the old lexer, parser and
-# module loader. Each command gives the same result with either, and an unset
-# variable is the stage.
-expect_front_end_same() {
-    local name="$1"
-    shift
-    local existing_output existing_code
-
-    TOTAL=$((TOTAL + 1))
-    run_capture "" env BLORP_FRONT_END=existing "$@"
-    existing_output="$RUN_OUTPUT"
-    existing_code="$RUN_CODE"
-    run_capture "" env BLORP_FRONT_END=stage "$@"
-
-    if [ "$existing_code" -ne "$RUN_CODE" ]; then
-        record_fail "$name" "exit $existing_code with the existing front end, $RUN_CODE with the stage
-existing:
-$existing_output
-stage:
-$RUN_OUTPUT"
-    elif [ "$existing_output" = "$RUN_OUTPUT" ]; then
-        record_pass "$name"
-    else
-        record_fail "$name" "output differs
-existing:
-$existing_output
-stage:
-$RUN_OUTPUT"
-    fi
-}
-
-# The stage's teaching diagnostics add a `help:` line the existing parser does not
-# print (docs/DISCOVERY_TABLES_DESIGN.md, "Diagnostic text"); everything else,
-# the position and the message, is the same.
-expect_front_end_same_but_help() {
-    local name="$1"
-    shift
-    local existing_output existing_code stage_output
-
-    TOTAL=$((TOTAL + 1))
-    run_capture "" env BLORP_FRONT_END=existing "$@"
-    existing_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" | grep -v '^$')
-    existing_code="$RUN_CODE"
-    run_capture "" env BLORP_FRONT_END=stage "$@"
-    stage_output=$(grep -v '^help: ' <<<"$RUN_OUTPUT" | grep -v '^$')
-
-    if [ "$existing_code" -ne "$RUN_CODE" ]; then
-        record_fail "$name" "exit $existing_code with the existing front end, $RUN_CODE with the stage
-$RUN_OUTPUT"
-    elif [ "$existing_output" = "$stage_output" ]; then
-        record_pass "$name"
-    else
-        record_fail "$name" "output differs apart from help lines
-existing:
-$existing_output
-stage:
-$stage_output"
-    fi
-}
-
+# The discovery stage and its adapter build the graph every command compiles,
+# checks, tests or purifies.
 front_end_dir="$TMPDIR_CLI/front_end"
 mkdir -p "$front_end_dir"
 printf 'func double(x: Int) -> Int:\n\tx * 2\n\nfunc main(args: List[String]) -> Int:\n\tprint("value ${double(21)}")\n\t0\n' \
@@ -1642,108 +1564,43 @@ printf 'import:\n\t./Helper\n\nfunc main(args: List[String]) -> Int:\n\t0\n' \
     > "$front_end_dir/case_import.brp"
 printf 'VALUE: Int = 1\n' > "$front_end_dir/helper.brp"
 
-expect_front_end_same "front end stage: check success" \
+expect_output_contains "front end: check success" 0 "Type checking succeeded." \
     "$BLORP_BIN" check --no-format "$front_end_dir/ok.brp"
-expect_front_end_same "front end stage: check type failure" \
-    "$BLORP_BIN" check --no-format "$invalid_prog"
-expect_front_end_same_but_help "front end stage: check parse failure" \
-    "$BLORP_BIN" check --no-format "$parse_missing_colon_prog"
-expect_front_end_same_but_help "front end stage: check parse failures in a root and an import" \
-    "$BLORP_BIN" check --no-format "$parse_two_modules_dir/main.brp"
-expect_front_end_same "front end stage: check unresolved import" \
+expect_output_contains "front end: check unresolved import" 1 \
+    "module 'no_such_module' is not loaded for import registration" \
     "$BLORP_BIN" check --no-format "$front_end_dir/unresolved_import.brp"
-# The stage points at the import; the existing front end prints the message alone.
-expect_output_contains "front end stage: check case-mismatched import" 1 \
+expect_output_contains "front end: check case-mismatched import" 1 \
     "$front_end_dir/case_import.brp:2:5: error: import \`./Helper\` does not match the file's name \`helper.brp\`" \
-    env BLORP_FRONT_END=stage "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
-expect_output_contains "front end existing: check case-mismatched import" 1 \
-    "error: import \`./Helper\` does not match the file's name \`helper.brp\`" \
-    env BLORP_FRONT_END=existing "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
-# The existing loader skips an implicit module its standard-library directory
-# lacks; the stage reports it.
+    "$BLORP_BIN" check --no-format "$front_end_dir/case_import.brp"
 mkdir -p "$front_end_dir/empty_std"
-expect_output_contains "front end stage: a missing implicit module is reported" 1 \
+expect_output_contains "front end: a missing implicit module is reported" 1 \
     "error: cannot find implicit module \`prelude\`" \
-    env BLORP_FRONT_END=stage "$BLORP_BIN" check --no-format \
-    --std-dir "$front_end_dir/empty_std" "$front_end_dir/ok.brp"
-expect_output_contains "front end stage: unknown value is rejected" 1 \
-    "BLORP_FRONT_END is \`bogus\`, which names no front end." \
-    env BLORP_FRONT_END=bogus "$BLORP_BIN" check --no-format "$front_end_dir/ok.brp"
-expect_output_contains "front end stage: unknown value names the accepted values" 1 \
-    "help: use \`existing\` or \`stage\`" \
-    env BLORP_FRONT_END=bogus "$BLORP_BIN" compile --no-format -o "$front_end_dir/never.c" "$front_end_dir/ok.brp"
-expect_output_contains "front end stage: a blank value is the default" 0 \
-    "Type checking succeeded." \
-    env BLORP_FRONT_END= "$BLORP_BIN" check --no-format "$front_end_dir/ok.brp"
-mkdir -p "$front_end_dir/chain"
-printf 'import:\n\t./middle\n\nfunc main(args: List[String]) -> Int:\n\tmiddle_value()\n' \
-    > "$front_end_dir/chain/top.brp"
-printf 'import:\n\t./leaf\n\nfunc middle_value() -> Int:\n\tleaf_value() + 1\n' \
-    > "$front_end_dir/chain/middle.brp"
-printf 'func leaf_value() -> Int:\n\t41\n' > "$front_end_dir/chain/leaf.brp"
-printf 'import:\n\t./middle\n\nfunc main(args: List[String]) -> Int:\n\tmiddle_value() + "x"\n' \
-    > "$front_end_dir/chain/top_type_error.brp"
+    "$BLORP_BIN" check --no-format --std-dir "$front_end_dir/empty_std" "$front_end_dir/ok.brp"
 # A file named like a standard-library module is the user's mistake, reported as
 # the graph validation words it; it is not a defect of the stage's tables.
 mkdir -p "$front_end_dir/reserved"
 printf 'func main(args: List[String]) -> Int:\n\t0\n' > "$front_end_dir/reserved/debug.brp"
-expect_front_end_same "front end stage: a root named like a standard-library module is rejected the same way" \
+expect_output_contains "front end: a root named like a standard-library module is rejected" 1 \
+    "standard-library module path \`debug\` is reserved" \
     "$BLORP_BIN" check --no-format "$front_end_dir/reserved/debug.brp"
-expect_front_end_same "front end stage: check a module chain" \
-    "$BLORP_BIN" check --no-format "$front_end_dir/chain/top.brp"
-expect_front_end_same "front end stage: check a type error across a module chain" \
-    "$BLORP_BIN" check --no-format "$front_end_dir/chain/top_type_error.brp"
-expect_front_end_same "front end stage: check a root in a configured standard-library directory" \
+expect_output_contains "front end: check a root in a configured standard-library directory" 0 \
+    "Type checking succeeded." \
     "$BLORP_BIN" check --no-format --std-dir "$PWD/standard_library/src" \
     "$PWD/standard_library/src/bool.brp"
-expect_front_end_same "front end stage: check a root inside a relative standard-library directory" \
+expect_output_contains "front end: check a root inside a relative standard-library directory" 0 \
+    "Type checking succeeded." \
     "$BLORP_BIN" check --no-format --std-dir standard_library/src standard_library/src/bool.brp
-expect_front_end_same "front end stage: check a root inside a relative standard-library directory, spelled absolutely" \
+expect_output_contains "front end: check a root inside a relative standard-library directory, spelled absolutely" 0 \
+    "Type checking succeeded." \
     "$BLORP_BIN" check --no-format --std-dir standard_library/src "$PWD/standard_library/src/bool.brp"
-expect_front_end_same "front end stage: check a user root with a relative standard-library directory" \
+expect_output_contains "front end: check a user root with a relative standard-library directory" 0 \
+    "Type checking succeeded." \
     "$BLORP_BIN" check --no-format --std-dir standard_library/src "$front_end_dir/ok.brp"
-expect_front_end_same "front end stage: test a source with doctests" \
+expect_exit "front end: test a source with doctests" 0 \
     "$BLORP_BIN" test --doc --timeout 60 standard_library/src/option.brp
-expect_front_end_same "front end stage: purify dry run" \
-    "$BLORP_BIN" purify --dry-run "$front_end_dir/ok.brp"
-expect_front_end_same "front end stage: test" \
+expect_exit "front end: purify dry run" 0 "$BLORP_BIN" purify --dry-run "$front_end_dir/ok.brp"
+expect_exit "front end: test" 0 \
     "$BLORP_BIN" test --suite --timeout 20 blorp/test/runtime/types/test_bool.brp
-
-TOTAL=$((TOTAL + 1))
-run_capture "" env BLORP_FRONT_END=existing "$BLORP_BIN" compile --no-format -o "$front_end_dir/existing.c" "$front_end_dir/ok.brp"
-existing_compile_code="$RUN_CODE"
-run_capture "" env BLORP_FRONT_END=stage "$BLORP_BIN" compile --no-format -o "$front_end_dir/stage.c" "$front_end_dir/ok.brp"
-if [ "$existing_compile_code" -eq 0 ] && [ "$RUN_CODE" -eq 0 ] \
-    && cmp -s "$front_end_dir/existing.c" "$front_end_dir/stage.c"; then
-    record_pass "front end stage: compile emits the same C"
-else
-    record_fail "front end stage: compile emits the same C" "exit $existing_compile_code with the existing front end, $RUN_CODE with the stage
-$RUN_OUTPUT"
-fi
-
-# An unset variable is the stage: the default compile emits the stage's C and a
-# parse failure prints the stage's diagnostics, `help:` lines included.
-TOTAL=$((TOTAL + 1))
-run_capture "" env -u BLORP_FRONT_END "$BLORP_BIN" compile --no-format -o "$front_end_dir/unset.c" "$front_end_dir/ok.brp"
-unset_compile_code="$RUN_CODE"
-if [ "$unset_compile_code" -eq 0 ] && cmp -s "$front_end_dir/unset.c" "$front_end_dir/stage.c"; then
-    record_pass "front end default: an unset variable compiles like the stage"
-else
-    record_fail "front end default: an unset variable compiles like the stage" "exit $unset_compile_code
-$RUN_OUTPUT"
-fi
-TOTAL=$((TOTAL + 1))
-run_capture "" env -u BLORP_FRONT_END "$BLORP_BIN" check --no-format "$parse_missing_colon_prog"
-unset_parse_output="$RUN_OUTPUT"
-run_capture "" env BLORP_FRONT_END=stage "$BLORP_BIN" check --no-format "$parse_missing_colon_prog"
-if [ "$unset_parse_output" = "$RUN_OUTPUT" ] && grep -q '^help: ' <<<"$unset_parse_output"; then
-    record_pass "front end default: an unset variable reports parse failures like the stage"
-else
-    record_fail "front end default: an unset variable reports parse failures like the stage" "unset:
-$unset_parse_output
-stage:
-$RUN_OUTPUT"
-fi
 if $run_deep_checks; then
 	expect_output_contains "check multi-file success" 0 "Checking " \
 		"$BLORP_BIN" check --no-format "$check_dir_ok/root.brp" "$check_dir_ok/nested/child.brp"

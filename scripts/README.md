@@ -34,8 +34,8 @@ plan that selects nothing is a no-op explanation, not a passing validation; use
 the task-specific build, docs, or release checks for those changes.
 
 Sources under `blorp/src/compiler_new` and suites under
-`blorp/test/compiler_new` (the rewritten compiler stages, not linked into
-`bin/blorp` yet) are outside this manifest: `--changed` selects nothing for
+`blorp/test/compiler_new` (the discovery stage, which `bin/blorp` links through
+its adapter) are outside this manifest: `--changed` selects nothing for
 them and names their gate, `scripts/test compiler-new`.
 
 The command prints the selected sources, suites, and special checks before it
@@ -52,7 +52,6 @@ scripts/test compiler-blorp     # Blorp TestSuites + marked production check fix
 scripts/test compiler-tools     # formatter/purify/lint fixtures + backend/identity tool guards
 scripts/test compiler-new       # rewritten compiler stages (blorp/src/compiler_new) TestSuites
 scripts/test compiler-new-parity # discovery stage vs the existing front end over the corpus
-scripts/test front-end-existing    # fast slice of the gates run with BLORP_FRONT_END=existing
 scripts/test std-check          # broad standard-library source typecheck sweep
 scripts/test runtime            # runtime .brp tests
 scripts/test leak               # ownership suites, leak baselines, and diagnostics
@@ -90,18 +89,6 @@ premerge gate and of the compiler CI lane. The layout check keeps that tree isol
 imports them, and its tests import only `compiler_new`, `lib`, their own tree
 and the standard library (`isolated_test_owners` in
 `blorp/source_ownership.json`).
-The `front-end-existing` gate (`scripts/front-end-existing-check`) keeps the
-existing front end's compile path green until it is removed; the discovery stage
-is the default. It runs, with `BLORP_FRONT_END=existing`, the CLI smoke checks,
-the package lifecycle, the parser fixtures, the suites that own the front-end
-seam and the CLI wrapper, and the self-compile, whose generated C must equal the
-default's. It takes about three minutes. The full gates run under the old path by
-exporting the variable, for example `BLORP_FRONT_END=existing scripts/test
---no-build cli`; every gate passes it to the compiler unchanged. A syntax change
-lands in both parsers until the old path is removed
-(`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`, "Rules for the interim"), and this gate
-is what shows the old path breaking.
-
 The `compiler-new-parity` gate (`scripts/compiler-new-parity`) holds the
 discovery stage to the existing front end across every tracked `.brp` file
 under `blorp/src`, `standard_library/src` and `blorp/test`: it compiles
@@ -110,16 +97,16 @@ under `blorp/src`, `standard_library/src` and `blorp/test`: it compiles
 sequentially over the file list, and compares every token (kind, byte range,
 text; the old `#` plus name is one `DimensionNameToken`), the set of files with
 lexer diagnostics and each file's accept/reject verdict. A mismatch prints the
-file and the first differing token. It also compares module order: for the
-self-compile root and for a `blorp test` root, the existing graph's module
-sequence and origins (`legacy_module_order_dump.brp`) must equal the stage's
-(`discovery_module_order_dump.brp`), which catches the stage's implicit module
-names drifting from the existing front end's. The same roots run with the
-standard library read from the compiler's embedded texts, and fixture projects
-run with `blorp.toml` source packages and a native package. Known divergences are listed
-in the script with a reason: `KNOWN_DIVERGENCES` (today the two interpolation cases the
-existing lexer reads wrongly), `KNOWN_POSITION_DIVERGENCES` (parse diagnostics reported
-at a different position) and `WORDING_DIFFERENCES` (diagnostic text the stage deliberately
+file and the first differing token. It also checks the stage's module graph
+(`discovery_module_order_dump.brp`) for the self-compile root and for a
+`blorp test` root: each must load at least the expected number of modules. The
+same roots run with the standard library read from the compiler's embedded
+texts, and fixture projects run with `blorp.toml` source packages and a native
+package, each of which must contribute a module with its origin. Known
+divergences are listed in the script with a reason: `KNOWN_DIVERGENCES` (today
+the two interpolation cases the existing lexer reads wrongly),
+`KNOWN_POSITION_DIVERGENCES` (parse diagnostics reported at a different
+position) and `WORDING_DIFFERENCES` (diagnostic text the stage deliberately
 words differently). An entry that stops disagreeing fails the gate until it is
 removed. The gate
 takes about 1-2 minutes (mostly the C compiler on the two dumpers), so it is not a
@@ -226,7 +213,6 @@ compiler-core-sanitize
 compiler-blorp-sanitize
 compiler-new
 compiler-new-parity
-front-end-existing
 std-check
 runtime
 leak + doctest + cli + lsp
@@ -275,7 +261,7 @@ cutting preview builds. It composes:
 
 - clean build at `-O2` (`BLORP_CLI_C_OPTIMIZATION=-O2`; use `--no-release-compiler` for `-O0`)
 - `make quality`
-- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity front-end-existing`
+- `scripts/test --serial --release-compiler compiler-blorp compiler-tools std-check runtime leak doctest cli-deep lsp compiler-new compiler-new-parity`
 - the direct generated-C audit in `blorp/test/compiler/pipeline/codegen_audit/`
 - preview CLI/runtime smoke
 - example checks and selected example runs

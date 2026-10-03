@@ -229,32 +229,18 @@ Use `bin/blorp <command> --help` for current flags and environment controls.
 portable substitute. `lint` typechecks the import graph but reports only for
 selected files and does not rewrite source. See [Lint](LINT.md) for rule IDs.
 
-### Running With The Discovery Stage Or The Existing Front End
+### The Front End
 
 Every command that builds the compiler's front-end graph (`check`, `compile`,
 `run`, `test`, `purify`, `lint`, `package check`) gets it from one function,
 `frontend_compilation_graph_for_root_paths` in `blorp/src/lib/source_graph.brp`.
-It runs the discovery stage and its legacy adapter by default. Set
-`BLORP_FRONT_END=existing` to run the existing lexer, parser and module loader
-instead; they stay reachable until they are removed after the next bootstrap
-rotation. `BLORP_FRONT_END=stage`, unset or blank is the default, and any other
-value is an error that names the accepted ones. The variable is read once per
-setup (each command makes one), so every gate takes it without editing a script:
-
-```bash
-BLORP_FRONT_END=existing bin/blorp check --no-format program.brp
-BLORP_FRONT_END=existing scripts/test --no-build cli
-BLORP_FRONT_END=existing bin/blorp compile --no-format -o /tmp/existing.c blorp/src/main.brp
-```
-
-`scripts/test front-end-existing` runs a fast slice of this on every premerge run (the
-CLI smoke checks, the package lifecycle, the parser fixtures, the seam suites and
-the self-compile C identity), so the old path cannot break silently before it is
-removed. A syntax change lands in both parsers until then.
-
-The graph is the same, and so is the generated C. Differences a user can see
-are in `docs/DISCOVERY_TABLES_DESIGN.md` ("Running the stage from the CLI").
-The formatter, the linter's own parse and the LSP do not use the stage.
+It runs the discovery stage (`blorp/src/compiler_new/stage_01_discovery`) and
+its legacy adapter (`blorp/src/compiler/discovery_adapter.brp`, composed by
+`discovery_front_end.brp`), which rebuilds the graph the typecheck reads. Details
+and the user-visible diagnostics are in `docs/DISCOVERY_TABLES_DESIGN.md`
+("Running the stage from the CLI"). The formatter, the linter's own parse, the
+LSP, `compile --ast` and the `blorp test` discovery still use the old lexer and
+parser (`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`).
 
 ## Test Placement
 

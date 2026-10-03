@@ -11,8 +11,8 @@ are in `benchmarks/results/discovery_adapter_declarations_2026-10-01.md`,
 `discovery_adapter_bodies_2026-10-01.md` and
 `discovery_stage_switched_on_2026-10-01.md`. This document holds only what is
 still open: removing the old front end, hardening the comparison, and the
-adapter's shrinkage. The old path remains reachable as
-`BLORP_FRONT_END=existing` until it is removed.
+adapter's shrinkage. There is no front-end switch: the seam in
+`lib/source_graph.brp` always runs the stage and the adapter.
 
 ## Open acceptance gaps
 
@@ -74,35 +74,40 @@ These hold until the old path is removed.
 
 - **A syntax change lands in both parsers**, with the parity gate and pinned
   fixtures proving they agree (`scripts/README.md` describes the
-  `front-end-existing` and `compiler-new-parity` gates that show either path
-  breaking). Non-urgent syntax and diagnostic changes may wait so they are made
+  `compiler-new-parity` gate that shows the two breaking). Non-urgent syntax and diagnostic changes may wait so they are made
   once.
 - **Rules decidable from syntax go into the parsers**, not typecheck.
 - **Fixtures are run or deleted.** No fixture exists that no gate runs.
 
 ## Removing the old front end
 
-After the next bootstrap rotation has run on the default, in this order:
+Done: the switch (`BLORP_FRONT_END`, `FrontEnd`, `FrontEndSelection`), the
+`ExistingDiscovery` arm of the seam and the functions only it reached, and the
+`front-end-existing` gate with its `scripts/test` and `scripts/premerge-gate`
+entries and the `existing` comparisons in `test_cli.sh` and `test_package.sh`.
 
-1. Delete the switch: `BLORP_FRONT_END`, `FrontEnd`, `FrontEndSelection` and
-   `front_end_selection*` in `lib/source_graph.brp` and `lib/cli_plan.brp`; the
-   seam always builds the graph from the stage and the adapter.
-2. Remove the existing discovery (lexer, parser and module loader) from the
-   compile path, and the `ExistingDiscovery` arm of the seam.
-3. Delete the `front-end-existing` gate: `scripts/front-end-existing-check`, its
-   entries in `scripts/test` and `scripts/premerge-gate`, and the `existing`
-   comparisons in `test_cli.sh` and `test_package.sh`.
-4. Delete the old parser itself only once the formatter, test discovery,
-   doctest generation and the LSP no longer use it (see "Open decision"); the
-   corpus parity gate and the two-parser rule end with it. `GRAMMAR.md` and the
-   GUIDE already record the grammar the stage implements, including its
-   deliberate differences (for example `# N` with a space is rejected).
+The old lexer, parser and module loader (`stage_02_lex`, `stage_03_parse`,
+`stage_04_modules`) remain only for these users:
+
+- `compile --ast` (`compiler/command.brp`);
+- `blorp test` discovery, doctest extraction and the test plan
+  (`test/discovery.brp`, `test/doctest.brp`, `test/plan.brp`), and the
+  generated harness root in `lib/source_graph.brp`;
+- the formatter (`blorp/src/format`), which keeps its own parser because it
+  needs the comments the stage drops;
+- the LSP, which calls the old discovery directly (`lsp/analysis/diagnostic.brp`,
+  `lsp/analysis/frontend_graph.brp` through `frontend_graph_discover`);
+- the finalizer (`source_ast_finalize.brp`) and the typecheck bridge fallback
+  (`stage_06_typecheck/bridge.brp`).
+
+They are deleted once none of these use them; the corpus parity gate and the
+two-parser rule end with them. `GRAMMAR.md` and the GUIDE already record the
+grammar the stage implements, including its deliberate differences (for example
+`# N` with a space is rejected).
 
 ## Open decision
 
-- **The other users of the old front end.** The formatter needs comments,
-  which the stage drops by design, so it keeps its own parser or the stage
-  gains an optional trivia table. The linter and the LSP move to the stage (the
-  LSP with an in-memory provider for unsaved buffers, and off its direct calls
-  to the old discovery). Test discovery and doctest generation also still use
-  the old parser (`test/discovery.brp`, `test/doctest.brp`).
+- **The other users of the old front end.** The linter and the LSP move to the
+  stage (the LSP with an in-memory provider for unsaved buffers, and off its
+  direct calls to the old discovery). Test discovery and doctest generation
+  move off the old parser too (`test/discovery.brp`, `test/doctest.brp`).

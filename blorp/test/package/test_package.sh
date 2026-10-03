@@ -423,28 +423,6 @@ expect_output_contains "package check success" 0 "Package sample: ok" \
     "$BLORP_BIN" package check "$package_ok"
 expect_output_contains "package check rejects external import" 1 "may import only std modules" \
     "$BLORP_BIN" package check "$package_bad"
-# The same checks with each front end named (BLORP_FRONT_END). The stage is the
-# default; it loads the package's own modules as source-package modules. The
-# existing front end stays reachable until it is removed.
-expect_output_contains "package check success with the existing front end" 0 "Package sample: ok" \
-    env BLORP_FRONT_END=existing "$BLORP_BIN" package check "$package_ok"
-expect_output_contains "package check rejects external import with the existing front end" 1 \
-    "may import only std modules" \
-    env BLORP_FRONT_END=existing "$BLORP_BIN" package check "$package_bad"
-expect_output_contains "package check rejects builtin function body with the existing front end" 1 \
-    "builtin expressions cannot be used in source packages" \
-    env BLORP_FRONT_END=existing "$BLORP_BIN" package check "$package_builtin_body"
-expect_output_contains "package check success with the discovery stage" 0 "Package sample: ok" \
-    env BLORP_FRONT_END=stage "$BLORP_BIN" package check "$package_ok"
-expect_output_contains "package check rejects external import with the discovery stage" 1 \
-    "may import only std modules" \
-    env BLORP_FRONT_END=stage "$BLORP_BIN" package check "$package_bad"
-expect_output_contains "package check rejects builtin function body with the discovery stage" 1 \
-    "builtin expressions cannot be used in source packages" \
-    env BLORP_FRONT_END=stage "$BLORP_BIN" package check "$package_builtin_body"
-expect_output_contains "package check rejects an unknown front end" 1 \
-    "BLORP_FRONT_END is \`bogus\`, which names no front end." \
-    env BLORP_FRONT_END=bogus "$BLORP_BIN" package check "$package_ok"
 expect_output_contains "package check rejects builtin function body" 1 "builtin expressions cannot be used in source packages" \
     "$BLORP_BIN" package check "$package_builtin_body"
 expect_output_contains "package check rejects nested builtin expression" 1 "builtin expressions cannot be used in source packages" \

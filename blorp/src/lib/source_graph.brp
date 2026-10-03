@@ -5,8 +5,6 @@ import:
 		FrontendCompilationGraph,
 		FrontendGraphContext,
 		FrontendSourcePackage,
-	../compiler/pipeline: frontend_graph_discover
-	../compiler/stage_01_generated_inputs/embedded_std: embedded_std_source
 	../compiler/stage_02_lex/name_table: NameTable
 	../compiler/stage_03_parse/language_parser: parse_compiler_source
 	../compiler/stage_03_parse/parsed_ast: ParsedProgram
@@ -15,7 +13,6 @@ import:
 		finalized_typecheck_program_ast,
 		finalized_typecheck_program_with_single_file_names,
 	../compiler/stage_04_modules/frontend_graph:
-		FrontendGraph,
 		FrontendImportEdge,
 		FrontendImportResolution(FrontendResolvedImport, FrontendUnresolvedImport),
 		FrontendModule,
@@ -25,24 +22,8 @@ import:
 		frontend_graph_root_modules,
 	../compiler/stage_04_modules/frontend_graph_service:
 		COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS,
-		FrontendDiscoveryError(FrontendDiscoveryImportCaseMismatch),
-		FrontendSourceCandidate,
-		FrontendSourceInput(FinalizedFrontendSource, RawFrontendSource),
-		FrontendSourceLocation,
-		FrontendSourceResolution(
-			FrontendSourceCaseMismatch, FrontendSourceResolved, FrontendSourceUnresolved,
-		),
-		frontend_discovery_error_message,
 		frontend_graph_service_error_message,
-		frontend_source_candidate_source,
 		validated_frontend_graph_for_modules,
-	../compiler/stage_04_modules/frontend_import_plan:
-		FrontendImportLookup(
-			FrontendLocalPathLookup, FrontendNativePackageLookup, FrontendRelativePathLookup,
-			FrontendSourcePackageAliasLookup, FrontendSourcePackageInternalLookup,
-			FrontendStandardLibraryLookup,
-		),
-		frontend_import_lookup_plan,
 	../compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
 		ResolvedModuleIdentity,
@@ -63,11 +44,6 @@ import:
 		ProjectSourcePackage,
 		ProjectStdProvider(ProjectEmbeddedStd, ProjectFilesystemStd),
 		project_source_catalog,
-	../compiler/stage_04_modules/source_package_layout:
-		SourcePackageLayout,
-		source_package_contains_internal_module,
-		source_package_export_for_alias,
-		source_package_path_for_module,
 	../compiler/stage_06_typecheck/graph/source_name_table: name_table_with_declared_names
 	cli_args: CliAction(CliCheck, CliCompile, CliRun, CliTest)
 	cli_plan:
@@ -78,9 +54,7 @@ import:
 		CliRootSource(CliParsedRoot, CliUnparsedRoot),
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
-		FrontEnd(DiscoveryStage, ExistingDiscovery),
-		FrontEndSelection(SelectedFrontEnd, UnknownFrontEnd),
-		FrontendRuntimeModules(CompilerOnly, WithTestRuntime),
+		FrontendRuntimeModules,
 	diagnostic: cli_error_message
 	frontend_graph_identity: FrontendGraphSourceKey
 	fs:
@@ -89,11 +63,10 @@ import:
 		open_read,
 		path_spelling_below,
 		read_text,
-		stored_spelling_below,
 		walk_files,
 	path: basename, dirname, join, normalize, stem
 	path_identity: canonical_existing_path
-	source: SourceFile, source_file
+	source: source_file
 	system: file_exists, getcwd, getenv, is_directory, temp_dir
 
 
@@ -290,72 +263,6 @@ pure func parsed_cli_source_from_program(program: ParsedProgram) -> CliParsedSou
 	}
 
 
---- Where an import resolved to, with no text read. `load_source_for_location`
---- loads the text later, deciding embedded-vs-filesystem the same way this
---- was resolved: by origin and `FrontendGraphContext.std_dir`, not by
---- anything carried here. `finding` is how the file's spelling compared with
---- the import (`ExactImportFile` for an embedded source).
-record CliResolvedImportSource {
-	path: String,
-	finding: ImportFileFinding,
-	module_name: String,
-	origin: ModuleOrigin
-}
-
-
---- How a filesystem import candidate is matched. Imports are case-sensitive on
---- every platform, so a lookup first accepts only a file spelled exactly as
---- stored. Only when every lookup has failed does a second pass accept a file
---- stored under different letter case, to name it in a diagnostic instead of
---- calling the import unresolved.
-private enum ImportSpellingSearch:
-	SearchExactSpelling
-	SearchDifferentCase
-
-
---- What a lookup found at a path.
---- - `ExactImportFile`: the file exists and no component below the resolving
----   directory is known to be stored in different letter case.
---- - `MisspelledImportFile(names)`: the file is stored under different letter
----   case; `names` are the components below the resolving directory as stored.
---- - `UnverifiableImportFile(directory)`: the file exists but `directory`, on
----   the way to it, could not be listed, so its spelling is unknown.
-private union ImportFileFinding:
-	ExactImportFile
-	MisspelledImportFile(List[String])
-	UnverifiableImportFile(String)
-
-
---- What `search` finds at `path`, or `None` for nothing. `trusted_directory` is
---- the directory the import text is resolved against (the importer's
---- directory, the standard-library or package root), so only the components
---- the import text names are compared. The exact search stats the path first,
---- so a miss never lists a directory.
-private func import_path_found(
-	search: ImportSpellingSearch,
-	trusted_directory: String,
-	path: String,
-) -> Option[ImportFileFinding]:
-	match search:
-		SearchExactSpelling:
-			if not file_exists(path):
-				None
-			else:
-				match path_spelling_below(trusted_directory, path):
-					ExactSpelling:
-						Some(ExactImportFile)
-					StoredSpelling(_, _):
-						None
-					SpellingUnverifiable(directory):
-						Some(UnverifiableImportFile(directory))
-		SearchDifferentCase:
-			match stored_spelling_below(trusted_directory, path):
-				Some(names):
-					Some(MisspelledImportFile(names))
-				None:
-					None
-
-
 private pure func action_std_dir(action: CliAction) -> Option[String]:
 	match action:
 		CliCheck(args):
@@ -492,83 +399,8 @@ func canonical_cli_source_for_graph(source: CliSourceFile) -> CliSourceFile:
 	}
 
 
-private pure func module_source_filename(module_path: String) -> String:
-	if module_path.ends_with(".brp"):
-		module_path
-	else:
-		module_path + ".brp"
-
-
----
-The environment variable that selects the front end, and the spellings it
-accepts. Unset or blank selects `DEFAULT_FRONT_END`; any other value is
-rejected, never defaulted.
----
-FRONT_END_ENVIRONMENT_VARIABLE: String = "BLORP_FRONT_END"
-
-EXISTING_DISCOVERY_SPELLING: String = "existing"
-
-DISCOVERY_STAGE_SPELLING: String = "stage"
-
-
----
-The front end used when the variable is unset or blank: the discovery stage.
-`ExistingDiscovery` stays reachable as `existing` until the old path is removed.
----
-DEFAULT_FRONT_END: FrontEnd = DiscoveryStage
-
-
----
-The spelling that selects a front end.
----
-pure func front_end_spelling(front_end: FrontEnd) -> String:
-	match front_end:
-		ExistingDiscovery:
-			EXISTING_DISCOVERY_SPELLING
-		DiscoveryStage:
-			DISCOVERY_STAGE_SPELLING
-
-
----
-The front end a setting of `FRONT_END_ENVIRONMENT_VARIABLE` selects.
----
-pure func front_end_selection(setting: Option[String]) -> FrontEndSelection:
-	match setting:
-		None:
-			SelectedFrontEnd(DEFAULT_FRONT_END)
-		Some(spelling):
-			trimmed: String = spelling.trim()
-
-			if trimmed == "":
-				SelectedFrontEnd(DEFAULT_FRONT_END)
-			else if trimmed == EXISTING_DISCOVERY_SPELLING:
-				SelectedFrontEnd(ExistingDiscovery)
-			else if trimmed == DISCOVERY_STAGE_SPELLING:
-				SelectedFrontEnd(DiscoveryStage)
-			else:
-				UnknownFrontEnd(trimmed)
-
-
----
-The front end the environment asks for. Each command reads it once, when it
-makes its setup.
----
-func front_end_selection_from_environment() -> FrontEndSelection:
-	front_end_selection(getenv(FRONT_END_ENVIRONMENT_VARIABLE))
-
-
----
-The error for a front end spelling that names none.
----
-pure func unknown_front_end_message(spelling: String) -> String:
-	cli_error_message(
-		"${FRONT_END_ENVIRONMENT_VARIABLE} is `${spelling}`, which names no front end.\nhelp: use `${EXISTING_DISCOVERY_SPELLING}` or `${DISCOVERY_STAGE_SPELLING}`, or unset it for the default (`${front_end_spelling(DEFAULT_FRONT_END)}`).",
-	)
-
-
 record CliSourceGraphSetup {
 	context: FrontendGraphContext,
-	front_end: FrontEndSelection,
 	diagnostics: List[String]
 }
 
@@ -630,7 +462,7 @@ func source_graph_setup_for_paths(
 		ProjectEmbeddedStd:
 			None
 		-- Absolute and normalized once, here, so a root given by a relative or an
-		-- absolute path inside the directory has one identity in every front end.
+		-- absolute path inside the directory has one identity.
 		ProjectFilesystemStd(path):
 			Some(absolute_path(path))
 
@@ -640,7 +472,6 @@ func source_graph_setup_for_paths(
 			source_packages = catalog.source_packages.map(cli_source_package),
 			package_roots = catalog.native_package_roots
 		},
-		front_end = front_end_selection_from_environment(),
 		diagnostics = catalog.issues.map(project_source_catalog_issue_diagnostic)
 	}
 
@@ -808,264 +639,6 @@ private func compiler_module_origin_for_path(
 				UserModule
 
 
-private pure func filesystem_import_source(
-	path: String,
-	finding: ImportFileFinding,
-	module_name: String,
-	origin: ModuleOrigin,
-) -> CliResolvedImportSource:
-	{
-		path = normalize(path),
-		finding = finding,
-		module_name = module_name,
-		origin = origin
-	}
-
-
---- The source `import_path_found` finds at `path`, if any.
-private func import_source_if_found(
-	search: ImportSpellingSearch,
-	trusted_directory: String,
-	path: String,
-	module_name: String,
-	origin: ModuleOrigin,
-) -> Option[CliResolvedImportSource]:
-	import_path_found(
-		search,
-		trusted_directory,
-		path,
-	).map(
-		func(finding): filesystem_import_source(path, finding, module_name, origin),
-	)
-
-
---- Reports whether the embedded standard library carries `module_name`,
---- without holding onto its text: a location that is later discovered for
---- the first time re-fetches it from `embedded_std_source`, an in-memory
---- lookup with no I/O cost either way.
-private pure func embedded_std_import_source(
-	module_name: String,
-) -> Option[CliResolvedImportSource]:
-	if embedded_std_source(module_name).is_some():
-		Some({
-			path = "<embedded:${module_name}>",
-			finding = ExactImportFile,
-			module_name = module_name,
-			origin = StdlibModule,
-		})
-	else:
-		None
-
-
-private pure func source_package_layout(package: FrontendSourcePackage) -> SourcePackageLayout:
-	{
-		package_alias = package.package_alias,
-		package_name = package.package_name,
-		source_dir = package.source_dir,
-		exports = package.exports
-	}
-
-
-private func resolve_source_package_alias_import(
-	context: FrontendGraphContext,
-	search: ImportSpellingSearch,
-	module_path: String,
-) -> Option[CliResolvedImportSource]:
-	var result: Option[CliResolvedImportSource] = None
-
-	for package in context.source_packages:
-		if result.is_some():
-			break
-
-		layout = source_package_layout(package)
-
-		match source_package_export_for_alias(layout, module_path):
-			Some(package_module):
-				path = source_package_path_for_module(layout.source_dir, package_module)
-
-				result = import_source_if_found(
-					search,
-					package.source_dir,
-					path,
-					module_path,
-					SourcePackageModule(package.package_alias),
-				)
-			None:
-				void
-
-	result
-
-
-private func resolve_source_package_internal_import(
-	package: FrontendSourcePackage,
-	search: ImportSpellingSearch,
-	module_path: String,
-) -> Option[CliResolvedImportSource]:
-	layout = source_package_layout(package)
-
-	if source_package_contains_internal_module(layout.package_name, module_path):
-		path = source_package_path_for_module(layout.source_dir, module_path)
-
-		import_source_if_found(
-			search,
-			package.source_dir,
-			path,
-			module_path,
-			SourcePackageModule(package.package_alias),
-		)
-	else:
-		None
-
-
-private func resolve_native_package_import(
-	context: FrontendGraphContext,
-	search: ImportSpellingSearch,
-	module_path: String,
-) -> Option[CliResolvedImportSource]:
-	-- Request syntax: the import request `pkg/<id>/...` names a native package.
-	rest: String = strip_prefix("pkg/", module_path)
-	var result: Option[CliResolvedImportSource] = None
-
-	for package_root in context.package_roots:
-		if result.is_some():
-			break
-
-		candidate: String = join(package_root, module_source_filename(rest))
-
-		package_id: String = split_module_ref(rest)
-			.map(func(parts): parts[0])
-			.get_or("pkg")
-		result = import_source_if_found(
-			search,
-			package_root,
-			candidate,
-			module_path,
-			NativePackageModule(package_id),
-		)
-
-	result
-
-
-private func resolve_standard_library_import(
-	context: FrontendGraphContext,
-	search: ImportSpellingSearch,
-	module_path: String,
-) -> Option[CliResolvedImportSource]:
-	match context.std_dir:
-		Some(dir):
-			path: String = join(dir, module_source_filename(module_path))
-
-			import_source_if_found(search, dir, path, module_path, StdlibModule)
-		None:
-			embedded_std_import_source(module_path)
-
-
-private pure func source_package_with_alias(
-	context: FrontendGraphContext,
-	package_alias: String,
-) -> Option[FrontendSourcePackage]:
-	context.source_packages.find(func(package): package.package_alias == package_alias)
-
-
-private func resolve_path_import(
-	path: String,
-	importer_directory: String,
-	search: ImportSpellingSearch,
-	confinement_origin: Option[ModuleOrigin],
-	context: FrontendGraphContext,
-) -> Option[CliResolvedImportSource]:
-	allowed: Bool = match confinement_origin:
-		Some(SourcePackageModule(package_alias)):
-			match source_package_with_alias(context, package_alias):
-				Some(package):
-					is_path_under_dir(package.source_dir, path)
-				None:
-					False
-		_:
-			True
-
-	if allowed:
-		import_source_if_found(
-			search,
-			importer_directory,
-			path,
-			module_name_for_resolved_source_path(path),
-			confinement_origin.get_or(UserModule),
-		)
-	else:
-		None
-
-
-private func resolve_frontend_import_lookup(
-	context: FrontendGraphContext,
-	importer_directory: String,
-	search: ImportSpellingSearch,
-	lookup: FrontendImportLookup,
-) -> Option[CliResolvedImportSource]:
-	match lookup:
-		FrontendNativePackageLookup(module_path):
-			resolve_native_package_import(context, search, module_path)
-		FrontendStandardLibraryLookup(module_path):
-			resolve_standard_library_import(context, search, module_path)
-		FrontendRelativePathLookup(path, confinement_origin):
-			resolve_path_import(path, importer_directory, search, Some(confinement_origin), context)
-		FrontendSourcePackageAliasLookup(module_path):
-			resolve_source_package_alias_import(context, search, module_path)
-		FrontendSourcePackageInternalLookup(package_alias, module_path):
-			match source_package_with_alias(context, package_alias):
-				Some(package):
-					resolve_source_package_internal_import(package, search, module_path)
-				None:
-					None
-		FrontendLocalPathLookup(path):
-			resolve_path_import(path, importer_directory, search, None, context)
-
-
---- Reads the file a resolved location names. Every filesystem lookup already
---- passed an exact-case existence check on this path while it was resolved
---- (`resolve_path_import`, `resolve_source_package_alias_import`,
---- `resolve_source_package_internal_import`, `resolve_native_package_import`,
---- and the `std_dir`-set branch of `resolve_standard_library_import` each
---- gate their `filesystem_import_source` call on one); a file that vanishes
---- between that check and this read surfaces as a hard error rather than a
---- silent `Unresolved`, since discovery does not defend against the
---- filesystem changing under one compiler run.
-private func read_source_file(location: FrontendSourceLocation) -> Result[SourceFile, String]:
-	text ?= read_text_file(
-		location.path,
-	).map_err(
-		func(err): "failed to read source file `" + location.path + "`: " + err,
-	)
-
-	Ok(source_file(location.path, location.module_name, text))
-
-
---- Loads a located import's text, one call per module identity the
---- discovery walk has not already seen. Recomputes embedded-vs-filesystem
---- from the location's origin and `context.std_dir` instead of carrying that
---- decision from resolve time, so resolving an import never does more than
---- decide where it lives.
-private func load_source_for_location(
-	context: FrontendGraphContext,
-	location: FrontendSourceLocation,
-) -> Result[SourceFile, String]:
-	match resolved_module_origin(location.identity):
-		StdlibModule:
-			match context.std_dir:
-				Some(_):
-					read_source_file(location)
-				None:
-					match embedded_std_source(location.module_name):
-						Some(text):
-							Ok(source_file(location.path, location.module_name, text))
-						None:
-							Err(
-								"embedded standard library is missing `" + location.module_name + "`",
-							)
-		_:
-			read_source_file(location)
-
-
 private pure func generated_import_binding(
 	bindings: List[CliGeneratedModuleImport],
 	module_path: String,
@@ -1109,274 +682,12 @@ private pure func ambiguous_generated_import_module(
 	ambiguous
 
 
-private func implicit_std_module_source(
-	context: FrontendGraphContext,
-	roots: List[CliParsedSourceFile],
-	module_name: String,
-) -> Result[List[CliSourceFile], String]:
-	if roots.any(func(root): root.module_name == module_name):
-		Ok([])
-	else:
-		match context.std_dir:
-			Some(std_dir):
-				path: String = normalize(join(std_dir, module_source_filename(module_name)))
-
-				if roots.any(func(root): normalize(root.path) == path) or not file_exists(path):
-					Ok([])
-				else:
-					source ?= read_text_file(
-						path,
-					).map_err(
-						func(err): "failed to read implicit compiler module `${path}`: ${err}",
-					)
-
-					Ok(
-						[
-							{
-								path = path,
-								module_name = module_name,
-								source_text = source
-							},
-						],
-					)
-			None:
-				match embedded_std_source(module_name):
-					Some(source):
-						Ok(
-							[
-								{
-									path = "<embedded:${module_name}>",
-									module_name = module_name,
-									source_text = source
-								},
-							],
-						)
-					None:
-						Err("embedded standard library is missing `${module_name}`")
-
-
-private func implicit_compiler_sources_from(
-	context: FrontendGraphContext,
-	roots: List[CliParsedSourceFile],
-	module_paths: List[String],
-	index: Int,
-) -> Result[List[CliSourceFile], String]:
-	if index >= module_paths.length():
-		Ok([])
-	else:
-		module_path = module_paths.get_or(index, "")
-		current ?= implicit_std_module_source(context, roots, module_path)
-		rest ?= implicit_compiler_sources_from(context, roots, module_paths, index + 1)
-		Ok(current.concat(rest))
-
-
-private func implicit_compiler_sources(
-	context: FrontendGraphContext,
-	roots: List[CliParsedSourceFile],
-) -> Result[List[CliSourceFile], String]:
-	module_paths = COMPILER_FRONTEND_IMPLICIT_MODULE_PATHS
-
-	implicit_compiler_sources_from(context, roots, module_paths, 0)
-
-
-private func implicit_test_runtime_sources(
-	context: FrontendGraphContext,
-	roots: List[CliParsedSourceFile],
-	enabled: Bool,
-) -> Result[List[CliSourceFile], String]:
-	if enabled:
-		implicit_std_module_source(context, roots, TEST_RUNTIME_MODULE)
-	else:
-		Ok([])
-
-
-private func implicit_compiler_sources_if_enabled(
-	context: FrontendGraphContext,
-	roots: List[CliParsedSourceFile],
-	enabled: Bool,
-) -> Result[List[CliSourceFile], String]:
-	if enabled:
-		implicit_compiler_sources(context, roots)
-	else:
-		Ok([])
-
-
-private func source_candidate(
-	context: FrontendGraphContext,
-	source: CliSourceFile,
-) -> FrontendSourceCandidate:
-	origin = compiler_module_origin_for_path(context, source.path, source.module_name)
-	source_candidate_with_origin(source, origin)
-
-
-private pure func source_candidate_with_origin(
-	source: CliSourceFile,
-	origin: ModuleOrigin,
-) -> FrontendSourceCandidate:
-	{
-		identity = resolved_module_identity_from_resolver(source.module_name, origin),
-		input = RawFrontendSource(source_file(source.path, source.module_name, source.source_text))
-	}
-
-
-private func parsed_source_candidate(
-	context: FrontendGraphContext,
-	source: CliParsedSourceFile,
-) -> FrontendSourceCandidate:
-	program_source = finalized_typecheck_program_ast(source.typecheck_program).source
-	origin = compiler_module_origin_for_path(
-		context,
-		program_source.path,
-		program_source.module_name,
-	)
-	{
-		identity = resolved_module_identity_from_resolver(program_source.module_name, origin),
-		input = FinalizedFrontendSource(source.typecheck_program, source.typecheck_names)
-	}
-
-
---- Locates an import with no I/O: it stops at path, module name and origin.
---- `load_source_for_location` fetches the text later, and only for a
---- location whose identity the discovery walk has not already discovered.
-private func resolve_frontend_source_candidate(
-	context: FrontendGraphContext,
-	importer: FrontendSourceCandidate,
-	requested_path: String,
-) -> Result[FrontendSourceResolution, String]:
-	importer_directory: String = dirname(frontend_source_candidate_source(importer).path)
-	lookups: List[FrontendImportLookup] = frontend_import_lookup_plan(importer, requested_path)
-
-	match first_import_source(context, importer_directory, SearchExactSpelling, lookups):
-		Some(source):
-			match source.finding:
-				UnverifiableImportFile(directory):
-					Err(
-						"cannot verify the spelling of the file this import names: directory `" + directory + "` could not be listed",
-					)
-				_:
-					Ok(FrontendSourceResolved({
-						identity = resolved_module_identity_from_resolver(
-							source.module_name,
-							source.origin,
-						),
-						path = source.path,
-						module_name = source.module_name,
-					}))
-		None:
-			-- Only now, with every lookup failed, search for a file stored under
-			-- different letter case, so an import that resolves never pays for it.
-			match first_import_source(context, importer_directory, SearchDifferentCase, lookups):
-				Some(source):
-					match source.finding:
-						MisspelledImportFile(stored_names):
-							Ok(FrontendSourceCaseMismatch(stored_names))
-						_:
-							Ok(FrontendSourceUnresolved)
-				None:
-					Ok(FrontendSourceUnresolved)
-
-
---- The first lookup in `lookups` that finds a source for `search`.
-private func first_import_source(
-	context: FrontendGraphContext,
-	importer_directory: String,
-	search: ImportSpellingSearch,
-	lookups: List[FrontendImportLookup],
-) -> Option[CliResolvedImportSource]:
-	var resolved: Option[CliResolvedImportSource] = None
-
-	for lookup in lookups:
-		if resolved.is_none():
-			resolved = resolve_frontend_import_lookup(context, importer_directory, search, lookup)
-
-	resolved
-
-
---- A discovery error as the CLI prints it: a case mismatch is a located-free
---- diagnostic of its own, so it carries the `error:` severity prefix like other
---- diagnostics; provider failures keep their `failed to resolve` wording.
-private pure func discovery_error_cli_message(error: FrontendDiscoveryError) -> String:
-	match error:
-		FrontendDiscoveryImportCaseMismatch(_, _, _):
-			cli_error_message(frontend_discovery_error_message(error))
-		_:
-			frontend_discovery_error_message(error)
-
-
-private func compiler_frontend_graph_for_roots(
-	context: FrontendGraphContext,
-	roots: List[CliParsedSourceFile],
-	include_implicit_compiler_sources: Bool,
-	include_test_runtime: Bool,
-) -> Result[FrontendGraph, String]:
-	sources ?= implicit_compiler_sources_if_enabled(
-		context,
-		roots,
-		include_implicit_compiler_sources,
-	)
-	test_runtime_sources ?= implicit_test_runtime_sources(context, roots, include_test_runtime)
-	implicit_sources: List[CliSourceFile] = sources.concat(test_runtime_sources)
-	root_candidates = roots.map(func(root): parsed_source_candidate(context, root))
-	seed_candidates = implicit_sources.map(func(source):
-		source_candidate_with_origin(source, StdlibModule)
-	)
-	frontend_graph_discover(
-		root_candidates,
-		seed_candidates,
-		func(
-			importer,
-			requested_path,
-		): resolve_frontend_source_candidate(context, importer, requested_path),
-		func(location): load_source_for_location(context, location),
-	).map_err(discovery_error_cli_message)
-
-
----
-`root` as a parsed source: parsed now, or as test discovery parsed it.
----
-private pure func parsed_root(root: CliRootSource) -> CliParsedSourceFile:
-	match root:
-		CliUnparsedRoot(source):
-			parse_cli_source(source)
-		CliParsedRoot(parsed):
-			parsed
-
-
----
-The existing discovery's graph for `roots`, which it parses first.
----
-private func existing_discovery_graph(
-	setup: CliSourceGraphSetup,
-	roots: List[CliRootSource],
-	runtime: FrontendRuntimeModules,
-) -> Result[FrontendCompilationGraph, String]:
-	include_test_runtime: Bool = match runtime:
-		CompilerOnly:
-			False
-		WithTestRuntime:
-			True
-
-	graph ?= compiler_frontend_graph_for_roots(
-		setup.context,
-		roots.map(parsed_root),
-		True,
-		include_test_runtime,
-	)
-
-	Ok({
-		context = setup.context,
-		graph = graph,
-		diagnostics = setup.diagnostics,
-	})
-
-
 ---
 The compiler's front end for `roots`: every CLI command that compiles,
-checks, tests, purifies or package-checks sources gets its graph here, so the
-choice between the existing discovery and the discovery stage is made in one
-place. A root is a source the command has already read, with the name the
-command chose for it; the front end parses it, except a test root that test
-discovery already parsed (`CliParsedRoot`), which the existing path reuses.
+checks, tests, purifies or package-checks sources gets its graph here, from
+the discovery stage. A root is a source the command has already read, with
+the name the command chose for it; the stage parses it again, including a
+test root that test discovery already parsed (`CliParsedRoot`).
 ---
 func frontend_compilation_graph_for_root_paths(
 	setup: CliSourceGraphSetup,
@@ -1387,31 +698,21 @@ func frontend_compilation_graph_for_root_paths(
 		root_with_configured_std_name(setup.context, root)
 	)
 
-	match setup.front_end:
-		UnknownFrontEnd(spelling):
-			Err(unknown_front_end_message(spelling))
-		SelectedFrontEnd(ExistingDiscovery):
-			existing_discovery_graph(setup, named_roots, runtime)
-		SelectedFrontEnd(DiscoveryStage):
-			stage_roots: List[StageRoot] = named_roots.map(func(root):
-				source: CliSourceFile = root_source_file(root)
-				{
-					source = source,
-					origin = compiler_module_origin_for_path(
-						setup.context,
-						source.path,
-						source.module_name,
-					)
-				}
-			)
-			cwd: String = getcwd()
-			graph ?= stage_frontend_graph(
-				setup.context,
-				stage_roots,
-				runtime,
-				pure func(path): module_name_for_resolved_source_path_from(cwd, path),
-			)
-			Ok({ graph | diagnostics = setup.diagnostics })
+	stage_roots: List[StageRoot] = named_roots.map(func(root):
+		source: CliSourceFile = root_source_file(root)
+		{
+			source = source,
+			origin = compiler_module_origin_for_path(setup.context, source.path, source.module_name)
+		}
+	)
+	cwd: String = getcwd()
+	graph ?= stage_frontend_graph(
+		setup.context,
+		stage_roots,
+		runtime,
+		pure func(path): module_name_for_resolved_source_path_from(cwd, path),
+	)
+	Ok({ graph | diagnostics = setup.diagnostics })
 
 
 private pure func frontend_graph_keys_contain(

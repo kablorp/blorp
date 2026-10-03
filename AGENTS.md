@@ -14,7 +14,7 @@ setup/measure/land loop before reading a roadmap.
 
 | Task | Start with | First feedback |
 | --- | --- | --- |
-| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (default parser; also `blorp/src/compiler/stage_03_parse/` while it exists, since a syntax change lands in both), matching compiler fixture, [`GRAMMAR`](docs/GRAMMAR.md) | Exact fixture and expected message; `scripts/compiler-check --changed` |
+| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (lexer in `lex/`, message text in `diagnostics/render.brp`; also `blorp/src/compiler/stage_03_parse/` while it exists, since a syntax change lands in both), matching fixture under `blorp/test/compiler_new/stage_01_discovery/parse/fixtures/`, [`GRAMMAR`](docs/GRAMMAR.md) | `parse/test_parser_fixtures.brp`; then `scripts/test compiler-new` (`compiler-check --changed` selects nothing under `compiler_new`) |
 | Inference or typecheck | `blorp/src/compiler/stage_06_typecheck/`, matching compiler fixture | Exact suite; then `scripts/compiler-check --stage typecheck` |
 | Core/ownership | [`pipeline.brp`](blorp/src/compiler/stage_09_core/pipeline.brp), [`ARCHITECTURE`](docs/ARCHITECTURE.md), owning Core suite | Before/after Core, focused suite, relevant sanitizer |
 | Backend/runtime | `blorp/src/compiler/stage_10_backend/`, `blorp/src/lib/runtime/native/`, codegen audit | Focused emitter/runtime test and generated C |
@@ -32,11 +32,11 @@ proportionate to the change before review.
 For common requests, the first command and final gate are concrete:
 
 ```bash
-# Parser diagnostic: inspect the exact expected message, then owner checks.
-bin/blorp check --no-format \
-  blorp/test/compiler/stage_03_parse/fixtures/parser/should_fail/subscript_missing_close.brp
-scripts/compiler-check --changed
-scripts/test compiler-blorp
+# Parser diagnostic: run the discovery stage's parser fixtures, then its gates.
+bin/blorp test --timeout 180 \
+  blorp/test/compiler_new/stage_01_discovery/parse/test_parser_fixtures.brp
+scripts/test compiler-new
+scripts/test compiler-blorp compiler-new-parity
 
 # Core ownership: run the owning suite, then ownership-sensitive gates.
 bin/blorp test --timeout 180 \
@@ -53,8 +53,11 @@ bash blorp/test/build/test_release_toolchain.sh
 scripts/test package
 ```
 
-The parser's `should_fail` check is expected to exit nonzero; compare its
-diagnostic text with the fixture expectation, not its status alone. For Core
+A `should_fail` parser fixture pins its first diagnostic in an
+`-- EXPECT-DISCOVERY:` line; compare the text, not the exit status alone. The
+old parser (`blorp/src/compiler/stage_03_parse`) still serves `compile --ast`,
+test discovery and the LSP, and the formatter has its own copy, so a syntax
+change lands in both parsers and `compiler-new-parity` keeps them in agreement. For Core
 codegen changes also inspect generated C and run the codegen audit. For a
 preview/bootstrap release, use the full gate in
 [`docs/RELEASES.md`](docs/RELEASES.md#preview-validation).

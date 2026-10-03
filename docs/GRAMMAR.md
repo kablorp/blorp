@@ -1,9 +1,10 @@
 # Blorp Formal Grammar (EBNF)
 
 This is the formal grammar for the blorp programming language in Extended Backus-Naur Form (EBNF).
-It is the authoritative specification. The implementation lives in the Blorp
-frontend sources under `blorp/src/compiler/stage_02_lex/lexer.brp` and
-`blorp/src/compiler/stage_03_parse/language_parser.brp`.
+It is the authoritative specification. The implementation the compiler runs
+lives in the discovery stage, `blorp/src/compiler_new/stage_01_discovery/lex/`
+and `parse/`; the formatter and a few tools still use the older lexer and
+parser under `blorp/src/compiler/stage_02_lex` and `stage_03_parse`.
 
 The grammar defines the shape of source text. Name resolution, scoping, UFCS
 dispatch, trait coherence, orphan rules, and dimension-variable interpretation

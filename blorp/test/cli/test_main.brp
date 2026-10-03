@@ -31,31 +31,20 @@ import:
 		CliCheckTargetExpansion,
 		CliGeneratedModule,
 		CliGeneratedModuleImport,
+		CliHandledResult,
 		CliPackageRunCommand(
-			CliPackageRunCheck,
-			CliPackageRunFetchTarget,
-			CliPackageRunPack,
+			CliPackageRunCheck, CliPackageRunFetchTarget, CliPackageRunPack,
 			CliPackageRunVendorTarget,
 		),
-		CliHandledResult,
 		CliParsedSourceFile,
-		CliRunPlan(
-			CliRunCheck,
-			CliRunCompile,
-			CliRunHandled,
-			CliRunLsp,
-			CliRunLint,
-			CliRunPackage,
-			CliRunPurify,
-			CliRunSource,
-			CliRunTest,
-		),
 		CliRootSource(CliUnparsedRoot),
+		CliRunPlan(
+			CliRunCheck, CliRunCompile, CliRunHandled, CliRunLsp, CliRunLint, CliRunPackage,
+			CliRunPurify, CliRunSource, CliRunTest,
+		),
 		CliSourceFile,
 		CliSourceTarget(CliSourceDirectoryTarget, CliSourceFileTarget),
 		CliTestRunCommand(CliTestExecute, CliTestWarmup),
-		FrontEnd(DiscoveryStage),
-		FrontEndSelection(SelectedFrontEnd),
 		FrontendRuntimeModules(CompilerOnly),
 	../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileExact)
 	../../src/lib/source: source_file
@@ -63,7 +52,6 @@ import:
 		expand_check_targets,
 		frontend_compilation_graph_for_root_paths,
 		frontend_compilation_graph_with_generated_root,
-		front_end_selection_from_environment,
 		parse_cli_source,
 		source_graph_setup_for_paths,
 	../../src/main: run_cli
@@ -81,46 +69,8 @@ pure func graph_source_diagnostic_count(source: FrontendModule) -> Int:
 
 
 ---
-Whether the discovery stage is the front end these tests run under: the
-default, or `BLORP_FRONT_END=stage`; `BLORP_FRONT_END=existing` selects the
-other. Decided from the selection the CLI itself makes. The two front ends report a parse failure in
-different places: the existing parser leaves the diagnostics in the failing
-module of the graph, and the stage rejects the compilation before any graph
-exists, so the command prints them and is handled.
----
-func stage_front_end_selected() -> Bool:
-	match front_end_selection_from_environment():
-		SelectedFrontEnd(DiscoveryStage):
-			True
-		_:
-			False
-
-
----
-Whether root `index` of `graph` is the module at `path` named `module_name` and
-holds parse diagnostics: how the existing parser reports a parse failure.
----
-func graph_root_holds_parse_failure(
-	graph: FrontendCompilationGraph,
-	index: Int,
-	path: String,
-	module_name: String,
-) -> Bool:
-	match frontend_graph_root_modules(graph.graph).get(index):
-		Some(source):
-			(
-				graph_module_path(source) == path
-				and graph_module_name(source) == module_name
-				and graph_source_diagnostic_count(source) > 0
-			)
-		None:
-			False
-
-
----
-Whether a command the stage rejected failed and printed an error located in the
-file at `path`: how the discovery stage reports a parse failure, before any
-graph exists.
+Whether a command failed and printed an error located in the file at `path`:
+how the front end reports a parse failure, before any graph exists.
 ---
 func handled_result_prints_parse_failure(result: CliHandledResult, path: String) -> Bool:
 	(
@@ -415,7 +365,10 @@ private func graph_for_check_roots(
 	action: CliAction,
 	roots: List[CliSourceFile],
 ) -> Result[FrontendCompilationGraph, String]:
-	setup = source_graph_setup_for_paths(action, roots.map(func(root): root.path))
+	setup = source_graph_setup_for_paths(
+		action,
+		roots.map(func(root): root.path),
+	)
 	frontend_compilation_graph_for_root_paths(
 		setup,
 		roots.map(func(root): CliUnparsedRoot(root)),
@@ -482,15 +435,17 @@ private func graph_names_configured_std_root_case(std_dir: String) -> Bool:
 	if not (write_text_ok(std_path, "ANSWER: Int = 42") and write_implicit_std_modules(std_dir)):
 		False
 	else:
-		match graph_for_check_roots(
-			action,
-			[
-				{
-					path = std_path,
-					module_name = "stale_name",
-					source_text = "ANSWER: Int = 42"
-				},
-			],
+		match (
+			graph_for_check_roots(
+				action,
+				[
+					{
+						path = std_path,
+						module_name = "stale_name",
+						source_text = "ANSWER: Int = 42"
+					},
+				],
+			)
 		):
 			Ok(graph):
 				match graph_root_at(graph, 0):
@@ -923,7 +878,7 @@ func test_run_cli_returns_frontend_graph_for_directory_check() -> Bool:
 				False
 
 
-func test_run_cli_frontend_graph_preserves_parse_diagnostics() -> Bool:
+func test_run_cli_check_reports_parse_failure_before_a_graph_exists() -> Bool:
 	first_path: String = temp_dir() + "/blorp_cli_check_diag_a.brp"
 	second_path: String = temp_dir() + "/blorp_cli_check_diag_b.brp"
 	_ = remove_file(first_path)
@@ -945,29 +900,8 @@ func test_run_cli_frontend_graph_preserves_parse_diagnostics() -> Bool:
 		_ = remove_file(second_path)
 
 		match plan:
-			CliRunCheck(check_plan):
-				graph = check_plan.graph
-
-				roots = frontend_graph_root_modules(graph.graph)
-
-				not stage_front_end_selected() and roots.length() == 2 and graph_root_holds_parse_failure(
-					graph,
-					1,
-					second_path,
-					"blorp_cli_check_diag_b",
-				)
 			CliRunHandled(result):
-				stage_front_end_selected() and handled_result_prints_parse_failure(result, second_path)
-			CliRunTest(_):
-				False
-			CliRunPurify(_):
-				False
-			CliRunLint(_):
-				False
-			CliRunLsp:
-				False
-			CliRunPackage(_):
-				False
+				handled_result_prints_parse_failure(result, second_path)
 			_:
 				False
 
@@ -2274,7 +2208,7 @@ func test_run_cli_formats_run_source_before_parse() -> Bool:
 			False
 
 
-func test_run_cli_compile_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
+func test_run_cli_compile_reports_parse_failure_before_a_graph_exists() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_compile_diag.brp"
 	_ = remove_file(path)
 
@@ -2285,30 +2219,13 @@ func test_run_cli_compile_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 		_ = remove_file(path)
 
 		match plan:
-			CliRunCompile(compile_plan):
-				not stage_front_end_selected() and graph_root_holds_parse_failure(
-					compile_plan.graph,
-					0,
-					path,
-					"blorp_cli_compile_diag",
-				)
 			CliRunHandled(result):
-				stage_front_end_selected() and handled_result_prints_parse_failure(result, path)
-			CliRunTest(_):
-				False
-			CliRunPurify(_):
-				False
-			CliRunLint(_):
-				False
-			CliRunLsp:
-				False
-			CliRunPackage(_):
-				False
+				handled_result_prints_parse_failure(result, path)
 			_:
 				False
 
 
-func test_run_cli_run_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
+func test_run_cli_run_reports_parse_failure_before_a_graph_exists() -> Bool:
 	path: String = temp_dir() + "/blorp_cli_run_diag.brp"
 	_ = remove_file(path)
 
@@ -2319,25 +2236,8 @@ func test_run_cli_run_parse_diagnostics_stay_in_parsed_artifact() -> Bool:
 		_ = remove_file(path)
 
 		match plan:
-			CliRunSource(run_plan):
-				not stage_front_end_selected() and graph_root_holds_parse_failure(
-					run_plan.graph,
-					0,
-					path,
-					"blorp_cli_run_diag",
-				)
 			CliRunHandled(result):
-				stage_front_end_selected() and handled_result_prints_parse_failure(result, path)
-			CliRunTest(_):
-				False
-			CliRunPurify(_):
-				False
-			CliRunLint(_):
-				False
-			CliRunLsp:
-				False
-			CliRunPackage(_):
-				False
+				handled_result_prints_parse_failure(result, path)
 			_:
 				False
 
@@ -2593,8 +2493,8 @@ tests: TestSuite = {
 			test_run_cli_returns_frontend_graph_for_directory_check,
 		),
 		(
-			"run CLI frontend graph preserves parse diagnostics",
-			test_run_cli_frontend_graph_preserves_parse_diagnostics,
+			"run CLI check reports a parse failure before a graph exists",
+			test_run_cli_check_reports_parse_failure_before_a_graph_exists,
 		),
 		("run CLI formats check source before read", test_run_cli_formats_check_source_before_read),
 		("run CLI no-format preserves check source", test_run_cli_no_format_preserves_check_source),
@@ -2642,12 +2542,12 @@ tests: TestSuite = {
 		("run CLI builds run source plan", test_run_cli_builds_run_source_plan),
 		("run CLI formats run source before parse", test_run_cli_formats_run_source_before_parse),
 		(
-			"run CLI compile parse diagnostics stay in parsed artifact",
-			test_run_cli_compile_parse_diagnostics_stay_in_parsed_artifact,
+			"run CLI compile reports a parse failure before a graph exists",
+			test_run_cli_compile_reports_parse_failure_before_a_graph_exists,
 		),
 		(
-			"run CLI run parse diagnostics stay in parsed artifact",
-			test_run_cli_run_parse_diagnostics_stay_in_parsed_artifact,
+			"run CLI run reports a parse failure before a graph exists",
+			test_run_cli_run_reports_parse_failure_before_a_graph_exists,
 		),
 		("run CLI plans test command", test_run_cli_plans_test_command),
 		("run CLI plans purify command", test_run_cli_plans_purify_command),
