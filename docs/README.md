@@ -84,8 +84,9 @@ experiments live in Git history and `benchmarks/results/`.
   open typecheck allocation issue (module environment preparation) and the
   rules the rejected cuts taught.
 - [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md)
-  is the plan of record for tuples as multi-values with no heap form except
-  in storage, and consuming clones extended to tuple results.
+  is the plan of record for tuple flattening, owned state through calls, and
+  stored tuple layout. It distinguishes current `main` from the validated,
+  unmerged local-tuple pilot and keeps later increments as proposals.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 

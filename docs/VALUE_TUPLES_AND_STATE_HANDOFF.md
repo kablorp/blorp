@@ -1,17 +1,26 @@
 # Value Tuples and Owned State Hand-off
 
-Status: design for review, revised after the first review. Nothing here is
-implemented.
+Status (2026-10-02): plan of record for `main`. Increment 1 has a validated,
+unmerged implementation on `core/local-tuples-never-allocate`; increments 2-5
+and 7 remain design. Section 9.1 records what that pilot actually proves.
+Nothing in this document should be read as a claim that tuple flattening has
+landed on `main`.
+
+Unless a section names a newer matched comparison, "today" and all
+self-compile percentages below refer to the historical design baseline,
+not the current checkout. Section 9.1 separates the pilot's two
+measurement revisions.
 
 The discovery redesign ([`DISCOVERY_REDESIGN.md`](DISCOVERY_REDESIGN.md),
 its sections 3.15, 3.16 and 7) threads a parse state through every parse
 function and returns `(ParseState, node)`; the minting functions return
-`(IdMint, node)`. The M0 prototype measured what that costs on today's
-compiler: the tree parse of the self-compile's bodies takes 6.80 G
-instructions and 11.4 M allocations, against 0.94 G and about 6,600 for
-today's parser, and 80% of those allocations are tuples and record copies,
-not tree. The flip ceiling is +1% instructions, +5% peak RSS and +1% wall
-time on the self-compile.
+`(IdMint, node)`. The historical M0 prototype measured the tree parse of
+the self-compile's bodies at 6.80 G instructions and 11.4 M allocations,
+against 0.94 G and about 6,600 for the then-current parser. Roughly 80% of
+those M0 allocations were tuples and record copies, not tree nodes. These
+are frozen-prototype measurements, not a current-main comparison. The flip
+ceiling is +1% instructions, +5% peak RSS and +1% wall time on the
+self-compile, to be rechecked against a matched current baseline.
 
 This document designs the compiler work that removes that cost for every
 program, not only the parser. It is the design asked for by "make small tuples
@@ -44,7 +53,7 @@ step S5), [`MEMORY_MODEL.md`](MEMORY_MODEL.md), and the open copy issues in
 
 ## 0. Decisions in brief
 
-1. **A tuple is never an object while it is a local, parameter or result.**
+1. **Target: a tuple is not an object while it is a local, parameter or result.**
    A tuple type at the top level of a binding, parameter or function result is
    a group of independent values: locals and parameters are flattened into one
    variable per element, and a function that returns a tuple returns a C
@@ -53,7 +62,10 @@ step S5), [`MEMORY_MODEL.md`](MEMORY_MODEL.md), and the open copy issues in
    *boxed tuple*, the `blorp_Tuple` of today. A value that comes out of a box
    keeps its box until it is taken apart, so a stored tuple is never rebuilt
    (section 3.1). This is GHC's unboxed tuples, with the boxing decided by
-   the compiler instead of the programmer.
+   the compiler instead of the programmer. The unmerged increment 1 pilot
+   reaches match subjects and immutable locals built from a tuple and only
+   taken apart. A `var` tuple, a local used whole, and a local built in arms
+   remain boxed until later increments (section 9.1).
 2. **Ownership belongs to elements.** No unboxed tuple has a reference count.
    Each element is owned, borrowed or moved on its own, by the existing rules.
    Destructuring a call result binds owned values; it does not alias a tuple.
@@ -95,16 +107,19 @@ step S5), [`MEMORY_MODEL.md`](MEMORY_MODEL.md), and the open copy issues in
    in records, unions and lists (S5), an unboxed `Option` of a tuple, and
    `List.enumerate` materializing tuples. Sections 6 and 9 place them.
 
-**Headline.** With increments 1 to 4, and increment 5 if M0 re-measured
-after increment 4 still needs it (section 9), the M0 tree parse's plumbing
+**Historical projection, not an achieved result.** With increments 1 to 4,
+and increment 5 if M0 re-measured after increment 4 still needs it
+(section 9), the M0 tree parse's plumbing
 falls from 9.06 M allocations to about 2.3 M (1.5 M if the struct boxes inside
 tuples, part of M0's unattributed 1.46 M, go with the tuples). The removals
 are worth 3.5 to 4.6 G instructions at the measured 510 to 600 instructions
 per allocation (section 9), so the tree stage moves from +1.45% to between
 +0.33% and +0.59% of the 405 G self-compile, about +0.44% at the central
-estimate, before the adapter's saving. Every number in that sentence is an
-estimate built from measured counts and measured unit costs; each increment
-replaces its part with a measurement.
+estimate, before the adapter's saving. The 405 G denominator belongs to the
+older baseline used for that projection; the increment 1 pilot's later
+matched baseline retired about 204.6 G instructions (section 9.1). Do not
+combine the old percentage estimate with the newer baseline. Each increment
+must replace its part with a matched measurement.
 
 ## 1. Open questions and decisions
 
@@ -274,7 +289,7 @@ update sees a shared builder and copies it and its list. The last pair shows
 the `var` side: a `var` passed to a call and then reassigned from a temporary
 is not handed over, while the one shape `x = f(x)` is.
 
-### 2.3 Tuples in today's self-compile
+### 2.3 Tuples in the historical self-compile baseline
 
 A self-compile (`bin/blorp compile blorp/src/main.brp`) linked against a
 runtime that counts `blorp_tuple_new` allocates **3,446,785 tuples** (2.83 M
@@ -293,14 +308,16 @@ least 500 allocations each; the other 21,664 come from smaller sites.
 | Not classified | 372,061 | 11% | |
 | A box rebuilt from another box's elements | 0 | | must stay 0 (section 3.1, counted) |
 
-So the design removes about 1.79 M of 3.45 M tuple allocations from today's
-compiler: about 1.0 G instructions at 574 per tuple (section 2.4), about
-0.25% of the self-compile. It removes all 3.3 M from the M0 parser. The
-precedent: extending `tuple_sroa` to constructor-match subjects on 2026-09-24
-removed 6.3 M allocations and 1.23% of instructions
-(`benchmarks/results/tuple_match_subject_sroa_2026-09-24.md`).
+So the original design projected removing about 1.79 M of 3.45 M tuple
+allocations from that compiler: about 1.0 G instructions at 574 per tuple
+(section 2.4), about 0.25% of that self-compile. Increment 1 has since
+measured a narrower result (section 9.1); the M0 removal remains a
+projection. A prior constructor-match-subject change removed 6.3 M
+allocations and 1.23% of instructions. Its completed-work report was pruned
+from maintained results; read it in Git history with
+`git show b04950053:benchmarks/results/tuple_match_subject_sroa_2026-09-24.md`.
 
-Percentages of the self-compile in this document are of the 405 G stage-2
+Historical self-compile percentages in this document use the 405 G stage-2
 `-O2` self-compile in redesign section 7. The counting run above used
 `bin/blorp` itself, whose compiler C is built at `-O0`, and retired 397.7 G;
 it is a count of tuples, not a cost baseline.
@@ -546,11 +563,12 @@ as a value, and DCE removes it otherwise. The adapter is a real function: a
 struct-returning function is never called through a pointer typed as
 returning `void*` (that is undefined behaviour in C).
 
-**`tuple_sroa`'s call expansion stays until increment 2.** Increment 1
-flattens locals but does not change signatures. `tuple_sroa` today inlines a
-tiny unmanaged tuple-returning function at its call (the probe's
-`pair_inline`, 0 allocations), so increment 1 keeps that expansion and
-increment 2, which makes every tuple result allocation-free, deletes it.
+**The call-expansion behavior stays until increment 2.** Increment 1
+flattens locals but does not change signatures. The existing `tuple_sroa`
+pass inlines a tiny unmanaged tuple-returning function at its call (the
+probe's `pair_inline`, 0 allocations). The pilot retires that pass and keeps
+the behavior in `tuple_element_producers.brp`; increment 2, which makes
+tuple results allocation-free, deletes the expansion.
 
 ### 3.5 C representation
 
@@ -1042,14 +1060,17 @@ slightly below the two-call version, which looks a new spelling up before
 adding it. Increment 4 replaces this estimate with the `tables` stage
 measurement.
 
-`docs/issues/branch-returning-given-table-copies-on-update.md`, being
-rewritten around this case, should record these two causes. The hit arm's
-return of the given table is not one of them: the tuple-free variant with the
-same arms is flat.
+The historical issue `branch-returning-given-table-copies-on-update`
+(removed from the open-issue index; see Git history at `68b46c9b9`)
+recorded these two causes. The hit arm's return of the given table is not
+one of them: the tuple-free variant with the same arms is flat.
 
 ### 4.6 What is deleted, and what stays
 
-- Deleted: `tuple_sroa.brp`'s tuple-return call expansion, in increment 2
+- Deleted in the increment 1 pilot: the `tuple_sroa.brp` pass; its surviving
+  call expansion and `if`/`match` producers move to
+  `tuple_element_producers.brp`. Increment 2 deletes that module's call
+  expansion and replaces the producers with a multi-value binding
   (section 3.4).
 - Deleted: `reuse.brp`'s field-take rules, in increment 5.
 - Deleted: consume-specialization's own last-use walk, in increment 4, which
@@ -1311,7 +1332,7 @@ in place.
 
 | Piece | Size | Replaces | Risk |
 | --- | --- | --- | --- |
-| Tuple flattening and multi-value results | medium to large: a new pass, one Core form, Perceus and emitter cases, adapters | `tuple_sroa.brp` (2,801 lines) | ABI of every tuple-returning function; contained by the ingress check |
+| Tuple flattening and multi-value results | medium to large: a new pass, one Core form, Perceus and emitter cases, adapters | Increment 1 retires `tuple_sroa.brp`; increment 2 retires the surviving `tuple_element_producers.brp` behavior | ABI of every tuple-returning function; contained by the ingress check |
 | Consuming clones for multi-value results, with simple reads first | small to medium: about 300 to 400 lines changed (section 4.2) | nothing; extends `consume_specialize.brp` | more clones and more emitted C; measured |
 | Place analysis and last-use releases for variables | large | Perceus's scope-end release placement and its alias-move special cases | the largest: Perceus is about 25,000 lines and every ownership gate is sensitive to it |
 | Field places | medium | `reuse.brp`'s take rules (most of their part of 5,700 lines) | early exits, cancellation and derived borrows (section 7) |
@@ -1725,7 +1746,8 @@ value. The codegen audit fixtures that pin heap tuples are updated in the
 increment that changes them, with the new expectation stated.
 
 **End to end.** The M0 prototype (`blorp/test/compiler_new/tools/m0_tree/`
-and `m0_tree_cost.brp` on `compiler-new/m0-tree-prototype`) is rebuilt with
+and `m0_tree_cost.brp` on the separate `compiler-new/m0-tree-prototype`
+branch, not on `main`) is rebuilt with
 each increment's stage-2 compiler and run in the `new` and `scan` modes:
 instructions and allocations of the tree parse, against the 6.80 G and 11.38 M
 of today. The discovery `tables` stage is measured with the one-call
@@ -1741,16 +1763,22 @@ fixpoint of section 7.5.
 
 ## 9. Increments
 
-Each lands on its own with its proof. They are ordered by measured payoff for
-the discovery flip, within their dependencies. Increments 1 to 4 are on the
-flip's path; increment 5 is, if M0 re-measured after increment 4 still needs
-it (section 1, questions 2 and 7). Payoffs are estimates from measured counts times the measured
-cost per allocation (section 2.4), until the increment measures them.
+Each lands on its own with its proof. The sequence is: land the validated
+increment 1 pilot; implement multi-value parameters/results (2);
+extend consuming clones (3); then implement last-use and place analysis (4).
+Re-measure M0 before deciding whether field places (5) are needed. Stored
+tuple layout (7) is separate and may follow 2 without waiting for 3-5.
+Increment 6 is deferred pending a real-site census. Do not start 2 against
+an unmerged version of 1 or treat 1's pilot numbers as a current-main
+baseline. The remaining payoffs are estimates from historical counts and
+unit costs (section 2.4), not acceptance evidence. If increment 1 is
+rejected, revise this sequence before starting 2; it is a prerequisite,
+not an optional optimization.
 
 | # | Change | Depends on | Expected payoff | Proof |
 | --- | --- | --- | --- | --- |
-| 1 | **Local tuples never allocate.** `tuple_flatten.brp` flattens every local tuple and `match` subject and applies the source rules of section 3.1; no signature changes yet, and `tuple_sroa`'s call expansion stays. The fixpoint script. | none | Self-compile: about −1.5 M tuple allocations (the census's match subjects and arm-built tuples), about −0.86 G instructions at `-O2`. M0: small. | census before and after, re-boxing count 0; flat fixtures for or-pattern and literal-pattern subjects; stage-2 instructions |
-| 2 | **Multi-value results.** `UnpackLetExpr`, flattened parameters, struct returns, boxed tuples at sinks by type position, the box-keeping rules, adapters for function values, the ingress check, identity builtins and their documentation; `tuple_sroa`'s call expansion deleted. | 1 | M0: −3.3 M tuple allocations, −1.7 to −2.0 G of 6.80 G. Self-compile: about −0.28 M. Probes: an opaque `(Int, Int)` from 574 to about 10 instructions; `record_pair` from 2 allocations to 1. | probes; M0 `new`; re-boxing fixtures; codegen audit updates |
+| 1 | **Local/match tuple flattening, validated but unmerged.** `tuple_flatten.brp` flattens `match` subjects and immutable locals built from tuples and only taken apart. A `var` tuple, a local used whole, and an arm-built local remain boxed; the call-expansion behavior moves from `tuple_sroa.brp` to `tuple_element_producers.brp` (section 9.1). | none | Earlier tuple census: −1.11 M tuple containers; later matched self-compile: −1.36 M total allocations and −0.75 G instructions. These are distinct comparisons, neither on current `main`. | Pilot report and fixtures on `core/local-tuples-never-allocate`; recheck on integration base before landing. |
+| 2 | **Multi-value results.** `UnpackLetExpr`, flattened parameters, struct returns, boxed tuples at sinks by type position, the box-keeping rules, adapters for function values, the ingress check, identity builtins and their documentation; `tuple_element_producers.brp`'s call expansion deleted. | 1 | M0: −3.3 M tuple allocations, −1.7 to −2.0 G of 6.80 G. Self-compile: about −0.28 M. Probes: an opaque `(Int, Int)` from 574 to about 10 instructions; `record_pair` from 2 allocations to 1. | probes; M0 `new`; re-boxing fixtures; codegen audit updates |
 | 3 | **Consuming clones for multi-value results, with simple reads first.** Section 4.2: candidacy for a result element of the parameter's record type, the walk over elements and `UnpackLetExpr` binders, the benefit and record-update rule 2 for an update inside an element, contract parity for originals, simple reads first within one call, result or update. Requires the `cancelled-loop-var-record-leaks` fix first. | 2 | M0: the `ParseFields` copies reached through immutable binders and call results, the recursive-descent chain of section 4.4, part of about 1.2 M; proven with fixtures written that way, not with the `var`-loop probes. Self-compile: more clones and more emitted C, measured (the first input to question 1's revisit criterion). Acceptance: stage-2 instructions and allocations of increment 3 alone rise by no more than 0.3% (the Perceus cleanup floor in `PERCEUS_CLEANUP_ISSUES.md`), and increments 3 and 4 together lower them. | a recursive-descent fixture over immutable binders; clone count and C bytes; a fixture row pinning the two-owned shape copying exactly one record per call; self-compile stage 2 |
 | 4 | **Place analysis and last-use releases for variables.** The analysis table with derived borrows and `var` writes; consume-specialization reads its liveness in place of its own walk; `last_use_release` after Perceus. | 3 | With increments 2 and 3: the rest of the `ParseFields` copies (about 1.2 M in all, −0.6 to −0.7 G); spelling interning's whole +1.06 M allocations and +1.7 G, causes (a) and (b) (section 4.5); `cell_pair`, `pushed` and `step` reached as clones from their `var` loops; `record_pair` to no allocation; builder in a tuple from quadratic to linear (77,931 to about 40 instructions per call at 100,000 rows); two owned records from quadratic to linear, one `Cell` copy per call remaining; the dead-alias probe from 40,001 to about 15; the variable shapes of section 5.1. Self-compile: fewer reference-count operations; measured, no estimate. | fixture rows; the `tables` stage; ASan derived-borrow test; the garbage-free invariant |
 | 5 | **Field places.** Moves out of field paths at any depth, re-initialization by update, demotion rules; `reuse.brp`'s take rules deleted. M0 is re-measured after increment 4 before this starts (section 1). | 4 | M0: the `MintState` copies, about −1.2 M allocations, −0.6 to −0.7 G, which needs a field-path move (`fields.mint`) to count for retargeting to `minted_expression`'s clone. Probes: three-level update 1 to 0 per call; list two levels down quadratic to flat; field moved into a loop variable flat; `record-update-same-field-read` (1,005 / 10,005 to flat), by simple reads first within one update applied to field places. | fixture rows, including one in which a taken field is passed to and retargeted to a clone; ASan cancellation tests |
@@ -1773,10 +1801,10 @@ go with increment 2 and the remainder is about 1.5 M.
 | Allocations removed | 6.8 M | 6.8 M | 7.6 M |
 | Cost per allocation | 510 | 600 | 600 |
 | Instructions removed | 3.5 G | 4.1 G | 4.6 G |
-| Tree parse of the bodies (6.80 G today) | 3.3 G | 2.7 G | 2.2 G |
-| Tree stage (9.12 G today; today's stage 3.25 G) | 5.7 G | 5.0 G | 4.6 G |
-| Over today's stage | +2.4 G | +1.8 G | +1.3 G |
-| Share of the 405 G self-compile | +0.59% | +0.44% | +0.33% |
+| Tree parse of the bodies (historical M0: 6.80 G) | 3.3 G | 2.7 G | 2.2 G |
+| Tree stage (historical M0: 9.12 G; then-current stage: 3.25 G) | 5.7 G | 5.0 G | 4.6 G |
+| Over that stage | +2.4 G | +1.8 G | +1.3 G |
+| Share of the historical 405 G self-compile | +0.59% | +0.44% | +0.33% |
 
 The low case prices each allocation at M0's isolated probe (510
 instructions); the central and high cases at M0's whole-parse average (600),
@@ -1784,10 +1812,11 @@ which is measured on this workload; the high case also removes the up to
 0.8 M struct boxes inside tuples. Extended clones in place of inferred
 ownership leave this table unchanged: every M0 removal it counts needs only
 one owned parameter per function (section 4.2), so nothing here depended on
-inference. All three are within the +1% ceiling before
-the adapter's saving, which
-redesign section 7 estimates at 1.3 to 2.0 G and which is not measured. Each
-increment replaces its row of this table with a measurement.
+inference. All three were within the +1% ceiling of that older baseline
+before the adapter's estimated, unmeasured saving. This table is a
+hypothesis for the remaining work, not a prediction against the later
+204.6 G baseline. Replace each row with a matched measurement before
+deciding to proceed.
 
 **Found while measuring, outside this design:**
 
@@ -1802,10 +1831,41 @@ increment replaces its row of this table with a measurement.
 - The M0 report's "missing projected callable" when constructing a generic
   union across modules is still not minimized.
 
+### 9.1 Increment 1 pilot and remaining boundary
+
+The unmerged `core/local-tuples-never-allocate` branch implements
+`tuple_flatten.brp` after the existing early-Core passes. It flattens tuple
+`match` subjects and immutable local tuples that are only taken apart. It
+preserves the box for a whole-value use, a `var` tuple, or an arm-built
+local. In particular, `(a, b) = match ...` with tuple-building arms still
+needs the multi-value binding in increment 2; the original estimate of
+1.5 M removable tuples counted about 0.45 M of these arm-built tuples too
+early. The earlier pilot census found a re-boxing count of zero; that
+count was not repeated in the later matched comparison. Its `-O2`
+fixpoint holds.
+
+The branch's retained report is
+`benchmarks/results/tuple_flatten_increment1_2026-10-02.md` (read it with
+`git show core/local-tuples-never-allocate:benchmarks/results/tuple_flatten_increment1_2026-10-02.md`
+until the branch lands). In its later matched comparison against
+`deb198af83a62`, total self-compile allocations changed from 215,010,542
+to 213,645,604 (−1,364,938), and median retired instructions from
+204,631,122,930 to 203,876,898,519 (−754,224,411). The earlier tuple
+census measured 3,446,082 to 2,336,386 tuple allocations (−1,109,696)
+against a different frozen revision; that exact tuple count was not
+remeasured in the later comparison. These numbers establish a promising
+pilot, not a result on `main` or proof of increments 2-7.
+
+Before landing, review the branch against the then-current `main`, repeat
+its targeted and ownership-sensitive gates, and preserve its measured
+baseline/candidate provenance. Once landed, remove increment 1 from this
+open-work plan and link the retained benchmark report; start increment 2
+from that integrated baseline.
+
 ## Appendix A. Probe programs and commands
 
-The probes are kept in the session scratchpad (`value_tuples/`); increment 1
-moves them into `benchmarks/ownership_shapes/`. In
+The pilot branch retains the probes in `benchmarks/ownership_shapes/`;
+they are not on `main` yet. In
 `value_tuple_probe.brp` each mode runs one shape `count` times, and each tuple
 shape has a control doing the same work without a tuple.
 
