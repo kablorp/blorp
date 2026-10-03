@@ -326,6 +326,30 @@ class CompilerCheckPlanTests(unittest.TestCase):
 			validation = repo.run("--validate-manifest")
 			self.assert_success(validation)
 
+	def test_manifest_validation_rejects_suite_hidden_in_fixture_directory(self) -> None:
+		with MiniCompilerCheckRepository() as repo:
+			hidden_suite = (
+				"blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/"
+				"should_pass/test_hidden.brp"
+			)
+			repo.write_suite_path(hidden_suite)
+
+			validation = repo.run("--validate-manifest")
+			self.assertEqual(validation.returncode, 2)
+			self.assertIn("executable Blorp suite in fixture directory", validation.stderr)
+			self.assertIn(hidden_suite, validation.stderr)
+
+	def test_manifest_validation_ignores_commented_suite_text_in_fixture(self) -> None:
+		with MiniCompilerCheckRepository() as repo:
+			repo.write_source(
+				"blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/"
+				"should_pass/comment_only.brp",
+				"-- tests: TestSuite = this is a comment, not an executable suite\n",
+			)
+
+			validation = repo.run("--validate-manifest")
+			self.assert_success(validation)
+
 	def test_plan_json_matches_human_selection(self) -> None:
 		with MiniCompilerCheckRepository() as repo:
 			repo.write_source("blorp/src/compiler/stage_09_core/match lowering.brp", "value = 5\n")
