@@ -735,10 +735,9 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_reset_racing_concurrent_alloc_and_release_stays_balanced(self) -> None:
-        # Worker threads allocate and release their own objects continuously
-        # while the main thread escalates from "off" with a reset. Objects
-        # allocated before the reset are released after it, so a release must
-        # not be subtracted from an epoch that never counted its allocation.
+        # Every worker holds an object allocated while tracking is off until
+        # the main thread resets the epoch. This guarantees that each held
+        # object's release crosses the reset boundary before worker stress.
         source = textwrap.dedent(
             """\
             #define MINICORO_IMPL
@@ -749,22 +748,36 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
             #define BATCH 64
             #define SAMPLE_COUNT 3000
             static _Atomic int stop_workers;
+            static _Atomic int workers_ready;
+            static _Atomic int reset_complete;
+            static _Atomic int cross_epoch_releases;
+            static _Atomic int completed_batches;
 
             static void* worker(void* unused) {
                 (void)unused;
                 void* objects[BATCH];
-                while (!atomic_load(&stop_workers)) {
+                void* before_reset = blorp_alloc(48);
+                atomic_fetch_add(&workers_ready, 1);
+                while (!atomic_load(&reset_complete)) sched_yield();
+                blorp_release(before_reset);
+                atomic_fetch_add(&cross_epoch_releases, 1);
+                do {
                     for (int i = 0; i < BATCH; i++) objects[i] = blorp_alloc(48 + (i % 5) * 16);
                     for (int i = 0; i < BATCH; i++) blorp_release(objects[i]);
-                }
+                    atomic_fetch_add(&completed_batches, 1);
+                } while (!atomic_load(&stop_workers));
                 return NULL;
             }
 
             int main(void) {
                 pthread_t threads[WORKER_COUNT];
-                for (int i = 0; i < WORKER_COUNT; i++) pthread_create(&threads[i], NULL, worker, NULL);
-                usleep(20000);
+                for (int i = 0; i < WORKER_COUNT; i++) {
+                    if (pthread_create(&threads[i], NULL, worker, NULL) != 0) return 9;
+                }
+                while (atomic_load(&workers_ready) != WORKER_COUNT) sched_yield();
+                if (atomic_load(&cross_epoch_releases) != 0) return 10;
                 blorp_reset_mem_stats();
+                atomic_store(&reset_complete, 1);
                 for (int sample = 0; sample < SAMPLE_COUNT; sample++) {
                     blorp_MemStats live = blorp_get_mem_stats();
                     if (live.current_objects < 0) return 2;
@@ -774,6 +787,8 @@ class RuntimeAllocatorStatsTests(unittest.TestCase):
                 }
                 atomic_store(&stop_workers, 1);
                 for (int i = 0; i < WORKER_COUNT; i++) pthread_join(threads[i], NULL);
+                if (atomic_load(&cross_epoch_releases) != WORKER_COUNT) return 11;
+                if (atomic_load(&completed_batches) < WORKER_COUNT) return 12;
                 blorp_MemStats done = blorp_get_mem_stats();
                 if (done.total_allocations <= 0) return 5;
                 if (done.total_allocations != done.total_releases) return 6;
