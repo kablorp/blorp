@@ -186,6 +186,43 @@ field-wise copy/drop and erased-placement rules are implemented. The public
 managed-field restriction remains in force; this is not runtime owned-field
 support. See the [R2 inline policy checkpoint](../benchmarks/results/fixed_layout_r2_inline_policy_2026-10-03.md).
 
+**R2 decision checkpoint (2026-10-03).** R1 syntax and Core declaration
+metadata are landed. The accepted emitter callback-pairing and heap/typed-union
+destructor `Result` preparations preserve existing generated C; none admits a
+managed fixed field. A separate, unmerged Core policy experiment contains
+declaration-aware selectors intended to assign inline-owned retain/release
+policies to a synthetic direct local; its tests remain unverified because the
+new variants exposed nine backend/cancellation exhaustiveness sites. The
+backend also makes 21 cleanup-policy decisions from type alone, Perceus has
+widespread `is_managed_type` checks, and recursive function-body emission has
+91 call expressions across 61 owning helpers, most of which return `Option`.
+Those boundaries prevent a bounded, fail-closed negative-only cut. A preflight
+cannot make the remaining `String`/`Option` matches return a typed error, and an
+empty, ARC, or no-release arm would hide an ownership bug.
+
+Keep the public managed-field gate closed; do not merge the experimental policy
+variants or add placeholder emitter arms. The next architecture choice is a
+broader `Result`-bearing function emitter, or a prepared backend ownership
+action/slot authority built from the exact final Core program and projected C
+symbols. Prefer investigating the prepared authority first: it can resolve
+declaration identity, address-based helper/thunk calls, and backend-created
+temporary cleanup before a `String` renderer runs, without making a missing
+dictionary entry look like an ordinary policy. It is a substantial backend
+preparation change, not a small preflight or permission to open source
+admission. Stop if it cannot cover every generated cleanup site and both
+single- and split-unit emission paths.
+
+Before admission, require source diagnostics for unsupported erased, foreign,
+collection, nested-aggregate, global, capture, parameter, and result placements;
+verify direct-local copy, move, branch/drop, and cancellation behavior through
+Core and generated C. Then run native address/undefined sanitizers on a
+*dynamically allocated* `String` owner (not an immortal literal), asserting
+one allocation/one release/zero live after copy-and-drop, plus a two-owned-
+field case with two/two/zero. Keep a comparable heap-record control, verify
+ordinary-program generated-C identity and stage-2 compiler allocations and
+retired instructions, and do not claim a feature or performance win from the
+existing helper-only oracle or preparatory measurements.
+
 Implement one vertical slice for a direct `String` or heap-record field in a
 non-generic fixed record, then expand to nested fixed records and other
 managed fields. A value has no ARC header of its own; its fields still have
