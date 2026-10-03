@@ -116,10 +116,16 @@ class FieldDeclaration:
 
 
 @dataclass(frozen=True)
+class SelectedImport:
+    name: str
+    local_name: str
+
+
+@dataclass(frozen=True)
 class ImportBinding:
     module: str
     alias: str | None
-    selected: tuple[str, ...]
+    selected: tuple[SelectedImport, ...]
     line: int
 
 
@@ -220,12 +226,27 @@ def parse_imports(path: Path, text: str, known_paths: set[Path]) -> list[ImportB
                 ImportBinding(
                     module=module_name(target),
                     alias=match.group("alias"),
-                    selected=tuple(WORD.findall(selection_text)),
+                    selected=parse_selected_imports(selection_text),
                     line=index + 1,
                 )
             )
             index = following
     return imports
+
+
+def parse_selected_imports(text: str) -> tuple[SelectedImport, ...]:
+    words = WORD.findall(text)
+    selected: list[SelectedImport] = []
+    index = 0
+    while index < len(words):
+        name = words[index]
+        if index + 2 < len(words) and words[index + 1] == "as":
+            selected.append(SelectedImport(name, words[index + 2]))
+            index += 3
+        else:
+            selected.append(SelectedImport(name, name))
+            index += 1
+    return tuple(selected)
 
 
 def source_without_imports(text: str) -> str:
@@ -305,10 +326,10 @@ def unused_import_bindings(
     unused: list[ImportBinding] = []
 
     for imported in parse_imports(path, text, known_paths):
-        if imported.alias is not None:
-            used = any(alias == imported.alias for alias, _ in qualified)
-        else:
-            used = any(name in words for name in imported.selected)
+        used = (
+            imported.alias is not None
+            and any(alias == imported.alias for alias, _ in qualified)
+        ) or any(item.local_name in words for item in imported.selected)
         if not used:
             unused.append(imported)
 
@@ -445,13 +466,12 @@ def declaration_edges(
                     target = exported_node(imported.module, name, declarations, variants)
                     if target is not None:
                         edges[node].add(target)
-            else:
-                for name in imported.selected:
-                    if name not in words:
-                        continue
-                    target = exported_node(imported.module, name, declarations, variants)
-                    if target is not None:
-                        edges[node].add(target)
+            for item in imported.selected:
+                if item.local_name not in words:
+                    continue
+                target = exported_node(imported.module, item.name, declarations, variants)
+                if target is not None:
+                    edges[node].add(target)
     return edges
 
 
@@ -653,12 +673,11 @@ def external_roots(
                         target = exported_node(imported.module, name, declarations, variants)
                         if target is not None:
                             roots.add(target)
-            else:
-                for name in imported.selected:
-                    if name in words:
-                        target = exported_node(imported.module, name, declarations, variants)
-                        if target is not None:
-                            roots.add(target)
+            for item in imported.selected:
+                if item.local_name in words:
+                    target = exported_node(imported.module, item.name, declarations, variants)
+                    if target is not None:
+                        roots.add(target)
     return roots
 
 
@@ -835,7 +854,7 @@ def collect_audit() -> dict[str, object]:
                 "line": imported.line,
                 "module": imported.module,
                 "alias": imported.alias,
-                "selected": list(imported.selected),
+                "selected": [item.name for item in imported.selected],
             }
             for path in source_files
             for imported in unused_import_bindings(

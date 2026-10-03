@@ -19,6 +19,115 @@ class CompilerBlorpDeadCodeAuditTests(unittest.TestCase):
     def setUp(self) -> None:
         self.audit = runpy.run_path(str(SCRIPT))
 
+    def reachable_synthetic_declarations(
+        self, source_texts: dict[str, str], root_name: str
+    ) -> tuple[set[object], set[object]]:
+        with tempfile.TemporaryDirectory() as raw_temp_dir:
+            source_root = Path(raw_temp_dir).resolve()
+            paths = []
+            for name, source_text in source_texts.items():
+                path = source_root / f"{name}.brp"
+                path.write_text(source_text, encoding="utf-8")
+                paths.append(path)
+
+            self.audit["parse_declarations"].__globals__["SOURCE_ROOT"] = source_root
+            declarations, variants = self.audit["parse_declarations"](paths)
+            known_paths = set(paths)
+            imports_by_module = {
+                name: self.audit["parse_imports"](
+                    source_root / f"{name}.brp", source_text, known_paths
+                )
+                for name, source_text in source_texts.items()
+            }
+            edges = self.audit["declaration_edges"](
+                declarations, variants, imports_by_module
+            )
+            root = self.audit["Node"]("entry", root_name)
+            live = self.audit["reachable"]({root}, edges)
+            return live, set(declarations) - live
+
+    def test_selected_import_with_module_alias_reaches_bare_calls(self) -> None:
+        live, probable_dead = self.reachable_synthetic_declarations(
+            {
+                "entry": """\
+import:
+\tprovider as Provider: selected_function
+pure func main() -> Int: selected_function()
+""",
+                "provider": "pure func selected_function() -> Int: 1\n",
+            },
+            "main",
+        )
+        selected_function = self.audit["Node"]("provider", "selected_function")
+        self.assertIn(selected_function, live)
+        self.assertNotIn(selected_function, probable_dead)
+
+    def test_renamed_selected_import_reaches_original_declaration(self) -> None:
+        live, probable_dead = self.reachable_synthetic_declarations(
+            {
+                "entry": """\
+import:
+\tprovider: original_function as local_function
+pure func main() -> Int: local_function()
+""",
+                "provider": "pure func original_function() -> Int: 1\n",
+            },
+            "main",
+        )
+        original_function = self.audit["Node"]("provider", "original_function")
+        self.assertIn(original_function, live)
+        self.assertNotIn(original_function, probable_dead)
+
+    def test_reachable_source_module_follows_selected_import_transitively(self) -> None:
+        live, probable_dead = self.reachable_synthetic_declarations(
+            {
+                "entry": """\
+import:
+\tintermediate: used_function
+pure func main() -> Int: used_function()
+""",
+                "intermediate": """\
+import:
+\tprovider as Provider:
+\t\tleaf_function
+pure func used_function() -> Int: leaf_function()
+""",
+                "provider": "pure func leaf_function() -> Int: 1\n",
+            },
+            "main",
+        )
+        leaf_function = self.audit["Node"]("provider", "leaf_function")
+        self.assertIn(leaf_function, live)
+        self.assertNotIn(leaf_function, probable_dead)
+
+    def test_external_selected_import_uses_local_spelling(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp_dir:
+            root = Path(raw_temp_dir).resolve()
+            source_root = root / "src"
+            source_root.mkdir()
+            provider = source_root / "provider.brp"
+            provider.write_text(
+                "pure func original_function() -> Int: 1\n", encoding="utf-8"
+            )
+            external = source_root / "test_entry.brp"
+            external.write_text(
+                """\
+import:
+\tprovider as Provider: original_function as local_function
+pure func test_entry() -> Int: local_function()
+""",
+                encoding="utf-8",
+            )
+
+            self.audit["parse_declarations"].__globals__["SOURCE_ROOT"] = source_root
+            declarations, variants = self.audit["parse_declarations"]([provider])
+            roots = self.audit["external_roots"](
+                [external], {provider, external}, declarations, variants
+            )
+            self.assertEqual(
+                roots, {self.audit["Node"]("provider", "original_function")}
+            )
+
     def test_documentation_prose_does_not_create_declarations_or_fields(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp_dir:
             source_root = Path(raw_temp_dir) / "src"
