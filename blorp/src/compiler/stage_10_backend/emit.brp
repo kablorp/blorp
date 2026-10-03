@@ -26,15 +26,10 @@ import:
 		CancellationActivationIdentity(
 			FunctionCancellationActivation, GlobalInitializerCancellationActivation,
 		),
-		CancellationCleanupAction(
-			ReleaseArcCancellationOwner, ReleaseArcOnlyCancellationOwner,
-			ReleaseStackResultCancellationOwner,
-		),
 		CancellationProtectionPlan,
 		build_current_behavior_cancellation_plan,
 		cancellation_backend_temporary_candidate,
 		cancellation_call_consumed_arg_indices,
-		cancellation_cleanup_action_for_release_policy,
 		cancellation_construct_transferred_operands,
 		cancellation_let_protection,
 		cancellation_match_scrutinee_protection,
@@ -13357,7 +13352,7 @@ private pure func tracked_moved_captures(
 				ClosureMoveTemporary(index),
 				policy,
 			)
-			and owned_temp_cleanup_release_fn(policy).is_some()
+			and owned_temp_cleanup_kind(policy).is_some()
 		):
 			tracked = tracked.append(moved_capture_var(capture))
 
@@ -13756,8 +13751,8 @@ private pure func transferred_body_value_release_after_match(
 	if not body_value_can_be_cleanup_slot(body):
 		""
 	else:
-		match owned_temp_cleanup_release_fn(scrutinee_release_policy):
-			Some(release_fn):
+		match owned_temp_cleanup_kind(scrutinee_release_policy):
+			Some(_):
 				""
 			None:
 				emit_release_statement(
@@ -13767,26 +13762,33 @@ private pure func transferred_body_value_release_after_match(
 				)
 
 
-private pure func owned_temp_cleanup_release_fn(policy: CoreReleasePolicy) -> Option[String]:
-	match cancellation_cleanup_action_for_release_policy(policy):
-		Some(ReleaseArcCancellationOwner):
-			Some("blorp_cleanup_release_arc_value")
-		Some(ReleaseArcOnlyCancellationOwner):
-			Some("blorp_cleanup_release_arc_only_value")
-		Some(ReleaseStackResultCancellationOwner):
-			Some("blorp_cleanup_stack_result_value")
-		_:
+private enum CCleanupCallbackKind:
+	ArcCleanupCallback
+	ArcOnlyCleanupCallback
+	StackResultCleanupCallback
+
+
+private pure func owned_temp_cleanup_kind(policy: CoreReleasePolicy) -> Option[CCleanupCallbackKind]:
+	match policy:
+		ArcReleasePolicy:
+			Some(ArcCleanupCallback)
+		ArcReleaseOnlyPolicy:
+			Some(ArcOnlyCleanupCallback)
+		StackResultReleasePolicy:
+			Some(StackResultCleanupCallback)
+		NoReleasePolicy:
 			None
 
 
-private pure func owned_temp_cleanup_value_arg(slot: String, policy: CoreReleasePolicy) -> String:
-	match cancellation_cleanup_action_for_release_policy(policy):
-		Some(ReleaseStackResultCancellationOwner):
-			"(void*)&" + slot
-		Some(_):
-			"(void*)" + slot
-		None:
-			"(void*)0"
+--- Select the callback and its ABI argument as one C fragment. ---
+private pure func owned_temp_cleanup_arguments(slot: String, kind: CCleanupCallbackKind) -> String:
+	match kind:
+		ArcCleanupCallback:
+			"(void*)" + slot + ", blorp_cleanup_release_arc_value"
+		ArcOnlyCleanupCallback:
+			"(void*)" + slot + ", blorp_cleanup_release_arc_only_value"
+		StackResultCleanupCallback:
+			"(void*)&" + slot + ", blorp_cleanup_stack_result_value"
 
 
 private pure func owned_temp_cleanup_push_statement(
@@ -13794,11 +13796,10 @@ private pure func owned_temp_cleanup_push_statement(
 	slot: String,
 	policy: CoreReleasePolicy,
 ) -> String:
-	match owned_temp_cleanup_release_fn(policy):
-		Some(release_fn):
+	match owned_temp_cleanup_kind(policy):
+		Some(kind):
 			frame_name: String = "__blorp_owned_cleanup_" + slot
-			value_arg: String = owned_temp_cleanup_value_arg(slot, policy)
-			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + slot + ", " + value_arg + ", " + release_fn + ", __blorp_task);\n"
+			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + slot + ", " + owned_temp_cleanup_arguments(slot, kind) + ", __blorp_task);\n"
 		None:
 			""
 
@@ -13900,8 +13901,8 @@ private pure func owned_temp_cleanup_pop_statement(
 	slot: String,
 	policy: CoreReleasePolicy,
 ) -> String:
-	match owned_temp_cleanup_release_fn(policy):
-		Some(release_fn):
+	match owned_temp_cleanup_kind(policy):
+		Some(_):
 			indent + "blorp_task_cleanup_pop_slot_with_task(&" + slot + ", __blorp_task);\n"
 		None:
 			""
@@ -13928,12 +13929,11 @@ private pure func cancellation_cleanup_push_statement(
 	variable: CoreVar,
 	policy: CoreReleasePolicy,
 ) -> String:
-	match owned_temp_cleanup_release_fn(policy):
-		Some(release_fn):
+	match owned_temp_cleanup_kind(policy):
+		Some(kind):
 			var_name: String = c_var_name(variable)
 			frame_name: String = cleanup_frame_name(variable)
-			value_arg: String = owned_temp_cleanup_value_arg(var_name, policy)
-			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + var_name + ", " + value_arg + ", " + release_fn + ", __blorp_task);\n"
+			indent + "blorp_CancelCleanupFrame " + frame_name + ";\n" + indent + "BLORP_TASK_CLEANUP_SCOPE_WITH_TASK(" + frame_name + ", __blorp_task);\n" + indent + "blorp_task_cleanup_push_with_task(&" + frame_name + ", &" + var_name + ", " + owned_temp_cleanup_arguments(var_name, kind) + ", __blorp_task);\n"
 		None:
 			""
 
@@ -14123,7 +14123,7 @@ private pure func call_arg_requires_transfer_cleanup_pop(
 					emission_context.cleanup_plan,
 					variable,
 				)
-				and owned_temp_cleanup_release_fn(
+				and owned_temp_cleanup_kind(
 					CoreTypePolicy.cleanup_release_policy_for_type(typ),
 				).is_some()
 			)
@@ -17888,7 +17888,7 @@ private pure func emit_concurrently_loop(
 
 
 private pure func release_policy_requires_cleanup(policy: CoreReleasePolicy) -> Bool:
-	cancellation_cleanup_action_for_release_policy(policy).is_some()
+	owned_temp_cleanup_kind(policy).is_some()
 
 
 private pure func render_select_backend_op(indent: String, op: PreparedBackendOp) -> String:
@@ -17905,20 +17905,18 @@ private pure func select_cleanup_push_statement(
 	slot: String,
 	policy: CoreReleasePolicy,
 ) -> String:
-	match owned_temp_cleanup_release_fn(policy):
-		Some(release_fn):
-			value_arg: String = owned_temp_cleanup_value_arg(slot, policy)
+	match owned_temp_cleanup_kind(policy):
+		Some(kind):
 			render_select_backend_op(
 				indent,
 				BackendSelectCleanupFrameDecl(
 					frame_name,
 				),
 			) + render_select_backend_op(indent, BackendSelectCleanupPush({
-					cleanup_frame = frame_name,
-					value_slot = slot,
-					cleanup_value = value_arg,
-					release_fn = release_fn,
-				}))
+				cleanup_frame = frame_name,
+				value_slot = slot,
+				callback_arguments = owned_temp_cleanup_arguments(slot, kind),
+			}))
 		None:
 			""
 
