@@ -27250,10 +27250,10 @@ private pure func heap_record_field_release_statement(
 	field: CoreHeapRecordField,
 	member_spelling: CRecordMemberScope,
 	ordinal: Int,
-) -> String:
+) -> Result[String, CoreEmitError]:
 	field_name: String = c_declared_record_member(member_spelling, field.name, ordinal)
 
-	match field.release_policy:
+	statement: String = match field.release_policy:
 		NoReleasePolicy:
 			""
 		ArcReleasePolicy:
@@ -27262,6 +27262,7 @@ private pure func heap_record_field_release_statement(
 			"  if (__rec->" + field_name + ") blorp_release_arc_only(__rec->" + field_name + ");\n"
 		StackResultReleasePolicy:
 			"  blorp_stack_result_release(__rec->" + field_name + ");\n"
+	Ok(statement)
 
 
 ---
@@ -27300,23 +27301,33 @@ private pure func emit_heap_record_destructor(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
-) -> String:
+) -> Result[String, CoreEmitError]:
 	if cleanup_type_plan_has_destructor(type_plan):
 		var releases: String = ""
+		var failure: Option[CoreEmitError] = None
 
 		for entry in record_decl.fields.enumerate():
-			releases += heap_record_field_release_statement(entry[1], member_spelling, entry[0])
+			if failure.is_none():
+				match heap_record_field_release_statement(entry[1], member_spelling, entry[0]):
+					Ok(release_statement):
+						releases += release_statement
+					Err(error):
+						failure = Some(error)
 
-		storage_class: String = if internal_type_linkage:
-			"static "
-		else:
-			""
-
-		storage_class + destroy_function_signature(
-			naming.destroy_name,
-		) + " {\n" + "  " + naming.c_name + "* __rec = (" + naming.c_name + "*)obj;\n" + releases + "}\n\n"
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				storage_class: String = if internal_type_linkage:
+					"static "
+				else:
+					""
+				definition: String = storage_class + destroy_function_signature(
+					naming.destroy_name,
+				) + " {\n" + "  " + naming.c_name + "* __rec = (" + naming.c_name + "*)obj;\n" + releases + "}\n\n"
+				Ok(definition)
 	else:
-		""
+		Ok("")
 
 
 private pure func emit_heap_record_reuse(
@@ -27381,7 +27392,7 @@ private pure func emit_heap_record_decl(
 	layout: CRecordLayout,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
-) -> CHeapRecordDeclEmission:
+) -> Result[CHeapRecordDeclEmission, CoreEmitError]:
 	var source_order_fields_c: String = ""
 	var internal_non_boolean_fields_c: String = ""
 	var internal_boolean_fields_c: String = ""
@@ -27456,7 +27467,7 @@ private pure func emit_heap_record_decl(
 		"  BLORP_INSTALL_TAG(__rec, \"" + record_decl.name + "\");\n"
 
 	header: String = "typedef struct " + naming.c_name + " {\n" + "  blorp_Object header;\n" + fields_c + "} " + naming.c_name + ";\n\n"
-	destructor_c: String = emit_heap_record_destructor(
+	destructor_c ?= emit_heap_record_destructor(
 		record_decl,
 		member_spelling,
 		type_plan,
@@ -27466,7 +27477,7 @@ private pure func emit_heap_record_decl(
 	record_alloc: String = render_prepared_backend_op(BackendGenericObjectAlloc(naming.c_name))
 	make_c: String = record_c_type + " " + naming.make_name + "(" + param_c + ") {\n" + "  " + naming.c_name + "* __rec = (" + naming.c_name + "*)" + record_alloc + ";\n" + type_install + assignments + "  return (" + record_c_type + ")__rec;\n}\n\n"
 
-	{
+	Ok({
 		type_header = header,
 		functions = [destructor_c, make_c],
 		inline_support = emit_heap_record_reuse(
@@ -27476,7 +27487,7 @@ private pure func emit_heap_record_decl(
 			naming,
 			selected_type_symbol_lookup(authority),
 		)
-	}
+	})
 
 
 private pure func union_field_storage_type(
@@ -28826,16 +28837,17 @@ private pure func collect_heap_record_decl_emissions(
 	layouts: CRecordLayoutRegistry,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
-) -> List[CHeapRecordDeclEmission]:
+) -> Result[List[CHeapRecordDeclEmission], CoreEmitError]:
 	var result: List[CHeapRecordDeclEmission] = []
+	var failure: Option[CoreEmitError] = None
 
 	for entry in decls.enumerate():
 		decl_index: Int = entry[0]
 
 		match entry[1]:
 			HeapRecordDecl(record_decl):
-				result = result.append(
-					emit_heap_record_decl(
+				if failure.is_none():
+					match emit_heap_record_decl(
 						record_decl,
 						cleanup_plan_row(plan, decl_index),
 						layouts,
@@ -28845,8 +28857,11 @@ private pure func collect_heap_record_decl_emissions(
 						),
 						authority,
 						internal_type_linkage,
-					),
-				)
+					):
+						Ok(emission):
+							result = result.append(emission)
+						Err(error):
+							failure = Some(error)
 			ValueRecordDecl(record_decl):
 				void
 			UnionDecl(union_decl):
@@ -28864,7 +28879,11 @@ private pure func collect_heap_record_decl_emissions(
 			ImplDecl(impl_decl):
 				void
 
-	result
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
 
 
 private pure func collect_union_decl_emissions(
@@ -29053,7 +29072,7 @@ private pure func emit_decls(
 		layouts,
 		symbol_authority,
 	)
-	heap_record_emissions: List[CHeapRecordDeclEmission] = collect_heap_record_decl_emissions(
+	heap_record_emissions ?= collect_heap_record_decl_emissions(
 		decls,
 		plan,
 		layouts,
