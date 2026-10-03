@@ -205,6 +205,12 @@ fi
 
 if [ "\${1:-}" = "test" ]; then
 	echo "\$*" >> "$TMP_HARNESS/test-command-log.txt"
+	if [ "\${2:-}" = "--warmup-only" ]; then
+		if [ "\${BLORP_TEST_WARMUP_EXIT:-0}" != "0" ]; then
+			echo "fake compiler warmup failed" >&2
+		fi
+		exit "\${BLORP_TEST_WARMUP_EXIT:-0}"
+	fi
 	if [ -n "\${BLORP_TEST_FAILURE_OUTPUT:-}" ]; then
 		for progress_line in {1..45}; do
 			echo "test progress \$progress_line"
@@ -794,6 +800,7 @@ echo "PASS: package lifecycle checks have a package-owned implementation"
 mkdir -p "$TMP_HARNESS/blorp/test/lsp/fixtures" "$TMP_HARNESS/fake-python-bin"
 cat > "$TMP_HARNESS/fake-python-bin/python3" <<'SH'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> fake-python-command-log.txt
 emit_fixture_result=false
 case "$*" in
 	*test_lsp_fixture_process.py) emit_fixture_result=true ;;
@@ -856,6 +863,38 @@ then
 fi
 
 echo "PASS: scripts/test collects LSP and package parallel workers"
+
+rm -f "$TMP_HARNESS/test-command-log.txt" \
+	"$TMP_HARNESS/fake-python-command-log.txt" \
+	"$TMP_HARNESS/package-command-log.txt"
+warmup_failure_output="$TMP_HARNESS/warmup-failure-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_WARMUP_EXIT=23 \
+		PATH="$TMP_HARNESS/fake-python-bin:$PATH" \
+		bash scripts/test lsp package --no-build
+) > "$warmup_failure_output" 2>&1
+warmup_failure_status=$?
+warmup_verdict_count=$(grep -Ec '^BLORP_GATE_RESULT gate=test ' "$warmup_failure_output" || true)
+if [ "$warmup_failure_status" -eq 0 ] \
+	|| ! grep -Fq 'Error: runtime cache warmup failed; aborting parallel test gates.' \
+		"$warmup_failure_output" \
+	|| [ "$warmup_verdict_count" -ne 1 ] \
+	|| ! grep -Fxq 'BLORP_GATE_RESULT gate=test status=FAIL passed=0 failed=0 tests=0' \
+		"$warmup_failure_output" \
+	|| ! grep -Fxq 'test --warmup-only' "$TMP_HARNESS/test-command-log.txt" \
+	|| [ "$(wc -l < "$TMP_HARNESS/test-command-log.txt")" -ne 1 ] \
+	|| grep -Fq 'RUN wave:' "$warmup_failure_output" \
+	|| [ -e "$TMP_HARNESS/fake-python-command-log.txt" ] \
+	|| [ -e "$TMP_HARNESS/package-command-log.txt" ]
+then
+	echo "FAIL: failed warmup should abort before launching parallel gate workers"
+	cat "$warmup_failure_output"
+	exit 1
+fi
+
+echo "PASS: scripts/test aborts parallel gates when warmup fails"
 
 mkdir -p "$TMP_HARNESS/blorp/test/compiler"
 for source_number in 01 02 03 04 05 06 07; do
