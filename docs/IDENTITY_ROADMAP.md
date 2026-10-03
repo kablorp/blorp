@@ -430,7 +430,7 @@ records keep source names), closures and tasks, and locals with a binder id
   `Some(__value)` pattern binder at id 0; `run_synth_pass` does not thread
   `next_binder_id`), `specialize_collection`, `consume_specialize`,
   `match_projection`, `mono_option`, `record_update`, `ssa`, `tailrec`,
-  `tensor_specialize`, `tuple_sroa`, `parallel_tensor_pipeline`, and the
+  `tensor_specialize`, `parallel_tensor_pipeline`, and the
   tuple-destruct temporary in lowering (about 402k binder occurrences carried a
   synthetic spelling for this reason when last counted). Each pass mints from
   `CorePassState.next_binder_id` once it threads state; then delete the id-0

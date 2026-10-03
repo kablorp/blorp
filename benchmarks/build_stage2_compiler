@@ -15,10 +15,17 @@ included) stay in sync with the Makefile without being copied by hand.
 With --diagnostic-output it generates and compiles the compiler body once,
 then links it against the two mode-specific native runtime objects.
 
+A later stage is the same build with another generator: `--generator` names
+the compiler that generates the C (default `bin/blorp`), and `--generated-c`
+where that C is written. `--c-only` stops after generating the C, which is how
+`scripts/compiler-fixpoint` reads a stage's output without building from it.
+
 Usage:
 
     benchmarks/build_stage2_compiler <output-binary>
     benchmarks/build_stage2_compiler --diagnostic-output <diagnostic-binary> <output-binary>
+    benchmarks/build_stage2_compiler --generator <compiler> --generated-c <c-file> <output-binary>
+    benchmarks/build_stage2_compiler --generator <compiler> --generated-c <c-file> --c-only
 """
 
 from __future__ import annotations
@@ -261,27 +268,40 @@ def verify_binary_mode(binary: Path, expected: int) -> None:
         )
 
 
-def build(output: Path, diagnostic_output: Path | None = None) -> int:
+def default_generated_c() -> Path:
+    return REPO_ROOT / make_var("BLORP_CLI_BUILD_DIR") / "stage2_main.c"
+
+
+def generate(generator: Path, generated_c: Path) -> None:
+    """Write the compiler's C, as `generator` emits it, to `generated_c`."""
+    check_bin_blorp_fresh()
+    if not generator.is_file():
+        raise BuildError(f"generator compiler does not exist: {generator}")
+    generated_c.parent.mkdir(parents=True, exist_ok=True)
+    tmp_c = generated_c.with_name(generated_c.name + ".tmp")
+    generate_cmd = extract_generate_command(
+        make_recipe("generate-blorp-cli-c"), generator, tmp_c
+    )
+    run(generate_cmd, f"{generator} compile (C generation)")
+    if not tmp_c.is_file() or tmp_c.stat().st_size == 0:
+        raise BuildError(f"generated C is missing or empty: {tmp_c}")
+    tmp_c.replace(generated_c)
+
+
+def build(
+    output: Path,
+    diagnostic_output: Path | None = None,
+    generator: Path = INSTALLED_BIN,
+    generated_c: Path | None = None,
+) -> int:
     if output.resolve() == INSTALLED_BIN.resolve():
         raise BuildError("refusing to overwrite bin/blorp; choose a different output path")
     if diagnostic_output is not None:
         if diagnostic_output.resolve() in (output.resolve(), INSTALLED_BIN.resolve()):
             raise BuildError("diagnostic output must differ from normal output and bin/blorp")
 
-    check_bin_blorp_fresh()
-
-    build_dir = REPO_ROOT / make_var("BLORP_CLI_BUILD_DIR")
-    build_dir.mkdir(parents=True, exist_ok=True)
-    stage2_c = build_dir / "stage2_main.c"
-
-    tmp_c = stage2_c.with_name(stage2_c.name + ".tmp")
-    generate_cmd = extract_generate_command(
-        make_recipe("generate-blorp-cli-c"), INSTALLED_BIN, tmp_c
-    )
-    run(generate_cmd, "bin/blorp compile (stage-2 generation)")
-    if not tmp_c.is_file() or tmp_c.stat().st_size == 0:
-        raise BuildError(f"generated C is missing or empty: {tmp_c}")
-    tmp_c.replace(stage2_c)
+    stage2_c = generated_c if generated_c is not None else default_generated_c()
+    generate(generator, stage2_c)
 
     compile_prepared_recipe = make_recipe("compile-prepared-blorp-cli")
     stage2_obj = stage2_c.with_suffix(".o")
@@ -297,7 +317,7 @@ def build(output: Path, diagnostic_output: Path | None = None) -> int:
     stamp_result = subprocess.run(
         ["make", "prepare-blorp-cli-build-stamp"],
         cwd=REPO_ROOT,
-        env={**os.environ, "BLORP_BOOTSTRAP_COMPILER_BIN": str(INSTALLED_BIN), "BLORP_CC": BLORP_CC},
+        env={**os.environ, "BLORP_BOOTSTRAP_COMPILER_BIN": str(generator), "BLORP_CC": BLORP_CC},
         capture_output=True,
         text=True,
     )
@@ -345,13 +365,38 @@ def build(output: Path, diagnostic_output: Path | None = None) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("output", help="path to write the stage-2 compiler binary to")
+    parser.add_argument("output", nargs="?", help="path to write the stage-2 compiler binary to")
     parser.add_argument("--diagnostic-output", help="also link a compiler with memory diagnostics enabled")
+    parser.add_argument(
+        "--generator", default=str(INSTALLED_BIN),
+        help="compiler that generates the C (default: bin/blorp)",
+    )
+    parser.add_argument(
+        "--generated-c",
+        help="where to write the generated C (default: stage2_main.c in the CLI build directory)",
+    )
+    parser.add_argument(
+        "--c-only", action="store_true",
+        help="generate the C into --generated-c and stop; build no binary",
+    )
     args = parser.parse_args(argv)
+    generator = Path(args.generator).resolve()
+    generated_c = Path(args.generated_c).resolve() if args.generated_c else None
     try:
+        if args.c_only:
+            if generated_c is None or args.output or args.diagnostic_output:
+                parser.error("--c-only takes --generated-c and no output binaries")
+            generate(generator, generated_c)
+            print(f"generated C       : {generated_c}")
+            print(f"generated C sha256: {sha256_file(generated_c)}")
+            return 0
+        if not args.output:
+            parser.error("an output binary path is required unless --c-only is given")
         return build(
             Path(args.output).resolve(),
             Path(args.diagnostic_output).resolve() if args.diagnostic_output else None,
+            generator,
+            generated_c,
         )
     except BuildError as error:
         print(f"build_stage2_compiler: {error}", file=sys.stderr)

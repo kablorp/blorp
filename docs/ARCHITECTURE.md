@@ -311,7 +311,7 @@ lower + ffi_boundary + list_layout
   -> std_inline
   -> tailrec
   -> string_pipeline + collection_pipeline
-  -> parallel_tensor_pipeline + tensor_fusion + tuple_sroa
+  -> parallel_tensor_pipeline + tensor_fusion + tuple_flatten
   -> function-reference adaptation + tensor_specialize + specialize
   -> hash-key callbacks
   -> callable resolution + backend projection + match projection + dce

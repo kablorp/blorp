@@ -1,0 +1,1030 @@
+-- Tuple element producers that predate multi-value results (what remains of
+-- the retired tuple_sroa pass). Increment 2 of
+-- docs/VALUE_TUPLES_AND_STATE_HANDOFF.md deletes the call expansion, and a
+-- multi-value binding the `if` and `match` producers, after which this module
+-- goes.
+--
+-- Tuple flattening (tuple_flatten.brp) binds the elements of a built tuple
+-- to locals. A tuple literal names its elements directly; the shapes here
+-- produce them from something that is not a literal, without a multi-value
+-- binding:
+--
+-- - a call to a small function whose result is a tuple of unmanaged scalar
+--   expressions over its parameters, expanded at the call (removed by
+--   increment 2 of docs/VALUE_TUPLES_AND_STATE_HANDOFF.md, which returns
+--   every tuple result by value);
+-- - an `if` whose arms are tuple literals, and a `match` on an unmanaged
+--   subject whose leaves are tuple literals, evaluated once per element
+--   (replaced by a multi-value binding, section 3.3, when one exists).
+import:
+	../stage_08_core_lower/list_layout: CoreLayoutTypeIndex, build_layout_type_index
+	ir:
+		CoreBinaryOp,
+		CoreCallKind(UserCall),
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreExpr(
+			BinaryExpr, CallExpr, IfExpr, LetExpr, LiteralExpr, SemanticMatchExpr, TupleExpr,
+			UnaryExpr, VarExpr,
+		),
+		CoreFunction,
+		CoreLiteral,
+		CoreParam,
+		CoreProgram,
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch, SemanticLengthMatch, SemanticLiteralMatch, SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
+		CoreSourceLoc,
+		CoreType(TupleType),
+		CoreUnaryOp,
+		CoreVar,
+		TUPLE_FLATTEN_TEMP_ORIGIN,
+		core_expr_type,
+		core_var_equal,
+		is_user_function_kind,
+	mono: core_mono_type_equal
+	unmanaged_type: core_type_is_known_unmanaged
+
+
+---
+A binder minted for tuple flattening, and the last id handed out. Minted
+binder ids count down from the pass's base (`CorePassState.next_binder_id`):
+`last_id` is the last id handed out, one above the base before the first.
+The binder's identity, and its C spelling, is its id; `label` is its name only
+so Core dumps read well.
+---
+record TupleBinderMint {
+	variable: CoreVar,
+	last_id: Int
+}
+
+
+pure func mint_tuple_binder(label: String, last_id: Int) -> TupleBinderMint:
+	minted_id: Int = last_id - 1
+	{
+		variable = {
+			name = label,
+			id = minted_id,
+			def_id = None,
+			origin = TUPLE_FLATTEN_TEMP_ORIGIN
+		},
+		last_id = minted_id
+	}
+
+
+record TupleCoreBinding {
+	variable: CoreVar,
+	typ: CoreType,
+	rhs: CoreExpr
+}
+
+
+---
+A built tuple's elements before they are bound: `prelude` is evaluated first,
+in order, then each of `elements`, in element order.
+---
+record TupleElementSource {
+	prelude: List[TupleCoreBinding],
+	elements: List[CoreExpr],
+	last_id: Int
+}
+
+
+private record MintedBinders {
+	variables: List[CoreVar],
+	last_id: Int
+}
+
+
+private pure func mint_tuple_binders(label: String, count: Int, last_id: Int) -> MintedBinders:
+	var variables: List[CoreVar] = []
+	var current: Int = last_id
+
+	for index in 0..count:
+		minted: TupleBinderMint = mint_tuple_binder("${label}_${index}", current)
+		variables = variables.append(minted.variable)
+		current = minted.last_id
+
+	{
+		variables = variables,
+		last_id = current
+	}
+
+
+---
+`if cond: (a, b) else: (c, d)` as `cond` bound once, then
+`if cond: a else: c` and `if cond: b else: d`. Only the taken arm's
+expressions run, in their written order, so evaluation is unchanged.
+---
+private pure func if_tuple_elements(
+	cond: CoreExpr,
+	then_elements: List[CoreExpr],
+	else_elements: List[CoreExpr],
+	loc: CoreSourceLoc,
+	last_id: Int,
+) -> Option[TupleElementSource]:
+	if then_elements.length() != else_elements.length():
+		None
+	else:
+		cond_binder: TupleBinderMint = mint_tuple_binder("condition", last_id)
+		cond_ref: CoreExpr = VarExpr(cond_binder.variable, core_expr_type(cond), loc)
+		var elements: List[CoreExpr] = []
+		var compatible: Bool = True
+
+		for index in 0..then_elements.length():
+			match (then_elements.get(index), else_elements.get(index)):
+				(Some(then_element), Some(else_element)):
+					if core_mono_type_equal(
+						core_expr_type(then_element),
+						core_expr_type(else_element),
+					):
+						elements = elements.append(
+							IfExpr(
+								cond_ref,
+								then_element,
+								else_element,
+								core_expr_type(then_element),
+								loc,
+							),
+						)
+					else:
+						compatible = False
+						break
+				_:
+					compatible = False
+					break
+
+		if compatible:
+			Some({
+				prelude = [
+					{
+						variable = cond_binder.variable,
+						typ = core_expr_type(cond),
+						rhs = cond
+					},
+				],
+				elements = elements,
+				last_id = cond_binder.last_id,
+			})
+		else:
+			None
+
+
+private record TupleTypedTree {
+	typ: CoreType,
+	tree: CoreSemanticMatchTree
+}
+
+
+private pure func tuple_tree_leaf_elements_reversed(
+	tree: CoreSemanticMatchTree,
+	leaves: List[List[CoreExpr]],
+) -> Option[List[List[CoreExpr]]]:
+	match tree:
+		SemanticMatchLeaf(_, TupleExpr(elements, _, _)):
+			Some([elements].concat(leaves))
+		SemanticMatchLeaf(_, _):
+			None
+		SemanticMatchFail:
+			Some(leaves)
+		SemanticConstructorMatch(_, cases, fallback):
+			var collected: List[List[CoreExpr]] = leaves
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_leaf_elements_reversed(match_case.body, collected):
+					Some(case_leaves):
+						collected = case_leaves
+					None:
+						supported = False
+						break
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						tuple_tree_leaf_elements_reversed(fallback_tree, collected)
+					None:
+						Some(collected)
+			else:
+				None
+		SemanticLiteralMatch(_, cases, fallback):
+			var collected: List[List[CoreExpr]] = leaves
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_leaf_elements_reversed(match_case.body, collected):
+					Some(case_leaves):
+						collected = case_leaves
+					None:
+						supported = False
+						break
+
+			if supported:
+				tuple_tree_leaf_elements_reversed(fallback, collected)
+			else:
+				None
+		SemanticLengthMatch(_, cases, geq, fallback):
+			var collected: List[List[CoreExpr]] = leaves
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_leaf_elements_reversed(match_case.body, collected):
+					Some(case_leaves):
+						collected = case_leaves
+					None:
+						supported = False
+						break
+
+			if supported:
+				match geq:
+					Some(geq_case):
+						match tuple_tree_leaf_elements_reversed(geq_case.body, collected):
+							Some(geq_leaves):
+								collected = geq_leaves
+							None:
+								supported = False
+					None:
+						void
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						tuple_tree_leaf_elements_reversed(fallback_tree, collected)
+					None:
+						Some(collected)
+			else:
+				None
+
+
+private pure func tuple_leaf_shape(leaves: List[List[CoreExpr]]) -> Option[List[CoreType]]:
+	match leaves:
+		[]:
+			None
+		[first, ...rest]:
+			var compatible: Bool = True
+
+			for elements in rest:
+				if elements.length() != first.length():
+					compatible = False
+					break
+
+				var index: Int = 0
+
+				while index < first.length():
+					match (first.get(index), elements.get(index)):
+						(Some(expected), Some(actual)):
+							if not core_mono_type_equal(
+								core_expr_type(expected),
+								core_expr_type(actual),
+							):
+								compatible = False
+								break
+						_:
+							compatible = False
+							break
+
+					index += 1
+
+				if not compatible:
+					break
+
+			if compatible:
+				Some(first.map(core_expr_type))
+			else:
+				None
+
+
+private pure func tuple_tree_element(
+	index: Int,
+	tree: CoreSemanticMatchTree,
+) -> Option[CoreSemanticMatchTree]:
+	match tree:
+		SemanticMatchLeaf(bindings, TupleExpr(elements, _, _)):
+			match elements.get(index):
+				Some(element):
+					Some(SemanticMatchLeaf(bindings, element))
+				None:
+					None
+		SemanticMatchLeaf(_, _):
+			None
+		SemanticMatchFail:
+			Some(SemanticMatchFail)
+		SemanticConstructorMatch(accessor, cases, fallback):
+			var rewritten_cases: List[CoreSemanticConstructorMatchCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_element(index, match_case.body):
+					Some(body):
+						rewritten_cases = rewritten_cases.append({ match_case | body = body })
+					None:
+						supported = False
+						break
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						match tuple_tree_element(index, fallback_tree):
+							Some(rewritten_fallback):
+								Some(
+									SemanticConstructorMatch(
+										accessor,
+										rewritten_cases,
+										Some(rewritten_fallback),
+									),
+								)
+							None:
+								None
+					None:
+						Some(SemanticConstructorMatch(accessor, rewritten_cases, None))
+			else:
+				None
+		SemanticLiteralMatch(accessor, cases, fallback):
+			var rewritten_cases: List[CoreSemanticLiteralMatchCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_element(index, match_case.body):
+					Some(body):
+						rewritten_cases = rewritten_cases.append({ match_case | body = body })
+					None:
+						supported = False
+						break
+
+			if supported:
+				match tuple_tree_element(index, fallback):
+					Some(rewritten_fallback):
+						Some(SemanticLiteralMatch(accessor, rewritten_cases, rewritten_fallback))
+					None:
+						None
+			else:
+				None
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			var rewritten_cases: List[CoreSemanticLengthMatchCase] = []
+			var supported: Bool = True
+
+			for match_case in cases:
+				match tuple_tree_element(index, match_case.body):
+					Some(body):
+						rewritten_cases = rewritten_cases.append({ match_case | body = body })
+					None:
+						supported = False
+						break
+
+			var rewritten_geq = None
+
+			if supported:
+				match geq:
+					Some(geq_case):
+						match tuple_tree_element(index, geq_case.body):
+							Some(body):
+								rewritten_geq = Some({ geq_case | body = body })
+							None:
+								supported = False
+					None:
+						void
+
+			var rewritten_fallback = None
+
+			if supported:
+				match fallback:
+					Some(fallback_tree):
+						match tuple_tree_element(index, fallback_tree):
+							Some(body):
+								rewritten_fallback = Some(body)
+							None:
+								supported = False
+					None:
+						void
+
+			if supported:
+				Some(
+					SemanticLengthMatch(
+						accessor,
+						rewritten_cases,
+						rewritten_geq,
+						rewritten_fallback,
+					),
+				)
+			else:
+				None
+
+
+private pure func tuple_match_element_trees(
+	tree: CoreSemanticMatchTree,
+) -> Option[List[TupleTypedTree]]:
+	leaves ?= tuple_tree_leaf_elements_reversed(tree, []).map(func(leaves): leaves.reverse())
+	element_types ?= tuple_leaf_shape(leaves)
+	var result: List[TupleTypedTree] = []
+	var index: Int = 0
+	var supported: Bool = True
+
+	while index < element_types.length():
+		match (element_types.get(index), tuple_tree_element(index, tree)):
+			(Some(typ), Some(element_tree)):
+				result = result.append({
+					typ = typ,
+					tree = element_tree,
+				})
+			_:
+				supported = False
+				break
+
+		index += 1
+
+	if supported:
+		Some(result)
+	else:
+		None
+
+
+---
+A `match` on an unmanaged subject whose every leaf is a tuple literal, as the
+subject bound once, then one `match` of it per element whose leaves are that
+element. The subject is unmanaged, so matching it again reads only scalars.
+---
+private pure func match_tuple_elements(
+	layout_types: CoreLayoutTypeIndex,
+	scrutinee: CoreExpr,
+	tree: CoreSemanticMatchTree,
+	loc: CoreSourceLoc,
+	last_id: Int,
+) -> Option[TupleElementSource]:
+	subject_type: CoreType = core_expr_type(scrutinee)
+
+	if not core_type_is_known_unmanaged(layout_types, subject_type):
+		None
+	else:
+		element_trees ?= tuple_match_element_trees(tree)
+		subject: TupleBinderMint = mint_tuple_binder("match_subject", last_id)
+		subject_ref: CoreExpr = VarExpr(subject.variable, subject_type, loc)
+		elements: List[CoreExpr] = element_trees.map(pure func(typed_tree: TupleTypedTree):
+			SemanticMatchExpr(subject_ref, typed_tree.tree, typed_tree.typ, loc)
+		)
+		Some({
+			prelude = [
+				{
+					variable = subject.variable,
+					typ = subject_type,
+					rhs = scrutinee
+				},
+			],
+			elements = elements,
+			last_id = subject.last_id,
+		})
+
+
+private union TupleReturnExpr:
+	TupleReturnParameter(Int, CoreType, CoreSourceLoc)
+	TupleReturnLocal(Int, CoreType, CoreSourceLoc)
+	TupleReturnLiteral(CoreLiteral, CoreType, CoreSourceLoc)
+	TupleReturnUnary(CoreUnaryOp, TupleReturnExpr, CoreType, CoreSourceLoc)
+	TupleReturnBinary(CoreBinaryOp, TupleReturnExpr, TupleReturnExpr, CoreType, CoreSourceLoc)
+	TupleReturnIf(TupleReturnExpr, TupleReturnExpr, TupleReturnExpr, CoreType, CoreSourceLoc)
+
+
+private union TupleReturnReference:
+	TupleReturnParameterReference(Int)
+	TupleReturnLocalReference(Int)
+
+
+private record TupleReturnScopeBinding {
+	variable: CoreVar,
+	reference: TupleReturnReference
+}
+
+
+private record TupleReturnLocalBinding {
+	rhs: TupleReturnExpr,
+	typ: CoreType
+}
+
+
+private record TupleReturnSummary {
+	params: List[CoreParam],
+	locals: List[TupleReturnLocalBinding],
+	elements: List[TupleReturnExpr]
+}
+
+
+private pure func tuple_return_expr_type(expr: TupleReturnExpr) -> CoreType:
+	match expr:
+		TupleReturnParameter(_, typ, _):
+			typ
+		TupleReturnLocal(_, typ, _):
+			typ
+		TupleReturnLiteral(_, typ, _):
+			typ
+		TupleReturnUnary(_, _, typ, _):
+			typ
+		TupleReturnBinary(_, _, _, typ, _):
+			typ
+		TupleReturnIf(_, _, _, typ, _):
+			typ
+
+
+private pure func tuple_return_expr_loc(expr: TupleReturnExpr) -> CoreSourceLoc:
+	match expr:
+		TupleReturnParameter(_, _, loc):
+			loc
+		TupleReturnLocal(_, _, loc):
+			loc
+		TupleReturnLiteral(_, _, loc):
+			loc
+		TupleReturnUnary(_, _, _, loc):
+			loc
+		TupleReturnBinary(_, _, _, _, loc):
+			loc
+		TupleReturnIf(_, _, _, _, loc):
+			loc
+
+
+private pure func tuple_return_if(
+	cond: TupleReturnExpr,
+	then_expr: TupleReturnExpr,
+	else_expr: TupleReturnExpr,
+) -> Option[TupleReturnExpr]:
+	if core_mono_type_equal(tuple_return_expr_type(then_expr), tuple_return_expr_type(else_expr)):
+		Some(
+			TupleReturnIf(
+				cond,
+				then_expr,
+				else_expr,
+				tuple_return_expr_type(then_expr),
+				tuple_return_expr_loc(then_expr),
+			),
+		)
+	else:
+		None
+
+
+private pure func tuple_return_scope_of_params(
+	params: List[CoreParam],
+) -> List[TupleReturnScopeBinding]:
+	var scope: List[TupleReturnScopeBinding] = []
+	var index: Int = 0
+
+	for parameter in params:
+		scope = scope.append({
+			variable = parameter.name,
+			reference = TupleReturnParameterReference(index),
+		})
+		index += 1
+
+	scope
+
+
+private pure func tuple_return_reference(
+	scope: List[TupleReturnScopeBinding],
+	variable_name: CoreVar,
+) -> Option[TupleReturnReference]:
+	var result: Option[TupleReturnReference] = None
+
+	for binding in scope:
+		if core_var_equal(binding.variable, variable_name):
+			result = Some(binding.reference)
+			break
+
+	result
+
+
+private pure func tuple_return_expr_of_core(
+	layout_types: CoreLayoutTypeIndex,
+	scope: List[TupleReturnScopeBinding],
+	expr: CoreExpr,
+) -> Option[TupleReturnExpr]:
+	if not core_type_is_known_unmanaged(layout_types, core_expr_type(expr)):
+		None
+	else:
+		match expr:
+			VarExpr(variable_name, typ, loc):
+				match tuple_return_reference(scope, variable_name):
+					Some(TupleReturnParameterReference(index)):
+						Some(TupleReturnParameter(index, typ, loc))
+					Some(TupleReturnLocalReference(index)):
+						Some(TupleReturnLocal(index, typ, loc))
+					None:
+						None
+			LiteralExpr(literal, typ, loc):
+				Some(TupleReturnLiteral(literal, typ, loc))
+			UnaryExpr(op, arg, typ, loc):
+				rewritten_arg ?= tuple_return_expr_of_core(layout_types, scope, arg)
+				Some(TupleReturnUnary(op, rewritten_arg, typ, loc))
+			BinaryExpr(op, left, right, typ, loc):
+				rewritten_left ?= tuple_return_expr_of_core(layout_types, scope, left)
+				rewritten_right ?= tuple_return_expr_of_core(layout_types, scope, right)
+				Some(TupleReturnBinary(op, rewritten_left, rewritten_right, typ, loc))
+			IfExpr(cond, then_expr, else_expr, _, _):
+				rewritten_cond ?= tuple_return_expr_of_core(layout_types, scope, cond)
+				rewritten_then ?= tuple_return_expr_of_core(layout_types, scope, then_expr)
+				rewritten_else ?= tuple_return_expr_of_core(layout_types, scope, else_expr)
+				tuple_return_if(rewritten_cond, rewritten_then, rewritten_else)
+			_:
+				None
+
+
+private pure func tuple_return_elements_from_body(
+	layout_types: CoreLayoutTypeIndex,
+	scope: List[TupleReturnScopeBinding],
+	body: CoreExpr,
+) -> Option[List[TupleReturnExpr]]:
+	-- Keep nested payload checks explicit. The current constructor decision-tree
+	-- compiler can lose later payload tests when cases share an earlier literal.
+	maybe_elements: Option[List[CoreExpr]] = match body:
+		TupleExpr(tuple_elements, _, _):
+			Some(tuple_elements)
+		LetExpr(variable_name, False, _, rhs, next_body):
+			match rhs:
+				TupleExpr(tuple_elements, _, _):
+					match next_body:
+						VarExpr(result, _, _):
+							if core_var_equal(variable_name, result):
+								Some(tuple_elements)
+							else:
+								None
+						_:
+							None
+				_:
+					None
+		_:
+			None
+
+	match maybe_elements:
+		Some(elements):
+			var result: List[TupleReturnExpr] = []
+			var supported: Bool = True
+
+			for element in elements:
+				match tuple_return_expr_of_core(layout_types, scope, element):
+					Some(summary_expr):
+						result = result.append(summary_expr)
+					None:
+						supported = False
+						break
+
+			if supported:
+				Some(result)
+			else:
+				None
+		None:
+			None
+
+
+private pure func finish_tuple_return_summary(
+	layout_types: CoreLayoutTypeIndex,
+	params: List[CoreParam],
+	scope: List[TupleReturnScopeBinding],
+	locals: List[TupleReturnLocalBinding],
+	elements: List[CoreExpr],
+) -> Option[TupleReturnSummary]:
+	var summary_elements: List[TupleReturnExpr] = []
+	var supported: Bool = True
+
+	for element in elements:
+		match tuple_return_expr_of_core(layout_types, scope, element):
+			Some(summary_expr):
+				summary_elements = summary_elements.append(summary_expr)
+			None:
+				supported = False
+				break
+
+	if supported:
+		Some({
+			params = params,
+			locals = locals,
+			elements = summary_elements,
+		})
+	else:
+		None
+
+
+private pure func tuple_return_summary_from_body(
+	layout_types: CoreLayoutTypeIndex,
+	params: List[CoreParam],
+	scope: List[TupleReturnScopeBinding],
+	locals: List[TupleReturnLocalBinding],
+	body: CoreExpr,
+) -> Option[TupleReturnSummary]:
+	match body:
+		TupleExpr(elements, _, _):
+			finish_tuple_return_summary(layout_types, params, scope, locals, elements)
+		LetExpr(variable_name, False, typ, rhs, next_body):
+			bound_tuple: Option[List[CoreExpr]] = match rhs:
+				TupleExpr(elements, _, _):
+					match next_body:
+						VarExpr(result, _, _):
+							if core_var_equal(variable_name, result):
+								Some(elements)
+							else:
+								None
+						_:
+							None
+				_:
+					None
+
+			match bound_tuple:
+				Some(elements):
+					finish_tuple_return_summary(layout_types, params, scope, locals, elements)
+				None:
+					if core_type_is_known_unmanaged(layout_types, typ):
+						summary_rhs ?= tuple_return_expr_of_core(layout_types, scope, rhs)
+						tuple_return_summary_from_body(
+							layout_types,
+							params,
+							scope.append({
+								variable = variable_name,
+								reference = TupleReturnLocalReference(locals.length()),
+							}),
+							locals.append({
+								rhs = summary_rhs,
+								typ = typ,
+							}),
+							next_body,
+						)
+					else:
+						None
+		IfExpr(cond, then_body, else_body, _, _):
+			summary_cond ?= tuple_return_expr_of_core(layout_types, scope, cond)
+			then_elements ?= tuple_return_elements_from_body(layout_types, scope, then_body)
+			else_elements ?= tuple_return_elements_from_body(layout_types, scope, else_body)
+
+			if then_elements.length() != else_elements.length():
+				None
+			else:
+				cond_local_index: Int = locals.length()
+				cond_ref: TupleReturnExpr = TupleReturnLocal(
+					cond_local_index,
+					core_expr_type(cond),
+					tuple_return_expr_loc(summary_cond),
+				)
+				var elements: List[TupleReturnExpr] = []
+				var index: Int = 0
+				var supported: Bool = True
+
+				while index < then_elements.length():
+					match (then_elements.get(index), else_elements.get(index)):
+						(Some(then_element), Some(else_element)):
+							match tuple_return_if(cond_ref, then_element, else_element):
+								Some(element):
+									elements = elements.append(element)
+								None:
+									supported = False
+									break
+						_:
+							supported = False
+							break
+
+					index += 1
+
+				if supported:
+					Some({
+						params = params,
+						locals = locals.append({
+							rhs = summary_cond,
+							typ = core_expr_type(cond),
+						}),
+						elements = elements,
+					})
+				else:
+					None
+		_:
+			None
+
+
+private pure func tuple_return_summary_of_function(
+	layout_types: CoreLayoutTypeIndex,
+	function_info: CoreFunction,
+) -> Option[TupleReturnSummary]:
+	if (
+		not is_user_function_kind(function_info.function_kind)
+		or not function_info.type_params.is_empty()
+		or not function_info.params.all(pure func(parameter: CoreParam):
+			core_type_is_known_unmanaged(layout_types, parameter.typ)
+		)
+	):
+		None
+	else:
+		match (function_info.return_type, function_info.body):
+			(TupleType(return_types), Some(body)):
+				summary ?= tuple_return_summary_from_body(
+					layout_types,
+					function_info.params,
+					tuple_return_scope_of_params(function_info.params),
+					[],
+					body,
+				)
+
+				if summary.elements.length() == return_types.length():
+					Some(summary)
+				else:
+					None
+			_:
+				None
+
+
+private pure func build_tuple_return_summaries(
+	layout_types: CoreLayoutTypeIndex,
+	program: CoreProgram,
+) -> Dict[Int, TupleReturnSummary]:
+	var summaries: Dict[Int, TupleReturnSummary] = {}
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match tuple_return_summary_of_function(layout_types, function_info):
+					Some(summary):
+						summaries = summaries.set(function_info.def_id, summary)
+					None:
+						void
+			ImplDecl(implementation):
+				if implementation.type_params.is_empty():
+					for method in implementation.methods:
+						match tuple_return_summary_of_function(layout_types, method):
+							Some(summary):
+								summaries = summaries.set(method.def_id, summary)
+							None:
+								void
+			_:
+				void
+
+	summaries
+
+
+private pure func tuple_return_summary_for_call(
+	summaries: Dict[Int, TupleReturnSummary],
+	call_kind: CoreCallKind,
+) -> Option[TupleReturnSummary]:
+	match call_kind:
+		UserCall(_, Some(def_id), _):
+			summaries.get(def_id)
+		_:
+			None
+
+
+private pure func tuple_return_expr_to_core(
+	param_vars: List[CoreVar],
+	local_vars: List[CoreVar],
+	expr: TupleReturnExpr,
+) -> Option[CoreExpr]:
+	match expr:
+		TupleReturnParameter(index, typ, loc):
+			param_var ?= param_vars.get(index)
+			Some(VarExpr(param_var, typ, loc))
+		TupleReturnLocal(index, typ, loc):
+			local_var ?= local_vars.get(index)
+			Some(VarExpr(local_var, typ, loc))
+		TupleReturnLiteral(literal, typ, loc):
+			Some(LiteralExpr(literal, typ, loc))
+		TupleReturnUnary(op, arg, typ, loc):
+			rewritten_arg ?= tuple_return_expr_to_core(param_vars, local_vars, arg)
+			Some(UnaryExpr(op, rewritten_arg, typ, loc))
+		TupleReturnBinary(op, left, right, typ, loc):
+			rewritten_left ?= tuple_return_expr_to_core(param_vars, local_vars, left)
+			rewritten_right ?= tuple_return_expr_to_core(param_vars, local_vars, right)
+			Some(BinaryExpr(op, rewritten_left, rewritten_right, typ, loc))
+		TupleReturnIf(cond, then_expr, else_expr, typ, loc):
+			rewritten_cond ?= tuple_return_expr_to_core(param_vars, local_vars, cond)
+			rewritten_then ?= tuple_return_expr_to_core(param_vars, local_vars, then_expr)
+			rewritten_else ?= tuple_return_expr_to_core(param_vars, local_vars, else_expr)
+			Some(IfExpr(rewritten_cond, rewritten_then, rewritten_else, typ, loc))
+
+
+---
+A summarized call's elements: each argument bound once, in order, then the
+callee's scalar locals, then one expression per element over them.
+---
+private pure func expanded_tuple_return_call(
+	summary: TupleReturnSummary,
+	args: List[CoreExpr],
+	last_id: Int,
+) -> Option[TupleElementSource]:
+	if summary.params.length() != args.length():
+		None
+	else:
+		arg_binders: MintedBinders = mint_tuple_binders("argument", args.length(), last_id)
+		local_binders: MintedBinders = mint_tuple_binders(
+			"local",
+			summary.locals.length(),
+			arg_binders.last_id,
+		)
+		var prelude: List[TupleCoreBinding] = []
+		var supported: Bool = True
+		var index: Int = 0
+
+		while supported and index < summary.params.length():
+			match (summary.params.get(index), arg_binders.variables.get(index), args.get(index)):
+				(Some(parameter), Some(variable), Some(arg)):
+					prelude = prelude.append({
+						variable = variable,
+						typ = parameter.typ,
+						rhs = arg,
+					})
+				_:
+					supported = False
+
+			index += 1
+
+		index = 0
+
+		while supported and index < summary.locals.length():
+			match (summary.locals.get(index), local_binders.variables.get(index)):
+				(Some(local), Some(variable)):
+					match tuple_return_expr_to_core(
+						arg_binders.variables,
+						local_binders.variables,
+						local.rhs,
+					):
+						Some(rhs):
+							prelude = prelude.append({
+								variable = variable,
+								typ = local.typ,
+								rhs = rhs,
+							})
+						None:
+							supported = False
+				_:
+					supported = False
+
+			index += 1
+
+		var elements: List[CoreExpr] = []
+
+		for summary_element in summary.elements:
+			if supported:
+				match tuple_return_expr_to_core(
+					arg_binders.variables,
+					local_binders.variables,
+					summary_element,
+				):
+					Some(element):
+						elements = elements.append(element)
+					None:
+						supported = False
+
+		if supported:
+			Some({
+				prelude = prelude,
+				elements = elements,
+				last_id = local_binders.last_id,
+			})
+		else:
+			None
+
+
+private record TupleProducerTables {
+	layout_types: CoreLayoutTypeIndex,
+	summaries: Dict[Int, TupleReturnSummary]
+}
+
+
+---
+What the producers need from the whole program: which types are known to be
+unmanaged, and which callees' results expand at a call. Built once per
+program and read-only afterwards.
+---
+opaque type TupleElementProducers = TupleProducerTables
+
+
+pure func tuple_element_producers(program: CoreProgram) -> TupleElementProducers:
+	layout_types: CoreLayoutTypeIndex = build_layout_type_index(program)
+	into_opaque TupleElementProducers({
+		layout_types = layout_types,
+		summaries = build_tuple_return_summaries(layout_types, program)
+	})
+
+
+---
+The elements of `expr` when it builds a tuple in one of the shapes above, or
+`None`. Every expression in the result is as written; the caller rewrites
+each one when it binds it.
+---
+pure func produced_tuple_elements(
+	producers: TupleElementProducers,
+	expr: CoreExpr,
+	last_id: Int,
+) -> Option[TupleElementSource]:
+	tables: TupleProducerTables = from_opaque TupleElementProducers(producers)
+
+	match expr:
+		CallExpr(call_kind, _, args, _, _):
+			summary ?= tuple_return_summary_for_call(tables.summaries, call_kind)
+			expanded_tuple_return_call(summary, args, last_id)
+		IfExpr(cond, then_expr, else_expr, _, loc):
+			-- One payload column per pattern: the pinned bootstrap tests only the
+			-- first one (match lowering, fixed in 65341398d, not yet pinned).
+			match then_expr:
+				TupleExpr(then_elements, _, _):
+					match else_expr:
+						TupleExpr(else_elements, _, _):
+							if_tuple_elements(cond, then_elements, else_elements, loc, last_id)
+						_:
+							None
+				_:
+					None
+		SemanticMatchExpr(scrutinee, tree, _, loc):
+			match_tuple_elements(tables.layout_types, scrutinee, tree, loc, last_id)
+		_:
+			None

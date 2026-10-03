@@ -25,7 +25,7 @@ import:
 		CorePassControl,
 		CorePassDiagnostic(
 			CoreEarlyInvariantDiagnostic, CoreEarlyMonoDiagnostic, CoreEarlySynthDiagnostic,
-			CoreEarlyTraitResolveDiagnostic,
+			CoreEarlyTraitResolveDiagnostic, CoreEarlyTupleFlattenDiagnostic,
 		),
 		CorePassObservation,
 		CorePassRun(CorePassesCompleted, CorePassesFailed, CorePassesStopped),
@@ -45,7 +45,7 @@ import:
 	tailrec: lower_tailrec_program
 	tensor_fusion: fuse_tensor_update_program
 	trait_resolve: resolve_core_traits
-	tuple_sroa: rewrite_tuple_sroa_program
+	tuple_flatten: flatten_tuples_program
 
 
 enum CoreEarlyPipelineStage:
@@ -100,9 +100,10 @@ FUSE_PARALLEL_TENSOR_PASS: String = "fuse_parallel_tensor"
 
 FUSE_TENSOR_UPDATE_PASS: String = "fuse_tensor_update"
 
--- Generic templates are projected out between tensor fusion and tuple SROA, so
--- the user-visible `fusion` snapshot is the one taken after tuple SROA.
-TUPLE_SROA_PASS: String = "tuple_sroa"
+-- Generic templates are projected out between tensor fusion and tuple
+-- flattening, so the user-visible `fusion` snapshot is the one taken after
+-- tuple flattening.
+TUPLE_FLATTEN_PASS: String = "tuple_flatten"
 
 FUSION_STAGE: String = "fusion"
 
@@ -176,18 +177,18 @@ pure func core_early_pipeline_stage_name(stage: CoreEarlyPipelineStage) -> Strin
 
 ---
 User-visible stage names are aliases for the pass they end at. Only `fusion`
-differs from its pass, because it names the post-tuple-SROA program.
+differs from its pass, because it names the program after tuple flattening.
 ---
 pure func early_core_pass_name(stage: CoreEarlyPipelineStage) -> String:
 	match stage:
 		CoreEarlyFusionStage:
-			TUPLE_SROA_PASS
+			TUPLE_FLATTEN_PASS
 		_:
 			core_early_pipeline_stage_name(stage)
 
 
 pure func early_core_pass_stage_name(pass_name: String) -> String:
-	if pass_name == TUPLE_SROA_PASS:
+	if pass_name == TUPLE_FLATTEN_PASS:
 		FUSION_STAGE
 	else:
 		pass_name
@@ -259,7 +260,7 @@ touch it. `resolve`, `std_inline`, and `tailrec` construct none of the
 three forbidden shapes (verified by grepping each pass's module for a
 constructed `SelectedDirectCall(` or a `BinaryExpr(AddOp, ...)` with a
 string-typed left operand -- see the commit message), so this single check
-runs on every compile but only at `tuple_sroa`, the last pass of the early
+runs on every compile but only at `tuple_flatten`, the last pass of the early
 segment, instead of after each of the four passes that used to carry it.
 ---
 private pure func resolve_and_std_inline_invariant(
@@ -347,8 +348,16 @@ private pure func run_fuse_tensor_update_pass(program: CoreProgram) -> CoreProgr
 	fuse_tensor_update_program(program)
 
 
-private pure func run_tuple_sroa_pass(program: CoreProgram) -> CoreProgram:
-	rewrite_tuple_sroa_program(program)
+--- Tuple flattening mints the element locals it binds, so it reserves their
+--- binder ids rather than running as a plain program rewrite.
+private pure func run_tuple_flatten_pass(
+	state: CorePassState,
+) -> Result[CorePassState, CorePassDiagnostic]:
+	match flatten_tuples_program(state.program, state.next_binder_id):
+		Ok(flattened):
+			Ok(core_reserve_binder_ids({ state | program = flattened.program }, flattened.ids_used))
+		Err(failure):
+			Err(CoreEarlyTupleFlattenDiagnostic(failure))
 
 
 ---
@@ -454,12 +463,12 @@ pure func early_core_resolution_passes(
 
 
 ---
-Tuple SROA runs after the caller projects generic templates out, so it is its
-own list segment rather than a tail of the one above.
+Tuple flattening runs after the caller projects generic templates out, so it
+is its own list segment rather than a tail of the one above.
 ---
 pure func early_core_projection_passes() -> List[CorePass]:
 	[
-		{ core_program_pass(TUPLE_SROA_PASS, run_tuple_sroa_pass) |
+		{ core_pass(TUPLE_FLATTEN_PASS, run_tuple_flatten_pass) |
 			invariant = Some(resolve_and_std_inline_invariant)
 		},
 	]

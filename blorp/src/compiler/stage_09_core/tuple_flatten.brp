@@ -1,0 +1,1756 @@
+-- Tuple flattening (docs/VALUE_TUPLES_AND_STATE_HANDOFF.md, section 3,
+-- increment 1): a tuple that is only ever a local value is a group of
+-- independent values, never an object.
+--
+-- Two kinds of tuple become groups:
+--
+-- - a `match` subject built in place, `match (a, b):`. Each element is bound
+--   once, in order, and the decision tree runs on the elements: every test
+--   becomes a `match` of the element it reads, and every leaf binding moves to
+--   the innermost test of its own element, the case that proves it;
+-- - an immutable local bound to a built tuple and only taken apart: read by
+--   index, matched, or named again by another such local.
+--
+-- A local tuple used whole anywhere else (passed to a call, returned,
+-- stored, compared, captured whole by a closure) keeps its box. Until
+-- increment 2 flattens signatures, every such use takes a box, and building
+-- it once at the binding, as before, never costs more than building it at
+-- each use. So this pass adds no box: every box in its output is one its
+-- input built, at most on fewer paths, and the count of boxes rebuilt from
+-- another box's elements (section 3.1) is zero by construction.
+--
+-- A tuple that comes out of a box (a call result, a list element, a field, a
+-- payload, a parameter) is a source and keeps its box; its element reads
+-- stay projections of it.
+--
+-- Built tuples other than a literal come from `tuple_element_producers`: a
+-- small call it expands, and `if` or `match` arms that each build a tuple. A
+-- local built by arms in general needs a multi-value binding (section 3.3),
+-- which this increment does not add.
+--
+-- The pass relies on the binder identity contract (pass_runner.brp): a
+-- local's (name, id) pair is bound once in its function, so a use names one
+-- binder and the facts below are keyed by binder identity.
+import:
+	ir:
+		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
+		CoreConcurrentBinding,
+		CoreExpr(
+			BorrowLetExpr, ConcurrentExpr, ConcurrentlyLoopExpr, ForChannelExpr, ForDictExpr,
+			ForListExpr, ForRangeExpr, ForResourceSourceExpr, ForSetExpr, ForStreamExpr,
+			ForStringExpr, ForTensorExpr, LambdaExpr, LetExpr, ListHandoffExpr,
+			PreClosureConcurrentExpr, PreClosureConcurrentlyLoopExpr, ResourceScopeExpr,
+			SelectExpr, SemanticMatchExpr, TailrecListSpreadLoopExpr, TailrecLoopExpr,
+			TensorRawViewLetExpr, TupleExpr, TupleFieldExpr, VarExpr,
+		),
+		CoreFunction,
+		CoreParam,
+		CorePreClosureConcurrentBinding,
+		CoreProgram,
+		CoreSelectArmKind(SelectRecvArm),
+		CoreSemanticConstructorMatchCase,
+		CoreSemanticLengthMatchCase,
+		CoreSemanticLengthMatchGeq,
+		CoreSemanticLiteralMatchCase,
+		CoreSemanticMatchAccessor(
+			ListElementSemanticMatchAccessor, ListSpreadSemanticMatchAccessor,
+			RootSemanticMatchAccessor, TupleFieldSemanticMatchAccessor,
+			VariantFieldSemanticMatchAccessor,
+		),
+		CoreSemanticMatchBinding,
+		CoreSemanticMatchTree(
+			SemanticConstructorMatch, SemanticLengthMatch, SemanticLiteralMatch, SemanticMatchFail,
+			SemanticMatchLeaf,
+		),
+		CoreSourceLoc,
+		CoreType(TupleType),
+		CoreVar,
+		core_expr_type,
+		core_var_equal,
+	traverse:
+		CoreMapState,
+		immediate_core_expr_children,
+		map_core_expr_children_with_state,
+		same_core_expr,
+	tuple_element_producers:
+		TupleBinderMint,
+		TupleCoreBinding,
+		TupleElementProducers,
+		TupleElementSource,
+		mint_tuple_binder,
+		produced_tuple_elements,
+		tuple_element_producers,
+
+
+---
+Why flattening could not finish. Each is an internal error: a decision tree
+from match lowering, and the use analysis below, rule all of them out.
+---
+union TupleFlattenFault:
+	-- A test or binding reads the subject where no element is: the whole
+	-- tuple tested, or an element index the tuple lacks.
+	SubjectAccessorOutsideElements(CoreSemanticMatchAccessor)
+	-- A binding reads a payload or a list item of one element, and no test of
+	-- that element encloses it.
+	ElementBindingWithoutTest(CoreVar)
+	-- A decision tree that fails before testing anything.
+	SubjectTreeAlwaysFails
+	-- A flattened local is used whole, where the use analysis found no whole use.
+	FlattenedLocalUsedWhole(CoreVar)
+	-- A built tuple whose type has no element at an index it binds.
+	ElementTypeMissing(CoreType, Int)
+
+
+record TupleFlattenFailure {
+	function_name: String,
+	fault: TupleFlattenFault
+}
+
+
+pure func tuple_flatten_failure_message(failure: TupleFlattenFailure) -> String:
+	detail: String = match failure.fault:
+		SubjectAccessorOutsideElements(_):
+			"a match on a tuple subject tests or binds the tuple outside its elements"
+		ElementBindingWithoutTest(variable):
+			"match binding `${variable.name}` reads into one element of a tuple subject with no test of that element above it"
+		SubjectTreeAlwaysFails:
+			"a match on a tuple subject fails before testing anything"
+		FlattenedLocalUsedWhole(variable):
+			"flattened tuple local `${variable.name}` is used whole"
+		ElementTypeMissing(_, index):
+			"a built tuple's type has no element ${index}"
+
+	"tuple flattening in `${failure.function_name}`: ${detail}"
+
+
+record TupleFlattenedProgram {
+	program: CoreProgram,
+	-- How many binder ids the pass minted below its base, for
+	-- `core_reserve_binder_ids`.
+	ids_used: Int
+}
+
+
+---
+One element of a flattened tuple: the immutable local that holds it.
+---
+private record TupleElement {
+	variable: CoreVar,
+	typ: CoreType
+}
+
+
+---
+A tuple that is a group of values: its elements in element order. The tuple
+type is kept for the one whole use a group can still have, a whole-subject
+match binding used whole, which builds the box there.
+---
+private record ElementGroup {
+	elements: List[TupleElement],
+	tuple_type: CoreType
+}
+
+
+private record FlattenedLocal {
+	variable: CoreVar,
+	group: ElementGroup
+}
+
+
+---
+A match binding of one whole element, replaced by the element itself.
+---
+private record ElementAlias {
+	variable: CoreVar,
+	element: TupleElement
+}
+
+
+---
+Locals that name `source` again: an immutable alias, or a leaf binder that
+names a matched variable's whole value. Their whole uses are the source's.
+---
+private record TupleAliases {
+	aliases: List[CoreVar],
+	source: CoreVar
+}
+
+
+---
+What the pass needs to know about a function's binders, from its body as
+written:
+
+- which tuple variables are used whole: anywhere but as the base of an
+  element read, the subject of a `match`, or the value of an immutable alias,
+  with an alias's whole uses carried back to its source;
+- which binders are bound more than once. The binder identity contract makes
+  that an error, but a body that `std_inline` clones can still repeat one
+  (docs/NAME_ID_ROADMAP.md, B1). Such a binder is never flattened, renamed or
+  reused as an element, so a use can never resolve to the wrong binding.
+---
+private record LocalFacts {
+	used_whole: List[CoreVar],
+	rebound: List[CoreVar]
+}
+
+
+---
+Walked on demand, once per function: most functions have no tuple local or
+tuple subject, and never pay for the walk.
+---
+private union LocalFactsAnalysis:
+	LocalFactsNotWalked(List[CoreVar], CoreExpr)
+	LocalFactsWalked(LocalFacts)
+
+
+private record TupleFlattenState {
+	producers: TupleElementProducers,
+	local_facts: LocalFactsAnalysis,
+	-- The last binder id minted; ids count down.
+	last_id: Int,
+	-- Scoped: the locals that can change after they are bound, in scope here:
+	-- a `var`, and a tail-recursive loop's rebound parameters.
+	mutable_in_scope: List[CoreVar],
+	-- Scoped: a local's group is visible only in its binding's body.
+	flattened: List[FlattenedLocal],
+	-- Scoped: an alias is visible only in its leaf's body.
+	element_aliases: List[ElementAlias],
+	-- The first fault met; the pass fails with it once the walk ends.
+	fault: Option[TupleFlattenFault]
+}
+
+
+private pure func contains_var(variables: List[CoreVar], variable: CoreVar) -> Bool:
+	variables.any(pure func(candidate: CoreVar): core_var_equal(candidate, variable))
+
+
+private pure func is_tuple_type(typ: CoreType) -> Bool:
+	match typ:
+		TupleType(_):
+			True
+		_:
+			False
+
+
+---
+The binders `expr` itself introduces, for the binder count. A match's leaf
+bindings are counted once per match: one pattern variable can appear in
+several leaves of one decision tree.
+---
+private pure func introduced_binders(expr: CoreExpr) -> List[CoreVar]:
+	match expr:
+		LetExpr(variable, _, _, _, _):
+			[variable]
+		BorrowLetExpr(variable, _, _, _):
+			[variable]
+		LambdaExpr(params, _, _, _, _, _):
+			params.map(pure func(param: CoreParam): param.name)
+		TailrecLoopExpr(params, _, _, _):
+			params.map(pure func(param: CoreParam): param.name)
+		TailrecListSpreadLoopExpr(loop, _):
+			[loop.cursor, loop.list_param.name].concat(
+				loop.params.map(pure func(param: CoreParam): param.name),
+			)
+		ForRangeExpr(binder, _, _, _, _, _):
+			[binder.variable]
+		ForChannelExpr(loop, _, _):
+			[loop.binder.variable]
+		ForListExpr(loop, _, _):
+			[loop.binder.variable]
+		ForStringExpr(loop, _, _):
+			[loop.binder.variable]
+		ForDictExpr(loop, _, _):
+			[loop.binder.variable]
+		ForSetExpr(loop, _, _):
+			[loop.binder.variable]
+		ForStreamExpr(loop, _, _):
+			[loop.binder.variable]
+		ForResourceSourceExpr(loop, _, _):
+			[loop.binder.variable]
+		ForTensorExpr(loop, _, _):
+			[loop.binder.variable]
+		ResourceScopeExpr(scope, _, _):
+			[scope.variable]
+		ListHandoffExpr(handoff, _, _):
+			[handoff.source_var, handoff.result_var, handoff.len_var, handoff.out_var]
+		TensorRawViewLetExpr(binding, _, _, _):
+			[binding.variable]
+		ConcurrentExpr(block, _, _):
+			block.bindings.map(pure func(binding: CoreConcurrentBinding): binding.variable)
+		PreClosureConcurrentExpr(block, _, _):
+			block.bindings.map(pure func(binding: CorePreClosureConcurrentBinding): binding.variable)
+		ConcurrentlyLoopExpr(loop, _, _):
+			[loop.variable]
+		PreClosureConcurrentlyLoopExpr(loop, _, _):
+			[loop.variable]
+		SelectExpr(arms, _, _):
+			var binders: List[CoreVar] = []
+
+			for arm in arms:
+				match arm.kind:
+					SelectRecvArm(recv):
+						binders = binders.append(recv.binder)
+					_:
+						void
+
+			binders
+		SemanticMatchExpr(_, tree, _, _):
+			var binders: List[CoreVar] = []
+
+			for binding in tree_bindings(tree):
+				if not contains_var(binders, binding.variable):
+					binders = binders.append(binding.variable)
+
+			binders
+		_:
+			[]
+
+
+---
+The children of `expr` to walk, each once: a decision tree reaches a shared
+subtree, and its leaf bodies, from more than one branch.
+---
+private pure func distinct_children(expr: CoreExpr) -> List[CoreExpr]:
+	var children: List[CoreExpr] = []
+
+	for child in immediate_core_expr_children(expr):
+		if not children.any(pure func(seen: CoreExpr): same_core_expr(seen, child)):
+			children = children.append(child)
+
+	children
+
+
+---
+The function's local facts, by one walk with an explicit stack. Every table
+is a local of this walk, so it grows in place; threading the tables through a
+recursive walk would copy them at each binder.
+---
+private pure func local_facts(params: List[CoreVar], body: CoreExpr) -> LocalFacts:
+	var used_whole: List[CoreVar] = []
+	var aliases: List[TupleAliases] = []
+	-- Binders seen so far, kept by id and compared by full identity
+	-- `(name, id)`. The binders with no minted id yet (id 0) share one bucket.
+	var binders_by_id: Dict[Int, List[CoreVar]] = {}
+	var rebound: List[CoreVar] = []
+	var stack: List[CoreExpr] = [body]
+	var depth: Int = 1
+	var introduced: List[CoreVar] = params
+
+	while depth > 0 or not introduced.is_empty():
+		for variable in introduced:
+			if contains_var(binders_by_id.get_or(variable.id, []), variable):
+				if not contains_var(rebound, variable):
+					rebound = rebound.append(variable)
+			else:
+				binders_by_id = binders_by_id.set(
+					variable.id,
+					binders_by_id.get_or(variable.id, []).append(variable),
+				)
+
+		introduced = []
+
+		if depth > 0:
+			depth -= 1
+
+			match stack.get(depth):
+				Some(expr):
+					introduced = introduced_binders(expr)
+					var children: List[CoreExpr] = []
+
+					match expr:
+						VarExpr(variable, typ, _):
+							if is_tuple_type(typ) and not contains_var(used_whole, variable):
+								used_whole = used_whole.append(variable)
+						TupleFieldExpr(VarExpr(_, _, _), _, _, _):
+							void
+						SemanticMatchExpr(VarExpr(subject, _, _), tree, _, _):
+							-- A leaf binder that names the whole subject is the subject
+							-- again: its whole uses are the subject's, or a box would be
+							-- rebuilt in that leaf each time it runs. The scrutinee
+							-- comes first among the children; the rest are leaf bodies.
+							-- The subject is stored once: storing one match binding in
+							-- a loop over-releases it (a Perceus bug; see the
+							-- increment 1 results in benchmarks/results).
+							whole_binders: List[CoreVar] = tree_bindings(tree)
+								.filter(pure func(binding: CoreSemanticMatchBinding): is_root_accessor(binding.accessor))
+								.map(pure func(binding: CoreSemanticMatchBinding): binding.variable)
+							aliases = aliases.append({
+								aliases = whole_binders,
+								source = subject,
+							})
+
+							children = distinct_children(expr).drop(1)
+						LetExpr(variable, is_mutable, typ, rhs, body):
+							-- One payload column per pattern: the pinned bootstrap tests
+							-- only the first one (match lowering, fixed in 65341398d, not
+							-- yet pinned).
+							match rhs:
+								VarExpr(source, _, _):
+									if not is_mutable and is_tuple_type(typ):
+										aliases = aliases.append({
+											aliases = [variable],
+											source = source,
+										})
+										children = [body]
+									else:
+										children = distinct_children(expr)
+								_:
+									children = distinct_children(expr)
+						_:
+							children = distinct_children(expr)
+
+					for child in children:
+						stack = if depth < stack.length():
+							stack.set(depth, child)
+						else:
+							stack.append(child)
+						depth += 1
+				None:
+					depth = 0
+
+	-- A binder bound more than once keeps its box, which is a whole use: an
+	-- alias of a flattened local kept boxed this way needs its source boxed.
+	for variable in rebound:
+		if not contains_var(used_whole, variable):
+			used_whole = used_whole.append(variable)
+
+	var changed: Bool = True
+
+	while changed:
+		changed = False
+
+		for group in aliases:
+			if not contains_var(used_whole, group.source):
+				var alias_used_whole: Bool = False
+
+				for alias_variable in group.aliases:
+					if contains_var(used_whole, alias_variable):
+						alias_used_whole = True
+						break
+
+				if alias_used_whole:
+					used_whole = used_whole.append(group.source)
+					changed = True
+
+	{
+		used_whole = used_whole,
+		rebound = rebound
+	}
+
+
+private record LocalFactsAnswer {
+	state: TupleFlattenState,
+	facts: LocalFacts
+}
+
+
+private pure func local_facts_of(state: TupleFlattenState) -> LocalFactsAnswer:
+	match state.local_facts:
+		LocalFactsWalked(facts):
+			{
+				state = state,
+				facts = facts
+			}
+		LocalFactsNotWalked(params, body):
+			facts: LocalFacts = local_facts(params, body)
+			{
+				state = { state | local_facts = LocalFactsWalked(facts) },
+				facts = facts
+			}
+
+
+---
+Whether `variable` must keep its box: it is used whole, which includes being
+bound more than once.
+---
+private record KeepsBoxAnswer {
+	state: TupleFlattenState,
+	keeps_box: Bool
+}
+
+
+private pure func keeps_box(state: TupleFlattenState, variable: CoreVar) -> KeepsBoxAnswer:
+	answer: LocalFactsAnswer = local_facts_of(state)
+	{
+		state = answer.state,
+		keeps_box = contains_var(answer.facts.used_whole, variable)
+	}
+
+
+-- The innermost group in scope for `variable`.
+private pure func flattened_group(state: TupleFlattenState, variable: CoreVar) -> Option[ElementGroup]:
+	var found: Option[ElementGroup] = None
+
+	for local in state.flattened.reverse():
+		if core_var_equal(local.variable, variable):
+			found = Some(local.group)
+			break
+
+	found
+
+
+-- The innermost alias in scope for `variable`.
+private pure func element_alias(state: TupleFlattenState, variable: CoreVar) -> Option[TupleElement]:
+	var found: Option[TupleElement] = None
+
+	for candidate in state.element_aliases.reverse():
+		if core_var_equal(candidate.variable, variable):
+			found = Some(candidate.element)
+			break
+
+	found
+
+
+private pure func with_fault(state: TupleFlattenState, fault: TupleFlattenFault) -> TupleFlattenState:
+	match state.fault:
+		Some(_):
+			state
+		None:
+			{ state | fault = Some(fault) }
+
+
+private pure func element_ref(element: TupleElement, loc: CoreSourceLoc) -> CoreExpr:
+	VarExpr(element.variable, element.typ, loc)
+
+
+private pure func bind_all(bindings: List[TupleCoreBinding], body: CoreExpr) -> CoreExpr:
+	var result: CoreExpr = body
+
+	for binding in bindings.reverse():
+		result = LetExpr(binding.variable, False, binding.typ, binding.rhs, result)
+
+	result
+
+
+---
+Where a tuple about to be taken apart comes from.
+---
+private union TupleGroupSource:
+	-- A flattened local named again: the same elements.
+	ExistingGroup(ElementGroup)
+	-- A tuple built here, whose elements can be bound one by one.
+	BuiltElements(TupleElementSource)
+	-- Anything else, a source among them: it keeps its box.
+	NotBuiltHere
+
+
+private pure func group_source(state: TupleFlattenState, expr: CoreExpr) -> TupleGroupSource:
+	match expr:
+		VarExpr(variable, _, _):
+			match flattened_group(state, variable):
+				Some(group):
+					ExistingGroup(group)
+				None:
+					NotBuiltHere
+		TupleExpr(items, _, _):
+			BuiltElements({
+				prelude = [],
+				elements = items,
+				last_id = state.last_id,
+			})
+		_:
+			match produced_tuple_elements(state.producers, expr, state.last_id):
+				Some(source):
+					BuiltElements(source)
+				None:
+					NotBuiltHere
+
+
+---
+An element's type is the one its tuple type declares, which is the type match
+projection reads an accessor of the subject at.
+---
+private pure func tuple_element_type(tuple_type: CoreType, index: Int) -> Option[CoreType]:
+	match tuple_type:
+		TupleType(items):
+			items.get(index)
+		_:
+			None
+
+
+private record BoundGroup {
+	state: TupleFlattenState,
+	bindings: List[TupleCoreBinding],
+	group: ElementGroup
+}
+
+
+---
+An element that is already an immutable local is that local: binding a copy
+would retain a borrowed value only to release it again (section 3.6: a
+borrowed element stays borrowed). A local that can change after it is bound,
+a global, and a binder bound more than once keep the tuple's snapshot in a
+copy.
+---
+private record ReusableElement {
+	state: TupleFlattenState,
+	element: Option[TupleElement]
+}
+
+
+private pure func reusable_element(state: TupleFlattenState, expr: CoreExpr) -> ReusableElement:
+	match expr:
+		VarExpr(variable, typ, _):
+			if variable.def_id.is_some() or contains_var(state.mutable_in_scope, variable):
+				{
+					state = state,
+					element = None
+				}
+			else:
+				answer: LocalFactsAnswer = local_facts_of(state)
+				reusable: Option[TupleElement] = if contains_var(answer.facts.rebound, variable):
+					None
+				else:
+					Some({
+						variable = variable,
+						typ = typ
+					})
+				{
+					state = answer.state,
+					element = reusable
+				}
+		_:
+			{
+				state = state,
+				element = None
+			}
+
+
+---
+Binds a built tuple's prelude and then each element to a fresh local, in
+order, rewriting each expression as it is bound: the elements are evaluated
+exactly once, left to right, as the tuple's were. An element that is an
+immutable local needs no binding.
+---
+private pure func bind_elements(
+	state: TupleFlattenState,
+	label: String,
+	source: TupleElementSource,
+	tuple_type: CoreType,
+) -> BoundGroup:
+	var current: TupleFlattenState = { state | last_id = source.last_id }
+	var bindings: List[TupleCoreBinding] = []
+
+	for binding in source.prelude:
+		rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(current, binding.rhs)
+		current = rewritten.state
+		bindings = bindings.append({ binding | rhs = rewritten.value })
+
+	var elements: List[TupleElement] = []
+	var index: Int = 0
+
+	for element_expr in source.elements:
+		rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(current, element_expr)
+		reused: ReusableElement = reusable_element(rewritten.state, rewritten.value)
+
+		match reused.element:
+			Some(existing):
+				current = reused.state
+				elements = elements.append(existing)
+			None:
+				minted: TupleBinderMint = mint_tuple_binder(
+					"${label}_${index}",
+					reused.state.last_id,
+				)
+				-- A missing element type is a fault: the bound local keeps the
+				-- expression's type only so the walk can finish before failing.
+				typed_state: TupleFlattenState = match tuple_element_type(tuple_type, index):
+					Some(_):
+						reused.state
+					None:
+						with_fault(reused.state, ElementTypeMissing(tuple_type, index))
+				element: TupleElement = {
+					variable = minted.variable,
+					typ = tuple_element_type(tuple_type, index).get_or(core_expr_type(element_expr))
+				}
+				current = { typed_state | last_id = minted.last_id }
+				bindings = bindings.append({
+					variable = element.variable,
+					typ = element.typ,
+					rhs = rewritten.value,
+				})
+				elements = elements.append(element)
+
+		index += 1
+
+	{
+		state = current,
+		bindings = bindings,
+		group = {
+			elements = elements,
+			tuple_type = tuple_type
+		}
+	}
+
+
+private pure func flatten_children(
+	state: TupleFlattenState,
+	expr: CoreExpr,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	map_core_expr_children_with_state(state, flatten_expr, expr)
+
+
+---
+Rewrites `expr`'s children with `variables` known to change after they are
+bound, then forgets them: they are in scope only below `expr`.
+---
+private pure func flatten_with_mutable(
+	state: TupleFlattenState,
+	variables: List[CoreVar],
+	expr: CoreExpr,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_children(
+		{ state | mutable_in_scope = state.mutable_in_scope.concat(variables) },
+		expr,
+	)
+	{
+		state = { rewritten.state | mutable_in_scope = state.mutable_in_scope },
+		value = rewritten.value
+	}
+
+
+---
+Rewrites `body` with `local` flattened, then forgets it: the group is visible
+only in its binding's body.
+---
+private pure func flatten_in_scope_of(
+	state: TupleFlattenState,
+	local: FlattenedLocal,
+	body: CoreExpr,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(
+		{ state | flattened = state.flattened.append(local) },
+		body,
+	)
+	{
+		state = { rewritten.state | flattened = state.flattened },
+		value = rewritten.value
+	}
+
+
+private pure func flatten_tuple_let(
+	state: TupleFlattenState,
+	expr: CoreExpr,
+	variable: CoreVar,
+	rhs: CoreExpr,
+	body: CoreExpr,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	answer: KeepsBoxAnswer = keeps_box(state, variable)
+
+	if answer.keeps_box:
+		flatten_children(answer.state, expr)
+	else:
+		match group_source(answer.state, rhs):
+			ExistingGroup(group):
+				flatten_in_scope_of(
+					answer.state,
+					{
+						variable = variable,
+						group = group
+					},
+					body,
+				)
+			BuiltElements(source):
+				bound: BoundGroup = bind_elements(answer.state, variable.name, source, core_expr_type(rhs))
+				rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_in_scope_of(
+					bound.state,
+					{
+						variable = variable,
+						group = bound.group
+					},
+					body,
+				)
+				{
+					state = rewritten.state,
+					value = bind_all(bound.bindings, rewritten.value)
+				}
+			NotBuiltHere:
+				flatten_children(answer.state, expr)
+
+
+private pure func flatten_element_read(
+	state: TupleFlattenState,
+	expr: CoreExpr,
+	base: CoreExpr,
+	index: Int,
+	loc: CoreSourceLoc,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	match group_source(state, base):
+		ExistingGroup(group):
+			match group.elements.get(index):
+				Some(element):
+					{
+						state = state,
+						value = element_ref(element, loc)
+					}
+				None:
+					{
+						state = with_fault(
+							state,
+							SubjectAccessorOutsideElements(
+								TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, index),
+							),
+						),
+						value = expr
+					}
+		BuiltElements(source):
+			bound: BoundGroup = bind_elements(state, "element", source, core_expr_type(base))
+
+			match bound.group.elements.get(index):
+				Some(element):
+					{
+						state = bound.state,
+						value = bind_all(bound.bindings, element_ref(element, loc))
+					}
+				None:
+					{
+						state = with_fault(
+							bound.state,
+							SubjectAccessorOutsideElements(
+								TupleFieldSemanticMatchAccessor(RootSemanticMatchAccessor, index),
+							),
+						),
+						value = expr
+					}
+		NotBuiltHere:
+			flatten_children(state, expr)
+
+
+private pure func flatten_match(
+	state: TupleFlattenState,
+	expr: CoreExpr,
+	scrutinee: CoreExpr,
+	tree: CoreSemanticMatchTree,
+	typ: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	match group_source(state, scrutinee):
+		ExistingGroup(group):
+			split_subject_match(state, expr, group, tree, typ, loc)
+		BuiltElements(source):
+			bound: BoundGroup = bind_elements(state, "match", source, core_expr_type(scrutinee))
+			split: CoreMapState[TupleFlattenState, CoreExpr] = split_subject_match(
+				bound.state,
+				expr,
+				bound.group,
+				tree,
+				typ,
+				loc,
+			)
+			{
+				state = split.state,
+				value = bind_all(bound.bindings, split.value)
+			}
+		NotBuiltHere:
+			flatten_children(state, expr)
+
+
+private pure func flatten_variable(
+	state: TupleFlattenState,
+	expr: CoreExpr,
+	variable: CoreVar,
+	loc: CoreSourceLoc,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	match element_alias(state, variable):
+		Some(element):
+			{
+				state = state,
+				value = element_ref(element, loc)
+			}
+		None:
+			match flattened_group(state, variable):
+				Some(_):
+					{
+						state = with_fault(state, FlattenedLocalUsedWhole(variable)),
+						value = expr
+					}
+				None:
+					{
+						state = state,
+						value = expr
+					}
+
+
+private pure func flatten_expr(
+	state: TupleFlattenState,
+	expr: CoreExpr,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	match expr:
+		LetExpr(variable, is_mutable, typ, rhs, body):
+			if is_mutable:
+				flatten_with_mutable(state, [variable], expr)
+			else if is_tuple_type(typ):
+				flatten_tuple_let(state, expr, variable, rhs, body)
+			else:
+				flatten_children(state, expr)
+		TailrecLoopExpr(params, _, _, _):
+			flatten_with_mutable(state, params.map(pure func(param: CoreParam): param.name), expr)
+		TailrecListSpreadLoopExpr(loop, _):
+			rebound: List[CoreVar] = [loop.cursor, loop.list_param.name].concat(
+				loop.params.map(pure func(param: CoreParam): param.name),
+			)
+			flatten_with_mutable(state, rebound, expr)
+		TupleFieldExpr(base, index, _, loc):
+			flatten_element_read(state, expr, base, index, loc)
+		SemanticMatchExpr(scrutinee, tree, typ, loc):
+			flatten_match(state, expr, scrutinee, tree, typ, loc)
+		VarExpr(variable, _, loc):
+			flatten_variable(state, expr, variable, loc)
+		_:
+			flatten_children(state, expr)
+
+
+-- Splitting a match on a group of elements --------------------------------
+
+
+---
+Where a decision-tree accessor reads, once the subject is a group: inside one
+element, with the accessor rerooted at that element, or the whole group.
+---
+private union GroupAccess:
+	ElementAccess(TupleElement, CoreSemanticMatchAccessor)
+	WholeGroupAccess
+
+
+private pure func group_access(
+	group: ElementGroup,
+	accessor: CoreSemanticMatchAccessor,
+) -> Option[GroupAccess]:
+	match accessor:
+		RootSemanticMatchAccessor:
+			Some(WholeGroupAccess)
+		TupleFieldSemanticMatchAccessor(parent, index):
+			match group_access(group, parent):
+				Some(WholeGroupAccess):
+					group.elements
+						.get(index)
+						.map(pure func(element: TupleElement):
+							ElementAccess(element, RootSemanticMatchAccessor)
+						)
+				Some(ElementAccess(element, path)):
+					Some(ElementAccess(element, TupleFieldSemanticMatchAccessor(path, index)))
+				None:
+					None
+		VariantFieldSemanticMatchAccessor(parent, constructor, field_index):
+			match group_access(group, parent):
+				Some(ElementAccess(element, path)):
+					Some(
+						ElementAccess(
+							element,
+							VariantFieldSemanticMatchAccessor(path, constructor, field_index),
+						),
+					)
+				_:
+					None
+		ListElementSemanticMatchAccessor(parent, index):
+			match group_access(group, parent):
+				Some(ElementAccess(element, path)):
+					Some(ElementAccess(element, ListElementSemanticMatchAccessor(path, index)))
+				_:
+					None
+		ListSpreadSemanticMatchAccessor(parent, offset):
+			match group_access(group, parent):
+				Some(ElementAccess(element, path)):
+					Some(ElementAccess(element, ListSpreadSemanticMatchAccessor(path, offset)))
+				_:
+					None
+
+
+---
+Whether reading `path` relies on a test: a variant payload needs its
+constructor tested, a list item its length. A path of tuple fields alone
+reads a value that is always there.
+---
+private pure func is_root_accessor(accessor: CoreSemanticMatchAccessor) -> Bool:
+	match accessor:
+		RootSemanticMatchAccessor:
+			True
+		_:
+			False
+
+
+private pure func path_relies_on_test(path: CoreSemanticMatchAccessor) -> Bool:
+	match path:
+		RootSemanticMatchAccessor:
+			False
+		TupleFieldSemanticMatchAccessor(parent, _):
+			path_relies_on_test(parent)
+		VariantFieldSemanticMatchAccessor(_, _, _) | ListElementSemanticMatchAccessor(_, _) | ListSpreadSemanticMatchAccessor(_, _):
+			True
+
+
+---
+A leaf binding that reads into one element and relies on a test of it: it
+waits until the walk back up reaches the innermost test of that element on
+its path, and is bound in that test's case, as the whole tuple's leaf binding
+was bound below the same test.
+---
+private record PendingBinding {
+	element: TupleElement,
+	binding: CoreSemanticMatchBinding
+}
+
+
+---
+A converted subtree, before it is placed under its parent.
+---
+private union ConvertedNode:
+	-- A test of one element; the tree's accessors are rooted at that element.
+	ConvertedTest(TupleElement, CoreSemanticMatchTree)
+	-- A leaf's body, with the bindings it can bind itself already bound.
+	ConvertedBody(CoreExpr)
+	ConvertedFail
+
+
+private record ConvertedTree {
+	state: TupleFlattenState,
+	node: ConvertedNode,
+	pending: List[PendingBinding]
+}
+
+
+private record SplitContext {
+	group: ElementGroup,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+	-- Binders that read into one element at different paths in different
+	-- leaves (alternatives of one or-pattern); see `binders_at_several_paths`.
+	bound_at_leaves: List[CoreVar]
+}
+
+
+private pure func same_accessor(left: CoreSemanticMatchAccessor, right: CoreSemanticMatchAccessor) -> Bool:
+	-- One payload column per pattern: the pinned bootstrap tests only the
+	-- first one (match lowering, fixed in 65341398d, not yet pinned).
+	match left:
+		RootSemanticMatchAccessor:
+			is_root_accessor(right)
+		TupleFieldSemanticMatchAccessor(left_parent, left_index):
+			match right:
+				TupleFieldSemanticMatchAccessor(right_parent, right_index):
+					left_index == right_index and same_accessor(left_parent, right_parent)
+				_:
+					False
+		VariantFieldSemanticMatchAccessor(left_parent, left_constructor, left_index):
+			match right:
+				VariantFieldSemanticMatchAccessor(right_parent, right_constructor, right_index):
+					(
+						left_index == right_index
+						and left_constructor == right_constructor
+						and same_accessor(left_parent, right_parent)
+					)
+				_:
+					False
+		ListElementSemanticMatchAccessor(left_parent, left_index):
+			match right:
+				ListElementSemanticMatchAccessor(right_parent, right_index):
+					left_index == right_index and same_accessor(left_parent, right_parent)
+				_:
+					False
+		ListSpreadSemanticMatchAccessor(left_parent, left_offset):
+			match right:
+				ListSpreadSemanticMatchAccessor(right_parent, right_offset):
+					left_offset == right_offset and same_accessor(left_parent, right_parent)
+				_:
+					False
+
+
+private pure func tree_bindings(tree: CoreSemanticMatchTree) -> List[CoreSemanticMatchBinding]:
+	match tree:
+		SemanticMatchLeaf(bindings, _):
+			bindings
+		SemanticMatchFail:
+			[]
+		SemanticConstructorMatch(_, cases, fallback):
+			var bindings: List[CoreSemanticMatchBinding] = []
+
+			for match_case in cases:
+				bindings = bindings.concat(tree_bindings(match_case.body))
+
+			match fallback:
+				Some(fallback_tree):
+					bindings.concat(tree_bindings(fallback_tree))
+				None:
+					bindings
+		SemanticLiteralMatch(_, cases, fallback):
+			var bindings: List[CoreSemanticMatchBinding] = []
+
+			for match_case in cases:
+				bindings = bindings.concat(tree_bindings(match_case.body))
+
+			bindings.concat(tree_bindings(fallback))
+		SemanticLengthMatch(_, cases, geq, fallback):
+			var bindings: List[CoreSemanticMatchBinding] = []
+
+			for match_case in cases:
+				bindings = bindings.concat(tree_bindings(match_case.body))
+
+			match geq:
+				Some(geq_case):
+					bindings = bindings.concat(tree_bindings(geq_case.body))
+				None:
+					void
+
+			match fallback:
+				Some(fallback_tree):
+					bindings.concat(tree_bindings(fallback_tree))
+				None:
+					bindings
+
+
+---
+A decision tree may bind one binder in several leaves: a row repeated under
+several tests reads the same place in each, and the copies are one binding at
+their common test. The alternatives of one or-pattern can instead bind one
+binder at different places; those cannot share a test's case, so they are
+bound at their own leaves, by a match of their element with no test, as the
+tuple's leaves bound them.
+---
+private pure func binders_at_several_paths(tree: CoreSemanticMatchTree) -> List[CoreVar]:
+	var seen: List[CoreSemanticMatchBinding] = []
+	var several: List[CoreVar] = []
+
+	for binding in tree_bindings(tree):
+		for earlier in seen:
+			if (
+				core_var_equal(earlier.variable, binding.variable)
+				and not same_accessor(earlier.accessor, binding.accessor)
+				and not contains_var(several, binding.variable)
+			):
+				several = several.append(binding.variable)
+
+		seen = seen.append(binding)
+
+	several
+
+
+private pure func same_element(left: TupleElement, right: TupleElement) -> Bool:
+	core_var_equal(left.variable, right.variable)
+
+
+private record PlacedChild {
+	tree: CoreSemanticMatchTree,
+	pending: List[PendingBinding]
+}
+
+
+---
+Places a converted child under a test of `parent`: the child's pending
+bindings on `parent` are bound in this case, and a test of another element
+becomes a `match` of that element. Returns the case body and the bindings
+still waiting for a test further up.
+---
+private pure func place_under(
+	context: SplitContext,
+	parent: TupleElement,
+	child: ConvertedTree,
+) -> PlacedChild:
+	var here: List[CoreSemanticMatchBinding] = []
+	var rest: List[PendingBinding] = []
+
+	for pending in child.pending:
+		if same_element(pending.element, parent):
+			-- A row repeated below this test binds the same place again.
+			if not here.any(pure func(placed: CoreSemanticMatchBinding):
+				core_var_equal(placed.variable, pending.binding.variable)
+			):
+				here = here.append(pending.binding)
+		else:
+			rest = rest.append(pending)
+
+	tree: CoreSemanticMatchTree = match child.node:
+		ConvertedTest(element, test_tree):
+			if same_element(element, parent) and here.is_empty():
+				test_tree
+			else:
+				SemanticMatchLeaf(
+					here,
+					SemanticMatchExpr(
+						element_ref(element, context.loc),
+						test_tree,
+						context.result_type,
+						context.loc,
+					),
+				)
+		ConvertedBody(body):
+			SemanticMatchLeaf(here, body)
+		ConvertedFail:
+			SemanticMatchFail
+
+	{
+		tree = tree,
+		pending = rest
+	}
+
+
+private record LeafBindingPlan {
+	state: TupleFlattenState,
+	aliases: List[ElementAlias],
+	flattened: List[FlattenedLocal],
+	-- Lets bound at the leaf: a whole subject used whole, boxed here, and a
+	-- whole-element binder bound more than once.
+	leaf_lets: List[TupleCoreBinding],
+	leaf_bound: List[PendingBinding],
+	pending: List[PendingBinding]
+}
+
+
+---
+Sorts a leaf's bindings: a whole element is an alias of it; a whole subject
+is the group itself, or a box built here when it is used whole; a read into
+one element that relies on a test waits for that test; any other read into
+one element is bound at the leaf (`bind_at_leaf`).
+---
+private pure func plan_leaf_bindings(
+	state: TupleFlattenState,
+	context: SplitContext,
+	bindings: List[CoreSemanticMatchBinding],
+) -> LeafBindingPlan:
+	var plan: LeafBindingPlan = {
+		state = state,
+		aliases = [],
+		flattened = [],
+		leaf_lets = [],
+		leaf_bound = [],
+		pending = []
+	}
+
+	for binding in bindings:
+		plan = match group_access(context.group, binding.accessor):
+			Some(access):
+				match access:
+					ElementAccess(element, path):
+						plan_element_binding(plan, context, element, binding, path)
+					WholeGroupAccess:
+						plan_whole_subject_binding(plan, context, binding)
+			None:
+				{ plan |
+					state = with_fault(
+						plan.state,
+						SubjectAccessorOutsideElements(binding.accessor),
+					)
+				}
+
+	plan
+
+
+private pure func plan_element_binding(
+	plan: LeafBindingPlan,
+	context: SplitContext,
+	element: TupleElement,
+	binding: CoreSemanticMatchBinding,
+	path: CoreSemanticMatchAccessor,
+) -> LeafBindingPlan:
+	match path:
+		RootSemanticMatchAccessor:
+			-- A binder bound more than once keeps a real binding, scoped to
+			-- this leaf, instead of being renamed everywhere it is named.
+			answer: LocalFactsAnswer = local_facts_of(plan.state)
+
+			if contains_var(answer.facts.rebound, binding.variable):
+				{ plan |
+					state = answer.state,
+					leaf_lets = plan.leaf_lets.append({
+						variable = binding.variable,
+						typ = element.typ,
+						rhs = element_ref(element, context.loc),
+					})
+				}
+			else:
+				{ plan |
+					state = answer.state,
+					aliases = plan.aliases.append({
+						variable = binding.variable,
+						element = element,
+					})
+				}
+		_:
+			rooted: PendingBinding = {
+				element = element,
+				binding = { binding | accessor = path }
+			}
+
+			if path_relies_on_test(path) and not contains_var(context.bound_at_leaves, binding.variable):
+				{ plan | pending = plan.pending.append(rooted) }
+			else:
+				{ plan | leaf_bound = plan.leaf_bound.append(rooted) }
+
+
+private pure func plan_whole_subject_binding(
+	plan: LeafBindingPlan,
+	context: SplitContext,
+	binding: CoreSemanticMatchBinding,
+) -> LeafBindingPlan:
+	answer: KeepsBoxAnswer = keeps_box(plan.state, binding.variable)
+
+	if answer.keeps_box:
+		boxed_subject: CoreExpr = TupleExpr(
+			context.group.elements.map(pure func(element: TupleElement):
+				element_ref(element, context.loc)
+			),
+			context.group.tuple_type,
+			context.loc,
+		)
+		{ plan |
+			state = answer.state,
+			leaf_lets = plan.leaf_lets.append({
+				variable = binding.variable,
+				typ = context.group.tuple_type,
+				rhs = boxed_subject,
+			})
+		}
+	else:
+		{ plan |
+			state = answer.state,
+			flattened = plan.flattened.append({
+				variable = binding.variable,
+				group = context.group,
+			})
+		}
+
+
+---
+Binds at the leaf, by a match of the element with no test, as a whole tuple's
+leaf bound them: a read of a boxed element's tuple field, which needs no test,
+and a binder an or-pattern binds at several places (`binders_at_several_paths`),
+whose test encloses the leaf.
+---
+private pure func bind_at_leaf(
+	context: SplitContext,
+	leaf_bound: List[PendingBinding],
+	body: CoreExpr,
+) -> CoreExpr:
+	var result: CoreExpr = body
+
+	for bound in leaf_bound.reverse():
+		result = SemanticMatchExpr(
+			element_ref(bound.element, context.loc),
+			SemanticMatchLeaf([bound.binding], result),
+			context.result_type,
+			context.loc,
+		)
+
+	result
+
+
+private pure func convert_leaf(
+	state: TupleFlattenState,
+	context: SplitContext,
+	bindings: List[CoreSemanticMatchBinding],
+	body: CoreExpr,
+) -> ConvertedTree:
+	plan: LeafBindingPlan = plan_leaf_bindings(state, context, bindings)
+	scoped: TupleFlattenState = { plan.state |
+		flattened = plan.state.flattened.concat(plan.flattened),
+		element_aliases = plan.state.element_aliases.concat(plan.aliases)
+	}
+	rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(scoped, body)
+	{
+		state = { rewritten.state |
+			flattened = plan.state.flattened,
+			element_aliases = plan.state.element_aliases
+		},
+		node = ConvertedBody(
+			bind_all(plan.leaf_lets, bind_at_leaf(context, plan.leaf_bound, rewritten.value)),
+		),
+		pending = plan.pending
+	}
+
+
+private pure func convert_and_place(
+	state: TupleFlattenState,
+	context: SplitContext,
+	parent: TupleElement,
+	subtree: CoreSemanticMatchTree,
+) -> PlacedSubtree:
+	converted: ConvertedTree = convert_tree(state, context, subtree)
+	placed: PlacedChild = place_under(context, parent, converted)
+	{
+		state = converted.state,
+		tree = placed.tree,
+		pending = placed.pending
+	}
+
+
+private record PlacedSubtree {
+	state: TupleFlattenState,
+	tree: CoreSemanticMatchTree,
+	pending: List[PendingBinding]
+}
+
+
+---
+The cases of one test, each converted and placed under the tested element, in
+order. Each case is rebuilt from itself with its new body, so none can be lost
+or mismatched.
+---
+private record PlacedCases[C] {
+	state: TupleFlattenState,
+	cases: List[C],
+	pending: List[PendingBinding]
+}
+
+
+private pure func place_cases[C](
+	state: TupleFlattenState,
+	context: SplitContext,
+	parent: TupleElement,
+	cases: List[C],
+	body_of: pure (C) -> CoreSemanticMatchTree,
+	with_body: pure (C, CoreSemanticMatchTree) -> C,
+) -> PlacedCases[C]:
+	var current: TupleFlattenState = state
+	var placed_cases: List[C] = []
+	var pending: List[PendingBinding] = []
+
+	for match_case in cases:
+		placed: PlacedSubtree = convert_and_place(current, context, parent, body_of(match_case))
+		current = placed.state
+		placed_cases = placed_cases.append(with_body(match_case, placed.tree))
+		pending = pending.concat(placed.pending)
+
+	{
+		state = current,
+		cases = placed_cases,
+		pending = pending
+	}
+
+
+private record PlacedOptional {
+	state: TupleFlattenState,
+	tree: Option[CoreSemanticMatchTree],
+	pending: List[PendingBinding]
+}
+
+
+private pure func place_optional(
+	state: TupleFlattenState,
+	context: SplitContext,
+	parent: TupleElement,
+	subtree: Option[CoreSemanticMatchTree],
+) -> PlacedOptional:
+	match subtree:
+		Some(tree):
+			placed: PlacedSubtree = convert_and_place(state, context, parent, tree)
+			{
+				state = placed.state,
+				tree = Some(placed.tree),
+				pending = placed.pending
+			}
+		None:
+			{
+				state = state,
+				tree = None,
+				pending = []
+			}
+
+
+private pure func outside_elements(
+	state: TupleFlattenState,
+	accessor: CoreSemanticMatchAccessor,
+) -> ConvertedTree:
+	{
+		state = with_fault(state, SubjectAccessorOutsideElements(accessor)),
+		node = ConvertedFail,
+		pending = []
+	}
+
+
+private pure func convert_tree(
+	state: TupleFlattenState,
+	context: SplitContext,
+	tree: CoreSemanticMatchTree,
+) -> ConvertedTree:
+	match tree:
+		SemanticMatchLeaf(bindings, body):
+			convert_leaf(state, context, bindings, body)
+		SemanticMatchFail:
+			{
+				state = state,
+				node = ConvertedFail,
+				pending = []
+			}
+		SemanticConstructorMatch(accessor, cases, fallback):
+			match group_access(context.group, accessor):
+				Some(ElementAccess(element, path)):
+					placed: PlacedCases[CoreSemanticConstructorMatchCase] = place_cases(
+						state,
+						context,
+						element,
+						cases,
+						pure func(match_case: CoreSemanticConstructorMatchCase): match_case.body,
+						pure func(match_case: CoreSemanticConstructorMatchCase, body: CoreSemanticMatchTree): { match_case | body = body },
+					)
+					placed_fallback: PlacedOptional = place_optional(placed.state, context, element, fallback)
+					{
+						state = placed_fallback.state,
+						node = ConvertedTest(
+							element,
+							SemanticConstructorMatch(path, placed.cases, placed_fallback.tree),
+						),
+						pending = placed.pending.concat(placed_fallback.pending)
+					}
+				_:
+					outside_elements(state, accessor)
+		SemanticLiteralMatch(accessor, cases, fallback):
+			match group_access(context.group, accessor):
+				Some(ElementAccess(element, path)):
+					placed: PlacedCases[CoreSemanticLiteralMatchCase] = place_cases(
+						state,
+						context,
+						element,
+						cases,
+						pure func(match_case: CoreSemanticLiteralMatchCase): match_case.body,
+						pure func(match_case: CoreSemanticLiteralMatchCase, body: CoreSemanticMatchTree): { match_case | body = body },
+					)
+					placed_fallback: PlacedSubtree = convert_and_place(placed.state, context, element, fallback)
+					{
+						state = placed_fallback.state,
+						node = ConvertedTest(
+							element,
+							SemanticLiteralMatch(path, placed.cases, placed_fallback.tree),
+						),
+						pending = placed.pending.concat(placed_fallback.pending)
+					}
+				_:
+					outside_elements(state, accessor)
+		SemanticLengthMatch(accessor, cases, geq, fallback):
+			match group_access(context.group, accessor):
+				Some(ElementAccess(element, path)):
+					placed: PlacedCases[CoreSemanticLengthMatchCase] = place_cases(
+						state,
+						context,
+						element,
+						cases,
+						pure func(match_case: CoreSemanticLengthMatchCase): match_case.body,
+						pure func(match_case: CoreSemanticLengthMatchCase, body: CoreSemanticMatchTree): { match_case | body = body },
+					)
+					-- At most one: an optional `>=` case is a list of none or one.
+					placed_geq: PlacedCases[CoreSemanticLengthMatchGeq] = place_cases(
+						placed.state,
+						context,
+						element,
+						geq.map(pure func(geq_case: CoreSemanticLengthMatchGeq): [geq_case]).get_or([]),
+						pure func(geq_case: CoreSemanticLengthMatchGeq): geq_case.body,
+						pure func(geq_case: CoreSemanticLengthMatchGeq, body: CoreSemanticMatchTree): { geq_case | body = body },
+					)
+					placed_fallback: PlacedOptional = place_optional(placed_geq.state, context, element, fallback)
+					{
+						state = placed_fallback.state,
+						node = ConvertedTest(
+							element,
+							SemanticLengthMatch(path, placed.cases, placed_geq.cases.get(0), placed_fallback.tree),
+						),
+						pending = placed.pending.concat(placed_geq.pending).concat(placed_fallback.pending)
+					}
+				_:
+					outside_elements(state, accessor)
+
+
+---
+A `match` whose subject is a group, as matches of its elements. Every leaf
+binding that relies on a test is bound below the innermost test of its
+element, so none may still be waiting at the top.
+---
+private pure func split_subject_match(
+	state: TupleFlattenState,
+	expr: CoreExpr,
+	group: ElementGroup,
+	tree: CoreSemanticMatchTree,
+	result_type: CoreType,
+	loc: CoreSourceLoc,
+) -> CoreMapState[TupleFlattenState, CoreExpr]:
+	context: SplitContext = {
+		group = group,
+		result_type = result_type,
+		loc = loc,
+		bound_at_leaves = binders_at_several_paths(tree)
+	}
+	converted: ConvertedTree = convert_tree(state, context, tree)
+
+	match converted.pending.get(0):
+		Some(unplaced):
+			{
+				state = with_fault(
+					converted.state,
+					ElementBindingWithoutTest(unplaced.binding.variable),
+				),
+				value = expr
+			}
+		None:
+			match converted.node:
+				ConvertedTest(element, test_tree):
+					{
+						state = converted.state,
+						value = SemanticMatchExpr(
+							element_ref(element, loc),
+							test_tree,
+							result_type,
+							loc,
+						)
+					}
+				ConvertedBody(body):
+					{
+						state = converted.state,
+						value = body
+					}
+				ConvertedFail:
+					{
+						state = with_fault(converted.state, SubjectTreeAlwaysFails),
+						value = expr
+					}
+
+
+-- Driver ----------------------------------------------------------------------
+
+
+private pure func first_failure(
+	earlier: Option[TupleFlattenFailure],
+	function_name: String,
+	fault: Option[TupleFlattenFault],
+) -> Option[TupleFlattenFailure]:
+	match earlier:
+		Some(_):
+			earlier
+		None:
+			fault.map(pure func(found: TupleFlattenFault):
+				{
+					function_name = function_name,
+					fault = found
+				}
+			)
+
+
+---
+One flattened body: the rewritten expression, how many binder ids it minted
+below its base, and the first fault met.
+---
+private record FlattenedBody {
+	body: CoreExpr,
+	ids_used: Int,
+	fault: Option[TupleFlattenFault]
+}
+
+
+private pure func flatten_body(
+	producers: TupleElementProducers,
+	params: List[CoreVar],
+	body: CoreExpr,
+	id_base: Int,
+) -> FlattenedBody:
+	rewritten: CoreMapState[TupleFlattenState, CoreExpr] = flatten_expr(
+		{
+			producers = producers,
+			local_facts = LocalFactsNotWalked(params, body),
+			last_id = id_base + 1,
+			mutable_in_scope = [],
+			flattened = [],
+			element_aliases = [],
+			fault = None
+		},
+		body,
+	)
+	{
+		body = rewritten.value,
+		ids_used = id_base + 1 - rewritten.state.last_id,
+		fault = rewritten.state.fault
+	}
+
+
+private pure func flatten_function_body(
+	producers: TupleElementProducers,
+	function_info: CoreFunction,
+	id_base: Int,
+) -> Option[FlattenedBody]:
+	body ?= function_info.body
+
+	if function_info.type_params.is_empty():
+		Some(
+			flatten_body(
+				producers,
+				function_info.params.map(pure func(param: CoreParam): param.name),
+				body,
+				id_base,
+			),
+		)
+	else:
+		None
+
+
+---
+Flattens every function, method and global initializer. Binder uniqueness is
+per function, so each body mints from the same `id_base`, and the pass
+reserves the most any one used. The declarations are collected in a local
+list: threading the list through a record per function would copy it once
+per function.
+---
+pure func flatten_tuples_program(
+	program: CoreProgram,
+	id_base: Int,
+) -> Result[TupleFlattenedProgram, TupleFlattenFailure]:
+	producers: TupleElementProducers = tuple_element_producers(program)
+	var decls: List[CoreDecl] = []
+	var ids_used: Int = 0
+	var failure: Option[TupleFlattenFailure] = None
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(function_info):
+				match flatten_function_body(producers, function_info, id_base):
+					Some(flattened):
+						decls = decls.append(FunctionDecl({ function_info | body = Some(flattened.body) }))
+						ids_used = ids_used.max(flattened.ids_used)
+						failure = first_failure(failure, function_info.name, flattened.fault)
+					None:
+						decls = decls.append(decl)
+			ImplDecl(implementation):
+				if implementation.type_params.is_empty():
+					var methods: List[CoreFunction] = []
+
+					for method in implementation.methods:
+						match flatten_function_body(producers, method, id_base):
+							Some(flattened):
+								methods = methods.append({ method | body = Some(flattened.body) })
+								ids_used = ids_used.max(flattened.ids_used)
+								failure = first_failure(failure, method.name, flattened.fault)
+							None:
+								methods = methods.append(method)
+
+					decls = decls.append(ImplDecl({ implementation | methods = methods }))
+				else:
+					decls = decls.append(decl)
+			GlobalDecl(global):
+				flattened: FlattenedBody = flatten_body(producers, [], global.init, id_base)
+				decls = decls.append(GlobalDecl({ global | init = flattened.body }))
+				ids_used = ids_used.max(flattened.ids_used)
+				failure = first_failure(failure, global.name.name, flattened.fault)
+			_:
+				decls = decls.append(decl)
+
+	match failure:
+		Some(found):
+			Err(found)
+		None:
+			Ok({
+				program = { program | decls = decls },
+				ids_used = ids_used
+			})
+
+
+---
+Flattens one expression on its own, as a function body with no program
+around it: no call expands. For tests of the rewrite.
+---
+pure func flatten_tuples_expr(expr: CoreExpr, id_base: Int) -> Result[CoreExpr, TupleFlattenFault]:
+	empty_program: CoreProgram = {
+		decls = [],
+		foreign_includes = [],
+		source_files = []
+	}
+	flattened: FlattenedBody = flatten_body(tuple_element_producers(empty_program), [], expr, id_base)
+
+	match flattened.fault:
+		Some(fault):
+			Err(fault)
+		None:
+			Ok(flattened.body)

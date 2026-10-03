@@ -85,8 +85,8 @@ experiments live in Git history and `benchmarks/results/`.
   rules the rejected cuts taught.
 - [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md)
   is the plan of record for tuple flattening, owned state through calls, and
-  stored tuple layout. It distinguishes current `main` from the validated,
-  unmerged local-tuple pilot and keeps later increments as proposals.
+  stored tuple layout. Local/match tuple flattening is implemented; later
+  increments remain proposals.
 - [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
   is the standard compiler-performance measurement and its retained baselines.
 

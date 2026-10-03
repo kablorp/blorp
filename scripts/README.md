@@ -489,6 +489,30 @@ scripts/blorp-compiler-bootstrap --print-path
 scripts/blorp-compiler-bootstrap --print-toolchain-dir
 ```
 
+## Compiler Fixpoint
+
+`bin/blorp` is built from C the pinned bootstrap emitted, so a change to Core
+or the backend reaches the compiler's own code only in a later stage.
+`scripts/compiler-fixpoint` builds those stages with
+`benchmarks/build_stage2_compiler`: stage 1 (`bin/blorp`) emits the compiler's
+C and stage 2 is built from it, stage 2 emits it again and stage 3 is built
+from that, and stage 3 emits it a third time. Stage 2 and stage 3 must emit
+byte-identical C; a difference means the compiler miscompiled itself, and the
+script prints the first differing line. It also reports whether stage 1's
+output matches, as information: stage 1 was compiled by the bootstrap.
+
+Run it for every change that alters emitted C, before a bootstrap rotation
+picks the change up. It needs a `FRESH` `bin/blorp`, builds each stage at the
+optimization level `BLORP_CLI_C_OPTIMIZATION` selects, and keeps the stages
+and their C in `blorp/build/_build/fixpoint/` (or `--work-dir`). Exit status
+is 0 at a fixpoint, 1 when stage 2 and stage 3 differ, and 2 when a stage
+could not be built.
+
+```bash
+scripts/compiler-fixpoint
+BLORP_CLI_C_OPTIMIZATION=-O2 scripts/compiler-fixpoint --work-dir /tmp/blorp-fixpoint
+```
+
 ## Compiler Source Cleanup Audit
 
 `scripts/audit-compiler-blorp-dead-code` builds a conservative whole-compiler

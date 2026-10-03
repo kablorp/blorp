@@ -1,14 +1,12 @@
 # Value Tuples and Owned State Hand-off
 
-Status (2026-10-02): plan of record for `main`. Increment 1 has a validated,
-unmerged implementation on `core/local-tuples-never-allocate`; increments 2-5
-and 7 remain design. Section 9.1 records what that pilot actually proves.
-Nothing in this document should be read as a claim that tuple flattening has
-landed on `main`.
+Status (2026-10-02): plan of record. Increment 1 is implemented; increments
+2-5 and 7 remain design. Section 9.1 records the implemented boundary and
+its measurements.
 
 Unless a section names a newer matched comparison, "today" and all
 self-compile percentages below refer to the historical design baseline,
-not the current checkout. Section 9.1 separates the pilot's two
+not the current checkout. Section 9.1 separates the distinct
 measurement revisions.
 
 The discovery redesign ([`DISCOVERY_REDESIGN.md`](DISCOVERY_REDESIGN.md),
@@ -62,10 +60,10 @@ step S5), [`MEMORY_MODEL.md`](MEMORY_MODEL.md), and the open copy issues in
    *boxed tuple*, the `blorp_Tuple` of today. A value that comes out of a box
    keeps its box until it is taken apart, so a stored tuple is never rebuilt
    (section 3.1). This is GHC's unboxed tuples, with the boxing decided by
-   the compiler instead of the programmer. The unmerged increment 1 pilot
-   reaches match subjects and immutable locals built from a tuple and only
-   taken apart. A `var` tuple, a local used whole, and a local built in arms
-   remain boxed until later increments (section 9.1).
+   the compiler instead of the programmer. Increment 1 reaches match
+   subjects and immutable locals built from a tuple and only taken apart.
+   A `var` tuple, a local used whole, and a local built in arms remain boxed
+   until later increments (section 9.1).
 2. **Ownership belongs to elements.** No unboxed tuple has a reference count.
    Each element is owned, borrowed or moved on its own, by the existing rules.
    Destructuring a call result binds owned values; it does not alias a tuple.
@@ -116,8 +114,8 @@ are worth 3.5 to 4.6 G instructions at the measured 510 to 600 instructions
 per allocation (section 9), so the tree stage moves from +1.45% to between
 +0.33% and +0.59% of the 405 G self-compile, about +0.44% at the central
 estimate, before the adapter's saving. The 405 G denominator belongs to the
-older baseline used for that projection; the increment 1 pilot's later
-matched baseline retired about 204.6 G instructions (section 9.1). Do not
+older baseline used for that projection; increment 1's later matched
+baselines retired about 204 G instructions (section 9.1). Do not
 combine the old percentage estimate with the newer baseline. Each increment
 must replace its part with a matched measurement.
 
@@ -517,7 +515,7 @@ every Core pass, so the narrowing is a phase rule, and the phase rule is
 checked where Core is admitted to ownership (below), not left to convention.
 
 **Validation, failing loudly.** Perceus ingress already validates admitted
-forms. It gains one check: after flattening, a `TupleType` appears only in a
+forms. Increment 2 adds one check: after flattening, a `TupleType` appears only in a
 multi-value context, and a `TupleFieldExpr` reads only a `BoxedTupleType`.
 Anything else is an internal error naming the function, not a fallback to the
 heap.
@@ -527,8 +525,10 @@ heap.
 `tuple_flatten.brp` replaces `tuple_sroa.brp` at the same pipeline position
 (after `tensor_fusion`, before function-reference adaptation and
 specialization). `tuple_sroa` scalar-replaces the shapes it recognizes and
-leaves the rest on the heap; flattening is total over the rules below, and
-its result is checked (section 3.3).
+leaves the rest on the heap; the complete flattening design is total over the
+rules below, and increment 2 checks its result (section 3.3). Increment 1 applies only the rows for
+match subjects and for immutable locals that are built and never used whole
+(section 9.1).
 
 | Source shape | Core after flattening |
 | --- | --- |
@@ -566,7 +566,7 @@ returning `void*` (that is undefined behaviour in C).
 **The call-expansion behavior stays until increment 2.** Increment 1
 flattens locals but does not change signatures. The existing `tuple_sroa`
 pass inlines a tiny unmanaged tuple-returning function at its call (the
-probe's `pair_inline`, 0 allocations). The pilot retires that pass and keeps
+probe's `pair_inline`, 0 allocations). Increment 1 retires that pass and keeps
 the behavior in `tuple_element_producers.brp`; increment 2, which makes
 tuple results allocation-free, deletes the expansion.
 
@@ -1643,12 +1643,12 @@ own speed through a stage-2 build, which is also what the flip ceiling
 measures (`benchmarks/self_compile_measure --stage2`). Each increment that
 changes emitted C proves a fixpoint: the stage-2 compiler compiles the
 compiler to C, a stage-3 compiler is built from that C, and stage 3's output
-equals stage 2's byte for byte. No repository tool does this today; the first
-increment adds it as a script. Rotation stays a separate, coordinated step.
+equals stage 2's byte for byte. `scripts/compiler-fixpoint` performs this
+check. Rotation stays a separate, coordinated step.
 
 ### 7.6 Invariants
 
-- After flattening, always on: a `TupleType` only in a multi-value context
+- After complete flattening (increment 2), always on: a `TupleType` only in a multi-value context
   (section 3.3); a `TupleFieldExpr` only of a `BoxedTupleType`.
 - After `last_use_release`, under `--check-invariants`: no owned variable is
   released later than the point after its last use on a path where it is dead
@@ -1763,21 +1763,19 @@ fixpoint of section 7.5.
 
 ## 9. Increments
 
-Each lands on its own with its proof. The sequence is: land the validated
-increment 1 pilot; implement multi-value parameters/results (2);
+Each lands on its own with its proof. Increment 1 is implemented. The
+remaining sequence is: implement multi-value parameters/results (2);
 extend consuming clones (3); then implement last-use and place analysis (4).
 Re-measure M0 before deciding whether field places (5) are needed. Stored
 tuple layout (7) is separate and may follow 2 without waiting for 3-5.
-Increment 6 is deferred pending a real-site census. Do not start 2 against
-an unmerged version of 1 or treat 1's pilot numbers as a current-main
-baseline. The remaining payoffs are estimates from historical counts and
-unit costs (section 2.4), not acceptance evidence. If increment 1 is
-rejected, revise this sequence before starting 2; it is a prerequisite,
-not an optional optimization.
+Increment 6 is deferred pending a real-site census. Measure increment 2
+against the integrated increment 1 baseline. The remaining payoffs are
+estimates from historical counts and unit costs (section 2.4), not
+acceptance evidence.
 
 | # | Change | Depends on | Expected payoff | Proof |
 | --- | --- | --- | --- | --- |
-| 1 | **Local/match tuple flattening, validated but unmerged.** `tuple_flatten.brp` flattens `match` subjects and immutable locals built from tuples and only taken apart. A `var` tuple, a local used whole, and an arm-built local remain boxed; the call-expansion behavior moves from `tuple_sroa.brp` to `tuple_element_producers.brp` (section 9.1). | none | Earlier tuple census: −1.11 M tuple containers; later matched self-compile: −1.36 M total allocations and −0.75 G instructions. These are distinct comparisons, neither on current `main`. | Pilot report and fixtures on `core/local-tuples-never-allocate`; recheck on integration base before landing. |
+| 1 | **Local/match tuple flattening, implemented.** `tuple_flatten.brp` flattens `match` subjects and immutable locals built from tuples and only taken apart. A `var` tuple, a local used whole, and an arm-built local remain boxed; the call-expansion behavior moves from `tuple_sroa.brp` to `tuple_element_producers.brp` (section 9.1). | none | Earlier tuple census: −1.11 M tuple containers. Matched self-compile against `be99917ce`: −1.36 M total allocations; the small instruction difference is not a robust speed claim. | Retained report, focused fixtures, ownership-sensitive gates, and stage-2/3 C fixpoint. |
 | 2 | **Multi-value results.** `UnpackLetExpr`, flattened parameters, struct returns, boxed tuples at sinks by type position, the box-keeping rules, adapters for function values, the ingress check, identity builtins and their documentation; `tuple_element_producers.brp`'s call expansion deleted. | 1 | M0: −3.3 M tuple allocations, −1.7 to −2.0 G of 6.80 G. Self-compile: about −0.28 M. Probes: an opaque `(Int, Int)` from 574 to about 10 instructions; `record_pair` from 2 allocations to 1. | probes; M0 `new`; re-boxing fixtures; codegen audit updates |
 | 3 | **Consuming clones for multi-value results, with simple reads first.** Section 4.2: candidacy for a result element of the parameter's record type, the walk over elements and `UnpackLetExpr` binders, the benefit and record-update rule 2 for an update inside an element, contract parity for originals, simple reads first within one call, result or update. Requires the `cancelled-loop-var-record-leaks` fix first. | 2 | M0: the `ParseFields` copies reached through immutable binders and call results, the recursive-descent chain of section 4.4, part of about 1.2 M; proven with fixtures written that way, not with the `var`-loop probes. Self-compile: more clones and more emitted C, measured (the first input to question 1's revisit criterion). Acceptance: stage-2 instructions and allocations of increment 3 alone rise by no more than 0.3% (the Perceus cleanup floor in `PERCEUS_CLEANUP_ISSUES.md`), and increments 3 and 4 together lower them. | a recursive-descent fixture over immutable binders; clone count and C bytes; a fixture row pinning the two-owned shape copying exactly one record per call; self-compile stage 2 |
 | 4 | **Place analysis and last-use releases for variables.** The analysis table with derived borrows and `var` writes; consume-specialization reads its liveness in place of its own walk; `last_use_release` after Perceus. | 3 | With increments 2 and 3: the rest of the `ParseFields` copies (about 1.2 M in all, −0.6 to −0.7 G); spelling interning's whole +1.06 M allocations and +1.7 G, causes (a) and (b) (section 4.5); `cell_pair`, `pushed` and `step` reached as clones from their `var` loops; `record_pair` to no allocation; builder in a tuple from quadratic to linear (77,931 to about 40 instructions per call at 100,000 rows); two owned records from quadratic to linear, one `Cell` copy per call remaining; the dead-alias probe from 40,001 to about 15; the variable shapes of section 5.1. Self-compile: fewer reference-count operations; measured, no estimate. | fixture rows; the `tables` stage; ASan derived-borrow test; the garbage-free invariant |
@@ -1831,43 +1829,65 @@ deciding to proceed.
 - The M0 report's "missing projected callable" when constructing a generic
   union across modules is still not minimized.
 
-### 9.1 Increment 1 pilot and remaining boundary
+### 9.1 Increment 1 as built
 
-The unmerged `core/local-tuples-never-allocate` branch implements
-`tuple_flatten.brp` after the existing early-Core passes. It flattens tuple
-`match` subjects and immutable local tuples that are only taken apart. It
-preserves the box for a whole-value use, a `var` tuple, or an arm-built
-local. In particular, `(a, b) = match ...` with tuple-building arms still
-needs the multi-value binding in increment 2; the original estimate of
-1.5 M removable tuples counted about 0.45 M of these arm-built tuples too
-early. The earlier pilot census found a re-boxing count of zero; that
-count was not repeated in the later matched comparison. Its `-O2`
-fixpoint holds.
+Measured in [`benchmarks/results/tuple_flatten_increment1_2026-10-02.md`](../benchmarks/results/tuple_flatten_increment1_2026-10-02.md).
+`tuple_flatten.brp` replaces `tuple_sroa`'s pass at the same position. Its
+surviving call expansion and per-element `if`/`match` producers live in
+`tuple_element_producers.brp` until increment 2.
 
-The branch's retained report is
-`benchmarks/results/tuple_flatten_increment1_2026-10-02.md` (read it with
-`git show core/local-tuples-never-allocate:benchmarks/results/tuple_flatten_increment1_2026-10-02.md`
-until the branch lands). In its later matched comparison against
-`deb198af83a62`, total self-compile allocations changed from 215,010,542
-to 213,645,604 (−1,364,938), and median retired instructions from
-204,631,122,930 to 203,876,898,519 (−754,224,411). The earlier tuple
-census measured 3,446,082 to 2,336,386 tuple allocations (−1,109,696)
-against a different frozen revision; that exact tuple count was not
-remeasured in the later comparison. These numbers establish a promising
-pilot, not a result on `main` or proof of increments 2-7.
+- **Match subjects.** `match (a, b):` binds each element once, in order, and
+  every test becomes a `match` of the element it reads. A leaf binding that
+  reads into an element moves to the case of the innermost test of that
+  element on its path, the case that proves it; a whole element is the element
+  itself; a whole subject is the group, or a box built in that leaf when it is
+  used whole. A tree that binds one binder at two places of an element
+  (alternatives of one or-pattern) binds it at the leaves.
+- **Locals.** An immutable local bound to a built tuple and only taken apart
+  (read by index, matched, aliased) is a group. A `var` tuple, a local used
+  whole, and a local bound twice (a body `std_inline` cloned) keep their box.
+  A leaf binder naming a matched local's whole value counts as a whole use of
+  that local, so a loop never rebuilds its box (fixture
+  `whole_binding_in_loop`). An element that is an
+  immutable local is that local, not a copy, so a borrowed element stays
+  borrowed (section 3.6).
+- **Self-compile.** An earlier census measured 3,446,082 to 2,336,386
+  tuple allocations (−1,109,696), with re-boxing count 0. A separate
+  matched comparison against `be99917ce` measured 215,081,904 to
+  213,718,236 total allocations (−1,363,668). Minimum retired
+  instructions were 204,120,167,812 to 203,895,737,567 (−0.11%);
+  this small difference is not a robust speed claim. The tuple census
+  and re-boxing count were not repeated on that later baseline. The
+  stage-2/3 C fixpoint holds at `-O2`.
+- **Contract shifts.** 94 functions move 155 parameters from owned to
+  borrowed, none the other way, generated from the self-compile; the list is
+  beside the results.
 
-Before landing, review the branch against the then-current `main`, repeat
-its targeted and ownership-sensitive gates, and preserve its measured
-baseline/candidate provenance. Once landed, remove increment 1 from this
-open-work plan and link the retained benchmark report; start increment 2
-from that integrated baseline.
+Departures from the plan:
+
+- **Arm-built locals are not flattened.** `(a, b) = match ...` whose arms
+  build tuples (0.45 M of the census, 0.43 M in one function) needs the
+  multi-value binding `UnpackLetExpr` of section 3.3, which the table above
+  schedules for increment 2. The original estimate of 1.5 M removable
+  tuples counted these arm-built tuples too early. Increment 1 keeps the
+  per-element producers in `tuple_element_producers.brp` for unmanaged arms.
+  Either increment 2 adds the
+  binding for local arms first, or a separate step does before it.
+- **A local used whole keeps its box at the binding** instead of being
+  flattened and boxed at the use (the section 3.4 table). Until increment 2
+  every whole use is a boxed position, so boxing at the use could only cost
+  more: once per use, or per loop iteration.
+- **No ingress check yet.** With no multi-value context in Core, the check of
+  section 3.3 belongs with `UnpackLetExpr`. The pass instead fails loudly
+  (`CoreEarlyTupleFlattenDiagnostic`) on a tree it cannot place: a test of the
+  whole tuple, or a payload binding with no test of its element above it.
 
 ## Appendix A. Probe programs and commands
 
-The pilot branch retains the probes in `benchmarks/ownership_shapes/`;
-they are not on `main` yet. In
-`value_tuple_probe.brp` each mode runs one shape `count` times, and each tuple
-shape has a control doing the same work without a tuple.
+The probes are in [`benchmarks/ownership_shapes/`](../benchmarks/ownership_shapes/README.md),
+whose README has the commands. In `value_tuple_probe.brp` each mode runs one
+shape `count` times, and each tuple shape has a control doing the same work
+without a tuple.
 
 ```blorp
 record Cell {

@@ -19,6 +19,9 @@ CONSUME_THREADING_SHAPES="named_local chained_receiver nested_argument read_in_l
 CONSUME_NESTED_FIELD_FIXTURE=blorp/test/runtime/fixture/consume_owned_nested_field_shapes.brp
 # Every shape the nested-field fixture reports; each must print `PASS <shape>`.
 CONSUME_NESTED_FIELD_SHAPES="nested_family nested_family_chain read_sibling method_chain_on_field conditional read_only_state loop_update driver_three_levels intern_two_calls intern_register pair_record"
+TUPLE_FLATTEN_FIXTURE=blorp/test/runtime/fixture/tuple_flatten_shapes.brp
+# Every shape the tuple flattening fixture reports; each must print `PASS <shape>`.
+TUPLE_FLATTEN_SHAPES="same_kind classify picked_length whole_subject local_pair destructured_pair element_put_back whole_binding_in_loop payload_stored generic_put stored_local"
 PASS=0
 FAIL=0
 
@@ -151,6 +154,23 @@ if [ -z "$nested_field_failed" ]; then
 else
     echo "FAIL (shapes:$nested_field_failed)"
     echo "  Got: $nested_field_output"
+    FAIL=$((FAIL + 1))
+fi
+
+echo -n "Test 11: local and match-subject tuples allocate nothing; stored tuples keep their box... "
+tuple_flatten_output=$($BLORP run --memory-stats "$TUPLE_FLATTEN_FIXTURE" 2>&1 || true)
+tuple_flatten_failed=""
+for shape in $TUPLE_FLATTEN_SHAPES; do
+    if ! grep -qx "PASS $shape" <<< "$tuple_flatten_output"; then
+        tuple_flatten_failed="$tuple_flatten_failed $shape"
+    fi
+done
+if [ -z "$tuple_flatten_failed" ]; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL (shapes:$tuple_flatten_failed)"
+    echo "  Got: $tuple_flatten_output"
     FAIL=$((FAIL + 1))
 fi
 

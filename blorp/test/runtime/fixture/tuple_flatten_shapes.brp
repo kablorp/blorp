@@ -1,0 +1,325 @@
+-- Allocation fixture for tuples that are only ever local values: a `match`
+-- subject, or a tuple bound to a local and taken apart
+-- (docs/VALUE_TUPLES_AND_STATE_HANDOFF.md, increment 1). Each such tuple is
+-- a group of values, so a call allocates nothing, and the allocations of
+-- 1,000 calls equal those of 10,000.
+--
+-- The box-keeping shapes are the other half: a tuple that already lives in a
+-- box (a list element, an `Option` payload) is passed on by retain, and a
+-- local tuple stored whole is boxed once, exactly as before flattening. Each
+-- of those reports its exact count per call.
+--
+-- Prints one `PASS <shape>` or `FAIL <shape> ...` line per shape.
+-- Run in its own process with --memory-stats
+-- (see test_alloc_oracle_blorp_level.sh).
+import:
+	memory: MemStats, get_mem_stats, mem_delta
+
+
+union Shape:
+	Circle(Int)
+	Square(Int)
+	Empty
+
+
+private SMALL_CALL_COUNT: Int = 1000
+
+private LARGE_CALL_COUNT: Int = 10000
+
+-- One per-call box: a local tuple stored whole into a list slot.
+private STORED_LOCAL_BOXES_PER_CALL: Int = 1
+
+
+-- The census's commonest shape: two values compared through or-patterns.
+pure func same_kind(left: Shape, right: Shape) -> Bool:
+	match (left, right):
+		(Circle(_), Circle(_)) | (Square(_), Square(_)) | (Empty, Empty):
+			True
+		_:
+			False
+
+
+-- Literal patterns on one element beside constructor patterns on the other.
+pure func classify(code: Int, shape: Shape) -> Int:
+	match (code, shape):
+		(0, Circle(radius)):
+			radius
+		(0, _):
+			1
+		(1, Square(side)):
+			side + 2
+		_:
+			3
+
+
+-- Three elements, one of them managed, with a payload bound from each side.
+pure func picked_length(prefer_left: Bool, left: Option[String], right: Option[String]) -> Int:
+	match (prefer_left, left, right):
+		(True, Some(text), _):
+			text.length()
+		(False, _, Some(text)):
+			text.length()
+		_:
+			0
+
+
+-- A pattern that names the whole subject and only takes it apart.
+pure func whole_subject(left: Shape, right: Shape) -> Int:
+	match (left, right):
+		(Circle(radius), _):
+			radius
+		pair:
+			match pair[1]:
+				Square(side):
+					side
+				_:
+					0
+
+
+-- A local tuple read by index and matched, never stored.
+pure func local_pair(count: Int, label: String) -> Int:
+	pair: (Int, String) = (count, label)
+
+	match pair:
+		(0, text):
+			text.length()
+		_:
+			pair[0] + pair[1].length()
+
+
+-- A local tuple destructured into names.
+pure func destructured_pair(count: Int, label: String) -> Int:
+	(first, second) = (count + 1, label)
+	first + second.length()
+
+
+-- Box keeping: an `Option` payload stored whole is the same box.
+pure func payload_stored(found: Option[(Int, Int)], pairs: List[(Int, Int)]) -> List[(Int, Int)]:
+	match found:
+		Some(pair):
+			pairs.set(0, pair)
+		None:
+			pairs
+
+
+pure func put[T](items: List[T], item: T) -> List[T]:
+	items.set(0, item)
+
+
+-- Box keeping: a list element passed to a generic parameter at a tuple type.
+pure func generic_put(pairs: List[(Int, Int)]) -> List[(Int, Int)]:
+	match pairs.get(1):
+		Some(pair):
+			put(pairs, pair)
+		None:
+			pairs
+
+
+-- A local tuple stored whole gets one box, as before flattening.
+pure func stored_local(pairs: List[(Int, Int)], value: Int) -> List[(Int, Int)]:
+	pair: (Int, Int) = (value, value + 1)
+	pairs.set(0, pair)
+
+
+---
+The managed allocations between two snapshots, or -1 when counting was off
+(without `--memory-stats` every count reads 0, which would pass vacuously).
+---
+func counted_allocations(before: MemStats, after: MemStats) -> Int:
+	if before.memory_stats_active == 1 and after.memory_stats_active == 1:
+		mem_delta(before, after).total_allocations
+	else:
+		-1
+
+
+---
+The allocations of `calls` calls of one local-value shape, or -1 when a
+result is wrong or counting was off. The arguments are built before the
+measured region, so only what the call itself allocates is counted.
+---
+func local_value_allocations(shape: String, calls: Int) -> Int:
+	circle: Shape = Circle(4)
+	square: Shape = Square(5)
+	label: Option[String] = Some("label")
+	var checksum: Int = 0
+	before: MemStats = get_mem_stats()
+
+	for i in 0..calls:
+		checksum += match shape:
+			"same_kind":
+				if same_kind(circle, square):
+					1
+				else:
+					2
+			"classify":
+				classify(i % 2, square)
+			"picked_length":
+				picked_length(i % 2 == 0, label, None)
+			"whole_subject":
+				whole_subject(square, square)
+			"local_pair":
+				local_pair(i % 2, "text")
+			"destructured_pair":
+				destructured_pair(i, "text")
+			_:
+				-1
+
+	after: MemStats = get_mem_stats()
+
+	if checksum == expected_checksum(shape, calls):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+pure func expected_checksum(shape: String, calls: Int) -> Int:
+	evens: Int = (calls + 1) / 2
+	odds: Int = calls / 2
+
+	match shape:
+		"same_kind":
+			2 * calls
+		"classify":
+			evens * 1 + odds * 7
+		"picked_length":
+			evens * 5
+		"whole_subject":
+			5 * calls
+		"local_pair":
+			evens * 4 + odds * 5
+		"destructured_pair":
+			calls * (calls - 1) / 2 + calls * 5
+		_:
+			-2
+
+
+---
+The allocations of putting a list element into another list `calls` times,
+or -1 when the list is wrong or counting was off. A list element is already a
+box, so putting it back is a retain. The loop updates `pairs` directly, where
+it is owned, so the list itself is updated in place and only tuple boxes
+could be counted.
+---
+func element_put_back_allocations(calls: Int) -> Int:
+	sources: List[(Int, Int)] = [(1, 2), (3, 4)]
+	var pairs: List[(Int, Int)] = [(5, 6), (7, 8)]
+	before: MemStats = get_mem_stats()
+
+	for _ in 0..calls:
+		for pair in sources:
+			pairs = pairs.set(0, pair)
+
+	after: MemStats = get_mem_stats()
+
+	if pairs.get(0) == Some((3, 4)):
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+---
+The allocations of matching one local tuple `calls` times with a pattern that
+names the whole tuple and stores it, or -1 when the list is wrong or counting
+was off. The tuple is built once, before the loop: storing it is a retain of
+that box, never a box rebuilt from its elements on each pass.
+---
+func whole_binding_in_loop_allocations(calls: Int) -> Int:
+	pair: (Int, Int) = (calls, calls + 1)
+	var pairs: List[(Int, Int)] = [(1, 2), (3, 4)]
+	before: MemStats = get_mem_stats()
+
+	for _ in 0..calls:
+		pairs = match pair:
+			(0, _):
+				pairs
+			whole:
+				pairs.set(0, whole)
+
+	after: MemStats = get_mem_stats()
+
+	if pairs.get(0) == Some((calls, calls + 1)) and pair[0] == calls:
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+---
+The allocations of `calls` calls of one box-keeping shape, or -1 when the
+list is wrong or counting was off.
+---
+func box_keeping_allocations(shape: String, calls: Int) -> Int:
+	var pairs: List[(Int, Int)] = [(1, 2), (3, 4)]
+	found: Option[(Int, Int)] = pairs.get(1)
+	before: MemStats = get_mem_stats()
+
+	for i in 0..calls:
+		pairs = match shape:
+			"payload_stored":
+				payload_stored(found, pairs)
+			"generic_put":
+				generic_put(pairs)
+			"stored_local":
+				stored_local(pairs, i)
+			_:
+				[]
+
+	after: MemStats = get_mem_stats()
+
+	if pairs.length() == 2:
+		counted_allocations(before, after)
+	else:
+		-1
+
+
+-- A local-value shape allocates nothing per call: the counts at both sizes
+-- are equal.
+func report_local_value(shape: String):
+	small: Int = local_value_allocations(shape, SMALL_CALL_COUNT)
+	large: Int = local_value_allocations(shape, LARGE_CALL_COUNT)
+
+	if small >= 0 and small == large:
+		print("PASS ${shape}")
+	else:
+		print("FAIL ${shape}: ${small}/${large} allocations")
+
+
+-- A box-keeping shape allocates exactly `per_call` per call: the counts grow
+-- by that many for each added call, and no more.
+func report_box_keeping(shape: String, per_call: Int, small: Int, large: Int):
+	if small >= 0 and large - small == per_call * (LARGE_CALL_COUNT - SMALL_CALL_COUNT):
+		print("PASS ${shape}")
+	else:
+		print("FAIL ${shape}: ${small}/${large} allocations")
+
+
+func report_box_keeping_call(shape: String, per_call: Int):
+	report_box_keeping(
+		shape,
+		per_call,
+		box_keeping_allocations(shape, SMALL_CALL_COUNT),
+		box_keeping_allocations(shape, LARGE_CALL_COUNT),
+	)
+
+
+func main(args: List[String]):
+	report_local_value("same_kind")
+	report_local_value("classify")
+	report_local_value("picked_length")
+	report_local_value("whole_subject")
+	report_local_value("local_pair")
+	report_local_value("destructured_pair")
+	report_box_keeping(
+		"element_put_back",
+		0,
+		element_put_back_allocations(SMALL_CALL_COUNT),
+		element_put_back_allocations(LARGE_CALL_COUNT),
+	)
+	report_box_keeping(
+		"whole_binding_in_loop",
+		0,
+		whole_binding_in_loop_allocations(SMALL_CALL_COUNT),
+		whole_binding_in_loop_allocations(LARGE_CALL_COUNT),
+	)
+	report_box_keeping_call("payload_stored", 0)
+	report_box_keeping_call("generic_put", 0)
+	report_box_keeping_call("stored_local", STORED_LOCAL_BOXES_PER_CALL)

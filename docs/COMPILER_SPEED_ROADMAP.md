@@ -55,7 +55,7 @@ list adds what is specific to speed work:
 
 The early-Core resolve and std-inline invariants are one fused walk
 (`check_resolve_and_std_inline_invariants` in `early_invariants.brp`) that runs
-on every compile at `tuple_sroa`, the last early pass, even without
+on every compile at `tuple_flatten`, the last early pass, even without
 `--check-invariants` (`early_pipeline.brp`, `resolve_and_std_inline_invariant`).
 That is still a full read walk of the program per compile.
 
@@ -130,7 +130,7 @@ Each is a lead to size with a counter or profile before it becomes an item.
   with a direct loop per caller is the cure; a closure-taking fold is not (see
   the visitor rule above). Verified still true in the source; its share of any
   pass has not been measured.
-- **Analysis indexes rebuilt per pass.** `rewrite_tuple_sroa_program` and
+- **Analysis indexes rebuilt per pass.** `flatten_tuples_program` and
   `lower_tailrec_program` each call `build_layout_type_index` on the whole
   program every run (as do `collection_policy.brp` and `specialize_layout.brp`).
   Verified in the source; unmeasured.

@@ -63,6 +63,10 @@ benchmarks/self_compile_measure --label <task> --input-rev <rev> \
   (`benchmarks/build_stage2_compiler`, or `self_compile_measure --stage2`).
   A compiler fix on `main` does not reach a branch's binary until the
   bootstrap pin is rotated.
+- **Fixpoint**: a change to Core passes or the backend that alters emitted C
+  runs `scripts/compiler-fixpoint` before review: stage 2 and stage 3 must
+  emit identical C. It is not in the premerge gate because it builds two
+  more compilers; the worker who changes code generation runs it once.
 - Run gate commands directly (`scripts/test`, `scripts/compiler-check`, etc.);
   do not spawn many compiled test binaries in parallel yourself (macOS
   `syspolicyd` stalls). Measurement noise from concurrent work is accepted;

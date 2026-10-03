@@ -1,0 +1,332 @@
+-- Probe for docs/VALUE_TUPLES_AND_STATE_HANDOFF.md: each tuple shape is paired
+-- with a control that does the same work without a tuple, which is the cost a
+-- value tuple with ownership hand-off should reach.
+--
+-- Usage: value_tuple_probe <mode> <count>
+-- Allocation counts need a diagnostic build and BLORP_MEMORY_STATS=1.
+import:
+	memory: MemStats, get_mem_stats, mem_delta
+
+
+record Cell {
+	count: Int,
+	label: String
+}
+
+
+record Counts {
+	expressions: Int,
+	statements: Int
+}
+
+
+record Mint {
+	module: Int,
+	counts: Counts
+}
+
+
+record State {
+	cursor: Int,
+	mint: Mint,
+	diagnostics: List[Int]
+}
+
+
+opaque type ParseState = State
+
+
+record Node {
+	id: Int,
+	span: Int,
+	kind: Int
+}
+
+
+record Builder {
+	rows: List[Int],
+	edges: List[Int]
+}
+
+
+record Pair {
+	builder: Builder,
+	cell: Cell
+}
+
+
+union Shape:
+	Circle(Int)
+	Square(Int)
+	Empty
+
+
+-- A `match` subject with or-patterns, the census's commonest tuple: a heap
+-- tuple per call before increment 1, a group of values after.
+pure func same_kind(left: Shape, right: Shape) -> Bool:
+	match (left, right):
+		(Circle(_), Circle(_)) | (Square(_), Square(_)) | (Empty, Empty):
+			True
+		_:
+			False
+
+
+-- The control: the same tests written as nested matches, with no tuple.
+pure func same_kind_nested(left: Shape, right: Shape) -> Bool:
+	match left:
+		Circle(_):
+			match right:
+				Circle(_):
+					True
+				_:
+					False
+		Square(_):
+			match right:
+				Square(_):
+					True
+				_:
+					False
+		Empty:
+			match right:
+				Empty:
+					True
+				_:
+					False
+
+
+-- (Int, Int) small enough for tuple_sroa's call expansion.
+pure func pair_of(value: Int) -> (Int, Int):
+	(value + 1, value)
+
+
+-- (Int, Int) from a body tuple_sroa cannot summarize (a loop).
+pure func pair_of_loop(value: Int) -> (Int, Int):
+	var total: Int = value
+
+	for i in 0..2:
+		total += i
+
+	(total, value)
+
+
+pure func bumped(cell: Cell) -> Cell:
+	{ cell | count = cell.count + 1 }
+
+
+pure func cell_pair(cell: Cell) -> (Cell, Int):
+	({ cell | count = cell.count + 1 }, cell.count)
+
+
+-- The section 3.15 mint: (Mint, Node).
+pure func minted(mint: Mint, span: Int, kind: Int) -> (Mint, Node):
+	id: Int = mint.counts.expressions
+	(
+		{ mint | counts = { mint.counts | expressions = id + 1 } },
+		{id = id, span = span, kind = kind},
+	)
+
+
+-- The section 3.16 finish: (ParseState, Node) over the mint.
+pure func finished(state: ParseState, span: Int, kind: Int) -> (ParseState, Node):
+	fields: State = from_opaque ParseState(state)
+	(mint, node) = fields.mint.minted(span, kind)
+	(into_opaque ParseState({ fields | mint = mint }), node)
+
+
+-- Control for the two above: the same counter update and node, no tuple.
+pure func counted(state: ParseState) -> ParseState:
+	fields: State = from_opaque ParseState(state)
+	into_opaque ParseState({ fields |
+		mint = { fields.mint | counts = { fields.mint.counts | expressions = fields.mint.counts.expressions + 1 } }
+	})
+
+
+pure func next_id(state: ParseState) -> Int:
+	fields: State = from_opaque ParseState(state)
+	fields.mint.counts.expressions
+
+
+pure func advanced(state: ParseState) -> ParseState:
+	fields: State = from_opaque ParseState(state)
+	into_opaque ParseState({ fields | cursor = fields.cursor + 1 })
+
+
+-- Recursive descent: a right-nested sum of `depth` leaves, each a mint.
+pure func parse_sum(state: ParseState, depth: Int) -> (ParseState, Node):
+	(after_leaf, leaf) = state.advanced().finished(depth, 1)
+
+	if depth == 0:
+		(after_leaf, leaf)
+	else:
+		(after_rest, rest) = after_leaf.parse_sum(depth - 1)
+		after_rest.finished(leaf.id + rest.id, 2)
+
+
+pure func pushed(builder: Builder, value: Int) -> (Builder, Int):
+	({ builder | rows = builder.rows.append(value) }, builder.rows.length())
+
+
+pure func pushed_only(builder: Builder, value: Int) -> Builder:
+	{ builder | rows = builder.rows.append(value) }
+
+
+pure func step(builder: Builder, cell: Cell, value: Int) -> (Builder, Cell):
+	({ builder | rows = builder.rows.append(value) }, { cell | count = cell.count + 1 })
+
+
+pure func step_pair(pair: Pair, value: Int) -> Pair:
+	{ pair |
+		builder = { pair.builder | rows = pair.builder.rows.append(value) },
+		cell = { pair.cell | count = pair.cell.count + 1 }
+	}
+
+
+func new_state() -> ParseState:
+	into_opaque ParseState({
+		cursor = 0,
+		mint = {module = 1, counts = {expressions = 0, statements = 0}},
+		diagnostics = [1, 2, 3]
+	})
+
+
+func report(name: String, before: MemStats, calls: Int, checksum: Int):
+	delta: MemStats = mem_delta(before, get_mem_stats())
+	print("${name}: ${delta.total_allocations} allocations over ${calls} calls, checksum ${checksum}")
+
+
+func run(mode: String, count: Int) -> Int:
+	before: MemStats = get_mem_stats()
+	var index: Int = 0
+	var checksum: Int = 0
+
+	if mode == "empty":
+		while index < count:
+			checksum += index
+			index += 1
+	else if mode == "pair_inline":
+		while index < count:
+			(next, _) = pair_of(checksum)
+			checksum = next
+			index += 1
+	else if mode == "pair_call":
+		while index < count:
+			(next, _) = pair_of_loop(checksum)
+			checksum = next
+			index += 1
+	else if mode == "record_alone":
+		var cell: Cell = {count = 0, label = "x"}
+
+		while index < count:
+			cell = bumped(cell)
+			index += 1
+
+		checksum = cell.count
+	else if mode == "record_pair":
+		var cell: Cell = {count = 0, label = "x"}
+
+		while index < count:
+			(next_cell, n) = cell_pair(cell)
+			cell = next_cell
+			checksum += n
+			index += 1
+	else if mode == "mint_kept":
+		var state: ParseState = new_state()
+		var kept: List[Node] = []
+
+		while index < count:
+			(next_state, node) = state.finished(index, 7)
+			state = next_state
+			kept = kept.append(node)
+			index += 1
+
+		checksum = kept.length()
+	else if mode == "mint_control":
+		var state: ParseState = new_state()
+		var kept: List[Node] = []
+
+		while index < count:
+			node: Node = {id = state.next_id(), span = index, kind = 7}
+			state = state.counted()
+			kept = kept.append(node)
+			index += 1
+
+		checksum = kept.length()
+	else if mode == "descent":
+		var state: ParseState = new_state()
+
+		while index < count:
+			(next_state, node) = state.parse_sum(9)
+			state = next_state
+			checksum += node.id
+			index += 10
+	else if mode == "builder_pair":
+		var builder: Builder = {rows = [], edges = []}
+
+		while index < count:
+			(next_builder, n) = builder.pushed(index)
+			builder = next_builder
+			checksum += n
+			index += 1
+	else if mode == "builder_alone":
+		var builder: Builder = {rows = [], edges = []}
+
+		while index < count:
+			builder = builder.pushed_only(index)
+			index += 1
+
+		checksum = builder.rows.length()
+	else if mode == "two_owned":
+		var builder: Builder = {rows = [], edges = []}
+		var cell: Cell = {count = 0, label = "x"}
+
+		while index < count:
+			(next_builder, next_cell) = step(builder, cell, index)
+			builder = next_builder
+			cell = next_cell
+			index += 1
+
+		checksum = builder.rows.length() + cell.count
+	else if mode == "subject_or":
+		shapes: List[Shape] = [Circle(1), Square(2), Empty]
+
+		while index < count:
+			left: Shape = shapes.get_or(index % 3, Empty)
+			right: Shape = shapes.get_or((index / 3) % 3, Empty)
+
+			if same_kind(left, right):
+				checksum += 1
+
+			index += 1
+	else if mode == "subject_control":
+		shapes: List[Shape] = [Circle(1), Square(2), Empty]
+
+		while index < count:
+			left: Shape = shapes.get_or(index % 3, Empty)
+			right: Shape = shapes.get_or((index / 3) % 3, Empty)
+
+			if same_kind_nested(left, right):
+				checksum += 1
+
+			index += 1
+	else if mode == "two_owned_record":
+		var pair: Pair = {builder = {rows = [], edges = []}, cell = {count = 0, label = "x"}}
+
+		while index < count:
+			pair = pair.step_pair(index)
+			index += 1
+
+		checksum = pair.builder.rows.length() + pair.cell.count
+	else:
+		print("unknown mode ${mode}")
+
+	report(mode, before, count, checksum)
+	0
+
+
+func main(args: List[String]) -> Int:
+	match (args.get(1), args.get(2)):
+		(Some(mode), Some(count_text)):
+			run(mode, count_text.parse_int().get_or(1000))
+		_:
+			print("usage: value_tuple_probe <mode> <count>")
+			2

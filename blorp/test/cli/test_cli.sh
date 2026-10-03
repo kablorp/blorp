@@ -1820,8 +1820,8 @@ expect_output_contains "compile time phases reports one row per early Core pass"
 	$'  mono\t' \
 	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
 		-o "$timed_phase_c" "$valid_prog"
-expect_output_contains "compile time phases reports the tuple SROA pass row" 0 \
-	$'  tuple_sroa\t' \
+expect_output_contains "compile time phases reports the tuple flattening pass row" 0 \
+	$'  tuple_flatten\t' \
 	"$BLORP_BIN" compile --no-format --no-embed-runtime --time-phases \
 		-o "$timed_phase_c" "$valid_prog"
 expect_output_contains "compile time phases reports one row per late Core pass" 0 \

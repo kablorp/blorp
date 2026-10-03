@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Check that the compiler reaches a code-generation fixpoint.
+
+`bin/blorp` (stage 1) is built from C the pinned bootstrap emitted, so a change
+to Core or the backend in this checkout reaches the compiler's own code only
+through a later stage. This script builds those stages and compares what they
+emit (docs/VALUE_TUPLES_AND_STATE_HANDOFF.md, section 7.5):
+
+- stage 1 (`bin/blorp`) generates the compiler's C, and stage 2 is built from it;
+- stage 2 generates the compiler's C, and stage 3 is built from it;
+- stage 3 generates the compiler's C once more.
+
+Stage 2 and stage 3 are the same source compiled through the checkout's own
+code generation, so they must emit byte-identical C. A difference means the
+compiler miscompiled itself. Whether stage 1's output also matches is reported
+too: stage 1 runs the same source compiled by the bootstrap, so a difference
+there points at the bootstrap or at stage 2 rather than at a fixpoint failure.
+
+Each stage is built by `benchmarks/build_stage2_compiler`, which reads the
+Makefile's own generation, compile and link recipes, so the stages use the
+optimization level `BLORP_CLI_C_OPTIMIZATION` selects (the Makefile's default
+unless set).
+
+Usage:
+
+    scripts/compiler-fixpoint [--work-dir DIR]
+
+Exit status: 0 at a fixpoint, 1 when stage 2 and stage 3 emit different C,
+2 when a stage could not be built.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BUILD_STAGE = REPO_ROOT / "benchmarks" / "build_stage2_compiler"
+INSTALLED_BIN = REPO_ROOT / "bin" / "blorp"
+DEFAULT_WORK_DIR = REPO_ROOT / "blorp" / "build" / "_build" / "fixpoint"
+
+FIXPOINT = 0
+NOT_A_FIXPOINT = 1
+STAGE_FAILED = 2
+
+
+class StageError(Exception):
+    pass
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_stage_builder(arguments: list[str], what: str) -> None:
+    print(f"== {what}", flush=True)
+    result = subprocess.run([str(BUILD_STAGE), *arguments], cwd=REPO_ROOT)
+    if result.returncode != 0:
+        raise StageError(f"{what} failed (exit {result.returncode})")
+
+
+def build_stage(generator: Path, generated_c: Path, binary: Path, what: str) -> None:
+    run_stage_builder(
+        ["--generator", str(generator), "--generated-c", str(generated_c), str(binary)],
+        what,
+    )
+
+
+def generate_only(generator: Path, generated_c: Path, what: str) -> None:
+    run_stage_builder(
+        ["--generator", str(generator), "--generated-c", str(generated_c), "--c-only"],
+        what,
+    )
+
+
+def first_difference(left: Path, right: Path) -> str:
+    with left.open("rb") as left_file, right.open("rb") as right_file:
+        line_number = 0
+        for left_line in left_file:
+            line_number += 1
+            right_line = right_file.readline()
+            if left_line != right_line:
+                return (
+                    f"first difference at line {line_number}:\n"
+                    f"  stage 2: {left_line[:200]!r}\n"
+                    f"  stage 3: {right_line[:200]!r}"
+                )
+        extra = right_file.readline()
+        if extra:
+            return f"stage 3's C continues past stage 2's last line {line_number}: {extra[:200]!r}"
+    return "the files differ in length only"
+
+
+def fixpoint(work_dir: Path) -> int:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    stage1_output = work_dir / "stage1_output.c"
+    stage2_binary = work_dir / "blorp-stage2"
+    stage2_output = work_dir / "stage2_output.c"
+    stage3_binary = work_dir / "blorp-stage3"
+    stage3_output = work_dir / "stage3_output.c"
+
+    build_stage(INSTALLED_BIN, stage1_output, stage2_binary, "stage 1 generates C; build stage 2")
+    build_stage(stage2_binary, stage2_output, stage3_binary, "stage 2 generates C; build stage 3")
+    generate_only(stage3_binary, stage3_output, "stage 3 generates C")
+
+    digests = {
+        "stage 1": sha256_file(stage1_output),
+        "stage 2": sha256_file(stage2_output),
+        "stage 3": sha256_file(stage3_output),
+    }
+    for stage, digest in digests.items():
+        print(f"{stage} output sha256: {digest}")
+
+    if digests["stage 1"] == digests["stage 2"]:
+        print("stage 1 and stage 2 emit identical C")
+    else:
+        print("note: stage 1 and stage 2 emit different C (stage 1 was built by the bootstrap)")
+
+    if digests["stage 2"] == digests["stage 3"]:
+        print("FIXPOINT: stage 2 and stage 3 emit identical C")
+        return FIXPOINT
+
+    print("NOT A FIXPOINT: stage 2 and stage 3 emit different C")
+    print(first_difference(stage2_output, stage3_output))
+    print(f"outputs kept in {work_dir}")
+    return NOT_A_FIXPOINT
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--work-dir", default=str(DEFAULT_WORK_DIR),
+        help=f"where the stages and their C are kept (default: {DEFAULT_WORK_DIR})",
+    )
+    args = parser.parse_args(argv)
+    try:
+        return fixpoint(Path(args.work_dir).resolve())
+    except StageError as error:
+        print(f"compiler-fixpoint: {error}", file=sys.stderr)
+        return STAGE_FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
