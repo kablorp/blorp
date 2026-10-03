@@ -259,7 +259,12 @@ Put a test at the boundary whose behavior it proves:
 
 New compiler implementation suites must be registered in
 `blorp/test/compiler/compiler_test_ownership.json`. Map each suite to the production
-source it covers so `scripts/compiler-check --changed` can select it.
+source it covers so `scripts/compiler-check --changed` can select it. A suite
+without a focused production owner, such as a benchmark-fixture or broad
+integration suite, uses `"scope": "broad-only"` in its suite entry. The
+manifest validator rejects unreferenced focused suites and broad-only suites
+listed under a production module. A directly changed registered suite is
+still selected by `--changed`, regardless of its scope.
 
 The parser/inference/typecheck compatibility corpus in the registered fixture
 directories under `blorp/test/compiler/` is mostly frozen. Follow

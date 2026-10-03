@@ -176,6 +176,43 @@ class CompilerCheckTestCase(unittest.TestCase):
         self.assertIn("blorp/test/compiler/test_alpha.brp", result.stdout)
         self.assertIn("Selected production sources:\n  (none)", result.stdout)
 
+    def test_unreferenced_focused_suite_is_rejected(self):
+        self.fixture.write("blorp/test/compiler/test_orphan.brp", "-- orphan\n")
+        manifest = self.fixture.manifest()
+        manifest["suites"].append(
+            {"id": "orphan", "path": "blorp/test/compiler/test_orphan.brp"}
+        )
+        self.fixture.write_manifest(manifest)
+        self.assert_invalid("focused suite 'orphan' is not referenced by any production module")
+
+    def test_broad_only_suite_is_valid_and_directly_changed_suite_is_selected(self):
+        self.fixture.write("blorp/test/compiler/test_broad.brp", "-- broad\n")
+        manifest = self.fixture.manifest()
+        manifest["suites"].append(
+            {"id": "broad", "path": "blorp/test/compiler/test_broad.brp", "scope": "broad-only"}
+        )
+        self.fixture.write_manifest(manifest)
+        self.fixture.git("add", ".")
+        self.fixture.write("blorp/test/compiler/test_broad.brp", "-- changed broad\n")
+        result = self.fixture.run("--changed", "--plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("blorp/test/compiler/test_broad.brp", result.stdout)
+        self.assertIn("Selected 0 production sources, 1 suites", result.stdout)
+        self.assertEqual(self.fixture.recorded_events(), [])
+
+    def test_broad_only_suite_cannot_be_a_focused_module_suite(self):
+        manifest = self.fixture.manifest()
+        manifest["suites"][0]["scope"] = "broad-only"
+        self.fixture.write_manifest(manifest)
+        self.assert_invalid("broad-only suite 'alpha' is referenced by production module")
+
+    def test_suite_scope_accepts_only_broad_only_when_explicit(self):
+        for invalid_scope in ("focused", "broad", "", None, True, 1):
+            manifest = self.fixture.manifest()
+            manifest["suites"][0]["scope"] = invalid_scope
+            self.fixture.write_manifest(manifest)
+            self.assert_invalid("scope: expected 'broad-only'")
+
     def test_unregistered_executable_suite_is_rejected(self):
         self.fixture.write(
             "blorp/test/compiler/test_unregistered.brp",

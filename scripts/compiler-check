@@ -57,6 +57,7 @@ class ManifestError(Exception):
 class Suite:
     identifier: str
     path: str
+    broad_only: bool
 
 
 @dataclass(frozen=True)
@@ -207,9 +208,11 @@ def load_manifest(root: Path) -> Manifest:
         entry = _require_object(item, context, errors)
         if entry is None:
             continue
-        _unknown_fields(entry, {"id", "path"}, context, errors)
+        _unknown_fields(entry, {"id", "path", "scope"}, context, errors)
         identifier = entry.get("id")
         path = _validate_relative_path(entry.get("path"), f"{context}.path", errors)
+        if "scope" in entry and entry["scope"] != "broad-only":
+            errors.append(f"{context}.scope: expected 'broad-only'")
         if path is not None and (
             not path.startswith("blorp/test/") or not path.endswith(".brp")
         ):
@@ -223,7 +226,7 @@ def load_manifest(root: Path) -> Manifest:
             errors.append(f"duplicate suite path: {path}")
         _path_exists(root, path, "suite", errors)
         if path is not None and identifier not in suites and path not in suites_by_path:
-            suite = Suite(identifier, path)
+            suite = Suite(identifier, path, entry.get("scope") == "broad-only")
             suites[identifier] = suite
             suites_by_path[path] = suite
 
@@ -313,6 +316,10 @@ def load_manifest(root: Path) -> Manifest:
         for suite_id in focused_suites:
             if suite_id not in suites:
                 errors.append(f"{context}: unknown suite {suite_id!r}")
+            elif suites[suite_id].broad_only:
+                errors.append(
+                    f"{context}: broad-only suite {suite_id!r} is referenced by production module"
+                )
         for check_id in special_checks:
             if check_id not in checks:
                 errors.append(f"{context}: unknown check {check_id!r}")
@@ -327,6 +334,13 @@ def load_manifest(root: Path) -> Manifest:
                 focused_suites,
                 special_checks,
                 broad_gate if isinstance(broad_gate, str) else "",
+            )
+
+    referenced_suites = {suite_id for module in modules.values() for suite_id in module.suites}
+    for suite in suites.values():
+        if not suite.broad_only and suite.identifier not in referenced_suites:
+            errors.append(
+                f"focused suite {suite.identifier!r} is not referenced by any production module"
             )
 
     production_paths = _git_paths(
