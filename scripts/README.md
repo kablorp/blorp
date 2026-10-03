@@ -406,7 +406,9 @@ uses it to decide whether to reinstall `bin/blorp`.
 `scripts/with-build-lock` serializes build/test gates per worktree. `scripts/test`
 and `scripts/premerge-gate` use it automatically so concurrent local runs do not
 race on generated runtime caches or std embedding. The wrapper also
-holds the shared canonical per-user host compiler contention lease. Registered
+holds the shared canonical per-user host compiler contention lease. On hosts
+without the `flock` utility, the build lock uses Python 3 and a POSIX file
+lock held by the command, so termination releases it automatically. Registered
 `scripts/bench-blorp-test-session` evidence takes the exclusive side and rejects
 a run while any participating build/test gate for that user is active. The
 owner-only lease namespace rejects symlinks and foreign ownership before a gate

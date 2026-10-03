@@ -552,6 +552,7 @@ tooling-check: build-blorp-cli
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_blorp_source_layout.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_build_status.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_compiler_new_parity.py
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_with_build_lock.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/cli/test_memory_compiler_setup.py
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/build/test_record_validation.py
 	@BLORP_RECORD_UPDATE_SKIP_BUILD=1 benchmarks/compiler_record_update_match_allocations
