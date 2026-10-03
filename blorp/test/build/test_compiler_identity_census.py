@@ -10,9 +10,19 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/compiler-identity-census"
+CHECKED_IN_BASELINE = SCRIPT.with_name("compiler-identity-census-baseline.json")
 
 
 class IdentityCensusTest(unittest.TestCase):
+    def test_checked_in_coverage_tracks_tuple_flatten_replacement(self):
+        baseline = json.loads(CHECKED_IN_BASELINE.read_text(encoding="utf-8"))
+        covered = set(baseline["coverage"]["paths"])
+        old_path = "blorp/src/compiler/stage_09_core/tuple_sroa.brp"
+        replacement = "blorp/src/compiler/stage_09_core/tuple_flatten.brp"
+        self.assertFalse(old_path in covered, old_path)
+        self.assertTrue(replacement in covered, replacement)
+        self.assertTrue((SCRIPT.parents[1] / replacement).is_file())
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
