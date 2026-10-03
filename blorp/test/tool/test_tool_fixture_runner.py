@@ -16,6 +16,9 @@ sys.path.insert(0, str(REPO_ROOT / "blorp/test/lib"))
 
 import process_supervisor
 
+sys.path.insert(0, str(RUNNER.parent))
+import test_compiler_tool_fixtures as fixture_runner
+
 
 class CompilerToolFixtureRunnerTests(unittest.TestCase):
     @staticmethod
@@ -34,7 +37,10 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                 "format/should_pass/formatted.brp": "func main(args: List[String]) -> Int: 0\n",
                 "format/should_fail/unformatted.brp": "func main( args:List[String] )->Int:0\n",
                 "format/should_error/broken.brp": "-- EXPECT: error: broken syntax\nfunc broken(\n",
-                "purify/should_purify/pure.brp": "func pure_candidate() -> Int: 1\n",
+                "purify/should_purify/pure.brp": (
+                    "-- EXPECT-PURIFY: pure_candidate\n"
+                    "func pure_candidate() -> Int: 1\n"
+                ),
                 "purify/should_not_purify/impure.brp": "func impure_candidate(): print(1)\n",
                 "purify/should_rewrite/rewrite.brp": (
                     "-- EXPECT-CONTAINS: pure func rewrite_me\n"
@@ -85,7 +91,10 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                     if command == "purify":
                         if "--dry-run" in sys.argv:
                             if path.parent.name == "should_purify":
-                                print("pure_candidate")
+                                print(
+                                    f"[DRY-RUN] Functions that could be purified in "
+                                    f"{path}: pure_candidate"
+                                )
                             raise SystemExit(0)
                         source = path.read_text(encoding="utf-8")
                         path.write_text(
@@ -139,6 +148,53 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                 "status=PASS passed=8 failed=0 tests=8",
                 result.stdout,
             )
+
+    def test_purify_change_rejects_wrong_function_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_path = Path(temp_dir) / "returns_impure_closure.brp"
+            fixture_path.write_text(
+                "-- EXPECT-PURIFY: get_action\nfunc get_action() -> Int: 1\n",
+                encoding="utf-8",
+            )
+            output = (
+                "[DRY-RUN] Functions that could be purified in "
+                f"{fixture_path}: helper\n"
+            )
+            with mock.patch.object(
+                fixture_runner,
+                "run_command",
+                return_value=process_supervisor.CommandResult(0, output),
+            ):
+                failures = fixture_runner.run_fixture(
+                    Path("bin/blorp"),
+                    fixture_runner.Fixture(
+                        fixture_runner.FixtureKind.PURIFY_CHANGE, fixture_path
+                    ),
+                    30,
+                )
+
+            self.assertIn("expected purify functions: get_action", failures)
+            self.assertIn("actual purify functions: helper", failures)
+
+    def test_purify_change_rejects_unstructured_or_unrelated_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_path = Path(temp_dir) / "pure.brp"
+            fixture_path.write_text(
+                "-- EXPECT-PURIFY: candidate\nfunc candidate() -> Int: 1\n",
+                encoding="utf-8",
+            )
+            unrelated_path = fixture_path.parent / "unrelated" / fixture_path.name
+            for output in (
+                "candidate\n",
+                "[DRY-RUN] Functions that could be purified in other.brp: candidate\n",
+                f"[DRY-RUN] Functions that could be purified in {unrelated_path}: candidate\n",
+                f"[DRY-RUN] Functions that could be purified in {fixture_path}: candidate\nnoise\n",
+                f"[DRY-RUN] Functions that could be purified in {fixture_path}: candidate, extra\n",
+            ):
+                with self.subTest(output=output):
+                    self.assertTrue(
+                        fixture_runner.purify_change_failures(fixture_path, output)
+                    )
 
     def test_reports_expectation_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

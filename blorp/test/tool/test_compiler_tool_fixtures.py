@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -27,6 +28,11 @@ from run_blorp_check_fixtures import expectation_failures, parse_expectations
 
 DEFAULT_FIXTURE_ROOT = Path("blorp/test")
 DEFAULT_STDLIB_CASE = Path("standard_library/src/crypto_random.brp")
+PURIFY_EXPECTATION_PREFIX = "-- EXPECT-PURIFY: "
+PURIFY_DRY_RUN_LINE = re.compile(
+    r"\[DRY-RUN\] Functions that could be purified in (.+): "
+    r"([A-Za-z_][A-Za-z_0-9]*(?:, [A-Za-z_][A-Za-z_0-9]*)*)"
+)
 
 
 class FixtureKind(Enum):
@@ -107,6 +113,39 @@ def rewrite_expectation_failures(original: Path, rewritten: str) -> list[str]:
         if forbidden and forbidden in body
     )
     return failures
+
+
+def purify_change_failures(fixture: Path, output: str) -> list[str]:
+    expectations = [
+        line.removeprefix(PURIFY_EXPECTATION_PREFIX)
+        for line in fixture.read_text(encoding="utf-8").splitlines()
+        if line.startswith(PURIFY_EXPECTATION_PREFIX)
+    ]
+    if len(expectations) != 1:
+        return ["expected exactly one -- EXPECT-PURIFY: function list"]
+    expected_names = expectations[0].split(", ")
+    if not all(re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name) for name in expected_names):
+        return ["invalid -- EXPECT-PURIFY: function list"]
+
+    lines = output.splitlines()
+    if len(lines) != 1:
+        return [
+            "expected exactly one purify dry-run line",
+            "actual output: " + (output.strip() or "(empty)"),
+        ]
+    match = PURIFY_DRY_RUN_LINE.fullmatch(lines[0])
+    if match is None:
+        return ["malformed purify dry-run line", "actual output: " + lines[0]]
+    reported_path, names = match.groups()
+    if Path(reported_path).resolve() != fixture.resolve():
+        return [f"purify reported a different file: {reported_path}"]
+    actual_names = names.split(", ")
+    if sorted(actual_names) != sorted(expected_names):
+        return [
+            "expected purify functions: " + ", ".join(expected_names),
+            "actual purify functions: " + ", ".join(actual_names),
+        ]
+    return []
 
 
 def line_comment_text(line: str) -> str | None:
@@ -238,8 +277,8 @@ def run_fixture(compiler: Path, fixture: Fixture, timeout: int) -> list[str]:
         if result.returncode != 0:
             return output_details(result, "purify")
         changed = bool(result.output.strip())
-        if fixture.kind is FixtureKind.PURIFY_CHANGE and not changed:
-            return ["expected purify to report functions to change"]
+        if fixture.kind is FixtureKind.PURIFY_CHANGE:
+            return purify_change_failures(fixture.path, result.output)
         if fixture.kind is FixtureKind.PURIFY_NO_CHANGE and changed:
             return ["expected purify to report no changes", result.output.strip()]
         return []
