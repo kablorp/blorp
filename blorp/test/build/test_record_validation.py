@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import importlib.machinery
+import importlib.util
+import io
 import json
 import os
 import signal
@@ -13,10 +17,21 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
 RECORDER = ROOT / "scripts" / "record-validation"
+
+
+def load_recorder_module():
+	loader = importlib.machinery.SourceFileLoader("record_validation", str(RECORDER))
+	spec = importlib.util.spec_from_loader(loader.name, loader)
+	if spec is None:
+		raise RuntimeError("could not load record-validation")
+	module = importlib.util.module_from_spec(spec)
+	loader.exec_module(module)
+	return module
 
 
 def sha256_file(path: Path) -> str:
@@ -170,6 +185,54 @@ class RecordValidationTests(unittest.TestCase):
 
 			self.assertEqual(signal_result.returncode, 128 + signal.SIGTERM)
 			self.assertEqual(self.read_metadata(signal_output)["exit_code"], -signal.SIGTERM)
+
+	def test_metadata_write_failure_fails_closed_after_successful_command(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			output = Path(directory) / "packet"
+			recorder = load_recorder_module()
+			stdout = io.StringIO()
+			stderr = io.StringIO()
+
+			with (
+				mock.patch.object(
+					recorder,
+					"write_metadata",
+					side_effect=OSError("injected metadata failure"),
+				),
+				contextlib.redirect_stdout(stdout),
+				contextlib.redirect_stderr(stderr),
+			):
+				exit_code = recorder.main(
+					["--output", str(output), "--", sys.executable, "-c", "print('child passed')"]
+				)
+
+			self.assertNotEqual(exit_code, 0)
+			self.assertIn("failed to write metadata: injected metadata failure", stderr.getvalue())
+			self.assertNotIn("Validation packet:", stdout.getvalue())
+			self.assertFalse((output / "metadata.json").exists())
+			self.assertEqual((output / "stdout.log").read_text(encoding="utf-8"), "child passed\n")
+
+	def test_metadata_write_failure_preserves_child_failure_status(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			output = Path(directory) / "packet"
+			recorder = load_recorder_module()
+			stderr = io.StringIO()
+
+			with (
+				mock.patch.object(
+					recorder,
+					"write_metadata",
+					side_effect=OSError("injected metadata failure"),
+				),
+				contextlib.redirect_stderr(stderr),
+			):
+				exit_code = recorder.main(
+					["--output", str(output), "--", sys.executable, "-c", "raise SystemExit(42)"]
+				)
+
+			self.assertEqual(exit_code, 42)
+			self.assertIn("failed to write metadata: injected metadata failure", stderr.getvalue())
+			self.assertFalse((output / "metadata.json").exists())
 
 	def test_timeout_records_and_returns_failure_without_hiding_output(self) -> None:
 		if not RECORDER.exists():
