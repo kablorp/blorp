@@ -2139,6 +2139,11 @@ when `BENCH_RUNS` is greater than 1, the harness reports the best timed run.
 This excludes shell overhead, process launch time, and dynamic-loader startup
 from the measured result.
 
+For `fib`, `numeric_loop`, `array_sum`, and `array_ops`, the sample runner checks
+exact stdout on every warmup and timed run before accepting its `BENCH` marker.
+Their one-line expected outputs are recorded in `benchmarks/bench_run.py`.
+Other rows do not yet have an output contract in the sample runner.
+
 The current runners instrument the full benchmark `main` body. That means
 benchmark-specific setup and output are included unless the source factors them
 out before entering `main`. If a benchmark needs narrower hot-section timing,

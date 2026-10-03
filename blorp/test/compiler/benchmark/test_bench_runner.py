@@ -13,6 +13,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 RUNNER = ROOT / "benchmarks" / "bench_run.py"
 FIB_OUTPUT = "Fib(40) = 102334155\n"
+EXPECTED_OUTPUTS = {
+    "numeric_loop": "Total Collatz steps: 131434272\n",
+    "array_sum": "Completed 10000 iterations, total: 4995000000\n",
+    "array_ops": "Completed 10000 iterations, final sum: 44955000000\n",
+}
 
 
 class BenchmarkRunnerTests(unittest.TestCase):
@@ -98,10 +103,53 @@ class BenchmarkRunnerTests(unittest.TestCase):
             self.assertIn("fib output mismatch", result.stderr)
             self.assertEqual(counter.read_text(), "2")
 
-    def test_other_benchmarks_keep_timing_contract_without_output_check(self) -> None:
+    def test_selected_benchmarks_reject_wrong_result_despite_valid_timing_marker(self) -> None:
+        for name in EXPECTED_OUTPUTS:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_name:
+                script, counter = self.fake_benchmark(Path(temp_name), ["wrong result\n"])
+                result = self.run_samples(name, script, counter)
+
+                self.assertEqual(result.returncode, 125)
+                self.assertIn(f"{name} output mismatch", result.stderr)
+                self.assertEqual(counter.read_text(), "1")
+
+    def test_selected_benchmarks_accept_exact_result(self) -> None:
+        for name, output in EXPECTED_OUTPUTS.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_name:
+                script, counter = self.fake_benchmark(Path(temp_name), [output])
+                result = self.run_samples(name, script, counter)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "0.1250\n")
+
+    def test_selected_benchmarks_check_warmup_output(self) -> None:
+        for name, output in EXPECTED_OUTPUTS.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_name:
+                script, counter = self.fake_benchmark(
+                    Path(temp_name), ["wrong result\n", output]
+                )
+                result = self.run_samples(name, script, counter, warmups=1)
+
+                self.assertEqual(result.returncode, 125)
+                self.assertIn(f"{name} output mismatch", result.stderr)
+                self.assertEqual(counter.read_text(), "1")
+
+    def test_selected_benchmarks_check_every_timed_output(self) -> None:
+        for name, output in EXPECTED_OUTPUTS.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_name:
+                script, counter = self.fake_benchmark(
+                    Path(temp_name), [output, "wrong result\n"]
+                )
+                result = self.run_samples(name, script, counter, runs=2)
+
+                self.assertEqual(result.returncode, 125)
+                self.assertIn(f"{name} output mismatch", result.stderr)
+                self.assertEqual(counter.read_text(), "2")
+
+    def test_unchecked_benchmarks_keep_timing_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
             script, counter = self.fake_benchmark(Path(temp_name), ["other result\n"])
-            result = self.run_samples("numeric_loop", script, counter)
+            result = self.run_samples("string", script, counter)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "0.1250\n")

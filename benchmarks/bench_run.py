@@ -8,7 +8,12 @@ import subprocess
 import sys
 
 
-FIB_EXPECTED_OUTPUT = "Fib(40) = 102334155\n"
+EXPECTED_OUTPUTS = {
+    "fib": "Fib(40) = 102334155\n",
+    "numeric_loop": "Total Collatz steps: 131434272\n",
+    "array_sum": "Completed 10000 iterations, total: 4995000000\n",
+    "array_ops": "Completed 10000 iterations, final sum: 44955000000\n",
+}
 BENCH_RE = re.compile(
     r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))",
     re.M,
@@ -16,10 +21,11 @@ BENCH_RE = re.compile(
 
 
 def run_once(name: str, command: list[str]) -> float:
-    # Most rows can generate large output, so only capture the fib row's one-line oracle.
+    # Only capture rows with a small exact output contract; other rows can be large.
+    expected_output = EXPECTED_OUTPUTS.get(name)
     proc = subprocess.run(
         command,
-        stdout=subprocess.PIPE if name == "fib" else subprocess.DEVNULL,
+        stdout=subprocess.PIPE if expected_output is not None else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         check=False,
@@ -29,9 +35,9 @@ def run_once(name: str, command: list[str]) -> float:
             sys.stderr.write(proc.stderr)
         raise SystemExit(proc.returncode)
 
-    if name == "fib" and proc.stdout != FIB_EXPECTED_OUTPUT:
+    if expected_output is not None and proc.stdout != expected_output:
         sys.stderr.write(
-            f"fib output mismatch: expected {FIB_EXPECTED_OUTPUT!r}, "
+            f"{name} output mismatch: expected {expected_output!r}, "
             f"got {proc.stdout[:120]!r}\n"
         )
         raise SystemExit(125)
