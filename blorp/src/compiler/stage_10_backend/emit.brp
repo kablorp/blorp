@@ -27570,8 +27570,8 @@ private pure func union_decl_has_release_mask(
 private pure func typed_union_field_release_statement(
 	field: CoreUnionField,
 	field_c: String,
-) -> String:
-	match field.release_policy:
+) -> Result[String, CoreEmitError]:
+	statement: String = match field.release_policy:
 		NoReleasePolicy:
 			""
 		ArcReleasePolicy:
@@ -27580,6 +27580,7 @@ private pure func typed_union_field_release_statement(
 			"        if (" + field_c + ") blorp_release_arc_only(" + field_c + ");\n"
 		StackResultReleasePolicy:
 			"        blorp_stack_result_release(" + field_c + ");\n"
+	Ok(statement)
 
 
 private pure func erased_union_field_release_statement(index: Int, field_c: String) -> String:
@@ -27610,24 +27611,24 @@ private pure func union_field_release_statement(
 	field_plan: Option[CleanupFieldPlan],
 	index: Int,
 	naming: BackendTypeNaming,
-) -> String:
+) -> Result[String, CoreEmitError]:
 	match field_plan:
 		None:
-			""
+			Ok("")
 		Some(plan_row):
 			if not plan_row.needs_release:
-				""
+				Ok("")
 			else:
 				field_c: String = "self->data." + variant.name + ".field" + index.to_string()
 
 				if plan_row.uses_iterative_cleanup:
-					iterative_union_field_release_statement(union_decl, index, field_c, naming)
+					Ok(iterative_union_field_release_statement(union_decl, index, field_c, naming))
 				else:
 					match union_decl.payload_storage:
 						TypedUnionPayloadStorage:
 							typed_union_field_release_statement(field, field_c)
 						ErasedUnionPayloadStorage:
-							erased_union_field_release_statement(index, field_c)
+							Ok(erased_union_field_release_statement(index, field_c))
 
 
 private pure func emit_union_destructor_cases(
@@ -27635,9 +27636,10 @@ private pure func emit_union_destructor_cases(
 	type_plan: CleanupTypePlan,
 	naming: BackendTypeNaming,
 	authority: CEmissionSymbolAuthority,
-) -> String:
+) -> Result[String, CoreEmitError]:
 	var cases_c: String = ""
 	var variant_index: Int = 0
+	var failure: Option[CoreEmitError] = None
 
 	for variant in union_decl.variants:
 		variant_has_cleanup: Bool = match union_cleanup_variant_plan(type_plan, variant_index):
@@ -27646,31 +27648,41 @@ private pure func emit_union_destructor_cases(
 			None:
 				False
 
-		if variant_has_cleanup:
+		if variant_has_cleanup and failure.is_none():
 			var releases_c: String = ""
 			var index: Int = 0
 
 			for field in variant.fields:
-				releases_c += union_field_release_statement(
-					union_decl,
-					variant,
-					field,
-					union_cleanup_field_plan(type_plan, variant_index, index),
-					index,
-					naming,
-				)
+				if failure.is_none():
+					match union_field_release_statement(
+						union_decl,
+						variant,
+						field,
+						union_cleanup_field_plan(type_plan, variant_index, index),
+						index,
+						naming,
+					):
+						Ok(release_statement):
+							releases_c += release_statement
+						Err(error):
+							failure = Some(error)
 				index += 1
 
-			cases_c += "    case " + union_variant_tag_symbol(
-				authority,
-				variant,
-			) + ":\n" + releases_c + "      break;\n"
+			if failure.is_none():
+				cases_c += "    case " + union_variant_tag_symbol(
+					authority,
+					variant,
+				) + ":\n" + releases_c + "      break;\n"
 		else:
 			void
 
 		variant_index += 1
 
-	cases_c
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(cases_c)
 
 
 private pure func emit_simple_union_destructor(
@@ -27679,20 +27691,16 @@ private pure func emit_simple_union_destructor(
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 	authority: CEmissionSymbolAuthority,
-) -> String:
+) -> Result[String, CoreEmitError]:
+	cases_c ?= emit_union_destructor_cases(union_decl, type_plan, naming, authority)
 	storage_class: String = if internal_type_linkage:
 		"static "
 	else:
 		""
 
-	storage_class + destroy_function_signature(
+	Ok(storage_class + destroy_function_signature(
 		naming.destroy_name,
-	) + " {\n" + "  " + naming.c_name + "* self = (" + naming.c_name + "*)obj;\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
-		union_decl,
-		type_plan,
-		naming,
-		authority,
-	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n"
+	) + " {\n" + "  " + naming.c_name + "* self = (" + naming.c_name + "*)obj;\n" + "  switch (self->tag) {\n" + cases_c + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n")
 
 
 private pure func emit_iterative_union_destructor(
@@ -27701,7 +27709,8 @@ private pure func emit_iterative_union_destructor(
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 	authority: CEmissionSymbolAuthority,
-) -> String:
+) -> Result[String, CoreEmitError]:
+	cases_c ?= emit_union_destructor_cases(union_decl, type_plan, naming, authority)
 	type_name: String = naming.c_name
 	stack_push_name: String = naming.union_destroy_stack_push_name
 	release_child_name: String = naming.union_destroy_release_child_name
@@ -27712,14 +27721,9 @@ private pure func emit_iterative_union_destructor(
 	else:
 		""
 
-	"static void " + stack_push_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (*count >= *capacity) {\n" + "    long next_capacity = (*capacity == 0) ? 64 : (*capacity * 2);\n" + "    " + type_name + "** grown = (" + type_name + "**)blorp_union_destroy_stack_grow(*stack, sizeof(" + type_name + "*) * (size_t)next_capacity);\n" + "    if (!grown) { fprintf(stderr, \"blorp: out of memory (" + type_name + " destroy stack)\\n\"); abort(); }\n" + "    *stack = grown;\n" + "    *capacity = next_capacity;\n" + "  }\n" + "  (*stack)[*count] = value;\n" + "  *count += 1;\n" + "}\n\n" + "static void " + release_child_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (!value) return;\n" + "  blorp_Object* header = (blorp_Object*)value;\n" + "  long previous_refcount = BLORP_RC_DEC_PREV(header->refcount);\n" + "  if (previous_refcount == 1) {\n" + "    BLORP_RC_ACQUIRE_FENCE();\n" + "    " + stack_push_name + "(stack, count, capacity, value);\n" + "  }\n" + "}\n\n" + "static void " + destroy_fields_name + "(" + type_name + "* self, " + type_name + "*** __destroy_stack, long* __destroy_count, long* __destroy_capacity) {\n" + "  switch (self->tag) {\n" + emit_union_destructor_cases(
-		union_decl,
-		type_plan,
-		naming,
-		authority,
-	) + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + storage_class + destroy_function_signature(
+	Ok("static void " + stack_push_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (*count >= *capacity) {\n" + "    long next_capacity = (*capacity == 0) ? 64 : (*capacity * 2);\n" + "    " + type_name + "** grown = (" + type_name + "**)blorp_union_destroy_stack_grow(*stack, sizeof(" + type_name + "*) * (size_t)next_capacity);\n" + "    if (!grown) { fprintf(stderr, \"blorp: out of memory (" + type_name + " destroy stack)\\n\"); abort(); }\n" + "    *stack = grown;\n" + "    *capacity = next_capacity;\n" + "  }\n" + "  (*stack)[*count] = value;\n" + "  *count += 1;\n" + "}\n\n" + "static void " + release_child_name + "(" + type_name + "*** stack, long* count, long* capacity, " + type_name + "* value) {\n" + "  if (!value) return;\n" + "  blorp_Object* header = (blorp_Object*)value;\n" + "  long previous_refcount = BLORP_RC_DEC_PREV(header->refcount);\n" + "  if (previous_refcount == 1) {\n" + "    BLORP_RC_ACQUIRE_FENCE();\n" + "    " + stack_push_name + "(stack, count, capacity, value);\n" + "  }\n" + "}\n\n" + "static void " + destroy_fields_name + "(" + type_name + "* self, " + type_name + "*** __destroy_stack, long* __destroy_count, long* __destroy_capacity) {\n" + "  switch (self->tag) {\n" + cases_c + "    default:\n" + "      break;\n" + "  }\n" + "}\n\n" + storage_class + destroy_function_signature(
 		naming.destroy_name,
-	) + " {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n"
+	) + " {\n" + "  " + type_name + "** __destroy_stack = NULL;\n" + "  long __destroy_count = 0;\n" + "  long __destroy_capacity = 0;\n" + "  " + destroy_fields_name + "((" + type_name + "*)obj, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "  while (__destroy_count > 0) {\n" + "    " + type_name + "* self = __destroy_stack[--__destroy_count];\n" + "    " + destroy_fields_name + "(self, &__destroy_stack, &__destroy_count, &__destroy_capacity);\n" + "    blorp_release_arc_only_slow_extern(self);\n" + "  }\n" + "  free(__destroy_stack);\n" + "}\n\n")
 
 
 private pure func emit_union_destructor(
@@ -27728,10 +27732,10 @@ private pure func emit_union_destructor(
 	naming: BackendTypeNaming,
 	internal_type_linkage: Bool,
 	authority: CEmissionSymbolAuthority,
-) -> String:
+) -> Result[String, CoreEmitError]:
 	match cleanup_type_plan_strategy(type_plan):
 		NoCleanup:
-			""
+			Ok("")
 		IterativeCleanup:
 			emit_iterative_union_destructor(
 				union_decl,
@@ -27947,7 +27951,7 @@ private pure func emit_union_decl(
 	type_plan: CleanupTypePlan,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
-) -> CUnionDeclEmission:
+) -> Result[CUnionDeclEmission, CoreEmitError]:
 	var storage_c: String = make_string(0)
 	var tags_c: String = make_string(0)
 	var constructor_pieces: List[CUnionConstructorPiece] = []
@@ -28003,21 +28007,20 @@ private pure func emit_union_decl(
 		)
 
 	header: String = "typedef struct " + naming.c_name + " {\n" + "  blorp_Object header;\n" + "  int tag;\n" + release_mask_field + "  union {\n" + storage_c + "  } data;\n" + "} " + naming.c_name + ";\n\n" + tags_c + "\n"
+	destructor_c ?= emit_union_destructor(
+		union_decl,
+		type_plan,
+		naming,
+		internal_type_linkage,
+		authority,
+	)
 
-	{
+	Ok({
 		type_header = header,
-		functions = [
-			emit_union_destructor(
-				union_decl,
-				type_plan,
-				naming,
-				internal_type_linkage,
-				authority,
-			),
-		],
+		functions = [destructor_c],
 		constructor_pieces = constructor_pieces,
 		inline_support = reuse_constructors_c
-	}
+	})
 
 
 private record ValueRecordEmissionOrder {
@@ -28891,22 +28894,26 @@ private pure func collect_union_decl_emissions(
 	plan: CleanupPlan,
 	authority: CEmissionSymbolAuthority,
 	internal_type_linkage: Bool,
-) -> List[CUnionDeclEmission]:
+) -> Result[List[CUnionDeclEmission], CoreEmitError]:
 	var result: List[CUnionDeclEmission] = []
+	var failure: Option[CoreEmitError] = None
 
 	for entry in decls.enumerate():
 		decl_index: Int = entry[0]
 
 		match entry[1]:
 			UnionDecl(union_decl):
-				result = result.append(
-					emit_union_decl(
+				if failure.is_none():
+					match emit_union_decl(
 						union_decl,
 						cleanup_plan_row(plan, decl_index),
 						authority,
 						internal_type_linkage,
-					),
-				)
+					):
+						Ok(emission):
+							result = result.append(emission)
+						Err(error):
+							failure = Some(error)
 			HeapRecordDecl(record_decl):
 				void
 			ValueRecordDecl(record_decl):
@@ -28924,7 +28931,11 @@ private pure func collect_union_decl_emissions(
 			ImplDecl(impl_decl):
 				void
 
-	result
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
 
 
 private pure func collect_enum_decl_emissions(
@@ -29079,7 +29090,7 @@ private pure func emit_decls(
 		symbol_authority,
 		internal_type_linkage,
 	)
-	union_emissions: List[CUnionDeclEmission] = collect_union_decl_emissions(
+	union_emissions ?= collect_union_decl_emissions(
 		decls,
 		plan,
 		symbol_authority,
