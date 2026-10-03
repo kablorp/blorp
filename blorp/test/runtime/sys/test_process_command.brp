@@ -1,5 +1,5 @@
 import:
-	fs: IOError, resource_path, temporary_directory
+	fs: IOError, entry_stream, open_directory, resource_path, temporary_directory
 	process:
 		ProcessCaptureLimit(BoundedCapture, UnboundedCapture),
 		ProcessEnvironmentChange,
@@ -11,7 +11,8 @@ import:
 		command,
 		run_command,
 	string: remove_suffix, repeat
-	system: exec, exec_output, file_exists, getenv, setenv, temp_dir
+	stream: count_result
+	system: exec, file_exists, getenv, setenv, temp_dir
 	test: TestSuite, process_spawn_fallback_probe_for_test
 	units: from_bytes, milliseconds, seconds
 
@@ -164,31 +165,43 @@ func test_command_missing_program_is_structured_error() -> Bool:
 				.contains("program not found")
 
 
+func directory_entry_count_result(path: String) -> Result[Int, IOError]:
+	with directory ?= open_directory(path):
+		directory.entry_stream().count_result()
+
+
+func open_fd_count_result() -> Result[Int, IOError]:
+	-- Count in this process: launch descriptors marked close-on-exec disappear
+	-- from a spawned child and cannot be detected by exec_output.
+	match directory_entry_count_result("/dev/fd"):
+		Ok(count):
+			Ok(count)
+		Err(_):
+			directory_entry_count_result("/proc/self/fd")
+
+
 func test_repeated_spawn_failures_release_launch_resources() -> Bool:
 	var failures_are_structured: Bool = True
-	before = exec_output("ls -1 /dev/fd 2>/dev/null | wc -l")
-
-	for _ in 0..64:
-		match run_command(command("__blorp_repeated_missing_process__", [])):
-			Ok(_):
-				failures_are_structured = False
-			Err(_):
-				void
-
-	after = exec_output("ls -1 /dev/fd 2>/dev/null | wc -l")
-
-	match (
-		run_command(
-			command(
-				"sh",
-				["-c", "exit 0"],
-			),
-		)
-	):
-		Ok(result):
-			failures_are_structured and result.exit == Exited(0) and before == after
+	match open_fd_count_result():
 		Err(_):
 			False
+		Ok(before):
+			for _ in 0..64:
+				match run_command(command("__blorp_repeated_missing_process__", [])):
+					Ok(_):
+						failures_are_structured = False
+					Err(_):
+						void
+
+			match open_fd_count_result():
+				Err(_):
+					False
+				Ok(after):
+					match run_command(command("sh", ["-c", "exit 0"])):
+						Ok(result):
+							failures_are_structured and result.exit == Exited(0) and before == after
+						Err(_):
+							False
 
 
 func test_forced_fallback_spawn_owns_every_descriptor_and_child() -> Bool:
