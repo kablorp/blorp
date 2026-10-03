@@ -1337,9 +1337,58 @@ run_compiler_core_sanitize_commands() {
 run_compiler_blorp_sanitize_commands() {
     local output_file="$1"
     local live="${2:-false}"
+    # Keep each sanitized executable within the existing 180-second run budget.
+    # The manifest order is stable; contiguous slices cover every suite once.
+    local sources_per_shard=100
+    local source_count offset=0 shard_index=0 shard_key shard_file shard_output
+    local shard_exit shard_valid shard_status shard_passed shard_failed shard_tests
+    local total_passed=0 total_failed=0 total_tests=0 status
 
-    capture_stream_append "$output_file" "$live" env BLORP_GATE_RESULT=compiler_blorp_sanitize \
-        bin/blorp test $blorp_test_artifact_flags --sanitize --timeout "$compiler_sanitize_test_timeout" blorp/test/compiler/
+    load_compiler_blorp_test_sources "$output_file" || return 1
+    source_count=${#compiler_blorp_test_sources[@]}
+    if [ "$source_count" -eq 0 ]; then
+        echo "Error: compiler test manifest has no suites" >> "$output_file"
+        return 1
+    fi
+
+    while [ "$offset" -lt "$source_count" ]; do
+        shard_index=$((shard_index + 1))
+        shard_key="compiler_blorp_sanitize_shard_$shard_index"
+        shard_file=$(mktemp "${TMPDIR:-/tmp}/blorp_compiler_sanitize_shard.XXXXXX") || return 1
+
+        capture_stream_append "$shard_file" "$live" env BLORP_GATE_RESULT="$shard_key" \
+            bin/blorp test $blorp_test_artifact_flags --sanitize --timeout "$compiler_sanitize_test_timeout" \
+            "${compiler_blorp_test_sources[@]:offset:sources_per_shard}"
+        shard_exit=$?
+        cat "$shard_file" >> "$output_file"
+        shard_output=$(cat "$shard_file")
+        rm -f "$shard_file"
+
+        parse_structured_gate_result "$shard_output" "$shard_key"
+        eval "shard_valid=\$${shard_key}_structured_valid"
+        eval "shard_status=\$${shard_key}_status"
+        eval "shard_passed=\$${shard_key}_passed"
+        eval "shard_failed=\$${shard_key}_failed"
+        eval "shard_tests=\$${shard_key}_tests"
+        if [ "$shard_valid" != "true" ]; then
+            echo "FAIL: $shard_key did not report exactly one valid structured result" >> "$output_file"
+        elif [ "$shard_exit" -ne 0 ] && [ "$shard_status" = "PASS" ]; then
+            echo "FAIL: $shard_key process exited with status $shard_exit after reporting PASS" >> "$output_file"
+            shard_failed=$((shard_failed + 1))
+            shard_tests=$((shard_tests + 1))
+        fi
+
+        total_passed=$((total_passed + shard_passed))
+        total_failed=$((total_failed + shard_failed))
+        total_tests=$((total_tests + shard_tests))
+        offset=$((offset + sources_per_shard))
+    done
+
+    status="PASS"
+    [ "$total_failed" -eq 0 ] || status="FAIL"
+    printf 'BLORP_GATE_RESULT gate=compiler_blorp_sanitize status=%s passed=%s failed=%s tests=%s\n' \
+        "$status" "$total_passed" "$total_failed" "$total_tests" >> "$output_file"
+    [ "$status" = "PASS" ]
 }
 
 parse_std_check_gate_output() {

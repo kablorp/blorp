@@ -981,6 +981,14 @@ fi
 	fi
 	echo "Results: 1 passed, 0 failed (1 tests)"
 	echo "BLORP_GATE_RESULT gate=\${BLORP_GATE_RESULT:-missing} status=PASS passed=1 failed=0 tests=1"
+	if [ "\${BLORP_TEST_DUPLICATE_SANITIZE_SHARD:-0}" = "1" ] \
+		&& [ "\${BLORP_GATE_RESULT:-}" = "compiler_blorp_sanitize_shard_2" ]; then
+		echo "BLORP_GATE_RESULT gate=\${BLORP_GATE_RESULT} status=PASS passed=1 failed=0 tests=1"
+	fi
+	if [ "\${BLORP_TEST_FAIL_SANITIZE_SHARD_PROCESS:-0}" = "1" ] \
+		&& [ "\${BLORP_GATE_RESULT:-}" = "compiler_blorp_sanitize_shard_2" ]; then
+		exit 23
+	fi
 	exit 0
 fi
 
@@ -1004,9 +1012,9 @@ if [ "$compiler_blorp_sanitize_status" -ne 0 ]; then
 fi
 
 expected_compiler_sanitize_timeout=180
-expected_blorp_sanitize_command="test --sanitize --timeout $expected_compiler_sanitize_timeout blorp/test/compiler/"
+expected_blorp_sanitize_command="test --sanitize --timeout $expected_compiler_sanitize_timeout blorp/test/compiler/test_01.brp blorp/test/compiler/test_02.brp blorp/test/compiler/test_03.brp blorp/test/compiler/test_04.brp blorp/test/compiler/test_05.brp blorp/test/compiler/test_06.brp blorp/test/compiler/test_07.brp blorp/test/lsp/analysis/test_08.brp"
 if ! grep -Fxq "$expected_blorp_sanitize_command" "$compiler_blorp_sanitize_log"; then
-	echo "FAIL: compiler-blorp-sanitize should use the sanitized test route"
+	echo "FAIL: compiler-blorp-sanitize should run every manifest-owned TestSuite under sanitizers"
 	cat "$compiler_blorp_sanitize_output"
 	cat "$compiler_blorp_sanitize_log"
 	exit 1
@@ -1081,6 +1089,201 @@ then
 fi
 
 echo "PASS: scripts/test rejects stale compiler suite inventory"
+
+: > "$compiler_blorp_sanitize_log"
+compiler_blorp_sanitize_missing_output="$TMP_HARNESS/compiler-blorp-sanitize-missing-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		bash scripts/test compiler-blorp-sanitize --serial
+) > "$compiler_blorp_sanitize_missing_output" 2>&1
+compiler_blorp_sanitize_missing_status=$?
+
+if [ "$compiler_blorp_sanitize_missing_status" -eq 0 ] \
+	|| ! grep -Fq 'Error: compiler test suite does not exist: blorp/test/compiler/missing.brp' \
+		"$compiler_blorp_sanitize_missing_output" \
+	|| [ -s "$compiler_blorp_sanitize_log" ]
+then
+	echo "FAIL: compiler-blorp-sanitize should reject a stale manifest before compilation"
+	cat "$compiler_blorp_sanitize_missing_output"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+
+echo "PASS: compiler-blorp-sanitize rejects stale compiler suite inventory"
+
+python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text())
+manifest["suites"].pop()
+path.write_text(json.dumps(manifest))
+PY
+
+python3 - "$TMP_HARNESS" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+manifest_path = root / "blorp/test/compiler/compiler_test_ownership.json"
+manifest = json.loads(manifest_path.read_text())
+for number in range(9, 102):
+    source = f"blorp/test/compiler/test_{number:03}.brp"
+    (root / source).touch()
+    manifest["suites"].append({"path": source})
+manifest_path.write_text(json.dumps(manifest))
+PY
+
+: > "$compiler_blorp_sanitize_log"
+compiler_blorp_sanitize_shards_output="$TMP_HARNESS/compiler-blorp-sanitize-shards-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		bash scripts/test compiler-blorp-sanitize --serial \
+			--log-dir "$TMP_HARNESS/compiler-blorp-sanitize-shards-logs"
+) > "$compiler_blorp_sanitize_shards_output" 2>&1
+compiler_blorp_sanitize_shards_status=$?
+
+if [ "$compiler_blorp_sanitize_shards_status" -ne 0 ] || \
+	! python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" \
+		"$compiler_blorp_sanitize_log" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+paths = [suite["path"] for suite in manifest["suites"]]
+commands = Path(sys.argv[2]).read_text().splitlines()
+expected = [
+    "test --sanitize --timeout 180 " + " ".join(paths[:100]),
+    "test --sanitize --timeout 180 " + paths[100],
+]
+raise SystemExit(0 if len(paths) == 101 and commands == expected else 1)
+PY
+then
+	echo "FAIL: compiler-blorp-sanitize should shard every manifest suite exactly once"
+	cat "$compiler_blorp_sanitize_shards_output"
+	cat "$compiler_blorp_sanitize_log"
+	exit 1
+fi
+
+compiler_blorp_sanitize_shards_gate_log="$TMP_HARNESS/compiler-blorp-sanitize-shards-logs/compiler-blorp-sanitize.log"
+if [ "$(grep -Ec '^BLORP_GATE_RESULT gate=compiler_blorp_sanitize_shard_[0-9]+ ' "$compiler_blorp_sanitize_shards_gate_log")" -ne 2 ] \
+	|| [ "$(grep -Ec '^BLORP_GATE_RESULT gate=compiler_blorp_sanitize ' "$compiler_blorp_sanitize_shards_gate_log")" -ne 1 ] \
+	|| ! grep -Fxq 'BLORP_GATE_RESULT gate=compiler_blorp_sanitize status=PASS passed=2 failed=0 tests=2' \
+		"$compiler_blorp_sanitize_shards_gate_log"
+then
+	echo "FAIL: compiler-blorp-sanitize should aggregate one verdict for both shards"
+	cat "$compiler_blorp_sanitize_shards_output"
+	cat "$compiler_blorp_sanitize_shards_gate_log"
+	exit 1
+fi
+
+echo "PASS: compiler-blorp-sanitize shards every manifest suite with one final verdict"
+
+: > "$compiler_blorp_sanitize_log"
+compiler_blorp_sanitize_duplicate_output="$TMP_HARNESS/compiler-blorp-sanitize-duplicate-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_DUPLICATE_SANITIZE_SHARD=1 \
+		bash scripts/test compiler-blorp-sanitize --serial \
+			--log-dir "$TMP_HARNESS/compiler-blorp-sanitize-duplicate-logs"
+) > "$compiler_blorp_sanitize_duplicate_output" 2>&1
+compiler_blorp_sanitize_duplicate_status=$?
+
+compiler_blorp_sanitize_duplicate_gate_log="$TMP_HARNESS/compiler-blorp-sanitize-duplicate-logs/compiler-blorp-sanitize.log"
+if [ "$compiler_blorp_sanitize_duplicate_status" -eq 0 ] \
+	|| ! grep -Fq 'FAIL: compiler_blorp_sanitize_shard_2 did not report exactly one valid structured result' \
+		"$compiler_blorp_sanitize_duplicate_gate_log" \
+	|| ! grep -Fxq 'BLORP_GATE_RESULT gate=compiler_blorp_sanitize status=FAIL passed=1 failed=1 tests=2' \
+		"$compiler_blorp_sanitize_duplicate_gate_log" \
+	|| [ "$(grep -Ec '^BLORP_GATE_RESULT gate=compiler_blorp_sanitize ' "$compiler_blorp_sanitize_duplicate_gate_log")" -ne 1 ]
+then
+	echo "FAIL: compiler-blorp-sanitize should reject duplicate shard verdicts"
+	cat "$compiler_blorp_sanitize_duplicate_output"
+	cat "$compiler_blorp_sanitize_duplicate_gate_log"
+	exit 1
+fi
+
+echo "PASS: compiler-blorp-sanitize rejects duplicate shard verdicts"
+
+: > "$compiler_blorp_sanitize_log"
+compiler_blorp_sanitize_process_output="$TMP_HARNESS/compiler-blorp-sanitize-process-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		BLORP_TEST_FAIL_SANITIZE_SHARD_PROCESS=1 \
+		bash scripts/test compiler-blorp-sanitize --serial \
+			--log-dir "$TMP_HARNESS/compiler-blorp-sanitize-process-logs"
+) > "$compiler_blorp_sanitize_process_output" 2>&1
+compiler_blorp_sanitize_process_status=$?
+
+compiler_blorp_sanitize_process_gate_log="$TMP_HARNESS/compiler-blorp-sanitize-process-logs/compiler-blorp-sanitize.log"
+if [ "$compiler_blorp_sanitize_process_status" -eq 0 ] \
+	|| ! grep -Fq 'FAIL: compiler_blorp_sanitize_shard_2 process exited with status 23 after reporting PASS' \
+		"$compiler_blorp_sanitize_process_gate_log" \
+	|| ! grep -Fxq 'BLORP_GATE_RESULT gate=compiler_blorp_sanitize status=FAIL passed=2 failed=1 tests=3' \
+		"$compiler_blorp_sanitize_process_gate_log"
+then
+	echo "FAIL: compiler-blorp-sanitize should retain nonzero shard process exits"
+	cat "$compiler_blorp_sanitize_process_output"
+	cat "$compiler_blorp_sanitize_process_gate_log"
+	exit 1
+fi
+
+echo "PASS: compiler-blorp-sanitize retains nonzero shard process exits"
+
+python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text())
+for suite in manifest["suites"][8:]:
+    (path.parents[3] / suite["path"]).unlink()
+del manifest["suites"][8:]
+path.write_text(json.dumps(manifest))
+PY
+
+cp "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" \
+	"$TMP_HARNESS/compiler-manifest-before-empty.json"
+python3 - "$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+manifest = json.loads(path.read_text())
+manifest["suites"] = []
+path.write_text(json.dumps(manifest))
+PY
+: > "$compiler_blorp_sanitize_log"
+compiler_blorp_sanitize_empty_output="$TMP_HARNESS/compiler-blorp-sanitize-empty-output.txt"
+(
+	cd "$TMP_HARNESS" || exit 1
+	BLORP_TEST_LOCK_HELD=1 \
+		bash scripts/test compiler-blorp-sanitize --serial
+) > "$compiler_blorp_sanitize_empty_output" 2>&1
+compiler_blorp_sanitize_empty_status=$?
+
+if [ "$compiler_blorp_sanitize_empty_status" -eq 0 ] \
+	|| ! grep -Fq 'compiler test manifest has no suites' "$compiler_blorp_sanitize_empty_output" \
+	|| [ -s "$compiler_blorp_sanitize_log" ]
+then
+	echo "FAIL: compiler-blorp-sanitize should reject an empty manifest before compilation"
+	cat "$compiler_blorp_sanitize_empty_output"
+	exit 1
+fi
+cp "$TMP_HARNESS/compiler-manifest-before-empty.json" \
+	"$TMP_HARNESS/blorp/test/compiler/compiler_test_ownership.json"
+
+echo "PASS: compiler-blorp-sanitize rejects an empty compiler suite inventory"
 
 compiler_tools_output="$TMP_HARNESS/compiler-tools-output.txt"
 expected_compiler_tools_passed=$((3 + compiler_tools_stub_count))
