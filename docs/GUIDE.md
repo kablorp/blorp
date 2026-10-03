@@ -2483,11 +2483,7 @@ import:
     list: List
 ```
 
-The compiler rejects imports that are not used in the same file when that file
-is checked, compiled, or run explicitly. Imported user modules are checked too;
-compiler-injected prelude imports are not reported. `standard_library/src/prelude.brp` is also
-exempt because it is the compiler-owned re-export hub for those injected
-imports.
+Unused imports are allowed.
 
 ### Selective Imports
 

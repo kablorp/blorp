@@ -50,7 +50,6 @@ One line per entry. Fault entries (CF) first, then diagnostic entries (DG) by ti
 | CF-005 | `Int[]` silently becomes `Int`; unknown type names generalise | Fault | S |
 | CF-006 | `"""hello"""` is silently the empty string | Fault | S |
 | CF-007 | Duplicate function and parameter names are accepted | Fault | S |
-| CF-008 | The unused-import error is documented and fixtured but not emitted | Fault | S |
 | CF-009 | A `pure func` may read a module-level `var` (design question open) | Fault | S |
 | DG-001 | Semantic errors carry no source location | High | L |
 | DG-002 | One bad expression cascades into two or three more errors | High | M |
@@ -93,7 +92,6 @@ One line per entry. Fault entries (CF) first, then diagnostic entries (DG) by ti
 | DG-042 | Reserved words used as names: second error and `select` | Medium | S |
 | DG-043 | `try`, `except`, `with open`, `import x from y`, `from x import y`, `import list` | Medium | S |
 | DG-044 | Inclusive ranges, chained comparisons and valueless declarations | Medium | S |
-| DG-045 | Unused imports are accepted although the Guide says they are rejected | moved to CF-008 | - |
 | DG-046 | A typo in an assignment target creates a new binding | Medium | M |
 | DG-050 | Explicit generic call syntax | Low | S |
 | DG-051 | Declaration shapes `Int x = 1` and `f(Int x)` | Low | S |
@@ -234,19 +232,6 @@ rewrite replaces, so prefer a fix that the replacement can carry over.
   duplicate type-parameter check is the model).
 - Cost: S
 - Issue: [`duplicate-function-and-parameter-accepted.md`](issues/duplicate-function-and-parameter-accepted.md)
-
-### CF-008 The unused-import error is documented and fixtured but not emitted
-- Input: `import:` then `list: map`, with `map` unused
-- Current output: `Type checking succeeded.`; `lint` is silent. Four fixtures expect
-  an error and fail when run by hand:
-  `blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_fail/unused_selective_import_error.brp`
-  (`-- EXPECT: error: unused import 'sum' from module 'vector'`),
-  `unused_qualified_import_error.brp`, `unused_multiple_import_errors.brp`,
-  `unused_import_error_in_helper.brp`. No emitter exists in `blorp/src`.
-- Should be: restore the check (GUIDE section 8 is right) and confirm the fixtures run.
-- Owner: module binding, `compiler/stage_06_typecheck/modules/`.
-- Cost: S to M
-- Issue: [`unused-import-check-missing.md`](issues/unused-import-check-missing.md)
 
 ### CF-009 A `pure func` may read a module-level `var` (design question open)
 - Input: `var counter: Int = 0` and `pure func f() -> Int:` returning `counter`
@@ -957,9 +942,6 @@ rewrite replaces, so prefer a fix that the replacement can carry over.
 - Owner: discovery parser, `parse/expression_atoms.brp:143`; typecheck `infer.brp:6589`.
 - Cost: S each
 - ROI: Medium.
-
-### DG-045 Unused imports are accepted although the Guide says they are rejected
-- Moved to CF-008: the check is documented and fixtured but not emitted.
 
 ### DG-046 A typo in an assignment target creates a new binding
 - Input:
