@@ -120,6 +120,9 @@ if child_pid == 0:
     partial_pid_path.write_text(str(os.getpid()), encoding="utf-8")
     os.replace(partial_pid_path, child_pid_path)
     started.write_text("started", encoding="utf-8")
+    if os.environ.get("BLORP_FAKE_BRIDGE_WAIT_FOR_TERMINATION") == "1":
+        while True:
+            signal.pause()
     time.sleep(5)
     os._exit(0)
 
@@ -424,6 +427,7 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
             ]
             original_grace = self.benchmark.TERMINATE_GRACE_SECONDS
             self.benchmark.TERMINATE_GRACE_SECONDS = 0.05
+            cleanup_needed = True
 
             try:
                 with environment("BLORP_FAKE_BRIDGE_STARTED", str(started_path)):
@@ -436,8 +440,8 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
                             str(child_pid_path),
                         ):
                             with environment(
-                                "BLORP_FAKE_BRIDGE_SURVIVE_DELAY",
-                                "0.15",
+                                "BLORP_FAKE_BRIDGE_WAIT_FOR_TERMINATION",
+                                "1",
                             ):
                                 with environment(
                                     "BLORP_FAKE_BRIDGE_PARENT_EXIT",
@@ -447,12 +451,17 @@ class CompilerBackendMemoryBenchmarkTests(unittest.TestCase):
                                         self.benchmark.measurement_worker(worker_args),
                                         0,
                                     )
+                # This child has no natural exit; a stopped pid proves cleanup ran.
+                self.assert_process_stopped(child_pid_path)
+                cleanup_needed = False
             finally:
                 self.benchmark.TERMINATE_GRACE_SECONDS = original_grace
-
-            time.sleep(0.25)
-            self.assertFalse(survived_path.exists())
-            self.assert_process_stopped(child_pid_path)
+                if cleanup_needed and child_pid_path.exists():
+                    try:
+                        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_controller_interrupt_stops_renderer_process_group(self) -> None:
         for interrupt in ("sigterm", "process_group_sigint"):
