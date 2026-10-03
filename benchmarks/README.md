@@ -551,41 +551,34 @@ timed comparison. Use `--fixture-source` for benchmark sources that must be
 byte-identical under both source roots; use `--fixture` only for shared
 external input files that are not source-root relative.
 
+`compiler_consume_candidate_index_profile` is itself a build/run driver, so use
+its paired mode for this Core pilot. Run from the candidate checkout with a
+disposable baseline worktree: the driver copies the candidate's benchmark
+sources into both roots, builds each compiler and fixture binary once per
+invocation, then alternates seven samples per compiler. The benchmark warms
+one rewrite before timing its production `rewrite_program` loop. Each compiler
+path below is the root-local `bin/blorp` installed by `make all`; the pinned
+bootstrap is only an input to that build.
+
 ```bash
-benchmarks/compiler_pass_compare \
-  --label consume-candidate-index \
-  --baseline-bin /path/to/base/benchmarks/compiler_consume_candidate_index_profile \
-  --candidate-bin /path/to/candidate/benchmarks/compiler_consume_candidate_index_profile \
-  --baseline-source-root /path/to/base \
-  --candidate-source-root /path/to/candidate \
-  --fixture-source blorp/benchmark/compiler/compiler_consume_candidate_index_profile.brp \
-  --fixture-source blorp/benchmark/compiler/compiler_consume_candidate_index_profile_fixture.brp \
-  --prefix CONSUME_CANDIDATE_INDEX_PROFILE \
-  --time-field elapsed_microseconds \
-  --checksum-field core_json_checksum \
-  --checksum-field setup_checksum \
-  --checksum-field rewritten_function_checksum \
-  --stable-field functions \
-  --stable-field candidates_per_function \
-  --stable-field user_calls \
-  --stable-field used_percent \
-  --stable-field collision_mode \
-  --stable-field candidates_discovered \
-  --stable-field rewritten_clone_count \
-  --stable-field core_json_bytes \
-  --stable-field workload_valid \
-  --metric-field allocations \
-  --pairs 7 \
-  --warmup-pairs 1 \
-  --results /tmp/consume-candidate-index-pairs.json \
-  -- plain 20 256 8 256 25 none
+for candidate_count in 8 0; do
+  benchmarks/compiler_consume_candidate_index_profile \
+    --compiler /path/to/candidate/bin/blorp \
+    --compiler-root /path/to/candidate \
+    --baseline-compiler /path/to/base/bin/blorp \
+    --baseline-compiler-root /path/to/base \
+    --samples 7 --json \
+    plain 20 256 "$candidate_count" 256 25 none \
+    > "/tmp/consume-candidate-index-${candidate_count}.json"
+done
 ```
 
-The Core pilot above compares the existing consume-specialization benchmark:
-the measured production boundary is the benchmark's `rewrite_program` loop, and
-`setup_microseconds` remains an untimed fixture-construction check. Run the same
-shape with `candidates_per_function=0` as the zero-query control before making a
-speed claim.
+The `8` run measures candidate lookup; the `0` run is the zero-query control
+and should report zero discovered candidates and clones. Each JSON result keeps
+the raw timing and allocation samples, compiler/source/binary hashes, and
+setup and generated-Core checksums. Paired mode rejects differing semantic
+fields; also confirm `workload_valid` is true for both compilers before making a
+speed claim. `setup_microseconds` remains outside the measured loop.
 
 ```bash
 benchmarks/compiler_pass_compare \
@@ -1538,13 +1531,16 @@ benchmarks/compiler_consume_candidate_index_profile \
   plain 1 64 8 256 25 same-def-different-name
 
 benchmarks/compiler_consume_candidate_index_profile \
-  --compiler /path/to/pinned-bootstrap/blorp \
+  --compiler /path/to/candidate/bin/blorp \
   --compiler-root /path/to/candidate \
-  --baseline-compiler /path/to/pinned-bootstrap/blorp \
-  --baseline-compiler-root /path/to/base_worktree_644575ed \
+  --baseline-compiler /path/to/base/bin/blorp \
+  --baseline-compiler-root /path/to/base \
   --samples 7 \
   plain 20 256 8 256 25 none
 ```
+
+Use each checkout's built compiler for this comparison; the pinned bootstrap
+only builds those compilers through `make`.
 
 Single-compiler rows print `CONSUME_CANDIDATE_INDEX_PROFILE` with discovered
 candidates, emitted clone count, allocator stats, measured rewrite
