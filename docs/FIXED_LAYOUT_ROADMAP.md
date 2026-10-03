@@ -223,6 +223,112 @@ ordinary-program generated-C identity and stage-2 compiler allocations and
 retired instructions, and do not claim a feature or performance win from the
 existing helper-only oracle or preparatory measurements.
 
+#### R2 preparatory consolidation audit (2026-10-03)
+
+Source census at `313f50fb8`: consolidate *ownership decisions*, not the
+different layouts of heap records, typed unions, and inline values. These
+existing seams make an owned-inline policy hard to introduce safely:
+
+| Seam | Current evidence | Risk for R2 |
+| --- | --- | --- |
+| Core ownership meaning | `type_policy.brp` defines `CoreOwnershipKind` and a declaration-derived, name-keyed `CoreInlineOwnershipIndex`, but `core_ownership_kind` has no production consumer. Perceus still asks `is_managed_type` across its body, while `cleanup_release_policy_for_type(ValueRecordType)` is `NoReleasePolicy`. | “Needs owned copy/drop,” “has an ARC root,” and “needs a cancellation action” are different questions. Globally making a fixed record “managed” would route inline bits through pointer operations; duplicate type names would make the current index ambiguous. |
+| Prepared-plan completeness | `prepare.brp` gives a missing cleanup row `NotACleanupType`; a missing union field plan can become `Ok("")` in `emit_union_destructor_cases`. `emit.brp` also substitutes an empty cancellation plan for a missing function row. | A stale row must not silently become no cleanup when a field owns a child. |
+| Emission sites | `emit.brp` has 21 type-only cleanup-policy reads. `FunctionBodyC.value` is plain C text, and `body_value_can_be_cleanup_slot` guesses whether it names a temporary from the spelling. | A final-Core preflight alone cannot identify every backend-created owner or its value-versus-address cleanup ABI. |
+| Failure and naming | `emit_function_body` returns `Option` through 91 call expressions in 61 helpers; `None` means an unsupported expression and can lead to generated error C. `c_emission_type_naming` falls back to a freshly derived name if its plan has no row. | Neither path is a typed ownership error; a new helper or missing action must fail before malformed C is rendered. |
+
+There is already useful sharing: `CleanupTypePlan` is built once from final
+Core, `emit_decls` feeds both single- and split-unit output, the cancellation
+planner has semantic owner/site/slot identities, and heap/union destructors
+share signature and cleanup-strategy helpers. Do **not** merge the two field
+release loops merely because both now return `Result`: typed union payloads,
+erased release masks, iterative cleanup, and heap COW destruction have
+different obligations. Nor should a new generic “managed” boolean replace
+the separate representation and ownership facts.
+
+Do these bounded preparations before introducing new production release-policy
+variants. Each is one reviewable change, keeps managed fixed fields rejected,
+and may be stopped independently if its measured cost or required scope grows.
+
+1. **Classify the questions at each ownership read.** Make a retained census
+   of the Perceus `is_managed_type` uses and the 21 backend type-only policy
+   reads, grouped by *owner existence*, *root representation*, *copy/drop
+   operation*, *cancellation action*, and *ABI placement*. Identify which
+   already consume a Core field policy or prepared cleanup row. Route one
+   owner-existence family at a time through the existing declaration-derived
+   `CoreOwnershipKind`; do not mechanically replace every `is_managed_type`
+   call or treat `StackResultValue` as an ARC pointer. First make a site-specific
+   behavior matrix for current types: for example, `LiteralString` has
+   ownership work but is absent from the old managed-name set, and
+   `StackResult[Int, Int]` has a distinct ownership kind while the old
+   managed-type query is false. Check unchanged Perceus Core and generated C
+   after each migrated family, and delete the superseded local decision in
+   the same cut.
+2. **Make prepared ownership facts fail closed.** `PreparedCoreProgram` and
+   its plan records are currently public, so matching row counts and variants
+   alone is insufficient: a same-shape row with `needs_release = False`,
+   `NoCleanup`, or an inert cancellation action could suppress a real owner.
+   Bind plans semantically to the exact final Core program with an opaque
+   smart constructor that builds them together, or compare all relevant
+   facts against canonical builders at a checked entry if public records must
+   remain constructible. Validate row count/kind, union variant/field shape,
+   cancellation rows *and their actions*. Build/validate once for both single
+   and split emission, not once per output unit. A missing, mistagged, or
+   same-shape corrupted plan must produce a typed diagnostic, never
+   `NotACleanupType`, an empty plan, or an empty release statement. Check the
+   cost of any extra validation against stage-2 allocations/instructions;
+   existing valid-program C remains byte-identical. Do not remove old
+   defensive fallbacks until all relevant entries use the checked view.
+3. **Give backend-created owners explicit slot provenance.** Replace the
+   `FunctionBodyC.value` spelling test with a tagged body value: absent,
+   ordinary rendered expression, or addressable temporary with its stable
+   site/role and slot spelling. Constructors must establish the tag/slot
+   pairing; readers obtain rendered text through one accessor. The C spelling
+   is for rendering only, never the proof that cleanup is needed. Inventory
+   `FunctionBodyC` constructors and readers as well as its 91 recursive call
+   sites, then pilot one match/if-result family and its cancellation push/pop
+   before migrating other body values. Preserve the exact C text and test a
+   non-slot expression that resembles a generated name. If that full fanout
+   makes stable identity a broad emitter rewrite, stop and redesign this
+   slice rather than adding an unsynchronized boolean beside the string.
+4. **Prepare one action/ABI authority.** From that exact final program, its
+   validated cleanup/cancellation plans, and the projected C-symbol plan,
+   publish the release action and whether its target is passed by value or
+   address for each supported owner/temporary site. Core value-record types
+   currently carry names, not type definition ids: first validate a unique
+   name-to-declaration-row mapping across all emitted value-record, heap-record,
+   union, and enum declarations, and reject missing, wrong-kind, or duplicate
+   entries. Do not infer identity from a spelling convention or add a second
+   unvalidated name map. Start with the *existing* ARC, ARC-only, and
+   stack-Result cases and require byte-identical single-
+   and split-unit C. Reserve and check future inline helper/thunk names in
+   symbol projection when there is a real consumer; a missing owned-inline
+   helper must not use `c_emission_type_naming`'s fallback. Only after the
+   existing cases are proved should an inline-owned action be added. The
+   renderer must not repeat a type-only policy lookup or choose a different
+   callback ABI for a migrated site.
+
+`Option[FunctionBodyC]` remains the existing unsupported-expression channel;
+do not convert 61 helpers to always-`Ok` `Result` wrappers as speculative
+preparation. The checked authority must reject unsupported owned-inline
+placements *before* entering those `String`/`Option` renderers. If a required
+action can only be discovered while rendering, stop at that concrete site and
+convert the smallest owning call chain to `Result[_, CoreEmitError]` instead
+of emitting a placeholder release, silently omitting cleanup, or generating
+error C. This is the decision test for the prepared-authority route versus a
+broader `Result` emitter.
+
+Fast loop for each code slice: a focused Core policy/cancellation or emitter
+fixture (`test_core_type_policy.brp`, `test_cancellation_plan.brp`,
+`test_core_emit.brp`, `test_split_emit.brp` under `blorp/test/compiler/`),
+then `scripts/compiler-check --changed`. Compare the same fixture's Core and
+single/split C before and after. Forge missing and same-shape no-release
+cleanup plans, missing helper symbols, and duplicate or wrong-kind type names;
+each must fail with a typed diagnostic on the relevant single/split entry.
+For a production cut, use the verification
+protocol below, including serial sanitizer/leak gates and a matched,
+same-cwd `-O2` stage-2 allocation/instruction comparison. No preparatory
+slice claims a runtime allocation win or opens the public managed-field gate.
+
 Implement one vertical slice for a direct `String` or heap-record field in a
 non-generic fixed record, then expand to nested fixed records and other
 managed fields. A value has no ARC header of its own; its fields still have
