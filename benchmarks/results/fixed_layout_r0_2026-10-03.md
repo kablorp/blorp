@@ -77,14 +77,12 @@ This is a declaration inventory, not a construction or allocation count.
 | Closure environment capture | The typed capture path can be inline; `ClosureAbiStruct` call arguments/results box at `emit.brp`'s closure ABI boundary. |
 | Foreign boundary | No universal by-value contract was established here; R2 must check each exposed ABI before emission. |
 
-The frozen self-compile C contains 377 textual `blorp_box_struct(` occurrences.
-Seven are compiler string literals that quote generated C; the remaining 370
-still include helper/runtime/Option cases. This is a *static* text count, not
-an executable-site or allocation count. It does not say which calls execute or
-how often, nor does it identify 377 fixable struct allocations. Full
-self-compile per-declaration dynamic counts would need separate, isolated
-instrumentation; this R0 run did not alter generated C or the production
-compiler to obtain them.
+The frozen self-compile C has 377 matching *lines* for `blorp_box_struct(`.
+A lexical scan that excludes quoted strings and comments identifies 375 actual
+generated-C call expressions: some lines contain more than one call. The
+earlier estimate of 370 subtracted quoted-literal lines from matching lines
+and was not an expression count. These are static sites, not allocations;
+their executed counts appear in the bounded diagnostic below.
 
 For fresh nested ordinary records, a bounded source search for a literal in
 another literal finds `PerceusGlobal.value = { ... }` at
@@ -207,9 +205,10 @@ above. The build command used `--input blorp/build/_build/blorp-cli/stage2_main.
 `/tmp/fixed-layout-r0-stage2-probe.stderr`. These `/tmp` paths are temporary.
 The script SHA-256 at execution was
 `21c846196fd469f584e3db2e7b77ecb441f8762ab775b30f72f8db74b4fdd8b4`;
-its current SHA-256 is
+after a docstring-only correction, the historical script SHA-256 was
 `29183620f553f2c74b3db6597fead410889660dc764aa97344928def3b38a12e`
-after a docstring-only correction;
+and the current extended callsite-census script SHA-256 is
+`abdc751e8ef4a1a5457208ba3054c72eddc887b9f5ae974140eda5566d11c3fb`;
 the instrumented C SHA-256 was
 `0b6a59bb72fa70867fb2ba9f9b6015d75dcb95cf35fd196774e61793e507ea92`;
 the diagnostic binary SHA-256 was
@@ -255,3 +254,73 @@ ownership/leak evidence, RSS, and generated-C inspection as independent gates.
 The measured `PerceusGlobal` nested site gives a 3,178-allocation direct
 upper bound, but no broader R2/R3 self-compile allocation target is justified
 until another candidate's dynamic reachability and closure are established.
+
+### Bounded callsite census checkpoint
+
+The diagnostic-only script now assigns stable IDs 0–374 to the 375 actual
+generated-C `blorp_box_struct` call expressions in the pinned stage-2 body.
+It leaves calls inside strings/comments and the separately linked native
+runtime untouched. Its manifest records each original C line and the explicit
+`sizeof(C type)`, plus a destination only when the emitted operation proves it.
+The source `struct` inventory includes 157 declarations when `private struct`
+is counted; the earlier 108-declaration search omitted that spelling. Generated
+C does not carry an exact source-name mapping for value-struct typedefs, so all
+157 source rows remain **unattributed**, not zero-hit. The manifest's site IDs
+with no stderr counter row are the 280 zero-hit *callsites* in this run.
+
+Two temporary static scanner checks passed (quoted/commented calls and
+multiple calls on one line); `git diff --check` is clean. One serialized
+diagnostic build and one self-compile used the same frozen stage-2 body and
+input revision as above. The instrumented C SHA-256 is
+`5f74d194d31fe03ce7656e3347c6d0e8c4056719dba8f0f7b965b612cd69504d`;
+binary SHA-256 is
+`2f789098b3fc83a4eac7dc63ccb909e5d0801887f3e3f0b76e126225f53ba499`.
+The compiled output C SHA-256 is exactly the baseline
+`b8cdac82dacc0576cc2b095056e725a1d246b8cc7869454da58a31cc2ca7864f`.
+The emitted counter line independently repeats the prior 2,133,784 aggregate
+box calls, 295,205 `CoreParam` makers, and 3,178 each for `PerceusGlobal`
+makers and the selected nested site. The 95 nonzero callsite counters sum to
+**2,133,784**, reconciling exactly with that aggregate.
+
+| Proven destination in generated C | Executed boxes |
+| --- | ---: |
+| Stack `Result` payload | 1,016,018 |
+| Closure result ABI | 485,629 |
+| Closure argument ABI | 264,517 |
+| Stored tuple element | 39,310 |
+| Dictionary value | 29,790 |
+| List fallback | 0 |
+| Unknown destination | 298,520 |
+| **Total** | **2,133,784** |
+
+The unknown bucket is material. Its largest callsite, ID 88, executed 143,409
+times and passes a stack `Option[Int]` to generated `brp_c_872`; ID 57 executed
+76,256 times and passes another `Option[Int]` through a temporary before a
+generated constructor. The first has a directly visible constructor call but
+the current classifier leaves it unknown; the second needs a bounded
+producer/consumer trace to prove the sink. A second attribution pass could
+reduce the unknown bucket without a new compiled run. Neither call count
+establishes a source `struct` conversion opportunity: the hot unknown values
+are compiler-specialized stack Options. The high box traffic therefore does
+not itself identify an R3 parent/child pilot.
+
+Raw site counts and phase stderr are retained in
+[`fixed_layout_r0_box_sites_399096040.stderr`](fixed_layout_r0_box_sites_399096040.stderr)
+(SHA-256 `0f231e14da75831976fa163071e5085e1dd7ec884abc7f29492584ab4166e4d4`);
+the static site/declaration map is
+[`fixed_layout_r0_box_sites_399096040.json`](fixed_layout_r0_box_sites_399096040.json)
+(SHA-256 `36e0ed4a1a7b91f2e5b98fe8cc2e40ce1b6ba5383cbe74b26a34d49daba5ea14`).
+The temporary instrumented C, binary, and output C are not durable artifacts.
+
+This checkpoint does **not** close R0's per-declaration dynamic construction
+census or R3 parent construction/escape closure. Keep the production R3
+candidate unselected. A predeclared pilot admission bar is at least 1,069,159
+reachable removable child roots (0.5% of baseline allocations), with a net
+saved allocation count of at least 80% of that reach and no unexplained phase
+increase. The targeted fixture must still change from two allocations to one
+per construction and pass ownership/codegen gates. For a self-compile speed
+claim, the five serialized `-O2` stage-2 instruction samples must improve by
+more than the baseline 448,842,704-instruction spread (0.219%) with identical
+frozen inputs/toolchain; a regression larger than that spread rejects or
+requires explanation. R2's targeted ownership/allocation gate remains separate
+from this performance admission bar.
