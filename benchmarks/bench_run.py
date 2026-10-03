@@ -13,6 +13,29 @@ EXPECTED_OUTPUTS = {
     "numeric_loop": "Total Collatz steps: 131434272\n",
     "array_sum": "Completed 10000 iterations, total: 4995000000\n",
     "array_ops": "Completed 10000 iterations, final sum: 44955000000\n",
+    "dict_ops": (
+        "build: done\n"
+        "lookup_hit checksum: 34996500000\n"
+        "lookup_miss count: 1000000\n"
+        "remove count: 1000000\n"
+        "iterate sum: 349965000000\n"
+    ),
+    "list_ops": (
+        "append checksum: 5000000\n"
+        "sort checksum: 4999000\n"
+        "filter checksum: 2500000\n"
+        "fold checksum: 99990000000\n"
+        "reverse checksum: 10000000\n"
+        "concat checksum: 10000000\n"
+    ),
+    "set_ops": (
+        "build: done\n"
+        "contains_hit: 2000000\n"
+        "contains_miss: 2000000\n"
+        "union: 5000000\n"
+        "intersect: 2500000\n"
+        "difference: 2500000\n"
+    ),
 }
 BENCH_RE = re.compile(
     r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))",
