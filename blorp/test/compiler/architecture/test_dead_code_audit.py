@@ -19,6 +19,83 @@ class CompilerBlorpDeadCodeAuditTests(unittest.TestCase):
     def setUp(self) -> None:
         self.audit = runpy.run_path(str(SCRIPT))
 
+    def test_documentation_prose_does_not_create_declarations_or_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp_dir:
+            source_root = Path(raw_temp_dir) / "src"
+            source_root.mkdir()
+            source_root = source_root.resolve()
+            source = source_root / "sample.brp"
+            source.write_text(
+                """\
+---
+The backend emits record and union support:
+union destroy functions
+record Imaginary {
+    phantom: Int
+}
+---
+-- record AlsoImaginary {
+record Real {
+    value: Int
+}
+""",
+                encoding="utf-8",
+            )
+
+            self.audit["parse_declarations"].__globals__["SOURCE_ROOT"] = source_root
+            declarations, _ = self.audit["parse_declarations"]([source])
+            fields = self.audit["parse_fields"]([source])
+            real = self.audit["Node"]("sample", "Real")
+
+            self.assertEqual(set(declarations), {real})
+            self.assertEqual(declarations[real].line, 9)
+            self.assertEqual(
+                [(field.owner, field.name, field.line) for field in fields],
+                [("Real", "value", 10)],
+            )
+
+    def test_inline_comments_and_escaped_quotes_preserve_real_declarations(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp_dir:
+            source_root = Path(raw_temp_dir) / "src"
+            source_root.mkdir()
+            source_root = source_root.resolve()
+            source = source_root / "sample.brp"
+            text = r'''MESSAGE: String = "escaped \" keep -- union Quoted"
+COUNT: Int = 1 -- record Commented {
+record Real {
+    value: Int
+}
+'''
+            source.write_text(text, encoding="utf-8")
+
+            masked = self.audit["declaration_code"](text)
+            self.assertEqual(len(masked), len(text))
+            self.assertEqual(
+                [index for index, character in enumerate(masked) if character == "\n"],
+                [index for index, character in enumerate(text) if character == "\n"],
+            )
+            self.assertEqual(masked[text.index("keep") : text.index("keep") + 4], "    ")
+            comment = "-- record Commented {"
+            self.assertEqual(
+                masked[text.index(comment) : text.index(comment) + len(comment)],
+                " " * len(comment),
+            )
+
+            self.audit["parse_declarations"].__globals__["SOURCE_ROOT"] = source_root
+            declarations, _ = self.audit["parse_declarations"]([source])
+            self.assertEqual(
+                set(declarations),
+                {
+                    self.audit["Node"]("sample", "MESSAGE"),
+                    self.audit["Node"]("sample", "COUNT"),
+                    self.audit["Node"]("sample", "Real"),
+                },
+            )
+            self.assertEqual(
+                declarations[self.audit["Node"]("sample", "Real")].line,
+                3,
+            )
+
     def test_type_declarations_participate_in_reachability(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp_dir:
             source_root = Path(raw_temp_dir) / "src"
