@@ -573,6 +573,51 @@ fi
 
 echo "PASS: scripts/test compiles all selected runtime roots once"
 
+# Repeating explicit gates must not repeat their work or inflate the verdict.
+# Serial mode preserves argument order; parallel mode keeps the fixed wave order.
+runtime_test_command=$(cat "$TMP_HARNESS/test-command-log.txt")
+expected_std_root=$(CDPATH= cd -- "$TMP_HARNESS/standard_library/src" && pwd -P)
+for gate_mode in serial parallel; do
+	: > "$TMP_HARNESS/test-command-log.txt"
+	duplicate_gates_output="$TMP_HARNESS/duplicate-gates-$gate_mode-output.txt"
+	gate_options=(--no-build)
+	if [ "$gate_mode" = serial ]; then
+		gate_options+=(--serial)
+	fi
+	(
+		cd "$TMP_HARNESS" || exit 1
+		BLORP_TEST_LOCK_HELD=1 \
+			BLORP_TEST_COMMAND_EXIT=0 \
+			bash scripts/test "${gate_options[@]}" doctest runtime doctest runtime
+	) > "$duplicate_gates_output" 2>&1
+	duplicate_gates_status=$?
+
+	if [ "$gate_mode" = serial ]; then
+		expected_commands=$(printf '%s\n' \
+			"test --doc --std-dir $expected_std_root --timeout 30 $expected_std_root" \
+			"$runtime_test_command")
+	else
+		expected_commands=$(printf '%s\n' \
+			'test --warmup-only' \
+			"$runtime_test_command" \
+			"test --doc --std-dir $expected_std_root --timeout 30 $expected_std_root")
+	fi
+	if [ "$duplicate_gates_status" -ne 0 ] \
+		|| [ "$(cat "$TMP_HARNESS/test-command-log.txt")" != "$expected_commands" ] \
+		|| [ "$(grep -Ec '^[[:space:]]+Runtime[[:space:]]+PASS' "$duplicate_gates_output")" -ne 1 ] \
+		|| [ "$(grep -Ec '^[[:space:]]+Doctests[[:space:]]+PASS' "$duplicate_gates_output")" -ne 1 ] \
+		|| ! grep -Eq 'Total[[:space:]]+PASS[[:space:]]+2[[:space:]]+0[[:space:]]+2' "$duplicate_gates_output" \
+		|| [ "$(grep -Fc 'BLORP_GATE_RESULT gate=test status=PASS passed=2 failed=0 tests=2' "$duplicate_gates_output")" -ne 1 ]
+	then
+		echo "FAIL: scripts/test should run and summarize each $gate_mode gate once"
+		cat "$duplicate_gates_output"
+		cat "$TMP_HARNESS/test-command-log.txt"
+		exit 1
+	fi
+done
+
+echo "PASS: scripts/test deduplicates selected gates in serial and parallel runs"
+
 mkdir -p "$TMP_HARNESS/blorp/test/runtime/memory/leak_check_baselines"
 : > "$TMP_HARNESS/blorp/test/runtime/memory/leak_check_baselines/isolated_example.brp"
 
