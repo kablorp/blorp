@@ -173,51 +173,7 @@ is_built() {
 }
 
 run_and_read_seconds() {
-    "$PYTHON" - "$BENCH_WARMUPS" "$BENCH_RUNS" "$@" <<'PY'
-import re
-import subprocess
-import sys
-
-warmups = int(sys.argv[1])
-runs = int(sys.argv[2])
-cmd = sys.argv[3:]
-
-bench_re = re.compile(r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))", re.M)
-
-def run_once():
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc.returncode != 0:
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
-        raise SystemExit(proc.returncode)
-
-    match = None
-    for candidate in bench_re.finditer(proc.stderr):
-        match = candidate
-    if match is None:
-        sys.stderr.write("benchmark did not report a BENCH timing line\n")
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
-        raise SystemExit(125)
-
-    seconds, microseconds, micros = match.groups()
-    if seconds is not None:
-        return float(seconds)
-    if microseconds is not None:
-        return float(microseconds) / 1_000_000.0
-    return float(micros) / 1_000_000.0
-
-for _ in range(warmups):
-    run_once()
-
-samples = [run_once() for _ in range(runs)]
-print(f"{min(samples):.4f}")
-PY
+    "$PYTHON" "$SCRIPT_DIR/bench_run.py" "$BENCH_WARMUPS" "$BENCH_RUNS" "$@"
 }
 
 run_and_read_blorp_alloc_stats() {
@@ -559,16 +515,16 @@ run_built_lang() {
     if is_concurrency_benchmark "$name"; then
         case "$lang" in
             blorp)
-                run_and_read_seconds env "BLORP_THREADS=$BLORP_CONCURRENCY_THREADS" "$out" "${args[@]}"
+                run_and_read_seconds "$name" env "BLORP_THREADS=$BLORP_CONCURRENCY_THREADS" "$out" "${args[@]}"
                 return
                 ;;
             go)
-                run_and_read_seconds env "GOMAXPROCS=$GO_CONCURRENCY_THREADS" "$out" "${args[@]}"
+                run_and_read_seconds "$name" env "GOMAXPROCS=$GO_CONCURRENCY_THREADS" "$out" "${args[@]}"
                 return
                 ;;
         esac
     fi
-    run_and_read_seconds "$out" "${args[@]}"
+    run_and_read_seconds "$name" "$out" "${args[@]}"
 }
 
 run_blorp_alloc_stats() {
@@ -620,7 +576,7 @@ if callable(is_gil_enabled) and is_gil_enabled():
 PY
     fi
 
-    run_and_read_seconds "$py" "${py_args[@]}" "$runner" "$name" "$src" "${args[@]}"
+    run_and_read_seconds "$name" "$py" "${py_args[@]}" "$runner" "$name" "$src" "${args[@]}"
 }
 
 run_one() {

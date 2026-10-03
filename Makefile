@@ -568,6 +568,7 @@ tooling-check: build-blorp-cli
 # protect the scripts used to judge performance changes, not the compiler.
 # `quality`, and so CI and the premerge gate, run them.
 benchmark-tooling-check: build-blorp-cli
+	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_bench_runner.py
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_typecheck_worker.brp
 	@$(BLORP_CLI_BIN) check --no-format blorp/benchmark/compiler/compiler_backend_worker.brp
 	@PYTHONDONTWRITEBYTECODE=1 python3 -m unittest blorp/test/compiler/benchmark/test_backend_memory.py
