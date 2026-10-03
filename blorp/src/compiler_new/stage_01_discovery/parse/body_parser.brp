@@ -31,6 +31,7 @@ import:
 		OwnedRows,
 		advance_token,
 		append_plain_diagnostic,
+		append_syntax_diagnostic,
 		interpolation_part_at,
 		interpolation_parts_of,
 		interpolation_text_at,
@@ -40,13 +41,15 @@ import:
 		pending_annotation_count,
 		token_count,
 	../tables/diagnostic_code:
+		SyntaxDiagnostic(DuplicateFieldGiven),
 		PlainSyntaxCode(
 			AssignmentInConditionDiagnostic, AssignmentInExpressionDiagnostic,
 			BreakOutsideLoopDiagnostic, ConcurrentForMissingLimitDiagnostic,
 			ConcurrentForTupleBinderDiagnostic, ContinueOutsideLoopDiagnostic,
-			ExpectedAssignmentOperatorDiagnostic, ExpectedConcurrentParameterDiagnostic,
-			FieldAssignmentDiagnostic, InterpolationHoleNotExpressionDiagnostic,
-			TupleArityDiagnostic, WithMultipleBindingsDiagnostic,
+			DiscardedCompoundAssignmentDiagnostic, ExpectedAssignmentOperatorDiagnostic,
+			ExpectedConcurrentParameterDiagnostic, FieldAssignmentDiagnostic,
+			InterpolationHoleNotExpressionDiagnostic, TupleArityDiagnostic,
+			WithMultipleBindingsDiagnostic,
 		),
 	../tables/expected_token:
 		ColonConstruct(
@@ -97,12 +100,15 @@ import:
 		NameId,
 		NodeId,
 		SourceId,
+		name_ids_equal,
+	../tables/name_vocabulary: DISCARD_NAME, EMPTY_NAME
 	../tables/node_builder:
 		ChildMark,
 		append_literal_leaf_node,
 		append_local_function_node,
 		append_missing_parent_node_from_stack,
 		append_named_parent_node_from_stack,
+		span_of_child_named_since,
 		append_named_parent_node_since,
 		append_plain_leaf_node,
 		append_plain_parent_node_from_stack,
@@ -145,7 +151,7 @@ import:
 		),
 	../tables/rows: InterpolationPart(HolePart, TextPart), InterpolationPartRow, NodeRow, RowRange
 	../tables/source_position: LineColumn, span_start_line, span_start_position
-	../tables/span: Span, pack_span, span_covering, span_source, spans_equal
+	../tables/span: NO_SPAN, Span, pack_span, span_covering, span_source, spans_equal
 	../tables/token:
 		Token,
 		TokenKind(
@@ -224,8 +230,10 @@ import:
 		constraint_end,
 		definition_span,
 		function_body_follows,
+		indented_block_follows,
 		local_function_purity,
 		parse_signature,
+		report_missing_function_body,
 		skip_pure_keyword,
 		starts_local_function,
 	parser_cursor:
@@ -253,6 +261,7 @@ import:
 		referenced_name_at_cursor,
 		report_at_current,
 		report_expected,
+		report_expected_after_previous_content,
 		run_end,
 		skip_newlines,
 		skip_optional_token,
@@ -300,6 +309,17 @@ enum FunctionPlacement:
 
 
 ---
+Whether a function header that ends with no body is an error where it is
+written. A top-level function may be a forward declaration, whose body is
+another function of the same name; that is checked once the whole module is
+read (`forward_declarations`). Anywhere else the header must have its body.
+---
+private enum BodylessHeader:
+	ForwardDeclarationAllowed
+	BodyRequired
+
+
+---
 `func name[T](params) -> R where ... : body` for a function declared at
 `placement`; the header carries what came before `func`.
 ---
@@ -317,10 +337,16 @@ pure func parse_function(
 	match placement:
 		TopLevelFunction:
 			opening: FunctionOpening = out.function_opening(header, name, name_span)
-			out.parse_opened_function(header, opening, keyword_span, name_span)
+			out.parse_opened_function(
+				header,
+				opening,
+				keyword_span,
+				name_span,
+				ForwardDeclarationAllowed,
+			)
 		LocalFunction:
 			opening: FunctionOpening = out.local_function_opening(header, name, name_span)
-			out.parse_opened_function(header, opening, keyword_span, name_span)
+			out.parse_opened_function(header, opening, keyword_span, name_span, BodyRequired)
 
 
 ---
@@ -337,7 +363,7 @@ pure func parse_impl_method_function(
 	name_span: Span = out.current_span()
 	out = out.consume_declared_name(NameInFunctionName)
 	opening: FunctionOpening = out.impl_method_opening(header, owner, name, name_span)
-	out.parse_opened_function(header, opening, keyword_span, name_span)
+	out.parse_opened_function(header, opening, keyword_span, name_span, BodyRequired)
 
 
 ---
@@ -349,6 +375,7 @@ private pure func parse_opened_function(
 	opening: FunctionOpening,
 	keyword_span: Span,
 	name_span: Span,
+	bodyless: BodylessHeader,
 ) -> DiscoveryBuilder:
 	var out: DiscoveryBuilder = builder
 	out = out.open_function(opening)
@@ -381,13 +408,57 @@ private pure func parse_opened_function(
 			out = out.parse_function_body(header.module, opening, header.start)
 			has_body = True
 			end = out.node_span(out.last_node_id())
-	else if not (out.at(NewlineToken) or out.at_block_end()):
+		else:
+			out = out.report_bodyless_header(bodyless, name_span)
+	else if out.indented_block_follows():
+		-- The body is there and only the `:` is missing: report that and read the body,
+		-- so its lines are not each reported as stray declarations.
+		out = out.report_expected_after_previous_content(ExpectedColon(ColonInFunctionBody))
+		out = out.parse_function_body(header.module, opening, header.start)
+		has_body = True
+		end = out.node_span(out.last_node_id())
+	else if out.at(NewlineToken) or out.at_block_end():
+		out = out.report_colonless_header(bodyless, name_span)
+	else:
 		out = out.report_expected(ExpectedColon(ColonInFunctionBody))
 
 	if not has_body and end.spans_equal(name_span):
 		end = keyword_span
 
 	out.close_function(opening, end)
+
+
+---
+Reports a header that ends its line with neither a `:` nor a body. A forward
+declaration ends in `:`, so where one is allowed the missing `:` is the mistake;
+elsewhere the missing body is.
+---
+private pure func report_colonless_header(
+	builder: DiscoveryBuilder,
+	bodyless: BodylessHeader,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	match bodyless:
+		ForwardDeclarationAllowed:
+			builder.report_expected_after_previous_content(ExpectedColon(ColonInFunctionBody))
+		BodyRequired:
+			builder.report_missing_function_body(name_span)
+
+
+---
+Reports a function header that ends in `:` with no body, unless it may be a forward
+declaration.
+---
+private pure func report_bodyless_header(
+	builder: DiscoveryBuilder,
+	bodyless: BodylessHeader,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	match bodyless:
+		ForwardDeclarationAllowed:
+			builder
+		BodyRequired:
+			builder.report_missing_function_body(name_span)
 
 
 ---
@@ -740,13 +811,13 @@ private pure func parse_named_assignment_tail(
 		QuestionEqualsSymbol:
 			builder.parse_question_bind_value(scope, name, name_span, mark)
 		PlusEqualSymbol:
-			builder.parse_named_value(scope, AddAssignParent, name, name_span, mark)
+			builder.parse_compound_assignment_value(scope, AddAssignParent, name, name_span, mark)
 		MinusEqualSymbol:
-			builder.parse_named_value(scope, SubtractAssignParent, name, name_span, mark)
+			builder.parse_compound_assignment_value(scope, SubtractAssignParent, name, name_span, mark)
 		StarEqualSymbol:
-			builder.parse_named_value(scope, MultiplyAssignParent, name, name_span, mark)
+			builder.parse_compound_assignment_value(scope, MultiplyAssignParent, name, name_span, mark)
 		SlashEqualSymbol:
-			builder.parse_named_value(scope, DivideAssignParent, name, name_span, mark)
+			builder.parse_compound_assignment_value(scope, DivideAssignParent, name, name_span, mark)
 		_:
 			builder.missing_statement(name_span, mark, ExpectedAssignmentOperatorDiagnostic)
 
@@ -766,6 +837,26 @@ private pure func parse_named_value(
 		.advance_token()
 		.parse_assignment_value(scope, name_span)
 		.finish_named_statement(kind, name, name_span, mark)
+
+
+---
+The value of `name op= value` and the `kind` statement over it. `_` holds no
+value to update, so `_ += value` and its siblings are reported.
+---
+private pure func parse_compound_assignment_value(
+	builder: DiscoveryBuilder,
+	scope: BodyScope,
+	kind: NamedParentKind,
+	name: NameId,
+	name_span: Span,
+	mark: ChildMark,
+) -> DiscoveryBuilder:
+	if name.name_ids_equal(DISCARD_NAME):
+		builder
+			.append_plain_diagnostic(DiscardedCompoundAssignmentDiagnostic, name_span)
+			.parse_named_value(scope, kind, name, name_span, mark)
+	else:
+		builder.parse_named_value(scope, kind, name, name_span, mark)
 
 
 private pure func parse_question_bind_value(
@@ -2106,13 +2197,16 @@ private pure func parse_record_fields(
 	items: ListItems,
 ) -> DiscoveryBuilder:
 	var out: DiscoveryBuilder = builder
+	-- Taken from `out`: a later read of `builder` would keep it alive and make every
+	-- update copy its tables.
+	mark: ChildMark = out.mark_children()
 	var parsing: Bool = not ((
 		out.at(EndOfFileToken)
 		or items == MayBeEmpty and out.at(RightBraceSymbol)
 	))
 
 	while parsing:
-		out = out.parse_record_field(scope)
+		out = out.parse_record_field(scope, mark)
 		out = out.push_last_node()
 
 		if out.at(CommaSymbol):
@@ -2125,20 +2219,55 @@ private pure func parse_record_fields(
 
 
 ---
-`name = value`.
+The span of the field of the record literal or update being parsed (its fields are
+the children pushed since `mark`) that is already named `name`, else `NO_SPAN`. A
+missing name is no name, so it repeats nothing.
+---
+private pure func earlier_field_given(
+	builder: DiscoveryBuilder,
+	mark: ChildMark,
+	name: NameId,
+) -> Span:
+	if name.name_ids_equal(EMPTY_NAME):
+		NO_SPAN
+	else:
+		builder.span_of_child_named_since(mark, name)
+
+
+---
+Reports at `name_span` that the field was already given at `earlier`, unless
+`earlier` is `NO_SPAN`.
+---
+private pure func report_field_given_twice(
+	builder: DiscoveryBuilder,
+	earlier: Span,
+	name_span: Span,
+) -> DiscoveryBuilder:
+	if earlier.spans_equal(NO_SPAN):
+		builder
+	else:
+		builder.append_syntax_diagnostic(name_span, DuplicateFieldGiven(earlier))
+
+
+---
+`name = value`, where `mark` is the start of the fields of the record literal or
+update (a field already given under the name is reported).
 ---
 private pure func parse_record_field(
 	builder: DiscoveryBuilder,
 	scope: BodyScope,
+	mark: ChildMark,
 ) -> DiscoveryBuilder:
 	name: NameId = builder.referenced_name_at_cursor()
 	name_span: Span = builder.current_span()
+	earlier: Span = builder.earlier_field_given(mark, name)
 	out: DiscoveryBuilder = builder
 		.consume_referenced_name(NameInRecordFieldName)
 		.expect_equal(EqualInRecordFieldName)
 		.parse_expression(scope)
 	value_span: Span = out.node_span(out.last_node_id())
 	out
+		.report_field_given_twice(earlier, name_span)
 		.push_last_node()
 		.append_named_parent_node_from_stack(
 			RecordFieldParent,

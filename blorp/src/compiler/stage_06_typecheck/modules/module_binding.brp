@@ -1190,15 +1190,19 @@ private pure func import_std_package_error(
 	)
 
 
+---
+The error for a selective import of a name the module declares `private`.
+---
+pure func private_import_message(module_path: String, symbol_name: String) -> String:
+	"'" + symbol_name + "' is private in module '" + module_path + "' and cannot be imported"
+
+
 private pure func import_private_symbol_error(
 	state: TypecheckState,
 	module_path: String,
 	symbol_name: String,
 ) -> TypecheckState:
-	typecheck_state_add_error(
-		state,
-		"'" + symbol_name + "' is private in module '" + module_path + "' and cannot be imported",
-	)
+	typecheck_state_add_error(state, private_import_message(module_path, symbol_name))
 
 
 private pure func import_missing_symbol_error(
@@ -1360,14 +1364,10 @@ private pure func register_import_symbol(
 			else:
 				registration.state
 		None:
-			match find_surface_symbol(
-				importable_surface_value(imported_module).private_names,
-				original_name,
-			):
-				Some(_):
-					import_private_symbol_error(state, module_path, original_name)
-				None:
-					import_missing_symbol_error(state, module_path, original_name)
+			if imported_symbol_is_private(imported_module, original_name):
+				import_private_symbol_error(state, module_path, original_name)
+			else:
+				import_missing_symbol_error(state, module_path, original_name)
 
 
 private pure func register_import_constructor_for_module(
@@ -1493,6 +1493,60 @@ private pure func apply_import_decl_decision(
 							import_default_alias(decl.module_path)
 
 					register_import_module_alias(state, imported_module, alias_name)
+
+
+---
+Whether `original_name` is declared in `imported_module` but not exported: a
+selective import of it is rejected as private.
+---
+private pure func imported_symbol_is_private(
+	imported_module: ImportableModuleSurface,
+	original_name: String,
+) -> Bool:
+	is_exported: Bool = match importable_module_surface_rep(imported_module):
+		GraphImportableModuleSurface(_, _, _, _, _, targets):
+			exported_definition_targets_find(targets, original_name).is_some()
+		StandaloneImportableModuleSurface(_, _, module_surface):
+			find_surface_symbol(module_surface.exports, original_name).is_some()
+
+	private_names: List[ModuleSurfaceSymbol] = importable_surface_value(imported_module).private_names
+
+	not is_exported and find_surface_symbol(private_names, original_name).is_some()
+
+
+---
+The module path and original name of the private declaration `program`
+selectively imports as `local_name`, when that import is therefore rejected.
+Header resolution uses it to report the import's own error instead of an
+unknown type. `visible_modules` are the modules the program's imports select
+from.
+---
+pure func program_rejected_private_import(
+	program: ParsedProgram,
+	visible_modules: List[ImportableModule],
+	local_name: String,
+) -> Option[(String, String)]:
+	index = import_module_index(visible_modules.map(importable_module_to_surface))
+	var found: Option[(String, String)] = None
+
+	for parsed_decl in program.decls:
+		match parsed_decl:
+			ImportBlockParsedDecl(imports, _):
+				for import_decl in imports:
+					match (import_decl.symbols, decide_import_decl(index, import_decl, {}, False)):
+						(Some(symbols), ImportDeclSelected(imported_module)):
+							for symbol in symbols:
+								if (
+									import_symbol_local_name(symbol) == local_name
+									and imported_symbol_is_private(imported_module, symbol.name.text)
+								):
+									found = Some((importable_module_surface_path(imported_module), symbol.name.text))
+						_:
+							void
+			_:
+				void
+
+	found
 
 
 pure func register_program_imports(

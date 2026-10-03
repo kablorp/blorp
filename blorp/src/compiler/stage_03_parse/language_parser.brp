@@ -19,6 +19,7 @@ import:
 		NameTable,
 		SYNTHESIZED_NAME_TABLE,
 		name_id_from_interned_index,
+		name_id_index,
 		name_id_unseeded_spelling,
 		name_ids_equal,
 		name_table_dict,
@@ -172,6 +173,24 @@ private EXPECTED_FOREIGN_BLOCK_ARG: String = "foreign block argument"
 private EXPECTED_CONCURRENT_PARAM: String = "concurrent parameter"
 
 private PREC_LOWEST: Int = 0
+
+private MISSING_FUNCTION_BODY_MESSAGE: String = "function has no body"
+
+private MISSING_FUNCTION_BODY_HELP: String = (
+	"a function body must have at least one expression or statement, indented on the lines "
+	+ "below the header; write `void` for a body that does nothing"
+)
+
+private UNPAIRED_FORWARD_DECLARATION_HELP: String = (
+	"a function body must have at least one expression or statement (`void` does nothing); a "
+	+ "header with no body is a forward declaration, which needs a function of the same name "
+	+ "with a body"
+)
+
+private MISSING_COLON_HELP: String = (
+	"a block header ends with `:` before its indented body, as in `if condition:` or "
+	+ "`func name() -> Type:`"
+)
 
 private ASSIGNMENT_IN_CONDITION_MESSAGE: String = (
 	"A condition cannot be an assignment. Use `==` to compare, or assign on its own line before "
@@ -776,6 +795,31 @@ private pure func eof_location(state: ParserInput) -> SourceLocation:
 	offset: Int = state.source.text.length() + state.location_offset_delta
 
 	source_location_from_offsets(state.file_id, offset, offset)
+
+
+---
+An empty location just after the last token before `index` that is not layout
+(a newline, indent or dedent): where a construct that stopped short ended. The
+layout tokens after it sit where the next line starts, or past the end of the
+source, so a missing piece of a line is reported here instead.
+---
+private pure func location_after_previous_content(state: ParserInput, index: Int) -> SourceLocation:
+	var previous: Int = index - 1
+
+	while previous >= 0 and is_layout_tag(current_tag(state, previous)):
+		previous -= 1
+
+	end_offset: Int = state.end_offsets.get_or(previous, 0) + state.location_offset_delta
+
+	source_location_from_offsets(state.file_id, end_offset, end_offset)
+
+
+private pure func is_layout_tag(tag: TokenTag) -> Bool:
+	match tag:
+		NewlineTag | IndentTag | DedentTag:
+			True
+		_:
+			False
 
 
 private pure func current_tag(state: ParserInput, index: Int) -> TokenTag:
@@ -2139,11 +2183,54 @@ private pure func parse_dim_constraints_opt(
 	}
 
 
+---
+Where a type is written, which decides what a bound `Name: Bound` inside it
+means. Only an `implements` receiver introduces type parameters in a type
+(`Labeled[T: Stringable]`), so only its arguments may carry bounds; anywhere
+else a bound is reported, because type parameters are declared in a
+declaration's bracket list. At the top of a type a `:` after a name belongs to
+what follows.
+
+- `OrdinaryType`: an annotation, a return type, a field, a payload, an alias.
+- `OrdinaryArgument`: inside brackets or parentheses of an ordinary type.
+- `ReceiverType`: the type an `implements` block is for.
+- `ReceiverArgument`: inside brackets or parentheses of a receiver.
+---
+private enum TypeContext:
+	OrdinaryType
+	OrdinaryArgument
+	ReceiverType
+	ReceiverArgument
+
+
+---
+The context of the arguments of a type written in `context`.
+---
+private pure func argument_context(context: TypeContext) -> TypeContext:
+	match context:
+		OrdinaryType | OrdinaryArgument:
+			OrdinaryArgument
+		ReceiverType | ReceiverArgument:
+			ReceiverArgument
+
+
+---
+The context of a function type's return type, which is a type of its own.
+---
+private pure func return_context(context: TypeContext) -> TypeContext:
+	match context:
+		OrdinaryType | OrdinaryArgument:
+			OrdinaryType
+		ReceiverType | ReceiverArgument:
+			ReceiverType
+
+
 private pure func parse_type_array_suffixes(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	base: ParsedTypeExpr,
+	context: TypeContext,
 ) -> ParseTypeStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -2156,6 +2243,7 @@ private pure func parse_type_array_suffixes(
 			st_diag,
 			RightBracketSymbol,
 			False,
+			argument_context(context),
 		)
 		right_step: ParseSymbolStep = expect_symbol(state, dims_step.index, RightBracketSymbol)
 		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -2196,11 +2284,11 @@ private pure func parse_type_array_suffixes(
 	}
 
 
-private pure func parse_named_type_expr_with_bounds(
+private pure func parse_named_type_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	allow_bounds: Bool,
+	context: TypeContext,
 ) -> ParseTypeStep:
 	can_qualify: Bool = match current_tag(state, index):
 		IdentifierTag:
@@ -2221,7 +2309,33 @@ private pure func parse_named_type_expr_with_bounds(
 	var args: List[ParsedTypeExpr] = []
 	var end_span: SourceLocation = first_name_step.value.span
 
-	if allow_bounds and current_is_symbol(state, st, ColonSymbol):
+	if context == OrdinaryArgument and current_is_symbol(state, st, ColonSymbol):
+		-- The bounds are parsed so recovery skips them, then dropped: the type is
+		-- the name alone.
+		bounds_step: ParseTraitReferenceListStep = parse_plus_separated_trait_reference_list(
+			state,
+			advance_parser(state, st),
+			st_diag,
+			"trait bound",
+		)
+		bound_span: SourceLocation = location_cover(
+			type_name.span,
+			last_trait_reference_span(bounds_step.values, type_name.span),
+		)
+
+		{
+			index = bounds_step.index,
+			diagnostics = add_expected_error(
+				state,
+				bounds_step.diagnostics,
+				bound_span,
+				"a bound cannot be written inside a type",
+				[],
+				Some("declare the type parameter with its bounds in brackets, such as `func show[T: Equatable](x: T)`"),
+			),
+			value = ParsedNamedType(type_name, [], type_name.span)
+		}
+	else if context == ReceiverArgument and current_is_symbol(state, st, ColonSymbol):
 		bounds_step: ParseTraitReferenceListStep = parse_plus_separated_trait_reference_list(
 			state,
 			advance_parser(state, st),
@@ -2262,6 +2376,7 @@ private pure func parse_named_type_expr_with_bounds(
 				st_diag,
 				RightBracketSymbol,
 				True,
+				argument_context(context),
 			)
 			right_step: ParseSymbolStep = expect_symbol(state, args_step.index, RightBracketSymbol)
 			right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -2296,7 +2411,7 @@ private pure func parse_named_type_expr_with_bounds(
 				args,
 				location_cover(parsed_type_expr_location(base_type), end_span),
 			)
-			parse_type_array_suffixes(state, st, st_diag, array_type)
+			parse_type_array_suffixes(state, st, st_diag, array_type, context)
 		else:
 			named_type: ParsedTypeExpr = match qualifier:
 				Some(module_name):
@@ -2313,13 +2428,14 @@ private pure func parse_named_type_expr_with_bounds(
 						location_cover(type_name.span, end_span),
 					)
 
-			parse_type_array_suffixes(state, st, st_diag, named_type)
+			parse_type_array_suffixes(state, st, st_diag, named_type, context)
 
 
 private pure func parse_parenthesized_type_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
+	context: TypeContext,
 ) -> ParseTypeStep:
 	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
@@ -2353,10 +2469,11 @@ private pure func parse_parenthesized_type_expr(
 		)
 
 		if current_is_symbol(state, st, ArrowSymbol):
-			return_step: ParseTypeStep = parse_type_expr(
+			return_step: ParseTypeStep = parse_type_expr_in(
 				state,
 				advance_parser(state, st),
 				st_diag,
+				return_context(context),
 			)
 
 			{
@@ -2370,7 +2487,7 @@ private pure func parse_parenthesized_type_expr(
 				)
 			}
 		else:
-			parse_type_array_suffixes(state, st, st_diag, void_type)
+			parse_type_array_suffixes(state, st, st_diag, void_type, context)
 	else:
 		items_step: ParseTypeListStep = parse_type_expr_list_until(
 			state,
@@ -2378,6 +2495,7 @@ private pure func parse_parenthesized_type_expr(
 			st_diag,
 			RightParenSymbol,
 			False,
+			argument_context(context),
 		)
 		right_step: ParseSymbolStep = expect_symbol(state, items_step.index, RightParenSymbol)
 		right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -2391,10 +2509,11 @@ private pure func parse_parenthesized_type_expr(
 		st_diag = right_step_diagnostics
 
 		if current_is_symbol(state, st, ArrowSymbol):
-			return_step: ParseTypeStep = parse_type_expr(
+			return_step: ParseTypeStep = parse_type_expr_in(
 				state,
 				advance_parser(state, st),
 				st_diag,
+				return_context(context),
 			)
 
 			{
@@ -2433,13 +2552,14 @@ private pure func parse_parenthesized_type_expr(
 					),
 				)
 
-			parse_type_array_suffixes(state, st, st_diag, base_type)
+			parse_type_array_suffixes(state, st, st_diag, base_type, context)
 
 
 private pure func parse_pure_function_type_expr(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
+	context: TypeContext,
 ) -> ParseTypeStep:
 	start_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
@@ -2460,6 +2580,7 @@ private pure func parse_pure_function_type_expr(
 		st_diag,
 		RightParenSymbol,
 		True,
+		argument_context(context),
 	)
 	right_step: ParseSymbolStep = expect_symbol(state, params_step.index, RightParenSymbol)
 	right_step_diagnostics: List[ParseDiagnostic] = expect_symbol_diagnostics(
@@ -2479,7 +2600,12 @@ private pure func parse_pure_function_type_expr(
 		ArrowSymbol,
 		"expected `->` after function type parameters",
 	)
-	return_step: ParseTypeStep = parse_type_expr(state, arrow_step.index, arrow_step_diagnostics)
+	return_step: ParseTypeStep = parse_type_expr_in(
+		state,
+		arrow_step.index,
+		arrow_step_diagnostics,
+		return_context(context),
+	)
 
 	{
 		index = return_step.index,
@@ -2577,22 +2703,22 @@ private pure func parse_type_expr_missing(
 	}
 
 
-private pure func parse_type_expr_allow_bounds(
+private pure func parse_type_expr_in(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	allow_bounds: Bool,
+	context: TypeContext,
 ) -> ParseTypeStep:
 	match current_tag(state, index):
 		IdentifierTag:
-			parse_named_type_expr_with_bounds(state, index, diagnostics, allow_bounds)
+			parse_named_type_expr(state, index, diagnostics, context)
 		KeywordTag:
 			keyword: Keyword = current_keyword(state, index)
 
 			if keyword == SelfKeyword or keyword == VoidKeyword:
-				parse_named_type_expr_with_bounds(state, index, diagnostics, allow_bounds)
+				parse_named_type_expr(state, index, diagnostics, context)
 			else if keyword == PureKeyword:
-				parse_pure_function_type_expr(state, index, diagnostics)
+				parse_pure_function_type_expr(state, index, diagnostics, context)
 			else:
 				parse_type_expr_missing(state, index, diagnostics)
 		SymbolTag:
@@ -2606,7 +2732,7 @@ private pure func parse_type_expr_allow_bounds(
 				if starts_parenthesized_dim_expr(state, index):
 					parse_dim_expr(state, index, diagnostics)
 				else:
-					parse_parenthesized_type_expr(state, index, diagnostics)
+					parse_parenthesized_type_expr(state, index, diagnostics, context)
 			else:
 				parse_type_expr_missing(state, index, diagnostics)
 		IntLiteralTag:
@@ -2620,7 +2746,19 @@ private pure func parse_type_expr(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseTypeStep:
-	parse_type_expr_allow_bounds(state, index, diagnostics, False)
+	parse_type_expr_in(state, index, diagnostics, OrdinaryType)
+
+
+---
+The type an `implements` block is for. Its arguments may introduce type
+parameters, bare or bounded.
+---
+private pure func parse_receiver_type_expr(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+) -> ParseTypeStep:
+	parse_type_expr_in(state, index, diagnostics, ReceiverType)
 
 
 private pure func param_location_from_start(
@@ -2943,6 +3081,7 @@ private pure func parse_type_expr_list_until(
 	diagnostics: List[ParseDiagnostic],
 	end_symbol: Symbol,
 	allow_empty: Bool,
+	item_context: TypeContext,
 ) -> ParseTypeListStep:
 	var st: Int = index
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -2958,7 +3097,7 @@ private pure func parse_type_expr_list_until(
 		var parsing_values: Bool = True
 
 		while parsing_values and not current_is_eof(state, st):
-			type_step: ParseTypeStep = parse_type_expr_allow_bounds(state, st, st_diag, True)
+			type_step: ParseTypeStep = parse_type_expr_in(state, st, st_diag, item_context)
 			values = values.append(type_step.value)
 			st = type_step.index
 			st_diag = type_step.diagnostics
@@ -3001,6 +3140,18 @@ private pure func parse_type_param_decl(
 	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, ColonSymbol):
+		-- A dimension is a number, not a type, so no trait bounds it; the bounds
+		-- are still parsed so recovery skips them.
+		if is_dimension_parameter:
+			st_diag = add_expected_error(
+				state,
+				st_diag,
+				current_location(state, st),
+				"a dimension parameter cannot have trait bounds",
+				[],
+				Some("remove the bounds: a dimension is a number, so only type parameters such as `T: Equatable` take them"),
+			)
+
 		bounds_step: ParseTraitReferenceListStep = parse_plus_separated_trait_reference_list(
 			state,
 			advance_parser(state, st),
@@ -5220,6 +5371,11 @@ private pure func parse_with_expr(
 	}
 
 
+---
+The largest `Int`, in decimal digits.
+---
+private INT_MAX_DECIMAL: String = "9223372036854775807"
+
 private CONCURRENT_PARAM_MAX_THREADS: String = "max_threads"
 
 private CONCURRENT_PARAM_TIMEOUT: String = "timeout"
@@ -5249,17 +5405,17 @@ private record ConcurrentParameterScan {
 
 ---
 The positive integer a literal writes, or None for any other expression,
-zero or a negative number. Negation is a separate expression node, so `-1`
-is not a literal here. `parse_int` saturates a literal above `Int`'s range
-and this accepts the saturated value; rejecting oversized literals is a
-general rule for typecheck (a literal must fit its type), not a check here.
+zero, a negative number or a literal above `Int`'s range. Negation is a
+separate expression node, so `-1` is not a literal here. `parse_int`
+saturates an oversized literal, so the digits are compared with `Int`'s
+largest value instead.
 ---
 private pure func positive_int_literal_value(value: ParsedExpr) -> Option[Int]:
 	match value:
 		ParsedIntLiteralExpr(text, _):
 			match text.parse_int():
 				Some(number):
-					if number > 0:
+					if number > 0 and decimal_digits_fit_int(text):
 						Some(number)
 					else:
 						None
@@ -5267,6 +5423,26 @@ private pure func positive_int_literal_value(value: ParsedExpr) -> Option[Int]:
 					None
 		_:
 			None
+
+
+---
+Whether the decimal digits `text` write a value of at most `Int`'s largest,
+ignoring leading zeros. Only a literal as long as `Int`'s largest is sliced and
+compared, so counting digits allocates nothing. Duplicated in the discovery
+stage until this parser is removed.
+---
+private pure func decimal_digits_fit_int(text: String) -> Bool:
+	var first_digit: Int = 0
+
+	while first_digit + 1 < text.length() and text.get_or(first_digit, '0') == '0':
+		first_digit += 1
+
+	significant: Int = text.length() - first_digit
+
+	if significant != INT_MAX_DECIMAL.length():
+		significant < INT_MAX_DECIMAL.length()
+	else:
+		text.drop_left(first_digit) <= INT_MAX_DECIMAL
 
 
 private pure func add_concurrent_param_error(
@@ -5339,7 +5515,7 @@ private pure func scan_concurrent_params(
 							state,
 							next_diag,
 							parsed_expr_location(param.value),
-							"`${name}` must be a positive integer literal",
+							"`${name}` must be a positive integer literal, at most ${INT_MAX_DECIMAL}",
 							"write `${count_example}`",
 						)
 		else:
@@ -6114,10 +6290,24 @@ private pure func parse_named_assignment_tail(
 	else:
 		match current_compound_assign_op(state, index):
 			Some(op):
+				-- `_` holds no value to update; reported before the value is parsed, so
+				-- it comes first as it does in the discovery stage.
+				operator_diagnostics: List[ParseDiagnostic] = if identifier_is_underscore(state, name):
+					add_expected_error(
+						state,
+						diagnostics,
+						name.span,
+						"compound assignment cannot update `_`",
+						[],
+						Some("name the variable you are updating, such as `total += value`; `_` only discards a value"),
+					)
+				else:
+					diagnostics
+
 				value_step: ParseExprStep = parse_assignment_value_expr(
 					state,
 					advance_parser(state, index),
-					diagnostics,
+					operator_diagnostics,
 					name.span,
 				)
 
@@ -6283,6 +6473,7 @@ private pure func parse_nested_function_decl_expr(
 		is_pure,
 		[],
 		start_span,
+		BodyRequired,
 	)
 
 	{
@@ -6850,6 +7041,39 @@ private pure func parse_record_expr_field(
 	}
 
 
+---
+`diagnostics` with a report at `field`'s name when an earlier field of the same
+record literal or update has that name. A missing name is no name.
+---
+private pure func report_field_given_twice(
+	state: ParserInput,
+	earlier: List[ParsedRecordExprField],
+	field: ParsedRecordExprField,
+	diagnostics: List[ParseDiagnostic],
+) -> List[ParseDiagnostic]:
+	repeated: Option[ParsedRecordExprField] = if field.name.text.is_empty():
+		None
+	else:
+		earlier.find(pure func(candidate): candidate.name.name.name_ids_equal(field.name.name))
+
+	match repeated:
+		Some(first):
+			add_expected_error(
+				state,
+				diagnostics,
+				field.name.span,
+				"duplicate field `" + field.name.text + "`",
+				[],
+				Some(
+					"the field was already given at "
+					+ location_text(state, first.name.span)
+					+ "; give it once",
+				),
+			)
+		None:
+			diagnostics
+
+
 private pure func parse_record_expr_field_list_until_right_brace(
 	state: ParserInput,
 	index: Int,
@@ -6871,9 +7095,14 @@ private pure func parse_record_expr_field_list_until_right_brace(
 
 		while parsing_fields and not current_is_eof(state, st):
 			field_step: ParseRecordExprFieldStep = parse_record_expr_field(state, st, st_diag)
+			st_diag = report_field_given_twice(
+				state,
+				fields,
+				field_step.value,
+				field_step.diagnostics,
+			)
 			fields = fields.append(field_step.value)
 			st = field_step.index
-			st_diag = field_step.diagnostics
 
 			if current_is_symbol(state, st, CommaSymbol):
 				st = advance_parser(state, st)
@@ -8023,6 +8252,152 @@ private pure func parse_function_body(
 		}
 
 
+---
+Whether a body follows the `:` at token `colon_index`: not the end of a block, not
+a new line without an indented block, and not a token on a later line (which
+belongs to what follows).
+---
+private pure func function_body_follows_colon(
+	state: ParserInput,
+	index: Int,
+	colon_index: Int,
+) -> Bool:
+	if current_is_eof(state, index) or current_is_dedent(state, index):
+		False
+	else if current_is_newline(state, index):
+		current_is_indent(state, advance_parser(state, index))
+	else:
+		state.start_lines.get_or(index, 0) <= state.start_lines.get_or(colon_index, 0)
+
+
+---
+Whether a function header that ends with no body is an error where it is
+written. A top-level function may be a forward declaration, whose body is
+another function of the same name; that is checked once the whole module is
+read (`report_unpaired_forward_declarations`). Anywhere else the header must
+have its body.
+---
+private enum BodylessHeader:
+	ForwardDeclarationAllowed
+	BodyRequired
+
+
+---
+The step for a function header that ends with no body: a function must have
+one, except a forward declaration where `bodyless` allows it. The error is
+at the function's name.
+---
+private pure func bodyless_header_step(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	name_span: SourceLocation,
+	bodyless: BodylessHeader,
+) -> ParseBodyStep:
+	reported: List[ParseDiagnostic] = match bodyless:
+		ForwardDeclarationAllowed:
+			diagnostics
+		BodyRequired:
+			diagnostics.append(
+				missing_function_body_error(state, name_span, MISSING_FUNCTION_BODY_HELP),
+			)
+
+	{
+		index = index,
+		diagnostics = reported,
+		body = None
+	}
+
+
+---
+The step for a header that ends its line with neither a `:` nor a body. A forward
+declaration ends in `:`, so where one is allowed the missing `:` is the mistake;
+elsewhere the missing body is.
+---
+private pure func colonless_header_step(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	name_span: SourceLocation,
+	bodyless: BodylessHeader,
+) -> ParseBodyStep:
+	match bodyless:
+		ForwardDeclarationAllowed:
+			{
+				index = index,
+				diagnostics = add_expected_error(
+					state,
+					diagnostics,
+					location_after_previous_content(state, index),
+					"expected `:` before function body",
+					[":"],
+					Some(MISSING_COLON_HELP),
+				),
+				body = None
+			}
+		BodyRequired:
+			bodyless_header_step(state, index, diagnostics, name_span, bodyless)
+
+
+private pure func missing_function_body_error(
+	state: ParserInput,
+	name_span: SourceLocation,
+	help: String,
+) -> ParseDiagnostic:
+	parse_error_expected(
+		parser_location_span(state, name_span),
+		MISSING_FUNCTION_BODY_MESSAGE,
+		[],
+		Some(help),
+	)
+
+
+---
+Reports each top-level function with no body and no same-named top-level
+function with one: a forward declaration needs the function that supplies its
+body. Run only on a module with no other diagnostic, because an earlier syntax
+error can itself leave a header without its body.
+---
+private pure func report_unpaired_forward_declarations(
+	state: ParserInput,
+	decls: List[ParsedDecl],
+	diagnostics: List[ParseDiagnostic],
+) -> List[ParseDiagnostic]:
+	if not diagnostics.is_empty():
+		diagnostics
+	else:
+		var names_with_body: Dict[Int, Bool] = {}
+
+		for decl in decls:
+			match decl:
+				FunctionParsedDecl(function):
+					if function.body.is_some():
+						names_with_body = names_with_body.set(function.name.name.name_id_index(), True)
+				_:
+					void
+
+		var reported: List[ParseDiagnostic] = diagnostics
+
+		for decl in decls:
+			match decl:
+				FunctionParsedDecl(function):
+					if (
+						function.body.is_none()
+						and not names_with_body.get_or(function.name.name.name_id_index(), False)
+					):
+						reported = reported.append(
+							missing_function_body_error(
+								state,
+								function.name.span,
+								UNPAIRED_FORWARD_DECLARATION_HELP,
+							),
+						)
+				_:
+					void
+
+		reported
+
+
 private pure func parse_function_decl_value(
 	state: ParserInput,
 	index: Int,
@@ -8031,6 +8406,7 @@ private pure func parse_function_decl_value(
 	is_pure: Bool,
 	annotations: List[ParsedFunctionAnnotation],
 	start_span: SourceLocation,
+	bodyless: BodylessHeader,
 ) -> ParseFunctionStep:
 	func_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
@@ -8098,42 +8474,28 @@ private pure func parse_function_decl_value(
 		st = colon_step.index
 		st_diag = colon_step_diagnostics
 
-		if current_is_eof(state, st) or current_is_dedent(state, st):
-			{
-				index = st,
-				diagnostics = st_diag,
-				body = None
-			}
-		else if current_is_newline(state, st) and not current_is_indent(
-			state,
-			advance_parser(state, st),
-		):
-			{
-				index = st,
-				diagnostics = st_diag,
-				body = None
-			}
-		else if (
-			not current_is_newline(state, st)
-			and state.start_lines.get_or(st, 0) > state.start_lines.get_or(colon_step.span.first, 0)
-		):
-			{
-				index = st,
-				diagnostics = st_diag,
-				body = None
-			}
-		else:
+		if function_body_follows_colon(state, st, colon_step.span.first):
 			parse_function_body(state, st, st_diag, start_span)
+		else:
+			bodyless_header_step(state, st, st_diag, name_step.value.span, bodyless)
+	else if current_is_newline(state, st) and current_is_indent(state, advance_parser(state, st)):
+		-- The body is there and only the `:` is missing: report that and read the body,
+		-- so its lines are not each reported as stray declarations.
+		missing_colon_diagnostics: List[ParseDiagnostic] = add_expected_error(
+			state,
+			st_diag,
+			location_after_previous_content(state, st),
+			"expected `:` before function body",
+			[":"],
+			Some(MISSING_COLON_HELP),
+		)
+		parse_function_body(state, st, missing_colon_diagnostics, start_span)
 	else if (
 		current_is_newline(state, st)
 		or current_is_dedent(state, st)
 		or current_is_eof(state, st)
 	):
-		{
-			index = st,
-			diagnostics = st_diag,
-			body = None
-		}
+		colonless_header_step(state, st, st_diag, name_step.value.span, bodyless)
 	else:
 		error_state: Int = st
 		error_state_diag: List[ParseDiagnostic] = add_expected_error(
@@ -8142,7 +8504,7 @@ private pure func parse_function_decl_value(
 			current_location(state, st),
 			"expected `:` before function body",
 			[":"],
-			None,
+			Some(MISSING_COLON_HELP),
 		)
 		{
 			index = error_state,
@@ -8196,6 +8558,7 @@ private pure func parse_function_decl(
 		is_pure,
 		annotations,
 		start_span,
+		ForwardDeclarationAllowed,
 	)
 
 	{
@@ -9127,6 +9490,49 @@ private pure func parse_field_decl(
 	}
 
 
+---
+`line:column` of where `location` starts.
+---
+private pure func location_text(state: ParserInput, location: SourceLocation) -> String:
+	position: SourceSpan = parser_location_span(state, location)
+	position.start_line.to_string() + ":" + position.start_column.to_string()
+
+
+---
+`diagnostics` with a report at `field`'s name when an earlier field of the same
+declaration has that name. The field names of one declaration are local to it,
+so the parser sees the repeat before any later phase does.
+---
+private pure func report_duplicate_field(
+	state: ParserInput,
+	earlier: List[ParsedFieldDecl],
+	field: ParsedFieldDecl,
+	diagnostics: List[ParseDiagnostic],
+) -> List[ParseDiagnostic]:
+	-- A missing name is no name, so it repeats nothing.
+	repeated: Option[ParsedFieldDecl] = if field.name.text.is_empty():
+		None
+	else:
+		earlier.find(pure func(candidate): candidate.name.name.name_ids_equal(field.name.name))
+
+	match repeated:
+		Some(first):
+			add_expected_error(
+				state,
+				diagnostics,
+				field.name.span,
+				"duplicate field `" + field.name.text + "`",
+				[],
+				Some(
+					"the field was already declared at "
+					+ location_text(state, first.name.span)
+					+ "; remove one or give it another name",
+				),
+			)
+		None:
+			diagnostics
+
+
 private pure func parse_field_list_until_right_brace(
 	state: ParserInput,
 	index: Int,
@@ -9141,9 +9547,9 @@ private pure func parse_field_list_until_right_brace(
 
 		while parsing_fields and not current_is_eof(state, st):
 			field_step: ParseFieldStep = parse_field_decl(state, st, st_diag)
+			st_diag = report_duplicate_field(state, fields, field_step.value, field_step.diagnostics)
 			fields = fields.append(field_step.value)
 			st = field_step.index
-			st_diag = field_step.diagnostics
 
 			if current_is_symbol(state, st, CommaSymbol):
 				st = advance_parser(state, st)
@@ -9274,6 +9680,7 @@ private pure func parse_variant_decl(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
+	is_enum: Bool,
 ) -> ParseVariantStep:
 	name_step: ParseIdentifierStep = parse_variant_identifier_expected(state, index, diagnostics)
 	var st: Int = name_step.index
@@ -9282,12 +9689,25 @@ private pure func parse_variant_decl(
 	var end_span: SourceLocation = name_step.value.span
 
 	if current_is_symbol(state, st, LeftParenSymbol):
+		-- An `enum` case is only a name, so its parentheses are reported even
+		-- when they are empty; they are still parsed so recovery skips them.
+		if is_enum:
+			st_diag = add_expected_error(
+				state,
+				st_diag,
+				name_step.value.span,
+				"an `enum` case is only a name",
+				[],
+				Some("remove the parentheses, or write `union` instead of `enum` for cases that carry values"),
+			)
+
 		fields_step: ParseTypeListStep = parse_type_expr_list_until(
 			state,
 			advance_parser(state, st),
 			st_diag,
 			RightParenSymbol,
 			True,
+			OrdinaryArgument,
 		)
 		fields = fields_step.values
 		right_step: ParseSymbolStep = expect_symbol(state, fields_step.index, RightParenSymbol)
@@ -9319,6 +9739,7 @@ private pure func parse_variant_list(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
+	is_enum: Bool,
 ) -> ParseVariantListStep:
 	var st: Int = skip_newlines(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -9326,7 +9747,7 @@ private pure func parse_variant_list(
 
 	while not current_is_block_end(state, st):
 		before_index: Int = st
-		variant_step: ParseVariantStep = parse_variant_decl(state, st, st_diag)
+		variant_step: ParseVariantStep = parse_variant_decl(state, st, st_diag, is_enum)
 		variants = variants.append(variant_step.value)
 		st = skip_newlines(state, variant_step.index)
 		st_diag = variant_step.diagnostics
@@ -9412,7 +9833,7 @@ private pure func parse_union_decl(
 	)
 	st = __step_24.index
 	st_diag = __step_24_diagnostics
-	variants_step: ParseVariantListStep = parse_variant_list(state, st, st_diag)
+	variants_step: ParseVariantListStep = parse_variant_list(state, st, st_diag, is_enum)
 	st = variants_step.index
 	st_diag = add_variant_field_count_errors(state, variants_step.diagnostics, variants_step.values)
 
@@ -9724,12 +10145,21 @@ private pure func parse_trait_method(
 			ColonSymbol,
 			"expected `:` before trait method body",
 		)
-		body_step: ParseBodyStep = parse_function_body(
+		body_step: ParseBodyStep = if function_body_follows_colon(
 			state,
 			colon_step.index,
-			colon_step_diagnostics,
-			start_span,
-		)
+			colon_step.span.first,
+		):
+			parse_function_body(state, colon_step.index, colon_step_diagnostics, start_span)
+		else:
+			bodyless_header_step(
+				state,
+				colon_step.index,
+				colon_step_diagnostics,
+				name_step.value.span,
+				BodyRequired,
+			)
+
 		body = body_step.body
 		st = body_step.index
 		st_diag = body_step.diagnostics
@@ -9941,6 +10371,7 @@ private pure func parse_impl_method_list(
 				is_pure,
 				annotations_step.values,
 				method_start_span,
+				BodyRequired,
 			)
 			values = values.append(function_step.value)
 			st = skip_newlines(state, function_step.index)
@@ -9995,7 +10426,7 @@ private pure func parse_impl_decl(
 	)
 	st = __step_32.index
 	st_diag = __step_32_diagnostics
-	for_type_step: ParseTypeStep = parse_type_expr(state, st, st_diag)
+	for_type_step: ParseTypeStep = parse_receiver_type_expr(state, st, st_diag)
 	st = for_type_step.index
 	st_diag = for_type_step.diagnostics
 	colon_step: ParseSymbolStep = expect_symbol(state, st, ColonSymbol)
@@ -10424,7 +10855,7 @@ pure func parse_compiler_source_rebased_with_names(
 			source = source,
 			module_doc = module_doc_step.value,
 			decls = decls,
-			diagnostics = diagnostics
+			diagnostics = report_unpaired_forward_declarations(state, decls, diagnostics)
 		}, lex_result.names)
 
 

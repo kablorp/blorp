@@ -1,0 +1,115 @@
+-- Forward declarations: a top-level function written with no body.
+--
+-- The standard library declares a higher-order function twice, an impure
+-- signature and a pure one, and only one of the two carries the body. The
+-- other is a forward declaration, a header ending in `:` with nothing under
+-- it, written before or after its implementation. Every other function must
+-- have a body, so a bodyless top-level function is accepted only when the
+-- module holds a function of the same name that has one. The pairing is
+-- known only once the module is read, so it is checked here, after the last
+-- declaration. A syntax error earlier in the module can itself leave a header
+-- without its body, so the check runs only for a module that has none: the
+-- reader fixes the first error and is not told about its consequence.
+import:
+	../tables/builder: DiscoveryBuilder, append_plain_diagnostic
+	../tables/diagnostic_code: PlainSyntaxCode(UnpairedForwardDeclarationDiagnostic)
+	../tables/ids: SourceId, definition_id_index, name_id_index, source_ids_equal
+	../tables/row_kinds: DefinitionKind(FunctionDefinition)
+	../tables/rows: DefinitionRow
+	../tables/span: span_source
+	parser_cursor: current_span
+
+
+---
+Reports each top-level function of the module whose definition rows start at
+`definitions_first`, body rows at `bodies_first` and diagnostics at
+`diagnostics_first` that has no body and no same-named function with one.
+---
+pure func report_unpaired_forward_declarations(
+	builder: DiscoveryBuilder,
+	definitions_first: Int,
+	bodies_first: Int,
+	diagnostics_first: Int,
+) -> DiscoveryBuilder:
+	if builder.diagnostics.length() > diagnostics_first:
+		builder
+	else:
+		builder.report_unpaired(definitions_first, bodies_first)
+
+
+---
+The first row of `diagnostics` that belongs to the module about to be parsed: its
+lexer diagnostics come first, so a snapshot of the table's length at the start of
+parsing would miss them. The rows at the end of the table that sit in the module's
+source.
+---
+pure func module_diagnostics_first(builder: DiscoveryBuilder) -> Int:
+	source: SourceId = builder
+		.current_span()
+		.span_source()
+	var first: Int = builder.diagnostics.length()
+
+	while first > 0 and builder.diagnostic_in_source(first - 1, source):
+		first -= 1
+
+	first
+
+
+private pure func diagnostic_in_source(
+	builder: DiscoveryBuilder,
+	row: Int,
+	source: SourceId,
+) -> Bool:
+	match builder.diagnostics.get(row):
+		Some(diagnostic):
+			diagnostic.span
+				.span_source()
+				.source_ids_equal(source)
+		None:
+			False
+
+
+-- The pairing is by name and by position in the tables: a definition's id is the
+-- index of its row in `definitions`, and a body row names its definition.
+private pure func report_unpaired(
+	builder: DiscoveryBuilder,
+	definitions_first: Int,
+	bodies_first: Int,
+) -> DiscoveryBuilder:
+	var with_body: Dict[Int, Bool] = {}
+
+	var body_index: Int = bodies_first
+
+	while body_index < builder.bodies.length():
+		match builder.bodies.get(body_index):
+			Some(body):
+				with_body = with_body.set(body.definition.definition_id_index(), True)
+			None:
+				void
+
+		body_index += 1
+
+	var names_with_body: Dict[Int, Bool] = {}
+	var bodyless: List[DefinitionRow] = []
+	var index: Int = definitions_first
+
+	while index < builder.definitions.length():
+		match builder.definitions.get(index):
+			Some(row):
+				if row.kind == FunctionDefinition:
+					if with_body.get_or(index, False):
+						names_with_body = names_with_body.set(row.name.name_id_index(), True)
+					else:
+						bodyless = bodyless.append(row)
+			None:
+				void
+
+		index += 1
+
+	var out: DiscoveryBuilder = builder
+
+	for row in bodyless:
+		if not names_with_body.get_or(row.name.name_id_index(), False):
+			out = out.append_plain_diagnostic(UnpairedForwardDeclarationDiagnostic, row.name_span)
+
+	out

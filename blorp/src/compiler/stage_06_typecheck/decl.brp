@@ -64,7 +64,6 @@ import:
 			ParsedDimNameType, ParsedFunctionType, ParsedMissingType, ParsedNamedType,
 			ParsedQualifiedNamedType, ParsedRangeType, ParsedTupleType,
 		),
-		ParsedTypeParamDecl,
 		ParsedUnionDecl,
 		ParsedVarDecl,
 		ParsedVariantDecl,
@@ -389,7 +388,6 @@ import:
 		TopLevelNameKind(
 			TopLevelConstructor, TopLevelFunction, TopLevelTrait, TopLevelType, TopLevelVariable,
 		),
-		module_view_accepted_alias_authority,
 		module_view_accepted_callable_authority,
 		module_view_accepted_global_authority,
 		module_view_accepted_record_authority,
@@ -465,7 +463,6 @@ import:
 	type_system/accepted_alias_authority:
 		AcceptedAliasAuthority,
 		AcceptedAliasTable,
-		accepted_alias_contains,
 		accepted_alias_table_alias_count,
 	type_system/accepted_callable_authority:
 		AcceptedCallableAuthority,
@@ -496,7 +493,6 @@ import:
 	type_system/accepted_record_authority:
 		AcceptedRecordAuthority,
 		AcceptedRecordTable,
-		accepted_record_contains,
 		accepted_record_table_entry_count,
 	type_system/accepted_semantic_catalog:
 		AcceptedSemanticCatalog,
@@ -546,7 +542,6 @@ import:
 	type_system/accepted_union_authority:
 		AcceptedUnionAuthority,
 		AcceptedUnionTable,
-		accepted_union_contains,
 		accepted_union_find_constructor_for_parent,
 		accepted_union_table_entry_count,
 	type_system/builtins:
@@ -600,13 +595,9 @@ import:
 		env_extend_type_param_bounds,
 		env_from_prepared_infer_session,
 		env_from_prepared_module_declarations,
-		env_get_alias,
 		env_get_constructor_for_parent,
 		env_get_function_trait,
-		env_get_opaque_alias,
-		env_get_record,
 		env_get_trait,
-		env_get_type_decl,
 		env_get_type_params,
 		env_has_direct_trait_evidence,
 		env_push_scope,
@@ -650,13 +641,11 @@ import:
 		TYPE_VOID,
 		collect_type_vars,
 		is_dimension_parameter_name,
-		is_global_abi_type_name,
 		qualify_module_local_types,
 		semantic_type_variable_named,
 		type_contains_meta,
 		type_instantiate_type_params,
 		type_list,
-		type_parameter_name_without_sigil,
 		type_to_string,
 		types_compatible_with_params,
 		types_equal,
@@ -2518,30 +2507,31 @@ private pure func claim_global_definition_id(
 			(next, None)
 
 
-private pure func type_param_candidate_name_is_valid(name: String) -> Bool:
-	if name == "#_":
-		True
-	else:
-		base = type_parameter_name_without_sigil(name)
+private pure func variadic_dimension_names_from_types(types: List[SemanticType]) -> List[String]:
+	types.flat_map(variadic_dimension_names)
 
-		if base.length() == 0:
-			False
-		else:
-			first = base.get_or(0, ' ')
-			var valid = first >= 'A' and first <= 'Z'
-			var index: Int = 1
 
-			while valid and index < base.length():
-				ch = base.get_or(index, ' ')
-				valid = (
-					ch >= 'A' and ch <= 'Z'
-					or ch >= 'a' and ch <= 'z'
-					or ch >= '0' and ch <= '9'
-				)
-
-				index += 1
-
-			valid
+---
+The names the type writes as named variadic dimensions (`#Ds...`).
+---
+private pure func variadic_dimension_names(typ: SemanticType) -> List[String]:
+	match typ:
+		SemanticVarDimsType(name):
+			[name]
+		SemanticNamedType(_, args):
+			variadic_dimension_names_from_types(args)
+		SemanticArrayType(element, dims):
+			variadic_dimension_names(element).concat(variadic_dimension_names_from_types(dims))
+		SemanticFunctionType(_, params, return_type):
+			variadic_dimension_names_from_types(params).concat(variadic_dimension_names(return_type))
+		SemanticTupleType(elements):
+			variadic_dimension_names_from_types(elements)
+		SemanticRangeType(inner):
+			variadic_dimension_names(inner)
+		SemanticDimOpType(_, left, right):
+			variadic_dimension_names(left).concat(variadic_dimension_names(right))
+		_:
+			[]
 
 
 private pure func type_param_candidates_from_types(types: List[SemanticType]) -> List[String]:
@@ -2552,11 +2542,8 @@ private pure func type_param_candidates(typ: SemanticType) -> List[String]:
 	match typ:
 		SemanticTypeVar(name, _):
 			[name]
-		SemanticNamedType(name, args):
-			if args.length() == 0 and type_param_candidate_name_is_valid(name):
-				[name]
-			else:
-				type_param_candidates_from_types(args)
+		SemanticNamedType(_, args):
+			type_param_candidates_from_types(args)
 		SemanticArrayType(element, dims):
 			type_param_candidates(element).concat(type_param_candidates_from_types(dims))
 		SemanticFunctionType(_, params, return_type):
@@ -2569,37 +2556,6 @@ private pure func type_param_candidates(typ: SemanticType) -> List[String]:
 			type_param_candidates(left).concat(type_param_candidates(right))
 		_:
 			[]
-
-
-private pure func state_has_type_name(state: TypecheckState, name: String) -> Bool:
-	has_alias = match module_view_accepted_alias_authority(state.module_view):
-		Some(authority):
-			accepted_alias_contains(authority, name)
-		None:
-			(
-				env_get_alias(state.env, name).is_some()
-				or env_get_opaque_alias(state.env, name).is_some()
-			)
-
-	has_record = match module_view_accepted_record_authority(state.module_view):
-		Some(authority):
-			accepted_record_contains(authority, name)
-		None:
-			env_get_record(state.env, name).is_some()
-
-	has_union = match module_view_accepted_union_authority(state.module_view):
-		Some(index):
-			accepted_union_contains(index, name)
-		None:
-			env_get_type_decl(state.env, name).is_some()
-
-	(
-		is_global_abi_type_name(name)
-		or typecheck_state_has_known_type_name(state, name)
-		or has_union
-		or has_record
-		or has_alias
-	)
 
 
 ---
@@ -2629,54 +2585,16 @@ private pure func typecheck_state_add_errors(
 
 ---
 Type parameters for a function signature rebuilt from its annotations during
-error recovery (no accepted signature exists). The declared bounds are left off
-on purpose: the header phase reports an unresolved bound and accepted signatures
-carry each bound's exact identity, so a recovery signature has no identity to
-give them.
+error recovery (no accepted signature exists): the declared ones. Their bounds
+are left off on purpose: the header phase reports an unresolved bound and
+accepted signatures carry each bound's exact identity, so a recovery signature
+has no identity to give them.
 ---
-private pure func effective_bound_type_params(
-	state: TypecheckState,
-	declared: List[ParsedTypeParamDecl],
-	func_type: SemanticType,
-) -> List[BoundTypeParam]:
-	var result: List[BoundTypeParam] = declared.map(
-		func(parameter): make_resolved_bound_type_param(parameter.name.text, []),
-	)
-	var seen = result.map(func(param): param.name)
-
-	for name in type_param_candidates(func_type):
-		if (
-			name != "#_"
-			and not seen.contains(name)
-			and not state_has_type_name(state, name)
-		):
-			seen = seen.append(name)
-			result = result.append(make_resolved_bound_type_param(name, []))
-
-	result
-
-
 private pure func effective_function_type_params(
-	state: TypecheckState,
 	function_decl: ParsedFunctionDecl,
 ) -> List[BoundTypeParam]:
-	declared_type_param_names = type_param_names(function_decl.type_params)
-	param_types = function_decl.params
-		.map(func(param): type_from_optional_parsed_type_expr(param.type_expr))
-		.map(
-			func(
-				param_type,
-			): canonical_function_annotation_type(state, declared_type_param_names, param_type),
-		)
-	return_type = canonical_return_type(
-		state,
-		declared_type_param_names,
-		function_decl.return_type,
-	).get_or(TYPE_VOID)
-	effective_bound_type_params(
-		state,
-		function_decl.type_params,
-		SemanticFunctionType(function_decl.is_pure, param_types, return_type),
+	function_decl.type_params.map(
+		func(parameter): make_resolved_bound_type_param(parameter.name.text, []),
 	)
 
 
@@ -2685,7 +2603,7 @@ private pure func function_body_signature_from_annotations(
 	function_decl: ParsedFunctionDecl,
 	callable_id: Option[Int],
 ) -> FunctionBodySignature:
-	effective_type_params = effective_function_type_params(state, function_decl)
+	effective_type_params = effective_function_type_params(function_decl)
 	effective_type_param_names = effective_type_params.map(func(param): param.name)
 	declared_type_param_names = type_param_names(function_decl.type_params)
 	param_types = function_decl.params
@@ -2816,11 +2734,9 @@ private CALLABLE_HEADER_PROFILE_RETURN_CONVERSIONS: Int = 4
 
 private CALLABLE_HEADER_PROFILE_DIMENSION_SIDE_CONVERSIONS: Int = 5
 
-private CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS: Int = 6
+private CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS: Int = 6
 
-private CALLABLE_HEADER_PROFILE_RESOURCE_VALIDATIONS: Int = 7
-
-private CALLABLE_HEADER_PROFILE_ID_CLAIMS: Int = 8
+private CALLABLE_HEADER_PROFILE_ID_CLAIMS: Int = 7
 
 
 ---
@@ -2859,45 +2775,29 @@ private pure func callable_header_parameter_name(binder: CallableParameterBinder
 private pure func callable_header_bound_type_params(
 	definition_table: DefinitionTable,
 	header: CallableHeader,
-	declared: List[ParsedTypeParamDecl],
 	func_type: SemanticType,
 	dim_constraints: List[(SemanticType, SemanticType)],
-	count_profile_candidates: Bool,
 ) -> List[BoundTypeParam]:
 	-- Named variadic dimensions preserve relationships inside a signature, but
-	-- they are shape wildcards rather than parameters that callers specialize.
-	var generic_names = declared.map(func(param): param.name.text)
-
-	if count_profile_candidates:
-		_ = profile_callable_header_event(
-			CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS,
-		)
-
-	for name in type_param_candidates(func_type):
-		if not generic_names.contains(name):
-			generic_names = generic_names.append(name)
+	-- they are shape wildcards rather than parameters that callers specialize. A
+	-- declared parameter that the signature uses only that way is left out.
+	var plain_names = type_param_candidates(func_type)
+	var variadic_names = variadic_dimension_names(func_type)
 
 	for constraint in dim_constraints:
-		if count_profile_candidates:
-			_ = profile_callable_header_event(
-				CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS,
-			)
-			_ = profile_callable_header_event(
-				CALLABLE_HEADER_PROFILE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS,
-			)
-
-		for name in type_param_candidates(
-			constraint[0],
-		).concat(type_param_candidates(constraint[1])):
-			if not generic_names.contains(name):
-				generic_names = generic_names.append(name)
+		plain_names = plain_names
+			.concat(type_param_candidates(constraint[0]))
+			.concat(type_param_candidates(constraint[1]))
+		variadic_names = variadic_names
+			.concat(variadic_dimension_names(constraint[0]))
+			.concat(variadic_dimension_names(constraint[1]))
 
 	var result: List[BoundTypeParam] = []
 
 	for parameter in callable_header_parameters(header):
 		name = callable_type_parameter_id_name(callable_type_parameter_id(parameter))
 
-		if generic_names.contains(name):
+		if plain_names.contains(name) or not variadic_names.contains(name):
 			result = result.append(
 				make_resolved_bound_type_param(
 					name,
@@ -3070,10 +2970,8 @@ private pure func prepare_accepted_callable_header(
 											type_params = callable_header_bound_type_params(
 												type_header_graph_definition_table(type_headers),
 												header,
-												decl.type_params,
 												func_type,
 												dim_constraints,
-												True,
 											),
 											param_names = param_names,
 											purity = purity_from_parsed(decl.is_pure),

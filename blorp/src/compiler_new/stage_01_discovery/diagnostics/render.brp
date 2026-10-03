@@ -29,12 +29,15 @@ import:
 		PlainSyntaxCode(
 			AnnotationArgumentsDiagnostic, AnnotationWithoutFunctionDiagnostic,
 			ArrayDimensionsExpectedDiagnostic, AssignmentInConditionDiagnostic,
-			AssignmentInExpressionDiagnostic, BreakOutsideLoopDiagnostic,
+			AssignmentInExpressionDiagnostic, BoundInTypeDiagnostic, BreakOutsideLoopDiagnostic,
 			BuiltinTypeArgumentsDiagnostic, ConcurrentForMaxThreadsDiagnostic,
 			ConcurrentForMissingLimitDiagnostic, ConcurrentForTupleBinderDiagnostic,
 			ConcurrentLimitNotPositiveLiteralDiagnostic,
 			ConcurrentMaxThreadsNotPositiveLiteralDiagnostic, ContinueOutsideLoopDiagnostic,
+			DimensionParameterBoundsDiagnostic,
+			DiscardedCompoundAssignmentDiagnostic,
 			DiscardedQuestionBindDiagnostic, DocstringBeforeImportBlockDiagnostic,
+			EnumCaseParenthesesDiagnostic,
 			ExpectedAliasNameDiagnostic, ExpectedAssignmentOperatorDiagnostic,
 			ExpectedBuiltinNameDiagnostic, ExpectedCleanupBuiltinNameDiagnostic,
 			ExpectedClosingParenAfterConstructorsDiagnostic, ExpectedColonAfterImportDiagnostic,
@@ -54,7 +57,8 @@ import:
 			InterpolatedEscapeAtEndDiagnostic, InterpolatedStringPatternDiagnostic,
 			InterpolationHoleNotExpressionDiagnostic, InterpolationTooDeepDiagnostic,
 			InvalidCharLiteralDiagnostic, MultilineInterpolatedStringDiagnostic,
-			MultilineRawStringDiagnostic, MultilineStringDiagnostic, QuestionBindInLoopDiagnostic,
+			MissingFunctionBodyDiagnostic, MultilineRawStringDiagnostic, MultilineStringDiagnostic,
+			UnpairedForwardDeclarationDiagnostic, QuestionBindInLoopDiagnostic,
 			RemovedTypeAscriptionDiagnostic, TupleArityDiagnostic, UnexpectedCharacterDiagnostic,
 			UnicodeCodepointOutOfRangeDiagnostic, UnicodeEscapeDigitCountDiagnostic,
 			UnicodeEscapeNonHexDiagnostic, UnionVariantTooManyFieldsDiagnostic,
@@ -73,8 +77,8 @@ import:
 		),
 		SyntaxDiagnostic(
 			ConcurrentDuplicateParameter, ConcurrentForUnknownParameter, ConcurrentUnknownParameter,
-			ExpectedToken, IntegerLiteralOverflow, Plain, ReservedKeywordAsName, UnexpectedByte,
-			UnknownAnnotation, UnknownEscape,
+			DuplicateField, DuplicateFieldGiven, ExpectedToken, IntegerLiteralOverflow, Plain,
+			ReservedKeywordAsName, UnexpectedByte, UnknownAnnotation, UnknownEscape,
 		),
 	../tables/expected_token:
 		ArrowConstruct(ArrowInForeignFunctionReturnType, ArrowInFunctionTypeParameters),
@@ -178,8 +182,8 @@ import:
 		root_id_at_row,
 		source_id_at_row,
 		source_id_index,
-	../tables/limits: MAX_INTERPOLATION_DEPTH, MAX_UNION_VARIANT_FIELDS
-	../tables/rows: ResolutionDiagnosticRow, SyntaxDiagnosticRow
+	../tables/limits: INT_MAX_DECIMAL, MAX_INTERPOLATION_DEPTH, MAX_UNION_VARIANT_FIELDS
+	../tables/rows: DefinitionRow, ResolutionDiagnosticRow, SyntaxDiagnosticRow
 	../tables/source_position: LineColumn
 	../tables/span: MAX_SOURCE_COUNT, SPAN_OFFSET_LIMIT, Span, span_length, span_source, span_start
 	string: from_char, to_hex
@@ -367,9 +371,10 @@ private pure func displayed_at(
 	span: Span,
 	rendered: RenderedDiagnostic,
 ) -> String:
-	position: LineColumn = tables.span_line_column(span)
 	source_path: String = tables.source_display_path(span.span_source())
-	first_line: String = source_path + ":" + (position.line + 1).to_string() + ":" + position.column.to_string() + ": error: " + rendered.message
+	first_line: String = source_path + ":" + tables.position_text(
+		span,
+	) + ": error: " + rendered.message
 
 	match rendered.help:
 		Some(help):
@@ -379,6 +384,14 @@ private pure func displayed_at(
 
 
 -- Reading arguments and spans.
+---
+`line:column` of where `span` starts, as a diagnostic's own position prints.
+---
+private pure func position_text(tables: FrontendTables, span: Span) -> String:
+	position: LineColumn = tables.span_line_column(span)
+	(position.line + 1).to_string() + ":" + position.column.to_string()
+
+
 private pure func span_text(tables: FrontendTables, span: Span) -> String:
 	tables
 		.source_text(span.span_source())
@@ -886,6 +899,19 @@ private pure func render_syntax(
 				"duplicate `" + tables.name_spelling(name) + "` parameter",
 				"remove the second `" + tables.name_spelling(name) + "`",
 			)
+		DuplicateField(first):
+			earlier: DefinitionRow = tables.definition_row(first)
+			position: String = tables.position_text(earlier.name_span)
+
+			with_help(
+				"duplicate field `" + tables.name_spelling(earlier.name) + "`",
+				"the field was already declared at " + position + "; remove one or give it another name",
+			)
+		DuplicateFieldGiven(first):
+			with_help(
+				"duplicate field `" + span_text + "`",
+				"the field was already given at " + tables.position_text(first) + "; give it once",
+			)
 		ConcurrentUnknownParameter(name):
 			with_help(
 				"unknown concurrent parameter `" + tables.name_spelling(
@@ -1369,12 +1395,12 @@ private pure func render_plain_syntax(
 			)
 		ConcurrentMaxThreadsNotPositiveLiteralDiagnostic:
 			with_help(
-				"`max_threads` must be a positive integer literal",
+				"`max_threads` must be a positive integer literal, at most " + INT_MAX_DECIMAL,
 				"write `concurrent(max_threads: 4):`",
 			)
 		ConcurrentLimitNotPositiveLiteralDiagnostic:
 			with_help(
-				"`limit` must be a positive integer literal",
+				"`limit` must be a positive integer literal, at most " + INT_MAX_DECIMAL,
 				"write `concurrently(limit: 4)`",
 			)
 		ConcurrentForMissingLimitDiagnostic:
@@ -1420,10 +1446,47 @@ private pure func render_plain_syntax(
 				"string interpolation nested too deeply",
 				"interpolation holes can nest at most " + MAX_INTERPOLATION_DEPTH.to_string() + " deep; move the inner expression into a named binding",
 			)
+		MissingFunctionBodyDiagnostic:
+			with_help(
+				"function has no body",
+				(
+					"a function body must have at least one expression or statement, indented on the "
+					+ "lines below the header; write `void` for a body that does nothing"
+				),
+			)
+		UnpairedForwardDeclarationDiagnostic:
+			with_help(
+				"function has no body",
+				(
+					"a function body must have at least one expression or statement (`void` does "
+					+ "nothing); a header with no body is a forward declaration, which needs a "
+					+ "function of the same name with a body"
+				),
+			)
 		UnionVariantTooManyFieldsDiagnostic:
 			with_help(
 				"Union variants support at most " + MAX_UNION_VARIANT_FIELDS.to_string() + " fields",
 				"group related fields into a record and use the record as one field",
+			)
+		DiscardedCompoundAssignmentDiagnostic:
+			with_help(
+				"compound assignment cannot update `_`",
+				"name the variable you are updating, such as `total += value`; `_` only discards a value",
+			)
+		EnumCaseParenthesesDiagnostic:
+			with_help(
+				"an `enum` case is only a name",
+				"remove the parentheses, or write `union` instead of `enum` for cases that carry values",
+			)
+		BoundInTypeDiagnostic:
+			with_help(
+				"a bound cannot be written inside a type",
+				"declare the type parameter with its bounds in brackets, such as `func show[T: Equatable](x: T)`",
+			)
+		DimensionParameterBoundsDiagnostic:
+			with_help(
+				"a dimension parameter cannot have trait bounds",
+				"remove the bounds: a dimension is a number, so only type parameters such as `T: Equatable` take them",
 			)
 
 

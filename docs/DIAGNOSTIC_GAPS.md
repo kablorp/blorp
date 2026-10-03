@@ -46,8 +46,6 @@ One line per entry. Fault entries (CF) first, then diagnostic entries (DG) by ti
 | ID | Title | Tier | Cost |
 |---|---|---|---|
 | CF-001 | A bare `print` statement passes `check` and emits invalid C | Fault | M |
-| CF-002 | A function with no body is accepted and fails in Core when called | Fault | S |
-| CF-003 | A duplicate record field prints an internal typecheck error | Fault | S |
 | CF-004 | An uppercase pattern name that is not a constructor binds silently | Fault | M |
 | CF-005 | `Int[]` silently becomes `Int`; unknown type names generalise | Fault | S |
 | CF-006 | `"""hello"""` is silently the empty string | Fault | S |
@@ -143,7 +141,7 @@ programs that were correctly accepted, 115 diagnostics were good, 268 fell
 short in a way recorded below. DG-001 and DG-002 are systemic and are not
 counted against every individual probe they touch: of the 115 good ones, most
 still lack a source location because of DG-001. The 268 "short" probes include
-those that revealed the nine CF entries below.
+those that revealed the seven CF entries below.
 
 Two sources emit diagnostics. Parse and lexical errors are rendered by
 `blorp/src/compiler_new/stage_01_discovery/diagnostics/render.brp`
@@ -181,31 +179,6 @@ rewrite replaces, so prefer a fix that the replacement can carry over.
 - Cost: M
 - Issue: [`print-statement-emits-undeclared-ufcs-wrapper.md`](issues/print-statement-emits-undeclared-ufcs-wrapper.md)
 
-### CF-002 A function with no body is accepted and fails in Core when called
-- Input:
-  ```
-  func f() -> Int:
-
-  func main(args: List[String]) -> Int:
-      f()
-  ```
-- Current output: `check` succeeds; `bin/blorp compile` prints `selected direct call
-  survived Core call resolution`. Precondition: the failure needs the call; with `f`
-  never called, the program compiles.
-- Should be: `expected an indented block`, as every other block header reports.
-- Owner: discovery parser, `parse/body_parser.brp:385` and `parse/block_layout.brp:74`.
-- Cost: S
-- Issue: [`empty-function-body-accepted-then-ice-when-called.md`](issues/empty-function-body-accepted-then-ice-when-called.md)
-
-### CF-003 A duplicate record field prints an internal typecheck error
-- Input: `record P { x: Int, x: Int }`
-- Current output: `error: internal typecheck error: accepted record graph rejected
-  accepted headers: accepted record table rejected duplicate or mismatched identities`
-- Should be: ``duplicate field `x` in record `P` `` with a position, as the
-  duplicate-constructor check does for unions.
-- Owner: `compiler/stage_06_typecheck/headers/accepted_record_graph.brp:343`.
-- Cost: S
-- Issue: [`duplicate-record-field-internal-typecheck-error.md`](issues/duplicate-record-field-internal-typecheck-error.md)
 
 ### CF-004 An uppercase pattern name that is not a constructor binds silently
 - Input:
@@ -824,16 +797,17 @@ rewrite replaces, so prefer a fix that the replacement can carry over.
   and for agents editing in place.
 
 ### DG-034 Missing `:` on a function header produces no `:` message
-- Input: `func main(args: List[String]) -> Int` (no colon), `func f(x: Int) Int:`,
-  `func f x: Int -> Int:`, `func f(x Int) -> Int:`, `func f(Int x) -> Int:`,
-  `func -> Int double(x: Int):`
-- Current output (no colon): three errors, all
-  ``error: expected declaration`` / ``help: start a function declaration with `func` ``.
+- Input: `func f(x: Int) Int:`, `func f x: Int -> Int:`, `func f(x Int) -> Int:`,
+  `func f(Int x) -> Int:`, `func -> Int double(x: Int):`. (The colon missing at the end
+  of a line, `func main(args: List[String]) -> Int` with an indented body, now reports
+  ``expected `:` before function body`` at the end of the header and reads the body.)
+- Current output (`func f(x: Int) Int:`): several errors, ``error: expected declaration``
+  / ``help: start a function declaration with `func` ``.
   `if`, `for`, `while`, `match` and `else` handle the same slip well.
 - Should say: ``expected `:` after the function header`` at the end of the
   signature, as the other block headers do; for `x Int`, "write `x: Int`".
-- Owner: discovery parser, `parse/body_parser.brp:385` (`ColonInFunctionBody`) and
-  `parse/binder_parser.brp:111`; text in `diagnostics/render.brp:637` and `:1248`.
+- Owner: discovery parser, `parse/body_parser.brp:417` (`ColonInFunctionBody`, the
+  non-newline case) and `parse/binder_parser.brp:111`; text in `diagnostics/render.brp:531`.
 - Cost: S
 - ROI: Medium. Rarer than the `if` form, but the output hides the cause.
 
@@ -1058,6 +1032,14 @@ Syntax, with `file:line:col` and a help line:
 - `enum Shape: Circle(Float)` ("Enum variant ... cannot have fields; use 'union'").
 - `struct S {name: String}` and a `record` field in a struct (names the reason and
   suggests a record).
+- CF-003: a field name repeated in a `record` or `struct` declaration, a record literal or a
+  record update reports ``duplicate field `x` `` at the second one and gives the first one's
+  position (`record_duplicate_field_on_later_line.brp`, `struct_duplicate_field.brp`,
+  `record_literal_duplicate_field.brp`, `record_update_duplicate_field.brp`).
+- CF-002: a function with no body reports ``function has no body`` at its name unless
+  a same-named top-level function supplies the body (a forward declaration, which ends in `:`) (`function_without_body.brp`,
+  `forward_declaration_without_implementation.brp`); a header missing only its `:`
+  reports ``expected `:` before function body`` and reads the body (`missing_colon_func.brp`).
 
 Typecheck, correct message (location aside, DG-001):
 - Non-exhaustive match on a union, `Bool`, `Option`, `Int` and `List` names the

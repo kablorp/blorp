@@ -91,7 +91,9 @@ Appendix A: node census. Appendix B: allocation probes.
      both parsers, and the language has no named call arguments (landed in
      `d460bac5f`).
    - A second syntax change, M-1, makes the parser reject the other forms
-     that only typecheck rejects today.
+     that only typecheck rejects today, and removes the implicit type
+     parameters (auto-generalization and bounded arguments outside an
+     `implements` receiver).
 
    With both landed, the tree types need no form that exists only to be
    rejected.
@@ -656,7 +658,7 @@ types, read by every later stage and built only by `parse/` (and tests).
 | `foreign.brp` | `ForeignBlock`, `ForeignArgument`, `ForeignFunction`, `ForeignCName` (section 3.6) |
 | `declarations.brp` | Every declaration record, `Function`, `Signature`, `Annotation`, and the parameter, type-parameter, trait-reference and constraint records (sections 3.7, 3.8) |
 | `definitions.brp` | `Definition`, the definitions index's union (section 3.18) |
-| `types.brp` | `WrittenType`, `TypeArgument`, `BoundedTypeArgument`, `Dimension` and their kinds (section 3.9) |
+| `types.brp` | `WrittenType`, `TypeArgument`, `BoundedTypeArgument` (receivers only), `Dimension` and their kinds (section 3.9) |
 | `patterns.brp` | `Pattern`, `PatternKind`, `ListSpread`, `Sign`, `StringForm` (section 3.10) |
 | `expressions.brp` | `Expression`, `Statement`, `Block`, `Body` and every form of sections 3.11 to 3.13, including `SubscriptPlace`: bodies, statements and expressions refer to each other, so they share a module, as the body parser does today |
 | `dump.brp` | The canonical text form of a module's syntax, for tests and the differential |
@@ -1204,8 +1206,8 @@ record VariantDeclaration {
 
 
 ---
-`enum Name:` and its cases. After M-1 the parser rejects a payload on an enum
-case.
+`enum Name:` and its cases. After M-1 the parser rejects parentheses on an enum
+case, payload or empty.
 ---
 record EnumDeclaration {
 	id: DefinitionId,
@@ -1442,11 +1444,12 @@ union WrittenTypeKind:
 	FunctionType(Purity, List[TypeArgument], WrittenType)  -- `(A) -> R`, `pure (A) -> R`
 	ArrayType(WrittenType, AtLeastOne[Dimension])          -- `Float[#3]`, `Int[#N, #M]`
 	RangeType(Dimension)                                   -- `..#N`
+	DimensionType(Dimension)                               -- `rows: #N`, `-> #M`: the type of a dimension value
 
 
 ---
-One argument in brackets or parentheses: a type, a dimension, or an implicit
-parameter with bounds.
+One argument in brackets or parentheses: a type, a dimension, or, in an
+`implements` receiver only, a bounded type parameter.
 ---
 union TypeArgument:
 	TypeArgumentType(WrittenType)
@@ -1455,8 +1458,10 @@ union TypeArgument:
 
 
 ---
-`T: Eq + Hash` inside an argument list: an implicit type parameter with its
-bounds.
+`T: Eq + Hash` inside an `implements` receiver's arguments
+(`implements Show for Box[T: Eq]`): the type parameter that impl introduces,
+with its bounds. A bound written in any other type is a parse error, so
+`BoundedArgument` occurs only below an implementation's receiver.
 ---
 record BoundedTypeArgument {
 	parameter: NameUse,
@@ -1500,9 +1505,19 @@ These keep today's parsing rules, as `type_parser.brp` documents them:
 spellings. `()` is `VoidType`, where today it is a `NamedTypeNode` spelled
 with an invented `Void` name.
 
-The parser today also accepts a dimension or a bounded argument where a type
-is required (`x: #3`, `x: (T: Eq)`), and typecheck rejects them. M-1 makes
-the parser reject them, so `WrittenTypeKind` has no form for either.
+A dimension is also a type where a type is required: `rows: #N` and `-> #M`
+are documented forms that the standard library uses (the type of a dimension
+value, a refinement of `Int`), so `DimensionType(Dimension)` holds one.
+Typecheck accepts them; M-1 does not touch them.
+
+A bound inside a type (`x: (T: Eq)`, `List[T: Eq]`) is different: M-1 makes
+the parser reject it everywhere except an `implements` receiver, where the
+receiver introduces the impl's type parameters, bare (`Box[T]`) or bounded
+(`Box[T: Showable]`, a conditional impl). Type parameters are otherwise only
+declared in a bracket list, and the implicit ones are gone: an undeclared `T`
+in a signature is an error, not a generalization. So `BoundedArgument` exists
+only inside a receiver; typecheck resolves the receiver's bare and bounded
+names as the impl's parameters and keeps no discovery elsewhere.
 
 ### 3.10 Patterns
 
@@ -2452,13 +2467,13 @@ self-compile census (Appendix A).
 | `OrPatternNode` | 781 | `AlternativePatterns(AtLeastTwo[Pattern])` |
 | `NamedTypeNode` | 104,774 | `NamedType(NameUse, List[TypeArgument])`; `()` is `VoidType` |
 | `QualifiedTypeNode`, `TypeQualifierNode` | 252 | `QualifiedType(NameUse, NameUse, List[TypeArgument])` |
-| `BoundedTypeNode` | 54 | `BoundedArgument(BoundedTypeArgument)` inside argument lists; in a type position, rejected by M-1 |
+| `BoundedTypeNode` | 54 | `BoundedArgument(BoundedTypeArgument)` inside an `implements` receiver's arguments; rejected by M-1 in every other type |
 | `TypeBoundNode`, `QualifiedTypeBoundNode` | 54 | `TraitReference` |
 | `DimensionNameTypeNode`, `VariadicDimensionNameTypeNode` | 357 | `NamedDimension(NameUse)`, `VariadicNamedDimension(NameUse)` |
 | `DimensionWildcardTypeNode`, `VariadicDimensionWildcardTypeNode` | 8 | `WildcardDimension`, `VariadicWildcardDimension` |
 | `DimensionLiteralTypeNode` | 3 | `LiteralDimension(Int128)` |
 | `DimensionAddTypeNode` ... `DimensionDivideTypeNode` | 3 | `DimensionArithmetic(DimensionOperator, ...)` |
-| A dimension in a type position (`x: #3`) | not counted | rejected by M-1 |
+| A dimension in a type position (`rows: #N`, `-> #M`, `x: #3`) | not counted | `DimensionType(Dimension)` |
 | `RangeTypeNode` | 23 | `RangeType(Dimension)` |
 | `TupleTypeNode` | 567 | `TupleType(SmallTuple[TypeArgument])` |
 | `FunctionTypeNode`, `PureFunctionTypeNode` | 539 | `FunctionType(Purity, List[TypeArgument], WrittenType)` |
@@ -3261,7 +3276,7 @@ both parsers (`d460bac5f`), ahead of M1.
 
 | # | Change | Proof | Deleted |
 | --- | --- | --- | --- |
-| **M-1** | **Syntax change in both parsers**, under the urgent-syntax-change rule (`DISCOVERY_ACCEPTANCE_ROADMAP.md`, "Rules for the interim"). The parsers reject: a dimension or bounded argument where a type is required; bounds on `#N` and `#_`; a payload on an `enum` case; `_ += v` and its siblings; a concurrency count above `Int`'s range. Each gets a teaching message. `GRAMMAR.md` and `GUIDE.md` are updated in the same change, with fixtures for each form and its message. | Both parsers agree (corpus parity gate, per-code fixtures); a corpus search shows no use of the rejected forms, or each use is rewritten in the same change; the full-AST differential is unchanged | the parsers' acceptance of those forms |
+| **M-1** | **Syntax change in both parsers**, under the urgent-syntax-change rule (`DISCOVERY_ACCEPTANCE_ROADMAP.md`, "Rules for the interim"). The parsers reject: a bounded argument where a single type is required (a dimension is a type there and stays accepted: `rows: #N`, `-> #M`); bounds on `#N` and `#_`; parentheses on an `enum` case, payload or empty; `_ += v` and its siblings; a concurrency count above `Int`'s range; and a bound inside any type except an `implements` receiver. It also removes the implicit type parameters: an undeclared `T` in a signature is an error that suggests `func f[T](x: T)`. Each gets a teaching message. `GRAMMAR.md` and `GUIDE.md` are updated in the same change, with fixtures for each form and its message. | Both parsers agree (corpus parity gate, per-code fixtures); a corpus search shows no use of the rejected forms, or each use is rewritten in the same change; the full-AST differential is unchanged | the parsers' acceptance of those forms |
 | **M0** | Measurement only. The shape probes of Appendix B are recorded with this document. Build a throwaway prototype of the expression and statement parser over trees, and measure allocations, instructions, wall time and peak RSS per node on the corpus's bodies. | Recorded numbers that confirm or correct section 7 | none |
 | **M1** | Prerequisite: the compiler fix for an opaque type inside an import cycle (section 3.15). Then `syntax/`: every type of section 3, `syntax/ids.brp` with `IdMint`, the layout rule that confines `IdMint` to `parse/` and tests, `syntax/dump.brp` (canonical text), and unit tests that build each form through the mint and dump it. Nothing calls it yet. | Tests; `compiler-new` gate; the layout check rejects an import of `IdMint` from outside `parse/` | none |
 | **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. | Token parity test unchanged; `tables` dump identical; cost recorded (the bridge's cost is temporary) | the lexer's builder appenders; transient interpolation tables |

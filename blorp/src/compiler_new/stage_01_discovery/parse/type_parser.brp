@@ -16,7 +16,8 @@ import:
 		append_type_parameter,
 	../tables/diagnostic_code:
 		PlainSyntaxCode(
-			ArrayDimensionsExpectedDiagnostic, ExpectedDimensionDiagnostic,
+			ArrayDimensionsExpectedDiagnostic, BoundInTypeDiagnostic,
+			DimensionParameterBoundsDiagnostic, ExpectedDimensionDiagnostic,
 			ExpectedEqualEqualDiagnostic, ExpectedHashDiagnostic, ExpectedTypeDiagnostic,
 			TupleArityDiagnostic,
 		),
@@ -136,34 +137,83 @@ private pure func all_dimensions(builder: DiscoveryBuilder, nodes: List[NodeId])
 
 -- Types.
 ---
-A type expression; bounded arguments (`T: Eq`) are not allowed at the top.
+Where a type is written, which decides what a bound `Name: Bound` inside it
+means. Only an `implements` receiver introduces type parameters in a type
+(`Labeled[T: Stringable]`), so only its arguments may carry bounds; anywhere
+else a bound is reported, because type parameters are declared in a
+declaration's bracket list. At the top of a type a `:` after a name belongs to
+what follows.
+
+- `OrdinaryType`: an annotation, a return type, a field, a payload, an alias.
+- `OrdinaryArgument`: inside brackets or parentheses of an ordinary type.
+- `ReceiverType`: the type an `implements` block is for.
+- `ReceiverArgument`: inside brackets or parentheses of a receiver.
+---
+private enum TypeContext:
+	OrdinaryType
+	OrdinaryArgument
+	ReceiverType
+	ReceiverArgument
+
+
+---
+The context of the arguments of a type written in `context`.
+---
+private pure func argument_context(context: TypeContext) -> TypeContext:
+	match context:
+		OrdinaryType | OrdinaryArgument:
+			OrdinaryArgument
+		ReceiverType | ReceiverArgument:
+			ReceiverArgument
+
+
+---
+The context of a function type's return type, which is a type of its own.
+---
+private pure func return_context(context: TypeContext) -> TypeContext:
+	match context:
+		OrdinaryType | OrdinaryArgument:
+			OrdinaryType
+		ReceiverType | ReceiverArgument:
+			ReceiverType
+
+
+---
+A type where only a type is accepted (an annotation, a return type, a field).
+A dimension is a type here (`rows: #N`, `-> #M`): it is the refinement of `Int`
+that names a dimension. A bound is reported.
 ---
 pure func parse_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
-	builder.parse_type_allowing_bounds(BoundsNotAllowed)
+	builder.parse_type_in(OrdinaryType)
 
 
 ---
-Whether a written type may carry bounds (`Name: Bound`): inside type argument
-lists it may, elsewhere a `:` after a type belongs to what follows.
+A union variant's payload type: a bound there is reported like one inside brackets.
 ---
-enum BoundPolicy:
-	BoundsAllowed
-	BoundsNotAllowed
+pure func parse_variant_payload_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	builder.parse_type_in(OrdinaryArgument)
 
 
 ---
-A type expression, with `Name: Bound + Bound` accepted when `bounds` is `BoundsAllowed`
-(inside type argument lists).
+The type an `implements` block is for. Its arguments may introduce type
+parameters, bare or bounded.
 ---
-pure func parse_type_allowing_bounds(
+pure func parse_receiver_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	builder.parse_type_in(ReceiverType)
+
+
+---
+A type expression written in `context`.
+---
+private pure func parse_type_in(
 	builder: DiscoveryBuilder,
-	bounds: BoundPolicy,
+	context: TypeContext,
 ) -> DiscoveryBuilder:
 	match builder.current_kind():
 		IdentifierToken | SelfKeyword | VoidKeyword:
-			builder.parse_named_type(bounds)
+			builder.parse_named_type(context)
 		PureKeyword:
-			builder.parse_pure_function_type()
+			builder.parse_pure_function_type(context)
 		DimensionNameToken | HashSymbol | IntLiteralToken:
 			builder.parse_dimension_expression()
 		DotDotSymbol:
@@ -172,7 +222,7 @@ pure func parse_type_allowing_bounds(
 			if builder.starts_parenthesized_dimension(1):
 				builder.parse_dimension_expression()
 			else:
-				builder.parse_parenthesized_type()
+				builder.parse_parenthesized_type(context)
 		_:
 			builder.parse_missing_type()
 
@@ -227,19 +277,35 @@ private pure func consume_type_name(builder: DiscoveryBuilder) -> DiscoveryBuild
 
 
 ---
-`Name`, `Name[args]`, `Module.Name[args]`, or with `BoundsAllowed`
-`Name: Bound + ...`; then any array suffixes.
+`Name`, `Name[args]` or `Module.Name[args]`, then any array suffixes. In a
+`ReceiverArgument`, `Name: Bound + ...` is a bounded type parameter. In an
+`OrdinaryArgument` a bound is reported, and the type is the name alone.
 ---
 private pure func parse_named_type(
 	builder: DiscoveryBuilder,
-	bounds: BoundPolicy,
+	context: TypeContext,
 ) -> DiscoveryBuilder:
 	can_qualify: Bool = builder.current_kind() == IdentifierToken
 	first_name: NameId = builder.type_name_at_cursor()
 	first_span: Span = builder.current_span()
 	var out: DiscoveryBuilder = builder.consume_type_name()
 
-	if bounds == BoundsAllowed and out.at(ColonSymbol):
+	if context == OrdinaryArgument and out.at(ColonSymbol):
+		-- The bounds are skipped so recovery resumes after them.
+		out = out.advance_token()
+		var end_span: Span = first_span
+
+		while out.at(IdentifierToken) or out.at(DotSymbol) or out.at(PlusSymbol):
+			end_span = out.current_span()
+			out = out.advance_token()
+
+		out = out.append_plain_diagnostic(BoundInTypeDiagnostic, first_span.span_covering(end_span))
+		-- Not a tail call on purpose: ending the branch with the call directly made
+		-- the bootstrap-built compiler read a null builder. See
+		-- docs/issues/tail-call-on-reassigned-builder-null-deref.md.
+		out = out.append_named_type(None, first_name, first_span, first_span, [])
+		out
+	else if context == ReceiverArgument and out.at(ColonSymbol):
 		out = out.advance_token()
 		var bounds: List[NodeId] = []
 		var end_span: Span = first_span
@@ -286,7 +352,7 @@ private pure func parse_named_type(
 				var parsing: Bool = True
 
 				while parsing and not out.at_end_of_tokens():
-					out = out.parse_type_allowing_bounds(BoundsAllowed)
+					out = out.parse_type_in(argument_context(context))
 					argument: NodeId = out.last_node_id()
 					arguments = arguments.append(argument)
 					end_span = out.node_span(argument)
@@ -334,7 +400,7 @@ private pure func parse_named_type(
 				arguments,
 			)
 
-		out = out.parse_array_suffixes()
+		out = out.parse_array_suffixes(context)
 		out
 
 
@@ -383,11 +449,14 @@ private pure func at_end_of_tokens(builder: DiscoveryBuilder) -> Bool:
 ---
 Array suffixes after a type: each `[dims]` wraps the type so far.
 ---
-private pure func parse_array_suffixes(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+private pure func parse_array_suffixes(
+	builder: DiscoveryBuilder,
+	context: TypeContext,
+) -> DiscoveryBuilder:
 	var out: DiscoveryBuilder = builder
 
 	while out.at(LeftBracketSymbol):
-		out = out.parse_array_suffix()
+		out = out.parse_array_suffix(context)
 
 	out
 
@@ -395,7 +464,10 @@ private pure func parse_array_suffixes(builder: DiscoveryBuilder) -> DiscoveryBu
 ---
 One `[dims]` suffix, from its `[`, wrapping the last node.
 ---
-private pure func parse_array_suffix(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+private pure func parse_array_suffix(
+	builder: DiscoveryBuilder,
+	context: TypeContext,
+) -> DiscoveryBuilder:
 	element: NodeId = builder.last_node_id()
 	element_span: Span = builder.node_span(element)
 	var out: DiscoveryBuilder = builder.advance_token()
@@ -404,7 +476,7 @@ private pure func parse_array_suffix(builder: DiscoveryBuilder) -> DiscoveryBuil
 	var parsing: Bool = True
 
 	while parsing and not out.at_end_of_tokens():
-		out = out.parse_type_allowing_bounds(BoundsAllowed)
+		out = out.parse_type_in(argument_context(context))
 		dimension: NodeId = out.last_node_id()
 		dimensions = dimensions.append(dimension)
 		end_span = out.node_span(dimension)
@@ -444,7 +516,10 @@ private pure func parse_array_suffix(builder: DiscoveryBuilder) -> DiscoveryBuil
 `(...)`: `()` (the named type `Void`), a function type `(T, U) -> R`, a
 grouping `(T)`, or a tuple `(T, U)`; then any array suffixes.
 ---
-private pure func parse_parenthesized_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+private pure func parse_parenthesized_type(
+	builder: DiscoveryBuilder,
+	context: TypeContext,
+) -> DiscoveryBuilder:
 	start: Span = builder.current_span()
 	var out: DiscoveryBuilder = builder.advance_token()
 
@@ -454,7 +529,7 @@ private pure func parse_parenthesized_type(builder: DiscoveryBuilder) -> Discove
 
 		if out.at(ArrowSymbol):
 			out = out.advance_token()
-			out = out.parse_type()
+			out = out.parse_type_in(return_context(context))
 			return_type: NodeId = out.last_node_id()
 			end_span: Span = out.node_span(return_type)
 			out = out.append_plain_parent_node(
@@ -466,14 +541,14 @@ private pure func parse_parenthesized_type(builder: DiscoveryBuilder) -> Discove
 		else:
 			void_span: Span = start.span_covering(close)
 			out = out.append_name_leaf_node(NamedTypeLeaf, void_span, VOID_NAME)
-			out = out.parse_array_suffixes()
+			out = out.parse_array_suffixes(context)
 			out
 	else:
 		var items: List[NodeId] = []
 		var parsing: Bool = True
 
 		while parsing and not out.at_end_of_tokens():
-			out = out.parse_type_allowing_bounds(BoundsAllowed)
+			out = out.parse_type_in(argument_context(context))
 			items = items.append(out.last_node_id())
 
 			if out.at(CommaSymbol):
@@ -489,7 +564,7 @@ private pure func parse_parenthesized_type(builder: DiscoveryBuilder) -> Discove
 
 		if out.at(ArrowSymbol):
 			out = out.advance_token()
-			out = out.parse_type()
+			out = out.parse_type_in(return_context(context))
 			return_type: NodeId = out.last_node_id()
 			end_span: Span = out.node_span(return_type)
 			out = out.append_plain_parent_node(
@@ -507,14 +582,17 @@ private pure func parse_parenthesized_type(builder: DiscoveryBuilder) -> Discove
 			if items.length() != 1:
 				out = out.append_plain_parent_node(TupleTypeParent, tuple_span, items)
 
-			out = out.parse_array_suffixes()
+			out = out.parse_array_suffixes(context)
 			out
 
 
 ---
 `pure (T, ...) -> R`.
 ---
-private pure func parse_pure_function_type(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+private pure func parse_pure_function_type(
+	builder: DiscoveryBuilder,
+	context: TypeContext,
+) -> DiscoveryBuilder:
 	start: Span = builder.current_span()
 	var out: DiscoveryBuilder = builder.advance_token()
 
@@ -529,7 +607,7 @@ private pure func parse_pure_function_type(builder: DiscoveryBuilder) -> Discove
 		var parsing: Bool = True
 
 		while parsing and not out.at_end_of_tokens():
-			out = out.parse_type_allowing_bounds(BoundsAllowed)
+			out = out.parse_type_in(argument_context(context))
 			parameters = parameters.append(out.last_node_id())
 
 			if out.at(CommaSymbol):
@@ -547,7 +625,7 @@ private pure func parse_pure_function_type(builder: DiscoveryBuilder) -> Discove
 	else:
 		out = out.report_expected(ExpectedArrow(ArrowInFunctionTypeParameters))
 
-	out = out.parse_type()
+	out = out.parse_type_in(return_context(context))
 	return_type: NodeId = out.last_node_id()
 	end_span: Span = out.node_span(return_type)
 	out.append_plain_parent_node(
@@ -869,6 +947,11 @@ private pure func parse_type_parameter(
 	var end_span: Span = name_span
 
 	if out.at(ColonSymbol):
+		-- A dimension is a number, not a type, so no trait bounds it; the bounds
+		-- are still parsed so recovery skips them.
+		if kind != TypeParameter:
+			out = out.append_plain_diagnostic(DimensionParameterBoundsDiagnostic, out.current_span())
+
 		out = out.advance_token()
 		var parsing: Bool = True
 

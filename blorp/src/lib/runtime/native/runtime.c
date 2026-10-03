@@ -39519,7 +39519,7 @@ void blorp_reset_scheduler_stats(void) {
 // The callable-header fixture has a documented 32 * 512 header maximum. Keep
 // enough exact identity slots for that matrix plus the generated entrypoint.
 #define BLORP_PROFILE_CALLABLE_HEADER_SEEN_CAPACITY 32768
-#define BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT 12
+#define BLORP_PROFILE_CALLABLE_HEADER_COUNTER_COUNT 11
 
 enum {
     BLORP_PROFILE_CALLABLE_HEADERS_ENTERED = 0,
@@ -39528,12 +39528,11 @@ enum {
     BLORP_PROFILE_CALLABLE_PARAMETER_CONVERSIONS = 3,
     BLORP_PROFILE_CALLABLE_RETURN_CONVERSIONS = 4,
     BLORP_PROFILE_CALLABLE_DIMENSION_SIDE_CONVERSIONS = 5,
-    BLORP_PROFILE_CALLABLE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS = 6,
-    BLORP_PROFILE_CALLABLE_RESOURCE_VALIDATIONS = 7,
-    BLORP_PROFILE_CALLABLE_ID_CLAIMS = 8,
-    BLORP_PROFILE_CALLABLE_ENVIRONMENT_INSERTIONS = 9,
-    BLORP_PROFILE_CALLABLE_REPEAT_REGISTRATIONS = 10,
-    BLORP_PROFILE_CALLABLE_SEEN_CAPACITY_OVERFLOWS = 11,
+    BLORP_PROFILE_CALLABLE_RESOURCE_VALIDATIONS = 6,
+    BLORP_PROFILE_CALLABLE_ID_CLAIMS = 7,
+    BLORP_PROFILE_CALLABLE_ENVIRONMENT_INSERTIONS = 8,
+    BLORP_PROFILE_CALLABLE_REPEAT_REGISTRATIONS = 9,
+    BLORP_PROFILE_CALLABLE_SEEN_CAPACITY_OVERFLOWS = 10,
 };
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
@@ -40849,8 +40848,8 @@ static void blorp_profile_report_with_abandonment_cause(
         fprintf(stderr,
             "CALLABLE_HEADER_PROFILE_COUNTERS headers_entered=%ld source_headers=%ld "
             "foreign_headers=%ld parameter_conversions=%ld return_conversions=%ld "
-            "dimension_side_conversions=%ld type_parameter_candidate_traversals=%ld "
-            "resource_validations=%ld id_claims=%ld environment_insertions=%ld "
+            "dimension_side_conversions=%ld resource_validations=%ld id_claims=%ld "
+            "environment_insertions=%ld "
             "repeat_registrations=%ld seen_capacity_overflows=%ld\n",
             blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_HEADERS_ENTERED),
             blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_SOURCE_HEADERS),
@@ -40858,8 +40857,6 @@ static void blorp_profile_report_with_abandonment_cause(
             blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_PARAMETER_CONVERSIONS),
             blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_RETURN_CONVERSIONS),
             blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_DIMENSION_SIDE_CONVERSIONS),
-            blorp_profile_callable_header_counter(
-                BLORP_PROFILE_CALLABLE_TYPE_PARAMETER_CANDIDATE_TRAVERSALS),
             blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_RESOURCE_VALIDATIONS),
             blorp_profile_callable_header_counter(BLORP_PROFILE_CALLABLE_ID_CLAIMS),
             blorp_profile_callable_header_counter(

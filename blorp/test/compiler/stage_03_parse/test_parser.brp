@@ -879,7 +879,7 @@ func test_parse_simple_inline_function() -> Bool:
 
 
 func test_parse_bodyless_function_signature() -> Bool:
-	program_source: String = "func map[T, U](self: Option[T], f: (T) -> U) -> Option[U]:"
+	program_source: String = "func map[T, U](self: Option[T], f: (T) -> U) -> Option[U]:\npure func map[T, U](self: Option[T], f: pure (T) -> U) -> Option[U]:\n\tNone"
 	program = parse_compiler_source(source(program_source))
 
 	match program.decls.get(0):
@@ -921,7 +921,7 @@ func test_parse_bodyless_function_signature() -> Bool:
 
 
 func test_parse_bodyless_function_before_docstring() -> Bool:
-	program_source: String = "func map[T](self: Set[T]) -> Set[T]:\n\n---\nFilter elements.\n---\npure func filter[T](self: Set[T]) -> Set[T]:\n\tbuiltin(\"set.filter\")"
+	program_source: String = "func map[T](self: Set[T]) -> Set[T]:\n\n---\nFilter elements.\n---\npure func map[T](self: Set[T]) -> Set[T]:\n\tbuiltin(\"set.map\")"
 	program = parse_compiler_source(source(program_source))
 
 	first_ok: Bool = match program.decls.get(0):
@@ -937,13 +937,147 @@ func test_parse_bodyless_function_before_docstring() -> Bool:
 	second_ok: Bool = match program.decls.get(1):
 		Some(FunctionParsedDecl(function_decl)):
 			(
-				function_decl.name.text == "filter"
+				function_decl.name.text == "map"
 				and function_decl.doc.get_or("") == "Filter elements."
 			)
 		_:
 			False
 
 	parsed_program_ok(program) and first_ok and second_ok
+
+
+func test_parse_repeated_record_field_is_reported_at_the_later_name() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"record P { x: Int, x: Int }\n",
+		"duplicate field `x`",
+		"the field was already declared at 1:12; remove one or give it another name",
+		"x",
+	)
+
+
+func test_parse_repeated_struct_field_is_reported_at_the_later_name() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"struct S {\n\ta: Int,\n\tb: Int,\n\ta: Float\n}\n",
+		"duplicate field `a`",
+		"the field was already declared at 2:5; remove one or give it another name",
+		"a",
+	)
+
+
+func test_parse_field_given_twice_in_a_record_literal_is_reported_at_the_second() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"p: P = { x = 1, x = 2 }\n",
+		"duplicate field `x`",
+		"the field was already given at 1:10; give it once",
+		"x",
+	)
+
+
+func test_parse_field_given_twice_in_a_record_update_is_reported_at_the_second() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"q: P = { p | x = 1, y = 2, x = 3 }\n",
+		"duplicate field `x`",
+		"the field was already given at 1:14; give it once",
+		"x",
+	)
+
+
+func test_parse_missing_field_names_do_not_repeat_each_other() -> Bool:
+	not parse_compiler_source(source("record P { : Int, : Int }\n")).diagnostics.any(
+		pure func(diagnostic): diagnostic.message.starts_with("duplicate field"),
+	)
+
+
+func test_parse_distinct_field_names_are_accepted() -> Bool:
+	parsed_program_ok(parse_compiler_source(source("record P { x: Int, y: Int }\nrecord Q { x: Int }\n")))
+
+
+func test_parse_forward_declaration_after_its_implementation_is_accepted() -> Bool:
+	program = parse_compiler_source(
+		source("pure func f(x: Int) -> Int:\n\tx\nfunc f(x: Int) -> Int:\n"),
+	)
+
+	parsed_program_ok(program)
+
+
+MISSING_BODY_MESSAGE: String = "function has no body"
+
+MISSING_BODY_HELP: String = "a function body must have at least one expression or statement, indented on the lines below the header; write `void` for a body that does nothing"
+
+UNPAIRED_FORWARD_HELP: String = "a function body must have at least one expression or statement (`void` does nothing); a header with no body is a forward declaration, which needs a function of the same name with a body"
+
+MISSING_COLON_HELP: String = "a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`"
+
+
+func test_parse_function_without_body_is_rejected_at_its_name() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"func f() -> Int:\n\nfunc main() -> Int:\n\tf()\n",
+		MISSING_BODY_MESSAGE,
+		UNPAIRED_FORWARD_HELP,
+		"f",
+	)
+
+
+func test_parse_forward_declaration_needs_a_function_of_the_same_name() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"func f() -> Int:\nfunc g() -> Int:\n\t1\n",
+		MISSING_BODY_MESSAGE,
+		UNPAIRED_FORWARD_HELP,
+		"f",
+	)
+
+
+func test_parse_local_function_without_body_is_rejected() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"func main() -> Int:\n\tfunc inner() -> Int:\n\t0\n",
+		MISSING_BODY_MESSAGE,
+		MISSING_BODY_HELP,
+		"inner",
+	)
+
+
+func test_parse_implementation_method_without_body_is_rejected() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"implements Shape for Int:\n\tfunc area(x: Int) -> Int:\n\tfunc area(x: Int) -> Int:\n\t\tx\n",
+		MISSING_BODY_MESSAGE,
+		MISSING_BODY_HELP,
+		"area",
+	)
+
+
+func test_parse_trait_method_with_colon_and_no_body_is_rejected() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"trait Shape:\n\tfunc area(x: Int) -> Int:\n\nfunc main() -> Int:\n\t0\n",
+		MISSING_BODY_MESSAGE,
+		MISSING_BODY_HELP,
+		"area",
+	)
+
+
+func test_parse_header_missing_only_its_colon_reports_the_colon_and_reads_the_body() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"func f(x: Int) -> Int\n\tx\n",
+		"expected `:` before function body",
+		MISSING_COLON_HELP,
+		"",
+	)
+
+
+func test_parse_forward_declaration_without_its_colon_reports_the_colon() -> Bool:
+	parser_diagnostic_has_message_help_and_span_text(
+		"func f(x: Int) -> Int\npure func f(x: Int) -> Int:\n\tx\n",
+		"expected `:` before function body",
+		MISSING_COLON_HELP,
+		"",
+	)
+
+
+func test_parse_lexer_error_suppresses_the_forward_declaration_check() -> Bool:
+	program = parse_compiler_source(source("func f(x: Int) -> Int: ;\n"))
+
+	program.diagnostics.length() == 1 and program.diagnostics.all(
+		pure func(diagnostic): diagnostic.message.starts_with("unexpected character"),
+	)
 
 
 func test_parse_module_doc_before_import_block_is_kept_on_program() -> Bool:
@@ -5437,6 +5571,63 @@ tests: TestSuite = {
 		("parse simple inline function", test_parse_simple_inline_function),
 		("parse bodyless function signature", test_parse_bodyless_function_signature),
 		("parse bodyless function before docstring", test_parse_bodyless_function_before_docstring),
+		(
+			"parse repeated record field is reported at the later name",
+			test_parse_repeated_record_field_is_reported_at_the_later_name,
+		),
+		(
+			"parse repeated struct field is reported at the later name",
+			test_parse_repeated_struct_field_is_reported_at_the_later_name,
+		),
+		(
+			"parse field given twice in a record literal is reported at the second",
+			test_parse_field_given_twice_in_a_record_literal_is_reported_at_the_second,
+		),
+		(
+			"parse field given twice in a record update is reported at the second",
+			test_parse_field_given_twice_in_a_record_update_is_reported_at_the_second,
+		),
+		(
+			"parse missing field names do not repeat each other",
+			test_parse_missing_field_names_do_not_repeat_each_other,
+		),
+		("parse distinct field names are accepted", test_parse_distinct_field_names_are_accepted),
+		(
+			"parse forward declaration after its implementation is accepted",
+			test_parse_forward_declaration_after_its_implementation_is_accepted,
+		),
+		(
+			"parse function without body is rejected at its name",
+			test_parse_function_without_body_is_rejected_at_its_name,
+		),
+		(
+			"parse forward declaration needs a function of the same name",
+			test_parse_forward_declaration_needs_a_function_of_the_same_name,
+		),
+		(
+			"parse local function without body is rejected",
+			test_parse_local_function_without_body_is_rejected,
+		),
+		(
+			"parse implementation method without body is rejected",
+			test_parse_implementation_method_without_body_is_rejected,
+		),
+		(
+			"parse trait method with colon and no body is rejected",
+			test_parse_trait_method_with_colon_and_no_body_is_rejected,
+		),
+		(
+			"parse forward declaration without its colon reports the colon",
+			test_parse_forward_declaration_without_its_colon_reports_the_colon,
+		),
+		(
+			"parse lexer error suppresses the forward declaration check",
+			test_parse_lexer_error_suppresses_the_forward_declaration_check,
+		),
+		(
+			"parse header missing only its colon reports the colon and reads the body",
+			test_parse_header_missing_only_its_colon_reports_the_colon_and_reads_the_body,
+		),
 		(
 			"parse module doc before import block is kept on program",
 			test_parse_module_doc_before_import_block_is_kept_on_program,

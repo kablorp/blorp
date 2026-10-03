@@ -96,7 +96,7 @@ func factorial(n: Int, acc: Int) -> Int:
 
 - `func` declares an impure function (can do I/O, call impure functions)
 - `pure func` declares a pure function (no side effects)
-- Return type follows `->`. Body is indented; last expression is the return value
+- Return type follows `->`. Body is indented; last expression is the return value. A body must have at least one expression or statement (`void` is a body that does nothing); a header with nothing under it is an error, except a top-level forward declaration (a header ending in `:` with no body) whose same-named function supplies the body, as the standard library's paired impure and pure signatures do
 - `@tail_recursive` verifies all recursive calls are in tail position. The Core pipeline lowers unmanaged scalar self-recursion to explicit loops, and lowers common list-consumer patterns like `[x, ...rest]` into cursor loops instead of allocating a tail list on every step
 - `builtin("module.name")` as a standard-library function body names a compiler-provided intrinsic; `builtin("c_name")` binds standard-library/runtime wrappers to a named C helper. Bare function-body `builtin` is not used in standard-library source.
 
@@ -665,19 +665,19 @@ t: Float[#2, #3, #4] = ...
 -- "the caller provides the concrete dimensions", NOT "unknown size."
 -- They can only appear in array types, and must be the last dimension.
 -- Concrete dimensions flow through at the call site:
-func count_elements[T](data: T[#Ds...]) -> Int:
+func count_elements[T, #Ds](data: T[#Ds...]) -> Int:
     length(data)
 
 v5: Int[#5] = {1, 2, 3, 4, 5}
 n: Int = count_elements(v5)   -- returns 5, v5's #5 flows through #Ds...
 
 -- Named sharing: same name in param and return preserves concrete dims
-pure func set_all[T](arr: T[#Ds...], val: T) -> T[#Ds...]:
+pure func set_all[T, #Ds](arr: T[#Ds...], val: T) -> T[#Ds...]:
     ...
 z: Int[#5] = set_all(v5, 0)  -- #5 preserved through #Ds...
 
 -- Different names resolve independently:
-pure func swap(a: T[#As...], b: T[#Bs...]) -> (T[#Bs...], T[#As...]):
+pure func swap[T, #As, #Bs](a: T[#As...], b: T[#Bs...]) -> (T[#Bs...], T[#As...]):
     (b, a)
 
 -- Dimension variables can also be used as parameter types:
@@ -698,10 +698,10 @@ pure func zeros_like[#N](src: Float[#N]) -> Float[#N]:
 -- Wildcard dims (#_ and #_...): "don't care about this dimension."
 -- Use them in parameter positions when the function doesn't need to know
 -- or reflect the dimension in its return type.
-pure func length(arr: T[#_...]) -> Int:
+pure func length[T](arr: T[#_...]) -> Int:
     builtin      -- Works on any array rank — length ignores all dims.
 
-pure func get(arr: T[#_], i: Int) -> Option[T]:
+pure func get[T](arr: T[#_], i: Int) -> Option[T]:
     builtin      -- Works on any 1D array regardless of size.
 
 -- Each call site freshens #_ independently, so different call sites
@@ -978,12 +978,12 @@ When working with variadic-dimension arrays (`T[#Ds...]`), you can refine them t
 ```blorp
 -- assert_shape(array, N) returns Option[T[#N]]
 -- Refines variadic dims to a concrete dimension if the runtime length matches
-func process(data: Float[#Ds...]) -> Option[Float]:
+func process[#Ds](data: Float[#Ds...]) -> Option[Float]:
     v ?= assert_shape(data, 4)    -- v: Float[#4]
     Some(v[0] + v[1] + v[2] + v[3])
 
 -- Works with match too
-func check(t: Int[#Ds...]) -> Bool:
+func check[#Ds](t: Int[#Ds...]) -> Bool:
     match assert_shape(t, 10):
         Some(validated):
             length(validated) == 10
@@ -1167,6 +1167,10 @@ var player: Person = {name = "Alice", age = 30}
 player = { player | age = player.age + 1 }
 ```
 
+Each field name appears once in a declaration, a record literal and a record update:
+`record P { x: Int, x: Int }` and `{ x = 1, x = 2 }` are rejected at the second `x`, and
+the message gives the position of the first.
+
 ### Structs (Value Types)
 
 Stack-allocated value types with no ARC overhead:
@@ -1269,7 +1273,7 @@ different: Bool = Red != Blue
 name: String = to_string(Red)
 ```
 
-For variants that carry data (payloads), use `union` instead of `enum`.
+For variants that carry data (payloads), use `union` instead of `enum`. An `enum` case is only a name: `Circle(Float)` and even `Red()` in an `enum` are parse errors ("an `enum` case is only a name").
 
 #### Coming From Other Languages?
 
@@ -1349,38 +1353,34 @@ Generic type parameter names must start with a capital ASCII letter and contain
 only ASCII letters and digits, such as `T`, `Elem`, or `Item2`. Dimension
 parameters follow the same rule after `#`, such as `#N` or `#Rows`.
 
-**Auto-generalization.** The `[T, ...]` list is optional when every generic
-name already appears in the parameter or return types. The compiler
-auto-generalizes any capitalized alphanumeric name (`T`, `Elem`, `Item2`) or
-`#`-prefixed dimension (`#N`, `#Ds...`) that is not a defined type or alias:
+**Declare every type parameter.** A type parameter exists only where it is
+declared: in the bracket list after a function, record, union, trait or alias
+name, or in the receiver of an `implements` block (below). Naming an
+undeclared `T` in a signature is an error, and the message suggests the
+declaration:
 
 ```blorp
--- Explicit and auto-generalized forms are equivalent:
-pure func identity_explicit[T](x: T) -> T: x
-pure func identity_auto(x: T) -> T: x           -- T auto-generalized
-pure func identity_named_auto(x: Elem) -> Elem: x -- Elem auto-generalized
+pure func identity(x: T) -> T: x
+-- error: Unknown type 'T' while resolving 'identity'
+-- help: if 'T' is a type parameter, declare it in brackets after the name,
+--       such as `func identity[T](x: T) -> T`; otherwise check its spelling
+--       and imports
+
+pure func identity[T](x: T) -> T: x      -- declared: fine
 
 pure func repeat_value[T, #N](v: T, n: #N) -> T[#N]:
 	vector(v, n)
-
-pure func repeat_value_auto(v: T, n: #N) -> T[#N]:
-    vector(v, n)   -- both T and #N auto-generalized
 ```
 
-Auto-generalization does **not** capture names that are already defined as
-types (records, unions, aliases) — even if declared later in the file:
+A bound belongs only in a bracket list (`func show[T: Equatable](x: T)`).
+Writing one inside a type, as in `x: (T: Equatable)` or `List[T: Equatable]`,
+is a parse error. The one exception is an `implements` receiver, which
+introduces its parameters where it names the type, bare or bounded:
 
 ```blorp
-func test(x: T) -> Int:    -- T is the union below, NOT a type parameter
-    match x:
-        Wrap(n): n
-
-union T:
-    Wrap(Int)
+implements Stringable for Labeled[T]:              -- every Labeled[T]
+implements Stringable for Labeled[T: Stringable]:  -- only when T is Stringable
 ```
-
-Use the explicit `[T]` form when you want to disambiguate, or when the name
-shadows a concrete type on purpose.
 
 Generic type parameters are opaque inside the function body. A concrete value
 does not satisfy `T` unless it came from a value already typed as `T`, but the
@@ -2342,6 +2342,8 @@ func compare_and_print[T: Orderable + Stringable](a: T, b: T) -> Void:
         print("${to_string(a)} > ${to_string(b)}")
 ```
 
+Only type parameters take bounds. A dimension parameter such as `#N` is a number, so `#N: Equatable` is a parse error, and a bound cannot be written inside a type: `x: (T: Equatable)` and `List[T: Equatable]` are parse errors, so write `func f[T: Equatable](x: T)`. Only an `implements` receiver may bound a parameter where it names the type.
+
 A trait you declare is its own trait, even when it shares a name with a standard
 one: a user `Addable` is not the prelude `Addable`, so bounding a type parameter
 by it does not make `+` available. Use the prelude trait, or implement it for the
@@ -2699,7 +2701,7 @@ func main(args: List[String]) -> Int:
     0
 ```
 
-`limit` is required and must be a positive integer literal; `timeout` is
+`limit` is required and must be a positive integer literal that fits in `Int`; `timeout` is
 optional. Each name may appear once and no other names are accepted, so
 `concurrently(limit: 0)`, `concurrently(limit: n)` and `concurrently(timeout: 5)`
 without a `limit` are parse errors. (`max_threads` belongs to `concurrent(...)`
@@ -2894,7 +2896,7 @@ func pool_example() -> Int:
 -- bin/blorp run program.brp --threads 4
 ```
 
-The thread pool is lazily initialized on first concurrent operation. Global OS-worker capacity comes from `BLORP_THREADS`, `--threads`, or the platform default. The `max_threads` parameter is optional on `concurrent(...)`, must be a positive integer literal (`0`, negative numbers and expressions are parse errors), may appear once, and limits only that `concurrent:` block's active child tasks; it does not resize the process-wide worker pool. `concurrent(...)` accepts only `max_threads` and `timeout`; `for ... concurrently(...)` uses `limit` instead and requires it.
+The thread pool is lazily initialized on first concurrent operation. Global OS-worker capacity comes from `BLORP_THREADS`, `--threads`, or the platform default. The `max_threads` parameter is optional on `concurrent(...)`, must be a positive integer literal that fits in `Int` (`0`, negative numbers, larger literals and expressions are parse errors), may appear once, and limits only that `concurrent:` block's active child tasks; it does not resize the process-wide worker pool. `concurrent(...)` accepts only `max_threads` and `timeout`; `for ... concurrently(...)` uses `limit` instead and requires it.
 
 ### Virtual Threads (Fibers)
 
@@ -3011,7 +3013,7 @@ func update_x() -> Int:
     x
 ```
 
-These desugar to `x = x op rhs`. The left-hand side must be a `var`-declared mutable variable. There is no `%=` operator.
+These desugar to `x = x op rhs`. The left-hand side must be a `var`-declared mutable variable. There is no `%=` operator. `_` holds no value, so `_ += 1` is a parse error ("compound assignment cannot update `_`").
 
 ### String Concatenation
 

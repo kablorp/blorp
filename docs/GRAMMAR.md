@@ -138,20 +138,30 @@ docstring = DOCSTRING ;
 ### Function Declaration
 
 ```ebnf
-func_decl = { annotation } [ "pure" ] "func" name [ type_params ] params [ "->" type_expr ] [ where_clause ] ":" func_body ;
+func_decl = { annotation } [ "pure" ] "func" name [ type_params ] params [ "->" type_expr ] [ where_clause ] ":" ( func_body | forward_decl ) ;
 
 annotation = "@" IDENT [ NEWLINE ]
            | "@" IDENT "(" INT ")" [ NEWLINE ] ;
 
 func_body = expr
-          | NEWLINE INDENT stmt_list DEDENT
-          | NEWLINE ;                           (* forward declaration *)
+          | NEWLINE INDENT stmt_list DEDENT ;
+
+forward_decl = NEWLINE ;                        (* top-level `func` declarations only *)
 
 where_clause = "where" dim_constraint { "," dim_constraint } ;
 dim_constraint = dim_expr "==" dim_expr ;
 
 stmt_list = stmt { NEWLINE stmt } ;
 ```
+
+A function body holds at least one expression or statement (`void` is a body that
+does nothing). The one exception is a forward declaration: a top-level header
+ending in `:` with nothing under it (a missing `:` is reported),
+accepted only when the module also holds a top-level function of the same name
+that has a body. The standard library uses it to declare a higher-order
+function's impure signature before or after its pure implementation. A nested
+function, an implementation method, a trait method with a `:` and any other
+header without a body is rejected with `function has no body`.
 
 Compiler-recognized function annotations include `@tail_recursive` and
 `@debug_only`. `@debug_only` is declaration metadata: calls and function
@@ -179,11 +189,13 @@ Type parameter names must start with a capital ASCII letter and contain only
 ASCII letters and digits (`T`, `Elem`, `Item2`). Dimension parameters use the
 same rule after `#` (`#N`, `#Rows`); `#_` is the wildcard dimension exception.
 
-The `type_params` list is optional. If a capitalized alphanumeric name or a
-`#`-prefixed dim (`#N`, `#Ds...`) appears in `params` or `type_expr` without
-being declared as a type (record, union, alias) anywhere in the program,
-typechecking auto-generalizes it as an implicit type parameter. See the Type
-Inference section of GUIDE.md for details.
+A dimension parameter (`#N`, `#_`) takes no bounds: `#N: Equatable` is a parse
+error, since a dimension is a number and no trait bounds it.
+
+A type parameter exists only where it is declared: in a `type_params` list, or
+in the receiver of an `implements` block. A capitalized name or a `#`-prefixed
+dimension that is neither declared nor a defined type is an error; the message
+suggests declaring it, as in `func identity[T](x: T) -> T`.
 
 ### Parameters
 
@@ -204,7 +216,7 @@ tuple_param = "(" IDENT "," IDENT [ "," IDENT [ "," IDENT ] ] [ "," ] ")" ;
 ```ebnf
 stmt = var_decl
      | IDENT "=" expr                           (* assignment *)
-     | IDENT ("+=" | "-=" | "*=" | "/=") expr   (* compound assignment *)
+     | IDENT ("+=" | "-=" | "*=" | "/=") expr   (* compound assignment; IDENT is not `_` *)
      | postfix_expr "[" expr_list "]" "=" expr  (* subscript assignment *)
      | "while" expr ":" NEWLINE INDENT stmt_list DEDENT
      | "for" IDENT "in" expr ":" NEWLINE INDENT stmt_list DEDENT
@@ -254,7 +266,10 @@ type_decl = "union" IDENT [ type_params ] ":" NEWLINE INDENT variant_list DEDENT
           | "resource" "type" IDENT [ type_params ] "=" "builtin"
               [ "(" STRING ")" ] ;  (* std-only; optional cleanup builtin *)
 
-enum_decl = "enum" IDENT ":" NEWLINE INDENT variant_list DEDENT ;
+enum_decl = "enum" IDENT ":" NEWLINE INDENT enum_case_list DEDENT ;
+
+enum_case_list = variant_name { NEWLINE variant_name } ;
+(* An enum case is only a name; parentheses on one, even empty ones, are a parse error. Use `union`. *)
 
 variant_list = variant { NEWLINE variant } ;
 variant      = variant_name [ "(" type_expr { "," type_expr } [ "," ] ")" ] ;
@@ -266,6 +281,7 @@ struct_decl = "struct" IDENT "{" field_list "}" ;
 
 field_list = [ field_decl { "," field_decl } [ "," ] ] ;
 field_decl = identifier ":" type_expr ;
+(* The field names of one declaration are distinct; the parser rejects a repeat, and a record literal or update gives each field once. *)
 
 type_alias_decl = "type" "alias" IDENT [ type_params ] "=" type_expr
                 | "opaque" "type" IDENT [ type_params ] "=" type_expr ;
@@ -341,9 +357,11 @@ trait_method = [ "pure" ] "func" name params [ "->" type_expr ]                 
 
 trait_body = expr | NEWLINE INDENT stmt_list DEDENT ;
 
-impl_decl = "implements" IDENT "for" type_expr ":"
+impl_decl = "implements" IDENT "for" receiver_type ":"
             NEWLINE INDENT impl_methods DEDENT ;
-(* Bounds on type params use inline syntax: Type[T: Bound] *)
+(* receiver_type is a type_expr whose arguments introduce the impl's type
+   parameters, bare or bounded: Labeled[T], Labeled[T: Stringable]. It is the
+   only place a bound is written inside a type. *)
 
 impl_methods = impl_method { NEWLINE impl_method } ;
 impl_method  = [ "pure" ] "func" name [ type_params ] params [ "->" type_expr ] [ where_clause ] ":" func_body ;
@@ -379,7 +397,7 @@ type_args = type_arg { "," type_arg } [ "," ] ;
 
 type_arg = type_expr
          | dim_expr
-         | IDENT ":" bounds                                 (* bounded type arg *)
+         | IDENT ":" bounds                                 (* receiver_type only *)
          | "#" "_"                                          (* wildcard dim *)
          | "#" IDENT "..." ;                                (* variadic dim *)
 
@@ -389,12 +407,18 @@ array_dim_arg = dim_expr
               | "#" IDENT "..." ;
 
 type_list = tuple_elem { "," tuple_elem } [ "," ] ;
-tuple_elem = type_expr | IDENT ":" bounds ;
+tuple_elem = type_expr | IDENT ":" bounds ;         (* bounds: receiver_type only *)
 
 dim_expr = dim_mul { ("+" | "-") dim_mul } ;
 dim_mul  = dim_atom { ("*" | "/") dim_atom } ;
 dim_atom = "#" IDENT | "#" INT | INT | "(" dim_expr ")" ;
 ```
+
+A bound `IDENT ":" bounds` inside a type is accepted only in an `implements`
+receiver. In any other type (an annotation, a return type, a field, a payload,
+an alias, or inside `[...]` or tuple parentheses of one) it is a parse error:
+`x: (T: Equatable)` and `List[T: Equatable]` are rejected. Declare the
+parameter and its bounds in `type_params` instead.
 
 ### Expressions
 
@@ -525,7 +549,8 @@ detach_expr = "detach" unary_expr ;
 ```
 
 `INT` in `concurrent_param` and `concurrently_param` is a positive integer
-literal; `0`, negative numbers and expressions such as `2 + 2` are parse errors.
+literal that fits in `Int` (at most 9223372036854775807); `0`, negative numbers,
+larger literals and expressions such as `2 + 2` are parse errors.
 Each name appears at most once, `concurrent(...)` accepts no name but
 `max_threads` and `timeout`, and `for ... concurrently(...)` requires `limit`
 and accepts no name but `limit` and `timeout`. The parser rejects all of these,

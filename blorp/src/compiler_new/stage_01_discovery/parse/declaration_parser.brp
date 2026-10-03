@@ -30,6 +30,7 @@ import:
 	../tables/diagnostic_code:
 		PlainSyntaxCode(
 			UnionVariantTooManyFieldsDiagnostic, AnnotationWithoutFunctionDiagnostic,
+			EnumCaseParenthesesDiagnostic,
 			BuiltinTypeArgumentsDiagnostic, DocstringBeforeImportBlockDiagnostic,
 			ExpectedCleanupBuiltinNameDiagnostic, ExpectedDeclarationDiagnostic,
 			ExpectedForeignArgumentDiagnostic, ExpectedForeignArgumentValueDiagnostic,
@@ -37,6 +38,7 @@ import:
 			ExpectedImplMethodDiagnostic, ExpectedSupertraitOrMethodsDiagnostic,
 			ForeignFunctionOutsideBlockDiagnostic,
 		),
+		SyntaxDiagnostic(DuplicateField),
 	../tables/expected_token:
 		ArrowConstruct(ArrowInForeignFunctionReturnType),
 		ColonConstruct(
@@ -78,9 +80,12 @@ import:
 		ModuleId,
 		NameId,
 		NodeId,
+		definition_id_at_row,
+		definition_id_index,
 		literal_id_at_row,
+		name_ids_equal,
 	../tables/limits: MAX_UNION_VARIANT_FIELDS
-	../tables/name_vocabulary: IMPL_NAME
+	../tables/name_vocabulary: EMPTY_NAME, IMPL_NAME
 	../tables/node_builder: last_node_id
 	../tables/row_kinds:
 		DefinitionKind(
@@ -93,6 +98,7 @@ import:
 		Purity(ImpureFunction, PureFunction),
 		Visibility(PrivateVisibility, PublicVisibility),
 	../tables/rows: RowRange
+	../tables/source_position: span_start_line
 	../tables/span: Span, span_covering
 	../tables/token:
 		Token,
@@ -176,6 +182,7 @@ import:
 		open_trait,
 		open_union,
 		open_variant,
+		record_definition,
 		record_opening,
 		record_rows,
 		trait_definition,
@@ -186,7 +193,8 @@ import:
 		union_rows,
 		variant_opening,
 		variant_rows,
-	function_parser: parse_signature
+	forward_declarations: module_diagnostics_first, report_unpaired_forward_declarations
+	function_parser: function_body_follows, parse_signature, report_missing_function_body
 	import_parser: parse_import_block
 	parser_cursor:
 		at,
@@ -222,7 +230,7 @@ import:
 		span_before_current,
 		token_kind_at,
 	trait_reference_parser: TraitReferenceSink(SupertraitSink), parse_trait_reference
-	type_parser: node_span, parse_type, parse_type_parameters
+	type_parser: node_span, parse_variant_payload_type, parse_receiver_type, parse_type, parse_type_parameters
 
 
 -- Module.
@@ -233,6 +241,10 @@ pure func parse_module_declarations(
 	builder: DiscoveryBuilder,
 	module: ModuleId,
 ) -> DiscoveryBuilder:
+	definitions_first: Int = builder.definitions.length()
+	bodies_first: Int = builder.bodies.length()
+	diagnostics_first: Int = builder.module_diagnostics_first()
+
 	var out: DiscoveryBuilder = builder
 		.skip_newlines()
 		.parse_module_documentation(module)
@@ -245,7 +257,7 @@ pure func parse_module_declarations(
 		if out.token_cursor == before and not out.at(EndOfFileToken):
 			out = out.advance_token()
 
-	out
+	out.report_unpaired_forward_declarations(definitions_first, bodies_first, diagnostics_first)
 
 
 ---
@@ -561,15 +573,70 @@ private pure func parse_field(
 	name_span: Span = builder.current_span()
 	header: DeclarationHeader = module.plain_header(name_span, builder.pending_annotation_count())
 	opening: FieldOpening = builder.field_opening(header, owner, name, name_span)
+	-- Read before the field's own row is appended, so it cannot find itself.
+	earlier: Option[DefinitionId] = builder.earlier_field_named(owner, name)
 	var out: DiscoveryBuilder = builder
 		.consume_declared_name(NameInFieldName)
 		.open_field(opening)
 		.expect_colon(ColonInFieldName)
 		.parse_type()
+		.report_duplicate_field(earlier, name_span)
 	field_type: NodeId = out.last_node_id()
 	out = out.append_field_type(opening, field_type)
 	end: Span = out.node_span(field_type)
 	out.close_field(opening, end)
+
+
+---
+Reports at `name_span` that the field repeats `earlier`, a field of the same
+declaration. The field names of a declaration are local to it, so the parser sees
+the repeat first. It is reported after the field's type, as the existing parser
+does, so both front ends order their diagnostics alike.
+---
+private pure func report_duplicate_field(
+	builder: DiscoveryBuilder,
+	earlier: Option[DefinitionId],
+	name_span: Span,
+) -> DiscoveryBuilder:
+	match earlier:
+		Some(first):
+			builder.append_syntax_diagnostic(name_span, DuplicateField(first))
+		None:
+			builder
+
+
+---
+The first field of `owner` named `name`, found among the definition rows after the
+record's own. A record is parsed before the next declaration begins, so every row
+after its own is one of its fields. A missing name is no name, so it repeats
+nothing.
+---
+private pure func earlier_field_named(
+	builder: DiscoveryBuilder,
+	owner: RecordOpening,
+	name: NameId,
+) -> Option[DefinitionId]:
+	var found: Option[DefinitionId] = None
+	var index: Int = owner
+		.record_definition()
+		.definition_id_index() + 1
+
+	while (
+		found.is_none()
+		and index < builder.definitions.length()
+		and not name.name_ids_equal(EMPTY_NAME)
+	):
+		match builder.definitions.get(index):
+			Some(row):
+				if row.kind == FieldDefinition and row.name.name_ids_equal(name):
+					found = Some(definition_id_at_row(index))
+			None:
+				-- Unreachable: `index` is below the length.
+				void
+
+		index += 1
+
+	found
 
 
 -- Unions and enums.
@@ -599,7 +666,7 @@ private pure func parse_union(
 
 	while not out.at_block_end():
 		before: Int = out.token_cursor
-		out = out.parse_variant(header.module, opening)
+		out = out.parse_variant(header.module, opening, form)
 		out = out.skip_newlines()
 
 		if out.token_cursor == before and not out.at_block_end():
@@ -626,12 +693,14 @@ private pure func consume_variant_name(builder: DiscoveryBuilder) -> DiscoveryBu
 
 
 ---
-`Name` or `Name(T, ...)`; `True` and `False` are variant names too.
+`Name` or `Name(T, ...)`; `True` and `False` are variant names too. An `enum`
+case is only a name, so parentheses on one are reported, at the case's name.
 ---
 private pure func parse_variant(
 	builder: DiscoveryBuilder,
 	module: ModuleId,
 	owner: UnionOpening,
+	form: UnionForm,
 ) -> DiscoveryBuilder:
 	name_span: Span = builder.current_span()
 	name: NameId = builder.declared_name_at_cursor()
@@ -644,13 +713,18 @@ private pure func parse_variant(
 	var end: Span = name_span
 
 	if out.at(LeftParenSymbol):
+		-- An `enum` case is only a name, so its parentheses are reported even
+		-- when they are empty; they are still parsed so recovery skips them.
+		if form == EnumType:
+			out = out.append_plain_diagnostic(EnumCaseParenthesesDiagnostic, name_span)
+
 		out = out.advance_token()
 
 		if not out.at(RightParenSymbol):
 			var parsing: Bool = True
 
 			while parsing and not out.at(EndOfFileToken):
-				out = out.parse_type()
+				out = out.parse_variant_payload_type()
 				payload: NodeId = out.last_node_id()
 				out = out.append_variant_payload(opening, payload)
 
@@ -896,12 +970,16 @@ private pure func parse_trait_method(
 		out = out.append_function_return_type(opening, return_type)
 		end = out.node_span(return_type)
 
-	-- After a `:` the existing parser always parses a body, so a trait method
-	-- written with a `:` and no body is reported by the block parser.
+	-- A `:` promises a default body; without a `:` the method is abstract.
 	if out.at(ColonSymbol):
+		colon_line: Int = out.span_start_line(out.current_span())
 		out = out.advance_token()
-		out = out.parse_function_body(module, opening, start)
-		end = out.node_span(out.last_node_id())
+
+		if out.function_body_follows(colon_line):
+			out = out.parse_function_body(module, opening, start)
+			end = out.node_span(out.last_node_id())
+		else:
+			out = out.report_missing_function_body(name_span)
 
 	out.close_function(opening, end)
 
@@ -921,7 +999,7 @@ private pure func parse_impl(
 	opening: ImplOpening = out.impl_opening(header, IMPL_NAME, keyword_span, trait_name, trait_span)
 	out = out.open_impl(opening)
 	out = out.expect_keyword_token(ForKeyword, KeywordInImplementationTrait)
-	out = out.parse_type()
+	out = out.parse_receiver_type()
 	receiver: NodeId = out.last_node_id()
 	out = out.append_receiver_type(opening, receiver)
 	var end: Span = out.node_span(receiver)

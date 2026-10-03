@@ -936,6 +936,7 @@ invalid_prog="$TMPDIR_CLI/invalid.brp"
 parse_invalid_prog="$TMPDIR_CLI/parse_invalid.brp"
 parse_missing_colon_prog="$TMPDIR_CLI/parse_missing_colon.brp"
 parse_two_errors_prog="$TMPDIR_CLI/parse_two_errors.brp"
+duplicate_literal_field_prog="$TMPDIR_CLI/duplicate_literal_field.brp"
 parse_two_modules_dir="$TMPDIR_CLI/parse_two_modules"
 compiler_runtime_import="$TMPDIR_CLI/compiler_runtime_import.brp"
 failing_test="$TMPDIR_CLI/failing_test.brp"
@@ -1256,6 +1257,13 @@ func main(args: List[String]) -> Int:
 	1
 BRP
 
+cat > "$duplicate_literal_field_prog" <<'BRP'
+record P { x: Int }
+
+func main(args: List[String]) -> Int:
+    p: P = { x = 1, x = 2 }
+    p.x
+BRP
 cat > "$parse_two_errors_prog" <<'BRP'
 func first() -> Int:
 	if True
@@ -1547,6 +1555,9 @@ $parse_two_errors_prog:8:9: error: expected \`:\` after if condition" \
     "$missing_colon_help
 $missing_colon_help" \
     "$BLORP_BIN" check --no-format "$parse_two_errors_prog"
+expect_output_contains "run rejects a field given twice in a record literal" 1 \
+    "duplicate field \`x\`" \
+    "$BLORP_BIN" run --no-format "$duplicate_literal_field_prog"
 expect_output_contains "compiler runtime is not importable from std" 1 \
 	"module 'compiler_runtime' is not loaded for import registration" \
 	"$BLORP_BIN" check --no-format "$compiler_runtime_import"

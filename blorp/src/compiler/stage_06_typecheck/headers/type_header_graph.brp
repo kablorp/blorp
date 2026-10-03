@@ -52,6 +52,7 @@ import:
 			ParsedDimNameType, ParsedFunctionType, ParsedMissingType, ParsedNamedType,
 			ParsedQualifiedNamedType, ParsedRangeType, ParsedTupleType,
 		),
+		ParsedTypeParamKind(ParsedTypeParameter),
 		ParsedUnionDecl,
 		ParsedVariantDecl,
 		parsed_type_expr_location,
@@ -80,6 +81,7 @@ import:
 		type_id_name,
 		type_id_source_span,
 		type_ids_equal,
+	type_parameter_discovery: type_parameter_name_is_valid
 	../modules/bound_module_graph:
 		BoundModule,
 		BoundModuleGraph,
@@ -94,8 +96,10 @@ import:
 		bound_module_graph_target,
 		bound_module_program,
 		bound_module_scope,
+		bound_module_visible_import_modules,
 		bound_module_view,
-	../modules/module_binding: importable_module_request_aliases
+	../modules/module_binding:
+		importable_module_request_aliases, private_import_message, program_rejected_private_import
 	../modules/module_view:
 		module_view_find_graph_module_alias,
 		module_view_find_imported_name,
@@ -266,6 +270,7 @@ union TypeShapeResolutionError:
 	TypeShapeUnknownQualifier(TypeResolutionOwner, String, SourceLocation)
 	TypeShapeImportedModuleMissing(TypeResolutionOwner, String, SourceLocation)
 	TypeShapePrivateTypeReference(TypeResolutionOwner, String, String, SourceLocation)
+	TypeShapePrivateImport(String, String, SourceLocation)
 	TypeShapeArityMismatch(TypeResolutionOwner, String, Int, Int, SourceLocation)
 	TypeShapeUnknownTypeParameter(TypeResolutionOwner, String, SourceLocation)
 	TypeShapeInvalidDimension(TypeResolutionOwner, String, SourceLocation)
@@ -489,7 +494,6 @@ union TypeHeaderError:
 	TypeHeaderConstructorMissing(TypeId, String)
 	TypeHeaderFieldDefinitionMissing(TypeId, String, SourceLocation)
 	TypeHeaderInvalidEnumTypeParameters(TypeId)
-	TypeHeaderInvalidEnumVariantFields(TypeId, String)
 	TypeHeaderInvalidStructTypeParameters(TypeId)
 	TypeHeaderEmptyStruct(TypeId)
 	TypeHeaderInvalidStructField(TypeId, String)
@@ -1230,14 +1234,29 @@ private pure func resolve_named_type(
 														)
 											None:
 												ResolvedTypeRejected(
-													[
-														TypeShapeUnknownType(
-															context.owner,
-															name,
-															span,
-														),
-													],
+													[unknown_unqualified_type_error(context, name, span)],
 												)
+
+
+---
+The error for an unqualified type name nothing declares. When the module
+imports that name from a module where it is private, the import's own error
+says so: calling the name unknown would hide the cause.
+---
+private pure func unknown_unqualified_type_error(
+	context: TypeResolutionContext,
+	name: String,
+	span: SourceLocation,
+) -> TypeShapeResolutionError:
+	match program_rejected_private_import(
+		bound_module_program(context.module),
+		bound_module_visible_import_modules(context.module),
+		name,
+	):
+		Some((module_path, original_name)):
+			TypeShapePrivateImport(module_path, original_name, span)
+		None:
+			TypeShapeUnknownType(context.owner, name, span)
 
 
 private pure func resolve_qualified_named_type(
@@ -1933,16 +1952,6 @@ private pure func build_union_header(
 
 	if decl.is_enum and not parameters.is_empty():
 		errors = errors.append(TypeHeaderInvalidEnumTypeParameters(context.owner))
-
-	if decl.is_enum:
-		for variant in decl.variants:
-			if not variant.fields.is_empty():
-				errors = errors.append(
-					TypeHeaderInvalidEnumVariantFields(
-						context.owner,
-						variant.name.text,
-					),
-				)
 
 	match resolve_variants(context, decl.variants):
 		Err(variant_errors):
@@ -3819,6 +3828,18 @@ pure func type_resolution_owner_display_name(owner: TypeResolutionOwner) -> Stri
 			name
 
 
+---
+The help line for an unknown type. A name that could be a type parameter
+(a capital ASCII letter first) is offered the declaration; any other can only
+be a misspelling or a missing import.
+---
+private pure func unknown_type_help(name: String) -> String:
+	if type_parameter_name_is_valid(name, ParsedTypeParameter):
+		"help: if '" + name + "' is a type parameter, declare it in brackets after the name, such as `func identity[" + name + "](x: " + name + ") -> " + name + "`; otherwise check its spelling and imports"
+	else:
+		"help: check the spelling of '" + name + "' and its imports"
+
+
 pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -> String:
 	match error:
 		TypeShapeOwnerModuleMissing(owner, _):
@@ -3846,7 +3867,7 @@ pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -
 		TypeShapeUnknownType(owner, name, _):
 			"Unknown type '" + name + "' while resolving '" + type_resolution_owner_display_name(
 				owner,
-			) + "'"
+			) + "'\n" + unknown_type_help(name)
 		TypeShapeUnknownQualifier(owner, qualifier, _):
 			"Unknown module qualifier '" + qualifier + "' while resolving '" + type_resolution_owner_display_name(
 				owner,
@@ -3855,6 +3876,8 @@ pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -
 			"Imported module '" + module_path + "' is missing while resolving '" + type_resolution_owner_display_name(
 				owner,
 			) + "'"
+		TypeShapePrivateImport(module_path, original_name, _):
+			private_import_message(module_path, original_name)
 		TypeShapePrivateTypeReference(owner, module_path, referenced_name, _):
 			"Declaration '" + type_resolution_owner_display_name(
 				owner,
@@ -3866,7 +3889,7 @@ pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -
 		TypeShapeUnknownTypeParameter(owner, name, _):
 			"Unknown type parameter '" + name + "' while resolving '" + type_resolution_owner_display_name(
 				owner,
-			) + "'"
+			) + "'\nhelp: declare '" + name + "' in brackets after the name, such as `func rows[" + name + "](values: Int[" + name + "])`"
 		TypeShapeInvalidDimension(owner, value, _):
 			"Invalid dimension '" + value + "' while resolving '" + type_resolution_owner_display_name(
 				owner,
@@ -3881,7 +3904,7 @@ pure func type_shape_resolution_error_message(error: TypeShapeResolutionError) -
 
 pure func type_shape_resolution_error_span(error: TypeShapeResolutionError) -> SourceLocation:
 	match error:
-		TypeShapeOwnerModuleMissing(_, span) | TypeShapeForeignTraitParameter(_, _, span) | TypeShapeForeignCallableParameter(_, _, span) | TypeShapeForeignImplementationParameter(_, _, span) | TypeShapeUnknownType(_, _, span) | TypeShapeUnknownQualifier(_, _, span) | TypeShapeImportedModuleMissing(_, _, span) | TypeShapePrivateTypeReference(_, _, _, span) | TypeShapeArityMismatch(_, _, _, _, span) | TypeShapeUnknownTypeParameter(_, _, span) | TypeShapeInvalidDimension(_, _, span) | TypeShapeMissingType(_, span) | TypeShapeSelfNotAllowed(_, span):
+		TypeShapeOwnerModuleMissing(_, span) | TypeShapeForeignTraitParameter(_, _, span) | TypeShapeForeignCallableParameter(_, _, span) | TypeShapeForeignImplementationParameter(_, _, span) | TypeShapeUnknownType(_, _, span) | TypeShapeUnknownQualifier(_, _, span) | TypeShapeImportedModuleMissing(_, _, span) | TypeShapePrivateTypeReference(_, _, _, span) | TypeShapePrivateImport(_, _, span) | TypeShapeArityMismatch(_, _, _, _, span) | TypeShapeUnknownTypeParameter(_, _, span) | TypeShapeInvalidDimension(_, _, span) | TypeShapeMissingType(_, span) | TypeShapeSelfNotAllowed(_, span):
 			span
 
 
@@ -3965,8 +3988,6 @@ pure func type_header_error_message(
 				definition_table,
 				id,
 			).get_or("<unknown type>") + "' cannot have type parameters"
-		TypeHeaderInvalidEnumVariantFields(_, name):
-			"Enum variant '" + name + "' cannot have fields; use 'union' instead"
 		TypeHeaderInvalidStructTypeParameters(id):
 			"Struct '" + type_id_name(
 				definition_table,
@@ -4011,7 +4032,7 @@ pure func type_header_error_span(
 	error: TypeHeaderError,
 ) -> Option[SourceLocation]:
 	match error:
-		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidEnumVariantFields(id, _) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
+		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
 			type_id_source_span(definition_table, id)
 		TypeHeaderFieldDefinitionMissing(_, _, span):
 			Some(span)
