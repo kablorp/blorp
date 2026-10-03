@@ -21,6 +21,13 @@ import sys
 DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASELINE = Path(__file__).with_name("compiler-identity-census-baseline.json")
 REVIEW_REQUIRED = "REVIEW_REQUIRED"
+EXACT_CATEGORIES = (
+    "identity_field",
+    "pending_constructor",
+    "source_spelling_predicate",
+    "string_collection",
+    "symbol_projection",
+)
 PHASE_DIRECTORIES = {
     "stage_06_typecheck": "typecheck",
     "stage_08_core_lower": "lowering",
@@ -454,6 +461,48 @@ def check(current, baseline):
     return errors
 
 
+def check_failure_summary(root, current, baseline):
+    """Explain a stale ratchet without changing what the ratchet accepts."""
+    baseline_revision = baseline.get("source_revision", "unknown")
+    lines = [f"baseline revision: {baseline_revision}"]
+    try:
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=False)
+    except OSError:
+        head = None
+    if head is not None and head.returncode == 0:
+        current_head = head.stdout.strip()
+        lines.append(f"current HEAD: {current_head}")
+        ancestor = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor",
+             baseline_revision, current_head], capture_output=True, check=False,
+        )
+        if ancestor.returncode == 0:
+            distance = subprocess.run(
+                ["git", "-C", str(root), "rev-list", "--count",
+                 f"{baseline_revision}..{current_head}"],
+                capture_output=True, text=True, check=False,
+            )
+            if distance.returncode == 0:
+                lines.append(f"commits since baseline: {distance.stdout.strip()}")
+        elif ancestor.returncode == 1:
+            lines.append("baseline revision is not an ancestor of current HEAD")
+
+    exact_rows = (row for row in current["rows"]
+                  if row["classification"] in {"legacy_semantic", "legacy_source_shape"})
+    current_keys = {row["key"] for row in exact_rows}
+    baseline_keys = set(baseline["exact_site_keys"])
+    added = current_keys - baseline_keys
+    removed = baseline_keys - current_keys
+    lines.append(f"exact-site drift: {len(added)} added, {len(removed)} removed")
+    for category in EXACT_CATEGORIES:
+        added_count = sum(f":{category}:" in key for key in added)
+        removed_count = sum(f":{category}:" in key for key in removed)
+        if added_count or removed_count:
+            lines.append(f"  {category}: +{added_count} -{removed_count}")
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -517,6 +566,9 @@ def main():
             print(f"invalid baseline: {error}", file=sys.stderr)
             return 2
         errors = check(current, baseline)
+        if errors:
+            for line in check_failure_summary(args.root, current, baseline):
+                print(line, file=sys.stderr)
         for error in errors:
             print(error, file=sys.stderr)
         if errors:

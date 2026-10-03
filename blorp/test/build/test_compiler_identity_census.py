@@ -1,6 +1,7 @@
 """Focused contract tests for the source identity census."""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -114,6 +115,40 @@ class IdentityCensusTest(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("ir.brp:8", failed.stderr)
         self.assertIn("new exact identity site", failed.stderr)
+
+    def test_failed_check_summarizes_revision_and_exact_site_drift(self):
+        self.write_reviewed_baseline()
+        self.source.write_text(
+            self.source.read_text().replace("variable.name == \"x\"",
+                                            "variable.name == \"y\"")
+                + "\tvar names: Dict[String, Int] = {}\n",
+            encoding="utf-8",
+        )
+        failed = self.run_census("--check")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertIn("baseline revision: unversioned-fixture", failed.stderr)
+        self.assertIn("exact-site drift: 2 added, 1 removed", failed.stderr)
+        self.assertIn("source_spelling_predicate: +1 -1", failed.stderr)
+        self.assertIn("string_collection: +1 -0", failed.stderr)
+        self.assertIn("new exact identity site", failed.stderr)
+
+    def test_failed_check_reports_sites_when_git_is_unavailable(self):
+        self.write_reviewed_baseline()
+        self.source.write_text(
+            self.source.read_text().replace("variable.name == \"x\"",
+                                            "variable.name == \"y\""),
+            encoding="utf-8",
+        )
+        failed = subprocess.run(
+            [sys.executable, str(SCRIPT), "--root", str(self.root),
+             "--baseline", str(self.baseline), "--check"],
+            env={**os.environ, "PATH": "/nonexistent"},
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertIn("baseline revision: unversioned-fixture", failed.stderr)
+        self.assertIn("new exact identity site", failed.stderr)
+        self.assertNotIn("Traceback", failed.stderr)
 
     def test_same_function_constructor_swap_at_same_count_fails(self):
         self.source.write_text(
