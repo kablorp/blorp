@@ -1,5 +1,11 @@
 # Struct Payload Roadmap
 
+This document describes the current `struct` representation and its targeted
+payload experiments. The proposed `fixed record` / `fixed union` language
+contract, managed inline values and ordinary-record inlining are owned by
+the [Fixed Layout Roadmap](FIXED_LAYOUT_ROADMAP.md); the exclusions below
+apply only to this older payload-specific workstream.
+
 Goal: a `struct` value stays a value wherever it lives. It is inline as a
 record field, a local, a list element, an `Option` payload, a closure
 environment capture and a source-union payload whose union is otherwise typed;
@@ -94,32 +100,13 @@ classifying the field. Oracle if reopened: all behavioural gates including
 leak checker's live-object summary, foreign marshalling) must not assume
 `void*` slots.
 
-### S4. Hot records become structs
-
-Needs a fresh census after the identity work in
-[`IDENTITY_ROADMAP.md`](IDENTITY_ROADMAP.md) lands, and a fresh decision about
-the S2 dependency (a struct in an erased union payload is still boxed, so the
-SourceSpan lesson still applies). `CoreVar` and `CoreSourceLoc` are not
-candidates here: the identity roadmap's "Delete strings from Core variables"
-step replaces `CoreVar` with a spelling-free value id, and `CoreSourceLoc` is
-already an opaque `Int`. `CoreParam { name, typ, loc }` stays a record while it
-holds a `CoreType` pointer, until expression and parameter types become type ids
-("Core types as type ids" in the identity roadmap). `SourceSpan` is worth
-converting only if a fresh census still shows material cost.
-
-One type per commit, each with the SourceSpan probe's method: count where the
-value lives, convert, and measure every phase row. Do not introduce sentinel
-encodings where a typed id or precise variant already represents the state.
-Oracle: byte-identical C for compiler-internal representation cuts unless the
-change names a layout change; exact diagnostic fixtures for any display-span
-carrier.
-
 ### S5. Struct values in erased dictionary storage
 
 `blorp_Dict` uses erased key and value slots shared with the runtime's generic
 helpers. A struct key or value entering those slots needs a box. A prior
 inspection of generated dictionary C found no such boxes; that static
-observation does not establish the dynamic cost. After S4, count actual
+observation does not establish the dynamic cost. After the record census in
+the Fixed Layout Roadmap, count actual
 `blorp_box_struct` calls at dictionary boundaries on a current workload.
 Consider typed dictionary storage for struct keys and values only if the
 dynamic count and a stage-2 measurement justify it; otherwise park S5.

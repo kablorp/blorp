@@ -62,10 +62,13 @@ experiments live in Git history and `benchmarks/results/`.
   to ids, retiring magic spellings, emission by id, value identity through the
   front end and Core, type identity and interning, Core node tables and
   frontend facts, with each step's oracle and the interim states still on main.
+- [Fixed Layout Roadmap](FIXED_LAYOUT_ROADMAP.md) plans `fixed record` first,
+  then conditionally `fixed union`, enum retirement and shared product layout;
+  it separates source guarantees from opportunistic record inlining.
 - [Struct Payload Roadmap](STRUCT_PAYLOAD_ROADMAP.md) lists the open steps for
-  keeping struct values inline in unions and dictionary storage, and
-  converting hot records to structs. Stored tuple layout belongs to the
-  value-tuple plan below.
+  the current struct payload representation and its measured limits. Future
+  fixed-layout language changes belong to the roadmap above; stored tuple
+  layout belongs to the value-tuple plan below.
 - [Allocation Contract Roadmap](ALLOCATION_CONTRACT_ROADMAP.md) proposes
   allocation explanations and a compile-time `no_alloc` block, including
   runtime/cleanup coverage, Core analysis, and tooling enforcement.
