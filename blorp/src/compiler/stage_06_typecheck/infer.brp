@@ -298,8 +298,11 @@ import:
 		env_lookup,
 		env_lookup_in_current_scope,
 		env_lookup_is_outermost_scope,
+		env_lookup_local,
+		env_lookup_outermost_scope,
 		env_lookup_session_ufcs_functions,
 		env_lookup_with_scope_depth,
+		env_outermost_scope_symbols_named,
 		env_pop_scope,
 		env_push_scope,
 		env_resolve_alias,
@@ -307,7 +310,6 @@ import:
 		env_resolve_trait_obligation,
 		env_scoped_resource_unavailable_owner,
 		env_select_ufcs_method,
-		env_symbols_named,
 		env_type_contains_resource_if_valid,
 		env_type_is_resource,
 		env_type_may_contain_function,
@@ -7472,6 +7474,38 @@ private union BareValueLookup:
 	BareAcceptedGlobal(AcceptedGlobalBinding)
 
 
+---
+What a bare name yields in module-level value lookup, apart from any local
+binding. The variants name where the meaning comes from, in the order the
+lookup prefers them: a value declared in this module wins over one supplied
+by an accepted authority or an import, and a compiler builtin is the last
+resort. A visible type-only symbol is also returned so value inference can
+report that the name is not a value. This does not establish whether that type
+name is visible in the type namespace.
+---
+union ModuleBareValueReferent:
+	-- A function, constant or `var` declared in this module, or a constructor
+	-- of a union declared here.
+	OwnModuleValue(Symbol)
+	-- A function the accepted callable authority binds the name to.
+	AcceptedFunctionValue(AcceptedCallableBinding)
+	-- A constructor named by a selective import, in a view without an
+	-- accepted union authority.
+	SelectiveImportConstructorValue(Symbol)
+	-- A constant or `var` the accepted global authority binds the name to.
+	AcceptedGlobalValue(AcceptedGlobalBinding)
+	-- A constructor the accepted union authority makes visible bare.
+	AcceptedConstructorValue(Symbol)
+	-- A function, constant or constructor of another module that is visible
+	-- bare in this one.
+	ImportedModuleValue(Symbol)
+	-- A type, record, or alias selected by value lookup for the not-a-value
+	-- diagnostic; this does not establish visibility in the type namespace.
+	TypeNameValueLookupFallback(Symbol)
+	-- A compiler builtin function.
+	BuiltinFunctionValue(Symbol)
+
+
 private pure func infer_session_accepted_global(
 	session: InferSession,
 	name: String,
@@ -7494,11 +7528,17 @@ private pure func infer_session_accepted_callable(
 			None
 
 
-private pure func lookup_bare_value(
+---
+The module-level meaning of the bare value name `name`, read from the outermost
+(module) scope and the module's accepted authorities. Local bindings are not
+consulted, so a caller that has a local binding of the name must prefer it.
+The expected type of `context` picks between same-named constructors.
+---
+pure func module_bare_value_referent(
 	context: InferContext,
-	name: ParsedIdentifier,
-) -> Option[BareValueLookup]:
-	var local_or_current = match env_lookup(context.state.env, name.text):
+	name: String,
+) -> Option[ModuleBareValueReferent]:
+	var own_module_value = match env_lookup_outermost_scope(context.state.env, name):
 		Some(symbol):
 			if symbol_is_lexical_or_current_module(context, symbol):
 				Some(symbol)
@@ -7509,10 +7549,10 @@ private pure func lookup_bare_value(
 
 	var visible_fallback: Option[Symbol] = None
 	var builtin_fallback: Option[Symbol] = None
-	imported_binding = module_view_find_imported_name(context.state.facts.module_view, name.text)
+	imported_binding = module_view_find_imported_name(context.state.facts.module_view, name)
 
-	if local_or_current.is_none():
-		for symbol in env_symbols_named(context.state.env, name.text):
+	if own_module_value.is_none():
+		for symbol in env_outermost_scope_symbols_named(context.state.env, name):
 			match symbol.kind:
 				FuncSymbolKind(func_symbol):
 					if func_symbol.origin == BuiltinFunc:
@@ -7520,68 +7560,103 @@ private pure func lookup_bare_value(
 							builtin_fallback = Some(symbol)
 					else:
 						if symbol_is_lexical_or_current_module(context, symbol):
-							local_or_current = Some(symbol)
+							own_module_value = Some(symbol)
 							break
 						else if (
 							visible_fallback.is_none()
-							and symbol_visible_as_bare(context, name.text, symbol)
+							and symbol_visible_as_bare(context, name, symbol)
 						):
 							visible_fallback = Some(symbol)
 				_:
 					if symbol_is_lexical_or_current_module(context, symbol):
-						local_or_current = Some(symbol)
+						own_module_value = Some(symbol)
 						break
 					else if (
 						visible_fallback.is_none()
-						and symbol_visible_as_bare(context, name.text, symbol)
+						and symbol_visible_as_bare(context, name, symbol)
 					):
 						visible_fallback = Some(symbol)
 
 	explicit_import = match imported_binding:
 		Some(binding):
-			symbol_from_imported_binding(context, name.text, binding)
+			symbol_from_imported_binding(context, name, binding)
 		None:
 			None
 
-	match local_or_current:
+	match own_module_value:
 		Some(symbol):
-			Some(BareEnvSymbol(symbol))
+			Some(OwnModuleValue(symbol))
 		None:
-			match infer_session_accepted_callable(context.state, name.text):
+			match infer_session_accepted_callable(context.state, name):
 				Some(binding):
-					Some(BareAcceptedCallable(binding))
+					Some(AcceptedFunctionValue(binding))
 				None:
 					match explicit_import:
 						Some(symbol):
-							Some(BareEnvSymbol(symbol))
+							Some(SelectiveImportConstructorValue(symbol))
 						None:
-							global_fallback = infer_session_accepted_global(
-								context.state,
-								name.text,
-							)
-
-							match global_fallback:
+							match infer_session_accepted_global(context.state, name):
 								Some(binding):
-									Some(BareAcceptedGlobal(binding))
+									Some(AcceptedGlobalValue(binding))
 								None:
-									constructor_fallback = find_accepted_bare_constructor_symbol(
-										context,
-										name.text,
-									)
-
-									match constructor_fallback:
+									match find_accepted_bare_constructor_symbol(context, name):
 										Some(symbol):
-											Some(BareEnvSymbol(symbol))
+											Some(AcceptedConstructorValue(symbol))
 										None:
 											match visible_fallback:
 												Some(symbol):
-													Some(BareEnvSymbol(symbol))
+													match symbol.kind:
+														TypeSymbolKind(_) | RecordSymbolKind(_) | AliasSymbolKind(_) | OpaqueAliasSymbolKind(_):
+															Some(TypeNameValueLookupFallback(symbol))
+														VarSymbolKind(_) | FuncSymbolKind(_) | ConstructorSymbolKind(_):
+															Some(ImportedModuleValue(symbol))
 												None:
 													match builtin_fallback:
 														Some(symbol):
-															Some(BareEnvSymbol(symbol))
+															Some(BuiltinFunctionValue(symbol))
 														None:
 															None
+
+
+private pure func bare_value_from_module_referent(
+	referent: ModuleBareValueReferent,
+) -> BareValueLookup:
+	match referent:
+		AcceptedFunctionValue(binding):
+			BareAcceptedCallable(binding)
+		AcceptedGlobalValue(binding):
+			BareAcceptedGlobal(binding)
+		OwnModuleValue(symbol):
+			BareEnvSymbol(symbol)
+		SelectiveImportConstructorValue(symbol):
+			BareEnvSymbol(symbol)
+		AcceptedConstructorValue(symbol):
+			BareEnvSymbol(symbol)
+		ImportedModuleValue(symbol):
+			BareEnvSymbol(symbol)
+		TypeNameValueLookupFallback(symbol):
+			BareEnvSymbol(symbol)
+		BuiltinFunctionValue(symbol):
+			BareEnvSymbol(symbol)
+
+
+---
+A local binding of `name` wins; otherwise the name means what it means at module
+level.
+---
+private pure func lookup_bare_value(
+	context: InferContext,
+	name: ParsedIdentifier,
+) -> Option[BareValueLookup]:
+	match env_lookup_local(context.state.env, name.text):
+		Some(symbol):
+			Some(BareEnvSymbol(symbol))
+		None:
+			match module_bare_value_referent(context, name.text):
+				Some(referent):
+					Some(bare_value_from_module_referent(referent))
+				None:
+					None
 
 
 ---
