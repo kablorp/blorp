@@ -58,11 +58,12 @@ Hardening, alongside but not on the critical path:
 The adapter is a plain transformation from the stage's frozen tables to the
 shapes the existing typecheck reads: no parsing, no resolution, no checks of
 its own, and anything it finds missing from the tables is a gap to fix in the
-stage. It is the one module that may import both `compiler_new` and the
-existing compiler's AST types; nothing else in `compiler` may import
-`compiler_new`. Each typecheck rewrite step reads some part of the tables
-directly (definitions, then signatures and types, then bodies) and deletes the
-matching part of the adapter, until typecheck accepts `FrontendTables` as its
+stage. The adapter and `compiler/discovery_front_end.brp`, which runs the
+stage, are the two `compiler` modules permitted to import `compiler_new`
+(`temporary_cross_owner_imports` in `blorp/source_ownership.json`). Each
+typecheck rewrite step reads some part of the tables directly (definitions,
+then signatures and types, then bodies) and deletes the matching part of the
+adapter, until typecheck accepts `FrontendTables` as its
 input and the adapter is gone. Its size is the measure of how much of
 typecheck still reads the old shapes. Ids are internal identity: the adapter
 does not imitate the old front end's numbering, and if generated C differs
@@ -107,7 +108,9 @@ grammar the stage implements, including its deliberate differences (for example
 
 ## Open decision
 
-- **The other users of the old front end.** The linter and the LSP move to the
-  stage (the LSP with an in-memory provider for unsaved buffers, and off its
-  direct calls to the old discovery). Test discovery and doctest generation
-  move off the old parser too (`test/discovery.brp`, `test/doctest.brp`).
+- **The other users of the old front end.** The LSP moves to the stage with
+  an in-memory provider for unsaved buffers, off its direct calls to the old
+  discovery. Test discovery and doctest generation move off the old parser too
+  (`test/discovery.brp`, `test/doctest.brp`). `lint` already runs the stage
+  through the legacy adapter; it reads the rebuilt typechecked graph until
+  typecheck consumes the tables directly.

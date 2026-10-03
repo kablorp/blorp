@@ -84,11 +84,13 @@ The `compiler-new` gate runs the TestSuites registered in
 `blorp/test/compiler_new/compiler_new_test_ownership.json`, after checking that
 every `test_*.brp` under `blorp/test/compiler_new` is registered and that its
 tools and support modules type check. It is a default gate, part of the
-premerge gate and of the compiler CI lane. The layout check keeps that tree isolated:
-`compiler_new` sources import only `compiler_new` and `lib`, nothing else
-imports them, and its tests import only `compiler_new`, `lib`, their own tree
-and the standard library (`isolated_test_owners` in
-`blorp/source_ownership.json`).
+premerge gate and of the compiler CI lane. The layout check keeps
+`compiler_new` sources importing only `compiler_new` and `lib`. The production
+`compiler/discovery_front_end.brp` and `compiler/discovery_adapter.brp` modules
+are explicit temporary consumers (`temporary_cross_owner_imports` in
+`blorp/source_ownership.json`). The isolated test tree imports only
+`compiler_new`, `lib`, its own tree and the standard library
+(`isolated_test_owners` in that manifest).
 The `compiler-new-parity` gate (`scripts/compiler-new-parity`) holds the
 discovery stage to the existing front end across every tracked `.brp` file
 under `blorp/src`, `standard_library/src` and `blorp/test`: it compiles

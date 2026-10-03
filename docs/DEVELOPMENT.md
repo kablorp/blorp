@@ -238,9 +238,9 @@ It runs the discovery stage (`blorp/src/compiler_new/stage_01_discovery`) and
 its legacy adapter (`blorp/src/compiler/discovery_adapter.brp`, composed by
 `discovery_front_end.brp`), which rebuilds the graph the typecheck reads. Details
 and the user-visible diagnostics are in `docs/DISCOVERY_TABLES_DESIGN.md`
-("Running the stage from the CLI"). The formatter, the linter's own parse, the
-LSP, `compile --ast` and the `blorp test` discovery still use the old lexer and
-parser (`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`).
+("Running the stage from the CLI"). The formatter, the LSP, `compile --ast`
+and `blorp test` discovery still use the old lexer and parser
+(`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`).
 
 ## Test Placement
 

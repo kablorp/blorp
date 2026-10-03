@@ -95,10 +95,11 @@ compiler CI):
 - the legacy adapter (section 10), declarations and bodies, proved by a
   full-AST differential over the corpus.
 
-**Pending:**
-
-- **The switch** (roadmap items 7 and 8). Nothing in a compile reads the
-  tables yet.
+**In production:** `frontend_compilation_graph_for_root_paths` in
+`blorp/src/lib/source_graph.brp` runs this stage and passes its frozen tables
+to `legacy_frontend_graph`, which rebuilds the graph typecheck reads. Direct
+typecheck consumption of the tables remains open in
+[`DISCOVERY_ACCEPTANCE_ROADMAP.md`](DISCOVERY_ACCEPTANCE_ROADMAP.md).
 
 ## 1. Principles
 
@@ -1065,11 +1066,12 @@ payload class.
 
 ## 10. The legacy adapter
 
-The adapter is `blorp/src/compiler/discovery_adapter.brp`, the one module in
-`compiler` allowed to import `compiler_new` (named in
+The adapter is `blorp/src/compiler/discovery_adapter.brp`. Together with
+`blorp/src/compiler/discovery_front_end.brp`, which runs the stage, it is one
+of the two `compiler` modules allowed to import `compiler_new` (named in
 `temporary_cross_owner_imports` of `blorp/source_ownership.json`, which
-`scripts/check-blorp-layout` enforces). It is a plain transformation from
-`FrontendTables` to the `FrontendCompilationGraph` the existing typecheck
+`scripts/check-blorp-layout` enforces). The adapter is a plain transformation
+from `FrontendTables` to the `FrontendCompilationGraph` the existing typecheck
 reads. It belongs to neither side: the new stage never imports the old
 compiler, and typecheck keeps its current input.
 
