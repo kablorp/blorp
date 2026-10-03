@@ -1417,20 +1417,19 @@ uint32_t blorp_register_type(_Atomic uint32_t* cache, blorp_destructor_fn fn, co
 }
 
 // A plain table load, with no acquire of the entry count and no bounds check.
-// Every nonzero id in a header came from blorp_register_type (or the legacy
-// entry points below), which writes the entry before it release-stores the
-// count and then the site cache, all under the registry mutex; so the id is
-// always below the count and within BLORP_TYPE_REGISTRY_SLOTS, and entry 0
-// stays empty. The thread that stored the id into the header obtained it with
-// an acquire of the site cache (or under the mutex), so the entry write
-// happens-before that header store. The releasing thread reads destructor_id
-// with a plain load, which is only race-free if the header store
-// happens-before it (through the object's hand-off and the
-// release/acquire-fence pair on the final decrement). By transitivity the
-// entry write happens-before this load, so an acquire of the count would add
-// no ordering. Entries are written once and never change. A diagnostic runtime
-// still checks the id against the registered count so a corrupted header is
-// reported instead of calling through an arbitrary entry.
+// Every nonzero id in a header came from blorp_register_type, which writes the
+// entry before it release-stores the count and then the site cache, all under
+// the registry mutex; so the id is always below the count and within
+// BLORP_TYPE_REGISTRY_SLOTS, and entry 0 stays empty. The thread that stored
+// the id into the header obtained it with an acquire of the site cache (or
+// under the mutex), so the entry write happens-before that header store. The
+// releasing thread reads destructor_id with a plain load, which is only
+// race-free if the header store happens-before it (through the object's
+// hand-off and the release/acquire-fence pair on the final decrement). By
+// transitivity the entry write happens-before this load, so an acquire of the
+// count would add no ordering. Entries are written once and never change. A
+// diagnostic runtime still checks the id against the registered count so a
+// corrupted header is reported instead of calling through an arbitrary entry.
 static inline blorp_destructor_fn blorp_destructor_for_id(uint32_t id) {
 #if BLORP_MEMORY_DIAGNOSTICS
     uint32_t count = atomic_load_explicit(&__blorp_type_registry_count, memory_order_acquire);
@@ -1479,46 +1478,6 @@ static inline void blorp_install_type(
 } while (0)
 #define BLORP_INSTALL_TAG(ptr, tag) BLORP_INSTALL_TYPE(ptr, NULL, tag)
 #define BLORP_INSTALL_DESTRUCTOR(ptr, fn) BLORP_INSTALL_TYPE(ptr, fn, NULL)
-
-// Entry points for C emitted by the pinned bootstrap compiler, which still
-// writes `BLORP_TAG(obj, tag); ... BLORP_SET_DESTRUCTOR(obj, fn);` as two
-// steps and links against this runtime through runtime_decl.c. They fold the
-// two steps into one registry entry: the tag step records (existing fn, tag)
-// and the destructor step records (fn, existing tag). They exist only for
-// bootstrap-generated C and are removed with the legacy macros after the
-// next bootstrap rotation.
-// The legacy tag step keeps the object's current destructor and sets the tag;
-// the legacy destructor step keeps the current tag and sets the destructor.
-static uint32_t __blorp_legacy_reintern(blorp_Object* obj, blorp_destructor_fn fn, const char* tag) {
-    uint32_t id;
-    pthread_mutex_lock(&__blorp_type_registry_mutex);
-    id = __blorp_type_registry_intern_locked(fn, tag);
-    pthread_mutex_unlock(&__blorp_type_registry_mutex);
-    obj->destructor_id = id;
-    return id;
-}
-
-// Caller holds no lock; entries are immutable once published, so reading the
-// current entry only needs the count's acquire.
-static blorp_TypeRegistryEntry __blorp_legacy_current_entry(const blorp_Object* obj) {
-    uint32_t count = atomic_load_explicit(&__blorp_type_registry_count, memory_order_acquire);
-    blorp_TypeRegistryEntry none = {NULL, NULL};
-    return obj->destructor_id != 0 && obj->destructor_id < count
-        ? __blorp_type_registry[obj->destructor_id]
-        : none;
-}
-
-void blorp_legacy_tag_allocation(void* obj, const char* tag) {
-    if (!obj) return;
-    blorp_TypeRegistryEntry current = __blorp_legacy_current_entry((blorp_Object*)obj);
-    __blorp_legacy_reintern((blorp_Object*)obj, current.destructor, tag);
-}
-
-void blorp_legacy_upgrade_destructor(void* obj, blorp_destructor_fn fn) {
-    if (!obj) return;
-    blorp_TypeRegistryEntry current = __blorp_legacy_current_entry((blorp_Object*)obj);
-    __blorp_legacy_reintern((blorp_Object*)obj, fn, current.tag);
-}
 
 #ifdef BLORP_COMPILER_RUNTIME_SOURCES
 long blorp_perceus_engine_metrics_enabled_c(void);
@@ -3462,11 +3421,6 @@ static void __blorp_teardown_before_leak_report(void) {
 int blorp_memory_diagnostics_mode(void) {
     return BLORP_MEMORY_DIAGNOSTICS;
 }
-
-// The same fact as a data symbol, read by runtime_decl.c's legacy
-// BLORP_TAG / BLORP_SET_DESTRUCTOR macros (bootstrap-generated C only), so an
-// ordinary runtime skips their slow path without a function call.
-const bool blorp_runtime_memory_diagnostics = BLORP_MEMORY_DIAGNOSTICS;
 
 void* blorp_alloc(size_t size) {
 #if BLORP_MEMORY_DIAGNOSTICS
@@ -21656,20 +21610,6 @@ static inline void blorp_hash_table_place_distinct(
     table->order_index[slot] = table->order_len;
     table->order[table->order_len++] = slot;
     table->size++;
-}
-
-// First slot on `hash`'s probe path that holds no live entry. Only valid for
-// a key known to be absent: that is exactly the slot blorp_hash_table_find_slot
-// reports as the insert position (the first tombstone before the first empty
-// slot, else that empty slot). Empty (0xFF) and deleted (0x80) meta bytes
-// both have the high bit set and live h2 fingerprints never do, so one bit
-// test tells a free slot from a live one.
-static inline long blorp_hash_table_free_slot_for(const blorp_HashTable* table, unsigned long hash) {
-    long slot = (long)(hash & (unsigned long)table->mask);
-    while (!(table->meta[slot] & DICT_META_DELETED)) {
-        slot = (slot + 1) & table->mask;
-    }
-    return slot;
 }
 
 // Fill the freshly allocated (all-empty) table with the live entries of a

@@ -1048,59 +1048,6 @@ extern _Thread_local long __blorp_cooperative_checkpoint_budget;
 // ARC / Memory Management
 void* blorp_alloc(size_t size);
 void blorp_move_ref(void* obj);
-// Whether the linked runtime object records allocation metadata. It is a
-// runtime symbol, not a macro, because one generated body object is linked
-// against both runtime modes (benchmarks/build_stage2_compiler
-// --diagnostic-output), so the body cannot know the mode when it is compiled.
-// Only the legacy macros below read it.
-extern const bool blorp_runtime_memory_diagnostics;
-
-// ---------------------------------------------------------------------------
-// Legacy allocation-site macros. C emitted by the pinned bootstrap compiler
-// still writes `BLORP_TAG(obj, tag)` and then `BLORP_SET_DESTRUCTOR(obj, fn)`
-// as two steps, and is linked against this header and runtime. They exist only
-// for that bootstrap-generated C and are removed after the next bootstrap
-// rotation; the emitter now writes BLORP_INSTALL_TYPE / BLORP_INSTALL_TAG /
-// BLORP_INSTALL_DESTRUCTOR. Behavior is preserved: destructors always run, and
-// on a diagnostic runtime the tag survives into the leak report because each
-// step folds into the object's registry entry (see runtime.c).
-// Cost: on a diagnostic runtime each legacy tag or destructor-upgrade step takes
-// the registry mutex and hashes the tag text (a slow path per tagged
-// allocation); an ordinary runtime pays one load and a not-taken branch. That
-// cost disappears when these macros are removed after the next pin rotation.
-// ---------------------------------------------------------------------------
-void blorp_legacy_tag_allocation(void* obj, const char* tag);
-void blorp_legacy_upgrade_destructor(void* obj, blorp_destructor_fn fn);
-
-static inline void blorp_tag_allocation(void* obj, const char* tag) {
-    if (__builtin_expect(blorp_runtime_memory_diagnostics, 0))
-        blorp_legacy_tag_allocation(obj, tag);
-}
-
-#define BLORP_TAG(ptr, tag) blorp_tag_allocation((void*)(ptr), (tag))
-
-// The first allocation of a site registers its destructor with no tag. On a
-// diagnostic runtime an object that already carries a tag id (from BLORP_TAG,
-// which the bootstrap emitter writes first) takes the slow path so the tag is
-// kept.
-static inline void blorp_legacy_install_destructor(
-    void* obj,
-    _Atomic uint32_t* cache,
-    blorp_destructor_fn fn
-) {
-    if (__builtin_expect(blorp_runtime_memory_diagnostics && obj &&
-                         ((blorp_Object*)obj)->destructor_id != 0, 0)) {
-        blorp_legacy_upgrade_destructor(obj, fn);
-        return;
-    }
-    blorp_install_type(obj, cache, fn, NULL);
-}
-
-#define BLORP_SET_DESTRUCTOR(ptr, fn) do { \
-    static _Atomic uint32_t __blorp_destructor_id = 0; \
-    blorp_legacy_install_destructor((void*)(ptr), &__blorp_destructor_id, \
-        (blorp_destructor_fn)(fn)); \
-} while (0)
 
 // Release slow path (destructor + free + stats) — defined in runtime.o
 void blorp_release_slow_extern(void* obj);

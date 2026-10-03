@@ -4,10 +4,8 @@
 Every generated allocation site registers its (destructor, leak-report tag)
 pair once; the object header stores only the registry id. These tests cover
 the registry itself (deduplication, capacity, concurrent first registration)
-and, most importantly, that C emitted by the pinned bootstrap compiler, which
-still writes the two legacy macros BLORP_TAG and BLORP_SET_DESTRUCTOR, keeps
-running destructors and keeps its tags in the leak report until the next
-bootstrap rotation removes those macros.
+and that a generated body linked against either runtime mode runs destructors
+and keeps its tags in the leak report.
 
 Set BLORP_TEST_TSAN=1 to also run the registration race under
 ThreadSanitizer.
@@ -29,76 +27,6 @@ COMPILER = os.environ.get("CC", "cc")
 
 # Bodies are compiled once through runtime_decl.c with no memory-diagnostics
 # define, then linked against each runtime mode: the shape of generated code.
-LEGACY_BODY = textwrap.dedent(
-    """\
-    static int destructor_calls;
-    static void legacy_destroy(void* object) {
-        (void)object;
-        destructor_calls++;
-    }
-
-    // What the bootstrap emitter writes for a record with a destructor.
-    static void* legacy_pair(void) {
-        void* object = blorp_alloc(32);
-        BLORP_TAG(object, "LegacyPair");
-        BLORP_SET_DESTRUCTOR(object, legacy_destroy);
-        return object;
-    }
-    // A record with no destructor: the tag alone.
-    static void* legacy_tag_only(void) {
-        void* object = blorp_alloc(32);
-        BLORP_TAG(object, "LegacyTagOnly");
-        return object;
-    }
-    // A closure environment: no tag at all.
-    static void* legacy_destructor_only(void) {
-        void* object = blorp_alloc(32);
-        BLORP_SET_DESTRUCTOR(object, legacy_destroy);
-        return object;
-    }
-    // A typed closure: the runtime tags it, then the generated caller installs
-    // the environment destructor in a later statement.
-    static void* legacy_split_tag(void) {
-        void* object = blorp_alloc(32);
-        BLORP_TAG(object, "LegacySplit");
-        return object;
-    }
-
-    // Reverse order: destructor first, tag second.
-    static void* legacy_reverse_pair(void) {
-        void* object = blorp_alloc(32);
-        BLORP_SET_DESTRUCTOR(object, legacy_destroy);
-        BLORP_TAG(object, "LegacyReverse");
-        return object;
-    }
-
-    int main(void) {
-        blorp_release(legacy_pair());
-        blorp_release(legacy_pair());
-        if (destructor_calls != 2) return 2;
-        blorp_release(legacy_tag_only());
-        blorp_release(legacy_destructor_only());
-        if (destructor_calls != 3) return 3;
-        void* split = legacy_split_tag();
-        BLORP_SET_DESTRUCTOR(split, legacy_destroy);
-        blorp_release(split);
-        if (destructor_calls != 4) return 4;
-        blorp_release(legacy_reverse_pair());
-        if (destructor_calls != 5) return 5;
-
-        // Deliberately leaked so a diagnostic runtime reports the tags.
-        (void)legacy_pair();
-        (void)legacy_tag_only();
-        (void)legacy_tag_only();
-        (void)legacy_destructor_only();
-        (void)legacy_reverse_pair();
-        split = legacy_split_tag();
-        BLORP_SET_DESTRUCTOR(split, legacy_destroy);
-        return 0;
-    }
-    """
-)
-
 CURRENT_BODY = textwrap.dedent(
     """\
     static int destructor_calls;
@@ -368,12 +296,6 @@ class TypeRegistryTests(unittest.TestCase):
             self.assertIn("Leaked by type:", diagnostic.stderr)
             for tag, count in tags_and_counts.items():
                 self.assertRegex(diagnostic.stderr, rf"{tag}\s+{count}\s", diagnostic.stderr)
-
-    def test_bootstrap_legacy_macros_run_destructors_and_keep_tags(self) -> None:
-        self._check_both_modes(
-            LEGACY_BODY,
-            {"LegacyPair": 1, "LegacyTagOnly": 2, "LegacySplit": 1, "LegacyReverse": 1},
-        )
 
     def test_install_macros_run_destructors_and_report_tags_including_tag_only_sites(self) -> None:
         self._check_both_modes(
