@@ -1744,6 +1744,11 @@ match key:
     _: void
 ```
 
+A bare pattern name matching a constructor of the value's union type must be
+imported with that type or qualified with its module alias. Otherwise the
+compiler reports an error instead of treating the name as a catch-all binding.
+A name that is not a constructor of the value's type remains a variable binding.
+
 ### Exhaustiveness
 
 The compiler verifies all cases are covered for unions, booleans, and lists:

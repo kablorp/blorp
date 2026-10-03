@@ -577,7 +577,7 @@ driven by the resource type's compiler-owned cleanup metadata.
 pattern = simple_pattern { "|" simple_pattern } ;      (* or-pattern *)
 
 simple_pattern = "_"                                    (* wildcard *)
-               | IDENT                                  (* variable or constructor *)
+               | IDENT                                  (* variable or constructor of the matched type; its constructor must be imported bare *)
                | INT | BIGINT | "-" INT                 (* integer literal *)
                | FLOAT | "-" FLOAT                      (* float literal *)
                | STRING | RAW_STRING
