@@ -36,6 +36,7 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
             fixtures = {
                 "format/should_pass/formatted.brp": "func main(args: List[String]) -> Int: 0\n",
                 "format/should_fail/unformatted.brp": "func main( args:List[String] )->Int:0\n",
+                "format/expected_output/unformatted.brp": "func main(args: List[String]) -> Int: 0\n",
                 "format/should_error/broken.brp": "-- EXPECT: error: broken syntax\nfunc broken(\n",
                 "purify/should_purify/pure.brp": (
                     "-- EXPECT-PURIFY: pure_candidate\n"
@@ -130,7 +131,7 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                     str(fixture_root),
                     "--no-stdlib-case",
                     "--expected-count",
-                    str(len(fixtures)),
+                    str(len(fixtures) - 1),  # expected_output is a golden, not a fixture
                     "--gate-name",
                     "compiler_tools_test",
                 ],
@@ -256,6 +257,9 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
                 '    0\n',
                 encoding="utf-8",
             )
+            expected = fixture_root / "format/expected_output/comments.brp"
+            expected.parent.mkdir(parents=True)
+            expected.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
             compiler = root / "bin" / "blorp"
             compiler.parent.mkdir(parents=True, exist_ok=True)
             compiler.write_text(
@@ -300,8 +304,72 @@ class CompilerToolFixtureRunnerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("formatter dropped comment: -- dropped", result.stdout)
-            self.assertNotIn("-- kept", result.stdout)
-            self.assertNotIn("not -- a comment", result.stdout)
+            self.assertNotIn("formatter dropped comment: -- kept", result.stdout)
+            self.assertNotIn("formatter dropped comment: not -- a comment", result.stdout)
+
+    def test_format_fail_fixture_rejects_wrong_stable_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture_root = root / "test_compiler"
+            fixture = fixture_root / "format/should_fail/list_record_literal.brp"
+            expected = fixture_root / "format/should_pass/list_record_literal.brp"
+            fixture.parent.mkdir(parents=True)
+            expected.parent.mkdir(parents=True)
+            fixture.write_text("func main( )->Int:0\n", encoding="utf-8")
+            expected.write_text("func main() -> Int: 0\n", encoding="utf-8")
+            compiler = root / "bin" / "blorp"
+            compiler.parent.mkdir(parents=True)
+            compiler.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    from pathlib import Path
+                    import sys
+
+                    path = Path(sys.argv[-1])
+                    source = path.read_text(encoding="utf-8")
+                    if "--check" in sys.argv or "--diff" in sys.argv:
+                        raise SystemExit(1 if "func main( )->Int:0" in source else 0)
+                    path.write_text("func main()->Int:0\\n", encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            compiler.chmod(0o755)
+
+            failures = fixture_runner.run_fixture(
+                compiler,
+                fixture_runner.Fixture(fixture_runner.FixtureKind.FORMAT_FAIL, fixture),
+                30,
+            )
+
+            self.assertIn("formatted output differs from expected output", failures)
+
+    def test_format_fail_fixture_requires_sidecar_despite_same_named_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            format_root = Path(temp_dir) / "format"
+            fixture = format_root / "should_fail/bad_spacing.brp"
+            passing_fixture = format_root / "should_pass/bad_spacing.brp"
+            fixture.parent.mkdir(parents=True)
+            passing_fixture.parent.mkdir(parents=True)
+            fixture.write_text("func main( )->Int:0\n", encoding="utf-8")
+            passing_fixture.write_text("func main() -> Int: 0\n", encoding="utf-8")
+
+            with mock.patch.object(
+                fixture_runner,
+                "run_command",
+                return_value=process_supervisor.CommandResult(1, "needs formatting"),
+            ):
+                failures = fixture_runner.run_fixture(
+                    Path("bin/blorp"),
+                    fixture_runner.Fixture(fixture_runner.FixtureKind.FORMAT_FAIL, fixture),
+                    30,
+                )
+
+            self.assertEqual(
+                failures,
+                ["missing expected formatted output for bad_spacing.brp"],
+            )
 
     def test_rejects_empty_custom_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

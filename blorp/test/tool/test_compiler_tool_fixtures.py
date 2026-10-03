@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
+import difflib
 from enum import Enum
 import json
 from pathlib import Path
@@ -29,6 +30,21 @@ from run_blorp_check_fixtures import expectation_failures, parse_expectations
 DEFAULT_FIXTURE_ROOT = Path("blorp/test")
 DEFAULT_STDLIB_CASE = Path("standard_library/src/crypto_random.brp")
 PURIFY_EXPECTATION_PREFIX = "-- EXPECT-PURIFY: "
+FORMAT_PASS_GOLDENS = frozenset(
+    {
+        "block_header_expression_multiline.brp",
+        "collection_call_arg_indentation.brp",
+        "comment_declaration_lines.brp",
+        "control_flow_block_spacing.brp",
+        "if_condition_chain_multiline.brp",
+        "list_record_literal.brp",
+        "logical_condition_multiline.brp",
+        "logical_value_multiline.brp",
+        "nested_collection_tuple_indentation.brp",
+        "nested_inline_lambda_call_argument.brp",
+        "record_multiline_layout.brp",
+    }
+)
 PURIFY_DRY_RUN_LINE = re.compile(
     r"\[DRY-RUN\] Functions that could be purified in (.+): "
     r"([A-Za-z_][A-Za-z_0-9]*(?:, [A-Za-z_][A-Za-z_0-9]*)*)"
@@ -192,13 +208,25 @@ def comment_preservation_failures(original: str, formatted: str) -> list[str]:
     return failures
 
 
+def expected_formatted_path(fixture: Path) -> Path | None:
+    """Find the exact golden for a formatter should_fail fixture."""
+    format_root = fixture.parent.parent
+    if fixture.name in FORMAT_PASS_GOLDENS:
+        expected = format_root / "should_pass" / fixture.name
+    else:
+        expected = format_root / "expected_output" / fixture.name
+    return expected if expected.is_file() else None
+
+
 def formatted_fixpoint_failures(compiler: Path, fixture: Path, timeout: int) -> list[str]:
-    """Format a copy of a should_fail fixture and require the result to be a fixpoint.
+    """Require exact canonical output, a fixpoint, and preserved comments.
 
     The formatter must accept its own output unchanged; otherwise `format --check`
-    cannot serve as a gate over freshly formatted trees. It must also keep every
-    comment: a layout change that silently deletes a comment is a failure.
+    cannot serve as a gate over freshly formatted trees.
     """
+    expected_path = expected_formatted_path(fixture)
+    if expected_path is None:
+        return [f"missing expected formatted output for {fixture.name}"]
     with tempfile.TemporaryDirectory(prefix="blorp-format-fixpoint-") as temp_dir:
         formatted_path = Path(temp_dir) / fixture.name
         shutil.copyfile(fixture, formatted_path)
@@ -207,10 +235,22 @@ def formatted_fixpoint_failures(compiler: Path, fixture: Path, timeout: int) -> 
             return ["formatter failed to rewrite the source"] + output_details(
                 write, "formatter"
             )
+        formatted_bytes = formatted_path.read_bytes()
+        expected_bytes = expected_path.read_bytes()
         failures = comment_preservation_failures(
-            fixture.read_text(encoding="utf-8"),
-            formatted_path.read_text(encoding="utf-8"),
+            fixture.read_text(encoding="utf-8"), formatted_bytes.decode("utf-8")
         )
+        if formatted_bytes != expected_bytes:
+            failures.append("formatted output differs from expected output")
+            failures.extend(
+                difflib.unified_diff(
+                    expected_bytes.decode("utf-8").splitlines(),
+                    formatted_bytes.decode("utf-8").splitlines(),
+                    fromfile=str(expected_path),
+                    tofile="actual formatted output",
+                    lineterm="",
+                )
+            )
         recheck = run_command(
             [str(compiler), "format", "--diff", str(formatted_path)], timeout
         )
