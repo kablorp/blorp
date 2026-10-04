@@ -99,7 +99,8 @@ same commit unless a vertical slice needs both to compile.
 At the committed one-type pilot there were 151 production `struct` declarations
 across `blorp/src/`, `standard_library/src/`, and `pkg/`, and no production
 `fixed record` declarations (tests do contain fixed records). The two-metric
-and embedded-header-count cuts bring this count to 148 on this branch.
+and embedded-header-count cuts brought this count to 148; eliminating the
+one-field union locator brings it to 147 on this branch.
 Re-run the
 census on the integration base. Classify each declaration by use: internal
 typed value, nested field, `Option`/union/tuple/collection, closure, generic
@@ -118,9 +119,9 @@ scripts/compiler-build-status
 a matched same-cwd stage-2 baseline. If the ABI census is incomplete, keep
 working on safe internal types; do not switch all source forms globally.
 
-The 2026-10-03 source census is preliminary, not this exit gate: 148
-declarations remain (128 under `blorp/src/`, 20 under
-`standard_library/src/`, none under `pkg/`). Of the 128, 52 belong to the
+The 2026-10-03 source census is preliminary, not this exit gate: 147
+declarations remain (127 under `blorp/src/`, 20 under
+`standard_library/src/`, none under `pkg/`). Of the 127, 52 belong to the
 new discovery tables; 42 are row shapes in
 `compiler_new/stage_01_discovery/tables/rows.brp`. Most are held in inline
 `List` tables; allocation budgets protect representative discovery paths
@@ -136,16 +137,21 @@ In the standard library, `MemStats` and `SchedulerStats` mirror native C
 return-by-value structs; `Range` has a dedicated Core/backend ABI path.
 These three are held for S3/S4. The other 17 include hot geometry/DSP
 values and JSON/parser state, so a source-only safety check is insufficient.
-The narrowest next internal pilot appears to be `AcceptedUnionLocator`
-(`stage_06_typecheck/type_system/accepted_union_authority.brp`), followed
-by `GlobalHeaderCompletionMetrics` (`stage_06_typecheck/decl.brp`); neither
-has a proven allocation cost yet. This census does not establish that
+The [union-index cut](../benchmarks/results/record_unification_union_index_2026-10-03.md)
+deleted `AcceptedUnionLocator` entirely: it only wrapped one `Int`, and
+direct index storage showed 98,712 fewer typed-frontend allocations on the frozen
+self-compile without changing emitted C. `GlobalHeaderCompletionMetrics`
+(`stage_06_typecheck/decl.brp`) remains a bounded candidate, but its cost
+is unmeasured. This census does not establish that
 downstream foreign declarations cannot use other value records by value.
 
 ### S2. Migrate internal declarations in small families
 
-Convert only types with no external C layout obligation or value-only
-consumer. The embedded header-count cut is complete; keep hot
+First delete a transparent wrapper when its meaning is already carried by
+an existing id or index; do not allocate a record solely to preserve an
+unnecessary shell. Convert remaining types only when they have no external
+C layout obligation or value-only consumer. The embedded header-count cut
+is complete; keep hot
 per-expression/offset structs and Core work-profile types for separate cuts.
 A source migration uses
 ordinary `record` now; it does **not** change the language-wide meaning of

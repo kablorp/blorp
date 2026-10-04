@@ -79,11 +79,6 @@ struct AcceptedUnionConstructorLocator {
 }
 
 
-struct AcceptedUnionLocator {
-	union_index: Int
-}
-
-
 private record AcceptedUnionTableRep {
 	definition_table: DefinitionTable,
 	unions: List[AcceptedUnionEntry],
@@ -120,7 +115,7 @@ record AcceptedVisibleConstructorBinding {
 
 private record AcceptedUnionModuleViewRep {
 	owner_module_path: Option[String],
-	visible_unions_by_source_name: Dict[String, AcceptedUnionLocator],
+	visible_union_indices_by_source_name: Dict[String, Int],
 	visible_constructors_by_source_name: Dict[String, List[AcceptedUnionConstructorLocator]],
 	constructor_parent_aliases: Dict[String, String],
 	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]]
@@ -133,7 +128,7 @@ opaque type AcceptedUnionModuleView = AcceptedUnionModuleViewRep
 private record AcceptedUnionAuthorityRep {
 	table: AcceptedUnionTable,
 	owner_module_path: Option[String],
-	visible_unions_by_source_name: Dict[String, AcceptedUnionLocator],
+	visible_union_indices_by_source_name: Dict[String, Int],
 	visible_constructors_by_source_name: Dict[String, List[AcceptedUnionConstructorLocator]],
 	constructor_parent_aliases: Dict[String, String],
 	local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]]
@@ -638,7 +633,7 @@ pure func accepted_union_module_view(
 	constructor_bindings: List[AcceptedVisibleConstructorBinding],
 ) -> Option[AcceptedUnionModuleView]:
 	representation = table_rep(table)
-	var visible_unions: Dict[String, AcceptedUnionLocator] = {}
+	var visible_union_indices: Dict[String, Int] = {}
 	var visible_constructors: Dict[String, List[AcceptedUnionConstructorLocator]] = {}
 	var parent_aliases: Dict[String, String] = {}
 	var local_constructor_symbols_by_union_index: Dict[Int, List[Symbol]] = {}
@@ -663,13 +658,13 @@ pure func accepted_union_module_view(
 				if (
 					not owner_matches
 					or not visible
-					or visible_unions.contains(binding.source_name)
+					or visible_union_indices.contains(binding.source_name)
 				):
 					valid = False
 				else:
-					visible_unions = visible_unions.set(
+					visible_union_indices = visible_union_indices.set(
 						binding.source_name,
-						{union_index = found_index},
+						found_index,
 					)
 			None:
 				valid = False
@@ -679,12 +674,12 @@ pure func accepted_union_module_view(
 	-- also makes the authority deterministic for synthetic test views.
 	for binding in union_bindings:
 		if binding.owner_local:
-			match visible_unions.get(binding.source_name):
-				Some(locator):
+			match visible_union_indices.get(binding.source_name):
+				Some(union_index):
 					visible_constructors = prepend_visible_union_constructors(
 						representation,
 						visible_constructors,
-						locator.union_index,
+						union_index,
 					)
 				None:
 					valid = False
@@ -735,17 +730,17 @@ pure func accepted_union_module_view(
 	-- constructors so the established explicit-import precedence is retained.
 	for binding in union_bindings:
 		if not binding.owner_local:
-			match visible_unions.get(binding.source_name):
-				Some(locator):
+			match visible_union_indices.get(binding.source_name):
+				Some(union_index):
 					visible_constructors = append_visible_union_constructors(
 						representation,
 						visible_constructors,
-						locator.union_index,
+						union_index,
 						False,
 					)
 
 					if not parent_aliases.contains(binding.source_name):
-						match representation.canonical_names.get(locator.union_index):
+						match representation.canonical_names.get(union_index):
 							Some(canonical_name):
 								parent_aliases = parent_aliases.set(
 									binding.source_name,
@@ -791,7 +786,7 @@ pure func accepted_union_module_view(
 
 		Some(into_opaque AcceptedUnionModuleView({
 					owner_module_path = owner_module_path,
-					visible_unions_by_source_name = visible_unions,
+					visible_union_indices_by_source_name = visible_union_indices,
 					visible_constructors_by_source_name = visible_constructors,
 					constructor_parent_aliases = parent_aliases,
 					local_constructor_symbols_by_union_index = local_constructor_symbols_by_union_index
@@ -803,7 +798,7 @@ pure func accepted_union_module_view(
 pure func accepted_union_empty_module_view() -> AcceptedUnionModuleView:
 	into_opaque AcceptedUnionModuleView({
 			owner_module_path = None,
-			visible_unions_by_source_name = {},
+			visible_union_indices_by_source_name = {},
 			visible_constructors_by_source_name = {},
 			constructor_parent_aliases = {},
 			local_constructor_symbols_by_union_index = {}
@@ -818,7 +813,7 @@ pure func accepted_union_authority(
 	into_opaque AcceptedUnionAuthority({
 			table = table,
 			owner_module_path = representation.owner_module_path,
-			visible_unions_by_source_name = representation.visible_unions_by_source_name,
+			visible_union_indices_by_source_name = representation.visible_union_indices_by_source_name,
 			visible_constructors_by_source_name = representation.visible_constructors_by_source_name,
 			constructor_parent_aliases = representation.constructor_parent_aliases,
 			local_constructor_symbols_by_union_index = representation.local_constructor_symbols_by_union_index
@@ -830,28 +825,26 @@ pure func accepted_union_authority_without_visible_names(
 ) -> AcceptedUnionAuthority:
 	representation = authority_rep(authority)
 	into_opaque AcceptedUnionAuthority({ representation |
-			visible_unions_by_source_name = {},
+			visible_union_indices_by_source_name = {},
 			visible_constructors_by_source_name = {},
 			constructor_parent_aliases = {}
 		})
 
 
-private pure func union_locator_for_name(
+private pure func union_index_for_name(
 	representation: AcceptedUnionAuthorityRep,
 	table: AcceptedUnionTableRep,
 	name: String,
-) -> Option[AcceptedUnionLocator]:
-	match representation.visible_unions_by_source_name.get(name):
-		Some(locator):
-			Some(locator)
+) -> Option[Int]:
+	match representation.visible_union_indices_by_source_name.get(name):
+		Some(union_index):
+			Some(union_index)
 		None:
-			index = match table.canonical_graph_union_indices_by_name.get(name):
+			match table.canonical_graph_union_indices_by_name.get(name):
 				Some(found):
 					Some(found)
 				None:
 					table.builtin_union_indices_by_name.get(name)
-
-			index.map(func(index): {union_index = index})
 
 
 ---
@@ -922,8 +915,8 @@ private pure func accepted_union_entry_raw(
 ) -> Option[AcceptedUnionEntry]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	locator ?= union_locator_for_name(representation, table, name)
-	table.unions.get(locator.union_index)
+	union_index ?= union_index_for_name(representation, table, name)
+	table.unions.get(union_index)
 
 
 pure func accepted_union_find(
@@ -932,14 +925,14 @@ pure func accepted_union_find(
 ) -> Option[AcceptedUnionEntry]:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	locator ?= union_locator_for_name(representation, table, name)
+	union_index ?= union_index_for_name(representation, table, name)
 
-	localized_entry(table, locator.union_index, representation.owner_module_path)
+	localized_entry(table, union_index, representation.owner_module_path)
 
 
 pure func accepted_union_contains(authority: AcceptedUnionAuthority, name: String) -> Bool:
 	representation = authority_rep(authority)
-	union_locator_for_name(representation, table_rep(representation.table), name).is_some()
+	union_index_for_name(representation, table_rep(representation.table), name).is_some()
 
 
 private pure func constructor_symbol_from_locator(
