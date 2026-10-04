@@ -2,7 +2,7 @@
 
 Status: open.
 
-These 190 should_fail fixtures are still rejected, but the current diagnostic
+These 168 should_fail fixtures are still rejected, but the current diagnostic
 is less helpful than the one the fixture pins: a help line, suggestion or name
 was lost, or the wording is misleading. AGENTS.md rules 6 and 7 ask every
 compile error to teach the fix, so the fixtures stay unmarked (not run by
@@ -15,6 +15,9 @@ Fixtures live under
 ("typecheck") and
 `blorp/test/compiler/stage_06_typecheck/infer_fixtures/infer/should_fail/`
 ("infer"). Each class gives one pinned/current pair.
+
+The 13 missing-module and nine empty-list inference fixtures were restored and
+marked for `RUN-BLORP-CHECK`; they are no longer in this inventory.
 
 ## Classes
 
@@ -33,17 +36,6 @@ typecheck: `flattened_row_major_index_off_by_one`, `mutable_var_narrowing_unsoun
 `dim_branch_bound_offset_subscript`, `int_as_range_type`,
 `range_conditional_incomplete`, `subscript_assign_unproven`,
 `subscript_runtime_index`.
-
-### Missing module reported with internal wording (13)
-
-Pinned: `Could not find module 'crypto'`. Current: `module 'crypto' is not
-loaded for import registration`.
-
-typecheck: `module_nonexistent`, `pkg_audio_neural_amp_removed`,
-`pkg_bare_import_not_package`, `pkg_tui_removed`, `std_audio_neural_amp_removed`,
-`std_benchmark_removed`, `std_compress_removed`, `std_crypto_removed`,
-`std_net_http_client_removed`, `std_net_smtp_removed`, `std_sqlite_removed`,
-`std_tui_removed`; infer: `import_nonexistent_module`.
 
 ### Method call with no matching function reported as a field access (11)
 
@@ -82,22 +74,6 @@ typecheck: `purity_eta_expansion_bypass`, `purity_hof_exemption_bypass`,
 `purity_impure_callback_param`, `purity_impure_callback_to_pure_func`,
 `purity_impure_lambda_to_pure_func`, `purity_builtin_reason`,
 `structured_purity_note`.
-
-### Empty list inference lost the annotation hint (9)
-
-Pinned: `Cannot infer type of empty list. Add an explicit type annotation, e.g.
-xs: List[Int] = []`. Current: `Cannot infer element type for empty list
-literal`.
-
-typecheck: `block_nonfinal_empty_list_no_return_context`,
-`statement_context_debug_no_return_context`,
-`statement_context_detach_no_return_context`,
-`statement_context_for_iter_no_return_context`,
-`statement_context_for_tuple_iter_no_return_context`,
-`statement_context_if_without_else_no_return_context`,
-`statement_context_tuple_destruct_no_return_context`,
-`statement_context_while_body_no_return_context`; infer:
-`empty_list_needs_annotation`.
 
 ### Import suggestions lost (7)
 

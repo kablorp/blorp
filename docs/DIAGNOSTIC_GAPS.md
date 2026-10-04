@@ -61,7 +61,7 @@ One line per entry. Fault entries (CF) first, then diagnostic entries (DG) by ti
 | DG-008 | Parser reports a cascade of follow-on errors after the first | High | M |
 | DG-009 | Lambda habits give `expected expression` and no teaching | High | S |
 | DG-010 | f-strings and template strings | High | S |
-| DG-011 | Import errors are internal jargon with no suggestion | High | M |
+| DG-011 | Import errors lack suggestions and attempted paths | High | M |
 | DG-012 | A typo'd constructor in a pattern is a silent catch-all | moved to CF-004 | - |
 | DG-013 | Assigning to an immutable binding gives no way forward | High | S |
 | DG-014 | Python tuple loops: `for i, x in ...` | High | S |
@@ -464,22 +464,23 @@ rewrite replaces, so prefer a fix that the replacement can carry over.
 - Cost: S
 - ROI: High. Every Python port uses f-strings.
 
-### DG-011 Import errors are internal jargon with no suggestion
+### DG-011 Import errors lack suggestions and attempted paths
 - Input: `lst: map`, `no_such_module: foo`, `./nothere: foo`, `list: mapp`,
   `option: Option(Some, Nope)`
 - Current output:
   ```
-  error: module 'lst' is not loaded for import registration
+  error: Could not find module 'lst'
   error: 'mapp' is not exported by module 'list'
   error: constructor 'Nope' is not exported by type 'Option' from module 'option'
   ```
-  An unknown module in a relative or aliased import prints the same
-  "import registration" wording. No location, no near match.
-- Should say: "cannot find module `lst`; did you mean `list`?" with the import
-  line's position; for a missing symbol, list close names from the module
+  Unknown modules now name the missing path at the import location, but do not
+  suggest a near match. A missing relative file does not show the path tried.
+  Missing symbols also have no near-match suggestion.
+- Should say: "cannot find module `lst`; did you mean `list`?" while retaining
+  the import line's position; for a missing symbol, list close names from the module
   (`mapp` -> `map`); for a missing relative file, the path that was tried.
-- Owner: `blorp/src/compiler/stage_06_typecheck/modules/module_binding.brp:1152`
-  and `:1211`.
+- Owner: `blorp/src/compiler/stage_06_typecheck/modules/module_binding.brp`
+  (missing modules and imported symbols).
 - Cost: M (edit distance over a module's exports)
 - ROI: High. Agents hallucinate standard-library names constantly and the error
   tells them nothing about what exists.

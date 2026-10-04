@@ -638,6 +638,10 @@ elem: Option[Int] = numbers.get(0)
 len: Int = numbers.length()
 ```
 
+An empty list has no element to infer its type from. Give it a type annotation,
+as in `empty: List[String] = []`, unless its surrounding expression supplies
+an expected `List` type.
+
 ### Fixed-Size Arrays
 
 Compile-time sized numeric arrays use postfix dimensions on the element type. `Float[#4]` is a 1D vector, `Float[#2, #3]` is a 2D matrix, and `Float[#2, #3, #4]` is a higher-rank array. Plain `Float` is the scalar form.

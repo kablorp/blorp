@@ -750,7 +750,7 @@ class NativeLspBaselineTests(unittest.TestCase):
                 "VALUE: Int = value\n"
             )
             expected_message = (
-                "module 'missing/module' is not loaded for import registration"
+                "Could not find module 'missing/module'"
             )
 
             client = RUNNER.LspClient(str(BLORP), ROOT)

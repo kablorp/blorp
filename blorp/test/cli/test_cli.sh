@@ -1559,7 +1559,7 @@ expect_output_contains "run rejects a field given twice in a record literal" 1 \
     "duplicate field \`x\`" \
     "$BLORP_BIN" run --no-format "$duplicate_literal_field_prog"
 expect_output_contains "compiler runtime is not importable from std" 1 \
-	"module 'compiler_runtime' is not loaded for import registration" \
+	"Could not find module 'compiler_runtime'" \
 	"$BLORP_BIN" check --no-format "$compiler_runtime_import"
 expect_exit "check missing file arg" 1 "$BLORP_BIN" check
 
@@ -1578,7 +1578,7 @@ printf 'VALUE: Int = 1\n' > "$front_end_dir/helper.brp"
 expect_output_contains "front end: check success" 0 "Type checking succeeded." \
     "$BLORP_BIN" check --no-format "$front_end_dir/ok.brp"
 expect_output_contains "front end: check unresolved import" 1 \
-    "module 'no_such_module' is not loaded for import registration" \
+    "Could not find module 'no_such_module'" \
     "$BLORP_BIN" check --no-format "$front_end_dir/unresolved_import.brp"
 expect_output_contains "front end: check case-mismatched import" 1 \
     "$front_end_dir/case_import.brp:2:5: error: import \`./Helper\` does not match the file's name \`helper.brp\`" \
