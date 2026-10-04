@@ -462,11 +462,9 @@ sanitizer gates.
 
 ## Active Boundaries
 
-The remaining architectural work is to require accepted type headers on every
-semantic test path, preserve nominal type identity through representation-
-sensitive Core, and give Perceus one exhaustive ownership-ready input. These are
-tracked in [COMPILER_PRIORITIES.md](COMPILER_PRIORITIES.md); this document should
-change only when the resulting ABI changes.
+Proposed ownership and representation changes are routed through the
+[open work index](README.md#open-issues-and-plans). This document changes only
+when the resulting ABI becomes authoritative.
 
 ## Debugging Ownership Bugs
 

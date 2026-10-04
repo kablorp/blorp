@@ -6,25 +6,17 @@ open compiler-speed work; completed cuts, their measurements and the rejected
 experiments are in `benchmarks/results/` and Git history. Per-node cost in the
 generated C is in [`PER_NODE_CODEGEN_ROADMAP.md`](PER_NODE_CODEGEN_ROADMAP.md);
 the name-to-id and table work that removes string and name work from Core is in
-[`IDENTITY_ROADMAP.md`](IDENTITY_ROADMAP.md). The standing outcomes are in
-[`COMPILER_PRIORITIES.md`](COMPILER_PRIORITIES.md).
+[`IDENTITY_ROADMAP.md`](IDENTITY_ROADMAP.md).
 
 ## How To Work An Item
 
-Setup, the fast feedback loop, the measurement protocol, the stage-2 rule and
-landing rules are in [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md); the
-profiling recipes are in
-[`DEVELOPMENT.md`](DEVELOPMENT.md#function-profiling-and-flame-graphs). This
-list adds what is specific to speed work:
-
-- Measure with `benchmarks/self_compile_measure` on both `--program self` and
-  `--program small`, with `--require-identical` unless the item says the C may
-  change. Primary metrics are retired instructions and per-phase allocations;
-  wall time is confirmation only, and never read from a run made while another
-  gate or build is active on the machine. Iterate at `-O0`; confirm at `-O2`.
-- `bin/blorp compile --dump-core-after=<stage> --dump-core-file=<path>` gives a
-  Core snapshot before and after a pass; diff two snapshots to localize a
-  semantic change. `--check-invariants` runs the full invariant set.
+Use [Worker Checklist](WORKER_CHECKLIST.md), the
+[measurement protocol](../benchmarks/README.md#self-compile-measurement-protocol)
+and [profiling guide](DEVELOPMENT.md#function-profiling-and-flame-graphs).
+Semantics-preserving source refactors require identical C on self and small
+inputs. Intentional codegen/layout changes instead require behavior gates,
+generated-C review and stage-2 measurement/fixpoint as relevant. These rules
+are specific to sizing the remaining experiments:
 - **Reading profiles.** A module-limited exact profile charges uninstrumented
   callee time to the instrumented caller's self row, so a function's share in
   such a profile is an upper bound on what removing its own work can win, and
@@ -33,8 +25,7 @@ list adds what is specific to speed work:
   whole-compiler profile before promising a number. Single-sample instruction
   readings under load vary by about half a percent; accept or reject only on
   two or three samples.
-- One change per commit, named after the cut, with a protecting test first.
-  Use grouped arm functions rather than one giant match when adding locals to
+- Use grouped arm functions rather than one giant match when adding locals to
   an 89-arm match (a larger one overflowed the default 8 MB stack at -O0).
   Delete the code a change replaces; no parallel authorities, no caches without
   a lifetime, no heuristics keyed on names.
@@ -116,8 +107,10 @@ Fieldless union variants, including `None`, are immortal static singletons.
 Every other constructor heap-allocates, including variants whose payload is a
 single scalar and Core's leaf node kinds. This is a representation decision for
 all unions; measure on Core node counts as well as tokens before proposing a
-layout. Earlier struct-payload experiments are
-[archived](STRUCT_PAYLOAD_ROADMAP.md); this item is scalar payloads. Not
+layout. Earlier struct-payload experiments failed their dynamic-cost bars
+([S2 outcome](../benchmarks/results/STRUCT_PAYLOAD_S2A_OUTCOME.md),
+[follow-up](../benchmarks/results/struct_payload_managed_union_s2b_probe_2026-09-23.md));
+shorter C alone is not a win. This item is scalar payloads. Not
 re-verified against the current backend.
 
 ### Smaller open leads

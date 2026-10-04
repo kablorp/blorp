@@ -54,6 +54,14 @@ was selected. See [R0 evidence](../benchmarks/results/fixed_layout_r0_2026-10-03
 Do not restart an inline-ownership backend project to make a source spelling
 useful before the product model is simplified.
 
+Inline construction alone does not prove a win at erased storage boundaries:
+spans boxed into union payloads previously moved costs into typechecking.
+The [managed-union pilot](../benchmarks/results/STRUCT_PAYLOAD_S2A_OUTCOME.md)
+and [accessor follow-up](../benchmarks/results/struct_payload_managed_union_s2b_probe_2026-09-23.md)
+missed their instruction admission bars; typed dictionary storage had no
+measured dynamic reach. Reopen those representation cuts only with fresh
+dynamic evidence, not a static box count or a smaller emitted-C file.
+
 ## Target model and non-goals
 
 ```blorp

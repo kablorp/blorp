@@ -188,7 +188,7 @@ state. Check `UnpackLetExpr` binder tracking, result-element update benefit,
 parity of original contracts, clone count and emitted C bytes. The two-owned
 fixture must still copy exactly one record per call. Stage-2 instructions
 and allocations for increment 3 alone may rise by no more than 0.3% (the
-Perceus cleanup floor in [`PERCEUS_CLEANUP_ISSUES.md`](PERCEUS_CLEANUP_ISSUES.md));
+[Perceus cleanup acceptance ceiling](issues/perceus-frame-stacks-duplicate-traversal-storage.md#acceptance-and-owner));
 increments 3 and 4 together must lower them. Measure, rather than assume,
 the cost of the extra clones.
 

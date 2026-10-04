@@ -16,37 +16,23 @@ the `scripts/check-magic-spellings.allowlist` and `scripts/compiler-identity-cen
 reports are the progress meters. Read [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md)
 first; its setup, measurement, foreground-gate and landing rules apply.
 
-## Where this stands
+## Current guarantees and remaining boundaries
 
-Enough has landed that these steps can assume it:
+The source owners are the authority; the census and allowlist measure migration,
+not a second semantic model.
 
-- **Names.** One compilation-wide `NameTable` interns every source name once;
-  `ParsedIdentifier` is `{ name: NameId, text: String, span }`; the closed
-  vocabulary is pinned as `NAME_ID_*` constants; the table reaches typecheck,
-  Core input and pass state, emission, the formatter and the LSP. Typecheck
-  diagnostics, lint findings, AST dumps and frontend summaries render through
-  it. Special inference and the compile-time intrinsic tables are keyed by
-  `NameId`.
-- **Traits.** `TraitId` is the identity of a trait (graph traits are their
-  `DefinitionId`, builtins a negative registry id); bounds, impls, obligations
-  and supertraits carry it, and the legacy standalone-registration path is gone.
-- **Functions.** Every `CoreFunction` carries an explicit `origin`
-  (`CoreFunctionOrigin`: declared, or synthesized with how it was declared) and
-  a `module` origin; mono instances are deduplicated by id; the declaration
-  index, the closed `CoreKnownFunction` enum and the runtime callback table
-  replace the readers that parsed mangled names, UFCS prefixes and trait-method
-  prefixes; callback carriers hold definition ids.
-- **Emission.** Callables, types, variants, record members, closures, tasks and
-  authored locals are spelled from definition and binder ids; compiler
-  temporaries carry a `CoreBinderOrigin` and are spelled once at creation. Field
-  identity is `CoreFieldRef`.
-- **Core nodes.** `CoreSourceLoc` is an opaque `Int` packing module index, start
-  offset and length (0 is synthetic); a node's own id is that handle, and passes
-  mint fresh ids for synthetic nodes under a checked uniqueness invariant.
-- **Frontend.** Discovery is a table-based stage (the default front end); module
-  lookups are by `ModuleId`; header install is a per-module builder; zonk is
-  skipped for bodies without metas; the parser, lexer and discovery
-  allocation cuts are in.
+| Landed boundary | Remaining work |
+| --- | --- |
+| Compilation `NameTable`, `ParsedIdentifier.name`, pinned vocabulary ids; diagnostic/lint/dump rendering by table | Builtin source-effect registries, formatter and remaining `.text` readers; shared table for standalone graphs |
+| `TraitId` through headers, bounds, obligations and supertraits | Exact resolved trait targets, lowering and Core trait dispatch |
+| `CoreFunction.origin`/module, id-deduplicated mono instances, known-function and runtime callback catalogs | Remove path/name dual carries, complete callback trait/type identity |
+| Callable/type/variant/member/closure/task and authored-local C projection by id; `CoreFieldRef` | Every synthetic binder gets an authoritative id; nullary references and remaining semantic consumers use it |
+| `CoreSourceLoc` opaque `Int`, packed module and line/column coordinates; negative pass-minted ids with `minted_origins`, zero synthetic | Verify uniqueness on duplication before node-keyed memoization; preserve source ownership |
+| Default discovery node/definition tables, `ModuleId` lookups, per-module header builder, no-meta zonk skip | Propagate discovery's definition authority through the legacy adapter and typed front end |
+
+These are prerequisites, not instructions to repeat completed migrations. The
+[interim states](#interim-states-on-main) name the remaining bridges and their
+removal owners.
 
 ## Principles
 
@@ -143,22 +129,19 @@ names. Each lives in a field named for what it is (`c_name`, `abi_name`, `path`)
 
 ## Rules for every change
 
-- One landing at a time through `scripts/land` from the integration checkout; at
-  most three workers, each brief citing one section below and owning the files
-  it lists. `emit.brp`, `lower.brp`, `infer.brp` and `match_projection.brp` have
-  exactly one owner at a time. Do not run compiled gates or measurements
-  concurrently (macOS `syspolicyd` stalls).
+- Follow [Worker Checklist](WORKER_CHECKLIST.md) for setup, serialized gates,
+  review and landing, and the
+  [self-compile protocol](../benchmarks/README.md#self-compile-measurement-protocol)
+  for baseline/candidate provenance. `emit.brp`, `lower.brp`, `infer.brp` and
+  `match_projection.brp` each have one owner during overlapping slices.
 - Replaced data is deleted in the same commit: a String that only carries what an
   id already carries does not survive the step that adds the id. Add the fact
   beside the name first, move readers one family at a time, delete the name last.
   Every migrated consumer reads exactly one path and never falls back from id to
   name.
-- Every change starts with a failing test and the exact census of its family, and
-  records a baseline on a frozen self-compile (and a small fixture when practical).
-  A bounded handoff names: green base, the lookup or copy or fallback removed, the
-  authority before and after, the logical schema, the files owned, the first
-  failing test, the fast loop, the acceptance and the stop conditions. If a row is
-  unknown, run a named probe and report before changing production code.
+- Start each slice with its failing identity test and exact family census.
+  Name the old/new authority, deleted lookup/copy/fallback, logical schema,
+  acceptance and stop conditions; probe an unknown representation before edits.
 - **Identity oracles.** Byte-identical generated C until output spelling changes
   (`benchmarks/self_compile_measure --stage2 --require-identical` against a parent
   frozen at the branch base, on `--program self` and `--program small`, plus the
@@ -732,7 +715,13 @@ consumer, otherwise the exact typed id key if the standard dictionary supports i
 a nested owner, domain and key index, never a flattened magic integer. Oracle:
 byte-identical C (a changed answer is retained only when a test proves the old name
 result wrong); report phase rows and string hash and equality counters, and promise
-no allocation saving from key replacement alone.
+no allocation saving from key replacement alone. For the Perceus resolved-value
+index, preserve the three collision and occurrence-count fixture families in
+`test_core_perceus.brp`: byte-identical self/small C, no increase in
+`pass_perceus_complete` or total allocations, and at most +0.3% retired
+instructions. These stricter slice gates override the general 0.5% budget.
+If counters do not show paying index work, describe the cut as semantic cleanup,
+with no speed claim.
 
 ### Delete strings from Core variables
 
@@ -753,11 +742,8 @@ variable, profile and symbol maps, display-row loss, shadowing, the complete Cor
 suite. Oracle: normalized C plus compiler, runtime, leak and sanitizer gates, exact
 diagnostic text. Acceptance: zero `String` field in Core variable identity, zero Core
 semantic name fallback, at most one display lookup per rendered item, positive
-allocation or instruction evidence or stop and investigate. Full-compile payoff
-estimate for the whole identity series, not a promise: 0.1 to 0.8% instructions for
-id-only equality and selected maps, 1 to 3% instructions and allocations for the
-fixed-layout variable with a display side table, 2 to 4% instructions with several
-percent allocation upside for consistent post-discovery id use.
+allocation or instruction evidence or stop and investigate. Remeasure the whole series cumulatively; allocation savings come from removed
+carriers/ARC paths, not merely integer equality or renamed keys.
 
 ### Typed frontend values
 
@@ -852,8 +838,9 @@ with a measurement taken before it starts; every step here is byte-identical C (
 that changed mangled names would be a different roadmap) and uses a stage-2 build for
 instruction claims. Rows to watch: `typed_frontend_complete`, `core_lowering_complete`,
 `pass_mono_complete`, `pass_trait_resolve_complete`. `test_immutable_sharing.brp` pins
-allocation ceilings on shared type fixtures and needs updating by any step here; 860
-typecheck diagnostic fixtures pin `type_to_string`; the `type_name` intrinsic makes
+allocation ceilings on shared type fixtures; preserve those ceilings unless the
+change's evidence justifies updating them. Typecheck diagnostic fixtures pin
+`type_to_string`; the `type_name` intrinsic makes
 `core_type_to_string` user-visible.
 
 **Two representations.** `SemanticType` (`type_system/semantic_type.brp`, metas as
@@ -872,8 +859,8 @@ call. There is no type scheme; generalization is by name at zonk time.
   by the callee's definition id in the lowering context, but first verify with a test
   that instantiates one generic at two types and asserts `info.resolved_call` yields
   distinct ids; if it does not, key by `(def_id, lowered argument types)` after type
-  ids exist. The report includes that test. Expected: lowering about -0.8M
-  allocations. Not re-verified since the memo was approved.
+  ids exist. The report includes that test. The old allocation estimate is a hypothesis;
+  remeasure the current lowering boundary before implementation.
 - **Interned `SemanticType`.** A `SemanticTypeTable` on the typecheck `Context`
   interning at the hot producers (`localize_module_types`, qualify, `apply_subst`,
   unify's rebuilds); metas are never interned (`types_equal` distinguishes meta
@@ -994,19 +981,14 @@ only a pass that genuinely rewrites a node allocates a new one. This is the end 
 late-Core pass fusions and "Value identity" are walking toward. It is not a rewrite of
 Core into a flat arena in one step; each step changes one representation fact, is
 measured, and is parked with its numbers if negative. The traversal already preserves
-identity (`traverse.brp` rebuilds a node only when a child changed; that one change
-bought -8.21% total allocations), but 52 files under `stage_09_core/` and `emit.brp` have
-their own `match expr:` walks. Rules that bind every step: instrumentation is
-allocation-neutral with its flag off (flag-off totals equal the parent's); dictionary
-probes do not allocate; small pooled allocations are cheap but per-call overhead is not
-(removing a child list is a win only if the replacement walk is not more calls); a
-closure-callback visitor on a per-node path cost +6% instructions, so per-node code stays
-a direct `match`; a fold instead of a list traversal was rejected (allocations -0.08%,
-instructions +0.6%). Measurement: frozen input, three samples for instructions,
-`--require-identical` unless the step says otherwise, a stage-2 compiler for any gain in
-instructions, and the owning suites (`test_core_traverse.brp`, `test_core_json.brp`, the
-pass's own), `scripts/test leak`, `scripts/test compiler-core-sanitize`,
-`make hygiene-check`.
+identity (`traverse.brp` rebuilds only when a child changed), but private per-pass
+walks remain. Instrumentation must be allocation-neutral with its flag off.
+Replacing child-list construction pays only if it avoids extra per-call overhead:
+closure-callback per-node visitors (+6% instructions) and a fold replacing a list
+walk (-0.08% allocations, +0.6% instructions) were rejected. Keep direct `match`
+on hot paths. Use the canonical frozen self/small measurement protocol and stage 2
+for instruction claims; require identical C unless a slice says otherwise, the
+owning traverse/JSON/pass suites, leak, sanitizer and hygiene gates.
 
 ### Perceus summaries by node id
 
@@ -1066,22 +1048,18 @@ and the emitted-C shape ([`PER_NODE_CODEGEN_ROADMAP.md`](PER_NODE_CODEGEN_ROADMA
 
 ## Frontend facts
 
-Goal: time-to-C weighted toward the front of the pipeline, because those phases are what an
-LSP and static analysis reuse and what every edit-compile iteration pays. One architectural
-rule, applied stage by stage: each stage publishes immutable facts as tables and indexes keyed
-by ids, built inside one function with local `var` accumulators, published once as fields of the
-record handed to the next stage, never updated again; no stage rebuilds an index an earlier
-stage publishes; no hot path keys a table by `String` when an id exists. When one lookup on a
-data source converts, convert every lookup on it in the same task, delete the old accessor and
-grep for stragglers. None of these steps changes generated C: the oracle is byte identity plus
-the pass rows, and the frontend-only loop is `--stop-after=lower --dump-core-after=lower`
-compared with `cmp` against the base build (about 5 s against 17 s for the full compile).
-Measure with `benchmarks/self_compile_measure` (frozen input, three samples, `--require-identical`
-on both programs); the primary metrics are the allocation row of the phase you changed, whole
-instructions retired and the string-lookup category from a sample (`blorp_string_eq`,
-`blorp_dict_hash_string`, `blorp_dict_copy`, `blorp_dict_get_nullable`, `memcmp`), which a
-facts change keying a hot table by id must move. Of the whole compile about 8.5% is string and
-dictionary work in total, which bounds what propagation can remove.
+Apply the [normalized-table principles](#principles) at each frontend stage:
+local uniquely owned builders publish immutable id-keyed facts once; later stages
+reuse them rather than rebuilding indexes. Convert every lookup on a migrated data
+source and delete its old accessor in the same slice.
+
+The fast loop is `--stop-after=lower --dump-core-after=lower`, compared by `cmp`
+against the frozen base. Generated C remains byte-identical. Measure the changed
+phase's allocations, whole retired instructions and the corresponding string/hash/
+copy samples (`blorp_string_eq`, `blorp_dict_hash_string`, `blorp_dict_copy`,
+`blorp_dict_get_nullable`, `memcmp`) using the canonical self/small protocol.
+A key-change claim must move its sampled lookup category; dictionary probes do not
+allocate.
 
 ### Typecheck state ownership (two gated probes)
 
@@ -1163,59 +1141,56 @@ surfaces), how it is keyed and invalidated, and how `PreparedCanonicalModuleEnvi
 cached header product without reconstructing module facts. Write it after the module-view
 publication cut above proves the final publication boundary. Cold-compile gain is 0%; the value is
 per-edit latency. Related typecheck allocation work is in
-[`TYPECHECK_OPTIMIZATION_ISSUES.md`](TYPECHECK_OPTIMIZATION_ISSUES.md).
+[`module-environment-preparation-rebuilds-state`](issues/module-environment-preparation-rebuilds-state.md).
 
 ### Body checking follow-ups
 
-Body checking is dominated by the helpers around inference (generated code 30%, reference
-counting 27%, cleanup frames 18.5%, allocation 7.5%, string and dictionary lookups 5%); dictionary
-copies and string construction are under 1% of the body loop, and per-node expression zonk reuse
-was measured negative (57k allocations for twenty identity predicates; skipping zonk for bodies
-without metas landed). Open ranked leads: resolve each identifier occurrence once by definition id
-instead of re-walking the scope chain by name (`scope_lookup` 4.4M calls, `env_lookup` 1.2M,
-`lookup_bare_value` 0.4M; the typecheck Env builder that made scope updates single-owner measured
-flat, so the next step is an allocation-site attribution, not more ownership plumbing); key the
-id-indirection chain directly (`source_name_id_table_index` 8.8M calls,
-`definition_id_runtime_value` 5.6M, `definition_table_rep_row` 2.3M; a facts change shared with
-header completion); the scope-table insert (`scope_add_symbol`, real but small) only alongside the
-first. Consume-specialization for `Dict` and `List` helpers with tail-position propagation was
-parked (instructions +2.2% net on stage 2) because retargeting fired at hot sites whose argument
-arrives borrowed and never unique at runtime; to revive, retarget only when the argument is
-provably owned by the caller and make the clone's pass-through path cost no more than the
-original.
+Resolve each occurrence once by definition id instead of repeating `scope_lookup`,
+`env_lookup` and `lookup_bare_value` by spelling (the typed-values slice above).
+Before more environment ownership plumbing, attribute its allocation sites: the
+single-owner Env builder measured flat. Separately remove repeated id indirection
+through `source_name_id_table_index`, `definition_id_runtime_value` and
+`definition_table_rep_row`, shared with header completion. Scope insertion is a
+small lead, only alongside the first.
+
+Owned-call specialization for `Dict`/`List` helpers with tail-position propagation
+was rejected at **+2.2% stage-2 instructions**: hot retargets received borrowed
+arguments that never became unique. Reopen only with proof that the caller owns the
+argument and that the clone's pass-through costs no more than the original.
+That rejection has no linked durable report; retain this stop condition until
+a new measured experiment supersedes it.
 
 ## Interim states on main
 
-Every dual carry or bridge currently on main, with the step that deletes it. A row leaves this
-table only when its deletion lands; nothing temporary becomes permanent by being forgotten.
-Rows were checked against the source when this table was last cut; a row whose named symbol
-no longer exists should be deleted rather than re-verified.
+This index routes live bridges to their detailed removal tasks above; it does not
+repeat their designs. Named symbols were checked in the current checkout. Delete
+a row only after its bridge is removed; verify behavior before treating a renamed
+symbol as completed work.
 
-| Interim state | Deleted by |
+| Interim state | Removal task |
 | --- | --- |
-| `CoreFunction.name` still produced beside `CoreFunction.origin`; readers still parse it in places; `origin_name_agreement.brp` invariant reads the mangled markers (`BLORP_ORIGIN_CONTRACT`); the `__ufcs_<module>__<name>` callee spelling is still produced (no reader decodes it) | "Function names and module origins": delete the producers |
-| `CoreFunction.source_module` path String beside `CoreFunction.module`, and `ModuleOrigin` beside the `ModuleId` in `SourceModule` (passes hold no module table in places); `CoreKnownFunction` recognises by `(module path String, member NameId)` | "Module origin as an id only" |
-| `typed_name_identity.brp` census (`BLORP_NAME_IDENTITY`) counts `.text` and id mismatches; `--dump-core` JSON carries both name Strings and ids | "Identifier text becomes the id" |
-| Non-first finalized root: a finalized root's identifiers index the table it was finalized against, so discovery adopts that table only while it is the first file discovered (`DiscoveryNames` is `SeededTableOnly`); a later finalized root is finalized again from its own source against the accumulator (one extra parse, about 1.9% of instructions on an eight-file batch); the generated test-harness root added after discovery (`frontend_compilation_graph_with_generated_root`) still keeps own-table ids. Sound fix: thread one name table through the parse of every root and adopt the final table for all finalized roots (tables only append, so each root's ids index a prefix) | "Identifier text becomes the id" (standalone-graph precondition); likely moot once the old front end is removed ([`DISCOVERY_ACCEPTANCE_ROADMAP.md`](DISCOVERY_ACCEPTANCE_ROADMAP.md)), not re-checked |
-| `name_spelling_of_text(table, text)` bridge for Core and LSP names held as Strings; six temporary cross-owner import permissions for `stage_02_lex/name_table.brp` (format, lsp, test x2, format/command, lint/command) | Core names: "Identifier text becomes the id"; the permissions: move `name_table.brp` to `blorp/src/lib` |
-| Standalone graphs (`graph_source_name_table_for_programs`) give identifiers ids from private per-program tables; rendering there is `.text`-only (`SpellingsFromIdentifierText`) | before "Identifier text becomes the id" |
-| `.text` lookups in type header resolution kept beside `identifier.name`; 13 `.text` copies in `stage_07_ctfe/ir.brp` and 2 in `typed_ast_json.brp` | "Diagnostics, dumps and the formatter through the name table" |
-| `ResolvedCallInfo.callee_name` / `.source_name` Strings beside `source_name_id` (also `CtfeIrDirectCall.source_name`, `AcceptedCallableBinding.source_name`, `TraitMethodCallee.source_name` and `.method_name`); CTFE-materialized calls have `source_name_id = None` because CTFE value payloads hold Strings; `builtin_is_registered(name)` recognizes special-inference names by `synthesized_name_id(name)` because cancellation classification holds a Core `BuiltinCall` String | "Builtin and intrinsic vocabularies by id" (effect table source half, then `core_builtin_name`), then the String deletion step |
-| `infer_source_name_id` recovers the id of an `import ... as` alias's original name and of an `AcceptedCallableBinding`'s defining spelling with a lookup in the synthesized table (`ImportedNameBinding.original_name` is a String; the accepted graph's source name table is not guaranteed to be the seeded compilation table, so a slot's id cannot be compared with the pinned keys); `ctfe_imported_intrinsic` selects its table by comparing the std module path String against `STD_*_MODULE_PATH` | both bindings carrying ids from the compilation table once standalone graphs share the discovery table; module ids for the table choice |
-| `TraitDef.name` display spelling beside `TraitDef.trait_id`; spelling-only trait entry points keep a name index; `env_get_trait_by_id` is a linear scan; `typecheck_find_trait(state, EXIT_STATUS_TRAIT_NAME)`; `find_prelude_trait_decl` derives the prelude-traits module from path and name | "Trait identity through typecheck and Core" |
-| `CoreImplMethodRole` and the pinned `NAME_ID_*` callback constants stand in for the trait identity of Stringable, Hashable and Equatable; `ImplMethod(trait NameId, method NameId)` lacks impl and trait ids and a type key; `CoreRuntimeCallbackTable` is keyed by the rendered `core_trait_impl_type_key` String; origin payloads holding a `CoreType` go stale when flatten renames types | "Trait identity" (Core by id); type ids |
-| `dce.brp` keeps `function_ids_by_name`; `resolve.brp` keeps `foreign_functions`, `builtin_functions` and `user_call_by_name` keyed by flat name | "Every call site reaches `resolve` with its callee's definition id" |
-| The synthesis passes, `resolve` and `std_inline` key on a member's spelling String (`synthesis_member`, `core_source_function_member_spelling`, via `CoreDeclarationIndex.names`): the body tables, the runtime builtin registry and resolve's module-scoped tables are String vocabularies; `work_profile.brp` builds its declaration index from `EMPTY_NAME_TABLE` (a benchmark harness) | builtin vocabularies by id; module-scoped resolve tables keyed by id in "Identifier text becomes the id" |
-| `core_empty_declaration_index` and `core_synth_context_empty` are functions, not constants, because the C emitter rejects a global initializer that reads a global of another module ("unsupported global initializer for `<name>`") | an emitter change that accepts cross-module globals in initializers |
-| `CoreMonoInstanceIndex` buckets instances by a structural hash in a `Dict[Int, ...]` instead of keying a `Dict` by `CoreMonoInstanceKey`, because a `Dict` with custom `Hashable` keys bound to variables missed equal keys; that bug is fixed (1e0a4ae4c, 2b9a595b7) | key the `Dict` by `CoreMonoInstanceKey` and drop the bucket layer |
-| `c_local_name` escape branches and `c_binder_name`'s id-0 branch, reached by the small-pass binders below; a Perceus or derived temporary's `CoreVar.name` IS its C spelling, built once at creation, and the identity contract recomputes it from `(id, origin)`; `__perceus_shadow_<name>_<id>_<branch>_<binding>` names a freshened shadowing match binding (a uniqueness key only; the binding keeps its id and origin) | "Synthetic binders" and "Binders" (once the small passes mint ids and Perceus matches bound variables by id) |
-| Small-pass binders still id 0 (list under "Emission by id"); span-derived positive binder ids for authored binders | "Synthetic binders"; "Parser-minted versus inference-minted binder ids" |
-| `FieldExpr` / `CoreRecordFieldValue` / record-field decls / `CowFieldTakeRetainPolicy` still carry the field name String beside the ref (read only by the ABI branch and diagnostics) | "Identifier text becomes the id" |
-| A nullary constructor's `VarExpr` name rewritten to its projected symbol in `backend_projection.brp` and matched by that spelling or the source name in `closure.brp` and `perceus/env.brp`; `operation_metadata.brp` finds a runtime union's declared variant by case name | "Variant constructor references by id alone" |
-| `c_naming.brp` imports `ir.brp` for `CoreBinderOrigin` (the codegen audit adds `-I blorp/src/compiler/stage_04_modules`) | spelling functions stop reading `CoreVar`, or `c_naming` splits from the origin type |
-| One sigil read left in `type_parameter_name_kind` (`List[String]` type parameters) | "Dimension sigil" |
-| `direct_constructor_payload` recognises a discarded payload by the name `_` on a `NamePattern` (`match_lowering.brp`) | "Synthetic binders" |
-| The authored and `?=`/`with` binder ids derive from the construct's span start (`core_binder_id`, `core_question_bind_var`; offsets must stay below 2^31) | "Authored locals" or the parser-minted alternative |
+| `CoreFunction.name` beside `origin`; `origin_name_agreement.brp` and UFCS spelling producers | [Function origins](#function-names-and-module-origins): delete producers |
+| Function/global `source_module`, `SourceModule(ModuleId, ModuleOrigin)`; path-based known functions | Module origin as id only |
+| `typed_name_identity.brp`, dual name/id Core JSON | [Identifier text](#identifier-text-becomes-the-id) |
+| `DiscoveryNames.SeededTableOnly` adopts only the first finalized root's table; generated root keeps own-table ids | Share one append-only table across root parses; standalone precondition below, coordinate old-front-end removal |
+| `name_spelling_of_text` Core/LSP bridge; cross-owner name-table imports | Identifier text; move shared name-table owner to `blorp/src/lib` |
+| `graph_source_name_table_for_programs`, `SpellingsFromIdentifierText` standalone rendering | Share discovery's compilation table before identifier text removal |
+| Type-header, CTFE and typed-AST JSON `.text` readers | [Display/formatter boundary](#diagnostics-dumps-and-the-formatter-through-the-name-table) |
+| `ResolvedCallInfo`, `CtfeIrDirectCall`, `AcceptedCallableBinding`, `TraitMethodCallee` spelling fields; CTFE `source_name_id = None`; `builtin_is_registered` synthesized-name lookup | [Builtin vocabularies](#builtin-and-intrinsic-vocabularies-by-id), then string deletion |
+| `infer_source_name_id` reconstructs imported original/accepted names; `ctfe_imported_intrinsic` selects by module path | Shared compilation name ids on bindings; module ids for intrinsic table selection |
+| `TraitDef.name` beside `trait_id`; by-name accessors, linear `env_get_trait_by_id`, entrypoint/prelude path checks | [Trait identity](#trait-identity-through-typecheck-and-core) |
+| `CoreImplMethodRole`, callback name constants, incomplete `ImplMethod` origin; String-keyed `CoreRuntimeCallbackTable`; type-carrying origins | Core trait/type ids with callback identity invariants |
+| DCE `function_ids_by_name`; resolve `foreign_functions`, `builtin_functions`, `user_call_by_name` | Every call site reaches resolve with definition id |
+| Synthesis/resolve/std-inline member vocabularies via `CoreDeclarationIndex.names`; work-profile's empty name table | Builtin vocabularies and module-scoped resolve by id |
+| `core_empty_declaration_index`, `core_synth_context_empty` remain functions because cross-module global initializers are unsupported | Emitter capability, not an identity cut |
+| `CoreMonoInstanceIndex` structural-hash buckets despite the custom-key dictionary fix | Key by `CoreMonoInstanceKey`; delete bucket layer |
+| `c_local_name` escapes/id-zero fallback; creation-time Perceus/derived C spellings and shadow-match uniqueness names | [Synthetic binders](#synthetic-binders) and [binder producers](#binders) |
+| Small-pass id-zero binders and span-derived authored/`?=`/`with` ids (`core_binder_id`, `core_question_bind_var`) | Synthetic/authored issuer decision; span offsets remain below 2^31 |
+| Field spelling beside `CoreFieldRef` | Identifier text, retaining explicit ABI/display facts |
+| Projected nullary `VarExpr` spelling; case-name lookup in operation metadata | [Constructor references](#emission-by-id) by exact id |
+| `c_naming` imports `ir` for `CoreBinderOrigin` and inherits foreign-header requirement | Split origin/spelling boundary |
+| `type_parameter_name_kind` sigil read | Dimension kind instead of spelling |
+| `direct_constructor_payload` checks `NamePattern("_")` | Lower wildcard explicitly in synthetic-binder slice |
 
 ## Order and parallelism
 

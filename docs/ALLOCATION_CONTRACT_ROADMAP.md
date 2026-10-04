@@ -51,13 +51,6 @@ implementation of `no_alloc`.
 Paths beginning `stage_` in this document are relative to
 `blorp/src/compiler/`. Follow `docs/ARCHITECTURE.md` for application boundaries.
 
-The parser wrapper experiment is motivation, not the implementation: on its
-frozen `31e3206c` self-compile workload at `-O0`, 2,081,994 actual heap wrapper allocations were about 17.57%
-of discovery allocations, but zero wrappers remained at discovery completion.
-That is an allocation-call ceiling, not an achieved saving or a peak-memory
-estimate. An allocation checker itself is tooling and may add compile cost;
-its purpose is to expose and prevent unwanted runtime allocation.
-
 ## Contract decisions implementers must preserve
 
 ### Meaning of allocation
@@ -180,9 +173,12 @@ Core alone is not currently the whole allocation authority. Extract or share
 the allocation-relevant emission/runtime decisions first; do not maintain an
 optimistic checker beside a more powerful emitter.
 
-Publish a normalized, compilation-owned fact product. Suggested new owners
-are `stage_09_core/allocation_contracts.brp`, `allocation_analysis.brp`, and
-`allocation_diagnostics.brp`; names are proposals, not existing modules.
+Extend the normalized, compilation-owned facts in
+[`allocation_contracts.brp`](../blorp/src/compiler/stage_09_core/allocation_contracts.brp)
+and [`allocation_analysis.brp`](../blorp/src/compiler/stage_09_core/allocation_analysis.brp).
+[`allocation_report.brp`](../blorp/src/compiler/stage_09_core/allocation_report.brp)
+owns current report rendering; region obligations and rejection diagnostics below
+remain proposals.
 
 | Table | Key and payload | Owner/lifetime |
 | --- | --- | --- |
@@ -239,15 +235,13 @@ certified prepared artifact; the C renderer traverses their bodies
 transparently without mutating that artifact or emitting calls/closures.
 There is no post-verification wrapper-erasure rewrite.
 
-Today `CoreSourceLoc` is `KnownSourceLoc(path, line/column coordinates)` or
-synthetic, and lowering expands frontend compact locations. Do not assume
-late Core can reconstruct byte extents or source text from that value.
-Retain a small allocation-origin/source catalog for requested reports or
-marked regions, carrying authored compact locations through lowering and
-linking synthetic operations to their originating obligation/call. Integrate
-with existing source ownership rather than retaining an entire parsed/typed
-graph or duplicating path strings on every fact row. Render late diagnostics
-before the owning source catalog is released.
+`CoreSourceLoc` is an opaque packed `Int`: authored handles encode module and
+line/column coordinates, zero is synthetic, and negative pass-minted ids resolve
+through `minted_origins`. It is not an authored byte-extent or region identity.
+Extend the report's source-origin handling with a compact authored region catalog,
+linking synthetic operations to their originating obligation/call. Reuse the
+existing module/source ownership; do not retain whole earlier graphs or duplicate
+paths per fact row. Render diagnostics while the source catalog is available.
 
 Build local facts once, condense recursion into SCCs, and propagate finite
 risk categories with a worklist/reverse edges. A recursive SCC with no local
@@ -327,35 +321,17 @@ Implementation status:
 | 3. Allocation explanation interface | Complete | Human and versioned JSON reports run after final prepared Core without C emission; executable coverage remains explicitly incomplete. |
 | 4-7. Source contracts, enforcement, runtime oracle, precision | Not implemented | No `no_alloc` syntax or allocation-contract rejection is available yet. |
 
-### 0. Freeze the contract and allocation-coverage inventory
-
-**Context.** Constructor-only checking would miss raw growth, destructor
-stacks, and foreign callbacks. A broad "everything unknown" checker would
-be sound but useless. Specify the initial useful subset before adding syntax.
-
-**Implementation strategy.** Add a test-owned inventory covering every
-`CoreExpr` and `CoreCallKind` variant and every allocation-bearing emitter
-family. Record explicit safe/risky/unknown/unsupported classification, the
-shared owner, and the witness category. Audit `runtime.c`, generated helper
-bodies in `emit.brp`, closure/resource/cancellation helpers, and
-`intrinsic_renderer.brp`. This inventory is a coverage test of the canonical
-implementation, not a separately maintained whitelist. Select safe pilots:
-scalar arithmetic, scalar field access/borrow, statically emitted strings,
-and audited scalar runtime helpers. Select negative pilots: boxed payload,
-string construction, shared/growing list mutation, and allocating drop.
-
-**Example.** `size = text.length()` is not accepted because it returns `Int`;
-it is accepted only when the resolved operation and argument representation
-have an audited nonallocating implementation.
-
-**Fast loop.** Inventory/unit tests without compiling the self compiler;
-read one relevant generated C helper per class. Add the exact failing
-classification fixture before implementing that class.
-
-**Acceptance.** Parser/ergonomics, ownership/code-optimizer, and data-model
-review agree on the above contract. Every variant has an explicit policy;
-new variants fail coverage until classified. Raw allocation and cleanup
-counterexamples are retained. No broad runtime or language refactor occurs.
+Completed report milestones 0, 2 and 3 are represented by the status table above,
+the canonical [contracts](../blorp/src/compiler/stage_09_core/allocation_contracts.brp),
+[analysis](../blorp/src/compiler/stage_09_core/allocation_analysis.brp), and
+[report](../blorp/src/compiler/stage_09_core/allocation_report.brp) owners and their
+[`test_core_allocation_*` suites](../blorp/test/compiler/stage_09_core/test_core_allocation_contracts.brp).
+Their invariants remain requirements: explicit coverage for every Core variant,
+separate `may_allocate` and `unknown` facts, deterministic artifact-local ids,
+iterative SCC propagation (safe recursion can converge), bounded witnesses and
+node/edge work, and no analysis tables when reporting is disabled. Allocation
+facts remain a separate effect channel from purity and ownership; analysis must
+not mutate ownership policies or treat a pure/owned result as an allocation proof.
 
 ### 1. Publish allocation facts shared with runtime/emission plans
 
@@ -378,8 +354,8 @@ Do not infer no allocation solely from `RecordReuseExpr`/`UnionReuseConstructExp
 `RawScratchGrowth`; a plain integer struct drop has no such dependency.
 `ListGetExpr` may require boxing for some layouts and no boxing for others.
 
-**Fast loop.** New proposed `test_core_allocation_contracts.brp` with synthetic
-Core/layout cases; owning `test_core_prepare.brp` and codegen helper fixtures.
+**Fast loop.** Extend `test_core_allocation_contracts.brp` with the missing
+Core/layout/helper cases; use `test_core_prepare.brp` and codegen helper fixtures.
 Compare generated C before/after factoring: this milestone changes fact
 publication, not runtime behavior.
 
@@ -389,60 +365,14 @@ cold paths, shared storage, capacity exhaustion, destructor recursion, and
 callback invocation. No new unverified purity/name whitelist. Fact extraction
 is shared with emission; ordinary builds retain identical generated C.
 
-### 2. Analyze final Core and solve transitive summaries
+### Current allocation report interface
 
-**Context.** Allocations in callees and cleanup must be attributed to the
-caller's constrained region. Repeated full-tree searches would add substantial
-compiler cost, especially on the self-compile graph.
-
-**Implementation strategy.** Build dense identity maps, site/dependency tables,
-local summaries and SCCs as described above. Match every final Core node;
-reject unresolved/forbidden final-stage nodes through existing invariants.
-Add a structured `CorePassDiagnostic` alternative with location and help.
-Expose a pure analysis API for prepared Core, initially without syntax or CLI.
-Direct user/trait calls use resolved concrete declaration identity; closures
-are exact-target when proven, otherwise unknown. Follow function-body and
-destructor edges separately so diagnostics can explain both.
-
-**Example.** For `a -> b -> c -> string allocation`, all three summaries have
-a risk, but store one site row and predecessor edges, not three copied trees.
-For mutually recursive scalar-only `even/odd`, prove no allocation when all
-other reachable operations have safe contracts.
-
-**Fast loop.** Proposed `test_core_allocation_analysis.brp`: local operation,
-call chain, diamond, self/mutual recursion, unknown callee, nested destruction,
-same-spelled different definitions, and layout-dependent specialization.
-Use counters for node visits, edge visits, SCC work and witness storage.
-
-**Acceptance.** Exactly expected safe/may/unknown results; no optimistic
-handling of missing targets; recursive safe cases converge. Work scales with
-nodes/edges and finite risk categories, not call paths. Repeat runs produce
-identical IDs/order within an artifact. Allocation facts are analysis output,
-not mutations of ownership policies. No code-generation changes yet.
-
-### 3. Expose actionable allocation explanations before source contracts
-
-**Context.** This is the first usable tool for identifying unexpected
-allocations without handwritten `mem_stats` tests. It is also the fastest
-way to evaluate whether the facts are useful before AST-wide syntax changes.
-
-**Implementation strategy.** Proposed CLI contract:
-`compile --explain-allocations` emits a human report to stdout;
-`compile --explain-allocations=json` emits one versioned JSON report object
-with header and fact/result tables. Document both in `--help`. This is a
-report-only mode: reject a simultaneous C output `-o` request and an early
-`--stop-after` that would bypass final analysis, rather than silently ignoring
-them. Diagnostics go to stderr. A valid unannotated program has exit status 0
-even if its report contains risks; invalid code or a violated `no_alloc`
-obligation has nonzero status. Automated consumers must inspect proof status,
-not equate the report command's exit status with "no allocations."
-Run the normal pipeline through final preparation, analyze, and print bounded
-function/site witnesses; do not compile/link C merely to explain allocations.
-Keep reporting separate from rejection: unannotated risky code remains legal.
-Attach source locations before rendering, with explicit "compiler-generated"
-fallback provenance. Expose the same structured result for future LSP use.
-
-**Example report (abridged current fields).**
+`compile --explain-allocations[=human|json]` reports after final prepared Core,
+without C emission/linking. The default is human output; JSON is one versioned
+object. `-o`, `--ast`/AST output options and any `--stop-after` are rejected.
+Diagnostics go to stderr. A valid program exits successfully even when the report
+contains risks: inspect the report's status and witnesses, not its exit status.
+The report does not enforce the proposed source contract.
 
 ```json
 {"schema_version":1,"report_kind":"core_allocation_analysis",
@@ -451,20 +381,13 @@ fallback provenance. Expose the same structured result for future LSP use.
  "may_reasons":["heap_box"],"may_witness_path":[8,17]}]}
 ```
 
-IDs are artifact-local; also include source/canonical declaration display
-information and compiler/catalog provenance in the report header. Unknown
-and incomplete reports must be distinguishable from proven zero allocation.
-
-**Fast loop.** Tiny CLI fixtures containing one local allocation, one callee
-allocation, one allocating release, and one unknown foreign call; assert
-stable schema/reason codes and useful human help. Test output-path errors
-through the existing guarded command boundary.
-
-**Acceptance.** A developer can locate hidden boxing/COW/cleanup work without
-instrumenting the program. Reports never call conditional allocation
-"definite" or unknown code "allocation-free". No report flag means no
-analysis table construction. Ordinary output/C is unchanged. Retain one
-representative parser-helper report; do not report millions of runtime events.
+Ids are artifact-local; source/display and catalog provenance accompany the facts.
+`Safe`, `MayAllocate` and `Unknown` are conservative Core classifications, not an
+executable certificate. Explicit unsupported/unknown witnesses and incomplete
+backend-plan/configuration coverage prohibit an executable allocation-free claim.
+Reports preserve both may and unknown risks, distinguish conditional from definite
+allocation and keep compiler-generated provenance explicit. When source contracts
+land, a violated obligation must fail even in report mode.
 
 ### 4. Carry allocation regions through the language and all transforms
 
@@ -490,7 +413,9 @@ CTFE preserves an obligation record even if evaluating the enclosing
 expression removes its runtime body; an erased region is explicitly marked
 with its elimination reason, not lost from the inventory.
 
-Mechanical source route: `stage_02_lex/token.brp` keyword/tag tables;
+Mechanical source route: both discovery parser/lexer owners under
+`blorp/src/compiler_new/stage_01_discovery/` and the legacy
+`stage_02_lex/token.brp` keyword/tag tables;
 `stage_03_parse/language_parser.brp` (`parse_block_after_colon`),
 `parsed_ast.brp`, `parsed_ast_json.brp`, `parsed_ast_traverse.brp`;
 `stage_06_typecheck/infer.brp`, `typed_ast_json.brp`,
@@ -708,65 +633,32 @@ negative/shared/cold paths remain rejected. No global effect-polymorphism or
 managed-struct feature is smuggled into a precision patch. Each follow-up has
 its own reviewed scope and measured benefit; V1 completion does not depend on it.
 
-## Worker ownership, commands, and handoff
+## Coordination and validation
 
-Three implementation lanes are enough. One coordinator owns the fact schema,
-integration, and release gate; avoid one agent per tiny registry entry.
+The remaining lanes share a schema: contracts/runtime owns milestone 1 and the
+runtime portion of 6; language/tooling owns 4–5; analysis/reporting extends the
+existing owners as those facts become available. Freeze helper-plan, region-id and
+diagnostic schemas before dependent consumers. Schedule Core enum/traversal/codec
+edits serially. Milestones 4–6 form the public release boundary; no temporarily
+unsound syntax lands as a working contract.
 
-| Lane | Work | Dependency and overlap rule |
-| --- | --- | --- |
-| Core/runtime contracts | 0, 1, runtime portion of 6 | Own shared helper plans; freeze schema before analysis consumes it |
-| Analysis/reporting | 2, 3 | Use stable schema; no independent runtime-name whitelist |
-| Language/tooling | 4, 5 | Design/parser review can start early; implement after IDs/diagnostics agreed; owns AST/Core variant integration |
-
-The Core enum/traversal/serialization files are shared: schedule those changes
-serially or land one preparatory schema commit, then rebase the other lanes.
-No worker commits a temporarily unsound public feature to the integration
-branch. Separate worktrees/branches, narrow reviewable commits, no bootstrap
-rotation or external publication without coordinator direction.
-
-Existing commands (the new allocation test filenames above are proposed):
-
-```bash
-scripts/compiler-build-status
-make
-scripts/compiler-build-status
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_pipeline.brp
-bin/blorp test --timeout 180 blorp/test/compiler/stage_09_core/test_core_prepare.brp
-bin/blorp compile --check-invariants --dump-core-after=final \
-  --dump-core-file=/tmp/no-alloc-fixture.core.txt --no-format \
-  -o /tmp/no-alloc-fixture.c /tmp/no-alloc-fixture.brp
-scripts/compiler-check --changed --plan
-scripts/compiler-check --changed
-git diff --check
-```
-
-Create the named scratch fixture before using those `/tmp` example paths.
-Register new compiler tests in
-`blorp/test/compiler/compiler_test_ownership.json`; formatting/purify/lint/LSP
-tests remain under their existing owners. For combined checks, use an explicit
-common base so a clean final worktree does not select zero tests. Verify
-current CLI help rather than assuming future flags in this plan already exist.
-Follow `docs/DEVELOPMENT.md` and `benchmarks/README.md` for current build/gate
-serialization, frozen-input measurements and provenance packets.
-
-Every handoff includes: exact revision/worktree; files and fact owners changed;
-one minimal accepted/rejected example; proof coverage/unknown cases; tests and
-counts; generated Core/C excerpt paths; same-input metrics and binary hashes;
-code-reviewer/test-runner verdicts; unresolved decisions. No claims from a
-different compiler binary, no repeated full gates for comment-only edits when
-semantic/artifact identity can be established, and no giant pasted logs.
+Use [Worker Checklist](WORKER_CHECKLIST.md) and
+[Developer Guide](DEVELOPMENT.md) for build status, focused gates, serialization,
+test registration and review/handoff; use the
+[self-compile protocol](../benchmarks/README.md#self-compile-measurement-protocol)
+for frozen-input measurements. Allocation-specific evidence is the accepted and
+rejected fixture pair, complete versus unknown proof coverage, the exact generated
+helper/Core excerpt, artifact/catalog/configuration identity, and milestone 6's
+runtime observations and cost budgets. Verify current CLI help before using a
+proposed flag.
 
 ## Completion checklist
 
 - [ ] Complete shared backend/runtime allocation and cleanup contracts; the Core catalog and exhaustive coverage tests are implemented.
-- [x] Indexed final-Core analysis, recursive summaries and bounded witnesses.
-- [x] Useful human and machine-readable allocation explanations.
 - [ ] Region syntax/provenance survives all relevant transforms.
 - [ ] Consistent `check`/compile/run/test enforcement and honest LSP status.
 - [ ] Runtime oracle catches raw growth, boxing and allocating destruction.
 - [ ] Independent review, combined gates, documented exclusions and cost budget.
 
-Deliver milestones 0–3 first as a reviewable tool. Ship the public `no_alloc`
-contract only with 4–6 complete. This provides a useful early stopping point
-without claiming a partially implemented language guarantee.
+The report tool is available. Ship the public `no_alloc` contract only when
+shared backend coverage and milestones 4–6 are complete.

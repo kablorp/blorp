@@ -7,33 +7,27 @@ reference counting, cancellation cleanup frames, out-of-line runtime calls and
 uniqueness tests. This roadmap holds the open work that attacks that per-node
 cost. Every item here changes the generated C on purpose, so the oracle is
 behavioral (suites, leak and sanitizer gates, cancellation fixtures) plus a
-measured instruction reduction, never byte identity. Measurements and the
-completed first round (checkpoint inlining, direct list element reads, the
-task pointer read once per function, cleanup-frame elision, borrowed iteration
-over parameters and immutable lets) are in `benchmarks/results/` and Git
-history.
+measured instruction reduction and generated-C review. Semantics-preserving
+compiler source refactors still require byte identity. Measurements and
+completed work are in `benchmarks/results/` and Git history.
 
 Working rules are in [`WORKER_CHECKLIST.md`](WORKER_CHECKLIST.md) and
 [`COMPILER_SPEED_ROADMAP.md`](COMPILER_SPEED_ROADMAP.md) ("Reading profiles").
 
 ## The stage-2 rule
 
-`bin/blorp` is linked by the pinned bootstrap compiler
-(`blorp/build/bootstrap.env`), not by the compiler in the worktree, so a change
-to the backend or to the native runtime does not change the code `bin/blorp`
-itself runs. Every item below is measured on a stage-2 compiler
-(`benchmarks/build_stage2_compiler`, or `benchmarks/self_compile_measure
---stage2`) against a stage-2 compiler built the same way from the base commit,
-at -O2 with three samples on both the self-compile and the small program. The
+Backend/runtime changes must run inside matching stage-2 parent/candidate
+compilers: the pinned bootstrap builds `bin/blorp` and otherwise hides the
+codegen change being measured. Use the
+[stage-2 protocol](../benchmarks/README.md#the-stage-2-rule), including its
+fixpoint checks, at `-O2` with three samples on self and small inputs. The
 candidate must lower self-compile instructions by the item's floor and must not
 raise the small program's by more than 0.5%. Report `output_bytes`, the
-instruction rows and the item's pattern counts. The full rule, the harness
-flags and the sampling recipe are in
-[`benchmarks/README.md`](../benchmarks/README.md#the-stage-2-rule) and
-"Sampling A Pass" there; the pattern counts below are cheap oracles obtained by
+instruction rows and the item's pattern counts. The pattern counts are cheap
+oracles obtained by
 grepping the generated C of `blorp/src/main.brp`
 (`bin/blorp compile --std-dir standard_library/src --no-format
---no-embed-runtime -o out.c`). After a codegen round the bootstrap is
+--no-embed-runtime blorp/src/main.brp -o out.c`). After a codegen round the bootstrap is
 re-pinned so `bin/blorp` itself gets the gains.
 
 ## The per-node patterns

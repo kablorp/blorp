@@ -76,6 +76,10 @@ benchmarks/self_compile_measure --stage2 --label candidate \
 - Compare only against a baseline built with the same toolchain (clang
   version, bootstrap pin, `-O` level); wall time is not evidence, allocation
   counts and retired instructions are.
+- `--require-identical` applies to semantics-preserving source refactors.
+  Intentional codegen changes instead require generated-C review, behavioral
+  and ownership gates, and the fixpoint check below; keep the normal and
+  diagnostic executables' output identical within each measured pair.
 - **Stage-2 rule**: `bin/blorp` is linked by the pinned bootstrap
   (`blorp/build/bootstrap.env`), so a backend or
   `blorp/src/lib/runtime/native` change does not affect `bin/blorp`'s own

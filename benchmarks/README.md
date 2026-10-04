@@ -297,7 +297,7 @@ foreign-reachable heap records, and a value struct reachable from a foreign
 signature. The runner appends a temporary layout reporter to the generated C;
 it does not modify production sources or artifacts. Use it as the fast
 feedback loop for representation work tracked in
-`docs/COMPILER_PRIORITIES.md`.
+[record simplification](../docs/FIXED_LAYOUT_ROADMAP.md).
 
 `compiler_enum_field_layout` reproduces the Slice 8 source inventory and the
 generated compiler-C structural comparison. Inventory mode is read-only and
@@ -1831,8 +1831,8 @@ match byte for byte. The harness reports:
 - retired instructions per run, from `/usr/bin/time -l` (stable to about
   0.1% on Apple Silicon; the primary acceptance signal);
 - per-phase wall time, total wall time, and peak RSS (secondary; host noise);
-- the SHA-256 of the generated C (the correctness gate: a
-  representation-only change must produce **identical** C).
+- the SHA-256 of the generated C (semantics-preserving source refactors must
+  produce **identical** C).
 
 ```bash
 # One-time per checkout: build at the acceptance optimization level.
@@ -1928,6 +1928,12 @@ of a hard refusal, and instruction-count deltas against them should be read
 with that in mind rather than trusted outright. Existing baseline files are
 not rewritten retroactively — fingerprints are recorded from this change
 forward only.
+
+For intentional code-generation changes, omit `--require-identical` when
+comparing baseline with candidate; use generated-C review, behavioral and
+ownership gates, and the stage-2/stage-3 fixpoint oracle instead. The normal
+and diagnostic binaries must still emit identical C within each measured
+pair. Record changes in C size alongside instructions and allocations.
 
 ### The Stage-2 Rule
 

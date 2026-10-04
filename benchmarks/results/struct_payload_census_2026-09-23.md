@@ -1,7 +1,7 @@
 # Struct payload and erased union census (S0)
 
 Date: 2026-09-23. Read-only measurement pass for
-[`docs/STRUCT_PAYLOAD_ROADMAP.md`](../../docs/STRUCT_PAYLOAD_ROADMAP.md) step
+[`docs/STRUCT_PAYLOAD_ROADMAP.md`](https://github.com/kablorp/blorp/blob/53f5e73cc620896d1925916975e7aca7261d7cf2/docs/STRUCT_PAYLOAD_ROADMAP.md) step
 S0. No compiler source changes in this commit.
 
 Compiler commit: `53f5e73cc620` (`origin/main`, clean). `bin/blorp --version`:

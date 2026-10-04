@@ -237,8 +237,8 @@ Every command that builds the compiler's front-end graph (`check`, `compile`,
 It runs the discovery stage (`blorp/src/compiler_new/stage_01_discovery`) and
 its legacy adapter (`blorp/src/compiler/discovery_adapter.brp`, composed by
 `discovery_front_end.brp`), which rebuilds the graph the typecheck reads. Details
-and the user-visible diagnostics are in `docs/DISCOVERY_TABLES_DESIGN.md`
-("Running the stage from the CLI"). The formatter, the LSP, `compile --ast`
+and the user-visible diagnostic boundaries are in
+[Discovery Tables](DISCOVERY_TABLES_DESIGN.md). The formatter, the LSP, `compile --ast`
 and `blorp test` discovery still use the old lexer and parser
 (`docs/DISCOVERY_ACCEPTANCE_ROADMAP.md`).
 

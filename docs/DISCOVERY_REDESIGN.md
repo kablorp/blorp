@@ -1,233 +1,74 @@
 # Discovery Redesign: Per-Module Parses into Typed Syntax Trees
 
-This is a design for review. The typed-tree path is not implemented yet; the
-syntax prerequisite M-1 has landed, and M0 measured a throwaway body-parser
-prototype. M1 to M7 remain open. It replaces the data model of
-[`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) (one builder threaded
-through every module, a flat node table and about 50 side tables) with:
+This is an active design for review, not the current implementation.
+The default front end still uses the
+[normalized tables](DISCOVERY_TABLES_DESIGN.md). M1–M7 below remain open.
+This proposal replaces the global builder and flat syntax tables with
+independent pure module parses into typed syntax trees, a module walk and
+one link step.
 
-- one pure parse per module, producing a typed syntax tree or the diagnostics
-  that reject the module;
-- a module-graph walk that calls it;
-- one link step that produces what later stages read.
+The future schema below is specified in full; function bodies appear where
+their shape matters. Ordinary `record` is the syntax-value target under the
+[record simplification roadmap](FIXED_LAYOUT_ROADMAP.md). The historical
+[M0 prototype](../benchmarks/results/discovery_redesign_m0_2026-10-02.md)
+used several `struct` values and does not price this exact design.
+[Census and initial probes](../benchmarks/results/discovery_redesign_probes_2026-10-01.md)
+are historical evidence, not a current candidate baseline.
 
-The code below is real Blorp: every type is written out in full. Function
-bodies are given only where the shape matters.
-
-- **Current implementation checked at:** main `1a767d0c7` (2026-10-03).
-  The census and initial cost probes below are historical measurements at
-  `519e7311c`, not measurements of this revision.
-- **Counts:** taken on the self-compile inputs (`blorp/src/main.brp`, 449
-  modules, prelude and tuple implicit modules) with a census tool over the
-  then-current tables. Appendix A gives the census; Appendix B gives the
-  allocation probes.
-- **Decisions:** revised after an independent review of the first version;
-  the decisions taken are in section 10.
-- **Product direction:** ordinary `record` is the target nominal product
-  ([`FIXED_LAYOUT_ROADMAP.md`](FIXED_LAYOUT_ROADMAP.md)). The proposed syntax
-  below uses records for name and syntax values. Its historical M0 prototype
-  used several `struct` values, so its costs do not price this exact shape.
-- **Precedence:** where this document and a later implementation disagree,
-  the implementation and its tests win, and this document is fixed in the
-  same change.
-
-## Contents
-
-0. Decisions in brief
-1. Goals, principles, non-goals, and what the redesign replaces
-2. The pipeline
-3. The syntax types
-4. The output: the contract with later stages
-5. Interning and literal values
-6. The legacy adapter and the parity gates
-7. Expected cost
-8. Migration plan
-9. Remaining disagreements
-10. Decisions taken
-
-Appendix A: node census. Appendix B: allocation probes.
-
-## 0. Decisions in brief
-
-1. **Typed trees are the output.** Bodies, written types and patterns stay
-   trees after discovery. They are not flattened into a node table. Every
-   reader in the pipeline (resolution, typecheck, Core lowering, the legacy
-   adapter) walks a body in its structure. A node table makes each of them
-   rebuild that structure from kinds and child positions. The adapter's 25
-   derived owner indexes (`DeclarationReader`) show the cost. `AGENTS.md`
-   already names this as the case where a table does not pay: "every
-   consumer immediately joins [it] back into the original shape".
-2. **Every construct a later stage elaborates or keys a fact on carries an
-   id.** The family is fixed by the construct, and the list is section 3.3:
-   - `DefinitionId`, `ImportId`;
-   - `StatementId`, `BlockId`;
-   - `ExpressionId`, `PatternId`, `WrittenTypeId`, `DimensionId`;
-   - `NameUseId`, `BinderId`, `TypeBinderId`.
-
-   An id is packed from (module, index within the module). A program-wide
-   id is the module's base plus the local index. A name's spelling is a
-   `SpellingId`, packed the same way. A module's ids do not depend on any
-   other module, so modules can be parsed independently and later in
-   parallel. This borrows rustc's `HirId` = (owner, local id).
-3. **Ids live behind one opaque boundary.** `IdMint` is the only maker of
-   ids, and only the parser may import it. A node gets its id from the mint
-   as the node is built, in the same step. No id is ever predicted, read from
-   a length, or visible before its node exists.
-4. **One pure function parses a module:** `parse_module(module, text) ->
-   ParsedSource`, with the lexer inside it. The module-graph walk is the only
-   impure part: it reads files and resolves requests.
-5. **A module with a syntax error has no tree.** Discovery reports its
-   diagnostics, exactly as today: the parser continues after an error with
-   placeholders that never leave it. The tree types contain no recovery forms
-   and no missing names. A discovery with any problem that stops compilation
-   produces a failure report instead of a program.
-6. **Names are interned per module and merged once at link.** A tree holds a
-   `SpellingId`; `program.name_id(spelling)` gives the program-wide `NameId`.
-   Discovery does not intern literal texts (the backend pools strings). The
-   tree stores literal values in checked form. The seeded vocabulary of the
-   old compiler moves into the legacy adapter.
-7. **The link step is not a flatten, and nothing is checked at freeze.** Link
-   interns names, computes the program-wide id bases, and builds the module,
-   request and name tables. It cannot fail. The 2,800 lines of `invariants/`
-   are deleted: each violation they check is unrepresentable or guaranteed by
-   the mint. An id census proves the minting discipline, as a corpus test and
-   in debug builds at link.
-8. **Prerequisites in the language.**
-   - Assignment is a statement only. `=` in an expression position
-     (`xs = [a = 1]`, `print(ys[0] = 3)`, `if a = 1:`) is a parse error in
-     both parsers, and the language has no named call arguments (landed in
-     `d460bac5f`).
-   - M-1 landed in `020b95d90`: both parsers reject the remaining forms
-     that only typecheck rejected, and implicit type parameters are removed
-     (auto-generalization and bounded arguments outside an `implements`
-     receiver).
-
-   With both landed, the tree types need no form that exists only to be
-   rejected.
-9. **The legacy adapter becomes a structural map from tree to old AST.** It
-   stays in `blorp/src/compiler/discovery_adapter.brp`, run by
-   `blorp/src/compiler/discovery_front_end.brp`; M3 to M6 rewrite both in
-   place over the trees, and they are deleted when typecheck reads the trees
-   directly. These two are the only compiler modules that import
-   `compiler_new`, as `temporary_cross_owner_imports` in
-   `blorp/source_ownership.json` lists.
-10. **The tree path becomes the default only within a hard ceiling** on retired
-    instructions, peak RSS and wall time. This is an internal table-to-tree
-    selection inside the already-default discovery stage, not a return of
-    `BLORP_FRONT_END`. The ceiling is not loosened for any compiler change.
-    Since 2026-10-02 M6 waits on the compiler work of
-    [`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md): its increments 1 to 4, and
-    increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5
-    do not wait (section 10, flip timing).
+Syntax prerequisites are already current language rules: assignment is a
+statement, calls have no named arguments, and type parameters are explicit
+except those introduced by an `implements` receiver. The parser rejects
+syntactically forbidden forms before typecheck. The retained M0 report is
+a throwaway cost experiment, not M1 implementation. M1 begins with a fresh
+opaque-import-cycle check (3.15); M6 depends on tuple increments (7.3).
+Implementation and tests win if later work diverges, and this plan must be
+updated in the same change.
 
 ## 1. Goals, principles, non-goals, and what the redesign replaces
 
-### Goals
+The proposal makes discovery's output directly readable by later stages:
+typed trees retain structure, while each later stage keeps its own facts in
+columns keyed by parser-issued identity. There is no flatten step. Syntax
+categories have distinct record/union forms, optional parts use `Option`,
+and bounded sequences encode the grammar's arity. Exhaustive readers need
+no kind-dependent payload decoding or child-position checks.
 
-The goal is output that lets the following stages of the compiler be
-straightforward and not re-do work from earlier stages. That breaks down
-into:
+The parser alone constructs syntax. Its opaque `IdMint` builds each node
+with its ID in one step; it never predicts an ID. Each name's role is explicit:
+`WrittenName` for names nobody resolves, `Binder`/`TypeBinder` for
+introductions, and `NameUse` for scope- or type-decided uses. Sections 3.2,
+3.3 and 3.15 specify that boundary. Resolution determines whether assignment
+targets/name patterns declare or refer, and stores binding form/mutability.
 
-1. **Clean, understandable, correct code**, in the stage and in its readers.
-   The organization of the code and the data model comes first.
-2. **Illegal states unrepresentable by construction.** No freeze check stands
-   in for a type, and nothing is left half-way.
-3. **Later stages read discovery's output directly.** Resolution resolves names
-   by walking typed syntax, and typecheck keys types by ids discovery issued.
-   Neither re-derives a fact that discovery had: no digits to re-parse, no
-   arity to re-check, no parent to inspect.
-4. **The stage knows nothing about the old compiler.** Glue lives in
-   `blorp/src/compiler/discovery_front_end.brp` and `discovery_adapter.brp`,
-   the only compiler modules that import the stage.
-5. **Design first; cost second.** Where today's compiler makes a clean shape
-   expensive, the cost and the compiler work that recovers it go into a ledger
-   (section 7). The default still flips only within a hard ceiling.
+Each pure per-module parse owns temporary state and returns a complete tree
+or diagnostics. Paths, origin and package belong to the module walk; import
+targets belong to its outcomes. Per-module names are merged once at link.
+The definitions/import indexes share the records in the tree and stay
+read-only. Missing issued IDs are internal errors in every build (4.5);
+no placeholder or fallback row reaches a later stage.
 
-### Principles
+This replaces the current global builder, opening/closing protocols,
+post-order node/edge tables, sorted optional side tables and final invariant
+walk with per-module state and structurally complete values. Required parts
+become fields; optional parts become `Option`; owner relationships become
+containment. `SourceId` merges with `ModuleId`; paths/literals become values.
+Legacy seed/sigil spellings move to the adapter. Sections 3.19 and 4.6 map the
+current forms/invariants to the proposed replacement.
 
-- **A syntactic category is a type.** Statements, expressions, patterns,
-  written types, dimensions and declarations are each a record with a union of
-  forms. Every form holds exactly its parts:
-  - `Option` for an optional part;
-  - a `List` for a sequence of any length;
-  - a non-empty or fixed-arity shape for a sequence the grammar bounds
-    (section 3.1);
-  - a union where the grammar offers alternatives.
-
-  Readers match exhaustively, so they never need an arity check, a
-  child-role table or a "child 2 when written" convention. (OCaml's typed
-  intermediate forms; rustc's `ExprKind`.)
-- **A node has its common fields in a record and its form in a union**:
-  `Expression {id, span, kind}`. This is rustc's `Expr {id, kind, span}` and
-  OCaml's `expression = {exp_desc; exp_loc; ...}`.
-- **The id rule.** Every construct that a later stage elaborates or keys a
-  fact on carries an id of its family. Section 3.3 lists every such
-  construct. A construct not on the list carries no id, and nothing on the
-  list lacks one.
-- **Ids are managed exclusively behind the opaque boundary.** Only `IdMint`
-  makes an id. A node's record is built in the step that mints its id
-  (section 3.15).
-- **A name says its role in its type.**
-  - `NameUse` is a reference whose meaning a later stage decides: resolution
-    by scope, or typecheck by type (a field or a method).
-  - `Binder` introduces a local value, and `TypeBinder` a type parameter.
-  - `WrittenName` is a name that no later stage resolves: a declared name,
-    a module alias, a path part.
-- **Later stages never construct syntax.** They read the trees and key their
-  own facts by the ids in them. Every syntax value outside `parse/` is one
-  the parser built. Tests are the only other code that builds trees.
-- **Failure is loud in every build.** A read of an id the program issued that
-  misses is an internal compiler error in debug and release alike (section
-  4.5). There are no fallback rows.
-- **One fact, one place.**
-  - A module's path, origin and package live in its module record.
-  - An import's target lives in that module's import targets, one per import.
-  - A name's text lives once in the name table.
-  - The definitions index holds references to the declaration records, not
-    copies.
-- **Deterministic.** Module order is roots, then implicit modules, then
-  imports breadth first in source order. Ids within a module follow source
-  order (names, binders) or completion order (nodes and definitions). Names
-  are merged in module order. Output depends only on the inputs, never on
-  scheduling.
+Code shape and correctness come first. Today's compiler costs are measured
+rather than encoded as parser calling conventions. The hard M6 ceiling
+still applies; sections 7 and 8 own its budget and tuple prerequisites.
 
 ### Non-goals
 
-- **The current LSP integration.** The LSP will likely share compiler
-  utilities piecemeal rather than invoke the compiler's stages directly. This
-  design neither serves nor constrains today's LSP.
-- **Comments and layout trivia.** The trees hold no comments, blank lines or
-  spacing; spans are their only link to the source text. The formatter keeps
-  the old parser until a separate design gives it a lossless tree or a trivia
-  table.
-- **An error-tolerant tree.** A module with a syntax error has no tree.
-  Editing support inside a broken module needs its own lossless,
-  error-tolerant syntax, which is a tooling design.
-- **Incremental re-discovery.** Per-module parses and per-module ids make it
-  possible later. It is not designed here.
-- **What typecheck and Core lowering read.** Section 4.7 lists the effects on
-  resolution. The reads of typecheck and Core lowering are specified when
-  those stages are designed.
-- **Name resolution and types.** Those are resolution's and typecheck's.
-
-### What the redesign replaces, and why each goes
-
-| Today | Why it goes | Replaced by |
-| --- | --- | --- |
-| `DiscoveryBuilder`, a flat record of 61 fields threaded through every lexer and parser call, and every module | It is one owner of all state because rows had to be appended in place. That forced the parse of every module into one sequential value, mixed transient parse state with output, and made "the last node appended" a protocol. | A per-module `ParseState` (cursor, id mint, spellings, diagnostics) that dies with the parse; trees returned by value |
-| The five builder threading rules and `tools/builder_rule_probe.brp` | They encode where the compiler copies a builder. A routine had to be written to the rules, and a broken rule meant an O(n) copy per append. | Ordinary values returned from functions. The cost of those returns is in the ledger (section 7), not in a rule list. |
-| Openings and closings (`open_module`/`close_module`, `ImportOpening`, `ForeignBlockOpening`, the per-class definition openings, `OwnedRows`, `TypeParametersStart`) | They existed to append a parent's row before or after its children with the right ranges. Closing once was a caller obligation that only debug builds checked. | A parent record built after its children, holding them. Nothing is open. |
-| Predicted ids (`next_definition_id`, `next_module_id`, `*_id_at_row(length())` in every opening, `interned_path_id` before `intern_path`) | The id was read before the row existed, so its correctness depended on no other append in between. | `IdMint`: the id is minted in the step that builds its node (section 3.15) |
-| `NodeRow {kind, span, payload: Int, children: RowRange}`, `node_schema`, `ChildArity`, `NodePayloadReference`, `NameSpanRule`, `node_kind_classes` | The payload's meaning and the children's roles depended on the kind. Appenders were typed by kind class, but readers still decoded positions. | One record and union per category; payloads are typed fields |
-| The child stack (`child_stack`, `child_stack_depth`, `push_last_node`, `last_node_id`, `discard_last_leaf_node`) | It was needed to build post-order rows without a local list of child ids. | Parse functions return their node |
-| Sorted side tables read by binary search through a closure (`bound_qualifiers`, `import_targets`, `import_aliases`, `node_name_spans`, `else_keywords`, `module_packages`, ...) | They expressed optional relationships when a struct row could hold no `Option`. Correctness depended on append order, which `SideTableUnsorted` checked at freeze. | `Option` fields in the records that own them |
-| `DimensionNameRow` (`#N` beside `N`) and the 236-name seeded vocabulary | Both exist only for the old compiler's name table. | Moved into the legacy adapter (section 6) |
-| Transient tables (`tokens`, `token_cursor`, `pending_docstrings`, `pending_annotations`, `interpolations`, `interpolation_parts`, `interpolation_texts`) and tokens of interpolation holes appended after the end-of-file token | Parse state lived in the output's owner. | `ParseState` and `LexedModule`, which never reach the output; a hole is lexed into its own token list |
-| `freeze` and `invariants/` (2,800 lines, about 30 violation kinds), `TableInvariantViolation`, `FreezeOutcome.TableInvariantsViolated` | They checked at freeze what construction did not guarantee. | Construction guarantees each fact (section 4.6). Freeze is gone. |
-| `UNREACHABLE_*` fallback rows and `report_unreachable_lookup` in about 20 accessors | A release build continued with an invented row after a compiler defect. | Readers hold the node. The few by-id reads return `Option`, and a miss is an internal compiler error in every build (section 4.5). |
-| `SourceId` beside `ModuleId`; `PathId` and the paths table | Every admitted source is exactly one module, and paths were interned only to be stored in rows. | `ModuleId` names the source too; a path is a `String` in the one record that owns it |
-| `ResolutionDiagnosticRow` table | An import's or request's failure is its outcome. | `ImportOutcome`, `RootOutcome` and `ImplicitOutcome` hold their failures |
-| Literal texts in a `literals` table, digits re-parsed by every reader | Typecheck, CTFE and the concurrency parameters each parse digits again. | Checked literal values in the tree (section 5.2) |
+- Comments/layout trivia and an error-tolerant editing tree. The formatter
+  keeps its parser until a separate lossless-tree or trivia design replaces
+  it. Today's LSP integration neither requires nor constrains this proposal.
+- Incremental rediscovery and parallel execution. Per-module isolation
+  enables later work; section 2.6 gives parallelism's extra prerequisites.
+- Name resolution and type inference. Section 4.7 specifies resolution's
+  changed input; typecheck and Core reads are specified when those stages
+  are designed.
 
 ## 2. The pipeline
 
@@ -824,8 +665,7 @@ union BindingTarget:
   hashing a slice again at every lookup, which is the interning work done
   over again.
 - **The span** is the name's own extent. Diagnostics point at the name, not
-  at the node around it. Today that needs `NodeNameSpanRow` (162,465 rows on
-  the self-compile); here it is a field.
+  at the node around it. Today that needs `NodeNameSpanRow`; here it is a field.
 - **The role wrapper** puts resolution's per-kind schema (`name_role` in the
   resolution design) into the type:
   - a `NameUse` gets exactly one outcome;
@@ -2444,79 +2284,81 @@ method in its trait's or implementation's `methods`.
 
 ### 3.19 Where every current node kind goes
 
-Every one of today's 128 `NodeKind`s (`tables/row_kinds.brp`) has a home,
-or is rejected by the assignment-statement rule or M-1. Counts are from the
-self-compile census (Appendix A).
+The current node-kind families in `tables/row_kinds.brp` map as follows.
+This is the migration mapping; the historical frequency census belongs to
+the [probe report](../benchmarks/results/discovery_redesign_probes_2026-10-01.md).
+Forbidden forms are rejected by the current assignment-statement and explicit
+parameter rules, not represented as accepted tree forms.
 
-| Today's node kind(s) | Count | New home |
-| --- | ---: | --- |
-| `IdentifierNode` | 282,208 | `NameReference(NameUse)` |
-| `IntegerLiteralNode`, `FloatLiteralNode` | 10,537 | `IntegerLiteral(Int128)`, `FloatLiteral(DecimalFloat)` |
-| `StringLiteralNode`, `RawStringLiteralNode`, `PipeStringLiteralNode`, `RawPipeStringLiteralNode` | 24,750 | `StringLiteral(StringForm, String)` |
-| `InterpolatedStringNode`, `InterpolatedPipeStringNode` | 922 | `InterpolatedString(InterpolationForm, List[InterpolationPiece])` |
-| `InterpolationTextNode` | 2,181 | `InterpolationText(String)` |
-| `InterpolationHoleNode` | 1,705 | `InterpolationHole(Hole)` |
-| `TrueLiteralNode`, `FalseLiteralNode` | 9,794 | `BooleanLiteral(Bool)` |
-| `CharLiteralNode` | 546 | `CharacterLiteral(Char)` |
-| `NegateNode`, `NotNode` | 1,999 | `Unary(UnaryOperator, Expression)` |
-| `DetachNode` | 5 | `Detach(Expression)` |
-| `AddNode` ... `GreaterEqualNode` (11 kinds) | 18,515 | `Binary(BinaryOperator, ...)` |
-| `AndNode`, `OrNode` | 6,184 | `ShortCircuit(LogicalOperator, ...)` |
-| `RangeNode` | 94 | `RangeExpression(Expression, Expression)` |
-| `CallNode` | 97,175 | `Call(Expression, List[Expression])` |
-| `FieldAccessNode` | 59,010 | `FieldAccess(Expression, NameUse)` |
-| `SubscriptNode` | 724 | `Subscript(Expression, AtLeastOne[Expression])` |
-| `ListLiteralNode`, `TupleNode`, `VectorLiteralNode` | 9,915+ | `ListLiteral`, `TupleLiteral(SmallTuple[...])`, `VectorLiteral` |
-| `RecordLiteralNode`, `RecordUpdateNode` | 7,514 | `RecordLiteral(List[NamedValue])`, `RecordUpdate(Expression, List[NamedValue])` |
-| `RecordFieldNode` | 19,685 | `NamedValue` |
-| `DictLiteralNode`, `DictEntryNode` | 114 | `DictLiteral(List[DictEntry])`, `DictEntry` |
-| `IntoOpaqueNode`, `FromOpaqueNode` | 1,186 | `OpaqueConversion(OpaqueDirection, WrittenType, Expression)` |
-| `BlockNode` | 77,521 | `Block` (in `Body`, `CaseBody`, `ElseBody` and the block fields); never an expression |
-| `IfNode` | 10,821 | `If(IfExpression)`; an `else if` is `ElseIf(ElseIfExpression)` |
-| `MatchNode`, `MatchCaseNode` | 51,337 | `Match(Expression, List[MatchCase])`, `MatchCase` |
-| `SelectNode`, `SelectReceiveArmNode`, `SelectSealedArmNode`, `SelectAfterArmNode` | not in the self-compile | `Select(List[SelectArm])`, `SelectArmKind` |
-| `WithNode`, `WithBindingNode`, `WithTryBindingNode`, `WithErrorMapNode` | 42 | `With(WithExpression)`, `WithBinding`, `WithTryBinding`, `ErrorMap` |
-| `DebugBlockNode` | 89 | `DebugBlock(Block)` |
-| `LambdaNode`, `PureLambdaNode`, `LambdaParameterNode` | 3,927 | `Lambda(LambdaExpression)` with `purity`; `LambdaParameter` |
-| `LocalFunctionNode` | (in `LocalFunctionDefinition`) | `LocalFunctionStatement(LocalFunction)`, inline, with its `DefinitionId` |
-| `WhileNode` | 698 | `WhileLoop(WhileStatement)` |
-| `ForNode`, `LoopBinderNode`, `TupleLoopBinderNode` | 6,135 | `ForLoop(ForStatement)`, `LoopBinder` |
-| `ConcurrentForNode`, `ConcurrentBlockNode`, `ConcurrentParameterNode` | not in the self-compile | `ConcurrentForLoop`, `ConcurrentBlock`, `CountParameter` / `TimeoutParameter` |
-| `BreakNode`, `ContinueNode` | 884+ | `Break`, `Continue` |
-| `VoidNode` | 1,677 | `VoidValue` |
-| `BuiltinNode`, `NamedBuiltinNode` | 542+ | `CompilerBuiltin(Option[String])` |
-| `MissingExpressionNode`, `MissingPatternNode`, `MissingTypeNode` | 0 in accepted modules | none: a module with a syntax error has no tree (3.17) |
-| `VarDeclarationNode` | 6,506 | `VariableDeclaration(VariableStatement)` |
-| `TypedBindingNode` | 9,287 | `TypedBinding(TypedBindingStatement)` |
-| `AssignmentNode` as a statement | 13,983 | `Assignment(AssignmentStatement)` |
-| `AssignmentNode` anywhere else (a list element, a call argument such as `print(ys[0] = 3)`, a condition) | not counted | rejected: assignment is a statement only |
-| `QuestionBindNode` | 4,766 | `QuestionBinding(QuestionBindingStatement)` |
-| `AddAssignNode` ... `DivideAssignNode` | 1,893 | `CompoundAssignment(...)`; `_ += v` rejected by M-1 |
-| `SubscriptAssignmentNode` | 5 | `SubscriptAssignment(SubscriptAssignmentStatement)` |
-| `TupleDestructureNode`, `DestructureBinderNode` | 218 | `TupleDestructure(...)`, `BindingTarget` |
-| `WildcardPatternNode` | 17,713 | `WildcardPattern` |
-| `NamePatternNode` | 53,435 | `NamePattern(NameUse)` |
-| `IntegerPatternNode`, `NegativeIntegerPatternNode`, `FloatPatternNode`, `NegativeFloatPatternNode` | 144+ | `IntegerPattern(Sign, Int128)`, `FloatPattern(Sign, DecimalFloat)` |
-| `StringPatternNode`, `RawStringPatternNode`, `PipeStringPatternNode`, `RawPipeStringPatternNode` | 1,491+ | `StringPattern(StringForm, String)` |
-| `CharPatternNode`, `TruePatternNode`, `FalsePatternNode` | 260 | `CharacterPattern(Char)`, `BooleanPattern(Bool)` |
-| `ConstructorPatternNode` | 26,608 | `ConstructorPattern(NameUse, List[Pattern])` |
-| `QualifiedConstructorPatternNode`, `PatternQualifierNode` | 412 | `QualifiedConstructorPattern(NameUse, NameUse, List[Pattern])` |
-| `TuplePatternNode`, `ListPatternNode` | 1,833 | `TuplePattern(SmallTuple[...])`, `ListPattern` |
-| `ListSpreadNameNode`, `ListSpreadWildcardNode` | 187 | `ListSpread` with `BindingTarget` |
-| `OrPatternNode` | 781 | `AlternativePatterns(AtLeastTwo[Pattern])` |
-| `NamedTypeNode` | 104,774 | `NamedType(NameUse, List[TypeArgument])`; `()` is `VoidType` |
-| `QualifiedTypeNode`, `TypeQualifierNode` | 252 | `QualifiedType(NameUse, NameUse, List[TypeArgument])` |
-| `BoundedTypeNode` | 54 | `BoundedArgument(BoundedTypeArgument)` inside an `implements` receiver's arguments; rejected by M-1 in every other type |
-| `TypeBoundNode`, `QualifiedTypeBoundNode` | 54 | `TraitReference` |
-| `DimensionNameTypeNode`, `VariadicDimensionNameTypeNode` | 357 | `NamedDimension(NameUse)`, `VariadicNamedDimension(NameUse)` |
-| `DimensionWildcardTypeNode`, `VariadicDimensionWildcardTypeNode` | 8 | `WildcardDimension`, `VariadicWildcardDimension` |
-| `DimensionLiteralTypeNode` | 3 | `LiteralDimension(Int128)` |
-| `DimensionAddTypeNode` ... `DimensionDivideTypeNode` | 3 | `DimensionArithmetic(DimensionOperator, ...)` |
-| A dimension in a type position (`rows: #N`, `-> #M`, `x: #3`) | not counted | `DimensionType(Dimension)` |
-| `RangeTypeNode` | 23 | `RangeType(Dimension)` |
-| `TupleTypeNode` | 567 | `TupleType(SmallTuple[TypeArgument])` |
-| `FunctionTypeNode`, `PureFunctionTypeNode` | 539 | `FunctionType(Purity, List[TypeArgument], WrittenType)` |
-| `ArrayTypeNode` | 174 | `ArrayType(WrittenType, AtLeastOne[Dimension])` |
+| Today's node kind(s) | New home |
+| --- | --- |
+| `IdentifierNode` | `NameReference(NameUse)` |
+| `IntegerLiteralNode`, `FloatLiteralNode` | `IntegerLiteral(Int128)`, `FloatLiteral(DecimalFloat)` |
+| `StringLiteralNode`, `RawStringLiteralNode`, `PipeStringLiteralNode`, `RawPipeStringLiteralNode` | `StringLiteral(StringForm, String)` |
+| `InterpolatedStringNode`, `InterpolatedPipeStringNode` | `InterpolatedString(InterpolationForm, List[InterpolationPiece])` |
+| `InterpolationTextNode` | `InterpolationText(String)` |
+| `InterpolationHoleNode` | `InterpolationHole(Hole)` |
+| `TrueLiteralNode`, `FalseLiteralNode` | `BooleanLiteral(Bool)` |
+| `CharLiteralNode` | `CharacterLiteral(Char)` |
+| `NegateNode`, `NotNode` | `Unary(UnaryOperator, Expression)` |
+| `DetachNode` | `Detach(Expression)` |
+| `AddNode` ... `GreaterEqualNode` (11 kinds) | `Binary(BinaryOperator, ...)` |
+| `AndNode`, `OrNode` | `ShortCircuit(LogicalOperator, ...)` |
+| `RangeNode` | `RangeExpression(Expression, Expression)` |
+| `CallNode` | `Call(Expression, List[Expression])` |
+| `FieldAccessNode` | `FieldAccess(Expression, NameUse)` |
+| `SubscriptNode` | `Subscript(Expression, AtLeastOne[Expression])` |
+| `ListLiteralNode`, `TupleNode`, `VectorLiteralNode` | `ListLiteral`, `TupleLiteral(SmallTuple[...])`, `VectorLiteral` |
+| `RecordLiteralNode`, `RecordUpdateNode` | `RecordLiteral(List[NamedValue])`, `RecordUpdate(Expression, List[NamedValue])` |
+| `RecordFieldNode` | `NamedValue` |
+| `DictLiteralNode`, `DictEntryNode` | `DictLiteral(List[DictEntry])`, `DictEntry` |
+| `IntoOpaqueNode`, `FromOpaqueNode` | `OpaqueConversion(OpaqueDirection, WrittenType, Expression)` |
+| `BlockNode` | `Block` (in `Body`, `CaseBody`, `ElseBody` and the block fields); never an expression |
+| `IfNode` | `If(IfExpression)`; an `else if` is `ElseIf(ElseIfExpression)` |
+| `MatchNode`, `MatchCaseNode` | `Match(Expression, List[MatchCase])`, `MatchCase` |
+| `SelectNode`, `SelectReceiveArmNode`, `SelectSealedArmNode`, `SelectAfterArmNode` | `Select(List[SelectArm])`, `SelectArmKind` |
+| `WithNode`, `WithBindingNode`, `WithTryBindingNode`, `WithErrorMapNode` | `With(WithExpression)`, `WithBinding`, `WithTryBinding`, `ErrorMap` |
+| `DebugBlockNode` | `DebugBlock(Block)` |
+| `LambdaNode`, `PureLambdaNode`, `LambdaParameterNode` | `Lambda(LambdaExpression)` with `purity`; `LambdaParameter` |
+| `LocalFunctionNode` | `LocalFunctionStatement(LocalFunction)`, inline, with its `DefinitionId` |
+| `WhileNode` | `WhileLoop(WhileStatement)` |
+| `ForNode`, `LoopBinderNode`, `TupleLoopBinderNode` | `ForLoop(ForStatement)`, `LoopBinder` |
+| `ConcurrentForNode`, `ConcurrentBlockNode`, `ConcurrentParameterNode` | `ConcurrentForLoop`, `ConcurrentBlock`, `CountParameter` / `TimeoutParameter` |
+| `BreakNode`, `ContinueNode` | `Break`, `Continue` |
+| `VoidNode` | `VoidValue` |
+| `BuiltinNode`, `NamedBuiltinNode` | `CompilerBuiltin(Option[String])` |
+| `MissingExpressionNode`, `MissingPatternNode`, `MissingTypeNode` | none: a module with a syntax error has no tree (3.17) |
+| `VarDeclarationNode` | `VariableDeclaration(VariableStatement)` |
+| `TypedBindingNode` | `TypedBinding(TypedBindingStatement)` |
+| `AssignmentNode` as a statement | `Assignment(AssignmentStatement)` |
+| `AssignmentNode` anywhere else (a list element, a call argument such as `print(ys[0] = 3)`, a condition) | rejected: assignment is a statement only |
+| `QuestionBindNode` | `QuestionBinding(QuestionBindingStatement)` |
+| `AddAssignNode` ... `DivideAssignNode` | `CompoundAssignment(...)`; `_ += v` rejected by M-1 |
+| `SubscriptAssignmentNode` | `SubscriptAssignment(SubscriptAssignmentStatement)` |
+| `TupleDestructureNode`, `DestructureBinderNode` | `TupleDestructure(...)`, `BindingTarget` |
+| `WildcardPatternNode` | `WildcardPattern` |
+| `NamePatternNode` | `NamePattern(NameUse)` |
+| `IntegerPatternNode`, `NegativeIntegerPatternNode`, `FloatPatternNode`, `NegativeFloatPatternNode` | `IntegerPattern(Sign, Int128)`, `FloatPattern(Sign, DecimalFloat)` |
+| `StringPatternNode`, `RawStringPatternNode`, `PipeStringPatternNode`, `RawPipeStringPatternNode` | `StringPattern(StringForm, String)` |
+| `CharPatternNode`, `TruePatternNode`, `FalsePatternNode` | `CharacterPattern(Char)`, `BooleanPattern(Bool)` |
+| `ConstructorPatternNode` | `ConstructorPattern(NameUse, List[Pattern])` |
+| `QualifiedConstructorPatternNode`, `PatternQualifierNode` | `QualifiedConstructorPattern(NameUse, NameUse, List[Pattern])` |
+| `TuplePatternNode`, `ListPatternNode` | `TuplePattern(SmallTuple[...])`, `ListPattern` |
+| `ListSpreadNameNode`, `ListSpreadWildcardNode` | `ListSpread` with `BindingTarget` |
+| `OrPatternNode` | `AlternativePatterns(AtLeastTwo[Pattern])` |
+| `NamedTypeNode` | `NamedType(NameUse, List[TypeArgument])`; `()` is `VoidType` |
+| `QualifiedTypeNode`, `TypeQualifierNode` | `QualifiedType(NameUse, NameUse, List[TypeArgument])` |
+| `BoundedTypeNode` | `BoundedArgument(BoundedTypeArgument)` inside an `implements` receiver's arguments; rejected by M-1 in every other type |
+| `TypeBoundNode`, `QualifiedTypeBoundNode` | `TraitReference` |
+| `DimensionNameTypeNode`, `VariadicDimensionNameTypeNode` | `NamedDimension(NameUse)`, `VariadicNamedDimension(NameUse)` |
+| `DimensionWildcardTypeNode`, `VariadicDimensionWildcardTypeNode` | `WildcardDimension`, `VariadicWildcardDimension` |
+| `DimensionLiteralTypeNode` | `LiteralDimension(Int128)` |
+| `DimensionAddTypeNode` ... `DimensionDivideTypeNode` | `DimensionArithmetic(DimensionOperator, ...)` |
+| A dimension in a type position (`rows: #N`, `-> #M`, `x: #3`) | `DimensionType(Dimension)` |
+| `RangeTypeNode` | `RangeType(Dimension)` |
+| `TupleTypeNode` | `TupleType(SmallTuple[TypeArgument])` |
+| `FunctionTypeNode`, `PureFunctionTypeNode` | `FunctionType(Purity, List[TypeArgument], WrittenType)` |
+| `ArrayTypeNode` | `ArrayType(WrittenType, AtLeastOne[Dimension])` |
 
 The rows and side tables go as follows:
 
@@ -2546,32 +2388,13 @@ The rows and side tables go as follows:
 
 ### 4.1 Decision: the trees are the output
 
-The question was whether bodies stay a node table in the output, or the typed
-trees are the output. **The trees are the output, held by the module records
-that the link step builds.** There is no flatten step.
-
-1. **Every consumer walks.**
-   - Resolution walks bodies in scope order. Its design already needed an
-     explicit step stack and `child_at(row, n)` per kind.
-   - Typecheck walks bodies in evaluation order, and Core lowering walks
-     them again.
-   - The legacy adapter rebuilds a tree from the table with 25 derived owner
-     indexes.
-
-   A node table serves a reader that scans all rows without structure. None
-   of discovery's readers is that reader.
-2. **Facts are keyed by id, not stored in nodes.** Later stages write their
-   facts into their own columns, keyed by the ids discovery stamped.
-   Discovery's output stays immutable and shared, and no stage copies it.
-   OCaml's `Typedtree` copies the tree per phase; this design does not.
-   This is the half of "tables" that pays: columns keyed by identity.
-3. **The illegal states are in the readers too.** `NodeArityMismatch`,
-   `PayloadOutOfRange` and "child 2 when written" are checks every reader of
-   a node table depends on. A typed tree cannot express them.
-4. **A flat table could still be derived.** If a measured workload ever needs
-   flat rows (a whole-program scan), one walk can build them from the trees,
-   documented as derived. Nothing here prevents that, and nothing needs it
-   now.
+The module records hold typed trees; link does not flatten them. Resolution
+walks scope order, typecheck evaluation order and Core lowering the same
+structure again. A node table would make all these readers decode structure,
+as the current adapter does. Facts remain separate columns keyed by identity,
+so immutable syntax can be shared across phases rather than copied.
+If a measured whole-program scan later benefits from flat rows, derive them
+in one walk; there is no current consumer requiring that representation.
 
 ### 4.2 The output types
 
@@ -2783,7 +2606,8 @@ eleven `program_*_index` functions. `find_name` is a search that may miss.
 - the driver prints `internal compiler error: ...` and exits nonzero, in
   debug and release builds alike.
 
-`Option[Int]` is unboxed (Appendix B), so the indexes cost a branch, not an
+The historical [allocation probes](../benchmarks/results/discovery_redesign_probes_2026-10-01.md)
+found `Option[Int]` unboxed, so the indexes cost a branch, not an
 allocation. The `UNREACHABLE_*` constants and every fallback row are gone.
 L1 in section 7 is the language work that would make these reads total.
 
@@ -3070,8 +2894,7 @@ legacy adapter path. The old `BLORP_FRONT_END` switch and its
 `ExistingDiscovery` arm have already been removed. M5's comparison is an
 internal test-only choice between the stage's table and tree paths; it must
 not restore a public front-end switch. The adapter may later split into a
-folder if it grows past one readable module. After the tree rewrite its
-expected size is 1,500 to 2,000 lines.
+folder if needed for readable ownership boundaries.
 
 **Layout rules**, enforced by `scripts/check-blorp-layout` and
 `blorp/source_ownership.json`:
@@ -3085,15 +2908,14 @@ expected size is 1,500 to 2,000 lines.
 
 ### 6.2 How it changes
 
-Today the adapter is 4,019 lines. Most of it does three things:
+The current adapter's table reconstruction does three things:
 
 - builds a `DeclarationReader` of 25 derived owner indexes, to find each
   declaration's members, bounds, payloads and bodies again;
 - walks a module's post-order node block by position, keeping each node's
   rebuilt value in a slot, with `NotYetBuilt` and `MalformedNode` for
   children of the wrong kind or count;
-- propagates a `Result` through every row read: 139 sites of
-  `MissingTableRow`, `MalformedNode`, `NotYetBuilt` or `Result[`.
+- propagates checked row/shape failures through `Result`.
 
 Over trees it is a structural map. Each typed form has one target form, and
 the old AST is close in shape (`ParsedExpr`, `ParsedPattern`,
@@ -3204,51 +3026,29 @@ oracle while its other users still need it. The proofs:
 
 ## 7. Measured cost and open budget
 
-The 2026-10-01 baselines used the table stage on the self-compile input
-(`blorp/src/main.brp`, 449 modules), at `-O2`. They are historical controls,
-not a matched baseline for a candidate built from this revision.
+Use the [Worker Checklist](WORKER_CHECKLIST.md) and
+[measurement protocol](../benchmarks/README.md#self-compile-measurement-protocol).
+The workload is the reachable self-compile graph from `blorp/src/main.brp`,
+including implicit modules. Compare stage-only, stage plus adapter/graph and
+whole-compiler boundaries separately, with matching source/binary provenance.
+Historical reports are not matched controls for today's compiler.
 
-| Boundary | Allocations | Instructions | Peak RSS |
-| --- | ---: | ---: | ---: |
-| Stage, cost tool `tables` | 0.578 M | 4.20 G | 131.5 MB |
-| Stage plus adapter, `graph` | 7.65 M | 9.17 G | 324.6 MB |
-| Whole self-compile, stage-2 `-O2` | 211.4 M | 405.3 G | 2.15 GB |
+### 7.1 What M0 established
 
-The original shape probes and node census are in
-[`discovery_redesign_probes_2026-10-01.md`](../benchmarks/results/discovery_redesign_probes_2026-10-01.md)
-and Appendices A and B. M0 then built a throwaway parser for all 13,105
-function bodies in that input. Its measured source, coverage, counters and
-limitations are in
-[`discovery_redesign_m0_2026-10-02.md`](../benchmarks/results/discovery_redesign_m0_2026-10-02.md).
-That prototype used `struct` for `WrittenName`, `NameUse`, `Binder` and other
-small values. It did not build the declaration parser, link step or tree
-adapter, and it used a different compiler baseline. It is evidence about
-cost mechanisms, not a performance prediction for the record-based design
-in section 3 or for today's compiler.
+The [initial census/probes](../benchmarks/results/discovery_redesign_probes_2026-10-01.md)
+and [M0 report](../benchmarks/results/discovery_redesign_m0_2026-10-02.md)
+retain exact sources, counters, commands, coverage and limitations.
+M0 built a throwaway body parser, without declaration parsing, link or tree
+adapter. It disproved the original cheap-allocation estimates: retained
+variant lifecycles and transient state/tuple handoffs dominated cost, and
+body parsing alone exceeded the instruction ceiling on its historical
+compiler. It also increased stage-local memory.
 
-### 7.1 What M0 measured
-
-| Same-body boundary | Allocations | Retired instructions |
-| --- | ---: | ---: |
-| Existing table parser | 6,623 | 0.939 G |
-| M0 tree parser | 11,383,762 | 6.801 G |
-
-M0 found 2.32 M retained tree objects (131.8 MB) and about 9.1 M transient
-state and tuple allocations. The tree stage's own peak was estimated at
-about 207 MB against 122.7 MB for the then-current table parser, an 84 MB
-increase. The 5.9 G instruction difference for body parsing alone was
-+1.45% of that revision's 405.3 G whole self-compile, before any adapter
-saving. M0 did not measure a completed tree front end or a whole-compiler
-candidate against the flip ceiling.
-
-The old section 7 estimates that priced an allocation at 60 to 80
-instructions and predicted a 4.6 to 5.6 G tree stage were disproved.
-M0 observed roughly 510 instructions for one retained variant box's
-lifecycle and 600 per allocation over the body parse. Its exact retained
-census included 0.46 M boxes for the proposed name and binder values when
-they were `struct` payloads. Ordinary `record` values change that shape,
-so no allocation or instruction total for the section 3 design is claimed
-from M0's totals.
+M0's `struct` name/binder payloads differ from the ordinary-record schema
+here. Its totals are mechanism evidence, not a prediction of the completed
+design or a whole-compiler candidate. Record-shaped construction, actual
+tuple increments, complete link/adapter savings and whole-compiler lifetimes
+must be measured before M6.
 
 ### 7.2 Costs to measure as the design lands
 
@@ -3256,9 +3056,9 @@ from M0's totals.
 | --- | --- |
 | Syntax values | M1's proposed `record` names, binders, counts, annotations and forms need representative construction and return probes. Keep the role and id contract; measure its cost rather than reverting to `struct` to match M0. |
 | Tokens | M2 compares the provisional scalar `fixed record Token` with an ordinary `record` on the same token corpus, including retained bytes and instructions. Keep an inline token only while it is an explicit, measured storage exception under the record simplification plan. |
-| Parser hand-off | M0 attributed about 9.1 M allocations to transient state, tuples and other parse work. Its experimental tuple hand-off compiler reduced the body parse by 1.50 M allocations and 0.80 G instructions, but was not the current incremental implementation. Re-measure after the actual tuple increments. |
+| Parser hand-off | M0 attributed substantial cost to transient state/tuple work. Its experimental tuple compiler was not the incremental implementation. Re-measure after the actual tuple increments; the report retains the historical comparison. |
 | Link and removed tables | Deleting freeze, openings, side tables, sigil interning and owner searches may save work; M0 did not measure these deletions or the new link. Measure the complete stage at M5. |
-| Tree adapter | M0 did not build it. Measure the structural adapter at M5 instead of carrying forward the old 6.5 M allocation or 3.0 to 3.7 G instruction estimates. |
+| Tree adapter | M0 did not build it. Measure the structural adapter at M5; do not carry forward the disproved estimates. |
 | Whole compiler | M5 and M6 use matched stage-2 `-O2` compilers on identical frozen inputs, with output identity and phase-local counters. Earlier stage-only or cross-compiler figures are not acceptance evidence. |
 
 The tree program should be released after the adapter builds the old AST.
@@ -3313,12 +3113,9 @@ ends. The old parser still serves `compile --ast`, test discovery, the LSP
 and parity checks, as [`DISCOVERY_ACCEPTANCE_ROADMAP.md`](DISCOVERY_ACCEPTANCE_ROADMAP.md)
 records.
 
-**Completed prerequisites:** `=` in expression positions is a parse error
-in both parsers (`d460bac5f`). M-1's remaining syntax restrictions and
-teaching messages landed in `020b95d90`. M0's throwaway parser and cost
-report are retained in
-[`discovery_redesign_m0_2026-10-02.md`](../benchmarks/results/discovery_redesign_m0_2026-10-02.md);
-the prototype is not the M1 implementation.
+The schema assumes the current syntax rules described above. No prerequisite
+language migration remains in this plan; the import-cycle check is still
+required at M1. The M0 prototype is evidence only.
 
 | # | Change | Proof | Deleted |
 | --- | --- | --- | --- |
@@ -3332,7 +3129,6 @@ the prototype is not the M1 implementation.
 
 Ordering and parallelism:
 
-- The `=` and M-1 language prerequisites have landed.
 - M1 begins by verifying the opaque-type import-cycle repro on its own base.
 - M1 and M2 are independent of each other.
 - M3 needs M1 and M2, M4 needs M3, and M5 needs M4.
@@ -3341,98 +3137,24 @@ Ordering and parallelism:
 Syntax stays frozen from M1 through M4, so the differential compares against
 a fixed target.
 
-## 9. Remaining disagreements
+## 9. Open decisions
 
-**D1. Floats keep their decimal digits (section 5.2).** The alternative is a
-`Float` that has passed the overflow check. This design stores an opaque
-`DecimalFloat` that only the lexer makes, after the same check, because a
-stored 64-bit `Float` would round a `Float32` literal twice. The lexer checks
-finiteness as a 64-bit `Float`; a literal that is finite there but overflows
-`Float32` is still rejected by typecheck, which knows the width.
-*Recommendation:* accept `DecimalFloat`. Its opaque type gives the "checked,
-not re-validated" guarantee, without double rounding.
+These recommendations are not acceptance decisions yet; sections 3–6 use
+the proposed forms so their consequences can be reviewed.
 
-**D2. The flip ceiling** is decided (sections 7.3 and 10): +1.0% instructions, +5%
-peak RSS, and +1.0% wall time on the median of at least 5 interleaved runs,
-which keeps the measurement outside the about 0.8% pairing noise of a median
-of 3 back to back.
+- **D1. Decimal floats (5.2).** Recommend opaque `DecimalFloat` over a
+  checked 64-bit `Float`: converting decimal directly to the selected width
+  avoids double rounding for `Float32`. Lexing checks 64-bit finiteness;
+  typecheck still rejects values overflowing the selected narrower width.
+- **D3. Type-decided names (3.2, E8).** Recommend one `NameUse` family for
+  record fields and dotted members, rather than a separate member family.
+  `m.f` may be scope-decided and `x.f` type-decided; one ID per use keeps
+  resolution's outcome discipline uniform.
+- **D4. Legacy sigil order (6.2).** Recommend accepting normalized C identity
+  if reordered `#N` names affect only ID-derived output names, rather than
+  remembering legacy interleaving in discovery.
 
-**D3. Names decided by type are `NameUse`s.** Record
-field names and the member after a dot get a `NameUseId`, and resolution
-records "decided by type" for them. The alternative was a separate
-member-name family that resolution never sees. *Recommendation:* one
-family, because a dotted member is sometimes resolution's (`m.f`) and
-sometimes typecheck's (`x.f`), and one id per written name keeps "one outcome
-per use" uniform.
-
-**D4. The `#N` order in the legacy name table** may change id-derived names
-in the generated C (section 6.2). *Recommendation:* accept a normalized C
-comparison if it does, rather than carrying legacy order in the stage.
-
-## 10. Decisions taken
-
-| Topic | Decision | Applied in |
-| --- | --- | --- |
-| Recovery | A module with a syntax error has no tree; discovery reports its diagnostics. The simplest output: a program, or a failure report. Not designed around today's LSP. | 2.3, 2.4, 3.17, 4.2, E1 |
-| Ids | Packed (module, local) ids; a program-wide id is the module's base plus the local id. Ids are managed exclusively behind the opaque boundary. | 3.3, 3.15, 3.16, 4.4 |
-| Names | Interned per module | 3.2, 5.1 |
-| Declare-or-refer names | `x = v` and name patterns stay `NameUse`s that resolution decides; resolution stores binding form and mutability itself | 3.12, E5 |
-| Forms only typecheck rejected | Both parsers reject them; assignment-as-statement landed in `d460bac5f`, and M-1 landed in `020b95d90`. | 3.9, 3.11, 3.12, 3.19, 8 |
-| Product spelling | Ordinary `record` is the syntax-value target. `struct` and `fixed record` are temporary source forms represented by `ValueRecordSpelling` until the record simplification sequence removes their separate semantics. A scalar token may temporarily use `fixed record` only with a measured storage reason. | 2.3, 3.4, 3.7, 7.2, M2, M3 |
-| Flip timing | The stage switches from tables to trees only within +1% retired instructions, +5% peak RSS and +1% wall time. M6 waits on tuple increments 1 to 4, and increment 5 if re-measured M0 still needs it; record-shaped costs are measured again. M1 to M5 do not wait. | 0, 7.3, 8 |
-| Glue location | `compiler/discovery_front_end.brp` and `compiler/discovery_adapter.brp`, the only compiler modules importing `compiler_new`; rewritten in place over trees, deleted when typecheck reads trees directly | 6.1, M6 |
-| Literals | Discovery does not intern literal texts (the backend pools strings); the tree stores checked values | 5.2 |
-| Downstream reads | Typecheck and Core lowering reads come later; E1 to E21 cover resolution | 1, 4.7 |
-
-## Appendix A. Node census
-
-Taken at `519e7311c` with the census tool in the probes record over
-`discover(blorp/src/main.brp)` with the compiler's implicit modules:
-
-- 449 modules; 32,098 definitions; 35,443 parameters; 902 type parameters
-- 954,978 nodes; 874,344 child edges; 162,465 name-span rows
-
-Nodes by kind, largest first:
-
-| Kind | Count | Kind | Count | Kind | Count |
-| --- | ---: | --- | ---: | --- | ---: |
-| `IdentifierNode` | 282,208 | `NamedTypeNode` | 104,774 | `CallNode` | 97,175 |
-| `BlockNode` | 77,521 | `FieldAccessNode` | 59,010 | `NamePatternNode` | 53,435 |
-| `MatchCaseNode` | 40,127 | `ConstructorPatternNode` | 26,608 | `StringLiteralNode` | 24,638 |
-| `RecordFieldNode` | 19,685 | `WildcardPatternNode` | 17,713 | `AssignmentNode` | 13,983 |
-| `MatchNode` | 11,210 | `IfNode` | 10,821 | `IntegerLiteralNode` | 10,306 |
-| `AddNode` | 9,308 | `TypedBindingNode` | 9,287 | `ListLiteralNode` | 6,699 |
-| `FalseLiteralNode` | 6,527 | `VarDeclarationNode` | 6,506 | `EqualNode` | 5,889 |
-| `RecordLiteralNode` | 5,575 | `QuestionBindNode` | 4,766 | `AndNode` | 3,781 |
-| `TrueLiteralNode` | 3,267 | `TupleNode` | 3,216 | `LoopBinderNode` | 3,070 |
-| `ForNode` | 3,032 | `OrNode` | 2,403 | `InterpolationTextNode` | 2,181 |
-| `LambdaParameterNode` | 1,986 | `RecordUpdateNode` | 1,939 | `NotNode` | 1,850 |
-| `AddAssignNode` | 1,731 | `InterpolationHoleNode` | 1,705 | `VoidNode` | 1,677 |
-| `LambdaNode` | 1,622 | `StringPatternNode` | 1,491 | `TuplePatternNode` | 965 |
-
-Every other kind has fewer than 1,000 nodes. The select, concurrency and
-dictionary forms are rare or absent on this input; the corpus run of the
-differential covers them.
-
-## Appendix B. Allocation probes
-
-Run with `bin/blorp run --release --no-format --memory-stats` at
-`519e7311c`, 10,000 values each, kept in a list. The programs and the census
-tool are in
-[`benchmarks/results/discovery_redesign_probes_2026-10-01.md`](../benchmarks/results/discovery_redesign_probes_2026-10-01.md);
-they are not committed as tests, because no gate would run them.
-
-| Probe | Allocations per value |
-| --- | ---: |
-| payload-free variant | 0.0013 (list growth only) |
-| variant `Name(Int, Int, Int)` | 1 |
-| variant `Spotted(Spot, Int)`, `Spot` a struct | 2 |
-| variant `Call(CallParts)`, a record with an empty list and a 1-allocation child | 3 |
-| variant `Call(CallParts)` with a two-element list of payload-free leaves | 3 |
-| variant `Pair(Node, Node, Int, Int)` of payload-free leaves | 1 |
-| record holding `Some(Int)` / `None` | 1 / 1 (the record only) |
-| variant `WithOptional(Some(existing node), Int)` / `None` | 1 / 1 |
-| variant with `Some(new record)` | 2 |
-| `(state, leaf)` returned and destructured, leaf a 2-field record | 4 (leaf 1, overhead 3) |
-| the same, two nested calls, one leaf kept | 9 |
-| `(state, value)` where `state` holds a growing `List[Int]` | 3 per call, linear (no copy of the list per call: 200,000 calls finish without quadratic time) |
+The M6 ceiling is decided and stays in section 7.3. Recovery, opaque minting,
+per-module interning, tree output, ordinary-record syntax values, glue
+ownership and resolution's binding responsibility are the proposal's settled
+contracts in their owning sections, not a second decision inventory.

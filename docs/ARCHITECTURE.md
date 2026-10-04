@@ -274,7 +274,8 @@ requires a specific Core consumer; it is not a general escape hatch for
 retaining the typed graph.
 
 Remaining typechecking decomposition is tracked in
-[COMPILER_PRIORITIES.md](COMPILER_PRIORITIES.md). Production behavior belongs
+[the module-environment issue](issues/module-environment-preparation-rebuilds-state.md)
+and [Identity And Tables](IDENTITY_ROADMAP.md#frontend-facts). Production behavior belongs
 here only after a phase product becomes authoritative.
 
 ## Compile-Time Evaluation
@@ -453,6 +454,20 @@ The ownership sequence is deliberately split:
 
 The normative ABI is [OWNERSHIP_MODEL.md](OWNERSHIP_MODEL.md). The user-facing
 model is [MEMORY_MODEL.md](MEMORY_MODEL.md).
+
+## Allocation Reports
+
+`compile --explain-allocations[=human|json]` analyzes final prepared Core without
+emitting C. It rejects `-o`, AST dump modes, and `--stop-after`. The versioned
+JSON and human reports distinguish known allocation from unknown coverage and
+include transitive call and cleanup effects; an unsupported operation is not
+evidence of safety. The owning modules are `stage_09_core/allocation_analysis.brp`,
+`allocation_contracts.brp`, and `allocation_report.brp`.
+
+This is an explanation tool, not a language-level allocation guarantee.
+Backend helper coverage is incomplete, and `no_alloc` syntax and enforcement
+are not implemented. [Allocation Contracts](ALLOCATION_CONTRACT_ROADMAP.md)
+owns that remaining work and the fail-closed proof requirements.
 
 ## Backend
 

@@ -6,10 +6,12 @@ default front end. A legacy adapter, `legacy_frontend_graph` in
 input from the stage's tables, and the self-compile emits the same C as the
 old front end. The design lives in
 [`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) and
-[`DISCOVERY_REDESIGN.md`](DISCOVERY_REDESIGN.md); the acceptance measurements
-are in `benchmarks/results/discovery_adapter_declarations_2026-10-01.md`,
-`discovery_adapter_bodies_2026-10-01.md` and
-`discovery_stage_switched_on_2026-10-01.md`. This document holds only what is
+[`DISCOVERY_REDESIGN.md`](DISCOVERY_REDESIGN.md) (an unimplemented tree proposal).
+Historical acceptance evidence lives in the
+[declaration](../benchmarks/results/discovery_adapter_declarations_2026-10-01.md),
+[body](../benchmarks/results/discovery_adapter_bodies_2026-10-01.md) and
+[default-stage](../benchmarks/results/discovery_stage_switched_on_2026-10-01.md)
+reports. This document holds only what is
 still open: removing the old front end, hardening the comparison, and the
 adapter's shrinkage. There is no front-end switch: the seam in
 `lib/source_graph.brp` always runs the stage and the adapter.
@@ -82,13 +84,9 @@ These hold until the old path is removed.
 
 ## Removing the old front end
 
-Done: the switch (`BLORP_FRONT_END`, `FrontEnd`, `FrontEndSelection`), the
-`ExistingDiscovery` arm of the seam and the functions only it reached, and the
-`front-end-existing` gate with its `scripts/test` and `scripts/premerge-gate`
-entries and the `existing` comparisons in `test_cli.sh` and `test_package.sh`.
-
 The old lexer, parser and module loader (`stage_02_lex`, `stage_03_parse`,
-`stage_04_modules`) remain only for these users:
+`stage_04_modules`) remain for these consumers. Retire each dependency before
+deleting its owner; this work does not require the typed-tree redesign:
 
 - `compile --ast` (`compiler/command.brp`);
 - `blorp test` discovery, doctest extraction and the test plan
@@ -96,8 +94,9 @@ The old lexer, parser and module loader (`stage_02_lex`, `stage_03_parse`,
   generated harness root in `lib/source_graph.brp`;
 - the formatter (`blorp/src/format`), which keeps its own parser because it
   needs the comments the stage drops;
-- the LSP, which calls the old discovery directly (`lsp/analysis/diagnostic.brp`,
-  `lsp/analysis/frontend_graph.brp` through `frontend_graph_discover`);
+- the LSP, which calls old discovery directly (`lsp/analysis/diagnostic.brp`,
+  `lsp/analysis/frontend_graph.brp` through `frontend_graph_discover`); its
+  replacement needs an in-memory provider for unsaved buffers;
 - the finalizer (`source_ast_finalize.brp`) and the typecheck bridge fallback
   (`stage_06_typecheck/bridge.brp`).
 
@@ -106,11 +105,8 @@ two-parser rule end with them. `GRAMMAR.md` and the GUIDE already record the
 grammar the stage implements, including its deliberate differences (for example
 `# N` with a space is rejected).
 
-## Open decision
-
-- **The other users of the old front end.** The LSP moves to the stage with
-  an in-memory provider for unsaved buffers, off its direct calls to the old
-  discovery. Test discovery and doctest generation move off the old parser too
-  (`test/discovery.brp`, `test/doctest.brp`). `lint` already runs the stage
-  through the legacy adapter; it reads the rebuilt typechecked graph until
-  typecheck consumes the tables directly.
+The formatter needs a separate decision about lossless syntax or trivia:
+the discovery stage drops comments. `lint` already uses the stage through
+the adapter and reads the rebuilt typechecked graph until typecheck consumes
+discovery directly. Adapter retirement and old-parser retirement are separate
+dependencies; neither requires waiting for the other by default.

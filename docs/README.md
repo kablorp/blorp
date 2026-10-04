@@ -1,9 +1,8 @@
 # Blorp Documentation
 
-The references below describe the current language, toolchain, and
-implementation. The priorities map, the plans and the open issues describe
-future work and hold only what is still open. Completed implementation history
-belongs in Git history and benchmark results, not in maintained docs.
+Start with the reference for your task. References describe current behavior;
+plans describe proposed changes and remaining work, not available features.
+Completed work belongs in Git history and benchmark results.
 
 ## Learn The Language
 
@@ -34,6 +33,8 @@ module inventory lives in
 
 - [Compiler Architecture](ARCHITECTURE.md) defines phase ownership, pipeline
   order, and backend boundaries.
+- [Discovery Tables](DISCOVERY_TABLES_DESIGN.md) defines the current front-end
+  output, identities, spans, validation, and legacy adapter boundary.
 - [Memory Model](MEMORY_MODEL.md) explains source-level value semantics, ARC,
   and copy-on-write behavior.
 - [Ownership Model](OWNERSHIP_MODEL.md) defines the compiler/runtime ownership
@@ -41,55 +42,38 @@ module inventory lives in
 - [Concurrency And Resources](CONCURRENCY_AND_RESOURCES.md) defines structured
   concurrency, cancellation, resources, streams, and networking contracts.
 
-## Plan Current Work
+## Open Issues And Plans
 
-- [Diagnostic Gaps](DIAGNOSTIC_GAPS.md) is the living ledger of weak compiler
-  diagnostics ranked by return on investment; add an entry when you meet one.
-Plans hold only open work: completed steps, measurements and rejected
-experiments live in Git history and `benchmarks/results/`.
+[`issues/`](issues/) holds reproducible open problems. [Diagnostic Gaps](DIAGNOSTIC_GAPS.md)
+owns diagnostic-quality findings and indexes compiler faults; each fault's
+issue owns its reproduction and acceptance criteria.
 
-- [Compiler Priorities](COMPILER_PRIORITIES.md) is the short cross-cutting
-  outcomes map and the rules for the next round of speed work.
-- [`issues/`](issues/) holds the open issues, one file each: reproduction,
-  cause and the change that closes it.
-- [Compiler Speed Roadmap](COMPILER_SPEED_ROADMAP.md) lists the open
-  compiler-speed items (production invariant walks, late-Core walk fusion,
-  cancellation re-analysis) and the working rules for profiling them.
-- [Per-Node Codegen Roadmap](PER_NODE_CODEGEN_ROADMAP.md) lists the open work
-  on the per-node cost of generated C (reference counting, cleanup frames,
-  out-of-line runtime calls) and points at the stage-2 measurement rule.
-- [Identity And Tables Roadmap](IDENTITY_ROADMAP.md) is the one plan for names
-  to ids, retiring magic spellings, emission by id, value identity through the
-  front end and Core, type identity and interning, Core node tables and
-  frontend facts, with each step's oracle and the interim states still on main.
-- [Record Simplification Roadmap](FIXED_LAYOUT_ROADMAP.md) plans bounded
-  migration from the current `struct`/fixed-record value path to ordinary
-  record semantics, explicit foreign ABI adapters, deletion of dead layout
-  branches, and only then measured inline-placement optimizations.
-- [Allocation Contract Roadmap](ALLOCATION_CONTRACT_ROADMAP.md) proposes
-  allocation explanations and a compile-time `no_alloc` block, including
-  runtime/cleanup coverage, Core analysis, and tooling enforcement.
-- [Discovery Acceptance Roadmap](DISCOVERY_ACCEPTANCE_ROADMAP.md) lists what
-  remains after the discovery stage became the default front end: the two
-  known parser differences, hardening, the adapter's shrinkage and the plan to
-  remove the old front end.
-- [Discovery Tables Design](DISCOVERY_TABLES_DESIGN.md) describes the
-  implemented discovery schema (node table, definition ids minted in
-  discovery, packed spans) under `blorp/src/compiler_new/stage_01_discovery/`.
-- [Discovery Redesign](DISCOVERY_REDESIGN.md) is a design for review:
-  discovery as independent per-module parses into typed syntax trees with
-  parser-stamped ids, one link step and no freeze checks.
-- [Perceus Cleanup Issues](PERCEUS_CLEANUP_ISSUES.md) lists the open
-  worker-ready Perceus cleanups and the allocation floor rules.
-- [Typecheck Optimization Issues](TYPECHECK_OPTIMIZATION_ISSUES.md) holds the
-  open typecheck allocation issue (module environment preparation) and the
-  rules the rejected cuts taught.
-- [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md)
-  is the plan of record for tuple flattening, owned state through calls, and
-  stored tuple layout. Local/match tuple flattening is implemented; later
-  increments remain proposals.
-- [Self-Compile Measurement Protocol](../benchmarks/README.md#self-compile-measurement-protocol)
-  is the standard compiler-performance measurement and its retained baselines.
+The compiler-speed goal is to emit C for `blorp/src/main.brp` in about ten
+seconds, not a claim about current performance. Use the
+[self-compile protocol](../benchmarks/README.md#self-compile-measurement-protocol)
+for matched measurements; do not copy a profile into the work index.
+
+- [Compiler Speed](COMPILER_SPEED_ROADMAP.md): redundant walks and remaining
+  pass-level experiments.
+- [Per-Node Codegen](PER_NODE_CODEGEN_ROADMAP.md): ARC, cleanup frames, and
+  borrowed traversal in generated code.
+- [Identity And Tables](IDENTITY_ROADMAP.md): identity authorities, names to
+  IDs, type interning, and remaining table migrations.
+- [Record Simplification](FIXED_LAYOUT_ROADMAP.md): ordinary-record semantics,
+  ABI boundaries, and later measured placement optimizations.
+- [Allocation Contracts](ALLOCATION_CONTRACT_ROADMAP.md): incomplete backend
+  coverage and proposed `no_alloc` enforcement. The existing report is
+  described in [Architecture](ARCHITECTURE.md#allocation-reports).
+- [Discovery Acceptance](DISCOVERY_ACCEPTANCE_ROADMAP.md): parser differences
+  and retiring legacy consumers. [Discovery Redesign](DISCOVERY_REDESIGN.md)
+  separately proposes typed syntax trees; that path is not implemented.
+- [Value Tuples And State Handoff](VALUE_TUPLES_AND_STATE_HANDOFF.md): remaining
+  tuple and owned-call increments; local/match flattening already exists.
+
+Focused cleanup work lives in issues, not additional umbrella plans:
+[module environment preparation](issues/module-environment-preparation-rebuilds-state.md),
+[Perceus frame stacks](issues/perceus-frame-stacks-duplicate-traversal-storage.md), and
+[Perceus managed-let bookkeeping](issues/perceus-managed-let-bookkeeping-allocates.md).
 
 ## Maintenance Rules
 
@@ -104,6 +88,8 @@ experiments live in Git history and `benchmarks/results/`.
   keeps it), and delete the plan when nothing is open.
 - Put raw performance evidence in `benchmarks/results/` and link it from the
   issue or plan that uses it.
+- Keep common build, measurement, and landing recipes in the Worker Checklist
+  and its linked references. Plans retain only task-specific commands and gates.
 - Prefer generated inventories and `--help` output over copied file, command,
   flag, keyword, or declaration lists.
 - When implementation, tests, and docs disagree, verify the implementation and
