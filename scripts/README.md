@@ -480,11 +480,9 @@ release identity and per-target checksums from
 `$HOME/.cache/blorp/compiler-bootstrap`, or `BLORP_COMPILER_BOOTSTRAP_CACHE_DIR`
 when set. Rotate the tag, version, and all target checksums together in that
 single manifest only after release CI has published the merged revision.
-The current pin uses the `direct` binary layout. The resolver still accepts
-historical `single`-archive manifests, but normal builds do not exercise that
-compatibility branch; retiring it is a separate manifest-format cleanup. Both
-layouts cache only `blorp` and remain isolated from the retired
-multi-executable distribution.
+The manifest requires the `direct` binary layout. The resolver verifies the
+selected target's downloaded SHA-256 and rechecks the cached binary before
+reuse. Historical archive layouts are unsupported.
 
 Useful compiler bootstrap commands:
 

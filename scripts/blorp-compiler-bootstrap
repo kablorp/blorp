@@ -38,7 +38,7 @@ version="$BLORP_BOOTSTRAP_VERSION"
 layout="$BLORP_BOOTSTRAP_LAYOUT"
 
 case "$layout" in
-	single | direct) ;;
+	direct) ;;
 	*)
 		echo "Compiler bootstrap manifest has unsupported layout: $layout" >&2
 		exit 1
@@ -55,13 +55,13 @@ if [[ "$version" != *"-dev.$revision" ]]; then
 	exit 1
 fi
 
-for archive_sha in \
+for artifact_sha in \
 	"$BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN" \
 	"$BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU" \
 	"$BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU"
 do
-	if [[ ! "$archive_sha" =~ ^[0-9a-f]{64}$ ]]; then
-		echo "Compiler bootstrap manifest contains an invalid SHA-256: $archive_sha" >&2
+	if [[ ! "$artifact_sha" =~ ^[0-9a-f]{64}$ ]]; then
+		echo "Compiler bootstrap manifest contains an invalid SHA-256: $artifact_sha" >&2
 		exit 1
 	fi
 done
@@ -167,13 +167,7 @@ cache_marker_matches() {
 	local target="$3"
 	local artifact_sha="$4"
 	local binary="$install_dir/blorp"
-	local actual_sha sha_field
-
-	if [ "$layout" = "single" ]; then
-		sha_field="archive_sha256"
-	else
-		sha_field="artifact_sha256"
-	fi
+	local actual_sha
 
 	if [ ! -x "$binary" ] || [ ! -f "$marker" ]; then
 		return 1
@@ -184,13 +178,14 @@ cache_marker_matches() {
 		! grep -Fxq "version=$version" "$marker" ||
 		! grep -Fxq "layout=$layout" "$marker" ||
 		! grep -Fxq "target=$target" "$marker" ||
-		! grep -Fxq "${sha_field}=$artifact_sha" "$marker"
+		! grep -Fxq "artifact_sha256=$artifact_sha" "$marker"
 	then
 		return 1
 	fi
 
 	actual_sha=$(sha256_file "$binary")
-	grep -Fxq "file_sha256_blorp=$actual_sha" "$marker"
+	[ "$actual_sha" = "$artifact_sha" ] &&
+		grep -Fxq "file_sha256_blorp=$actual_sha" "$marker"
 }
 
 install_bootstrap() {
@@ -200,31 +195,15 @@ install_bootstrap() {
 	local binary="$4"
 	local marker="$5"
 	local asset artifact url actual_checksum
-	local binary_path stage_dir actual_sha sha_field
+	local stage_dir actual_sha
 
-	if [ "$layout" = "single" ]; then
-		sha_field="archive_sha256"
-	else
-		sha_field="artifact_sha256"
-	fi
-
-	if [ "$layout" = "direct" ]; then
-		asset="blorp-${target}"
-	else
-		# Historical single-archive manifests remain accepted independently of
-		# the source-identity bridge used by no current build.
-		asset="blorp-${version}-${target}.tar.gz"
-	fi
+	asset="blorp-${target}"
 	url="https://github.com/${repo}/releases/download/${tag}/${asset}"
 
 	stage_dir=$(mktemp -d "${TMPDIR:-/tmp}/blorp-compiler-bootstrap.XXXXXX")
 	trap 'rm -rf "$stage_dir"; rm -f "$binary.tmp.$$" "$marker.tmp.$$"' EXIT
 
-	if [ "$layout" = "direct" ]; then
-		artifact="$stage_dir/blorp"
-	else
-		artifact="$stage_dir/$asset"
-	fi
+	artifact="$stage_dir/blorp"
 	download_file "$url" "$artifact"
 
 	actual_checksum=$(sha256_file "$artifact")
@@ -235,21 +214,14 @@ install_bootstrap() {
 		exit 1
 	fi
 
-	if [ "$layout" = "direct" ]; then
-		binary_path="$artifact"
-	else
-		tar -xzf "$artifact" -C "$stage_dir"
-		binary_path=$(find "$stage_dir" -type f -name blorp -print -quit)
-	fi
-	if [ -z "$binary_path" ]; then
-		echo "Downloaded compiler bootstrap asset did not contain a blorp binary." >&2
-		exit 1
-	fi
-
 	mkdir -p "$install_dir"
-	cp "$binary_path" "$binary.tmp.$$"
+	cp "$artifact" "$binary.tmp.$$"
 	chmod 0755 "$binary.tmp.$$"
 	actual_sha=$(sha256_file "$binary.tmp.$$")
+	if [ "$actual_sha" != "$artifact_sha" ]; then
+		echo "Staged compiler bootstrap binary failed checksum verification." >&2
+		exit 1
+	fi
 
 	{
 		echo "repo=$repo"
@@ -257,7 +229,7 @@ install_bootstrap() {
 		echo "version=$version"
 		echo "layout=$layout"
 		echo "target=$target"
-		echo "${sha_field}=$artifact_sha"
+		echo "artifact_sha256=$artifact_sha"
 		echo "file_sha256_blorp=$actual_sha"
 	} > "$marker.tmp.$$"
 

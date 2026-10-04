@@ -202,37 +202,25 @@ bootstrap_downloads="$tmp_dir/bootstrap-downloads"
 mkdir -p "$bootstrap_repo/scripts" "$bootstrap_repo/blorp/build" "$bootstrap_downloads"
 cp scripts/blorp-compiler-bootstrap "$bootstrap_repo/scripts/"
 bootstrap_tag=dev-aaaaaaaaaaaa
-bootstrap_asset="blorp-${release_version}-${release_target}.tar.gz"
-archive_base="blorp-${release_version}-${release_target}"
-archive_root="$tmp_dir/bootstrap-archive/$archive_base"
-mkdir -p "$archive_root"
-cp "$release_binary" "$archive_root/blorp"
-tar -C "$tmp_dir/bootstrap-archive" -czf \
-	"$bootstrap_downloads/$bootstrap_asset" "$archive_base"
-write_checksum "$bootstrap_downloads/$bootstrap_asset"
+bootstrap_asset="blorp-${release_target}"
+cp "$release_binary" "$bootstrap_downloads/$bootstrap_asset"
 bootstrap_sha=$(sha256_file "$bootstrap_downloads/$bootstrap_asset")
 
 write_bootstrap_manifest() {
 	local layout="$1"
-	local artifact_sha="${2:-$bootstrap_sha}"
 	cat >"$bootstrap_repo/blorp/build/bootstrap.env" <<EOF
 BLORP_BOOTSTRAP_REPO=example/blorp
 BLORP_BOOTSTRAP_TAG=$bootstrap_tag
 BLORP_BOOTSTRAP_VERSION=$release_version
 BLORP_BOOTSTRAP_LAYOUT=$layout
-BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN=$artifact_sha
-BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=$artifact_sha
-BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU=$artifact_sha
+BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN=$bootstrap_sha
+BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=$bootstrap_sha
+BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU=$bootstrap_sha
 EOF
 }
 
 bootstrap_cache="$tmp_dir/bootstrap-cache"
-legacy_bootstrap_dir="$bootstrap_cache/$bootstrap_tag/toolchain/$release_target/$bootstrap_sha"
-mkdir -p "$legacy_bootstrap_dir"
-printf 'legacy compiler\n' >"$legacy_bootstrap_dir/blorp"
-chmod +x "$legacy_bootstrap_dir/blorp"
-
-write_bootstrap_manifest single
+write_bootstrap_manifest direct
 if [ "$("$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-tag)" != "$bootstrap_tag" ]; then
 	fail "the bootstrap wrapper must read its default tag from bootstrap.env"
 fi
@@ -241,35 +229,17 @@ overridden_tag=$(BLORP_COMPILER_BOOTSTRAP_TAG=dev-000000000000 \
 if [ "$overridden_tag" != "$bootstrap_tag" ]; then
 	fail "an ambient environment variable must not override the bootstrap manifest"
 fi
-single_bootstrap_dir="$bootstrap_cache/$bootstrap_tag/single/$release_target/$bootstrap_sha"
-mkdir -p "$single_bootstrap_dir"
-cp "$fake_bin/blorp" "$single_bootstrap_dir/blorp"
-chmod +x "$single_bootstrap_dir/blorp"
-single_binary_sha=$(sha256_file "$single_bootstrap_dir/blorp")
-cat >"$single_bootstrap_dir/MANIFEST" <<EOF
-repo=example/blorp
-tag=$bootstrap_tag
-version=$release_version
-layout=single
-target=$release_target
-archive_sha256=$bootstrap_sha
-file_sha256_blorp=$single_binary_sha
-EOF
-mv "$bootstrap_downloads/$bootstrap_asset" \
-	"$bootstrap_downloads/$bootstrap_asset.saved"
 bootstrap_path=$(PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
 	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
 	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path)
-mv "$bootstrap_downloads/$bootstrap_asset.saved" \
-	"$bootstrap_downloads/$bootstrap_asset"
 if [ ! -x "$bootstrap_path" ]; then
 	fail "the bootstrap resolver must cache the compiler"
 fi
-if [ "$bootstrap_path" = "$legacy_bootstrap_dir/blorp" ] ||
-	[[ "$bootstrap_path" != */single/* ]]
+if [[ "$bootstrap_path" != */direct/* ]] ||
+	! cmp "$fake_bin/blorp" "$bootstrap_path"
 then
-	fail "the single-binary layout must not reuse a legacy toolchain cache"
+	fail "the bootstrap resolver must install the pinned direct binary"
 fi
 bootstrap_smoke="$tmp_dir/bootstrap-smoke.c"
 "$bootstrap_path" compile --no-format \
@@ -289,28 +259,104 @@ if ! cmp "$fake_bin/blorp" "$bootstrap_path"; then
 	fail "bootstrap cache validation must repair a corrupted compiler"
 fi
 
-direct_bootstrap_asset="blorp-${release_target}"
-cp "$release_binary" "$bootstrap_downloads/$direct_bootstrap_asset"
-direct_bootstrap_sha=$(sha256_file "$bootstrap_downloads/$direct_bootstrap_asset")
-write_bootstrap_manifest direct "$direct_bootstrap_sha"
-direct_bootstrap_path=$(PATH="$mock_bin:$PATH" \
+bootstrap_marker="$(dirname "$bootstrap_path")/MANIFEST"
+if ! grep -Fxq "artifact_sha256=$bootstrap_sha" "$bootstrap_marker" ||
+	! grep -Fxq "file_sha256_blorp=$bootstrap_sha" "$bootstrap_marker"
+then
+	fail "the direct cache marker must record the downloaded binary digest"
+fi
+mv "$bootstrap_marker" "$bootstrap_marker.interrupted"
+PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
 	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
-	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path)
-if [[ "$direct_bootstrap_path" != */direct/* ]] ||
-	! cmp "$fake_bin/blorp" "$direct_bootstrap_path"
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path >/dev/null
+if [ ! -f "$bootstrap_marker" ] || ! cmp "$fake_bin/blorp" "$bootstrap_path"; then
+	fail "an interrupted cache install must be repaired"
+fi
+
+wrong_sha=$(printf '%064d' 0)
+write_bootstrap_manifest direct
+sed "s/^BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=.*/BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=$wrong_sha/" \
+	"$bootstrap_repo/blorp/build/bootstrap.env" \
+	>"$bootstrap_repo/blorp/build/bootstrap.env.tmp"
+mv "$bootstrap_repo/blorp/build/bootstrap.env.tmp" \
+	"$bootstrap_repo/blorp/build/bootstrap.env"
+if PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$tmp_dir/bad-checksum-cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path \
+		>"$tmp_dir/bad-checksum.output" 2>&1
 then
-	fail "the bootstrap resolver must install a pinned direct binary"
+	fail "the bootstrap resolver must reject a wrong target digest"
+fi
+if ! grep -Fq 'failed checksum verification' "$tmp_dir/bad-checksum.output"; then
+	fail "the wrong target digest must report a checksum error"
+fi
+
+write_bootstrap_manifest direct
+grep -v '^BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU=' \
+	"$bootstrap_repo/blorp/build/bootstrap.env" \
+	>"$bootstrap_repo/blorp/build/bootstrap.env.tmp"
+mv "$bootstrap_repo/blorp/build/bootstrap.env.tmp" \
+	"$bootstrap_repo/blorp/build/bootstrap.env"
+if "$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-id \
+	>"$tmp_dir/missing-field.output" 2>&1
+then
+	fail "the bootstrap resolver must reject a missing target digest"
+fi
+if ! grep -Fq 'missing BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU' \
+	"$tmp_dir/missing-field.output"
+then
+	fail "the missing digest must identify its manifest field"
+fi
+
+write_bootstrap_manifest direct
+unknown_bin="$tmp_dir/unknown-bin"
+mkdir -p "$unknown_bin"
+cat >"$unknown_bin/uname" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+	-m) printf '%s\n' mips64 ;;
+	-s) printf '%s\n' Linux ;;
+esac
+SH
+chmod +x "$unknown_bin/uname"
+if PATH="$unknown_bin:$mock_bin:$PATH" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path \
+		>"$tmp_dir/unknown-target.output" 2>&1
+then
+	fail "the bootstrap resolver must reject an unknown target"
+fi
+if ! grep -Fq 'Unsupported compiler bootstrap target: Linux/mips64' \
+	"$tmp_dir/unknown-target.output"
+then
+	fail "the unknown target must report its platform"
+fi
+
+write_bootstrap_manifest single
+if PATH="$mock_bin:$PATH" \
+	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$bootstrap_cache" \
+	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path \
+		>"$tmp_dir/single-layout.output" 2>&1
+then
+	fail "the bootstrap resolver must reject the historical single layout"
+fi
+if ! grep -Fq 'unsupported layout: single' "$tmp_dir/single-layout.output"; then
+	fail "the historical layout must explain why it is unsupported"
 fi
 
 write_bootstrap_manifest toolchain
 if PATH="$mock_bin:$PATH" \
 	BLORP_TEST_DOWNLOAD_DIR="$bootstrap_downloads" \
-	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$tmp_dir/single-cache" \
+	BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$tmp_dir/unknown-layout-cache" \
 	"$bootstrap_repo/scripts/blorp-compiler-bootstrap" --print-path \
 		>"$tmp_dir/toolchain-layout.output" 2>&1
 then
 	fail "the bootstrap resolver must reject an unknown layout"
+fi
+if ! grep -Fq 'unsupported layout: toolchain' "$tmp_dir/toolchain-layout.output"; then
+	fail "the unknown layout must identify the unsupported value"
 fi
 
 if BLORP_RELEASE_BINARY="$tmp_dir/missing-blorp" \

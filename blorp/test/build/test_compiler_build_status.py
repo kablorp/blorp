@@ -87,7 +87,7 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		make_executable(self.root / "bootstrap-blorp", b"bootstrap compiler\n")
 		self.bootstrap_compiler = str((self.root / "bootstrap-blorp").resolve())
 		self.bootstrap_target = self.detect_bootstrap_target()
-		self.bootstrap_artifact_sha = "a" * 64
+		self.bootstrap_artifact_sha = sha256_bytes(b"pinned cached compiler\n")
 		self.write(
 			"blorp/build/bootstrap.env",
 			"\n".join(
@@ -606,6 +606,33 @@ class CompilerBuildStatusTests(unittest.TestCase):
 		)
 
 		self.assert_status(result, 0, "FRESH")
+		make_executable(pinned_dir / "blorp", b"tampered cached compiler\n")
+		marker = pinned_dir / "MANIFEST"
+		marker.write_text(
+			marker.read_text(encoding="utf-8").replace(
+				"file_sha256_blorp=" + self.bootstrap_artifact_sha,
+				"file_sha256_blorp=" + sha256_file(pinned_dir / "blorp"),
+			),
+			encoding="utf-8",
+		)
+		self.assert_status(
+			self.run_status(
+				extra_env={"BLORP_COMPILER_BOOTSTRAP_CACHE_DIR": str(cache_root)},
+				use_bootstrap_override=False,
+			),
+			2,
+			"UNKNOWN",
+		)
+
+	def test_historical_bootstrap_layout_reports_unknown(self) -> None:
+		manifest = self.root / "blorp/build/bootstrap.env"
+		manifest.write_text(
+			manifest.read_text(encoding="utf-8").replace("LAYOUT=direct", "LAYOUT=single"),
+			encoding="utf-8",
+		)
+		result = self.run_status(use_bootstrap_override=False)
+		self.assert_status(result, 2, "UNKNOWN")
+		self.assertIn("unsupported bootstrap layout: single", result.stdout)
 
 	def test_bootstrap_manifest_drift_reports_unknown_even_off_host(self) -> None:
 		self.write(
