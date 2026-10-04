@@ -1,6 +1,8 @@
 # Discovery Redesign: Per-Module Parses into Typed Syntax Trees
 
-This is a design for review. No code exists yet. It replaces the data model of
+This is a design for review. The typed-tree path is not implemented yet; the
+syntax prerequisite M-1 has landed, and M0 measured a throwaway body-parser
+prototype. M1 to M7 remain open. It replaces the data model of
 [`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) (one builder threaded
 through every module, a flat node table and about 50 side tables) with:
 
@@ -12,14 +14,19 @@ through every module, a flat node table and about 50 side tables) with:
 The code below is real Blorp: every type is written out in full. Function
 bodies are given only where the shape matters.
 
-- **Read at:** main `519e7311c` ("Make the discovery stage the default front
-  end").
+- **Current implementation checked at:** main `1a767d0c7` (2026-10-03).
+  The census and initial cost probes below are historical measurements at
+  `519e7311c`, not measurements of this revision.
 - **Counts:** taken on the self-compile inputs (`blorp/src/main.brp`, 449
   modules, prelude and tuple implicit modules) with a census tool over the
-  current tables. Appendix A gives the census; Appendix B gives the
+  then-current tables. Appendix A gives the census; Appendix B gives the
   allocation probes.
 - **Decisions:** revised after an independent review of the first version;
   the decisions taken are in section 10.
+- **Product direction:** ordinary `record` is the target nominal product
+  ([`FIXED_LAYOUT_ROADMAP.md`](FIXED_LAYOUT_ROADMAP.md)). The proposed syntax
+  below uses records for name and syntax values. Its historical M0 prototype
+  used several `struct` values, so its costs do not price this exact shape.
 - **Precedence:** where this document and a later implementation disagree,
   the implementation and its tests win, and this document is fixed in the
   same change.
@@ -90,10 +97,10 @@ Appendix A: node census. Appendix B: allocation probes.
      (`xs = [a = 1]`, `print(ys[0] = 3)`, `if a = 1:`) is a parse error in
      both parsers, and the language has no named call arguments (landed in
      `d460bac5f`).
-   - A second syntax change, M-1, makes the parser reject the other forms
-     that only typecheck rejects today, and removes the implicit type
-     parameters (auto-generalization and bounded arguments outside an
-     `implements` receiver).
+   - M-1 landed in `020b95d90`: both parsers reject the remaining forms
+     that only typecheck rejected, and implicit type parameters are removed
+     (auto-generalization and bounded arguments outside an `implements`
+     receiver).
 
    With both landed, the tree types need no form that exists only to be
    rejected.
@@ -104,9 +111,11 @@ Appendix A: node census. Appendix B: allocation probes.
    directly. These two are the only compiler modules that import
    `compiler_new`, as `temporary_cross_owner_imports` in
    `blorp/source_ownership.json` lists.
-10. **The default flips only within a hard ceiling** on retired instructions,
-    peak RSS and wall time. The ceiling is not loosened for any compiler
-    change. Since 2026-10-02 the flip (M6) waits on the compiler work of
+10. **The tree path becomes the default only within a hard ceiling** on retired
+    instructions, peak RSS and wall time. This is an internal table-to-tree
+    selection inside the already-default discovery stage, not a return of
+    `BLORP_FRONT_END`. The ceiling is not loosened for any compiler change.
+    Since 2026-10-02 M6 waits on the compiler work of
     [`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md): its increments 1 to 4, and
     increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5
     do not wait (section 10, flip timing).
@@ -471,8 +480,21 @@ union LiteralValue:
 pure func lex_module(module: ModuleId, text: String) -> LexedModule
 ```
 
-`Token` stays a struct: `{kind: TokenKind, span: Span, payload: Int}`. It is
-private to `lex/` and the parser's cursor module, and is read only through
+`Token` uses `fixed record` provisionally:
+
+```blorp
+fixed record Token {
+	kind: TokenKind,
+	span: Span,
+	payload: Int
+}
+```
+
+It is a hot, scalar-only transient value in token lists, not part of the tree
+or the public product model. An ordinary `record`
+would change its storage cost; M2 measures that choice against the token
+parity and cost gates before retaining the fixed layout. It is private to
+`lex/` and the parser's cursor module, and is read only through
 accessors that check the kind:
 
 ```blorp
@@ -482,9 +504,17 @@ pure func token_codepoint(token: Token) -> Option[Char]
 pure func token_interpolation(token: Token) -> Option[InterpolationIndex]
 ```
 
+The spelling is a transition, not a permanent layout promise: when the
+record simplification sequence converges old value records, remeasure tokens
+and choose a stage-local storage representation if ordinary records miss the
+same cost gate.
+
 The payload `Int` whose meaning depends on the kind is the one tagged `Int`
 left in the stage. It is confined to two modules and never reaches the output.
-It goes when a struct field can hold a value union (G1 in section 7).
+It goes when the token's storage can hold a value union at an acceptable
+measured cost; the record simplification plan does not itself supply that
+layout optimization.
+
 `LiteralIndex` and `InterpolationIndex` are opaque indexes into
 `LexedSource`, minted only by the lexer.
 
@@ -500,7 +530,7 @@ union ScannedPiece:
 A hole's bytes, `${` through `}`; its expression is `expression_start ..
 expression_end`.
 ---
-struct HoleScan {
+record HoleScan {
 	expression_start: Int,
 	expression_end: Int,
 	span: Span
@@ -515,8 +545,7 @@ record InterpolationScan {
 When the parser reaches a hole, it lexes the hole's bytes into a token list of
 its own (`lex_hole`) and parses one expression from a cursor over that list.
 The outer cursor is an ordinary value held across the call. Nothing is
-appended after the module's end-of-file token, and no cursor is moved by hand
-(audit G2).
+appended after the module's end-of-file token, and no cursor is moved by hand.
 
 ### 2.4 Diagnostics, and what stops compilation
 
@@ -730,7 +759,7 @@ opaque type SpellingId = Int
 ---
 A name as the source wrote it: which spelling, and where.
 ---
-struct WrittenName {
+record WrittenName {
 	spelling: SpellingId,
 	span: Span
 }
@@ -745,7 +774,7 @@ keeps exactly one outcome per use:
 - by type (typecheck), after resolution records that it is not its own: the
   member after a dot, a field name in a record literal or update.
 ---
-struct NameUse {
+record NameUse {
 	name: WrittenName,
 	use: NameUseId
 }
@@ -756,7 +785,7 @@ A name that introduces a local value: a variable, a parameter, a loop
 variable, a lambda parameter, a `with`, `select` or `on` binder, a
 destructured name, a list spread.
 ---
-struct Binder {
+record Binder {
 	name: WrittenName,
 	binder: BinderId
 }
@@ -765,7 +794,7 @@ struct Binder {
 ---
 A name that introduces a type or dimension parameter of a declaration.
 ---
-struct TypeBinder {
+record TypeBinder {
 	name: WrittenName,
 	binder: TypeBinderId
 }
@@ -913,7 +942,7 @@ How many ids of each node, name and binder family the module issued; ids are
 `0 ..< count` within the module. Definitions and imports are counted by their
 indexes' lengths, not here, so no count can disagree with an index.
 ---
-struct SyntaxCounts {
+record SyntaxCounts {
 	statements: Int,
 	blocks: Int,
 	expressions: Int,
@@ -933,7 +962,7 @@ union ModuleItem:
 	FunctionItem(FunctionDeclaration)
 	GlobalItem(GlobalDeclaration)
 	RecordItem(RecordDeclaration)
-	StructItem(StructDeclaration)
+	ValueRecordItem(ValueRecordDeclaration)
 	UnionItem(UnionDeclaration)
 	EnumItem(EnumDeclaration)
 	AliasItem(AliasDeclaration)
@@ -1076,10 +1105,14 @@ record ForeignCName {
 
 One record per class. Two forms share a record only when they have the same
 parts: a constant and a mutable global, or an alias and an opaque type. Forms
-with different parts get separate records: a record takes type parameters and
-a struct does not; a resource type has a cleanup builtin and a builtin type
-does not; an `enum` case has no payload and a `union` variant may. Otherwise
-one record would have to allow a combination the grammar forbids.
+with different parts get separate records: an ordinary record takes type
+parameters, while today's `struct` and `fixed record` declarations do not;
+a resource type has a cleanup builtin and a builtin type does not; an `enum`
+case has no payload and a `union` variant may. Otherwise one record would
+have to allow a combination the grammar forbids. The two old value-record
+spellings share one temporary declaration form until the record simplification
+sequence removes their distinct semantics. The adapter retains their source
+spelling for parity with the old parsed AST.
 
 ```blorp
 ---
@@ -1164,14 +1197,20 @@ record RecordDeclaration {
 }
 
 
-record StructDeclaration {
+record ValueRecordDeclaration {
 	id: DefinitionId,
 	visibility: Visibility,
 	documentation: Option[Documentation],
+	spelling: ValueRecordSpelling,
 	name: WrittenName,
 	fields: List[FieldDeclaration],
 	span: Span
 }
+
+
+enum ValueRecordSpelling:
+	StructSpelling
+	FixedRecordSpelling
 
 
 record FieldDeclaration {
@@ -1206,7 +1245,7 @@ record VariantDeclaration {
 
 
 ---
-`enum Name:` and its cases. After M-1 the parser rejects parentheses on an enum
+`enum Name:` and its cases. The parser rejects parentheses on an enum
 case, payload or empty.
 ---
 record EnumDeclaration {
@@ -1335,7 +1374,7 @@ One `@annotation` of a function, in written order. An unknown annotation
 name, or annotations before anything but a function, are reported, so an
 accepted module holds only these.
 ---
-struct Annotation {
+record Annotation {
 	annotation: FunctionAnnotation,
 	span: Span
 }
@@ -1383,7 +1422,7 @@ record TupleBinding {
 
 
 ---
-A declared type parameter: `T` with its bounds, `#N`, or `#_`. After M-1 the
+A declared type parameter: `T` with its bounds, `#N`, or `#_`. The
 parser rejects bounds on a dimension parameter.
 ---
 union TypeParameter:
@@ -1510,8 +1549,8 @@ are documented forms that the standard library uses (the type of a dimension
 value, a refinement of `Int`), so `DimensionType(Dimension)` holds one.
 Typecheck accepts them; M-1 does not touch them.
 
-A bound inside a type (`x: (T: Eq)`, `List[T: Eq]`) is different: M-1 makes
-the parser reject it everywhere except an `implements` receiver, where the
+A bound inside a type (`x: (T: Eq)`, `List[T: Eq]`) is different: the parser
+rejects it everywhere except an `implements` receiver, where the
 receiver introduces the impl's type parameters, bare (`Box[T]`) or bounded
 (`Box[T: Showable]`, a conditional impl). Type parameters are otherwise only
 declared in a bracket list, and the implicit ones are gone: an undeclared `T`
@@ -1771,7 +1810,7 @@ record QuestionBindingStatement {
 
 
 ---
-`x += v` and its siblings. After M-1, `_ += v` is rejected, so the target is
+`x += v` and its siblings. `_ += v` is rejected, so the target is
 always a name.
 ---
 record CompoundAssignmentStatement {
@@ -2019,7 +2058,7 @@ record ConcurrentForStatement {
 `max_threads: n` or `limit: n`: a positive integer literal, checked by the
 parser.
 ---
-struct CountParameter {
+record CountParameter {
 	count: PositiveCount,
 	name_span: Span,
 	span: Span
@@ -2042,10 +2081,9 @@ record TimeoutParameter {
 }
 ```
 
-`positive_count` replaces today's `positive_count_of_literal`, which saturated
-an over-range literal to `Int`'s maximum. Here the parser rejects a count
-above `Int`'s range with the same diagnostic as a non-positive one. This is
-part of M-1.
+`positive_count` replaces the old `positive_count_of_literal`, which saturated
+an over-range literal to `Int`'s maximum. The parser now rejects a count
+above `Int`'s range with the same diagnostic as a non-positive one (M-1).
 
 ### 3.14 Recursion depth
 
@@ -2184,7 +2222,7 @@ pure func minted_record(
 ) -> (IdMint, RecordDeclaration)
 
 -- ... one `minted_*` for each class of section 3.18: local function, trait
--- method, implementation method, foreign function, global, struct, union,
+-- method, implementation method, foreign function, global, value record, union,
 -- variant, enum, enum case, alias, builtin type, resource type, trait and
 -- implementation.
 ```
@@ -2238,17 +2276,18 @@ builds at link and as a corpus test.
   issued for another node. The rule says they never build one; code review
   enforces it.
 
-**A compiler bug blocks this layout until it is fixed (an M1
-prerequisite).** `syntax/ids.brp` imports the node types it builds (from
+**An M1 prerequisite needs a fresh check.** At M0, a compiler bug blocked
+this layout: `syntax/ids.brp` imports the node types it builds (from
 `expressions.brp`, `declarations.brp` and the others), and those modules
 import the id types from `ids.brp`. An opaque type inside an import cycle is
-rejected today: a record field of the opaque type fails with `Record field
+rejected by that compiler: a record field of the opaque type failed with `Record field
 'id': expected d.DId, got DId`. The probe pairs `d.brp`/`e.brp` and `m3.brp`
-fail; the same shapes without the cycle (`f.brp`, `g.brp`, `m4.brp`) pass.
-The fix is in progress separately. The design keeps the mint beside the id
-types, because that is what makes "only the mint makes an id" structural. It
-does not move the node types into `ids.brp` or the mint out of it to dodge
-the bug.
+failed; the same shapes without the cycle (`f.brp`, `g.brp`, `m4.brp`)
+passed. M1 first retains and reruns a minimal cycle fixture on its integration
+base, then fixes the compiler if it still fails. The design keeps the mint
+beside the id types, because that is what makes "only the mint makes an id"
+structural. It does not move the node types into `ids.brp` or the mint out
+of it to dodge the bug.
 
 **The no-discard rule.** The parser decides by lookahead before it builds,
 and never drops a node it built in an accepted parse. Today's parser
@@ -2383,7 +2422,7 @@ union Definition:
 	ForeignFunctionDefinition(ForeignFunction)
 	GlobalDefinition(GlobalDeclaration)
 	RecordDefinition(RecordDeclaration)
-	StructDefinition(StructDeclaration)
+	ValueRecordDefinition(ValueRecordDeclaration)
 	FieldDefinition(FieldDeclaration)
 	UnionDefinition(UnionDeclaration)
 	VariantDefinition(VariantDeclaration)
@@ -2625,7 +2664,7 @@ record Package {
 The first program-wide index of each family in one module: the prefix sums
 of the modules' counts, in module order.
 ---
-struct SyntaxBases {
+record SyntaxBases {
 	definitions: Int,
 	imports: Int,
 	statements: Int,
@@ -3026,10 +3065,13 @@ blorp/src/compiler/
                             name table
 ```
 
-`blorp/src/lib/source_graph.brp` chooses between this path and the existing
-lexer, parser and module loader with `BLORP_FRONT_END`. The adapter may later
-split into a folder if it grows past one readable module. After the tree
-rewrite its expected size is 1,500 to 2,000 lines.
+`blorp/src/lib/source_graph.brp` always takes the current discovery stage and
+legacy adapter path. The old `BLORP_FRONT_END` switch and its
+`ExistingDiscovery` arm have already been removed. M5's comparison is an
+internal test-only choice between the stage's table and tree paths; it must
+not restore a public front-end switch. The adapter may later split into a
+folder if it grows past one readable module. After the tree rewrite its
+expected size is 1,500 to 2,000 lines.
 
 **Layout rules**, enforced by `scripts/check-blorp-layout` and
 `blorp/source_ownership.json`:
@@ -3122,8 +3164,10 @@ does not take that.
 
 ### 6.3 Parity during the transition
 
-The stage is the default front end now (`519e7311c`), so every increment must
-keep it passing every default and premerge gate. The proofs:
+The stage is the only compilation front end now, so every increment must keep
+it passing every default and premerge gate. M3 to M5 compare the table and
+tree paths inside that stage; the old parser remains an independent parity
+oracle while its other users still need it. The proofs:
 
 - **The full-AST differential**
   (`blorp/test/compiler/tools/discovery_adapter_differential.brp`, run by
@@ -3158,139 +3202,138 @@ keep it passing every default and premerge gate. The proofs:
 - **The self-compile.** C is byte-identical, or identical after normalizing
   id-derived names, from `bin/blorp` and a stage-2 `-O2` compiler.
 
-## 7. Expected cost
+## 7. Measured cost and open budget
 
-Baselines on the self-compile inputs, `-O2`, median of 3
-(`benchmarks/results/discovery_append_at_close_2026-10-01.md`,
-`discovery_stage_default_2026-10-01.md`):
+The 2026-10-01 baselines used the table stage on the self-compile input
+(`blorp/src/main.brp`, 449 modules), at `-O2`. They are historical controls,
+not a matched baseline for a candidate built from this revision.
 
-| | Allocations | Instructions | Peak RSS |
+| Boundary | Allocations | Instructions | Peak RSS |
 | --- | ---: | ---: | ---: |
 | Stage, cost tool `tables` | 0.578 M | 4.20 G | 131.5 MB |
 | Stage plus adapter, `graph` | 7.65 M | 9.17 G | 324.6 MB |
-| Whole self-compile (stage-2 `-O2`) | 211.4 M | 405.3 G | 2.15 GB |
+| Whole self-compile, stage-2 `-O2` | 211.4 M | 405.3 G | 2.15 GB |
 
-The estimates below combine the census (Appendix A) with the shape probes
-(Appendix B). They are estimates, not measurements: M0 measures a prototype,
-including peak RSS and wall time, before anything lands.
+The original shape probes and node census are in
+[`discovery_redesign_probes_2026-10-01.md`](../benchmarks/results/discovery_redesign_probes_2026-10-01.md)
+and Appendices A and B. M0 then built a throwaway parser for all 13,105
+function bodies in that input. Its measured source, coverage, counters and
+limitations are in
+[`discovery_redesign_m0_2026-10-02.md`](../benchmarks/results/discovery_redesign_m0_2026-10-02.md).
+That prototype used `struct` for `WrittenName`, `NameUse`, `Binder` and other
+small values. It did not build the declaration parser, link step or tree
+adapter, and it used a different compiler baseline. It is evidence about
+cost mechanisms, not a performance prediction for the record-based design
+in section 3 or for today's compiler.
 
-### 7.1 Per-shape costs on today's compiler (probed)
+### 7.1 What M0 measured
 
-| Shape | Allocations per value |
-| --- | ---: |
-| Variant without payload (`Break`, `WildcardPattern`) | 0 |
-| Variant with positional scalar or heap payloads (`Binary(op, a, b)`) | 1 |
-| A struct in a variant's payload (`NameReference(NameUse)`) | +1 per struct (boxed) |
-| Variant whose payload is a record (`If(IfExpression)`) | 2 (box and record) |
-| A record field holding `Some(x)` or `None` | 0 extra |
-| A non-empty list | 1 |
-| A call returning `(ParseState, node)`, destructured | about 3 beyond the node (the tuple, and a copy of the state record); linear in the number of calls, with no copy of the state's lists |
-
-### 7.2 Ledger
-
-| Cost on today's compiler | Estimate | Compiler work that would recover it |
-| --- | ---: | --- |
-| Tree nodes. Each node is a record (1); most also box their form (1); a struct in the form adds a box (`NameUse`: 1); record payloads and non-empty lists add 1 each. Identifiers, named types and field accesses are 3 each; calls about 4.5; blocks and statements about 5.5 with the `Statement` wrappers. | about 3.9 M allocations (0.955 M nodes plus about 0.2 M statements) | **Value unions in a record field (G1)**: the form stored inline in `Expression`, so node plus form is one allocation. **Struct payloads unboxed** (`STRUCT_PAYLOAD_ROADMAP` S2, parked at +0.1% on the self-compile; this workload is the case it was missing). **A variant whose only payload is a record shares the variant's box** (OCaml's inline records). Together these take trees to about 1.5 M. |
-| Parse calls returning `(ParseState, T)`, and the mint's `(IdMint, node)` returns inside them: about 2.4 M value-returning calls (about 2.5 per node, from the precedence levels of recursive descent), each about 3 | about 7 M allocations | **G2, cheap multi-value return**: a destructured tuple's components moved, not shared, and a small tuple returned in registers, designed in `VALUE_TUPLES_AND_STATE_HANDOFF.md`. M6 waits on it (section 7.4). |
-| `intern_slice` returning a tuple, once per identifier token | about 0.5 M (inside the 7 M line if counted there) | G2 |
-| Literal values not interned; `DecimalFloat` strings | +10,000 to 20,000 allocations | None needed |
-| Allocation and release work | about 11 M allocations × 60 to 80 instructions = 0.7 to 0.9 G | G2 and inline payloads (above); later, **arena allocation for syntax trees**, since all of a compilation's trees die together (rustc's arenas), which turns allocation into a bump and skips per-node release |
-| Removed: the `freeze` invariant check (about 8% of the stage) | -0.33 G | none |
-| Removed: openings and closings, side tables, name-span and else-keyword rows, sigil interning, owner binary searches | -0.1 to -0.2 G (estimate) | none |
-| Added in debug builds only: the id census at link | one walk per module | none needed (debug only) |
-
-Memory is secondary but measured in M0. A tree node is larger than a flat row
-(a record header plus the form's box, against a 32-byte row and an 8-byte
-edge). The trees should cost on the order of +100 MB over today's tables.
-They live while the adapter runs: `discovery_front_end.brp` drops the program
-once the old AST is built. The whole compile's memory peak is expected later,
-in Core and C emission, after the trees are released, so the trees should
-raise discovery's own peak but not the whole compile's. M0 checks this with a
-memory reading per phase.
-
-### 7.3 Totals
-
-| | Allocations | Instructions |
+| Same-body boundary | Allocations | Retired instructions |
 | --- | ---: | ---: |
-| Stage today | 0.58 M | 4.20 G |
-| Tree stage, today's compiler | about 11 M | about 4.6 to 5.6 G |
-| Tree stage after G2 | about 4 M | about 4.0 to 4.5 G |
-| Tree stage after G2, G1 and inline payloads | about 1.6 M | about 3.7 to 4.2 G |
-| Adapter today (`graph` minus `tables`, including the old finalization) | 7.1 M | 5.0 G |
-| Tree adapter (estimate: the same old AST built by a direct map, without owner indexes, binary searches or a `Result` per read) | about 6.5 M | about 3.0 to 3.7 G |
-| `graph` mode, today's compiler | about 17.5 M against 7.65 M | about 7.6 to 9.3 G against 9.17 G |
+| Existing table parser | 6,623 | 0.939 G |
+| M0 tree parser | 11,383,762 | 6.801 G |
 
-On the whole self-compile, on today's compiler:
+M0 found 2.32 M retained tree objects (131.8 MB) and about 9.1 M transient
+state and tuple allocations. The tree stage's own peak was estimated at
+about 207 MB against 122.7 MB for the then-current table parser, an 84 MB
+increase. The 5.9 G instruction difference for body parsing alone was
++1.45% of that revision's 405.3 G whole self-compile, before any adapter
+saving. M0 did not measure a completed tree front end or a whole-compiler
+candidate against the flip ceiling.
 
-- **Allocations:** about +10 M of 211 M (+5%).
-- **Instructions:** between about 1.6 G fewer and 0.1 G more, of 405 G
-  (-0.4% to 0%). The adapter's savings offset the stage's allocation work.
+The old section 7 estimates that priced an allocation at 60 to 80
+instructions and predicted a 4.6 to 5.6 G tree stage were disproved.
+M0 observed roughly 510 instructions for one retained variant box's
+lifecycle and 600 per allocation over the body parse. Its exact retained
+census included 0.46 M boxes for the proposed name and binder values when
+they were `struct` payloads. Ordinary `record` values change that shape,
+so no allocation or instruction total for the section 3 design is claimed
+from M0's totals.
 
-### 7.4 The flip ceiling
+### 7.2 Costs to measure as the design lands
 
-The default flips at M6 only if all three hold on the self-compile, with a
-stage-2 `-O2` compiler and today's compiler, against main:
+| Boundary | Evidence and required next measurement |
+| --- | --- |
+| Syntax values | M1's proposed `record` names, binders, counts, annotations and forms need representative construction and return probes. Keep the role and id contract; measure its cost rather than reverting to `struct` to match M0. |
+| Tokens | M2 compares the provisional scalar `fixed record Token` with an ordinary `record` on the same token corpus, including retained bytes and instructions. Keep an inline token only while it is an explicit, measured storage exception under the record simplification plan. |
+| Parser hand-off | M0 attributed about 9.1 M allocations to transient state, tuples and other parse work. Its experimental tuple hand-off compiler reduced the body parse by 1.50 M allocations and 0.80 G instructions, but was not the current incremental implementation. Re-measure after the actual tuple increments. |
+| Link and removed tables | Deleting freeze, openings, side tables, sigil interning and owner searches may save work; M0 did not measure these deletions or the new link. Measure the complete stage at M5. |
+| Tree adapter | M0 did not build it. Measure the structural adapter at M5 instead of carrying forward the old 6.5 M allocation or 3.0 to 3.7 G instruction estimates. |
+| Whole compiler | M5 and M6 use matched stage-2 `-O2` compilers on identical frozen inputs, with output identity and phase-local counters. Earlier stage-only or cross-compiler figures are not acceptance evidence. |
+
+The tree program should be released after the adapter builds the old AST.
+M0's stage-local RSS increase does not establish the whole-compiler peak;
+M5 measures the lifetime and peak directly. Value unions in record fields,
+record placement and arena allocation are possible later compiler work,
+not prerequisites silently assumed in the estimates here. The
+[record simplification roadmap](FIXED_LAYOUT_ROADMAP.md) owns product
+representation choices; the
+[tuple hand-off plan](VALUE_TUPLES_AND_STATE_HANDOFF.md) owns its
+increments.
+
+### 7.3 The M6 ceiling
+
+The tree path becomes the stage's default at M6 only if all three hold on
+the self-compile, with a stage-2 `-O2` compiler against a matched main
+baseline:
 
 - **Retired instructions:** at most +1.0%, median of 3 back to back.
-- **Peak RSS:** at most +5%, median of 3. The peak is expected after the
-  trees are released (section 7.2), so this mostly guards against the trees
-  outliving the adapter.
-- **Wall time:** at most +1.0%, on the median of at least 5 interleaved runs
-  of each side. A median of 3 back to back moves by about 0.8% between
-  sessions with no change, which is most of a 1% ceiling.
+- **Peak RSS:** at most +5%, median of 3.
+- **Wall time:** at most +1.0%, on the median of at least 5 interleaved
+  runs of each side.
 
-These ceilings are decided (section 10) and are not loosened for any compiler
-change. M0 measured that today's compiler misses them (+1.45% for the tree
-stage alone), so M6 waits on the compiler work of
-[`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md) (its increments 1 to 4, and 5 if
-M0 re-measured after increment 4 still needs it), and is then measured against
-these same ceilings (section 10, flip timing, revised 2026-10-02). If they are still missed,
-M6 waits. The tree path is then made cheaper without changing the design: a
-slimmer `ParseState`, fewer return levels in the expression parser (one
-precedence-climbing loop), and fewer wrapper records where a form is
-payload-free.
+These ceilings are unchanged and are not loosened for an unrelated compiler
+change. M0 showed that its historical body parser alone exceeded the
+instruction ceiling on its compiler. M1 to M5 can proceed; M6 waits on
+increments 1 to 4 of
+[`VALUE_TUPLES_AND_STATE_HANDOFF.md`](VALUE_TUPLES_AND_STATE_HANDOFF.md)
+and increment 5 if the re-measured M0 after 4 still needs it. The
+[record simplification roadmap](FIXED_LAYOUT_ROADMAP.md) also changes
+representation and cost: rerun the record-shaped parser and whole
+stage against the then-current compiler before applying the ceiling.
+If it is missed, reduce measured parser or adapter work without weakening
+the output contract.
 
-Language work recorded alongside:
+A separate language improvement, L1, could make issued-index reads total.
+Today `List.get` returns `Option`, so a by-id miss becomes an internal
+error (section 4.5). A branded index handed out at append would remove
+that error path, but is not required for M1 to M6.
 
-- **L1, a total read for issued indexes.** `List.get` returns `Option`, so
-  each by-id read carries an internal-error path (section 4.5). A list that
-  hands out a branded index type at append, which its indexed read accepts
-  without `Option`, removes that path. This borrows rustc's `IndexVec` and
-  Lean 4's `Fin n`. The Range types (`..#N`) already do this for fixed-size
-  data.
-
-Parallel parsing (section 2.6) lowers wall time, not instructions. It needs
-the task-fiber parse overhead fixed in the runtime first, and it is not in
-these totals.
+Parallel parsing (section 2.6) targets wall time, not instructions. It
+still needs the measured task-fiber overhead and concurrent provider reads
+addressed first.
 
 ## 8. Migration plan
 
-The stage stays the default front end throughout. Each increment is one
-change and lands with its proof. Old code is deleted in the increment that
-makes it unreachable, not later. `BLORP_FRONT_END=existing` (the old
-discovery) is unaffected and stays until the next bootstrap rotation, as the
-flip commit set out.
+The stage stays the only compilation front end throughout. Each increment is
+one change and lands with its proof. Old code is deleted in the increment
+that makes it unreachable, not later. M6 switches the stage's internal
+default from tables to trees; it does not switch between two compiler front
+ends. The old parser still serves `compile --ast`, test discovery, the LSP
+and parity checks, as [`DISCOVERY_ACCEPTANCE_ROADMAP.md`](DISCOVERY_ACCEPTANCE_ROADMAP.md)
+records.
 
-**Prerequisite, landed:** `=` in expression positions is a parse error in
-both parsers (`d460bac5f`), ahead of M1.
+**Completed prerequisites:** `=` in expression positions is a parse error
+in both parsers (`d460bac5f`). M-1's remaining syntax restrictions and
+teaching messages landed in `020b95d90`. M0's throwaway parser and cost
+report are retained in
+[`discovery_redesign_m0_2026-10-02.md`](../benchmarks/results/discovery_redesign_m0_2026-10-02.md);
+the prototype is not the M1 implementation.
 
 | # | Change | Proof | Deleted |
 | --- | --- | --- | --- |
-| **M-1** | **Syntax change in both parsers**, under the urgent-syntax-change rule (`DISCOVERY_ACCEPTANCE_ROADMAP.md`, "Rules for the interim"). The parsers reject: a bounded argument where a single type is required (a dimension is a type there and stays accepted: `rows: #N`, `-> #M`); bounds on `#N` and `#_`; parentheses on an `enum` case, payload or empty; `_ += v` and its siblings; a concurrency count above `Int`'s range; and a bound inside any type except an `implements` receiver. It also removes the implicit type parameters: an undeclared `T` in a signature is an error that suggests `func f[T](x: T)`. Each gets a teaching message. `GRAMMAR.md` and `GUIDE.md` are updated in the same change, with fixtures for each form and its message. | Both parsers agree (corpus parity gate, per-code fixtures); a corpus search shows no use of the rejected forms, or each use is rewritten in the same change; the full-AST differential is unchanged | the parsers' acceptance of those forms |
-| **M0** | Measurement only. The shape probes of Appendix B are recorded with this document. Build a throwaway prototype of the expression and statement parser over trees, and measure allocations, instructions, wall time and peak RSS per node on the corpus's bodies. | Recorded numbers that confirm or correct section 7 | none |
-| **M1** | Prerequisite: the compiler fix for an opaque type inside an import cycle (section 3.15). Then `syntax/`: every type of section 3, `syntax/ids.brp` with `IdMint`, the layout rule that confines `IdMint` to `parse/` and tests, `syntax/dump.brp` (canonical text), and unit tests that build each form through the mint and dump it. Nothing calls it yet. | Tests; `compiler-new` gate; the layout check rejects an import of `IdMint` from outside `parse/` | none |
-| **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. | Token parity test unchanged; `tables` dump identical; cost recorded (the bridge's cost is temporary) | the lexer's builder appenders; transient interpolation tables |
-| **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison (as the adapter's declaration half was first proved), tree path against the old parser; per-module declaration diagnostics equal to today's stage | none |
+| **M1** | Retain and rerun the opaque-type import-cycle repro (section 3.15), fixing the compiler if it still fails. Then `syntax/`: every type of section 3, using ordinary `record` for the proposed name and syntax values; `syntax/ids.brp` with `IdMint`; the layout rule that confines `IdMint` to `parse/` and tests; `syntax/dump.brp`; and unit tests that build each form through the mint and dump it. Nothing calls it yet. | Tests; `compiler-new` gate; the layout check rejects an import of `IdMint` from outside `parse/`; record-shape construction and return costs recorded (section 7.2) | none |
+| **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. Decide the provisional `fixed record Token` from a same-corpus record/layout probe. | Token parity test unchanged; `tables` dump identical; token storage and bridge costs recorded | the lexer's builder appenders; transient interpolation tables |
+| **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout. The temporary `ValueRecordSpelling` preserves today's `struct` and `fixed record` syntax for the adapter until record semantics converge. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison, tree path against the old parser including both value-record spellings; per-module declaration diagnostics equal to today's stage | none |
 | **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; every rendered diagnostic per module equals today's stage, except the listed broken-import case; the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, adapter and the old typecheck | none |
-| **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal selection, with `cli`, `package` and `front-end-stage`-style gates run on both paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against main | none |
-| **M6** | Flip the default to the tree path, within the ceiling of section 7.4, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
+| **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal test-only selection, with `compiler-new`, `cli` and `package` gates exercised on both stage paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against matched main | none |
+| **M6** | Make the tree path the stage's default, within the ceiling of section 7.3, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |
 | **M7** | Documentation: `DISCOVERY_TABLES_DESIGN.md` is replaced by this document's settled form; `ARCHITECTURE.md`, `DISCOVERY_ACCEPTANCE_ROADMAP.md` and `docs/README.md` are updated; the resolution design takes section 4.7. | `git diff --check`; link check | the superseded design text |
 
 Ordering and parallelism:
 
-- The `=` prerequisite has landed; M-1 lands before M1. Each is a language
-  change and stands on its own.
-- M1 also waits for the opaque-type import-cycle fix, in progress separately.
+- The `=` and M-1 language prerequisites have landed.
+- M1 begins by verifying the opaque-type import-cycle repro on its own base.
 - M1 and M2 are independent of each other.
 - M3 needs M1 and M2, M4 needs M3, and M5 needs M4.
 - G2 (tuple hand-off, `VALUE_TUPLES_AND_STATE_HANDOFF.md`) proceeds in parallel. M1 to M5 do not wait on it; M6 does (its increments 1 to 4, and 5 if the re-measured M0 still needs it).
@@ -3309,7 +3352,7 @@ finiteness as a 64-bit `Float`; a literal that is finite there but overflows
 *Recommendation:* accept `DecimalFloat`. Its opaque type gives the "checked,
 not re-validated" guarantee, without double rounding.
 
-**D2. The flip ceiling** is decided (section 10): +1.0% instructions, +5%
+**D2. The flip ceiling** is decided (sections 7.3 and 10): +1.0% instructions, +5%
 peak RSS, and +1.0% wall time on the median of at least 5 interleaved runs,
 which keeps the measurement outside the about 0.8% pairing noise of a median
 of 3 back to back.
@@ -3334,9 +3377,9 @@ comparison if it does, rather than carrying legacy order in the stage.
 | Ids | Packed (module, local) ids; a program-wide id is the module's base plus the local id. Ids are managed exclusively behind the opaque boundary. | 3.3, 3.15, 3.16, 4.4 |
 | Names | Interned per module | 3.2, 5.1 |
 | Declare-or-refer names | `x = v` and name patterns stay `NameUse`s that resolution decides; resolution stores binding form and mutability itself | 3.12, E5 |
-| Forms only typecheck rejects | The parser rejects them. Assignment as a statement only landed first, as its own change; the rest is M-1. | 3.9, 3.11, 3.12, 3.19, 8 |
-| Flip timing | Only within a hard ceiling, not counting on the tuple hand-off: +1% retired instructions, +5% peak RSS, +1% wall time on the median of at least 5 interleaved runs | 7.4, M6 |
-| Flip timing, revised 2026-10-02 | The ceilings are unchanged. After M0 measured the tree stage at +1.45% on today's compiler, M6 waits on the compiler work of `VALUE_TUPLES_AND_STATE_HANDOFF.md` (its question 7): increments 1 to 4, and increment 5 if M0 re-measured after increment 4 still needs it. M1 to M5 proceed in parallel. | 0, 7.2, 7.4, 8 |
+| Forms only typecheck rejected | Both parsers reject them; assignment-as-statement landed in `d460bac5f`, and M-1 landed in `020b95d90`. | 3.9, 3.11, 3.12, 3.19, 8 |
+| Product spelling | Ordinary `record` is the syntax-value target. `struct` and `fixed record` are temporary source forms represented by `ValueRecordSpelling` until the record simplification sequence removes their separate semantics. A scalar token may temporarily use `fixed record` only with a measured storage reason. | 2.3, 3.4, 3.7, 7.2, M2, M3 |
+| Flip timing | The stage switches from tables to trees only within +1% retired instructions, +5% peak RSS and +1% wall time. M6 waits on tuple increments 1 to 4, and increment 5 if re-measured M0 still needs it; record-shaped costs are measured again. M1 to M5 do not wait. | 0, 7.3, 8 |
 | Glue location | `compiler/discovery_front_end.brp` and `compiler/discovery_adapter.brp`, the only compiler modules importing `compiler_new`; rewritten in place over trees, deleted when typecheck reads trees directly | 6.1, M6 |
 | Literals | Discovery does not intern literal texts (the backend pools strings); the tree stores checked values | 5.2 |
 | Downstream reads | Typecheck and Core lowering reads come later; E1 to E21 cover resolution | 1, 4.7 |
