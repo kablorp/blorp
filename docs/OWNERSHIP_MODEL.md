@@ -26,7 +26,7 @@ records, payload unions, captured closures, channels, and other runtime objects
 classified by Core representation.
 
 Unmanaged values include primitive scalars, enums, fieldless unions, raw
-pointers, and dimension values. `record`, `struct`, and `fixed record` all
+pointers, and dimension values. `record` and `fixed record` both
 denote ordinary managed records; fields may themselves be managed.
 Type-header validation rejects mandatory recursive products before Core
 lowering, independently of the declaration spelling.

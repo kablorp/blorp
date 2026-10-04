@@ -27,7 +27,7 @@ class CompilerAntipatternAuditTests(unittest.TestCase):
         source_root.mkdir(parents=True)
         (source_root / "sample.brp").write_text(
             """\
-record CompilerState {
+fixed record CompilerState {
 \tfacts: Facts,
 \tnames: Dict[String, Int],
 \tfirst: Option[String],
@@ -38,7 +38,7 @@ record CompilerState {
 \terrors: List[String]
 }
 
-struct TinyValue {
+fixed record TinyValue {
 \tvalue: Int
 }
 
@@ -100,7 +100,6 @@ private pure func build_name_index[T](
                     "large-file": 1,
                     "small-tuple-return": 1,
                     "string-keyed-dict": 2,
-                    "struct-storage-review": 3,
                     "threaded-state-record": 1,
                 },
             )

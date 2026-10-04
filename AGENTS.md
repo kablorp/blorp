@@ -368,10 +368,10 @@ maps production sources and tests. In particular:
 - Pure functions may mutate local `var` state but cannot call impure functions
   or capture mutable variables in closures. Lambdas use `func`; use explicit
   state threading for pure lazy iterators.
-- `record`, `struct`, and `fixed record` have the same managed record semantics
+- `record` and `fixed record` have the same managed record semantics
   and ARC/COW behavior; prefer `record` for new declarations. The other
-  spellings do not promise inline storage or a native by-value ABI. Verify
-  current behavior in tests before changing layout or ownership.
+  spelling does not promise inline storage, no allocation, or a native by-value
+  ABI. Verify current behavior in tests before changing layout or ownership.
 - `standard_library/src/` is portable and always available. Do not add new
   explicit `foreign` declarations or native `_ffi.h` headers there. Optional
   native bindings, link flags, and third-party packages belong in `pkg/`.

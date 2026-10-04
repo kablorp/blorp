@@ -16,7 +16,7 @@ Prefer this style:
   effects such as I/O, sleeping, channels, or process/system calls.
 - Use immutable bindings by default. Reach for `var` only for local
   accumulators or clear step-by-step construction.
-- Model states with `enum`, `union`, `record`, and `struct`; do not smuggle
+- Model states with `enum`, `union`, and `record`; do not smuggle
   state through magic integers or strings.
 - Keep enums to real domain cases. Use `Option[T]` for absence/disabled state
   and `Result[T, E]` for parse or validation failure instead of adding escape
@@ -163,7 +163,7 @@ Prelude types such as `List`, `String`, `Option`, `Result`, `Dict`, and `Set`
 have common methods available without imports. Import non-prelude types or
 bare functions explicitly.
 
-## Records, Structs, Enums, and Unions
+## Records, Enums, and Unions
 
 Use `record` for most product data.
 
@@ -177,11 +177,11 @@ pure func birthday(user: User) -> User:
 	{ user | age = user.age + 1 }
 ```
 
-`struct` and `fixed record` are alternative spellings of `record`, with the
+`fixed record` is an alternative spelling of `record`, with the
 same managed ownership and value semantics. Prefer `record` for new declarations.
 
 ```blorp
-struct Vec2 {x: Float, y: Float}
+fixed record Vec2 {x: Float, y: Float}
 
 pure func add(a: Vec2, b: Vec2) -> Vec2:
 	{x = a.x + b.x, y = a.y + b.y}
@@ -542,7 +542,7 @@ if the cited code has since moved.
   `trait_resolve.brp` routes every union there). Two separately constructed
   `Circle(1.0)` values are `!=` unless you implement `Equatable` yourself.
 - **All record spellings are managed**, including inside `Option`, unions,
-  lists, and closures. Choosing `struct` or `fixed record` does not promise
+  lists, and closures. Choosing `fixed record` does not promise
   inline storage or remove allocation. Measure concrete hot workloads before
   choosing a representation optimization.
 - **`from_opaque` is transparent to ownership analysis, like a cast** — it

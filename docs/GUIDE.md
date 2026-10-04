@@ -183,7 +183,7 @@ func sum_with_destructuring() -> Int:
 ```
 
 Immutable top-level bindings are constants. Their initializers may use literal
-data, records, structs, tuples, collections, arithmetic, union constructors, and
+data, records, tuples, collections, arithmetic, union constructors, and
 pure computations that the compile-time evaluator supports. When an immutable
 global calls a pure function or method, the compiler evaluates that computation
 before Core lowering and materializes the result as ordinary global data.
@@ -216,7 +216,7 @@ func main(args: List[String]) -> Int:
 Compile-time evaluation follows source order, so later constants can reference
 earlier evaluated constants. A constant may not reference itself or a later
 constant. A constant may also be initialized from another module's constant,
-including structs, records, enums, unions and lists whose types that module
+including records, enums, unions and lists whose types that module
 owns. Top-level `var` bindings are mutable runtime globals, not constants.
 Local `var` mutation is allowed inside pure functions evaluated by the
 compiler.
@@ -1032,7 +1032,7 @@ These types are `Hashable` already:
   whose components are `Hashable`, element by element.
 
 `Dict` and `Set` are not `Hashable`; key by a sorted `List` of entries instead.
-For your own `struct`, `record` and `union` types, implement both traits over
+For your own `record` and `union` types, implement both traits over
 the same fields:
 
 ```blorp
@@ -1175,12 +1175,13 @@ Each field name appears once in a declaration, a record literal and a record upd
 `record P { x: Int, x: Int }` and `{ x = 1, x = 2 }` are rejected at the second `x`, and
 the message gives the position of the first.
 
-### Alternative Record Spellings
+### Fixed Records
 
-`struct` and `fixed record` are alternative spellings of `record`. All three
+`fixed record` is an alternative spelling of `record`. Both
 have ordinary managed record behavior: ARC ownership, value-preserving updates,
 and the same field, type-parameter, dimension-parameter, and empty-record rules.
-Neither spelling promises stack storage, an unmanaged layout, or a C ABI.
+Neither spelling promises stack storage, no allocation, an unmanaged layout,
+or a foreign by-value ABI.
 
 ```blorp
 fixed record Color {r: UInt8, g: UInt8, b: UInt8, a: UInt8}
@@ -1189,19 +1190,10 @@ c: Color = {r = to_uint8(255), g = to_uint8(0), b = to_uint8(0), a = to_uint8(25
 red: UInt8 = c.r
 ```
 
-The `struct` spelling behaves identically:
-
-```blorp
-struct Color {r: UInt8, g: UInt8, b: UInt8, a: UInt8}
-
-c: Color = {r = to_uint8(255), g = to_uint8(0), b = to_uint8(0), a = to_uint8(255)}
-red: UInt8 = c.r
-```
-
 Both spellings support record update syntax:
 
 ```blorp
-struct Vec2 {x: Float, y: Float}
+fixed record Vec2 {x: Float, y: Float}
 
 v: Vec2 = {x = 1.0, y = 2.0}
 moved: Vec2 = { v | x = v.x + 10.0 }   -- v remains unchanged
@@ -1210,6 +1202,9 @@ moved: Vec2 = { v | x = v.x + 10.0 }   -- v remains unchanged
 Prefer `record` for new declarations. Choosing another spelling does not change
 ownership or allocation behavior. Managed fields such as `String` and `List[T]`
 are accepted in every spelling.
+
+`fixed` is contextual: it modifies a following `record` declaration and remains
+an ordinary identifier elsewhere. `struct` is also an ordinary identifier.
 
 ### Union Types (Sum Types / ADTs)
 
@@ -1818,7 +1813,7 @@ result2: Option[Int] = safe_divide(10, 2)
 Representation note: `Option[T]` is optimized by payload type. Primitive
 numeric/bool/char payloads, `Int128`/`UInt128`, bounded range types, and enums
 use stack `{tag, value}` layouts. Managed payloads such
-as `String`, `List[T]`, records (including `struct` and `fixed record`),
+as `String`, `List[T]`, records (including `fixed record`),
 first-class `Range`, non-enum `union`, tuples, and functions
 use an internal nullable-pointer layout. Nested options, `Ptr`, unresolved
 generic payloads, and unsupported payloads stay boxed so `Some(x)` and `None`
@@ -1976,7 +1971,7 @@ a terminal operation such as `collect_result()`, `fold_result(...)`,
 A non-positive explicit chunk size or window size is reported as
 `Err(InvalidInput(...))` by the terminal operation. Streams are one-shot cursors,
 so they cannot be bound globally or stored in ordinary aggregates such as
-tuples, lists, dicts, records, structs, or unions, and they cannot be hidden
+tuples, lists, dicts, records or unions, and they cannot be hidden
 inside ordinary carrier type aliases such as
 `type alias MaybeStream = Option[Stream[T]]`. Ordinary local bindings such as
 `maybe: Option[Stream[T]] = None` and ordinary function signatures containing
@@ -2285,7 +2280,7 @@ The key idea: an `implements` block connects behavior to a type after the type d
 Arithmetic operators (`+`, `-`, `*`, `/`, `%`, unary `-`) dispatch through traits. Implement the corresponding trait for your type and the operator just works:
 
 ```blorp
-struct Vec2 {x: Float, y: Float}
+fixed record Vec2 {x: Float, y: Float}
 
 implements Addable for Vec2:
     pure func add(a: Vec2, b: Vec2) -> Vec2:
@@ -2314,14 +2309,14 @@ e: Vec2 = -a             -- {x = -1.0, y = -2.0}
 Similarly, implement `Equatable` for `==`/`!=` and `Orderable` for `<`, `>`, `<=`, `>=`:
 
 ```blorp
-struct Vec2 {x: Float, y: Float}
+fixed record Vec2 {x: Float, y: Float}
 
 implements Equatable for Vec2:
     pure func equals(a: Vec2, b: Vec2) -> Bool:
         a.x == b.x and a.y == b.y
 ```
 
-Every type that has data needs an explicit `Equatable` implementation to use `==`: records, structs, and unions with payloads. There is no identity fallback. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, and `List`. `Option[T]`, `Result[T, E]`, tuples, and `List[T]` are `Equatable` exactly when their components are, so `Option[Point]` is rejected unless `Point` implements `Equatable`.
+Every type that has data needs an explicit `Equatable` implementation to use `==`: records and unions with payloads. There is no identity fallback. Payload-free `enum`s are compared by tag and need no implementation, and the standard library provides the implementations for scalars, `String`, tuples, `Option`, `Result`, and `List`. `Option[T]`, `Result[T, E]`, tuples, and `List[T]` are `Equatable` exactly when their components are, so `Option[Point]` is rejected unless `Point` implements `Equatable`.
 
 `List[T]` is `Equatable` exactly when `T` is: `==` compares lengths, then elements
 with the element type's own `==`, so lists of lists, options, and records with an
@@ -3466,7 +3461,7 @@ for source formatting.
 ## 18. Keywords
 
 ```
-func       pure       var        union      enum       record     struct     trait
+func       pure       var        union      enum       record     trait
 type       alias      opaque     private    import     as         implements Self
 builtin    on
 match      while      for        in         if         else       and        or

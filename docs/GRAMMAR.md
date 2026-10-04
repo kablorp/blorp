@@ -36,7 +36,7 @@ continues the previous expression instead of starting an indented block.
 ### Keywords
 
 ```
-func   pure   var   union   enum   record   struct   void
+func   pure   var   union   enum   record   void
 while  for    in    if      else   and      or       not
 break  continue    match   import   as       private   on
 debug  resource     implements   trait   Self   type   alias   opaque
@@ -128,7 +128,6 @@ decl = [ docstring ] ( func_decl
                       | enum_decl
                       | record_decl
                       | fixed_record_decl
-                      | struct_decl
                       | var_decl
                       | trait_decl
                       | impl_decl
@@ -281,8 +280,8 @@ variant_name = IDENT | "True" | "False" ;
 
 record_decl = "record" IDENT [ type_params ] "{" field_list "}" ;
 fixed_record_decl = "fixed" "record" IDENT [ type_params ] "{" field_list "}" ;
-struct_decl = "struct" IDENT [ type_params ] "{" field_list "}" ;
-(* All three spellings have ordinary managed record semantics, including empty fields and parameters. *)
+(* Both spellings have ordinary managed record semantics, including empty fields and parameters. *)
+(* `fixed` is contextual before `record`; elsewhere it is an identifier. `struct` is an ordinary identifier. *)
 
 field_list = [ field_decl { "," field_decl } [ "," ] ] ;
 field_decl = identifier ":" type_expr ;

@@ -755,8 +755,8 @@ each node: a name-site table per body, and two disjoint sparse target satellites
 unresolved and recovery sites stay in the site table without a sentinel id, and one
 accessor reads the right satellite). The composite site key `(owner_definition_id,
 site_id)` is stored as two scalar fields in the existing typed record; a standalone
-struct inside the erased typed-expression union is rejected if generated C boxes it
-or the allocation census rises per name occurrence. Inference owns a distinct, initially empty
+managed record inside the erased typed-expression union is rejected if
+the allocation census rises per name occurrence. Inference owns a distinct, initially empty
 builder for the non-local satellite (never appending into the borrowed local table
 and never part of the per-body seed), consumed once at the body-outcome boundary;
 accepted and recovered outcomes and completed global headers store the finalized

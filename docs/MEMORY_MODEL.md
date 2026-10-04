@@ -65,7 +65,7 @@ items = items.append(2)
 
 Ignoring the returned value leaves `items` unchanged at the source level.
 
-## Records, Fixed Records, And Structs
+## Records And Fixed Records
 
 `record` values are managed heap values with COW behavior. Record update always
 creates a new logical value:
@@ -80,9 +80,9 @@ q: Point = { p | x = 10 }
 `p` remains `{x = 1, y = 2}` and `q` is `{x = 10, y = 2}`. The compiler may
 reuse `p`'s allocation when ownership proves no other live value can observe it.
 
-`struct` and `fixed record` have the same managed representation and ownership
+`fixed record` has the same managed representation and ownership
 rules as `record`, including managed fields and generic parameters. Prefer
-`record` for new declarations. None of these spellings promises an unmanaged
+`record` for new declarations. Neither spelling promises no allocation, an unmanaged
 layout or a foreign by-value ABI.
 
 ## Option And Result

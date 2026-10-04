@@ -29,12 +29,11 @@ RULES = (
     "large-file",
     "small-tuple-return",
     "string-keyed-dict",
-    "struct-storage-review",
     "threaded-state-record",
 )
 
 TYPE_DECLARATION = re.compile(
-    r"^(?P<indent>[ \t]*)(?:private\s+)?(?P<kind>record|struct)\s+"
+    r"^(?P<indent>[ \t]*)(?:private\s+)?(?P<kind>record|fixed record)\s+"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\{",
 )
 FUNCTION_START = re.compile(
@@ -48,9 +47,6 @@ DICT_STRING = re.compile(r"\bDict\s*\[\s*String\s*,")
 OPTION_TYPE = re.compile(r"\bOption\s*\[")
 BOOL_TYPE = re.compile(r"^Bool\b")
 INDEX_BUILDER_NAME = re.compile(r"(?:build.*index|index.*build)", re.IGNORECASE)
-UNION_START = re.compile(
-    r"^(?:private\s+)?union\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)[^:]*:\s*$"
-)
 
 
 @dataclass(frozen=True)
@@ -312,14 +308,13 @@ def collect_findings(source_root: Path, large_file_lines: int) -> tuple[list[Fin
                 )
             )
 
-    record_types = {declaration.name: declaration for declaration in types if declaration.kind == "record"}
-    struct_names = {declaration.name for declaration in types if declaration.kind == "struct"}
+    record_types = {declaration.name: declaration for declaration in types if declaration.kind in {"record", "fixed record"}}
 
     for declaration in types:
         shown_path = display_path(declaration.path, source_root)
         option_fields = sum(bool(OPTION_TYPE.match(field_type)) for _, field_type, _ in declaration.fields)
         bool_fields = sum(bool(BOOL_TYPE.match(field_type)) for _, field_type, _ in declaration.fields)
-        if declaration.kind == "record" and option_fields >= 2 and bool_fields >= 1:
+        if declaration.kind in {"record", "fixed record"} and option_fields >= 2 and bool_fields >= 1:
             findings.append(
                 Finding(
                     "flag-state-record",
@@ -447,48 +442,6 @@ def collect_findings(source_root: Path, large_file_lines: int) -> tuple[list[Fin
                     f"{len(declaration.fields)}-field record is accepted and returned directly or in a carrier by {len(set(names))} functions",
                 )
             )
-
-    for path, text, lines in parsed_files:
-        shown_path = display_path(path, source_root)
-        for struct_name in sorted(struct_names):
-            container = re.compile(rf"\b(?P<kind>Option|List)\s*\[\s*{re.escape(struct_name)}\s*\]")
-            for match in container.finditer(text):
-                findings.append(
-                    Finding(
-                        "struct-storage-review",
-                        "medium",
-                        shown_path,
-                        line_number(text, match.start()),
-                        struct_name,
-                        f"struct appears in {match.group('kind')} placement; verify final layout and hot read behavior",
-                    )
-                )
-
-        index = 0
-        while index < len(lines):
-            union = UNION_START.match(lines[index].rstrip("\n"))
-            if union is None:
-                index += 1
-                continue
-            base_indent = indentation(lines[index])
-            index += 1
-            while index < len(lines):
-                line = lines[index]
-                if line.strip() and indentation(line) <= base_indent:
-                    break
-                for struct_name in sorted(struct_names):
-                    if re.search(rf"\(\s*{re.escape(struct_name)}\s*\)", line):
-                        findings.append(
-                            Finding(
-                                "struct-storage-review",
-                                "medium",
-                                shown_path,
-                                index + 1,
-                                struct_name,
-                                f"struct is a payload of union {union.group('name')}; verify final layout and hot read behavior",
-                            )
-                        )
-                index += 1
 
     return sorted(findings, key=lambda item: (item.rule, item.path, item.line, item.symbol)), len(files), total_lines
 

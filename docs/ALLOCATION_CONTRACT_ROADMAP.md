@@ -38,7 +38,7 @@ implementation of `no_alloc`.
 
 | Current owner | Relevant fact and consequence |
 | --- | --- |
-| `standard_library/src/memory.brp` | `MemStats` is an allocation-free struct. Its counters observe executions, not all paths or allocation causes. `total_releases` counts deallocations, not every ARC decrement. Snapshot bytes are not peak bytes. |
+| `standard_library/src/memory.brp` | `MemStats` is a managed record; snapshots allocate. Exact allocation intervals use scalar `read_memory_counter(MemoryCounter)` endpoints. Counters observe executions, not all paths or allocation causes. `total_releases` counts deallocations, not every ARC decrement. Snapshot bytes are not peak bytes. |
 | `blorp/src/lib/runtime/native/runtime.c` | `blorp_init_object_header`, managed release accounting, raw buffer allocation, pool allocation, tracing, and scheduler allocation are different paths. The former `BLORP_TRACE_ALLOCS` return-address table was removed; it never gave a complete source-level allocation proof. |
 | `stage_09_core/ir.brp` | Explicit boxes, list allocation/construction, record/union construction and reuse, closure creation, drops, resources, and concurrency already expose many relevant operations. `CoreCallKind` is richer than user/builtin/foreign; every variant needs an explicit policy. |
 | `stage_09_core/type_policy.brp`, `ownership.brp` | Ownership and representation facts are reusable inputs, **not** allocation summaries. A scalar-returning call can allocate temporaries. `FreshOwned` describes a result, not all work in a call. |
@@ -274,11 +274,11 @@ an optional boolean that means "someone probably checked this earlier."
 | Concrete representation/operation | Required classifier behavior |
 | --- | --- |
 | `PrimBox`, `PointerBox`, `VoidBox`, Float/Float32/Float16 boxes | No direct allocation in current runtime; floats are bit-packed into pointer-sized storage. Analyze the operand. A helper named `box` alone is not evidence of allocation. |
-| Int128/UInt128/struct boxes | Heap allocation risk; see `emit.brp` box rendering and the actual runtime helper |
+| Int128/UInt128/scalar ABI struct boxes | Heap allocation risk; see `emit.brp` box rendering and the actual runtime helper |
 | `CoreBoxedStorageValue`, tuple elements, closure/task argument adapters | Classify implicit boxing in the storage/ABI plan, not just explicit `BoxExpr` children |
 | `TupleConstructExpr` | Current prepared tuple renderer calls `blorp_tuple_new` |
 | Dict iteration with a pair binder | Current prepared backend renderer constructs a tuple; seemingly read-only iteration can allocate |
-| `RecordConstructExpr` | Distinguish heap records from inline value records |
+| `RecordConstructExpr` | Both record spellings construct managed records; accept only when final Core removes allocation |
 | `ClosureCreateExpr` | Static zero-capture representation differs from allocated capture environment |
 | `ClosureCall` | Unknown target and argument/result ABI boxing are independent risks; V1 rejects unresolved closure calls |
 | `ForeignDefaultArgs` | Defensive argument copying can allocate even if the foreign body is audited; `@no_copy` is not an allocation-free promise |
@@ -351,7 +351,7 @@ dynamic destructor dispatch is not free. COW and reuse forms remain
 Do not infer no allocation solely from `RecordReuseExpr`/`UnionReuseConstructExpr`.
 
 **Example.** A self-recursive union's drop depends on a destructor plan with
-`RawScratchGrowth`; a plain integer struct drop has no such dependency.
+`RawScratchGrowth`; a primitive scalar drop has no such dependency.
 `ListGetExpr` may require boxing for some layouts and no boxing for others.
 
 **Fast loop.** Extend `test_core_allocation_contracts.brp` with the missing
@@ -571,7 +571,7 @@ cross-task recorder. No public runtime aborting `no_alloc` mode is required.
 | Case | Expected proof and observation |
 | --- | --- |
 | Scalar arithmetic, audited scalar borrow/read | Accept; zero covered heap requests |
-| Static string, scalar struct | Accept when final representation is static/inline |
+| Static string, primitive scalar | Accept when final representation is static/inline |
 | Payload union/record constructor | Reject unless final Core completely removes allocation |
 | Empty collection canonical singleton | Accept only for exact known static representation |
 | COW update with shared receiver or exhausted capacity | Reject; exercise both allocating paths |
@@ -630,7 +630,7 @@ and the affected runtime/Core owner tests, followed by one measured workload.
 
 **Acceptance.** More cases accepted without weakening existing guarantees;
 negative/shared/cold paths remain rejected. No global effect-polymorphism or
-managed-struct feature is smuggled into a precision patch. Each follow-up has
+new record-layout feature is smuggled into a precision patch. Each follow-up has
 its own reviewed scope and measured benefit; V1 completion does not depend on it.
 
 ## Coordination and validation

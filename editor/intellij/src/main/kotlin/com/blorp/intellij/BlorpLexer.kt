@@ -159,7 +159,6 @@ class BlorpLexer : LexerBase() {
             "pure",
             "record",
             "resource",
-            "struct",
             "trait",
             "type",
             "union",

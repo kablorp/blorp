@@ -2426,7 +2426,7 @@ record Point {x: Int, y: Int}
 
 record Counter {value: Int}
 
-struct Box {value: Int}
+fixed record Box {value: Int}
 
 union OptionLike[T]:
     SomeLike(T)

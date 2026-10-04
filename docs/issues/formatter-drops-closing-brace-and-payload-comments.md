@@ -2,7 +2,7 @@
 
 Status: open.
 
-Comments inside record, struct, union and enum bodies are kept, but two
+Comments inside record, fixed record, union and enum bodies are kept, but two
 neighbouring places still lose or move them. Both behave the same before and
 after member comments were kept, so neither is a regression from that change.
 
