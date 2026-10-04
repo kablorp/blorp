@@ -18,12 +18,45 @@ cat > "$fake_compiler" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${1:-}" = "run" ]; then
+	# The production driver must supply the authoritative final Core input.
+	for final_core in "$@"; do :; done
+	if [ ! -s "$final_core" ]; then
+		echo "fake compiler: missing final Core dump" >&2
+		exit 1
+	fi
+	rows=$(cat <<'ROWS'
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutThreeFlags c_type=ProbeThreeFlags field_first=mapped_first field_second=mapped_second field_third=mapped_third
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutMixed c_type=ProbeMixed field_first=mapped_first field_count=mapped_count field_second=mapped_second field_total=mapped_total
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutHeapFlags c_type=ProbeHeapFlags field_first=mapped_first field_second=mapped_second field_third=mapped_third field_payload=mapped_payload
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutHeapDenseFlags c_type=ProbeHeapDenseFlags field_first=mapped_first field_second=mapped_second field_third=mapped_third field_fourth=mapped_fourth field_fifth=mapped_fifth field_sixth=mapped_sixth field_seventh=mapped_seventh field_eighth=mapped_eighth field_ninth=mapped_ninth field_payload=mapped_payload
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutHeapInterleavedFlags c_type=ProbeHeapInterleavedFlags field_first=mapped_first field_count=mapped_count field_second=mapped_second
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutHeapStates c_type=ProbeHeapStates field_count=mapped_count field_first=mapped_first field_second=mapped_second field_third=mapped_third
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutForeignHeapFlags c_type=ProbeForeignHeapFlags field_first=mapped_first field_second=mapped_second field_count=mapped_count
+RECORD_LAYOUT_SYMBOL schema=1 record=LayoutForeignHeapState c_type=ProbeForeignHeapState field_state=mapped_state field_count=mapped_count
+ROWS
+	)
+	case "${BLORP_RECORD_LAYOUT_FAKE_MAPPING:-valid}" in
+		valid) printf '%s\n' "$rows" ;;
+		missing) printf '%s\n' "$rows" | sed '1d' ;;
+		duplicate) printf '%s\n%s\n' "$rows" "$rows" ;;
+		malformed) printf '%s\n' "$rows" | sed 's/c_type=ProbeMixed/c_type=bad-name/' ;;
+		duplicate_key) printf '%s\n' "$rows" | sed 's/schema=1/schema=1 schema=1/' ;;
+		unknown_field) printf '%s\n' "$rows" | sed 's/field_total=mapped_total/field_extra=mapped_total/' ;;
+	esac
+	exit 0
+fi
+
 output=""
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 		-o)
 			output="$2"
 			shift 2
+			;;
+		--dump-core-file=*)
+			printf '%s\n' '-- blorp mock' '===== after final =====' '{}' > "${1#*=}"
+			shift
 			;;
 		*)
 			shift
@@ -40,73 +73,70 @@ cat > "$output" <<'C'
 #include <stddef.h>
 #include <stdint.h>
 
-static const size_t blorp_pool_sizes[] = {32, 64, 96, 128};
-static int blorp_pool_class(size_t size) {
-	if (size == 0 || size > 128) return -1;
-	return (int)((size - 1) / 32);
-}
+/* The managed header matches runtime_decl.c, not an assumed byte array. */
+typedef struct blorp_Object_s {
+	_Atomic long refcount;
+	uint32_t alloc_class;
+	uint32_t destructor_id;
+} blorp_Object;
 
-typedef struct { int first; int second; int third; } LayoutThreeFlags;
+typedef struct ProbeThreeFlags {
+	blorp_Object header;
+	_Bool mapped_first : 1;
+	_Bool mapped_second : 1;
+	_Bool mapped_third : 1;
+} ProbeThreeFlags;
 typedef struct {
-	int tag;
-	LayoutThreeFlags value;
-} blorp_StackOption_LayoutThreeFlags;
-typedef struct {
-	int first;
-	long count;
-	int second;
-	long total;
-} LayoutMixed;
-typedef struct LayoutHeapFlags {
-	long header[2];
-	void* payload;
-	_Bool first : 1;
-	_Bool second : 1;
-	_Bool third : 1;
-} LayoutHeapFlags;
-typedef struct LayoutHeapDenseFlags {
-	long header[2];
-	void* payload;
-	_Bool first : 1;
-	_Bool second : 1;
-	_Bool third : 1;
-	_Bool fourth : 1;
-	_Bool fifth : 1;
-	_Bool sixth : 1;
-	_Bool seventh : 1;
-	_Bool eighth : 1;
-	_Bool ninth : 1;
-} LayoutHeapDenseFlags;
-typedef struct LayoutHeapInterleavedFlags {
-	long header[2];
-	long count;
-	_Bool first;
-	_Bool second;
-} LayoutHeapInterleavedFlags;
-typedef struct LayoutHeapStates {
-	long header[2];
-	long count;
-	uint8_t first;
-	uint8_t second;
-	uint8_t third;
-} LayoutHeapStates;
-typedef struct LayoutForeignHeapFlags {
-	long header[2];
-	int first;
-	int second;
-	long count;
-} LayoutForeignHeapFlags;
-typedef struct LayoutForeignHeapState {
-	long header[2];
-	long state;
-	long count;
-} LayoutForeignHeapState;
-typedef struct {
-	int first;
-	long count;
-	int second;
-	long total;
-} LayoutForeignMixed;
+	blorp_Object header;
+	long mapped_count;
+	long mapped_total;
+	_Bool mapped_first;
+	_Bool mapped_second;
+} ProbeMixed;
+typedef struct ProbeHeapFlags {
+	blorp_Object header;
+	void* mapped_payload;
+	_Bool mapped_first : 1;
+	_Bool mapped_second : 1;
+	_Bool mapped_third : 1;
+} ProbeHeapFlags;
+typedef struct ProbeHeapDenseFlags {
+	blorp_Object header;
+	void* mapped_payload;
+	_Bool mapped_first : 1;
+	_Bool mapped_second : 1;
+	_Bool mapped_third : 1;
+	_Bool mapped_fourth : 1;
+	_Bool mapped_fifth : 1;
+	_Bool mapped_sixth : 1;
+	_Bool mapped_seventh : 1;
+	_Bool mapped_eighth : 1;
+	_Bool mapped_ninth : 1;
+} ProbeHeapDenseFlags;
+typedef struct ProbeHeapInterleavedFlags {
+	blorp_Object header;
+	long mapped_count;
+	_Bool mapped_first;
+	_Bool mapped_second;
+} ProbeHeapInterleavedFlags;
+typedef struct ProbeHeapStates {
+	blorp_Object header;
+	long mapped_count;
+	uint8_t mapped_first;
+	uint8_t mapped_second;
+	uint8_t mapped_third;
+} ProbeHeapStates;
+typedef struct ProbeForeignHeapFlags {
+	blorp_Object header;
+	int mapped_first;
+	int mapped_second;
+	long mapped_count;
+} ProbeForeignHeapFlags;
+typedef struct ProbeForeignHeapState {
+	blorp_Object header;
+	long mapped_state;
+	long mapped_count;
+} ProbeForeignHeapState;
 
 int main(void) {
 	return 0;
@@ -115,9 +145,9 @@ C
 EOF
 chmod +x "$fake_compiler"
 printf '%s\n' \
-	'-- EXPECT-C: typedef struct { int first; int second; int third; } LayoutThreeFlags;' \
+	'-- EXPECT-C: typedef struct ProbeThreeFlags {' \
 	> "$fake_source"
-printf '%s\n' '#define blorp_layout_foreign_identity(value) (value)' > "$fake_support_header"
+printf '%s\n' 'int blorp_layout_foreign_mixed_fields(int first, long count, int second, long total);' > "$fake_support_header"
 printf '%s\n' 'int fake_support_source;' > "$fake_support_source"
 printf '%s\n' \
 	'-- EXPECT-C: typedef struct MissingLayoutExpectation {' \
@@ -138,23 +168,22 @@ output=$(
 	"$runner"
 )
 
-if [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -ne 19 ]; then
-	echo "FAIL: record layout probe must emit one metadata and eighteen layout rows" >&2
+if [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -ne 17 ]; then
+	echo "FAIL: record layout probe must emit one metadata and sixteen layout rows" >&2
 	printf '%s\n' "$output" >&2
 	exit 1
 fi
 
 for mode in O0 O2; do
 	for expected in \
-		"layout=three_flags size=12 align=4 c_type=LayoutThreeFlags" \
-		"layout=mixed size=32 align=8 c_type=LayoutMixed" \
-		"layout=heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 payload_offset=16 payload_size=8 c_type=LayoutHeapFlags" \
-		"layout=dense_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 payload_offset=16 payload_size=8 c_type=LayoutHeapDenseFlags" \
-		"layout=interleaved_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 count_offset=16 count_size=8 first_offset=24 first_size=1 second_offset=25 second_size=1 c_type=LayoutHeapInterleavedFlags" \
-		"layout=heap_states size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 count_offset=16 count_size=8 first_offset=24 first_size=1 second_offset=25 second_size=1 third_offset=26 third_size=1 c_type=LayoutHeapStates" \
-		"layout=foreign_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 first_offset=16 first_size=4 second_offset=20 second_size=4 count_offset=24 count_size=8 c_type=LayoutForeignHeapFlags" \
-		"layout=foreign_heap_state size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 state_offset=16 state_size=8 count_offset=24 count_size=8 c_type=LayoutForeignHeapState" \
-		"layout=foreign_mixed size=32 align=8 first_offset=0 first_size=4 count_offset=8 count_size=8 second_offset=16 second_size=4 total_offset=24 total_size=8 c_type=LayoutForeignMixed"
+		"layout=three_flags size=24 align=8 allocator_bytes=24 header_offset=0 header_size=16 c_type=ProbeThreeFlags" \
+		"layout=mixed size=40 align=8 allocator_bytes=40 header_offset=0 header_size=16 count_offset=16 count_size=8 total_offset=24 total_size=8 first_offset=32 first_size=1 second_offset=33 second_size=1 c_type=ProbeMixed" \
+		"layout=heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 payload_offset=16 payload_size=8 c_type=ProbeHeapFlags" \
+		"layout=dense_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 payload_offset=16 payload_size=8 c_type=ProbeHeapDenseFlags" \
+		"layout=interleaved_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 count_offset=16 count_size=8 first_offset=24 first_size=1 second_offset=25 second_size=1 c_type=ProbeHeapInterleavedFlags" \
+		"layout=heap_states size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 count_offset=16 count_size=8 first_offset=24 first_size=1 second_offset=25 second_size=1 third_offset=26 third_size=1 c_type=ProbeHeapStates" \
+		"layout=foreign_heap_flags size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 first_offset=16 first_size=4 second_offset=20 second_size=4 count_offset=24 count_size=8 c_type=ProbeForeignHeapFlags" \
+		"layout=foreign_heap_state size=32 align=8 allocator_bytes=32 header_offset=0 header_size=16 state_offset=16 state_size=8 count_offset=24 count_size=8 c_type=ProbeForeignHeapState"
 	do
 		if ! grep -Fq "RECORD_LAYOUT mode=$mode $expected" <<<"$output"; then
 			echo "FAIL: missing $mode layout row: $expected" >&2
@@ -190,6 +219,25 @@ then
 	cat "$stage_dir/missing.err" >&2
 	exit 1
 fi
+
+for corruption in missing duplicate malformed duplicate_key unknown_field; do
+	if BLORP_RECORD_LAYOUT_SKIP_BUILD=1 \
+		BLORP_RECORD_LAYOUT_COMPILER="$fake_compiler" \
+		BLORP_RECORD_LAYOUT_SOURCE="$fake_source" \
+		BLORP_RECORD_LAYOUT_SUPPORT_HEADER="$fake_support_header" \
+		BLORP_RECORD_LAYOUT_SUPPORT_SOURCE="$fake_support_source" \
+		BLORP_RECORD_LAYOUT_FAKE_MAPPING="$corruption" \
+		"$runner" >"$stage_dir/$corruption.out" 2>"$stage_dir/$corruption.err"
+	then
+		echo "FAIL: record layout probe must reject $corruption symbol mappings" >&2
+		exit 1
+	fi
+	if ! grep -Fq 'compiler_record_layout: invalid symbol mapping:' "$stage_dir/$corruption.err"; then
+		echo "FAIL: $corruption mapping rejection lacks a diagnostic" >&2
+		cat "$stage_dir/$corruption.err" >&2
+		exit 1
+	fi
+done
 
 if "$enum_layout_runner" \
 	--generated-c "$unparsable_enum_record" \

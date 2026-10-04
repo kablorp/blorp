@@ -60,12 +60,12 @@ lookup fallback in the reserved source; storing it in frozen rows fails
 
 ## Rows, ranges and construction
 
-The flat `DiscoveryBuilder` owns output and transient state. Most rows are
-scalar structs stored inline in lists, with no allocation per row. Text lives
-in the names, paths, source-text and literal tables. Optional relationships
-are side rows, at most one per owner; variable-length children occupy
-contiguous child-table blocks addressed by `RowRange`. Rows with union
-fields (request outcomes and diagnostics) are records instead.
+The flat `DiscoveryBuilder` owns output and transient state. All source record
+spellings are managed and accept type parameters; `fixed record` does not
+select inline storage. Row construction and storage costs require measurement.
+Text lives in the names, paths, source-text and literal tables. Optional
+relationships are side rows, at most one per owner; variable-length children occupy
+contiguous child-table blocks addressed by `RowRange`.
 
 Module definition/import/node/syntax-diagnostic ranges close after its parse.
 Imports, selected items and foreign blocks append at close from typed

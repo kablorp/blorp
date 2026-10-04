@@ -945,14 +945,15 @@ record ForeignCName {
 
 One record per class. Two forms share a record only when they have the same
 parts: a constant and a mutable global, or an alias and an opaque type. Forms
-with different parts get separate records: an ordinary record takes type
-parameters, while today's `struct` and `fixed record` declarations do not;
-a resource type has a cleanup builtin and a builtin type does not; an `enum`
+with different parts get separate records: a resource type has a cleanup
+builtin and a builtin type does not; an `enum`
 case has no payload and a `union` variant may. Otherwise one record would
-have to allow a combination the grammar forbids. The two old value-record
-spellings share one temporary declaration form until the record simplification
-sequence removes their distinct semantics. The adapter retains their source
-spelling for parity with the old parsed AST.
+have to allow a combination the grammar forbids. All source record forms
+accept type parameters and already have ordinary managed record semantics.
+The temporary `ValueRecordDeclaration` retains `struct` and `fixed record`
+source spelling only for adaptation to the legacy parsed AST, not for a
+distinct layout or ownership policy. That adaptation distinction remains
+until keyword retirement.
 
 ```blorp
 ---
@@ -1043,6 +1044,7 @@ record ValueRecordDeclaration {
 	documentation: Option[Documentation],
 	spelling: ValueRecordSpelling,
 	name: WrittenName,
+	type_parameters: List[TypeParameter],
 	fields: List[FieldDeclaration],
 	span: Span
 }
@@ -3055,7 +3057,7 @@ must be measured before M6.
 | Boundary | Evidence and required next measurement |
 | --- | --- |
 | Syntax values | M1's proposed `record` names, binders, counts, annotations and forms need representative construction and return probes. Keep the role and id contract; measure its cost rather than reverting to `struct` to match M0. |
-| Tokens | M2 compares the provisional scalar `fixed record Token` with an ordinary `record` on the same token corpus, including retained bytes and instructions. Keep an inline token only while it is an explicit, measured storage exception under the record simplification plan. |
+| Tokens | M2 measures the provisional `Token` on the same token corpus, including retained bytes and instructions. `fixed record` versus `record` does not itself select inline storage: both are managed. Any future inline placement requires a separate, measured record optimization. |
 | Parser hand-off | M0 attributed substantial cost to transient state/tuple work. Its experimental tuple compiler was not the incremental implementation. Re-measure after the actual tuple increments; the report retains the historical comparison. |
 | Link and removed tables | Deleting freeze, openings, side tables, sigil interning and owner searches may save work; M0 did not measure these deletions or the new link. Measure the complete stage at M5. |
 | Tree adapter | M0 did not build it. Measure the structural adapter at M5; do not carry forward the disproved estimates. |
@@ -3120,8 +3122,8 @@ required at M1. The M0 prototype is evidence only.
 | # | Change | Proof | Deleted |
 | --- | --- | --- | --- |
 | **M1** | Retain and rerun the opaque-type import-cycle repro (section 3.15), fixing the compiler if it still fails. Then `syntax/`: every type of section 3, using ordinary `record` for the proposed name and syntax values; `syntax/ids.brp` with `IdMint`; the layout rule that confines `IdMint` to `parse/` and tests; `syntax/dump.brp`; and unit tests that build each form through the mint and dump it. Nothing calls it yet. | Tests; `compiler-new` gate; the layout check rejects an import of `IdMint` from outside `parse/`; record-shape construction and return costs recorded (section 7.2) | none |
-| **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. Decide the provisional `fixed record Token` from a same-corpus record/layout probe. | Token parity test unchanged; `tables` dump identical; token storage and bridge costs recorded | the lexer's builder appenders; transient interpolation tables |
-| **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout. The temporary `ValueRecordSpelling` preserves today's `struct` and `fixed record` syntax for the adapter until record semantics converge. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison, tree path against the old parser including both value-record spellings; per-module declaration diagnostics equal to today's stage | none |
+| **M2** | The lexer becomes `lex_module(module, text) -> LexedModule`, with per-module `Spellings`, checked `LiteralValue`s and `InterpolationScan`. The existing builder path consumes `LexedModule` through a bridge that interns spellings into the builder and rewrites token payloads. Measure the provisional managed `Token` on the same corpus; any future inline placement is a separate record optimization, not a source-spelling choice. | Token parity test unchanged; `tables` dump identical; token storage and bridge costs recorded | the lexer's builder appenders; transient interpolation tables |
+| **M3** | `parse/` over trees, declaration level: module items, imports, foreign blocks, signatures, type parameters, bounds, written types, dimensions, patterns. Bodies are skipped by layout. The temporary `ValueRecordSpelling` preserves today's `struct` and `fixed record` source spelling for legacy parsed AST adaptation until keyword retirement; managed semantics have already converged. Then the tree adapter's declaration half, behind a test-only entry. | The differential's declaration-level comparison, tree path against the old parser including both retained record spellings; per-module declaration diagnostics equal to today's stage | none |
 | **M4** | The body parser over trees (statements, blocks, expressions), and the tree adapter's body half. | Full-AST differential: the tree path equals the old parser on every corpus module and root run; every rendered diagnostic per module equals today's stage, except the listed broken-import case; the syntax dump differential matches; the id census passes; the deep-chain tests of section 3.14 pass through parse, dump, adapter and the old typecheck | none |
 | **M5** | `sources/module_walk.brp`, `link/`, `DiscoveryOutcome`, and `discovery_front_end.brp` on the tree path, behind an internal test-only selection, with `compiler-new`, `cli` and `package` gates exercised on both stage paths. | Module-order parity; self-compile C identical (or normalized); cost measured with the cost tool's `tables` and `graph` modes and the self-compile against matched main | none |
 | **M6** | Make the tree path the stage's default, within the ceiling of section 7.3, and delete the table path in the same change. | Every default and premerge gate on the new default; self-compile C identical; the ceiling's measurement record | `tables/` (builder, node builder, rows, row kinds' node part, node kind classes, `frontend_tables`, `discovery_tables`, `invariants/`, `intern_index` moved, `name_vocabulary` moved to the adapter): about 11,600 lines; the table-reading bodies of `compiler/discovery_adapter.brp` and `compiler/discovery_front_end.brp` (the files stay, now reading trees); `builder_rule_probe`, `builder_append_probe`, `test_invariants`, `test_allocation_budget` (replaced by a syntax allocation test pinning allocations per construct, so a compiler improvement shows as a decrease and a regression fails) |

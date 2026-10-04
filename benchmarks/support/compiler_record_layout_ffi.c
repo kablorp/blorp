@@ -1,12 +1,5 @@
-typedef struct {
-    int first;
-    long count;
-    int second;
-    long total;
-} LayoutForeignMixed;
-
-LayoutForeignMixed blorp_layout_foreign_identity_impl(LayoutForeignMixed value) {
-    return value;
+int blorp_layout_foreign_mixed_fields(int first, long count, int second, long total) {
+    return first && count == 43 && !second && total == 44;
 }
 
 static long blorp_layout_next_expected = 0;

@@ -37,10 +37,9 @@ compile error; explicit state should be threaded through values instead.
 
 ### Inline Values
 
-Primitive scalars, enums, opaque scalar representations, and valid `fixed record`
-or legacy `struct` values are copied directly. Both value-record forms are
-currently unmanaged and may contain only fields with valid inline unmanaged
-representation.
+Primitive scalars, enums, opaque scalar representations, and bounded range
+refinements are copied directly. Source record spellings do not select inline
+storage.
 
 ### Managed Values
 
@@ -81,11 +80,10 @@ q: Point = { p | x = 10 }
 `p` remains `{x = 1, y = 2}` and `q` is `{x = 10, y = 2}`. The compiler may
 reuse `p`'s allocation when ownership proves no other live value can observe it.
 
-`fixed record` values are inline and unmanaged in the current implementation.
-The legacy `struct` spelling has the same value layout and field restriction;
-use `fixed record` for new declarations. Both are appropriate for small values
-whose complete field graph is inline. Field declaration order remains source
-order; ordinary C alignment and padding apply.
+`struct` and `fixed record` have the same managed representation and ownership
+rules as `record`, including managed fields and generic parameters. Prefer
+`record` for new declarations. None of these spellings promises an unmanaged
+layout or a foreign by-value ABI.
 
 ## Option And Result
 
@@ -214,8 +212,9 @@ record Node {
 }
 ```
 
-An infinitely inline fixed-record/struct product is rejected during type-header
-validation. The absence of cycles is what lets ARC reclaim values without a
+Mandatory recursive products are rejected during type-header validation: every
+construction path must have a finite value. This applies to all record spellings.
+The absence of cycles is what lets ARC reclaim values without a
 cycle collector.
 
 ## Concurrency

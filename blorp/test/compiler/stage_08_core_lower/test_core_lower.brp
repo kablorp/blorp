@@ -1,4 +1,6 @@
 import:
+	../test_support_range_record: range_record_test_fields
+	../../../src/compiler/stage_06_typecheck/graph/range_record: ResolvedRangeFields, STANDARD_RANGE_RECORD_TYPE_NAME
 	../stage_06_typecheck/fixtures/trait_identity_fixture: test_bound_type_param
 	../../../src/compiler/stage_02_lex/name_table:
 		NameId,
@@ -36,7 +38,7 @@ import:
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
 		parsed_identifier,
 	../../../src/compiler/stage_04_modules/loaded_module:
-		ModuleOrigin(UserModule),
+		ModuleOrigin(UserModule, StdlibModule),
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_table:
 		ModuleId,
@@ -85,6 +87,7 @@ import:
 		DefinitionTable,
 		MISSING_RESOLVED_FIELD_IDENTITY,
 		definition_index_definition_table,
+		field_id_definition_id,
 		definition_index_empty,
 		definition_index_initial_seed,
 		definition_index_insert_func_callable_id,
@@ -240,11 +243,12 @@ import:
 		sanitize_core_module_name,
 	../../../src/compiler/stage_08_core_lower/lower:
 		CoreLowerCallableName,
-		CoreLowerCallableNameRegistry(CoreLowerPreparedCallableNames),
+		CoreLowerCallableNameRegistry(CoreLowerPreparedCallableNames, CoreLowerDefaultCallableNames),
 		CoreLowerContext,
 		CoreLowerError(CoreLowerInvalidCall, CoreLowerInvalidType, CoreLowerUnsupported),
 		core_lower_context,
 		core_lower_context_with_callable_names,
+		core_lower_context_with_range_fields,
 		core_lower_type,
 		QUESTION_BIND_FAILURE_BAND,
 		QUESTION_BIND_ID_BAND,
@@ -280,7 +284,6 @@ import:
 			TraitDecl,
 			TypeAliasDecl,
 			UnionDecl,
-			ValueRecordDecl,
 		),
 		CoreExpr(
 			AssignExpr,
@@ -309,7 +312,6 @@ import:
 			PreClosureConcurrentExpr,
 			PreClosureConcurrentlyLoopExpr,
 			RawMatchExpr,
-			RangeExpr,
 			RecordExpr,
 			RecordUpdateExpr,
 			ResourceScopeExpr,
@@ -323,6 +325,7 @@ import:
 			VoidExpr,
 		),
 		CoreForeignArgPassing(ForeignDefaultArgs),
+		core_field_ref_id,
 		CoreForeignLinkPlatform(CoreForeignLinux, CoreForeignMacos),
 		CoreEntrypointKind(ProgramWrapperEntrypoint, UserMainEntrypoint),
 		CoreFunctionKind(
@@ -3294,11 +3297,18 @@ func test_lowers_while_expression() -> Bool:
 
 
 func test_lowers_range_for_expression() -> Bool:
+	match range_record_test_fields():
+		Some(fields): lowers_range_for_expression(fields)
+		None: False
+
+
+private func lowers_range_for_expression(fields: ResolvedRangeFields) -> Bool:
 	iterable = TypedRangeExpr(
 		int_expr("1"),
 		int_expr("3"),
+		fields,
 		fixture_source_span(),
-		expr_info(SemanticNamedType("Range", [])),
+		expr_info(SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, [])),
 	)
 	body = TypedBreakExpr(fixture_source_span(), expr_info(TYPE_VOID))
 	expr = TypedForExpr(
@@ -3350,7 +3360,15 @@ func test_lowers_range_for_expression() -> Bool:
 
 
 func test_lowers_first_class_range_for_once() -> Bool:
-	range_type = SemanticNamedType("Range", [])
+	match range_record_test_fields():
+		Some(range_fields):
+			lowers_first_class_range_for_once(range_fields)
+		None:
+			False
+
+
+private func lowers_first_class_range_for_once(range_fields: ResolvedRangeFields) -> Bool:
+	range_type = SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, [])
 	make_range = TypedNameExpr(
 		ident("make_range"),
 		expr_info(semantic_function_type(True, [], range_type)),
@@ -3366,7 +3384,8 @@ func test_lowers_first_class_range_for_once() -> Bool:
 		expr_info(TYPE_VOID),
 	)
 
-	match lower_typed_expr(fixture_source_table(), expr):
+	context = core_lower_context_with_range_fields(core_lower_context(0, None), Some(range_fields))
+	match lower_core_test_expr_with_context(context, expr):
 		Ok(LetExpr(range_var, False, range_core_type, range_rhs, loop)):
 			rhs_ok: Bool = match range_rhs:
 				CallExpr(_, VarExpr(callee, _, _), [], _, _):
@@ -3377,9 +3396,10 @@ func test_lowers_first_class_range_for_once() -> Bool:
 			loop_ok: Bool = match loop:
 				ForRangeExpr(binder, start, end_value, BreakExpr(_, _), _, _):
 					start_ok: Bool = match start:
-						FieldExpr(VarExpr(start_var, _, _), start_field, _, start_type, _):
+						FieldExpr(VarExpr(start_var, _, _), start_field, start_ref, start_type, _):
 							(
 								start_field == "start"
+								and core_field_ref_id(start_ref) == field_id_definition_id(range_fields.start)
 								and start_var.name == range_var.name
 								and core_types_equal(start_type, core_int_type())
 							)
@@ -3387,9 +3407,10 @@ func test_lowers_first_class_range_for_once() -> Bool:
 							False
 
 					end_ok: Bool = match end_value:
-						FieldExpr(VarExpr(end_var, _, _), end_field, _, end_type, _):
+						FieldExpr(VarExpr(end_var, _, _), end_field, end_ref, end_type, _):
 							(
 								end_field == "end"
+								and core_field_ref_id(end_ref) == field_id_definition_id(range_fields.end)
 								and end_var.name == range_var.name
 								and core_types_equal(end_type, core_int_type())
 							)
@@ -3407,7 +3428,7 @@ func test_lowers_first_class_range_for_once() -> Bool:
 
 			range_var.name.starts_with("__loop_range_source_") and core_types_equal(
 				range_core_type,
-				NamedType("Range", []),
+				NamedType(flatten_canonical_core_type_name(STANDARD_RANGE_RECORD_TYPE_NAME), []),
 			) and rhs_ok and loop_ok
 		_:
 			False
@@ -4982,31 +5003,38 @@ func test_lowers_tuple_field_access_expression() -> Bool:
 
 
 func test_lowers_range_expression() -> Bool:
-	range_type = SemanticRangeType(TYPE_INT)
+	match range_record_test_fields():
+		Some(fields): lowers_range_expression(fields)
+		None: False
+
+
+private func lowers_range_expression(fields: ResolvedRangeFields) -> Bool:
+	range_type = SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, [])
 	expr = TypedRangeExpr(
 		int_expr("1"),
 		int_expr("5"),
+		fields,
 		fixture_source_span(),
 		expr_info(range_type),
 	)
 
 	match lower_typed_expr(fixture_source_table(), expr):
-		Ok(RangeExpr(start, end_value, typ, _)):
+		Ok(RecordExpr([start, end_value], typ, _)):
 			core_exprs_equal(
-				start,
+				start.value,
 				LiteralExpr(
 					IntLiteral(1),
 					core_int_type(),
 					core_source_loc(0, fixture_source_table(), fixture_source_span()),
 				),
 			) and core_exprs_equal(
-				end_value,
+				end_value.value,
 				LiteralExpr(
 					IntLiteral(5),
 					core_int_type(),
 					core_source_loc(0, fixture_source_table(), fixture_source_span()),
 				),
-			) and core_type_to_json(typ).to_string() == core_type_to_json(RangeType).to_string()
+			) and core_type_to_json(typ).to_string() == core_type_to_json(NamedType(flatten_canonical_core_type_name(STANDARD_RANGE_RECORD_TYPE_NAME), [])).to_string()
 		_:
 			False
 
@@ -5948,7 +5976,7 @@ func test_lowers_private_global_visibility() -> Bool:
 			False
 
 
-func test_lowers_struct_record_decl() -> Bool:
+func test_lowers_struct_as_managed_record_decl() -> Bool:
 	context = core_lower_context(10, None)
 
 	match lower_typed_decl(
@@ -5958,7 +5986,7 @@ func test_lowers_struct_record_decl() -> Bool:
 	):
 		Ok(result):
 			match result.decl:
-				ValueRecordDecl(record_info):
+				HeapRecordDecl(record_info):
 					match (record_info.fields.get(0), record_info.fields.get(1)):
 						(Some(first), Some(second)):
 							(
@@ -5987,7 +6015,7 @@ func test_lowers_struct_record_decl() -> Bool:
 			False
 
 
-pure func lowered_value_record_json(form: RecordDeclarationForm) -> Option[String]:
+pure func lowered_record_form_json(form: RecordDeclarationForm) -> Option[String]:
 	info: TypedRecordInfo = { typed_record_info(True) |
 		decl = { parsed_record_decl(True) | form = form },
 		fields = [typed_record_field("x", int_type(), int_type())]
@@ -6003,14 +6031,17 @@ pure func lowered_value_record_json(form: RecordDeclarationForm) -> Option[Strin
 			None
 
 
-func test_value_record_lowering_preserves_form_and_trivial_fields() -> Bool:
-	match (lowered_value_record_json(LegacyStruct), lowered_value_record_json(FixedRecord)):
-		(Some(legacy), Some(fixed)):
+func test_record_forms_lower_to_same_managed_declaration() -> Bool:
+	match (
+		lowered_record_form_json(OrdinaryRecord),
+		lowered_record_form_json(LegacyStruct),
+		lowered_record_form_json(FixedRecord),
+	):
+		(Some(ordinary), Some(legacy), Some(fixed)):
 			(
-				legacy.contains("\"origin\":\"legacy_struct\"")
-				and fixed.contains("\"origin\":\"fixed_record\"")
-				and legacy.contains("\"ownership\":\"trivial_inline\"")
-				and fixed.contains("\"ownership\":\"trivial_inline\"")
+				ordinary == legacy
+				and ordinary == fixed
+				and ordinary.contains("\"kind\":\"heap_record\"")
 			)
 		_:
 			False
@@ -6051,9 +6082,13 @@ func test_lowers_heap_record_decl_with_field_release_policy() -> Bool:
 func test_lowers_exact_std_declaration_with_abi_identity() -> Bool:
 	base_info: TypedRecordInfo = typed_record_info(False)
 	info: TypedRecordInfo = { base_info | decl = { base_info.decl | name = ident("MemStats") } }
+	(modules, module_id) = singleton_module_table(resolved_module_identity_from_resolver("memory", StdlibModule))
+	standard_memory_context = core_lower_context_with_callable_names(
+		10, Some("memory"), empty_core_definition_table(modules), module_id, CoreLowerDefaultCallableNames,
+	)
 
 	match lower_typed_decl(
-		core_lower_context(10, Some("memory")),
+		standard_memory_context,
 		fixture_source_table(),
 		TypedRecordDecl(info),
 	):
@@ -6070,9 +6105,13 @@ func test_lowers_exact_std_declaration_with_abi_identity() -> Bool:
 func test_does_not_assign_abi_identity_by_declaration_name() -> Bool:
 	base_info: TypedRecordInfo = typed_record_info(False)
 	info: TypedRecordInfo = { base_info | decl = { base_info.decl | name = ident("MemStats") } }
+	(modules, module_id) = singleton_module_table(resolved_module_identity_from_resolver("memory", UserModule))
+	user_memory_context = core_lower_context_with_callable_names(
+		10, Some("memory"), empty_core_definition_table(modules), module_id, CoreLowerDefaultCallableNames,
+	)
 
 	match lower_typed_decl(
-		core_lower_context(10, Some("app/memory")),
+		user_memory_context,
 		fixture_source_table(),
 		TypedRecordDecl(info),
 	):
@@ -6416,7 +6455,7 @@ private func prepares_module_graph_at_core_boundary(
 		definitions,
 		target_module_id,
 		target_program,
-		core_graph_modules(definitions, [module_unit]),
+		core_graph_modules(definitions, [module_unit], None),
 		10,
 	):
 		Ok(prepared):
@@ -6490,6 +6529,7 @@ func test_core_graph_rejects_module_id_outside_table() -> Bool:
 								ctfe_replacements = ctfe_global_replacements_empty()
 							},
 						],
+						None,
 					),
 					10,
 				)
@@ -6519,7 +6559,7 @@ func test_core_graph_rejects_duplicate_definition_authority() -> Bool:
 				first,
 				target_id,
 				program,
-				core_graph_modules(duplicate, []),
+				core_graph_modules(duplicate, [], None),
 				10,
 			):
 				Err(CoreGraphModuleTableError(message)):
@@ -6548,7 +6588,7 @@ func test_core_graph_rejects_foreign_ctfe_replacement_authority() -> Bool:
 				target_id,
 				program,
 				ctfe_global_replacements_for_definition_table(foreign_definitions),
-				core_graph_modules(definitions, []),
+				core_graph_modules(definitions, [], None),
 				10,
 			):
 				Err(CoreGraphModuleTableError(message)):
@@ -6599,7 +6639,7 @@ private func core_graph_consumes_keyed_ctfe_replacement_without_rewriting_source
 		target_id,
 		program,
 		replacements,
-		core_graph_modules(definitions, []),
+		core_graph_modules(definitions, [], None),
 		definition_index_next_def_id(inserted[0]),
 	).to_option()
 
@@ -6729,6 +6769,7 @@ private func prepared_graph_resolves_repeated_imports(
 				core_graph_modules(
 					definitions,
 					[first_module, second_module],
+					None,
 				),
 				10,
 			)
@@ -6834,7 +6875,7 @@ private func synthesizes_explicit_program_entrypoint(
 			definitions,
 			target_module_id,
 			program,
-			core_graph_modules(definitions, []),
+			core_graph_modules(definitions, [], None),
 			core_frontier,
 		):
 			Ok(prepared):
@@ -7378,8 +7419,8 @@ tests: TestSuite = {
 			test_lowers_const_refined_global_binding_as_runtime_int,
 		),
 		("lowers private global visibility", test_lowers_private_global_visibility),
-		("lowers struct record decl", test_lowers_struct_record_decl),
-		("value record lowering preserves form and trivial fields", test_value_record_lowering_preserves_form_and_trivial_fields),
+		("lowers struct as managed record decl", test_lowers_struct_as_managed_record_decl),
+		("record forms lower to same managed declaration", test_record_forms_lower_to_same_managed_declaration),
 		(
 			"lowers heap record decl with field release policy",
 			test_lowers_heap_record_decl_with_field_release_policy,

@@ -9,7 +9,7 @@ import:
 		CoreClosureCapture,
 		CoreDecl(
 			EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, TraitDecl, TypeAliasDecl,
-			UnionDecl, ValueRecordDecl,
+			UnionDecl,
 		),
 		CoreExpr(SeqExpr),
 		CoreFunction,
@@ -25,7 +25,7 @@ import:
 		CoreTraitMethod,
 		CoreType(
 			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType, ValueRecordType,
+			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
 			VoidType,
 		),
 		CoreTypeAliasDecl,
@@ -33,8 +33,6 @@ import:
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreUnionVariant,
-		CoreValueRecordDecl,
-		CoreValueRecordField,
 		core_expr_type,
 	mono: apply_type_substitution, core_type_contains_parameter, mangle_generic_data_name
 	traverse as CoreTraverse
@@ -48,7 +46,6 @@ record CoreMonoDataSpecialization {
 
 
 private union CoreMonoDataTemplate:
-	MonoValueRecordTemplate(CoreValueRecordDecl)
 	MonoHeapRecordTemplate(CoreHeapRecordDecl)
 	MonoUnionTemplate(CoreUnionDecl)
 
@@ -96,8 +93,6 @@ private record CoreMonoDataOrderState {
 
 private pure func template_name(template: CoreMonoDataTemplate) -> String:
 	match template:
-		MonoValueRecordTemplate(record_decl):
-			record_decl.name
 		MonoHeapRecordTemplate(record_decl):
 			record_decl.name
 		MonoUnionTemplate(union_decl):
@@ -106,8 +101,6 @@ private pure func template_name(template: CoreMonoDataTemplate) -> String:
 
 private pure func template_type_params(template: CoreMonoDataTemplate) -> List[String]:
 	match template:
-		MonoValueRecordTemplate(record_decl):
-			record_decl.type_params
 		MonoHeapRecordTemplate(record_decl):
 			record_decl.type_params
 		MonoUnionTemplate(union_decl):
@@ -121,9 +114,6 @@ private pure func collect_generic_data_templates(
 
 	for decl in program.decls:
 		match decl:
-			ValueRecordDecl(record_decl):
-				if not record_decl.type_params.is_empty() and record_decl.abi_type.is_none():
-					templates = templates.append(MonoValueRecordTemplate(record_decl))
 			HeapRecordDecl(record_decl):
 				if not record_decl.type_params.is_empty() and record_decl.abi_type.is_none():
 					templates = templates.append(MonoHeapRecordTemplate(record_decl))
@@ -392,7 +382,7 @@ private pure func rewrite_data_type(
 				typ = TupleType(items_result.types),
 				requests = items_result.requests
 			}
-		VoidType | EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
+		VoidType | EnumType(_) | HeapRecordType(_) | UnionType(_) | RangeType:
 			{
 				typ = typ,
 				requests = requests
@@ -524,19 +514,6 @@ private pure func collect_union_requests(
 	current
 
 
-private pure func collect_value_record_requests(
-	context: CoreMonoDataRewriteContext,
-	requests: List[CoreMonoDataRequest],
-	fields: List[CoreValueRecordField],
-) -> List[CoreMonoDataRequest]:
-	var current: List[CoreMonoDataRequest] = requests
-
-	for field in fields:
-		current = collect_type_request(context, current, field.typ)
-
-	current
-
-
 private pure func collect_heap_record_requests(
 	context: CoreMonoDataRewriteContext,
 	requests: List[CoreMonoDataRequest],
@@ -612,13 +589,6 @@ private pure func collect_decl_requests(
 				union_decl.type_params,
 			)
 			collect_union_requests(context, requests, union_decl.variants)
-		ValueRecordDecl(record_decl):
-			context: CoreMonoDataRewriteContext = rewrite_context(
-				templates,
-				transparent_aliases,
-				record_decl.type_params,
-			)
-			collect_value_record_requests(context, requests, record_decl.fields)
 		HeapRecordDecl(record_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(
 				templates,
@@ -701,8 +671,6 @@ private pure func materialized_data_release_policy(
 						match find_template(templates, source_name):
 							Some(MonoHeapRecordTemplate(_)) | Some(MonoUnionTemplate(_)):
 								ArcReleasePolicy
-							Some(MonoValueRecordTemplate(_)):
-								NoReleasePolicy
 							None:
 								CoreTypePolicy.cleanup_release_policy_for_type(typ)
 					None:
@@ -711,38 +679,6 @@ private pure func materialized_data_release_policy(
 				CoreTypePolicy.cleanup_release_policy_for_type(typ)
 		_:
 			CoreTypePolicy.cleanup_release_policy_for_type(typ)
-
-
-private pure func materialize_value_record(
-	templates: Dict[String, CoreMonoDataTemplate],
-	transparent_aliases: Dict[String, CoreTypeAliasDecl],
-	state: CoreMonoDataMaterializationState,
-	request: CoreMonoDataRequest,
-	record_decl: CoreValueRecordDecl,
-) -> CoreMonoDataMaterializationState:
-	substitution: CoreMonoSubstitution = type_param_substitution(
-		record_decl.type_params,
-		request.args,
-	)
-	context: CoreMonoDataRewriteContext = rewrite_context(templates, transparent_aliases, [])
-	var fields: List[CoreValueRecordField] = []
-	var requests: List[CoreMonoDataRequest] = state.requests
-
-	for field in record_decl.fields:
-		substituted: CoreType = apply_type_substitution(substitution, field.typ)
-		result: CoreMonoDataTypeRewrite = rewrite_data_type(context, requests, substituted)
-		fields = fields.append({ field | typ = result.typ })
-		requests = result.requests
-
-	{
-		requests = requests,
-		generated = state.generated.append(ValueRecordDecl({ record_decl |
-					name = request.concrete_name,
-					type_params = [],
-					fields = fields
-				})),
-		next_def_id = state.next_def_id
-	}
 
 
 private pure func materialize_heap_record(
@@ -865,8 +801,6 @@ private pure func materialize_request(
 	request: CoreMonoDataRequest,
 ) -> CoreMonoDataMaterializationState:
 	match find_template(templates, request.source_name):
-		Some(MonoValueRecordTemplate(record_decl)):
-			materialize_value_record(templates, transparent_aliases, state, request, record_decl)
 		Some(MonoHeapRecordTemplate(record_decl)):
 			materialize_heap_record(templates, transparent_aliases, state, request, record_decl)
 		Some(MonoUnionTemplate(union_decl)):
@@ -902,8 +836,6 @@ private pure func materialize_requests(
 
 private pure func generated_data_name(decl: CoreDecl) -> Option[String]:
 	match decl:
-		ValueRecordDecl(record_decl):
-			Some(record_decl.name)
 		HeapRecordDecl(record_decl):
 			Some(record_decl.name)
 		UnionDecl(union_decl):
@@ -963,7 +895,7 @@ private pure func append_type_dependency_names(names: List[String], typ: CoreTyp
 				result = append_type_dependency_names(result, item)
 
 			result
-		ValueRecordType(name) | HeapRecordType(name) | UnionType(name):
+		HeapRecordType(name) | UnionType(name):
 			if names.contains(name):
 				names
 			else:
@@ -976,9 +908,6 @@ private pure func generated_data_dependencies(decl: CoreDecl) -> List[String]:
 	var names: List[String] = []
 
 	match decl:
-		ValueRecordDecl(record_decl):
-			for field in record_decl.fields:
-				names = append_type_dependency_names(names, field.typ)
 		HeapRecordDecl(record_decl):
 			for field in record_decl.fields:
 				names = append_type_dependency_names(names, field.typ)
@@ -1181,20 +1110,6 @@ private pure func rewrite_union_variants(
 	rewritten
 
 
-private pure func rewrite_value_record_fields(
-	context: CoreMonoDataRewriteContext,
-	fields: List[CoreValueRecordField],
-) -> List[CoreValueRecordField]:
-	var rewritten: List[CoreValueRecordField] = []
-
-	for field in fields:
-		rewritten = rewritten.append(
-			{ field | typ = rewrite_type_without_requests(context, field.typ) },
-		)
-
-	rewritten
-
-
 private pure func rewrite_heap_record_fields(
 	context: CoreMonoDataRewriteContext,
 	fields: List[CoreHeapRecordField],
@@ -1267,17 +1182,6 @@ private pure func rewrite_decl(
 			)
 			UnionDecl(
 				{ union_decl | variants = rewrite_union_variants(context, union_decl.variants) },
-			)
-		ValueRecordDecl(record_decl):
-			context: CoreMonoDataRewriteContext = rewrite_context(
-				templates,
-				transparent_aliases,
-				record_decl.type_params,
-			)
-			ValueRecordDecl(
-				{ record_decl |
-					fields = rewrite_value_record_fields(context, record_decl.fields)
-				},
 			)
 		HeapRecordDecl(record_decl):
 			context: CoreMonoDataRewriteContext = rewrite_context(

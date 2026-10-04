@@ -1,0 +1,154 @@
+-- Bounded probe adapter: consume the same final Core identities and C naming
+-- authorities as emission, never recover identities from generated C shapes.
+import:
+	../../blorp/src/compiler/stage_09_core/ir:
+		CoreDecl(HeapRecordDecl), CoreHeapRecordDecl, CoreProgram, core_field_ref_id,
+		core_field_ref_is_resolved, decode_core_program_json
+	../../blorp/src/compiler/stage_09_core/specialize_layout: build_specialize_layout
+	../../blorp/src/compiler/stage_10_backend/c_symbol_projection:
+		c_emission_foreign_boundary_types, c_emission_type_symbol_lookup,
+		prepare_c_emission_symbols
+	../../blorp/src/compiler/stage_10_backend/emit_record_layout:
+		CRecordLayoutRegistry, c_record_member_of, classify_c_record_layouts
+	io: print, print_error
+	json: parse_json
+	system: read_file
+
+
+private RECORD_FIELDS: List[(String, List[String])] = [
+	("LayoutThreeFlags", ["first", "second", "third"]),
+	("LayoutMixed", ["first", "count", "second", "total"]),
+	("LayoutHeapFlags", ["first", "second", "third", "payload"]),
+	("LayoutHeapDenseFlags", ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "payload"]),
+	("LayoutHeapInterleavedFlags", ["first", "count", "second"]),
+	("LayoutHeapStates", ["count", "first", "second", "third"]),
+	("LayoutForeignHeapFlags", ["first", "second", "count"]),
+	("LayoutForeignHeapState", ["state", "count"]),
+]
+
+
+private pure func decode_final_dump(text: String) -> Result[CoreProgram, String]:
+	match text.split("\n"):
+		[header, stage, ...body]:
+			if header.starts_with("-- blorp ") and stage == "===== after final =====":
+				value ?= parse_json(body.join("\n"))
+				match decode_core_program_json(value):
+					Ok(program): Ok(program)
+					Err(_): Err("invalid final Core program")
+			else:
+				Err("expected exactly one final Core observation")
+		_:
+			Err("expected exactly one final Core observation")
+
+
+private pure func selected_record(
+	program: CoreProgram,
+	name: String,
+) -> Result[CoreHeapRecordDecl, String]:
+	var selected: Option[CoreHeapRecordDecl] = None
+	var duplicate: Bool = False
+	for decl in program.decls:
+		match decl:
+			HeapRecordDecl(record_decl):
+				if record_decl.name == name:
+					if selected.is_some():
+						duplicate = True
+					selected = Some(record_decl)
+			_: void
+	if duplicate:
+		Err("duplicate record identity: " + name)
+	else:
+		selected.to_result("missing record identity: " + name)
+
+
+private pure func record_row(
+	record_decl: CoreHeapRecordDecl,
+	types: Dict[String, String],
+	layouts: CRecordLayoutRegistry,
+) -> Result[String, String]:
+	c_type ?= types.get(record_decl.name).to_result("missing projected record: " + record_decl.name)
+	var fields: Dict[String, Bool] = {}
+	var identities: Dict[Int, Bool] = {}
+	var row: Result[String, String] = Ok(
+		"RECORD_LAYOUT_SYMBOL schema=1 record=" + record_decl.name + " c_type=" + c_type,
+	)
+	for field in record_decl.fields:
+		row = match row:
+			Err(message):
+				Err(message)
+			Ok(prefix):
+				if fields.contains(field.name):
+					Err("duplicate field name: " + record_decl.name + "." + field.name)
+				else if not core_field_ref_is_resolved(field.ref) or identities.contains(core_field_ref_id(field.ref)):
+					Err("invalid field identity: " + record_decl.name + "." + field.name)
+				else:
+					match c_record_member_of(layouts, record_decl.name, field.name, field.ref):
+						None:
+							Err("missing field identity: " + record_decl.name + "." + field.name)
+						Some(member):
+							fields = fields.set(field.name, True)
+							identities = identities.set(core_field_ref_id(field.ref), True)
+							Ok(prefix + " field_" + field.name + "=" + member)
+	row
+
+
+private pure func mapping_rows(program: CoreProgram) -> Result[List[String], String]:
+	-- Reject missing/duplicate declaration identities before projection can
+	-- accidentally collapse them into one dictionary entry.
+	var selected_records: Result[List[CoreHeapRecordDecl], String] = Ok([])
+	for entry in RECORD_FIELDS:
+		(name, field_names) = entry
+		selected_records = match selected_records:
+			Err(message):
+				Err(message)
+			Ok(prefix):
+				match selected_record(program, name):
+					Err(message):
+						Err(message)
+					Ok(record_decl):
+						if record_decl.fields.map(pure func(field): field.name) == field_names:
+							Ok(prefix.append(record_decl))
+						else:
+							Err("unexpected fixture fields: " + name)
+	records ?= selected_records
+	plan ?= match prepare_c_emission_symbols(program):
+		Ok(value): Ok(value)
+		Err(_): Err("invalid C symbol authority")
+	layouts ?= match classify_c_record_layouts(
+		build_specialize_layout(program), c_emission_foreign_boundary_types(plan),
+	):
+		Ok(value): Ok(value)
+		Err(_): Err("invalid record field authority")
+	types = c_emission_type_symbol_lookup(plan)
+	var rows: Result[List[String], String] = Ok([])
+	for record_decl in records:
+		rows = match rows:
+			Err(message):
+				Err(message)
+			Ok(prefix):
+				match record_row(record_decl, types, layouts):
+					Err(message):
+						Err(message)
+					Ok(row):
+						Ok(prefix.append(row))
+	rows
+
+
+func main(args: List[String]) -> Int:
+	result = match args:
+		[_, path]:
+			match read_file(path):
+				Ok(text):
+					match decode_final_dump(text):
+						Ok(program): mapping_rows(program)
+						Err(message): Err(message)
+				Err(_): Err("cannot read final Core dump")
+		_: Err("expected one final Core dump path")
+	match result:
+		Ok(rows):
+			for row in rows:
+				print(row)
+			0
+		Err(message):
+			print_error("compiler_record_layout_symbols: " + message)
+			1

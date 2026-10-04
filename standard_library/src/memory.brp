@@ -29,8 +29,8 @@
 -- aligned buffers, generated cleanup scratch growth, fiber stack mmaps).
 -- `oracle_stats_active` and `memory_stats_active` are 1 only when counting
 -- was on when the snapshot was taken; a caller must treat 0 as an incomplete
--- measurement, never as "zero events". See `assert_no_heap_activity`.
-struct MemStats {
+-- measurement, never as "zero events".
+fixed record MemStats {
 	total_allocations: Int,
 	total_releases: Int,
 	current_objects: Int,
@@ -52,8 +52,41 @@ struct MemStats {
 }
 
 
+-- Stable native selector tags, in the order of runtime.c's
+-- blorp_MemoryCounter enum. These are individual observations: multiple reads
+-- bracket exact single-fiber workloads, not a coherent concurrent snapshot.
+enum MemoryCounter:
+	ManagedAllocations
+	ManagedReleases
+	LiveManagedObjects
+	ManagedBytes
+	ManagedBytesAvailable
+	AllocatorBytesInUse
+	AllocatorBytesAvailable
+	BackingMallocEvents
+	RawMallocEvents
+	RawCallocEvents
+	RawReallocEvents
+	RawAlignedEvents
+	CleanupScratchEvents
+	FiberMapEvents
+	OracleStatsActive
+	MemoryStatsActive
+
+
+-- Read one diagnostic counter without allocating or changing the counting
+-- gates. For an exact allocation interval, capture scalar endpoints around
+-- the unchanged workload and construct reports only after the final reads.
+-- Check MemoryStatsActive and OracleStatsActive before interpreting counters;
+-- inactive counters do not prove that no allocation happened.
+pure func read_memory_counter(counter: MemoryCounter) -> Int:
+	builtin("blorp_read_memory_counter")
+
+
 -- Get current memory statistics.
--- The returned MemStats value requires no allocation, and reading never turns
+-- The returned MemStats is an ordinary managed record. Native counters are
+-- sampled before allocating that report; later observations include its
+-- allocation and release. Reading never turns
 -- counting on: when nothing has (see the header), the snapshot is all zeros
 -- with memory_stats_active == 0. After `reset_mem_stats()` it reports zero
 -- live objects unless user code has allocated something. Check
@@ -89,7 +122,8 @@ pure func is_unique[T](obj: T) -> Bool:
 -- Check whether two values are the same managed allocation.
 -- This is allocation identity, not equality: it answers "did this value come
 -- back untouched?", never "do these values mean the same thing". Stack types
--- (Int, Bool, structs, etc.) always return False, and immortal literals such
+-- (Int, Bool, etc.) always return False. All record spellings are managed.
+-- Immortal literals such
 -- as canonical string and empty list literals are unspecified.
 pure func same_object[T](left: T, right: T) -> Bool:
 	builtin("blorp_same_object")
@@ -97,7 +131,7 @@ pure func same_object[T](left: T, right: T) -> Bool:
 
 -- Get the current reference count. Heap objects return their ARC count,
 -- immortal literals return the runtime immortal sentinel, and stack types
--- (Int, Bool, structs, etc.) return 0.
+-- (Int, Bool, etc.) return 0. All record spellings are managed.
 pure func refcount[T](obj: T) -> Int:
 	builtin("blorp_refcount")
 
@@ -193,7 +227,7 @@ private pure func both_available(before: Int, after: Int) -> Int:
 -- negative delta with the field 1 is a real decrease.
 pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
 	-- Both endpoints must have been taken with the oracle gate active for a
-	-- delta to mean anything; see assert_no_heap_activity.
+	-- delta to mean anything. Snapshot construction remains measured activity.
 	both_active: Bool = before.oracle_stats_active > 0 and after.oracle_stats_active > 0
 	both_memory_active: Bool = before.memory_stats_active > 0 and after.memory_stats_active > 0
 
@@ -240,77 +274,3 @@ pure func mem_delta(before: MemStats, after: MemStats) -> MemStats:
 		oracle_stats_active = active_flag,
 		memory_stats_active = memory_active_flag
 	}
-
-
--- Allocation oracle assertion (allocation-contract roadmap milestone 6).
---
--- Given a `before`/`after` MemStats pair bracketing a piece of test code,
--- confirm that NO heap activity happened on any counted path: managed
--- object requests, backing libc malloc, raw buffer malloc/calloc/realloc,
--- SIMD-aligned buffers, generated cleanup scratch growth, and fiber stack
--- mmaps. On success returns `Ok(void)`. On failure, names the first
--- counter that moved (or explains that the oracle gate was not active) so
--- a caller does not have to re-derive which path allocated.
---
--- This is test-only: it is for single-fiber test code measured under
--- `BLORP_MEMORY_STATS=1` (`blorp run --memory-stats`), since the underlying
--- counters are process-global. It does not support nested scopes or
--- concurrent fibers; a test that needs either must snapshot around each
--- fiber's own single-threaded region instead of sharing one before/after
--- pair.
-pure func assert_no_heap_activity(before: MemStats, after: MemStats) -> Result[Void, String]:
-	if before.memory_stats_active == 0 or after.memory_stats_active == 0:
-		Err((
-				"memory stats inactive: run with --memory-stats or call reset_mem_stats() (needs "
-				+ "a runtime built with BLORP_MEMORY_DIAGNOSTICS=1)"
-			))
-	else if before.oracle_stats_active == 0 or after.oracle_stats_active == 0:
-		Err((
-				"allocation oracle inactive: run with BLORP_MEMORY_STATS=1 (a disabled gate must "
-				+ "fail, not read as zero)"
-			))
-	else:
-		delta: MemStats = mem_delta(before, after)
-
-		if delta.total_allocations != 0:
-			Err("managed allocation requests moved by " + delta.total_allocations.to_string())
-		else:
-			if delta.total_releases != 0:
-				Err("managed release requests moved by " + delta.total_releases.to_string())
-			else:
-				if delta.backing_libc_malloc_events != 0:
-					Err(
-						"backing libc malloc events moved by " + delta.backing_libc_malloc_events.to_string(),
-					)
-				else:
-					if delta.raw_buffer_malloc_events != 0:
-						Err(
-							"raw buffer malloc events moved by " + delta.raw_buffer_malloc_events.to_string(),
-						)
-					else:
-						if delta.raw_buffer_calloc_events != 0:
-							Err(
-								"raw buffer calloc events moved by " + delta.raw_buffer_calloc_events.to_string(),
-							)
-						else:
-							if delta.raw_buffer_realloc_events != 0:
-								Err(
-									"raw buffer realloc events moved by " + delta.raw_buffer_realloc_events.to_string(),
-								)
-							else:
-								if delta.raw_buffer_aligned_events != 0:
-									Err(
-										"raw aligned-buffer events moved by " + delta.raw_buffer_aligned_events.to_string(),
-									)
-								else:
-									if delta.cleanup_scratch_events != 0:
-										Err(
-											"cleanup scratch events moved by " + delta.cleanup_scratch_events.to_string(),
-										)
-									else:
-										if delta.fiber_mmap_events != 0:
-											Err(
-												"fiber stack mmap events moved by " + delta.fiber_mmap_events.to_string(),
-											)
-										else:
-											Ok(void)

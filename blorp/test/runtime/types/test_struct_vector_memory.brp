@@ -1,20 +1,33 @@
--- Test that struct vectors use inline storage (not per-element heap boxing).
--- A vector of 1000 structs should require ~1 allocation (the vector itself),
--- NOT 1000+ allocations (one box per element).
+-- Managed product literals allocate each authored value once; fill shares
+-- one record across every slot. Exact pins include existing tensor COW costs
+-- and scalar observation endpoints, with no snapshot observer allowance.
 import:
-	memory: MemStats, get_mem_stats, reset_mem_stats
+	memory:
+		MemoryCounter(ManagedAllocations, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
+		same_object,
+		reset_mem_stats,
 	tensor: get_or, set_index
 	test: TestSuite
 
 
-struct Pt {
+-- Pins measured after the exact logical workloads with scalar counters.
+private VECTOR_LITERAL_ALLOCATIONS: Int = 10
+private VECTOR_FILL_ALLOCATIONS: Int = 3
+private MATRIX_LITERAL_ALLOCATIONS: Int = 5
+private MATRIX_FILL_ALLOCATIONS: Int = 2
+private VECTOR_UPDATE_ALLOCATIONS: Int = 22
+
+
+fixed record Pt {
 	x: Int,
 	y: Int
 }
 
 
-func test_literal_no_per_element_alloc() -> Bool:
+func test_literal_allocates_each_authored_record_once() -> Bool:
 	reset_mem_stats()
+	active_before = counters_active()
 	v: Pt[#8] = {{
 			x = 0,
 			y = 0
@@ -47,12 +60,13 @@ func test_literal_no_per_element_alloc() -> Bool:
 			y = -1
 		},
 	)
-	stats: MemStats = get_mem_stats()
-	p.x == 7 and p.y == 14 and stats.total_allocations < 5
+	allocations = read_memory_counter(ManagedAllocations)
+	p.x == 7 and p.y == 14 and active_before and counters_active() and allocations == VECTOR_LITERAL_ALLOCATIONS
 
 
-func test_fill_no_per_element_alloc() -> Bool:
+func test_fill_shares_one_record() -> Bool:
 	reset_mem_stats()
+	active_before = counters_active()
 	v: Pt[#1000] = vector(
 		{
 			x = 0,
@@ -70,15 +84,18 @@ func test_fill_no_per_element_alloc() -> Bool:
 		},
 	)
 	_ = p.x
-	stats: MemStats = get_mem_stats()
+	allocations = read_memory_counter(ManagedAllocations)
 
-	-- With inline storage: ~2-5 allocations (vector + maybe a few temps)
-	-- With boxing: 1000+ allocations (one per element)
-	stats.total_allocations < 20
+	-- One shared Pt, one vector, and the authored get_or default.
+	(
+		p.x == 0 and p.y == 0 and same_object(v[0], v[999])
+		and active_before and counters_active() and allocations == VECTOR_FILL_ALLOCATIONS
+	)
 
 
-func test_matrix_literal_no_per_element_alloc() -> Bool:
+func test_matrix_literal_allocates_each_authored_record_once() -> Bool:
 	reset_mem_stats()
+	active_before = counters_active()
 	m: Pt[#2, #2] = {
 		{{
 				x = 1,
@@ -96,12 +113,13 @@ func test_matrix_literal_no_per_element_alloc() -> Bool:
 			}},
 	}
 	p: Pt = m[1, 1]
-	stats: MemStats = get_mem_stats()
-	p.x == 7 and p.y == 8 and stats.total_allocations < 5
+	allocations = read_memory_counter(ManagedAllocations)
+	p.x == 7 and p.y == 8 and active_before and counters_active() and allocations == MATRIX_LITERAL_ALLOCATIONS
 
 
-func test_matrix_fill_no_per_element_alloc() -> Bool:
+func test_matrix_fill_shares_one_record() -> Bool:
 	reset_mem_stats()
+	active_before = counters_active()
 	m: Pt[#10, #10] = matrix(
 		{
 			x = 3,
@@ -111,12 +129,16 @@ func test_matrix_fill_no_per_element_alloc() -> Bool:
 		10,
 	)
 	p: Pt = m[9, 9]
-	stats: MemStats = get_mem_stats()
-	p.x == 3 and p.y == 4 and stats.total_allocations < 5
+	allocations = read_memory_counter(ManagedAllocations)
+	(
+		p.x == 3 and p.y == 4 and same_object(m[0, 0], m[9, 9])
+		and active_before and counters_active() and allocations == MATRIX_FILL_ALLOCATIONS
+	)
 
 
-func test_set_index_no_extra_alloc() -> Bool:
+func test_set_index_preserves_values_and_exact_cow_cost() -> Bool:
 	reset_mem_stats()
+	active_before = counters_active()
 	var v: Pt[#100] = vector(
 		{
 			x = 0,
@@ -145,20 +167,26 @@ func test_set_index_no_extra_alloc() -> Bool:
 
 		i += 1
 
-	stats: MemStats = get_mem_stats()
+	allocations = read_memory_counter(ManagedAllocations)
 
-	-- With inline storage: ~12-20 allocations (vector + COW copies + Option wrappers)
-	-- With boxing: 100+ (initial fill) + 10+ (new boxes for sets)
-	stats.total_allocations < 50
+	-- Initial Pt/vector plus ten authored Pt values and ten tensor copies.
+	(
+		v[9].x == 9 and v[9].y == 18 and v[99].x == 0
+		and active_before and counters_active() and allocations == VECTOR_UPDATE_ALLOCATIONS
+	)
+
+
+private pure func counters_active() -> Bool:
+	read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
 
 
 tests: TestSuite = {
 	description = "Struct Vector Memory",
 	tests = [
-		("literal: no per-element alloc", test_literal_no_per_element_alloc),
-		("fill: no per-element alloc", test_fill_no_per_element_alloc),
-		("matrix literal: no per-element alloc", test_matrix_literal_no_per_element_alloc),
-		("matrix fill: no per-element alloc", test_matrix_fill_no_per_element_alloc),
-		("set: no extra alloc", test_set_index_no_extra_alloc),
+		("literal: one allocation per authored record", test_literal_allocates_each_authored_record_once),
+		("fill: shared managed record", test_fill_shares_one_record),
+		("matrix literal: one allocation per authored record", test_matrix_literal_allocates_each_authored_record_once),
+		("matrix fill: shared managed record", test_matrix_fill_shares_one_record),
+		("set: exact record and tensor COW cost", test_set_index_preserves_values_and_exact_cow_cost),
 	]
 }

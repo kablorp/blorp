@@ -3,7 +3,7 @@
 -- The synthesized bodies expose probing, COW, ownership, and insertion-order
 -- mechanics to later Core passes. Arbitrary NamedType values are deliberately
 -- rejected: without declaration registry facts, a name alone cannot distinguish
--- an alias, enum, value record, heap record, or union.
+-- an alias, enum, heap record, or union.
 import:
 	erased_key_temps: ERASED_KEY_TEMP_RELEASE_INTRINSIC
 	ir:
@@ -11,7 +11,7 @@ import:
 			AddOp, DivideOp, EqualOp, GreaterEqualOp, GreaterOp, LessEqualOp, LessOp, MultiplyOp,
 			NotEqualOp,
 		),
-		CoreBoxKind(Float16Box, Float32Box, FloatBox, Int128Box, PrimBox, StructBox, UInt128Box),
+		CoreBoxKind(Float16Box, Float32Box, FloatBox, Int128Box, PrimBox, UInt128Box),
 		CoreExpr(BoxExpr, CastExpr, DropExpr, LiteralExpr, SeqExpr, TupleExpr, UnboxExpr, VarExpr),
 		CoreFunction,
 		CoreLiteral(IntLiteral),
@@ -20,12 +20,12 @@ import:
 		CoreSourceLoc,
 		CoreType(
 			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType, ValueRecordType,
+			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
 			VoidType,
 		),
 		CoreUnboxKind(
 			Float16Unbox, Float32Unbox, FloatUnbox, Int128Unbox, PointerUnbox, PrimUnbox,
-			StructUnbox, UInt128Unbox,
+			UInt128Unbox,
 		),
 		CoreVar,
 		synthetic_core_source_loc,
@@ -33,7 +33,7 @@ import:
 	synth_context:
 		CoreSynthContext,
 		CoreSynthNamedTypeLayout(
-			SynthEnumLayout, SynthHeapRecordLayout, SynthUnionLayout, SynthValueRecordLayout,
+			SynthEnumLayout, SynthHeapRecordLayout, SynthUnionLayout,
 		),
 		core_synth_expand_alias,
 		core_synth_named_type_layout,
@@ -106,8 +106,8 @@ union CoreHashPointerLayout:
 
 
 ---
-Keys and values need separate pointer layouts. In particular, the current
-runtime ABI casts value-record keys but boxes value-record dictionary values.
+Keys and values need separate pointer layouts: scalar erased slots may need
+fresh boxes, while managed record keys and values reuse their owned pointers.
 A `BoxedHashPointer` release flag is meaningful only for
 `boxed_value_pointer_layout`: key temporaries are always released through
 the erased-key-temp marker, which specialization resolves with the key's
@@ -272,16 +272,6 @@ private pure func classify_representation_type(
 								False,
 							),
 						})
-					Some(SynthValueRecordLayout):
-						ExactHashTypeLayout({
-							probe_mode = DispatchedHashProbe,
-							hash_key_pointer_layout = CastHashPointer(StructUnbox(name)),
-							boxed_value_pointer_layout = BoxedHashPointer(
-								StructBox(name),
-								StructUnbox(name),
-								True,
-							),
-						})
 					Some(SynthHeapRecordLayout) | Some(SynthUnionLayout):
 						ExactHashTypeLayout({
 							probe_mode = DispatchedHashProbe,
@@ -295,16 +285,6 @@ private pure func classify_representation_type(
 				probe_mode = ImmediateHashProbe,
 				hash_key_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
 				boxed_value_pointer_layout = BoxedHashPointer(PrimBox, PrimUnbox, False),
-			})
-		ValueRecordType(name):
-			ExactHashTypeLayout({
-				probe_mode = DispatchedHashProbe,
-				hash_key_pointer_layout = CastHashPointer(StructUnbox(name)),
-				boxed_value_pointer_layout = BoxedHashPointer(
-					StructBox(name),
-					StructUnbox(name),
-					True,
-				),
 			})
 		HeapRecordType(_) | UnionType(_) | TensorType(_) | TupleType(_) | FunctionType(_, _, _):
 			ExactHashTypeLayout({
@@ -383,13 +363,13 @@ private pure func exact_release_policy(
 						Ok(cleanup_release_policy_for_type(typ))
 					else:
 						match core_synth_named_type_layout(context, name):
-							Some(SynthEnumLayout) | Some(SynthValueRecordLayout):
+							Some(SynthEnumLayout):
 								Ok(NoReleasePolicy)
 							Some(SynthHeapRecordLayout) | Some(SynthUnionLayout):
 								Ok(ArcReleasePolicy)
 							None:
 								Err(HashCollectionLayoutUnavailable(operation, typ, loc))
-				EnumType(_) | ValueRecordType(_) | HeapRecordType(_) | UnionType(_) | RangeType | TensorType(_) | TupleType(_) | BoxedResultType(_, _) | FunctionType(_, _, _):
+				EnumType(_) | HeapRecordType(_) | UnionType(_) | RangeType | TensorType(_) | TupleType(_) | BoxedResultType(_, _) | FunctionType(_, _, _):
 					Ok(cleanup_release_policy_for_type(typ))
 				TypeParameterType(_) | SelfType | StackResultType(_, _) | VoidType:
 					Err(HashCollectionLayoutUnavailable(operation, typ, loc))
@@ -440,7 +420,7 @@ private pure func pointer_temp_needs_release(layout: CoreHashPointerLayout) -> B
 ---
 Drops an operation's own key temporary after its last use when converting
 `source` into erased key storage made a fresh box. Synthesis cannot tell: a
-`CastHashPointer` key (stack option, stack result, value struct) only becomes
+`CastHashPointer` key (scalar stack option or stack result) only becomes
 a box during specialization, so this is a marker that specialization resolves
 with the key's final layout (`erased_key_temps`). The temporary is always the
 operation's own: a table that keeps the key retains its own reference, and a

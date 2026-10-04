@@ -12,8 +12,6 @@ import:
 		type_requires_release,
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
-		CoreValueRecordOrigin(LegacyStructOrigin),
-		CoreInlineFieldOwnership(TrivialInlineField),
 		CoreBinderOrigin(AuthoredBinder),
 		CoreCallKind(ForeignCall),
 		CoreDecl(
@@ -24,7 +22,6 @@ import:
 			ImplDecl,
 			TypeAliasDecl,
 			UnionDecl,
-			ValueRecordDecl,
 		),
 		CoreExpr(CallExpr, VoidExpr),
 		CoreForeignArgPassing(ForeignBorrowArgs),
@@ -51,11 +48,10 @@ import:
 			TupleType,
 			TypeParameterType,
 			UnionType,
-			ValueRecordType,
 			VoidType,
 		),
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
-		CoreValueRecordField,
+		CoreHeapRecordField,
 		core_field_ref,
 	../../../src/compiler/stage_09_core/pipeline: prepared_core_program_value, run_pre_dce_tail
 	../../../src/compiler/stage_09_core/specialize_layout: build_specialize_layout
@@ -66,11 +62,8 @@ import:
 		CHeapRecordFieldStorage(OrdinaryCHeapRecordField, PackedBooleanCHeapRecordField),
 		CRecordLayout(ForeignAbiLayout, InternalLayout),
 		CRecordLayoutRegistry,
-		CValueRecordFieldStorage(OrdinaryCValueRecordField, PackedBooleanCValueRecordField),
 		c_heap_record_field_storage,
 		c_heap_record_layout,
-		c_record_layout,
-		c_value_record_field_storage,
 		classify_c_record_layouts,
 		collect_foreign_boundary_types,
 	set as Sets
@@ -81,7 +74,6 @@ import:
 -- leaves the registry empty, which the assertions then reject.
 private pure func empty_layout_registry() -> CRecordLayoutRegistry:
 	{
-		foreign_abi_value_record_names = Sets.set(),
 		foreign_abi_heap_record_names = Sets.set(),
 		byte_sized_enum_names = Sets.set(),
 		source_member_record_names = Sets.set(),
@@ -176,7 +168,7 @@ pure func test_c_type_names() -> Bool:
 		and c_type_name(NamedType("Option", [int_type()]), {}) == "blorp_StackOption_Int"
 		and c_type_name(stack_result_type(), {}) == "blorp_StackResult"
 		and c_type_name(BoxedResultType(int_type(), string_type()), {}) == "blorp_Result*"
-		and c_type_name(ValueRecordType("MemStats"), {}) == "blorp_MemStats"
+		and c_type_name(HeapRecordType("MemStats"), {}) == "MemStats*"
 		and c_type_name(HeapRecordType("UserRecord"), {}) == "UserRecord*"
 	)
 
@@ -186,10 +178,7 @@ pure func test_stack_option_layout_facts() -> Bool:
 		stack_option_c_type(int_type(), {}),
 		"blorp_StackOption_Int",
 	)
-	record_stack_option_ok: Bool = option_string_is(
-		stack_option_c_type(ValueRecordType("Point"), {}),
-		"blorp_StackOption_Point",
-	)
+	record_stack_option_ok: Bool = option_string_is_none(stack_option_c_type(HeapRecordType("Point"), {}))
 	unsupported_stack_option_ok: Bool = option_string_is_none(stack_option_c_type(string_type(), {}))
 
 	(
@@ -224,8 +213,9 @@ pure func test_nullable_managed_option_layout_facts() -> Bool:
 		and option_type_is_none(
 			nullable_managed_option_payload_type(NamedType("Option", [int_type()])),
 		)
-		and option_type_is_none(
-			nullable_managed_option_payload_type(NamedType("Option", [ValueRecordType("Point")])),
+		and option_type_c_name_is(
+			nullable_managed_option_payload_type(NamedType("Option", [HeapRecordType("Point")])),
+			"Point*",
 		)
 		and option_type_is_none(
 			nullable_managed_option_payload_type(
@@ -320,10 +310,9 @@ pure func test_result_layout_facts() -> Bool:
 	) and not is_stack_result_type(NamedType("Result", [int_type()]))
 
 
-pure func value_record_decl(name: String, fields: List[CoreValueRecordField]) -> CoreDecl:
-	ValueRecordDecl({
+pure func heap_record_decl(name: String, fields: List[CoreHeapRecordField]) -> CoreDecl:
+	HeapRecordDecl({
 		abi_type = None,
-		origin = LegacyStructOrigin,
 		name = name,
 		type_params = [],
 		fields = fields,
@@ -393,58 +382,58 @@ pure func foreign_function_decl(param_types: List[CoreType], return_type: CoreTy
 pure func test_foreign_abi_record_layout_classification() -> Bool:
 	program: CoreProgram = {
 		decls = [
-			value_record_decl(
+			heap_record_decl(
 				"InternalFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
-			value_record_decl(
+			heap_record_decl(
 				"NestedFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
-			value_record_decl(
+			heap_record_decl(
 				"ForeignOuter",
 				[
 					{
 						ref = core_field_ref(2),
 						name = "nested",
-						typ = NamedType("NestedFlags", []),
-						ownership = TrivialInlineField
+						typ = HeapRecordType("NestedFlags"),
+						release_policy = ArcReleasePolicy
 					},
 				],
 			),
-			value_record_decl(
+			heap_record_decl(
 				"ForeignReturn",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
-			value_record_decl(
+			heap_record_decl(
 				"HeapNestedFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
@@ -456,7 +445,7 @@ pure func test_foreign_abi_record_layout_classification() -> Bool:
 					{
 						ref = core_field_ref(1),
 						name = "flags",
-						typ = NamedType("InternalFlags", []),
+						typ = HeapRecordType("InternalFlags"),
 						release_policy = NoReleasePolicy
 					},
 				],
@@ -470,7 +459,7 @@ pure func test_foreign_abi_record_layout_classification() -> Bool:
 					{
 						ref = core_field_ref(2),
 						name = "nested",
-						typ = NamedType("HeapNestedFlags", []),
+						typ = HeapRecordType("HeapNestedFlags"),
 						release_policy = NoReleasePolicy
 					},
 					{
@@ -482,14 +471,14 @@ pure func test_foreign_abi_record_layout_classification() -> Bool:
 				],
 				loc = synthetic_core_source_loc(),
 			}),
-			value_record_decl(
+			heap_record_decl(
 				"UnionNestedFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
@@ -504,7 +493,7 @@ pure func test_foreign_abi_record_layout_classification() -> Bool:
 						tag = 0,
 						fields = [
 							{
-								typ = NamedType("UnionNestedFlags", []),
+								typ = HeapRecordType("UnionNestedFlags"),
 								release_policy = NoReleasePolicy
 							},
 						],
@@ -576,7 +565,7 @@ pure func test_foreign_abi_record_layout_classification() -> Bool:
 	prepared: CoreProgram = prepared_core_program_value(run_pre_dce_tail(program))
 	internal_flags_retained = prepared.decls.any(func(decl):
 		match decl:
-			ValueRecordDecl(record_decl):
+			HeapRecordDecl(record_decl):
 				record_decl.name == "InternalFlags"
 			_:
 				False
@@ -595,48 +584,15 @@ pure func test_foreign_abi_record_layout_classification() -> Bool:
 	(
 		internal_flags_retained
 		and internal_heap_retained
-		and c_record_layout(layouts.foreign_abi_value_record_names, "InternalFlags") == InternalLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "InternalFlags") == InternalLayout
 		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "InternalHeapEnvelope") == InternalLayout
-		and c_record_layout(layouts.foreign_abi_value_record_names, "ForeignOuter") == ForeignAbiLayout
-		and c_record_layout(layouts.foreign_abi_value_record_names, "NestedFlags") == ForeignAbiLayout
-		and c_record_layout(layouts.foreign_abi_value_record_names, "ForeignReturn") == ForeignAbiLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "ForeignOuter") == ForeignAbiLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "NestedFlags") == ForeignAbiLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "ForeignReturn") == ForeignAbiLayout
 		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "ForeignHeapEnvelope") == ForeignAbiLayout
-		and c_record_layout(layouts.foreign_abi_value_record_names, "HeapNestedFlags") == ForeignAbiLayout
-		and c_record_layout(layouts.foreign_abi_value_record_names, "UnionNestedFlags") == ForeignAbiLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "HeapNestedFlags") == ForeignAbiLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "UnionNestedFlags") == ForeignAbiLayout
 	)
-
-
-pure func test_consecutive_internal_value_record_boolean_field_storage() -> Bool:
-	c_value_record_field_storage(
-		InternalLayout,
-		canonical_bool_type(),
-		True,
-		{},
-	) == PackedBooleanCValueRecordField
-
-
-pure func test_isolated_internal_value_record_boolean_field_storage() -> Bool:
-	match c_value_record_field_storage(InternalLayout, canonical_bool_type(), False, {}):
-		OrdinaryCValueRecordField(c_type):
-			c_type == "_Bool"
-		PackedBooleanCValueRecordField:
-			False
-
-
-pure func test_foreign_value_record_boolean_field_storage() -> Bool:
-	match c_value_record_field_storage(ForeignAbiLayout, canonical_bool_type(), True, {}):
-		OrdinaryCValueRecordField(c_type):
-			c_type == "int"
-		PackedBooleanCValueRecordField:
-			False
-
-
-pure func test_internal_value_record_non_boolean_field_storage() -> Bool:
-	match c_value_record_field_storage(InternalLayout, int_type(), True, {}):
-		OrdinaryCValueRecordField(c_type):
-			c_type == "long"
-		PackedBooleanCValueRecordField:
-			False
 
 
 pure func test_consecutive_internal_heap_record_boolean_field_storage() -> Bool:
@@ -769,11 +725,10 @@ pure func test_foreign_heap_record_byte_enum_field_storage() -> Bool:
 			False
 
 
-pure func test_runtime_backed_value_record_uses_foreign_layout() -> Bool:
+pure func test_native_snapshot_record_keeps_managed_layout() -> Bool:
 	layouts: CRecordLayoutRegistry = classify_record_layouts_for_test({
-		decls = [ValueRecordDecl({
+		decls = [HeapRecordDecl({
 				abi_type = Some(DeclaredAbiMemStats),
-				origin = LegacyStructOrigin,
 				name = "MemStats",
 				type_params = [],
 				fields = [],
@@ -783,7 +738,7 @@ pure func test_runtime_backed_value_record_uses_foreign_layout() -> Bool:
 		source_files = []
 	})
 
-	c_record_layout(layouts.foreign_abi_value_record_names, "MemStats") == ForeignAbiLayout
+	c_heap_record_layout(layouts.foreign_abi_heap_record_names, "MemStats") == InternalLayout
 
 
 pure func foreign_identity_call(typ: CoreType) -> CoreExpr:
@@ -801,25 +756,25 @@ pure func test_retained_foreign_call_record_layout_classification() -> Bool:
 	second_record_type: CoreType = NamedType("SecondForeignFlags", [])
 	program: CoreProgram = {
 		decls = [
-			value_record_decl(
+			heap_record_decl(
 				"LiveForeignFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
-			value_record_decl(
+			heap_record_decl(
 				"SecondForeignFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
@@ -858,8 +813,8 @@ pure func test_retained_foreign_call_record_layout_classification() -> Bool:
 	layouts: CRecordLayoutRegistry = classify_record_layouts_for_test(program)
 
 	(
-		c_record_layout(layouts.foreign_abi_value_record_names, "LiveForeignFlags") == ForeignAbiLayout
-		and c_record_layout(layouts.foreign_abi_value_record_names, "SecondForeignFlags") == ForeignAbiLayout
+		c_heap_record_layout(layouts.foreign_abi_heap_record_names, "LiveForeignFlags") == ForeignAbiLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "SecondForeignFlags") == ForeignAbiLayout
 	)
 
 
@@ -868,25 +823,25 @@ pure func test_non_function_foreign_call_record_layout_classification() -> Bool:
 	impl_record_type: CoreType = NamedType("ImplForeignFlags", [])
 	program: CoreProgram = {
 		decls = [
-			value_record_decl(
+			heap_record_decl(
 				"GlobalForeignFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
-			value_record_decl(
+			heap_record_decl(
 				"ImplForeignFlags",
 				[
 					{
 						ref = core_field_ref(0),
 						name = "flag",
 						typ = bool_type(),
-						ownership = TrivialInlineField
+						release_policy = cleanup_release_policy_for_type(bool_type())
 					},
 				],
 			),
@@ -935,8 +890,8 @@ pure func test_non_function_foreign_call_record_layout_classification() -> Bool:
 	layouts: CRecordLayoutRegistry = classify_record_layouts_for_test(program)
 
 	(
-		c_record_layout(layouts.foreign_abi_value_record_names, "GlobalForeignFlags") == ForeignAbiLayout
-		and c_record_layout(layouts.foreign_abi_value_record_names, "ImplForeignFlags") == ForeignAbiLayout
+		c_heap_record_layout(layouts.foreign_abi_heap_record_names, "GlobalForeignFlags") == ForeignAbiLayout
+		and c_heap_record_layout(layouts.foreign_abi_heap_record_names, "ImplForeignFlags") == ForeignAbiLayout
 	)
 
 
@@ -950,22 +905,6 @@ tests: TestSuite = {
 		("collection element facts", test_collection_element_facts),
 		("Result layout facts", test_result_layout_facts),
 		("foreign ABI record layout classification", test_foreign_abi_record_layout_classification),
-		(
-			"consecutive internal value-record Boolean field storage",
-			test_consecutive_internal_value_record_boolean_field_storage,
-		),
-		(
-			"isolated internal value-record Boolean field storage",
-			test_isolated_internal_value_record_boolean_field_storage,
-		),
-		(
-			"foreign value-record Boolean field storage",
-			test_foreign_value_record_boolean_field_storage,
-		),
-		(
-			"internal value-record non-Boolean field storage",
-			test_internal_value_record_non_boolean_field_storage,
-		),
 		(
 			"consecutive internal heap-record Boolean field storage",
 			test_consecutive_internal_heap_record_boolean_field_storage,
@@ -995,8 +934,8 @@ tests: TestSuite = {
 			test_foreign_heap_record_byte_enum_field_storage,
 		),
 		(
-			"runtime-backed value record uses foreign layout",
-			test_runtime_backed_value_record_uses_foreign_layout,
+			"native snapshot report keeps ordinary managed layout",
+			test_native_snapshot_record_keeps_managed_layout,
 		),
 		(
 			"retained foreign call record layout classification",

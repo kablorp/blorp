@@ -1,0 +1,64 @@
+import:
+	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest:
+		DeclaredAbiType(DeclaredAbiBool, DeclaredAbiMemStats, DeclaredAbiSchedulerStats),
+	../../../src/compiler/stage_06_typecheck/type_system/native_snapshot_abi:
+		NativeSnapshotKind(MemorySnapshot, SchedulerSnapshot),
+		native_snapshot_kind,
+		native_snapshot_fields,
+		native_snapshot_field_error,
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type: SemanticType(SemanticNamedType),
+	../../../src/compiler/stage_10_backend/emit_native_snapshot:
+		emit_native_snapshot_adapter,
+	test: TestSuite
+
+
+pure func test_snapshot_abi_requires_declared_identity() -> Bool:
+	(
+		native_snapshot_kind(DeclaredAbiMemStats) == Some(MemorySnapshot)
+		and native_snapshot_kind(DeclaredAbiSchedulerStats) == Some(SchedulerSnapshot)
+		and native_snapshot_kind(DeclaredAbiBool).is_none()
+	)
+
+
+pure func test_memory_bridge_reads_one_snapshot_before_managed_construction() -> Bool:
+	emitted = emit_native_snapshot_adapter(MemorySnapshot, "ManagedStats", "ManagedStats_make", "memory_snapshot", "static inline ")
+	emitted == "static inline ManagedStats* memory_snapshot(void) {\n  blorp_MemStats native = blorp_get_mem_stats();\n  return ManagedStats_make(native.total_allocations, native.total_releases, native.current_objects, native.bytes_allocated, native.bytes_available, native.allocator_bytes_in_use, native.allocator_bytes_available, native.backing_libc_malloc_events, native.raw_buffer_malloc_events, native.raw_buffer_calloc_events, native.raw_buffer_realloc_events, native.raw_buffer_aligned_events, native.cleanup_scratch_events, native.fiber_mmap_events, native.oracle_stats_active, native.memory_stats_active);\n}\n\n"
+
+
+pure func test_scheduler_bridge_copies_every_native_field_in_order() -> Bool:
+	fields = native_snapshot_fields(SchedulerSnapshot)
+	emitted = emit_native_snapshot_adapter(SchedulerSnapshot, "ManagedScheduler", "ManagedScheduler_make", "scheduler_snapshot", "static inline ")
+	(
+		fields.length() == 30
+		and fields.get(0) == Some("tasks_spawned")
+		and fields.get(29) == Some("timers_pending")
+		and emitted.contains("blorp_SchedulerStats native = blorp_get_scheduler_stats();")
+		and emitted.contains("return ManagedScheduler_make(native.tasks_spawned, native.tasks_cancelled,")
+		and emitted.contains("native.worker_count, native.runnable_count, native.timers_pending);")
+	)
+
+
+pure func test_adapter_uses_its_managed_constructor_linkage() -> Bool:
+	emit_native_snapshot_adapter(MemorySnapshot, "ManagedStats", "ManagedStats_make", "memory_snapshot", "").starts_with("ManagedStats* memory_snapshot(void)")
+
+
+pure func test_native_schema_rejects_missing_reordered_and_managed_fields() -> Bool:
+	fields = native_snapshot_fields(MemorySnapshot).map(pure func(name): (name, SemanticNamedType("Int", [])))
+	(
+		native_snapshot_field_error(MemorySnapshot, fields).is_none()
+		and native_snapshot_field_error(MemorySnapshot, []) == Some("native snapshot fields must match the declared runtime schema; restore its ordered Int fields")
+		and native_snapshot_field_error(MemorySnapshot, fields.set(0, ("wrong", SemanticNamedType("Int", [])))) == Some("native snapshot field order must match the declared runtime schema; restore its ordered Int fields")
+		and native_snapshot_field_error(MemorySnapshot, fields.set(0, ("total_allocations", SemanticNamedType("String", [])))) == Some("native snapshot fields must have type Int; use a separate record for other data")
+	)
+
+
+tests: TestSuite = {
+	description = "Native snapshot adapters",
+	tests = [
+		("snapshot ABI requires declared identity", test_snapshot_abi_requires_declared_identity),
+		("memory bridge reads one snapshot before managed construction", test_memory_bridge_reads_one_snapshot_before_managed_construction),
+		("scheduler bridge copies every native field in order", test_scheduler_bridge_copies_every_native_field_in_order),
+		("native schema rejects missing reordered and managed fields", test_native_schema_rejects_missing_reordered_and_managed_fields),
+		("adapter uses its managed constructor linkage", test_adapter_uses_its_managed_constructor_linkage),
+	]
+}

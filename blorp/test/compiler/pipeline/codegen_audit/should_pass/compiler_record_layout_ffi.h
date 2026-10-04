@@ -1,11 +1,9 @@
 #ifndef BLORP_TEST_COMPILER_RECORD_LAYOUT_FFI_H
 #define BLORP_TEST_COMPILER_RECORD_LAYOUT_FFI_H
 
-#define blorp_layout_foreign_identity(value) \
-    ({ \
-        extern __typeof__(value) blorp_layout_foreign_identity_impl(__typeof__(value)); \
-        blorp_layout_foreign_identity_impl(value); \
-    })
+/* The language record never crosses this boundary. Native scalar prototypes
+ * are independent of the compiler's managed layout and projected members. */
+int blorp_layout_foreign_mixed_fields(int first, long count, int second, long total);
 
 #define blorp_layout_bool_identity(value) \
     ({ \

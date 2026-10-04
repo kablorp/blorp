@@ -1,6 +1,12 @@
 import:
 	dict as D
-	memory: MemStats, get_mem_stats, reset_mem_stats
+	memory:
+		MemStats,
+		MemoryCounter(ManagedAllocations, ManagedReleases, LiveManagedObjects, MemoryStatsActive, OracleStatsActive),
+		get_mem_stats,
+		read_memory_counter,
+		reset_mem_stats,
+		same_object,
 	string: parse_int
 	tensor as T
 	test: TestSuite
@@ -9,7 +15,7 @@ import:
 type alias MaybeFloat = Option[Float]
 
 
-struct StackPoint {
+fixed record StackPoint {
 	x: Int,
 	y: Int
 }
@@ -370,7 +376,7 @@ tests: TestSuite = {
 		("Option[UInt128]", test_option_uint128),
 		("Option[range]", test_option_range),
 		("Option[enum]", test_option_enum),
-		("Option[struct]", test_option_value_record),
+		("Option[managed record] shares and preserves values on update", test_option_managed_record),
 		("Option None default", test_option_none_default),
 		("Option no alloc sized types", test_option_no_alloc_sized),
 		("Option generated stack no alloc", test_option_generated_stack_no_alloc),
@@ -488,7 +494,7 @@ func test_option_enum() -> Bool:
 			False
 
 
-func test_option_value_record() -> Bool:
+pure func managed_record_option_values() -> Bool:
 	p: StackPoint = {
 		x = 3,
 		y = 4
@@ -496,9 +502,25 @@ func test_option_value_record() -> Bool:
 
 	match Some(p):
 		Some(v):
-			v.x == 3 and v.y == 4
+			shared: Bool = same_object(p, v)
+			updated: StackPoint = { v | x = 7 }
+			shared and p.x == 3 and p.y == 4 and updated.x == 7 and updated.y == 4 and not same_object(p, updated)
 		None:
 			False
+
+
+func test_option_managed_record() -> Bool:
+	reset_mem_stats()
+	active_before: Bool = read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
+	values_preserved: Bool = managed_record_option_values()
+	(
+		active_before and values_preserved
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and read_memory_counter(ManagedAllocations) == 2
+		and read_memory_counter(ManagedReleases) == 2
+		and read_memory_counter(LiveManagedObjects) == 0
+	)
 
 
 func test_option_bool_false() -> Bool:
@@ -557,6 +579,7 @@ func test_option_no_alloc_sized() -> Bool:
 
 func test_option_generated_stack_no_alloc() -> Bool:
 	reset_mem_stats()
+	active_before: Bool = read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
 	var i: Int = 0
 
 	while i < 500:
@@ -580,17 +603,22 @@ func test_option_generated_stack_no_alloc() -> Bool:
 			None:
 				i = i
 
-		match Some({
-			x = i,
-			y = i + 1,
-		}):
-			Some(p):
-				i = p.x + 1
+		unsigned_wide: UInt128 = to_uint128(i)
+		match Some(unsigned_wide):
+			Some(_):
+				i += 1
 			None:
 				i += 1
 
-	stats: MemStats = get_mem_stats()
-	stats.total_allocations < 10
+	(
+		active_before
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and read_memory_counter(ManagedAllocations) == 0
+		and read_memory_counter(ManagedReleases) == 0
+		and read_memory_counter(LiveManagedObjects) == 0
+		and i == 500
+	)
 
 
 func test_vector_get_int128_stack_option() -> Bool:

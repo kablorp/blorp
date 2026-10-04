@@ -128,7 +128,6 @@ import:
 			TensorType,
 			TupleType,
 			UnionType,
-			ValueRecordType,
 			VoidType,
 		),
 		CoreUnaryOp(NotOp),
@@ -154,6 +153,7 @@ import:
 		perceus_temporary_binder_id,
 		CoreVar,
 		core_field_ref,
+		core_field_refs_equal,
 		core_node_id_raw,
 		core_program_to_json,
 		core_program_max_declared_definition_id,
@@ -9327,8 +9327,8 @@ pure func test_nested_mutable_record_result_preserves_slot_owner() -> Bool:
 	dup_count_for("slot", rewritten) == 1 and drop_count_for("slot", rewritten) == 1
 
 
-pure func test_value_record_update_field_read_preserves_core_tree() -> Bool:
-	pair_type: CoreType = ValueRecordType("Pair")
+pure func test_managed_record_update_releases_consumed_owners_after_field_read() -> Bool:
+	pair_type: CoreType = HeapRecordType("Pair")
 	initial: CoreExpr = RecordConstructExpr(
 		"Pair",
 		[
@@ -9402,8 +9402,27 @@ pure func test_value_record_update_field_read_preserves_core_tree() -> Bool:
 	match function_body(program, "record_update"):
 		Some(LetExpr(p, p_mutable, p_type, p_rhs, p_body)):
 			match p_body:
-				LetExpr(q, q_mutable, q_type, q_rhs, q_body):
-					count_uses("q", q_body) == 1
+				LetExpr(_, False, _, LetExpr(q, False, _, q_rhs, q_body), _):
+					update_has_arc_drop: Bool = match q_rhs:
+						LetExpr(_, False, _, _, LetExpr(_, False, _, RecordConstructExpr("Pair", _, _, _), DropExpr(update_base, _, ArcReleasePolicy, _, _, _))):
+							update_base.name == "__upd_0"
+						_:
+							False
+					match q_body:
+						LetExpr(_, False, _, FieldExpr(VarExpr(read_var, _, _), "a", field_ref, _, _), DropExpr(dropped_var, _, ArcReleasePolicy, _, _, _)):
+							(
+								p.name == "p" and q.name == "q"
+								and read_var.name == "q" and dropped_var.name == "q"
+								and core_field_refs_equal(field_ref, core_field_ref(1))
+								and count_uses("q", q_body) == 1
+								and drop_count_for("q", p_body) == 1
+								and drop_count_for("__upd_0", p_body) == 1
+								and update_has_arc_drop
+								and drop_count_for("p", p_body) == 0
+								and dup_count_for("p", p_body) == 0
+							)
+						_:
+							False
 				_:
 					False
 		Some(_):
@@ -20881,8 +20900,8 @@ tests: TestSuite = {
 			test_nested_mutable_record_result_preserves_slot_owner,
 		),
 		(
-			"value record update field read preserves Core tree",
-			test_value_record_update_field_read_preserves_core_tree,
+			"managed record update releases consumed owners after field read",
+			test_managed_record_update_releases_consumed_owners_after_field_read,
 		),
 		(
 			"mutable assignment releases old and final owners",

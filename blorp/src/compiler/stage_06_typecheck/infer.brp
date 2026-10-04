@@ -5,6 +5,7 @@
 -- extend this module or split call/resource/concurrency helpers out of it while
 -- preserving the typed expression metadata boundary defined here.
 import:
+	graph/range_record: ResolvedRangeFields, STANDARD_RANGE_RECORD_TYPE_NAME
 	../../lib/source:
 		SourceLocation,
 		source_location_end_offset,
@@ -173,6 +174,8 @@ import:
 		accepted_record_field_name,
 		accepted_record_find,
 		accepted_record_find_field_id,
+		accepted_record_range_fields,
+		accepted_record_is_standard_range,
 		accepted_record_find_field_type_by_id,
 		accepted_record_find_names_with_fields,
 		accepted_record_find_type_params,
@@ -422,7 +425,7 @@ import:
 		is_resource_source_type_name,
 		is_stream_type_name,
 		type_name_has_componentwise_equality,
-	type_system/type_resolution: resolve_graph_qualified_type_names
+	type_system/type_resolution: resolve_graph_qualified_type_names, resolve_nominal_dimension_applications
 	type_system/type_widening:
 		CollectionKind,
 		TypeWideningDecision(TypeKeep, TypeWiden),
@@ -726,7 +729,7 @@ union TypedExpr:
 	TypedRecordUpdateExpr(TypedExpr, List[TypedRecordField], List[ResolvedRecordField], SourceLocation, TypedExprInfo)
 	TypedFieldAccessExpr(TypedExpr, ParsedIdentifier, ResolvedFieldIdentity, SourceLocation, TypedExprInfo)
 	TypedLambdaExpr(Bool, List[TypedLambdaParam], Option[SemanticType], TypedExpr, SourceLocation, TypedExprInfo)
-	TypedRangeExpr(TypedExpr, TypedExpr, SourceLocation, TypedExprInfo)
+	TypedRangeExpr(TypedExpr, TypedExpr, ResolvedRangeFields, SourceLocation, TypedExprInfo)
 	TypedIfExpr(TypedExpr, TypedExpr, Option[TypedExpr], SourceLocation, TypedExprInfo)
 	TypedMatchExpr(TypedExpr, List[TypedMatchCase], SourceLocation, TypedExprInfo)
 	TypedSelectExpr(List[TypedSelectArm], SourceLocation, TypedExprInfo)
@@ -848,7 +851,7 @@ pure func typed_expr_location(expr: TypedExpr) -> SourceLocation:
 			span
 		TypedLambdaExpr(_, _, _, _, span, _):
 			span
-		TypedRangeExpr(_, _, span, _):
+		TypedRangeExpr(_, _, range_fields, span, _):
 			span
 		TypedIfExpr(_, _, _, span, _):
 			span
@@ -918,7 +921,7 @@ private record MemoizedTypeShapeCheck {
 }
 
 
-private struct ResourceCapabilityPresence {
+private fixed record ResourceCapabilityPresence {
 	contains_one_shot_stream: Bool,
 	contains_resource_source: Bool
 }
@@ -1157,7 +1160,12 @@ private pure func infer_canonical_expected_type(
 		context.state.facts.module_view,
 		source_type,
 	)
-	resolved_aliases = infer_resolve_alias(context, qualified)
+	nominal = resolve_nominal_dimension_applications(
+		context.state.facts.module_view,
+		context.state.env,
+		qualified,
+	)
+	resolved_aliases = infer_resolve_alias(context, nominal)
 
 	type_instantiate_type_params(env_get_type_params(context.state.env), resolved_aliases)
 
@@ -2006,7 +2014,7 @@ pure func typed_expr_info(expr: TypedExpr) -> TypedExprInfo:
 			info
 		TypedLambdaExpr(_, _, _, _, _, info):
 			info
-		TypedRangeExpr(_, _, _, info):
+		TypedRangeExpr(_, _, range_fields, _, info):
 			info
 		TypedIfExpr(_, _, _, _, info):
 			info
@@ -2102,8 +2110,8 @@ private pure func typed_expr_with_info(expr: TypedExpr, info: TypedExprInfo) -> 
 			TypedFieldAccessExpr(receiver, field, field_id, span, info)
 		TypedLambdaExpr(is_pure, params, return_annotation, body, span, _):
 			TypedLambdaExpr(is_pure, params, return_annotation, body, span, info)
-		TypedRangeExpr(start_expr, end_expr, span, _):
-			TypedRangeExpr(start_expr, end_expr, span, info)
+		TypedRangeExpr(start_expr, end_expr, range_fields, span, _):
+			TypedRangeExpr(start_expr, end_expr, range_fields, span, info)
 		TypedIfExpr(condition, then_branch, else_branch, span, _):
 			TypedIfExpr(condition, then_branch, else_branch, span, info)
 		TypedMatchExpr(scrutinee, cases, span, _):
@@ -2745,7 +2753,7 @@ pure func typed_expr_type_error(expr: TypedExpr) -> Option[String]:
 					typed_expr_type_error(receiver)
 				TypedLambdaExpr(_, _, _, body, _, _):
 					typed_expr_type_error(body)
-				TypedRangeExpr(start_expr, end_expr, _, _):
+				TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 					match typed_expr_type_error(start_expr):
 						Some(message):
 							Some(message)
@@ -2981,7 +2989,7 @@ pure func typed_expr_contains_meta(expr: TypedExpr) -> Bool:
 					or optional_type_contains_meta(return_annotation)
 					or typed_expr_contains_meta(body)
 				)
-			TypedRangeExpr(start_expr, end_expr, _, _):
+			TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 				typed_expr_contains_meta(start_expr) or typed_expr_contains_meta(end_expr)
 			TypedIfExpr(condition, then_branch, else_branch, _, _):
 				(
@@ -3534,10 +3542,11 @@ pure func zonk_typed_expr(context: Context, expr: TypedExpr) -> TypedExpr:
 				span,
 				info,
 			)
-		TypedRangeExpr(start_expr, end_expr, span, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, span, _):
 			TypedRangeExpr(
 				zonk_typed_expr(context, start_expr),
 				zonk_typed_expr(context, end_expr),
+				range_fields,
 				span,
 				info,
 			)
@@ -3867,7 +3876,7 @@ private pure func typed_expr_resource_dependency_refs(
 			)
 		TypedFieldAccessExpr(receiver, _, _, _, _):
 			typed_expr_resource_dependency_refs(context, receiver)
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			append_resource_refs(
 				typed_expr_resource_dependency_refs(context, start_expr),
 				typed_expr_resource_dependency_refs(context, end_expr),
@@ -4168,7 +4177,7 @@ pure func typed_expr_purity_requirements(expr: TypedExpr) -> List[PurityRequirem
 				typed_expr_purity_requirements(body)
 			else:
 				[]
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			append_purity_requirements(
 				typed_expr_purity_requirements(start_expr),
 				typed_expr_purity_requirements(end_expr),
@@ -4469,7 +4478,7 @@ pure func typed_expr_module_assign_names(expr: TypedExpr) -> List[String]:
 				typed_expr_module_assign_names(body)
 			else:
 				[]
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			append_module_assign_names(
 				typed_expr_module_assign_names(start_expr),
 				typed_expr_module_assign_names(end_expr),
@@ -4797,7 +4806,7 @@ pure func typed_expr_startup_work_scan(expr: TypedExpr) -> TypedStartupWorkScan:
 			typed_expr_startup_work_scan(receiver)
 		TypedLambdaExpr(_, _, _, _, _, _):
 			STARTUP_WORK_SCAN_EMPTY
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			append_startup_work_scan(
 				typed_expr_startup_work_scan(start_expr),
 				typed_expr_startup_work_scan(end_expr),
@@ -5124,7 +5133,7 @@ private pure func typed_expr_has_non_tail_recursive_call_inner(
 			typed_expr_has_non_tail_recursive_call_inner(receiver, function_name, False)
 		TypedLambdaExpr(_, _, _, body, _, _):
 			typed_expr_has_non_tail_recursive_call_inner(body, function_name, True)
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			(
 				typed_expr_has_non_tail_recursive_call_inner(start_expr, function_name, False)
 				or typed_expr_has_non_tail_recursive_call_inner(end_expr, function_name, False)
@@ -5412,7 +5421,7 @@ pure func typed_expr_pure_lambda_impure_call_names(expr: TypedExpr) -> List[Stri
 				typed_expr_impure_call_names(body)
 			else:
 				typed_expr_pure_lambda_impure_call_names(body)
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			append_impure_call_names(
 				typed_expr_pure_lambda_impure_call_names(start_expr),
 				typed_expr_pure_lambda_impure_call_names(end_expr),
@@ -5667,7 +5676,7 @@ pure func typed_expr_debug_block_impure_call_names(expr: TypedExpr) -> List[Stri
 			typed_expr_debug_block_impure_call_names(receiver)
 		TypedLambdaExpr(_, _, _, body, _, _):
 			typed_expr_debug_block_impure_call_names(body)
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			append_impure_call_names(
 				typed_expr_debug_block_impure_call_names(start_expr),
 				typed_expr_debug_block_impure_call_names(end_expr),
@@ -18606,17 +18615,23 @@ private pure func infer_range_expr(
 			range_endpoint_error(end_result.context, "end", end_type).state,
 		)
 
-	typed = TypedRangeExpr(
-		start_result.expr,
-		end_result.expr,
-		span,
-		inferred_info(
-			result_context,
-			SemanticNamedType("Range", []),
-		),
-	)
-
-	infer_result(result_context, typed)
+	fields = module_view_accepted_record_authority(result_context.state.facts.module_view)
+		.and_then(accepted_record_range_fields)
+	match fields:
+		Some(range_fields):
+			infer_result(result_context, TypedRangeExpr(
+				start_result.expr,
+				end_result.expr,
+				range_fields,
+				span,
+				inferred_info(result_context, SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, [])),
+			))
+		None:
+			failed = infer_error(
+				result_context,
+				"internal compiler error: standard Range record fields are unavailable; rebuild the compiler's embedded standard library",
+			)
+			infer_result(failed, TypedVoidExpr(span, inferred_info(failed, TYPE_VOID)))
 
 
 private pure func pattern_type_error(
@@ -20107,10 +20122,13 @@ private pure func is_single_argument_iterable_type_name(name: String) -> Bool:
 	)
 
 
-private pure func iterable_element_type(typ: SemanticType) -> Option[SemanticType]:
+private pure func iterable_element_type(
+	records: Option[AcceptedRecordAuthority],
+	typ: SemanticType,
+) -> Option[SemanticType]:
 	match typ:
 		SemanticNamedType(name, args):
-			if name == "Range" and args.length() == 0:
+			if args.length() == 0 and records.map(func(authority): accepted_record_is_standard_range(authority, name)).get_or(False):
 				Some(TYPE_INT)
 			else if name == "String" and args.length() == 0:
 				Some(TYPE_CHAR)
@@ -20384,13 +20402,13 @@ private pure func for_tuple_element_types(
 							ok = False
 						}
 			else:
-				match iterable_element_type(iterable_type):
+				match iterable_element_type(module_view_accepted_record_authority(context.state.facts.module_view), iterable_type):
 					Some(element_type):
 						for_tuple_elements_from_iterable_element(context, element_type)
 					None:
 						for_tuple_iterable_error(context, iterable_type)
 		_:
-			match iterable_element_type(iterable_type):
+			match iterable_element_type(module_view_accepted_record_authority(context.state.facts.module_view), iterable_type):
 				Some(element_type):
 					for_tuple_elements_from_iterable_element(context, element_type)
 				None:
@@ -20484,7 +20502,7 @@ private pure func for_name_binding_type(
 			typed_loop_view_element_type(view)
 		None:
 			match iterable:
-				TypedRangeExpr(start_expr, end_expr, _, _):
+				TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 					match (
 						static_operand_semantic_type(start_expr),
 						static_operand_semantic_type(end_expr),
@@ -20504,7 +20522,7 @@ private pure func for_name_binding_type(
 
 private pure func for_name_binding_refinement(iterable: TypedExpr) -> ValueProofs:
 	match iterable:
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			match (
 				static_operand_semantic_type(start_expr),
 				static_operand_semantic_type(end_expr),
@@ -20609,7 +20627,7 @@ private pure func infer_for_expr(
 				Some(view):
 					Some(typed_loop_view_element_type(view))
 				None:
-					iterable_element_type(iter_type)
+					iterable_element_type(module_view_accepted_record_authority(iter_result.context.state.facts.module_view), iter_type)
 
 			binding_origin = iterable_binding_origin(iter_type)
 

@@ -39305,6 +39305,54 @@ blorp_MemStats blorp_get_mem_stats(void) {
 #endif
 }
 
+// Stable tags match memory.brp's MemoryCounter declaration. Keep these named:
+// the foreign enum ABI is C long, and these numbers are its wire contract.
+typedef enum {
+    BLORP_MEMORY_COUNTER_MANAGED_ALLOCATIONS = 0,
+    BLORP_MEMORY_COUNTER_MANAGED_RELEASES = 1,
+    BLORP_MEMORY_COUNTER_LIVE_MANAGED_OBJECTS = 2,
+    BLORP_MEMORY_COUNTER_MANAGED_BYTES = 3,
+    BLORP_MEMORY_COUNTER_MANAGED_BYTES_AVAILABLE = 4,
+    BLORP_MEMORY_COUNTER_ALLOCATOR_BYTES_IN_USE = 5,
+    BLORP_MEMORY_COUNTER_ALLOCATOR_BYTES_AVAILABLE = 6,
+    BLORP_MEMORY_COUNTER_BACKING_MALLOC_EVENTS = 7,
+    BLORP_MEMORY_COUNTER_RAW_MALLOC_EVENTS = 8,
+    BLORP_MEMORY_COUNTER_RAW_CALLOC_EVENTS = 9,
+    BLORP_MEMORY_COUNTER_RAW_REALLOC_EVENTS = 10,
+    BLORP_MEMORY_COUNTER_RAW_ALIGNED_EVENTS = 11,
+    BLORP_MEMORY_COUNTER_CLEANUP_SCRATCH_EVENTS = 12,
+    BLORP_MEMORY_COUNTER_FIBER_MAP_EVENTS = 13,
+    BLORP_MEMORY_COUNTER_ORACLE_STATS_ACTIVE = 14,
+    BLORP_MEMORY_COUNTER_MEMORY_STATS_ACTIVE = 15
+} blorp_MemoryCounter;
+
+long blorp_read_memory_counter(long counter) {
+    blorp_MemStats snapshot = blorp_get_mem_stats();
+    switch (counter) {
+        case BLORP_MEMORY_COUNTER_MANAGED_ALLOCATIONS: return snapshot.total_allocations;
+        case BLORP_MEMORY_COUNTER_MANAGED_RELEASES: return snapshot.total_releases;
+        case BLORP_MEMORY_COUNTER_LIVE_MANAGED_OBJECTS: return snapshot.current_objects;
+        case BLORP_MEMORY_COUNTER_MANAGED_BYTES: return snapshot.bytes_allocated;
+        case BLORP_MEMORY_COUNTER_MANAGED_BYTES_AVAILABLE: return snapshot.bytes_available;
+        case BLORP_MEMORY_COUNTER_ALLOCATOR_BYTES_IN_USE: return snapshot.allocator_bytes_in_use;
+        case BLORP_MEMORY_COUNTER_ALLOCATOR_BYTES_AVAILABLE: return snapshot.allocator_bytes_available;
+        case BLORP_MEMORY_COUNTER_BACKING_MALLOC_EVENTS: return snapshot.backing_libc_malloc_events;
+        case BLORP_MEMORY_COUNTER_RAW_MALLOC_EVENTS: return snapshot.raw_buffer_malloc_events;
+        case BLORP_MEMORY_COUNTER_RAW_CALLOC_EVENTS: return snapshot.raw_buffer_calloc_events;
+        case BLORP_MEMORY_COUNTER_RAW_REALLOC_EVENTS: return snapshot.raw_buffer_realloc_events;
+        case BLORP_MEMORY_COUNTER_RAW_ALIGNED_EVENTS: return snapshot.raw_buffer_aligned_events;
+        case BLORP_MEMORY_COUNTER_CLEANUP_SCRATCH_EVENTS: return snapshot.cleanup_scratch_events;
+        case BLORP_MEMORY_COUNTER_FIBER_MAP_EVENTS: return snapshot.fiber_mmap_events;
+        case BLORP_MEMORY_COUNTER_ORACLE_STATS_ACTIVE: return snapshot.oracle_stats_active;
+        case BLORP_MEMORY_COUNTER_MEMORY_STATS_ACTIVE: return snapshot.memory_stats_active;
+        default:
+            // Valid language enums cannot reach this. Foreign code passing an
+            // invalid tag violates the boundary contract; never report zero.
+            fputs("invalid MemoryCounter tag at native boundary\n", stderr);
+            abort();
+    }
+}
+
 void blorp_reset_mem_stats(void) {
 #if BLORP_MEMORY_DIAGNOSTICS
     // The one explicit call that starts an exact measurement epoch: objects
@@ -39319,9 +39367,8 @@ void blorp_reset_mem_stats(void) {
     // Called when BLORP_MEMORY_STATS already counted without metadata, it
     // cannot tell in-flight untracked operations apart; call it while other
     // threads are quiescent. The allocation-oracle counters are deliberately
-    // not cleared: the oracle's before/after workflow (see memory.brp's
-    // assert_no_heap_activity) diffs two get_mem_stats() snapshots and does
-    // not use this reset.
+    // not cleared: exact oracle intervals compare read_memory_counter scalar
+    // endpoints and do not use this reset or allocated snapshot records.
     pthread_mutex_lock(&__alloc_meta_mutex);
     atomic_fetch_add(&global_mem_stats.epoch, 1);
     atomic_store(&global_mem_stats.total_allocations, 0);

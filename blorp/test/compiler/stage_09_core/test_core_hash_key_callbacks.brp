@@ -29,7 +29,7 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreRuntimeCallbackRole(EquatableEqualsCallback, HashableHashCallback),
-		CoreType(HeapRecordType, NamedType, ValueRecordType),
+		CoreType(HeapRecordType, NamedType),
 		CoreUnboxKind(PointerUnbox, PrimUnbox, StructUnbox),
 		CoreVar,
 		core_function_declared_origin,
@@ -37,7 +37,7 @@ import:
 	test: TestSuite
 
 
-private POINT_TYPE: CoreType = ValueRecordType("Point")
+private POINT_TYPE: CoreType = HeapRecordType("Point")
 
 private INT_TYPE: CoreType = NamedType("Int", [])
 
@@ -163,10 +163,10 @@ pure func adapter_for(program: CoreProgram, impl_def: Int) -> Option[CoreFunctio
 	found
 
 
-pure func is_struct_slot_unbox(expr: CoreExpr, slot_name: String, struct_name: String) -> Bool:
+pure func is_record_slot_unbox(expr: CoreExpr, slot_name: String, struct_name: String) -> Bool:
 	match expr:
-		UnboxExpr(StructUnbox(c_type), VarExpr(slot, NamedType("Ptr", []), _), ValueRecordType(unboxed), _):
-			c_type == struct_name and slot.name == slot_name and unboxed == struct_name
+		UnboxExpr(PointerUnbox, VarExpr(slot, NamedType("Ptr", []), _), HeapRecordType(unboxed), _):
+			slot.name == slot_name and unboxed == struct_name
 		_:
 			False
 
@@ -175,7 +175,7 @@ pure func adapter_table(program: CoreProgram) -> HashKeyAdapterTable:
 	build_hash_key_adapter_table(program, build_specialize_layout(program), build_runtime_callback_table(program))
 
 
-pure func test_mints_value_record_slot_adapters() -> Bool:
+pure func test_mints_record_slot_adapters() -> Bool:
 	result: HashKeyCallbackResult = minted([hash_impl(POINT_TYPE), equals_impl(POINT_TYPE)])
 
 	hash_adapter_calls_impl: Bool = match adapter_for(result.program, HASH_IMPL_DEF_ID):
@@ -186,7 +186,7 @@ pure func test_mints_value_record_slot_adapters() -> Bool:
 						impl_id == HASH_IMPL_DEF_ID
 						and adapter.def_id == FIRST_FREE_DEF_ID
 						and adapter.params.map(func(p): p.typ) == [NamedType("Ptr", [])]
-						and is_struct_slot_unbox(key, "key_slot", "Point")
+						and is_record_slot_unbox(key, "key_slot", "Point")
 					)
 				_:
 					False
@@ -200,8 +200,8 @@ pure func test_mints_value_record_slot_adapters() -> Bool:
 					(
 						impl_id == EQUALS_IMPL_DEF_ID
 						and adapter.def_id == FIRST_FREE_DEF_ID + 1
-						and is_struct_slot_unbox(left, "left_slot", "Point")
-						and is_struct_slot_unbox(right, "right_slot", "Point")
+						and is_record_slot_unbox(left, "left_slot", "Point")
+						and is_record_slot_unbox(right, "right_slot", "Point")
 					)
 				_:
 					False
@@ -322,7 +322,7 @@ pure func test_unboxes_heap_record_slot_as_pointer() -> Bool:
 			False
 
 
-pure func test_binds_value_record_key_to_minted_adapters() -> Bool:
+pure func test_binds_record_key_to_minted_adapters() -> Bool:
 	result: HashKeyCallbackResult = minted([hash_impl(POINT_TYPE), equals_impl(POINT_TYPE)])
 
 	match bound_hash_container_constructor(
@@ -330,7 +330,7 @@ pure func test_binds_value_record_key_to_minted_adapters() -> Bool:
 		adapter_table(result.program),
 		POINT_TYPE,
 	):
-		-- The slot owns the key's struct box, so the container releases it.
+		-- The slot owns the managed record pointer, so the container releases it.
 		CustomHashContainerConstructor(hash_fn, equals_fn, needs_release):
 			hash_fn == FIRST_FREE_DEF_ID and equals_fn == FIRST_FREE_DEF_ID + 1 and needs_release
 		_:
@@ -341,20 +341,28 @@ pure func test_leaves_boxed_key_without_adapters_unbound() -> Bool:
 	program: CoreProgram = program_with([])
 
 	match bound_hash_container_constructor(build_specialize_layout(program), adapter_table(program), POINT_TYPE):
-		TraitHashContainerConstructor(ValueRecordType("Point")):
+		TraitHashContainerConstructor(HeapRecordType("Point")):
 			True
 		_:
 			False
 
 
 pure func test_refuses_adapters_with_a_different_slot_layout() -> Bool:
-	-- Adapters minted for a heap record never bind a value record that shares
-	-- its impls' type key, since they unbox a pointer, not a struct.
+	-- Even with exact impl identity, a stale scalar stack-Option slot must
+	-- never bind a managed record pointer key.
 	result: HashKeyCallbackResult = minted([hash_impl(HeapRecordType("Point")), equals_impl(HeapRecordType("Point"))])
+
+	table: HashKeyAdapterTable = adapter_table(result.program)
+	mismatched: HashKeyAdapterTable = { table |
+		adapters = table.adapters.set(HASH_IMPL_DEF_ID, {
+			def_id = FIRST_FREE_DEF_ID,
+			slot = StructUnbox("blorp_StackOption_Int")
+		})
+	}
 
 	match bound_hash_container_constructor(
 		build_specialize_layout(result.program),
-		adapter_table(result.program),
+		mismatched,
 		POINT_TYPE,
 	):
 		TraitHashContainerConstructor(_):
@@ -382,7 +390,7 @@ pure func test_leaves_pointer_key_without_adapters_unbound() -> Bool:
 tests: TestSuite = {
 	description = "Core hash-key callback adapters",
 	tests = [
-		("mints value record slot adapters", test_mints_value_record_slot_adapters),
+		("mints record pointer slot adapters", test_mints_record_slot_adapters),
 		("mints nothing without hash impls", test_mints_nothing_without_hash_impls),
 		("needs both impls to mint", test_needs_both_impls_to_mint),
 		("mints nothing for runtime-hashed keys", test_mints_nothing_for_runtime_hashed_keys),
@@ -397,7 +405,7 @@ tests: TestSuite = {
 		),
 		("rejects other pinned impl ids", test_rejects_other_pinned_impl_ids),
 		("unboxes heap record slot as pointer", test_unboxes_heap_record_slot_as_pointer),
-		("binds value record key to minted adapters", test_binds_value_record_key_to_minted_adapters),
+		("binds record key to minted adapters", test_binds_record_key_to_minted_adapters),
 		("leaves boxed key without adapters unbound", test_leaves_boxed_key_without_adapters_unbound),
 		("refuses adapters with a different slot layout", test_refuses_adapters_with_a_different_slot_layout),
 		("leaves pointer key without adapters unbound", test_leaves_pointer_key_without_adapters_unbound),

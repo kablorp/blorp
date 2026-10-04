@@ -25,11 +25,11 @@ Current families include strings, lists, dictionaries, sets, tensors, heap
 records, payload unions, captured closures, channels, and other runtime objects
 classified by Core representation.
 
-Unmanaged values include primitive scalars, enums, fieldless unions, valid
-struct values, raw pointers, and dimension values. A struct is unmanaged as a
-whole, so every field must also have a valid inline unmanaged representation.
-Type-header validation rejects managed struct fields and infinitely recursive
-inline products before Core lowering.
+Unmanaged values include primitive scalars, enums, fieldless unions, raw
+pointers, and dimension values. `record`, `struct`, and `fixed record` all
+denote ordinary managed records; fields may themselves be managed.
+Type-header validation rejects mandatory recursive products before Core
+lowering, independently of the declaration spelling.
 
 Type declarations enter the environment only through category-specific headers
 accepted by a validated `TypeHeaderGraph`. Production and phase-local compiler

@@ -11,7 +11,10 @@ import:
 		ParsedParamBinder(ParsedParamNameBinder, ParsedParamTupleBinder, ParsedParamWildcardBinder),
 		ParsedUnaryOp,
 	../stage_04_modules/module_table: ModuleId, module_ids_equal
-	../stage_06_typecheck/graph/definition_index: ResolvedFieldIdentity
+	../stage_06_typecheck/graph/definition_index:
+		FieldId, ResolvedFieldIdentity, resolved_field_identity, field_id_definition_id,
+		resolved_field_identity_runtime_value
+	../stage_06_typecheck/graph/range_record: ResolvedRangeFields, RANGE_START_FIELD, RANGE_END_FIELD
 	../stage_06_typecheck/headers/declaration_skeleton: callable_id_definition_id
 	../stage_06_typecheck/infer: TypedExpr, TypedLambdaParam
 	../stage_06_typecheck/type_system/semantic_type: SemanticType, array_type, array_type_parts
@@ -101,7 +104,7 @@ import:
 		CtfeIrField,
 		CtfeIrFieldAccess,
 		CtfeIrFieldAccessKind(
-			CtfeIrRangeEndField, CtfeIrRangeInvalidField, CtfeIrRangeStartField, CtfeIrRecordField,
+			CtfeIrRecordField,
 			CtfeIrTupleField, CtfeIrTupleInvalidField,
 		),
 		CtfeIrIdentifier,
@@ -131,7 +134,7 @@ import:
 		CtfeValue,
 		CtfeValueDesc(
 			CtfeConstructorValue, CtfeDictValue, CtfeFloatValue, CtfeFunctionReferenceValue,
-			CtfeIntValue, CtfeLambdaValue, CtfeListValue, CtfeRangeValue, CtfeRecordValue,
+			CtfeIntValue, CtfeLambdaValue, CtfeListValue, CtfeRecordValue,
 			CtfeStringValue, CtfeTupleValue, CtfeVectorValue, CtfeVoidValue,
 		),
 		ctfe_bool,
@@ -566,28 +569,6 @@ private pure func ctfe_eval_field_access_kind(
 					Err(CtfeEvalUnsupported("tuple field access '" + field_name + "'"))
 				_:
 					Err(CtfeEvalUnsupported("field access on this value"))
-		CtfeIrRangeStartField:
-			match value.desc:
-				CtfeRangeValue(start_value, _):
-					Ok(start_value)
-				_:
-					Err(CtfeEvalUnsupported("field access on this value"))
-		CtfeIrRangeEndField:
-			match value.desc:
-				CtfeRangeValue(_, end_value):
-					Ok(end_value)
-				_:
-					Err(CtfeEvalUnsupported("field access on this value"))
-		CtfeIrRangeInvalidField(field_name):
-			match value.desc:
-				CtfeRangeValue(_, _):
-					Err(
-						CtfeEvalInvalid(
-							"compile-time Range value has no field '" + field_name + "'",
-						),
-					)
-				_:
-					Err(CtfeEvalUnsupported("field access on this value"))
 
 
 private pure func ctfe_eval_imported_global(
@@ -730,8 +711,8 @@ private pure func ctfe_eval_block_item(
 				CtfeIrWhileExpr(condition, body):
 					next_env ?= ctfe_eval_while_env(context, env, condition, body)
 					Ok(CtfeBlockItemContinue(next_env))
-				CtfeIrForExpr(name, iterable, body):
-					next_env ?= ctfe_eval_for_env(context, env, name, iterable, body)
+				CtfeIrForExpr(name, iterable, body, range_fields):
+					next_env ?= ctfe_eval_for_env(context, env, name, iterable, body, range_fields)
 					Ok(CtfeBlockItemContinue(next_env))
 				CtfeIrForTupleExpr(names, iterable, body):
 					next_env ?= ctfe_eval_for_tuple_env(context, env, names, iterable, body)
@@ -2671,8 +2652,8 @@ private pure func ctfe_eval_loop_body(
 		CtfeIrWhileExpr(condition, body):
 			next_env ?= ctfe_eval_while_env(context, env, condition, body)
 			Ok(CtfeLoopBodyValue(next_env, ctfe_eval_void_value(expr)))
-		CtfeIrForExpr(name, iterable, body):
-			next_env ?= ctfe_eval_for_env(context, env, name, iterable, body)
+		CtfeIrForExpr(name, iterable, body, range_fields):
+			next_env ?= ctfe_eval_for_env(context, env, name, iterable, body, range_fields)
 			Ok(CtfeLoopBodyValue(next_env, ctfe_eval_void_value(expr)))
 		CtfeIrForTupleExpr(names, iterable, body):
 			next_env ?= ctfe_eval_for_tuple_env(context, env, names, iterable, body)
@@ -2893,19 +2874,33 @@ private pure func ctfe_eval_for_tuple_list_env(
 			Ok(loop_env)
 
 
+private pure func ctfe_eval_record_field_by_id(
+	fields: List[(String, CtfeValue, ResolvedFieldIdentity)],
+	id: FieldId,
+) -> Result[CtfeValue, CtfeEvalError]:
+	match fields.find(func(field): resolved_field_identity_runtime_value(field[2]) == field_id_definition_id(id)):
+		Some(field):
+			Ok(field[1])
+		None:
+			Err(CtfeEvalInvalid("compile-time standard Range record is missing an authoritative field"))
+
+
 private pure func ctfe_eval_for_env(
 	context: CtfeContext,
 	env: CtfeEnv,
 	name: String,
 	iterable: CtfeIrExpr,
 	body: CtfeIrExpr,
+	range_fields: Option[ResolvedRangeFields],
 ) -> Result[CtfeEnv, CtfeEvalError]:
 	iterable_value ?= ctfe_eval_ir_in_context(context, env, iterable)
 
-	match iterable_value.desc:
-		CtfeRangeValue(start_value, end_value):
+	match (range_fields, iterable_value.desc):
+		(Some(witness), CtfeRecordValue(fields)):
+			start_value ?= ctfe_eval_record_field_by_id(fields, witness.start)
+			end_value ?= ctfe_eval_record_field_by_id(fields, witness.end)
 			ctfe_eval_for_range_env(context, env, name, iterable, start_value, end_value, body)
-		CtfeListValue(values):
+		(None, CtfeListValue(values)):
 			ctfe_eval_for_list_env(context, env, name, values, body)
 		_:
 			Err(CtfeEvalUnsupported("for loops over this iterable"))
@@ -2984,7 +2979,7 @@ private pure func ctfe_eval_ir_in_context(
 			ctfe_eval_field_access_kind(access.kind, receiver_value)
 		CtfeIrImportedGlobalExpr(imported):
 			ctfe_eval_imported_global(context, imported)
-		CtfeIrRangeExpr(start_expr, end_expr):
+		CtfeIrRangeExpr(start_expr, end_expr, range_fields):
 			start_value ?= ctfe_eval_ir_in_context(context, env, start_expr)
 			end_value ?= ctfe_eval_ir_in_context(context, env, end_expr)
 
@@ -2992,7 +2987,10 @@ private pure func ctfe_eval_ir_in_context(
 			start_int ?= ctfe_eval_int_result(ctfe_expect_int(start_value))
 			end_int ?= ctfe_eval_int_result(ctfe_expect_int(end_value))
 
-			Ok(ctfe_value(expr.value_type, CtfeRangeValue(start_value, end_value), expr.span))
+			Ok(ctfe_value(expr.value_type, CtfeRecordValue([
+				(RANGE_START_FIELD, start_value, resolved_field_identity(range_fields.start)),
+				(RANGE_END_FIELD, end_value, resolved_field_identity(range_fields.end)),
+			]), expr.span))
 		CtfeIrMatchExpr(scrutinee, cases):
 			ctfe_eval_match(context, env, scrutinee, cases)
 		CtfeIrWhileExpr(condition, body):
@@ -3001,8 +2999,8 @@ private pure func ctfe_eval_ir_in_context(
 					Ok(ctfe_eval_void_value(expr))
 				Err(error):
 					Err(error)
-		CtfeIrForExpr(name, iterable, body):
-			match ctfe_eval_for_env(context, env, name, iterable, body):
+		CtfeIrForExpr(name, iterable, body, range_fields):
+			match ctfe_eval_for_env(context, env, name, iterable, body, range_fields):
 				Ok(_):
 					Ok(ctfe_eval_void_value(expr))
 				Err(error):

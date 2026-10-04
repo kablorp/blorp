@@ -1,14 +1,22 @@
 # Record Simplification Roadmap
 
-Status: three bounded compiler migrations have passed review, but the
-language still gives
-`struct` and `fixed record` their old unmanaged inline layout. This plan
-changes direction: make ordinary `record` the canonical nominal product,
-migrate internal users in bounded cuts, and remove the distinct value-record
-pipeline once its ABI obligations have explicit homes. Regain inline placement
-later as an optimization of records, not as a prerequisite for a coherent
-source model. Do not change the Guide, Grammar, or memory-model description of
-*current* behavior before the corresponding implementation cut lands.
+Status: S4 semantic convergence and old value-record pipeline deletion are
+complete. The original checkpoint is `83a9c1082811`; the prepared squash based on
+main `4535746a6a21` passes 25,438 checks across 13 gates, the three-stage C
+fixpoint, the 228-fixture stage-2 codegen audit, full quality, and stage-2
+runtime/layout controls. This is correctness acceptance, not release or
+performance acceptance.
+`record`, `struct`, and `fixed record` follow ordinary managed-record semantics;
+native snapshot boundaries use explicit adapters. See the
+[repair checkpoint](../benchmarks/results/record_s4_repair_checkpoint_2026-10-03.md)
+and [remaining-gate results](../benchmarks/results/record_s4_remaining_gates_2026-10-03.md)
+for provenance, commands, ownership oracles, and bounded validation repairs.
+
+Regain inline placement later as an optimization of records, not as a
+prerequisite for a coherent source model. The verification checkout uses main's
+syntax-capable bootstrap and migrates 317 declarations to `fixed record`.
+The legacy `struct` keyword remains accepted and has an explicit parser fixture;
+keyword retirement is still a separate cut after S4 validation and integration.
 
 Read [WORKER_CHECKLIST](WORKER_CHECKLIST.md) before compiler work. The
 [Language Guide](GUIDE.md), [Grammar](GRAMMAR.md), and
@@ -45,9 +53,10 @@ does execute in the self-compile: its one converted nested product adds
 exactly one typed-frontend allocation, with identical frozen-input C and
 overlapping retired-instruction ranges.
 
-The old R1 `fixed record` syntax and unmanaged layout are implemented.
-Managed fixed fields remain rejected; the attempted owned-inline policy was
-not admitted. The old R2 ownership-authority and R3 all-fresh nested-child
+The earlier R1 pilot implemented `fixed record` syntax with unmanaged layout.
+That pilot rejected managed fixed fields; its attempted owned-inline policy was
+not admitted. S4 supersedes that restriction with ordinary managed-record
+semantics. The old R2 ownership-authority and R3 all-fresh nested-child
 pilots are no longer prerequisites to simplification. A bounded nested R3
 site fell far below the predeclared admission bar; no production candidate
 was selected. See [R0 evidence](../benchmarks/results/fixed_layout_r0_2026-10-03.md).
@@ -74,14 +83,12 @@ record Box[T] {value: T}
   typecheck/Core/backend representation. Generic records remain supported.
   Record fields may own managed children; copy, update, drop, and cancellation
   continue to obey the existing ARC/COW contracts.
-- During a coordinated transition, the old `struct` and `fixed record`
-  spellings may still parse. The intended semantic cut makes them behave like
-  records, with **no temporary promise of stack placement or no allocation**.
-  Since a permanent no-op `fixed` qualifier is misleading in a pre-0.1
-  language, decide whether to remove both old spellings after source and
-  bootstrap migration. Do not preserve them as indefinite compatibility
-  wrappers. Reintroducing an explicit layout promise later requires a proven
-  cross-boundary contract, not just a different keyword.
+- The semantic cut keeps `struct` and `fixed record` parsing as managed
+  records, with **no promise of stack placement or no allocation**. The next
+  source migration replaces `struct` with `fixed record`, after a verified
+  bootstrap that accepts that spelling is available. Ordinary `record`
+  remains supported. Removing the `struct` source form is a separate syntax
+  cut, not a new layout contract or a prerequisite for S4 acceptance.
 - A tuple remains a structural product with ordinal access. Existing
   local/match tuple scalar replacement and multi-value results must not turn
   into heap records for conceptual uniformity. Share helpers only where two
@@ -153,6 +160,15 @@ self-compile without changing emitted C. `GlobalHeaderCompletionMetrics`
 is unmeasured. This census does not establish that
 downstream foreign declarations cannot use other value records by value.
 
+The S2 caller audit on `d29b264e1` found no custom by-value foreign use of
+the remaining structs in production or standalone tools. Native snapshots
+and first-class `Range` are the production exceptions; direct aggregate
+foreign signatures also exist in fixtures. The other products use ordinary
+construction, selection, update, collections, or existing erased calls.
+They can converge through one coordinated semantic cut rather than 144
+independent keyword migrations. This finding does not establish zero cost:
+inline rows and frames will become managed records and must be measured.
+
 ### S2. Migrate internal declarations in small families
 
 First delete a transparent wrapper when its meaning is already carried by
@@ -183,22 +199,62 @@ sanitizer failure, inspected representation, and a retained measurement.
 Remove each converted declaration from the outstanding census. Do not mix
 hot and cold families in one commit.
 
+For the coordinated S4 cut, S2 owns caller and test readiness rather than
+requiring every declaration's spelling to change first. The user has admitted
+a measured temporary allocation regression in exchange for a single product
+model. Keep table APIs and direct-loop optimizations; do not make a table
+redesign a prerequisite. Replace inline-layout allocation expectations with
+measured, narrow record-construction budgets that still catch per-use table
+copies. Never drop the budgets or raise one shared ceiling until everything
+passes. Old spelling counts remain a migration inventory, not a measure of
+remaining semantic categories.
+
 ### S3. Isolate foreign and native by-value ABI
 
-`MemStats` and `SchedulerStats` mirror native C structs, and foreign
-signatures can take or return value records (including an `Option` payload)
-by value. A heap-record pointer is **not** ABI-equivalent to a C struct.
-Before the global semantic cut, choose an explicit boundary representation:
-for example, a narrow ABI-only C value type with generated copy-in/copy-out
-adapters, or verified native wrappers. The chosen representation must be
-declared at the foreign/runtime boundary; do not infer it from a name or
-silently change C signatures. Keep it out of general Blorp product
-ownership and lowering.
+`MemStats` and `SchedulerStats` mirror native C structs. A heap-record pointer
+is **not** ABI-equivalent to a C struct, so these two runtime boundaries need
+explicit adapters before the global semantic cut. A native snapshot is copied
+into an ordinary managed record; the native layout does not become a general
+Blorp product category.
 
-**Exit:** native and foreign fixtures prove parameter, result, nested and
-`Option` cases; generated C signatures and layout match the C declarations;
-sanitizer/leak tests pass. Every remaining by-value use has an adapter or an
-explicitly retained ABI category before source semantics change.
+The production audit found no other foreign aggregate-by-value callers. One
+codegen fixture passes a four-field value product to C; migrate it through a
+source-level wrapper passing four scalar fields. Preserve existing managed
+record-pointer foreign calls and their validation. Generalized aggregate
+annotations, copy-in/copy-out metadata, and a new ABI type system are **parked**:
+they are not prerequisites for changing a declaration spelling or deleting the
+value-record pipeline. Synthetic Core tests of the retired layout are updated
+to test the surviving managed pointer boundary, not used to justify a new
+language feature.
+
+**Exit:** native snapshot retention, field values and teardown pass runtime,
+leak and sanitizer checks; the independent scalar foreign fixture and existing
+record-pointer fixtures pass. Generated native signatures match their C
+declarations. No remaining caller depends on the old source spelling selecting
+a C aggregate ABI.
+
+Native snapshot adapters are keyed by the existing explicit `DeclaredAbi`
+identity. Their schema owns the native field order and types; typechecking
+validates the corresponding language record before emission. An adapter
+takes exactly one native snapshot, then constructs an ordinary managed
+record. It must have owned-result and allocating effects. Neither source
+spelling nor a rendered type name selects the native ABI.
+
+Managed `get_mem_stats()` snapshots honestly allocate. Do not suppress their
+allocation/release counters or subtract a hardcoded observer allowance.
+Exact single-fiber interval tests use a nonallocating scalar
+`read_memory_counter(MemoryCounter)` interface, leaving the measured owner's
+dataflow unchanged and constructing reports only after the endpoints.
+Counter-active flags remain mandatory: disabled instrumentation is not zero
+activity. Separate scalar reads do not promise a coherent concurrent
+snapshot; `get_mem_stats()` still does. Retire the old snapshot-based
+`assert_no_heap_activity` helper and migrate its two actual callers.
+
+Direct C aggregate support is a separate future task. Ordinary managed record
+pointers and C by-value aggregates cannot be distinguished from a record
+signature alone; use explicit scalar/`Ptr` wrappers at that boundary for this
+migration. Do not preserve a hidden distinction based on `struct` spelling,
+silently change a C signature, or infer an ABI from field shapes.
 
 ### S4. Converge semantic headers, Core, and emission
 
@@ -224,6 +280,31 @@ variants have no producers or consumers; compiler-new parity, formatter,
 runtime, leak, sanitizer, codegen audit, and stage-2/3 fixpoint pass.
 Inspect generated C differences at the representation cut instead of
 demanding byte identity across intentionally different layouts.
+
+Execution is split into three isolated workstreams: S2 caller/fixture and
+allocation-oracle migration; S3 native/foreign boundary adapters; S4
+parser/header/lowering convergence followed by exhaustive consumer deletion.
+The coordinator settles shared types and source contracts before integration,
+reviews each slice, and runs compiled gates serially. Parallel source work
+does not authorize overlapping benchmark or test binaries.
+
+First-class `range.Range` is an ordinary managed nominal record in all
+positions. Carry its authoritative start/end field identities through typed
+range expressions and CTFE, then lower construction through the normal record
+path. Preserve optimized `ForRangeExpr` loops over scalar bounds. The unrelated
+bounded-integer `SemanticRangeType`/Core `RangeType` remain scalar types; they
+are not the first-class range product. A local type named `Range` cannot
+redirect the standard syntax provider.
+
+Use the same frozen stage-1 generator and same-cwd stage-2 baseline when
+measuring this work. The retained starting measurement is
+`/tmp/blorp-record-through-s4.5K6t2p/baseline.json`, compiling frozen input
+`d29b264e1a74d73a1c0c02f437437947660c3ff3` at `-O2` with five instruction
+samples. Unlike source-only pilots, the global representation cut intentionally
+changes that input's emitted C: compare logical behavior and diagnostics,
+inspect the changed layouts, and require stage-2/3 fixpoint identity. Report
+allocation and instruction regressions with their mechanism; do not claim
+byte-identical C or speed from declaration counts.
 
 ### S5. Decide which layout optimizations are worth reintroducing
 
@@ -251,7 +332,38 @@ sanitizers; C-changing compiler cuts need `scripts/compiler-fixpoint`.
 Run compiled gates serially on macOS. Record full logs and raw benchmark
 JSON under `benchmarks/results/` or link a retained artifact from there.
 
-After S4, decide whether the remaining syntax is useful. Do not start
+### Retire `struct` after the bootstrap rotation
+
+The next spelling cut replaces Blorp `struct` declarations with `fixed record`;
+ordinary `record` remains supported. It does not introduce a layout promise or
+change the managed-record semantics established by S4.
+
+The original frozen integration branch pins `dev-0322140767b0`, which does not
+parse `fixed record`: its direct empty-fixture check fails before typechecking.
+Main `02c0786a6` now pins `dev-8228a8fa12e3`. A direct bootstrap check of
+`fixed_record_matches_struct_layout.brp` succeeds, and its Darwin digest
+matches the manifest. This establishes the syntax prerequisite, not the
+candidate's managed-record semantics or S4 acceptance.
+
+The verification checkout is based on that main revision and already migrates
+317 declarations using the newer pin. Finish the broad S4 landing gates before
+retiring the keyword; do not mistake declaration replacement for keyword removal.
+Publishing another S4 compiler release is not required just to parse the new
+spelling. Pin integration and any release remain separately authorized actions.
+
+Replace declaration tokens and embedded Blorp-source fixtures, then remove
+struct-specific lexer, parser, source-form, discovery, formatter, and JSON
+branches. Update paired formatter fixtures and diagnostic-span expectations
+using the formatter/parser as the oracle. Do not perform a repository-wide
+word substitution: native C `struct` syntax, generated-C assertions, and scalar
+Option/Result C storage remain valid. After keyword retirement, `struct` is an
+ordinary identifier, not a compatibility declaration form.
+
+Use focused parser/discovery/formatter suites first, then compiler-new parity
+and the S4 integration gates. This is a syntax-and-source migration, not another
+representation or performance project.
+
+Do not start
 `fixed union`, enum retirement, or shared tuple/union machinery merely
 because the record path simplified. A conditional union plan needs its own
 ABI and active-payload ownership gate; the old fixed-union proposal remains

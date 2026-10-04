@@ -1,6 +1,6 @@
 -- Classify record layouts before C emission.
 --
--- Foreign ABI exposure is transitive: changing an embedded value record also
+-- Foreign pointer ABI exposure is transitive: changing an embedded record also
 -- changes the containing foreign parameter or result. Keep that distinction
 -- explicit so storage optimizations cannot depend on naming conventions.
 import:
@@ -10,7 +10,7 @@ import:
 	../stage_09_core/c_type_layout: c_type_name
 	../stage_09_core/ir:
 		CoreCallKind(ForeignCall),
-		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl, ValueRecordDecl),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl, UnionDecl),
 		CoreEnumDecl,
 		CoreExpr(CallExpr),
 		CoreFieldRef,
@@ -20,11 +20,10 @@ import:
 		CoreProgram,
 		CoreType(
 			BoxedResultType, EnumType, FunctionType, HeapRecordType, NamedType, RangeType, SelfType,
-			StackResultType, TensorType, TupleType, TypeParameterType, UnionType, ValueRecordType,
+			StackResultType, TensorType, TupleType, TypeParameterType, UnionType,
 			VoidType,
 		),
 		CoreUnionDecl,
-		CoreValueRecordDecl,
 		core_expr_type,
 		core_field_ref_id,
 		core_field_ref_is_resolved,
@@ -39,23 +38,8 @@ enum CRecordLayout:
 	ForeignAbiLayout
 
 
-union CValueRecordFieldStorage:
-	OrdinaryCValueRecordField(String)
-	PackedBooleanCValueRecordField
 
 
-implements Equatable for CValueRecordFieldStorage:
-	pure func equals(left: CValueRecordFieldStorage, right: CValueRecordFieldStorage) -> Bool:
-		match (left, right):
-			(OrdinaryCValueRecordField(left_value), OrdinaryCValueRecordField(right_value)):
-				left_value == right_value
-			(PackedBooleanCValueRecordField, PackedBooleanCValueRecordField):
-				True
-			_:
-				False
-
-	pure func not_equals(left: CValueRecordFieldStorage, right: CValueRecordFieldStorage) -> Bool:
-		not equals(left, right)
 
 
 union CHeapRecordFieldStorage:
@@ -80,7 +64,7 @@ implements Equatable for CHeapRecordFieldStorage:
 MAX_BYTE_ENUM_TAG: Int = 255
 
 
-pure func c_value_record_field_type_is_boolean(typ: CoreType) -> Bool:
+pure func c_record_field_type_is_boolean(typ: CoreType) -> Bool:
 	match typ:
 		NamedType(name, args):
 			name == "Bool" and args.length() == 0
@@ -99,7 +83,7 @@ pure func c_heap_record_field_storage(
 ) -> CHeapRecordFieldStorage:
 	match layout:
 		InternalLayout:
-			if c_value_record_field_type_is_boolean(typ):
+			if c_record_field_type_is_boolean(typ):
 				if has_boolean_neighbor:
 					PackedBooleanCHeapRecordField
 				else:
@@ -117,27 +101,9 @@ pure func c_heap_record_field_storage(
 			OrdinaryCHeapRecordField(c_type_name(typ, type_symbol_lookup))
 
 
-pure func c_value_record_field_storage(
-	layout: CRecordLayout,
-	typ: CoreType,
-	has_boolean_neighbor: Bool,
-	type_symbol_lookup: Dict[String, String],
-) -> CValueRecordFieldStorage:
-	match layout:
-		InternalLayout:
-			if c_value_record_field_type_is_boolean(typ):
-				if has_boolean_neighbor:
-					PackedBooleanCValueRecordField
-				else:
-					OrdinaryCValueRecordField("_Bool")
-			else:
-				OrdinaryCValueRecordField(c_type_name(typ, type_symbol_lookup))
-		ForeignAbiLayout:
-			OrdinaryCValueRecordField(c_type_name(typ, type_symbol_lookup))
 
 
 record CRecordLayoutRegistry {
-	foreign_abi_value_record_names: Set[String],
 	foreign_abi_heap_record_names: Set[String],
 	byte_sized_enum_names: Set[String],
 	source_member_record_names: Set[String],
@@ -219,7 +185,6 @@ pure func c_declared_record_member(scope: CRecordMemberScope, name: String, ordi
 
 private record CRecordDeclIndex {
 	layout_types: CoreLayoutTypeIndex,
-	value_records: Dict[String, CoreValueRecordDecl],
 	heap_records: Dict[String, CoreHeapRecordDecl],
 	unions: Dict[String, CoreUnionDecl]
 }
@@ -228,15 +193,11 @@ private record CRecordDeclIndex {
 private pure func build_record_decl_index(
 	specialize_layout: CoreSpecializeLayout,
 ) -> CRecordDeclIndex:
-	var value_records: Dict[String, CoreValueRecordDecl] = {}
 	var heap_records: Dict[String, CoreHeapRecordDecl] = {}
 	var unions: Dict[String, CoreUnionDecl] = {}
 
 	for decl in specialize_layout.program.decls:
 		match decl:
-			ValueRecordDecl(record_decl):
-				if not value_records.contains(record_decl.name):
-					value_records = value_records.set(record_decl.name, record_decl)
 			HeapRecordDecl(record_decl):
 				if not heap_records.contains(record_decl.name):
 					heap_records = heap_records.set(record_decl.name, record_decl)
@@ -248,20 +209,11 @@ private pure func build_record_decl_index(
 
 	{
 		layout_types = specialize_layout.types,
-		value_records = value_records,
 		heap_records = heap_records,
 		unions = unions
 	}
 
 
-pure func c_record_layout(
-	foreign_abi_value_record_names: Set[String],
-	record_name: String,
-) -> CRecordLayout:
-	if Sets.contains(foreign_abi_value_record_names, record_name):
-		ForeignAbiLayout
-	else:
-		InternalLayout
 
 
 pure func c_heap_record_layout(
@@ -371,7 +323,7 @@ private pure func append_nested_types(pending: List[CoreType], typ: CoreType) ->
 			pending.append(info.element_type)
 		TupleType(items):
 			pending.concat(items)
-		VoidType | EnumType(_) | HeapRecordType(_) | RangeType | TypeParameterType(_) | SelfType | UnionType(_) | ValueRecordType(_):
+		VoidType | EnumType(_) | HeapRecordType(_) | RangeType | TypeParameterType(_) | SelfType | UnionType(_):
 			pending
 
 
@@ -430,7 +382,6 @@ pure func classify_c_record_layouts(
 ) -> Result[CRecordLayoutRegistry, CRecordLayoutError]:
 	program: CoreProgram = specialize_layout.program
 	decl_index: CRecordDeclIndex = build_record_decl_index(specialize_layout)
-	var foreign_names: Set[String] = Sets.set()
 	var foreign_heap_names: Set[String] = Sets.set()
 	var declared_abi_names: Set[String] = Sets.set()
 	var record_member_names: Dict[Int, String] = {}
@@ -445,30 +396,6 @@ pure func classify_c_record_layouts(
 			EnumDecl(enum_decl):
 				if enum_decl_uses_byte_tags(enum_decl):
 					byte_sized_enum_names = Sets.add(byte_sized_enum_names, enum_decl.name)
-			ValueRecordDecl(record_decl):
-				match record_decl.abi_type:
-					Some(DeclaredAbiMemStats) | Some(DeclaredAbiSchedulerStats):
-						foreign_names = Sets.add(foreign_names, record_decl.name)
-					_:
-						void
-
-				if record_decl.abi_type.is_some():
-					declared_abi_names = Sets.add(declared_abi_names, record_decl.name)
-
-				for entry in record_decl.fields.enumerate():
-					record_member_names = with_member_name(
-						record_member_names,
-						entry[1].ref,
-						entry[0],
-					)
-
-					if not core_field_ref_is_resolved(entry[1].ref):
-						unresolved_fields = unresolved_fields.append(
-							UnresolvedRecordFieldRef(
-								record_decl.name,
-								entry[1].name,
-							),
-						)
 			HeapRecordDecl(record_decl):
 				if record_decl.abi_type.is_some():
 					declared_abi_names = Sets.add(declared_abi_names, record_decl.name)
@@ -496,16 +423,6 @@ pure func classify_c_record_layouts(
 				resolved: CoreType = resolve_layout_type_with_index(decl_index.layout_types, typ)
 
 				match resolved:
-					ValueRecordType(record_name):
-						if not Sets.contains(foreign_names, record_name):
-							foreign_names = Sets.add(foreign_names, record_name)
-
-							match decl_index.value_records.get(record_name):
-								Some(record_decl):
-									for field in record_decl.fields:
-										pending = pending.append(field.typ)
-								None:
-									void
 					HeapRecordType(record_name):
 						if not Sets.contains(foreign_heap_names, record_name):
 							foreign_heap_names = Sets.add(foreign_heap_names, record_name)
@@ -534,10 +451,7 @@ pure func classify_c_record_layouts(
 
 		index += 1
 
-	source_member_names: Set[String] = Sets.combine(
-		Sets.combine(declared_abi_names, foreign_names),
-		foreign_heap_names,
-	)
+	source_member_names: Set[String] = Sets.combine(declared_abi_names, foreign_heap_names)
 	unresolved: Option[CRecordLayoutError] = first_unresolved_outside(
 		unresolved_fields,
 		source_member_names,
@@ -548,7 +462,6 @@ pure func classify_c_record_layouts(
 			Err(error)
 		None:
 			Ok({
-				foreign_abi_value_record_names = foreign_names,
 				foreign_abi_heap_record_names = foreign_heap_names,
 				byte_sized_enum_names = byte_sized_enum_names,
 				source_member_record_names = source_member_names,

@@ -280,9 +280,9 @@ variant_name = IDENT | "True" | "False" ;
 (* A variant declares at most 64 payload fields; the parser rejects more. *)
 
 record_decl = "record" IDENT [ type_params ] "{" field_list "}" ;
-fixed_record_decl = "fixed" "record" IDENT "{" field_list "}" ;
-struct_decl = "struct" IDENT "{" field_list "}" ;
-(* A fixed record cannot declare type or dimension parameters. *)
+fixed_record_decl = "fixed" "record" IDENT [ type_params ] "{" field_list "}" ;
+struct_decl = "struct" IDENT [ type_params ] "{" field_list "}" ;
+(* All three spellings have ordinary managed record semantics, including empty fields and parameters. *)
 
 field_list = [ field_decl { "," field_decl } [ "," ] ] ;
 field_decl = identifier ":" type_expr ;

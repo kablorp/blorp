@@ -9,7 +9,7 @@ import:
 		finalized_typecheck_program,
 	../../src/compiler/stage_04_modules/loaded_module:
 		ModuleLoadCandidate,
-		ModuleOrigin,
+		ModuleOrigin(StdlibModule, UserModule),
 		module_load_candidate,
 		module_load_candidate_resolved_identity,
 		resolved_module_identity_from_resolver,
@@ -58,6 +58,10 @@ import:
 		prepared_module_scope_module_table,
 	../../src/compiler/stage_06_typecheck/graph/type_identity: TypeId, type_id_from_definition_table
 	../../src/compiler/stage_06_typecheck/headers/callable_headers: callable_header_graph_build
+	../../src/compiler/stage_06_typecheck/headers/accepted_record_graph:
+		accepted_record_graph_build,
+		accepted_record_graph_table,
+		accepted_record_table_canonical_authority,
 	../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		declaration_skeleton_graph_build,
 		declaration_skeleton_graph_error_message,
@@ -88,16 +92,21 @@ import:
 		ImportableModule,
 		ImportableModuleGraph,
 		ImportableModuleIndex,
+		importable_module,
 		importable_module_graph,
 		importable_module_graph_all_index,
 		importable_module_path,
 		importable_module_prepared_scope,
+	../../src/compiler/stage_06_typecheck/modules/module_view:
+		module_view_with_accepted_record_authority,
 	../../src/compiler/stage_06_typecheck/state:
 		TypecheckState,
+		typecheck_state_definition_table,
 		typecheck_state_enter_prepared_module_scope,
 		typecheck_state_for_origin,
 		typecheck_state_module_origin,
 	../../src/compiler/stage_06_typecheck/type_system/meta_identity: BodyMetaSessionPurpose
+	../../src/compiler/stage_06_typecheck/type_system/accepted_record_authority: AcceptedRecordAuthority
 	../../src/lib/source: source_file
 	option: to_result
 
@@ -410,6 +419,60 @@ private pure func validated_type_header_fixture(
 		headers = headers,
 		importable_graph = importable_graph,
 	})
+
+
+-- Derive the Range provider and field identities from a real standard-module
+-- graph. Direct inference/Core tests must not invent graph-owned ids.
+pure func range_record_test_authority() -> Result[AcceptedRecordAuthority, String]:
+	program = parse_compiler_source(source_file(
+		"range.brp",
+		"range",
+		"record Range {start: Int, end: Int}",
+	))
+	fixture ?= validated_type_header_fixture(
+		typecheck_state_for_origin(StdlibModule),
+		program,
+		[],
+	)
+	records ?= accepted_record_graph_build(fixture.headers, fixture.bound)
+		.map_err(func(errors): errors.join("; "))
+	Ok(accepted_record_table_canonical_authority(accepted_record_graph_table(records)))
+
+
+-- Phase-local local facts have no graph identity domain yet. Adopt target scope
+-- and provider authority from one graph; reject an already scoped test state.
+pure func state_with_range_record_test_authority(
+	state: TypecheckState,
+) -> Result[TypecheckState, String]:
+	if typecheck_state_definition_table(state).is_some():
+		Err("range fixture requires an unscoped direct-inference state")
+	else:
+		provider = module_load_candidate(
+			resolved_module_identity_from_resolver("range", StdlibModule),
+			finalized_typecheck_program_fixture(
+				"range.brp", "range", "record Range {start: Int, end: Int}",
+			),
+		)
+		provider_graph ?= indexed_graph_build(provider, [])
+			.map_err(func(_): "range provider indexing failed")
+		provider_module = importable_module(indexed_graph_target_scope(provider_graph))
+		fixture ?= validated_type_header_fixture(
+			state,
+			parse_compiler_source(source_file("infer.brp", "infer", "")),
+			[provider_module],
+		)
+		records ?= accepted_record_graph_build(fixture.headers, fixture.bound)
+			.map_err(func(errors): errors.join("; "))
+		scoped_state = test_state_in_prepared_scope(
+			state,
+			bound_module_scope(bound_module_graph_target(fixture.bound)),
+		)
+		Ok({ scoped_state |
+			module_view = module_view_with_accepted_record_authority(
+				scoped_state.module_view,
+				accepted_record_table_canonical_authority(accepted_record_graph_table(records)),
+			)
+		})
 
 
 private func validated_typecheck_fixture(

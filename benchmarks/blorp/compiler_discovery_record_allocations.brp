@@ -1,0 +1,72 @@
+-- Measure the exact retained discovery-budget workloads. Construct every input
+-- before its measured reset; the owning parser helper checks logical success
+-- and active diagnostic gates before reading the nonallocating scalar counter.
+-- Print/report allocations only after those scalar endpoints have been read.
+-- Use `run --debug --memory-stats` to match the owning TestSuite compilation:
+-- test/plan retains debug invariant blocks, whose managed rows also allocate.
+import:
+	../../blorp/test/compiler_new/stage_01_discovery/tables/test_allocation_budget:
+		parse_allocations,
+		repeated_text,
+
+
+record DiscoveryAllocationFamily {
+	name: String,
+	prefix: String,
+	item: String
+}
+
+
+private pure func statement(name: String, item: String) -> DiscoveryAllocationFamily:
+	{name = name, prefix = "func f(a, b, c, x):\n", item = item}
+
+
+private pure func declaration(name: String, item: String) -> DiscoveryAllocationFamily:
+	{name = name, prefix = "", item = item}
+
+
+private pure func families() -> List[DiscoveryAllocationFamily]:
+	[
+		statement("expression_statements", "\tx = a + b * c\n"),
+		statement("blocks_and_calls", "\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n"),
+		statement("matches_and_patterns", "\tx = match a:\n\t\tSome(v) | Other(v): v\n\t\t(l, 1): l\n\t\t[h, ...t]: h\n\t\t_: b\n"),
+		statement("selects", "\tselect:\n\t\tv from a:\n\t\t\tv\n\t\tsealed b:\n\t\t\tx\n\t\t_ after 5:\n\t\t\tc\n"),
+		statement("concurrent_blocks", "\tconcurrent(timeout: 100, max_threads: 2):\n\t\tl = f(a)\n\t\tr = f(b)\n\tfor p in a concurrently(limit: 4):\n\t\tf(p)\n"),
+		statement("lambdas", "\ty = func(p, q: Int) -> Int: p + q\n\tz = pure func(p):\n\t\tw = p\n\t\tw\n"),
+		statement("interpolations", "\ty = \"a $" + "{a} b $" + "{b + c}\"\n"),
+		statement("record_literals_and_updates", "\ty = {k = a, m = b}\n\tz = {y | k = c, m = a}\n"),
+		statement("loops", "\tfor i in 0..a:\n\t\tf(i)\n\twhile a > b:\n\t\tbreak\n\tfor (k, v) in c:\n\t\tcontinue\n"),
+		statement("question_binds", "\tv ?= f(a)\n\tvar w = v\n\tw += 1\n"),
+		declaration("function_declarations", "---\nAdds.\n---\npure func g[T: Orderable](p: T, q: Int[#N]) -> List[T] where #N == 3:\n\tp\n\n\n"),
+		declaration("type_declarations", "record R {\n\tfirst: Int,\n\tsecond: Int\n}\n\n\nunion U:\n\tA(Int)\n\tB\n\n\nenum E:\n\tX\n\tY\n\n\ntype alias Al = Int\n\n\n"),
+		declaration("trait_and_impl_declarations", "trait Shape:\n\tpure func area(value: Self) -> Int\n\n\nimplements Shape for R:\n\tpure func area(r: R) -> Int:\n\t\t1\n\n\n"),
+		{name = "imports", prefix = "import:\n", item = "\tmath: sin, cos\n\tlist as L: List(Cons, Nil)\n"},
+		statement("collection_literals", "\ty = {1 => 2, 3 => 4}\n\tz = {a, b}\n\tw = (a, b, c)\n\tv = [a, b]\n\tu = ()\n\tt = (a)\n"),
+		statement("tuple_list_and_qualified_patterns", "\tx = match a:\n\t\t(l, r): l\n\t\tOption.Some(v): v\n\t\tOption.None: b\n\t\t[]: c\n\t\t[h, ...t]: h\n\t\tSome(Some(v)) | Other(v): v\n\t\t-1: a\n\t\t\"s\": b\n\t\t_: c\n"),
+		statement("with_scopes", "\twith r = f(a):\n\t\tr\n\twith t ?= f(b) on e => e:\n\t\tt\n"),
+		statement("conversions_and_builtins", "\tz = builtin(\"x\")\n\tq = into_opaque T(a)\n\tp = from_opaque T(b)\n\tr = builtin\n"),
+		statement("bindings_and_local_functions", "\t(p, q) = a\n\tn: Int = a\n\tfunc g(u):\n\t\tu\n\ta[b] = c\n"),
+		statement("postfix_chains_and_unary_operators", "\tx = a.b(c)[d]\n\ty = a\n\t\t.b()\n\t\t.c()\n\tz = not a\n\tw = -a\n\tdetach f(a)\n"),
+		declaration("written_types", "func g[V: Orderable + Equatable](p: Dict[String, List[Int]], f: pure (Int) -> Int, t: (Int, Int), m: Int[#N, #M], k: a.B[C], n: Int[#_...], v: V) -> void:\n\tp\n\n\n"),
+		declaration("foreign_blocks", "foreign(include: \"a.h\", link: \"-lm\"):\n\tpure func c_sin(x: Float) -> Float = \"sin\"\n\tfunc c_puts(s: String) -> Int\n\n\n"),
+		declaration("supertraits", "trait Base:\n\tpure func one(value: Self) -> Int\n\n\ntrait Wide: Base:\n\tpure func two(value: Self) -> Int\n\tfunc three(value: Self) -> Int:\n\t\t3\n\n\n"),
+	]
+
+
+func main(args: List[String]) -> Int:
+	selected = args.get_or(1, "all")
+	var measured: Int = 0
+	var failed: Bool = False
+	for family in families():
+		if selected == "all" or selected == family.name:
+			match parse_allocations(repeated_text(family.prefix, family.item)):
+				Some(allocations):
+					print(family.name + "\t" + allocations.to_string())
+					measured += 1
+				None:
+					print(family.name + "\tFAIL: logical discovery result or diagnostic gates")
+					failed = True
+	if failed or measured == 0:
+		1
+	else:
+		0

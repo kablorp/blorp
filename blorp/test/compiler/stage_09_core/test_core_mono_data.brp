@@ -8,10 +8,8 @@ import:
 		DeclaredAbiType(DeclaredAbiOption, DeclaredAbiResult),
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
-		CoreValueRecordOrigin(LegacyStructOrigin),
-		CoreInlineFieldOwnership(TrivialInlineField),
 		CoreCallKind(SelectedDirectCall, UnknownCall),
-		CoreDecl(FunctionDecl, HeapRecordDecl, ImplDecl, TypeAliasDecl, UnionDecl, ValueRecordDecl),
+		CoreDecl(FunctionDecl, HeapRecordDecl, ImplDecl, TypeAliasDecl, UnionDecl),
 		CoreExpr(CallExpr, FieldExpr, LiteralExpr, SeqExpr, VarExpr, VoidExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
@@ -22,7 +20,7 @@ import:
 		CoreLiteral(IntLiteral),
 		CoreParam,
 		CoreProgram,
-		CoreReleasePolicy(ArcReleaseOnlyPolicy, NoReleasePolicy),
+		CoreReleasePolicy(ArcReleaseOnlyPolicy, ArcReleasePolicy, NoReleasePolicy),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreType(FunctionType, NamedType, TypeParameterType, VoidType),
@@ -31,6 +29,7 @@ import:
 		CoreVar,
 		core_field_ref,
 		core_program_to_json,
+	../../../src/compiler/stage_09_core/type_policy: cleanup_release_policy_for_type
 	../../../src/compiler/stage_09_core/mono: mangle_generic_data_name
 	../../../src/compiler/stage_09_core/mono_data:
 		CoreMonoDataSpecialization,
@@ -94,24 +93,6 @@ pure func function_decl(
 		module = FIXTURE_NO_SOURCE_MODULE,
 		function_kind = UserFunction,
 		def_id = def_id,
-		loc = synthetic_core_source_loc(),
-	})
-
-
--- Synthetic generic value records test mono rewrites, not source-valid ownership or codegen.
-pure func value_record_template(name: String, field_type: CoreType) -> CoreDecl:
-	ValueRecordDecl({
-		abi_type = None,
-		origin = LegacyStructOrigin,
-		name = name,
-		type_params = ["T"],
-		fields = [
-			{
-				ref = core_field_ref(0),name = "value",
-				typ = field_type,
-				ownership = TrivialInlineField
-			},
-		],
 		loc = synthetic_core_source_loc(),
 	})
 
@@ -229,18 +210,17 @@ pure func programs_equal(left: CoreProgram, right: CoreProgram) -> Bool:
 	core_program_to_json(left).to_string() == core_program_to_json(right).to_string()
 
 
--- May contain String; this expected Core shape is only a mono equality oracle.
-pure func concrete_value_record(name: String, field_type: CoreType) -> CoreDecl:
-	ValueRecordDecl({
+-- Exact ordinary record ownership is part of the mono equality oracle.
+pure func concrete_record(name: String, field_type: CoreType, release_policy: CoreReleasePolicy) -> CoreDecl:
+	HeapRecordDecl({
 		abi_type = None,
-		origin = LegacyStructOrigin,
 		name = name,
 		type_params = [],
 		fields = [
 			{
 				ref = core_field_ref(0),name = "value",
 				typ = field_type,
-				ownership = TrivialInlineField
+				release_policy = release_policy
 			},
 		],
 		loc = synthetic_core_source_loc(),
@@ -360,10 +340,10 @@ func test_generic_data_names_are_structurally_injective() -> Bool:
 	left != right and nested != flat
 
 
-func test_materializes_value_record_and_rewrites_function_types() -> Bool:
+func test_materializes_record_and_rewrites_function_types() -> Bool:
 	box_int: CoreType = applied_type("Box", [named_type("Int")])
 	input: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
 		function_decl(
 			"read",
 			20,
@@ -382,7 +362,7 @@ func test_materializes_value_record_and_rewrites_function_types() -> Bool:
 	result: CoreMonoDataSpecialization = specialize_generic_data(input, 100)
 	concrete_type: CoreType = named_type("Box__mono_Int")
 	expected: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
 		function_decl(
 			"read",
 			20,
@@ -397,7 +377,7 @@ func test_materializes_value_record_and_rewrites_function_types() -> Bool:
 				synthetic_core_source_loc(),
 			),
 		),
-		concrete_value_record("Box__mono_Int", named_type("Int")),
+		concrete_record("Box__mono_Int", named_type("Int"), cleanup_release_policy_for_type(named_type("Int"))),
 	])
 
 	result.next_def_id == 100 and programs_equal(result.program, expected)
@@ -472,8 +452,8 @@ func test_does_not_materialize_global_abi_unions() -> Bool:
 func test_materializes_nested_data_once() -> Bool:
 	outer_string: CoreType = applied_type("Outer", [named_type("String")])
 	result: CoreMonoDataSpecialization = specialize_generic_data(program([
-			value_record_template("Inner", type_parameter("T")),
-			value_record_template(
+			heap_record_template("Inner", type_parameter("T")),
+			heap_record_template(
 				"Outer",
 				applied_type("Inner", [type_parameter("T")]),
 			),
@@ -482,15 +462,15 @@ func test_materializes_nested_data_once() -> Bool:
 		]), 100)
 	concrete_outer: CoreType = named_type("Outer__mono_String")
 	expected: CoreProgram = program([
-		value_record_template("Inner", type_parameter("T")),
-		value_record_template(
+		heap_record_template("Inner", type_parameter("T")),
+		heap_record_template(
 			"Outer",
 			applied_type("Inner", [type_parameter("T")]),
 		),
 		pass_function("first", 20, concrete_outer),
 		pass_function("second", 21, concrete_outer),
-		concrete_value_record("Inner__mono_String", named_type("String")),
-		concrete_value_record("Outer__mono_String", named_type("Inner__mono_String")),
+		concrete_record("Inner__mono_String", named_type("String"), cleanup_release_policy_for_type(named_type("String"))),
+		concrete_record("Outer__mono_String", named_type("Inner__mono_String"), ArcReleasePolicy),
 	])
 
 	result.next_def_id == 100 and programs_equal(result.program, expected)
@@ -537,16 +517,16 @@ func test_generic_alias_exposes_data_specialization() -> Bool:
 	box_t: CoreType = applied_type("Box", [type_parameter("T")])
 	alias_string: CoreType = applied_type("Alias", [named_type("String")])
 	result: CoreMonoDataSpecialization = specialize_generic_data(program([
-			value_record_template("Box", type_parameter("T")),
+			heap_record_template("Box", type_parameter("T")),
 			alias_decl("Alias", box_t),
 			pass_function("pass_alias", 20, alias_string),
 		]), 100)
 	concrete_box: CoreType = named_type("Box__mono_String")
 	expected: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
 		alias_decl("Alias", box_t),
 		pass_function("pass_alias", 20, concrete_box),
-		concrete_value_record("Box__mono_String", named_type("String")),
+		concrete_record("Box__mono_String", named_type("String"), cleanup_release_policy_for_type(named_type("String"))),
 	])
 
 	result.next_def_id == 100 and programs_equal(result.program, expected)
@@ -684,8 +664,8 @@ func test_duplicate_transparent_alias_specialization_uses_first_transparent() ->
 	box_t: CoreType = applied_type("Box", [type_parameter("T")])
 	other_t: CoreType = applied_type("Other", [type_parameter("T")])
 	result: CoreMonoDataSpecialization = specialize_generic_data(program([
-			value_record_template("Box", type_parameter("T")),
-			value_record_template("Other", type_parameter("T")),
+			heap_record_template("Box", type_parameter("T")),
+			heap_record_template("Other", type_parameter("T")),
 			opaque_alias_decl("Alias", named_type("OpaqueTarget")),
 			alias_decl("Alias", box_t),
 			alias_decl("Alias", other_t),
@@ -693,13 +673,13 @@ func test_duplicate_transparent_alias_specialization_uses_first_transparent() ->
 		]), 100)
 	concrete_box: CoreType = named_type("Box__mono_String")
 	expected: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
-		value_record_template("Other", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
+		heap_record_template("Other", type_parameter("T")),
 		opaque_alias_decl("Alias", named_type("OpaqueTarget")),
 		alias_decl("Alias", box_t),
 		alias_decl("Alias", other_t),
 		pass_function("pass_alias", 20, concrete_box),
-		concrete_value_record("Box__mono_String", named_type("String")),
+		concrete_record("Box__mono_String", named_type("String"), cleanup_release_policy_for_type(named_type("String"))),
 	])
 
 	result.next_def_id == 100 and programs_equal(result.program, expected)
@@ -708,17 +688,17 @@ func test_duplicate_transparent_alias_specialization_uses_first_transparent() ->
 func test_duplicate_template_name_materializes_first_declaration() -> Bool:
 	box_string: CoreType = applied_type("Box", [named_type("String")])
 	result: CoreMonoDataSpecialization = specialize_generic_data(program([
-			value_record_template("Box", type_parameter("T")),
 			heap_record_template("Box", type_parameter("T")),
+			heap_record_template("Box", named_type("Int")),
 			pass_function("pass_box", 20, box_string),
 		]), 100)
-	-- The first "Box" template owns the name, so the concrete declaration is a
-	-- value record, not the heap record declared after it.
+	-- The first "Box" template owns the name: applying String must preserve
+	-- its substituted String field, not the later declaration's fixed Int field.
 	expected: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
 		heap_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", named_type("Int")),
 		pass_function("pass_box", 20, named_type("Box__mono_String")),
-		concrete_value_record("Box__mono_String", named_type("String")),
+		concrete_record("Box__mono_String", named_type("String"), cleanup_release_policy_for_type(named_type("String"))),
 	])
 
 	result.next_def_id == 100 and programs_equal(result.program, expected)
@@ -728,16 +708,16 @@ func test_materializes_two_concrete_record_instances() -> Bool:
 	box_int: CoreType = applied_type("Box", [named_type("Int")])
 	box_string: CoreType = applied_type("Box", [named_type("String")])
 	result: CoreMonoDataSpecialization = specialize_generic_data(program([
-			value_record_template("Box", type_parameter("T")),
+			heap_record_template("Box", type_parameter("T")),
 			pass_function("pass_int", 20, box_int),
 			pass_function("pass_string", 21, box_string),
 		]), 100)
 	expected: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
 		pass_function("pass_int", 20, named_type("Box__mono_Int")),
 		pass_function("pass_string", 21, named_type("Box__mono_String")),
-		concrete_value_record("Box__mono_Int", named_type("Int")),
-		concrete_value_record("Box__mono_String", named_type("String")),
+		concrete_record("Box__mono_Int", named_type("Int"), cleanup_release_policy_for_type(named_type("Int"))),
+		concrete_record("Box__mono_String", named_type("String"), cleanup_release_policy_for_type(named_type("String"))),
 	])
 
 	result.next_def_id == 100 and programs_equal(result.program, expected)
@@ -757,7 +737,7 @@ func test_expression_result_type_roots_local_specialization() -> Bool:
 		),
 	)
 	result: CoreMonoDataSpecialization = specialize_generic_data(
-		program([value_record_template("Box", type_parameter("T")), main]),
+		program([heap_record_template("Box", type_parameter("T")), main]),
 		100,
 	)
 	concrete_type: CoreType = named_type("Box__mono_String")
@@ -773,9 +753,9 @@ func test_expression_result_type_roots_local_specialization() -> Bool:
 		),
 	)
 	expected: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
 		expected_main,
-		concrete_value_record("Box__mono_String", named_type("String")),
+		concrete_record("Box__mono_String", named_type("String"), cleanup_release_policy_for_type(named_type("String"))),
 	])
 
 	result.next_def_id == 100 and programs_equal(result.program, expected)
@@ -821,7 +801,7 @@ func test_unresolved_generic_scope_does_not_materialize_data() -> Bool:
 		VarExpr(named_var("box"), box_t, synthetic_core_source_loc()),
 	)
 	result: CoreMonoDataSpecialization = specialize_generic_data(
-		program([value_record_template("Box", type_parameter("T")), generic]),
+		program([heap_record_template("Box", type_parameter("T")), generic]),
 		100,
 	)
 
@@ -845,7 +825,7 @@ func test_unresolved_generic_impl_scope_does_not_materialize_data() -> Bool:
 		loc = synthetic_core_source_loc()
 	}
 	input: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
 		ImplDecl({
 			trait_name = "Identity",
 			for_type = box_t,
@@ -900,13 +880,13 @@ func test_specializes_function_before_materializing_return_data() -> Bool:
 		direct_call("wrap", Some(10), SelectedDirectCall(10), named_type("String"), box_string),
 	)
 	result: CoreMonoDataSpecialization = specialize_generic_functions_and_data(program([
-			value_record_template("Box", type_parameter("T")),
+			heap_record_template("Box", type_parameter("T")),
 			wrap,
 			main,
 		]), 100)
 	concrete_box: CoreType = named_type("Box__mono_String")
 	expected: CoreProgram = program([
-		value_record_template("Box", type_parameter("T")),
+		heap_record_template("Box", type_parameter("T")),
 		function_decl(
 			"wrap",
 			10,
@@ -941,7 +921,7 @@ func test_specializes_function_before_materializing_return_data() -> Bool:
 			10,
 			[("T", TypeSubstitution(named_type("String")))],
 		),
-		concrete_value_record("Box__mono_String", named_type("String")),
+		concrete_record("Box__mono_String", named_type("String"), cleanup_release_policy_for_type(named_type("String"))),
 	])
 
 	result.next_def_id == 101 and programs_equal(result.program, expected)
@@ -959,8 +939,8 @@ tests: TestSuite = {
 			test_generic_data_names_are_structurally_injective,
 		),
 		(
-			"materializes value record and rewrites function types",
-			test_materializes_value_record_and_rewrites_function_types,
+			"materializes record and rewrites function types",
+			test_materializes_record_and_rewrites_function_types,
 		),
 		(
 			"materializes heap record with concrete release policy",

@@ -4,16 +4,19 @@
 -- `{ b | nodes = b.nodes.with_parent(..) }`. When the builder is uniquely
 -- owned, the update takes the family out of it, hands it uniquely to the
 -- family's consuming clone, and writes the result back, so every list grows
--- in place and the allocations grow only with capacity doublings. A shape
--- that copies the family on each step allocates per row instead.
+-- in place. Each authored Row now allocates one managed product; the remaining
+-- allocations grow only with capacity doublings. Exact two-size pins and the
+-- residual growth check reject extra family/table copies on each step.
 -- Prints one `PASS <shape>` or `FAIL <shape> ...` line per shape.
 -- Run in its own process with --memory-stats
 -- (see test_alloc_oracle_blorp_level.sh).
 import:
-	memory: MemStats, get_mem_stats, mem_delta
+	memory:
+		MemoryCounter(ManagedAllocations, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
 
 
-struct Row {
+fixed record Row {
 	kind: Int,
 	first: Int
 }
@@ -237,17 +240,25 @@ func intern_two_calls_allocations(words: List[String]) -> Int:
 		definitions = []
 	}
 	var total: Int = 0
-	before: MemStats = get_mem_stats()
+	before_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	before = read_memory_counter(ManagedAllocations)
 
 	for word in words:
 		id: Int = b.names.id_for(word)
 		b = { b | names = b.names.interned(word) }
 		total += id
 
-	after: MemStats = get_mem_stats()
+	after = read_memory_counter(ManagedAllocations)
+	after_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
 
 	if b.names.name_count() * 2 == words.length() and total >= 0:
-		counted_allocations(before, after)
+		counted_allocations(before, after, before_active, after_active)
 	else:
 		-1
 
@@ -259,16 +270,24 @@ func intern_register_allocations(words: List[String]) -> Int:
 		definitions = []
 	}
 	var total: Int = 0
-	before: MemStats = get_mem_stats()
+	before_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	before = read_memory_counter(ManagedAllocations)
 
 	for word in words:
 		b = { b | names = b.names.intern_registering(word) }
 		total += b.names.last_interned()
 
-	after: MemStats = get_mem_stats()
+	after = read_memory_counter(ManagedAllocations)
+	after_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
 
 	if b.names.name_count() * 2 == words.length() and total >= 0:
-		counted_allocations(before, after)
+		counted_allocations(before, after, before_active, after_active)
 	else:
 		-1
 
@@ -292,15 +311,23 @@ func pair_record_allocations(rows: Int) -> Int:
 			cursor = 0
 		}
 	}
-	before: MemStats = get_mem_stats()
+	before_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	before = read_memory_counter(ManagedAllocations)
 
 	for i in 0..rows:
 		p = step_pair_record(p, i)
 
-	after: MemStats = get_mem_stats()
+	after = read_memory_counter(ManagedAllocations)
+	after_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
 
 	if p.state.cursor == rows and builder_is_complete(p.builder, "pair_record", rows):
-		counted_allocations(before, after)
+		counted_allocations(before, after, before_active, after_active)
 	else:
 		-1
 
@@ -332,12 +359,17 @@ pure func growth_allowance(rows: Int) -> Int:
 
 
 ---
-The managed allocations between two snapshots, or -1 when counting was off
+The managed allocations between scalar endpoints, or -1 when counting was off
 (without `--memory-stats` every count reads 0, which would pass vacuously).
 ---
-func counted_allocations(before: MemStats, after: MemStats) -> Int:
-	if before.memory_stats_active == 1 and after.memory_stats_active == 1:
-		mem_delta(before, after).total_allocations
+func counted_allocations(
+	before: Int,
+	after: Int,
+	before_active: Bool,
+	after_active: Bool,
+) -> Int:
+	if before_active and after_active:
+		after - before
 	else:
 		-1
 
@@ -406,15 +438,23 @@ pure func builder_is_complete(b: NestedBuilder, shape: String, rows: Int) -> Boo
 func builder_shape_allocations(shape: String, rows: Int) -> Int:
 	state: ReadOnlyState = {tokens = [0, 1, 2]}
 	var b: NestedBuilder = empty_builder()
-	before: MemStats = get_mem_stats()
+	before_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	before = read_memory_counter(ManagedAllocations)
 
 	for i in 0..rows:
 		b = builder_step(shape, b, state, i)
 
-	after: MemStats = get_mem_stats()
+	after = read_memory_counter(ManagedAllocations)
+	after_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
 
 	if builder_is_complete(b, shape, rows):
-		counted_allocations(before, after)
+		counted_allocations(before, after, before_active, after_active)
 	else:
 		-1
 
@@ -422,15 +462,23 @@ func builder_shape_allocations(shape: String, rows: Int) -> Int:
 -- The family updated in place directly in a loop, with no helper call.
 func loop_update_allocations(rows: Int) -> Int:
 	var b: NestedBuilder = empty_builder()
-	before: MemStats = get_mem_stats()
+	before_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	before = read_memory_counter(ManagedAllocations)
 
 	for i in 0..rows:
 		b = { b | nodes = b.nodes.with_parent(i, i) }
 
-	after: MemStats = get_mem_stats()
+	after = read_memory_counter(ManagedAllocations)
+	after_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
 
 	if builder_is_complete(b, "loop_update", rows):
-		counted_allocations(before, after)
+		counted_allocations(before, after, before_active, after_active)
 	else:
 		-1
 
@@ -440,15 +488,23 @@ func driver_allocations(rows: Int) -> Int:
 		builder = empty_builder(),
 		steps = 0
 	}
-	before: MemStats = get_mem_stats()
+	before_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	before = read_memory_counter(ManagedAllocations)
 
 	for i in 0..rows:
 		d = step_driver(d, i)
 
-	after: MemStats = get_mem_stats()
+	after = read_memory_counter(ManagedAllocations)
+	after_active = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
 
 	if d.steps == rows and builder_is_complete(d.builder, "driver", rows):
-		counted_allocations(before, after)
+		counted_allocations(before, after, before_active, after_active)
 	else:
 		-1
 
@@ -473,11 +529,59 @@ pure func within(allocations: Int, rows: Int) -> Bool:
 	allocations >= 0 and allocations <= growth_allowance(rows)
 
 
+-- Measured with unchanged owned workloads and scalar endpoints. Unknown shapes
+-- or sizes fail closed rather than inheriting a broad allocation ceiling.
+pure func pinned_row_allocations(shape: String, rows: Int) -> Int:
+	match shape:
+		"nested_family" | "read_sibling" | "read_only_state" | "loop_update" | "driver_three_levels" | "pair_record":
+			if rows == SMALL_ROW_COUNT:
+				1018
+			else if rows == LARGE_ROW_COUNT:
+				10026
+			else:
+				-1
+		"nested_family_chain" | "conditional":
+			if rows == SMALL_ROW_COUNT:
+				1027
+			else if rows == LARGE_ROW_COUNT:
+				10039
+			else:
+				-1
+		"method_chain_on_field":
+			if rows == SMALL_ROW_COUNT:
+				2020
+			else if rows == LARGE_ROW_COUNT:
+				20028
+			else:
+				-1
+		_:
+			-1
+
+
 func report(shape: String):
 	small: Int = shape_allocations(shape, SMALL_ROW_COUNT)
 	large: Int = shape_allocations(shape, LARGE_ROW_COUNT)
 
-	if within(small, SMALL_ROW_COUNT) and within(large, LARGE_ROW_COUNT):
+	rows_per_step: Int = if shape == "method_chain_on_field":
+		2
+	else:
+		1
+
+	valid: Bool = if shape == "intern_two_calls" or shape == "intern_register":
+		within(small, SMALL_ROW_COUNT) and within(large, LARGE_ROW_COUNT)
+	else:
+		(
+			small >= 0
+			and large >= 0
+			and small == pinned_row_allocations(shape, SMALL_ROW_COUNT)
+			and large == pinned_row_allocations(shape, LARGE_ROW_COUNT)
+			and large - small >= rows_per_step * (LARGE_ROW_COUNT - SMALL_ROW_COUNT)
+			and large - small - rows_per_step * (LARGE_ROW_COUNT - SMALL_ROW_COUNT) <= growth_allowance(
+				LARGE_ROW_COUNT,
+			)
+		)
+
+	if valid:
 		print("PASS ${shape}")
 	else:
 		print("FAIL ${shape}: ${small}/${large} allocations")

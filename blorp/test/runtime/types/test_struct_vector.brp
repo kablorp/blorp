@@ -1,19 +1,20 @@
--- Test inline struct storage in vectors.
--- Structs with all-primitive fields should be stored contiguously
--- in the vector data array, not heap-boxed per element.
+-- Managed record vector elements preserve values through sharing and updates.
 import:
-	memory: MemStats, get_mem_stats, reset_mem_stats
+	memory:
+		MemoryCounter(ManagedAllocations, ManagedReleases, LiveManagedObjects, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
+		reset_mem_stats,
 	tensor: get_or, set_index
 	test: TestSuite
 
 
-struct Point {
+fixed record Point {
 	x: Int,
 	y: Int
 }
 
 
-struct Particle {
+fixed record Particle {
 	x: Float,
 	y: Float,
 	vx: Float,
@@ -341,12 +342,12 @@ tests: TestSuite = {
 		("struct matrix literal read", test_struct_matrix_literal_read),
 		("filled struct matrix read", test_filled_struct_matrix_read),
 		("direct subscript read", test_direct_subscript_read),
-		("set_index no leak", test_set_index_no_leak),
+		("set_index releases displaced records and all final owners", test_set_index_releases_all_owners),
 	]
 }
 
 
--- Regression: direct subscript v[i] on inline-storage struct vector
+-- Regression: direct subscript v[i] on a managed record vector.
 func test_direct_subscript_read() -> Bool:
 	v: Point[#3] = vector(
 		{
@@ -366,9 +367,9 @@ func test_direct_subscript_read() -> Bool:
 	ok
 
 
--- Regression: set_index on inline struct vectors must not leak the boxed value
-func test_set_index_no_leak() -> Bool:
-	reset_mem_stats()
+-- One initial Point/vector and one Point/vector copy per update: 2002 objects.
+-- After all slots have been replaced, the vector retains exactly 100 Points.
+pure func updated_vector_retains_final_records() -> Bool:
 	var v: Point[#100] = vector(
 		{
 			x = 0,
@@ -395,10 +396,25 @@ func test_set_index_no_leak() -> Bool:
 
 		i += 1
 
-	stats: MemStats = get_mem_stats()
+	live_objects: Int = read_memory_counter(LiveManagedObjects)
+	var values_preserved: Bool = True
+	-- Keep v live after the scalar observation and check every updated slot.
+	for index in 0..length(v):
+		point: Point = v[index]
+		values_preserved = values_preserved and point.x == 900 + index and point.y == (900 + index) * 2
+	live_objects == 101 and values_preserved
 
-	-- With the leak fix: current_objects should be small (vector + a few temps)
-	-- Without fix: 1000+ leaked boxed structs
-	-- In test suite context, other objects may be alive from prior tests.
-	-- The key invariant: 1000 set_index calls should NOT leave 1000+ leaked boxes.
-	stats.current_objects < 50
+
+func test_set_index_releases_all_owners() -> Bool:
+	reset_mem_stats()
+	active_before: Bool = read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
+	values_preserved: Bool = updated_vector_retains_final_records()
+	-- The primitive result cannot carry vector/element ownership across this boundary.
+	(
+		active_before and values_preserved
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and read_memory_counter(ManagedAllocations) == 2002
+		and read_memory_counter(ManagedReleases) == 2002
+		and read_memory_counter(LiveManagedObjects) == 0
+	)

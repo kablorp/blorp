@@ -30,7 +30,6 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/type_header_graph:
 		AliasLayout(OpaqueAlias, TransparentAlias),
 		IntrinsicType(IntrinsicInt, IntrinsicOption, IntrinsicTaskResult),
-		RecordLayout(HeapRecord),
 		ResolvedTypeShape(
 			DeclaredTypeShape,
 			IntrinsicTypeShape,
@@ -40,8 +39,6 @@ import:
 		TypeContainmentFacts,
 		TypeHeader,
 		TypeHeaderError(
-			TypeHeaderInlineStorageCycle,
-			TypeHeaderInvalidStructField,
 			TypeHeaderRecursiveValueLayout,
 			TypeHeaderResolutionError,
 		),
@@ -130,7 +127,6 @@ import:
 		env_get_record,
 		env_get_type_decl,
 		env_get_type_kind,
-		env_is_value_record,
 		env_type_contains_resource_if_valid,
 		env_type_may_contain_function,
 		env_type_may_contain_one_shot_stream,
@@ -467,7 +463,7 @@ private pure func source() -> String:
 
 private pure func type_header_kind_name(header: TypeHeader) -> String:
 	match header.shape:
-		RecordTypeHeader(_, _):
+		RecordTypeHeader(_):
 			"record"
 		UnionTypeHeader(_, _):
 			"union"
@@ -479,7 +475,7 @@ private pure func type_header_kind_name(header: TypeHeader) -> String:
 
 private pure func recursive_node_shape_matches(node_id: TypeId, header: TypeHeader) -> Bool:
 	match header.shape:
-		RecordTypeHeader(HeapRecord, fields):
+		RecordTypeHeader(fields):
 			match (fields.get(0), fields.get(1)):
 				(Some(value), Some(next)):
 					match (value.typ, next.typ):
@@ -532,7 +528,7 @@ func test_type_header_graph_accepts_implicit_prelude_type_without_loaded_std() -
 					match type_header_graph_find(fixture.graph, type_id):
 						Some(header):
 							match header.shape:
-								RecordTypeHeader(_, [field]):
+								RecordTypeHeader([field]):
 									match field.typ:
 										PreludeTypeShape(PreludeList, [IntrinsicTypeShape(IntrinsicInt, [])]):
 											True
@@ -560,7 +556,7 @@ func test_type_header_graph_preserves_local_prelude_name_shadow() -> Bool:
 					match type_header_graph_find(fixture.graph, uses_id):
 						Some(header):
 							match header.shape:
-								RecordTypeHeader(_, [field]):
+								RecordTypeHeader([field]):
 									match field.typ:
 										DeclaredTypeShape(resolved_id, []):
 											type_ids_equal(resolved_id, list_id)
@@ -617,7 +613,7 @@ func test_type_header_graph_resolves_qualified_reference_to_exact_dependency_id(
 									match type_header_graph_find(graph, uses_remote.id):
 										Some(header):
 											match header.shape:
-												RecordTypeHeader(_, [field]):
+												RecordTypeHeader([field]):
 													match field.typ:
 														DeclaredTypeShape(resolved_id, []):
 															type_ids_equal(resolved_id, remote.id)
@@ -643,7 +639,7 @@ func test_type_header_graph_rejects_private_qualified_reference() -> Bool:
 					False
 
 
-func test_type_header_graph_rejects_managed_struct_fields() -> Bool:
+func test_type_header_graph_accepts_managed_struct_fields() -> Bool:
 	source: String =
 		|record Config {name: String}
 		|type alias Names = List[Int]
@@ -666,30 +662,13 @@ func test_type_header_graph_rejects_managed_struct_fields() -> Bool:
 		| pair: (Int, Int)
 		|}
 
-	match type_parameter_graph(source):
-		None:
-			False
-		Some((_, _, parameters)):
-			match type_header_graph_build(parameters):
-				Err([TypeHeaderInvalidStructField(_, "name"), TypeHeaderInvalidStructField(_, "items"), TypeHeaderInvalidStructField(_, "maybe"), TypeHeaderInvalidStructField(_, "config"), TypeHeaderInvalidStructField(_, "callback"), TypeHeaderInvalidStructField(_, "names"), TypeHeaderInvalidStructField(_, "more_names"), TypeHeaderInvalidStructField(_, "hidden_names"), TypeHeaderInvalidStructField(_, "generic_names"), TypeHeaderInvalidStructField(_, "payload"), TypeHeaderInvalidStructField(_, "pair")]):
-					True
-				_:
-					False
+	type_header_fixture(source).is_some()
 
 
-func test_invalid_struct_field_message_explains_ownership_rule() -> Bool:
-	match type_parameter_graph("struct Bad {name: String}"):
-		None:
-			False
-		Some((_, skeletons, parameters)):
-			match type_header_graph_build(parameters):
-				Err([error]):
-					type_header_error_message(
-						declaration_skeleton_graph_definition_table(skeletons),
-						error,
-					) == "Struct 'Bad' field 'name' has invalid storage: struct fields must be " + "scalar values, fieldless enums, or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples"
-				_:
-					False
+func test_record_spellings_accept_managed_fields_and_parameters() -> Bool:
+	type_header_fixture(
+		"record Ordinary[T] {value: T}\nstruct Legacy[T] {value: T}\nfixed record Fixed[T] {value: T}\nfixed record Empty {}\nstruct Nested {legacy: Legacy[String], fixed: Fixed[List[Int]], ordinary: Ordinary[Int]}",
+	).is_some()
 
 
 func test_type_header_graph_accepts_scalar_and_nested_struct_fields() -> Bool:
@@ -718,36 +697,20 @@ func test_type_header_graph_distinguishes_declared_builtin_storage() -> Bool:
 		"type Port = builtin\nstruct Endpoint {port: Port}",
 	).is_some()
 
-	managed_string_is_rejected = match type_parameter_graph_at(
+	managed_string_is_accepted = type_header_fixture_at(
 		"string",
 		"type String = builtin\nstruct ManagedField {value: String}",
-	):
-		Some((_, _, parameters)):
-			match type_header_graph_build(parameters):
-				Err([TypeHeaderInvalidStructField(_, "value")]):
-					True
-				_:
-					False
-		None:
-			False
+	).is_some()
 
-	same_named_non_abi_builtin_is_rejected = match type_parameter_graph(
+	same_named_non_abi_builtin_is_accepted = type_header_fixture(
 		"type Int = builtin\nstruct ImpostorField {value: Int}",
-	):
-		Some((_, _, parameters)):
-			match type_header_graph_build(parameters):
-				Err([TypeHeaderInvalidStructField(_, "value")]):
-					True
-				_:
-					False
-		None:
-			False
+	).is_some()
 
 	(
 		int_is_scalar
 		and port_is_scalar
-		and managed_string_is_rejected
-		and same_named_non_abi_builtin_is_rejected
+		and managed_string_is_accepted
+		and same_named_non_abi_builtin_is_accepted
 	)
 
 
@@ -1843,39 +1806,39 @@ func test_type_header_graph_scope_queries_require_compatible_graph() -> Bool:
 func test_type_header_graph_rejects_direct_value_layout_recursion() -> Bool:
 	type_header_errors_equal(
 		"struct Node {next: Node}",
-		["Infinitely sized value layout: Node -> Node"],
+		["Type 'Node' is directly recursive — this would require infinite memory"],
 	)
 
 
 func test_type_header_graph_rejects_mutual_value_layout_recursion() -> Bool:
 	type_header_errors_equal(
 		"struct Left {right: Right}\n\nstruct Right {left: Left}",
-		["Infinitely sized value layout: Left -> Right -> Left"],
+		[
+			"Type 'Left' has a recursive value layout — every construction path requires another product value",
+			"Type 'Right' has a recursive value layout — every construction path requires another product value",
+		],
 	)
 
 
 func test_type_header_graph_rejects_value_layout_recursion_through_alias() -> Bool:
 	type_header_errors_equal(
 		"type alias Next = Node\n\nstruct Node {next: Next}",
-		["Infinitely sized value layout: Node -> Node"],
+		["Type 'Node' is directly recursive — this would require infinite memory"],
 	)
 
 
-func test_type_header_graph_rejects_value_layout_recursion_through_stack_carriers() -> Bool:
-	option_errors = type_header_errors_equal(
+func test_type_header_graph_accepts_record_recursion_through_sum_carriers() -> Bool:
+	option_accepted = type_header_fixture(
 		"struct OptionalNode {next: Option[OptionalNode]}",
-		["Infinitely sized value layout: OptionalNode -> OptionalNode"],
-	)
-	result_errors = type_header_errors_equal(
+	).is_some()
+	result_accepted = type_header_fixture(
 		"struct FallibleNode {next: Result[FallibleNode, String]}",
-		["Infinitely sized value layout: FallibleNode -> FallibleNode"],
-	)
-	task_result_errors = type_header_errors_equal(
+	).is_some()
+	task_result_accepted = type_header_fixture(
 		"struct TaskNode {next: TaskResult[TaskNode]}",
-		["Infinitely sized value layout: TaskNode -> TaskNode"],
-	)
+	).is_some()
 
-	option_errors and result_errors and task_result_errors
+	option_accepted and result_accepted and task_result_accepted
 
 
 func test_type_header_graph_allows_recursion_through_heap_layouts() -> Bool:
@@ -1936,7 +1899,6 @@ func test_local_record_header_installation_preserves_shape_and_layout() -> Bool:
 						state.errors.length() == 0
 						and parameters == ["T"]
 						and installed_recursive_node_matches(node_fields)
-						and env_is_value_record(state.env, "Point")
 						and point_fields.length() == 2
 						and types_equal(
 							names_field.field_type,
@@ -2492,10 +2454,10 @@ tests: TestSuite = {
 			"rejects private qualified reference",
 			test_type_header_graph_rejects_private_qualified_reference,
 		),
-		("rejects managed struct fields", test_type_header_graph_rejects_managed_struct_fields),
+		("accepts managed struct fields", test_type_header_graph_accepts_managed_struct_fields),
 		(
-			"invalid struct field message explains ownership rule",
-			test_invalid_struct_field_message_explains_ownership_rule,
+			"record spellings accept managed fields and parameters",
+			test_record_spellings_accept_managed_fields_and_parameters,
 		),
 		(
 			"accepts scalar and nested struct fields",
@@ -2600,8 +2562,8 @@ tests: TestSuite = {
 			test_type_header_graph_rejects_value_layout_recursion_through_alias,
 		),
 		(
-			"rejects value layout recursion through stack carriers",
-			test_type_header_graph_rejects_value_layout_recursion_through_stack_carriers,
+			"accepts record recursion through sum carriers",
+			test_type_header_graph_accepts_record_recursion_through_sum_carriers,
 		),
 		(
 			"allows recursion through heap layouts",

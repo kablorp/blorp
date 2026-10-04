@@ -1,9 +1,8 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
-		CoreValueRecordOrigin(LegacyStructOrigin),
 		CoreBoxKind(FloatBox, PointerBox, PrimBox, StructBox),
 		CoreCallKind(BuiltinCall, IntrinsicCall),
-		CoreDecl(EnumDecl, HeapRecordDecl, TypeAliasDecl, ValueRecordDecl),
+		CoreDecl(EnumDecl, HeapRecordDecl, TypeAliasDecl),
 		CoreExpr(
 			BoxExpr,
 			CallExpr,
@@ -26,10 +25,10 @@ import:
 			FunctionType,
 			HeapRecordType,
 			NamedType,
+			RangeType,
 			StackResultType,
 			TensorType,
 			TupleType,
-			ValueRecordType,
 			VoidType,
 		),
 		CoreUnboxKind(PointerUnbox, StructUnbox),
@@ -145,9 +144,8 @@ private pure func collection_program() -> CoreProgram:
 				],
 				loc = synthetic_core_source_loc(),
 			}),
-			ValueRecordDecl({
+			HeapRecordDecl({
 				abi_type = None,
-				origin = LegacyStructOrigin,
 				name = "Pair",
 				type_params = [],
 				fields = [],
@@ -275,11 +273,11 @@ private pure func unfold_has_trailing_layouts(expr: CoreExpr, element: Int, stat
 			False
 
 
-private pure func fold_has_box_and_release(expr: CoreExpr) -> Bool:
+private pure func fold_has_pointer_and_release(expr: CoreExpr) -> Bool:
 	match expr:
-		UnboxExpr(StructUnbox("Pair"), CallExpr(BuiltinCall("blorp_fold_parallel_with"), _, args, NamedType("Ptr", []), _), ValueRecordType("Pair"), _):
+		CastExpr(CallExpr(BuiltinCall("blorp_fold_parallel_with"), _, args, NamedType("Ptr", []), _), HeapRecordType("Pair"), _):
 			match args:
-				[_, BoxExpr(_, NamedType("Ptr", []), _), _, _, release_flag]:
+				[_, VarExpr(_, HeapRecordType("Pair"), _), _, _, release_flag]:
 					is_int_literal(release_flag, 1)
 				_:
 					False
@@ -440,7 +438,7 @@ pure func test_erased_stack_result_metadata_is_canonicalized() -> Bool:
 
 
 pure func test_box_and_unbox_metadata_is_canonicalized() -> Bool:
-	pair_type: CoreType = ValueRecordType("Pair")
+	pair_type: CoreType = HeapRecordType("Pair")
 	value: CoreExpr = variable("pair", pair_type)
 	stale_box: CoreExpr = BoxExpr(
 		{
@@ -459,12 +457,8 @@ pure func test_box_and_unbox_metadata_is_canonicalized() -> Bool:
 	)
 
 	match (specialized(stale_box), specialized(stale_unbox)):
-		(BoxExpr(box, _, _), UnboxExpr(StructUnbox(unbox_type), _, _, _)):
-			match box.kind:
-				StructBox(box_type):
-					box_type == "Pair" and unbox_type == "Pair"
-				_:
-					False
+		(CastExpr(VarExpr(_, HeapRecordType("Pair"), _), NamedType("Ptr", []), _), UnboxExpr(PointerUnbox, _, HeapRecordType("Pair"), _)):
+			True
 		_:
 			False
 
@@ -597,11 +591,8 @@ private pure func erased_key_marker(source: CoreExpr) -> CoreExpr:
 	)
 
 
-pure func test_erased_key_marker_releases_fresh_struct_box() -> Bool:
-	is_intrinsic_named(
-		specialized(erased_key_marker(variable("key", ValueRecordType("Pair")))),
-		"release_hash_key_box",
-	)
+pure func test_erased_key_marker_does_not_release_managed_record() -> Bool:
+	is_void(specialized(erased_key_marker(variable("key", HeapRecordType("Pair")))))
 
 
 pure func test_erased_key_marker_releases_stack_option_box() -> Bool:
@@ -911,26 +902,42 @@ pure func test_parallel_filter_map_dispatch_and_fallback() -> Bool:
 			list_type(named_type("String")),
 		),
 	)
+	boxed_nested_option: CoreExpr = specialized(
+		call(
+			"blorp_filter_map_parallel",
+			[variable("items", list_int), variable(
+					"map",
+					function_type([named_type("Int")], option_type(option_type(named_type("Int")))),
+				)],
+			list_type(option_type(named_type("Int"))),
+		),
+	)
 	fallback: CoreExpr = specialized(
 		call(
 			"blorp_filter_map_parallel",
 			[variable("items", list_int), variable(
 					"map",
-					function_type([named_type("Int")], option_type(ValueRecordType("Pair"))),
+					function_type([named_type("Int")], option_type(RangeType)),
 				)],
-			list_type(ValueRecordType("Pair")),
+			list_type(RangeType),
 		),
 	)
+	boxed_shape: Bool = match boxed_nested_option:
+		CallExpr(BuiltinCall("blorp_filter_map_parallel"), _, [VarExpr(_, NamedType("List", [NamedType("Int", [])]), _), VarExpr(_, FunctionType(True, [NamedType("Int", [])], NamedType("Option", [NamedType("Option", [NamedType("Int", [])])])), _), LiteralExpr(IntLiteral(1), NamedType("Int", []), _)], NamedType("List", [NamedType("Option", [NamedType("Int", [])])]), _):
+			True
+		_:
+			False
 
 	(
 		call_name(direct) == Some("blorp_filter_map_parallel_nullable")
 		and call_last_int_is(direct, 1)
+		and boxed_shape
 		and parallel_filter_map_fallback_shape(fallback)
 	)
 
 
 pure func test_collection_map_release_metadata() -> Bool:
-	pair: CoreType = ValueRecordType("Pair")
+	pair: CoreType = HeapRecordType("Pair")
 	list_map: CoreExpr = specialized(
 		call(
 			"blorp_map_parallel",
@@ -1003,17 +1010,17 @@ pure func test_fold_release_metadata_and_raw_result() -> Bool:
 			"blorp_fold_parallel_with",
 			[
 				variable("items", list_type(named_type("Int"))),
-				variable("init", ValueRecordType("Pair")),
+				variable("init", HeapRecordType("Pair")),
 				variable(
 					"fold",
 					function_type(
-						[ValueRecordType("Pair"), named_type("Int")],
-						ValueRecordType("Pair"),
+						[HeapRecordType("Pair"), named_type("Int")],
+						HeapRecordType("Pair"),
 					),
 				),
 				int_literal(2),
 			],
-			ValueRecordType("Pair"),
+			HeapRecordType("Pair"),
 		),
 	)
 	fallible: CoreExpr = specialized(
@@ -1046,7 +1053,7 @@ pure func test_fold_release_metadata_and_raw_result() -> Bool:
 		),
 	)
 
-	fold_has_box_and_release(fold) and call_last_int_is(fallible, 0)
+	fold_has_pointer_and_release(fold) and call_last_int_is(fallible, 0)
 
 
 tests: TestSuite = {
@@ -1054,8 +1061,8 @@ tests: TestSuite = {
 	tests = [
 		("list allocation uses concrete layout", test_list_alloc_uses_concrete_layout),
 		(
-			"erased key marker releases fresh struct box",
-			test_erased_key_marker_releases_fresh_struct_box,
+			"erased key marker preserves managed record ownership",
+			test_erased_key_marker_does_not_release_managed_record,
 		),
 		(
 			"erased key marker releases stack option box",

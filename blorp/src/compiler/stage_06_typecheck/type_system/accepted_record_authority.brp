@@ -5,7 +5,9 @@
 -- names; field spellings local to the viewing module are materialized only
 -- when queried.
 import:
-	../../stage_04_modules/module_table: ModuleId, module_ids_equal, module_table_canonical_path
+	../../stage_04_modules/module_table:
+		ModuleId, module_ids_equal, module_table_canonical_path, module_table_resolved_identity
+	../../stage_04_modules/loaded_module: ModuleOrigin(StdlibModule), resolved_module_origin
 	../graph/definition_index:
 		DefinitionTable,
 		FieldId,
@@ -23,8 +25,11 @@ import:
 		type_id_name,
 		type_ids_equal,
 	env: FieldDecl
+	../graph/range_record: ResolvedRangeFields, RANGE_START_FIELD, RANGE_END_FIELD
+	language_surface_manifest:
+		PreludeType(PreludeRange), prelude_type_name, prelude_type_module_path
 	memory: same_object
-	semantic_type: SemanticType, canonical_module_type_name, localize_module_types
+	semantic_type: SemanticType, TYPE_INT, canonical_module_type_name, localize_module_types
 
 
 record AcceptedFieldRow {
@@ -38,7 +43,6 @@ record AcceptedFieldRow {
 record AcceptedRecordEntry {
 	type_params: List[String],
 	fields: List[AcceptedFieldRow],
-	is_value: Bool,
 	contains_resource: Bool,
 	may_contain_function: Bool,
 	may_contain_one_shot_stream: Bool,
@@ -100,6 +104,7 @@ opaque type AcceptedRecordModuleView = AcceptedRecordModuleViewRep
 
 private record AcceptedRecordAuthorityRep {
 	table: AcceptedRecordTable,
+	range_fields: Option[ResolvedRangeFields],
 	owner_module_path: Option[String],
 	visible_records_by_source_name: Dict[String, Int],
 	visible_names_by_field_key: Dict[String, List[String]]
@@ -451,6 +456,7 @@ pure func accepted_record_authority(
 
 	into_opaque AcceptedRecordAuthority({
 			table = table,
+			range_fields = accepted_record_table_range_fields(table),
 			owner_module_path = view_representation.owner_module_path,
 			visible_records_by_source_name = view_representation.visible_records_by_source_name,
 			visible_names_by_field_key = view_representation.visible_names_by_field_key
@@ -577,6 +583,68 @@ pure func accepted_record_find_field_id(
 	Some(field.id)
 
 
+private pure func accepted_record_table_range_fields(
+	accepted_table: AcceptedRecordTable,
+) -> Option[ResolvedRangeFields]:
+	table = table_rep(accepted_table)
+	provider = prelude_type_module_path(PreludeRange)
+	name = prelude_type_name(PreludeRange)
+	canonical = canonical_module_type_name(provider, name)
+	index ?= table.canonical_record_indices_by_name.get(canonical)
+	id ?= table.record_ids.get(index)
+	row ?= definition_table_type_row(table.definition_table, type_id_definition_id(id))
+	owner ?= module_table_canonical_path(
+		definition_table_module_table(table.definition_table),
+		row.module_id,
+	)
+	identity ?= module_table_resolved_identity(
+		definition_table_module_table(table.definition_table),
+		row.module_id,
+	)
+	if owner != provider or row.name != name or resolved_module_origin(identity) != StdlibModule:
+		None
+	else:
+		payload ?= table.records.get(index)
+		start_index ?= accepted_record_field_index(table.definition_table, payload.fields, RANGE_START_FIELD)
+		end_index ?= accepted_record_field_index(table.definition_table, payload.fields, RANGE_END_FIELD)
+		start ?= payload.fields.get(start_index)
+		end ?= payload.fields.get(end_index)
+		if (
+			payload.type_params.is_empty()
+			and payload.fields.length() == 2
+			and type_ids_equal(start.parent, id)
+			and type_ids_equal(end.parent, id)
+			and start.field_type == TYPE_INT
+			and end.field_type == TYPE_INT
+		):
+			Some({ record_id = id, start = start.id, end = end.id })
+		else:
+			None
+
+
+pure func accepted_record_range_fields(
+	authority: AcceptedRecordAuthority,
+) -> Option[ResolvedRangeFields]:
+	authority_rep(authority).range_fields
+
+
+pure func accepted_record_authority_definition_table(authority: AcceptedRecordAuthority) -> DefinitionTable:
+	table_rep(authority_rep(authority).table).definition_table
+
+
+pure func accepted_record_is_standard_range(authority: AcceptedRecordAuthority, name: String) -> Bool:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+	match (
+		accepted_record_index(representation, table, name).and_then(func(index): table.record_ids.get(index)),
+		representation.range_fields,
+	):
+		(Some(record_id), Some(range_fields)):
+			type_ids_equal(record_id, range_fields.record_id)
+		_:
+			False
+
+
 pure func accepted_record_field_name(
 	authority: AcceptedRecordAuthority,
 	id: FieldId,
@@ -645,13 +713,6 @@ pure func accepted_record_contains(authority: AcceptedRecordAuthority, name: Str
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
 	accepted_record_index(representation, table, name).is_some()
-
-
-pure func accepted_record_is_value(
-	authority: AcceptedRecordAuthority,
-	name: String,
-) -> Option[Bool]:
-	accepted_record_entry_raw(authority, name).map(func(entry): entry.is_value)
 
 
 pure func accepted_record_contains_resource(

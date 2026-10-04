@@ -177,7 +177,8 @@ pure func birthday(user: User) -> User:
 	{ user | age = user.age + 1 }
 ```
 
-Use `struct` for small stack values with primitive fields.
+`struct` and `fixed record` are alternative spellings of `record`, with the
+same managed ownership and value semantics. Prefer `record` for new declarations.
 
 ```blorp
 struct Vec2 {x: Float, y: Float}
@@ -540,15 +541,10 @@ if the cited code has since moved.
   `c_primitive_binary_expr`; `has_native_structural_equality` in
   `trait_resolve.brp` routes every union there). Two separately constructed
   `Circle(1.0)` values are `!=` unless you implement `Equatable` yourself.
-- **A `struct` is boxed when it lives in a union payload or an `Option`**,
-  but stored inline (not boxed) inside a `List`. See the comment at
-  `blorp/src/lib/source.brp:37-41` on why `SourceLocation` is an `Int` rather
-  than a struct, and `boxed_storage_kind` in
-  `stage_09_core/specialize_layout.brp`.
-- **`List[struct]` stores structs inline; reading one element copies the
-  whole struct** (`InlineStructListStorage` in `stage_09_core/ir.brp`). Read
-  the field you need through the list rather than binding the whole element
-  on a hot path.
+- **All record spellings are managed**, including inside `Option`, unions,
+  lists, and closures. Choosing `struct` or `fixed record` does not promise
+  inline storage or remove allocation. Measure concrete hot workloads before
+  choosing a representation optimization.
 - **`from_opaque` is transparent to ownership analysis, like a cast** — it
   does not introduce a retain by itself (`perceus.brp`'s
   `direct_aliases_name` passes `CastExpr`/`from_opaque` through to its inner

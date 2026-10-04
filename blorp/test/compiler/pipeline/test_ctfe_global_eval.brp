@@ -1,4 +1,8 @@
 import:
+	../../../src/compiler/stage_06_typecheck/bridge:
+		TypecheckGraphRequest, TypecheckImportModule, typecheck_graph_with_metrics,
+		typechecked_module_program_with_ctfe_replacements
+	../../../src/compiler/stage_06_typecheck/graph/type_identity: type_id_module_id
 	../../../src/compiler/stage_02_lex/name_table: name_id_pending_dynamic_intern, synthesized_name_id
 	../../../src/compiler/stage_03_parse/parsed_ast:
 		ParsedBinaryOp(ParsedAddOp),
@@ -12,11 +16,12 @@ import:
 		ParsedVariantDecl,
 		parsed_identifier,
 	../../../src/compiler/stage_04_modules/loaded_module:
-		ModuleOrigin(UserModule),
+		ModuleOrigin(StdlibModule, UserModule),
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_table:
 		ModuleId,
 		ModuleTable,
+		module_ids_equal,
 		module_table,
 		module_table_find_id_by_canonical_path,
 		singleton_module_table,
@@ -46,6 +51,7 @@ import:
 			TypedIntLiteralExpr,
 			TypedMatchExpr,
 			TypedNameExpr,
+			TypedRecordExpr,
 		),
 		TypedExprInfo,
 		TypedMatchCase,
@@ -151,6 +157,7 @@ private pure func ctfe_test_context_from_program(
 	imported_program_set = ctfe_imported_program_set(
 		base_context.definition_table,
 		imported_programs,
+		None,
 	)
 	ctfe_context_from_program(
 		base_context.definition_table,
@@ -165,7 +172,7 @@ private pure func ctfe_test_imported_program_set(
 	context: CtfeContext,
 	programs: List[CtfeImportedProgram],
 ) -> CtfeImportedProgramSet:
-	ctfe_imported_program_set(context.definition_table, programs)
+	ctfe_imported_program_set(context.definition_table, programs, None)
 
 
 private pure func ctfe_test_module_global_value(
@@ -1145,7 +1152,7 @@ private pure func evaluate_program_globals_builds_context_and_rewrites_target(
 		fixture.definitions,
 		fixture.target,
 		program,
-		ctfe_imported_program_set(fixture.definitions, imported_programs),
+		ctfe_imported_program_set(fixture.definitions, imported_programs, None),
 		[selective_import_binding(base_context, "OFFSET", "dep", "OFFSET")],
 	)
 
@@ -1213,7 +1220,7 @@ func test_dependency_global_graph_evaluates_shared_module_once() -> Bool:
 	match ctfe_evaluate_dependency_global_graph(
 		base_context.definition_table,
 		base_context.target_module_id,
-		ctfe_imported_program_set(base_context.definition_table, [dependency]),
+		ctfe_imported_program_set(base_context.definition_table, [dependency], None),
 	):
 		Err(_):
 			False
@@ -1223,14 +1230,14 @@ func test_dependency_global_graph_evaluates_shared_module_once() -> Bool:
 				graph,
 				base_context.target_module_id,
 				first_target,
-				ctfe_imported_program_set(base_context.definition_table, [dependency]),
+				ctfe_imported_program_set(base_context.definition_table, [dependency], None),
 				bindings,
 			)
 			second = ctfe_rewrite_program_globals_with_evaluated_dependencies(
 				graph,
 				base_context.target_module_id,
 				second_target,
-				ctfe_imported_program_set(base_context.definition_table, [dependency]),
+				ctfe_imported_program_set(base_context.definition_table, [dependency], None),
 				bindings,
 			)
 
@@ -1246,6 +1253,90 @@ func test_dependency_global_graph_evaluates_shared_module_once() -> Bool:
 					)
 				_:
 					False
+
+
+private pure func range_graph_test_module(name: String, text: String) -> TypecheckImportModule:
+	{
+		path = name + ".brp", module_name = name, module_path = name, text = text,
+		typecheck_program = None, module_surface = None, origin = UserModule
+	}
+
+
+private pure func range_graph_test_request(target_text: String) -> TypecheckGraphRequest:
+	provider = { range_graph_test_module("range", (
+			"record Range {start: Int, end: Int}\n\n"
+			+ "pure func sum_interval(interval: Range) -> Int:\n"
+			+ "\tvar total = 0\n\tfor item in interval:\n\t\ttotal = total + item\n\ttotal"
+		)) | origin = StdlibModule }
+	dependency = range_graph_test_module("dependency", (
+		"import:\n\trange: Range, sum_interval\n\n"
+		+ "INTERVAL: Range = 0..5\n"
+		+ "LITERAL: Range = {start = 1, end = 4}\n"
+		+ "UPDATED: Range = {LITERAL | end = 5}\n"
+		+ "ANSWER: Int = sum_interval(INTERVAL)\n\n"
+		+ "pure func read_interval() -> Int:\n\tsum_interval(INTERVAL)\n\n"
+		+ "pure func read_literal() -> Int:\n\tsum_interval(LITERAL)\n\n"
+		+ "pure func read_updated() -> Int:\n\tsum_interval(UPDATED)"
+	))
+	{
+		target = range_graph_test_module("target", target_text),
+		modules = [provider, dependency], module_targets = ["dependency"],
+		resolved_imports = [], include_comments = False, allow_debug_only_calls = False
+	}
+
+
+func test_selected_ctfe_artifact_preserves_range_authority_under_shadow() -> Bool:
+	-- Selecting the dependency exercises the production retained-CTFE artifact
+	-- path. All provider/function/field identities come from this one graph.
+	run = typecheck_graph_with_metrics(range_graph_test_request(
+		"import:\n\tdependency: read_interval, read_literal, read_updated\n\n"
+		+ "record Range {start: Int, end: Int}\n"
+		+ "LOCAL: Range = {start = 99, end = 100}\n"
+		+ "FIRST: Int = read_interval()\nSECOND: Int = read_literal()\nTHIRD: Int = read_updated()"
+	))
+	graph = run.graph
+	target_program = typechecked_module_program_with_ctfe_replacements(graph.target)
+	local_record = target_program.decls.any(func(decl):
+		match decl:
+			TypedGlobalVarDecl(info):
+				if info.decl.name.text == "LOCAL":
+					match info.value:
+						TypedRecordExpr(_, _, _): True
+						_: False
+				else:
+					False
+			_: False
+	)
+	provider_identity = match (
+		graph.range_fields,
+		module_table_find_id_by_canonical_path(graph.module_table, "range"),
+	):
+		(Some(fields), Some(provider_id)):
+			type_id_module_id(graph.definition_table, fields.record_id)
+				.map(func(owner): module_ids_equal(owner, provider_id)).get_or(False)
+		_: False
+	dependency_answer = graph.modules.any(func(module):
+		(module.parsed_program.source.module_name == "dependency"
+			and module.errors.is_empty()
+			and rewritten_global_int(typechecked_module_program_with_ctfe_replacements(module), "ANSWER") == Some("10"))
+	)
+	(graph.target.errors.is_empty() and graph.modules.all(func(module): module.errors.is_empty())
+		and provider_identity and local_record and dependency_answer
+		and rewritten_global_int(target_program, "FIRST") == Some("10")
+		and rewritten_global_int(target_program, "SECOND") == Some("6")
+		and rewritten_global_int(target_program, "THIRD") == Some("10")
+		and run.ctfe.duplicate_global_evaluations == 0)
+
+
+func test_unrelated_range_shadow_is_not_a_ctfe_iterable() -> Bool:
+	run = typecheck_graph_with_metrics(range_graph_test_request(
+		"record Range {start: Int, end: Int}\n\n"
+		+ "pure func sum_local() -> Int:\n\tlocal: Range = {start = 0, end = 5}\n\tvar total = 0\n"
+		+ "\tfor item in local:\n\t\ttotal = total + item\n\ttotal"
+	))
+	run.graph.target.errors.contains(
+		"Cannot iterate over type Range. For-in loops work with Channel, Dict, List, Vector, Set, Stream, String, and Range types",
+	)
 
 
 func test_dependency_global_graph_measures_duplicate_plan_entries() -> Bool:
@@ -1264,6 +1355,7 @@ func test_dependency_global_graph_measures_duplicate_plan_entries() -> Bool:
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[dependency, dependency],
+				None,
 			),
 		)
 	):
@@ -1302,6 +1394,7 @@ func test_dependency_global_graph_refreshes_only_first_duplicate_program() -> Bo
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[first, duplicate],
+				None,
 			),
 		)
 	):
@@ -1312,7 +1405,7 @@ func test_dependency_global_graph_refreshes_only_first_duplicate_program() -> Bo
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("OFFSET"))]),
-				ctfe_imported_program_set(base_context.definition_table, [first]),
+				ctfe_imported_program_set(base_context.definition_table, [first], None),
 				[selective_import_binding(base_context, "OFFSET", "dep", "OFFSET")],
 			):
 				Ok(program):
@@ -1349,6 +1442,7 @@ func test_dependency_global_graph_discovers_reversed_global_dependency() -> Bool
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[dependency, middle, base],
+				None,
 			),
 		)
 	):
@@ -1359,7 +1453,7 @@ func test_dependency_global_graph_discovers_reversed_global_dependency() -> Bool
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("ANSWER"))]),
-				ctfe_imported_program_set(base_context.definition_table, [dependency]),
+				ctfe_imported_program_set(base_context.definition_table, [dependency], None),
 				[selective_import_binding(base_context, "ANSWER", "dep", "ANSWER")],
 			)
 			metrics = ctfe_evaluated_global_graph_metrics(graph)
@@ -1401,6 +1495,7 @@ func test_dependency_global_graph_rejects_global_cycle_once() -> Bool:
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[right, left],
+				None,
 			),
 		)
 	):
@@ -1411,14 +1506,14 @@ func test_dependency_global_graph_rejects_global_cycle_once() -> Bool:
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("LEFT"))]),
-				ctfe_imported_program_set(base_context.definition_table, [left]),
+				ctfe_imported_program_set(base_context.definition_table, [left], None),
 				[selective_import_binding(base_context, "LEFT", "left", "LEFT")],
 			)
 			right_result = ctfe_rewrite_program_globals_with_evaluated_dependencies(
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("RIGHT"))]),
-				ctfe_imported_program_set(base_context.definition_table, [right]),
+				ctfe_imported_program_set(base_context.definition_table, [right], None),
 				[selective_import_binding(base_context, "RIGHT", "right", "RIGHT")],
 			)
 			metrics = ctfe_evaluated_global_graph_metrics(graph)
@@ -1465,6 +1560,7 @@ func test_dependency_global_graph_preserves_runtime_global_error_across_back_edg
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[right, left],
+				None,
 			),
 		)
 	):
@@ -1475,7 +1571,7 @@ func test_dependency_global_graph_preserves_runtime_global_error_across_back_edg
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("RIGHT"))]),
-				ctfe_imported_program_set(base_context.definition_table, [right]),
+				ctfe_imported_program_set(base_context.definition_table, [right], None),
 				[selective_import_binding(base_context, "RIGHT", "right", "RIGHT")],
 			)
 
@@ -1518,6 +1614,7 @@ func test_dependency_global_graph_attributes_cycle_before_rejecting_dependent() 
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[dependent, right, left],
+				None,
 			),
 		)
 	):
@@ -1528,7 +1625,7 @@ func test_dependency_global_graph_attributes_cycle_before_rejecting_dependent() 
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("DEPENDENT"))]),
-				ctfe_imported_program_set(base_context.definition_table, [dependent]),
+				ctfe_imported_program_set(base_context.definition_table, [dependent], None),
 				[selective_import_binding(base_context, "DEPENDENT", "dep", "DEPENDENT")],
 			)
 
@@ -1576,6 +1673,7 @@ func test_dependency_global_graph_keeps_disjoint_cycle_errors_separate() -> Bool
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[right, left, base, dep],
+				None,
 			),
 		)
 	):
@@ -1586,14 +1684,14 @@ func test_dependency_global_graph_keeps_disjoint_cycle_errors_separate() -> Bool
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("LEFT"))]),
-				ctfe_imported_program_set(base_context.definition_table, [left]),
+				ctfe_imported_program_set(base_context.definition_table, [left], None),
 				[selective_import_binding(base_context, "LEFT", "left", "LEFT")],
 			)
 			dep_result = ctfe_rewrite_program_globals_with_evaluated_dependencies(
 				graph,
 				base_context.target_module_id,
 				typed_program([typed_global_decl("RESULT", False, name_expr("DEP"))]),
-				ctfe_imported_program_set(base_context.definition_table, [dep]),
+				ctfe_imported_program_set(base_context.definition_table, [dep], None),
 				[selective_import_binding(base_context, "DEP", "dep", "DEP")],
 			)
 
@@ -1622,7 +1720,7 @@ func test_dependency_global_graph_counts_only_attempted_declarations() -> Bool:
 	match ctfe_evaluate_dependency_global_graph(
 		base_context.definition_table,
 		base_context.target_module_id,
-		ctfe_imported_program_set(base_context.definition_table, [broken]),
+		ctfe_imported_program_set(base_context.definition_table, [broken], None),
 	):
 		Err(_):
 			False
@@ -1655,6 +1753,7 @@ func test_dependency_global_graph_retains_rejection_and_continues_independent_ro
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[broken, independent],
+				None,
 			),
 		)
 	):
@@ -1668,21 +1767,21 @@ func test_dependency_global_graph_retains_rejection_and_continues_independent_ro
 				graph,
 				base_context.target_module_id,
 				broken_target,
-				ctfe_imported_program_set(base_context.definition_table, [broken]),
+				ctfe_imported_program_set(base_context.definition_table, [broken], None),
 				broken_bindings,
 			)
 			second_broken = ctfe_rewrite_program_globals_with_evaluated_dependencies(
 				graph,
 				base_context.target_module_id,
 				broken_target,
-				ctfe_imported_program_set(base_context.definition_table, [broken]),
+				ctfe_imported_program_set(base_context.definition_table, [broken], None),
 				broken_bindings,
 			)
 			independent_result = ctfe_rewrite_program_globals_with_evaluated_dependencies(
 				graph,
 				base_context.target_module_id,
 				independent_target,
-				ctfe_imported_program_set(base_context.definition_table, [independent]),
+				ctfe_imported_program_set(base_context.definition_table, [independent], None),
 				[selective_import_binding(base_context, "VALUE", "right", "VALUE")],
 			)
 			metrics = ctfe_evaluated_global_graph_metrics(graph)
@@ -1728,6 +1827,7 @@ func test_dependency_global_graph_does_not_install_unimported_sibling() -> Bool:
 			ctfe_imported_program_set(
 				base_context.definition_table,
 				[left, right],
+				None,
 			),
 		)
 	):
@@ -1738,7 +1838,7 @@ func test_dependency_global_graph_does_not_install_unimported_sibling() -> Bool:
 				graph,
 				base_context.target_module_id,
 				target,
-				ctfe_imported_program_set(base_context.definition_table, [left]),
+				ctfe_imported_program_set(base_context.definition_table, [left], None),
 				[selective_import_binding(base_context, "VALUE", "right", "VALUE")],
 			):
 				Err(error):
@@ -1832,6 +1932,8 @@ tests: TestSuite = {
 			"dependency global graph evaluates a shared module once",
 			test_dependency_global_graph_evaluates_shared_module_once,
 		),
+		("selected CTFE artifact preserves Range authority under shadow", test_selected_ctfe_artifact_preserves_range_authority_under_shadow),
+		("unrelated Range shadow is not a CTFE iterable", test_unrelated_range_shadow_is_not_a_ctfe_iterable),
 		(
 			"dependency global graph measures duplicate plan entries",
 			test_dependency_global_graph_measures_duplicate_plan_entries,

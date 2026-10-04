@@ -1,4 +1,7 @@
 import:
+	test_support_range_context: ctfe_range_test_context
+	../test_support_range_record: range_record_test_fields
+	../../../src/compiler/stage_06_typecheck/graph/range_record: ResolvedRangeFields, STANDARD_RANGE_RECORD_TYPE_NAME
 	../../../src/compiler/stage_02_lex/name_table: name_id_pending_dynamic_intern, synthesized_name_id
 	../../../src/compiler/stage_03_parse/parsed_ast:
 		ParsedBinaryOp(ParsedAddOp, ParsedEqualOp, ParsedLessOp),
@@ -39,6 +42,7 @@ import:
 		definition_table_definition_count,
 		definition_table_definition_id,
 		definition_table_row,
+		resolved_field_identity,
 	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		ConstructorId,
@@ -143,7 +147,6 @@ import:
 			CtfeFloatValue,
 			CtfeLambdaValue,
 			CtfeListValue,
-			CtfeRangeValue,
 			CtfeRecordValue,
 			CtfeStringValue,
 		),
@@ -891,6 +894,12 @@ func test_eval_collection_and_record_values() -> Bool:
 
 
 func test_eval_if_range_field_and_record_update() -> Bool:
+	match range_record_test_fields():
+		Some(fields): eval_if_range_field_and_record_update(fields)
+		None: False
+
+
+private func eval_if_range_field_and_record_update(fields: ResolvedRangeFields) -> Bool:
 	base_field: TypedRecordField = {
 		name = ident("value"),
 		value = int_expr("1"),
@@ -918,8 +927,9 @@ func test_eval_if_range_field_and_record_update() -> Bool:
 	range_expr = TypedRangeExpr(
 		int_expr("0"),
 		int_expr("3"),
+		fields,
 		fixture_source_span(),
-		expr_info_for(SemanticNamedType("Range", [])),
+		expr_info_for(SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, [])),
 	)
 	range_start_expr = TypedFieldAccessExpr(
 		range_expr,
@@ -990,14 +1000,14 @@ func test_eval_if_range_field_and_record_update() -> Bool:
 	match ctfe_eval_typed_expr(context, env, range_expr):
 		Ok(value):
 			match value.desc:
-				CtfeRangeValue(start_value, end_value):
-					range_literal_ok = ctfe_values_equal(
-						start_value,
-						ctfe_int(fixture_source_span(), 0),
-					) and ctfe_values_equal(
-						end_value,
-						ctfe_int(fixture_source_span(), 3),
-					)
+				CtfeRecordValue(record_fields):
+					range_literal_ok = match (record_fields.get(0), record_fields.get(1)):
+						(Some(start), Some(end)):
+							(start[0] == "start" and end[0] == "end"
+								and ctfe_values_equal(start[1], ctfe_int(fixture_source_span(), 0))
+								and ctfe_values_equal(end[1], ctfe_int(fixture_source_span(), 3)))
+						_:
+							False
 				_:
 					void
 		Err(_):
@@ -1306,6 +1316,53 @@ func test_eval_while_break_and_continue_control_flow() -> Bool:
 
 
 func test_eval_for_range_updates_mutable_local() -> Bool:
+	match ctfe_range_test_context():
+		Some((context, fields)): eval_for_range_updates_mutable_local(context, fields)
+		None: False
+
+
+private func eval_for_range_updates_mutable_local(context: CtfeContext, fields: ResolvedRangeFields) -> Bool:
+	iterable = TypedRangeExpr(
+		int_expr("0"), int_expr("5"), fields, fixture_source_span(),
+		expr_info_for(SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, [])),
+	)
+	eval_for_range_iterable_updates_mutable_local(context, iterable)
+
+
+func test_eval_range_forms_share_record_values_and_iteration() -> Bool:
+	match ctfe_range_test_context():
+		Some((context, fields)): eval_range_forms_share_record_values_and_iteration(context, fields)
+		None: False
+
+
+private func eval_range_forms_share_record_values_and_iteration(context: CtfeContext, fields: ResolvedRangeFields) -> Bool:
+	info = expr_info_for(SemanticNamedType(STANDARD_RANGE_RECORD_TYPE_NAME, []))
+	start_field: TypedRecordField = {
+		name = ident("start"), value = int_expr("0"), span = fixture_source_span(),
+		field_id = resolved_field_identity(fields.start)
+	}
+	end_field: TypedRecordField = {
+		name = ident("end"), value = int_expr("5"), span = fixture_source_span(),
+		field_id = resolved_field_identity(fields.end)
+	}
+	literal = TypedRecordExpr([start_field, end_field], fixture_source_span(), info)
+	syntax = TypedRangeExpr(int_expr("0"), int_expr("5"), fields, fixture_source_span(), info)
+	short_syntax = TypedRangeExpr(int_expr("0"), int_expr("3"), fields, fixture_source_span(), info)
+	updated = TypedRecordUpdateExpr(short_syntax, [end_field], [], fixture_source_span(), info)
+	values_equal = match (
+		ctfe_eval_typed_expr(context, CTFE_ENV_EMPTY, syntax),
+		ctfe_eval_typed_expr(context, CTFE_ENV_EMPTY, literal),
+		ctfe_eval_typed_expr(context, CTFE_ENV_EMPTY, updated),
+	):
+		(Ok(syntax_value), Ok(literal_value), Ok(updated_value)):
+			ctfe_values_equal(syntax_value, literal_value) and ctfe_values_equal(literal_value, updated_value)
+		_: False
+	(values_equal
+		and eval_for_range_iterable_updates_mutable_local(context, literal)
+		and eval_for_range_iterable_updates_mutable_local(context, updated))
+
+
+private func eval_for_range_iterable_updates_mutable_local(context: CtfeContext, iterable: TypedExpr) -> Bool:
 	total_payload: TypedVarDeclPayload = {
 		name = ident("total"),
 		annotation = Some(TYPE_INT),
@@ -1332,12 +1389,6 @@ func test_eval_for_range_updates_mutable_local() -> Bool:
 		fixture_source_span(),
 		void_expr_info(),
 	)
-	iterable = TypedRangeExpr(
-		int_expr("0"),
-		int_expr("5"),
-		fixture_source_span(),
-		expr_info_for(SemanticNamedType("Range", [])),
-	)
 	block = TypedBlockExpr(
 		[
 			TypedVarDeclExpr(total_payload, void_expr_info()),
@@ -1356,7 +1407,7 @@ func test_eval_for_range_updates_mutable_local() -> Bool:
 	)
 
 	value_equals(
-		ctfe_eval_typed_expr(ctfe_test_context(), CTFE_ENV_EMPTY, block),
+		ctfe_eval_typed_expr(context, CTFE_ENV_EMPTY, block),
 		ctfe_int(fixture_source_span(), 8),
 	)
 
@@ -2810,6 +2861,7 @@ tests: TestSuite = {
 			test_eval_while_break_and_continue_control_flow,
 		),
 		("eval for range updates mutable local", test_eval_for_range_updates_mutable_local),
+		("eval range forms share record values and iteration", test_eval_range_forms_share_record_values_and_iteration),
 		("eval for list break control flow", test_eval_for_list_break_control_flow),
 		("eval for tuple binder over list", test_eval_for_tuple_binder_over_list),
 		(

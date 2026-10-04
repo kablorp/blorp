@@ -4,6 +4,7 @@
 -- the typed facts CTFE needs and rejects unsupported expression forms at a
 -- named boundary instead of letting evaluation guess from typed-AST shapes.
 import:
+	../stage_06_typecheck/graph/range_record: ResolvedRangeFields, STANDARD_RANGE_RECORD_TYPE_NAME
 	../../lib/source: SourceLocation
 	../stage_02_lex/name_table: NAME_ID_WILDCARD, NameId, name_ids_equal
 	../stage_03_parse/parsed_ast:
@@ -13,7 +14,8 @@ import:
 		ParsedLogicalOp,
 		ParsedUnaryOp,
 	../stage_04_modules/module_table: ModuleId, module_ids_equal, module_table_canonical_path
-	../stage_06_typecheck/graph/definition_index: ResolvedFieldIdentity
+	../stage_06_typecheck/graph/definition_index: ResolvedFieldIdentity, definition_table_type_row
+	../stage_06_typecheck/graph/type_identity: type_id_definition_id
 	../stage_06_typecheck/headers/declaration_skeleton:
 		CallableId,
 		callable_id_definition_id,
@@ -166,9 +168,6 @@ union CtfeIrFieldAccessKind:
 	CtfeIrRecordField(String)
 	CtfeIrTupleField(Int, String)
 	CtfeIrTupleInvalidField(String)
-	CtfeIrRangeStartField
-	CtfeIrRangeEndField
-	CtfeIrRangeInvalidField(String)
 
 
 record CtfeIrFieldAccess {
@@ -207,10 +206,10 @@ union CtfeIrExprDesc:
 	CtfeIrLambdaExpr(CtfeLambdaSource)
 	CtfeIrFieldAccessExpr(CtfeIrFieldAccess)
 	CtfeIrImportedGlobalExpr(CtfeIrImportedGlobal)
-	CtfeIrRangeExpr(CtfeIrExpr, CtfeIrExpr)
+	CtfeIrRangeExpr(CtfeIrExpr, CtfeIrExpr, ResolvedRangeFields)
 	CtfeIrMatchExpr(CtfeIrExpr, List[CtfeIrMatchCase])
 	CtfeIrWhileExpr(CtfeIrExpr, CtfeIrExpr)
-	CtfeIrForExpr(String, CtfeIrExpr, CtfeIrExpr)
+	CtfeIrForExpr(String, CtfeIrExpr, CtfeIrExpr, Option[ResolvedRangeFields])
 	CtfeIrForTupleExpr(List[String], CtfeIrExpr, CtfeIrExpr)
 	CtfeIrBreakExpr
 	CtfeIrContinueExpr
@@ -520,17 +519,44 @@ private pure func ctfe_ir_field_access_kind(
 		SemanticNamedType(name, args):
 			if name == "Tuple":
 				ctfe_ir_tuple_field_kind(field, args.length())
-			else if name == "Range" and args.length() == 0:
-				if field == "start":
-					CtfeIrRangeStartField
-				else if field == "end":
-					CtfeIrRangeEndField
-				else:
-					CtfeIrRangeInvalidField(field)
 			else:
 				CtfeIrRecordField(field)
 		_:
 			CtfeIrRecordField(field)
+
+
+private pure func ctfe_ir_range_iterable_fields(
+	context: CtfeContext,
+	iterable: TypedExpr,
+) -> Result[Option[ResolvedRangeFields], CtfeIrTranslateError]:
+	match typed_expr_value_type(iterable):
+		SemanticNamedType(name, []):
+			if name == STANDARD_RANGE_RECORD_TYPE_NAME:
+				context.range_fields.map(func(fields): Some(fields)).to_result({
+					span = typed_expr_location(iterable),
+					form = "a missing standard Range field authority; prepare the accepted module graph before compile-time iteration",
+					kind = CtfeIrInvalidGraphIdentity,
+				})
+			else:
+				match context.range_fields:
+					Some(fields):
+						match definition_table_type_row(context.definition_table, type_id_definition_id(fields.record_id)):
+							Some(row):
+								provider_fields = if module_ids_equal(row.module_id, context.active_module_id) and name == row.name:
+									Some(fields)
+								else:
+									None
+								Ok(provider_fields)
+							None:
+								Err({
+									span = typed_expr_location(iterable),
+									form = "a missing standard Range provider",
+									kind = CtfeIrInvalidGraphIdentity,
+								})
+					None:
+						Ok(None)
+		_:
+			Ok(None)
 
 
 private pure func ctfe_ir_qualified_field_expr(
@@ -889,10 +915,10 @@ private pure func ctfe_ir_from_valid_typed_expr(
 							kind = ctfe_ir_field_access_kind(receiver_ir.value_type, field.text),
 						}),
 					))
-		TypedRangeExpr(start_expr, end_expr, _, _):
+		TypedRangeExpr(start_expr, end_expr, range_fields, _, _):
 			start_ir ?= ctfe_ir_from_typed_expr(context, start_expr)
 			end_ir ?= ctfe_ir_from_typed_expr(context, end_expr)
-			Ok(ctfe_ir_expr(expr, CtfeIrRangeExpr(start_ir, end_ir)))
+			Ok(ctfe_ir_expr(expr, CtfeIrRangeExpr(start_ir, end_ir, range_fields)))
 		TypedBlockExpr(items, _, _):
 			block ?= ctfe_ir_block_from_typed(context, expr, items)
 			Ok(ctfe_ir_expr(expr, CtfeIrBlockExpr(block)))
@@ -956,7 +982,8 @@ private pure func ctfe_ir_from_valid_typed_expr(
 
 			match binder:
 				ParsedForNameBinder(name):
-					Ok(ctfe_ir_expr(expr, CtfeIrForExpr(name.text, iterable_ir, body_ir)))
+					range_fields ?= ctfe_ir_range_iterable_fields(context, iterable)
+					Ok(ctfe_ir_expr(expr, CtfeIrForExpr(name.text, iterable_ir, body_ir, range_fields)))
 				ParsedForTupleBinder(names, _):
 					name_texts = names.map(func(name): name.text)
 					Ok(ctfe_ir_expr(expr, CtfeIrForTupleExpr(name_texts, iterable_ir, body_ir)))

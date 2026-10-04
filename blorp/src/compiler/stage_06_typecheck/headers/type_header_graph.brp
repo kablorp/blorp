@@ -53,7 +53,7 @@ import:
 			ParsedDimNameType, ParsedFunctionType, ParsedMissingType, ParsedNamedType,
 			ParsedQualifiedNamedType, ParsedRangeType, ParsedTupleType,
 		),
-		ParsedTypeParamKind(ParsedTypeParameter),
+		ParsedTypeParamKind(ParsedDimensionParameter, ParsedTypeParameter),
 		ParsedUnionDecl,
 		ParsedVariantDecl,
 		parsed_type_expr_location,
@@ -281,19 +281,6 @@ union TypeShapeResolutionError:
 	TypeShapeSelfNotAllowed(TypeResolutionOwner, SourceLocation)
 
 
-enum RecordLayout:
-	HeapRecord
-	ValueStruct
-	FixedValueRecord
-
-
---- Both value forms use the current unmanaged, by-value C layout in R1.
-pure func record_layout_is_value(layout: RecordLayout) -> Bool:
-	match layout:
-		HeapRecord: False
-		ValueStruct | FixedValueRecord: True
-
-
 enum UnionLayout:
 	TaggedUnion
 	FieldlessEnum
@@ -340,13 +327,13 @@ record TypeHeaderVariant {
 
 
 union TypeHeaderShape:
-	RecordTypeHeader(RecordLayout, List[TypeHeaderField])
+	RecordTypeHeader(List[TypeHeaderField])
 	UnionTypeHeader(UnionLayout, List[TypeHeaderVariant])
 	BuiltinTypeHeader(BuiltinTypeLayout)
 	AliasTypeHeader(AliasLayout, ResolvedTypeShape)
 
 
-struct TypeContainmentFacts {
+fixed record TypeContainmentFacts {
 	contains_resource: Bool,
 	may_contain_function: Bool,
 	may_contain_one_shot_stream: Bool,
@@ -396,7 +383,6 @@ private record AcceptedRecordHeaderRep {
 	id: TypeId,
 	source_name: String,
 	parameters: List[ResolvedTypeParameter],
-	layout: RecordLayout,
 	fields: List[TypeHeaderField],
 	containment: TypeContainmentFacts
 }
@@ -504,14 +490,7 @@ union TypeHeaderError:
 	TypeHeaderConstructorMissing(TypeId, String)
 	TypeHeaderFieldDefinitionMissing(TypeId, String, SourceLocation)
 	TypeHeaderInvalidEnumTypeParameters(TypeId)
-	TypeHeaderInvalidStructTypeParameters(TypeId)
-	TypeHeaderInvalidFixedRecordParameters(TypeId)
-	TypeHeaderEmptyStruct(TypeId)
-	TypeHeaderEmptyFixedRecord(TypeId)
-	TypeHeaderInvalidStructField(TypeId, String)
-	TypeHeaderInvalidFixedRecordField(TypeId, String)
 	TypeHeaderRecursiveValueLayout(TypeId, Bool)
-	TypeHeaderInlineStorageCycle(List[TypeId], List[String])
 
 
 private record LayoutTypeSubstitution {
@@ -520,22 +499,6 @@ private record LayoutTypeSubstitution {
 }
 
 
-private record InlineLayoutDependency {
-	id: TypeId,
-	dependency_indices: List[Int]
-}
-
-
-private enum InlineLayoutVisitState:
-	InlineLayoutUnvisited
-	InlineLayoutVisiting
-	InlineLayoutComplete
-
-
-private struct InlineLayoutFrame {
-	node_index: Int,
-	next_dependency_index: Int
-}
 
 
 private record TypeResolutionContext {
@@ -795,44 +758,6 @@ private pure func intrinsic_type(name: NameId) -> Option[IntrinsicType]:
 		None
 
 
-private pure func intrinsic_is_struct_scalar(intrinsic: IntrinsicType) -> Bool:
-	match intrinsic:
-		IntrinsicInt:
-			True
-		IntrinsicFloat:
-			True
-		IntrinsicBool:
-			True
-		IntrinsicChar:
-			True
-		IntrinsicPtr:
-			True
-		IntrinsicInt8:
-			True
-		IntrinsicInt16:
-			True
-		IntrinsicInt32:
-			True
-		IntrinsicInt64:
-			True
-		IntrinsicInt128:
-			True
-		IntrinsicUInt8:
-			True
-		IntrinsicUInt16:
-			True
-		IntrinsicUInt32:
-			True
-		IntrinsicUInt64:
-			True
-		IntrinsicUInt128:
-			True
-		IntrinsicFloat32:
-			True
-		IntrinsicFloat16:
-			True
-		_:
-			False
 
 
 private pure func intrinsic_type_arity(typ: IntrinsicType) -> Int:
@@ -1085,6 +1010,37 @@ private pure func resolved_skeleton_type(
 			ResolvedTypeReady(DeclaredTypeShape(skeleton.id, args))
 
 
+private pure func skeleton_has_only_dimension_parameters(
+	skeleton: TypeDeclarationSkeletonInfo,
+) -> Bool:
+	parameters = match skeleton.source:
+		RecordTypeSource(decl): decl.type_params
+		UnionTypeSource(decl): decl.type_params
+		AliasTypeSource(decl): decl.type_params
+		BuiltinTypeSource(decl): decl.type_params
+	parameters.length() > 0 and parameters.all(func(parameter):
+		parameter.kind == ParsedDimensionParameter
+	)
+
+
+-- All-dimension brackets have array syntax. The declaration decides whether
+-- they are nominal arguments before resolving the otherwise zero-argument base.
+private pure func resolved_skeleton_dimension_application(
+	context: TypeResolutionContext,
+	skeleton: TypeDeclarationSkeletonInfo,
+	name: String,
+	dimensions: List[ResolvedTypeShape],
+	span: SourceLocation,
+) -> ResolvedTypeResult:
+	if skeleton_has_only_dimension_parameters(skeleton):
+		resolved_skeleton_type(context, skeleton, name, dimensions, span)
+	else:
+		map_single_shape(
+			resolved_skeleton_type(context, skeleton, name, [], span),
+			func(element): ArrayTypeShape(element, dimensions),
+		)
+
+
 private pure func resolved_implicit_prelude_type(
 	context: TypeResolutionContext,
 	identifier: ParsedIdentifier,
@@ -1250,6 +1206,7 @@ private pure func resolve_qualified_named_type(
 	name: String,
 	args: List[ParsedTypeExpr],
 	span: SourceLocation,
+	is_dimension_application: Bool,
 ) -> ResolvedTypeResult:
 	match resolve_type_exprs(context, args):
 		ResolvedTypesRejected(errors):
@@ -1284,13 +1241,16 @@ private pure func resolve_qualified_named_type(
 										Err(error):
 											ResolvedTypeRejected([error])
 										Ok(skeleton):
-											resolved_skeleton_type(
-												context,
-												skeleton,
-												qualifier + "." + name,
-												resolved_args,
-												span,
-											)
+											if is_dimension_application:
+												resolved_skeleton_dimension_application(context, skeleton, qualifier + "." + name, resolved_args, span)
+											else:
+												resolved_skeleton_type(
+													context,
+													skeleton,
+													qualifier + "." + name,
+													resolved_args,
+													span,
+												)
 				Some(module_id):
 					match bound_module_graph_find_for_id(
 						context.bound_graph,
@@ -1311,13 +1271,16 @@ private pure func resolve_qualified_named_type(
 								Err(error):
 									ResolvedTypeRejected([error])
 								Ok(skeleton):
-									resolved_skeleton_type(
-										context,
-										skeleton,
-										qualifier + "." + name,
-										resolved_args,
-										span,
-									)
+									if is_dimension_application:
+										resolved_skeleton_dimension_application(context, skeleton, qualifier + "." + name, resolved_args, span)
+									else:
+										resolved_skeleton_type(
+											context,
+											skeleton,
+											qualifier + "." + name,
+											resolved_args,
+											span,
+										)
 
 
 private pure func combine_binary_dimension(
@@ -1355,7 +1318,7 @@ private pure func resolve_type_expr(
 		ParsedNamedType(name, args, span):
 			resolve_named_type(context, name, args, span)
 		ParsedQualifiedNamedType(qualifier, name, args, span):
-			resolve_qualified_named_type(context, qualifier.text, name.text, args, span)
+			resolve_qualified_named_type(context, qualifier.text, name.text, args, span, False)
 		ParsedBoundedType(name, _, span):
 			match type_parameter_by_name(context.parameters, name.text):
 				Some(parameter):
@@ -1421,18 +1384,54 @@ private pure func resolve_type_expr(
 					ResolvedTypeRejected(errors)
 				(_, ResolvedTypeRejected(errors)):
 					ResolvedTypeRejected(errors)
-		ParsedArrayType(element, dims, _):
-			match (resolve_type_expr(context, element), resolve_type_exprs(context, dims)):
-				(ResolvedTypeReady(element_shape), ResolvedTypesReady(dim_shapes)):
-					ResolvedTypeReady(ArrayTypeShape(element_shape, dim_shapes))
-				(ResolvedTypeRejected(errors), ResolvedTypesRejected(dim_errors)):
-					ResolvedTypeRejected(errors.concat(dim_errors))
-				(ResolvedTypeRejected(errors), _):
-					ResolvedTypeRejected(errors)
-				(_, ResolvedTypesRejected(errors)):
-					ResolvedTypeRejected(errors)
+		ParsedArrayType(element, dims, span):
+			resolve_array_type(context, element, dims, span)
 		ParsedMissingType(span):
 			ResolvedTypeRejected([TypeShapeMissingType(context.owner, span)])
+
+
+private pure func resolve_array_type(
+	context: TypeResolutionContext,
+	element: ParsedTypeExpr,
+	dims: List[ParsedTypeExpr],
+	span: SourceLocation,
+) -> ResolvedTypeResult:
+	match element:
+		ParsedNamedType(name, [], _):
+			if type_parameter_by_name(context.parameters, name.text).is_none():
+				match declared_unqualified_type(context, name, span):
+					Err(error):
+						ResolvedTypeRejected([error])
+					Ok(Some(skeleton)):
+						match resolve_type_exprs(context, dims):
+							ResolvedTypesReady(shapes):
+								resolved_skeleton_dimension_application(context, skeleton, name.text, shapes, span)
+							ResolvedTypesRejected(errors):
+								ResolvedTypeRejected(errors)
+					Ok(None):
+						resolve_tensor_array_type(context, element, dims)
+			else:
+				resolve_tensor_array_type(context, element, dims)
+		ParsedQualifiedNamedType(qualifier, name, [], _):
+			resolve_qualified_named_type(context, qualifier.text, name.text, dims, span, True)
+		_:
+			resolve_tensor_array_type(context, element, dims)
+
+
+private pure func resolve_tensor_array_type(
+	context: TypeResolutionContext,
+	element: ParsedTypeExpr,
+	dims: List[ParsedTypeExpr],
+) -> ResolvedTypeResult:
+	match (resolve_type_expr(context, element), resolve_type_exprs(context, dims)):
+		(ResolvedTypeReady(element_shape), ResolvedTypesReady(dim_shapes)):
+			ResolvedTypeReady(ArrayTypeShape(element_shape, dim_shapes))
+		(ResolvedTypeRejected(errors), ResolvedTypesRejected(dim_errors)):
+			ResolvedTypeRejected(errors.concat(dim_errors))
+		(ResolvedTypeRejected(errors), _):
+			ResolvedTypeRejected(errors)
+		(_, ResolvedTypesRejected(errors)):
+			ResolvedTypeRejected(errors)
 
 
 private pure func type_resolution_owner_matches_module(
@@ -1896,46 +1895,20 @@ private pure func build_record_header(
 	parameters: List[ResolvedTypeParameter],
 	decl: ParsedRecordDecl,
 ) -> TypeHeaderBuildResult:
-	var errors: List[TypeHeaderError] = []
-
-	if not parameters.is_empty():
-		match decl.form:
-			OrdinaryRecord: void
-			LegacyStruct:
-				errors = errors.append(TypeHeaderInvalidStructTypeParameters(context.owner))
-			FixedRecord:
-				errors = errors.append(TypeHeaderInvalidFixedRecordParameters(context.owner))
-
-	if decl.fields.is_empty():
-		match decl.form:
-			OrdinaryRecord: void
-			LegacyStruct:
-				errors = errors.append(TypeHeaderEmptyStruct(context.owner))
-			FixedRecord:
-				errors = errors.append(TypeHeaderEmptyFixedRecord(context.owner))
-
 	match resolve_fields(context, decl.fields):
 		Err(field_errors):
-			TypeHeaderRejected(errors.concat(field_errors))
+			TypeHeaderRejected(field_errors)
 		Ok(fields):
-			if errors.is_empty():
-				layout = match decl.form:
-					OrdinaryRecord: HeapRecord
-					LegacyStruct: ValueStruct
-					FixedRecord: FixedValueRecord
-
-				TypeHeaderReady({
-					id = context.owner,
-					owner_module_id = prepared_module_scope_id(
-						bound_module_scope(context.resolution.module),
-					),
-					source_name = context.owner_name,
-					parameters = parameters,
-					shape = RecordTypeHeader(layout, fields),
-					containment = EMPTY_TYPE_CONTAINMENT_FACTS,
-				})
-			else:
-				TypeHeaderRejected(errors)
+			TypeHeaderReady({
+				id = context.owner,
+				owner_module_id = prepared_module_scope_id(
+					bound_module_scope(context.resolution.module),
+				),
+				source_name = context.owner_name,
+				parameters = parameters,
+				shape = RecordTypeHeader(fields),
+				containment = EMPTY_TYPE_CONTAINMENT_FACTS,
+			})
 
 
 private pure func build_union_header(
@@ -2236,409 +2209,6 @@ private pure func layout_substitution_find(
 	result
 
 
-private pure func layout_alias_substitutions(
-	parameters: List[ResolvedTypeParameter],
-	args: List[ResolvedTypeShape],
-	outer: List[LayoutTypeSubstitution],
-) -> List[LayoutTypeSubstitution]:
-	var result = outer
-	var index: Int = 0
-
-	while index < parameters.length():
-		match (parameters.get(index), args.get(index)):
-			(Some(parameter), Some(arg)):
-				result = [
-					{
-						parameter = parameter.id,
-						replacement = arg
-					},
-				].concat(result)
-			_:
-				void
-
-		index += 1
-
-	result
-
-
----
-This classification mirrors the exhaustive stack/heap cases in
-stage_09_core/c_type_layout.brp. Keep every variant explicit so adding
-a new type representation fails compilation here until its storage edge is
-deliberately classified. The codegen audit pins the accepted heap cases.
----
-private pure func resolved_shape_supports_stack_option(
-	table: TypeHeaderTable,
-	shape: ResolvedTypeShape,
-	substitutions: List[LayoutTypeSubstitution],
-) -> Bool:
-	match shape:
-		DeclaredTypeShape(id, args):
-			match type_header_table_find(table, id):
-				Some(header):
-					match header.shape:
-						RecordTypeHeader(ValueStruct, _) | RecordTypeHeader(FixedValueRecord, _):
-							True
-						RecordTypeHeader(HeapRecord, _):
-							False
-						UnionTypeHeader(FieldlessEnum, _):
-							True
-						UnionTypeHeader(TaggedUnion, _):
-							False
-						AliasTypeHeader(_, target):
-							resolved_shape_supports_stack_option(
-								table,
-								target,
-								layout_alias_substitutions(header.parameters, args, substitutions),
-							)
-						BuiltinTypeHeader(_):
-							False
-				None:
-					False
-		IntrinsicTypeShape(intrinsic, args):
-			if not args.is_empty():
-				False
-			else:
-				match intrinsic:
-					IntrinsicInt | IntrinsicFloat | IntrinsicBool | IntrinsicChar | IntrinsicVoid | IntrinsicInt8 | IntrinsicInt16 | IntrinsicInt32 | IntrinsicInt64 | IntrinsicInt128 | IntrinsicUInt8 | IntrinsicUInt16 | IntrinsicUInt32 | IntrinsicUInt64 | IntrinsicUInt128 | IntrinsicFloat32 | IntrinsicFloat16:
-						True
-					IntrinsicString | IntrinsicLiteralString | IntrinsicBytes | IntrinsicPtr | IntrinsicFixed | IntrinsicTensor | IntrinsicOption | IntrinsicResult | IntrinsicConcurrencyError | IntrinsicTaskResult | IntrinsicChannel:
-						False
-		TypeParameterShape(parameter):
-			match layout_substitution_find(substitutions, parameter):
-				Some(replacement):
-					resolved_shape_supports_stack_option(table, replacement, substitutions)
-				None:
-					False
-		SelfTypeShape(id):
-			resolved_shape_supports_stack_option(
-				table,
-				DeclaredTypeShape(id, []),
-				substitutions,
-			)
-		TraitTypeParameterShape(_) | TraitSelfTypeShape(_) | TraitDimensionParameterShape(_, _) | CallableTypeParameterShape(_) | CallableDimensionParameterShape(_, _) | ImplementationTypeParameterShape(_) | ImplementationDimensionParameterShape(_, _) | WildcardDimensionShape(_):
-			False
-		RangeTypeShape(_):
-			True
-		PreludeTypeShape(_, _) | DimensionParameterShape(_, _) | DimensionLiteralShape(_) | DimensionBinaryShape(_, _, _) | TupleTypeShape(_) | FunctionTypeShape(_, _, _) | ArrayTypeShape(_, _):
-			False
-
-
-private pure func resolved_shape_inline_dependencies(
-	table: TypeHeaderTable,
-	shape: ResolvedTypeShape,
-	substitutions: List[LayoutTypeSubstitution],
-) -> List[TypeId]:
-	match shape:
-		DeclaredTypeShape(id, args):
-			match type_header_table_find(table, id):
-				Some(header):
-					match header.shape:
-						RecordTypeHeader(ValueStruct, _) | RecordTypeHeader(FixedValueRecord, _):
-							[id]
-						RecordTypeHeader(HeapRecord, _):
-							[]
-						AliasTypeHeader(_, target):
-							resolved_shape_inline_dependencies(
-								table,
-								target,
-								layout_alias_substitutions(header.parameters, args, substitutions),
-							)
-						UnionTypeHeader(_, _) | BuiltinTypeHeader(_):
-							[]
-				None:
-					[]
-		IntrinsicTypeShape(intrinsic, args):
-			match intrinsic:
-				IntrinsicResult | IntrinsicTaskResult:
-					resolved_shapes_inline_dependencies(table, args, substitutions)
-				IntrinsicOption:
-					match args:
-						[payload]:
-							if resolved_shape_supports_stack_option(table, payload, substitutions):
-								resolved_shape_inline_dependencies(table, payload, substitutions)
-							else:
-								[]
-						_:
-							[]
-				IntrinsicInt | IntrinsicFloat | IntrinsicBool | IntrinsicString | IntrinsicLiteralString | IntrinsicChar | IntrinsicVoid | IntrinsicBytes | IntrinsicPtr | IntrinsicFixed | IntrinsicInt8 | IntrinsicInt16 | IntrinsicInt32 | IntrinsicInt64 | IntrinsicInt128 | IntrinsicUInt8 | IntrinsicUInt16 | IntrinsicUInt32 | IntrinsicUInt64 | IntrinsicUInt128 | IntrinsicFloat32 | IntrinsicFloat16 | IntrinsicTensor | IntrinsicConcurrencyError | IntrinsicChannel:
-					[]
-		TypeParameterShape(parameter):
-			match layout_substitution_find(substitutions, parameter):
-				Some(replacement):
-					resolved_shape_inline_dependencies(table, replacement, substitutions)
-				None:
-					[]
-		SelfTypeShape(id):
-			resolved_shape_inline_dependencies(
-				table,
-				DeclaredTypeShape(id, []),
-				substitutions,
-			)
-		TraitTypeParameterShape(_) | TraitSelfTypeShape(_) | TraitDimensionParameterShape(_, _) | CallableTypeParameterShape(_) | CallableDimensionParameterShape(_, _) | ImplementationTypeParameterShape(_) | ImplementationDimensionParameterShape(_, _) | WildcardDimensionShape(_):
-			[]
-		PreludeTypeShape(_, _) | DimensionParameterShape(_, _) | DimensionLiteralShape(_) | DimensionBinaryShape(_, _, _) | RangeTypeShape(_) | TupleTypeShape(_) | FunctionTypeShape(_, _, _) | ArrayTypeShape(_, _):
-			-- Tuples and tensors are ARC-managed heap layouts in current Core.
-			-- Function values and every prelude container are indirect as well.
-			[]
-
-
-private pure func resolved_shapes_inline_dependencies(
-	table: TypeHeaderTable,
-	shapes: List[ResolvedTypeShape],
-	substitutions: List[LayoutTypeSubstitution],
-) -> List[TypeId]:
-	var result: List[TypeId] = []
-
-	for shape in shapes:
-		result = concat_unique_type_ids(
-			result,
-			resolved_shape_inline_dependencies(table, shape, substitutions),
-		)
-
-	result
-
-
-private pure func type_header_inline_dependencies(
-	table: TypeHeaderTable,
-	header: TypeHeader,
-) -> List[TypeId]:
-	match header.shape:
-		RecordTypeHeader(ValueStruct, fields) | RecordTypeHeader(FixedValueRecord, fields):
-			resolved_shapes_inline_dependencies(
-				table,
-				fields.map(func(field): field.typ),
-				[],
-			)
-		AliasTypeHeader(_, target):
-			resolved_shape_inline_dependencies(table, target, [])
-		RecordTypeHeader(HeapRecord, _) | UnionTypeHeader(_, _) | BuiltinTypeHeader(_):
-			[]
-
-
-private pure func inline_layout_dependencies(
-	table: TypeHeaderTable,
-) -> List[InlineLayoutDependency]:
-	var result: List[InlineLayoutDependency] = []
-
-	for header in table.headers:
-		var dependency_indices: List[Int] = []
-
-		for id in type_header_inline_dependencies(table, header):
-			match type_header_table_index(table, id):
-				Some(index):
-					dependency_indices = dependency_indices.append(index)
-				None:
-					void
-
-		node: InlineLayoutDependency = {
-			id = header.id,
-			dependency_indices = dependency_indices
-		}
-		result = result.append(node)
-
-	result
-
-
-private pure func inline_layout_cycle_from_path(
-	path: List[TypeId],
-	repeated_id: TypeId,
-) -> List[TypeId]:
-	var start_index: Int = 0
-	var index: Int = 0
-
-	while index < path.length():
-		match path.get(index):
-			Some(id):
-				if type_ids_equal(id, repeated_id):
-					start_index = index
-					break
-			None:
-				void
-
-		index += 1
-
-	path
-		.drop(start_index)
-		.append(repeated_id)
-
-
-private pure func inline_layout_cycle_from_stack(
-	nodes: List[InlineLayoutDependency],
-	stack: List[InlineLayoutFrame],
-	repeated_index: Int,
-) -> Option[List[TypeId]]:
-	var path: List[TypeId] = []
-
-	for frame in stack:
-		match nodes.get(frame.node_index):
-			Some(node):
-				path = path.append(node.id)
-			None:
-				void
-
-	match nodes.get(repeated_index):
-		Some(node):
-			Some(inline_layout_cycle_from_path(path, node.id))
-		None:
-			None
-
-
-private pure func inline_layout_cycle(table: TypeHeaderTable) -> Option[List[TypeId]]:
-	nodes = inline_layout_dependencies(table)
-	var visit_states: List[InlineLayoutVisitState] = []
-
-	for _ in nodes:
-		visit_states = visit_states.append(InlineLayoutUnvisited)
-
-	var cycle: Option[List[TypeId]] = None
-	var root_index: Int = 0
-
-	while root_index < nodes.length() and cycle.is_none():
-		if visit_states.get_or(root_index, InlineLayoutUnvisited) == InlineLayoutUnvisited:
-			var stack: List[InlineLayoutFrame] = [
-				{
-					node_index = root_index,
-					next_dependency_index = 0
-				},
-			]
-			visit_states = visit_states.set(root_index, InlineLayoutVisiting)
-
-			while not stack.is_empty() and cycle.is_none():
-				frame_index = stack.length() - 1
-
-				match stack.get(frame_index):
-					None:
-						stack = stack.take(frame_index)
-					Some(frame):
-						match nodes.get(frame.node_index):
-							None:
-								stack = stack.take(frame_index)
-							Some(node):
-								match node.dependency_indices.get(frame.next_dependency_index):
-									Some(dependency_index):
-										stack = stack.set(
-											frame_index,
-											{
-												node_index = frame.node_index,
-												next_dependency_index = frame.next_dependency_index + 1
-											},
-										)
-
-										match visit_states.get_or(
-											dependency_index,
-											InlineLayoutUnvisited,
-										):
-											InlineLayoutVisiting:
-												cycle = inline_layout_cycle_from_stack(
-													nodes,
-													stack,
-													dependency_index,
-												)
-											InlineLayoutUnvisited:
-												visit_states = visit_states.set(
-													dependency_index,
-													InlineLayoutVisiting,
-												)
-												stack = stack.append({
-													node_index = dependency_index,
-													next_dependency_index = 0,
-												})
-											InlineLayoutComplete:
-												void
-									None:
-										visit_states = visit_states.set(
-											frame.node_index,
-											InlineLayoutComplete,
-										)
-										stack = stack.take(frame_index)
-
-		root_index += 1
-
-	cycle
-
-
-private pure func resolved_shape_is_valid_struct_field(
-	table: TypeHeaderTable,
-	shape: ResolvedTypeShape,
-	substitutions: List[LayoutTypeSubstitution],
-) -> Bool:
-	-- Alias cycles have already been rejected by the dependency graph. Walk
-	-- the remaining single-target alias chain iteratively so a deep valid chain
-	-- cannot exhaust the compiler stack.
-	var current = shape
-	var current_substitutions = substitutions
-	var valid: Bool = False
-	var complete: Bool = False
-
-	while not complete:
-		match current:
-			IntrinsicTypeShape(intrinsic, args):
-				valid = args.is_empty() and intrinsic_is_struct_scalar(intrinsic)
-				complete = True
-			PreludeTypeShape(prelude_type, args):
-				valid = args.is_empty() and prelude_type_has_inline_value_storage(prelude_type)
-
-				complete = True
-			DeclaredTypeShape(id, args):
-				match type_header_table_find(table, id):
-					Some(header):
-						match header.shape:
-							BuiltinTypeHeader(ScalarBuiltin):
-								valid = args.is_empty()
-								complete = True
-							UnionTypeHeader(FieldlessEnum, _):
-								valid = args.is_empty()
-								complete = True
-							RecordTypeHeader(ValueStruct, _) | RecordTypeHeader(FixedValueRecord, _):
-								valid = args.is_empty()
-								complete = True
-							AliasTypeHeader(_, target):
-								match type_shape_substitutions(
-									header.parameters,
-									args,
-									current_substitutions,
-								):
-									Some(alias_substitutions):
-										current = target
-										current_substitutions = alias_substitutions
-									None:
-										complete = True
-							_:
-								complete = True
-					None:
-						complete = True
-			TypeParameterShape(parameter):
-				match layout_substitution_find(current_substitutions, parameter):
-					Some(replacement):
-						current = replacement
-					None:
-						complete = True
-			_:
-				complete = True
-
-	valid
-
-
-private pure func invalid_struct_field_errors(table: TypeHeaderTable) -> List[TypeHeaderError]:
-	var errors: List[TypeHeaderError] = []
-
-	for header in table.headers:
-		match header.shape:
-			RecordTypeHeader(ValueStruct, fields):
-				for field in fields:
-					if not resolved_shape_is_valid_struct_field(table, field.typ, []):
-						errors = errors.append(TypeHeaderInvalidStructField(header.id, field.name))
-			RecordTypeHeader(FixedValueRecord, fields):
-				for field in fields:
-					if not resolved_shape_is_valid_struct_field(table, field.typ, []):
-						errors = errors.append(TypeHeaderInvalidFixedRecordField(header.id, field.name))
-			_:
-				void
-
-	errors
-
-
 private pure func type_shape_substitutions(
 	parameters: List[ResolvedTypeParameter],
 	args: List[ResolvedTypeShape],
@@ -2788,7 +2358,7 @@ private pure func record_value_layout_summary(
 										void
 									Some(header):
 										match header.shape:
-											RecordTypeHeader(_, _):
+											RecordTypeHeader(_):
 												result = { result |
 													dependencies = append_unique_int(
 														result.dependencies,
@@ -2895,7 +2465,7 @@ private pure func value_layout_references(
 								match table.headers.get(header_index):
 									Some(header):
 										match header.shape:
-											RecordTypeHeader(_, _):
+											RecordTypeHeader(_):
 												references = append_unique_int(
 													references,
 													header_index,
@@ -2970,7 +2540,7 @@ private pure func value_layout_summary_consumers(table: TypeHeaderTable) -> List
 
 	for header in table.headers:
 		match header.shape:
-			RecordTypeHeader(_, fields):
+			RecordTypeHeader(fields):
 				for dependency in value_layout_references(table, fields):
 					match consumers.get(dependency):
 						Some(existing):
@@ -3002,7 +2572,7 @@ private pure func complete_value_layout_summaries(
 
 	for header in table.headers:
 		match header.shape:
-			RecordTypeHeader(_, _):
+			RecordTypeHeader(_):
 				queue = queue.append(index)
 				queued = queued.set(index, True)
 			_:
@@ -3018,7 +2588,7 @@ private pure func complete_value_layout_summaries(
 				match table.headers.get(header_index):
 					Some(header):
 						match header.shape:
-							RecordTypeHeader(_, fields):
+							RecordTypeHeader(fields):
 								before = value_layout_summary_at(summaries, header_index)
 								after = record_value_layout_summary(
 									table,
@@ -3063,7 +2633,7 @@ private pure func recursive_value_layout_errors(table: TypeHeaderTable) -> List[
 
 	for header in table.headers:
 		match header.shape:
-			RecordTypeHeader(_, _):
+			RecordTypeHeader(_):
 				summary = value_layout_summary_at(summaries, index)
 				unresolved = unresolved.set(index, summary.dependencies.length())
 
@@ -3085,7 +2655,7 @@ private pure func recursive_value_layout_errors(table: TypeHeaderTable) -> List[
 
 	for header in table.headers:
 		match header.shape:
-			RecordTypeHeader(_, _):
+			RecordTypeHeader(_):
 				if unresolved.get_or(index, 0) == 0:
 					queue = queue.append(index)
 			_:
@@ -3111,7 +2681,7 @@ private pure func recursive_value_layout_errors(table: TypeHeaderTable) -> List[
 
 	for header in table.headers:
 		match header.shape:
-			RecordTypeHeader(_, _):
+			RecordTypeHeader(_):
 				if unresolved.get_or(index, 0) > 0:
 					errors = errors.append(
 						TypeHeaderRecursiveValueLayout(
@@ -3254,7 +2824,7 @@ private pure func header_shape_containment_facts(
 	shape: TypeHeaderShape,
 ) -> TypeContainmentFacts:
 	match shape:
-		RecordTypeHeader(_, fields):
+		RecordTypeHeader(fields):
 			var facts = EMPTY_TYPE_CONTAINMENT_FACTS
 
 			for field in fields:
@@ -3367,32 +2937,16 @@ pure func type_header_graph_build(
 			Err(table_errors):
 				Err(table_errors)
 			Ok(table):
-				match inline_layout_cycle(table):
-					Some(cycle):
-						Err([TypeHeaderInlineStorageCycle(
-									cycle,
-									type_header_cycle_display_names(
-										declaration_skeleton_graph_bound_graph(declaration_graph),
-										declaration_skeleton_graph_definition_table(
-											declaration_graph,
-										),
-										cycle,
-									),
-								)])
-					None:
-						struct_field_errors = invalid_struct_field_errors(table)
-						recursive_layout_errors = recursive_value_layout_errors(table)
-						validation_errors = struct_field_errors.concat(recursive_layout_errors)
-
-						if not validation_errors.is_empty():
-							Err(validation_errors)
-						else:
-							completed_table = complete_type_containment(table)
-							representation: TypeHeaderGraphRep = {
-								parameter_graph = parameter_graph,
-								table = completed_table
-							}
-							Ok(into_opaque TypeHeaderGraph(representation))
+				validation_errors = recursive_value_layout_errors(table)
+				if not validation_errors.is_empty():
+					Err(validation_errors)
+				else:
+					completed_table = complete_type_containment(table)
+					representation: TypeHeaderGraphRep = {
+						parameter_graph = parameter_graph,
+						table = completed_table
+					}
+					Ok(into_opaque TypeHeaderGraph(representation))
 
 
 private pure func type_header_graph_rep(graph: TypeHeaderGraph) -> TypeHeaderGraphRep:
@@ -3494,12 +3048,11 @@ pure func type_header_graph_public_builtin_headers_for_scope(
 
 private pure func record_type_header(header: TypeHeader) -> Option[AcceptedRecordHeader]:
 	match header.shape:
-		RecordTypeHeader(layout, fields):
+		RecordTypeHeader(fields):
 			Some(into_opaque AcceptedRecordHeader({
 						id = header.id,
 						source_name = header.source_name,
 						parameters = header.parameters,
-						layout = layout,
 						fields = fields,
 						containment = header.containment
 					}))
@@ -3723,10 +3276,6 @@ pure func record_type_header_parameters(
 	header: AcceptedRecordHeader,
 ) -> List[ResolvedTypeParameter]:
 	from_opaque AcceptedRecordHeader(header).parameters
-
-
-pure func record_type_header_layout(header: AcceptedRecordHeader) -> RecordLayout:
-	from_opaque AcceptedRecordHeader(header).layout
 
 
 pure func record_type_header_fields(header: AcceptedRecordHeader) -> List[TypeHeaderField]:
@@ -3971,38 +3520,6 @@ pure func type_header_error_message(
 				definition_table,
 				id,
 			).get_or("<unknown type>") + "' cannot have type parameters"
-		TypeHeaderInvalidStructTypeParameters(id):
-			"Struct '" + type_id_name(
-				definition_table,
-				id,
-			).get_or("<unknown type>") + "' cannot have type parameters"
-		TypeHeaderInvalidFixedRecordParameters(id):
-			"fixed record '" + type_id_name(
-				definition_table,
-				id,
-			).get_or("<unknown type>") + "' cannot have type or dimension parameters\n" + "help: use an ordinary record declaration when parameters are needed"
-		TypeHeaderEmptyStruct(id):
-			"Struct '" + type_id_name(
-				definition_table,
-				id,
-			).get_or("<unknown type>") + "' must have at least one field"
-		TypeHeaderEmptyFixedRecord(id):
-			"fixed record '" + type_id_name(
-				definition_table,
-				id,
-			).get_or("<unknown type>") + "' must have at least one field\n" + "help: add a field, or use an ordinary record for an empty value"
-		TypeHeaderInvalidStructField(id, field_name):
-			"Struct '" + type_id_name(
-				definition_table,
-				id,
-			).get_or(
-				"<unknown type>",
-			) + "' field '" + field_name + ("' has invalid storage: struct fields must be scalar values, fieldless enums, " + "or other structs\n" + "help: Use a record for strings, collections, functions, payload unions, " + "records, and tuples")
-		TypeHeaderInvalidFixedRecordField(id, field_name):
-			"fixed record '" + type_id_name(
-				definition_table,
-				id,
-			).get_or("<unknown type>") + "' field '" + field_name + "' cannot contain a managed value yet: fixed layout is shallow, but owned fields are not supported yet\n" + "help: use an ordinary record until managed fixed fields are supported"
 		TypeHeaderRecursiveValueLayout(id, is_direct):
 			if is_direct:
 				"Type '" + type_id_name(
@@ -4018,11 +3535,6 @@ pure func type_header_error_message(
 				).get_or(
 					"<unknown type>",
 				) + "' has a recursive value layout — every construction path requires another product value"
-		TypeHeaderInlineStorageCycle(cycle, names):
-			if cycle.is_empty():
-				"Infinitely sized value layout"
-			else:
-				"Infinitely sized value layout: " + names.join(" -> ")
 
 
 pure func type_header_error_span(
@@ -4030,15 +3542,9 @@ pure func type_header_error_span(
 	error: TypeHeaderError,
 ) -> Option[SourceLocation]:
 	match error:
-		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderInvalidStructTypeParameters(id) | TypeHeaderInvalidFixedRecordParameters(id) | TypeHeaderEmptyStruct(id) | TypeHeaderEmptyFixedRecord(id) | TypeHeaderInvalidStructField(id, _) | TypeHeaderInvalidFixedRecordField(id, _) | TypeHeaderRecursiveValueLayout(id, _):
+		TypeHeaderOwnerModuleMissing(id) | TypeHeaderDuplicateIdentity(id) | TypeHeaderParametersMissing(id) | TypeHeaderConstructorMissing(id, _) | TypeHeaderInvalidEnumTypeParameters(id) | TypeHeaderRecursiveValueLayout(id, _):
 			type_id_source_span(definition_table, id)
 		TypeHeaderFieldDefinitionMissing(_, _, span):
 			Some(span)
 		TypeHeaderResolutionError(resolution_error):
 			Some(type_shape_resolution_error_span(resolution_error))
-		TypeHeaderInlineStorageCycle(cycle, _):
-			match cycle.get(0):
-				Some(id):
-					type_id_source_span(definition_table, id)
-				None:
-					None

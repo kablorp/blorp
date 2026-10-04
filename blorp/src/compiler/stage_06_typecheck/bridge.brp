@@ -3,6 +3,10 @@
 -- Production compilation consumes typed values directly. Benchmarks and
 -- diagnostic tools use this adapter when they require a serialized artifact.
 import:
+	graph/range_record: ResolvedRangeFields
+	headers/accepted_record_graph: accepted_record_table_canonical_authority
+	type_system/accepted_record_authority: accepted_record_range_fields
+	type_system/accepted_semantic_catalog: accepted_semantic_catalog_record_table
 	../../lib/source: SourceFile, source_file
 	../bridge_protocol:
 		BRIDGE_SCHEMA_VERSION,
@@ -114,6 +118,7 @@ import:
 		ctfe_evaluate_dependency_global_graph,
 		ctfe_evaluate_program_global_replacements,
 		ctfe_evaluated_global_graph_metrics,
+		ctfe_evaluated_global_graph_range_fields,
 		ctfe_global_replacements_count,
 		ctfe_global_replacements_empty,
 		ctfe_global_replacements_for_definition_table,
@@ -142,6 +147,7 @@ import:
 		accepted_typecheck_graph_completed_globals,
 		accepted_typecheck_graph_declaration_skeleton_count,
 		accepted_typecheck_graph_import_modules,
+		accepted_typecheck_graph_semantic_catalog,
 		accepted_typecheck_module_body_registry,
 		body_check_outcome_typed_function,
 		body_check_registry_context_for_definition_id,
@@ -299,7 +305,7 @@ import:
 		importable_module_path,
 		importable_module_request_aliases,
 		importable_module_surface_value,
-	modules/module_view: module_view_import_bindings
+	modules/module_view: module_view_import_bindings, module_view_accepted_record_authority
 	set as Sets
 	state:
 		TypecheckState,
@@ -1297,6 +1303,7 @@ pure func typechecked_module_identity(
 record TypecheckedGraph {
 	module_table: ModuleTable,
 	definition_table: DefinitionTable,
+	range_fields: Option[ResolvedRangeFields],
 	target: TypecheckedModule,
 	modules: List[TypecheckedModule],
 	next_def_id: Int,
@@ -1345,6 +1352,7 @@ pure func typechecked_graph_view_for_identity(
 	Some({
 		module_table = graph.module_table,
 		definition_table = graph.definition_table,
+		range_fields = graph.range_fields,
 		target = target,
 		modules = modules.filter(
 			func(candidate): not module_ids_equal(candidate.module_id, target_module_id),
@@ -1356,7 +1364,7 @@ pure func typechecked_graph_view_for_identity(
 	})
 
 
-struct CtfeMaterializationMetrics {
+fixed record CtfeMaterializationMetrics {
 	dependency_body_checks: Int,
 	target_discovery_body_checks: Int,
 	reused_body_checks: Int,
@@ -1399,7 +1407,7 @@ private enum TypecheckedGraphModuleOrigin:
 	ReusedCtfeGraphModule
 
 
-private struct TypecheckedProgramOwnership {
+private fixed record TypecheckedProgramOwnership {
 	after_typecheck_unique: Bool,
 	after_ctfe_unique: Bool,
 	after_module_construction_unique: Bool
@@ -2170,6 +2178,16 @@ private pure func ctfe_imported_program_from_accepted_module(
 		}
 
 
+private pure func body_graph_range_fields(graph: BodyTypecheckGraph) -> Option[ResolvedRangeFields]:
+	match graph:
+		AcceptedBodyTypecheckGraph(accepted):
+			accepted_record_range_fields(accepted_record_table_canonical_authority(
+				accepted_semantic_catalog_record_table(accepted_typecheck_graph_semantic_catalog(accepted)),
+			))
+		RecoverableBodyTypecheckGraph(_):
+			None
+
+
 private pure func body_graph_typecheck_module(
 	graph: BodyTypecheckGraph,
 	scope: PreparedModuleScope,
@@ -2758,7 +2776,7 @@ private pure func ctfe_body_module_registries(
 		Some(registries)
 
 
-private struct CtfeAttemptedBodyChecks {
+private fixed record CtfeAttemptedBodyChecks {
 	dependency_checks: Int,
 	target_checks: Int
 }
@@ -3460,9 +3478,10 @@ private pure func evaluated_ctfe_globals_for_graph(
 	definition_table: DefinitionTable,
 	target_module_id: ModuleId,
 	ctfe_dependencies: List[PreparedCtfeDependency],
+	range_fields: Option[ResolvedRangeFields],
 ) -> Result[Option[CtfeEvaluatedGlobalGraph], CtfeEvalError]:
 	programs = available_ctfe_imported_programs_from_dependencies(ctfe_dependencies)
-	program_set = ctfe_imported_program_set(definition_table, programs)
+	program_set = ctfe_imported_program_set(definition_table, programs, range_fields)
 	graph ?= timed_ctfe_global_graph(definition_table, target_module_id, program_set)
 	Ok(Some(graph))
 
@@ -3510,6 +3529,7 @@ private pure func evaluated_typecheck_artifact(
 	import_bindings: List[ImportBinding],
 	imported_programs: Option[List[CtfeImportedProgram]],
 	evaluated_globals: Option[CtfeEvaluatedGlobalGraph],
+	range_fields: Option[ResolvedRangeFields],
 ) -> TypecheckCtfeArtifact:
 	if errors.length() != 0:
 		{
@@ -3532,7 +3552,7 @@ private pure func evaluated_typecheck_artifact(
 	else:
 		module_table = definition_table_module_table(definition_table)
 		imported_program_set = imported_programs.map(
-			func(programs): ctfe_imported_program_set(definition_table, programs),
+			func(programs): ctfe_imported_program_set(definition_table, programs, range_fields),
 		)
 
 		match (
@@ -3611,6 +3631,7 @@ private pure func typecheck_ctfe_artifact(
 		module_view_import_bindings(typed_result.state.module_view),
 		imported_programs,
 		evaluated_globals,
+		module_view_accepted_record_authority(typed_result.state.module_view).and_then(accepted_record_range_fields),
 	)
 
 
@@ -3898,6 +3919,7 @@ private pure func typechecked_reusable_ctfe_module(
 		artifact.import_bindings,
 		imported_programs,
 		evaluated_globals,
+		evaluated_globals.and_then(ctfe_evaluated_global_graph_range_fields),
 	)
 
 	typechecked_module_from_ctfe_artifact(scope, module_surface, ctfe_artifact)
@@ -4147,6 +4169,7 @@ private pure func rejected_typechecked_graph(
 		module_table = module_table,
 		definition_table = definition_table,
 		target = typechecked_rejected_module_with_id(target, module_id, diagnostics),
+		range_fields = None,
 		modules = [],
 		next_def_id = definition_index_seed_next_def_id(seed),
 		analysis_context = None,
@@ -4519,6 +4542,7 @@ private pure func prepare_typecheck_graph_from_completed_headers(
 				definition_table,
 				prepared_module_scope_id(target_scope),
 				ctfe_dependencies.modules,
+				body_graph_range_fields(typecheck_graph),
 			):
 				Err(error):
 					message = ctfe_eval_error_message(error)
@@ -4860,6 +4884,7 @@ private func prepare_typecheck_graph_from_completed_headers_with_trace(
 				definition_table,
 				prepared_module_scope_id(target_scope),
 				ctfe_dependencies.modules,
+				body_graph_range_fields(typecheck_graph),
 			):
 				Err(error):
 					message = ctfe_eval_error_message(error)
@@ -5135,6 +5160,7 @@ func typecheck_graph_with_metrics(request: TypecheckGraphRequest) -> TypecheckGr
 				graph = {
 					module_table = graph.module_table,
 					definition_table = graph.definition_table,
+					range_fields = body_graph_range_fields(graph.target.context.typecheck_graph),
 					target = target_result.module,
 					modules = modules,
 					next_def_id = definition_index_next_def_id(
@@ -5220,6 +5246,7 @@ private pure func typechecked_graph_from_prepared(
 			{
 				module_table = graph.module_table,
 				definition_table = graph.definition_table,
+				range_fields = body_graph_range_fields(graph.target.context.typecheck_graph),
 				target = typechecked_graph_module(
 					allow_debug_only_calls,
 					graph.target,

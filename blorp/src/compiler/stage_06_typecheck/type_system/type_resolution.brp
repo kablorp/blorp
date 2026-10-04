@@ -8,7 +8,15 @@ import:
 		module_view_graph_has_exact_catalog,
 		module_view_has_graph_source_names,
 		module_view_import_binding_count,
-	env: Env, env_disambiguate_nominal_dim_application, env_resolve_alias
+		module_view_accepted_alias_authority,
+		module_view_accepted_record_authority,
+		module_view_accepted_union_authority,
+	accepted_alias_authority: accepted_alias_find_type_params
+	accepted_record_authority: accepted_record_find_type_params
+	accepted_union_authority: accepted_union_find_type_params
+	env:
+		Env, env_disambiguate_nominal_dim_application, env_resolve_alias,
+		env_get_record, env_get_type_decl, env_get_alias, env_get_opaque_alias
 	semantic_type:
 		SemanticType(
 			SemanticArrayType, SemanticConstIntType, SemanticDimOpType, SemanticFunctionType,
@@ -16,7 +24,149 @@ import:
 			SemanticTupleType, SemanticTypeVar, SemanticVarDimsType,
 		),
 		canonical_module_type_name,
+		is_dimension_parameter_name,
 		split_qualified_type_name,
+
+
+private pure func accepted_nominal_parameters(
+	view: ModuleView,
+	env: Env,
+	name: String,
+) -> Option[List[String]]:
+	record_parameters = match module_view_accepted_record_authority(view):
+		Some(authority):
+			accepted_record_find_type_params(authority, name)
+		None:
+			match env_get_record(env, name):
+				Some((parameters, _)): Some(parameters)
+				None: None
+	if record_parameters.is_some():
+		record_parameters
+	else:
+		union_parameters = match module_view_accepted_union_authority(view):
+			Some(authority): accepted_union_find_type_params(authority, name)
+			None:
+				match env_get_type_decl(env, name):
+					Some((parameters, _)): Some(parameters)
+					None: None
+		if union_parameters.is_some():
+			union_parameters
+		else:
+			match module_view_accepted_alias_authority(view):
+				Some(authority):
+					accepted_alias_find_type_params(authority, name)
+				None:
+					match env_get_alias(env, name):
+						Some((parameters, _)): Some(parameters)
+						None:
+							match env_get_opaque_alias(env, name):
+								Some((parameters, _, _)): Some(parameters)
+								None: None
+
+
+private pure func nominal_dimension_list_if_changed(
+	view: ModuleView,
+	env: Env,
+	types: List[SemanticType],
+) -> Option[List[SemanticType]]:
+	var resolved = types
+	var changed: Bool = False
+	var index: Int = 0
+	for typ in types:
+		match nominal_dimensions_if_changed(view, env, typ):
+			Some(next):
+				resolved = resolved.set(index, next)
+				changed = True
+			None: void
+		index += 1
+	if changed:
+		Some(resolved)
+	else:
+		None
+
+
+private pure func nominal_dimensions_if_changed(
+	view: ModuleView,
+	env: Env,
+	typ: SemanticType,
+) -> Option[SemanticType]:
+	match typ:
+		SemanticArrayType(element, dims):
+			dimensions = nominal_dimension_list_if_changed(view, env, dims)
+			nominal = match element:
+				SemanticNamedType(name, []):
+					match accepted_nominal_parameters(view, env, name):
+						Some(parameters):
+							if (
+								parameters.length() > 0
+								and parameters.all(is_dimension_parameter_name)
+								and parameters.length() == dims.length()
+							):
+								Some(SemanticNamedType(name, dimensions.get_or(dims)))
+							else:
+								None
+						None: None
+				_: None
+			match nominal:
+				Some(_): nominal
+				None:
+					resolved_element = nominal_dimensions_if_changed(view, env, element)
+					if resolved_element.is_some() or dimensions.is_some():
+						Some(SemanticArrayType(
+							resolved_element.get_or(element),
+							dimensions.get_or(dims),
+						))
+					else:
+						None
+		SemanticNamedType(name, args):
+			match nominal_dimension_list_if_changed(view, env, args):
+				Some(next): Some(SemanticNamedType(name, next))
+				None: None
+		SemanticFunctionType(is_pure, params, result):
+			next_params = nominal_dimension_list_if_changed(view, env, params)
+			next_result = nominal_dimensions_if_changed(view, env, result)
+			if next_params.is_some() or next_result.is_some():
+				Some(SemanticFunctionType(
+					is_pure,
+					next_params.get_or(params),
+					next_result.get_or(result),
+				))
+			else:
+				None
+		SemanticTupleType(elements):
+			match nominal_dimension_list_if_changed(view, env, elements):
+				Some(next): Some(SemanticTupleType(next))
+				None: None
+		SemanticRangeType(inner):
+			match nominal_dimensions_if_changed(view, env, inner):
+				Some(next): Some(SemanticRangeType(next))
+				None: None
+		SemanticDimOpType(op, left, right):
+			next_left = nominal_dimensions_if_changed(view, env, left)
+			next_right = nominal_dimensions_if_changed(view, env, right)
+			if next_left.is_some() or next_right.is_some():
+				Some(SemanticDimOpType(op, next_left.get_or(left), next_right.get_or(right)))
+			else:
+				None
+		_: None
+
+
+-- Headers resolve against declaration skeletons; body annotations must use
+-- their installed accepted authority instead. An authority miss cannot revive
+-- an obsolete environment declaration. Preserve unchanged type trees and lists.
+pure func resolve_nominal_dimension_applications(
+	view: ModuleView,
+	env: Env,
+	typ: SemanticType,
+) -> SemanticType:
+	if (
+		module_view_accepted_record_authority(view).is_none()
+		and module_view_accepted_union_authority(view).is_none()
+		and module_view_accepted_alias_authority(view).is_none()
+	):
+		env_disambiguate_nominal_dim_application(env, typ)
+	else:
+		nominal_dimensions_if_changed(view, env, typ).get_or(typ)
 
 
 enum AliasPolicy:

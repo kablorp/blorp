@@ -2536,6 +2536,7 @@ bool blorp_setenv(const blorp_String* name, const blorp_String* value);
 
 // Memory Stats / Profiling
 blorp_MemStats blorp_get_mem_stats(void);
+long blorp_read_memory_counter(long counter);
 void blorp_reset_mem_stats(void);
 void blorp_compiler_memory_checkpoint_c(const char* phase);
 long blorp_runtime_total_allocations_c(void);

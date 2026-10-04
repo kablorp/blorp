@@ -1,7 +1,6 @@
 import:
+	../../../src/compiler/stage_09_core/type_policy as FieldPolicy
 	../../../src/compiler/stage_02_lex/name_table: NameId, name_id_from_interned_index, name_ids_equal
-	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest:
-		DeclaredAbiType(DeclaredAbiRange),
 	../../../src/compiler/stage_09_core/c_type_layout: type_requires_release
 	../../../src/compiler/stage_04_modules/loaded_module:
 		ModuleOrigin(NativePackageModule, SourcePackageModule, StdlibModule, UserModule),
@@ -52,7 +51,6 @@ import:
 			TraitDecl,
 			TypeAliasDecl,
 			UnionDecl,
-			ValueRecordDecl,
 		),
 		CoreDictLiteralEntry,
 		CoreDirectRuntimeArgs(DirectRuntimeArgsAppendListParallelLayout),
@@ -95,7 +93,6 @@ import:
 			LiteralExpr,
 			LiteralMatchExpr,
 			LogicalExpr,
-			RangeExpr,
 			RecordExpr,
 			RecordConstructExpr,
 			RecordCowUpdateExpr,
@@ -277,7 +274,6 @@ import:
 			TupleType,
 			TypeParameterType,
 			UnionType,
-			ValueRecordType,
 			VoidType,
 		),
 		CoreUnaryOp(NotOp),
@@ -292,10 +288,7 @@ import:
 			StackOptionRepresentation,
 			StackResultRepresentation,
 		),
-		CoreValueRecordDecl,
-		CoreValueRecordField,
-		CoreValueRecordOrigin(LegacyStructOrigin, FixedRecordOrigin),
-		CoreInlineFieldOwnership(OwnedArcInlineField, TrivialInlineField),
+		CoreHeapRecordField,
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_constructor_match_test_to_json,
@@ -307,8 +300,8 @@ import:
 		core_module_origin_to_json,
 		core_function_to_json,
 		core_program_to_json,
-		core_value_record_decl_to_json,
-		core_value_record_field_to_json,
+		core_heap_record_decl_to_json,
+		core_heap_record_field_to_json,
 		core_select_to_json,
 		core_set_alloc_to_json,
 		core_type_to_json,
@@ -322,8 +315,8 @@ import:
 		decode_core_module_origin_json,
 		decode_core_literal_json,
 		decode_core_program_json,
-		decode_core_value_record_decl_json,
-		decode_core_value_record_field_json,
+		decode_core_heap_record_decl_json,
+		decode_core_heap_record_field_json,
 		decode_core_select_json,
 		decode_core_set_alloc_json,
 		decode_core_type_json,
@@ -558,11 +551,11 @@ pure func tensor_float32_type() -> CoreType:
 
 
 pure func tensor_accel_type() -> CoreType:
-	tensor_type_for(ValueRecordType("Accel"), [2])
+	tensor_type_for(HeapRecordType("Accel"), [2])
 
 
 pure func point_type() -> CoreType:
-	ValueRecordType("Point")
+	HeapRecordType("Point")
 
 
 pure func tensor_point_type() -> CoreType:
@@ -743,33 +736,31 @@ pure func range_loop_binder() -> CoreLoopBinder:
 	}
 
 
-pure func value_record_field(name: String, typ: CoreType) -> CoreValueRecordField:
+pure func managed_record_field(name: String, typ: CoreType) -> CoreHeapRecordField:
 	{
 		name = name,
 		ref = core_field_ref(0),
 		typ = typ,
-		ownership = TrivialInlineField
+		release_policy = FieldPolicy.cleanup_release_policy_for_type(typ)
 	}
 
 
-pure func range_record_decl() -> CoreValueRecordDecl:
+pure func range_record_decl() -> CoreHeapRecordDecl:
 	{
-		abi_type = Some(DeclaredAbiRange),
-		origin = LegacyStructOrigin,
+		abi_type = None,
 		name = "Range",
 		type_params = [],
-		fields = [value_record_field("start", int_type()), value_record_field("end", int_type())],
+		fields = [managed_record_field("start", int_type()), managed_record_field("end", int_type())],
 		loc = sample_loc()
 	}
 
 
-pure func point_record_decl() -> CoreValueRecordDecl:
+pure func point_record_decl() -> CoreHeapRecordDecl:
 	{
 		abi_type = None,
-		origin = LegacyStructOrigin,
 		name = "Point",
 		type_params = [],
-		fields = [value_record_field("x", int_type()), value_record_field("y", int_type())],
+		fields = [managed_record_field("x", int_type()), managed_record_field("y", int_type())],
 		loc = sample_loc()
 	}
 
@@ -798,15 +789,14 @@ pure func box_heap_record_decl() -> CoreHeapRecordDecl:
 
 
 -- Deliberately invalid ownership shape: only the record-reuse JSON rejection uses it.
-pure func box_value_record_decl() -> CoreValueRecordDecl:
+pure func box_managed_record_decl() -> CoreHeapRecordDecl:
 	{
 		abi_type = None,
-		origin = LegacyStructOrigin,
 		name = "Box",
 		type_params = [],
 		fields = [
-			value_record_field("count", int_type()),
-			value_record_field("label", string_type()),
+			managed_record_field("count", int_type()),
+			managed_record_field("label", string_type()),
 		],
 		loc = sample_loc()
 	}
@@ -862,7 +852,7 @@ pure func sample_program() -> CoreProgram:
 pure func early_declarations_program() -> CoreProgram:
 	{
 		decls = [
-			ValueRecordDecl({ range_record_decl() | type_params = ["T"] }),
+			HeapRecordDecl({ range_record_decl() | type_params = ["T"] }),
 			HeapRecordDecl({ box_heap_record_decl() | type_params = ["T"] }),
 			EnumDecl({ color_enum_decl() | type_params = ["T"] }),
 			UnionDecl({ choice_union_decl() | type_params = ["T"] }),
@@ -3614,11 +3604,13 @@ pure func resource_program() -> CoreProgram:
 	}
 
 
-pure func value_record_range_program() -> CoreProgram:
-	range_expr: CoreExpr = RangeExpr(
-		LiteralExpr(IntLiteral(1), int_type(), sample_loc()),
-		LiteralExpr(IntLiteral(4), int_type(), sample_loc()),
-		range_type(),
+pure func managed_record_range_program() -> CoreProgram:
+	range_expr: CoreExpr = RecordExpr(
+		[
+			{ref = core_field_ref(0), name = "start", value = LiteralExpr(IntLiteral(1), int_type(), sample_loc())},
+			{ref = core_field_ref(1), name = "end", value = LiteralExpr(IntLiteral(4), int_type(), sample_loc())},
+		],
+		HeapRecordType("Range"),
 		sample_loc(),
 	)
 	body: CoreExpr = FieldExpr(range_expr, "start", core_field_ref(0), int_type(), sample_loc())
@@ -3638,13 +3630,13 @@ pure func value_record_range_program() -> CoreProgram:
 	}
 
 	{
-		decls = [ValueRecordDecl(range_record_decl()), FunctionDecl(func_info)],
+		decls = [HeapRecordDecl(range_record_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
 
 
-pure func value_record_construct_program() -> CoreProgram:
+pure func managed_record_construct_program() -> CoreProgram:
 	body: CoreExpr = RecordConstructExpr(
 		"Point",
 		[
@@ -3678,13 +3670,13 @@ pure func value_record_construct_program() -> CoreProgram:
 	}
 
 	{
-		decls = [ValueRecordDecl(point_record_decl()), FunctionDecl(func_info)],
+		decls = [HeapRecordDecl(point_record_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
 
 
-pure func value_record_literal_program() -> CoreProgram:
+pure func managed_record_literal_program() -> CoreProgram:
 	body: CoreExpr = RecordExpr(
 		[
 			{
@@ -3717,13 +3709,13 @@ pure func value_record_literal_program() -> CoreProgram:
 	}
 
 	{
-		decls = [ValueRecordDecl(point_record_decl()), FunctionDecl(func_info)],
+		decls = [HeapRecordDecl(point_record_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
 
 
-pure func value_record_update_program_with_fields(
+pure func managed_record_update_program_with_fields(
 	fields: List[CoreRecordFieldValue],
 	include_declaration: Bool,
 ) -> CoreProgram:
@@ -3761,7 +3753,7 @@ pure func value_record_update_program_with_fields(
 	}
 
 	declarations: List[CoreDecl] = if include_declaration:
-		[ValueRecordDecl(point_record_decl()), FunctionDecl(func_info)]
+		[HeapRecordDecl(point_record_decl()), FunctionDecl(func_info)]
 	else:
 		[FunctionDecl(func_info)]
 
@@ -3772,14 +3764,14 @@ pure func value_record_update_program_with_fields(
 	}
 
 
-pure func value_record_update_program() -> CoreProgram:
+pure func managed_record_update_program() -> CoreProgram:
 	point_var: CoreVar = {
 		name = "point",
 		id = 0,
 		def_id = None,
 		origin = AuthoredBinder
 	}
-	value_record_update_program_with_fields(
+	managed_record_update_program_with_fields(
 		[
 			{
 				name = "x",
@@ -3803,7 +3795,7 @@ pure func value_record_update_program() -> CoreProgram:
 
 
 pure func empty_record_update_program() -> CoreProgram:
-	empty_type: CoreType = ValueRecordType("Empty")
+	empty_type: CoreType = HeapRecordType("Empty")
 	empty_var: CoreVar = {
 		name = "empty",
 		id = 0,
@@ -3819,9 +3811,8 @@ pure func empty_record_update_program() -> CoreProgram:
 
 	{
 		decls = [
-			ValueRecordDecl({
+			HeapRecordDecl({
 				abi_type = None,
-				origin = LegacyStructOrigin,
 				name = "Empty",
 				type_params = [],
 				fields = [],
@@ -3897,7 +3888,7 @@ pure func inline_struct_tensor_literal_program() -> CoreProgram:
 	}
 
 	{
-		decls = [ValueRecordDecl(point_record_decl()), FunctionDecl(func_info)],
+		decls = [HeapRecordDecl(point_record_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
@@ -3955,7 +3946,7 @@ pure func tensor_for_program() -> CoreProgram:
 	}
 
 	{
-		decls = [ValueRecordDecl(point_record_decl()), FunctionDecl(func_info)],
+		decls = [HeapRecordDecl(point_record_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
@@ -4335,7 +4326,7 @@ pure func struct_tuple_construct_program() -> CoreProgram:
 	}
 
 	{
-		decls = [ValueRecordDecl(point_record_decl()), FunctionDecl(func_info)],
+		decls = [HeapRecordDecl(point_record_decl()), FunctionDecl(func_info)],
 		foreign_includes = [],
 		source_files = [{ path = "main.brp", module_name = "main.brp" }]
 	}
@@ -5162,10 +5153,10 @@ pure func test_set_alloc_json_schema_contract() -> Bool:
 
 
 pure func test_trait_hash_constructor_json_round_trips_key_type() -> Bool:
-	encoded: JsonValue = core_set_alloc_to_json(TraitHashContainerConstructor(ValueRecordType("Point")))
+	encoded: JsonValue = core_set_alloc_to_json(TraitHashContainerConstructor(HeapRecordType("Point")))
 
 	match decode_core_set_alloc_json(encoded, "set_alloc"):
-		Ok(TraitHashContainerConstructor(ValueRecordType(name))):
+		Ok(TraitHashContainerConstructor(HeapRecordType(name))):
 			name == "Point" and encoded.to_string().contains("\"kind\":\"trait\"")
 		_:
 			False
@@ -5311,99 +5302,41 @@ pure func test_core_program_json_round_trips_global_declaration() -> Bool:
 	program_round_trips(global_program())
 
 
-pure func test_core_program_json_round_trips_value_record_range() -> Bool:
-	program_round_trips(value_record_range_program())
+pure func test_core_program_json_round_trips_managed_record_range() -> Bool:
+	program_round_trips(managed_record_range_program())
 
 
-pure func test_core_value_record_metadata_json_round_trips_and_fails_closed() -> Bool:
-	decl: CoreValueRecordDecl = { range_record_decl() | origin = FixedRecordOrigin }
-	encoded: JsonValue = core_value_record_decl_to_json(decl)
-	field_encoded: JsonValue = core_value_record_field_to_json(value_record_field("x", int_type()))
-	decl_round_trip: Bool = match decode_core_value_record_decl_json(encoded, "decl"):
-		Ok(decoded):
-			(
-				decoded.origin == FixedRecordOrigin
-				and core_value_record_decl_to_json(decoded).to_string() == encoded.to_string()
-			)
-		Err(_):
-			False
-	field_round_trip: Bool = match decode_core_value_record_field_json(field_encoded, "field"):
-		Ok(decoded):
-			decoded.ownership == TrivialInlineField
-		Err(_):
-			False
-	trivial_field: CoreValueRecordField = value_record_field("name", NamedType("String", []))
-	owned_field: CoreValueRecordField = { trivial_field | ownership = OwnedArcInlineField }
-	owned_encoded: JsonValue = core_value_record_field_to_json(owned_field)
-	owned_round_trip: Bool = match decode_core_value_record_field_json(owned_encoded, "field"):
-		Ok(decoded):
-			(
-				decoded.ownership == OwnedArcInlineField
-				and core_value_record_field_to_json(decoded).to_string() == owned_encoded.to_string()
-			)
-		Err(_):
-			False
-	missing_origin: Bool = match encoded:
+pure func test_core_heap_record_metadata_json_round_trips_and_fails_closed() -> Bool:
+	decl: CoreHeapRecordDecl = range_record_decl()
+	encoded: JsonValue = core_heap_record_decl_to_json(decl)
+	owned_field: CoreHeapRecordField = { managed_record_field("label", string_type()) | release_policy = ArcReleasePolicy }
+	field_encoded: JsonValue = core_heap_record_field_to_json(owned_field)
+	decl_round_trip = match decode_core_heap_record_decl_json(encoded, "decl"):
+		Ok(decoded): core_heap_record_decl_to_json(decoded).to_string() == encoded.to_string()
+		Err(_): False
+	field_round_trip = match decode_core_heap_record_field_json(field_encoded, "field"):
+		Ok(decoded): decoded.release_policy == ArcReleasePolicy
+		Err(_): False
+	missing_policy = match field_encoded:
 		JsonObject(fields):
-			malformed: JsonValue = JsonObject(fields.filter(
-				pure func(field: (String, JsonValue)) -> Bool: field[0] != "origin",
-			))
-			match decode_core_value_record_decl_json(malformed, "decl"):
-				Err(error):
-					core_json_error_to_string(error) == "missing Core JSON field at decl: origin"
-				Ok(_):
-					False
-		_:
-			False
-	missing_ownership: Bool = match field_encoded:
-		JsonObject(fields):
-			malformed: JsonValue = JsonObject(fields.filter(
-				pure func(field: (String, JsonValue)) -> Bool: field[0] != "ownership",
-			))
-			match decode_core_value_record_field_json(malformed, "field"):
-				Err(error):
-					core_json_error_to_string(error) == "missing Core JSON field at field: ownership"
-				Ok(_):
-					False
-		_:
-			False
-	unknown_origin: Bool = match encoded:
-		JsonObject(fields):
-			malformed: JsonValue = JsonObject(fields.filter(
-				pure func(field: (String, JsonValue)) -> Bool: field[0] != "origin",
-			).append(("origin", JsonString("future_origin"))))
-			match decode_core_value_record_decl_json(malformed, "decl"):
-				Err(CoreUnsupportedTag(path, tag)):
-					path == "decl.origin" and tag == "future_origin"
-				_:
-					False
-		_:
-			False
-	unknown_ownership: Bool = match field_encoded:
-		JsonObject(fields):
-			malformed: JsonValue = JsonObject(fields.filter(
-				pure func(field: (String, JsonValue)) -> Bool: field[0] != "ownership",
-			).append(("ownership", JsonString("future_ownership"))))
-			match decode_core_value_record_field_json(malformed, "field"):
-				Err(CoreUnsupportedTag(path, tag)):
-					path == "field.ownership" and tag == "future_ownership"
-				_:
-					False
-		_:
-			False
-	decl_round_trip and field_round_trip and owned_round_trip and missing_origin and missing_ownership and unknown_origin and unknown_ownership
+			malformed = JsonObject(fields.filter(func(field): field[0] != "release_policy"))
+			match decode_core_heap_record_field_json(malformed, "field"):
+				Err(error): core_json_error_to_string(error).contains("release_policy")
+				Ok(_): False
+		_: False
+	decl_round_trip and field_round_trip and missing_policy
 
 
-pure func test_core_program_json_round_trips_value_record_construct() -> Bool:
-	program_round_trips(value_record_construct_program())
+pure func test_core_program_json_round_trips_managed_record_construct() -> Bool:
+	program_round_trips(managed_record_construct_program())
 
 
-pure func test_core_program_json_round_trips_value_record_literal() -> Bool:
-	program_round_trips(value_record_literal_program())
+pure func test_core_program_json_round_trips_managed_record_literal() -> Bool:
+	program_round_trips(managed_record_literal_program())
 
 
-pure func test_core_program_json_round_trips_value_record_update() -> Bool:
-	program: CoreProgram = value_record_update_program()
+pure func test_core_program_json_round_trips_managed_record_update() -> Bool:
+	program: CoreProgram = managed_record_update_program()
 	encoded: String = core_program_to_json(program).to_string()
 	encoded.contains("\"kind\":\"record_update\"") and program_round_trips(program)
 
@@ -5592,9 +5525,9 @@ pure func test_core_json_rejects_non_heap_record_reuse_type() -> Bool:
 		origin = AuthoredBinder
 	}
 	expr: CoreExpr = RecordReuseExpr(
-		VarExpr(point_var, point_type(), sample_loc()),
+		VarExpr(point_var, int_type(), sample_loc()),
 		[],
-		point_type(),
+		int_type(),
 		sample_loc(),
 	)
 
@@ -5644,14 +5577,14 @@ pure func test_core_program_json_rejects_incomplete_record_reuse_shape() -> Bool
 			False
 
 
-pure func test_core_program_json_rejects_value_record_declaration_for_reuse() -> Bool:
+pure func test_core_program_json_rejects_missing_record_declaration_for_reuse() -> Bool:
 	program: CoreProgram = heap_record_reuse_program()
 	var malformed_decls: List[CoreDecl] = []
 
 	for decl in program.decls:
 		match decl:
 			HeapRecordDecl(_):
-				malformed_decls = malformed_decls.append(ValueRecordDecl(box_value_record_decl()))
+				void
 			_:
 				malformed_decls = malformed_decls.append(decl)
 
@@ -5691,7 +5624,7 @@ pure func test_core_json_rejects_mismatched_record_update_base_type() -> Bool:
 		origin = AuthoredBinder
 	}
 	expr: CoreExpr = RecordUpdateExpr(
-		VarExpr(point_var, HeapRecordType("Point"), sample_loc()),
+		VarExpr(point_var, HeapRecordType("OtherPoint"), sample_loc()),
 		[],
 		point_type(),
 		sample_loc(),
@@ -5716,7 +5649,7 @@ pure func record_update_shape_is_rejected(
 	fields: List[CoreRecordFieldValue],
 	include_declaration: Bool,
 ) -> Bool:
-	program: CoreProgram = value_record_update_program_with_fields(fields, include_declaration)
+	program: CoreProgram = managed_record_update_program_with_fields(fields, include_declaration)
 
 	match decode_core_program_json(core_program_to_json(program)):
 		Err(CoreInvalidRecordUpdateShape(path, detail)):
@@ -6617,24 +6550,24 @@ tests: TestSuite = {
 			test_core_program_json_round_trips_global_declaration,
 		),
 		(
-			"Core program JSON round trips value record range",
-			test_core_program_json_round_trips_value_record_range,
+			"Core program JSON round trips managed record range",
+			test_core_program_json_round_trips_managed_record_range,
 		),
 		(
-			"Core value record metadata round trips and fails closed",
-			test_core_value_record_metadata_json_round_trips_and_fails_closed,
+			"Core managed record metadata round trips and fails closed",
+			test_core_heap_record_metadata_json_round_trips_and_fails_closed,
 		),
 		(
-			"Core program JSON round trips value record construct",
-			test_core_program_json_round_trips_value_record_construct,
+			"Core program JSON round trips managed record construct",
+			test_core_program_json_round_trips_managed_record_construct,
 		),
 		(
-			"Core program JSON round trips value record literal",
-			test_core_program_json_round_trips_value_record_literal,
+			"Core program JSON round trips managed record literal",
+			test_core_program_json_round_trips_managed_record_literal,
 		),
 		(
-			"Core program JSON round trips value record update",
-			test_core_program_json_round_trips_value_record_update,
+			"Core program JSON round trips managed record update",
+			test_core_program_json_round_trips_managed_record_update,
 		),
 		(
 			"Core program JSON round trips heap record reuse",
@@ -6681,8 +6614,8 @@ tests: TestSuite = {
 			test_core_program_json_rejects_incomplete_record_reuse_shape,
 		),
 		(
-			"Core program JSON rejects value-record declarations for reuse",
-			test_core_program_json_rejects_value_record_declaration_for_reuse,
+			"Core program JSON rejects managed-record declarations for reuse",
+			test_core_program_json_rejects_missing_record_declaration_for_reuse,
 		),
 		(
 			"Core program JSON round trips empty record update",

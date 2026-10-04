@@ -1,8 +1,6 @@
--- Allocation budgets that guard the builder threading rules (see
--- `tables/builder.brp`). A routine that breaks a rule copies the builder
--- and then every table it appends to, once per call: thousands of
--- allocations where table growth alone needs a few hundred. Each budget sits
--- well above growth and well below one copy per statement or row.
+-- Exact per-family pins guard builder threading with managed discovery rows.
+-- The fixed tolerance remains far below one extra copy per 2,000 repeats;
+-- larger admitted row costs do not increase tolerated table-copy traffic.
 import:
 	../../support/raw_rows: append_definition
 	../../../../src/compiler_new/stage_01_discovery/pipeline: load_module
@@ -24,7 +22,10 @@ import:
 		ModuleReach(RootModule),
 		Visibility(PublicVisibility),
 	../../../../src/compiler_new/stage_01_discovery/tables/span: pack_span
-	memory: MemStats, get_mem_stats, reset_mem_stats
+	memory:
+		MemoryCounter(ManagedAllocations, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
+		reset_mem_stats,
 	test: TestSuite
 
 
@@ -32,14 +33,6 @@ import:
 Statements or rows per measured run.
 ---
 REPEATS: Int = 2000
-
----
-The allocations a run may make when its construct allocates nothing of its
-own: table growth and per-module setup stay under it, while one copy per
-statement or row would exceed it several times.
----
-ALLOCATION_BUDGET: Int = 500
-
 
 ---
 A module that is `prefix` followed by `item` repeated `REPEATS` times; the
@@ -62,6 +55,8 @@ rejected it or lost its repeated items: either would pass a budget vacuously.
 ---
 func parse_allocations(text: String) -> Option[Int]:
 	reset_mem_stats()
+	active_before = read_memory_counter(MemoryStatsActive)
+	oracle_before = read_memory_counter(OracleStatsActive)
 	builder: DiscoveryBuilder = load_module(
 		empty_discovery_builder(),
 		{
@@ -72,19 +67,17 @@ func parse_allocations(text: String) -> Option[Int]:
 		RootModule,
 		text,
 	)
-	stats: MemStats = get_mem_stats()
-
-	if builder.diagnostics.length() == 0 and builder.tokens.length() > REPEATS:
-		Some(stats.total_allocations)
+	if (
+		builder.diagnostics.length() == 0
+		and builder.tokens.length() > REPEATS
+		and active_before == 1
+		and oracle_before == 1
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	):
+		Some(read_memory_counter(ManagedAllocations))
 	else:
 		None
-
-
----
-Whether `allocations` shows the counters ran and stayed within the budget.
----
-pure func within_budget(allocations: Int) -> Bool:
-	allocations > 0 and allocations < ALLOCATION_BUDGET
 
 
 ---
@@ -95,23 +88,15 @@ A builder or table copy per use adds at least one allocation per repeat,
 EXACT_TOLERANCE: Int = 100
 
 
----
-Whether parsing `item` after `prefix`, `REPEATS` times, allocates nothing
-beyond table growth: the sharpest guard, for constructs with no per-use
-allocation of their own.
----
-func family_within_budget(prefix: String, item: String) -> Bool:
-	match parse_allocations(repeated_text(prefix, item)):
-		Some(allocations):
-			within_budget(allocations)
-		None:
-			False
+-- Two list-growth sequences plus one DefinitionRow, NodeRow, and child span
+-- record per iteration: 6,000 owned products and 20 growth allocations.
+private ROW_APPEND_ALLOCATIONS: Int = 6020
 
 
 ---
 Whether parsing `item` after `prefix`, `REPEATS` times, allocates within
-`EXACT_TOLERANCE` of `expected_allocations`, both ways. For the few families
-whose construct allocates values of its own per use. The count is measured,
+`EXACT_TOLERANCE` of `expected_allocations`, both ways. Managed discovery rows
+allocate per use without enlarging the tolerated overhead. The count is measured,
 not derived: a drop is as worth noticing as a rise, so tighten the pin when
 an allocation goes away.
 ---
@@ -127,13 +112,6 @@ func family_allocates(prefix: String, item: String, expected_allocations: Int) -
 
 
 ---
-Whether parsing `statement` repeated in one function body stays within budget.
----
-func statement_family_within_budget(statement: String) -> Bool:
-	family_within_budget("func f(a, b, c, x):\n", statement)
-
-
----
 As `family_allocates`, for statements in one function body.
 ---
 func statement_family_allocates(statement: String, expected_allocations: Int) -> Bool:
@@ -141,147 +119,135 @@ func statement_family_allocates(statement: String, expected_allocations: Int) ->
 
 
 func test_parsing_repeated_expression_statements_copies_no_table() -> Bool:
-	statement_family_within_budget("\tx = a + b * c\n")
-
+	statement_family_allocates("\tx = a + b * c\n", 58152)
 
 func test_parsing_repeated_blocks_and_calls_copies_no_table() -> Bool:
-	statement_family_within_budget("\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n")
-
+	statement_family_allocates("\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n", 150159)
 
 func test_parsing_repeated_matches_and_patterns_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\tx = match a:\n\t\tSome(v) | Other(v): v\n\t\t(l, 1): l\n\t\t[h, ...t]: h\n\t\t_: b\n",
+		262172,
 	)
-
 
 func test_parsing_repeated_selects_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\tselect:\n\t\tv from a:\n\t\t\tv\n\t\tsealed b:\n\t\t\tx\n\t\t_ after 5:\n\t\t\tc\n",
+		170163,
 	)
 
-
--- Pinned to the measured 4123 allocations: about 2 per repeat. A concurrent block and a concurrently loop allocate a couple of values of their own per use. Where they come from has not been investigated.
 func test_parsing_repeated_concurrent_blocks_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tconcurrent(timeout: 100, max_threads: 2):\n\t\tl = f(a)\n\t\tr = f(b)\n\tfor p in a concurrently(limit: 4):\n\t\tf(p)\n",
-		4123,
+		290174,
 	)
 
 
 func test_parsing_repeated_lambdas_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\ty = func(p, q: Int) -> Int: p + q\n\tz = pure func(p):\n\t\tw = p\n\t\tw\n",
+		206168,
 	)
 
-
--- Pinned to the measured 66131 allocations: about 33 per repeat. An interpolated string with two holes allocates for its pieces and holes, and for each hole's scan frames and each open piece's start (a union and an `Option` where integers stood for them). The rest has not been investigated.
 func test_parsing_repeated_interpolations_copies_no_table() -> Bool:
 	-- The `${` is split across two literals so this file does not interpolate it.
-	statement_family_allocates("\ty = \"a $" + "{a} b $" + "{b + c}\"\n", 66131)
+	statement_family_allocates("\ty = \"a $" + "{a} b $" + "{b + c}\"\n", 164192)
 
 
 func test_parsing_repeated_record_literals_and_updates_copies_no_table() -> Bool:
-	statement_family_within_budget("\ty = {k = a, m = b}\n\tz = {y | k = c, m = a}\n")
-
+	statement_family_allocates("\ty = {k = a, m = b}\n\tz = {y | k = c, m = a}\n", 166165)
 
 func test_parsing_repeated_loops_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\tfor i in 0..a:\n\t\tf(i)\n\twhile a > b:\n\t\tbreak\n\tfor (k, v) in c:\n\t\tcontinue\n",
+		238160,
 	)
 
-
 func test_parsing_repeated_question_binds_copies_no_table() -> Bool:
-	statement_family_within_budget("\tv ?= f(a)\n\tvar w = v\n\tw += 1\n")
+	statement_family_allocates("\tv ?= f(a)\n\tvar w = v\n\tw += 1\n", 102163)
 
-
--- Pinned to the measured 22212 allocations: about 11 per repeat. A documented generic function with a dimension constraint allocates for its parts. Where they come from has not been investigated.
 func test_parsing_repeated_function_declarations_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"---\nAdds.\n---\npure func g[T: Orderable](p: T, q: Int[#N]) -> List[T] where #N == 3:\n\tp\n\n\n",
-		22212,
+		232226,
 	)
 
 
 func test_parsing_repeated_type_declarations_copies_no_table() -> Bool:
-	family_within_budget(
+	family_allocates(
 		"",
 		"record R {\n\tfirst: Int,\n\tsecond: Int\n}\n\n\nunion U:\n\tA(Int)\n\tB\n\n\nenum E:\n\tX\n\tY\n\n\ntype alias Al = Int\n\n\n",
+		300126,
 	)
-
 
 func test_parsing_repeated_trait_and_impl_declarations_copies_no_table() -> Bool:
-	family_within_budget(
+	family_allocates(
 		"",
 		"trait Shape:\n\tpure func area(value: Self) -> Int\n\n\nimplements Shape for R:\n\tpure func area(r: R) -> Int:\n\t\t1\n\n\n",
+		248186,
 	)
 
-
--- Pinned to the measured 8102 allocations: about 4 per repeat. An import block with two items allocates for its items. Where they come from has not been investigated.
 func test_parsing_repeated_imports_copies_no_table() -> Bool:
-	family_within_budget("import:\n", "\tmath: sin, cos\n\tlist as L: List(Cons, Nil)\n")
-
+	family_allocates("import:\n", "\tmath: sin, cos\n\tlist as L: List(Cons, Nil)\n", 90126)
 
 func test_parsing_repeated_collection_literals_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\ty = {1 => 2, 3 => 4}\n\tz = {a, b}\n\tw = (a, b, c)\n\tv = [a, b]\n\tu = ()\n\tt = (a)\n",
+		316179,
 	)
-
 
 func test_parsing_repeated_tuple_list_and_qualified_patterns_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\tx = match a:\n\t\t(l, r): l\n\t\tOption.Some(v): v\n\t\tOption.None: b\n\t\t[]: c\n\t\t[h, ...t]: h\n\t\tSome(Some(v)) | Other(v): v\n\t\t-1: a\n\t\t\"s\": b\n\t\t_: c\n",
+		474180,
 	)
-
 
 func test_parsing_repeated_with_scopes_copies_no_table() -> Bool:
-	statement_family_within_budget("\twith r = f(a):\n\t\tr\n\twith t ?= f(b) on e => e:\n\t\tt\n")
-
+	statement_family_allocates("\twith r = f(a):\n\t\tr\n\twith t ?= f(b) on e => e:\n\t\tt\n", 182165)
 
 func test_parsing_repeated_conversions_and_builtins_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\tz = builtin(\"x\")\n\tq = into_opaque T(a)\n\tp = from_opaque T(b)\n\tr = builtin\n",
+		158168,
 	)
-
 
 func test_parsing_repeated_bindings_and_local_functions_copies_no_table() -> Bool:
-	statement_family_within_budget("\t(p, q) = a\n\tn: Int = a\n\tfunc g(u):\n\t\tu\n\ta[b] = c\n")
-
+	statement_family_allocates("\t(p, q) = a\n\tn: Int = a\n\tfunc g(u):\n\t\tu\n\ta[b] = c\n", 206211)
 
 func test_parsing_repeated_postfix_chains_and_unary_operators_copies_no_table() -> Bool:
-	statement_family_within_budget(
+	statement_family_allocates(
 		"\tx = a.b(c)[d]\n\ty = a\n\t\t.b()\n\t\t.c()\n\tz = not a\n\tw = -a\n\tdetach f(a)\n",
+		282172,
 	)
 
-
--- Pinned to the measured 44202 allocations: about 22 per repeat. The seven written types in the item allocate for their parts. Where they come from has not been investigated.
 func test_parsing_repeated_written_types_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"func g[V: Orderable + Equatable](p: Dict[String, List[Int]], f: pure (Int) -> Int, t: (Int, Int), m: Int[#N, #M], k: a.B[C], n: Int[#_...], v: V) -> void:\n\tp\n\n\n",
-		44202,
+		488217,
 	)
 
 
 func test_parsing_repeated_foreign_blocks_copies_no_table() -> Bool:
-	family_within_budget(
+	family_allocates(
 		"",
 		"foreign(include: \"a.h\", link: \"-lm\"):\n\tpure func c_sin(x: Float) -> Float = \"sin\"\n\tfunc c_puts(s: String) -> Int\n\n\n",
+		206184,
 	)
 
-
--- Pinned to the measured 2180 allocations: about 1 per repeat. A trait with a supertrait allocates for the supertrait reference. Where they come from has not been investigated.
 func test_parsing_repeated_supertraits_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"trait Base:\n\tpure func one(value: Self) -> Int\n\n\ntrait Wide: Base:\n\tpure func two(value: Self) -> Int\n\tfunc three(value: Self) -> Int:\n\t\t3\n\n\n",
-		2180,
+		310193,
 	)
 
 
 func test_appending_rows_copies_no_table() -> Bool:
 	var builder: DiscoveryBuilder = empty_discovery_builder()
 	reset_mem_stats()
+	active_before = read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
 	var index: Int = 0
 
 	while index < REPEATS:
@@ -299,7 +265,16 @@ func test_appending_rows_copies_no_table() -> Bool:
 		)
 		index += 1
 
-	within_budget(get_mem_stats().total_allocations)
+	allocations = read_memory_counter(ManagedAllocations)
+
+	(
+		active_before and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and builder.definitions.length() == REPEATS
+		and builder.nodes.length() == REPEATS
+		and allocations > ROW_APPEND_ALLOCATIONS - EXACT_TOLERANCE
+		and allocations < ROW_APPEND_ALLOCATIONS + EXACT_TOLERANCE
+	)
 
 
 tests: TestSuite = {

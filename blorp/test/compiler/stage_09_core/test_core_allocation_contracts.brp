@@ -81,6 +81,9 @@ import:
 			ForDictExpr,
 			ForListExpr,
 			ForResourceSourceExpr,
+			ForSetExpr,
+			ForStreamExpr,
+			ForStringExpr,
 			ForTensorExpr,
 			ListGetExpr,
 			ListConstructExpr,
@@ -99,7 +102,7 @@ import:
 		CoreHashContainerConstructor(CustomHashContainerConstructor),
 		CoreListAccessBounds(CheckedListAccess),
 		CoreListStorageLayout(InlineListStorage, InlineStructListStorage, PointerListStorage),
-		CoreLiteral(IntLiteral),
+		CoreLiteral(IntLiteral, StringLiteral, WideIntLiteral),
 		CoreLiteralMatchFallback(LiteralMatchFallbackFail),
 		CoreLoopBinder,
 		CoreLoopRangeDirection(RangeMayRunBackward),
@@ -116,7 +119,7 @@ import:
 		CoreTensorLiteralShape(TensorVectorLength),
 		CoreTensorRawScalarKind(TensorInt64Elements),
 		CoreTupleElement(TuplePrimElement, TupleStackResultElement, TupleStructElement),
-		CoreType(HeapRecordType, NamedType, TupleType, UnionType, ValueRecordType),
+		CoreType(HeapRecordType, NamedType, StackResultType, TupleType, UnionType),
 		CoreUnionDecl,
 		CoreUnionField,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
@@ -150,7 +153,7 @@ private pure func test_bit_packed_boxes_are_allocation_free() -> Bool:
 private pure func test_wide_and_struct_boxes_allocate() -> Bool:
 	var valid: Bool = True
 
-	for kind in [Int128Box, UInt128Box, StructBox("Point")]:
+	for kind in [Int128Box, UInt128Box, StructBox("blorp_StackOption_Int")]:
 		facts: CoreLocalAllocationFacts = box_allocation_facts(kind)
 
 		if facts.may_allocate != [HeapBoxAllocation] or not facts.unknown.is_empty():
@@ -304,6 +307,27 @@ private pure func int_literal(value: Int) -> CoreExpr:
 	)
 
 
+private pure func stack_option_value() -> CoreExpr:
+	UnionConstructExpr(
+		{
+			type_name = "Option",
+			constructor_name = "Some",
+			variant = unspelled_test_variant(),
+			representation = StackOptionRepresentation({
+				option_type = "blorp_StackOption_Int",
+				tag = 1,
+				none_value = "0",
+			}),
+			payload_storage = TypedUnionPayloadStorage,
+			uses_release_mask = False,
+			release_mask = 0,
+			args = [{kind = PrimBox, value = int_literal(1), needs_release = False, transfers_ownership = False}],
+		},
+		NamedType("Option", [NamedType("Int", [])]),
+		synthetic_core_source_loc(),
+	)
+
+
 private pure func test_direct_call_dependencies_use_exact_definition_ids() -> Bool:
 	contract: CoreAllocationContract = core_call_allocation_contract(
 		UserCall(
@@ -323,6 +347,19 @@ private pure func test_direct_call_dependencies_use_exact_definition_ids() -> Bo
 			)
 		_:
 			False
+
+
+private pure func test_native_snapshot_and_counter_allocation_contracts() -> Bool:
+	memory = core_call_allocation_contract(BuiltinCall("blorp_get_mem_stats"))
+	scheduler = core_call_allocation_contract(BuiltinCall("blorp_get_scheduler_stats"))
+	counter = core_call_allocation_contract(BuiltinCall("blorp_read_memory_counter"))
+	near_miss = core_call_allocation_contract(BuiltinCall("blorp_read_memory_counter_extra"))
+	(
+		memory.facts.may_allocate == [ManagedObjectAllocation]
+		and scheduler.facts.may_allocate == [ManagedObjectAllocation]
+		and allocation_facts_are_free(counter.facts)
+		and not allocation_facts_are_free(near_miss.facts)
+	)
 
 
 private pure func test_unknown_and_named_runtime_calls_fail_closed() -> Bool:
@@ -460,15 +497,7 @@ private pure func test_closure_creation_distinguishes_capture_environments() -> 
 	)
 
 
-private pure func test_record_construction_distinguishes_value_and_heap_layouts() -> Bool:
-	value_record: CoreAllocationContract = core_expr_allocation_contract(
-		RecordConstructExpr(
-			"Point",
-			[],
-			ValueRecordType("Point"),
-			synthetic_core_source_loc(),
-		),
-	)
+private pure func test_record_construction_uses_managed_allocation() -> Bool:
 	heap_record: CoreAllocationContract = core_expr_allocation_contract(
 		RecordConstructExpr(
 			"Node",
@@ -479,8 +508,7 @@ private pure func test_record_construction_distinguishes_value_and_heap_layouts(
 	)
 
 	(
-		allocation_facts_are_free(value_record.facts)
-		and heap_record.facts.may_allocate == [ManagedObjectAllocation]
+		heap_record.facts.may_allocate == [ManagedObjectAllocation]
 		and heap_record.facts.unknown.is_empty()
 	)
 
@@ -531,13 +559,26 @@ private pure func test_generic_union_construction_distinguishes_nullary_payload(
 
 
 private pure func stack_union_construct(kind: CoreBoxKind) -> CoreExpr:
+	payload_type: CoreType = if kind == Int128Box:
+		NamedType("Int128", [])
+	else:
+		NamedType("Int", [])
+	payload_literal: CoreLiteral = if kind == Int128Box:
+		WideIntLiteral("1")
+	else:
+		IntLiteral(1)
+	option_type: String = if kind == Int128Box:
+		"blorp_StackOption_Int128"
+	else:
+		"blorp_StackOption_Int"
+
 	UnionConstructExpr(
 		{
-			type_name = "MaybeValue",
+			type_name = "Option",
 			constructor_name = "Some",
 			variant = unspelled_test_variant(),
 			representation = StackOptionRepresentation({
-				option_type = "blorp_MaybeValue",
+				option_type = option_type,
 				tag = 1,
 				none_value = "0",
 			}),
@@ -547,13 +588,13 @@ private pure func stack_union_construct(kind: CoreBoxKind) -> CoreExpr:
 			args = [
 				{
 					kind = kind,
-					value = int_literal(1),
+					value = LiteralExpr(payload_literal, payload_type, synthetic_core_source_loc()),
 					needs_release = False,
 					transfers_ownership = False
 				},
 			]
 		},
-		UnionType("MaybeValue"),
+		NamedType("Option", [payload_type]),
 		synthetic_core_source_loc(),
 	)
 
@@ -563,18 +604,13 @@ private pure func test_stack_union_elides_implicit_boxes() -> Bool:
 		stack_union_construct(PrimBox),
 	)
 	wide: CoreAllocationContract = core_expr_allocation_contract(stack_union_construct(Int128Box))
-	structure: CoreAllocationContract = core_expr_allocation_contract(
-		stack_union_construct(StructBox("Point")),
-	)
-
 	(
 		allocation_facts_are_free(primitive.facts)
 		and allocation_facts_are_free(wide.facts)
-		and allocation_facts_are_free(structure.facts)
 	)
 
 
-private pure func generic_struct_union(erased: Bool) -> CoreExpr:
+private pure func generic_wide_integer_union(erased: Bool) -> CoreExpr:
 	payload_storage: CoreUnionPayloadStorage = if erased:
 		ErasedUnionPayloadStorage
 	else:
@@ -582,8 +618,8 @@ private pure func generic_struct_union(erased: Bool) -> CoreExpr:
 
 	UnionConstructExpr(
 		{
-			type_name = "WrappedPoint",
-			constructor_name = "WrappedPoint",
+			type_name = "WrappedWideInteger",
+			constructor_name = "WrappedWideInteger",
 			variant = unspelled_test_variant(),
 			representation = GenericUnionRepresentation,
 			payload_storage = payload_storage,
@@ -591,22 +627,22 @@ private pure func generic_struct_union(erased: Bool) -> CoreExpr:
 			release_mask = 0,
 			args = [
 				{
-					kind = StructBox("Point"),
-					value = int_literal(1),
+					kind = Int128Box,
+					value = LiteralExpr(WideIntLiteral("1"), NamedType("Int128", []), synthetic_core_source_loc()),
 					needs_release = False,
 					transfers_ownership = False
 				},
 			]
 		},
-		UnionType("WrappedPoint"),
+		UnionType("WrappedWideInteger"),
 		synthetic_core_source_loc(),
 	)
 
 
-private pure func nullable_struct_union() -> CoreExpr:
+private pure func nullable_pointer_union() -> CoreExpr:
 	UnionConstructExpr(
 		{
-			type_name = "MaybePoint",
+			type_name = "Option",
 			constructor_name = "Some",
 			variant = unspelled_test_variant(),
 			representation = NullableOptionRepresentation,
@@ -615,22 +651,22 @@ private pure func nullable_struct_union() -> CoreExpr:
 			release_mask = 0,
 			args = [
 				{
-					kind = StructBox("Point"),
-					value = int_literal(1),
-					needs_release = False,
+					kind = PointerBox,
+					value = LiteralExpr(StringLiteral("value"), NamedType("String", []), synthetic_core_source_loc()),
+					needs_release = True,
 					transfers_ownership = False
 				},
 			]
 		},
-		UnionType("MaybePoint"),
+		NamedType("Option", [NamedType("String", [])]),
 		synthetic_core_source_loc(),
 	)
 
 
 private pure func test_union_box_facts_follow_payload_emission() -> Bool:
-	typed: CoreAllocationContract = core_expr_allocation_contract(generic_struct_union(False))
-	erased: CoreAllocationContract = core_expr_allocation_contract(generic_struct_union(True))
-	nullable: CoreAllocationContract = core_expr_allocation_contract(nullable_struct_union())
+	typed: CoreAllocationContract = core_expr_allocation_contract(generic_wide_integer_union(False))
+	erased: CoreAllocationContract = core_expr_allocation_contract(generic_wide_integer_union(True))
+	nullable: CoreAllocationContract = core_expr_allocation_contract(nullable_pointer_union())
 
 	(
 		typed.facts.may_allocate == [ManagedObjectAllocation]
@@ -641,9 +677,14 @@ private pure func test_union_box_facts_follow_payload_emission() -> Bool:
 
 private pure func tuple_construct(struct_element: Bool) -> CoreExpr:
 	elements: List[CoreTupleElement] = if struct_element:
-		[TupleStructElement(int_literal(1), "Point")]
+		[TupleStructElement(stack_option_value(), "blorp_StackOption_Int")]
 	else:
 		[TuplePrimElement(int_literal(1))]
+
+	element_type: CoreType = if struct_element:
+		NamedType("Option", [NamedType("Int", [])])
+	else:
+		NamedType("Int", [])
 
 	TupleConstructExpr(
 		{
@@ -651,7 +692,7 @@ private pure func tuple_construct(struct_element: Bool) -> CoreExpr:
 			release_mask = 0,
 			retain_mask = 0
 		},
-		TupleType([NamedType("Int", [])]),
+		TupleType([element_type]),
 		synthetic_core_source_loc(),
 	)
 
@@ -763,7 +804,7 @@ private pure func test_list_get_layouts_are_locally_allocation_free() -> Bool:
 			core_expr_allocation_contract(list_get(InlineListStorage(8))).facts,
 		)
 		and allocation_facts_are_free(
-			core_expr_allocation_contract(list_get(InlineStructListStorage("Point"))).facts,
+			core_expr_allocation_contract(list_get(InlineStructListStorage("blorp_StackOption_Int"))).facts,
 		)
 	)
 
@@ -908,10 +949,10 @@ private pure func test_accessor_match_publishes_scrutinee_cleanup() -> Bool:
 			False
 
 
-private pure func struct_boxed_value() -> CoreBoxedStorageValue:
+private pure func scalar_option_boxed_value() -> CoreBoxedStorageValue:
 	{
-		kind = StructBox("Point"),
-		value = int_literal(1),
+		kind = StructBox("blorp_StackOption_Int"),
+		value = stack_option_value(),
 		needs_release = False,
 		transfers_ownership = False
 	}
@@ -922,7 +963,7 @@ private pure func test_container_construction_preserves_payload_risks() -> Bool:
 		ListConstructExpr(
 			{
 				layout = PointerListStorage,
-				elements = [struct_boxed_value()],
+				elements = [scalar_option_boxed_value()],
 				elem_needs_release = False
 			},
 			NamedType(
@@ -936,7 +977,7 @@ private pure func test_container_construction_preserves_payload_risks() -> Bool:
 		TensorBoxedLiteralExpr(
 			{
 				shape = TensorVectorLength(1),
-				elements = [struct_boxed_value()],
+				elements = [scalar_option_boxed_value()],
 				elem_needs_release = False
 			},
 			NamedType(
@@ -952,8 +993,8 @@ private pure func test_container_construction_preserves_payload_risks() -> Bool:
 				constructor = CustomHashContainerConstructor(42, 43, False),
 				entries = [
 					{
-						key = struct_boxed_value(),
-						value = struct_boxed_value()
+						key = scalar_option_boxed_value(),
+						value = scalar_option_boxed_value()
 					},
 				],
 				value_needs_release = False
@@ -1061,7 +1102,7 @@ private pure func test_capture_and_reuse_contracts_preserve_hidden_causes() -> B
 					{
 						name = "point",
 						id = 0,
-						typ = ValueRecordType("Point"),
+						typ = StackResultType(NamedType("Int", []), NamedType("Int", [])),
 						origin = AuthoredBinder
 					},
 				]
@@ -1092,7 +1133,7 @@ private pure func test_capture_and_reuse_contracts_preserve_hidden_causes() -> B
 				payload_storage = ErasedUnionPayloadStorage,
 				uses_release_mask = False,
 				release_mask = 0,
-				args = [struct_boxed_value()]
+				args = [scalar_option_boxed_value()]
 			},
 			UnionType("Node"),
 			synthetic_core_source_loc(),
@@ -1274,6 +1315,90 @@ private pure func test_cleanup_and_loop_site_detail_names_the_type() -> Bool:
 	)
 
 
+private pure func test_all_loop_site_details_use_their_own_iterable_field() -> Bool:
+	iterable: CoreExpr = LiteralExpr(StringLiteral("items"), NamedType("String", []), synthetic_core_source_loc())
+	loops: List[CoreExpr] = [
+		ForListExpr(
+			{
+				binder = loop_binder(),
+				layout = PointerListStorage,
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType("Void", []),
+			synthetic_core_source_loc(),
+		),
+		ForStringExpr(
+			{
+				binder = loop_binder(),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType("Void", []),
+			synthetic_core_source_loc(),
+		),
+		ForSetExpr(
+			{
+				binder = loop_binder(),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType("Void", []),
+			synthetic_core_source_loc(),
+		),
+		ForResourceSourceExpr(
+			{
+				binder = loop_binder(),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType("Void", []),
+			synthetic_core_source_loc(),
+		),
+		ForTensorExpr(
+			{
+				binder = loop_binder(),
+				element_storage = TensorForRawScalarElement(TensorInt64Elements),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType("Void", []),
+			synthetic_core_source_loc(),
+		),
+		ForStreamExpr(
+			{
+				binder = loop_binder(),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType("Void", []),
+			synthetic_core_source_loc(),
+		),
+		ForDictExpr(
+			{
+				binder = loop_binder(),
+				iterable = iterable,
+				iterable_release_policy = NoReleasePolicy,
+				body = int_literal(0)
+			},
+			NamedType("Void", []),
+			synthetic_core_source_loc(),
+		),
+	]
+	var correct: Bool = True
+
+	for loop in loops:
+		correct = correct and core_expr_operation_detail({}, loop) == "String"
+
+	correct
+
+
 private pure func test_custom_hash_dict_detail_names_the_hash_function() -> Bool:
 	construct: CoreExpr = DictConstructExpr(
 		{
@@ -1294,6 +1419,7 @@ private pure func test_custom_hash_dict_detail_names_the_hash_function() -> Bool
 tests: TestSuite = {
 	description = "Blorp compiler Core allocation contracts",
 	tests = [
+		("native snapshot and counter allocation contracts", test_native_snapshot_and_counter_allocation_contracts),
 		("bit-packed boxes are allocation-free", test_bit_packed_boxes_are_allocation_free),
 		("wide and struct boxes allocate", test_wide_and_struct_boxes_allocate),
 		("union cleanup plans are explicit", test_union_cleanup_plans_are_explicit),
@@ -1325,7 +1451,7 @@ tests: TestSuite = {
 		),
 		(
 			"record construction distinguishes value and heap layouts",
-			test_record_construction_distinguishes_value_and_heap_layouts,
+			test_record_construction_uses_managed_allocation,
 		),
 		(
 			"generic union construction distinguishes nullary payload",
@@ -1390,6 +1516,10 @@ tests: TestSuite = {
 		(
 			"custom hash dict detail names the hash function",
 			test_custom_hash_dict_detail_names_the_hash_function,
+		),
+		(
+			"all loop site details use their own iterable field",
+			test_all_loop_site_details_use_their_own_iterable_field,
 		),
 	]
 }

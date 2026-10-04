@@ -1,12 +1,8 @@
 import:
 	../../../src/compiler/stage_09_core/ir:
-		CoreValueRecordOrigin(FixedRecordOrigin, LegacyStructOrigin),
-		CoreInlineFieldOwnership(OwnedArcInlineField, TrivialInlineField),
-		CoreDecl(EnumDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
-		CoreHeapRecordDecl,
+		CoreDecl(EnumDecl, HeapRecordDecl, UnionDecl),
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy),
-		CoreSourceLoc,
 		synthetic_core_source_loc,
 		CoreTensorDim(TensorStaticDim),
 		CoreType(
@@ -22,38 +18,19 @@ import:
 			TupleType,
 			TypeParameterType,
 			UnionType,
-			ValueRecordType,
 			VoidType,
 		),
 		CoreUnionDecl,
 		CoreUnionPayloadStorage(TypedUnionPayloadStorage),
-		CoreValueRecordDecl,
-		core_field_ref,
 	../../../src/compiler/stage_09_core/type_policy:
 		CORE_MANAGED_TYPE_NAMES,
-		CoreInlineOwnershipError(LegacyStructOwnedField, ManagedInlineFieldMissingOwnership),
-		CoreOwnershipKind(ExistingManagedValue, InlineOwnedValue, TrivialValue),
-		build_core_inline_ownership_index,
 		cleanup_release_policy_for_type,
-		core_ownership_kind,
+		core_type_requires_ownership,
 		ManagedTypeIndex,
 		is_managed_type,
 		is_core_one_shot_stream_type_name,
 		is_core_resource_source_type_name,
 		managed_type_index,
-	../../../src/compiler/stage_09_core/pass_runner:
-		CorePassDiagnostic(CorePassMessage),
-		core_pass_state,
-	../../../src/compiler/stage_09_core/pipeline:
-		prepared_core_program,
-		run_fused_ownership_perceus_pass,
-		run_ownership_contracts_pass,
-	../../../src/compiler/stage_10_backend/emit:
-		CoreEmitError(UnsupportedOwnedInlineCore),
-		try_emit_core_program_c_artifact_with_profile,
-		try_emit_prepared_core_program_c_artifact_with_profile,
-		try_emit_prepared_core_program_c_split_artifact_with_profile,
-	../../../src/lib/function_profile: FunctionProfileConfiguration(FunctionProfileOff),
 	io: print_error
 	test: TestSuite
 
@@ -105,9 +82,8 @@ private pure func managed_decl_program() -> CoreProgram:
 				payload_storage = TypedUnionPayloadStorage,
 				variants = [],
 				loc = synthetic_core_source_loc(),
-			}), ValueRecordDecl({
+			}), HeapRecordDecl({
 				abi_type = None,
-				origin = LegacyStructOrigin,
 				name = "Pair",
 				type_params = [],
 				fields = [],
@@ -153,7 +129,7 @@ private pure func legacy_is_managed_type(managed_names: List[String], typ: CoreT
 				legacy_is_managed_type(managed_names, ok_type)
 				or legacy_is_managed_type(managed_names, err_type)
 			)
-		VoidType | EnumType(_) | ValueRecordType(_) | RangeType:
+		VoidType | EnumType(_) | RangeType:
 			False
 
 
@@ -180,9 +156,9 @@ private pure func managed_type_cases() -> List[ManagedTypeCase]:
 			expected = True
 		},
 		{
-			label = "named value record declaration",
+			label = "named managed product declaration",
 			typ = NamedType("Pair", []),
-			expected = False
+			expected = True
 		},
 		{
 			label = "named enum declaration",
@@ -282,9 +258,9 @@ private pure func managed_type_cases() -> List[ManagedTypeCase]:
 			expected = False
 		},
 		{
-			label = "value record type",
-			typ = ValueRecordType("Pair"),
-			expected = False
+			label = "managed product type",
+			typ = HeapRecordType("Pair"),
+			expected = True
 		},
 		{
 			label = "range type",
@@ -372,182 +348,34 @@ pure func test_optional_function_requires_arc_cleanup() -> Bool:
 	cleanup_release_policy_for_type(NamedType("Option", [function_type])) == ArcReleasePolicy
 
 
-private pure func owned_header_program(
-	origin: CoreValueRecordOrigin,
-	name_type: CoreType,
-	name_ownership: CoreInlineFieldOwnership,
-) -> CoreProgram:
-	{
-		decls = [ValueRecordDecl({
-				abi_type = None,
-				origin = origin,
-				name = "Header",
-				type_params = [],
-				fields = [
-					{name = "name", ref = core_field_ref(1), typ = name_type, ownership = name_ownership},
-					{name = "code", ref = core_field_ref(2), typ = int_type(), ownership = TrivialInlineField},
-				],
-				loc = synthetic_core_source_loc(),
-			})],
-		foreign_includes = [],
-		source_files = [],
-	}
-
-
-pure func test_owned_fixed_header_is_inline_owned_not_an_arc_pointer() -> Bool:
-	program: CoreProgram = owned_header_program(FixedRecordOrigin, string_type(), OwnedArcInlineField)
-	match build_core_inline_ownership_index(program):
-		Ok(index):
-			named_owned: Bool = match core_ownership_kind(index, managed_type_index(program), NamedType("Header", [])):
-				InlineOwnedValue("Header"): True
-				_: False
-			value_owned: Bool = match core_ownership_kind(index, managed_type_index(program), ValueRecordType("Header")):
-				InlineOwnedValue("Header"): True
-				_: False
-			int_trivial: Bool = match core_ownership_kind(index, managed_type_index(program), int_type()):
-				TrivialValue: True
-				_: False
-			(
-				named_owned
-				and value_owned
-				and int_trivial
-				and not is_managed_type(managed_type_index(program), NamedType("Header", []))
-			)
-		Err(_):
-			False
-
-
-pure func test_legacy_struct_cannot_gain_owned_inline_field() -> Bool:
-	match build_core_inline_ownership_index(owned_header_program(LegacyStructOrigin, string_type(), OwnedArcInlineField)):
-		Err(LegacyStructOwnedField(record_name, field_name)):
-			record_name == "Header" and field_name == "name"
-		_:
-			False
-
-
-pure func test_string_field_cannot_be_falsely_tagged_trivial() -> Bool:
-	match build_core_inline_ownership_index(owned_header_program(FixedRecordOrigin, string_type(), TrivialInlineField)):
-		Err(ManagedInlineFieldMissingOwnership(record_name, field_name)):
-			record_name == "Header" and field_name == "name"
-		_:
-			False
-
-
-pure func test_list_field_cannot_be_falsely_tagged_trivial() -> Bool:
-	match build_core_inline_ownership_index(
-		owned_header_program(FixedRecordOrigin, NamedType("List", [int_type()]), TrivialInlineField),
-	):
-		Err(ManagedInlineFieldMissingOwnership(record_name, field_name)):
-			record_name == "Header" and field_name == "name"
-		_:
-			False
-
-
-pure func test_literal_string_field_cannot_be_falsely_tagged_trivial() -> Bool:
-	match build_core_inline_ownership_index(
-		owned_header_program(FixedRecordOrigin, NamedType("LiteralString", []), TrivialInlineField),
-	):
-		Err(ManagedInlineFieldMissingOwnership(record_name, field_name)):
-			record_name == "Header" and field_name == "name"
-		_:
-			False
-
-
-pure func test_prefixed_resource_field_cannot_be_falsely_tagged_trivial() -> Bool:
-	match build_core_inline_ownership_index(
-		owned_header_program(FixedRecordOrigin, NamedType("net_tls__TlsSession", []), TrivialInlineField),
-	):
-		Err(ManagedInlineFieldMissingOwnership(record_name, field_name)):
-			record_name == "Header" and field_name == "name"
-		_:
-			False
+pure func test_record_declarations_use_existing_managed_policy() -> Bool:
+	index = managed_type_index(managed_decl_program())
+	(
+		is_managed_type(index, NamedType("Pair", []))
+		and is_managed_type(index, HeapRecordType("Pair"))
+		and cleanup_release_policy_for_type(HeapRecordType("Pair")) == ArcReleasePolicy
+		and not is_managed_type(index, int_type())
+	)
 
 
 pure func test_existing_releasable_types_classify_as_managed() -> Bool:
-	program: CoreProgram = owned_header_program(FixedRecordOrigin, int_type(), TrivialInlineField)
-	match build_core_inline_ownership_index(program):
-		Ok(index):
-			literal_managed: Bool = match core_ownership_kind(index, managed_type_index(program), NamedType("LiteralString", [])):
-				ExistingManagedValue: True
-				_: False
-			handle_managed: Bool = match core_ownership_kind(index, managed_type_index(program), NamedType("net_tls__TlsSession", [])):
-				ExistingManagedValue: True
-				_: False
-			list_managed: Bool = match core_ownership_kind(index, managed_type_index(program), NamedType("List", [int_type()])):
-				ExistingManagedValue: True
-				_: False
-			literal_managed and handle_managed and list_managed
-		Err(_):
-			False
-
-
-pure func test_owned_inline_core_is_rejected_before_production_perceus() -> Bool:
-	program: CoreProgram = owned_header_program(FixedRecordOrigin, string_type(), OwnedArcInlineField)
-	state = core_pass_state(program, 3)
-	contracts_rejected: Bool = match run_ownership_contracts_pass(state):
-		Err(CorePassMessage(message)):
-			message == "owned inline fixed record `Header` is not supported by the current Core ownership/emission pipeline"
-		_:
-			False
-	fused_rejected: Bool = match run_fused_ownership_perceus_pass(state):
-		Err(CorePassMessage(message)):
-			message == "owned inline fixed record `Header` is not supported by the current Core ownership/emission pipeline"
-		_:
-			False
-	contracts_rejected and fused_rejected
-
-
-pure func test_owned_inline_core_is_rejected_by_direct_and_prepared_emitters() -> Bool:
-	program: CoreProgram = owned_header_program(FixedRecordOrigin, string_type(), OwnedArcInlineField)
-	direct_rejected: Bool = match try_emit_core_program_c_artifact_with_profile(program, FunctionProfileOff):
-		Err(UnsupportedOwnedInlineCore(_)): True
-		_:
-			False
-	prepared_rejected: Bool = match try_emit_prepared_core_program_c_artifact_with_profile(
-		prepared_core_program(program),
-		FunctionProfileOff,
-	):
-		Err(UnsupportedOwnedInlineCore(_)): True
-		_:
-			False
-	direct_rejected and prepared_rejected
-
-
-pure func test_split_emitter_rejects_owned_and_mistagged_managed_fields() -> Bool:
-	owned: CoreProgram = owned_header_program(FixedRecordOrigin, string_type(), OwnedArcInlineField)
-	mistagged: CoreProgram = owned_header_program(FixedRecordOrigin, string_type(), TrivialInlineField)
-	owned_rejected: Bool = match try_emit_prepared_core_program_c_split_artifact_with_profile(
-		prepared_core_program(owned), FunctionProfileOff, 2, "shared.h",
-	):
-		Err(UnsupportedOwnedInlineCore(_)): True
-		_:
-			False
-	mistagged_rejected: Bool = match try_emit_prepared_core_program_c_split_artifact_with_profile(
-		prepared_core_program(mistagged), FunctionProfileOff, 2, "shared.h",
-	):
-		Err(UnsupportedOwnedInlineCore(_)): True
-		_:
-			False
-	owned_rejected and mistagged_rejected
+	index = managed_type_index(managed_decl_program())
+	(
+		core_type_requires_ownership(index, NamedType("LiteralString", []))
+		and core_type_requires_ownership(index, NamedType("net_tls__TlsSession", []))
+		and core_type_requires_ownership(index, NamedType("List", [int_type()]))
+	)
 
 
 tests: TestSuite = {
 	description = "Blorp compiler Core type policy",
 	tests = [
+		("record declarations use managed ownership", test_record_declarations_use_existing_managed_policy),
 		("optional function fields require ARC cleanup", test_optional_function_requires_arc_cleanup),
 		(
 			"managed type index matches legacy policy",
 			test_managed_type_index_matches_legacy_policy,
 		),
-		("owned fixed fields classify as inline ownership", test_owned_fixed_header_is_inline_owned_not_an_arc_pointer),
-		("legacy structs reject owned inline fields", test_legacy_struct_cannot_gain_owned_inline_field),
-		("String inline fields cannot be tagged trivial", test_string_field_cannot_be_falsely_tagged_trivial),
-		("List inline fields cannot be tagged trivial", test_list_field_cannot_be_falsely_tagged_trivial),
-		("LiteralString inline fields cannot be tagged trivial", test_literal_string_field_cannot_be_falsely_tagged_trivial),
-		("prefixed resource fields cannot be tagged trivial", test_prefixed_resource_field_cannot_be_falsely_tagged_trivial),
 		("existing releasable types classify as managed", test_existing_releasable_types_classify_as_managed),
-		("owned inline Core is rejected before production Perceus", test_owned_inline_core_is_rejected_before_production_perceus),
-		("owned inline Core is rejected by direct and prepared emitters", test_owned_inline_core_is_rejected_by_direct_and_prepared_emitters),
-		("split emitter rejects owned and mistagged managed fields", test_split_emitter_rejects_owned_and_mistagged_managed_fields),
 	]
 }

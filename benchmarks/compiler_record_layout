@@ -10,6 +10,7 @@ support_header="${BLORP_RECORD_LAYOUT_SUPPORT_HEADER:-$source_dir/compiler_recor
 support_source="${BLORP_RECORD_LAYOUT_SUPPORT_SOURCE:-$repo_root/benchmarks/support/compiler_record_layout_ffi.c}"
 cc_command_text="${BLORP_RECORD_LAYOUT_CC:-${CC:-cc}}"
 read -r -a cc_command <<< "$cc_command_text"
+symbol_helper="$repo_root/benchmarks/support/compiler_record_layout_symbols.brp"
 
 usage() {
 	cat <<'EOF'
@@ -78,9 +79,12 @@ trap cleanup_stage EXIT
 
 generated_c="$stage_dir/compiler_record_layout.c"
 probe_c="$stage_dir/compiler_record_layout_probe.c"
+final_core="$stage_dir/compiler_record_layout_final.core"
+symbol_mapping="$stage_dir/compiler_record_layout_symbols.txt"
 
 cd "$repo_root"
 "$compiler" compile --no-format \
+	--dump-core-after=final --dump-core-file="$final_core" \
 	-o "$generated_c" \
 	"$source_file" >/dev/null
 
@@ -91,47 +95,132 @@ while IFS= read -r expected_c; do
 	fi
 done < <(sed -n 's/^-- EXPECT-C: *//p' "$source_file")
 
-three_flags_type="LayoutThreeFlags"
-mixed_type="LayoutMixed"
-heap_flags_type="LayoutHeapFlags"
-dense_heap_flags_type="LayoutHeapDenseFlags"
-interleaved_heap_flags_type="LayoutHeapInterleavedFlags"
-heap_states_type="LayoutHeapStates"
-foreign_heap_flags_type="LayoutForeignHeapFlags"
-foreign_heap_state_type="LayoutForeignHeapState"
-foreign_mixed_type="LayoutForeignMixed"
+# Core dumps are serialized JSON, selected explicitly at the final stage.
+# Resolve symbols from the same nominal and field authorities as emission.
+"$compiler" run --no-format "$symbol_helper" -- "$final_core" > "$symbol_mapping"
+cp "$symbol_helper" "$stage_dir/compiler_record_layout_symbols.brp"
+
+awk '
+function fail(message) {
+	print "compiler_record_layout: invalid symbol mapping: " message > "/dev/stderr"
+	failed = 1
+	exit 1
+}
+BEGIN {
+	expected["LayoutThreeFlags"] = "first second third"
+	expected["LayoutMixed"] = "first count second total"
+	expected["LayoutHeapFlags"] = "first second third payload"
+	expected["LayoutHeapDenseFlags"] = "first second third fourth fifth sixth seventh eighth ninth payload"
+	expected["LayoutHeapInterleavedFlags"] = "first count second"
+	expected["LayoutHeapStates"] = "count first second third"
+	expected["LayoutForeignHeapFlags"] = "first second count"
+	expected["LayoutForeignHeapState"] = "state count"
+}
+{
+	if ($1 != "RECORD_LAYOUT_SYMBOL" || $2 != "schema=1" || $3 !~ /^record=/ || $4 !~ /^c_type=/)
+		fail("malformed row")
+	record = substr($3, 8)
+	if (!(record in expected)) fail("unknown record " record)
+	if (seen[record]++) fail("duplicate record " record)
+	count = split(expected[record], fields, " ")
+	if (NF != count + 4) fail("wrong field count for " record)
+	for (token_index = 4; token_index <= NF; token_index++) {
+		if (split($token_index, pair, "=") != 2 || pair[2] !~ /^[A-Za-z_][A-Za-z0-9_]*$/)
+			fail("malformed symbol for " record)
+		key = pair[1]
+		if (keys[record SUBSEP key]++) fail("duplicate key for " record)
+		if (token_index == 4) {
+			if (types[pair[2]]++) fail("duplicate C type " pair[2])
+		} else {
+			found = 0
+			for (field = 1; field <= count; field++)
+				if (key == "field_" fields[field]) found = 1
+			if (!found) fail("unknown field for " record)
+			if (members[record SUBSEP pair[2]]++) fail("duplicate member for " record)
+		}
+	}
+}
+END {
+	if (failed) exit 1
+	for (record in expected)
+		if (!(record in seen)) fail("missing record " record)
+}
+' "$symbol_mapping"
+
+projected_symbol() {
+	awk -v record="$1" -v key="$2" '
+	$3 == "record=" record {
+		for (token_index = 4; token_index <= NF; token_index++) {
+			split($token_index, pair, "=")
+			if (pair[1] == key) print pair[2]
+		}
+	}' "$symbol_mapping"
+}
+
+three_flags_type=$(projected_symbol LayoutThreeFlags c_type)
+mixed_type=$(projected_symbol LayoutMixed c_type)
+heap_flags_type=$(projected_symbol LayoutHeapFlags c_type)
+dense_heap_flags_type=$(projected_symbol LayoutHeapDenseFlags c_type)
+interleaved_heap_flags_type=$(projected_symbol LayoutHeapInterleavedFlags c_type)
+heap_states_type=$(projected_symbol LayoutHeapStates c_type)
+foreign_heap_flags_type=$(projected_symbol LayoutForeignHeapFlags c_type)
+foreign_heap_state_type=$(projected_symbol LayoutForeignHeapState c_type)
 
 cp "$generated_c" "$probe_c"
+{
+	# Probe-only, per-record members; never rewrite generated C symbols.
+	for field in first count second total; do
+		printf '#define BLORP_LAYOUT_FIELD_MIXED_%s %s\n' "$field" "$(projected_symbol LayoutMixed "field_$field")"
+	done
+	printf '#define BLORP_LAYOUT_FIELD_HEAP_payload %s\n' "$(projected_symbol LayoutHeapFlags field_payload)"
+	printf '#define BLORP_LAYOUT_FIELD_DENSE_payload %s\n' "$(projected_symbol LayoutHeapDenseFlags field_payload)"
+	for field in first count second; do
+		printf '#define BLORP_LAYOUT_FIELD_INTERLEAVED_%s %s\n' "$field" "$(projected_symbol LayoutHeapInterleavedFlags "field_$field")"
+		printf '#define BLORP_LAYOUT_FIELD_FOREIGN_FLAGS_%s %s\n' "$field" "$(projected_symbol LayoutForeignHeapFlags "field_$field")"
+	done
+	for field in count first second third; do
+		printf '#define BLORP_LAYOUT_FIELD_STATES_%s %s\n' "$field" "$(projected_symbol LayoutHeapStates "field_$field")"
+	done
+	for field in state count; do
+		printf '#define BLORP_LAYOUT_FIELD_FOREIGN_STATE_%s %s\n' "$field" "$(projected_symbol LayoutForeignHeapState "field_$field")"
+	done
+} >> "$probe_c"
 {
 	printf '\n#include <stddef.h>\n#include <stdio.h>\n'
 	printf '#ifndef BLORP_LAYOUT_OPT\n#define BLORP_LAYOUT_OPT "unknown"\n#endif\n'
 	printf 'static size_t blorp_record_layout_allocator_bytes(size_t size) {\n'
-	printf '  int allocation_class = blorp_pool_class(size);\n'
-	printf '  return allocation_class >= 0 ? blorp_pool_sizes[allocation_class] : size;\n'
+	# BackendGenericObjectAlloc renders blorp_alloc(sizeof(T)); runtime.c's
+	# blorp_alloc requests at least one managed header, without pool rounding.
+	printf '  return size < sizeof(blorp_Object) ? sizeof(blorp_Object) : size;\n'
 	printf '}\n'
 	printf '__attribute__((constructor)) static void blorp_report_record_layout(void) {\n'
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=three_flags size=%%zu align=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s));\n' \
+	# Individual packed flags have no addressable C offset or sizeof.
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=three_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header));\n' \
+		"$three_flags_type" "$three_flags_type" "$three_flags_type" \
 		"$three_flags_type" "$three_flags_type" "$three_flags_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=mixed size=%%zu align=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s));\n' \
-		"$mixed_type" "$mixed_type" "$mixed_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu payload_offset=%%zu payload_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, payload), sizeof(((%s*)0)->payload));\n' \
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=mixed size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu count_offset=%%zu count_size=%%zu total_offset=%%zu total_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, BLORP_LAYOUT_FIELD_MIXED_count), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_MIXED_count), offsetof(%s, BLORP_LAYOUT_FIELD_MIXED_total), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_MIXED_total), offsetof(%s, BLORP_LAYOUT_FIELD_MIXED_first), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_MIXED_first), offsetof(%s, BLORP_LAYOUT_FIELD_MIXED_second), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_MIXED_second));\n' \
+		"$mixed_type" "$mixed_type" "$mixed_type" "$mixed_type" \
+		"$mixed_type" "$mixed_type" "$mixed_type" "$mixed_type" \
+		"$mixed_type" "$mixed_type" "$mixed_type" "$mixed_type" \
+		"$mixed_type" "$mixed_type"
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu payload_offset=%%zu payload_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, BLORP_LAYOUT_FIELD_HEAP_payload), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_HEAP_payload));\n' \
 		"$heap_flags_type" \
 		"$heap_flags_type" "$heap_flags_type" "$heap_flags_type" \
 		"$heap_flags_type" "$heap_flags_type" \
 		"$heap_flags_type" "$heap_flags_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=dense_heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu payload_offset=%%zu payload_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, payload), sizeof(((%s*)0)->payload));\n' \
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=dense_heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu payload_offset=%%zu payload_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, BLORP_LAYOUT_FIELD_DENSE_payload), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_DENSE_payload));\n' \
 		"$dense_heap_flags_type" \
 		"$dense_heap_flags_type" "$dense_heap_flags_type" "$dense_heap_flags_type" \
 		"$dense_heap_flags_type" "$dense_heap_flags_type" \
 		"$dense_heap_flags_type" "$dense_heap_flags_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=interleaved_heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu count_offset=%%zu count_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, count), sizeof(((%s*)0)->count), offsetof(%s, first), sizeof(((%s*)0)->first), offsetof(%s, second), sizeof(((%s*)0)->second));\n' \
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=interleaved_heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu count_offset=%%zu count_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, BLORP_LAYOUT_FIELD_INTERLEAVED_count), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_INTERLEAVED_count), offsetof(%s, BLORP_LAYOUT_FIELD_INTERLEAVED_first), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_INTERLEAVED_first), offsetof(%s, BLORP_LAYOUT_FIELD_INTERLEAVED_second), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_INTERLEAVED_second));\n' \
 		"$interleaved_heap_flags_type" \
 		"$interleaved_heap_flags_type" "$interleaved_heap_flags_type" "$interleaved_heap_flags_type" \
 		"$interleaved_heap_flags_type" "$interleaved_heap_flags_type" \
 		"$interleaved_heap_flags_type" "$interleaved_heap_flags_type" \
 		"$interleaved_heap_flags_type" "$interleaved_heap_flags_type" \
 		"$interleaved_heap_flags_type" "$interleaved_heap_flags_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=heap_states size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu count_offset=%%zu count_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu third_offset=%%zu third_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, count), sizeof(((%s*)0)->count), offsetof(%s, first), sizeof(((%s*)0)->first), offsetof(%s, second), sizeof(((%s*)0)->second), offsetof(%s, third), sizeof(((%s*)0)->third));\n' \
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=heap_states size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu count_offset=%%zu count_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu third_offset=%%zu third_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, BLORP_LAYOUT_FIELD_STATES_count), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_STATES_count), offsetof(%s, BLORP_LAYOUT_FIELD_STATES_first), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_STATES_first), offsetof(%s, BLORP_LAYOUT_FIELD_STATES_second), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_STATES_second), offsetof(%s, BLORP_LAYOUT_FIELD_STATES_third), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_STATES_third));\n' \
 		"$heap_states_type" \
 		"$heap_states_type" "$heap_states_type" "$heap_states_type" \
 		"$heap_states_type" "$heap_states_type" \
@@ -139,26 +228,19 @@ cp "$generated_c" "$probe_c"
 		"$heap_states_type" "$heap_states_type" \
 		"$heap_states_type" "$heap_states_type" \
 		"$heap_states_type" "$heap_states_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=foreign_heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu count_offset=%%zu count_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, first), sizeof(((%s*)0)->first), offsetof(%s, second), sizeof(((%s*)0)->second), offsetof(%s, count), sizeof(((%s*)0)->count));\n' \
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=foreign_heap_flags size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu first_offset=%%zu first_size=%%zu second_offset=%%zu second_size=%%zu count_offset=%%zu count_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, BLORP_LAYOUT_FIELD_FOREIGN_FLAGS_first), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_FOREIGN_FLAGS_first), offsetof(%s, BLORP_LAYOUT_FIELD_FOREIGN_FLAGS_second), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_FOREIGN_FLAGS_second), offsetof(%s, BLORP_LAYOUT_FIELD_FOREIGN_FLAGS_count), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_FOREIGN_FLAGS_count));\n' \
 		"$foreign_heap_flags_type" \
 		"$foreign_heap_flags_type" "$foreign_heap_flags_type" "$foreign_heap_flags_type" \
 		"$foreign_heap_flags_type" "$foreign_heap_flags_type" \
 		"$foreign_heap_flags_type" "$foreign_heap_flags_type" \
 		"$foreign_heap_flags_type" "$foreign_heap_flags_type" \
 		"$foreign_heap_flags_type" "$foreign_heap_flags_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=foreign_heap_state size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu state_offset=%%zu state_size=%%zu count_offset=%%zu count_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, state), sizeof(((%s*)0)->state), offsetof(%s, count), sizeof(((%s*)0)->count));\n' \
+	printf '  printf("RECORD_LAYOUT mode=%%s layout=foreign_heap_state size=%%zu align=%%zu allocator_bytes=%%zu header_offset=%%zu header_size=%%zu state_offset=%%zu state_size=%%zu count_offset=%%zu count_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), blorp_record_layout_allocator_bytes(sizeof(%s)), offsetof(%s, header), sizeof(((%s*)0)->header), offsetof(%s, BLORP_LAYOUT_FIELD_FOREIGN_STATE_state), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_FOREIGN_STATE_state), offsetof(%s, BLORP_LAYOUT_FIELD_FOREIGN_STATE_count), sizeof(((%s*)0)->BLORP_LAYOUT_FIELD_FOREIGN_STATE_count));\n' \
 		"$foreign_heap_state_type" \
 		"$foreign_heap_state_type" "$foreign_heap_state_type" "$foreign_heap_state_type" \
 		"$foreign_heap_state_type" "$foreign_heap_state_type" \
 		"$foreign_heap_state_type" "$foreign_heap_state_type" \
 		"$foreign_heap_state_type" "$foreign_heap_state_type"
-	printf '  printf("RECORD_LAYOUT mode=%%s layout=foreign_mixed size=%%zu align=%%zu first_offset=%%zu first_size=%%zu count_offset=%%zu count_size=%%zu second_offset=%%zu second_size=%%zu total_offset=%%zu total_size=%%zu c_type=%s\\n", BLORP_LAYOUT_OPT, sizeof(%s), _Alignof(%s), offsetof(%s, first), sizeof(((%s*)0)->first), offsetof(%s, count), sizeof(((%s*)0)->count), offsetof(%s, second), sizeof(((%s*)0)->second), offsetof(%s, total), sizeof(((%s*)0)->total));\n' \
-		"$foreign_mixed_type" \
-		"$foreign_mixed_type" "$foreign_mixed_type" \
-		"$foreign_mixed_type" "$foreign_mixed_type" \
-		"$foreign_mixed_type" "$foreign_mixed_type" \
-		"$foreign_mixed_type" "$foreign_mixed_type" \
-		"$foreign_mixed_type" "$foreign_mixed_type"
 	printf '}\n'
 } >> "$probe_c"
 

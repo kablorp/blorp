@@ -1175,14 +1175,12 @@ Each field name appears once in a declaration, a record literal and a record upd
 `record P { x: Int, x: Int }` and `{ x = 1, x = 2 }` are rejected at the second `x`, and
 the message gives the position of the first.
 
-### Fixed Records (Value Types)
+### Alternative Record Spellings
 
-`fixed record` gives a value a known shallow layout with no separate ARC header.
-For now, its fields must use the same unmanaged types accepted in `struct`:
-scalars, fieldless enums, and other fixed values. A `String`, collection,
-function, union with payload, heap record, or tuple field is rejected with a
-message explaining that managed fixed fields are not supported yet. An ordinary
-`record` is the current choice for those fields.
+`struct` and `fixed record` are alternative spellings of `record`. All three
+have ordinary managed record behavior: ARC ownership, value-preserving updates,
+and the same field, type-parameter, dimension-parameter, and empty-record rules.
+Neither spelling promises stack storage, an unmanaged layout, or a C ABI.
 
 ```blorp
 fixed record Color {r: UInt8, g: UInt8, b: UInt8, a: UInt8}
@@ -1191,12 +1189,7 @@ c: Color = {r = to_uint8(255), g = to_uint8(0), b = to_uint8(0), a = to_uint8(25
 red: UInt8 = c.r
 ```
 
-Fixed records support the same update syntax as ordinary records. They cannot
-declare type or dimension parameters; use an ordinary `record` when parameters
-are needed.
-
-The old `struct` spelling remains accepted while the compiler bootstrap and
-source tree migrate. It currently has the same layout and field restrictions:
+The `struct` spelling behaves identically:
 
 ```blorp
 struct Color {r: UInt8, g: UInt8, b: UInt8, a: UInt8}
@@ -1211,25 +1204,12 @@ Both spellings support record update syntax:
 struct Vec2 {x: Float, y: Float}
 
 v: Vec2 = {x = 1.0, y = 2.0}
-moved: Vec2 = { v | x = v.x + 10.0 }   -- stack copy, zero allocation
+moved: Vec2 = { v | x = v.x + 10.0 }   -- v remains unchanged
 ```
 
-`struct` also cannot have type or dimension parameters.
-
-#### When to Use Fixed Record vs Record
-
-**Default to `record`.** Use `fixed record` when a known by-value layout matters.
-
-| | `record` | `fixed record` |
-|---|---|---|
-| **Layout** | Heap-backed by default (ARC + COW) | By-value root; erased positions may require a box |
-| **Copying cost** | Cheap (bumps refcount) | Copies all fields |
-| **Best for** | General-purpose data, collections, anything with String/List fields | Small unmanaged fields, including scalars, fieldless enums, and nested fixed records |
-| **Examples** | `Person`, `Config`, `HttpRequest` | `Color`, `Vec2`, `RGBA`, `FilterState` |
-
-The current implementation accepts unmanaged fields only. This is a temporary
-ownership restriction, not a promise that a fixed record can never contain an
-ARC-managed field.
+Prefer `record` for new declarations. Choosing another spelling does not change
+ownership or allocation behavior. Managed fields such as `String` and `List[T]`
+are accepted in every spelling.
 
 ### Union Types (Sum Types / ADTs)
 
@@ -1423,7 +1403,7 @@ pure func bad[T]() -> T:
 ### Range Refinement Types
 
 The type `..#N` represents an integer proven to be in the range `[0, N)`.
-These refinement values are distinct from the first-class `Range` struct used
+These refinement values are distinct from the first-class managed `Range` record used
 by `0..10` expressions. Refinement values come from compile-time proofs: literal indices, bounded loops,
 `enumerate`, modulo narrowing, or control-flow checks such as
 `if i >= 0 and i < length(v):`.
@@ -1836,9 +1816,10 @@ result2: Option[Int] = safe_divide(10, 2)
 ```
 
 Representation note: `Option[T]` is optimized by payload type. Primitive
-numeric/bool/char payloads, `Int128`/`UInt128`, range types, enums, and
-`struct` value records use stack `{tag, value}` layouts. Managed payloads such
-as `String`, `List[T]`, heap `record`, non-enum `union`, tuples, and functions
+numeric/bool/char payloads, `Int128`/`UInt128`, bounded range types, and enums
+use stack `{tag, value}` layouts. Managed payloads such
+as `String`, `List[T]`, records (including `struct` and `fixed record`),
+first-class `Range`, non-enum `union`, tuples, and functions
 use an internal nullable-pointer layout. Nested options, `Ptr`, unresolved
 generic payloads, and unsupported payloads stay boxed so `Some(x)` and `None`
 remain distinguishable.

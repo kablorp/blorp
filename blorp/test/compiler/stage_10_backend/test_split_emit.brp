@@ -1,13 +1,12 @@
 import:
+	../../../src/compiler/stage_06_typecheck/type_system/native_snapshot_abi: NativeSnapshotKind(MemorySnapshot), native_snapshot_fields
 	../../../src/compiler/stage_06_typecheck/type_system/language_surface_manifest: DeclaredAbiType(DeclaredAbiMemStats)
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
-		CoreValueRecordOrigin(LegacyStructOrigin),
-		CoreInlineFieldOwnership(TrivialInlineField),
 		CoreBinaryOp(AddOp),
 		CoreClosureAbi,
 		CoreClosureCapture,
-		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl, ValueRecordDecl),
+		CoreDecl(EnumDecl, FunctionDecl, GlobalDecl, HeapRecordDecl, UnionDecl),
 		CoreEnumDecl,
 		CoreExpr(BinaryExpr, ClosureCreateExpr, FieldExpr, LiteralExpr, ListConstructExpr, VarExpr),
 		CoreFunction,
@@ -20,10 +19,9 @@ import:
 		CoreProgram,
 		CoreReleasePolicy(ArcReleasePolicy, NoReleasePolicy),
 		CoreHeapRecordField,
-		CoreValueRecordDecl,
 		CoreSourceLoc,
 		synthetic_core_source_loc,
-		CoreType(NamedType, ValueRecordType),
+		CoreType(NamedType, HeapRecordType),
 		CoreUnionDecl,
 		CoreUnionPayloadStorage(ErasedUnionPayloadStorage, TypedUnionPayloadStorage),
 		CoreBinderOrigin(AuthoredBinder),
@@ -305,19 +303,18 @@ pure func split_test_program() -> CoreProgram:
 
 
 pure func all_type_sections_program() -> CoreProgram:
-	point_decl: CoreValueRecordDecl = {
+	point_decl: CoreHeapRecordDecl = {
 		abi_type = None,
-		origin = LegacyStructOrigin,
 		name = "Point",
 		type_params = [],
 		fields = [
-			{ ref = core_field_ref(3), name = "x", typ = int_type(), ownership = TrivialInlineField },
-			{ ref = core_field_ref(4), name = "y", typ = int_type(), ownership = TrivialInlineField },
+			{ ref = core_field_ref(3), name = "x", typ = int_type(), release_policy = NoReleasePolicy },
+			{ ref = core_field_ref(4), name = "y", typ = int_type(), release_policy = NoReleasePolicy },
 		],
 		loc = synthetic_core_source_loc(),
 	}
 	program: CoreProgram = split_test_program()
-	{ program | decls = program.decls.append(ValueRecordDecl(point_decl)) }
+	{ program | decls = program.decls.append(HeapRecordDecl(point_decl)) }
 
 
 ---
@@ -515,7 +512,7 @@ pure func test_all_type_sections_render_in_both_modes() -> Bool:
 		),
 	):
 		(Ok(single), Ok(split)):
-			point_header: String = "long f0; long f1;"
+			point_header: String = "long f0;\n  long f1;"
 			enum_header: String = "#define " + variant_constructor_symbol(101) + " 0L"
 			union_header: String = "typedef struct " + projected_type_base_symbol(1) + " {"
 			heap_header: String = "typedef struct " + projected_type_base_symbol(0) + " {"
@@ -1134,7 +1131,7 @@ pure func runtime_reserved_field_split_program() -> CoreProgram:
 
 ---
 Test 12: the split path reuses the exact per-declaration emission records
-the single-file path builds (`value_record_emissions` / `heap_record_
+the single-file path builds (`managed_record_emissions` / `heap_record_
 emissions` / `enum_emissions` / `union_emissions` on `CEmissionSections`),
 so a field named `header` must be spelled identically on both paths: a
 non-ABI record's member is spelled from the field's position (`f<ordinal>`), so it
@@ -1292,7 +1289,7 @@ pure func test_closure_environment_destructor_follows_closure_body() -> Bool:
 
 
 pure func projected_point_closure_split_program() -> CoreProgram:
-	point_type: CoreType = ValueRecordType("Point")
+	point_type: CoreType = HeapRecordType("Point")
 	point_var: CoreVar = { name = "point", id = 0, def_id = None, origin = AuthoredBinder }
 	capture: CoreClosureCapture = {
 		name = "point",
@@ -1353,20 +1350,19 @@ pure func projected_point_closure_split_program() -> CoreProgram:
 		def_id = 983,
 		loc = synthetic_core_source_loc(),
 	}
-	point_decl: CoreValueRecordDecl = {
+	point_decl: CoreHeapRecordDecl = {
 		abi_type = None,
-		origin = LegacyStructOrigin,
 		name = "Point",
 		type_params = [],
 		fields = [
-			{ ref = core_field_ref(3), name = "x", typ = int_type(), ownership = TrivialInlineField },
-			{ ref = core_field_ref(4), name = "y", typ = int_type(), ownership = TrivialInlineField },
+			{ ref = core_field_ref(3), name = "x", typ = int_type(), release_policy = NoReleasePolicy },
+			{ ref = core_field_ref(4), name = "y", typ = int_type(), release_policy = NoReleasePolicy },
 		],
 		loc = synthetic_core_source_loc(),
 	}
 	{
 		decls = [
-			ValueRecordDecl(point_decl),
+			HeapRecordDecl(point_decl),
 			FunctionDecl(creator),
 			FunctionDecl(closure_body),
 		],
@@ -1385,8 +1381,8 @@ pure func test_projected_emission_spells_a_non_abi_member_from_its_field_id() ->
 	):
 		Ok(artifact):
 			(
-				artifact.c_code.contains("long f0; long f1;")
-				and artifact.c_code.contains(".f0")
+				artifact.c_code.contains("long f0;\n  long f1;")
+				and artifact.c_code.contains("->f0")
 				and not artifact.c_code.contains("long x; long y;")
 			)
 		Err(_):
@@ -1396,22 +1392,23 @@ pure func test_projected_emission_spells_a_non_abi_member_from_its_field_id() ->
 -- A declared ABI record keeps its member names: C code outside the compiler
 -- reads `MemStats`, so its constructor assigns the source-named members.
 pure func test_projected_emission_keeps_source_member_names_for_an_abi_record() -> Bool:
-	stats_decl: CoreValueRecordDecl = {
+	stats_decl: CoreHeapRecordDecl = {
 		abi_type = Some(DeclaredAbiMemStats),
-		origin = LegacyStructOrigin,
 		name = "MemStats",
 		type_params = [],
-		fields = [{ ref = core_field_ref(7), name = "allocated", typ = int_type(), ownership = TrivialInlineField }],
+		fields = native_snapshot_fields(MemorySnapshot).enumerate().map(func(entry): {
+			ref = core_field_ref(7 + entry[0]), name = entry[1], typ = int_type(), release_policy = NoReleasePolicy
+		}),
 		loc = synthetic_core_source_loc(),
 	}
 	program: CoreProgram = split_test_program()
 
 	match try_emit_prepared_core_program_c_artifact_with_profile(
-		run_pre_dce_tail({ program | decls = program.decls.append(ValueRecordDecl(stats_decl)) }),
+		run_pre_dce_tail({ program | decls = program.decls.append(HeapRecordDecl(stats_decl)) }),
 		FunctionProfileOff,
 	):
 		Ok(artifact):
-			artifact.c_code.contains(".allocated = allocated") and not artifact.c_code.contains("long f0; ")
+			artifact.c_code.contains("->total_allocations = total_allocations") and not artifact.c_code.contains("long f0; ")
 		Err(_):
 			False
 
@@ -1452,32 +1449,27 @@ pure func test_projected_closure_env_uses_projected_point_type() -> Bool:
 			point_symbol: String = projected_type_base_symbol(0)
 			closure_symbol: String = projected_callable_base_symbol(982)
 			creator_symbol: String = projected_callable_base_symbol(983)
-			env_name: String = "__blorp_closure_env_" + closure_symbol
-			destructor_name: String = "__blorp_closure_env_destroy_" + closure_symbol
-			destructor_prototype: String = "void " + destructor_name + "(void* obj);"
-			destructor_definition: String = "void " + destructor_name + "(void* obj) {"
 			closure_body_signature: String = "void* " + closure_symbol + "(void* __env) {"
-			creator_signature: String = creator_symbol + "(" + point_symbol + " point) {"
-			env_typedef: String = "typedef struct { " + point_symbol + " capture_0; } " + env_name + ";"
-			creator_assignment: String = "__cl_env->capture_0 = point;"
-			body_local: String = point_symbol + " point = __e->capture_0;"
+			creator_signature: String = creator_symbol + "(" + point_symbol + "* point) {"
+			creator_assignment: String = "((void**)__cl_new->env)[0] = (void*)blorp_retain((blorp_Object*)point);"
+			body_local: String = point_symbol + "* point = (" + point_symbol + "*)__e[0];"
 			var creator_uses_projected_point: Bool = False
 			var closure_body_uses_projected_point: Bool = False
 
 			for body in result.bodies:
-				if body.contains(creator_signature) and body.contains(creator_assignment):
+				if (body.contains(creator_signature) and body.contains(creator_assignment)
+				and body.contains("__cl_new->env_release_mask = 1UL;")):
 					creator_uses_projected_point = True
 
-				if body.contains(closure_body_signature) and body.contains(body_local) and body.contains(
-					destructor_definition
-				):
+				if (body.contains(closure_body_signature) and body.contains(body_local)
+				and body.contains("point->f0")):
 					closure_body_uses_projected_point = True
 
 			(
-				result.shared_header.contains(env_typedef)
-				and result.shared_header.contains(destructor_prototype)
-				and not result.shared_header.contains(destructor_definition)
-				and count_occurrences_across(result.bodies, destructor_definition) == 1
+				result.shared_header.contains("typedef struct " + point_symbol + " " + point_symbol + ";")
+				and not result.shared_header.contains("__blorp_closure_env_")
+				and count_occurrences_across(result.bodies, creator_signature) == 1
+				and count_occurrences_across(result.bodies, closure_body_signature) == 1
 				and creator_uses_projected_point
 				and closure_body_uses_projected_point
 			)

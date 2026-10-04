@@ -311,6 +311,7 @@ import:
 		typecheck_state_add_error,
 		typecheck_state_definition_index,
 		typecheck_state_enter_prepared_module_scope,
+		typecheck_state_scope_to_program,
 		typecheck_state_find_imported_name,
 		typecheck_state_find_module_alias,
 		typecheck_state_find_top_level_name,
@@ -5908,21 +5909,25 @@ func test_materializes_foreign_block_as_typed_functions() -> Bool:
 			False
 
 
-func test_foreign_default_args_use_accepted_value_record_authority() -> Bool:
-	value_record = RecordParsedDecl({
-		name = ident("NativePoint"),
-		type_params = [],
-		fields = [field_decl("x", int_type()), field_decl("y", int_type())],
-		form = LegacyStruct,
-		doc = None,
-		span = fixture_source_span(),
-	})
-	result = typecheck_test_program(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), program([
-			value_record,
-			foreign_block_with_param_decl("native_point_x", "point", named_type("NativePoint")),
-		]))
+func test_foreign_records_require_explicit_borrow_mode() -> Bool:
+	declaration = "record NativePoint { x: Int, y: Int }\n\nforeign:\n"
+	default_program = parsed_program_source(
+		"native_boundary",
+		declaration + "\tfunc native_point_x(point: NativePoint) -> Int\n",
+	)
+	borrow_program = parsed_program_source(
+		"native_boundary",
+		declaration + "\tpure func native_point_x(point: NativePoint) -> Int\n"
+		+ "\t@no_copy func native_point_y(point: NativePoint) -> Int\n",
+	)
+	default_result = typecheck_test_program(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), default_program)
+	borrow_result = typecheck_test_program(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), borrow_program)
 
-	result.state.errors.is_empty() and env_get_record(result.state.env, "NativePoint").is_none()
+	(
+		default_result.state.errors.length() == 1
+		and default_result.state.errors.contains("Foreign function 'native_point_x' cannot defensively copy parameter 'point' of type NativePoint in default foreign mode")
+		and borrow_result.state.errors.is_empty()
+	)
 
 
 func test_foreign_default_args_use_accepted_enum_authority() -> Bool:
@@ -8625,9 +8630,27 @@ func test_global_initializer_meta_sessions_follow_mixed_plan_order() -> Bool:
 	global_initializer_meta_sessions_follow_mixed_plan_order().get_or(False)
 
 
+func test_native_snapshot_schema_requires_stdlib_provider() -> Bool:
+	source_program = parsed_program_source("memory", "record MemStats { field: Int }\n")
+	std_result = typecheck_test_program(typecheck_state_for_origin(TYPECHECK_STDLIB_ORIGIN), source_program)
+	-- Isolate the validator boundary: the full loader rejects a user provider
+	-- replacing an implicit stdlib module before declaration validation runs.
+	user_scope = typecheck_state_scope_to_program(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), source_program)
+	user_state = typecheck_validate_typed_program({ std_result | state = user_scope }).state
+	std_state = std_result.state
+
+	(
+		user_state.errors.is_empty()
+		and std_state.errors.any(pure func(error):
+			error == "native snapshot fields must match the declared runtime schema; restore its ordered Int fields"
+		)
+	)
+
+
 tests: TestSuite = {
 	description = "Compiler typecheck declaration pre-scan",
 	tests = [
+		("native snapshot schema requires stdlib provider", test_native_snapshot_schema_requires_stdlib_provider),
 		(
 			"global initializer meta sessions follow plan provenance",
 			test_global_initializer_meta_sessions_follow_plan_provenance,
@@ -8940,8 +8963,8 @@ tests: TestSuite = {
 			test_materializes_foreign_block_as_typed_functions,
 		),
 		(
-			"foreign default args use accepted value record authority",
-			test_foreign_default_args_use_accepted_value_record_authority,
+			"foreign records require explicit borrow mode",
+			test_foreign_records_require_explicit_borrow_mode,
 		),
 		(
 			"foreign default args use accepted enum authority",

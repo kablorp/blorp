@@ -45,10 +45,11 @@ projections into current-main acceptance evidence.
 
 ### Layout and box preservation
 
-Blorp tuples have two to four elements and compare and hash by element. A
-`struct` is unmanaged, so a managed tuple is not made into a source-language
-struct. After monomorphization, a tuple that is the whole type of a local,
-parameter or result is a group of values. A multi-value result uses a C
+Blorp tuples have two to four elements and compare and hash by element. All
+source record forms are managed; tuple flattening does not introduce a
+separate source-language record representation. After monomorphization, a
+tuple that is the whole type of a local, parameter or result is a group of
+values. A multi-value result uses a C
 struct by value only as ABI transport; it is never a Blorp value or Perceus
 variable. A tuple nested inside another type remains a `blorp_Tuple` box
 through increment 5: list/set/dictionary slots, record fields, union and
