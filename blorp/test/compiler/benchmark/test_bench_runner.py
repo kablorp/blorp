@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,15 @@ EXPECTED_OUTPUTS = {
 
 
 class BenchmarkRunnerTests(unittest.TestCase):
+    def test_c_benchmark_commands_use_o2(self) -> None:
+        script = (ROOT / "benchmarks" / "bench.sh").read_text(encoding="utf-8")
+        logical_commands = script.replace("\\\n", " ")
+        compile_commands = re.findall(r"^\s*\$CC\s+[^\n]+", logical_commands, re.MULTILINE)
+        self.assertEqual(len(compile_commands), 6)
+        for command in compile_commands:
+            self.assertIn("-O2", command)
+            self.assertNotIn("-O3", command)
+
     def fake_benchmark(self, directory: Path, outputs: list[str]) -> tuple[Path, Path]:
         script = directory / "fake_benchmark.py"
         counter = directory / "invocations.txt"

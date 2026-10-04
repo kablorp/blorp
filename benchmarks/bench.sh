@@ -271,10 +271,10 @@ compile_blorp() {
     [ -f "$bench_c" ] || return 1
 
     write_c_timer "$timer_c" "$name" "blorp" 1
-    $CC -fwrapv -O3 -march=native -flto -pthread -Dmain=bench_main \
+    $CC -fwrapv -O2 -march=native -flto -pthread -Dmain=bench_main \
         "-DBLORP_MEMORY_DIAGNOSTICS=$memory_diagnostics" -c "$bench_c" -o "$obj"
-    $CC -fwrapv -O3 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
-    $CC -fwrapv -O3 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm -lpthread
+    $CC -fwrapv -O2 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
+    $CC -fwrapv -O2 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm -lpthread
 }
 
 compile_c() {
@@ -289,9 +289,9 @@ compile_c() {
     fi
 
     write_c_timer "$timer_c" "$name" "c" "$call_with_args"
-    $CC -O3 -march=native -flto -pthread -Dmain=bench_main -c "$src" -o "$obj"
-    $CC -O3 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
-    $CC -O3 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm
+    $CC -O2 -march=native -flto -pthread -Dmain=bench_main -c "$src" -o "$obj"
+    $CC -O2 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
+    $CC -O2 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm
 }
 
 compile_go() {

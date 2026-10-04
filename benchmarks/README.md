@@ -2125,6 +2125,8 @@ full tables and the go/no-go calls for the roadmap's P3/P4/P5 issues.
 benchmark set into a temporary directory. Timed execution remains
 benchmark-major, so the comparison table still runs `fib` across
 blorp/C/Go/OCaml/Python before moving to the next benchmark.
+Blorp-generated C and the C comparison programs are compiled and linked at
+`-O2`; this is a benchmark setting, not a substitute for output validation.
 
 The harness does not time benchmarks from the outside. It runs a
 language-specific instrumented entry point, and that entry point prints a
