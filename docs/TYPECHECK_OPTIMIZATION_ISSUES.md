@@ -47,7 +47,8 @@ for attribution and the harness rows for acceptance):
 ```bash
 base=$(git rev-parse origin/main)
 input=$(benchmarks/self_compile_measure freeze --rev "$base")
-BLORP_CLI_C_OPTIMIZATION=-O2 make && scripts/compiler-build-status   # must say FRESH
+export BLORP_CLI_C_OPTIMIZATION=-O2
+make && scripts/compiler-build-status   # must say FRESH
 
 BLORP_TYPECHECK_BODY_METRICS=1 BLORP_MEMORY_STATS=1 \
   bin/blorp compile --stop-after=lower --no-format \
@@ -69,16 +70,34 @@ profiled compiler with the two-step recipe in `benchmarks/README.md` and check
 Acceptance:
 
 ```bash
-benchmarks/self_compile_measure --label <issue>-parent --input-rev "$base" \
-  --samples 3 --output /tmp/<issue>-parent.json            # on the untouched tree, first
-benchmarks/self_compile_measure --label <issue> --input-rev "$base" --samples 3 \
-  --baseline /tmp/<issue>-parent.json --output /tmp/<issue>.json --require-identical
-benchmarks/self_compile_measure --program small --label <issue>-small --input-rev "$base" \
-  --samples 3 --baseline /tmp/<issue>-parent-small.json --output /tmp/<issue>-small.json --require-identical
+# On the untouched parent, using the same -O2 build as the fast loop.
+export BLORP_CLI_C_OPTIMIZATION=-O2
+benchmarks/self_compile_measure --stage2 --label parent --input-rev "$base" \
+  --samples 3 --output /tmp/typecheck-parent.json
+shasum -a 256 benchmarks/self_compile/small.brp \
+  > /tmp/typecheck-parent-small.sha256
+benchmarks/self_compile_measure --stage2 --program small --label parent-small \
+  --input-rev "$base" --samples 3 --output /tmp/typecheck-parent-small.json
+
+# After editing, rebuild with BLORP_CLI_C_OPTIMIZATION=-O2 and require FRESH.
+export BLORP_CLI_C_OPTIMIZATION=-O2
+make && scripts/compiler-build-status
+benchmarks/self_compile_measure --stage2 --label candidate --input-rev "$base" \
+  --samples 3 --baseline /tmp/typecheck-parent.json \
+  --output /tmp/typecheck-candidate.json --require-identical
+shasum -a 256 -c /tmp/typecheck-parent-small.sha256 && \
+  benchmarks/self_compile_measure --stage2 --program small --label candidate-small \
+  --input-rev "$base" --samples 3 --baseline /tmp/typecheck-parent-small.json \
+  --output /tmp/typecheck-candidate-small.json --require-identical
 ```
 
+`--stage2` builds matching normal and diagnostic compilers from each checkout.
+Keep the frozen input revision and `-O2` toolchain the same for parent and
+candidate, and check the recorded provenance before trusting the comparison.
+The checksum check also requires the checkout-local small program to match;
+`--input-rev` does not freeze it.
 Typecheck source is compiled into `bin/blorp` by the bootstrap, so these
-measurements observe your change directly, and `--require-identical` is a real
+measurements observe your change directly. `--require-identical` is a real
 identity check (exit 3 means the typed program changed: a bug, not a result). A
 cut lands when the issue's named allocation row drops by at least the issue's
 target, retired instructions do not rise beyond 0.3%, and the small program does

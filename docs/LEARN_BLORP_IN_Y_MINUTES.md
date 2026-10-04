@@ -554,9 +554,9 @@ if the cited code has since moved.
   `direct_aliases_name` passes `CastExpr`/`from_opaque` through to its inner
   value the same as `FieldExpr`). A borrowed argument stays borrowed after
   `from_opaque`.
-- **Foreign `same_object` is a raw pointer compare with no module-local
-  state**, so identity checks work the same across modules
-  (`blorp_same_object` in `runtime_decl.c`; see
+- **`memory.same_object` checks allocation identity across modules**. Its
+  heap path compares object addresses without module-local state; stack
+  values always return `False` (see `standard_library/src/memory.brp` and
   `blorp/test/runtime/memory/test_same_object_identity.brp`).
 - **Declarations take `---` fenced docstrings, not `--` comment blocks**
   (`docs/GUIDE.md`'s Doctests section; `standard_library/src/string.brp` has

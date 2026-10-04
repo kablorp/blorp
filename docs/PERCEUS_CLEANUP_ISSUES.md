@@ -92,16 +92,8 @@ one issue once the counters say which matter.
   `rebuild_managed_let` and `managed_let_reuses_source`; if it is never passed
   further, compute the fields as locals and publish once at the return.
 - `exact_owned_vars_add`, `exact_owned_vars_remove` and `exact_owned_vars_contains`
-  (a `CoreVar` set over a list) and `int_list_contains` (defined in `ownership_contracts.brp`, `perceus/results_and_loops.brp`
-  and `perceus/short_circuit.brp`) are the same membership shape; once value ids are strict (see P3) the
-  `CoreVar` version keys on the exact id, never on raw `id`.
-- `same_core_expr` and `same_core_type` are redeclared as private
-  `blorp_same_object` foreign functions in a dozen Core and lowering files
-  (`traverse.brp` holds the public one) behind a comment that says to delete
-  them once the bootstrap pin passes the commit that introduced
-  `blorp_same_object`. The current pin (`blorp/build/bootstrap.env`) contains
-  that commit, so replace every copy with one `memory: same_object` import in a
-  separate, repo-wide commit, and update the stale comment's pin name with it.
+  still maintain a `CoreVar` set over a list. Once value ids are strict (see
+  P3), assess a typed-id set keyed on exact identity, never raw `id`.
 
 **Acceptance.** Identical C; the row does not rise.
 

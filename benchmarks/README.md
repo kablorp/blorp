@@ -1835,25 +1835,35 @@ match byte for byte. The harness reports:
   representation-only change must produce **identical** C).
 
 ```bash
-# One-time per checkout: build, then confirm the executable is fresh.
+# One-time per checkout: build at the acceptance optimization level.
+export BLORP_CLI_C_OPTIMIZATION=-O2
 make
 scripts/compiler-build-status
 
-# Establish a paired baseline, then compare the candidate on the same input.
+# On the untouched parent, record one input revision for both checkouts.
+frozen_input_rev=$(git rev-parse HEAD)
+# Establish both paired baselines on the untouched parent.
 benchmarks/self_compile_measure --stage2 \
-  --label baseline --input-rev <frozen_input_rev> \
+  --label baseline --input-rev "$frozen_input_rev" \
   --output /tmp/paired-baseline.json
+shasum -a 256 benchmarks/self_compile/small.brp \
+  > /tmp/paired-small-baseline.sha256
+benchmarks/self_compile_measure --stage2 --program small \
+  --label baseline-small --input-rev "$frozen_input_rev" \
+  --output /tmp/paired-small-baseline.json
+
+# In the candidate checkout, rebuild at -O2 and confirm FRESH before comparing.
+export BLORP_CLI_C_OPTIMIZATION=-O2
+make
+scripts/compiler-build-status
 benchmarks/self_compile_measure --stage2 \
-  --label candidate --input-rev <frozen_input_rev> \
+  --label candidate --input-rev "$frozen_input_rev" \
   --baseline /tmp/paired-baseline.json \
   --output /tmp/candidate.json --require-identical
-
 # Small-program guard (must not regress materially).
-benchmarks/self_compile_measure --stage2 --program small \
-  --label baseline-small --input-rev <frozen_input_rev> \
-  --output /tmp/paired-small-baseline.json
-benchmarks/self_compile_measure --stage2 --program small \
-  --label candidate-small --input-rev <frozen_input_rev> \
+shasum -a 256 -c /tmp/paired-small-baseline.sha256 && \
+  benchmarks/self_compile_measure --stage2 --program small \
+  --label candidate-small --input-rev "$frozen_input_rev" \
   --baseline /tmp/paired-small-baseline.json \
   --output /tmp/candidate-small.json --require-identical
 
@@ -1898,6 +1908,11 @@ Rules:
    `blorp/src/lib/runtime/native/`, the harness also prints a loud warning
    that the measurement cannot observe those changes and points at
    `benchmarks/build_stage2_compiler` (see the stage-2 rule below).
+7. `--input-rev` freezes the self-compile source, but `--program small` reads
+   `benchmarks/self_compile/small.brp` from each checkout. Before comparing
+   small-program results, require that file to have the same SHA-256 in the
+   baseline and candidate checkouts, as verified in the example above. A
+   changed small program is a different workload even if `--input-rev` matches.
 
 Retained baselines live in `benchmarks/results/self_compile_baseline_*.json`
 and `self_compile_small_baseline_*.json`; a new baseline is recorded only when

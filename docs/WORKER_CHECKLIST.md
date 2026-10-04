@@ -48,11 +48,31 @@ behavior under investigation before reaching for a broad gate.
 Full protocol: [`benchmarks/README.md`](../benchmarks/README.md#self-compile-measurement-protocol).
 
 ```bash
-benchmarks/self_compile_measure --label <task> --input-rev <rev> \
-  --baseline benchmarks/results/self_compile_baseline_<toolchain>.json \
-  --output /tmp/<task>.json --require-identical
+# Record this revision before editing; use it as the input for both runs.
+frozen_input_rev=$(git rev-parse HEAD)
+export BLORP_CLI_C_OPTIMIZATION=-O2
+make
+scripts/compiler-build-status        # must say FRESH
+benchmarks/self_compile_measure --stage2 --label baseline \
+  --input-rev "$frozen_input_rev" --output /tmp/baseline.json
+
+# After editing, rebuild at the same optimization level and compare.
+export BLORP_CLI_C_OPTIMIZATION=-O2
+make
+scripts/compiler-build-status        # must say FRESH
+benchmarks/self_compile_measure --stage2 --label candidate \
+  --input-rev "$frozen_input_rev" --baseline /tmp/baseline.json \
+  --output /tmp/candidate.json --require-identical
 ```
 
+- `--stage2` builds and measures the matching normal and diagnostic compiler
+  executables. If using external binaries instead, pass both `--compiler` and
+  `--diagnostic-compiler` from the same build. Record the frozen input revision
+  and verify baseline/candidate toolchain provenance before comparing.
+- For the `--program small` guard, compare the SHA-256 of checkout-local
+  `benchmarks/self_compile/small.brp` before measuring candidate against
+  baseline; `--input-rev` freezes the self-compile input only. The full protocol
+  shows `shasum -a 256` and its check command.
 - Compare only against a baseline built with the same toolchain (clang
   version, bootstrap pin, `-O` level); wall time is not evidence, allocation
   counts and retired instructions are.
