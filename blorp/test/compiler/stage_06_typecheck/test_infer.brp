@@ -3,6 +3,7 @@ import:
 	../test_support_range_record: state_with_range_record_test_authority
 	fixtures/trait_identity_fixture: test_bound_type_param, test_trait_id
 	../../../src/compiler/stage_02_lex/name_table: SYNTHESIZED_NAME_TABLE, name_spelling, synthesized_name_id
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
 		ConcurrentForLimit(MissingLimit, WrittenLimit),
 		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
@@ -103,9 +104,12 @@ import:
 		ModuleOrigin(SourcePackageModule, UserModule),
 		resolved_module_identity_from_resolver,
 	../../../src/compiler/stage_04_modules/module_table: module_table, module_table_id_at
+	../../../src/compiler/stage_06_typecheck/decl: accepted_typecheck_graph_semantic_catalog
 	../../../src/compiler/stage_06_typecheck/diagnostic: typecheck_diagnostic
 	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		definition_table_module_table,
 		resolved_field_identity_field_id,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton: TraitMethodId
 	../../../src/compiler/stage_06_typecheck/infer:
 		BUILTIN_CALLEES,
 		ExpectedValueSlotContext(ExpectedArgumentSlot),
@@ -184,19 +188,41 @@ import:
 		typed_expr_var_initializer_widening,
 		typed_expr_vector_item_widening,
 		typed_expr_widening,
+	../../../src/compiler/stage_06_typecheck/modules/module_view:
+		module_view_accepted_trait_implementation_authority,
+		module_view_with_accepted_trait_implementation_authority,
 	../../../src/compiler/stage_06_typecheck/state:
 		InferSession,
 		ResourceCapabilityMemoEntry,
 		ResourceShapeTarget(OneShotStreamShape, ResourceSourceShape),
+		ScopedTraitFunctionOwner(AcceptedScopedMethod, CompilerScopedMethod, UnindexedScopedTrait),
 		TYPECHECK_USER_ORIGIN,
 		TypecheckState,
+		infer_module_facts_requires_graph_definition,
 		typecheck_state_add_known_resource_type_name,
 		typecheck_state_add_scoped_trait_function,
+		typecheck_state_definition_table,
+		typecheck_state_enter_prepared_module_scope,
 		typecheck_state_for_origin,
+		typecheck_state_from_infer_session,
 		typecheck_state_record_type_home,
 		typecheck_state_register_imported_name,
 		typecheck_state_register_standalone_module_alias,
-	../../../src/compiler/stage_06_typecheck/type_system/builtins: env_with_builtins
+		typecheck_state_scope_to_program,
+		typecheck_state_with_scoped_trait_functions,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog:
+		accepted_semantic_catalog_trait_implementation_table,
+	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
+		ScopedTraitMethodSource(IssuedScopedMethods),
+		accepted_scoped_trait_methods,
+		accepted_trait_empty_visibility,
+		accepted_trait_find,
+		accepted_trait_implementation_authority,
+		accepted_trait_implementation_table,
+		accepted_trait_implementation_table_definition_table,
+	../../../src/compiler/stage_06_typecheck/type_system/builtins:
+		BUILTIN_TRAIT_NAMES,
+		env_with_builtins,
 	../../../src/compiler/stage_06_typecheck/type_system/context: register_resource_cleanup
 	../../../src/compiler/stage_06_typecheck/type_system/env:
 		Env,
@@ -208,7 +234,7 @@ import:
 		Purity(Impure, Pure),
 		ResourceArgPolicy(AllowResourceArgs, RejectResourceArgs),
 		ResourceResultPolicy(ResourceResultDependent, ResourceResultOrdinary),
-		SymbolKind(TypeSymbolKind),
+		SymbolKind(FuncSymbolKind, TypeSymbolKind),
 		TypeContainmentSummary,
 		TypeKind(TypeEnum, TypeResource, TypeUnion),
 		VarMutability(ImmutableBinding),
@@ -220,6 +246,7 @@ import:
 		env_add_impl,
 		env_add_opaque_alias,
 		env_add_record,
+		env_add_trait_function,
 		env_add_type,
 		env_add_type_with_constructor_ids,
 		env_add_var_with_details,
@@ -228,6 +255,7 @@ import:
 		env_get_constructor_for_parent,
 		env_get_func_callable_id,
 		env_get_var_type,
+		env_lookup,
 		env_mint_def_id,
 		env_push_scope,
 		env_set_type_param_bounds,
@@ -277,8 +305,11 @@ import:
 		source_location_for_file,
 	list: list
 	../../../src/compiler/stage_06_typecheck/type_system/trait_identity:
+		TRAIT_ID_EQUATABLE,
 		TRAIT_ID_SIGNED_INTEGER,
+		builtin_trait_id_at_registry_index,
 		trait_ids_equal,
+	../typecheck_test_support: module_id_fixture, typecheck_test_accepted_graph
 	test: TestSuite
 	type_system/meta_support: test_bind_meta, test_fresh_meta, test_meta_context
 
@@ -2874,7 +2905,13 @@ func test_scoped_trait_method_wins_builtin_name_collision() -> Bool:
 		"right",
 		TYPE_INT,
 	)
-	scoped = typecheck_state_add_scoped_trait_function(state, "equals", "Equatable")
+	scoped = typecheck_state_add_scoped_trait_function(
+		state,
+		{
+			source_name = "equals",
+			owner = UnindexedScopedTrait("Equatable")
+		},
+	)
 	result = infer_expr(
 		infer_context(scoped),
 		call_expr(
@@ -2921,7 +2958,13 @@ pure func state_with_imported_equals_in_trait_scope() -> TypecheckState:
 				"helpers/equality",
 				"equals",
 			)
-			typecheck_state_add_scoped_trait_function(imported.state, "equals", "Equatable")
+			typecheck_state_add_scoped_trait_function(
+				imported.state,
+				{
+					source_name = "equals",
+					owner = UnindexedScopedTrait("Equatable")
+				},
+			)
 
 
 func test_explicit_import_wins_scoped_trait_method_name() -> Bool:
@@ -2942,6 +2985,288 @@ func test_explicit_import_wins_scoped_trait_method_name() -> Bool:
 					False
 		None:
 			False
+
+
+private func scoped_context_with_semantic_authority(reserved: Bool) -> Option[InferContext]:
+	base = add_infer_value(
+		add_infer_value(typecheck_state_for_origin(TYPECHECK_USER_ORIGIN), "left", TYPE_INT),
+		"right",
+		TYPE_INT,
+	)
+	fixture ?= module_id_fixture(["infer"])
+
+	state = if reserved:
+		typecheck_state_enter_prepared_module_scope(base, fixture)
+	else:
+		typecheck_state_scope_to_program(base, parse_compiler_source(fixture_source_file()))
+
+	issuer ?= typecheck_state_definition_table(state)
+	table ?= accepted_trait_implementation_table({
+		module_table = definition_table_module_table(issuer),
+		definition_table = issuer,
+		traits = [],
+		implementations = [],
+	})
+	authority = accepted_trait_implementation_authority(
+		table,
+		"infer",
+		accepted_trait_empty_visibility(table),
+		[],
+	)
+	with_authority = { state |
+		module_view = module_view_with_accepted_trait_implementation_authority(
+			state.module_view,
+			authority,
+		)
+	}
+	Some(
+		infer_context(
+			typecheck_state_add_scoped_trait_function(
+				with_authority,
+				{
+					source_name = "equals",
+					owner = UnindexedScopedTrait("Equatable")
+				},
+			),
+		),
+	)
+
+
+private func unindexed_scoped_owner_with_authority_is_explicit() -> Option[Bool]:
+	context ?= scoped_context_with_semantic_authority(False)
+	result = infer_expr(
+		context,
+		call_expr(
+			ParsedNameExpr(ident("equals")),
+			[ParsedNameExpr(ident("left")), ParsedNameExpr(ident("right"))],
+		),
+	)
+	Some(
+		(
+			module_view_accepted_trait_implementation_authority(
+				context.state.facts.module_view,
+			).is_some()
+			and not infer_module_facts_requires_graph_definition(context.state.facts)
+			and result.context.state.errors.is_empty()
+			and resolved_call_targets_trait(result, "Equatable")
+		),
+	)
+
+
+func test_unindexed_scoped_owner_with_authority_is_explicit() -> Bool:
+	unindexed_scoped_owner_with_authority_is_explicit().get_or(False)
+
+
+private func reserved_scope_rejects_unindexed_owner_without_fallback() -> Option[Bool]:
+	context ?= scoped_context_with_semantic_authority(True)
+	result = infer_expr(
+		context,
+		call_expr(
+			ParsedNameExpr(ident("equals")),
+			[ParsedNameExpr(ident("left")), ParsedNameExpr(ident("right"))],
+		),
+	)
+	Some(
+		(
+			infer_module_facts_requires_graph_definition(context.state.facts)
+			and module_view_accepted_trait_implementation_authority(
+				context.state.facts.module_view,
+			).is_some()
+			and result.context.state.errors.contains(
+				"internal typecheck error: unindexed scoped trait in accepted inference",
+			)
+			and typed_expr_resolved_call(result.expr).is_none()
+		),
+	)
+
+
+func test_reserved_scope_rejects_unindexed_owner_without_fallback() -> Bool:
+	reserved_scope_rejects_unindexed_owner_without_fallback().get_or(False)
+
+
+func test_invalid_compiler_scope_never_falls_to_builtin_or_namesake() -> Bool:
+	base = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	forged = builtin_trait_id_at_registry_index(BUILTIN_TRAIT_NAMES.length())
+	invalid = infer_expr(
+		infer_context(
+			typecheck_state_add_scoped_trait_function(
+				base,
+				{
+					source_name = "equals",
+					owner = CompilerScopedMethod(forged)
+				},
+			),
+		),
+		ParsedNameExpr(ident("equals")),
+	)
+	missing_method = infer_expr(
+		infer_context(
+			typecheck_state_add_scoped_trait_function(
+				base,
+				{
+					source_name = "absent_method",
+					owner = CompilerScopedMethod(TRAIT_ID_EQUATABLE)
+				},
+			),
+		),
+		ParsedNameExpr(ident("absent_method")),
+	)
+	namesake_traits = base.env.traits.map(func(definition):
+		if trait_ids_equal(definition.trait_id, TRAIT_ID_EQUATABLE):
+			{ definition | trait_id = test_trait_id("UnrelatedEquatable") }
+		else:
+			definition
+	)
+	namesake_env = { base.env | traits = namesake_traits }
+	namesake = infer_expr(
+		infer_context(
+			typecheck_state_add_scoped_trait_function(
+				{ base | env = namesake_env },
+				{
+					source_name = "equals",
+					owner = CompilerScopedMethod(TRAIT_ID_EQUATABLE)
+				},
+			),
+		),
+		ParsedNameExpr(ident("equals")),
+	)
+	(
+		invalid.context.state.errors.contains(
+			"internal typecheck error: compiler scoped trait is not registered",
+		)
+		and missing_method.context.state.errors.contains((
+				"internal typecheck error: compiler scoped method is absent from its declaring "
+				+ "trait"
+			))
+		and namesake.context.state.errors.contains(
+			"internal typecheck error: compiler scoped trait is absent from Env",
+		)
+		and typed_expr_resolved_call(invalid.expr).is_none()
+		and typed_expr_resolved_call(missing_method.expr).is_none()
+		and typed_expr_resolved_call(namesake.expr).is_none()
+	)
+
+
+private func issued_method_for_invalid_scope() -> Option[TraitMethodId]:
+	program = parse_compiler_source(
+		source_file(
+			"scope.brp",
+			"scope",
+			"trait Identity:\n\tpure func equals(left: Self, right: Self) -> Bool\n",
+		),
+	)
+	graph ?= typecheck_test_accepted_graph(
+		typecheck_state_for_origin(TYPECHECK_USER_ORIGIN),
+		program,
+		[],
+	).to_option()
+	table = accepted_semantic_catalog_trait_implementation_table(
+		accepted_typecheck_graph_semantic_catalog(graph),
+	)
+	issuer = accepted_trait_implementation_table_definition_table(table)
+	authority = accepted_trait_implementation_authority(
+		table,
+		"scope",
+		accepted_trait_empty_visibility(table),
+		[],
+	)
+	trait_def ?= accepted_trait_find(authority, "Identity")
+
+	match accepted_scoped_trait_methods(authority, issuer, trait_def.trait_id):
+		Ok(IssuedScopedMethods(methods)):
+			method ?= methods.get(0)
+			Some(method[1])
+		_:
+			None
+
+
+private func invalid_accepted_scope_is_terminal(without_symbol: Bool, ufcs: Bool) -> Option[Bool]:
+	context ?= scoped_context_with_semantic_authority(True)
+	method_id ?= issued_method_for_invalid_scope()
+	state = typecheck_state_with_scoped_trait_functions(
+		typecheck_state_from_infer_session(context.state),
+		[],
+	)
+	issuer ?= typecheck_state_definition_table(state)
+	fallback_env = env_add_trait_function(state.env, "equals", "Equatable")
+
+	with_fallback = if without_symbol:
+		add_infer_value(
+			add_infer_value({ state | env = { fallback_env | scopes = [] } }, "left", TYPE_INT),
+			"right",
+			TYPE_INT,
+		)
+	else:
+		{ state | env = fallback_env }
+
+	scoped = typecheck_state_add_scoped_trait_function(
+		with_fallback,
+		{
+			source_name = "equals",
+			owner = AcceptedScopedMethod(issuer, method_id)
+		},
+	)
+	admitted = infer_context(scoped)
+
+	callee = if ufcs:
+		field_access_expr(ParsedNameExpr(ident("left")), "equals")
+	else:
+		ParsedNameExpr(ident("equals"))
+
+	expression = if ufcs:
+		call_expr(callee, [ParsedNameExpr(ident("right"))])
+	else:
+		callee
+
+	fallback = infer_expr(infer_context(with_fallback), expression)
+	result = infer_expr(admitted, expression)
+
+	symbol_premise = match env_lookup(scoped.env, "equals"):
+		Some(symbol):
+			match symbol.kind:
+				FuncSymbolKind(_):
+					not without_symbol
+				_:
+					False
+		None:
+			without_symbol
+
+	Some((
+			module_view_accepted_trait_implementation_authority(
+				admitted.state.facts.module_view,
+			).is_some()
+			and infer_module_facts_requires_graph_definition(admitted.state.facts)
+			and scoped.scoped_trait_functions.length() == 1
+			and symbol_premise
+			and env_lookup(scoped.env, "left").is_some()
+			and env_lookup(scoped.env, "right").is_some()
+			and env_get_var_type(scoped.env, "left")
+				.map(func(typ): types_equal(typ, TYPE_INT))
+				.get_or(False)
+			and env_get_var_type(scoped.env, "right")
+				.map(func(typ): types_equal(typ, TYPE_INT))
+				.get_or(False)
+			and fallback.context.state.errors.is_empty()
+			and typed_expr_resolved_call(fallback.expr).is_some()
+			and result.context.state.errors.length() == 1
+			and result.context.state.errors.contains((
+					"internal typecheck error: scoped trait method identity is absent from accepted "
+					+ "authority"
+				))
+			and typed_expr_resolved_call(result.expr).is_none()
+		))
+
+
+func test_invalid_accepted_scope_func_symbol_is_terminal() -> Bool:
+	invalid_accepted_scope_is_terminal(False, False).get_or(False)
+
+
+func test_invalid_accepted_scope_without_symbol_is_terminal() -> Bool:
+	invalid_accepted_scope_is_terminal(True, False).get_or(False)
+
+
+func test_invalid_accepted_scope_ufcs_is_terminal() -> Bool:
+	invalid_accepted_scope_is_terminal(True, True).get_or(False)
 
 
 func test_ufcs_to_string_uses_trait_dispatch_for_bounded_generic() -> Bool:
@@ -5986,11 +6311,17 @@ func test_closure_call_records_resolved_metadata() -> Bool:
 	(
 		result.context.state.errors.length() == 0
 		and types_equal(typed_expr_semantic_type(result.expr), TYPE_INT)
+		and typed_expr_type_error(result.expr).is_none()
 		and match typed_expr_resolved_call(result.expr):
 			Some(info):
 				(
 					info.callee_name == "<closure>"
 					and resolved_call_callable_id(info) == None
+					and match info.target:
+						ResolvedClosureCall:
+							True
+						_:
+							False
 					and match info.purity:
 						Pure:
 							True
@@ -11712,6 +12043,21 @@ tests: TestSuite = {
 		(
 			"explicit import wins scoped trait method name",
 			test_explicit_import_wins_scoped_trait_method_name,
+		),
+		("unindexed scoped owner with authority is explicit", test_unindexed_scoped_owner_with_authority_is_explicit),
+		("reserved scope rejects unindexed owner without fallback", test_reserved_scope_rejects_unindexed_owner_without_fallback),
+		("invalid compiler scope never falls to builtin or namesake", test_invalid_compiler_scope_never_falls_to_builtin_or_namesake),
+		(
+			"invalid accepted scope FuncSymbol is terminal",
+			test_invalid_accepted_scope_func_symbol_is_terminal,
+		),
+		(
+			"invalid accepted scope without symbol is terminal",
+			test_invalid_accepted_scope_without_symbol_is_terminal,
+		),
+		(
+			"invalid accepted scope UFCS is terminal",
+			test_invalid_accepted_scope_ufcs_is_terminal,
 		),
 		(
 			"UFCS to_string uses trait dispatch for bounded generic",

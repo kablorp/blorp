@@ -4,6 +4,7 @@
 -- operation table. Method names alone are never sufficient because unrelated
 -- traits may intentionally use the same name.
 import:
+	hash: hash_combine
 	ir:
 		CoreCallKind(BuiltinCall, DeferredTraitCall, SelectedDirectCall, SelectedTraitCall),
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
@@ -13,6 +14,7 @@ import:
 		CoreMonoSubstitution,
 		CoreMonoSubstitutionValue(TypeSubstitution),
 		CoreProgram,
+		CoreSourceLoc,
 		CoreType(NamedType, TupleType),
 		CoreTypeParam,
 		CoreVar,
@@ -20,10 +22,15 @@ import:
 	mono:
 		apply_type_substitution,
 		collect_type_substitution,
+		core_mono_type_equal,
 		core_type_contains_parameter,
+		erase_core_mono_value_refinements,
 		is_concrete_substitution,
 		mangle_generic_data_name,
-	mono_specialize: CoreMonoProgramSpecialization
+	mono_instance: core_mono_type_hash
+	mono_specialize:
+		CoreMonoDiagnostic(CoreMonoConflictingImplMethods),
+		CoreMonoProgramSpecialization,
 	mono_substitute: substitute_core_decl_types
 	trait_dispatch:
 		CoreTraitMethodIdentity,
@@ -32,7 +39,8 @@ import:
 		core_hash_key_equals_method,
 		core_hash_key_hash_method,
 		core_unary_trait_method,
-	traverse as CoreTraverse
+	traverse as CoreTraverse: CoreMapState
+	type_policy as CoreTypePolicy
 
 
 private record CoreMonoImplRequest {
@@ -45,8 +53,25 @@ private record CoreMonoImplRequest {
 
 private record CoreMonoImplMaterialization {
 	decl: CoreDecl,
-	next_def_id: Int
+	next_def_id: Int,
+	method_selections: List[CoreMonoImplMethodSelection]
 }
+
+
+record CoreMonoImplMethodSelection {
+	source_def_id: Int,
+	closed_receiver: CoreType,
+	target_def_id: Int
+}
+
+
+type alias CoreMonoImplSelectionIndex = Dict[Int, List[CoreMonoImplMethodSelection]]
+
+
+union CoreMonoImplSelectionLookup:
+	NoSelectedImpl
+	SelectedImpl(Int)
+	ConflictingSelectedImpl(Int, Int)
 
 
 ---
@@ -57,7 +82,8 @@ pass it back in on the next call to skip them.
 record CoreMonoImplSpecializationStep {
 	program: CoreProgram,
 	next_def_id: Int,
-	processed_decl_count: Int
+	processed_decl_count: Int,
+	method_selections: List[CoreMonoImplMethodSelection]
 }
 
 
@@ -693,6 +719,16 @@ private pure func rewrite_sequence_method_references(
 
 private pure func rewrite_method_references(mapping: CoreMonoDefIdMap, expr: CoreExpr) -> CoreExpr:
 	match expr:
+		CallExpr(SelectedTraitCall(trait_name, method_name, module_path, def_id), callee, args, typ, loc):
+			-- The same source method can be called on a different closed receiver.
+			-- Preserve its callee identity until the final receiver-aware remap.
+			CallExpr(
+				SelectedTraitCall(trait_name, method_name, module_path, def_id),
+				callee,
+				args.map(pure func(arg): rewrite_method_references(mapping, arg)),
+				typ,
+				loc,
+			)
 		SeqExpr(_, _):
 			rewrite_sequence_method_references(mapping, expr)
 		LogicalExpr(_, _, _, _, _):
@@ -722,27 +758,6 @@ private pure func rewrite_method_references(mapping: CoreMonoDefIdMap, expr: Cor
 								Some(replacement):
 									CallExpr(
 										SelectedDirectCall(replacement),
-										callee,
-										args,
-										typ,
-										loc,
-									)
-								None:
-									children_rewritten
-						_:
-							children_rewritten
-				CallExpr(SelectedTraitCall(trait_name, method_name, module_path, def_id), callee, args, typ, loc):
-					match callee:
-						VarExpr(variable, _, _):
-							match replacement_def_id(mapping, def_id):
-								Some(replacement):
-									CallExpr(
-										SelectedTraitCall(
-											trait_name,
-											method_name,
-											module_path,
-											replacement,
-										),
 										callee,
 										args,
 										typ,
@@ -808,6 +823,7 @@ private pure func materialize_request(
 			methods: List[CoreFunction] = substituted.methods.map(pure func(method):
 				specialize_method(mapping, impl_type_params, method)
 			)
+			closed_receiver = erase_core_mono_value_refinements(request.concrete_for_type)
 
 			{
 				decl = ImplDecl({ substituted |
@@ -815,13 +831,245 @@ private pure func materialize_request(
 						type_params = [],
 						methods = methods
 					}),
-				next_def_id = next_def_id + methods.length()
+				next_def_id = next_def_id + methods.length(),
+				method_selections = mapping.map(pure func(entry): {
+						source_def_id = entry.source_def_id,
+						closed_receiver = closed_receiver,
+						target_def_id = entry.target_def_id
+					})
 			}
 		_:
 			{
 				decl = ImplDecl(request.template),
-				next_def_id = next_def_id
+				next_def_id = next_def_id,
+				method_selections = []
 			}
+
+
+private pure func selection_hash(source_def_id: Int, receiver: CoreType) -> Int:
+	-- Hashes only choose a bucket; identity is verified structurally below.
+	hash_combine(source_def_id, core_mono_type_hash(receiver))
+
+
+private pure func collect_selection_index(
+	selections: List[CoreMonoImplMethodSelection],
+) -> CoreMonoImplSelectionIndex:
+	var index: CoreMonoImplSelectionIndex = {}
+
+	for selection in selections:
+		key: Int = selection_hash(selection.source_def_id, selection.closed_receiver)
+		index = index.set(
+			key,
+			index
+				.get_or(key, [])
+				.append(selection),
+		)
+
+	index
+
+
+pure func selected_impl_target(
+	index: CoreMonoImplSelectionIndex,
+	source_def_id: Int,
+	receiver: CoreType,
+) -> CoreMonoImplSelectionLookup:
+	var found: CoreMonoImplSelectionLookup = NoSelectedImpl
+
+	for selection in index.get_or(
+		selection_hash(source_def_id, receiver),
+		[],
+	):
+		if (
+			selection.source_def_id == source_def_id
+			and core_mono_type_equal(selection.closed_receiver, receiver)
+		):
+			match found:
+				NoSelectedImpl:
+					found = SelectedImpl(selection.target_def_id)
+				SelectedImpl(first_id):
+					if first_id != selection.target_def_id:
+						found = ConflictingSelectedImpl(first_id, selection.target_def_id)
+						break
+					else:
+						void
+				ConflictingSelectedImpl(_, _):
+					break
+		else:
+			void
+
+	found
+
+
+private pure func remap_selected_impl_expr(
+	state: Result[CoreMonoImplSelectionIndex, CoreMonoDiagnostic],
+	expr: CoreExpr,
+) -> CoreMapState[Result[CoreMonoImplSelectionIndex, CoreMonoDiagnostic], CoreExpr]:
+	match state:
+		Err(_):
+			{
+				state = state,
+				value = expr
+			}
+		Ok(_):
+			mapped: CoreMapState[Result[CoreMonoImplSelectionIndex, CoreMonoDiagnostic], CoreExpr] = match expr:
+				SeqExpr(_, _):
+					spine = CoreTraverse.split_core_sequence(expr)
+					var current_state = state
+					var items: List[CoreExpr] = []
+
+					for item in spine.preceding_items:
+						item_result = remap_selected_impl_expr(current_state, item)
+						current_state = item_result.state
+						items = items.append(item_result.value)
+
+					final_result = remap_selected_impl_expr(current_state, spine.final_item)
+					{
+						state = final_result.state,
+						value = CoreTraverse.rebuild_core_sequence({
+							preceding_items = items,
+							final_item = final_result.value,
+						})
+					}
+				_:
+					CoreTraverse.map_core_expr_children_with_state(
+						state,
+						remap_selected_impl_expr,
+						expr,
+					)
+
+			match mapped.state:
+				Ok(index):
+					match mapped.value:
+						CallExpr(kind, function, args, typ, loc):
+							match kind:
+								SelectedTraitCall(trait_name, method_name, module_path, source_id):
+									match function:
+										VarExpr(callee, callee_type, callee_loc):
+											receiver = erase_core_mono_value_refinements(
+												dispatch_receiver_type(
+													args,
+													typ,
+												),
+											)
+
+											match selected_impl_target(index, source_id, receiver):
+												SelectedImpl(target_id):
+													{
+														state = mapped.state,
+														value = CallExpr(
+															SelectedTraitCall(
+																trait_name,
+																method_name,
+																module_path,
+																target_id,
+															),
+															VarExpr(
+																{ callee |
+																	def_id = Some(target_id)
+																},
+																callee_type,
+																callee_loc,
+															),
+															args,
+															typ,
+															loc,
+														)
+													}
+												ConflictingSelectedImpl(first_id, second_id):
+													{
+														state = Err(
+															CoreMonoConflictingImplMethods(
+																source_id,
+																receiver,
+																first_id,
+																second_id,
+																loc,
+															),
+														),
+														value = mapped.value
+													}
+												NoSelectedImpl:
+													mapped
+										_:
+											mapped
+								_:
+									mapped
+						_:
+							mapped
+				Err(_):
+					mapped
+
+
+private pure func remap_selected_impl_function(
+	state: Result[CoreMonoImplSelectionIndex, CoreMonoDiagnostic],
+	function: CoreFunction,
+) -> CoreMapState[Result[CoreMonoImplSelectionIndex, CoreMonoDiagnostic], CoreFunction]:
+	if not function.type_params.is_empty():
+		{
+			state = state,
+			value = function
+		}
+	else:
+		match function.body:
+			Some(body):
+				mapped = remap_selected_impl_expr(state, body)
+				{
+					state = mapped.state,
+					value = { function | body = Some(mapped.value) }
+				}
+			None:
+				{
+					state = state,
+					value = function
+				}
+
+
+pure func remap_selected_impl_methods(
+	program: CoreProgram,
+	selections: List[CoreMonoImplMethodSelection],
+) -> Result[CoreProgram, CoreMonoDiagnostic]:
+	if selections.is_empty():
+		Ok(program)
+	else:
+		index = collect_selection_index(selections)
+		var state: Result[CoreMonoImplSelectionIndex, CoreMonoDiagnostic] = Ok(index)
+		var decls: List[CoreDecl] = []
+
+		for decl in program.decls:
+			mapped: CoreDecl = match decl:
+				FunctionDecl(function):
+					remapped = remap_selected_impl_function(state, function)
+					state = remapped.state
+					FunctionDecl(remapped.value)
+				GlobalDecl(global):
+					remapped = remap_selected_impl_expr(state, global.init)
+					state = remapped.state
+					GlobalDecl({ global | init = remapped.value })
+				ImplDecl(implementation):
+					if CoreTypePolicy.core_impl_is_generic(implementation):
+						decl
+					else:
+						var methods: List[CoreFunction] = []
+
+						for method in implementation.methods:
+							remapped = remap_selected_impl_function(state, method)
+							state = remapped.state
+							methods = methods.append(remapped.value)
+
+						ImplDecl({ implementation | methods = methods })
+				_:
+					decl
+
+			decls = decls.append(mapped)
+
+			match state:
+				Err(_):
+					break
+				Ok(_):
+					void
+
+		validated_index ?= state
+		Ok({ program | decls = decls })
 
 
 ---
@@ -833,7 +1081,7 @@ directly instead.
 pure func specialize_generic_impls(
 	program: CoreProgram,
 	next_def_id: Int,
-) -> CoreMonoProgramSpecialization:
+) -> Result[CoreMonoProgramSpecialization, CoreMonoDiagnostic]:
 	step: CoreMonoImplSpecializationStep = specialize_generic_impls_with_templates(
 		program,
 		next_def_id,
@@ -841,10 +1089,11 @@ pure func specialize_generic_impls(
 		0,
 	)
 
-	{
-		program = step.program,
-		next_def_id = step.next_def_id
-	}
+	remapped ?= remap_selected_impl_methods(step.program, step.method_selections)
+	Ok({
+		program = remapped,
+		next_def_id = step.next_def_id,
+	})
 
 
 ---
@@ -867,7 +1116,8 @@ pure func specialize_generic_impls_with_templates(
 		{
 			program = program,
 			next_def_id = next_def_id,
-			processed_decl_count = program.decls.length()
+			processed_decl_count = program.decls.length(),
+			method_selections = []
 		}
 	else:
 		concrete_keys: List[String] = concrete_impl_keys(program)
@@ -880,6 +1130,7 @@ pure func specialize_generic_impls_with_templates(
 		var specialized: List[CoreDecl] = []
 		var request_index: Int = 0
 		var current_def_id: Int = next_def_id
+		var method_selections: List[CoreMonoImplMethodSelection] = []
 
 		while request_index < requests.length():
 			match requests.get(request_index):
@@ -889,6 +1140,7 @@ pure func specialize_generic_impls_with_templates(
 						current_def_id,
 					)
 					current_def_id = materialized.next_def_id
+					method_selections = method_selections.concat(materialized.method_selections)
 					specialized = specialized.append(materialized.decl)
 					requests = collect_bound_requests(templates, concrete_keys, requests, request)
 
@@ -912,5 +1164,6 @@ pure func specialize_generic_impls_with_templates(
 		{
 			program = { program | decls = final_decls },
 			next_def_id = current_def_id,
-			processed_decl_count = final_decls.length()
+			processed_decl_count = final_decls.length(),
+			method_selections = method_selections
 		}

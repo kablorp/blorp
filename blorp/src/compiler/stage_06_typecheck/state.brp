@@ -76,6 +76,7 @@ import:
 		prepared_module_scopes_are_compatible,
 		prepared_module_scopes_select_same_module,
 	graph/source_name_table: GraphSourceNameTable
+	headers/declaration_skeleton: TraitMethodId, trait_method_ids_equal
 	modules/module_view:
 		COMPILER_MODULE_VIEW_EMPTY,
 		GraphImportAdmission,
@@ -141,6 +142,7 @@ import:
 		module_origin_is_std,
 	type_system/env: ENV_EMPTY, Env, env_mint_def_id
 	type_system/semantic_type: SemanticType, types_equal
+	type_system/trait_identity: TraitId, trait_ids_equal
 
 
 enum ResourceShapeTarget:
@@ -197,6 +199,18 @@ record TypeShapeMemo {
 }
 
 
+union ScopedTraitFunctionOwner:
+	AcceptedScopedMethod(DefinitionTable, TraitMethodId)
+	CompilerScopedMethod(TraitId)
+	UnindexedScopedTrait(String)
+
+
+record ScopedTraitFunction {
+	source_name: String,
+	owner: ScopedTraitFunctionOwner
+}
+
+
 record TypecheckState {
 	context: Context,
 	env: Env,
@@ -207,7 +221,7 @@ record TypecheckState {
 	module_scope: TypecheckModuleScope,
 	allow_debug_only_calls: Bool,
 	known_type_index: KnownTypeIndex,
-	scoped_trait_functions: List[(String, String)],
+	scoped_trait_functions: List[ScopedTraitFunction],
 	type_homes: TypeHomeIndex,
 	type_shape_memo: TypeShapeMemo,
 	source_table: Option[SourceTable],
@@ -745,39 +759,34 @@ pure func typecheck_state_with_debug_calls(
 
 pure func typecheck_state_with_scoped_trait_functions(
 	state: TypecheckState,
-	functions: List[(String, String)],
+	functions: List[ScopedTraitFunction],
 ) -> TypecheckState:
 	{ state | scoped_trait_functions = functions }
 
 
-pure func typecheck_state_allows_scoped_trait_function(
-	state: TypecheckState,
-	function_name: String,
-	trait_name: String,
-) -> Bool:
-	var found: Bool = False
-
-	for pair in state.scoped_trait_functions:
-		if pair[0] == function_name and pair[1] == trait_name:
-			found = True
-			break
-
-	found
-
-
 pure func typecheck_state_add_scoped_trait_function(
 	state: TypecheckState,
-	function_name: String,
-	trait_name: String,
+	function: ScopedTraitFunction,
 ) -> TypecheckState:
-	if typecheck_state_allows_scoped_trait_function(state, function_name, trait_name):
+	already_present = state.scoped_trait_functions.any(func(existing):
+		existing.source_name == function.source_name and match (existing.owner, function.owner):
+			(UnindexedScopedTrait(left), UnindexedScopedTrait(right)):
+				left == right
+			(CompilerScopedMethod(left), CompilerScopedMethod(right)):
+				trait_ids_equal(left, right)
+			(AcceptedScopedMethod(left_issuer, left), AcceptedScopedMethod(right_issuer, right)):
+				(
+					definition_tables_share_provenance(left_issuer, right_issuer)
+					and trait_method_ids_equal(left, right)
+				)
+			_:
+				False
+	)
+
+	if already_present:
 		state
 	else:
-		{ state |
-			scoped_trait_functions = state.scoped_trait_functions.append(
-				(function_name, trait_name),
-			)
-		}
+		{ state | scoped_trait_functions = state.scoped_trait_functions.append(function) }
 
 
 pure func typecheck_state_add_error(state: TypecheckState, message: String) -> TypecheckState:
@@ -2246,7 +2255,7 @@ record InferModuleFacts {
 	definition_identity_domain: InferDefinitionIdentityDomain,
 	allow_debug_only_calls: Bool,
 	known_type_index: KnownTypeIndex,
-	scoped_trait_functions: List[(String, String)],
+	scoped_trait_functions: List[ScopedTraitFunction],
 	type_homes: TypeHomeIndex,
 	source_table: Option[SourceTable],
 	identifier_spellings: IdentifierSpellings

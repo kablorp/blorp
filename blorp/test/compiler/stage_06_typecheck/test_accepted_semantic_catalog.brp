@@ -7,6 +7,15 @@ import:
 	../../../src/compiler/stage_06_typecheck/headers/accepted_alias_graph: AcceptedAliasGraph
 	../../../src/compiler/stage_06_typecheck/headers/accepted_record_graph: AcceptedRecordGraph
 	../../../src/compiler/stage_06_typecheck/headers/accepted_union_graph: AcceptedUnionGraph
+	../../../src/compiler/stage_06_typecheck/graph/definition_index:
+		DefinitionTable,
+		definition_table_module_table,
+	../../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		TraitMethodId,
+		callable_id_from_definition_table,
+		callable_id_name,
+		trait_id_module_id,
+		trait_method_id_owner,
 	../../../src/compiler/stage_06_typecheck/headers/implementation_headers:
 		ImplementationHeaderGraph,
 		implementation_header_graph_definition_table,
@@ -38,8 +47,38 @@ import:
 		accepted_semantic_catalog_union_graph,
 		accepted_semantic_catalog_union_table,
 	../../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
+		AcceptedConcreteMethodLookup(
+			AcceptedConcreteMethodAbsent, AcceptedConcreteMethodFound,
+			AcceptedConcreteMethodInvalid, AcceptedConcreteMethodTemplate,
+		),
+		AcceptedTraitImplementationAuthority,
 		AcceptedTraitImplementationTable,
+		ScopedTraitMethodSource(CompilerProvidedScopedTrait, IssuedScopedMethods),
+		accepted_find_impl_method_info,
+		accepted_find_impl_method_info_by_trait_id,
+		accepted_find_concrete_impl_method_by_trait_id,
+		accepted_resolve_trait_id_obligation,
+		accepted_scoped_trait_methods,
+		accepted_trait_empty_visibility,
+		accepted_trait_find,
+		accepted_trait_implementation_authority,
+		accepted_trait_implementation_authority_without_visible_names,
 		accepted_trait_implementation_table,
+		accepted_trait_method_binding_declaring_trait_name,
+		accepted_trait_method_binding_for_id,
+	../../../src/compiler/stage_06_typecheck/type_system/builtins: BUILTIN_TRAIT_NAMES
+	../../../src/compiler/stage_06_typecheck/type_system/env:
+		TraitObligationResolution(TraitObligationSatisfied, TraitObligationUnsatisfied),
+		resource_arg_policies_equal,
+	../../../src/compiler/stage_06_typecheck/type_system/semantic_type:
+		SemanticType(SemanticNamedType),
+		TYPE_INT,
+		types_equal,
+	../../../src/compiler/stage_06_typecheck/type_system/trait_identity:
+		TRAIT_ID_EQUATABLE,
+		TraitId,
+		builtin_trait_id_at_registry_index,
+		trait_ids_equal,
 	../../../src/lib/source: source_file
 	../typecheck_test_support: typecheck_test_accepted_graph
 	memory: same_object
@@ -284,9 +323,401 @@ func test_catalog_rejects_empty_complete_global_table() -> Bool:
 	catalog_rejects_empty_complete_global_table().get_or(False)
 
 
+private record ScopedAuthorityFixture {
+	issuer: DefinitionTable,
+	authority: AcceptedTraitImplementationAuthority
+}
+
+
+private func scoped_authority_fixture(source: String) -> Option[ScopedAuthorityFixture]:
+	fixture ?= catalog_component_fixture("scope/main", source)
+	table = fixture.traits_and_implementations
+	Some({
+		issuer = implementation_header_graph_definition_table(fixture.implementation_headers),
+		authority = accepted_trait_implementation_authority(
+			table,
+			"scope/main",
+			accepted_trait_empty_visibility(table),
+			[],
+		),
+	})
+
+
+private pure func issued_scoped_methods(
+	fixture: ScopedAuthorityFixture,
+	trait_id: TraitId,
+) -> Option[List[(String, TraitMethodId)]]:
+	match accepted_scoped_trait_methods(fixture.authority, fixture.issuer, trait_id):
+		Ok(IssuedScopedMethods(methods)):
+			Some(methods)
+		_:
+			None
+
+
+private func scoped_semantic_visibility_survives_hidden_names() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	expected ?= accepted_trait_find(fixture.authority, "Identity")
+	hidden = accepted_trait_implementation_authority_without_visible_names(fixture.authority)
+	methods ?= issued_scoped_methods({ fixture | authority = hidden }, expected.trait_id)
+	Some(accepted_trait_find(hidden, "Identity").is_none() and methods.length() == 1)
+
+
+func test_scoped_semantic_visibility_survives_hidden_names() -> Bool:
+	scoped_semantic_visibility_survives_hidden_names().get_or(False)
+
+
+private func scoped_authority_rejects_foreign_issuer_and_missing_members() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	other_fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	trait_def ?= accepted_trait_find(fixture.authority, "Identity")
+	methods ?= issued_scoped_methods(fixture, trait_def.trait_id)
+	method ?= methods.get(0)
+	empty_table ?= accepted_trait_implementation_table({
+		module_table = definition_table_module_table(fixture.issuer),
+		definition_table = fixture.issuer,
+		traits = [],
+		implementations = [],
+	})
+	empty_authority = accepted_trait_implementation_authority(
+		empty_table,
+		"scope/main",
+		accepted_trait_empty_visibility(empty_table),
+		[],
+	)
+
+	foreign_trait_rejected = match accepted_scoped_trait_methods(
+		fixture.authority,
+		other_fixture.issuer,
+		trait_def.trait_id,
+	):
+		Err(message):
+			message == "scoped trait method issuer does not match accepted authority"
+		_:
+			False
+
+	foreign_method_rejected = match accepted_trait_method_binding_for_id(
+		fixture.authority,
+		other_fixture.issuer,
+		method[1],
+	):
+		Err(message):
+			message == "scoped trait method issuer does not match accepted authority"
+		_:
+			False
+
+	missing_trait_rejected = match accepted_scoped_trait_methods(
+		empty_authority,
+		fixture.issuer,
+		trait_def.trait_id,
+	):
+		Err(message):
+			message == "scoped trait identity is absent from accepted authority"
+		_:
+			False
+
+	missing_method_rejected = match accepted_trait_method_binding_for_id(
+		empty_authority,
+		fixture.issuer,
+		method[1],
+	):
+		Err(message):
+			message == "scoped trait method identity is absent from accepted authority"
+		_:
+			False
+
+	Some(
+		(
+			foreign_trait_rejected
+			and foreign_method_rejected
+			and missing_trait_rejected
+			and missing_method_rejected
+		),
+	)
+
+
+func test_scoped_authority_rejects_foreign_issuer_and_missing_members() -> Bool:
+	scoped_authority_rejects_foreign_issuer_and_missing_members().get_or(False)
+
+
+private func concrete_method_lookup_preserves_invalid_and_absent_boundaries() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	foreign_fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	trait_def ?= accepted_trait_find(fixture.authority, "Identity")
+	env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	receiver = SemanticNamedType("Pair", [])
+	ordinary ?= accepted_find_impl_method_info_by_trait_id(
+		fixture.authority,
+		fixture.issuer,
+		env,
+		trait_def.trait_id,
+		"identity",
+		receiver,
+	)
+	expected ?= ordinary.target
+
+	selected = match accepted_find_concrete_impl_method_by_trait_id(
+		fixture.authority,
+		fixture.issuer,
+		env,
+		trait_def.trait_id,
+		"identity",
+		receiver,
+	):
+		AcceptedConcreteMethodFound(method):
+			method.target
+				.map(func(target): target.callable_id == expected.callable_id)
+				.get_or(False)
+		_:
+			False
+
+	foreign_rejected = match accepted_find_concrete_impl_method_by_trait_id(
+		fixture.authority,
+		foreign_fixture.issuer,
+		env,
+		trait_def.trait_id,
+		"identity",
+		receiver,
+	):
+		AcceptedConcreteMethodInvalid(_):
+			True
+		_:
+			False
+
+	member_rejected = match accepted_find_concrete_impl_method_by_trait_id(
+		fixture.authority,
+		fixture.issuer,
+		env,
+		trait_def.trait_id,
+		"missing_member",
+		receiver,
+	):
+		AcceptedConcreteMethodInvalid(_):
+			True
+		_:
+			False
+
+	compiler_member_rejected = match accepted_find_concrete_impl_method_by_trait_id(
+		fixture.authority,
+		fixture.issuer,
+		env,
+		TRAIT_ID_EQUATABLE,
+		"missing_member",
+		TYPE_INT,
+	):
+		AcceptedConcreteMethodInvalid(_):
+			True
+		_:
+			False
+
+	no_method = match accepted_find_concrete_impl_method_by_trait_id(
+		fixture.authority,
+		fixture.issuer,
+		env,
+		trait_def.trait_id,
+		"identity",
+		TYPE_INT,
+	):
+		AcceptedConcreteMethodAbsent:
+			True
+		_:
+			False
+
+	Some(
+		(
+			selected
+			and foreign_rejected
+			and member_rejected
+			and compiler_member_rejected
+			and no_method
+		),
+	)
+
+
+func test_concrete_method_lookup_preserves_invalid_and_absent_boundaries() -> Bool:
+	concrete_method_lookup_preserves_invalid_and_absent_boundaries().get_or(False)
+
+
+private func scoped_inheritance_preserves_declaring_identity() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(
+		"trait Parent:\n\tpure func show(value: Self) -> Int\n" + "trait Child: Parent:\n\tpure func show(value: Self) -> Int\n\tpure func detail(value: Self) -> Int\n" + "trait Equatable:\n\tpure func equals(left: Self, right: Self) -> Bool\n",
+	)
+	child ?= accepted_trait_find(fixture.authority, "Child")
+	parent ?= accepted_trait_find(fixture.authority, "Parent")
+	namesake ?= accepted_trait_find(fixture.authority, "Equatable")
+	methods ?= issued_scoped_methods(fixture, child.trait_id)
+	first ?= methods.get(0)
+	inherited ?= methods.get(2)
+	binding ?= accepted_trait_method_binding_for_id(
+		fixture.authority,
+		fixture.issuer,
+		inherited[1],
+	).to_option()
+	Some(
+		(
+			methods.length() == 3
+			and first[0] == "show"
+			and trait_ids_equal(trait_method_id_owner(first[1]), child.trait_id)
+			and inherited[0] == "show"
+			and trait_ids_equal(trait_method_id_owner(inherited[1]), parent.trait_id)
+			and accepted_trait_method_binding_declaring_trait_name(binding) == "Parent"
+			and trait_id_module_id(fixture.issuer, namesake.trait_id).is_some()
+		),
+	)
+
+
+func test_scoped_inheritance_preserves_declaring_identity() -> Bool:
+	scoped_inheritance_preserves_declaring_identity().get_or(False)
+
+
+private func compiler_scope_preserves_obligation_and_selected_metadata() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(
+		"record Choice {value: Int}\nimplements Equatable for Choice:\n\tpure func equals(left: Choice, right: Choice) -> Bool: True\n",
+	)
+
+	compiler_source = match accepted_scoped_trait_methods(
+		fixture.authority,
+		fixture.issuer,
+		TRAIT_ID_EQUATABLE,
+	):
+		Ok(CompilerProvidedScopedTrait(id)):
+			trait_ids_equal(id, TRAIT_ID_EQUATABLE)
+		_:
+			False
+
+	env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	receiver = SemanticNamedType("Choice", [])
+	legacy ?= accepted_find_impl_method_info(
+		fixture.authority,
+		env,
+		"Equatable",
+		"equals",
+		receiver,
+	)
+	selected ?= accepted_find_impl_method_info_by_trait_id(
+		fixture.authority,
+		fixture.issuer,
+		env,
+		TRAIT_ID_EQUATABLE,
+		"equals",
+		receiver,
+	)
+	legacy_target ?= legacy.target
+	selected_target ?= selected.target
+	issued_callable ?= callable_id_from_definition_table(
+		fixture.issuer,
+		selected_target.callable_id,
+	)
+	Some(
+		(
+			compiler_source
+			and accepted_trait_find(fixture.authority, "Equatable").is_none()
+			and callable_id_name(fixture.issuer, issued_callable) == Some("equals")
+			and selected_target.callable_id == legacy_target.callable_id
+			and types_equal(selected.func_type, legacy.func_type)
+			and selected.param_names == legacy.param_names
+			and selected.purity == legacy.purity
+			and resource_arg_policies_equal(selected.resource_args, legacy.resource_args)
+			and selected.debug_only == legacy.debug_only
+			and selected.type_params.is_empty()
+			and legacy.type_params.is_empty()
+			and selected.dim_constraints.is_empty()
+			and legacy.dim_constraints.is_empty()
+			and accepted_resolve_trait_id_obligation(
+				fixture.authority,
+				fixture.issuer,
+				env,
+				TYPE_INT,
+				TRAIT_ID_EQUATABLE,
+			) == TraitObligationSatisfied
+		),
+	)
+
+
+func test_compiler_scope_preserves_obligation_and_selected_metadata() -> Bool:
+	compiler_scope_preserves_obligation_and_selected_metadata().get_or(False)
+
+
+private func compiler_consumers_reject_foreign_and_unregistered_ids() -> Option[Bool]:
+	fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	other_fixture ?= scoped_authority_fixture(CATALOG_SOURCE)
+	env = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN).env
+	forged = builtin_trait_id_at_registry_index(BUILTIN_TRAIT_NAMES.length())
+
+	forged_scope_rejected = match accepted_scoped_trait_methods(
+		fixture.authority,
+		fixture.issuer,
+		forged,
+	):
+		Err(message):
+			message == "scoped trait identity is not registered in its issuing domain"
+		_:
+			False
+
+	Some(
+		(
+			forged_scope_rejected
+			and accepted_resolve_trait_id_obligation(
+				fixture.authority,
+				other_fixture.issuer,
+				env,
+				TYPE_INT,
+				TRAIT_ID_EQUATABLE,
+			) == TraitObligationUnsatisfied
+			and accepted_resolve_trait_id_obligation(
+				fixture.authority,
+				fixture.issuer,
+				env,
+				TYPE_INT,
+				forged,
+			) == TraitObligationUnsatisfied
+			and accepted_find_impl_method_info_by_trait_id(
+				fixture.authority,
+				other_fixture.issuer,
+				env,
+				TRAIT_ID_EQUATABLE,
+				"equals",
+				TYPE_INT,
+			).is_none()
+			and accepted_find_impl_method_info_by_trait_id(
+				fixture.authority,
+				fixture.issuer,
+				env,
+				forged,
+				"equals",
+				TYPE_INT,
+			).is_none()
+		),
+	)
+
+
+func test_compiler_consumers_reject_foreign_and_unregistered_ids() -> Bool:
+	compiler_consumers_reject_foreign_and_unregistered_ids().get_or(False)
+
+
 tests: TestSuite = {
 	description = "Accepted semantic catalog",
 	tests = [
+		("concrete method lookup preserves invalid and absent boundaries", test_concrete_method_lookup_preserves_invalid_and_absent_boundaries),
+		(
+			"compiler scope preserves obligation and selected metadata",
+			test_compiler_scope_preserves_obligation_and_selected_metadata,
+		),
+		(
+			"compiler consumers reject foreign and unregistered IDs",
+			test_compiler_consumers_reject_foreign_and_unregistered_ids,
+		),
+		(
+			"scoped semantic visibility survives hidden names",
+			test_scoped_semantic_visibility_survives_hidden_names,
+		),
+		(
+			"scoped authority rejects foreign issuers and missing members",
+			test_scoped_authority_rejects_foreign_issuer_and_missing_members,
+		),
+		(
+			"scoped inheritance preserves declaring identity",
+			test_scoped_inheritance_preserves_declaring_identity,
+		),
 		("accepts one coherent domain", test_catalog_accepts_one_coherent_domain),
 		("catalog counts have record identity", test_catalog_counts_have_record_identity),
 		("rejects every mixed domain", test_catalog_rejects_every_mixed_domain),

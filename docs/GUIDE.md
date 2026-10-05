@@ -1208,7 +1208,7 @@ Prefer `record` for new declarations. Choosing another spelling does not change
 ownership or allocation behavior. Managed fields such as `String` and `List[T]`
 are accepted in every spelling.
 
-`fixed` is contextual: it modifies a following `record` declaration and remains
+`fixed` is contextual: it modifies a following `record` or `union` declaration and remains
 an ordinary identifier elsewhere. `struct` is also an ordinary identifier.
 
 ### Union Types (Sum Types / ADTs)
@@ -1239,6 +1239,28 @@ err: Result[Int, String] = Err("failed")
 
 A variant may declare at most 64 fields. Group related fields into a record and
 use the record as one field when a payload grows that large.
+
+`fixed union` is currently an alternative spelling of `union`. The formatter
+preserves the qualifier, but both spellings use the same typechecking, matching,
+ownership, and storage rules, including type and dimension parameters. It
+promises no stack placement, inline payload, absence of allocation or boxing,
+or native by-value ABI.
+
+Both union spellings let you declare a payload-free variant as `Empty` or
+`Empty()`; the formatter prints `Empty`. The constructor is a value: refer to
+it as `Empty`, not a call `Empty()`. Enum cases remain bare names without parentheses.
+
+```blorp
+-- Temporary synonym behavior; this payload will not satisfy checked fixed unions.
+fixed union Response:
+    Accepted(Int)
+    Rejected(String)
+```
+
+The planned checked `fixed union` constraint will reject direct or nested
+`String` payloads, even in unused variants. Use ordinary `union` for managed
+payloads such as `String` when preparing for that constraint. This checked
+guarantee is not enforced by the current synonym.
 
 ### Enum Types
 
@@ -3481,5 +3503,5 @@ concurrent concurrently detach   select     from       after      sealed     wit
 resource   where      into_opaque from_opaque
 ```
 
-`fixed` is contextual only before `record` at a declaration opening; it
+`fixed` is contextual before `record` or `union` at a declaration opening; it
 remains an ordinary identifier elsewhere.

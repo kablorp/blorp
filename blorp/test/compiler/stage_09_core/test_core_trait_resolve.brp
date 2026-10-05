@@ -1,5 +1,9 @@
 import:
-	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
+	../../../src/compiler/stage_09_core/function_origin_fixture:
+		FIXTURE_NO_SOURCE_MODULE,
+		FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		fixture_declaration_index,
+		fixture_name_table,
 	../../../src/compiler/stage_09_core/ir:
 		is_user_function_kind,
 		CoreBinaryOp(AddOp, EqualOp, GreaterEqualOp, GreaterOp, LessEqualOp, LessOp, NotEqualOp),
@@ -9,6 +13,7 @@ import:
 			SelectedDirectCall,
 			SelectedTraitCall,
 			UnknownCall,
+			UserCall,
 		),
 		CoreDecl(EnumDecl, FunctionDecl, ImplDecl, TraitDecl, UnionDecl),
 		CoreDimOp(DimDivide, DimMultiply, DimSubtract),
@@ -30,6 +35,8 @@ import:
 		CoreParam,
 		CoreProgram,
 		CoreSourceLoc,
+		core_source_loc_row_unresolved,
+		pack_core_source_loc,
 		synthetic_core_source_loc,
 		CoreTensorDim(TensorDimOperation, TensorRuntimeDim, TensorStaticDim),
 		CoreTraitDecl,
@@ -50,6 +57,15 @@ import:
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_expr_type,
+	../../../src/compiler/stage_09_core/mono: core_mono_type_equal
+	../../../src/compiler/stage_09_core/mono_impl: remap_selected_impl_methods
+	../../../src/compiler/stage_09_core/mono_specialize:
+		CoreMonoDiagnostic(CoreMonoConflictingImplMethods),
+		core_mono_diagnostic_hint,
+		core_mono_diagnostic_loc,
+		core_mono_diagnostic_message,
+	../../../src/compiler/stage_09_core/monomorphize: specialize_generic_functions_and_data
+	../../../src/compiler/stage_09_core/resolve: resolve_core_program
 	../../../src/compiler/stage_09_core/trait_resolve:
 		CoreTraitResolveDiagnostic,
 		core_trait_impl_type_key,
@@ -418,10 +434,262 @@ pure func test_selected_trait_call_resolves_by_trait_identity() -> Bool:
 		stringable_impl(widget_type()),
 		main,
 	])):
-		Some(resolved):
-			call_targets(resolved, True, "Stringable_to_string_Widget")
+		Some(CallExpr(SelectedDirectCall(10), VarExpr(callee, _, _), _, _, _)):
+			callee.name == "Stringable_to_string_Widget" and callee.def_id == Some(10)
+		Some(_):
+			False
 		None:
 			False
+
+
+pure func selected_stringable_program(methods: List[CoreDecl], selected_id: Int) -> CoreProgram:
+	value: CoreExpr = var_expr("value", widget_type())
+	body: CoreExpr = call(
+		SelectedTraitCall("Stringable", "to_string", "packages/app", selected_id),
+		"__ufcs_app__to_string",
+		[value],
+		string_type(),
+	)
+	program(
+		[stringable_trait(widget_type())]
+			.concat(methods)
+			.append(
+				FunctionDecl(
+					function(
+						"main",
+						20,
+						[param("value", widget_type())],
+						string_type(),
+						body,
+					),
+				),
+			),
+	)
+
+
+pure func test_selected_trait_keeps_exact_id_across_colliding_dispatch_keys() -> Bool:
+	first: CoreDecl = stringable_impl(widget_type())
+	second: CoreDecl = impl_decl(
+		"Stringable",
+		widget_type(),
+		[
+			function(
+				"to_string",
+				11,
+				[param("value", widget_type())],
+				string_type(),
+				string_literal("second"),
+			),
+		],
+	)
+	var valid: Bool = True
+
+	for methods in (
+		[
+			[first, second],
+			[second, first],
+		]
+	):
+		for requested_id in [10, 11]:
+			match resolved_main_body(selected_stringable_program(methods, requested_id)):
+				Some(CallExpr(SelectedDirectCall(selected_id), VarExpr(callee, _, _), _, _, _)):
+					valid = (
+						valid
+						and selected_id == requested_id
+						and callee.def_id == Some(requested_id)
+						and callee.name == "Stringable_to_string_Widget"
+					)
+				_:
+					valid = False
+
+	valid
+
+
+pure func test_selected_trait_missing_id_rejects_viable_dispatch_fallback() -> Bool:
+	selected_target_is_missing(
+		selected_stringable_program([stringable_impl(widget_type())], 99),
+		"Stringable",
+		"to_string",
+		"packages/app",
+		99,
+	)
+
+
+private pure func selected_target_is_missing(
+	program: CoreProgram,
+	trait_name: String,
+	method_name: String,
+	module_name: String,
+	def_id: Int,
+) -> Bool:
+	match resolve_core_traits(program):
+		Err(diagnostic):
+			match diagnostic:
+				MissingSelectedTraitTarget(selected):
+					(
+						selected.trait_name == trait_name
+						and selected.method_name == method_name
+						and selected.module_name == module_name
+						and selected.def_id == def_id
+						and core_trait_resolve_diagnostic_message(
+							diagnostic,
+						) == "selected trait target `${trait_name}.${method_name}` was not available after monomorphization"
+						and core_trait_resolve_diagnostic_hint(
+							diagnostic,
+						) == "compiler-selected target `${module_name}` definition ${def_id} was lost; report this as a compiler bug"
+					)
+				_:
+					False
+		Ok(_):
+			False
+
+
+pure func test_selected_trait_id_survives_callable_resolution() -> Bool:
+	match resolve_core_traits(selected_stringable_program([stringable_impl(widget_type())], 10)):
+		Ok(selected):
+			names = fixture_name_table([
+				"Stringable_to_string_Widget",
+				"to_string",
+				"main",
+				"Widget",
+				"Stringable",
+			])
+			resolved: CoreProgram = resolve_core_program(
+				fixture_declaration_index(names, selected),
+				selected,
+				[],
+				[],
+			)
+
+			match resolved.decls.get(resolved.decls.length() - 1):
+				Some(FunctionDecl(main)):
+					match main.body:
+						Some(CallExpr(UserCall("Stringable_to_string_Widget", Some(10), _), VarExpr(callee, _, _), _, _, _)):
+							callee.def_id == Some(10)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_selected_trait_duplicate_id_is_rejected() -> Bool:
+	implementation: CoreDecl = stringable_impl(widget_type())
+	selected_target_is_missing(
+		selected_stringable_program(
+			[implementation, implementation],
+			10,
+		),
+		"Stringable",
+		"to_string",
+		"packages/app",
+		10,
+	)
+
+
+pure func test_selected_trait_checks_enclosing_trait_member_and_receiver() -> Bool:
+	var valid: Bool = True
+
+	for kind in [
+		SelectedTraitCall("OtherTrait", "to_string", "app", 10),
+		SelectedTraitCall("Stringable", "other_member", "app", 10),
+	]:
+		body: CoreExpr = call(kind, "to_string", [var_expr("value", widget_type())], string_type())
+
+		match kind:
+			SelectedTraitCall(trait_name, method_name, module_name, def_id):
+				valid = valid and selected_target_is_missing(program([
+						stringable_trait(widget_type()),
+						stringable_impl(widget_type()),
+						FunctionDecl(function("main", 20, [], string_type(), body)),
+					]), trait_name, method_name, module_name, def_id)
+			_:
+				valid = False
+
+	body: CoreExpr = call(
+		SelectedTraitCall("Stringable", "to_string", "app", 10),
+		"to_string",
+		[var_expr("value", named_type("OtherReceiver"))],
+		string_type(),
+	)
+	valid and selected_target_is_missing(program([
+			stringable_trait(widget_type()),
+			stringable_impl(widget_type()),
+			FunctionDecl(function("main", 20, [], string_type(), body)),
+		]), "Stringable", "to_string", "app", 10)
+
+
+pure func test_selected_scalar_method_classification_uses_exact_method() -> Bool:
+	receiver: CoreType = named_type("Int16")
+	native: CoreDecl = native_scalar_addable_impl(receiver, "int16")
+	source: CoreDecl = impl_decl(
+		"Addable",
+		receiver,
+		[
+			function(
+				"add",
+				12,
+				[param("left", receiver), param("right", receiver)],
+				receiver,
+				var_expr(
+					"left",
+					receiver,
+				),
+			),
+		],
+	)
+	var valid: Bool = True
+
+	for implementations in (
+		[
+			[native, source],
+			[source, native],
+		]
+	):
+		for requested_id in [11, 12]:
+			body: CoreExpr = call(
+				SelectedTraitCall(
+					"Addable",
+					"add",
+					"packages/int16",
+					requested_id,
+				),
+				"add",
+				[var_expr("left", receiver), var_expr("right", receiver)],
+				receiver,
+			)
+
+			match resolve_core_traits(
+				program(
+					implementations.append(
+						FunctionDecl(function("main", 20, [], receiver, body)),
+					),
+				),
+			):
+				Ok(resolved):
+					for decl in resolved.decls:
+						match decl:
+							ImplDecl(implementation):
+								for method in implementation.methods:
+									valid = valid and is_user_function_kind(method.function_kind)
+							FunctionDecl(main):
+								valid = valid and match (requested_id, main.body):
+									(11, Some(BinaryExpr(AddOp, _, _, _, _))):
+										True
+									(12, Some(CallExpr(SelectedDirectCall(12), VarExpr(callee, _, _), _, _, _))):
+										(
+											callee.def_id == Some(12)
+											and callee.name == "Addable_add_Int16"
+										)
+									_:
+										False
+							_:
+								void
+				Err(_):
+					valid = False
+
+	valid
 
 
 pure func test_selected_trait_registry_miss_is_an_error() -> Bool:
@@ -549,14 +817,132 @@ pure func test_unmaterialized_generic_source_target_is_an_error() -> Bool:
 		),
 	)
 
-	match resolve_core_traits(program([
-		stringable_trait(list_type),
-		generic_source_stringable_impl(),
-		main,
-	])):
-		Err(_):
-			True
+	selected_target_is_missing(program([
+			stringable_trait(list_type),
+			generic_source_stringable_impl(),
+			main,
+		]), "Stringable", "to_string", "app", 10)
+
+
+pure func test_selected_generic_builtin_requires_exact_quadruple() -> Bool:
+	list_type: CoreType = NamedType("List", [widget_type()])
+	var valid: Bool = True
+
+	for kind in [
+		SelectedTraitCall("OtherTrait", "to_string", "list", 10),
+		SelectedTraitCall("Stringable", "other_member", "list", 10),
+		SelectedTraitCall("Stringable", "to_string", "other_owner", 10),
+		SelectedTraitCall("Stringable", "to_string", "list", 99),
+	]:
+		body: CoreExpr = call(kind, "to_string", [var_expr("value", list_type)], string_type())
+
+		match kind:
+			SelectedTraitCall(trait_name, method_name, module_name, def_id):
+				valid = valid and selected_target_is_missing(program([
+						generic_stringable_impl(),
+						FunctionDecl(function("main", 20, [], string_type(), body)),
+					]), trait_name, method_name, module_name, def_id)
+			_:
+				valid = False
+
+	valid
+
+
+pure func test_conflicting_remap_is_terminal_before_generic_builtin_exception() -> Bool:
+	list_type: CoreType = NamedType("List", [widget_type()])
+	loc = pack_core_source_loc(0, 17, 3, 17, 20)
+	body: CoreExpr = CallExpr(
+		SelectedTraitCall("Stringable", "to_string", "list", 10),
+		var_expr(
+			"to_string",
+			function_type([list_type], string_type()),
+		),
+		[var_expr("value", list_type)],
+		string_type(),
+		loc,
+	)
+	source = program([
+		generic_stringable_impl(),
+		FunctionDecl(function("main", 20, [], string_type(), body)),
+	])
+
+	match (
+		remap_selected_impl_methods(
+			source,
+			[
+				{
+					source_def_id = 10,
+					closed_receiver = list_type,
+					target_def_id = 100
+				},
+				{
+					source_def_id = 10,
+					closed_receiver = list_type,
+					target_def_id = 101
+				},
+			],
+		)
+	):
+		Err(diagnostic):
+			match diagnostic:
+				CoreMonoConflictingImplMethods(10, receiver, 100, 101, _):
+					(
+						core_mono_type_equal(receiver, list_type)
+						and core_source_loc_row_unresolved(
+							core_mono_diagnostic_loc(diagnostic),
+						).start_line == 17
+						and core_mono_diagnostic_message(diagnostic).contains("selected method 10")
+						and core_mono_diagnostic_message(diagnostic).contains("targets 100 and 101")
+						and core_mono_diagnostic_message(diagnostic).contains("Widget")
+						and core_mono_diagnostic_hint(diagnostic)
+							.get_or("")
+							.contains("internal compiler error")
+					)
+				_:
+					False
 		Ok(_):
+			False
+
+
+pure func test_selected_specialized_method_keeps_remapped_identity() -> Bool:
+	list_type: CoreType = NamedType("List", [widget_type()])
+	body: CoreExpr = call(
+		SelectedTraitCall("Stringable", "to_string", "packages/app", 10),
+		"to_string",
+		[var_expr("value", list_type)],
+		string_type(),
+	)
+
+	match specialize_generic_functions_and_data(program([
+			generic_source_stringable_impl(),
+			FunctionDecl(function("main", 20, [], string_type(), body)),
+		]), 100):
+		Ok(specialized):
+			match resolve_core_traits(specialized.program):
+				Ok(resolved):
+					var valid: Bool = False
+
+					for decl in resolved.decls:
+						match decl:
+							FunctionDecl(main):
+								if main.name == "main":
+									valid = match main.body:
+										Some(CallExpr(SelectedDirectCall(100), VarExpr(callee, _, _), _, _, _)):
+											(
+												callee.def_id == Some(100)
+												and callee.name == "Stringable_to_string_List_Widget"
+											)
+										_:
+											False
+								else:
+									void
+							_:
+								void
+
+					valid
+				Err(_):
+					False
+		Err(_):
 			False
 
 
@@ -2135,6 +2521,27 @@ tests: TestSuite = {
 		),
 		("selected trait registry miss is an error", test_selected_trait_registry_miss_is_an_error),
 		(
+			"selected trait keeps exact id across colliding dispatch keys",
+			test_selected_trait_keeps_exact_id_across_colliding_dispatch_keys,
+		),
+		(
+			"selected trait missing id rejects viable dispatch fallback",
+			test_selected_trait_missing_id_rejects_viable_dispatch_fallback,
+		),
+		("selected trait duplicate id is rejected", test_selected_trait_duplicate_id_is_rejected),
+		(
+			"selected trait id survives callable resolution",
+			test_selected_trait_id_survives_callable_resolution,
+		),
+		(
+			"selected trait checks enclosing trait member and receiver",
+			test_selected_trait_checks_enclosing_trait_member_and_receiver,
+		),
+		(
+			"selected scalar method classification uses exact method",
+			test_selected_scalar_method_classification_uses_exact_method,
+		),
+		(
 			"selected direct call is not trait dispatch",
 			test_selected_direct_call_is_not_trait_dispatch,
 		),
@@ -2146,6 +2553,18 @@ tests: TestSuite = {
 		(
 			"unmaterialized generic source target is an error",
 			test_unmaterialized_generic_source_target_is_an_error,
+		),
+		(
+			"selected generic builtin requires exact quadruple",
+			test_selected_generic_builtin_requires_exact_quadruple,
+		),
+		(
+			"conflicting remap is terminal before builtin exception",
+			test_conflicting_remap_is_terminal_before_generic_builtin_exception,
+		),
+		(
+			"selected specialized method keeps remapped identity",
+			test_selected_specialized_method_keeps_remapped_identity,
 		),
 		(
 			"generic function keeps selected trait identity",

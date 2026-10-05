@@ -671,6 +671,114 @@ func test_extracts_type_definitions_and_references() -> Bool:
 					False
 
 
+private func fixed_union_query_case(
+	graph: TypecheckedGraph,
+	declaration_graph: TypecheckedGraph,
+	declaration_uri_text: String,
+	type_line: Int,
+	match_line: Int,
+	construction_line: Int,
+) -> Option[Bool]:
+	artifact = semantic_artifact_id_from_value("fixed-union-semantic-index-test")
+	uri = document_uri("file:///workspace/main.brp")
+	declaration_uri = document_uri(declaration_uri_text)
+	index ?= semantic_index_for_target(artifact, uri, graph).to_option()
+	declaration_index ?= semantic_index_for_target(artifact, declaration_uri, declaration_graph).to_option()
+	definitions = module_semantic_index_definitions(declaration_index)
+	response ?= definition_named(definitions, "Response")
+	accepted ?= definition_named(definitions, "Accepted")
+	references = module_semantic_index_references(index)
+	constructor_use ?= references.find(func(reference):
+		(not reference.is_declaration and semantic_symbol_ids_equal(reference.symbol, accepted.symbol)
+			and reference.location.range.start.line == construction_line)
+	)
+	type_use ?= references.find(func(reference):
+		(not reference.is_declaration and semantic_symbol_ids_equal(reference.symbol, response.symbol)
+			and reference.location.range.start.line == type_line)
+	)
+	revision ?= workspace_revision(0)
+	modules = if declaration_uri == uri:
+		[index]
+	else:
+		[index, declaration_index]
+	snapshot: SemanticIndexSnapshot = {
+		workspace_revision = revision, modules = modules, coverage = CompleteIndexCoverage
+	}
+	state = CurrentSemanticIndex(snapshot)
+	constructor_locations ?= definition_query_snapshot(state, uri, constructor_use.location.range.start)
+	type_locations ?= definition_query_snapshot(state, uri, type_use.location.range.start)
+	hover ?= hover_query_snapshot(state, uri, constructor_use.location.range.start)
+	symbols ?= document_symbols_query_snapshot(state, declaration_uri)
+	Some((
+		graph.target.errors.is_empty() and graph.modules.all(func(module): module.errors.is_empty())
+		and constructor_locations.length() == 1
+		and constructor_locations.get(0).map(func(location): location.uri == declaration_uri).get_or(False)
+		and type_locations.length() == 1
+		and type_locations.get(0).map(func(location): location.uri == declaration_uri).get_or(False)
+		and hover.contents == accepted.hover_contents and hover.contents.contains("Accepted")
+		and references.filter(func(reference):
+			not reference.is_declaration and semantic_symbol_ids_equal(reference.symbol, accepted.symbol)
+		).length() == 2
+		and references.filter(func(reference):
+			(not reference.is_declaration and semantic_symbol_ids_equal(reference.symbol, accepted.symbol)
+				and reference.location.range.start.line == match_line)
+		).length() == 1
+		-- Selective import openings do not contribute constructor occurrences.
+		and references.filter(func(reference):
+			(not reference.is_declaration and semantic_symbol_ids_equal(reference.symbol, accepted.symbol)
+				and reference.location.range.start.line < type_line)
+		).is_empty()
+		and symbols.any(func(symbol): symbol.name == "Response" and symbol.kind == DocumentSymbolClass)
+		and symbols.any(func(symbol): symbol.name == "Accepted" and symbol.kind == DocumentSymbolConstructor)
+		and symbols.any(func(symbol): symbol.name == "Rejected" and symbol.kind == DocumentSymbolConstructor)
+	))
+
+
+func test_fixed_union_local_definitions_hover_symbols_and_constructor_references() -> Bool:
+	source: String =
+		|fixed union Response:
+		|	Accepted(Int)
+		|	Rejected(String)
+		|
+		|pure func read(response: Response) -> Int:
+		|	match response:
+		|		Accepted(value): value
+		|		Rejected(_): 0
+		|
+		|pure func example() -> Int: read(Accepted(7))
+	graph = typecheck_graph(graph_request_for_source(source))
+	fixed_union_query_case(graph, graph, "file:///workspace/main.brp", 4, 6, 9).get_or(False)
+
+
+func test_fixed_union_imported_definitions_hover_symbols_and_constructor_references() -> Bool:
+	source: String =
+		|import:
+		|	dep: Response(Accepted, Rejected)
+		|
+		|pure func read(response: Response) -> Int:
+		|	match response:
+		|		Accepted(value): value
+		|		Rejected(_): 0
+		|
+		|pure func example() -> Int: read(Accepted(7))
+	request = graph_request_for_source(source)
+	dependency: TypecheckImportModule = {
+		path = "/workspace/dep.brp", module_name = "dep", module_path = "dep",
+		text = "fixed union Response:\n\tAccepted(Int)\n\tRejected(String)\n",
+		typecheck_program = None, module_surface = None, origin = UserModule
+	}
+	graph = typecheck_graph({ request |
+		modules = [dependency], module_targets = ["dep"],
+		resolved_imports = [{
+			from_path = "/workspace/main.brp", from_module = "main",
+			import_path = "dep", resolved_module = "dep"
+		}]
+	})
+	match graph.modules.get(0):
+		Some(module): fixed_union_query_case(graph, { graph | target = module }, "file:///workspace/dep.brp", 3, 5, 8).get_or(False)
+		None: False
+
+
 func test_type_references_preserve_local_and_imported_definition_owners() -> Bool:
 	source: String =
 		|import:
@@ -1661,6 +1769,8 @@ tests: TestSuite = {
 			test_extracts_constructor_definitions_and_references,
 		),
 		("extract type definitions and references", test_extracts_type_definitions_and_references),
+		("fixed union local definitions hover symbols and constructor references", test_fixed_union_local_definitions_hover_symbols_and_constructor_references),
+		("fixed union imported definitions hover symbols and constructor references", test_fixed_union_imported_definitions_hover_symbols_and_constructor_references),
 		(
 			"type references preserve local and imported definition owners",
 			test_type_references_preserve_local_and_imported_definition_owners,

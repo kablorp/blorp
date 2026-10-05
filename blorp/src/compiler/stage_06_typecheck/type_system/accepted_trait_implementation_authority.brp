@@ -32,14 +32,17 @@ import:
 		TraitMethodId,
 		builtin_trait_id,
 		callable_id_definition_id,
+		callable_id_from_definition_table,
 		callable_id_module_id,
 		callable_id_name,
+		callable_ids_equal,
 		impl_id_definition_id,
 		impl_id_module_id,
 		impl_id_name,
 		trait_id_compiler_identity,
 		trait_id_definition_id,
 		trait_id_from_definition_table,
+		trait_id_is_valid,
 		trait_id_module_id,
 		trait_id_name,
 		trait_id_source_span,
@@ -69,6 +72,7 @@ import:
 		TraitObligationResolution(
 			TraitObligationDeferred, TraitObligationSatisfied, TraitObligationUnsatisfied,
 		),
+		env_get_trait_by_id,
 		env_get_type_param_bound_identities,
 		env_resolve_trait_obligation,
 		impl_instances_may_overlap,
@@ -2471,6 +2475,66 @@ private pure func table_find_trait_method_by_id(
 		})
 
 
+-- Scoped method identities are issued from the same table as their body header.
+-- Keep inheritance's local-first order and each method's declaring owner.
+union ScopedTraitMethodSource:
+	IssuedScopedMethods(List[(String, TraitMethodId)])
+	CompilerProvidedScopedTrait(TraitId)
+
+
+private pure func table_trait_is_compiler_owned(
+	table: AcceptedTraitImplementationTableRep,
+	trait_id: TraitId,
+) -> Bool:
+	(
+		trait_id_is_compiler_builtin(trait_id)
+		and trait_id_is_valid(table.definition_table, trait_id)
+		and not table.trait_index_by_compiler_identity.contains(trait_id_storage_key(trait_id))
+	)
+
+
+pure func accepted_scoped_trait_methods(
+	authority: AcceptedTraitImplementationAuthority,
+	issuer: DefinitionTable,
+	trait_id: TraitId,
+) -> Result[ScopedTraitMethodSource, String]:
+	table = table_rep(authority_rep(authority).table)
+
+	if not definition_tables_share_provenance(table.definition_table, issuer):
+		Err("scoped trait method issuer does not match accepted authority")
+	else if not trait_id_is_valid(issuer, trait_id):
+		Err("scoped trait identity is not registered in its issuing domain")
+	else:
+		match table_find_trait_identity_index(table, issuer, trait_id):
+			Some(index):
+				Ok(IssuedScopedMethods(table_trait_methods_seen(table, [], index)))
+			None:
+				if table_trait_is_compiler_owned(table, trait_id):
+					Ok(CompilerProvidedScopedTrait(trait_id))
+				else:
+					Err("scoped trait identity is absent from accepted authority")
+
+
+pure func accepted_trait_method_binding_for_id(
+	authority: AcceptedTraitImplementationAuthority,
+	issuer: DefinitionTable,
+	method_id: TraitMethodId,
+) -> Result[AcceptedTraitMethodBinding, String]:
+	representation = authority_rep(authority)
+
+	if not definition_tables_share_provenance(
+		table_rep(representation.table).definition_table,
+		issuer,
+	):
+		Err("scoped trait method issuer does not match accepted authority")
+	else:
+		match table_find_trait_method_by_id(representation, method_id):
+			Some(found):
+				Ok(into_opaque AcceptedTraitMethodBinding(found))
+			None:
+				Err("scoped trait method identity is absent from accepted authority")
+
+
 pure func accepted_trait_find_function_method(
 	authority: AcceptedTraitImplementationAuthority,
 	method_name: String,
@@ -2887,7 +2951,25 @@ pure func accepted_resolve_trait_id_obligation(
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
 
-	match table_find_trait_identity_index(table, issuing_table, trait_id):
+	if (
+		not definition_tables_share_provenance(table.definition_table, issuing_table)
+		or not trait_id_is_valid(issuing_table, trait_id)
+	):
+		TraitObligationUnsatisfied
+	else:
+		accepted_resolve_valid_trait_id_obligation(authority, env, typ, trait_id)
+
+
+private pure func accepted_resolve_valid_trait_id_obligation(
+	authority: AcceptedTraitImplementationAuthority,
+	env: Env,
+	typ: SemanticType,
+	trait_id: TraitId,
+) -> TraitObligationResolution:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	match table_find_obligation_trait_index(table, trait_id):
 		Some(trait_index):
 			match typ:
 				SemanticMetaType(_, _):
@@ -2919,7 +3001,14 @@ pure func accepted_resolve_trait_id_obligation(
 							trait_index,
 						)
 		None:
-			TraitObligationUnsatisfied
+			if table_trait_is_compiler_owned(table, trait_id):
+				accepted_resolve_trait_obligation(
+					authority,
+					env,
+					trait_obligation(typ, trait_id),
+				)
+			else:
+				TraitObligationUnsatisfied
 
 
 pure func accepted_find_unsatisfied_bound_type_param(
@@ -3012,6 +3101,71 @@ pure func accepted_resolve_trait_obligation(
 				accepted_or_compiler_trait_obligation_resolution(authority, env, obligation)
 
 
+private enum AcceptedMethodSelectionMode:
+	SelectAnyAcceptedMethod
+	SelectConcreteAcceptedMethod
+
+
+union AcceptedConcreteMethodLookup:
+	AcceptedConcreteMethodFound(ImplMethodInfo)
+	AcceptedConcreteMethodAbsent
+	AcceptedConcreteMethodTemplate
+	AcceptedConcreteMethodInvalid(String)
+
+
+private pure func accepted_selected_method(
+	table: AcceptedTraitImplementationTableRep,
+	item: AcceptedImplementationTableRecord,
+	method_index: Int,
+	method: ImplMethodInfo,
+	mode: AcceptedMethodSelectionMode,
+) -> AcceptedConcreteMethodLookup:
+	match mode:
+		SelectAnyAcceptedMethod:
+			AcceptedConcreteMethodFound(method)
+		SelectConcreteAcceptedMethod:
+			-- Validate identity before classifying templates. An invalid target
+			-- must not disappear behind generic implementation bounds.
+			match (item.method_ids.get(method_index), method.target):
+				(Some(method_id), Some(target)):
+					if (
+						not callable_id_from_definition_table(
+							table.definition_table,
+							target.callable_id,
+						)
+							.map(func(id): callable_ids_equal(id, method_id))
+							.get_or(False)
+						or callable_id_module_id(
+							table.definition_table,
+							method_id,
+						) != impl_id_module_id(table.definition_table, item.id)
+					):
+						AcceptedConcreteMethodInvalid(
+							"selected implementation callable identity is invalid",
+						)
+					else if (
+						not item.instance.bounds.is_empty()
+						or not method.type_params.is_empty()
+					):
+						AcceptedConcreteMethodTemplate
+					else:
+						AcceptedConcreteMethodFound(method)
+				_:
+					AcceptedConcreteMethodInvalid(
+						"selected implementation callable identity is absent",
+					)
+
+
+private pure func accepted_method_lookup_option(
+	lookup: AcceptedConcreteMethodLookup,
+) -> Option[ImplMethodInfo]:
+	match lookup:
+		AcceptedConcreteMethodFound(method):
+			Some(method)
+		_:
+			None
+
+
 private pure func accepted_find_impl_method_info_from_candidates(
 	authority: AcceptedTraitImplementationAuthority,
 	env: Env,
@@ -3020,10 +3174,11 @@ private pure func accepted_find_impl_method_info_from_candidates(
 	implementation_indices: List[Int],
 	method_name: String,
 	receiver_type: SemanticType,
-) -> Option[ImplMethodInfo]:
+	mode: AcceptedMethodSelectionMode,
+) -> AcceptedConcreteMethodLookup:
 	representation = authority_rep(authority)
 	table = table_rep(representation.table)
-	var result: Option[ImplMethodInfo] = None
+	var result: AcceptedConcreteMethodLookup = AcceptedConcreteMethodAbsent
 
 	for implementation_index in implementation_indices:
 		match table.implementations.get(implementation_index):
@@ -3072,13 +3227,16 @@ private pure func accepted_find_impl_method_info_from_candidates(
 								indexed[1],
 							)
 
-							result = Some(method)
+							result = accepted_selected_method(table, item, indexed[0], method, mode)
 							break
 			None:
 				void
 
-		if result.is_some():
-			break
+		match result:
+			AcceptedConcreteMethodAbsent:
+				void
+			_:
+				break
 
 	result
 
@@ -3103,14 +3261,17 @@ pure func accepted_find_impl_method_info(
 	-- trait of that name, else the compiler builtin of that name.
 	match accepted_trait_id_for_spelling(authority, trait_name):
 		Some(trait_id):
-			accepted_find_impl_method_info_from_candidates(
-				authority,
-				env,
-				trait_method,
-				builtin_trait_id(trait_name),
-				implementation_candidate_indices_for_trait(representation, trait_id),
-				method_name,
-				receiver_type,
+			accepted_method_lookup_option(
+				accepted_find_impl_method_info_from_candidates(
+					authority,
+					env,
+					trait_method,
+					builtin_trait_id(trait_name),
+					implementation_candidate_indices_for_trait(representation, trait_id),
+					method_name,
+					receiver_type,
+					SelectAnyAcceptedMethod,
+				),
 			)
 		None:
 			None
@@ -3129,20 +3290,110 @@ pure func accepted_find_impl_method_info_by_trait_id(
 	method_name: String,
 	receiver_type: SemanticType,
 ) -> Option[ImplMethodInfo]:
-	representation = authority_rep(authority)
-	table = table_rep(representation.table)
-	trait_index ?= table_find_trait_identity_index(table, issuing_table, trait_id)
-	trait_method ?= table_find_trait_method_seen(representation, [], trait_index, method_name)
+	accepted_method_lookup_option(
+		accepted_select_impl_method_by_trait_id(
+			authority,
+			issuing_table,
+			env,
+			trait_id,
+			method_name,
+			receiver_type,
+			SelectAnyAcceptedMethod,
+		),
+	)
 
-	accepted_find_impl_method_info_from_candidates(
+
+pure func accepted_find_concrete_impl_method_by_trait_id(
+	authority: AcceptedTraitImplementationAuthority,
+	issuing_table: DefinitionTable,
+	env: Env,
+	trait_id: TraitId,
+	method_name: String,
+	receiver_type: SemanticType,
+) -> AcceptedConcreteMethodLookup:
+	accepted_select_impl_method_by_trait_id(
 		authority,
+		issuing_table,
 		env,
-		Some(trait_method),
-		None,
-		implementation_candidate_indices_for_trait_index(representation, trait_index),
+		trait_id,
 		method_name,
 		receiver_type,
+		SelectConcreteAcceptedMethod,
 	)
+
+
+private pure func accepted_select_impl_method_by_trait_id(
+	authority: AcceptedTraitImplementationAuthority,
+	issuing_table: DefinitionTable,
+	env: Env,
+	trait_id: TraitId,
+	method_name: String,
+	receiver_type: SemanticType,
+	mode: AcceptedMethodSelectionMode,
+) -> AcceptedConcreteMethodLookup:
+	representation = authority_rep(authority)
+	table = table_rep(representation.table)
+
+	if (
+		not definition_tables_share_provenance(table.definition_table, issuing_table)
+		or not trait_id_is_valid(issuing_table, trait_id)
+	):
+		AcceptedConcreteMethodInvalid("trait method issuer or trait identity is invalid")
+	else:
+		match table_find_obligation_trait_index(table, trait_id):
+			Some(trait_index):
+				match table_find_trait_method_seen(representation, [], trait_index, method_name):
+					Some(trait_method):
+						accepted_find_impl_method_info_from_candidates(
+							authority,
+							env,
+							Some(trait_method),
+							None,
+							implementation_candidate_indices_for_trait_index(
+								representation,
+								trait_index,
+							),
+							method_name,
+							receiver_type,
+							mode,
+						)
+					None:
+						AcceptedConcreteMethodInvalid(
+							"trait method slot is absent from accepted authority",
+						)
+			None:
+				if table_trait_is_compiler_owned(table, trait_id):
+					requested_slot_exists = match mode:
+						SelectAnyAcceptedMethod:
+							True
+						SelectConcreteAcceptedMethod:
+							env_get_trait_by_id(env, trait_id)
+								.map(
+									func(
+										trait_def,
+									): trait_def.methods.any(
+										func(method): method.name == method_name,
+									),
+								)
+								.get_or(False)
+
+					if not requested_slot_exists:
+						AcceptedConcreteMethodInvalid("compiler trait method slot is absent")
+					else:
+						accepted_find_impl_method_info_from_candidates(
+							authority,
+							env,
+							None,
+							Some(trait_id),
+							implementation_candidate_indices_for_trait(representation, trait_id),
+							method_name,
+							receiver_type,
+							mode,
+						)
+				else:
+					AcceptedConcreteMethodInvalid(
+						"trait identity is absent from accepted authority",
+					)
 
 
 ---
@@ -3168,17 +3419,20 @@ pure func accepted_trait_find_ufcs_method(
 			Some(method):
 				method_owner_index = table_find_trait_index(table, trait_method_id_owner(method.id))
 				implementation = method_owner_index.and_then(func(owner_index):
-					accepted_find_impl_method_info_from_candidates(
-						authority,
-						env,
-						Some(method),
-						None,
-						implementation_candidate_indices_for_trait_index(
-							representation,
-							owner_index,
+					accepted_method_lookup_option(
+						accepted_find_impl_method_info_from_candidates(
+							authority,
+							env,
+							Some(method),
+							None,
+							implementation_candidate_indices_for_trait_index(
+								representation,
+								owner_index,
+							),
+							method_name,
+							receiver_type,
+							SelectAnyAcceptedMethod,
 						),
-						method_name,
-						receiver_type,
 					)
 				)
 

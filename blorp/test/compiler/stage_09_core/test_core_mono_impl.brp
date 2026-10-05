@@ -4,8 +4,8 @@ import:
 	../../../src/compiler/stage_09_core/ir:
 		CoreBinaryOp(AddOp),
 		CoreCallKind(BuiltinCall, DeferredTraitCall, SelectedDirectCall, SelectedTraitCall),
-		CoreDecl(FunctionDecl, ImplDecl),
-		CoreExpr(BinaryExpr, CallExpr, LiteralExpr, LogicalExpr, VarExpr),
+		CoreDecl(FunctionDecl, GlobalDecl, HeapRecordDecl, ImplDecl),
+		CoreExpr(BinaryExpr, CallExpr, LambdaExpr, LiteralExpr, LogicalExpr, SeqExpr, VarExpr),
 		CoreFunction,
 		CoreFunctionKind(UserFunction),
 		CoreImplDecl,
@@ -13,17 +13,27 @@ import:
 		CoreLogicalOp(AndOp),
 		CoreParam,
 		CoreProgram,
+		CoreReleasePolicy(NoReleasePolicy),
 		CoreSourceLoc,
 		synthetic_core_source_loc,
-		CoreType(FunctionType, NamedType, TypeParameterType),
+		CoreType(FunctionType, NamedType, RangeType, TypeParameterType),
 		CoreTypeParam,
 		CoreBinderOrigin(AuthoredBinder),
 		CoreVar,
 		core_expr_type,
+		core_field_ref,
 	../../../src/compiler/stage_09_core/mono: core_mono_type_equal
-	../../../src/compiler/stage_09_core/mono_impl: specialize_generic_impls
+	../../../src/compiler/stage_09_core/mono_impl:
+		CoreMonoImplSelectionIndex,
+		CoreMonoImplSelectionLookup(SelectedImpl),
+		remap_selected_impl_methods,
+		selected_impl_target,
+		specialize_generic_impls,
+	../../../src/compiler/stage_09_core/mono_instance: core_mono_type_hash
 	../../../src/compiler/stage_09_core/mono_specialize: CoreMonoProgramSpecialization
 	../../../src/compiler/stage_09_core/monomorphize: specialize_generic_functions_and_data
+	../../../src/compiler/stage_09_core/trait_resolve: resolve_core_traits
+	hash: hash_combine
 	test: TestSuite
 
 
@@ -264,24 +274,31 @@ func test_specializes_explicit_deferred_trait_call() -> Bool:
 			named_type("Int"),
 		),
 	])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(source, 100)
 
-	match find_concrete_impl(result.program, "Display", list_int):
-		Some(impl):
-			match impl.methods:
-				[specialized]:
-					(
-						result.next_def_id == 101
-						and specialized.def_id == 100
-						and specialized.type_params.is_empty()
-						and specialized.params
-							.get(0)
-							.map(pure func(value): core_mono_type_equal(value.typ, list_int))
-							.get_or(False)
-					)
-				_:
+	match specialize_generic_impls(source, 100):
+		Ok(result):
+			match find_concrete_impl(result.program, "Display", list_int):
+				Some(impl):
+					match impl.methods:
+						[specialized]:
+							(
+								result.next_def_id == 101
+								and specialized.def_id == 100
+								and specialized.type_params.is_empty()
+								and specialized.params
+									.get(0)
+									.map(
+										pure func(
+											value,
+										): core_mono_type_equal(value.typ, list_int),
+									)
+									.get_or(False)
+							)
+						_:
+							False
+				None:
 					False
-		None:
+		Err(_):
 			False
 
 
@@ -303,7 +320,7 @@ func test_specializes_deep_logical_impl_body_without_exhausting_stack() -> Bool:
 		)
 		depth += 1
 
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+	match specialize_generic_impls(program([
 			generic_impl(
 				"Valid",
 				[method("valid", 10, ["T"], [param("value", list_t)], bool_type, body)],
@@ -314,20 +331,22 @@ func test_specializes_deep_logical_impl_body_without_exhausting_stack() -> Bool:
 				deferred_call("Valid", "valid", [variable("items", list_int)], bool_type),
 				bool_type,
 			),
-		]), 100)
-
-	match find_concrete_impl(result.program, "Valid", list_int):
-		Some(impl):
-			match impl.methods:
-				[specialized]:
-					match specialized.body:
-						Some(LogicalExpr(_, _, _, _, _)):
-							True
+		]), 100):
+		Ok(result):
+			match find_concrete_impl(result.program, "Valid", list_int):
+				Some(impl):
+					match impl.methods:
+						[specialized]:
+							match specialized.body:
+								Some(LogicalExpr(_, _, _, _, _)):
+									True
+								_:
+									False
 						_:
 							False
-				_:
+				None:
 					False
-		None:
+		Err(_):
 			False
 
 
@@ -351,7 +370,8 @@ func test_specializes_typechecker_selected_trait_call() -> Bool:
 		named_type("Int"),
 		synthetic_core_source_loc(),
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_impl(
 				"Display",
 				[source_method],
@@ -359,9 +379,14 @@ func test_specializes_typechecker_selected_trait_call() -> Bool:
 				[type_param("T", [])],
 			),
 			main_function(call, named_type("Int")),
-		]), 100)
-
-	result.next_def_id == 101 and find_concrete_impl(result.program, "Display", list_int).is_some()
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and find_concrete_impl(result.program, "Display", list_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_specializes_target_module_selected_trait_call() -> Bool:
@@ -381,7 +406,8 @@ func test_specializes_target_module_selected_trait_call() -> Bool:
 		named_type("Int"),
 		synthetic_core_source_loc(),
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_impl(
 				"Display",
 				[source_method],
@@ -389,32 +415,41 @@ func test_specializes_target_module_selected_trait_call() -> Bool:
 				[type_param("T", [])],
 			),
 			main_function(call, named_type("Int")),
-		]), 100)
-
-	result.next_def_id == 101 and find_concrete_impl(result.program, "Display", list_int).is_some()
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and find_concrete_impl(result.program, "Display", list_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_trait_identity_disambiguates_same_method_name() -> Bool:
 	list_int: CoreType = applied_type("List", [named_type("Int")])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_unary_impl("Display", "show", "List", [], 10),
 			generic_unary_impl("Debug", "show", "List", [], 20),
 			main_function(
 				deferred_call("Display", "show", [variable("items", list_int)], named_type("Int")),
 				named_type("Int"),
 			),
-		]), 100)
-
-	(
-		result.next_def_id == 101
-		and find_concrete_impl(result.program, "Display", list_int).is_some()
-		and find_concrete_impl(result.program, "Debug", list_int).is_none()
-	)
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and find_concrete_impl(result.program, "Display", list_int).is_some()
+				and find_concrete_impl(result.program, "Debug", list_int).is_none()
+			)
+		Err(_):
+			False
 
 
 func test_ambiguous_generic_impl_candidates_fail_closed() -> Bool:
 	list_int: CoreType = applied_type("List", [named_type("Int")])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_unary_impl("Display", "display", "List", [], 10),
 			generic_unary_impl("Display", "display", "List", [], 20),
 			main_function(
@@ -426,9 +461,14 @@ func test_ambiguous_generic_impl_candidates_fail_closed() -> Bool:
 				),
 				named_type("Int"),
 			),
-		]), 100)
-
-	result.next_def_id == 100 and find_concrete_impl(result.program, "Display", list_int).is_none()
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 100
+				and find_concrete_impl(result.program, "Display", list_int).is_none()
+			)
+		Err(_):
+			False
 
 
 func test_preserves_method_local_type_params() -> Bool:
@@ -436,54 +476,59 @@ func test_preserves_method_local_type_params() -> Bool:
 	u: CoreType = type_parameter("U")
 	box_t: CoreType = applied_type("Box", [t])
 	box_int: CoreType = applied_type("Box", [named_type("Int")])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(
-		program([
-			generic_impl(
-				"Convert",
-				[
-					method(
-						"convert",
-						10,
-						["T", "U"],
-						[param("self", box_t), param("fallback", u)],
-						u,
-						variable(
-							"fallback",
-							u,
-						),
-					),
-				],
-				box_t,
-				[type_param("T", [])],
-			),
-			main_function(
-				deferred_call(
+
+	match (
+		specialize_generic_impls(
+			program([
+				generic_impl(
 					"Convert",
-					"convert",
-					[variable("value", box_int), variable("fallback", named_type("String"))],
+					[
+						method(
+							"convert",
+							10,
+							["T", "U"],
+							[param("self", box_t), param("fallback", u)],
+							u,
+							variable(
+								"fallback",
+								u,
+							),
+						),
+					],
+					box_t,
+					[type_param("T", [])],
+				),
+				main_function(
+					deferred_call(
+						"Convert",
+						"convert",
+						[variable("value", box_int), variable("fallback", named_type("String"))],
+						named_type("String"),
+					),
 					named_type("String"),
 				),
-				named_type("String"),
-			),
-		]),
-		100,
-	)
-
-	match find_concrete_impl(result.program, "Convert", box_int):
-		Some(impl):
-			match impl.methods.get(0):
-				Some(specialized):
-					(
-						specialized.type_params == ["U"]
-						and specialized.params
-							.get(1)
-							.map(pure func(value): core_mono_type_equal(value.typ, u))
-							.get_or(False)
-						and core_mono_type_equal(specialized.return_type, u)
-					)
+			]),
+			100,
+		)
+	):
+		Ok(result):
+			match find_concrete_impl(result.program, "Convert", box_int):
+				Some(impl):
+					match impl.methods.get(0):
+						Some(specialized):
+							(
+								specialized.type_params == ["U"]
+								and specialized.params
+									.get(1)
+									.map(pure func(value): core_mono_type_equal(value.typ, u))
+									.get_or(False)
+								and core_mono_type_equal(specialized.return_type, u)
+							)
+						None:
+							False
 				None:
 					False
-		None:
+		Err(_):
 			False
 
 
@@ -516,17 +561,21 @@ func test_specializes_operator_impl() -> Bool:
 		box_int,
 		synthetic_core_source_loc(),
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(
-		program([add_impl, main_function(body, box_int)]),
-		100,
-	)
 
-	result.next_def_id == 101 and find_concrete_impl(result.program, "Addable", box_int).is_some()
+	match specialize_generic_impls(program([add_impl, main_function(body, box_int)]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and find_concrete_impl(result.program, "Addable", box_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_specializes_stringable_impl_for_builtin_to_string() -> Bool:
 	wrapper_int: CoreType = applied_type("Wrapper", [named_type("Int")])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_unary_impl("Stringable", "to_string", "Wrapper", [], 10),
 			main_function(
 				builtin_call(
@@ -536,18 +585,21 @@ func test_specializes_stringable_impl_for_builtin_to_string() -> Bool:
 				),
 				named_type("String"),
 			),
-		]), 100)
-
-	(
-		result.next_def_id == 101
-		and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
-	)
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_builtin_list_to_string_materializes_element_impl() -> Bool:
 	wrapper_int: CoreType = applied_type("Wrapper", [named_type("Int")])
 	list_wrapper_int: CoreType = applied_type("List", [wrapper_int])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_unary_impl("Stringable", "to_string", "Wrapper", [], 10),
 			main_function(
 				builtin_call(
@@ -557,12 +609,14 @@ func test_builtin_list_to_string_materializes_element_impl() -> Bool:
 				),
 				named_type("String"),
 			),
-		]), 100)
-
-	(
-		result.next_def_id == 101
-		and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
-	)
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_deduplicates_repeated_demands() -> Bool:
@@ -573,13 +627,19 @@ func test_deduplicates_repeated_demands() -> Bool:
 		[variable("items", list_int)],
 		named_type("Int"),
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_unary_impl("Display", "display", "List", [], 10),
 			main_function(call, named_type("Int")),
 			FunctionDecl(method("other", 91, [], [], named_type("Int"), call)),
-		]), 100)
-
-	result.next_def_id == 101 and count_concrete_impls(result.program, "Display", list_int) == 1
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and count_concrete_impls(result.program, "Display", list_int) == 1
+			)
+		Err(_):
+			False
 
 
 func test_existing_concrete_impl_suppresses_specialization() -> Bool:
@@ -592,7 +652,8 @@ func test_existing_concrete_impl_suppresses_specialization() -> Bool:
 		list_int,
 		[],
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_impl(
 				"Display",
 				[
@@ -618,9 +679,14 @@ func test_existing_concrete_impl_suppresses_specialization() -> Bool:
 				),
 				named_type("Int"),
 			),
-		]), 100)
-
-	result.next_def_id == 100 and count_concrete_impls(result.program, "Display", list_int) == 1
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 100
+				and count_concrete_impls(result.program, "Display", list_int) == 1
+			)
+		Err(_):
+			False
 
 
 func test_static_trait_method_uses_result_type() -> Bool:
@@ -635,21 +701,28 @@ func test_static_trait_method_uses_result_type() -> Bool:
 				box_t,
 				variable("zero_box", box_t),
 			)], box_t, [type_param("T", [])])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			zero_impl,
 			main_function(
 				deferred_call("HasZero", "zero", [], box_int),
 				box_int,
 			),
-		]), 100)
-
-	result.next_def_id == 101 and find_concrete_impl(result.program, "HasZero", box_int).is_some()
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 101
+				and find_concrete_impl(result.program, "HasZero", box_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_materializes_bound_impl_transitively() -> Bool:
 	wrapper_int: CoreType = applied_type("Wrapper", [named_type("Int")])
 	box_wrapper_int: CoreType = applied_type("Box", [wrapper_int])
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_unary_impl("Display", "display", "Box", ["Stringable"], 10),
 			generic_unary_impl("Stringable", "to_string", "Wrapper", [], 20),
 			main_function(
@@ -661,13 +734,15 @@ func test_materializes_bound_impl_transitively() -> Bool:
 				),
 				named_type("Int"),
 			),
-		]), 100)
-
-	(
-		result.next_def_id == 102
-		and find_concrete_impl(result.program, "Display", box_wrapper_int).is_some()
-		and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
-	)
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 102
+				and find_concrete_impl(result.program, "Display", box_wrapper_int).is_some()
+				and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_discovers_demand_in_specialized_impl_body() -> Bool:
@@ -695,28 +770,33 @@ func test_discovers_demand_in_specialized_impl_body() -> Bool:
 		box_t,
 		[type_param("T", [])],
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(
-		program([
-			display_impl,
-			generic_unary_impl("Stringable", "to_string", "Wrapper", [], 20),
-			main_function(
-				deferred_call(
-					"Display",
-					"display",
-					[variable("value", box_wrapper_int), variable("inner", wrapper_int)],
+
+	match (
+		specialize_generic_impls(
+			program([
+				display_impl,
+				generic_unary_impl("Stringable", "to_string", "Wrapper", [], 20),
+				main_function(
+					deferred_call(
+						"Display",
+						"display",
+						[variable("value", box_wrapper_int), variable("inner", wrapper_int)],
+						named_type("String"),
+					),
 					named_type("String"),
 				),
-				named_type("String"),
-			),
-		]),
-		100,
-	)
-
-	(
-		result.next_def_id == 102
-		and find_concrete_impl(result.program, "Display", box_wrapper_int).is_some()
-		and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
-	)
+			]),
+			100,
+		)
+	):
+		Ok(result):
+			(
+				result.next_def_id == 102
+				and find_concrete_impl(result.program, "Display", box_wrapper_int).is_some()
+				and find_concrete_impl(result.program, "Stringable", wrapper_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_unresolved_caller_does_not_materialize_impl() -> Bool:
@@ -731,12 +811,15 @@ func test_unresolved_caller_does_not_materialize_impl() -> Bool:
 			deferred_call("Display", "display", [variable("items", list_t)], named_type("Int")),
 		),
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			generic_unary_impl("Display", "display", "List", [], 10),
 			generic_user,
-		]), 100)
-
-	result.next_def_id == 100 and result.program.decls.length() == 2
+		]), 100):
+		Ok(result):
+			result.next_def_id == 100 and result.program.decls.length() == 2
+		Err(_):
+			False
 
 
 func test_rewrites_specialized_method_references_to_fresh_ids() -> Bool:
@@ -770,7 +853,8 @@ func test_rewrites_specialized_method_references_to_fresh_ids() -> Bool:
 		box_t,
 		[type_param("T", [])],
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(program([
+
+	match specialize_generic_impls(program([
 			source_impl,
 			main_function(
 				deferred_call(
@@ -781,26 +865,28 @@ func test_rewrites_specialized_method_references_to_fresh_ids() -> Bool:
 				),
 				named_type("Int"),
 			),
-		]), 100)
-
-	match find_concrete_impl(result.program, "Display", box_int):
-		Some(impl):
-			match impl.methods:
-				[display, helper]:
-					match display.body:
-						Some(CallExpr(SelectedDirectCall(def_id), VarExpr(callee, _, _), _, _, _)):
-							(
-								result.next_def_id == 102
-								and display.def_id == 100
-								and helper.def_id == 101
-								and def_id == 101
-								and callee.def_id == Some(101)
-							)
+		]), 100):
+		Ok(result):
+			match find_concrete_impl(result.program, "Display", box_int):
+				Some(impl):
+					match impl.methods:
+						[display, helper]:
+							match display.body:
+								Some(CallExpr(SelectedDirectCall(def_id), VarExpr(callee, _, _), _, _, _)):
+									(
+										result.next_def_id == 102
+										and display.def_id == 100
+										and helper.def_id == 101
+										and def_id == 101
+										and callee.def_id == Some(101)
+									)
+								_:
+									False
 						_:
 							False
-				_:
+				None:
 					False
-		None:
+		Err(_):
 			False
 
 
@@ -821,56 +907,61 @@ func test_rewrites_a_method_reference_by_its_id_whatever_its_spelling() -> Bool:
 		named_type("Int"),
 		synthetic_core_source_loc(),
 	)
-	result: CoreMonoProgramSpecialization = specialize_generic_impls(
-		program([
-			generic_impl(
-				"Display",
-				[
-					method(
-						"display",
-						10,
-						["T"],
-						[param("value", box_t)],
-						named_type("Int"),
-						imported_call,
-					),
-					method(
-						"helper",
-						11,
-						["T"],
-						[param("value", box_t)],
-						named_type("Int"),
-						int_literal(1),
-					),
-				],
-				box_t,
-				[type_param("T", [])],
-			),
-			main_function(
-				deferred_call(
+
+	match (
+		specialize_generic_impls(
+			program([
+				generic_impl(
 					"Display",
-					"display",
-					[variable("value", box_int)],
+					[
+						method(
+							"display",
+							10,
+							["T"],
+							[param("value", box_t)],
+							named_type("Int"),
+							imported_call,
+						),
+						method(
+							"helper",
+							11,
+							["T"],
+							[param("value", box_t)],
+							named_type("Int"),
+							int_literal(1),
+						),
+					],
+					box_t,
+					[type_param("T", [])],
+				),
+				main_function(
+					deferred_call(
+						"Display",
+						"display",
+						[variable("value", box_int)],
+						named_type("Int"),
+					),
 					named_type("Int"),
 				),
-				named_type("Int"),
-			),
-		]),
-		100,
-	)
-
-	match find_concrete_impl(result.program, "Display", box_int):
-		Some(impl):
-			match impl.methods:
-				[display, _]:
-					match display.body:
-						Some(CallExpr(SelectedDirectCall(def_id), VarExpr(callee, _, _), _, _, _)):
-							def_id != 11 and callee.def_id == Some(def_id)
+			]),
+			100,
+		)
+	):
+		Ok(result):
+			match find_concrete_impl(result.program, "Display", box_int):
+				Some(impl):
+					match impl.methods:
+						[display, _]:
+							match display.body:
+								Some(CallExpr(SelectedDirectCall(def_id), VarExpr(callee, _, _), _, _, _)):
+									def_id != 11 and callee.def_id == Some(def_id)
+								_:
+									False
 						_:
 							False
-				_:
+				None:
 					False
-		None:
+		Err(_):
 			False
 
 
@@ -899,17 +990,20 @@ func test_callable_fixpoint_exposes_impl_demand_from_specialized_function() -> B
 		named_type("Int"),
 		synthetic_core_source_loc(),
 	)
-	result = specialize_generic_functions_and_data(program([
+
+	match specialize_generic_functions_and_data(program([
 			render,
 			generic_unary_impl("Display", "display", "List", [], 10),
 			main_function(main_call, named_type("Int")),
-		]), 100)
-
-	(
-		result.next_def_id == 102
-		and program_has_function(result.program, "render__mono_Int")
-		and find_concrete_impl(result.program, "Display", list_int).is_some()
-	)
+		]), 100):
+		Ok(result):
+			(
+				result.next_def_id == 102
+				and program_has_function(result.program, "render__mono_Int")
+				and find_concrete_impl(result.program, "Display", list_int).is_some()
+			)
+		Err(_):
+			False
 
 
 func test_callable_fixpoint_exposes_function_demand_from_specialized_impl() -> Bool:
@@ -952,33 +1046,520 @@ func test_callable_fixpoint_exposes_function_demand_from_specialized_impl() -> B
 		box_t,
 		[type_param("T", [])],
 	)
-	result = specialize_generic_functions_and_data(
-		program([
-			identity,
-			display_impl,
-			main_function(
-				deferred_call(
-					"Display",
-					"display",
-					[variable("value", box_int), variable("inner", named_type("Int"))],
+
+	match (
+		specialize_generic_functions_and_data(
+			program([
+				identity,
+				display_impl,
+				main_function(
+					deferred_call(
+						"Display",
+						"display",
+						[variable("value", box_int), variable("inner", named_type("Int"))],
+						named_type("Int"),
+					),
 					named_type("Int"),
 				),
-				named_type("Int"),
-			),
-		]),
-		100,
+			]),
+			100,
+		)
+	):
+		Ok(result):
+			(
+				result.next_def_id == 102
+				and find_concrete_impl(result.program, "Display", box_int).is_some()
+				and program_has_function(result.program, "identity__mono_Int")
+			)
+		Err(_):
+			False
+
+
+pure func selected_display_call(receiver: CoreType, source_id: Int) -> CoreExpr:
+	CallExpr(
+		SelectedTraitCall("Display", "display", "packages/display", source_id),
+		VarExpr(
+			named_var("display", Some(source_id)),
+			function_type([receiver], named_type("Int")),
+			synthetic_core_source_loc(),
+		),
+		[variable("value", receiver)],
+		named_type("Int"),
+		synthetic_core_source_loc(),
 	)
 
-	(
-		result.next_def_id == 102
-		and find_concrete_impl(result.program, "Display", box_int).is_some()
-		and program_has_function(result.program, "identity__mono_Int")
+
+pure func selected_call_ids(expr: CoreExpr) -> List[Int]:
+	match expr:
+		SeqExpr(first, second):
+			selected_call_ids(first).concat(selected_call_ids(second))
+		CallExpr(SelectedTraitCall(_, _, _, target_id), VarExpr(callee, _, _), _, _, _):
+			if callee.def_id == Some(target_id):
+				[target_id]
+			else:
+				[]
+		_:
+			[]
+
+
+pure func main_selected_ids(program: CoreProgram) -> List[Int]:
+	var ids: List[Int] = []
+
+	for decl in program.decls:
+		match decl:
+			FunctionDecl(main):
+				if main.name == "main":
+					ids = main.body
+						.map(selected_call_ids)
+						.get_or([])
+				else:
+					void
+			_:
+				void
+
+	ids
+
+
+func test_selected_method_instances_distinguish_receivers_and_reuse_equivalents() -> Bool:
+	list_int = applied_type("List", [named_type("Int")])
+	list_bool = applied_type("List", [named_type("Bool")])
+	var valid: Bool = True
+
+	for receivers in (
+		[
+			[list_int, list_bool],
+			[list_bool, list_int],
+		]
+	):
+		match receivers:
+			[first, second]:
+				body = SeqExpr(
+					selected_display_call(first, 10),
+					SeqExpr(
+						selected_display_call(second, 10),
+						selected_display_call(first, 10),
+					),
+				)
+
+				match specialize_generic_impls(program([
+						generic_unary_impl("Display", "display", "List", [], 10),
+						main_function(body, named_type("Int")),
+					]), 100):
+					Ok(result):
+						valid = (
+							valid
+							and result.next_def_id == 102
+							and main_selected_ids(result.program) == [100, 101, 100]
+						)
+					Err(_):
+						valid = False
+			_:
+				valid = False
+
+	valid
+
+
+func test_refined_receiver_reuses_erased_implementation_instance() -> Bool:
+	list_range = applied_type("List", [RangeType])
+	list_int = applied_type("List", [named_type("Int")])
+	body = SeqExpr(
+		selected_display_call(list_range, 10),
+		selected_display_call(list_int, 10),
 	)
+
+	match specialize_generic_impls(program([
+			generic_unary_impl("Display", "display", "List", [], 10),
+			main_function(body, named_type("Int")),
+		]), 100):
+		Ok(result):
+			result.next_def_id == 101 and main_selected_ids(result.program) == [100, 100]
+		Err(_):
+			False
+
+
+func test_same_template_call_on_other_receiver_keeps_its_own_instance() -> Bool:
+	list_int = applied_type("List", [named_type("Int")])
+	list_bool = applied_type("List", [named_type("Bool")])
+	list_t = applied_type("List", [type_parameter("T")])
+	source = generic_impl("Display", [method(
+				"display",
+				10,
+				["T"],
+				[param("value", list_t)],
+				named_type("Int"),
+				selected_display_call(list_bool, 10),
+			)], list_t, [type_param("T", [])])
+
+	match specialize_generic_impls(program([
+			source,
+			main_function(
+				selected_display_call(list_int, 10),
+				named_type("Int"),
+			),
+		]), 100):
+		Ok(result):
+			match (
+				find_concrete_impl(result.program, "Display", list_int),
+				find_concrete_impl(result.program, "Display", list_bool),
+			):
+				(Some(first), Some(second)):
+					match (first.methods, second.methods):
+						([first_method], [second_method]):
+							(
+								result.next_def_id == 102
+								and first_method.def_id != second_method.def_id
+								and main_selected_ids(result.program) == [first_method.def_id]
+								and first_method.body
+									.map(selected_call_ids)
+									.get_or([]) == [second_method.def_id]
+								and second_method.body
+									.map(selected_call_ids)
+									.get_or([]) == [second_method.def_id]
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_final_remap_reaches_later_function_instances_and_cross_impl_calls() -> Bool:
+	list_int = applied_type("List", [named_type("Int")])
+	box_t = applied_type("Box", [type_parameter("T")])
+	box_int = applied_type("Box", [named_type("Int")])
+	render = FunctionDecl(
+		method(
+			"render",
+			30,
+			["T"],
+			[param("value", type_parameter("T"))],
+			named_type("Int"),
+			selected_display_call(list_int, 10),
+		),
+	)
+	render_call = CallExpr(
+		SelectedDirectCall(30),
+		VarExpr(
+			named_var("render", Some(30)),
+			function_type([box_t], named_type("Int")),
+			synthetic_core_source_loc(),
+		),
+		[variable("value", box_t)],
+		named_type("Int"),
+		synthetic_core_source_loc(),
+	)
+	box_impl = generic_impl("Display", [method(
+				"display",
+				20,
+				["T"],
+				[param("value", box_t)],
+				named_type("Int"),
+				SeqExpr(
+					selected_display_call(list_int, 10),
+					render_call,
+				),
+			)], box_t, [type_param("T", [])])
+
+	match specialize_generic_functions_and_data(program([
+			render,
+			generic_unary_impl("Display", "display", "List", [], 10),
+			box_impl,
+			main_function(
+				selected_display_call(box_int, 20),
+				named_type("Int"),
+			),
+		]), 100):
+		Ok(result):
+			match (
+				find_concrete_impl(result.program, "Display", list_int),
+				find_concrete_impl(result.program, "Display", box_int),
+			):
+				(Some(list_impl), Some(box_impl)):
+					match (list_impl.methods, box_impl.methods):
+						([list_method], [box_method]):
+							var render_id: Option[Int] = None
+
+							match box_method.body:
+								Some(body):
+									match body:
+										SeqExpr(_, call):
+											match call:
+												CallExpr(kind, _, _, _, _):
+													match kind:
+														SelectedDirectCall(id):
+															render_id = Some(id)
+														_:
+															void
+												_:
+													void
+										_:
+											void
+								None:
+									void
+
+							var valid: Bool = False
+
+							for decl in result.program.decls:
+								match decl:
+									FunctionDecl(function):
+										if render_id == Some(function.def_id):
+											valid = function.body
+												.map(selected_call_ids)
+												.get_or([]) == [list_method.def_id]
+										else:
+											void
+									_:
+										void
+
+							(
+								valid
+								and list_method.def_id != box_method.def_id
+								and main_selected_ids(result.program) == [box_method.def_id]
+								and box_method.body
+									.map(selected_call_ids)
+									.get_or([]) == [list_method.def_id]
+								and result.next_def_id == 103
+							)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_structural_remap_hash_collisions_do_not_merge_identity() -> Bool:
+	first = named_type("Int")
+	second = named_type("Bool")
+	key = hash_combine(10, core_mono_type_hash(first))
+	-- Force other keys into this bucket: a hash is not identity authority.
+	index: CoreMonoImplSelectionIndex = {
+		key => [
+			{
+				source_def_id = 10,
+				closed_receiver = second,
+				target_def_id = 101
+			},
+			{
+				source_def_id = 11,
+				closed_receiver = first,
+				target_def_id = 102
+			},
+			{
+				source_def_id = 10,
+				closed_receiver = first,
+				target_def_id = 100
+			},
+		],
+	}
+
+	match selected_impl_target(index, 10, first):
+		SelectedImpl(100):
+			True
+		_:
+			False
+
+
+func test_generic_record_selected_ids_and_types_survive_data_specialization() -> Bool:
+	box_t = applied_type("Box", [type_parameter("T")])
+	box_int = applied_type("Box", [named_type("Int")])
+	concrete = named_type("Box__mono_Int")
+	template = HeapRecordDecl({
+		abi_type = None,
+		name = "Box",
+		type_params = ["T"],
+		fields = [
+			{
+				ref = core_field_ref(0),
+				name = "value",
+				typ = type_parameter("T"),
+				release_policy = NoReleasePolicy
+			},
+		],
+		loc = synthetic_core_source_loc(),
+	})
+	implementation = generic_impl(
+		"Display",
+		[method("display", 10, ["T"], [param("value", box_t)], named_type("Int"), int_literal(1))],
+		box_t,
+		[type_param("T", [])],
+	)
+
+	match specialize_generic_functions_and_data(program([
+			template,
+			implementation,
+			main_function(
+				selected_display_call(box_int, 10),
+				named_type("Int"),
+			),
+		]), 100):
+		Ok(result):
+			match find_concrete_impl(result.program, "Display", concrete):
+				Some(implementation):
+					match implementation.methods:
+						[method]:
+							match method.params:
+								[parameter]:
+									match resolve_core_traits(result.program):
+										Ok(resolved):
+											var valid: Bool = False
+
+											for decl in resolved.decls:
+												match decl:
+													FunctionDecl(function):
+														if function.name == "main":
+															match function.body:
+																Some(CallExpr(SelectedDirectCall(id), VarExpr(callee, callee_type, _), args, _, _)):
+																	valid = (
+																		id == method.def_id
+																		and callee.def_id == Some(
+																			id,
+																		)
+																		and callee_type == function_type(
+																			[concrete],
+																			named_type("Int"),
+																		)
+																		and args.map(
+																			core_expr_type,
+																		) == [concrete]
+																	)
+																_:
+																	void
+														else:
+															void
+													_:
+														void
+
+											(
+												valid
+												and parameter.typ == concrete
+												and result.next_def_id == 101
+											)
+										Err(_):
+											False
+								_:
+									False
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+func test_global_lambda_selected_call_uses_shared_final_remapper() -> Bool:
+	receiver = named_type("Int")
+	body = LambdaExpr(
+		[param("value", receiver)],
+		receiver,
+		selected_display_call(receiver, 10),
+		True,
+		function_type([receiver], receiver),
+		synthetic_core_source_loc(),
+	)
+	global = GlobalDecl({
+		name = named_var("callback", Some(20)),
+		source_module = None,
+		typ = function_type([receiver], receiver),
+		init = body,
+		is_mutable = False,
+		is_const = False,
+		is_private = False,
+		def_id = 20,
+		loc = synthetic_core_source_loc(),
+	})
+
+	match (
+		remap_selected_impl_methods(
+			program([global]),
+			[
+				{
+					source_def_id = 10,
+					closed_receiver = receiver,
+					target_def_id = 100
+				},
+			],
+		)
+	):
+		Ok(result):
+			match result.decls:
+				[GlobalDecl(global)]:
+					match global.init:
+						LambdaExpr(_, _, remapped, _, _, _):
+							selected_call_ids(remapped) == [100]
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+func test_missing_selected_instance_never_borrows_another_source_or_receiver() -> Bool:
+	first = named_type("Int")
+	second = named_type("Bool")
+	source = program([main_function(
+				SeqExpr(
+					selected_display_call(first, 99),
+					selected_display_call(second, 10),
+				),
+				named_type("Int"),
+			)])
+
+	match (
+		remap_selected_impl_methods(
+			source,
+			[
+				{
+					source_def_id = 10,
+					closed_receiver = first,
+					target_def_id = 100
+				},
+			],
+		)
+	):
+		Ok(remapped):
+			main_selected_ids(remapped) == [99, 10]
+		Err(_):
+			False
 
 
 tests: TestSuite = {
 	description = "Blorp compiler generic impl monomorphization",
 	tests = [
+		(
+			"generic record selected IDs and types survive data specialization",
+			test_generic_record_selected_ids_and_types_survive_data_specialization,
+		),
+		(
+			"global lambda uses shared selected remapper",
+			test_global_lambda_selected_call_uses_shared_final_remapper,
+		),
+		(
+			"missing instance never borrows source or receiver",
+			test_missing_selected_instance_never_borrows_another_source_or_receiver,
+		),
+		(
+			"selected instances distinguish receivers and reuse equivalents",
+			test_selected_method_instances_distinguish_receivers_and_reuse_equivalents,
+		),
+		(
+			"refined receiver reuses erased implementation instance",
+			test_refined_receiver_reuses_erased_implementation_instance,
+		),
+		(
+			"same template other receiver keeps its own instance",
+			test_same_template_call_on_other_receiver_keeps_its_own_instance,
+		),
+		(
+			"final remap reaches later functions and cross impl calls",
+			test_final_remap_reaches_later_function_instances_and_cross_impl_calls,
+		),
+		(
+			"structural remap hash collision preserves identity",
+			test_structural_remap_hash_collisions_do_not_merge_identity,
+		),
 		("specializes explicit deferred trait call", test_specializes_explicit_deferred_trait_call),
 		(
 			"specializes deep logical impl body without exhausting stack",

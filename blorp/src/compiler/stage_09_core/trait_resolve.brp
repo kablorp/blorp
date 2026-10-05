@@ -87,6 +87,26 @@ private union CoreTraitImplTargetKind:
 	NativeUnaryTraitTarget(CoreUnaryOp)
 
 
+private union CoreImplMethodKind:
+	SourceImplMethod
+	NativeBinaryImplMethod(CoreBinaryOp)
+	NativeUnaryImplMethod(CoreUnaryOp)
+
+
+private record CoreSelectedTraitMethod {
+	trait_name: String,
+	method_name: String,
+	type_name: String,
+	target: CoreTraitImplTargetKind
+}
+
+
+private union CoreSelectedTraitMethodEntry:
+	SelectedTraitMethod(CoreSelectedTraitMethod)
+	UnmaterializedTraitMethod
+	DuplicateTraitMethodId
+
+
 private record CoreGenericBuiltinTarget {
 	trait_name: String,
 	method_name: String,
@@ -116,6 +136,7 @@ private pure func has_generic_builtin_target(
 
 private record CoreTraitResolveRegistry {
 	targets: Dict[String, CoreTraitImplTargetKind],
+	selected_methods: Dict[Int, CoreSelectedTraitMethodEntry],
 	generic_builtin_targets: List[CoreGenericBuiltinTarget],
 	types_by_method: Dict[String, List[String]],
 	static_self_methods: Dict[String, Bool],
@@ -321,28 +342,89 @@ private pure func append_unique(items: List[String], item: String) -> List[Strin
 		items.append(item)
 
 
+private pure func classify_impl_method(
+	trait_name: String,
+	type_name: String,
+	method: CoreFunction,
+) -> CoreImplMethodKind:
+	match native_scalar_binary_impl_target(trait_name, type_name, method):
+		Some(op):
+			NativeBinaryImplMethod(op)
+		None:
+			match native_scalar_unary_impl_target(trait_name, type_name, method):
+				Some(op):
+					NativeUnaryImplMethod(op)
+				None:
+					SourceImplMethod
+
+
+private pure func impl_method_target(
+	trait_name: String,
+	type_name: String,
+	method: CoreFunction,
+) -> CoreTraitImplTargetKind:
+	match classify_impl_method(trait_name, type_name, method):
+		SourceImplMethod:
+			FunctionTraitTarget("${trait_name}_${method.name}_${type_name}")
+		NativeBinaryImplMethod(op):
+			NativeBinaryTraitTarget(op)
+		NativeUnaryImplMethod(op):
+			NativeUnaryTraitTarget(op)
+
+
+private pure func collect_selected_methods(
+	program: CoreProgram,
+) -> Dict[Int, CoreSelectedTraitMethodEntry]:
+	-- Function ids are program-wide identity. Keep duplicates invalid rather
+	-- than allowing declaration order to choose an implementation.
+	var entries: Dict[Int, CoreSelectedTraitMethodEntry] = {}
+
+	for decl in program.decls:
+		match decl:
+			ImplDecl(implementation):
+				for method in implementation.methods:
+					entry: CoreSelectedTraitMethodEntry = if CoreTypePolicy.core_impl_is_generic(
+						implementation,
+					):
+						UnmaterializedTraitMethod
+					else:
+						match core_trait_impl_type_key(implementation.for_type):
+							Some(type_name):
+								SelectedTraitMethod({
+									trait_name = implementation.trait_name,
+									method_name = method.name,
+									type_name = type_name,
+									target = impl_method_target(
+										implementation.trait_name,
+										type_name,
+										method,
+									),
+								})
+							None:
+								UnmaterializedTraitMethod
+
+					if entries.contains(method.def_id):
+						entries = entries.set(method.def_id, DuplicateTraitMethodId)
+					else:
+						entries = entries.set(method.def_id, entry)
+			FunctionDecl(function):
+				if entries.contains(function.def_id):
+					entries = entries.set(function.def_id, DuplicateTraitMethodId)
+				else:
+					entries = entries.set(function.def_id, UnmaterializedTraitMethod)
+			_:
+				void
+
+	entries
+
+
 private pure func add_impl_target(
 	registry: CoreTraitResolveRegistry,
 	trait_name: String,
 	type_name: String,
 	method: CoreFunction,
 ) -> CoreTraitResolveRegistry:
-	mangled_name: String = "${trait_name}_${method.name}_${type_name}"
-
-	kind: CoreTraitImplTargetKind = match native_scalar_binary_impl_target(
-		trait_name,
-		type_name,
-		method,
-	):
-		Some(op):
-			NativeBinaryTraitTarget(op)
-		None:
-			match native_scalar_unary_impl_target(trait_name, type_name, method):
-				Some(op):
-					NativeUnaryTraitTarget(op)
-				None:
-					FunctionTraitTarget(mangled_name)
-
+	kind: CoreTraitImplTargetKind = impl_method_target(trait_name, type_name, method)
 	key: String = method_key(trait_name, method.name)
 	types: List[String] = registry.types_by_method.get_or(key, [])
 
@@ -431,6 +513,7 @@ private pure func collect_trait(
 private pure func collect_registry(program: CoreProgram) -> CoreTraitResolveRegistry:
 	var registry: CoreTraitResolveRegistry = {
 		targets = {},
+		selected_methods = collect_selected_methods(program),
 		generic_builtin_targets = [],
 		types_by_method = {},
 		static_self_methods = {},
@@ -622,15 +705,6 @@ private pure func target_for_dispatch(
 			compiler_native_target(registry, identity, dispatch)
 
 
-private pure func registered_target_for_dispatch(
-	targets: Dict[String, CoreTraitImplTargetKind],
-	identity: CoreTraitMethodIdentity,
-	dispatch: CoreType,
-) -> Option[CoreTraitImplTargetKind]:
-	type_name ?= core_trait_impl_type_key(dispatch)
-	targets.get(target_key(identity.trait_name, identity.method_name, type_name))
-
-
 private pure func unresolved_trait_call_kind(
 	generic_builtin_targets: List[CoreGenericBuiltinTarget],
 	original_kind: CoreCallKind,
@@ -660,6 +734,7 @@ private pure func unresolved_trait_call_kind(
 private pure func rewrite_callee(
 	callee: CoreExpr,
 	mangled_name: String,
+	target_id: Option[Int],
 	fallback_loc: CoreSourceLoc,
 ) -> CoreExpr:
 	match callee:
@@ -667,7 +742,7 @@ private pure func rewrite_callee(
 			VarExpr(
 				{ variable |
 					name = mangled_name,
-					def_id = None
+					def_id = target_id
 				},
 				typ,
 				loc,
@@ -677,7 +752,7 @@ private pure func rewrite_callee(
 				{
 					name = mangled_name,
 					id = 0,
-					def_id = None,
+					def_id = target_id,
 					origin = AuthoredBinder
 				},
 				NamedType(
@@ -774,11 +849,19 @@ private pure func rewrite_unresolved_trait_call(
 	return_type: CoreType,
 	loc: CoreSourceLoc,
 ) -> CoreExpr:
-	kind: CoreCallKind = unresolved_trait_call_kind(
-		registry.generic_builtin_targets,
-		original_kind,
-		callee,
-	)
+	kind: CoreCallKind = match original_kind:
+		SelectedTraitCall(_, _, _, def_id):
+			match registry.selected_methods.get(def_id):
+				Some(DuplicateTraitMethodId):
+					original_kind
+				_:
+					unresolved_trait_call_kind(
+						registry.generic_builtin_targets,
+						original_kind,
+						callee,
+					)
+		_:
+			unresolved_trait_call_kind(registry.generic_builtin_targets, original_kind, callee)
 
 	fallback_callee: CoreExpr = match kind:
 		DeferredTraitCall(_, _):
@@ -787,7 +870,7 @@ private pure func rewrite_unresolved_trait_call(
 				dispatch_type(registry.static_self_methods, identity, args, return_type),
 			):
 				Some(name):
-					rewrite_callee(callee, name, loc)
+					rewrite_callee(callee, name, None, loc)
 				None:
 					callee
 		_:
@@ -824,8 +907,19 @@ private pure func rewrite_trait_call(
 		match dispatch_type(context.registry.static_self_methods, identity, args, return_type):
 			Some(dispatch):
 				target: Option[CoreTraitImplTargetKind] = match original_kind:
-					SelectedTraitCall(_, _, _, _):
-						registered_target_for_dispatch(context.registry.targets, identity, dispatch)
+					SelectedTraitCall(_, _, _, def_id):
+						match context.registry.selected_methods.get(def_id):
+							Some(SelectedTraitMethod(method)):
+								if (
+									method.trait_name == identity.trait_name
+									and method.method_name == identity.method_name
+									and core_trait_impl_type_key(dispatch) == Some(method.type_name)
+								):
+									Some(method.target)
+								else:
+									None
+							_:
+								None
 					_:
 						target_for_dispatch(context.registry, identity, dispatch)
 
@@ -847,13 +941,23 @@ private pure func rewrite_trait_call(
 									loc,
 								).get_or(CallExpr(original_kind, callee, args, return_type, loc))
 							FunctionTraitTarget(mangled_name):
-								CallExpr(
-									UnknownCall,
-									rewrite_callee(callee, mangled_name, loc),
-									args,
-									return_type,
-									loc,
-								)
+								match original_kind:
+									SelectedTraitCall(_, _, _, def_id):
+										CallExpr(
+											SelectedDirectCall(def_id),
+											rewrite_callee(callee, mangled_name, Some(def_id), loc),
+											args,
+											return_type,
+											loc,
+										)
+									_:
+										CallExpr(
+											UnknownCall,
+											rewrite_callee(callee, mangled_name, None, loc),
+											args,
+											return_type,
+											loc,
+										)
 					None:
 						rewrite_unresolved_trait_call(
 							context.registry,
@@ -1048,13 +1152,12 @@ private pure func rewrite_function(
 
 
 private pure func finalize_native_impl_method(
-	targets: Dict[String, CoreTraitImplTargetKind],
 	trait_name: String,
 	type_name: String,
 	method: CoreFunction,
 ) -> CoreFunction:
-	match targets.get(target_key(trait_name, method.name, type_name)):
-		Some(NativeBinaryTraitTarget(_)) | Some(NativeUnaryTraitTarget(_)):
+	match classify_impl_method(trait_name, type_name, method):
+		NativeBinaryImplMethod(_) | NativeUnaryImplMethod(_):
 			if is_unresolved_builtin_function_kind(method.function_kind) and method.body.is_some():
 				{ method | function_kind = UserFunction }
 			else:
@@ -1077,7 +1180,6 @@ private pure func rewrite_impl(
 				for method in implementation.methods:
 					methods = methods.append(
 						finalize_native_impl_method(
-							registry.targets,
 							implementation.trait_name,
 							type_name,
 							rewrite_function(registry, method),

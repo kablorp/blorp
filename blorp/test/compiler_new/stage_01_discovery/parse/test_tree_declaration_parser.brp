@@ -1,7 +1,7 @@
 -- One declaration step only: no module loop, module docs or initializer grammar.
 -- Deferred bodies are lexical evidence; completed leaf/owner recovery is frozen.
 import:
-	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: RecordDeclarationForm(FixedRecord), GlobalForm(ConstantGlobal, MutableGlobal)
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: RecordDeclarationForm(FixedRecord), GlobalForm(ConstantGlobal, MutableGlobal), UnionDeclarationForm(FixedUnion)
 	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
@@ -21,7 +21,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
 	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, type_binder_local_index, name_use_local_index, binder_local_index, written_type_local_index
-	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedColon, ExpectedRightBracket, ExpectedRightParen, ExpectedNewline, ExpectedIndent, ExpectedKeyword, ExpectedLeftParen, ExpectedEqual, ExpectedRightBrace), NameConstruct(NameInTraitName)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedColon, ExpectedRightBracket, ExpectedRightParen, ExpectedNewline, ExpectedIndent, ExpectedKeyword, ExpectedLeftParen, ExpectedEqual, ExpectedRightBrace), NameConstruct(NameInTraitName), RightBracketConstruct(RightBracketInTypeParameters), ColonConstruct(ColonInUnionVariants)
 	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
 	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(PureFunction, ImpureFunction)
 	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
@@ -237,6 +237,59 @@ pure func test_fixed_record_uses_exact_spelling_and_accepts_parameters() -> Bool
 		_: False
 
 
+pure func test_fixed_union_route_preserves_prefix_and_ordinary_grammar() -> Bool:
+	text: String = "---\nDocs\n---\nprivate fixed union U[T, #N]:\n\tEmpty()\n\tValue(T, String)\n"
+	match parsed(text):
+		Some((state, ParsedDeclarationPreview(UnionDeclarationPreview(declaration)))):
+			match declaration.documentation:
+				Some(doc):
+					(declaration.form == FixedUnion and declaration.visibility == PrivateVisibility and doc.text == "Docs"
+						and declaration.type_parameters.length() == 2 and declaration.variants.length() == 2
+						and declaration.span.covers(0, text.length()) and state.matches_frozen(frozen(text)))
+				_: False
+		_: False
+
+
+pure func test_fixed_union_malformed_headers_match_table_diagnostics() -> Bool:
+	var correct: Bool = True
+	for text in ["fixed union U\n\tA", "fixed union U:\n\tA(Int", "union U\n\tA", "union U:\n\tA(Int"]:
+		match parsed(text):
+			Some((state, RejectedDeclarationPreview)):
+				correct = correct and state.diagnostic_count() > 0 and state.matches_frozen(frozen(text))
+			_: correct = False
+	correct
+
+
+-- Rejected type parameters stop the typed preview leaf immediately. The
+-- production table parser continues header/body recovery. P1 preserves this
+-- existing ordinary-union boundary for the fixed spelling as well.
+private pure func rejected_type_parameter_boundary(text: String, cursor: Int, offset: Int, table_cursor: Int) -> Bool:
+	match parsed(text):
+		Some((state, RejectedDeclarationPreview)):
+			reference = frozen(text)
+			match (state.diagnostics(), reference.diagnostics):
+				([tree_name, tree_bracket], [table_name, table_bracket, table_colon]):
+					match ((tree_name.diagnostic, tree_bracket.diagnostic), (table_name.diagnostic, table_bracket.diagnostic, table_colon.diagnostic)):
+						((TreeDiagnostics.ExpectedToken(ExpectedName(NameInTraitName)), TreeDiagnostics.ExpectedToken(ExpectedRightBracket(RightBracketInTypeParameters))), (FrozenDiagnostics.ExpectedToken(ExpectedName(NameInTraitName)), FrozenDiagnostics.ExpectedToken(ExpectedRightBracket(RightBracketInTypeParameters)), FrozenDiagnostics.ExpectedToken(ExpectedColon(ColonInUnionVariants)))):
+							(
+								state.position() == cursor and state.current_kind() == NewlineToken and state.current_span().covers(offset, offset)
+								and tree_name.span.covers(offset, offset) and tree_bracket.span.covers(offset, offset)
+								and reference.token_cursor == table_cursor and FrozenCursor.current_kind(reference) == EndOfFileToken
+								and FrozenCursor.current_span(reference).covers(text.length(), text.length())
+								and table_name.span.covers(offset, offset) and table_bracket.span.covers(offset, offset) and table_colon.span.covers(offset, offset)
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_union_forms_reject_type_parameters_at_existing_preview_boundary() -> Bool:
+	(
+		rejected_type_parameter_boundary("union U[T:\n\tA", 5, 12, 9)
+		and rejected_type_parameter_boundary("fixed union U[T:\n\tA", 6, 18, 10)
+	)
+
+
 private pure func diagnostics_match_leaf(state: ParseState, reference: ParseState) -> Bool:
 	var correct: Bool = state.diagnostic_count() == reference.diagnostic_count()
 	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics()):
@@ -403,6 +456,9 @@ pure func test_sequential_completed_leaves_isolate_prefix_purity_and_ids() -> Bo
 tests: TestSuite = {
 	description = "Single declaration previews and explicit initializer handoffs",
 	tests = [
+		("fixed union route preserves prefix and ordinary grammar", test_fixed_union_route_preserves_prefix_and_ordinary_grammar),
+		("fixed union malformed headers match table diagnostics", test_fixed_union_malformed_headers_match_table_diagnostics),
+		("union forms reject type parameters at existing preview boundary", test_union_forms_reject_type_parameters_at_existing_preview_boundary),
 		("completed routes and keyword priorities", test_completed_routes_and_keyword_priorities),
 		("public import foreign and private recovery", test_public_import_and_foreign_are_owner_routes),
 		("deferred function trait implementation previews", test_function_trait_and_implementation_stay_previews),

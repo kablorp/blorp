@@ -22,6 +22,7 @@ import:
 		NAME_ID_BUILTIN_TENSOR4_CHECKED_SET,
 		NAME_ID_BUILTIN_TENSOR5_CHECKED_SET,
 		NAME_ID_BUILTIN_TENSOR_PEEL,
+		NAME_ID_EQUALS_METHOD,
 		NAME_ID_LENGTH,
 		NAME_ID_WILDCARD,
 		NameId,
@@ -89,14 +90,17 @@ import:
 		MISSING_RESOLVED_FIELD_IDENTITY,
 		ResolvedFieldIdentity,
 		definition_table_module_table,
+		definition_tables_share_provenance,
 		field_id_definition_id,
 		resolved_field_identity,
 		resolved_field_identity_field_id,
 		resolved_field_identity_from_optional_id,
+	graph/source_name_table: graph_source_name_table_source_names
 	headers/declaration_skeleton:
 		CallableId,
 		ConstructorId,
 		builtin_trait_id,
+		builtin_trait_id_name,
 		callable_id_definition_id,
 		callable_id_from_definition_table,
 		callable_id_from_reserved_graph_definition,
@@ -128,6 +132,8 @@ import:
 		InferSession,
 		ResourceCapabilityMemoEntry,
 		ResourceShapeTarget(OneShotStreamShape, ResourceSourceShape),
+		ScopedTraitFunction,
+		ScopedTraitFunctionOwner(AcceptedScopedMethod, CompilerScopedMethod, UnindexedScopedTrait),
 		TypeShapeMemo,
 		TypecheckState,
 		infer_module_facts_definition_table,
@@ -184,11 +190,16 @@ import:
 		accepted_record_may_contain_resource_source,
 		accepted_record_resource_scan_is_proven_unnecessary,
 	type_system/accepted_trait_implementation_authority:
+		AcceptedConcreteMethodLookup(
+			AcceptedConcreteMethodAbsent, AcceptedConcreteMethodFound,
+			AcceptedConcreteMethodInvalid, AcceptedConcreteMethodTemplate,
+		),
 		AcceptedQualifiedTraitMethodInfo,
 		AcceptedTraitUfcsMethodLookup(
 			AcceptedTraitUfcsMethodAmbiguous, AcceptedTraitUfcsMethodFound,
 			AcceptedTraitUfcsMethodNotFound,
 		),
+		accepted_find_concrete_impl_method_by_trait_id,
 		accepted_find_impl_method_info,
 		accepted_find_impl_method_info_by_trait_id,
 		accepted_find_qualified_trait_method_info,
@@ -207,6 +218,7 @@ import:
 		accepted_trait_find_ufcs_method,
 		accepted_trait_matches_compiler_identity,
 		accepted_trait_method_binding_declaring_trait_name,
+		accepted_trait_method_binding_for_id,
 		accepted_trait_method_binding_id,
 		accepted_trait_method_binding_signature,
 		accepted_trait_module_path,
@@ -269,7 +281,7 @@ import:
 		TraitMethodSig,
 		TraitObligation,
 		TraitObligationResolution(TraitObligationSatisfied, TraitObligationUnsatisfied),
-		TypeKind(TypeEnum, TypeUnion),
+		TypeKind(TypeBuiltin, TypeEnum, TypeResource, TypeScalarBuiltin, TypeUnion),
 		VarMutability(ImmutableBinding),
 		VarOrigin(
 			ForLoopVar, FuncParam, LetBinding, MatchBinding, ScopedResource, ScopedResourceDerived,
@@ -443,6 +455,7 @@ import:
 		widening_decision,
 		widening_semantic_type,
 		widening_value_type,
+	type_system/union_layout: UnionLayout(TaggedUnion)
 	types: type_from_parsed_type_expr
 
 
@@ -1222,12 +1235,8 @@ pure func infer_context_typecheck_state(context: InferContext) -> TypecheckState
 private pure func infer_facts_find_scoped_trait_function(
 	facts: InferModuleFacts,
 	function_name: String,
-) -> Option[String]:
-	match facts.scoped_trait_functions.find(func(pair): pair[0] == function_name):
-		Some(pair):
-			Some(pair[1])
-		None:
-			None
+) -> Option[ScopedTraitFunction]:
+	facts.scoped_trait_functions.find(func(binding): binding.source_name == function_name)
 
 
 private pure func infer_find_trait_module_path(
@@ -7396,50 +7405,58 @@ private pure func trait_method_callee_from_trait(
 			None
 
 
+private union TraitMethodCalleeLookup:
+	TraitMethodFound(TraitMethodCallee)
+	TraitMethodAbsent
+	TraitMethodInvalid(String)
+
+
 private pure func local_trait_method_callee(
 	context: InferContext,
-	name: String,
-	name_id: NameId,
-) -> Option[TraitMethodCallee]:
-	match infer_find_function_trait_method(context, name, name_id, name):
-		Some(callee):
-			if context.state.facts.scoped_trait_functions.any(
-				func(pair): pair[0] == name and pair[1] == callee.trait_name,
-			):
-				Some(callee)
-			else if builtin_trait_is_prelude(callee.trait_name):
-				Some(callee)
-			else:
-				match module_view_find_local_name(
-					context.state.facts.module_view,
-					callee.trait_name,
-				):
-					Some(kind):
-						if top_level_name_kind_is_trait(kind):
-							Some(callee)
-						else:
-							None
-					None:
-						None
-		None:
-			None
+	name: ParsedIdentifier,
+) -> TraitMethodCalleeLookup:
+	match scoped_trait_method_callee(context, name):
+		TraitMethodAbsent:
+			match infer_find_function_trait_method(context, name.text, name.name, name.text):
+				Some(callee):
+					if builtin_trait_is_prelude(callee.trait_name):
+						TraitMethodFound(callee)
+					else:
+						match module_view_find_local_name(
+							context.state.facts.module_view,
+							callee.trait_name,
+						):
+							Some(kind):
+								if top_level_name_kind_is_trait(kind):
+									TraitMethodFound(callee)
+								else:
+									TraitMethodAbsent
+							None:
+								TraitMethodAbsent
+				None:
+					TraitMethodAbsent
+		found:
+			found
 
 
 private pure func lookup_trait_method_callee(
 	context: InferContext,
 	name: ParsedIdentifier,
-) -> Option[TraitMethodCallee]:
+) -> TraitMethodCalleeLookup:
 	match module_view_find_imported_name(context.state.facts.module_view, name.text):
 		Some(binding):
 			infer_find_function_trait_method(context, name.text, name.name, binding.original_name)
+				.map(func(callee): TraitMethodFound(callee))
+				.get_or(TraitMethodAbsent)
 		None:
-			local_trait_method_callee(context, name.text, name.name)
+			local_trait_method_callee(context, name)
 
 
 private union ImportedReceiverTraitMethodLookup:
 	ImportedReceiverTraitMethodFound(TraitMethodCallee)
 	ImportedReceiverTraitMethodNotFound
 	ImportedReceiverTraitMethodAmbiguous
+	ImportedReceiverTraitMethodInvalid(String)
 
 
 private pure func imported_receiver_trait_method_callee(
@@ -7761,12 +7778,110 @@ private pure func infer_trait_method_name_expr(
 private pure func scoped_trait_method_callee(
 	context: InferContext,
 	name: ParsedIdentifier,
-) -> Option[TraitMethodCallee]:
+) -> TraitMethodCalleeLookup:
 	if module_view_find_imported_name(context.state.facts.module_view, name.text).is_some():
-		None
+		TraitMethodAbsent
 	else:
-		trait_name ?= infer_facts_find_scoped_trait_function(context.state.facts, name.text)
-		trait_method_callee_from_trait(context, name.text, name.name, name.text, trait_name)
+		match infer_facts_find_scoped_trait_function(context.state.facts, name.text):
+			None:
+				TraitMethodAbsent
+			Some(binding):
+				match binding.owner:
+					CompilerScopedMethod(trait_id):
+						if builtin_trait_id_name(trait_id).is_none():
+							TraitMethodInvalid("compiler scoped trait is not registered")
+						else:
+							match env_get_trait_by_id(context.state.env, trait_id):
+								None:
+									TraitMethodInvalid("compiler scoped trait is absent from Env")
+								Some(trait_def):
+									match trait_def.methods.find(
+										func(method): method.name == binding.source_name,
+									):
+										None:
+											TraitMethodInvalid(
+												"compiler scoped method is absent from its declaring trait",
+											)
+										Some(method):
+											TraitMethodFound({
+												source_name = name.text,
+												source_name_id = name.name,
+												method_name = method.name,
+												trait_name = trait_def.name,
+												method = method,
+												identity = AcceptedTraitMethodCalleeIdentity(
+													trait_id,
+												),
+											})
+					UnindexedScopedTrait(trait_name):
+						if infer_module_facts_requires_graph_definition(context.state.facts):
+							TraitMethodInvalid("unindexed scoped trait in accepted inference")
+						else:
+							trait_method_callee_from_trait(
+								context,
+								name.text,
+								name.name,
+								name.text,
+								trait_name,
+							)
+								.map(func(callee): TraitMethodFound(callee))
+								.get_or(TraitMethodAbsent)
+					AcceptedScopedMethod(issuer, method_id):
+						match (
+							module_view_accepted_trait_implementation_authority(
+								context.state.facts.module_view,
+							),
+							infer_module_facts_definition_table(context.state.facts),
+						):
+							(Some(authority), Some(current_issuer)):
+								if not definition_tables_share_provenance(issuer, current_issuer):
+									TraitMethodInvalid(
+										"scoped trait method issuer does not match inference",
+									)
+								else:
+									match accepted_trait_method_binding_for_id(
+										authority,
+										issuer,
+										method_id,
+									):
+										Ok(method):
+											TraitMethodFound({
+												source_name = name.text,
+												source_name_id = name.name,
+												method_name = accepted_trait_method_binding_signature(
+													method,
+												).name,
+												trait_name = accepted_trait_method_binding_declaring_trait_name(
+													method,
+												),
+												method = accepted_trait_method_binding_signature(
+													method,
+												),
+												identity = AcceptedTraitMethodCalleeIdentity(
+													trait_method_id_owner(method_id),
+												),
+											})
+										Err(message):
+											TraitMethodInvalid(message)
+							_:
+								TraitMethodInvalid(
+									"scoped trait method has incomplete accepted authority",
+								)
+
+
+private pure func invalid_trait_method_result(
+	context: InferContext,
+	name: ParsedIdentifier,
+	message: String,
+) -> InferResult:
+	next = infer_error(context, "internal typecheck error: " + message)
+	infer_result(
+		next,
+		TypedNameExpr(
+			name,
+			inferred_info(next, TYPE_VOID),
+		),
+	)
 
 
 private pure func builtin_symbol_prefers_trait_dispatch(name: String) -> Bool:
@@ -7885,26 +8000,28 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 					is_local: Bool = symbol_is_lexical_or_current_module(context, symbol)
 
 					scoped_trait_callee = if is_local:
-						None
+						TraitMethodAbsent
 					else:
 						scoped_trait_method_callee(context, name)
 
 					trait_callee = match scoped_trait_callee:
-						Some(callee):
-							Some(callee)
-						None:
+						TraitMethodAbsent:
 							if (
 								func_symbol.origin == BuiltinFunc
 								and builtin_symbol_prefers_trait_dispatch(name.text)
 							):
 								lookup_trait_method_callee(context, name)
 							else:
-								None
+								TraitMethodAbsent
+						found:
+							found
 
 					match trait_callee:
-						Some(callee):
+						TraitMethodFound(callee):
 							infer_trait_method_name_expr(context, name, callee)
-						None:
+						TraitMethodInvalid(message):
+							invalid_trait_method_result(context, name, message)
+						TraitMethodAbsent:
 							source_name = source_name_for_imported_module_path(
 								context,
 								name.text,
@@ -7949,9 +8066,11 @@ private pure func infer_name_expr(context: InferContext, name: ParsedIdentifier)
 					)
 		None:
 			match lookup_trait_method_callee(context, name):
-				Some(callee):
+				TraitMethodFound(callee):
 					infer_trait_method_name_expr(context, name, callee)
-				None:
+				TraitMethodInvalid(message):
+					invalid_trait_method_result(context, name, message)
+				TraitMethodAbsent:
 					match find_bare_constructor(context, context.state.env, name.text):
 						Some(ctor):
 							infer_constructor_name_expr(context, name, ctor)
@@ -8350,6 +8469,224 @@ private pure func infer_binary_operands(
 			}
 
 
+-- Keep native scalars and legacy enums on their existing operator path.
+-- Declaration parameters, not just applied arguments, exclude phantom generics.
+private pure func explicit_binary_equality_receiver(
+	context: InferContext,
+	receiver: SemanticType,
+) -> Bool:
+	match receiver:
+		SemanticNamedType(name, []):
+			match env_get_type_kind(context.state.env, name):
+				Some(TypeBuiltin) | Some(TypeScalarBuiltin) | Some(TypeResource) | Some(TypeEnum):
+					False
+				_:
+					record_entry = module_view_accepted_record_authority(
+						context.state.facts.module_view,
+					).and_then(
+						func(authority): accepted_record_find(authority, name),
+					)
+					union_entry = module_view_accepted_union_authority(
+						context.state.facts.module_view,
+					).and_then(
+						func(authority): accepted_union_find(authority, name),
+					)
+					(
+						record_entry
+							.map(
+								func(
+									entry,
+								): entry.type_params.is_empty() and not entry.contains_resource,
+							)
+							.get_or(False)
+						or union_entry
+							.map(
+								func(
+									entry,
+								): (
+									entry.type_params.is_empty()
+									and entry.layout == TaggedUnion
+									and not entry.contains_resource
+								),
+							)
+							.get_or(False)
+					)
+		_:
+			False
+
+
+private pure func explicit_binary_equality_signature(
+	context: InferContext,
+	method: ImplMethodInfo,
+	receiver: SemanticType,
+) -> Bool:
+	-- Selection retains the original/localized signature, not an instantiated
+	-- generic signature. Exact concrete parameters keep blanket selection out.
+	method.type_params.is_empty() and match method.func_type:
+		SemanticFunctionType(True, [first, second], result):
+			types_equal(
+				infer_resolve_alias(context, first),
+				receiver,
+			) and types_equal(
+				infer_resolve_alias(context, second),
+				receiver,
+			) and types_equal(
+				infer_resolve_alias(context, result),
+				TYPE_BOOL,
+			)
+		_:
+			False
+
+
+private pure func infer_explicit_binary_equality_call(
+	context: InferContext,
+	op: ParsedBinaryOp,
+	left: TypedExpr,
+	right: TypedExpr,
+	span: SourceLocation,
+) -> Option[InferResult]:
+	method_name ?= match op:
+		ParsedEqualOp:
+			Some("equals")
+		ParsedNotEqualOp:
+			Some("not_equals")
+		_:
+			None
+
+	receiver = zonk_type(
+		context.state.context,
+		infer_resolve_alias(context, typed_expr_value_type(left)),
+	)
+
+	if not explicit_binary_equality_receiver(context, receiver):
+		None
+	else:
+		authority ?= module_view_accepted_trait_implementation_authority(
+			context.state.facts.module_view,
+		)
+		definitions ?= infer_module_facts_definition_table(context.state.facts)
+		method ?= accepted_find_impl_method_info_by_trait_id(
+			authority,
+			definitions,
+			context.state.env,
+			TRAIT_ID_EQUATABLE,
+			method_name,
+			receiver,
+		)
+
+		if not explicit_binary_equality_signature(context, method, receiver):
+			None
+		else:
+			selected_target ?= method.target
+
+			method_name_id ?= if method_name == "equals":
+				Some(NAME_ID_EQUALS_METHOD)
+			else:
+				-- not_equals has no predefined vocabulary ID in this compiler.
+				infer_module_facts_graph_source_name_table(
+					context.state.facts,
+				).and_then(
+					func(
+						graph_names,
+					): name_table_find_id(
+						graph_source_name_table_source_names(graph_names),
+						method_name,
+					),
+				)
+
+			method_callee: TraitMethodCallee = {
+				source_name = method_name,
+				source_name_id = method_name_id,
+				method_name = method_name,
+				trait_name = trait_id_name(definitions, TRAIT_ID_EQUATABLE),
+				method = {
+					name = method_name,
+					params = [receiver, receiver],
+					return_type = TYPE_BOOL,
+					is_pure = True,
+					has_default = False,
+					param_names = method.param_names
+				},
+				identity = AcceptedTraitMethodCalleeIdentity(TRAIT_ID_EQUATABLE)
+			}
+			args = [left, right]
+			resolved = { resolved_call_from_trait_method_callee(
+				context.state.facts,
+				method_callee,
+				Some(method),
+				None,
+			) |
+				resource_args = method.resource_args,
+				dim_constraints = method.dim_constraints
+			}
+			callee = TypedNameExpr(
+				parsed_identifier(
+					method_name_id,
+					method_name,
+					span,
+				),
+				typed_expr_info_from_slot(
+					None,
+					InferredOrigin,
+					UNREFINED_BINDING,
+					Some(resolved),
+					KeptValueSlot(
+						SemanticFunctionType(
+							True,
+							[receiver, receiver],
+							TYPE_BOOL,
+						),
+					),
+				),
+			)
+
+			var next = if trait_impl_target_is_outside_definition_table(
+				context.state.facts,
+				Some(method),
+			):
+				graph_definition_invariant_error(
+					context,
+					"implementation method",
+					method_name,
+					selected_target.callable_id,
+				)
+			else:
+				context
+
+			for indexed in args.enumerate():
+				arg = indexed[1]
+				arg_type = generic_argument_bind_type(receiver, arg, typed_expr_value_type(arg))
+
+				next = match call_argument_assignable_context(next, callee, receiver, arg_type):
+					Some(assignable):
+						assignable
+					None:
+						argument_mismatch_error(
+							next,
+							callee,
+							indexed[0],
+							receiver,
+							arg_type,
+							typed_expr_location(arg),
+						)
+
+			bound_checked = check_call_trait_bounds_for_params(next, callee, [], [])
+			dim_checked = check_call_dim_constraints(bound_checked, Some(resolved), [])
+			debug_checked = check_debug_only_call(dim_checked, Some(resolved))
+			checked = check_call_resource_args(debug_checked, Some(resolved), args)
+			Some(
+				infer_result(
+					checked,
+					TypedCallExpr(
+						callee,
+						args,
+						span,
+						inferred_call_info(checked, TYPE_BOOL, Some(resolved)),
+					),
+				),
+			)
+
+
 private pure func infer_binary_expr(
 	context: InferContext,
 	op: ParsedBinaryOp,
@@ -8373,15 +8710,24 @@ private pure func infer_binary_expr(
 	)
 	typed_left = typed_expr_with_slot(operands.left, left_slot)
 	typed_right = typed_expr_with_slot(operands.right, right_slot)
-	typed = TypedBinaryExpr(
-		op,
-		typed_left,
-		typed_right,
-		span,
-		inferred_info(checked.context, result_type),
-	)
 
-	infer_result(checked.context, typed)
+	selected = if checked.context.state.errors.length() == operands.context.state.errors.length():
+		infer_explicit_binary_equality_call(checked.context, op, typed_left, typed_right, span)
+	else:
+		None
+
+	match selected:
+		Some(call):
+			call
+		None:
+			typed = TypedBinaryExpr(
+				op,
+				typed_left,
+				typed_right,
+				span,
+				inferred_info(checked.context, result_type),
+			)
+			infer_result(checked.context, typed)
 
 
 private pure func infer_logical_expr(
@@ -11079,6 +11425,235 @@ private pure func debug_reflection_result(
 			None
 
 
+private pure func accepted_call_type_is_concrete(context: InferContext, typ: SemanticType) -> Bool:
+	match typ:
+		SemanticTypeVar(_, _) | SemanticMetaType(_, _) | SemanticSelfType | SemanticVarDimsType(_):
+			False
+		SemanticNamedType(name, args):
+			(
+				not env_get_type_params(context.state.env).contains(name)
+				and args.all(func(arg): accepted_call_type_is_concrete(context, arg))
+			)
+		SemanticArrayType(element, dims):
+			(
+				accepted_call_type_is_concrete(context, element)
+				and dims.all(func(dim): accepted_call_type_is_concrete(context, dim))
+			)
+		SemanticFunctionType(_, params, result):
+			(
+				params.all(func(param): accepted_call_type_is_concrete(context, param))
+				and accepted_call_type_is_concrete(context, result)
+			)
+		SemanticTupleType(elements):
+			elements.all(func(element): accepted_call_type_is_concrete(context, element))
+		SemanticRangeType(inner):
+			accepted_call_type_is_concrete(context, inner)
+		SemanticDimOpType(_, left, right):
+			(
+				accepted_call_type_is_concrete(context, left)
+				and accepted_call_type_is_concrete(context, right)
+			)
+		SemanticConstIntType(_):
+			True
+
+
+private pure func bind_selected_accepted_trait_call(
+	context: InferContext,
+	callee: TypedExpr,
+	call: ResolvedCallInfo,
+	trait_id: TraitId,
+	method: ImplMethodInfo,
+	params: List[SemanticType],
+	return_type: SemanticType,
+	subst: List[SemanticTypeSubstEntry],
+) -> Option[InferResult]:
+	match method.func_type:
+		SemanticFunctionType(is_pure, method_params, method_return):
+			concrete_params = method_params.map(func(param): zonk_type(
+					context.state.context,
+					infer_resolve_alias(context, param),
+				))
+			concrete_return = zonk_type(
+				context.state.context,
+				infer_resolve_alias(context, method_return),
+			)
+			instantiated_params = params.map(func(param): zonk_type(
+					context.state.context,
+					infer_resolve_alias(
+						context,
+						apply_subst(subst, param),
+					),
+				))
+			instantiated_return = zonk_type(
+				context.state.context,
+				infer_resolve_alias(
+					context,
+					apply_subst(subst, return_type),
+				),
+			)
+			concrete_constraints = method.dim_constraints.all(
+				func(
+					pair,
+				): (
+					accepted_call_type_is_concrete(context, pair[0])
+					and accepted_call_type_is_concrete(context, pair[1])
+				),
+			)
+
+			if (
+				not concrete_params.all(func(param): accepted_call_type_is_concrete(context, param))
+				or not accepted_call_type_is_concrete(context, concrete_return)
+				or not concrete_constraints
+			):
+				None
+			else if (
+				-- Shape equality deliberately excludes purity: a pure implementation
+				-- may satisfy an impure slot. Preserve the conservative call.purity
+				-- and reject only refinement in the opposite direction below.
+				not types_equal(
+					SemanticFunctionType(True, concrete_params, concrete_return),
+					SemanticFunctionType(True, instantiated_params, instantiated_return),
+				)
+				or (
+					purities_equal(call.purity, Pure)
+					and (not is_pure or not purities_equal(method.purity, Pure))
+				)
+			):
+				Some(
+					infer_result(
+						infer_error(
+							context,
+							(
+								"internal typecheck error: selected implementation signature disagrees with "
+								+ "instantiated trait call"
+							),
+						),
+						callee,
+					),
+				)
+			else:
+				match method.target.and_then(
+					func(
+						target,
+					): infer_facts_callable_id(context.state.facts, target.callable_id),
+				):
+					Some(callable_id):
+						selected = { call |
+							target = ResolvedAcceptedTraitMethodCall(trait_id, callable_id),
+							bound_type_params = method.type_params,
+							debug_only = method.debug_only,
+							resource_args = method.resource_args,
+							dim_constraints = method.dim_constraints,
+							instantiated_params = instantiated_params,
+							instantiated_return = instantiated_return
+						}
+						Some(
+							infer_result(
+								context,
+								typed_expr_with_info(
+									callee,
+									{ typed_expr_info(callee) | resolved_call = Some(selected) },
+								),
+							),
+						)
+					None:
+						Some(
+							infer_result(
+								infer_error(
+									context,
+									(
+										"internal typecheck error: selected implementation callable is outside inference "
+										+ "definition table"
+									),
+								),
+								callee,
+							),
+						)
+		_:
+			Some(
+				infer_result(
+					infer_error(
+						context,
+						"internal typecheck error: selected implementation method is not callable",
+					),
+					callee,
+				),
+			)
+
+
+private pure func bind_concrete_accepted_trait_call(
+	context: InferContext,
+	callee: TypedExpr,
+	args: List[TypedExpr],
+	params: List[SemanticType],
+	return_type: SemanticType,
+	resolved_call: Option[ResolvedCallInfo],
+	subst: List[SemanticTypeSubstEntry],
+) -> Option[InferResult]:
+	call ?= resolved_call
+
+	trait_id ?= match call.target:
+		ResolvedAcceptedUnresolvedTraitMethodCall(id):
+			Some(id)
+		_:
+			None
+
+	receiver_arg ?= args.get(0)
+	receiver = zonk_type(
+		context.state.context,
+		infer_resolve_alias(context, typed_expr_value_type(receiver_arg)),
+	)
+
+	-- Symbolic calls retain their existing specialization route. Selection
+	-- consumes the already inferred receiver and never repeats inference.
+	if not accepted_call_type_is_concrete(context, receiver):
+		None
+	else:
+		match (
+			module_view_accepted_trait_implementation_authority(context.state.facts.module_view),
+			infer_module_facts_definition_table(context.state.facts),
+		):
+			(Some(authority), Some(issuer)):
+				match accepted_find_concrete_impl_method_by_trait_id(
+					authority,
+					issuer,
+					context.state.env,
+					trait_id,
+					call.callee_name,
+					receiver,
+				):
+					AcceptedConcreteMethodInvalid(message):
+						Some(
+							infer_result(
+								infer_error(context, "internal typecheck error: " + message),
+								callee,
+							),
+						)
+					AcceptedConcreteMethodAbsent | AcceptedConcreteMethodTemplate:
+						None
+					AcceptedConcreteMethodFound(method):
+						bind_selected_accepted_trait_call(
+							context,
+							callee,
+							call,
+							trait_id,
+							method,
+							params,
+							return_type,
+							subst,
+						)
+			_:
+				Some(
+					infer_result(
+						infer_error(
+							context,
+							"internal typecheck error: accepted trait call has incomplete authority",
+						),
+						callee,
+					),
+				)
+
+
 private pure func infer_call_with_callee_result(
 	context: InferContext,
 	callee_result: InferResult,
@@ -11206,24 +11781,48 @@ private pure func infer_call_with_callee_result(
 						return_bind.subst,
 					)
 
-				checked_context = check_call_trait_bounds_for_params(
+				bound_resolution = bind_concrete_accepted_trait_call(
 					complete_subst.context,
 					callee_expr,
+					arg_result.args,
+					call_params,
+					call_return_type,
+					self_resolved_call,
+					complete_subst.subst,
+				)
+				bound_callee = match bound_resolution:
+					Some(result):
+						result.expr
+					None:
+						callee_expr
+				bound_resolved_call = match bound_resolution:
+					Some(result):
+						typed_expr_resolved_call(result.expr)
+					None:
+						self_resolved_call
+				bound_context = match bound_resolution:
+					Some(result):
+						result.context
+					None:
+						complete_subst.context
+				checked_context = check_call_trait_bounds_for_params(
+					bound_context,
+					bound_callee,
 					signature.bound_params,
 					complete_subst.subst,
 				)
 				dim_checked_context = check_call_dim_constraints(
 					checked_context,
-					self_resolved_call,
+					bound_resolved_call,
 					complete_subst.subst,
 				)
 				debug_checked_context = check_debug_only_call(
 					dim_checked_context,
-					self_resolved_call,
+					bound_resolved_call,
 				)
 				resource_checked_context = check_call_resource_args(
 					debug_checked_context,
-					self_resolved_call,
+					bound_resolved_call,
 					arg_result.args,
 				)
 
@@ -11253,12 +11852,12 @@ private pure func infer_call_with_callee_result(
 				)
 				resolved_return_type = refined_builtin_return_type(
 					var_dims_bind.context.state.facts,
-					self_resolved_call,
+					bound_resolved_call,
 					arg_result.args,
 					resolved_return_base,
 				)
 
-				instantiated_resolved_call = match self_resolved_call:
+				instantiated_resolved_call = match bound_resolved_call:
 					Some(call):
 						Some({ call |
 								instantiated_params = resolved_param_types,
@@ -11269,7 +11868,7 @@ private pure func infer_call_with_callee_result(
 
 				match debug_reflection_result(
 					var_dims_bind.context,
-					callee_expr,
+					bound_callee,
 					arg_result.args,
 					span,
 					resolved_return_type,
@@ -11279,7 +11878,7 @@ private pure func infer_call_with_callee_result(
 						result
 					None:
 						typed = TypedCallExpr(
-							callee_expr,
+							bound_callee,
 							arg_result.args,
 							span,
 							inferred_call_info(
@@ -11648,9 +12247,11 @@ private pure func infer_trait_method_ufcs_call_expr(
 					context,
 					method,
 				):
-					Some(callee):
+					TraitMethodFound(callee):
 						ImportedReceiverTraitMethodFound(callee)
-					None:
+					TraitMethodInvalid(message):
+						ImportedReceiverTraitMethodInvalid(message)
+					TraitMethodAbsent:
 						if receiver_result.context.state.errors.length() == context.state.errors.length():
 							imported_receiver_trait_method_callee(
 								context,
@@ -11661,6 +12262,8 @@ private pure func infer_trait_method_ufcs_call_expr(
 							ImportedReceiverTraitMethodNotFound
 
 				match method_lookup:
+					ImportedReceiverTraitMethodInvalid(message):
+						Some(invalid_trait_method_result(receiver_result.context, method, message))
 					ImportedReceiverTraitMethodFound(method_callee):
 						func_type = SemanticFunctionType(
 							method_callee.method.is_pure,

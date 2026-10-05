@@ -11,6 +11,10 @@ GRAMMARS = (
     EDITOR / "vscode/syntaxes/blorp.tmLanguage.json",
     EDITOR / "intellij/src/main/resources/textmate/blorp/syntaxes/blorp.tmLanguage.json",
 )
+CONFIGURATIONS = (
+    EDITOR / "vscode/language-configuration.json",
+    EDITOR / "intellij/src/main/resources/textmate/blorp/language-configuration.json",
+)
 
 
 def rules(value):
@@ -24,6 +28,44 @@ def rules(value):
 
 
 class RecordSpellingGrammarTest(unittest.TestCase):
+    def test_fixed_union_headers_increase_indentation(self):
+        for path in CONFIGURATIONS:
+            pattern = json.loads(path.read_text())["indentationRules"]["increaseIndentPattern"]
+            for prefix in ("", "private "):
+                for header in ("fixed union Response:", "fixed union Response[T, #N]: -- payloads"):
+                    with self.subTest(path=path, source=prefix + header):
+                        self.assertIsNotNone(re.search(pattern, prefix + header))
+
+    def test_fixed_identifiers_do_not_increase_indentation(self):
+        for path in CONFIGURATIONS:
+            pattern = json.loads(path.read_text())["indentationRules"]["increaseIndentPattern"]
+            for source in ("fixed: Int = 1", "private fixed: Int = 1", "fixed union_name:", "fixed_record:"):
+                with self.subTest(path=path, source=source):
+                    self.assertIsNone(re.search(pattern, source))
+
+    def test_contextual_fixed_union_declarations(self):
+        for path in GRAMMARS:
+            with self.subTest(path=path):
+                grammar = json.loads(path.read_text())
+                declaration_rules = list(rules(grammar))
+                for prefix in ("", "private "):
+                    rule = next(rule for rule in declaration_rules
+                                if rule.get("comment") == prefix + "fixed union declaration")
+                    matched = re.search(rule["match"], prefix + "fixed union Response[T, #N]:")
+                    self.assertIsNotNone(matched)
+                    captured_scopes = {
+                        matched.group(int(group)): capture["name"]
+                        for group, capture in rule["captures"].items()
+                    }
+                    self.assertEqual(captured_scopes["fixed"], "storage.modifier.fixed.blorp")
+                    self.assertEqual(captured_scopes["union"], "keyword.declaration.union.blorp")
+                    self.assertEqual(captured_scopes["Response"], "entity.name.type.union.blorp")
+                    ordinary = next(rule for rule in declaration_rules
+                                    if rule.get("comment") == prefix + "union declaration")
+                    self.assertLess(declaration_rules.index(rule), declaration_rules.index(ordinary))
+                    for source in ("fixed: Int = 1", "func bump(fixed: Int) -> Int:"):
+                        self.assertIsNone(re.search(rule["match"], source))
+
     def test_contextual_fixed_record_declarations(self):
         for path in GRAMMARS:
             with self.subTest(path=path):

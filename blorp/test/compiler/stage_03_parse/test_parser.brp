@@ -5,6 +5,8 @@ import:
 	../../../src/compiler/stage_02_lex/parse_diagnostic: parse_diagnostic_to_string
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
 	../../../src/compiler/stage_03_parse/parsed_ast:
+		UnionDeclarationForm(OrdinaryUnion, FixedUnion, LegacyEnum),
+		MAX_UNION_VARIANT_FIELDS,
 		RecordDeclarationForm(OrdinaryRecord, FixedRecord),
 		ConcurrentForLimit(MissingLimit, WrittenLimit),
 		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
@@ -4534,7 +4536,7 @@ func test_parse_union_and_enum_declarations() -> Bool:
 		Some(UnionParsedDecl(union_decl)):
 			union_ok: Bool = (
 				union_decl.name.text == "Option"
-				and not union_decl.is_enum
+				and union_decl.form == OrdinaryUnion
 				and union_decl.type_params.length() == 1
 				and union_decl.variants.length() == 2
 			)
@@ -4543,7 +4545,7 @@ func test_parse_union_and_enum_declarations() -> Bool:
 				Some(UnionParsedDecl(enum_decl)):
 					(
 						enum_decl.name.text == "Color"
-						and enum_decl.is_enum
+						and enum_decl.form == LegacyEnum
 						and enum_decl.variants.length() == 2
 					)
 				_:
@@ -4552,6 +4554,57 @@ func test_parse_union_and_enum_declarations() -> Bool:
 			parsed_program_ok(program) and union_ok and enum_ok
 		_:
 			False
+
+
+func test_fixed_union_preserves_source_form_and_ordinary_payload_rules() -> Bool:
+	program = parse_compiler_source(source(
+		"fixed union Response[T, #N]:\n\tAccepted(T)\n\tRejected(String)\n\tEmpty()\n\tSized(Int[#N])\n",
+	))
+	text: String = parsed_program_to_json(program).to_string()
+	match program.decls:
+		[UnionParsedDecl(declaration)]:
+			(parsed_program_ok(program) and declaration.form == FixedUnion
+				and declaration.type_params.length() == 2
+				and declaration.variants.length() == 4
+				and text.contains("\"form\":\"fixed_union\""))
+		_:
+			False
+
+
+func test_private_fixed_union_and_contextual_fixed_identifier() -> Bool:
+	program = parse_compiler_source(source(
+		"private fixed union Response:\n\tAccepted(Int)\n\tRejected(String)\n\nfixed = 1\n",
+	))
+	text: String = parsed_program_to_json(program).to_string()
+	match program.decls:
+		[PrivateParsedDecl(UnionParsedDecl(_), _), VarParsedDecl(binding)]:
+			(parsed_program_ok(program) and binding.name.text == "fixed"
+				and text.contains("\"form\":\"fixed_union\""))
+		_:
+			False
+
+
+func test_union_json_preserves_all_declaration_forms() -> Bool:
+	program = parse_compiler_source(source(
+		"union Ordinary:\n\tA\nfixed union Fixed:\n\tA\nenum Legacy:\n\tA\n",
+	))
+	text: String = parsed_program_to_json(program).to_string()
+	(parsed_program_ok(program) and text.contains("\"form\":\"ordinary_union\"")
+		and text.contains("\"form\":\"fixed_union\"")
+		and text.contains("\"form\":\"legacy_enum\"")
+		and not text.contains("\"is_enum\""))
+
+
+func test_fixed_union_preserves_variant_field_limit_and_diagnostics() -> Bool:
+	var fields: List[String] = []
+	while fields.length() < MAX_UNION_VARIANT_FIELDS:
+		fields = fields.append("Int")
+	valid = "fixed union Payload:\n\tWide(" + fields.join(", ") + ")\n"
+	invalid = "fixed union Payload:\n\tWide(" + fields.append("Int").join(", ") + ")\n"
+	diagnostic = first_diagnostic_text(invalid)
+	(parsed_program_ok(parse_compiler_source(source(valid)))
+		and diagnostic.contains("Union variants support at most 64 fields")
+		and diagnostic.contains("group related fields into a record and use the record as one field"))
 
 
 func test_parse_builtin_type_declaration() -> Bool:
@@ -5929,6 +5982,10 @@ tests: TestSuite = {
 			test_parse_fixed_record_diagnostics_use_fixed_record_wording,
 		),
 		("parse union and enum declarations", test_parse_union_and_enum_declarations),
+		("fixed union preserves source form and ordinary payload rules", test_fixed_union_preserves_source_form_and_ordinary_payload_rules),
+		("private fixed union and contextual fixed identifier", test_private_fixed_union_and_contextual_fixed_identifier),
+		("union json preserves all declaration forms", test_union_json_preserves_all_declaration_forms),
+		("fixed union preserves variant field limit and diagnostics", test_fixed_union_preserves_variant_field_limit_and_diagnostics),
 		("parse builtin type declaration", test_parse_builtin_type_declaration),
 		("parse resource builtin type declaration", test_parse_resource_builtin_type_declaration),
 		(

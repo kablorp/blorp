@@ -42,6 +42,8 @@ import:
 		TYPE_STRING,
 		canonical_module_type_name,
 		types_equal,
+	../../../src/compiler/stage_06_typecheck/type_system/union_layout:
+		UnionLayout(FieldlessEnum, TaggedUnion),
 	../typecheck_test_support:
 		DefinitionBackedTypeFixtureModule,
 		definition_backed_type_fixture,
@@ -124,7 +126,7 @@ private pure func fixture_union(
 	name: String,
 	canonical_visible: Bool,
 	variants: List[AcceptedUnionVariantEntry],
-	is_enum: Bool,
+	layout: UnionLayout,
 ) -> AcceptedUnionTableRecord:
 	{
 		id = id,
@@ -133,7 +135,7 @@ private pure func fixture_union(
 		payload = {
 			type_params = [],
 			variants = variants,
-			is_enum = is_enum,
+			layout = layout,
 			contains_resource = True,
 			may_contain_function = False,
 			may_contain_one_shot_stream = True,
@@ -155,7 +157,7 @@ private pure func table_input(
 						canonical_module_type_name("pkg/left", "Node"),
 						[],
 					)], 0)],
-		False,
+		TaggedUnion,
 	)
 	right = fixture_union(
 		fixture.right_choice,
@@ -163,7 +165,7 @@ private pure func table_input(
 		"Choice",
 		True,
 		[variant("Other", 202, [TYPE_STRING], 0)],
-		True,
+		FieldlessEnum,
 	)
 	-- The owner-local union is intentionally not table index zero.
 	unions = [right, left]
@@ -175,7 +177,7 @@ private pure func table_input(
 			"Extra",
 			True,
 			[variant("ExtraValue", 303, [TYPE_INT], 0)],
-			False,
+			TaggedUnion,
 		)
 		{
 			definition_table = definition_backed_type_fixture_definition_table(fixture.scope),
@@ -302,7 +304,7 @@ private pure func category_table_and_compact_view_are_authoritative_result() -> 
 		AcceptedUnionExactFound(_) | AcceptedUnionExactMissing:
 			False
 
-	Some(types_equal(
+	Some(local.layout == TaggedUnion and canonical.layout == TaggedUnion and types_equal(
 			local_field,
 			SemanticNamedType("Node", []),
 		) and types_equal(
@@ -437,7 +439,7 @@ private pure func later_local_constructor_declaration_wins_result() -> Option[Bo
 				"First",
 				True,
 				[variant("Shared", 401, [], 0)],
-				True,
+				FieldlessEnum,
 			),
 			fixture_union(
 				second_id,
@@ -445,7 +447,7 @@ private pure func later_local_constructor_declaration_wins_result() -> Option[Bo
 				"Second",
 				True,
 				[variant("Shared", 402, [], 0)],
-				True,
+				FieldlessEnum,
 			),
 		]
 	}
@@ -619,6 +621,7 @@ private pure func imported_union_payloads_use_viewer_spelling_result() -> Option
 	cycle = accepted_union_authority(table, cycle_view)
 	outside = accepted_union_authority(table, outside_view)
 	cycle_entry ?= accepted_union_find(cycle, "Remote")
+	outside_entry ?= accepted_union_find(outside, "Remote")
 	cycle_payload ?= cycle_entry.variants
 		.get(0)
 		.and_then(func(item): item.fields.get(0))
@@ -628,10 +631,14 @@ private pure func imported_union_payloads_use_viewer_spelling_result() -> Option
 	outside_constructor_field ?= outside_constructor.field_types.get(0)
 
 	Some(
-		types_equal(cycle_payload, SemanticNamedType("Node", []))
-		and types_equal(cycle_constructor_field, SemanticNamedType("Node", []))
-		and cycle_constructor.parent_type == canonical_module_type_name("pkg/right", "Choice")
-		and types_equal(outside_constructor_field, left_node_type)
+		(
+			cycle_entry.layout == FieldlessEnum
+			and outside_entry.layout == FieldlessEnum
+			and types_equal(cycle_payload, SemanticNamedType("Node", []))
+			and types_equal(cycle_constructor_field, SemanticNamedType("Node", []))
+			and cycle_constructor.parent_type == canonical_module_type_name("pkg/right", "Choice")
+			and types_equal(outside_constructor_field, left_node_type)
+		),
 	)
 
 
@@ -665,6 +672,7 @@ private pure func builtin_union_is_copied_once_into_the_table_result() -> Option
 	Some(
 		(
 			entry.variants.length() == 2
+			and entry.layout == TaggedUnion
 			and some.parent_type == "Option"
 			and accepted_union_table_entry_count(table) == 1
 		),
@@ -732,10 +740,34 @@ private pure func matching_graph_and_builtin_union_share_one_payload_result() ->
 	).to_option()
 	shared_authority = accepted_union_authority(shared_table, accepted_union_empty_module_view())
 	some ?= accepted_union_find_constructor(shared_authority, "Some")
+	-- Change a published fact, not a declaration's payload shape.
+	conflicting_table = accepted_union_table(
+		{
+			definition_table = definition_table,
+			unions = [
+				{
+					id = option_id,
+					canonical_name = "Option",
+					canonical_visible = True,
+					payload = { builtin_entry | layout = FieldlessEnum }
+				},
+			]
+		},
+		graph_identities,
+		env_with_builtins(ENV_EMPTY),
+		["Option"],
+	)
+
+	conflicting_metadata_rejected = match conflicting_table:
+		Err(errors):
+			errors == ["bootstrap union 'Option' does not match accepted graph metadata"]
+		Ok(_):
+			False
 
 	Some(
 		(
 			accepted_union_table_entry_count(shared_table) == 1
+			and conflicting_metadata_rejected
 			and some.parent_type == "Option"
 			and match accepted_union_exact(shared_table, graph_identities, option_id).lookup:
 				AcceptedUnionExactFound(_):

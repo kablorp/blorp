@@ -61,6 +61,8 @@ for matched measurements; do not copy a profile into the work index.
   IDs, type interning, and remaining table migrations.
 - [Record Simplification](FIXED_LAYOUT_ROADMAP.md): ordinary-record semantics,
   ABI boundaries, and later measured placement optimizations.
+- [Union Simplification](FIXED_UNION_ROADMAP.md): enum migration, one logical
+  union model, shared representations, and later checked fixed unions.
 - [Allocation Contracts](ALLOCATION_CONTRACT_ROADMAP.md): incomplete backend
   coverage and proposed `no_alloc` enforcement. The existing report is
   described in [Architecture](ARCHITECTURE.md#allocation-reports).

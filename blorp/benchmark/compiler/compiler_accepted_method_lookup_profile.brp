@@ -1,0 +1,171 @@
+-- Ordinary accepted lookup adapter cost; setup and observation are outside the window.
+import:
+	../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../src/compiler/stage_06_typecheck/decl:
+		accepted_typecheck_graph_implementation_headers,
+		accepted_typecheck_graph_semantic_catalog,
+	../../src/compiler/stage_06_typecheck/graph/definition_index: DefinitionTable
+	../../src/compiler/stage_06_typecheck/headers/declaration_skeleton:
+		callable_id_from_definition_table,
+		callable_id_name,
+	../../src/compiler/stage_06_typecheck/headers/implementation_headers:
+		implementation_header_graph_definition_table,
+	../../src/compiler/stage_06_typecheck/state: TYPECHECK_USER_ORIGIN, typecheck_state_for_origin
+	../../src/compiler/stage_06_typecheck/type_system/accepted_semantic_catalog:
+		accepted_semantic_catalog_trait_implementation_table,
+	../../src/compiler/stage_06_typecheck/type_system/accepted_trait_implementation_authority:
+		AcceptedTraitImplementationAuthority,
+		accepted_find_impl_method_info_by_trait_id,
+		accepted_trait_empty_visibility,
+		accepted_trait_find,
+		accepted_trait_implementation_authority,
+		accepted_trait_implementation_authority_preparation_errors,
+	../../src/compiler/stage_06_typecheck/type_system/env: Env, ImplMethodInfo
+	../../src/compiler/stage_06_typecheck/type_system/semantic_type: SemanticType(SemanticNamedType)
+	../../src/compiler/stage_06_typecheck/type_system/trait_identity: TraitId
+	../../src/lib/source: source_file
+	../../test/compiler/typecheck_test_support: typecheck_test_accepted_graph
+	memory:
+		MemoryCounter(ManagedAllocations, ManagedReleases, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
+		reset_mem_stats,
+	string: parse_int
+	system: now_microseconds
+
+
+private record LookupFixture {
+	authority: AcceptedTraitImplementationAuthority,
+	issuer: DefinitionTable,
+	env: Env,
+	trait_id: TraitId,
+	receiver: SemanticType,
+	expected_target: Int
+}
+
+
+private pure func lookup(fixture: LookupFixture) -> Option[ImplMethodInfo]:
+	accepted_find_impl_method_info_by_trait_id(
+		fixture.authority,
+		fixture.issuer,
+		fixture.env,
+		fixture.trait_id,
+		"select",
+		fixture.receiver,
+	)
+
+
+private func lookup_fixture() -> Option[LookupFixture]:
+	source = "trait Selector:\n\tpure func select(value: Self) -> Int\nrecord Box {value: Int}\nimplements Selector for Box:\n\tpure func select(value: Box) -> Int: value.value\n"
+	state = typecheck_state_for_origin(TYPECHECK_USER_ORIGIN)
+	program = parse_compiler_source(source_file("lookup/main.brp", "lookup/main", source))
+	graph ?= typecheck_test_accepted_graph(state, program, []).to_option()
+	table = accepted_semantic_catalog_trait_implementation_table(
+		accepted_typecheck_graph_semantic_catalog(graph),
+	)
+	issuer = implementation_header_graph_definition_table(
+		accepted_typecheck_graph_implementation_headers(graph),
+	)
+	authority = accepted_trait_implementation_authority(
+		table,
+		"lookup/main",
+		accepted_trait_empty_visibility(table),
+		[],
+	)
+	trait_def ?= accepted_trait_find(authority, "Selector")
+	receiver = SemanticNamedType("Box", [])
+	method ?= accepted_find_impl_method_info_by_trait_id(
+		authority,
+		issuer,
+		state.env,
+		trait_def.trait_id,
+		"select",
+		receiver,
+	)
+	target ?= method.target
+	issued ?= callable_id_from_definition_table(issuer, target.callable_id)
+
+	if (
+		callable_id_name(issuer, issued) != Some("select")
+		or not method.type_params.is_empty()
+		or not accepted_trait_implementation_authority_preparation_errors(authority).is_empty()
+	):
+		None
+	else:
+		Some({
+			authority = authority,
+			issuer = issuer,
+			env = state.env,
+			trait_id = trait_def.trait_id,
+			receiver = receiver,
+			expected_target = target.callable_id,
+		})
+
+
+private pure func target_matches(fixture: LookupFixture, method: Option[ImplMethodInfo]) -> Bool:
+	match method:
+		Some(info):
+			info.target
+				.map(func(target): target.callable_id == fixture.expected_target)
+				.get_or(False)
+		None:
+			False
+
+
+private func measure_lookup(fixture: LookupFixture, iterations: Int) -> Int:
+	var last = lookup(fixture)
+	warmup_valid = target_matches(fixture, last)
+	-- reset enables tracked allocation/mutex overhead: this is not a plain timing run.
+	reset_mem_stats()
+	memory_active = read_memory_counter(MemoryStatsActive)
+	oracle_active = read_memory_counter(OracleStatsActive)
+
+	if (
+		memory_active != 1
+		or oracle_active != 1
+		or not warmup_valid
+	):
+		print("accepted lookup counters or warmup invalid")
+		1
+	else:
+		started = now_microseconds()
+		allocations_before = read_memory_counter(ManagedAllocations)
+		releases_before = read_memory_counter(ManagedReleases)
+
+		for _ in 0..iterations:
+			last = lookup(fixture)
+
+		allocations_after = read_memory_counter(ManagedAllocations)
+		releases_after = read_memory_counter(ManagedReleases)
+		elapsed = now_microseconds() - started
+		valid = target_matches(fixture, last)
+
+		checksum = if valid:
+			fixture.expected_target * iterations
+		else:
+			0
+
+		print(
+			"ACCEPTED_METHOD_LOOKUP iterations=" + iterations.to_string() + " checksum=" + checksum.to_string() + " workload_valid=" + valid.to_string() + " memory_stats_active=" + memory_active.to_string() + " oracle_stats_active=" + oracle_active.to_string() + " instrumentation=tracked_reset elapsed_microseconds=" + elapsed.to_string() + " allocations=" + (allocations_after - allocations_before).to_string() + " releases=" + (releases_after - releases_before).to_string(),
+		)
+
+		if valid:
+			0
+		else:
+			2
+
+
+func main(args: List[String]) -> Int:
+	iterations = args
+		.get(1)
+		.and_then(parse_int)
+		.get_or(100000)
+
+	match lookup_fixture():
+		Some(fixture):
+			if iterations > 0:
+				measure_lookup(fixture, iterations)
+			else:
+				1
+		None:
+			print("accepted lookup fixture rejected")
+			1

@@ -146,7 +146,7 @@ union Declaration:
 	ImportDeclaration(ImportItem)
 	VariableDeclaration(Bool, Option[String], Option[Pattern], Bool, Option[TypeExpression], Expression)
 	FunctionDeclaration(Bool, String, Bool, Bool, Bool, Bool, Bool, List[String], List[FunctionParameter], Option[TypeExpression], List[TypeConstraint], FunctionBody)
-	TypeDeclaration(Bool, String, List[String], Bool, Bool, Bool, Option[String], List[TypeVariant], List[String])
+	TypeDeclaration(Bool, String, List[String], TypeDeclarationKind, List[TypeVariant], List[String])
 	RecordDeclaration(Bool, String, List[String], RecordSpelling, Bool, List[DeclarationField], List[String])
 	TypeAliasDeclaration(Bool, Bool, String, List[String], TypeExpression)
 	TraitDeclaration(Bool, String, List[String], List[String], List[TraitMethod])
@@ -156,6 +156,18 @@ union Declaration:
 enum RecordSpelling:
 	OrdinaryRecordSpelling
 	FixedRecordSpelling
+
+
+enum UnionSpelling:
+	OrdinaryUnionSpelling
+	FixedUnionSpelling
+	LegacyEnumSpelling
+
+
+union TypeDeclarationKind:
+	UnionDeclarationKind(UnionSpelling)
+	BuiltinTypeDeclarationKind
+	ResourceTypeDeclarationKind(Option[String])
 
 
 record FormatterComment {
@@ -629,10 +641,17 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 			is_private ?= value.bool_field("private")
 			name ?= value.string_field("name")
 			type_params ?= value.string_array_field("type_params")
-			is_enum ?= value.bool_field("enum")
-			is_builtin ?= value.bool_field("builtin")
-			is_resource ?= value.bool_field("resource")
-			resource_cleanup ?= value.optional_string_field("resource_cleanup_builtin")
+			form ?= value.string_field("form")
+			decoded_kind: Result[TypeDeclarationKind, String] = match form:
+				"ordinary_union": Ok(UnionDeclarationKind(OrdinaryUnionSpelling))
+				"fixed_union": Ok(UnionDeclarationKind(FixedUnionSpelling))
+				"legacy_enum": Ok(UnionDeclarationKind(LegacyEnumSpelling))
+				"builtin_type": Ok(BuiltinTypeDeclarationKind)
+				"resource_type":
+					cleanup ?= value.optional_string_field("resource_cleanup_builtin")
+					Ok(ResourceTypeDeclarationKind(cleanup))
+				other: Err("unknown type declaration form: " + other)
+			kind ?= decoded_kind
 			variants ?= value.type_variant_array_field("variants")
 			optional_closing_comments ?= value.optional_string_array_field("closing_comments")
 			closing_comments: List[String] = optional_closing_comments.get_or([])
@@ -641,10 +660,7 @@ pure func declaration_from_json(value: JsonValue) -> Result[Declaration, String]
 					is_private,
 					name,
 					type_params,
-					is_enum,
-					is_builtin,
-					is_resource,
-					resource_cleanup,
+					kind,
 					variants,
 					closing_comments,
 				),
@@ -1439,60 +1455,50 @@ private pure func type_declaration_document(
 	is_private: Bool,
 	name: String,
 	type_params: List[String],
-	is_enum: Bool,
-	is_builtin: Bool,
-	is_resource: Bool,
-	resource_cleanup: Option[String],
+	kind: TypeDeclarationKind,
 	variants: List[TypeVariant],
 	closing_comments: List[String],
 ) -> Doc:
-	if is_builtin:
-		keyword: String = if is_resource:
-			"resource type "
-		else:
-			"type "
+	keyword: String = match kind:
+		BuiltinTypeDeclarationKind: "type "
+		ResourceTypeDeclarationKind(_): "resource type "
+		UnionDeclarationKind(spelling):
+			match spelling:
+				OrdinaryUnionSpelling: "union "
+				FixedUnionSpelling: "fixed union "
+				LegacyEnumSpelling: "enum "
 
-		cleanup_document: Doc = match resource_cleanup:
-			Some(cleanup):
-				"(\""
-					.text()
-					.cat(
-						cleanup
-							.escape_string_value()
-							.text(),
-					)
-					.cat("\")".text())
-			None:
-				"".text()
+	header: Doc = is_private
+		.private_document()
+		.cat(keyword.text())
+		.cat(name.text())
+		.cat(type_params.type_params_document())
 
-		is_private
-			.private_document()
-			.cat(keyword.text())
-			.cat(name.text())
-			.cat(type_params.type_params_document())
-			.cat(" = builtin".text())
-			.cat(cleanup_document)
-	else:
-		keyword: String = if is_enum:
-			"enum "
-		else:
-			"union "
-
-		is_private
-			.private_document()
-			.cat(keyword.text())
-			.cat(name.text())
-			.cat(type_params.type_params_document())
-			.cat(":".text())
-			.cat(
-				Hardline
-					.cat(
-						variants
-							.type_variant_lines(closing_comments)
-							.hardlines(),
-					)
-					.indent(),
-			)
+	match kind:
+		BuiltinTypeDeclarationKind:
+			header.cat(" = builtin".text())
+		ResourceTypeDeclarationKind(cleanup):
+			cleanup_document: Doc = match cleanup:
+				Some(cleanup_name):
+					"(\""
+						.text()
+						.cat(cleanup_name.escape_string_value().text())
+						.cat("\")".text())
+				None:
+					"".text()
+			header.cat(" = builtin".text()).cat(cleanup_document)
+		UnionDeclarationKind(_):
+			header
+				.cat(":".text())
+				.cat(
+					Hardline
+						.cat(
+							variants
+								.type_variant_lines(closing_comments)
+								.hardlines(),
+						)
+						.indent(),
+				)
 
 
 private pure func declaration_field_head_document(field_value: DeclarationField) -> Doc:
@@ -1801,15 +1807,12 @@ pure func declaration_document(decl: Declaration) -> Doc:
 					where_constraints,
 					body,
 				)
-		TypeDeclaration(is_private, name, type_params, is_enum, is_builtin, is_resource, resource_cleanup, variants, closing_comments):
+		TypeDeclaration(is_private, name, type_params, kind, variants, closing_comments):
 			type_declaration_document(
 				is_private,
 				name,
 				type_params,
-				is_enum,
-				is_builtin,
-				is_resource,
-				resource_cleanup,
+				kind,
 				variants,
 				closing_comments,
 			)

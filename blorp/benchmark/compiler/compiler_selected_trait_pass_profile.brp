@@ -1,0 +1,226 @@
+-- Actual trait resolution and full monomorphization over prebuilt, single-target Core.
+-- Setup, warmup, and semantic observations are outside the allocation window.
+import:
+	../../src/compiler/stage_09_core/function_origin_fixture:
+		fixture_declaration_index,
+		fixture_name_table,
+	../../src/compiler/stage_09_core/ir:
+		CoreCallKind(SelectedTraitCall, UserCall),
+		CoreDecl(FunctionDecl, ImplDecl),
+		CoreExpr(CallExpr, LiteralExpr, VarExpr),
+		CoreLiteral(IntLiteral),
+		CoreProgram,
+		synthetic_core_source_loc,
+	../../src/compiler/stage_09_core/monomorphize: monomorphize_program
+	../../src/compiler/stage_09_core/resolve: resolve_core_program
+	../../src/compiler/stage_09_core/trait_resolve: resolve_core_traits
+	../../test/compiler/stage_09_core/test_core_mono_impl:
+		applied_type,
+		function_type,
+		generic_impl,
+		generic_unary_impl,
+		int_literal,
+		main_function,
+		method,
+		named_type,
+		named_var,
+		param,
+		program,
+		variable,
+	memory:
+		MemoryCounter(ManagedAllocations, ManagedReleases, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
+		reset_mem_stats,
+	string: parse_int
+	system: now_microseconds
+
+
+private pure func fixture(generic: Bool) -> CoreProgram:
+	receiver = applied_type("List", [named_type("Int")])
+	integer = named_type("Int")
+	body = CallExpr(
+		SelectedTraitCall("Display", "display", "bench/provider", 10),
+		VarExpr(
+			named_var("display", Some(10)),
+			function_type([receiver], integer),
+			synthetic_core_source_loc(),
+		),
+		[variable("value", receiver)],
+		integer,
+		synthetic_core_source_loc(),
+	)
+
+	implementation = if generic:
+		generic_unary_impl("Display", "display", "List", [], 10)
+	else:
+		generic_impl(
+			"Display",
+			[method("display", 10, [], [param("value", receiver)], integer, int_literal(1))],
+			receiver,
+			[],
+		)
+
+	program([implementation, main_function(body, integer)])
+
+
+private pure func execute(input: CoreProgram, generic: Bool) -> Option[CoreProgram]:
+	if generic:
+		match monomorphize_program(input, 100):
+			Ok(result):
+				Some(result.program)
+			Err(_):
+				None
+	else:
+		resolve_core_traits(input).to_option()
+
+
+private pure func resolved_call_matches(expr: CoreExpr, expected_id: Int) -> Bool:
+	match expr:
+		CallExpr(kind, function, _, _, _):
+			match kind:
+				UserCall(_, target, _):
+					match function:
+						VarExpr(callee, _, _):
+							(
+								target == Some(expected_id)
+								and callee.def_id == Some(expected_id)
+								and callee.name == "Display_display_List_Int"
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func literal_method_matches(body: CoreExpr) -> Bool:
+	match body:
+		LiteralExpr(literal, _, _):
+			match literal:
+				IntLiteral(value):
+					value == 1
+				_:
+					False
+		_:
+			False
+
+
+private pure func observe(output: CoreProgram, generic: Bool) -> Bool:
+	expected_id = if generic:
+		100
+	else:
+		10
+
+	match resolve_core_traits(output):
+		Ok(traits):
+			names = fixture_name_table([
+				"Display",
+				"display",
+				"Display_display_List_Int",
+				"List",
+				"Int",
+				"main",
+			])
+			resolved = resolve_core_program(
+				fixture_declaration_index(names, traits),
+				traits,
+				[],
+				[],
+			)
+			var method_valid: Bool = False
+			var call_valid: Bool = False
+
+			for decl in resolved.decls:
+				match decl:
+					ImplDecl(implementation):
+						if implementation.type_params.is_empty():
+							for method in implementation.methods:
+								method_valid = (
+									method.def_id == expected_id
+									and method.body
+										.map(literal_method_matches)
+										.get_or(False)
+								)
+						else:
+							void
+					FunctionDecl(function):
+						call_valid = function.body
+							.map(pure func(body): resolved_call_matches(body, expected_id))
+							.get_or(False)
+					_:
+						void
+
+			method_valid and call_valid
+		Err(_):
+			False
+
+
+func main(args: List[String]) -> Int:
+	mode = args
+		.get(1)
+		.get_or("traits")
+	generic = mode == "mono"
+	iterations = args
+		.get(2)
+		.and_then(parse_int)
+		.get_or(1000)
+	input = fixture(generic)
+	warmup = execute(input, generic)
+
+	expected_declarations = if generic:
+		3
+	else:
+		2
+
+	setup_valid = match warmup:
+		Some(output):
+			output.decls.length() == expected_declarations and observe(output, generic)
+		None:
+			False
+
+	if (
+		not setup_valid
+		or iterations < 1
+		or mode != "mono" and mode != "traits"
+	):
+		print("invalid setup")
+		1
+	else:
+		reset_mem_stats()
+		memory_active = read_memory_counter(MemoryStatsActive)
+		oracle_active = read_memory_counter(OracleStatsActive)
+		var last: Option[CoreProgram] = None
+		allocations_before = read_memory_counter(ManagedAllocations)
+		releases_before = read_memory_counter(ManagedReleases)
+		started = now_microseconds()
+
+		for iteration in 0..iterations:
+			last = execute(input, generic)
+
+		elapsed = now_microseconds() - started
+		allocations = read_memory_counter(ManagedAllocations) - allocations_before
+		releases = read_memory_counter(ManagedReleases) - releases_before
+		memory_active_after = read_memory_counter(MemoryStatsActive)
+		oracle_active_after = read_memory_counter(OracleStatsActive)
+
+		valid = match last:
+			Some(output):
+				output.decls.length() == expected_declarations and observe(output, generic)
+			None:
+				False
+
+		print(
+			"SELECTED_TRAIT_PASS mode=${mode} iterations=${iterations} declarations=${expected_declarations} elapsed_microseconds=${elapsed} allocations=${allocations} releases=${releases} memory_active=${memory_active} oracle_active=${oracle_active} memory_active_after=${memory_active_after} oracle_active_after=${oracle_active_after} workload_valid=${valid}",
+		)
+
+		if (
+			valid
+			and memory_active == 1
+			and oracle_active == 1
+			and memory_active_after == 1
+			and oracle_active_after == 1
+		):
+			0
+		else:
+			1

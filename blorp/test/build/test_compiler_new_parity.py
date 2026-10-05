@@ -377,7 +377,7 @@ class CompilerNewParityTests(unittest.TestCase):
 		}
 		for kind in (
 			"import_block", "foreign_block", "record", "fixed_record",
-			"alias", "builtin_type", "resource_type", "union", "enum",
+			"alias", "builtin_type", "resource_type", "union", "fixed_union", "enum",
 		):
 			counts[f"kind_{kind}"] = 1
 		for kind in ("function", "trait", "implementation", "constant_global", "mutable_global"):
@@ -558,7 +558,7 @@ class CompilerNewParityTests(unittest.TestCase):
 		updates = {"modules": 0, "compared": 0, "declarations": 0, "stop_end_of_source": 0}
 		for kind in (
 			"import_block", "foreign_block", "record", "fixed_record",
-			"alias", "builtin_type", "resource_type", "union", "enum",
+			"alias", "builtin_type", "resource_type", "union", "fixed_union", "enum",
 		):
 			updates[f"kind_{kind}"] = 0
 		self.assertTrue(self.tree_prefix_problems(self.tree_prefix_output(updates=updates)))
@@ -566,7 +566,7 @@ class CompilerNewParityTests(unittest.TestCase):
 	def test_corpus_tree_prefix_requires_every_completed_declaration_kind(self) -> None:
 		for kind in (
 			"import_block", "foreign_block", "record", "fixed_record",
-			"alias", "builtin_type", "resource_type", "union", "enum",
+			"alias", "builtin_type", "resource_type", "union", "fixed_union", "enum",
 		):
 			with self.subTest(kind=kind):
 				output = self.tree_prefix_output(updates={f"kind_{kind}": 0})
@@ -576,11 +576,13 @@ class CompilerNewParityTests(unittest.TestCase):
 	def test_tree_prefix_rejects_missing_unknown_and_negative_kind_or_stop_counts(self) -> None:
 		for output in (
 			self.tree_prefix_output(omitted=("kind_fixed_record",)),
+			self.tree_prefix_output(omitted=("kind_fixed_union",)),
 			self.tree_prefix_output(omitted=("stop_end_of_source",)),
 			self.tree_prefix_output(extra=("kind_value_record=1",)),
 			self.tree_prefix_output(extra=("kind_struct=1",)),
 			self.tree_prefix_output(extra=("stop_unknown=1",)),
 			self.tree_prefix_output(updates={"kind_fixed_record": -1}),
+			self.tree_prefix_output(updates={"kind_fixed_union": -1}),
 			self.tree_prefix_output(updates={"stop_end_of_source": -1}),
 		):
 			with self.subTest(output=output):

@@ -61,6 +61,7 @@ import:
 		unpacked_string_literal_text_id,
 	list: list
 	parsed_ast:
+		UnionDeclarationForm(OrdinaryUnion, FixedUnion, LegacyEnum),
 		RecordDeclarationForm(OrdinaryRecord, FixedRecord),
 		ConcurrentForLimit(MissingLimit, WrittenLimit),
 		ConcurrentThreadLimit(DefaultThreadLimit, ThreadLimit),
@@ -1164,10 +1165,10 @@ private pure func next_is_keyword(state: ParserInput, index: Int, expected: Keyw
 			False
 
 
-private pure func current_starts_fixed_record(state: ParserInput, index: Int) -> Bool:
+private pure func current_starts_fixed_declaration(state: ParserInput, index: Int, keyword: Keyword) -> Bool:
 	match current_tag(state, index):
 		IdentifierTag:
-			current_payload(state, index) == name_id_index(NAME_ID_FIXED) and next_is_keyword(state, index, RecordKeyword)
+			current_payload(state, index) == name_id_index(NAME_ID_FIXED) and next_is_keyword(state, index, keyword)
 		_:
 			False
 
@@ -9687,7 +9688,7 @@ private pure func parse_variant_decl(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	is_enum: Bool,
+	form: UnionDeclarationForm,
 ) -> ParseVariantStep:
 	name_step: ParseIdentifierStep = parse_variant_identifier_expected(state, index, diagnostics)
 	var st: Int = name_step.index
@@ -9698,7 +9699,7 @@ private pure func parse_variant_decl(
 	if current_is_symbol(state, st, LeftParenSymbol):
 		-- An `enum` case is only a name, so its parentheses are reported even
 		-- when they are empty; they are still parsed so recovery skips them.
-		if is_enum:
+		if form == LegacyEnum:
 			st_diag = add_expected_error(
 				state,
 				st_diag,
@@ -9746,7 +9747,7 @@ private pure func parse_variant_list(
 	state: ParserInput,
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
-	is_enum: Bool,
+	form: UnionDeclarationForm,
 ) -> ParseVariantListStep:
 	var st: Int = skip_newlines(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
@@ -9754,7 +9755,7 @@ private pure func parse_variant_list(
 
 	while not current_is_block_end(state, st):
 		before_index: Int = st
-		variant_step: ParseVariantStep = parse_variant_decl(state, st, st_diag, is_enum)
+		variant_step: ParseVariantStep = parse_variant_decl(state, st, st_diag, form)
 		variants = variants.append(variant_step.value)
 		st = skip_newlines(state, variant_step.index)
 		st_diag = variant_step.diagnostics
@@ -9795,16 +9796,18 @@ private pure func parse_union_decl(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 	doc: Option[String],
-	is_enum: Bool,
+	form: UnionDeclarationForm,
 	start_span: SourceLocation,
 ) -> ParseDeclStep:
 	var st: Int = advance_parser(state, index)
+	if form == FixedUnion:
+		st = advance_parser(state, st)
 	var st_diag: List[ParseDiagnostic] = diagnostics
 	name_step: ParseIdentifierStep = parse_declared_name_expected(state, st, st_diag, "type name")
 	st = name_step.index
 	st_diag = name_step.diagnostics
 
-	type_params_step: ParseTypeParamListStep = if is_enum:
+	type_params_step: ParseTypeParamListStep = if form == LegacyEnum:
 		{
 			index = st,
 			diagnostics = st_diag,
@@ -9840,7 +9843,7 @@ private pure func parse_union_decl(
 	)
 	st = __step_24.index
 	st_diag = __step_24_diagnostics
-	variants_step: ParseVariantListStep = parse_variant_list(state, st, st_diag, is_enum)
+	variants_step: ParseVariantListStep = parse_variant_list(state, st, st_diag, form)
 	st = variants_step.index
 	st_diag = add_variant_field_count_errors(state, variants_step.diagnostics, variants_step.values)
 
@@ -9865,7 +9868,7 @@ private pure func parse_union_decl(
 			name = name_step.value,
 			type_params = type_params_step.values,
 			variants = variants_step.values,
-			is_enum = is_enum,
+			form = form,
 			doc = doc,
 			span = location_cover(start_span, end_span),
 		})
@@ -10602,12 +10605,14 @@ private pure func parse_private_decl(
 		parse_top_level_var_decl(state, st, st_diag, True, doc, inner_start_span)
 	else if current_is_keyword(state, st, RecordKeyword):
 		parse_record_decl(state, st, st_diag, doc, RecordDeclarationSyntax, inner_start_span)
-	else if current_starts_fixed_record(state, st):
+	else if current_starts_fixed_declaration(state, st, RecordKeyword):
 		parse_record_decl(state, st, st_diag, doc, FixedRecordDeclarationSyntax, inner_start_span)
 	else if current_is_keyword(state, st, UnionKeyword):
-		parse_union_decl(state, st, st_diag, doc, False, inner_start_span)
+		parse_union_decl(state, st, st_diag, doc, OrdinaryUnion, inner_start_span)
+	else if current_starts_fixed_declaration(state, st, UnionKeyword):
+		parse_union_decl(state, st, st_diag, doc, FixedUnion, inner_start_span)
 	else if current_is_keyword(state, st, EnumKeyword):
-		parse_union_decl(state, st, st_diag, doc, True, inner_start_span)
+		parse_union_decl(state, st, st_diag, doc, LegacyEnum, inner_start_span)
 	else if current_is_keyword(state, st, TypeKeyword):
 		if next_is_keyword(state, st, AliasKeyword):
 			parse_type_alias_decl(state, st, st_diag, doc, False, inner_start_span)
@@ -10723,12 +10728,14 @@ private pure func parse_decl(
 		parse_top_level_var_decl(state, st, st_diag, True, doc, start_span)
 	else if current_is_keyword(state, st, RecordKeyword):
 		parse_record_decl(state, st, st_diag, doc, RecordDeclarationSyntax, start_span)
-	else if current_starts_fixed_record(state, st):
+	else if current_starts_fixed_declaration(state, st, RecordKeyword):
 		parse_record_decl(state, st, st_diag, doc, FixedRecordDeclarationSyntax, start_span)
 	else if current_is_keyword(state, st, UnionKeyword):
-		parse_union_decl(state, st, st_diag, doc, False, start_span)
+		parse_union_decl(state, st, st_diag, doc, OrdinaryUnion, start_span)
+	else if current_starts_fixed_declaration(state, st, UnionKeyword):
+		parse_union_decl(state, st, st_diag, doc, FixedUnion, start_span)
 	else if current_is_keyword(state, st, EnumKeyword):
-		parse_union_decl(state, st, st_diag, doc, True, start_span)
+		parse_union_decl(state, st, st_diag, doc, LegacyEnum, start_span)
 	else if current_is_keyword(state, st, TypeKeyword):
 		if next_is_keyword(state, st, AliasKeyword):
 			parse_type_alias_decl(state, st, st_diag, doc, False, start_span)

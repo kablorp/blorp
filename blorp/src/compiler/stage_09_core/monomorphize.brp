@@ -8,8 +8,10 @@ import:
 	ir: CoreImplDecl, CoreProgram
 	mono_data: CoreMonoDataSpecialization, specialize_generic_data
 	mono_impl:
+		CoreMonoImplMethodSelection,
 		CoreMonoImplSpecializationStep,
 		generic_impls,
+		remap_selected_impl_methods,
 		specialize_generic_impls_with_templates,
 	mono_instance: CoreMonoInstanceIndex, empty_core_mono_instance_index
 	mono_specialize:
@@ -31,7 +33,7 @@ decls added since the last one, not the whole program.
 private pure func specialize_generic_callables(
 	program: CoreProgram,
 	next_def_id: Int,
-) -> CoreMonoProgramSpecialization:
+) -> Result[CoreMonoProgramSpecialization, CoreMonoDiagnostic]:
 	generic_functions: CoreGenericFunctionIndex = collect_generic_functions(program)
 	generic_impl_templates: List[CoreImplDecl] = generic_impls(program)
 
@@ -40,6 +42,7 @@ private pure func specialize_generic_callables(
 	var rewritten_decl_count: Int = 0
 	var instances: CoreMonoInstanceIndex = empty_core_mono_instance_index()
 	var processed_impl_decl_count: Int = 0
+	var method_selections: List[CoreMonoImplMethodSelection] = []
 
 	while True:
 		start_decl_count: Int = current_program.decls.length()
@@ -62,32 +65,33 @@ private pure func specialize_generic_callables(
 		rewritten_decl_count = functions.rewritten_decl_count
 		instances = functions.instances
 		processed_impl_decl_count = impls.processed_decl_count
+		method_selections = method_selections.concat(impls.method_selections)
 
 		if current_program.decls.length() == start_decl_count and current_def_id == start_def_id:
 			break
 
-	{
-		program = current_program,
-		next_def_id = current_def_id
-	}
+	-- All append-only request scans have settled. Remapping earlier would
+	-- miss later function instances or capture a sibling receiver's method.
+	remapped ?= remap_selected_impl_methods(current_program, method_selections)
+	Ok({
+		program = remapped,
+		next_def_id = current_def_id,
+	})
 
 
 pure func specialize_generic_functions_and_data(
 	program: CoreProgram,
 	next_def_id: Int,
-) -> CoreMonoDataSpecialization:
-	callables: CoreMonoProgramSpecialization = specialize_generic_callables(program, next_def_id)
-	specialize_generic_data(callables.program, callables.next_def_id)
+) -> Result[CoreMonoDataSpecialization, CoreMonoDiagnostic]:
+	callables ?= specialize_generic_callables(program, next_def_id)
+	Ok(specialize_generic_data(callables.program, callables.next_def_id))
 
 
 pure func monomorphize_program(
 	program: CoreProgram,
 	next_def_id: Int,
 ) -> Result[CoreMonoDataSpecialization, CoreMonoDiagnostic]:
-	specialized: CoreMonoDataSpecialization = specialize_generic_functions_and_data(
-		program,
-		next_def_id,
-	)
+	specialized ?= specialize_generic_functions_and_data(program, next_def_id)
 
 	match validate_selected_generic_calls(specialized.program):
 		Some(diagnostic):

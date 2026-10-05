@@ -54,7 +54,7 @@ error: `alias` is a reserved keyword and cannot be used as a name; choose anothe
 ```
 
 The soft keywords listed under [Names](#names) are exceptions. `fixed` remains
-an identifier except when it immediately precedes `record` at a declaration
+an identifier except when it immediately precedes `record` or `union` at a declaration
 opening.
 
 Declarations are public by default; `private` hides a declaration from
@@ -268,7 +268,7 @@ var_initializer = "=" expr
 ### Type Declarations
 
 ```ebnf
-type_decl = "union" IDENT [ type_params ] ":" NEWLINE INDENT variant_list DEDENT
+type_decl = [ "fixed" ] "union" IDENT [ type_params ] ":" NEWLINE INDENT variant_list DEDENT
           | "type" IDENT [ type_params ] "=" "builtin"   (* std-only *)
           | "resource" "type" IDENT [ type_params ] "=" "builtin"
               [ "(" STRING ")" ] ;  (* std-only; optional cleanup builtin *)
@@ -279,14 +279,16 @@ enum_case_list = variant_name { NEWLINE variant_name } ;
 (* An enum case is only a name; parentheses on one, even empty ones, are a parse error. Use `union`. *)
 
 variant_list = variant { NEWLINE variant } ;
-variant      = variant_name [ "(" type_expr { "," type_expr } [ "," ] ")" ] ;
+variant      = variant_name [ "(" [ type_expr { "," type_expr } [ "," ] ] ")" ] ;
 variant_name = IDENT | "True" | "False" ;
 (* A variant declares at most 64 payload fields; the parser rejects more. *)
+(* Ordinary and fixed unions accept empty parentheses; enum cases remain names only. *)
+(* `fixed union` currently has ordinary union semantics; it promises no allocation or layout guarantee. *)
 
 record_decl = "record" IDENT [ type_params ] "{" field_list "}" ;
 fixed_record_decl = "fixed" "record" IDENT [ type_params ] "{" field_list "}" ;
 (* Both spellings have ordinary managed record semantics, including empty fields and parameters. *)
-(* `fixed` is contextual before `record`; elsewhere it is an identifier. `struct` is an ordinary identifier. *)
+(* `fixed` is contextual before `record` or `union`; elsewhere it is an identifier. `struct` is an ordinary identifier. *)
 
 field_list = [ field_decl { "," field_decl } [ "," ] ] ;
 field_decl = identifier ":" type_expr ;

@@ -4,7 +4,7 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, advanced, current_kind, current_span, diagnostics, diagnostic_count, issued_counts, spellings
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_union_parser: UnionParse(ParsedUnion, RejectedUnion), parse_union
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_enum_parser: EnumParse(ParsedEnum, RejectedEnum), parse_enum
-	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter), UnionDeclarationForm(OrdinaryUnion, FixedUnion)
 	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
 	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, type_binder_local_index, name_use_local_index, written_type_local_index
 	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
@@ -32,7 +32,7 @@ pure func test_generic_union_mints_payloads_variants_and_parent_in_order() -> Bo
 	match new_parse_state(lex_module(module_id_at_row(3), text)):
 		Ok(state):
 			documentation: Documentation = { text = "A choice.", span = state.current_span() }
-			(parsed, result) = parse_union(state.advanced(), PrivateVisibility, Some(documentation), state.current_span())
+			(parsed, result) = parse_union(state.advanced(), PrivateVisibility, Some(documentation), state.current_span(), OrdinaryUnion)
 
 			match result:
 				ParsedUnion(value):
@@ -103,7 +103,7 @@ pure func test_eof_blocks_and_blank_indented_lines_preserve_children() -> Bool:
 	for text in ["union U:\n\tA\n\t\n\tB", "union U:\n\tA\n\n\tB\n"]:
 		match new_parse_state(lex_module(module_id_at_row(0), text)):
 			Ok(state):
-				(parsed, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+				(parsed, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span(), OrdinaryUnion)
 				match result:
 					ParsedUnion(value):
 						correct = value.variants.length() == 2 and value.id.definition_local_index() == 2 and value.span.covers(0, text.length()) and value.type_parameters.is_empty() and parsed.diagnostic_count() == 0 and parsed.current_kind() == EndOfFileToken and correct
@@ -164,7 +164,7 @@ private pure func rejection_matches(text: String, is_enum: Bool, expected: List[
 						False
 				(parsed_state, is_rejected)
 			else:
-				(parsed_state, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+				(parsed_state, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span(), OrdinaryUnion)
 				is_rejected: Bool = match result:
 					RejectedUnion:
 						True
@@ -215,7 +215,7 @@ private pure func invalid_name_payload_counts(text: String, is_enum: Bool) -> Bo
 						False
 				(parsed_state, is_rejected)
 			else:
-				(parsed_state, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+				(parsed_state, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span(), OrdinaryUnion)
 				is_rejected: Bool = match result:
 					RejectedUnion:
 						True
@@ -276,7 +276,7 @@ pure func test_enum_brackets_remain_authored_body_material() -> Bool:
 	], IfKeyword, 13, 15)
 
 
-private pure func payload_limit_case(count: Int) -> Bool:
+private pure func payload_limit_case(count: Int, form: UnionDeclarationForm) -> Bool:
 	var payloads: String = ""
 	var index: Int = 0
 
@@ -286,10 +286,16 @@ private pure func payload_limit_case(count: Int) -> Bool:
 		payloads += "Int"
 		index += 1
 
-	text: String = "union U:\n\tMany(${payloads})\nif"
+	introducer: String = match form:
+		OrdinaryUnion: "union"
+		FixedUnion: "fixed union"
+	text: String = "${introducer} U:\n\tMany(${payloads})\nif"
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
-			(parsed, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+			after_introducer = match form:
+				OrdinaryUnion: state.advanced()
+				FixedUnion: state.advanced().advanced()
+			(parsed, result) = parse_union(after_introducer, PublicVisibility, None, state.current_span(), form)
 			common: Bool = (parsed.current_kind() == IfKeyword and parsed.current_span().covers(text.length() - 2, text.length())
 				and parsed.issued_counts().written_types == count and parsed.issued_counts().name_uses == count)
 
@@ -298,7 +304,7 @@ private pure func payload_limit_case(count: Int) -> Bool:
 					ParsedUnion(value):
 						match value.variants:
 							[variant]:
-								common and variant.payload.length() == count and variant.id.definition_local_index() == 0 and value.id.definition_local_index() == 1 and parsed.diagnostic_count() == 0
+								common and value.form == form and variant.payload.length() == count and variant.id.definition_local_index() == 0 and value.id.definition_local_index() == 1 and parsed.diagnostic_count() == 0
 							_:
 								False
 					_:
@@ -308,7 +314,7 @@ private pure func payload_limit_case(count: Int) -> Bool:
 					(RejectedUnion, [at]):
 						match at.diagnostic:
 							Plain(UnionVariantTooManyFieldsDiagnostic):
-								common and at.span.covers(10, 14)
+								common and at.span.covers(introducer.length() + 5, introducer.length() + 9)
 							_:
 								False
 					_:
@@ -318,8 +324,12 @@ private pure func payload_limit_case(count: Int) -> Bool:
 
 
 pure func test_payload_limit_accepts_boundary_and_reports_overflow_once_after_full_recovery() -> Bool:
-	(payload_limit_case(MAX_UNION_VARIANT_FIELDS) and payload_limit_case(MAX_UNION_VARIANT_FIELDS + 1)
-		and payload_limit_case(MAX_UNION_VARIANT_FIELDS + 2))
+	var correct: Bool = True
+	for form in [OrdinaryUnion, FixedUnion]:
+		correct = (correct and payload_limit_case(MAX_UNION_VARIANT_FIELDS, form)
+			and payload_limit_case(MAX_UNION_VARIANT_FIELDS + 1, form)
+			and payload_limit_case(MAX_UNION_VARIANT_FIELDS + 2, form))
+	correct
 
 
 tests: TestSuite = {
