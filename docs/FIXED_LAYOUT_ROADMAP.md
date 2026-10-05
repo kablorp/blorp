@@ -86,6 +86,16 @@ embedded implementation methods, globals, managed fields, nonliteral right-hand
 sides, capture, and whole-value uses were outside the admitted subset. This is
 bounded static evidence, not a dynamic ROI claim or closure of the wider S5 work.
 
+The [dynamic managed-record allocation census](../benchmarks/results/record_allocation_census_2026-10-04.md)
+keeps that literal-only pilot parked and redirects the next investigation:
+small tuple/SSA mint wrappers have tiny dynamic reach, while `Cursor` dominates
+the workspace self-compile ranking. The [source-coordinate builder pilot](../benchmarks/results/cursor_scalar_reconstruction_2026-10-04.md)
+is accepted as a bounded source-owned optimization: matched self-compile
+allocations fell 13.93% and minimum retired instructions 8.19%, with identical
+emitted C and completed correctness, quality and fixpoint gates. Managed record
+APIs/layout are unchanged; this is not general scalar replacement, a general
+inliner or a reintroduced layout promise. The wider S5 work remains open.
+
 Profile actual record constructions and escapes before choosing an optimization.
 The compiler may scalar-replace a nonescaping record or fold a fresh nested
 record into one parent allocation while preserving ordinary record semantics.

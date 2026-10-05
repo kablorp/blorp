@@ -22,11 +22,149 @@ import:
 		source_span_text,
 		source_start,
 		unindexed_source_table_for_file,
+	memory:
+		MemoryCounter(ManagedAllocations, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
+		reset_mem_stats,
 	test: TestSuite
 
 
 pure func sample_source() -> SourceFile:
 	source_file("sample.brp", "sample", "a\nbc\ndef")
+
+
+-- Independent coordinate oracle: retain the public single-byte transition,
+-- rather than reproducing the reconstruction scanner under test.
+pure func advanced_cursor_at(src: SourceFile, offset: Int) -> Cursor:
+	target = if offset < 0:
+		0
+	else if offset > src.text.length():
+		src.text.length()
+	else:
+		offset
+	var cursor: Cursor = source_start(src)
+	while cursor.offset < target:
+		cursor = source_advance(src, cursor)
+	cursor
+
+
+func test_reconstructed_coordinates_match_each_byte_transition() -> Bool:
+	var matches: Bool = True
+	for text in ["", "\n", "a\t\tb\n\tc\r\0é\n", "é\t\r\0z"]:
+		src = source_file("bytes.brp", "bytes", text)
+		(indexed, file_id) = singleton_source_table(src)
+		unindexed = unindexed_source_table_for_file(src)
+		var offset: Int = -1
+		while offset <= text.length() + 1:
+			expected = advanced_cursor_at(src, offset)
+			actual = source_cursor_at(src, offset)
+			location = source_location_from_offsets(file_id, expected.offset, expected.offset)
+			indexed_span = source_location_line_column_span(indexed, location)
+			unindexed_span = source_location_line_column_span(unindexed, location)
+			matches = matches and (
+				actual.offset == expected.offset
+				and actual.line == expected.line
+				and actual.column == expected.column
+				and indexed_span.start_line == expected.line
+				and indexed_span.start_column == expected.column
+				and indexed_span.end_line == expected.line
+				and indexed_span.end_column == expected.column
+				and unindexed_span.start_line == expected.line
+				and unindexed_span.start_column == expected.column
+				and unindexed_span.end_line == expected.line
+				and unindexed_span.end_column == expected.column
+			)
+			offset += 1
+	matches
+
+
+pure func reconstruction_allocation_source() -> SourceFile:
+	source_file(
+		"allocation.brp",
+		"allocation",
+		"first\n\tabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\tend",
+	)
+
+
+func test_cursor_reconstruction_allocates_only_its_result() -> Bool:
+	src = reconstruction_allocation_source()
+	expected = advanced_cursor_at(src, src.text.length())
+	warm = source_cursor_at(src, src.text.length())
+	if warm.column != expected.column or warm.line != expected.line:
+		False
+	else:
+		reset_mem_stats()
+		active_before = read_memory_counter(MemoryStatsActive)
+		oracle_before = read_memory_counter(OracleStatsActive)
+		before = read_memory_counter(ManagedAllocations)
+		actual = source_cursor_at(src, src.text.length())
+		after = read_memory_counter(ManagedAllocations)
+		active_after = read_memory_counter(MemoryStatsActive)
+		oracle_after = read_memory_counter(OracleStatsActive)
+		(
+			active_before == 1 and active_after == 1 and oracle_before == 1 and oracle_after == 1
+			and after - before == 1
+			and actual.offset == expected.offset
+			and actual.line == expected.line
+			and actual.column == expected.column
+		)
+
+
+func test_indexed_coordinates_allocate_only_endpoints_and_result() -> Bool:
+	src = reconstruction_allocation_source()
+	(table, file_id) = singleton_source_table(src)
+	location = source_location_from_offsets(file_id, src.text.length() - 2, src.text.length())
+	expected_start = advanced_cursor_at(src, src.text.length() - 2)
+	expected_end = advanced_cursor_at(src, src.text.length())
+	warm = source_location_line_column_span(table, location)
+	if warm.start_column != expected_start.column or warm.end_column != expected_end.column:
+		False
+	else:
+		reset_mem_stats()
+		active_before = read_memory_counter(MemoryStatsActive)
+		oracle_before = read_memory_counter(OracleStatsActive)
+		before = read_memory_counter(ManagedAllocations)
+		actual = source_location_line_column_span(table, location)
+		after = read_memory_counter(ManagedAllocations)
+		active_after = read_memory_counter(MemoryStatsActive)
+		oracle_after = read_memory_counter(OracleStatsActive)
+		(
+			active_before == 1 and active_after == 1 and oracle_before == 1 and oracle_after == 1
+			and after - before == 3
+			and actual.start_line == expected_start.line
+			and actual.start_column == expected_start.column
+			and actual.end_line == expected_end.line
+			and actual.end_column == expected_end.column
+		)
+
+
+func test_unindexed_coordinates_allocate_only_endpoints_and_result() -> Bool:
+	src = reconstruction_allocation_source()
+	table = unindexed_source_table_for_file(src)
+	(_, file_id) = singleton_source_table(src)
+	location = source_location_from_offsets(file_id, src.text.length() - 2, src.text.length())
+	expected_start = advanced_cursor_at(src, src.text.length() - 2)
+	expected_end = advanced_cursor_at(src, src.text.length())
+	warm = source_location_line_column_span(table, location)
+	if warm.start_column != expected_start.column or warm.end_column != expected_end.column:
+		False
+	else:
+		reset_mem_stats()
+		active_before = read_memory_counter(MemoryStatsActive)
+		oracle_before = read_memory_counter(OracleStatsActive)
+		before = read_memory_counter(ManagedAllocations)
+		actual = source_location_line_column_span(table, location)
+		after = read_memory_counter(ManagedAllocations)
+		active_after = read_memory_counter(MemoryStatsActive)
+		oracle_after = read_memory_counter(OracleStatsActive)
+		(
+			active_before == 1 and active_after == 1 and oracle_before == 1 and oracle_after == 1
+			and after - before == 3
+			and actual.start_line == expected_start.line
+			and actual.start_column == expected_start.column
+			and actual.end_line == expected_end.line
+			and actual.end_column == expected_end.column
+		)
 
 
 func test_source_keeps_metadata() -> Bool:
@@ -231,6 +369,22 @@ func test_line_column_span_matches_unindexed_and_prelude_locations() -> Bool:
 tests: TestSuite = {
 	description = "Shared source foundation",
 	tests = [
+		(
+			"reconstructed coordinates match each byte transition",
+			test_reconstructed_coordinates_match_each_byte_transition,
+		),
+		(
+			"cursor reconstruction allocates only its result",
+			test_cursor_reconstruction_allocates_only_its_result,
+		),
+		(
+			"indexed coordinates allocate only endpoints and result",
+			test_indexed_coordinates_allocate_only_endpoints_and_result,
+		),
+		(
+			"unindexed coordinates allocate only endpoints and result",
+			test_unindexed_coordinates_allocate_only_endpoints_and_result,
+		),
 		("source keeps metadata", test_source_keeps_metadata),
 		("cursor tracks newlines", test_cursor_tracks_newlines),
 		("cursor tracks tabs as four column stops", test_cursor_tracks_tabs_as_four_column_stops),
