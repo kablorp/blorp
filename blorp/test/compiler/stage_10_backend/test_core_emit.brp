@@ -7,6 +7,7 @@ import:
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(
+			BoxedStackOptionPayloadAccessor,
 			BoxedStackResultErrPayloadAccessor,
 			BoxedStackResultOkPayloadAccessor,
 			BoxedResultErrPayloadAccessor,
@@ -15753,6 +15754,116 @@ pure func test_emit_stack_option_constructor_match() -> Bool:
 	)
 
 
+-- A length branch deliberately has no current Some constructor test. Its
+-- payload binding must carry enough representation data to decode the box.
+pure func boxed_stack_option_list_binding_function(
+	payload_type: CoreType,
+	option_c_type: String,
+) -> CoreFunction:
+	list_type: CoreType = NamedType("List", [NamedType("Option", [payload_type])])
+	value_var: CoreVar = named_var("value")
+	list_var: CoreVar = named_var("options")
+	match_info: CoreConstructorLengthMatch = {
+		accessor = RootAccessor,
+		cases = [
+			{
+				length = 1,
+				branch = {
+					bindings = [
+						{
+							variable = value_var,
+							typ = payload_type,
+							accessor = BoxedStackOptionPayloadAccessor(
+								ListElementAccessor(RootAccessor, 0),
+								option_c_type,
+							),
+							mode = MatchBorrowBindingMode,
+							needs_release = type_requires_release(payload_type)
+						},
+					],
+					body = ConstructorMatchBodyExpr(VarExpr(value_var, payload_type, synthetic_core_source_loc()))
+				}
+			},
+		],
+		geq = None,
+		fallback = Some({
+			bindings = [],
+			body = ConstructorMatchBodyExpr(LiteralExpr(IntLiteral(0), payload_type, synthetic_core_source_loc()))
+		}),
+		result_type = payload_type,
+		loc = synthetic_core_source_loc()
+	}
+
+	{
+		name = "boxed_option_payload",
+		source_module = None,
+		type_params = [],
+		params = [{ name = list_var, typ = list_type, loc = synthetic_core_source_loc() }],
+		return_type = payload_type,
+		body = Some(LengthMatchExpr(
+			VarExpr(list_var, list_type, synthetic_core_source_loc()),
+			NoReleasePolicy,
+			match_info,
+			payload_type,
+			synthetic_core_source_loc(),
+		)),
+		is_pure = True,
+		origin = FIXTURE_SOURCE_FUNCTION_ORIGIN,
+		module = FIXTURE_NO_SOURCE_MODULE,
+		function_kind = UserFunction,
+		def_id = 991,
+		loc = synthetic_core_source_loc()
+	}
+
+
+pure func boxed_stack_option_binding_c_source(option_c_type: String) -> String:
+	"long value = (*(" + option_c_type + "*)((char*)(blorp_list_get((blorp_List*)__match_scrut_0, 0)) + sizeof(blorp_Object))).value;"
+
+
+pure func test_emit_boxed_stack_option_native_payload_without_case_context() -> Bool:
+	program: CoreProgram = {
+		decls = [FunctionDecl(boxed_stack_option_list_binding_function(int_type(), "blorp_StackOption_Int"))],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match try_emit_prepared_core_program_c_artifact_with_profile(prepared_core_program(program), FunctionProfileOff):
+		Ok(artifact):
+			artifact.c_code.contains(boxed_stack_option_binding_c_source("blorp_StackOption_Int"))
+		Err(_):
+			False
+
+
+pure func test_emit_boxed_stack_option_enum_payload_uses_projected_type() -> Bool:
+	program: CoreProgram = {
+		decls = [
+			EnumDecl(color_enum_decl()),
+			FunctionDecl(boxed_stack_option_list_binding_function(color_type(), "blorp_StackOption_Color")),
+		],
+		foreign_includes = [],
+		source_files = []
+	}
+
+	match prepare_c_emission_symbols(program):
+		Ok(plan):
+			match c_emission_type_symbol_lookup(plan).get("Color"):
+				Some(projected_type):
+					option_type: String = "blorp_StackOption_" + projected_type
+					match try_emit_prepared_core_program_c_artifact_with_profile(prepared_core_program(program), FunctionProfileOff):
+						Ok(artifact):
+							(
+								artifact.c_code.contains("typedef struct { int tag; long value; } " + option_type + ";")
+								and artifact.c_code.contains(boxed_stack_option_binding_c_source(option_type))
+								and not artifact.c_code.contains("blorp_StackOption_Color")
+							)
+						Err(_):
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
 pure func test_emit_constructor_payload_literal_match() -> Bool:
 	program: CoreProgram = {
 		decls = [FunctionDecl(stack_option_payload_literal_match_function())],
@@ -29300,6 +29411,14 @@ tests: TestSuite = {
 			test_emit_constructor_payload_string_literal_length_dispatch,
 		),
 		("emit stack option constructor match", test_emit_stack_option_constructor_match),
+		(
+			"emit boxed stack Option native payload without case context",
+			test_emit_boxed_stack_option_native_payload_without_case_context,
+		),
+		(
+			"emit boxed stack Option enum payload uses projected type",
+			test_emit_boxed_stack_option_enum_payload_uses_projected_type,
+		),
 		("emit constructor payload literal match", test_emit_constructor_payload_literal_match),
 		("emit boxed Result payload literal match", test_emit_boxed_result_payload_literal_match),
 		("emit stack Result constructor match", test_emit_stack_result_constructor_match),

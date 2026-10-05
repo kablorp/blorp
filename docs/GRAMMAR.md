@@ -608,6 +608,11 @@ list_pattern = "[" "]"                                  (* empty list *)
 spread_target = IDENT | "_" ;
 ```
 
+A list pattern without a spread matches exactly its written element count;
+with a spread it matches at least the fixed prefix count. Nested patterns keep
+these checks: a constructor pattern matches only when every payload pattern
+matches, including list lengths and element patterns.
+
 A pipe-string pattern runs to the end of its line, so the `:` that ends a match
 case cannot follow it on that line; write it inside parentheses, as in
 `Some(` newline `|text` newline `):`.

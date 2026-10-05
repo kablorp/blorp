@@ -1753,6 +1753,12 @@ imported with that type or qualified with its module alias. Otherwise the
 compiler reports an error instead of treating the name as a catch-all binding.
 A name that is not a constructor of the value's type remains a variable binding.
 
+List patterns without a spread require exactly the written number of elements.
+A spread permits additional elements after the fixed prefix. These length and
+element checks also apply inside constructor and tuple patterns: `Some([value])`
+matches a singleton list, and falls through to later arms for an empty or longer
+list. Every subpattern must match before the arm runs.
+
 ### Exhaustiveness
 
 The compiler verifies all cases are covered for unions, booleans, and lists:

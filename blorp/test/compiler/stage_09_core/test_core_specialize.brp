@@ -3,7 +3,7 @@ import:
 	../../../src/compiler/stage_09_core/function_origin_fixture: FIXTURE_NO_SOURCE_MODULE, FIXTURE_SOURCE_FUNCTION_ORIGIN
 	../../../src/compiler/stage_09_core/ir:
 		CoreAccessor(RootAccessor),
-		CoreBinaryOp(NotEqualOp),
+		CoreBinaryOp(GreaterEqualOp, LessOp, NotEqualOp),
 		CoreCallKind(BuiltinCall, DirectRuntimeCall, IntrinsicCall),
 		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
 		CoreConstructorMatchFallback(ConstructorMatchFallbackBody),
@@ -18,12 +18,14 @@ import:
 			FieldExpr,
 			IfExpr,
 			LiteralExpr,
+			LogicalExpr,
 			SemanticMatchExpr,
 			VarExpr,
 			VoidExpr,
 		),
 		CoreFunctionKind(UserFunction),
 		CoreLiteral(BoolLiteral, FloatLiteral, IntLiteral, StringLiteral),
+		CoreLogicalOp(AndOp),
 		CoreMatchBindingMode(MatchBorrowBindingMode),
 		CoreProgram,
 		CoreReleasePolicy(NoReleasePolicy),
@@ -357,17 +359,74 @@ private pure func tensor_get_or_match(return_type: CoreType, default: CoreExpr) 
 	)
 
 
-pure func test_tensor_get_or_match_uses_direct_storage_reads() -> Bool:
-	int_default: CoreExpr = LiteralExpr(IntLiteral(0), named_type("Int"), synthetic_core_source_loc())
+pure func test_scalar_tensor_get_or_uses_bounded_direct_storage_read() -> Bool:
+	int_default: CoreExpr = LiteralExpr(IntLiteral(9), named_type("Int"), synthetic_core_source_loc())
+	body: CoreExpr = tensor_get_or_match(named_type("Int"), int_default)
+
+	match body:
+		SemanticMatchExpr(CallExpr(_, _, [values, index], _, _), _, _, _):
+			expected: CoreExpr = IfExpr(
+				LogicalExpr(
+					AndOp,
+					BinaryExpr(
+						GreaterEqualOp,
+						index,
+						LiteralExpr(IntLiteral(0), named_type("Int"), synthetic_core_source_loc()),
+						named_type("Bool"),
+						synthetic_core_source_loc(),
+					),
+					BinaryExpr(
+						LessOp,
+						index,
+						intrinsic_call("tensor_len", values, named_type("Int")),
+						named_type("Bool"),
+						synthetic_core_source_loc(),
+					),
+					named_type("Bool"),
+					synthetic_core_source_loc(),
+				),
+				CallExpr(
+					IntrinsicCall("tensor_get_i64"),
+					VoidExpr(VoidType, synthetic_core_source_loc()),
+					[values, index],
+					named_type("Int"),
+					synthetic_core_source_loc(),
+				),
+				int_default,
+				named_type("Int"),
+				synthetic_core_source_loc(),
+			)
+
+			match specialized_body(body):
+				Some(specialized):
+					core_expr_to_json(specialized).to_string() == core_expr_to_json(expected).to_string()
+				None:
+					False
+		_:
+			False
+
+
+pure func test_managed_tensor_get_or_preserves_nullable_payload_match() -> Bool:
 	point_type: CoreType = HeapRecordType("Point")
 	point_default: CoreExpr = variable("default_point", point_type)
+	body: CoreExpr = tensor_get_or_match(point_type, point_default)
 
-	match (
-		specialized_body(tensor_get_or_match(named_type("Int"), int_default)),
-		specialized_body(tensor_get_or_match(point_type, point_default)),
-	):
-		(Some(IfExpr(_, CallExpr(IntrinsicCall("tensor_get_i64"), _, [_, _], _, _), _, _, _)), Some(IfExpr(_, CallExpr(IntrinsicCall("tensor_get_unchecked"), _, [_, _], _, _), _, _, _))):
-			True
+	match body:
+		SemanticMatchExpr(CallExpr(_, callee, args, option_type, call_loc), tree, result_type, loc):
+			-- Managed payloads preserve the authored Some borrow and None
+			-- default; the nullable lookup replaces only the scrutinee call.
+			expected: CoreExpr = SemanticMatchExpr(
+				CallExpr(BuiltinCall("blorp_vector_get_nullable"), callee, args, option_type, call_loc),
+				tree,
+				result_type,
+				loc,
+			)
+
+			match specialized_body(body):
+				Some(specialized):
+					core_expr_to_json(specialized).to_string() == core_expr_to_json(expected).to_string()
+				None:
+					False
 		_:
 			False
 
@@ -592,8 +651,12 @@ tests: TestSuite = {
 			test_specialization_recurses_through_semantic_match_leaf,
 		),
 		(
-			"tensor get_or match uses direct storage reads",
-			test_tensor_get_or_match_uses_direct_storage_reads,
+			"scalar tensor get_or uses bounded direct storage read",
+			test_scalar_tensor_get_or_uses_bounded_direct_storage_read,
+		),
+		(
+			"managed tensor get_or preserves nullable payload match",
+			test_managed_tensor_get_or_preserves_nullable_payload_match,
 		),
 		(
 			"program specialization boxes Dict[Int] keys",
