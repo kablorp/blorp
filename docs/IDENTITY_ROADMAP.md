@@ -296,7 +296,7 @@ No reader learns a fact from the shape of a String: every fact a prefix, suffix,
 marker or embedded number carries lives in a record field, an enum or an id.
 The inventory by family is `benchmarks/results/magic_spelling_census_2026-09-28.md`;
 `scripts/check-magic-spellings.allowlist` (hooked into `make hygiene-check`) is the
-meter, and a step is complete when the allowlist lines it owns are deleted,
+meter, and a step is complete when the allowlist entries it owns are deleted,
 `make hygiene-check` passes and the generated C is byte-identical. The gate for
 every step is the owning suites, `scripts/compiler-check --changed` and the
 identical-C measurement, plus the allowlist delta the step names.

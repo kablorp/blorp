@@ -646,11 +646,18 @@ it). It needs a built `bin/blorp`. `make tooling-check` runs it.
 `scripts/check-magic-spellings` fails when a reader or producer of a name's
 prefix, suffix or embedded number (`starts_with`, `parse_int`, `__mono_`
 concatenation and the named accessors) appears that is not in
-`scripts/check-magic-spellings.allowlist`. `--report` prints per-family counts
-and `--update` regenerates the allowlist after a deletion; the families and
-their replacements are in
-`benchmarks/results/magic_spelling_census_2026-09-28.md`. `make hygiene-check`
-runs it.
+`scripts/check-magic-spellings.allowlist`. An allowlist entry is keyed by file,
+role, rule, enclosing top-level declaration and the string literals and
+constants the match tests, with a count, so reformatting, rewrapping or moving
+a listed line does not make it new while changing what it tests does; the
+trailing line-text column is for review only. A new finding whose literal is
+spelled in other files is reported with a hint to share one named definition.
+`--report` prints per-family counts and the literals spelled in the most files,
+`--update` regenerates the allowlist (keeping `#` comments above entries that
+still exist) and `--strict` also fails on stale entries. The families and their
+replacements are in `benchmarks/results/magic_spelling_census_2026-09-28.md`;
+`blorp/test/build/test_check_magic_spellings.py` tests the identity rules.
+`make hygiene-check` runs it.
 
 `scripts/check-std-builtins` verifies that standalone standard-library function builtin
 bodies use explicit identities matching their source declaration, for example

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only check: no new reader may learn a fact from the shape of a name.
+r"""Read-only check: no new reader may learn a fact from the shape of a name.
 
 Scans blorp/src/**/*.brp for the operations that recover facts from a
 name-like String (prefix/suffix tests, splitting, index searches, parse_int,
@@ -8,13 +8,62 @@ scripts/check-magic-spellings.allowlist. Exit status is 1 when a finding is
 absent from the allowlist, so a new prefix test cannot land unnoticed.
 
   python3 scripts/check-magic-spellings            # check (used by hygiene)
-  python3 scripts/check-magic-spellings --report   # per-family counts
+  python3 scripts/check-magic-spellings --report   # per-family counts, shared literals
   python3 scripts/check-magic-spellings --update   # rewrite the allowlist
+  python3 scripts/check-magic-spellings --strict   # also fail on stale entries
+
+Finding identity. An allowlist entry names a finding by
+(file, role, rule, declaration, subject), not by its source line, so
+reformatting, rewrapping or moving a listed line does not report it as new,
+while changing what it tests does.
+
+  declaration  the nearest preceding top-level header: the name of a
+               `func`/`pure func`, a constant, a record/union/struct/enum/
+               trait/opaque type, or `Trait for Type` of an `implements`.
+  subject      the string literals and ALL_CAPS constant names inside the
+               construct the rule matched (a marker_constant's subject is the
+               constant it declares; an accessor_call's is the accessor name).
+               A match that opens a call, such as `.starts_with(`, extends
+               through its closing bracket, so the subject is what the call
+               tests. A match that reads no literal has subject `-` and is
+               identified by its declaration alone, so such keys are count
+               only: replacing one literal-free reader with another of the
+               same rule in the same declaration is not detected.
+  count        one entry covers `count` equal keys, so the same test written
+               twice in one declaration needs count 2 and a third copy is new.
+               Each regex match is its own finding, so one line holding two
+               prefix tests counts twice.
+
+Rewrapping. Rules match against a statement window, not a bare line: the
+line plus the lines that close its open brackets, with comments dropped and
+whitespace, bracket padding and trailing commas collapsed. A finding belongs
+to the line where its match starts. So `x.starts_with(\n  "pkg/",\n)` is
+the same finding as the one-line call, and a call wrapped so that its argument
+moved to the next line is still seen. This was chosen over keying on the line
+text because the argument is the subject, and over a lookahead only for the
+subject because rules such as contains_literal need the argument to match at
+all. Text-only calls (`.split("/")`, `.contains("->")`) are excluded
+per match, by looking at the call's own text. A statement continued without
+an open bracket is scanned line by line, so a rewrap that moves an operator
+across a line break without brackets can hide or reveal a match.
+
+An entry is `file<TAB>role<TAB>rule<TAB>declaration<TAB>subject<TAB>count<TAB>
+line text`. The line text is the first occurrence's source line; it only helps
+review and is ignored when matching, and --update refreshes it. Comment lines
+(`#`) directly above an entry stay with that entry across --update while its
+key still exists. Entries are sorted by key, so moving code never reorders
+the file.
+
+New findings that share a string literal with findings in other files are
+grouped under a hint: spell such a literal once as a shared named definition
+instead of allowlisting every copy. --report lists the literals spelled in
+the most files.
 
 The census benchmarks/results/magic_spelling_census_2026-09-28.md explains
 every family, the explicit data that replaces it, and the step of
-docs/IDENTITY_ROADMAP.md ("Retiring magic spellings") that owns the deletion. Deleting a finding's code requires removing its allowlist
-line; a stale line is reported but does not fail (use --strict to fail).
+docs/IDENTITY_ROADMAP.md ("Retiring magic spellings") that owns the deletion.
+Deleting a finding's code requires removing its allowlist entry; a stale entry
+is reported but does not fail (use --strict to fail).
 """
 import argparse
 import collections
@@ -47,14 +96,17 @@ IGNORED_FILE_PATTERNS = [
     r"^compiler/stage_06_typecheck/foreign_validation\.brp$",
 ]
 
-# Arguments that name a file-system or text-layout token, never a compiler name.
+# Arguments that name a file-system, text-layout or number-sign token, never a
+# compiler name. A match whose own text has one is not a finding. Known gap
+# (follow-up): the pattern looks for the text token anywhere in the call, not
+# only as its first argument, so `f(x, "/")` is excluded like `f("/")`.
 TEXT_ARGUMENT = re.compile(
-    r"""\(\s*(?:"(?:\.brp|/|\\\\|\\n|\\r\\n|\\t|\s+|,|=|-|\?|\(|\)|\[|\]|\|)"
+    r"""\(\s*(?:"(?:\.brp|/|\\\\|\\n|\\r\\n|\\t|\s+|,|=|-|\+|\?|\(|\)|\[|\]|\|)"
               |[A-Z_]*(?:EXTENSION|SEPARATOR_PATH)
               |[A-Za-z_.]+\s*\+\s*"/")\s*[,)]"""
     , re.VERBOSE)
 
-# Lines that only spell C syntax while rendering emitted text.
+# Calls that only spell C syntax while rendering emitted text.
 C_TEXT_ARGUMENT = re.compile(r'\.(?:contains|index_of)\((?:C_[A-Z_]+|"(?:->|\.|\(|\)|\[|\])")\)')
 
 # Bare spellings of the stdlib types the compiler treats specially. A type is
@@ -183,111 +235,358 @@ FAMILIES = [
 ]
 
 DOC_FENCE = "---"
+NO_DECLARATION = "<module>"
+NO_SUBJECT = "-"
+TOP_LITERAL_COUNT = 10
+MAX_HINT_FILES = 8
+LOOKAHEAD_LIMIT = 4000  # characters; a call longer than this keeps only its matched text
+
+# Top-level headers. Source indents with tabs, so a header is a column-0 line.
+TYPE_OR_FUNCTION_HEADER = re.compile(
+    r"^(?:private\s+)?(?:(?:pure|opaque|fixed)\s+)*"
+    r"(?:(?:func|record|union|struct|enum|trait|type)\s+(?P<name>\w+)"
+    # The type may carry generic bounds (`Holder[Inner:Provider]:`), so the
+    # header ends at the last colon of the line, not the first.
+    r"|implements\s+(?P<implemented>.+?)\s*:\s*$)"
+)
+# `foreign:` and `foreign(include: "x.h"):` open a block of declarations.
+FOREIGN_HEADER = re.compile(r"^foreign\b(?P<arguments>\([^)]*\))?\s*:\s*$")
+# A constant: `NAME: Type = value` or `name = value`, upper or lower case.
+CONSTANT_HEADER = re.compile(r"^(?:private\s+)?(?P<name>[A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
+CONSTANT_DECLARATION = re.compile(r"^\s*(?:private\s+)?(?P<name>[A-Z][A-Z0-9_]*)\b")
+STRING_TOKEN = r'"(?:[^"\\]|\\.)*"'
+STRING_LITERAL_AT = re.compile(STRING_TOKEN)
+SUBJECT_TOKEN = re.compile(STRING_TOKEN + r"|\b[A-Z][A-Z0-9_]+\b")
+STRING_LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
+# What a wrapped call adds around its arguments: a space inside a bracket and
+# a trailing comma before the closing one. Strings match first so they stay whole.
+WRAP_PADDING = re.compile(STRING_TOKEN + r"|(?<=[(\[{]) +| +(?=[)\]}])|,(?= *[)\]}])")
+
+Finding = collections.namedtuple(
+    "Finding", "file role rule declaration subject literals number text"
+)
+
+
+def declaration_name(line):
+    """The declaration a column-0 line starts, or None."""
+    header = TYPE_OR_FUNCTION_HEADER.match(line)
+    if header:
+        return header.group("name") or header.group("implemented")
+    foreign = FOREIGN_HEADER.match(line)
+    if foreign:
+        return "foreign" + (foreign.group("arguments") or "")
+    constant = CONSTANT_HEADER.match(line)
+    return constant.group("name") if constant else None
+
+
+def code_of_line(line):
+    """(code, depth change) of one source line.
+
+    The code has its `--` comment removed and its whitespace collapsed outside
+    string literals. Strings are skipped as units so a bracket or `--` inside
+    one counts for nothing. The depth change is the line's net open brackets.
+    """
+    pieces = []
+    depth = 0
+    position = 0
+    while position < len(line):
+        character = line[position]
+        if character == '"':
+            literal = STRING_LITERAL_AT.match(line, position)
+            stop = literal.end() if literal else len(line)
+            pieces.append(line[position:stop])
+            position = stop
+            continue
+        if line.startswith("--", position):
+            break
+        if character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+        if not character.isspace():
+            pieces.append(character)
+        elif pieces and pieces[-1] != " ":
+            pieces.append(" ")
+        position += 1
+    return "".join(pieces).strip(), depth
+
+
+def without_wrap_padding(text):
+    return WRAP_PADDING.sub(lambda match: match.group(0) if match.group(0).startswith('"') else "", text)
+
+
+def statement_window(codes, depths, first):
+    """The collapsed text of line `first` and the lines that close its open
+    brackets, and the length of the part that comes from `first` itself.
+
+    Rules match against this window and a finding belongs to the line where its
+    match starts, so wrapping a call over several lines changes neither which
+    rules match nor what they match. A statement continued without an open
+    bracket is not joined; it is scanned line by line.
+    """
+    parts = []
+    depth = 0
+    length = 0
+    for index in range(first, len(codes)):
+        if not codes[index]:
+            continue
+        parts.append(codes[index])
+        length += len(codes[index])
+        depth += depths[index]
+        if depth <= 0 or length > LOOKAHEAD_LIMIT:
+            break
+    # Collapsing the padding of the whole window can drop a trailing comma of
+    # `parts[0]` that collapsing `parts[0]` alone keeps, so the first line's
+    # length may be one too long. That only matters to a match starting on that
+    # character, and no rule starts at a comma or closing bracket.
+    return without_wrap_padding(" ".join(parts)), len(without_wrap_padding(parts[0]))
+
+
+def matched_extent(window, start, end):
+    """The match, extended through its call's closing bracket.
+
+    A match such as `.starts_with(` ends inside a call, and what the call
+    tests is its argument. A call that never closes in the window keeps only
+    its matched text.
+    """
+    depth = 0
+    position = start
+    while position < len(window) and (position < end or depth > 0):
+        if window[position] == '"':
+            literal = STRING_LITERAL_AT.match(window, position)
+            position = literal.end() if literal else position + 1
+            continue
+        if window[position] in "([{":
+            depth += 1
+        elif window[position] in ")]}":
+            depth -= 1
+        position += 1
+    return window[start:end] if depth > 0 else window[start:position]
+
+
+def is_text_extent(extent):
+    """Whether a match only handles file-system, layout or C text."""
+    text_argument = TEXT_ARGUMENT.search(extent) and not re.search(r"(?:MARKER|PREFIX)", extent)
+    return bool(text_argument or C_TEXT_ARGUMENT.search(extent))
+
+
+def subject_of(extent):
+    return " ".join(SUBJECT_TOKEN.findall(extent)) or NO_SUBJECT
+
+
+def literals_of(extent):
+    return tuple(STRING_LITERAL.findall(extent))
 
 
 def scan_file(path, relative):
-    findings = []
-    in_docstring = False
     with open(path, encoding="utf-8") as handle:
-        for number, raw in enumerate(handle, 1):
-            line = raw.rstrip("\n")
-            stripped = line.strip()
-            if stripped == DOC_FENCE:
-                in_docstring = not in_docstring
-                continue
-            if in_docstring or stripped.startswith("--") or not stripped:
-                continue
-            if TEXT_ARGUMENT.search(line) and not re.search(r"(?:MARKER|PREFIX)", line):
-                continue
-            if C_TEXT_ARGUMENT.search(line):
-                continue
-            for rule, pattern in READER_RULES:
-                if pattern.search(line):
-                    findings.append((relative, "reader", rule, stripped, number))
-            if not DEFINITION_LINE.match(line):
-                for match in ACCESSOR_CALL.finditer(line):
-                    findings.append((relative, "accessor", "accessor_call", match.group(1), number))
-            for rule, pattern in PRODUCER_RULES:
-                if pattern.search(line):
-                    findings.append((relative, "producer", rule, stripped, number))
+        lines = handle.read().split("\n")
+    codes = []
+    depths = []
+    is_code = []
+    in_docstring = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == DOC_FENCE:
+            in_docstring = not in_docstring
+            code_line = False
+        else:
+            code_line = bool(stripped) and not in_docstring and not stripped.startswith("--")
+        code, depth = code_of_line(line) if code_line else ("", 0)
+        codes.append(code)
+        depths.append(depth)
+        is_code.append(code_line)
+
+    findings = []
+    declaration = NO_DECLARATION
+    for index, line in enumerate(lines):
+        if not is_code[index]:
+            continue
+        declared = declaration_name(line)
+        if declared:
+            declaration = declared
+        window, first_length = statement_window(codes, depths, index)
+
+        def matches(pattern):
+            for match in pattern.finditer(window):
+                if match.start() >= first_length:
+                    return
+                extent = matched_extent(window, match.start(), match.end())
+                if not is_text_extent(extent):
+                    yield match, extent
+
+        def add(role, rule, subject, literals):
+            findings.append(Finding(relative, role, rule, declaration, subject, literals, index + 1, line.strip()))
+
+        for rule, pattern in READER_RULES:
+            for _, extent in matches(pattern):
+                add("reader", rule, subject_of(extent), literals_of(extent))
+        if not DEFINITION_LINE.match(line):
+            for match, _ in matches(ACCESSOR_CALL):
+                add("accessor", "accessor_call", match.group(1), ())
+        for rule, pattern in PRODUCER_RULES:
+            for _, extent in matches(pattern):
+                if rule == "marker_constant":
+                    # The declared constant is the subject; the literal it
+                    # defines is kept for the duplication hint.
+                    add("producer", rule, CONSTANT_DECLARATION.match(window).group("name"), literals_of(extent))
+                else:
+                    add("producer", rule, subject_of(extent), literals_of(extent))
     return findings
 
 
-def scan():
+def scan(source_root):
     findings = []
     ignored = [re.compile(pattern) for pattern in IGNORED_FILE_PATTERNS]
-    for directory, _, files in os.walk(SOURCE_ROOT):
+    for directory, _, files in os.walk(source_root):
         for name in sorted(files):
             if not name.endswith(".brp"):
                 continue
             path = os.path.join(directory, name)
-            relative = os.path.relpath(path, SOURCE_ROOT)
+            relative = os.path.relpath(path, source_root)
             if any(pattern.search(relative) for pattern in ignored):
                 continue
             findings.extend(scan_file(path, relative))
-    findings.sort(key=lambda item: (item[0], item[4], item[1], item[2]))
+    findings.sort(key=lambda item: (item.file, item.number, item.role, item.rule))
     return findings
 
 
 def key_of(finding):
-    relative, role, rule, text, _ = finding
-    return "\t".join((relative, role, rule, text))
+    return (finding.file, finding.role, finding.rule, finding.declaration, finding.subject)
 
 
-def load_allowlist():
+def parse_allowlist(path):
+    """Returns (counts, comments, errors): the count per key, the `#` lines
+    directly above each key's first entry, and malformed-line messages."""
     counts = collections.Counter()
-    if os.path.exists(ALLOWLIST):
-        with open(ALLOWLIST, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.rstrip("\n")
-                if line and not line.startswith("#"):
-                    counts[line] += 1
-    return counts
+    comments = {}
+    errors = []
+    if not os.path.exists(path):
+        return counts, comments, errors
+    pending = []
+    with open(path, encoding="utf-8") as handle:
+        for number, raw in enumerate(handle, 1):
+            line = raw.rstrip("\n")
+            if not line.strip():
+                pending = []  # a blank line ends the header or a floating comment
+                continue
+            if line.startswith("#"):
+                pending.append(line)
+                continue
+            fields = line.split("\t", 6)
+            if len(fields) < 6 or not fields[5].isdigit():
+                errors.append(
+                    f"{os.path.basename(path)}:{number}: expected "
+                    "file, role, rule, declaration, subject, count[, line text] separated by tabs"
+                )
+                pending = []
+                continue
+            key = tuple(fields[:5])
+            counts[key] += int(fields[5])
+            if pending:
+                comments.setdefault(key, pending)
+            pending = []
+    return counts, comments, errors
+
+
+ALLOWLIST_HEADER = [
+    "# file<TAB>role<TAB>rule<TAB>declaration<TAB>subject<TAB>count<TAB>line text",
+    "# An entry is identified by its first six columns (see the docstring of scripts/check-magic-spellings);",
+    "# the line text is the first occurrence, kept for review, and ignored when matching.",
+    "# Regenerate with --update after deleting a reader. A `#` comment directly above an entry stays with it.",
+    "",
+]
+
+
+def write_allowlist(path, findings, comments):
+    groups = {}
+    for finding in findings:
+        key = key_of(finding)
+        if key in groups:
+            groups[key][0] += 1
+        else:
+            groups[key] = [1, finding.text.replace("\t", " ")]
+    with open(path, "w", encoding="utf-8") as handle:
+        for line in ALLOWLIST_HEADER:
+            handle.write(line + "\n")
+        for key in sorted(groups):
+            count, text = groups[key]
+            for comment in comments.get(key, ()):
+                handle.write(comment + "\n")
+            handle.write("\t".join(key + (str(count), text)) + "\n")
+    return len(groups)
 
 
 def family_of(finding):
-    relative, _, _, text, _ = finding
     for family, file_pattern, text_pattern in FAMILIES:
-        if re.search(file_pattern, relative) and re.search(text_pattern, text):
+        if re.search(file_pattern, finding.file) and re.search(text_pattern, finding.text):
             return family
     return "unclassified"
 
 
-def main():
+def shared_literals(findings, only=None):
+    """(literal, files) for each literal spelled in several files, most files first."""
+    files_of = collections.defaultdict(set)
+    for finding in findings:
+        for literal in finding.literals:
+            files_of[literal].add(finding.file)
+    shared = [(literal, sorted(files)) for literal, files in files_of.items()
+              if len(files) > 1 and (only is None or literal in only)]
+    shared.sort(key=lambda item: (-len(item[1]), item[0]))
+    return shared
+
+
+def file_list(files):
+    shown = ", ".join(files[:MAX_HINT_FILES])
+    return shown + (f", and {len(files) - MAX_HINT_FILES} more" if len(files) > MAX_HINT_FILES else "")
+
+
+def print_report(findings, top):
+    table = collections.defaultdict(collections.Counter)
+    seen = set()
+    for finding in findings:
+        line_key = (finding.file, finding.number, finding.role)
+        if line_key in seen:
+            continue  # one line matching two producer rules counts once
+        seen.add(line_key)
+        stage = finding.file.split("/")[1] if finding.file.startswith("compiler/") else finding.file.split("/")[0]
+        table[family_of(finding)][finding.role] += 1
+        table[family_of(finding)]["stage:" + stage] += 1
+    for family in sorted(table):
+        counts = table[family]
+        stages = ", ".join(f"{key[6:]}={value}" for key, value in sorted(counts.items()) if key.startswith("stage:"))
+        print(f"{family}: readers={counts['reader']} accessor_calls={counts['accessor']} producers={counts['producer']} [{stages}]")
+    print("total: " + " ".join(f"{role}s={sum(1 for d in seen if d[2] == role)}" for role in ("reader", "accessor", "producer")))
+    shared = shared_literals(findings)
+    print(f"\nliterals spelled in several files ({len(shared)}; top {min(top, len(shared))} by file count):")
+    for literal, files in shared[:top]:
+        print(f'  "{literal}": {len(files)} files: {file_list(files)}')
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--update", action="store_true", help="rewrite the allowlist from the current findings")
-    parser.add_argument("--report", action="store_true", help="print per-family reader/producer counts")
-    parser.add_argument("--strict", action="store_true", help="also fail on stale allowlist lines")
-    args = parser.parse_args()
+    parser.add_argument("--report", action="store_true", help="print per-family reader/producer counts and shared literals")
+    parser.add_argument("--strict", action="store_true", help="also fail on stale allowlist entries")
+    parser.add_argument("--top", type=int, default=TOP_LITERAL_COUNT, help="literals listed by --report (default %(default)s)")
+    args = parser.parse_args(argv)
 
-    findings = scan()
+    findings = scan(SOURCE_ROOT)
     if args.update:
-        with open(ALLOWLIST, "w", encoding="utf-8") as handle:
-            handle.write("# file<TAB>role<TAB>rule<TAB>line text; regenerate with --update after deleting a reader.\n")
-            for finding in findings:
-                handle.write(key_of(finding) + "\n")
-        print(f"wrote {len(findings)} findings to {os.path.relpath(ALLOWLIST, ROOT)}")
+        _, comments, _ = parse_allowlist(ALLOWLIST)
+        entries = write_allowlist(ALLOWLIST, findings, comments)
+        print(f"wrote {len(findings)} findings as {entries} entries to {os.path.relpath(ALLOWLIST, ROOT)}")
         return 0
-
     if args.report:
-        table = collections.defaultdict(lambda: collections.Counter())
-        seen = set()
-        for finding in findings:
-            if (finding[0], finding[4], finding[1]) in seen:
-                continue  # one line matching two producer rules counts once
-            seen.add((finding[0], finding[4], finding[1]))
-            stage = finding[0].split("/")[1] if finding[0].startswith("compiler/") else finding[0].split("/")[0]
-            table[family_of(finding)][finding[1]] += 1
-            table[family_of(finding)]["stage:" + stage] += 1
-        for family in sorted(table):
-            counts = table[family]
-            stages = ", ".join(f"{key[6:]}={value}" for key, value in sorted(counts.items()) if key.startswith("stage:"))
-            print(f"{family}: readers={counts['reader']} accessor_calls={counts['accessor']} producers={counts['producer']} [{stages}]")
-        distinct = {(f[0], f[4], f[1]) for f in findings}
-        print("total: " + " ".join(f"{role}s={sum(1 for d in distinct if d[2] == role)}" for role in ("reader", "accessor", "producer")))
+        print_report(findings, args.top)
         return 0
 
-    allowed = load_allowlist()
+    allowed, _, errors = parse_allowlist(ALLOWLIST)
+    if errors:
+        for message in errors:
+            print(message, file=sys.stderr)
+        print("run --update to regenerate the allowlist in the current format", file=sys.stderr)
+        return 2
     new = []
     remaining = collections.Counter(allowed)
     for finding in findings:
@@ -296,22 +595,29 @@ def main():
             remaining[key] -= 1
         else:
             new.append(finding)
-    stale = [key for key, count in remaining.items() for _ in range(count)]
+    stale = [(key, count) for key, count in sorted(remaining.items()) if count > 0]
 
-    for relative, role, rule, text, number in new:
-        print(f"blorp/src/{relative}:{number}: new {role} ({rule}): {text}")
+    for finding in new:
+        print(f"blorp/src/{finding.file}:{finding.number}: new {finding.role} ({finding.rule}) in {finding.declaration}: {finding.text}")
     if new:
+        new_literals = {literal for finding in new for literal in finding.literals}
+        for literal, files in shared_literals(findings, only=new_literals):
+            print(
+                f'hint: the literal "{literal}" appears in {len(files)} files: {file_list(files)}; '
+                "prefer one shared named definition over allowlisting each copy"
+            )
+        sys.stdout.flush()  # keep the findings and hints ahead of the stderr summary
         print(
             f"\n{len(new)} new name-shape finding(s). A name's prefix, suffix or embedded number must be an explicit\n"
             "field, enum or id (see benchmarks/results/magic_spelling_census_2026-09-28.md). If the String is not a\n"
             "compiler name (file path, CLI text, C vocabulary), add it with --update and say why in the review.",
             file=sys.stderr,
         )
-    for key in stale:
-        print(f"stale allowlist line (code deleted or edited): {key}", file=sys.stderr)
+    for key, count in stale:
+        print("stale allowlist entry (code deleted or edited): " + "\t".join(key) + (f" (x{count})" if count > 1 else ""), file=sys.stderr)
     if new or (args.strict and stale):
         return 1
-    print(f"magic-spelling check ok: {len(findings)} allowlisted findings, {len(stale)} stale")
+    print(f"magic-spelling check ok: {len(findings)} allowlisted findings, {sum(count for _, count in stale)} stale")
     return 0
 
 
