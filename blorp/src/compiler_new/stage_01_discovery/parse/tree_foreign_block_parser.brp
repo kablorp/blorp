@@ -1,0 +1,131 @@
+-- Foreign-block ownership and recovery over completed signature leaves.
+import:
+	../lex/lexed_module: LiteralValue(TextValue)
+	../syntax/foreign_blocks: ForeignBlock, ForeignArgument, ForeignFunction
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../tables/diagnostic_code:
+		PlainSyntaxCode(ForeignFunctionOutsideBlockDiagnostic, ExpectedForeignArgumentDiagnostic, ExpectedForeignArgumentValueDiagnostic, ExpectedForeignFunctionDiagnostic)
+	../tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedColon, ExpectedComma, ExpectedRightParen, ExpectedNewline, ExpectedIndent),
+		NameConstruct(NameInForeignBlockArgumentName), ColonConstruct(ColonInForeignBlockArgumentName, ColonInForeignHeader),
+		CommaConstruct(CommaInForeignBlockArguments), RightParenConstruct(RightParenInForeignBlockArguments),
+		NewlineConstruct(NewlineInForeignHeader), IndentConstruct(IndentInForeignBlock)
+	../tables/span: Span, span_covering
+	../tables/token:
+		TokenKind(PureKeyword, FuncKeyword, PrivateKeyword, AtSymbol, LeftParenSymbol, RightParenSymbol, ColonSymbol, CommaSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken)
+	parse_state:
+		ParseState, current_kind, current_span, current_literal, position, advanced, diagnostic_count,
+		expect_token, consume_referenced_name, report_at_current, report_and_recover, report_diagnostic
+	tree_foreign_function_parser: ForeignFunctionParse(ParsedForeignFunction, RejectedForeignFunction), parse_foreign_function
+
+
+union ForeignBlockParse:
+	ParsedForeignBlock(ForeignBlock)
+	RejectedForeignBlock
+
+
+-- The cursor is at `foreign`; start may include caller-owned documentation.
+pure func parse_foreign_block(state: ParseState, start: Span) -> (ParseState, ForeignBlockParse):
+	before: Int = state.diagnostic_count()
+	var out: ParseState = state.advanced()
+
+	if out.current_kind() == PureKeyword or out.current_kind() == FuncKeyword:
+		(out.report_diagnostic(start, Plain(ForeignFunctionOutsideBlockDiagnostic)).advanced(), RejectedForeignBlock)
+	else:
+		var arguments: List[ForeignArgument] = []
+		var functions: List[ForeignFunction] = []
+
+		if out.current_kind() == LeftParenSymbol:
+			(after_arguments, written) = parse_foreign_arguments(out.advanced())
+			arguments = written
+			out = after_arguments.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInForeignBlockArguments))
+
+		out = out
+			.expect_token(ColonSymbol, ExpectedColon(ColonInForeignHeader))
+			.expect_token(NewlineToken, ExpectedNewline(NewlineInForeignHeader))
+			.expect_token(IndentToken, ExpectedIndent(IndentInForeignBlock))
+			.skip_newlines()
+
+		-- Frozen recovery is token/layout owned, including missing-indent
+		-- cases. Source columns must not introduce a new sibling boundary.
+		while not out.at_block_end():
+			item_start: Int = out.position()
+
+			match out.current_kind():
+				PrivateKeyword | PureKeyword | FuncKeyword | AtSymbol:
+					(after_function, parsed) = parse_foreign_function(out)
+					out = after_function.skip_newlines()
+
+					match parsed:
+						ParsedForeignFunction(function):
+							functions = functions.append(function)
+						RejectedForeignFunction:
+							()
+				_:
+					out = out.report_at_current(ExpectedForeignFunctionDiagnostic).advanced().skip_newlines()
+
+			if out.position() == item_start and not out.at_block_end():
+				out = out.advanced()
+
+		var end: Span = start
+
+		if out.current_kind() == DedentToken:
+			end = out.current_span()
+			out = out.advanced()
+
+		if out.diagnostic_count() != before:
+			(out, RejectedForeignBlock)
+		else:
+			(out, ParsedForeignBlock({ arguments = arguments, functions = functions, span = start.span_covering(end) }))
+
+
+private pure func at_block_end(state: ParseState) -> Bool:
+	state.current_kind() == DedentToken or state.current_kind() == EndOfFileToken
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+
+	out
+
+
+private pure func parse_foreign_arguments(state: ParseState) -> (ParseState, List[ForeignArgument]):
+	var out: ParseState = state
+	var arguments: List[ForeignArgument] = []
+
+	if out.current_kind() == RightParenSymbol:
+		out = out.report_at_current(ExpectedForeignArgumentDiagnostic)
+	else:
+		while out.current_kind() != RightParenSymbol and out.current_kind() != EndOfFileToken:
+			argument_start: Int = out.position()
+			(after_name, name) = out.consume_referenced_name(NameInForeignBlockArgumentName)
+			out = after_name.expect_token(ColonSymbol, ExpectedColon(ColonInForeignBlockArgumentName))
+			value: Option[String] = match out.current_kind():
+				NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+					match out.current_literal():
+						Some(TextValue(text)):
+							Some(text)
+						_:
+							None
+				_:
+					None
+
+			match value:
+				Some(value):
+					arguments = arguments.append({ name = name, value = value, span = name.span.span_covering(out.current_span()) })
+					out = out.advanced()
+				None:
+					out = out.report_and_recover(ExpectedForeignArgumentValueDiagnostic)
+
+			if out.current_kind() == CommaSymbol:
+				out = out.advanced()
+			else if out.current_kind() != RightParenSymbol:
+				out = out.expect_token(CommaSymbol, ExpectedComma(CommaInForeignBlockArguments))
+
+			if out.position() == argument_start and out.current_kind() != RightParenSymbol:
+				out = out.advanced()
+
+	(out, arguments)

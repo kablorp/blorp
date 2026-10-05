@@ -1,0 +1,301 @@
+-- A single frozen declaration call includes top-level prefix recovery.
+-- Valid deferred bodies carry lexical evidence, not M4 expression-tree parity.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_implementation_parser: ImplementationPreview, ImplementationParse(ParsedImplementation, RejectedImplementation), parse_implementation
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser: parse_declaration_prefix
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_declaration
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parser_cursor as FrozenCursor
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: ParameterBinding(NamedParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenType, WrittenTypeKind(NamedType, BoundedType, FunctionType), TypeArgument(TypeArgumentType, BoundedArgument, DimensionArgument)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, type_binder_local_index, name_use_local_index, binder_local_index, written_type_local_index, dimension_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedColon, ExpectedRightBracket, ExpectedRightParen, ExpectedNewline, ExpectedIndent, ExpectedKeyword, ExpectedLeftParen, ExpectedArrow), NameConstruct(NameInTraitName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(PureFunction, ImpureFunction)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(ImplementsKeyword, IdentifierToken, EndOfFileToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func frozen(text: String) -> DiscoveryBuilder:
+	lexed = lex_module(module_id_at_row(0), text)
+	prepared = empty_discovery_builder().admit_source("implementation.brp", text).bridge_lexed_module(lexed)
+	parse_declaration(prepared, module_id_at_row(0))
+
+
+private pure func expected_token_matches(actual: ExpectedTokenDiagnostic, wanted: ExpectedTokenDiagnostic) -> Bool:
+	match (actual, wanted):
+		(ExpectedName(actual), ExpectedName(wanted)):
+			actual == wanted
+		(ExpectedColon(actual), ExpectedColon(wanted)):
+			actual == wanted
+		(ExpectedRightBracket(actual), ExpectedRightBracket(wanted)):
+			actual == wanted
+		(ExpectedRightParen(actual), ExpectedRightParen(wanted)):
+			actual == wanted
+		(ExpectedNewline(actual), ExpectedNewline(wanted)):
+			actual == wanted
+		(ExpectedIndent(actual), ExpectedIndent(wanted)):
+			actual == wanted
+		(ExpectedKeyword(actual), ExpectedKeyword(wanted)):
+			actual == wanted
+		(ExpectedLeftParen(actual), ExpectedLeftParen(wanted)):
+			actual == wanted
+		(ExpectedArrow(actual), ExpectedArrow(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func matches_frozen(state: ParseState, reference: DiscoveryBuilder) -> Bool:
+	var correct: Bool = (state.diagnostic_count() == reference.diagnostics.length() and state.position() == reference.token_cursor
+		and state.current_kind() == FrozenCursor.current_kind(reference) and state.current_span().spans_equal(FrozenCursor.current_span(reference)))
+	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics):
+		correct = correct and actual.span.spans_equal(wanted.span)
+		match (actual.diagnostic, wanted.diagnostic):
+			(TreeDiagnostics.Plain(actual), FrozenDiagnostics.Plain(wanted)):
+				correct = correct and actual == wanted
+			(TreeDiagnostics.ExpectedToken(actual), FrozenDiagnostics.ExpectedToken(wanted)):
+				correct = correct and expected_token_matches(actual, wanted)
+			(TreeDiagnostics.ReservedKeywordAsName(actual), FrozenDiagnostics.ReservedKeywordAsName(wanted)) | (TreeDiagnostics.UnknownAnnotation(actual), FrozenDiagnostics.UnknownAnnotation(wanted)):
+				correct = correct and state.spellings().spelling_text(actual) == reference.name_spellings.get(wanted.name_id_index())
+			_:
+				-- Exact variant/construct/order/span parity; no code-name normalization.
+				correct = False
+	correct
+
+
+private pure func no_definitions_or_bodies(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(witness_state):
+			(_, name) = witness_state.consume_declared_name(NameInTraitName)
+			match name:
+				Some(name):
+					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					(witness.id.definition_local_index() == 0 and counts.expressions == 0 and counts.blocks == 0
+						and counts.statements == 0 and counts.patterns == 0)
+				None:
+					False
+		Err(_):
+			False
+
+
+-- Direct owner tolerates existing diagnostics; composition rejects its own delta.
+private pure func composed(text: String) -> Option[(ParseState, ImplementationParse)]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			before: Int = state.diagnostic_count()
+			(after_prefix, prefix) = parse_declaration_prefix(state)
+			(parsed, result) = parse_implementation(after_prefix, prefix.visibility, prefix.documentation, prefix.start)
+			if parsed.diagnostic_count() != before:
+				Some((parsed, RejectedImplementation))
+			else:
+				Some((parsed, result))
+		Err(_):
+			None
+
+
+private pure func accepted(text: String, method_names: List[String]) -> Bool:
+	reference = frozen(text)
+	match composed(text):
+		Some((parsed, ParsedImplementation(preview))):
+			match (reference.definitions.get(0), reference.impls.get(0)):
+				(Some(owner), Some(implementation)):
+					var correct: Bool = (matches_frozen(parsed, reference) and parsed.diagnostic_count() == 0
+						and preview.span.spans_equal(owner.span) and preview.trait_name.name.span.spans_equal(implementation.trait_span)
+						and preview.methods.length() == method_names.length() and no_definitions_or_bodies(parsed))
+					for (method, name) in preview.methods.zip(method_names):
+						correct = correct and parsed.spellings().spelling_text(method.header.signature.name.spelling) == Some(name)
+						-- Body intervals belong to the lexical skipper, never frozen AST rows.
+						correct = correct and method.body.deferred_body_token_start() < method.body.deferred_body_token_end()
+					correct
+				_:
+					False
+		_:
+			False
+
+
+private pure func rejected(text: String) -> Bool:
+	match composed(text):
+		Some((parsed, RejectedImplementation)):
+			matches_frozen(parsed, frozen(text)) and parsed.diagnostic_count() > 0 and no_definitions_or_bodies(parsed)
+		_:
+			False
+
+
+private pure func rich_receiver_ids(receiver: WrittenType) -> Bool:
+	match receiver.kind:
+		NamedType(_, [BoundedArgument(bound), TypeArgumentType(unbounded), DimensionArgument(dimension)]):
+			match (bound.bounds.rest.get(0), unbounded.kind):
+				(Some(qualified), NamedType(unbounded_name, [])):
+					match qualified.qualifier:
+						Some(qualifier):
+							(qualifier.use.name_use_local_index() == 4 and qualified.trait_name.use.name_use_local_index() == 5
+								and unbounded_name.use.name_use_local_index() == 6 and dimension.id.dimension_local_index() == 0)
+						None:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_private_documented_bounded_receiver_and_two_methods_keep_child_ids() -> Bool:
+	text: String = "---\nDoc\n---\nprivate implements Eq for Box[T: Eq + mm.Hash,U,#N]:\n\tfunc f(x: T) -> U: x\n\tpure func g(y: U) -> T: y\nnext"
+	match composed(text):
+		Some((parsed, ParsedImplementation(preview))):
+			match (preview.documentation, preview.receiver.kind, preview.methods):
+				(Some(doc), NamedType(box, [BoundedArgument(bound), TypeArgumentType(unbounded), DimensionArgument(_)]), [first, second]):
+					match (first.header.signature.parameters, second.header.signature.parameters, first.header.signature.return_type, second.header.signature.return_type):
+						([x], [y], Some(first_return), Some(second_return)):
+							match (x.binding, y.binding, x.declared_type, y.declared_type):
+								(NamedParameter(x_name), NamedParameter(y_name), Some(x_type), Some(y_type)):
+									(accepted(text, ["f", "g"]) and preview.visibility == PrivateVisibility and doc.text == "Doc" and doc.span.covers(0, 12)
+										and preview.keyword.covers(20, 30) and preview.trait_name.use.name_use_local_index() == 0 and box.use.name_use_local_index() == 1
+										and bound.parameter.use.name_use_local_index() == 2 and bound.bounds.rest.length() == 1 and bound.bounds.first.trait_name.use.name_use_local_index() == 3 and unbounded.id.written_type_local_index() == 0
+										and rich_receiver_ids(preview.receiver) and preview.receiver.id.written_type_local_index() == 1 and x_type.id.written_type_local_index() == 2 and first_return.id.written_type_local_index() == 3
+										and y_type.id.written_type_local_index() == 4 and second_return.id.written_type_local_index() == 5
+										and x_name.binder.binder_local_index() == 0 and y_name.binder.binder_local_index() == 1
+										and first.header.signature.purity == ImpureFunction and second.header.signature.purity == PureFunction
+										and first.header.header_span.covers(66, 84) and second.header.header_span.covers(88, 111)
+										and first.body.deferred_body_span().covers(85, 86) and second.body.deferred_body_span().covers(112, 113)
+										and preview.span.covers(0, 114) and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(114, 118)
+										and parsed.issued_counts().written_types == 6 and parsed.issued_counts().name_uses == 12 and parsed.issued_counts().dimensions == 1
+										and parsed.issued_counts().type_binders == 0 and parsed.issued_counts().binders == 2)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_empty_region_owns_dedent_and_preserves_sibling() -> Bool:
+	text: String = "implements Eq for Int:\n\t\nnext"
+	-- Blank lines do not manufacture an IndentToken: pin the resulting layout
+	-- recovery rather than treating a visually indented blank as an empty region.
+	(rejected(text) and rejected("implements Eq for Int:\nnext") and rejected("implements Eq for Int:\n"))
+
+
+pure func test_grouped_bounded_and_function_receivers_are_owner_types() -> Bool:
+	(accepted("implements Eq for (T: Eq):\n\tfunc f(): 1\nnext", ["f"])
+		and accepted("implements Eq for (Box[T: Eq]):\n\tfunc f(): 1\nnext", ["f"])
+		and accepted("implements Eq for () -> (T: Eq):\n\tfunc f(): 1\nnext", ["f"])
+		and accepted("implements Eq for pure (T: Eq) -> Int:\n\tfunc f(): 1\nnext", ["f"]))
+
+
+pure func test_punctuation_and_layout_omissions_follow_frozen_order() -> Bool:
+	(rejected("implements Eq Int:") and rejected("implements Eq for Int")
+		and rejected("implements Eq for Int: func f():") and rejected("implements Eq for Int:\nfunc f():"))
+
+
+pure func test_trait_name_is_one_reference_without_qualifier_or_arguments() -> Bool:
+	(accepted("implements Eq for Int:\n\tfunc f(): 1\nnext", ["f"])
+		and rejected("implements m.Eq for Int:") and rejected("implements Eq[T] for Int:")
+		and rejected("implements if for Int:") and rejected("implements 123 for Int:") and rejected("implements for Int:"))
+
+
+pure func test_unsupported_and_missing_body_children_continue_unfiltered() -> Bool:
+	-- No malformed expression bodies: exact frozen recovery ends at header/layout.
+	(rejected("implements Eq for Int:\n\tprivate func f()\n\tfunc good()\nnext")
+		and rejected("implements Eq for Int:\n\t123\n\tfunc good()\nnext")
+		and rejected("implements Eq for Int:\n\tfunc bad():\n\tfunc good()\nnext")
+		and rejected("implements Eq for Int:\n\t@unknown func bad()\n\tfunc good()\nnext"))
+
+
+pure func test_missing_indent_consumes_unindented_method_siblings() -> Bool:
+	text: String = "implements Eq for Int:\nfunc f()\nfunc g()"
+	match composed(text):
+		Some((parsed, RejectedImplementation)):
+			(rejected(text) and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(40, 40)
+				and parsed.issued_counts().written_types == 1 and parsed.issued_counts().name_uses == 2)
+		_:
+			False
+
+
+-- Without a real indent the frozen owner still closes at the receiver span;
+-- the rejected preview carries no owner. Pin that recovery boundary explicitly.
+private pure func rejected_eof_fallback() -> Bool:
+	text: String = "implements Eq for Int:"
+	reference = frozen(text)
+	match (composed(text), reference.definitions.get(0)):
+		(Some((parsed, RejectedImplementation)), Some(owner)):
+			(owner.span.covers(0, 21) and matches_frozen(parsed, reference) and parsed.current_kind() == EndOfFileToken
+				and parsed.current_span().covers(22, 22) and no_definitions_or_bodies(parsed))
+		_:
+			False
+
+
+pure func test_dedent_span_and_eof_fallback_keep_receiver_endpoint() -> Bool:
+	text: String = "implements Eq for Int:\n\tfunc f(): 1\nnext"
+	match composed(text):
+		Some((parsed, ParsedImplementation(preview))):
+			match preview.methods:
+				[method]:
+					(accepted(text, ["f"]) and preview.span.covers(0, 36) and preview.receiver.span.covers(18, 21)
+						and method.header.header_span.covers(24, 33) and method.body.deferred_body_span().covers(34, 35)
+						and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(36, 40)
+						and rejected_eof_fallback() and rejected("implements Eq for Int:\n"))
+				_:
+					False
+		_:
+			False
+
+
+pure func test_purity_is_ignored_and_annotations_reject_at_prefix_boundary() -> Bool:
+	(accepted("pure implements Eq for Int:\n\tfunc f(): 1\nnext", ["f"])
+		and accepted("private pure implements Eq for Int:\n\tfunc f(): 1\nnext", ["f"])
+		and rejected("@no_copy implements Eq for Int:") and rejected("@unknown implements Eq for Int:"))
+
+
+pure func test_direct_earlier_start_and_existing_diagnostic_are_retained() -> Bool:
+	text: String = "prefix implements Eq for Int:\n\tfunc f(): 1\nnext"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			entry = state.advanced().report_at_current(FrozenDiagnostics.ExpectedImplMethodDiagnostic)
+			(parsed, result) = parse_implementation(entry, PrivateVisibility, None, state.current_span())
+			match (result, parsed.diagnostics().get(0)):
+				(ParsedImplementation(preview), Some(diagnostic)):
+					match diagnostic.diagnostic:
+						TreeDiagnostics.Plain(FrozenDiagnostics.ExpectedImplMethodDiagnostic):
+							(preview.span.covers(0, 43) and preview.keyword.covers(7, 17) and preview.visibility == PrivateVisibility and preview.documentation.is_none()
+								and diagnostic.span.covers(7, 7) and parsed.diagnostic_count() == 1 and no_definitions_or_bodies(parsed)
+								and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(43, 47))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Implementation owner previews and frozen header recovery",
+	tests = [
+		("private documentation receiver and child IDs", test_private_documented_bounded_receiver_and_two_methods_keep_child_ids),
+		("empty region layout recovery preserves sibling", test_empty_region_owns_dedent_and_preserves_sibling),
+		("grouped and function receivers", test_grouped_bounded_and_function_receivers_are_owner_types),
+		("punctuation and layout omissions", test_punctuation_and_layout_omissions_follow_frozen_order),
+		("single trait reference quirks", test_trait_name_is_one_reference_without_qualifier_or_arguments),
+		("unsupported missing-body children continue", test_unsupported_and_missing_body_children_continue_unfiltered),
+		("missing indent consumes siblings", test_missing_indent_consumes_unindented_method_siblings),
+		("dedent and eof owner span", test_dedent_span_and_eof_fallback_keep_receiver_endpoint),
+		("prefix purity and annotation rejection", test_purity_is_ignored_and_annotations_reject_at_prefix_boundary),
+		("earlier start and existing diagnostic", test_direct_earlier_start_and_existing_diagnostic_are_retained)
+	]
+}

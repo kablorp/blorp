@@ -1,0 +1,328 @@
+-- Complete foreign signatures; no bodies, expressions, or module assembly.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, consume_declared_name, finished_builtin_type
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_foreign_function_parser: ForeignFunctionParse(ParsedForeignFunction, RejectedForeignFunction), parse_foreign_function
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: ParameterBinding(NamedParameter, WildcardParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/foreign_blocks: ForeignFunction
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken, ReservedKeywordAsName, UnknownAnnotation)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, binder_local_index, written_type_local_index, name_use_local_index, dimension_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(ArrayType, QualifiedType, NamedType), TypeArgument(TypeArgumentType), DimensionKind(NamedDimension)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedTypeDiagnostic, ExpectedForeignCNameDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedName, ExpectedKeyword, ExpectedLeftParen, ExpectedArrow),
+		NameConstruct(NameInForeignFunctionName, NameInParameterName), KeywordConstruct(KeywordInForeignBlockItem),
+		LeftParenConstruct(LeftParenInForeignFunctionName), ArrowConstruct(ArrowInForeignFunctionReturnType)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(ImpureFunction, PureFunction), FunctionAnnotation(NoCopyAnnotation)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(EndOfFileToken, NewlineToken, LeftBracketSymbol, WhereKeyword, ColonSymbol, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken)
+	test: TestSuite
+
+
+private INTERPOLATION_OPENER: String = "$" + "{"
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func no_body_ids(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	counts.expressions == 0 and counts.blocks == 0 and counts.statements == 0 and counts.patterns == 0 and counts.type_binders == 0
+
+
+private pure func no_parent_definition(state: ParseState) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(witness_state):
+			(_, name) = witness_state.consume_declared_name(NameInForeignFunctionName)
+			match name:
+				Some(name):
+					(_, declaration) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					declaration.id.definition_local_index() == 0
+				None:
+					False
+		Err(_):
+			False
+
+
+private union ExpectedDiagnostic:
+	MissingArrow
+	MissingKeyword
+	MissingForeignName
+	MissingParameterName
+	MissingParameters
+	PlainCode(PlainSyntaxCode)
+	ReservedName(String)
+	UnknownAnnotationName(String)
+
+
+private pure func diagnostics_match(state: ParseState, expected: List[(ExpectedDiagnostic, Int, Int)]) -> Bool:
+	var correct: Bool = state.diagnostic_count() == expected.length()
+	for (actual, wanted) in state.diagnostics().zip(expected):
+		(code, first, last) = wanted
+		correct = correct and actual.span.covers(first, last)
+		match (actual.diagnostic, code):
+			(ExpectedToken(ExpectedArrow(ArrowInForeignFunctionReturnType)), MissingArrow) | (ExpectedToken(ExpectedKeyword(KeywordInForeignBlockItem)), MissingKeyword) | (ExpectedToken(ExpectedName(NameInForeignFunctionName)), MissingForeignName) | (ExpectedToken(ExpectedName(NameInParameterName)), MissingParameterName) | (ExpectedToken(ExpectedLeftParen(LeftParenInForeignFunctionName)), MissingParameters):
+				void
+			(Plain(found), PlainCode(wanted_code)):
+				correct = correct and found == wanted_code
+			(ReservedKeywordAsName(spelling), ReservedName(name)) | (UnknownAnnotation(spelling), UnknownAnnotationName(name)):
+				correct = correct and state.spellings().spelling_text(spelling) == Some(name)
+			_:
+				correct = False
+	correct
+
+
+private pure func rejected(text: String, expected: List[(ExpectedDiagnostic, Int, Int)], cursor: TokenKind, first: Int, last: Int, token_position: Int, types: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_foreign_function(state)
+			match result:
+				RejectedForeignFunction:
+					(parsed.current_kind() == cursor and parsed.current_span().covers(first, last) and parsed.position() == token_position
+						and diagnostics_match(parsed, expected) and parsed.issued_counts().written_types == types
+						and no_body_ids(parsed) and no_parent_definition(parsed))
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func simple_result(state: ParseState, c_name: Option[(String, Int, Int)], function_end: Int, cursor: TokenKind, first: Int, last: Int, token_position: Int) -> Bool:
+	(parsed, result) = parse_foreign_function(state)
+	match result:
+		ParsedForeignFunction(function):
+			var correct: Bool = (function.id.definition_local_index() == 0 and function.visibility == PublicVisibility and function.purity == ImpureFunction
+				and function.annotations.is_empty() and function.parameters.is_empty() and function.keyword.covers(0, 4) and function.name.span.covers(5, 6)
+				and function.return_type.span.covers(12, 15) and function.return_type.id.written_type_local_index() == 0 and function.span.covers(0, function_end)
+				and parsed.spellings().spelling_text(function.name.spelling) == Some("f")
+				and parsed.current_kind() == cursor and parsed.current_span().covers(first, last) and parsed.position() == token_position
+				and parsed.diagnostic_count() == 0 and parsed.issued_counts().written_types == 1 and parsed.issued_counts().name_uses == 1
+				and parsed.issued_counts().binders == 0 and parsed.issued_counts().dimensions == 0 and no_body_ids(parsed))
+			match (function.c_name, c_name):
+				(None, None):
+					void
+				(Some(actual), Some((content, start, end))):
+					correct = correct and actual.name == content and actual.span.covers(start, end)
+				_:
+					correct = False
+			correct
+		_:
+			False
+
+
+private pure func simple(text: String, c_name: Option[(String, Int, Int)], end: Int, cursor: TokenKind, first: Int, last: Int, token_position: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			simple_result(state, c_name, end, cursor, first, last, token_position)
+		Err(_):
+			False
+
+
+pure func test_plain_signature_completes_definition_without_body_ids() -> Bool:
+	simple("func f() -> Int", None, 15, EndOfFileToken, 15, 15, 6)
+
+
+pure func test_grouped_return_span_ends_at_inner_type_after_consuming_close() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "func f() -> (Int)")):
+		Ok(state):
+			(parsed, result) = parse_foreign_function(state)
+			match result:
+				ParsedForeignFunction(function):
+					-- Grouping adds no written type. The consumed ')' belongs to
+					-- cursor recovery, while the frozen function ends at Int.
+					(function.span.covers(0, 16) and function.return_type.span.covers(13, 16)
+						and function.id.definition_local_index() == 0 and function.return_type.id.written_type_local_index() == 0
+						and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(17, 17) and parsed.position() == 8
+						and parsed.issued_counts().written_types == 1 and parsed.issued_counts().name_uses == 1 and parsed.issued_counts().binders == 0
+						and parsed.diagnostic_count() == 0 and no_body_ids(parsed))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_arrow_still_consumes_authored_c_name() -> Bool:
+	(rejected("func f()", [(MissingArrow, 8, 8)], EndOfFileToken, 8, 8, 4, 0)
+		and rejected("func f() = \"f\"", [(MissingArrow, 9, 9)], EndOfFileToken, 14, 14, 6, 0))
+
+
+pure func test_invalid_c_name_consumes_one_invalid_token() -> Bool:
+	rejected("func f() -> Int = 3", [(PlainCode(ExpectedForeignCNameDiagnostic), 18, 18)], EndOfFileToken, 19, 19, 8, 1)
+
+
+pure func test_private_annotations_and_purity_attach_with_exact_spans() -> Bool:
+	text: String = "private @no_copy pure func raw(x: Int) -> Int = \"c_raw\""
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_foreign_function(state)
+			match result:
+				ParsedForeignFunction(function):
+					match (function.annotations, function.parameters, function.c_name):
+						([annotation], [parameter], Some(c_name)):
+							(function.id.definition_local_index() == 0 and function.visibility == PrivateVisibility and function.purity == PureFunction
+								and annotation.annotation == NoCopyAnnotation and annotation.span.covers(9, 16) and parameter.span.covers(31, 37)
+								and function.keyword.covers(22, 26) and function.name.span.covers(27, 30) and function.return_type.span.covers(42, 45)
+								and function.span.covers(0, 55) and c_name.name == "c_raw" and c_name.span.covers(48, 55)
+								and parsed.position() == 15 and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(55, 55)
+								and parsed.issued_counts().binders == 1 and parsed.issued_counts().written_types == 2 and parsed.issued_counts().name_uses == 2
+								and parsed.diagnostic_count() == 0 and no_body_ids(parsed))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_unknown_annotation_has_no_attachment_diagnostic() -> Bool:
+	rejected("@unknown pure func f() -> Int", [(UnknownAnnotationName("unknown"), 1, 8)], EndOfFileToken, 29, 29, 9, 1)
+
+
+pure func test_annotation_newline_is_left_for_downstream_expectations() -> Bool:
+	rejected("@no_copy\nfunc f() -> Int", [(MissingKeyword, 9, 9), (MissingForeignName, 9, 9), (MissingParameters, 9, 9), (MissingArrow, 9, 9)], NewlineToken, 9, 9, 2, 0)
+
+
+pure func test_invalid_names_and_parameters_recover_through_return_and_c_name() -> Bool:
+	(rejected("func 123() -> Int = \"f\"", [(MissingForeignName, 5, 5)], EndOfFileToken, 23, 23, 8, 1)
+		and rejected("func if() -> Int = \"f\"", [(ReservedName("if"), 5, 5)], EndOfFileToken, 22, 22, 8, 1)
+		and rejected("func f(123) -> Int = \"f\"", [(MissingParameterName, 7, 7)], EndOfFileToken, 24, 24, 9, 1))
+
+
+pure func test_malformed_return_type_recovery_still_consumes_c_name() -> Bool:
+	-- '+' reaches missing-type recovery in both frozen and tree type parsers;
+	-- it is consumed, leaving the authored '=' and C name for this leaf.
+	rejected("func f() -> + = \"f\"", [(PlainCode(ExpectedTypeDiagnostic), 12, 12)], EndOfFileToken, 19, 19, 8, 1)
+
+
+private pure func accepted_string_form(text: String, kind: TokenKind, end: Int, content: String) -> Bool:
+	lexed = lex_module(module_id_at_row(0), text)
+	match lexed.tokens.get(7):
+		Some(token):
+			token.kind == kind and simple(text, Some((content, 18, end)), end, EndOfFileToken, end, end, 8)
+		None:
+			False
+
+
+pure func test_source_reachable_plain_raw_and_raw_pipe_c_names() -> Bool:
+	(accepted_string_form("func f() -> Int = \"f\"", NormalStringToken, 21, "f")
+		and accepted_string_form("func f() -> Int = raw\"f\"", RawStringToken, 24, "f")
+		and accepted_string_form("func f() -> Int = raw\n\t| f", RawPipeStringToken, 26, " f"))
+
+
+pure func test_pipe_token_contract_preserves_checked_payload_and_source_fields() -> Bool:
+	-- A plain pipe literal needs a new source line, so it is unreachable directly
+	-- after this grammar's '='. This parser-unit oracle changes only token kind,
+	-- following the LexedModule record-update precedent in test_tree_parse_state.
+	lexed = lex_module(module_id_at_row(0), "func f() -> Int = \"f\"")
+	match lexed.tokens.get(7):
+		Some(token):
+			match new_parse_state({ lexed | tokens = lexed.tokens.set(7, { token | kind = PipeStringToken }) }):
+				Ok(state):
+					simple_result(state, Some(("f", 18, 21)), 21, EndOfFileToken, 21, 21, 8)
+				Err(_):
+					False
+		None:
+			False
+
+
+pure func test_real_pipe_layout_is_rejected_without_skipping_newline() -> Bool:
+	rejected("func f() -> Int =\n\t| f", [(PlainCode(ExpectedForeignCNameDiagnostic), 19, 19)], NewlineToken, 19, 19, 7, 1)
+
+
+pure func test_interpolated_character_and_documentation_c_names_are_rejected() -> Bool:
+	(rejected("func f() -> Int = \"" + INTERPOLATION_OPENER + "x}\"", [(PlainCode(ExpectedForeignCNameDiagnostic), 18, 18)], EndOfFileToken, 24, 24, 8, 1)
+		and rejected("func f() -> Int = 'f'", [(PlainCode(ExpectedForeignCNameDiagnostic), 18, 18)], EndOfFileToken, 21, 21, 8, 1)
+		and rejected("func f() -> Int = ---\nDocs\n---\n", [(PlainCode(ExpectedForeignCNameDiagnostic), 18, 18)], EndOfFileToken, 31, 31, 8, 1))
+
+
+pure func test_generic_constraints_and_body_colon_remain_for_block_owner() -> Bool:
+	(rejected("func f[T]() -> Int", [(MissingParameters, 6, 6), (MissingArrow, 6, 6)], LeftBracketSymbol, 6, 7, 2, 0)
+		and simple("func f() -> Int where", None, 15, WhereKeyword, 16, 21, 6)
+		and simple("func f() -> Int:", None, 15, ColonSymbol, 15, 16, 6))
+
+
+pure func test_rich_children_complete_before_function_definition() -> Bool:
+	text: String = "func rich(x: List[Int], _, _: Int) -> m.Buffer[Int][#N] = \"rich\""
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_foreign_function(state)
+			match result:
+				ParsedForeignFunction(function):
+					match (function.parameters, function.return_type.kind, function.c_name):
+						([first, wildcard, discard], ArrayType(base, dimensions), Some(c_name)):
+							match ((first.binding, wildcard.binding, discard.binding), (first.declared_type, discard.declared_type)):
+								((NamedParameter(first_binder), WildcardParameter(wildcard_span), NamedParameter(discard_binder)), (Some(list), Some(integer))):
+									match (list.kind, base.kind, dimensions.first.kind):
+										(NamedType(list_name, [TypeArgumentType(element)]), QualifiedType(owner, name, [TypeArgumentType(argument)]), NamedDimension(dimension_name)):
+											(function.id.definition_local_index() == 0 and first_binder.binder.binder_local_index() == 0 and discard_binder.binder.binder_local_index() == 1
+												and list_name.use.name_use_local_index() == 0 and owner.use.name_use_local_index() == 3 and name.use.name_use_local_index() == 4 and dimension_name.use.name_use_local_index() == 6
+												and element.id.written_type_local_index() == 0 and list.id.written_type_local_index() == 1 and integer.id.written_type_local_index() == 2
+												and argument.id.written_type_local_index() == 3 and base.id.written_type_local_index() == 4 and function.return_type.id.written_type_local_index() == 5
+												and dimensions.first.id.dimension_local_index() == 0 and dimensions.rest.is_empty()
+												and first.span.covers(10, 22) and wildcard_span.covers(24, 25) and discard.span.covers(27, 33) and function.return_type.span.covers(38, 55)
+												and c_name.name == "rich" and c_name.span.covers(58, 64) and function.span.covers(0, 64)
+												and parsed.issued_counts().written_types == 6 and parsed.issued_counts().name_uses == 7 and parsed.issued_counts().binders == 2 and parsed.issued_counts().dimensions == 1
+												and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(64, 64) and parsed.position() == 28 and parsed.diagnostic_count() == 0 and no_body_ids(parsed))
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_sequential_leaves_mint_definitions_in_order_without_metadata_leak() -> Bool:
+	text: String = "private @no_copy pure func f() -> Int\nfunc g() -> Int"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(after_first, first_result) = parse_foreign_function(state)
+			match first_result:
+				ParsedForeignFunction(first):
+					if after_first.current_kind() != NewlineToken:
+						False
+					else:
+						(parsed, second_result) = parse_foreign_function(after_first.advanced())
+						match second_result:
+							ParsedForeignFunction(second):
+								(first.id.definition_local_index() == 0 and second.id.definition_local_index() == 1 and first.visibility == PrivateVisibility and first.purity == PureFunction
+									and first.annotations.length() == 1 and first.span.covers(0, 37) and after_first.current_span().covers(38, 38) and after_first.position() == 10
+									and second.visibility == PublicVisibility and second.purity == ImpureFunction and second.annotations.is_empty() and second.c_name.is_none()
+									and second.keyword.covers(38, 42) and second.name.span.covers(43, 44) and second.span.covers(38, 53)
+									and second.return_type.id.written_type_local_index() == 1 and parsed.issued_counts().written_types == 2 and parsed.issued_counts().name_uses == 2
+									and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(53, 53) and parsed.position() == 17 and parsed.diagnostic_count() == 0 and no_body_ids(parsed))
+							_:
+								False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Direct complete foreign functions",
+	tests = [
+		("plain signature completes definition without body ids", test_plain_signature_completes_definition_without_body_ids),
+		("grouped return span ends at inner type after consuming close", test_grouped_return_span_ends_at_inner_type_after_consuming_close),
+		("missing arrow still consumes authored c name", test_missing_arrow_still_consumes_authored_c_name),
+		("invalid c name consumes one invalid token", test_invalid_c_name_consumes_one_invalid_token),
+		("private annotations and purity attach with exact spans", test_private_annotations_and_purity_attach_with_exact_spans),
+		("unknown annotation has no attachment diagnostic", test_unknown_annotation_has_no_attachment_diagnostic),
+		("annotation newline is left for downstream expectations", test_annotation_newline_is_left_for_downstream_expectations),
+		("invalid names and parameters recover through return and c name", test_invalid_names_and_parameters_recover_through_return_and_c_name),
+		("malformed return type recovery still consumes c name", test_malformed_return_type_recovery_still_consumes_c_name),
+		("source reachable plain raw and raw pipe c names", test_source_reachable_plain_raw_and_raw_pipe_c_names),
+		("pipe token contract preserves checked payload and source fields", test_pipe_token_contract_preserves_checked_payload_and_source_fields),
+		("real pipe layout is rejected without skipping newline", test_real_pipe_layout_is_rejected_without_skipping_newline),
+		("interpolated character and documentation c names are rejected", test_interpolated_character_and_documentation_c_names_are_rejected),
+		("generic constraints and body colon remain for block owner", test_generic_constraints_and_body_colon_remain_for_block_owner),
+		("rich children complete before function definition", test_rich_children_complete_before_function_definition),
+		("sequential leaves mint definitions in order without metadata leak", test_sequential_leaves_mint_definitions_in_order_without_metadata_leak)
+	]
+}

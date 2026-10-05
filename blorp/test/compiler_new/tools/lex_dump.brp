@@ -1,0 +1,107 @@
+-- Lexes every file named in a list with the discovery lexer, sharing one
+-- builder as discovery does, and prints each file's token dump; or, with
+-- `count`, prints only totals and the lexing phase's allocation counters.
+--
+-- Usage: lex_dump.brp <dump|count> <file listing one source path per line>
+--
+-- The corpus parity check diffs the `dump` output with the same rendering of
+-- the existing lexer's tokens.
+import:
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../src/compiler_new/stage_01_discovery/tables/builder:
+		DiscoveryBuilder,
+		empty_discovery_builder,
+		next_source_id,
+	../../../src/compiler_new/stage_01_discovery/tables/ids:
+		SourceId,
+		module_id_at_row,
+		source_id_index,
+	../support/token_dump: diagnostic_dump, token_dump
+	memory: MemStats, get_mem_stats, mem_delta
+	system: read_file
+
+
+---
+Positions of the tool's command-line arguments; position 0 is the program.
+---
+MODE_ARGUMENT: Int = 1
+
+LIST_ARGUMENT: Int = 2
+
+EXIT_USAGE: Int = 2
+
+
+pure func argument_or_empty(args: List[String], position: Int) -> String:
+	match args.get(position):
+		Some(argument):
+			argument
+		None:
+			""
+
+
+func read_paths(list_path: String) -> List[String]:
+	match read_file(list_path):
+		Ok(listing):
+			listing
+				.lines()
+				.filter(pure func(line): not line.is_empty())
+		Err(_):
+			[]
+
+
+func main(args: List[String]) -> Int:
+	mode: String = argument_or_empty(args, MODE_ARGUMENT)
+	paths: List[String] = read_paths(argument_or_empty(args, LIST_ARGUMENT))
+	dumping: Bool = mode == "dump"
+
+	if not dumping and mode != "count":
+		print("usage: lex_dump.brp <dump|count> <file list>")
+		EXIT_USAGE
+	else:
+		var builder: DiscoveryBuilder = empty_discovery_builder()
+		var token_total: Int = 0
+		var lexing_allocations: Int = 0
+		var files_with_diagnostics: Int = 0
+
+		for path in paths:
+			match read_file(path):
+				Ok(text):
+					source: SourceId = builder.next_source_id()
+					builder = builder.admit_source(path, text)
+					diagnostics_before: Int = builder.diagnostics.length()
+					before: MemStats = get_mem_stats()
+					builder = builder.bridge_lexed_module(
+						lex_module(
+							module_id_at_row(source.source_id_index()),
+							text,
+						),
+					)
+					after: MemStats = get_mem_stats()
+					file_allocations: Int = mem_delta(before, after).total_allocations
+					lexing_allocations += file_allocations
+
+					if not dumping:
+						print(
+							"${path} tokens=${builder.tokens.length()} allocations=${file_allocations}",
+						)
+
+					token_total += builder.tokens.length()
+					diagnostic_rows: Int = builder.diagnostics.length() - diagnostics_before
+
+					if diagnostic_rows > 0:
+						files_with_diagnostics += 1
+
+					if dumping:
+						print("== ${path}")
+						print(builder.token_dump())
+						print("diagnostics ${diagnostic_rows}")
+						print(builder.diagnostic_dump(diagnostics_before))
+				Err(message):
+					print("unreadable ${path}: ${message}")
+
+		print(
+			"files=${paths.length()} tokens=${token_total} names=${builder.name_spellings.length()} literals=${builder.literals.length()} files_with_diagnostics=${files_with_diagnostics} lexing_allocations=${lexing_allocations}",
+		)
+		0

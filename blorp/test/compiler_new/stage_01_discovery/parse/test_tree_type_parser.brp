@@ -1,0 +1,472 @@
+-- Direct typed syntax tests, independent of the builder/table parser.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, diagnostic_count, diagnostics, current_kind, current_span, position
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_type_parser: parse_type, parse_dimension
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: written_type_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/types:
+		WrittenTypeKind(NamedType, ArrayType, VoidType, FunctionType, RangeType, DimensionType),
+		TypeArgument(TypeArgumentType, DimensionArgument),
+		DimensionKind(NamedDimension, LiteralDimension, WildcardDimension)
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(ExpectedToken, Plain, IntegerLiteralOverflow)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedRightBracket, ExpectedName), RightBracketConstruct(RightBracketInTypeArguments, RightBracketInArrayDimensions), NameConstruct(NameInTypeName)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedTypeDiagnostic, ExpectedDimensionDiagnostic, ArrayDimensionsExpectedDiagnostic, BoundInTypeDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end,
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Purity(PureFunction)
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(ColonSymbol, IdentifierToken, LeftBracketSymbol, RightBracketSymbol, EndOfFileToken)
+	test: TestSuite
+
+
+pure func test_nested_types_complete_children_before_parent() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(3), "List[Int]")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			match written.kind:
+				NamedType(_, [TypeArgumentType(child)]):
+					(
+						written.id.written_type_local_index() == 1
+						and child.id.written_type_local_index() == 0
+						and parsed_state.diagnostic_count() == 0
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_dimension_arguments_make_an_array_type() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "Int[#N, #3]")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			match written.kind:
+				ArrayType(base, dimensions):
+					correct_dimensions: Bool = match (dimensions.first.kind, dimensions.rest.get(0)):
+						(NamedDimension(_), Some(second)):
+							match second.kind:
+								LiteralDimension(value):
+									value == to_int128(3)
+								_:
+									False
+						_:
+							False
+
+					(base.id.written_type_local_index() < written.id.written_type_local_index()
+						and correct_dimensions and parsed_state.diagnostic_count() == 0)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_void_and_pure_function_types_are_distinct() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "pure () -> ()")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			match written.kind:
+				FunctionType(PureFunction, [], result):
+					match result.kind:
+						VoidType:
+							parsed_state.diagnostic_count() == 0
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_parenthesized_dimension_keeps_the_frozen_arrow_rejection() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "List[(#N) -> Int]")):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics().get(0):
+				Some(at):
+					match at.diagnostic:
+						ExpectedToken(ExpectedRightBracket(RightBracketInTypeArguments)):
+							at.span.span_start() == 10 and at.span.span_end() == 10
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_range_accepts_a_parenthesized_dimension_expression() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "..(#N + 1)")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			match written.kind:
+				RangeType(_):
+					parsed_state.diagnostic_count() == 0
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_bare_soft_keyword_is_not_a_type() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "debug")):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics().get(0):
+				Some(at):
+					match at.diagnostic:
+						Plain(ExpectedTypeDiagnostic):
+							at.span.span_start() == 0 and at.span.span_end() == 0
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+private pure func qualified_special_name_is_rejected(text: String) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics().get(0):
+				Some(at):
+					match at.diagnostic:
+						ExpectedToken(ExpectedName(NameInTypeName)):
+							at.span.span_start() == 2 and at.span.span_end() == 2
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_qualified_special_type_names_are_rejected() -> Bool:
+	qualified_special_name_is_rejected("m.Self") and qualified_special_name_is_rejected("m.void")
+
+
+-- Exactly one more than the largest checked integer literal.
+private INTEGER_OVERFLOW_DIGITS: String = "170141183460469231731687303715884105728"
+
+
+private pure func rejected_dimension_argument_consumes_its_number(text: String, literal_start: Int, colon_position: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			correct_shape: Bool = match written.kind:
+				ArrayType(_, dimensions):
+					match dimensions.first.kind:
+						WildcardDimension:
+							dimensions.rest.is_empty()
+						_:
+							False
+				_:
+					False
+
+			match parsed_state.diagnostics():
+				[at]:
+					match at.diagnostic:
+						IntegerLiteralOverflow(digits):
+							(correct_shape and digits == INTEGER_OVERFLOW_DIGITS
+								and at.span.span_start() == literal_start
+								and at.span.span_end() == literal_start + INTEGER_OVERFLOW_DIGITS.length()
+								and parsed_state.position() == colon_position
+								and parsed_state.current_kind() == ColonSymbol
+								and parsed_state.current_span().span_start() == text.length() - 1
+								and parsed_state.current_span().span_end() == text.length())
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_rejected_integer_type_argument_keeps_only_lexical_overflow() -> Bool:
+	rejected_dimension_argument_consumes_its_number("List[" + INTEGER_OVERFLOW_DIGITS + "]:", 5, 4)
+
+
+pure func test_hash_rejected_integer_dimension_consumes_its_number() -> Bool:
+	rejected_dimension_argument_consumes_its_number("List[#" + INTEGER_OVERFLOW_DIGITS + "]:", 6, 5)
+
+
+pure func test_parenthesized_rejected_integer_dimension_consumes_its_number() -> Bool:
+	rejected_dimension_argument_consumes_its_number("List[(" + INTEGER_OVERFLOW_DIGITS + ")]:", 6, 6)
+
+
+pure func test_missing_bracket_reports_the_expected_token_at_empty_span() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "List[Int")):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics().get(0):
+				Some(at):
+					match at.diagnostic:
+						ExpectedToken(ExpectedRightBracket(RightBracketInTypeArguments)):
+							at.span.span_start() == 8 and at.span.span_end() == 8
+						_:
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_ordinary_type_leaves_the_body_colon_for_its_caller() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "Int:")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			match written.kind:
+				NamedType(_, []):
+					parsed_state.diagnostic_count() == 0 and parsed_state.current_kind() == ColonSymbol
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func dimension_error_keeps_current_name(text: String, offset: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, _) = parse_dimension(state)
+
+			match parsed_state.diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(ExpectedDimensionDiagnostic):
+							(at.span.span_start() == offset and at.span.span_end() == offset
+								and parsed_state.current_kind() == IdentifierToken
+								and parsed_state.current_span().span_start() == offset)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_spaced_dimension_sigil_preserves_the_name_at_empty_span() -> Bool:
+	dimension_error_keeps_current_name("# N", 2)
+
+
+pure func test_bare_name_is_not_a_dimension_and_stays_current() -> Bool:
+	dimension_error_keeps_current_name("x", 0)
+
+
+pure func test_array_suffix_rejects_types_once_at_the_last_argument_span() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(Int)[String,Bool]")):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(ArrayDimensionsExpectedDiagnostic):
+							(at.span.span_start() == 13 and at.span.span_end() == 17
+								and parsed_state.current_kind() == EndOfFileToken
+								and parsed_state.current_span().span_start() == 18)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func atom_keeps_array_suffix(text: String) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+			parsed_state.diagnostic_count() == 0 and parsed_state.current_kind() == LeftBracketSymbol
+		Err(_):
+			False
+
+
+pure func test_dimension_atom_leaves_array_suffix_for_the_caller() -> Bool:
+	atom_keeps_array_suffix("#N[#M]")
+
+
+pure func test_range_atom_leaves_array_suffix_for_the_caller() -> Bool:
+	atom_keeps_array_suffix("..#N[#M]")
+
+
+pure func test_function_dimension_return_leaves_array_suffix_for_the_caller() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(Int) -> #N[#M]")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			match written.kind:
+				FunctionType(_, [TypeArgumentType(parameter)], result):
+					match (parameter.kind, result.kind):
+						(NamedType(_, []), DimensionType(dimension)):
+							match dimension.kind:
+								NamedDimension(_):
+									parsed_state.diagnostic_count() == 0 and parsed_state.current_kind() == LeftBracketSymbol
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_generic_close_recovers_function_return_suffix_on_the_outer_type() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "List[(Int) -> #N[#M]]")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			correct_shape: Bool = match written.kind:
+				ArrayType(base, dimensions):
+					match (base.kind, dimensions.first.kind):
+						(NamedType(_, [TypeArgumentType(argument)]), NamedDimension(_)):
+							match argument.kind:
+								FunctionType(_, [_], result):
+									match result.kind:
+										DimensionType(_):
+											dimensions.rest.is_empty()
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+			match parsed_state.diagnostics():
+				[at]:
+					match at.diagnostic:
+						ExpectedToken(ExpectedRightBracket(RightBracketInTypeArguments)):
+							(correct_shape and at.span.span_start() == 16 and at.span.span_end() == 16
+								and parsed_state.current_kind() == RightBracketSymbol
+								and parsed_state.current_span().span_start() == 20)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_array_close_preserves_the_nested_argument_span_and_colon() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(Int)[List[String]:")):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics():
+				[first, second]:
+					match (first.diagnostic, second.diagnostic):
+						(ExpectedToken(ExpectedRightBracket(RightBracketInArrayDimensions)), Plain(ArrayDimensionsExpectedDiagnostic)):
+							(first.span.span_start() == 18 and first.span.span_end() == 18
+								and second.span.span_start() == 6 and second.span.span_end() == 18
+								and parsed_state.current_kind() == ColonSymbol
+								and parsed_state.current_span().span_start() == 18)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_inner_generic_close_preserves_the_last_argument_span() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(Int)[List[String:")):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics():
+				[bound, generic_close, array_close, dimensions]:
+					match (bound.diagnostic, generic_close.diagnostic, array_close.diagnostic, dimensions.diagnostic):
+						(Plain(BoundInTypeDiagnostic), ExpectedToken(ExpectedRightBracket(RightBracketInTypeArguments)), ExpectedToken(ExpectedRightBracket(RightBracketInArrayDimensions)), Plain(ArrayDimensionsExpectedDiagnostic)):
+							(bound.span.span_start() == 11 and bound.span.span_end() == 17
+								and generic_close.span.span_start() == 18 and generic_close.span.span_end() == 18
+								and array_close.span.span_start() == 18 and array_close.span.span_end() == 18
+								and dimensions.span.span_start() == 6 and dimensions.span.span_end() == 17
+								and parsed_state.position() == 8
+								and parsed_state.current_kind() == EndOfFileToken
+								and parsed_state.current_span().span_start() == 18
+								and parsed_state.current_span().span_end() == 18)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_empty_array_suffix_requires_an_argument_and_pins_both_diagnostics() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(Int)[]")):
+		Ok(state):
+			(parsed_state, _) = parse_type(state)
+
+			match parsed_state.diagnostics():
+				[first, second]:
+					match (first.diagnostic, second.diagnostic):
+						(Plain(ExpectedTypeDiagnostic), Plain(ArrayDimensionsExpectedDiagnostic)):
+							(first.span.span_start() == 6 and first.span.span_end() == 6
+								and second.span.span_start() == 6 and second.span.span_end() == 7
+								and parsed_state.current_kind() == EndOfFileToken)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_parenthesized_type_supports_a_dimension_array_suffix() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(Int)[#N]")):
+		Ok(state):
+			(parsed_state, written) = parse_type(state)
+
+			match written.kind:
+				ArrayType(base, dimensions):
+					match (base.kind, dimensions.first.kind):
+						(NamedType(_, []), NamedDimension(_)):
+							parsed_state.diagnostic_count() == 0 and parsed_state.current_kind() == EndOfFileToken
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Direct tree type parser",
+	tests = [
+		("rejected integer type argument keeps only lexical overflow", test_rejected_integer_type_argument_keeps_only_lexical_overflow),
+		("hash rejected integer dimension consumes its number", test_hash_rejected_integer_dimension_consumes_its_number),
+		("parenthesized rejected integer dimension consumes its number", test_parenthesized_rejected_integer_dimension_consumes_its_number),
+		("missing inner generic close preserves last argument span", test_missing_inner_generic_close_preserves_the_last_argument_span),
+		("parenthesized type supports dimension array suffix", test_parenthesized_type_supports_a_dimension_array_suffix),
+		("empty array suffix requires argument and pins both diagnostics", test_empty_array_suffix_requires_an_argument_and_pins_both_diagnostics),
+		("spaced dimension sigil preserves name at empty span", test_spaced_dimension_sigil_preserves_the_name_at_empty_span),
+		("bare name is not a dimension and stays current", test_bare_name_is_not_a_dimension_and_stays_current),
+		("array suffix rejects types once at last argument span", test_array_suffix_rejects_types_once_at_the_last_argument_span),
+		("dimension atom leaves array suffix for caller", test_dimension_atom_leaves_array_suffix_for_the_caller),
+		("range atom leaves array suffix for caller", test_range_atom_leaves_array_suffix_for_the_caller),
+		("function dimension return leaves array suffix for caller", test_function_dimension_return_leaves_array_suffix_for_the_caller),
+		("missing generic close recovers function return suffix on outer type", test_missing_generic_close_recovers_function_return_suffix_on_the_outer_type),
+		("missing array close preserves nested argument span and colon", test_missing_array_close_preserves_the_nested_argument_span_and_colon),
+		("ordinary type leaves the body colon for its caller", test_ordinary_type_leaves_the_body_colon_for_its_caller),
+		("nested types complete children before parent", test_nested_types_complete_children_before_parent),
+		("dimension arguments make an array type", test_dimension_arguments_make_an_array_type),
+		("void and pure function types are distinct", test_void_and_pure_function_types_are_distinct),
+		("parenthesized dimension keeps frozen arrow rejection", test_parenthesized_dimension_keeps_the_frozen_arrow_rejection),
+		("range accepts parenthesized dimension expression", test_range_accepts_a_parenthesized_dimension_expression),
+		("bare soft keyword is not a type", test_bare_soft_keyword_is_not_a_type),
+		("qualified special type names are rejected", test_qualified_special_type_names_are_rejected),
+		("missing bracket reports expected token at empty span", test_missing_bracket_reports_the_expected_token_at_empty_span)
+	]
+}

@@ -1,0 +1,195 @@
+-- Caller-owned declaration metadata, composed with the top-level function leaf.
+import:
+	../lex/lexed_module: LiteralValue(TextValue)
+	../syntax/declarations: Annotation
+	../syntax/module_syntax: Documentation
+	../syntax/diagnostics: SyntaxDiagnostic(Plain, UnknownAnnotation)
+	../syntax/spellings: spelling_text
+	../tables/diagnostic_code: PlainSyntaxCode(AnnotationArgumentsDiagnostic, AnnotationWithoutFunctionDiagnostic, DocstringBeforeImportBlockDiagnostic)
+	../tables/expected_token: NameConstruct(NameInAnnotationName)
+	../tables/row_kinds:
+		Visibility(PublicVisibility, PrivateVisibility), Purity(ImpureFunction, PureFunction),
+		FunctionAnnotation(TailRecursiveAnnotation, NoCopyAnnotation, DebugOnlyAnnotation, ResourceResultOrdinaryAnnotation)
+	../tables/span: Span
+	../tables/token: TokenKind(DocStringToken, AtSymbol, PureKeyword, PrivateKeyword, FuncKeyword, ImportKeyword, LeftParenSymbol, RightParenSymbol, NewlineToken, EndOfFileToken)
+	parse_state:
+		ParseState, NameRole(OrdinaryName), name_allowed, current_kind, current_span, current_literal, advanced,
+		consume_referenced_name, spellings, diagnostic_count, report_at_current, report_diagnostic
+	tree_function_header_parser:
+		FunctionHeaderPreview, FunctionHeaderParse(ParsedFunctionHeader, RejectedFunctionHeader), parse_function_header
+
+
+record DeclarationPrefix {
+	start: Span,
+	visibility: Visibility,
+	purity: Purity,
+	documentation: Option[Documentation],
+	annotations: List[Annotation]
+}
+
+
+union PrefixedFunctionParse:
+	ParsedPrefixedFunction(FunctionHeaderPreview)
+	RejectedPrefixedFunction
+	DeferredPrefixedDeclaration(DeclarationPrefix)
+
+
+private enum AfterAnnotation:
+	SkipNewlines
+	LeaveNewlines
+
+
+-- Annotation spellings are grammar names, independent of lexer table IDs.
+private TAIL_RECURSIVE_ANNOTATION_NAME: String = "tail_recursive"
+private NO_COPY_ANNOTATION_NAME: String = "no_copy"
+private DEBUG_ONLY_ANNOTATION_NAME: String = "debug_only"
+private RESOURCE_RESULT_ORDINARY_ANNOTATION_NAME: String = "resource_result_ordinary"
+
+
+pure func parse_declaration_prefix(state: ParseState) -> (ParseState, DeclarationPrefix):
+	var start: Span = state.current_span()
+	var out: ParseState = state
+	var documentation: Option[Documentation] = None
+
+	if out.current_kind() == DocStringToken:
+		documentation = match out.current_literal():
+			Some(TextValue(text)):
+				Some({ text = text, span = out.current_span() })
+			_:
+				None
+		out = skip_newlines(out.advanced())
+
+	annotation_start: Span = out.current_span()
+	(after_annotations, annotations) = consume_annotations(out, SkipNewlines)
+	out = after_annotations
+
+	if not annotations.is_empty() and documentation.is_none():
+		start = annotation_start
+
+	var purity: Purity = ImpureFunction
+
+	if out.current_kind() == PureKeyword:
+		purity = PureFunction
+
+		if documentation.is_none() and annotations.is_empty():
+			start = out.current_span()
+
+		out = out.advanced()
+
+	if not annotations.is_empty() and out.current_kind() != FuncKeyword:
+		out = out.report_at_current(AnnotationWithoutFunctionDiagnostic)
+
+	match documentation:
+		Some(doc):
+			if out.current_kind() == ImportKeyword:
+				out = out.report_diagnostic(doc.span, Plain(DocstringBeforeImportBlockDiagnostic))
+		None:
+			()
+
+	var visibility: Visibility = PublicVisibility
+	var all_annotations: List[Annotation] = annotations
+
+	if out.current_kind() == PrivateKeyword:
+		visibility = PrivateVisibility
+		(after_private_annotations, added) = consume_annotations(out.advanced(), LeaveNewlines)
+		out = after_private_annotations
+		all_annotations = all_annotations.concat(added)
+
+		if out.current_kind() == PureKeyword:
+			purity = PureFunction
+			out = out.advanced()
+
+		if not added.is_empty() and out.current_kind() != FuncKeyword:
+			out = out.report_at_current(AnnotationWithoutFunctionDiagnostic)
+
+	(out, { start = start, visibility = visibility, purity = purity, documentation = documentation, annotations = all_annotations })
+
+
+pure func parse_prefixed_function_header(state: ParseState) -> (ParseState, PrefixedFunctionParse):
+	before: Int = state.diagnostic_count()
+	(after_prefix, prefix) = parse_declaration_prefix(state)
+
+	if after_prefix.current_kind() != FuncKeyword:
+		(after_prefix, DeferredPrefixedDeclaration(prefix))
+	else:
+		(parsed, result) = parse_function_header(after_prefix, prefix.visibility, prefix.documentation, prefix.annotations, prefix.purity, prefix.start)
+
+		if parsed.diagnostic_count() != before:
+			(parsed, RejectedPrefixedFunction)
+		else:
+			match result:
+				ParsedFunctionHeader(preview):
+					(parsed, ParsedPrefixedFunction(preview))
+				RejectedFunctionHeader:
+					(parsed, RejectedPrefixedFunction)
+
+
+-- Foreign signatures permit inline annotations but leave newlines to their
+-- owning grammar. Attachment checks belong to the declaration caller.
+pure func parse_inline_annotations(state: ParseState) -> (ParseState, List[Annotation]):
+	consume_annotations(state, LeaveNewlines)
+
+
+-- Implementation methods permit newlines between annotations and the header.
+-- The method caller owns attachment and diagnostic acceptance.
+pure func parse_annotations_skipping_newlines(state: ParseState) -> (ParseState, List[Annotation]):
+	consume_annotations(state, SkipNewlines)
+
+
+private pure func consume_annotations(state: ParseState, after: AfterAnnotation) -> (ParseState, List[Annotation]):
+	var out: ParseState = state
+	var annotations: List[Annotation] = []
+
+	while out.current_kind() == AtSymbol:
+		out = out.advanced()
+		written_name: Bool = name_allowed(out.current_kind(), OrdinaryName)
+		(after_name, name) = out.consume_referenced_name(NameInAnnotationName)
+		out = after_name
+
+		-- A recovery name is never recognized or reported as an unknown name.
+		if written_name:
+			match out.spellings().spelling_text(name.spelling):
+				Some(text):
+					match annotation_named(text):
+						Some(annotation):
+							annotations = annotations.append({ annotation = annotation, span = name.span })
+						None:
+							out = out.report_diagnostic(name.span, UnknownAnnotation(name.spelling))
+				None:
+					()
+
+		if out.current_kind() == LeftParenSymbol:
+			out = out.report_at_current(AnnotationArgumentsDiagnostic).advanced()
+
+			while out.current_kind() != RightParenSymbol and out.current_kind() != NewlineToken and out.current_kind() != EndOfFileToken:
+				out = out.advanced()
+
+			if out.current_kind() == RightParenSymbol:
+				out = out.advanced()
+
+		if after == SkipNewlines:
+			out = skip_newlines(out)
+
+	(out, annotations)
+
+
+private pure func annotation_named(text: String) -> Option[FunctionAnnotation]:
+	if text == TAIL_RECURSIVE_ANNOTATION_NAME:
+		Some(TailRecursiveAnnotation)
+	else if text == NO_COPY_ANNOTATION_NAME:
+		Some(NoCopyAnnotation)
+	else if text == DEBUG_ONLY_ANNOTATION_NAME:
+		Some(DebugOnlyAnnotation)
+	else if text == RESOURCE_RESULT_ORDINARY_ANNOTATION_NAME:
+		Some(ResourceResultOrdinaryAnnotation)
+	else:
+		None
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+
+	out

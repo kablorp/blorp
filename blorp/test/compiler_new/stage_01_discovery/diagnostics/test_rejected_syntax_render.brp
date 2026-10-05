@@ -1,0 +1,420 @@
+-- Rejection must preserve every definition and spelling a diagnostic refers to.
+import:
+	../../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render:
+		RejectedRenderError(
+			CrossModuleDefinition, MissingDefinition, WrongDefinitionKind, ForwardFieldReference,
+		),
+		render_rejected_duplicate_field,
+		render_rejected_diagnostics,
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/alias_preview:
+		AliasPreviewOutcome(RejectedAliasPreview),
+		preview_alias,
+	../../../../src/compiler_new/stage_01_discovery/parse/builtin_type_preview:
+		BuiltinTypePreviewOutcome(RejectedBuiltinTypePreview),
+		preview_builtin_type,
+	../../../../src/compiler_new/stage_01_discovery/parse/enum_preview:
+		EnumPreviewOutcome(RejectedEnumPreview),
+		preview_enum,
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		ParseInputError(EmptyRejection, InvalidLineStarts),
+		advanced,
+		current_span,
+		new_parse_state,
+		consume_declared_name,
+		report_diagnostic,
+	../../../../src/compiler_new/stage_01_discovery/parse/record_preview:
+		RecordPreviewOutcome(RejectedRecordPreview),
+		preview_record,
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview:
+		RejectedPreview,
+		reject_preview,
+		rejected_definitions,
+		rejected_diagnostics,
+		rejected_spellings,
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_record_parser:
+		RecordParse(ParsedRecord),
+		parse_record,
+	../../../../src/compiler_new/stage_01_discovery/parse/union_preview:
+		UnionPreviewOutcome(RejectedUnionPreview),
+		preview_union,
+	../../../../src/compiler_new/stage_01_discovery/syntax/definitions:
+		Definition(FieldDefinition, RecordDefinition),
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics:
+		SyntaxDiagnostic(DuplicateField, ReservedKeywordAsName, Plain, ExpectedToken, UnknownEscape, IntegerLiteralOverflow, FloatLiteralOverflow, UnexpectedByte, UnknownAnnotation, ConcurrentDuplicateParameter, ConcurrentUnknownParameter, ConcurrentForUnknownParameter, DuplicateFieldGiven),
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: DefinitionId, definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: ModuleId, module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: NameConstruct(NameInFieldName), ExpectedTokenDiagnostic(ExpectedName)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedTypeDiagnostic)
+	test: TestSuite
+
+
+-- Every payload family passes through the retained context. Definitions have
+-- separate real-parser and malformed-reference regressions below.
+pure func test_complete_renderer_covers_every_payload_family() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(2), "item tail")):
+		Ok(entry):
+			(after_name, name) = entry.consume_declared_name(NameInFieldName)
+			match name:
+				Some(written):
+					cases: List[SyntaxDiagnostic] = [
+						Plain(ExpectedTypeDiagnostic), ExpectedToken(ExpectedName(NameInFieldName)),
+						UnknownEscape('q'), IntegerLiteralOverflow("999"), FloatLiteralOverflow("1e999"), UnexpectedByte('x'),
+						ReservedKeywordAsName(written.spelling), UnknownAnnotation(written.spelling),
+						ConcurrentDuplicateParameter(written.spelling), ConcurrentUnknownParameter(written.spelling),
+						ConcurrentForUnknownParameter(written.spelling), DuplicateFieldGiven(written.span)
+					]
+					var state = after_name
+					for diagnostic in cases:
+						state = state.report_diagnostic(after_name.current_span(), diagnostic)
+					match reject_preview(state):
+						Ok(rejected):
+							match render_rejected_diagnostics(rejected):
+								Ok(rows):
+									var correct: Bool = rows.length() == 12
+									for row in rows:
+										correct = correct and not row.rendered.message.is_empty() and row.rendered.help.is_some() and row.line == 1 and row.column == 6
+									correct
+								Err(_):
+									False
+						Err(_):
+							False
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_complete_renderer_keeps_all_diagnostics_and_positions() -> Bool:
+	match preview_record(lex_module(module_id_at_row(3), "record Box {\n\tif: Int,\n\tvalue Int,\n\tvalue: Int\n}")):
+		Ok(RejectedRecordPreview(rejected)):
+			match render_rejected_diagnostics(rejected):
+				Ok([keyword, missing_colon, duplicate]):
+					(keyword.rendered.message == "`if` is a reserved keyword and cannot be used as a name"
+						and keyword.rendered.help == Some("choose another identifier such as `if_name`")
+						and keyword.line == 2 and keyword.column == 5
+						and missing_colon.rendered.message == "expected `:` after field name"
+						and missing_colon.line == 3
+						and duplicate.rendered.message == "duplicate field `value`"
+						and duplicate.line == 4 and duplicate.column == 5)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_rejected_record_keeps_earlier_field_for_rendering() -> Bool:
+	match preview_record(
+		lex_module(
+			module_id_at_row(3),
+			"record Box {\n\tother: Int,\n\tvalue: Int,\n\tvalue: Int\n}",
+		),
+	):
+		Ok(RejectedRecordPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[diagnostic]:
+					match render_rejected_duplicate_field(rejected, diagnostic):
+						Ok(rendered):
+							(
+								rendered.message == "duplicate field `value`"
+								and rendered.help == Some(
+									"the field was already declared at 3:5; remove one or give it another name",
+								)
+							)
+						Err(_):
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_rejected_ordinary_record_keeps_earlier_field_for_rendering() -> Bool:
+	match preview_record(
+		lex_module(
+			module_id_at_row(4),
+			"record Pair { item: Int, item: Int }",
+		),
+	):
+		Ok(RejectedRecordPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[diagnostic]:
+					match render_rejected_duplicate_field(rejected, diagnostic):
+						Ok(rendered):
+							(
+								rendered.message == "duplicate field `item`"
+								and rendered.help == Some(
+									"the field was already declared at 1:15; remove one or give it another name",
+								)
+							)
+						Err(_):
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_rejected_fixed_record_keeps_earlier_field_for_rendering() -> Bool:
+	match preview_record(
+		lex_module(
+			module_id_at_row(4),
+			"fixed record Pair { item: Int, item: Int }",
+		),
+	):
+		Ok(RejectedRecordPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[diagnostic]:
+					match render_rejected_duplicate_field(rejected, diagnostic):
+						Ok(rendered):
+							(
+								rendered.message == "duplicate field `item`"
+								and rendered.help == Some(
+									"the field was already declared at 1:21; remove one or give it another name",
+								)
+							)
+						Err(_):
+							False
+				_:
+					False
+		_:
+			False
+
+
+-- Accepted leaf parses let tests mint real ids of each kind and module;
+-- malformed ids are never built from magic integer encodings.
+private pure func record_id(module: ModuleId, text: String) -> Option[DefinitionId]:
+	match new_parse_state(lex_module(module, text)):
+		Ok(state):
+			match parse_record(state.advanced(), PublicVisibility, None, state.current_span()):
+				(_, ParsedRecord(declaration)):
+					Some(declaration.id)
+				_:
+					None
+		_:
+			None
+
+
+private pure func rejects_reference(
+	rejected: RejectedPreview,
+	span: Span,
+	id: DefinitionId,
+	expected: RejectedRenderError,
+) -> Bool:
+	match (
+		render_rejected_duplicate_field(
+			rejected,
+			{
+				span = span,
+				diagnostic = DuplicateField(id)
+			},
+		)
+	):
+		Err(error):
+			error == expected
+		Ok(_):
+			False
+
+
+pure func test_definition_lookup_rejects_missing_cross_module_and_forward_references() -> Bool:
+	match preview_record(
+		lex_module(
+			module_id_at_row(3),
+			"record Box { first: Int, value: Int, value: Int }",
+		),
+	):
+		Ok(RejectedRecordPreview(rejected)):
+			match (
+				rejected.rejected_diagnostics(),
+				rejected.rejected_definitions(),
+				record_id(module_id_at_row(3), "record Box { a: Int, b: Int, c: Int, d: Int }"),
+				record_id(module_id_at_row(4), "record Empty {}"),
+			):
+				([diagnostic], [FieldDefinition(_), FieldDefinition(earlier), FieldDefinition(later)], Some(missing), Some(other_module)):
+					(
+						earlier.id.definition_local_index() == 1
+						and rejected.rejects_reference(diagnostic.span, missing, MissingDefinition)
+						and rejected.rejects_reference(
+							diagnostic.span,
+							other_module,
+							CrossModuleDefinition,
+						)
+						and rejected.rejects_reference(
+							diagnostic.span,
+							later.id,
+							ForwardFieldReference,
+						)
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_definition_lookup_rejects_wrong_kind() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(3), "record Box { a: Int }")):
+		Ok(state):
+			match parse_record(state.advanced(), PublicVisibility, None, state.current_span()):
+				(parsed, ParsedRecord(declaration)):
+					match reject_preview(
+						parsed.report_diagnostic(
+							declaration.name.span,
+							DuplicateField(declaration.id),
+						),
+					):
+						Ok(rejected):
+							rejected.rejects_reference(
+								declaration.name.span,
+								declaration.id,
+								WrongDefinitionKind,
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_rejection_requires_a_diagnostic() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(3), "record Box {}")):
+		Ok(state):
+			match reject_preview(state):
+				Err(EmptyRejection):
+					True
+				_:
+					False
+		_:
+			False
+
+
+private pure func reserved_spelling_is_retained(rejected: RejectedPreview) -> Bool:
+	match rejected.rejected_diagnostics():
+		[diagnostic]:
+			match diagnostic.diagnostic:
+				ReservedKeywordAsName(spelling):
+					rejected
+						.rejected_spellings()
+						.spelling_text(spelling) == Some("if")
+				_:
+					False
+		_:
+			False
+
+
+pure func test_every_preview_rejection_keeps_spelling_lookup() -> Bool:
+	alias_retained: Bool = match preview_alias(
+		lex_module(
+			module_id_at_row(3),
+			"type alias if = Int",
+		),
+	):
+		Ok(RejectedAliasPreview(rejected)):
+			rejected.reserved_spelling_is_retained()
+		_:
+			False
+
+	builtin_retained: Bool = match preview_builtin_type(
+		lex_module(
+			module_id_at_row(3),
+			"type if = builtin",
+		),
+	):
+		Ok(RejectedBuiltinTypePreview(rejected)):
+			rejected.reserved_spelling_is_retained()
+		_:
+			False
+
+	enum_retained: Bool = match preview_enum(lex_module(module_id_at_row(3), "enum if:\n\tA\n")):
+		Ok(RejectedEnumPreview(rejected)):
+			rejected.reserved_spelling_is_retained()
+		_:
+			False
+
+	union_retained: Bool = match preview_union(lex_module(module_id_at_row(3), "union if:\n\tA\n")):
+		Ok(RejectedUnionPreview(rejected)):
+			rejected.reserved_spelling_is_retained()
+		_:
+			False
+
+	record_retained: Bool = match preview_record(lex_module(module_id_at_row(3), "record if {}")):
+		Ok(RejectedRecordPreview(rejected)):
+			rejected.reserved_spelling_is_retained()
+		_:
+			False
+
+	fixed_record_retained: Bool = match preview_record(
+		lex_module(
+			module_id_at_row(3),
+			"fixed record if {}",
+		),
+	):
+		Ok(RejectedRecordPreview(rejected)):
+			rejected.reserved_spelling_is_retained()
+		_:
+			False
+
+	(
+		alias_retained
+		and builtin_retained
+		and enum_retained
+		and union_retained
+		and record_retained
+		and fixed_record_retained
+	)
+
+
+pure func test_parser_rejects_inexact_line_starts() -> Bool:
+	lexed = lex_module(module_id_at_row(3), "record Box {\n\ta: Int,\n\ta: Int\n}")
+	var rejected: Bool = True
+	invalid_starts: List[List[Int]] = [
+		[],
+		[0, 1],
+		[0],
+		[0, 13, 13],
+		[0, 13, 22, 1000],
+	]
+
+	for starts in invalid_starts:
+		match new_parse_state({ lexed | line_starts = starts }):
+			Err(InvalidLineStarts):
+				void
+			_:
+				rejected = False
+
+	rejected
+
+
+tests: TestSuite = {
+	description = "rejected syntax rendering",
+	tests = [
+		("complete renderer covers every payload family", test_complete_renderer_covers_every_payload_family),
+		("complete renderer keeps every diagnostic and position", test_complete_renderer_keeps_all_diagnostics_and_positions),
+		(
+			"rejected record keeps earlier field for rendering",
+			test_rejected_record_keeps_earlier_field_for_rendering,
+		),
+		(
+			"rejected ordinary record keeps earlier field for rendering",
+			test_rejected_ordinary_record_keeps_earlier_field_for_rendering,
+		),
+		(
+			"rejected fixed record keeps earlier field for rendering",
+			test_rejected_fixed_record_keeps_earlier_field_for_rendering,
+		),
+		(
+			"definition lookup rejects missing cross-module and forward references",
+			test_definition_lookup_rejects_missing_cross_module_and_forward_references,
+		),
+		("definition lookup rejects wrong kind", test_definition_lookup_rejects_wrong_kind),
+		("rejection requires a diagnostic", test_rejection_requires_a_diagnostic),
+		(
+			"every preview rejection keeps spelling lookup",
+			test_every_preview_rejection_keeps_spelling_lookup,
+		),
+		("parser rejects inexact line starts", test_parser_rejects_inexact_line_starts),
+	]
+}

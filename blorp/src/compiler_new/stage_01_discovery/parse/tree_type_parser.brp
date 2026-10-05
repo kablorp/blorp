@@ -1,0 +1,537 @@
+-- Direct written types and dimensions, with explicit receiver bound context. No builder rows or accepted
+-- module are produced here. A recovery node is constructed only after a
+-- diagnostic, and can survive only inside a rejected declaration preview.
+import:
+	../lex/lexed_module: LiteralValue(IntegerValue)
+	../syntax/names: NameUse
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../syntax/declarations: TraitReference
+	../syntax/sequences: AtLeastOne, SmallTuple(Pair, Triple, Quadruple)
+	../syntax/types:
+		WrittenType, WrittenTypeKind(NamedType, QualifiedType, BoundedType, VoidType, TupleType, FunctionType, ArrayType, RangeType, DimensionType),
+		TypeArgument(TypeArgumentType, DimensionArgument, BoundedArgument),
+		Dimension, DimensionKind(NamedDimension, VariadicNamedDimension, WildcardDimension, VariadicWildcardDimension, LiteralDimension, DimensionArithmetic),
+		DimensionOperator(AddDimensions, SubtractDimensions, MultiplyDimensions, DivideDimensions),
+	../tables/diagnostic_code:
+		PlainSyntaxCode(ExpectedTypeDiagnostic, ExpectedDimensionDiagnostic, ExpectedHashDiagnostic, TupleArityDiagnostic, ArrayDimensionsExpectedDiagnostic, BoundInTypeDiagnostic),
+	../tables/expected_token:
+		NameConstruct(NameInTypeName),
+		ExpectedTokenDiagnostic(ExpectedRightBracket, ExpectedRightParen, ExpectedLeftParen, ExpectedArrow),
+		RightBracketConstruct(RightBracketInTypeArguments, RightBracketInArrayDimensions),
+		RightParenConstruct(RightParenInGroupedType, RightParenInFunctionTypeParameters, RightParenInDimensionExpression),
+		LeftParenConstruct(LeftParenInPureFunctionType),
+		ArrowConstruct(ArrowInFunctionTypeParameters),
+	../tables/row_kinds: Purity(ImpureFunction, PureFunction)
+	../tables/span: Span, span_covering
+	../tables/token:
+		TokenKind(
+			IdentifierToken, SelfKeyword, VoidKeyword, PureKeyword, DimensionNameToken,
+			HashSymbol, IntLiteralToken, RejectedIntegerToken, LeftParenSymbol, RightParenSymbol,
+			LeftBracketSymbol, RightBracketSymbol, DotSymbol, DotDotSymbol, DotDotDotSymbol,
+			ArrowSymbol, ColonSymbol, CommaSymbol, PlusSymbol, MinusSymbol, StarSymbol, SlashSymbol,
+			EndOfFileToken, NewlineToken, DedentToken, UnderscoreSymbol,
+		),
+	parse_state:
+		ParseState, NameRole(TypeName), current_kind, current_span, current_literal,
+		previous_span, peek_kind, advanced, position, report_diagnostic, expect_token,
+		consume_name, consume_referenced_name, report_at_current, report_and_recover, finished_name_use, finished_written_type, finished_dimension,
+
+	tree_trait_reference_parser: parse_trait_reference
+
+
+-- A colon following an ordinary annotation belongs to its enclosing
+-- declaration. A bound is forbidden only inside an argument list.
+private enum TypeContext:
+	OrdinaryType
+	OrdinaryArgument
+	ReceiverType
+	ReceiverArgument
+
+
+private pure func argument_context(context: TypeContext) -> TypeContext:
+	match context:
+		OrdinaryType | OrdinaryArgument:
+			OrdinaryArgument
+		ReceiverType | ReceiverArgument:
+			ReceiverArgument
+
+
+private pure func return_context(context: TypeContext) -> TypeContext:
+	match context:
+		OrdinaryType | OrdinaryArgument:
+			OrdinaryType
+		ReceiverType | ReceiverArgument:
+			ReceiverType
+
+
+pure func parse_receiver_type(state: ParseState) -> (ParseState, WrittenType):
+	parse_type_in(state, ReceiverType)
+
+
+pure func parse_type(state: ParseState) -> (ParseState, WrittenType):
+	parse_type_in(state, OrdinaryType)
+
+
+pure func parse_variant_payload_type(state: ParseState) -> (ParseState, WrittenType):
+	parse_type_in(state, OrdinaryArgument)
+
+
+private pure func parse_type_in(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
+	(parsed_state, written) = parse_type_atom(state, context)
+
+	-- Names accept suffixes here. Parenthesized parsing owns the distinction
+	-- between grouped types, which accept suffixes, and function types.
+	match state.current_kind():
+		IdentifierToken | SelfKeyword | VoidKeyword:
+			parse_array_suffixes(parsed_state, written, context)
+		_:
+			(parsed_state, written)
+
+
+private pure func parse_type_atom(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
+	kind: TokenKind = state.current_kind()
+
+	if kind == IdentifierToken or kind == SelfKeyword or kind == VoidKeyword:
+		parse_named_type(state, context)
+	else:
+		match kind:
+			LeftParenSymbol:
+				parse_parenthesized_type(state, context)
+			PureKeyword:
+				parse_pure_function_type(state, context)
+			DotDotSymbol:
+				start: Span = state.current_span()
+				parsed_state: ParseState = state.advanced()
+
+				checked: ParseState = if (parsed_state.current_kind() == HashSymbol or parsed_state.current_kind() == DimensionNameToken
+						or parsed_state.current_kind() == LeftParenSymbol):
+					parsed_state
+				else:
+					parsed_state.report_at_current(ExpectedHashDiagnostic)
+
+				(finished, dimension) = parse_dimension(checked)
+				finished.finished_written_type(start.span_covering(dimension.span), RangeType(dimension))
+			DimensionNameToken | HashSymbol | IntLiteralToken | RejectedIntegerToken:
+				(parsed_state, dimension) = parse_dimension(state)
+				parsed_state.finished_written_type(dimension.span, DimensionType(dimension))
+			_:
+				span: Span = state.current_span()
+				state.report_and_recover(ExpectedTypeDiagnostic).finished_written_type(span, VoidType)
+
+
+private pure func parse_named_type(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
+	(parsed, argument) = parse_named_argument(state, context)
+	match argument:
+		TypeArgumentType(written):
+			(parsed, written)
+		BoundedArgument(bound):
+			parsed.finished_written_type(bound.span, BoundedType(bound))
+		DimensionArgument(dimension):
+			parsed.finished_written_type(dimension.span, DimensionType(dimension))
+
+
+-- A bounded argument owns name uses and references, but no WrittenTypeId.
+private pure func parse_named_argument(state: ParseState, context: TypeContext) -> (ParseState, TypeArgument):
+	can_qualify: Bool = state.current_kind() == IdentifierToken
+	(after_name, first) = state.consume_name(TypeName, NameInTypeName)
+	(after_use, first_use) = after_name.finished_name_use(first)
+
+	if context == ReceiverArgument and after_use.current_kind() == ColonSymbol:
+		(after_first, first_bound) = parse_trait_reference(after_use.advanced(), NameInTypeName)
+		var out: ParseState = after_first
+		var bounds: AtLeastOne[TraitReference] = { first = first_bound, rest = [] }
+		var end: Span = first_bound.span
+
+		-- Every plus requires another reference, including at EOF. Shared name
+		-- recovery supplies the same diagnostic and cursor as the frozen parser.
+		while out.current_kind() == PlusSymbol:
+			(after_bound, bound) = parse_trait_reference(out.advanced(), NameInTypeName)
+			out = after_bound
+			bounds = { bounds | rest = bounds.rest.append(bound) }
+			end = bound.span
+
+		(out, BoundedArgument({ parameter = first_use, bounds = bounds, span = first.span.span_covering(end) }))
+	else if context == OrdinaryArgument and after_use.current_kind() == ColonSymbol:
+		var out: ParseState = after_use.advanced()
+		var end: Span = first.span
+
+		while out.current_kind() == IdentifierToken or out.current_kind() == DotSymbol or out.current_kind() == PlusSymbol:
+			end = out.current_span()
+			out = out.advanced()
+
+		(parsed, written) = out.report_diagnostic(first.span.span_covering(end), Plain(BoundInTypeDiagnostic)).finished_written_type(first.span, NamedType(first_use, []))
+		(parsed, TypeArgumentType(written))
+	else:
+		(parsed, written) = parse_named_type_tail(after_use, first_use, can_qualify, context)
+		(parsed, TypeArgumentType(written))
+
+private pure func parse_named_type_tail(state: ParseState, first: NameUse, can_qualify: Bool, context: TypeContext) -> (ParseState, WrittenType):
+	var out: ParseState = state
+	var qualifier: Option[NameUse] = None
+	var name: NameUse = first
+
+	if can_qualify and out.current_kind() == DotSymbol:
+		(after_second, second) = out.advanced().consume_referenced_name(NameInTypeName)
+		(after_second_use, second_use) = after_second.finished_name_use(second)
+		out = after_second_use
+		qualifier = Some(first)
+		name = second_use
+
+	var arguments: List[TypeArgument] = []
+	var end: Span = name.name.span
+
+	if out.current_kind() == LeftBracketSymbol:
+		(after_arguments, parsed_arguments) = parse_arguments(out.advanced(), RightBracketSymbol, argument_context(context))
+		arguments = parsed_arguments
+
+		-- A missing close leaves the named type at its last argument's span.
+		-- Only a real closing bracket extends it through the cursor token.
+		for argument in arguments:
+			match argument:
+				TypeArgumentType(written):
+					end = written.span
+				DimensionArgument(dimension):
+					end = dimension.span
+				BoundedArgument(bound):
+					end = bound.span
+
+		if after_arguments.current_kind() == RightBracketSymbol:
+			end = after_arguments.current_span()
+
+		out = after_arguments.expect_token(RightBracketSymbol, ExpectedRightBracket(RightBracketInTypeArguments))
+
+	var dimensions: List[Dimension] = []
+	var all_dimensions: Bool = not arguments.is_empty()
+
+	for argument in arguments:
+		match argument:
+			DimensionArgument(dimension):
+				dimensions = dimensions.append(dimension)
+			_:
+				all_dimensions = False
+
+	if all_dimensions:
+		kind: WrittenTypeKind = match qualifier:
+			Some(owner):
+				QualifiedType(owner, name, [])
+			None:
+				NamedType(name, [])
+
+		(after_base, base) = out.finished_written_type(first.name.span.span_covering(name.name.span), kind)
+
+		match dimensions:
+			[first_dimension, ...rest]:
+				after_base.finished_written_type(first.name.span.span_covering(end), ArrayType(base, { first = first_dimension, rest = rest }))
+			_:
+				-- all_dimensions requires a nonempty argument list.
+				after_base.report_diagnostic(end, Plain(ExpectedDimensionDiagnostic)).finished_written_type(end, VoidType)
+	else:
+		kind: WrittenTypeKind = match qualifier:
+			Some(owner):
+				QualifiedType(owner, name, arguments)
+			None:
+				NamedType(name, arguments)
+
+		out.finished_written_type(first.name.span.span_covering(end), kind)
+
+
+private pure func parse_argument(state: ParseState, context: TypeContext) -> (ParseState, TypeArgument):
+	match state.current_kind():
+		IdentifierToken | SelfKeyword | VoidKeyword:
+			(parsed, argument) = parse_named_argument(state, context)
+			match argument:
+				TypeArgumentType(written):
+					(after_array, array) = parse_array_suffixes(parsed, written, context)
+					(after_array, TypeArgumentType(array))
+				_:
+					(parsed, argument)
+		DimensionNameToken | HashSymbol | IntLiteralToken | RejectedIntegerToken:
+			(parsed_state, dimension) = parse_dimension(state)
+			(parsed_state, DimensionArgument(dimension))
+		LeftParenSymbol:
+			if starts_parenthesized_dimension(state, 1):
+				(parsed_state, dimension) = parse_dimension(state)
+				(parsed_state, DimensionArgument(dimension))
+			else:
+				(parsed_state, argument) = parse_parenthesized_argument(state, context)
+
+				match argument:
+					TypeArgumentType(_):
+						(parsed_state, argument)
+					DimensionArgument(_):
+						(parsed_state, argument)
+					BoundedArgument(bound):
+						-- Bounds are receiver-only; keep the rejected argument explicit.
+						if context == ReceiverArgument:
+							(parsed_state, argument)
+						else:
+							(parsed_state.report_diagnostic(bound.span, Plain(BoundInTypeDiagnostic)), argument)
+		_:
+			(parsed_state, written) = parse_type_in(state, context)
+			(parsed_state, TypeArgumentType(written))
+
+
+-- The frozen grammar gives nested parentheses beginning with a dimension
+-- atom to the dimension grammar, before considering a function-type arrow.
+private pure func starts_parenthesized_dimension(state: ParseState, ahead: Int) -> Bool:
+	match state.peek_kind(ahead):
+		HashSymbol | DimensionNameToken | IntLiteralToken | RejectedIntegerToken:
+			True
+		LeftParenSymbol:
+			starts_parenthesized_dimension(state, ahead + 1)
+		_:
+			False
+
+
+private pure func parse_arguments(state: ParseState, close: TokenKind, context: TypeContext) -> (ParseState, List[TypeArgument]):
+	var out: ParseState = state
+	var arguments: List[TypeArgument] = []
+	var parsing: Bool = out.current_kind() != close
+
+	while parsing and out.current_kind() != EndOfFileToken:
+		before: Int = out.position()
+		(parsed_state, argument) = parse_argument(out, context)
+		out = parsed_state
+		arguments = arguments.append(argument)
+
+		if out.current_kind() == CommaSymbol:
+			out = out.advanced()
+			parsing = out.current_kind() != close
+		else:
+			parsing = False
+
+		if out.position() == before:
+			parsing = False
+
+	(out, arguments)
+
+
+private pure func parse_parenthesized_type(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
+	(parsed_state, argument) = parse_argument(state, argument_context(context))
+
+	match argument:
+		TypeArgumentType(written):
+			(parsed_state, written)
+		DimensionArgument(dimension):
+			parsed_state.finished_written_type(dimension.span, DimensionType(dimension))
+		BoundedArgument(bound):
+			if context == ReceiverType or context == ReceiverArgument:
+				parsed_state.finished_written_type(bound.span, BoundedType(bound))
+			else:
+				-- Ordinary recovery keeps the parameter after rejecting the bound.
+				parsed_state.report_diagnostic(bound.span, Plain(BoundInTypeDiagnostic)).finished_written_type(bound.span, NamedType(bound.parameter, []))
+
+
+-- Parse the shared parenthesized grammar before deciding whether the result
+-- is a type or a dimension argument. A following arrow makes a function type;
+-- grouping a single argument preserves it without minting/discarding a node.
+private pure func parse_parenthesized_argument(state: ParseState, context: TypeContext) -> (ParseState, TypeArgument):
+	start: Span = state.current_span()
+	(after_arguments, arguments) = parse_arguments(state.advanced(), RightParenSymbol, argument_context(context))
+	end: Span = after_arguments.current_span()
+	parsed_state: ParseState = after_arguments.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInGroupedType))
+
+	if parsed_state.current_kind() == ArrowSymbol:
+		(after_return, result) = parse_type_in(parsed_state.advanced(), return_context(context))
+		(finished, written) = after_return.finished_written_type(start.span_covering(result.span), FunctionType(ImpureFunction, arguments, result))
+		(finished, TypeArgumentType(written))
+	else:
+		match arguments:
+			[single]:
+				match single:
+					TypeArgumentType(written):
+						(after_array, array) = parse_array_suffixes(parsed_state, written, context)
+						(after_array, TypeArgumentType(array))
+					BoundedArgument(bound):
+						if context == ReceiverArgument and parsed_state.current_kind() == LeftBracketSymbol:
+							(after_bound, written) = parsed_state.finished_written_type(bound.span, BoundedType(bound))
+							(after_array, array) = parse_array_suffixes(after_bound, written, context)
+							(after_array, TypeArgumentType(array))
+						else:
+							(parsed_state, single)
+					DimensionArgument(_):
+						(parsed_state, single)
+			_:
+				kind: WrittenTypeKind = match arguments:
+					[]:
+						VoidType
+					[first, second]:
+						TupleType(Pair(first, second))
+					[first, second, third]:
+						TupleType(Triple(first, second, third))
+					[first, second, third, fourth]:
+						TupleType(Quadruple(first, second, third, fourth))
+					_:
+						VoidType
+
+				checked: ParseState = if arguments.length() > 4:
+					parsed_state.report_diagnostic(start.span_covering(end), Plain(TupleArityDiagnostic))
+				else:
+					parsed_state
+
+				(finished, written) = checked.finished_written_type(start.span_covering(end), kind)
+				(after_array, array) = parse_array_suffixes(finished, written, context)
+				(after_array, TypeArgumentType(array))
+
+
+private pure func parse_pure_function_type(state: ParseState, context: TypeContext) -> (ParseState, WrittenType):
+	start: Span = state.current_span()
+	opened: ParseState = state.advanced().expect_token(LeftParenSymbol, ExpectedLeftParen(LeftParenInPureFunctionType))
+	(after_arguments, arguments) = parse_arguments(opened, RightParenSymbol, argument_context(context))
+	parsed_state: ParseState = after_arguments
+		.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInFunctionTypeParameters))
+		.expect_token(ArrowSymbol, ExpectedArrow(ArrowInFunctionTypeParameters))
+	(after_return, result) = parse_type_in(parsed_state, return_context(context))
+	after_return.finished_written_type(start.span_covering(result.span), FunctionType(PureFunction, arguments, result))
+
+
+private pure func parse_array_suffixes(state: ParseState, written: WrittenType, context: TypeContext) -> (ParseState, WrittenType):
+	var out: ParseState = state
+	var element: WrittenType = written
+
+	while out.current_kind() == LeftBracketSymbol:
+		out = out.advanced()
+		var dimensions: List[Dimension] = []
+		var all_dimensions: Bool = True
+		var argument_end: Span = element.span
+		var parsing: Bool = True
+
+		-- Unlike generic arguments, a suffix requires its first argument even
+		-- when the next token is `]`. Recovery preserves that closing token.
+		while parsing and out.current_kind() != EndOfFileToken:
+			(parsed_state, argument) = parse_argument(out, argument_context(context))
+			out = parsed_state
+
+			match argument:
+				DimensionArgument(dimension):
+					dimensions = dimensions.append(dimension)
+					argument_end = dimension.span
+				TypeArgumentType(written):
+					all_dimensions = False
+					argument_end = written.span
+				BoundedArgument(bound):
+					all_dimensions = False
+					argument_end = bound.span
+
+			if out.current_kind() == CommaSymbol:
+				out = out.advanced()
+				parsing = out.current_kind() != RightBracketSymbol
+			else:
+				parsing = False
+
+		end: Span = out.current_span()
+		out = out.expect_token(RightBracketSymbol, ExpectedRightBracket(RightBracketInArrayDimensions))
+
+		if not all_dimensions or dimensions.is_empty():
+			out = out.report_diagnostic(argument_end, Plain(ArrayDimensionsExpectedDiagnostic))
+
+		match dimensions:
+			[first, ...rest]:
+				(after_array, array) = out.finished_written_type(element.span.span_covering(end), ArrayType(element, { first = first, rest = rest }))
+				out = after_array
+				element = array
+			_:
+				-- ArrayType requires at least one dimension. After diagnosing an
+				-- empty rejected suffix, retain the preceding type as recovery.
+				void
+
+	(out, element)
+
+
+pure func parse_dimension(state: ParseState) -> (ParseState, Dimension):
+	(after_first, first) = parse_dimension_product(state)
+	parse_dimension_sum_tail(after_first, first)
+
+
+private pure func parse_dimension_sum_tail(state: ParseState, first: Dimension) -> (ParseState, Dimension):
+	var out: ParseState = state
+	var left: Dimension = first
+
+	while out.current_kind() == PlusSymbol or out.current_kind() == MinusSymbol:
+		operator: DimensionOperator = if out.current_kind() == PlusSymbol:
+			AddDimensions
+		else:
+			SubtractDimensions
+
+		(after_right, right) = parse_dimension_product(out.advanced())
+		(after_parent, parent) = after_right.finished_dimension(left.span.span_covering(right.span), DimensionArithmetic(operator, left, right))
+		out = after_parent
+		left = parent
+
+	(out, left)
+
+
+private pure func parse_dimension_product(state: ParseState) -> (ParseState, Dimension):
+	(after_first, first) = parse_dimension_atom(state)
+	parse_dimension_product_tail(after_first, first)
+
+
+private pure func parse_dimension_product_tail(state: ParseState, first: Dimension) -> (ParseState, Dimension):
+	var out: ParseState = state
+	var left: Dimension = first
+
+	while out.current_kind() == StarSymbol or out.current_kind() == SlashSymbol:
+		operator: DimensionOperator = if out.current_kind() == StarSymbol:
+			MultiplyDimensions
+		else:
+			DivideDimensions
+
+		(after_right, right) = parse_dimension_atom(out.advanced())
+		(after_parent, parent) = after_right.finished_dimension(left.span.span_covering(right.span), DimensionArithmetic(operator, left, right))
+		out = after_parent
+		left = parent
+
+	(out, left)
+
+
+private pure func parse_dimension_atom(state: ParseState) -> (ParseState, Dimension):
+	span: Span = state.current_span()
+
+	match state.current_kind():
+		DimensionNameToken:
+			(after_name, name) = state.consume_name(TypeName, NameInTypeName)
+			(after_use, use) = after_name.finished_name_use(name)
+
+			if after_use.current_kind() == DotDotDotSymbol:
+				end: Span = after_use.current_span()
+				after_use.advanced().finished_dimension(span.span_covering(end), VariadicNamedDimension(use))
+			else:
+				after_use.finished_dimension(span, NamedDimension(use))
+		IntLiteralToken:
+			match state.current_literal():
+				Some(IntegerValue(value)):
+					state.advanced().finished_dimension(span, LiteralDimension(value))
+				_:
+					state.report_diagnostic(span, Plain(ExpectedDimensionDiagnostic)).finished_dimension(span, WildcardDimension)
+		RejectedIntegerToken:
+			-- ParseState construction checked the matching lexical overflow error.
+			-- No checked value exists; consume the frozen path's numeric token and
+			-- retain a recovery dimension inside this rejected preview.
+			state.advanced().finished_dimension(span, WildcardDimension)
+		HashSymbol:
+			out: ParseState = state.advanced()
+
+			if out.current_kind() == IntLiteralToken:
+				match out.current_literal():
+					Some(IntegerValue(value)):
+						out.advanced().finished_dimension(span.span_covering(out.current_span()), LiteralDimension(value))
+					_:
+						out.report_diagnostic(span, Plain(ExpectedDimensionDiagnostic)).finished_dimension(span, WildcardDimension)
+
+			else if out.current_kind() == RejectedIntegerToken:
+				out.advanced().finished_dimension(span.span_covering(out.current_span()), WildcardDimension)
+			else if out.current_kind() == UnderscoreSymbol:
+				parsed_state: ParseState = out.advanced()
+
+				if parsed_state.current_kind() == DotDotDotSymbol:
+					end: Span = parsed_state.current_span()
+					parsed_state.advanced().finished_dimension(span.span_covering(end), VariadicWildcardDimension)
+				else:
+					parsed_state.finished_dimension(span.span_covering(out.current_span()), WildcardDimension)
+			else:
+				out.report_at_current(ExpectedDimensionDiagnostic).finished_dimension(span, WildcardDimension)
+		LeftParenSymbol:
+			(after_dimension, dimension) = parse_dimension(state.advanced())
+			(after_dimension.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInDimensionExpression)), dimension)
+		_:
+			state.report_at_current(ExpectedDimensionDiagnostic).finished_dimension(span, WildcardDimension)

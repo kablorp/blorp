@@ -1,0 +1,186 @@
+-- The expression slice has its own closed unsupported/rejected boundary.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		ParseState, new_parse_state, position, issued_counts, diagnostics, spellings, diagnostic_count, current_kind, current_span, previous_span
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser:
+		parse_same_line_expression, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
+	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
+		ExpressionKind(NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression),
+		UnaryOperator(Negate), BinaryOperator(Add, Multiply), LogicalOperator(LogicalOr, LogicalAnd)
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedRightParen), RightParenConstruct(RightParenInGroupedExpression)
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: expression_local_index, name_use_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_count, spelling_text_at
+	test: TestSuite
+
+
+private pure func id_counts(state: ParseState) -> List[Int]:
+	counts = state.issued_counts()
+	[counts.expressions, counts.name_uses, counts.statements, counts.blocks, counts.patterns,
+		counts.written_types, counts.dimensions, counts.binders, counts.type_binders]
+
+
+pure func test_precedence_and_postorder_ids() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "first + 007 * -last")):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						Binary(Add, first, product):
+							match (first.kind, product.kind):
+								(NameReference(first_use), Binary(Multiply, integer, negative)):
+									match (integer.kind, negative.kind):
+										(IntegerLiteral(magnitude), Unary(Negate, last)):
+											match last.kind:
+												NameReference(last_use):
+													(first.id.expression_local_index() == 0 and integer.id.expression_local_index() == 1
+														and last.id.expression_local_index() == 2 and negative.id.expression_local_index() == 3
+														and product.id.expression_local_index() == 4 and value.id.expression_local_index() == 5
+														and first_use.use.name_use_local_index() == 0 and last_use.use.name_use_local_index() == 1
+														and magnitude.to_string() == "7" and parsed.issued_counts().expressions == 6
+														and parsed.issued_counts().name_uses == 2 and parsed.diagnostic_count() == 0)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_grouping_preserves_identity_and_name_token_span() -> Bool:
+	var correct = True
+	for text in ["((name))", "((007))"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					ParsedExpression(value):
+						correct = correct and value.id.expression_local_index() == 0 and parsed.issued_counts().expressions == 1
+						match value.kind:
+							NameReference(use):
+								correct = correct and value.span.spans_equal(use.name.span) and value.span.span_start() == 2 and value.span.span_end() == 6
+							IntegerLiteral(magnitude):
+								correct = correct and magnitude.to_string() == "7" and value.span.span_start() == 0 and value.span.span_end() == text.length()
+							_: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_logical_and_range_have_explicit_forms() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "a or b and 1..2")):
+		Ok(entry):
+			(_, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						ShortCircuit(LogicalOr, _, conjunction):
+							match conjunction.kind:
+								ShortCircuit(LogicalAnd, _, range):
+									match range.kind:
+										RangeExpression(_, _): True
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_unsupported_returns_original_state() -> Bool:
+	var correct = True
+	for text in ["first + call()", "(first, other)", "name.field", "1\n.field", "1\n\t.field", "1 +\n 2", "(\n1)", "not [1]", "first + \"text\"", "()()", "(\n)", "(007\n)", "(name\n)"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					UnsupportedExpression:
+						correct = (correct and parsed.position() == entry.position() and parsed.current_kind() == entry.current_kind()
+							and parsed.current_span().spans_equal(entry.current_span()) and parsed.previous_span().spans_equal(entry.previous_span())
+							and parsed.id_counts() == entry.id_counts() and parsed.diagnostic_count() == entry.diagnostic_count()
+							and parsed.spellings().spelling_count() == entry.spellings().spelling_count())
+						var spelling_index = 0
+						while spelling_index < entry.spellings().spelling_count():
+							correct = correct and parsed.spellings().spelling_text_at(spelling_index) == entry.spellings().spelling_text_at(spelling_index)
+							spelling_index += 1
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_rejection_issues_no_ids() -> Bool:
+	var correct = True
+	for text in ["1 +", "(1", "1 + )"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					RejectedExpression:
+						correct = correct and parsed.diagnostic_count() == 1 and parsed.id_counts() == entry.id_counts()
+						match parsed.diagnostics().get(0):
+							Some(at):
+								match at.diagnostic:
+									ExpectedToken(ExpectedRightParen(RightParenInGroupedExpression)):
+										correct = correct and text == "(1" and at.span.span_start() == 2 and at.span.span_end() == 2
+									Plain(ExpectedExpressionDiagnostic):
+										offset = if text == "1 + )":
+											4
+										else:
+											3
+										correct = correct and text != "(1" and at.span.span_start() == offset and at.span.span_end() == offset
+									_: correct = False
+							None: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_long_sum_is_left_associative_without_recursive_left_walk() -> Bool:
+	var text = "1"
+	var terms = 1
+	while terms < 5000:
+		text += " + 1"
+		terms += 1
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					var left = value
+					var additions = 0
+					var walking = True
+					var correct = parsed.issued_counts().expressions == terms * 2 - 1
+					while walking:
+						match left.kind:
+							Binary(Add, next, right):
+								match right.kind:
+									IntegerLiteral(magnitude): correct = correct and magnitude.to_string() == "1"
+									_: correct = False
+								left = next
+								additions += 1
+							IntegerLiteral(magnitude):
+								correct = correct and magnitude.to_string() == "1"
+								walking = False
+							_:
+								correct = False
+								walking = False
+					correct and additions == terms - 1
+				_: False
+		Err(_): False
+
+
+tests: TestSuite = {
+	description = "Bounded tree operator expressions",
+	tests = [
+		("precedence and postorder ids", test_precedence_and_postorder_ids),
+		("grouping keeps identity and token name span", test_grouping_preserves_identity_and_name_token_span),
+		("logical and range forms", test_logical_and_range_have_explicit_forms),
+		("unsupported exact rollback", test_unsupported_returns_original_state),
+		("rejected expression has no ids", test_rejection_issues_no_ids),
+		("5000 term left spine", test_long_sum_is_left_associative_without_recursive_left_walk)
+	]
+}

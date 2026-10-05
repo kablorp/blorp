@@ -8,7 +8,20 @@
 -- adapter's program; `program_differences` lists every field that differs,
 -- spans included.
 import:
-	../../../src/compiler/stage_03_parse/parsed_ast: ParsedProgram
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedProgram, ParsedModuleDoc, ParsedVarDecl, parsed_type_expr_location, ParsedDecl(FunctionParsedDecl, VarParsedDecl, ImportBlockParsedDecl, ForeignBlockParsedDecl, RecordParsedDecl, UnionParsedDecl, BuiltinTypeParsedDecl, TypeAliasParsedDecl, TraitParsedDecl, ImplParsedDecl, PrivateParsedDecl, ParsedErrorDecl),
+		RecordDeclarationForm(OrdinaryRecord, FixedRecord), parsed_decl_location, parsed_function_header, parsed_var_header, parsed_trait_header, parsed_impl_header
+	../../../src/compiler/discovery_adapter:
+		LegacyDeclarationProjection, LegacyGlobalHeaderPreview, legacy_trait_header, legacy_implementation_header, LegacyDeclarationProjectionStop(ReachedEndOfSource, StoppedAtFunctionHeader, StoppedAtTraitPreview, StoppedAtImplementationPreview, StoppedAtGlobalInitializer, StoppedAtRejectedGlobalInitializer, StoppedAtRejectedDeclaration, StoppedWithoutDeclarationProgress)
+	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable)
+	../../../src/compiler/stage_02_lex/lexer: lex
+	../../../src/compiler/stage_02_lex/token: TokenKind(SymbolToken), Symbol(EqualSymbol), token_kind_of
+	../../../src/compiler/stage_03_parse/parsed_ast_json: AstJsonRender, ast_json_render, parsed_decl_to_json, parsed_source_location_to_json, parsed_function_header_to_json, parsed_var_header_to_json, parsed_trait_header_to_json, parsed_impl_header_to_json
+	../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
+	../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PrivateVisibility, PublicVisibility)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent(AbstractMethod, SkippedDefaultBody)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: FunctionBodyExtent(ForwardDeclaration, SkippedBody)
+	../../../src/lib/source: SourceFile, SourceLocation, source_location_start_offset, source_location_end_offset
 	../../../src/compiler/stage_03_parse/source_ast_finalize: finalize_interpolation_program
 	json: JsonValue(JsonNull, JsonObject, JsonString, JsonVector)
 
@@ -235,3 +248,393 @@ pure func program_differences(old_json: JsonValue, new_json: JsonValue) -> List[
 		)
 
 	found
+
+
+-- Coverage describes authored declaration forms, rather than the legacy AST's
+-- shared encodings for value records, resources and enums.
+enum DeclarationPrefixKind:
+	ImportBlockPrefix
+	ForeignBlockPrefix
+	RecordPrefix
+	FixedRecordPrefix
+	AliasPrefix
+	BuiltinTypePrefix
+	ResourceTypePrefix
+	UnionPrefix
+	EnumPrefix
+	FunctionPrefix
+	TraitPrefix
+	ImplementationPrefix
+	ConstantGlobalPrefix
+	MutableGlobalPrefix
+
+
+enum DeclarationPrefixStopKind:
+	EndOfSourcePrefixStop
+	FunctionHeaderPrefixStop
+	TraitPreviewPrefixStop
+	ImplementationPreviewPrefixStop
+	GlobalInitializerPrefixStop
+	RejectedGlobalInitializerPrefixStop
+	RejectedDeclarationPrefixStop
+	WithoutProgressPrefixStop
+
+
+record DeclarationPrefixComparison {
+	completed_declarations: Int,
+	declaration_kinds: List[DeclarationPrefixKind],
+	stop: DeclarationPrefixStopKind,
+	differences: List[JsonDifference]
+}
+
+
+private pure func prefix_kind(declaration: ParsedDecl) -> Option[DeclarationPrefixKind]:
+	match declaration:
+		PrivateParsedDecl(inner, _):
+			prefix_kind(inner)
+		ImportBlockParsedDecl(_, _):
+			Some(ImportBlockPrefix)
+		ForeignBlockParsedDecl(_, _, _):
+			Some(ForeignBlockPrefix)
+		RecordParsedDecl(value):
+			match value.form:
+				OrdinaryRecord:
+					Some(RecordPrefix)
+				FixedRecord:
+					Some(FixedRecordPrefix)
+		TypeAliasParsedDecl(_):
+			Some(AliasPrefix)
+		BuiltinTypeParsedDecl(value):
+			if value.is_resource:
+				Some(ResourceTypePrefix)
+			else:
+				Some(BuiltinTypePrefix)
+		UnionParsedDecl(value):
+			if value.is_enum:
+				Some(EnumPrefix)
+			else:
+				Some(UnionPrefix)
+		FunctionParsedDecl(_):
+			Some(FunctionPrefix)
+		TraitParsedDecl(_):
+			Some(TraitPrefix)
+		ImplParsedDecl(_):
+			Some(ImplementationPrefix)
+		VarParsedDecl(value):
+			if value.is_mutable:
+				Some(MutableGlobalPrefix)
+			else:
+				Some(ConstantGlobalPrefix)
+		ParsedErrorDecl(_):
+			None
+
+
+private pure func prefix_kind_name(kind: Option[DeclarationPrefixKind]) -> String:
+	match kind:
+		None:
+			"absent or error"
+		Some(value):
+			match value:
+				ImportBlockPrefix:
+					"import block"
+				ForeignBlockPrefix:
+					"foreign block"
+				RecordPrefix:
+					"record"
+				FixedRecordPrefix:
+					"fixed record"
+				AliasPrefix:
+					"alias"
+				BuiltinTypePrefix:
+					"builtin type"
+				ResourceTypePrefix:
+					"resource type"
+				UnionPrefix:
+					"union"
+				EnumPrefix:
+					"enum"
+				FunctionPrefix:
+					"function"
+				TraitPrefix:
+					"trait"
+				ImplementationPrefix:
+					"implementation"
+				ConstantGlobalPrefix:
+					"constant global"
+				MutableGlobalPrefix:
+					"mutable global"
+
+
+private pure func prefix_stop_kind(stop: LegacyDeclarationProjectionStop) -> DeclarationPrefixStopKind:
+	match stop:
+		ReachedEndOfSource:
+			EndOfSourcePrefixStop
+		StoppedAtFunctionHeader(_):
+			FunctionHeaderPrefixStop
+		StoppedAtTraitPreview(_):
+			TraitPreviewPrefixStop
+		StoppedAtImplementationPreview(_):
+			ImplementationPreviewPrefixStop
+		StoppedAtGlobalInitializer(_):
+			GlobalInitializerPrefixStop
+		StoppedAtRejectedGlobalInitializer(_):
+			RejectedGlobalInitializerPrefixStop
+		StoppedAtRejectedDeclaration:
+			RejectedDeclarationPrefixStop
+		StoppedWithoutDeclarationProgress:
+			WithoutProgressPrefixStop
+
+
+private pure func prefix_difference(path: String, old_text: String, new_text: String) -> List[JsonDifference]:
+	if old_text == new_text:
+		[]
+	else:
+		[{ declaration = "", path = path, old_text = shortened(old_text), new_text = shortened(new_text) }]
+
+
+private pure func module_doc_json(render: AstJsonRender, documentation: Option[ParsedModuleDoc]) -> JsonValue:
+	match documentation:
+		None:
+			JsonNull
+		Some(doc):
+			JsonObject([("text", JsonString(doc.text)), ("span", parsed_source_location_to_json(render, doc.span))])
+
+
+private pure func boundary_span_differences(old_span: SourceLocation, preview: Span) -> List[JsonDifference]:
+	var found = prefix_difference("stop.start", "${source_location_start_offset(old_span)}", "${preview.span_start()}")
+	-- Header and lexical previews need not reach the completed body's endpoint.
+	-- They must remain within the same old declaration, including its prefixes.
+	if preview.span_end() < preview.span_start() or preview.span_end() > source_location_end_offset(old_span):
+		found = found.concat(prefix_difference("stop.end", "within ${source_location_start_offset(old_span)}..${source_location_end_offset(old_span)}", "${preview.span_end()}"))
+	found
+
+
+-- Method headers are bounded by their own legacy methods, independently of
+-- owner spans: at EOF, an owner can end before its method previews.
+private pure func method_header_span_differences(
+	path: String, old_span: SourceLocation, preview: Span,
+) -> List[JsonDifference]:
+	var found = prefix_difference(path + ".start", "${source_location_start_offset(old_span)}", "${preview.span_start()}")
+	if preview.span_end() < preview.span_start() or preview.span_end() > source_location_end_offset(old_span):
+		found = found.concat(prefix_difference(path + ".end", "within ${source_location_start_offset(old_span)}..${source_location_end_offset(old_span)}", "${preview.span_end()}"))
+	found
+
+
+-- The legacy AST drops grouping parentheses and retains no assignment token.
+-- Its lexer supplies the exact equal and immediately following token, including
+-- layout tokens; this compares lexical entry evidence without parsing a value.
+private pure func global_initializer_entry_differences(
+	source: SourceFile, global: ParsedVarDecl, preview: LegacyGlobalHeaderPreview,
+) -> List[JsonDifference]:
+	lexed = lex(source, EMPTY_NAME_TABLE)
+	if not lexed.diagnostics.is_empty():
+		prefix_difference("stop.initializer.lex", "accepted lexical source", "lexical diagnostics")
+	else:
+		header_end = match global.type_expr:
+			Some(written_type):
+				source_location_end_offset(parsed_type_expr_location(written_type))
+			None:
+				source_location_end_offset(global.name.span)
+		var equal_index: Option[Int] = None
+		for index in 0..lexed.tokens.length():
+			match lexed.tokens.get(index):
+				Some(token):
+					if token.start_offset >= source_location_end_offset(global.span):
+						break
+					is_equal = match token_kind_of(lexed.texts, token):
+						SymbolToken(EqualSymbol): True
+						_: False
+					if token.start_offset >= header_end and is_equal:
+						equal_index = Some(index)
+						break
+				None:
+					void
+		match equal_index:
+			Some(index):
+				match (lexed.tokens.get(index), lexed.tokens.get(index + 1)):
+					(Some(assignment_equal), Some(initializer_entry)):
+						prefix_difference("stop.assignment_equal.start", "${assignment_equal.start_offset}", "${preview.initializer.assignment_equal.span_start()}")
+							.concat(prefix_difference("stop.assignment_equal.end", "${assignment_equal.end_offset}", "${preview.initializer.assignment_equal.span_end()}"))
+							.concat(prefix_difference("stop.initializer_entry.start", "${initializer_entry.start_offset}", "${preview.initializer.initializer_entry.span_start()}"))
+							.concat(prefix_difference("stop.initializer_entry.end", "${initializer_entry.end_offset}", "${preview.initializer.initializer_entry.span_end()}"))
+							.concat(prefix_difference("stop.end", "${assignment_equal.end_offset}", "${preview.header_span.span_end()}"))
+					_:
+						prefix_difference("stop.initializer.entry", "equal and next token", "absent lexical entry")
+			None:
+				prefix_difference("stop.initializer.equal", "authored equal after header", "absent assignment token")
+
+
+private pure func unwrapped_declaration(declaration: ParsedDecl) -> ParsedDecl:
+	match declaration:
+		PrivateParsedDecl(inner, _):
+			unwrapped_declaration(inner)
+		_:
+			declaration
+
+
+---
+Compare completed declaration evidence and its next boundary against an accepted
+old-parser program. This returns partial coverage, never an accepted program.
+---
+pure func declaration_prefix_comparison(old_program: ParsedProgram, projection: LegacyDeclarationProjection) -> DeclarationPrefixComparison:
+	old_render = ast_json_render(old_program.source, SpellingsFromIdentifierText)
+	new_render = ast_json_render(old_program.source, SpellingsFromNameTable(projection.names))
+	var found: List[JsonDifference] = value_differences("", "module_doc", module_doc_json(old_render, old_program.module_doc), module_doc_json(new_render, projection.module_doc))
+	var kinds: List[DeclarationPrefixKind] = []
+	completed = projection.declarations.length()
+
+	if not old_program.diagnostics.is_empty():
+		found = found.concat(prefix_difference("old.diagnostics", "${old_program.diagnostics.length()}", "0"))
+	if completed > old_program.decls.length():
+		found = found.concat(prefix_difference("prefix.length", "${old_program.decls.length()}", "${completed}"))
+
+	for index in 0..completed:
+		match projection.declarations.get(index):
+			Some(declaration):
+				match prefix_kind(declaration):
+					Some(kind):
+						if not kinds.contains(kind):
+							kinds = kinds.append(kind)
+					None:
+						found = found.concat(prefix_difference("decls[${index}].kind", "completed declaration", "error"))
+				match old_program.decls.get(index):
+					Some(old_declaration):
+						old_json = parsed_decl_to_json(old_render, old_declaration)
+						found = found.concat(value_differences(declaration_label(old_json), "decls[${index}]", old_json, parsed_decl_to_json(new_render, declaration)))
+					None:
+						void
+			None:
+				void
+
+	-- Coverage at the deferred boundary is earned only after all its evidence
+	-- matches. Keep the original wrapper's span for start/containment checks.
+	var boundary_found: List[JsonDifference] = []
+	var boundary_kind: Option[DeclarationPrefixKind] = None
+	match projection.stop:
+		ReachedEndOfSource:
+			found = found.concat(prefix_difference("prefix.length", "${old_program.decls.length()}", "${completed}"))
+		StoppedAtRejectedGlobalInitializer(_) | StoppedAtRejectedDeclaration | StoppedWithoutDeclarationProgress:
+			found = found.concat(prefix_difference("stop.rejected", "accepted boundary", "rejected or without progress"))
+		_:
+			match old_program.decls.get(completed):
+				None:
+					boundary_found = prefix_difference("stop.kind", "absent", "deferred declaration")
+				Some(declaration):
+					old_kind = prefix_kind(declaration)
+					old_span = parsed_decl_location(declaration)
+					match projection.stop:
+						StoppedAtFunctionHeader(preview):
+							boundary_kind = Some(FunctionPrefix)
+							span = preview.header_span
+							colon = preview.body_colon
+							match preview.body_extent:
+								SkippedBody(_):
+									boundary_found = boundary_span_differences(old_span, span)
+								ForwardDeclaration:
+									boundary_found = prefix_difference("stop.start", "${source_location_start_offset(old_span)}", "${span.span_start()}")
+									-- Legacy forward endpoints precede the authored colon;
+									-- their distance varies with whitespace and return syntax.
+									if source_location_end_offset(old_span) > colon.span_start():
+										boundary_found = boundary_found.concat(prefix_difference("stop.end", "at most ${colon.span_start()}", "${source_location_end_offset(old_span)}"))
+									-- A forward header cannot borrow a later declaration's colon.
+									upper_bound = match old_program.decls.get(completed + 1):
+										Some(next_declaration):
+											source_location_start_offset(parsed_decl_location(next_declaration))
+										None:
+											old_program.source.text.length()
+									if colon.span_end() > upper_bound:
+										boundary_found = boundary_found.concat(prefix_difference("stop.end", "at most ${upper_bound}", "${colon.span_end()}"))
+							boundary_found = boundary_found.concat(prefix_difference("stop.end", "${colon.span_end()}", "${span.span_end()}"))
+							if colon.span_start() < span.span_start() or colon.span_end() < colon.span_start():
+								boundary_found = boundary_found.concat(prefix_difference("stop.colon.start", "within header", "${colon.span_start()}..${colon.span_end()}"))
+							boundary_found = boundary_found.concat(prefix_difference("stop.colon", ":", old_program.source.text.substring(colon.span_start(), colon.span_end() - colon.span_start())))
+							is_private = match declaration:
+								PrivateParsedDecl(_, _): True
+								_: False
+							boundary_found = boundary_found.concat(prefix_difference("stop.visibility", "${is_private}", "${preview.visibility == PrivateVisibility}"))
+							match unwrapped_declaration(declaration):
+								FunctionParsedDecl(function):
+									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_function_header_to_json(old_render, parsed_function_header(function)), parsed_function_header_to_json(new_render, preview.header)))
+									expects_body = match preview.body_extent:
+										SkippedBody(_): True
+										ForwardDeclaration: False
+									boundary_found = boundary_found.concat(prefix_difference("stop.body", "${function.body.is_some()}", "${expects_body}"))
+								_:
+									void
+						StoppedAtTraitPreview(preview):
+							boundary_kind = Some(TraitPrefix)
+							boundary_found = boundary_span_differences(old_span, preview.owner_span)
+							is_private = match declaration:
+								PrivateParsedDecl(_, _): True
+								_: False
+							boundary_found = boundary_found.concat(prefix_difference("stop.visibility", "${is_private}", "${preview.visibility == PrivateVisibility}"))
+							match unwrapped_declaration(declaration):
+								TraitParsedDecl(trait_declaration):
+									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_trait_header_to_json(old_render, parsed_trait_header(trait_declaration)), parsed_trait_header_to_json(new_render, legacy_trait_header(preview))))
+									for index in 0..preview.methods.length():
+										match (trait_declaration.methods.get(index), preview.methods.get(index)):
+											(Some(old_method), Some(method)):
+												path = "stop.methods[${index}]"
+												boundary_found = boundary_found.concat(method_header_span_differences(path + ".header_span", old_method.span, method.header_span))
+												expects_body = match method.body_extent:
+													AbstractMethod:
+														boundary_found = boundary_found.concat(prefix_difference(path + ".header_span.end", "${source_location_end_offset(old_method.span)}", "${method.header_span.span_end()}"))
+														False
+													SkippedDefaultBody(_):
+														True
+												boundary_found = boundary_found.concat(prefix_difference(path + ".body", "${old_method.body.is_some()}", "${expects_body}"))
+											_:
+												boundary_found = boundary_found.concat(prefix_difference("stop.methods[${index}].kind", "legacy method", "absent corresponding method"))
+								_:
+									void
+						StoppedAtImplementationPreview(preview):
+							boundary_kind = Some(ImplementationPrefix)
+							boundary_found = boundary_span_differences(old_span, preview.owner_span)
+							is_private = match declaration:
+								PrivateParsedDecl(_, _): True
+								_: False
+							boundary_found = boundary_found.concat(prefix_difference("stop.visibility", "${is_private}", "${preview.visibility == PrivateVisibility}"))
+							match unwrapped_declaration(declaration):
+								ImplParsedDecl(implementation):
+									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_impl_header_to_json(old_render, parsed_impl_header(implementation)), parsed_impl_header_to_json(new_render, legacy_implementation_header(preview))))
+									for index in 0..preview.methods.length():
+										match (implementation.methods.get(index), preview.methods.get(index)):
+											(Some(old_method), Some(method)):
+												path = "stop.methods[${index}]"
+												boundary_found = boundary_found.concat(method_header_span_differences(path + ".header_span", old_method.span, method.header_span))
+												boundary_found = boundary_found.concat(prefix_difference(path + ".body", "${old_method.body.is_some()}", "${True}"))
+											_:
+												boundary_found = boundary_found.concat(prefix_difference("stop.methods[${index}].kind", "legacy method", "absent corresponding method"))
+								_:
+									void
+						StoppedAtGlobalInitializer(preview):
+							header = preview.header
+							boundary_kind = if header.is_mutable:
+								Some(MutableGlobalPrefix)
+							else:
+								Some(ConstantGlobalPrefix)
+							boundary_found = boundary_span_differences(old_span, preview.initializer.anchor).concat(boundary_span_differences(old_span, preview.header_span))
+							is_private = match declaration:
+								PrivateParsedDecl(_, _): True
+								_: False
+							boundary_found = boundary_found.concat(prefix_difference("stop.visibility", "${is_private}", "${preview.visibility == PrivateVisibility}"))
+							match unwrapped_declaration(declaration):
+								VarParsedDecl(global):
+									boundary_found = boundary_found.concat(global_initializer_entry_differences(old_program.source, global, preview))
+									boundary_found = boundary_found.concat(value_differences("", "stop.header", parsed_var_header_to_json(old_render, parsed_var_header(global)), parsed_var_header_to_json(new_render, header)))
+								_:
+									void
+						_:
+							void
+					if old_kind != boundary_kind:
+						boundary_found = boundary_found.concat(prefix_difference("stop.kind", prefix_kind_name(old_kind), prefix_kind_name(boundary_kind)))
+
+	found = found.concat(boundary_found)
+	if boundary_found.is_empty() and old_program.diagnostics.is_empty():
+		match boundary_kind:
+			Some(kind):
+				if not kinds.contains(kind):
+					kinds = kinds.append(kind)
+			None:
+				void
+	{ completed_declarations = completed, declaration_kinds = kinds, stop = prefix_stop_kind(projection.stop), differences = found }

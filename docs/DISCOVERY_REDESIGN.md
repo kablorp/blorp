@@ -1,11 +1,14 @@
 # Discovery Redesign: Per-Module Parses into Typed Syntax Trees
 
-This is an active design for review, not the current implementation.
-The default front end still uses the
-[normalized tables](DISCOVERY_TABLES_DESIGN.md). M1–M7 below remain open.
-This proposal replaces the global builder and flat syntax tables with
-independent pure module parses into typed syntax trees, a module walk and
-one link step.
+This is the design and migration record for the typed-tree path. The syntax
+prerequisite M-1 has landed, M0 measured a throwaway body-parser prototype,
+and M1 and M2 are implemented and validated. M3 remains open on rejected
+module diagnostic parity; bounded M4 global expression slices are implemented,
+and M5 to M7 remain open. It replaces the data model of
+[`DISCOVERY_TABLES_DESIGN.md`](DISCOVERY_TABLES_DESIGN.md) (one builder threaded
+through every module, a flat node table and about 50 side tables) with:
+
+The default front end still uses the normalized tables.
 
 The future schema below is specified in full; function bodies appear where
 their shape matters. Ordinary `record` is the syntax-value target under the
@@ -19,8 +22,8 @@ Syntax prerequisites are already current language rules: assignment is a
 statement, calls have no named arguments, and type parameters are explicit
 except those introduced by an `implements` receiver. The parser rejects
 syntactically forbidden forms before typecheck. The retained M0 report is
-a throwaway cost experiment, not M1 implementation. M1 begins with a fresh
-opaque-import-cycle check (3.15); M6 depends on tuple increments (7.3).
+a throwaway cost experiment, not M1 implementation. M1 retained and passed
+the opaque-import-cycle check (3.15); M6 depends on tuple increments (7.3).
 Implementation and tests win if later work diverges, and this plan must be
 updated in the same change.
 
@@ -260,7 +263,7 @@ A rejected module is specified exactly:
 ```blorp
 ---
 A module the lexer or parser reported at least one diagnostic in. It has no
-tree.
+accepted `ModuleSyntax`; its definitions index still owns partial syntax.
 
 `diagnostics` is every diagnostic the module's lexing and parsing reported,
 in the order reported today: the lexer's, then the parser's, with an
@@ -269,13 +272,18 @@ interpolation hole's lexer diagnostics where the parser reaches the hole.
 `kept_imports` is each `Import` (one module path with its alias and selected
 items) during whose parse no diagnostic was reported: the diagnostics count
 was the same after its last token as before its first. An import that
-reported anything is dropped whole, items included. So is everything that is
-not an import. The walk resolves the kept imports and loads their modules, so
-those modules' own problems are reported in the same run, as they are today.
+reported anything is dropped whole, items included. The walk resolves the kept
+imports and loads their modules, so those modules' own problems are reported
+in the same run, as they are today. Rejection keeps the authoritative
+`definitions` index minted during parsing: a diagnostic such as
+`DuplicateField(DefinitionId)` still refers to an earlier field even when its
+containing declaration has no accepted tree. Final parser spellings and source
+positions survive with this index until the last reader finishes.
 ---
 record RejectedSyntax {
 	diagnostics: AtLeastOne[SyntaxDiagnosticAt],
-	kept_imports: List[Import]
+	kept_imports: List[Import],
+	definitions: List[Definition]
 }
 ```
 
@@ -331,12 +339,12 @@ fixed record Token {
 }
 ```
 
-It is a hot, scalar-only transient value in token lists, not part of the tree
-or the public product model. An ordinary `record`
-would change its storage cost; M2 measures that choice against the token
-parity and cost gates before retaining the fixed layout. It is private to
-`lex/` and the parser's cursor module, and is read only through
-accessors that check the kind:
+It is a hot, scalar-payload transient value in token lists, not part of the tree
+or the public product model. Both `record` and `fixed record` now have managed
+semantics; the spelling does not promise inline placement or zero allocation.
+M2 measures the actual token representation against token parity and cost
+gates. It is private to `lex/` and the parser's cursor module, and is read only
+through accessors that check the kind:
 
 ```blorp
 pure func token_spelling(token: Token) -> Option[SpellingId]
@@ -345,10 +353,9 @@ pure func token_codepoint(token: Token) -> Option[Char]
 pure func token_interpolation(token: Token) -> Option[InterpolationIndex]
 ```
 
-The spelling is a transition, not a permanent layout promise: when the
-record simplification sequence converges old value records, remeasure tokens
-and choose a stage-local storage representation if ordinary records miss the
-same cost gate.
+Token storage is an internal optimization boundary. Remeasure after compiler
+record-placement changes, and choose a stage-local representation only with
+matched cost and parity evidence.
 
 The payload `Int` whose meaning depends on the kind is the one tagged `Int`
 left in the stage. It is confined to two modules and never reaches the output.
@@ -525,10 +532,10 @@ types, read by every later stage and built only by `parse/` (and tests).
 | `checked_values.brp` | The checked literal and count values and their only constructors: `DecimalFloat` (`decimal_float`), `PositiveCount` (`positive_count`), `ParentSteps` (`parent_steps`) (sections 3.5, 3.13, 5.2) |
 | `module_syntax.brp` | `ModuleSyntax`, `SyntaxCounts`, `ModuleItem`, `Documentation` (section 3.4) |
 | `imports.brp` | `ImportBlock`, `Import`, `ModulePath`, `PathAnchor`, `ImportItem` (section 3.5) |
-| `foreign.brp` | `ForeignBlock`, `ForeignArgument`, `ForeignFunction`, `ForeignCName` (section 3.6) |
+| `foreign_blocks.brp` | `ForeignBlock`, `ForeignArgument`, `ForeignFunction`, `ForeignCName` (section 3.6) |
 | `declarations.brp` | Every declaration record, `Function`, `Signature`, `Annotation`, and the parameter, type-parameter, trait-reference and constraint records (sections 3.7, 3.8) |
 | `definitions.brp` | `Definition`, the definitions index's union (section 3.18) |
-| `types.brp` | `WrittenType`, `TypeArgument`, `BoundedTypeArgument` (receivers only), `Dimension` and their kinds (section 3.9) |
+| `types.brp` | `WrittenType`, `TypeArgument`, `BoundedTypeArgument` (grouped single or argument receiver bounds), `Dimension` and their kinds (section 3.9) |
 | `patterns.brp` | `Pattern`, `PatternKind`, `ListSpread`, `Sign`, `StringForm` (section 3.10) |
 | `expressions.brp` | `Expression`, `Statement`, `Block`, `Body` and every form of sections 3.11 to 3.13, including `SubscriptPlace`: bodies, statements and expressions refer to each other, so they share a module, as the body parser does today |
 | `dump.brp` | The canonical text form of a module's syntax, for tests and the differential |
@@ -1216,6 +1223,11 @@ enum FunctionAnnotation:
 	ResourceResultOrdinaryAnnotation
 ```
 
+The current M1 implementation temporarily imports `FunctionAnnotation` from
+`tables/row_kinds.brp`, so the table path and tree records share one identical
+enum while both exist. M6 moves or deletes that table ownership with the table
+path. This is a transitional ownership exception, not a second syntax shape.
+
 `Visibility` (`PublicVisibility`, `PrivateVisibility`) and `Purity`
 (`PureFunction`, `ImpureFunction`) are today's enums. Visibility appears only
 on records that `private` can precede: top-level declarations and foreign
@@ -1313,6 +1325,7 @@ union WrittenTypeKind:
 	ArrayType(WrittenType, AtLeastOne[Dimension])          -- `Float[#3]`, `Int[#N, #M]`
 	RangeType(Dimension)                                   -- `..#N`
 	DimensionType(Dimension)                               -- `rows: #N`, `-> #M`: the type of a dimension value
+	BoundedType(BoundedTypeArgument)                        -- `(T: Eq)` in receiver context, including a receiver function result
 
 
 ---
@@ -1326,10 +1339,11 @@ union TypeArgument:
 
 
 ---
-`T: Eq + Hash` inside an `implements` receiver's arguments
-(`implements Show for Box[T: Eq]`): the type parameter that impl introduces,
-with its bounds. A bound written in any other type is a parse error, so
-`BoundedArgument` occurs only below an implementation's receiver.
+`T: Eq + Hash` in an `implements` receiver, either as a grouped single form
+or inside its arguments (`implements Show for Box[T: Eq]`): the type parameter
+that impl introduces, with its bounds. `BoundedType` owns a `WrittenTypeId`
+for the grouped single form; `BoundedArgument` has no enclosing type ID. Both share
+this payload. A bound written in any other type is a parse error.
 ---
 record BoundedTypeArgument {
 	parameter: NameUse,
@@ -1384,7 +1398,10 @@ receiver introduces the impl's type parameters, bare (`Box[T]`) or bounded
 (`Box[T: Showable]`, a conditional impl). Type parameters are otherwise only
 declared in a bracket list, and the implicit ones are gone: an undeclared `T`
 in a signature is an error, not a generalization. So `BoundedArgument` exists
-only inside a receiver; typecheck resolves the receiver's bare and bounded
+only inside a receiver. `BoundedType` represents a grouped single bound,
+including a receiver function result (`implements Show for (T: Eq)`).
+Bare root `T: Eq` leaves the colon to the implementation owner. Typecheck
+resolves the receiver's bare and bounded
 names as the impl's parameters and keeps no discovery elsewhere.
 
 ### 3.10 Patterns
@@ -2105,15 +2122,20 @@ builds at link and as a corpus test.
   issued for another node. The rule says they never build one; code review
   enforces it.
 
-**An M1 prerequisite needs a fresh check.** At M0, a compiler bug blocked
+**The opaque-cycle prerequisite is fixed and retained.** At M0, a compiler bug blocked
 this layout: `syntax/ids.brp` imports the node types it builds (from
 `expressions.brp`, `declarations.brp` and the others), and those modules
 import the id types from `ids.brp`. An opaque type inside an import cycle is
 rejected by that compiler: a record field of the opaque type failed with `Record field
 'id': expected d.DId, got DId`. The probe pairs `d.brp`/`e.brp` and `m3.brp`
 failed; the same shapes without the cycle (`f.brp`, `g.brp`, `m4.brp`)
-passed. M1 first retains and reruns a minimal cycle fixture on its integration
-base, then fixes the compiler if it still fails. The design keeps the mint
+passed. Commit `9172b35e0` fixed the identity mismatch. The retained regression
+is [`opaque_type_import_cycle.brp`](../blorp/test/compiler/stage_06_typecheck/fixtures/typecheck/should_pass/opaque_type_import_cycle.brp),
+with its `opaque_cycle_ids` and `opaque_cycle_syntax` helpers; it covers records,
+unions, aliases, globals and implementations across the cycle. It passed
+`bin/blorp check --no-format` on the M1 integration base `684f5e5`.
+M1 also compiles its real mint/node import cycles through the syntax tests.
+The design keeps the mint
 beside the id types, because that is what makes "only the mint makes an id"
 structural. It does not move the node types into `ids.brp` or the mint out
 of it to dodge the bug.
@@ -2131,8 +2153,12 @@ discards in two places, and each changes:
 2. **Record literals.** `{x = 1}` is already recognized by lookahead
    (`starts_record_field`).
 
-A placeholder built after a diagnostic may be dropped: its module is
-rejected, so no tree holds it (section 3.17).
+Information may be discarded only after no surviving tree, diagnostic, fact,
+or identifier needs it. This applies to rejected parses as well as accepted
+ones. A recovery placeholder may be dropped only when no surviving value
+refers to it; rejection alone does not establish that condition. The mint's
+exact definitions index therefore survives a rejected declaration while any
+diagnostic can refer to its definitions (section 3.17).
 
 ### 3.16 Parse state and parse function shape
 
@@ -2336,7 +2362,7 @@ parameter rules, not represented as accepted tree forms.
 | `OrPatternNode` | `AlternativePatterns(AtLeastTwo[Pattern])` |
 | `NamedTypeNode` | `NamedType(NameUse, List[TypeArgument])`; `()` is `VoidType` |
 | `QualifiedTypeNode`, `TypeQualifierNode` | `QualifiedType(NameUse, NameUse, List[TypeArgument])` |
-| `BoundedTypeNode` | `BoundedArgument(BoundedTypeArgument)` inside an `implements` receiver's arguments; rejected by M-1 in every other type |
+| `BoundedTypeNode` | `BoundedType(BoundedTypeArgument)` for a grouped single bound in receiver context, or `BoundedArgument(BoundedTypeArgument)` inside receiver arguments; rejected by M-1 in every other type |
 | `TypeBoundNode`, `QualifiedTypeBoundNode` | `TraitReference` |
 | `DimensionNameTypeNode`, `VariadicDimensionNameTypeNode` | `NamedDimension(NameUse)`, `VariadicNamedDimension(NameUse)` |
 | `DimensionWildcardTypeNode`, `VariadicDimensionWildcardTypeNode` | `WildcardDimension`, `VariadicWildcardDimension` |
@@ -2510,7 +2536,8 @@ syntax diagnostic's name argument is a spelling of its module.
 record FailedSource {
 	source: ModuleSource,
 	line_starts: List[Int],
-	spellings: Spellings
+	spellings: Spellings,
+	definitions: List[Definition]
 }
 
 
@@ -2760,12 +2787,17 @@ union LocalBinding:
   source.
 - **E20.** R0 shrinks to nothing: every discovery addition it asked for is
   either here by construction or no longer needed.
-- **E21. Spans by id.** A fact or problem that outlives the walk
-  carries the `NameUse` (which has its span) or a `Span`, never an id alone.
-  An id is identity; a span is where to point. A reader that will report must
-  keep the span, because no table maps an id back to a node. If a later
-  reader ever needs that mapping, it is one derived column per family, built
-  by `IdMint` as it mints; it is not built now.
+- **E21. Information lifetime.** An id is identity; its exact lookup must
+  survive as long as a reader needs information behind that identity.
+  `IdMint` already builds the authoritative `DefinitionId -> Definition`
+  index, and accepted and rejected syntax retain it. In particular,
+  `DuplicateField(first)` resolves the earlier field's exact spelling and
+  span through that index. Rendering rejects missing entries, cross-module
+  ids, wrong definition kinds and forward references; it never guesses a
+  name or position. A fact can instead carry its `NameUse` or `Span` when
+  that contains all information its readers need. Derived indexes for other
+  id families are built only when a reader needs them, and no referenced
+  information is discarded before its last reader finishes.
 
 ## 5. Interning and literal values
 
@@ -2842,9 +2874,16 @@ decimal.
 opaque type DecimalFloat = String
 
 pure func to_float(value: DecimalFloat) -> Float
-pure func to_float32(value: DecimalFloat) -> Float32
 pure func written_digits(value: DecimalFloat) -> String
 ```
+
+A direct `DecimalFloat` to `Float32` reader requires a decimal-to-Float32
+primitive: the current `String.parse_float` returns a 64-bit `Float`, so
+converting that result to `Float32` would round twice. This reader remains a
+consumer prerequisite before any later stage needs a numeric `Float32`
+value. M1 and M2 retain the original digits, and the legacy adapter passes
+them to the existing backend, which already emits literals at their chosen
+width. They do not materialize an intermediate `Float32` value.
 
 **Floats keep their digits: a deliberate departure from storing a checked
 `Float`** (section 9, D1). A stored 64-bit `Float` would make a `Float32`
@@ -3042,8 +3081,9 @@ must be measured before M6.
 
 | Boundary | Evidence and required next measurement |
 | --- | --- |
-| Syntax values | M1's proposed `record` names, binders, counts, annotations and forms need representative construction and return probes. Keep the role and id contract; measure its cost rather than reverting to `struct` to match M0. |
+| Syntax values | M1 construction and return probes are retained in [`discovery_redesign_record_shapes_2026-10-03.md`](../benchmarks/results/discovery_redesign_record_shapes_2026-10-03.md). Their compiler and record layout predate managed record unification; remeasure on the current bootstrap and tuple increments while retaining the role and identity contract. |
 | Tokens | M2 measures the provisional `Token` on the same token corpus, including retained bytes and instructions. `fixed record` versus `record` does not itself select inline storage: both are managed. Any future inline placement requires a separate, measured record optimization. |
+| Pure lexer and temporary bridge | The pre-unification matched stage measurement is retained in [`discovery_redesign_m2_current_2026-10-03.md`](../benchmarks/results/discovery_redesign_m2_current_2026-10-03.md). Its historical tables identity and cost ledger do not establish post-unification costs; remeasure with current managed records and bootstrap. |
 | Parser hand-off | M0 attributed substantial cost to transient state/tuple work. Its experimental tuple compiler was not the incremental implementation. Re-measure after the actual tuple increments; the report retains the historical comparison. |
 | Link and removed tables | Deleting freeze, openings, side tables, sigil interning and owner searches may save work; M0 did not measure these deletions or the new link. Measure the complete stage at M5. |
 | Tree adapter | M0 did not build it. Measure the structural adapter at M5; do not carry forward the disproved estimates. |
@@ -3104,6 +3144,191 @@ records.
 The schema assumes the current syntax rules described above. No prerequisite
 language migration remains in this plan; the import-cycle check is still
 required at M1. The M0 prototype is evidence only.
+
+**Current milestone status:** M1 and M2 are complete. M1's pre-unification ordinary-record
+construction costs and token comparison are in
+[`discovery_redesign_record_shapes_2026-10-03.md`](../benchmarks/results/discovery_redesign_record_shapes_2026-10-03.md).
+M2's pre-unification stage cost and byte-identical tables dump are in
+[`discovery_redesign_m2_current_2026-10-03.md`](../benchmarks/results/discovery_redesign_m2_current_2026-10-03.md).
+M3 has the parse state, token cursor, imports, written types, dimensions,
+patterns and the shared field, type-parameter, signature and constraint
+grammar. Direct declaration leaves now cover ordinary and fixed records through
+one generic-capable `RecordDeclaration`, aliases, builtin and resource types, unions, enums and
+top-level function headers. Complete foreign blocks cover their attributes,
+bodyless function signatures and optional C names. Trait previews cover type
+parameters, supertraits and method headers. Their method previews distinguish
+abstract methods from authored deferred default bodies and reject a promised
+body that is missing. They mint no declaration definitions: M4 replays each
+completed method in source order and mints the containing trait last, preserving
+child ID order when deferred bodies become syntax trees. Declaration-prefix
+scanning preserves documentation, annotations, visibility and purity and composes
+those prefixes with the function header parser.
+Implementation-method previews reuse that signature grammar and require authored
+deferred bodies, leaving abstract and forward method states unrepresentable.
+Receiver-specific type parsing preserves bounded arguments and the grouped bounded
+type forms that can occur at a receiver root or function result. Implementation
+previews cover the single trait target, receiver and method headers without minting
+declaration definitions. M4 replays from the authoritative pre-declaration state,
+completes methods in source order and mints the containing implementation last.
+Global-header previews preserve their metadata, names and written types while
+stopping at an explicit initializer entry; M4 owns initializer expressions and
+completes the global declaration. A function header records `ForwardDeclaration`
+or `SkippedBody(DeferredBody)` explicitly, preserving forward declarations as
+authored syntax while M4 owns body trees.
+Import blocks now own their layout and repeated child imports. A test-only
+single-declaration dispatcher routes every completed leaf and declaration preview,
+and stops explicitly at global initializer or rejected-declaration boundaries.
+Both record spellings use the same type-parameter and field grammar and have
+managed semantics. The explicit `RecordDeclarationForm` preserves authored
+spelling for diagnostics and legacy projection. `struct` is an ordinary
+identifier; the retired declaration spelling is rejected by the current
+parser grammar.
+The module preamble recognizes a leading module docstring only when its next
+non-newline token is `import`; other docstrings remain declaration prefixes.
+A bounded test-only module scan retains those previews in source order and stops
+at global initializers or the first rejected declaration. It
+does not claim an accepted `ModuleSyntax`, final ID census or forward pairing.
+The test-only legacy declaration projection now maps the completed non-body
+prefix through one shared legacy name table. It covers both record spellings, aliases, builtin and resource types, unions, enums, import blocks
+and foreign blocks, including module and declaration documentation, visibility,
+annotations and normalized import paths. At a function, trait, implementation
+or global initializer it now projects the body-independent header structurally;
+it still stops at that deferred owner and at rejected or non-progressing scan
+boundaries, and never constructs a `ParsedProgram`. Unit
+differentials compare every projected declaration with the old parser and pin
+name-id continuity across declarations and projections. The additive
+declaration-prefix corpus differential now runs this projection from each exact
+accepted old-parser source and program, threads one shared synthesized name table,
+and fails closed on projection errors, rejected or non-progressing accepted
+boundaries, malformed protocol output and any unlisted field difference. Its
+first full corpus run compared 3,307 accepted modules and 4,403 completed
+declarations with zero tree-prefix differences or errors. Distinct per-module
+coverage included all completed forms: 2,095 import blocks, 69 foreign blocks,
+447 ordinary records, 118 `struct` declarations, 10 `fixed record` declarations,
+168 aliases, 29 builtin types, 10 resource types, 309 unions and 127 enums.
+The deferred function stop now projects a body-free legacy header and compares
+its name, keyword, type parameters and bounds, parameters and types, result,
+dimension constraints, purity, annotations and documentation through the shared
+AST JSON encoding. The same corpus run validated 2,683 function-header stops
+with no structural or boundary difference while leaving bodies unconstructed.
+It also validated all 452 global-initializer stops by comparing the global name,
+optional written type, constant or mutable form, documentation, visibility and
+exact assignment and initializer-entry boundary. The selected global header
+advances the shared name table, while its initializer and any later declaration
+cannot contribute names. A later 3,404-file parity run, whose 3,307 accepted
+modules entered declaration-prefix comparison, compared 60 trait headers and
+57 implementation headers, including every ordered method header,
+abstract/default or required-body presence and per-method boundary. Names from
+deferred method bodies and later declarations remain outside the projected name
+table. Module assembly, rejected-module tree diagnostic parity, the remaining
+global initializer expression families, trait and implementation bodies and
+completed owners, and forward pairing remain open.
+The standalone alias, builtin-type, enum, ordinary-record, union and
+fixed-record rejection previews now own a shared opaque `RejectedPreview`:
+source, line starts, final parser spellings, all issued definitions and ordered
+diagnostics. Its constructor rejects an empty diagnostic list. `new_parse_state`
+validates that line starts exactly match the source in one scan without building
+a second list; malformed lexical inputs fail before layout or rendering. The bounded
+`render_rejected_duplicate_field` seam resolves the surviving `DefinitionId`
+against that immutable index and shares wording with the table renderer.
+Focused regressions cover both record spellings, a nonzero earlier field id, and invalid missing, cross-module,
+wrong-kind and forward references. This closes the preview lifetime blocker;
+full rejected-module assembly and diagnostic parity remain open.
+
+The syntax diagnostic payload audit found one definition identity
+(`DuplicateField`) and spelling identities in `ReservedKeywordAsName`,
+`UnknownAnnotation`, `ConcurrentDuplicateParameter`,
+`ConcurrentUnknownParameter` and `ConcurrentForUnknownParameter`. The shared
+rejection owner keeps both lookup
+families. Other syntax payloads carry direct values or spans and retain their
+source with the same owner.
+
+The first bounded M4 slice completes a global only when its initializer is one
+same-line ordinary name, checked decimal integer literal or checked float
+literal and its following token proves an EOF or newline boundary rather than
+a leading-dot continuation. It checks the whole supported shape before minting
+anything. A name mints its `NameUse`, `Expression`, and global definition in
+that order; a numeric literal mints only its `Expression` and global definition.
+The tree keeps the checked integer magnitude or decimal float while the legacy
+projection recovers the exact authored digits, so `007` and `007.500` remain
+unchanged. Every unsupported expression returns the exact
+authoritative initializer state. The existing M3 scan remains the default; an
+explicit test-only scan opts into atomic completion. Its legacy projection
+compares the full `ParsedVarDecl`, including the initializer and complete span,
+while threading the shared name table through repeated spellings and later
+modules. After a fresh rebuild, the 3,404-file parity gate passed with zero
+mismatched files. Its declaration-prefix run compared 3,308 accepted modules
+and 4,862 completed declarations, then stopped at 2,782 functions, 60 traits,
+59 implementations, 339 unsupported global initializers and 68 ends of source,
+with no rejected or non-progressing accepted boundary. This proves only the
+three atomic initializer forms: general expressions, complete bodies, module
+assembly, final ID census and the rest of M4 remain open.
+
+
+A bounded diagnostic gate now renders every `SyntaxDiagnostic` variant
+from the retained rejection owner. Spelling payloads resolve through its final
+spelling table; `DuplicateField` resolves through its exact definitions index.
+The tree and table renderers share context-free wording helpers. A separate
+whole-source rejected-declaration scan continues leaf recovery to EOF and
+compares every ordered diagnostic, including help, byte spans and tab-aware
+locations, against the table renderer. Raw legacy differences are always
+reported, and counted as baseline differences only after exact tree/table
+equality, preserving the stage's existing help and wording changes. It explicitly
+defers functions, traits, implementations and globals before their omitted
+bodies or initializers can affect diagnostics. Those deferred counts remain
+outside this proof; full rejected-module parity remains open.
+
+A second bounded M4 expression increment recognizes same-line names, checked numeric
+literals, booleans, void, grouping, unary operators and the shared binary
+operator table, including logical and range expressions. It first builds an
+ID-free recipe and validates the complete boundary. Only then does it mint
+syntax identities in source order. Unsupported postfix, aggregate, control
+flow and multiline shapes restore the exact entry state. An explicit prefix
+scan opts into this expression grammar; production discovery remains unchanged.
+The legacy projection walks expression continuations iteratively, preserving
+source-order names and spans. Grouped integer literals recover digits from
+an exact balanced token shape, with a projection error when provenance is
+missing. This increment does not complete function bodies, blocks, module
+assembly, forward pairing or the full M4 deep-chain gate.
+
+Validation before the main reconciliation, at `a5ae15eab`:
+
+The combined fresh-build focused run passed 121/121 tests, including a
+5,000-term binary chain through parsing and legacy projection. The separate
+rejection differential read 3,500 source files, skipped 3,320 accepted by the
+legacy parser, and compared all 35 ordered diagnostics in 27 complete rejected
+leaf modules with zero tree/table differences or errors. It reported 31 raw
+legacy baseline differences and explicitly deferred 122 function owners,
+4 traits, 1 implementation and 26 global initializers. Deferred owners are not
+rejected-module parity evidence. Logs are retained at
+`/tmp/blorp-discovery-expression-final` for this local run.
+The broader fresh-build gates also passed: `compiler-new` 805/805,
+`compiler-blorp` 6,460/6,460 and `compiler-new-parity` 3,508/3,508. The
+expression opt-in corpus prefix compared 5,028 completed declarations and
+stopped at 2,845 functions, 60 traits, 59 implementations, 326 unsupported
+global initializers and 68 ends of source, with zero rejected or non-progress
+stops. These counts establish the bounded expression seam, not complete body
+or module parity. Independent code review approved the change with no
+remaining findings.
+
+The main reconciliation uses the managed-record bootstrap `dev-d44472d3a5d0`.
+Both record spellings share one generic-capable declaration type, and `struct`
+remains an ordinary identifier. The current lexer, bridge, parser and full-load
+allocation contracts are measured separately in
+[`discovery_merge_allocations_2026-10-04.md`](../benchmarks/results/discovery_merge_allocations_2026-10-04.md);
+historical inline-record counts are not current cost evidence. Rejected type
+parameters stop the tree record parser before its field grammar. If recovery
+then reaches an identifier that may start a global, the rejection scan reports
+that deferred owner and excludes the source from complete diagnostic parity.
+
+The reconciled fresh-build checks passed 147/147 focused discovery tests,
+6/6 ownership regressions with zero reported leaks, and `compiler-new`
+825/825. The rejected corpus read 3,519 modules, skipped 3,342 accepted by the
+legacy parser, and compared 35 diagnostics in 27 complete rejected leaf modules:
+zero strict tree/table differences or errors, with 31 separately reported legacy
+baseline differences. It deferred 119 function owners, 4 traits, 1 implementation
+and 26 globals; those 150 owners remain outside the proof. Logs are in
+`/tmp/blorp-merge-publish-tests/`.
 
 | # | Change | Proof | Deleted |
 | --- | --- | --- | --- |

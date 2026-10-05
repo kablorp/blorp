@@ -1,0 +1,301 @@
+-- Standalone union/enum previews own syntax and lexical evidence only.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/enum_preview:
+		EnumPreview,
+		EnumPreviewOutcome(PreviewedEnum, RejectedEnumPreview, UnsupportedEnumPreview),
+		enum_declaration,
+		enum_source,
+		preview_enum,
+	../../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_span_text
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
+	../../../../src/compiler_new/stage_01_discovery/parse/union_preview:
+		UnionPreview,
+		UnionPreviewOutcome(PreviewedUnion, RejectedUnionPreview, UnsupportedUnionPreview),
+		preview_union,
+		union_declaration,
+		union_source,
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations:
+		TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter),
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics:
+		SyntaxDiagnostic(ExpectedToken, Plain),
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
+		PlainSyntaxCode(
+			UnexpectedCharacterDiagnostic, EnumCaseParenthesesDiagnostic,
+			UnionVariantTooManyFieldsDiagnostic,
+		),
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ColonConstruct(ColonInUnionVariants),
+		ExpectedTokenDiagnostic(ExpectedColon),
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/limits: MAX_UNION_VARIANT_FIELDS
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
+	test: TestSuite
+
+
+private pure func covers(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+pure func test_rich_union_preserves_metadata_spans_parameters_variants_and_source() -> Bool:
+	text: String = "union Choice[T: m.Eq + Hashable, #N, #_]:\n\tBare\n\tEmpty()\n\tPair(T, Int,)\n\tTrue\n\tFalse\n"
+
+	match preview_union(lex_module(module_id_at_row(3), text)):
+		Ok(PreviewedUnion(preview)):
+			value = union_declaration(preview)
+			source = union_source(preview)
+
+			match (value.type_parameters, value.variants):
+				([TypeVariable(variable), DimensionVariable(dimension), WildcardDimensionParameter(wildcard)], [bare, empty, pair, truth, falsity]):
+					match variable.bounds:
+						[qualified, hashable]:
+							(
+								value.visibility == PublicVisibility
+								and value.documentation.is_none()
+								and value.name.span.covers(6, 12)
+								and value.span.covers(0, text.length())
+								and source.source.text == text
+								and not source.tokens.is_empty()
+								and qualified.qualifier.is_some()
+								and hashable.qualifier.is_none()
+								and source.preview_span_text(value.name.span) == "Choice"
+								and source.preview_span_text(variable.binder.name.span) == "T"
+								and source.preview_span_text(dimension.name.span) == "#N"
+								and source.preview_span_text(wildcard) == "#_"
+								and bare.payload.is_empty()
+								and empty.payload.is_empty()
+								and pair.payload.length() == 2
+								and bare.span.covers(43, 47)
+								and empty.span.covers(49, 56)
+								and pair.span.covers(58, 71)
+								and source.preview_span_text(truth.name.span) == "True"
+								and source.preview_span_text(falsity.name.span) == "False"
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_enum_boolean_and_soft_cases_preserve_metadata_spans_and_source() -> Bool:
+	text: String = "enum Flags:\n\tTrue\n\tFalse\n\tdebug\n"
+
+	match preview_enum(lex_module(module_id_at_row(3), text)):
+		Ok(PreviewedEnum(preview)):
+			value = enum_declaration(preview)
+			source = enum_source(preview)
+
+			match value.cases:
+				[truth, falsity, soft]:
+					(
+						value.visibility == PublicVisibility
+						and value.documentation.is_none()
+						and value.name.span.covers(5, 10)
+						and value.span.covers(0, text.length())
+						and source.source.text == text
+						and not source.tokens.is_empty()
+						and source.preview_span_text(value.name.span) == "Flags"
+						and truth.span.covers(13, 17)
+						and falsity.span.covers(19, 24)
+						and soft.span.covers(26, 31)
+						and source.preview_span_text(truth.name.span) == "True"
+						and source.preview_span_text(falsity.name.span) == "False"
+						and source.preview_span_text(soft.name.span) == "debug"
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_eof_blocks_blank_lines_and_terminal_newlines_are_supported() -> Bool:
+	var correct: Bool = True
+
+	for text in ["union U:\n\tA", "union U:\n\tA\n\t\n\tB\n\n"]:
+		match preview_union(lex_module(module_id_at_row(0), text)):
+			Ok(PreviewedUnion(preview)):
+				correct = (
+					union_declaration(preview).span.covers(0, text.length())
+					and union_source(preview).source.text == text
+					and correct
+				)
+			_:
+				correct = False
+
+	for text in ["enum E:\n\tA", "enum E:\n\tA\n\t\n\tB\n\n"]:
+		match preview_enum(lex_module(module_id_at_row(0), text)):
+			Ok(PreviewedEnum(preview)):
+				correct = (
+					enum_declaration(preview).span.covers(0, text.length())
+					and enum_source(preview).source.text == text
+					and correct
+				)
+			_:
+				correct = False
+
+	correct
+
+
+pure func test_missing_colon_and_enum_parentheses_reject_with_exact_diagnostics() -> Bool:
+	union_rejected: Bool = match preview_union(lex_module(module_id_at_row(0), "union U\n\tA")):
+		Ok(RejectedUnionPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						ExpectedToken(ExpectedColon(ColonInUnionVariants)):
+							at.span.covers(9, 9)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+	enum_rejected: Bool = match preview_enum(lex_module(module_id_at_row(0), "enum E:\n\tA()")):
+		Ok(RejectedEnumPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(EnumCaseParenthesesDiagnostic):
+							at.span.covers(9, 10)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+	union_rejected and enum_rejected
+
+
+pure func test_payload_overflow_rejects_once_at_original_variant_name() -> Bool:
+	var payload: String = "Int"
+	var count: Int = 1
+
+	while count <= MAX_UNION_VARIANT_FIELDS:
+		payload += ", Int"
+		count += 1
+
+	match preview_union(lex_module(module_id_at_row(0), "union U:\n\tMany(${payload})\n")):
+		Ok(RejectedUnionPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(UnionVariantTooManyFieldsDiagnostic):
+							at.span.covers(10, 14)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_lexical_diagnostics_reject_before_recognition() -> Bool:
+	union_rejected: Bool = match preview_union(lex_module(module_id_at_row(0), "`")):
+		Ok(RejectedUnionPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(UnexpectedCharacterDiagnostic):
+							at.span.covers(0, 1)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+	enum_rejected: Bool = match preview_enum(lex_module(module_id_at_row(0), "`")):
+		Ok(RejectedEnumPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(UnexpectedCharacterDiagnostic):
+							at.span.covers(0, 1)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+	union_rejected and enum_rejected
+
+
+pure func test_headers_other_forms_multiple_declarations_and_trailing_material_are_unsupported(
+
+) -> Bool:
+	var correct: Bool = True
+
+	for text in [
+		"enum E:\n\tA",
+		"record R {}",
+		"type alias A = Int",
+		"type A = builtin",
+		"private union U:\n\tA",
+		"---\nDocs\n---\nunion U:\n\tA",
+		"union U:\n\tA\nenum E:\n\tB",
+		"union U:\n\tA\nif",
+	]:
+		match preview_union(lex_module(module_id_at_row(0), text)):
+			Ok(UnsupportedUnionPreview):
+				void
+			_:
+				correct = False
+
+	for text in [
+		"union U:\n\tA",
+		"record R {}",
+		"opaque type A = Int",
+		"resource type A = builtin",
+		"private enum E:\n\tA",
+		"---\nDocs\n---\nenum E:\n\tA",
+		"enum E:\n\tA\nenum F:\n\tB",
+		"enum E:\n\tA\nif",
+	]:
+		match preview_enum(lex_module(module_id_at_row(0), text)):
+			Ok(UnsupportedEnumPreview):
+				void
+			_:
+				correct = False
+
+	correct
+
+
+tests: TestSuite = {
+	description = "Standalone union and enum previews",
+	tests = [
+		(
+			"rich union preserves metadata spans parameters variants and source",
+			test_rich_union_preserves_metadata_spans_parameters_variants_and_source,
+		),
+		(
+			"enum boolean and soft cases preserve metadata spans and source",
+			test_enum_boolean_and_soft_cases_preserve_metadata_spans_and_source,
+		),
+		(
+			"eof blocks blank lines and terminal newlines are supported",
+			test_eof_blocks_blank_lines_and_terminal_newlines_are_supported,
+		),
+		(
+			"missing colon and enum parentheses reject with exact diagnostics",
+			test_missing_colon_and_enum_parentheses_reject_with_exact_diagnostics,
+		),
+		(
+			"payload overflow rejects once at original variant name",
+			test_payload_overflow_rejects_once_at_original_variant_name,
+		),
+		(
+			"lexical diagnostics reject before recognition",
+			test_lexical_diagnostics_reject_before_recognition,
+		),
+		(
+			"headers other forms multiple declarations and trailing material unsupported",
+			test_headers_other_forms_multiple_declarations_and_trailing_material_are_unsupported,
+		),
+	]
+}

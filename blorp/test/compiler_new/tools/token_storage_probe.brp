@@ -1,0 +1,84 @@
+-- The same real lexer token corpus under two layouts of tables/Token.
+-- Build this tool once with fixed record Token and once with ordinary record
+-- Token, using the same compiler, C flags and list of corpus files. Retained bytes are
+-- read after the lexer's spellings/literals/interpolations have been released.
+-- Run plain builds under /usr/bin/time -l for instructions, and diagnostic
+-- builds with BLORP_MEMORY_STATS=1 for managed objects and retained bytes.
+-- Usage: token_storage_probe <file-list> <read-rounds>
+import:
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/tables/span: span_end, span_start
+	../../../src/compiler_new/stage_01_discovery/tables/token: Token, token_kind_name
+	memory: MemStats, get_mem_stats, reset_mem_stats
+	system: read_file
+
+
+func source_texts(list_path: String) -> Result[List[String], String]:
+	match read_file(list_path):
+		Ok(listing):
+			var loaded: Result[List[String], String] = Ok([])
+
+			for path in listing.lines():
+				if not path.is_empty():
+					match loaded:
+						Ok(texts):
+							match read_file(path):
+								Ok(text):
+									loaded = Ok(texts.append(text))
+								Err(error):
+									loaded = Err("${path}: ${error}")
+						Err(_):
+							break
+
+			loaded
+		Err(error):
+			Err(error)
+
+
+pure func corpus_tokens(texts: List[String]) -> List[List[Token]]:
+	var modules: List[List[Token]] = []
+	var module_index: Int = 0
+
+	for text in texts:
+		modules = modules.append(lex_module(module_id_at_row(module_index), text).tokens)
+		module_index += 1
+
+	modules
+
+
+pure func read_tokens(modules: List[List[Token]], rounds: Int) -> Int:
+	var checksum: Int = 0
+
+	for round in 0..rounds:
+		for tokens in modules:
+			for token in tokens:
+				checksum = checksum * 31 + token.payload + token.span.span_start()
+				checksum = checksum * 31 + token.span.span_end() + token.kind.token_kind_name().length()
+
+	checksum
+
+
+func main(args: List[String]) -> Int:
+	match source_texts(args.get_or(1, "")):
+		Ok(texts):
+			rounds: Int = args.get_or(2, "1").parse_int().get_or(1)
+			reset_mem_stats()
+			before: MemStats = get_mem_stats()
+			modules: List[List[Token]] = corpus_tokens(texts)
+			after: MemStats = get_mem_stats()
+			checksum: Int = read_tokens(modules, rounds)
+			var token_count: Int = 0
+
+			for tokens in modules:
+				token_count += tokens.length()
+
+			-- Keep the input texts alive through the measured boundary: releasing
+			-- them between the snapshots would subtract their bytes from the result.
+			print("modules=${texts.length()} tokens=${token_count} rounds=${rounds} checksum=${checksum}")
+			print("allocations=${after.total_allocations - before.total_allocations} retained_objects=${after.current_objects - before.current_objects}")
+			print("retained_bytes=${after.bytes_allocated - before.bytes_allocated} bytes_available=${after.bytes_available} counters_active=${after.memory_stats_active}")
+			0
+		Err(error):
+			print("cannot read token corpus: ${error}")
+			1

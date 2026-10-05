@@ -1,0 +1,127 @@
+-- Lexical evidence owned by standalone declaration previews. Authored spans
+-- and token kinds supply exact bytes without reconstructing their spelling.
+import:
+	../lex/lexed_module: LexedModule, LexedSource
+	../tables/ids: source_id_index
+	../tables/span: Span, span_start, span_end, span_source, pack_span
+	../tables/token: Token, TokenKind(UnderscoreSymbol, IntLiteralToken, LeftParenSymbol, RightParenSymbol)
+
+
+record PreviewSource {
+	source: LexedSource,
+	tokens: List[Token]
+}
+
+
+pure func preview_source(lexed: LexedModule) -> PreviewSource:
+	{ source = lexed.source, tokens = lexed.tokens }
+
+
+pure func preview_span_text(preview: PreviewSource, span: Span) -> String:
+	preview.source.text.substring(span_start(span), span_end(span) - span_start(span))
+
+
+-- Grouping widens a numeric expression's location without changing its literal.
+-- Validate the exact lexical shape: opening groups, one integer, closing groups.
+-- A lower-bound search avoids rescanning the module for every numeric leaf.
+pure func preview_integer_literal_text(preview: PreviewSource, span: Span) -> Option[String]:
+	var lower: Int = 0
+	var upper: Int = preview.tokens.length()
+	var valid: Bool = True
+
+	while valid and lower < upper:
+		middle: Int = (lower + upper) / 2
+
+		match preview.tokens.get(middle):
+			Some(token):
+				if span_start(token.span) < span_start(span):
+					lower = middle + 1
+				else:
+					upper = middle
+			None:
+				valid = False
+
+	var index: Int = lower
+	var groups: Int = 0
+	var literal: Option[Token] = None
+	var last_end: Int = span_start(span)
+	var closing: Bool = False
+
+	while valid and index < preview.tokens.length():
+		match preview.tokens.get(index):
+			None:
+				valid = False
+			Some(token):
+				if span_start(token.span) >= span_end(span):
+					break
+
+				if (
+					span_source(token.span).source_id_index() != span_source(span).source_id_index()
+					or span_end(token.span) > span_end(span)
+					or index == lower and span_start(token.span) != span_start(span)
+				):
+					valid = False
+
+				match token.kind:
+					LeftParenSymbol:
+						if literal.is_some() or closing:
+							valid = False
+
+						groups += 1
+					IntLiteralToken:
+						if literal.is_some() or closing:
+							valid = False
+
+						literal = Some(token)
+					RightParenSymbol:
+						if literal.is_none() or groups == 0:
+							valid = False
+
+						closing = True
+						groups -= 1
+					_:
+						valid = False
+
+				last_end = span_end(token.span)
+
+		index += 1
+
+	if (
+		not valid
+		or groups != 0
+		or last_end != span_end(span)
+	):
+		None
+	else:
+		literal.map(pure func(token): preview_span_text(preview, token.span))
+
+
+-- A literal dimension may start at a separate hash token with whitespace or
+-- comments before its integer. Read the integer token's authored bytes, never
+-- the intervening trivia or a formatted checked value.
+pure func preview_dimension_literal_text(preview: PreviewSource, span: Span) -> Option[String]:
+	contents: PreviewSource = preview
+	var digits: Option[String] = None
+
+	for token in contents.tokens:
+		if (token.kind == IntLiteralToken and span_end(token.span) == span_end(span)
+			and span_start(token.span) >= span_start(span)):
+			digits = Some(contents.source.text.substring(span_start(token.span), span_end(token.span) - span_start(token.span)))
+			break
+
+	digits
+
+
+-- A variadic wildcard's legacy identifier ends at its authored underscore,
+-- before the ellipsis. Trivia between hash and underscore belongs to its span.
+pure func preview_variadic_wildcard_span(preview: PreviewSource, span: Span) -> Option[Span]:
+	contents: PreviewSource = preview
+	var identifier_span: Option[Span] = None
+
+	for token in contents.tokens:
+		if (token.kind == UnderscoreSymbol and span_start(token.span) >= span_start(span)
+			and span_end(token.span) <= span_end(span)):
+			identifier_span = Some(pack_span(span_source(span), span_start(span), span_end(token.span)))
+			break
+
+	identifier_span

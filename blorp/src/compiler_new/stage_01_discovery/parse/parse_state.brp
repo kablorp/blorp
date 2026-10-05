@@ -1,0 +1,928 @@
+-- The direct parser's opaque construction boundary. Recovery values exist
+-- only after a diagnostic, inside a rejected declaration preview. This module
+-- exposes no AcceptedSource or ModuleSyntax constructor.
+import:
+	../lex/lexed_module: LexedModule, LexedSource, LiteralValue
+	../syntax/declarations:
+		AliasDeclaration,
+		AliasForm,
+		Annotation,
+		BuiltinTypeDeclaration,
+		CleanupBuiltin,
+		EnumCase,
+		EnumDeclaration,
+		FieldDeclaration,
+		GlobalDeclaration,
+		GlobalForm,
+		Parameter,
+		RecordDeclaration,
+		ResourceTypeDeclaration,
+		TypeParameter,
+		UnionDeclaration,
+		RecordDeclarationForm,
+		VariantDeclaration,
+	../syntax/diagnostics:
+		SyntaxDiagnostic(
+			Plain, ExpectedToken, UnknownEscape, IntegerLiteralOverflow, FloatLiteralOverflow,
+			UnexpectedByte, ReservedKeywordAsName,
+		),
+		SyntaxDiagnosticAt,
+	../syntax/expressions: Expression, ExpressionKind
+	../syntax/foreign_blocks: ForeignCName, ForeignFunction
+	../syntax/ids:
+		IdMint,
+		IssuedIds,
+		SpellingId,
+		issued,
+		minted_alias,
+		minted_binder,
+		minted_builtin_type,
+		minted_dimension,
+		minted_enum,
+		minted_enum_case,
+		minted_expression,
+		minted_field,
+		minted_foreign_function,
+		minted_global,
+		minted_import,
+		minted_name_use,
+		minted_pattern,
+		minted_record,
+		minted_resource_type,
+		minted_type_binder,
+		minted_union,
+		minted_variant,
+		minted_written_type,
+		new_id_mint,
+	../syntax/imports: Import, ImportItem, ModulePath
+	../syntax/module_syntax: Documentation, SyntaxCounts
+	../syntax/names: Binder, NameUse, TypeBinder, WrittenName
+	../syntax/patterns: Pattern, PatternKind
+	../syntax/spellings: Spellings, interned_spelling
+	../syntax/types: Dimension, DimensionKind, WrittenType, WrittenTypeKind
+	../tables/diagnostic_code as TableDiagnostics
+	../tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedName),
+		NameConstruct(NameInVariantName, NameInParameterName, NameInVariableName),
+	../tables/ids: ModuleId
+	../tables/row_kinds: Purity, Visibility
+	../tables/source_position: column_at
+	../tables/span: Span, pack_span, span_end, span_source, span_start
+	../tables/token:
+		KEYWORD_KINDS_IN_SEEDED_ORDER,
+		Token,
+		TokenKind(
+			IdentifierToken, DimensionNameToken, SelfKeyword, VoidKeyword, TrueKeyword,
+			FalseKeyword, IntLiteralToken, FloatLiteralToken, NormalStringToken, RawStringToken,
+			PipeStringToken, RawPipeStringToken, DocStringToken, EndOfFileToken, NewlineToken,
+			DedentToken, ColonSymbol, CommaSymbol, LeftParenSymbol, RightBracketSymbol,
+			RightParenSymbol, LeftBracketSymbol, LeftBraceSymbol, RightBraceSymbol,
+			UnderscoreSymbol,
+		),
+		fixed_token_spelling,
+	token_cursor:
+		TokenCursor,
+		TokenInputError,
+		advanced as advanced_cursor,
+		current_token as cursor_token,
+		cursor_position,
+		is_soft_keyword,
+		new_token_cursor,
+		peek_kind as cursor_peek,
+		previous_content_span as cursor_previous_content_span,
+		token_spelling,
+
+
+union ParseInputError:
+	EmptyRejection
+	InvalidLineStarts
+	InvalidTokenInput(TokenInputError)
+	NonLexicalDiagnostic(Span, TableDiagnostics.SyntaxDiagnostic)
+
+
+opaque type ParseState = ParseFields
+
+
+private record ParseFields {
+	module: ModuleId,
+	source: LexedSource,
+	line_starts: List[Int],
+	cursor: TokenCursor,
+	spellings: Spellings,
+	mint: IdMint,
+	diagnostics: List[SyntaxDiagnosticAt],
+	previous: Span
+}
+
+
+enum NameRole:
+	OrdinaryName
+	TypeName
+	VariantName
+
+
+private RECOVERY_NAME: String = "_"
+
+private DISCARD_NAME: String = "_"
+
+
+pure func new_parse_state(lexed: LexedModule) -> Result[ParseState, ParseInputError]:
+	if not valid_line_starts(lexed.source.text, lexed.line_starts):
+		Err(InvalidLineStarts)
+	else:
+		match new_token_cursor(lexed):
+			Err(error):
+				Err(InvalidTokenInput(error))
+			Ok(cursor):
+				var diagnostics: List[SyntaxDiagnosticAt] = []
+				var problem: Option[ParseInputError] = None
+
+				for at in lexed.diagnostics:
+					match lexical_diagnostic(at.diagnostic):
+						Some(diagnostic):
+							diagnostics = diagnostics.append({
+								span = at.span,
+								diagnostic = diagnostic,
+							})
+						None:
+							problem = Some(NonLexicalDiagnostic(at.span, at.diagnostic))
+							break
+
+				match problem:
+					Some(error):
+						Err(error)
+					None:
+						Ok(into_opaque ParseState({
+									module = lexed.module,
+									source = lexed.source,
+									line_starts = lexed.line_starts,
+									cursor = cursor,
+									spellings = lexed.spellings,
+									mint = new_id_mint(lexed.module),
+									diagnostics = diagnostics,
+									previous = cursor_token(cursor).span
+								}))
+
+
+private pure func lexical_diagnostic(
+	diagnostic: TableDiagnostics.SyntaxDiagnostic,
+) -> Option[SyntaxDiagnostic]:
+	match diagnostic:
+		TableDiagnostics.Plain(code):
+			if lexical_plain_code(code):
+				Some(Plain(code))
+			else:
+				None
+		TableDiagnostics.UnknownEscape(character):
+			Some(UnknownEscape(character))
+		TableDiagnostics.IntegerLiteralOverflow(digits):
+			Some(IntegerLiteralOverflow(digits))
+		TableDiagnostics.FloatLiteralOverflow(digits):
+			Some(FloatLiteralOverflow(digits))
+		TableDiagnostics.UnexpectedByte(character):
+			Some(UnexpectedByte(character))
+		_:
+			None
+
+
+private pure func lexical_plain_code(code: TableDiagnostics.PlainSyntaxCode) -> Bool:
+	match code:
+		TableDiagnostics.InconsistentIndentationDiagnostic | TableDiagnostics.UnexpectedCharacterDiagnostic:
+			True
+		TableDiagnostics.InvalidCharLiteralDiagnostic | TableDiagnostics.UnicodeCodepointOutOfRangeDiagnostic:
+			True
+		TableDiagnostics.UnicodeEscapeDigitCountDiagnostic | TableDiagnostics.UnicodeEscapeNonHexDiagnostic:
+			True
+		TableDiagnostics.UnterminatedCharLiteralDiagnostic | TableDiagnostics.UnterminatedUnicodeEscapeDiagnostic:
+			True
+		TableDiagnostics.MultilineRawStringDiagnostic | TableDiagnostics.MultilineStringDiagnostic:
+			True
+		TableDiagnostics.UnterminatedDocstringDiagnostic | TableDiagnostics.UnterminatedEscapeDiagnostic:
+			True
+		TableDiagnostics.UnterminatedRawStringDiagnostic | TableDiagnostics.UnterminatedStringDiagnostic:
+			True
+		TableDiagnostics.InterpolationTooDeepDiagnostic | TableDiagnostics.InterpolatedEscapeAtEndDiagnostic:
+			True
+		TableDiagnostics.MultilineInterpolatedStringDiagnostic | TableDiagnostics.UnterminatedInterpolatedStringDiagnostic:
+			True
+		_:
+			False
+
+
+pure func current_token(state: ParseState) -> Token:
+	cursor_token(from_opaque ParseState(state).cursor)
+
+
+pure func current_kind(state: ParseState) -> TokenKind:
+	state.current_token().kind
+
+
+pure func current_span(state: ParseState) -> Span:
+	state.current_token().span
+
+
+pure func span_before_current(state: ParseState) -> Span:
+	span: Span = state.current_span()
+	pack_span(span.span_source(), span.span_start(), span.span_start())
+
+
+pure func at_soft_boundary(state: ParseState) -> Bool:
+	match state.current_kind():
+		EndOfFileToken | NewlineToken | DedentToken | ColonSymbol | CommaSymbol | LeftParenSymbol | RightBracketSymbol | RightParenSymbol:
+			True
+		_:
+			False
+
+
+pure func previous_span(state: ParseState) -> Span:
+	from_opaque ParseState(state).previous
+
+
+pure func position(state: ParseState) -> Int:
+	from_opaque ParseState(state).cursor.cursor_position()
+
+
+pure func peek_kind(state: ParseState, ahead: Int) -> TokenKind:
+	cursor_peek(from_opaque ParseState(state).cursor, ahead)
+
+
+pure func advanced(state: ParseState) -> ParseState:
+	fields: ParseFields = from_opaque ParseState(state)
+	into_opaque ParseState({ fields |
+			previous = cursor_token(fields.cursor).span,
+			cursor = advanced_cursor(fields.cursor)
+		})
+
+
+pure func diagnostic_count(state: ParseState) -> Int:
+	from_opaque ParseState(state).diagnostics.length()
+
+
+pure func diagnostics(state: ParseState) -> List[SyntaxDiagnosticAt]:
+	from_opaque ParseState(state).diagnostics
+
+
+pure func report_diagnostic(
+	state: ParseState,
+	span: Span,
+	diagnostic: SyntaxDiagnostic,
+) -> ParseState:
+	fields: ParseFields = from_opaque ParseState(state)
+	into_opaque ParseState({ fields | diagnostics = fields.diagnostics.append({
+				span = span,
+				diagnostic = diagnostic,
+			}) })
+
+
+-- Plain missing-item diagnostics share the frozen parser's empty span.
+pure func report_at_current(
+	state: ParseState,
+	code: TableDiagnostics.PlainSyntaxCode,
+) -> ParseState:
+	state.report_diagnostic(state.span_before_current(), Plain(code))
+
+
+pure func report_and_recover(
+	state: ParseState,
+	code: TableDiagnostics.PlainSyntaxCode,
+) -> ParseState:
+	reported: ParseState = state.report_at_current(code)
+
+	if state.at_soft_boundary():
+		reported
+	else:
+		reported.advanced()
+
+
+pure func expect_token(
+	state: ParseState,
+	kind: TokenKind,
+	diagnostic: ExpectedTokenDiagnostic,
+) -> ParseState:
+	if state.current_kind() == kind:
+		state.advanced()
+	else:
+		state.report_diagnostic(state.span_before_current(), ExpectedToken(diagnostic))
+
+
+-- Missing header punctuation follows authored content, skipping consumed layout.
+pure func report_expected_after_previous_content(
+	state: ParseState,
+	diagnostic: ExpectedTokenDiagnostic,
+) -> ParseState:
+	previous: Span = cursor_previous_content_span(from_opaque ParseState(state).cursor)
+	state.report_diagnostic(
+		pack_span(previous.span_source(), previous.span_end(), previous.span_end()),
+		ExpectedToken(diagnostic),
+	)
+
+
+-- Layout ownership uses the lexer's admitted line starts and tab-expanded columns.
+pure func span_start_line(state: ParseState, span: Span) -> Int:
+	fields: ParseFields = from_opaque ParseState(state)
+	var lower: Int = 0
+	var upper: Int = fields.line_starts.length()
+
+	while upper - lower > 1:
+		middle: Int = (lower + upper) / 2
+
+		if fields.line_starts.get_or(middle, 0) <= span.span_start():
+			lower = middle
+		else:
+			upper = middle
+
+	lower
+
+
+pure func span_start_column(state: ParseState, span: Span) -> Int:
+	fields: ParseFields = from_opaque ParseState(state)
+	line: Int = state.span_start_line(span)
+	line_start: Int = fields.line_starts.get_or(line, 0)
+	column_at(fields.source.text, line_start, span.span_start())
+
+
+pure func current_literal(state: ParseState) -> Option[LiteralValue]:
+	fields: ParseFields = from_opaque ParseState(state)
+	token: Token = cursor_token(fields.cursor)
+
+	match token.kind:
+		IntLiteralToken | FloatLiteralToken | NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken | DocStringToken:
+			fields.source.literals.get(token.payload)
+		_:
+			None
+
+
+pure func name_allowed(kind: TokenKind, role: NameRole) -> Bool:
+	if kind == IdentifierToken or kind.is_soft_keyword():
+		True
+	else:
+		match role:
+			TypeName:
+				kind == SelfKeyword or kind == VoidKeyword
+			VariantName:
+				kind == TrueKeyword or kind == FalseKeyword
+			OrdinaryName:
+				False
+
+
+-- Capture the frozen declaration diagnostic payload without constructing a
+-- recovery WrittenName. Only parameterized value-record recovery needs this.
+pure func current_name_spelling_or_empty(state: ParseState) -> (ParseState, SpellingId):
+	fields: ParseFields = from_opaque ParseState(state)
+	token: Token = state.current_token()
+
+	if token.kind == IdentifierToken:
+		match token.token_spelling(fields.spellings):
+			Some(spelling):
+				(state, spelling)
+			None:
+				state.intern_diagnostic_name("")
+	else if KEYWORD_KINDS_IN_SEEDED_ORDER.contains(token.kind):
+		match token.kind.fixed_token_spelling():
+			Some(text):
+				state.intern_diagnostic_name(text)
+			None:
+				state.intern_diagnostic_name("")
+	else:
+		-- Invalid authored names use the frozen parser's empty name spelling.
+		state.intern_diagnostic_name("")
+
+
+private pure func intern_diagnostic_name(
+	state: ParseState,
+	text: String,
+) -> (ParseState, SpellingId):
+	fields: ParseFields = from_opaque ParseState(state)
+	(spellings, spelling) = interned_spelling(fields.spellings, text, 0, text.length())
+	(into_opaque ParseState({ fields | spellings = spellings }), spelling)
+
+
+pure func consume_name(
+	state: ParseState,
+	role: NameRole,
+	construct: NameConstruct,
+) -> (ParseState, WrittenName):
+	fields: ParseFields = from_opaque ParseState(state)
+	token: Token = cursor_token(fields.cursor)
+
+	match token.token_spelling(fields.spellings):
+		Some(spelling):
+			(state.advanced(), {
+					spelling = spelling,
+					span = token.span
+				})
+		None:
+			match token.kind.fixed_token_spelling():
+				Some(text):
+					if KEYWORD_KINDS_IN_SEEDED_ORDER.contains(token.kind):
+						(spellings, spelling) = interned_spelling(
+							fields.spellings,
+							text,
+							0,
+							text.length(),
+						)
+						interned: ParseState = into_opaque ParseState(
+							{ fields | spellings = spellings }
+						)
+
+						checked: ParseState = if name_allowed(token.kind, role):
+							interned
+						else:
+							interned.report_diagnostic(token.span, ReservedKeywordAsName(spelling))
+
+						(checked.advanced(), {
+								spelling = spelling,
+								span = token.span
+							})
+					else:
+						state.missing_name(token.span, construct)
+				None:
+					state.missing_name(token.span, construct)
+
+
+pure func consume_referenced_name(
+	state: ParseState,
+	construct: NameConstruct,
+) -> (ParseState, WrittenName):
+	if name_allowed(state.current_kind(), OrdinaryName):
+		state.consume_name(OrdinaryName, construct)
+	else:
+		span: Span = state.current_span()
+		(reported, name) = state.missing_name(span, construct)
+
+		if state.at_soft_boundary():
+			(reported, name)
+		else:
+			(reported.advanced(), name)
+
+
+-- Declaration leaves share the frozen grammar's name recovery: an invalid
+-- token is skipped unless it is a soft boundary, and never mints a binder.
+pure func consume_declared_name(
+	state: ParseState,
+	construct: NameConstruct,
+) -> (ParseState, Option[WrittenName]):
+	if name_allowed(state.current_kind(), OrdinaryName):
+		(after_name, name) = state.consume_name(OrdinaryName, construct)
+		(after_name, Some(name))
+	else if KEYWORD_KINDS_IN_SEEDED_ORDER.contains(state.current_kind()):
+		state.reject_reserved_declared_name(construct)
+	else:
+		reported: ParseState = state.report_diagnostic(
+			state.span_before_current(),
+			ExpectedToken(ExpectedName(construct)),
+		)
+
+		if state.at_soft_boundary():
+			(reported, None)
+		else:
+			(reported.advanced(), None)
+
+
+-- Boolean spellings are authored variant names; invalid names stay absent.
+pure func consume_variant_name(state: ParseState) -> (ParseState, Option[WrittenName]):
+	if name_allowed(state.current_kind(), VariantName):
+		(after_name, name) = state.consume_name(VariantName, NameInVariantName)
+		(after_name, Some(name))
+	else:
+		state.consume_declared_name(NameInVariantName)
+
+
+-- A typed discard is a named parameter; bare discards bypass this constructor.
+pure func consume_parameter_name(state: ParseState) -> (ParseState, Option[WrittenName]):
+	state.consume_discard_or_declared_name(NameInParameterName)
+
+
+-- Global discards remain written names, without allocating a BinderId.
+pure func consume_global_name(state: ParseState) -> (ParseState, Option[WrittenName]):
+	state.consume_discard_or_declared_name(NameInVariableName)
+
+
+private pure func consume_discard_or_declared_name(
+	state: ParseState,
+	construct: NameConstruct,
+) -> (ParseState, Option[WrittenName]):
+	if state.current_kind() == UnderscoreSymbol:
+		fields: ParseFields = from_opaque ParseState(state)
+		(spellings, spelling) = interned_spelling(
+			fields.spellings,
+			DISCARD_NAME,
+			0,
+			DISCARD_NAME.length(),
+		)
+		written: WrittenName = {
+			spelling = spelling,
+			span = state.current_span()
+		}
+		(into_opaque ParseState({ fields | spellings = spellings }).advanced(), Some(written))
+	else:
+		state.consume_declared_name(construct)
+
+
+-- A missing declaration name is absent, never a fabricated written name.
+-- Keep delimiters for the owning grammar and consume an invalid name token
+-- so its following annotation can still be parsed without a cascade.
+pure func consume_ordinary_name(
+	state: ParseState,
+	construct: NameConstruct,
+) -> (ParseState, Option[WrittenName]):
+	if name_allowed(state.current_kind(), OrdinaryName):
+		(after_name, name) = state.consume_name(OrdinaryName, construct)
+		(after_name, Some(name))
+	else if KEYWORD_KINDS_IN_SEEDED_ORDER.contains(state.current_kind()):
+		state.reject_reserved_declared_name(construct)
+	else:
+		reported: ParseState = state.report_diagnostic(
+			state.span_before_current(),
+			ExpectedToken(ExpectedName(construct)),
+		)
+
+		match state.current_kind():
+			LeftBracketSymbol | LeftBraceSymbol | RightBraceSymbol:
+				(reported, None)
+			_:
+				if state.at_soft_boundary():
+					(reported, None)
+				else:
+					(reported.advanced(), None)
+
+
+-- Declared keywords share the frozen parser's empty diagnostic span, while
+-- consume_name retains its distinct role-specific authored-name behavior.
+private pure func reject_reserved_declared_name(
+	state: ParseState,
+	construct: NameConstruct,
+) -> (ParseState, Option[WrittenName]):
+	fields: ParseFields = from_opaque ParseState(state)
+
+	match (
+		state
+			.current_kind()
+			.fixed_token_spelling()
+	):
+		Some(text):
+			(spellings, spelling) = interned_spelling(fields.spellings, text, 0, text.length())
+			interned: ParseState = into_opaque ParseState({ fields | spellings = spellings })
+			(
+				interned
+					.report_diagnostic(state.span_before_current(), ReservedKeywordAsName(spelling))
+					.advanced(),
+				None,
+			)
+		None:
+			-- Seeded keywords have fixed spellings. If that table invariant
+			-- changes, reject without fabricating an authored keyword name.
+			(
+				state
+					.report_diagnostic(
+						state.span_before_current(),
+						ExpectedToken(ExpectedName(construct)),
+					)
+					.advanced(),
+				None,
+			)
+
+
+private pure func missing_name(
+	state: ParseState,
+	span: Span,
+	construct: NameConstruct,
+) -> (ParseState, WrittenName):
+	empty: Span = pack_span(span.span_source(), span.span_start(), span.span_start())
+	fields: ParseFields = from_opaque ParseState(
+		state.report_diagnostic(empty, ExpectedToken(ExpectedName(construct)))
+	)
+	(spellings, spelling) = interned_spelling(
+		fields.spellings,
+		RECOVERY_NAME,
+		0,
+		RECOVERY_NAME.length(),
+	)
+	(into_opaque ParseState({ fields | spellings = spellings }), {
+			spelling = spelling,
+			span = span
+		})
+
+
+pure func finished_name_use(state: ParseState, name: WrittenName) -> (ParseState, NameUse):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, use) = minted_name_use(fields.mint, name)
+	(into_opaque ParseState({ fields | mint = mint }), use)
+
+
+pure func finished_expression(
+	state: ParseState,
+	span: Span,
+	kind: ExpressionKind,
+) -> (ParseState, Expression):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, expression) = minted_expression(fields.mint, span, kind)
+	(into_opaque ParseState({ fields | mint = mint }), expression)
+
+
+pure func finished_global(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	form: GlobalForm,
+	name: WrittenName,
+	declared_type: Option[WrittenType],
+	value: Expression,
+	span: Span,
+) -> (ParseState, GlobalDeclaration):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_global(
+		fields.mint,
+		visibility,
+		documentation,
+		form,
+		name,
+		declared_type,
+		value,
+		span,
+	)
+	(into_opaque ParseState({ fields | mint = mint }), declaration)
+
+
+pure func finished_type_binder(state: ParseState, name: WrittenName) -> (ParseState, TypeBinder):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, binder) = minted_type_binder(fields.mint, name)
+	(into_opaque ParseState({ fields | mint = mint }), binder)
+
+
+pure func finished_written_type(
+	state: ParseState,
+	span: Span,
+	kind: WrittenTypeKind,
+) -> (ParseState, WrittenType):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, written) = minted_written_type(fields.mint, span, kind)
+	(into_opaque ParseState({ fields | mint = mint }), written)
+
+
+pure func finished_dimension(
+	state: ParseState,
+	span: Span,
+	kind: DimensionKind,
+) -> (ParseState, Dimension):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, dimension) = minted_dimension(fields.mint, span, kind)
+	(into_opaque ParseState({ fields | mint = mint }), dimension)
+
+
+pure func finished_import(
+	state: ParseState,
+	path: ModulePath,
+	alias_name: Option[WrittenName],
+	items: List[ImportItem],
+	path_span: Span,
+	span: Span,
+) -> (ParseState, Import):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, imported) = minted_import(fields.mint, path, alias_name, items, path_span, span)
+	(into_opaque ParseState({ fields | mint = mint }), imported)
+
+
+pure func finished_pattern(
+	state: ParseState,
+	span: Span,
+	kind: PatternKind,
+) -> (ParseState, Pattern):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, pattern) = minted_pattern(fields.mint, span, kind)
+	(into_opaque ParseState({ fields | mint = mint }), pattern)
+
+
+pure func finished_binder(state: ParseState, name: WrittenName) -> (ParseState, Binder):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, binder) = minted_binder(fields.mint, name)
+	(into_opaque ParseState({ fields | mint = mint }), binder)
+
+
+pure func finished_field(
+	state: ParseState,
+	name: WrittenName,
+	field_type: WrittenType,
+	span: Span,
+) -> (ParseState, FieldDeclaration):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, field) = minted_field(fields.mint, name, field_type, span)
+	(into_opaque ParseState({ fields | mint = mint }), field)
+
+
+pure func finished_record(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	form: RecordDeclarationForm,
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	fields: List[FieldDeclaration],
+	span: Span,
+) -> (ParseState, RecordDeclaration):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_record(
+		contents.mint,
+		visibility,
+		documentation,
+		form,
+		name,
+		type_parameters,
+		fields,
+		span,
+	)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_alias(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	form: AliasForm,
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	target: WrittenType,
+	span: Span,
+) -> (ParseState, AliasDeclaration):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_alias(
+		contents.mint,
+		visibility,
+		documentation,
+		form,
+		name,
+		type_parameters,
+		target,
+		span,
+	)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_builtin_type(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	span: Span,
+) -> (ParseState, BuiltinTypeDeclaration):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_builtin_type(
+		contents.mint,
+		visibility,
+		documentation,
+		name,
+		type_parameters,
+		span,
+	)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_resource_type(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	cleanup: Option[CleanupBuiltin],
+	span: Span,
+) -> (ParseState, ResourceTypeDeclaration):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_resource_type(
+		contents.mint,
+		visibility,
+		documentation,
+		name,
+		type_parameters,
+		cleanup,
+		span,
+	)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_variant(
+	state: ParseState,
+	name: WrittenName,
+	payload: List[WrittenType],
+	span: Span,
+) -> (ParseState, VariantDeclaration):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_variant(contents.mint, name, payload, span)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_union(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	variants: List[VariantDeclaration],
+	span: Span,
+) -> (ParseState, UnionDeclaration):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_union(
+		contents.mint,
+		visibility,
+		documentation,
+		name,
+		type_parameters,
+		variants,
+		span,
+	)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_enum_case(
+	state: ParseState,
+	name: WrittenName,
+	span: Span,
+) -> (ParseState, EnumCase):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_enum_case(contents.mint, name, span)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_enum(
+	state: ParseState,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	cases: List[EnumCase],
+	span: Span,
+) -> (ParseState, EnumDeclaration):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, declaration) = minted_enum(contents.mint, visibility, documentation, name, cases, span)
+	(into_opaque ParseState({ contents | mint = mint }), declaration)
+
+
+pure func finished_foreign_function(
+	state: ParseState,
+	visibility: Visibility,
+	annotations: List[Annotation],
+	purity: Purity,
+	keyword: Span,
+	name: WrittenName,
+	parameters: List[Parameter],
+	return_type: WrittenType,
+	c_name: Option[ForeignCName],
+	span: Span,
+) -> (ParseState, ForeignFunction):
+	contents: ParseFields = from_opaque ParseState(state)
+	(mint, function) = minted_foreign_function(
+		contents.mint,
+		visibility,
+		annotations,
+		purity,
+		keyword,
+		name,
+		parameters,
+		return_type,
+		c_name,
+		span,
+	)
+	(into_opaque ParseState({ contents | mint = mint }), function)
+
+
+pure func spellings(state: ParseState) -> Spellings:
+	from_opaque ParseState(state).spellings
+
+
+-- A snapshot for the test-only declaration preview, never a completed module.
+pure func issued_counts(state: ParseState) -> SyntaxCounts:
+	issued(from_opaque ParseState(state).mint).counts
+
+
+-- Rejection keeps the mint's authoritative immutable indexes even when no
+-- declaration tree can be published.
+pure func issued_ids(state: ParseState) -> IssuedIds:
+	issued(from_opaque ParseState(state).mint)
+
+
+pure func parse_module(state: ParseState) -> ModuleId:
+	from_opaque ParseState(state).module
+
+
+pure func parse_source(state: ParseState) -> LexedSource:
+	from_opaque ParseState(state).source
+
+
+pure func parse_line_starts(state: ParseState) -> List[Int]:
+	from_opaque ParseState(state).line_starts
+
+
+-- The parser's layout readers and diagnostic positions share this exact
+-- lexical index. Validate every newline without allocating a second list.
+private pure func valid_line_starts(text: String, starts: List[Int]) -> Bool:
+	var valid: Bool = starts.get(0) == Some(0)
+	var line: Int = 1
+	var offset: Int = 0
+
+	while valid and offset < text.length():
+		if text.get(offset) == Some('\n'):
+			valid = starts.get(line) == Some(offset + 1)
+			line += 1
+
+		offset += 1
+
+	valid and starts.length() == line

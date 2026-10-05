@@ -1,0 +1,263 @@
+-- Direct import-block ownership only, over the completed single-path leaf.
+-- Frozen declaration comparison includes exact recovery and closing-dedent extent.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name, finished_import
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_import_parser: parse_import, ImportParse(ParsedImport, RejectedImport)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_import_block_parser: ImportBlockParse(ParsedImportBlock, RejectedImportBlock), parse_import_block
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_declaration
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parser_cursor as FrozenCursor
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, name_use_local_index, import_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedColon, ExpectedRightBracket, ExpectedRightParen, ExpectedNewline, ExpectedIndent, ExpectedKeyword, ExpectedLeftParen), NameConstruct(NameInTraitName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(IdentifierToken, EndOfFileToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func frozen(text: String) -> DiscoveryBuilder:
+	lexed = lex_module(module_id_at_row(0), text)
+	prepared = empty_discovery_builder().admit_source("imports.brp", text).bridge_lexed_module(lexed)
+	parse_declaration(prepared, module_id_at_row(0))
+
+
+private pure func expected_token_matches(actual: ExpectedTokenDiagnostic, wanted: ExpectedTokenDiagnostic) -> Bool:
+	match (actual, wanted):
+		(ExpectedName(actual), ExpectedName(wanted)):
+			actual == wanted
+		(ExpectedColon(actual), ExpectedColon(wanted)):
+			actual == wanted
+		(ExpectedRightBracket(actual), ExpectedRightBracket(wanted)):
+			actual == wanted
+		(ExpectedRightParen(actual), ExpectedRightParen(wanted)):
+			actual == wanted
+		(ExpectedNewline(actual), ExpectedNewline(wanted)):
+			actual == wanted
+		(ExpectedIndent(actual), ExpectedIndent(wanted)):
+			actual == wanted
+		(ExpectedKeyword(actual), ExpectedKeyword(wanted)):
+			actual == wanted
+		(ExpectedLeftParen(actual), ExpectedLeftParen(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func matches_frozen(state: ParseState, reference: DiscoveryBuilder) -> Bool:
+	var correct: Bool = (state.diagnostic_count() == reference.diagnostics.length() and state.position() == reference.token_cursor
+		and state.current_kind() == FrozenCursor.current_kind(reference) and state.current_span().spans_equal(FrozenCursor.current_span(reference)))
+	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics):
+		correct = correct and actual.span.spans_equal(wanted.span)
+		match (actual.diagnostic, wanted.diagnostic):
+			(TreeDiagnostics.Plain(actual), FrozenDiagnostics.Plain(wanted)):
+				correct = correct and actual == wanted
+			(TreeDiagnostics.ExpectedToken(actual), FrozenDiagnostics.ExpectedToken(wanted)):
+				correct = correct and expected_token_matches(actual, wanted)
+			(TreeDiagnostics.ReservedKeywordAsName(actual), FrozenDiagnostics.ReservedKeywordAsName(wanted)) | (TreeDiagnostics.UnknownAnnotation(actual), FrozenDiagnostics.UnknownAnnotation(wanted)):
+				correct = correct and state.spellings().spelling_text(actual) == reference.name_spellings.get(wanted.name_id_index())
+			_:
+				-- Exact variant/construct/order/span parity; no code-name normalization.
+				correct = False
+	correct
+
+
+private pure func no_definitions_or_bodies(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(witness_state):
+			(_, name) = witness_state.consume_declared_name(NameInTraitName)
+			match name:
+				Some(name):
+					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					(witness.id.definition_local_index() == 0 and counts.expressions == 0 and counts.blocks == 0
+						and counts.statements == 0 and counts.patterns == 0 and counts.binders == 0 and counts.type_binders == 0
+						and counts.written_types == 0 and counts.dimensions == 0)
+				None:
+					False
+		Err(_):
+			False
+
+
+-- Import ids have no SyntaxCounts field; use an ordinary completed import
+-- as the witness passed to the current mint, without retaining its scratch id.
+private pure func issued_imports(state: ParseState, count: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(entry):
+			match parse_import(entry):
+				(_, ParsedImport(template)):
+					(_, witness) = state.finished_import(template.path, template.alias_name, template.items, template.path_span, template.span)
+					witness.id.import_local_index() == count
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func parsed(text: String) -> Option[(ParseState, ImportBlockParse)]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			Some(parse_import_block(state))
+		Err(_):
+			None
+
+
+private pure func accepted(text: String, count: Int) -> Bool:
+	reference = frozen(text)
+	match (parsed(text), reference.import_blocks.get(0)):
+		(Some((state, ParsedImportBlock(block))), Some(reference_block)):
+			var correct: Bool = (matches_frozen(state, reference) and state.diagnostic_count() == 0 and no_definitions_or_bodies(state)
+				and block.span.spans_equal(reference_block.span) and block.imports.length() == count and reference.imports.length() == count)
+			var index: Int = 0
+			for imported in block.imports:
+				match reference.imports.get(index):
+					Some(reference_import):
+						correct = correct and imported.id.import_local_index() == index and imported.span.spans_equal(reference_import.span)
+						correct = correct and imported.path_span.spans_equal(reference_import.path_span)
+					None:
+						correct = False
+				index += 1
+			correct
+		_:
+			False
+
+
+private pure func rejected(text: String) -> Bool:
+	match parsed(text):
+		Some((state, RejectedImportBlock)):
+			state.diagnostic_count() > 0 and matches_frozen(state, frozen(text)) and no_definitions_or_bodies(state)
+		_:
+			False
+
+
+pure func test_repeated_paths_alias_and_selections_keep_child_ids() -> Bool:
+	text: String = "import:\n\theap\n\t./lib/io as IO\n\tshapes: Shape(Circle, Square), origin\nnext"
+	match parsed(text):
+		Some((state, ParsedImportBlock(block))):
+			match block.imports:
+				[first, second, third]:
+					match (second.alias_name, third.items):
+						(Some(alias_name), [shape, origin]):
+							match shape.constructors:
+								[circle, square]:
+									(accepted(text, 3) and first.items.is_empty() and state.spellings().spelling_text(alias_name.spelling) == Some("IO")
+										and first.id.import_local_index() == 0 and second.id.import_local_index() == 1 and third.id.import_local_index() == 2
+										and shape.name.use.name_use_local_index() == 0 and circle.use.name_use_local_index() == 1
+										and square.use.name_use_local_index() == 2 and origin.name.use.name_use_local_index() == 3
+										and issued_imports(state, 3) and state.issued_counts().name_uses == 4)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_block_owns_keyword_to_dedent_and_leaves_sibling() -> Bool:
+	text: String = "import:\n\theap\nnext"
+	match parsed(text):
+		Some((state, ParsedImportBlock(block))):
+			(accepted(text, 1) and block.span.covers(0, 14) and state.current_kind() == IdentifierToken
+				and state.current_span().covers(14, 18) and state.position() == 6 and issued_imports(state, 1))
+		_:
+			False
+
+
+pure func test_missing_colon_newline_and_indent_preserve_ordered_recovery() -> Bool:
+	(rejected("import\n\theap\nnext") and rejected("import: heap")
+		and rejected("import:\nheap\nnext") and rejected("import heap"))
+
+
+pure func test_malformed_path_skips_line_then_later_import_is_still_owned() -> Bool:
+	text: String = "import:\n\t./:\n\theap\nnext"
+	match parsed(text):
+		Some((state, RejectedImportBlock)):
+			(rejected(text) and issued_imports(state, 1) and state.issued_counts().name_uses == 0
+				and state.current_kind() == IdentifierToken and state.current_span().covers(19, 23))
+		_:
+			False
+
+
+pure func test_blank_lines_and_nested_selections_leave_outer_dedent() -> Bool:
+	(accepted("import:\n\theap\n\n\tshapes: Circle, Square\n\nnext", 2)
+		and accepted("import:\n\tshapes:\n\t\tShape(Circle, Square)\n\tio\nnext", 2))
+
+
+pure func test_unsupported_items_make_progress_and_keep_valid_sibling() -> Bool:
+	(rejected("import:\n\t123\n\theap\nnext") and rejected("import:\n\t@no_copy\n\theap\nnext")
+		and rejected("import:\n\tif\n\theap\nnext") and rejected("import:\n\t.\n\theap\nnext"))
+
+
+pure func test_bad_alias_and_selection_diagnostics_match_frozen_leaf_recovery() -> Bool:
+	(rejected("import:\n\tshapes as if: Thing\n\theap\nnext")
+		and rejected("import:\n\tshapes: Circle Square\n\theap\nnext")
+		and rejected("import:\n\tshapes: Shape()\n\theap\nnext"))
+
+
+pure func test_eof_closes_real_indent_but_unclosed_block_ends_at_keyword() -> Bool:
+	text: String = "import:\nheap"
+	reference = frozen(text)
+	match reference.import_blocks.get(0):
+		Some(block):
+			(rejected(text) and block.span.covers(0, 6) and accepted("import:\n\theap", 1)
+				and rejected("import:") and rejected("import:\n"))
+		None:
+			False
+
+
+pure func test_unindented_recovery_consumes_following_paths_until_eof() -> Bool:
+	text: String = "import:\nheap\nio"
+	match parsed(text):
+		Some((state, RejectedImportBlock)):
+			(rejected(text) and state.current_kind() == EndOfFileToken and state.current_span().covers(15, 15)
+				and issued_imports(state, 2) and state.issued_counts().name_uses == 0)
+		_:
+			False
+
+
+pure func test_existing_diagnostic_does_not_reject_new_clean_owner() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "import:\n\theap\nnext")):
+		Ok(state):
+			entry = state.report_at_current(FrozenDiagnostics.ExpectedModulePathDiagnostic)
+			(after_block, result) = parse_import_block(entry)
+			match (result, after_block.diagnostics().get(0)):
+				(ParsedImportBlock(block), Some(at)):
+					match at.diagnostic:
+						TreeDiagnostics.Plain(FrozenDiagnostics.ExpectedModulePathDiagnostic):
+							(block.span.covers(0, 14) and at.span.covers(0, 0) and after_block.diagnostic_count() == 1
+								and after_block.current_kind() == IdentifierToken and after_block.current_span().covers(14, 18) and no_definitions_or_bodies(after_block))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Import block ownership and frozen recovery",
+	tests = [
+		("paths aliases selections and child IDs", test_repeated_paths_alias_and_selections_keep_child_ids),
+		("keyword dedent extent and sibling", test_block_owns_keyword_to_dedent_and_leaves_sibling),
+		("header layout omissions", test_missing_colon_newline_and_indent_preserve_ordered_recovery),
+		("malformed path then valid import", test_malformed_path_skips_line_then_later_import_is_still_owned),
+		("blank lines and nested selections", test_blank_lines_and_nested_selections_leave_outer_dedent),
+		("unsupported children make progress", test_unsupported_items_make_progress_and_keep_valid_sibling),
+		("alias and selection leaf recovery", test_bad_alias_and_selection_diagnostics_match_frozen_leaf_recovery),
+		("eof closing and keyword fallback", test_eof_closes_real_indent_but_unclosed_block_ends_at_keyword),
+		("unindented paths consumed through eof", test_unindented_recovery_consumes_following_paths_until_eof),
+		("existing diagnostic tolerance", test_existing_diagnostic_does_not_reject_new_clean_owner)
+	]
+}

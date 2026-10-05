@@ -1,0 +1,158 @@
+-- Tree expression projection parity, authored literals and iterative traversal.
+import:
+	../../../src/compiler/discovery_adapter:
+		legacy_expression_preview, legacy_declaration_projection, LegacyDeclarationPreviewError(MissingIntegerLiteralToken)
+	../../../src/compiler/stage_02_lex/name_table:
+		NameTable, EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable), name_table_spellings
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedExpr(ParsedBinaryExpr, ParsedNameExpr, ParsedIntLiteralExpr), ParsedBinaryOp(ParsedAddOp)
+	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state
+	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
+	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
+		parse_declaration_preview, DeclarationPreviewParse(DeferredGlobalInitializer), DeclarationPreview(GlobalDeclarationPreview)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_global_parser:
+		complete_expression_global, GlobalExpressionCompletion(CompletedExpressionGlobal)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		ModuleDeclarationPreviewScan, ModuleDeclarationScanStop(ReachedEndOfSource)
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/lib/source: source_file
+	test: TestSuite
+
+
+private func projected_expression(text: String) -> Option[(NameTable, ParsedExpr)]:
+	lexed = lex_module(module_id_at_row(0), text)
+	match new_parse_state(lexed):
+		Err(_): None
+		Ok(entry):
+			(at_value, result) = parse_declaration_preview(entry)
+			match result:
+				DeferredGlobalInitializer(preview):
+					(_, completion) = complete_expression_global(at_value, preview)
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							match legacy_expression_preview(preview_source(lexed), EMPTY_NAME_TABLE, declaration.value):
+								Ok(projected): Some(projected)
+								Err(_): None
+						_: None
+				_: None
+
+
+func test_supported_expressions_match_old_ast_json() -> Bool:
+	var correct: Bool = True
+	for expression in [
+		"left + right * 007 - third / 2 % 3", "-left + not right",
+		"left == right or left != other and left < last",
+		"left <= right and left > other or left >= last", "left..right",
+		"((007)) + (007.500)", "(left) + ((right))", "True", "False", "(True)", "void", "((void))", "_", "()",
+		"(left + right) * third", "not (left or right)", "-(-007)",
+	]:
+		correct = declaration_projection_matches("value = ${expression}") and correct
+	correct
+
+
+func test_completed_global_matches_full_old_declaration() -> Bool:
+	declaration_projection_matches("private var total: Int = (007 + left) * right")
+
+
+private func declaration_projection_matches(text: String) -> Bool:
+	source = source_file("/tmp/tree_expression_projection.brp", "tree_expression_projection", text)
+	old = parse_compiler_source(source)
+	lexed = lex_module(module_id_at_row(0), text)
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(at_value, result) = parse_declaration_preview(entry)
+			match result:
+				DeferredGlobalInitializer(preview):
+					(_, completion) = complete_expression_global(at_value, preview)
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							scan: ModuleDeclarationPreviewScan = {
+								documentation = None, declarations = [GlobalDeclarationPreview(declaration)], stop = ReachedEndOfSource
+							}
+							match legacy_declaration_projection(preview_source(lexed), scan, EMPTY_NAME_TABLE):
+								Err(_): False
+								Ok(projected):
+									match (old.decls.get(0), projected.declarations.get(0)):
+										(Some(expected), Some(actual)):
+											expected_json = parsed_decl_to_json(ast_json_render(source, SpellingsFromIdentifierText), expected).to_string()
+											actual_json = parsed_decl_to_json(ast_json_render(source, SpellingsFromNameTable(projected.names)), actual).to_string()
+											if expected_json != actual_json:
+												print("declaration expected: ${expected_json}\nactual: ${actual_json}")
+											old.diagnostics.is_empty() and expected_json == actual_json
+										_: False
+						_: False
+				_: False
+
+
+func test_grouped_integer_keeps_exact_digits() -> Bool:
+	match projected_expression("value = ((007))"):
+		Some((_, ParsedIntLiteralExpr(digits, _))): digits == "007"
+		_: False
+
+
+func test_missing_integer_token_fails_closed() -> Bool:
+	lexed = lex_module(module_id_at_row(0), "value = ((007))")
+	match new_parse_state(lexed):
+		Err(_): False
+		Ok(entry):
+			(at_value, result) = parse_declaration_preview(entry)
+			match result:
+				DeferredGlobalInitializer(preview):
+					(_, completion) = complete_expression_global(at_value, preview)
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							original = preview_source(lexed)
+							broken = { original | tokens = [] }
+							match legacy_expression_preview(broken, EMPTY_NAME_TABLE, declaration.value):
+								Err(MissingIntegerLiteralToken(_)): True
+								_: False
+						_: False
+				_: False
+
+
+func test_names_follow_written_order_and_reuse_spelling() -> Bool:
+	match projected_expression("value = first + (second * third) + first + fourth"):
+		Some((names, _)): name_table_spellings(names) == ["first", "second", "third", "fourth"]
+		None: False
+
+
+func test_deep_binary_left_spine_projects_iteratively() -> Bool:
+	var text: String = "value = item"
+	var terms: Int = 1
+	while terms < 5000:
+		text += " + item"
+		terms += 1
+	match projected_expression(text):
+		None: False
+		Some((names, value)):
+			var current: ParsedExpr = value
+			var count: Int = 1
+			var walking: Bool = True
+			var correct: Bool = name_table_spellings(names) == ["item"]
+			while walking:
+				match current:
+					ParsedBinaryExpr(ParsedAddOp, left, ParsedNameExpr(_), _):
+						current = left
+						count += 1
+					ParsedNameExpr(_): walking = False
+					_:
+						correct = False
+						walking = False
+			correct and count == terms
+
+
+tests: TestSuite = {
+	description = "Tree expression legacy projection",
+	tests = [
+		("supported expression AST JSON parity", test_supported_expressions_match_old_ast_json),
+		("completed global full declaration parity", test_completed_global_matches_full_old_declaration),
+		("grouped integer preserves authored digits", test_grouped_integer_keeps_exact_digits),
+		("missing integer token fails closed", test_missing_integer_token_fails_closed),
+		("names follow written order", test_names_follow_written_order_and_reuse_spelling),
+		("deep binary projection uses an iterative walk", test_deep_binary_left_spine_projects_iteratively)
+	]
+}

@@ -1,0 +1,131 @@
+-- Direct union declarations mint payloads and children before the parent.
+import:
+	../syntax/declarations: UnionDeclaration, VariantDeclaration, TypeParameter
+	../syntax/module_syntax: Documentation
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../syntax/types: WrittenType
+	../tables/diagnostic_code: PlainSyntaxCode(UnionVariantTooManyFieldsDiagnostic)
+	../tables/expected_token:
+		NameConstruct(NameInTypeName), ExpectedTokenDiagnostic(ExpectedColon, ExpectedNewline, ExpectedIndent, ExpectedRightParen),
+		ColonConstruct(ColonInUnionVariants), NewlineConstruct(NewlineInUnionVariants), IndentConstruct(IndentInUnionVariants), RightParenConstruct(RightParenInVariantFields)
+	../tables/limits: MAX_UNION_VARIANT_FIELDS
+	../tables/row_kinds: Visibility
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, LeftParenSymbol, RightParenSymbol, CommaSymbol)
+	parse_state:
+		ParseState, diagnostic_count, consume_ordinary_name, consume_variant_name, current_kind, current_span, position,
+		advanced, expect_token, report_diagnostic, finished_variant, finished_union
+	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
+	tree_type_parser: parse_variant_payload_type
+
+
+union UnionParse:
+	ParsedUnion(UnionDeclaration)
+	RejectedUnion
+
+
+pure func parse_union(state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span) -> (ParseState, UnionParse):
+	before: Int = state.diagnostic_count()
+	(after_name, parsed_name) = state.consume_ordinary_name(NameInTypeName)
+
+	match parsed_name:
+		None:
+			(after_name, RejectedUnion)
+		Some(name):
+			(after_parameters, parsed_parameters) = parse_type_parameters(after_name)
+			parameters: Option[List[TypeParameter]] = match parsed_parameters:
+				NoTypeParameters:
+					Some([])
+				ParsedTypeParameters(written, _):
+					Some(written)
+				RejectedTypeParameters:
+					None
+
+			match parameters:
+				None:
+					(after_parameters, RejectedUnion)
+				Some(parameters):
+					var out: ParseState = after_parameters
+						.expect_token(ColonSymbol, ExpectedColon(ColonInUnionVariants))
+						.expect_token(NewlineToken, ExpectedNewline(NewlineInUnionVariants))
+						.expect_token(IndentToken, ExpectedIndent(IndentInUnionVariants))
+					var variants: List[VariantDeclaration] = []
+
+					while out.current_kind() == NewlineToken:
+						out = out.advanced()
+
+					while out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+						previous: Int = out.position()
+						(after_variant, variant) = parse_variant(out)
+						out = after_variant
+
+						match variant:
+							Some(variant):
+								variants = variants.append(variant)
+							None:
+								()
+
+						while out.current_kind() == NewlineToken:
+							out = out.advanced()
+
+						if out.position() == previous and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+							out = out.advanced()
+
+					var end: Span = name.span
+
+					if out.current_kind() == DedentToken:
+						end = out.current_span()
+						out = out.advanced()
+
+					if out.diagnostic_count() != before:
+						(out, RejectedUnion)
+					else:
+						(finished, declaration) = out.finished_union(visibility, documentation, name, parameters, variants, start.span_covering(end))
+						(finished, ParsedUnion(declaration))
+
+
+private pure func parse_variant(state: ParseState) -> (ParseState, Option[VariantDeclaration]):
+	before: Int = state.diagnostic_count()
+	name_span: Span = state.current_span()
+	(after_name, name) = state.consume_variant_name()
+	(after_fields, payload, end) = parse_variant_fields(after_name, name_span)
+
+	match name:
+		None:
+			(after_fields, None)
+		Some(name):
+			if after_fields.diagnostic_count() != before:
+				(after_fields, None)
+			else:
+				(finished, variant) = after_fields.finished_variant(name, payload, name.span.span_covering(end))
+				(finished, Some(variant))
+
+
+-- The parenthesized payload grammar is also used to recover enum cases.
+pure func parse_variant_fields(state: ParseState, name_span: Span) -> (ParseState, List[WrittenType], Span):
+	if state.current_kind() != LeftParenSymbol:
+		(state, [], name_span)
+	else:
+		var out: ParseState = state.advanced()
+		var payload: List[WrittenType] = []
+		var parsing: Bool = out.current_kind() != RightParenSymbol
+
+		while parsing and out.current_kind() != EndOfFileToken:
+			(after_type, written) = parse_variant_payload_type(out)
+			out = after_type
+			payload = payload.append(written)
+
+			if payload.length() == MAX_UNION_VARIANT_FIELDS + 1:
+				out = out.report_diagnostic(name_span, Plain(UnionVariantTooManyFieldsDiagnostic))
+
+			if out.current_kind() == CommaSymbol:
+				out = out.advanced()
+				parsing = out.current_kind() != RightParenSymbol
+			else:
+				parsing = False
+
+		end: Span = if out.current_kind() == RightParenSymbol:
+			out.current_span()
+		else:
+			name_span
+		(out.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInVariantFields)), payload, end)

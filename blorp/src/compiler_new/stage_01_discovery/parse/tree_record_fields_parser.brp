@@ -1,0 +1,88 @@
+-- Shared braced field lists for written ordinary and fixed record declarations.
+import:
+	../syntax/declarations: FieldDeclaration
+	../syntax/diagnostics: SyntaxDiagnostic(DuplicateField)
+	../syntax/spellings: spelling_text
+	../tables/expected_token:
+		NameConstruct(NameInFieldName),
+		ExpectedTokenDiagnostic(ExpectedLeftBrace, ExpectedRightBrace, ExpectedColon),
+		LeftBraceConstruct(LeftBraceInRecordFields, LeftBraceInFixedRecordFields),
+		RightBraceConstruct(RightBraceInRecordFields, RightBraceInFixedRecordFields),
+		ColonConstruct(ColonInFieldName),
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(LeftBraceSymbol, RightBraceSymbol, ColonSymbol, CommaSymbol, EndOfFileToken)
+	parse_state:
+		ParseState, current_kind, current_span, advanced,
+		diagnostic_count, consume_ordinary_name, consume_declared_name, expect_token, report_diagnostic, spellings,
+		finished_field,
+	tree_type_parser: parse_type
+
+
+enum RecordFieldsForm:
+	OrdinaryRecordFields
+	FixedRecordFields
+
+
+union RecordFieldsParse:
+	ParsedRecordFields(List[FieldDeclaration], Span)
+	RejectedRecordFields
+
+
+pure func parse_record_fields(state: ParseState, form: RecordFieldsForm) -> (ParseState, RecordFieldsParse):
+	opening: LeftBraceConstruct = match form:
+		OrdinaryRecordFields:
+			LeftBraceInRecordFields
+		FixedRecordFields:
+			LeftBraceInFixedRecordFields
+
+	closing: RightBraceConstruct = match form:
+		OrdinaryRecordFields:
+			RightBraceInRecordFields
+		FixedRecordFields:
+			RightBraceInFixedRecordFields
+
+	if state.current_kind() != LeftBraceSymbol:
+		(state.expect_token(LeftBraceSymbol, ExpectedLeftBrace(opening)), RejectedRecordFields)
+	else:
+		parse_fields_contents(state.advanced(), state.diagnostic_count(), closing)
+
+
+private pure func parse_fields_contents(state: ParseState, before: Int, closing: RightBraceConstruct) -> (ParseState, RecordFieldsParse):
+	var out: ParseState = state
+	var fields: List[FieldDeclaration] = []
+	var parsing: Bool = out.current_kind() != RightBraceSymbol
+
+	while parsing and out.current_kind() != EndOfFileToken:
+		(after_field_name, field_name) = out.consume_ordinary_name(NameInFieldName)
+		(after_type, field_type) = parse_type(after_field_name.expect_token(ColonSymbol, ExpectedColon(ColonInFieldName)))
+		out = after_type
+
+		match field_name:
+			None:
+				void
+			Some(field_name):
+				-- Compare written spellings. Search only this
+				-- declaration, before appending the repeated field itself.
+				-- Report after its type to preserve diagnostic ordering.
+				for earlier in fields:
+					if out.spellings().spelling_text(earlier.name.spelling) == out.spellings().spelling_text(field_name.spelling):
+						out = out.report_diagnostic(field_name.span, DuplicateField(earlier.id))
+						break
+
+				(after_field, field) = out.finished_field(field_name, field_type, field_name.span.span_covering(field_type.span))
+				out = after_field
+				fields = fields.append(field)
+
+		if out.current_kind() == CommaSymbol:
+			out = out.advanced()
+			parsing = out.current_kind() != RightBraceSymbol
+		else:
+			parsing = False
+
+	end: Span = out.current_span()
+	out = out.expect_token(RightBraceSymbol, ExpectedRightBrace(closing))
+
+	if out.diagnostic_count() != before:
+		(out, RejectedRecordFields)
+	else:
+		(out, ParsedRecordFields(fields, end))

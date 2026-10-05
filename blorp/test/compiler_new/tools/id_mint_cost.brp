@@ -1,0 +1,315 @@
+-- What minting costs on today's compiler, per call: the probe of
+-- `benchmarks/results/discovery_redesign_m1_2026-10-02.md`.
+--
+-- Each mode mints `count` nodes in a loop written the way the parser will
+-- write it (`(next, node) = f(state, ...)`, then `state = next`) and keeps every
+-- node in a list, as a tree does:
+--
+-- - `empty`: the loop and the list alone, to subtract;
+-- - `mint`: `minted_expression` on the `IdMint` itself;
+-- - `state`: `finished_expression` through a parse state that holds the mint,
+--   the shape of `DISCOVERY_REDESIGN.md` section 3.16 (two layers);
+-- - `single`: the counts in the parse state's own record and one function, the
+--   single-layer shape the M0 measurement priced (its variant C); a plain
+--   `Int` stands in for the id, since only `ids.brp` can make one;
+-- - `name`: `finished_name_use`, a record node, through the parse state;
+-- - `field`: `minted_field` through the parse state, which also appends the
+--   definitions index; `mint-field` the same on the `IdMint` itself;
+-- - `import`: `minted_import` through the parse state, which also appends the
+--   imports index.
+--
+-- Usage: `id_mint_cost <mode> <count>`. Run a build with
+-- `-DBLORP_MEMORY_DIAGNOSTICS=1` and `BLORP_MEMORY_STATS=1` for allocations
+-- (printed per call, the loop's own excluded), and a plain build under
+-- `/usr/bin/time -l` for instructions.
+import:
+	../../../src/compiler_new/stage_01_discovery/syntax/declarations: FieldDeclaration
+	../../../src/compiler_new/stage_01_discovery/syntax/expressions:
+		Expression,
+		ExpressionKind(BooleanLiteral, VoidValue),
+	../../../src/compiler_new/stage_01_discovery/syntax/ids:
+		IdMint,
+		SpellingId,
+		minted_expression,
+		minted_field,
+		minted_import,
+		minted_name_use,
+		minted_written_type,
+		new_id_mint,
+	../../../src/compiler_new/stage_01_discovery/syntax/imports:
+		Import,
+		ModulePath,
+		PathAnchor(BareAnchor),
+	../../../src/compiler_new/stage_01_discovery/syntax/names: NameUse, WrittenName
+	../../../src/compiler_new/stage_01_discovery/syntax/spellings:
+		interned_spelling,
+		new_spellings,
+	../../../src/compiler_new/stage_01_discovery/syntax/types:
+		WrittenType,
+		WrittenTypeKind(VoidType),
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, source_id_at_row
+	../../../src/compiler_new/stage_01_discovery/tables/span: Span, pack_span
+	memory: MemStats, get_mem_stats, reset_mem_stats
+
+
+PROBE_SPAN: Span = pack_span(source_id_at_row(0), 0, 1)
+
+---
+A stand-in for the parse state of section 3.16: read-only source, a cursor,
+the mint, and diagnostics. Opaque, so the mint is reached only through the
+`finished_*` functions, as `parse/parse_state.brp` will.
+---
+opaque type ProbeState = ProbeFields
+
+
+private record ProbeFields {
+	source: List[Int],
+	cursor: Int,
+	mint: IdMint,
+	diagnostics: List[Int]
+}
+
+
+pure func new_probe_state() -> ProbeState:
+	into_opaque ProbeState({
+			source = [1, 2, 3],
+			cursor = 0,
+			mint = new_id_mint(module_id_at_row(0)),
+			diagnostics = []
+		})
+
+
+pure func finished_expression(
+	state: ProbeState,
+	span: Span,
+	kind: ExpressionKind,
+) -> (ProbeState, Expression):
+	fields: ProbeFields = from_opaque ProbeState(state)
+	(mint, expression) = fields.mint.minted_expression(span, kind)
+	(into_opaque ProbeState({ fields | mint = mint }), expression)
+
+
+pure func finished_name_use(state: ProbeState, name: WrittenName) -> (ProbeState, NameUse):
+	fields: ProbeFields = from_opaque ProbeState(state)
+	(mint, use) = fields.mint.minted_name_use(name)
+	(into_opaque ProbeState({ fields | mint = mint }), use)
+
+
+pure func finished_written_type(state: ProbeState, span: Span) -> (ProbeState, WrittenType):
+	fields: ProbeFields = from_opaque ProbeState(state)
+	(mint, written_type) = fields.mint.minted_written_type(span, VoidType)
+	(into_opaque ProbeState({ fields | mint = mint }), written_type)
+
+
+pure func finished_field(
+	state: ProbeState,
+	name: WrittenName,
+	field_type: WrittenType,
+) -> (ProbeState, FieldDeclaration):
+	fields: ProbeFields = from_opaque ProbeState(state)
+	(mint, field) = fields.mint.minted_field(name, field_type, PROBE_SPAN)
+	(into_opaque ProbeState({ fields | mint = mint }), field)
+
+
+pure func finished_import(state: ProbeState, path: ModulePath) -> (ProbeState, Import):
+	fields: ProbeFields = from_opaque ProbeState(state)
+	(mint, import_row) = fields.mint.minted_import(path, None, [], PROBE_SPAN, PROBE_SPAN)
+	(into_opaque ProbeState({ fields | mint = mint }), import_row)
+
+
+---
+The single-layer shape: the counts in the state's own record, so a mint is
+one record update and one tuple.
+---
+record SingleLayerState {
+	source: List[Int],
+	cursor: Int,
+	statements: Int,
+	blocks: Int,
+	expressions: Int,
+	patterns: Int,
+	written_types: Int,
+	dimensions: Int,
+	name_uses: Int,
+	binders: Int,
+	type_binders: Int,
+	diagnostics: List[Int]
+}
+
+
+record SingleLayerNode {
+	id: Int,
+	span: Span,
+	kind: ExpressionKind
+}
+
+
+pure func single_layer_finished(
+	state: SingleLayerState,
+	span: Span,
+	kind: ExpressionKind,
+) -> (SingleLayerState, SingleLayerNode):
+	index: Int = state.expressions
+	node: SingleLayerNode = {
+		id = index,
+		span = span,
+		kind = kind
+	}
+	({ state | expressions = index + 1 }, node)
+
+
+pure func probe_name() -> WrittenName:
+	(_, spelling) = new_spellings(module_id_at_row(0)).interned_spelling("x", 0, 1)
+	{
+		spelling = spelling,
+		span = PROBE_SPAN
+	}
+
+
+func report(
+	mode: String,
+	count: Int,
+	kept: Int,
+	before: MemStats,
+):
+	after: MemStats = get_mem_stats()
+	print(
+		mode + ": " + count.to_string() + " calls, " + kept.to_string() + " kept, " + (after.total_allocations - before.total_allocations).to_string() + " allocations",
+	)
+
+
+func main(args: List[String]) -> Int:
+	mode: String = args.get_or(1, "")
+	count: Int = args
+		.get_or(2, "0")
+		.parse_int()
+		.get_or(0)
+	name: WrittenName = probe_name()
+	(_, void_type) = new_probe_state().finished_written_type(PROBE_SPAN)
+	path: ModulePath = {
+		anchor = BareAnchor,
+		parts = {
+			first = name,
+			rest = []
+		}
+	}
+	var index: Int = 0
+
+	if mode == "empty":
+		var kept: List[Int] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			kept = kept.append(index)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else if mode == "mint":
+		var mint: IdMint = new_id_mint(module_id_at_row(0))
+		var kept: List[Expression] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			(next, expression) = mint.minted_expression(PROBE_SPAN, BooleanLiteral(True))
+			mint = next
+			kept = kept.append(expression)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else if mode == "state":
+		var state: ProbeState = new_probe_state()
+		var kept: List[Expression] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			(next, expression) = state.finished_expression(PROBE_SPAN, BooleanLiteral(True))
+			state = next
+			kept = kept.append(expression)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else if mode == "single":
+		var single: SingleLayerState = {
+			source = [1, 2, 3],
+			cursor = 0,
+			statements = 0,
+			blocks = 0,
+			expressions = 0,
+			patterns = 0,
+			written_types = 0,
+			dimensions = 0,
+			name_uses = 0,
+			binders = 0,
+			type_binders = 0,
+			diagnostics = []
+		}
+		var kept: List[SingleLayerNode] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			(next, node) = single.single_layer_finished(PROBE_SPAN, BooleanLiteral(True))
+			single = next
+			kept = kept.append(node)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else if mode == "name":
+		var state: ProbeState = new_probe_state()
+		var kept: List[NameUse] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			(next, use) = state.finished_name_use(name)
+			state = next
+			kept = kept.append(use)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else if mode == "field":
+		var state: ProbeState = new_probe_state()
+		var kept: List[FieldDeclaration] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			(next, field) = state.finished_field(name, void_type)
+			state = next
+			kept = kept.append(field)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else if mode == "mint-field":
+		var mint: IdMint = new_id_mint(module_id_at_row(0))
+		var kept: List[FieldDeclaration] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			(next, field) = mint.minted_field(name, void_type, PROBE_SPAN)
+			mint = next
+			kept = kept.append(field)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else if mode == "import":
+		var state: ProbeState = new_probe_state()
+		var kept: List[Import] = []
+		reset_mem_stats()
+		before: MemStats = get_mem_stats()
+
+		while index < count:
+			(next, import_row) = state.finished_import(path)
+			state = next
+			kept = kept.append(import_row)
+			index += 1
+
+		report(mode, count, kept.length(), before)
+	else:
+		print("modes: empty mint state single name field mint-field import")
+
+	0

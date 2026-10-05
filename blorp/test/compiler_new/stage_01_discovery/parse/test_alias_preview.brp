@@ -1,0 +1,259 @@
+-- Standalone aliases own syntax and lexical evidence without module publication.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/alias_preview:
+		AliasPreview,
+		AliasPreviewOutcome(PreviewedAlias, RejectedAliasPreview, UnsupportedAliasPreview),
+		alias_declaration,
+		alias_source,
+		preview_alias,
+	../../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_span_text
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations:
+		AliasForm(TransparentAlias, OpaqueAlias),
+		TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter),
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics:
+		SyntaxDiagnostic(ExpectedToken, Plain),
+	../../../../src/compiler_new/stage_01_discovery/syntax/types:
+		DimensionKind(NamedDimension),
+		WrittenTypeKind(ArrayType, NamedType),
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
+		PlainSyntaxCode(ExpectedTypeDiagnostic, UnexpectedCharacterDiagnostic),
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		EqualConstruct(EqualInTypeAliasTarget),
+		ExpectedTokenDiagnostic(ExpectedKeyword, ExpectedEqual, ExpectedRightBracket),
+		KeywordConstruct(KeywordInOpaqueType),
+		RightBracketConstruct(RightBracketInTypeParameters),
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
+	test: TestSuite
+
+
+private pure func covers(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+private pure func rich_preview(text: String, form: AliasForm, offset: Int) -> Bool:
+	match preview_alias(lex_module(module_id_at_row(3), text)):
+		Ok(PreviewedAlias(preview)):
+			value = alias_declaration(preview)
+			source = alias_source(preview)
+
+			match (value.type_parameters, value.target.kind):
+				([TypeVariable(variable), DimensionVariable(dimension), WildcardDimensionParameter(wildcard)], ArrayType(base, dimensions)):
+					match (variable.bounds, base.kind, dimensions.first.kind):
+						([qualified, bare], NamedType(use, []), NamedDimension(dimension_use)):
+							match qualified.qualifier:
+								Some(qualifier):
+									(
+										value.form == form
+										and value.visibility == PublicVisibility
+										and value.documentation.is_none()
+										and value.span.covers(0, 53 + offset)
+										and value.name.span.covers(11 + offset, 17 + offset)
+										and value.target.span.covers(48 + offset, 53 + offset)
+										and dimensions.rest.is_empty()
+										and source.source.text == text
+										and not source.tokens.is_empty()
+										and source.preview_span_text(value.name.span) == "Buffer"
+										and source.preview_span_text(
+											variable.binder.name.span,
+										) == "T"
+										and source.preview_span_text(qualifier.name.span) == "m"
+										and source.preview_span_text(
+											qualified.trait_name.name.span,
+										) == "Eq"
+										and source.preview_span_text(
+											bare.trait_name.name.span,
+										) == "Hashable"
+										and source.preview_span_text(dimension.name.span) == "#N"
+										and source.preview_span_text(wildcard) == "#_"
+										and source.preview_span_text(use.name.span) == "T"
+										and source.preview_span_text(dimensions.first.span) == "#N"
+										and source.preview_span_text(
+											dimension_use.name.span,
+										) == "#N"
+									)
+								None:
+									False
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_both_alias_forms_own_metadata_spans_and_source() -> Bool:
+	(
+		rich_preview("type alias Buffer[T: m.Eq + Hashable, #N, #_] = T[#N]", TransparentAlias, 0)
+		and rich_preview("opaque type Buffer[T: m.Eq + Hashable, #N, #_] = T[#N]", OpaqueAlias, 1)
+		and rich_preview(
+			"type alias Buffer[T: m.Eq + Hashable, #N, #_] = T[#N]\n\n",
+			TransparentAlias,
+			0,
+		)
+		and rich_preview("opaque type Buffer[T: m.Eq + Hashable, #N, #_] = T[#N]\n", OpaqueAlias, 1)
+	)
+
+
+pure func test_empty_parameter_lists_and_terminal_newlines_are_supported() -> Bool:
+	var correct: Bool = True
+
+	for text in [
+		"type alias Empty = ()",
+		"type alias Empty[] = ()\n",
+		"opaque type Empty = ()\n\n",
+		"opaque type Empty[] = ()",
+	]:
+		match preview_alias(lex_module(module_id_at_row(0), text)):
+			Ok(PreviewedAlias(preview)):
+				correct = (
+					alias_declaration(preview).type_parameters.is_empty()
+					and alias_source(preview).source.text == text
+					and correct
+				)
+			_:
+				correct = False
+
+	correct
+
+
+pure func test_missing_opaque_second_keyword_rejects_with_exact_diagnostic() -> Bool:
+	match preview_alias(lex_module(module_id_at_row(0), "opaque Buffer = Int")):
+		Ok(RejectedAliasPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						ExpectedToken(ExpectedKeyword(KeywordInOpaqueType)):
+							at.span.covers(7, 7)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_missing_equal_and_target_rejections_pin_diagnostic_details() -> Bool:
+	missing_equal: Bool = match preview_alias(lex_module(module_id_at_row(0), "type alias A Int")):
+		Ok(RejectedAliasPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						ExpectedToken(ExpectedEqual(EqualInTypeAliasTarget)):
+							at.span.covers(13, 13)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+	missing_target: Bool = match preview_alias(lex_module(module_id_at_row(0), "opaque type A =")):
+		Ok(RejectedAliasPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(ExpectedTypeDiagnostic):
+							at.span.covers(15, 15)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+	missing_equal and missing_target
+
+
+pure func test_malformed_parameters_reject_with_exact_construct_and_span() -> Bool:
+	match preview_alias(lex_module(module_id_at_row(0), "type alias A[T U] = Int")):
+		Ok(RejectedAliasPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						ExpectedToken(ExpectedRightBracket(RightBracketInTypeParameters)):
+							at.span.covers(15, 15)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_lexical_diagnostics_reject_before_alias_recognition() -> Bool:
+	match preview_alias(lex_module(module_id_at_row(0), "type alias A = Int $")):
+		Ok(RejectedAliasPreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(UnexpectedCharacterDiagnostic):
+							at.span.covers(19, 20)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_other_declarations_headers_and_trailing_material_are_unsupported() -> Bool:
+	var correct: Bool = True
+
+	for text in [
+		"type Number = builtin",
+		"resource type Handle = builtin",
+		"record Box {}",
+		"private type alias A = Int",
+		"---\nDocumentation\n---\ntype alias A = Int",
+		"@inline type alias A = Int",
+		"type alias A = Int\ntype alias B = Bool",
+		"opaque type A = Int\nopaque type B = Bool",
+		"type alias A = Int surplus",
+		"opaque type A = Int if",
+	]:
+		match preview_alias(lex_module(module_id_at_row(0), text)):
+			Ok(UnsupportedAliasPreview):
+				void
+			_:
+				correct = False
+
+	correct
+
+
+tests: TestSuite = {
+	description = "Standalone alias preview",
+	tests = [
+		(
+			"both alias forms own metadata spans and source",
+			test_both_alias_forms_own_metadata_spans_and_source,
+		),
+		(
+			"empty parameter lists and terminal newlines are supported",
+			test_empty_parameter_lists_and_terminal_newlines_are_supported,
+		),
+		(
+			"missing opaque second keyword rejects with exact diagnostic",
+			test_missing_opaque_second_keyword_rejects_with_exact_diagnostic,
+		),
+		(
+			"missing equal and target rejections pin diagnostic details",
+			test_missing_equal_and_target_rejections_pin_diagnostic_details,
+		),
+		(
+			"malformed parameters reject with exact construct and span",
+			test_malformed_parameters_reject_with_exact_construct_and_span,
+		),
+		(
+			"lexical diagnostics reject before alias recognition",
+			test_lexical_diagnostics_reject_before_alias_recognition,
+		),
+		(
+			"other declarations headers and trailing material are unsupported",
+			test_other_declarations_headers_and_trailing_material_are_unsupported,
+		),
+	]
+}

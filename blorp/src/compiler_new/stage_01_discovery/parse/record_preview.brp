@@ -1,0 +1,104 @@
+-- A standalone ordinary or fixed record preview owns only its declaration and lexical
+-- evidence. It does not publish a completed module or route production parsing.
+import:
+	../lex/lexed_module: LexedModule
+	../syntax/declarations: RecordDeclaration, RecordDeclarationForm(OrdinaryRecord, FixedRecord)
+	../syntax/spellings: spelling_text
+	../tables/row_kinds: Visibility(PublicVisibility)
+	../tables/token: TokenKind(IdentifierToken, RecordKeyword, NewlineToken, EndOfFileToken)
+	parse_state:
+		ParseInputError,
+		ParseState,
+		advanced,
+		current_kind,
+		current_span,
+		current_token,
+		peek_kind,
+		spellings,
+		diagnostic_count,
+		diagnostics,
+		new_parse_state,
+	preview_source: PreviewSource, preview_source
+	rejected_preview: RejectedPreview, reject_preview
+	token_cursor: token_spelling
+	tree_record_parser: RecordParse(ParsedRecord, RejectedRecord), parse_record_form
+
+
+opaque type RecordPreview = PreviewContents
+
+
+private record PreviewContents {
+	declaration: RecordDeclaration,
+	source: PreviewSource
+}
+
+
+union RecordPreviewOutcome:
+	PreviewedRecord(RecordPreview)
+	RejectedRecordPreview(RejectedPreview)
+	UnsupportedRecordPreview
+
+
+pure func record_declaration(preview: RecordPreview) -> RecordDeclaration:
+	from_opaque RecordPreview(preview).declaration
+
+
+pure func record_source(preview: RecordPreview) -> PreviewSource:
+	from_opaque RecordPreview(preview).source
+
+
+pure func preview_record(lexed: LexedModule) -> Result[RecordPreviewOutcome, ParseInputError]:
+	state ?= new_parse_state(lexed)
+
+	if state.diagnostic_count() != 0:
+		rejected ?= reject_preview(state)
+		Ok(RejectedRecordPreview(rejected))
+	else if state.current_kind() != RecordKeyword and not fixed_record_starts(state):
+		Ok(UnsupportedRecordPreview)
+	else:
+		fixed: Bool = fixed_record_starts(state)
+		after_introducer: ParseState = if fixed:
+			state.advanced().advanced()
+		else:
+			state.advanced()
+		form: RecordDeclarationForm = if fixed:
+			FixedRecord
+		else:
+			OrdinaryRecord
+		(parsed_state, result) = parse_record_form(
+			after_introducer,
+			PublicVisibility,
+			None,
+			state.current_span(),
+			form,
+		)
+
+		match result:
+			RejectedRecord:
+				rejected ?= reject_preview(parsed_state)
+				Ok(RejectedRecordPreview(rejected))
+			ParsedRecord(declaration):
+				var end: ParseState = parsed_state
+
+				while end.current_kind() == NewlineToken:
+					end = end.advanced()
+
+				if end.current_kind() != EndOfFileToken:
+					Ok(UnsupportedRecordPreview)
+				else:
+					Ok(PreviewedRecord(into_opaque RecordPreview({
+									declaration = declaration,
+									source = preview_source(lexed)
+								})))
+
+
+private FIXED_RECORD_MARKER: String = "fixed"
+
+
+private pure func fixed_record_starts(state: ParseState) -> Bool:
+	if state.current_kind() != IdentifierToken or state.peek_kind(1) != RecordKeyword:
+		False
+	else:
+		match state.current_token().token_spelling(state.spellings()):
+			Some(spelling): state.spellings().spelling_text(spelling) == Some(FIXED_RECORD_MARKER)
+			None: False

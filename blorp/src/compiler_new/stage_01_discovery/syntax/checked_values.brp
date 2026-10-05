@@ -1,0 +1,199 @@
+-- Literal values the lexer has checked, and the only functions that make them.
+--
+-- A value of these types is always a checked one, so later stages need not
+-- validate its syntax or range. Decimal floats retain the written digits for
+-- conversion at the width typecheck chooses (`docs/DISCOVERY_REDESIGN.md`,
+-- section 5.2). Only `lex/`, `parse/` and tests build them (`scripts/check-blorp-layout`
+-- enforces it); anyone may read them.
+import:
+	../lex/scan_support: byte_at, is_digit_byte
+	int: INT_MAX
+
+
+---
+The largest integer literal the language accepts: the Int128 maximum.
+---
+private INT128_MAX_DECIMAL: String = "170141183460469231731687303715884105727"
+
+---
+The base of the decimal digits a literal is written in.
+---
+private DECIMAL_RADIX: Int = 10
+
+
+---
+The magnitude of the integer literal written as the digits `start .. end` of
+`source`, or `None` when it exceeds the Int128 maximum. Leading zeros are
+written digits and do not count towards the size. The caller passes only
+digits.
+---
+pure func checked_integer(source: String, start: Int, end: Int) -> Option[Int128]:
+	first: Int = first_significant_digit(source, start, end)
+	count: Int = end - first
+
+	if (
+		count > INT128_MAX_DECIMAL.length()
+		or count == INT128_MAX_DECIMAL.length() and digits_exceed_maximum(source, first)
+	):
+		None
+	else:
+		Some(digits_value(source, first, end))
+
+
+---
+The first digit of `start .. end` that is not a leading zero, or the last
+digit when every digit is zero.
+---
+private pure func first_significant_digit(source: String, start: Int, end: Int) -> Int:
+	var index: Int = start
+
+	while index + 1 < end and byte_at(source, index) == '0':
+		index += 1
+
+	index
+
+
+---
+Whether the digits from `first` (exactly as many as the Int128 maximum has)
+denote a value above it.
+---
+private pure func digits_exceed_maximum(source: String, first: Int) -> Bool:
+	var exceeds: Bool = False
+	var index: Int = 0
+
+	while index < INT128_MAX_DECIMAL.length():
+		digit: Char = byte_at(source, first + index)
+		maximum_digit: Char = byte_at(INT128_MAX_DECIMAL, index)
+
+		if digit != maximum_digit:
+			exceeds = digit > maximum_digit
+			break
+
+		index += 1
+
+	exceeds
+
+
+---
+The value of the digits `start .. end`, of any count the Int128 maximum allows.
+---
+private pure func digits_value(source: String, start: Int, end: Int) -> Int128:
+	var value: Int128 = to_int128(0)
+	var index: Int = start
+
+	while index < end:
+		value = value * to_int128(
+			DECIMAL_RADIX,
+		) + to_int128(to_int(byte_at(source, index)) - to_int('0'))
+		index += 1
+
+	value
+
+
+---
+A float literal: its decimal digits as written, made only by
+`decimal_float` after checking that the digits are well formed and the value
+is finite. A later stage reads the value once, at the width typecheck chose
+(each conversion rounds directly from the decimal, so the digits are kept).
+---
+opaque type DecimalFloat = String
+
+
+---
+The float literal written as `digits`, or `None` when they are not a decimal
+float or the value is not finite as a `Float`. Well formed is digits, then
+optionally a `.` followed by digits, as the lexer scans a number.
+---
+pure func decimal_float(digits: String) -> Option[DecimalFloat]:
+	if not is_decimal_form(digits):
+		None
+	else:
+		match digits.parse_float():
+			Some(value):
+				if is_finite(value):
+					Some(into_opaque DecimalFloat(digits))
+				else:
+					None
+			None:
+				None
+
+
+private pure func is_decimal_form(digits: String) -> Bool:
+	length: Int = digits.length()
+	var index: Int = 0
+	var form_ok: Bool = length > 0 and is_digit_byte(byte_at(digits, 0))
+	var saw_dot: Bool = False
+
+	while form_ok and index < length:
+		c: Char = byte_at(digits, index)
+
+		if c == '.':
+			form_ok = (
+				not saw_dot
+				and index + 1 < length
+				and is_digit_byte(byte_at(digits, index + 1))
+			)
+			saw_dot = True
+		else:
+			form_ok = is_digit_byte(c)
+
+		index += 1
+
+	form_ok
+
+
+---
+The digits as the source wrote them.
+---
+pure func written_digits(value: DecimalFloat) -> String:
+	from_opaque DecimalFloat(value)
+
+
+---
+The value, rounded once from the decimal digits to a `Float`.
+---
+pure func to_float(value: DecimalFloat) -> Float:
+	from_opaque DecimalFloat(value).parse_float().get_or(0.0)
+
+
+---
+A count of one or more that fits in `Int`: a concurrency parameter's
+`max_threads` or `limit`. Made only by `positive_count`.
+---
+opaque type PositiveCount = Int
+
+
+---
+`value` as a positive count, or `None` when it is below one or above `Int`'s
+range. The parser reports either with the same diagnostic.
+---
+pure func positive_count(value: Int128) -> Option[PositiveCount]:
+	if value < to_int128(1) or value > to_int128(INT_MAX):
+		None
+	else:
+		Some(into_opaque PositiveCount(to_int(value)))
+
+
+pure func positive_count_value(count: PositiveCount) -> Int:
+	from_opaque PositiveCount(count)
+
+
+---
+How many `../` a relative module path climbs: one or more. Made only by
+`parent_steps`.
+---
+opaque type ParentSteps = Int
+
+
+---
+`count` as parent steps, or `None` when it is below one.
+---
+pure func parent_steps(count: Int) -> Option[ParentSteps]:
+	if count < 1:
+		None
+	else:
+		Some(into_opaque ParentSteps(count))
+
+
+pure func parent_step_count(steps: ParentSteps) -> Int:
+	from_opaque ParentSteps(steps)

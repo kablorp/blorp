@@ -1,0 +1,308 @@
+-- The frozen pattern grammar, parsed into typed syntax. Every completed child
+-- is handed into its parent's mint call; no accepted pattern is discarded.
+import:
+	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue, TextValue)
+	../syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken)
+	../syntax/names: BindingTarget(BindsName, DiscardsValue)
+	../syntax/patterns:
+		Pattern, PatternKind(WildcardPattern, NamePattern, IntegerPattern, FloatPattern,
+			StringPattern, CharacterPattern, BooleanPattern, ConstructorPattern,
+			QualifiedConstructorPattern, TuplePattern, ListPattern, AlternativePatterns),
+		ListSpread, Sign(NonNegative, Negative), StringForm(QuotedString, RawString, PipeString, RawPipeString)
+	../syntax/sequences: SmallTuple(Pair, Triple, Quadruple)
+	../tables/diagnostic_code:
+		PlainSyntaxCode(ExpectedPatternDiagnostic, InterpolatedStringPatternDiagnostic,
+			ExpectedSpreadTargetDiagnostic, ExpectedNumberAfterMinusDiagnostic, TupleArityDiagnostic)
+	../tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedComma, ExpectedRightParen, ExpectedRightBracket),
+		CommaConstruct(CommaInTuplePatternItems), NameConstruct(NameInConstructorName),
+		RightParenConstruct(RightParenInConstructorPattern, RightParenInTuplePattern),
+		RightBracketConstruct(RightBracketInListPattern)
+	../tables/span: Span, span_covering, span_source, span_start, pack_span
+	../tables/token:
+		TokenKind(IdentifierToken, TrueKeyword, FalseKeyword, UnderscoreSymbol,
+			LeftParenSymbol, LeftBracketSymbol, MinusSymbol, IntLiteralToken, FloatLiteralToken,
+			RejectedIntegerToken, RejectedFloatToken,
+			NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken,
+			InterpolatedStringToken, InterpolatedPipeStringToken, CharLiteralToken,
+			RightParenSymbol, RightBracketSymbol, CommaSymbol, DotSymbol, DotDotDotSymbol,
+			PipeSymbol, EndOfFileToken, NewlineToken, DedentToken, ColonSymbol),
+		KEYWORD_KINDS_IN_SEEDED_ORDER
+	parse_state:
+		ParseState, NameRole(OrdinaryName), current_token, current_kind,
+		current_span, peek_kind, advanced, current_literal, consume_name, consume_referenced_name,
+		finished_name_use, finished_binder, finished_pattern, report_diagnostic, report_at_current, expect_token
+
+
+pure func parse_pattern(state: ParseState) -> (ParseState, Pattern):
+	(first_state, first) = parse_simple_pattern(state)
+
+	if first_state.current_kind() != PipeSymbol:
+		(first_state, first)
+	else:
+		(second_state, second) = parse_simple_pattern(first_state.advanced())
+		var out: ParseState = second_state
+		var rest: List[Pattern] = []
+		var end: Span = second.span
+
+		while out.current_kind() == PipeSymbol:
+			(next, alternative) = parse_simple_pattern(out.advanced())
+			out = next
+			rest = rest.append(alternative)
+			end = alternative.span
+
+		out.finished_pattern(first.span.span_covering(end), AlternativePatterns({
+			first = first,
+			second = second,
+			rest = rest
+		}))
+
+
+private pure func parse_simple_pattern(state: ParseState) -> (ParseState, Pattern):
+	token = state.current_token()
+
+	match token.kind:
+		IdentifierToken:
+			state.parse_named_pattern()
+		TrueKeyword:
+			state.advanced().finished_pattern(token.span, BooleanPattern(True))
+		FalseKeyword:
+			state.advanced().finished_pattern(token.span, BooleanPattern(False))
+		UnderscoreSymbol:
+			state.advanced().finished_pattern(token.span, WildcardPattern)
+		LeftParenSymbol:
+			state.parse_tuple_pattern()
+		LeftBracketSymbol:
+			state.parse_list_pattern()
+		MinusSymbol:
+			state.parse_negative_pattern()
+		IntLiteralToken | FloatLiteralToken:
+			state.parse_number_pattern(NonNegative, token.span)
+		RejectedIntegerToken | RejectedFloatToken:
+			-- ParseState construction checked the matching lexical overflow error.
+			-- There is no accepted numeric value; this diagnosed preview keeps only
+			-- a recovery root and consumes the same source token as the table parser.
+			state.advanced().finished_pattern(token.span, WildcardPattern)
+		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+			match state.current_literal():
+				Some(TextValue(text)):
+					form: StringForm = match token.kind:
+						RawStringToken:
+							RawString
+						PipeStringToken:
+							PipeString
+						RawPipeStringToken:
+							RawPipeString
+						_:
+							QuotedString
+					state.advanced().finished_pattern(token.span, StringPattern(form, text))
+				_:
+					-- Input validation excludes a missing or mismatched literal.
+					-- A broken internal input still rejects the preview before recovery.
+					state.missing_pattern(ExpectedPatternDiagnostic)
+		InterpolatedStringToken | InterpolatedPipeStringToken:
+			state.missing_pattern(InterpolatedStringPatternDiagnostic)
+		CharLiteralToken:
+			-- The cursor validated this payload as a Unicode scalar value.
+			state.advanced().finished_pattern(token.span, CharacterPattern(to_char(token.payload)))
+		_:
+			if KEYWORD_KINDS_IN_SEEDED_ORDER.contains(token.kind):
+				(named, name) = state.consume_name(OrdinaryName, NameInConstructorName)
+				(used, use) = named.finished_name_use(name)
+				used.finished_pattern(token.span, NamePattern(use))
+			else:
+				state.missing_pattern(ExpectedPatternDiagnostic)
+
+
+private pure func parse_named_pattern(state: ParseState) -> (ParseState, Pattern):
+	start: Span = state.current_span()
+	(named, name) = state.consume_name(OrdinaryName, NameInConstructorName)
+	(used, use) = named.finished_name_use(name)
+
+	if used.current_kind() == DotSymbol:
+		(qualified, constructor_name) = used.advanced().consume_referenced_name(NameInConstructorName)
+		(with_constructor, constructor) = qualified.finished_name_use(constructor_name)
+
+		if with_constructor.current_kind() == LeftParenSymbol:
+			(arguments_state, arguments) = parse_pattern_arguments(with_constructor.advanced())
+			end: Span = if arguments_state.current_kind() == RightParenSymbol:
+				arguments_state.current_span()
+			else:
+				constructor_name.span
+			arguments_state
+				.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInConstructorPattern))
+				.finished_pattern(start.span_covering(end), QualifiedConstructorPattern(use, constructor, arguments))
+		else:
+			with_constructor.finished_pattern(start.span_covering(constructor_name.span), QualifiedConstructorPattern(use, constructor, []))
+	else if used.current_kind() == LeftParenSymbol:
+		(arguments_state, arguments) = parse_pattern_arguments(used.advanced())
+		end: Span = if arguments_state.current_kind() == RightParenSymbol:
+			arguments_state.current_span()
+		else:
+			start
+		arguments_state
+			.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInConstructorPattern))
+			.finished_pattern(start.span_covering(end), ConstructorPattern(use, arguments))
+	else:
+		used.finished_pattern(start, NamePattern(use))
+
+
+-- Comma-separated constructor or tuple items, leaving the closing delimiter.
+-- Both contexts permit a trailing comma; tuple arity is checked by its caller.
+private pure func parse_pattern_arguments(state: ParseState) -> (ParseState, List[Pattern]):
+	var out: ParseState = state
+	var patterns: List[Pattern] = []
+	var parsing: Bool = out.current_kind() != RightParenSymbol
+
+	while parsing:
+		(next, pattern) = parse_pattern(out)
+		out = next
+		patterns = patterns.append(pattern)
+
+		if out.current_kind() == CommaSymbol:
+			out = out.advanced()
+			parsing = out.current_kind() != RightParenSymbol and out.current_kind() != EndOfFileToken
+		else:
+			parsing = False
+
+	(out, patterns)
+
+
+private pure func parse_tuple_pattern(state: ParseState) -> (ParseState, Pattern):
+	start: Span = state.current_span()
+	(first_state, first) = parse_pattern(state.advanced())
+	var out: ParseState = first_state
+	var patterns: List[Pattern] = [first]
+	var end: Span = first.span
+
+	if out.current_kind() == CommaSymbol:
+		comma: Span = out.current_span()
+		(after_rest, rest) = parse_pattern_arguments(out.advanced())
+		out = after_rest
+		patterns = patterns.concat(rest)
+		end = match rest.last():
+			Some(last):
+				last.span
+			None:
+				comma
+	else:
+		out = out.report_diagnostic(empty_before(out.current_span()), ExpectedToken(ExpectedComma(CommaInTuplePatternItems)))
+
+	if out.current_kind() == RightParenSymbol:
+		end = out.current_span()
+
+	out = out.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInTuplePattern))
+	span: Span = start.span_covering(end)
+
+	match patterns:
+		[first, second]:
+			out.finished_pattern(span, TuplePattern(Pair(first, second)))
+		[first, second, third]:
+			out.finished_pattern(span, TuplePattern(Triple(first, second, third)))
+		[first, second, third, fourth]:
+			out.finished_pattern(span, TuplePattern(Quadruple(first, second, third, fourth)))
+		_:
+			-- An invalid arity has no SmallTuple representation. Only rejected
+			-- previews get this recovery root; their built children are discarded.
+			out.report_diagnostic(span, Plain(TupleArityDiagnostic)).finished_pattern(span, WildcardPattern)
+
+
+private pure func parse_list_pattern(state: ParseState) -> (ParseState, Pattern):
+	start: Span = state.current_span()
+	var out: ParseState = state.advanced()
+	var items: List[Pattern] = []
+	var spread: Option[ListSpread] = None
+	var end: Span = start
+
+	if out.current_kind() == DotDotDotSymbol:
+		(after_spread, parsed_spread) = parse_list_spread(out)
+		out = after_spread
+		spread = Some(parsed_spread)
+		end = parsed_spread.span
+	else if out.current_kind() != RightBracketSymbol:
+		var parsing: Bool = True
+
+		while parsing and out.current_kind() != EndOfFileToken:
+			(next, pattern) = parse_pattern(out)
+			out = next
+			items = items.append(pattern)
+			end = pattern.span
+
+			if out.current_kind() == CommaSymbol:
+				out = out.advanced()
+
+				if out.current_kind() == DotDotDotSymbol:
+					(after_spread, parsed_spread) = parse_list_spread(out)
+					out = after_spread
+					spread = Some(parsed_spread)
+					end = parsed_spread.span
+					parsing = False
+			else:
+				parsing = False
+
+	if out.current_kind() == RightBracketSymbol:
+		end = out.current_span()
+
+	out
+		.expect_token(RightBracketSymbol, ExpectedRightBracket(RightBracketInListPattern))
+		.finished_pattern(start.span_covering(end), ListPattern(items, spread))
+
+
+private pure func parse_list_spread(state: ParseState) -> (ParseState, ListSpread):
+	dots: Span = state.current_span()
+	out: ParseState = state.advanced()
+	target = out.current_token()
+	span: Span = dots.span_covering(target.span)
+
+	match target.kind:
+		IdentifierToken:
+			(named, name) = out.consume_name(OrdinaryName, NameInConstructorName)
+			(bound, binder) = named.finished_binder(name)
+			(bound, { target = BindsName(binder), span = span })
+		UnderscoreSymbol:
+			(out.advanced(), { target = DiscardsValue(target.span), span = span })
+		_:
+			(recovered(out.report_at_current(ExpectedSpreadTargetDiagnostic)),
+				{ target = DiscardsValue(span), span = span })
+
+
+private pure func parse_negative_pattern(state: ParseState) -> (ParseState, Pattern):
+	minus: Span = state.current_span()
+	out: ParseState = state.advanced()
+
+	match out.current_kind():
+		IntLiteralToken | FloatLiteralToken:
+			out.parse_number_pattern(Negative, minus.span_covering(out.current_span()))
+		RejectedIntegerToken | RejectedFloatToken:
+			out.advanced().finished_pattern(minus.span_covering(out.current_span()), WildcardPattern)
+		_:
+			out.report_diagnostic(minus, Plain(ExpectedNumberAfterMinusDiagnostic)).finished_pattern(minus, WildcardPattern)
+
+
+private pure func parse_number_pattern(state: ParseState, sign: Sign, span: Span) -> (ParseState, Pattern):
+	match state.current_literal():
+		Some(IntegerValue(value)):
+			state.advanced().finished_pattern(span, IntegerPattern(sign, value))
+		Some(FloatValue(value)):
+			state.advanced().finished_pattern(span, FloatPattern(sign, value))
+		_:
+			state.missing_pattern(ExpectedPatternDiagnostic)
+
+
+-- Missing-item diagnostics are zero-width at the current token; recovery
+-- preserves enclosing delimiters so their caller can still close the construct.
+private pure func empty_before(span: Span) -> Span:
+	pack_span(span.span_source(), span.span_start(), span.span_start())
+
+
+private pure func missing_pattern(state: ParseState, code: PlainSyntaxCode) -> (ParseState, Pattern):
+	span: Span = state.current_span()
+	recovered(state.report_diagnostic(empty_before(span), Plain(code))).finished_pattern(span, WildcardPattern)
+
+
+private pure func recovered(state: ParseState) -> ParseState:
+	match state.current_kind():
+		EndOfFileToken | NewlineToken | DedentToken | ColonSymbol | CommaSymbol | LeftParenSymbol | RightBracketSymbol | RightParenSymbol:
+			state
+		_:
+			state.advanced()

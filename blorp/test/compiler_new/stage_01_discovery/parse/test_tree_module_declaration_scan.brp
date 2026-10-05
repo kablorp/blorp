@@ -1,0 +1,315 @@
+-- Bounded M3 evidence only: EOF is a scan stop, never module acceptance.
+-- No ModuleSyntax, final id census, expression parsing or forward pairing.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, finished_builtin_type, consume_declared_name, spellings
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan: ModuleDeclarationPreviewScan, ModuleDeclarationScanStop(ReachedEndOfSource, StoppedAtGlobalInitializer, StoppedAtRejectedGlobalInitializer, StoppedAtRejectedDeclaration, StoppedWithoutDeclarationProgress), scan_module_declaration_previews, scan_module_declaration_prefix_with_expressions
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(RecordDeclarationPreview, AliasDeclarationPreview, ImportBlockDeclarationPreview, ForeignBlockDeclarationPreview, FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview, GlobalDeclarationPreview)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent(SkippedDefaultBody)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: FunctionBodyExtent(SkippedBody, ForwardDeclaration), deferred_body_span
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as Codes
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, import_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: NameConstruct(NameInTypeName), ExpectedTokenDiagnostic(ExpectedName, ExpectedLeftBrace, ExpectedRightBrace, ExpectedColon)
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(EndOfFileToken, IntLiteralToken, NewlineToken, LeftBracketSymbol, RightBracketSymbol, RecordKeyword)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func scanned(text: String) -> Option[(ParseState, ModuleDeclarationPreviewScan)]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			Some(scan_module_declaration_previews(state))
+		Err(_):
+			None
+
+
+private pure func no_body_ids(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	counts.expressions == 0 and counts.blocks == 0 and counts.statements == 0 and counts.patterns == 0
+
+
+private pure func definition_count(state: ParseState, count: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(entry):
+			(_, name) = entry.consume_declared_name(NameInTypeName)
+			match name:
+				Some(name):
+					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					witness.id.definition_local_index() == count
+				None:
+					False
+		Err(_):
+			False
+
+
+private pure func empty_scan(text: String) -> Bool:
+	match scanned(text):
+		Some((state, preview)):
+			match preview.stop:
+				ReachedEndOfSource:
+					(preview.documentation.is_none() and preview.declarations.is_empty() and state.current_kind() == EndOfFileToken
+						and state.current_span().covers(text.length(), text.length()) and state.diagnostic_count() == 0 and no_body_ids(state) and definition_count(state, 0))
+				_:
+					False
+		None:
+			False
+
+
+pure func test_empty_blank_and_comment_modules_reach_eof_without_nodes() -> Bool:
+	(empty_scan("") and empty_scan("\n\n") and empty_scan("-- only a comment\n\n"))
+
+
+pure func test_completed_leaves_keep_source_order_and_newlines() -> Bool:
+	text: String = "record R {}\n\ntype alias A = Int\nimport:\n\theap\nforeign:\n\tfunc f() -> Int\n"
+	match scanned(text):
+		Some((state, preview)):
+			match (preview.stop, preview.declarations):
+				(ReachedEndOfSource, [RecordDeclarationPreview(record_value), AliasDeclarationPreview(alias_value), ImportBlockDeclarationPreview(imported), ForeignBlockDeclarationPreview(foreign_block)]):
+					match (imported.imports, foreign_block.functions):
+						([import_value], [function]):
+							(record_value.id.definition_local_index() == 0 and alias_value.id.definition_local_index() == 1
+								and import_value.id.import_local_index() == 0 and function.id.definition_local_index() == 2 and definition_count(state, 3)
+								and state.current_kind() == EndOfFileToken and state.current_span().covers(text.length(), text.length())
+								and state.diagnostic_count() == 0 and no_body_ids(state))
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+private pure func later_import_documentation_rejects() -> Bool:
+	match scanned("import:\n\theap\n---\nDoc\n---\nimport:\n\tio"):
+		Some((state, preview)):
+			match (preview.stop, preview.declarations, state.diagnostics().get(0)):
+				(StoppedAtRejectedDeclaration, [ImportBlockDeclarationPreview(_)], Some(at)):
+					match at.diagnostic:
+						TreeDiagnostics.Plain(Codes.DocstringBeforeImportBlockDiagnostic):
+							preview.documentation.is_none() and at.span.covers(14, 26) and state.diagnostic_count() == 1
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+private pure func rejected_newline_is_preserved() -> Bool:
+	match scanned("123\nrecord S {}"):
+		Some((state, preview)):
+			match preview.stop:
+				StoppedAtRejectedDeclaration:
+					preview.declarations.is_empty() and state.current_kind() == NewlineToken and state.current_span().covers(4, 4) and state.position() == 1
+				_:
+					False
+		None:
+			False
+
+
+pure func test_module_documentation_and_later_declaration_documentation_are_separate() -> Bool:
+	text: String = "---\nModule\n---\nimport:\n\theap\n---\nRecord\n---\nrecord R {}"
+	match scanned(text):
+		Some((state, preview)):
+			match (preview.stop, preview.documentation, preview.declarations):
+				(ReachedEndOfSource, Some(module_doc), [ImportBlockDeclarationPreview(_), RecordDeclarationPreview(record_value)]):
+					match record_value.documentation:
+						Some(record_doc):
+							(module_doc.text == "Module" and module_doc.span.covers(0, 15) and record_doc.text == "Record" and record_doc.span.covers(29, 44)
+								and state.diagnostic_count() == 0 and no_body_ids(state) and later_import_documentation_rejects())
+						None:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_function_trait_and_implementation_keep_only_lexical_body_evidence() -> Bool:
+	-- Valid bodies only; no frozen expression cursor/diagnostic parity claim.
+	text: String = "func f(): 1\ntrait T:\n\tfunc g(): 2\nimplements Eq for Int:\n\tfunc h(): 3\n"
+	match scanned(text):
+		Some((state, preview)):
+			match (preview.stop, preview.declarations):
+				(ReachedEndOfSource, [FunctionDeclarationPreview(function), TraitDeclarationPreview(trait_value), ImplementationDeclarationPreview(implementation)]):
+					match (function.body_extent, trait_value.methods, implementation.methods):
+						(SkippedBody(function_body), [trait_method], [implementation_method]):
+							match trait_method.body_extent:
+								SkippedDefaultBody(trait_body):
+									(function_body.deferred_body_span().covers(10, 11) and trait_body.deferred_body_span().covers(32, 33)
+										and implementation_method.body.deferred_body_span().covers(68, 69) and state.diagnostic_count() == 0
+										and no_body_ids(state) and definition_count(state, 0))
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_global_initializer_handoff_retains_prior_previews_and_next_tokens() -> Bool:
+	text: String = "record R {}\nx: Int = 1\nrecord S {}"
+	match scanned(text):
+		Some((state, preview)):
+			match (preview.stop, preview.declarations):
+				(StoppedAtGlobalInitializer(global_value), [RecordDeclarationPreview(record_value)]):
+					(state.current_kind() == IntLiteralToken and state.current_span().covers(21, 22) and global_value.initializer.token_start == state.position()
+						and global_value.initializer.anchor.covers(12, 13) and global_value.header.header_span.covers(12, 20)
+						and state.spellings().spelling_text(global_value.header.name.spelling) == Some("x") and record_value.id.definition_local_index() == 0
+						and state.diagnostic_count() == 0 and definition_count(state, 1) and no_body_ids(state))
+				_:
+					False
+		None:
+			False
+
+
+pure func test_rejected_global_handoff_does_not_skip_initializer_or_sibling() -> Bool:
+	match scanned("if = 1\nrecord S {}"):
+		Some((state, preview)):
+			match (preview.stop, state.diagnostics().get(0)):
+				(StoppedAtRejectedGlobalInitializer(start), Some(at)):
+					match at.diagnostic:
+						TreeDiagnostics.ReservedKeywordAsName(spelling):
+							(preview.declarations.is_empty() and start.token_start == state.position() and start.anchor.covers(0, 2)
+								and state.current_kind() == IntLiteralToken and state.current_span().covers(5, 6) and at.span.covers(0, 0)
+								and state.spellings().spelling_text(spelling) == Some("if") and state.diagnostic_count() == 1
+								and no_body_ids(state) and definition_count(state, 0))
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_generic_fixed_record_scan_completes() -> Bool:
+	match scanned("fixed record P[T] { value: T }\nrecord S {}"):
+		Some((state, preview)):
+			match (preview.stop, preview.declarations):
+				(ReachedEndOfSource, [RecordDeclarationPreview(first), RecordDeclarationPreview(_)]):
+					first.type_parameters.length() == 1 and first.fields.length() == 1 and state.diagnostic_count() == 0 and no_body_ids(state)
+				_: False
+		None: False
+
+
+pure func test_rejected_declaration_stops_after_its_one_token_recovery() -> Bool:
+	match scanned("123 record R {}"):
+		Some((state, preview)):
+			match (preview.stop, state.diagnostics().get(0)):
+				(StoppedAtRejectedDeclaration, Some(at)):
+					match at.diagnostic:
+						TreeDiagnostics.Plain(Codes.ExpectedDeclarationDiagnostic):
+							(preview.declarations.is_empty() and state.position() == 1 and state.current_kind() == RecordKeyword
+								and state.current_span().covers(4, 10) and at.span.covers(0, 0) and state.diagnostic_count() == 1 and rejected_newline_is_preserved()
+								and no_body_ids(state) and definition_count(state, 0))
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_lexical_diagnostic_survives_reached_eof_without_claiming_acceptance() -> Bool:
+	match scanned("record R {} $"):
+		Some((state, preview)):
+			match (preview.stop, preview.declarations, state.diagnostics().get(0)):
+				(ReachedEndOfSource, [RecordDeclarationPreview(_)], Some(at)):
+					match at.diagnostic:
+						TreeDiagnostics.Plain(Codes.UnexpectedCharacterDiagnostic):
+							(at.span.covers(12, 13) and state.diagnostic_count() == 1 and state.current_kind() == EndOfFileToken
+								and state.current_span().covers(13, 13) and no_body_ids(state))
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_unpaired_forward_is_retained_without_final_pairing_diagnostic() -> Bool:
+	match scanned("func f():\n\n"):
+		Some((state, preview)):
+			match (preview.stop, preview.declarations):
+				(ReachedEndOfSource, [FunctionDeclarationPreview(function)]):
+					match function.body_extent:
+						ForwardDeclaration:
+							(state.diagnostic_count() == 0 and state.current_kind() == EndOfFileToken and function.header.header_span.covers(0, 9)
+								and no_body_ids(state) and definition_count(state, 0))
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_expression_scan_completes_operator_global_then_preserves_function_boundary() -> Bool:
+	text = "value = (007 + 2) * 3\nfunc later(): value"
+
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
+
+			match preview.declarations:
+				[GlobalDeclarationPreview(global_value), FunctionDeclarationPreview(_)]:
+					counts = state.issued_counts()
+					(
+						global_value.id.definition_local_index() == 0
+						and counts.expressions == 5
+						and counts.blocks == 0
+						and counts.statements == 0
+						and state.diagnostic_count() == 0
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_expression_scan_defers_postfix_without_minting_expression_ids() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "value = source.field\nrecord Later {}")):
+		Ok(entry):
+			(state, preview) = scan_module_declaration_prefix_with_expressions(entry)
+
+			match (preview.stop, preview.declarations):
+				(StoppedAtGlobalInitializer(global_value), []):
+					(
+						state.position() == global_value.initializer.token_start
+						and no_body_ids(state)
+						and definition_count(state, 0)
+						and state.diagnostic_count() == 0
+					)
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Bounded module declaration evidence and explicit scan stops",
+	tests = [
+		("expression scan operator global and function boundary", test_expression_scan_completes_operator_global_then_preserves_function_boundary),
+		("expression scan postfix exact handoff", test_expression_scan_defers_postfix_without_minting_expression_ids),
+		("empty blank comment eof", test_empty_blank_and_comment_modules_reach_eof_without_nodes),
+		("completed order and newlines", test_completed_leaves_keep_source_order_and_newlines),
+		("module and declaration documentation", test_module_documentation_and_later_declaration_documentation_are_separate),
+		("body previews carry only lexical evidence", test_function_trait_and_implementation_keep_only_lexical_body_evidence),
+		("global hard stop retains prior previews", test_global_initializer_handoff_retains_prior_previews_and_next_tokens),
+		("rejected global preserves initializer", test_rejected_global_handoff_does_not_skip_initializer_or_sibling),
+		("generic fixed record scan completes", test_generic_fixed_record_scan_completes),
+		("rejected declaration sibling boundary", test_rejected_declaration_stops_after_its_one_token_recovery),
+		("lexical diagnostic retained at eof", test_lexical_diagnostic_survives_reached_eof_without_claiming_acceptance),
+		("unpaired forward deferred final pairing", test_unpaired_forward_is_retained_without_final_pairing_diagnostic)
+	]
+}

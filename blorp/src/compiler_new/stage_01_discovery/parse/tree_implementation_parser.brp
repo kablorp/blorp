@@ -1,0 +1,93 @@
+-- Implementation ownership over receiver syntax and method header previews.
+-- Deferred bodies are lexical evidence; M4 owns bodies and definition IDs.
+import:
+	../syntax/module_syntax: Documentation
+	../syntax/names: NameUse
+	../syntax/types: WrittenType
+	../tables/expected_token:
+		NameConstruct(NameInTraitName), ExpectedTokenDiagnostic(ExpectedKeyword, ExpectedColon, ExpectedNewline, ExpectedIndent),
+		KeywordConstruct(KeywordInImplementationTrait), ColonConstruct(ColonInImplementationMethods),
+		NewlineConstruct(NewlineInImplementationMethods), IndentConstruct(IndentInImplementationMethods)
+	../tables/row_kinds: Visibility
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(ForKeyword, ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
+	parse_state:
+		ParseState, current_kind, current_span, position, advanced, diagnostic_count,
+		consume_referenced_name, finished_name_use, expect_token
+	tree_type_parser: parse_receiver_type
+	tree_implementation_method_header_parser:
+		ImplementationMethodHeaderPreview, ImplementationMethodHeaderParse(ParsedImplementationMethodHeader, RejectedImplementationMethodHeader), parse_implementation_method_header
+
+
+record ImplementationPreview {
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	keyword: Span,
+	trait_name: NameUse,
+	receiver: WrittenType,
+	methods: List[ImplementationMethodHeaderPreview],
+	span: Span
+}
+
+
+union ImplementationParse:
+	ParsedImplementation(ImplementationPreview)
+	RejectedImplementation
+
+
+-- The cursor is at `implements`; the caller owns any declaration prefix.
+pure func parse_implementation(state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span) -> (ParseState, ImplementationParse):
+	before: Int = state.diagnostic_count()
+	keyword: Span = state.current_span()
+	(after_name, name) = state.advanced().consume_referenced_name(NameInTraitName)
+	(after_trait, trait_name) = after_name.finished_name_use(name)
+	before_receiver: ParseState = after_trait.expect_token(ForKeyword, ExpectedKeyword(KeywordInImplementationTrait))
+	(after_receiver, receiver) = parse_receiver_type(before_receiver)
+	var end: Span = receiver.span
+	var out: ParseState = after_receiver
+		.expect_token(ColonSymbol, ExpectedColon(ColonInImplementationMethods))
+		.expect_token(NewlineToken, ExpectedNewline(NewlineInImplementationMethods))
+		.expect_token(IndentToken, ExpectedIndent(IndentInImplementationMethods))
+		.skip_newlines()
+	var methods: List[ImplementationMethodHeaderPreview] = []
+
+	-- Every token enters method recovery. Missing indentation deliberately
+	-- does not create a source-column guard for unindented method siblings.
+	while not out.at_block_end():
+		method_start: Int = out.position()
+		(after_method, result) = parse_implementation_method_header(out)
+		out = after_method.skip_newlines()
+		match result:
+			ParsedImplementationMethodHeader(method):
+				methods = methods.append(method)
+			RejectedImplementationMethodHeader:
+				()
+
+		if out.position() == method_start and not out.at_block_end():
+			out = out.advanced()
+
+	-- The frozen owner covers the closing dedent. At EOF, even after methods,
+	-- its endpoint remains the receiver rather than the last method header.
+	if out.current_kind() == DedentToken:
+		end = out.current_span()
+		out = out.advanced()
+
+	if out.diagnostic_count() != before:
+		(out, RejectedImplementation)
+	else:
+		(out, ParsedImplementation({
+			visibility = visibility, documentation = documentation, keyword = keyword,
+			trait_name = trait_name, receiver = receiver, methods = methods,
+			span = start.span_covering(end)
+		}))
+
+
+private pure func at_block_end(state: ParseState) -> Bool:
+	state.current_kind() == DedentToken or state.current_kind() == EndOfFileToken
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+	out

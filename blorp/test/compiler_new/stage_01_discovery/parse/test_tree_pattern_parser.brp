@@ -1,0 +1,413 @@
+-- Frozen pattern grammar, built directly from checked lexical values.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/lex/lexed_module: LexedModule
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		ParseState, new_parse_state, diagnostic_count, diagnostics, issued_counts, spellings, position, current_kind,
+		ParseInputError(InvalidTokenInput)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_pattern_parser: parse_pattern
+	../../../../src/compiler_new/stage_01_discovery/parse/token_cursor: TokenInputError(RejectedLiteralDiagnosticMismatch)
+	../../../../src/compiler_new/stage_01_discovery/syntax/checked_values: written_digits
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics:
+		SyntaxDiagnostic(Plain, ExpectedToken, IntegerLiteralOverflow, FloatLiteralOverflow)
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: pattern_local_index, name_use_local_index, binder_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/names: BindingTarget(BindsName, DiscardsValue)
+	../../../../src/compiler_new/stage_01_discovery/syntax/patterns:
+		Pattern, PatternKind(WildcardPattern, NamePattern, IntegerPattern, FloatPattern,
+			StringPattern, CharacterPattern, BooleanPattern, ConstructorPattern,
+			QualifiedConstructorPattern, TuplePattern, ListPattern, AlternativePatterns),
+		Sign(NonNegative, Negative), StringForm(QuotedString, RawString, PipeString, RawPipeString)
+	../../../../src/compiler_new/stage_01_discovery/syntax/sequences: SmallTuple(Pair, Triple, Quadruple)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedComma, ExpectedName), CommaConstruct(CommaInTuplePatternItems), NameConstruct(NameInConstructorName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, source_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end, span_source, pack_span
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as TableDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(EndOfFileToken)
+	test: TestSuite
+
+
+pure func parsed(text: String) -> Option[(ParseState, Pattern)]:
+	match new_parse_state(lex_module(module_id_at_row(3), text)):
+		Ok(state):
+			Some(parse_pattern(state))
+		Err(_):
+			None
+
+
+pure func clean_pattern(text: String) -> Option[Pattern]:
+	match parsed(text):
+		Some((state, pattern)):
+			if state.diagnostic_count() == 0:
+				Some(pattern)
+			else:
+				None
+		None:
+			None
+
+
+pure func test_names_are_uses_and_wildcards_mint_no_name() -> Bool:
+	match (parsed("name"), parsed("_")):
+		(Some((named_state, named)), Some((wild_state, wildcard))):
+			match (named.kind, wildcard.kind):
+				(NamePattern(use), WildcardPattern):
+					(
+						use.use.name_use_local_index() == 0
+						and named_state.spellings().spelling_text(use.name.spelling) == Some("name")
+						and named_state.issued_counts().name_uses == 1
+						and wild_state.issued_counts().name_uses == 0
+						and named_state.diagnostic_count() == 0 and wild_state.diagnostic_count() == 0
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_signed_numbers_keep_checked_magnitudes_and_spans() -> Bool:
+	match (clean_pattern("-42"), clean_pattern("-1.5"), clean_pattern("42")):
+		(Some(integer), Some(float), Some(positive)):
+			match (integer.kind, float.kind, positive.kind):
+				(IntegerPattern(Negative, magnitude), FloatPattern(Negative, digits), IntegerPattern(NonNegative, value)):
+					(
+						magnitude == to_int128(42) and value == to_int128(42)
+						and digits.written_digits() == "1.5"
+						and integer.span.span_start() == 0 and integer.span.span_end() == 3
+						and float.span.span_end() == 4
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_string_forms_keep_decoded_values() -> Bool:
+	match (clean_pattern("\"a\\n\""), clean_pattern("raw\"a\\n\""), clean_pattern("|hello"), clean_pattern("raw\n|hello")):
+		(Some(quoted), Some(raw), Some(pipe), Some(raw_pipe)):
+			match (quoted.kind, raw.kind, pipe.kind, raw_pipe.kind):
+				(StringPattern(QuotedString, quoted_text), StringPattern(RawString, raw_text),
+					StringPattern(PipeString, pipe_text), StringPattern(RawPipeString, raw_pipe_text)):
+					quoted_text == "a\n" and raw_text == "a\\n" and pipe_text == "hello" and raw_pipe_text == "hello"
+				_:
+					False
+		_:
+			False
+
+
+pure func test_characters_and_booleans_are_values() -> Bool:
+	match (clean_pattern("'a'"), clean_pattern("True"), clean_pattern("False")):
+		(Some(character), Some(yes), Some(no)):
+			match (character.kind, yes.kind, no.kind):
+				(CharacterPattern(value), BooleanPattern(yes_value), BooleanPattern(no_value)):
+					value == 'a' and yes_value and not no_value
+				_:
+					False
+		_:
+			False
+
+
+pure func test_constructor_children_complete_before_parent() -> Bool:
+	match parsed("Some(x, _)"):
+		Some((state, pattern)):
+			match pattern.kind:
+				ConstructorPattern(constructor, [first, second]):
+					(
+						state.spellings().spelling_text(constructor.name.spelling) == Some("Some")
+						and first.id.pattern_local_index() == 0 and second.id.pattern_local_index() == 1
+						and pattern.id.pattern_local_index() == 2
+						and state.issued_counts().patterns == 3 and state.diagnostic_count() == 0
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_qualified_constructor_keeps_both_name_uses() -> Bool:
+	match parsed("m.Some(x)"):
+		Some((state, pattern)):
+			match pattern.kind:
+				QualifiedConstructorPattern(qualifier, constructor, [_]):
+					(
+						state.spellings().spelling_text(qualifier.name.spelling) == Some("m")
+						and state.spellings().spelling_text(constructor.name.spelling) == Some("Some")
+						and qualifier.use.name_use_local_index() == 0 and constructor.use.name_use_local_index() == 1
+						and pattern.span.span_end() == 9 and state.diagnostic_count() == 0
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_tuple_bounds_have_precise_shapes() -> Bool:
+	match (clean_pattern("(a, b)"), clean_pattern("(a, b, c)"), clean_pattern("(a, b, c, d)")):
+		(Some(pair), Some(triple), Some(quadruple)):
+			match (pair.kind, triple.kind, quadruple.kind):
+				(TuplePattern(Pair(_, _)), TuplePattern(Triple(_, _, _)), TuplePattern(Quadruple(_, _, _, _))):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_list_spread_declares_a_binder_or_discards() -> Bool:
+	match (parsed("[x, ...rest]"), parsed("[..._]"), clean_pattern("[]")):
+		(Some((named_state, named)), Some((discard_state, discard)), Some(empty)):
+			empty_is_list: Bool = match empty.kind:
+				ListPattern([], None):
+					True
+				_:
+					False
+			match (named.kind, discard.kind):
+				(ListPattern([_], Some(spread)), ListPattern([], Some(discarded))):
+					match (spread.target, discarded.target):
+						(BindsName(binder), DiscardsValue(_)):
+							(
+								binder.binder.binder_local_index() == 0
+								and named_state.spellings().spelling_text(binder.name.spelling) == Some("rest")
+								and spread.span.span_start() == 4 and spread.span.span_end() == 11
+								and named_state.issued_counts().binders == 1 and discard_state.issued_counts().binders == 0
+								and empty_is_list
+								and named_state.diagnostic_count() == 0 and discard_state.diagnostic_count() == 0
+							)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_alternatives_mint_a_single_parent_after_all_children() -> Bool:
+	match parsed("a | b | c"):
+		Some((state, pattern)):
+			match pattern.kind:
+				AlternativePatterns(alternatives):
+					(
+						alternatives.first.id.pattern_local_index() == 0
+						and alternatives.second.id.pattern_local_index() == 1
+						and alternatives.rest.length() == 1 and pattern.id.pattern_local_index() == 3
+						and state.issued_counts().patterns == 4 and state.diagnostic_count() == 0
+					)
+				_:
+					False
+		None:
+			False
+
+
+private pure func same_problem(actual: SyntaxDiagnostic, expected: SyntaxDiagnostic) -> Bool:
+	match (actual, expected):
+		(IntegerLiteralOverflow(actual_digits), IntegerLiteralOverflow(expected_digits)):
+			actual_digits == expected_digits
+		(FloatLiteralOverflow(actual_digits), FloatLiteralOverflow(expected_digits)):
+			actual_digits == expected_digits
+		(Plain(actual_code), Plain(expected_code)):
+			actual_code == expected_code
+		(ExpectedToken(ExpectedComma(actual_context)), ExpectedToken(ExpectedComma(expected_context))):
+			actual_context == expected_context
+		(ExpectedToken(ExpectedName(actual_context)), ExpectedToken(ExpectedName(expected_context))):
+			actual_context == expected_context
+		_:
+			False
+
+
+pure func first_problem(text: String, expected: SyntaxDiagnostic, start: Int, end: Int) -> Bool:
+	match parsed(text):
+		Some((state, _)):
+			match state.diagnostics().get(0):
+				Some(problem):
+					same_problem(problem.diagnostic, expected) and problem.span.span_start() == start and problem.span.span_end() == end
+				None:
+					False
+		None:
+			False
+
+
+pure func test_tuple_errors_pin_legacy_diagnostic_spans() -> Bool:
+	(
+		first_problem("(x)", ExpectedToken(ExpectedComma(CommaInTuplePatternItems)), 2, 2)
+		and first_problem("(a,b,c,d,e)", Plain(TableDiagnostics.TupleArityDiagnostic), 0, 11)
+	)
+
+
+pure func test_minus_requires_a_checked_number() -> Bool:
+	first_problem("-name", Plain(TableDiagnostics.ExpectedNumberAfterMinusDiagnostic), 0, 1)
+
+
+pure func test_missing_spread_target_is_reported_at_the_cursor() -> Bool:
+	first_problem("[...42]", Plain(TableDiagnostics.ExpectedSpreadTargetDiagnostic), 4, 4)
+
+
+pure func test_interpolation_is_rejected_at_the_pattern_start() -> Bool:
+	first_problem("\"" + "$" + "{x}\"", Plain(TableDiagnostics.InterpolatedStringPatternDiagnostic), 0, 0)
+
+
+pure func test_missing_pattern_preserves_the_enclosing_delimiter() -> Bool:
+	first_problem(":", Plain(TableDiagnostics.ExpectedPatternDiagnostic), 0, 0)
+
+
+pure func test_qualified_constructor_rejects_a_reserved_keyword() -> Bool:
+	first_problem("m.True", ExpectedToken(ExpectedName(NameInConstructorName)), 2, 2)
+
+
+-- Exactly one more than the largest checked integer literal.
+private INTEGER_OVERFLOW_DIGITS: String = "170141183460469231731687303715884105728"
+
+
+private pure func float_overflow_digits() -> String:
+	"1" + "0".repeat(400) + ".5"
+
+
+private pure func rejected_pattern_advances(text: String, expected: SyntaxDiagnostic, literal_start: Int, token_count: Int) -> Bool:
+	match parsed(text):
+		Some((state, pattern)):
+			match (pattern.kind, state.diagnostics().get(0)):
+				(WildcardPattern, Some(problem)):
+					(
+						state.diagnostic_count() == 1 and same_problem(problem.diagnostic, expected)
+						and problem.span.span_start() == literal_start and problem.span.span_end() == text.length()
+						and state.position() == token_count and state.current_kind() == EndOfFileToken
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_rejected_integer_pattern_keeps_only_lexical_overflow() -> Bool:
+	rejected_pattern_advances(INTEGER_OVERFLOW_DIGITS, IntegerLiteralOverflow(INTEGER_OVERFLOW_DIGITS), 0, 1)
+
+
+pure func test_negative_rejected_integer_pattern_consumes_its_number() -> Bool:
+	rejected_pattern_advances("-" + INTEGER_OVERFLOW_DIGITS, IntegerLiteralOverflow(INTEGER_OVERFLOW_DIGITS), 1, 2)
+
+
+pure func test_rejected_float_pattern_keeps_only_lexical_overflow() -> Bool:
+	digits: String = float_overflow_digits()
+	rejected_pattern_advances(digits, FloatLiteralOverflow(digits), 0, 1)
+
+
+pure func test_negative_rejected_float_pattern_consumes_its_number() -> Bool:
+	digits: String = float_overflow_digits()
+	rejected_pattern_advances("-" + digits, FloatLiteralOverflow(digits), 1, 2)
+
+
+private pure func rejected_input_is_invalid(lexed: LexedModule) -> Bool:
+	match (lexed.tokens.get(0), new_parse_state(lexed)):
+		(Some(token), Err(InvalidTokenInput(RejectedLiteralDiagnosticMismatch(span)))):
+			(
+				span.span_source().source_id_index() == token.span.span_source().source_id_index()
+				and span.span_start() == token.span.span_start() and span.span_end() == token.span.span_end()
+			)
+		_:
+			False
+
+
+pure func test_rejected_integer_requires_its_lexer_diagnostic() -> Bool:
+	lexed = lex_module(module_id_at_row(3), INTEGER_OVERFLOW_DIGITS)
+	rejected_input_is_invalid({ lexed | diagnostics = [] })
+
+
+pure func test_rejected_float_requires_its_lexer_diagnostic() -> Bool:
+	lexed = lex_module(module_id_at_row(3), float_overflow_digits())
+	rejected_input_is_invalid({ lexed | diagnostics = [] })
+
+
+pure func test_rejected_integer_rejects_a_float_overflow_diagnostic() -> Bool:
+	lexed = lex_module(module_id_at_row(3), INTEGER_OVERFLOW_DIGITS)
+	match lexed.diagnostics.get(0):
+		Some(problem):
+			rejected_input_is_invalid({ lexed | diagnostics = [{ problem |
+				diagnostic = TableDiagnostics.FloatLiteralOverflow(INTEGER_OVERFLOW_DIGITS)
+			}] })
+		None:
+			False
+
+
+pure func test_rejected_float_rejects_an_integer_overflow_diagnostic() -> Bool:
+	digits: String = float_overflow_digits()
+	lexed = lex_module(module_id_at_row(3), digits)
+	match lexed.diagnostics.get(0):
+		Some(problem):
+			rejected_input_is_invalid({ lexed | diagnostics = [{ problem |
+				diagnostic = TableDiagnostics.IntegerLiteralOverflow(digits)
+			}] })
+		None:
+			False
+
+
+pure func test_rejected_integer_rejects_different_reported_digits() -> Bool:
+	lexed = lex_module(module_id_at_row(3), INTEGER_OVERFLOW_DIGITS)
+	match lexed.diagnostics.get(0):
+		Some(problem):
+			rejected_input_is_invalid({ lexed | diagnostics = [{ problem |
+				diagnostic = TableDiagnostics.IntegerLiteralOverflow("different")
+			}] })
+		None:
+			False
+
+
+pure func test_rejected_float_rejects_different_reported_digits() -> Bool:
+	lexed = lex_module(module_id_at_row(3), float_overflow_digits())
+	match lexed.diagnostics.get(0):
+		Some(problem):
+			rejected_input_is_invalid({ lexed | diagnostics = [{ problem |
+				diagnostic = TableDiagnostics.FloatLiteralOverflow("different")
+			}] })
+		None:
+			False
+
+
+private pure func rejected_diagnostic_at_another_span_is_invalid(text: String) -> Bool:
+	lexed = lex_module(module_id_at_row(3), text)
+	match lexed.diagnostics.get(0):
+		Some(problem):
+			point = pack_span(problem.span.span_source(), problem.span.span_start(), problem.span.span_start())
+			rejected_input_is_invalid({ lexed | diagnostics = [{ problem | span = point }] })
+		None:
+			False
+
+
+pure func test_rejected_integer_requires_the_matching_diagnostic_span() -> Bool:
+	rejected_diagnostic_at_another_span_is_invalid(INTEGER_OVERFLOW_DIGITS)
+
+
+pure func test_rejected_float_requires_the_matching_diagnostic_span() -> Bool:
+	rejected_diagnostic_at_another_span_is_invalid(float_overflow_digits())
+
+
+tests: TestSuite = {
+	description = "Direct tree pattern parser",
+	tests = [
+		("names are uses and wildcards mint no name", test_names_are_uses_and_wildcards_mint_no_name),
+		("signed numbers keep checked magnitudes and spans", test_signed_numbers_keep_checked_magnitudes_and_spans),
+		("string forms keep decoded values", test_string_forms_keep_decoded_values),
+		("characters and booleans are values", test_characters_and_booleans_are_values),
+		("constructor children complete before parent", test_constructor_children_complete_before_parent),
+		("qualified constructor keeps both name uses", test_qualified_constructor_keeps_both_name_uses),
+		("tuple bounds have precise shapes", test_tuple_bounds_have_precise_shapes),
+		("list spread declares a binder or discards", test_list_spread_declares_a_binder_or_discards),
+		("alternatives mint one parent after all children", test_alternatives_mint_a_single_parent_after_all_children),
+		("tuple errors pin legacy diagnostic spans", test_tuple_errors_pin_legacy_diagnostic_spans),
+		("minus requires a checked number", test_minus_requires_a_checked_number),
+		("missing spread target is reported at the cursor", test_missing_spread_target_is_reported_at_the_cursor),
+		("interpolation is rejected at the pattern start", test_interpolation_is_rejected_at_the_pattern_start),
+		("missing pattern preserves the enclosing delimiter", test_missing_pattern_preserves_the_enclosing_delimiter),
+		("qualified constructor rejects a reserved keyword", test_qualified_constructor_rejects_a_reserved_keyword),
+		("rejected integer keeps only lexical overflow", test_rejected_integer_pattern_keeps_only_lexical_overflow),
+		("negative rejected integer consumes its number", test_negative_rejected_integer_pattern_consumes_its_number),
+		("rejected float keeps only lexical overflow", test_rejected_float_pattern_keeps_only_lexical_overflow),
+		("negative rejected float consumes its number", test_negative_rejected_float_pattern_consumes_its_number),
+		("rejected integer requires lexer diagnostic", test_rejected_integer_requires_its_lexer_diagnostic),
+		("rejected float requires lexer diagnostic", test_rejected_float_requires_its_lexer_diagnostic),
+		("rejected integer rejects float overflow diagnostic", test_rejected_integer_rejects_a_float_overflow_diagnostic),
+		("rejected float rejects integer overflow diagnostic", test_rejected_float_rejects_an_integer_overflow_diagnostic),
+		("rejected integer rejects different reported digits", test_rejected_integer_rejects_different_reported_digits),
+		("rejected float rejects different reported digits", test_rejected_float_rejects_different_reported_digits),
+		("rejected integer requires matching diagnostic span", test_rejected_integer_requires_the_matching_diagnostic_span),
+		("rejected float requires matching diagnostic span", test_rejected_float_requires_the_matching_diagnostic_span)
+	]
+}

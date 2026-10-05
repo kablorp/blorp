@@ -1,0 +1,391 @@
+-- The bridge from the lexer's product to the builder the parser still reads.
+--
+-- `lex_module` is a pure function of a module's text; the parser reads names,
+-- literals and tokens from the builder's tables. The bridge copies one into
+-- the other: it interns the lexer's spellings and literal texts into the
+-- builder in token order, and rewrites each token's payload to the builder's
+-- row (a name row, a literal row, or the index of a bridged interpolation).
+-- Interning in token order gives every name and literal the row the
+-- table-building lexer gave it, so what the parser appends is unchanged.
+--
+-- A rejected number token (`RejectedIntegerToken`, `RejectedFloatToken`) is
+-- bridged as the number token the parser reads, with its digits from the
+-- source, since the lexer has already rejected the module.
+--
+-- The bridge is temporary: it goes when the parser reads trees from a
+-- `LexedModule` directly.
+import:
+	../lex/lexed_module:
+		InterpolationScan,
+		LexedModule,
+		LexedRun,
+		LiteralValue(TextValue),
+		ScannedPiece(ScannedHole, ScannedText),
+	../lex/lexer: lex_hole, lex_module
+	../syntax/spellings:
+		Spellings,
+		new_spellings,
+		spelling_text_at,
+	../tables/builder:
+		BridgedPiece(BridgedHole, BridgedText),
+		DiscoveryBuilder,
+		NOT_INTERNED,
+		TransientTable(BridgedInterpolationTable, LexedLiteralTable, LexingSpellingsTable),
+		append_bridged_interpolation,
+		append_literal,
+		append_name,
+		append_syntax_diagnostic,
+		append_token,
+		interned_literal_index,
+		interned_literal_slice_index,
+		interned_name_index,
+		interned_name_slice_index,
+		report_unreachable_transient,
+		source_text_of,
+		without_transient_tables,
+	../tables/ids:
+		ModuleId,
+		SourceId,
+		literal_id_at_row,
+		module_id_at_row,
+		module_id_index,
+		name_id_at_row,
+		source_id_index,
+	../tables/node_builder: append_dimension_name
+	../tables/span: Span, span_end, span_start
+	../tables/token:
+		Token,
+		TokenKind(
+			DimensionNameToken, DocStringToken, FloatLiteralToken, IdentifierToken, IntLiteralToken,
+			InterpolatedPipeStringToken, InterpolatedStringToken, NormalStringToken,
+			PipeStringToken, RawPipeStringToken, RawStringToken, RejectedFloatToken,
+			RejectedIntegerToken,
+		),
+
+
+---
+The text an unreachable lookup of a spelling returns: none.
+---
+private UNREACHABLE_SPELLING_TEXT: String = ""
+
+---
+The text an unreachable lookup of a string token's literal returns: none.
+---
+private UNREACHABLE_LITERAL_TEXT: String = ""
+
+---
+The name row an unreachable lookup of a spelling's row returns: the first row.
+---
+private UNREACHABLE_NAME_ROW: Int = 0
+
+
+---
+Copies `lexed` into `builder`, replacing the previous module's transient
+tables: its diagnostics, and its tokens with names and literals interned in
+the builder's tables.
+---
+pure func bridge_lexed_module(builder: DiscoveryBuilder, lexed: LexedModule) -> DiscoveryBuilder:
+	cleared: DiscoveryBuilder = builder.without_transient_tables()
+	cleared.bridge_run(
+		lexed.module,
+		lexed.source.text,
+		{
+			spellings = lexed.spellings,
+			tokens = lexed.tokens,
+			literals = lexed.source.literals,
+			interpolations = lexed.source.interpolations,
+			diagnostics = lexed.diagnostics
+		},
+	)
+
+
+---
+Lexes the text of an interpolation hole, bytes `start .. end` of `source`, and
+appends its tokens and an end-of-file token after the tokens already in the
+table. The parser moves its cursor there to parse the hole and back
+afterwards.
+---
+pure func lex_interpolation_hole(
+	builder: DiscoveryBuilder,
+	source: SourceId,
+	start: Int,
+	end: Int,
+) -> DiscoveryBuilder:
+	module: ModuleId = module_id_at_row(source.source_id_index())
+	text: String = builder.source_text_of(source)
+	builder.with_hole_tokens_bridged(module, text, start, end)
+
+
+---
+Lexes and bridges a hole after removing the builder's reference to its
+spellings. Keeping this handoff in one region avoids a heap tuple that would
+keep the builder shared while the bridge appends the hole's tokens.
+---
+private pure func with_hole_tokens_bridged(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	text: String,
+	start: Int,
+	end: Int,
+) -> DiscoveryBuilder:
+	match builder.lexing_spellings:
+		Some(spellings):
+			cleared: DiscoveryBuilder = builder.without_lexing_spellings()
+			cleared.bridge_run(module, text, lex_hole(module, text, spellings, start, end))
+		None:
+			-- A hole is lexed only while its module is parsed, after the module's
+			-- own lexing left its spellings here.
+			report_unreachable_transient(
+				LexingSpellingsTable,
+				module.module_id_index(),
+				"a hole is lexed after its module's tokens were bridged",
+			)
+			builder.bridge_run(module, text, lex_hole(module, text, new_spellings(module), start, end))
+
+
+---
+Removes the builder's spellings reference before handing it to the hole's
+lexer. The update is a tail expression so ownership transfers directly.
+---
+private pure func without_lexing_spellings(builder: DiscoveryBuilder) -> DiscoveryBuilder:
+	{ builder | lexing_spellings = None }
+
+
+
+---
+Appends `run`'s diagnostics, then its tokens with their payloads rewritten to
+builder rows, and keeps the run's spellings for the next hole.
+---
+private pure func bridge_run(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	text: String,
+	run: LexedRun,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+
+	for diagnostic in run.diagnostics:
+		out = out.append_syntax_diagnostic(diagnostic.span, diagnostic.diagnostic)
+
+	for token in run.tokens:
+		out = out.append_bridged_token(module, text, run, token)
+
+	{ out | lexing_spellings = Some(run.spellings) }
+
+
+private pure func append_bridged_token(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	text: String,
+	run: LexedRun,
+	token: Token,
+) -> DiscoveryBuilder:
+	match token.kind:
+		IdentifierToken:
+			named: DiscoveryBuilder = builder.with_spellings_interned_through(
+				module,
+				run.spellings,
+				token.payload,
+			)
+			row: Int = named.name_row_of_spelling(token.payload)
+			named.append_token({ token | payload = row })
+		DimensionNameToken:
+			named: DiscoveryBuilder = builder.with_spellings_interned_through(
+				module,
+				run.spellings,
+				token.payload,
+			)
+			row: Int = named.name_row_of_spelling(token.payload)
+			named
+				.with_sigil_name_of_dimension(text, token.span, row)
+				.append_token({ token | payload = row })
+		IntLiteralToken | FloatLiteralToken:
+			builder.with_number_token(text, token)
+		RejectedIntegerToken:
+			builder.with_number_token(text, { token | kind = IntLiteralToken })
+		RejectedFloatToken:
+			builder.with_number_token(text, { token | kind = FloatLiteralToken })
+		NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken | DocStringToken:
+			builder.with_text_literal_token(run.literals, token)
+		InterpolatedStringToken | InterpolatedPipeStringToken:
+			builder.with_interpolated_string_token(run.interpolations, token)
+		_:
+			builder.append_token(token)
+
+
+---
+Interns the module's spellings that the builder's name table has not met, up
+to and including spelling `index`, in the order the lexer met them. Spellings
+come in token order, so this is at most the token's own spelling; the loop
+only keeps a gap from mis-numbering the rows after it.
+---
+private pure func with_spellings_interned_through(
+	builder: DiscoveryBuilder,
+	module: ModuleId,
+	spellings: Spellings,
+	index: Int,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+
+	while out.spelling_name_rows.length() <= index:
+		next: Int = out.spelling_name_rows.length()
+
+		spelling: String = match spelling_text_at(spellings, next):
+			Some(text):
+				text
+			None:
+				report_unreachable_transient(
+					LexingSpellingsTable,
+					next,
+					"a token's spelling is one of the spellings its run returns",
+				)
+				UNREACHABLE_SPELLING_TEXT
+
+		var row: Int = out.interned_name_index(spelling)
+
+		if row == NOT_INTERNED:
+			row = out.name_spellings.length()
+			out = out.append_name(spelling)
+
+		out = { out | spelling_name_rows = out.spelling_name_rows.append(row) }
+
+	out
+
+
+---
+The name row spelling `index` was interned as, when
+`with_spellings_interned_through` has run for it.
+---
+private pure func name_row_of_spelling(builder: DiscoveryBuilder, index: Int) -> Int:
+	match builder.spelling_name_rows.get(index):
+		Some(row):
+			row
+		None:
+			report_unreachable_transient(
+				LexingSpellingsTable,
+				index,
+				"a token's spelling was interned before its payload was rewritten",
+			)
+			UNREACHABLE_NAME_ROW
+
+
+---
+A dimension name token's `#name` spelling, interned beside the plain name
+(as the table-building lexer did) with the row that pairs the two for the
+legacy adapter, unless an earlier `#name` already did.
+---
+private pure func with_sigil_name_of_dimension(
+	builder: DiscoveryBuilder,
+	text: String,
+	span: Span,
+	name_row: Int,
+) -> DiscoveryBuilder:
+	start: Int = span.span_start()
+	end: Int = span.span_end()
+
+	if builder.interned_name_slice_index(text, start, end) == NOT_INTERNED:
+		sigil_row: Int = builder.name_spellings.length()
+		builder
+			.append_name(text.substring(start, end - start))
+			.append_dimension_name({
+				name = name_id_at_row(name_row),
+				sigil_name = name_id_at_row(sigil_row),
+			})
+	else:
+		builder
+
+
+---
+A number token with its digits as written, read from the source under the
+token's span, interned as a literal whose row is the token's payload.
+---
+private pure func with_number_token(
+	builder: DiscoveryBuilder,
+	text: String,
+	token: Token,
+) -> DiscoveryBuilder:
+	start: Int = token.span.span_start()
+	end: Int = token.span.span_end()
+	var out: DiscoveryBuilder = builder
+	var row: Int = out.interned_literal_slice_index(text, start, end)
+
+	if row == NOT_INTERNED:
+		row = out.literals.length()
+		out = out.append_literal(text.substring(start, end - start))
+
+	out.append_token({ token | payload = row })
+
+
+---
+A string-like token with its text interned as a literal, whose row is its
+payload.
+---
+private pure func with_text_literal_token(
+	builder: DiscoveryBuilder,
+	literals: List[LiteralValue],
+	token: Token,
+) -> DiscoveryBuilder:
+	literal: String = match literals.get(token.payload):
+		Some(TextValue(value)):
+			value
+		_:
+			report_unreachable_transient(
+				LexedLiteralTable,
+				token.payload,
+				"a string token's payload indexes its text in the lexed literals",
+			)
+			UNREACHABLE_LITERAL_TEXT
+
+	var out: DiscoveryBuilder = builder
+	var row: Int = out.interned_literal_index(literal)
+
+	if row == NOT_INTERNED:
+		row = out.literals.length()
+		out = out.append_literal(literal)
+
+	out.append_token({ token | payload = row })
+
+
+---
+An interpolated string token with its text pieces interned as literals, in
+order, and its pieces kept as a bridged interpolation whose index is the
+token's payload.
+---
+private pure func with_interpolated_string_token(
+	builder: DiscoveryBuilder,
+	interpolations: List[InterpolationScan],
+	token: Token,
+) -> DiscoveryBuilder:
+	var out: DiscoveryBuilder = builder
+	var pieces: List[BridgedPiece] = []
+
+	match interpolations.get(token.payload):
+		Some(scan):
+			for piece in scan.pieces:
+				match piece:
+					ScannedText(scanned):
+						var row: Int = out.interned_literal_index(scanned.text)
+
+						if row == NOT_INTERNED:
+							row = out.literals.length()
+							out = out.append_literal(scanned.text)
+
+						pieces = pieces.append(BridgedText({
+							text = literal_id_at_row(row),
+							span = scanned.span,
+						}))
+					ScannedHole(hole):
+						pieces = pieces.append(BridgedHole(hole))
+		None:
+			report_unreachable_transient(
+				BridgedInterpolationTable,
+				token.payload,
+				(
+					"an interpolated string token's payload indexes its pieces in the lexed "
+					+ "interpolations"
+				),
+			)
+
+	index: Int = out.interpolations.length()
+	out = out.append_bridged_interpolation({pieces = pieces})
+	out.append_token({ token | payload = index })

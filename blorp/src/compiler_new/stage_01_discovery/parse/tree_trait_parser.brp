@@ -1,0 +1,133 @@
+-- Trait ownership over method header previews. Defaults carry lexical body
+-- evidence; M4 owns body trees and complete method/trait definition minting.
+import:
+	../syntax/declarations: TypeParameter, TraitReference
+	../syntax/module_syntax: Documentation
+	../syntax/names: WrittenName
+	../tables/diagnostic_code: PlainSyntaxCode(ExpectedSupertraitOrMethodsDiagnostic)
+	../tables/expected_token:
+		NameConstruct(NameInTraitName), ExpectedTokenDiagnostic(ExpectedColon, ExpectedNewline, ExpectedIndent),
+		ColonConstruct(ColonInTraitName), NewlineConstruct(NewlineInTraitMethods), IndentConstruct(IndentInTraitMethods)
+	../tables/row_kinds: Visibility
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(ColonSymbol, PlusSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
+	parse_state:
+		ParseState, current_kind, current_span, previous_span, position, advanced, diagnostic_count,
+		consume_declared_name, expect_token, report_at_current
+	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
+	tree_trait_reference_parser: parse_trait_reference
+	tree_trait_method_header_parser:
+		TraitMethodHeaderPreview, TraitMethodHeaderParse(ParsedTraitMethodHeader, RejectedTraitMethodHeader), parse_trait_method_header
+
+
+record TraitPreview {
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	supertraits: List[TraitReference],
+	methods: List[TraitMethodHeaderPreview],
+	span: Span
+}
+
+
+union TraitParse:
+	ParsedTrait(TraitPreview)
+	RejectedTrait
+
+
+-- The cursor is at `trait`; start includes caller-owned prefixes, if any.
+pure func parse_trait(state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span) -> (ParseState, TraitParse):
+	before: Int = state.diagnostic_count()
+	name_position: Span = state.advanced().current_span()
+	(after_name, name) = state.advanced().consume_declared_name(NameInTraitName)
+	(after_parameters, parsed_parameters) = parse_type_parameters(after_name)
+	parameters: Option[List[TypeParameter]] = match parsed_parameters:
+		NoTypeParameters:
+			Some([])
+		ParsedTypeParameters(parameters, _):
+			Some(parameters)
+		RejectedTypeParameters:
+			None
+
+	var out: ParseState = after_parameters.expect_token(ColonSymbol, ExpectedColon(ColonInTraitName))
+	var end: Span = name_position
+	var supertraits: List[TraitReference] = []
+	var methods: List[TraitMethodHeaderPreview] = []
+	var has_methods: Bool = False
+
+	if out.current_kind() == NewlineToken:
+		has_methods = True
+	else if out.at_block_end():
+		out = out.report_at_current(ExpectedSupertraitOrMethodsDiagnostic)
+	else:
+		var parsing: Bool = True
+
+		-- EOF after a trailing plus intentionally ends this frozen loop.
+		-- Header extent follows consumed reference tokens, not the plus.
+		while parsing and out.current_kind() != EndOfFileToken:
+			(after_supertrait, supertrait) = parse_trait_reference(out, NameInTraitName)
+			out = after_supertrait
+			supertraits = supertraits.append(supertrait)
+			end = out.previous_span()
+
+			if out.current_kind() == PlusSymbol:
+				out = out.advanced()
+			else:
+				parsing = False
+
+		if out.current_kind() == ColonSymbol:
+			out = out.advanced()
+			has_methods = True
+
+	if has_methods:
+		out = out
+			.expect_token(NewlineToken, ExpectedNewline(NewlineInTraitMethods))
+			.expect_token(IndentToken, ExpectedIndent(IndentInTraitMethods))
+			.skip_newlines()
+
+		-- Every token enters method recovery, including unsupported prefixes.
+		-- Missing indentation does not create a source-column sibling guard.
+		while not out.at_block_end():
+			method_start: Int = out.position()
+			(after_method, parsed_method) = parse_trait_method_header(out)
+			out = after_method.skip_newlines()
+
+			match parsed_method:
+				ParsedTraitMethodHeader(method):
+					methods = methods.append(method)
+				RejectedTraitMethodHeader:
+					()
+
+			if out.position() == method_start and not out.at_block_end():
+				out = out.advanced()
+
+		if out.current_kind() == DedentToken:
+			end = out.current_span()
+			out = out.advanced()
+
+	if out.diagnostic_count() != before:
+		(out, RejectedTrait)
+	else:
+		match (name, parameters):
+			(Some(name), Some(parameters)):
+				(out, ParsedTrait({
+					visibility = visibility, documentation = documentation, name = name,
+					type_parameters = parameters, supertraits = supertraits, methods = methods,
+					span = start.span_covering(end)
+				}))
+			_:
+				(out, RejectedTrait)
+
+
+private pure func at_block_end(state: ParseState) -> Bool:
+	state.current_kind() == DedentToken or state.current_kind() == EndOfFileToken
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+
+	out

@@ -1,0 +1,354 @@
+-- The test-only declaration leaf starts at the name after a recognized
+-- introducer. It returns a declaration or rejection; it cannot construct accepted source or a completed module.
+-- Expected API (production implementation deliberately follows these tests):
+-- parse_record_form(state, visibility, documentation, start, spelling)
+--     -> (ParseState, RecordParse)
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		ParseState, new_parse_state, advanced, current_kind, current_span, current_name_spelling_or_empty, diagnostics, diagnostic_count, issued_counts, spellings, position, finished_builtin_type, consume_declared_name, finished_type_binder, finished_name_use, finished_written_type
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_record_parser:
+		parse_record_form, RecordParse(ParsedRecord, RejectedRecord)
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: RecordDeclarationForm(OrdinaryRecord, FixedRecord)
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, written_type_local_index, type_binder_local_index, name_use_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(NamedType, VoidType), TypeArgument(TypeArgumentType)
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(DuplicateField, ExpectedToken, ReservedKeywordAsName, Plain)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedLeftBrace, ExpectedName, ExpectedRightBrace, ExpectedRightBracket, ExpectedColon, ExpectedRightParen), NameConstruct(NameInTypeName, NameInFieldName), LeftBraceConstruct(LeftBraceInRecordFields, LeftBraceInFixedRecordFields)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(IfKeyword, LeftBracketSymbol)
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_declaration
+	../../../../src/compiler_new/stage_01_discovery/parse/parser_cursor as FrozenCursor
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	test: TestSuite
+
+
+private pure func span_is(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+-- Recognition belongs to a later declaration preview. Each test supplies the
+-- known spelling, so this helper only advances its already-recognized tokens.
+private pure func after_introducer(state: ParseState, spelling: RecordDeclarationForm) -> ParseState:
+	match spelling:
+		OrdinaryRecord:
+			state.advanced()
+		FixedRecord:
+			state.advanced().advanced()
+
+
+private pure func empty_record(text: String, spelling: RecordDeclarationForm, name_start: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match parsed:
+				ParsedRecord(value):
+					(value.form == spelling
+						and value.visibility == PublicVisibility
+						and value.documentation.is_none()
+						and value.fields.is_empty()
+						and value.id.definition_local_index() == 0
+						and value.name.span.span_is(name_start, name_start + 5)
+						and value.span.span_is(0, text.length() - 3)
+						and parsed_state.spellings().spelling_text(value.name.spelling) == Some("Point")
+						and parsed_state.diagnostic_count() == 0
+						and parsed_state.issued_counts().written_types == 0
+						and parsed_state.current_kind() == IfKeyword
+						and parsed_state.current_span().span_is(text.length() - 2, text.length()))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_both_spellings_allow_empty_fields_and_leave_next_token() -> Bool:
+	(empty_record("record Point {} if", OrdinaryRecord, 7)
+		and empty_record("fixed record Point {} if", FixedRecord, 13))
+
+
+private pure func two_fields(text: String, spelling: RecordDeclarationForm, offset: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(3), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match parsed:
+				ParsedRecord(value):
+					match value.fields:
+						[first, second]:
+							match first.field_type.kind:
+								NamedType(_, [TypeArgumentType(child)]):
+									(value.form == spelling
+										and value.name.span.span_is(7 + offset, 12 + offset)
+										and value.span.span_is(0, 39 + offset)
+										and first.name.span.span_is(15 + offset, 16 + offset)
+										and first.span.span_is(15 + offset, 27 + offset)
+										and first.field_type.span.span_is(18 + offset, 27 + offset)
+										and child.span.span_is(23 + offset, 26 + offset)
+										and second.name.span.span_is(29 + offset, 30 + offset)
+										and second.span.span_is(29 + offset, 36 + offset)
+										and second.field_type.span.span_is(32 + offset, 36 + offset)
+										and first.id.definition_local_index() == 0
+										and second.id.definition_local_index() == 1
+										and value.id.definition_local_index() == 2
+										and child.id.written_type_local_index() == 0
+										and first.field_type.id.written_type_local_index() == 1
+										and second.field_type.id.written_type_local_index() == 2
+										and parsed_state.issued_counts().written_types == 3
+										and parsed_state.diagnostic_count() == 0
+										and parsed_state.current_kind() == IfKeyword
+										and parsed_state.current_span().span_is(40 + offset, 42 + offset))
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_both_spellings_keep_spans_child_order_and_trailing_comma() -> Bool:
+	(two_fields("record Point { x: List[Int], y: Bool, } if", OrdinaryRecord, 0)
+		and two_fields("fixed record Point { x: List[Int], y: Bool, } if", FixedRecord, 6))
+
+
+pure func test_visibility_and_documentation_are_preserved() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "record Point {}")):
+		Ok(state):
+			documentation: Documentation = { text = "A point.", span = state.current_span() }
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, OrdinaryRecord), PrivateVisibility, Some(documentation), documentation.span, OrdinaryRecord)
+
+			match parsed:
+				ParsedRecord(value):
+					match value.documentation:
+						Some(doc):
+							(value.visibility == PrivateVisibility and doc.text == documentation.text
+								and doc.span.spans_equal(documentation.span) and value.span.span_is(0, 15)
+								and parsed_state.diagnostic_count() == 0)
+						None:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func duplicate_field(text: String, spelling: RecordDeclarationForm, offset: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match (parsed, parsed_state.diagnostics()):
+				(RejectedRecord, [at]):
+					match at.diagnostic:
+						DuplicateField(first):
+							first.definition_local_index() == 0 and at.span.span_is(23 + offset, 24 + offset)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_duplicate_field_rejects_declaration_and_identifies_first_field() -> Bool:
+	(duplicate_field("record Point { x: Int, x: Bool }", OrdinaryRecord, 0)
+		and duplicate_field("fixed record Point { x: Int, x: Bool }", FixedRecord, 6))
+
+
+-- One frozen declaration owns transitional parameter recovery; no module scan.
+private pure func missing_open_brace(text: String, spelling: RecordDeclarationForm) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match (parsed, parsed_state.diagnostics()):
+				(RejectedRecord, [at]):
+					expected: Bool = match (spelling, at.diagnostic):
+						(OrdinaryRecord, ExpectedToken(ExpectedLeftBrace(LeftBraceInRecordFields))):
+							True
+						(FixedRecord, ExpectedToken(ExpectedLeftBrace(LeftBraceInFixedRecordFields))):
+							True
+						_:
+							False
+
+					(expected and at.span.span_is(text.length() - 2, text.length() - 2)
+						and parsed_state.current_kind() == IfKeyword)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_open_brace_rejects_at_next_token() -> Bool:
+	(missing_open_brace("record Point if", OrdinaryRecord)
+		and missing_open_brace("fixed record Point if", FixedRecord))
+
+
+-- Invalid declaration/field names use the table parser's expected-name
+-- diagnostic at an empty span before the offending token.
+private pure func dimension_declaration_name(text: String, spelling: RecordDeclarationForm, name_start: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match (parsed, parsed_state.diagnostics()):
+				(RejectedRecord, [at]):
+					match at.diagnostic:
+						ExpectedToken(ExpectedName(NameInTypeName)):
+							at.span.span_is(name_start, name_start)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_dimension_tokens_are_rejected_as_declaration_names() -> Bool:
+	(dimension_declaration_name("record #Point {}", OrdinaryRecord, 7)
+		and dimension_declaration_name("fixed record #Point {}", FixedRecord, 13))
+
+
+private pure func invalid_field_name(text: String, spelling: RecordDeclarationForm, name_start: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match (parsed, parsed_state.diagnostics()):
+				(RejectedRecord, [at]):
+					match at.diagnostic:
+						ExpectedToken(ExpectedName(NameInFieldName)):
+							(at.span.span_is(name_start, name_start)
+								and parsed_state.current_kind() == IfKeyword
+								and parsed_state.current_span().span_is(text.length() - 2, text.length()))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_dimension_tokens_are_rejected_as_field_names() -> Bool:
+	(invalid_field_name("record Point { #x: Int } if", OrdinaryRecord, 15)
+		and invalid_field_name("fixed record Point { #x: Int } if", FixedRecord, 21))
+
+
+pure func test_invalid_integer_field_name_recovers_without_a_diagnostic_cascade() -> Bool:
+	(invalid_field_name("record Point { 123: Int } if", OrdinaryRecord, 15)
+		and invalid_field_name("fixed record Point { 123: Int } if", FixedRecord, 21))
+
+
+private pure func missing_field_names(text: String, spelling: RecordDeclarationForm, offset: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match (parsed, parsed_state.diagnostics()):
+				(RejectedRecord, [first, second]):
+					match (first.diagnostic, second.diagnostic):
+						(ExpectedToken(ExpectedName(NameInFieldName)), ExpectedToken(ExpectedName(NameInFieldName))):
+							(first.span.span_is(15 + offset, 15 + offset)
+								and second.span.span_is(22 + offset, 22 + offset)
+								and parsed_state.current_kind() == IfKeyword
+								and parsed_state.current_span().span_is(text.length() - 2, text.length()))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_field_names_do_not_report_a_false_duplicate() -> Bool:
+	(missing_field_names("record Point { : Int, : Bool } if", OrdinaryRecord, 0)
+		and missing_field_names("fixed record Point { : Int, : Bool } if", FixedRecord, 6))
+
+
+private pure func reserved_declaration_name(text: String, spelling: RecordDeclarationForm, name_start: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match (parsed, parsed_state.diagnostics()):
+				(RejectedRecord, [at]):
+					match at.diagnostic:
+						ReservedKeywordAsName(name):
+							(at.span.span_is(name_start, name_start)
+								and parsed_state.spellings().spelling_text(name) == Some("if"))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_unparameterized_reserved_declaration_names_keep_existing_boundary() -> Bool:
+	(reserved_declaration_name("record if {}", OrdinaryRecord, 7)
+		and reserved_declaration_name("fixed record if {}", FixedRecord, 13))
+
+
+private pure func reserved_field_name(text: String, spelling: RecordDeclarationForm, name_start: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed_state, parsed) = parse_record_form(after_introducer(state, spelling), PublicVisibility, None, state.current_span(), spelling)
+
+			match (parsed, parsed_state.diagnostics()):
+				(RejectedRecord, [at]):
+					match at.diagnostic:
+						ReservedKeywordAsName(name):
+							(at.span.span_is(name_start, name_start)
+								and parsed_state.spellings().spelling_text(name) == Some("if")
+								and parsed_state.current_kind() == IfKeyword
+								and parsed_state.current_span().span_is(text.length() - 2, text.length()))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_reserved_field_names_reject_and_preserve_following_token() -> Bool:
+	(reserved_field_name("record Point { if: Int } if", OrdinaryRecord, 15)
+		and reserved_field_name("fixed record Point { if: Int } if", FixedRecord, 21))
+
+
+tests: TestSuite = {
+	description = "Direct tree ordinary and fixed record declarations",
+	tests = [
+		("fixed record accepts generic managed fields", test_fixed_record_accepts_generic_managed_fields),
+		("both spellings allow empty fields and leave next token", test_both_spellings_allow_empty_fields_and_leave_next_token),
+		("both spellings keep spans child order and trailing comma", test_both_spellings_keep_spans_child_order_and_trailing_comma),
+		("visibility and documentation are preserved", test_visibility_and_documentation_are_preserved),
+		("duplicate field rejects declaration and identifies first field", test_duplicate_field_rejects_declaration_and_identifies_first_field),
+		("missing open brace rejects at next token", test_missing_open_brace_rejects_at_next_token),
+		("dimension tokens are rejected as declaration names", test_dimension_tokens_are_rejected_as_declaration_names),
+		("dimension tokens are rejected as field names", test_dimension_tokens_are_rejected_as_field_names),
+		("invalid integer field name recovers without diagnostic cascade", test_invalid_integer_field_name_recovers_without_a_diagnostic_cascade),
+		("missing field names do not report false duplicate", test_missing_field_names_do_not_report_a_false_duplicate),
+		("unparameterized reserved names keep existing boundary", test_unparameterized_reserved_declaration_names_keep_existing_boundary),
+		("reserved field names reject and preserve following token", test_reserved_field_names_reject_and_preserve_following_token)
+	]
+}
+
+
+pure func test_fixed_record_accepts_generic_managed_fields() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "fixed record Box[T] { value: T, values: List[T] } if")):
+		Ok(entry):
+			(state, result) = parse_record_form(entry.advanced().advanced(), PublicVisibility, None, entry.current_span(), FixedRecord)
+			match result:
+				ParsedRecord(declaration):
+					declaration.form == FixedRecord and declaration.type_parameters.length() == 1 and declaration.fields.length() == 2 and state.diagnostic_count() == 0 and state.current_kind() == IfKeyword
+				RejectedRecord: False
+		Err(_): False

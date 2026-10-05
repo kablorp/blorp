@@ -1,0 +1,74 @@
+-- Global headers stop where the initializer grammar begins. M4 owns its
+-- expression, extent and diagnostics; these previews mint no global IDs.
+import:
+	../syntax/declarations: GlobalForm
+	../syntax/module_syntax: Documentation
+	../syntax/names: WrittenName
+	../syntax/types: WrittenType
+	../tables/expected_token: ExpectedTokenDiagnostic(ExpectedEqual), EqualConstruct(EqualInTopLevelVariable)
+	../tables/row_kinds: Visibility
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(ColonSymbol, EqualSymbol)
+	parse_state: ParseState, diagnostic_count, consume_global_name, current_kind, advanced, expect_token, previous_span, position
+	tree_declaration_prefix_parser: DeclarationPrefix
+	tree_type_parser: parse_type
+
+
+record GlobalHeader {
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	form: GlobalForm,
+	name: WrittenName,
+	declared_type: Option[WrittenType],
+	header_span: Span
+}
+
+
+-- Entry evidence only: it does not claim an initializer endpoint or value.
+record DeferredInitializerStart {
+	token_start: Int,
+	anchor: Span
+}
+
+
+record GlobalHeaderPreview {
+	header: GlobalHeader,
+	initializer: DeferredInitializerStart
+}
+
+
+union GlobalHeaderParse:
+	ParsedGlobalHeader(GlobalHeaderPreview)
+	RejectedGlobalHeader
+
+
+-- The caller consumed `var`, if present. Prefix purity has no global meaning;
+-- the composing caller rejects diagnostics introduced by its prefix grammar.
+pure func parse_global_header(state: ParseState, prefix: DeclarationPrefix, form: GlobalForm) -> (ParseState, GlobalHeaderParse):
+	before: Int = state.diagnostic_count()
+	(after_name, name) = state.consume_global_name()
+	(after_type, declared_type) = if after_name.current_kind() == ColonSymbol:
+		(parsed, written) = parse_type(after_name.advanced())
+		(parsed, Some(written))
+	else:
+		(after_name, None)
+
+	-- Even malformed names and types reach this expectation. A missing equal
+	-- leaves the value token untouched, just as the frozen global grammar does.
+	parsed: ParseState = after_type.expect_token(EqualSymbol, ExpectedEqual(EqualInTopLevelVariable))
+
+	if parsed.diagnostic_count() != before:
+		(parsed, RejectedGlobalHeader)
+	else:
+		match name:
+			None:
+				(parsed, RejectedGlobalHeader)
+			Some(name):
+				(parsed, ParsedGlobalHeader({
+					header = {
+						visibility = prefix.visibility, documentation = prefix.documentation,
+						form = form, name = name, declared_type = declared_type,
+						header_span = prefix.start.span_covering(parsed.previous_span())
+					},
+					initializer = { token_start = parsed.position(), anchor = prefix.start }
+				}))

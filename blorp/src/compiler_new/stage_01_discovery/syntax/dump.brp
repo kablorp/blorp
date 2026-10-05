@@ -1,0 +1,1920 @@
+-- The canonical text form of a module's syntax, for tests and the syntax dump
+-- differential (`docs/DISCOVERY_REDESIGN.md`, sections 6.3 and 8, M1).
+--
+-- Every node is a parenthesized form: its kind, its id when it has one, its
+-- span, then its parts in field order, so two trees dump equal exactly when
+-- they are equal. Ids print as module-local indexes with a family prefix
+-- (`expr4`, `use12`); spellings print as their text, so two name numberings
+-- need not agree. A statement, a module item and a declaration member start a
+-- line, indented by how deep it is in blocks and declarations; everything
+-- else stays on its line. Indentation therefore follows the source's own, and
+-- a long left-nested chain (`a + b + c ...`) costs no indentation.
+--
+-- Walkers follow section 3.14: a left spine (operands, callees, receivers) and
+-- an `else if` chain are walked by loops, so recursion depth is bounded by
+-- right-nesting and bracket nesting, which the source bounds.
+import:
+	../tables/row_kinds:
+		FunctionAnnotation(
+			DebugOnlyAnnotation, NoCopyAnnotation, ResourceResultOrdinaryAnnotation,
+			TailRecursiveAnnotation,
+		),
+		Purity(ImpureFunction, PureFunction),
+		Visibility(PrivateVisibility, PublicVisibility),
+	../tables/span: Span, span_end, span_start
+	checked_values: parent_step_count, positive_count_value, written_digits
+	declarations:
+		AliasDeclaration,
+		AliasForm(OpaqueAlias, TransparentAlias),
+		Annotation,
+		BuiltinTypeDeclaration,
+		DimensionConstraint,
+		EnumDeclaration,
+		FieldDeclaration,
+		Function,
+		FunctionDeclaration,
+		GlobalDeclaration,
+		GlobalForm(ConstantGlobal, MutableGlobal),
+		ImplementationDeclaration,
+		LocalFunction,
+		Parameter,
+		ParameterBinding(NamedParameter, TupleParameter, WildcardParameter),
+		RecordDeclaration,
+		ResourceTypeDeclaration,
+		Signature,
+		RecordDeclarationForm(OrdinaryRecord, FixedRecord),
+		TraitDeclaration,
+		TraitReference,
+		TypeParameter(DimensionVariable, TypeVariable, WildcardDimensionParameter),
+		UnionDeclaration,
+	expressions:
+		AssignmentTarget(AssignsDiscard, AssignsName),
+		BinaryOperator(
+			Add, Divide, Equal, Greater, GreaterEqual, Less, LessEqual, Modulo, Multiply, NotEqual,
+			Subtract,
+		),
+		Block,
+		Body(BlockBody, ExpressionBody),
+		CaseBody(CaseBlock, CaseStatement),
+		CompoundOperator(AddAssign, DivideAssign, MultiplyAssign, SubtractAssign),
+		CountParameter,
+		ElseBody(ElseBlock, ElseIf),
+		ElseBranch,
+		Expression,
+		ExpressionKind(
+			Binary, BooleanLiteral, Break, Call, CharacterLiteral, CompilerBuiltin, ConcurrentBlock,
+			Continue, DebugBlock, Detach, DictLiteral, FieldAccess, FloatLiteral, If,
+			IntegerLiteral, InterpolatedString, Lambda, ListLiteral, Match, NameReference,
+			OpaqueConversion, RangeExpression, RecordLiteral, RecordUpdate, Select, ShortCircuit,
+			StringLiteral, Subscript, TupleLiteral, Unary, VectorLiteral, VoidValue, With,
+		),
+		IfExpression,
+		InterpolationForm(PipeInterpolation, QuotedInterpolation),
+		InterpolationPiece(InterpolationHole, InterpolationText),
+		LogicalOperator(LogicalAnd, LogicalOr),
+		LoopBinder(LoopTuple, LoopVariable),
+		NamedValue,
+		OpaqueDirection(FromOpaque, IntoOpaque),
+		SelectArmKind(AfterArm, ReceiveArm, SealedArm),
+		Statement,
+		StatementKind(
+			Assignment, CompoundAssignment, ConcurrentForLoop, ExpressionStatement, ForLoop,
+			LocalFunctionStatement, QuestionBinding, SubscriptAssignment, TupleDestructure,
+			TypedBinding, VariableDeclaration, WhileLoop,
+		),
+		TimeoutParameter,
+		UnaryOperator(LogicalNot, Negate),
+		WithAcquisition(WithTry, WithValue),
+	foreign_blocks: ForeignBlock, ForeignFunction
+	ids:
+		binder_local_index,
+		block_local_index,
+		definition_local_index,
+		dimension_local_index,
+		expression_local_index,
+		import_local_index,
+		name_use_local_index,
+		pattern_local_index,
+		spelling_index,
+		statement_local_index,
+		type_binder_local_index,
+		written_type_local_index,
+	imports:
+		Import,
+		ImportBlock,
+		PathAnchor(BareAnchor, NativePackageAnchor, ParentDirectoryAnchor, SameDirectoryAnchor),
+	module_syntax:
+		Documentation,
+		ModuleItem(
+			AliasItem, BuiltinTypeItem, EnumItem, ForeignBlockItem, FunctionItem, GlobalItem,
+			ImplementationItem, ImportBlockItem, RecordItem, ResourceTypeItem,
+			TraitItem, UnionItem,
+		),
+		ModuleSyntax,
+	names: Binder, BindingTarget(BindsName, DiscardsValue), NameUse, TypeBinder, WrittenName
+	patterns:
+		Pattern,
+		PatternKind(
+			AlternativePatterns, BooleanPattern, CharacterPattern, ConstructorPattern, FloatPattern,
+			IntegerPattern, ListPattern, NamePattern, QualifiedConstructorPattern, StringPattern,
+			TuplePattern, WildcardPattern,
+		),
+		Sign(Negative, NonNegative),
+		StringForm(PipeString, QuotedString, RawPipeString, RawString),
+	sequences: at_least_one_items, at_least_two_items, small_tuple_items
+	spellings: Spellings, spelling_text
+	types:
+		Dimension,
+		DimensionKind(
+			DimensionArithmetic, LiteralDimension, NamedDimension, VariadicNamedDimension,
+			VariadicWildcardDimension, WildcardDimension,
+		),
+		DimensionOperator(AddDimensions, DivideDimensions, MultiplyDimensions, SubtractDimensions),
+		TypeArgument(BoundedArgument, DimensionArgument, TypeArgumentType),
+		WrittenType, BoundedTypeArgument,
+		WrittenTypeKind(
+			ArrayType, BoundedType, DimensionType, FunctionType, NamedType, QualifiedType, RangeType, TupleType,
+			VoidType,
+		),
+
+
+---
+How far one level of block or declaration nesting indents a line.
+---
+private DUMP_INDENT: String = "  "
+
+
+---
+The canonical text of `syntax`, whose names are spellings of `spellings`.
+---
+pure func dumped_module(syntax: ModuleSyntax, spellings: Spellings) -> String:
+	var out: List[String] = ["(module"]
+
+	match syntax.documentation:
+		Some(documentation):
+			out = out
+				.on_line(1)
+				.append(documentation_text(documentation))
+		None:
+			out = out
+
+	for item in syntax.items:
+		out = out
+			.on_line(1)
+			.dumped_item(spellings, 1, item)
+
+	out
+		.append(")")
+		.join("")
+
+
+-- Leaves: spans, names and literal values, each one string.
+private pure func span_text(span: Span) -> String:
+	"@" + span
+		.span_start()
+		.to_string() + ".." + span
+		.span_end()
+		.to_string()
+
+
+---
+`text` in double quotes, with `\`, `"` and line breaks escaped, so a dump of
+any text is one line and reads back unambiguously.
+---
+private pure func quoted(text: String) -> String:
+	escaped: String = text
+		.replace("\\", "\\\\")
+		.replace("\"", "\\\"")
+		.replace("\n", "\\n")
+		.replace("\r", "\\r")
+		.replace("\t", "\\t")
+	"\"" + escaped + "\""
+
+
+---
+A spelling's text, quoted; a spelling the table does not hold prints as
+`?` and its index, so a dump shows the defect instead of hiding it.
+---
+private pure func written_text(spellings: Spellings, name: WrittenName) -> String:
+	text: String = match spellings.spelling_text(name.spelling):
+		Some(found):
+			quoted(found)
+		None:
+			"?" + name.spelling
+				.spelling_index()
+				.to_string()
+
+	text + span_text(name.span)
+
+
+private pure func use_text(spellings: Spellings, use: NameUse) -> String:
+	"use" + use.use
+		.name_use_local_index()
+		.to_string() + ":" + written_text(spellings, use.name)
+
+
+private pure func binder_text(spellings: Spellings, binder: Binder) -> String:
+	"bind" + binder.binder
+		.binder_local_index()
+		.to_string() + ":" + written_text(spellings, binder.name)
+
+
+private pure func type_binder_text(spellings: Spellings, binder: TypeBinder) -> String:
+	"tbind" + binder.binder
+		.type_binder_local_index()
+		.to_string() + ":" + written_text(spellings, binder.name)
+
+
+private pure func target_text(spellings: Spellings, target: BindingTarget) -> String:
+	match target:
+		BindsName(binder):
+			binder_text(spellings, binder)
+		DiscardsValue(span):
+			"_" + span_text(span)
+
+
+private pure func optional_written_text(spellings: Spellings, name: Option[WrittenName]) -> String:
+	match name:
+		Some(written):
+			written_text(spellings, written)
+		None:
+			"-"
+
+
+private pure func purity_text(purity: Purity) -> String:
+	match purity:
+		PureFunction:
+			"pure"
+		ImpureFunction:
+			"impure"
+
+
+private pure func visibility_text(visibility: Visibility) -> String:
+	match visibility:
+		PublicVisibility:
+			"public"
+		PrivateVisibility:
+			"private"
+
+
+private pure func string_form_text(form: StringForm) -> String:
+	match form:
+		QuotedString:
+			"quoted"
+		RawString:
+			"raw"
+		PipeString:
+			"pipe"
+		RawPipeString:
+			"raw-pipe"
+
+
+private pure func sign_text(sign: Sign) -> String:
+	match sign:
+		NonNegative:
+			"+"
+		Negative:
+			"-"
+
+
+private pure func binary_operator_text(operator: BinaryOperator) -> String:
+	match operator:
+		Add:
+			"add"
+		Subtract:
+			"subtract"
+		Multiply:
+			"multiply"
+		Divide:
+			"divide"
+		Modulo:
+			"modulo"
+		Equal:
+			"equal"
+		NotEqual:
+			"not-equal"
+		Less:
+			"less"
+		LessEqual:
+			"less-equal"
+		Greater:
+			"greater"
+		GreaterEqual:
+			"greater-equal"
+
+
+private pure func annotation_text(annotation: Annotation) -> String:
+	name: String = match annotation.annotation:
+		TailRecursiveAnnotation:
+			"tail-recursive"
+		NoCopyAnnotation:
+			"no-copy"
+		DebugOnlyAnnotation:
+			"debug-only"
+		ResourceResultOrdinaryAnnotation:
+			"resource-result-ordinary"
+
+	"(annotation " + name + " " + span_text(annotation.span) + ")"
+
+
+-- Layout.
+---
+`out` with a line break and the indentation of `depth`.
+---
+private pure func on_line(out: List[String], depth: Int) -> List[String]:
+	out.append("\n" + DUMP_INDENT.repeat(depth))
+
+
+private pure func dumped_annotations(
+	out: List[String],
+	annotations: List[Annotation],
+) -> List[String]:
+	var dumped: List[String] = out
+
+	for annotation in annotations:
+		dumped = dumped.append(" " + annotation_text(annotation))
+
+	dumped
+
+
+---
+The parts every top-level declaration starts with: its id, visibility and
+span, then its docstring when written.
+---
+private pure func declaration_head(
+	out: List[String],
+	form: String,
+	definition: Int,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	span: Span,
+) -> List[String]:
+	head: String = "(" + form + " def" + definition.to_string() + " " + visibility_text(
+		visibility,
+	) + " " + span_text(span)
+
+	match documentation:
+		Some(written):
+			out.append(head + " " + documentation_text(written))
+		None:
+			out.append(head)
+
+
+private pure func documentation_text(documentation: Documentation) -> String:
+	"(documentation " + quoted(documentation.text) + " " + span_text(documentation.span) + ")"
+
+
+-- Module items and declarations.
+private pure func dumped_item(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	item: ModuleItem,
+) -> List[String]:
+	match item:
+		FunctionItem(declaration):
+			out.dumped_function_declaration(spellings, depth, declaration)
+		GlobalItem(declaration):
+			out.dumped_global(spellings, depth, declaration)
+		RecordItem(declaration):
+			out.dumped_record(spellings, depth, declaration)
+		UnionItem(declaration):
+			out.dumped_union(spellings, depth, declaration)
+		EnumItem(declaration):
+			out.dumped_enum(spellings, depth, declaration)
+		AliasItem(declaration):
+			out.dumped_alias(spellings, depth, declaration)
+		BuiltinTypeItem(declaration):
+			out.dumped_builtin_type(spellings, depth, declaration)
+		ResourceTypeItem(declaration):
+			out.dumped_resource_type(spellings, depth, declaration)
+		TraitItem(declaration):
+			out.dumped_trait(spellings, depth, declaration)
+		ImplementationItem(declaration):
+			out.dumped_implementation(spellings, depth, declaration)
+		ImportBlockItem(block):
+			out.dumped_import_block(spellings, depth, block)
+		ForeignBlockItem(block):
+			out.dumped_foreign_block(spellings, depth, block)
+
+
+private pure func dumped_function_declaration(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: FunctionDeclaration,
+) -> List[String]:
+	out
+		.declaration_head(
+			"function",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.dumped_annotations(declaration.annotations)
+		.dumped_function(spellings, depth, declaration.function)
+		.append(")")
+
+
+---
+A function's parts: its signature and type parameters on the current line,
+then its constraints, then its body (`-` when it has none).
+---
+private pure func dumped_function(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	function: Function,
+) -> List[String]:
+	var dumped: List[String] = out
+		.dumped_signature(spellings, depth, function.signature)
+		.append(" (type-parameters")
+
+	for parameter in function.type_parameters:
+		dumped = dumped
+			.append(" ")
+			.dumped_type_parameter(spellings, depth, parameter)
+
+	dumped = dumped.append(") (where")
+
+	for constraint in function.constraints:
+		dumped = dumped
+			.append(" ")
+			.dumped_constraint(spellings, depth, constraint)
+
+	dumped = dumped.append(")")
+
+	match function.body:
+		Some(body):
+			dumped
+				.append(" ")
+				.dumped_body(spellings, depth, body)
+		None:
+			dumped.append(" -")
+
+
+private pure func dumped_signature(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	signature: Signature,
+) -> List[String]:
+	var dumped: List[String] = out.append(
+		" (signature " + purity_text(
+			signature.purity,
+		) + " " + span_text(
+			signature.keyword,
+		) + " " + written_text(spellings, signature.name) + " (parameters",
+	)
+
+	for parameter in signature.parameters:
+		dumped = dumped
+			.append(" ")
+			.dumped_parameter(spellings, depth, parameter)
+
+	dumped
+		.append(") ")
+		.dumped_optional_type(spellings, depth, signature.return_type)
+		.append(")")
+
+
+private pure func dumped_parameter(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	parameter: Parameter,
+) -> List[String]:
+	binding: String = match parameter.binding:
+		NamedParameter(binder):
+			binder_text(spellings, binder)
+		WildcardParameter(span):
+			"_" + span_text(span)
+		TupleParameter(tuple):
+			"(tuple " + span_text(tuple.span) + " " + tuple.names
+				.small_tuple_items()
+				.map(pure func(binder): binder_text(spellings, binder))
+				.join(" ") + ")"
+
+	out
+		.append("(parameter " + span_text(parameter.span) + " " + binding + " ")
+		.dumped_optional_type(spellings, depth, parameter.declared_type)
+		.append(")")
+
+
+private pure func dumped_type_parameter(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	parameter: TypeParameter,
+) -> List[String]:
+	match parameter:
+		TypeVariable(variable):
+			out
+				.append(
+					"(type-variable " + span_text(
+						variable.span,
+					) + " " + type_binder_text(spellings, variable.binder),
+				)
+				.dumped_trait_references(spellings, variable.bounds)
+				.append(")")
+		DimensionVariable(binder):
+			out.append("(dimension-variable " + type_binder_text(spellings, binder) + ")")
+		WildcardDimensionParameter(span):
+			out.append("(wildcard-dimension " + span_text(span) + ")")
+
+
+private pure func trait_reference_text(spellings: Spellings, reference: TraitReference) -> String:
+	qualifier: String = match reference.qualifier:
+		Some(use):
+			use_text(spellings, use)
+		None:
+			"-"
+
+	"(trait " + span_text(
+		reference.span,
+	) + " " + qualifier + " " + use_text(spellings, reference.trait_name) + ")"
+
+
+private pure func dumped_trait_references(
+	out: List[String],
+	spellings: Spellings,
+	references: List[TraitReference],
+) -> List[String]:
+	var dumped: List[String] = out
+
+	for reference in references:
+		dumped = dumped.append(" " + trait_reference_text(spellings, reference))
+
+	dumped
+
+
+private pure func dumped_constraint(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	constraint: DimensionConstraint,
+) -> List[String]:
+	out
+		.append("(constraint " + span_text(constraint.span) + " ")
+		.dumped_dimension(spellings, depth, constraint.left)
+		.append(" ")
+		.dumped_dimension(spellings, depth, constraint.right)
+		.append(")")
+
+
+private pure func dumped_global(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: GlobalDeclaration,
+) -> List[String]:
+	form: String = match declaration.form:
+		ConstantGlobal:
+			"constant"
+		MutableGlobal:
+			"mutable"
+
+	out
+		.declaration_head(
+			"global",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + form + " " + written_text(spellings, declaration.name) + " ")
+		.dumped_optional_type(spellings, depth, declaration.declared_type)
+		.append(" ")
+		.dumped_expression(spellings, depth, declaration.value)
+		.append(")")
+
+
+private pure func dumped_type_parameters(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	parameters: List[TypeParameter],
+) -> List[String]:
+	var dumped: List[String] = out.append(" (type-parameters")
+
+	for parameter in parameters:
+		dumped = dumped
+			.append(" ")
+			.dumped_type_parameter(spellings, depth, parameter)
+
+	dumped.append(")")
+
+
+private pure func dumped_fields(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	fields: List[FieldDeclaration],
+) -> List[String]:
+	var dumped: List[String] = out
+
+	for field in fields:
+		dumped = dumped
+			.on_line(depth + 1)
+			.append("(field def" + field.id
+					.definition_local_index()
+					.to_string() + " " + span_text(
+					field.span,
+				) + " " + written_text(spellings, field.name) + " ")
+			.dumped_type(spellings, depth + 1, field.field_type)
+			.append(")")
+
+	dumped
+
+
+private pure func dumped_record(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: RecordDeclaration,
+) -> List[String]:
+	form: String = match declaration.form:
+		OrdinaryRecord: "record"
+		FixedRecord: "fixed-record"
+	out
+		.declaration_head(
+			form,
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + written_text(spellings, declaration.name))
+		.dumped_type_parameters(spellings, depth, declaration.type_parameters)
+		.dumped_fields(spellings, depth, declaration.fields)
+		.append(")")
+
+
+private pure func dumped_union(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: UnionDeclaration,
+) -> List[String]:
+	var dumped: List[String] = out
+		.declaration_head(
+			"union",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + written_text(spellings, declaration.name))
+		.dumped_type_parameters(spellings, depth, declaration.type_parameters)
+
+	for variant in declaration.variants:
+		dumped = dumped
+			.on_line(depth + 1)
+			.append("(variant def" + variant.id
+					.definition_local_index()
+					.to_string() + " " + span_text(
+					variant.span,
+				) + " " + written_text(spellings, variant.name))
+
+		for payload in variant.payload:
+			dumped = dumped
+				.append(" ")
+				.dumped_type(spellings, depth + 1, payload)
+
+		dumped = dumped.append(")")
+
+	dumped.append(")")
+
+
+private pure func dumped_enum(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: EnumDeclaration,
+) -> List[String]:
+	var dumped: List[String] = out
+		.declaration_head(
+			"enum",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + written_text(spellings, declaration.name))
+
+	for case_declaration in declaration.cases:
+		dumped = dumped
+			.on_line(depth + 1)
+			.append("(case def" + case_declaration.id
+					.definition_local_index()
+					.to_string() + " " + span_text(
+					case_declaration.span,
+				) + " " + written_text(spellings, case_declaration.name) + ")")
+
+	dumped.append(")")
+
+
+private pure func dumped_alias(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: AliasDeclaration,
+) -> List[String]:
+	form: String = match declaration.form:
+		TransparentAlias:
+			"transparent"
+		OpaqueAlias:
+			"opaque"
+
+	out
+		.declaration_head(
+			"alias",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + form + " " + written_text(spellings, declaration.name))
+		.dumped_type_parameters(spellings, depth, declaration.type_parameters)
+		.append(" ")
+		.dumped_type(spellings, depth, declaration.target)
+		.append(")")
+
+
+private pure func dumped_builtin_type(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: BuiltinTypeDeclaration,
+) -> List[String]:
+	out
+		.declaration_head(
+			"builtin-type",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + written_text(spellings, declaration.name))
+		.dumped_type_parameters(spellings, depth, declaration.type_parameters)
+		.append(")")
+
+
+private pure func dumped_resource_type(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: ResourceTypeDeclaration,
+) -> List[String]:
+	cleanup: String = match declaration.cleanup:
+		Some(builtin_name):
+			"(cleanup " + quoted(builtin_name.name) + " " + span_text(builtin_name.span) + ")"
+		None:
+			"-"
+
+	out
+		.declaration_head(
+			"resource-type",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + written_text(spellings, declaration.name))
+		.dumped_type_parameters(spellings, depth, declaration.type_parameters)
+		.append(" " + cleanup + ")")
+
+
+private pure func dumped_trait(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: TraitDeclaration,
+) -> List[String]:
+	var dumped: List[String] = out
+		.declaration_head(
+			"trait",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(" " + written_text(spellings, declaration.name))
+		.dumped_type_parameters(spellings, depth, declaration.type_parameters)
+		.append(" (supertraits")
+		.dumped_trait_references(spellings, declaration.supertraits)
+		.append(")")
+
+	for method in declaration.methods:
+		dumped = dumped
+			.on_line(depth + 1)
+			.append("(trait-method def" + method.id
+					.definition_local_index()
+					.to_string() + " " + span_text(method.span))
+			.dumped_signature(spellings, depth + 1, method.signature)
+
+		match method.default_body:
+			Some(body):
+				dumped = dumped
+					.append(" ")
+					.dumped_body(spellings, depth + 1, body)
+			None:
+				dumped = dumped.append(" -")
+
+		dumped = dumped.append(")")
+
+	dumped.append(")")
+
+
+private pure func dumped_implementation(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	declaration: ImplementationDeclaration,
+) -> List[String]:
+	var dumped: List[String] = out
+		.declaration_head(
+			"implementation",
+			declaration.id.definition_local_index(),
+			declaration.visibility,
+			declaration.documentation,
+			declaration.span,
+		)
+		.append(
+			" " + span_text(
+				declaration.keyword,
+			) + " " + use_text(spellings, declaration.trait_name) + " ",
+		)
+		.dumped_type(spellings, depth, declaration.receiver)
+
+	for method in declaration.methods:
+		dumped = dumped
+			.on_line(depth + 1)
+			.append("(method def" + method.id
+					.definition_local_index()
+					.to_string() + " " + span_text(method.span))
+			.dumped_annotations(method.annotations)
+			.dumped_function(spellings, depth + 1, method.function)
+			.append(")")
+
+	dumped.append(")")
+
+
+private pure func dumped_import_block(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	block: ImportBlock,
+) -> List[String]:
+	var dumped: List[String] = out.append("(import-block " + span_text(block.span))
+
+	for import_row in block.imports:
+		dumped = dumped
+			.on_line(depth + 1)
+			.append(import_text(spellings, import_row))
+
+	dumped.append(")")
+
+
+private pure func import_text(spellings: Spellings, import_row: Import) -> String:
+	anchor: String = match import_row.path.anchor:
+		BareAnchor:
+			"bare"
+		SameDirectoryAnchor:
+			"same-directory"
+		ParentDirectoryAnchor(steps):
+			"parent-" + steps
+				.parent_step_count()
+				.to_string()
+		NativePackageAnchor:
+			"package"
+
+	parts: String = import_row.path.parts
+		.at_least_one_items()
+		.map(pure func(part): written_text(spellings, part))
+		.join(" ")
+	var items: String = ""
+
+	for item in import_row.items:
+		constructors: String = item.constructors
+			.map(pure func(use): " " + use_text(spellings, use))
+			.join("")
+		alias_name: String = optional_written_text(spellings, item.alias_name)
+		items = items + " (item " + span_text(
+			item.span,
+		) + " " + use_text(spellings, item.name) + " " + alias_name + constructors + ")"
+
+	"(import imp" + import_row.id
+		.import_local_index()
+		.to_string() + " " + span_text(
+		import_row.span,
+	) + " (path " + anchor + " " + span_text(
+		import_row.path_span,
+	) + " " + parts + ") " + optional_written_text(
+		spellings,
+		import_row.alias_name,
+	) + " (items" + items + "))"
+
+
+private pure func dumped_foreign_block(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	block: ForeignBlock,
+) -> List[String]:
+	var dumped: List[String] = out.append("(foreign-block " + span_text(block.span))
+
+	for argument in block.arguments:
+		dumped = dumped.append(
+			" (argument " + span_text(
+				argument.span,
+			) + " " + written_text(spellings, argument.name) + " " + quoted(argument.value) + ")",
+		)
+
+	for function in block.functions:
+		dumped = dumped
+			.on_line(depth + 1)
+			.dumped_foreign_function(spellings, depth + 1, function)
+
+	dumped.append(")")
+
+
+private pure func dumped_foreign_function(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	function: ForeignFunction,
+) -> List[String]:
+	var dumped: List[String] = out
+		.append("(foreign-function def" + function.id
+				.definition_local_index()
+				.to_string() + " " + visibility_text(
+				function.visibility,
+			) + " " + span_text(function.span))
+		.dumped_annotations(function.annotations)
+		.append(
+			" " + purity_text(
+				function.purity,
+			) + " " + span_text(
+				function.keyword,
+			) + " " + written_text(spellings, function.name) + " (parameters",
+		)
+
+	for parameter in function.parameters:
+		dumped = dumped
+			.append(" ")
+			.dumped_parameter(spellings, depth, parameter)
+
+	c_name: String = match function.c_name:
+		Some(written):
+			"(c-name " + quoted(written.name) + " " + span_text(written.span) + ")"
+		None:
+			"-"
+
+	dumped
+		.append(") ")
+		.dumped_type(spellings, depth, function.return_type)
+		.append(" " + c_name + ")")
+
+
+-- Written types and dimensions.
+private pure func dumped_optional_type(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	written_type: Option[WrittenType],
+) -> List[String]:
+	match written_type:
+		Some(present):
+			out.dumped_type(spellings, depth, present)
+		None:
+			out.append("-")
+
+
+private pure func dumped_type(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	written_type: WrittenType,
+) -> List[String]:
+	head: String = " type" + written_type.id
+		.written_type_local_index()
+		.to_string() + " " + span_text(written_type.span)
+
+	match written_type.kind:
+		NamedType(name, arguments):
+			out
+				.append("(named-type" + head + " " + use_text(spellings, name))
+				.dumped_type_arguments(spellings, depth, arguments)
+				.append(")")
+		QualifiedType(qualifier, name, arguments):
+			out
+				.append(
+					"(qualified-type" + head + " " + use_text(
+						spellings,
+						qualifier,
+					) + " " + use_text(spellings, name),
+				)
+				.dumped_type_arguments(spellings, depth, arguments)
+				.append(")")
+		VoidType:
+			out.append("(void-type" + head + ")")
+		TupleType(elements):
+			out
+				.append("(tuple-type" + head)
+				.dumped_type_arguments(spellings, depth, elements.small_tuple_items())
+				.append(")")
+		FunctionType(purity, parameters, result):
+			out
+				.append("(function-type" + head + " " + purity_text(purity) + " (parameters")
+				.dumped_type_arguments(spellings, depth, parameters)
+				.append(") ")
+				.dumped_type(spellings, depth, result)
+				.append(")")
+		ArrayType(element, dimensions):
+			var dumped: List[String] = out
+				.append("(array-type" + head + " ")
+				.dumped_type(spellings, depth, element)
+
+			for dimension in dimensions.at_least_one_items():
+				dumped = dumped
+					.append(" ")
+					.dumped_dimension(spellings, depth, dimension)
+
+			dumped.append(")")
+		RangeType(bound):
+			out
+				.append("(range-type" + head + " ")
+				.dumped_dimension(spellings, depth, bound)
+				.append(")")
+		DimensionType(dimension):
+			out
+				.append("(dimension-type" + head + " ")
+				.dumped_dimension(spellings, depth, dimension)
+				.append(")")
+		BoundedType(bounded):
+			out.append("(bounded-type" + head + " ").dumped_bounded_type(spellings, bounded).append(")")
+
+
+private pure func dumped_bounded_type(out: List[String], spellings: Spellings, bounded: BoundedTypeArgument) -> List[String]:
+	out
+		.append("(bounded " + span_text(bounded.span) + " " + use_text(spellings, bounded.parameter))
+		.dumped_trait_references(spellings, bounded.bounds.at_least_one_items())
+		.append(")")
+
+
+private pure func dumped_type_arguments(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	arguments: List[TypeArgument],
+) -> List[String]:
+	var dumped: List[String] = out
+
+	for argument in arguments:
+		dumped = dumped.append(" ")
+
+		match argument:
+			TypeArgumentType(written_type):
+				dumped = dumped.dumped_type(spellings, depth, written_type)
+			DimensionArgument(dimension):
+				dumped = dumped.dumped_dimension(spellings, depth, dimension)
+			BoundedArgument(bounded):
+				dumped = dumped.dumped_bounded_type(spellings, bounded)
+
+	dumped
+
+
+private pure func dumped_dimension(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	dimension: Dimension,
+) -> List[String]:
+	head: String = " dim" + dimension.id
+		.dimension_local_index()
+		.to_string() + " " + span_text(dimension.span)
+
+	match dimension.kind:
+		NamedDimension(name):
+			out.append("(named-dimension" + head + " " + use_text(spellings, name) + ")")
+		VariadicNamedDimension(name):
+			out.append("(variadic-dimension" + head + " " + use_text(spellings, name) + ")")
+		WildcardDimension:
+			out.append("(wildcard-dimension" + head + ")")
+		VariadicWildcardDimension:
+			out.append("(variadic-wildcard-dimension" + head + ")")
+		LiteralDimension(value):
+			out.append("(literal-dimension" + head + " " + value.to_string() + ")")
+		DimensionArithmetic(operator, left, right):
+			name: String = match operator:
+				AddDimensions:
+					"add"
+				SubtractDimensions:
+					"subtract"
+				MultiplyDimensions:
+					"multiply"
+				DivideDimensions:
+					"divide"
+
+			out
+				.append("(dimension-arithmetic" + head + " " + name + " ")
+				.dumped_dimension(spellings, depth, left)
+				.append(" ")
+				.dumped_dimension(spellings, depth, right)
+				.append(")")
+
+
+-- Patterns.
+private pure func dumped_pattern(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	pattern: Pattern,
+) -> List[String]:
+	head: String = " pat" + pattern.id
+		.pattern_local_index()
+		.to_string() + " " + span_text(pattern.span)
+
+	match pattern.kind:
+		WildcardPattern:
+			out.append("(wildcard-pattern" + head + ")")
+		NamePattern(name):
+			out.append("(name-pattern" + head + " " + use_text(spellings, name) + ")")
+		IntegerPattern(sign, magnitude):
+			out.append(
+				"(integer-pattern" + head + " " + sign_text(
+					sign,
+				) + " " + magnitude.to_string() + ")",
+			)
+		FloatPattern(sign, magnitude):
+			out.append(
+				"(float-pattern" + head + " " + sign_text(
+					sign,
+				) + " " + magnitude.written_digits() + ")",
+			)
+		StringPattern(form, text):
+			out.append(
+				"(string-pattern" + head + " " + string_form_text(form) + " " + quoted(text) + ")",
+			)
+		CharacterPattern(character):
+			out.append("(character-pattern" + head + " " + to_int(character).to_string() + ")")
+		BooleanPattern(value):
+			out.append("(boolean-pattern" + head + " " + value.to_string() + ")")
+		ConstructorPattern(constructor, arguments):
+			out
+				.append("(constructor-pattern" + head + " " + use_text(spellings, constructor))
+				.dumped_patterns(spellings, depth, arguments)
+				.append(")")
+		QualifiedConstructorPattern(qualifier, constructor, arguments):
+			out
+				.append(
+					"(qualified-constructor-pattern" + head + " " + use_text(
+						spellings,
+						qualifier,
+					) + " " + use_text(spellings, constructor),
+				)
+				.dumped_patterns(spellings, depth, arguments)
+				.append(")")
+		TuplePattern(elements):
+			out
+				.append("(tuple-pattern" + head)
+				.dumped_patterns(spellings, depth, elements.small_tuple_items())
+				.append(")")
+		ListPattern(elements, spread):
+			spread_text: String = match spread:
+				Some(written):
+					" (spread " + span_text(
+						written.span,
+					) + " " + target_text(spellings, written.target) + ")"
+				None:
+					" -"
+
+			out
+				.append("(list-pattern" + head)
+				.dumped_patterns(spellings, depth, elements)
+				.append(spread_text + ")")
+		AlternativePatterns(alternatives):
+			out
+				.append("(alternative-patterns" + head)
+				.dumped_patterns(spellings, depth, alternatives.at_least_two_items())
+				.append(")")
+
+
+private pure func dumped_patterns(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	patterns: List[Pattern],
+) -> List[String]:
+	var dumped: List[String] = out
+
+	for pattern in patterns:
+		dumped = dumped
+			.append(" ")
+			.dumped_pattern(spellings, depth, pattern)
+
+	dumped
+
+
+-- Blocks and statements.
+private pure func dumped_body(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	body: Body,
+) -> List[String]:
+	match body:
+		BlockBody(block):
+			out.dumped_block(spellings, depth, block)
+		ExpressionBody(expression):
+			out
+				.append("(expression-body ")
+				.dumped_expression(spellings, depth, expression)
+				.append(")")
+
+
+---
+A block, its statements each on a line one level deeper than `depth`.
+---
+private pure func dumped_block(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	block: Block,
+) -> List[String]:
+	var dumped: List[String] = out.append("(block block" + block.id
+			.block_local_index()
+			.to_string() + " " + span_text(block.span))
+
+	for statement in block.leading:
+		dumped = dumped
+			.on_line(depth + 1)
+			.dumped_statement(spellings, depth + 1, statement)
+
+	dumped
+		.on_line(depth + 1)
+		.dumped_statement(spellings, depth + 1, block.last)
+		.append(")")
+
+
+private pure func dumped_statement(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	statement: Statement,
+) -> List[String]:
+	head: String = " stmt" + statement.id
+		.statement_local_index()
+		.to_string() + " " + span_text(statement.span)
+
+	match statement.kind:
+		ExpressionStatement(expression):
+			out
+				.append("(expression-statement" + head + " ")
+				.dumped_expression(spellings, depth, expression)
+				.append(")")
+		VariableDeclaration(declaration):
+			out
+				.append("(var" + head + " " + target_text(spellings, declaration.target) + " ")
+				.dumped_optional_type(spellings, depth, declaration.declared_type)
+				.append(" ")
+				.dumped_expression(spellings, depth, declaration.value)
+				.append(")")
+		TypedBinding(binding):
+			out
+				.append(
+					"(typed-binding" + head + " " + target_text(spellings, binding.target) + " ",
+				)
+				.dumped_type(spellings, depth, binding.declared_type)
+				.append(" ")
+				.dumped_expression(spellings, depth, binding.value)
+				.append(")")
+		Assignment(assignment):
+			target: String = match assignment.target:
+				AssignsName(use):
+					use_text(spellings, use)
+				AssignsDiscard(span):
+					"_" + span_text(span)
+
+			out
+				.append("(assignment" + head + " " + target + " ")
+				.dumped_expression(spellings, depth, assignment.value)
+				.append(")")
+		QuestionBinding(binding):
+			out
+				.append(
+					"(question-binding" + head + " " + binder_text(
+						spellings,
+						binding.binder,
+					) + " ",
+				)
+				.dumped_optional_type(spellings, depth, binding.declared_type)
+				.append(" ")
+				.dumped_expression(spellings, depth, binding.value)
+				.append(")")
+		CompoundAssignment(assignment):
+			operator: String = match assignment.operator:
+				AddAssign:
+					"add"
+				SubtractAssign:
+					"subtract"
+				MultiplyAssign:
+					"multiply"
+				DivideAssign:
+					"divide"
+
+			out
+				.append(
+					"(compound-assignment" + head + " " + operator + " " + use_text(
+						spellings,
+						assignment.target,
+					) + " ",
+				)
+				.dumped_expression(spellings, depth, assignment.value)
+				.append(")")
+		SubscriptAssignment(assignment):
+			place: String = " (place expr" + assignment.place.id
+				.expression_local_index()
+				.to_string() + " " + span_text(assignment.place.span) + " "
+			out
+				.append("(subscript-assignment" + head + place)
+				.dumped_expression(spellings, depth, assignment.place.collection)
+				.dumped_expressions(spellings, depth, assignment.place.indices.at_least_one_items())
+				.append(") ")
+				.dumped_expression(spellings, depth, assignment.value)
+				.append(")")
+		TupleDestructure(destructure):
+			targets: String = destructure.targets
+				.small_tuple_items()
+				.map(pure func(target): target_text(spellings, target))
+				.join(" ")
+			out
+				.append("(tuple-destructure" + head + " (" + targets + ") ")
+				.dumped_expression(spellings, depth, destructure.value)
+				.append(")")
+		WhileLoop(loop):
+			out
+				.append("(while" + head + " ")
+				.dumped_expression(spellings, depth, loop.condition)
+				.append(" ")
+				.dumped_block(spellings, depth, loop.body)
+				.append(")")
+		ForLoop(loop):
+			binder: String = match loop.binder:
+				LoopVariable(target):
+					target_text(spellings, target)
+				LoopTuple(targets, span):
+					"(tuple " + span_text(span) + " " + targets
+						.small_tuple_items()
+						.map(pure func(target): target_text(spellings, target))
+						.join(" ") + ")"
+
+			out
+				.append("(for" + head + " " + binder + " ")
+				.dumped_expression(spellings, depth, loop.iterable)
+				.append(" ")
+				.dumped_block(spellings, depth, loop.body)
+				.append(")")
+		ConcurrentForLoop(loop):
+			out
+				.append("(concurrent-for" + head + " " + binder_text(spellings, loop.binder) + " ")
+				.dumped_expression(spellings, depth, loop.iterable)
+				.append(" " + count_text(loop.limit) + " ")
+				.dumped_timeout(spellings, depth, loop.timeout)
+				.append(" ")
+				.dumped_block(spellings, depth, loop.body)
+				.append(")")
+		LocalFunctionStatement(function):
+			out
+				.append("(local-function-statement" + head + " ")
+				.dumped_local_function(spellings, depth, function)
+				.append(")")
+
+
+private pure func dumped_local_function(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	function: LocalFunction,
+) -> List[String]:
+	out
+		.append("(local-function def" + function.id
+				.definition_local_index()
+				.to_string() + " " + span_text(function.span))
+		.dumped_function(spellings, depth, function.function)
+		.append(")")
+
+
+private pure func count_text(count: CountParameter) -> String:
+	"(count " + span_text(count.span) + " " + span_text(count.name_span) + " " + count.count
+		.positive_count_value()
+		.to_string() + ")"
+
+
+private pure func dumped_timeout(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	timeout: Option[TimeoutParameter],
+) -> List[String]:
+	match timeout:
+		Some(parameter):
+			out
+				.append(
+					"(timeout " + span_text(
+						parameter.span,
+					) + " " + span_text(parameter.name_span) + " ",
+				)
+				.dumped_expression(spellings, depth, parameter.value)
+				.append(")")
+		None:
+			out.append("-")
+
+
+-- Expressions.
+private pure func dumped_expressions(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expressions: List[Expression],
+) -> List[String]:
+	var dumped: List[String] = out
+
+	for expression in expressions:
+		dumped = dumped
+			.append(" ")
+			.dumped_expression(spellings, depth, expression)
+
+	dumped
+
+
+private pure func expression_head(form: String, expression: Expression) -> String:
+	"(" + form + " expr" + expression.id
+		.expression_local_index()
+		.to_string() + " " + span_text(expression.span)
+
+
+---
+An expression. Its left spine (the left operand of a binary or
+short-circuit operator, a callee, a receiver, a subscripted collection) is
+walked by a loop: every spine node's head is written root first, then the
+node the spine ends at, then every spine node's remaining parts innermost
+first.
+---
+private pure func dumped_expression(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	expression: Expression,
+) -> List[String]:
+	var dumped: List[String] = out
+	var spine: List[Expression] = []
+	var current: Expression = expression
+	var on_spine: Bool = True
+
+	while on_spine:
+		match current.kind:
+			Binary(operator, left, _):
+				dumped = dumped.append(
+					expression_head(
+						"binary",
+						current,
+					) + " " + binary_operator_text(operator) + " ",
+				)
+				spine = spine.append(current)
+				current = left
+			ShortCircuit(operator, left, _):
+				name: String = match operator:
+					LogicalAnd:
+						"and"
+					LogicalOr:
+						"or"
+
+				dumped = dumped.append(expression_head("short-circuit", current) + " " + name + " ")
+				spine = spine.append(current)
+				current = left
+			Call(callee, _):
+				dumped = dumped.append(expression_head("call", current) + " ")
+				spine = spine.append(current)
+				current = callee
+			FieldAccess(receiver, _):
+				dumped = dumped.append(expression_head("field", current) + " ")
+				spine = spine.append(current)
+				current = receiver
+			Subscript(collection, _):
+				dumped = dumped.append(expression_head("subscript", current) + " ")
+				spine = spine.append(current)
+				current = collection
+			NameReference(use):
+				dumped = dumped.append(
+					expression_head("name", current) + " " + use_text(spellings, use) + ")",
+				)
+				on_spine = False
+			IntegerLiteral(magnitude):
+				dumped = dumped.append(
+					expression_head("integer", current) + " " + magnitude.to_string() + ")",
+				)
+				on_spine = False
+			FloatLiteral(value):
+				dumped = dumped.append(
+					expression_head("float", current) + " " + value.written_digits() + ")",
+				)
+				on_spine = False
+			StringLiteral(form, text):
+				dumped = dumped.append(
+					expression_head(
+						"string",
+						current,
+					) + " " + string_form_text(form) + " " + quoted(text) + ")",
+				)
+				on_spine = False
+			InterpolatedString(form, pieces):
+				form_text: String = match form:
+					QuotedInterpolation:
+						"quoted"
+					PipeInterpolation:
+						"pipe"
+
+				dumped = dumped.append(expression_head("interpolated", current) + " " + form_text)
+
+				for piece in pieces:
+					match piece:
+						InterpolationText(text):
+							dumped = dumped.append(" (text " + quoted(text) + ")")
+						InterpolationHole(hole):
+							dumped = dumped
+								.append(" (hole expr" + hole.id
+										.expression_local_index()
+										.to_string() + " " + span_text(hole.span) + " ")
+								.dumped_expression(spellings, depth, hole.value)
+								.append(")")
+
+				dumped = dumped.append(")")
+				on_spine = False
+			BooleanLiteral(value):
+				dumped = dumped.append(
+					expression_head("boolean", current) + " " + value.to_string() + ")",
+				)
+				on_spine = False
+			CharacterLiteral(character):
+				dumped = dumped.append(
+					expression_head(
+						"character",
+						current,
+					) + " " + to_int(character).to_string() + ")",
+				)
+				on_spine = False
+			VoidValue:
+				dumped = dumped.append(expression_head("void", current) + ")")
+				on_spine = False
+			CompilerBuiltin(name):
+				name_text: String = match name:
+					Some(written):
+						quoted(written)
+					None:
+						"-"
+
+				dumped = dumped.append(expression_head("builtin", current) + " " + name_text + ")")
+				on_spine = False
+			Unary(operator, operand):
+				name: String = match operator:
+					Negate:
+						"negate"
+					LogicalNot:
+						"not"
+
+				dumped = dumped
+					.append(expression_head("unary", current) + " " + name + " ")
+					.dumped_expression(spellings, depth, operand)
+					.append(")")
+				on_spine = False
+			RangeExpression(start, end):
+				dumped = dumped
+					.append(expression_head("range", current) + " ")
+					.dumped_expression(spellings, depth, start)
+					.append(" ")
+					.dumped_expression(spellings, depth, end)
+					.append(")")
+				on_spine = False
+			ListLiteral(elements):
+				dumped = dumped
+					.append(expression_head("list", current))
+					.dumped_expressions(spellings, depth, elements)
+					.append(")")
+				on_spine = False
+			TupleLiteral(elements):
+				dumped = dumped
+					.append(expression_head("tuple", current))
+					.dumped_expressions(spellings, depth, elements.small_tuple_items())
+					.append(")")
+				on_spine = False
+			VectorLiteral(elements):
+				dumped = dumped
+					.append(expression_head("vector", current))
+					.dumped_expressions(spellings, depth, elements)
+					.append(")")
+				on_spine = False
+			RecordLiteral(fields):
+				dumped = dumped
+					.append(expression_head("record", current))
+					.dumped_named_values(spellings, depth, fields)
+					.append(")")
+				on_spine = False
+			RecordUpdate(base, fields):
+				dumped = dumped
+					.append(expression_head("record-update", current) + " ")
+					.dumped_expression(spellings, depth, base)
+					.dumped_named_values(spellings, depth, fields)
+					.append(")")
+				on_spine = False
+			DictLiteral(entries):
+				dumped = dumped.append(expression_head("dict", current))
+
+				for entry in entries:
+					dumped = dumped
+						.append(" (entry " + span_text(entry.span) + " ")
+						.dumped_expression(spellings, depth, entry.key)
+						.append(" ")
+						.dumped_expression(spellings, depth, entry.value)
+						.append(")")
+
+				dumped = dumped.append(")")
+				on_spine = False
+			OpaqueConversion(direction, opaque_type, value):
+				name: String = match direction:
+					IntoOpaque:
+						"into"
+					FromOpaque:
+						"from"
+
+				dumped = dumped
+					.append(expression_head("opaque", current) + " " + name + " ")
+					.dumped_type(spellings, depth, opaque_type)
+					.append(" ")
+					.dumped_expression(spellings, depth, value)
+					.append(")")
+				on_spine = False
+			If(conditional):
+				dumped = dumped
+					.append(expression_head("if", current) + " ")
+					.dumped_if(spellings, depth, conditional)
+					.append(")")
+				on_spine = False
+			Match(subject, cases):
+				dumped = dumped
+					.append(expression_head("match", current) + " ")
+					.dumped_expression(spellings, depth, subject)
+
+				for match_case in cases:
+					dumped = dumped
+						.on_line(depth + 1)
+						.append("(case " + span_text(match_case.span) + " ")
+						.dumped_pattern(spellings, depth + 1, match_case.pattern)
+						.append(" ")
+
+					match match_case.body:
+						CaseBlock(block):
+							dumped = dumped.dumped_block(spellings, depth + 1, block)
+						CaseStatement(statement):
+							dumped = dumped.dumped_statement(spellings, depth + 1, statement)
+
+					dumped = dumped.append(")")
+
+				dumped = dumped.append(")")
+				on_spine = False
+			Select(arms):
+				dumped = dumped.append(expression_head("select", current))
+
+				for arm in arms:
+					dumped = dumped.on_line(depth + 1)
+
+					match arm.kind:
+						ReceiveArm(target, channel):
+							dumped = dumped
+								.append(
+									"(receive-arm " + span_text(
+										arm.span,
+									) + " " + target_text(spellings, target) + " ",
+								)
+								.dumped_expression(spellings, depth + 1, channel)
+						SealedArm(channel):
+							dumped = dumped
+								.append("(sealed-arm " + span_text(arm.span) + " ")
+								.dumped_expression(spellings, depth + 1, channel)
+						AfterArm(timeout):
+							dumped = dumped
+								.append("(after-arm " + span_text(arm.span) + " ")
+								.dumped_expression(spellings, depth + 1, timeout)
+
+					dumped = dumped
+						.append(" ")
+						.dumped_block(spellings, depth + 1, arm.body)
+						.append(")")
+
+				dumped = dumped.append(")")
+				on_spine = False
+			With(with_expression):
+				dumped = dumped.append(expression_head("with", current) + " ")
+
+				match with_expression.acquisition:
+					WithValue(binding):
+						dumped = dumped
+							.append(
+								"(with-value " + span_text(
+									binding.span,
+								) + " " + target_text(spellings, binding.target) + " ",
+							)
+							.dumped_optional_type(spellings, depth, binding.declared_type)
+							.append(" ")
+							.dumped_expression(spellings, depth, binding.value)
+							.append(")")
+					WithTry(binding):
+						dumped = dumped
+							.append(
+								"(with-try " + span_text(
+									binding.span,
+								) + " " + target_text(spellings, binding.target) + " ",
+							)
+							.dumped_optional_type(spellings, depth, binding.declared_type)
+							.append(" ")
+							.dumped_expression(spellings, depth, binding.value)
+
+						match binding.on_error:
+							Some(error_map):
+								dumped = dumped
+									.append(
+										" (on-error " + span_text(
+											error_map.span,
+										) + " " + target_text(spellings, error_map.target) + " ",
+									)
+									.dumped_expression(spellings, depth, error_map.value)
+									.append(")")
+							None:
+								dumped = dumped.append(" -")
+
+						dumped = dumped.append(")")
+
+				dumped = dumped
+					.append(" ")
+					.dumped_block(spellings, depth, with_expression.body)
+					.append(")")
+				on_spine = False
+			DebugBlock(block):
+				dumped = dumped
+					.append(expression_head("debug", current) + " ")
+					.dumped_block(spellings, depth, block)
+					.append(")")
+				on_spine = False
+			Lambda(lambda):
+				dumped = dumped.append(
+					expression_head(
+						"lambda",
+						current,
+					) + " " + purity_text(lambda.purity) + " (parameters",
+				)
+
+				for parameter in lambda.parameters:
+					dumped = dumped
+						.append(
+							" (parameter " + span_text(
+								parameter.span,
+							) + " " + target_text(spellings, parameter.target) + " ",
+						)
+						.dumped_optional_type(spellings, depth, parameter.declared_type)
+						.append(")")
+
+				dumped = dumped
+					.append(") ")
+					.dumped_optional_type(spellings, depth, lambda.return_type)
+					.append(" ")
+					.dumped_body(spellings, depth, lambda.body)
+					.append(")")
+				on_spine = False
+			ConcurrentBlock(concurrent_block):
+				max_threads: String = match concurrent_block.max_threads:
+					Some(count):
+						count_text(count)
+					None:
+						"-"
+
+				dumped = dumped
+					.append(expression_head("concurrent", current) + " " + max_threads + " ")
+					.dumped_timeout(spellings, depth, concurrent_block.timeout)
+					.append(" ")
+					.dumped_block(spellings, depth, concurrent_block.body)
+					.append(")")
+				on_spine = False
+			Detach(value):
+				dumped = dumped
+					.append(expression_head("detach", current) + " ")
+					.dumped_expression(spellings, depth, value)
+					.append(")")
+				on_spine = False
+			Break:
+				dumped = dumped.append(expression_head("break", current) + ")")
+				on_spine = False
+			Continue:
+				dumped = dumped.append(expression_head("continue", current) + ")")
+				on_spine = False
+
+	for node in spine.reverse():
+		match node.kind:
+			Binary(_, _, right):
+				dumped = dumped
+					.append(" ")
+					.dumped_expression(spellings, depth, right)
+					.append(")")
+			ShortCircuit(_, _, right):
+				dumped = dumped
+					.append(" ")
+					.dumped_expression(spellings, depth, right)
+					.append(")")
+			Call(_, arguments):
+				dumped = dumped
+					.append(" (arguments")
+					.dumped_expressions(spellings, depth, arguments)
+					.append("))")
+			FieldAccess(_, member):
+				dumped = dumped.append(" " + use_text(spellings, member) + ")")
+			Subscript(_, indices):
+				dumped = dumped
+					.dumped_expressions(spellings, depth, indices.at_least_one_items())
+					.append(")")
+			_:
+				dumped = dumped
+
+	dumped
+
+
+private pure func dumped_named_value(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	named: NamedValue,
+) -> List[String]:
+	out
+		.append("(named " + span_text(named.span) + " " + use_text(spellings, named.name) + " ")
+		.dumped_expression(spellings, depth, named.value)
+		.append(")")
+
+
+private pure func dumped_named_values(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	values: List[NamedValue],
+) -> List[String]:
+	var dumped: List[String] = out
+
+	for named in values:
+		dumped = dumped
+			.append(" ")
+			.dumped_named_value(spellings, depth, named)
+
+	dumped
+
+
+---
+An `if`'s condition and blocks, then its `else` chain. Each `else if` is
+walked by the loop, not by recursion, and its blocks indent as the source's
+do: at the depth of the first `if`.
+---
+private pure func dumped_if(
+	out: List[String],
+	spellings: Spellings,
+	depth: Int,
+	conditional: IfExpression,
+) -> List[String]:
+	var dumped: List[String] = out
+		.dumped_expression(spellings, depth, conditional.condition)
+		.append(" ")
+		.dumped_block(spellings, depth, conditional.then_block)
+	var branch: Option[ElseBranch] = conditional.else_branch
+	var open_branches: Int = 0
+
+	while branch.is_some():
+		match branch:
+			Some(written):
+				dumped = dumped.append(" (else " + span_text(written.keyword) + " ")
+				open_branches += 1
+
+				match written.body:
+					ElseBlock(block):
+						dumped = dumped.dumped_block(spellings, depth, block)
+						branch = None
+					ElseIf(else_if):
+						dumped = dumped
+							.append("(else-if expr" + else_if.id
+									.expression_local_index()
+									.to_string() + " " + span_text(else_if.span) + " ")
+							.dumped_expression(spellings, depth, else_if.conditional.condition)
+							.append(" ")
+							.dumped_block(spellings, depth, else_if.conditional.then_block)
+						open_branches += 1
+						branch = else_if.conditional.else_branch
+			None:
+				branch = None
+
+	dumped.append(")".repeat(open_branches))

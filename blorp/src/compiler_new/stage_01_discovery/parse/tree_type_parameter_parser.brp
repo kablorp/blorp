@@ -1,0 +1,121 @@
+-- Direct declaration type parameters. Rejected names never mint binders;
+-- recovery still consumes bounds and the list delimiters in written order.
+import:
+	../syntax/declarations:
+		TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter), TraitReference
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../tables/diagnostic_code: PlainSyntaxCode(DimensionParameterBoundsDiagnostic, ExpectedDimensionDiagnostic)
+	../tables/expected_token:
+		NameConstruct(NameInTypeParameterName, NameInTraitName),
+		ExpectedTokenDiagnostic(ExpectedRightBracket), RightBracketConstruct(RightBracketInTypeParameters)
+	../tables/span: Span, span_covering
+	../tables/token:
+		TokenKind(LeftBracketSymbol, RightBracketSymbol, CommaSymbol, ColonSymbol, PlusSymbol, DimensionNameToken, HashSymbol, UnderscoreSymbol, EndOfFileToken)
+	parse_state:
+		ParseState, NameRole(TypeName), current_kind, current_span, previous_span, advanced,
+		peek_kind, diagnostic_count, consume_name, consume_declared_name, finished_type_binder,
+		report_diagnostic, report_at_current, expect_token
+	tree_trait_reference_parser: parse_trait_reference
+
+
+union TypeParametersParse:
+	NoTypeParameters
+	ParsedTypeParameters(List[TypeParameter], Span)
+	RejectedTypeParameters
+
+
+pure func parse_type_parameters(state: ParseState) -> (ParseState, TypeParametersParse):
+	if state.current_kind() != LeftBracketSymbol:
+		(state, NoTypeParameters)
+	else:
+		start: Span = state.current_span()
+		var out: ParseState = state.advanced()
+		var parameters: List[TypeParameter] = []
+		var parsing: Bool = out.current_kind() != RightBracketSymbol
+
+		while parsing and out.current_kind() != EndOfFileToken:
+			(after_parameter, parameter) = parse_type_parameter(out)
+			out = after_parameter
+
+			match parameter:
+				Some(written):
+					parameters = parameters.append(written)
+				None:
+					void
+
+			if out.current_kind() == CommaSymbol:
+				out = out.advanced()
+				parsing = out.current_kind() != RightBracketSymbol
+			else:
+				parsing = False
+
+		end: Span = out.current_span()
+		out = out.expect_token(RightBracketSymbol, ExpectedRightBracket(RightBracketInTypeParameters))
+
+		if out.diagnostic_count() != state.diagnostic_count():
+			(out, RejectedTypeParameters)
+		else:
+			(out, ParsedTypeParameters(parameters, start.span_covering(end)))
+
+
+private pure func parse_type_parameter(state: ParseState) -> (ParseState, Option[TypeParameter]):
+	start: Span = state.current_span()
+	var out: ParseState = state
+	var parameter: Option[TypeParameter] = None
+
+	match state.current_kind():
+		DimensionNameToken:
+			(after_name, name) = state.consume_name(TypeName, NameInTypeParameterName)
+			(after_binder, binder) = after_name.finished_type_binder(name)
+			out = after_binder
+			parameter = Some(DimensionVariable(binder))
+		HashSymbol:
+			out = state.advanced()
+
+			if state.peek_kind(1) == UnderscoreSymbol:
+				parameter = Some(WildcardDimensionParameter(start.span_covering(out.current_span())))
+				out = out.advanced()
+			else:
+				out = out.report_at_current(ExpectedDimensionDiagnostic)
+		_:
+			(after_name, name) = state.consume_declared_name(NameInTypeParameterName)
+			out = after_name
+
+			match name:
+				Some(written):
+					(after_binder, binder) = out.finished_type_binder(written)
+					out = after_binder
+					parameter = Some(TypeVariable({ binder = binder, bounds = [], span = written.span }))
+				None:
+					void
+
+	var bounds: List[TraitReference] = []
+	var end: Span = start
+
+	if out.current_kind() == ColonSymbol:
+		-- Dimensions cannot have traits, but read their bounds for recovery.
+		match state.current_kind():
+			DimensionNameToken | HashSymbol:
+				out = out.report_diagnostic(out.current_span(), Plain(DimensionParameterBoundsDiagnostic))
+			_:
+				void
+
+		out = out.advanced()
+		var parsing: Bool = True
+
+		while parsing and out.current_kind() != EndOfFileToken:
+			(after_bound, bound) = parse_trait_reference(out, NameInTraitName)
+			out = after_bound
+			bounds = bounds.append(bound)
+			end = out.previous_span()
+
+			if out.current_kind() == PlusSymbol:
+				out = out.advanced()
+			else:
+				parsing = False
+
+	match parameter:
+		Some(TypeVariable(variable)):
+			(out, Some(TypeVariable({ variable | bounds = bounds, span = start.span_covering(end) })))
+		_:
+			(out, parameter)

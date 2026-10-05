@@ -1,0 +1,313 @@
+-- Top-level function header and deferred body evidence; no body syntax minted.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, finished_builtin_type
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser:
+		FunctionHeaderParse(ParsedFunctionHeader, RejectedFunctionHeader), FunctionBodyExtent(ForwardDeclaration, SkippedBody),
+		parse_function_header, deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/names: WrittenName
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(ExpectedToken, Plain)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedTypeDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedColon, ExpectedName, ExpectedRightBracket, ExpectedLeftParen, ExpectedRightParen), ColonConstruct(ColonInFunctionBody), NameConstruct(NameInFunctionName), RightBracketConstruct(RightBracketInTypeParameters), LeftParenConstruct(LeftParenInFunctionName), RightParenConstruct(RightParenInFunctionParameters)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(PureFunction), FunctionAnnotation(TailRecursiveAnnotation)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, ElseKeyword, ColonSymbol, NewlineToken, IdentifierToken, EndOfFileToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+private pure func no_body_ids(parsed: ParseState) -> Bool:
+	counts = parsed.issued_counts()
+	counts.blocks == 0 and counts.expressions == 0 and counts.statements == 0 and counts.patterns == 0
+
+
+private pure func no_definition_ids(parsed: ParseState, name: WrittenName) -> Bool:
+	-- ParseState exposes no definition count. The first definition minted after
+	-- header parsing must still be index0; this builtin is a counter witness.
+	(_, witness) = parsed.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+	witness.id.definition_local_index() == 0
+
+
+pure func test_rich_forward_header_composes_metadata_parameters_return_and_constraints() -> Bool:
+	text: String = "func apply[T: m.Eq + Hashable, #N, #_](x: T) -> T[#N] where #N == #3:"
+	match new_parse_state(lex_module(module_id_at_row(3), text)):
+		Ok(state):
+			documentation: Documentation = { text = "Apply a value.", span = state.current_span() }
+			annotations = [{ annotation = TailRecursiveAnnotation, span = state.current_span() }]
+			(parsed, result) = parse_function_header(state, PrivateVisibility, Some(documentation), annotations, PureFunction, state.current_span())
+
+			match result:
+				ParsedFunctionHeader(preview):
+					header = preview.header
+					match (preview.body_extent, header.type_parameters, header.documentation, header.annotations):
+						(ForwardDeclaration, [TypeVariable(variable), DimensionVariable(_), WildcardDimensionParameter(_)], Some(doc), [annotation]):
+							(header.visibility == PrivateVisibility and doc.text == documentation.text and doc.span.spans_equal(documentation.span)
+								and annotation.annotation == TailRecursiveAnnotation and annotation.span.spans_equal(state.current_span())
+								and header.signature.purity == PureFunction and header.signature.keyword.covers(0, 4) and header.signature.name.span.covers(5, 10)
+								and variable.bounds.length() == 2 and header.signature.parameters.length() == 1 and header.signature.return_type.is_some() and header.constraints.length() == 1
+								and header.header_span.covers(0, 69) and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(69, 69)
+								and parsed.issued_counts().type_binders == 2 and parsed.issued_counts().binders == 1 and parsed.issued_counts().name_uses == 7
+								and parsed.issued_counts().written_types == 3 and parsed.issued_counts().dimensions == 3
+								and parsed.diagnostic_count() == 0 and no_body_ids(parsed) and no_definition_ids(parsed, header.signature.name))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_forward_colon_at_eof_and_newline_preserves_following_cursor() -> Bool:
+	var correct: Bool = True
+
+	for text in ["func f():", "func f():\nfunc g():"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(state):
+				(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+				match result:
+					ParsedFunctionHeader(preview):
+						match preview.body_extent:
+							ForwardDeclaration:
+								cursor_correct: Bool = if text == "func f():":
+									parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(9, 9)
+								else:
+									parsed.current_kind() == NewlineToken and parsed.current_span().covers(10, 10)
+								correct = (cursor_correct and preview.header.header_span.covers(0, 9) and preview.header.signature.return_type.is_none()
+									and preview.header.type_parameters.is_empty() and preview.header.constraints.is_empty() and parsed.diagnostic_count() == 0
+									and no_body_ids(parsed) and no_definition_ids(parsed, preview.header.signature.name) and correct)
+							_:
+								correct = False
+					_:
+						correct = False
+			Err(_):
+				correct = False
+
+	correct
+
+
+-- The delimiter is authored evidence. Header bounds alone cannot recover its
+-- location when whitespace follows the signature or the return type is omitted.
+pure func test_function_header_preserves_authored_body_colon_span() -> Bool:
+	var correct: Bool = True
+	for (text, colon_start, has_return) in [("func next() -> Int :", 19, True),
+		("func next():", 11, False), ("func next()   :", 14, False), ("func next()   : ()", 14, False)]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(state):
+				(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+				match result:
+					ParsedFunctionHeader(preview):
+						correct = (preview.header.body_colon.covers(colon_start, colon_start + 1)
+							and preview.header.signature.return_type.is_some() == has_return
+							and parsed.diagnostic_count() == 0 and no_body_ids(parsed)) and correct
+					_:
+						correct = False
+			Err(_):
+				correct = False
+	correct
+
+
+private pure func skipped_body(text: String, body_start: Int, body_end: Int, next_start: Int, token_end: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			match result:
+				ParsedFunctionHeader(preview):
+					match preview.body_extent:
+						SkippedBody(body):
+							(preview.header.header_span.covers(0, 9) and body.deferred_body_span().covers(body_start, body_end)
+								and body.deferred_body_token_start() == 5 and body.deferred_body_token_end() == token_end and parsed.position() == token_end
+								and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(next_start, next_start + 4)
+								and parsed.diagnostic_count() == 0 and no_body_ids(parsed) and no_definition_ids(parsed, preview.header.signature.name))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_inline_body_skips_owned_newline_and_preserves_next_declaration() -> Bool:
+	skipped_body("func f(): 1 + 2\nfunc g():", 10, 15, 16, 9)
+
+
+-- `else` at the function anchor continues the inline block expression;
+-- the skipped extent must retain both branches before the next declaration.
+pure func test_inline_block_continuation_at_function_anchor_remains_one_body() -> Bool:
+	skipped_body("func f(): if True:\n\t1\nelse:\n\t2\nfunc g():", 10, 30, 31, 18)
+
+
+pure func test_indented_nested_body_preserves_authored_span_and_layout_interval() -> Bool:
+	skipped_body("func f():\n\tif True:\n\t\t1\n\telse:\n\t\t2\nfunc g():", 11, 34, 35, 21)
+
+
+pure func test_stray_else_after_nonconditional_body_remains_outside_deferred_extent() -> Bool:
+	text: String = "func f(): 1\nelse: 2\nfunc g():"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			match result:
+				ParsedFunctionHeader(preview):
+					match preview.body_extent:
+						SkippedBody(body):
+							(body.deferred_body_span().covers(10, 11) and body.deferred_body_token_start() == 5
+								and body.deferred_body_token_end() == 7 and parsed.position() == 7
+								and parsed.current_kind() == ElseKeyword and parsed.current_span().covers(12, 16)
+								and parsed.diagnostic_count() == 0 and no_body_ids(parsed) and no_definition_ids(parsed, preview.header.signature.name))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_multiple_else_if_continuations_stay_in_one_deferred_body() -> Bool:
+	skipped_body("func f(): if True:\n\t1\nelse if False:\n\t2\nelse:\n\t3\nfunc g():", 10, 48, 49, 26)
+
+
+pure func test_leading_dot_postfix_continuation_stays_in_inline_body() -> Bool:
+	skipped_body("func f(): value\n.method()\nfunc g():", 10, 25, 26, 12)
+
+
+-- Parenthesized inline bodies may put their close at the function anchor;
+-- that close still belongs to the body despite its column.
+pure func test_multiline_parenthesized_body_owns_anchor_close_and_following_layout() -> Bool:
+	skipped_body("func f(): foo(\n\t1,\n\t2,\n)\nfunc g():", 10, 24, 25, 13)
+
+
+pure func test_conditional_inside_parentheses_owns_else_but_leaves_later_stray_else() -> Bool:
+	text: String = "func f(): foo(if True:\n\t1\nelse:\n\t2\n)\nelse: 3\nfunc g():"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			match result:
+				ParsedFunctionHeader(preview):
+					match preview.body_extent:
+						SkippedBody(body):
+							(body.deferred_body_span().covers(10, 36) and body.deferred_body_token_start() == 5
+								and body.deferred_body_token_end() == 22 and parsed.position() == 22
+								and parsed.current_kind() == ElseKeyword and parsed.current_span().covers(37, 41)
+								and parsed.diagnostic_count() == 0 and no_body_ids(parsed) and no_definition_ids(parsed, preview.header.signature.name))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_colon_before_indented_body_reports_header_and_skips_body() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "func f()\n\t1\nfunc g():")):
+		Ok(state):
+			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			match (result, parsed.diagnostics()):
+				(RejectedFunctionHeader, [at]):
+					match at.diagnostic:
+						ExpectedToken(ExpectedColon(ColonInFunctionBody)):
+							(at.span.covers(8, 8) and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(12, 16)
+								and parsed.issued_counts().binders == 0 and parsed.issued_counts().written_types == 0 and no_body_ids(parsed))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private union ExpectedDiagnostic:
+	TokenDiagnostic(ExpectedTokenDiagnostic)
+	PlainDiagnostic(PlainSyntaxCode)
+
+
+private pure func diagnostic_matches(actual: SyntaxDiagnostic, expected: ExpectedDiagnostic) -> Bool:
+	match (actual, expected):
+		(ExpectedToken(ExpectedColon(actual)), TokenDiagnostic(ExpectedColon(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedName(actual)), TokenDiagnostic(ExpectedName(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedRightBracket(actual)), TokenDiagnostic(ExpectedRightBracket(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedLeftParen(actual)), TokenDiagnostic(ExpectedLeftParen(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedRightParen(actual)), TokenDiagnostic(ExpectedRightParen(wanted))):
+			actual == wanted
+		(Plain(actual), PlainDiagnostic(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func rejected_header(text: String, expected: List[(ExpectedDiagnostic, Int)], cursor: TokenKind, first: Int, last: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_function_header(state, PublicVisibility, None, [], PureFunction, state.current_span())
+			var correct: Bool = match result:
+				RejectedFunctionHeader:
+					True
+				_:
+					False
+			correct = correct and parsed.diagnostic_count() == expected.length()
+			var index: Int = 0
+			for (diagnostic, offset) in expected:
+				match parsed.diagnostics().get(index):
+					Some(at):
+						correct = correct and diagnostic_matches(at.diagnostic, diagnostic) and at.span.covers(offset, offset)
+					None:
+						correct = False
+				index += 1
+			correct and parsed.current_kind() == cursor and parsed.current_span().covers(first, last) and no_body_ids(parsed)
+		Err(_):
+			False
+
+
+pure func test_bracket_in_function_name_preserves_declared_name_recovery() -> Bool:
+	rejected_header("func [T]():", [
+		(TokenDiagnostic(ExpectedName(NameInFunctionName)), 5),
+		(TokenDiagnostic(ExpectedLeftParen(LeftParenInFunctionName)), 6),
+		(TokenDiagnostic(ExpectedColon(ColonInFunctionBody)), 6)
+	], IdentifierToken, 6, 7)
+
+
+pure func test_malformed_headers_reject_at_bounded_grammar_boundary() -> Bool:
+	(rejected_header("func :", [
+		(TokenDiagnostic(ExpectedName(NameInFunctionName)), 5),
+		(TokenDiagnostic(ExpectedLeftParen(LeftParenInFunctionName)), 5)
+	], EndOfFileToken, 6, 6)
+		and rejected_header("func f[T U]():\n\t1", [
+			(TokenDiagnostic(ExpectedRightBracket(RightBracketInTypeParameters)), 9),
+			(TokenDiagnostic(ExpectedLeftParen(LeftParenInFunctionName)), 9),
+			(TokenDiagnostic(ExpectedColon(ColonInFunctionBody)), 9)
+		], IdentifierToken, 9, 10)
+		and rejected_header("func f(x: ): 1", [(PlainDiagnostic(ExpectedTypeDiagnostic), 10)], EndOfFileToken, 14, 14)
+		and rejected_header("func f() -> : 1", [(PlainDiagnostic(ExpectedTypeDiagnostic), 12)], EndOfFileToken, 15, 15)
+		and rejected_header("func f()", [(TokenDiagnostic(ExpectedColon(ColonInFunctionBody)), 8)], EndOfFileToken, 8, 8))
+
+
+tests: TestSuite = {
+	description = "Direct tree function header and deferred body evidence",
+	tests = [
+		("leading dot postfix continuation stays in inline body", test_leading_dot_postfix_continuation_stays_in_inline_body),
+		("multiline parenthesized body owns anchor close and following layout", test_multiline_parenthesized_body_owns_anchor_close_and_following_layout),
+		("conditional inside parentheses owns else but leaves later stray else", test_conditional_inside_parentheses_owns_else_but_leaves_later_stray_else),
+
+		("stray else after nonconditional body remains outside deferred extent", test_stray_else_after_nonconditional_body_remains_outside_deferred_extent),
+		("multiple else if continuations stay in one deferred body", test_multiple_else_if_continuations_stay_in_one_deferred_body),
+		("bracket in function name preserves declared name recovery", test_bracket_in_function_name_preserves_declared_name_recovery),
+
+		("inline block continuation at function anchor remains one body", test_inline_block_continuation_at_function_anchor_remains_one_body),
+		("rich forward header composes metadata parameters return constraints", test_rich_forward_header_composes_metadata_parameters_return_and_constraints),
+		("function header preserves authored body colon span", test_function_header_preserves_authored_body_colon_span),
+		("forward colon at eof and newline preserves following cursor", test_forward_colon_at_eof_and_newline_preserves_following_cursor),
+		("inline body skips owned newline preserves next declaration", test_inline_body_skips_owned_newline_and_preserves_next_declaration),
+		("indented nested body preserves authored span and layout interval", test_indented_nested_body_preserves_authored_span_and_layout_interval),
+		("missing colon before indented body reports header and skips body", test_missing_colon_before_indented_body_reports_header_and_skips_body),
+		("malformed headers reject at bounded grammar boundary", test_malformed_headers_reject_at_bounded_grammar_boundary)
+	]
+}

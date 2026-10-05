@@ -1,0 +1,146 @@
+-- Implementation-method headers require lexical body evidence. M4 owns body
+-- trees and expression diagnostics; this preview mints no method or body IDs.
+import:
+	../syntax/declarations: Annotation, Signature, TypeParameter, DimensionConstraint
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../tables/diagnostic_code: PlainSyntaxCode(ExpectedImplMethodDiagnostic, MissingFunctionBodyDiagnostic)
+	../tables/expected_token: ExpectedTokenDiagnostic(ExpectedColon), ColonConstruct(ColonInFunctionBody), NameConstruct(NameInFunctionName), LeftParenConstruct(LeftParenInFunctionName)
+	../tables/row_kinds: Purity(PureFunction, ImpureFunction)
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(PureKeyword, FuncKeyword, ArrowSymbol, ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
+	parse_state:
+		ParseState, diagnostic_count, current_kind, current_span, advanced, peek_kind, span_start_line,
+		consume_declared_name, report_at_current, report_diagnostic, expect_token, report_expected_after_previous_content
+	tree_declaration_prefix_parser: parse_annotations_skipping_newlines
+	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
+	tree_signature_parser: SignatureParse(ParsedSignature, RejectedSignature), parse_signature
+	tree_parameter_parser: parse_parenthesized_parameters
+	tree_type_parser: parse_type
+	tree_dimension_constraint_parser: DimensionConstraintsParse(NoDimensionConstraints, ParsedDimensionConstraints, RejectedDimensionConstraints), parse_dimension_constraints
+	tree_function_header_parser: DeferredBody, FunctionBodyExtent(ForwardDeclaration, SkippedBody), skip_deferred_body
+
+
+record ImplementationMethodHeader {
+	annotations: List[Annotation],
+	signature: Signature,
+	type_parameters: List[TypeParameter],
+	constraints: List[DimensionConstraint],
+	header_span: Span
+}
+
+
+record ImplementationMethodHeaderPreview {
+	header: ImplementationMethodHeader,
+	body: DeferredBody
+}
+
+
+union ImplementationMethodHeaderParse:
+	ParsedImplementationMethodHeader(ImplementationMethodHeaderPreview)
+	RejectedImplementationMethodHeader
+
+
+pure func parse_implementation_method_header(state: ParseState) -> (ParseState, ImplementationMethodHeaderParse):
+	before: Int = state.diagnostic_count()
+	var start: Span = state.current_span()
+	(after_annotations, annotations) = parse_annotations_skipping_newlines(state)
+	var out: ParseState = after_annotations
+	var purity: Purity = ImpureFunction
+
+	if out.current_kind() == PureKeyword:
+		purity = PureFunction
+		if annotations.is_empty():
+			start = out.current_span()
+		out = out.advanced()
+
+	if out.current_kind() != FuncKeyword:
+		out = out.report_at_current(ExpectedImplMethodDiagnostic)
+		if out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+			out = out.advanced()
+		(out, RejectedImplementationMethodHeader)
+	else:
+		parse_method_header(out, before, start, annotations, purity)
+
+
+private pure func parse_method_header(out_at_keyword: ParseState, before: Int, start: Span, annotations: List[Annotation], purity: Purity) -> (ParseState, ImplementationMethodHeaderParse):
+	var out: ParseState = out_at_keyword
+
+	keyword: Span = out.current_span()
+	name_position: Span = out.advanced().current_span()
+	(after_name, name) = out.advanced().consume_declared_name(NameInFunctionName)
+	(after_parameters, parsed_parameters) = parse_type_parameters(after_name)
+	type_parameters: List[TypeParameter] = match parsed_parameters:
+		ParsedTypeParameters(parameters, _):
+			parameters
+		NoTypeParameters | RejectedTypeParameters:
+			[]
+	(after_signature, signature) = match name:
+		Some(name):
+			(parsed, result) = parse_signature(after_parameters, purity, keyword, name, LeftParenInFunctionName)
+			match result:
+				ParsedSignature(signature, _):
+					(parsed, Some(signature))
+				RejectedSignature:
+					(parsed, None)
+		None:
+			(parsed, _) = parse_parenthesized_parameters(after_parameters, LeftParenInFunctionName)
+			(parsed, None)
+
+	-- Rejected names/parameters still leave return, constraints and body recovery
+	-- to this declaration, matching the frozen implementation-method boundary.
+	before_constraints: ParseState = if signature.is_none() and after_signature.current_kind() == ArrowSymbol:
+		(parsed, _) = parse_type(after_signature.advanced())
+		parsed
+	else:
+		after_signature
+	(after_constraints, parsed_constraints) = parse_dimension_constraints(before_constraints)
+	constraints: List[DimensionConstraint] = match parsed_constraints:
+		ParsedDimensionConstraints(constraints, _):
+			constraints
+		NoDimensionConstraints | RejectedDimensionConstraints:
+			[]
+	out = after_constraints
+	header_end: Span = out.current_span()
+	var body: Option[DeferredBody] = None
+	var scan_body: Bool = False
+
+	if out.current_kind() == ColonSymbol:
+		colon_line: Int = out.span_start_line(out.current_span())
+		out = out.advanced()
+		-- A colon promises a body only under the frozen body-follows predicate.
+		scan_body = if out.current_kind() == EndOfFileToken or out.current_kind() == DedentToken:
+			False
+		else if out.current_kind() == NewlineToken:
+			out.peek_kind(1) == IndentToken
+		else:
+			out.span_start_line(out.current_span()) <= colon_line
+		if not scan_body:
+			out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
+	else if out.current_kind() == NewlineToken and out.peek_kind(1) == IndentToken:
+		out = out.report_expected_after_previous_content(ExpectedColon(ColonInFunctionBody))
+		scan_body = True
+	else if out.current_kind() == NewlineToken or out.current_kind() == DedentToken or out.current_kind() == EndOfFileToken:
+		out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
+	else:
+		out = out.expect_token(ColonSymbol, ExpectedColon(ColonInFunctionBody))
+
+	if scan_body:
+		(after_body, extent) = skip_deferred_body(out, start)
+		out = after_body
+		match extent:
+			SkippedBody(deferred):
+				body = Some(deferred)
+			ForwardDeclaration:
+				out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
+
+	if out.diagnostic_count() != before:
+		(out, RejectedImplementationMethodHeader)
+	else:
+		match (signature, body):
+			(Some(signature), Some(body)):
+				(out, ParsedImplementationMethodHeader({
+					header = { annotations = annotations, signature = signature, type_parameters = type_parameters, constraints = constraints, header_span = start.span_covering(header_end) },
+					body = body
+				}))
+			_:
+				(out, RejectedImplementationMethodHeader)

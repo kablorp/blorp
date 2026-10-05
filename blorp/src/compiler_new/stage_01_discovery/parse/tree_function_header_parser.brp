@@ -1,0 +1,284 @@
+-- Top-level header syntax and deferred body evidence, without function/body IDs.
+import:
+	../syntax/declarations: Annotation, Signature, TypeParameter, DimensionConstraint
+	../syntax/module_syntax: Documentation
+	../tables/expected_token: ExpectedTokenDiagnostic(ExpectedColon), ColonConstruct(ColonInFunctionBody), NameConstruct(NameInFunctionName), LeftParenConstruct(LeftParenInFunctionName)
+	../tables/row_kinds: Visibility, Purity
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(DotSymbol, IfKeyword, ElseKeyword, ColonSymbol, ArrowSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken, LeftParenSymbol, RightParenSymbol, LeftBracketSymbol, RightBracketSymbol, LeftBraceSymbol, RightBraceSymbol)
+	parse_state:
+		ParseState, current_kind, current_span, previous_span, position, peek_kind, advanced, diagnostic_count,
+		consume_declared_name, expect_token, report_expected_after_previous_content, span_start_line, span_start_column
+	tree_type_parameter_parser: TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
+	tree_signature_parser: SignatureParse(ParsedSignature, RejectedSignature), parse_signature
+	tree_parameter_parser: parse_parenthesized_parameters
+	tree_type_parser: parse_type
+	tree_dimension_constraint_parser: DimensionConstraintsParse(NoDimensionConstraints, ParsedDimensionConstraints, RejectedDimensionConstraints), parse_dimension_constraints
+
+
+record FunctionHeader {
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	annotations: List[Annotation],
+	signature: Signature,
+	type_parameters: List[TypeParameter],
+	constraints: List[DimensionConstraint],
+	body_colon: Span,
+	header_span: Span
+}
+
+
+opaque type DeferredBody = DeferredBodyContents
+
+private record DeferredBodyContents {
+	span: Span,
+	token_start: Int,
+	token_end: Int
+}
+
+
+union FunctionBodyExtent:
+	ForwardDeclaration
+	SkippedBody(DeferredBody)
+
+
+record FunctionHeaderPreview {
+	header: FunctionHeader,
+	body_extent: FunctionBodyExtent
+}
+
+
+union FunctionHeaderParse:
+	ParsedFunctionHeader(FunctionHeaderPreview)
+	RejectedFunctionHeader
+
+
+pure func deferred_body_span(body: DeferredBody) -> Span:
+	from_opaque DeferredBody(body).span
+
+
+pure func deferred_body_token_start(body: DeferredBody) -> Int:
+	from_opaque DeferredBody(body).token_start
+
+
+pure func deferred_body_token_end(body: DeferredBody) -> Int:
+	from_opaque DeferredBody(body).token_end
+
+
+-- The caller owns prefixes and places the cursor at `func`.
+pure func parse_function_header(
+	state: ParseState, visibility: Visibility, documentation: Option[Documentation],
+	annotations: List[Annotation], purity: Purity, start: Span,
+) -> (ParseState, FunctionHeaderParse):
+	before: Int = state.diagnostic_count()
+	keyword: Span = state.current_span()
+	(after_name, name) = state.advanced().consume_declared_name(NameInFunctionName)
+	(after_parameters, parsed_parameters) = parse_type_parameters(after_name)
+	parameters: List[TypeParameter] = match parsed_parameters:
+		ParsedTypeParameters(parameters, _):
+			parameters
+		NoTypeParameters | RejectedTypeParameters:
+			[]
+
+	(after_signature, signature) = match name:
+		Some(name):
+			(parsed, result) = parse_signature(after_parameters, purity, keyword, name, LeftParenInFunctionName)
+
+			match result:
+				ParsedSignature(signature, _):
+					(parsed, Some(signature))
+				RejectedSignature:
+					(parsed, None)
+		None:
+			(parsed, _) = parse_parenthesized_parameters(after_parameters, LeftParenInFunctionName)
+			(parsed, None)
+
+	-- Rejected parameter/name shapes still permit an authored return and body
+	-- to be consumed, preserving the frozen declaration recovery boundary.
+	before_constraints: ParseState = if signature.is_none() and after_signature.current_kind() == ArrowSymbol:
+		(parsed, _) = parse_type(after_signature.advanced())
+		parsed
+	else:
+		after_signature
+	(after_constraints, parsed_constraints) = parse_dimension_constraints(before_constraints)
+	constraints: List[DimensionConstraint] = match parsed_constraints:
+		ParsedDimensionConstraints(constraints, _):
+			constraints
+		NoDimensionConstraints | RejectedDimensionConstraints:
+			[]
+
+	colon: Span = after_constraints.current_span()
+	has_colon: Bool = after_constraints.current_kind() == ColonSymbol
+	indented_body: Bool = after_constraints.current_kind() == NewlineToken and after_constraints.peek_kind(1) == IndentToken
+	(after_colon, header_end) = if has_colon:
+		(after_constraints.advanced(), colon)
+	else if indented_body or after_constraints.current_kind() == NewlineToken or after_constraints.current_kind() == DedentToken or after_constraints.current_kind() == EndOfFileToken:
+		(after_constraints.report_expected_after_previous_content(ExpectedColon(ColonInFunctionBody)), after_constraints.previous_span())
+	else:
+		(after_constraints.expect_token(ColonSymbol, ExpectedColon(ColonInFunctionBody)), after_constraints.previous_span())
+
+	(parsed, body_extent) = if has_colon or indented_body:
+		parse_body_extent(after_colon, start, colon)
+	else:
+		(after_colon, ForwardDeclaration)
+
+	if parsed.diagnostic_count() != before:
+		(parsed, RejectedFunctionHeader)
+	else:
+		match signature:
+			None:
+				(parsed, RejectedFunctionHeader)
+			Some(signature):
+				(parsed, ParsedFunctionHeader({
+					header = {
+						visibility = visibility, documentation = documentation, annotations = annotations,
+						signature = signature, type_parameters = parameters, constraints = constraints,
+						body_colon = colon, header_span = start.span_covering(header_end)
+					},
+					body_extent = body_extent
+				}))
+
+
+private pure func parse_body_extent(state: ParseState, anchor: Span, colon: Span) -> (ParseState, FunctionBodyExtent):
+	colon_line: Int = state.span_start_line(colon)
+	anchor_line: Int = state.span_start_line(anchor)
+	anchor_column: Int = state.span_start_column(anchor)
+	indented_body: Bool = state.current_kind() == NewlineToken and state.peek_kind(1) == IndentToken
+
+	if state.current_kind() == EndOfFileToken or state.current_kind() == DedentToken:
+		(state, ForwardDeclaration)
+	else if state.current_kind() == NewlineToken and not indented_body:
+		(state, ForwardDeclaration)
+	else if not indented_body and state.span_start_line(state.current_span()) > colon_line:
+		(state, ForwardDeclaration)
+	else:
+		skip_body(state, anchor_line, anchor_column)
+
+
+-- Only an authored inline conditional can own an anchor-column else.
+private enum BodyContinuation:
+	AtBodyStart
+	NoContinuation
+	AwaitingElse
+	AfterElse
+
+
+private enum PostfixContinuation:
+	NoPostfixContinuation
+	LeadingDot
+
+
+-- Layout nesting owns the interval. Source positions prevent a later sibling
+-- from being swallowed even when a body token has no preceding newline token.
+-- Lexical evidence only. The caller owns whether its grammar permits or
+-- requires a body; ForwardDeclaration means the scan found no authored body.
+pure func skip_deferred_body(state: ParseState, anchor: Span) -> (ParseState, FunctionBodyExtent):
+	skip_body(state, state.span_start_line(anchor), state.span_start_column(anchor))
+
+
+private pure func skip_body(state: ParseState, anchor_line: Int, anchor_column: Int) -> (ParseState, FunctionBodyExtent):
+	token_start: Int = state.position()
+	var out: ParseState = state
+	var depth: Int = 0
+	var continuation: BodyContinuation = AtBodyStart
+	var postfix: PostfixContinuation = NoPostfixContinuation
+	var expected_closes: List[TokenKind] = []
+	var authored: Option[Span] = None
+	var skipping: Bool = True
+
+	while skipping and out.current_kind() != EndOfFileToken:
+		match out.current_kind():
+			IndentToken:
+				depth += 1
+				out = out.advanced()
+			DedentToken:
+				if depth == 0:
+					if expected_closes.is_empty():
+						skipping = False
+					else:
+						out = out.advanced()
+				else:
+					depth -= 1
+					out = out.advanced()
+
+					if depth == 0 and expected_closes.is_empty():
+						while out.current_kind() == NewlineToken:
+							out = out.advanced()
+						skipping = continuation == AwaitingElse and out.current_kind() == ElseKeyword
+			NewlineToken:
+				out = out.advanced()
+				postfix = if out.current_kind() == DotSymbol or (out.current_kind() == IndentToken and out.peek_kind(1) == DotSymbol):
+					LeadingDot
+				else:
+					NoPostfixContinuation
+
+				if depth == 0 and expected_closes.is_empty() and out.current_kind() != IndentToken and postfix != LeadingDot and not (continuation == AwaitingElse and out.current_kind() == ElseKeyword):
+					skipping = False
+			ElseKeyword:
+				if depth == 0 and expected_closes.is_empty() and continuation != AwaitingElse:
+					skipping = False
+				else:
+					if depth == 0 and expected_closes.is_empty():
+						continuation = AfterElse
+					authored = covering_authored(authored, out.current_span())
+					out = out.advanced()
+			_:
+				line: Int = out.span_start_line(out.current_span())
+				column: Int = out.span_start_column(out.current_span())
+
+				if expected_closes.is_empty() and line > anchor_line and column <= anchor_column and not (postfix == LeadingDot and out.current_kind() == DotSymbol):
+					skipping = False
+				else:
+					match continuation:
+						AtBodyStart | AfterElse:
+							continuation = if depth == 0 and expected_closes.is_empty() and out.current_kind() == IfKeyword:
+								AwaitingElse
+							else:
+								NoContinuation
+						NoContinuation | AwaitingElse:
+							()
+
+					-- Only the dot immediately following lexical newline/indent
+					-- evidence bypasses the sibling boundary at the anchor column.
+					postfix = NoPostfixContinuation
+
+					-- A matching delimiter closes its own lexical extent even when
+					-- it returns to the function anchor's column on a later line.
+					expected_closes = update_delimiters(expected_closes, out.current_kind())
+					authored = covering_authored(authored, out.current_span())
+					out = out.advanced()
+
+	match authored:
+		None:
+			(out, ForwardDeclaration)
+		Some(span):
+			(out, SkippedBody(into_opaque DeferredBody({ span = span, token_start = token_start, token_end = out.position() })))
+
+
+private pure func covering_authored(previous: Option[Span], current: Span) -> Option[Span]:
+	match previous:
+		None:
+			Some(current)
+		Some(previous):
+			Some(previous.span_covering(current))
+
+
+private pure func update_delimiters(expected: List[TokenKind], kind: TokenKind) -> List[TokenKind]:
+	match kind:
+		LeftParenSymbol:
+			expected.append(RightParenSymbol)
+		LeftBracketSymbol:
+			expected.append(RightBracketSymbol)
+		LeftBraceSymbol:
+			expected.append(RightBraceSymbol)
+		RightParenSymbol | RightBracketSymbol | RightBraceSymbol:
+			match expected.get(expected.length() - 1):
+				Some(close):
+					if close == kind:
+						expected.drop_last()
+					else:
+						expected
+				None:
+					expected
+		_:
+			expected

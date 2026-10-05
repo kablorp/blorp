@@ -1,0 +1,334 @@
+-- One frozen declaration call is the recovery oracle; no module assembly runs.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/lex/lexed_module: LexedModule
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_foreign_block_parser: ForeignBlockParse(ParsedForeignBlock, RejectedForeignBlock), parse_foreign_block
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser: parse_declaration_prefix
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_declaration
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parser_cursor as FrozenCursor
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedColon, ExpectedComma, ExpectedRightParen, ExpectedNewline, ExpectedIndent, ExpectedKeyword, ExpectedLeftParen, ExpectedArrow), NameConstruct(NameInForeignFunctionName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index, literal_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, EndOfFileToken, NormalStringToken, PipeStringToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func frozen_lexed(lexed: LexedModule) -> DiscoveryBuilder:
+	prepared = empty_discovery_builder().admit_source("foreign.brp", lexed.source.text).bridge_lexed_module(lexed)
+	parse_declaration(prepared, module_id_at_row(0))
+
+
+private pure func frozen(text: String) -> DiscoveryBuilder:
+	frozen_lexed(lex_module(module_id_at_row(0), text))
+
+
+private pure func expected_token_matches(actual: ExpectedTokenDiagnostic, wanted: ExpectedTokenDiagnostic) -> Bool:
+	match (actual, wanted):
+		(ExpectedName(actual), ExpectedName(wanted)):
+			actual == wanted
+		(ExpectedColon(actual), ExpectedColon(wanted)):
+			actual == wanted
+		(ExpectedComma(actual), ExpectedComma(wanted)):
+			actual == wanted
+		(ExpectedRightParen(actual), ExpectedRightParen(wanted)):
+			actual == wanted
+		(ExpectedNewline(actual), ExpectedNewline(wanted)):
+			actual == wanted
+		(ExpectedIndent(actual), ExpectedIndent(wanted)):
+			actual == wanted
+		(ExpectedKeyword(actual), ExpectedKeyword(wanted)):
+			actual == wanted
+		(ExpectedLeftParen(actual), ExpectedLeftParen(wanted)):
+			actual == wanted
+		(ExpectedArrow(actual), ExpectedArrow(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func matches_frozen(state: ParseState, reference: DiscoveryBuilder) -> Bool:
+	var correct: Bool = (state.diagnostic_count() == reference.diagnostics.length() and state.position() == reference.token_cursor
+		and state.current_kind() == FrozenCursor.current_kind(reference) and state.current_span().spans_equal(FrozenCursor.current_span(reference)))
+	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics):
+		correct = correct and actual.span.spans_equal(wanted.span)
+		match (actual.diagnostic, wanted.diagnostic):
+			(TreeDiagnostics.Plain(actual_code), FrozenDiagnostics.Plain(wanted_code)):
+				correct = correct and actual_code == wanted_code
+			(TreeDiagnostics.ExpectedToken(actual_code), FrozenDiagnostics.ExpectedToken(wanted_code)):
+				correct = correct and expected_token_matches(actual_code, wanted_code)
+			_:
+				-- No code-name normalization: unsupported or extra diagnostics fail.
+				correct = False
+	correct
+
+
+private pure func no_body_ids(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	counts.expressions == 0 and counts.blocks == 0 and counts.statements == 0 and counts.patterns == 0 and counts.type_binders == 0
+
+
+private pure func next_definition_is(state: ParseState, index: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(witness_state):
+			(_, name) = witness_state.consume_declared_name(NameInForeignFunctionName)
+			match name:
+				Some(name):
+					(_, declaration) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					declaration.id.definition_local_index() == index
+				None:
+					False
+		Err(_):
+			False
+
+
+private pure func accepted_lexed(lexed: LexedModule, arguments: List[(String, String)], names: List[String]) -> Bool:
+	reference = frozen_lexed(lexed)
+	match new_parse_state(lexed):
+		Ok(state):
+			(parsed, result) = parse_foreign_block(state, state.current_span())
+			match (result, reference.foreign_blocks.get(0)):
+				(ParsedForeignBlock(block), Some(reference_block)):
+					var correct: Bool = (reference.foreign_blocks.length() == 1 and matches_frozen(parsed, reference) and parsed.diagnostic_count() == 0 and block.span.spans_equal(reference_block.span)
+						and block.arguments.length() == arguments.length() and block.functions.length() == names.length()
+						and block.arguments.length() == reference.foreign_arguments.length() and block.functions.length() == reference.definitions.length()
+						and parsed.issued_counts().name_uses == names.length() and parsed.issued_counts().written_types == names.length()
+						and parsed.issued_counts().binders == 0 and parsed.issued_counts().dimensions == 0 and no_body_ids(parsed)
+						and next_definition_is(parsed, names.length()))
+					for (actual, wanted) in block.arguments.zip(arguments):
+						(name, value) = wanted
+						correct = correct and parsed.spellings().spelling_text(actual.name.spelling) == Some(name) and actual.value == value
+					for (actual, wanted) in block.arguments.zip(reference.foreign_arguments):
+						correct = (correct and actual.name.span.spans_equal(wanted.name_span) and actual.span.spans_equal(wanted.span)
+							and parsed.spellings().spelling_text(actual.name.spelling) == reference.name_spellings.get(wanted.name.name_id_index())
+							and Some(actual.value) == reference.literals.get(wanted.value.literal_id_index()))
+					for (actual, wanted) in block.functions.zip(names):
+						correct = correct and parsed.spellings().spelling_text(actual.name.spelling) == Some(wanted)
+					var index: Int = 0
+					for (actual, wanted) in block.functions.zip(reference.definitions):
+						correct = correct and actual.id.definition_local_index() == index and actual.span.spans_equal(wanted.span) and actual.name.span.spans_equal(wanted.name_span)
+						index += 1
+					correct
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func accepted(text: String, arguments: List[(String, String)], names: List[String]) -> Bool:
+	accepted_lexed(lex_module(module_id_at_row(0), text), arguments, names)
+
+
+private pure func rejected(text: String, completed_children: Int) -> Bool:
+	reference = frozen(text)
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_foreign_block(state, state.current_span())
+			match result:
+				RejectedForeignBlock:
+					matches_frozen(parsed, reference) and parsed.diagnostic_count() > 0 and no_body_ids(parsed) and next_definition_is(parsed, completed_children)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_one_child_consumes_dedent_and_preserves_following_declaration() -> Bool:
+	text: String = "foreign:\n\tfunc f() -> Int\nfunc g():"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_foreign_block(state, state.current_span())
+			match result:
+				ParsedForeignBlock(block):
+					(block.span.covers(0, 26) and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(26, 30)
+						and accepted(text, [], ["f"]))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_duplicate_arbitrary_attributes_preserve_order_payloads_and_spans() -> Bool:
+	accepted("foreign(include: \"x.h\", include: raw\"y.h\", strange: \"z\"):\n\tfunc f() -> Int\nnext", [("include", "x.h"), ("include", "y.h"), ("strange", "z")], ["f"])
+
+
+pure func test_plain_pipe_source_layout_preserves_frozen_rejection() -> Bool:
+	-- Real source emits newline and indent before the pipe literal here.
+	text: String = "foreign(include:\n\t| x.h\n):\n\tfunc f() -> Int\nnext"
+	frozen(text).diagnostics.length() == 13 and rejected(text, 1)
+
+
+pure func test_raw_pipe_attribute_payload_preserves_leading_space() -> Bool:
+	accepted("foreign(include: raw\n\t| x.h\n):\n\tfunc f() -> Int\nnext", [("include", " x.h")], ["f"])
+
+
+pure func test_pipe_attribute_token_contract_preserves_checked_payload_and_source_fields() -> Bool:
+	-- Parser-unit coverage follows test_tree_parse_state's record-update pattern.
+	-- Only the inline string token kind changes; checked TextValue, span, source,
+	-- spelling, interpolation, layout and diagnostic fields remain unchanged.
+	-- Both parsers consume this same input and retain every differential assertion.
+	lexed = lex_module(module_id_at_row(0), "foreign(include: \" x.h\"):\n\tfunc f() -> Int\nnext")
+	match lexed.tokens.get(4):
+		Some(token):
+			token.kind == NormalStringToken and accepted_lexed({ lexed | tokens = lexed.tokens.set(4, { token | kind = PipeStringToken }) }, [("include", " x.h")], ["f"])
+		None:
+			False
+
+
+pure func test_empty_attribute_parentheses_are_rejected_then_children_continue() -> Bool:
+	rejected("foreign():\n\tfunc f() -> Int\nnext", 1)
+
+
+pure func test_argument_errors_preserve_order_spans_and_progress() -> Bool:
+	(rejected("foreign(123: \"x\"):\n\tfunc f() -> Int\nnext", 1)
+		and rejected("foreign(include \"x\"):\n\tfunc f() -> Int\nnext", 1)
+		and rejected("foreign(include: 3):\n\tfunc f() -> Int\nnext", 1)
+		and rejected("foreign(include: \"x\" link: \"y\"):\n\tfunc f() -> Int\nnext", 1)
+		and rejected("foreign(:):\n\tfunc f() -> Int\nnext", 1))
+
+
+pure func test_trailing_comma_is_accepted_and_missing_close_runs_all_expectations() -> Bool:
+	(accepted("foreign(include: \"x\",):\n\tfunc f() -> Int\nnext", [("include", "x")], ["f"])
+		and rejected("foreign(include: \"x\"", 0))
+
+
+pure func test_missing_colon_newline_and_indent_do_not_skip_signature() -> Bool:
+	(rejected("foreign\n\tfunc f() -> Int\nnext", 1)
+		and rejected("foreign: func f() -> Int", 1)
+		and rejected("foreign:\nfunc f() -> Int\nfunc g() -> Int", 2))
+
+
+pure func test_unknown_items_make_progress_and_later_child_gets_first_id() -> Bool:
+	rejected("foreign:\n\t123\n\tfunc f() -> Int\nnext", 1)
+
+
+pure func test_rejected_child_does_not_mint_parent_before_later_valid_child() -> Bool:
+	rejected("foreign:\n\tfunc broken()\n\tfunc good() -> Int\nnext", 1)
+
+
+pure func test_two_children_mint_ids_in_order_without_block_or_argument_ids() -> Bool:
+	accepted("foreign(include: \"x\"):\n\tfunc f() -> Int\n\tfunc g() -> Int\nnext", [("include", "x")], ["f", "g"])
+
+
+pure func test_annotation_newline_and_trailing_body_tokens_compose_child_recovery() -> Bool:
+	(rejected("foreign:\n\t@no_copy\n\tfunc f() -> Int\nnext", 1)
+		and rejected("foreign:\n\tfunc f() -> Int:\n\tfunc g() -> Int\nnext", 2)
+		and rejected("foreign:\n\tfunc f() -> Int where\n\tfunc g() -> Int\nnext", 2))
+
+
+pure func test_foreign_func_and_pure_report_full_start_and_consume_one_token() -> Bool:
+	var correct: Bool = True
+	for text in ["foreign func f() -> Int", "foreign pure func f() -> Int"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(state):
+				(parsed, result) = parse_foreign_block(state, state.current_span())
+				match (result, parsed.diagnostics()):
+					(RejectedForeignBlock, [at]):
+						match at.diagnostic:
+							TreeDiagnostics.Plain(FrozenDiagnostics.ForeignFunctionOutsideBlockDiagnostic):
+								correct = correct and at.span.covers(0, 7) and parsed.position() == 2 and matches_frozen(parsed, frozen(text)) and next_definition_is(parsed, 0)
+							_:
+								correct = False
+					_:
+						correct = False
+			Err(_):
+				correct = False
+	correct
+
+
+pure func test_supplied_documentation_anchor_extends_span_without_metadata() -> Bool:
+	text: String = "---\nDocs\n---\nforeign:\n\tfunc f() -> Int\nnext"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(after_prefix, prefix) = parse_declaration_prefix(state)
+			(parsed, result) = parse_foreign_block(after_prefix, prefix.start)
+			match result:
+				ParsedForeignBlock(block):
+					match block.functions:
+						[function]:
+							(block.span.covers(0, 39) and function.span.covers(23, 38) and function.annotations.is_empty()
+								and parsed.diagnostic_count() == 0 and matches_frozen(parsed, frozen(text)) and no_body_ids(parsed))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_direct_leaf_tolerates_prior_diagnostic_but_prefix_composition_rejects_delta() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "foreign:\n\tfunc f() -> Int\nnext")):
+		Ok(state):
+			with_prior: ParseState = state.report_at_current(FrozenDiagnostics.ExpectedForeignFunctionDiagnostic)
+			(parsed, result) = parse_foreign_block(with_prior, state.current_span())
+			prior_ok: Bool = match result:
+				ParsedForeignBlock(_):
+					parsed.diagnostic_count() == with_prior.diagnostic_count() and next_definition_is(parsed, 1) and no_body_ids(parsed)
+				_:
+					False
+			match new_parse_state(lex_module(module_id_at_row(0), "@no_copy foreign:\n\tfunc f() -> Int\nnext")):
+				Ok(composed):
+					before: Int = composed.diagnostic_count()
+					(after_prefix, prefix) = parse_declaration_prefix(composed)
+					(finished, block_result) = parse_foreign_block(after_prefix, prefix.start)
+					match (block_result, finished.diagnostics()):
+						(ParsedForeignBlock(_), [at]):
+							match at.diagnostic:
+								TreeDiagnostics.Plain(FrozenDiagnostics.AnnotationWithoutFunctionDiagnostic):
+									-- The direct block added nothing; module composition must
+									-- reject this result against its pre-prefix count.
+									prior_ok and finished.diagnostic_count() != before and at.span.covers(9, 9)
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_eof_fallback_matches_frozen_header_recovery() -> Bool:
+	-- Missing layout reaches EOF: no child or block definition may be minted.
+	rejected("foreign:", 0)
+
+
+pure func test_grouped_return_child_keeps_written_span_while_block_owns_dedent() -> Bool:
+	accepted("foreign:\n\tfunc f() -> (Int)\nnext", [], ["f"])
+
+
+tests: TestSuite = {
+	description = "Complete foreign blocks with frozen declaration recovery",
+	tests = [
+		("one child consumes dedent and preserves following declaration", test_one_child_consumes_dedent_and_preserves_following_declaration),
+		("duplicate arbitrary attributes preserve order payloads and spans", test_duplicate_arbitrary_attributes_preserve_order_payloads_and_spans),
+		("plain pipe source layout preserves frozen rejection", test_plain_pipe_source_layout_preserves_frozen_rejection),
+		("raw pipe attribute payload preserves leading space", test_raw_pipe_attribute_payload_preserves_leading_space),
+		("pipe attribute token contract preserves checked payload and source fields", test_pipe_attribute_token_contract_preserves_checked_payload_and_source_fields),
+		("empty attribute parentheses are rejected then children continue", test_empty_attribute_parentheses_are_rejected_then_children_continue),
+		("argument errors preserve order spans and progress", test_argument_errors_preserve_order_spans_and_progress),
+		("trailing comma is accepted and missing close runs all expectations", test_trailing_comma_is_accepted_and_missing_close_runs_all_expectations),
+		("missing colon newline and indent do not skip signature", test_missing_colon_newline_and_indent_do_not_skip_signature),
+		("unknown items make progress and later child gets first id", test_unknown_items_make_progress_and_later_child_gets_first_id),
+		("rejected child does not mint parent before later valid child", test_rejected_child_does_not_mint_parent_before_later_valid_child),
+		("two children mint ids in order without block or argument ids", test_two_children_mint_ids_in_order_without_block_or_argument_ids),
+		("annotation newline and trailing body tokens compose child recovery", test_annotation_newline_and_trailing_body_tokens_compose_child_recovery),
+		("foreign func and pure report full start and consume one token", test_foreign_func_and_pure_report_full_start_and_consume_one_token),
+		("supplied documentation anchor extends span without metadata", test_supplied_documentation_anchor_extends_span_without_metadata),
+		("direct leaf tolerates prior diagnostic but prefix composition rejects delta", test_direct_leaf_tolerates_prior_diagnostic_but_prefix_composition_rejects_delta),
+		("eof fallback matches frozen header recovery", test_eof_fallback_matches_frozen_header_recovery),
+		("grouped return child keeps written span while block owns dedent", test_grouped_return_child_keeps_written_span_while_block_owns_dedent)
+	]
+}

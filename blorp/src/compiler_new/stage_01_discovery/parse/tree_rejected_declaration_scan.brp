@@ -1,0 +1,118 @@
+-- Test-only whole-source rejection evidence. A completed leaf's recovery can
+-- continue into later declarations. A deferred body or initializer stops the
+-- proof before any of its omitted grammar can contribute diagnostics.
+import:
+	../lex/lexed_module: LexedModule
+	../syntax/spellings: spelling_text
+	../tables/token:
+		TokenKind(NewlineToken, EndOfFileToken, FuncKeyword, TraitKeyword,
+			ImplementsKeyword, VarKeyword, IdentifierToken, UnderscoreSymbol,
+			RecordKeyword)
+	parse_state:
+		ParseInputError, ParseState, new_parse_state, current_kind,
+		current_token, peek_kind, position, advanced, diagnostic_count, spellings
+	rejected_preview: RejectedPreview, reject_preview
+	token_cursor: token_spelling
+	tree_declaration_prefix_parser: parse_declaration_prefix
+	tree_module_documentation_parser: parse_module_preamble
+	tree_declaration_preview_parser:
+		DeclarationPreview(FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview),
+		DeclarationPreviewParse(ParsedDeclarationPreview, RejectedDeclarationPreview, DeferredGlobalInitializer, RejectedGlobalInitializer),
+		parse_declaration_preview
+
+
+enum DeferredRejectionOwner:
+	FunctionBodyOwner
+	TraitBodyOwner
+	ImplementationBodyOwner
+	GlobalInitializerOwner
+
+
+union RejectedDeclarationScan:
+	CompleteDeclarationRejection(RejectedPreview)
+	NoDeclarationRejection
+	DeferredDeclarationRejection(DeferredRejectionOwner)
+	NonProgressingDeclarationRejection
+
+
+private FIXED_RECORD_MARKER: String = "fixed"
+
+
+pure func scan_rejected_declarations(lexed: LexedModule) -> Result[RejectedDeclarationScan, ParseInputError]:
+	entry ?= new_parse_state(lexed)
+	(after_preamble, _) = parse_module_preamble(entry)
+	var state: ParseState = after_preamble.skip_rejection_newlines()
+	var stopped: Option[RejectedDeclarationScan] = None
+	while state.current_kind() != EndOfFileToken:
+		-- Prefix grammar is independent of owners. Inspect its exact token
+		-- route to stop before an owner whose body grammar is deferred.
+		(after_prefix, _) = parse_declaration_prefix(state)
+		match deferred_rejection_owner(after_prefix):
+			Some(owner):
+				stopped = Some(DeferredDeclarationRejection(owner))
+				break
+			None:
+				void
+		before: Int = state.position()
+		(parsed, result) = parse_declaration_preview(state)
+		state = parsed
+		match result:
+			DeferredGlobalInitializer(_) | RejectedGlobalInitializer(_):
+				stopped = Some(DeferredDeclarationRejection(GlobalInitializerOwner))
+				break
+			ParsedDeclarationPreview(FunctionDeclarationPreview(_)):
+				stopped = Some(DeferredDeclarationRejection(FunctionBodyOwner))
+				break
+			ParsedDeclarationPreview(TraitDeclarationPreview(_)):
+				stopped = Some(DeferredDeclarationRejection(TraitBodyOwner))
+				break
+			ParsedDeclarationPreview(ImplementationDeclarationPreview(_)):
+				stopped = Some(DeferredDeclarationRejection(ImplementationBodyOwner))
+				break
+			ParsedDeclarationPreview(_) | RejectedDeclarationPreview:
+				void
+		if state.position() == before:
+			stopped = Some(NonProgressingDeclarationRejection)
+			break
+		state = state.skip_rejection_newlines()
+	match stopped:
+		Some(stop):
+			Ok(stop)
+		None:
+			if state.diagnostic_count() == 0:
+				Ok(NoDeclarationRejection)
+			else:
+				rejected ?= reject_preview(state)
+				Ok(CompleteDeclarationRejection(rejected))
+
+
+private pure func deferred_rejection_owner(state: ParseState) -> Option[DeferredRejectionOwner]:
+	match state.current_kind():
+		FuncKeyword:
+			Some(FunctionBodyOwner)
+		TraitKeyword:
+			Some(TraitBodyOwner)
+		ImplementsKeyword:
+			Some(ImplementationBodyOwner)
+		VarKeyword | UnderscoreSymbol:
+			Some(GlobalInitializerOwner)
+		IdentifierToken:
+			-- `fixed record` is an explicit language marker. Its spelling is
+			-- resolved from the token's authoritative spelling identity.
+			match state.current_token().token_spelling(state.spellings()):
+				Some(name):
+					if state.peek_kind(1) == RecordKeyword and state.spellings().spelling_text(name) == Some(FIXED_RECORD_MARKER):
+						None
+					else:
+						Some(GlobalInitializerOwner)
+				None:
+					Some(GlobalInitializerOwner)
+		_:
+			None
+
+
+private pure func skip_rejection_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+	out

@@ -1,0 +1,460 @@
+-- Expressions, statements, blocks and bodies, with the control-flow,
+-- interpolation and concurrency forms (`docs/DISCOVERY_REDESIGN.md`, sections
+-- 3.11 to 3.13). Bodies, statements and expressions refer to each other, so
+-- they share a module, as the body parser does today.
+--
+-- `=` is a statement or a record field, never an expression, so `Expression`
+-- has no assignment form, and a call takes only positional arguments. Grouping parentheses add
+-- no node: they widen the enclosed expression's span (except a name's and a
+-- lambda's), and the expression keeps its id.
+import:
+	../tables/row_kinds: Purity
+	../tables/span: Span
+	checked_values: DecimalFloat, PositiveCount
+	declarations: LocalFunction
+	ids: BlockId, ExpressionId, StatementId
+	names: Binder, BindingTarget, NameUse
+	patterns: Pattern, StringForm
+	sequences: AtLeastOne, SmallTuple
+	types: WrittenType
+
+
+---
+An expression as the source wrote it. Made only by `minted_expression`.
+---
+record Expression {
+	id: ExpressionId,
+	span: Span,
+	kind: ExpressionKind
+}
+
+
+union ExpressionKind:
+	-- Names and literals (literal values are checked: section 5.2).
+	NameReference(NameUse)
+	IntegerLiteral(Int128) -- the magnitude; a `-` is a `Unary`
+	FloatLiteral(DecimalFloat)
+	StringLiteral(StringForm, String) -- the text after escapes; joined lines for a pipe string
+	InterpolatedString(InterpolationForm, List[InterpolationPiece])
+	BooleanLiteral(Bool)
+	CharacterLiteral(Char)
+	VoidValue -- `void`, `()`, or `_` as an expression
+	CompilerBuiltin(Option[String]) -- `builtin` or `builtin("name")`
+	-- Operators.
+	Unary(UnaryOperator, Expression)
+	Binary(BinaryOperator, Expression, Expression)
+	ShortCircuit(LogicalOperator, Expression, Expression)
+	RangeExpression(Expression, Expression)
+	-- Calls and access.
+	Call(Expression, List[Expression]) -- positional arguments only: the language has no named ones
+	FieldAccess(Expression, NameUse) -- `x.f`: a field, a method, or a module member
+	Subscript(Expression, AtLeastOne[Expression])
+	-- Aggregates.
+	ListLiteral(List[Expression])
+	TupleLiteral(SmallTuple[Expression])
+	VectorLiteral(List[Expression])
+	RecordLiteral(List[NamedValue])
+	RecordUpdate(Expression, List[NamedValue])
+	DictLiteral(List[DictEntry])
+	OpaqueConversion(OpaqueDirection, WrittenType, Expression)
+	-- Control flow.
+	If(IfExpression)
+	Match(Expression, List[MatchCase])
+	Select(List[SelectArm])
+	With(WithExpression)
+	DebugBlock(Block)
+	Lambda(LambdaExpression)
+	ConcurrentBlock(ConcurrentBlockExpression)
+	Detach(Expression)
+	Break
+	Continue
+
+
+enum UnaryOperator:
+	Negate
+	LogicalNot
+
+
+enum BinaryOperator:
+	Add
+	Subtract
+	Multiply
+	Divide
+	Modulo
+	Equal
+	NotEqual
+	Less
+	LessEqual
+	Greater
+	GreaterEqual
+
+
+---
+`and` and `or`: they may skip their right operand, so they are not operators
+over two evaluated values.
+---
+enum LogicalOperator:
+	LogicalAnd
+	LogicalOr
+
+
+enum OpaqueDirection:
+	IntoOpaque
+	FromOpaque
+
+
+---
+`name = value` in a record literal or a record update. `name` is a use that
+typecheck decides against the record type's fields.
+---
+record NamedValue {
+	name: NameUse,
+	value: Expression,
+	span: Span
+}
+
+
+---
+`key => value` in a dict literal.
+---
+record DictEntry {
+	key: Expression,
+	value: Expression,
+	span: Span
+}
+
+
+---
+A statement as the source wrote it. Made only by `minted_statement`. The
+statement records below do not repeat the span this wrapper holds.
+---
+record Statement {
+	id: StatementId,
+	span: Span,
+	kind: StatementKind
+}
+
+
+union StatementKind:
+	ExpressionStatement(Expression)
+	VariableDeclaration(VariableStatement) -- `var x [: T] = v`
+	TypedBinding(TypedBindingStatement) -- `x: T = v`
+	Assignment(AssignmentStatement) -- `x = v`: declares or assigns (resolution decides)
+	QuestionBinding(QuestionBindingStatement) -- `x [: T] ?= v`
+	CompoundAssignment(CompoundAssignmentStatement)
+	SubscriptAssignment(SubscriptAssignmentStatement)
+	TupleDestructure(TupleDestructureStatement)
+	WhileLoop(WhileStatement)
+	ForLoop(ForStatement)
+	ConcurrentForLoop(ConcurrentForStatement)
+	LocalFunctionStatement(LocalFunction)
+
+
+---
+An indented block. It always has a last statement, which gives the block its
+value; an empty block is reported, so an accepted module has none. Made only
+by `minted_block`.
+---
+record Block {
+	id: BlockId,
+	leading: List[Statement],
+	last: Statement,
+	span: Span
+}
+
+
+---
+The body of a function, a method or a lambda: an indented block, or an
+expression on the `:` line.
+---
+union Body:
+	BlockBody(Block)
+	ExpressionBody(Expression)
+
+
+record VariableStatement {
+	target: BindingTarget,
+	declared_type: Option[WrittenType],
+	value: Expression
+}
+
+
+record TypedBindingStatement {
+	target: BindingTarget,
+	declared_type: WrittenType,
+	value: Expression
+}
+
+
+---
+`x = v` or `_ = v`. A name target either declares a new binding or assigns an
+existing mutable one; resolution decides by a lookup, so the target is a use,
+not a binder.
+---
+record AssignmentStatement {
+	target: AssignmentTarget,
+	value: Expression
+}
+
+
+union AssignmentTarget:
+	AssignsName(NameUse)
+	AssignsDiscard(Span)
+
+
+record QuestionBindingStatement {
+	binder: Binder,
+	declared_type: Option[WrittenType],
+	value: Expression
+}
+
+
+---
+`x += v` and its siblings. The parser rejects `_ += v`, so the target is
+always a name.
+---
+record CompoundAssignmentStatement {
+	target: NameUse,
+	operator: CompoundOperator,
+	value: Expression
+}
+
+
+enum CompoundOperator:
+	AddAssign
+	SubtractAssign
+	MultiplyAssign
+	DivideAssign
+
+
+---
+`xs[i] = v`: the written place and the value stored there.
+---
+record SubscriptAssignmentStatement {
+	place: SubscriptPlace,
+	value: Expression
+}
+
+
+---
+The written `xs[i]` of `xs[i] = v`: the element place typecheck types, so it
+carries an `ExpressionId` (section 3.3). Made only by
+`minted_subscript_place`, when the parser sees the `=` and before it parses
+the value.
+---
+record SubscriptPlace {
+	id: ExpressionId,
+	span: Span,
+	collection: Expression,
+	indices: AtLeastOne[Expression]
+}
+
+
+---
+`(a, _, c) = v`.
+---
+record TupleDestructureStatement {
+	targets: SmallTuple[BindingTarget],
+	value: Expression
+}
+
+
+record WhileStatement {
+	condition: Expression,
+	body: Block
+}
+
+
+record ForStatement {
+	binder: LoopBinder,
+	iterable: Expression,
+	body: Block
+}
+
+
+union LoopBinder:
+	LoopVariable(BindingTarget) -- `for x in`, `for _ in`
+	LoopTuple(SmallTuple[BindingTarget], Span) -- `for (k, v) in`
+
+
+record IfExpression {
+	condition: Expression,
+	then_block: Block,
+	else_branch: Option[ElseBranch]
+}
+
+
+---
+`else:` or `else if`. `keyword` is the `else` keyword, which neither branch's
+span covers; the formatter places comments around it.
+---
+record ElseBranch {
+	keyword: Span,
+	body: ElseBody
+}
+
+
+union ElseBody:
+	ElseBlock(Block)
+	ElseIf(ElseIfExpression)
+
+
+---
+The `if` of an `else if`: an expression of its own (section 3.3). Made only
+by `minted_else_if`.
+---
+record ElseIfExpression {
+	id: ExpressionId,
+	span: Span,
+	conditional: IfExpression
+}
+
+
+---
+`pattern: body`. A case written on the pattern's line is one statement.
+---
+record MatchCase {
+	pattern: Pattern,
+	body: CaseBody,
+	span: Span
+}
+
+
+union CaseBody:
+	CaseBlock(Block)
+	CaseStatement(Statement)
+
+
+record SelectArm {
+	kind: SelectArmKind,
+	body: Block,
+	span: Span
+}
+
+
+union SelectArmKind:
+	ReceiveArm(BindingTarget, Expression) -- `x from channel:`
+	SealedArm(Expression) -- `sealed channel:`
+	AfterArm(Expression) -- `_ after timeout:`
+
+
+record WithExpression {
+	acquisition: WithAcquisition,
+	body: Block
+}
+
+
+union WithAcquisition:
+	WithValue(WithBinding) -- `with r [: T] = v:`
+	WithTry(WithTryBinding) -- `with r [: T] ?= v [on e => mapped]:`
+
+
+record WithBinding {
+	target: BindingTarget,
+	declared_type: Option[WrittenType],
+	value: Expression,
+	span: Span
+}
+
+
+record WithTryBinding {
+	target: BindingTarget,
+	declared_type: Option[WrittenType],
+	value: Expression,
+	on_error: Option[ErrorMap],
+	span: Span
+}
+
+
+---
+`on e => mapped`.
+---
+record ErrorMap {
+	target: BindingTarget,
+	value: Expression,
+	span: Span
+}
+
+
+record LambdaExpression {
+	purity: Purity,
+	parameters: List[LambdaParameter],
+	return_type: Option[WrittenType],
+	body: Body
+}
+
+
+record LambdaParameter {
+	target: BindingTarget,
+	declared_type: Option[WrittenType],
+	span: Span
+}
+
+
+enum InterpolationForm:
+	QuotedInterpolation
+	PipeInterpolation
+
+
+---
+Text pieces and holes in source order; a text piece is present before,
+between and after holes when it is non-empty.
+---
+union InterpolationPiece:
+	InterpolationText(String)
+	InterpolationHole(Hole)
+
+
+---
+`${value}`. `span` covers the `$` through the `}`. `id` is the hole's own
+expression id: the implicit conversion of `value` to text, which typecheck
+selects and Core emits (section 3.3). Made only by `minted_hole`.
+---
+record Hole {
+	id: ExpressionId,
+	value: Expression,
+	span: Span
+}
+
+
+---
+`concurrent:` or `concurrent(max_threads: n, timeout: t):`. Each task is a
+statement of `body`, identified by its `StatementId`.
+---
+record ConcurrentBlockExpression {
+	max_threads: Option[CountParameter],
+	timeout: Option[TimeoutParameter],
+	body: Block
+}
+
+
+---
+`for x in xs concurrently(limit: n[, timeout: t]):`. `limit` is required; the
+parser reports a missing one, so an accepted module always has it. The body
+runs as a task per element: its `BlockId` identifies that closure.
+---
+record ConcurrentForStatement {
+	binder: Binder,
+	iterable: Expression,
+	limit: CountParameter,
+	timeout: Option[TimeoutParameter],
+	body: Block
+}
+
+
+---
+`max_threads: n` or `limit: n`: a positive integer literal, checked by the
+parser.
+---
+record CountParameter {
+	count: PositiveCount,
+	name_span: Span,
+	span: Span
+}
+
+
+record TimeoutParameter {
+	value: Expression,
+	name_span: Span,
+	span: Span
+}

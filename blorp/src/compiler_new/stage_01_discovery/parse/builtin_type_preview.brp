@@ -1,0 +1,109 @@
+-- Standalone builtin declarations retain syntax and lexical evidence without
+-- publishing a completed module or routing production parsing.
+import:
+	../lex/lexed_module: LexedModule
+	../syntax/declarations: BuiltinTypeDeclaration, ResourceTypeDeclaration
+	../tables/row_kinds: Visibility(PublicVisibility)
+	../tables/token:
+		TokenKind(ResourceKeyword, TypeKeyword, AliasKeyword, NewlineToken, EndOfFileToken),
+	parse_state:
+		ParseInputError,
+		ParseState,
+		advanced,
+		current_kind,
+		current_span,
+		diagnostic_count,
+		diagnostics,
+		new_parse_state,
+		peek_kind,
+	preview_source: PreviewSource, preview_source
+	rejected_preview: RejectedPreview, reject_preview
+	tree_builtin_type_parser:
+		BuiltinTypeForm(PlainBuiltinType, ResourceBuiltinType),
+		BuiltinTypeParse(ParsedBuiltinType, ParsedResourceType, RejectedBuiltinType),
+		parse_builtin_type,
+
+
+union BuiltinTypePreviewDeclaration:
+	BuiltinDeclaration(BuiltinTypeDeclaration)
+	ResourceDeclaration(ResourceTypeDeclaration)
+
+
+opaque type BuiltinTypePreview = PreviewContents
+
+
+private record PreviewContents {
+	declaration: BuiltinTypePreviewDeclaration,
+	source: PreviewSource
+}
+
+
+union BuiltinTypePreviewOutcome:
+	PreviewedBuiltinType(BuiltinTypePreview)
+	RejectedBuiltinTypePreview(RejectedPreview)
+	UnsupportedBuiltinTypePreview
+
+
+pure func builtin_type_declaration(preview: BuiltinTypePreview) -> BuiltinTypePreviewDeclaration:
+	from_opaque BuiltinTypePreview(preview).declaration
+
+
+pure func builtin_type_source(preview: BuiltinTypePreview) -> PreviewSource:
+	from_opaque BuiltinTypePreview(preview).source
+
+
+pure func preview_builtin_type(
+	lexed: LexedModule,
+) -> Result[BuiltinTypePreviewOutcome, ParseInputError]:
+	state ?= new_parse_state(lexed)
+
+	if state.diagnostic_count() != 0:
+		rejected ?= reject_preview(state)
+		Ok(RejectedBuiltinTypePreview(rejected))
+	else:
+		opening: Option[(ParseState, BuiltinTypeForm)] = if state.current_kind() == ResourceKeyword:
+			Some((state.advanced(), ResourceBuiltinType))
+		else if state.current_kind() == TypeKeyword and state.peek_kind(1) != AliasKeyword:
+			Some((state, PlainBuiltinType))
+		else:
+			None
+
+		match opening:
+			None:
+				Ok(UnsupportedBuiltinTypePreview)
+			Some((input, form)):
+				(parsed_state, result) = parse_builtin_type(
+					input,
+					PublicVisibility,
+					None,
+					state.current_span(),
+					form,
+				)
+
+				match result:
+					RejectedBuiltinType:
+						rejected ?= reject_preview(parsed_state)
+						Ok(RejectedBuiltinTypePreview(rejected))
+					ParsedBuiltinType(declaration):
+						Ok(finished_preview(parsed_state, lexed, BuiltinDeclaration(declaration)))
+					ParsedResourceType(declaration):
+						Ok(finished_preview(parsed_state, lexed, ResourceDeclaration(declaration)))
+
+
+private pure func finished_preview(
+	state: ParseState,
+	lexed: LexedModule,
+	declaration: BuiltinTypePreviewDeclaration,
+) -> BuiltinTypePreviewOutcome:
+	var end: ParseState = state
+
+	while end.current_kind() == NewlineToken:
+		end = end.advanced()
+
+	if end.current_kind() != EndOfFileToken:
+		UnsupportedBuiltinTypePreview
+	else:
+		PreviewedBuiltinType(into_opaque BuiltinTypePreview({
+					declaration = declaration,
+					source = preview_source(lexed)
+				}))

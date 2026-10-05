@@ -1,0 +1,305 @@
+-- The id census: a tree built through one mint holds every id it issued
+-- exactly once; a stale mint, a dropped node, another module's node or a count
+-- taken too early is reported, family and index; and long chains are walked
+-- without deep recursion.
+import:
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: GlobalForm(ConstantGlobal)
+	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
+		BinaryOperator(Add),
+		ElseBody(ElseBlock, ElseIf),
+		Expression,
+		ExpressionKind(Binary, Call, FieldAccess, If, IntegerLiteral, VoidValue),
+	../../../../src/compiler_new/stage_01_discovery/syntax/id_census:
+		CensusProblem(IdHeldTwice, IdNotHeld, IdNotIssued, IdOfAnotherModule),
+		IdFamily(
+			BinderIds, BlockIds, DefinitionIds, DimensionIds, ExpressionIds, ImportIds, NameUseIds,
+			PatternIds, StatementIds, TypeBinderIds, WrittenTypeIds,
+		),
+		id_census,
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids:
+		minted_else_if,
+		minted_expression,
+		minted_global,
+		written_type_local_index,
+		name_use_local_index,
+		new_id_mint,
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax:
+		ModuleItem(GlobalItem),
+		ModuleSyntax,
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, module_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility), Purity(PureFunction)
+	../../support/syntax_samples:
+		SampleBuild,
+		block_of,
+		every_form_module,
+		expression,
+		module_syntax,
+		name_expression,
+		next_span,
+		sample_build,
+		sample_bounded_type,
+		sample_type_module,
+		written_type,
+		sample_module,
+		sample_span,
+		statement,
+		use,
+		written,
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(BoundedType, FunctionType)
+	test: TestSuite
+
+
+pure func family_text(family: IdFamily) -> String:
+	match family:
+		DefinitionIds:
+			"definition"
+		ImportIds:
+			"import"
+		StatementIds:
+			"statement"
+		BlockIds:
+			"block"
+		ExpressionIds:
+			"expression"
+		PatternIds:
+			"pattern"
+		WrittenTypeIds:
+			"written type"
+		DimensionIds:
+			"dimension"
+		NameUseIds:
+			"name use"
+		BinderIds:
+			"binder"
+		TypeBinderIds:
+			"type binder"
+
+
+pure func problem_text(problem: CensusProblem) -> String:
+	match problem:
+		IdHeldTwice(family, index):
+			family_text(family) + " " + index.to_string() + " held twice"
+		IdNotHeld(family, index):
+			family_text(family) + " " + index.to_string() + " not held"
+		IdNotIssued(family, index):
+			family_text(family) + " " + index.to_string() + " not issued"
+		IdOfAnotherModule(family, module, index):
+			family_text(family) + " " + index.to_string() + " of module " + module
+				.module_id_index()
+				.to_string()
+
+
+pure func census_of(syntax: ModuleSyntax) -> List[String]:
+	id_census(sample_module(), syntax).map(pure func(problem): problem_text(problem))
+
+
+---
+A module whose one item is a global holding `value`.
+---
+pure func module_holding(build: SampleBuild, value: Expression) -> ModuleSyntax:
+	(b1, name) = build.written("value")
+	(b2, span) = b1.next_span()
+	(m1, global) = b2.mint.minted_global(
+		PublicVisibility,
+		None,
+		ConstantGlobal,
+		name,
+		None,
+		value,
+		span,
+	)
+	{ b2 | mint = m1 }.module_syntax([GlobalItem(global)], None)
+
+
+pure func test_a_module_with_every_form_holds_each_id_once() -> Bool:
+	(syntax, _) = every_form_module()
+	census_of(syntax).is_empty()
+
+
+pure func test_an_id_minted_twice_by_a_stale_mint_is_reported() -> Bool:
+	start: SampleBuild = sample_build()
+	(stale, first) = start.expression(VoidValue)
+	-- `start` is used again: its mint issues expression 0 a second time.
+	(_, again) = start.expression(VoidValue)
+	(b1, pair) = stale.expression(Binary(Add, first, again))
+	census_of(b1.module_holding(pair)) == ["expression 0 held twice"]
+
+
+pure func test_a_node_dropped_after_it_was_built_is_reported() -> Bool:
+	(b1, _) = sample_build().expression(VoidValue)
+	(b2, kept) = b1.expression(VoidValue)
+	census_of(b2.module_holding(kept)) == ["expression 0 not held"]
+
+
+pure func test_a_node_of_another_module_is_reported() -> Bool:
+	(_, foreign_node) = new_id_mint(module_id_at_row(9)).minted_expression(
+		sample_span(0, 1),
+		VoidValue,
+	)
+	census_of(sample_build().module_holding(foreign_node)) == ["expression 0 of module 9"]
+
+
+pure func test_a_count_taken_before_the_last_mint_is_reported() -> Bool:
+	(b1, first) = sample_build().expression(VoidValue)
+	(b2, second) = b1.expression(VoidValue)
+	(b3, both) = b2.expression(Binary(Add, first, second))
+	syntax: ModuleSyntax = b3.module_holding(both)
+	early: ModuleSyntax = { syntax | counts = { syntax.counts | expressions = 2 } }
+	census_of(early) == ["expression 2 not issued"]
+
+
+---
+`1 + 1 + ... + 1`, `terms` long: a left spine `terms - 1` deep.
+---
+pure func long_sum(build: SampleBuild, terms: Int) -> (SampleBuild, Expression):
+	(b1, first) = build.expression(IntegerLiteral(to_int128(1)))
+	var current: SampleBuild = b1
+	var sum: Expression = first
+	var added: Int = 1
+
+	while added < terms:
+		(with_term, term) = current.expression(IntegerLiteral(to_int128(1)))
+		(with_sum, next_sum) = with_term.expression(Binary(Add, sum, term))
+		current = with_sum
+		sum = next_sum
+		added += 1
+
+	(current, sum)
+
+
+pure func test_a_five_thousand_term_sum_is_walked() -> Bool:
+	(b1, sum) = sample_build().long_sum(5000)
+	census_of(b1.module_holding(sum)).is_empty()
+
+
+pure func test_a_two_thousand_call_method_chain_is_walked() -> Bool:
+	(b1, receiver) = sample_build().name_expression("x")
+	var current: SampleBuild = b1
+	var chain: Expression = receiver
+	var calls: Int = 0
+
+	while calls < 2000:
+		(with_member, member) = current.use("next")
+		(with_access, access) = with_member.expression(FieldAccess(chain, member))
+		(with_call, call) = with_access.expression(Call(access, []))
+		current = with_call
+		chain = call
+		calls += 1
+
+	census_of(current.module_holding(chain)).is_empty()
+
+
+---
+`if c: void else if c: void ... else: void`, 2,000 `else if`s deep, built
+innermost first as the parser completes it.
+---
+pure func test_a_two_thousand_deep_else_if_chain_is_walked() -> Bool:
+	(b1, last_value) = sample_build().expression(VoidValue)
+	(b2, last_block) = b1.block_of(last_value)
+	(b3, keyword) = b2.next_span()
+	var current: SampleBuild = b3
+	var tail: ElseBody = ElseBlock(last_block)
+	var depth: Int = 0
+
+	while depth < 2000:
+		(with_condition, condition) = current.name_expression("c")
+		(with_value, value) = with_condition.expression(VoidValue)
+		(with_block, then_block) = with_value.block_of(value)
+		(mint, else_if) = with_block.mint.minted_else_if(
+			keyword,
+			{
+				condition = condition,
+				then_block = then_block,
+				else_branch = Some({
+					keyword = keyword,
+					body = tail,
+				})
+			},
+		)
+		current = { with_block | mint = mint }
+		tail = ElseIf(else_if)
+		depth += 1
+
+	(b4, condition) = current.name_expression("c")
+	(b5, value) = b4.expression(VoidValue)
+	(b6, then_block) = b5.block_of(value)
+	(b7, conditional) = b6.expression(If({
+		condition = condition,
+		then_block = then_block,
+		else_branch = Some({
+			keyword = keyword,
+			body = tail,
+		}),
+	}))
+	census_of(b7.module_holding(conditional)).is_empty()
+
+
+pure func test_standalone_bound_and_function_result_hold_outer_type_and_all_name_ids() -> Bool:
+	(build, bounded) = sample_build().sample_bounded_type()
+	(function_build, function) = build.written_type(FunctionType(PureFunction, [], bounded))
+	match bounded.kind:
+		BoundedType(argument):
+			match (argument.bounds.first.qualifier, argument.bounds.rest):
+				(Some(qualifier), [bare]):
+					(bounded.id.written_type_local_index() == 0 and function.id.written_type_local_index() == 1
+						and argument.parameter.use.name_use_local_index() == 0 and qualifier.use.name_use_local_index() == 1
+						and argument.bounds.first.trait_name.use.name_use_local_index() == 2 and bare.trait_name.use.name_use_local_index() == 3
+						and build.sample_type_module(bounded).counts.written_types == 1 and function_build.sample_type_module(function).counts.written_types == 2
+						and build.sample_type_module(bounded).counts.name_uses == 4 and function_build.sample_type_module(function).counts.name_uses == 4
+						and census_of(build.sample_type_module(bounded)).is_empty() and census_of(function_build.sample_type_module(function)).is_empty())
+				_:
+					False
+		_:
+			False
+
+
+pure func test_standalone_bound_census_reports_dropped_qualifier_and_duplicate_parameter_use() -> Bool:
+	(build, bounded) = sample_build().sample_bounded_type()
+	match bounded.kind:
+		BoundedType(argument):
+			match argument.bounds.first.qualifier:
+				Some(qualifier):
+					first = argument.bounds.first
+					without_qualifier = { bounded | kind = BoundedType({ argument | bounds = { argument.bounds | first = { first | qualifier = None } } }) }
+					duplicate_parameter = { bounded | kind = BoundedType({ argument | parameter = qualifier }) }
+					(census_of(build.sample_type_module(without_qualifier)) == ["name use 1 not held"]
+						and census_of(build.sample_type_module(duplicate_parameter)) == ["name use 0 not held", "name use 1 held twice"])
+				None:
+					False
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Discovery syntax id census",
+	tests = [
+		("standalone bound and function result retain all IDs", test_standalone_bound_and_function_result_hold_outer_type_and_all_name_ids),
+		("standalone bound census catches dropped and duplicate uses", test_standalone_bound_census_reports_dropped_qualifier_and_duplicate_parameter_use),
+		(
+			"a module with every form holds each id once",
+			test_a_module_with_every_form_holds_each_id_once,
+		),
+		(
+			"an id minted twice by a stale mint is reported",
+			test_an_id_minted_twice_by_a_stale_mint_is_reported,
+		),
+		(
+			"a node dropped after it was built is reported",
+			test_a_node_dropped_after_it_was_built_is_reported,
+		),
+		("a node of another module is reported", test_a_node_of_another_module_is_reported),
+		(
+			"a count taken before the last mint is reported",
+			test_a_count_taken_before_the_last_mint_is_reported,
+		),
+		("a five thousand term sum is walked", test_a_five_thousand_term_sum_is_walked),
+		(
+			"a two thousand call method chain is walked",
+			test_a_two_thousand_call_method_chain_is_walked,
+		),
+		(
+			"a two thousand deep else if chain is walked",
+			test_a_two_thousand_deep_else_if_chain_is_walked,
+		),
+	]
+}

@@ -9,11 +9,12 @@
 --      is loaded once per canonical path;
 --   4. freeze, behind the table invariants.
 --
--- Each module is admitted, lexed and parsed into the builder as it is loaded.
+-- Each module is lexed, admitted and parsed into the builder as it is loaded.
 -- Where a step's mechanics live: `sources/module_graph` (resolving requests
 -- and the walk state), `sources/source_admission`, `lex/` (`lexer`
--- drives the scan; `layout`, `string_literals`, `interpolation`,
--- `char_literals` and `scan_support` hold its parts),
+-- drives the scan into a `LexedModule`; `layout`, `string_literals`,
+-- `interpolation`, `char_literals` and `scan_support` hold its parts),
+-- `parse/lexed_bridge` (copies the lexed module into the builder),
 -- `parse/declaration_parser` (with `parse/body_parser` and the modules under it
 -- for function bodies), `tables/builder` (the tables, with `ids`, `rows`
 -- and `node_builder`) and
@@ -25,9 +26,12 @@
 -- inside the import queue or any other value (see the builder threading rules
 -- in `tables/builder`).
 import:
+	debug as dbg
 	fs: DirectoryListing
-	lex/lexer: lex_source
+	lex/lexed_module: LexedModule
+	lex/lexer: lex_module
 	parse/declaration_parser: parse_module_declarations
+	parse/lexed_bridge: bridge_lexed_module
 	sources/module_graph:
 		ImportQueue,
 		ModuleRequester(RequestedByImport, RequestedByRoot, RequestedImplicitly),
@@ -43,7 +47,7 @@ import:
 		resolve_implicit,
 		resolve_import,
 		resolve_root,
-	sources/source_admission: admit_source, intern_path, interned_path_id
+	sources/source_admission: admit_source_with_line_starts, intern_path, interned_path_id
 	sources/source_provider:
 		RootRequest,
 		SourceCandidate,
@@ -59,9 +63,8 @@ import:
 		next_module_id,
 		open_module,
 		opened_module,
-		opened_source,
 	tables/frontend_tables: FreezeOutcome, freeze
-	tables/ids: ModuleId, PathId
+	tables/ids: ModuleId, PathId, module_id_index
 	tables/row_kinds: ModuleReach
 
 
@@ -201,9 +204,11 @@ private pure func settle_request(
 
 
 ---
-One module: admit its source, open the module, lex, parse, and close it, which
-appends the module's row with its blocks ended over the rows that lexing and
-parsing appended.
+One module: lex its text, admit its source, open the module, bridge the lexed
+module into the builder, parse, and close it, which appends the module's row
+with its blocks ended over the rows that lexing and parsing appended. The text
+is lexed first, as the module `next_module_id` names, because its line starts
+are part of admitting the source.
 ---
 pure func load_module(
 	builder: DiscoveryBuilder,
@@ -211,11 +216,31 @@ pure func load_module(
 	reach: ModuleReach,
 	text: String,
 ) -> DiscoveryBuilder:
-	admitted: DiscoveryBuilder = builder.admit_source(candidate.path, text)
+	lexed: LexedModule = lex_module(builder.next_module_id(), text)
+	admitted: DiscoveryBuilder = builder.admit_source_with_line_starts(
+		candidate.path,
+		text,
+		lexed.line_starts,
+	)
 	opening: ModuleOpening = admitted.open_module(candidate.placement.origin_kind(), reach)
-	module: ModuleId = opening.opened_module()
+	module: ModuleId = module_opened_as_lexed(opening.opened_module(), lexed.module)
 	admitted
 		.record_module_package(module, candidate.placement)
-		.lex_source(opening.opened_source())
+		.bridge_lexed_module(lexed)
 		.parse_module_declarations(module)
 		.close_module(opening)
+
+
+---
+`opened`, the module `open_module` opened, after a debug-build check that it is
+the module the text was lexed as: the lexer's spans and spellings name the id
+`next_module_id` gave, so a module opened under another id would carry
+another module's sources and spellings. A function of the two ids that
+returns the opened one, so that no bare guard call sits in the load chain.
+---
+private pure func module_opened_as_lexed(opened: ModuleId, lexed: ModuleId) -> ModuleId:
+	debug:
+		if opened.module_id_index() != lexed.module_id_index():
+			dbg.error("a module was opened under a different id than the one its text was lexed as")
+
+	opened

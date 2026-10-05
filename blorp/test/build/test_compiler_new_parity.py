@@ -370,6 +370,239 @@ class CompilerNewParityTests(unittest.TestCase):
 		)
 		self.assertIn("unexpected adapter differential output", "\n".join(self.adapter_problems(output)))
 
+	def tree_prefix_output(self, *lines: str, updates=None, omitted=(), extra=()) -> str:
+		counts = {
+			"modules": 1, "compared": 1, "skipped": 0, "errors": 0,
+			"declarations": 10, "differences": 0, "reported": 0,
+		}
+		for kind in (
+			"import_block", "foreign_block", "record", "fixed_record",
+			"alias", "builtin_type", "resource_type", "union", "enum",
+		):
+			counts[f"kind_{kind}"] = 1
+		for kind in ("function", "trait", "implementation", "constant_global", "mutable_global"):
+			counts[f"kind_{kind}"] = 0
+		for stop in (
+			"end_of_source", "function_header", "trait_preview", "implementation_preview",
+			"global_initializer", "rejected_global_initializer", "rejected_declaration", "without_progress",
+		):
+			counts[f"stop_{stop}"] = int(stop == "end_of_source")
+		counts.update({} if updates is None else updates)
+		fields = [f"{name}={value}" for name, value in counts.items() if name not in omitted]
+		return self.adapter_output(
+			*lines,
+			"tree-prefix-summary " + " ".join([*fields, *extra]),
+			"summary modules=1 compared=1 skipped=0 declarations=10 differences=0",
+		)
+
+	def tree_prefix_problems(self, output: str, expected_skipped=None, require_completed_kinds=False) -> list[str]:
+		return parity.tree_prefix_problems(
+			"tree prefix, test root",
+			parity.parse_adapter_output(output).tree_prefix,
+			set() if expected_skipped is None else expected_skipped,
+			require_completed_kinds=require_completed_kinds,
+		)
+
+	def test_clean_combined_output_preserves_both_adapter_reports(self) -> None:
+		output = self.tree_prefix_output()
+		report = parity.parse_adapter_output(output)
+		self.assertEqual((report.modules, report.compared, report.declarations), (1, 1, 10))
+		prefix = report.tree_prefix
+		self.assertEqual((prefix.modules, prefix.compared, prefix.declarations), (1, 1, 10))
+		self.assertEqual((prefix.skipped, prefix.errors, prefix.reported), (0, 0, 0))
+		self.assertEqual((prefix.kinds["record"], prefix.kinds["fixed_record"]), (1, 1))
+		self.assertEqual(prefix.stops["end_of_source"], 1)
+		self.assertEqual(self.adapter_problems(output), [])
+		self.assertEqual(self.tree_prefix_problems(output, require_completed_kinds=True), [])
+
+	def test_tree_prefix_requires_one_summary(self) -> None:
+		output = self.tree_prefix_output()
+		summary = next(line for line in output.splitlines() if line.startswith("tree-prefix-summary "))
+		for changed in (output.replace(summary + "\n", ""), output + summary + "\n"):
+			with self.subTest(output=changed):
+				self.assertTrue(self.tree_prefix_problems(changed))
+
+	def test_tree_prefix_rejects_malformed_missing_unknown_and_negative_fields(self) -> None:
+		outputs = (
+			self.tree_prefix_output(updates={"modules": "many"}),
+			self.tree_prefix_output(updates={"modules": -1}),
+			self.tree_prefix_output(omitted=("declarations",)),
+			self.tree_prefix_output(extra=("unexpected=0",)),
+			self.tree_prefix_output(extra=("modules=1",)),
+			self.tree_prefix_output(extra=("broken",)),
+		)
+		for output in outputs:
+			with self.subTest(output=output):
+				self.assertTrue(self.tree_prefix_problems(output))
+
+	def test_tree_prefix_rejects_inconsistent_module_stop_and_kind_counts(self) -> None:
+		for updates in (
+			{"modules": 2}, {"stop_end_of_source": 0}, {"stop_function_header": 1},
+			{"kind_record": 3}, {"skipped": 1, "modules": 2}, {"errors": 1, "modules": 2},
+		):
+			with self.subTest(updates=updates):
+				self.assertTrue(self.tree_prefix_problems(self.tree_prefix_output(updates=updates)))
+
+	def test_tree_prefix_skips_exactly_the_rejected_modules(self) -> None:
+		output = self.tree_prefix_output(
+			"tree-prefix-skipped a.brp | rejected by the existing parser",
+			updates={"modules": 2, "skipped": 1},
+		)
+		self.assertEqual(parity.parse_adapter_output(output).tree_prefix.skipped_paths, ["a.brp"])
+		self.assertEqual(self.tree_prefix_problems(output, expected_skipped={"a.brp"}), [])
+		self.assertTrue(self.tree_prefix_problems(output))
+		self.assertTrue(self.tree_prefix_problems(output, expected_skipped={"b.brp"}))
+		self.assertTrue(self.tree_prefix_problems(self.tree_prefix_output(), expected_skipped={"a.brp"}))
+
+	def test_tree_prefix_errors_name_the_module_stage_and_message(self) -> None:
+		output = self.tree_prefix_output(
+			"tree-prefix-error a.brp | projection | missing dimension literal token",
+			updates={"modules": 2, "errors": 1},
+		)
+		joined = "\n".join(self.tree_prefix_problems(output))
+		self.assertIn("a.brp", joined)
+		self.assertIn("projection", joined)
+		self.assertIn("missing dimension literal token", joined)
+
+	def test_tree_prefix_rejects_malformed_skip_error_and_difference_lines(self) -> None:
+		for line in (
+			"tree-prefix-skipped", "tree-prefix-skipped a.brp",
+			"tree-prefix-error", "tree-prefix-error a.brp | projection",
+			"tree-prefix-difference a.brp | f | decls[0].doc | old=x",
+		):
+			with self.subTest(line=line):
+				self.assertTrue(self.tree_prefix_problems(self.tree_prefix_output(line)))
+
+	def test_tree_prefix_rejects_unknown_error_stages(self) -> None:
+		output = self.tree_prefix_output(
+			"tree-prefix-error a.brp | unknown | missing dimension literal token",
+			updates={"modules": 2, "errors": 1},
+		)
+		problems = parity.parse_adapter_output(output).tree_prefix.problems
+		self.assertTrue(any("unreadable tree prefix error line" in problem for problem in problems))
+
+	def test_tree_prefix_completed_kind_counts_cannot_exceed_completed_declarations(self) -> None:
+		output = self.tree_prefix_output(updates={"declarations": 8})
+		problems = parity.parse_adapter_output(output).tree_prefix.problems
+		self.assertIn("tree prefix completed kind counts exceed completed declarations", problems)
+
+	def test_clean_tree_prefix_preview_coverage_matches_its_typed_stop(self) -> None:
+		for kind, stop in (
+			("function", "function_header"), ("trait", "trait_preview"),
+			("implementation", "implementation_preview"),
+		):
+			with self.subTest(kind=kind):
+				matched = {"stop_end_of_source": 0, f"stop_{stop}": 1, f"kind_{kind}": 1}
+				self.assertEqual(self.tree_prefix_problems(self.tree_prefix_output(updates=matched)), [])
+				for mismatched in ({f"kind_{kind}": 1}, {"stop_end_of_source": 0, f"stop_{stop}": 1}):
+					problems = parity.parse_adapter_output(self.tree_prefix_output(updates=mismatched)).tree_prefix.problems
+					self.assertTrue(any("coverage does not match" in problem for problem in problems))
+
+	def test_clean_tree_prefix_global_coverage_includes_remaining_typed_stops(self) -> None:
+		completed_and_stopped = {
+			"stop_end_of_source": 0,
+			"stop_global_initializer": 1,
+			"kind_constant_global": 1,
+			"kind_mutable_global": 1,
+		}
+		self.assertEqual(self.tree_prefix_problems(self.tree_prefix_output(updates=completed_and_stopped)), [])
+
+		missing_stop_coverage = {
+			"stop_end_of_source": 0,
+			"stop_global_initializer": 1,
+		}
+		problems = parity.parse_adapter_output(self.tree_prefix_output(updates=missing_stop_coverage)).tree_prefix.problems
+		self.assertTrue(any("coverage does not include" in problem for problem in problems))
+
+	def test_differing_tree_prefix_boundary_may_earn_no_preview_coverage(self) -> None:
+		output = self.tree_prefix_output(
+			"tree-prefix-difference a.brp | helper | stop.kind | old=function | new=trait",
+			updates={"differences": 1, "reported": 1, "stop_end_of_source": 0, "stop_trait_preview": 1},
+		)
+		self.assertEqual(parity.parse_adapter_output(output).tree_prefix.problems, [])
+		self.assertTrue(self.tree_prefix_problems(output))
+
+	def test_full_adapter_error_does_not_fail_a_clean_tree_prefix_report(self) -> None:
+		output = self.tree_prefix_output("adapter-error a.brp | the tables hold no row 3 of DefinitionTable")
+		self.assertTrue(self.adapter_problems(output))
+		self.assertEqual(self.tree_prefix_problems(output), [])
+
+	def test_tree_prefix_difference_values_preserve_escaped_separators(self) -> None:
+		output = self.tree_prefix_output(
+			'tree-prefix-difference a.brp | f | decls[0].doc | old="a \\| b" | new="a \\| new=c"',
+			updates={"differences": 1, "reported": 1},
+		)
+		report = parity.parse_adapter_output(output)
+		self.assertEqual(report.differences, [])
+		difference = report.tree_prefix.differences[0]
+		self.assertEqual((difference.old, difference.new), ('"a | b"', '"a | new=c"'))
+		self.assertTrue(self.tree_prefix_problems(output))
+
+	def test_tree_prefix_truncated_differences_still_fail(self) -> None:
+		output = self.tree_prefix_output(
+			"tree-prefix-difference a.brp | Point | decls[0].span.end | old=7 | new=9",
+			updates={"differences": 2, "reported": 1},
+		)
+		self.assertEqual(parity.parse_adapter_output(output).tree_prefix.problems, [])
+		self.assertTrue(self.tree_prefix_problems(output))
+		self.assertTrue(self.tree_prefix_problems(self.tree_prefix_output(updates={"differences": 1})))
+
+	def test_tree_prefix_rejects_inconsistent_reported_difference_counts(self) -> None:
+		line = "tree-prefix-difference a.brp | Point | decls[0].span.end | old=7 | new=9"
+		for updates in ({"differences": 1, "reported": 0}, {"differences": 0, "reported": 1}):
+			with self.subTest(updates=updates):
+				report = parity.parse_adapter_output(self.tree_prefix_output(line, updates=updates))
+				self.assertTrue(report.tree_prefix.problems)
+
+	def test_tree_prefix_run_that_compared_nothing_fails(self) -> None:
+		updates = {"modules": 0, "compared": 0, "declarations": 0, "stop_end_of_source": 0}
+		for kind in (
+			"import_block", "foreign_block", "record", "fixed_record",
+			"alias", "builtin_type", "resource_type", "union", "enum",
+		):
+			updates[f"kind_{kind}"] = 0
+		self.assertTrue(self.tree_prefix_problems(self.tree_prefix_output(updates=updates)))
+
+	def test_corpus_tree_prefix_requires_every_completed_declaration_kind(self) -> None:
+		for kind in (
+			"import_block", "foreign_block", "record", "fixed_record",
+			"alias", "builtin_type", "resource_type", "union", "enum",
+		):
+			with self.subTest(kind=kind):
+				output = self.tree_prefix_output(updates={f"kind_{kind}": 0})
+				self.assertEqual(self.tree_prefix_problems(output), [])
+				self.assertIn(kind, "\n".join(self.tree_prefix_problems(output, require_completed_kinds=True)))
+
+	def test_tree_prefix_rejects_missing_unknown_and_negative_kind_or_stop_counts(self) -> None:
+		for output in (
+			self.tree_prefix_output(omitted=("kind_fixed_record",)),
+			self.tree_prefix_output(omitted=("stop_end_of_source",)),
+			self.tree_prefix_output(extra=("kind_value_record=1",)),
+			self.tree_prefix_output(extra=("kind_struct=1",)),
+			self.tree_prefix_output(extra=("stop_unknown=1",)),
+			self.tree_prefix_output(updates={"kind_fixed_record": -1}),
+			self.tree_prefix_output(updates={"stop_end_of_source": -1}),
+		):
+			with self.subTest(output=output):
+				self.assertTrue(self.tree_prefix_problems(output))
+
+	def test_tree_prefix_rejected_and_nonprogressing_stops_fail_on_accepted_modules(self) -> None:
+		for stop in ("rejected_global_initializer", "rejected_declaration", "without_progress"):
+			with self.subTest(stop=stop):
+				output = self.tree_prefix_output(updates={"stop_end_of_source": 0, f"stop_{stop}": 1})
+				self.assertTrue(self.tree_prefix_problems(output))
+
+	def test_adapter_allowances_cannot_allow_tree_prefix_differences(self) -> None:
+		output = self.tree_prefix_output(
+			"tree-prefix-difference a.brp | helper | decls[0].function.doc | old=null | new=x",
+			updates={"differences": 1, "reported": 1},
+		)
+		entry = parity.AdapterDifference(r"decls\[\d+\]\.function\.doc", "a reason", declaration="helper")
+		used: set = set()
+		self.assertEqual(self.adapter_problems(output, (entry,), used), [])
+		self.assertEqual(used, set())
+		self.assertTrue(self.tree_prefix_problems(output))
+
 	def test_the_repository_lists_no_unexplained_adapter_difference(self) -> None:
 		for entry in parity.ADAPTER_DIFFERENCES:
 			self.assertTrue(entry.reason.strip())

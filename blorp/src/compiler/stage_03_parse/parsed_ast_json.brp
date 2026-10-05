@@ -62,7 +62,9 @@ import:
 			ParsedDebugOnlyAnnotation, ParsedNoCopyAnnotation,
 			ParsedResourceResultOrdinaryAnnotation, ParsedTailRecursiveAnnotation,
 		),
-		ParsedFunctionDecl,
+		ParsedFunctionDecl, ParsedFunctionHeader, parsed_function_header,
+		ParsedTraitMethodHeader, ParsedTraitHeader, ParsedImplHeader,
+		parsed_trait_method_header,
 		ParsedIdentifier,
 		ParsedImplDecl,
 		ParsedImportDecl,
@@ -103,7 +105,7 @@ import:
 		ParsedTypeParamDecl,
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		ParsedUnionDecl,
-		ParsedVarDecl,
+		ParsedVarDecl, ParsedVarHeader, parsed_var_header,
 		ParsedVariantDecl,
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
@@ -1198,40 +1200,77 @@ private pure func parsed_expr_to_json(render: AstJsonRender, expr: ParsedExpr) -
 			])
 
 
+-- The legacy declaration encoding puts its body between signature syntax and
+-- metadata. Keep both groups shared so the body-free encoding uses identical
+-- nested serializers without changing that established field order.
+private pure func parsed_function_header_json_fields(
+	render: AstJsonRender,
+	header: ParsedFunctionHeader,
+) -> (List[(String, JsonValue)], List[(String, JsonValue)]):
+	([
+		("name", parsed_identifier_to_json(render, header.name)),
+		("keyword_span", optional_source_location_to_json(render, header.keyword_span)),
+		("type_params", JsonVector(header.type_params.map(
+				func(item): parsed_type_param_decl_to_json(render, item),
+			))),
+		("params", JsonVector(header.params.map(
+				func(item): parsed_param_to_json(render, item),
+			))),
+		("return_type", option_type_expr_to_json(render, header.return_type)),
+		("dim_constraints", JsonVector(header.dim_constraints.map(
+				func(item): dim_constraint_to_json(render, item),
+			))),
+	], [
+		("is_pure", JsonBool(header.is_pure)),
+		("annotations", JsonVector(header.annotations.map(function_annotation_to_json))),
+		("doc", option_string_to_json(header.doc)),
+	])
+
+
+pure func parsed_function_header_to_json(
+	render: AstJsonRender,
+	header: ParsedFunctionHeader,
+) -> JsonValue:
+	(signature_fields, metadata_fields) = parsed_function_header_json_fields(render, header)
+	JsonObject(signature_fields.concat(metadata_fields))
+
+
 pure func parsed_function_decl_to_json(
 	render: AstJsonRender,
 	decl: ParsedFunctionDecl,
 ) -> JsonValue:
-	JsonObject([
-		("name", parsed_identifier_to_json(render, decl.name)),
-		("keyword_span", optional_source_location_to_json(render, decl.keyword_span)),
-		("type_params", JsonVector(decl.type_params.map(
-				func(item): parsed_type_param_decl_to_json(render, item),
-			))),
-		("params", JsonVector(decl.params.map(
-				func(item): parsed_param_to_json(render, item),
-			))),
-		("return_type", option_type_expr_to_json(render, decl.return_type)),
-		("dim_constraints", JsonVector(decl.dim_constraints.map(
-				func(item): dim_constraint_to_json(render, item),
-			))),
-		("body", option_expr_to_json(render, decl.body)),
-		("is_pure", JsonBool(decl.is_pure)),
-		("annotations", JsonVector(decl.annotations.map(function_annotation_to_json))),
-		("doc", option_string_to_json(decl.doc)),
-		("span", parsed_source_location_to_json(render, decl.span)),
+	(signature_fields, metadata_fields) = parsed_function_header_json_fields(render, parsed_function_header(decl))
+	JsonObject(signature_fields
+		.concat([("body", option_expr_to_json(render, decl.body))])
+		.concat(metadata_fields)
+		.append(("span", parsed_source_location_to_json(render, decl.span))))
+
+
+-- Preserve the legacy value field between the authored header syntax and
+-- metadata while sharing all body-independent mappings with header encoding.
+private pure func parsed_var_header_json_fields(
+	render: AstJsonRender, header: ParsedVarHeader,
+) -> (List[(String, JsonValue)], List[(String, JsonValue)]):
+	([
+		("name", parsed_identifier_to_json(render, header.name)),
+		("type", option_type_expr_to_json(render, header.type_expr)),
+	], [
+		("is_mutable", JsonBool(header.is_mutable)),
+		("doc", option_string_to_json(header.doc)),
 	])
+
+
+pure func parsed_var_header_to_json(render: AstJsonRender, header: ParsedVarHeader) -> JsonValue:
+	(syntax_fields, metadata_fields) = parsed_var_header_json_fields(render, header)
+	JsonObject(syntax_fields.concat(metadata_fields))
 
 
 pure func parsed_var_decl_to_json(render: AstJsonRender, decl: ParsedVarDecl) -> JsonValue:
-	JsonObject([
-		("name", parsed_identifier_to_json(render, decl.name)),
-		("type", option_type_expr_to_json(render, decl.type_expr)),
-		("value", parsed_expr_to_json(render, decl.value)),
-		("is_mutable", JsonBool(decl.is_mutable)),
-		("doc", option_string_to_json(decl.doc)),
-		("span", parsed_source_location_to_json(render, decl.span)),
-	])
+	(syntax_fields, metadata_fields) = parsed_var_header_json_fields(render, parsed_var_header(decl))
+	JsonObject(syntax_fields
+		.concat([("value", parsed_expr_to_json(render, decl.value))])
+		.concat(metadata_fields)
+		.append(("span", parsed_source_location_to_json(render, decl.span))))
 
 
 private pure func parsed_import_symbol_to_json(
@@ -1413,52 +1452,72 @@ pure func parsed_type_alias_decl_to_json(
 	])
 
 
-private pure func parsed_trait_method_decl_to_json(
-	render: AstJsonRender,
-	decl: ParsedTraitMethodDecl,
-) -> JsonValue:
-	JsonObject([
-		("name", parsed_identifier_to_json(render, decl.name)),
-		("params", JsonVector(decl.params.map(
-				func(item): parsed_param_to_json(render, item),
-			))),
-		("return_type", option_type_expr_to_json(render, decl.return_type)),
-		("body", option_expr_to_json(render, decl.body)),
-		("is_pure", JsonBool(decl.is_pure)),
-		("span", parsed_source_location_to_json(render, decl.span)),
-	])
+private pure func parsed_trait_method_header_json_fields(
+	render: AstJsonRender, header: ParsedTraitMethodHeader,
+) -> (List[(String, JsonValue)], List[(String, JsonValue)]):
+	([
+		("name", parsed_identifier_to_json(render, header.name)),
+		("params", JsonVector(header.params.map(func(item): parsed_param_to_json(render, item)))),
+		("return_type", option_type_expr_to_json(render, header.return_type)),
+	], [("is_pure", JsonBool(header.is_pure))])
 
 
-private pure func parsed_trait_decl_to_json(
-	render: AstJsonRender,
-	decl: ParsedTraitDecl,
-) -> JsonValue:
-	JsonObject([
-		("name", parsed_identifier_to_json(render, decl.name)),
-		("type_params", JsonVector(decl.type_params.map(
-				func(item): parsed_type_param_decl_to_json(render, item),
-			))),
-		("supertraits", JsonVector(decl.supertraits.map(
-				func(item): parsed_trait_reference_to_json(render, item),
-			))),
-		("methods", JsonVector(decl.methods.map(
-				func(item): parsed_trait_method_decl_to_json(render, item),
-			))),
-		("doc", option_string_to_json(decl.doc)),
-		("span", parsed_source_location_to_json(render, decl.span)),
-	])
+pure func parsed_trait_method_header_to_json(render: AstJsonRender, header: ParsedTraitMethodHeader) -> JsonValue:
+	(signature_fields, metadata_fields) = parsed_trait_method_header_json_fields(render, header)
+	JsonObject(signature_fields.concat(metadata_fields))
+
+
+private pure func parsed_trait_method_decl_to_json(render: AstJsonRender, decl: ParsedTraitMethodDecl) -> JsonValue:
+	(signature_fields, metadata_fields) = parsed_trait_method_header_json_fields(render, parsed_trait_method_header(decl))
+	JsonObject(signature_fields.concat([("body", option_expr_to_json(render, decl.body))])
+		.concat(metadata_fields).append(("span", parsed_source_location_to_json(render, decl.span))))
+
+
+private pure func parsed_trait_header_json_fields(
+	render: AstJsonRender, name: ParsedIdentifier, type_params: List[ParsedTypeParamDecl],
+	supertraits: List[ParsedTraitReference], methods: List[JsonValue], doc: Option[String],
+) -> List[(String, JsonValue)]:
+	[
+		("name", parsed_identifier_to_json(render, name)),
+		("type_params", JsonVector(type_params.map(func(item): parsed_type_param_decl_to_json(render, item)))),
+		("supertraits", JsonVector(supertraits.map(func(item): parsed_trait_reference_to_json(render, item)))),
+		("methods", JsonVector(methods)),
+		("doc", option_string_to_json(doc)),
+	]
+
+
+pure func parsed_trait_header_to_json(render: AstJsonRender, header: ParsedTraitHeader) -> JsonValue:
+	JsonObject(parsed_trait_header_json_fields(render, header.name, header.type_params, header.supertraits,
+		header.methods.map(func(item): parsed_trait_method_header_to_json(render, item)), header.doc))
+
+
+private pure func parsed_trait_decl_to_json(render: AstJsonRender, decl: ParsedTraitDecl) -> JsonValue:
+	JsonObject(parsed_trait_header_json_fields(render, decl.name, decl.type_params, decl.supertraits,
+		decl.methods.map(func(item): parsed_trait_method_decl_to_json(render, item)), decl.doc)
+		.append(("span", parsed_source_location_to_json(render, decl.span))))
+
+
+private pure func parsed_impl_header_json_fields(
+	render: AstJsonRender, trait_name: ParsedIdentifier, for_type: ParsedTypeExpr,
+	methods: List[JsonValue], doc: Option[String],
+) -> List[(String, JsonValue)]:
+	[
+		("trait_name", parsed_identifier_to_json(render, trait_name)),
+		("for_type", parsed_type_expr_to_json(render, for_type)),
+		("methods", JsonVector(methods)),
+		("doc", option_string_to_json(doc)),
+	]
+
+
+pure func parsed_impl_header_to_json(render: AstJsonRender, header: ParsedImplHeader) -> JsonValue:
+	JsonObject(parsed_impl_header_json_fields(render, header.trait_name, header.for_type,
+		header.methods.map(func(item): parsed_function_header_to_json(render, item)), header.doc))
 
 
 pure func parsed_impl_decl_to_json(render: AstJsonRender, decl: ParsedImplDecl) -> JsonValue:
-	JsonObject([
-		("trait_name", parsed_identifier_to_json(render, decl.trait_name)),
-		("for_type", parsed_type_expr_to_json(render, decl.for_type)),
-		("methods", JsonVector(decl.methods.map(
-				func(item): parsed_function_decl_to_json(render, item),
-			))),
-		("doc", option_string_to_json(decl.doc)),
-		("span", parsed_source_location_to_json(render, decl.span)),
-	])
+	JsonObject(parsed_impl_header_json_fields(render, decl.trait_name, decl.for_type,
+		decl.methods.map(func(item): parsed_function_decl_to_json(render, item)), decl.doc)
+		.append(("span", parsed_source_location_to_json(render, decl.span))))
 
 
 private pure func with_kind(fields: List[(String, JsonValue)], kind: String) -> JsonValue:

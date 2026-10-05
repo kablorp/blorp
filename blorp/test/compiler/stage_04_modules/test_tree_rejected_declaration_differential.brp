@@ -1,0 +1,155 @@
+-- The old compiler belongs only in this outer differential boundary.
+import:
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, current_kind, current_span, position, diagnostics, issued_counts
+	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: parse_declaration_preview, DeclarationPreviewParse(RejectedDeclarationPreview)
+	../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(ExpectedToken)
+	../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName), NameConstruct(NameInTraitName)
+	../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(LeftBraceSymbol)
+	../tools/tree_rejected_declaration_differential: rejected_declaration_diagnostics_match, rejected_declaration_table_diagnostics_match
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/tree_rejected_declaration_scan:
+		RejectedDeclarationScan(CompleteDeclarationRejection, NoDeclarationRejection, DeferredDeclarationRejection),
+		DeferredRejectionOwner(FunctionBodyOwner, TraitBodyOwner, ImplementationBodyOwner, GlobalInitializerOwner),
+		scan_rejected_declarations
+	../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/lib/source: source_file
+	../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render: render_rejected_diagnostics
+	../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
+	test: TestSuite
+
+
+pure func test_complete_leaf_rejections_compare_all_messages_help_and_locations() -> Bool:
+	var correct: Bool = True
+	for text in [
+		"record R { item: Int, item: Int }",
+		"fixed record R[T] { item: T, item: T }",
+		"fixed record R { item: Int, item: Int }",
+		"type alias A =",
+		"opaque type A =",
+		"type T = builtin(\"wrong\")",
+		"resource type T = builtin(42)",
+		"enum E:\n\tA()",
+		"union U:\n\tA(",
+		"record R { if: Int, item Int, item: Int }",
+		"foreign:\n\tfunc f(\n",
+		"import:\n\ta/./b\n",
+	]:
+		correct = correct and rejected_declaration_table_diagnostics_match(text)
+	correct
+
+
+pure func test_recovery_compares_later_declarations_in_diagnostic_order() -> Bool:
+	text: String = "record R { item: Int, item: Int }\nrecord S { value: Int, value: Int }\ntype alias A =\n"
+	match scan_rejected_declarations(lex_module(module_id_at_row(0), text)):
+		Ok(CompleteDeclarationRejection(rejected)):
+			rejected.rejected_diagnostics().length() == 3 and rejected_declaration_table_diagnostics_match(text)
+		_:
+			False
+
+
+private pure func deferred(text: String, wanted: DeferredRejectionOwner) -> Bool:
+	match scan_rejected_declarations(lex_module(module_id_at_row(0), text)):
+		Ok(DeferredDeclarationRejection(actual)):
+			actual == wanted and not rejected_declaration_diagnostics_match(text)
+		_:
+			False
+
+
+pure func test_deferred_owners_never_count_as_rejected_tree_proof() -> Bool:
+	(deferred("record R { item: Int, item: Int }\nfunc f(): bad +", FunctionBodyOwner)
+		and deferred("trait T:\n\tfunc f(): bad +", TraitBodyOwner)
+		and deferred("implements T for Int:\n\tfunc f(): bad +", ImplementationBodyOwner)
+		and deferred("value = bad +", GlobalInitializerOwner))
+
+
+-- Parameter rejection stops this leaf before fields. The omitted field parser
+-- leaves an identifier that the whole-source scanner must treat as a deferred
+-- initializer owner; it cannot claim full tree/table diagnostic parity.
+pure func test_malformed_fixed_bound_preserves_leaf_stop_and_deferred_proof() -> Bool:
+	text: String = "fixed record R[T:] { item: Int }"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(state, result) = parse_declaration_preview(entry)
+			match (result, state.diagnostics()):
+				(RejectedDeclarationPreview, [missing_bound]):
+					match missing_bound.diagnostic:
+						ExpectedToken(ExpectedName(NameInTraitName)):
+							(state.position() == 7 and state.current_kind() == LeftBraceSymbol
+								and state.current_span().span_start() == 19 and state.current_span().span_end() == 20
+								and missing_bound.span.span_start() == 17 and missing_bound.span.span_end() == 17
+								and state.issued_counts().type_binders == 1 and state.issued_counts().name_uses == 1
+								and state.issued_counts().written_types == 0 and state.issued_counts().dimensions == 0
+								and deferred(text, GlobalInitializerOwner) and not rejected_declaration_table_diagnostics_match(text))
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_accepted_leaf_source_is_not_rejection_evidence() -> Bool:
+	match scan_rejected_declarations(lex_module(module_id_at_row(0), "record R {}\nrecord S {}")):
+		Ok(NoDeclarationRejection):
+			not rejected_declaration_diagnostics_match("record R {}\nrecord S {}")
+		_:
+			False
+
+
+-- Deliberate legacy/stage differences are pinned as full payloads, not
+-- accepted by a count or a message normalization rule.
+pure func test_legacy_added_help_is_an_explicit_baseline_difference() -> Bool:
+	text: String = "type alias A ="
+	old = parse_compiler_source(source_file("rejected.brp", "main", text))
+	match (old.diagnostics, scan_rejected_declarations(lex_module(module_id_at_row(0), text))):
+		([legacy], Ok(CompleteDeclarationRejection(rejected))):
+			match render_rejected_diagnostics(rejected):
+				Ok([tree]):
+					(legacy.message == "expected type" and legacy.help == None
+						and legacy.span.start_offset == 14 and legacy.span.end_offset == 14
+						and legacy.span.start_line == 1 and legacy.span.start_column == 15
+						and tree.rendered.message == "expected type"
+						and tree.rendered.help == Some("write a type such as `Int` or `List[String]`")
+						and tree.span.span_start() == 14 and tree.span.span_end() == 14 and tree.line == 1 and tree.column == 15
+						and rejected_declaration_table_diagnostics_match(text) and not rejected_declaration_diagnostics_match(text))
+				_:
+					False
+		_:
+			False
+
+
+pure func test_legacy_inline_advice_is_an_explicit_baseline_difference() -> Bool:
+	text: String = "record R { if: Int }"
+	old = parse_compiler_source(source_file("rejected.brp", "main", text))
+	match (old.diagnostics, scan_rejected_declarations(lex_module(module_id_at_row(0), text))):
+		([legacy], Ok(CompleteDeclarationRejection(rejected))):
+			match render_rejected_diagnostics(rejected):
+				Ok([tree]):
+					(legacy.message == "`if` is a reserved keyword and cannot be used as a name; choose another identifier such as `if_name`" and legacy.help == None
+						and legacy.span.start_offset == 11 and legacy.span.end_offset == 13 and legacy.span.start_line == 1 and legacy.span.start_column == 12
+						and tree.rendered.message == "`if` is a reserved keyword and cannot be used as a name"
+						and tree.rendered.help == Some("choose another identifier such as `if_name`")
+						and tree.span.span_start() == 11 and tree.span.span_end() == 11 and tree.line == 1 and tree.column == 12
+						and rejected_declaration_table_diagnostics_match(text) and not rejected_declaration_diagnostics_match(text))
+				_:
+					False
+		_:
+			False
+
+
+pure func test_duplicate_fields_also_match_legacy_exactly() -> Bool:
+	rejected_declaration_diagnostics_match("record R { item: Int, item: Int }")
+
+
+tests: TestSuite = {
+	description = "Tree rejected declaration differential",
+	tests = [
+		("malformed fixed bound pins deferred proof boundary", test_malformed_fixed_bound_preserves_leaf_stop_and_deferred_proof),
+		("added help baseline difference is exact", test_legacy_added_help_is_an_explicit_baseline_difference),
+		("inline advice baseline difference is exact", test_legacy_inline_advice_is_an_explicit_baseline_difference),
+		("duplicate fields match raw legacy diagnostics", test_duplicate_fields_also_match_legacy_exactly),
+		("completed leaf rejections compare all diagnostic fields", test_complete_leaf_rejections_compare_all_messages_help_and_locations),
+		("recovery compares later declarations in diagnostic order", test_recovery_compares_later_declarations_in_diagnostic_order),
+		("deferred owners never count as tree rejection proof", test_deferred_owners_never_count_as_rejected_tree_proof),
+		("accepted leaf source is not rejection evidence", test_accepted_leaf_source_is_not_rejection_evidence)
+	]
+}

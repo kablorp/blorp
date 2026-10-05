@@ -1,0 +1,111 @@
+-- Trait method headers and lexical evidence for default bodies. M4 owns
+-- body trees and expression diagnostics; these previews mint no method IDs.
+import:
+	../syntax/declarations: Signature
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../tables/diagnostic_code: PlainSyntaxCode(MissingFunctionBodyDiagnostic)
+	../tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedKeyword), KeywordConstruct(KeywordInTraitMethodName),
+		NameConstruct(NameInTraitMethodName), LeftParenConstruct(LeftParenInTraitMethodName)
+	../tables/row_kinds: Purity(PureFunction, ImpureFunction)
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(PureKeyword, FuncKeyword, ArrowSymbol, ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
+	parse_state:
+		ParseState, diagnostic_count, current_kind, current_span, advanced, peek_kind, span_start_line,
+		expect_token, consume_declared_name, report_diagnostic
+	tree_parameter_parser: ParametersParse(ParsedParameters), parse_parenthesized_parameters
+	tree_type_parser: parse_type
+	tree_function_header_parser:
+		DeferredBody, FunctionBodyExtent(ForwardDeclaration, SkippedBody), skip_deferred_body
+
+
+record TraitMethodHeader {
+	signature: Signature,
+	span: Span
+}
+
+
+union MethodBodyExtent:
+	AbstractMethod
+	SkippedDefaultBody(DeferredBody)
+
+
+record TraitMethodHeaderPreview {
+	header: TraitMethodHeader,
+	body_extent: MethodBodyExtent
+}
+
+
+union TraitMethodHeaderParse:
+	ParsedTraitMethodHeader(TraitMethodHeaderPreview)
+	RejectedTraitMethodHeader
+
+
+pure func parse_trait_method_header(state: ParseState) -> (ParseState, TraitMethodHeaderParse):
+	before: Int = state.diagnostic_count()
+	start: Span = state.current_span()
+	purity: Purity = if state.current_kind() == PureKeyword:
+		PureFunction
+	else:
+		ImpureFunction
+	before_keyword: ParseState = if purity == PureFunction:
+		state.advanced()
+	else:
+		state
+	keyword: Span = before_keyword.current_span()
+	before_name: ParseState = before_keyword.expect_token(FuncKeyword, ExpectedKeyword(KeywordInTraitMethodName))
+	name_position: Span = before_name.current_span()
+	(after_name, name) = before_name.consume_declared_name(NameInTraitMethodName)
+	(after_parameters, parameters) = parse_parenthesized_parameters(after_name, LeftParenInTraitMethodName)
+	(after_return, return_type) = if after_parameters.current_kind() == ArrowSymbol:
+		(parsed, written) = parse_type(after_parameters.advanced())
+		(parsed, Some(written))
+	else:
+		(after_parameters, None)
+	header_end: Span = match return_type:
+		Some(written):
+			written.span
+		None:
+			name_position
+
+	var out: ParseState = after_return
+	var body_extent: MethodBodyExtent = AbstractMethod
+
+	-- An authored colon promises a body. This is the frozen body-follows
+	-- predicate, applied before the lexical scanner consumes any body tokens.
+	if out.current_kind() == ColonSymbol:
+		colon_line: Int = out.span_start_line(out.current_span())
+		out = out.advanced()
+		body_follows: Bool = if out.current_kind() == EndOfFileToken or out.current_kind() == DedentToken:
+			False
+		else if out.current_kind() == NewlineToken:
+			out.peek_kind(1) == IndentToken
+		else:
+			out.span_start_line(out.current_span()) <= colon_line
+
+		if body_follows:
+			(after_body, body) = skip_deferred_body(out, start)
+			out = after_body
+
+			match body:
+				SkippedBody(body):
+					body_extent = SkippedDefaultBody(body)
+				ForwardDeclaration:
+					out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
+		else:
+			out = out.report_diagnostic(name_position, Plain(MissingFunctionBodyDiagnostic))
+
+	if out.diagnostic_count() != before:
+		(out, RejectedTraitMethodHeader)
+	else:
+		match (name, parameters):
+			(Some(name), ParsedParameters(parameters, _)):
+				(out, ParsedTraitMethodHeader({
+					header = {
+						signature = { purity = purity, keyword = keyword, name = name, parameters = parameters, return_type = return_type },
+						span = start.span_covering(header_end)
+					},
+					body_extent = body_extent
+				}))
+			_:
+				(out, RejectedTraitMethodHeader)

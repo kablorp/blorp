@@ -1,0 +1,160 @@
+-- One module's spellings: the names its lexer meets, each interned once, and
+-- the id each is known by.
+--
+-- A module interns its own spellings, so lexing one module reads nothing that
+-- another module's lexing wrote (`docs/DISCOVERY_REDESIGN.md`, sections 3.2
+-- and 5.1). The program-wide name table is built later, from these.
+--
+import:
+	../tables/ids: ModuleId, module_id_index
+	../tables/intern_index:
+		INITIAL_SLOT_COUNT,
+		NO_ROW,
+		empty_slots,
+		find_slice,
+		slice_hash,
+		slots_with_row,
+	ids: SpellingId, spelling_id, spelling_index, spelling_module
+
+
+---
+One module's spellings, interned as the lexer meets them. `interned_spelling`
+is the only mutator; a slice that is already present adds no text. Today every
+call, hit or miss, allocates its result tuple, and a miss copies the table's
+lists (`docs/issues/interning-copies-table-and-allocates-tuple.md`). The slot
+index (open addressing over the texts' hashes) is private and cannot disagree
+with the texts.
+---
+opaque type Spellings = InternedSpellings
+
+
+private record InternedSpellings {
+	module: ModuleId,
+	texts: List[String],
+	slots: List[Int]
+}
+
+
+---
+The spellings of `module` before its lexer has met any name. Keywords are
+classified independently; a keyword spelling is added only if the parser
+later reads that keyword as a name.
+---
+pure func new_spellings(module: ModuleId) -> Spellings:
+	into_opaque Spellings({
+			module = module,
+			texts = [],
+			slots = empty_slots(INITIAL_SLOT_COUNT)
+		})
+
+
+---
+The module that owns this vocabulary, including when it is empty.
+---
+pure func spellings_module(spellings: Spellings) -> ModuleId:
+	from_opaque Spellings(spellings).module
+
+
+---
+How many distinct spellings the module has met.
+---
+pure func spelling_count(spellings: Spellings) -> Int:
+	from_opaque Spellings(spellings).texts.length()
+
+
+---
+The module's spellings with the spelling `source` has at `start .. end`
+interned, and its id: the one the module already gave it, with the table
+unchanged, or the next the module hands out, with its text appended. One call
+with no precondition, so a spelling cannot be added twice or under an id that
+names another.
+---
+pure func interned_spelling(
+	spellings: Spellings,
+	source: String,
+	start: Int,
+	end: Int,
+) -> (Spellings, SpellingId):
+	state: InternedSpellings = from_opaque Spellings(spellings)
+	hash: Int = slice_hash(source, start, end)
+	found: Int = find_slice(state.texts, state.slots, source, start, end, hash)
+
+	if found == NO_ROW:
+		row: Int = state.texts.length()
+		(
+			into_opaque Spellings(with_text_appended(state, source, start, end, hash)),
+			spelling_id(state.module, row),
+		)
+	else:
+		(spellings, spelling_id(state.module, found))
+
+
+---
+`state` with the text `source` has at `start .. end` (of hash `hash`) appended
+and indexed. The update is its own function of `state` alone, so that the one
+reference to the texts and slots is handed on and both lists grow in place.
+---
+private pure func with_text_appended(
+	state: InternedSpellings,
+	source: String,
+	start: Int,
+	end: Int,
+	hash: Int,
+) -> InternedSpellings:
+	row: Int = state.texts.length()
+	-- One record update that reads only the fields it replaces.
+	{ state |
+		slots = slots_with_row(state.slots, row, hash, row + 1),
+		texts = state.texts.append(source.substring(start, end - start))
+	}
+
+
+---
+The id of the spelling `source` has at `start .. end`, or `None` when the
+module has not met it. Allocates no text and changes nothing.
+---
+pure func find_spelling(
+	spellings: Spellings,
+	source: String,
+	start: Int,
+	end: Int,
+) -> Option[SpellingId]:
+	state: InternedSpellings = from_opaque Spellings(spellings)
+	found: Int = find_slice(
+		state.texts,
+		state.slots,
+		source,
+		start,
+		end,
+		slice_hash(source, start, end),
+	)
+
+	if found == NO_ROW:
+		None
+	else:
+		Some(spelling_id(state.module, found))
+
+
+---
+The text of the spelling at `index`, or `None` when the module has no such
+spelling.
+---
+pure func spelling_text_at(spellings: Spellings, index: Int) -> Option[String]:
+	from_opaque Spellings(spellings).texts.get(index)
+
+
+---
+The text of `spelling`, or `None` when it is not one of these spellings: another
+module's, or past the last one this module interned.
+---
+pure func spelling_text(spellings: Spellings, spelling: SpellingId) -> Option[String]:
+	state: InternedSpellings = from_opaque Spellings(spellings)
+
+	if (
+		spelling
+			.spelling_module()
+			.module_id_index() == state.module.module_id_index()
+	):
+		state.texts.get(spelling.spelling_index())
+	else:
+		None

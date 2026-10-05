@@ -1,0 +1,89 @@
+-- A standalone alias preview owns its declaration and lexical evidence.
+-- It does not publish a completed module or route production parsing.
+import:
+	../lex/lexed_module: LexedModule
+	../syntax/declarations: AliasDeclaration, AliasForm(TransparentAlias, OpaqueAlias)
+	../tables/row_kinds: Visibility(PublicVisibility)
+	../tables/token:
+		TokenKind(TypeKeyword, AliasKeyword, OpaqueKeyword, NewlineToken, EndOfFileToken),
+	parse_state:
+		ParseInputError,
+		ParseState,
+		advanced,
+		current_kind,
+		current_span,
+		diagnostic_count,
+		diagnostics,
+		new_parse_state,
+		peek_kind,
+	preview_source: PreviewSource, preview_source
+	rejected_preview: RejectedPreview, reject_preview
+	tree_alias_parser: AliasParse(ParsedAlias, RejectedAlias), parse_alias
+
+
+opaque type AliasPreview = PreviewContents
+
+
+private record PreviewContents {
+	declaration: AliasDeclaration,
+	source: PreviewSource
+}
+
+
+union AliasPreviewOutcome:
+	PreviewedAlias(AliasPreview)
+	RejectedAliasPreview(RejectedPreview)
+	UnsupportedAliasPreview
+
+
+pure func alias_declaration(preview: AliasPreview) -> AliasDeclaration:
+	from_opaque AliasPreview(preview).declaration
+
+
+pure func alias_source(preview: AliasPreview) -> PreviewSource:
+	from_opaque AliasPreview(preview).source
+
+
+pure func preview_alias(lexed: LexedModule) -> Result[AliasPreviewOutcome, ParseInputError]:
+	state ?= new_parse_state(lexed)
+
+	if state.diagnostic_count() != 0:
+		rejected ?= reject_preview(state)
+		Ok(RejectedAliasPreview(rejected))
+	else:
+		form: Option[AliasForm] = if state.current_kind() == OpaqueKeyword:
+			Some(OpaqueAlias)
+		else if state.current_kind() == TypeKeyword and state.peek_kind(1) == AliasKeyword:
+			Some(TransparentAlias)
+		else:
+			None
+
+		match form:
+			None:
+				Ok(UnsupportedAliasPreview)
+			Some(form):
+				(parsed_state, result) = parse_alias(
+					state.advanced(),
+					PublicVisibility,
+					None,
+					state.current_span(),
+					form,
+				)
+
+				match result:
+					RejectedAlias:
+						rejected ?= reject_preview(parsed_state)
+						Ok(RejectedAliasPreview(rejected))
+					ParsedAlias(declaration):
+						var end: ParseState = parsed_state
+
+						while end.current_kind() == NewlineToken:
+							end = end.advanced()
+
+						if end.current_kind() != EndOfFileToken:
+							Ok(UnsupportedAliasPreview)
+						else:
+							Ok(PreviewedAlias(into_opaque AliasPreview({
+											declaration = declaration,
+											source = preview_source(lexed)
+										})))

@@ -1,14 +1,23 @@
+-- Measurements: benchmarks/results/discovery_merge_allocations_2026-10-04.md
 -- Exact per-family pins guard builder threading with managed discovery rows.
 -- The fixed tolerance remains far below one extra copy per 2,000 repeats;
 -- larger admitted row costs do not increase tolerated table-copy traffic.
 import:
-	../../support/raw_rows: append_definition
-	../../../../src/compiler_new/stage_01_discovery/pipeline: load_module
-	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
-		ModulePlacement(InUserCode),
+	../../../../src/compiler_new/stage_01_discovery/lex/lexed_module: LexedModule
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser:
+		parse_module_declarations,
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission:
+		admit_source_with_line_starts,
 	../../../../src/compiler_new/stage_01_discovery/tables/builder:
 		DiscoveryBuilder,
+		ModuleOpening,
+		close_module,
 		empty_discovery_builder,
+		next_module_id,
+		open_module,
+		opened_module,
 	../../../../src/compiler_new/stage_01_discovery/tables/ids:
 		module_id_at_row,
 		name_id_at_row,
@@ -22,6 +31,7 @@ import:
 		ModuleReach(RootModule),
 		Visibility(PublicVisibility),
 	../../../../src/compiler_new/stage_01_discovery/tables/span: pack_span
+	../../support/raw_rows: append_definition
 	memory:
 		MemoryCounter(ManagedAllocations, MemoryStatsActive, OracleStatsActive),
 		read_memory_counter,
@@ -52,30 +62,33 @@ pure func repeated_text(prefix: String, item: String) -> String:
 ---
 The allocations parsing `text` as a module made, or `None` when the parse
 rejected it or lost its repeated items: either would pass a budget vacuously.
+Lexing and bridging the module happen before the counters reset: the budget
+guards the parser's builder threading, and the lexer is a pure function whose
+own allocations `test_lexer_allocations` pins.
 ---
 func parse_allocations(text: String) -> Option[Int]:
-	reset_mem_stats()
-	active_before = read_memory_counter(MemoryStatsActive)
-	oracle_before = read_memory_counter(OracleStatsActive)
-	builder: DiscoveryBuilder = load_module(
-		empty_discovery_builder(),
-		{
-			path = "budget.brp",
-			trusted_directory = ".",
-			placement = InUserCode
-		},
-		RootModule,
+	empty: DiscoveryBuilder = empty_discovery_builder()
+	lexed: LexedModule = lex_module(empty.next_module_id(), text)
+	admitted: DiscoveryBuilder = empty.admit_source_with_line_starts(
+		"budget.brp",
 		text,
+		lexed.line_starts,
 	)
+	opening: ModuleOpening = admitted.open_module(UserModule, RootModule)
+	prepared: DiscoveryBuilder = admitted.bridge_lexed_module(lexed)
+	reset_mem_stats()
+	active_before = read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
+	builder: DiscoveryBuilder = prepared
+		.parse_module_declarations(opening.opened_module())
+		.close_module(opening)
+	allocations = read_memory_counter(ManagedAllocations)
+
 	if (
-		builder.diagnostics.length() == 0
-		and builder.tokens.length() > REPEATS
-		and active_before == 1
-		and oracle_before == 1
-		and read_memory_counter(MemoryStatsActive) == 1
+		active_before and read_memory_counter(MemoryStatsActive) == 1
 		and read_memory_counter(OracleStatsActive) == 1
+		and builder.diagnostics.length() == 0 and builder.tokens.length() > REPEATS
 	):
-		Some(read_memory_counter(ManagedAllocations))
+		Some(allocations)
 	else:
 		None
 
@@ -103,6 +116,8 @@ an allocation goes away.
 func family_allocates(prefix: String, item: String, expected_allocations: Int) -> Bool:
 	match parse_allocations(repeated_text(prefix, item)):
 		Some(allocations):
+			if allocations <= expected_allocations - EXACT_TOLERANCE or allocations >= expected_allocations + EXACT_TOLERANCE:
+				print("parser allocation pin: expected=${expected_allocations} actual=${allocations}")
 			(
 				allocations > expected_allocations - EXACT_TOLERANCE
 				and allocations < expected_allocations + EXACT_TOLERANCE
@@ -118,59 +133,150 @@ func statement_family_allocates(statement: String, expected_allocations: Int) ->
 	family_allocates("func f(a, b, c, x):\n", statement, expected_allocations)
 
 
+---
+The allocations bridging `text`, lexed before the counters reset, into a
+builder made, or `None` when the counters did not run or the bridge lost the
+repeated tokens: either would pass a budget vacuously.
+---
+func bridge_allocations(text: String) -> Option[Int]:
+	empty: DiscoveryBuilder = empty_discovery_builder()
+	lexed: LexedModule = lex_module(empty.next_module_id(), text)
+	admitted: DiscoveryBuilder = empty.admit_source_with_line_starts(
+		"budget.brp",
+		text,
+		lexed.line_starts,
+	)
+	reset_mem_stats()
+	active_before = read_memory_counter(MemoryStatsActive) == 1 and read_memory_counter(OracleStatsActive) == 1
+	bridged: DiscoveryBuilder = admitted.bridge_lexed_module(lexed)
+	allocations = read_memory_counter(ManagedAllocations)
+
+	if (
+		active_before and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and allocations > 0 and bridged.tokens.length() > REPEATS
+	):
+		Some(allocations)
+	else:
+		None
+
+
+---
+What bridging a module may allocate beyond `allocations_per_repeat` for each
+repeat of its item: the builder's tables growing and the module's setup.
+A builder or table copied per repeat adds at least one allocation to every
+repeat, `REPEATS` in all, far above this.
+---
+BRIDGE_SETUP_ALLOWANCE: Int = 100
+
+
+---
+Whether bridging `item` repeated `REPEATS` times allocates `allocations_per_repeat`
+for each repeat, give or take `BRIDGE_SETUP_ALLOWANCE` for table growth: names and
+literals the builder has met allocate nothing, and what an item does allocate
+is a count per use that the item's test explains.
+---
+func bridging_allocates_per_repeat(item: String, allocations_per_repeat: Int) -> Bool:
+	match bridge_allocations(repeated_text("", item)):
+		Some(allocations):
+			if allocations < allocations_per_repeat * REPEATS or allocations >= allocations_per_repeat * REPEATS + BRIDGE_SETUP_ALLOWANCE:
+				print("bridge allocation pin ${item}: expected_per_repeat=${allocations_per_repeat} actual=${allocations}")
+			(
+				allocations >= allocations_per_repeat * REPEATS
+				and allocations < allocations_per_repeat * REPEATS + BRIDGE_SETUP_ALLOWANCE
+			)
+		None:
+			False
+
+
+-- Five rewritten identifier/dimension tokens per repeat; seeded spellings
+-- contribute setup costs rather than a copied spelling table per occurrence.
+func test_bridging_repeated_names_copies_no_table() -> Bool:
+	bridging_allocates_per_repeat("alpha beta alpha #Rows beta\n", 5)
+
+
+-- Six rewritten name/literal tokens per repeat; repeated literals reuse
+-- their interned texts. No other token must be reconstructed.
+func test_bridging_repeated_literals_copies_no_table() -> Bool:
+	bridging_allocates_per_repeat("x = 1 + 2.5 + 1 + \"text\" + \"text\"\n", 6)
+
+
+-- Four per rejected number: the name token, two rejected-token updates
+-- (kind then literal payload), and the diagnostic row. Both rejection
+-- families share this path; the rejected digits are interned only once.
+func test_bridging_repeated_rejected_integers_copies_no_table() -> Bool:
+	bridging_allocates_per_repeat("x = 170141183460469231731687303715884105728\n", 4)
+
+
+-- The same four-product rejection path as integers.
+func test_bridging_repeated_rejected_floats_copies_no_table() -> Bool:
+	bridging_allocates_per_repeat("x = 1" + "0".repeat(400) + ".5\n", 4)
+
+
+-- Ten per interpolated string: eight bridged piece/interpolation products
+-- plus two rewritten tokens (the binding name and the interpolation token).
+func test_bridging_repeated_interpolations_copies_no_table() -> Bool:
+	-- The `${` is split across two literals so this file does not interpolate it.
+	bridging_allocates_per_repeat("y = \"a $" + "{a} b $" + "{b + c}\"\n", 10)
+
+
 func test_parsing_repeated_expression_statements_copies_no_table() -> Bool:
-	statement_family_allocates("\tx = a + b * c\n", 58152)
+	statement_family_allocates("\tx = a + b * c\n", 34086)
 
 func test_parsing_repeated_blocks_and_calls_copies_no_table() -> Bool:
-	statement_family_allocates("\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n", 150159)
+	statement_family_allocates("\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n", 76088)
 
 func test_parsing_repeated_matches_and_patterns_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tx = match a:\n\t\tSome(v) | Other(v): v\n\t\t(l, 1): l\n\t\t[h, ...t]: h\n\t\t_: b\n",
-		262172,
+		134092,
 	)
 
 func test_parsing_repeated_selects_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tselect:\n\t\tv from a:\n\t\t\tv\n\t\tsealed b:\n\t\t\tx\n\t\t_ after 5:\n\t\t\tc\n",
-		170163,
+		90088,
 	)
 
 func test_parsing_repeated_concurrent_blocks_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tconcurrent(timeout: 100, max_threads: 2):\n\t\tl = f(a)\n\t\tr = f(b)\n\tfor p in a concurrently(limit: 4):\n\t\tf(p)\n",
-		290174,
+		148094,
 	)
 
 
 func test_parsing_repeated_lambdas_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\ty = func(p, q: Int) -> Int: p + q\n\tz = pure func(p):\n\t\tw = p\n\t\tw\n",
-		206168,
+		106091,
 	)
 
+
+-- Current managed-record TestSuite measurements are recorded in the ledger above.
 func test_parsing_repeated_interpolations_copies_no_table() -> Bool:
 	-- The `${` is split across two literals so this file does not interpolate it.
-	statement_family_allocates("\ty = \"a $" + "{a} b $" + "{b + c}\"\n", 164192)
+	statement_family_allocates("\ty = \"a $" + "{a} b $" + "{b + c}\"\n", 116090)
 
 
 func test_parsing_repeated_record_literals_and_updates_copies_no_table() -> Bool:
-	statement_family_allocates("\ty = {k = a, m = b}\n\tz = {y | k = c, m = a}\n", 166165)
+	statement_family_allocates("\ty = {k = a, m = b}\n\tz = {y | k = c, m = a}\n", 84092)
 
 func test_parsing_repeated_loops_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tfor i in 0..a:\n\t\tf(i)\n\twhile a > b:\n\t\tbreak\n\tfor (k, v) in c:\n\t\tcontinue\n",
-		238160,
+		132082,
 	)
 
 func test_parsing_repeated_question_binds_copies_no_table() -> Bool:
-	statement_family_allocates("\tv ?= f(a)\n\tvar w = v\n\tw += 1\n", 102163)
+	statement_family_allocates("\tv ?= f(a)\n\tvar w = v\n\tw += 1\n", 52090)
 
+
+-- Current managed-record TestSuite measurements are recorded in the ledger above.
 func test_parsing_repeated_function_declarations_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"---\nAdds.\n---\npure func g[T: Orderable](p: T, q: Int[#N]) -> List[T] where #N == 3:\n\tp\n\n\n",
-		232226,
+		112168,
 	)
 
 
@@ -178,54 +284,54 @@ func test_parsing_repeated_type_declarations_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"record R {\n\tfirst: Int,\n\tsecond: Int\n}\n\n\nunion U:\n\tA(Int)\n\tB\n\n\nenum E:\n\tX\n\tY\n\n\ntype alias Al = Int\n\n\n",
-		300126,
+		164069,
 	)
 
 func test_parsing_repeated_trait_and_impl_declarations_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"trait Shape:\n\tpure func area(value: Self) -> Int\n\n\nimplements Shape for R:\n\tpure func area(r: R) -> Int:\n\t\t1\n\n\n",
-		248186,
+		128131,
 	)
 
 func test_parsing_repeated_imports_copies_no_table() -> Bool:
-	family_allocates("import:\n", "\tmath: sin, cos\n\tlist as L: List(Cons, Nil)\n", 90126)
+	family_allocates("import:\n", "\tmath: sin, cos\n\tlist as L: List(Cons, Nil)\n", 40069)
 
 func test_parsing_repeated_collection_literals_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\ty = {1 => 2, 3 => 4}\n\tz = {a, b}\n\tw = (a, b, c)\n\tv = [a, b]\n\tu = ()\n\tt = (a)\n",
-		316179,
+		148096,
 	)
 
 func test_parsing_repeated_tuple_list_and_qualified_patterns_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tx = match a:\n\t\t(l, r): l\n\t\tOption.Some(v): v\n\t\tOption.None: b\n\t\t[]: c\n\t\t[h, ...t]: h\n\t\tSome(Some(v)) | Other(v): v\n\t\t-1: a\n\t\t\"s\": b\n\t\t_: c\n",
-		474180,
+		244095,
 	)
 
 func test_parsing_repeated_with_scopes_copies_no_table() -> Bool:
-	statement_family_allocates("\twith r = f(a):\n\t\tr\n\twith t ?= f(b) on e => e:\n\t\tt\n", 182165)
+	statement_family_allocates("\twith r = f(a):\n\t\tr\n\twith t ?= f(b) on e => e:\n\t\tt\n", 100091)
 
 func test_parsing_repeated_conversions_and_builtins_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tz = builtin(\"x\")\n\tq = into_opaque T(a)\n\tp = from_opaque T(b)\n\tr = builtin\n",
-		158168,
+		76092,
 	)
 
 func test_parsing_repeated_bindings_and_local_functions_copies_no_table() -> Bool:
-	statement_family_allocates("\t(p, q) = a\n\tn: Int = a\n\tfunc g(u):\n\t\tu\n\ta[b] = c\n", 206211)
+	statement_family_allocates("\t(p, q) = a\n\tn: Int = a\n\tfunc g(u):\n\t\tu\n\ta[b] = c\n", 110135)
 
 func test_parsing_repeated_postfix_chains_and_unary_operators_copies_no_table() -> Bool:
 	statement_family_allocates(
 		"\tx = a.b(c)[d]\n\ty = a\n\t\t.b()\n\t\t.c()\n\tz = not a\n\tw = -a\n\tdetach f(a)\n",
-		282172,
+		146096,
 	)
 
 func test_parsing_repeated_written_types_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"func g[V: Orderable + Equatable](p: Dict[String, List[Int]], f: pure (Int) -> Int, t: (Int, Int), m: Int[#N, #M], k: a.B[C], n: Int[#_...], v: V) -> void:\n\tp\n\n\n",
-		488217,
+		242150,
 	)
 
 
@@ -233,14 +339,14 @@ func test_parsing_repeated_foreign_blocks_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"foreign(include: \"a.h\", link: \"-lm\"):\n\tpure func c_sin(x: Float) -> Float = \"sin\"\n\tfunc c_puts(s: String) -> Int\n\n\n",
-		206184,
+		94128,
 	)
 
 func test_parsing_repeated_supertraits_copies_no_table() -> Bool:
 	family_allocates(
 		"",
 		"trait Base:\n\tpure func one(value: Self) -> Int\n\n\ntrait Wide: Base:\n\tpure func two(value: Self) -> Int\n\tfunc three(value: Self) -> Int:\n\t\t3\n\n\n",
-		310193,
+		158137,
 	)
 
 
@@ -278,8 +384,25 @@ func test_appending_rows_copies_no_table() -> Bool:
 
 
 tests: TestSuite = {
-	description = "Discovery allocation budgets",
+	description = "Discovery parser and bridge allocation budgets",
 	tests = [
+		("bridging repeated names copies no table", test_bridging_repeated_names_copies_no_table),
+		(
+			"bridging repeated literals copies no table",
+			test_bridging_repeated_literals_copies_no_table,
+		),
+		(
+			"bridging repeated rejected integers copies no table",
+			test_bridging_repeated_rejected_integers_copies_no_table,
+		),
+		(
+			"bridging repeated rejected floats copies no table",
+			test_bridging_repeated_rejected_floats_copies_no_table,
+		),
+		(
+			"bridging repeated interpolations copies no table",
+			test_bridging_repeated_interpolations_copies_no_table,
+		),
 		(
 			"parsing repeated expression statements copies no table",
 			test_parsing_repeated_expression_statements_copies_no_table,

@@ -1,0 +1,264 @@
+-- Direct shared builtin/resource leaf; its input cursor is at `type`.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, diagnostics, diagnostic_count, issued_counts, spellings
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_builtin_type_parser: BuiltinTypeForm(PlainBuiltinType, ResourceBuiltinType), BuiltinTypeParse(ParsedBuiltinType, ParsedResourceType, RejectedBuiltinType), parse_builtin_type
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, type_binder_local_index, name_use_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(ExpectedToken, Plain, ReservedKeywordAsName)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(BuiltinTypeArgumentsDiagnostic, ExpectedCleanupBuiltinNameDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedKeyword, ExpectedEqual, ExpectedName, ExpectedRightBracket, ExpectedRightParen),
+		KeywordConstruct(KeywordInBuiltinTypeDeclaration, KeywordInBuiltinTypeMarker), EqualConstruct(EqualInBuiltinTypeMarker),
+		NameConstruct(NameInTypeName), RightBracketConstruct(RightBracketInTypeParameters), RightParenConstruct(RightParenInResourceCleanupBuiltinName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(IfKeyword, IdentifierToken, RightParenSymbol, LeftBracketSymbol, NewlineToken, EndOfFileToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+private pure func parameters_match(parsed: ParseState, parameters: List[TypeParameter], offset: Int) -> Bool:
+	match parameters:
+		[TypeVariable(variable), DimensionVariable(dimension), WildcardDimensionParameter(wildcard)]:
+			match variable.bounds:
+				[qualified, bare]:
+					match (qualified.qualifier, bare.qualifier):
+						(Some(qualifier), None):
+							(variable.binder.binder.type_binder_local_index() == 0 and dimension.binder.type_binder_local_index() == 1
+								and qualifier.use.name_use_local_index() == 0 and qualified.trait_name.use.name_use_local_index() == 1
+								and bare.trait_name.use.name_use_local_index() == 2
+								and variable.binder.name.span.covers(12 + offset, 13 + offset) and variable.span.covers(12 + offset, 30 + offset)
+								and qualified.span.covers(15 + offset, 19 + offset) and bare.span.covers(22 + offset, 30 + offset)
+								and dimension.name.span.covers(32 + offset, 34 + offset) and wildcard.covers(36 + offset, 38 + offset)
+								and parsed.spellings().spelling_text(variable.binder.name.spelling) == Some("T")
+								and parsed.spellings().spelling_text(dimension.name.spelling) == Some("N")
+								and parsed.spellings().spelling_text(qualifier.name.spelling) == Some("m")
+								and parsed.spellings().spelling_text(qualified.trait_name.name.spelling) == Some("Eq")
+								and parsed.spellings().spelling_text(bare.trait_name.name.spelling) == Some("Hashable")
+								and parsed.issued_counts().type_binders == 2 and parsed.issued_counts().name_uses == 3)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+private pure func rich_builtin(text: String, form: BuiltinTypeForm, cleanup_written: Bool) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(3), text)):
+		Ok(state):
+			input = if form == ResourceBuiltinType:
+				state.advanced()
+			else:
+				state
+			(parsed, result) = parse_builtin_type(input, PublicVisibility, None, state.current_span(), form)
+			common: Bool = (parsed.diagnostic_count() == 0 and parsed.current_kind() == IfKeyword
+				and parsed.current_span().covers(text.length() - 2, text.length())
+				and parsed.issued_counts().written_types == 0 and parsed.issued_counts().dimensions == 0)
+
+			match result:
+				ParsedBuiltinType(value):
+					(common and form == PlainBuiltinType and value.id.definition_local_index() == 0
+						and value.visibility == PublicVisibility and value.documentation.is_none()
+						and value.name.span.covers(5, 11) and value.span.covers(0, 49)
+						and parsed.spellings().spelling_text(value.name.spelling) == Some("Buffer")
+						and parameters_match(parsed, value.type_parameters, 0))
+				ParsedResourceType(value):
+					cleanup_matches: Bool = match value.cleanup:
+						None:
+							not cleanup_written
+						Some(cleanup):
+							cleanup_written and cleanup.name == "close\nfile" and cleanup.span.covers(59, 72)
+
+					(common and form == ResourceBuiltinType and cleanup_matches and value.id.definition_local_index() == 0
+						and value.visibility == PublicVisibility and value.documentation.is_none()
+						and value.name.span.covers(14, 20) and value.span.covers(0, text.length() - 3)
+						and parsed.spellings().spelling_text(value.name.spelling) == Some("Buffer")
+						and parameters_match(parsed, value.type_parameters, 9))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_three_forms_mint_parameters_then_definition_and_preserve_cursor() -> Bool:
+	(rich_builtin("type Buffer[T: m.Eq + Hashable, #N, #_] = builtin if", PlainBuiltinType, False)
+		and rich_builtin("resource type Buffer[T: m.Eq + Hashable, #N, #_] = builtin if", ResourceBuiltinType, False)
+		and rich_builtin("resource type Buffer[T: m.Eq + Hashable, #N, #_] = builtin(\"close\\nfile\") if", ResourceBuiltinType, True))
+
+
+private pure func empty_builtin(text: String, form: BuiltinTypeForm) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			documentation: Documentation = { text = "A builtin type.", span = state.current_span() }
+			input = if form == ResourceBuiltinType:
+				state.advanced()
+			else:
+				state
+			(parsed, result) = parse_builtin_type(input, PrivateVisibility, Some(documentation), state.current_span(), form)
+			var parameters: List[TypeParameter] = []
+			var metadata: Bool = False
+
+			match result:
+				ParsedBuiltinType(value):
+					parameters = value.type_parameters
+					metadata = value.visibility == PrivateVisibility and value.id.definition_local_index() == 0 and value.span.covers(0, text.length() - 3)
+					match value.documentation:
+						Some(doc):
+							metadata = metadata and doc.text == documentation.text and doc.span.spans_equal(documentation.span)
+						None:
+							metadata = False
+				ParsedResourceType(value):
+					parameters = value.type_parameters
+					metadata = value.visibility == PrivateVisibility and value.id.definition_local_index() == 0 and value.span.covers(0, text.length() - 3) and value.cleanup.is_none()
+					match value.documentation:
+						Some(doc):
+							metadata = metadata and doc.text == documentation.text and doc.span.spans_equal(documentation.span)
+						None:
+							metadata = False
+				_:
+					void
+
+			(metadata and parameters.is_empty() and parsed.diagnostic_count() == 0 and parsed.current_kind() == IfKeyword
+				and parsed.issued_counts().type_binders == 0 and parsed.issued_counts().name_uses == 0)
+		Err(_):
+			False
+
+
+pure func test_absent_and_written_empty_parameters_preserve_metadata() -> Bool:
+	(empty_builtin("type Empty = builtin if", PlainBuiltinType) and empty_builtin("type Empty[] = builtin if", PlainBuiltinType)
+		and empty_builtin("resource type Empty = builtin if", ResourceBuiltinType) and empty_builtin("resource type Empty[] = builtin if", ResourceBuiltinType))
+
+
+private pure func cleanup_literal(written: String, decoded: String, start: Int, end: Int) -> Bool:
+	text: String = "resource type File = builtin(${written}) if"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_builtin_type(state.advanced(), PublicVisibility, None, state.current_span(), ResourceBuiltinType)
+
+			match result:
+				ParsedResourceType(value):
+					match value.cleanup:
+						Some(cleanup):
+							(cleanup.name == decoded and cleanup.span.covers(start, end)
+								and value.span.covers(0, text.length() - 3) and value.id.definition_local_index() == 0
+								and parsed.diagnostic_count() == 0 and parsed.current_kind() == IfKeyword)
+						None:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_cleanup_accepts_quoted_raw_pipe_and_raw_pipe_strings() -> Bool:
+	(cleanup_literal("\"close\\nfile\"", "close\nfile", 29, 42)
+		and cleanup_literal("raw\"close\\nfile\"", "close\\nfile", 29, 45)
+		and cleanup_literal("\n\t|cleanup\n", "cleanup", 31, 40)
+		and cleanup_literal("raw\n\t|cleanup\n", "cleanup", 29, 43))
+
+
+private union ExpectedDiagnostic:
+	TokenDiagnostic(ExpectedTokenDiagnostic)
+	PlainDiagnostic(PlainSyntaxCode)
+	ReservedName
+
+
+private pure func diagnostic_matches(actual: SyntaxDiagnostic, expected: ExpectedDiagnostic) -> Bool:
+	match (actual, expected):
+		(ExpectedToken(ExpectedKeyword(actual_construct)), TokenDiagnostic(ExpectedKeyword(expected_construct))):
+			actual_construct == expected_construct
+		(ExpectedToken(ExpectedEqual(actual_construct)), TokenDiagnostic(ExpectedEqual(expected_construct))):
+			actual_construct == expected_construct
+		(ExpectedToken(ExpectedName(actual_construct)), TokenDiagnostic(ExpectedName(expected_construct))):
+			actual_construct == expected_construct
+		(ExpectedToken(ExpectedRightBracket(actual_construct)), TokenDiagnostic(ExpectedRightBracket(expected_construct))):
+			actual_construct == expected_construct
+		(ExpectedToken(ExpectedRightParen(actual_construct)), TokenDiagnostic(ExpectedRightParen(expected_construct))):
+			actual_construct == expected_construct
+		(Plain(actual_code), PlainDiagnostic(expected_code)):
+			actual_code == expected_code
+		(ReservedKeywordAsName(_), ReservedName):
+			True
+		_:
+			False
+
+
+private pure func rejection_matches(text: String, form: BuiltinTypeForm, expected: List[(ExpectedDiagnostic, Int, Int)], cursor: TokenKind, start: Int, end: Int, binders: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			input = if form == ResourceBuiltinType:
+				state.advanced()
+			else:
+				state
+			(parsed, result) = parse_builtin_type(input, PublicVisibility, None, state.current_span(), form)
+			var correct: Bool = match result:
+				RejectedBuiltinType:
+					True
+				_:
+					False
+			correct = correct and parsed.diagnostic_count() == expected.length()
+			var index: Int = 0
+
+			for (diagnostic, diagnostic_start, diagnostic_end) in expected:
+				match parsed.diagnostics().get(index):
+					Some(at):
+						correct = correct and diagnostic_matches(at.diagnostic, diagnostic) and at.span.covers(diagnostic_start, diagnostic_end)
+					None:
+						correct = False
+				index = index + 1
+
+			(correct and parsed.current_kind() == cursor and parsed.current_span().covers(start, end)
+				and parsed.issued_counts().type_binders == binders and parsed.issued_counts().written_types == 0 and parsed.issued_counts().dimensions == 0)
+		Err(_):
+			False
+
+
+pure func test_missing_type_equal_and_marker_continue_without_cascades() -> Bool:
+	(rejection_matches("resource File = builtin if", ResourceBuiltinType, [(TokenDiagnostic(ExpectedKeyword(KeywordInBuiltinTypeDeclaration)), 9, 9)], IfKeyword, 24, 26, 0)
+		and rejection_matches("type File builtin if", PlainBuiltinType, [(TokenDiagnostic(ExpectedEqual(EqualInBuiltinTypeMarker)), 10, 10)], IfKeyword, 18, 20, 0)
+		and rejection_matches("type File = if", PlainBuiltinType, [(TokenDiagnostic(ExpectedKeyword(KeywordInBuiltinTypeMarker)), 12, 12)], IfKeyword, 12, 14, 0))
+
+
+pure func test_missing_reserved_names_and_malformed_parameters_stop_early() -> Bool:
+	(rejection_matches("type [T] = builtin if", PlainBuiltinType, [(TokenDiagnostic(ExpectedName(NameInTypeName)), 5, 5)], LeftBracketSymbol, 5, 6, 0)
+		and rejection_matches("type if[T] = builtin", PlainBuiltinType, [(ReservedName, 5, 5)], LeftBracketSymbol, 7, 8, 0)
+		and rejection_matches("type File[T U] = builtin if", PlainBuiltinType, [(TokenDiagnostic(ExpectedRightBracket(RightBracketInTypeParameters)), 12, 12)], IdentifierToken, 12, 13, 1)
+		and rejection_matches("type File[T", PlainBuiltinType, [(TokenDiagnostic(ExpectedRightBracket(RightBracketInTypeParameters)), 11, 11)], EndOfFileToken, 11, 11, 1))
+
+
+-- A colon opens bracket layout, exposing a newline token without an earlier
+-- right parenthesis; ordinary parenthesized newlines are lexical trivia.
+pure func test_plain_arguments_stop_at_first_close_newline_or_eof() -> Bool:
+	(rejection_matches("type File = builtin(\"cleanup\") if", PlainBuiltinType, [(PlainDiagnostic(BuiltinTypeArgumentsDiagnostic), 19, 19)], IfKeyword, 31, 33, 0)
+		and rejection_matches("type File = builtin((3)) if", PlainBuiltinType, [(PlainDiagnostic(BuiltinTypeArgumentsDiagnostic), 19, 19)], RightParenSymbol, 23, 24, 0)
+		and rejection_matches("type File = builtin(3", PlainBuiltinType, [(PlainDiagnostic(BuiltinTypeArgumentsDiagnostic), 19, 19)], EndOfFileToken, 21, 21, 0)
+		and rejection_matches("type File = builtin(:\n\t3", PlainBuiltinType, [(PlainDiagnostic(BuiltinTypeArgumentsDiagnostic), 19, 19)], NewlineToken, 23, 23, 0))
+
+
+pure func test_resource_cleanup_errors_preserve_existing_recovery() -> Bool:
+	(rejection_matches("resource type File = builtin() if", ResourceBuiltinType, [(PlainDiagnostic(ExpectedCleanupBuiltinNameDiagnostic), 29, 29)], IfKeyword, 31, 33, 0)
+		and rejection_matches("resource type File = builtin(3) if", ResourceBuiltinType, [(PlainDiagnostic(ExpectedCleanupBuiltinNameDiagnostic), 29, 29)], IfKeyword, 32, 34, 0)
+		and rejection_matches("resource type File = builtin(\"cleanup\" if", ResourceBuiltinType, [(TokenDiagnostic(ExpectedRightParen(RightParenInResourceCleanupBuiltinName)), 39, 39)], IfKeyword, 39, 41, 0)
+		and rejection_matches("resource type File = builtin(", ResourceBuiltinType, [(PlainDiagnostic(ExpectedCleanupBuiltinNameDiagnostic), 29, 29), (TokenDiagnostic(ExpectedRightParen(RightParenInResourceCleanupBuiltinName)), 29, 29)], EndOfFileToken, 29, 29, 0))
+
+
+tests: TestSuite = {
+	description = "Direct tree builtin and resource type leaf",
+	tests = [
+		("three forms mint parameters then definition and preserve cursor", test_three_forms_mint_parameters_then_definition_and_preserve_cursor),
+		("absent and written empty parameters preserve metadata", test_absent_and_written_empty_parameters_preserve_metadata),
+		("cleanup accepts quoted raw pipe and raw pipe strings", test_cleanup_accepts_quoted_raw_pipe_and_raw_pipe_strings),
+		("missing type equal and marker continue without cascades", test_missing_type_equal_and_marker_continue_without_cascades),
+		("missing reserved names and malformed parameters stop early", test_missing_reserved_names_and_malformed_parameters_stop_early),
+		("plain arguments stop at first close newline or eof", test_plain_arguments_stop_at_first_close_newline_or_eof),
+		("resource cleanup errors preserve existing recovery", test_resource_cleanup_errors_preserve_existing_recovery)
+	]
+}

@@ -27,6 +27,35 @@ the stage's total accessors, whose fallbacks are unreachable for the same
 reason.
 ---
 import:
+	../compiler_new/stage_01_discovery/parse/tree_module_declaration_scan as TreeScan
+	../compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser as TreePreviews
+	../compiler_new/stage_01_discovery/parse/tree_function_header_parser: FunctionHeaderPreview, FunctionBodyExtent, DeferredBody
+	../compiler_new/stage_01_discovery/parse/tree_trait_parser: TraitPreview
+	../compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent
+	../compiler_new/stage_01_discovery/parse/tree_implementation_parser: ImplementationPreview
+	../compiler_new/stage_01_discovery/tables/token as PreviewTokens
+	../compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview, DeferredInitializerStart
+	../compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
+	../compiler_new/stage_01_discovery/syntax/checked_values: parent_step_count, written_digits
+	../compiler_new/stage_01_discovery/syntax/imports as TreeImports
+	../compiler_new/stage_01_discovery/syntax/foreign_blocks as TreeForeign
+	../compiler_new/stage_01_discovery/parse/union_preview:
+		UnionPreview, union_declaration, union_source
+	../compiler_new/stage_01_discovery/parse/enum_preview:
+		EnumPreview, enum_declaration, enum_source
+	../compiler_new/stage_01_discovery/parse/builtin_type_preview:
+		BuiltinTypePreview, BuiltinTypePreviewDeclaration(BuiltinDeclaration, ResourceDeclaration), builtin_type_declaration, builtin_type_source
+	../compiler_new/stage_01_discovery/parse/alias_preview:
+		AliasPreview, alias_declaration, alias_source
+	../compiler_new/stage_01_discovery/parse/record_preview:
+		RecordPreview, record_declaration, record_source
+	../compiler_new/stage_01_discovery/parse/preview_source:
+		PreviewSource, preview_span_text, preview_dimension_literal_text, preview_variadic_wildcard_span, preview_integer_literal_text
+	../compiler_new/stage_01_discovery/syntax/declarations as TreeDeclarations
+	../compiler_new/stage_01_discovery/syntax/names: WrittenName
+	../compiler_new/stage_01_discovery/syntax/sequences: small_tuple_items, at_least_one_items
+	../compiler_new/stage_01_discovery/syntax/expressions as TreeExpressions
+	../compiler_new/stage_01_discovery/syntax/types as TreeTypes
 	../compiler_new/stage_01_discovery/sources/embedded_standard_library:
 		EmbeddedStandardLibraryTexts,
 		embedded_module_name,
@@ -92,7 +121,7 @@ import:
 	frontend_request: FrontendCompilationGraph, FrontendGraphContext
 	list: range, repeat
 	stage_01_generated_inputs/embedded_std: embedded_std_module_names, embedded_std_source
-	stage_02_lex/name_table: NameTable, name_id_from_interned_index, name_table_from_parts
+	stage_02_lex/name_table: NameTable, EMPTY_NAME_TABLE, name_table_intern, name_id_from_interned_index, name_table_from_parts
 	stage_03_parse/parsed_ast:
 		RecordDeclarationForm(OrdinaryRecord, FixedRecord),
 		ConcurrentForLimit(WrittenLimit),
@@ -139,9 +168,9 @@ import:
 			ParsedDebugOnlyAnnotation, ParsedNoCopyAnnotation,
 			ParsedResourceResultOrdinaryAnnotation, ParsedTailRecursiveAnnotation,
 		),
-		ParsedFunctionDecl,
+		ParsedFunctionDecl, ParsedFunctionHeader,
 		ParsedIdentifier,
-		ParsedImplDecl,
+		ParsedImplDecl, ParsedImplHeader,
 		ParsedImportDecl,
 		ParsedImportSymbol,
 		ParsedLambdaParam,
@@ -168,7 +197,7 @@ import:
 			ParsedPipeStringLiteral, ParsedPlainStringLiteral, ParsedRawPipeStringLiteral,
 			ParsedRawStringLiteral,
 		),
-		ParsedTraitDecl,
+		ParsedTraitDecl, ParsedTraitHeader, ParsedTraitMethodHeader,
 		ParsedTraitMethodDecl,
 		ParsedTraitReference,
 		ParsedTypeAliasDecl,
@@ -181,7 +210,7 @@ import:
 		ParsedTypeParamKind(ParsedDimensionParameter, ParsedTypeParameter),
 		ParsedUnaryOp(ParsedNegateOp, ParsedNotOp),
 		ParsedUnionDecl,
-		ParsedVarDecl,
+		ParsedVarDecl, ParsedVarHeader,
 		ParsedVariantDecl,
 		ParsedWithBinding,
 		ParsedWithBindingKind(ParsedWithPlainBinding, ParsedWithTryBinding),
@@ -4005,3 +4034,1132 @@ private pure func legacy_root_identities(
 	collected(loaded.map(
 		pure func(target): legacy_module_identity(reader, target),
 	))
+
+
+---
+A successful preview lacked an integer or wildcard token its dimension must own.
+This is a preview invariant error, never replacement text in the legacy AST.
+---
+union LegacyDeclarationPreviewError:
+	MissingDimensionLiteralToken(Span)
+	MissingVariadicWildcardToken(Span)
+	InvalidGlobalInitializerEntry(Span)
+	UnsupportedGlobalInitializerExpression(Span)
+	MissingIntegerLiteralToken(Span)
+
+
+---
+One successful tree preview rebuilt for the legacy parser boundary. Every
+identifier indexes this preview's own name table, independent of lexer ids.
+---
+record LegacyRecordPreview {
+	declaration: ParsedDecl,
+	names: NameTable
+}
+
+
+pure func legacy_record_preview(preview: RecordPreview) -> Result[LegacyRecordPreview, LegacyDeclarationPreviewError]:
+	translated ?= preview_record_declaration(record_source(preview), EMPTY_NAME_TABLE, record_declaration(preview))
+	(names, declaration) = translated
+	Ok({ declaration = declaration, names = names })
+
+
+private pure func preview_record_declaration(
+	source: PreviewSource, initial_names: NameTable, declaration: TreeDeclarations.RecordDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, initial_names, declaration.name)
+	(after_parameters, parameters) = preview_type_parameters(source, after_name, declaration.type_parameters)
+	translated_fields ?= preview_fields(source, after_parameters, declaration.fields)
+	(names, fields) = translated_fields
+	form: RecordDeclarationForm = match declaration.form:
+		TreeDeclarations.OrdinaryRecord: OrdinaryRecord
+		TreeDeclarations.FixedRecord: FixedRecord
+	Ok((names, preview_visibility(RecordParsedDecl({
+		name = name, type_params = parameters, fields = fields, form = form,
+		doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+record LegacyAliasPreview {
+	declaration: ParsedDecl,
+	names: NameTable
+}
+
+
+pure func legacy_alias_preview(preview: AliasPreview) -> Result[LegacyAliasPreview, LegacyDeclarationPreviewError]:
+	translated ?= preview_alias_declaration(alias_source(preview), EMPTY_NAME_TABLE, alias_declaration(preview))
+	(names, declaration) = translated
+	Ok({ declaration = declaration, names = names })
+
+
+private pure func preview_alias_declaration(
+	source: PreviewSource, initial_names: NameTable, declaration: TreeDeclarations.AliasDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, initial_names, declaration.name)
+	(after_parameters, parameters) = preview_type_parameters(source, after_name, declaration.type_parameters)
+	translated_target ?= preview_type(source, after_parameters, declaration.target)
+	(names, target) = translated_target
+	Ok((names, preview_visibility(TypeAliasParsedDecl({
+		name = name, type_params = parameters, target = target,
+		is_opaque = declaration.form == TreeDeclarations.OpaqueAlias,
+		doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+record LegacyBuiltinTypePreview {
+	declaration: ParsedDecl,
+	names: NameTable
+}
+
+
+pure func legacy_builtin_type_preview(preview: BuiltinTypePreview) -> Result[LegacyBuiltinTypePreview, LegacyDeclarationPreviewError]:
+	translated ?= match builtin_type_declaration(preview):
+		BuiltinDeclaration(declaration):
+			preview_builtin_declaration(builtin_type_source(preview), EMPTY_NAME_TABLE, declaration)
+		ResourceDeclaration(declaration):
+			preview_resource_declaration(builtin_type_source(preview), EMPTY_NAME_TABLE, declaration)
+	(names, declaration) = translated
+	Ok({ declaration = declaration, names = names })
+
+
+private pure func preview_builtin_declaration(
+	source: PreviewSource, initial_names: NameTable, declaration: TreeDeclarations.BuiltinTypeDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, initial_names, declaration.name)
+	(names, parameters) = preview_type_parameters(source, after_name, declaration.type_parameters)
+	Ok((names, preview_visibility(BuiltinTypeParsedDecl({
+		name = name, type_params = parameters, is_resource = False, cleanup = None,
+		doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+private pure func preview_resource_declaration(
+	source: PreviewSource, initial_names: NameTable, declaration: TreeDeclarations.ResourceTypeDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, initial_names, declaration.name)
+	(names, parameters) = preview_type_parameters(source, after_name, declaration.type_parameters)
+	cleanup: Option[ParsedResourceCleanup] = match declaration.cleanup:
+		None:
+			None
+		Some(cleanup):
+			Some({ builtin_name = cleanup.name, span = legacy_location(cleanup.span) })
+	Ok((names, preview_visibility(BuiltinTypeParsedDecl({
+		name = name, type_params = parameters, is_resource = True, cleanup = cleanup,
+		doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+
+record LegacyUnionPreview {
+	declaration: ParsedDecl,
+	names: NameTable
+}
+
+
+pure func legacy_union_preview(preview: UnionPreview) -> Result[LegacyUnionPreview, LegacyDeclarationPreviewError]:
+	translated ?= preview_union_declaration(union_source(preview), EMPTY_NAME_TABLE, union_declaration(preview))
+	(names, declaration) = translated
+	Ok({ declaration = declaration, names = names })
+
+
+private pure func preview_union_declaration(
+	source: PreviewSource, initial_names: NameTable, declaration: TreeDeclarations.UnionDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, initial_names, declaration.name)
+	(after_parameters, parameters) = preview_type_parameters(source, after_name, declaration.type_parameters)
+	translated_variants ?= preview_variants(source, after_parameters, declaration.variants)
+	(names, variants) = translated_variants
+	Ok((names, preview_visibility(UnionParsedDecl({
+		name = name, type_params = parameters, variants = variants, is_enum = False,
+		doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+private pure func preview_variants(
+	source: PreviewSource, names: NameTable, written: List[TreeDeclarations.VariantDeclaration],
+) -> Result[(NameTable, List[ParsedVariantDecl]), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var variants: List[ParsedVariantDecl] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+
+	for variant in written:
+		(after_name, name) = preview_identifier(source, extended, variant.name)
+		payload: List[TreeTypes.TypeArgument] = variant.payload.map(pure func(written): TreeTypes.TypeArgumentType(written))
+
+		match preview_arguments(source, after_name, payload):
+			Ok((after_payload, fields)):
+				extended = after_payload
+				variants = variants.append({ name = name, fields = fields, span = legacy_location(variant.span) })
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, variants))
+
+
+record LegacyEnumPreview {
+	declaration: ParsedDecl,
+	names: NameTable
+}
+
+
+pure func legacy_enum_preview(preview: EnumPreview) -> Result[LegacyEnumPreview, LegacyDeclarationPreviewError]:
+	translated ?= preview_enum_declaration(enum_source(preview), EMPTY_NAME_TABLE, enum_declaration(preview))
+	(names, declaration) = translated
+	Ok({ declaration = declaration, names = names })
+
+
+private pure func preview_enum_declaration(
+	source: PreviewSource, initial_names: NameTable, declaration: TreeDeclarations.EnumDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, initial_names, declaration.name)
+	var names: NameTable = after_name
+	var variants: List[ParsedVariantDecl] = []
+
+	for case in declaration.cases:
+		(after_case, case_name) = preview_identifier(source, names, case.name)
+		names = after_case
+		variants = variants.append({ name = case_name, fields = [], span = legacy_location(case.span) })
+
+	Ok((names, preview_visibility(UnionParsedDecl({
+		name = name, type_params = [], variants = variants, is_enum = True,
+		doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+---
+Completed declaration evidence with a shared legacy name table. This bounded
+projection never asserts that a module or its deferred bodies were accepted.
+---
+record LegacyDeclarationProjection {
+	module_doc: Option[ParsedModuleDoc],
+	declarations: List[ParsedDecl],
+	names: NameTable,
+	stop: LegacyDeclarationProjectionStop
+}
+
+
+---
+Translated function syntax and deferred body evidence. The header cannot carry
+a function body or the complete declaration's endpoint.
+---
+record LegacyFunctionHeaderPreview {
+	header: ParsedFunctionHeader,
+	visibility: Kinds.Visibility,
+	body_extent: FunctionBodyExtent,
+	header_span: Span,
+	body_colon: Span
+}
+
+
+---
+Translated global header syntax and the scanner's deferred initializer entry.
+The initializer expression and its endpoint remain outside this projection.
+---
+record LegacyGlobalInitializerEntry {
+	assignment_equal: Span,
+	initializer_entry: Span,
+	anchor: Span
+}
+
+
+record LegacyGlobalHeaderPreview {
+	header: ParsedVarHeader,
+	visibility: Kinds.Visibility,
+	header_span: Span,
+	initializer: LegacyGlobalInitializerEntry
+}
+
+
+-- Keep method syntax paired with its lexical body evidence and boundary.
+-- Owner headers are derived from these records rather than parallel lists.
+record LegacyTraitMethodHeaderPreview {
+	header: ParsedTraitMethodHeader,
+	body_extent: MethodBodyExtent,
+	header_span: Span
+}
+
+
+record LegacyTraitHeaderPreview {
+	name: ParsedIdentifier,
+	type_params: List[ParsedTypeParamDecl],
+	supertraits: List[ParsedTraitReference],
+	methods: List[LegacyTraitMethodHeaderPreview],
+	doc: Option[String],
+	visibility: Kinds.Visibility,
+	owner_span: Span
+}
+
+
+pure func legacy_trait_header(preview: LegacyTraitHeaderPreview) -> ParsedTraitHeader:
+	{
+		name = preview.name, type_params = preview.type_params, supertraits = preview.supertraits,
+		methods = preview.methods.map(pure func(method): method.header), doc = preview.doc
+	}
+
+
+record LegacyImplementationMethodHeaderPreview {
+	header: ParsedFunctionHeader,
+	body: DeferredBody,
+	header_span: Span
+}
+
+
+record LegacyImplementationHeaderPreview {
+	trait_name: ParsedIdentifier,
+	for_type: ParsedTypeExpr,
+	methods: List[LegacyImplementationMethodHeaderPreview],
+	doc: Option[String],
+	visibility: Kinds.Visibility,
+	owner_span: Span
+}
+
+
+pure func legacy_implementation_header(preview: LegacyImplementationHeaderPreview) -> ParsedImplHeader:
+	{
+		trait_name = preview.trait_name, for_type = preview.for_type,
+		methods = preview.methods.map(pure func(method): method.header), doc = preview.doc
+	}
+
+
+union LegacyDeclarationProjectionStop:
+	ReachedEndOfSource
+	StoppedAtFunctionHeader(LegacyFunctionHeaderPreview)
+	StoppedAtTraitPreview(LegacyTraitHeaderPreview)
+	StoppedAtImplementationPreview(LegacyImplementationHeaderPreview)
+	StoppedAtGlobalInitializer(LegacyGlobalHeaderPreview)
+	StoppedAtRejectedGlobalInitializer(DeferredInitializerStart)
+	StoppedAtRejectedDeclaration
+	StoppedWithoutDeclarationProgress
+
+
+private union PreviewDeclarationProjection:
+	CompletedPreviewDeclaration(NameTable, ParsedDecl)
+	DeferredPreviewDeclaration(NameTable, LegacyDeclarationProjectionStop)
+
+
+pure func legacy_declaration_projection(
+	source: PreviewSource, scan: TreeScan.ModuleDeclarationPreviewScan, names: NameTable,
+) -> Result[LegacyDeclarationProjection, LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var declarations: List[ParsedDecl] = []
+	var deferred_stop: Option[LegacyDeclarationProjectionStop] = None
+
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for preview in scan.declarations:
+		match preview_declaration(source, extended, preview):
+			Ok(CompletedPreviewDeclaration(after_declaration, declaration)):
+				extended = after_declaration
+				declarations = declarations.append(declaration)
+			Ok(DeferredPreviewDeclaration(after_header, deferred)):
+				extended = after_header
+				-- The scanner may hold later previews. Their names and syntax
+				-- cannot enter this prefix until its deferred owner is implemented.
+				deferred_stop = Some(deferred)
+				break
+			Err(error):
+				failure = Some(error)
+				break
+
+	module_doc: Option[ParsedModuleDoc] = match scan.documentation:
+		None:
+			None
+		Some(documentation):
+			Some({ text = documentation.text, span = legacy_location(documentation.span) })
+	-- Only select the scan's global stop after all completed declarations. An
+	-- earlier deferred declaration owns the boundary and excludes later names.
+	stop_translation: Result[(NameTable, LegacyDeclarationProjectionStop), LegacyDeclarationPreviewError] = match failure:
+		Some(error):
+			Err(error)
+		None:
+			match deferred_stop:
+				Some(stop):
+					Ok((extended, stop))
+				None:
+					match scan.stop:
+						TreeScan.ReachedEndOfSource:
+							Ok((extended, ReachedEndOfSource))
+						TreeScan.StoppedAtGlobalInitializer(preview):
+							match preview_global_header(source, extended, preview):
+								Ok((after_header, header)):
+									Ok((after_header, StoppedAtGlobalInitializer(header)))
+								Err(error):
+									Err(error)
+						TreeScan.StoppedAtRejectedGlobalInitializer(start):
+							Ok((extended, StoppedAtRejectedGlobalInitializer(start)))
+						TreeScan.StoppedAtRejectedDeclaration:
+							Ok((extended, StoppedAtRejectedDeclaration))
+						TreeScan.StoppedWithoutDeclarationProgress:
+							Ok((extended, StoppedWithoutDeclarationProgress))
+	selected_stop ?= stop_translation
+	(projected_names, stop) = selected_stop
+	Ok({ module_doc = module_doc, declarations = declarations, names = projected_names, stop = stop })
+
+
+private pure func preview_declaration(
+	source: PreviewSource, names: NameTable, preview: TreePreviews.DeclarationPreview,
+) -> Result[PreviewDeclarationProjection, LegacyDeclarationPreviewError]:
+	match preview:
+		TreePreviews.GlobalDeclarationPreview(declaration):
+			translated ?= preview_completed_global(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.RecordDeclarationPreview(declaration):
+			translated ?= preview_record_declaration(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.AliasDeclarationPreview(declaration):
+			translated ?= preview_alias_declaration(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.BuiltinTypeDeclarationPreview(declaration):
+			translated ?= preview_builtin_declaration(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.ResourceTypeDeclarationPreview(declaration):
+			translated ?= preview_resource_declaration(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.UnionDeclarationPreview(declaration):
+			translated ?= preview_union_declaration(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.EnumDeclarationPreview(declaration):
+			translated ?= preview_enum_declaration(source, names, declaration)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.ImportBlockDeclarationPreview(block):
+			(extended, parsed) = preview_import_block(source, names, block)
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.ForeignBlockDeclarationPreview(block):
+			translated ?= preview_foreign_block(source, names, block)
+			(extended, parsed) = translated
+			Ok(CompletedPreviewDeclaration(extended, parsed))
+		TreePreviews.FunctionDeclarationPreview(preview):
+			translated ?= preview_function_header(source, names, preview)
+			(extended, header) = translated
+			Ok(DeferredPreviewDeclaration(extended, StoppedAtFunctionHeader(header)))
+		TreePreviews.TraitDeclarationPreview(preview):
+			translated ?= preview_trait_header(source, names, preview)
+			(extended, header) = translated
+			Ok(DeferredPreviewDeclaration(extended, StoppedAtTraitPreview(header)))
+		TreePreviews.ImplementationDeclarationPreview(preview):
+			translated ?= preview_implementation_header(source, names, preview)
+			(extended, header) = translated
+			Ok(DeferredPreviewDeclaration(extended, StoppedAtImplementationPreview(header)))
+
+
+private pure func preview_completed_global(
+	source: PreviewSource, names: NameTable, declaration: TreeDeclarations.GlobalDeclaration,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, names, declaration.name)
+	translated_type ?= preview_optional_type(source, after_name, declaration.declared_type)
+	(after_type, type_expr) = translated_type
+	value_translation ?= legacy_expression_preview(source, after_type, declaration.value)
+	(after_value, value) = value_translation
+	Ok((after_value, preview_visibility(VarParsedDecl({
+		name = name, type_expr = type_expr, value = value,
+		is_mutable = declaration.form == TreeDeclarations.MutableGlobal,
+		doc = preview_documentation(declaration.documentation), span = legacy_location(declaration.span)
+	}), declaration.visibility, declaration.span)))
+
+
+-- A continuation holds the completed left child while the right child is
+-- visited. The state distinguishes descent from a completed value, so there
+-- is no partial result stack and no recursive walk down a binary left spine.
+private union PreviewPairOperator:
+	PreviewBinaryOperator(ParsedBinaryOp)
+	PreviewLogicalOperator(ParsedLogicalOp)
+	PreviewRangeOperator
+
+
+private union PreviewExpressionContinuation:
+	FinishPreviewUnary(ParsedUnaryOp, Span)
+	VisitPreviewRight(PreviewPairOperator, TreeExpressions.Expression, Span)
+	FinishPreviewPair(PreviewPairOperator, ParsedExpr, Span)
+
+
+private union PreviewExpressionWalk:
+	VisitPreviewExpression(TreeExpressions.Expression)
+	ReturnPreviewExpression(ParsedExpr)
+
+
+-- Rebuild supported expression syntax and intern names in written order.
+-- Numeric text belongs to lexical evidence, independently of grouping spans.
+pure func legacy_expression_preview(
+	source: PreviewSource, names: NameTable, value: TreeExpressions.Expression,
+) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var walk: PreviewExpressionWalk = VisitPreviewExpression(value)
+	var continuations: List[PreviewExpressionContinuation] = []
+	-- Every exit supplies a completed value or a precise projection error.
+	var result: Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError] = Err(UnsupportedGlobalInitializerExpression(value.span))
+	while True:
+		match walk:
+			VisitPreviewExpression(current):
+				location = legacy_location(current.span)
+				match current.kind:
+					TreeExpressions.NameReference(use):
+						(after_name, name) = preview_identifier(source, extended, use.name)
+						extended = after_name
+						walk = ReturnPreviewExpression(ParsedNameExpr(name))
+					TreeExpressions.IntegerLiteral(_):
+						match preview_integer_literal_text(source, current.span):
+							Some(digits): walk = ReturnPreviewExpression(ParsedIntLiteralExpr(digits, location))
+							None:
+								result = Err(MissingIntegerLiteralToken(current.span))
+								break
+					TreeExpressions.FloatLiteral(literal):
+						walk = ReturnPreviewExpression(ParsedFloatLiteralExpr(literal.written_digits(), location))
+					TreeExpressions.BooleanLiteral(literal):
+						walk = ReturnPreviewExpression(ParsedBoolLiteralExpr(literal, location))
+					TreeExpressions.VoidValue:
+						walk = ReturnPreviewExpression(ParsedVoidExpr(location))
+					TreeExpressions.Unary(operator, operand):
+						legacy_operator: ParsedUnaryOp = match operator:
+							TreeExpressions.Negate: ParsedNegateOp
+							TreeExpressions.LogicalNot: ParsedNotOp
+						continuations = continuations.append(FinishPreviewUnary(legacy_operator, current.span))
+						walk = VisitPreviewExpression(operand)
+					TreeExpressions.Binary(operator, left, right):
+						continuations = continuations.append(VisitPreviewRight(PreviewBinaryOperator(preview_binary_operator(operator)), right, current.span))
+						walk = VisitPreviewExpression(left)
+					TreeExpressions.ShortCircuit(operator, left, right):
+						legacy_operator: ParsedLogicalOp = match operator:
+							TreeExpressions.LogicalAnd: ParsedAndOp
+							TreeExpressions.LogicalOr: ParsedOrOp
+						continuations = continuations.append(VisitPreviewRight(PreviewLogicalOperator(legacy_operator), right, current.span))
+						walk = VisitPreviewExpression(left)
+					TreeExpressions.RangeExpression(left, right):
+						continuations = continuations.append(VisitPreviewRight(PreviewRangeOperator, right, current.span))
+						walk = VisitPreviewExpression(left)
+					_:
+						result = Err(UnsupportedGlobalInitializerExpression(current.span))
+						break
+			ReturnPreviewExpression(completed):
+				match continuations.get(continuations.length() - 1):
+					None:
+						result = Ok((extended, completed))
+						break
+					Some(continuation):
+						continuations = continuations.drop_last()
+						match continuation:
+							FinishPreviewUnary(operator, span):
+								walk = ReturnPreviewExpression(ParsedUnaryExpr(operator, completed, legacy_location(span)))
+							VisitPreviewRight(operator, right, span):
+								continuations = continuations.append(FinishPreviewPair(operator, completed, span))
+								walk = VisitPreviewExpression(right)
+							FinishPreviewPair(operator, left, span):
+								location = legacy_location(span)
+								parsed: ParsedExpr = match operator:
+									PreviewBinaryOperator(binary): ParsedBinaryExpr(binary, left, completed, location)
+									PreviewLogicalOperator(logical): ParsedLogicalExpr(logical, left, completed, location)
+									PreviewRangeOperator: ParsedRangeExpr(left, completed, location)
+								walk = ReturnPreviewExpression(parsed)
+	result
+
+
+private pure func preview_binary_operator(operator: TreeExpressions.BinaryOperator) -> ParsedBinaryOp:
+	match operator:
+		TreeExpressions.Add: ParsedAddOp
+		TreeExpressions.Subtract: ParsedSubtractOp
+		TreeExpressions.Multiply: ParsedMultiplyOp
+		TreeExpressions.Divide: ParsedDivideOp
+		TreeExpressions.Modulo: ParsedModuloOp
+		TreeExpressions.Equal: ParsedEqualOp
+		TreeExpressions.NotEqual: ParsedNotEqualOp
+		TreeExpressions.Less: ParsedLessOp
+		TreeExpressions.LessEqual: ParsedLessEqualOp
+		TreeExpressions.Greater: ParsedGreaterOp
+		TreeExpressions.GreaterEqual: ParsedGreaterEqualOp
+
+
+private pure func preview_global_header(
+	source: PreviewSource, names: NameTable, preview: GlobalHeaderPreview,
+) -> Result[(NameTable, LegacyGlobalHeaderPreview), LegacyDeclarationPreviewError]:
+	-- Read only the scanner's consumed equal token and its next lexical token.
+	-- Initializer grammar and its endpoint remain M4's responsibility.
+	entry_translation: Result[LegacyGlobalInitializerEntry, LegacyDeclarationPreviewError] = match (source.tokens.get(preview.initializer.token_start - 1), source.tokens.get(preview.initializer.token_start)):
+		(Some(assignment_equal), Some(initializer_entry)):
+			if (preview.initializer.token_start <= 0 or assignment_equal.kind != PreviewTokens.EqualSymbol
+				or assignment_equal.span.span_end() != preview.header.header_span.span_end()
+				or initializer_entry.span.span_start() < assignment_equal.span.span_end()):
+				Err(InvalidGlobalInitializerEntry(preview.initializer.anchor))
+			else:
+				Ok({ assignment_equal = assignment_equal.span, initializer_entry = initializer_entry.span, anchor = preview.initializer.anchor })
+		_:
+			Err(InvalidGlobalInitializerEntry(preview.initializer.anchor))
+	initializer ?= entry_translation
+	written = preview.header
+	(after_name, name) = preview_identifier(source, names, written.name)
+	type_translation: Result[(NameTable, Option[ParsedTypeExpr]), LegacyDeclarationPreviewError] = match written.declared_type:
+		Some(written_type):
+			match preview_type(source, after_name, written_type):
+				Ok((after_type, translated)):
+					Ok((after_type, Some(translated)))
+				Err(error):
+					Err(error)
+		None:
+			Ok((after_name, None))
+	translated_type ?= type_translation
+	(extended, type_expr) = translated_type
+	Ok((extended, {
+		header = {
+			name = name, type_expr = type_expr,
+			is_mutable = written.form == TreeDeclarations.MutableGlobal,
+			doc = preview_documentation(written.documentation)
+		},
+		visibility = written.visibility, header_span = written.header_span,
+		initializer = initializer
+	}))
+
+
+private pure func preview_function_header(
+	source: PreviewSource, names: NameTable, preview: FunctionHeaderPreview,
+) -> Result[(NameTable, LegacyFunctionHeaderPreview), LegacyDeclarationPreviewError]:
+	written = preview.header
+	translated ?= preview_callable_header(source, names, written.signature, written.type_parameters,
+		written.constraints, written.annotations, preview_documentation(written.documentation))
+	(extended, header) = translated
+	Ok((extended, {
+		header = header, visibility = written.visibility, body_extent = preview.body_extent,
+		header_span = written.header_span, body_colon = written.body_colon
+	}))
+
+
+private pure func preview_callable_header(
+	source: PreviewSource, names: NameTable, signature: TreeDeclarations.Signature,
+	type_parameters: List[TreeDeclarations.TypeParameter], constraints: List[TreeDeclarations.DimensionConstraint],
+	annotations: List[TreeDeclarations.Annotation], doc: Option[String],
+) -> Result[(NameTable, ParsedFunctionHeader), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, names, signature.name)
+	(after_type_parameters, translated_type_parameters) = preview_type_parameters(source, after_name, type_parameters)
+	translated_parameters ?= preview_parameters(source, after_type_parameters, signature.parameters)
+	(after_parameters, parameters) = translated_parameters
+	translated_return ?= preview_optional_type(source, after_parameters, signature.return_type)
+	(after_return, return_type) = translated_return
+	var extended: NameTable = after_return
+	var translated_constraints: List[ParsedDimConstraint] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for constraint in constraints:
+		match preview_dimension_constraint(source, extended, constraint):
+			Ok((after_constraint, translated)):
+				extended = after_constraint
+				translated_constraints = translated_constraints.append(translated)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None:
+			Ok((extended, {
+				name = name, keyword_span = Some(legacy_location(signature.keyword)),
+				type_params = translated_type_parameters, params = parameters, return_type = return_type,
+				dim_constraints = translated_constraints, is_pure = signature.purity == Kinds.PureFunction,
+				annotations = annotations.map(pure func(annotation): preview_annotation(annotation.annotation)), doc = doc
+			}))
+
+
+private pure func preview_optional_type(
+	source: PreviewSource, names: NameTable, written: Option[TreeTypes.WrittenType],
+) -> Result[(NameTable, Option[ParsedTypeExpr]), LegacyDeclarationPreviewError]:
+	match written:
+		Some(result):
+			translated ?= preview_type(source, names, result)
+			(extended, parsed) = translated
+			Ok((extended, Some(parsed)))
+		None: Ok((names, None))
+
+
+private pure func preview_trait_header(
+	source: PreviewSource, names: NameTable, preview: TraitPreview,
+) -> Result[(NameTable, LegacyTraitHeaderPreview), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, names, preview.name)
+	(after_type_parameters, type_parameters) = preview_type_parameters(source, after_name, preview.type_parameters)
+	var extended: NameTable = after_type_parameters
+	var supertraits: List[ParsedTraitReference] = []
+	for bound in preview.supertraits:
+		(after_bound, translated) = preview_bound(source, extended, bound)
+		extended = after_bound
+		supertraits = supertraits.append(translated)
+	var methods: List[LegacyTraitMethodHeaderPreview] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for method in preview.methods:
+		signature = method.header.signature
+		(after_method, method_name) = preview_identifier(source, extended, signature.name)
+		match preview_parameters(source, after_method, signature.parameters):
+			Ok((after_parameters, parameters)):
+				match preview_optional_type(source, after_parameters, signature.return_type):
+					Ok((after_return, return_type)):
+						extended = after_return
+						methods = methods.append({
+							header = { name = method_name, params = parameters, return_type = return_type, is_pure = signature.purity == Kinds.PureFunction },
+							body_extent = method.body_extent, header_span = method.header.span
+						})
+					Err(error): failure = Some(error)
+			Err(error): failure = Some(error)
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None:
+			Ok((extended, {
+				name = name, type_params = type_parameters, supertraits = supertraits, methods = methods,
+				doc = preview_documentation(preview.documentation), visibility = preview.visibility, owner_span = preview.span
+			}))
+
+
+private pure func preview_implementation_header(
+	source: PreviewSource, names: NameTable, preview: ImplementationPreview,
+) -> Result[(NameTable, LegacyImplementationHeaderPreview), LegacyDeclarationPreviewError]:
+	(after_trait, trait_name) = preview_identifier(source, names, preview.trait_name.name)
+	translated_receiver ?= preview_type(source, after_trait, preview.receiver)
+	(after_receiver, receiver) = translated_receiver
+	var extended: NameTable = after_receiver
+	var methods: List[LegacyImplementationMethodHeaderPreview] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for method in preview.methods:
+		written = method.header
+		match preview_callable_header(source, extended, written.signature, written.type_parameters,
+			written.constraints, written.annotations, None):
+			Ok((after_method, header)):
+				extended = after_method
+				methods = methods.append({ header = header, body = method.body, header_span = written.header_span })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None:
+			Ok((extended, {
+				trait_name = trait_name, for_type = receiver, methods = methods,
+				doc = preview_documentation(preview.documentation), visibility = preview.visibility, owner_span = preview.span
+			}))
+
+
+private pure func preview_dimension_constraint(
+	source: PreviewSource, names: NameTable, constraint: TreeDeclarations.DimensionConstraint,
+) -> Result[(NameTable, ParsedDimConstraint), LegacyDeclarationPreviewError]:
+	translated_left ?= preview_dimension(source, names, constraint.left)
+	(after_left, left) = translated_left
+	translated_right ?= preview_dimension(source, after_left, constraint.right)
+	(extended, right) = translated_right
+	Ok((extended, { left = left, right = right, span = legacy_location(constraint.span) }))
+
+
+private pure func preview_documentation(documentation: Option[Documentation]) -> Option[String]:
+	documentation.map(pure func(written): written.text)
+
+
+private pure func preview_visibility(declaration: ParsedDecl, visibility: Kinds.Visibility, span: Span) -> ParsedDecl:
+	match visibility:
+		Kinds.PublicVisibility:
+			declaration
+		Kinds.PrivateVisibility:
+			PrivateParsedDecl(declaration, legacy_location(span))
+
+
+private pure func preview_import_block(
+	source: PreviewSource, names: NameTable, block: TreeImports.ImportBlock,
+) -> (NameTable, ParsedDecl):
+	var extended: NameTable = names
+	var imports: List[ParsedImportDecl] = []
+	for written in block.imports:
+		var module_alias: Option[ParsedIdentifier] = None
+		match written.alias_name:
+			Some(alias_name):
+				(after_alias, parsed) = preview_identifier(source, extended, alias_name)
+				extended = after_alias
+				module_alias = Some(parsed)
+			None:
+				()
+		var symbols: List[ParsedImportSymbol] = []
+		for item in written.items:
+			(after_name, name) = preview_identifier(source, extended, item.name.name)
+			var after_item: NameTable = after_name
+			var symbol_alias: Option[ParsedIdentifier] = None
+			match item.alias_name:
+				Some(alias_name):
+					(after_alias, parsed) = preview_identifier(source, after_item, alias_name)
+					after_item = after_alias
+					symbol_alias = Some(parsed)
+				None:
+					()
+			var constructors: List[ParsedIdentifier] = []
+			for constructor in item.constructors:
+				(after_constructor, parsed) = preview_identifier(source, after_item, constructor.name)
+				after_item = after_constructor
+				constructors = constructors.append(parsed)
+			extended = after_item
+			symbols = symbols.append({ name = name, symbol_alias = symbol_alias,
+				constructors = constructors, span = legacy_location(item.span) })
+		selected: Option[List[ParsedImportSymbol]] = if symbols.is_empty():
+			None
+		else:
+			Some(symbols)
+		-- Legacy paths use separators from the grammar, excluding source trivia.
+		prefix: String = match written.path.anchor:
+			TreeImports.BareAnchor:
+				""
+			TreeImports.SameDirectoryAnchor:
+				"./"
+			TreeImports.ParentDirectoryAnchor(steps):
+				repeat("../", parent_step_count(steps)).join("")
+			TreeImports.NativePackageAnchor:
+				"pkg/"
+		parts: List[String] = at_least_one_items(written.path.parts)
+			.map(pure func(part): preview_span_text(source, part.span))
+		imports = imports.append({
+			module_path = prefix + parts.join("/"),
+			module_path_span = legacy_location(written.path_span), module_alias = module_alias,
+			symbols = selected,
+			span = legacy_location(written.span)
+		})
+	(extended, ImportBlockParsedDecl(imports, legacy_location(block.span)))
+
+
+private pure func preview_foreign_block(
+	source: PreviewSource, names: NameTable, block: TreeForeign.ForeignBlock,
+) -> Result[(NameTable, ParsedDecl), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var arguments: List[ParsedForeignBlockArg] = []
+	for argument in block.arguments:
+		(after_name, name) = preview_identifier(source, extended, argument.name)
+		extended = after_name
+		arguments = arguments.append({ name = name, value = argument.value, span = legacy_location(argument.span) })
+	var functions: List[ParsedForeignFunctionDecl] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for function in block.functions:
+		match preview_foreign_function(source, extended, function):
+			Ok((after_function, parsed)):
+				extended = after_function
+				functions = functions.append(parsed)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, ForeignBlockParsedDecl(arguments, functions, legacy_location(block.span))))
+
+
+private pure func preview_foreign_function(
+	source: PreviewSource, names: NameTable, function: TreeForeign.ForeignFunction,
+) -> Result[(NameTable, ParsedForeignFunctionDecl), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(source, names, function.name)
+	translated_parameters ?= preview_parameters(source, after_name, function.parameters)
+	(after_parameters, parameters) = translated_parameters
+	translated_return ?= preview_type(source, after_parameters, function.return_type)
+	(after_return, return_type) = translated_return
+	Ok((after_return, {
+		name = name, params = parameters, return_type = return_type,
+		c_name = function.c_name.map(pure func(written): written.name),
+		is_pure = function.purity == Kinds.PureFunction,
+		is_private = function.visibility == Kinds.PrivateVisibility,
+		annotations = function.annotations.map(pure func(written): preview_annotation(written.annotation)),
+		span = legacy_location(function.span)
+	}))
+
+
+private pure func preview_annotation(annotation: Kinds.FunctionAnnotation) -> ParsedFunctionAnnotation:
+	match annotation:
+		Kinds.TailRecursiveAnnotation:
+			ParsedTailRecursiveAnnotation
+		Kinds.NoCopyAnnotation:
+			ParsedNoCopyAnnotation
+		Kinds.DebugOnlyAnnotation:
+			ParsedDebugOnlyAnnotation
+		Kinds.ResourceResultOrdinaryAnnotation:
+			ParsedResourceResultOrdinaryAnnotation
+
+
+private pure func preview_parameters(
+	source: PreviewSource, names: NameTable, written: List[TreeDeclarations.Parameter],
+) -> Result[(NameTable, List[ParsedParam]), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var parameters: List[ParsedParam] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+	for parameter in written:
+		match preview_parameter(source, extended, parameter):
+			Ok((after_parameter, parsed)):
+				extended = after_parameter
+				parameters = parameters.append(parsed)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, parameters))
+
+
+private pure func preview_parameter(
+	source: PreviewSource, names: NameTable, parameter: TreeDeclarations.Parameter,
+) -> Result[(NameTable, ParsedParam), LegacyDeclarationPreviewError]:
+	(after_binding, binder) = preview_parameter_binding(source, names, parameter.binding)
+	match parameter.declared_type:
+		Some(written_type):
+			translated ?= preview_type(source, after_binding, written_type)
+			(after_type, parsed) = translated
+			Ok((after_type, { binder = binder, type_expr = Some(parsed), span = legacy_location(parameter.span) }))
+		None:
+			Ok((after_binding, { binder = binder, type_expr = None, span = legacy_location(parameter.span) }))
+
+
+private pure func preview_parameter_binding(
+	source: PreviewSource, names: NameTable, binding: TreeDeclarations.ParameterBinding,
+) -> (NameTable, ParsedParamBinder):
+	match binding:
+		TreeDeclarations.NamedParameter(binder):
+			(extended, name) = preview_identifier(source, names, binder.name)
+			(extended, ParsedParamNameBinder(name))
+		TreeDeclarations.WildcardParameter(span):
+			(names, ParsedParamWildcardBinder(legacy_location(span)))
+		TreeDeclarations.TupleParameter(binding):
+			var extended: NameTable = names
+			var binders: List[ParsedIdentifier] = []
+			for binder in small_tuple_items(binding.names):
+				(after_name, name) = preview_identifier(source, extended, binder.name)
+				extended = after_name
+				binders = binders.append(name)
+			(extended, ParsedParamTupleBinder(binders, legacy_location(binding.span)))
+
+
+private pure func preview_fields(
+	source: PreviewSource, names: NameTable, written: List[TreeDeclarations.FieldDeclaration],
+) -> Result[(NameTable, List[ParsedFieldDecl]), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var fields: List[ParsedFieldDecl] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+
+	for field in written:
+		(after_name, field_name) = preview_identifier(source, extended, field.name)
+
+		match preview_type(source, after_name, field.field_type):
+			Ok(translated):
+				(after_type, field_type) = translated
+				extended = after_type
+				fields = fields.append({ name = field_name, type_expr = field_type, span = legacy_location(field.span) })
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, fields))
+
+
+private pure func preview_type_parameters(
+	source: PreviewSource, names: NameTable, written: List[TreeDeclarations.TypeParameter],
+) -> (NameTable, List[ParsedTypeParamDecl]):
+	var extended: NameTable = names
+	var parameters: List[ParsedTypeParamDecl] = []
+
+	for parameter in written:
+		match parameter:
+			TreeDeclarations.TypeVariable(variable):
+				(after_name, name) = preview_identifier(source, extended, variable.binder.name)
+				extended = after_name
+				var bounds: List[ParsedTraitReference] = []
+
+				for bound in variable.bounds:
+					(after_bound, translated) = preview_bound(source, extended, bound)
+					extended = after_bound
+					bounds = bounds.append(translated)
+
+				parameters = parameters.append({ name = name, kind = ParsedTypeParameter, bounds = bounds, span = legacy_location(variable.span) })
+			TreeDeclarations.DimensionVariable(binder):
+				(after_name, name) = preview_text_identifier(extended, preview_span_text(source, binder.name.span), binder.name.span)
+				extended = after_name
+				parameters = parameters.append({ name = name, kind = ParsedDimensionParameter, bounds = [], span = legacy_location(binder.name.span) })
+			TreeDeclarations.WildcardDimensionParameter(span):
+				(after_name, name) = preview_text_identifier(extended, PREVIEW_WILDCARD_DIMENSION_NAME, span)
+				extended = after_name
+				parameters = parameters.append({ name = name, kind = ParsedDimensionParameter, bounds = [], span = legacy_location(span) })
+
+	(extended, parameters)
+
+
+-- Syntax-owned spellings synthesized by the legacy AST representation.
+private PREVIEW_VOID_NAME: String = "Void"
+private PREVIEW_WILDCARD_DIMENSION_NAME: String = "#_"
+
+
+private pure func preview_identifier(
+	preview: PreviewSource, names: NameTable, name: WrittenName,
+) -> (NameTable, ParsedIdentifier):
+	preview_text_identifier(names, preview_span_text(preview, name.span), name.span)
+
+
+private pure func preview_text_identifier(
+	names: NameTable, text: String, span: Span,
+) -> (NameTable, ParsedIdentifier):
+	(extended, index) = name_table_intern(names, text)
+	(extended, parsed_identifier(name_id_from_interned_index(index), text, legacy_location(span)))
+
+
+private pure func preview_arguments(
+	preview: PreviewSource, names: NameTable, arguments: List[TreeTypes.TypeArgument],
+) -> Result[(NameTable, List[ParsedTypeExpr]), LegacyDeclarationPreviewError]:
+	var extended: NameTable = names
+	var translated: List[ParsedTypeExpr] = []
+	var failure: Option[LegacyDeclarationPreviewError] = None
+
+	for argument in arguments:
+		match preview_argument(preview, extended, argument):
+			Ok(part):
+				(extended_names, written) = part
+				extended = extended_names
+				translated = translated.append(written)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok((extended, translated))
+
+
+private pure func preview_type(
+	preview: PreviewSource, names: NameTable, written: TreeTypes.WrittenType,
+) -> Result[(NameTable, ParsedTypeExpr), LegacyDeclarationPreviewError]:
+	location: SourceLocation = legacy_location(written.span)
+
+	match written.kind:
+		TreeTypes.NamedType(use, arguments):
+			(after_name, name) = preview_identifier(preview, names, use.name)
+			translated_arguments ?= preview_arguments(preview, after_name, arguments)
+			(extended_names, translated) = translated_arguments
+			Ok((extended_names, ParsedNamedType(name, translated, location)))
+		TreeTypes.QualifiedType(qualifier_use, name_use, arguments):
+			(after_qualifier, qualifier) = preview_identifier(preview, names, qualifier_use.name)
+			(after_name, name) = preview_identifier(preview, after_qualifier, name_use.name)
+			translated_arguments ?= preview_arguments(preview, after_name, arguments)
+			(extended_names, translated) = translated_arguments
+			Ok((extended_names, ParsedQualifiedNamedType(qualifier, name, translated, location)))
+		TreeTypes.VoidType:
+			(extended_names, name) = preview_text_identifier(names, PREVIEW_VOID_NAME, written.span)
+			Ok((extended_names, ParsedNamedType(name, [], location)))
+		TreeTypes.TupleType(elements):
+			translated_elements ?= preview_arguments(preview, names, small_tuple_items(elements))
+			(extended_names, translated) = translated_elements
+			Ok((extended_names, ParsedTupleType(translated, location)))
+		TreeTypes.FunctionType(purity, parameters, result):
+			translated_parameters ?= preview_arguments(preview, names, parameters)
+			(after_parameters, translated) = translated_parameters
+			translated_return_type ?= preview_type(preview, after_parameters, result)
+			(extended_names, translated_result) = translated_return_type
+			Ok((extended_names, ParsedFunctionType(purity == Kinds.PureFunction, translated, translated_result, location)))
+		TreeTypes.ArrayType(element, dimensions):
+			translated_element_part ?= preview_type(preview, names, element)
+			(after_element, translated_element) = translated_element_part
+			arguments: List[TreeTypes.TypeArgument] = at_least_one_items(dimensions).map(pure func(dimension): TreeTypes.DimensionArgument(dimension))
+			translated_dimensions ?= preview_arguments(preview, after_element, arguments)
+			(extended, translated) = translated_dimensions
+			Ok((extended, ParsedArrayType(translated_element, translated, location)))
+		TreeTypes.RangeType(dimension):
+			translated_dimension ?= preview_dimension(preview, names, dimension)
+			(extended_names, translated) = translated_dimension
+			Ok((extended_names, ParsedRangeType(translated, location)))
+		TreeTypes.DimensionType(dimension):
+			preview_dimension(preview, names, dimension)
+		TreeTypes.BoundedType(bounded):
+			preview_bounded_type(preview, names, bounded)
+
+
+private pure func preview_argument(
+	preview: PreviewSource, names: NameTable, argument: TreeTypes.TypeArgument,
+) -> Result[(NameTable, ParsedTypeExpr), LegacyDeclarationPreviewError]:
+	match argument:
+		TreeTypes.TypeArgumentType(written):
+			preview_type(preview, names, written)
+		TreeTypes.DimensionArgument(dimension):
+			preview_dimension(preview, names, dimension)
+		TreeTypes.BoundedArgument(bounded):
+			preview_bounded_type(preview, names, bounded)
+
+
+-- Both receiver shapes preserve the bounded payload's authored location.
+private pure func preview_bounded_type(
+	preview: PreviewSource, names: NameTable, bounded: TreeTypes.BoundedTypeArgument,
+) -> Result[(NameTable, ParsedTypeExpr), LegacyDeclarationPreviewError]:
+	(after_name, name) = preview_identifier(preview, names, bounded.parameter.name)
+	var extended: NameTable = after_name
+	var bounds: List[ParsedTraitReference] = []
+
+	for bound in at_least_one_items(bounded.bounds):
+		(extended_names, translated) = preview_bound(preview, extended, bound)
+		extended = extended_names
+		bounds = bounds.append(translated)
+
+	Ok((extended, ParsedBoundedType(name, bounds, legacy_location(bounded.span))))
+
+
+private pure func preview_bound(
+	preview: PreviewSource, names: NameTable, bound: TreeDeclarations.TraitReference,
+) -> (NameTable, ParsedTraitReference):
+	(after_qualifier, qualifier) = match bound.qualifier:
+		Some(use):
+			(extended_names, name) = preview_identifier(preview, names, use.name)
+			(extended_names, Some(name))
+		None:
+			(names, None)
+
+	(extended_names, name) = preview_identifier(preview, after_qualifier, bound.trait_name.name)
+	(extended_names, { qualifier = qualifier, name = name, span = legacy_location(bound.span) })
+
+
+private pure func preview_dimension(
+	preview: PreviewSource, names: NameTable, dimension: TreeTypes.Dimension,
+) -> Result[(NameTable, ParsedTypeExpr), LegacyDeclarationPreviewError]:
+	location: SourceLocation = legacy_location(dimension.span)
+
+	match dimension.kind:
+		TreeTypes.NamedDimension(use):
+			(extended_names, name) = preview_text_identifier(names, preview_span_text(preview, use.name.span), dimension.span)
+			Ok((extended_names, ParsedDimNameType(name, False, location)))
+		TreeTypes.VariadicNamedDimension(use):
+			(extended_names, name) = preview_text_identifier(names, preview_span_text(preview, use.name.span), use.name.span)
+			Ok((extended_names, ParsedDimNameType(name, True, location)))
+		TreeTypes.WildcardDimension:
+			(extended_names, name) = preview_text_identifier(names, PREVIEW_WILDCARD_DIMENSION_NAME, dimension.span)
+			Ok((extended_names, ParsedDimNameType(name, False, location)))
+		TreeTypes.VariadicWildcardDimension:
+			match preview_variadic_wildcard_span(preview, dimension.span):
+				Some(identifier_span):
+					(extended_names, name) = preview_text_identifier(names, PREVIEW_WILDCARD_DIMENSION_NAME, identifier_span)
+					Ok((extended_names, ParsedDimNameType(name, True, location)))
+				None:
+					Err(MissingVariadicWildcardToken(dimension.span))
+		TreeTypes.LiteralDimension(_):
+			match preview_dimension_literal_text(preview, dimension.span):
+				Some(digits):
+					Ok((names, ParsedDimLiteralType(digits, location)))
+				None:
+					Err(MissingDimensionLiteralToken(dimension.span))
+		TreeTypes.DimensionArithmetic(operator, left, right):
+			translated_left_dimension ?= preview_dimension(preview, names, left)
+			(after_left, translated_left) = translated_left_dimension
+			translated_right_dimension ?= preview_dimension(preview, after_left, right)
+			(extended_names, translated_right) = translated_right_dimension
+			translated_operator: ParsedDimBinaryOp = match operator:
+				TreeTypes.AddDimensions:
+					ParsedDimAddOp
+				TreeTypes.SubtractDimensions:
+					ParsedDimSubtractOp
+				TreeTypes.MultiplyDimensions:
+					ParsedDimMultiplyOp
+				TreeTypes.DivideDimensions:
+					ParsedDimDivideOp
+
+			Ok((extended_names, ParsedDimBinaryType(translated_operator, translated_left, translated_right, location)))

@@ -1,0 +1,137 @@
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		new_parse_state, ParseInputError(InvalidTokenInput, NonLexicalDiagnostic),
+		advanced, current_kind, position, diagnostics, report_expected_after_previous_content,
+		consume_declared_name, consume_ordinary_name, spellings, issued_counts, finished_builtin_type,
+	../../../../src/compiler_new/stage_01_discovery/parse/token_cursor: TokenInputError(InvalidSpellingPayload, SpellingModuleMismatch)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, module_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as TableDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(ExpectedToken, ReservedKeywordAsName)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedColon), ColonConstruct(ColonInFunctionBody), NameConstruct(NameInTypeName)
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(NewlineToken, IndentToken, DedentToken, IdentifierToken)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	test: TestSuite
+
+
+pure func test_malformed_spelling_payload_is_an_input_error() -> Bool:
+	lexed = lex_module(module_id_at_row(0), "name")
+
+	match lexed.tokens.get(0):
+		Some(token):
+			malformed = { lexed | tokens = lexed.tokens.set(0, { token | payload = 99 }) }
+
+			match new_parse_state(malformed):
+				Err(InvalidTokenInput(InvalidSpellingPayload(span, payload))):
+					payload == 99 and span.span_start() == 0 and span.span_end() == 4
+				_:
+					False
+		None:
+			False
+
+
+pure func test_parser_diagnostics_are_rejected_at_the_lexical_bridge() -> Bool:
+	lexed = lex_module(module_id_at_row(0), "name")
+
+	match lexed.tokens.get(0):
+		Some(token):
+			diagnostic: TableDiagnostics.SyntaxDiagnostic = TableDiagnostics.Plain(TableDiagnostics.ExpectedTypeDiagnostic)
+			malformed = { lexed | diagnostics = [{ span = token.span, diagnostic = diagnostic }] }
+
+			match new_parse_state(malformed):
+				Err(NonLexicalDiagnostic(span, TableDiagnostics.Plain(TableDiagnostics.ExpectedTypeDiagnostic))):
+					span.span_start() == 0 and span.span_end() == 4
+				_:
+					False
+		None:
+			False
+
+
+pure func test_spellings_from_another_module_are_rejected_even_when_payload_fits() -> Bool:
+	lexed = lex_module(module_id_at_row(0), "name")
+	other_module_lexed = lex_module(module_id_at_row(1), "name")
+	match new_parse_state({ lexed | spellings = other_module_lexed.spellings }):
+		Err(InvalidTokenInput(SpellingModuleMismatch(expected, actual))):
+			expected.module_id_index() == 0 and actual.module_id_index() == 1
+		_:
+			False
+
+
+-- Real lexical layout follows `1`; a diagnostic after that authored content
+-- must end at4 even after the cursor has consumed the dedent at5.
+pure func test_previous_content_diagnostic_ignores_consumed_lexical_layout() -> Bool:
+	lexed = lex_module(module_id_at_row(0), "x\n\t1\nz")
+	layout_is_real: Bool = match (lexed.tokens.get(1), lexed.tokens.get(2), lexed.tokens.get(4)):
+		(Some(newline), Some(indent), Some(dedent)):
+			newline.kind == NewlineToken and indent.kind == IndentToken and dedent.kind == DedentToken
+		_:
+			False
+
+	match new_parse_state(lexed):
+		Ok(state):
+			-- Consume x, its newline/indent, 1, then its dedent.
+			at_next_name = state.advanced().advanced().advanced().advanced().advanced()
+			reported = at_next_name.report_expected_after_previous_content(ExpectedColon(ColonInFunctionBody))
+			match reported.diagnostics():
+				[at]:
+					match at.diagnostic:
+						ExpectedToken(ExpectedColon(ColonInFunctionBody)):
+							(layout_is_real and at.span.span_start() == 4 and at.span.span_end() == 4
+								and reported.current_kind() == IdentifierToken and reported.position() == at_next_name.position())
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+-- Both declaration entry points preserve the reserved spelling for the
+-- diagnostic, consume one token, and never publish a name or mint an owner.
+pure func test_reserved_declared_and_ordinary_names_report_empty_start_without_ids() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "name if next")):
+		Ok(initial):
+			(_, witness_name) = initial.consume_declared_name(NameInTypeName)
+			match witness_name:
+				Some(witness_name):
+					var correct: Bool = True
+					for ordinary in [False, True]:
+						entry = initial.advanced()
+						(parsed, name) = if ordinary:
+							entry.consume_ordinary_name(NameInTypeName)
+						else:
+							entry.consume_declared_name(NameInTypeName)
+						(_, witness) = parsed.finished_builtin_type(PublicVisibility, None, witness_name, [], witness_name.span)
+						match (name, parsed.diagnostics().get(0)):
+							(None, Some(at)):
+								match at.diagnostic:
+									ReservedKeywordAsName(spelling):
+										correct = (correct and at.span.span_start() == 5 and at.span.span_end() == 5
+											and parsed.spellings().spelling_text(spelling) == Some("if") and parsed.diagnostics().length() == 1
+											and parsed.position() == entry.position() + 1 and parsed.position() == 2 and parsed.current_kind() == IdentifierToken
+											and parsed.issued_counts().binders == 0 and parsed.issued_counts().type_binders == 0 and parsed.issued_counts().name_uses == 0
+											and witness.id.definition_local_index() == 0)
+									_:
+										correct = False
+							_:
+								correct = False
+					correct
+				None:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Direct tree parse input boundary",
+	tests = [
+		("reserved declared and ordinary names report empty start without IDs", test_reserved_declared_and_ordinary_names_report_empty_start_without_ids),
+		("previous content diagnostic ignores consumed lexical layout", test_previous_content_diagnostic_ignores_consumed_lexical_layout),
+		("malformed spelling payload is an input error", test_malformed_spelling_payload_is_an_input_error),
+		("parser diagnostics rejected at lexical bridge", test_parser_diagnostics_are_rejected_at_the_lexical_bridge),
+		("spellings from another module rejected even when payload fits", test_spellings_from_another_module_are_rejected_even_when_payload_fits)
+	]
+}

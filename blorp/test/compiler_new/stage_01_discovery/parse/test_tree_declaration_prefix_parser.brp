@@ -1,0 +1,285 @@
+-- Prefix grammar owns metadata only; non-function declarations stay deferred.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser:
+		DeclarationPrefix, parse_declaration_prefix, PrefixedFunctionParse(ParsedPrefixedFunction, RejectedPrefixedFunction, DeferredPrefixedDeclaration), parse_prefixed_function_header
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: FunctionBodyExtent(ForwardDeclaration, SkippedBody), deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken, UnknownAnnotation)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(AnnotationArgumentsDiagnostic, AnnotationWithoutFunctionDiagnostic, DocstringBeforeImportBlockDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName), NameConstruct(NameInAnnotationName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(PureFunction, ImpureFunction), FunctionAnnotation(TailRecursiveAnnotation, NoCopyAnnotation, DebugOnlyAnnotation, ResourceResultOrdinaryAnnotation)
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(FuncKeyword, IdentifierToken, RightParenSymbol, IndentToken, NewlineToken, DocStringToken, ImportKeyword, EndOfFileToken)
+	test: TestSuite
+
+
+private union ExpectedPrefixDiagnostic:
+	Simple(PlainSyntaxCode)
+	MissingAnnotationName
+	UnknownAnnotationName(String)
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func diagnostics_match(state: ParseState, expected: List[(ExpectedPrefixDiagnostic, Int, Int)]) -> Bool:
+	var correct: Bool = state.diagnostic_count() == expected.length()
+
+	if correct:
+		for (actual, wanted) in state.diagnostics().zip(expected):
+			(code, first, last) = wanted
+			correct = correct and actual.span.covers(first, last)
+			match (actual.diagnostic, code):
+				(Plain(found), Simple(wanted_code)):
+					correct = correct and found == wanted_code
+				(ExpectedToken(ExpectedName(NameInAnnotationName)), MissingAnnotationName):
+					void
+				(UnknownAnnotation(spelling), UnknownAnnotationName(name)):
+					correct = correct and state.spellings().spelling_text(spelling) == Some(name)
+				_:
+					correct = False
+	correct
+
+
+private pure func prefix_case(
+	text: String, start_first: Int, start_last: Int, visibility: Visibility, purity: Purity,
+	documentation: Option[(String, Int, Int)], annotations: List[(FunctionAnnotation, Int, Int)],
+	expected: List[(ExpectedPrefixDiagnostic, Int, Int)], cursor: TokenKind, first: Int, last: Int, token_position: Int,
+) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, prefix) = parse_declaration_prefix(state)
+			var correct: Bool = (prefix.start.covers(start_first, start_last) and prefix.visibility == visibility and prefix.purity == purity
+				and parsed.current_kind() == cursor and parsed.current_span().covers(first, last) and parsed.position() == token_position
+				and diagnostics_match(parsed, expected) and prefix.annotations.length() == annotations.length())
+			match (prefix.documentation, documentation):
+				(None, None):
+					void
+				(Some(actual), Some((content, doc_first, doc_last))):
+					correct = correct and actual.text == content and actual.span.covers(doc_first, doc_last)
+				_:
+					correct = False
+			for (actual, wanted_annotation) in prefix.annotations.zip(annotations):
+				(annotation, annotation_first, annotation_last) = wanted_annotation
+				correct = correct and actual.annotation == annotation and actual.span.covers(annotation_first, annotation_last)
+			counts = parsed.issued_counts()
+			correct and counts.binders == 0 and counts.type_binders == 0 and counts.name_uses == 0 and counts.written_types == 0 and counts.dimensions == 0 and counts.expressions == 0 and counts.blocks == 0
+		Err(_):
+			False
+
+
+private pure func rejected_function(text: String, expected: List[(ExpectedPrefixDiagnostic, Int, Int)], eof: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_prefixed_function_header(state)
+			match result:
+				RejectedPrefixedFunction:
+					parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(eof, eof) and diagnostics_match(parsed, expected) and parsed.issued_counts().expressions == 0 and parsed.issued_counts().blocks == 0
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func deferred_case(text: String, expected: List[(ExpectedPrefixDiagnostic, Int, Int)], cursor: TokenKind, first: Int, last: Int, token_position: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_prefixed_function_header(state)
+			match result:
+				DeferredPrefixedDeclaration(prefix):
+					parsed.current_kind() == cursor and parsed.current_span().covers(first, last) and parsed.position() == token_position and diagnostics_match(parsed, expected) and prefix.start.span_start() == 0
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_defaults_leave_introducer_untouched() -> Bool:
+	(prefix_case("func f():", 0, 4, PublicVisibility, ImpureFunction, None, [], [], FuncKeyword, 0, 4, 0)
+		and prefix_case("import:", 0, 6, PublicVisibility, ImpureFunction, None, [], [], ImportKeyword, 0, 6, 0))
+
+
+pure func test_documentation_and_known_annotations_preserve_authored_metadata() -> Bool:
+	(prefix_case("---\nDocs.\n---\n@tail_recursive\n@no_copy pure func f():", 0, 14, PublicVisibility, PureFunction, Some(("Docs.", 0, 14)), [(TailRecursiveAnnotation, 15, 29), (NoCopyAnnotation, 31, 38)], [], FuncKeyword, 44, 48, 7))
+
+
+pure func test_all_known_annotations_and_repetition_preserve_order() -> Bool:
+	(prefix_case("@tail_recursive @no_copy @debug_only @resource_result_ordinary @no_copy func f():", 0, 1, PublicVisibility, ImpureFunction, None, [(TailRecursiveAnnotation, 1, 15), (NoCopyAnnotation, 17, 24), (DebugOnlyAnnotation, 26, 36), (ResourceResultOrdinaryAnnotation, 38, 62), (NoCopyAnnotation, 64, 71)], [], FuncKeyword, 72, 76, 10))
+
+
+pure func test_private_annotations_and_repeated_pure_compose() -> Bool:
+	(prefix_case("private @no_copy pure func f():", 0, 7, PrivateVisibility, PureFunction, None, [(NoCopyAnnotation, 9, 16)], [], FuncKeyword, 22, 26, 4)
+		and prefix_case("pure private pure func f():", 0, 4, PrivateVisibility, PureFunction, None, [], [], FuncKeyword, 18, 22, 3)
+		and repeated_pure_private_forward())
+
+
+private pure func repeated_pure_private_forward() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "pure private pure func f():")):
+		Ok(state):
+			(parsed, result) = parse_prefixed_function_header(state)
+			match result:
+				ParsedPrefixedFunction(preview):
+					match preview.body_extent:
+						ForwardDeclaration:
+							(preview.header.visibility == PrivateVisibility and preview.header.signature.purity == PureFunction
+								and preview.header.header_span.covers(0, 27) and preview.header.documentation.is_none() and preview.header.annotations.is_empty()
+								and parsed.position() == 8 and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(27, 27) and parsed.diagnostic_count() == 0)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_pre_private_annotation_reports_before_complete_body_rejection() -> Bool:
+	(prefix_case("@no_copy private pure func f(): 1", 0, 1, PrivateVisibility, PureFunction, None, [(NoCopyAnnotation, 1, 8)], [(Simple(AnnotationWithoutFunctionDiagnostic), 9, 9)], FuncKeyword, 22, 26, 4)
+		and rejected_function("@no_copy private pure func f(): 1", [(Simple(AnnotationWithoutFunctionDiagnostic), 9, 9)], 33))
+
+
+pure func test_unknown_annotations_do_not_count_and_pure_resets_start() -> Bool:
+	(prefix_case("@unknown pure func f():", 9, 13, PublicVisibility, PureFunction, None, [], [(UnknownAnnotationName("unknown"), 1, 8)], FuncKeyword, 14, 18, 3)
+		and prefix_case("@unknown private func f():", 0, 1, PrivateVisibility, ImpureFunction, None, [], [(UnknownAnnotationName("unknown"), 1, 8)], FuncKeyword, 17, 21, 3)
+		and rejected_function("@unknown private func f():", [(UnknownAnnotationName("unknown"), 1, 8)], 26))
+
+
+pure func test_annotation_newline_ownership_changes_after_private() -> Bool:
+	(prefix_case("@no_copy\nprivate func f():", 0, 1, PrivateVisibility, ImpureFunction, None, [(NoCopyAnnotation, 1, 8)], [(Simple(AnnotationWithoutFunctionDiagnostic), 9, 9)], FuncKeyword, 17, 21, 4)
+		and prefix_case("private @no_copy\nfunc f():", 0, 7, PrivateVisibility, ImpureFunction, None, [(NoCopyAnnotation, 9, 16)], [(Simple(AnnotationWithoutFunctionDiagnostic), 17, 17)], NewlineToken, 17, 17, 3)
+		and deferred_case("private @no_copy\nfunc f():", [(Simple(AnnotationWithoutFunctionDiagnostic), 17, 17)], NewlineToken, 17, 17, 3))
+
+
+pure func test_private_and_pure_do_not_skip_newlines() -> Bool:
+	(prefix_case("private\nfunc f():", 0, 7, PrivateVisibility, ImpureFunction, None, [], [], NewlineToken, 8, 8, 1)
+		and prefix_case("pure\nfunc f():", 0, 4, PublicVisibility, PureFunction, None, [], [], NewlineToken, 5, 5, 1)
+		and deferred_case("private\nfunc f():", [], NewlineToken, 8, 8, 1)
+		and deferred_case("pure\nfunc f():", [], NewlineToken, 5, 5, 1))
+
+
+pure func test_missing_annotation_names_recover_one_authored_token() -> Bool:
+	(prefix_case("@", 0, 1, PublicVisibility, ImpureFunction, None, [], [(MissingAnnotationName, 1, 1)], EndOfFileToken, 1, 1, 1)
+		and prefix_case("@123 func f():", 0, 1, PublicVisibility, ImpureFunction, None, [], [(MissingAnnotationName, 1, 1)], FuncKeyword, 5, 9, 2)
+		and prefix_case("@ func f():", 0, 1, PublicVisibility, ImpureFunction, None, [], [(MissingAnnotationName, 2, 2)], IdentifierToken, 7, 8, 2)
+		and rejected_function("@123 func f():", [(MissingAnnotationName, 1, 1)], 14))
+
+
+pure func test_annotation_arguments_stop_at_first_close_newline_or_eof() -> Bool:
+	(prefix_case("@no_copy(1) func f():", 0, 1, PublicVisibility, ImpureFunction, None, [(NoCopyAnnotation, 1, 8)], [(Simple(AnnotationArgumentsDiagnostic), 8, 8)], FuncKeyword, 12, 16, 5)
+		and prefix_case("@no_copy(1, (2)) func f():", 0, 1, PublicVisibility, ImpureFunction, None, [(NoCopyAnnotation, 1, 8)], [(Simple(AnnotationArgumentsDiagnostic), 8, 8), (Simple(AnnotationWithoutFunctionDiagnostic), 15, 15)], RightParenSymbol, 15, 16, 8)
+		and prefix_case("@no_copy(:\n\t1\nfunc f():", 0, 1, PublicVisibility, ImpureFunction, None, [(NoCopyAnnotation, 1, 8)], [(Simple(AnnotationArgumentsDiagnostic), 8, 8), (Simple(AnnotationWithoutFunctionDiagnostic), 11, 11)], IndentToken, 11, 12, 5)
+		and prefix_case("@no_copy(1", 0, 1, PublicVisibility, ImpureFunction, None, [(NoCopyAnnotation, 1, 8)], [(Simple(AnnotationArgumentsDiagnostic), 8, 8), (Simple(AnnotationWithoutFunctionDiagnostic), 10, 10)], EndOfFileToken, 10, 10, 4)
+		and rejected_function("@no_copy(1) func f():", [(Simple(AnnotationArgumentsDiagnostic), 8, 8)], 21))
+
+
+pure func test_second_docstring_and_doc_after_annotation_remain_authored_material() -> Bool:
+	(prefix_case("---\nFirst\n---\n---\nSecond\n---\nfunc f():", 0, 14, PublicVisibility, ImpureFunction, Some(("First", 0, 14)), [], [], DocStringToken, 14, 29, 1)
+		and prefix_case("@no_copy\n---\nDocs\n---\nfunc f():", 0, 1, PublicVisibility, ImpureFunction, None, [(NoCopyAnnotation, 1, 8)], [(Simple(AnnotationWithoutFunctionDiagnostic), 9, 9)], DocStringToken, 9, 22, 3)
+		and deferred_case("---\nFirst\n---\n---\nSecond\n---\nfunc f():", [], DocStringToken, 14, 29, 1))
+
+
+pure func test_documented_annotated_import_reports_in_order_without_dispatch() -> Bool:
+	(prefix_case("---\nDocs\n---\n@no_copy import:", 0, 13, PublicVisibility, ImpureFunction, Some(("Docs", 0, 13)), [(NoCopyAnnotation, 14, 21)], [(Simple(AnnotationWithoutFunctionDiagnostic), 22, 22), (Simple(DocstringBeforeImportBlockDiagnostic), 0, 13)], ImportKeyword, 22, 28, 3)
+		and deferred_case("---\nDocs\n---\n@no_copy import:", [(Simple(AnnotationWithoutFunctionDiagnostic), 22, 22), (Simple(DocstringBeforeImportBlockDiagnostic), 0, 13)], ImportKeyword, 22, 28, 3))
+
+
+pure func test_rich_documented_forward_header_composes_existing_children() -> Bool:
+	text: String = "---\nDocs.\n---\n@no_copy pure func apply[T: m.Eq + Hashable, #N, #_](x: T) -> T[#N] where #N == #3:"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_prefixed_function_header(state)
+			match result:
+				ParsedPrefixedFunction(preview):
+					header = preview.header
+					match (header.documentation, header.annotations, preview.body_extent):
+						(Some(doc), [annotation], ForwardDeclaration):
+							counts = parsed.issued_counts()
+							(header.header_span.covers(0, 97) and header.visibility == PublicVisibility and header.signature.purity == PureFunction
+								and doc.text == "Docs." and doc.span.covers(0, 14) and annotation.annotation == NoCopyAnnotation and annotation.span.covers(15, 22)
+								and header.signature.keyword.covers(28, 32) and header.signature.name.span.covers(33, 38)
+								and header.type_parameters.length() == 3 and header.signature.parameters.length() == 1 and header.signature.return_type.is_some() and header.constraints.length() == 1
+								and counts.binders == 1 and counts.type_binders == 2 and counts.name_uses == 7 and counts.written_types == 3 and counts.dimensions == 3
+								and counts.blocks == 0 and counts.expressions == 0 and parsed.position() == 36 and parsed.current_kind() == EndOfFileToken and parsed.current_span().covers(97, 97) and parsed.diagnostic_count() == 0)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func attached_body(text: String, visibility: Visibility, purity: Purity, annotation: FunctionAnnotation, annotation_first: Int, annotation_last: Int, header_end: Int, body_first: Int, body_last: Int, token_first: Int, token_last: Int, next_first: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_prefixed_function_header(state)
+			match result:
+				ParsedPrefixedFunction(preview):
+					match (preview.header.annotations, preview.body_extent):
+						([actual], SkippedBody(body)):
+							(preview.header.visibility == visibility and preview.header.signature.purity == purity and preview.header.documentation.is_none()
+								and actual.annotation == annotation and actual.span.covers(annotation_first, annotation_last) and preview.header.header_span.covers(0, header_end)
+								and body.deferred_body_span().covers(body_first, body_last) and body.deferred_body_token_start() == token_first and body.deferred_body_token_end() == token_last
+								and parsed.position() == token_last and parsed.current_kind() == FuncKeyword and parsed.current_span().covers(next_first, next_first + 4)
+								and parsed.diagnostic_count() == 0 and parsed.issued_counts().expressions == 0 and parsed.issued_counts().blocks == 0)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_inline_and_indented_bodies_attach_after_prefix_metadata() -> Bool:
+	(attached_body("@debug_only func f(): 1\nfunc g():", PublicVisibility, ImpureFunction, DebugOnlyAnnotation, 1, 11, 21, 22, 23, 7, 9, 24)
+		and attached_body("private @no_copy pure func f():\n\t1\nfunc g():", PrivateVisibility, PureFunction, NoCopyAnnotation, 9, 16, 31, 33, 34, 9, 13, 35))
+
+
+pure func test_sequential_function_parses_do_not_leak_metadata() -> Bool:
+	text: String = "---\nDocs\n---\nprivate @no_copy pure func f(): 1\nfunc g():"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(first_state, first_result) = parse_prefixed_function_header(state)
+			(second_state, second_result) = parse_prefixed_function_header(first_state)
+			match (first_result, second_result):
+				(ParsedPrefixedFunction(first), ParsedPrefixedFunction(second)):
+					match (first.header.documentation, first.header.annotations, first.body_extent, second.body_extent):
+						(Some(doc), [annotation], SkippedBody(body), ForwardDeclaration):
+							(first.header.visibility == PrivateVisibility and first.header.signature.purity == PureFunction and first.header.header_span.covers(0, 44)
+								and doc.text == "Docs" and doc.span.covers(0, 13) and annotation.annotation == NoCopyAnnotation and annotation.span.covers(22, 29)
+								and body.deferred_body_span().covers(45, 46) and body.deferred_body_token_start() == 10 and body.deferred_body_token_end() == 12
+								and first_state.position() == 12 and first_state.current_kind() == FuncKeyword and first_state.current_span().covers(47, 51)
+								and second.header.visibility == PublicVisibility and second.header.signature.purity == ImpureFunction and second.header.documentation.is_none() and second.header.annotations.is_empty()
+								and second.header.header_span.covers(47, 56) and second.header.signature.keyword.covers(47, 51) and second.header.signature.name.span.covers(52, 53)
+								and second_state.position() == 17 and second_state.current_kind() == EndOfFileToken and second_state.current_span().covers(56, 56) and second_state.diagnostic_count() == 0
+								and second_state.issued_counts().expressions == 0 and second_state.issued_counts().blocks == 0)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Direct declaration prefix metadata and function header composition",
+	tests = [
+		("defaults leave introducer untouched", test_defaults_leave_introducer_untouched),
+		("documentation and known annotations preserve authored metadata", test_documentation_and_known_annotations_preserve_authored_metadata),
+		("all known annotations and repetition preserve order", test_all_known_annotations_and_repetition_preserve_order),
+		("private annotations and repeated pure compose", test_private_annotations_and_repeated_pure_compose),
+		("pre private annotation reports before complete body rejection", test_pre_private_annotation_reports_before_complete_body_rejection),
+		("unknown annotations do not count and pure resets start", test_unknown_annotations_do_not_count_and_pure_resets_start),
+		("annotation newline ownership changes after private", test_annotation_newline_ownership_changes_after_private),
+		("private and pure do not skip newlines", test_private_and_pure_do_not_skip_newlines),
+		("missing annotation names recover one authored token", test_missing_annotation_names_recover_one_authored_token),
+		("annotation arguments stop at first close newline or eof", test_annotation_arguments_stop_at_first_close_newline_or_eof),
+		("second docstring and doc after annotation remain authored material", test_second_docstring_and_doc_after_annotation_remain_authored_material),
+		("documented annotated import reports in order without dispatch", test_documented_annotated_import_reports_in_order_without_dispatch),
+		("rich documented forward header composes existing children", test_rich_documented_forward_header_composes_existing_children),
+		("inline and indented bodies attach after prefix metadata", test_inline_and_indented_bodies_attach_after_prefix_metadata),
+		("sequential function parses do not leak metadata", test_sequential_function_parses_do_not_leak_metadata)
+	]
+}

@@ -1,0 +1,417 @@
+-- One declaration step only: no module loop, module docs or initializer grammar.
+-- Deferred bodies are lexical evidence; completed leaf/owner recovery is frozen.
+import:
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: RecordDeclarationForm(FixedRecord), GlobalForm(ConstantGlobal, MutableGlobal)
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
+		DeclarationPreview(GlobalDeclarationPreview, RecordDeclarationPreview, AliasDeclarationPreview, BuiltinTypeDeclarationPreview, ResourceTypeDeclarationPreview, UnionDeclarationPreview, EnumDeclarationPreview, ImportBlockDeclarationPreview, ForeignBlockDeclarationPreview, FunctionDeclarationPreview, TraitDeclarationPreview, ImplementationDeclarationPreview),
+		DeclarationPreviewParse(ParsedDeclarationPreview, DeferredGlobalInitializer, RejectedGlobalInitializer, RejectedDeclarationPreview), parse_declaration_preview
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser: parse_declaration_prefix
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_builtin_type_parser: BuiltinTypeForm(PlainBuiltinType, ResourceBuiltinType), parse_builtin_type
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_record_parser: parse_record
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderParse(ParsedGlobalHeader, RejectedGlobalHeader), parse_global_header
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_declaration
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parser_cursor as FrozenCursor
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, type_binder_local_index, name_use_local_index, binder_local_index, written_type_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedColon, ExpectedRightBracket, ExpectedRightParen, ExpectedNewline, ExpectedIndent, ExpectedKeyword, ExpectedLeftParen, ExpectedEqual, ExpectedRightBrace), NameConstruct(NameInTraitName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(PureFunction, ImpureFunction)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(IdentifierToken, LeftBracketSymbol, NewlineToken, EndOfFileToken, IntLiteralToken, ImportKeyword, ForeignKeyword, EqualSymbol, VarKeyword, RecordKeyword)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func frozen(text: String) -> DiscoveryBuilder:
+	lexed = lex_module(module_id_at_row(0), text)
+	prepared = empty_discovery_builder().admit_source("declaration.brp", text).bridge_lexed_module(lexed)
+	parse_declaration(prepared, module_id_at_row(0))
+
+
+private pure func expected_token_matches(actual: ExpectedTokenDiagnostic, wanted: ExpectedTokenDiagnostic) -> Bool:
+	match (actual, wanted):
+		(ExpectedName(actual), ExpectedName(wanted)):
+			actual == wanted
+		(ExpectedColon(actual), ExpectedColon(wanted)):
+			actual == wanted
+		(ExpectedRightBracket(actual), ExpectedRightBracket(wanted)):
+			actual == wanted
+		(ExpectedRightParen(actual), ExpectedRightParen(wanted)):
+			actual == wanted
+		(ExpectedNewline(actual), ExpectedNewline(wanted)):
+			actual == wanted
+		(ExpectedIndent(actual), ExpectedIndent(wanted)):
+			actual == wanted
+		(ExpectedKeyword(actual), ExpectedKeyword(wanted)):
+			actual == wanted
+		(ExpectedLeftParen(actual), ExpectedLeftParen(wanted)):
+			actual == wanted
+		(ExpectedEqual(actual), ExpectedEqual(wanted)):
+			actual == wanted
+		(ExpectedRightBrace(actual), ExpectedRightBrace(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func matches_frozen(state: ParseState, reference: DiscoveryBuilder) -> Bool:
+	var correct: Bool = (state.diagnostic_count() == reference.diagnostics.length() and state.position() == reference.token_cursor
+		and state.current_kind() == FrozenCursor.current_kind(reference) and state.current_span().spans_equal(FrozenCursor.current_span(reference)))
+	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics):
+		correct = correct and actual.span.spans_equal(wanted.span)
+		match (actual.diagnostic, wanted.diagnostic):
+			(TreeDiagnostics.Plain(actual), FrozenDiagnostics.Plain(wanted)):
+				correct = correct and actual == wanted
+			(TreeDiagnostics.ExpectedToken(actual), FrozenDiagnostics.ExpectedToken(wanted)):
+				correct = correct and expected_token_matches(actual, wanted)
+			(TreeDiagnostics.ReservedKeywordAsName(actual), FrozenDiagnostics.ReservedKeywordAsName(wanted)) | (TreeDiagnostics.UnknownAnnotation(actual), FrozenDiagnostics.UnknownAnnotation(wanted)):
+				correct = correct and state.spellings().spelling_text(actual) == reference.name_spellings.get(wanted.name_id_index())
+			_:
+				-- Exact variant/construct/order/span parity; no code-name normalization.
+				correct = False
+	correct
+
+
+private enum Route:
+	GlobalRoute
+	RecordRoute
+	AliasRoute
+	BuiltinRoute
+	ResourceRoute
+	UnionRoute
+	EnumRoute
+	ImportRoute
+	ForeignRoute
+	FunctionRoute
+	TraitRoute
+	ImplementationRoute
+
+
+private pure func route_of(preview: DeclarationPreview) -> Route:
+	match preview:
+		GlobalDeclarationPreview(_):
+			GlobalRoute
+		RecordDeclarationPreview(_):
+			RecordRoute
+		AliasDeclarationPreview(_):
+			AliasRoute
+		BuiltinTypeDeclarationPreview(_):
+			BuiltinRoute
+		ResourceTypeDeclarationPreview(_):
+			ResourceRoute
+		UnionDeclarationPreview(_):
+			UnionRoute
+		EnumDeclarationPreview(_):
+			EnumRoute
+		ImportBlockDeclarationPreview(_):
+			ImportRoute
+		ForeignBlockDeclarationPreview(_):
+			ForeignRoute
+		FunctionDeclarationPreview(_):
+			FunctionRoute
+		TraitDeclarationPreview(_):
+			TraitRoute
+		ImplementationDeclarationPreview(_):
+			ImplementationRoute
+
+
+private pure func parsed(text: String) -> Option[(ParseState, DeclarationPreviewParse)]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			Some(parse_declaration_preview(state))
+		Err(_):
+			None
+
+
+private pure func completed(text: String, wanted: Route) -> Bool:
+	reference = frozen(text)
+	match parsed(text):
+		Some((state, ParsedDeclarationPreview(preview))):
+			var correct: Bool = route_of(preview) == wanted and matches_frozen(state, reference) and state.diagnostic_count() == 0
+			match preview:
+				GlobalDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				RecordDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				AliasDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				BuiltinTypeDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				ResourceTypeDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				UnionDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				EnumDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				ImportBlockDeclarationPreview(value):
+					correct = correct and reference.import_blocks.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				ForeignBlockDeclarationPreview(value):
+					correct = correct and reference.foreign_blocks.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				FunctionDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.header.signature.name.span.spans_equal(owner.name_span)) == Some(True)
+				TraitDeclarationPreview(value):
+					correct = correct and reference.definitions.get(0).map(pure func(owner): value.span.spans_equal(owner.span)) == Some(True)
+				ImplementationDeclarationPreview(_):
+					-- Never called for a deferred implementation body: M4 owns
+					-- expression parsing and its cursor/diagnostic contract.
+					correct = False
+			correct
+		_:
+			False
+
+
+private pure func rejected(text: String) -> Bool:
+	match parsed(text):
+		Some((state, RejectedDeclarationPreview)):
+			matches_frozen(state, frozen(text)) and state.diagnostic_count() > 0
+		_:
+			False
+
+
+pure func test_completed_routes_and_keyword_priorities() -> Bool:
+	(completed("record R {} next", RecordRoute) and completed("record S {} next", RecordRoute)
+		and completed("type alias A = Int next", AliasRoute) and completed("opaque type A = Int next", AliasRoute)
+		and completed("type T = builtin next", BuiltinRoute) and completed("resource type T = builtin next", ResourceRoute)
+		and completed("union U:\n\tA\nnext", UnionRoute) and completed("enum E:\n\tA\nnext", EnumRoute))
+
+
+pure func test_public_import_and_foreign_are_owner_routes() -> Bool:
+	(completed("import:\n\theap\nnext", ImportRoute)
+		and completed("foreign:\n\tfunc f() -> Int\nnext", ForeignRoute)
+		and private_global_boundary("private import:\n\theap\nnext", 17)
+		and private_global_boundary("private foreign:\n\tfunc f() -> Int\nnext", 18))
+
+
+pure func test_function_trait_and_implementation_stay_previews() -> Bool:
+	match parsed("implements Eq for Int:\n\tfunc f(): 1\nnext"):
+		Some((state, ParsedDeclarationPreview(ImplementationDeclarationPreview(value)))):
+			match value.methods:
+				[method]:
+					(completed("func f():\nnext", FunctionRoute) and completed("trait T: Eq\nnext", TraitRoute)
+						and value.span.covers(0, 36) and method.header.header_span.covers(24, 33) and method.body.deferred_body_span().covers(34, 35)
+						and state.current_kind() == IdentifierToken and state.current_span().covers(36, 40)
+						and state.diagnostic_count() == 0 and state.issued_counts().expressions == 0 and state.issued_counts().blocks == 0)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_prefix_diagnostics_reject_from_before_prefix_scan() -> Bool:
+	(rejected("@no_copy record R {} next") and rejected("@unknown func f():")
+		and rejected("@no_copy private func f():") and rejected("private @no_copy\nfunc f():")
+		and rejected("private @unknown func f():") and rejected("---\nDoc\n---\nimport:\n\theap\nnext"))
+
+
+pure func test_private_documentation_and_pure_metadata_are_composed() -> Bool:
+	match parsed("---\nDoc\n---\nprivate @no_copy pure func f():"):
+		Some((state, ParsedDeclarationPreview(FunctionDeclarationPreview(value)))):
+			match (value.header.documentation, value.header.annotations):
+				(Some(doc), [annotation]):
+					(doc.text == "Doc" and value.header.visibility == PrivateVisibility and value.header.signature.purity == PureFunction
+						and value.header.header_span.covers(0, 43) and annotation.span.covers(21, 28) and state.diagnostic_count() == 0)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_fixed_record_uses_exact_spelling_and_accepts_parameters() -> Bool:
+	match parsed("fixed record P[T] {} next"):
+		Some((state, ParsedDeclarationPreview(RecordDeclarationPreview(declaration)))):
+			(completed("fixed record P {} next", RecordRoute) and completed("fixed record P[T] {} next", RecordRoute)
+				and declaration.form == FixedRecord and declaration.type_parameters.length() == 1
+				and state.current_kind() == IdentifierToken and state.current_span().covers(21, 25) and state.position() == 8
+				and state.diagnostic_count() == 0 and state.issued_counts().type_binders == 1 and state.issued_counts().written_types == 0)
+		_: False
+
+
+private pure func diagnostics_match_leaf(state: ParseState, reference: ParseState) -> Bool:
+	var correct: Bool = state.diagnostic_count() == reference.diagnostic_count()
+	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics()):
+		correct = correct and actual.span.spans_equal(wanted.span)
+		match (actual.diagnostic, wanted.diagnostic):
+			(TreeDiagnostics.Plain(actual), TreeDiagnostics.Plain(wanted)):
+				correct = correct and actual == wanted
+			(TreeDiagnostics.ExpectedToken(actual), TreeDiagnostics.ExpectedToken(wanted)):
+				correct = correct and expected_token_matches(actual, wanted)
+			(TreeDiagnostics.ReservedKeywordAsName(actual), TreeDiagnostics.ReservedKeywordAsName(wanted)) | (TreeDiagnostics.UnknownAnnotation(actual), TreeDiagnostics.UnknownAnnotation(wanted)):
+				correct = correct and state.spellings().spelling_text(actual) == reference.spellings().spelling_text(wanted)
+			_:
+				correct = False
+	correct
+
+
+private pure func no_global_or_initializer_ids(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(entry):
+			(_, name) = entry.consume_declared_name(NameInTraitName)
+			match name:
+				Some(name):
+					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					(witness.id.definition_local_index() == 0 and counts.binders == 0 and counts.type_binders == 0
+						and counts.expressions == 0 and counts.blocks == 0 and counts.statements == 0 and counts.patterns == 0)
+				None:
+					False
+		Err(_):
+			False
+
+
+-- Global comparisons use the completed header leaf, never frozen expression
+-- parsing. Both success and rejection are hard handoffs at initializer entry.
+private pure func global_boundary(text: String, rejected_header: Bool, first: Int, last: Int, cursor: TokenKind) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(after_prefix, prefix) = parse_declaration_prefix(entry)
+			form: GlobalForm = if after_prefix.current_kind() == VarKeyword:
+				MutableGlobal
+			else:
+				ConstantGlobal
+			at_name = if form == MutableGlobal:
+				after_prefix.advanced()
+			else:
+				after_prefix
+			(reference_state, _) = parse_global_header(at_name, prefix, form)
+			(state, result) = parse_declaration_preview(entry)
+			correct: Bool = (state.position() == reference_state.position() and state.current_kind() == cursor and state.current_span().covers(first, last)
+				and diagnostics_match_leaf(state, reference_state) and no_global_or_initializer_ids(state))
+			match result:
+				DeferredGlobalInitializer(value):
+					correct and not rejected_header and value.initializer.token_start == state.position() and value.initializer.anchor.spans_equal(entry.current_span())
+				RejectedGlobalInitializer(start):
+					correct and rejected_header and start.token_start == state.position() and start.anchor.spans_equal(entry.current_span())
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_globals_are_hard_initializer_handoffs_even_when_rejected() -> Bool:
+	(global_boundary("x: Int = 1\nrecord R {}", False, 9, 10, IntLiteralToken)
+		and global_boundary("private var x = 1\nrecord R {}", False, 16, 17, IntLiteralToken)
+		and global_boundary("_ =\nrecord R {}", False, 4, 4, NewlineToken)
+		and global_boundary("if = 1\nrecord R {}", True, 5, 6, IntLiteralToken)
+		and global_boundary("x 1\nrecord R {}", True, 2, 3, IntLiteralToken)
+		and global_boundary("@no_copy x = 1\nrecord R {}", True, 13, 14, IntLiteralToken))
+
+
+-- Private seeded-keyword bindings stop at the global header boundary;
+-- complete frozen declarations would continue into initializer recovery.
+private pure func private_global_boundary(text: String, newline: Int) -> Bool:
+	match parsed(text):
+		Some((state, RejectedGlobalInitializer(_))):
+			(global_boundary(text, True, newline, newline, NewlineToken) and state.position() == 3
+				and state.diagnostic_count() == 3)
+		_:
+			False
+
+
+-- Explicit starters win over the seeded binding fallback. The existing
+-- leaf's recovery contract is authoritative here, not a full frozen owner.
+private pure func explicit_route_boundary(text: String, wanted: Route, first: Int, diagnostics: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(after_prefix, prefix) = parse_declaration_prefix(entry)
+			reference: ParseState = match wanted:
+				BuiltinRoute:
+					(out, _) = parse_builtin_type(after_prefix, prefix.visibility, prefix.documentation, prefix.start, PlainBuiltinType)
+					out
+				ResourceRoute:
+					(out, _) = parse_builtin_type(after_prefix.advanced(), prefix.visibility, prefix.documentation, prefix.start, ResourceBuiltinType)
+					out
+				_:
+					(out, _) = parse_record(after_prefix.advanced(), prefix.visibility, prefix.documentation, prefix.start)
+					out
+			(state, result) = parse_declaration_preview(entry)
+			match result:
+				RejectedDeclarationPreview:
+					(state.position() == 2 and state.position() == reference.position() and state.current_kind() == IntLiteralToken
+						and state.current_span().covers(first, first + 1) and state.current_span().spans_equal(reference.current_span())
+						and state.diagnostic_count() == diagnostics and diagnostics_match_leaf(state, reference) and no_global_or_initializer_ids(state))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_explicit_keyword_routes_precede_reserved_binding_fallback() -> Bool:
+	-- `type` and `resource` keep their declaration routes even before '=';
+	-- reserved `if` falls back to a rejected global, preserving initializer.
+	(explicit_route_boundary("type = 1", BuiltinRoute, 7, 1) and explicit_route_boundary("resource = 1", ResourceRoute, 11, 2)
+		and explicit_route_boundary("record = 1", RecordRoute, 9, 1)
+		and global_boundary("if: Int = 1", True, 10, 11, IntLiteralToken)
+		and global_boundary("Fixed = 1", False, 8, 9, IntLiteralToken)
+		and global_boundary("fixed = 1", False, 8, 9, IntLiteralToken)
+		and global_boundary("Fixed record P {}", True, 6, 12, RecordKeyword))
+
+
+pure func test_error_and_eof_progress_is_exactly_one_token_or_none() -> Bool:
+	match parsed("123 next"):
+		Some((state, RejectedDeclarationPreview)):
+			(state.position() == 1 and state.current_kind() == IdentifierToken and state.current_span().covers(4, 8)
+				and rejected("123 next") and rejected("") and rejected("pure"))
+		_:
+			False
+
+
+private pure func sequential_function_purity_and_existing_diagnostic() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "pure func f():\nfunc g():")):
+		Ok(entry):
+			(first_state, first) = parse_declaration_preview(entry.report_at_current(FrozenDiagnostics.ExpectedDeclarationDiagnostic))
+			-- One declaration does not own its sibling's separating newline.
+			(second_state, second) = parse_declaration_preview(first_state.advanced())
+			match (first, second):
+				(ParsedDeclarationPreview(FunctionDeclarationPreview(a)), ParsedDeclarationPreview(FunctionDeclarationPreview(b))):
+					(a.header.signature.purity == PureFunction and b.header.signature.purity == ImpureFunction
+						and a.header.annotations.is_empty() and b.header.annotations.is_empty() and b.header.documentation.is_none()
+						and first_state.current_kind() == NewlineToken and second_state.current_kind() == EndOfFileToken
+						and second_state.diagnostic_count() == 1 and second_state.issued_counts().expressions == 0)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_sequential_completed_leaves_isolate_prefix_purity_and_ids() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "private pure record R {} record S {}")):
+		Ok(entry):
+			(first_state, first) = parse_declaration_preview(entry)
+			(second_state, second) = parse_declaration_preview(first_state)
+			match (first, second):
+				(ParsedDeclarationPreview(RecordDeclarationPreview(a)), ParsedDeclarationPreview(RecordDeclarationPreview(b))):
+					(a.visibility == PrivateVisibility and b.visibility == PublicVisibility and a.id.definition_local_index() == 0 and b.id.definition_local_index() == 1
+						and second_state.diagnostic_count() == 0 and second_state.current_kind() == EndOfFileToken
+						and sequential_function_purity_and_existing_diagnostic())
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Single declaration previews and explicit initializer handoffs",
+	tests = [
+		("completed routes and keyword priorities", test_completed_routes_and_keyword_priorities),
+		("public import foreign and private recovery", test_public_import_and_foreign_are_owner_routes),
+		("deferred function trait implementation previews", test_function_trait_and_implementation_stay_previews),
+		("prefix diagnostics own declaration rejection", test_prefix_diagnostics_reject_from_before_prefix_scan),
+		("private documentation pure metadata", test_private_documentation_and_pure_metadata_are_composed),
+		("fixed exact spelling and generic parameters", test_fixed_record_uses_exact_spelling_and_accepts_parameters),
+		("global handoffs preserve initializer tokens", test_globals_are_hard_initializer_handoffs_even_when_rejected),
+		("explicit routes before reserved bindings", test_explicit_keyword_routes_precede_reserved_binding_fallback),
+		("error eof progress", test_error_and_eof_progress_is_exactly_one_token_or_none),
+		("sequential completed leaves isolate prefixes", test_sequential_completed_leaves_isolate_prefix_purity_and_ids)
+	]
+}

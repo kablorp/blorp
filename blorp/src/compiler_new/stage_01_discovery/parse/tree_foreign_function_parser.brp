@@ -1,0 +1,94 @@
+-- Complete foreign signatures, with no body or enclosing-block grammar.
+import:
+	../lex/lexed_module: LiteralValue(TextValue)
+	../syntax/foreign_blocks: ForeignFunction, ForeignCName
+	../tables/diagnostic_code: PlainSyntaxCode(ExpectedForeignCNameDiagnostic)
+	../tables/expected_token:
+		NameConstruct(NameInForeignFunctionName), LeftParenConstruct(LeftParenInForeignFunctionName),
+		ExpectedTokenDiagnostic(ExpectedKeyword, ExpectedArrow), KeywordConstruct(KeywordInForeignBlockItem),
+		ArrowConstruct(ArrowInForeignFunctionReturnType)
+	../tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(ImpureFunction, PureFunction)
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(PrivateKeyword, PureKeyword, FuncKeyword, ArrowSymbol, EqualSymbol, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken)
+	parse_state:
+		ParseState, current_kind, current_span, current_literal, previous_span, advanced, diagnostic_count,
+		expect_token, consume_declared_name, report_and_recover, finished_foreign_function
+	tree_declaration_prefix_parser: parse_inline_annotations
+	tree_parameter_parser: ParametersParse(ParsedParameters), parse_parenthesized_parameters
+	tree_type_parser: parse_type
+
+
+union ForeignFunctionParse:
+	ParsedForeignFunction(ForeignFunction)
+	RejectedForeignFunction
+
+
+pure func parse_foreign_function(state: ParseState) -> (ParseState, ForeignFunctionParse):
+	before: Int = state.diagnostic_count()
+	start: Span = state.current_span()
+	visibility: Visibility = if state.current_kind() == PrivateKeyword:
+		PrivateVisibility
+	else:
+		PublicVisibility
+	after_visibility: ParseState = if visibility == PrivateVisibility:
+		state.advanced()
+	else:
+		state
+	(after_annotations, annotations) = parse_inline_annotations(after_visibility)
+	purity: Purity = if after_annotations.current_kind() == PureKeyword:
+		PureFunction
+	else:
+		ImpureFunction
+	before_keyword: ParseState = if purity == PureFunction:
+		after_annotations.advanced()
+	else:
+		after_annotations
+	keyword: Span = before_keyword.current_span()
+	(after_name, name) = before_keyword.expect_token(FuncKeyword, ExpectedKeyword(KeywordInForeignBlockItem)).consume_declared_name(NameInForeignFunctionName)
+	(after_parameters, parameters) = parse_parenthesized_parameters(after_name, LeftParenInForeignFunctionName)
+	(after_return, return_type) = if after_parameters.current_kind() == ArrowSymbol:
+		(parsed, written) = parse_type(after_parameters.advanced())
+		(parsed, Some(written))
+	else:
+		(after_parameters.expect_token(ArrowSymbol, ExpectedArrow(ArrowInForeignFunctionReturnType)), None)
+
+	-- Earlier signature errors do not suppress authored C-name recovery.
+	var out: ParseState = after_return
+	var end: Span = match return_type:
+		Some(written):
+			written.span
+		None:
+			after_return.previous_span()
+	var c_name: Option[ForeignCName] = None
+
+	if out.current_kind() == EqualSymbol:
+		out = out.advanced()
+		text: Option[String] = match out.current_kind():
+			NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+				match out.current_literal():
+					Some(TextValue(text)):
+						Some(text)
+					_:
+						None
+			_:
+				None
+
+		match text:
+			Some(text):
+				end = out.current_span()
+				c_name = Some({ name = text, span = end })
+				out = out.advanced()
+			None:
+				out = out.report_and_recover(ExpectedForeignCNameDiagnostic)
+
+	if out.diagnostic_count() != before:
+		(out, RejectedForeignFunction)
+	else:
+		match (name, parameters, return_type):
+			(Some(name), ParsedParameters(parameters, _), Some(return_type)):
+				-- Child syntax and checked C-name metadata are complete before
+				-- the sole parent mint. A rejected signature never gets an ID.
+				(finished, function) = out.finished_foreign_function(visibility, annotations, purity, keyword, name, parameters, return_type, c_name, start.span_covering(end))
+				(finished, ParsedForeignFunction(function))
+			_:
+				(out, RejectedForeignFunction)

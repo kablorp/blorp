@@ -1,0 +1,230 @@
+-- Module entry only: no declaration scan, initializer parsing or body parsing.
+-- Comments are absent from the lexer's token stream, not a second trivia grammar.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, current_literal, position, diagnostics, diagnostic_count, issued_counts, finished_builtin_type, consume_declared_name
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_type_parser: parse_type
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_documentation_parser: parse_module_preamble
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: parse_declaration_preview, DeclarationPreviewParse(ParsedDeclarationPreview, RejectedDeclarationPreview), DeclarationPreview(ImportBlockDeclarationPreview, FunctionDeclarationPreview, RecordDeclarationPreview)
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_module_declarations
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/lex/lexed_module: LiteralValue(TextValue)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, literal_id_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: NameConstruct(NameInTypeName)
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, spans_equal, span_start, span_end
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(DocStringToken, ImportKeyword, NewlineToken, EndOfFileToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func unchanged_counts(before: ParseState, parsed: ParseState) -> Bool:
+	a = before.issued_counts()
+	b = parsed.issued_counts()
+	(a.binders == b.binders and a.type_binders == b.type_binders and a.written_types == b.written_types
+		and a.dimensions == b.dimensions and a.name_uses == b.name_uses and a.blocks == b.blocks
+		and a.expressions == b.expressions and a.statements == b.statements and a.patterns == b.patterns)
+
+
+private pure func no_owner_id(state: ParseState) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(entry):
+			(_, name) = entry.consume_declared_name(NameInTypeName)
+			match name:
+				Some(name):
+					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					witness.id.definition_local_index() == 0
+				None:
+					False
+		Err(_):
+			False
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out = state
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+	out
+
+
+-- The lexer supplies exact token positions/payloads; this helper checks the
+-- module rule alone: one doc token followed past newlines directly by import.
+private pure func recognized(text: String, decoded: String, first: Int, last: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			at_doc = skip_newlines(entry)
+			at_import = skip_newlines(at_doc.advanced())
+			(parsed, documentation) = parse_module_preamble(entry)
+			match (documentation, at_doc.current_literal()):
+				(Some(doc), Some(TextValue(token_text))):
+					(doc.text == decoded and doc.text == token_text and doc.span.covers(first, last) and doc.span.spans_equal(at_doc.current_span())
+						and at_doc.current_kind() == DocStringToken and at_import.current_kind() == ImportKeyword
+						and parsed.current_kind() == ImportKeyword and parsed.current_span().spans_equal(at_import.current_span())
+						and parsed.position() == at_import.position() and parsed.diagnostic_count() == entry.diagnostic_count()
+						and unchanged_counts(entry, parsed) and no_owner_id(parsed))
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func declined(text: String) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			at_entry = skip_newlines(entry)
+			(parsed, documentation) = parse_module_preamble(entry)
+			(documentation.is_none() and parsed.position() == at_entry.position() and parsed.current_kind() == at_entry.current_kind()
+				and parsed.current_span().spans_equal(at_entry.current_span()) and parsed.diagnostic_count() == entry.diagnostic_count()
+				and unchanged_counts(entry, parsed) and no_owner_id(parsed))
+		Err(_):
+			False
+
+
+pure func test_single_doc_before_import_keeps_decoded_text_token_span_and_cursor() -> Bool:
+	(recognized("---\nDoc\n---\nimport:\n\theap", "Doc", 0, 12)
+		and recognized("\n\n---\nDoc\n---\n\nimport:", "Doc", 2, 14)
+		and recognized("---\nFirst\nSecond\n---\nimport", "First\nSecond", 0, 21))
+
+
+pure func test_recognition_depends_on_import_keyword_not_valid_import_header() -> Bool:
+	(recognized("---\nDoc\n---\nimport", "Doc", 0, 12)
+		and recognized("---\nDoc\n---\nimport heap", "Doc", 0, 12)
+		and recognized("---\nDoc\n---\nimport:", "Doc", 0, 12))
+
+
+pure func test_comments_follow_emitted_tokens_without_new_trivia_rules() -> Bool:
+	(recognized("-- before\n---\nDoc\n---\n-- between\nimport:", "Doc", 10, 22)
+		and declined("---\nDoc\n---\n-- before function\nfunc f():"))
+
+
+pure func test_declaration_starters_and_prefixes_decline_without_consuming_doc() -> Bool:
+	prefix: String = "---\nDoc\n---\n"
+	var correct: Bool = True
+	for suffix in ["func f():", "record R {}", "x = 1", "trait T: Eq", "implements Eq for Int:", "private import:", "pure import:", "@no_copy import:"]:
+		correct = correct and declined("${prefix}${suffix}")
+	correct
+
+
+pure func test_lone_and_double_docs_decline_and_empty_entries_have_no_doc() -> Bool:
+	(declined("---\nDoc\n---\n") and declined("---\nOne\n---\n---\nTwo\n---\nimport:")
+		and declined("") and declined("\n\n") and declined("import:\n\theap"))
+
+
+private pure func preserves_already_issued_children() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "Int\n---\nDoc\n---\nimport:")):
+		Ok(entry):
+			(after_type, _) = parse_type(entry)
+			(parsed, documentation) = parse_module_preamble(after_type)
+			match documentation:
+				Some(doc):
+					(doc.span.covers(4, 16) and parsed.current_kind() == ImportKeyword and parsed.current_span().covers(16, 22)
+						and after_type.issued_counts().written_types == 1 and after_type.issued_counts().name_uses == 1 and unchanged_counts(after_type, parsed))
+				None:
+					False
+		Err(_):
+			False
+
+
+pure func test_preamble_preserves_existing_lexical_diagnostic_and_all_counts() -> Bool:
+	-- '$' after the import produces a real lexical diagnostic already present
+	-- at entry; recognizing the preamble does not consume that later syntax.
+	text: String = "---\nDoc\n---\nimport:\n\theap\n$"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, documentation) = parse_module_preamble(entry)
+			match (entry.diagnostics().get(0), parsed.diagnostics().get(0)):
+				(Some(before), Some(after_preamble)):
+					match (before.diagnostic, after_preamble.diagnostic):
+						(TreeDiagnostics.Plain(FrozenDiagnostics.UnexpectedCharacterDiagnostic), TreeDiagnostics.Plain(FrozenDiagnostics.UnexpectedCharacterDiagnostic)):
+							(documentation.is_some() and before.span.spans_equal(after_preamble.span)
+								and before.span.covers(26, 27) and entry.diagnostic_count() == 1 and parsed.diagnostic_count() == 1
+								and recognized(text, "Doc", 0, 12) and unchanged_counts(entry, parsed) and preserves_already_issued_children())
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_module_doc_then_dispatch_matches_frozen_module_entry() -> Bool:
+	text: String = "---\nDoc\n---\nimport:\n\theap"
+	lexed = lex_module(module_id_at_row(0), text)
+	prepared = empty_discovery_builder().admit_source("preamble.brp", text).bridge_lexed_module(lexed)
+	-- Small import-only module: no expressions/default bodies/forward pairing.
+	reference = parse_module_declarations(prepared, module_id_at_row(0))
+	match (new_parse_state(lexed), reference.module_documentation.get(0)):
+		(Ok(entry), Some(reference_doc)):
+			(at_import, documentation) = parse_module_preamble(entry)
+			(parsed, result) = parse_declaration_preview(at_import)
+			match (documentation, result):
+				(Some(doc), ParsedDeclarationPreview(ImportBlockDeclarationPreview(block))):
+					(doc.span.spans_equal(reference_doc.span) and reference.literals.get(reference_doc.text.literal_id_index()) == Some(doc.text)
+						and reference.module_documentation.length() == 1 and parsed.diagnostic_count() == 0 and reference.diagnostics.is_empty()
+						and parsed.current_kind() == EndOfFileToken and block.imports.length() == 1)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_declined_function_doc_attaches_and_later_import_doc_diagnoses() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "---\nDoc\n---\nfunc f():")):
+		Ok(entry):
+			(at_function, module_doc) = parse_module_preamble(entry)
+			(parsed, result) = parse_declaration_preview(at_function)
+			function_correct: Bool = match result:
+				ParsedDeclarationPreview(FunctionDeclarationPreview(function)):
+					match function.header.documentation:
+						Some(doc):
+							module_doc.is_none() and doc.text == "Doc" and doc.span.covers(0, 12) and parsed.diagnostic_count() == 0
+						None:
+							False
+				_:
+					False
+			function_correct and later_import_doc_diagnoses()
+		Err(_):
+			False
+
+
+private pure func later_import_doc_diagnoses() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "record R {}\n---\nDoc\n---\nimport:\n\theap")):
+		Ok(entry):
+			(at_record, module_doc) = parse_module_preamble(entry)
+			(after_record, first) = parse_declaration_preview(at_record)
+			-- Preamble runs once at module entry; this later doc is a declaration prefix.
+			(after_import, second) = parse_declaration_preview(skip_newlines(after_record))
+			match (first, second, after_import.diagnostics().get(0)):
+				(ParsedDeclarationPreview(RecordDeclarationPreview(_)), RejectedDeclarationPreview, Some(at)):
+					match at.diagnostic:
+						TreeDiagnostics.Plain(FrozenDiagnostics.DocstringBeforeImportBlockDiagnostic):
+							module_doc.is_none() and at.span.covers(12, 24) and after_import.diagnostic_count() == 1
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Module leading documentation and declaration attachment",
+	tests = [
+		("single doc text span and import cursor", test_single_doc_before_import_keeps_decoded_text_token_span_and_cursor),
+		("malformed import still recognizes module doc", test_recognition_depends_on_import_keyword_not_valid_import_header),
+		("comments follow emitted lexer tokens", test_comments_follow_emitted_tokens_without_new_trivia_rules),
+		("declaration starters and prefixes decline", test_declaration_starters_and_prefixes_decline_without_consuming_doc),
+		("lone double and absent docs", test_lone_and_double_docs_decline_and_empty_entries_have_no_doc),
+		("lexical diagnostic and count preservation", test_preamble_preserves_existing_lexical_diagnostic_and_all_counts),
+		("module doc dispatch matches frozen entry", test_module_doc_then_dispatch_matches_frozen_module_entry),
+		("function doc attaches later import doc diagnoses", test_declined_function_doc_attaches_and_later_import_doc_diagnoses)
+	]
+}

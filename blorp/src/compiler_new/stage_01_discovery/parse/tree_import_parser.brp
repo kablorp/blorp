@@ -1,0 +1,294 @@
+-- Import leaves for the test-only declaration preview. An import is minted
+-- only after all of its syntax is complete and has added no diagnostic.
+import:
+	../syntax/checked_values: parent_steps
+	../syntax/imports: Import, ImportItem, ModulePath, PathAnchor(BareAnchor, SameDirectoryAnchor, ParentDirectoryAnchor, NativePackageAnchor)
+	../syntax/names: WrittenName, NameUse
+	../syntax/spellings: spelling_text
+	../tables/diagnostic_code:
+		PlainSyntaxCode(ExpectedModulePathDiagnostic, ImportPathCurrentNotLeadingDiagnostic, ImportPathParentNotLeadingDiagnostic, ExpectedAliasNameDiagnostic, ExpectedImportSymbolsAfterColonDiagnostic, ExpectedImportSymbolDiagnostic, ExpectedCommaBetweenImportSymbolsDiagnostic, ExpectedConstructorNameDiagnostic, ExpectedClosingParenAfterConstructorsDiagnostic),
+	../tables/expected_token: NameConstruct(NameInTypeName)
+	../tables/span: Span, span_covering
+	../tables/token:
+		KEYWORD_KINDS_IN_SEEDED_ORDER,
+		TokenKind(AsKeyword, ColonSymbol, CommaSymbol, DedentToken, DotDotSymbol, DotSymbol, IndentToken, LeftParenSymbol, NewlineToken, RightParenSymbol, SlashSymbol, EndOfFileToken),
+	parse_state:
+		ParseState, NameRole(OrdinaryName), current_kind, current_span, previous_span,
+		peek_kind, advanced, position, diagnostic_count, report_at_current,
+		consume_name, name_allowed, finished_name_use, finished_import, spellings,
+
+
+union ImportParse:
+	ParsedImport(Import)
+	RejectedImport
+
+
+-- This root is part of the language's package import grammar.
+private NATIVE_PACKAGE_PATH_ROOT: String = "pkg"
+
+
+pure func parse_import(state: ParseState) -> (ParseState, ImportParse):
+	before: Int = state.diagnostic_count()
+	start: Span = state.current_span()
+	(after_path, path) = parse_path(state)
+
+	match path:
+		None:
+			(after_path, RejectedImport)
+		Some(module_path):
+			path_span: Span = start.span_covering(after_path.previous_span())
+			(after_alias, alias_name) = parse_alias(after_path)
+			alias_end: Span = after_alias.previous_span()
+			(after_items, items) = parse_items(after_alias)
+
+			if after_items.diagnostic_count() != before:
+				(after_items, RejectedImport)
+			else:
+				end: Span = match items.last():
+					Some(item):
+						item.span
+					None:
+						alias_end
+
+				(after_import, imported) = after_items.finished_import(module_path, alias_name, items, path_span, start.span_covering(end))
+				(after_import, ParsedImport(imported))
+
+
+private pure func malformed_path(state: ParseState) -> ParseState:
+	code: PlainSyntaxCode = match state.current_kind():
+		DotSymbol:
+			ImportPathCurrentNotLeadingDiagnostic
+		DotDotSymbol:
+			ImportPathParentNotLeadingDiagnostic
+		_:
+			ExpectedModulePathDiagnostic
+
+	state.report_at_current(code)
+
+
+private pure func parse_path(state: ParseState) -> (ParseState, Option[ModulePath]):
+	(after_prefix, anchor) = parse_path_prefix(state)
+
+	match anchor:
+		None:
+			(after_prefix, None)
+		Some(path_anchor):
+			if not name_allowed(after_prefix.current_kind(), OrdinaryName):
+				-- A later dot is the offending segment. Other failures after a
+				-- prefix are reported at the path's start by the frozen parser.
+				at_offender: ParseState = match after_prefix.current_kind():
+					DotSymbol | DotDotSymbol:
+						after_prefix
+					_:
+						state
+
+				(at_offender.malformed_path().skip_path_line(), None)
+			else:
+				(after_first, first) = after_prefix.consume_name(OrdinaryName, NameInTypeName)
+				is_package: Bool = match path_anchor:
+					BareAnchor:
+						(after_first.current_kind() == SlashSymbol
+							and after_first.spellings().spelling_text(first.spelling) == Some(NATIVE_PACKAGE_PATH_ROOT))
+					_:
+						False
+
+				-- `pkg` is an anchor only when followed by `/`. Otherwise it is
+				-- a bare path part, compared by spelling rather than id/index.
+				if is_package:
+					next_state: ParseState = after_first.advanced()
+
+					if not name_allowed(next_state.current_kind(), OrdinaryName):
+						(next_state.malformed_path(), None)
+					else:
+						(after_part, part) = next_state.consume_name(OrdinaryName, NameInTypeName)
+						parse_path_tail(after_part, NativePackageAnchor, part)
+				else:
+					parse_path_tail(after_first, path_anchor, first)
+
+
+private pure func skip_path_line(state: ParseState) -> ParseState:
+	var out: ParseState = state
+
+	while out.current_kind() != NewlineToken and out.current_kind() != DedentToken and out.current_kind() != EndOfFileToken:
+		out = out.advanced()
+
+	out
+
+
+private pure func parse_path_prefix(state: ParseState) -> (ParseState, Option[PathAnchor]):
+	if state.current_kind() == DotSymbol and state.peek_kind(1) == SlashSymbol:
+		(state.advanced().advanced(), Some(SameDirectoryAnchor))
+	else:
+		var out: ParseState = state
+		var count: Int = 0
+
+		while out.current_kind() == DotDotSymbol and out.peek_kind(1) == SlashSymbol:
+			count += 1
+			out = out.advanced().advanced()
+
+		if count > 0:
+			match parent_steps(count):
+				Some(steps):
+					(out, Some(ParentDirectoryAnchor(steps)))
+				None:
+					-- Every counted step consumed two tokens, so count cannot be zero.
+					(out.malformed_path(), None)
+		else:
+			(out, Some(BareAnchor))
+
+
+private pure func parse_path_tail(state: ParseState, anchor: PathAnchor, first: WrittenName) -> (ParseState, Option[ModulePath]):
+	var out: ParseState = state
+	var rest: List[WrittenName] = []
+	var parsing: Bool = out.current_kind() == SlashSymbol
+	var failed: Bool = False
+
+	while parsing:
+		out = out.advanced()
+
+		if name_allowed(out.current_kind(), OrdinaryName):
+			(after_part, part) = out.consume_name(OrdinaryName, NameInTypeName)
+			out = after_part
+			rest = rest.append(part)
+			parsing = out.current_kind() == SlashSymbol
+		else:
+			out = out.malformed_path()
+			failed = True
+			parsing = False
+
+	if failed:
+		(out, None)
+	else:
+		(out, Some({ anchor = anchor, parts = { first = first, rest = rest } }))
+
+
+private pure func parse_alias(state: ParseState) -> (ParseState, Option[WrittenName]):
+	if state.current_kind() != AsKeyword:
+		(state, None)
+	else:
+		out: ParseState = state.advanced()
+
+		if name_allowed(out.current_kind(), OrdinaryName):
+			(parsed_state, name) = out.consume_name(OrdinaryName, NameInTypeName)
+			(parsed_state, Some(name))
+		else:
+			reported: ParseState = out.report_at_current(ExpectedAliasNameDiagnostic)
+
+			if KEYWORD_KINDS_IN_SEEDED_ORDER.contains(out.current_kind()):
+				(reported.advanced(), None)
+			else:
+				(reported, None)
+
+
+private pure func line_ended(state: ParseState) -> Bool:
+	match state.current_kind():
+		NewlineToken | DedentToken | EndOfFileToken:
+			True
+		_:
+			False
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+
+	out
+
+
+private pure func parse_items(state: ParseState) -> (ParseState, List[ImportItem]):
+	if state.current_kind() != ColonSymbol:
+		(state, [])
+	else:
+		out: ParseState = state.advanced()
+
+		if out.current_kind() != NewlineToken:
+			parse_item_line(out)
+		else:
+			start: ParseState = out.skip_newlines()
+
+			if start.current_kind() != IndentToken:
+				(start.report_at_current(ExpectedImportSymbolsAfterColonDiagnostic), [])
+			else:
+				var cursor: ParseState = start.advanced().skip_newlines()
+				var items: List[ImportItem] = []
+
+				while cursor.current_kind() != DedentToken and cursor.current_kind() != EndOfFileToken:
+					(after_line, line) = parse_item_line(cursor)
+					cursor = after_line.skip_newlines()
+					items = items.concat(line)
+
+				if cursor.current_kind() == DedentToken:
+					cursor = cursor.advanced()
+
+				(cursor, items)
+
+
+private pure func parse_item_line(state: ParseState) -> (ParseState, List[ImportItem]):
+	var out: ParseState = state
+	var items: List[ImportItem] = []
+
+	while not out.line_ended():
+		before: Int = out.position()
+		(parsed_state, item) = parse_item(out)
+		out = parsed_state
+
+		match item:
+			Some(value):
+				items = items.append(value)
+			None:
+				void
+
+		if out.current_kind() == CommaSymbol:
+			out = out.advanced()
+		else if not out.line_ended():
+			out = out.report_at_current(ExpectedCommaBetweenImportSymbolsDiagnostic)
+
+		if out.position() == before and not out.line_ended():
+			out = out.advanced()
+
+	(out, items)
+
+
+private pure func parse_item(state: ParseState) -> (ParseState, Option[ImportItem]):
+	start: Span = state.current_span()
+
+	if not name_allowed(state.current_kind(), OrdinaryName):
+		(state.report_at_current(ExpectedImportSymbolDiagnostic), None)
+	else:
+		(after_name, name) = state.consume_name(OrdinaryName, NameInTypeName)
+		(after_use, use) = after_name.finished_name_use(name)
+		(after_constructors, constructors) = parse_constructors(after_use)
+		(after_alias, alias_name) = parse_alias(after_constructors)
+		(after_alias, Some({ name = use, alias_name = alias_name, constructors = constructors, span = start.span_covering(after_alias.previous_span()) }))
+
+
+private pure func parse_constructors(state: ParseState) -> (ParseState, List[NameUse]):
+	if state.current_kind() != LeftParenSymbol:
+		(state, [])
+	else:
+		var out: ParseState = state.advanced()
+		var constructors: List[NameUse] = []
+
+		while out.current_kind() != RightParenSymbol and not out.line_ended():
+			if name_allowed(out.current_kind(), OrdinaryName):
+				(after_name, name) = out.consume_name(OrdinaryName, NameInTypeName)
+				(after_use, use) = after_name.finished_name_use(name)
+				out = after_use
+				constructors = constructors.append(use)
+			else:
+				out = out.report_at_current(ExpectedConstructorNameDiagnostic).advanced()
+
+			if out.current_kind() == CommaSymbol:
+				out = out.advanced()
+
+		if constructors.is_empty():
+			out = out.report_at_current(ExpectedConstructorNameDiagnostic)
+
+		if out.current_kind() == RightParenSymbol:
+			out = out.advanced()
+		else:
+			out = out.report_at_current(ExpectedClosingParenAfterConstructorsDiagnostic)
+
+		(out, constructors)

@@ -1,0 +1,407 @@
+-- The lexer as a pure function: what `lex_module` and `lex_hole` return for a
+-- module's text, independent of any builder.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexed_module:
+		LexedModule,
+		InterpolationScan,
+		LexedRun,
+		LiteralValue(FloatValue, IntegerValue, TextValue),
+		ScannedPiece(ScannedHole, ScannedText),
+	../../../../src/compiler_new/stage_01_discovery/lex/interpolation:
+		interpolation_scan,
+		interpolation_segments,
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_hole, lex_module
+	../../../../src/compiler_new/stage_01_discovery/syntax/checked_values: written_digits
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings:
+		spelling_count,
+		spelling_text_at,
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
+		SyntaxDiagnostic(FloatLiteralOverflow, IntegerLiteralOverflow, Plain),
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: ModuleId, module_id_at_row, source_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_end, span_start
+	../../../../src/compiler_new/stage_01_discovery/tables/token:
+		NO_TOKEN_PAYLOAD,
+		Token,
+		TokenKind(
+			DimensionNameToken, EndOfFileToken, FloatLiteralToken, IdentifierToken, IntLiteralToken,
+			InterpolatedStringToken, MatchKeyword, NormalStringToken, RejectedFloatToken,
+			RejectedIntegerToken,
+		),
+		token_kind_name,
+	test: TestSuite
+
+
+FIRST_MODULE: ModuleId = module_id_at_row(0)
+
+SECOND_MODULE: ModuleId = module_id_at_row(1)
+
+INT128_MAX_PLUS_ONE: String = "170141183460469231731687303715884105728"
+
+-- The `${` is split across two literals so this file does not interpolate it.
+HOLE_OPENER: String = "$" + "{"
+
+
+---
+Every token as `kind start end payload`, one per line.
+---
+pure func token_summary(tokens: List[Token]) -> String:
+	tokens
+		.map(
+			pure func(
+				token,
+			): "${token.kind.token_kind_name()} ${token.span.span_start()} ${token.span.span_end()} ${token.payload}",
+		)
+		.join("\n")
+
+
+pure func token_at(lexed: LexedModule, index: Int) -> Option[Token]:
+	lexed.tokens.get(index)
+
+
+pure func test_the_same_text_lexes_to_the_same_module_whatever_came_before() -> Bool:
+	text: String = "func f(a, b):\n\ta + b + c\n"
+	alone: LexedModule = lex_module(FIRST_MODULE, text)
+	between: LexedModule = lex_module(FIRST_MODULE, "other names entirely: x y z\n")
+	after: LexedModule = lex_module(FIRST_MODULE, text)
+	(
+		token_summary(alone.tokens) == token_summary(after.tokens)
+		and spelling_count(alone.spellings) == spelling_count(after.spellings)
+		and spelling_count(between.spellings) != spelling_count(alone.spellings)
+	)
+
+
+pure func test_a_module_interns_only_its_own_names() -> Bool:
+	first: LexedModule = lex_module(FIRST_MODULE, "alpha beta\n")
+	second: LexedModule = lex_module(SECOND_MODULE, "gamma\n")
+	(
+		spelling_count(first.spellings) == 2
+		and spelling_count(second.spellings) == 1
+		and spelling_text_at(second.spellings, 0) == Some("gamma")
+	)
+
+
+pure func test_an_identifier_token_carries_its_spellings_index() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "alpha beta alpha\n")
+
+	match (token_at(lexed, 0), token_at(lexed, 1), token_at(lexed, 2)):
+		(Some(first), Some(second), Some(third)):
+			(
+				first.kind == IdentifierToken
+				and first.payload == 0
+				and second.payload == 1
+				and third.payload == first.payload
+			)
+		_:
+			False
+
+
+pure func test_a_keyword_token_has_no_spelling_payload_and_adds_no_spelling() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "match")
+
+	match token_at(lexed, 0):
+		Some(token):
+			(
+				token.kind == MatchKeyword
+				and spelling_count(lexed.spellings) == 0
+			)
+		None:
+			False
+
+
+pure func test_a_dimension_name_shares_the_plain_names_spelling() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "N #N\n")
+
+	match (token_at(lexed, 0), token_at(lexed, 1)):
+		(Some(plain), Some(dimension)):
+			(
+				dimension.kind == DimensionNameToken
+				and dimension.payload == plain.payload
+				and spelling_count(lexed.spellings) == 1
+			)
+		_:
+			False
+
+
+pure func literal_at(lexed: LexedModule, index: Int) -> Option[LiteralValue]:
+	lexed.source.literals.get(index)
+
+
+pure func test_an_integer_literal_is_its_checked_magnitude() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "007 170141183460469231731687303715884105727\n")
+
+	match (literal_at(lexed, 0), literal_at(lexed, 1)):
+		(Some(IntegerValue(small)), Some(IntegerValue(largest))):
+			(
+				small == to_int128(7)
+				and largest > to_int128(0)
+				and largest + to_int128(1) < to_int128(0)
+				and lexed.diagnostics.is_empty()
+			)
+		_:
+			False
+
+
+pure func test_a_float_literal_keeps_its_written_digits() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "01.50\n")
+
+	match literal_at(lexed, 0):
+		Some(FloatValue(value)):
+			written_digits(value) == "01.50" and lexed.diagnostics.is_empty()
+		_:
+			False
+
+
+pure func test_a_string_literal_is_its_decoded_text() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "\"a\\tb\" \"plain\"\n")
+
+	match (literal_at(lexed, 0), literal_at(lexed, 1)):
+		(Some(TextValue(escaped)), Some(TextValue(plain))):
+			escaped == "a\tb" and plain == "plain"
+		_:
+			False
+
+
+pure func test_literal_payloads_index_the_literals_in_token_order() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "x = 1 + 2.5\ns = \"t\"\n")
+	payloads: List[Int] = lexed.tokens
+		.filter(
+			pure func(
+				token,
+			): (
+				token.kind == IntLiteralToken
+				or token.kind == FloatLiteralToken
+				or token.kind == NormalStringToken
+			),
+		)
+		.map(pure func(token): token.payload)
+	payloads == [0, 1, 2] and lexed.source.literals.length() == 3
+
+
+---
+The module's one number token the lexer rejected, if any.
+---
+pure func rejected_number_token(lexed: LexedModule) -> Option[Token]:
+	lexed.tokens
+		.filter(
+			pure func(
+				token,
+			): token.kind == RejectedIntegerToken or token.kind == RejectedFloatToken,
+		)
+		.get(0)
+
+
+pure func test_an_integer_above_int128_is_reported_with_its_digits() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "x = " + INT128_MAX_PLUS_ONE + "\n")
+
+	match (lexed.diagnostics.get(0), rejected_number_token(lexed)):
+		(Some(reported), Some(token)):
+			match reported.diagnostic:
+				IntegerLiteralOverflow(written):
+					(
+						written == INT128_MAX_PLUS_ONE
+						and token.kind == RejectedIntegerToken
+						and token.payload == NO_TOKEN_PAYLOAD
+						and lexed.source.literals.is_empty()
+						and reported.span.span_start() == 4
+						and reported.span.span_end() == 4 + INT128_MAX_PLUS_ONE.length()
+						and lexed.diagnostics.length() == 1
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_a_float_that_is_not_finite_is_reported_with_its_digits() -> Bool:
+	too_large: String = "1" + "0".repeat(400) + ".5"
+	lexed: LexedModule = lex_module(FIRST_MODULE, too_large + "\n")
+
+	match (lexed.diagnostics.get(0), rejected_number_token(lexed)):
+		(Some(reported), Some(token)):
+			match reported.diagnostic:
+				FloatLiteralOverflow(written):
+					(
+						written == too_large
+						and token.kind == RejectedFloatToken
+						and token.payload == NO_TOKEN_PAYLOAD
+						and lexed.source.literals.is_empty()
+					)
+				_:
+					False
+		_:
+			False
+
+
+pure func test_an_unexpected_character_is_a_diagnostic_and_lexing_goes_on() -> Bool:
+	lexed: LexedModule = lex_module(FIRST_MODULE, "a ; b\n")
+
+	match lexed.diagnostics.get(0):
+		Some(reported):
+			match reported.diagnostic:
+				Plain(_):
+					lexed.tokens.count(pure func(token): token.kind == IdentifierToken) == 2
+				_:
+					False
+		None:
+			False
+
+
+pure func test_line_starts_are_the_offsets_after_each_newline() -> Bool:
+	lex_module(FIRST_MODULE, "ab\n\ncde\nf").line_starts == [0, 3, 4, 8]
+
+
+pure func pieces_of(lexed: LexedModule, index: Int) -> List[ScannedPiece]:
+	match lexed.source.interpolations.get(index):
+		Some(scan):
+			scan.pieces
+		None:
+			[]
+
+
+pure func test_an_interpolated_string_is_scanned_into_text_and_holes() -> Bool:
+	text: String = "\"a " + HOLE_OPENER + "b} c\"\n"
+	lexed: LexedModule = lex_module(FIRST_MODULE, text)
+
+	match (token_at(lexed, 0), pieces_of(lexed, 0)):
+		(Some(string), [ScannedText(first), ScannedHole(hole), ScannedText(last)]):
+			(
+				string.kind == InterpolatedStringToken
+				and string.payload == 0
+				and first.text == "a "
+				and first.span.span_start() == 1
+				and first.span.span_end() == 3
+				and hole.expression_start == 5
+				and hole.expression_end == 6
+				and hole.span.span_start() == 3
+				and hole.span.span_end() == 7
+				and last.text == " c"
+			)
+		_:
+			False
+
+
+-- A hole that does not close inside its string is reported by the string's scan, so the token is dropped and
+-- no piece reaches a parser. The scan of its segments still gives the hole the
+-- extent the existing compiler gives an unclosed one: from its `$` to the end of
+-- the string token, closing quote included (`interpolation_hole_extents`).
+pure func test_an_unclosed_hole_extends_to_the_end_of_its_string_as_in_the_existing_compiler() -> Bool:
+	text: String = "\"a " + HOLE_OPENER + "b\""
+	token_end: Int = text.length()
+	scan: InterpolationScan = interpolation_scan(
+		source_id_at_row(0),
+		text,
+		interpolation_segments(text, InterpolatedStringToken, 0, token_end),
+	)
+
+	match scan.pieces:
+		[ScannedText(_), ScannedHole(hole)]:
+			(
+				hole.expression_start == 5
+				and hole.expression_end == token_end - 1
+				and hole.span.span_start() == 3
+				and hole.span.span_end() == token_end
+			)
+		_:
+			False
+
+
+pure func test_a_hole_is_lexed_apart_with_the_modules_spellings() -> Bool:
+	text: String = "known \"" + HOLE_OPENER + "known + fresh}\"\n"
+	module_run: LexedModule = lex_module(FIRST_MODULE, text)
+	hole_start: Int = 9
+	hole_end: Int = 21
+	run: LexedRun = lex_hole(FIRST_MODULE, text, module_run.spellings, hole_start, hole_end)
+	kinds: List[TokenKind] = run.tokens.map(pure func(token): token.kind)
+
+	match (run.tokens.get(0), run.tokens.get(2)):
+		(Some(known), Some(fresh)):
+			(
+				kinds.length() == 4
+				and kinds.get_or(3, MatchKeyword) == EndOfFileToken
+				and known.payload == 0
+				and fresh.payload == 1
+				and spelling_count(module_run.spellings) == 1
+				and spelling_count(run.spellings) == 2
+			)
+		_:
+			False
+
+
+pure func test_a_hole_keeps_its_own_literals_and_diagnostics() -> Bool:
+	text: String = "\"" + HOLE_OPENER + "7 + " + INT128_MAX_PLUS_ONE + "}\"\n"
+	module_run: LexedModule = lex_module(FIRST_MODULE, text)
+	hole_start: Int = 3
+	hole_end: Int = 7 + INT128_MAX_PLUS_ONE.length()
+	run: LexedRun = lex_hole(FIRST_MODULE, text, module_run.spellings, hole_start, hole_end)
+
+	match run.literals.get(0):
+		Some(IntegerValue(seven)):
+			seven == to_int128(7) and run.literals.length() == 1 and run.diagnostics.length() == 1
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Discovery lexer as a pure function",
+	tests = [
+		(
+			"the same text lexes to the same module whatever came before",
+			test_the_same_text_lexes_to_the_same_module_whatever_came_before,
+		),
+		("a module interns only its own names", test_a_module_interns_only_its_own_names),
+		(
+			"an identifier token carries its spelling's index",
+			test_an_identifier_token_carries_its_spellings_index,
+		),
+		(
+			"a keyword token has no spelling payload and adds no spelling",
+			test_a_keyword_token_has_no_spelling_payload_and_adds_no_spelling,
+		),
+		(
+			"a dimension name shares the plain name's spelling",
+			test_a_dimension_name_shares_the_plain_names_spelling,
+		),
+		(
+			"an integer literal is its checked magnitude",
+			test_an_integer_literal_is_its_checked_magnitude,
+		),
+		("a float literal keeps its written digits", test_a_float_literal_keeps_its_written_digits),
+		("a string literal is its decoded text", test_a_string_literal_is_its_decoded_text),
+		(
+			"literal payloads index the literals in token order",
+			test_literal_payloads_index_the_literals_in_token_order,
+		),
+		(
+			"an integer above Int128 is reported with its digits",
+			test_an_integer_above_int128_is_reported_with_its_digits,
+		),
+		(
+			"a float that is not finite is reported with its digits",
+			test_a_float_that_is_not_finite_is_reported_with_its_digits,
+		),
+		(
+			"an unexpected character is a diagnostic and lexing goes on",
+			test_an_unexpected_character_is_a_diagnostic_and_lexing_goes_on,
+		),
+		(
+			"line starts are the offsets after each newline",
+			test_line_starts_are_the_offsets_after_each_newline,
+		),
+		(
+			"an interpolated string is scanned into text and holes",
+			test_an_interpolated_string_is_scanned_into_text_and_holes,
+		),
+		(
+			"an unclosed hole extends to the end of its string as in the existing compiler",
+			test_an_unclosed_hole_extends_to_the_end_of_its_string_as_in_the_existing_compiler,
+		),
+		(
+			"a hole is lexed apart with the module's spellings",
+			test_a_hole_is_lexed_apart_with_the_modules_spellings,
+		),
+		(
+			"a hole keeps its own literals and diagnostics",
+			test_a_hole_keeps_its_own_literals_and_diagnostics,
+		),
+	]
+}

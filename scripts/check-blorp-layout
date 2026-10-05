@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import sys
@@ -16,7 +17,7 @@ from pathlib import Path
 # the entry above, not modules. A module imported without symbols (`path` or
 # `path as Alias`) has no colon, so it must match too: it is still an import.
 IMPORT_MODULE = re.compile(
-	r"^\t([./A-Za-z0-9_-]+)(?:\s+as\s+[A-Za-z0-9_]+)?(?::|\s*$)"
+	r"^\t([./A-Za-z0-9_-]+)(?:[ \t]+as[ \t]+([A-Za-z0-9_]+))?[ \t]*(?::|$)"
 )
 TEST_SUFFIXES = {".brp", ".py", ".sh"}
 
@@ -36,22 +37,33 @@ def load_manifest(path: Path) -> dict[str, object]:
 	return manifest
 
 
-def source_imports(path: Path) -> list[str]:
-	"""Import module names of a real Blorp source, which must be UTF-8.
+def source_text(path: Path) -> str:
+	"""The text of a real Blorp source, which must be UTF-8.
 
 	Fixture inputs are not sources and never reach this function: they may
 	contain invalid bytes on purpose (see `test_module_sources`).
 	"""
-	imports: list[str] = []
-	in_import_block = False
 	try:
-		text = path.read_text(encoding="utf-8")
+		return path.read_text(encoding="utf-8")
 	except UnicodeDecodeError as error:
 		raise ValueError(
 			f"{path} is not valid UTF-8 at byte {error.start}: "
 			"Blorp sources must be UTF-8"
 		) from error
-	for line in text.splitlines():
+
+
+def import_entries(path: Path) -> list[tuple[str, list[str] | None]]:
+	"""Each module entry of a source's `import:` block, with the names it selects.
+
+	The names are `None` for namespace imports: a bare module or any module
+	alias, including `path as Alias: symbols`. An alias exposes the full module
+	even when the same entry also selects individual names.
+	"""
+	entries: list[tuple[str, list[str] | None]] = []
+	in_import_block = False
+	for line in source_text(path).splitlines():
+		# Import paths and names cannot contain strings; line comments end them.
+		line = line.partition("--")[0].rstrip()
 		if line == "import:":
 			in_import_block = True
 			continue
@@ -61,8 +73,45 @@ def source_imports(path: Path) -> list[str]:
 			break
 		match = IMPORT_MODULE.match(line)
 		if match is not None:
-			imports.append(match.group(1))
-	return imports
+			selected = (
+				selection_names(line[match.end():])
+				if match.group(0).endswith(":") and match.group(2) is None
+				else None
+			)
+			entries.append((match.group(1), selected))
+		elif line.startswith("\t\t") and entries and entries[-1][1] is not None:
+			# Each line is its own list; no comma is required between lines.
+			entries[-1][1].extend(selection_names(line))
+	return entries
+
+
+def selection_names(selection: str) -> list[str]:
+	"""The module names an import's symbol list selects.
+
+	A selection's alias (`name as Alias`) and the variants in its parentheses
+	(`Union(A, B)`) are not names of the module, so neither is listed.
+	"""
+	names: list[str] = []
+	depth = 0
+	current = ""
+	for character in selection + ",":
+		if character == "(":
+			depth += 1
+		elif character == ")":
+			depth -= 1
+		elif depth == 0 and character == ",":
+			words = current.split()
+			if words:
+				names.append(words[0])
+			current = ""
+		elif depth == 0:
+			current += character
+	return names
+
+
+def source_imports(path: Path) -> list[str]:
+	"""Import module names of a real Blorp source."""
+	return [module for module, _ in import_entries(path)]
 
 
 def is_within(path: Path, root: Path) -> bool:
@@ -218,6 +267,45 @@ def reachable(graph: dict[Path, set[Path]], starts: set[Path]) -> set[Path]:
 	return seen
 
 
+def validate_restricted_import(
+	importer: str,
+	target: str,
+	names: list[str] | None,
+	restricted_symbols: dict[str, list[tuple[list[str], list[str]]]],
+	errors: list[str],
+) -> None:
+	"""A restricted name of `target` is imported only by its permitted importers.
+
+	A manifest entry restricts some names of a module (exact, or `fnmatch`
+	patterns such as `minted_*`) to a list of importers: a module path, or a
+	directory ending in `/` for every module below it. Tests may always import
+	them, since this check reads only the source root. A module imported with
+	an alias or without a symbol list reaches every name. Per-symbol
+	`symbol_importers` entries add restrictions with their own importer lists,
+	for constructors whose owner differs from the module's other constructors.
+	"""
+	for patterns, importers in restricted_symbols.get(target, []):
+		if any(
+			importer == allowed or (allowed.endswith("/") and importer.startswith(allowed))
+			for allowed in importers
+		):
+			continue
+		permitted = " and ".join([", ".join(importers), "tests"]) if importers else "tests"
+		if names is None:
+			errors.append(
+				f"restricted import: {importer} imports all of {target}; "
+				f"name what it needs, and only {permitted} may import "
+				f"{', '.join(patterns)}"
+			)
+			continue
+		for name in names:
+			if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+				errors.append(
+					f"restricted import: {importer} imports {name} from {target}; "
+					f"only {permitted} may import it"
+				)
+
+
 def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 	errors: list[str] = []
 	source_root = (root / str(manifest["source_root"])).resolve()
@@ -268,6 +356,16 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 	isolated_test_owners = set(
 		str(owner) for owner in manifest.get("isolated_test_owners", [])
 	)
+	restricted_symbols: dict[str, list[tuple[list[str], list[str]]]] = {}
+	for module, restriction in dict(manifest.get("restricted_symbols", {})).items():
+		restricted_symbols[str(module)] = [(
+			[str(pattern) for pattern in restriction["symbols"]],
+			[str(importer) for importer in restriction["importers"]],
+		)]
+		for symbol, importers in restriction.get("symbol_importers", {}).items():
+			restricted_symbols[str(module)].append((
+				[str(symbol)], [str(importer) for importer in importers],
+			))
 	for owner in sorted(isolated_test_owners - owners):
 		errors.append(f"isolated test owner is not a registered owner: {owner}")
 
@@ -280,6 +378,10 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 			)
 	for legacy_owner in sorted(set(legacy_owner_importers) - set(legacy_owner_roots)):
 		errors.append(f"importers declared for unknown legacy owner: {legacy_owner}")
+
+	for module in sorted(restricted_symbols):
+		if not (source_root / module).is_file():
+			errors.append(f"restricted module does not exist: {module}")
 
 	sources = sorted(path.resolve() for path in source_root.rglob("*.brp"))
 	graph: dict[Path, set[Path]] = defaultdict(set)
@@ -308,7 +410,7 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 		if source.name.startswith("test_") and not in_legacy_owner:
 			errors.append(f"test-shaped module is not allowed under source root: {relative}")
 
-		for module in source_imports(source):
+		for module, names in import_entries(source):
 			target = resolve_import(source, module, source_root)
 			if target is None:
 				if module.startswith("."):
@@ -316,6 +418,13 @@ def validate_layout(root: Path, manifest: dict[str, object]) -> list[str]:
 				continue
 			if is_within(target, source_root):
 				graph[source].add(target)
+				validate_restricted_import(
+					str(relative),
+					str(target.relative_to(source_root)),
+					names,
+					restricted_symbols,
+					errors,
+				)
 				for legacy_owner, legacy_owner_root in legacy_owner_roots.items():
 					if not is_within(target, legacy_owner_root):
 						continue

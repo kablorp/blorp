@@ -25,16 +25,15 @@
 -- the span a construct's header starts at: a block belongs to a header when
 -- its tokens sit on a later line and in a later column.
 import:
-	../lex/lexer: lex_interpolation_hole
+	../lex/lexed_module: HoleScan
 	../tables/builder:
+		BridgedPiece(BridgedHole, BridgedText),
 		DiscoveryBuilder,
 		OwnedRows,
 		advance_token,
 		append_plain_diagnostic,
 		append_syntax_diagnostic,
-		interpolation_part_at,
-		interpolation_parts_of,
-		interpolation_text_at,
+		bridged_interpolation_at,
 		move_token_cursor,
 		next_definition_id,
 		next_diagnostic_id,
@@ -95,11 +94,11 @@ import:
 	../tables/ids:
 		DefinitionId,
 		DiagnosticId,
-		LiteralId,
 		ModuleId,
 		NameId,
 		NodeId,
 		SourceId,
+		name_id_at_row,
 		name_ids_equal,
 	../tables/name_vocabulary: DISCARD_NAME, EMPTY_NAME
 	../tables/node_builder:
@@ -149,7 +148,7 @@ import:
 			FieldAccessNode, InterpolationHoleNode, InterpolationTextNode,
 			LocalFunctionNode, SubscriptAssignmentNode, SubscriptNode,
 		),
-	../tables/rows: InterpolationPart(HolePart, TextPart), InterpolationPartRow, NodeRow, RowRange
+	../tables/rows: NodeRow
 	../tables/source_position: LineColumn, span_start_line, span_start_position
 	../tables/span: NO_SPAN, Span, pack_span, span_covering, span_source, spans_equal
 	../tables/token:
@@ -236,6 +235,7 @@ import:
 		report_missing_function_body,
 		skip_pure_keyword,
 		starts_local_function,
+	lexed_bridge: lex_interpolation_hole
 	parser_cursor:
 		at,
 		at_block_end,
@@ -287,15 +287,6 @@ import:
 The most elements a tuple expression may have.
 ---
 private MAX_TUPLE_ITEMS: Int = 4
-
----
-The widths of the `${` that opens an interpolation hole and the `}` that
-closes it: a hole's part row covers only the code between them, and its
-`InterpolationHoleNode` covers both.
----
-private INTERPOLATION_HOLE_OPENER_WIDTH: Int = 2
-
-private INTERPOLATION_HOLE_CLOSER_WIDTH: Int = 1
 
 
 -- Function declarations.
@@ -2406,26 +2397,29 @@ private pure func parse_interpolated_string(
 	token: Token = builder.current_token()
 	resume: Int = builder.token_cursor + 1
 	mark: ChildMark = builder.mark_children()
-	parts: RowRange = builder.interpolation_parts_of(token.payload)
+	pieces: List[BridgedPiece] = builder.bridged_interpolation_at(token.payload).pieces
 	builder
-		.parse_interpolation_parts(scope, token.span.span_source(), parts)
+		.parse_interpolation_pieces(scope, token.span.span_source(), pieces)
 		.move_token_cursor(resume)
 		.append_plain_parent_node_since(mark, kind, token.span)
 
 
-private pure func parse_interpolation_parts(
+---
+The pieces of one interpolated string, each pushed. A function of its own so
+that the chain after it in `parse_interpolated_string` starts from a parameter,
+not from a `var` builder reassigned in a loop (the threading rules in
+`tables/builder`, rule 2): that shape copies every table the parse appends to.
+---
+private pure func parse_interpolation_pieces(
 	builder: DiscoveryBuilder,
 	scope: BodyScope,
 	source: SourceId,
-	parts: RowRange,
+	pieces: List[BridgedPiece],
 ) -> DiscoveryBuilder:
 	var out: DiscoveryBuilder = builder
-	var index: Int = parts.first
 
-	while index < parts.first + parts.count:
-		part: InterpolationPartRow = out.interpolation_part_at(index)
-		out = out.parse_interpolation_part(scope, source, part)
-		index += 1
+	for piece in pieces:
+		out = out.parse_interpolation_piece(scope, source, piece)
 
 	out
 
@@ -2433,22 +2427,19 @@ private pure func parse_interpolation_parts(
 ---
 One piece, pushed: a text node, or the hole's expression.
 ---
-private pure func parse_interpolation_part(
+private pure func parse_interpolation_piece(
 	builder: DiscoveryBuilder,
 	scope: BodyScope,
 	source: SourceId,
-	part: InterpolationPartRow,
+	piece: BridgedPiece,
 ) -> DiscoveryBuilder:
-	span: Span = pack_span(source, part.start, part.end)
-
-	match part.part:
-		TextPart:
-			text: LiteralId = builder.interpolation_text_at(part.text.first)
+	match piece:
+		BridgedText(text):
 			builder
-				.append_literal_leaf_node(InterpolationTextLeaf, span, text)
+				.append_literal_leaf_node(InterpolationTextLeaf, text.span, text.text)
 				.push_last_node()
-		HolePart:
-			builder.parse_interpolation_hole(scope, source, part)
+		BridgedHole(hole):
+			builder.parse_interpolation_hole(scope, source, hole)
 
 
 ---
@@ -2461,12 +2452,12 @@ private pure func parse_interpolation_hole(
 	builder: DiscoveryBuilder,
 	scope: BodyScope,
 	source: SourceId,
-	hole: InterpolationPartRow,
+	hole: HoleScan,
 ) -> DiscoveryBuilder:
 	hole_start: Int = builder.token_count()
-	anchor: Span = pack_span(source, hole.start, hole.start)
+	anchor: Span = pack_span(source, hole.expression_start, hole.expression_start)
 	out: DiscoveryBuilder = builder
-		.lex_interpolation_hole(source, hole.start, hole.end)
+		.lex_interpolation_hole(source, hole.expression_start, hole.expression_end)
 		.move_token_cursor(hole_start)
 		.parse_assignment_value(scope, anchor)
 		.push_last_node()
@@ -2477,11 +2468,6 @@ private pure func parse_interpolation_hole(
 	else:
 		out
 
-	hole_span: Span = pack_span(
-		source,
-		hole.start - INTERPOLATION_HOLE_OPENER_WIDTH,
-		hole.end + INTERPOLATION_HOLE_CLOSER_WIDTH,
-	)
 	checked
-		.append_plain_parent_node_from_stack(InterpolationHoleParent, hole_span, 1)
+		.append_plain_parent_node_from_stack(InterpolationHoleParent, hole.span, 1)
 		.push_last_node()

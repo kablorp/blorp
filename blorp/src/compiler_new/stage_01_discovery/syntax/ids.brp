@@ -1,0 +1,923 @@
+-- The syntax ids, their readers, and `IdMint`, the only maker of ids
+-- (`docs/DISCOVERY_REDESIGN.md`, sections 3.3 and 3.15).
+--
+-- An id is packed from its module and its index within the module's family, so
+-- a module's ids do not depend on any other module and modules parse
+-- independently (rustc's `HirId` = (owner, local id)). A program-wide id is the
+-- module's base plus the local index (section 4.4). Ids are stable within one
+-- compilation only: never store or compare one across compilations.
+--
+-- An id exists only once its node is being built. Every `minted_*` function
+-- mints the next id of a family and builds the node with it in the same call,
+-- so no caller ever holds an id its node does not carry, and no function here
+-- returns a bare new id. A record is built after its parts, which are its
+-- arguments, so ids follow completion order (post-order), and within a family
+-- a subtree's ids form one contiguous range ending at its root.
+--
+-- Only `parse/parse_state.brp` and tests may import `IdMint`, `new_id_mint`,
+-- `issued` and the `minted_*` functions (`scripts/check-blorp-layout`); anyone
+-- may import the id types and their readers. Blorp has no linear types, so a
+-- parse that kept using a stale mint, or made two mints for one module, would
+-- mint an id twice: `new_id_mint` is called once per module, and the id census
+-- (`id_census.brp`) finds a duplicate or a gap.
+import:
+	../tables/ids: ModuleId, module_id_at_row, module_id_index
+	../tables/row_kinds: Purity, Visibility
+	../tables/span: SPAN_SOURCE_BITS, Span, power_of_two
+	declarations:
+		AliasDeclaration,
+		AliasForm,
+		Annotation,
+		BuiltinTypeDeclaration,
+		CleanupBuiltin,
+		EnumCase,
+		EnumDeclaration,
+		FieldDeclaration,
+		Function,
+		FunctionDeclaration,
+		GlobalDeclaration,
+		GlobalForm,
+		ImplementationDeclaration,
+		ImplementationMethod,
+		LocalFunction,
+		Parameter,
+		RecordDeclaration,
+		ResourceTypeDeclaration,
+		Signature,
+		RecordDeclarationForm,
+		TraitDeclaration,
+		TraitMethod,
+		TraitReference,
+		TypeParameter,
+		UnionDeclaration,
+		VariantDeclaration,
+	definitions:
+		Definition(
+			AliasDefinition, BuiltinTypeDefinition, EnumCaseDefinition, EnumDefinition,
+			FieldDefinition, ForeignFunctionDefinition, FunctionDefinition, GlobalDefinition,
+			ImplementationDefinition, ImplementationMethodDefinition, LocalFunctionDefinition,
+			RecordDefinition, ResourceTypeDefinition, TraitDefinition,
+			TraitMethodDefinition, UnionDefinition, VariantDefinition,
+		),
+	expressions:
+		Block,
+		Body,
+		ElseIfExpression,
+		Expression,
+		ExpressionKind,
+		Hole,
+		IfExpression,
+		Statement,
+		StatementKind,
+		SubscriptPlace,
+	foreign_blocks: ForeignCName, ForeignFunction
+	imports: Import, ImportItem, ModulePath
+	module_syntax: Documentation, SyntaxCounts
+	names: Binder, NameUse, TypeBinder, WrittenName
+	patterns: Pattern, PatternKind
+	sequences: AtLeastOne
+	types: Dimension, DimensionKind, WrittenType, WrittenTypeKind
+
+
+---
+How a syntax id is laid out: the module in the high bits, the index within the
+module's family in the low bits. The module bits are the span's source bits
+(15): admission gives no module an index the span cannot hold
+(`source_index_fits_span`), so none overflows an id either. 48 bits of index
+are far beyond any module, whose source holds at most 2^24 bytes. Together they
+fill an `Int` without its sign bit.
+---
+SYNTAX_ID_MODULE_BITS: Int = SPAN_SOURCE_BITS
+
+SYNTAX_ID_INDEX_BITS: Int = 48
+
+private SYNTAX_ID_INDEX_LIMIT: Int = power_of_two(SYNTAX_ID_INDEX_BITS)
+
+---
+A spelling in its module, packed like the other syntax identities. Only the
+spelling interner imports its constructor; readers need no table access.
+---
+opaque type SpellingId = Int
+
+
+---
+A declaration, member, method, foreign function or local function: the `id` of its record.
+---
+opaque type DefinitionId = Int
+
+---
+An import: `Import.id`.
+---
+opaque type ImportId = Int
+
+---
+A statement: `Statement.id`.
+---
+opaque type StatementId = Int
+
+---
+A block: `Block.id`.
+---
+opaque type BlockId = Int
+
+---
+An expression: `Expression.id`, and the `id` of an `else if`, an interpolation hole and the place of `xs[i] = v`, which typecheck types without the `Expression` wrapper.
+---
+opaque type ExpressionId = Int
+
+---
+A pattern: `Pattern.id`.
+---
+opaque type PatternId = Int
+
+---
+A written type: `WrittenType.id`.
+---
+opaque type WrittenTypeId = Int
+
+---
+A dimension: `Dimension.id`.
+---
+opaque type DimensionId = Int
+
+---
+A name use: `NameUse.use`.
+---
+opaque type NameUseId = Int
+
+---
+A local binder: `Binder.binder`.
+---
+opaque type BinderId = Int
+
+---
+A declared type parameter: `TypeBinder.binder`.
+---
+opaque type TypeBinderId = Int
+
+
+---
+The packed value of index `index` of a family of `module`.
+---
+private pure func packed_id(module: ModuleId, index: Int) -> Int:
+	module.module_id_index() * SYNTAX_ID_INDEX_LIMIT + index
+
+
+private pure func packed_module(packed: Int) -> ModuleId:
+	module_id_at_row(packed / SYNTAX_ID_INDEX_LIMIT)
+
+
+private pure func packed_index(packed: Int) -> Int:
+	packed % SYNTAX_ID_INDEX_LIMIT
+
+
+pure func definition_module(id: DefinitionId) -> ModuleId:
+	packed_module(from_opaque DefinitionId(id))
+
+
+pure func definition_local_index(id: DefinitionId) -> Int:
+	packed_index(from_opaque DefinitionId(id))
+
+
+pure func import_module(id: ImportId) -> ModuleId:
+	packed_module(from_opaque ImportId(id))
+
+
+pure func import_local_index(id: ImportId) -> Int:
+	packed_index(from_opaque ImportId(id))
+
+
+pure func statement_module(id: StatementId) -> ModuleId:
+	packed_module(from_opaque StatementId(id))
+
+
+pure func statement_local_index(id: StatementId) -> Int:
+	packed_index(from_opaque StatementId(id))
+
+
+pure func block_module(id: BlockId) -> ModuleId:
+	packed_module(from_opaque BlockId(id))
+
+
+pure func block_local_index(id: BlockId) -> Int:
+	packed_index(from_opaque BlockId(id))
+
+
+pure func expression_module(id: ExpressionId) -> ModuleId:
+	packed_module(from_opaque ExpressionId(id))
+
+
+pure func expression_local_index(id: ExpressionId) -> Int:
+	packed_index(from_opaque ExpressionId(id))
+
+
+pure func pattern_module(id: PatternId) -> ModuleId:
+	packed_module(from_opaque PatternId(id))
+
+
+pure func pattern_local_index(id: PatternId) -> Int:
+	packed_index(from_opaque PatternId(id))
+
+
+pure func written_type_module(id: WrittenTypeId) -> ModuleId:
+	packed_module(from_opaque WrittenTypeId(id))
+
+
+pure func written_type_local_index(id: WrittenTypeId) -> Int:
+	packed_index(from_opaque WrittenTypeId(id))
+
+
+pure func dimension_module(id: DimensionId) -> ModuleId:
+	packed_module(from_opaque DimensionId(id))
+
+
+pure func dimension_local_index(id: DimensionId) -> Int:
+	packed_index(from_opaque DimensionId(id))
+
+
+pure func name_use_module(id: NameUseId) -> ModuleId:
+	packed_module(from_opaque NameUseId(id))
+
+
+pure func name_use_local_index(id: NameUseId) -> Int:
+	packed_index(from_opaque NameUseId(id))
+
+
+pure func binder_module(id: BinderId) -> ModuleId:
+	packed_module(from_opaque BinderId(id))
+
+
+pure func binder_local_index(id: BinderId) -> Int:
+	packed_index(from_opaque BinderId(id))
+
+
+pure func type_binder_module(id: TypeBinderId) -> ModuleId:
+	packed_module(from_opaque TypeBinderId(id))
+
+
+pure func type_binder_local_index(id: TypeBinderId) -> Int:
+	packed_index(from_opaque TypeBinderId(id))
+
+
+-- The interner creates this id in the same step that accepts its spelling.
+pure func spelling_id(module: ModuleId, index: Int) -> SpellingId:
+	into_opaque SpellingId(packed_id(module, index))
+
+
+pure func spelling_module(id: SpellingId) -> ModuleId:
+	packed_module(from_opaque SpellingId(id))
+
+
+pure func spelling_index(id: SpellingId) -> Int:
+	packed_index(from_opaque SpellingId(id))
+
+
+---
+The maker of one module's syntax ids. An id exists only once its node is
+being built: every function here mints the next id of a family and builds the
+node with it in the same call, so no caller ever holds an id its node does not
+carry. Definitions and imports are also indexed here, in that same call, at
+the index of their id.
+---
+opaque type IdMint = MintState
+
+
+---
+`definitions` and `imports` are the module's indexes: a definition's id is
+the length of `definitions` when it is minted, and the same update appends
+it there, so the position is not a separate fact. The other families are
+counted in `counts`.
+---
+private record MintState {
+	module: ModuleId,
+	counts: SyntaxCounts,
+	definitions: List[Definition],
+	imports: List[Import]
+}
+
+
+---
+What a module's parse issued, for its `ModuleSyntax`: how many ids of each
+node, name and binder family, and the definitions and imports indexes.
+---
+record IssuedIds {
+	counts: SyntaxCounts,
+	definitions: List[Definition],
+	imports: List[Import]
+}
+
+
+private NO_IDS_ISSUED: SyntaxCounts = {
+	statements = 0,
+	blocks = 0,
+	expressions = 0,
+	patterns = 0,
+	written_types = 0,
+	dimensions = 0,
+	name_uses = 0,
+	binders = 0,
+	type_binders = 0
+}
+
+
+---
+The mint of `module`'s parse, before any id is issued. Called once per
+module, when its parse starts.
+---
+pure func new_id_mint(module: ModuleId) -> IdMint:
+	into_opaque IdMint({
+			module = module,
+			counts = NO_IDS_ISSUED,
+			definitions = [],
+			imports = []
+		})
+
+
+---
+What the module issued: the counts and the two indexes. Consumes the mint.
+---
+pure func issued(mint: IdMint) -> IssuedIds:
+	state: MintState = from_opaque IdMint(mint)
+	{
+		counts = state.counts,
+		definitions = state.definitions,
+		imports = state.imports
+	}
+
+
+---
+`state` advanced past `counts`, the counts with one family's next index taken.
+---
+private pure func with_counts(state: MintState, counts: SyntaxCounts) -> IdMint:
+	into_opaque IdMint({ state | counts = counts })
+
+
+-- Node families.
+---
+Builds an expression with the next expression id: `{id, span, kind}`.
+---
+pure func minted_expression(mint: IdMint, span: Span, kind: ExpressionKind) -> (IdMint, Expression):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.expressions
+	expression: Expression = {
+		id = into_opaque ExpressionId(packed_id(state.module, index)),
+		span = span,
+		kind = kind
+	}
+	(state.with_counts({ state.counts | expressions = index + 1 }), expression)
+
+
+---
+Builds the `if` of an `else if` with the next expression id.
+---
+pure func minted_else_if(
+	mint: IdMint,
+	span: Span,
+	conditional: IfExpression,
+) -> (IdMint, ElseIfExpression):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.expressions
+	else_if: ElseIfExpression = {
+		id = into_opaque ExpressionId(packed_id(state.module, index)),
+		span = span,
+		conditional = conditional
+	}
+	(state.with_counts({ state.counts | expressions = index + 1 }), else_if)
+
+
+---
+Builds an interpolation hole with the next expression id, after its value.
+---
+pure func minted_hole(mint: IdMint, value: Expression, span: Span) -> (IdMint, Hole):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.expressions
+	hole: Hole = {
+		id = into_opaque ExpressionId(packed_id(state.module, index)),
+		value = value,
+		span = span
+	}
+	(state.with_counts({ state.counts | expressions = index + 1 }), hole)
+
+
+---
+Builds the written place of `xs[i] = v` with the next expression id. The
+parser calls it when it sees the `=`, before it parses the value.
+---
+pure func minted_subscript_place(
+	mint: IdMint,
+	span: Span,
+	collection: Expression,
+	indices: AtLeastOne[Expression],
+) -> (IdMint, SubscriptPlace):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.expressions
+	place: SubscriptPlace = {
+		id = into_opaque ExpressionId(packed_id(state.module, index)),
+		span = span,
+		collection = collection,
+		indices = indices
+	}
+	(state.with_counts({ state.counts | expressions = index + 1 }), place)
+
+
+pure func minted_statement(mint: IdMint, span: Span, kind: StatementKind) -> (IdMint, Statement):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.statements
+	statement: Statement = {
+		id = into_opaque StatementId(packed_id(state.module, index)),
+		span = span,
+		kind = kind
+	}
+	(state.with_counts({ state.counts | statements = index + 1 }), statement)
+
+
+pure func minted_block(
+	mint: IdMint,
+	leading: List[Statement],
+	last: Statement,
+	span: Span,
+) -> (IdMint, Block):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.blocks
+	block: Block = {
+		id = into_opaque BlockId(packed_id(state.module, index)),
+		leading = leading,
+		last = last,
+		span = span
+	}
+	(state.with_counts({ state.counts | blocks = index + 1 }), block)
+
+
+pure func minted_pattern(mint: IdMint, span: Span, kind: PatternKind) -> (IdMint, Pattern):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.patterns
+	pattern: Pattern = {
+		id = into_opaque PatternId(packed_id(state.module, index)),
+		span = span,
+		kind = kind
+	}
+	(state.with_counts({ state.counts | patterns = index + 1 }), pattern)
+
+
+pure func minted_written_type(
+	mint: IdMint,
+	span: Span,
+	kind: WrittenTypeKind,
+) -> (IdMint, WrittenType):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.written_types
+	written_type: WrittenType = {
+		id = into_opaque WrittenTypeId(packed_id(state.module, index)),
+		span = span,
+		kind = kind
+	}
+	(state.with_counts({ state.counts | written_types = index + 1 }), written_type)
+
+
+pure func minted_dimension(mint: IdMint, span: Span, kind: DimensionKind) -> (IdMint, Dimension):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.dimensions
+	dimension: Dimension = {
+		id = into_opaque DimensionId(packed_id(state.module, index)),
+		span = span,
+		kind = kind
+	}
+	(state.with_counts({ state.counts | dimensions = index + 1 }), dimension)
+
+
+-- Name and binder families: minted in source order, when the name's token is
+-- consumed.
+pure func minted_name_use(mint: IdMint, name: WrittenName) -> (IdMint, NameUse):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.name_uses
+	use: NameUse = {
+		name = name,
+		use = into_opaque NameUseId(packed_id(state.module, index))
+	}
+	(state.with_counts({ state.counts | name_uses = index + 1 }), use)
+
+
+pure func minted_binder(mint: IdMint, name: WrittenName) -> (IdMint, Binder):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.binders
+	binder: Binder = {
+		name = name,
+		binder = into_opaque BinderId(packed_id(state.module, index))
+	}
+	(state.with_counts({ state.counts | binders = index + 1 }), binder)
+
+
+pure func minted_type_binder(mint: IdMint, name: WrittenName) -> (IdMint, TypeBinder):
+	state: MintState = from_opaque IdMint(mint)
+	index: Int = state.counts.type_binders
+	binder: TypeBinder = {
+		name = name,
+		binder = into_opaque TypeBinderId(packed_id(state.module, index))
+	}
+	(state.with_counts({ state.counts | type_binders = index + 1 }), binder)
+
+
+-- Imports and definitions: each id is the length of its index, and the same
+-- update appends the record there.
+---
+Builds an import with the next import id and indexes it.
+---
+pure func minted_import(
+	mint: IdMint,
+	path: ModulePath,
+	alias_name: Option[WrittenName],
+	items: List[ImportItem],
+	path_span: Span,
+	span: Span,
+) -> (IdMint, Import):
+	state: MintState = from_opaque IdMint(mint)
+	import_row: Import = {
+		id = into_opaque ImportId(packed_id(state.module, state.imports.length())),
+		path = path,
+		alias_name = alias_name,
+		items = items,
+		path_span = path_span,
+		span = span
+	}
+	(state.with_import(import_row), import_row)
+
+
+---
+`state` with `import_row` appended to the imports index. Its own function of
+`state` alone, so that the one reference to the index is handed on and the
+list grows in place when the mint is not shared.
+---
+private pure func with_import(state: MintState, import_row: Import) -> IdMint:
+	into_opaque IdMint({ state | imports = state.imports.append(import_row) })
+
+
+---
+The id the next definition of `state` gets: the length of the index it is
+appended to in the same call.
+---
+private pure func next_definition_index(state: MintState) -> Int:
+	packed_id(state.module, state.definitions.length())
+
+
+---
+`state` with `definition` appended to the definitions index, as
+`with_import` appends an import.
+---
+private pure func with_definition(state: MintState, definition: Definition) -> IdMint:
+	into_opaque IdMint({ state | definitions = state.definitions.append(definition) })
+
+
+---
+Builds a top-level function with the next definition id and indexes it.
+---
+pure func minted_function(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	annotations: List[Annotation],
+	function: Function,
+	span: Span,
+) -> (IdMint, FunctionDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: FunctionDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		annotations = annotations,
+		function = function,
+		span = span
+	}
+	(state.with_definition(FunctionDefinition(declaration)), declaration)
+
+
+---
+Builds a local function with the next definition id and indexes it: after
+every function declared in its body.
+---
+pure func minted_local_function(
+	mint: IdMint,
+	function: Function,
+	span: Span,
+) -> (IdMint, LocalFunction):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: LocalFunction = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		function = function,
+		span = span
+	}
+	(state.with_definition(LocalFunctionDefinition(declaration)), declaration)
+
+
+pure func minted_trait_method(
+	mint: IdMint,
+	signature: Signature,
+	default_body: Option[Body],
+	span: Span,
+) -> (IdMint, TraitMethod):
+	state: MintState = from_opaque IdMint(mint)
+	method: TraitMethod = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		signature = signature,
+		default_body = default_body,
+		span = span
+	}
+	(state.with_definition(TraitMethodDefinition(method)), method)
+
+
+pure func minted_implementation_method(
+	mint: IdMint,
+	annotations: List[Annotation],
+	function: Function,
+	span: Span,
+) -> (IdMint, ImplementationMethod):
+	state: MintState = from_opaque IdMint(mint)
+	method: ImplementationMethod = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		annotations = annotations,
+		function = function,
+		span = span
+	}
+	(state.with_definition(ImplementationMethodDefinition(method)), method)
+
+
+pure func minted_foreign_function(
+	mint: IdMint,
+	visibility: Visibility,
+	annotations: List[Annotation],
+	purity: Purity,
+	keyword: Span,
+	name: WrittenName,
+	parameters: List[Parameter],
+	return_type: WrittenType,
+	c_name: Option[ForeignCName],
+	span: Span,
+) -> (IdMint, ForeignFunction):
+	state: MintState = from_opaque IdMint(mint)
+	function: ForeignFunction = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		annotations = annotations,
+		purity = purity,
+		keyword = keyword,
+		name = name,
+		parameters = parameters,
+		return_type = return_type,
+		c_name = c_name,
+		span = span
+	}
+	(state.with_definition(ForeignFunctionDefinition(function)), function)
+
+
+pure func minted_global(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	form: GlobalForm,
+	name: WrittenName,
+	declared_type: Option[WrittenType],
+	value: Expression,
+	span: Span,
+) -> (IdMint, GlobalDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: GlobalDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		form = form,
+		name = name,
+		declared_type = declared_type,
+		value = value,
+		span = span
+	}
+	(state.with_definition(GlobalDefinition(declaration)), declaration)
+
+
+pure func minted_field(
+	mint: IdMint,
+	name: WrittenName,
+	field_type: WrittenType,
+	span: Span,
+) -> (IdMint, FieldDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	field: FieldDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		name = name,
+		field_type = field_type,
+		span = span
+	}
+	(state.with_definition(FieldDefinition(field)), field)
+
+
+---
+Builds a record declaration over its already-minted `fields`.
+---
+pure func minted_record(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	form: RecordDeclarationForm,
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	fields: List[FieldDeclaration],
+	span: Span,
+) -> (IdMint, RecordDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: RecordDeclaration = {
+		form = form,
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		name = name,
+		type_parameters = type_parameters,
+		fields = fields,
+		span = span
+	}
+	(state.with_definition(RecordDefinition(declaration)), declaration)
+
+
+pure func minted_variant(
+	mint: IdMint,
+	name: WrittenName,
+	payload: List[WrittenType],
+	span: Span,
+) -> (IdMint, VariantDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	variant: VariantDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		name = name,
+		payload = payload,
+		span = span
+	}
+	(state.with_definition(VariantDefinition(variant)), variant)
+
+
+pure func minted_union(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	variants: List[VariantDeclaration],
+	span: Span,
+) -> (IdMint, UnionDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: UnionDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		name = name,
+		type_parameters = type_parameters,
+		variants = variants,
+		span = span
+	}
+	(state.with_definition(UnionDefinition(declaration)), declaration)
+
+
+pure func minted_enum_case(mint: IdMint, name: WrittenName, span: Span) -> (IdMint, EnumCase):
+	state: MintState = from_opaque IdMint(mint)
+	case_declaration: EnumCase = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		name = name,
+		span = span
+	}
+	(state.with_definition(EnumCaseDefinition(case_declaration)), case_declaration)
+
+
+pure func minted_enum(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	cases: List[EnumCase],
+	span: Span,
+) -> (IdMint, EnumDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: EnumDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		name = name,
+		cases = cases,
+		span = span
+	}
+	(state.with_definition(EnumDefinition(declaration)), declaration)
+
+
+pure func minted_alias(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	form: AliasForm,
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	target: WrittenType,
+	span: Span,
+) -> (IdMint, AliasDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: AliasDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		form = form,
+		name = name,
+		type_parameters = type_parameters,
+		target = target,
+		span = span
+	}
+	(state.with_definition(AliasDefinition(declaration)), declaration)
+
+
+pure func minted_builtin_type(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	span: Span,
+) -> (IdMint, BuiltinTypeDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: BuiltinTypeDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		name = name,
+		type_parameters = type_parameters,
+		span = span
+	}
+	(state.with_definition(BuiltinTypeDefinition(declaration)), declaration)
+
+
+pure func minted_resource_type(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	cleanup: Option[CleanupBuiltin],
+	span: Span,
+) -> (IdMint, ResourceTypeDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: ResourceTypeDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		name = name,
+		type_parameters = type_parameters,
+		cleanup = cleanup,
+		span = span
+	}
+	(state.with_definition(ResourceTypeDefinition(declaration)), declaration)
+
+
+---
+Builds a trait declaration over its already-minted `methods`.
+---
+pure func minted_trait(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	name: WrittenName,
+	type_parameters: List[TypeParameter],
+	supertraits: List[TraitReference],
+	methods: List[TraitMethod],
+	span: Span,
+) -> (IdMint, TraitDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: TraitDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		name = name,
+		type_parameters = type_parameters,
+		supertraits = supertraits,
+		methods = methods,
+		span = span
+	}
+	(state.with_definition(TraitDefinition(declaration)), declaration)
+
+
+---
+Builds an implementation over its already-minted `methods`.
+---
+pure func minted_implementation(
+	mint: IdMint,
+	visibility: Visibility,
+	documentation: Option[Documentation],
+	keyword: Span,
+	trait_name: NameUse,
+	receiver: WrittenType,
+	methods: List[ImplementationMethod],
+	span: Span,
+) -> (IdMint, ImplementationDeclaration):
+	state: MintState = from_opaque IdMint(mint)
+	declaration: ImplementationDeclaration = {
+		id = into_opaque DefinitionId(state.next_definition_index()),
+		visibility = visibility,
+		documentation = documentation,
+		keyword = keyword,
+		trait_name = trait_name,
+		receiver = receiver,
+		methods = methods,
+		span = span
+	}
+	(state.with_definition(ImplementationDefinition(declaration)), declaration)

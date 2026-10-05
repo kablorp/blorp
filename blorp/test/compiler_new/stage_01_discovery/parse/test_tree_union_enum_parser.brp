@@ -1,0 +1,342 @@
+-- Direct declaration leaves; callers consumed `union` or `enum` only.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, advanced, current_kind, current_span, diagnostics, diagnostic_count, issued_counts, spellings
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_union_parser: UnionParse(ParsedUnion, RejectedUnion), parse_union
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_enum_parser: EnumParse(ParsedEnum, RejectedEnum), parse_enum
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/module_syntax: Documentation
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, type_binder_local_index, name_use_local_index, written_type_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(NamedType)
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(ExpectedToken, Plain)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(EnumCaseParenthesesDiagnostic, UnionVariantTooManyFieldsDiagnostic, BoundInTypeDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		ExpectedTokenDiagnostic(ExpectedColon, ExpectedNewline, ExpectedIndent, ExpectedName, ExpectedRightParen, ExpectedRightBracket),
+		ColonConstruct(ColonInUnionVariants), NewlineConstruct(NewlineInUnionVariants), IndentConstruct(IndentInUnionVariants),
+		NameConstruct(NameInTypeName, NameInVariantName), RightParenConstruct(RightParenInVariantFields), RightBracketConstruct(RightBracketInTypeParameters)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/limits: MAX_UNION_VARIANT_FIELDS
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(IfKeyword, IdentifierToken, ColonSymbol, EndOfFileToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+pure func test_generic_union_mints_payloads_variants_and_parent_in_order() -> Bool:
+	text: String = "union Choice[T: m.Eq + Hashable, #N, #_]:\n\tBare\n\tEmpty()\n\tPair(T, Int,)\n\tTrue\n\tFalse\nif"
+	match new_parse_state(lex_module(module_id_at_row(3), text)):
+		Ok(state):
+			documentation: Documentation = { text = "A choice.", span = state.current_span() }
+			(parsed, result) = parse_union(state.advanced(), PrivateVisibility, Some(documentation), state.current_span())
+
+			match result:
+				ParsedUnion(value):
+					match (value.type_parameters, value.variants, value.documentation):
+						([TypeVariable(variable), DimensionVariable(dimension), WildcardDimensionParameter(wildcard)], [bare, empty, pair, truth, falsity], Some(doc)):
+							match (variable.bounds, pair.payload):
+								([qualified, hashable], [first, second]):
+									match (qualified.qualifier, first.kind, second.kind):
+										(Some(qualifier), NamedType(first_use, []), NamedType(second_use, [])):
+											(value.visibility == PrivateVisibility and doc.text == documentation.text and doc.span.spans_equal(documentation.span)
+												and value.name.span.covers(6, 12) and value.span.covers(0, 85)
+												and variable.binder.binder.type_binder_local_index() == 0 and dimension.binder.type_binder_local_index() == 1
+												and variable.span.covers(13, 31) and dimension.name.span.covers(33, 35) and wildcard.covers(37, 39)
+												and qualifier.use.name_use_local_index() == 0 and qualified.trait_name.use.name_use_local_index() == 1
+												and hashable.trait_name.use.name_use_local_index() == 2 and first_use.use.name_use_local_index() == 3 and second_use.use.name_use_local_index() == 4
+												and first.id.written_type_local_index() == 0 and second.id.written_type_local_index() == 1
+												and first.span.covers(63, 64) and second.span.covers(66, 69)
+												and bare.id.definition_local_index() == 0 and empty.id.definition_local_index() == 1 and pair.id.definition_local_index() == 2
+												and truth.id.definition_local_index() == 3 and falsity.id.definition_local_index() == 4 and value.id.definition_local_index() == 5
+												and bare.payload.is_empty() and empty.payload.is_empty() and truth.payload.is_empty() and falsity.payload.is_empty()
+												and bare.span.covers(43, 47) and empty.span.covers(49, 56) and pair.span.covers(58, 71)
+												and truth.name.span.covers(73, 77) and falsity.name.span.covers(79, 84)
+												and parsed.spellings().spelling_text(truth.name.spelling) == Some("True") and parsed.spellings().spelling_text(falsity.name.spelling) == Some("False")
+												and parsed.spellings().spelling_text(first_use.name.spelling) == Some("T") and parsed.spellings().spelling_text(second_use.name.spelling) == Some("Int")
+												and parsed.issued_counts().type_binders == 2 and parsed.issued_counts().name_uses == 5 and parsed.issued_counts().written_types == 2
+												and parsed.diagnostic_count() == 0 and parsed.current_kind() == IfKeyword and parsed.current_span().covers(85, 87))
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_enum_boolean_and_soft_keyword_cases_mint_before_parent() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(3), "enum Flags:\n\tTrue\n\tFalse\n\tdebug\nif")):
+		Ok(state):
+			(parsed, result) = parse_enum(state.advanced(), PublicVisibility, None, state.current_span())
+
+			match result:
+				ParsedEnum(value):
+					match value.cases:
+						[truth, falsity, soft]:
+							(value.visibility == PublicVisibility and value.documentation.is_none()
+								and value.name.span.covers(5, 10) and value.span.covers(0, 32)
+								and truth.span.covers(13, 17) and falsity.span.covers(19, 24) and soft.span.covers(26, 31)
+								and truth.id.definition_local_index() == 0 and falsity.id.definition_local_index() == 1 and soft.id.definition_local_index() == 2 and value.id.definition_local_index() == 3
+								and parsed.spellings().spelling_text(truth.name.spelling) == Some("True")
+								and parsed.spellings().spelling_text(falsity.name.spelling) == Some("False")
+								and parsed.spellings().spelling_text(soft.name.spelling) == Some("debug")
+								and parsed.issued_counts().written_types == 0 and parsed.issued_counts().name_uses == 0
+								and parsed.diagnostic_count() == 0 and parsed.current_kind() == IfKeyword and parsed.current_span().covers(32, 34))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_eof_blocks_and_blank_indented_lines_preserve_children() -> Bool:
+	var correct: Bool = True
+
+	for text in ["union U:\n\tA\n\t\n\tB", "union U:\n\tA\n\n\tB\n"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(state):
+				(parsed, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+				match result:
+					ParsedUnion(value):
+						correct = value.variants.length() == 2 and value.id.definition_local_index() == 2 and value.span.covers(0, text.length()) and value.type_parameters.is_empty() and parsed.diagnostic_count() == 0 and parsed.current_kind() == EndOfFileToken and correct
+					_:
+						correct = False
+			Err(_):
+				correct = False
+
+	for text in ["enum E:\n\tA\n\t\n\tB", "enum E:\n\tA\n\n\tB\n"]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(state):
+				(parsed, result) = parse_enum(state.advanced(), PublicVisibility, None, state.current_span())
+				match result:
+					ParsedEnum(value):
+						correct = value.cases.length() == 2 and value.id.definition_local_index() == 2 and value.span.covers(0, text.length()) and parsed.diagnostic_count() == 0 and parsed.current_kind() == EndOfFileToken and correct
+					_:
+						correct = False
+			Err(_):
+				correct = False
+
+	correct
+
+
+private union ExpectedDiagnostic:
+	TokenDiagnostic(ExpectedTokenDiagnostic)
+	PlainDiagnostic(PlainSyntaxCode)
+
+
+private pure func diagnostic_matches(actual: SyntaxDiagnostic, expected: ExpectedDiagnostic) -> Bool:
+	match (actual, expected):
+		(ExpectedToken(ExpectedColon(actual)), TokenDiagnostic(ExpectedColon(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedNewline(actual)), TokenDiagnostic(ExpectedNewline(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedIndent(actual)), TokenDiagnostic(ExpectedIndent(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedName(actual)), TokenDiagnostic(ExpectedName(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedRightParen(actual)), TokenDiagnostic(ExpectedRightParen(wanted))):
+			actual == wanted
+		(ExpectedToken(ExpectedRightBracket(actual)), TokenDiagnostic(ExpectedRightBracket(wanted))):
+			actual == wanted
+		(Plain(actual), PlainDiagnostic(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func rejection_matches(text: String, is_enum: Bool, expected: List[(ExpectedDiagnostic, Int, Int)], cursor: TokenKind, start: Int, end: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, rejected) = if is_enum:
+				(parsed_state, result) = parse_enum(state.advanced(), PublicVisibility, None, state.current_span())
+				is_rejected: Bool = match result:
+					RejectedEnum:
+						True
+					_:
+						False
+				(parsed_state, is_rejected)
+			else:
+				(parsed_state, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+				is_rejected: Bool = match result:
+					RejectedUnion:
+						True
+					_:
+						False
+				(parsed_state, is_rejected)
+			var correct: Bool = rejected and parsed.diagnostic_count() == expected.length()
+			var index: Int = 0
+
+			for (diagnostic, first, last) in expected:
+				match parsed.diagnostics().get(index):
+					Some(at):
+						correct = diagnostic_matches(at.diagnostic, diagnostic) and at.span.covers(first, last) and correct
+					None:
+						correct = False
+				index += 1
+
+			correct and parsed.current_kind() == cursor and parsed.current_span().covers(start, end)
+		Err(_):
+			False
+
+
+pure func test_header_diagnostics_preserve_missing_indent_continuation() -> Bool:
+	(rejection_matches("union U\n\tA\nif", False, [(TokenDiagnostic(ExpectedColon(ColonInUnionVariants)), 9, 9)], IfKeyword, 11, 13)
+		and rejection_matches("union U: A\n", False, [(TokenDiagnostic(ExpectedNewline(NewlineInUnionVariants)), 9, 9), (TokenDiagnostic(ExpectedIndent(IndentInUnionVariants)), 9, 9)], EndOfFileToken, 11, 11)
+		and rejection_matches("union U:\nCase", False, [(TokenDiagnostic(ExpectedIndent(IndentInUnionVariants)), 9, 9)], EndOfFileToken, 13, 13)
+		and rejection_matches("enum E:\nCase", True, [(TokenDiagnostic(ExpectedIndent(IndentInUnionVariants)), 8, 8)], EndOfFileToken, 12, 12))
+
+
+pure func test_missing_names_malformed_parameters_and_tokens_reject() -> Bool:
+	(rejection_matches("union :", False, [(TokenDiagnostic(ExpectedName(NameInTypeName)), 6, 6)], ColonSymbol, 6, 7)
+		and rejection_matches("union U[T V]:\n\tA", False, [(TokenDiagnostic(ExpectedRightBracket(RightBracketInTypeParameters)), 10, 10)], IdentifierToken, 10, 11)
+		and rejection_matches("union U:\n\t123\nif", False, [(TokenDiagnostic(ExpectedName(NameInVariantName)), 10, 10)], IfKeyword, 14, 16)
+		and rejection_matches("enum E:\n\t123\nif", True, [(TokenDiagnostic(ExpectedName(NameInVariantName)), 9, 9)], IfKeyword, 13, 15))
+
+
+-- Invalid authored names still own their following payload syntax. Recovery
+-- mints payload children, then diagnostics prevent publishing the parent.
+private pure func invalid_name_payload_counts(text: String, is_enum: Bool) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, rejected) = if is_enum:
+				(parsed_state, result) = parse_enum(state.advanced(), PublicVisibility, None, state.current_span())
+				is_rejected: Bool = match result:
+					RejectedEnum:
+						True
+					_:
+						False
+				(parsed_state, is_rejected)
+			else:
+				(parsed_state, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+				is_rejected: Bool = match result:
+					RejectedUnion:
+						True
+					_:
+						False
+				(parsed_state, is_rejected)
+
+			rejected and parsed.issued_counts().name_uses == 1 and parsed.issued_counts().written_types == 1
+		Err(_):
+			False
+
+
+pure func test_invalid_union_name_recovers_its_payload_without_cascades() -> Bool:
+	text: String = "union U:\n\t123(Int)\nif"
+	(rejection_matches(text, False, [(TokenDiagnostic(ExpectedName(NameInVariantName)), 10, 10)], IfKeyword, 19, 21)
+		and invalid_name_payload_counts(text, False))
+
+
+pure func test_invalid_enum_name_preserves_authored_parentheses_diagnostic_and_payload() -> Bool:
+	text: String = "enum E:\n\t123(Int)\nif"
+	(rejection_matches(text, True, [
+		(TokenDiagnostic(ExpectedName(NameInVariantName)), 9, 9),
+		(PlainDiagnostic(EnumCaseParenthesesDiagnostic), 9, 12)
+	], IfKeyword, 18, 20) and invalid_name_payload_counts(text, True))
+
+
+pure func test_missing_name_parenthesis_recovers_payload_at_original_delimiter() -> Bool:
+	union_text: String = "union U:\n\t(Int)\nif"
+	enum_text: String = "enum E:\n\t(Int)\nif"
+	(rejection_matches(union_text, False, [(TokenDiagnostic(ExpectedName(NameInVariantName)), 10, 10)], IfKeyword, 16, 18)
+		and invalid_name_payload_counts(union_text, False)
+		and rejection_matches(enum_text, True, [
+			(TokenDiagnostic(ExpectedName(NameInVariantName)), 9, 9),
+			(PlainDiagnostic(EnumCaseParenthesesDiagnostic), 9, 10)
+		], IfKeyword, 15, 17) and invalid_name_payload_counts(enum_text, True))
+
+
+pure func test_enum_parentheses_and_payloads_are_rejected_at_case_name() -> Bool:
+	(rejection_matches("enum E:\n\tA()\nif", True, [(PlainDiagnostic(EnumCaseParenthesesDiagnostic), 9, 10)], IfKeyword, 13, 15)
+		and rejection_matches("enum E:\n\tA(Int, Bool,)\nif", True, [(PlainDiagnostic(EnumCaseParenthesesDiagnostic), 9, 10)], IfKeyword, 23, 25))
+
+
+pure func test_missing_right_paren_and_bounded_payload_keep_type_recovery() -> Bool:
+	(rejection_matches("union U:\n\tA(Int", False, [(TokenDiagnostic(ExpectedRightParen(RightParenInVariantFields)), 15, 15)], EndOfFileToken, 15, 15)
+		and rejection_matches("union U:\n\tA(T: Eq)\nif", False, [(PlainDiagnostic(BoundInTypeDiagnostic), 12, 17)], IfKeyword, 19, 21))
+
+
+pure func test_enum_brackets_remain_authored_body_material() -> Bool:
+	rejection_matches("enum E[]:\n\tA\nif", True, [
+		(TokenDiagnostic(ExpectedColon(ColonInUnionVariants)), 6, 6),
+		(TokenDiagnostic(ExpectedNewline(NewlineInUnionVariants)), 6, 6),
+		(TokenDiagnostic(ExpectedIndent(IndentInUnionVariants)), 6, 6),
+		(TokenDiagnostic(ExpectedName(NameInVariantName)), 6, 6),
+		(TokenDiagnostic(ExpectedName(NameInVariantName)), 7, 7),
+		(TokenDiagnostic(ExpectedName(NameInVariantName)), 8, 8),
+		(TokenDiagnostic(ExpectedName(NameInVariantName)), 11, 11),
+		(TokenDiagnostic(ExpectedName(NameInVariantName)), 10, 10)
+	], IfKeyword, 13, 15)
+
+
+private pure func payload_limit_case(count: Int) -> Bool:
+	var payloads: String = ""
+	var index: Int = 0
+
+	while index < count:
+		if index != 0:
+			payloads += ", "
+		payloads += "Int"
+		index += 1
+
+	text: String = "union U:\n\tMany(${payloads})\nif"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_union(state.advanced(), PublicVisibility, None, state.current_span())
+			common: Bool = (parsed.current_kind() == IfKeyword and parsed.current_span().covers(text.length() - 2, text.length())
+				and parsed.issued_counts().written_types == count and parsed.issued_counts().name_uses == count)
+
+			if count <= MAX_UNION_VARIANT_FIELDS:
+				match result:
+					ParsedUnion(value):
+						match value.variants:
+							[variant]:
+								common and variant.payload.length() == count and variant.id.definition_local_index() == 0 and value.id.definition_local_index() == 1 and parsed.diagnostic_count() == 0
+							_:
+								False
+					_:
+						False
+			else:
+				match (result, parsed.diagnostics()):
+					(RejectedUnion, [at]):
+						match at.diagnostic:
+							Plain(UnionVariantTooManyFieldsDiagnostic):
+								common and at.span.covers(10, 14)
+							_:
+								False
+					_:
+						False
+		Err(_):
+			False
+
+
+pure func test_payload_limit_accepts_boundary_and_reports_overflow_once_after_full_recovery() -> Bool:
+	(payload_limit_case(MAX_UNION_VARIANT_FIELDS) and payload_limit_case(MAX_UNION_VARIANT_FIELDS + 1)
+		and payload_limit_case(MAX_UNION_VARIANT_FIELDS + 2))
+
+
+tests: TestSuite = {
+	description = "Direct tree union and enum declaration leaves",
+	tests = [
+		("invalid union name recovers its payload without cascades", test_invalid_union_name_recovers_its_payload_without_cascades),
+		("invalid enum name preserves authored parentheses diagnostic and payload", test_invalid_enum_name_preserves_authored_parentheses_diagnostic_and_payload),
+		("missing name parenthesis recovers payload at original delimiter", test_missing_name_parenthesis_recovers_payload_at_original_delimiter),
+
+		("generic union mints payloads variants and parent in order", test_generic_union_mints_payloads_variants_and_parent_in_order),
+		("enum boolean and soft keyword cases mint before parent", test_enum_boolean_and_soft_keyword_cases_mint_before_parent),
+		("eof blocks and blank indented lines preserve children", test_eof_blocks_and_blank_indented_lines_preserve_children),
+		("header diagnostics preserve missing indent continuation", test_header_diagnostics_preserve_missing_indent_continuation),
+		("missing names malformed parameters and tokens reject", test_missing_names_malformed_parameters_and_tokens_reject),
+		("enum parentheses and payloads reject at case name", test_enum_parentheses_and_payloads_are_rejected_at_case_name),
+		("missing right paren and bounded payload keep type recovery", test_missing_right_paren_and_bounded_payload_keep_type_recovery),
+		("enum brackets remain authored body material", test_enum_brackets_remain_authored_body_material),
+		("payload limit accepts boundary and reports overflow once after recovery", test_payload_limit_accepts_boundary_and_reports_overflow_once_after_full_recovery)
+	]
+}

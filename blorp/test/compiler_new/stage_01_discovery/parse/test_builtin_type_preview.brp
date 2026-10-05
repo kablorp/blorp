@@ -1,0 +1,280 @@
+-- Standalone builtin/resource previews retain lexical evidence and reject headers.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/builtin_type_preview:
+		BuiltinTypePreview,
+		BuiltinTypePreviewDeclaration(BuiltinDeclaration, ResourceDeclaration),
+		BuiltinTypePreviewOutcome(
+			PreviewedBuiltinType, RejectedBuiltinTypePreview, UnsupportedBuiltinTypePreview,
+		),
+		builtin_type_declaration,
+		builtin_type_source,
+		preview_builtin_type,
+	../../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_span_text
+	../../../../src/compiler_new/stage_01_discovery/parse/rejected_preview: rejected_diagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations:
+		TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter),
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics:
+		SyntaxDiagnostic(ExpectedToken, Plain),
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code:
+		PlainSyntaxCode(UnexpectedCharacterDiagnostic, ExpectedCleanupBuiltinNameDiagnostic),
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
+		EqualConstruct(EqualInBuiltinTypeMarker),
+		ExpectedTokenDiagnostic(ExpectedKeyword, ExpectedEqual, ExpectedRightParen),
+		KeywordConstruct(KeywordInBuiltinTypeDeclaration, KeywordInBuiltinTypeMarker),
+		RightParenConstruct(RightParenInResourceCleanupBuiltinName),
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_end, span_start
+	test: TestSuite
+
+
+private pure func covers(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+private pure func rich_parameters(parameters: List[TypeParameter]) -> Bool:
+	match parameters:
+		[TypeVariable(variable), DimensionVariable(_), WildcardDimensionParameter(_)]:
+			match variable.bounds:
+				[qualified, bare]:
+					qualified.qualifier.is_some() and bare.qualifier.is_none()
+				_:
+					False
+		_:
+			False
+
+
+private pure func rich_preview(text: String, is_resource: Bool, cleanup_written: Bool) -> Bool:
+	match preview_builtin_type(lex_module(module_id_at_row(3), text)):
+		Ok(PreviewedBuiltinType(preview)):
+			source = builtin_type_source(preview)
+			common: Bool = source.source.text == text and not source.tokens.is_empty()
+
+			match builtin_type_declaration(preview):
+				BuiltinDeclaration(value):
+					(
+						common
+						and not is_resource
+						and value.visibility == PublicVisibility
+						and value.documentation.is_none()
+						and value.name.span.covers(5, 11)
+						and value.span.covers(0, 49)
+						and value.id.definition_local_index() == 0
+						and source.preview_span_text(value.name.span) == "Buffer"
+						and rich_parameters(value.type_parameters)
+					)
+				ResourceDeclaration(value):
+					cleanup_correct: Bool = match value.cleanup:
+						None:
+							not cleanup_written
+						Some(cleanup):
+							(
+								cleanup_written
+								and cleanup.name == "close\nfile"
+								and cleanup.span.covers(59, 72)
+								and source.preview_span_text(cleanup.span) == "\"close\\nfile\""
+							)
+
+					end: Int = if cleanup_written:
+						73
+					else:
+						58
+
+					(
+						common
+						and is_resource
+						and cleanup_correct
+						and value.visibility == PublicVisibility
+						and value.documentation.is_none()
+						and value.name.span.covers(14, 20)
+						and value.span.covers(0, end)
+						and value.id.definition_local_index() == 0
+						and source.preview_span_text(value.name.span) == "Buffer"
+						and rich_parameters(value.type_parameters)
+					)
+		_:
+			False
+
+
+pure func test_three_forms_preserve_metadata_spans_parameters_and_source() -> Bool:
+	(
+		rich_preview("type Buffer[T: m.Eq + Hashable, #N, #_] = builtin", False, False)
+		and rich_preview("resource type Buffer[T: m.Eq + Hashable, #N, #_] = builtin", True, False)
+		and rich_preview(
+			"resource type Buffer[T: m.Eq + Hashable, #N, #_] = builtin(\"close\\nfile\")",
+			True,
+			True,
+		)
+		and rich_preview("type Buffer[T: m.Eq + Hashable, #N, #_] = builtin\n\n", False, False)
+		and rich_preview(
+			"resource type Buffer[T: m.Eq + Hashable, #N, #_] = builtin(\"close\\nfile\")\n",
+			True,
+			True,
+		)
+	)
+
+
+pure func test_absent_empty_parameters_and_terminal_newlines_are_supported() -> Bool:
+	var correct: Bool = True
+
+	for prefix in ["type", "resource type"]:
+		for suffix in ["Empty = builtin", "Empty[] = builtin\n", "Empty = builtin\n\n"]:
+			text: String = "${prefix} ${suffix}"
+
+			match preview_builtin_type(lex_module(module_id_at_row(0), text)):
+				Ok(PreviewedBuiltinType(preview)):
+					match builtin_type_declaration(preview):
+						BuiltinDeclaration(value):
+							correct = value.type_parameters.is_empty() and correct
+						ResourceDeclaration(value):
+							correct = (
+								value.type_parameters.is_empty()
+								and value.cleanup.is_none()
+								and correct
+							)
+				_:
+					correct = False
+
+	correct
+
+
+private pure func expected_token_rejection(
+	text: String,
+	expected: ExpectedTokenDiagnostic,
+	offset: Int,
+) -> Bool:
+	match preview_builtin_type(lex_module(module_id_at_row(0), text)):
+		Ok(RejectedBuiltinTypePreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match (at.diagnostic, expected):
+						(ExpectedToken(ExpectedKeyword(actual)), ExpectedKeyword(wanted)):
+							actual == wanted and at.span.covers(offset, offset)
+						(ExpectedToken(ExpectedEqual(actual)), ExpectedEqual(wanted)):
+							actual == wanted and at.span.covers(offset, offset)
+						(ExpectedToken(ExpectedRightParen(actual)), ExpectedRightParen(wanted)):
+							actual == wanted and at.span.covers(offset, offset)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_missing_resource_type_and_markers_reject_with_exact_diagnostics() -> Bool:
+	(
+		expected_token_rejection(
+			"resource File = builtin",
+			ExpectedKeyword(KeywordInBuiltinTypeDeclaration),
+			9,
+		)
+		and expected_token_rejection(
+			"type File builtin",
+			ExpectedEqual(EqualInBuiltinTypeMarker),
+			10,
+		)
+		and expected_token_rejection("type File =", ExpectedKeyword(KeywordInBuiltinTypeMarker), 11)
+		and expected_token_rejection(
+			"resource type File = builtin(\"cleanup\"",
+			ExpectedRightParen(RightParenInResourceCleanupBuiltinName),
+			38,
+		)
+	)
+
+
+pure func test_empty_and_numeric_cleanup_reject_with_exact_diagnostic_spans() -> Bool:
+	var correct: Bool = True
+
+	for text in ["resource type File = builtin()", "resource type File = builtin(3)"]:
+		match preview_builtin_type(lex_module(module_id_at_row(0), text)):
+			Ok(RejectedBuiltinTypePreview(rejected)):
+				match rejected.rejected_diagnostics():
+					[at]:
+						match at.diagnostic:
+							Plain(ExpectedCleanupBuiltinNameDiagnostic):
+								correct = at.span.covers(29, 29) and correct
+							_:
+								correct = False
+					_:
+						correct = False
+			_:
+				correct = False
+
+	correct
+
+
+pure func test_lexical_diagnostics_reject_before_declaration_recognition() -> Bool:
+	-- Even an unsupported header rejects when lexical evidence is invalid.
+	match preview_builtin_type(lex_module(module_id_at_row(0), "private type File = builtin `")):
+		Ok(RejectedBuiltinTypePreview(rejected)):
+			match rejected.rejected_diagnostics():
+				[at]:
+					match at.diagnostic:
+						Plain(UnexpectedCharacterDiagnostic):
+							at.span.covers(28, 29)
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+pure func test_other_declarations_headers_and_authored_trailing_material_are_unsupported() -> Bool:
+	var correct: Bool = True
+
+	for text in [
+		"type alias A = Int",
+		"opaque type A = Int",
+		"record A {}",
+		"record A {}",
+		"fixed record A {}",
+		"private type A = builtin",
+		"---\nDocumentation\n---\nresource type A = builtin",
+		"@inline type A = builtin",
+		"type A = builtin\ntype B = builtin",
+		"resource type A = builtin\nresource type B = builtin",
+		"type A = builtin surplus",
+		"resource type A = builtin(\"cleanup\") if",
+	]:
+		match preview_builtin_type(lex_module(module_id_at_row(0), text)):
+			Ok(UnsupportedBuiltinTypePreview):
+				void
+			_:
+				correct = False
+
+	correct
+
+
+tests: TestSuite = {
+	description = "Standalone builtin and resource type preview",
+	tests = [
+		(
+			"three forms preserve metadata spans parameters and source",
+			test_three_forms_preserve_metadata_spans_parameters_and_source,
+		),
+		(
+			"absent empty parameters and terminal newlines are supported",
+			test_absent_empty_parameters_and_terminal_newlines_are_supported,
+		),
+		(
+			"missing resource type and markers reject with exact diagnostics",
+			test_missing_resource_type_and_markers_reject_with_exact_diagnostics,
+		),
+		(
+			"empty and numeric cleanup reject with exact diagnostic spans",
+			test_empty_and_numeric_cleanup_reject_with_exact_diagnostic_spans,
+		),
+		(
+			"lexical diagnostics reject before declaration recognition",
+			test_lexical_diagnostics_reject_before_declaration_recognition,
+		),
+		(
+			"other declarations headers and authored trailing material are unsupported",
+			test_other_declarations_headers_and_authored_trailing_material_are_unsupported,
+		),
+	]
+}

@@ -1,0 +1,164 @@
+-- Shared callable parameters, with recovery shapes kept out of successful syntax.
+import:
+	../syntax/declarations: Parameter, ParameterBinding(NamedParameter, WildcardParameter, TupleParameter)
+	../syntax/names: Binder
+	../syntax/sequences: SmallTuple(Pair, Triple, Quadruple)
+	../syntax/types: WrittenType
+	../syntax/diagnostics: SyntaxDiagnostic(Plain)
+	../tables/diagnostic_code: PlainSyntaxCode(TupleArityDiagnostic)
+	../tables/expected_token:
+		LeftParenConstruct, NameConstruct(NameInParameterName),
+		ExpectedTokenDiagnostic(ExpectedLeftParen, ExpectedRightParen),
+		RightParenConstruct(RightParenInFunctionParameters, RightParenInTupleParameterNames)
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(LeftParenSymbol, RightParenSymbol, ColonSymbol, CommaSymbol, UnderscoreSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
+	parse_state:
+		ParseState, diagnostic_count, current_kind, current_span, peek_kind, advanced, expect_token,
+		consume_parameter_name, consume_declared_name, finished_binder, report_diagnostic
+	tree_type_parser: parse_type
+
+
+private MIN_TUPLE_BINDER_NAMES: Int = 2
+private MAX_TUPLE_BINDER_NAMES: Int = 4
+
+
+union ParametersParse:
+	ParsedParameters(List[Parameter], Span)
+	RejectedParameters
+
+
+pure func parse_parenthesized_parameters(state: ParseState, construct: LeftParenConstruct) -> (ParseState, ParametersParse):
+	before: Int = state.diagnostic_count()
+
+	if state.current_kind() != LeftParenSymbol:
+		(state.expect_token(LeftParenSymbol, ExpectedLeftParen(construct)), RejectedParameters)
+	else:
+		var out: ParseState = skip_newlines(state.advanced())
+		var opened_indent: Bool = False
+
+		if out.current_kind() == IndentToken:
+			opened_indent = True
+			out = skip_newlines(out.advanced())
+
+		var parameters: List[Parameter] = []
+		var parsing: Bool = out.current_kind() != RightParenSymbol
+
+		while parsing and out.current_kind() != EndOfFileToken:
+			(after_parameter, parameter) = parse_parameter(out)
+			out = after_parameter
+
+			match parameter:
+				Some(parameter):
+					parameters = parameters.append(parameter)
+				None:
+					()
+
+			if out.current_kind() == CommaSymbol:
+				out = skip_newlines(out.advanced())
+
+				if opened_indent and out.current_kind() == DedentToken:
+					out = skip_newlines(out.advanced())
+
+				parsing = out.current_kind() != RightParenSymbol
+			else:
+				parsing = False
+
+		out = skip_newlines(out)
+
+		if opened_indent and out.current_kind() == DedentToken:
+			out = skip_newlines(out.advanced())
+
+		closing: Span = out.current_span()
+		out = out.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInFunctionParameters))
+
+		if out.diagnostic_count() != before:
+			(out, RejectedParameters)
+		else:
+			(out, ParsedParameters(parameters, closing))
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+
+	out
+
+
+private pure func parse_parameter(state: ParseState) -> (ParseState, Option[Parameter]):
+	start: Span = state.current_span()
+	(after_binding, binding, binding_span) = if state.current_kind() == LeftParenSymbol:
+		parse_tuple_binding(state)
+	else if state.current_kind() == UnderscoreSymbol and state.peek_kind(1) != ColonSymbol:
+		(state.advanced(), Some(WildcardParameter(start)), start)
+	else:
+		(after_name, name) = state.consume_parameter_name()
+
+		match name:
+			None:
+				(after_name, None, start)
+			Some(name):
+				(finished, binder) = after_name.finished_binder(name)
+				(finished, Some(NamedParameter(binder)), start)
+
+	(after_type, declared_type, end) = if after_binding.current_kind() == ColonSymbol:
+		(after_type, written) = parse_type(after_binding.advanced())
+		(after_type, Some(written), binding_span.span_covering(written.span))
+	else:
+		(after_binding, None, binding_span)
+
+	match binding:
+		None:
+			(after_type, None)
+		Some(binding):
+			(after_type, Some({ binding = binding, declared_type = declared_type, span = end }))
+
+
+private pure func parse_tuple_binding(state: ParseState) -> (ParseState, Option[ParameterBinding], Span):
+	start: Span = state.current_span()
+	var out: ParseState = state.advanced()
+	var names: List[Binder] = []
+	var authored_names: Int = 0
+	var parsing: Bool = out.current_kind() != EndOfFileToken
+
+	while parsing:
+		authored_names += 1
+		(after_name, name) = out.consume_declared_name(NameInParameterName)
+		out = after_name
+
+		match name:
+			Some(name):
+				(finished, binder) = out.finished_binder(name)
+				out = finished
+				names = names.append(binder)
+			None:
+				()
+
+		if out.current_kind() == CommaSymbol:
+			out = out.advanced()
+			parsing = out.current_kind() != RightParenSymbol and out.current_kind() != EndOfFileToken
+		else:
+			parsing = False
+
+	close: Span = out.current_span()
+	out = out.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInTupleParameterNames))
+	span: Span = start.span_covering(close)
+	valid_arity: Bool = authored_names >= MIN_TUPLE_BINDER_NAMES and authored_names <= MAX_TUPLE_BINDER_NAMES
+	binding: Option[ParameterBinding] = if valid_arity and names.length() == authored_names:
+		match names:
+			[first, second]:
+				Some(TupleParameter({ names = Pair(first, second), span = span }))
+			[first, second, third]:
+				Some(TupleParameter({ names = Triple(first, second, third), span = span }))
+			[first, second, third, fourth]:
+				Some(TupleParameter({ names = Quadruple(first, second, third, fourth), span = span }))
+			_:
+				None
+	else:
+		None
+
+	if not valid_arity:
+		(out.report_diagnostic(span, Plain(TupleArityDiagnostic)), None, span)
+	else:
+		(out, binding, span)

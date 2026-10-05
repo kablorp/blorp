@@ -1,0 +1,272 @@
+-- Global headers stop at initializer entry; M4 owns initializer expressions.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, finished_builtin_type, consume_declared_name
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser: parse_declaration_prefix
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_global_header_parser: GlobalHeaderPreview, GlobalHeaderParse(ParsedGlobalHeader, RejectedGlobalHeader), parse_global_header
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: GlobalForm(ConstantGlobal, MutableGlobal)
+	../../../../src/compiler_new/stage_01_discovery/syntax/names: WrittenName
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken, ReservedKeywordAsName)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, written_type_local_index, name_use_local_index, dimension_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenTypeKind(ArrayType, QualifiedType, NamedType), TypeArgument(TypeArgumentType), DimensionKind(NamedDimension)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedTypeDiagnostic, AnnotationWithoutFunctionDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedEqual), NameConstruct(NameInVariableName), EqualConstruct(EqualInTopLevelVariable)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(VarKeyword, IntLiteralToken, IdentifierToken, EndOfFileToken, NewlineToken)
+	test: TestSuite
+
+
+private union ComposedGlobalParse:
+	ParsedComposedGlobal(GlobalHeaderPreview)
+	RejectedComposedGlobal
+
+
+-- This is a test entry, not module dispatch: every input is selected as a global.
+-- The leaf tolerates earlier diagnostics; composition rejects its own prefix errors.
+private pure func parse_composed_global(state: ParseState) -> (ParseState, ComposedGlobalParse):
+	before: Int = state.diagnostic_count()
+	(after_prefix, prefix) = parse_declaration_prefix(state)
+	form: GlobalForm = if after_prefix.current_kind() == VarKeyword:
+		MutableGlobal
+	else:
+		ConstantGlobal
+	at_name: ParseState = if form == MutableGlobal:
+		after_prefix.advanced()
+	else:
+		after_prefix
+	(parsed, result) = parse_global_header(at_name, prefix, form)
+
+	if parsed.diagnostic_count() != before:
+		(parsed, RejectedComposedGlobal)
+	else:
+		match result:
+			ParsedGlobalHeader(preview):
+				(parsed, ParsedComposedGlobal(preview))
+			RejectedGlobalHeader:
+				(parsed, RejectedComposedGlobal)
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func no_initializer_ids(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	counts.binders == 0 and counts.type_binders == 0 and counts.expressions == 0 and counts.patterns == 0 and counts.blocks == 0 and counts.statements == 0
+
+
+private pure func no_definition_ids(state: ParseState, name: WrittenName) -> Bool:
+	(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+	witness.id.definition_local_index() == 0
+
+
+private record ExpectedHeader {
+	name: String,
+	name_first: Int,
+	name_last: Int,
+	header_last: Int,
+	visibility: Visibility,
+	form: GlobalForm,
+	documentation: Option[(String, Int, Int)],
+	types: Int,
+	cursor: TokenKind,
+	first: Int,
+	last: Int,
+	token_position: Int
+}
+
+
+private pure func accepted(text: String, expected: ExpectedHeader) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_composed_global(state)
+			match result:
+				ParsedComposedGlobal(preview):
+					header = preview.header
+					var correct: Bool = (header.visibility == expected.visibility and header.form == expected.form
+						and parsed.spellings().spelling_text(header.name.spelling) == Some(expected.name)
+						and header.name.span.covers(expected.name_first, expected.name_last) and header.header_span.covers(0, expected.header_last)
+						and header.declared_type.is_some() == (expected.types > 0) and parsed.issued_counts().written_types == expected.types
+						and parsed.issued_counts().name_uses == expected.types and parsed.issued_counts().dimensions == 0
+						and parsed.current_kind() == expected.cursor and parsed.current_span().covers(expected.first, expected.last)
+						and parsed.position() == expected.token_position and preview.initializer.token_start == expected.token_position
+						and preview.initializer.anchor.spans_equal(state.current_span()) and parsed.diagnostic_count() == 0
+						and no_initializer_ids(parsed) and no_definition_ids(parsed, header.name))
+					match (header.documentation, expected.documentation):
+						(None, None):
+							void
+						(Some(doc), Some((content, first, last))):
+							correct = correct and doc.text == content and doc.span.covers(first, last)
+						_:
+							correct = False
+					correct
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func plain_expectation(name: String, last: Int, header_last: Int, first: Int, end: Int, token_position: Int, types: Int) -> ExpectedHeader:
+	{ name = name, name_first = 0, name_last = last, header_last = header_last, visibility = PublicVisibility, form = ConstantGlobal,
+		documentation = None, types = types, cursor = IntLiteralToken, first = first, last = end, token_position = token_position }
+
+
+pure func test_constant_and_typed_headers_preserve_initializer_token() -> Bool:
+	(accepted("limit = 10", plain_expectation("limit", 5, 7, 8, 10, 2, 0))
+		and accepted("limit: Int = 10", plain_expectation("limit", 5, 12, 13, 15, 4, 1)))
+
+
+pure func test_private_mutable_prefix_attaches_without_minting_global() -> Bool:
+	accepted("private var count: Int = 0", {
+		name = "count", name_first = 12, name_last = 17, header_last = 24, visibility = PrivateVisibility, form = MutableGlobal,
+		documentation = None, types = 1, cursor = IntLiteralToken, first = 25, last = 26, token_position = 6
+	})
+
+
+pure func test_bare_and_typed_underscore_are_written_names() -> Bool:
+	(accepted("_ = 1", plain_expectation("_", 1, 3, 4, 5, 2, 0))
+		and accepted("_: Int = 1", plain_expectation("_", 1, 8, 9, 10, 4, 1)))
+
+
+pure func test_purity_is_ignored_and_documentation_is_preserved() -> Bool:
+	(accepted("pure limit = 1", {
+		name = "limit", name_first = 5, name_last = 10, header_last = 12, visibility = PublicVisibility, form = ConstantGlobal,
+		documentation = None, types = 0, cursor = IntLiteralToken, first = 13, last = 14, token_position = 3
+	}) and accepted("---\nDocs\n---\nlimit = 1", {
+		name = "limit", name_first = 13, name_last = 18, header_last = 20, visibility = PublicVisibility, form = ConstantGlobal,
+		documentation = Some(("Docs", 0, 13)), types = 0, cursor = IntLiteralToken, first = 21, last = 22, token_position = 3
+	}))
+
+
+private union ExpectedDiagnostic:
+	MissingName
+	MissingEqual
+	PlainCode(PlainSyntaxCode)
+	ReservedName(String)
+
+
+private pure func diagnostics_match(state: ParseState, expected: List[(ExpectedDiagnostic, Int, Int)]) -> Bool:
+	var correct: Bool = state.diagnostic_count() == expected.length()
+	for (actual, wanted) in state.diagnostics().zip(expected):
+		(code, first, last) = wanted
+		correct = correct and actual.span.covers(first, last)
+		match (actual.diagnostic, code):
+			(ExpectedToken(ExpectedName(NameInVariableName)), MissingName) | (ExpectedToken(ExpectedEqual(EqualInTopLevelVariable)), MissingEqual):
+				void
+			(Plain(actual_code), PlainCode(wanted_code)):
+				correct = correct and actual_code == wanted_code
+			(ReservedKeywordAsName(spelling), ReservedName(name)):
+				correct = correct and state.spellings().spelling_text(spelling) == Some(name)
+			_:
+				correct = False
+	correct
+
+
+private pure func rejected(text: String, expected: List[(ExpectedDiagnostic, Int, Int)], first: Int, last: Int, token_position: Int, types: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_composed_global(state)
+			match result:
+				RejectedComposedGlobal:
+					(parsed.current_kind() == IntLiteralToken and parsed.current_span().covers(first, last) and parsed.position() == token_position
+						and diagnostics_match(parsed, expected) and parsed.issued_counts().written_types == types and no_initializer_ids(parsed))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_reserved_and_invalid_names_still_reach_initializer_entry() -> Bool:
+	-- Reserved-name handling is a direct leaf oracle, not a new module dispatcher.
+	(rejected("if = 1", [(ReservedName("if"), 0, 0)], 5, 6, 2, 0)
+		and rejected("123: Int = 1", [(MissingName, 0, 0)], 11, 12, 4, 1))
+
+
+pure func test_malformed_type_recovery_consumes_equal_then_checks_it_again() -> Bool:
+	-- EqualSymbol is not a soft boundary: shared type recovery consumes it.
+	rejected("limit: = 1", [(PlainCode(ExpectedTypeDiagnostic), 7, 7), (MissingEqual, 9, 9)], 9, 10, 3, 1)
+
+
+pure func test_missing_equal_leaves_value_token_for_m4() -> Bool:
+	rejected("limit 1", [(MissingEqual, 6, 6)], 6, 7, 1, 0)
+
+
+pure func test_prefix_diagnostic_rejects_composition_but_leaf_accepts_earlier_diagnostics() -> Bool:
+	text: String = "@no_copy limit = 1"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(after_prefix, prefix) = parse_declaration_prefix(state)
+			(parsed, leaf) = parse_global_header(after_prefix, prefix, ConstantGlobal)
+			match leaf:
+				ParsedGlobalHeader(preview):
+					(preview.header.header_span.covers(0, 16) and preview.initializer.token_start == 4
+						and preview.initializer.anchor.spans_equal(prefix.start)
+						and diagnostics_match(parsed, [(PlainCode(AnnotationWithoutFunctionDiagnostic), 9, 9)])
+						and rejected(text, [(PlainCode(AnnotationWithoutFunctionDiagnostic), 9, 9)], 17, 18, 4, 0))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_eof_and_newline_are_untouched_initializer_entries() -> Bool:
+	base = plain_expectation("limit", 5, 7, 7, 7, 2, 0)
+	(accepted("limit =", { base | cursor = EndOfFileToken })
+		and accepted("limit =\n\tbuild()", { base | cursor = NewlineToken, first = 9, last = 9 }))
+
+
+pure func test_rich_type_mints_children_before_parent_without_global_or_value_ids() -> Bool:
+	text: String = "values: m.Buffer[Int][#N] = init()"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_composed_global(state)
+			match result:
+				ParsedComposedGlobal(preview):
+					match preview.header.declared_type:
+						Some(written):
+							match written.kind:
+								ArrayType(base, dimensions):
+									match (base.kind, dimensions.first.kind):
+										(QualifiedType(owner, name, [TypeArgumentType(argument)]), NamedDimension(dimension_name)):
+											match argument.kind:
+												NamedType(argument_name, []):
+													(owner.use.name_use_local_index() == 0 and name.use.name_use_local_index() == 1 and argument_name.use.name_use_local_index() == 2
+														and dimension_name.use.name_use_local_index() == 3 and argument.id.written_type_local_index() == 0
+														and base.id.written_type_local_index() == 1 and written.id.written_type_local_index() == 2 and dimensions.first.id.dimension_local_index() == 0
+														and written.span.covers(8, 25) and preview.header.header_span.covers(0, 27) and dimensions.rest.is_empty()
+													and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(28, 32) and parsed.position() == 12
+													and preview.initializer.token_start == 12 and preview.initializer.anchor.covers(0, 6)
+														and parsed.issued_counts().written_types == 3 and parsed.issued_counts().dimensions == 1 and parsed.issued_counts().name_uses == 4
+														and parsed.diagnostic_count() == 0 and no_initializer_ids(parsed) and no_definition_ids(parsed, preview.header.name))
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Direct global headers and deferred initializer entry",
+	tests = [
+		("constant and typed headers preserve initializer token", test_constant_and_typed_headers_preserve_initializer_token),
+		("private mutable prefix attaches without minting global", test_private_mutable_prefix_attaches_without_minting_global),
+		("bare and typed underscore are written names", test_bare_and_typed_underscore_are_written_names),
+		("purity is ignored and documentation is preserved", test_purity_is_ignored_and_documentation_is_preserved),
+		("reserved and invalid names still reach initializer entry", test_reserved_and_invalid_names_still_reach_initializer_entry),
+		("malformed type recovery consumes equal then checks it again", test_malformed_type_recovery_consumes_equal_then_checks_it_again),
+		("missing equal leaves value token for m4", test_missing_equal_leaves_value_token_for_m4),
+		("prefix diagnostic rejects composition but leaf accepts earlier diagnostics", test_prefix_diagnostic_rejects_composition_but_leaf_accepts_earlier_diagnostics),
+		("eof and newline are untouched initializer entries", test_eof_and_newline_are_untouched_initializer_entries),
+		("rich type mints children before parent without global or value ids", test_rich_type_mints_children_before_parent_without_global_or_value_ids)
+	]
+}

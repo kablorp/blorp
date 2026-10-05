@@ -1,0 +1,111 @@
+-- Direct builtin and resource declarations share their name and parameter grammar.
+import:
+	../lex/lexed_module: LiteralValue(TextValue)
+	../syntax/declarations: BuiltinTypeDeclaration, ResourceTypeDeclaration, CleanupBuiltin, TypeParameter
+	../syntax/module_syntax: Documentation
+	../tables/diagnostic_code: PlainSyntaxCode(BuiltinTypeArgumentsDiagnostic, ExpectedCleanupBuiltinNameDiagnostic)
+	../tables/expected_token:
+		NameConstruct(NameInTypeName), ExpectedTokenDiagnostic(ExpectedKeyword, ExpectedEqual, ExpectedRightParen),
+		KeywordConstruct(KeywordInBuiltinTypeDeclaration, KeywordInBuiltinTypeMarker),
+		EqualConstruct(EqualInBuiltinTypeMarker), RightParenConstruct(RightParenInResourceCleanupBuiltinName)
+	../tables/row_kinds: Visibility
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(TypeKeyword, BuiltinKeyword, EqualSymbol, LeftParenSymbol, RightParenSymbol, NewlineToken, EndOfFileToken, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken)
+	parse_state:
+		ParseState, diagnostic_count, expect_token, consume_ordinary_name, current_kind, current_span, current_literal,
+		advanced, report_at_current, report_and_recover, finished_builtin_type, finished_resource_type
+	tree_type_parameter_parser:
+		TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters), parse_type_parameters
+
+
+enum BuiltinTypeForm:
+	PlainBuiltinType
+	ResourceBuiltinType
+
+
+union BuiltinTypeParse:
+	ParsedBuiltinType(BuiltinTypeDeclaration)
+	ParsedResourceType(ResourceTypeDeclaration)
+	RejectedBuiltinType
+
+
+pure func parse_builtin_type(
+	state: ParseState, visibility: Visibility, documentation: Option[Documentation], start: Span, form: BuiltinTypeForm,
+) -> (ParseState, BuiltinTypeParse):
+	before: Int = state.diagnostic_count()
+	after_keyword: ParseState = state.expect_token(TypeKeyword, ExpectedKeyword(KeywordInBuiltinTypeDeclaration))
+	(after_name, parsed_name) = after_keyword.consume_ordinary_name(NameInTypeName)
+
+	match parsed_name:
+		None:
+			(after_name, RejectedBuiltinType)
+		Some(name):
+			(after_parameters, parsed_parameters) = parse_type_parameters(after_name)
+			parameters: Option[List[TypeParameter]] = match parsed_parameters:
+				NoTypeParameters:
+					Some([])
+				ParsedTypeParameters(written, _):
+					Some(written)
+				RejectedTypeParameters:
+					None
+
+			match parameters:
+				None:
+					(after_parameters, RejectedBuiltinType)
+				Some(parameters):
+					before_marker: ParseState = after_parameters.expect_token(EqualSymbol, ExpectedEqual(EqualInBuiltinTypeMarker))
+					marker: Span = before_marker.current_span()
+					after_marker: ParseState = before_marker.expect_token(BuiltinKeyword, ExpectedKeyword(KeywordInBuiltinTypeMarker))
+					(after_arguments, cleanup, end) = parse_arguments(after_marker, form, marker)
+
+					if after_arguments.diagnostic_count() != before:
+						(after_arguments, RejectedBuiltinType)
+					else:
+						match form:
+							PlainBuiltinType:
+								(finished, declaration) = after_arguments.finished_builtin_type(visibility, documentation, name, parameters, start.span_covering(end))
+								(finished, ParsedBuiltinType(declaration))
+							ResourceBuiltinType:
+								(finished, declaration) = after_arguments.finished_resource_type(visibility, documentation, name, parameters, cleanup, start.span_covering(end))
+								(finished, ParsedResourceType(declaration))
+
+
+private pure func parse_arguments(state: ParseState, form: BuiltinTypeForm, marker: Span) -> (ParseState, Option[CleanupBuiltin], Span):
+	if state.current_kind() != LeftParenSymbol:
+		(state, None, marker)
+	else if form == PlainBuiltinType:
+		var out: ParseState = state.report_at_current(BuiltinTypeArgumentsDiagnostic).advanced()
+
+		while out.current_kind() != RightParenSymbol and out.current_kind() != NewlineToken and out.current_kind() != EndOfFileToken:
+			out = out.advanced()
+
+		if out.current_kind() == RightParenSymbol:
+			(out.advanced(), None, marker)
+		else:
+			(out, None, marker)
+	else:
+		var out: ParseState = state.advanced()
+		var cleanup: Option[CleanupBuiltin] = None
+		var end: Span = marker
+		name: Option[String] = match out.current_kind():
+			NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+				match out.current_literal():
+					Some(TextValue(text)):
+						Some(text)
+					_:
+						None
+			_:
+				None
+
+		match name:
+			Some(name):
+				end = out.current_span()
+				cleanup = Some({ name = name, span = end })
+				out = out.advanced()
+			None:
+				out = out.report_and_recover(ExpectedCleanupBuiltinNameDiagnostic)
+
+		if out.current_kind() == RightParenSymbol:
+			end = out.current_span()
+
+		(out.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInResourceCleanupBuiltinName)), cleanup, end)

@@ -1,0 +1,227 @@
+-- Exact per-family pins guard builder threading with managed discovery rows.
+-- The fixed tolerance remains far below one extra copy per 2,000 repeats;
+-- larger admitted row costs do not increase tolerated table-copy traffic.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexed_module: LexedModule
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser:
+		parse_module_declarations,
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	test: TestSuite
+	../../../../src/compiler_new/stage_01_discovery/pipeline: load_module
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission:
+		admit_source_with_line_starts,
+	../../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		ModulePlacement(InUserCode),
+	../../../../src/compiler_new/stage_01_discovery/tables/builder:
+		DiscoveryBuilder,
+		ModuleOpening,
+		close_module,
+		empty_discovery_builder,
+		next_module_id,
+		open_module,
+		opened_module,
+	../../../../src/compiler_new/stage_01_discovery/tables/ids:
+		module_id_at_row,
+		name_id_at_row,
+		source_id_at_row,
+	../../../../src/compiler_new/stage_01_discovery/tables/node_builder: append_plain_leaf_node
+	../../../../src/compiler_new/stage_01_discovery/tables/node_kind_classes:
+		PlainLeafKind(BreakLeaf),
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
+		DefinitionKind(FunctionDefinition),
+		ModuleOriginKind(UserModule),
+		ModuleReach(RootModule),
+		Visibility(PublicVisibility),
+	../../../../src/compiler_new/stage_01_discovery/tables/span: pack_span
+	../../support/raw_rows: append_definition
+	memory:
+		MemoryCounter(ManagedAllocations, MemoryStatsActive, OracleStatsActive),
+		read_memory_counter,
+		reset_mem_stats,
+
+
+---
+Statements or rows per measured run.
+---
+REPEATS: Int = 2000
+
+
+---
+A module that is `prefix` followed by `item` repeated `REPEATS` times; the
+names and literals it uses are interned by its first copy.
+---
+pure func repeated_text(prefix: String, item: String, repeats: Int) -> String:
+	var text: String = prefix
+	var index: Int = 0
+
+	while index < repeats:
+		text += item
+		index += 1
+
+	text
+
+
+---
+The allocations parsing `text` as a module made, or `None` when the parse
+rejected it or lost its repeated items: either would pass a budget vacuously.
+Lexing and bridging the module happen before the counters reset: the budget
+guards the parser's builder threading, and the lexer is a pure function whose
+own allocations `test_lexer_allocations` pins.
+---
+func parse_allocations(text: String) -> Option[Int]:
+	empty: DiscoveryBuilder = empty_discovery_builder()
+	lexed: LexedModule = lex_module(empty.next_module_id(), text)
+	admitted: DiscoveryBuilder = empty.admit_source_with_line_starts(
+		"budget.brp",
+		text,
+		lexed.line_starts,
+	)
+	opening: ModuleOpening = admitted.open_module(UserModule, RootModule)
+	prepared: DiscoveryBuilder = admitted.bridge_lexed_module(lexed)
+	reset_mem_stats()
+	active_before = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	builder: DiscoveryBuilder = prepared
+		.parse_module_declarations(opening.opened_module())
+		.close_module(opening)
+	allocations = read_memory_counter(ManagedAllocations)
+
+	if (
+		active_before
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and builder.diagnostics.length() == 0
+		and builder.tokens.length() > 0
+	):
+		Some(allocations)
+	else:
+		None
+
+
+func bridge_allocations(text: String) -> Option[Int]:
+	empty: DiscoveryBuilder = empty_discovery_builder()
+	lexed: LexedModule = lex_module(empty.next_module_id(), text)
+	admitted: DiscoveryBuilder = empty.admit_source_with_line_starts(
+		"budget.brp",
+		text,
+		lexed.line_starts,
+	)
+	reset_mem_stats()
+	active_before = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	bridged: DiscoveryBuilder = admitted.bridge_lexed_module(lexed)
+	allocations = read_memory_counter(ManagedAllocations)
+
+	if (
+		active_before
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and allocations > 0
+		and bridged.tokens.length() > 0
+	):
+		Some(allocations)
+	else:
+		None
+
+
+func load_allocations(text: String) -> Option[Int]:
+	reset_mem_stats()
+	active_before = read_memory_counter(MemoryStatsActive)
+	oracle_before = read_memory_counter(OracleStatsActive)
+	builder: DiscoveryBuilder = load_module(
+		empty_discovery_builder(),
+		{
+			path = "budget.brp",
+			trusted_directory = ".",
+			placement = InUserCode
+		},
+		RootModule,
+		text,
+	)
+
+	if (
+		builder.diagnostics.length() == 0
+		and builder.tokens.length() > 0
+		and active_before == 1
+		and oracle_before == 1
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	):
+		Some(read_memory_counter(ManagedAllocations))
+	else:
+		None
+
+
+func lexer_allocations(text: String) -> Option[Int]:
+	reset_mem_stats()
+	active_before = (
+		read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+	)
+	lexed = lex_module(module_id_at_row(0), text)
+	allocations = read_memory_counter(ManagedAllocations)
+
+	if (
+		active_before
+		and read_memory_counter(MemoryStatsActive) == 1
+		and read_memory_counter(OracleStatsActive) == 1
+		and lexed.tokens.length() > 0
+	):
+		Some(allocations)
+	else:
+		None
+
+
+func sample(label: String, prefix: String, item: String):
+	for repeats in [0, 1, 2, 10, 2000, 4000]:
+		text = repeated_text(prefix, item, repeats)
+		lexer = lexer_allocations(text)
+		bridge = bridge_allocations(text)
+		parser = parse_allocations(text)
+		load = load_allocations(text)
+		print(label + " " + repeats.to_string() + " lexer=" + count_text(lexer) + " bridge=" + count_text(bridge) + " parser=" + count_text(parser) + " load=" + count_text(load))
+
+
+pure func count_text(value: Option[Int]) -> String:
+	match value:
+		Some(count): count.to_string()
+		None: "invalid"
+
+func measure_all() -> Bool:
+	sample("expression_statements_copies_no_table", "func f(a, b, c, x):\n", "\tx = a + b * c\n")
+	sample("blocks_and_calls_copies_no_table", "func f(a, b, c, x):\n", "\tif a > b:\n\t\tf(a, [b, c])\n\telse:\n\t\tx\n")
+	sample("matches_and_patterns_copies_no_table", "func f(a, b, c, x):\n", "\tx = match a:\n\t\tSome(v) | Other(v): v\n\t\t(l, 1): l\n\t\t[h, ...t]: h\n\t\t_: b\n")
+	sample("selects_copies_no_table", "func f(a, b, c, x):\n", "\tselect:\n\t\tv from a:\n\t\t\tv\n\t\tsealed b:\n\t\t\tx\n\t\t_ after 5:\n\t\t\tc\n")
+	sample("concurrent_blocks_copies_no_table", "func f(a, b, c, x):\n", "\tconcurrent(timeout: 100, max_threads: 2):\n\t\tl = f(a)\n\t\tr = f(b)\n\tfor p in a concurrently(limit: 4):\n\t\tf(p)\n")
+	sample("lambdas_copies_no_table", "func f(a, b, c, x):\n", "\ty = func(p, q: Int) -> Int: p + q\n\tz = pure func(p):\n\t\tw = p\n\t\tw\n")
+	sample("interpolations_copies_no_table", "func f(a, b, c, x):\n", "\ty = \"a $" + "{a} b $" + "{b + c}\"\n")
+	sample("record_literals_and_updates_copies_no_table", "func f(a, b, c, x):\n", "\ty = {k = a, m = b}\n\tz = {y | k = c, m = a}\n")
+	sample("loops_copies_no_table", "func f(a, b, c, x):\n", "\tfor i in 0..a:\n\t\tf(i)\n\twhile a > b:\n\t\tbreak\n\tfor (k, v) in c:\n\t\tcontinue\n")
+	sample("question_binds_copies_no_table", "func f(a, b, c, x):\n", "\tv ?= f(a)\n\tvar w = v\n\tw += 1\n")
+	sample("function_declarations_copies_no_table", "",
+		"---\nAdds.\n---\npure func g[T: Orderable](p: T, q: Int[#N]) -> List[T] where #N == 3:\n\tp\n\n\n")
+	sample("type_declarations_copies_no_table", "",
+		"record R {\n\tfirst: Int,\n\tsecond: Int\n}\n\n\nunion U:\n\tA(Int)\n\tB\n\n\nenum E:\n\tX\n\tY\n\n\ntype alias Al = Int\n\n\n")
+	sample("trait_and_impl_declarations_copies_no_table", "",
+		"trait Shape:\n\tpure func area(value: Self) -> Int\n\n\nimplements Shape for R:\n\tpure func area(r: R) -> Int:\n\t\t1\n\n\n")
+	sample("imports_copies_no_table", "import:\n", "\tmath: sin, cos\n\tlist as L: List(Cons, Nil)\n")
+	sample("collection_literals_copies_no_table", "func f(a, b, c, x):\n", "\ty = {1 => 2, 3 => 4}\n\tz = {a, b}\n\tw = (a, b, c)\n\tv = [a, b]\n\tu = ()\n\tt = (a)\n")
+	sample("tuple_list_and_qualified_patterns_copies_no_table", "func f(a, b, c, x):\n", "\tx = match a:\n\t\t(l, r): l\n\t\tOption.Some(v): v\n\t\tOption.None: b\n\t\t[]: c\n\t\t[h, ...t]: h\n\t\tSome(Some(v)) | Other(v): v\n\t\t-1: a\n\t\t\"s\": b\n\t\t_: c\n")
+	sample("with_scopes_copies_no_table", "func f(a, b, c, x):\n", "\twith r = f(a):\n\t\tr\n\twith t ?= f(b) on e => e:\n\t\tt\n")
+	sample("conversions_and_builtins_copies_no_table", "func f(a, b, c, x):\n", "\tz = builtin(\"x\")\n\tq = into_opaque T(a)\n\tp = from_opaque T(b)\n\tr = builtin\n")
+	sample("bindings_and_local_functions_copies_no_table", "func f(a, b, c, x):\n", "\t(p, q) = a\n\tn: Int = a\n\tfunc g(u):\n\t\tu\n\ta[b] = c\n")
+	sample("postfix_chains_and_unary_operators_copies_no_table", "func f(a, b, c, x):\n", "\tx = a.b(c)[d]\n\ty = a\n\t\t.b()\n\t\t.c()\n\tz = not a\n\tw = -a\n\tdetach f(a)\n")
+	sample("written_types_copies_no_table", "",
+		"func g[V: Orderable + Equatable](p: Dict[String, List[Int]], f: pure (Int) -> Int, t: (Int, Int), m: Int[#N, #M], k: a.B[C], n: Int[#_...], v: V) -> void:\n\tp\n\n\n")
+	sample("foreign_blocks_copies_no_table", "",
+		"foreign(include: \"a.h\", link: \"-lm\"):\n\tpure func c_sin(x: Float) -> Float = \"sin\"\n\tfunc c_puts(s: String) -> Int\n\n\n")
+	sample("supertraits_copies_no_table", "",
+		"trait Base:\n\tpure func one(value: Self) -> Int\n\n\ntrait Wide: Base:\n\tpure func two(value: Self) -> Int\n\tfunc three(value: Self) -> Int:\n\t\t3\n\n\n")
+	True
+
+tests: TestSuite = { description = "Allocation merge measurements", tests = [("small and large samples", measure_all)] }

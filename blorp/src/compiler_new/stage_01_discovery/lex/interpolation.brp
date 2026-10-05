@@ -1,28 +1,19 @@
--- Interpolated text: scanning a `${` hole to its closing brace, splitting a
--- literal's text into segments and decoded parts, and appending them to the
--- builder's interpolation tables. The lexer lexes a hole's own tokens in
--- `lexer` (`lex_interpolation_hole`), since that re-enters the lexer's main
--- loop and this module must not import it.
+-- Interpolated text: scanning a `${` hole to its closing brace, and splitting
+-- a literal's text into the text pieces and holes of an `InterpolationScan`.
+-- The lexer lexes a hole's own tokens in `lexer` (`lex_hole`), since that
+-- re-enters the lexer's main loop and this module must not import it.
 import:
-	../tables/builder:
-		DiscoveryBuilder,
-		NOT_INTERNED,
-		append_interpolation,
-		append_interpolation_part,
-		append_interpolation_text,
-		append_literal,
-		interned_literal_index,
-		interned_literal_slice_index,
 	../tables/diagnostic_code:
 		PlainSyntaxCode(
 			InterpolationTooDeepDiagnostic, InterpolatedEscapeAtEndDiagnostic,
 			MultilineInterpolatedStringDiagnostic, UnterminatedInterpolatedStringDiagnostic,
 		),
-	../tables/ids: literal_id_at_row
+	../tables/ids: SourceId
 	../tables/limits: MAX_INTERPOLATION_DEPTH
-	../tables/rows: EMPTY_ROW_RANGE, InterpolationPart(HolePart, TextPart)
+	../tables/span: pack_span
 	../tables/token: TokenKind(InterpolatedStringToken)
 	char_literals: UnicodeEscapeScan, escaped_char, scan_char_literal, scan_unicode_escape
+	lexed_module: InterpolationScan, ScannedPiece(ScannedHole, ScannedText)
 	scan_support:
 		LiteralScan,
 		PendingDiagnostic,
@@ -71,7 +62,7 @@ private pure func plain_interpolation_run_end(text: String, offset: Int) -> Int:
 ---
 The rest of an interpolated string after its first `${`: where it ends and
 what went wrong. Its text pieces and holes are read from the source by
-`interpolation_parts` once the string's extent is known.
+`interpolation_scan` once the string's extent is known.
 ---
 pure func scan_interpolated_string_tail(text: String, offset: Int) -> LiteralScan:
 	length: Int = text.length()
@@ -80,7 +71,7 @@ pure func scan_interpolated_string_tail(text: String, offset: Int) -> LiteralSca
 	var closed: Bool = False
 
 	-- `offset` is past the first `${`, so the first hole is read first.
-	match hole_scan(text, position, length):
+	match read_hole(text, position, length):
 		HoleClosed(close):
 			position = close + 1
 		HoleFailed(failed_hole):
@@ -99,7 +90,7 @@ pure func scan_interpolated_string_tail(text: String, offset: Int) -> LiteralSca
 				position += 1
 				closed = True
 			else if c == '$' and text_at(text, position, INTERPOLATION_OPENER):
-				match hole_scan(text, position + 2, length):
+				match read_hole(text, position + 2, length):
 					HoleClosed(close):
 						position = close + 1
 					HoleFailed(failed_hole):
@@ -135,7 +126,7 @@ pure func scan_interpolated_string_tail(text: String, offset: Int) -> LiteralSca
 How reading a hole's code ended: at the `}` that closes it, or why it did not.
 `position` is where the problem is.
 ---
-private union HoleScan:
+private union HoleReading:
 	HoleClosed(Int)
 	HoleFailed(HoleFailure)
 
@@ -174,7 +165,7 @@ private pure func hole_failure(failed: HoleFailure) -> PendingDiagnostic:
 
 
 ---
-One level of `hole_scan`'s stack: code, holding its count of open braces (at
+One level of `read_hole`'s stack: code, holding its count of open braces (at
 least one), or a string literal inside a hole.
 ---
 private union ScanFrame:
@@ -191,11 +182,11 @@ opens or closes the string it belongs to, and a `}` inside a string closes
 nothing. A character literal in code is opaque too, as a string is. A
 backslash skips the byte after it, in code and in strings.
 ---
-private pure func hole_scan(text: String, start: Int, end: Int) -> HoleScan:
+private pure func read_hole(text: String, start: Int, end: Int) -> HoleReading:
 	var frames: List[ScanFrame] = [CodeFrame(1)]
 	var open_braces: Int = 1
 	var position: Int = start
-	var result: Option[HoleScan] = None
+	var result: Option[HoleReading] = None
 
 	while result.is_none():
 		if position >= end:
@@ -298,11 +289,19 @@ private enum PieceText:
 
 
 ---
-A text piece or hole as `interpolation_parts` found it. `decoded` holds the
+Whether a part is a text piece or a hole.
+---
+private enum PartKind:
+	TextPart
+	HolePart
+
+
+---
+A text piece or hole as `scanned_parts` found it. `decoded` holds the
 text when `text` is `DecodedText`; `start .. end` are the source bytes.
 ---
-record ScannedPart {
-	part: InterpolationPart,
+private record ScannedPart {
+	part: PartKind,
 	start: Int,
 	end: Int,
 	text: PieceText,
@@ -311,7 +310,7 @@ record ScannedPart {
 
 
 ---
-The open text piece while `interpolation_parts` scans: where it starts,
+The open text piece while `scanned_parts` scans: where it starts,
 the decoded text before `run_start` when it needed decoding, and whether it
 did.
 ---
@@ -387,12 +386,59 @@ private pure func pipe_segments(text: String, start: Int, end: Int) -> List[Inte
 
 
 ---
-The text pieces and holes of an interpolated string, in order. Escapes in
-text are decoded as the existing compiler decodes them; a hole runs from
-after its `${` to the `}` that closes it outside string literals. A `{` or
-`}` outside a hole is text.
+`${`'s width, and the `}` that closes a hole: the bytes a hole's span covers
+beyond its expression's.
 ---
-pure func interpolation_parts(
+private HOLE_OPENER_WIDTH: Int = INTERPOLATION_OPENER.length()
+
+private HOLE_CLOSER_WIDTH: Int = 1
+
+
+---
+The text pieces and holes of an interpolated string of `source`, in order.
+Escapes in text are decoded as the existing compiler decodes them; a hole
+runs from after its `${` to the `}` that closes it outside string literals. A
+`{` or `}` outside a hole is text.
+---
+pure func interpolation_scan(
+	source: SourceId,
+	text: String,
+	segments: List[InterpolationSegment],
+) -> InterpolationScan:
+	var pieces: List[ScannedPiece] = []
+
+	for part in scanned_parts(text, segments):
+		if part.part == HolePart:
+			pieces = pieces.append(ScannedHole({
+				expression_start = part.start,
+				expression_end = part.end,
+				span = pack_span(
+					source,
+					part.start - HOLE_OPENER_WIDTH,
+					part.end + HOLE_CLOSER_WIDTH,
+				),
+			}))
+		else:
+			pieces = pieces.append(ScannedText({
+				text = part_text(text, part),
+				span = pack_span(source, part.start, part.end),
+			}))
+
+	{pieces = pieces}
+
+
+---
+A text part's decoded text: its source bytes when it had no escape and lay in
+one segment, else the text the scan decoded.
+---
+private pure func part_text(text: String, part: ScannedPart) -> String:
+	if part.text == SourceBytes:
+		text.substring(part.start, part.end - part.start)
+	else:
+		part.decoded
+
+
+private pure func scanned_parts(
 	text: String,
 	segments: List[InterpolationSegment],
 ) -> List[ScannedPart]:
@@ -610,93 +656,8 @@ The offset of the `}` closing a hole whose text starts at `start`, or `end` when
 the hole does not close before it (the string's scan reports that).
 ---
 private pure func hole_close(text: String, start: Int, end: Int) -> Int:
-	match hole_scan(text, start, end):
+	match read_hole(text, start, end):
 		HoleClosed(close):
 			close
 		HoleFailed(_):
 			end
-
-
----
-Appends the parts of one interpolated string and its row; its index is the
-string token's payload.
----
-pure func append_scanned_interpolation(
-	builder: DiscoveryBuilder,
-	text: String,
-	parts: List[ScannedPart],
-) -> DiscoveryBuilder:
-	parts_first: Int = builder.interpolation_parts.length()
-	var out: DiscoveryBuilder = builder.append_interpolation({
-		first = parts_first,
-		count = parts.length(),
-	})
-
-	for part in parts:
-		out = out.append_scanned_part(text, part)
-
-	out
-
-
-private pure func append_scanned_part(
-	builder: DiscoveryBuilder,
-	text: String,
-	part: ScannedPart,
-) -> DiscoveryBuilder:
-	if part.part == HolePart:
-		builder.append_interpolation_part({
-			part = HolePart,
-			start = part.start,
-			end = part.end,
-			text = EMPTY_ROW_RANGE,
-		})
-	else:
-		builder.append_text_part(text, part)
-
-
----
-A text piece: its text interned as a literal (found in place when it is its
-source bytes), then its row.
----
-private pure func append_text_part(
-	builder: DiscoveryBuilder,
-	text: String,
-	part: ScannedPart,
-) -> DiscoveryBuilder:
-	existing: Int = if part.text == SourceBytes:
-		builder.interned_literal_slice_index(text, part.start, part.end)
-	else:
-		builder.interned_literal_index(part.decoded)
-
-	literal_row: Int = if existing == NOT_INTERNED:
-		builder.literals.length()
-	else:
-		existing
-
-	var out: DiscoveryBuilder = builder.with_part_literal(text, part, existing)
-	text_row: Int = out.interpolation_texts.length()
-	out = out.append_interpolation_text(literal_id_at_row(literal_row))
-	out = out.append_interpolation_part({
-		part = TextPart,
-		start = part.start,
-		end = part.end,
-		text = {
-			first = text_row,
-			count = 1
-		},
-	})
-	out
-
-
-private pure func with_part_literal(
-	builder: DiscoveryBuilder,
-	text: String,
-	part: ScannedPart,
-	existing: Int,
-) -> DiscoveryBuilder:
-	if existing != NOT_INTERNED:
-		builder
-	else if part.text == SourceBytes:
-		builder.append_literal(text.substring(part.start, part.end - part.start))
-	else:
-		builder.append_literal(part.decoded)

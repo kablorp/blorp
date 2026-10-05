@@ -1,0 +1,181 @@
+-- The bridge from a lexed module to the builder: names and literals reach the
+-- builder's tables in the order the table-building lexer interned them, and
+-- tokens carry the builder's rows.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge:
+		bridge_lexed_module,
+		lex_interpolation_hole,
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder:
+		BridgedInterpolation,
+		BridgedPiece(BridgedHole, BridgedText),
+		DiscoveryBuilder,
+		bridged_interpolation_at,
+		empty_discovery_builder,
+		next_source_id,
+	../../../../src/compiler_new/stage_01_discovery/tables/ids:
+		SourceId,
+		literal_id_index,
+		module_id_at_row,
+		source_id_index,
+	../../../../src/compiler_new/stage_01_discovery/tables/name_vocabulary:
+		ALL_SEEDED_NAME_SPELLINGS,
+	../../../../src/compiler_new/stage_01_discovery/tables/token:
+		Token,
+		TokenKind(EndOfFileToken, IdentifierToken, InterpolatedStringToken),
+	test: TestSuite
+
+
+-- The `${` is split across two literals so this file does not interpolate it.
+HOLE_OPENER: String = "$" + "{"
+
+
+---
+A builder after admitting and lexing `text` as its next source.
+---
+pure func bridged(builder: DiscoveryBuilder, path: String, text: String) -> DiscoveryBuilder:
+	source: SourceId = builder.next_source_id()
+	builder
+		.admit_source(path, text)
+		.bridge_lexed_module(lex_module(module_id_at_row(source.source_id_index()), text))
+
+
+---
+The names the builder holds beyond the seeded vocabulary, in row order.
+---
+pure func new_names(builder: DiscoveryBuilder) -> List[String]:
+	builder.name_spellings.drop(ALL_SEEDED_NAME_SPELLINGS.length())
+
+
+pure func test_names_are_interned_in_token_order_with_each_dimension_sigil_after_its_name() -> Bool:
+	builder: DiscoveryBuilder = bridged(
+		empty_discovery_builder(),
+		"a.brp",
+		"kappa #Rows Rows mu #Rows nu\n",
+	)
+	(
+		new_names(builder) == ["kappa", "Rows", "#Rows", "mu", "nu"]
+		and builder.dimension_names.length() == 1
+	)
+
+
+pure func test_an_identifier_token_carries_the_names_row() -> Bool:
+	builder: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", "alpha beta alpha\n")
+	spelled: List[String] = builder.tokens
+		.filter(pure func(token): token.kind == IdentifierToken)
+		.map(pure func(token): builder.name_spellings.get_or(token.payload, "?"))
+	spelled == ["alpha", "beta", "alpha"]
+
+
+pure func test_literals_are_interned_in_token_order_and_share_equal_text() -> Bool:
+	text: String = "x = 1 \"1\" 1.5 \"1.5\" 1 \"a\\tb\"\n"
+	builder: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", text)
+	builder.literals == ["1", "1.5", "a\tb"]
+
+
+pure func test_an_interpolated_strings_text_pieces_are_interned_where_the_string_is() -> Bool:
+	text: String = "\"p " + HOLE_OPENER + "a} q\" 7 \"p \"\n"
+	builder: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", text)
+	builder.literals == ["p ", " q", "7"]
+
+
+pure func test_the_interpolation_payload_indexes_its_bridged_pieces() -> Bool:
+	text: String = "\"p " + HOLE_OPENER + "a} q\"\n"
+	builder: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", text)
+
+	match builder.tokens.get(0):
+		Some(token):
+			interpolation: BridgedInterpolation = builder.bridged_interpolation_at(token.payload)
+
+			match interpolation.pieces:
+				[BridgedText(first), BridgedHole(hole), BridgedText(last)]:
+					(
+						token.kind == InterpolatedStringToken
+						and literal_id_index(first.text) == 0
+						and literal_id_index(last.text) == 1
+						and hole.expression_start == 5
+						and hole.expression_end == 6
+					)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_a_holes_names_are_interned_after_the_modules_own() -> Bool:
+	text: String = "tau \"" + HOLE_OPENER + "upsilon}\" phi\n"
+	source: SourceId = empty_discovery_builder().next_source_id()
+	lexed: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", text)
+	names_before_hole: List[String] = new_names(lexed)
+	hole_start: Int = 7
+	with_hole: DiscoveryBuilder = lexed.lex_interpolation_hole(source, hole_start, hole_start + 7)
+	hole_tokens: List[Token] = with_hole.tokens.drop(lexed.tokens.length())
+
+	match (hole_tokens.get(0), hole_tokens.get(1)):
+		(Some(name), Some(end)):
+			(
+				names_before_hole == ["tau", "phi"]
+				and new_names(with_hole) == ["tau", "phi", "upsilon"]
+				and with_hole.name_spellings.get_or(name.payload, "?") == "upsilon"
+				and end.kind == EndOfFileToken
+			)
+		_:
+			False
+
+
+pure func test_a_second_module_shares_names_with_the_first() -> Bool:
+	first: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", "alpha beta\n")
+	second: DiscoveryBuilder = bridged(first, "b.brp", "beta gamma\n")
+	new_names(second) == ["alpha", "beta", "gamma"]
+
+
+pure func test_the_second_modules_tokens_replace_the_first() -> Bool:
+	first: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", "alpha beta\n")
+	second: DiscoveryBuilder = bridged(first, "b.brp", "beta")
+	second.tokens.length() == 2
+
+
+pure func test_lexer_diagnostics_reach_the_builder() -> Bool:
+	builder: DiscoveryBuilder = bridged(empty_discovery_builder(), "a.brp", "a ; b\n")
+	builder.diagnostics.length() == 1
+
+
+tests: TestSuite = {
+	description = "Discovery lexed module bridge",
+	tests = [
+		(
+			"names are interned in token order with each dimension sigil after its name",
+			test_names_are_interned_in_token_order_with_each_dimension_sigil_after_its_name,
+		),
+		(
+			"an identifier token carries the name's row",
+			test_an_identifier_token_carries_the_names_row,
+		),
+		(
+			"literals are interned in token order and share equal text",
+			test_literals_are_interned_in_token_order_and_share_equal_text,
+		),
+		(
+			"an interpolated string's text pieces are interned where the string is",
+			test_an_interpolated_strings_text_pieces_are_interned_where_the_string_is,
+		),
+		(
+			"the interpolation payload indexes its bridged pieces",
+			test_the_interpolation_payload_indexes_its_bridged_pieces,
+		),
+		(
+			"a hole's names are interned after the module's own",
+			test_a_holes_names_are_interned_after_the_modules_own,
+		),
+		(
+			"a second module shares names with the first",
+			test_a_second_module_shares_names_with_the_first,
+		),
+		(
+			"the second module's tokens replace the first's",
+			test_the_second_modules_tokens_replace_the_first,
+		),
+		("lexer diagnostics reach the builder", test_lexer_diagnostics_reach_the_builder),
+	]
+}

@@ -1,6 +1,6 @@
 -- The discovery builder: the one owner of every discovery table and every id.
 --
--- Each table is a `List` of struct rows, and an id is the index of its row, so
+-- Each table is a `List` of managed record rows, and an id is the index of its row, so
 -- the only way to mint an id is to read `next_*_id` before the matching
 -- `append_*`. The ids are in `ids`, the row shapes in `rows`, and the body
 -- nodes and child stack in `node_builder`; this module holds the record, the
@@ -59,6 +59,8 @@
 -- optional relationship is a row in a side table; variable-length data is a
 -- contiguous block of a child table addressed by a `RowRange`.
 import:
+	../lex/lexed_module: HoleScan
+	../syntax/spellings: Spellings
 	debug as dbg
 	diagnostic_code: PlainSyntaxCode, ResolutionDiagnostic, SyntaxDiagnostic(Plain)
 	ids:
@@ -108,7 +110,7 @@ import:
 		slots_for_texts,
 		slots_with_row,
 		text_hash,
-	invariants/violation: DiscoveryTable(SourceTable), discovery_table_name
+	invariants/violation: DiscoveryTable(SourceTable, SourceTextTable), discovery_table_name
 	name_vocabulary: ALL_SEEDED_NAME_SPELLINGS
 	row_kinds:
 		FunctionAnnotation(TailRecursiveAnnotation),
@@ -128,7 +130,6 @@ import:
 		DimensionConstraintRow,
 		DimensionNameRow,
 		DocumentationRow,
-		EMPTY_ROW_RANGE,
 		ElseKeywordRow,
 		ForeignArgumentRow,
 		ForeignBindingRow,
@@ -143,8 +144,6 @@ import:
 		ImportItemVariantRow,
 		ImportRow,
 		ImportTargetRow,
-		InterpolationPart(HolePart),
-		InterpolationPartRow,
 		MemberRow,
 		ModuleDocumentationRow,
 		ModulePackageRow,
@@ -158,12 +157,11 @@ import:
 		ResolutionDiagnosticRow,
 		ResourceCleanupRow,
 		RootRow,
-		RowRange,
 		SignatureRow,
 		SourceRow,
 		SupertraitQualifierRow,
 		SupertraitRow,
-		SyntaxDiagnosticRow,
+		SyntaxDiagnosticAt,
 		TypeParameterRow,
 		VariantPayloadRow,
 	span: NO_SPAN, Span, span_covering
@@ -181,13 +179,16 @@ loaded no module, and sources that could not be admitted.
 The fields after `resolution_diagnostics` are transient: the tokens of the
 one module being parsed (and of its interpolation holes, appended after its
 end-of-file token), the index of the parser's next token, the docstrings and
-annotations read before their declaration's row exists, the parts of the
-module's interpolated strings, the roots of the child nodes a parent
-node has not yet claimed.
+annotations read before their declaration's row exists, the module's lexing
+state while holes are lexed (its spellings, and the name row each spelling was
+interned as; `None` spellings while a hole is being lexed), the module's
+interpolated strings, the roots of the child nodes a parent node has not yet
+claimed. The lexer's product (`LexedModule`) enters them through the bridge
+(`parse/lexed_bridge`), which interns its names and literals into this
+builder's tables and rewrites the tokens' payloads to match;
 `without_transient_tables` empties them when a module's lexing starts. They
-live here because lexing interns names and literals into this builder while it
-produces tokens, and parsing appends rows while it consumes them; the builder
-is the only value threaded through that work.
+live here because parsing appends rows while it consumes tokens, and the
+builder is the only value threaded through that work.
 
 `freeze` moves the tables into a `DiscoveryTables` (see `discovery_tables`) and
 drops the transient fields and the four intern indexes with the builder, so
@@ -246,15 +247,15 @@ record DiscoveryBuilder {
 	dimension_names: List[DimensionNameRow],
 	literals: List[String],
 	literal_slots: List[Int],
-	diagnostics: List[SyntaxDiagnosticRow],
+	diagnostics: List[SyntaxDiagnosticAt],
 	resolution_diagnostics: List[ResolutionDiagnosticRow],
 	tokens: List[Token],
 	token_cursor: Int,
 	pending_docstrings: List[LiteralId],
 	pending_annotations: List[PendingAnnotationRow],
-	interpolations: List[RowRange],
-	interpolation_parts: List[InterpolationPartRow],
-	interpolation_texts: List[LiteralId],
+	lexing_spellings: Option[Spellings],
+	spelling_name_rows: List[Int],
+	interpolations: List[BridgedInterpolation],
 	child_stack: List[NodeId],
 	child_stack_depth: Int
 }
@@ -324,9 +325,9 @@ pure func empty_discovery_builder() -> DiscoveryBuilder:
 		token_cursor = 0,
 		pending_docstrings = [],
 		pending_annotations = [],
+		lexing_spellings = None,
+		spelling_name_rows = [],
 		interpolations = [],
-		interpolation_parts = [],
-		interpolation_texts = [],
 		child_stack = [],
 		child_stack_depth = 0
 	}
@@ -511,8 +512,8 @@ pure func find_module_by_path(
 ---
 What `open_module` knows about a module when its parse begins: its identity
 (the module id and the source admitted for it), and where each block of rows
-that its parse appends starts. A plain struct, so an opening costs no
-allocation.
+that its parse appends starts. The opening is a managed record; its spelling
+does not imply allocation-free storage.
 ---
 private fixed record ModuleOpeningFields {
 	module: ModuleId,
@@ -589,13 +590,6 @@ The id the opened module has.
 ---
 pure func opened_module(opening: ModuleOpening) -> ModuleId:
 	from_opaque ModuleOpening(opening).module
-
-
----
-The source admitted for the opened module.
----
-pure func opened_source(opening: ModuleOpening) -> SourceId:
-	from_opaque ModuleOpening(opening).source
 
 
 ---
@@ -922,7 +916,7 @@ pure func next_definition_id(builder: DiscoveryBuilder) -> DefinitionId:
 ---
 Where `type_parameters` stood when its owner opened: a bound is numbered by how
 many parameters the table has gained since. Its own type, not an `Int`, so a
-sink that carries it holds no struct.
+sink can carry the start directly.
 ---
 opaque type TypeParametersStart = Int
 
@@ -937,8 +931,8 @@ A definition that owns ordered rows (members, type parameters, supertraits,
 variant payloads, parameters), with where each of those tables stood when it
 opened. Its rows are written while it is the one being parsed, so a row's
 ordinal is how many rows its table has gained since: the table's length less
-the start recorded here, never a count a caller keeps. Plain integers, so
-taking one allocates nothing.
+the start recorded here, never a count a caller keeps. The snapshot is a
+managed record even though each field represents an integer.
 ---
 fixed record OwnedRows {
 	definition: DefinitionId,
@@ -1054,8 +1048,7 @@ pure func append_module_documentation(
 ---
 Closes the span of `definition`'s row. `opened` is the row as it was
 appended, so the closing writes that row back with its span ended: no other
-column can change, and the table is not read (reading a struct row out of a
-list as an `Option` allocates on this per-definition path). This assumes the
+column can change, and the table is not read again. This assumes the
 closing is the only writer of the row between its opening and now: nothing else
 replaces a definition row, and `opened` is that opening's own row.
 ---
@@ -1320,8 +1313,9 @@ The tables of the module being parsed that no frozen row or violation names.
 enum TransientTable:
 	PendingDocstringTable
 	PendingAnnotationTable
-	InterpolationPartTable
-	InterpolationTextTable
+	BridgedInterpolationTable
+	LexingSpellingsTable
+	LexedLiteralTable
 	ChildStackTable
 
 
@@ -1334,10 +1328,12 @@ pure func transient_table_name(table: TransientTable) -> String:
 			"PendingDocstringTable"
 		PendingAnnotationTable:
 			"PendingAnnotationTable"
-		InterpolationPartTable:
-			"InterpolationPartTable"
-		InterpolationTextTable:
-			"InterpolationTextTable"
+		BridgedInterpolationTable:
+			"BridgedInterpolationTable"
+		LexingSpellingsTable:
+			"LexingSpellingsTable"
+		LexedLiteralTable:
+			"LexedLiteralTable"
 		ChildStackTable:
 			"ChildStackTable"
 
@@ -1348,6 +1344,30 @@ pure func transient_table_name(table: TransientTable) -> String:
 pure func report_unreachable_transient(table: TransientTable, index: Int, guarantee: String):
 	debug:
 		dbg.error("${table.transient_table_name()} row ${index} does not exist, but ${guarantee}")
+
+
+---
+The text an unreachable lookup of a source's text returns: none.
+---
+UNREACHABLE_SOURCE_TEXT: String = ""
+
+
+---
+The text of `source`, which discovery admitted before it lexed the source. A
+miss is a defect in the caller: it is reported and `UNREACHABLE_SOURCE_TEXT`
+returned.
+---
+pure func source_text_of(builder: DiscoveryBuilder, source: SourceId) -> String:
+	match builder.source_texts.get(source.source_id_index()):
+		Some(text):
+			text
+		None:
+			report_unreachable_lookup(
+				SourceTextTable,
+				source.source_id_index(),
+				"discovery admits a source's text before it lexes the source",
+			)
+			UNREACHABLE_SOURCE_TEXT
 
 
 ---
@@ -1405,9 +1425,9 @@ pure func without_transient_tables(builder: DiscoveryBuilder) -> DiscoveryBuilde
 		token_cursor = 0,
 		pending_docstrings = [],
 		pending_annotations = [],
+		lexing_spellings = None,
+		spelling_name_rows = [],
 		interpolations = [],
-		interpolation_parts = [],
-		interpolation_texts = [],
 		child_stack = [],
 		child_stack_depth = 0
 	}
@@ -1448,83 +1468,68 @@ pure func pending_docstring_at(builder: DiscoveryBuilder, index: Int) -> Literal
 			UNREACHABLE_LITERAL_ID
 
 
--- Interpolated strings.
+-- Interpolated strings (read from the bridged lexing).
 ---
-Appends one piece of an interpolated string: a hole's byte range, or a text
-piece with its decoded text (appended to `interpolation_texts` first by
-`append_interpolation_text`).
+One piece of an interpolated string as the parser reads it: a text piece whose
+decoded text is a row of the literals table, or a hole.
 ---
-pure func append_interpolation_part(
-	builder: DiscoveryBuilder,
-	row: InterpolationPartRow,
-) -> DiscoveryBuilder:
-	{ builder | interpolation_parts = builder.interpolation_parts.append(row) }
-
-
-pure func append_interpolation_text(builder: DiscoveryBuilder, text: LiteralId) -> DiscoveryBuilder:
-	{ builder | interpolation_texts = builder.interpolation_texts.append(text) }
+union BridgedPiece:
+	BridgedText(BridgedTextPiece)
+	BridgedHole(HoleScan)
 
 
 ---
-Appends the row of an interpolated string whose parts are
-`interpolation_parts` rows `parts`; the token's payload is its index.
+A text piece of an interpolated string: its literal and the source bytes it
+was read from.
 ---
-pure func append_interpolation(builder: DiscoveryBuilder, parts: RowRange) -> DiscoveryBuilder:
-	{ builder | interpolations = builder.interpolations.append(parts) }
-
-
-pure func interpolation_parts_of(builder: DiscoveryBuilder, interpolation: Int) -> RowRange:
-	match builder.interpolations.get(interpolation):
-		Some(parts):
-			parts
-		None:
-			EMPTY_ROW_RANGE
-
-
----
-The row `interpolation_part_at` returns for an index the table does not hold.
----
-UNREACHABLE_INTERPOLATION_PART: InterpolationPartRow = {
-	part = HolePart,
-	start = 0,
-	end = 0,
-	text = EMPTY_ROW_RANGE
+fixed record BridgedTextPiece {
+	text: LiteralId,
+	span: Span
 }
 
 
 ---
-Interpolation part `index`; callers pass an index inside a parts range they
-read, so a miss is a defect in the caller: it is reported and
-`UNREACHABLE_INTERPOLATION_PART` returned.
+The pieces of one interpolated string of the module being parsed.
 ---
-pure func interpolation_part_at(builder: DiscoveryBuilder, index: Int) -> InterpolationPartRow:
-	match builder.interpolation_parts.get(index):
-		Some(row):
-			row
-		None:
-			report_unreachable_transient(
-				InterpolationPartTable,
-				index,
-				"callers pass an index inside a parts range they read",
-			)
-			UNREACHABLE_INTERPOLATION_PART
+record BridgedInterpolation {
+	pieces: List[BridgedPiece]
+}
 
 
 ---
-Interpolation text `index`, a row of a parts range the caller read; a miss is
-reported and `UNREACHABLE_LITERAL_ID` returned.
+Appends the pieces of an interpolated string; the string token's payload is
+the index of this row, which `bridged_interpolation_at` reads back.
 ---
-pure func interpolation_text_at(builder: DiscoveryBuilder, index: Int) -> LiteralId:
-	match builder.interpolation_texts.get(index):
-		Some(text):
-			text
+pure func append_bridged_interpolation(
+	builder: DiscoveryBuilder,
+	interpolation: BridgedInterpolation,
+) -> DiscoveryBuilder:
+	{ builder | interpolations = builder.interpolations.append(interpolation) }
+
+
+---
+The interpolation an unreachable lookup of a bridged interpolation returns:
+one with no pieces.
+---
+UNREACHABLE_BRIDGED_INTERPOLATION: BridgedInterpolation = {pieces = []}
+
+
+---
+The interpolation `index` of the module being parsed: the payload of an
+interpolated string token. A miss is a defect in the caller: it is reported
+and `UNREACHABLE_BRIDGED_INTERPOLATION` returned.
+---
+pure func bridged_interpolation_at(builder: DiscoveryBuilder, index: Int) -> BridgedInterpolation:
+	match builder.interpolations.get(index):
+		Some(interpolation):
+			interpolation
 		None:
 			report_unreachable_transient(
-				InterpolationTextTable,
+				BridgedInterpolationTable,
 				index,
-				"callers pass an index inside a parts range they read",
+				"an interpolated string token's payload indexes the interpolations bridged for it",
 			)
-			UNREACHABLE_LITERAL_ID
+			UNREACHABLE_BRIDGED_INTERPOLATION
 
 
 pure func append_pending_annotation(

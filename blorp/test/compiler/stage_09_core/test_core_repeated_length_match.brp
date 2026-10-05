@@ -1,0 +1,177 @@
+import:
+	../../../src/compiler/stage_09_core/ir:
+		CoreAccessor(RootAccessor),
+		CoreBinderOrigin(AuthoredBinder),
+		CoreCallKind(UserCall),
+		CoreConstructorLengthMatchBranch,
+		CoreConstructorLengthMatchCase,
+		CoreConstructorLengthMatchGeq,
+		CoreConstructorMatchBody(ConstructorMatchBodyExpr),
+		CoreExpr(CallExpr, LengthMatchExpr, VarExpr),
+		CoreMatchBinding,
+		CoreMatchBindingMode(MatchBorrowBindingMode),
+		CoreReleasePolicy(ArcReleasePolicy),
+		CoreRetainPolicy(ArcRetainPolicy),
+		CoreType(NamedType),
+		CoreVar,
+		synthetic_core_source_loc,
+	../../../src/compiler/stage_09_core/perceus/env: perceus_env_for_managed_types
+	../../../src/compiler/stage_09_core/perceus/protect: protect_repeated_consumes
+	../../../src/compiler/stage_09_core/type_policy: CORE_MANAGED_TYPE_NAMES
+	../test_support_core_ownership_events:
+		OwnershipEvent,
+		OwnershipEventOperation(OwnershipRetainEvent),
+		ownership_events
+	memory: same_object
+	test: TestSuite
+
+
+private pure func string_type() -> CoreType:
+	NamedType("String", [])
+
+
+private pure func slot_variable() -> CoreVar:
+	{name = "slot", id = 1, def_id = None, origin = AuthoredBinder}
+
+
+private pure func consuming_branch(
+	owner: CoreVar,
+	bindings: List[CoreMatchBinding],
+) -> CoreConstructorLengthMatchBranch:
+	call: CoreExpr = CallExpr(
+		UserCall("consume_slot", Some(72), [0]),
+		VarExpr(
+			{name = "consume_slot", id = 3, def_id = Some(72), origin = AuthoredBinder},
+			NamedType("Function", []),
+			synthetic_core_source_loc(),
+		),
+		[VarExpr(owner, string_type(), synthetic_core_source_loc())],
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	{bindings = bindings, body = ConstructorMatchBodyExpr(call)}
+
+
+--- This is the protection boundary used for a mutable slot inside a repeated
+--- context. The consuming call transfers argument zero while the slot must
+--- retain its own reference for subsequent reads or reassignment.
+private pure func protected_length_match(
+	cases: List[CoreConstructorLengthMatchCase],
+	geq: Option[CoreConstructorLengthMatchGeq],
+	fallback: Option[CoreConstructorLengthMatchBranch],
+) -> CoreExpr:
+	expr: CoreExpr = LengthMatchExpr(
+		VarExpr(
+			{name = "items", id = 4, def_id = None, origin = AuthoredBinder},
+			NamedType("List", [NamedType("Int", [])]),
+			synthetic_core_source_loc(),
+		),
+		ArcReleasePolicy,
+		{
+			accessor = RootAccessor,
+			cases = cases,
+			geq = geq,
+			fallback = fallback,
+			result_type = string_type(),
+			loc = synthetic_core_source_loc()
+		},
+		string_type(),
+		synthetic_core_source_loc(),
+	)
+	protect_repeated_consumes(
+		perceus_env_for_managed_types(CORE_MANAGED_TYPE_NAMES),
+		slot_variable(),
+		string_type(),
+		expr,
+		True,
+	)
+
+
+private pure func slot_retain_at(event: OwnershipEvent, path: String) -> Bool:
+	policy_matches: Bool = match event.operation:
+		OwnershipRetainEvent(ArcRetainPolicy):
+			True
+		_:
+			False
+	type_matches: Bool = match event.value_type:
+		NamedType(name, args):
+			name == "String" and args.length() == 0
+		_:
+			False
+	(
+		event.path == path
+		and event.variable.name == "slot"
+		and event.variable.id == 1
+		and event.variable.def_id == None
+		and policy_matches
+		and type_matches
+	)
+
+
+private pure func has_only_slot_retain(expr: CoreExpr, path: String) -> Bool:
+	match ownership_events(expr):
+		Ok(events):
+			events.length() == 1 and events.get(0).map(func(event): slot_retain_at(event, path)).get_or(False)
+		Err(_):
+			False
+
+
+pure func test_exact_length_preserves_mutable_slot_owner() -> Bool:
+	rewritten: CoreExpr = protected_length_match(
+		[{length = 2, branch = consuming_branch(slot_variable(), [])}],
+		None,
+		None,
+	)
+	has_only_slot_retain(rewritten, "root.match.cases[0].branch.body.expr.dup")
+
+
+pure func test_at_least_length_preserves_mutable_slot_owner() -> Bool:
+	rewritten: CoreExpr = protected_length_match(
+		[],
+		Some({minimum_length = 1, branch = consuming_branch(slot_variable(), [])}),
+		None,
+	)
+	has_only_slot_retain(rewritten, "root.match.geq.branch.body.expr.dup")
+
+
+pure func test_fallback_preserves_mutable_slot_owner() -> Bool:
+	rewritten: CoreExpr = protected_length_match([], None, Some(consuming_branch(slot_variable(), [])))
+	has_only_slot_retain(rewritten, "root.match.fallback.body.expr.dup")
+
+
+pure func test_shadowed_length_binding_keeps_its_consuming_body() -> Bool:
+	binding: CoreMatchBinding = {
+		variable = {name = "slot", id = 2, def_id = None, origin = AuthoredBinder},
+		typ = string_type(),
+		accessor = RootAccessor,
+		mode = MatchBorrowBindingMode,
+		needs_release = True
+	}
+	branch: CoreConstructorLengthMatchBranch = consuming_branch(binding.variable, [binding])
+	rewritten: CoreExpr = protected_length_match([{length = 1, branch = branch}], None, None)
+	no_events: Bool = match ownership_events(rewritten):
+		Ok(events):
+			events.length() == 0
+		Err(_):
+			False
+	body_unchanged: Bool = match rewritten:
+		LengthMatchExpr(_, _, length_match, _, _):
+			match length_match.cases.get(0):
+				Some(match_case):
+					same_object(match_case.branch.body, branch.body)
+				None:
+					False
+		_:
+			False
+	no_events and body_unchanged
+
+
+tests: TestSuite = {
+	description = "Repeated consumes through standalone length matches",
+	tests = [
+		("exact length preserves mutable slot owner", test_exact_length_preserves_mutable_slot_owner),
+		("at least length preserves mutable slot owner", test_at_least_length_preserves_mutable_slot_owner),
+		("fallback preserves mutable slot owner", test_fallback_preserves_mutable_slot_owner),
+		("shadowed binding keeps consuming body", test_shadowed_length_binding_keeps_its_consuming_body),
+	]
+}

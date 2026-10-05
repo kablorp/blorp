@@ -1,0 +1,352 @@
+-- Direct declaration leaf tests; no builder/table parser participates.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, diagnostic_count, diagnostics, current_kind, current_span, position, issued_counts
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_type_parameter_parser: parse_type_parameters, TypeParametersParse(NoTypeParameters, ParsedTypeParameters, RejectedTypeParameters)
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: type_binder_local_index, name_use_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken, ReservedKeywordAsName)
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(DimensionParameterBoundsDiagnostic, ExpectedDimensionDiagnostic)
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedRightBracket, ExpectedName), RightBracketConstruct(RightBracketInTypeParameters), NameConstruct(NameInTypeParameterName, NameInTraitName)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(IfKeyword, EndOfFileToken, IdentifierToken, IntLiteralToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, start: Int, end: Int) -> Bool:
+	span.span_start() == start and span.span_end() == end
+
+
+pure func test_parameters_mint_binders_and_bound_uses_in_source_order() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(3), "[T: order.Orderable + Hashable, #N, #_,] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match result:
+				ParsedTypeParameters([TypeVariable(variable), DimensionVariable(dimension), WildcardDimensionParameter(wildcard)], list_span):
+					match variable.bounds:
+						[qualified, bare]:
+							match (qualified.qualifier, bare.qualifier):
+								(Some(qualifier), None):
+									(variable.binder.binder.type_binder_local_index() == 0
+										and dimension.binder.type_binder_local_index() == 1
+										and qualifier.use.name_use_local_index() == 0
+										and qualified.trait_name.use.name_use_local_index() == 1
+										and bare.trait_name.use.name_use_local_index() == 2
+										and variable.binder.name.span.covers(1, 2)
+										and variable.span.covers(1, 30)
+										and qualifier.name.span.covers(4, 9)
+										and qualified.trait_name.name.span.covers(10, 19)
+										and qualified.span.covers(4, 19)
+										and bare.trait_name.name.span.covers(22, 30)
+										and bare.span.covers(22, 30)
+										and dimension.name.span.covers(32, 34)
+										and wildcard.covers(36, 38)
+										and list_span.covers(0, 40)
+										and parsed.diagnostic_count() == 0
+										and parsed.current_kind() == IfKeyword
+										and parsed.current_span().covers(41, 43))
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_absent_parameters_preserve_the_cursor() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match result:
+				NoTypeParameters:
+					(parsed.position() == state.position() and parsed.diagnostic_count() == 0
+						and parsed.current_kind() == IfKeyword and parsed.current_span().covers(0, 2))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_written_empty_parameters_keep_the_bracket_span() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match result:
+				ParsedTypeParameters([], span):
+					(span.covers(0, 2) and parsed.diagnostic_count() == 0
+						and parsed.current_kind() == IfKeyword and parsed.current_span().covers(3, 5))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_trailing_comma_keeps_one_parameter() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[T,] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match result:
+				ParsedTypeParameters([TypeVariable(variable)], span):
+					(variable.bounds.is_empty() and variable.span.covers(1, 2)
+						and variable.binder.name.span.covers(1, 2)
+						and variable.binder.binder.type_binder_local_index() == 0
+						and span.covers(0, 4) and parsed.diagnostic_count() == 0
+						and parsed.current_kind() == IfKeyword and parsed.current_span().covers(5, 7))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_dimension_bounds_report_at_colon_and_recover_through_following_parameter() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[#N: Eq + m.Hash, T] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match (result, parsed.diagnostics()):
+				(RejectedTypeParameters, [at]):
+					match at.diagnostic:
+						Plain(DimensionParameterBoundsDiagnostic):
+							(at.span.covers(3, 4) and parsed.current_kind() == IfKeyword
+								and parsed.current_span().covers(21, 23))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_wildcard_dimension_span_covers_trivia_between_sigil_and_discard() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[# _] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match result:
+				ParsedTypeParameters([WildcardDimensionParameter(wildcard)], span):
+					(wildcard.covers(1, 4) and span.covers(0, 5)
+						and parsed.diagnostic_count() == 0 and parsed.current_kind() == IfKeyword
+						and parsed.current_span().covers(6, 8))
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_missing_close_at_eof_reports_the_type_parameter_construct() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[T")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match (result, parsed.diagnostics()):
+				(RejectedTypeParameters, [at]):
+					match at.diagnostic:
+						ExpectedToken(ExpectedRightBracket(RightBracketInTypeParameters)):
+							(at.span.covers(2, 2) and parsed.current_kind() == EndOfFileToken
+								and parsed.current_span().covers(2, 2))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+private union RecoveryDiagnostic:
+	MissingName(NameConstruct)
+	MissingDimension
+	MissingRightBracket
+
+
+private pure func matches_recovery_diagnostic(actual: SyntaxDiagnostic, expected: RecoveryDiagnostic) -> Bool:
+	match (actual, expected):
+		(ExpectedToken(ExpectedName(actual_name)), MissingName(expected_name)):
+			actual_name == expected_name
+		(Plain(ExpectedDimensionDiagnostic), MissingDimension):
+			True
+		(ExpectedToken(ExpectedRightBracket(RightBracketInTypeParameters)), MissingRightBracket):
+			True
+		_:
+			False
+
+
+private pure func recovery_matches(
+	text: String,
+	expected: List[(RecoveryDiagnostic, Int)],
+	cursor_kind: TokenKind,
+	cursor_start: Int,
+	cursor_end: Int,
+) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+			var correct: Bool = match result:
+				RejectedTypeParameters:
+					True
+				_:
+					False
+			correct = correct and parsed.diagnostic_count() == expected.length()
+			var index: Int = 0
+
+			for (diagnostic, offset) in expected:
+				match parsed.diagnostics().get(index):
+					Some(at):
+						correct = correct and matches_recovery_diagnostic(at.diagnostic, diagnostic) and at.span.covers(offset, offset)
+					None:
+						correct = False
+				index = index + 1
+
+			(correct and parsed.current_kind() == cursor_kind
+				and parsed.current_span().covers(cursor_start, cursor_end))
+		Err(_):
+			False
+
+
+pure func test_empty_bound_keeps_the_close_for_the_list() -> Bool:
+	recovery_matches("[T: ] if", [(MissingName(NameInTraitName), 4)], IfKeyword, 6, 8)
+
+
+pure func test_qualified_bound_missing_trait_keeps_the_close() -> Bool:
+	recovery_matches("[T: m.] if", [(MissingName(NameInTraitName), 6)], IfKeyword, 8, 10)
+
+
+pure func test_missing_bound_after_plus_keeps_the_close() -> Bool:
+	recovery_matches("[T: Eq + ] if", [(MissingName(NameInTraitName), 9)], IfKeyword, 11, 13)
+
+
+pure func test_missing_comma_leaves_the_next_name_current() -> Bool:
+	recovery_matches("[T U]", [(MissingRightBracket, 3)], IdentifierToken, 3, 4)
+
+
+pure func test_bare_hash_reports_dimension_then_consumes_close() -> Bool:
+	recovery_matches("[#] if", [(MissingDimension, 2)], IfKeyword, 4, 6)
+
+
+pure func test_literal_dimension_head_leaves_number_current() -> Bool:
+	recovery_matches("[#3] if", [(MissingDimension, 2), (MissingRightBracket, 2)], IntLiteralToken, 2, 3)
+
+
+pure func test_standalone_discard_is_not_a_type_parameter() -> Bool:
+	(recovery_matches("[_] if", [(MissingName(NameInTypeParameterName), 1)], IfKeyword, 4, 6)
+		and rejected_name_does_not_mint_type_binder("[_] if"))
+
+
+pure func test_reserved_trait_reference_reports_expected_name() -> Bool:
+	recovery_matches("[T: if] if", [(MissingName(NameInTraitName), 4)], IfKeyword, 8, 10)
+
+
+pure func test_eof_after_open_requires_only_the_close() -> Bool:
+	recovery_matches("[", [(MissingRightBracket, 1)], EndOfFileToken, 1, 1)
+
+
+pure func test_mixed_third_bound_reports_only_missing_trait() -> Bool:
+	recovery_matches("[T: Eq + m.Hash + ] if", [(MissingName(NameInTraitName), 18)], IfKeyword, 20, 22)
+
+
+pure func test_invalid_delimiter_head_consumes_one_token_before_missing_close() -> Bool:
+	recovery_matches("[[T]", [(MissingName(NameInTypeParameterName), 1), (MissingRightBracket, 2)], IdentifierToken, 2, 3)
+
+
+pure func test_reserved_declared_keyword_reports_empty_start_span() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[if] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match (result, parsed.diagnostics()):
+				(RejectedTypeParameters, [at]):
+					match at.diagnostic:
+						ReservedKeywordAsName(_):
+							(at.span.covers(1, 1) and parsed.issued_counts().type_binders == 0
+								and parsed.current_kind() == IfKeyword
+								and parsed.current_span().covers(5, 7))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_soft_keyword_is_an_allowed_type_parameter_name() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[debug] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match result:
+				ParsedTypeParameters([TypeVariable(variable)], span):
+					(variable.binder.name.span.covers(1, 6) and variable.span.covers(1, 6)
+						and span.covers(0, 7) and parsed.diagnostic_count() == 0
+						and parsed.current_kind() == IfKeyword and parsed.current_span().covers(8, 10))
+				_:
+					False
+		Err(_):
+			False
+
+
+private pure func rejected_name_does_not_mint_type_binder(text: String) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match result:
+				RejectedTypeParameters:
+					parsed.issued_counts().type_binders == 0
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_dimension_bound_rejection_precedes_missing_trait_diagnostic() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "[#N: ] if")):
+		Ok(state):
+			(parsed, result) = parse_type_parameters(state)
+
+			match (result, parsed.diagnostics()):
+				(RejectedTypeParameters, [dimension, missing]):
+					match (dimension.diagnostic, missing.diagnostic):
+						(Plain(DimensionParameterBoundsDiagnostic), ExpectedToken(ExpectedName(NameInTraitName))):
+							(dimension.span.covers(3, 4) and missing.span.covers(5, 5)
+								and parsed.current_kind() == IfKeyword and parsed.current_span().covers(7, 9))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Direct tree type parameter parser",
+	tests = [
+		("dimension bound rejection precedes missing trait diagnostic", test_dimension_bound_rejection_precedes_missing_trait_diagnostic),
+		("empty bound keeps the close for the list", test_empty_bound_keeps_the_close_for_the_list),
+		("qualified bound missing trait keeps the close", test_qualified_bound_missing_trait_keeps_the_close),
+		("missing bound after plus keeps the close", test_missing_bound_after_plus_keeps_the_close),
+		("missing comma leaves the next name current", test_missing_comma_leaves_the_next_name_current),
+		("bare hash reports dimension then consumes close", test_bare_hash_reports_dimension_then_consumes_close),
+		("literal dimension head leaves number current", test_literal_dimension_head_leaves_number_current),
+		("standalone discard is not a type parameter", test_standalone_discard_is_not_a_type_parameter),
+		("reserved trait reference reports expected name", test_reserved_trait_reference_reports_expected_name),
+		("eof after open requires only the close", test_eof_after_open_requires_only_the_close),
+		("mixed third bound reports only missing trait", test_mixed_third_bound_reports_only_missing_trait),
+		("invalid delimiter head consumes one token before missing close", test_invalid_delimiter_head_consumes_one_token_before_missing_close),
+		("reserved declared keyword reports empty start span", test_reserved_declared_keyword_reports_empty_start_span),
+		("soft keyword is an allowed type parameter name", test_soft_keyword_is_an_allowed_type_parameter_name),
+
+		("parameters mint binders and bound uses in source order", test_parameters_mint_binders_and_bound_uses_in_source_order),
+		("absent parameters preserve cursor", test_absent_parameters_preserve_the_cursor),
+		("written empty parameters keep bracket span", test_written_empty_parameters_keep_the_bracket_span),
+		("trailing comma keeps one parameter", test_trailing_comma_keeps_one_parameter),
+		("dimension bounds report at colon and recover through following parameter", test_dimension_bounds_report_at_colon_and_recover_through_following_parameter),
+		("wildcard dimension span covers trivia", test_wildcard_dimension_span_covers_trivia_between_sigil_and_discard),
+		("missing close at eof reports type parameter construct", test_missing_close_at_eof_reports_the_type_parameter_construct)
+	]
+}

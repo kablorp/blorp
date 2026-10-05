@@ -1,0 +1,360 @@
+-- Receiver-specific type contexts only; no implementation owner or adapter.
+-- One direct frozen type call pins diagnostics/cursor and successful root spans.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, consume_declared_name, finished_builtin_type
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_type_parser: parse_receiver_type, parse_type
+	../../../../src/compiler_new/stage_01_discovery/parse/type_parser as FrozenTypes
+	../../../../src/compiler_new/stage_01_discovery/parse/parser_cursor as FrozenCursor
+	../../../../src/compiler_new/stage_01_discovery/tables/node_builder as FrozenNodes
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/types: WrittenType, WrittenTypeKind(NamedType, QualifiedType, BoundedType, TupleType, FunctionType, ArrayType), TypeArgument(TypeArgumentType, BoundedArgument, DimensionArgument), DimensionKind(NamedDimension, LiteralDimension)
+	../../../../src/compiler_new/stage_01_discovery/syntax/sequences: SmallTuple(Pair)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, name_use_local_index, written_type_local_index, dimension_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedRightBracket, ExpectedRightParen, ExpectedLeftParen, ExpectedArrow), NameConstruct(NameInTypeName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility), Purity(PureFunction, ImpureFunction)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(IdentifierToken, ColonSymbol)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func frozen(text: String, receiver: Bool) -> DiscoveryBuilder:
+	lexed = lex_module(module_id_at_row(0), text)
+	prepared = empty_discovery_builder().admit_source("receiver.brp", text).bridge_lexed_module(lexed)
+	if receiver:
+		FrozenTypes.parse_receiver_type(prepared)
+	else:
+		FrozenTypes.parse_type(prepared)
+
+
+private pure func expected_token_matches(actual: ExpectedTokenDiagnostic, wanted: ExpectedTokenDiagnostic) -> Bool:
+	match (actual, wanted):
+		(ExpectedName(actual), ExpectedName(wanted)):
+			actual == wanted
+		(ExpectedRightBracket(actual), ExpectedRightBracket(wanted)):
+			actual == wanted
+		(ExpectedRightParen(actual), ExpectedRightParen(wanted)):
+			actual == wanted
+		(ExpectedLeftParen(actual), ExpectedLeftParen(wanted)):
+			actual == wanted
+		(ExpectedArrow(actual), ExpectedArrow(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func matches_frozen(state: ParseState, written: WrittenType, reference: DiscoveryBuilder) -> Bool:
+	var correct: Bool = (state.diagnostic_count() == reference.diagnostics.length() and state.position() == reference.token_cursor
+		and state.current_kind() == FrozenCursor.current_kind(reference) and state.current_span().spans_equal(FrozenCursor.current_span(reference)))
+	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics):
+		correct = correct and actual.span.spans_equal(wanted.span)
+		match (actual.diagnostic, wanted.diagnostic):
+			(TreeDiagnostics.Plain(actual), FrozenDiagnostics.Plain(wanted)):
+				correct = correct and actual == wanted
+			(TreeDiagnostics.ExpectedToken(actual), FrozenDiagnostics.ExpectedToken(wanted)):
+				correct = correct and expected_token_matches(actual, wanted)
+			_:
+				correct = False
+	-- Frozen tables can hold invalid arrays with non-dimension children; the
+	-- tree recovery shape is pinned separately, never claimed as AST parity.
+	if state.diagnostic_count() == 0:
+		correct = correct and written.span.spans_equal(FrozenTypes.node_span(reference, FrozenNodes.last_node_id(reference)))
+	correct
+
+
+private pure func no_binder_definition_or_body_ids(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(witness_state):
+			(_, name) = witness_state.consume_declared_name(NameInTypeName)
+			match name:
+				Some(name):
+					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					(witness.id.definition_local_index() == 0 and counts.binders == 0 and counts.type_binders == 0
+						and counts.blocks == 0 and counts.expressions == 0 and counts.statements == 0 and counts.patterns == 0)
+				None:
+					False
+		Err(_):
+			False
+
+
+private pure func parity(text: String, receiver: Bool, diagnostic_count: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, written) = if receiver:
+				parse_receiver_type(state)
+			else:
+				parse_type(state)
+			parsed.diagnostic_count() == diagnostic_count and matches_frozen(parsed, written, frozen(text, receiver)) and no_binder_definition_or_body_ids(parsed)
+		Err(_):
+			False
+
+
+pure func test_rich_receiver_arguments_hold_bounds_and_child_ids_without_binders() -> Bool:
+	text: String = "Box[T: Eq + mm.Hash,U,#N] next"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			match written.kind:
+				NamedType(box, [BoundedArgument(parameter), TypeArgumentType(u), DimensionArgument(dimension)]):
+					match (parameter.bounds.first.qualifier, parameter.bounds.rest, u.kind, dimension.kind):
+						(None, [qualified], NamedType(u_name, []), NamedDimension(n)):
+							match qualified.qualifier:
+								Some(qualifier):
+									(parity(text, True, 0) and written.span.covers(0, 25) and parameter.span.covers(4, 19) and parameter.parameter.name.span.covers(4, 5)
+										and parameter.bounds.first.span.covers(7, 9) and qualified.span.covers(12, 19) and qualifier.name.span.covers(12, 14)
+										and u.span.covers(20, 21) and dimension.span.covers(22, 24)
+										and box.use.name_use_local_index() == 0 and parameter.parameter.use.name_use_local_index() == 1
+										and parameter.bounds.first.trait_name.use.name_use_local_index() == 2 and qualifier.use.name_use_local_index() == 3 and qualified.trait_name.use.name_use_local_index() == 4
+										and u_name.use.name_use_local_index() == 5 and n.use.name_use_local_index() == 6 and dimension.id.dimension_local_index() == 0
+										and u.id.written_type_local_index() == 0 and written.id.written_type_local_index() == 1
+										and parsed.issued_counts().written_types == 2 and parsed.issued_counts().name_uses == 7 and parsed.issued_counts().dimensions == 1
+										and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(26, 30) and parsed.position() == 14)
+								None:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_qualified_and_nested_arguments_preserve_receiver_context() -> Bool:
+	text: String = "mm.Box[List[T: Eq], U] next"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			match written.kind:
+				QualifiedType(qualifier, box, [TypeArgumentType(list), TypeArgumentType(u)]):
+					match list.kind:
+						NamedType(list_name, [BoundedArgument(bound)]):
+							(parity(text, True, 0) and written.span.covers(0, 22) and list.span.covers(7, 18) and bound.span.covers(12, 17)
+								and qualifier.use.name_use_local_index() == 0 and box.use.name_use_local_index() == 1 and list_name.use.name_use_local_index() == 2
+								and bound.parameter.use.name_use_local_index() == 3 and bound.bounds.first.trait_name.use.name_use_local_index() == 4
+								and list.id.written_type_local_index() == 0 and u.id.written_type_local_index() == 1 and written.id.written_type_local_index() == 2
+								and parsed.issued_counts().written_types == 3 and parsed.issued_counts().name_uses == 6)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_single_grouped_bound_mints_type_only_when_used_as_root() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(T: Eq) next")):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			root_correct: Bool = match written.kind:
+				BoundedType(bound):
+					(written.id.written_type_local_index() == 0 and written.span.covers(1, 6) and bound.span.covers(1, 6)
+						and bound.parameter.use.name_use_local_index() == 0 and bound.bounds.first.trait_name.use.name_use_local_index() == 1
+						and parsed.issued_counts().written_types == 1 and parsed.issued_counts().name_uses == 2 and parity("(T: Eq) next", True, 0))
+				_:
+					False
+			match new_parse_state(lex_module(module_id_at_row(0), "Box[(T: Eq)] next")):
+				Ok(inner_state):
+					(inner_parsed, box) = parse_receiver_type(inner_state)
+					match box.kind:
+						NamedType(_, [BoundedArgument(bound)]):
+							(root_correct and parity("Box[(T: Eq)] next", True, 0) and box.span.covers(0, 12) and bound.span.covers(5, 10)
+								and box.id.written_type_local_index() == 0 and inner_parsed.issued_counts().written_types == 1 and inner_parsed.issued_counts().name_uses == 3)
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_grouping_existing_receiver_type_does_not_mint_extra_type() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(Box[T: Eq]) next")):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			match written.kind:
+				NamedType(_, [BoundedArgument(bound)]):
+					(parity("(Box[T: Eq]) next", True, 0) and written.span.covers(1, 11) and bound.span.covers(5, 10)
+						and written.id.written_type_local_index() == 0 and parsed.issued_counts().written_types == 1 and parsed.issued_counts().name_uses == 3)
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_tuple_and_function_parameter_lists_hold_unminted_bounded_arguments() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(T: Eq, U) next")):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			tuple_correct: Bool = match written.kind:
+				TupleType(Pair(BoundedArgument(bound), TypeArgumentType(u))):
+					(parity("(T: Eq, U) next", True, 0) and written.span.covers(0, 10) and bound.span.covers(1, 6)
+						and u.id.written_type_local_index() == 0 and written.id.written_type_local_index() == 1 and parsed.issued_counts().written_types == 2)
+				_:
+					False
+			match new_parse_state(lex_module(module_id_at_row(0), "(T: Eq) -> Box[U: Hash] next")):
+				Ok(function_state):
+					(function_parsed, function) = parse_receiver_type(function_state)
+					match function.kind:
+						FunctionType(ImpureFunction, [BoundedArgument(parameter)], result):
+							match result.kind:
+								NamedType(_, [BoundedArgument(return_bound)]):
+									(tuple_correct and parity("(T: Eq) -> Box[U: Hash] next", True, 0) and parameter.span.covers(1, 6) and return_bound.span.covers(15, 22)
+										and result.id.written_type_local_index() == 0 and function.id.written_type_local_index() == 1 and function.span.covers(0, 23)
+										and function_parsed.issued_counts().written_types == 2 and function_parsed.issued_counts().name_uses == 5)
+								_:
+									False
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_empty_function_parameters_preserve_grouped_bounded_result() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "() -> (T: Eq) next")):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			match written.kind:
+				FunctionType(ImpureFunction, [], result):
+					match result.kind:
+						BoundedType(bound):
+							(parity("() -> (T: Eq) next", True, 0) and result.span.covers(7, 12) and bound.span.covers(7, 12) and written.span.covers(0, 12)
+								and result.id.written_type_local_index() == 0 and written.id.written_type_local_index() == 1
+								and parsed.issued_counts().written_types == 2 and parsed.issued_counts().name_uses == 2)
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_pure_function_propagates_receiver_context_to_parameters_and_return() -> Bool:
+	text: String = "pure (T: Eq) -> (U: mm.Hash) next"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			match written.kind:
+				FunctionType(PureFunction, [BoundedArgument(parameter)], result):
+					match result.kind:
+						BoundedType(bound):
+							match bound.bounds.first.qualifier:
+								Some(qualifier):
+									(parity(text, True, 0) and parameter.parameter.use.name_use_local_index() == 0 and parameter.bounds.first.trait_name.use.name_use_local_index() == 1
+										and bound.parameter.use.name_use_local_index() == 2 and qualifier.use.name_use_local_index() == 3 and bound.bounds.first.trait_name.use.name_use_local_index() == 4
+										and result.id.written_type_local_index() == 0 and written.id.written_type_local_index() == 1 and result.span.covers(17, 27)
+										and written.span.covers(0, 27) and parsed.issued_counts().written_types == 2 and parsed.issued_counts().name_uses == 5)
+								None:
+									False
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+pure func test_dimension_suffix_wraps_bound_but_bounded_suffix_retains_recovery_element() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "(T: Eq)[#3] next")):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			array_correct: Bool = match written.kind:
+				ArrayType(element, dimensions):
+					match (element.kind, dimensions.first.kind):
+						(BoundedType(_), LiteralDimension(value)):
+							(parity("(T: Eq)[#3] next", True, 0) and value == to_int128(3) and element.span.covers(1, 6) and written.span.covers(1, 11)
+								and element.id.written_type_local_index() == 0 and written.id.written_type_local_index() == 1 and dimensions.first.id.dimension_local_index() == 0
+								and parsed.issued_counts().written_types == 2 and parsed.issued_counts().name_uses == 2 and parsed.issued_counts().dimensions == 1)
+						_:
+							False
+				_:
+					False
+			match new_parse_state(lex_module(module_id_at_row(0), "Box[T: Eq][U: Hash] next")):
+				Ok(suffix_state):
+					(suffix_parsed, recovery) = parse_receiver_type(suffix_state)
+					match recovery.kind:
+						NamedType(_, [BoundedArgument(_)]):
+							-- Exact diagnostics/cursor only for frozen-invalid array
+							-- children; this retained element is the tree recovery shape.
+							(array_correct and parity("Box[T: Eq][#N] next", True, 0) and parity("Box[T: Eq][U: Hash] next", True, 1)
+								and recovery.span.covers(0, 10) and recovery.id.written_type_local_index() == 0 and suffix_parsed.issued_counts().written_types == 1
+								and suffix_parsed.issued_counts().name_uses == 5 and suffix_parsed.issued_counts().dimensions == 0)
+						_:
+							False
+				Err(_):
+					False
+		Err(_):
+			False
+
+
+pure func test_malformed_and_trailing_plus_bounds_pin_frozen_diagnostics_and_cursor() -> Bool:
+	(parity("Box[T: Eq +] next", True, 1) and parity("Box[T: Eq +", True, 2)
+		and parity("Box[T: mm.] next", True, 1) and parity("Box[T: if] next", True, 1)
+		and parity("Box[T: Eq", True, 1))
+
+
+private pure func ordinary_bound(text: String, types: Int, names: Int, dimensions: Int) -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			(parsed, written) = parse_type(state)
+			var has_bound_diagnostic: Bool = False
+			for at in parsed.diagnostics():
+				match at.diagnostic:
+					TreeDiagnostics.Plain(FrozenDiagnostics.BoundInTypeDiagnostic):
+						has_bound_diagnostic = True
+					_:
+						void
+			(has_bound_diagnostic and matches_frozen(parsed, written, frozen(text, False)) and no_binder_definition_or_body_ids(parsed)
+				and parsed.issued_counts().written_types == types and parsed.issued_counts().name_uses == names and parsed.issued_counts().dimensions == dimensions)
+		Err(_):
+			False
+
+
+pure func test_ordinary_context_keeps_bound_rejection_ids_and_bare_root_colon() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "T: Eq")):
+		Ok(state):
+			(parsed, written) = parse_receiver_type(state)
+			root_correct: Bool = match written.kind:
+				NamedType(_, []):
+					(parity("T: Eq", True, 0) and parity("T: Eq", False, 0) and written.span.covers(0, 1) and written.id.written_type_local_index() == 0
+						and parsed.position() == 1 and parsed.current_kind() == ColonSymbol and parsed.current_span().covers(1, 2) and parsed.issued_counts().name_uses == 1)
+				_:
+					False
+			(root_correct and ordinary_bound("Box[T: Eq + mm.Hash,U,#N] next", 3, 4, 1)
+				and ordinary_bound("mm.Box[List[T: Eq], U] next", 4, 5, 0) and ordinary_bound("(T: Eq) next", 1, 1, 0)
+				and ordinary_bound("(Box[T: Eq]) next", 2, 2, 0) and ordinary_bound("Box[(T: Eq)] next", 2, 2, 0)
+				and ordinary_bound("(T: Eq, U) next", 3, 2, 0) and ordinary_bound("(T: Eq) -> Box[U: Hash] next", 4, 3, 0)
+				and ordinary_bound("() -> (T: Eq) next", 2, 1, 0) and ordinary_bound("pure (T: Eq) -> (U: mm.Hash) next", 3, 2, 0)
+				and ordinary_bound("(T: Eq)[#3] next", 2, 1, 1) and ordinary_bound("Box[T: Eq][#N] next", 3, 3, 1)
+				and ordinary_bound("Box[T: Eq][U: Hash] next", 3, 3, 0))
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Receiver type contexts and frozen recovery",
+	tests = [
+		("rich bounds dimensions and source IDs", test_rich_receiver_arguments_hold_bounds_and_child_ids_without_binders),
+		("qualified nested receiver propagation", test_qualified_and_nested_arguments_preserve_receiver_context),
+		("grouped bound root versus argument IDs", test_single_grouped_bound_mints_type_only_when_used_as_root),
+		("grouping existing receiver keeps type ID", test_grouping_existing_receiver_type_does_not_mint_extra_type),
+		("tuple and function parameter bounds", test_tuple_and_function_parameter_lists_hold_unminted_bounded_arguments),
+		("empty function returns grouped bound", test_empty_function_parameters_preserve_grouped_bounded_result),
+		("pure function parameter and result context", test_pure_function_propagates_receiver_context_to_parameters_and_return),
+		("dimension and rejected bounded suffix", test_dimension_suffix_wraps_bound_but_bounded_suffix_retains_recovery_element),
+		("malformed bounds preserve exact recovery", test_malformed_and_trailing_plus_bounds_pin_frozen_diagnostics_and_cursor),
+		("ordinary rejection and bare root colon", test_ordinary_context_keeps_bound_rejection_ids_and_bare_root_colon)
+	]
+}

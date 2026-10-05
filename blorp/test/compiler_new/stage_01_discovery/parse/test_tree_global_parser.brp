@@ -1,0 +1,334 @@
+-- Bounded M4 global completion: same-line names, checked integers and floats.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		ParseState, new_parse_state, advanced, position, current_kind, current_span, previous_span, issued_counts, diagnostic_count, spellings, consume_declared_name, finished_builtin_type
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
+		parse_declaration_preview, DeclarationPreviewParse(DeferredGlobalInitializer), DeclarationPreview(GlobalDeclarationPreview)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
+		scan_module_declaration_prefix_with_atomic_globals, ModuleDeclarationScanStop(StoppedAtGlobalInitializer, StoppedAtRejectedGlobalInitializer)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_global_parser:
+		GlobalCompletion(CompletedGlobal, DeferredGlobal), complete_atomic_global
+	../../../../src/compiler_new/stage_01_discovery/syntax/expressions: ExpressionKind(NameReference, IntegerLiteral, FloatLiteral)
+	../../../../src/compiler_new/stage_01_discovery/syntax/checked_values: written_digits
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: GlobalForm(ConstantGlobal, MutableGlobal)
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids:
+		name_use_local_index, expression_local_index, definition_local_index
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: NameConstruct(NameInTypeName)
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(EndOfFileToken, NewlineToken)
+	test: TestSuite
+
+
+private INT128_MAX_DIGITS: String = "170141183460469231731687303715884105727"
+
+
+-- The lexer accepts finite underflow as zero while retaining decimal digits.
+private FLOAT_UNDERFLOW_LITERAL: String = "0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"
+
+private FLOAT_OVERFLOW_LITERAL: String = "9999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999.0"
+
+
+pure func test_float_initializer_preserves_checked_digits_without_name_ids() -> Bool:
+	var correct: Bool = True
+	for digits in ["0.0", "007.00", "1.23456789012345678901234567890123456789", "0.000000000000000000000000000000000000001", FLOAT_UNDERFLOW_LITERAL]:
+		text = "value = ${digits}"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(at_value, header_parse) = parse_declaration_preview(entry)
+				match header_parse:
+					DeferredGlobalInitializer(preview):
+						(parsed, result) = complete_atomic_global(at_value, preview)
+						match result:
+							CompletedGlobal(global_value):
+								match global_value.value.kind:
+									FloatLiteral(value):
+										counts = parsed.issued_counts()
+										(_, witness) = parsed.finished_builtin_type(PublicVisibility, None, global_value.name, [], global_value.name.span)
+										correct = (correct and value.written_digits() == digits
+											and global_value.value.span.span_start() == "value = ".length() and global_value.value.span.span_end() == text.length()
+											and global_value.span.span_start() == 0 and global_value.span.span_end() == text.length()
+											and global_value.value.id.expression_local_index() == 0 and global_value.id.definition_local_index() == 0
+											and witness.id.definition_local_index() == 1 and counts.expressions == 1 and counts.name_uses == 0
+											and counts.binders == 0 and counts.type_binders == 0 and counts.statements == 0 and counts.blocks == 0
+											and parsed.diagnostic_count() == 0 and parsed.current_kind() == EndOfFileToken and parsed.position() == at_value.position() + 1)
+									_: correct = False
+							DeferredGlobal: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_float_initializer_preserves_rich_header_and_comment_boundary() -> Bool:
+	var correct: Bool = True
+	for suffix in [" -- comment", " -- comment\n-- next comment\nrecord Later {}"]:
+		text = "---\nDocs\n---\nprivate var values: m.Buffer[Int][#N] = 007.00${suffix}"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(at_value, header_parse) = parse_declaration_preview(entry)
+				match header_parse:
+					DeferredGlobalInitializer(preview):
+						boundary = at_value.advanced()
+						(parsed, result) = complete_atomic_global(at_value, preview)
+						match result:
+							CompletedGlobal(global_value):
+								match global_value.value.kind:
+									FloatLiteral(value):
+										counts = parsed.issued_counts()
+										correct = (correct and value.written_digits() == "007.00" and global_value.form == MutableGlobal and global_value.visibility == PrivateVisibility
+											and global_value.documentation.map(pure func(doc): doc.text) == Some("Docs") and global_value.declared_type.is_some()
+											and counts.name_uses == at_value.issued_counts().name_uses and counts.name_uses == 4
+											and counts.written_types == 3 and counts.dimensions == 1 and counts.expressions == 1
+											and global_value.value.id.expression_local_index() == 0 and global_value.id.definition_local_index() == 0
+											and parsed.position() == boundary.position() and parsed.current_kind() == boundary.current_kind()
+											and parsed.current_span().spans_equal(boundary.current_span())
+											and global_value.span.span_end() == text.length() - suffix.length() and parsed.diagnostic_count() == 0)
+									_: correct = False
+							DeferredGlobal: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_integer_initializer_uses_checked_magnitude_without_name_ids() -> Bool:
+	var correct: Bool = True
+	for digits in ["0", "007", "9223372036854775808", INT128_MAX_DIGITS, "000" + INT128_MAX_DIGITS]:
+		text = "value = ${digits}"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(at_value, header_parse) = parse_declaration_preview(entry)
+				match header_parse:
+					DeferredGlobalInitializer(preview):
+						(parsed, result) = complete_atomic_global(at_value, preview)
+						match result:
+							CompletedGlobal(global_value):
+								match global_value.value.kind:
+									IntegerLiteral(magnitude):
+										counts = parsed.issued_counts()
+										(_, witness) = parsed.finished_builtin_type(PublicVisibility, None, global_value.name, [], global_value.name.span)
+										-- Leading zeros change authored span, not the magnitude.
+										canonical = if digits == "007":
+											"7"
+										else if digits == "000" + INT128_MAX_DIGITS:
+											INT128_MAX_DIGITS
+										else:
+											digits
+										correct = (correct and magnitude.to_string() == canonical
+											and global_value.value.span.span_start() == "value = ".length() and global_value.value.span.span_end() == text.length()
+											and global_value.span.span_start() == 0 and global_value.span.span_end() == text.length()
+											and global_value.value.id.expression_local_index() == 0 and global_value.id.definition_local_index() == 0
+											and witness.id.definition_local_index() == 1 and counts.expressions == 1 and counts.name_uses == 0
+											and counts.binders == 0 and counts.type_binders == 0 and counts.statements == 0 and counts.blocks == 0
+											and parsed.diagnostic_count() == 0 and parsed.current_kind() == EndOfFileToken and parsed.position() == at_value.position() + 1)
+									_: correct = False
+							DeferredGlobal: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_integer_initializer_preserves_rich_header_and_comment_boundary() -> Bool:
+	var correct: Bool = True
+	for suffix in [" -- comment", " -- comment\n-- next comment\nrecord Later {}"]:
+		text = "---\nDocs\n---\nprivate var values: m.Buffer[Int][#N] = 007${suffix}"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(at_value, header_parse) = parse_declaration_preview(entry)
+				match header_parse:
+					DeferredGlobalInitializer(preview):
+						boundary = at_value.advanced()
+						(parsed, result) = complete_atomic_global(at_value, preview)
+						match result:
+							CompletedGlobal(global_value):
+								match global_value.value.kind:
+									IntegerLiteral(magnitude):
+										counts = parsed.issued_counts()
+										correct = (correct and magnitude.to_string() == "7" and global_value.form == MutableGlobal and global_value.visibility == PrivateVisibility
+											and global_value.documentation.map(pure func(doc): doc.text) == Some("Docs") and global_value.declared_type.is_some()
+											and counts.name_uses == at_value.issued_counts().name_uses and counts.name_uses == 4
+											and counts.written_types == 3 and counts.dimensions == 1 and counts.expressions == 1
+											and global_value.value.id.expression_local_index() == 0 and global_value.id.definition_local_index() == 0
+											and parsed.position() == boundary.position() and parsed.current_kind() == boundary.current_kind()
+											and parsed.current_span().spans_equal(boundary.current_span())
+											and global_value.span.span_end() == text.length() - suffix.length() and parsed.diagnostic_count() == 0)
+									_: correct = False
+							DeferredGlobal: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_name_initializer_mints_use_expression_then_global() -> Bool:
+	text = "target = Source"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(at_value, header_parse) = parse_declaration_preview(entry)
+			match header_parse:
+				DeferredGlobalInitializer(preview):
+					(parsed, result) = complete_atomic_global(at_value, preview)
+					match result:
+						CompletedGlobal(global_value):
+							match global_value.value.kind:
+								NameReference(use):
+									counts = parsed.issued_counts()
+									(global_value.form == ConstantGlobal and global_value.visibility == PublicVisibility
+										and parsed.spellings().spelling_text(global_value.name.spelling) == Some("target")
+										and parsed.spellings().spelling_text(use.name.spelling) == Some("Source")
+										and use.use.name_use_local_index() == 0 and global_value.value.id.expression_local_index() == 0
+										and global_value.id.definition_local_index() == 0
+										and global_value.span.span_start() == 0 and global_value.span.span_end() == text.length()
+										and global_value.value.span.spans_equal(use.name.span) and use.name.span.span_start() == 9
+										and counts.name_uses == 1 and counts.expressions == 1 and counts.binders == 0
+										and counts.statements == 0 and counts.blocks == 0 and counts.written_types == 0
+										and parsed.diagnostic_count() == 0 and parsed.current_kind() == EndOfFileToken
+										and parsed.position() == at_value.position() + 1)
+								_: False
+						DeferredGlobal: False
+				_: False
+		Err(_): False
+
+
+pure func test_rich_header_ids_precede_value_and_completed_owner() -> Bool:
+	text = "---\nDocs\n---\nprivate var values: m.Buffer[Int][#N] = Source\nrecord Later {}"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(at_value, header_parse) = parse_declaration_preview(entry)
+			match header_parse:
+				DeferredGlobalInitializer(preview):
+					(parsed, result) = complete_atomic_global(at_value, preview)
+					match result:
+						CompletedGlobal(global_value):
+							match global_value.value.kind:
+								NameReference(use):
+									counts = parsed.issued_counts()
+									(_, witness) = parsed.finished_builtin_type(PublicVisibility, None, global_value.name, [], global_value.name.span)
+									(global_value.form == MutableGlobal and global_value.visibility == PrivateVisibility
+										and global_value.documentation.map(pure func(doc): doc.text) == Some("Docs")
+										and global_value.declared_type.is_some() and global_value.span.span_start() == 0
+										and global_value.span.span_end() == text.length() - "\nrecord Later {}".length()
+										and at_value.issued_counts().name_uses == 4 and counts.name_uses == 5
+										and counts.written_types == 3 and counts.dimensions == 1
+										and counts.expressions == 1 and counts.binders == 0 and counts.statements == 0 and counts.blocks == 0
+										and use.use.name_use_local_index() == 4 and global_value.value.id.expression_local_index() == 0
+										and global_value.id.definition_local_index() == 0 and witness.id.definition_local_index() == 1
+										and parsed.current_kind() == NewlineToken and parsed.diagnostic_count() == 0)
+								_: False
+						DeferredGlobal: False
+				_: False
+		Err(_): False
+
+
+pure func test_comment_and_blank_lines_preserve_unconsumed_boundary() -> Bool:
+	var correct: Bool = True
+	for suffix in [" -- comment", " -- comment\n", "\n-- comment\n\nrecord Later {}"]:
+		text = "target = self${suffix}"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(at_value, header_parse) = parse_declaration_preview(entry)
+				match header_parse:
+					DeferredGlobalInitializer(preview):
+						boundary = at_value.advanced()
+						(parsed, result) = complete_atomic_global(at_value, preview)
+						match result:
+							CompletedGlobal(global_value):
+								correct = (correct and parsed.position() == boundary.position() and parsed.current_kind() == boundary.current_kind()
+									and parsed.current_span().spans_equal(boundary.current_span()) and global_value.span.span_end() == "target = self".length())
+							DeferredGlobal: correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_unsupported_initializer_returns_exact_authoritative_state() -> Bool:
+	var correct: Bool = True
+	for initializer in ["Source()", "Source.field", "Source[0]", "Source + Other", "Source Other", "(Source)", "123 Other", "True", "void", "Self", "_", "\n\tSource", "Source\n.field", "Source\n\n.field", "Source\n-- comment\n.field", "Source\n\t.field", "Source\n\tOther", "Source\n\t+ Other", "", "Source, Other", "-1", "(1)", "1 + Other", "1..2", "1.field", "1()", "1[0]", "1.5 Other", "0x4", "1_000", "\n\t1", "1\n.field", "1\n\t.field", "1\n\tOther", "170141183460469231731687303715884105728", "-1.0", "(1.0)", "1.0 + Other", "1.0..2.0", "1.0.field", "1.0()", "1.0[0]", "\n\t1.0", "1.0\n.field", "1.0\n\t.field", "1.0\n\tOther", ".5", "1.", "1e3", "1.0e3", "1.0f", "1.0_0", "1.0.2", FLOAT_OVERFLOW_LITERAL]:
+		text = "value: Int = ${initializer}"
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(at_value, header_parse) = parse_declaration_preview(entry)
+				match header_parse:
+					DeferredGlobalInitializer(preview):
+						(parsed, result) = complete_atomic_global(at_value, preview)
+						match result:
+							DeferredGlobal:
+								before = at_value.issued_counts()
+								after = parsed.issued_counts()
+								(_, before_witness) = at_value.finished_builtin_type(PublicVisibility, None, preview.header.name, [], preview.header.name.span)
+								(_, after_witness) = parsed.finished_builtin_type(PublicVisibility, None, preview.header.name, [], preview.header.name.span)
+								correct = (correct and parsed.position() == at_value.position() and parsed.current_kind() == at_value.current_kind()
+									and parsed.current_span().spans_equal(at_value.current_span()) and parsed.previous_span().spans_equal(at_value.previous_span())
+									and parsed.diagnostic_count() == at_value.diagnostic_count()
+									and before_witness.id.definition_local_index() == after_witness.id.definition_local_index()
+									and before.name_uses == after.name_uses and before.expressions == after.expressions and before.written_types == after.written_types
+									and before.dimensions == after.dimensions and before.type_binders == after.type_binders and before.binders == after.binders
+									and before.statements == after.statements and before.blocks == after.blocks and before.patterns == after.patterns)
+							CompletedGlobal(_): correct = False
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_opt_in_scan_completes_prefix_and_preserves_next_deferred_mint() -> Bool:
+	text = "first = Source\nsecond = Source\nblocked: Int = Unsupported(BodyName)\nrecord Later {}"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, scan) = scan_module_declaration_prefix_with_atomic_globals(entry)
+			match (scan.declarations, scan.stop):
+				([GlobalDeclarationPreview(first), GlobalDeclarationPreview(second)], StoppedAtGlobalInitializer(blocked)):
+					counts = parsed.issued_counts()
+					(_, witness) = parsed.finished_builtin_type(PublicVisibility, None, blocked.header.name, [], blocked.header.name.span)
+					match (first.value.kind, second.value.kind):
+						(NameReference(first_use), NameReference(second_use)):
+							(first.id.definition_local_index() == 0 and second.id.definition_local_index() == 1 and witness.id.definition_local_index() == 2
+								and first_use.use.name_use_local_index() == 0 and second_use.use.name_use_local_index() == 1
+								and first.value.id.expression_local_index() == 0 and second.value.id.expression_local_index() == 1
+								and counts.expressions == 2 and counts.name_uses == 3 and counts.written_types == 1
+								and counts.statements == 0 and counts.blocks == 0 and counts.binders == 0
+								and parsed.position() == blocked.initializer.token_start and parsed.diagnostic_count() == 0)
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_prefix_diagnostic_cannot_complete_global_body() -> Bool:
+	text = "@no_copy value = Source"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, scan) = scan_module_declaration_prefix_with_atomic_globals(entry)
+			match scan.stop:
+				StoppedAtRejectedGlobalInitializer(_):
+					(at_value, _) = parse_declaration_preview(entry)
+					counts = parsed.issued_counts()
+					match new_parse_state(lex_module(module_id_at_row(0), "Witness")):
+						Ok(witness_entry):
+							(_, witness_name) = witness_entry.consume_declared_name(NameInTypeName)
+							match witness_name:
+								Some(name):
+									(_, witness) = parsed.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+									(counts.expressions == 0 and counts.name_uses == 0 and counts.written_types == 0
+										and witness.id.definition_local_index() == 0 and scan.declarations.is_empty()
+										and parsed.diagnostic_count() > 0 and parsed.position() == at_value.position())
+								None: False
+						Err(_): False
+				_: False
+		Err(_): False
+
+
+tests: TestSuite = {
+	description = "Direct atomic global completion",
+	tests = [
+		("checked float digits and id order", test_float_initializer_preserves_checked_digits_without_name_ids),
+		("float rich header and comment boundary", test_float_initializer_preserves_rich_header_and_comment_boundary),
+		("checked integer magnitude and id order", test_integer_initializer_uses_checked_magnitude_without_name_ids),
+		("integer rich header and comment boundary", test_integer_initializer_preserves_rich_header_and_comment_boundary),
+		("name initializer mints use expression then global", test_name_initializer_mints_use_expression_then_global),
+		("rich header ids precede value and completed owner", test_rich_header_ids_precede_value_and_completed_owner),
+		("comments preserve unconsumed boundary", test_comment_and_blank_lines_preserve_unconsumed_boundary),
+		("opt in scan preserves deferred mint", test_opt_in_scan_completes_prefix_and_preserves_next_deferred_mint),
+		("prefix diagnostic cannot complete global", test_prefix_diagnostic_cannot_complete_global_body),
+		("unsupported initializer preserves authoritative state", test_unsupported_initializer_returns_exact_authoritative_state)
+	]
+}

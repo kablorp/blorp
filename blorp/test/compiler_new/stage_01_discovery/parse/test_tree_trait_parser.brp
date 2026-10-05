@@ -1,0 +1,352 @@
+-- A single frozen declaration call pins owner recovery; no module assembly.
+-- Default-body comparisons below are lexical evidence, not M4 expression parity.
+import:
+	../../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parse_state: ParseState, new_parse_state, advanced, current_kind, current_span, position, diagnostics, diagnostic_count, issued_counts, spellings, report_at_current, finished_builtin_type, consume_declared_name
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_parser: TraitPreview, TraitParse(ParsedTrait, RejectedTrait), parse_trait
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_trait_method_header_parser: MethodBodyExtent(AbstractMethod, SkippedDefaultBody)
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser: deferred_body_span, deferred_body_token_start, deferred_body_token_end
+	../../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_prefix_parser: parse_declaration_prefix
+	../../../../src/compiler_new/stage_01_discovery/parse/declaration_parser: parse_declaration
+	../../../../src/compiler_new/stage_01_discovery/parse/lexed_bridge: bridge_lexed_module
+	../../../../src/compiler_new/stage_01_discovery/parse/parser_cursor as FrozenCursor
+	../../../../src/compiler_new/stage_01_discovery/sources/source_admission: admit_source
+	../../../../src/compiler_new/stage_01_discovery/tables/builder: DiscoveryBuilder, empty_discovery_builder
+	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code as FrozenDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics as TreeDiagnostics
+	../../../../src/compiler_new/stage_01_discovery/syntax/declarations: TypeParameter(TypeVariable, DimensionVariable, WildcardDimensionParameter), ParameterBinding(NamedParameter)
+	../../../../src/compiler_new/stage_01_discovery/syntax/spellings: spelling_text
+	../../../../src/compiler_new/stage_01_discovery/syntax/ids: definition_local_index, type_binder_local_index, name_use_local_index, binder_local_index, written_type_local_index
+	../../../../src/compiler_new/stage_01_discovery/tables/expected_token: ExpectedTokenDiagnostic(ExpectedName, ExpectedColon, ExpectedRightBracket, ExpectedRightParen, ExpectedNewline, ExpectedIndent, ExpectedKeyword, ExpectedLeftParen), NameConstruct(NameInTraitName)
+	../../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
+	../../../../src/compiler_new/stage_01_discovery/tables/row_kinds: Visibility(PublicVisibility, PrivateVisibility), Purity(PureFunction, ImpureFunction)
+	../../../../src/compiler_new/stage_01_discovery/tables/span: Span, span_start, span_end, spans_equal
+	../../../../src/compiler_new/stage_01_discovery/tables/token: TokenKind(TraitKeyword, IdentifierToken, LeftBracketSymbol, NewlineToken, EndOfFileToken)
+	test: TestSuite
+
+
+private pure func covers(span: Span, first: Int, last: Int) -> Bool:
+	span.span_start() == first and span.span_end() == last
+
+
+private pure func frozen(text: String) -> DiscoveryBuilder:
+	lexed = lex_module(module_id_at_row(0), text)
+	prepared = empty_discovery_builder().admit_source("trait.brp", text).bridge_lexed_module(lexed)
+	parse_declaration(prepared, module_id_at_row(0))
+
+
+private pure func expected_token_matches(actual: ExpectedTokenDiagnostic, wanted: ExpectedTokenDiagnostic) -> Bool:
+	match (actual, wanted):
+		(ExpectedName(actual), ExpectedName(wanted)):
+			actual == wanted
+		(ExpectedColon(actual), ExpectedColon(wanted)):
+			actual == wanted
+		(ExpectedRightBracket(actual), ExpectedRightBracket(wanted)):
+			actual == wanted
+		(ExpectedRightParen(actual), ExpectedRightParen(wanted)):
+			actual == wanted
+		(ExpectedNewline(actual), ExpectedNewline(wanted)):
+			actual == wanted
+		(ExpectedIndent(actual), ExpectedIndent(wanted)):
+			actual == wanted
+		(ExpectedKeyword(actual), ExpectedKeyword(wanted)):
+			actual == wanted
+		(ExpectedLeftParen(actual), ExpectedLeftParen(wanted)):
+			actual == wanted
+		_:
+			False
+
+
+private pure func matches_frozen(state: ParseState, reference: DiscoveryBuilder) -> Bool:
+	var correct: Bool = (state.diagnostic_count() == reference.diagnostics.length() and state.position() == reference.token_cursor
+		and state.current_kind() == FrozenCursor.current_kind(reference) and state.current_span().spans_equal(FrozenCursor.current_span(reference)))
+	for (actual, wanted) in state.diagnostics().zip(reference.diagnostics):
+		correct = correct and actual.span.spans_equal(wanted.span)
+		match (actual.diagnostic, wanted.diagnostic):
+			(TreeDiagnostics.Plain(actual), FrozenDiagnostics.Plain(wanted)):
+				correct = correct and actual == wanted
+			(TreeDiagnostics.ExpectedToken(actual), FrozenDiagnostics.ExpectedToken(wanted)):
+				correct = correct and expected_token_matches(actual, wanted)
+			(TreeDiagnostics.ReservedKeywordAsName(actual), FrozenDiagnostics.ReservedKeywordAsName(wanted)) | (TreeDiagnostics.UnknownAnnotation(actual), FrozenDiagnostics.UnknownAnnotation(wanted)):
+				correct = correct and state.spellings().spelling_text(actual) == reference.name_spellings.get(wanted.name_id_index())
+			_:
+				-- Exact variant/construct/order/span parity; no code-name normalization.
+				correct = False
+	correct
+
+
+private pure func no_definitions_or_bodies(state: ParseState) -> Bool:
+	counts = state.issued_counts()
+	match new_parse_state(lex_module(module_id_at_row(0), "witness")):
+		Ok(witness_state):
+			(_, name) = witness_state.consume_declared_name(NameInTraitName)
+			match name:
+				Some(name):
+					(_, witness) = state.finished_builtin_type(PublicVisibility, None, name, [], name.span)
+					(witness.id.definition_local_index() == 0 and counts.expressions == 0 and counts.blocks == 0
+						and counts.statements == 0 and counts.patterns == 0)
+				None:
+					False
+		Err(_):
+			False
+
+
+-- Test-only composition rejects the diagnostic delta from before prefix scan.
+-- The direct production leaf tolerates diagnostics already present at its entry.
+private pure func composed(text: String) -> Option[(ParseState, TraitParse)]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(state):
+			before: Int = state.diagnostic_count()
+			(after_prefix, prefix) = parse_declaration_prefix(state)
+			(parsed, result) = parse_trait(after_prefix, prefix.visibility, prefix.documentation, prefix.start)
+			if parsed.diagnostic_count() != before:
+				Some((parsed, RejectedTrait))
+			else:
+				Some((parsed, result))
+		Err(_):
+			None
+
+
+private pure func accepted(text: String, methods: List[String], supers: List[String]) -> Bool:
+	reference = frozen(text)
+	match composed(text):
+		Some((parsed, result)):
+			match (result, reference.definitions.get(0)):
+				(ParsedTrait(declaration), Some(owner)):
+					var correct: Bool = (matches_frozen(parsed, reference) and parsed.diagnostic_count() == 0 and declaration.span.spans_equal(owner.span)
+						and declaration.name.span.spans_equal(owner.name_span) and declaration.methods.length() == methods.length() and declaration.supertraits.length() == supers.length()
+						and declaration.methods.length() + 1 == reference.definitions.length() and no_definitions_or_bodies(parsed))
+					for (method, name) in declaration.methods.zip(methods):
+						correct = correct and parsed.spellings().spelling_text(method.header.signature.name.spelling) == Some(name)
+					for (supertrait, name) in declaration.supertraits.zip(supers):
+						correct = correct and parsed.spellings().spelling_text(supertrait.trait_name.name.spelling) == Some(name)
+					var index: Int = 1
+					for method in declaration.methods:
+						-- Abstract spans are exact frozen extents. Defaults have separate
+						-- header/body evidence and are covered without this comparison.
+						match (method.body_extent, reference.definitions.get(index)):
+							(AbstractMethod, Some(reference_method)):
+								correct = correct and method.header.span.spans_equal(reference_method.span)
+							_:
+								correct = False
+						index += 1
+					correct
+				_:
+					False
+		None:
+			False
+
+
+private pure func rejected(text: String) -> Bool:
+	match composed(text):
+		Some((parsed, result)):
+			match result:
+				RejectedTrait:
+					matches_frozen(parsed, frozen(text)) and parsed.diagnostic_count() > 0 and no_definitions_or_bodies(parsed)
+				_:
+					False
+		None:
+			False
+
+
+pure func test_supertraits_preserve_qualifiers_duplicates_order_and_following_newline() -> Bool:
+	text: String = "trait T: Eq + m.Eq + Eq\nnext"
+	match composed(text):
+		Some((parsed, result)):
+			match result:
+				ParsedTrait(declaration):
+					match declaration.supertraits:
+						[first, qualified, duplicate]:
+							match (first.qualifier, qualified.qualifier, duplicate.qualifier):
+								(None, Some(qualifier), None):
+									(accepted(text, [], ["Eq", "Eq", "Eq"]) and declaration.span.covers(0, 23) and first.span.covers(9, 11) and qualified.span.covers(14, 18) and duplicate.span.covers(21, 23)
+										and first.trait_name.use.name_use_local_index() == 0 and qualifier.use.name_use_local_index() == 1
+										and qualified.trait_name.use.name_use_local_index() == 2 and duplicate.trait_name.use.name_use_local_index() == 3
+										and parsed.current_kind() == NewlineToken and parsed.current_span().covers(24, 24) and parsed.position() == 10
+										and parsed.issued_counts().name_uses == 4 and parsed.issued_counts().type_binders == 0 and parsed.issued_counts().written_types == 0)
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_type_parameter_children_and_supertrait_uses_keep_source_order() -> Bool:
+	text: String = "trait T[A: m.Eq + Eq, #N, #_]: m.Eq + Eq\nnext"
+	match composed(text):
+		Some((parsed, result)):
+			match result:
+				ParsedTrait(declaration):
+					match (declaration.type_parameters, declaration.supertraits):
+						([TypeVariable(variable), DimensionVariable(dimension), WildcardDimensionParameter(wildcard)], [qualified, bare]):
+							match (variable.bounds, qualified.qualifier):
+								([bound, other], Some(qualifier)):
+									match bound.qualifier:
+										Some(bound_qualifier):
+											(accepted(text, [], ["Eq", "Eq"]) and variable.binder.binder.type_binder_local_index() == 0 and dimension.binder.type_binder_local_index() == 1
+												and variable.span.covers(8, 20) and dimension.name.span.covers(22, 24) and wildcard.covers(26, 28)
+												and bound_qualifier.use.name_use_local_index() == 0 and bound.trait_name.use.name_use_local_index() == 1 and other.trait_name.use.name_use_local_index() == 2
+												and qualifier.use.name_use_local_index() == 3 and qualified.trait_name.use.name_use_local_index() == 4 and bare.trait_name.use.name_use_local_index() == 5
+												and parsed.issued_counts().type_binders == 2 and parsed.issued_counts().name_uses == 6 and parsed.issued_counts().binders == 0 and parsed.issued_counts().dimensions == 0)
+										None:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_two_abstract_methods_own_dedent_and_keep_child_ids() -> Bool:
+	text: String = "trait T:\n\tfunc a(x: Int) -> Int\n\tpure func b(y: Int) -> Int\nnext"
+	match composed(text):
+		Some((parsed, result)):
+			match result:
+				ParsedTrait(declaration):
+					match declaration.methods:
+						[first, second]:
+							match (first.header.signature.parameters, second.header.signature.parameters, first.header.signature.return_type, second.header.signature.return_type):
+								([x], [y], Some(first_return), Some(second_return)):
+									match (x.binding, y.binding, x.declared_type, y.declared_type):
+										(NamedParameter(x_name), NamedParameter(y_name), Some(x_type), Some(y_type)):
+											(accepted(text, ["a", "b"], []) and accepted("trait T: Eq:\n\tfunc f()\nnext", ["f"], ["Eq"]) and declaration.span.covers(0, 60) and first.header.span.covers(10, 31) and second.header.span.covers(33, 59)
+												and first.header.signature.purity == ImpureFunction and second.header.signature.purity == PureFunction
+												and x_name.binder.binder_local_index() == 0 and y_name.binder.binder_local_index() == 1
+												and x_type.id.written_type_local_index() == 0 and first_return.id.written_type_local_index() == 1 and y_type.id.written_type_local_index() == 2 and second_return.id.written_type_local_index() == 3
+												and parsed.issued_counts().binders == 2 and parsed.issued_counts().written_types == 4 and parsed.issued_counts().name_uses == 4
+												and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(60, 64))
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_top_level_documentation_private_and_pure_use_prefix_contract() -> Bool:
+	text: String = "---\nDoc\n---\nprivate pure trait T: Eq"
+	match composed(text):
+		Some((parsed, result)):
+			match result:
+				ParsedTrait(declaration):
+					match declaration.documentation:
+						Some(doc):
+							(accepted(text, [], ["Eq"]) and rejected("@no_copy trait T: Eq") and rejected("private @no_copy trait T: Eq") and rejected("@unknown trait T: Eq") and declaration.visibility == PrivateVisibility and doc.text == "Doc" and doc.span.covers(0, 12)
+								and declaration.span.covers(0, 36) and declaration.methods.is_empty() and parsed.issued_counts().binders == 0)
+						None:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_owner_name_parameter_and_colon_errors_continue_frozen_recovery() -> Bool:
+	(rejected("trait 123: Eq\nnext") and rejected("trait if: Eq\nnext")
+		and rejected("trait T[#N: Eq, A]: Eq\nnext") and rejected("trait T[A: Eq: Eq\nnext")
+		and rejected("trait T\n\tfunc good()\nnext"))
+
+
+pure func test_supertrait_recovery_preserves_trailing_plus_and_bracket_quirks() -> Bool:
+	match composed("trait T: Eq[Int]"):
+		Some((parsed, result)):
+			bracket_correct: Bool = match result:
+				ParsedTrait(declaration):
+					accepted("trait T: Eq[Int]", [], ["Eq"]) and declaration.span.covers(0, 11) and parsed.current_kind() == LeftBracketSymbol and parsed.current_span().covers(11, 12)
+				_:
+					False
+			(accepted("trait T: Eq +", [], ["Eq"]) and bracket_correct
+				and rejected("trait T: m.\nnext") and rejected("trait T: + Eq\nnext"))
+		None:
+			False
+
+
+pure func test_layout_failures_preserve_unindented_continuation_and_eof_reports() -> Bool:
+	(rejected("trait T:") and rejected("trait T:\n") and rejected("trait T: Eq: func f()")
+		and rejected("trait T:\nfunc f()\nfunc g()") and rejected("trait T: Eq:\nfunc f()\nfunc g()"))
+
+
+pure func test_rejected_children_and_unsupported_items_continue_without_filtering() -> Bool:
+	text: String = "trait T:\n\tfunc 123(x: Int) -> Int\n\tfunc good(y: Int) -> Int\nnext"
+	match composed(text):
+		Some((parsed, _)):
+			(rejected(text) and parsed.issued_counts().binders == 2 and parsed.issued_counts().written_types == 4
+				and rejected("trait T:\n\tprivate func f()\n\tfunc good()\nnext")
+				and rejected("trait T:\n\t@no_copy func f()\n\tfunc good()\nnext")
+				and rejected("trait T:\n\t123\n\tfunc good()\nnext")
+				and rejected("trait T:\n\tfunc f() where\n\tfunc good()\nnext")
+				and rejected("trait T:\n\tfunc f() -> Int:\nnext"))
+		None:
+			False
+
+
+pure func test_default_body_extent_then_abstract_method_is_lexical_evidence_only() -> Bool:
+	-- No frozen expression-parser comparison: M4 owns body trees, diagnostics
+	-- and final ID interleaving. Retain the header extent separately from body.
+	match composed("trait T:\n\tfunc f():\n\t\t1\n\tfunc g()\nnext"):
+		Some((parsed, result)):
+			match result:
+				ParsedTrait(declaration):
+					match declaration.methods:
+						[first, second]:
+							match (first.body_extent, second.body_extent):
+								(SkippedDefaultBody(body), AbstractMethod):
+									(declaration.span.covers(0, 34) and first.header.span.covers(10, 16) and second.header.span.covers(25, 31)
+										and body.deferred_body_span().covers(22, 23) and body.deferred_body_token_start() == 10 and body.deferred_body_token_end() == 14
+										and parsed.current_kind() == IdentifierToken and parsed.current_span().covers(34, 38) and parsed.position() == 19
+										and parsed.diagnostic_count() == 0 and no_definitions_or_bodies(parsed))
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_direct_entry_uses_earlier_anchor_and_tolerates_existing_diagnostic() -> Bool:
+	match new_parse_state(lex_module(module_id_at_row(0), "prefix trait T: Eq")):
+		Ok(state):
+			entry = state.advanced().report_at_current(FrozenDiagnostics.ExpectedSupertraitOrMethodsDiagnostic)
+			(parsed, result) = parse_trait(entry, PrivateVisibility, None, state.current_span())
+			match (result, parsed.diagnostics().get(0)):
+				(ParsedTrait(declaration), Some(diagnostic)):
+					match diagnostic.diagnostic:
+						TreeDiagnostics.Plain(FrozenDiagnostics.ExpectedSupertraitOrMethodsDiagnostic):
+							(declaration.span.covers(0, 18) and declaration.name.span.covers(13, 14) and declaration.visibility == PrivateVisibility and declaration.documentation.is_none()
+								and diagnostic.span.covers(7, 7) and parsed.diagnostic_count() == 1 and parsed.current_kind() == EndOfFileToken
+								and parsed.current_span().covers(18, 18) and parsed.position() == 5 and no_definitions_or_bodies(parsed))
+						_:
+							False
+				_:
+					False
+		Err(_):
+			False
+
+
+tests: TestSuite = {
+	description = "Trait owner previews and frozen declaration recovery",
+	tests = [
+		("supertraits preserve qualifiers duplicates and cursor", test_supertraits_preserve_qualifiers_duplicates_order_and_following_newline),
+		("type parameter children keep source IDs", test_type_parameter_children_and_supertrait_uses_keep_source_order),
+		("two abstracts own dedent and child IDs", test_two_abstract_methods_own_dedent_and_keep_child_ids),
+		("documentation private and pure prefix contract", test_top_level_documentation_private_and_pure_use_prefix_contract),
+		("owner header errors preserve recovery", test_owner_name_parameter_and_colon_errors_continue_frozen_recovery),
+		("supertrait recovery and suffix quirks", test_supertrait_recovery_preserves_trailing_plus_and_bracket_quirks),
+		("layout failures preserve continuation", test_layout_failures_preserve_unindented_continuation_and_eof_reports),
+		("rejected and unsupported children remain unfiltered", test_rejected_children_and_unsupported_items_continue_without_filtering),
+		("default then abstract lexical evidence", test_default_body_extent_then_abstract_method_is_lexical_evidence_only),
+		("direct entry anchor and existing diagnostic", test_direct_entry_uses_earlier_anchor_and_tolerates_existing_diagnostic)
+	]
+}

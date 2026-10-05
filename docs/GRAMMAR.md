@@ -78,7 +78,7 @@ Opaque representation conversions use `into_opaque` and `from_opaque`.
 INT                  = digit { digit }
 BIGINT               = digit { digit }              (* integer literal outside Int64 range; valid only where
                                                        UInt64 or a 128-bit type is expected, up to Int128 max *)
-FLOAT                = digit { digit } "." digit { digit } [ ("e" | "E") ["+" | "-"] digit { digit } ]
+FLOAT                = digit { digit } "." digit { digit }
 STRING               = '"' { string_char } '"'
 STRING_INTERP        = '"' { string_char_or_interp } '"'
 RAW_STRING           = 'raw"' { any_char_except_quote } '"'
@@ -88,6 +88,11 @@ CHAR                 = "'" unicode_char "'"
 IDENT                = (letter | "_") { letter | digit | "_" }
 DOCSTRING            = "---" newline { line } "---"
 ```
+
+`FLOAT` must denote a finite IEEE 754 64-bit value. A syntactically valid
+literal that exceeds that range is a lexer error, with a suggestion to write
+a smaller number. Its decimal digits remain available for conversion to the
+width selected by typechecking.
 
 A hole `${ expr }` holds any expression, including a string with holes of its
 own, to any depth (the compiler limits it to 64 open braces and holes together). Braces are text

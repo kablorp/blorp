@@ -1,0 +1,79 @@
+-- Direct import-block ownership. Children mint their own import IDs; the
+-- block has no identity and is accepted only when its grammar adds no errors.
+import:
+	../syntax/imports: ImportBlock, Import
+	../tables/diagnostic_code:
+		PlainSyntaxCode(ExpectedColonAfterImportDiagnostic, ExpectedNewlineAfterImportHeaderDiagnostic, ExpectedIndentedImportsDiagnostic)
+	../tables/span: Span, span_covering
+	../tables/token: TokenKind(ColonSymbol, NewlineToken, IndentToken, DedentToken, EndOfFileToken)
+	parse_state: ParseState, current_kind, current_span, advanced, position, diagnostic_count, report_at_current
+	tree_import_parser: ImportParse(ParsedImport, RejectedImport), parse_import
+
+
+union ImportBlockParse:
+	ParsedImportBlock(ImportBlock)
+	RejectedImportBlock
+
+
+-- The cursor is at `import`. Each missing layout token diagnoses without
+-- consuming the current token, then recovery continues through the children.
+pure func parse_import_block(state: ParseState) -> (ParseState, ImportBlockParse):
+	before: Int = state.diagnostic_count()
+	start: Span = state.current_span()
+	var out: ParseState = state.advanced()
+
+	if out.current_kind() == ColonSymbol:
+		out = out.advanced()
+	else:
+		out = out.report_at_current(ExpectedColonAfterImportDiagnostic)
+
+	if out.current_kind() == NewlineToken:
+		out = out.advanced()
+	else:
+		out = out.report_at_current(ExpectedNewlineAfterImportHeaderDiagnostic)
+
+	if out.current_kind() == IndentToken:
+		out = out.advanced()
+	else:
+		out = out.report_at_current(ExpectedIndentedImportsDiagnostic)
+
+	out = out.skip_newlines()
+	var imports: List[Import] = []
+	var end: Span = start
+
+	-- Missing indentation still owns imports through the enclosing block end.
+	-- Unsupported starters enter the leaf's path recovery without filtering.
+	while not out.at_block_end():
+		import_start: Int = out.position()
+		(after_import, result) = parse_import(out)
+		out = after_import.skip_newlines()
+		match result:
+			ParsedImport(imported):
+				imports = imports.append(imported)
+			RejectedImport:
+				()
+
+		if out.position() == import_start and not out.at_block_end():
+			out = out.advanced()
+
+	-- A real closing dedent extends the owner. Without it the frozen block
+	-- ends at its keyword, even when recovery consumed imports through EOF.
+	if out.current_kind() == DedentToken:
+		end = out.current_span()
+		out = out.advanced()
+
+	if out.diagnostic_count() != before:
+		(out, RejectedImportBlock)
+	else:
+		(out, ParsedImportBlock({ imports = imports, span = start.span_covering(end) }))
+
+
+private pure func at_block_end(state: ParseState) -> Bool:
+	state.current_kind() == DedentToken or state.current_kind() == EndOfFileToken
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+	out

@@ -603,6 +603,11 @@ z: Float32 = x + to_float32(1.0)
 big: Float = to_float(x)
 ```
 
+Float literals must represent a finite `Float`. The lexer rejects a literal
+above its range (about `1.8e308`) with a suggestion to write a smaller number.
+The written decimal digits are preserved so narrower literal types can round
+directly to their chosen width.
+
 All three float types support full fixed-size array operations.
 
 ### Tuples

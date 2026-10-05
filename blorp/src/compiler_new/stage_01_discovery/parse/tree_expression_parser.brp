@@ -1,0 +1,261 @@
+-- An explicitly bounded M4 operator grammar. Recognition builds only recipes:
+-- no NameUse, Expression or declaration ID exists until the entire same-line
+-- expression and its boundary have been accepted. Unsupported input returns
+-- the caller's original state, including spellings and diagnostics.
+import:
+	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue)
+	../syntax/checked_values: DecimalFloat
+	../syntax/expressions:
+		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, BooleanLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression),
+		UnaryOperator(Negate, LogicalNot),
+		BinaryOperator(Add, Subtract, Multiply, Divide, Modulo, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual),
+		LogicalOperator(LogicalAnd, LogicalOr)
+	../syntax/names: WrittenName
+	../tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
+	../tables/expected_token:
+		NameConstruct(NameInStatementName), ExpectedTokenDiagnostic(ExpectedRightParen),
+		RightParenConstruct(RightParenInGroupedExpression)
+	../tables/span: Span, span_covering
+	../tables/token:
+		TokenKind(IdentifierToken, IntLiteralToken, FloatLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
+			MinusSymbol, NotKeyword, LeftParenSymbol, RightParenSymbol,
+			EndOfFileToken, NewlineToken, DotSymbol, IndentToken)
+	binary_operators as Operators
+	parse_state:
+		ParseState, current_kind, current_span, current_literal, advanced, peek_kind, span_start_line,
+		consume_referenced_name, finished_name_use, finished_expression, report_at_current, expect_token
+
+
+union ExpressionParse:
+	ParsedExpression(Expression)
+	UnsupportedExpression
+	RejectedExpression
+
+
+-- Recipes retain only authored syntax and checked values, never parser IDs.
+private record ExpressionRecipe {
+	span: Span,
+	kind: RecipeKind
+}
+
+
+private union RecipeKind:
+	NameRecipe(WrittenName)
+	IntegerRecipe(Int128)
+	FloatRecipe(DecimalFloat)
+	BooleanRecipe(Bool)
+	VoidRecipe
+	UnaryRecipe(UnaryOperator, ExpressionRecipe)
+	BinaryRecipe(Operators.BinaryOperator, ExpressionRecipe, ExpressionRecipe)
+	GroupingRecipe(ExpressionRecipe)
+
+
+private union RecipeParse:
+	ParsedRecipe(ExpressionRecipe)
+	UnsupportedRecipe
+	RejectedRecipe
+
+
+-- A frame is one binary node whose left operand is still being walked.
+private record BinaryFrame {
+	span: Span,
+	operator: Operators.BinaryOperator,
+	right: ExpressionRecipe
+}
+
+
+pure func parse_same_line_expression(state: ParseState) -> (ParseState, ExpressionParse):
+	(parsed, result) = parse_operators(state, state.span_start_line(state.current_span()), Operators.LOWEST_PRECEDENCE)
+	match result:
+		UnsupportedRecipe:
+			(state, UnsupportedExpression)
+		RejectedRecipe:
+			(parsed, RejectedExpression)
+		ParsedRecipe(recipe):
+			if not parsed.has_expression_boundary():
+				(state, UnsupportedExpression)
+			else:
+				(minted, expression) = parsed.mint_recipe(recipe)
+				(minted, ParsedExpression(expression))
+
+
+-- An unindented dot or any indented tail may continue the legacy expression.
+-- Leave the newline unconsumed and defer those shapes in full.
+private pure func has_expression_boundary(state: ParseState) -> Bool:
+	if state.current_kind() == EndOfFileToken:
+		True
+	else if state.current_kind() == NewlineToken:
+		var ahead = 1
+		while state.peek_kind(ahead) == NewlineToken:
+			ahead += 1
+		state.peek_kind(ahead) != DotSymbol and state.peek_kind(ahead) != IndentToken
+	else:
+		False
+
+
+private pure func parse_operators(state: ParseState, line: Int, minimum: Int) -> (ParseState, RecipeParse):
+	(parsed, prefix) = parse_prefix(state, line)
+	match prefix:
+		ParsedRecipe(first):
+			var out = parsed
+			var left = first
+			var parsing = True
+			var failure: Option[RecipeParse] = None
+			while parsing:
+				match Operators.binary_operator(out.current_kind()):
+					Some(operator):
+						if Operators.operator_precedence(operator) < minimum:
+							parsing = False
+						else:
+							(after_right, right_result) = parse_operators(out.advanced(), line, Operators.operator_precedence(operator) + 1)
+							out = after_right
+							match right_result:
+								ParsedRecipe(right):
+									left = { span = left.span.span_covering(right.span), kind = BinaryRecipe(operator, left, right) }
+								_:
+									failure = Some(right_result)
+									parsing = False
+					None:
+						parsing = False
+			match failure:
+				Some(result): (out, result)
+				None: (out, ParsedRecipe(left))
+		_:
+			(parsed, prefix)
+
+
+private pure func parse_prefix(state: ParseState, line: Int) -> (ParseState, RecipeParse):
+	if state.current_kind() != EndOfFileToken and state.span_start_line(state.current_span()) != line:
+		(state, UnsupportedRecipe)
+	else:
+		span = state.current_span()
+		match state.current_kind():
+			IdentifierToken:
+				(advanced, name) = state.consume_referenced_name(NameInStatementName)
+				(advanced, ParsedRecipe({ span = span, kind = NameRecipe(name) }))
+			IntLiteralToken | FloatLiteralToken:
+				match state.current_literal():
+					Some(IntegerValue(magnitude)):
+						(state.advanced(), ParsedRecipe({ span = span, kind = IntegerRecipe(magnitude) }))
+					Some(FloatValue(value)):
+						(state.advanced(), ParsedRecipe({ span = span, kind = FloatRecipe(value) }))
+					_:
+						(state, UnsupportedRecipe)
+			TrueKeyword | FalseKeyword:
+				(state.advanced(), ParsedRecipe({ span = span, kind = BooleanRecipe(state.current_kind() == TrueKeyword) }))
+			VoidKeyword | UnderscoreSymbol:
+				(state.advanced(), ParsedRecipe({ span = span, kind = VoidRecipe }))
+			MinusSymbol | NotKeyword:
+				operator = if state.current_kind() == MinusSymbol:
+					Negate
+				else:
+					LogicalNot
+				(parsed, operand) = parse_prefix(state.advanced(), line)
+				match operand:
+					ParsedRecipe(value):
+						(parsed, ParsedRecipe({ span = span.span_covering(value.span), kind = UnaryRecipe(operator, value) }))
+					_:
+						(parsed, operand)
+			LeftParenSymbol:
+				opened = state.advanced()
+				if opened.current_kind() == RightParenSymbol and opened.span_start_line(opened.current_span()) == line:
+					(opened.advanced(), ParsedRecipe({ span = span.span_covering(opened.current_span()), kind = VoidRecipe }))
+				else:
+					(parsed, inner) = parse_operators(opened, line, Operators.LOWEST_PRECEDENCE)
+					match inner:
+						ParsedRecipe(value):
+							if parsed.current_kind() == RightParenSymbol and parsed.span_start_line(parsed.current_span()) == line:
+								-- Names retain their token span through every grouping layer.
+								group_span = if value.keeps_token_span():
+									value.span
+								else:
+									span.span_covering(parsed.current_span())
+								(parsed.advanced(), ParsedRecipe({ span = group_span, kind = GroupingRecipe(value) }))
+							else if parsed.current_kind() == EndOfFileToken:
+								(parsed.expect_token(RightParenSymbol, ExpectedRightParen(RightParenInGroupedExpression)), RejectedRecipe)
+							else:
+								(parsed, UnsupportedRecipe)
+						_:
+							(parsed, inner)
+			EndOfFileToken | RightParenSymbol:
+				(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
+			_:
+				(state, UnsupportedRecipe)
+
+
+-- The parser and every later walker must loop over binary left spines. Frames
+-- are folded inside out, preserving the frozen parser's postorder ID issuance.
+private pure func mint_recipe(state: ParseState, recipe: ExpressionRecipe) -> (ParseState, Expression):
+	var base = recipe
+	var frames: List[BinaryFrame] = []
+	var walking = True
+	while walking:
+		match base.kind:
+			BinaryRecipe(operator, left, right):
+				frames = frames.append({ span = base.span, operator = operator, right = right })
+				base = left
+			_:
+				walking = False
+	(parsed, value) = state.mint_nonbinary_recipe(base)
+	var out = parsed
+	var left = value
+	for frame in frames.reverse():
+		(after_right, right) = out.mint_recipe(frame.right)
+		kind = operator_expression_kind(frame.operator, left, right)
+		(minted, parent) = after_right.finished_expression(frame.span, kind)
+		out = minted
+		left = parent
+	(out, left)
+
+
+private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRecipe) -> (ParseState, Expression):
+	match recipe.kind:
+		NameRecipe(name):
+			(after_use, use) = state.finished_name_use(name)
+			after_use.finished_expression(recipe.span, NameReference(use))
+		IntegerRecipe(magnitude): state.finished_expression(recipe.span, IntegerLiteral(magnitude))
+		FloatRecipe(value): state.finished_expression(recipe.span, FloatLiteral(value))
+		BooleanRecipe(value): state.finished_expression(recipe.span, BooleanLiteral(value))
+		VoidRecipe: state.finished_expression(recipe.span, VoidValue)
+		UnaryRecipe(operator, operand):
+			(parsed, value) = state.mint_recipe(operand)
+			parsed.finished_expression(recipe.span, Unary(operator, value))
+		GroupingRecipe(inner):
+			(parsed, value) = state.mint_recipe(inner)
+			(parsed, { value | span = recipe.span })
+		BinaryRecipe(_, _, _):
+			-- This recursion boundary is total; mint_recipe owns the binary loop.
+			state.mint_recipe(recipe)
+
+
+-- Mapping is exhaustive: logical and range forms never enter ordinary Binary.
+private pure func operator_expression_kind(operator: Operators.BinaryOperator, left: Expression, right: Expression) -> ExpressionKind:
+	match operator:
+		Operators.OrOperator: ShortCircuit(LogicalOr, left, right)
+		Operators.AndOperator: ShortCircuit(LogicalAnd, left, right)
+		Operators.RangeOperator: RangeExpression(left, right)
+		Operators.AddOperator: Binary(Add, left, right)
+		Operators.SubtractOperator: Binary(Subtract, left, right)
+		Operators.MultiplyOperator: Binary(Multiply, left, right)
+		Operators.DivideOperator: Binary(Divide, left, right)
+		Operators.ModuloOperator: Binary(Modulo, left, right)
+		Operators.EqualOperator: Binary(Equal, left, right)
+		Operators.NotEqualOperator: Binary(NotEqual, left, right)
+		Operators.LessOperator: Binary(Less, left, right)
+		Operators.LessEqualOperator: Binary(LessEqual, left, right)
+		Operators.GreaterOperator: Binary(Greater, left, right)
+		Operators.GreaterEqualOperator: Binary(GreaterEqual, left, right)
+
+
+private pure func keeps_token_span(recipe: ExpressionRecipe) -> Bool:
+	var inner = recipe
+	var walking = True
+	var keeps = False
+	while walking:
+		match inner.kind:
+			GroupingRecipe(grouped): inner = grouped
+			NameRecipe(_):
+				keeps = True
+				walking = False
+			_: walking = False
+	keeps

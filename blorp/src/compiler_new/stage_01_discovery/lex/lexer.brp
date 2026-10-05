@@ -1,18 +1,15 @@
--- The discovery lexer: one source text into the builder's transient token
--- table, interning every identifier as a name and every literal's text as a
--- literal as it goes.
+-- The discovery lexer: one module's text into a `LexedModule`, a pure function
+-- of the module's id and text.
 --
 -- It reproduces the existing compiler's lexer token for token (kinds, spans,
--- literal texts, indentation, newline and lambda-body rules), with four
--- differences in what it records rather than what it recognizes: a `#`
--- directly followed by a name is one `DimensionNameToken` over the plain name
--- (the existing lexer emits `#` and the name, and interns a `#name` spelling;
--- here the token's payload is the plain name, and the `#name` spelling is
--- interned too, paired with the plain one in `DimensionNameRow.sigil_name`);
--- comments are skipped instead of kept
--- as trivia, since no table needs them; literal texts (numbers, strings,
--- docstrings) go to the literals table instead of the name table; and
--- diagnostics are coded rows instead of rendered messages.
+-- indentation, newline and lambda-body rules), with these differences in what
+-- it records rather than what it recognizes: a `#` directly followed by a
+-- name is one `DimensionNameToken` over the plain name (the existing lexer
+-- emits `#` and the name); comments are skipped instead of kept as trivia,
+-- since nothing reads them; literals are checked values (`LiteralValue`) in
+-- the module's own lists instead of texts in a shared table; names are
+-- spellings of the module's own `Spellings`; and diagnostics are coded values
+-- instead of rendered messages.
 --
 -- This module holds the scan loop, symbols and numbers; `layout` decides what
 -- a new line does, and `string_literals`, `interpolation` and `char_literals`
@@ -21,23 +18,19 @@
 -- The source is scanned by byte offset. Columns are not tracked: only a pipe
 -- string's margin needs one, and it is computed from the line start then.
 import:
-	../tables/builder:
-		DiscoveryBuilder,
-		NOT_INTERNED,
-		append_literal,
-		append_name,
-		append_plain_diagnostic,
-		append_syntax_diagnostic,
-		append_token,
-		interned_literal_index,
-		interned_literal_slice_index,
-		interned_name_slice_index,
-		without_transient_tables,
+	../syntax/ids: spelling_index
+	../tables/intern_index: INITIAL_SLOT_COUNT, find_slice, slice_hash, slots_for_texts
+	../tables/name_vocabulary: SEEDED_NAME_SPELLINGS
+	../syntax/checked_values: DecimalFloat, checked_integer, decimal_float
+	../syntax/spellings:
+		Spellings,
+		interned_spelling,
+		new_spellings,
 	../tables/diagnostic_code:
-		PlainSyntaxCode(UnexpectedCharacterDiagnostic),
-		SyntaxDiagnostic(IntegerLiteralOverflow, UnexpectedByte),
-	../tables/ids: SourceId, literal_id_at_row, name_id_at_row, source_id_index
-	../tables/node_builder: append_dimension_name
+		PlainSyntaxCode(InconsistentIndentationDiagnostic, UnexpectedCharacterDiagnostic),
+		SyntaxDiagnostic(FloatLiteralOverflow, IntegerLiteralOverflow, Plain, UnexpectedByte),
+	../tables/ids: ModuleId, SourceId, module_id_index, source_id_at_row
+	../tables/rows: SyntaxDiagnosticAt
 	../tables/source_position: column_at
 	../tables/span: pack_span
 	../tables/token:
@@ -45,31 +38,27 @@ import:
 		GroupDelimiter(ClosesGroup, NotGroupDelimiter, OpensGroup),
 		KEYWORD_KINDS_IN_SEEDED_ORDER,
 		NO_TOKEN_PAYLOAD,
+		Token,
 		TokenKind(
 			ArrowSymbol, AtSymbol, CharLiteralToken, ColonSymbol, CommaSymbol, DedentToken,
 			DimensionNameToken, DocStringToken, DotDotDotSymbol, DotDotSymbol, DotSymbol,
 			EndOfFileToken, EqualEqualSymbol, EqualSymbol, FatArrowSymbol, FloatLiteralToken,
-			GreaterEqualSymbol, GreaterSymbol, HashSymbol, IdentifierToken, IntLiteralToken,
-			InterpolatedStringToken, LeftBraceSymbol, LeftBracketSymbol, LeftParenSymbol,
-			LessEqualSymbol, LessSymbol, MinusEqualSymbol, MinusSymbol, NewlineToken,
-			NormalStringToken, NotEqualSymbol, PercentSymbol, PipeSymbol, PlusEqualSymbol,
-			PlusSymbol, QuestionEqualsSymbol, RightBraceSymbol, RightBracketSymbol,
-			RightParenSymbol, SlashEqualSymbol, SlashSymbol, StarEqualSymbol, StarSymbol,
-			UnderscoreSymbol,
+			GreaterEqualSymbol, GreaterSymbol, HashSymbol, IdentifierToken, IndentToken,
+			IntLiteralToken, InterpolatedStringToken, LeftBraceSymbol, LeftBracketSymbol,
+			LeftParenSymbol, LessEqualSymbol, LessSymbol, MinusEqualSymbol, MinusSymbol,
+			NewlineToken, NormalStringToken, NotEqualSymbol, PercentSymbol, PipeSymbol,
+			PlusEqualSymbol, PlusSymbol, QuestionEqualsSymbol, RejectedFloatToken,
+			RejectedIntegerToken, RightBraceSymbol, RightBracketSymbol, RightParenSymbol,
+			SlashEqualSymbol, SlashSymbol, StarEqualSymbol, StarSymbol, UnderscoreSymbol,
 		),
 		group_delimiter,
 	char_literals: scan_char_literal
-	interpolation:
-		InterpolationSegment,
-		ScannedPart,
-		append_scanned_interpolation,
-		interpolation_parts,
-		interpolation_segments,
+	interpolation: InterpolationSegment, interpolation_scan, interpolation_segments
 	layout:
+		DedentOutcome(DedentedBetweenLevels),
 		LayoutStacks,
 		LineStartPlan,
 		TOP_LEVEL_INDENT,
-		append_line_start_tokens,
 		initial_layout,
 		newline_is_insignificant,
 		opens_lambda_body,
@@ -78,6 +67,11 @@ import:
 		with_indent_popped,
 		with_lambda_opened,
 		with_line_start_applied,
+	lexed_module:
+		InterpolationScan,
+		LexedModule,
+		LexedRun,
+		LiteralValue(FloatValue, IntegerValue, TextValue),
 	scan_support:
 		LiteralScan,
 		ScanStop(StoppedAfterNewline),
@@ -91,6 +85,7 @@ import:
 		is_identifier_continue,
 		is_identifier_start,
 		line_end,
+		line_starts_of,
 		text_at,
 	string_literals:
 		NO_PLAIN_STRING_CLOSE,
@@ -103,11 +98,6 @@ import:
 		scan_raw_string_literal,
 		scan_string_literal,
 
-
----
-The largest integer literal the language accepts: the Int128 maximum.
----
-private INT128_MAX_DECIMAL: String = "170141183460469231731687303715884105727"
 
 -- UTF-8 lead and continuation byte bounds: bytes below
 -- `UTF8_FIRST_MULTIBYTE` are ASCII; two-, three- and four-byte leads start at
@@ -138,43 +128,6 @@ private UTF8_LAST_CONTINUATION: Int = 191
 
 
 -- Numbers and symbols.
-private pure func first_significant_digit(digits: String) -> Int:
-	var index: Int = 0
-
-	while index + 1 < digits.length() and byte_at(digits, index) == '0':
-		index += 1
-
-	index
-
-
----
-Whether the decimal digits `left` denote a value at most `right`'s.
----
-private pure func decimal_at_most(left: String, right: String) -> Bool:
-	left_start: Int = first_significant_digit(left)
-	right_start: Int = first_significant_digit(right)
-	left_length: Int = left.length() - left_start
-	right_length: Int = right.length() - right_start
-
-	if left_length != right_length:
-		left_length < right_length
-	else:
-		var result: Bool = True
-		var index: Int = 0
-
-		while index < left_length:
-			left_digit: Char = byte_at(left, left_start + index)
-			right_digit: Char = byte_at(right, right_start + index)
-
-			if left_digit != right_digit:
-				result = left_digit < right_digit
-				break
-
-			index += 1
-
-		result
-
-
 ---
 Digits with at most one `.` that is followed by a digit.
 ---
@@ -211,6 +164,38 @@ private pure func scan_number(text: String, offset: Int) -> NumberScan:
 	}
 
 
+---
+What checking a scanned number found: a value within the language's range, or
+the digits of a literal outside it (an integer above the Int128 maximum, a
+float that is not finite).
+---
+private union CheckedNumber:
+	AcceptedInteger(Int128)
+	AcceptedFloat(DecimalFloat)
+	RejectedInteger(String)
+	RejectedFloat(String)
+
+
+---
+Checks the number `scan` found at `offset` of `text`.
+---
+private pure func checked_number(text: String, offset: Int, scan: NumberScan) -> CheckedNumber:
+	if scan.saw_dot:
+		digits: String = text.substring(offset, scan.end - offset)
+
+		match decimal_float(digits):
+			Some(value):
+				AcceptedFloat(value)
+			None:
+				RejectedFloat(digits)
+	else:
+		match checked_integer(text, offset, scan.end):
+			Some(value):
+				AcceptedInteger(value)
+			None:
+				RejectedInteger(text.substring(offset, scan.end - offset))
+
+
 private fixed record SymbolMatch {
 	kind: TokenKind,
 	width: Int
@@ -227,8 +212,8 @@ private UNREACHABLE_SYMBOL_MATCH: SymbolMatch = {
 
 
 ---
-Whether a symbol starts at `offset`. Checked before `symbol_at` so that
-matching a symbol allocates nothing: an `Option` of a struct is boxed.
+Whether a symbol starts at `offset`. Checked before `symbol_at` so the
+matching result needs no additional `Option` wrapper.
 ---
 private pure func starts_symbol(text: String, offset: Int) -> Bool:
 	c: Char = byte_at(text, offset)
@@ -494,90 +479,93 @@ private pure func utf8_sequence_width(text: String, offset: Int) -> Option[Int]:
 			None
 
 
--- Interning.
+-- Keywords.
+-- Derived once per lexing run, then read immutably by keyword queries.
+-- The bootstrap constant evaluator cannot build an index through library
+-- calls, so this setup belongs to the invocation rather than a computed global.
+private record KeywordIndex {
+	texts: List[String],
+	slots: List[Int]
+}
+
+
+private pure func keyword_kind(keywords: KeywordIndex, text: String, start: Int, end: Int) -> TokenKind:
+	index: Int = find_slice(keywords.texts, keywords.slots, text, start, end, slice_hash(text, start, end))
+	KEYWORD_KINDS_IN_SEEDED_ORDER.get_or(index - FIRST_KEYWORD_NAME_INDEX, IdentifierToken)
+
+
 ---
-Whether a name follows the `#` just before `offset` directly, making the
-two one dimension name: an identifier that is neither a keyword nor the
-lone `_`. Otherwise the `#` stays a `HashSymbol` for the parser to diagnose.
+Whether a name follows the `#` directly: an identifier that is neither a
+keyword nor the lone `_`. Otherwise the `#` stays a `HashSymbol`.
 ---
-private pure func dimension_name_follows(
-	builder: DiscoveryBuilder,
-	text: String,
-	offset: Int,
-) -> Bool:
+private pure func dimension_name_follows(keywords: KeywordIndex, text: String, offset: Int) -> Bool:
 	if offset >= text.length() or not is_identifier_start(byte_at(text, offset)):
 		False
 	else:
 		end: Int = identifier_end(text, offset)
-		lone_underscore: Bool = end - offset == 1 and byte_at(text, offset) == '_'
-		name_index: Int = builder.interned_name_slice_index(text, offset, end)
-		not lone_underscore and not is_keyword_name_index(name_index)
+		(
+			not (end - offset == 1 and byte_at(text, offset) == '_')
+			and keyword_kind(keywords, text, offset, end) == IdentifierToken
+		)
+
+
+-- Entry points.
+---
+The source a module's spans point into. A module is its source: discovery
+admits one source for each module it opens, in the same order
+(`tables/builder`, `open_module`), so the module's index is its source's.
+---
+private pure func source_of(module: ModuleId) -> SourceId:
+	source_id_at_row(module.module_id_index())
 
 
 ---
-Whether a name index is a keyword's: keywords are the seeded names
-`FIRST_KEYWORD_NAME_INDEX ..= LAST_KEYWORD_NAME_INDEX`.
+Lexes the whole `text` of `module`. Every problem is a diagnostic in the
+result and an unrecognized byte never stops the lexer; the same module and
+text always give the same result, whatever was lexed before.
 ---
-private pure func is_keyword_name_index(name_index: Int) -> Bool:
-	name_index >= FIRST_KEYWORD_NAME_INDEX and name_index <= LAST_KEYWORD_NAME_INDEX
-
-
----
-The keyword kind of a keyword's name index (see `is_keyword_name_index`);
-the fallback for any other index is unreachable.
----
-private pure func keyword_kind_at_name_index(name_index: Int) -> TokenKind:
-	KEYWORD_KINDS_IN_SEEDED_ORDER.get_or(name_index - FIRST_KEYWORD_NAME_INDEX, IdentifierToken)
-
-
----
-The name index of the last keyword spelling in the seeded vocabulary; any
-larger index is not a keyword.
----
-private LAST_KEYWORD_NAME_INDEX: Int = FIRST_KEYWORD_NAME_INDEX + KEYWORD_KINDS_IN_SEEDED_ORDER.length() - 1
-
-
----
-Lexes source `source` of `builder` into its token table, replacing the
-previous module's tokens. Identifiers are interned as names (and `#name` as
-well after a `#`, the spelling the parser gives a dimension), literal texts as
-literals, and every problem is a diagnostic row; an unrecognized byte never
-stops the lexer.
----
-pure func lex_source(builder: DiscoveryBuilder, source: SourceId) -> DiscoveryBuilder:
-	text: String = builder.source_texts
-		.get(source.source_id_index())
-		.get_or("")
-	cleared: DiscoveryBuilder = builder.without_transient_tables()
-	cleared.lex_text_range(
-		source,
+pure func lex_module(module: ModuleId, text: String) -> LexedModule:
+	run: LexedRun = lex_text_range(
+		source_of(module),
 		text,
+		new_spellings(module),
 		{
 			start = 0,
 			end = text.length(),
 			position = AtLineStart
 		},
 	)
+	{
+		module = module,
+		source = {
+			text = text,
+			literals = run.literals,
+			interpolations = run.interpolations
+		},
+		tokens = run.tokens,
+		spellings = run.spellings,
+		line_starts = line_starts_of(text),
+		diagnostics = run.diagnostics
+	}
 
 
 ---
-Lexes the text of an interpolation hole, bytes `start .. end` of `source`,
-appending its tokens and an end-of-file token after the tokens already in
-the table. The parser moves its cursor there to parse the hole and back
-afterwards. A hole lies within one line, so its tokens hold no layout.
+Lexes the text of an interpolation hole, bytes `start .. end` of `module`'s
+`text`, into a run of its own that ends in an end-of-file token. `spellings`
+are the module's after the lexing before it; the run returns them with the
+hole's names added. A hole lies within one line, so its tokens hold no layout.
 ---
-pure func lex_interpolation_hole(
-	builder: DiscoveryBuilder,
-	source: SourceId,
+pure func lex_hole(
+	module: ModuleId,
+	text: String,
+	spellings: Spellings,
 	start: Int,
 	end: Int,
-) -> DiscoveryBuilder:
-	text: String = builder.source_texts
-		.get(source.source_id_index())
-		.get_or("")
-	builder.lex_text_range(
-		source,
+) -> LexedRun:
+	lex_text_range(
+		source_of(module),
 		text,
+		spellings,
 		{
 			start = start,
 			end = end,
@@ -590,7 +578,7 @@ pure func lex_interpolation_hole(
 Where a lexed range starts: at the start of a line, where indentation is
 measured, or after other tokens of its line (an interpolation hole).
 ---
-enum RangeStart:
+private enum RangeStart:
 	AtLineStart
 	WithinLine
 
@@ -598,7 +586,7 @@ enum RangeStart:
 ---
 The bytes a lexing run covers and where the first of them sits.
 ---
-fixed record LexRange {
+private fixed record LexRange {
 	start: Int,
 	end: Int,
 	position: RangeStart
@@ -606,15 +594,26 @@ fixed record LexRange {
 
 
 private pure func lex_text_range(
-	builder: DiscoveryBuilder,
 	source: SourceId,
 	text: String,
+	initial_spellings: Spellings,
 	range: LexRange,
-) -> DiscoveryBuilder:
+) -> LexedRun:
+	keyword_texts: List[String] = SEEDED_NAME_SPELLINGS.take(
+		FIRST_KEYWORD_NAME_INDEX + KEYWORD_KINDS_IN_SEEDED_ORDER.length(),
+	)
+	keywords: KeywordIndex = {
+		texts = keyword_texts,
+		slots = slots_for_texts(keyword_texts, INITIAL_SLOT_COUNT)
+	}
 	length: Int = text.length()
 	end_offset: Int = range.end
 	within_line: Bool = range.position == WithinLine
-	var out: DiscoveryBuilder = builder
+	var spellings: Spellings = initial_spellings
+	var tokens: List[Token] = []
+	var literals: List[LiteralValue] = []
+	var interpolations: List[InterpolationScan] = []
+	var diagnostics: List[SyntaxDiagnosticAt] = []
 	var offset: Int = range.start
 	var line_start: Int = line_start_before(text, range.start)
 	var layout: LayoutStacks = initial_layout()
@@ -643,7 +642,34 @@ private pure func lex_text_range(
 				pending_newline,
 				previous_kind,
 			)
-			out = out.append_line_start_tokens(source, plan, indent_start, offset)
+
+			if plan.emits_newline:
+				tokens = tokens.append({
+					kind = NewlineToken,
+					span = pack_span(source, offset, offset),
+					payload = NO_TOKEN_PAYLOAD,
+				})
+
+			if plan.opens_indent:
+				tokens = tokens.append({
+					kind = IndentToken,
+					span = pack_span(source, indent_start, offset),
+					payload = NO_TOKEN_PAYLOAD,
+				})
+
+			for dedent in 0..plan.dedent_count:
+				tokens = tokens.append({
+					kind = DedentToken,
+					span = pack_span(source, offset, offset),
+					payload = NO_TOKEN_PAYLOAD,
+				})
+
+			if plan.dedent == DedentedBetweenLevels:
+				diagnostics = diagnostics.append({
+					span = pack_span(source, offset, offset),
+					diagnostic = Plain(InconsistentIndentationDiagnostic),
+				})
+
 			layout = layout.with_line_start_applied(plan)
 			pending_newline = plan.pending_newline
 			at_line_start = plan.at_line_start
@@ -672,16 +698,11 @@ private pure func lex_text_range(
 			offset = after_blanks(text, offset)
 		else if c == '\"' and plain_string_close(text, offset) != NO_PLAIN_STRING_CLOSE:
 			-- The common string: no escape, hole or line break before its
-			-- closing quote. Its text is the bytes between the quotes, looked
-			-- up in place, so a repeated string allocates nothing.
+			-- closing quote. Its text is the bytes between the quotes.
 			close: Int = plain_string_close(text, offset)
-			var payload: Int = out.interned_literal_slice_index(text, offset + 1, close)
-
-			if payload == NOT_INTERNED:
-				payload = out.literals.length()
-				out = out.append_literal(text.substring(offset + 1, close - offset - 1))
-
-			out = out.append_token({
+			payload: Int = literals.length()
+			literals = literals.append(TextValue(text.substring(offset + 1, close - offset - 1)))
+			tokens = tokens.append({
 				kind = NormalStringToken,
 				span = pack_span(source, offset, close + 1),
 				payload = payload,
@@ -725,10 +746,11 @@ private pure func lex_text_range(
 					None:
 						failed_scan(offset, [])
 
-			for diagnostic in scan.diagnostics:
-				diagnostic_span = pack_span(source, diagnostic.start, diagnostic.end)
-
-				out = out.append_syntax_diagnostic(diagnostic_span, diagnostic.diagnostic)
+			for pending in scan.diagnostics:
+				diagnostics = diagnostics.append({
+					span = pack_span(source, pending.start, pending.end),
+					diagnostic = pending.diagnostic,
+				})
 
 			offset = scan.end
 			line_start = line_start_after(text, token_start, offset, line_start)
@@ -736,13 +758,9 @@ private pure func lex_text_range(
 
 			match scan.literal:
 				TextLiteral(kind, literal_text):
-					var payload: Int = out.interned_literal_index(literal_text)
-
-					if payload == NOT_INTERNED:
-						payload = out.literals.length()
-						out = out.append_literal(literal_text)
-
-					out = out.append_token({
+					payload: Int = literals.length()
+					literals = literals.append(TextValue(literal_text))
+					tokens = tokens.append({
 						kind = kind,
 						span = token_span,
 						payload = payload,
@@ -767,13 +785,18 @@ private pure func lex_text_range(
 						token_start,
 						scan.end,
 					)
-					parts: List[ScannedPart] = interpolation_parts(text, segments)
-					interpolation: Int = out.interpolations.length()
-					out = out.append_scanned_interpolation(text, parts)
-					out = out.append_token({
+					payload: Int = interpolations.length()
+					interpolations = interpolations.append(
+						interpolation_scan(
+							source,
+							text,
+							segments,
+						),
+					)
+					tokens = tokens.append({
 						kind = kind,
 						span = token_span,
-						payload = interpolation,
+						payload = payload,
 					})
 					previous_kind = kind
 					line_has_token = True
@@ -783,7 +806,7 @@ private pure func lex_text_range(
 						at_line_start = True
 						line_has_token = False
 				CodepointLiteral(codepoint):
-					out = out.append_token({
+					tokens = tokens.append({
 						kind = CharLiteralToken,
 						span = token_span,
 						payload = codepoint,
@@ -804,115 +827,101 @@ private pure func lex_text_range(
 			and not (offset + 1 < length and is_identifier_continue(byte_at(text, offset + 1)))
 		):
 			offset += 1
-			out = out.append_token({
+			tokens = tokens.append({
 				kind = UnderscoreSymbol,
 				span = pack_span(source, token_start, offset),
 				payload = NO_TOKEN_PAYLOAD,
 			})
 			previous_kind = UnderscoreSymbol
 			line_has_token = True
-		else if is_identifier_start(c):
-			end: Int = identifier_end(text, offset)
-			word_span = pack_span(source, offset, end)
-			-- Looked up by the bytes it spans: only a new spelling allocates.
-			var name_index: Int = out.interned_name_slice_index(text, offset, end)
+		else if (
+			is_identifier_start(c)
+			or c == '#' and dimension_name_follows(keywords, text, offset + 1)
+		):
+			-- A word, or a `#` and the name directly after it (one token over both).
+			is_dimension_name: Bool = c == '#'
 
-			if name_index == NOT_INTERNED:
-				name_index = out.name_spellings.length()
-				out = out.append_name(text.substring(offset, end - offset))
-
-			offset = end
-
-			if is_keyword_name_index(name_index):
-				keyword_kind: TokenKind = keyword_kind_at_name_index(name_index)
-				out = out.append_token({
-					kind = keyword_kind,
-					span = word_span,
-					payload = NO_TOKEN_PAYLOAD,
-				})
-				previous_kind = keyword_kind
+			name_start: Int = if is_dimension_name:
+				offset + 1
 			else:
-				out = out.append_token({
-					kind = IdentifierToken,
-					span = word_span,
-					payload = name_index,
-				})
-				previous_kind = IdentifierToken
+				offset
 
-			line_has_token = True
-		else if c == '#' and out.dimension_name_follows(text, offset + 1):
-			name_start: Int = offset + 1
 			end: Int = identifier_end(text, name_start)
-			dimension_span = pack_span(source, offset, end)
-			var name_index: Int = out.interned_name_slice_index(text, name_start, end)
+			word_span = pack_span(source, offset, end)
 
-			if name_index == NOT_INTERNED:
-				name_index = out.name_spellings.length()
-				out = out.append_name(text.substring(name_start, end - name_start))
+			kind: TokenKind = if is_dimension_name:
+				DimensionNameToken
+			else:
+				keyword_kind(keywords, text, name_start, end)
 
-			-- The `#N` spelling too, as the existing lexer interns a dimension
-			-- name, and the row that pairs it with `N` for the legacy adapter.
-			if out.interned_name_slice_index(text, offset, end) == NOT_INTERNED:
-				sigil_index: Int = out.name_spellings.length()
-				out = out.append_name(text.substring(offset, end - offset))
-				out = out.append_dimension_name({
-					name = name_id_at_row(name_index),
-					sigil_name = name_id_at_row(sigil_index),
-				})
+			var payload: Int = NO_TOKEN_PAYLOAD
 
-			offset = end
+			if kind == IdentifierToken or kind == DimensionNameToken:
+				(interned, name_spelling) = interned_spelling(spellings, text, name_start, end)
+				spellings = interned
+				payload = spelling_index(name_spelling)
 
-			out = out.append_token({
-				kind = DimensionNameToken,
-				span = dimension_span,
-				payload = name_index,
+			tokens = tokens.append({
+				kind = kind,
+				span = word_span,
+				payload = payload,
 			})
-			previous_kind = DimensionNameToken
+			offset = end
+			previous_kind = kind
+
 			line_has_token = True
 		else if is_digit_byte(c):
 			number: NumberScan = scan_number(text, offset)
 			number_span = pack_span(source, offset, number.end)
-			digit_count: Int = number.end - offset
-			var payload: Int = out.interned_literal_slice_index(text, offset, number.end)
 
-			if payload == NOT_INTERNED:
-				payload = out.literals.length()
-				out = out.append_literal(text.substring(offset, digit_count))
+			-- A literal the lexer rejects has a kind of its own with no payload,
+			-- so a literal token always indexes a checked value, and the
+			-- diagnostic is the one place its digits are kept.
+			number_token: Token = match checked_number(text, offset, number):
+				AcceptedInteger(value):
+					literals = literals.append(IntegerValue(value))
+					{
+						kind = IntLiteralToken,
+						span = number_span,
+						payload = literals.length() - 1
+					}
+				AcceptedFloat(value):
+					literals = literals.append(FloatValue(value))
+					{
+						kind = FloatLiteralToken,
+						span = number_span,
+						payload = literals.length() - 1
+					}
+				RejectedInteger(digits):
+					diagnostics = diagnostics.append({
+						span = number_span,
+						diagnostic = IntegerLiteralOverflow(digits),
+					})
+					{
+						kind = RejectedIntegerToken,
+						span = number_span,
+						payload = NO_TOKEN_PAYLOAD
+					}
+				RejectedFloat(digits):
+					diagnostics = diagnostics.append({
+						span = number_span,
+						diagnostic = FloatLiteralOverflow(digits),
+					})
+					{
+						kind = RejectedFloatToken,
+						span = number_span,
+						payload = NO_TOKEN_PAYLOAD
+					}
 
-			-- Only a literal as long as the Int128 maximum can exceed it.
-			overflows: Bool = (
-				not number.saw_dot
-				and digit_count >= INT128_MAX_DECIMAL.length()
-				and not decimal_at_most(
-					text.substring(offset, digit_count),
-					INT128_MAX_DECIMAL,
-				)
-			)
+			tokens = tokens.append(number_token)
 			offset = number.end
-
-			if overflows:
-				out = out.append_syntax_diagnostic(
-					number_span,
-					IntegerLiteralOverflow(literal_id_at_row(payload)),
-				)
-
-			kind: TokenKind = if number.saw_dot:
-				FloatLiteralToken
-			else:
-				IntLiteralToken
-
-			out = out.append_token({
-				kind = kind,
-				span = number_span,
-				payload = payload,
-			})
-			previous_kind = kind
+			previous_kind = number_token.kind
 			line_has_token = True
 		else:
 			if starts_symbol(text, offset):
 				found: SymbolMatch = symbol_at(text, offset)
 				offset += found.width
-				out = out.append_token({
+				tokens = tokens.append({
 					kind = found.kind,
 					span = pack_span(source, token_start, offset),
 					payload = NO_TOKEN_PAYLOAD,
@@ -925,32 +934,38 @@ private pure func lex_text_range(
 				-- report a byte that starts none by value.
 				match utf8_sequence_width(text, offset):
 					Some(width):
-						out = out.append_plain_diagnostic(
-							UnexpectedCharacterDiagnostic,
-							pack_span(source, offset, offset + width),
-						)
+						diagnostics = diagnostics.append({
+							span = pack_span(source, offset, offset + width),
+							diagnostic = Plain(UnexpectedCharacterDiagnostic),
+						})
 						offset += width
 					None:
-						out = out.append_syntax_diagnostic(
-							pack_span(source, offset, offset),
-							UnexpectedByte(c),
-						)
+						diagnostics = diagnostics.append({
+							span = pack_span(source, offset, offset),
+							diagnostic = UnexpectedByte(c),
+						})
 						offset += 1
 
 	while layout.top_indent() > TOP_LEVEL_INDENT:
-		out = out.append_token({
+		tokens = tokens.append({
 			kind = DedentToken,
 			span = pack_span(source, offset, offset),
 			payload = NO_TOKEN_PAYLOAD,
 		})
 		layout = layout.with_indent_popped()
 
-	out = out.append_token({
+	tokens = tokens.append({
 		kind = EndOfFileToken,
 		span = pack_span(source, offset, offset),
 		payload = NO_TOKEN_PAYLOAD,
 	})
-	out
+	{
+		spellings = spellings,
+		tokens = tokens,
+		literals = literals,
+		interpolations = interpolations,
+		diagnostics = diagnostics
+	}
 
 
 ---

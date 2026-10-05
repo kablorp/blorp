@@ -27,6 +27,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 		isolated_test_owners: list[str] | None = None,
 		owner_roots: list[str] | None = None,
 		fixture_directories: list[str] | None = None,
+		restricted_symbols: dict[str, dict[str, object]] | None = None,
 	) -> None:
 		for owner in owner_roots or []:
 			(root / "blorp/src" / owner).mkdir(parents=True, exist_ok=True)
@@ -41,6 +42,7 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 			json.dumps(
 				{
 					"version": 1,
+					"restricted_symbols": restricted_symbols or {},
 					"source_root": "blorp/src",
 					"test_root": "blorp/test",
 					"owner_roots": ["compiler", "run", "format", "test", *(owner_roots or [])],
@@ -484,6 +486,182 @@ class BlorpSourceLayoutTests(unittest.TestCase):
 
 			self.assertNotEqual(result.returncode, 0)
 			self.assertIn("isolated test owner is not a registered owner: missing", result.stderr)
+
+	def write_restricted_mint(self, root: Path, importer: str, import_text: str) -> None:
+		"""A mint module whose minting names only `parse/parse_state.brp` and
+		anything under `lex/` may import, and `importer` importing it."""
+		self.write_layout(
+			root,
+			restricted_symbols={
+				"compiler/syntax/ids.brp": {
+					"symbols": ["IdMint", "new_id_mint", "minted_*"],
+					"importers": ["compiler/parse/parse_state.brp", "compiler/lex/"],
+				},
+			},
+		)
+		for directory in ("syntax", "parse", "lex", "resolve"):
+			(root / "blorp/src/compiler" / directory).mkdir(parents=True, exist_ok=True)
+		(root / "blorp/src/compiler/syntax/ids.brp").write_text("", encoding="utf-8")
+		(root / "blorp/src/compiler" / importer).write_text(import_text, encoding="utf-8")
+
+	def test_rejects_a_restricted_symbol_imported_outside_its_importers(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(
+				root,
+				"resolve/walk.brp",
+				"import:\n\t../syntax/ids:\n\t\tExpressionId,\n\t\tminted_expression,\n",
+			)
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn(
+				"restricted import: compiler/resolve/walk.brp imports minted_expression "
+				"from compiler/syntax/ids.brp",
+				result.stderr,
+			)
+			self.assertNotIn("ExpressionId", result.stderr)
+
+	def test_rejects_a_restricted_module_imported_without_a_symbol_list(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(root, "resolve/walk.brp", "import:\n\t../syntax/ids as Ids\n")
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn(
+				"restricted import: compiler/resolve/walk.brp imports all of compiler/syntax/ids.brp",
+				result.stderr,
+			)
+
+	def test_accepts_unrestricted_symbols_from_anywhere(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(
+				root,
+				"resolve/walk.brp",
+				"import:\n\t../syntax/ids: ExpressionId, Kind(A, minted_lookalike), expression_module\n",
+			)
+
+			result = self.run_checker(root)
+
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def test_accepts_restricted_symbols_in_their_importers(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(
+				root,
+				"parse/parse_state.brp",
+				"import:\n\t../syntax/ids: IdMint, minted_expression, new_id_mint\n",
+			)
+			(root / "blorp/src/compiler/lex/lexer.brp").write_text(
+				"import:\n\t../syntax/ids:\n\t\tminted_name_use,\n",
+				encoding="utf-8",
+			)
+
+			result = self.run_checker(root)
+
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def test_rejects_a_restricted_symbol_selected_under_an_alias(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(
+				root,
+				"parse/declarations.brp",
+				"import:\n\t../syntax/ids: IdMint as Mint\n",
+			)
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn(
+				"restricted import: compiler/parse/declarations.brp imports IdMint",
+				result.stderr,
+			)
+
+	def test_namespace_alias_with_selected_readers_cannot_bypass_restriction(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(root, "resolve/walk.brp", "import:\n\t../syntax/ids as Ids: ExpressionId\n")
+			result = self.run_checker(root)
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("imports all of compiler/syntax/ids.brp", result.stderr)
+
+	def test_multiline_symbols_need_no_comma_between_lines(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(root, "resolve/walk.brp", "import:\n\t../syntax/ids:\n\t\tExpressionId\n\t\tminted_expression as make\n")
+			result = self.run_checker(root)
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("imports minted_expression", result.stderr)
+
+	def test_comment_on_namespace_import_cannot_hide_it(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(root, "resolve/walk.brp", "import:\n\t../syntax/ids as Ids -- namespace\n")
+			result = self.run_checker(root)
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("imports all of compiler/syntax/ids.brp", result.stderr)
+
+	def test_symbol_matching_ignores_aliases_variants_and_comments(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(root, "resolve/walk.brp", "import:\n\t../syntax/ids:\n\t\tExpressionId as IdMint -- minted_expression\n\t\tKind(A, minted_lookalike)\n\t\tIdMintReader, new_id_mint_reader, reissued\n")
+			result = self.run_checker(root)
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def test_spelling_constructor_has_its_own_importer_boundary(self) -> None:
+		for importer, selection, allowed in [
+			("syntax/spellings.brp", "spelling_id", True),
+			("parse/parse_state.brp", "spelling_id", False),
+			("resolve/walk.brp", "spelling_id as create", False),
+			("syntax/spellings.brp", "IdMint", False),
+			("parse/parse_state.brp", "IdMint", True),
+			("parse/parse_state.brp", None, False),
+			("syntax/spellings.brp", None, False),
+			("resolve/walk.brp", "SpellingId, spelling_module, spelling_index", True),
+		]:
+			with self.subTest(importer=importer, selection=selection), tempfile.TemporaryDirectory() as directory:
+				root = Path(directory)
+				self.write_restricted_mint(root, importer, "import:\n\t../syntax/ids" + (f": {selection}" if selection is not None else " as Ids") + "\n")
+				manifest_path = root / "blorp/source_ownership.json"
+				manifest = json.loads(manifest_path.read_text())
+				manifest["restricted_symbols"]["compiler/syntax/ids.brp"]["symbol_importers"] = {
+					"spelling_id": ["compiler/syntax/spellings.brp"],
+				}
+				manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+				result = self.run_checker(root)
+				self.assertEqual(result.returncode == 0, allowed, result.stderr)
+
+	def test_tests_can_import_restricted_constructors(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_restricted_mint(root, "resolve/walk.brp", "")
+			(root / "blorp/test/compiler/test_mint.brp").write_text(
+				"import:\n\t../../src/compiler/syntax/ids: IdMint, minted_expression, new_id_mint\n",
+				encoding="utf-8",
+			)
+			result = self.run_checker(root)
+			self.assertEqual(result.returncode, 0, result.stderr)
+
+	def test_rejects_a_restriction_on_a_module_that_does_not_exist(self) -> None:
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			self.write_layout(
+				root,
+				restricted_symbols={
+					"compiler/syntax/missing.brp": {"symbols": ["x"], "importers": []},
+				},
+			)
+
+			result = self.run_checker(root)
+
+			self.assertNotEqual(result.returncode, 0)
+			self.assertIn("restricted module does not exist: compiler/syntax/missing.brp", result.stderr)
 
 
 if __name__ == "__main__":

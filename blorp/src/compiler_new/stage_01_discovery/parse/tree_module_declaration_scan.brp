@@ -1,0 +1,115 @@
+-- Bounded declaration evidence, not module acceptance. Globals and rejected
+-- declarations stop the scan at their returned cursor. The explicit M4 opt-in
+-- completes only its supported same-line globals; no path accepts a ModuleSyntax.
+import:
+	../syntax/module_syntax: Documentation
+	../tables/token: TokenKind(NewlineToken, EndOfFileToken)
+	parse_state: ParseState, current_kind, position, advanced
+	tree_module_documentation_parser: parse_module_preamble
+	tree_global_header_parser: GlobalHeaderPreview, DeferredInitializerStart
+	tree_global_parser:
+		GlobalCompletion(CompletedGlobal, DeferredGlobal), complete_atomic_global,
+		GlobalExpressionCompletion(CompletedExpressionGlobal, DeferredExpressionGlobal, RejectedExpressionGlobal), complete_expression_global
+	tree_declaration_preview_parser:
+		DeclarationPreview(GlobalDeclarationPreview), DeclarationPreviewParse(ParsedDeclarationPreview, DeferredGlobalInitializer, RejectedGlobalInitializer, RejectedDeclarationPreview), parse_declaration_preview
+
+
+union ModuleDeclarationScanStop:
+	ReachedEndOfSource
+	StoppedAtGlobalInitializer(GlobalHeaderPreview)
+	StoppedAtRejectedGlobalInitializer(DeferredInitializerStart)
+	StoppedAtRejectedDeclaration
+	StoppedWithoutDeclarationProgress
+
+
+record ModuleDeclarationPreviewScan {
+	documentation: Option[Documentation],
+	declarations: List[DeclarationPreview],
+	stop: ModuleDeclarationScanStop
+}
+
+
+private enum GlobalCompletionPolicy:
+	KeepDeferredInitializers
+	CompleteSameLineAtomicInitializers
+	CompleteSameLineExpressions
+
+
+pure func scan_module_declaration_previews(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
+	scan_module_declaration_prefix(state, KeepDeferredInitializers)
+
+
+pure func scan_module_declaration_prefix_with_atomic_globals(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
+	scan_module_declaration_prefix(state, CompleteSameLineAtomicInitializers)
+
+
+pure func scan_module_declaration_prefix_with_expressions(state: ParseState) -> (ParseState, ModuleDeclarationPreviewScan):
+	scan_module_declaration_prefix(state, CompleteSameLineExpressions)
+
+
+private pure func scan_module_declaration_prefix(state: ParseState, globals: GlobalCompletionPolicy) -> (ParseState, ModuleDeclarationPreviewScan):
+	(after_preamble, documentation) = parse_module_preamble(state)
+	var out: ParseState = after_preamble
+	var declarations: List[DeclarationPreview] = []
+	var stop: ModuleDeclarationScanStop = ReachedEndOfSource
+	var scanning: Bool = True
+
+	while scanning and out.current_kind() != EndOfFileToken:
+		before: Int = out.position()
+		(parsed, result) = parse_declaration_preview(out)
+		out = parsed
+		match result:
+			ParsedDeclarationPreview(declaration):
+				-- A successful leaf must consume declaration syntax. Do not hide
+				-- an invariant violation by advancing or collecting stale evidence.
+				if out.position() == before:
+					stop = StoppedWithoutDeclarationProgress
+					scanning = False
+				else:
+					declarations = declarations.append(declaration)
+					out = out.skip_newlines()
+			DeferredGlobalInitializer(preview):
+				if globals == KeepDeferredInitializers:
+					stop = StoppedAtGlobalInitializer(preview)
+					scanning = False
+				else if globals == CompleteSameLineExpressions:
+					(completed, completion) = complete_expression_global(out, preview)
+					out = completed
+
+					match completion:
+						CompletedExpressionGlobal(declaration):
+							declarations = declarations.append(
+								GlobalDeclarationPreview(declaration),
+							)
+							out = out.skip_newlines()
+						DeferredExpressionGlobal:
+							stop = StoppedAtGlobalInitializer(preview)
+							scanning = False
+						RejectedExpressionGlobal:
+							stop = StoppedAtRejectedGlobalInitializer(preview.initializer)
+							scanning = False
+				else:
+					(completed, completion) = complete_atomic_global(out, preview)
+					out = completed
+					match completion:
+						CompletedGlobal(declaration):
+							declarations = declarations.append(GlobalDeclarationPreview(declaration))
+							out = out.skip_newlines()
+						DeferredGlobal:
+							stop = StoppedAtGlobalInitializer(preview)
+							scanning = False
+			RejectedGlobalInitializer(start):
+				stop = StoppedAtRejectedGlobalInitializer(start)
+				scanning = False
+			RejectedDeclarationPreview:
+				stop = StoppedAtRejectedDeclaration
+				scanning = False
+
+	(out, { documentation = documentation, declarations = declarations, stop = stop })
+
+
+private pure func skip_newlines(state: ParseState) -> ParseState:
+	var out: ParseState = state
+	while out.current_kind() == NewlineToken:
+		out = out.advanced()
+	out

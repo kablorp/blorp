@@ -1,0 +1,227 @@
+-- Complete syntax wording from retained tree rejection context. Identity and
+-- span corruption fail explicitly; no spelling or location is reconstructed.
+import:
+	../parse/rejected_preview:
+		RejectedPreview,
+		rejected_definitions,
+		rejected_diagnostics,
+		rejected_line_starts,
+		rejected_module,
+		rejected_source,
+		rejected_spellings,
+	../syntax/definitions: Definition(FieldDefinition)
+	../syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken, UnknownEscape, IntegerLiteralOverflow, FloatLiteralOverflow, UnexpectedByte, ReservedKeywordAsName, UnknownAnnotation, ConcurrentDuplicateParameter, ConcurrentUnknownParameter, ConcurrentForUnknownParameter, DuplicateField, DuplicateFieldGiven), SyntaxDiagnosticAt
+	../syntax/ids: definition_local_index, definition_module
+	../syntax/spellings: spelling_text
+	../tables/ids: module_id_index, source_id_index
+	../tables/source_position: column_at
+	../tables/span: Span, span_end, span_source, span_start, span_length
+	render: RenderedDiagnostic, render_duplicate_field, render_plain_syntax, render_expected_token, render_unknown_escape, render_integer_literal_overflow, render_float_literal_overflow, render_unexpected_byte, render_reserved_keyword_as_name, render_unknown_annotation, render_concurrent_duplicate_parameter, render_concurrent_unknown_parameter, render_concurrent_for_unknown_parameter, render_duplicate_field_given
+
+
+enum RejectedRenderError:
+	InvalidDiagnosticSpan
+	InvalidGivenFieldSpan
+	MissingDiagnosticSpelling
+	NotDuplicateField
+	CrossModuleDefinition
+	MissingDefinition
+	WrongDefinitionKind
+	MismatchedDefinitionId
+	InvalidFieldSpan
+	ForwardFieldReference
+	MissingFieldSpelling
+
+
+pure func render_rejected_duplicate_field(
+	rejected: RejectedPreview,
+	diagnostic: SyntaxDiagnosticAt,
+) -> Result[RenderedDiagnostic, RejectedRenderError]:
+	match diagnostic.diagnostic:
+		DuplicateField(first):
+			module_index: Int = rejected
+				.rejected_module()
+				.module_id_index()
+
+			if (
+				first
+					.definition_module()
+					.module_id_index() != module_index
+			):
+				Err(CrossModuleDefinition)
+			else:
+				match (
+					rejected
+						.rejected_definitions()
+						.get(first.definition_local_index())
+				):
+					None:
+						Err(MissingDefinition)
+					Some(FieldDefinition(field)):
+						if (
+							field.id
+								.definition_module()
+								.module_id_index() != module_index
+							or field.id.definition_local_index() != first.definition_local_index()
+						):
+							Err(MismatchedDefinitionId)
+						else if (
+							not valid_span(
+								field.name.span,
+								module_index,
+								rejected.rejected_source().text.length(),
+							)
+							or not valid_span(
+								diagnostic.span,
+								module_index,
+								rejected.rejected_source().text.length(),
+							)
+						):
+							Err(InvalidFieldSpan)
+						else if field.name.span.span_end() > diagnostic.span.span_start():
+							Err(ForwardFieldReference)
+						else:
+							match (
+								rejected
+									.rejected_spellings()
+									.spelling_text(field.name.spelling)
+							):
+								None:
+									Err(MissingFieldSpelling)
+								Some(name):
+									var line: Int = 0
+									var line_start: Int = 0
+
+									for start in rejected.rejected_line_starts():
+										if start > field.name.span.span_start():
+											break
+
+										line += 1
+										line_start = start
+
+									column: Int = column_at(
+										rejected.rejected_source().text,
+										line_start,
+										field.name.span.span_start(),
+									)
+									Ok(
+										render_duplicate_field(
+											name,
+											line.to_string() + ":" + column.to_string(),
+										),
+									)
+					Some(_):
+						Err(WrongDefinitionKind)
+		_:
+			Err(NotDuplicateField)
+
+
+private pure func valid_span(span: Span, module_index: Int, source_length: Int) -> Bool:
+	(
+		span
+			.span_source()
+			.source_id_index() == module_index
+		and span.span_start() < span.span_end()
+		and span.span_end() <= source_length
+	)
+
+
+-- Every returned row retains the authored span and ordered wording. Columns
+-- use the same tab-aware byte calculation as the table renderer.
+record RenderedRejectedDiagnostic {
+	span: Span,
+	rendered: RenderedDiagnostic,
+	line: Int,
+	column: Int
+}
+
+
+pure func render_rejected_diagnostics(rejected: RejectedPreview) -> Result[List[RenderedRejectedDiagnostic], RejectedRenderError]:
+	var rows: List[RenderedRejectedDiagnostic] = []
+	var failure: Option[RejectedRenderError] = None
+	for diagnostic in rejected.rejected_diagnostics():
+		match render_rejected_syntax(rejected, diagnostic):
+			Ok(rendered):
+				(line, column) = rejected_position(rejected, diagnostic.span)
+				rows = rows.append({ span = diagnostic.span, rendered = rendered, line = line, column = column })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(rows)
+
+
+pure func render_rejected_syntax(rejected: RejectedPreview, diagnostic: SyntaxDiagnosticAt) -> Result[RenderedDiagnostic, RejectedRenderError]:
+	span: Span = diagnostic.span
+	if (span.span_source().source_id_index() != rejected.rejected_module().module_id_index()
+		or span.span_start() > span.span_end() or span.span_end() > rejected.rejected_source().text.length()):
+		Err(InvalidDiagnosticSpan)
+	else:
+		text: String = rejected.rejected_source().text.substring(span.span_start(), span.span_length())
+		match diagnostic.diagnostic:
+			Plain(code):
+				Ok(render_plain_syntax(code, text))
+			ExpectedToken(expected):
+				Ok(render_expected_token(expected))
+			UnknownEscape(escaped):
+				Ok(render_unknown_escape(escaped))
+			IntegerLiteralOverflow(digits):
+				Ok(render_integer_literal_overflow(digits))
+			FloatLiteralOverflow(digits):
+				Ok(render_float_literal_overflow(digits))
+			UnexpectedByte(value):
+				Ok(render_unexpected_byte(value))
+			ReservedKeywordAsName(name):
+				match rejected.rejected_spellings().spelling_text(name):
+					Some(spelling):
+						Ok(render_reserved_keyword_as_name(spelling))
+					None:
+						Err(MissingDiagnosticSpelling)
+			UnknownAnnotation(name):
+				match rejected.rejected_spellings().spelling_text(name):
+					Some(spelling):
+						Ok(render_unknown_annotation(spelling))
+					None:
+						Err(MissingDiagnosticSpelling)
+			ConcurrentDuplicateParameter(name):
+				match rejected.rejected_spellings().spelling_text(name):
+					Some(spelling):
+						Ok(render_concurrent_duplicate_parameter(spelling))
+					None:
+						Err(MissingDiagnosticSpelling)
+			ConcurrentUnknownParameter(name):
+				match rejected.rejected_spellings().spelling_text(name):
+					Some(spelling):
+						Ok(render_concurrent_unknown_parameter(spelling))
+					None:
+						Err(MissingDiagnosticSpelling)
+			ConcurrentForUnknownParameter(name):
+				match rejected.rejected_spellings().spelling_text(name):
+					Some(spelling):
+						Ok(render_concurrent_for_unknown_parameter(spelling))
+					None:
+						Err(MissingDiagnosticSpelling)
+			DuplicateField(_):
+				render_rejected_duplicate_field(rejected, diagnostic)
+			DuplicateFieldGiven(first):
+				if not valid_span(first, rejected.rejected_module().module_id_index(), rejected.rejected_source().text.length()):
+					Err(InvalidGivenFieldSpan)
+				else if first.span_end() > span.span_start():
+					Err(ForwardFieldReference)
+				else:
+					(line, column) = rejected_position(rejected, first)
+					Ok(render_duplicate_field_given(text, line.to_string() + ":" + column.to_string()))
+
+
+private pure func rejected_position(rejected: RejectedPreview, span: Span) -> (Int, Int):
+	var line: Int = 0
+	var line_start: Int = 0
+	for start in rejected.rejected_line_starts():
+		if start > span.span_start():
+			break
+		line += 1
+		line_start = start
+	(line, column_at(rejected.rejected_source().text, line_start, span.span_start()))

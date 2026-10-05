@@ -1,0 +1,245 @@
+-- Whole-source rejected declaration differential, independent of production
+-- routing. Only CompleteDeclarationRejection enters comparison. Any deferred
+-- body/initializer or non-progress stop is counted explicitly, never as proof.
+-- Usage: tree_rejected_declaration_differential.brp <one-source-path-per-line>
+import:
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler_new/stage_01_discovery/diagnostics/rejected_syntax_render:
+		RenderedRejectedDiagnostic,
+		render_rejected_diagnostics,
+	../../../src/compiler_new/stage_01_discovery/diagnostics/render: render_diagnostic
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/parse/tree_rejected_declaration_scan:
+		DeferredRejectionOwner(
+			FunctionBodyOwner, TraitBodyOwner, ImplementationBodyOwner, GlobalInitializerOwner,
+		),
+		RejectedDeclarationScan(
+			CompleteDeclarationRejection, NoDeclarationRejection, DeferredDeclarationRejection,
+			NonProgressingDeclarationRejection,
+		),
+		scan_rejected_declarations,
+	../../../src/compiler_new/stage_01_discovery/pipeline: load_module
+	../../../src/compiler_new/stage_01_discovery/sources/source_provider:
+		ModulePlacement(InUserCode),
+	../../../src/compiler_new/stage_01_discovery/tables/builder: empty_discovery_builder
+	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables:
+		FreezeOutcome(FrozenTables),
+		diagnostic_count,
+		diagnostic_row_at,
+		freeze,
+		span_line_column,
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row
+	../../../src/compiler_new/stage_01_discovery/tables/row_kinds: ModuleReach(RootModule)
+	../../../src/compiler_new/stage_01_discovery/tables/span: span_end, span_start
+	../../../src/lib/source: source_file
+	system: read_file
+
+
+func main(args: List[String]) -> Int:
+	match args.get(1):
+		None:
+			print("usage: tree_rejected_declaration_differential <source-list>")
+			2
+		Some(listing_path):
+			match read_file(listing_path):
+				Err(_):
+					print("tree-rejection-error cannot read source list")
+					2
+				Ok(listing):
+					run_sources(listing.split("\n"))
+
+
+private func run_sources(paths: List[String]) -> Int:
+	var modules: Int = 0
+	var accepted: Int = 0
+	var compared: Int = 0
+	var diagnostics: Int = 0
+	var differences: Int = 0
+	var baseline_differences: Int = 0
+	var errors: Int = 0
+	var deferred_function: Int = 0
+	var deferred_trait: Int = 0
+	var deferred_implementation: Int = 0
+	var deferred_global: Int = 0
+
+	for path in paths:
+		if path.is_empty():
+			continue
+
+		modules += 1
+
+		match read_file(path):
+			Err(_):
+				errors += 1
+				print("tree-rejection-error ${path} | unreadable-source")
+			Ok(text):
+				old = parse_compiler_source(source_file(path, "main", text))
+
+				if old.diagnostics.is_empty():
+					accepted += 1
+					continue
+
+				match scan_rejected_declarations(lex_module(module_id_at_row(0), text)):
+					Err(_):
+						errors += 1
+						print("tree-rejection-error ${path} | invalid-parse-input")
+					Ok(NonProgressingDeclarationRejection):
+						errors += 1
+						print("tree-rejection-error ${path} | non-progressing-declaration")
+					Ok(NoDeclarationRejection):
+						differences += 1
+						print("tree-rejection-difference ${path} | old-rejected-tree-accepted")
+					Ok(DeferredDeclarationRejection(owner)):
+						match owner:
+							FunctionBodyOwner:
+								deferred_function += 1
+							TraitBodyOwner:
+								deferred_trait += 1
+							ImplementationBodyOwner:
+								deferred_implementation += 1
+							GlobalInitializerOwner:
+								deferred_global += 1
+					Ok(CompleteDeclarationRejection(rejected)):
+						match render_rejected_diagnostics(rejected):
+							Err(_):
+								errors += 1
+								print("tree-rejection-error ${path} | invalid-retained-diagnostic")
+							Ok(rows):
+								compared += 1
+								diagnostics += rows.length()
+
+								stage_matches: Bool = table_diagnostics_match(text, rows)
+
+								if not stage_matches:
+									differences += 1
+									print("tree-rejection-difference ${path} | table-diagnostics")
+
+								if rows.length() != old.diagnostics.length():
+									if stage_matches:
+										baseline_differences += 1
+
+									print(
+										"tree-rejection-legacy-difference ${path} | table_identity=${stage_matches} | diagnostic-count | old=${old.diagnostics.length()} | tree=${rows.length()}",
+									)
+
+								var index: Int = 0
+
+								for (actual, wanted) in rows.zip(old.diagnostics):
+									if (
+										actual.rendered.message != wanted.message
+										or actual.rendered.help != wanted.help
+										or actual.span.span_start() != wanted.span.start_offset
+										or actual.span.span_end() != wanted.span.end_offset
+										or actual.line != wanted.span.start_line
+										or actual.column != wanted.span.start_column
+									):
+										if stage_matches:
+											baseline_differences += 1
+
+										print(
+											"tree-rejection-legacy-difference ${path} | table_identity=${stage_matches} | diagnostic=${index} | old=${wanted.message} | tree=${actual.rendered.message} | old_help=${wanted.help.get_or("(none)")} | tree_help=${actual.rendered.help.get_or("(none)")} | old_span=${wanted.span.start_offset}:${wanted.span.end_offset} | tree_span=${actual.span.span_start()}:${actual.span.span_end()} | old_location=${wanted.span.start_line}:${wanted.span.start_column} | tree_location=${actual.line}:${actual.column}",
+										)
+
+									index += 1
+
+	print(
+		"tree-rejection-summary modules=${modules} accepted=${accepted} compared=${compared} diagnostics=${diagnostics} differences=${differences} baseline_differences=${baseline_differences} errors=${errors} deferred_function=${deferred_function} deferred_trait=${deferred_trait} deferred_implementation=${deferred_implementation} deferred_global=${deferred_global}",
+	)
+
+	if errors > 0:
+		4
+	else if differences > 0:
+		1
+	else:
+		0
+
+
+-- Unit-test entry point uses the same complete-source boundary as the tool.
+-- False includes deferred/accepted sources: neither counts as rejected proof.
+pure func rejected_declaration_diagnostics_match(text: String) -> Bool:
+	old = parse_compiler_source(source_file("rejected.brp", "main", text))
+
+	match scan_rejected_declarations(lex_module(module_id_at_row(0), text)):
+		Ok(CompleteDeclarationRejection(rejected)):
+			match render_rejected_diagnostics(rejected):
+				Ok(rows):
+					var correct: Bool = (
+						not old.diagnostics.is_empty()
+						and rows.length() == old.diagnostics.length()
+						and table_diagnostics_match(text, rows)
+					)
+
+					for (actual, wanted) in rows.zip(old.diagnostics):
+						correct = (
+							correct
+							and actual.rendered.message == wanted.message
+							and actual.rendered.help == wanted.help
+							and actual.span.span_start() == wanted.span.start_offset
+							and actual.span.span_end() == wanted.span.end_offset
+							and actual.line == wanted.span.start_line
+							and actual.column == wanted.span.start_column
+						)
+
+					correct
+				Err(_):
+					False
+		_:
+			False
+
+
+private pure func table_diagnostics_match(
+	text: String,
+	rows: List[RenderedRejectedDiagnostic],
+) -> Bool:
+	builder = empty_discovery_builder().load_module(
+		{
+			path = "rejected.brp",
+			trusted_directory = ".",
+			placement = InUserCode
+		},
+		RootModule,
+		text,
+	)
+
+	match builder.freeze():
+		FrozenTables(tables):
+			var correct: Bool = tables.diagnostic_count() == rows.length()
+			var index: Int = 0
+
+			for actual in rows:
+				match tables.diagnostic_row_at(index):
+					Some(wanted):
+						rendered = tables.render_diagnostic(wanted)
+						position = tables.span_line_column(wanted.span)
+						correct = (
+							correct
+							and actual.rendered.message == rendered.message
+							and actual.rendered.help == rendered.help
+							and actual.span.span_start() == wanted.span.span_start()
+							and actual.span.span_end() == wanted.span.span_end()
+							and actual.line == position.line + 1
+							and actual.column == position.column
+						)
+					None:
+						correct = False
+
+				index += 1
+
+			correct
+		_:
+			False
+
+
+-- Current stage wording is intentional (DISCOVERY_TABLES_DESIGN section 6).
+-- This entry checks every field against that independent table oracle; the
+-- strict legacy entry above remains available and never hides baseline drift.
+pure func rejected_declaration_table_diagnostics_match(text: String) -> Bool:
+	match scan_rejected_declarations(lex_module(module_id_at_row(0), text)):
+		Ok(CompleteDeclarationRejection(rejected)):
+			match render_rejected_diagnostics(rejected):
+				Ok(rows):
+					table_diagnostics_match(text, rows)
+				Err(_):
+					False
+		_:
+			False

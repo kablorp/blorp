@@ -1,0 +1,241 @@
+-- A cursor over a validated lexical product. Advancement stops at its real
+-- terminal token; no synthesized token or payload stands in for bad input.
+import:
+	../lex/lexed_module: LexedModule, LiteralValue(IntegerValue, FloatValue, TextValue)
+	../syntax/ids: SpellingId
+	../syntax/spellings: Spellings, spelling_count, spelling_text_at, find_spelling, spellings_module
+	../tables/diagnostic_code: SyntaxDiagnostic(IntegerLiteralOverflow, FloatLiteralOverflow)
+	../tables/rows: SyntaxDiagnosticAt
+	../tables/ids: ModuleId, module_id_index, source_id_index
+	../tables/span: Span, span_source, span_start, span_end, span_length, SPAN_LENGTH_LIMIT
+	../tables/token:
+		Token, NO_TOKEN_PAYLOAD,
+		TokenKind(
+			IdentifierToken, DimensionNameToken, IntLiteralToken, FloatLiteralToken,
+			NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken, DocStringToken,
+			InterpolatedStringToken, InterpolatedPipeStringToken, CharLiteralToken,
+			EndOfFileToken, RejectedIntegerToken, RejectedFloatToken, DebugKeyword, WithKeyword, ConcurrentKeyword, ConcurrentlyKeyword,
+			SelectKeyword, AfterKeyword, SealedKeyword, OnKeyword, NewlineToken, IndentToken, DedentToken,
+		),
+
+
+union TokenInputError:
+	SpellingModuleMismatch(ModuleId, ModuleId) -- expected lexical module, actual vocabulary owner
+	MissingEndOfFile
+	EarlyEndOfFile(Int)
+	TokenOutsideModule(Span)
+	InvalidSpellingPayload(Span, Int)
+	InvalidLiteralPayload(Span, Int)
+	LiteralKindMismatch(Span)
+	RejectedLiteralDiagnosticMismatch(Span)
+	InvalidInterpolationPayload(Span, Int)
+	InvalidCodepointPayload(Span, Int)
+	UnexpectedPayload(Span, Int)
+
+
+opaque type TokenCursor = CursorFields
+
+private record CursorFields {
+	tokens: List[Token],
+	position: Int,
+	terminal: Token
+}
+
+
+-- Built lazily once for rejected numbers. Independent integer/float indexes
+-- allow constant-time evidence checks even on malformed diagnostic-heavy input.
+private record RejectedLiteralEvidence {
+	integers: Dict[Int, Bool],
+	floats: Dict[Int, Bool]
+}
+
+
+private UNICODE_MAX_SCALAR: Int = 1114111
+private UNICODE_SURROGATE_START: Int = 55296
+private UNICODE_SURROGATE_END: Int = 57343
+
+
+pure func new_token_cursor(lexed: LexedModule) -> Result[TokenCursor, TokenInputError]:
+	if lexed.spellings.spellings_module().module_id_index() != lexed.module.module_id_index():
+		Err(SpellingModuleMismatch(lexed.module, lexed.spellings.spellings_module()))
+	else:
+		match lexed.tokens.get(lexed.tokens.length() - 1):
+			Some(terminal):
+				if terminal.kind != EndOfFileToken:
+					Err(MissingEndOfFile)
+				else:
+					var problem: Option[TokenInputError] = None
+					var index: Int = 0
+					var evidence: Option[RejectedLiteralEvidence] = None
+
+					for token in lexed.tokens:
+						if (evidence.is_none()
+							and (token.kind == RejectedIntegerToken or token.kind == RejectedFloatToken)):
+							evidence = Some(rejected_literal_evidence(lexed.module, lexed.source.text, lexed.diagnostics))
+
+						if token.kind == EndOfFileToken and index + 1 < lexed.tokens.length():
+							problem = Some(EarlyEndOfFile(index))
+						else:
+							problem = token_input_problem(lexed, token, evidence)
+
+						if problem.is_some():
+							break
+
+						index += 1
+
+					match problem:
+						Some(error):
+							Err(error)
+						None:
+							Ok(into_opaque TokenCursor({ tokens = lexed.tokens, position = 0, terminal = terminal }))
+			None:
+				Err(MissingEndOfFile)
+
+
+private pure func token_input_problem(lexed: LexedModule, token: Token, evidence: Option[RejectedLiteralEvidence]) -> Option[TokenInputError]:
+	if (
+		token.span.span_source().source_id_index() != lexed.module.module_id_index()
+		or token.span.span_start() < 0
+		or token.span.span_end() > lexed.source.text.length()
+	):
+		Some(TokenOutsideModule(token.span))
+	else:
+		match token.kind:
+			IdentifierToken | DimensionNameToken:
+				if token.payload < 0 or token.payload >= lexed.spellings.spelling_count():
+					Some(InvalidSpellingPayload(token.span, token.payload))
+				else:
+					None
+			IntLiteralToken | FloatLiteralToken | NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken | DocStringToken:
+				match lexed.source.literals.get(token.payload):
+					Some(literal):
+						match (token.kind, literal):
+							(IntLiteralToken, IntegerValue(_)) | (FloatLiteralToken, FloatValue(_)):
+								None
+							(NormalStringToken, TextValue(_)) | (RawStringToken, TextValue(_)) | (PipeStringToken, TextValue(_)) | (RawPipeStringToken, TextValue(_)) | (DocStringToken, TextValue(_)):
+								None
+							_:
+								Some(LiteralKindMismatch(token.span))
+					None:
+						Some(InvalidLiteralPayload(token.span, token.payload))
+			InterpolatedStringToken | InterpolatedPipeStringToken:
+				if token.payload < 0 or token.payload >= lexed.source.interpolations.length():
+					Some(InvalidInterpolationPayload(token.span, token.payload))
+				else:
+					None
+			RejectedIntegerToken | RejectedFloatToken:
+				if token.payload != NO_TOKEN_PAYLOAD:
+					Some(UnexpectedPayload(token.span, token.payload))
+				else:
+					present: Bool = match evidence:
+						Some(index):
+							if token.kind == RejectedIntegerToken:
+								index.integers.contains(span_offset_key(token.span))
+							else:
+								index.floats.contains(span_offset_key(token.span))
+						None:
+							False
+
+					if present:
+						None
+					else:
+						Some(RejectedLiteralDiagnosticMismatch(token.span))
+			CharLiteralToken:
+				if (
+					token.payload < 0 or token.payload > UNICODE_MAX_SCALAR
+					or token.payload >= UNICODE_SURROGATE_START and token.payload <= UNICODE_SURROGATE_END
+				):
+					Some(InvalidCodepointPayload(token.span, token.payload))
+				else:
+					None
+			_:
+				if token.payload == NO_TOKEN_PAYLOAD:
+					None
+				else:
+					Some(UnexpectedPayload(token.span, token.payload))
+
+
+-- A module-local exact span key. The admitted span's start and length each
+-- fit their named packed field; their product occupies 48 bits, within Int.
+-- Evidence from any other module is excluded before this key is made.
+private pure func span_offset_key(span: Span) -> Int:
+	span.span_start() * SPAN_LENGTH_LIMIT + span.span_length()
+
+
+private pure func rejected_literal_evidence(module: ModuleId, text: String, diagnostics: List[SyntaxDiagnosticAt]) -> RejectedLiteralEvidence:
+	var integers: Dict[Int, Bool] = {}
+	var floats: Dict[Int, Bool] = {}
+
+	for at in diagnostics:
+		if (at.span.span_source().source_id_index() == module.module_id_index()
+			and at.span.span_end() <= text.length()):
+			match at.diagnostic:
+				IntegerLiteralOverflow(digits):
+					if digits == text.substring(at.span.span_start(), at.span.span_length()):
+						integers = integers.set(span_offset_key(at.span), True)
+				FloatLiteralOverflow(digits):
+					if digits == text.substring(at.span.span_start(), at.span.span_length()):
+						floats = floats.set(span_offset_key(at.span), True)
+				_:
+					void
+
+	{ integers = integers, floats = floats }
+
+
+pure func current_token(cursor: TokenCursor) -> Token:
+	fields: CursorFields = from_opaque TokenCursor(cursor)
+	fields.tokens.get_or(fields.position, fields.terminal)
+
+
+pure func cursor_position(cursor: TokenCursor) -> Int:
+	from_opaque TokenCursor(cursor).position
+
+
+-- Missing header punctuation is reported after authored content, even when
+-- parameter recovery has already consumed layout. This scan is error-only.
+pure func previous_content_span(cursor: TokenCursor) -> Span:
+	fields: CursorFields = from_opaque TokenCursor(cursor)
+	var index: Int = fields.position - 1
+	var found: Span = cursor.current_token().span
+
+	while index >= 0:
+		match fields.tokens.get(index):
+			Some(token):
+				if token.kind != NewlineToken and token.kind != IndentToken and token.kind != DedentToken:
+					found = token.span
+					break
+			None:
+				()
+
+		index -= 1
+
+	found
+
+
+pure func peek_kind(cursor: TokenCursor, ahead: Int) -> TokenKind:
+	fields: CursorFields = from_opaque TokenCursor(cursor)
+	fields.tokens.get_or(fields.position + max(ahead, 0), fields.terminal).kind
+
+
+pure func advanced(cursor: TokenCursor) -> TokenCursor:
+	fields: CursorFields = from_opaque TokenCursor(cursor)
+	into_opaque TokenCursor({ fields | position = min(fields.position + 1, fields.tokens.length() - 1) })
+
+
+pure func token_spelling(token: Token, spellings: Spellings) -> Option[SpellingId]:
+	if token.kind == IdentifierToken or token.kind == DimensionNameToken:
+		match spelling_text_at(spellings, token.payload):
+			Some(text):
+				find_spelling(spellings, text, 0, text.length())
+			None:
+				None
+	else:
+		None
+
+
+pure func is_soft_keyword(kind: TokenKind) -> Bool:
+	match kind:
+		DebugKeyword | WithKeyword | ConcurrentKeyword | ConcurrentlyKeyword | SelectKeyword | AfterKeyword | SealedKeyword | OnKeyword:
+			True
+		_:
+			False
