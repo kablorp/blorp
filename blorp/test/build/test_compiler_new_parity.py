@@ -536,6 +536,20 @@ class CompilerNewParityTests(unittest.TestCase):
 		self.assertEqual(parity.parse_adapter_output(output).tree_prefix.problems, [])
 		self.assertTrue(self.tree_prefix_problems(output))
 
+	def test_tree_prefix_difference_passes_only_when_an_allowance_names_it(self) -> None:
+		output = self.tree_prefix_output(
+			"tree-prefix-difference a.brp | helper | decls[0].value.kind | old=x | new=y",
+			updates={"differences": 1, "reported": 1},
+		)
+		report = parity.parse_adapter_output(output).tree_prefix
+		allowance = parity.AdapterDifference(path=r"decls\[0\]\.value\..*", reason="known fault", declaration="helper", module="a.brp")
+		other_module = parity.AdapterDifference(path=r"decls\[0\]\.value\..*", reason="known fault", declaration="helper", module="b.brp")
+		used: set = set()
+		self.assertEqual(parity.tree_prefix_problems("tree prefix", report, set(), allowances=(allowance,), used=used), [])
+		self.assertEqual(used, {allowance})
+		self.assertTrue(parity.tree_prefix_problems("tree prefix", report, set(), allowances=(other_module,)))
+		self.assertTrue(parity.tree_prefix_problems("tree prefix", report, set()))
+
 	def test_full_adapter_error_does_not_fail_a_clean_tree_prefix_report(self) -> None:
 		output = self.tree_prefix_output("adapter-error a.brp | the tables hold no row 3 of DefinitionTable")
 		self.assertTrue(self.adapter_problems(output))

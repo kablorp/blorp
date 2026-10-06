@@ -3,15 +3,17 @@
 -- expression and its boundary have been accepted. Unsupported input returns
 -- the caller's original state, including spellings and diagnostics.
 import:
-	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue)
+	../lex/lexed_module: LiteralValue(IntegerValue, FloatValue, TextValue), HoleScan, ScannedPiece(ScannedText, ScannedHole)
 	../syntax/checked_values: DecimalFloat
 	../syntax/expressions:
-		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, BooleanLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral),
+		Expression, ExpressionKind(NameReference, IntegerLiteral, FloatLiteral, StringLiteral, InterpolatedString, BooleanLiteral, CharacterLiteral, VoidValue, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral),
+		InterpolationForm(QuotedInterpolation, PipeInterpolation), InterpolationPiece(InterpolationText, InterpolationHole),
 		UnaryOperator(Negate, LogicalNot),
 		BinaryOperator(Add, Subtract, Multiply, Divide, Modulo, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual),
 		LogicalOperator(LogicalAnd, LogicalOr)
 	../syntax/sequences: AtLeastOne, at_least_one_items
 	../syntax/names: WrittenName
+	../syntax/patterns: StringForm(QuotedString, RawString, PipeString, RawPipeString)
 	../tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
 	../tables/expected_token:
 		NameConstruct(NameInStatementName, NameInFieldName), ExpectedTokenDiagnostic(ExpectedRightParen, ExpectedRightBracket),
@@ -19,13 +21,14 @@ import:
 		RightBracketConstruct(RightBracketInSubscript, RightBracketInListLiteral)
 	../tables/span: Span, span_covering
 	../tables/token:
-		TokenKind(IdentifierToken, IntLiteralToken, FloatLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
+		TokenKind(IdentifierToken, IntLiteralToken, FloatLiteralToken, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken,
+			InterpolatedStringToken, InterpolatedPipeStringToken, CharLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
 			MinusSymbol, NotKeyword, LeftParenSymbol, RightParenSymbol, LeftBracketSymbol, RightBracketSymbol, CommaSymbol,
 			EndOfFileToken, NewlineToken, DotSymbol, IndentToken)
 	binary_operators as Operators
 	parse_state:
-		ParseState, diagnostic_count, current_kind, current_span, current_literal, advanced, peek_kind, span_start_line,
-		consume_referenced_name, finished_name_use, finished_expression, report_at_current, expect_token
+		ParseState, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, advanced, peek_kind, span_start_line,
+		consume_referenced_name, finished_name_use, finished_expression, finished_hole, report_at_current, report_unreachable_input, expect_token, entered_hole, left_hole
 
 
 union ExpressionParse:
@@ -42,10 +45,13 @@ record ExpressionRecipe {
 }
 
 
-union RecipeKind:
+private union RecipeKind:
 	NameRecipe(WrittenName)
 	IntegerRecipe(Int128)
 	FloatRecipe(DecimalFloat)
+	StringRecipe(StringForm, String)
+	InterpolatedRecipe(InterpolationForm, List[InterpolationPieceRecipe])
+	CharacterRecipe(Char)
 	BooleanRecipe(Bool)
 	VoidRecipe
 	UnaryRecipe(UnaryOperator, ExpressionRecipe)
@@ -55,6 +61,12 @@ union RecipeKind:
 	FieldRecipe(ExpressionRecipe, WrittenName)
 	SubscriptRecipe(ExpressionRecipe, AtLeastOne[ExpressionRecipe])
 	ListRecipe(List[ExpressionRecipe])
+
+
+-- A text piece, or a hole whose expression is still a recipe.
+private union InterpolationPieceRecipe:
+	TextPieceRecipe(String)
+	HolePieceRecipe(Span, ExpressionRecipe)
 
 
 union RecipeParse:
@@ -110,6 +122,17 @@ private union ChainStep[T]:
 	Extended(T)
 	Stopped
 	Abandoned(Abandonment)
+
+
+-- The collection and indices of a subscript recipe, so that a statement can
+-- turn `xs[i] = v` into an assignment to that place. A grouped subscript is a
+-- grouping recipe, not a subscript, and has none.
+pure func subscript_parts(recipe: ExpressionRecipe) -> Option[(ExpressionRecipe, AtLeastOne[ExpressionRecipe])]:
+	match recipe.kind:
+		SubscriptRecipe(collection, indices):
+			Some((collection, indices))
+		_:
+			None
 
 
 -- Recognizes one same-line expression without issuing ids. The caller owns
@@ -394,6 +417,67 @@ private pure func next_item_step(
 					(after_item, Abandoned(RejectedShape))
 
 
+-- An interpolated string whose every hole is one clean expression. A hole is
+-- lexed and read on its own, so the string's recipe holds hole recipes; any
+-- hole outside the grammar leaves the whole string unsupported.
+private pure func parse_interpolated_string(state: ParseState, span: Span) -> (ParseState, RecipeParse):
+	form: InterpolationForm = if state.current_kind() == InterpolatedPipeStringToken:
+		PipeInterpolation
+	else:
+		QuotedInterpolation
+	match state.current_interpolation():
+		None:
+			-- The token cursor checked that an interpolated string token indexes a scan.
+			report_unreachable_input("an interpolated string token indexes its scan")
+			(state, UnsupportedRecipe)
+		Some(scan):
+			no_pieces: List[InterpolationPieceRecipe] = []
+			(out, pieces, abandoned) = extend_chain(state, no_pieces, pure func(current, read):
+				interpolation_piece_step(current, scan.pieces, read)
+			)
+			match abandoned:
+				None:
+					(out.advanced(), ParsedRecipe({ span = span, kind = InterpolatedRecipe(form, pieces) }))
+				Some(_):
+					(state, UnsupportedRecipe)
+
+
+-- The next piece of the string, after the `read` ones: a text piece, a hole
+-- read to a recipe, or the end. A hole outside the grammar abandons the string.
+private pure func interpolation_piece_step(
+	state: ParseState, pieces: List[ScannedPiece], read: List[InterpolationPieceRecipe],
+) -> (ParseState, ChainStep[List[InterpolationPieceRecipe]]):
+	match pieces.get(read.length()):
+		None:
+			(state, Stopped)
+		Some(ScannedText(text)):
+			(state, Extended(read.append(TextPieceRecipe(text.text))))
+		Some(ScannedHole(hole)):
+			(after_hole, value) = state.parse_hole(hole)
+			match value:
+				Some(recipe):
+					(after_hole, Extended(read.append(HolePieceRecipe(hole.span, recipe))))
+				None:
+					(state, Abandoned(UnsupportedShape))
+
+
+-- One hole's expression: the whole of the hole's own tokens, and nothing else.
+private pure func parse_hole(state: ParseState, hole: HoleScan) -> (ParseState, Option[ExpressionRecipe]):
+	match state.entered_hole(hole):
+		None:
+			(state, None)
+		Some((inside, parked)):
+			(read, parsed) = parse_expression_recipe(inside)
+			match parsed:
+				ParsedRecipe(value):
+					if read.current_kind() == EndOfFileToken:
+						(read.left_hole(parked), Some(value))
+					else:
+						(state, None)
+				_:
+					(state, None)
+
+
 private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, RecipeParse):
 	if not state.on_line(line):
 		(state, UnsupportedRecipe)
@@ -411,6 +495,24 @@ private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, Recip
 						(state.advanced(), ParsedRecipe({ span = span, kind = FloatRecipe(value) }))
 					_:
 						(state, UnsupportedRecipe)
+			NormalStringToken | RawStringToken | PipeStringToken | RawPipeStringToken:
+				match state.current_literal():
+					Some(TextValue(text)):
+						form: StringForm = match state.current_kind():
+							RawStringToken: RawString
+							PipeStringToken: PipeString
+							RawPipeStringToken: RawPipeString
+							_: QuotedString
+						(state.advanced(), ParsedRecipe({ span = span, kind = StringRecipe(form, text) }))
+					_:
+						-- The token cursor checked that a string token's literal is text.
+						report_unreachable_input("a string token indexes a text literal")
+						(state, UnsupportedRecipe)
+			InterpolatedStringToken | InterpolatedPipeStringToken:
+				state.parse_interpolated_string(span)
+			CharLiteralToken:
+				-- The token cursor validated the payload as a Unicode scalar value.
+				(state.advanced(), ParsedRecipe({ span = span, kind = CharacterRecipe(to_char(state.current_token().payload)) }))
 			TrueKeyword | FalseKeyword:
 				(state.advanced(), ParsedRecipe({ span = span, kind = BooleanRecipe(state.current_kind() == TrueKeyword) }))
 			VoidKeyword | UnderscoreSymbol:
@@ -531,6 +633,21 @@ private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRec
 			after_use.finished_expression(recipe.span, NameReference(use))
 		IntegerRecipe(magnitude): state.finished_expression(recipe.span, IntegerLiteral(magnitude))
 		FloatRecipe(value): state.finished_expression(recipe.span, FloatLiteral(value))
+		StringRecipe(form, text): state.finished_expression(recipe.span, StringLiteral(form, text))
+		CharacterRecipe(character): state.finished_expression(recipe.span, CharacterLiteral(character))
+		InterpolatedRecipe(form, pieces):
+			var out: ParseState = state
+			var minted: List[InterpolationPiece] = []
+			for piece in pieces:
+				match piece:
+					TextPieceRecipe(text):
+						minted = minted.append(InterpolationText(text))
+					HolePieceRecipe(hole_span, value_recipe):
+						(after_value, value) = mint_recipe(out, value_recipe)
+						(after_hole, hole) = after_value.finished_hole(value, hole_span)
+						out = after_hole
+						minted = minted.append(InterpolationHole(hole))
+			out.finished_expression(recipe.span, InterpolatedString(form, minted))
 		BooleanRecipe(value): state.finished_expression(recipe.span, BooleanLiteral(value))
 		VoidRecipe: state.finished_expression(recipe.span, VoidValue)
 		UnaryRecipe(operator, operand):

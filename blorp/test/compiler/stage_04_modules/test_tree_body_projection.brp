@@ -2,16 +2,21 @@
 -- for the frozen parser, equal its own parse; and the walks that follow a
 -- source's length are loops.
 import:
-	../../../src/compiler/discovery_adapter: legacy_declaration_projection, LegacyDeclarationPreviewError(UnsupportedBodyStatement, MissingIntegerLiteralToken, UnsupportedGlobalInitializerExpression)
+	../../../src/compiler/discovery_adapter: legacy_declaration_projection, legacy_expression_preview, LegacyDeclarationPreviewError(UnsupportedBodyStatement, MissingIntegerLiteralToken, UnsupportedGlobalInitializerExpression)
 	../../../src/compiler_new/stage_01_discovery/tables/span: span_start, span_end
 	../../../src/compiler/stage_02_lex/name_table: EMPTY_NAME_TABLE, IdentifierSpellings(SpellingsFromIdentifierText, SpellingsFromNameTable)
 	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
-	../../../src/compiler/stage_03_parse/parsed_ast: ParsedDecl(FunctionParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr), ParsedElseBranch
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDecl(FunctionParsedDecl, VarParsedDecl), ParsedExpr(ParsedBlockExpr, ParsedIfExpr, ParsedNameExpr, ParsedStringLiteralExpr, ParsedStringInterpolationPartsExpr), ParsedElseBranch,
+		ParsedStringInterpolationPart(ParsedInterpolationLiteral, ParsedInterpolationExpr), ParsedStringLiteralForm(ParsedPipeStringLiteral)
+	../tools/discovery_adapter_comparison: with_holes_parsed
 	../../../src/compiler/stage_03_parse/parsed_ast_json: ast_json_render, parsed_decl_to_json
 	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
-	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, issued_ids, spellings
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state: new_parse_state, issued_ids, spellings, advanced
+	../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser: parse_expression_recipe, mint_recipe, RecipeParse(ParsedRecipe)
 	../../../src/compiler_new/stage_01_discovery/parse/preview_source: preview_source
-	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser: DeclarationPreview(CompletedFunctionPreview)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_declaration_preview_parser:
+		DeclarationPreview(CompletedFunctionPreview), DeclarationPreviewParse(DeferredGlobalInitializer), parse_declaration_preview
 	../../../src/compiler_new/stage_01_discovery/parse/tree_module_declaration_scan:
 		scan_module_declaration_prefix_with_bodies, ModuleDeclarationScanStop(ReachedEndOfSource)
 	../../../src/compiler_new/stage_01_discovery/syntax/dump: dumped_module
@@ -22,6 +27,11 @@ import:
 	test: TestSuite
 
 
+-- An interpolation hole, spelled without opening one in this file's own string.
+private pure func hole(text: String) -> String:
+	"$" + "{" + text + "}"
+
+
 private pure func source_lines(lines: List[String]) -> String:
 	lines.join("\n") + "\n"
 
@@ -30,7 +40,7 @@ private pure func source_lines(lines: List[String]) -> String:
 -- projection equals the frozen parser's declaration for declaration.
 private func bodies_match_old_parser(text: String) -> Bool:
 	source = source_file("/tmp/tree_body_projection.brp", "tree_body_projection", text)
-	old = parse_compiler_source(source)
+	old = with_holes_parsed(parse_compiler_source(source))
 	lexed = lex_module(module_id_at_row(0), text)
 	match new_parse_state(lexed):
 		Err(_): False
@@ -187,6 +197,106 @@ func test_several_declarations_match_old_parser() -> Bool:
 	]))
 
 
+func test_string_and_character_literals_match_old_parser() -> Bool:
+	first: Bool = bodies_match_old_parser(source_lines([
+		"func f(name: String) -> String:",
+		"\tplain = \"plain\"",
+		"\tempty = \"\"",
+		"\tescaped = \"tab\\t quote\\\" newline\\n\"",
+		"\tpath = raw\"C:\\Users\\x\"",
+		"\tletter = 'c'",
+		"\tnewline = '\\n'",
+		"\tgrouped = (\"grouped\")",
+		"\tjoined = name + \"suffix\"",
+		"\tlength(\"call\", ('d'), [\"list\"])",
+		"\tname"
+	]))
+	bodies_match_old_parser("label = \"a global\"\nmark = 'g'\n") and first
+
+
+func test_interpolated_strings_match_old_parser() -> Bool:
+	quote: String = "\""
+	first: Bool = bodies_match_old_parser(source_lines([
+		"func f(name: String, count: Int) -> String:",
+		"\ta = " + quote + "hello " + hole("name") + quote,
+		"\tb = " + quote + hole("name") + quote,
+		"\tc = " + quote + hole("count + 1") + " items, " + hole("name.length()") + " chars" + quote,
+		"\td = " + quote + "nested " + hole("show(" + quote + "inner " + hole("name") + quote + ", 'x')") + " done" + quote,
+		"\te = " + quote + "spaced " + hole(" name ") + " and " + hole("count") + hole("count") + quote,
+		"\tshow(" + quote + "in a call " + hole("name") + quote + ")",
+		"\tmatch name:",
+		"\t\t" + quote + "literal" + quote + ": " + quote + "case " + hole("count") + quote,
+		"\t\t_: " + quote + quote,
+		"\tfor item in [" + quote + hole("name") + quote + "]:",
+		"\t\tname += " + quote + hole("item") + quote,
+		"\tname"
+	]))
+	bodies_match_old_parser("greeting = " + quote + "hi " + hole("name") + " and " + hole("other.field") + quote + "\n") and first
+
+
+func test_character_escapes_and_raw_pipe_strings_match_old_parser() -> Bool:
+	bodies_match_old_parser(source_lines([
+		"func f() -> String:",
+		"\tnewline = '\\n'",
+		"\ttab = '\\t'",
+		"\tbackslash = '\\\\'",
+		"\tquote = '\\''",
+		"\tletter = '\\u{41}'",
+		"\temoji = '\\u{1F600}'",
+		"\tpath = raw",
+		"\t\t|C:\\Users",
+		"\t\t|" + hole("not_a_hole"),
+		"\tpath"
+	]))
+
+
+-- A pipe string or pipe interpolation can only be an indented value, which the
+-- statement grammar of this slice leaves to a later one, so the tree's
+-- expression is parsed where its token begins and its projection is compared
+-- with the old parser's text, form and parts.
+func test_pipe_strings_project_like_the_old_parser() -> Bool:
+	plain_text = source_lines(["x =", "\t|one", "\t|two"])
+	interpolated_text = source_lines(["x =", "\t|a " + hole("b"), "\t|c"])
+	match (pipe_expression(plain_text), pipe_expression(interpolated_text)):
+		(Some((ParsedStringLiteralExpr(old_text, old_form, _), ParsedStringLiteralExpr(new_text, new_form, _))), Some((ParsedStringInterpolationPartsExpr(old_parts, True, _), ParsedStringInterpolationPartsExpr(new_parts, True, _)))):
+			literal_forms: Bool = old_text == new_text and old_text == "one\ntwo" and old_form == new_form and new_form == ParsedPipeStringLiteral
+			literal_forms and pipe_parts_match(old_parts, new_parts)
+		_: False
+
+
+private func pipe_parts_match(old_parts: List[ParsedStringInterpolationPart], new_parts: List[ParsedStringInterpolationPart]) -> Bool:
+	match (old_parts, new_parts):
+		([ParsedInterpolationLiteral(old_first), ParsedInterpolationExpr(ParsedNameExpr(old_name), _), ParsedInterpolationLiteral(old_last)], [ParsedInterpolationLiteral(new_first), ParsedInterpolationExpr(ParsedNameExpr(new_name), _), ParsedInterpolationLiteral(new_last)]):
+			old_first == new_first and old_last == new_last and old_first == "a " and old_last == "\nc" and old_name.text == new_name.text
+		_: False
+
+
+-- The old parser's value of the global `x`, and the tree path's, for a value
+-- that begins on the line after the `=`: the tree parser starts at that token.
+private func pipe_expression(text: String) -> Option[(ParsedExpr, ParsedExpr)]:
+	source = source_file("/tmp/tree_body_projection.brp", "tree_body_projection", text)
+	old = with_holes_parsed(parse_compiler_source(source))
+	lexed = lex_module(module_id_at_row(0), text)
+	match (old.decls.get(0), new_parse_state(lexed)):
+		(Some(VarParsedDecl(global)), Ok(entry)):
+			(at_value, result) = parse_declaration_preview(entry)
+			match result:
+				DeferredGlobalInitializer(_):
+					-- Past the newline and the indent that precede the pipe token.
+					-- The recipe entry skips the boundary check, which an indented
+					-- value's closing dedent would fail.
+					(at_token, parsed) = parse_expression_recipe(at_value.advanced().advanced())
+					match parsed:
+						ParsedRecipe(recipe):
+							(_, value) = mint_recipe(at_token, recipe)
+							match legacy_expression_preview(preview_source(lexed), EMPTY_NAME_TABLE, value):
+								Ok((_, projected)): Some((global.value, projected))
+								Err(_): None
+						_: None
+				_: None
+		_: None
+
+
 -- The projected body of the only function of `text`: the old parser's
 -- `ParsedFunctionDecl.body`, shaped by the tree path.
 private func projected_function_body(text: String) -> Option[ParsedExpr]:
@@ -258,6 +368,10 @@ tests: TestSuite = {
 		("match statements match the old parser", test_match_statements_match_old_parser),
 		("nested blocks match the old parser", test_nested_blocks_match_old_parser),
 		("several declarations match the old parser", test_several_declarations_match_old_parser),
+		("string and character literals match the old parser", test_string_and_character_literals_match_old_parser),
+		("interpolated strings match the old parser", test_interpolated_strings_match_old_parser),
+		("character escapes and raw pipe strings match the old parser", test_character_escapes_and_raw_pipe_strings_match_old_parser),
+		("pipe strings project like the old parser", test_pipe_strings_project_like_the_old_parser),
 		("a 2000 link else if chain projects by a loop", test_deep_else_if_chain_projects_by_a_loop),
 		("5000 statements project in order", test_long_statement_list_projects_in_order)
 	]

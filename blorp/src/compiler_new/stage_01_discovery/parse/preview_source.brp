@@ -1,20 +1,64 @@
 -- Lexical evidence owned by standalone declaration previews. Authored spans
 -- and token kinds supply exact bytes without reconstructing their spelling.
 import:
-	../lex/lexed_module: LexedModule, LexedSource
+	../lex/lexed_module: InterpolationScan, LexedModule, LexedSource, ScannedPiece(ScannedHole)
+	../lex/lexer: lex_hole
 	../tables/ids: source_id_index
 	../tables/span: Span, span_start, span_end, span_source, pack_span
-	../tables/token: Token, TokenKind(UnderscoreSymbol, IntLiteralToken, FloatLiteralToken, LeftParenSymbol, RightParenSymbol, NewlineToken, IndentToken, DedentToken)
+	../tables/token: Token, TokenKind(EndOfFileToken, InterpolatedStringToken, InterpolatedPipeStringToken, UnderscoreSymbol, IntLiteralToken, FloatLiteralToken, LeftParenSymbol, RightParenSymbol, NewlineToken, IndentToken, DedentToken)
 
 
+-- `tokens` are the module's, addressed by token position. `hole_tokens` are
+-- those of every interpolation hole, in source order: the lexer reads each
+-- hole in a run of its own, but a hole's integer literal is authored text like
+-- any other.
 record PreviewSource {
 	source: LexedSource,
-	tokens: List[Token]
+	tokens: List[Token],
+	hole_tokens: List[Token]
 }
 
 
 pure func preview_source(lexed: LexedModule) -> PreviewSource:
-	{ source = lexed.source, tokens = lexed.tokens }
+	{
+		source = lexed.source, tokens = lexed.tokens,
+		hole_tokens = hole_tokens(lexed).sort_by(pure func(token): span_start(token.span))
+	}
+
+
+-- Every hole's tokens, nested strings' holes included, found by a worklist of
+-- token runs: the module's own, then each hole's. Each hole is lexed once per
+-- preview source, which tooling builds once per module.
+private pure func hole_tokens(lexed: LexedModule) -> List[Token]:
+	var runs: List[(List[Token], List[InterpolationScan])] = [(lexed.tokens, lexed.source.interpolations)]
+	var collected: List[Token] = []
+	var next_run: Int = 0
+
+	while next_run < runs.length():
+		match runs.get(next_run):
+			Some((tokens, scans)):
+				for token in tokens:
+					if token.kind == InterpolatedStringToken or token.kind == InterpolatedPipeStringToken:
+						match scans.get(token.payload):
+							Some(scan):
+								for piece in scan.pieces:
+									match piece:
+										ScannedHole(hole):
+											run = lex_hole(lexed.module, lexed.source.text, lexed.spellings, hole.expression_start, hole.expression_end)
+											for inner in run.tokens:
+												if inner.kind != EndOfFileToken:
+													collected = collected.append(inner)
+											runs = runs.append((run.tokens, run.interpolations))
+										_:
+											void
+							None:
+								void
+			None:
+				void
+
+		next_run += 1
+
+	collected
 
 
 pure func preview_span_text(preview: PreviewSource, span: Span) -> String:
@@ -29,14 +73,22 @@ private pure func is_layout_token(kind: TokenKind) -> Bool:
 -- Validate the exact lexical shape: opening groups, one integer, closing groups.
 -- A lower-bound search avoids rescanning the module for every numeric leaf.
 pure func preview_integer_literal_text(preview: PreviewSource, span: Span) -> Option[String]:
+	match integer_literal_text_in(preview, preview.tokens, span):
+		Some(digits):
+			Some(digits)
+		None:
+			integer_literal_text_in(preview, preview.hole_tokens, span)
+
+
+private pure func integer_literal_text_in(preview: PreviewSource, tokens: List[Token], span: Span) -> Option[String]:
 	var lower: Int = 0
-	var upper: Int = preview.tokens.length()
+	var upper: Int = tokens.length()
 	var valid: Bool = True
 
 	while valid and lower < upper:
 		middle: Int = (lower + upper) / 2
 
-		match preview.tokens.get(middle):
+		match tokens.get(middle):
 			Some(token):
 				if span_start(token.span) < span_start(span):
 					lower = middle + 1
@@ -53,8 +105,8 @@ pure func preview_integer_literal_text(preview: PreviewSource, span: Span) -> Op
 
 	-- A literal that starts a block follows layout tokens that begin where it
 	-- does: they own no bytes of the literal's span.
-	while valid and index < preview.tokens.length():
-		match preview.tokens.get(index):
+	while valid and index < tokens.length():
+		match tokens.get(index):
 			Some(token):
 				if is_layout_token(token.kind) and span_end(token.span) <= span_start(span):
 					index += 1
@@ -64,8 +116,8 @@ pure func preview_integer_literal_text(preview: PreviewSource, span: Span) -> Op
 				valid = False
 	lower = index
 
-	while valid and index < preview.tokens.length():
-		match preview.tokens.get(index):
+	while valid and index < tokens.length():
+		match tokens.get(index):
 			None:
 				valid = False
 			Some(token):
@@ -147,13 +199,21 @@ pure func preview_variadic_wildcard_span(preview: PreviewSource, span: Span) -> 
 -- The authored digits of the numeric literal that ends `span`: the whole span
 -- of an unsigned number pattern, or the token after a sign.
 pure func preview_number_literal_text(preview: PreviewSource, span: Span) -> Option[String]:
+	match number_literal_text_in(preview, preview.tokens, span):
+		Some(digits):
+			Some(digits)
+		None:
+			number_literal_text_in(preview, preview.hole_tokens, span)
+
+
+private pure func number_literal_text_in(preview: PreviewSource, tokens: List[Token], span: Span) -> Option[String]:
 	var lower: Int = 0
-	var upper: Int = preview.tokens.length()
+	var upper: Int = tokens.length()
 
 	while lower < upper:
 		middle: Int = (lower + upper) / 2
 
-		match preview.tokens.get(middle):
+		match tokens.get(middle):
 			Some(token):
 				if span_start(token.span) < span_start(span):
 					lower = middle + 1
@@ -165,8 +225,8 @@ pure func preview_number_literal_text(preview: PreviewSource, span: Span) -> Opt
 	var index: Int = lower
 	var literal: Option[Token] = None
 
-	while index < preview.tokens.length():
-		match preview.tokens.get(index):
+	while index < tokens.length():
+		match tokens.get(index):
 			Some(token):
 				if span_start(token.span) >= span_end(span):
 					break

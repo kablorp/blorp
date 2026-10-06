@@ -2,7 +2,8 @@
 -- only after a diagnostic, inside a rejected declaration preview. This module
 -- exposes no AcceptedSource or ModuleSyntax constructor.
 import:
-	../lex/lexed_module: LexedModule, LexedSource, LiteralValue
+	../lex/lexed_module: HoleScan, InterpolationScan, LexedModule, LexedSource, LiteralValue
+	../lex/lexer: lex_hole
 	../syntax/declarations:
 		AliasDeclaration,
 		AliasForm,
@@ -31,7 +32,7 @@ import:
 		),
 		SyntaxDiagnosticAt,
 	../syntax/expressions:
-		Block, ElseIfExpression, Expression, ExpressionKind, IfExpression, Statement, StatementKind, SubscriptPlace
+		Block, ElseIfExpression, Expression, ExpressionKind, Hole, IfExpression, Statement, StatementKind, SubscriptPlace
 	../syntax/foreign_blocks: ForeignCName, ForeignFunction
 	../syntax/ids:
 		IdMint,
@@ -51,6 +52,7 @@ import:
 		minted_foreign_function,
 		minted_function,
 		minted_global,
+		minted_hole,
 		minted_import,
 		minted_name_use,
 		minted_pattern,
@@ -75,6 +77,7 @@ import:
 		ExpectedTokenDiagnostic(ExpectedName),
 		NameConstruct(NameInVariantName, NameInParameterName, NameInVariableName),
 	../tables/ids: ModuleId
+	debug as dbg
 	../tables/row_kinds: Purity, Visibility
 	../tables/source_position: column_at
 	../tables/span: Span, pack_span, span_end, span_source, span_start
@@ -87,7 +90,7 @@ import:
 			PipeStringToken, RawPipeStringToken, DocStringToken, EndOfFileToken, NewlineToken,
 			DedentToken, ColonSymbol, CommaSymbol, LeftParenSymbol, RightBracketSymbol,
 			RightParenSymbol, LeftBracketSymbol, LeftBraceSymbol, RightBraceSymbol,
-			UnderscoreSymbol,
+			UnderscoreSymbol, InterpolatedStringToken, InterpolatedPipeStringToken,
 		),
 		fixed_token_spelling,
 	token_cursor:
@@ -293,6 +296,92 @@ pure func resumed_after(state: ParseState, reached: ParseState) -> ParseState:
 	own: ParseFields = from_opaque ParseState(state)
 	other: ParseFields = from_opaque ParseState(reached)
 	into_opaque ParseState({ other | mint = own.mint })
+
+
+---
+Reports an input the lexer and `new_parse_state` already validated as
+impossible. A debug build stops with the message, so the broken caller is found
+where it read; a release build goes on with the documented fallback, since a
+language-level operation must not crash. `guarantee` says why it cannot occur.
+---
+pure func report_unreachable_input(guarantee: String):
+	debug:
+		dbg.error("the parser met an input that cannot occur: ${guarantee}")
+
+
+---
+The outer parse an interpolation hole replaced: its cursor and its source.
+---
+opaque type ParkedParse = ParkedFields
+
+private record ParkedFields {
+	cursor: TokenCursor,
+	source: LexedSource
+}
+
+
+---
+The interpolated string under the cursor: its text pieces and holes.
+---
+pure func current_interpolation(state: ParseState) -> Option[InterpolationScan]:
+	fields: ParseFields = from_opaque ParseState(state)
+	token: Token = cursor_token(fields.cursor)
+
+	match token.kind:
+		InterpolatedStringToken | InterpolatedPipeStringToken:
+			fields.source.interpolations.get(token.payload)
+		_:
+			None
+
+
+---
+`state` reading one hole's expression: the hole's bytes lexed into a run of
+its own, ending in its end-of-file token, with the module's spellings after
+it and the module's own mint, diagnostics and line starts. The outer parse
+is parked for `left_hole`. A hole whose bytes do not lex cleanly has no
+entry, so the whole string stays outside the slice.
+---
+pure func entered_hole(state: ParseState, hole: HoleScan) -> Option[(ParseState, ParkedParse)]:
+	fields: ParseFields = from_opaque ParseState(state)
+	run = lex_hole(fields.module, fields.source.text, fields.spellings, hole.expression_start, hole.expression_end)
+	inside: LexedSource = {
+		text = fields.source.text,
+		literals = run.literals,
+		interpolations = run.interpolations
+	}
+	lexed: LexedModule = {
+		module = fields.module,
+		source = inside,
+		tokens = run.tokens,
+		spellings = run.spellings,
+		line_starts = fields.line_starts,
+		diagnostics = []
+	}
+
+	if not run.diagnostics.is_empty():
+		None
+	else:
+		match new_token_cursor(lexed):
+			Ok(cursor):
+				Some((
+					into_opaque ParseState({ fields | cursor = cursor, source = inside, spellings = run.spellings }),
+					into_opaque ParkedParse({ cursor = fields.cursor, source = fields.source })
+				))
+			Err(_):
+				-- The hole's tokens come from the lexer run just made, whose own
+				-- diagnostics were empty, so the cursor's payload checks cannot fail.
+				report_unreachable_input("a cleanly lexed interpolation hole yields a valid token cursor")
+				None
+
+
+---
+`state` back in the parse `parked` set aside, keeping what the hole added:
+spellings, diagnostics and the mint.
+---
+pure func left_hole(state: ParseState, parked: ParkedParse) -> ParseState:
+	fields: ParseFields = from_opaque ParseState(state)
+	outer: ParkedFields = from_opaque ParkedParse(parked)
+	into_opaque ParseState({ fields | cursor = outer.cursor, source = outer.source })
 
 
 pure func diagnostic_count(state: ParseState) -> Int:
@@ -787,6 +876,12 @@ pure func finished_function(
 	fields: ParseFields = from_opaque ParseState(state)
 	(mint, declaration) = minted_function(fields.mint, visibility, documentation, annotations, function, span)
 	(into_opaque ParseState({ fields | mint = mint }), declaration)
+
+
+pure func finished_hole(state: ParseState, value: Expression, span: Span) -> (ParseState, Hole):
+	fields: ParseFields = from_opaque ParseState(state)
+	(mint, hole) = minted_hole(fields.mint, value, span)
+	(into_opaque ParseState({ fields | mint = mint }), hole)
 
 
 pure func finished_binder(state: ParseState, name: WrittenName) -> (ParseState, Binder):

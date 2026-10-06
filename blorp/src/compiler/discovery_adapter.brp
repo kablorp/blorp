@@ -4502,9 +4502,48 @@ private union PreviewExpressionContinuation:
 	VisitPreviewArguments(PreviewArgumentOperator, List[TreeExpressions.Expression], Span)
 	FinishPreviewArgument(PreviewArgumentOperator, ParsedExpr, List[TreeExpressions.Expression], Int, List[ParsedExpr], Span)
 	FinishPreviewListItem(List[TreeExpressions.Expression], Int, List[ParsedExpr], Span)
+	FinishPreviewInterpolationHole(PreviewInterpolation, Span)
 	FinishPreviewUnary(ParsedUnaryOp, Span)
 	VisitPreviewRight(PreviewPairOperator, TreeExpressions.Expression, Span)
 	FinishPreviewPair(PreviewPairOperator, ParsedExpr, Span)
+
+
+-- An interpolated string being rebuilt: its pieces, the next one to read, the
+-- parts rebuilt so far, and its own form and span.
+private record PreviewInterpolation {
+	pieces: List[TreeExpressions.InterpolationPiece],
+	next: Int,
+	parts: List[ParsedStringInterpolationPart],
+	is_multiline: Bool,
+	span: Span
+}
+
+
+-- Text pieces are appended as they are met; the walk stops at the next hole,
+-- whose value the expression walk must visit before the string continues.
+private union PreviewInterpolationStep:
+	ReadPreviewHole(TreeExpressions.Hole, PreviewInterpolation)
+	FinishedPreviewInterpolation(ParsedExpr)
+
+
+private pure func next_interpolation_step(interpolation: PreviewInterpolation) -> PreviewInterpolationStep:
+	var parts: List[ParsedStringInterpolationPart] = interpolation.parts
+	var index: Int = interpolation.next
+	var hole: Option[TreeExpressions.Hole] = None
+	while hole.is_none() and index < interpolation.pieces.length():
+		match interpolation.pieces.get(index):
+			Some(TreeExpressions.InterpolationText(text)):
+				parts = parts.append(ParsedInterpolationLiteral(text))
+			Some(TreeExpressions.InterpolationHole(found)):
+				hole = Some(found)
+			None:
+				void
+		index += 1
+	match hole:
+		Some(found):
+			ReadPreviewHole(found, { interpolation | next = index, parts = parts })
+		None:
+			FinishedPreviewInterpolation(ParsedStringInterpolationPartsExpr(parts, interpolation.is_multiline, legacy_location(interpolation.span)))
 
 
 private union PreviewExpressionWalk:
@@ -4539,6 +4578,20 @@ pure func legacy_expression_preview(
 								break
 					TreeExpressions.FloatLiteral(literal):
 						walk = ReturnPreviewExpression(ParsedFloatLiteralExpr(literal.written_digits(), location))
+					TreeExpressions.StringLiteral(form, text):
+						walk = ReturnPreviewExpression(ParsedStringLiteralExpr(text, legacy_string_form(form), location))
+					TreeExpressions.CharacterLiteral(character):
+						walk = ReturnPreviewExpression(ParsedCharLiteralExpr(character.to_int(), location))
+					TreeExpressions.InterpolatedString(form, pieces):
+						is_multiline: Bool = match form:
+							TreeExpressions.QuotedInterpolation: False
+							TreeExpressions.PipeInterpolation: True
+						match next_interpolation_step({ pieces = pieces, next = 0, parts = [], is_multiline = is_multiline, span = current.span }):
+							ReadPreviewHole(hole, interpolation):
+								continuations = continuations.append(FinishPreviewInterpolationHole(interpolation, hole.span))
+								walk = VisitPreviewExpression(hole.value)
+							FinishedPreviewInterpolation(finished):
+								walk = ReturnPreviewExpression(finished)
 					TreeExpressions.BooleanLiteral(literal):
 						walk = ReturnPreviewExpression(ParsedBoolLiteralExpr(literal, location))
 					TreeExpressions.VoidValue:
@@ -4615,6 +4668,14 @@ pure func legacy_expression_preview(
 									Some(item):
 										continuations = continuations.append(FinishPreviewListItem(items, next + 1, completed_items, span))
 										walk = VisitPreviewExpression(item)
+							FinishPreviewInterpolationHole(interpolation, hole_span):
+								read: PreviewInterpolation = { interpolation | parts = interpolation.parts.append(ParsedInterpolationExpr(completed, legacy_location(hole_span))) }
+								match next_interpolation_step(read):
+									ReadPreviewHole(hole, next_interpolation):
+										continuations = continuations.append(FinishPreviewInterpolationHole(next_interpolation, hole.span))
+										walk = VisitPreviewExpression(hole.value)
+									FinishedPreviewInterpolation(finished):
+										walk = ReturnPreviewExpression(finished)
 							FinishPreviewUnary(operator, span):
 								walk = ReturnPreviewExpression(ParsedUnaryExpr(operator, completed, legacy_location(span)))
 							VisitPreviewRight(operator, right, span):
@@ -4628,6 +4689,14 @@ pure func legacy_expression_preview(
 									PreviewRangeOperator: ParsedRangeExpr(left, completed, location)
 								walk = ReturnPreviewExpression(parsed)
 	result
+
+
+private pure func legacy_string_form(form: TreePatterns.StringForm) -> ParsedStringLiteralForm:
+	match form:
+		TreePatterns.QuotedString: ParsedPlainStringLiteral
+		TreePatterns.RawString: ParsedRawStringLiteral
+		TreePatterns.PipeString: ParsedPipeStringLiteral
+		TreePatterns.RawPipeString: ParsedRawPipeStringLiteral
 
 
 private pure func preview_argument_expression(
@@ -4681,6 +4750,10 @@ private pure func legacy_optional_body_preview(
 			Ok((extended, Some(projected)))
 		None:
 			Ok((names, None))
+
+
+-- The name the frozen parser gives a discarded binder.
+private PREVIEW_DISCARD_NAME: String = "_"
 
 
 -- Bodies, blocks and statements. Statements are expressions in the frozen
@@ -4821,70 +4894,63 @@ private pure func legacy_statement_expression_preview(
 			legacy_expression_preview(source, names, expression)
 
 
--- One `if` or `else if` of a chain, projected before the links that follow it.
-private record PreviewIfLink {
-	preceding_else: Option[Span],
+-- One `else if` of a chain, projected before the links that follow it. The
+-- `else` keyword before it belongs to the branch that holds this link.
+private record PreviewElseIfLink {
+	else_keyword: Span,
 	span: Span,
 	condition: ParsedExpr,
 	then_block: ParsedExpr
 }
 
 
--- Names follow written order: each link's condition and block, then the final
--- `else` block. The nested `ParsedIfExpr`s are then built from the last link
--- back, so no recursion follows the length of the chain.
+-- Names follow written order: the head's condition and block, each `else if`
+-- link's, then the final `else` block. The nested `ParsedIfExpr`s are then
+-- built from the last link back, so no recursion follows the length of the
+-- chain.
 private pure func legacy_conditional_preview(
 	source: PreviewSource, names: NameTable, conditional: TreeExpressions.IfExpression, span: Span,
 ) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
-	var extended: NameTable = names
-	var links: List[PreviewIfLink] = []
-	var current: TreeExpressions.IfExpression = conditional
-	var current_span: Span = span
-	var preceding_else: Option[Span] = None
+	translated_head ?= legacy_if_link_preview(source, names, conditional)
+	(after_head, head_condition, head_block) = translated_head
+	var extended: NameTable = after_head
+	var else_ifs: List[PreviewElseIfLink] = []
 	var final_else: Option[ParsedElseBranch] = None
 	var failure: Option[LegacyDeclarationPreviewError] = None
-	var walking: Bool = True
-	while walking:
-		match legacy_if_link_preview(source, extended, current):
-			Err(error):
-				failure = Some(error)
-				walking = False
-			Ok((after_link, condition, then_block)):
-				extended = after_link
-				links = links.append({ preceding_else = preceding_else, span = current_span, condition = condition, then_block = then_block })
-				match current.else_branch:
-					None:
-						walking = False
-					Some(written):
-						match written.body:
-							TreeExpressions.ElseBlock(block):
-								match legacy_block_preview(source, extended, block):
-									Ok((after_block, else_block)):
-										extended = after_block
-										final_else = Some(parsed_else_branch(written.keyword, else_block))
-									Err(error):
-										failure = Some(error)
-								walking = False
-							TreeExpressions.ElseIf(else_if):
-								preceding_else = Some(written.keyword)
-								current = else_if.conditional
-								current_span = else_if.span
+	var branch: Option[TreeExpressions.ElseBranch] = conditional.else_branch
+	while branch.is_some() and failure.is_none():
+		match branch:
+			Some(written):
+				match written.body:
+					TreeExpressions.ElseBlock(block):
+						match legacy_block_preview(source, extended, block):
+							Ok((after_block, else_block)):
+								extended = after_block
+								final_else = Some(parsed_else_branch(written.keyword, else_block))
+							Err(error):
+								failure = Some(error)
+						branch = None
+					TreeExpressions.ElseIf(else_if):
+						match legacy_if_link_preview(source, extended, else_if.conditional):
+							Ok((after_link, condition, then_block)):
+								extended = after_link
+								else_ifs = else_ifs.append({
+									else_keyword = written.keyword, span = else_if.span, condition = condition, then_block = then_block
+								})
+								branch = else_if.conditional.else_branch
+							Err(error):
+								failure = Some(error)
+			None:
+				void
 	match failure:
 		Some(error):
 			Err(error)
 		None:
 			var else_branch: Option[ParsedElseBranch] = final_else
-			-- The head link is the last one built, and the chain always holds it.
-			var built: Option[ParsedExpr] = None
-			for link in links.reverse():
+			for link in else_ifs.reverse():
 				chained: ParsedExpr = ParsedIfExpr(link.condition, link.then_block, else_branch, legacy_location(link.span))
-				else_branch = link.preceding_else.map(pure func(keyword): parsed_else_branch(keyword, chained))
-				built = Some(chained)
-			match built:
-				Some(head):
-					Ok((extended, head))
-				None:
-					Err(UnsupportedBodyStatement(span))
+				else_branch = Some(parsed_else_branch(link.else_keyword, chained))
+			Ok((extended, ParsedIfExpr(head_condition, head_block, else_branch, legacy_location(span))))
 
 
 private pure func parsed_else_branch(keyword: Span, body: ParsedExpr) -> ParsedElseBranch:
@@ -4960,12 +5026,7 @@ private pure func legacy_pattern_preview(
 		TreePatterns.FloatPattern(sign, literal):
 			Ok((names, ParsedFloatPattern(signed_pattern_digits(sign, literal.written_digits()), location)))
 		TreePatterns.StringPattern(form, text):
-			legacy_form: ParsedStringLiteralForm = match form:
-				TreePatterns.QuotedString: ParsedPlainStringLiteral
-				TreePatterns.RawString: ParsedRawStringLiteral
-				TreePatterns.PipeString: ParsedPipeStringLiteral
-				TreePatterns.RawPipeString: ParsedRawPipeStringLiteral
-			Ok((names, ParsedStringPattern(text, legacy_form, location)))
+			Ok((names, ParsedStringPattern(text, legacy_string_form(form), location)))
 		TreePatterns.CharacterPattern(character):
 			Ok((names, ParsedCharPattern(character.to_int(), location)))
 		TreePatterns.BooleanPattern(value):
@@ -5050,10 +5111,6 @@ private pure func signed_pattern_digits(sign: TreePatterns.Sign, digits: String)
 	match sign:
 		TreePatterns.NonNegative: digits
 		TreePatterns.Negative: NEGATIVE_SIGN + digits
-
-
--- The name the frozen parser gives a discarded binder.
-private PREVIEW_DISCARD_NAME: String = "_"
 
 
 

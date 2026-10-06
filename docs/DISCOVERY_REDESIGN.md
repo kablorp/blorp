@@ -3428,6 +3428,49 @@ parse (the census holds), dump and projection to a 2,000-deep `ParsedIfExpr`,
 and 5,000 statements through the same three. `compiler-new` passed 853/853,
 `compiler-new-parity` 3,560/3,560 and `compiler-blorp` 6,629/6,629.
 
+The string-literal slice adds quoted, raw and pipe string literals, character
+literals and interpolated strings to the expression grammar, so every
+statement, condition, global initializer and call argument of the previous
+slices may hold them. A literal is an atom whose recipe keeps the checked text
+or codepoint. An interpolated string reads each hole as an expression: the
+hole's bytes are lexed into a token run of their own (`entered_hole`, which
+parks the outer cursor and source and takes the module's spellings), parsed to
+a recipe that must end at the run's end of file, and handed back
+(`left_hole`). The string's recipe holds hole recipes, so recognition still
+issues no id; minting walks the pieces in written order, each hole's value
+before the hole (an `ExpressionId` of its own) and the string last. A hole that
+does not lex cleanly or is not exactly one supported expression leaves the
+whole string unsupported, and the entry points restore the exact entry state,
+spellings included, even after an earlier hole read and interned names. The
+projection walks holes with the same continuation stack as other nested
+expressions. A hole's integer literal is authored text in a token run the
+module's token list does not hold, so `PreviewSource` also carries every hole's
+tokens, sorted by position, and the digit lookups search them after the
+module's own. The tree-prefix parity now accepts the one fixture on which the
+existing lexer mis-reads three-level nesting, through the same allowance the
+full adapter differential uses.
+
+Two constraints follow for the slices after this one. A pipe string or pipe
+interpolation is only ever an indented value (`x =` then an indented line), which
+the statement grammar does not read yet, so the pipe forms are tested at the
+expression level; they gain statement coverage with indented values. And a
+hole's tokens are indexed within the hole's own run, which no caller can see:
+a later slice that allows a lambda, a `match` or any construct that replays
+from a recorded token inside a hole must not replay by token index, and needs
+the hole's run kept with the recipe or the construct kept out of holes.
+
+On the 3,405-module "every corpus file as a root" run, the modules whose first
+stop is a function fell from 2,019 to 1,885, completed declarations rose from
+8,139 to 11,714 and functions with bodies from 2,759 to 4,841; global
+initializer stops fell from 359 to 257, and trait and implementation stops
+read 70 and 69 (66 and 65). The same base and tooling, with strings still
+rolling back, gave the first figures. There were no rejected or non-progress
+stops and no differing file in the parity gate. The 1,885 remaining function
+stops are bodies that use `?=`, tuple and braced forms (the parallel
+expression work), lambdas, local functions, `with`, `concurrent`, `select`,
+`debug:` and values on the line after their operator. `compiler-new` passed
+856/856, `compiler-new-parity` 3,563/3,563 and `compiler-blorp` 6,631/6,631.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a

@@ -6,8 +6,10 @@ import:
 	../../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser:
 		parse_same_line_expression, ExpressionParse(ParsedExpression, UnsupportedExpression, RejectedExpression)
 	../../../../src/compiler_new/stage_01_discovery/syntax/expressions:
-		ExpressionKind(NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral),
-		UnaryOperator(Negate), BinaryOperator(Add, Multiply), LogicalOperator(LogicalOr, LogicalAnd)
+		ExpressionKind(StringLiteral, CharacterLiteral, InterpolatedString, NameReference, IntegerLiteral, Unary, Binary, ShortCircuit, RangeExpression, Call, FieldAccess, Subscript, ListLiteral),
+		UnaryOperator(Negate), BinaryOperator(Add, Multiply), LogicalOperator(LogicalOr, LogicalAnd),
+		InterpolationForm(QuotedInterpolation, PipeInterpolation), InterpolationPiece(InterpolationText, InterpolationHole)
+	../../../../src/compiler_new/stage_01_discovery/syntax/patterns: StringForm(QuotedString, RawString, PipeString, RawPipeString)
 	../../../../src/compiler_new/stage_01_discovery/syntax/diagnostics: SyntaxDiagnostic(Plain, ExpectedToken)
 	../../../../src/compiler_new/stage_01_discovery/tables/diagnostic_code: PlainSyntaxCode(ExpectedExpressionDiagnostic)
 	../../../../src/compiler_new/stage_01_discovery/tables/expected_token:
@@ -94,10 +96,18 @@ pure func test_logical_and_range_have_explicit_forms() -> Bool:
 		Err(_): False
 
 
+-- An interpolation hole, spelled without opening one in this file's own string.
+pure func hole(text: String) -> String:
+	"$" + "{" + text + "}"
+
+
 pure func test_unsupported_returns_original_state() -> Bool:
 	var correct = True
-	for text in ["call({1, 2})", "name.field(1, {x = 2})", "(first, other)", "1\n.field", "1\n\t.field", "1 +\n 2", "(\n1)", "not {1, 2}", "first + \"text\"", "(\n)", "(007\n)", "(name\n)", "f(1,\n2)", "f(\n)", "f(x)[{1}]", "f(if True: 1 else: 2)", "f(x)\n.member", "target.member(1, {2})", "f(,x)", "f(x]",
-		"[1,\n2]", "[\n]", "[\n1]", "[1\n]", "[1 2]", "[,]", "[,1]", "[1,,2]", "[1, {x = 2}]", "[\"text\"]", "[(1, 2)]", "[if True: 1 else: 2]", "[1)", "[1}", "[[1], {2}]", "{a => b}", "[1]\n.length()", "[1]\n\t.length()", "first + [1,\n2]"]:
+	for text in ["call({1, 2})", "name.field(1, {x = 2})", "(first, other)", "1\n.field", "1\n\t.field", "1 +\n 2", "(\n1)", "not {1, 2}", "(\n)", "(007\n)", "(name\n)", "f(1,\n2)", "f(\n)", "f(x)[{1}]", "f(if True: 1 else: 2)", "f(x)\n.member", "target.member(1, {2})", "f(,x)", "f(x]",
+		"[1,\n2]", "[\n]", "[\n1]", "[1\n]", "[1 2]", "[,]", "[,1]", "[1,,2]", "[1, {x = 2}]", "[(1, 2)]", "[if True: 1 else: 2]", "[1)", "[1}", "[[1], {2}]", "{a => b}", "[1]\n.length()", "[1]\n\t.length()", "first + [1,\n2]"].concat(
+		-- A hole outside the grammar leaves the whole string unsupported, even after
+		-- an earlier hole read and interned its names.
+		["first + \"" + hole("a") + " " + hole("b c") + "\"", "\"" + hole("") + "\"", "[\"" + hole("a") + hole("{1}") + "\"]", "\"" + hole("\\\"") + "\""]):
 		match new_parse_state(lex_module(module_id_at_row(0), text)):
 			Ok(entry):
 				(parsed, result) = parse_same_line_expression(entry)
@@ -114,6 +124,114 @@ pure func test_unsupported_returns_original_state() -> Bool:
 					_: correct = False
 			Err(_): correct = False
 	correct
+
+
+private pure func form_name(form: StringForm) -> String:
+	match form:
+		QuotedString: "quoted"
+		RawString: "raw"
+		PipeString: "pipe"
+		RawPipeString: "raw pipe"
+
+
+-- The form and decoded text of the one string literal `text` is, or nothing.
+private pure func string_literal_of(text: String) -> Option[(String, String)]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						StringLiteral(form, decoded):
+							if parsed.issued_counts().expressions == 1 and parsed.diagnostic_count() == 0 and value.span.span_end() == text.length():
+								Some((form_name(form), decoded))
+							else:
+								None
+						_: None
+				_: None
+		Err(_): None
+
+
+private pure func character_literal_of(text: String) -> Option[Char]:
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						CharacterLiteral(character):
+							if parsed.issued_counts().expressions == 1 and parsed.diagnostic_count() == 0:
+								Some(character)
+							else:
+								None
+						_: None
+				_: None
+		Err(_): None
+
+
+-- Every string token kind keeps its own form and its decoded text.
+pure func test_string_literals_keep_their_form_and_text() -> Bool:
+	plain: Bool = string_literal_of("\"plain\"") == Some(("quoted", "plain")) and string_literal_of("\"\"") == Some(("quoted", ""))
+	escaped: Bool = string_literal_of("\"tab\\there \\\\ \\\" \\u{41}\"") == Some(("quoted", "tab\there \\ \" A"))
+	multiline: Bool = string_literal_of("raw\"a\\nb\"") == Some(("raw", "a\\nb")) and string_literal_of("|one\n|two") == Some(("pipe", "one\ntwo")) and string_literal_of("raw\n|a\\b\n|c") == Some(("raw pipe", "a\\b\nc"))
+	plain and escaped and multiline
+
+
+pure func test_character_literals_decode_every_escape() -> Bool:
+	simple: Bool = character_literal_of("'c'") == Some('c') and character_literal_of("'\\n'") == Some('\n') and character_literal_of("'\\\\'") == Some('\\')
+	simple and character_literal_of("'\\''") == Some('\'') and character_literal_of("'\\u{41}'") == Some('A') and character_literal_of("'\\u{1F600}'") == Some(to_char(128512))
+
+
+-- A pipe string with holes is multiline, and its pieces keep the line break.
+pure func test_pipe_interpolation_is_multiline_with_text_around_its_holes() -> Bool:
+	text = "|a " + hole("b") + "\n|c"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						InterpolatedString(PipeInterpolation, [InterpolationText(first), InterpolationHole(_), InterpolationText(last)]):
+							first == "a " and last == "\nc" and parsed.issued_counts().expressions == 3 and parsed.diagnostic_count() == 0
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_string_and_character_literals_are_atoms() -> Bool:
+	var correct = True
+	for (text, expected) in [("\"plain\"", "string"), ("raw\"x\"", "string"), ("'c'", "char")]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(parsed, result) = parse_same_line_expression(entry)
+				match result:
+					ParsedExpression(value):
+						kind_matches: Bool = match value.kind:
+							StringLiteral(_, _): expected == "string"
+							CharacterLiteral(_): expected == "char"
+							_: False
+						correct = correct and kind_matches and value.span.span_end() == text.length() and parsed.id_counts() == [1, 0, 0, 0, 0, 0, 0, 0, 0] and parsed.diagnostic_count() == 0
+					_: correct = False
+			Err(_): correct = False
+	correct
+
+
+pure func test_interpolated_string_holes_are_expressions_in_source_order() -> Bool:
+	text = "\"x " + hole("a") + " y " + hole("b.c(1)") + "\""
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Ok(entry):
+			(parsed, result) = parse_same_line_expression(entry)
+			match result:
+				ParsedExpression(value):
+					match value.kind:
+						InterpolatedString(QuotedInterpolation, [InterpolationText(first_text), InterpolationHole(first), InterpolationText(second_text), InterpolationHole(second)]):
+							-- a, hole, b, c, 1, call, hole, then the string itself.
+							(first_text == "x " and second_text == " y " and first.id.expression_local_index() == 1
+								and second.id.expression_local_index() == 6 and value.id.expression_local_index() == 7
+								and parsed.issued_counts().expressions == 8 and parsed.diagnostic_count() == 0)
+						_: False
+				_: False
+		Err(_): False
 
 
 pure func test_rejection_issues_no_ids() -> Bool:
@@ -415,6 +533,11 @@ tests: TestSuite = {
 	description = "Bounded tree operator expressions",
 	tests = [
 		("precedence and postorder ids", test_precedence_and_postorder_ids),
+		("string and character literals", test_string_and_character_literals_are_atoms),
+		("string literals keep form and text", test_string_literals_keep_their_form_and_text),
+		("character escapes", test_character_literals_decode_every_escape),
+		("pipe interpolation is multiline", test_pipe_interpolation_is_multiline_with_text_around_its_holes),
+		("interpolation holes in source order", test_interpolated_string_holes_are_expressions_in_source_order),
 		("grouping keeps identity and token name span", test_grouping_preserves_identity_and_name_token_span),
 		("logical and range forms", test_logical_and_range_have_explicit_forms),
 		("unsupported exact rollback", test_unsupported_returns_original_state),

@@ -40,7 +40,9 @@ hole, and braces and backslashes before the first hole.
 - `blorp/test/compiler/tools/fixtures/known_differences/interpolation_nesting.brp`
   is in the corpus; the adapter differential reports it, and
   `ADAPTER_DIFFERENCES` in `scripts/compiler-new-parity` lists the difference
-  with this reason.
+  with this reason. The tree-prefix check of the same script is a second user
+  of that entry: it compares the tree path's completed function bodies, which
+  now hold strings, and accepts exactly the differences the entry names.
 - `blorp/test/compiler/tools/fixtures/known_differences/interpolation_pipe_braces.brp`
   is in the corpus; the existing parser rejects it and the stage accepts it, and
   `KNOWN_DIVERGENCES` in `scripts/compiler-new-parity` lists it.

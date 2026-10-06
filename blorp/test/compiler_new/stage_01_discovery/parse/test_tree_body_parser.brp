@@ -27,6 +27,11 @@ private pure func joined_lines(lines: List[String]) -> String:
 	lines.join("\n")
 
 
+-- An interpolation hole, spelled without opening one in this file's own string.
+private pure func hole(text: String) -> String:
+	"$" + "{" + text + "}"
+
+
 private pure func scanned(text: String) -> Option[(ParseState, ModuleDeclarationPreviewScan)]:
 	match new_parse_state(lex_module(module_id_at_row(0), text)):
 		Ok(state):
@@ -122,7 +127,7 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 	var correct: Bool = True
 	for body in [
 		["\tx ?= f()"],
-		["\ta = 1", "\tb = \"text\""],
+		["\ta = 1", "\tb ?= f()"],
 		["\t(a, b) = pair"],
 		["\tx =", "\t\t1"],
 		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2"],
@@ -139,8 +144,11 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\tif a:", "\t\tb", "\telse", "\t\tc"],
 		["\tp.x = 1"],
 		["\ta = 1", "\tb = [", "\t\t1", "\t]"],
+		["\tvalue = \"" + hole("a b") + "\""],
+		["\tvalue = \"" + hole("") + "\""],
+		["\tvalue = \"" + hole("first") + " and " + hole("second third") + "\""],
 		-- A type and a pattern parsed to find their ends issue no ids that survive.
-		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\tflag = \"text\""]
+		["\tcount: Int = 1", "\tmatch count:", "\t\tSome(inner): inner", "\tflag ?= f()"]
 	]:
 		text = source_lines(["func f() -> Int:"].concat(body))
 		match (scanned(text), new_parse_state(lex_module(module_id_at_row(0), text))):
@@ -170,7 +178,20 @@ func test_types_and_patterns_are_minted_in_source_order() -> Bool:
 			dumped = completed_module(state, scan).dumped_module(spellings(state))
 			-- Header: `Int` twice (uses 0, 1). Body: the binding's `Int` (2), `v` (3),
 			-- the scrutinee `v` (4), `Some` (5), `inner` (6), then the case bodies (7, 8).
-			dumped.split("use2:\"Int\"").length() == 2 and dumped.split("use3:\"v\"").length() == 2 and dumped.split("use4:\"v\"").length() == 2 and dumped.split("(constructor-pattern pat1 @").length() == 2 and dumped.split("use5:\"Some\"").length() == 2 and dumped.split("use6:\"inner\"").length() == 2 and dumped.split("use7:\"inner\"").length() == 2
+			-- The replay of each type and pattern reports nothing.
+			state.diagnostic_count() == 0 and dumped.split("use2:\"Int\"").length() == 2 and dumped.split("use3:\"v\"").length() == 2 and dumped.split("use4:\"v\"").length() == 2 and dumped.split("(constructor-pattern pat1 @").length() == 2 and dumped.split("use5:\"Some\"").length() == 2 and dumped.split("use6:\"inner\"").length() == 2 and dumped.split("use7:\"inner\"").length() == 2
+		None: False
+
+
+-- A hole's value is minted before the hole, and the string after all of them;
+-- the hole's own id is an expression id.
+func test_interpolation_holes_are_minted_in_source_order() -> Bool:
+	text = source_lines(["func f(a: Int, b: Int):", "\t\"x " + hole("a") + " y " + hole("b + 1") + "\""])
+	match scanned(text):
+		Some((state, scan)):
+			dumped = completed_module(state, scan).dumped_module(spellings(state))
+			counts = state.issued_counts()
+			completed_count(scan) == 1 and state.diagnostic_count() == 0 and counts.expressions == 7 and dumped.split("(hole expr1 ").length() == 2 and dumped.split("(name expr2 ").length() == 2 and dumped.split("(hole expr5 ").length() == 2 and dumped.split("(interpolated expr6 ").length() == 2
 		None: False
 
 
@@ -242,7 +263,7 @@ func test_function_after_a_deferred_function_issues_only_its_own_ids() -> Bool:
 	text = source_lines([
 		"func first() -> Int:",
 		"\ta = 1",
-		"\tb = \"text\"",
+		"\tb ?= f()",
 		"func second() -> Int:",
 		"\tc = 2",
 		"\tc"
@@ -297,6 +318,7 @@ tests: TestSuite = {
 		("a function body is complete syntax with an exact census", test_function_body_is_complete_syntax_with_an_exact_census),
 		("unsupported bodies roll back exactly", test_unsupported_bodies_roll_back_exactly),
 		("types and patterns are minted in source order", test_types_and_patterns_are_minted_in_source_order),
+		("interpolation holes are minted in source order", test_interpolation_holes_are_minted_in_source_order),
 		("break and continue are supported only inside loops", test_break_and_continue_are_supported_only_inside_loops),
 		("else if links are minted inner before outer", test_else_if_chain_mints_inner_links_before_outer_ones),
 		("a function after a deferred function issues only its own ids", test_function_after_a_deferred_function_issues_only_its_own_ids),
