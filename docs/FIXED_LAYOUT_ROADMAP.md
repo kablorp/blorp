@@ -112,6 +112,80 @@ optimization implicit.
 Each optimization needs its own accept/park decision. No performance claim
 follows from static source counts, shorter C, or a microfixture alone.
 
+## Fixed-record continuation: checked layout contract
+
+The next fixed-record workstream is a future checked no-box contract, not a
+description of the landed representation. A fixed value would have a known
+shallow layout without a separate root allocation or hidden transport box.
+Managed children would still allocate and require copy/drop ownership. Source
+admission must wait until every admitted placement preserves the contract;
+unsupported erased, collection, closure, generic and foreign positions must
+produce a precise diagnostic before emission. A syntax spelling or a direct
+local oracle alone cannot establish this contract.
+
+Prioritize the existing tuple plan and measured product opportunities before
+opening this source promise. Keep `Option` and `Result` as sums: only the active
+payload is initialized and owned, and nullable, tagged and boxed specialized
+representations remain independent decisions. Record work does not authorize
+fixed-union admission, enum retirement, or replacing sum storage with ordinary
+record fields.
+
+### Recover ownership prerequisites in bounded slices
+
+Earlier value-record experiments targeted a pipeline that the landed record
+unification removed. Their checkpoints are historical evidence, not proof that
+the current managed-record tree supports owned inline values. These
+obligations remain open:
+
+1. Establish declaration/use identity across frontend lowering, specialization,
+   Core and C symbol projection. A rendered name, module-path sanitization,
+   declaration order or a second unchecked name map is not nominal identity.
+   Cover same-spelling types from distinct modules and wrong-kind uses at the
+   earliest authoritative boundary. A local `union Option[T]` and the prelude
+   `Option` already lower to one Core type reference; see
+   [`core-lowering-nominal-origin-collision`](issues/core-lowering-nominal-origin-collision.md).
+2. Bind prepared cleanup and cancellation facts to the exact final Core program.
+   Open: the actions and activations inside a present cancellation row,
+   same-shape corrupted rows, and cleanup-plan rows are not checked. Any such
+   check that can fail must return a typed error on both single- and
+   split-unit emission entries, never a default. Delete the emit-side
+   fallbacks `global_cancellation_plan_or_default`,
+   `function_cancellation_plan_or_default` and
+   `empty_cancellation_protection_plan`, which turn a missing row into an empty
+   plan.
+3. Give backend-created owners explicit site and slot provenance. Rendered C
+   text cannot prove that an expression is an addressable cleanup temporary.
+   Prepare the operation and value-versus-address callback ABI from one checked
+   authority before rendering.
+4. Prove existing ARC, ARC-only and stack-`Result` behavior first, then add one
+   owned-inline vertical slice. Direct-local tests need dynamically allocated
+   children, copy/move/update/drop, branch joins and cancellation. Test a
+   one-child and two-child owner with exact allocation/release/live counts and
+   a comparable ordinary managed-record control.
+
+Keep representation, owner existence, copy/drop, cancellation and ABI placement
+as separate explicit facts. An inline value with owned children is not an ARC
+pointer. Never substitute an empty release, inert cleanup action or generated
+error C for an unsupported owner. If a required action can only be discovered
+during rendering, convert the smallest owning call chain to a typed error
+channel before expanding admission.
+
+### Recovery and acceptance boundary
+
+Integrate the declaration/use identity candidate only after the Perceus fix on
+branch `perceus/for-loop-global-retain` lands. It repairs a heap-use-after-free
+on main: the for-loop arms in `perceus/borrowed.brp` skipped retaining a
+managed global stored into a record. Integrate declaration/use identity,
+checked plan and slot authority, and the product oracles as separate reviewed
+slices against the current APIs.
+
+Stop at any unexplained leak, retain/release, use-after-free or cancellation
+difference. Each preparatory slice must preserve existing behavior and emitted
+C where applicable; each physical-layout slice needs inspected C, exact dynamic
+ownership oracles, relevant sanitizers, the stage-2/3 C fixpoint and matched
+stage-2 allocations/retired instructions. A passing test packet, smaller C or
+a static count cannot close those gates.
+
 ## Verification
 
 Start with the owning narrow suite and `scripts/compiler-check --changed
