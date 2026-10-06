@@ -177,7 +177,11 @@ func test_unsupported_bodies_roll_back_exactly() -> Bool:
 		["\t(a, b) = pair"],
 		["\tx =", "\t\t1"],
 		["\tvalue = if flag: 1 else: 2"],
-		["\tvalue = 1 + if flag:", "\t\t1", "\telse:", "\t\t2"],
+		["\tvalue = 1 + if flag:", "\t\t1", "\telse:", "\t\t2", "\t-z"],
+		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\tand other"],
+		["\tvalue = 1 + if flag:", "\t\t1", "\telse:", "\t\t2", "\t.map(f)"],
+		["\tvalue = match flag:", "\t\t_: 1", "\t.map(f)"],
+		["\tvalue = [if flag:", "\t\t1", "\telse:", "\t\t2", "\t]"],
 		["\tvalue = f(if flag:", "\t\t1", "\telse:", "\t\t2", "\t)"],
 		["\tvalue = if flag:", "\t\t1", "\telse:", "\t\t2", "\t-z"],
 		["\tvalue = match flag:", "\t\t_: 1", "\t-z"],
@@ -465,10 +469,12 @@ func test_deep_else_if_chain_survives_parse_dump_and_census() -> Bool:
 		None: False
 
 
--- A control expression is a whole value after `=` or `op=`, and its blocks
--- end on dedents. Both sides are pinned: that shape completes, and every other
--- way of continuing past a block or indenting a tail stays deferred.
-func test_control_expression_is_only_a_whole_value() -> Bool:
+-- A control expression is an operand wherever the frozen grammar reads one at
+-- the end of a line: a statement's value, the right operand of an operator, a
+-- unary operand and an expression statement's right end. Both sides are
+-- pinned: those shapes complete, and every other way of continuing past a
+-- block, indenting a tail or bracketing one stays deferred.
+func test_control_expression_operands_complete_and_their_continuations_defer() -> Bool:
 	accepted = source_lines([
 		"func f(a: Int) -> Int:",
 		"\tx = if a:",
@@ -482,19 +488,36 @@ func test_control_expression_is_only_a_whole_value() -> Bool:
 		"\t\t_: 2",
 		"\tx += if a:",
 		"\t\ty",
+		"\tz = 1 + if a:",
+		"\t\t1",
+		"\telse:",
+		"\t\t2",
+		"\tw = -match z:",
+		"\t\t_: 1",
+		"\tz == 1 and match w:",
+		"\t\t_: True",
 		"\tx"
 	])
 	deferred = source_lines(["func f(a: Int) -> Int:", "\tx = if a:", "\t\t1", "\telse:", "\t\t2", "\t\t.tail()", "\tx"])
-	global_value = source_lines(["g = if a:", "\t1", "else:", "\t2"])
+	global_operand = source_lines(["g = 1 + if a:", "\t1", "else:", "\t2", "", "record Later {}"])
+	global_value = source_lines(["h = match a:", "\t_: 1"])
+	one_line_body = source_lines(["func k(a: Int) -> Int: match a:", "\t_: 1"])
+	one_line_lambda_body = source_lines(["func m() -> (Int) -> Int: func(x: Int) -> Int:", "\tx + 1"])
 	var correct: Bool = true_if_completed(accepted) and not true_if_completed(deferred)
-	match new_parse_state(lex_module(module_id_at_row(0), global_value)):
-		Ok(entry):
-			(state, scan) = scan_module_declaration_prefix_with_expressions(entry)
-			stopped = match scan.stop:
-				StoppedAtGlobalInitializer(_): True
-				_: False
-			correct = correct and stopped and scan.declarations.is_empty() and state.issued_counts().expressions == 0
-		Err(_): correct = False
+	for text in [global_operand, global_value]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Ok(entry):
+				(state, scan) = scan_module_declaration_prefix_with_expressions(entry)
+				correct = correct and not scan.declarations.is_empty() and state.diagnostic_count() == 0
+			Err(_): correct = False
+	-- The frozen grammar rejects a block after a same-line body; the new one
+	-- must not accept what it rejects.
+	match scanned(one_line_body):
+		Some((_, scan)): correct = correct and completed_count(scan) == 0
+		None: correct = False
+	match scanned(one_line_lambda_body):
+		Some((_, scan)): correct = correct and completed_count(scan) == 0
+		None: correct = False
 	correct
 
 
@@ -545,6 +568,23 @@ func test_deeply_nested_value_ifs_survive_parse_dump_and_census() -> Bool:
 	var level: Int = 0
 	while level < depth:
 		lines = lines.append("\t".repeat(level + 1) + "v${level} = if a:")
+		level += 1
+	lines = lines.append("\t".repeat(depth + 1) + "1")
+	match scanned(source_lines(lines)):
+		Some((state, scan)):
+			syntax = completed_module(state, scan)
+			dumped = dumped_module(syntax, spellings(state))
+			completed_count(scan) == 1 and id_census(module_id_at_row(0), syntax).is_empty() and dumped.split("(if expr").length() == depth + 1
+		None: False
+
+
+-- The same nesting through an operand: each level is `1 + if a:`.
+func test_deeply_nested_operand_ifs_survive_parse_dump_and_census() -> Bool:
+	depth = 300
+	var lines: List[String] = ["func f(a: Int) -> Int:"]
+	var level: Int = 0
+	while level < depth:
+		lines = lines.append("\t".repeat(level + 1) + "v${level} = 1 + if a:")
 		level += 1
 	lines = lines.append("\t".repeat(depth + 1) + "1")
 	match scanned(source_lines(lines)):
@@ -890,9 +930,10 @@ tests: TestSuite = {
 		("a function after a deferred function issues only its own ids", test_function_after_a_deferred_function_issues_only_its_own_ids),
 		("5000 statements", test_long_statement_list_is_read_and_minted_by_loops),
 		("2000 link else if chain", test_deep_else_if_chain_survives_parse_dump_and_census),
-		("a control expression is only a whole value", test_control_expression_is_only_a_whole_value),
+		("control expression operands complete and their continuations defer", test_control_expression_operands_complete_and_their_continuations_defer),
 		("control value ids follow source order", test_control_value_ids_follow_source_order),
 		("1000 nested value ifs", test_deeply_nested_value_ifs_survive_parse_dump_and_census),
+		("300 nested operand ifs", test_deeply_nested_operand_ifs_survive_parse_dump_and_census),
 		("2000 link else if value", test_long_else_if_value_survives_parse_dump_and_census),
 		("2000 arm match value", test_long_match_value_survives_parse_dump_and_census),
 		("with ids follow source order", test_with_ids_follow_source_order),

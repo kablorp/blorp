@@ -3437,12 +3437,41 @@ rebased build, 1,000 and 1,200 value `if`s nested one inside another pass
 parse, mint, census, dump and projection, and 1,400 overflow the native stack.
 That limit is open item D6 in section 9.
 
-The next bounded M4 slices are control expressions as operands and the
-statement forms `select`, `with`, `concurrent`, `detach` and `debug:` (the
-statement-forms slice below), then opaque conversions in a separate slice.
-Lambdas, local functions and the bodies of traits and implementations are read;
-the complete M4 gate still requires module assembly, forward pairing and the
-open depth items D5 to D7.
+Another bounded M4 increment lets a control expression be an operand: the
+right operand of a binary operator or the operand of a unary one, in a
+statement's value, an expression statement, a global initializer or a
+function's block, so `1 + if c: ...`, `-match x: ...` and `ok and match y: ...`
+read as the frozen parser reads them. An expression recipe may now hold a
+control recipe, and a control recipe holds blocks, statements and expressions,
+so the recipe types moved to `parse/recipes.brp` and the type graph has no
+cycle. The expression parser and the body parser import each other for
+functions only (`parse_control_recipe`, `mint_control`, `ends_in_control`); the
+compiler accepts mutually recursive modules and no repository check forbids
+them. A whole-value control keeps its thin front in the body parser, and the
+right operand of an operator is read through a thin front too, so the
+operator-precedence frames are not on the nesting path.
+
+An expression that ends in a control expression ends at the block's dedent, so
+it needs no newline: the next token starts the next statement or declaration,
+and `ends_in_control` says so. What may follow stays narrow: a binary
+operator, `as` or `=` after the dedent, a leading dot, a bracket or a tail
+indented past it all defer, and a control expression inside brackets defers.
+A same-line function body that ends on a later line is deferred, because the
+frozen grammar rejects a block after a one-line body. A statement of this slice
+that the new grammar accepted and the frozen one rejects would be a defect; the
+projection tests compare AST JSON for the accepted forms.
+
+Block nesting through an operand has a lower limit than through a statement's
+value, because the general expression dump and mint walkers are on the path:
+on macOS 700 nested operands pass and 900 overflow, in the dump; on Linux arm64
+300 pass and 500 overflow. The test proves 300. That is open item D6.
+
+The next bounded M4 slices are multiline expressions (a value continued after an
+operator, and calls, lists and braced forms that span lines), then opaque
+conversions in a separate slice. Lambdas, local functions, the bodies of traits
+and implementations and the statement forms are read; the complete M4 gate
+still requires module assembly, forward pairing and the open depth items D5 to
+D7.
 
 Argument and list nesting are the recursion in the postfix and list grammar.
 They follow brackets the source itself nests, as the frozen parser does, and
@@ -3793,6 +3822,19 @@ at 1,400 (not narrowed between). Focused checks passed 31/31 (body parser), 32/3
 `compiler-new` passed 901/901, `compiler-new-parity` 3,570/3,570 with zero
 mismatched files and `compiler-blorp` 6,682/6,682.
 
+The control-operand slice was validated on a fresh build merged with main
+through the statement forms, the stop-reason census and the test-naming rename.
+`compiler-new` passed 902/902, `compiler-new-parity` 3,571/3,571 with zero
+mismatched files and `compiler-blorp` 6,683/6,683. Operand shapes (right
+operands, unary operands, expression statements and global initializers) equal
+the frozen parser's AST JSON. The corpus prefix run compared 14,685 completed
+declarations in 3,413 modules (7,302 functions, 117 traits and 167
+implementations with bodies) and stopped at 1,337 functions and 362 unsupported
+globals, with zero rejected or non-progress stops. The Linux arm64 depth numbers
+in D6 (1,000 value `if`s, 300 operands) were measured before the lambda and
+statement-form merges; the 300-deep operand test is in the suite and was not
+re-measured after them.
+
 Validation before the main reconciliation, at `a5ae15eab`:
 
 The combined fresh-build focused run passed 121/121 tests, including a
@@ -3881,13 +3923,15 @@ the proposed forms so their consequences can be reviewed.
 - **D6. Block nesting depth (3.14).** Nesting by indentation recurses in the
   body parser, the minter, the dump and the legacy projection, as it did for
   statement-position blocks before value `if`s. On Linux arm64 1,000 nested
-  value `if`s pass at 1,000 and 1,200 and overflow at 1,400. Nested `with`,
-  `concurrent`, `debug` and `select` blocks pass at 1,000 through parse, mint,
-  census, dump and projection; `with`, `concurrent` and `debug` also pass at
-  1,400, a nested `select` passes parse at 1,000 and overflows by 1,400, and its
-  projection passes at 1,200 and overflows at 1,400. Follow-up if deeper
-  proof is wanted: iterate the block stack as the expression nesting is, or
-  raise the main stack size at the CLI.
+  value `if`s pass at 1,000 and 1,200 and overflow at 1,400. Nested operands
+  (`1 + if ...:`) pass at 300 and overflow at 500, because the general
+  expression dump walker is on that path. Nested `with`, `concurrent`, `debug`
+  and `select` blocks pass at 1,000 through parse, mint, census, dump and
+  projection; `with`, `concurrent` and `debug` also pass at 1,400, a nested
+  `select` passes parse at 1,000 and overflows by 1,400, and its projection
+  passes at 1,200 and overflows at 1,400. Follow-up if deeper proof is wanted:
+  split the rare arms out of the general dump walker, iterate the block stack
+  as the expression nesting is, or raise the main stack size at the CLI.
 
 - **D7. Nested lambda depth (3.14).** A lambda nests as an expression and as a
   body, so a chain of lambdas recurses in the expression parser, the body

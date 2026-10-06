@@ -12,9 +12,9 @@ import:
 		UnaryOperator(Negate, LogicalNot),
 		BinaryOperator(Add, Subtract, Multiply, Divide, Modulo, Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual),
 		LogicalOperator(LogicalAnd, LogicalOr)
-	-- A lambda atom holds a statement recipe, so this module and the body parser import
-	-- each other until the shared recipe types move to their own module.
-	tree_body_parser: LambdaRecipe, LambdaParse(ParsedLambda, UnsupportedLambda), BodyRecipe(BlockBodyRecipe), parse_lambda_recipe, mint_lambda_recipe
+	-- A lambda atom and a control expression hold statement recipes, so this module and
+	-- the body parser import each other for functions; the recipe types share `recipes`.
+	tree_body_parser: LambdaParse(ParsedLambda, UnsupportedLambda), parse_lambda_recipe, mint_lambda_recipe, parse_control_recipe, control_expression, mint_control
 	../syntax/ids: spelling_index
 	../syntax/sequences: AtLeastOne, SmallTuple(Pair, Triple, Quadruple), at_least_one_items
 	../syntax/names: WrittenName
@@ -31,7 +31,14 @@ import:
 		TokenKind(IdentifierToken, FuncKeyword, PureKeyword, IntLiteralToken, FloatLiteralToken, NormalStringToken, RawStringToken, PipeStringToken, RawPipeStringToken,
 			InterpolatedStringToken, InterpolatedPipeStringToken, CharLiteralToken, TrueKeyword, FalseKeyword, VoidKeyword, UnderscoreSymbol,
 			MinusSymbol, NotKeyword, DetachKeyword, LeftParenSymbol, RightParenSymbol, LeftBracketSymbol, RightBracketSymbol, LeftBraceSymbol, RightBraceSymbol, FatArrowSymbol, PipeSymbol, EqualSymbol, CommaSymbol,
-			EndOfFileToken, NewlineToken, DotSymbol)
+			EndOfFileToken, NewlineToken, DotSymbol, IfKeyword, MatchKeyword)
+	recipes:
+		BodyRecipe(BlockBodyRecipe), EntryRecipe, ExpressionRecipe, LambdaRecipe, InterpolationPieceRecipe(TextPieceRecipe, HolePieceRecipe), RecordFieldRecipe,
+		RecipeKind(
+			NameRecipe, IntegerRecipe, FloatRecipe, StringRecipe, InterpolatedRecipe, CharacterRecipe, BooleanRecipe, VoidRecipe, UnaryRecipe,
+			BinaryRecipe, GroupingRecipe, CallRecipe, FieldRecipe, SubscriptRecipe, ListRecipe, TupleRecipe, VectorRecipe, RecordRecipe,
+			UpdateRecipe, DictRecipe, ControlValueRecipe, DetachRecipe, LambdaAtomRecipe
+		)
 	binary_operators as Operators
 	stop_reason:
 		StopPoint, Recognition(Recognized, Declined), StopReason(MultilineCallArguments, MultilineSubscript, MultilineListLiteral, MultilineTuple, MultilineGrouping,
@@ -49,61 +56,6 @@ union ExpressionParse:
 	ParsedExpression(Expression)
 	UnsupportedExpression(StopPoint)
 	RejectedExpression
-
-
--- Recipes retain only authored syntax and checked values, never parser IDs.
--- The statement parser keeps them inside its own recipes and mints them later.
-record ExpressionRecipe {
-	span: Span,
-	kind: RecipeKind
-}
-
-
--- `name = value` in a record literal or update, before any ID exists.
-record RecordFieldRecipe {
-	name: WrittenName,
-	value: ExpressionRecipe,
-	span: Span
-}
-
-
--- `key => value` in a dict literal, before any ID exists.
-record EntryRecipe {
-	key: ExpressionRecipe,
-	value: ExpressionRecipe,
-	span: Span
-}
-
-
-union RecipeKind:
-	NameRecipe(WrittenName)
-	IntegerRecipe(Int128)
-	FloatRecipe(DecimalFloat)
-	StringRecipe(StringForm, String)
-	InterpolatedRecipe(InterpolationForm, List[InterpolationPieceRecipe])
-	CharacterRecipe(Char)
-	BooleanRecipe(Bool)
-	VoidRecipe
-	UnaryRecipe(UnaryOperator, ExpressionRecipe)
-	DetachRecipe(ExpressionRecipe)
-	BinaryRecipe(Operators.BinaryOperator, ExpressionRecipe, ExpressionRecipe)
-	GroupingRecipe(ExpressionRecipe)
-	CallRecipe(ExpressionRecipe, List[ExpressionRecipe])
-	FieldRecipe(ExpressionRecipe, WrittenName)
-	SubscriptRecipe(ExpressionRecipe, AtLeastOne[ExpressionRecipe])
-	ListRecipe(List[ExpressionRecipe])
-	TupleRecipe(SmallTuple[ExpressionRecipe])
-	VectorRecipe(AtLeastOne[ExpressionRecipe])
-	RecordRecipe(List[RecordFieldRecipe])
-	UpdateRecipe(ExpressionRecipe, AtLeastOne[RecordFieldRecipe])
-	DictRecipe(AtLeastOne[EntryRecipe])
-	LambdaAtomRecipe(LambdaRecipe)
-
-
--- A text piece, or a hole whose expression is still a recipe.
-private union InterpolationPieceRecipe:
-	TextPieceRecipe(String)
-	HolePieceRecipe(Span, ExpressionRecipe)
 
 
 union RecipeParse:
@@ -201,6 +153,28 @@ pure func parse_expression_recipe(state: ParseState) -> (ParseState, RecipeParse
 	parse_operators(state, state.span_start_line(state.current_span()), Operators.LOWEST_PRECEDENCE)
 
 
+-- Whether the expression's last token closes a block: it is a control
+-- expression, or an operator whose last operand is one. What follows such an
+-- expression starts a new line at the enclosing indentation, so it needs no
+-- newline of its own to end the expression.
+pure func ends_in_control(recipe: ExpressionRecipe) -> Bool:
+	var current: ExpressionRecipe = recipe
+	var walking: Bool = True
+	var ends: Bool = False
+	while walking:
+		match current.kind:
+			ControlValueRecipe(_):
+				ends = True
+				walking = False
+			BinaryRecipe(_, _, right):
+				current = right
+			UnaryRecipe(_, operand):
+				current = operand
+			_:
+				walking = False
+	ends
+
+
 pure func parse_same_line_expression(state: ParseState) -> (ParseState, ExpressionParse):
 	(parsed, result) = parse_expression_recipe(state)
 	match result:
@@ -209,7 +183,11 @@ pure func parse_same_line_expression(state: ParseState) -> (ParseState, Expressi
 		RejectedRecipe:
 			(parsed, RejectedExpression)
 		ParsedRecipe(recipe):
-			match parsed.expression_boundary():
+			boundary: Boundary = if recipe.ends_in_control():
+				AtBoundary
+			else:
+				parsed.expression_boundary()
+			match boundary:
 				PastBoundary(stop):
 					(state, UnsupportedExpression(stop))
 				AtBoundary:
@@ -248,7 +226,7 @@ private pure func operator_step(
 			else if after_operator.starts_next_line(line):
 				(state, Abandoned(UnsupportedShape(after_operator.stop_at(OperatorOperandOnNextLine))))
 			else:
-				(after_right, right_result) = parse_operators(after_operator, line, precedence + 1)
+				(after_right, right_result) = parse_right_operand(after_operator, line, precedence + 1)
 				match right_result:
 					ParsedRecipe(right):
 						(after_right, Extended({ span = left.span.span_covering(right.span), kind = BinaryRecipe(operator, left, right) }))
@@ -258,6 +236,16 @@ private pure func operator_step(
 						(after_right, Abandoned(RejectedShape))
 		None:
 			(state, Stopped)
+
+
+-- A control expression ends the expression it is the right operand of, so it
+-- is read directly: the operator-precedence frames between it and the
+-- statements of its blocks are on the native stack once per level of nesting.
+private pure func parse_right_operand(state: ParseState, line: Int, minimum: Int) -> (ParseState, RecipeParse):
+	if (state.current_kind() == IfKeyword or state.current_kind() == MatchKeyword) and state.on_line(line):
+		parse_control_operand(state)
+	else:
+		parse_operators(state, line, minimum)
 
 
 private pure func parse_prefix(state: ParseState, line: Int) -> (ParseState, RecipeParse):
@@ -688,6 +676,8 @@ private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, Recip
 				parse_list_literal(state, line, span)
 			LeftBraceSymbol:
 				parse_braced(state, line, span)
+			IfKeyword | MatchKeyword:
+				parse_control_operand(state)
 			EndOfFileToken | RightParenSymbol | RightBracketSymbol:
 				(state.report_at_current(ExpectedExpressionDiagnostic), RejectedRecipe)
 			_:
@@ -698,6 +688,20 @@ private pure func parse_atom(state: ParseState, line: Int) -> (ParseState, Recip
 						-- Every kind the arms above read has no reason; the others are named in full.
 						report_unreachable_input("an atom token the parser reads has an arm")
 						(state, UnsupportedRecipe(state.stop_at(MalformedTokenPayload)))
+
+
+-- An `if` or `match` as an operand. Its blocks end on dedents, so what the
+-- expression may do afterwards is decided by the control reader (a binary
+-- operator on the next line defers) and by the same-line checks of the
+-- postfix, item and boundary rules, which a later line fails. Its twin for a
+-- whole statement value is `parse_value` in the body parser.
+private pure func parse_control_operand(state: ParseState) -> (ParseState, RecipeParse):
+	(remaining, control) = parse_control_recipe(state)
+	match control:
+		Recognized(written):
+			(remaining, ParsedRecipe(control_expression(written)))
+		Declined(stop):
+			(state, UnsupportedRecipe(stop))
 
 
 -- The arms below are functions of their own, not inline in `parse_atom`: that
@@ -1094,6 +1098,7 @@ private pure func mint_nonbinary_recipe(state: ParseState, recipe: ExpressionRec
 						out = after_hole
 						minted = minted.append(InterpolationHole(hole))
 			out.finished_expression(recipe.span, InterpolatedString(form, minted))
+		ControlValueRecipe(control): mint_control(state, control)
 		LambdaAtomRecipe(lambda): mint_lambda_recipe(state, lambda)
 		BooleanRecipe(value): state.finished_expression(recipe.span, BooleanLiteral(value))
 		VoidRecipe: state.finished_expression(recipe.span, VoidValue)

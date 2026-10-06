@@ -60,8 +60,22 @@ import:
 			WithErrorMapMalformed, ConcurrentHeaderWithoutColon, ConcurrentParametersMalformed, ConcurrentParameterUnknown, ConcurrentParameterRepeated,
 			ConcurrentCountNotLiteral),
 		stop_at, statement_boundary, mapped, opens_block_form
+	recipes:
+		AcquisitionRecipe(ValueAcquisitionRecipe, TryAcquisitionRecipe), AssignmentTargetRecipe(NamedTargetRecipe, DiscardedTargetRecipe),
+		BinderRecipe(BindsNameRecipe, DiscardsRecipe), BlockRecipe, BodyRecipe(BlockBodyRecipe, ExpressionBodyRecipe),
+		CaseBodyRecipe(CaseBlockRecipe, CaseStatementRecipe), CaseRecipe, ConcurrentParameters, ConcurrentRecipe, ConditionalRecipe,
+		ControlRecipe(ConditionalControl, MatchControl, SelectControl), DebugRecipe, ElseBlockRecipe, ElseIfLink, ErrorMapRecipe, ExpressionRecipe, IfLink,
+		LambdaParameterRecipe, LambdaRecipe, LocalFunctionBody, LoopBindingRecipe(LoopVariableRecipe, LoopTupleRecipe), LoopExit(ExitWithBreak, ExitWithContinue),
+		MatchRecipe, PatternRecipe, RecipeKind(ControlValueRecipe, LambdaAtomRecipe), SelectArmRecipe,
+		SelectArmRecipeKind(ReceiveArmRecipe, SealedArmRecipe, AfterArmRecipe), SelectRecipe, StatementRecipe, SubscriptPlaceRecipe, TimeoutRecipe, TypeRecipe,
+		WithHeader, WithOperator(AcquireWithValue, AcquireWithTry), WithRecipe,
+		StatementRecipeKind(
+			ExpressionStatementRecipe, LoopExitRecipe, ConditionalStatementRecipe, MatchStatementRecipe, SelectStatementRecipe, WithStatementRecipe,
+			ConcurrentStatementRecipe, DebugStatementRecipe, VariableRecipe, TypedBindingRecipe, QuestionBindingRecipe, AssignmentRecipe,
+			CompoundAssignmentRecipe, SubscriptAssignmentRecipe, WhileRecipe, ForRecipe, LocalFunctionRecipe
+		)
 	tree_expression_parser:
-		ExpressionRecipe, RecipeKind(NameRecipe, IntegerRecipe, FloatRecipe, StringRecipe, InterpolatedRecipe, CharacterRecipe, BooleanRecipe, VoidRecipe, UnaryRecipe, BinaryRecipe, GroupingRecipe, CallRecipe, FieldRecipe, SubscriptRecipe, ListRecipe, TupleRecipe, VectorRecipe, RecordRecipe, UpdateRecipe, DictRecipe, DetachRecipe, LambdaAtomRecipe), RecipeParse(ParsedRecipe, UnsupportedRecipe, RejectedRecipe), parse_expression_recipe, mint_recipe, subscript_parts, is_block_lambda
+		RecipeParse(ParsedRecipe, UnsupportedRecipe, RejectedRecipe), ends_in_control, parse_expression_recipe, mint_recipe, subscript_parts, is_block_lambda
 	tree_function_header_parser:
 		DeferredBody, FunctionHeaderPreview, FunctionHeaderParse(ParsedFunctionHeader, RejectedFunctionHeader), FunctionBodyExtent(ForwardDeclaration, SkippedBody),
 		deferred_body_token_start, deferred_body_token_end, parse_function_header
@@ -76,171 +90,6 @@ private enum BodyContext:
 	InsideLoop
 
 
--- A written type, replayed at minting from the token it starts at.
-record TypeRecipe {
-	token: Int
-}
-
-
--- A pattern, replayed at minting from its first token.
-private record PatternRecipe {
-	token: Int
-}
-
-
-private record StatementRecipe {
-	span: Span,
-	kind: StatementRecipeKind
-}
-
-
--- What follows `=` or `op=`: an expression, or an `if`, `match` or `select`
--- whose blocks end on dedents. The frozen language has no one-line `if`, so a
--- control expression is always block-shaped, and it is a whole value: as an
--- operand, an argument or a global's initializer it stays unsupported. Giving
--- the whole-value position its own type keeps a control expression out of
--- `ExpressionRecipe`, whose boundary rules assume the expression ends on a
--- line. `with`, `concurrent` and `debug` are not values here: the frozen
--- parser indents their block past the keyword, not past the statement, so a
--- value written the usual way is rejected there and must not be read here.
-private union ValueRecipe:
-	PlainValue(ExpressionRecipe)
-	ConditionalValue(ConditionalRecipe)
-	MatchValue(MatchRecipe)
-	SelectValue(SelectRecipe)
-
-
-private union StatementRecipeKind:
-	ExpressionStatementRecipe(ExpressionRecipe)
-	LoopExitRecipe(LoopExit)
-	ConditionalStatementRecipe(ConditionalRecipe)
-	MatchStatementRecipe(MatchRecipe)
-	SelectStatementRecipe(SelectRecipe)
-	WithStatementRecipe(WithRecipe)
-	ConcurrentStatementRecipe(ConcurrentRecipe)
-	DebugStatementRecipe(DebugRecipe)
-	VariableRecipe(WrittenName, Option[TypeRecipe], ValueRecipe)
-	TypedBindingRecipe(WrittenName, TypeRecipe, ValueRecipe)
-	QuestionBindingRecipe(WrittenName, Option[TypeRecipe], ValueRecipe)
-	AssignmentRecipe(AssignmentTargetRecipe, ValueRecipe)
-	CompoundAssignmentRecipe(WrittenName, CompoundOperator, ValueRecipe)
-	SubscriptAssignmentRecipe(SubscriptPlaceRecipe, ValueRecipe)
-	WhileRecipe(ExpressionRecipe, BlockRecipe)
-	ForRecipe(LoopBindingRecipe, ExpressionRecipe, BlockRecipe)
-	LocalFunctionRecipe(LocalFunctionBody)
-
-
-private enum LoopExit:
-	ExitWithBreak
-	ExitWithContinue
-
-
-private union AssignmentTargetRecipe:
-	NamedTargetRecipe(WrittenName)
-	DiscardedTargetRecipe(Span)
-
-
--- A local function: its header is replayed from the token it starts at, so its
--- ids follow its neighbours', and its own body is a recipe read once.
-private record LocalFunctionBody {
-	keyword_token: Int,
-	start: Span,
-	purity: Purity,
-	body: BodyRecipe
-}
-
-
--- A lambda before minting: parameters and return type replay from their
--- tokens, and the body is a recipe. `span` runs from `func` or `pure` to the
--- end of the body.
-record LambdaRecipe {
-	purity: Purity,
-	parameters: List[LambdaParameterRecipe],
-	return_type: Option[TypeRecipe],
-	body: BodyRecipe,
-	span: Span
-}
-
-
-record LambdaParameterRecipe {
-	binder: BinderRecipe,
-	declared_type: Option[TypeRecipe]
-}
-
-
--- A binding position that may discard.
-union BinderRecipe:
-	BindsNameRecipe(WrittenName)
-	DiscardsRecipe(Span)
-
-
--- `for x in` / `for _ in`, or `for (a, b) in` with the parenthesized span.
-private union LoopBindingRecipe:
-	LoopVariableRecipe(BinderRecipe)
-	LoopTupleRecipe(SmallTuple[BinderRecipe], Span)
-
-
-private record SubscriptPlaceRecipe {
-	span: Span,
-	collection: ExpressionRecipe,
-	indices: AtLeastOne[ExpressionRecipe]
-}
-
-
-private record BlockRecipe {
-	statements: AtLeastOne[StatementRecipe]
-}
-
-
--- An `if` and its `else` chain, flat: the chain's length is a list's length,
--- never a nesting of recipes.
-private record ConditionalRecipe {
-	head: IfLink,
-	else_ifs: List[ElseIfLink],
-	final_else: Option[ElseBlockRecipe]
-}
-
-
-private record IfLink {
-	keyword: Span,
-	condition: ExpressionRecipe,
-	then_block: BlockRecipe
-}
-
-
-private record ElseIfLink {
-	else_keyword: Span,
-	link: IfLink
-}
-
-
-private record ElseBlockRecipe {
-	keyword: Span,
-	block: BlockRecipe
-}
-
-
--- `end` is the closing dedent's span, which the expression's own span
--- reaches (the frozen parser's rule).
-private record MatchRecipe {
-	keyword: Span,
-	scrutinee: ExpressionRecipe,
-	cases: AtLeastOne[CaseRecipe],
-	end: Span
-}
-
-
-private record CaseRecipe {
-	pattern: PatternRecipe,
-	body: CaseBodyRecipe
-}
-
-
-private union CaseBodyRecipe:
-	CaseBlockRecipe(BlockRecipe)
-	CaseStatementRecipe(StatementRecipe)
-
-
 -- The state of an unsupported result is meaningless: the public entry points
 -- return their own entry state. What it carries is why recognition declined.
 private union StatementParse:
@@ -251,12 +100,6 @@ private union StatementParse:
 private union BlockParse:
 	ParsedBlock(BlockRecipe)
 	UnsupportedBlock(StopPoint)
-
-
--- A body before minting: an indented block, or an expression on the `:` line.
-union BodyRecipe:
-	BlockBodyRecipe(BlockRecipe)
-	ExpressionBodyRecipe(ExpressionRecipe)
 
 
 union FunctionCompletion:
@@ -397,8 +240,17 @@ private pure func parse_body_recipe(state: ParseState, colon_line: Int) -> (Pars
 	else if not state.is_on_line(colon_line):
 		(state, Declined(state.stop_at(BodyNotOnHeaderLine)))
 	else:
-		(remaining, value) = parse_plain_value(state)
-		(remaining, value.mapped(pure func(expression): ExpressionBodyRecipe(expression)))
+		(remaining, value) = parse_value(state)
+		match value:
+			Recognized(expression):
+				-- A control expression or a block lambda ends on a later line, which
+				-- the frozen grammar rejects after a same-line body.
+				if remaining.span_start_line(remaining.previous_span()) != colon_line:
+					(state, Declined(state.stop_at(BodyNotOnHeaderLine)))
+				else:
+					(remaining, Recognized(ExpressionBodyRecipe(expression)))
+			Declined(stop):
+				(remaining, Declined(stop))
 
 
 -- Blocks.
@@ -494,40 +346,42 @@ private pure func parse_statement_recipe(state: ParseState, context: BodyContext
 
 
 -- A statement's `value` after its operator: an expression that starts on the
--- operator's line and ends the statement, or an `if` or `match` that does.
--- Its blocks read `break` and `continue` as outside any loop, so a loop exit
--- inside one defers.
-private pure func parse_value(state: ParseState) -> (ParseState, Recognition[ValueRecipe]):
+-- operator's line and ends the statement. It may be or contain an `if` or a
+-- `match`, whose blocks end on dedents, and may be a `select`. `with`,
+-- `concurrent` and `debug` are not values here: the frozen parser indents their
+-- block past the keyword, not past the statement, so a value written the usual
+-- way is rejected there and must not be read here.
+private pure func parse_value(state: ParseState) -> (ParseState, Recognition[ExpressionRecipe]):
 	match state.current_kind():
-		IfKeyword:
-			(remaining, chain) = parse_conditional_recipe(state, OutsideLoop)
-			(remaining, chain.mapped(pure func(written): ConditionalValue(written)))
-		MatchKeyword:
-			(remaining, written) = parse_match_recipe(state, OutsideLoop)
-			(remaining, written.mapped(pure func(recipe): MatchValue(recipe)))
+		IfKeyword | MatchKeyword:
+			-- The whole value is the control expression. Reading it here, not
+			-- through the expression grammar, keeps the frames between a
+			-- statement and the statements of its blocks few (section 3.14).
+			-- Its twin for an operand is `parse_control_operand` in the
+			-- expression parser, which builds the same recipe.
+			(remaining, control) = parse_control_recipe(state)
+			(remaining, control.mapped(control_expression))
 		SelectKeyword:
 			if state.opens_block_form():
-				(remaining, written) = parse_select_recipe(state, OutsideLoop)
-				(remaining, written.mapped(pure func(recipe): SelectValue(recipe)))
+				(remaining, control) = parse_control_recipe(state)
+				(remaining, control.mapped(control_expression))
 			else:
-				(remaining, plain) = parse_plain_value(state)
-				(remaining, plain.mapped(pure func(recipe): PlainValue(recipe)))
+				parse_expression_value(state)
 		_:
-			(remaining, plain) = parse_plain_value(state)
-			(remaining, plain.mapped(pure func(recipe): PlainValue(recipe)))
+			parse_expression_value(state)
 
 
-private pure func parse_plain_value(state: ParseState) -> (ParseState, Recognition[ExpressionRecipe]):
+private pure func parse_expression_value(state: ParseState) -> (ParseState, Recognition[ExpressionRecipe]):
 	(remaining, parsed) = parse_expression_recipe(state)
 	match parsed:
 		ParsedRecipe(value):
-			-- A lambda with a block body ends at its block's dedent, where the
-			-- next statement may already start.
 			match remaining.statement_boundary():
 				AtBoundary:
 					(remaining, Recognized(value))
 				PastBoundary(stop):
-					if is_block_lambda(value) and remaining.block_statement_ends():
+					-- A control expression, or a lambda with a block body, ends at its
+					-- block's dedent, where the next statement may already start.
+					if value.ends_in_control() or (is_block_lambda(value) and remaining.block_statement_ends()):
 						(remaining, Recognized(value))
 					else:
 						(state, Declined(stop))
@@ -537,28 +391,20 @@ private pure func parse_plain_value(state: ParseState) -> (ParseState, Recogniti
 			(state, Declined(remaining.stop_at(ExpressionSyntaxError)))
 
 
-private pure func parse_value_after(state: ParseState, operator_line: Int) -> (ParseState, Recognition[ValueRecipe]):
+private pure func parse_value_after(state: ParseState, operator_line: Int) -> (ParseState, Recognition[ExpressionRecipe]):
 	if state.is_on_line(operator_line):
 		parse_value(state)
 	else:
 		(state, Declined(state.stop_at(ValueOnNextLine)))
 
 
-private pure func value_span(value: ValueRecipe) -> Span:
-	match value:
-		PlainValue(expression): expression.span
-		ConditionalValue(chain): conditional_span(chain)
-		MatchValue(written): match_span(written)
-		SelectValue(written): select_span(written)
-
-
 -- A statement of `kind` over `start` and its value, or unsupported.
 private pure func valued_statement(
-	state: ParseState, start: Span, value: Recognition[ValueRecipe], kind: pure (ValueRecipe) -> StatementRecipeKind,
+	state: ParseState, start: Span, value: Recognition[ExpressionRecipe], kind: pure (ExpressionRecipe) -> StatementRecipeKind,
 ) -> (ParseState, StatementParse):
 	match value:
 		Recognized(recipe):
-			(state, ParsedStatement({ span = start.span_covering(value_span(recipe)), kind = kind(recipe) }))
+			(state, ParsedStatement({ span = start.span_covering(recipe.span), kind = kind(recipe) }))
 		Declined(stop):
 			(state, UnsupportedStatement(stop))
 
@@ -580,7 +426,10 @@ private pure func parse_expression_statement(state: ParseState) -> (ParseState, 
 					AtBoundary:
 						(remaining, ParsedStatement({ span = target.span, kind = ExpressionStatementRecipe(target) }))
 					PastBoundary(stop):
-						(state, UnsupportedStatement(stop))
+						if target.ends_in_control():
+							(remaining, ParsedStatement({ span = target.span, kind = ExpressionStatementRecipe(target) }))
+						else:
+							(state, UnsupportedStatement(stop))
 		UnsupportedRecipe(stop):
 			(state, UnsupportedStatement(stop))
 		RejectedRecipe:
@@ -597,7 +446,7 @@ private pure func unassignable_target_reason(target: ExpressionRecipe) -> StopRe
 		NameRecipe(_) | SubscriptRecipe(_, _): AssignmentTargetRoutedElsewhere
 		IntegerRecipe(_) | FloatRecipe(_) | StringRecipe(_, _) | InterpolatedRecipe(_, _) | CharacterRecipe(_) | BooleanRecipe(_) | VoidRecipe: NonPlaceAssignmentTarget
 		UnaryRecipe(_, _) | DetachRecipe(_) | BinaryRecipe(_, _, _) | GroupingRecipe(_) | CallRecipe(_, _) | ListRecipe(_) | VectorRecipe(_): NonPlaceAssignmentTarget
-		RecordRecipe(_) | UpdateRecipe(_, _) | DictRecipe(_) | LambdaAtomRecipe(_): NonPlaceAssignmentTarget
+		RecordRecipe(_) | UpdateRecipe(_, _) | DictRecipe(_) | ControlValueRecipe(_) | LambdaAtomRecipe(_): NonPlaceAssignmentTarget
 
 
 private pure func parse_loop_exit(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
@@ -861,6 +710,51 @@ private pure func block_span(recipe: BlockRecipe) -> Span:
 
 
 -- The chain is read by a loop: each `else if` appends a link.
+-- An `if`, `match` or `select` read where an expression is expected. Its
+-- blocks read `break` and `continue` as outside any loop, so a loop exit inside
+-- one defers, and the token after its last dedent must not continue it. A
+-- `select` is a whole value only: the expression grammar reads `if` and
+-- `match` as operands but not `select`.
+pure func parse_control_recipe(state: ParseState) -> (ParseState, Recognition[ControlRecipe]):
+	match state.current_kind():
+		IfKeyword:
+			(remaining, chain) = parse_conditional_recipe(state, OutsideLoop)
+			(remaining, chain.mapped(pure func(written): ConditionalControl(written)))
+		MatchKeyword:
+			(remaining, written) = parse_match_recipe(state, OutsideLoop)
+			(remaining, written.mapped(pure func(recipe): MatchControl(recipe)))
+		SelectKeyword:
+			(remaining, written) = parse_select_recipe(state, OutsideLoop)
+			(remaining, written.mapped(pure func(recipe): SelectControl(recipe)))
+		_:
+			(state, Declined(state.stop_at(ExpressionSyntaxError)))
+
+
+-- A control expression as the expression recipe that holds it.
+pure func control_expression(control: ControlRecipe) -> ExpressionRecipe:
+	{ span = control_span(control), kind = ControlValueRecipe(control) }
+
+
+pure func control_span(control: ControlRecipe) -> Span:
+	match control:
+		ConditionalControl(chain): conditional_span(chain)
+		MatchControl(written): match_span(written)
+		SelectControl(written): select_span(written)
+
+
+pure func mint_control(state: ParseState, control: ControlRecipe) -> (ParseState, Expression):
+	-- Minting replays written types and patterns from their own tokens, which
+	-- moves the cursor. A control expression inside a larger expression, or a
+	-- global initializer, is followed by more reading, so the cursor goes back
+	-- to where recognition left it.
+	end: Int = state.position()
+	(minted, expression) = match control:
+		ConditionalControl(chain): mint_conditional(state, chain, conditional_span(chain))
+		MatchControl(written): mint_match(state, written, match_span(written))
+		SelectControl(written): mint_select(state, written, select_span(written))
+	(minted.resumed_at(end), expression)
+
+
 private pure func parse_conditional_statement(state: ParseState, context: BodyContext) -> (ParseState, StatementParse):
 	(remaining, chain) = parse_conditional_recipe(state, context)
 	match chain:
@@ -1301,7 +1195,7 @@ private pure func mint_statement(state: ParseState, recipe: StatementRecipe) -> 
 
 
 private pure func mint_variable(
-	state: ParseState, span: Span, name: WrittenName, declared: Option[TypeRecipe], value: ValueRecipe,
+	state: ParseState, span: Span, name: WrittenName, declared: Option[TypeRecipe], value: ExpressionRecipe,
 ) -> (ParseState, Statement):
 	(after_binder, binder) = state.finished_binder(name)
 	(after_type, declared_type) = mint_optional_type(after_binder, declared)
@@ -1310,7 +1204,7 @@ private pure func mint_variable(
 
 
 private pure func mint_typed_binding(
-	state: ParseState, span: Span, name: WrittenName, declared: TypeRecipe, value: ValueRecipe,
+	state: ParseState, span: Span, name: WrittenName, declared: TypeRecipe, value: ExpressionRecipe,
 ) -> (ParseState, Statement):
 	(after_binder, binder) = state.finished_binder(name)
 	(after_type, declared_type) = mint_type(after_binder, declared)
@@ -1319,7 +1213,7 @@ private pure func mint_typed_binding(
 
 
 private pure func mint_assignment(
-	state: ParseState, span: Span, target: AssignmentTargetRecipe, value: ValueRecipe,
+	state: ParseState, span: Span, target: AssignmentTargetRecipe, value: ExpressionRecipe,
 ) -> (ParseState, Statement):
 	(after_target, written) = match target:
 		NamedTargetRecipe(name):
@@ -1332,7 +1226,7 @@ private pure func mint_assignment(
 
 
 private pure func mint_subscript_assignment(
-	state: ParseState, span: Span, place: SubscriptPlaceRecipe, value: ValueRecipe,
+	state: ParseState, span: Span, place: SubscriptPlaceRecipe, value: ExpressionRecipe,
 ) -> (ParseState, Statement):
 	(after_collection, collection) = mint_recipe(state, place.collection)
 	(after_first, first) = mint_recipe(after_collection, place.indices.first)
@@ -1348,7 +1242,7 @@ private pure func mint_subscript_assignment(
 
 
 private pure func mint_question_binding(
-	state: ParseState, span: Span, name: WrittenName, declared: Option[TypeRecipe], value: ValueRecipe,
+	state: ParseState, span: Span, name: WrittenName, declared: Option[TypeRecipe], value: ExpressionRecipe,
 ) -> (ParseState, Statement):
 	(after_binder, binder) = state.finished_binder(name)
 	(after_type, declared_type) = mint_optional_type(after_binder, declared)
@@ -1365,12 +1259,13 @@ private pure func mint_for_loop(
 	after_body.finished_statement(span, ForLoop({ binder = loop_binder, iterable = expression, body = block }))
 
 
-private pure func mint_value(state: ParseState, value: ValueRecipe) -> (ParseState, Expression):
-	match value:
-		PlainValue(expression): mint_recipe(state, expression)
-		ConditionalValue(chain): mint_conditional(state, chain, conditional_span(chain))
-		MatchValue(written): mint_match(state, written, match_span(written))
-		SelectValue(written): mint_select(state, written, select_span(written))
+-- A statement's value, minted through a thin front for the same reason it is
+-- parsed through one: a whole-value control expression skips the large
+-- expression minter.
+private pure func mint_value(state: ParseState, value: ExpressionRecipe) -> (ParseState, Expression):
+	match value.kind:
+		ControlValueRecipe(control): mint_control(state, control)
+		_: mint_recipe(state, value)
 
 
 private pure func mint_loop_binder(state: ParseState, binding: LoopBindingRecipe) -> (ParseState, LoopBinder):
@@ -1531,91 +1426,6 @@ private pure func parse_block_form_statement(state: ParseState, context: BodyCon
 -- `select`, `with`, `concurrent` and `debug`. Each is a keyword, a header that
 -- ends in a colon on its own line, and indented blocks closed by dedents, so
 -- each ends where the next statement may already begin.
-
--- An arm of a `select`: what it waits for, and the block it runs.
-private record SelectArmRecipe {
-	kind: SelectArmRecipeKind,
-	body: BlockRecipe,
-	span: Span
-}
-
-
-private union SelectArmRecipeKind:
-	ReceiveArmRecipe(BinderRecipe, ExpressionRecipe)
-	SealedArmRecipe(ExpressionRecipe)
-	AfterArmRecipe(ExpressionRecipe)
-
-
--- `end` is the closing dedent's span, which the expression's own span reaches
--- (the frozen parser's rule, as for `match`).
-private record SelectRecipe {
-	keyword: Span,
-	arms: AtLeastOne[SelectArmRecipe],
-	end: Span
-}
-
-
--- `with r [: T] = v:` and `with r [: T] ?= v [on e => mapped]:`, before the block.
-private record WithHeader {
-	binder: BinderRecipe,
-	declared: Option[TypeRecipe],
-	acquisition: AcquisitionRecipe
-}
-
-
-private union AcquisitionRecipe:
-	ValueAcquisitionRecipe(ExpressionRecipe)
-	TryAcquisitionRecipe(ExpressionRecipe, Option[ErrorMapRecipe])
-
-
-private enum WithOperator:
-	AcquireWithValue
-	AcquireWithTry
-
-
--- `on e => mapped`: its span starts at the binder, as the frozen parser's does.
-private record ErrorMapRecipe {
-	binder: BinderRecipe,
-	value: ExpressionRecipe,
-	span: Span
-}
-
-
-private record WithRecipe {
-	keyword: Span,
-	header: WithHeader,
-	body: BlockRecipe
-}
-
-
--- A `timeout` parameter keeps its value as a recipe until minting.
-private record TimeoutRecipe {
-	value: ExpressionRecipe,
-	name_span: Span,
-	span: Span
-}
-
-
--- A count parameter holds only a checked literal, so it is already the syntax
--- node and mints no id.
-private record ConcurrentParameters {
-	max_threads: Option[CountParameter],
-	timeout: Option[TimeoutRecipe]
-}
-
-
-private record ConcurrentRecipe {
-	keyword: Span,
-	parameters: ConcurrentParameters,
-	body: BlockRecipe
-}
-
-
-private record DebugRecipe {
-	keyword: Span,
-	body: BlockRecipe
-}
-
 
 private enum ConcurrentParameterName:
 	ConcurrentMaxThreads

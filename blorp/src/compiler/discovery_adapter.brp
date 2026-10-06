@@ -4535,7 +4535,7 @@ private pure func preview_completed_global(
 	(after_name, name) = preview_identifier(source, names, declaration.name)
 	translated_type ?= preview_optional_type(source, after_name, declaration.declared_type)
 	(after_type, type_expr) = translated_type
-	value_translation ?= legacy_expression_preview(source, after_type, declaration.value)
+	value_translation ?= legacy_value_preview(source, after_type, declaration.value)
 	(after_value, value) = value_translation
 	Ok((after_value, preview_visibility(VarParsedDecl({
 		name = name, type_expr = type_expr, value = value,
@@ -4724,6 +4724,24 @@ pure func legacy_expression_preview(
 							Some(first):
 								continuations = continuations.append(FinishPreviewSequenceItem(PreviewListSequence, items, 1, [], current.span))
 								walk = VisitPreviewExpression(first)
+					TreeExpressions.If(conditional):
+						-- A control expression opens blocks of statements, whose expressions
+						-- are projected by their own walks: nesting follows indentation.
+						match legacy_conditional_preview(source, extended, conditional, current.span):
+							Ok((after_control, projected)):
+								extended = after_control
+								walk = ReturnPreviewExpression(projected)
+							Err(error):
+								result = Err(error)
+								break
+					TreeExpressions.Match(subject, cases):
+						match legacy_match_preview(source, extended, subject, cases, location):
+							Ok((after_control, projected)):
+								extended = after_control
+								walk = ReturnPreviewExpression(projected)
+							Err(error):
+								result = Err(error)
+								break
 					TreeExpressions.VectorLiteral(items):
 						match items.get(0):
 							None:
@@ -5304,8 +5322,11 @@ private pure func legacy_statement_expression_preview(
 			legacy_value_preview(source, names, expression)
 
 
--- A statement's value: the block-bearing forms are read here, and every other
--- expression by the expression projection.
+-- A statement's whole value: the block forms it may be (`if`, `match`,
+-- `select`, `with`, `concurrent`, `debug`) are read here, through this thin
+-- function, so that the frames between a statement and the statements of its
+-- blocks stay small (section 3.14). An `if` or `match` nested inside an
+-- operand is read by the expression walk instead.
 private pure func legacy_value_preview(
 	source: PreviewSource, names: NameTable, expression: TreeExpressions.Expression,
 ) -> Result[(NameTable, ParsedExpr), LegacyDeclarationPreviewError]:
