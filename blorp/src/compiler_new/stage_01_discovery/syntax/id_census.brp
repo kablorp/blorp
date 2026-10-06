@@ -175,31 +175,21 @@ when every family's ids are exactly `0 ..< count` of `module`, each held once.
 Problems are reported family by family, in `ID_FAMILIES` order.
 ---
 pure func id_census(module: ModuleId, syntax: ModuleSyntax) -> List[CensusProblem]:
-	no_ids: List[HeldId] = []
-	var by_family: List[List[HeldId]] = no_ids.repeat(ID_FAMILIES.length())
-
-	for id in held_in_module(syntax):
-		slot: Int = family_slot(id.family)
-		by_family = by_family.set(
-			slot,
-			by_family
-				.get_or(slot, no_ids)
-				.append(id),
-		)
-
 	var problems: List[CensusProblem] = []
+	held: List[HeldId] = held_in_module(syntax)
 
 	for family in ID_FAMILIES:
 		count: Int = issued_count(syntax, family)
 		var times_held: List[Int] = 0.repeat(count)
 
-		for id in by_family.get_or(family_slot(family), no_ids):
-			if id.module.module_id_index() != module.module_id_index():
-				problems = problems.append(IdOfAnotherModule(family, id.module, id.index))
-			else if id.index >= count:
-				problems = problems.append(IdNotIssued(family, id.index))
-			else:
-				times_held = times_held.set(id.index, times_held.get_or(id.index, 0) + 1)
+		for id in held:
+			if id.family == family:
+				if id.module.module_id_index() != module.module_id_index():
+					problems = problems.append(IdOfAnotherModule(family, id.module, id.index))
+				else if id.index >= count:
+					problems = problems.append(IdNotIssued(family, id.index))
+				else:
+					times_held = times_held.set(id.index, times_held.get_or(id.index, 0) + 1)
 
 		for index in 0..count:
 			times: Int = times_held.get_or(index, 0)
@@ -210,32 +200,6 @@ pure func id_census(module: ModuleId, syntax: ModuleSyntax) -> List[CensusProble
 				problems = problems.append(IdHeldTwice(family, index))
 
 	problems
-
-
-private pure func family_slot(family: IdFamily) -> Int:
-	match family:
-		DefinitionIds:
-			0
-		ImportIds:
-			1
-		StatementIds:
-			2
-		BlockIds:
-			3
-		ExpressionIds:
-			4
-		PatternIds:
-			5
-		WrittenTypeIds:
-			6
-		DimensionIds:
-			7
-		NameUseIds:
-			8
-		BinderIds:
-			9
-		TypeBinderIds:
-			10
 
 
 ---
@@ -357,97 +321,113 @@ private pure func held_type_binder(binder: TypeBinderId) -> HeldId:
 	}
 
 
+---
+The ids the walk has met so far, in walk order. A record rather than a bare
+list: the compiler hands an owned record on to the next helper and updates it
+in place, where a list passed to a helper that appends to it is copied at
+every call, which made the walk quadratic in the size of the module.
+---
+private record HeldIds {
+	ids: List[HeldId]
+}
+
+
+-- Records `id` as held; the one place the walk grows `ids`, so it stays in place.
+private pure func hold(held: HeldIds, id: HeldId) -> HeldIds:
+	{ held | ids = held.ids.append(id) }
+
+
 -- The walk: every id-bearing field of section 3.3, once.
 private pure func held_in_module(syntax: ModuleSyntax) -> List[HeldId]:
-	var held: List[HeldId] = []
+	var held: HeldIds = { ids = [] }
 
 	for item in syntax.items:
 		held = held.held_in_item(item)
 
-	held
+	held.ids
 
 
-private pure func held_in_item(held: List[HeldId], item: ModuleItem) -> List[HeldId]:
+private pure func held_in_item(held: HeldIds, item: ModuleItem) -> HeldIds:
 	match item:
 		FunctionItem(declaration):
 			held
-				.append(held_definition(declaration.id))
+				.hold(held_definition(declaration.id))
 				.held_in_function(declaration.function)
 		GlobalItem(declaration):
 			held
-				.append(held_definition(declaration.id))
+				.hold(held_definition(declaration.id))
 				.held_in_optional_type(declaration.declared_type)
 				.held_in_expression(declaration.value)
 		RecordItem(declaration):
 			held
-				.append(held_definition(declaration.id))
+				.hold(held_definition(declaration.id))
 				.held_in_type_parameters(declaration.type_parameters)
 				.held_in_fields(declaration.fields)
 		UnionItem(declaration):
-			var with_variants: List[HeldId] = held
-				.append(held_definition(declaration.id))
+			var with_variants: HeldIds = held
+				.hold(held_definition(declaration.id))
 				.held_in_type_parameters(declaration.type_parameters)
 
 			for variant in declaration.variants:
 				with_variants = with_variants
-					.append(held_definition(variant.id))
+					.hold(held_definition(variant.id))
 					.held_in_types(variant.payload)
 
 			with_variants
 		EnumItem(declaration):
-			var with_cases: List[HeldId] = held.append(held_definition(declaration.id))
+			var with_cases: HeldIds = held.hold(held_definition(declaration.id))
 
 			for case_declaration in declaration.cases:
-				with_cases = with_cases.append(held_definition(case_declaration.id))
+				with_cases = with_cases.hold(held_definition(case_declaration.id))
 
 			with_cases
 		AliasItem(declaration):
 			held
-				.append(held_definition(declaration.id))
+				.hold(held_definition(declaration.id))
 				.held_in_type_parameters(declaration.type_parameters)
 				.held_in_type(declaration.target)
 		BuiltinTypeItem(declaration):
 			held
-				.append(held_definition(declaration.id))
+				.hold(held_definition(declaration.id))
 				.held_in_type_parameters(declaration.type_parameters)
 		ResourceTypeItem(declaration):
 			held
-				.append(held_definition(declaration.id))
+				.hold(held_definition(declaration.id))
 				.held_in_type_parameters(declaration.type_parameters)
 		TraitItem(declaration):
-			var with_methods: List[HeldId] = held
-				.append(held_definition(declaration.id))
+			var with_methods: HeldIds = held
+				.hold(held_definition(declaration.id))
 				.held_in_type_parameters(declaration.type_parameters)
 				.held_in_trait_references(declaration.supertraits)
 
 			for method in declaration.methods:
 				with_methods = with_methods
-					.append(held_definition(method.id))
+					.hold(held_definition(method.id))
 					.held_in_signature(method.signature)
 					.held_in_optional_body(method.default_body)
 
 			with_methods
 		ImplementationItem(declaration):
-			var with_methods: List[HeldId] = held
-				.append(held_definition(declaration.id))
-				.append(held_name_use(declaration.trait_name))
+			var with_methods: HeldIds = held
+				.hold(held_definition(declaration.id))
+				.hold(held_name_use(declaration.trait_name))
 				.held_in_type(declaration.receiver)
 
 			for method in declaration.methods:
 				with_methods = with_methods
-					.append(held_definition(method.id))
+					.hold(held_definition(method.id))
 					.held_in_function(method.function)
 
 			with_methods
 		ImportBlockItem(block):
-			var with_imports: List[HeldId] = held
+			var with_imports: HeldIds = held
 
 			for import_row in block.imports:
 				with_imports = with_imports.held_in_import(import_row)
 
 			with_imports
 		ForeignBlockItem(block):
-			var with_functions: List[HeldId] = held
+			var with_functions: HeldIds = held
 
 			for function in block.functions:
 				with_functions = with_functions.held_in_foreign_function(function)
@@ -455,44 +435,44 @@ private pure func held_in_item(held: List[HeldId], item: ModuleItem) -> List[Hel
 			with_functions
 
 
-private pure func held_in_import(held: List[HeldId], import_row: Import) -> List[HeldId]:
-	var with_items: List[HeldId] = held.append(held_import(import_row.id))
+private pure func held_in_import(held: HeldIds, import_row: Import) -> HeldIds:
+	var with_items: HeldIds = held.hold(held_import(import_row.id))
 
 	for item in import_row.items:
-		with_items = with_items.append(held_name_use(item.name))
+		with_items = with_items.hold(held_name_use(item.name))
 
 		for constructor in item.constructors:
-			with_items = with_items.append(held_name_use(constructor))
+			with_items = with_items.hold(held_name_use(constructor))
 
 	with_items
 
 
 private pure func held_in_foreign_function(
-	held: List[HeldId],
+	held: HeldIds,
 	function: ForeignFunction,
-) -> List[HeldId]:
+) -> HeldIds:
 	held
-		.append(held_definition(function.id))
+		.hold(held_definition(function.id))
 		.held_in_parameters(function.parameters)
 		.held_in_type(function.return_type)
 
 
 private pure func held_in_fields(
-	held: List[HeldId],
+	held: HeldIds,
 	fields: List[FieldDeclaration],
-) -> List[HeldId]:
-	var with_fields: List[HeldId] = held
+) -> HeldIds:
+	var with_fields: HeldIds = held
 
 	for field in fields:
 		with_fields = with_fields
-			.append(held_definition(field.id))
+			.hold(held_definition(field.id))
 			.held_in_type(field.field_type)
 
 	with_fields
 
 
-private pure func held_in_function(held: List[HeldId], function: Function) -> List[HeldId]:
-	var with_constraints: List[HeldId] = held
+private pure func held_in_function(held: HeldIds, function: Function) -> HeldIds:
+	var with_constraints: HeldIds = held
 		.held_in_signature(function.signature)
 		.held_in_type_parameters(function.type_parameters)
 
@@ -502,27 +482,27 @@ private pure func held_in_function(held: List[HeldId], function: Function) -> Li
 	with_constraints.held_in_optional_body(function.body)
 
 
-private pure func held_in_signature(held: List[HeldId], signature: Signature) -> List[HeldId]:
+private pure func held_in_signature(held: HeldIds, signature: Signature) -> HeldIds:
 	held
 		.held_in_parameters(signature.parameters)
 		.held_in_optional_type(signature.return_type)
 
 
 private pure func held_in_parameters(
-	held: List[HeldId],
+	held: HeldIds,
 	parameters: List[Parameter],
-) -> List[HeldId]:
-	var with_parameters: List[HeldId] = held
+) -> HeldIds:
+	var with_parameters: HeldIds = held
 
 	for parameter in parameters:
 		match parameter.binding:
 			NamedParameter(binder):
-				with_parameters = with_parameters.append(held_binder(binder))
+				with_parameters = with_parameters.hold(held_binder(binder))
 			WildcardParameter(_):
 				with_parameters = with_parameters
 			TupleParameter(tuple):
 				for binder in tuple.names.small_tuple_items():
-					with_parameters = with_parameters.append(held_binder(binder))
+					with_parameters = with_parameters.hold(held_binder(binder))
 
 		with_parameters = with_parameters.held_in_optional_type(parameter.declared_type)
 
@@ -530,19 +510,19 @@ private pure func held_in_parameters(
 
 
 private pure func held_in_type_parameters(
-	held: List[HeldId],
+	held: HeldIds,
 	parameters: List[TypeParameter],
-) -> List[HeldId]:
-	var with_parameters: List[HeldId] = held
+) -> HeldIds:
+	var with_parameters: HeldIds = held
 
 	for parameter in parameters:
 		match parameter:
 			TypeVariable(variable):
 				with_parameters = with_parameters
-					.append(held_type_binder(variable.binder.binder))
+					.hold(held_type_binder(variable.binder.binder))
 					.held_in_trait_references(variable.bounds)
 			DimensionVariable(binder):
-				with_parameters = with_parameters.append(held_type_binder(binder.binder))
+				with_parameters = with_parameters.hold(held_type_binder(binder.binder))
 			WildcardDimensionParameter(_):
 				with_parameters = with_parameters
 
@@ -550,27 +530,27 @@ private pure func held_in_type_parameters(
 
 
 private pure func held_in_trait_references(
-	held: List[HeldId],
+	held: HeldIds,
 	references: List[TraitReference],
-) -> List[HeldId]:
-	var with_references: List[HeldId] = held
+) -> HeldIds:
+	var with_references: HeldIds = held
 
 	for reference in references:
 		match reference.qualifier:
 			Some(qualifier):
-				with_references = with_references.append(held_name_use(qualifier))
+				with_references = with_references.hold(held_name_use(qualifier))
 			None:
 				with_references = with_references
 
-		with_references = with_references.append(held_name_use(reference.trait_name))
+		with_references = with_references.hold(held_name_use(reference.trait_name))
 
 	with_references
 
 
 private pure func held_in_constraint(
-	held: List[HeldId],
+	held: HeldIds,
 	constraint: DimensionConstraint,
-) -> List[HeldId]:
+) -> HeldIds:
 	held
 		.held_in_dimension(constraint.left)
 		.held_in_dimension(constraint.right)
@@ -578,9 +558,9 @@ private pure func held_in_constraint(
 
 -- Written types and dimensions.
 private pure func held_in_optional_type(
-	held: List[HeldId],
+	held: HeldIds,
 	written_type: Option[WrittenType],
-) -> List[HeldId]:
+) -> HeldIds:
 	match written_type:
 		Some(present):
 			held.held_in_type(present)
@@ -588,8 +568,8 @@ private pure func held_in_optional_type(
 			held
 
 
-private pure func held_in_types(held: List[HeldId], types: List[WrittenType]) -> List[HeldId]:
-	var with_types: List[HeldId] = held
+private pure func held_in_types(held: HeldIds, types: List[WrittenType]) -> HeldIds:
+	var with_types: HeldIds = held
 
 	for written_type in types:
 		with_types = with_types.held_in_type(written_type)
@@ -597,18 +577,18 @@ private pure func held_in_types(held: List[HeldId], types: List[WrittenType]) ->
 	with_types
 
 
-private pure func held_in_type(held: List[HeldId], written_type: WrittenType) -> List[HeldId]:
-	with_type: List[HeldId] = held.append(held_written_type(written_type.id))
+private pure func held_in_type(held: HeldIds, written_type: WrittenType) -> HeldIds:
+	with_type: HeldIds = held.hold(held_written_type(written_type.id))
 
 	match written_type.kind:
 		NamedType(name, arguments):
 			with_type
-				.append(held_name_use(name))
+				.hold(held_name_use(name))
 				.held_in_type_arguments(arguments)
 		QualifiedType(qualifier, name, arguments):
 			with_type
-				.append(held_name_use(qualifier))
-				.append(held_name_use(name))
+				.hold(held_name_use(qualifier))
+				.hold(held_name_use(name))
 				.held_in_type_arguments(arguments)
 		VoidType:
 			with_type
@@ -619,7 +599,7 @@ private pure func held_in_type(held: List[HeldId], written_type: WrittenType) ->
 				.held_in_type_arguments(parameters)
 				.held_in_type(result)
 		ArrayType(element, dimensions):
-			var with_dimensions: List[HeldId] = with_type.held_in_type(element)
+			var with_dimensions: HeldIds = with_type.held_in_type(element)
 
 			for dimension in dimensions.at_least_one_items():
 				with_dimensions = with_dimensions.held_in_dimension(dimension)
@@ -631,15 +611,15 @@ private pure func held_in_type(held: List[HeldId], written_type: WrittenType) ->
 			with_type.held_in_dimension(dimension)
 		BoundedType(bounded):
 			with_type
-				.append(held_name_use(bounded.parameter))
+				.hold(held_name_use(bounded.parameter))
 				.held_in_trait_references(bounded.bounds.at_least_one_items())
 
 
 private pure func held_in_type_arguments(
-	held: List[HeldId],
+	held: HeldIds,
 	arguments: List[TypeArgument],
-) -> List[HeldId]:
-	var with_arguments: List[HeldId] = held
+) -> HeldIds:
+	var with_arguments: HeldIds = held
 
 	for argument in arguments:
 		match argument:
@@ -649,20 +629,20 @@ private pure func held_in_type_arguments(
 				with_arguments = with_arguments.held_in_dimension(dimension)
 			BoundedArgument(bounded):
 				with_arguments = with_arguments
-					.append(held_name_use(bounded.parameter))
+					.hold(held_name_use(bounded.parameter))
 					.held_in_trait_references(bounded.bounds.at_least_one_items())
 
 	with_arguments
 
 
-private pure func held_in_dimension(held: List[HeldId], dimension: Dimension) -> List[HeldId]:
-	with_dimension: List[HeldId] = held.append(held_dimension(dimension.id))
+private pure func held_in_dimension(held: HeldIds, dimension: Dimension) -> HeldIds:
+	with_dimension: HeldIds = held.hold(held_dimension(dimension.id))
 
 	match dimension.kind:
 		NamedDimension(name):
-			with_dimension.append(held_name_use(name))
+			with_dimension.hold(held_name_use(name))
 		VariadicNamedDimension(name):
-			with_dimension.append(held_name_use(name))
+			with_dimension.hold(held_name_use(name))
 		WildcardDimension:
 			with_dimension
 		VariadicWildcardDimension:
@@ -676,16 +656,16 @@ private pure func held_in_dimension(held: List[HeldId], dimension: Dimension) ->
 
 
 -- Patterns.
-private pure func held_in_target(held: List[HeldId], target: BindingTarget) -> List[HeldId]:
+private pure func held_in_target(held: HeldIds, target: BindingTarget) -> HeldIds:
 	match target:
 		BindsName(binder):
-			held.append(held_binder(binder))
+			held.hold(held_binder(binder))
 		DiscardsValue(_):
 			held
 
 
-private pure func held_in_patterns(held: List[HeldId], patterns: List[Pattern]) -> List[HeldId]:
-	var with_patterns: List[HeldId] = held
+private pure func held_in_patterns(held: HeldIds, patterns: List[Pattern]) -> HeldIds:
+	var with_patterns: HeldIds = held
 
 	for pattern in patterns:
 		with_patterns = with_patterns.held_in_pattern(pattern)
@@ -693,14 +673,14 @@ private pure func held_in_patterns(held: List[HeldId], patterns: List[Pattern]) 
 	with_patterns
 
 
-private pure func held_in_pattern(held: List[HeldId], pattern: Pattern) -> List[HeldId]:
-	with_pattern: List[HeldId] = held.append(held_pattern(pattern.id))
+private pure func held_in_pattern(held: HeldIds, pattern: Pattern) -> HeldIds:
+	with_pattern: HeldIds = held.hold(held_pattern(pattern.id))
 
 	match pattern.kind:
 		WildcardPattern:
 			with_pattern
 		NamePattern(name):
-			with_pattern.append(held_name_use(name))
+			with_pattern.hold(held_name_use(name))
 		IntegerPattern(_, _):
 			with_pattern
 		FloatPattern(_, _):
@@ -713,17 +693,17 @@ private pure func held_in_pattern(held: List[HeldId], pattern: Pattern) -> List[
 			with_pattern
 		ConstructorPattern(constructor, arguments):
 			with_pattern
-				.append(held_name_use(constructor))
+				.hold(held_name_use(constructor))
 				.held_in_patterns(arguments)
 		QualifiedConstructorPattern(qualifier, constructor, arguments):
 			with_pattern
-				.append(held_name_use(qualifier))
-				.append(held_name_use(constructor))
+				.hold(held_name_use(qualifier))
+				.hold(held_name_use(constructor))
 				.held_in_patterns(arguments)
 		TuplePattern(elements):
 			with_pattern.held_in_patterns(elements.small_tuple_items())
 		ListPattern(elements, spread):
-			with_elements: List[HeldId] = with_pattern.held_in_patterns(elements)
+			with_elements: HeldIds = with_pattern.held_in_patterns(elements)
 
 			match spread:
 				Some(written):
@@ -735,7 +715,7 @@ private pure func held_in_pattern(held: List[HeldId], pattern: Pattern) -> List[
 
 
 -- Bodies, blocks and statements.
-private pure func held_in_optional_body(held: List[HeldId], body: Option[Body]) -> List[HeldId]:
+private pure func held_in_optional_body(held: HeldIds, body: Option[Body]) -> HeldIds:
 	match body:
 		Some(present):
 			held.held_in_body(present)
@@ -743,7 +723,7 @@ private pure func held_in_optional_body(held: List[HeldId], body: Option[Body]) 
 			held
 
 
-private pure func held_in_body(held: List[HeldId], body: Body) -> List[HeldId]:
+private pure func held_in_body(held: HeldIds, body: Body) -> HeldIds:
 	match body:
 		BlockBody(block):
 			held.held_in_block(block)
@@ -751,8 +731,8 @@ private pure func held_in_body(held: List[HeldId], body: Body) -> List[HeldId]:
 			held.held_in_expression(expression)
 
 
-private pure func held_in_block(held: List[HeldId], block: Block) -> List[HeldId]:
-	var with_statements: List[HeldId] = held.append(held_block(block.id))
+private pure func held_in_block(held: HeldIds, block: Block) -> HeldIds:
+	var with_statements: HeldIds = held.hold(held_block(block.id))
 
 	for statement in block.leading:
 		with_statements = with_statements.held_in_statement(statement)
@@ -760,8 +740,8 @@ private pure func held_in_block(held: List[HeldId], block: Block) -> List[HeldId
 	with_statements.held_in_statement(block.last)
 
 
-private pure func held_in_statement(held: List[HeldId], statement: Statement) -> List[HeldId]:
-	with_statement: List[HeldId] = held.append(held_statement(statement.id))
+private pure func held_in_statement(held: HeldIds, statement: Statement) -> HeldIds:
+	with_statement: HeldIds = held.hold(held_statement(statement.id))
 
 	match statement.kind:
 		ExpressionStatement(expression):
@@ -777,30 +757,30 @@ private pure func held_in_statement(held: List[HeldId], statement: Statement) ->
 				.held_in_type(binding.declared_type)
 				.held_in_expression(binding.value)
 		Assignment(assignment):
-			with_target: List[HeldId] = match assignment.target:
+			with_target: HeldIds = match assignment.target:
 				AssignsName(use):
-					with_statement.append(held_name_use(use))
+					with_statement.hold(held_name_use(use))
 				AssignsDiscard(_):
 					with_statement
 
 			with_target.held_in_expression(assignment.value)
 		QuestionBinding(binding):
 			with_statement
-				.append(held_binder(binding.binder))
+				.hold(held_binder(binding.binder))
 				.held_in_optional_type(binding.declared_type)
 				.held_in_expression(binding.value)
 		CompoundAssignment(assignment):
 			with_statement
-				.append(held_name_use(assignment.target))
+				.hold(held_name_use(assignment.target))
 				.held_in_expression(assignment.value)
 		SubscriptAssignment(assignment):
 			with_statement
-				.append(held_expression(assignment.place.id))
+				.hold(held_expression(assignment.place.id))
 				.held_in_expression(assignment.place.collection)
 				.held_in_expressions(assignment.place.indices.at_least_one_items())
 				.held_in_expression(assignment.value)
 		TupleDestructure(destructure):
-			var with_targets: List[HeldId] = with_statement
+			var with_targets: HeldIds = with_statement
 
 			for target in destructure.targets.small_tuple_items():
 				with_targets = with_targets.held_in_target(target)
@@ -811,7 +791,7 @@ private pure func held_in_statement(held: List[HeldId], statement: Statement) ->
 				.held_in_expression(loop.condition)
 				.held_in_block(loop.body)
 		ForLoop(loop):
-			var with_binder: List[HeldId] = with_statement
+			var with_binder: HeldIds = with_statement
 
 			match loop.binder:
 				LoopVariable(target):
@@ -825,20 +805,20 @@ private pure func held_in_statement(held: List[HeldId], statement: Statement) ->
 				.held_in_block(loop.body)
 		ConcurrentForLoop(loop):
 			with_statement
-				.append(held_binder(loop.binder))
+				.hold(held_binder(loop.binder))
 				.held_in_expression(loop.iterable)
 				.held_in_timeout(loop.timeout)
 				.held_in_block(loop.body)
 		LocalFunctionStatement(function):
 			with_statement
-				.append(held_definition(function.id))
+				.hold(held_definition(function.id))
 				.held_in_function(function.function)
 
 
 private pure func held_in_timeout(
-	held: List[HeldId],
+	held: HeldIds,
 	timeout: Option[TimeoutParameter],
-) -> List[HeldId]:
+) -> HeldIds:
 	match timeout:
 		Some(parameter):
 			held.held_in_expression(parameter.value)
@@ -848,10 +828,10 @@ private pure func held_in_timeout(
 
 -- Expressions.
 private pure func held_in_expressions(
-	held: List[HeldId],
+	held: HeldIds,
 	expressions: List[Expression],
-) -> List[HeldId]:
-	var with_expressions: List[HeldId] = held
+) -> HeldIds:
+	var with_expressions: HeldIds = held
 
 	for expression in expressions:
 		with_expressions = with_expressions.held_in_expression(expression)
@@ -860,14 +840,14 @@ private pure func held_in_expressions(
 
 
 private pure func held_in_named_values(
-	held: List[HeldId],
+	held: HeldIds,
 	values: List[NamedValue],
-) -> List[HeldId]:
-	var with_values: List[HeldId] = held
+) -> HeldIds:
+	var with_values: HeldIds = held
 
 	for named in values:
 		with_values = with_values
-			.append(held_name_use(named.name))
+			.hold(held_name_use(named.name))
 			.held_in_expression(named.value)
 
 	with_values
@@ -877,13 +857,13 @@ private pure func held_in_named_values(
 An expression's ids. Its left spine (operands, callees, receivers, the
 subscripted collection) is walked by the loop, not by recursion.
 ---
-private pure func held_in_expression(held: List[HeldId], expression: Expression) -> List[HeldId]:
-	var with_expression: List[HeldId] = held
+private pure func held_in_expression(held: HeldIds, expression: Expression) -> HeldIds:
+	var with_expression: HeldIds = held
 	var current: Expression = expression
 	var on_spine: Bool = True
 
 	while on_spine:
-		with_expression = with_expression.append(held_expression(current.id))
+		with_expression = with_expression.hold(held_expression(current.id))
 
 		match current.kind:
 			Binary(_, left, right):
@@ -896,13 +876,13 @@ private pure func held_in_expression(held: List[HeldId], expression: Expression)
 				with_expression = with_expression.held_in_expressions(arguments)
 				current = callee
 			FieldAccess(receiver, member):
-				with_expression = with_expression.append(held_name_use(member))
+				with_expression = with_expression.hold(held_name_use(member))
 				current = receiver
 			Subscript(collection, indices):
 				with_expression = with_expression.held_in_expressions(indices.at_least_one_items())
 				current = collection
 			NameReference(use):
-				with_expression = with_expression.append(held_name_use(use))
+				with_expression = with_expression.hold(held_name_use(use))
 				on_spine = False
 			IntegerLiteral(_):
 				on_spine = False
@@ -917,7 +897,7 @@ private pure func held_in_expression(held: List[HeldId], expression: Expression)
 							with_expression = with_expression
 						InterpolationHole(hole):
 							with_expression = with_expression
-								.append(held_expression(hole.id))
+								.hold(held_expression(hole.id))
 								.held_in_expression(hole.value)
 
 				on_spine = False
@@ -1052,8 +1032,8 @@ private pure func held_in_expression(held: List[HeldId], expression: Expression)
 ---
 An `if` and its `else` chain, each `else if` walked by the loop.
 ---
-private pure func held_in_if(held: List[HeldId], conditional: IfExpression) -> List[HeldId]:
-	var with_branches: List[HeldId] = held
+private pure func held_in_if(held: HeldIds, conditional: IfExpression) -> HeldIds:
+	var with_branches: HeldIds = held
 		.held_in_expression(conditional.condition)
 		.held_in_block(conditional.then_block)
 	var branch: Option[ElseBranch] = conditional.else_branch
@@ -1067,7 +1047,7 @@ private pure func held_in_if(held: List[HeldId], conditional: IfExpression) -> L
 						branch = None
 					ElseIf(else_if):
 						with_branches = with_branches
-							.append(held_expression(else_if.id))
+							.hold(held_expression(else_if.id))
 							.held_in_expression(else_if.conditional.condition)
 							.held_in_block(else_if.conditional.then_block)
 						branch = else_if.conditional.else_branch
